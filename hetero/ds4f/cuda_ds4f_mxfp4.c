@@ -326,8 +326,11 @@ void cuda_ds4f_mxfp4_set_terms(cuda_ds4f_mxfp4 *c, int terms) {
 
 int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x,
                          int M, int N, int K) {
+    /* Pass 0 as the output so gemm_once() grabs the current c->y: evaluating
+     * c->y at the call site captures a pointer that a growth realloc inside
+     * gemm_once() then frees, and the queued kernel writes into freed VRAM. */
     if (!c || c->terms < 2)
-        return cuda_ds4f_mxfp4_gemm_once(c, dst, x, M, N, K, c ? c->y : 0, 1);
+        return cuda_ds4f_mxfp4_gemm_once(c, dst, x, M, N, K, 0, 1);
     int Mp = M < 128 ? (M < 64 ? 64 : M) : ((M + 127) & ~127);
     size_t xb = (size_t)Mp * K * sizeof(float);
     size_t yb = (size_t)Mp * N * sizeof(float);
@@ -345,7 +348,7 @@ int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x,
         c->y2b = yb;
     }
     make_mxfp4_residual((float *)c->hres, x, M, Mp, K);
-    if (cuda_ds4f_mxfp4_gemm_once(c, NULL, x, M, N, K, c->y, 0) != 0 ||
+    if (cuda_ds4f_mxfp4_gemm_once(c, NULL, x, M, N, K, 0, 0) != 0 ||
         cuda_ds4f_mxfp4_gemm_once(c, NULL, (const float *)c->hres,
                                   M, N, K, c->y2, 0) != 0)
         return -1;
