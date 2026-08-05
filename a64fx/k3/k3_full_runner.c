@@ -1321,15 +1321,23 @@ static void full_kda_forward(k3_full_model *m, k3_full_layer *l,
     float *qstate = state;
     float *kstate = qstate + state_stride;
     float *vstate = kstate + state_stride;
-    float *qkv_outs[] = {m->q, m->k, m->v, m->tmp, m->expert_out};
+    /* b_proj reads only x, so it belongs in the first batch rather than with
+     * f_b.  That leaves both batches homogeneous in columns, which matters more
+     * than the ordering: a batch mixing f_b's 128 columns with b_proj's 7168
+     * takes the guided schedule, and f_b is 128 eight-row tasks of 128 columns
+     * each -- exactly the tiny-homogeneous-task case where guided measured 7.5x
+     * slower than static. */
+    float *qkv_outs[] = {m->q, m->k, m->v, m->tmp, m->expert_out, m->tmp2};
     const k3_full_tensor *qkv_weights[] = {
-        &l->q_proj, &l->k_proj, &l->v_proj, &l->f_a_proj, &l->g_proj,
+        &l->q_proj, &l->k_proj, &l->v_proj, &l->f_a_proj, &l->g_proj, &l->b_proj,
     };
-    const float *qkv_inputs[] = {x, x, x, x, x};
-    int qkv_rows[] = {channels, channels, channels, K3_HEAD_DIM, channels};
-    int qkv_cols[] = {K3_HIDDEN, K3_HIDDEN, K3_HIDDEN, K3_HIDDEN, K3_HIDDEN};
+    const float *qkv_inputs[] = {x, x, x, x, x, x};
+    int qkv_rows[] = {channels, channels, channels, K3_HEAD_DIM, channels,
+                      m->local_heads};
+    int qkv_cols[] = {K3_HIDDEN, K3_HIDDEN, K3_HIDDEN, K3_HIDDEN, K3_HIDDEN,
+                      K3_HIDDEN};
     full_bf16_many(qkv_outs, qkv_weights, qkv_inputs,
-                   qkv_rows, qkv_cols, 5, m->threads);
+                   qkv_rows, qkv_cols, 6, m->threads);
     memcpy(m->up, m->q, (size_t)channels * sizeof(float));
     k3_conv_step_sve(m->q, m->up, qstate, (const float *)l->q_conv.data,
                      NULL, channels, K3_FULL_CONV_KERNEL);
@@ -1339,13 +1347,13 @@ static void full_kda_forward(k3_full_model *m, k3_full_layer *l,
     memcpy(m->up, m->v, (size_t)channels * sizeof(float));
     k3_conv_step_sve(m->v, m->up, vstate, (const float *)l->v_conv.data,
                      NULL, channels, K3_FULL_CONV_KERNEL);
-    float *decay_outs[] = {m->gate, m->tmp2};
-    const k3_full_tensor *decay_weights[] = {&l->f_b_proj, &l->b_proj};
-    const float *decay_inputs[] = {m->tmp, x};
-    int decay_rows[] = {channels, m->local_heads};
-    int decay_cols[] = {K3_HEAD_DIM, K3_HIDDEN};
+    float *decay_outs[] = {m->gate};
+    const k3_full_tensor *decay_weights[] = {&l->f_b_proj};
+    const float *decay_inputs[] = {m->tmp};
+    int decay_rows[] = {channels};
+    int decay_cols[] = {K3_HEAD_DIM};
     full_bf16_many(decay_outs, decay_weights, decay_inputs,
-                   decay_rows, decay_cols, 2, m->threads);
+                   decay_rows, decay_cols, 1, m->threads);
     for (int h = 0; h < m->local_heads; ++h) {
         k3_l2_normalize_sve(m->q + (size_t)h * K3_HEAD_DIM, K3_HEAD_DIM, 1.0e-6f);
         k3_l2_normalize_sve(m->k + (size_t)h * K3_HEAD_DIM, K3_HEAD_DIM, 1.0e-6f);

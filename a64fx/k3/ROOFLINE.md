@@ -338,3 +338,55 @@ doing, not attempted here. Given that the persistent-team restructuring above
 turned out to be worth 1.2% and the thread count was worth 45%, the ordering
 question deserves the same "measure a small change first" treatment rather than
 being assumed to matter.
+
+## KDA stage merge: landed, and the reason is the schedule again
+
+Moved `b_proj` from the decay batch into the qkv batch. It reads only `x`, so
+the dependency allowed it, but the payoff is not the ordering — it is that both
+batches become homogeneous in columns. The old decay batch mixed f_b's 128
+columns with b_proj's 7168, so it took `guided`, and f_b is 128 eight-row tasks
+of 128 columns: exactly the tiny-homogeneous-task case measured at 7.5x slower
+than static earlier in this document.
+
+Three reps, layer 2, 47 threads:
+
+| | layer ms | attention ms |
+|---|---|---|
+| merged | 1.500 / 1.498 / 1.492 | 0.457 / 0.455 / 0.450 |
+| baseline | 1.757 / 1.972 / 1.508 | 0.610 / 0.677 / 0.467 |
+
+1.17x on the layer and 1.29x on attention, with the merged worst case beating
+the baseline best case. Output hash unchanged (`02e4dc4b1746567a`).
+
+## Where <1 ms/layer stands
+
+Phase profile at 47 threads, before the merge:
+
+| phase | KDA (l2) | MLA (l3) |
+|---|---|---|
+| **layer** | **1.524** | **1.958** |
+| attention | 0.481 | 0.909 |
+| moe | 0.935 | 0.939 |
+| — moe_dispatch | 0.244 | 0.247 |
+| — moe_expert | 0.212 | 0.212 |
+| — moe_shared | 0.190 | 0.192 |
+| — dispatch_proj | 0.175 | 0.176 |
+| — moe_finish | 0.171 | 0.169 |
+| — moe_collective | 0.126 | 0.124 |
+| reduce | 0.119 | 0.119 |
+
+After the merge KDA is ~1.49. **The target is not met and is not one change
+away.** The layer is now broadly balanced: MoE is 61% of a KDA layer and no
+sub-phase inside it exceeds 26% of MoE. Getting KDA under 1 ms means removing
+~0.5 ms spread across six sub-phases that are each 0.12-0.24 ms, and MLA needs
+~0.96 ms removed with attention (0.909) as the only large single item.
+
+Two observations for whoever continues:
+
+- Six MoE sub-stages at 47 threads carry roughly 18 us of barrier each, so
+  ~110 us of the 935 us is synchronization. Real, but it does not get you to
+  1 ms on its own — and the persistent-team attempt above shows barriers do not
+  disappear by merging regions, only by removing sync points.
+- MLA attention at 0.909 ms against KDA's 0.481 for the same projection volume
+  is the largest unexplained single number left in the profile, and has never
+  been broken down. That is where I would look next.
