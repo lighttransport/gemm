@@ -397,6 +397,24 @@ static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
      * GEMM results or the argmax.  Opt-in; see --hip-fused-shared-ffn. */
     m->gpu_shared_ffn = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn : NULL;
     m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
+    /* MXFP4 expert layer residency: install the HIP entry points BEFORE the
+     * dual wrapper swaps gpu_dense_ctx, so dual can capture and forward them.
+     * Dual owns expert routing and keeps small buckets on the exact CPU path,
+     * so streaming would only upload weights the dispatcher never uses; leave
+     * the callbacks off there. */
+    if (!dual) {
+        m->gpu_dense_layer_prefetch = opt->hip_mxfp4_stream_raw &&
+            hip_mxfp4_streaming(opt)
+            ? hip_ds4f_dense_prefetch_layer_raw : NULL;
+        m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
+            ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_begin_layer
+                                         : hip_ds4f_dense_stream_layer) : NULL;
+        m->gpu_dense_stream_prefill_only = hip_mxfp4_streaming(opt);
+    } else {
+        m->gpu_dense_layer_prefetch = NULL;
+        m->gpu_dense_layer_begin = NULL;
+        m->gpu_dense_stream_prefill_only = 0;
+    }
     /* Mixed dispatch is not a precision mode.  Without it a group holding
      * one CPU-only member (the router gate beside shared w2) sends every
      * member to the CPU; each member keeps its own arithmetic either way. */
@@ -504,13 +522,6 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
         m->gpu_dense_gemm_multi = dual_ds4f_prefill_gemm_multi;
         m->gpu_dense_gemm = dual_ds4f_prefill_gemm;
     }
-    m->gpu_dense_layer_prefetch = opt->hip_mxfp4_stream_raw &&
-        hip_mxfp4_streaming(opt)
-        ? hip_ds4f_dense_prefetch_layer_raw : NULL;
-    m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
-        ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_begin_layer
-                                     : hip_ds4f_dense_stream_layer) : NULL;
-    m->gpu_dense_stream_prefill_only = hip_mxfp4_streaming(opt);
     /* Mixed dispatch is not a precision mode.  Without it a group holding
      * one CPU-only member (the router gate beside shared w2) sends every
      * member to the CPU; each member keeps its own arithmetic either way. */

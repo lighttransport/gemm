@@ -25,6 +25,12 @@ struct dual_ds4f_prefill {
     int verbose;
     int cuda_mxfp4;
     int max_batch;
+    /* Captured HIP layer-residency entry points.  gpu_dense_ctx becomes the
+     * dual wrapper, so the MXFP4 expert streaming callbacks must be forwarded
+     * to the wrapped HIP runner or they would dereference the dual struct as a
+     * hip_ds4f_dense (crash). */
+    ds4f_gpu_dense_layer_fn hip_layer_begin;
+    ds4f_gpu_dense_layer_prefetch_fn hip_layer_prefetch;
 };
 
 static int cuda_eligible(const dual_ds4f_prefill *c, const ds4f_tensor *t,
@@ -233,6 +239,19 @@ static int dual_shared_ffn(void *opaque, float *dst,
                                      M, inter, C, lim);
 }
 
+/* MXFP4 expert layer residency: forward to the wrapped HIP runner.  The
+ * gpu_dense_ctx swap to the dual wrapper otherwise makes these HIP entry
+ * points read the dual struct as a hip_ds4f_dense. */
+static int dual_layer_begin(void *opaque, const ds4f_layer *layer) {
+    dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
+    return c->hip_layer_begin ? c->hip_layer_begin(c->hip, layer) : 0;
+}
+
+static int dual_layer_prefetch(void *opaque, const ds4f_layer *layer) {
+    dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
+    return c->hip_layer_prefetch ? c->hip_layer_prefetch(c->hip, layer) : 0;
+}
+
 void dual_ds4f_prefill_attach_model(ds4f_model *m, dual_ds4f_prefill *c) {
     if (!m) return;
     m->gpu_dense_ctx = c;
@@ -244,6 +263,17 @@ void dual_ds4f_prefill_attach_model(ds4f_model *m, dual_ds4f_prefill *c) {
     m->gpu_dense_blockdiag = c ? dual_blockdiag : NULL;
     m->gpu_prefill_attn = (c && m->gpu_prefill_attn) ? dual_prefill_attn : NULL;
     m->gpu_shared_ffn = c ? dual_shared_ffn : NULL;
+    /* Capture the HIP MXFP4 layer callbacks before gpu_dense_ctx is swapped,
+     * then forward them (dual layer residency on the wrapped HIP runner). */
+    if (c) {
+        c->hip_layer_begin = m->gpu_dense_layer_begin;
+        c->hip_layer_prefetch = m->gpu_dense_layer_prefetch;
+        m->gpu_dense_layer_begin = dual_layer_begin;
+        m->gpu_dense_layer_prefetch = dual_layer_prefetch;
+    } else {
+        m->gpu_dense_layer_begin = NULL;
+        m->gpu_dense_layer_prefetch = NULL;
+    }
     m->gpu_dense_mixed = c ? 1 : 0;
 }
 
