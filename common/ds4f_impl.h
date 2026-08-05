@@ -3095,7 +3095,14 @@ static ds4f_runtime_options ds4f_runtime_options_debug_env(ds4f_config cfg,
     if (stage_dir) snprintf(o.stage_dir, sizeof(o.stage_dir), "%s", stage_dir);
     { const char *e = getenv("DS4F_TOKENIZER"); if (e && *e) snprintf(o.tokenizer, sizeof(o.tokenizer), "%s", e); }
     { const char *e = getenv("DS4F_TOKENIZER_PY"); if (e && *e) snprintf(o.tokenizer_py, sizeof(o.tokenizer_py), "%s", e); }
-    o.cfg = ds4f_config_from_env();
+    /* Legacy DS4F_MODEL selects the config in --debug-env mode.  Only apply it
+     * when explicitly set: the caller's cfg may carry non-default dimensions
+     * (e.g. ds4f_alloc_synth() with n_layers=1) that ds4f_config_from_env()
+     * would clobber with the full 43-layer default. */
+    { const char *m = getenv("DS4F_MODEL");
+      if (m && *m) o.cfg = ds4f_config_from_env();
+      else { const char *x = getenv("DS4F_EXPERTS");
+             if (x && *x && strcmp(x, "q8pv") == 0) o.cfg.expert_qt = DS4F_Q8_PV; } }
     { const char *e = getenv("DS4F_FP8_BF16"); o.dense_bf16 = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_BF16_PV"); o.bf16_pv = e && *e ? atoi(e) : -1; }
     { const char *e = getenv("DS4F_DENSE_MXFP4"); o.dense_mxfp4 = e && *e ? atoi(e) : 0; }
