@@ -220,6 +220,7 @@ typedef struct {
     float *shared_hidden;
     float *reduce;
     int8_t *q_scratch;
+    float *mla_scratch, *mla_stats;
     int *expert_counts;
     int *expert_tokens;
     float *expert_weights;
@@ -1407,12 +1408,16 @@ static void full_mla_forward(k3_full_model *m, k3_full_layer *l,
         memcpy(kh, m->k + (size_t)h * 256 + 0, 128 * sizeof(float));
         memcpy(kh + 128, m->tmp2 + 512, 64 * sizeof(float));
         memcpy(vh, m->k + (size_t)h * 256 + 128, 128 * sizeof(float));
-        k3_attention_sve(m->attn + (size_t)h * K3_HEAD_DIM,
-                         m->q + (size_t)h * K3_FULL_MLA_QK,
-                         layer_keys + (size_t)h * key_stride,
-                         layer_values + (size_t)h * value_stride,
-                         position + 1, K3_FULL_MLA_QK, K3_FULL_MLA_VALUE);
     }
+    /* The scan over the KV cache was a serial loop over the local heads, which
+     * is what made MLA attention cost roughly twice KDA's for the same
+     * projection volume.  k3_attention_heads_parallel_sve splits each head's
+     * token range across the team and merges with log-sum-exp; k3_ep_runner
+     * already uses it (k3_ep_runner.c:715). */
+    k3_attention_heads_parallel_sve(m->attn, m->q, layer_keys, layer_values,
+                                    m->local_heads, position + 1, m->max_seq,
+                                    K3_FULL_MLA_QK, K3_FULL_MLA_VALUE,
+                                    m->threads, m->mla_scratch, m->mla_stats);
     for (int i = 0; i < channels / 192 * 128; ++i)
         m->attn[i] *= k3_sigmoidf(m->gate[i]);
     full_bf16_matvec(out, &l->mla_o_proj, K3_HIDDEN,
@@ -2031,12 +2036,19 @@ static int full_allocate_scratch(k3_full_model *m, const k3_full_options *o) {
     m->reduce = (float *)k3_pool_alloc(m->pool,
                                        K3_FULL_REDUCE_COUNT * sizeof(float));
     m->q_scratch = (int8_t *)k3_pool_alloc(m->pool, K3_LATENT * sizeof(int8_t));
+    /* Sized as in k3_ep_runner.c:869-870 for k3_attention_heads_parallel_sve. */
+    m->mla_scratch = (float *)k3_pool_alloc(m->pool,
+        (size_t)m->local_heads * m->threads * K3_HEAD_DIM * sizeof(float));
+    m->mla_stats = (float *)k3_pool_alloc(m->pool,
+        ((size_t)m->local_heads * m->threads * 2 +
+         (size_t)m->local_heads * 2) * sizeof(float));
     m->expert_counts = (int *)k3_pool_alloc(m->pool, (size_t)max_experts * sizeof(int));
     m->expert_tokens = (int *)k3_pool_alloc(m->pool, (size_t)max_experts * sizeof(int));
     m->expert_weights = (float *)k3_pool_alloc(m->pool, (size_t)max_experts * sizeof(float));
     if (!m->kda_state || !m->conv_state || !m->mla_keys || !m->mla_values ||
         !m->block_residual || !m->hidden || !m->normed || !m->tmp || !m->tmp2 ||
         !m->attn || !m->q || !m->k || !m->v || !m->gate || !m->up || !m->decay ||
+        !m->mla_scratch || !m->mla_stats ||
         !m->local_latent || !m->routed_latent || !m->moe_hidden || !m->logits ||
         !m->expert_gathered || !m->expert_gate || !m->expert_up || !m->expert_out ||
         !m->shared_hidden || !m->reduce || !m->q_scratch ||

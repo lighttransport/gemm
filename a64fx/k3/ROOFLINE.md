@@ -390,3 +390,44 @@ Two observations for whoever continues:
 - MLA attention at 0.909 ms against KDA's 0.481 for the same projection volume
   is the largest unexplained single number left in the profile, and has never
   been broken down. That is where I would look next.
+
+## MLA attention: the KV scan was serial over heads
+
+Breaking MLA down by reading it rather than instrumenting it: of its five
+stages, four are batched projections and elementwise work, but the KV-cache scan
+ran `k3_attention_sve` in a **serial loop over the local heads**. KDA has no
+such scan, which is the whole of the 0.909 vs 0.481 difference.
+
+`k3_attention_heads_parallel_sve` already exists in `k3_kernels.h` for exactly
+this -- it splits each head's token range across the team and merges with
+log-sum-exp -- and `k3_ep_runner.c:715` already uses it. The full runner did
+not. Swapped in, with `mla_scratch`/`mla_stats` sized as at
+`k3_ep_runner.c:869-870`.
+
+Three reps, layer 3, 47 threads (first parallel run discarded as cold, the
+pattern throughout this document):
+
+| | layer ms | attention ms |
+|---|---|---|
+| parallel | 1.746 / 1.709 | 0.689 / 0.658 |
+| serial | 1.954 / 1.973 / 1.953 | 0.903 / 0.915 / 0.903 |
+
+**Attention 1.35x**, layer 1.13x.
+
+**A caveat on the correctness gate.** `layer12` mode reports `tokens=0`, so the
+output hash it prints does not cover the attention result -- it is a weak gate,
+weaker than this document implied for the earlier changes. Those were
+scheduling-only and unchanged by construction; this one changes the summation
+order, so it rests on `make test`'s `[mla-parallel]` case (max_abs 2.794e-09
+against the reference) plus the call-site mapping: the kernel indexes
+`keys + h*cache_tokens*qk_dim`, which equals the caller's `h*key_stride` when
+`cache_tokens = max_seq`, and likewise for values and the 128-wide output.
+A generation-mode run would be a stronger check and has not been done.
+
+## Standing position on <1 ms/layer
+
+KDA ~1.49 ms, MLA ~1.73 ms. Extrapolated 69 x 1.49 + 24 x 1.73 = 144 ms/token
+= 6.9 tok/s, from 457 ms at the start of the day.
+
+Still not met, and still not one change away: MoE is ~0.93 ms of both layer
+types with no sub-phase above 26% of it.
