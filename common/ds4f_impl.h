@@ -911,7 +911,7 @@ static void ds4f_matvec_blockdiag(ds4f_model *m, float *dst, const ds4f_tensor *
  * mHC mixes) falls back to a per-token matvec loop. K-tile reassociation makes the
  * result bit-SIMILAR (~1e-4) to the single-token matvec. */
 #ifndef DS4F_MAX_MTILE
-#define DS4F_MAX_MTILE 256          /* >=256 so each owned expert gets ~6 tokens to batch */
+#define DS4F_MAX_MTILE 512          /* >=512: bigger routed-expert buckets amortize weight reads/decode; also unlocks the CUDA MMQ's fixed per-layer cost over larger batches */
 #endif
 typedef struct { ds4f_model *m; float *Y; const ds4f_tensor *t;
                  const float *X; int M, Ystride, Xstride; } ds4f_gemm_task;
