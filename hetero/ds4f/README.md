@@ -694,6 +694,15 @@ so streaming would only upload weights it never uses; `--dual-gpu 1` leaves
 the layer-residency callbacks off (they previously crashed because the dual
 wrapper swapped `gpu_dense_ctx` out from under the raw HIP entry points).
 
+Current measurements on this host (2026-08-05, batch 64, 43 layers) put all
+three expert routes behind the CPU-expert baseline: `resident-raw` measures
+~7.2 tok/s and `widen` slower still, versus ~17 tok/s with the exact CPU
+expert fallback plus the GPU dense/shared path (`--hip-ordered-fp8-layers 43
+--hip-fused-shared-ffn 1`). The historical 35.4 tok/s resident figure predates
+the current kernels; the RDNA4 raw/LUT expert GEMM and the per-layer streaming
+uploads are now the cost. The recommended stable-fast config is the CPU-expert
+dual (or single) run at 0/64 argmax mismatches.
+
 ## Long-context stability and speculative-decode probe
 
 The real HIP harness now accepts `DS4F_MAXPOS` and can warm a synthetic KV
