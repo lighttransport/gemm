@@ -75,6 +75,13 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "K3_IQ1_LOAD_ERROR model=%s\n", model_path);
         return 4;
     }
+    if (std::getenv("K3_IQ1_VOCAB_ONLY")) {
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        std::fprintf(stderr, "K3_IQ1_VOCAB_PASS vocab=%d\n",
+                     llama_vocab_n_tokens(vocab));
+        llama_model_free(model);
+        return 0;
+    }
     const llama_vocab * vocab = llama_model_get_vocab(model);
     int n_prompt = -llama_tokenize(vocab, prompt, std::strlen(prompt),
                                    nullptr, 0, true, true);
