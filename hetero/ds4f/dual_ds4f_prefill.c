@@ -25,6 +25,7 @@ struct dual_ds4f_prefill {
     int verbose;
     int cuda_mxfp4;
     int max_batch;
+    int small_buckets;
     /* Captured HIP layer-residency entry points.  gpu_dense_ctx becomes the
      * dual wrapper, so the MXFP4 expert streaming callbacks must be forwarded
      * to the wrapped HIP runner or they would dereference the dual struct as a
@@ -35,10 +36,12 @@ struct dual_ds4f_prefill {
 
 static int cuda_eligible(const dual_ds4f_prefill *c, const ds4f_tensor *t,
                          int M, int Ys, int Xs) {
-    /* Keep the exact CPU fallback for small routed buckets.  CUDA is used
-     * only once a full x128 batch is available; this avoids partial-tile
-     * instability and limits long-context accumulation drift. */
-    return c && c->cuda_mxfp4 && t && t->type == DS4F_MXFP4 && t->w && t->scale && M >= 128 &&
+    /* Keep the exact CPU fallback for small routed buckets by default.  CUDA
+     * is used only once a full x128 batch is available; this avoids partial-tile
+     * instability and limits long-context accumulation drift.  c->small_buckets
+     * opts into the padded small-bucket path (the MMQ pads internally). */
+    int mmin = c->small_buckets ? 1 : 128;
+    return c && c->cuda_mxfp4 && t && t->type == DS4F_MXFP4 && t->w && t->scale && M >= mmin &&
            Ys == t->rows && Xs == t->cols && (t->rows % 128) == 0 &&
            (t->cols % 32) == 0;
 }
@@ -156,18 +159,23 @@ void dual_ds4f_prefill_set_max_batch(dual_ds4f_prefill *c, int max_batch) {
     if (c) c->max_batch = max_batch;
 }
 
+void dual_ds4f_prefill_set_cuda_small_buckets(dual_ds4f_prefill *c, int on) {
+    if (c) c->small_buckets = on ? 1 : 0;
+}
+
 int dual_ds4f_prefill_bind_tensor(dual_ds4f_prefill *c, ds4f_tensor *t) {
     if (!c || !t) return -1;
     /* CUDA owns raw MXFP4 in dual mode and uploads only the current matrix;
      * avoid duplicating the complete expert bank in HIP VRAM.  A nonnegative
      * sentinel keeps the common dispatcher eligible for batched prefill. */
     /* Only claim MXFP4 for CUDA when this run can actually reach the SM120
-     * MMQ path's M >= 128.  Otherwise the sentinel makes the common
+     * MMQ path's M >= 128, or when small-bucket routing is opted in (the MMQ
+     * pads internally).  Otherwise the sentinel makes the common
      * dispatcher treat the tensor as device-owned, and every routed-expert
      * group then fails over one task at a time instead of using the fused CPU
      * multi-GEMM dispatch. */
     if (t->type == DS4F_MXFP4 && c->cuda_mxfp4 &&
-        (c->max_batch <= 0 || c->max_batch >= 128)) {
+        (c->max_batch <= 0 || c->max_batch >= 128 || c->small_buckets)) {
         if (!t->w || !t->scale || t->rows <= 0 || t->cols <= 0) return -1;
         t->gpu_id = 0;
         return 0;
@@ -281,7 +289,7 @@ int dual_ds4f_prefill_gemm(void *opaque, float *dst, const ds4f_tensor *t,
                            const float *x, int M, int Ys, int Xs) {
     dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
     if (!c || !dst || !t || !x) return -1;
-    if (t->type == DS4F_MXFP4 && M < 128) return -1;
+    if (t->type == DS4F_MXFP4 && !c->small_buckets && M < 128) return -1;
     if (cuda_eligible(c, t, M, Ys, Xs) &&
         dual_cuda_one(c, dst, t, x, M, Ys, Xs) == 0)
         return 0;
@@ -295,9 +303,10 @@ int dual_ds4f_prefill_gemm_multi(
     dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
     if (!c || !dst || !t || !x || !M || !Ys || !Xs || n < 1 || n > 32)
         return -1;
-    for (int i = 0; i < n; ++i)
-        if (t[i] && t[i]->type == DS4F_MXFP4 && M[i] < 128)
-            return -1; /* force ds4f_gemm()'s exact CPU fallback */
+    if (!c->small_buckets)
+        for (int i = 0; i < n; ++i)
+            if (t[i] && t[i]->type == DS4F_MXFP4 && M[i] < 128)
+                return -1; /* force ds4f_gemm()'s exact CPU fallback */
     int ci[32], hi[32], nc = 0, nh = 0;
     for (int i = 0; i < n; ++i) {
         if (cuda_eligible(c, t[i], M[i], Ys[i], Xs[i])) ci[nc++] = i;

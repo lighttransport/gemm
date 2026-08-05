@@ -604,6 +604,19 @@ upload -- engaging it would not help even if the buckets were larger. Dual
 mode is currently single-GPU parity plus an idle CUDA context; making the
 NVIDIA card earn its place needs resident experts, not a better kernel.
 
+**Measured prefill case (2026-08-05).** `--dual-cuda-small-buckets 1` opts the
+owned MXFP4 experts into the padded small-bucket SM120 path (verified
+numerically correct at M=1--64 for the real N=2048/K=4096 shapes). At batch 64
+on 43 layers it measures **6.34 tok/s with 3/64 argmax mismatches** versus
+**17.6 tok/s at 0/64** for the exact CPU-expert default (`--hip-ordered-fp8-
+layers 43 --hip-fused-shared-ffn 1`). The 16.5 GB owned expert bank is used
+once per layer in order and does not fit the ~12 GB CUDA budget, so a single
+prefill pays the full PCIe weight upload; the SM120 activation quantization
+adds the argmax drift. CUDA experts only pay off for a long-lived server whose
+resident weight cache amortizes the upload across many prompts -- and even then
+the result is approximate. The exact prefill best is ROCm dense/shared + CPU
+experts.
+
 The historical measurements below predate these fixes.
 
 The bridge gates pass at M=64 and M=128, and the direct small-bucket path
