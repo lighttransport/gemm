@@ -7,7 +7,9 @@
 #include <math.h>
 
 typedef struct { unsigned int x, y, z; } ds4f_u3;
-#define DS4F_CUDA_MXFP4_CACHE_SLOTS 32
+/* ~1000 slots = ~12 GB of expert tensors (the whole owned bank is ~16.5 GB;
+ * a resident-weight server keeps what fits and streams the rest). */
+#define DS4F_CUDA_MXFP4_CACHE_SLOTS 1024
 typedef struct {
     const void *wkey, *skey;
     CUdeviceptr d;
@@ -44,7 +46,13 @@ cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
     if (cuewInit(CUEW_INIT_CUDA) != CUEW_SUCCESS || cuInit(0) != CUDA_SUCCESS) return NULL;
     cuda_ds4f_mxfp4 *c = (cuda_ds4f_mxfp4 *)calloc(1, sizeof(*c)); if (!c) return NULL;
     c->verbose = verbose;
-    c->cache_limit = (size_t)512 * 1024 * 1024;
+    c->cache_limit = (size_t)12 * 1024 * 1024 * 1024;
+    {   const char *e = getenv("DS4F_CUDA_MXFP4_CACHE_MB");
+        if (e && *e) {
+            long mb = atol(e);
+            if (mb > 0) c->cache_limit = (size_t)mb * 1024 * 1024;
+        }
+    }
     c->active_cache_slot = -1;
     if (ck(cuDeviceGet(&c->dev, device_id), "device") ||
         ck(cuDevicePrimaryCtxRetain(&c->ctx, c->dev), "context") ||
@@ -173,7 +181,14 @@ static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
     const int use64 = M < 128;
     const int Mp = use64 ? (M < 64 ? 64 : M) : ((M + 127) & ~127);
     size_t xb = (size_t)Mp * K * sizeof(float), q8b = (size_t)Mp * ((K + 255) & ~255) / 256 * 144 + 256 * 144, yb = (size_t)Mp * N * sizeof(float);
-    if (!c->x || c->xb < xb) { if (c->x) cuMemFree(c->x); if (cuMemAlloc(&c->x, xb) != CUDA_SUCCESS) return -1; c->xb = xb; }
+    if (!c->x || c->xb < xb) {
+        if (c->x) cuMemFree(c->x);
+        if (cuMemAlloc(&c->x, xb) != CUDA_SUCCESS) return -1;
+        c->xb = xb;
+        /* The padded rows (M..Mp) must read as zero; zero the device buffer
+         * once and only upload the M real rows each call. */
+        if (cuMemsetD8(c->x, 0, xb) != CUDA_SUCCESS) return -1;
+    }
     if (!c->q8 || c->q8b < q8b) { if (c->q8) cuMemFree(c->q8); if (cuMemAlloc(&c->q8, q8b) != CUDA_SUCCESS) return -1; c->q8b = q8b; }
     if (!c->y || c->yb < yb) { if (c->y) cuMemFree(c->y); if (cuMemAlloc(&c->y, yb) != CUDA_SUCCESS) return -1; c->yb = yb; }
     if (!out) out = c->y;
@@ -190,9 +205,8 @@ static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
         if (cuMemHostAlloc(&c->hy, yb, 0) != CUDA_SUCCESS) return -1;
         c->hyb = yb;
     }
-    memset(c->hx, 0, xb);
     memcpy(c->hx, x, (size_t)M * K * sizeof(float));
-    CUresult xr = cuMemcpyHtoD(c->x, c->hx, xb);
+    CUresult xr = cuMemcpyHtoD(c->x, c->hx, (size_t)M * K * sizeof(float));
     if (xr != CUDA_SUCCESS || cuCtxSynchronize() != CUDA_SUCCESS) return -1;
     long long ne00 = K, s01 = K, ne0 = (K + 511) & ~511;
     int by = ((int)ne0 + 63) / 64;
@@ -240,7 +254,7 @@ static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
             cuStreamSynchronize(c->stream) != CUDA_SUCCESS) return -1;
     }
     if (copy_back) {
-        if (cuMemcpyDtoH(c->hy, out, yb) != CUDA_SUCCESS) return -1;
+        if (cuMemcpyDtoH(c->hy, out, (size_t)M * N * sizeof(float)) != CUDA_SUCCESS) return -1;
         for (int r = 0; r < M; ++r)
             memcpy(dst + (size_t)r * N, (float *)c->hy + (size_t)r * N,
                    (size_t)N * sizeof(float));
@@ -317,7 +331,7 @@ int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x,
                        c->stream, aa, NULL) != CUDA_SUCCESS ||
         cuStreamSynchronize(c->stream) != CUDA_SUCCESS)
         return -1;
-    if (cuMemcpyDtoH(c->hy, c->y, yb) != CUDA_SUCCESS)
+    if (cuMemcpyDtoH(c->hy, c->y, (size_t)M * N * sizeof(float)) != CUDA_SUCCESS)
         return -1;
     for (int r = 0; r < M; ++r)
         memcpy(dst + (size_t)r * N, (float *)c->hy + (size_t)r * N,
