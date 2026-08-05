@@ -271,3 +271,39 @@ persistent team per layer with the inner `parallel for` becoming `omp for`.
 That is now justified by data rather than by the assumption it was dismissed on,
 but it touches `k3_full_runner.c`, `k3_kernels.h`, `k3_moe.h` and
 `common/ggml_dequant.h` together and should be its own piece of work.
+
+## The persistent-team restructuring: built, measured, reverted
+
+Built it for the KDA path (the 69-layer majority): task lists for all three
+projection batches constructed before one `#pragma omp parallel`, with `omp for`
+per batch, `omp single` for the scalar stretches (conv step, L2 normalise,
+log-decay, the expf loop, gated RMS norm) and
+`k3_kda_step_decay_team_sve` — which already exists as an `omp for` designed to
+reuse an outer team — in the middle. Correct: the layer-2 output hash stayed
+`02e4dc4b1746567a`.
+
+Three reps each, layer 2, 12 nodes, 512 samples:
+
+| | layer ms | attention ms |
+|---|---|---|
+| persistent team | 2.195 / 1.904 / 2.041 | 0.862 / 0.703 / 0.778 |
+| pre-team | 1.851 / 2.353 / 2.013 | 0.583 / 0.881 / 0.668 |
+
+Means 2.047 vs 2.072 — 1.2% apart inside a ±12% spread. **No effect.** Reverted.
+
+Why the perf data pointed the wrong way: `__kmp_fork_barrier` at 37% is threads
+*waiting*, and a persistent team does not remove the waiting. Every `omp for`
+and `omp single` carries an implicit barrier, so ~4 region entries became ~6
+in-region barriers across the same 48 threads. The fork/join went away; the
+synchronization did not, and the synchronization was the cost.
+
+**What this implies for the next attempt.** The lever is the *number of
+synchronization points* per layer and the *team size*, not the team's lifetime.
+Two things already point that way and are cheap to test:
+
+- 24 threads with `OMP_WAIT_POLICY=active` measured 2.072/2.072 — the same mean
+  as 48 threads but reproducible, where 48 swings 2.05-2.35. Barriers get
+  cheaper with fewer threads, and KDA has only 8 local heads to spread anyway.
+- The KDA layer has ~6 dependency-ordered stages. Merging stages that do not
+  actually depend on each other (the decay batch needs only the qkv batch, not
+  the conv step) would remove barriers outright rather than relocating them.
