@@ -175,3 +175,49 @@ The same argument likely applies to `attention` and to `moe_dispatch` /
 `dispatch_proj`, which are also small projections in their own regions. That is
 the next piece of work, and it is a restructuring of where parallel regions
 begin and end across a layer, not kernel tuning.
+
+## The parallel-region hypothesis was wrong; the schedule was the bug
+
+Premise going in: the small phases are dominated by OpenMP region-entry cost, so
+a layer should hold one persistent team. **Measured, that premise is false.** An
+empty parallel region at 48 threads costs 10.6 us back-to-back and 18.5 us when
+threads idle between regions (8.9 / 12.2 with `OMP_WAIT_POLICY=active`). The
+shared-expert block uses two regions — ~37 us against its 0.711 ms. Region entry
+is a few percent, not the problem, and the restructuring was not done.
+
+Timing the three shared-expert calls standalone at their staged shapes
+(`local_shared = 6144/12 = 512`, so gate/up are 512x7168 and down is 7168x512)
+found the real defect — and it was self-inflicted:
+
+| schedule, 48 threads | gate+up | down | total |
+|---|---|---|---|
+| **static** | 0.025 ms (577 GB/s) | 0.025 (296 GB/s) | **0.052** |
+| guided | 0.074 | 0.311 (23.6 GB/s) | 0.390 |
+| dynamic | 0.075 | 0.105 | 0.184 |
+
+The commit that made `full_bf16_many` use `schedule(guided)` was measured on a
+*heterogeneous* batch — a whole layer's projections, columns spanning
+512..12288 — where guided is 1.36x. For a *homogeneous* batch of equal-cost
+8 KB tasks, guided's chunk arithmetic and shared counter dominate and it is
+**7.5x slower** than static. The shared expert is exactly that case.
+
+Fix: choose the schedule from the batch's shape — static when every `cols[i]`
+matches, guided otherwise, selected with `omp_set_schedule` + `schedule(runtime)`
+so there is still one loop body.
+
+Layer 3, 12 nodes, 512 samples, two reps:
+
+| phase | guided everywhere | per-batch choice |
+|---|---|---|
+| **layer** | 4.303 | **2.86** (1.51x) |
+| attention | 1.855 | 1.34 |
+| moe_collective | 0.933 | 0.56 |
+| moe_shared | 0.711 | 0.35 |
+| moe_finish | 0.583 | 0.30 |
+| moe_expert | 0.479 | 0.37 |
+
+The layer12 output hash is byte-identical (`02e4dc4b1746567a`), as it must be —
+scheduling cannot change results here.
+
+Extrapolated, 2.86 ms x 93 = 266 ms/token = 3.76 tok/s, against 2.19 before and
+the 96-node measured 1.699. Attention remains the largest phase at 47%.

@@ -907,18 +907,30 @@ static void full_bf16_many(float *const *outs,
     }
 #if defined(_OPENMP)
     omp_set_num_threads(workers > 0 ? workers : 1);
-    /* Guided, not static.  The task list mixes projections whose column counts
-     * span 512..12288, so a static split hands some threads several times the
-     * work of others and the team waits on the slowest.  Measured on a layer's
-     * worth of bf16 projections (861 eight-row tasks, 47 threads):
-     * static 1.170 ms, static,1 0.830, dynamic 0.485, guided 0.453.
+    /* Pick the schedule from the batch's shape, because the two cases want
+     * opposite answers and the difference is large in both directions.
      *
-     * This also explains away an apparent memory-bandwidth cliff: under static
-     * the same work ran faster on 30 threads than on 47, which looks like
-     * bandwidth contention and is really the imbalance changing shape with the
-     * chunk boundaries.  Under guided the thread count stops mattering.
-     * Each task writes its own output rows, so scheduling cannot change results. */
-#pragma omp parallel for schedule(guided)
+     * Heterogeneous batches (a whole layer's projections, columns spanning
+     * 512..12288) must not use static: it hands some threads several times the
+     * work of others.  861 eight-row tasks at 47 threads: static 1.170 ms,
+     * static,1 0.830, dynamic 0.485, guided 0.453.
+     *
+     * Homogeneous batches want static.  The shared expert is two 512x7168
+     * projections then one 7168x512 -- all equal-cost tasks -- and at 48
+     * threads guided costs 0.390 ms against static's 0.052, a 7.5x loss,
+     * because guided's chunk arithmetic and shared counter dominate when every
+     * task is 8 KB.  An earlier version of this code used guided for both and
+     * regressed the moe_shared phase accordingly.
+     *
+     * Each task writes its own output rows, so scheduling cannot change
+     * results either way. */
+    int homogeneous = 1;
+    for (int i = 1; i < count; ++i)
+        if (cols[i] != cols[0]) { homogeneous = 0; break; }
+#if defined(_OPENMP)
+    omp_set_schedule(homogeneous ? omp_sched_static : omp_sched_guided, 0);
+#endif
+#pragma omp parallel for schedule(runtime)
 #endif
     for (int i = 0; i < n; ++i) {
         full_bf16_run_task(&tasks[i]);
