@@ -583,17 +583,18 @@ gate default. Set `HIP_ORDERED_FP8_LAYERS=0` to run the fast reduction.
 **Fused shared FFN (2026-08-05).** The shared-expert `sh_w1/sh_w3 -> SwiGLU ->
 sh_w2` chain can run with the two `[M, shared_inter]` intermediates kept
 resident on the RDNA4 card (`--hip-fused-shared-ffn 1`, or
-`HIP_FUSED_SHARED_FFN=1` for `real-dual-test`): only `x` is uploaded and only
-`[M, hidden]` comes back, replacing the two download / two upload round trips
-of the unfused chain. Its SiLU is a bit-exact port of glibc 2.39's `__expf`
-(the `__exp2f_data` table, `rint` range reduction, explicit `fma` polynomial)
-and is compiled into its own always-precise HIPRTC module, because clang's
-`-ffast-math` turns the SiLU division into an approximate reciprocal even
-through `__fdiv_rn`. Keeping it separate means the dense module's math mode --
-and therefore its GEMM results -- are untouched, so the fused chain is
-bit-identical to the unfused one. Validated at `0` argmax mismatches with
-`HIP_FUSED_SHARED_FFN=1 HIP_ORDERED_FP8_LAYERS=43` at batch 64, batch 128, and
-4k context, on the staged EP=8 shard.
+`HIP_FUSED_SHARED_FFN=1` for `real-dual-test`, which now enables it by
+default): only `x` is uploaded and only `[M, hidden]` comes back, replacing
+the two download / two upload round trips of the unfused chain. Its SiLU is a
+bit-exact port of glibc 2.39's `__expf` (the `__exp2f_data` table, `rint`
+range reduction, explicit `fma` polynomial) and is compiled into its own
+always-precise HIPRTC module, because clang's `-ffast-math` turns the SiLU
+division into an approximate reciprocal even through `__fdiv_rn`. Keeping it
+separate means the dense module's math mode -- and therefore its GEMM results
+-- are untouched, so the fused chain is bit-identical to the unfused one.
+Validated at `0` argmax mismatches with `HIP_FUSED_SHARED_FFN=1
+HIP_ORDERED_FP8_LAYERS=43` at batch 64, batch 128, and 4k context, on the
+staged EP=8 shard.
 
 **CUDA is nonetheless inert at realistic batch sizes.** `--hip-verbose 1`
 reports every dispatched task as `cuda=0`: routed-expert buckets top out well
@@ -686,6 +687,12 @@ On 16-GB-class RDNA4 cards, `"hip_mxfp4_resident_layers": 20` keeps the first
 20 local expert layers resident in compact raw form and streams the remainder;
 this measured 35.4 tok/s for full 43-layer batch-64 prefill with zero argmax
 mismatches.
+
+These MXFP4 expert streaming options are single-GPU HIP features. The dual
+dispatcher owns expert routing and keeps small buckets on the exact CPU path,
+so streaming would only upload weights it never uses; `--dual-gpu 1` leaves
+the layer-residency callbacks off (they previously crashed because the dual
+wrapper swapped `gpu_dense_ctx` out from under the raw HIP entry points).
 
 ## Long-context stability and speculative-decode probe
 

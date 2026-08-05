@@ -119,7 +119,7 @@ real-dual-test: $(BUILD)/test_hip_ds4f_real
 		--hip-device $(or $(HIP_DEVICE),0) --hip-verbose $(or $(HIP_VERBOSE),0) \
 		--hip-exact-prefill $(or $(HIP_EXACT_PREFILL),0) \
 		--hip-ordered-fp8-layers $(or $(HIP_ORDERED_FP8_LAYERS),$(or $(LAYERS),43)) \
-		--hip-fused-shared-ffn $(or $(HIP_FUSED_SHARED_FFN),0)
+		--hip-fused-shared-ffn $(or $(HIP_FUSED_SHARED_FFN),1)
 
 forward-hip-test: $(BUILD)/test_hip_ds4f_forward
 	$(BUILD)/test_hip_ds4f_forward
