@@ -614,16 +614,19 @@ NVIDIA card earn its place needs resident experts, not a better kernel.
 
 **Measured prefill case (2026-08-05).** `--dual-cuda-small-buckets 1` opts the
 owned MXFP4 experts into the padded small-bucket SM120 path (verified
-numerically correct at M=1--64 for the real N=2048/K=4096 shapes). At batch 64
-on 43 layers it measures **~6.5 tok/s with argmax mismatches** versus
-**~43 tok/s at 0/64** for the exact CPU-expert default (`--hip-ordered-fp8-
-layers 43 --hip-fused-shared-ffn 1`, threads = `nproc`). The 16.5 GB owned
-expert bank is used once per layer in order and does not fit the ~12 GB CUDA
-budget, so a single prefill pays the full PCIe weight upload; the SM120
-activation quantization adds the argmax drift. CUDA experts only pay off for a
-long-lived server whose resident weight cache amortizes the upload across many
-prompts -- and even then the result is approximate. The exact prefill best is
-ROCm dense/shared + CPU experts.
+numerically correct at M=1--64 for the real N=2048/K=4096 shapes). With the
+hybrid split (`--dual-cuda-resident-from 12`: layers 0-11 stay CPU-exact, 12+
+route to the SM120 with the ~12 GB weight cache), the first prefill pays the
+weight upload (~22 tok/s at batch 64) and the cached re-runs reach **~50
+tok/s** versus **~43 tok/s at 0/64** for the exact CPU-expert default
+(`--hip-ordered-fp8-layers 43 --hip-fused-shared-ffn 1`, threads = `nproc`)
+-- about a 15-20% gain, approximate (~1/64 mismatch). At batch 256 it
+regresses (~27 vs ~40) because each expert GEMM pays four stream
+synchronizations and the per-distinct-tensor weight load; the cache fills
+correctly (up to ~12 GB) but the per-call sync overhead does not amortize.
+Making the CUDA path async (one sync per dispatch, batched loads) is the
+follow-up needed to extend the gain to larger batches. The exact prefill best
+is ROCm dense/shared + CPU experts.
 
 The historical measurements below predate these fixes.
 
