@@ -612,21 +612,38 @@ upload -- engaging it would not help even if the buckets were larger. Dual
 mode is currently single-GPU parity plus an idle CUDA context; making the
 NVIDIA card earn its place needs resident experts, not a better kernel.
 
-**Measured prefill case (2026-08-05).** `--dual-cuda-small-buckets 1` opts the
+**Measured prefill case (2026-08-06).** `--dual-cuda-small-buckets 1` opts the
 owned MXFP4 experts into the padded small-bucket SM120 path (verified
 numerically correct at M=1--64 for the real N=2048/K=4096 shapes). With the
-hybrid split (`--dual-cuda-resident-from 12`: layers 0-11 stay CPU-exact, 12+
-route to the SM120 with the ~12 GB weight cache), the first prefill pays the
-weight upload (~22 tok/s at batch 64) and the cached re-runs reach **~50
-tok/s** versus **~43 tok/s at 0/64** for the exact CPU-expert default
-(`--hip-ordered-fp8-layers 43 --hip-fused-shared-ffn 1`, threads = `nproc`)
--- about a 15-20% gain, approximate (~1/64 mismatch). At batch 256 it
-regresses (~27 vs ~40) because each expert GEMM pays four stream
-synchronizations and the per-distinct-tensor weight load; the cache fills
-correctly (up to ~12 GB) but the per-call sync overhead does not amortize.
-Making the CUDA path async (one sync per dispatch, batched loads) is the
-follow-up needed to extend the gain to larger batches. The exact prefill best
-is ROCm dense/shared + CPU experts.
+hybrid split (`--dual-cuda-resident-from 21`: layers 0-20 stay CPU-exact,
+21+ route to the SM120 with the 10 GB weight cache; ~22 layers fit -- the
+RTX 5060 Ti's real cudaMalloc ceiling is ~11 GB of its 16 GB), the expert
+dispatches go through the async batch (`cuda_ds4f_mxfp4_gemm_batch`): weights
+are preloaded before the timed prefill, the whole dispatch queues on one
+stream with a single sync, and the two-term activation residual is computed
+by the `mmqv_mxfp4_residual` device kernel instead of on the host. A stale
+`c->y` output pointer (evaluated at the call site, then realloc'd inside
+`gemm_once`) used to corrupt the context and forced per-task fallbacks;
+fixed, the batch runs every dispatch with zero fallbacks and compute-sanitizer
+is clean.
+
+Hybrid prefill (terms=2) vs the exact CPU-expert default
+(`--hip-ordered-fp8-layers 43 --hip-fused-shared-ffn 1`, threads = `nproc`):
+
+| batch | hybrid | exact | delta |
+|---:|---:|---:|---|
+| 256 | 47.7 | 40.7 | +17% |
+| 512 | 42.9 | 35.6 | +20% |
+| 1024 | 33.2 | 24.1 | +38% |
+| 2048 | 24.5 | 23.8 | +3% |
+| 4096 | 15.3 | 13.7 | +12% |
+
+The route is approximate (~1/64 at batch 64 small buckets; the exact default
+stays 0/64). The 1k--2k prefill gain is the target for the resident-weight
+server: the CPU-exact head layers 0-20 still dominate once the CUDA tail is
+fast, and their routed-expert GEMM degrades at large batch -- the next lever
+is covering more layers (or streaming the weights) as the cache allows.
+
 
 The historical measurements below predate these fixes.
 
