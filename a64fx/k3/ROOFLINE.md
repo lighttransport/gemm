@@ -307,3 +307,34 @@ Two things already point that way and are cheap to test:
 - The KDA layer has ~6 dependency-ordered stages. Merging stages that do not
   actually depend on each other (the decay batch needs only the qkv batch, not
   the conv step) would remove barriers outright rather than relocating them.
+
+## 48 threads is a cliff; 47 is optimal
+
+`run_k3_full_12n.sh` defaulted to `THREADS=48`, i.e. all 48 compute cores with
+none left for the runtime. Every layer measurement earlier in this document was
+taken there. Two reps each, after the schedule fix and the active wait policy:
+
+| threads | 24 | 32 | 40 | 44 | **47** | 48 |
+|---|---|---|---|---|---|---|
+| KDA layer ms | 2.070 | 1.768 | 1.606 | 1.542 | **1.508** | 2.180 |
+| MLA layer ms | — | 2.083 | 1.996 | — | **1.965** | 2.503 |
+
+Monotonic improvement from 24 to 47 and then a 45% jump at 48 — a cliff, not a
+curve, and it reproduces the note already in this repo that 48 pinned OMP
+threads on 48 compute cores costs ~40%. The earlier reading that "24 and 32 beat
+48" was really "anything beats 48"; the true optimum is 47.
+
+Default changed to 47. The production 96-node scripts already used 47.
+
+Corrected extrapolation: 69 x 1.508 + 24 x 1.965 = **151 ms/token = 6.6 tok/s**,
+against 4.40 before this and 2.19 at the start of the day.
+
+## Not attempted: merging the independent KDA stages
+
+The decay batch depends only on the qkv batch, not on the conv step that
+currently sits between them, so that barrier is removable by reordering (and
+`b_proj` reads only `x`, so it could move into the first batch outright). Worth
+doing, not attempted here. Given that the persistent-team restructuring above
+turned out to be worth 1.2% and the thread count was worth 45%, the ordering
+question deserves the same "measure a small change first" treatment rather than
+being assumed to matter.
