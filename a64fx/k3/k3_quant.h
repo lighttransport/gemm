@@ -159,6 +159,23 @@ static inline float k3_quant_dot_row_ref(const uint8_t *row, int type,
     return (float)sum;
 }
 
+static inline int k3_quant_dequant_row(float *out, const uint8_t *row,
+                                       int type, int cols) {
+    if (!out || !row || cols <= 0) return -1;
+    if (type == K3_Q_F32) {
+        memcpy(out, row, (size_t)cols * sizeof(float));
+        return 0;
+    }
+    if (type == K3_Q_BF16) {
+        const uint16_t *w = (const uint16_t *)row;
+        for (int i = 0; i < cols; ++i) out[i] = bf16_to_f32_scalar(w[i]);
+        return 0;
+    }
+    uint32_t gt = k3_quant_ggml_type(type);
+    if (gt == 0xffffffffu || dequant_row(gt, row, out, cols)) return -1;
+    return 0;
+}
+
 static inline float k3_quant_dot_row(const uint8_t *row, int type,
                                      const float *x, int cols) {
     /* Keep the first production path source-faithful.  This also handles the

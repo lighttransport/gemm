@@ -1606,10 +1606,24 @@ static int full_forward_token(k3_full_model *m, int token, int position) {
     m->block_count = 0;
     memset(m->hidden, 0, K3_HIDDEN * sizeof(float));
     if (token >= m->embed_start && token < m->embed_start + m->embed_rows) {
-        const uint16_t *row = (const uint16_t *)m->embed.data +
-            (size_t)(token - m->embed_start) * K3_HIDDEN;
-        for (int i = 0; i < K3_HIDDEN; ++i)
-            m->hidden[i] = bf16_to_f32_scalar(row[i]);
+        int row = token - m->embed_start;
+        if (m->embed.dtype == 1) {
+            const uint16_t *w = (const uint16_t *)m->embed.data +
+                (size_t)row * K3_HIDDEN;
+            for (int i = 0; i < K3_HIDDEN; ++i)
+                m->hidden[i] = bf16_to_f32_scalar(w[i]);
+        } else if (m->embed.dtype == 2) {
+            memcpy(m->hidden, m->embed.data +
+                   (size_t)row * K3_HIDDEN * sizeof(float),
+                   K3_HIDDEN * sizeof(float));
+        } else {
+            int qt = K3_Q_Q8_0 + (m->embed.dtype - K3_FULL_DTYPE_Q8_0);
+            size_t row_bytes = k3_quant_row_bytes(qt, K3_HIDDEN);
+            if (m->embed.dtype < K3_FULL_DTYPE_Q8_0 ||
+                m->embed.dtype > K3_FULL_DTYPE_IQ3_XXS ||
+                k3_quant_dequant_row(m->hidden, m->embed.data +
+                    (size_t)row * row_bytes, qt, K3_HIDDEN)) return EINVAL;
+        }
     }
     if (full_sum(m, m->hidden, K3_HIDDEN)) return EIO;
     for (int layer = 0; layer < K3_LAYERS; ++layer) {
