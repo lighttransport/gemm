@@ -10,4 +10,10 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *ctx, const uint8_t *w,
                          const uint8_t *scale, int rows, int cols);
 int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *ctx, float *dst, const float *x,
                          int tokens, int rows, int cols);
+int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *ctx, int n,
+                               float *const *dst, const uint8_t *const *w,
+                               const uint8_t *const *s, const float *const *x,
+                               const int *M, const int *rows, const int *cols);
+int cuda_ds4f_mxfp4_warm(cuda_ds4f_mxfp4 *ctx, const uint8_t *w,
+                         const uint8_t *scale, int rows, int cols);
 #endif

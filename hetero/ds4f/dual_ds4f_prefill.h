@@ -24,6 +24,9 @@ void dual_ds4f_prefill_set_cuda_small_buckets(dual_ds4f_prefill *ctx, int on);
  * must stay CPU-owned rather than carrying a device sentinel. */
 void dual_ds4f_prefill_set_max_batch(dual_ds4f_prefill *ctx, int max_batch);
 int dual_ds4f_prefill_bind_tensor(dual_ds4f_prefill *ctx, ds4f_tensor *t);
+/* Preload an expert weight into the CUDA cache so the async batch path runs
+ * (its GEMMs overlap on the stream; cold weights fall back to per-call). */
+int dual_ds4f_prefill_warm(dual_ds4f_prefill *ctx, const ds4f_tensor *t);
 void dual_ds4f_prefill_attach_model(ds4f_model *model,
                                     dual_ds4f_prefill *ctx);
 

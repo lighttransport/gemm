@@ -903,6 +903,22 @@ int main(int argc, char **argv) {
             }
         }
     }
+    if (dual && dual_cuda_small && dual_cuda_resident_from > 0) {
+        fprintf(stderr, "preloading CUDA resident expert weights (layers %d..%d)\n",
+                dual_cuda_resident_from, cfg.n_layers - 1);
+        for (int L = dual_cuda_resident_from; L < cfg.n_layers && pass; ++L) {
+            ds4f_layer *z = &m->layers[L];
+            for (int e = 0; e < z->n_owned; ++e) {
+                if (dual_ds4f_prefill_warm(dual, &z->ex_w1[e]) < 0 ||
+                    dual_ds4f_prefill_warm(dual, &z->ex_w2[e]) < 0 ||
+                    dual_ds4f_prefill_warm(dual, &z->ex_w3[e]) < 0) {
+                    fprintf(stderr, "CUDA expert preload failed at layer=%d expert=%d\n", L, e);
+                    pass = 0;
+                    break;
+                }
+            }
+        }
+    }
     int head_id = -1;
     if (m->head.type == DS4F_BF16)
         head_id = hip_ds4f_dense_bind_bf16_tensor(hip, &m->head);

@@ -75,11 +75,35 @@ static int dual_cuda_one(dual_ds4f_prefill *c, float *dst,
 static void *dual_cuda_worker(void *opaque) {
     dual_job *j = (dual_job *)opaque;
     j->rc = 0;
-    for (int k = 0; k < j->n; ++k) {
-        int i = j->idx[k];
-        if (dual_cuda_one(j->ctx, j->dst[i], j->t[i], j->x[i], j->M[i],
-                          j->Ys[i], j->Xs[i]) != 0)
-            j->rc = -1;
+    if (j->n > 0) {
+        float *dst[32]; const ds4f_tensor *t[32]; const float *x[32];
+        int M[32], Ys[32], Xs[32];
+        const uint8_t *w[32], *s[32];
+        for (int k = 0; k < j->n; ++k) {
+            int i = j->idx[k];
+            dst[k] = j->dst[i]; t[k] = j->t[i]; x[k] = j->x[i];
+            M[k] = j->M[i]; Ys[k] = j->Ys[i]; Xs[k] = j->Xs[i];
+            w[k] = (const uint8_t *)t[k]->w; s[k] = t[k]->scale;
+        }
+        pthread_mutex_lock(&j->ctx->cuda_lock);
+        /* Async batch: all weights must already be resident (preloaded), so
+         * the GEMMs overlap on the stream and one sync serves the whole
+         * dispatch.  Falls back to per-call loads for a cold weight. */
+        static int no_batch = -1;
+        if (no_batch < 0) { const char *nb = getenv("DS4F_NO_BATCH"); no_batch = nb ? atoi(nb) : 0; }
+        int rc = no_batch ? -1
+                          : cuda_ds4f_mxfp4_gemm_batch(j->ctx->cuda, j->n, dst, w, s, x,
+                                                       M, Ys, Xs);
+        pthread_mutex_unlock(&j->ctx->cuda_lock);
+        if (rc == 0) return NULL;
+        if (getenv("DS4F_DBG_BATCH"))
+            fprintf(stderr, "BATCH FALLBACK n=%d\n", j->n);
+        for (int k = 0; k < j->n; ++k) {
+            int i = j->idx[k];
+            if (dual_cuda_one(j->ctx, j->dst[i], j->t[i], j->x[i], j->M[i],
+                              j->Ys[i], j->Xs[i]) != 0)
+                j->rc = -1;
+        }
     }
     return NULL;
 }
@@ -161,6 +185,19 @@ void dual_ds4f_prefill_set_max_batch(dual_ds4f_prefill *c, int max_batch) {
 
 void dual_ds4f_prefill_set_cuda_small_buckets(dual_ds4f_prefill *c, int on) {
     if (c) c->small_buckets = on ? 1 : 0;
+}
+
+/* Warm an expert weight into the CUDA cache so the async batch path can run.
+ * The repack + upload happen here (once per tensor), not inside the measured
+ * prefill.  Returns 0 on success, -1 if the tensor is not CUDA-eligible. */
+int dual_ds4f_prefill_warm(dual_ds4f_prefill *c, const ds4f_tensor *t) {
+    if (!c || !c->cuda || !t || t->type != DS4F_MXFP4 || !t->w || !t->scale)
+        return -1;
+    pthread_mutex_lock(&c->cuda_lock);
+    int rc = cuda_ds4f_mxfp4_warm(c->cuda, (const uint8_t *)t->w, t->scale,
+                                  t->rows, t->cols);
+    pthread_mutex_unlock(&c->cuda_lock);
+    return rc;
 }
 
 int dual_ds4f_prefill_bind_tensor(dual_ds4f_prefill *c, ds4f_tensor *t) {

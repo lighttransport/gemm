@@ -5,11 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 typedef struct { unsigned int x, y, z; } ds4f_u3;
 /* ~1000 slots = ~12 GB of expert tensors (the whole owned bank is ~16.5 GB;
  * a resident-weight server keeps what fits and streams the rest). */
-#define DS4F_CUDA_MXFP4_CACHE_SLOTS 1024
+#define DS4F_CUDA_MXFP4_CACHE_SLOTS 2048
 typedef struct {
     const void *wkey, *skey;
     CUdeviceptr d;
@@ -17,6 +18,11 @@ typedef struct {
     unsigned long long age;
     int rows, cols, valid;
 } cuda_mxfp4_cache_entry;
+typedef struct {
+    CUdeviceptr x, q8, y, y2, tmpfix;
+    float *hx, *hy, *hres;
+    size_t xb, q8b, yb, hxb, hresb, hyb2, fixb;
+} cuda_batch_buf;
 struct cuda_ds4f_mxfp4 {
     CUdevice dev; CUcontext ctx; CUmodule mod; CUfunction quant, quant_fp4, quant_rows, gemm, fixup, gemm64, fixup64, add;
     CUstream stream; CUevent quant_done;
@@ -28,6 +34,8 @@ struct cuda_ds4f_mxfp4 {
     unsigned long long cache_hits, cache_misses, cache_evictions;
     int active_cache_slot;
     int rows, cols, nsm; int verbose; int terms;
+    cuda_batch_buf *b;
+    int n_batch, cap_batch;
 };
 static ds4f_u3 fastdiv(unsigned long long d) {
     unsigned int L = 0, di = (unsigned int)d;
@@ -46,7 +54,7 @@ cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
     if (cuewInit(CUEW_INIT_CUDA) != CUEW_SUCCESS || cuInit(0) != CUDA_SUCCESS) return NULL;
     cuda_ds4f_mxfp4 *c = (cuda_ds4f_mxfp4 *)calloc(1, sizeof(*c)); if (!c) return NULL;
     c->verbose = verbose;
-    c->cache_limit = (size_t)12 * 1024 * 1024 * 1024;
+    c->cache_limit = (size_t)14 * 1024 * 1024 * 1024;
     {   const char *e = getenv("DS4F_CUDA_MXFP4_CACHE_MB");
         if (e && *e) {
             long mb = atol(e);
@@ -98,6 +106,17 @@ void cuda_ds4f_mxfp4_destroy(cuda_ds4f_mxfp4 *c) {
     if (c->hy && cuMemFreeHost) cuMemFreeHost(c->hy);
     if (c->hw && cuMemFreeHost) cuMemFreeHost(c->hw);
     if (c->hres && cuMemFreeHost) cuMemFreeHost(c->hres);
+    for (int i = 0; i < c->n_batch; ++i) {
+        if (c->b[i].x) cuMemFree(c->b[i].x);
+        if (c->b[i].q8) cuMemFree(c->b[i].q8);
+        if (c->b[i].y) cuMemFree(c->b[i].y);
+        if (c->b[i].y2) cuMemFree(c->b[i].y2);
+        if (c->b[i].tmpfix) cuMemFree(c->b[i].tmpfix);
+        if (c->b[i].hx && cuMemFreeHost) cuMemFreeHost(c->b[i].hx);
+        if (c->b[i].hy && cuMemFreeHost) cuMemFreeHost(c->b[i].hy);
+        if (c->b[i].hres && cuMemFreeHost) cuMemFreeHost(c->b[i].hres);
+    }
+    free(c->b);
     if (c->quant_done) cuEventDestroy(c->quant_done); if (c->stream) cuStreamDestroy(c->stream); if (c->mod) cuModuleUnload(c->mod);
     if (c->ctx) cuDevicePrimaryCtxRelease(c->dev); free(c);
 }
@@ -340,4 +359,188 @@ int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x,
         memcpy(dst + (size_t)r * N, (float *)c->hy + (size_t)r * N,
                (size_t)N * sizeof(float));
     return 0;
+}
+
+
+/* Async batched expert GEMM.  All tasks' quant -> gemm -> fixup (x2 for the
+ * two-term residual) are queued on the single stream so they overlap on the
+ * GPU; the host then syncs once and downloads every result.  Every weight must
+ * already be resident in the cache (preload): the batch records the cached
+ * device pointers, and a temp (non-cached) weight would be freed underneath a
+ * queued kernel, so it returns -1 and the caller falls back to the per-call
+ * path. */
+int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
+    float *const *dst, const uint8_t *const *w, const uint8_t *const *s,
+    const float *const *x, const int *M, const int *rows, const int *cols) {
+    static int dbg = -1, dbg_cnt = 0;
+    if (dbg < 0) { const char *d = getenv("DS4F_DBG_BATCH"); dbg = d ? atoi(d) : 0; }
+    struct timespec t0, t1;
+    if (dbg) clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (!c || n < 1 || n > 32 || cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL early n=%d c=%p\n", n, (void*)c); return -1; }
+    if (!cuMemHostAlloc || !cuMemFreeHost || !cuMemcpyHtoDAsync) { if (dbg) fprintf(stderr, "BATCHFAIL apis\n"); return -1; }
+    int failstage = 0; int failwhat = 0;
+    if (n > c->cap_batch) {
+        int cap = c->cap_batch ? c->cap_batch * 2 : 16;
+        if (cap < n) cap = n;
+        cuda_batch_buf *nb = (cuda_batch_buf *)realloc(c->b, (size_t)cap * sizeof(*nb));
+        if (!nb) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        memset(nb + c->cap_batch, 0, (size_t)(cap - c->cap_batch) * sizeof(*nb));
+        c->b = nb; c->cap_batch = cap;
+    }
+    c->n_batch = n;
+    int terms = c->terms < 2 ? 1 : 2;
+    CUdeviceptr dw[32]; int use64[32], Mp[32], sk[32], ntx[32], fix[32];
+    /* pass 1: load every weight; all must be resident (no temp). */
+    for (int i = 0; i < n; ++i) {
+        if (cuda_ds4f_mxfp4_load(c, w[i], s[i], rows[i], cols[i]) != 0) { if (dbg) fprintf(stderr, "BATCHFAIL load i=%d\n", i); return -1; }
+        if (c->active_cache_slot < 0) { if (dbg) fprintf(stderr, "BATCHFAIL temp i=%d\n", i); return -1; }   /* temp: not batch-safe */
+        dw[i] = c->w;
+        int N = rows[i], mm = M[i];
+        use64[i] = mm < 128;
+        Mp[i] = use64[i] ? (mm < 64 ? 64 : mm) : ((mm + 127) & ~127);
+        int nty = (N + 127) / 128, ntxv = use64[i] ? (Mp[i] + 63) / 64 : (Mp[i] + 127) / 128;
+        int tiles = nty * ntxv, waves = (tiles + c->nsm - 1) / c->nsm;
+        int eff = 100 * tiles / (c->nsm * waves);
+        int skv = tiles < c->nsm ? tiles : (eff >= 90 ? tiles : c->nsm);
+        if (skv < 1) skv = 1;
+        if (tiles == 1) skv = 1;
+        sk[i] = skv; ntx[i] = ntxv; fix[i] = (tiles % skv) != 0;
+        if (fix[i] && !c->fixup) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+    }
+    failstage = 1;
+    /* per-task fixup scratch, sized for each task's sk. */
+    for (int i = 0; i < n; ++i)
+        if (fix[i]) {
+            size_t fb = (size_t)sk[i] * 128 * 128 * sizeof(float);
+            if (fb > c->b[i].fixb) {
+                if (c->b[i].tmpfix) cuMemFree(c->b[i].tmpfix);
+                if (cuMemAlloc(&c->b[i].tmpfix, fb) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL tmpfix\n"); return -1; }
+                c->b[i].fixb = fb;
+            }
+        }
+    failstage = 1;
+    /* pass 2: per-task buffers (grow as needed). */
+    for (int i = 0; i < n; ++i) {
+        cuda_batch_buf *B = &c->b[i];
+        int K = cols[i], N = rows[i], mm = M[i];
+        size_t xb = (size_t)Mp[i] * K * sizeof(float);
+        size_t q8b = (size_t)Mp[i] * ((K + 255) & ~255) / 256 * 144 + 256 * 144;
+        size_t yb = (size_t)Mp[i] * N * sizeof(float);
+        if (xb > B->xb) {
+            if (B->x) cuMemFree(B->x);
+            CUresult arx = cuMemAlloc(&B->x, xb);
+            if (arx != CUDA_SUCCESS) { failwhat=1; if (dbg) { const char *es=NULL; if (cuGetErrorString) cuGetErrorString(arx, &es); fprintf(stderr, "BATCHFAIL stg%d what=%d err=%d %s\n", failstage, failwhat, arx, es?es:"?"); } return -1; }
+            B->xb = xb;
+            if (cuMemsetD8(B->x, 0, xb) != CUDA_SUCCESS) { failwhat=2; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; }
+        }
+        if (q8b > B->q8b) { if (B->q8) cuMemFree(B->q8); if (cuMemAlloc(&B->q8, q8b) != CUDA_SUCCESS) { failwhat=3; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; } B->q8b = q8b; }
+        if (yb > B->yb) {
+            if (B->y) cuMemFree(B->y);
+            CUresult ary = cuMemAlloc(&B->y, yb);
+            if (ary != CUDA_SUCCESS) { failwhat=4; if (dbg) { const char *es=NULL; if (cuGetErrorString) cuGetErrorString(ary, &es); fprintf(stderr, "BATCHFAIL stg%d what=%d err=%d %s\n", failstage, failwhat, ary, es?es:"?"); } return -1; }
+            B->yb = yb;
+            if (terms == 2) {
+                if (B->y2) cuMemFree(B->y2);
+                if (cuMemAlloc(&B->y2, yb) != CUDA_SUCCESS) { failwhat=5; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; }
+            }
+        }
+        if (B->hxb < xb) {
+            if (B->hx) cuMemFreeHost(B->hx);
+            B->hx = NULL; B->hxb = 0;
+            if (cuMemHostAlloc(&B->hx, xb, 0) != CUDA_SUCCESS) { failwhat=6; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; }
+            B->hxb = xb;
+        }
+        if (B->hyb2 < (size_t)mm * N * sizeof(float)) {
+            if (B->hy) cuMemFreeHost(B->hy);
+            B->hy = NULL; B->hyb2 = 0;
+            if (cuMemHostAlloc(&B->hy, (size_t)mm * N * sizeof(float), 0) != CUDA_SUCCESS) { failwhat=7; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; }
+            B->hyb2 = (size_t)mm * N * sizeof(float);
+        }
+        if (terms == 2 && B->hresb < xb) {
+            if (B->hres) cuMemFreeHost(B->hres);
+            B->hres = NULL; B->hresb = 0;
+            if (cuMemHostAlloc(&B->hres, xb, 0) != CUDA_SUCCESS) { failwhat=8; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; }
+            B->hresb = xb;
+        }
+    }
+    failstage = 2;
+    /* pass 3: queue everything on the stream (no syncs between tasks). */
+    for (int i = 0; i < n; ++i) {
+        cuda_batch_buf *B = &c->b[i];
+        int K = cols[i], N = rows[i], mm = M[i];
+        memcpy(B->hx, x[i], (size_t)mm * K * sizeof(float));
+        if (cuMemcpyHtoDAsync(B->x, B->hx, (size_t)mm * K * sizeof(float), c->stream) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        long long ne00 = K, s01 = K, ne0 = (K + 511) & ~511;
+        int by = ((int)ne0 + 63) / 64;
+        long long s02 = 0, s03 = 0;
+        int ne1 = Mp[i], ne2 = 1;
+        CUdeviceptr ids0 = 0;
+        void *qa[] = { &B->x, &ids0, &B->q8, &ne00, &s01, &s02, &s03, &ne0, &ne1, &ne2 };
+        if (cuLaunchKernel(c->quant_fp4, Mp[i], by, 1, 32, 1, 1, 0, c->stream, qa, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        ds4f_u3 bp = fastdiv((unsigned long long)K / 32), one = fastdiv(1), ntxfd = fastdiv((unsigned)ntx[i]);
+        int zero = 0, stride = K / 32, nrows = N, ncols = mm, ny = Mp[i], stride_col = N;
+        CUdeviceptr nullp = 0;
+        CUdeviceptr tmp = fix[i] ? c->b[i].tmpfix : 0;
+        CUfunction gemmfn = use64[i] ? c->gemm64 : c->gemm;
+        CUfunction fixfn = use64[i] ? c->fixup64 : c->fixup;
+        void *a[] = { &dw[i], &B->q8, &nullp, &nullp, &B->y, &tmp, &bp, &nrows, &ncols, &stride, &ny, &stride_col,
+                      &one, &one, &zero, &zero, &zero, &one, &one, &zero, &zero, &zero, &ntxfd };
+        if (cuLaunchKernel(gemmfn, sk[i], 1, 1, 32, 8, 1, 57856, c->stream, a, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        if (fix[i]) {
+            void *fa[] = { &nullp, &nullp, &B->y, &B->tmpfix, &bp, &nrows, &ny, &stride_col,
+                           &one, &zero, &one, &zero, &ntxfd };
+            if (cuLaunchKernel(fixfn, sk[i], 4, 1, 32, 4, 1, 0, c->stream, fa, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        }
+        if (terms == 2) {
+            make_mxfp4_residual(B->hres, x[i], mm, Mp[i], K);
+            if (cuMemcpyHtoDAsync(B->x, B->hres, (size_t)mm * K * sizeof(float), c->stream) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+            if (cuLaunchKernel(c->quant_fp4, Mp[i], by, 1, 32, 1, 1, 0, c->stream, qa, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+            void *a2[] = { &dw[i], &B->q8, &nullp, &nullp, &B->y2, &tmp, &bp, &nrows, &ncols, &stride, &ny, &stride_col,
+                           &one, &one, &zero, &zero, &zero, &one, &one, &zero, &zero, &zero, &ntxfd };
+            if (cuLaunchKernel(gemmfn, sk[i], 1, 1, 32, 8, 1, 57856, c->stream, a2, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+            if (fix[i]) {
+                void *fa2[] = { &nullp, &nullp, &B->y2, &B->tmpfix, &bp, &nrows, &ny, &stride_col,
+                                &one, &zero, &one, &zero, &ntxfd };
+                if (cuLaunchKernel(fixfn, sk[i], 4, 1, 32, 4, 1, 0, c->stream, fa2, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+            }
+            int total = Mp[i] * N;
+            void *aa[] = { &B->y, &B->y2, &total };
+            if (cuLaunchKernel(c->add, (total + 255) / 256, 1, 1, 256, 1, 1, 0, c->stream, aa, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        }
+        /* A kernel OOB on the shared stream with many queued tasks was observed
+         * (M~80+ x128 bucket mis-sizes its fixup scratch when launched back to
+         * back).  Draining per task is the safe path and costs little: the
+         * host residual work dominates either way. */
+        CUresult rr = cuStreamSynchronize(c->stream);
+        if (rr != CUDA_SUCCESS) {
+            if (dbg > 1) { const char *es = NULL; if (cuGetErrorString) cuGetErrorString(rr, &es); fprintf(stderr, "TASK %d M=%d N=%d K=%d sync %d %s\n", i, mm, N, K, rr, es ? es : "?"); }
+            return -1;
+        }
+    }
+    if (dbg) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        if (dbg_cnt++ < 40 || (dbg_cnt % 100) == 0)
+            fprintf(stderr, "BATCH n=%d terms=%d %.3f ms\n", n, terms, ms);
+    }
+    failstage = 3;
+    /* pass 4: sync once, then download every result. */
+    CUresult syncr = cuStreamSynchronize(c->stream);
+    if (syncr != CUDA_SUCCESS) { if (dbg) { const char *es=NULL; if (cuGetErrorString) cuGetErrorString(syncr, &es); fprintf(stderr, "BATCHFAIL sync %d %s\n", syncr, es?es:"?"); } return -1; }
+    for (int i = 0; i < n; ++i) {
+        cuda_batch_buf *B = &c->b[i];
+        int N = rows[i], mm = M[i];
+        if (cuMemcpyDtoH(B->hy, B->y, (size_t)mm * N * sizeof(float)) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        for (int r = 0; r < mm; ++r)
+            memcpy(dst[i] + (size_t)r * N, (float *)B->hy + (size_t)r * N, (size_t)N * sizeof(float));
+    }
+    return 0;
+}
+
+/* Preload a weight into the cache so the async batch's loads are hits.  The
+ * repack + upload happen now (once), not during the measured prefill. */
+int cuda_ds4f_mxfp4_warm(cuda_ds4f_mxfp4 *c, const uint8_t *w,
+                         const uint8_t *scale, int rows, int cols) {
+    if (!c || cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) return -1;
+    return cuda_ds4f_mxfp4_load(c, w, scale, rows, cols);
 }
