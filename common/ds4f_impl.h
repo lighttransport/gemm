@@ -3236,6 +3236,8 @@ static int ds4f_runtime_options_load_json(ds4f_runtime_options *o, const char *p
     o->n_threads = ds4f_json_int(json, "threads", o->n_threads);
     o->n_cmgs = ds4f_json_int(json, "cmgs", o->n_cmgs);
     o->cfg.max_pos = ds4f_json_int(json, "max_pos", o->cfg.max_pos);
+    { const char *mp = getenv("DS4F_MAX_POS");
+      if (mp && *mp) { long v = atol(mp); if (v > 0) o->cfg.max_pos = (int)v; } }
     o->dense_bf16 = ds4f_json_int(json, "dense_bf16", o->dense_bf16);
     o->bf16_pv = ds4f_json_int(json, "bf16_pv", o->bf16_pv);
     o->dense_mxfp4 = ds4f_json_int(json, "dense_mxfp4", o->dense_mxfp4);

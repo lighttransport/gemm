@@ -767,6 +767,8 @@ int main(int argc, char **argv) {
     }
     ds4f_config cfg = opt.cfg;
     if (layers > 0) cfg.n_layers = layers;
+    { const char *mp = getenv("DS4F_MAX_POS");
+      if (mp && *mp) { long v = atol(mp); if (v > 0) cfg.max_pos = (int)v; } }
     if (cfg.max_pos < 2) cfg.max_pos = 2;
     if (cfg.max_pos > 16384) cfg.max_pos = 16384;
     opt.cfg = cfg;
