@@ -627,16 +627,24 @@ by the `mmqv_mxfp4_residual` device kernel instead of on the host. A stale
 fixed, the batch runs every dispatch with zero fallbacks and compute-sanitizer
 is clean.
 
-Hybrid prefill (terms=2) vs the exact CPU-expert default
-(`--hip-ordered-fp8-layers 43 --hip-fused-shared-ffn 1`, threads = `nproc`):
+**Settled prefill table (2026-08-06, `bench_summary.cpp`).** Tok/s across the
+configs, current tree (DS4F_MAX_MTILE=8192 for batch >512).  "exact" is the
+dual dense/shared on ROCm with routed experts CPU-exact for small buckets and
+auto-routed to the SM120 once M >= 128 (batch 1024+); the tiled head GEMM and
+the async batch roughly doubled the large-batch exact rate.  The accelerated
+routes are approximate (~1/64); the exact default stays 0/64 at batch 64.
 
-| batch | hybrid | exact | delta |
-|---:|---:|---:|---|
-| 256 | 47.7 | 40.7 | +17% |
-| 512 | 42.9 | 35.6 | +20% |
-| 1024 | 33.2 | 24.1 | +38% |
-| 2048 | 24.5 | 23.8 | +3% |
-| 4096 | 15.3 | 13.7 | +12% |
+| batch | exact | rocm-expert | cuda-stream | split |
+|---:|---:|---:|---:|---:|
+| 256 | 40.8 | 41.5 | 28.5 | 34.1 |
+| 512 | 43.8 | 43.9 | 32.1 | 35.9 |
+| 1024 | 46.8 | 47.1 | 37.4 | 40.1 |
+| 2048 | 54.5 | 53.6 | 40.7 | 45.9 |
+| 4096 | 58.1 | 59.9 | 38.9 | 49.1 |
+
+`rocm-expert`: `--hip-mxfp4-resident-layers 14 --hip-mxfp4-stream-raw 1`;
+`cuda-stream`: `--dual-cuda-resident-from 0 --dual-cuda-preload 0`;
+`split`: `--hip-mxfp4-resident-layers 14 --dual-cuda-resident-from 14`.
 
 The route is approximate (~1/64 at batch 64 small buckets; the exact default
 stays 0/64). The 1k--2k prefill gain is the target for the resident-weight
