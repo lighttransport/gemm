@@ -1215,10 +1215,10 @@ static int matrix_view(const hip_ds4f_matrix *mat, const ds4f_tensor *t,
                 return -1;
         }
     }
-    *dw_out = (uint8_t *)mat->dw + (size_t)row0 * row_bytes;
+    *dw_out = (uint8_t *)(void *)mat->dw + (size_t)row0 * row_bytes;
     *ds_out = mat->ds;
     if (t->type == DS4F_FP8 && row0)
-        *ds_out = (uint8_t *)mat->ds +
+        *ds_out = (uint8_t *)(void *)mat->ds +
                   (size_t)(row0 / 128) * (size_t)mat->scale_cols;
     return 0;
 }
@@ -1556,8 +1556,8 @@ static int launch_gemm_dev(hip_ds4f_dense *ctx, const hip_ds4f_matrix *mat,
     else if (matrix_is_fp8_ordered(mat->kind)) { fn = ctx->gemm_fp8_ordered; soff = (size_t)(row0 / 128) * (size_t)mat->scale_cols; }
     else if (matrix_is_fp8(mat->kind)) { fn = ctx->gemm_fp8; soff = (size_t)(row0 / 128) * (size_t)mat->scale_cols; }
     else return -1;   /* promoted BF16/FP16 and MXFP4 keep the unfused path */
-    void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K;
-    void *ds = (uint8_t *)mat->ds + soff;
+    void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K;
+    void *ds = (uint8_t *)(void *)mat->ds + soff;
     void *args[] = { &dY, &dw, &ds, &dX, &lut, &n_out, &n_in, &n_tok, &scale_cols };
     return hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0,
                                  ctx->stream, args, NULL) == hipSuccess ? 0 : -1;
@@ -1731,43 +1731,43 @@ int hip_ds4f_dense_gemm_tensor(
         void *dy = tile ? ctx->gemm_dy_tile : ctx->gemm_dy;
         void *dx = ctx->gemm_dx;
         if (matrix_is_mxfp4(mat->kind)) {
-            void *dw = (uint8_t *)mat->dw + (size_t)c0 * (size_t)(K / 2);
-            void *ds = (uint8_t *)mat->ds + (size_t)c0 * (size_t)(K / 32);
+            void *dw = (uint8_t *)(void *)mat->dw + (size_t)c0 * (size_t)(K / 2);
+            void *ds = (uint8_t *)(void *)mat->ds + (size_t)c0 * (size_t)(K / 32);
             void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok };
             err = hipModuleLaunchKernel(ctx->gemm_mxfp4, gx, gy, 1, 16, 16, 1, 0,
                                         ctx->stream, args, NULL);
         } else if (matrix_is_fp8_rowscale(mat->kind)) {
-            void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K + (size_t)c0 * (size_t)K;
-            void *ds = (uint8_t *)mat->ds + (size_t)row0 * (size_t)mat->scale_cols + (size_t)c0 * (size_t)mat->scale_cols;
+            void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K + (size_t)c0 * (size_t)K;
+            void *ds = (uint8_t *)(void *)mat->ds + (size_t)row0 * (size_t)mat->scale_cols + (size_t)c0 * (size_t)mat->scale_cols;
             void *lut = ctx->fp8_lut;
             int scale_cols = mat->scale_cols;
             void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
             err = hipModuleLaunchKernel(ctx->gemm_fp8_rowscale, gx, gy, 1, 16, 16, 1, 0,
                                         ctx->stream, args, NULL);
         } else if (matrix_is_fp8_ordered(mat->kind)) {
-            void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K + (size_t)c0 * (size_t)K;
-            void *ds = (uint8_t *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols + (size_t)(c0 / 128) * (size_t)mat->scale_cols;
+            void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K + (size_t)c0 * (size_t)K;
+            void *ds = (uint8_t *)(void *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols + (size_t)(c0 / 128) * (size_t)mat->scale_cols;
             void *lut = ctx->fp8_lut;
             int scale_cols = mat->scale_cols;
             void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
             err = hipModuleLaunchKernel(ctx->gemm_fp8_ordered, gx, gy, 1, 16, 16, 1, 0,
                                         ctx->stream, args, NULL);
         } else if (matrix_is_fp8(mat->kind)) {
-            void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K + (size_t)c0 * (size_t)K;
-            void *ds = (uint8_t *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols + (size_t)(c0 / 128) * (size_t)mat->scale_cols;
+            void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K + (size_t)c0 * (size_t)K;
+            void *ds = (uint8_t *)(void *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols + (size_t)(c0 / 128) * (size_t)mat->scale_cols;
             void *lut = ctx->fp8_lut;
             int scale_cols = mat->scale_cols;
             void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
             err = hipModuleLaunchKernel(ctx->gemm_fp8, gx, gy, 1, 16, 16, 1, 0,
                                         ctx->stream, args, NULL);
         } else if (matrix_is_bf16(mat->kind)) {
-            void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t) + (size_t)c0 * (size_t)K * sizeof(uint16_t);
+            void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t) + (size_t)c0 * (size_t)K * sizeof(uint16_t);
             void *bias = NULL;
             void *args[] = { &dy, &dw, &dx, &bias, &n_out, &n_in, &n_tok };
             err = hipModuleLaunchKernel(ctx->gemm_bf16, gx, gy, 1, 16, 16, 1, 0,
                                         ctx->stream, args, NULL);
         } else {
-            void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t) + (size_t)c0 * (size_t)K * sizeof(uint16_t);
+            void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t) + (size_t)c0 * (size_t)K * sizeof(uint16_t);
             void *bias = NULL;
             void *args[] = { &dy, &dw, &dx, &bias, &n_out, &n_in, &n_tok };
             err = hipModuleLaunchKernel(ctx->gemm_f16, gx, gy, 1, 16, 16, 1, 0,
