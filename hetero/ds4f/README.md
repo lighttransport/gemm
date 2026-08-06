@@ -640,7 +640,7 @@ routes are approximate (~1/64); the exact default stays 0/64 at batch 64.
 | 512 | 41.3 | 41.2 | 34.0 | **62.4** |
 | 1024 | 46.7 | 45.8 | 40.3 | **63.4** |
 | 2048 | 52.1 | 54.1 | 49.1 | **65.4** |
-| 4096 | 57.1 | 57.9 | 24.8 | **64.9** |
+| 4096 | 57.1 | 57.9 | 52.6 | **69.1** |
 
 The recommended prefill config is the split with the GPU sliding-window
 attention (`--hip-prefill-attn 1`): ~62-65 tok/s flat at every batch.  The
