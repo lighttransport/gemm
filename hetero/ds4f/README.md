@@ -636,11 +636,11 @@ routes are approximate (~1/64); the exact default stays 0/64 at batch 64.
 
 | batch | exact | rocm-expert | cuda-stream | split |
 |---:|---:|---:|---:|---:|
-| 256 | 40.8 | 41.5 | 28.5 | 34.1 |
-| 512 | 43.8 | 43.9 | 32.1 | 35.9 |
-| 1024 | 46.8 | 47.1 | 37.4 | 40.1 |
-| 2048 | 54.5 | 53.6 | 40.7 | 45.9 |
-| 4096 | 58.1 | 59.9 | 38.9 | 49.1 |
+| 256 | 40.1 | 40.1 | 28.4 | 34.1 |
+| 512 | 41.2 | 42.4 | 32.9 | 38.4 |
+| 1024 | 45.8 | 46.2 | 41.5 | 42.8 |
+| 2048 | 52.6 | 53.8 | 43.5 | 48.9 |
+| 4096 | 56.0 | 56.6 | 39.8 | 52.4 |
 
 `rocm-expert`: `--hip-mxfp4-resident-layers 14 --hip-mxfp4-stream-raw 1`;
 `cuda-stream`: `--dual-cuda-resident-from 0 --dual-cuda-preload 0`;
