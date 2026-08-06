@@ -39,11 +39,31 @@ detail but **`logs/` is gitignored**, so it is not in the repo.
 
 | | KDA (69 layers) | MLA (24 layers) |
 |---|---|---|
-| **now** | **~1.49 ms** | **~1.73 ms** |
+| **now** (all flags, below) | **~1.153 ms** | **~1.420 ms** |
+| stock defaults (`row-aligned`) | 1.410 | ~1.632 |
+| before `row-aligned` | 1.51 | 1.71 |
 | this morning | 4.30 | 4.30 |
 
-Extrapolated: 69×1.49 + 24×1.73 = **144 ms/token ≈ 6.9 tok/s**, from 457 ms at
-the start of the day. Phase split at 47 threads (before the last two commits):
+69×1.1534 + 24×1.4197 = **113.7 ms/token = 8.80 tok/s** (stock: 7.33), 1.20×.
+
+```
+K3_MOE_SHARD_LAYOUT=row-aligned K3_CMG_REPLICATE=1 K3_BF16_PV=1 K3_SITU_FAST=1
+```
+
+All three new flags default **off**. `K3_CMG_REPLICATE` costs +4.14 GB/rank at
+96n; `K3_SITU_FAST` is an **accuracy** change (gated by `make test`'s
+`[situ-fexpa]`, max_abs 1.457e-03 vs 2e-3 tolerance) and belongs to whoever owns
+output quality — note the 16 routed experts already use that approximation, so it
+makes the two expert paths consistent rather than introducing a new one.
+
+**The 1.6 TB "non-quantized" model is `bf16 + MXFP4`.** `config.json` gives 2.72 T
+expert params, which would be 5.4 TB at bf16 against a 1.5 TB checkpoint — the
+experts are natively MXFP4. It is already the fastest decode format we have, so
+**no quantization work is on the decode critical path**; TODO 4 below is a
+capacity item, not a speed one.
+
+Phase split at 47 threads (measured before `row-aligned`; see `ROOFLINE.md` for
+the row-aligned table):
 
 | phase | KDA | MLA |
 |---|---|---|
@@ -65,7 +85,10 @@ job `49931198`, 96 nodes, **prefill 1.709 / decode 1.699 tok/s**.
 ### Measured hardware constants
 
 - Node read ceiling **726 GB/s** at 48T (42 / 466 / 709 / 726 for 1/12/24/48).
-- bf16 matvec **652 GB/s = 90% of R**. Every quantized kernel is at 2–11%:
+- bf16 matvec **652 GB/s = 90% of R** — but that is a large standalone matrix.
+  **At the runner's actual shapes the same kernel delivers 174 GB/s, 24% of R**,
+  and the gap is not instruction issue (see the pv result). Do not plan against
+  the 652 figure. Every quantized kernel is at 2–11%:
   MXFP4 212 Gmac/s, IQ1_S 82, Q8_0 74, IQ2_XS 58. **The quantized path is
   compute-bound, and MXFP4 — which nobody has optimized — beats our
   six-times-optimized IQ1_S by 2.6× per mac.**
@@ -98,11 +121,20 @@ backfilled the same evening.
 
 ## TODO
 
-1. **Verify the MLA attention change in generation mode.** `layer12` reports
-   `tokens=0`, so its output hash does **not** cover the attention result. The
-   change rests on `make test`'s `[mla-parallel]` (2.794e-09 vs reference) plus
-   a hand-checked call-site mapping. Run something that actually generates
-   tokens before this reaches the 96-node job.
+1. **MLA data race: FIXED.** `full_mla_forward`'s `o_proj` read `m->attn` while
+   writing `out` — the same buffer, since the caller passes `out == m->attn`.
+   47 threads writing `out[0..7167]` clobbered `attn[0..1023]` mid-read, so
+   **24 of 93 layers computed intermittently wrong results**, including in the
+   96-node job. Fixed by staging through `m->tmp` as KDA already does; MLA is now
+   reproducible (`0d8160ab3188f259` x3 where it was a different hash every run).
+   KDA was immune only by accident of buffer choice. The outstanding
+   "verify the MLA attention change" item is now actually possible.
+
+   **`output_hash` is not a gate** — `layer12` runs with `generated_tokens=0` and
+   emits the same `14650fb0739d0383` for KDA *and* MLA layers. Use `hidden_hash`.
+   Every "hash-identical" claim written before 2026-08-06 ~11:00 was checked
+   against the wrong field; the race above is exactly what that let through.
+
 2. **Inspect `50005954` when it lands.** Require `stage_timing.tsv` rows for
    build / topology / barrier_preflight / full_weight_staging /
    full_short_generation **and validation**, all `rc=0`, non-empty
@@ -117,18 +149,60 @@ backfilled the same evening.
 
 ## Optimization opportunities, ranked by evidence
 
-1. **MoE, ~0.93 ms of both layer types.** The remaining grind to <1 ms/layer.
-   No sub-phase exceeds 26% of it, so this is six stages of 0.12–0.24 ms, not
-   one fix. ~110 µs of it is barrier (six sync points × ~18 µs at 47 threads).
-2. **`ar_groups`.** The runner uses 2 at 12 nodes → 2D A=2×B=6 = 93.9 µs.
-   A=3×B=4 measured 88.6 µs. One flag, ~5 µs × 2 collectives/layer.
-3. **MXFP4 expert kernel.** It is the fastest quantized kernel in the tree at
-   212 Gmac/s and has never been optimized, while six passes went into IQ. It is
-   also what the *original* checkpoint actually uses, i.e. what job `50005954`
-   will run.
-4. **Node count as a decode lever.** Decode is comm-bound, so IQ1's value is
-   fitting in 24–32 nodes rather than 56–96 — fewer collective hops. Quantify
-   with collective latency vs node count.
+Re-ranked 2026-08-06 06:00 against the phase table in `ROOFLINE.md`
+(layer 2, row-aligned, 1.419 ms). Bytes/rank vs the measured 652 GB/s bf16 and
+106 GB/s MXFP4 rates:
+
+1. **Turn on `K3_CMG_REPLICATE=1` for the 96-node job** (default off; check
+   memory first). Per-CMG replication of the bf16 projections measures **1.081×
+   on KDA and 1.068× on MLA at 12 nodes** (7.28 → 7.84 tok/s extrapolated), and
+   the 12n number badly understates it: at 96 nodes a per-rank projection is
+   1.835 MB — **under one 2 MB large page** — so it lands wholly on one CMG and
+   36 of 47 threads read it at ~119 GB/s. `K3_CMG_FORCE` simulates that condition
+   at 12n and costs **2.04× on attention**, which replication fully recovers.
+   Cost: +4.14 GB/rank at 96n (27% over the ~15.6 GB of weights) — verify against
+   the KV cache at target context before enabling.
+
+   Do **not** use the `K3_CMG_LOCAL` routing path: measured a 2.5% net loss,
+   because at 12n a projection is only 3-7 large pages and the 2/1/2/2 split
+   imbalance exceeds the locality gain. And note `sysconf(_SC_PAGESIZE)` reports
+   64 KB while the heap uses 2 MB pages: `mbind` on a 64 KB-aligned range returns
+   EINVAL, and without `MPOL_MF_MOVE` it returns 0 without moving anything. Both
+   are silent no-ops — always verify with `get_mempolicy`.
+
+2. **`K3_BF16_PV=1` — already implemented, default off.** `matvec_bf16_8row_pv`
+   is wired in via a load-time in-place repack (`full_bf16_pv_repack`), hash
+   verified `14650fb0739d0383`. Worth **1.335× at 1 thread** but only **1.038× at
+   47**, i.e. ~1.3% on the layer. Leave it off until item 1 is settled; the win
+   should reappear once the phase is issue-bound again rather than fabric-bound.
+   Superseded plan (kept for the reasoning): The mechanism is now
+   identified and measured (`ROOFLINE.md`, last four sections). `matvec_bf16_8row`
+   is **issue-bound on the bf16→f32 widen**: 21.4 GB/s single-threaded against
+   58.7 GB/s for a pure read of the same bytes. `matvec_bf16_8row_pv`
+   (`common/ggml_dequant.h:1531`) removes the widen and measures **1.57× at
+   cols=7168** — the column count of all five attention projections. Worth
+   ~0.15–0.20 ms/layer. Cost: `k3_full_stage.py` must write the pair-interleaved
+   layout for exactly the pv-read tensors and never for flat-read norms/embeds.
+   Reproduce with `a64fx/k3/k3_bf16_bench.c` (single thread, no allocation).
+
+   The control that proves it: in the same layer and the same OpenMP runtime,
+   **MXFP4 `moe_expert` scales ×38.0 of 47 threads (81%) while bf16 `moe_shared`
+   scales ×10.6 (23%)**. So the poor scaling is not OpenMP, not barriers, and not
+   the memory system — it is this one function. That retires the `perf`-based
+   "46% is OpenMP synchronization" reading which sent the persistent-team work,
+   the collective-count work, and the poll-spin sweep all after the wrong target.
+2. **MXFP4 expert kernel, 212 Gmac/s = 14.6% of the memory roofline.**
+   `moe_expert` (0.211 ms) is *at* this kernel's measured rate, so it is the one
+   phase that cannot improve without the kernel improving. This is now the
+   largest single structural inefficiency in the model, and it has never been
+   optimized while six passes went into IQ formats.
+3. **A shard layout that avoids the added collective.** `row-aligned` buys 118 µs
+   of redundant streaming and hands 132 µs back as a `latent_reduce`, and still
+   nets a win. Removing that collective — keeping the residual stream sharded and
+   reducing only at the RMSNorms — is worth ~118 µs/layer on top.
+4. **Memory placement.** First-touch vs interleave is a 2.34× swing, the largest
+   leverage of anything measured. CMG-*local* partitioning with a CMG-aware
+   task→thread mapping is untested and is a different thing from either arm.
 5. **Prefill chunk.** The one measured run used `chunk 64` on a 256-token
    prompt, the worst case. The model's table shows chunk 1024 → 140.8 vs
    chunk 64 → 125.5 tok/s. Job-script change, not code.
@@ -144,6 +218,16 @@ backfilled the same evening.
 | 8-row Q8_0 blocking | −20%, kept behind `K3_Q8_ROWS8=1` |
 | `svtbl` for IQ grid lookup | inapplicable — grids are 256–65536 entries; svtbl permutes within a vector |
 | `threads<=1` serial fast path in `k3_quant_matvec_ws` | −6% two different ways |
+| `--ar-groups` 2/3/4/6 | 1.498/1.520/1.511/1.500 — **noise.** The 88.6 vs 93.9 µs microbenchmark gap is real, but there are only ~2 collectives/layer, so ~10 µs sits under a ±5% run-to-run spread. |
+| `K3_COMM_POLL_SPINS` 1/2/8/32/128 | 1.500/1.498/1.484/1.495/1.516 — noise. Now swept; the default 4 is fine. |
+| threads 45/46/47 | 1.654/1.514/1.524. 46 == 47, i.e. **a core is free for a comm thread at no measured cost.** |
+| first-touch instead of `MPOL_INTERLEAVE` (`K3_NUMA_INTERLEAVE=0`) | 3.505/3.513 vs 1.500 — **2.34× worse.** Interleave is load-bearing. |
+| `moe_shared` task-quantization theory (64 8-row tasks over 47 threads ⇒ `ceil`=2, so 32 threads should tie 47) | shared 0.289/0.208/0.191 at 16/32/47 — scales monotonically with threads, so it is **not** critical-path-quantized. |
+
+**Collectives are not the 12-node lever.** `reduce` (0.117) + `moe_collective`
+(0.125) = 242 µs of a 1495 µs layer, 16%. Under `replicated` the profile shows
+`latent_reduce=0` and `router_reduce=0` — the layer was already running **2**
+collectives per layer, not the 4 the code paths suggest.
 
 **The pattern worth internalizing:** today's wins were a thread default (45%),
 schedule-chosen-by-batch-shape (51%, and it recurred twice more), and a kernel

@@ -75,6 +75,15 @@ static inline void k3_pool_set_error(k3_pool *pool, const char *operation,
 static inline unsigned long k3_apply_numa_interleave(void) {
     unsigned long nodemask = 0;
     cpu_set_t affinity;
+    /* K3_NUMA_INTERLEAVE=0 leaves the default first-touch policy in place, so
+     * the interleave can be A/B'd against CMG-local placement in one run. */
+    {
+        const char *env = getenv("K3_NUMA_INTERLEAVE");
+        if (env && env[0] == '0') {
+            fprintf(stderr, "k3: anonymous allocation NUMA policy=first-touch\n");
+            return 0;
+        }
+    }
     if (sched_getaffinity(0, sizeof affinity, &affinity) == 0) {
         for (int node = 0; node < (int)(8 * sizeof nodemask); ++node) {
             char path[128], line[256] = {0};

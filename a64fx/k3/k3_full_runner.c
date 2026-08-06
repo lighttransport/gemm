@@ -57,7 +57,7 @@
 #define K3_FULL_DTYPE_IQ2_XS 8
 #define K3_FULL_DTYPE_IQ2_XXS 9
 #define K3_FULL_DTYPE_IQ3_XXS 10
-#define K3_FULL_PROFILE_PHASES 13
+#define K3_FULL_PROFILE_PHASES 26
 
 enum {
     K3_FULL_PHASE_LAYER = 0,
@@ -73,6 +73,20 @@ enum {
     K3_FULL_PHASE_DISPATCH_PROJ = 10,
     K3_FULL_PHASE_ROUTER_REDUCE = 11,
     K3_FULL_PHASE_LATENT_REDUCE = 12,
+    /* KDA attention breakdown */
+    K3_FULL_PHASE_KDA_QKV = 13,
+    K3_FULL_PHASE_KDA_CONV = 14,
+    K3_FULL_PHASE_KDA_DECAY_PROJ = 15,
+    K3_FULL_PHASE_KDA_SERIAL = 16,
+    K3_FULL_PHASE_KDA_STEP = 17,
+    K3_FULL_PHASE_KDA_OUT = 18,
+    K3_FULL_PHASE_SHARED_GATEUP = 19,
+    K3_FULL_PHASE_SHARED_SITU = 20,
+    K3_FULL_PHASE_SHARED_DOWN = 21,
+    K3_FULL_PHASE_KDA_GRMSNORM = 22,
+    K3_FULL_PHASE_KDA_OPROJ = 23,
+    K3_FULL_PHASE_FINISH_MATVEC = 24,
+    K3_FULL_PHASE_FINISH_REDUCE = 25,
 };
 
 typedef struct {
@@ -97,12 +111,16 @@ typedef enum {
     K3_FULL_MODE_BARRIER = 3,
 } k3_full_mode;
 
+#define K3_CMG_COUNT 4
 typedef struct {
     const uint8_t *data;
     size_t nbytes;
     int dtype;              /* 1=BF16, 2=F32, 3=U8, 4=Q8P16, 5=Q8P8 */
     int ndims;
     size_t shape[3];
+    int pv;                 /* BF16 rows repacked pair-interleaved for _pv */
+    unsigned char *cmg_map; /* CMG index per 2 MB large page, NULL if unmapped */
+    unsigned char *cmg_copy[K3_CMG_COUNT];  /* per-CMG replica, NULL if not replicated */
     char name[K3_FULL_MAX_NAME];
 } k3_full_tensor;
 
@@ -335,7 +353,11 @@ static const char *full_profile_phase_name(int phase) {
         "layer", "attention", "moe", "reduce", "residual",
         "moe_dispatch", "moe_expert", "moe_shared",
         "moe_collective", "moe_finish", "dispatch_proj",
-        "router_reduce", "latent_reduce"
+        "router_reduce", "latent_reduce",
+        "kda_qkv", "kda_conv", "kda_decay_proj",
+        "kda_serial", "kda_step", "kda_out",
+        "shared_gateup", "shared_situ", "shared_down",
+        "kda_grmsnorm", "kda_oproj", "finish_matvec", "finish_reduce"
     };
     return phase >= 0 && phase < K3_FULL_PROFILE_PHASES ? names[phase] : "unknown";
 }
@@ -794,7 +816,357 @@ typedef struct {
     int rows;
     int cols;
     int dtype;
+    int pv;
+    int cmg;                /* CMG owning these rows, -1 if not CMG-bound */
+    unsigned char *const *cmg_copy;   /* per-CMG replicas, NULL if not replicated */
+    size_t woff;                      /* byte offset of this task's rows */
 } full_bf16_task;
+
+/* K3_CMG_LOCAL=1 routes each 8-row BF16 task to a thread on the CMG that
+ * already owns its weight pages.
+ *
+ * Why routing and not migration.  The heap is backed by 2 MB large pages, so
+ * MPOL_INTERLEAVE round-robins whole 2 MB blocks -- a 7168-column bf16 row is
+ * 14 KB and an 8-row task 114 KB, so a task's weights are almost always inside
+ * one large page, i.e. on ONE CMG already.  What is uncontrolled is *which*:
+ * with an arbitrary schedule ~3/4 of tasks run on a thread whose CMG does not
+ * own them, and inter-CMG bandwidth is ~119 GB/s against 226 GB/s CMG-local
+ * (k3_cmg_bw_bench.c).  Querying the existing placement and matching the thread
+ * to it needs no page migration, works for tensors of any size, and inherits
+ * the interleave's natural 1/4-per-CMG balance.
+ *
+ * mbind was tried first and is the wrong tool here: it requires 2 MB-aligned
+ * ranges (sysconf(_SC_PAGESIZE) reports 64 KB and every 64 KB-aligned call
+ * returns EINVAL), and at 12 nodes a per-rank projection is only 7-15 MB, i.e.
+ * 3-7 large pages -- too few to cut four ways.
+ *
+ * Thread t sits on core 12+t under OMP_PROC_BIND=close/OMP_PLACES=cores, so its
+ * CMG is t/12. */
+#define K3_CMG_NODE0 4
+#define K3_CMG_CORES 12
+#define K3_CMG_PAGE (2UL << 20)
+#ifndef MPOL_F_NODE
+#define MPOL_F_NODE (1 << 0)
+#endif
+#ifndef MPOL_F_ADDR
+#define MPOL_F_ADDR (1 << 1)
+#endif
+static int full_cmg_local = 0;
+static int full_cmg_verify = 0;
+/* K3_CMG_FORCE=<0..3> pins every mapped projection entirely onto one CMG.  This
+ * exists to simulate the 96-node case: per-rank projections there are ~1.2 MB,
+ * i.e. a SINGLE 2 MB large page, so each tensor lands wholly on one CMG and 36
+ * of 47 threads read it across the ~119 GB/s interconnect.  At 12 nodes a
+ * tensor is 3-7 pages and the interleave spreads it, so the effect is invisible
+ * -- this knob makes it measurable here. */
+static int full_cmg_force = -1;
+static int full_cmg_replicate_on = 0;
+/* K3_SITU_FAST=1 routes the shared-expert and dense SiTU through the FEXPA
+ * kernel the routed experts already use (k3_moe.h, 5 call sites).  k3_situ_sve
+ * is k3_situ_ref: 3 libm transcendentals per element (2x tanhf + sigmoidf), so
+ * 512 shared lanes cost 1536 libm calls = 0.089 ms/layer, half of moe_shared.
+ * This is an accuracy change -- it moves the layer hash -- but it makes the two
+ * expert paths consistent rather than approximating one and not the other, and
+ * `make test`'s [situ-fexpa] case bounds the error at 2e-3. */
+static int full_situ_fast = 0;
+
+/* K3_FAST_EXP=1 vectorises the two scalar-libm loops in the KDA path.
+ * kda_serial measured 0.047 ms/layer and is essentially all libm: the 1024-lane
+ * expf below plus k3_kda_log_decay's 128 expf + 1024 sigmoidf, ~2176 calls on
+ * one thread while 46 idle.  Same FEXPA primitives the routed experts already
+ * use.  Separate from K3_SITU_FAST because the error lands somewhere riskier:
+ * these feed the KDA recurrent state, so it persists across tokens rather than
+ * being consumed within one. */
+static int full_fast_exp = 0;
+/* K3_MLA_SERIAL_ATTN=1 restores the pre-optimization serial-over-heads KV scan.
+ * Bisect for the MLA run-to-run non-determinism: if this is reproducible while
+ * the parallel kernel is not, the kernel is implicated. */
+static int full_mla_serial_attn = 0;
+/* K3_MLA_TRACE=1 accumulates an FNV hash of each MLA intermediate so the first
+ * point of run-to-run divergence can be located. */
+static int full_mla_trace = 0;
+static uint64_t full_trace_h[6];
+static const char *full_trace_name[6] = {
+    "latent(tmp,q_a)", "latent(tmp2,kv_a)", "q_b", "kv_b", "attn_out", "layer_out"
+};
+static void full_trace_mix(int slot, const float *v, int n) {
+    if (!full_mla_trace) return;
+    uint64_t h = full_trace_h[slot] ? full_trace_h[slot] : 1469598103934665603ULL;
+    for (int i = 0; i < n; ++i) {
+        uint32_t b; memcpy(&b, &v[i], 4);
+        h = (h ^ b) * 1099511628211ULL;
+    }
+    full_trace_h[slot] = h;
+}
+
+static void full_exp_vec(float *out, const float *in, int n) {
+#if defined(__ARM_FEATURE_SVE)
+    int vl = (int)svcntw();
+    for (int i = 0; i < n; i += vl) {
+        svbool_t pg = svwhilelt_b32(i, n);
+        svfloat32_t t = svmul_n_f32_x(pg, svld1(pg, in + i), 1.4426950408889634f);
+        t = svmax_n_f32_x(pg, svmin_n_f32_x(pg, t, 126.0f), -126.0f);
+        svst1(pg, out + i, k3_exp2_fexpa_sve(pg, t));
+    }
+#else
+    for (int i = 0; i < n; ++i) out[i] = expf(in[i]);
+#endif
+}
+
+static void full_kda_log_decay_fast(float *out, const float *g_raw,
+                                    const float *a_log, const float *dt_bias,
+                                    int heads, int key_dim) {
+#if defined(__ARM_FEATURE_SVE)
+    int vl = (int)svcntw();
+    float a_scale[key_dim];
+    full_exp_vec(a_scale, a_log, key_dim);
+    for (int h = 0; h < heads; ++h)
+        for (int d = 0; d < key_dim; d += vl) {
+            svbool_t pg = svwhilelt_b32(d, key_dim);
+            int i = h * key_dim + d;
+            svfloat32_t t = svadd_f32_x(pg, svld1(pg, g_raw + i),
+                                        svld1(pg, dt_bias + i));
+            t = svmul_f32_x(pg, svld1(pg, a_scale + d), t);
+            svst1(pg, out + i,
+                  svmul_n_f32_x(pg, k3_sigmoid_fast_sve(pg, t), -5.0f));
+        }
+#else
+    k3_kda_log_decay(out, g_raw, a_log, dt_bias, heads, key_dim);
+#endif
+}
+
+static void full_situ(float *out, const float *gate, const float *up, int n) {
+    if (full_situ_fast) k3_situ_fast_sve(out, gate, up, n);
+    else k3_situ_sve(out, gate, up, n);
+}
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+#ifndef MPOL_MF_MOVE
+#define MPOL_MF_MOVE (1 << 1)
+#endif
+
+static int full_cmg_threads(int cmg, int workers) {
+    int base = cmg * K3_CMG_CORES;
+    if (workers <= base) return 0;
+    int n = workers - base;
+    return n < K3_CMG_CORES ? n : K3_CMG_CORES;
+}
+
+/* Simulate the 96-node placement at 12 nodes: pin a whole projection to one CMG.
+ * At 96 nodes a per-rank projection is ~1.2 MB, i.e. under one 2 MB large page,
+ * so it lands wholly on one CMG regardless of the interleave policy. */
+static void full_cmg_force_tensor(k3_full_tensor *t) {
+    if (!t || !t->data || t->dtype != 1 || t->ndims != 2 || full_cmg_force < 0) return;
+    uintptr_t b = (uintptr_t)t->data, e = b + t->nbytes;
+    uintptr_t lo = (b + K3_CMG_PAGE - 1) & ~(uintptr_t)(K3_CMG_PAGE - 1);
+    uintptr_t hi = e & ~(uintptr_t)(K3_CMG_PAGE - 1);
+    if (hi <= lo) return;
+    unsigned long mask = 1UL << (K3_CMG_NODE0 + full_cmg_force);
+    if (syscall(SYS_mbind, (void *)lo, (size_t)(hi - lo), MPOL_BIND,
+                &mask, 8 * sizeof mask, MPOL_MF_MOVE) != 0)
+        fprintf(stderr, "k3: cmg-force mbind(%s): %s\n", t->name, strerror(errno));
+}
+
+/* Give every CMG its own copy of a projection, each bound to that CMG, so all
+ * 47 threads read locally AND any thread can take any task -- unlike CMG routing,
+ * which buys locality at the cost of a load imbalance set by the 2 MB page
+ * granularity (7 pages over 4 CMGs at 12 nodes) and measured as a net loss.
+ * Costs 3x the bytes of the replicated tensors. */
+static int full_cmg_replicate(k3_full_tensor *t) {
+    if (!t || !t->data || t->dtype != 1 || t->ndims != 2 || t->cmg_copy[0]) return 0;
+    size_t n = t->nbytes, alloc = (n + K3_CMG_PAGE - 1) & ~(size_t)(K3_CMG_PAGE - 1);
+    for (int c = 0; c < K3_CMG_COUNT; ++c) {
+        void *p = NULL;
+        if (posix_memalign(&p, K3_CMG_PAGE, alloc) != 0) return ENOMEM;
+        unsigned long mask = 1UL << (K3_CMG_NODE0 + c);
+        if (syscall(SYS_mbind, p, alloc, MPOL_BIND, &mask,
+                    8 * sizeof mask, MPOL_MF_MOVE) != 0) {
+            fprintf(stderr, "k3: replicate mbind(%s, cmg=%d): %s\n",
+                    t->name, c, strerror(errno));
+            free(p);
+            for (int k = 0; k < c; ++k) { free(t->cmg_copy[k]); t->cmg_copy[k] = NULL; }
+            return 0;
+        }
+        memcpy(p, t->data, n);          /* fault in under the binding */
+        t->cmg_copy[c] = p;
+    }
+    if (full_cmg_verify)
+        fprintf(stderr, "k3: cmg-replicate %s %.2f MB x4\n", t->name, n / 1048576.0);
+    return 0;
+}
+
+static int full_cmg_map_tensor(k3_full_tensor *t) {
+    if (!t || !t->data || t->dtype != 1 || t->ndims != 2 || t->cmg_map) return 0;
+    size_t npage = (t->nbytes + K3_CMG_PAGE - 1) / K3_CMG_PAGE;
+    if (npage < 2) return 0;                 /* one page: nothing to route */
+    unsigned char *map = malloc(npage);
+    if (!map) return 0;
+    int hist[K3_CMG_COUNT] = {0};
+    for (size_t p = 0; p < npage; ++p) {
+        int node = -1;
+        void *a = (char *)(uintptr_t)t->data + p * K3_CMG_PAGE;
+        if (syscall(SYS_get_mempolicy, &node, NULL, 0UL, a,
+                    MPOL_F_NODE | MPOL_F_ADDR) != 0 ||
+            node < K3_CMG_NODE0 || node >= K3_CMG_NODE0 + K3_CMG_COUNT) {
+            free(map);
+            return 0;                        /* unknown placement: stay generic */
+        }
+        map[p] = (unsigned char)(node - K3_CMG_NODE0);
+        ++hist[map[p]];
+    }
+    t->cmg_map = map;
+    if (full_cmg_verify)
+        fprintf(stderr, "k3: cmg-map %s pages=%zu per-cmg=%d/%d/%d/%d\n",
+                t->name, npage, hist[0], hist[1], hist[2], hist[3]);
+    return 1;
+}
+
+/* K3_BF16_PV=1 repacks BF16 projection weights in place, once at load, into the
+ * pair-interleaved layout consumed by matvec_bf16_8row_pv.  That kernel replaces
+ * the SVE_BF16_ZIP widen with a p_odd predicated load (2 instructions instead of
+ * 4) and measures 1.57x at cols=7168 -- see ROOFLINE.md.  Repacking at load
+ * rather than at stage time keeps k3_full_stage.py and the K3FULLV1/V2 blob
+ * format untouched, and the layout is recorded per tensor so a tensor that is
+ * not repacked simply keeps using the row-major kernel.
+ *
+ * Layout, derived from the kernel: for an 8-row group the block holds four
+ * pair-planes of 2*cols halfwords each, and within a plane
+ * plane[2*c] = rowEven[c], plane[2*c+1] = rowOdd[c].  The group base stays
+ * w + r*cols, so full_bf16_many's task construction is unchanged.  Only whole
+ * 8-row groups are repacked; a short tail stays row-major for the scalar path. */
+static int full_bf16_pv = 0;
+
+static int full_bf16_pv_repack(k3_full_tensor *t) {
+    if (!t || t->dtype != 1 || t->ndims != 2) return 0;
+    size_t rows = t->shape[0], cols = t->shape[1];
+    if (rows < 8 || (cols % 16u) != 0) return 0;   /* kernel needs n % vl == 0 */
+    uint16_t *w = (uint16_t *)(uintptr_t)t->data;
+    uint16_t *tmp = malloc(8 * cols * sizeof *tmp);
+    if (!tmp) return ENOMEM;
+    for (size_t g = 0; g + 8 <= rows; g += 8) {
+        uint16_t *base = w + g * cols;
+        memcpy(tmp, base, 8 * cols * sizeof *tmp);
+        for (int pair = 0; pair < 4; ++pair) {
+            uint16_t *plane = base + (size_t)pair * 2 * cols;
+            const uint16_t *e = tmp + (size_t)(2 * pair) * cols;
+            const uint16_t *o = tmp + (size_t)(2 * pair + 1) * cols;
+            for (size_t c = 0; c < cols; ++c) {
+                plane[2 * c] = e[c];
+                plane[2 * c + 1] = o[c];
+            }
+        }
+    }
+    free(tmp);
+    t->pv = 1;
+    return 0;
+}
+
+/* K3_BF16_ROWS=4 splits each 8-row bf16 task into two 4-row kernel calls. */
+static int full_bf16_rows = 8;
+/* K3_BF16_PREFETCH=<elements> enables the software-prefetched 8-row variant
+ * below.  matvec_bf16_8row streams eight weight rows with no SW prefetch and
+ * measures 12.7 GB/s single-threaded against a 42 GB/s single-thread node
+ * bandwidth; this is the A/B for whether that gap is prefetch. */
+static int full_bf16_prefetch = 0;
+
+static void full_bf16_rows_init(void) {
+    const char *env = getenv("K3_BF16_ROWS");
+    if (env && env[0] == '4') full_bf16_rows = 4;
+    env = getenv("K3_CMG_LOCAL");
+    if (env && env[0] == '1') full_cmg_local = 1;
+    env = getenv("K3_MLA_TRACE");
+    if (env && env[0] == '1') full_mla_trace = 1;
+    env = getenv("K3_MLA_SERIAL_ATTN");
+    if (env && env[0] == '1') full_mla_serial_attn = 1;
+    env = getenv("K3_FAST_EXP");
+    if (env && env[0] == '1') full_fast_exp = 1;
+    env = getenv("K3_SITU_FAST");
+    if (env && env[0] == '1') full_situ_fast = 1;
+    env = getenv("K3_CMG_REPLICATE");
+    if (env && env[0] == '1') { full_cmg_replicate_on = 1; full_cmg_local = 1; }
+    env = getenv("K3_CMG_FORCE");
+    if (env && *env) { full_cmg_force = atoi(env); full_cmg_local = 1; }
+    env = getenv("K3_CMG_VERIFY");
+    if (env && env[0] == '1') { full_cmg_local = 1; full_cmg_verify = 1; }
+    env = getenv("K3_BF16_PV");
+    if (env && env[0] == '1') full_bf16_pv = 1;
+    env = getenv("K3_BF16_PREFETCH");
+    if (env && *env) {
+        int v = atoi(env);
+        if (v > 0) full_bf16_prefetch = v;
+    }
+}
+
+#if defined(__ARM_FEATURE_SVE)
+/* Byte-identical to matvec_bf16_8row: same column order, same lo/hi split, same
+ * per-row svaddv.  The only difference is the __builtin_prefetch pair per row. */
+static void full_matvec_bf16_8row_pf(float *dst,
+        const uint16_t *w0, const uint16_t *w1, const uint16_t *w2, const uint16_t *w3,
+        const uint16_t *w4, const uint16_t *w5, const uint16_t *w6, const uint16_t *w7,
+        const float *x, int n, int pd) {
+    int i = 0;
+    svfloat32_t a0l=svdup_f32(0),a1l=svdup_f32(0),a2l=svdup_f32(0),a3l=svdup_f32(0);
+    svfloat32_t a4l=svdup_f32(0),a5l=svdup_f32(0),a6l=svdup_f32(0),a7l=svdup_f32(0);
+    svfloat32_t a0h=svdup_f32(0),a1h=svdup_f32(0),a2h=svdup_f32(0),a3h=svdup_f32(0);
+    svfloat32_t a4h=svdup_f32(0),a5h=svdup_f32(0),a6h=svdup_f32(0),a7h=svdup_f32(0);
+    int vl = (int)svcntw(), vlh = (int)svcnth();
+    svbool_t pg = svptrue_b32(), pgh = svptrue_b16();
+    svuint16_t zero = svdup_u16(0);
+    for (; i + vlh - 1 < n; i += vlh) {
+        if (i + pd < n) {
+            __builtin_prefetch(&w0[i+pd],0,3); __builtin_prefetch(&w1[i+pd],0,3);
+            __builtin_prefetch(&w2[i+pd],0,3); __builtin_prefetch(&w3[i+pd],0,3);
+            __builtin_prefetch(&w4[i+pd],0,3); __builtin_prefetch(&w5[i+pd],0,3);
+            __builtin_prefetch(&w6[i+pd],0,3); __builtin_prefetch(&w7[i+pd],0,3);
+        }
+        svfloat32_t vxl = svld1(pg, &x[i]), vxh = svld1(pg, &x[i + vl]);
+        svfloat32_t wl, wh;
+        SVE_BF16_ZIP(svld1_u16(pgh,&w0[i]),zero,wl,wh); a0l=svmla_x(pg,a0l,wl,vxl); a0h=svmla_x(pg,a0h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w1[i]),zero,wl,wh); a1l=svmla_x(pg,a1l,wl,vxl); a1h=svmla_x(pg,a1h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w2[i]),zero,wl,wh); a2l=svmla_x(pg,a2l,wl,vxl); a2h=svmla_x(pg,a2h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w3[i]),zero,wl,wh); a3l=svmla_x(pg,a3l,wl,vxl); a3h=svmla_x(pg,a3h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w4[i]),zero,wl,wh); a4l=svmla_x(pg,a4l,wl,vxl); a4h=svmla_x(pg,a4h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w5[i]),zero,wl,wh); a5l=svmla_x(pg,a5l,wl,vxl); a5h=svmla_x(pg,a5h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w6[i]),zero,wl,wh); a6l=svmla_x(pg,a6l,wl,vxl); a6h=svmla_x(pg,a6h,wh,vxh);
+        SVE_BF16_ZIP(svld1_u16(pgh,&w7[i]),zero,wl,wh); a7l=svmla_x(pg,a7l,wl,vxl); a7h=svmla_x(pg,a7h,wh,vxh);
+    }
+    a0l=svadd_x(pg,a0l,a0h);a1l=svadd_x(pg,a1l,a1h);a2l=svadd_x(pg,a2l,a2h);a3l=svadd_x(pg,a3l,a3h);
+    a4l=svadd_x(pg,a4l,a4h);a5l=svadd_x(pg,a5l,a5h);a6l=svadd_x(pg,a6l,a6h);a7l=svadd_x(pg,a7l,a7h);
+    dst[0]=svaddv(pg,a0l); dst[1]=svaddv(pg,a1l); dst[2]=svaddv(pg,a2l); dst[3]=svaddv(pg,a3l);
+    dst[4]=svaddv(pg,a4l); dst[5]=svaddv(pg,a5l); dst[6]=svaddv(pg,a6l); dst[7]=svaddv(pg,a7l);
+    /* Scalar tail.  Every K3 bf16 matvec has cols a multiple of 32, so this is
+     * dead in practice; it exists so the kernel is correct for any n, and it is
+     * the one place this variant may not be bit-identical to the 8-row form. */
+    if (i < n) {
+        const uint16_t *w[8] = {w0,w1,w2,w3,w4,w5,w6,w7};
+        for (int r = 0; r < 8; ++r) {
+            float s = 0.0f;
+            for (int c = i; c < n; ++c) s += bf16_to_f32_scalar(w[r][c]) * x[c];
+            dst[r] += s;
+        }
+    }
+}
+#endif
+
+/* Resolve a replicated task onto the running thread's own CMG.  Thread t is on
+ * core 12+t under OMP_PROC_BIND=close, so its CMG is t/12. */
+static void full_bf16_run_task(const full_bf16_task *task);
+static void full_bf16_run_task_local(const full_bf16_task *task) {
+#if defined(_OPENMP)
+    if (task->cmg_copy) {
+        int c = omp_get_thread_num() / K3_CMG_CORES;
+        if (c >= K3_CMG_COUNT) c = K3_CMG_COUNT - 1;
+        if (task->cmg_copy[c]) {
+            full_bf16_task k = *task;
+            k.weights = (const uint16_t *)(task->cmg_copy[c] + task->woff);
+            full_bf16_run_task(&k);
+            return;
+        }
+    }
+#endif
+    full_bf16_run_task(task);
+}
 
 static void full_bf16_run_task(const full_bf16_task *task) {
     if (task->dtype >= K3_FULL_DTYPE_Q8_0 && task->dtype <= K3_FULL_DTYPE_IQ3_XXS) {
@@ -813,6 +1185,43 @@ static void full_bf16_run_task(const full_bf16_task *task) {
     } else if (task->dtype == K3_FULL_DTYPE_Q8P8 && task->rows == 8) {
         k3_matvec_q8pv8_f32_group(task->out, task->packed,
                                   task->input, task->cols);
+#if defined(__ARM_FEATURE_SVE)
+    } else if (task->pv) {
+        /* Four pair-planes of 2*cols halfwords; see full_bf16_pv_repack. */
+        const uint16_t *p = task->weights;
+        matvec_bf16_8row_pv(task->out, p,
+                            p + (size_t)2 * task->cols,
+                            p + (size_t)4 * task->cols,
+                            p + (size_t)6 * task->cols,
+                            task->input, task->cols);
+    } else if (task->dtype == 1 && task->rows == 8 && full_bf16_prefetch > 0) {
+        const uint16_t *p = task->weights;
+        full_matvec_bf16_8row_pf(task->out, p, p + task->cols,
+                                 p + (size_t)2 * task->cols,
+                                 p + (size_t)3 * task->cols,
+                                 p + (size_t)4 * task->cols,
+                                 p + (size_t)5 * task->cols,
+                                 p + (size_t)6 * task->cols,
+                                 p + (size_t)7 * task->cols,
+                                 task->input, task->cols, full_bf16_prefetch);
+#endif
+    } else if (task->dtype == 1 && task->rows == 8 && full_bf16_rows == 4) {
+        /* Same rows, same column order, same per-row svaddv reduction as the
+         * 8-row form, so the result is byte-identical -- but 5 concurrent
+         * streams and 8 accumulators instead of 9 and 16.  A64FX is
+         * prefetch-stream limited and has 32 SVE registers, so the 8-row form
+         * may be spilling; this is the A/B for that. */
+        const uint16_t *p = task->weights;
+        matvec_bf16_4row(task->out, p, p + task->cols,
+                         p + (size_t)2 * task->cols,
+                         p + (size_t)3 * task->cols,
+                         task->input, task->cols);
+        matvec_bf16_4row(task->out + 4,
+                         p + (size_t)4 * task->cols,
+                         p + (size_t)5 * task->cols,
+                         p + (size_t)6 * task->cols,
+                         p + (size_t)7 * task->cols,
+                         task->input, task->cols);
     } else if (task->dtype == 1 && task->rows == 8) {
         const uint16_t *p = task->weights;
         matvec_bf16_8row(task->out, p, p + task->cols,
@@ -871,6 +1280,8 @@ static void full_bf16_many(float *const *outs,
             return;
         }
         const uint16_t *w = dtype == 1 ? (const uint16_t *)tensors[i]->data : NULL;
+        const unsigned char *cmap = dtype == 1 ? tensors[i]->cmg_map : NULL;
+        size_t rowb = (size_t)cols[i] * 2;
         size_t qrb = (dtype >= K3_FULL_DTYPE_Q8_0 &&
                       dtype <= K3_FULL_DTYPE_IQ3_XXS) ?
             k3_quant_row_bytes(K3_Q_Q8_0 + (dtype - K3_FULL_DTYPE_Q8_0), cols[i]) : 0;
@@ -892,7 +1303,16 @@ static void full_bf16_many(float *const *outs,
                 .rows = nr,
                 .cols = cols[i],
                 .dtype = dtype,
+                .pv = tensors[i]->pv && nr == 8,
+                .cmg = -1,
+                .cmg_copy = tensors[i]->cmg_copy[0] ? tensors[i]->cmg_copy : NULL,
+                .woff = (size_t)r * rowb,
             };
+            if (cmap) {
+                /* CMG of the page holding this task's first row; an 8-row task
+                 * is 114 KB and a page 2 MB, so it rarely straddles. */
+                tasks[n - 1].cmg = (int)cmap[((size_t)r * rowb) / K3_CMG_PAGE];
+            }
         }
     }
 
@@ -908,6 +1328,36 @@ static void full_bf16_many(float *const *outs,
     }
 #if defined(_OPENMP)
     omp_set_num_threads(workers > 0 ? workers : 1);
+    /* CMG-local dispatch: every thread runs only the tasks whose weight rows are
+     * bound to its own CMG.  Replaces the schedule below rather than tuning it --
+     * inter-CMG bandwidth (~119 GB/s) is the cap, not the work distribution.
+     * Requires all tasks in the batch to be bound, and enough threads that at
+     * least two CMGs are populated; otherwise it falls through unchanged. */
+    int cmg_ok = full_cmg_local && workers >= 2 * K3_CMG_CORES;
+    if (cmg_ok)
+        for (int i = 0; i < n; ++i)
+            if (tasks[i].cmg < 0) { cmg_ok = 0; break; }
+    if (cmg_ok) {
+        int order[n];
+        int head[K3_CMG_COUNT + 1] = {0}, fill[K3_CMG_COUNT];
+        for (int i = 0; i < n; ++i) ++head[tasks[i].cmg + 1];
+        for (int c = 0; c < K3_CMG_COUNT; ++c) head[c + 1] += head[c];
+        for (int c = 0; c < K3_CMG_COUNT; ++c) fill[c] = head[c];
+        for (int i = 0; i < n; ++i) order[fill[tasks[i].cmg]++] = i;
+#pragma omp parallel num_threads(workers)
+        {
+            int t = omp_get_thread_num();
+            int c = t / K3_CMG_CORES;
+            if (c >= K3_CMG_COUNT) c = K3_CMG_COUNT - 1;
+            int nl = full_cmg_threads(c, workers);
+            int lid = t - c * K3_CMG_CORES;
+            if (nl > 0)
+                for (int k = head[c] + lid; k < head[c + 1]; k += nl)
+                    full_bf16_run_task_local(&tasks[order[k]]);
+        }
+        omp_set_num_threads(threads > 0 ? threads : 1);
+        return;
+    }
     /* Pick the schedule from the batch's shape, because the two cases want
      * opposite answers and the difference is large in both directions.
      *
@@ -934,7 +1384,7 @@ static void full_bf16_many(float *const *outs,
 #pragma omp parallel for schedule(runtime)
 #endif
     for (int i = 0; i < n; ++i) {
-        full_bf16_run_task(&tasks[i]);
+        full_bf16_run_task_local(&tasks[i]);
     }
 #if defined(_OPENMP)
     omp_set_num_threads(threads > 0 ? threads : 1);
@@ -1151,6 +1601,48 @@ static int full_load_layer(k3_full_model *m, k3_full_layer *l,
         }
     }
 #undef FT
+    if (full_bf16_pv) {
+        /* Explicit list of the BF16 tensors consumed as matvec weights.  Listed
+         * rather than swept so a flat-read tensor can never be repacked; the
+         * ndims==2 guard in full_bf16_pv_repack is the second line of defence,
+         * and anything omitted keeps the row-major kernel and stays correct. */
+        k3_full_tensor *pv[] = {
+            &l->q_proj, &l->k_proj, &l->v_proj, &l->g_proj,
+            &l->f_a_proj, &l->f_b_proj, &l->b_proj, &l->o_proj,
+            &l->q_a_proj, &l->q_b_proj, &l->kv_a_proj, &l->kv_b_proj,
+            &l->mla_g_proj, &l->mla_o_proj,
+            &l->dense_gate, &l->dense_up, &l->dense_down,
+            &l->router, &l->routed_down, &l->routed_up,
+            &l->shared_gate, &l->shared_up, &l->shared_down,
+        };
+        for (size_t i = 0; i < sizeof pv / sizeof *pv; ++i) {
+            if (!pv[i]->data) continue;
+            int rc = full_bf16_pv_repack(pv[i]);
+            if (rc) return rc;
+        }
+    }
+    if (full_cmg_local) {
+        k3_full_tensor *cg[] = {
+            &l->q_proj, &l->k_proj, &l->v_proj, &l->g_proj,
+            &l->f_a_proj, &l->f_b_proj, &l->b_proj, &l->o_proj,
+            &l->q_a_proj, &l->q_b_proj, &l->kv_a_proj, &l->kv_b_proj,
+            &l->mla_g_proj, &l->mla_o_proj,
+            &l->dense_gate, &l->dense_up, &l->dense_down,
+            &l->router, &l->routed_down, &l->routed_up,
+            &l->shared_gate, &l->shared_up, &l->shared_down,
+        };
+        for (size_t i = 0; i < sizeof cg / sizeof *cg; ++i) {
+            full_cmg_force_tensor(cg[i]);
+            if (full_cmg_replicate_on) {
+                /* Replicas are local to every CMG, so any thread may take any
+                 * task: skip the map so full_bf16_many keeps its normal
+                 * schedule instead of the imbalanced CMG-routed one. */
+                (void)full_cmg_replicate(cg[i]);
+                continue;
+            }
+            (void)full_cmg_map_tensor(cg[i]);
+        }
+    }
     return 0;
 }
 
@@ -1337,8 +1829,12 @@ static void full_kda_forward(k3_full_model *m, k3_full_layer *l,
                       m->local_heads};
     int qkv_cols[] = {K3_HIDDEN, K3_HIDDEN, K3_HIDDEN, K3_HIDDEN, K3_HIDDEN,
                       K3_HIDDEN};
+    double kt = m->profile.enabled ? full_now() : 0.0;
+#define KDA_MARK(ph) do { if (m->profile.enabled) { \
+        full_profile_phase_add(m, (ph), full_now() - kt); kt = full_now(); } } while (0)
     full_bf16_many(qkv_outs, qkv_weights, qkv_inputs,
                    qkv_rows, qkv_cols, 6, m->threads);
+    KDA_MARK(K3_FULL_PHASE_KDA_QKV);
     memcpy(m->up, m->q, (size_t)channels * sizeof(float));
     k3_conv_step_sve(m->q, m->up, qstate, (const float *)l->q_conv.data,
                      NULL, channels, K3_FULL_CONV_KERNEL);
@@ -1348,6 +1844,7 @@ static void full_kda_forward(k3_full_model *m, k3_full_layer *l,
     memcpy(m->up, m->v, (size_t)channels * sizeof(float));
     k3_conv_step_sve(m->v, m->up, vstate, (const float *)l->v_conv.data,
                      NULL, channels, K3_FULL_CONV_KERNEL);
+    KDA_MARK(K3_FULL_PHASE_KDA_CONV);
     float *decay_outs[] = {m->gate};
     const k3_full_tensor *decay_weights[] = {&l->f_b_proj};
     const float *decay_inputs[] = {m->tmp};
@@ -1355,24 +1852,38 @@ static void full_kda_forward(k3_full_model *m, k3_full_layer *l,
     int decay_cols[] = {K3_HEAD_DIM};
     full_bf16_many(decay_outs, decay_weights, decay_inputs,
                    decay_rows, decay_cols, 1, m->threads);
+    KDA_MARK(K3_FULL_PHASE_KDA_DECAY_PROJ);
     for (int h = 0; h < m->local_heads; ++h) {
         k3_l2_normalize_sve(m->q + (size_t)h * K3_HEAD_DIM, K3_HEAD_DIM, 1.0e-6f);
         k3_l2_normalize_sve(m->k + (size_t)h * K3_HEAD_DIM, K3_HEAD_DIM, 1.0e-6f);
         m->tmp2[h] = k3_sigmoidf(m->tmp2[h]);
     }
-    k3_kda_log_decay(m->decay, m->gate, (const float *)l->a_log.data,
-                     (const float *)l->dt_bias.data, m->local_heads, K3_HEAD_DIM);
+    if (full_fast_exp)
+        full_kda_log_decay_fast(m->decay, m->gate, (const float *)l->a_log.data,
+                                (const float *)l->dt_bias.data,
+                                m->local_heads, K3_HEAD_DIM);
+    else
+        k3_kda_log_decay(m->decay, m->gate, (const float *)l->a_log.data,
+                         (const float *)l->dt_bias.data, m->local_heads, K3_HEAD_DIM);
     float *recurrent = m->kda_state +
         (size_t)l->state_slot * m->local_heads * K3_HEAD_DIM * K3_HEAD_DIM;
     float decay[(size_t)m->local_heads * K3_HEAD_DIM];
-    for (int i = 0; i < m->local_heads * K3_HEAD_DIM; ++i)
-        decay[i] = expf(m->decay[i]);
+    if (full_fast_exp)
+        full_exp_vec(decay, m->decay, m->local_heads * K3_HEAD_DIM);
+    else
+        for (int i = 0; i < m->local_heads * K3_HEAD_DIM; ++i)
+            decay[i] = expf(m->decay[i]);
+    KDA_MARK(K3_FULL_PHASE_KDA_SERIAL);
     k3_kda_step_decay_parallel_sve(m->attn, m->q, m->k, m->v, decay,
                     m->tmp2, recurrent, m->local_heads, K3_HEAD_DIM,
                     K3_HEAD_DIM, m->threads);
+    KDA_MARK(K3_FULL_PHASE_KDA_STEP);
     full_gated_rmsnorm_tensor(m->tmp, m->attn, m->expert_out,
                               &l->o_norm, channels);
+    KDA_MARK(K3_FULL_PHASE_KDA_GRMSNORM);
     full_bf16_matvec(out, &l->o_proj, K3_HIDDEN, channels, m->tmp, m->threads);
+    KDA_MARK(K3_FULL_PHASE_KDA_OPROJ);
+#undef KDA_MARK
 }
 
 static void full_mla_forward(k3_full_model *m, k3_full_layer *l,
@@ -1387,6 +1898,8 @@ static void full_mla_forward(k3_full_model *m, k3_full_layer *l,
                    latent_rows, latent_cols, 2, m->threads);
     full_rmsnorm_tensor(m->tmp, m->tmp, &l->q_a_norm, 1536);
     full_rmsnorm_tensor(m->tmp2, m->tmp2, &l->kv_a_norm, 512);
+    full_trace_mix(0, m->tmp, 1536);
+    full_trace_mix(1, m->tmp2, 576);
     float *attn_proj_outs[] = {m->q, m->k, m->gate};
     const k3_full_tensor *attn_proj_weights[] = {
         &l->q_b_proj, &l->kv_b_proj, &l->mla_g_proj,
@@ -1397,6 +1910,8 @@ static void full_mla_forward(k3_full_model *m, k3_full_layer *l,
     int attn_proj_cols[] = {1536, 512, K3_HIDDEN};
     full_bf16_many(attn_proj_outs, attn_proj_weights, attn_proj_inputs,
                    attn_proj_rows, attn_proj_cols, 3, m->threads);
+    full_trace_mix(2, m->q, channels);
+    full_trace_mix(3, m->k, m->local_heads * 256);
     /* kv_b consumes only the 512-dimensional compressed part. */
     int key_stride = m->max_seq * K3_FULL_MLA_QK;
     int value_stride = m->max_seq * K3_FULL_MLA_VALUE;
@@ -1414,14 +1929,32 @@ static void full_mla_forward(k3_full_model *m, k3_full_layer *l,
      * projection volume.  k3_attention_heads_parallel_sve splits each head's
      * token range across the team and merges with log-sum-exp; k3_ep_runner
      * already uses it (k3_ep_runner.c:715). */
-    k3_attention_heads_parallel_sve(m->attn, m->q, layer_keys, layer_values,
-                                    m->local_heads, position + 1, m->max_seq,
-                                    K3_FULL_MLA_QK, K3_FULL_MLA_VALUE,
-                                    m->threads, m->mla_scratch, m->mla_stats);
+    if (full_mla_serial_attn) {
+        for (int h = 0; h < m->local_heads; ++h)
+            k3_attention_sve(m->attn + (size_t)h * K3_FULL_MLA_VALUE,
+                             m->q + (size_t)h * K3_FULL_MLA_QK,
+                             layer_keys + (size_t)h * key_stride,
+                             layer_values + (size_t)h * value_stride,
+                             position + 1, K3_FULL_MLA_QK, K3_FULL_MLA_VALUE);
+    } else {
+        k3_attention_heads_parallel_sve(m->attn, m->q, layer_keys, layer_values,
+                                        m->local_heads, position + 1, m->max_seq,
+                                        K3_FULL_MLA_QK, K3_FULL_MLA_VALUE,
+                                        m->threads, m->mla_scratch, m->mla_stats);
+    }
+    full_trace_mix(4, m->attn, channels / 192 * 128);
+    /* The caller passes out == m->attn (full_forward_token), so feeding o_proj
+     * from m->attn made this matvec read its own output buffer: 47 threads write
+     * out[0..7167] while others still read attn[0..1023].  A real data race, and
+     * the reason MLA layers were not reproducible run to run while KDA -- which
+     * feeds o_proj from m->tmp -- always was.  Stage the gated attention in
+     * m->tmp (dead here: it held q_a, already consumed by the attn_proj batch)
+     * exactly as full_kda_forward does. */
     for (int i = 0; i < channels / 192 * 128; ++i)
-        m->attn[i] *= k3_sigmoidf(m->gate[i]);
+        m->tmp[i] = m->attn[i] * k3_sigmoidf(m->gate[i]);
     full_bf16_matvec(out, &l->mla_o_proj, K3_HIDDEN,
-                     m->local_heads * K3_HEAD_DIM, m->attn, m->threads);
+                     m->local_heads * K3_HEAD_DIM, m->tmp, m->threads);
+    full_trace_mix(5, out, K3_HIDDEN);
 }
 
 static void full_dense_forward(k3_full_model *m, k3_full_layer *l,
@@ -1434,7 +1967,7 @@ static void full_dense_forward(k3_full_model *m, k3_full_layer *l,
     int gate_up_cols[] = {K3_HIDDEN, K3_HIDDEN};
     full_bf16_many(gate_up_outs, gate_up_weights, gate_up_inputs,
                    gate_up_rows, gate_up_cols, 2, m->threads);
-    k3_situ_sve(m->expert_gate, m->expert_gate, m->expert_up, local_inter);
+    full_situ(m->expert_gate, m->expert_gate, m->expert_up, local_inter);
     full_bf16_matvec(out, &l->dense_down, K3_HIDDEN, local_inter,
                      m->expert_gate, m->threads);
 }
@@ -1523,11 +2056,18 @@ static int full_moe_forward_expert_tp(k3_full_model *m, k3_full_layer *l,
     const float *shared_inputs[] = {x, x};
     int shared_rows[] = {local_shared, local_shared};
     int shared_cols[] = {K3_HIDDEN, K3_HIDDEN};
+    double st = m->profile.enabled ? full_now() : 0.0;
+#define SH_MARK(ph) do { if (m->profile.enabled) { \
+        full_profile_phase_add(m, (ph), full_now() - st); st = full_now(); } } while (0)
     full_bf16_many(shared_outs, shared_weights, shared_inputs,
                    shared_rows, shared_cols, 2, m->threads);
-    k3_situ_sve(m->expert_gate, m->expert_gate, m->expert_up, local_shared);
+    SH_MARK(K3_FULL_PHASE_SHARED_GATEUP);
+    full_situ(m->expert_gate, m->expert_gate, m->expert_up, local_shared);
+    SH_MARK(K3_FULL_PHASE_SHARED_SITU);
     full_bf16_matvec(m->shared_hidden, &l->shared_down, K3_HIDDEN,
                      local_shared, m->expert_gate, m->threads);
+    SH_MARK(K3_FULL_PHASE_SHARED_DOWN);
+#undef SH_MARK
     if (prefetch_active) pthread_join(prefetch_thread, NULL);
     if (m->profile.enabled) {
         full_profile_phase_add(m, K3_FULL_PHASE_MOE_SHARED,
@@ -1555,11 +2095,18 @@ static int full_moe_forward_expert_tp(k3_full_model *m, k3_full_layer *l,
             return EINVAL;
         }
     }
+    double ft = m->profile.enabled ? full_now() : 0.0;
     full_rmsnorm_tensor(m->tmp, m->reduce, &l->routed_norm, K3_LATENT);
     memset(out, 0, K3_HIDDEN * sizeof(float));
     full_bf16_matvec(out + hidden_start, &l->routed_up, local_hidden,
                      K3_LATENT, m->tmp, m->threads);
+    if (m->profile.enabled) {
+        full_profile_phase_add(m, K3_FULL_PHASE_FINISH_MATVEC, full_now() - ft);
+        ft = full_now();
+    }
     if (local_hidden != K3_HIDDEN && full_sum(m, out, K3_HIDDEN)) return EIO;
+    if (m->profile.enabled)
+        full_profile_phase_add(m, K3_FULL_PHASE_FINISH_REDUCE, full_now() - ft);
     full_add(out, m->reduce + K3_LATENT, K3_HIDDEN);
     if (m->profile.enabled)
         full_profile_phase_add(m, K3_FULL_PHASE_MOE_FINISH,
@@ -1629,7 +2176,7 @@ static int full_moe_forward(k3_full_model *m, k3_full_layer *l,
     int shared_cols[] = {K3_HIDDEN, K3_HIDDEN};
     full_bf16_many(shared_outs, shared_weights, shared_inputs,
                    shared_rows, shared_cols, 2, m->threads);
-    k3_situ_sve(m->expert_gate, m->expert_gate, m->expert_up, local_shared);
+    full_situ(m->expert_gate, m->expert_gate, m->expert_up, local_shared);
     full_bf16_matvec(m->tmp2, &l->shared_down, K3_HIDDEN,
                      local_shared, m->expert_gate, m->threads);
     full_add(m->moe_hidden, m->tmp2, K3_HIDDEN);
@@ -2386,6 +2933,10 @@ static int full_debug_run(k3_full_options *o, tp_comm *comm, tp_comm *comm_col,
                    (double)generated_count / decode_seconds : 0.0,
                o->output_path, (unsigned long long)output_hash);
     }
+    if (full_mla_trace)
+        for (int i = 0; i < 6; ++i)
+            fprintf(stderr, "k3: mla-trace %-18s %016llx\n",
+                    full_trace_name[i], (unsigned long long)full_trace_h[i]);
     full_barrier();
     free(prompt);
     free(generated);
@@ -2396,6 +2947,7 @@ int main(int argc, char **argv) {
     k3_full_options opt;
     int parsed = full_options(argc, argv, &opt);
     if (parsed) return parsed > 0 ? 0 : 2;
+    full_bf16_rows_init();
     omp_set_dynamic(0);
     omp_set_num_threads(opt.threads);
 
