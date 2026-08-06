@@ -62,7 +62,7 @@ cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
     if (cuewInit(CUEW_INIT_CUDA) != CUEW_SUCCESS || cuInit(0) != CUDA_SUCCESS) return NULL;
     cuda_ds4f_mxfp4 *c = (cuda_ds4f_mxfp4 *)calloc(1, sizeof(*c)); if (!c) return NULL;
     c->verbose = verbose;
-    c->cache_limit = (size_t)(12500ull * 1024 * 1024);
+    c->cache_limit = (size_t)(12000ull * 1024 * 1024);
     {   const char *e = getenv("DS4F_CUDA_MXFP4_CACHE_MB");
         if (e && *e) {
             long mb = atol(e);

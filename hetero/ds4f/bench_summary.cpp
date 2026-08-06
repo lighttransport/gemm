@@ -16,9 +16,10 @@
 // Run:    ./bench_summary /tmp/ds4f_nocopy_ep8 [--binary ./build/test_hip_ds4f_real]
 //
 // The exact route stays 0/64; the accelerated routes are approximate (~1/64).
-// The CUDA weight cache is one contiguous pool (default 12.5 GB -- a single
+// The CUDA weight cache is one contiguous pool (default 12 GB -- a single
 // cuMemAlloc reaches ~13 GB on this driver, vs ~10.8 GB for the per-tensor
-// 4.46 MB allocations), so the split's 29 CUDA layers now preload fully.
+// 4.46 MB allocations).  12 GB leaves ~1 GB for the batch buffers at M=4096
+// (12.5 GB OOM'd the buffer allocs and dropped cuda-stream to ~26 tok/s).
 
 #include <cstdio>
 #include <cstdlib>
