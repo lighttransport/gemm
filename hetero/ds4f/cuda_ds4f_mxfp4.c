@@ -32,6 +32,14 @@ struct cuda_ds4f_mxfp4 {
     size_t cache_bytes, cache_limit;
     unsigned long long cache_age;
     unsigned long long cache_hits, cache_misses, cache_evictions;
+    /* Contiguous weight pool: one big cuMemAlloc (the ~2363 separate 4.46 MB
+     * allocations fragmented the heap and topped out at ~10.8 GB; a single
+     * allocation reaches ~13 GB on this driver).  Sub-sliced by bump + a free
+     * list of evicted slots, so the cache can hold ~30 resident layers. */
+    CUdeviceptr cache_pool;
+    size_t cache_pool_size, cache_pool_used;
+    struct { size_t off, size; } pool_free[128];
+    int n_pool_free;
     int active_cache_slot;
     int rows, cols, nsm; int verbose; int terms;
     cuda_batch_buf *b;
@@ -54,7 +62,7 @@ cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
     if (cuewInit(CUEW_INIT_CUDA) != CUEW_SUCCESS || cuInit(0) != CUDA_SUCCESS) return NULL;
     cuda_ds4f_mxfp4 *c = (cuda_ds4f_mxfp4 *)calloc(1, sizeof(*c)); if (!c) return NULL;
     c->verbose = verbose;
-    c->cache_limit = (size_t)10 * 1024 * 1024 * 1024;
+    c->cache_limit = (size_t)(12500ull * 1024 * 1024);
     {   const char *e = getenv("DS4F_CUDA_MXFP4_CACHE_MB");
         if (e && *e) {
             long mb = atol(e);
@@ -90,13 +98,21 @@ cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
     if (sh < 65536) sh = 65536;
     cuFuncSetAttribute(c->gemm, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, sh);
     cuFuncSetAttribute(c->gemm64, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, sh);
+    /* One contiguous pool avoids the small-allocation fragmentation ceiling. */
+    if (cuMemAlloc(&c->cache_pool, c->cache_limit) != CUDA_SUCCESS)
+        c->cache_pool = 0;
+    c->cache_pool_size = c->cache_pool ? c->cache_limit : 0;
     return c;
 fail: cuda_ds4f_mxfp4_destroy(c); return NULL;
 }
 void cuda_ds4f_mxfp4_destroy(cuda_ds4f_mxfp4 *c) {
     if (!c) return; if (c->stream) cuStreamSynchronize(c->stream);
-    for (int i = 0; i < DS4F_CUDA_MXFP4_CACHE_SLOTS; ++i)
-        if (c->cache[i].valid) cuMemFree(c->cache[i].d);
+    if (c->cache_pool) {
+        cuMemFree(c->cache_pool);
+    } else {
+        for (int i = 0; i < DS4F_CUDA_MXFP4_CACHE_SLOTS; ++i)
+            if (c->cache[i].valid) cuMemFree(c->cache[i].d);
+    }
     if (c->verbose && (c->cache_hits || c->cache_misses))
         fprintf(stderr, "CUDA MXFP4 cache: hits=%llu misses=%llu evictions=%llu resident=%.1f MB\n",
                 c->cache_hits, c->cache_misses, c->cache_evictions,
@@ -125,7 +141,11 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     if (!c || !w || !s || rows <= 0 || cols <= 0 || (cols & 127)) return -1;
     if (cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) return -1;
     size_t nb = (size_t)cols / 32, bytes = (size_t)rows * nb * 17, rb = (size_t)cols / 2;
-    if (c->active_cache_slot < 0 && c->w) { cuMemFree(c->w); c->w = 0; }
+    if (c->active_cache_slot < 0 && c->w &&
+        !(c->cache_pool && c->w >= c->cache_pool &&
+          c->w < c->cache_pool + c->cache_pool_used)) {
+        cuMemFree(c->w); c->w = 0;
+    }
     for (int i = 0; i < DS4F_CUDA_MXFP4_CACHE_SLOTS; ++i) {
         cuda_mxfp4_cache_entry *e = &c->cache[i];
         if (e->valid && e->wkey == w && e->skey == s &&
@@ -168,7 +188,14 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
             for (int i = 0; i < DS4F_CUDA_MXFP4_CACHE_SLOTS; ++i)
                 if (c->cache[i].valid && (victim < 0 || c->cache[i].age < c->cache[victim].age)) victim = i;
             if (victim < 0) break;
-            cuMemFree(c->cache[victim].d);
+            if (c->cache_pool) {
+                if (c->n_pool_free < 128) {
+                    c->pool_free[c->n_pool_free].off =
+                        (size_t)(c->cache[victim].d - c->cache_pool);
+                    c->pool_free[c->n_pool_free].size = c->cache[victim].bytes;
+                    c->n_pool_free++;
+                }
+            } else cuMemFree(c->cache[victim].d);
             c->cache_evictions++;
             c->cache_bytes -= c->cache[victim].bytes;
             c->cache[victim].valid = 0;
@@ -178,10 +205,29 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     }
     c->cache_misses++;
     CUdeviceptr d = 0;
-    CUresult ar = cuMemAlloc(&d, bytes);
-    if (ar != CUDA_SUCCESS || cuMemcpyHtoD(d, p, bytes) != CUDA_SUCCESS) {
-        if (d) cuMemFree(d);
-        return -1;
+    if (c->cache_pool) {
+        size_t aligned = (bytes + 255) & ~255;
+        size_t off = (size_t)-1;
+        for (int i = 0; i < c->n_pool_free; ++i)
+            if (c->pool_free[i].size >= bytes) {
+                off = c->pool_free[i].off;
+                c->n_pool_free--;
+                c->pool_free[i] = c->pool_free[c->n_pool_free];
+                break;
+            }
+        if (off == (size_t)-1) {
+            if (c->cache_pool_used + aligned > c->cache_pool_size) return -1;
+            off = c->cache_pool_used;
+            c->cache_pool_used += aligned;
+        }
+        d = c->cache_pool + off;
+        if (cuMemcpyHtoD(d, p, bytes) != CUDA_SUCCESS) return -1;
+    } else {
+        CUresult ar = cuMemAlloc(&d, bytes);
+        if (ar != CUDA_SUCCESS || cuMemcpyHtoD(d, p, bytes) != CUDA_SUCCESS) {
+            if (d) cuMemFree(d);
+            return -1;
+        }
     }
     if (slot >= 0) {
         cuda_mxfp4_cache_entry *e = &c->cache[slot];

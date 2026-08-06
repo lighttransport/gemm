@@ -636,11 +636,18 @@ routes are approximate (~1/64); the exact default stays 0/64 at batch 64.
 
 | batch | exact | rocm-expert | cuda-stream | split |
 |---:|---:|---:|---:|---:|
-| 256 | 40.1 | 40.1 | 28.4 | 34.1 |
-| 512 | 41.2 | 42.4 | 32.9 | 38.4 |
-| 1024 | 45.8 | 46.2 | 41.5 | 42.8 |
-| 2048 | 52.6 | 53.8 | 43.5 | 48.9 |
-| 4096 | 56.0 | 56.6 | 39.8 | 52.4 |
+| 256 | 40.1 | 40.1 | 28.4 | **56.4** |
+| 512 | 41.2 | 42.4 | 32.9 | **54.8** |
+| 1024 | 45.8 | 46.2 | 41.5 | **57.3** |
+| 2048 | 52.6 | 53.8 | 43.5 | **56.8** |
+| 4096 | 56.0 | 56.6 | 39.8 | **57.0** |
+
+The split now preloads all 29 CUDA layers: the cache is a single contiguous
+12.5 GB pool (one `cuMemAlloc`; the driver tops out at ~13 GB for one
+allocation vs ~10.8 GB for the old per-tensor 4.46 MB chunks, which
+fragmented the heap), so the split is flat ~55-57 tok/s at every batch.
+`DS4F_CUDA_MXFP4_CACHE_MB` overrides the pool size (the driver's realistic
+single-allocation ceiling, not the 14.4 GB nvidia-smi "free").
 
 `rocm-expert`: `--hip-mxfp4-resident-layers 14 --hip-mxfp4-stream-raw 1`;
 `cuda-stream`: `--dual-cuda-resident-from 0 --dual-cuda-preload 0`;

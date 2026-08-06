@@ -16,6 +16,9 @@
 // Run:    ./bench_summary /tmp/ds4f_nocopy_ep8 [--binary ./build/test_hip_ds4f_real]
 //
 // The exact route stays 0/64; the accelerated routes are approximate (~1/64).
+// The CUDA weight cache is one contiguous pool (default 12.5 GB -- a single
+// cuMemAlloc reaches ~13 GB on this driver, vs ~10.8 GB for the per-tensor
+// 4.46 MB allocations), so the split's 29 CUDA layers now preload fully.
 
 #include <cstdio>
 #include <cstdlib>
@@ -50,10 +53,10 @@ std::string config_flags(const char *key) {
         return " --hip-mxfp4-resident-layers 14 --hip-mxfp4-stream-raw 1";
     if (!strcmp(key, "cuda"))
         return " --dual-gpu 1 --dual-cuda-small-buckets 1 --dual-cuda-terms 2"
-               " --dual-cuda-resident-from 0 --dual-cuda-preload 0";
+               " --dual-cuda-resident-from 0";
     if (!strcmp(key, "split"))
         return " --dual-gpu 1 --dual-cuda-small-buckets 1 --dual-cuda-terms 2"
-               " --dual-cuda-resident-from 14 --dual-cuda-preload 0"
+               " --dual-cuda-resident-from 14"
                " --hip-mxfp4-resident-layers 14 --hip-mxfp4-stream-raw 1";
     return "";
 }
