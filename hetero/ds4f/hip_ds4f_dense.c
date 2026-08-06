@@ -131,6 +131,10 @@ struct hip_ds4f_dense {
     size_t multi_hx_cap[HIP_DS4F_ASYNC_MAX], multi_hy_cap[HIP_DS4F_ASYNC_MAX];
 
     void *gemm_dx, *gemm_dy;
+    void *gemm_dy_tile;
+    size_t gemm_dy_tile_bytes;
+    float *gemm_yh_tile;
+    size_t gemm_yh_tile_bytes;
     void *gemm_mxfp4_tasks;
     size_t gemm_mxfp4_tasks_bytes;
     void *fp8_lut;
@@ -458,6 +462,8 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (ctx->dy) hipFree(ctx->dy);
     if (ctx->gemm_dx) hipFree(ctx->gemm_dx);
     if (ctx->gemm_dy) hipFree(ctx->gemm_dy);
+    if (ctx->gemm_dy_tile) hipFree(ctx->gemm_dy_tile);
+    if (ctx->gemm_yh_tile) hipHostFree(ctx->gemm_yh_tile);
     if (ctx->attn_q) hipFree(ctx->attn_q);
     if (ctx->attn_kv) hipFree(ctx->attn_kv);
     if (ctx->attn_sink) hipFree(ctx->attn_sink);
@@ -1349,6 +1355,30 @@ static int ensure_gemm_vectors(hip_ds4f_dense *ctx, size_t x_bytes, size_t y_byt
     return 0;
 }
 
+static int ensure_gemm_y_tile(hip_ds4f_dense *ctx, size_t y_bytes) {
+    if (ctx->gemm_dy_tile && ctx->gemm_dy_tile_bytes >= y_bytes) return 0;
+    void *dy = NULL;
+    if (hipMalloc(&dy, y_bytes) != hipSuccess) {
+        fprintf(stderr, "hip_ds4f_dense: batched GEMM tile allocation failed\n");
+        return -1;
+    }
+    if (ctx->gemm_dy_tile) hipFree(ctx->gemm_dy_tile);
+    ctx->gemm_dy_tile = dy; ctx->gemm_dy_tile_bytes = y_bytes;
+    return 0;
+}
+
+static int ensure_gemm_yh_tile(hip_ds4f_dense *ctx, size_t y_bytes) {
+    if (ctx->gemm_yh_tile && ctx->gemm_yh_tile_bytes >= y_bytes) return 0;
+    float *yh = NULL;
+    if (hipHostMalloc(&yh, y_bytes, 0) != hipSuccess) {
+        fprintf(stderr, "hip_ds4f_dense: batched GEMM host tile allocation failed\n");
+        return -1;
+    }
+    if (ctx->gemm_yh_tile) hipHostFree(ctx->gemm_yh_tile);
+    ctx->gemm_yh_tile = yh; ctx->gemm_yh_tile_bytes = y_bytes;
+    return 0;
+}
+
 static int ensure_gemm_x(hip_ds4f_dense *ctx, size_t x_bytes) {
     if (ctx->gemm_dx && ctx->gemm_x_bytes >= x_bytes) return 0;
     void *dx = NULL;
@@ -1617,7 +1647,26 @@ int hip_ds4f_dense_gemm_tensor(
         }
         if (Ystride != N) yh = ctx->gemm_y_pack;
     }
-    if (ensure_gemm_vectors(ctx, x_bytes, y_bytes) != 0) return -1;
+    /* Large outputs (the M~4096 head is [M, 129280] = 2.1 GB) must not need a
+     * full-size device scratch: on the 16 GB RX 9070 XT the resident expert
+     * set + prefill buffers leave no room, the gemm fails, and ds4f_gemm()
+     * silently falls back to a ~20x slower CPU GEMM (the batch-4096 taper).
+     * Tile the N dimension so the scratch stays <= 256 MB when Ystride == N
+     * (the head / wq_b layouts). */
+    size_t tiled_max = 256u << 20;
+    const char *nt = getenv("DS4F_NO_GEMM_TILE");
+    int tile = (!nt && Ystride == N && y_bytes > tiled_max) ? 1 : 0;
+    int nchunk = 1, chunkN = N;
+    if (tile) {
+        nchunk = (int)((y_bytes + tiled_max - 1) / tiled_max);
+        chunkN = ((N + nchunk - 1) / nchunk + 63) & ~63;
+        if (chunkN > N) chunkN = N;
+        if (chunkN < 64) chunkN = 64;
+        if (ensure_gemm_x(ctx, x_bytes) != 0 ||
+            ensure_gemm_y_tile(ctx, (size_t)M * (size_t)chunkN * sizeof(float)) != 0 ||
+            ensure_gemm_yh_tile(ctx, (size_t)M * (size_t)chunkN * sizeof(float)) != 0)
+            return -1;
+    } else if (ensure_gemm_vectors(ctx, x_bytes, y_bytes) != 0) return -1;
     /* Route both directions through the pinned pack buffers even when the
      * strides already match, so the transfers are real async DMA. */
     if (ensure_gemm_host_pack(ctx, x_bytes, y_bytes) == 0) {
@@ -1629,66 +1678,77 @@ int hip_ds4f_dense_gemm_tensor(
     if (hipMemcpy(ctx->gemm_dx, xh, x_bytes, hipMemcpyHostToDevice) != hipSuccess)
         return -1;
 
-    unsigned int gx = (unsigned int)((N + 63) / 64);
-    unsigned int gy = (unsigned int)((M + 15) / 16);
-    hipError_t err;
-    if (matrix_is_mxfp4(mat->kind)) {
-        void *dw = mat->dw, *ds = mat->ds;
-        void *dx = ctx->gemm_dx, *dy = ctx->gemm_dy;
-        int n_out = N, n_in = K, n_tok = M;
-        void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok };
-        err = hipModuleLaunchKernel(ctx->gemm_mxfp4, gx, gy, 1, 16, 16, 1, 0,
-                                    ctx->stream, args, NULL);
-    } else if (matrix_is_fp8_rowscale(mat->kind)) {
-        void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K;
-        void *ds = (uint8_t *)mat->ds + (size_t)row0 * (size_t)mat->scale_cols;
-        void *dx = ctx->gemm_dx, *dy = ctx->gemm_dy, *lut = ctx->fp8_lut;
-        int n_out = N, n_in = K, n_tok = M, scale_cols = mat->scale_cols;
-        void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
-        err = hipModuleLaunchKernel(ctx->gemm_fp8_rowscale, gx, gy, 1, 16, 16, 1, 0,
-                                    ctx->stream, args, NULL);
-    } else if (matrix_is_fp8_ordered(mat->kind)) {
-        void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K;
-        void *ds = (uint8_t *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols;
-        void *dx = ctx->gemm_dx, *dy = ctx->gemm_dy, *lut = ctx->fp8_lut;
-        int n_out = N, n_in = K, n_tok = M, scale_cols = mat->scale_cols;
-        void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
-        err = hipModuleLaunchKernel(ctx->gemm_fp8_ordered, gx, gy, 1, 16, 16, 1, 0,
-                                    ctx->stream, args, NULL);
-    } else if (matrix_is_fp8(mat->kind)) {
-        void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K;
-        void *ds = (uint8_t *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols;
-        void *dx = ctx->gemm_dx, *dy = ctx->gemm_dy, *lut = ctx->fp8_lut;
-        int n_out = N, n_in = K, n_tok = M, scale_cols = mat->scale_cols;
-        void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
-        err = hipModuleLaunchKernel(ctx->gemm_fp8, gx, gy, 1, 16, 16, 1, 0,
-                                    ctx->stream, args, NULL);
-    } else if (matrix_is_bf16(mat->kind)) {
-        void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t);
-        void *dx = ctx->gemm_dx, *dy = ctx->gemm_dy, *bias = NULL;
-        int n_out = N, n_in = K, n_tok = M;
-        void *args[] = { &dy, &dw, &dx, &bias, &n_out, &n_in, &n_tok };
-        err = hipModuleLaunchKernel(ctx->gemm_bf16, gx, gy, 1, 16, 16, 1, 0,
-                                    ctx->stream, args, NULL);
-    } else {
-        void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t);
-        void *dx = ctx->gemm_dx, *dy = ctx->gemm_dy, *bias = NULL;
-        int n_out = N, n_in = K, n_tok = M;
-        void *args[] = { &dy, &dw, &dx, &bias, &n_out, &n_in, &n_tok };
-        err = hipModuleLaunchKernel(ctx->gemm_f16, gx, gy, 1, 16, 16, 1, 0,
-                                    ctx->stream, args, NULL);
-    }
-    if (err != hipSuccess || hipStreamSynchronize(ctx->stream) != hipSuccess)
-        return -1;
-    if (ctx->gemm_y_pack && ctx->gemm_y_pack_bytes >= y_bytes) {
-        if (hipMemcpyAsync(ctx->gemm_y_pack, ctx->gemm_dy, y_bytes,
-                           hipMemcpyDeviceToHost, ctx->stream) != hipSuccess ||
-            hipStreamSynchronize(ctx->stream) != hipSuccess)
+    const int n_in = K, n_tok = M;
+    for (int c = 0; c < nchunk; ++c) {
+        int c0 = c * chunkN, cn = (c0 + chunkN <= N) ? chunkN : N - c0;
+        unsigned int gx = (unsigned int)((cn + 63) / 64);
+        unsigned int gy = (unsigned int)((M + 15) / 16);
+        int n_out = cn;
+        hipError_t err;
+        void *dy = tile ? ctx->gemm_dy_tile : ctx->gemm_dy;
+        void *dx = ctx->gemm_dx;
+        if (matrix_is_mxfp4(mat->kind)) {
+            void *dw = (uint8_t *)mat->dw + (size_t)c0 * (size_t)(K / 2);
+            void *ds = (uint8_t *)mat->ds + (size_t)c0 * (size_t)(K / 32);
+            void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok };
+            err = hipModuleLaunchKernel(ctx->gemm_mxfp4, gx, gy, 1, 16, 16, 1, 0,
+                                        ctx->stream, args, NULL);
+        } else if (matrix_is_fp8_rowscale(mat->kind)) {
+            void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K + (size_t)c0 * (size_t)K;
+            void *ds = (uint8_t *)mat->ds + (size_t)row0 * (size_t)mat->scale_cols + (size_t)c0 * (size_t)mat->scale_cols;
+            void *lut = ctx->fp8_lut;
+            int scale_cols = mat->scale_cols;
+            void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
+            err = hipModuleLaunchKernel(ctx->gemm_fp8_rowscale, gx, gy, 1, 16, 16, 1, 0,
+                                        ctx->stream, args, NULL);
+        } else if (matrix_is_fp8_ordered(mat->kind)) {
+            void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K + (size_t)c0 * (size_t)K;
+            void *ds = (uint8_t *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols + (size_t)(c0 / 128) * (size_t)mat->scale_cols;
+            void *lut = ctx->fp8_lut;
+            int scale_cols = mat->scale_cols;
+            void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
+            err = hipModuleLaunchKernel(ctx->gemm_fp8_ordered, gx, gy, 1, 16, 16, 1, 0,
+                                        ctx->stream, args, NULL);
+        } else if (matrix_is_fp8(mat->kind)) {
+            void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K + (size_t)c0 * (size_t)K;
+            void *ds = (uint8_t *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols + (size_t)(c0 / 128) * (size_t)mat->scale_cols;
+            void *lut = ctx->fp8_lut;
+            int scale_cols = mat->scale_cols;
+            void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
+            err = hipModuleLaunchKernel(ctx->gemm_fp8, gx, gy, 1, 16, 16, 1, 0,
+                                        ctx->stream, args, NULL);
+        } else if (matrix_is_bf16(mat->kind)) {
+            void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t) + (size_t)c0 * (size_t)K * sizeof(uint16_t);
+            void *bias = NULL;
+            void *args[] = { &dy, &dw, &dx, &bias, &n_out, &n_in, &n_tok };
+            err = hipModuleLaunchKernel(ctx->gemm_bf16, gx, gy, 1, 16, 16, 1, 0,
+                                        ctx->stream, args, NULL);
+        } else {
+            void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t) + (size_t)c0 * (size_t)K * sizeof(uint16_t);
+            void *bias = NULL;
+            void *args[] = { &dy, &dw, &dx, &bias, &n_out, &n_in, &n_tok };
+            err = hipModuleLaunchKernel(ctx->gemm_f16, gx, gy, 1, 16, 16, 1, 0,
+                                        ctx->stream, args, NULL);
+        }
+        if (err != hipSuccess || hipStreamSynchronize(ctx->stream) != hipSuccess)
             return -1;
-        if (yh != ctx->gemm_y_pack) memcpy(yh, ctx->gemm_y_pack, y_bytes);
-        else yh = ctx->gemm_y_pack;
-    } else if (hipMemcpy(yh, ctx->gemm_dy, y_bytes, hipMemcpyDeviceToHost) != hipSuccess)
-        return -1;
+        size_t cbytes = (size_t)M * (size_t)cn * sizeof(float);
+        float *dstr = (float *)yh + (size_t)c0;
+        if (tile) {
+            if (hipMemcpy(ctx->gemm_yh_tile, dy, cbytes, hipMemcpyDeviceToHost) != hipSuccess)
+                return -1;
+            for (int mm = 0; mm < M; ++mm)
+                memcpy(dstr + (size_t)mm * N, (float *)ctx->gemm_yh_tile + (size_t)mm * cn,
+                       (size_t)cn * sizeof(float));
+        } else if (ctx->gemm_y_pack && ctx->gemm_y_pack_bytes >= y_bytes) {
+            if (hipMemcpyAsync(ctx->gemm_y_pack, dy, cbytes,
+                               hipMemcpyDeviceToHost, ctx->stream) != hipSuccess ||
+                hipStreamSynchronize(ctx->stream) != hipSuccess)
+                return -1;
+            if (yh != ctx->gemm_y_pack) memcpy(yh, ctx->gemm_y_pack, cbytes);
+        } else if (hipMemcpy(yh, dy, cbytes, hipMemcpyDeviceToHost) != hipSuccess) return -1;
+    }
+
     if (Ystride != N) for (int mm = 0; mm < M; mm++)
         memcpy(dst + (size_t)mm*Ystride, yh + (size_t)mm*N, (size_t)N*sizeof(float));
     return 0;
