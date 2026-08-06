@@ -57,7 +57,8 @@ std::string config_flags(const char *key) {
     if (!strcmp(key, "split"))
         return " --dual-gpu 1 --dual-cuda-small-buckets 1 --dual-cuda-terms 2"
                " --dual-cuda-resident-from 14"
-               " --hip-mxfp4-resident-layers 14 --hip-mxfp4-stream-raw 1";
+               " --hip-mxfp4-resident-layers 14 --hip-mxfp4-stream-raw 1"
+               " --hip-prefill-attn 1";
     return "";
 }
 

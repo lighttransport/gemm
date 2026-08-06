@@ -636,11 +636,16 @@ routes are approximate (~1/64); the exact default stays 0/64 at batch 64.
 
 | batch | exact | rocm-expert | cuda-stream | split |
 |---:|---:|---:|---:|---:|
-| 256 | 40.1 | 40.1 | 28.4 | **56.4** |
-| 512 | 41.2 | 42.4 | 32.9 | **54.8** |
-| 1024 | 45.8 | 46.2 | 41.5 | **57.3** |
-| 2048 | 52.6 | 53.8 | 43.5 | **56.8** |
-| 4096 | 56.0 | 56.6 | 39.8 | **57.0** |
+| 256 | 40.6 | 40.3 | 30.6 | **61.7** |
+| 512 | 41.3 | 41.2 | 34.0 | **62.4** |
+| 1024 | 46.7 | 45.8 | 40.3 | **63.4** |
+| 2048 | 52.1 | 54.1 | 49.1 | **65.4** |
+| 4096 | 57.1 | 57.9 | 24.8 | **64.9** |
+
+The recommended prefill config is the split with the GPU sliding-window
+attention (`--hip-prefill-attn 1`): ~62-65 tok/s flat at every batch.  The
+GPU attention frees the CPU attention (was ~23% of the time) but is
+approximate like the other accelerated routes (exact default stays 0/64).
 
 The split now preloads all 29 CUDA layers: the cache is a single contiguous
 12.5 GB pool (one `cuMemAlloc`; the driver tops out at ~13 GB for one
