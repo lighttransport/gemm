@@ -698,6 +698,18 @@ The dual split (ROCm head 14 + CUDA tail) reaches 50.6 tok/s at batch 4096
 but is otherwise behind the ROCm-only route, which is the recommended large
 batch prefill config.
 
+**Single-token decode is ~17 tok/s; batch it.** The M=1 decode
+(`--iters`, `ds4f_forward_token`) reads ~9 GB of weights per token (dense
+~5.8 GB + routed experts ~3.4 GB) at ~190 GB/s effective -- the dense
+projections already run on the ROCm as M=1 matvecs and the MXFP4 experts now
+also have an M=1 ROCm path (`a0214381`), but the per-token serialized
+launch+sync leaves both GPUs far from their read bandwidth.  Profile (exact):
+qkv 12.0, o_proj 12.0, experts 16.8, shared 8.0, attn 4.3 ms/token.  The
+batched path (ds4f_forward_prefill, "M independent forward_token calls with
+the dense projections batched so each weight is read from HBM once") is the
+2.5-3x speedup: 42 tok/s exact at batch 64, 51-55 tok/s ROCm-expert at
+batch 1024-4096.
+
 
 The historical measurements below predate these fixes.
 
