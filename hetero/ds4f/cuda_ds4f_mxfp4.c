@@ -180,7 +180,6 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     CUdeviceptr d = 0;
     CUresult ar = cuMemAlloc(&d, bytes);
     if (ar != CUDA_SUCCESS || cuMemcpyHtoD(d, p, bytes) != CUDA_SUCCESS) {
-        if (getenv("DS4F_DBG_BATCH")) { const char *es=NULL; if (cuGetErrorString) cuGetErrorString(ar, &es); fprintf(stderr, "LOADFAIL %dx%d bytes=%zu arr=%d %s cache=%.1fGB\n", rows, cols, bytes, ar, es?es:"?", (double)c->cache_bytes/1e9); }
         if (d) cuMemFree(d);
         return -1;
     }
@@ -382,14 +381,13 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
     if (dbg < 0) { const char *d = getenv("DS4F_DBG_BATCH"); dbg = d ? atoi(d) : 0; }
     struct timespec t0, t1;
     if (dbg) clock_gettime(CLOCK_MONOTONIC, &t0);
-    if (!c || n < 1 || n > 32 || cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL early n=%d c=%p\n", n, (void*)c); return -1; }
-    if (!cuMemHostAlloc || !cuMemFreeHost || !cuMemcpyHtoDAsync) { if (dbg) fprintf(stderr, "BATCHFAIL apis\n"); return -1; }
-    int failstage = 0; int failwhat = 0;
+    if (!c || n < 1 || n > 32 || cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) return -1;
+    if (!cuMemHostAlloc || !cuMemFreeHost || !cuMemcpyHtoDAsync) return -1;
     if (n > c->cap_batch) {
         int cap = c->cap_batch ? c->cap_batch * 2 : 16;
         if (cap < n) cap = n;
         cuda_batch_buf *nb = (cuda_batch_buf *)realloc(c->b, (size_t)cap * sizeof(*nb));
-        if (!nb) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        if (!nb) return -1;
         memset(nb + c->cap_batch, 0, (size_t)(cap - c->cap_batch) * sizeof(*nb));
         c->b = nb; c->cap_batch = cap;
     }
@@ -398,8 +396,8 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
     CUdeviceptr dw[32]; int use64[32], Mp[32], sk[32], ntx[32], fix[32];
     /* pass 1: load every weight; all must be resident (no temp). */
     for (int i = 0; i < n; ++i) {
-        if (cuda_ds4f_mxfp4_load(c, w[i], s[i], rows[i], cols[i]) != 0) { if (dbg) fprintf(stderr, "BATCHFAIL load i=%d\n", i); return -1; }
-        if (c->active_cache_slot < 0) { if (dbg) fprintf(stderr, "BATCHFAIL temp i=%d\n", i); return -1; }   /* temp: not batch-safe */
+        if (cuda_ds4f_mxfp4_load(c, w[i], s[i], rows[i], cols[i]) != 0) return -1;
+        if (c->active_cache_slot < 0) return -1;   /* temp: not batch-safe */
         dw[i] = c->w;
         int N = rows[i], mm = M[i];
         use64[i] = mm < 128;
@@ -411,20 +409,18 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
         if (skv < 1) skv = 1;
         if (tiles == 1) skv = 1;
         sk[i] = skv; ntx[i] = ntxv; fix[i] = (tiles % skv) != 0;
-        if (fix[i] && !c->fixup) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        if (fix[i] && !c->fixup) return -1;
     }
-    failstage = 1;
     /* per-task fixup scratch, sized for each task's sk. */
     for (int i = 0; i < n; ++i)
         if (fix[i]) {
             size_t fb = (size_t)sk[i] * 128 * 128 * sizeof(float);
             if (fb > c->b[i].fixb) {
                 if (c->b[i].tmpfix) cuMemFree(c->b[i].tmpfix);
-                if (cuMemAlloc(&c->b[i].tmpfix, fb) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL tmpfix\n"); return -1; }
+                if (cuMemAlloc(&c->b[i].tmpfix, fb) != CUDA_SUCCESS) return -1;
                 c->b[i].fixb = fb;
             }
         }
-    failstage = 1;
     /* pass 2: per-task buffers (grow as needed). */
     for (int i = 0; i < n; ++i) {
         cuda_batch_buf *B = &c->b[i];
@@ -435,54 +431,53 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
         if (xb > B->xb) {
             if (B->x) cuMemFree(B->x);
             CUresult arx = cuMemAlloc(&B->x, xb);
-            if (arx != CUDA_SUCCESS) { failwhat=1; if (dbg) { const char *es=NULL; if (cuGetErrorString) cuGetErrorString(arx, &es); fprintf(stderr, "BATCHFAIL stg%d what=%d err=%d %s\n", failstage, failwhat, arx, es?es:"?"); } return -1; }
+            if (arx != CUDA_SUCCESS) return -1;
             B->xb = xb;
-            if (cuMemsetD8(B->x, 0, xb) != CUDA_SUCCESS) { failwhat=2; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; }
+            if (cuMemsetD8(B->x, 0, xb) != CUDA_SUCCESS) return -1;
         }
-        if (q8b > B->q8b) { if (B->q8) cuMemFree(B->q8); if (cuMemAlloc(&B->q8, q8b) != CUDA_SUCCESS) { failwhat=3; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; } B->q8b = q8b; }
+        if (q8b > B->q8b) { if (B->q8) cuMemFree(B->q8); if (cuMemAlloc(&B->q8, q8b) != CUDA_SUCCESS) return -1; B->q8b = q8b; }
         if (yb > B->yb) {
             if (B->y) cuMemFree(B->y);
             CUresult ary = cuMemAlloc(&B->y, yb);
-            if (ary != CUDA_SUCCESS) { failwhat=4; if (dbg) { const char *es=NULL; if (cuGetErrorString) cuGetErrorString(ary, &es); fprintf(stderr, "BATCHFAIL stg%d what=%d err=%d %s\n", failstage, failwhat, ary, es?es:"?"); } return -1; }
+            if (ary != CUDA_SUCCESS) return -1;
             B->yb = yb;
             if (terms == 2) {
                 if (B->y2) cuMemFree(B->y2);
-                if (cuMemAlloc(&B->y2, yb) != CUDA_SUCCESS) { failwhat=5; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; }
+                if (cuMemAlloc(&B->y2, yb) != CUDA_SUCCESS) return -1;
             }
         }
         if (B->hxb < xb) {
             if (B->hx) cuMemFreeHost(B->hx);
             B->hx = NULL; B->hxb = 0;
-            if (cuMemHostAlloc(&B->hx, xb, 0) != CUDA_SUCCESS) { failwhat=6; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; }
+            if (cuMemHostAlloc(&B->hx, xb, 0) != CUDA_SUCCESS) return -1;
             B->hxb = xb;
         }
         if (B->hyb2 < (size_t)mm * N * sizeof(float)) {
             if (B->hy) cuMemFreeHost(B->hy);
             B->hy = NULL; B->hyb2 = 0;
-            if (cuMemHostAlloc(&B->hy, (size_t)mm * N * sizeof(float), 0) != CUDA_SUCCESS) { failwhat=7; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; }
+            if (cuMemHostAlloc(&B->hy, (size_t)mm * N * sizeof(float), 0) != CUDA_SUCCESS) return -1;
             B->hyb2 = (size_t)mm * N * sizeof(float);
         }
         if (terms == 2 && B->hresb < xb) {
             if (B->hres) cuMemFreeHost(B->hres);
             B->hres = NULL; B->hresb = 0;
-            if (cuMemHostAlloc(&B->hres, xb, 0) != CUDA_SUCCESS) { failwhat=8; if (dbg) fprintf(stderr, "BATCHFAIL stg%d what=%d\n", failstage, failwhat); return -1; }
+            if (cuMemHostAlloc(&B->hres, xb, 0) != CUDA_SUCCESS) return -1;
             B->hresb = xb;
         }
     }
-    failstage = 2;
     /* pass 3: queue everything on the stream (no syncs between tasks). */
     for (int i = 0; i < n; ++i) {
         cuda_batch_buf *B = &c->b[i];
         int K = cols[i], N = rows[i], mm = M[i];
         memcpy(B->hx, x[i], (size_t)mm * K * sizeof(float));
-        if (cuMemcpyHtoDAsync(B->x, B->hx, (size_t)mm * K * sizeof(float), c->stream) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        if (cuMemcpyHtoDAsync(B->x, B->hx, (size_t)mm * K * sizeof(float), c->stream) != CUDA_SUCCESS) return -1;
         long long ne00 = K, s01 = K, ne0 = (K + 511) & ~511;
         int by = ((int)ne0 + 63) / 64;
         long long s02 = 0, s03 = 0;
         int ne1 = Mp[i], ne2 = 1;
         CUdeviceptr ids0 = 0;
         void *qa[] = { &B->x, &ids0, &B->q8, &ne00, &s01, &s02, &s03, &ne0, &ne1, &ne2 };
-        if (cuLaunchKernel(c->quant_fp4, Mp[i], by, 1, 32, 1, 1, 0, c->stream, qa, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        if (cuLaunchKernel(c->quant_fp4, Mp[i], by, 1, 32, 1, 1, 0, c->stream, qa, NULL) != CUDA_SUCCESS) return -1;
         ds4f_u3 bp = fastdiv((unsigned long long)K / 32), one = fastdiv(1), ntxfd = fastdiv((unsigned)ntx[i]);
         int zero = 0, stride = K / 32, nrows = N, ncols = mm, ny = Mp[i], stride_col = N;
         CUdeviceptr nullp = 0;
@@ -491,29 +486,29 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
         CUfunction fixfn = use64[i] ? c->fixup64 : c->fixup;
         void *a[] = { &dw[i], &B->q8, &nullp, &nullp, &B->y, &tmp, &bp, &nrows, &ncols, &stride, &ny, &stride_col,
                       &one, &one, &zero, &zero, &zero, &one, &one, &zero, &zero, &zero, &ntxfd };
-        if (cuLaunchKernel(gemmfn, sk[i], 1, 1, 32, 8, 1, 57856, c->stream, a, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        if (cuLaunchKernel(gemmfn, sk[i], 1, 1, 32, 8, 1, 57856, c->stream, a, NULL) != CUDA_SUCCESS) return -1;
         if (fix[i]) {
             void *fa[] = { &nullp, &nullp, &B->y, &B->tmpfix, &bp, &nrows, &ny, &stride_col,
                            &one, &zero, &one, &zero, &ntxfd };
-            if (cuLaunchKernel(fixfn, sk[i], 4, 1, 32, 4, 1, 0, c->stream, fa, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+            if (cuLaunchKernel(fixfn, sk[i], 4, 1, 32, 4, 1, 0, c->stream, fa, NULL) != CUDA_SUCCESS) return -1;
         }
         if (terms == 2) {
-            if (!c->residual) { if (dbg) fprintf(stderr, "BATCHFAIL nores\n"); return -1; }
+            if (!c->residual) return -1;
             long long r00 = K; int r1 = Mp[i];
             void *ra[] = { &B->x, &B->x, &r00, &r1 };
-            if (cuLaunchKernel(c->residual, Mp[i], K / 64, 1, 32, 1, 1, 0, c->stream, ra, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
-            if (cuLaunchKernel(c->quant_fp4, Mp[i], by, 1, 32, 1, 1, 0, c->stream, qa, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+            if (cuLaunchKernel(c->residual, Mp[i], K / 64, 1, 32, 1, 1, 0, c->stream, ra, NULL) != CUDA_SUCCESS) return -1;
+            if (cuLaunchKernel(c->quant_fp4, Mp[i], by, 1, 32, 1, 1, 0, c->stream, qa, NULL) != CUDA_SUCCESS) return -1;
             void *a2[] = { &dw[i], &B->q8, &nullp, &nullp, &B->y2, &tmp, &bp, &nrows, &ncols, &stride, &ny, &stride_col,
                            &one, &one, &zero, &zero, &zero, &one, &one, &zero, &zero, &zero, &ntxfd };
-            if (cuLaunchKernel(gemmfn, sk[i], 1, 1, 32, 8, 1, 57856, c->stream, a2, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+            if (cuLaunchKernel(gemmfn, sk[i], 1, 1, 32, 8, 1, 57856, c->stream, a2, NULL) != CUDA_SUCCESS) return -1;
             if (fix[i]) {
                 void *fa2[] = { &nullp, &nullp, &B->y2, &B->tmpfix, &bp, &nrows, &ny, &stride_col,
                                 &one, &zero, &one, &zero, &ntxfd };
-                if (cuLaunchKernel(fixfn, sk[i], 4, 1, 32, 4, 1, 0, c->stream, fa2, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+                if (cuLaunchKernel(fixfn, sk[i], 4, 1, 32, 4, 1, 0, c->stream, fa2, NULL) != CUDA_SUCCESS) return -1;
             }
             int total = Mp[i] * N;
             void *aa[] = { &B->y, &B->y2, &total };
-            if (cuLaunchKernel(c->add, (total + 255) / 256, 1, 1, 256, 1, 1, 0, c->stream, aa, NULL) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+            if (cuLaunchKernel(c->add, (total + 255) / 256, 1, 1, 256, 1, 1, 0, c->stream, aa, NULL) != CUDA_SUCCESS) return -1;
         }
         /* Drain per task: on a single FIFO stream the kernels serialize anyway,
          * and an error here is caught at the offending task instead of the
@@ -531,14 +526,13 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
         if (dbg_cnt++ < 40 || (dbg_cnt % 100) == 0)
             fprintf(stderr, "BATCH n=%d terms=%d %.3f ms\n", n, terms, ms);
     }
-    failstage = 3;
     /* pass 4: sync once, then download every result. */
     CUresult syncr = cuStreamSynchronize(c->stream);
-    if (syncr != CUDA_SUCCESS) { if (dbg) { const char *es=NULL; if (cuGetErrorString) cuGetErrorString(syncr, &es); fprintf(stderr, "BATCHFAIL sync %d %s\n", syncr, es?es:"?"); } return -1; }
+    if (syncr != CUDA_SUCCESS) return -1;
     for (int i = 0; i < n; ++i) {
         cuda_batch_buf *B = &c->b[i];
         int N = rows[i], mm = M[i];
-        if (cuMemcpyDtoH(B->hy, B->y, (size_t)mm * N * sizeof(float)) != CUDA_SUCCESS) { if (dbg) fprintf(stderr, "BATCHFAIL stg%d\n", failstage); return -1; }
+        if (cuMemcpyDtoH(B->hy, B->y, (size_t)mm * N * sizeof(float)) != CUDA_SUCCESS) return -1;
         for (int r = 0; r < mm; ++r)
             memcpy(dst[i] + (size_t)r * N, (float *)B->hy + (size_t)r * N, (size_t)N * sizeof(float));
     }
