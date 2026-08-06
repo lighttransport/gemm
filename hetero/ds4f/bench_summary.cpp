@@ -8,6 +8,10 @@
 //   cuda_stream -- all 43 layers' experts through the RTX cache (LRU streams)
 //   split       -- ROCm head 14 layers + CUDA tail (dual)
 //
+// Build the binary with the EXACT flags (no -ffast-math) + the tile override:
+//   make -C hetero/ds4f build/test_hip_ds4f_real \
+//     CFLAGS="-O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -march=native -mavx2 \
+//             -mfma -mf16c -ffp-contract=fast -DDS4F_MAX_MTILE=8192"
 // Build:  g++ -O2 -std=c++17 -o bench_summary bench_summary.cpp
 // Run:    ./bench_summary /tmp/ds4f_nocopy_ep8 [--binary ./build/test_hip_ds4f_real]
 //

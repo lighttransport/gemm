@@ -418,7 +418,23 @@ static inline void ds4f_mxfp4_xscratch(int K, int8_t **xq, float **xs, float **x
 
 /* Same scratch for a prefill tile: n tokens quantized up front so the row
  * loop can hoist outside the token loop and reuse each weight decode.
- * xq is [n, K], xs and xc are [n, K/32]. */
+ * xq is [n, K], xs and xc are [n, K/32]. *//* Per-thread [M,8] float accumulation scratch for the BF16-PV GEMM worker.
+ * Sized by the actual batch M instead of DS4F_MAX_MTILE: at MTILE=8192 the
+ * old stack array was 256 KB and spilled, changing the reduction order (and
+ * the argmax) at small batches. */
+static __thread float *ds4f_acc_buf = NULL;
+static __thread size_t ds4f_acc_cap = 0;
+static inline float (*ds4f_acc_scratch(size_t M))[8] {
+    size_t need = M * 8;
+    if (need > ds4f_acc_cap) {
+        ds4f_map_free(ds4f_acc_buf);
+        ds4f_acc_buf = (float *)ds4f_map_alloc(need * sizeof(float), 64, 0);
+        ds4f_acc_cap = ds4f_acc_buf ? need : 0;
+    }
+    return (float (*)[8])ds4f_acc_buf;
+}
+
+
 static __thread int8_t *ds4f_mxqn_buf = NULL;
 static __thread float  *ds4f_mxsn_buf = NULL;
 static __thread float  *ds4f_mxcn_buf = NULL;
@@ -982,7 +998,8 @@ static void ds4f_gemm_worker(void *arg, int tid, int nthr) {
         if (TILE_K < 0) { const char *e = getenv("DS4F_GEMM_TILE_K"); TILE_K = (e && atoi(e) > 0) ? (atoi(e) & ~15) : 4096; }
         for (int i = r0; i + 7 < r1; i += 8) {
             const uint16_t *g = base + (size_t)(i / 8) * 8 * K;
-            float acc[DS4F_MAX_MTILE][8];
+            float (*acc)[8] = ds4f_acc_scratch(M);
+            if (!acc) return;
             for (int mm = 0; mm < M; mm++)
                 for (int r = 0; r < 8; r++) acc[mm][r] = 0.f;
             for (int k0 = 0; k0 < K; k0 += TILE_K) {       /* tile outer, token inner: */
@@ -1032,7 +1049,8 @@ static void ds4f_gemm_worker(void *arg, int tid, int nthr) {
             svfloat32_t kv = svld1(pg, ds4f_kvalues_mxfp4_f32);
             int vl = (int)svcntw();
             for (int i = r0; i + 7 < r1; i += 8) {
-                float acc[DS4F_MAX_MTILE][8];
+                float (*acc)[8] = ds4f_acc_scratch(M);
+                if (!acc) return;
                 for (int mm = 0; mm < M; mm++) for (int r = 0; r < 8; r++) acc[mm][r] = 0.f;
                 for (int k0 = 0; k0 < K; k0 += TK) {
                     int klen = K - k0 < TK ? K - k0 : TK;
@@ -1111,7 +1129,8 @@ static void ds4f_gemm_worker(void *arg, int tid, int nthr) {
          * on-register magic dequant's real win is the HBM-bound M=1 decode matvec. */
         for (int i = r0; i + 7 < r1; i += 8) {
             const uint8_t *es = sbase + (size_t)(i >> 7) * sbc;     /* i is 8-aligned -> 128-block via >>7 */
-            float acc[DS4F_MAX_MTILE][8];
+            float (*acc)[8] = ds4f_acc_scratch(M);
+            if (!acc) return;
             for (int mm = 0; mm < M; mm++) for (int r = 0; r < 8; r++) acc[mm][r] = 0.f;
             for (int k0 = 0; k0 < K; k0 += TK) {
                 int klen = K - k0 < TK ? K - k0 : TK;
