@@ -710,6 +710,22 @@ the dense projections batched so each weight is read from HBM once") is the
 2.5-3x speedup: 42 tok/s exact at batch 64, 51-55 tok/s ROCm-expert at
 batch 1024-4096.
 
+**Long-context decode stability (2026-08-06).** `DS4F_MAX_POS` raises the
+model's `max_pos` (default 4096) so generation can be exercised at long
+context.  Decode runs 16 steps at warmed contexts 4096, 8192, and 16384 --
+all stable (no OOM or crash; ~16 tok/s, flat, because the sliding-window
+attention keeps the per-token cost constant):
+
+| context | decode tok/s |
+|---:|---:|
+| 4096 | 15.8 |
+| 8192 | 15.5 |
+| 16384 | 16.5 |
+
+`hetero/ds4f/bench_summary.cpp` re-runs the settled prefill configs
+(exact / rocm-expert / cuda-stream / split) across batch 256-4096 and prints
+the comparison table.
+
 
 The historical measurements below predate these fixes.
 
