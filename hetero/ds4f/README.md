@@ -646,6 +646,9 @@ The recommended prefill config is the split with the GPU sliding-window
 attention (`--hip-prefill-attn 1`): ~62-65 tok/s flat at every batch.  The
 GPU attention frees the CPU attention (was ~23% of the time) but is
 approximate like the other accelerated routes (exact default stays 0/64).
+`--dual-cuda-terms` is the quality/speed knob for the CUDA tail: terms=2 (the
+activation residual) is ~1/64 at 54.6 tok/s (batch 64), terms=1 skips the
+residual for ~56 tok/s but ~4/64.
 
 The split now preloads all 29 CUDA layers: the cache is a single contiguous
 12.5 GB pool (one `cuMemAlloc`; the driver tops out at ~13 GB for one
