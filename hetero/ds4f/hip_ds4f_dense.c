@@ -1277,6 +1277,49 @@ int hip_ds4f_dense_matvec_id_async(hip_ds4f_dense *ctx, int id, const float *x) 
         fprintf(stderr, "hip_ds4f_dense: no matrix or invalid input\n");
         return -1;
     }
+    if (matrix_is_mxfp4(mat->kind)) {
+        /* M=1 decode expert matvec: the 16-row gemm tile wastes the FMA on 15
+         * zero rows, but the weights are read once at VRAM bandwidth -- far
+         * faster than the CPU MXFP4 single-token decode for a routed expert. */
+        if (ctx->pending || ctx->multi_pending) {
+            fprintf(stderr, "hip_ds4f_dense: previous matvec is still in flight\n");
+            return -1;
+        }
+        if (hipSetDevice(ctx->device_id) != hipSuccess ||
+            ensure_vectors(ctx, mat->rows, mat->cols) != 0)
+            return -1;
+        size_t xb = (size_t)mat->cols * sizeof(float);
+        const void *xsrc = x;
+        if (ensure_pinned(&ctx->pin_hx, &ctx->pin_hx_cap, xb) == 0) {
+            memcpy(ctx->pin_hx, x, xb);
+            xsrc = ctx->pin_hx;
+        }
+        if (hipMemcpyAsync(ctx->dx, xsrc, xb, hipMemcpyHostToDevice, ctx->stream) != hipSuccess) {
+            fprintf(stderr, "hip_ds4f_dense: activation upload failed\n");
+            hipStreamSynchronize(ctx->stream);
+            return -1;
+        }
+        int n_out = mat->rows, n_in = mat->cols, n_tok = 1;
+        void *dw = mat->dw, *ds = mat->ds, *dx = ctx->dx, *dy = ctx->dy;
+        void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok };
+        hipError_t err = hipModuleLaunchKernel(ctx->gemm_mxfp4,
+            (unsigned int)((n_out + 63) / 64), 1, 1, 16, 16, 1, 0,
+            ctx->stream, args, NULL);
+        if (err != hipSuccess) {
+            fprintf(stderr, "hip_ds4f_dense: mxfp4 matvec launch failed (%d)\n", (int)err);
+            hipStreamSynchronize(ctx->stream);
+            return -1;
+        }
+        if (hipEventRecord(ctx->done, ctx->stream) != hipSuccess) {
+            fprintf(stderr, "hip_ds4f_dense: event record failed\n");
+            hipStreamSynchronize(ctx->stream);
+            return -1;
+        }
+        ctx->pending = 1;
+        ctx->pending_id = id;
+        ctx->pending_rows = mat->rows;
+        return 0;
+    }
     hipFunction_t fn = matrix_is_fp16(mat->kind) ? ctx->f16_matvec :
                        matrix_is_bf16(mat->kind) ? ctx->bf16_matvec : ctx->matvec;
     return launch_matvec_async(ctx, fn, id, mat->dw, mat->ds,
@@ -1292,8 +1335,8 @@ int hip_ds4f_dense_matvec_id(hip_ds4f_dense *ctx, int id,
 
 int hip_ds4f_dense_matvec_tensor(void *opaque, float *dst,
                                  const ds4f_tensor *t, const float *x) {
-    if (!opaque || !t || (t->type != DS4F_FP8 && t->type != DS4F_BF16) ||
-        t->gpu_id < 0)
+    if (!opaque || !t || (t->type != DS4F_FP8 && t->type != DS4F_BF16 &&
+                           t->type != DS4F_MXFP4) || t->gpu_id < 0)
         return -1;
     return hip_ds4f_dense_matvec_id((hip_ds4f_dense *)opaque, t->gpu_id, x, dst);
 }
