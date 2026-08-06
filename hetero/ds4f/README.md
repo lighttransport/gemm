@@ -679,6 +679,25 @@ amortize. The widened FP8 variant (default `--hip-mxfp4-stream-raw 0`) is
 The NVIDIA card is idle under this config; a dual split (ROCm head experts +
 CUDA tail experts) is the remaining integration.
 
+**The batch-4096 taper was the head GEMM OOM, not the experts.** With 14
+resident layers the M=4096 head gemm ([M, 129280] = 2.1 GB output) failed to
+allocate its device scratch and `ds4f_gemm` silently fell back to a ~20x
+slower CPU GEMM (42 vs ~56 tok/s). `hip_ds4f_dense_gemm_tensor` now tiles
+Ystride==N outputs over 256 MB into a ~256 MB chunk scratch, so the head runs
+on the GPU at every batch (batch 4096: 54.8 tok/s with 14 resident layers).
+The ROCm raw-expert curve is now smooth:
+
+| batch | ROCm-expert (14 res) | exact |
+|---:|---:|---:|
+| 512 | 46.2 | 35.6 |
+| 1024 | 51.2 | 24.1 |
+| 2048 | 52.8 | 23.8 |
+| 4096 | 54.8 | 13.7 |
+
+The dual split (ROCm head 14 + CUDA tail) reaches 50.6 tok/s at batch 4096
+but is otherwise behind the ROCm-only route, which is the recommended large
+batch prefill config.
+
 
 The historical measurements below predate these fixes.
 
