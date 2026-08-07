@@ -205,8 +205,13 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
         if tail:
             sess.prefill(tail, cached)
     else:
+        # a fresh (no-cache, no-slot) request carries the full conversation;
+        # the session must start at position 0 or the KV is written at the
+        # previous turn's position (context corruption).
+        if sess.pos() != 0:
+            sess.reset()
         if prompt:
-            sess.prefill(prompt, start)
+            sess.prefill(prompt, 0)
 
     # the generation loop: sample + decode until max_new or EOS
     out = []
