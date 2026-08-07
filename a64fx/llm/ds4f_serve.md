@@ -43,20 +43,20 @@ Smoke test: `sh a64fx/llm/test_ds4f_serve.sh /tmp/ds4f_single 8080`.
 
 ## Context / KV management
 
-- **Prefix cache** (`DS4F_SERVE_PREFIX_CACHE=1`): a request whose prompt
-  extends the previous one skips re-prefilling the shared prefix.  The frontend
-  passes `cache_load`/`cache_save` (ctl bits) + a cache path; the runner
-  snapshots/restores the per-layer KV + the tierb2 compressor state via
-  `ds4f_tb2_snap*`.  Measured (ROCm dense, warm): a 2-turn conversation where
-  turn 2 extends turn 1's 20-token prompt completes in **1.6 s** vs the full
-  prefill of the first turn (a request whose 24 tokens include a cold
-  page-in of the dense bank, ~100 s; warm prefill is seconds).
+- **Conversation prefix cache** (automatic in the frontend): the chat handler
+  keeps the last conversation's token ids + KV snapshot (`<BASE>.conv`) and,
+  when the next request extends it, asks the runner to restore the KV and
+  prefill only the new tail (`cache_load`+`cache_save`) instead of
+  re-prefilling the whole context.  A request that does not extend the cached
+  conversation falls back to a fresh full prefill (the session is reset to
+  position 0, so multi-turn conversations stay correct).  Measured: turn 2 of
+  a conversation lands in ~8 s vs a full re-prefill.
+- **System-prompt cache** (`DS4F_SERVE_SYSCACHE`): the runner loads a
+  persisted context (built once with a `cache_save` request) into slot 0 at
+  startup.  Combined with a `cache_load` request whose prompt begins with that
+  exact prefix, the system prompt / tool definitions are never re-prefilled.
 - **Slots** (`DS4F_SERVE_SLOTS`): per-conversation KV snapshots switched by
   the `slot` field (`<BASE>.slot.<i>` files).
-- **System-prompt cache** (`DS4F_SERVE_SYSCACHE`): a persisted context (built
-  once with a `cache_save` request) is loaded into slot 0 at startup, so every
-  conversation starts with the system prompt / tool definitions already
-  prefilled (instant TTFT, survives restarts).
 - **Truncation**: the runner caps the prompt at `max_pos - max_new`, keeping
   the head (system prompt + tools) and the recent tail whole.
 - The model's own sliding-window (128) + compressed long-range (tierb2)
