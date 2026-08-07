@@ -92,6 +92,74 @@ cold-prefix measurement and a warmup request to verify the system-prompt cache.
 Its prefill rate is based on uncached prompt tokens and includes the first
 decode step, so compare runs with the same prompt and context.
 
+### Qwen3.6/Qwen3.5 GGUF on the 9070 XT + 5060 Ti
+
+The `qwen36` adapter delegates to a local llama.cpp server and keeps the model
+path, server path, device list, split, context, and KV types configurable:
+
+```sh
+export QWEN36_MODEL=/path/to/Qwen3.6-27B-Q5_K_M.gguf
+export LLMGR_LLAMA_SERVER=/path/to/llama-server
+export LLMGR_LLAMA_DEVICES=Vulkan1,Vulkan0  # AMD primary, NVIDIA secondary
+export LLMGR_QWEN36_CACHE_DIR=$PWD/qwen36-cache
+mkdir -p "$LLMGR_QWEN36_CACHE_DIR"
+./a64fx/llmgr/run_llmgr_qwen36.sh --daemon --verbose
+python3 a64fx/llmgr/llmgr_cli.py start --model qwen36 --mode serve \
+  --port 8081 --ctx 524288
+```
+
+The adapter defaults to layer splitting, tensor split `1.4,1` (AMD primary), flash attention,
+and Q4 KV. Override `cache_type_k`, `cache_type_v`, `tensor_split`, or other
+runner fields in the `/runner/start` JSON when needed. A 512K context
+allocation succeeded with the fit allocator; short benchmark results were 628
+tok/s prefill at 4096 tokens and 18 tok/s decode.
+
+To persist an exact Codex or Claude Code system message after starting the
+server with `slot_save_path`/`LLMGR_QWEN36_CACHE_DIR`, run:
+
+```sh
+python3 a64fx/llmgr/qwen36_prompt_cache.py --agent codex \
+  --prompt-file /path/to/codex-system.txt --server http://127.0.0.1:8081
+python3 a64fx/llmgr/qwen36_prompt_cache.py --agent claude-code \
+  --prompt-file /path/to/claude-system.txt --server http://127.0.0.1:8081
+```
+
+Alternatively pass the exact captured wire request with `--request-file`; the
+utility extracts OpenAI/Responses `instructions`/system/developer messages or
+Anthropic `system` content automatically:
+
+```sh
+python3 a64fx/llmgr/qwen36_prompt_cache.py --agent codex \
+  --request-file codex-request.json --server http://127.0.0.1:8081
+```
+
+Each cache is model- and prompt-digest bound. Do not reuse a cache after
+changing the GGUF, tokenizer/chat template, or agent system message.
+The utility sends a `hello` user turn during warmup because Qwen3.6's chat
+template requires one; the cache digest remains based on the system prompt.
+
+For several agents or for a new model, use the batch wrapper. Agent labels are
+arbitrary, so adding a new client does not require changing the cache code:
+
+```sh
+./a64fx/llmgr/cache_agent_prompts.sh \
+  --model /path/to/model.gguf --server http://127.0.0.1:8081 \
+  --output-dir "$HOME/.cache/llmgr/emerging-model" \
+  codex=/tmp/codex-request.json \
+  claude-code=/tmp/claude-request.json \
+  opencode=/tmp/opencode-request.json
+```
+
+Use `--reuse` after a server restart to restore all matching slots instead of
+warming them again.
+On a later server launch, restore the matching slot before sending the first
+agent request:
+
+```sh
+python3 a64fx/llmgr/qwen36_prompt_cache.py --agent codex --reuse \
+  --prompt-file /path/to/codex-system.txt --server http://127.0.0.1:8081
+```
+
 On the validation host (48 shards, 155.4 GiB, `gfx1201`), the full-weight
 single-node run with `--q8-dense 0 --fp8-bf16 0` loaded in 107.7 s, used 7.2 GiB
 VRAM, and measured 1.18 tok/s decode / 2.48 uncached prompt tok/s in one
