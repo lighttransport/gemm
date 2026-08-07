@@ -681,7 +681,10 @@ def _select_cache(agent, messages, tools, prompt):
         prev = _conv["ids"]
         conv_reuse = _conv["agent"] == agent and _conv["path"] is not None and prev is not None and \
             len(ids_all) >= len(prev) and ids_all[:len(prev)] == prev
-        cpath = _conv["path"] or (BASE + ".conv." + agent)
+        # Conversation snapshots are agent-scoped too.  Reusing the previous
+        # agent's path would let a Codex turn overwrite Claude's context (and
+        # vice versa) when requests are interleaved.
+        cpath = BASE + ".conv." + agent
         if conv_reuse:
             reuse = True
             cache_path = cpath
@@ -779,6 +782,8 @@ class H(http.server.BaseHTTPRequestHandler):
         path = self.path.rstrip("/")
         if path in ("/v1/chat/completions", "/chat/completions"):
             return self.chat()
+        if path == "/v1/messages/count_tokens":
+            return self.messages_count_tokens()
         if path in ("/v1/messages", "/messages"):
             return self.messages_anthropic()
         if path in ("/v1/responses", "/responses"):
@@ -890,6 +895,21 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
     # ---- Anthropic messages API (claude-code's wire protocol) ----
+    def messages_count_tokens(self):
+        body = self._read_body()
+        if body is None:
+            return self._json(400, {"error": "bad json"})
+        tools = anthropic_tools_to_openai(body.get("tools", []))
+        messages = anthropic_messages_to_openai(body.get("messages", []))
+        system = body.get("system")
+        if system and not any(m.get("role") == "system" for m in messages):
+            if isinstance(system, list):
+                system = "".join(b.get("text", "") for b in system
+                                 if isinstance(b, dict) and b.get("type") == "text")
+            messages.insert(0, {"role": "system", "content": system})
+        return self._json(200, {"input_tokens": len(encode(
+            build_chat_prompt(messages, tools)))})
+
     def messages_anthropic(self):
         body = self._read_body()
         if body is None:

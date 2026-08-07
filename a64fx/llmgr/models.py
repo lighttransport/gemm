@@ -18,6 +18,7 @@ Standard library only.
 
 import glob
 import os
+import re
 import time
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -25,6 +26,7 @@ LAGUNA_DIR = os.path.join(REPO, "a64fx", "laguna-s21")
 GEMMA4_DIR = os.path.join(REPO, "a64fx", "gemma4-mn")
 K3_DIR = os.path.join(REPO, "a64fx", "k3")
 UTOFU_DIR = os.path.join(REPO, "a64fx", "utofu-tests")
+DS4F_DIR = os.path.join(REPO, "a64fx", "llm")
 
 
 class ConfigError(ValueError):
@@ -92,6 +94,7 @@ class Adapter:
     supports_serve = False
     supports_cache = False
     openai_models = ()
+    proxy_protocol = False
 
     def default_np(self):
         return int(os.environ.get("PJM_MPI_PROC", "12"))
@@ -176,9 +179,12 @@ class Adapter:
                 fn = self.profile_argv
             else:
                 fn = getattr(self, mode)
-            if fn.__func__ is not getattr(Adapter, mode, None):
+            base = getattr(Adapter, "profile_argv" if mode == "profile" else mode,
+                           None)
+            if getattr(fn, "__func__", fn) is not base:
                 modes.append(mode)
         return {"modes": modes, "supports_cache": self.supports_cache,
+                "protocol_proxy": self.proxy_protocol,
                 "openai_models": list(self.openai_models),
                 "runner_contract": "llmgr.v1"}
 
@@ -570,25 +576,6 @@ class K3Adapter(Adapter):
     supports_cache = True
     LAUNCHER = os.path.join(K3_DIR, "run_k3_ep.sh")
 
-    # K3 is intentionally not advertised as a serving model.  These hooks
-    # keep the protocol test seam usable if an experimental deployment opts
-    # into serving while its native tokenizer is still supplied externally.
-    def native_request(self, body, chat=True):
-        from laguna_openai import native_request
-        return native_request(body, chat=chat)
-
-    def completion_response(self, body, text, native, chat=True, request_id=None):
-        from laguna_openai import completion_response
-        return completion_response(body, text, native, chat=chat, request_id=request_id)
-
-    def responses_request(self, body):
-        from laguna_openai import responses_request
-        return responses_request(body)
-
-    def responses_response(self, body, chat_response, request_id=None):
-        from laguna_openai import responses_response
-        return responses_response(body, chat_response, request_id=request_id)
-
     def _np(self, cfg):
         np_ = _int(cfg, "np", self.default_np())
         if np_ < 1 or np_ > 512:
@@ -725,7 +712,136 @@ class K3Adapter(Adapter):
                 "--topo", "tofu_topo.txt", "--profile"] + _extra(cfg)
 
 
-ADAPTERS = {a.name: a() for a in (LagunaAdapter, Gemma4Adapter, K3Adapter)}
+class Ds4fAdapter(Adapter):
+    """DeepSeek-V4-Flash full-weight EP server.
+
+    DS4F already implements the OpenAI Responses/chat and Anthropic wire
+    protocols in its controller-side frontend.  llmgr supervises the MPI
+    wrapper and proxies those protocol requests without trying to tokenize or
+    reimplement the DS4F request state machine.
+    """
+
+    name = "ds4f"
+    variants = ("full",)
+    default_variant = "full"
+    supports_serve = True
+    openai_models = ("ds4f", "deepseek-v4-flash")
+    proxy_protocol = True
+
+    LAUNCHER = os.path.join(DS4F_DIR, "run_ds4f_serve_11n.sh")
+    STAGER = os.path.join(DS4F_DIR, "run_ds4f_stage_11n.sh")
+    SINGLE_LAUNCHER = os.path.join(DS4F_DIR, "run_ds4f_single_serve.sh")
+    SINGLE_STAGER = os.path.join(DS4F_DIR, "stage_ds4f_single.sh")
+
+    def deployment(self, cfg):
+        value = cfg.get("deployment") or os.environ.get("DS4F_DEPLOYMENT", "single")
+        if value not in ("single", "ep"):
+            raise ConfigError("deployment must be single or ep (got %r)" % value)
+        return value
+
+    def default_np(self):
+        return int(os.environ.get("DS4F_NP", "11"))
+
+    def _root(self, cfg):
+        return os.path.abspath(os.path.expanduser(
+            str(cfg.get("work_dir") or os.environ.get("DS4F_WORK_DIR", DS4F_DIR))))
+
+    def model_dir(self, cfg):
+        return os.path.expanduser(str(
+            cfg.get("model_dir") or os.environ.get("DS4F_MODEL_DIR", "~/models/ds4f")))
+
+    def stage_dir(self, cfg):
+        return os.path.expanduser(str(
+            cfg.get("stage_dir") or os.environ.get("DS4F_STAGE_DIR", "/local/ds4f")))
+
+    def _env(self, cfg, port=None):
+        env = _env_overrides(cfg)
+        env.setdefault("DS4F_REAL", "1")
+        env.setdefault("DS4F_STAGE_DIR", self.stage_dir(cfg))
+        env.setdefault("DS4F_MODEL_DIR", self.model_dir(cfg))
+        np_ = str(_int(cfg, "np", self.default_np()))
+        env.setdefault("DS4F_NP", np_)
+        # The existing DS4F shell launchers consume the generic NP variable.
+        env.setdefault("NP", np_)
+        deployment = self.deployment(cfg)
+        env.setdefault("DS4F_DEPLOYMENT", deployment)
+        if port is not None:
+            env["PORT"] = str(port)
+        if deployment == "single":
+            root = self._root(cfg)
+            env.setdefault("DS4F_SERVE_BASE", os.path.join(root, ".ds4f_serve"))
+            env.setdefault("DS4F_RUNNER_LOG", os.path.join(root, "ds4f_runner.log"))
+            env.setdefault("DS4F_SERVE_USE_HIP", "1")
+        for key in ("tok", "tokenizer"):
+            if cfg.get(key):
+                env["TOK"] = str(cfg[key])
+                break
+        for key, envname in (("ctx", "CTX"), ("model", "DS4F_MODEL"),
+                             ("exclude", "EXCLUDE"), ("vcoord", "VCOORD"),
+                             ("nshards", "DS4F_NSHARDS"),
+                             ("prefill_gemm", "DS4F_PREFILL_GEMM"),
+                             ("q8_dense", "DS4F_Q8_DENSE"),
+                             ("fp8_bf16", "DS4F_FP8_BF16"),
+                             ("mhc", "DS4F_MHC"), ("hc_par", "DS4F_HC_PAR"),
+                             ("hc_rmspar", "DS4F_HC_RMSPAR")):
+            if cfg.get(key) is not None:
+                env[envname] = str(cfg[key])
+        return env
+
+    def build(self, cfg):
+        cc = str(cfg.get("cc", "fcc"))
+        argv = ["make", "-C", DS4F_DIR, "ds4f_ep_runner",
+                "CC=%s" % cc, "OPENMP=1"]
+        if cfg.get("clean"):
+            argv = ["sh", "-c", "make -C %s clean && %s" %
+                    (DS4F_DIR, " ".join(shlex_quote(x) for x in argv))]
+        return argv, self._env(cfg), DS4F_DIR
+
+    def stage(self, cfg):
+        if self.deployment(cfg) == "single":
+            return [self.SINGLE_STAGER], self._env(cfg), DS4F_DIR
+        return [self.STAGER], self._env(cfg), self._root(cfg)
+
+    def serve(self, cfg):
+        port = _int(cfg, "port", required=True)
+        launcher = (self.SINGLE_LAUNCHER if self.deployment(cfg) == "single"
+                    else self.LAUNCHER)
+        return [launcher], self._env(cfg, port=port), self._root(cfg)
+
+    def readiness(self, cfg, since):
+        root = self._root(cfg)
+        if self.deployment(cfg) == "single":
+            path = os.path.join(root, "ds4f_runner.log")
+            try:
+                with open(path, "r", errors="replace") as f:
+                    ready = "serving on" in f.read()
+            except OSError:
+                ready = False
+            return ready, "single-node runner log=%s" % os.path.basename(path)
+        paths = glob.glob(os.path.join(root, "ds4f_ep_rank*.txt"))
+        expected = _int(cfg, "np", self.default_np())
+        ready = 0
+        for path in paths:
+            try:
+                with open(path, "r", errors="replace") as f:
+                    if re.search(r"SERVE(?:-BATCH|-DYNBATCH)? ready", f.read()):
+                        ready += 1
+            except OSError:
+                pass
+        return ready >= expected, "serve-ready %d/%d root=%s" % (
+            ready, expected, os.path.basename(root))
+
+    def runner_bin(self, cfg):
+        return os.path.join(DS4F_DIR, "build", "ds4f_ep_runner")
+
+def shlex_quote(value):
+    """Small local quote helper to keep the adapter Python-3.6 compatible."""
+    import shlex
+    return shlex.quote(str(value))
+
+
+ADAPTERS = {a.name: a() for a in
+            (LagunaAdapter, Gemma4Adapter, K3Adapter, Ds4fAdapter)}
 
 
 def default_model():

@@ -144,10 +144,17 @@ def main(argv=None):
     st.add_argument("--variant")
     st.add_argument("--stage-dir")
     st.add_argument("--model-dir")
+    st.add_argument("--work-dir")
+    st.add_argument("--deployment", choices=("single", "ep"),
+                    help="DS4F deployment topology")
+    st.add_argument("--tokenizer")
     st.add_argument("--np", type=int)
     st.add_argument("--tp-np", type=int, help="K3 tensor-parallel ranks per context")
     st.add_argument("--layer", type=int)
     st.add_argument("--experts")
+    st.add_argument("--exclude")
+    st.add_argument("--vcoord")
+    st.add_argument("--nshards", type=int)
 
     ss = sub.add_parser("stage-status")
     ss.add_argument("--model")
@@ -182,6 +189,19 @@ def main(argv=None):
     r.add_argument("--experts", help="K3 expert range, e.g. 0-15")
     r.add_argument("--stage-dir")
     r.add_argument("--model-dir")
+    r.add_argument("--work-dir")
+    r.add_argument("--deployment", choices=("single", "ep"),
+                    help="DS4F deployment topology")
+    r.add_argument("--tokenizer")
+    r.add_argument("--ctx", type=int)
+    r.add_argument("--q8-dense", type=int, choices=(0, 1))
+    r.add_argument("--fp8-bf16", type=int, choices=(0, 1))
+    r.add_argument("--prefill-gemm", type=int, choices=(0, 1))
+    r.add_argument("--mhc", type=int, choices=(0, 1))
+    r.add_argument("--hc-par", type=int, choices=(0, 1))
+    r.add_argument("--hc-rmspar", type=int, choices=(0, 1))
+    r.add_argument("--vcoord")
+    r.add_argument("--nshards", type=int)
     r.add_argument("--result-dir")
     r.add_argument("--heartbeat-tokens", type=int)
     r.add_argument("--min-available-mib", type=int)
@@ -275,7 +295,9 @@ def main(argv=None):
     def opt(*keys):
         """Only send flags the user actually set: llmgr fills the defaults."""
         return {k: getattr(args, k) for k in keys
-                if getattr(args, k, None) not in (None, False, [])}
+                if getattr(args, k, None) is not None and
+                getattr(args, k, None) is not False and
+                getattr(args, k, None) != []}
 
     c = args.cmd
     if c == "health":
@@ -295,8 +317,9 @@ def main(argv=None):
     elif c == "stage":
         emit(call(args, "POST", "/stage",
                   dict(model=args.model,
-                       **opt("variant", "stage_dir", "model_dir", "np", "tp_np",
-                             "layer", "experts"))))
+                       **opt("variant", "stage_dir", "model_dir", "work_dir",
+                             "tokenizer", "np", "tp_np", "layer", "experts",
+                             "exclude", "vcoord", "nshards"))))
     elif c == "stage-status":
         q = {"model": args.model}
         q.update(opt("variant", "stage_dir", "model_dir", "np", "tp_np"))
@@ -313,9 +336,12 @@ def main(argv=None):
                              "np", "tp_np", "max_new", "tokens", "layer", "experts",
                              "cache_load", "cache_save",
                              "stage_dir", "model_dir", "result_dir",
+                             "work_dir", "deployment", "tokenizer", "ctx", "q8_dense",
+                             "fp8_bf16", "prefill_gemm", "mhc", "hc_par",
+                             "hc_rmspar", "exclude", "vcoord", "nshards",
                              "heartbeat_tokens", "min_available_mib",
                              "prompt", "ids", "prompt_ids",
-                             "gguf", "mtp", "exclude", "threads", "spec_k",
+                             "gguf", "mtp", "threads", "spec_k",
                              "batch", "tp_skip_ar", "stage",
                              "extra"))))
     elif c == "stop":

@@ -42,6 +42,43 @@ request translation, tokenizer loading, runner selection, and response
 formatting; adding a serving model does not require a new branch in the HTTP
 supervisor.
 
+### DS4F + Codex on RX 9070 XT
+
+On the ROCm host with the full, unquantized DS4F weights available, the default
+topology is the single-node HIP runner. It keeps the routed weight set in host
+memory and uses the 9070 XT for the dense path; `--q8-dense 0` keeps this run
+unquantized:
+
+```sh
+DS4F_MODEL_DIR=/shared/models/ds4f-full \
+DS4F_STAGE_DIR=/local/ds4f \
+DS4F_WORK_DIR=$PWD/a64fx/llm \
+DS4F_NP=1 ./a64fx/llmgr/run_llmgr_ds4f.sh --daemon --verbose
+
+python3 a64fx/llmgr/llmgr_cli.py stage --model ds4f --deployment single --np 1
+python3 a64fx/llmgr/llmgr_cli.py start --model ds4f --mode serve --port 8080 \
+  --deployment single --np 1 --ctx 16384 --q8-dense 0 --fp8-bf16 1
+```
+
+For the existing 11-node MPI deployment, set `DS4F_DEPLOYMENT=ep`, use
+`DS4F_NP=11`, and pass `--deployment ep` to both commands.
+
+Point Codex at `http://127.0.0.1:21274/v1` with model `ds4f` and Responses
+wire format. The llmgr port proxies the request to the DS4F frontend; it does
+not tokenize or duplicate the 160 GB model in the controller process.
+
+Measure a warm single-stream run with:
+
+```sh
+python3 a64fx/llm/bench_ds4f_http.py \
+  --url http://127.0.0.1:21274/v1/responses \
+  --model ds4f --max-tokens 128 --warmup 1 --repeat 3
+```
+
+Use `--max-tokens 1` for a prefill/TTFT sample and a larger value for decode.
+The reported prefill rate includes the first decode step; compare runs with
+the same prompt and context.
+
 ## Quick start (inside an existing interactive allocation)
 
 ```sh
@@ -143,6 +180,7 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 | `laguna` | `int4` (default), `bf16`, `fp8` | yes | no | `a64fx/laguna-s21/run_laguna_s21_12n.sh` |
 | `gemma4` | `tp` (default), `pp` | no — one-shot only | no | `a64fx/gemma4-mn/run_gemma4_tp.sh` / `run_gemma4_pp.sh` |
 | `k3` | `partial` | no — one-shot only | yes | `a64fx/k3/run_k3_ep.sh` |
+| `ds4f` | `full` | yes — single HIP or 11-node EP | no | `a64fx/llm/run_ds4f_single_serve.sh` / `run_ds4f_serve_11n.sh` |
 
 Exactly one serving child per model may be starting or ready. All semantic and native
 requests share one bounded FIFO (capacity 8 by default, configurable with

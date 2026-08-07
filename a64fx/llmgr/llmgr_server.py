@@ -117,15 +117,6 @@ def _default_openai_model():
     return adapter.openai_models[0] if adapter.openai_models else adapter.name
 
 
-def _ready_default():
-    return _ready_serve(models.default_model())
-
-
-# Compatibility for older callers; new dispatch uses the resolved adapter.
-def _ready_laguna():
-    return _ready_default()
-
-
 class InferenceJob:
     def __init__(self, jid, body, native, tokenizer, chat, context_id=None,
                  model=None):
@@ -227,8 +218,6 @@ class InferenceQueue:
     def _run(self, job):
         adapter = _resolve_adapter(job.model or models.default_model())
         runner = _ready_serve(adapter.name)
-        if runner is None and adapter.name == models.default_model():
-            runner = _ready_laguna()
         if runner is None:
             raise RuntimeError("exactly one ready runner for model %s is required" %
                                adapter.name)
@@ -1222,6 +1211,54 @@ class Handler(bhs.Handler):
         self._send_json({"id": cid, "stopped": stopped, "state": c.state,
                          "exit_code": c.exit_code})
 
+    def _proxy_protocol(self, adapter, path, body):
+        """Forward a wire-compatible request to an adapter-owned frontend."""
+        runner = _ready_serve(adapter.name)
+        if runner is None:
+            return self._err("ready runner for model %s not found" % adapter.name,
+                             status=503)
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (runner.port, path),
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            response = urllib.request.urlopen(request, timeout=3600.0)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                payload = json.loads(raw.decode("utf-8", "replace"))
+            except (ValueError, UnicodeDecodeError):
+                payload = {"error": raw.decode("utf-8", "replace")}
+            return self._send_json(payload, status=e.code)
+        except (OSError, urllib.error.URLError) as e:
+            return self._err("proxy to %s failed: %s" % (adapter.name, e),
+                             status=502)
+        if body.get("stream"):
+            self.send_response(response.status)
+            self.send_header("Content-Type", response.headers.get(
+                "Content-Type", "text/event-stream"))
+            self.send_header("Cache-Control", response.headers.get(
+                "Cache-Control", "no-cache"))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                for chunk in iter(lambda: response.read(65536), b""):
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                response.close()
+            return None
+        try:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+        except (ValueError, UnicodeDecodeError) as e:
+            return self._err("invalid %s response: %s" % (adapter.name, e),
+                             status=502)
+        finally:
+            response.close()
+        return self._send_json(payload, status=response.status)
+
     def _post_generate(self, body):
         """Queue the native ids-in/ids-out request against the default runner."""
         req = dict(body)
@@ -1278,9 +1315,20 @@ class Handler(bhs.Handler):
 
     def _post_openai_responses(self, body):
         if "contexts" in body:
+            try:
+                if _resolve_adapter(body.get("model")).proxy_protocol:
+                    return self._err("context batches are not supported by the "
+                                     "DS4F wire proxy", status=400)
+            except models.ConfigError as e:
+                return self._err(str(e), status=400)
             return self._post_openai_batch(body)
         try:
             adapter = _resolve_adapter(body.get("model"))
+            if not adapter.supports_serve:
+                return self._err("%s does not support OpenAI-style serve operations" %
+                                 adapter.name, status=400)
+            if adapter.proxy_protocol:
+                return self._proxy_protocol(adapter, "/v1/responses", body)
             translated = adapter.responses_request(body)
         except (models.ConfigError, ValueError) as e:
             return self._err(str(e), status=400)
@@ -1324,8 +1372,12 @@ class Handler(bhs.Handler):
         if _ready_serve(adapter.name) is None:
             return self._err("ready runner for model %s not found" % adapter.name,
                              status=503)
+        if adapter.proxy_protocol:
+            return self._proxy_protocol(adapter, "/v1/messages", body)
         try:
-            request = anthropic_api.request(body)
+            request = anthropic_api.request(
+                body, model=(adapter.openai_models[0]
+                             if adapter.openai_models else model_name))
             context = _contexts.get_or_create(self._anthropic_context_id(body),
                                                model=adapter.name)
             self._accept_anthropic_tool_continuation(context, body)
@@ -1352,8 +1404,13 @@ class Handler(bhs.Handler):
 
     def _post_anthropic_count_tokens(self, body):
         try:
-            request = anthropic_api.request(body)
             adapter = _resolve_adapter(body.get("llmgr_model"))
+            if adapter.proxy_protocol:
+                return self._proxy_protocol(adapter, "/v1/messages/count_tokens", body)
+            model_name = body.get("llmgr_model")
+            request = anthropic_api.request(
+                body, model=(adapter.openai_models[0]
+                             if adapter.openai_models else model_name))
             native, _tokenizer = adapter.native_request(request, chat=True)
         except (ValueError, OSError) as e:
             return self._err(str(e))
@@ -1597,6 +1654,9 @@ class Handler(bhs.Handler):
                              status=400)
         if _ready_serve(adapter.name) is None:
             return self._err("ready runner for model %s not found" % adapter.name, status=503)
+        if adapter.proxy_protocol:
+            path = "/v1/chat/completions" if chat else "/v1/completions"
+            return self._proxy_protocol(adapter, path, body)
         try:
             original = response_body if isinstance(response_body, dict) else body
             context_id = original.get("context_id") or original.get("conversation_id")

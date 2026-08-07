@@ -59,6 +59,23 @@ class AgentInterfaceTest(unittest.TestCase):
             finally:
                 serve.AGENT_CACHE_ROOT, serve.TOK = old_root, old_tok
 
+    def test_conversation_cache_paths_do_not_cross_agents(self):
+        old_base = serve.BASE
+        serve.BASE = "/tmp/ds4f-audit"
+        old = dict(serve._conv)
+        try:
+            serve._conv.update({"agent": None, "path": None, "ids": None})
+            with mock.patch.object(serve, "encode", return_value=[1, 2]), \
+                    mock.patch.object(serve, "prepare_agent_cache",
+                                      return_value=([1, 2], "/tmp/system.kv", False, 0)):
+                serve._select_cache("codex", [], [], "prompt")
+                _, _, _, codex_path, _ = serve._select_cache(
+                    "claude-code", [], [], "prompt")
+            self.assertEqual(codex_path, "/tmp/ds4f-audit.conv.claude-code")
+        finally:
+            serve.BASE = old_base
+            serve._conv.update(old)
+
     def test_completion_parses_tool_calls_without_visible_marker(self):
         content, calls, finish = serve.parse_completion(
             'Need a command\n<tool_call>{"name":"bash","arguments":{"command":"pwd"}}</tool_call>',
