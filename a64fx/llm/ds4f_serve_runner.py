@@ -116,6 +116,11 @@ def run_serve(sess, base, prefix_cache, slots):
     reqseq = base + ".reqseq"; respseq = base + ".respseq"
     # per-slot cache paths (slot 0 is the live context; others are switched in)
     slot_path = [base + ".slot.%d" % i for i in range(slots)]
+    syscache = os.environ.get("DS4F_SERVE_SYSCACHE")
+    if syscache and os.path.exists(syscache):
+        sess.kv_restore(syscache)
+        print("[runner] system-prompt cache loaded from %s (pos=%d)" %
+              (syscache, sess.pos()), file=sys.stderr, flush=True)
     done = 0
     print("[runner] serving on %s.* slots=%d prefix_cache=%d" % (base, slots, prefix_cache),
           file=sys.stderr, flush=True)
@@ -159,9 +164,25 @@ def run_serve(sess, base, prefix_cache, slots):
               file=sys.stderr, flush=True)
 
 
+def truncate_prompt(prompt, limit):
+    """Keep the system prompt / tool definitions (the head) plus the recent
+    tail when the conversation would exceed the context ceiling.  The head and
+    the tail are both kept whole; the middle turns are dropped."""
+    if len(prompt) <= limit:
+        return prompt
+    head = max(1, limit * 2 // 3)
+    tail = limit - head
+    if tail < 1:
+        return prompt[-limit:]
+    return prompt[:head] + prompt[-tail:]
+
+
 def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
              slot, ctl, cache_path, prefix_cache, slots, slot_path):
     sp = Sampling(temp, top_p, top_k, pres, rep, seed)
+    maxpos = sess.maxpos()
+    limit = max(1, maxpos - max_new)
+    prompt = truncate_prompt(prompt, limit)
     start = sess.pos()
 
     if ctl & 1 and cache_path and os.path.exists(cache_path):
@@ -193,7 +214,7 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
         pos += 1
         if ar == sess.eos:
             break
-        if pos >= sess.maxpos():
+        if pos >= maxpos:
             break
 
     # cache save: the KV up to the current position (prefix for the next turn)
