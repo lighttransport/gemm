@@ -514,35 +514,33 @@ class H(http.server.BaseHTTPRequestHandler):
         _dbg = os.environ.get("DS4F_SERVE_DEBUG")
         if _dbg: print("[chat] t0 %.2f reuse=%s cpath=%s len=%d" %
                        (time.time(), reuse, cpath, len(ids_all)), flush=True)
-        try:
-            ids, gen, raw = infer(prompt, max_tokens, samp,
-                                  cache_path=cache_path, cache_load=reuse, cache_save=True,
-                                  save_path=save_path)
-            if _dbg: print("[chat] infer %.2f gen=%d" % (time.time() - t0, len(gen)), flush=True)
-        except TimeoutError:
-            return self._json(504, {"error": "runner timeout"})
-        except Exception as e:
-            return self._json(500, {"error": str(e)})
-        hit_eos = bool(gen and gen[-1] == 1)   # DS4F_EOS_ID == 1
-        content, tool_calls, finish = parse_completion(raw, hit_eos)
-        created = int(t0)
-        usage = {"prompt_tokens": len(ids), "completion_tokens": len(gen),
-                 "total_tokens": len(ids) + len(gen)}
         if not stream:
+            try:
+                ids, gen, raw = infer(prompt, max_tokens, samp,
+                                      cache_path=cache_path, cache_load=reuse, cache_save=True,
+                                      save_path=save_path)
+                if _dbg: print("[chat] infer %.2f gen=%d" % (time.time() - t0, len(gen)), flush=True)
+            except TimeoutError:
+                return self._json(504, {"error": "runner timeout"})
+            except Exception as e:
+                return self._json(500, {"error": str(e)})
+            hit_eos = bool(gen and gen[-1] == 1)   # DS4F_EOS_ID == 1
+            content, tool_calls, finish = parse_completion(raw, hit_eos)
             msg = {"role": "assistant", "content": content or None}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
             return self._json(200, {
-                "id": "chatcmpl-ds4f", "object": "chat.completion", "created": created,
+                "id": "chatcmpl-ds4f", "object": "chat.completion", "created": int(t0),
                 "model": MODEL_ID,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": usage,
+                "usage": {"prompt_tokens": len(ids), "completion_tokens": len(gen),
+                          "total_tokens": len(ids) + len(gen)},
             })
         # real streaming: the runner appends each generated token id to BASE.tok
         # (ctl bit2); infer() runs in a thread and this handler tails the file,
         # decoding each token and emitting an SSE delta as it lands.
         self._sse_headers()
-        head = {"id": "chatcmpl-ds4f", "object": "chat.completion.chunk", "created": created,
+        head = {"id": "chatcmpl-ds4f", "object": "chat.completion.chunk", "created": int(t0),
                 "model": MODEL_ID}
         self._sse({**head, "choices": [{"index": 0, "delta": {"role": "assistant"},
                                         "finish_reason": None}]})
