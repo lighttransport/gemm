@@ -7,7 +7,8 @@ set -eu
 : "${DS4F_STAGE_DIR:=}"
 : "${DS4F_WORK_DIR:=}"
 : "${DS4F_NP:=11}"
-export LLMGR_DEFAULT_MODEL=ds4f DS4F_NP
+export LLMGR_DEFAULT_MODEL=ds4f
+export DS4F_NP
 [ -z "$DS4F_MODEL_DIR" ] || export DS4F_MODEL_DIR
 [ -z "$DS4F_STAGE_DIR" ] || export DS4F_STAGE_DIR
 [ -z "$DS4F_WORK_DIR" ] || export DS4F_WORK_DIR

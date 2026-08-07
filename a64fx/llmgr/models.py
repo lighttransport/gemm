@@ -19,7 +19,10 @@ Standard library only.
 import glob
 import os
 import re
+import shutil
 import time
+import urllib.error
+import urllib.request
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 LAGUNA_DIR = os.path.join(REPO, "a64fx", "laguna-s21")
@@ -31,6 +34,16 @@ DS4F_DIR = os.path.join(REPO, "a64fx", "llm")
 
 class ConfigError(ValueError):
     """Bad request config -- reported to the client as HTTP 400."""
+
+
+def _expanded_path(value, field):
+    try:
+        path = os.fspath(value)
+    except TypeError:
+        raise ConfigError("%s must be a string path (got %r)" % (field, value))
+    if not isinstance(path, str) or not path or "\0" in path:
+        raise ConfigError("%s must be a non-empty NUL-free string path" % field)
+    return os.path.abspath(os.path.expanduser(path))
 
 
 def _int(cfg, key, default=None, required=False):
@@ -834,6 +847,104 @@ class Ds4fAdapter(Adapter):
     def runner_bin(self, cfg):
         return os.path.join(DS4F_DIR, "build", "ds4f_ep_runner")
 
+
+class Qwen36Adapter(Adapter):
+    """Qwen3.6/Qwen3.5 GGUF through a local llama.cpp server.
+
+    The model is a qwen35 hybrid GGUF even when its filename says Qwen3.6.
+    llama.cpp owns the graph and heterogeneous Vulkan/ROCm device split; llmgr
+    only supervises its OpenAI-compatible HTTP server.  Paths and device names
+    are intentionally configuration-driven so this adapter is usable with any
+    llama.cpp build and any GGUF model.
+    """
+
+    name = "qwen36"
+    variants = ("q5",)
+    default_variant = "q5"
+    supports_serve = True
+    openai_models = ("qwen36", "qwen3.6", "qwen3.5")
+    proxy_protocol = True
+
+    def _server(self, cfg):
+        value = cfg.get("server") or os.environ.get("LLMGR_LLAMA_SERVER")
+        value = value or shutil.which("llama-server")
+        if not value:
+            raise ConfigError("llama-server not found; set server or LLMGR_LLAMA_SERVER")
+        return _expanded_path(value, "server")
+
+    def model_path(self, cfg):
+        value = cfg.get("model") or cfg.get("model_path") or os.environ.get("QWEN36_MODEL")
+        if not value:
+            raise ConfigError("missing model path: set model or QWEN36_MODEL")
+        return _expanded_path(value, "model")
+
+    def default_np(self):
+        return 1
+
+    def _env(self, cfg):
+        env = _env_overrides(cfg)
+        if cfg.get("library_path"):
+            env["LD_LIBRARY_PATH"] = _expanded_path(cfg["library_path"], "library_path")
+        return env
+
+    def serve(self, cfg):
+        port = _int(cfg, "port", required=True)
+        model = self.model_path(cfg)
+        devices = str(cfg.get("devices") or os.environ.get(
+            "LLMGR_LLAMA_DEVICES", "Vulkan1,Vulkan0"))
+        split = str(cfg.get("split_mode", "layer"))
+        # The 5060 Ti exposes less usable VRAM than the 9070 XT on this host;
+        # leave a little more weight/KV headroom on the AMD primary for 512K.
+        tensor_split = str(cfg.get("tensor_split", "1.4,1"))
+        ctx = _int(cfg, "ctx", 524288)
+        cache_k = str(cfg.get("cache_type_k", "q4_0"))
+        cache_v = str(cfg.get("cache_type_v", "q4_0"))
+        batch = _int(cfg, "batch", 512)
+        ubatch = _int(cfg, "ubatch", batch)
+        slot_save_path = cfg.get("slot_save_path") or os.environ.get(
+            "LLMGR_QWEN36_CACHE_DIR")
+        argv = [self._server(cfg), "-m", model, "--host", "127.0.0.1",
+                "--port", str(port), "--device", devices,
+                "--main-gpu", str(_int(cfg, "main_gpu", 0)),
+                "--split-mode", split, "--tensor-split", tensor_split,
+                "--ctx-size", str(ctx), "--cache-type-k", cache_k,
+                "--cache-type-v", cache_v, "--batch-size", str(batch),
+                "--ubatch-size", str(ubatch),
+                "--flash-attn", str(cfg.get("flash_attn", "on"))]
+        if slot_save_path:
+            argv += ["--slot-save-path", os.path.abspath(os.path.expanduser(
+                os.fspath(slot_save_path)))]
+        for key, flag in (("gpu_layers", "--n-gpu-layers"),
+                          ("fit", "--fit"), ("fit_target", "--fit-target"),
+                          ("threads", "--threads"),
+                          ("threads_batch", "--threads-batch")):
+            if cfg.get(key) is not None:
+                argv += [flag, str(cfg[key])]
+        if cfg.get("fit") is None:
+            argv += ["--fit", "on"]
+        if cfg.get("fit_target") is None:
+            argv += ["--fit-target", str(os.environ.get(
+                "LLMGR_LLAMA_FIT_TARGET", "512"))]
+        argv += _extra(cfg)
+        return argv, self._env(cfg), os.path.dirname(model) or os.getcwd()
+
+    def readiness(self, cfg, since):
+        port = _int(cfg, "port", required=True)
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/health" % port,
+                                        timeout=0.5) as response:
+                if response.status == 200:
+                    return True, "llama-server healthy on %d" % port
+        except (OSError, urllib.error.URLError):
+            pass
+        return False, "waiting for llama-server health on %d" % port
+
+    def stage_dir(self, cfg):
+        return os.path.dirname(self.model_path(cfg)) or os.getcwd()
+
+    def runner_bin(self, cfg):
+        return self._server(cfg)
+
 def shlex_quote(value):
     """Small local quote helper to keep the adapter Python-3.6 compatible."""
     import shlex
@@ -841,7 +952,7 @@ def shlex_quote(value):
 
 
 ADAPTERS = {a.name: a() for a in
-            (LagunaAdapter, Gemma4Adapter, K3Adapter, Ds4fAdapter)}
+            (LagunaAdapter, Gemma4Adapter, K3Adapter, Ds4fAdapter, Qwen36Adapter)}
 
 
 def default_model():
