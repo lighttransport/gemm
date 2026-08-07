@@ -47,8 +47,10 @@ Smoke test: `sh a64fx/llm/test_ds4f_serve.sh /tmp/ds4f_single 8080`.
   extends the previous one skips re-prefilling the shared prefix.  The frontend
   passes `cache_load`/`cache_save` (ctl bits) + a cache path; the runner
   snapshots/restores the per-layer KV + the tierb2 compressor state via
-  `ds4f_tb2_snap*`.  Measured: the same 8-token tail generated in 9.2 s full
-  vs 3.6 s with a 5-token cached prefix.
+  `ds4f_tb2_snap*`.  Measured (ROCm dense, warm): a 2-turn conversation where
+  turn 2 extends turn 1's 20-token prompt completes in **1.6 s** vs the full
+  prefill of the first turn (a request whose 24 tokens include a cold
+  page-in of the dense bank, ~100 s; warm prefill is seconds).
 - **Slots** (`DS4F_SERVE_SLOTS`): per-conversation KV snapshots switched by
   the `slot` field (`<BASE>.slot.<i>` files).
 - **System-prompt cache** (`DS4F_SERVE_SYSCACHE`): a persisted context (built
@@ -102,7 +104,11 @@ OpenAI-to-Anthropic bridge (e.g. claude-code-router) with the same
 
 ## Performance notes
 
-The dense bank is attached to the ROCm via the `hip_ds4f_dense` hooks; the
-routed MXFP4 experts stay on the CPU.  The CPU expert decode dominates the
-token rate (~1-4 tok/s on this box for the full 256-expert model); the
-CUDA-expert async batch (hetero/ds4f) is the follow-on accelerator.
+The dense bank is attached to the ROCm via the `hip_ds4f_dense` hooks (the
+default `DS4F_SERVE_USE_HIP=1`; the CPU-only path is ~4x slower).  The routed
+MXFP4 experts stay on the CPU.  Measured decode: **~240 ms/token** (2.3-4 tok/s)
+with the tierb2 compressor on, ~176 ms with it off; the CPU experts are the
+floor (the harness's best no-compressor decode is ~185 ms/token, and neither
+the CUDA expert batch nor the ROCm MXFP4 path beats the CPU at M=1).  The
+CUDA-expert async batch (hetero/ds4f) is the follow-on accelerator for
+multi-token prefill, not the single-token decode.
