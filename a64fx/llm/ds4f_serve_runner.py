@@ -190,6 +190,8 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
     limit = max(1, maxpos - max_new)
     prompt = truncate_prompt(prompt, limit)
     start = sess.pos()
+    _dbg = os.environ.get("DS4F_SERVE_DEBUG")
+    _t0 = time.time()
 
     if ctl & 1 and cache_path and os.path.exists(cache_path):
         # load a cached prefix; prefill only the tokens after the cached length
@@ -236,9 +238,15 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
     if tf is not None:
         tf.close()
 
+    if _dbg:
+        print("[runner] gen prefill+decode %.1fs gen=%d pos=%d" %
+              (time.time() - _t0, len(out), sess.pos()), file=sys.stderr, flush=True)
     # cache save: the KV up to the current position (prefix for the next turn)
     if ctl & 2 and cache_path:
+        _ts = time.time()
         sess.kv_save(cache_path)
+        if _dbg:
+            print("[runner] kv_save %.2fs" % (time.time() - _ts), file=sys.stderr, flush=True)
     elif prefix_cache and slots > 1:
         sess.kv_save(slot_path[slot % slots])
     return out

@@ -228,6 +228,13 @@ def decode(ids):
             except OSError: pass
 
 
+# conversation prefix cache: the KV snapshot (BASE.conv) + the token ids of the
+# last prefilled conversation.  The chat handler reuses it when the next request
+# extends it, skipping the re-prefill of everything before the new turn.
+_conv = {"path": None, "ids": None}
+_conv_lock = threading.Lock()
+
+
 def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, cache_save=False,
           stream=False):
     global _seq
@@ -255,17 +262,21 @@ def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, c
         with open(REQSEQ, "w") as f:
             f.write(str(_seq) + "\n")                # write req then bump seq -> runner reads a complete file
         t0 = time.time()
+        _dbg = os.environ.get("DS4F_SERVE_DEBUG")
         while True:
             try:
                 with open(RESPSEQ) as f:
                     rs = int(f.read().strip() or 0)
             except (OSError, ValueError):
                 rs = 0
+            if _dbg and rs > 0:
+                pass
             if rs >= _seq:
                 break
             if time.time() - t0 > TIMEOUT:
                 raise TimeoutError("runner timeout")
             time.sleep(0.01)
+        if _dbg: print("[infer] wait %.2f rs=%d seq=%d" % (time.time() - t0, rs, _seq), flush=True)
         with open(RESP) as f:
             gen = [int(x) for x in f.read().split()]
         return ids, gen, decode(gen)
@@ -443,9 +454,21 @@ class H(http.server.BaseHTTPRequestHandler):
         max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 512)))
         samp = parse_sampling(body)
         prompt = build_chat_prompt(messages, tools)
+        with _conv_lock:
+            ids_all = encode(prompt)
+            prev = _conv["ids"]
+            reuse = _conv["path"] is not None and prev is not None and                 len(ids_all) >= len(prev) and ids_all[:len(prev)] == prev
+            cpath = _conv["path"] or (BASE + ".conv")
+            _conv["ids"] = ids_all
+            _conv["path"] = cpath
         t0 = time.time()
+        _dbg = os.environ.get("DS4F_SERVE_DEBUG")
+        if _dbg: print("[chat] t0 %.2f reuse=%s cpath=%s len=%d" %
+                       (time.time(), reuse, cpath, len(ids_all)), flush=True)
         try:
-            ids, gen, raw = infer(prompt, max_tokens, samp)
+            ids, gen, raw = infer(prompt, max_tokens, samp,
+                                  cache_path=cpath, cache_load=reuse, cache_save=True)
+            if _dbg: print("[chat] infer %.2f gen=%d" % (time.time() - t0, len(gen)), flush=True)
         except TimeoutError:
             return self._json(504, {"error": "runner timeout"})
         except Exception as e:
@@ -478,7 +501,8 @@ class H(http.server.BaseHTTPRequestHandler):
         done = {"gen": []}
         def _run():
             try:
-                p_ids, p_gen, _ = infer(prompt, max_tokens, samp, stream=True)
+                p_ids, p_gen, _ = infer(prompt, max_tokens, samp, stream=True,
+                                        cache_path=cpath, cache_load=reuse, cache_save=True)
                 done["ids"] = p_ids
                 done["gen"] = p_gen
             except Exception as e:
