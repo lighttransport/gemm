@@ -7,6 +7,8 @@ requests) over shared-FS files:  <BASE>.req / .reqseq  (prompt in) and  <BASE>.r
 
 Endpoints:
   POST /v1/chat/completions  {"messages":[...], "tools":[...], "stream":bool, ...}  (OpenAI chat)
+  POST /v1/responses         Responses API requests for Codex
+  POST /v1/messages          Anthropic Messages requests for Claude Code
   POST /v1/completions       {"prompt": str, "max_tokens": int, ...sampling}        (OpenAI text)
   POST /completion           {"prompt": str, "n_predict": int, ...sampling}         (llama.cpp)
   GET  /v1/models            {"object":"list","data":[{"id":"ds4f",...}]}
@@ -20,9 +22,10 @@ turn (blocking), then this frontend emits it as SSE deltas (pi's openai-completi
 stream:true). Sampling params (all optional): temperature (<=0 => greedy, default 0), top_p (1.0),
 top_k (0=off), presence_penalty (0), repeat_penalty / repetition_penalty (1.0), seed.
 
-Env: PORT (8080), TOK (~/models/ds4f/tokenizer.json), DS4F_SERVE_BASE, DS4F_SERVE_TIMEOUT (1200s).
+Env: PORT (8080), TOK (~/models/ds4f/tokenizer.json), DS4F_SERVE_BASE,
+DS4F_SERVE_AGENT_CACHE_DIR, DS4F_SERVE_TIMEOUT (1200s).
 Start via run_ds4f_serve_11n.sh (which launches the runner first, then this)."""
-import http.server, json, os, re, socketserver, subprocess, sys, tempfile, threading, time
+import hashlib, http.server, json, os, re, socketserver, subprocess, sys, tempfile, threading, time, uuid
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -231,13 +234,112 @@ def decode(ids):
 # conversation prefix cache: the KV snapshot (BASE.conv) + the token ids of the
 # last prefilled conversation.  The chat handler reuses it when the next request
 # extends it, skipping the re-prefill of everything before the new turn.
-_conv = {"path": None, "ids": None}
+_conv = {"agent": None, "path": None, "ids": None}
 _conv_lock = threading.Lock()
-# system-prompt cache (DS4F_SERVE_SYSCACHE): the KV of the fixed prefix that
-# every conversation shares (BOS + system message + tools).  Built once with a
-# max_tokens=0 cache_save request; the runner can also preload it at startup.
-SYSCACHE = os.environ.get("DS4F_SERVE_SYSCACHE", "") or ""
-_sys = {"path": SYSCACHE or (BASE + ".sys"), "ids": None}
+# Durable system-prefix caches are separate from DS4F_SERVE_SYSCACHE, which is
+# retained as the runner's legacy single-file checkpoint/preload knob.
+AGENT_CACHE_ROOT = os.environ.get("DS4F_SERVE_AGENT_CACHE_DIR", BASE + ".agent-cache")
+_cache_lock = threading.Lock()
+_cache_stats = {"hits": 0, "misses": 0, "writes": 0}
+
+# Responses API state is keyed by previous_response_id.  It is deliberately
+# bounded: Chat/Anthropic clients normally resend their complete history.
+_response_contexts = {}
+_response_context_order = []
+_response_context_lock = threading.Lock()
+_MAX_RESPONSE_CONTEXTS = int(os.environ.get("DS4F_SERVE_MAX_RESPONSE_CONTEXTS", "256"))
+
+
+def _cache_identity(agent, prefix_ids):
+    token_identity = os.path.abspath(TOK)
+    try:
+        st = os.stat(TOK)
+        token_identity += ":%d:%d" % (st.st_size, int(getattr(st, "st_mtime_ns", st.st_mtime * 1e9)))
+    except OSError:
+        pass
+    raw = ("ds4f-agent-cache-v1\0%s\0%s\0%s\0%s" %
+           (agent, MODEL_ID, token_identity, " ".join(map(str, prefix_ids)))).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _cache_paths(agent, prefix_ids):
+    key = _cache_identity(agent, prefix_ids)
+    directory = os.path.join(AGENT_CACHE_ROOT, agent)
+    return (key, directory, os.path.join(directory, key + ".kv"),
+            os.path.join(directory, key + ".json"))
+
+
+def _read_agent_cache(agent, prefix_ids):
+    key, directory, kv_path, meta_path = _cache_paths(agent, prefix_ids)
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if (meta.get("schema_version") != 1 or meta.get("agent") != agent or
+                meta.get("model") != MODEL_ID or meta.get("key") != key or
+                meta.get("token_ids") != prefix_ids or not os.path.isfile(kv_path) or
+                os.path.getsize(kv_path) < 16):
+            return None
+    except (OSError, ValueError, TypeError):
+        return None
+    return {"agent": agent, "key": key, "ids": prefix_ids, "path": kv_path,
+            "directory": directory, "hit": True}
+
+
+def _write_agent_cache(agent, prefix_text, prefix_ids):
+    key, directory, kv_path, meta_path = _cache_paths(agent, prefix_ids)
+    os.makedirs(directory, exist_ok=True)
+    tmp_kv = "%s.tmp.%d" % (kv_path, os.getpid())
+    tmp_meta = "%s.tmp.%d" % (meta_path, os.getpid())
+    try:
+        infer(prefix_text, 0, {"temperature": 0.0, "top_p": 1.0, "top_k": 0,
+                              "presence_penalty": 0.0, "repeat_penalty": 1.0,
+                              "seed": None}, cache_save=True, save_path=tmp_kv)
+        if not os.path.isfile(tmp_kv) or os.path.getsize(tmp_kv) < 16:
+            raise RuntimeError("runner did not produce a complete system cache")
+        meta = {"schema_version": 1, "agent": agent, "model": MODEL_ID,
+                "key": key, "tokenizer": os.path.abspath(TOK),
+                "token_count": len(prefix_ids), "token_ids": prefix_ids}
+        with open(tmp_meta, "w") as f:
+            json.dump(meta, f, separators=(",", ":"))
+        os.replace(tmp_kv, kv_path)
+        os.replace(tmp_meta, meta_path)
+        _cache_stats["writes"] += 1
+        return {"agent": agent, "key": key, "ids": prefix_ids, "path": kv_path,
+                "directory": directory, "hit": False}
+    finally:
+        for path in (tmp_kv, tmp_meta):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def prepare_agent_cache(agent, messages, tools, prompt_ids):
+    """Return (prompt_ids, cache_path, cache_load, cache_tokens).
+
+    The metadata sidecar makes a frontend restart safe: the raw KV file is
+    never restored unless its exact tokenized prefix matches this request.
+    """
+    prefix_text = sys_prefix_text(messages, tools)
+    prefix_ids = encode(prefix_text)
+    cache = None
+    with _cache_lock:
+        cache = _read_agent_cache(agent, prefix_ids)
+        if cache is None:
+            _cache_stats["misses"] += 1
+            try:
+                cache = _write_agent_cache(agent, prefix_text, prefix_ids)
+            except (OSError, RuntimeError) as e:
+                print("[cache] agent=%s WRITE_FAILED: %s" % (agent, e),
+                      file=sys.stderr, flush=True)
+                cache = {"path": None, "hit": False, "ids": []}
+        else:
+            _cache_stats["hits"] += 1
+    cached = cache["ids"] if cache and cache.get("hit") else []
+    print("[cache] agent=%s %s prefix_tokens=%d key=%s" %
+          (agent, "HIT" if cache.get("hit") else "WRITE", len(cached),
+           cache.get("key", "none")), file=sys.stderr, flush=True)
+    return prompt_ids, cache["path"], bool(cache.get("hit")), len(cached)
 
 
 def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, cache_save=False,
@@ -426,12 +528,21 @@ def anthropic_messages_to_openai(messages):
                 msg["tool_calls"] = tcs
             out.append(msg)
         else:
-            for tr in tool_results:
-                out.append({"role": "tool",
-                            "tool_call_id": tr.get("tool_use_id", "call_0"),
-                            "content": _content_to_text(tr.get("content"))})
-            if text_parts:
-                out.append({"role": "user", "content": "".join(text_parts)})
+            # Keep tool results in request order; Claude can send text and
+            # tool_result blocks together in one user message.
+            pending_text = []
+            for block in content:
+                if block.get("type") == "text":
+                    pending_text.append(block.get("text", ""))
+                elif block.get("type") == "tool_result":
+                    if pending_text:
+                        out.append({"role": "user", "content": "".join(pending_text)})
+                        pending_text = []
+                    out.append({"role": "tool",
+                                "tool_call_id": block.get("tool_use_id", "call_0"),
+                                "content": _content_to_text(block.get("content"))})
+            if pending_text:
+                out.append({"role": "user", "content": "".join(pending_text)})
     return out
 
 
@@ -482,28 +593,106 @@ def parse_completion(text, hit_eos):
     return text.strip(), [], ("stop" if (hit_eos or truncated) else "length")
 
 
-def _select_cache(prompt):
+def responses_tools_to_openai(tools):
+    """Codex/Responses-API tool defs -> OpenAI function tools."""
+    out = []
+    for t in (tools or []):
+        if not isinstance(t, dict) or not t.get("name"):
+            continue
+        out.append({"type": "function", "function": {
+            "name": t.get("name", ""),
+            "description": t.get("description", ""),
+            "parameters": t.get("parameters", {"type": "object", "properties": {}})}})
+    return out
+
+
+def responses_input_to_openai(body):
+    """Responses-API request -> OpenAI messages[] for the chat prompt builder."""
+    messages = []
+    instructions = body.get("instructions") or ""
+    if isinstance(instructions, list):
+        instructions = "".join(b.get("text", "") for b in instructions if isinstance(b, dict))
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+    incoming = body.get("input", [])
+    if isinstance(incoming, str):
+        incoming = [{"type": "message", "role": "user", "content": incoming}]
+    elif isinstance(incoming, dict):
+        incoming = [incoming]
+    for item in incoming:
+        t = item.get("type") if isinstance(item, dict) else None
+        if t == "message":
+            role = item.get("role", "user")
+            content = item.get("content", "")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "".join((b.get("text", "") if isinstance(b, dict) else str(b))
+                               for b in content)
+            else:
+                text = str(content)
+            messages.append({"role": role, "content": text})
+        elif t in ("input_text", "output_text"):
+            messages.append({"role": "user", "content": str(item.get("text", ""))})
+        elif t == "function_call":
+            messages.append({"role": "assistant", "content": None, "tool_calls": [
+                {"id": item.get("call_id", "call_0"), "type": "function",
+                 "function": {"name": item.get("name", ""),
+                              "arguments": item.get("arguments", "{}")}}]})
+        elif t == "function_call_output":
+            messages.append({"role": "tool",
+                             "tool_call_id": item.get("call_id", "call_0"),
+                             "content": str(item.get("output", ""))})
+    return messages
+
+
+def _response_context_messages(body):
+    previous = body.get("previous_response_id")
+    if not previous:
+        return responses_input_to_openai(body)
+    with _response_context_lock:
+        saved = _response_contexts.get(previous)
+    if saved is None:
+        raise KeyError(previous)
+    messages = json.loads(json.dumps(saved))
+    # Continuation requests carry only new function_call_output items.
+    continuation = dict(body)
+    continuation["instructions"] = ""
+    messages.extend(responses_input_to_openai(continuation))
+    return messages
+
+
+def _remember_response(response_id, messages):
+    with _response_context_lock:
+        _response_contexts[response_id] = json.loads(json.dumps(messages))
+        if response_id in _response_context_order:
+            _response_context_order.remove(response_id)
+        _response_context_order.append(response_id)
+        while len(_response_context_order) > _MAX_RESPONSE_CONTEXTS:
+            old = _response_context_order.pop(0)
+            _response_contexts.pop(old, None)
+
+
+def _select_cache(agent, messages, tools, prompt):
     """Decide the KV prefix to restore for this prompt (conversation reuse,
     system-prompt reuse, or fresh) and where to save the new KV snapshot."""
     with _conv_lock:
         ids_all = encode(prompt)
         prev = _conv["ids"]
-        conv_reuse = _conv["path"] is not None and prev is not None and \
+        conv_reuse = _conv["agent"] == agent and _conv["path"] is not None and prev is not None and \
             len(ids_all) >= len(prev) and ids_all[:len(prev)] == prev
-        cpath = _conv["path"] or (BASE + ".conv")
-        sys_ids = _sys["ids"]
-        sys_ready = SYSCACHE and os.path.exists(SYSCACHE) and sys_ids is not None and \
-            len(ids_all) >= len(sys_ids) and ids_all[:len(sys_ids)] == sys_ids
+        cpath = _conv["path"] or (BASE + ".conv." + agent)
         if conv_reuse:
-            reuse = True; cache_path = cpath
-        elif sys_ready:
-            reuse = True; cache_path = SYSCACHE
+            reuse = True
+            cache_path = cpath
+            cached_tokens = len(prev)
         else:
-            reuse = False; cache_path = cpath
+            _, cache_path, reuse, cached_tokens = prepare_agent_cache(agent, messages, tools, ids_all)
         save_path = cpath
+        _conv["agent"] = agent
         _conv["ids"] = ids_all
         _conv["path"] = cpath
-    return ids_all, reuse, cache_path, save_path
+    return ids_all, reuse, cache_path, save_path, cached_tokens
 
 
 def anthropic_blocks(content, tool_calls, finish, hit_eos):
@@ -527,6 +716,25 @@ def anthropic_blocks(content, tool_calls, finish, hit_eos):
     else:
         stop = "end_turn"
     return blocks, stop
+
+
+def stream_visible_delta(state, piece):
+    """Return only safe visible text; hold tool-call marker/JSON until EOF."""
+    state["raw"] += piece
+    raw = state["raw"]
+    marker = "<tool_call>"
+    cut = raw.find(marker)
+    if cut >= 0:
+        visible = raw[:cut]
+    else:
+        visible = raw
+        for n in range(1, len(marker)):
+            if raw.endswith(marker[:n]):
+                visible = raw[:-n]
+                break
+    delta = visible[state["emitted"]:]
+    state["emitted"] = len(visible)
+    return delta
 
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -573,6 +781,8 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.chat()
         if path in ("/v1/messages", "/messages"):
             return self.messages_anthropic()
+        if path in ("/v1/responses", "/responses"):
+            return self.responses_api()
         return self.completion()
 
     # ---- OpenAI chat completions (pi's path) ----
@@ -586,42 +796,12 @@ class H(http.server.BaseHTTPRequestHandler):
         max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 512)))
         samp = parse_sampling(body)
         prompt = build_chat_prompt(messages, tools)
-        # system-prompt cache: build once from the fixed prefix (BOS + system +
-        # tools) with a zero-token cache_save request; the runner restores it and
-        # prefills only the conversation tail on later requests that share it.
-        if SYSCACHE and not os.path.exists(SYSCACHE):
-            try:
-                sp_ids = encode(sys_prefix_text(messages, tools))
-                if sp_ids:
-                    infer(sys_prefix_text(messages, tools), 0,
-                          {"temperature": 0.0, "top_p": 1.0, "top_k": 0,
-                           "presence_penalty": 0.0, "repeat_penalty": 1.0, "seed": None},
-                          cache_path=SYSCACHE, cache_save=True)
-                    _sys["ids"] = sp_ids
-            except Exception:
-                pass
-        with _conv_lock:
-            ids_all = encode(prompt)
-            prev = _conv["ids"]
-            conv_reuse = _conv["path"] is not None and prev is not None and \
-                len(ids_all) >= len(prev) and ids_all[:len(prev)] == prev
-            cpath = _conv["path"] or (BASE + ".conv")
-            sys_ids = _sys["ids"]
-            sys_ready = SYSCACHE and os.path.exists(SYSCACHE) and sys_ids is not None and \
-                len(ids_all) >= len(sys_ids) and ids_all[:len(sys_ids)] == sys_ids
-            if conv_reuse:
-                reuse = True; cache_path = cpath
-            elif sys_ready:
-                reuse = True; cache_path = SYSCACHE
-            else:
-                reuse = False; cache_path = cpath
-            save_path = cpath
-            _conv["ids"] = ids_all
-            _conv["path"] = cpath
+        ids_all, reuse, cache_path, save_path, cached_tokens = _select_cache(
+            "opencode", messages, tools, prompt)
         t0 = time.time()
         _dbg = os.environ.get("DS4F_SERVE_DEBUG")
-        if _dbg: print("[chat] t0 %.2f reuse=%s cpath=%s len=%d" %
-                       (time.time(), reuse, cpath, len(ids_all)), flush=True)
+        if _dbg: print("[chat] t0 %.2f reuse=%s cache=%s len=%d" %
+                       (time.time(), reuse, cache_path, len(ids_all)), flush=True)
         if not stream:
             try:
                 ids, gen, raw = infer(prompt, max_tokens, samp,
@@ -642,7 +822,8 @@ class H(http.server.BaseHTTPRequestHandler):
                 "model": MODEL_ID,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
                 "usage": {"prompt_tokens": len(ids), "completion_tokens": len(gen),
-                          "total_tokens": len(ids) + len(gen)},
+                          "total_tokens": len(ids) + len(gen),
+                          "prompt_tokens_details": {"cached_tokens": cached_tokens}},
             })
         # real streaming: the runner appends each generated token id to BASE.tok
         # (ctl bit2); infer() runs in a thread and this handler tails the file,
@@ -655,6 +836,7 @@ class H(http.server.BaseHTTPRequestHandler):
         tok_path = BASE + ".tok"
         err = {}
         done = {"gen": []}
+        stream_state = {"raw": "", "emitted": 0}
         def _run():
             try:
                 p_ids, p_gen, _ = infer(prompt, max_tokens, samp, stream=True,
@@ -677,8 +859,10 @@ class H(http.server.BaseHTTPRequestHandler):
                     text = decode([int(tok)])
                 except Exception:
                     text = ""
-                self._sse({**head, "choices": [{"index": 0, "delta": {"content": text},
-                                                "finish_reason": None}]})
+                text = stream_visible_delta(stream_state, text)
+                if text:
+                    self._sse({**head, "choices": [{"index": 0, "delta": {"content": text},
+                                                    "finish_reason": None}]})
             seen = len(lines)
             if err:
                 return self._json(500, {"error": str(err["e"])})
@@ -690,7 +874,17 @@ class H(http.server.BaseHTTPRequestHandler):
         content, tool_calls, finish = parse_completion(decode(gen), hit_eos)
         usage = {"prompt_tokens": len(done.get("ids", ids)),
                  "completion_tokens": len(gen), "total_tokens": len(done.get("ids", ids)) + len(gen)}
-        self._sse({**head, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+        for i, tc in enumerate(tool_calls):
+            fn = tc.get("function", {})
+            self._sse({**head, "choices": [{"index": 0, "delta": {
+                "tool_calls": [{"index": i, "id": tc.get("id", "call_%d" % i),
+                                 "type": "function", "function": {
+                                     "name": fn.get("name", ""),
+                                     "arguments": fn.get("arguments", "{}")}}]},
+                "finish_reason": None}]})
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+        self._sse({**head, "choices": [{"index": 0, "delta": {},
+                                          "finish_reason": "tool_calls" if tool_calls else finish}],
                    "usage": usage})
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -711,21 +905,10 @@ class H(http.server.BaseHTTPRequestHandler):
                 system = "".join(b.get("text", "") for b in system if b.get("type") == "text")
             messages.insert(0, {"role": "system", "content": system})
         prompt = build_chat_prompt(messages, tools)
-        # the shared system-prompt cache build (same as chat)
-        if SYSCACHE and not os.path.exists(SYSCACHE):
-            try:
-                sp_ids = encode(sys_prefix_text(messages, tools))
-                if sp_ids:
-                    infer(sys_prefix_text(messages, tools), 0,
-                          {"temperature": 0.0, "top_p": 1.0, "top_k": 0,
-                           "presence_penalty": 0.0, "repeat_penalty": 1.0, "seed": None},
-                          cache_path=SYSCACHE, cache_save=True)
-                    _sys["ids"] = sp_ids
-            except Exception:
-                pass
-        _, reuse, cache_path, save_path = _select_cache(prompt)
+        ids_all, reuse, cache_path, save_path, cached_tokens = _select_cache(
+            "claude-code", messages, tools, prompt)
         t0 = time.time()
-        mid = "msg_ds4f_%d" % int(time.time())
+        mid = "msg_ds4f_" + uuid.uuid4().hex
         if not stream:
             try:
                 ids, gen, raw = infer(prompt, max_tokens, samp,
@@ -741,7 +924,8 @@ class H(http.server.BaseHTTPRequestHandler):
             return self._json(200, {
                 "id": mid, "type": "message", "role": "assistant", "model": MODEL_ID,
                 "content": blocks, "stop_reason": stop,
-                "usage": {"input_tokens": len(ids), "output_tokens": len(gen)},
+                "usage": {"input_tokens": len(ids), "output_tokens": len(gen),
+                          "cache_read_input_tokens": cached_tokens},
             })
         # streaming: content_block deltas over the .tok stream
         self._sse_headers()
@@ -755,6 +939,7 @@ class H(http.server.BaseHTTPRequestHandler):
         tok_path = BASE + ".tok"
         err = {}
         done = {"gen": []}
+        stream_state = {"raw": "", "emitted": 0}
         def _run():
             try:
                 p_ids, p_gen, _ = infer(prompt, max_tokens, samp, stream=True,
@@ -777,6 +962,7 @@ class H(http.server.BaseHTTPRequestHandler):
                     text = decode([int(tok)])
                 except Exception:
                     text = ""
+                text = stream_visible_delta(stream_state, text)
                 if text:
                     self._sse({"type": "content_block_delta", "index": 0,
                                "delta": {"type": "text_delta", "text": text}})
@@ -797,12 +983,164 @@ class H(http.server.BaseHTTPRequestHandler):
                     continue
                 self._sse({"type": "content_block_start", "index": 1 + i,
                            "content_block": {"type": "tool_use", "id": blk["id"],
-                                             "name": blk["name"], "input": blk["input"]}})
+                                             "name": blk["name"], "input": {}}})
+                self._sse({"type": "content_block_delta", "index": 1 + i,
+                           "delta": {"type": "input_json_delta",
+                                      "partial_json": json.dumps(blk["input"], ensure_ascii=False)}})
                 self._sse({"type": "content_block_stop", "index": 1 + i})
         self._sse({"type": "message_delta",
                    "delta": {"stop_reason": stop},
                    "usage": {"output_tokens": len(gen)}})
         self._sse({"type": "message_stop"})
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    # ---- OpenAI Responses API (codex's wire protocol) ----
+    def responses_api(self):
+        body = self._read_body()
+        if body is None:
+            return self._json(400, {"error": "bad json"})
+        stream = bool(body.get("stream", False))
+        max_tokens = int(body.get("max_output_tokens") or body.get("max_tokens") or 512)
+        samp = parse_sampling(body)
+        tools = responses_tools_to_openai(body.get("tools", []))
+        try:
+            messages = _response_context_messages(body)
+        except KeyError as e:
+            return self._json(409, {"error": "unknown previous_response_id: %s" % e.args[0]})
+        prompt = build_chat_prompt(messages, tools)
+        ids_all, reuse, cache_path, save_path, cached_tokens = _select_cache(
+            "codex", messages, tools, prompt)
+        t0 = time.time()
+        rid = "resp_ds4f_" + uuid.uuid4().hex
+        use = {"input_tokens": 0, "output_tokens": 0}
+        if not stream:
+            try:
+                ids, gen, raw = infer(prompt, max_tokens, samp,
+                                      cache_path=cache_path, cache_load=reuse,
+                                      cache_save=True, save_path=save_path)
+            except TimeoutError:
+                return self._json(504, {"error": "runner timeout"})
+            except Exception as e:
+                return self._json(500, {"error": str(e)})
+            hit_eos = bool(gen and gen[-1] == 1)
+            content, tool_calls, finish = parse_completion(raw, hit_eos)
+            output = []
+            if content:
+                output.append({"type": "message", "role": "assistant", "status": "completed",
+                               "content": [{"type": "output_text", "text": content, "annotations": []}]})
+            for tc in (tool_calls or []):
+                fn = tc.get("function", {})
+                output.append({"type": "function_call", "id": tc.get("id", "fc_0"),
+                               "call_id": tc.get("id", "fc_0"), "name": fn.get("name", ""),
+                               "arguments": fn.get("arguments", "{}"), "status": "completed"})
+            assistant = {"role": "assistant", "content": content or None}
+            if tool_calls:
+                assistant["tool_calls"] = tool_calls
+            _remember_response(rid, messages + [assistant])
+            return self._json(200, {
+                "id": rid, "object": "response", "created_at": int(t0), "model": MODEL_ID,
+                "status": "completed", "output": output,
+                "usage": {"input_tokens": len(ids), "output_tokens": len(gen),
+                          "total_tokens": len(ids) + len(gen),
+                          "input_tokens_details": {"cached_tokens": cached_tokens}}})
+        # streaming: codex requires the SSE event stream through response.completed
+        self._sse_headers()
+        mid = rid + "_msg"
+        out_msg = {"id": mid, "type": "message", "role": "assistant", "status": "in_progress",
+                   "content": []}
+        self._sse({"type": "response.created", "response": {
+            "id": rid, "object": "response", "created_at": int(t0), "model": MODEL_ID,
+            "status": "in_progress", "output": [], "usage": use}})
+        self._sse({"type": "response.in_progress", "response": {
+            "id": rid, "object": "response", "status": "in_progress", "output": [],
+            "usage": use}})
+        self._sse({"type": "response.output_item.added", "output_index": 0,
+                   "item": out_msg})
+        self._sse({"type": "response.content_part.added", "item_id": mid,
+                   "output_index": 0, "content_index": 0,
+                   "part": {"type": "output_text", "text": "", "annotations": []}})
+        tok_path = BASE + ".tok"
+        err = {}
+        done = {"gen": []}
+        stream_state = {"raw": "", "emitted": 0}
+        def _run():
+            try:
+                p_ids, p_gen, _ = infer(prompt, max_tokens, samp, stream=True,
+                                        cache_path=cache_path, cache_load=reuse,
+                                        cache_save=True, save_path=save_path)
+                done["ids"] = p_ids
+                done["gen"] = p_gen
+            except Exception as e:
+                err["e"] = e
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        seen = 0
+        while True:
+            try:
+                lines = open(tok_path).read().splitlines()
+            except OSError:
+                lines = []
+            for tok in lines[seen:]:
+                try:
+                    text = decode([int(tok)])
+                except Exception:
+                    text = ""
+                text = stream_visible_delta(stream_state, text)
+                if text:
+                    self._sse({"type": "response.output_text.delta", "item_id": mid,
+                               "output_index": 0, "content_index": 0, "delta": text})
+            seen = len(lines)
+            if err:
+                return self._json(500, {"error": str(err["e"])})
+            if not t.is_alive() and seen >= len(lines):
+                break
+            time.sleep(0.02)
+        gen = done["gen"]
+        hit_eos = bool(gen and gen[-1] == 1)
+        content, tool_calls, finish = parse_completion(decode(gen), hit_eos)
+        self._sse({"type": "response.output_text.done", "item_id": mid,
+                   "output_index": 0, "content_index": 0, "text": content})
+        self._sse({"type": "response.content_part.done", "item_id": mid,
+                   "output_index": 0, "content_index": 0,
+                   "part": {"type": "output_text", "text": content, "annotations": []}})
+        self._sse({"type": "response.output_item.done", "output_index": 0, "item": {
+            "id": mid, "type": "message", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": content, "annotations": []}]}})
+        output = []
+        if content:
+            output.append({"type": "message", "role": "assistant", "status": "completed",
+                           "content": [{"type": "output_text", "text": content, "annotations": []}]})
+        if tool_calls:
+            for i, tc in enumerate(tool_calls):
+                fn = tc.get("function", {})
+                fid = tc.get("id", "fc_%d" % i)
+                self._sse({"type": "response.output_item.added", "output_index": 1 + i,
+                           "item": {"id": fid, "type": "function_call", "call_id": fid,
+                                    "name": fn.get("name", ""), "arguments": "",
+                                    "status": "in_progress"}})
+                self._sse({"type": "response.function_call_arguments.delta",
+                           "item_id": fid, "output_index": 1 + i, "delta": fn.get("arguments", "")})
+                self._sse({"type": "response.function_call_arguments.done",
+                           "item_id": fid, "output_index": 1 + i,
+                           "arguments": fn.get("arguments", "")})
+                self._sse({"type": "response.output_item.done", "output_index": 1 + i,
+                           "item": {"id": fid, "type": "function_call", "call_id": fid,
+                                    "name": fn.get("name", ""),
+                                    "arguments": fn.get("arguments", ""), "status": "completed"}})
+                output.append({"type": "function_call", "id": fid, "call_id": fid,
+                               "name": fn.get("name", ""),
+                               "arguments": fn.get("arguments", ""), "status": "completed"})
+        use = {"input_tokens": len(done.get("ids", [])), "output_tokens": len(gen),
+               "total_tokens": len(done.get("ids", [])) + len(gen),
+               "input_tokens_details": {"cached_tokens": cached_tokens}}
+        assistant = {"role": "assistant", "content": content or None}
+        if tool_calls:
+            assistant["tool_calls"] = tool_calls
+        _remember_response(rid, messages + [assistant])
+        self._sse({"type": "response.completed", "response": {
+            "id": rid, "object": "response", "created_at": int(t0), "model": MODEL_ID,
+            "status": "completed", "output": output, "usage": use}})
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 

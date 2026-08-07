@@ -185,6 +185,20 @@ class Adapter:
     def cache_flags(self, action, path):
         return []
 
+    # Semantic API hooks.  A runner that advertises OpenAI/Anthropic serving
+    # owns these translations; the supervisor must not import a model module.
+    def native_request(self, body, chat=True):
+        raise ConfigError("model %s has no semantic request translator" % self.name)
+
+    def completion_response(self, body, text, native, chat=True, request_id=None):
+        raise ConfigError("model %s has no semantic response translator" % self.name)
+
+    def responses_request(self, body):
+        raise ConfigError("model %s has no Responses API translator" % self.name)
+
+    def responses_response(self, body, chat_response, request_id=None):
+        raise ConfigError("model %s has no Responses API renderer" % self.name)
+
 
 class LagunaAdapter(Adapter):
     """Laguna S-2.1, via a64fx/laguna-s21/run_laguna_s21_12n.sh.
@@ -209,12 +223,33 @@ class LagunaAdapter(Adapter):
         "fp8": "laguna_s21_fp8_ep_runner",
     }
     _FP16_KV_RUNNER_BIN = "laguna_s21_fp8_kvfp16_ep_runner"
-    _DEFAULT_MODEL_DIR = {
-        "int4": "~/models/laguna-s21-int4",
-        "bf16": "~/models/laguna-s21",
-        "fp8": "~/models/laguna-s21-fp8",
-    }
-    _DEFAULT_NSHARDS = {"int4": 15, "bf16": 46, "fp8": 24}
+
+    def tokenizer_path(self, cfg):
+        path = cfg.get("tokenizer")
+        if path is None:
+            path = (os.environ.get("LLMGR_TOKENIZER") or
+                    os.environ.get("LAGUNA_TOKENIZER"))
+        if path is None:
+            path = os.path.join(self.model_dir(cfg), "tokenizer.json")
+        return os.path.expanduser(os.fspath(path))
+
+    def native_request(self, body, chat=True):
+        from laguna_openai import native_request
+        request = dict(body)
+        request["tokenizer"] = self.tokenizer_path(body)
+        return native_request(request, chat=chat)
+
+    def completion_response(self, body, text, native, chat=True, request_id=None):
+        from laguna_openai import completion_response
+        return completion_response(body, text, native, chat=chat, request_id=request_id)
+
+    def responses_request(self, body):
+        from laguna_openai import responses_request
+        return responses_request(body)
+
+    def responses_response(self, body, chat_response, request_id=None):
+        from laguna_openai import responses_response
+        return responses_response(body, chat_response, request_id=request_id)
 
     def _variant_flag(self, variant):
         return [] if variant == "int4" else ["--%s" % variant]
@@ -245,12 +280,16 @@ class LagunaAdapter(Adapter):
         np_ = _int(cfg, "np", self.default_np())
         user = os.environ.get("USER", "unknown")
         suffix = {"int4": "", "bf16": "-bf16", "fp8": "-fp8"}[variant]
-        return "/local/%s/laguna-s21%s-ep%d" % (user, suffix, np_)
+        root = os.environ.get("LLMGR_STAGE_ROOT", "/local")
+        return os.path.join(root, user, "laguna-s21%s-ep%d" % (suffix, np_))
 
     def model_dir(self, cfg):
         if cfg.get("model_dir"):
             return str(cfg["model_dir"])
-        return os.path.expanduser(self._DEFAULT_MODEL_DIR[self.variant(cfg)])
+        root = os.environ.get("LLMGR_MODEL_ROOT", "~/models")
+        names = {"int4": "laguna-s21-int4", "bf16": "laguna-s21",
+                 "fp8": "laguna-s21-fp8"}
+        return os.path.expanduser(os.path.join(root, names[self.variant(cfg)]))
 
     def build(self, cfg):
         variant = self.variant(cfg)
@@ -428,12 +467,15 @@ class Gemma4Adapter(Adapter):
         return self.variant(cfg)
 
     def stage_dir(self, cfg):
-        default = "/local/gemma4_tp" if self._variant(cfg) == "tp" else "/local/gemma4_pp"
+        root = os.environ.get("LLMGR_STAGE_ROOT", "/local")
+        default = os.path.join(root, "gemma4_%s" % self._variant(cfg))
         return str(cfg.get("stage_dir") or default)
 
     def model_dir(self, cfg):
-        return str(cfg.get("gguf") or os.path.expanduser(
-            "~/models/gemma4/12b/gemma-4-12b-it-BF16.gguf"))
+        root = os.environ.get("LLMGR_MODEL_ROOT", "~/models")
+        default = os.path.join(root, "gemma4", "12b",
+                               "gemma-4-12b-it-BF16.gguf")
+        return str(cfg.get("gguf") or os.path.expanduser(default))
 
     def _env(self, cfg, *, skip_stage):
         """Gemma4 launchers are env-driven, not flag-driven."""
@@ -528,6 +570,25 @@ class K3Adapter(Adapter):
     supports_cache = True
     LAUNCHER = os.path.join(K3_DIR, "run_k3_ep.sh")
 
+    # K3 is intentionally not advertised as a serving model.  These hooks
+    # keep the protocol test seam usable if an experimental deployment opts
+    # into serving while its native tokenizer is still supplied externally.
+    def native_request(self, body, chat=True):
+        from laguna_openai import native_request
+        return native_request(body, chat=chat)
+
+    def completion_response(self, body, text, native, chat=True, request_id=None):
+        from laguna_openai import completion_response
+        return completion_response(body, text, native, chat=chat, request_id=request_id)
+
+    def responses_request(self, body):
+        from laguna_openai import responses_request
+        return responses_request(body)
+
+    def responses_response(self, body, chat_response, request_id=None):
+        from laguna_openai import responses_response
+        return responses_response(body, chat_response, request_id=request_id)
+
     def _np(self, cfg):
         np_ = _int(cfg, "np", self.default_np())
         if np_ < 1 or np_ > 512:
@@ -547,10 +608,13 @@ class K3Adapter(Adapter):
             return str(cfg["stage_dir"])
         user = os.environ.get("USER", "unknown")
         job = os.environ.get("PJM_JOBID", "interactive")
-        return "/local/%s/k3-llmgr-%s" % (user, job)
+        root = os.environ.get("LLMGR_STAGE_ROOT", "/local")
+        return os.path.join(root, user, "k3-llmgr-%s" % job)
 
     def model_dir(self, cfg):
-        return str(cfg.get("model_dir") or os.path.expanduser("~/models/kimi-k3"))
+        root = os.environ.get("LLMGR_MODEL_ROOT", "~/models")
+        return str(cfg.get("model_dir") or os.path.expanduser(
+            os.path.join(root, "kimi-k3")))
 
     def _result_dir(self, cfg, operation):
         if cfg.get("result_dir"):
@@ -664,6 +728,21 @@ class K3Adapter(Adapter):
 ADAPTERS = {a.name: a() for a in (LagunaAdapter, Gemma4Adapter, K3Adapter)}
 
 
+def default_model():
+    """Return the configured default adapter name.
+
+    The first serving-capable adapter is the fallback, so adding a serving
+    adapter does not require editing the supervisor's dispatch code.
+    """
+    configured = os.environ.get("LLMGR_DEFAULT_MODEL")
+    if configured:
+        return configured
+    for adapter in ADAPTERS.values():
+        if adapter.supports_serve:
+            return adapter.name
+    return next(iter(ADAPTERS), None)
+
+
 def get(model):
     a = ADAPTERS.get(model)
     if a is None:
@@ -686,8 +765,12 @@ def describe():
 
 
 def get_by_openai_model(model):
-    if model in (None, "", "laguna"):
-        model = "laguna-s21"
+    if model in (None, ""):
+        model = default_model()
+    if model in ADAPTERS:
+        adapter = ADAPTERS[model]
+        if adapter.supports_serve:
+            return adapter
     for a in ADAPTERS.values():
         if model in a.openai_models:
             return a

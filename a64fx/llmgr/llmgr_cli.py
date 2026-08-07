@@ -133,14 +133,14 @@ def main(argv=None):
     s.add_argument("--command-timeout", type=float, default=1800.0)
 
     b = sub.add_parser("build")
-    b.add_argument("--model", default="laguna")
+    b.add_argument("--model")
     b.add_argument("--variant")
     b.add_argument("--kv-fp16", action="store_true",
                    help="experimental Laguna FP16 KV (FP8 variant only)")
     b.add_argument("--clean", action="store_true")
 
     st = sub.add_parser("stage")
-    st.add_argument("--model", default="laguna")
+    st.add_argument("--model")
     st.add_argument("--variant")
     st.add_argument("--stage-dir")
     st.add_argument("--model-dir")
@@ -150,7 +150,7 @@ def main(argv=None):
     st.add_argument("--experts")
 
     ss = sub.add_parser("stage-status")
-    ss.add_argument("--model", default="laguna")
+    ss.add_argument("--model")
     ss.add_argument("--variant")
     ss.add_argument("--stage-dir")
     ss.add_argument("--model-dir")
@@ -159,7 +159,7 @@ def main(argv=None):
     ss.add_argument("--no-fanout", action="store_true")
 
     r = sub.add_parser("start", help="start a runner")
-    r.add_argument("--model", default="laguna")
+    r.add_argument("--model")
     r.add_argument("--variant")
     r.add_argument("--kv-fp16", action="store_true",
                    help="experimental Laguna FP16 KV (FP8 variant only)")
@@ -223,7 +223,7 @@ def main(argv=None):
     ch = sub.add_parser("chat", help="OpenAI-compatible Laguna chat")
     ch.add_argument("prompt")
     ch.add_argument("--system")
-    ch.add_argument("--model", default="laguna-s21")
+    ch.add_argument("--model")
     ch.add_argument("--max-new", type=int, default=256)
     ch.add_argument("--temperature", type=float, default=0.0)
     ch.add_argument("--top-k", type=int)
@@ -240,7 +240,7 @@ def main(argv=None):
     ca.add_argument("id")
 
     pr = sub.add_parser("profile")
-    pr.add_argument("--model", default="laguna")
+    pr.add_argument("--model")
     pr.add_argument("--variant")
     pr.add_argument("--kv-fp16", action="store_true",
                     help="experimental Laguna FP16 KV (FP8 variant only)")
@@ -258,7 +258,7 @@ def main(argv=None):
     ar.add_argument("id")
 
     kv = sub.add_parser("kv")
-    kv.add_argument("--model", default="laguna")
+    kv.add_argument("--model")
     kv.add_argument("action", choices=("save", "load", "clear", "stats"))
     kv.add_argument("--id")
     kv.add_argument("--path")

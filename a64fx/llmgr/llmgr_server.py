@@ -105,25 +105,37 @@ def _ready_serve(model):
 
 def _resolve_adapter(model=None):
     if model is None:
-        model = "laguna"
+        model = models.default_model()
     try:
         return models.get_by_openai_model(model)
     except models.ConfigError:
         return models.get(model)
 
 
+def _default_openai_model():
+    adapter = _resolve_adapter()
+    return adapter.openai_models[0] if adapter.openai_models else adapter.name
+
+
+def _ready_default():
+    return _ready_serve(models.default_model())
+
+
+# Compatibility for older callers; new dispatch uses the resolved adapter.
 def _ready_laguna():
-    return _ready_serve("laguna")
+    return _ready_default()
 
 
 class InferenceJob:
-    def __init__(self, jid, body, native, tokenizer, chat, context_id=None):
+    def __init__(self, jid, body, native, tokenizer, chat, context_id=None,
+                 model=None):
         self.id = jid
         self.body = body
         self.native = native
         self.tokenizer = tokenizer
         self.chat = chat
         self.context_id = context_id
+        self.model = model
         self.events = queue.Queue()
         self.done = threading.Event()
         self.cancelled = threading.Event()
@@ -156,7 +168,7 @@ class InferenceQueue:
             self.seq += 1
             jid = "infer-%d" % self.seq
             job = InferenceJob(jid, body, native, tokenizer, chat,
-                               context.context_id)
+                               context.context_id, model=model)
             self.jobs[jid] = job
         try:
             self.pending.put_nowait(job)
@@ -185,9 +197,12 @@ class InferenceQueue:
         with self.lock:
             jobs = [j.info() for j in self.jobs.values()
                     if not j.done.is_set()]
+        runners = []
+        with _children_lock:
+            runners = [c for c in _children.values()
+                       if c.kind == "serve" and c.state == "ready"]
         return {"capacity": self.capacity, "depth": self.pending.qsize(),
-                "jobs": jobs,
-                "runner": _ready_laguna().id if _ready_laguna() else None}
+                "jobs": jobs, "runner": runners[0].id if len(runners) == 1 else None}
 
     def _work(self):
         while not _stop_evt.is_set():
@@ -210,9 +225,13 @@ class InferenceQueue:
                 job.done.set(); job.events.put(None); self.pending.task_done()
 
     def _run(self, job):
-        runner = _ready_laguna()
+        adapter = _resolve_adapter(job.model or models.default_model())
+        runner = _ready_serve(adapter.name)
+        if runner is None and adapter.name == models.default_model():
+            runner = _ready_laguna()
         if runner is None:
-            raise RuntimeError("exactly one ready Laguna runner is required")
+            raise RuntimeError("exactly one ready runner for model %s is required" %
+                               adapter.name)
         job.state = "running"; job.started = time.time()
         native = dict(job.native)
         native["stream"] = True
@@ -242,9 +261,9 @@ class InferenceQueue:
         meta.setdefault("n", len(ids))
         if job.tokenizer:
             meta["prompt_ids"] = prompt_ids
-            job.result = laguna_openai.completion_response(
-                job.body, job.tokenizer.decode(ids, raw=job.chat), meta, chat=job.chat,
-                request_id=job.id)
+            job.result = adapter.completion_response(
+                job.body, job.tokenizer.decode(ids, raw=job.chat), meta,
+                chat=job.chat, request_id=job.id)
         else:
             meta.pop("event", None)
             job.result = meta
@@ -1020,7 +1039,7 @@ class Handler(bhs.Handler):
         self._write_chunk(b"")
 
     def _get_stage_status(self, q):
-        model = q.get("model", ["laguna"])[0]
+        model = q.get("model", [models.default_model()])[0]
         adapter = _resolve_adapter(model)
         cfg = {k: v[0] for k, v in q.items()}
         stage_dir = adapter.stage_dir(cfg)
@@ -1207,9 +1226,12 @@ class Handler(bhs.Handler):
         """Queue the native ids-in/ids-out request against the default runner."""
         req = dict(body)
         requested = req.pop("id", None)
-        runner = _ready_laguna()
+        model = req.get("model", models.default_model())
+        adapter = _resolve_adapter(model)
+        runner = _ready_serve(adapter.name)
         if runner is None:
-            return self._err("exactly one ready Laguna runner is required", status=503)
+            return self._err("exactly one ready runner for model %s is required" %
+                             adapter.name, status=503)
         if requested and requested != runner.id:
             return self._err("%s is not the active default runner" % requested,
                              status=409)
@@ -1219,7 +1241,7 @@ class Handler(bhs.Handler):
         try:
             job = _inference.submit(body, native=req, tokenizer=None, chat=False,
                                     context_id=body.get("context_id"),
-                                    model="native")
+                                    model=adapter.name)
         except OverflowError as e:
             return self._err(str(e), status=429)
         if body.get("stream"):
@@ -1257,7 +1279,11 @@ class Handler(bhs.Handler):
     def _post_openai_responses(self, body):
         if "contexts" in body:
             return self._post_openai_batch(body)
-        translated = laguna_openai.responses_request(body)
+        try:
+            adapter = _resolve_adapter(body.get("model"))
+            translated = adapter.responses_request(body)
+        except (models.ConfigError, ValueError) as e:
+            return self._err(str(e), status=400)
         return self._post_openai(translated, chat=True, response_api=True,
                                  response_body=body)
 
@@ -1287,7 +1313,7 @@ class Handler(bhs.Handler):
     def _post_anthropic(self, body):
         if not isinstance(body, dict):
             return self._err("request body must be an object")
-        model_name = body.get("llmgr_model", "laguna-s21")
+        model_name = body.get("llmgr_model", _default_openai_model())
         try:
             adapter = models.get_by_openai_model(model_name)
         except models.ConfigError as e:
@@ -1305,7 +1331,7 @@ class Handler(bhs.Handler):
             self._accept_anthropic_tool_continuation(context, body)
             request["context_id"] = context.context_id
             request = _apply_prompt_cache(request, adapter)
-            native, tokenizer = laguna_openai.native_request(request, chat=True)
+            native, tokenizer = adapter.native_request(request, chat=True)
             job = _inference.submit(request, native=native, tokenizer=tokenizer,
                                     chat=True, context_id=context.context_id,
                                     model=adapter.name)
@@ -1327,7 +1353,8 @@ class Handler(bhs.Handler):
     def _post_anthropic_count_tokens(self, body):
         try:
             request = anthropic_api.request(body)
-            native, _tokenizer = laguna_openai.native_request(request, chat=True)
+            adapter = _resolve_adapter(body.get("llmgr_model"))
+            native, _tokenizer = adapter.native_request(request, chat=True)
         except (ValueError, OSError) as e:
             return self._err(str(e))
         self._send_json({"input_tokens": len(native.get("ids", []))})
@@ -1403,13 +1430,13 @@ class Handler(bhs.Handler):
         request = dict(body)
         request.pop("contexts", None)
         request.update(item)
-        model = request.get("model", body.get("model", "laguna-s21"))
+        model = request.get("model", body.get("model", _default_openai_model()))
         adapter = models.get_by_openai_model(model)
         if not adapter.supports_serve:
             raise ValueError("%s does not support OpenAI-style serve operations" % adapter.name)
         if _ready_serve(adapter.name) is None:
             raise RuntimeError("ready runner for model %s not found" % adapter.name)
-        translated = laguna_openai.responses_request(request)
+        translated = adapter.responses_request(request)
         context_id = request.get("context_id") or request.get("conversation_id")
         if not context_id and request.get("previous_response_id"):
             prior = _contexts.find_response(request["previous_response_id"])
@@ -1425,7 +1452,7 @@ class Handler(bhs.Handler):
         if not translated.get("cache_save") and checkpoint.get("state") == "requested":
             translated["cache_save"] = checkpoint["staging_path"]
         translated = _apply_prompt_cache(translated, adapter)
-        native, tokenizer = laguna_openai.native_request(translated, chat=True)
+        native, tokenizer = adapter.native_request(translated, chat=True)
         job = _inference.submit(translated, native=native, tokenizer=tokenizer,
                                 chat=True, context_id=context.context_id,
                                 model=adapter.name)
@@ -1453,8 +1480,8 @@ class Handler(bhs.Handler):
                         self._finalize_context_checkpoint(context)
                     elif context.checkpoint.get("state") == "restore_requested":
                         context.checkpoint["state"] = "restored"
-                response = laguna_openai.responses_response(
-                    request, job.result, request_id=job.id)
+                response = adapter.responses_response(request, job.result,
+                                                       request_id=job.id)
                 results.append(agentic.batch_result(context.context_id,
                                                     response=response))
             except (ValueError, OSError, RuntimeError, OverflowError,
@@ -1486,7 +1513,7 @@ class Handler(bhs.Handler):
                     self._sse({"type": "response.created",
                                "context_id": context.context_id,
                                "response": {"id": job.id, "object": "response",
-                                             "model": request.get("model", "laguna-s21"),
+                                             "model": request.get("model", _default_openai_model()),
                                              "status": "in_progress"}})
                 except (ValueError, OSError, RuntimeError, OverflowError,
                         agentic.ContextError) as e:
@@ -1519,9 +1546,11 @@ class Handler(bhs.Handler):
                                         context.checkpoint["state"] = "restored"
                                 self._sse({"type": "response.completed",
                                            "context_id": context.context_id,
-                                           "response": laguna_openai.responses_response(
-                                               state["request"], job.result,
-                                               request_id=job.id)})
+                                           "response": _resolve_adapter(
+                                               getattr(state["job"], "model", None) or
+                                               state["request"].get("model")).responses_response(
+                                                   state["request"], job.result,
+                                                   request_id=job.id)})
                             jobs.pop(jid, None)
                             break
                         if event.get("event") != "token" or not event.get("text"):
@@ -1558,7 +1587,7 @@ class Handler(bhs.Handler):
                 _inference.cancel(state["job"].id)
 
     def _post_openai(self, body, chat, response_api=False, response_body=None):
-        model = body.get("model", "laguna-s21")
+        model = body.get("model", _default_openai_model())
         try:
             adapter = models.get_by_openai_model(model)
         except models.ConfigError as e:
@@ -1587,7 +1616,7 @@ class Handler(bhs.Handler):
             if not body.get("cache_save") and checkpoint.get("state") == "requested":
                 body["cache_save"] = checkpoint["staging_path"]
             body = _apply_prompt_cache(body, adapter)
-            native, tokenizer = laguna_openai.native_request(body, chat=chat)
+            native, tokenizer = adapter.native_request(body, chat=chat)
             job = _inference.submit(body, native=native, tokenizer=tokenizer,
                                     chat=chat, context_id=context_id,
                                     model=adapter.name)
@@ -1612,8 +1641,8 @@ class Handler(bhs.Handler):
                     self._finalize_context_checkpoint(context)
                 elif body.get("cache_load") and context.checkpoint.get("state") == "restore_requested":
                     context.checkpoint["state"] = "restored"
-        result = (laguna_openai.responses_response(response_body, job.result,
-                                                   request_id=job.id)
+        result = (adapter.responses_response(response_body, job.result,
+                                             request_id=job.id)
                   if response_api else job.result)
         self._send_json(result)
 
@@ -1630,7 +1659,7 @@ class Handler(bhs.Handler):
             if chat:
                 self._sse({"id": job.id, "object": "chat.completion.chunk",
                            "created": int(time.time()),
-                           "model": body.get("model", "laguna-s21"),
+                           "model": body.get("model", _default_openai_model()),
                            "choices": [{"index": 0, "delta": {"role": "assistant"},
                                         "finish_reason": None}]})
             while True:
@@ -1668,7 +1697,7 @@ class Handler(bhs.Handler):
                 choice["delta" if chat else "text"] = delta if chat else delta_text
                 self._sse({"id": job.id, "object": kind,
                            "created": int(time.time()),
-                           "model": body.get("model", "laguna-s21"),
+                           "model": body.get("model", _default_openai_model()),
                            "choices": [choice]})
             if job.error:
                 self._sse({"error": {"message": job.error, "type": "runner_error"}})
@@ -1682,7 +1711,7 @@ class Handler(bhs.Handler):
                 self._sse({"id": job.id,
                            "object": "chat.completion.chunk" if chat else "text_completion",
                            "created": int(time.time()),
-                           "model": body.get("model", "laguna-s21"),
+                           "model": body.get("model", _default_openai_model()),
                            "choices": [choice]})
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -1697,7 +1726,7 @@ class Handler(bhs.Handler):
         try:
             self._sse({"type": "response.created", "response": {
                 "id": job.id, "object": "response", "model": body.get(
-                    "model", "laguna-s21"), "status": "in_progress"}})
+                    "model", _default_openai_model()), "status": "in_progress"}})
             reasoning = body.get("enable_thinking", True) and \
                 body.get("reasoning_effort") != "none"
             for event in iter(job.events.get, None):
@@ -1736,8 +1765,10 @@ class Handler(bhs.Handler):
                             self._finalize_context_checkpoint(context)
                         elif context.checkpoint.get("state") == "restore_requested":
                             context.checkpoint["state"] = "restored"
+                adapter = _resolve_adapter(getattr(job, "model", None) or
+                                           body.get("model"))
                 self._sse({"type": "response.completed",
-                           "response": laguna_openai.responses_response(
+                           "response": adapter.responses_response(
                                body, job.result, request_id=job.id)})
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -1888,7 +1919,7 @@ class Handler(bhs.Handler):
         if model is None and c is not None:
             model = c.meta.get("model")
         if model is None:
-            model = "laguna"
+            model = models.default_model()
         adapter = _resolve_adapter(model)
         if cid and c is None:
             return self._err("no such child: %s" % cid, status=404)

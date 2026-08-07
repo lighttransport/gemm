@@ -31,6 +31,17 @@ survive between calls).
 
 Python 3 standard library only — Fugaku's system `python3` is 3.6.
 
+## Model configuration
+
+The supervisor resolves the default model from `LLMGR_DEFAULT_MODEL` (otherwise
+the first serving-capable adapter), and never assumes a home directory for
+weights. Set `LLMGR_MODEL_ROOT`, `LLMGR_STAGE_ROOT`, and `LLMGR_TOKENIZER`, or
+pass `model_dir`, `stage_dir`, and `tokenizer` in the request. The legacy
+`LAGUNA_TOKENIZER` variable is accepted as an alias. An adapter owns semantic
+request translation, tokenizer loading, runner selection, and response
+formatting; adding a serving model does not require a new branch in the HTTP
+supervisor.
+
 ## Quick start (inside an existing interactive allocation)
 
 ```sh

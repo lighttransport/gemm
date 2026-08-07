@@ -35,7 +35,8 @@ python3 a64fx/llm/ds4f_serve_runner.py --daemon
 
 # terminal 2: the OpenAI frontend
 TOK=/mnt/disk1/models/ds4f-0731/tokenizer.json \
-DS4F_SERVE_BASE=/tmp/ds4f_serve PORT=8080 \
+DS4F_SERVE_BASE=/tmp/ds4f_serve \
+DS4F_SERVE_AGENT_CACHE_DIR=/tmp/ds4f_serve.agent-cache PORT=8080 \
 python3 a64fx/llm/ds4f_serve.py
 ```
 
@@ -51,14 +52,14 @@ Smoke test: `sh a64fx/llm/test_ds4f_serve.sh /tmp/ds4f_single 8080`.
   conversation falls back to a fresh full prefill (the session is reset to
   position 0, so multi-turn conversations stay correct).  Measured: turn 2 of
   a conversation lands in ~8 s vs a full re-prefill.
-- **System-prompt cache** (`DS4F_SERVE_SYSCACHE`): the frontend builds the
-  KV of the fixed prompt prefix every conversation shares (BOS + system message
-  + tool definitions) once with a zero-token `cache_save` request, and later
-  requests that begin with that exact prefix ask the runner to restore it and
-  prefill only the conversation tail (the load and save paths are separate
-  ctl-bit lines, so the shared cache is never overwritten).  With a long agent
-  system prompt the first-turn TTFT drops from a full re-prefill to a ~5 s KV
-  restore.  The runner can also preload the same file into slot 0 at startup.
+- **Per-agent system-prompt cache** (`DS4F_SERVE_AGENT_CACHE_DIR`): the frontend
+  writes durable, content-addressed KV prefixes under separate `opencode`,
+  `codex`, and `claude-code` directories. Each sidecar records the exact token
+  IDs, model, tokenizer, and cache schema; a frontend restart therefore reuses
+  only an exact compatible prefix. The first request writes the cache with a
+  zero-token prefill, while later requests restore it and prefill only the
+  conversation tail. `DS4F_SERVE_SYSCACHE` remains available for the runner's
+  legacy single-file checkpoint/preload path.
 - **Slots** (`DS4F_SERVE_SLOTS`): per-conversation KV snapshots switched by
   the `slot` field (`<BASE>.slot.<i>` files).
 - **Truncation**: the runner caps the prompt at `max_pos - max_new`, keeping
@@ -68,13 +69,10 @@ Smoke test: `sh a64fx/llm/test_ds4f_serve.sh /tmp/ds4f_single 8080`.
 
 ## Tool calling
 
-`ds4f_serve.py` injects the OpenAI `tools` into the prompt
-(`<tool_call>{...}</tool_call>`) and parses them back into OpenAI `tool_calls`,
-so agents can loop tool calls over the same conversation.  `stream: true`
-requests are emitted as **real SSE deltas**: the runner appends each generated
-token id to `<BASE>.tok` (ctl bit2) and the frontend tails that file, decoding
-each token and sending a `chat.completion.chunk` event as it lands (finish +
-usage + `[DONE]` at the end).
+`ds4f_serve.py` injects tools into the plain-text model prompt and translates
+the model's `<tool_call>{...}</tool_call>` result into each client's native
+tool-call shape. Streaming holds a possible tool marker until it is complete,
+so clients never receive the internal marker as visible assistant text.
 
 ## Coding-agent configs
 
@@ -103,12 +101,11 @@ model_provider = "ds4f"
 [model_providers.ds4f]
 name = "DS4F local"
 base_url = "http://localhost:8080/v1"
-wire_api = "chat"
+wire_api = "responses"
 ```
 
-**claude-code**: the Anthropic wire protocol is not served directly; use an
-OpenAI-to-Anthropic bridge (e.g. claude-code-router) with the same
-`http://localhost:8080/v1` base URL.
+**claude-code**: point `ANTHROPIC_BASE_URL` at `http://localhost:8080` and use
+the `/v1/messages` endpoint directly; no OpenAI-to-Anthropic bridge is needed.
 
 ## Performance notes
 

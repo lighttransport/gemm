@@ -12,8 +12,8 @@ Request body (frontend, ds4f_serve.py infer()):
   hdr = "max_new temp top_p top_k presence_penalty repeat_penalty seed slot ctl"
   [cache_path, if ctl != 0]
   prompt ids (space-separated)
-  ctl bit0 = load KV prefix from cache_path before prefill
-  ctl bit1 = save KV prefix to cache_path after generation
+  ctl bit0 = load KV prefix from the next request line before prefill
+  ctl bit1 = save KV prefix to the following request line after generation
 
 The model runs through libds4f_serve.so (ctypes); the runner owns the chat
 loop, sampling penalties, prefix caching, and context/slot management.
@@ -124,9 +124,10 @@ def run_serve(sess, base, prefix_cache, slots):
     slot_path = [base + ".slot.%d" % i for i in range(slots)]
     syscache = os.environ.get("DS4F_SERVE_SYSCACHE")
     if syscache and os.path.exists(syscache):
-        sess.kv_restore(syscache)
-        print("[runner] system-prompt cache loaded from %s (pos=%d)" %
-              (syscache, sess.pos()), file=sys.stderr, flush=True)
+        restored = sess.kv_restore(syscache)
+        print("[runner] system-prompt cache %s from %s (pos=%d)" %
+              ("loaded" if restored == 0 else "restore failed", syscache, sess.pos()),
+              file=sys.stderr, flush=True)
     done = 0
     print("[runner] serving on %s.* slots=%d prefix_cache=%d" % (base, slots, prefix_cache),
           file=sys.stderr, flush=True)
@@ -205,9 +206,12 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
         # The cache only applies when its length is a prefix of the prompt; a
         # longer cache (e.g. the previous turn rendered the tool call in fewer
         # tokens than the model generated) must fall back to a fresh prefill.
-        sess.kv_restore(cache_path)
+        restored = sess.kv_restore(cache_path)
         cached = sess.pos()
-        if cached > len(prompt):
+        if restored != 0 or cached > len(prompt):
+            if restored != 0:
+                print("[runner] KV restore failed; falling back to full prefill: %s" % cache_path,
+                      file=sys.stderr, flush=True)
             sess.reset()
             if prompt:
                 sess.prefill(prompt, 0)
@@ -260,9 +264,10 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
     spath = save_path or cache_path
     if ctl & 2 and spath:
         _ts = time.time()
-        sess.kv_save(spath)
+        saved = sess.kv_save(spath)
         if _dbg:
-            print("[runner] kv_save %.2fs" % (time.time() - _ts), file=sys.stderr, flush=True)
+            print("[runner] kv_save %.2fs rc=%s" % (time.time() - _ts, saved),
+                  file=sys.stderr, flush=True)
     elif prefix_cache and slots > 1:
         sess.kv_save(slot_path[slot % slots])
     return out
