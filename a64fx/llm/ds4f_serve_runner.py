@@ -149,15 +149,19 @@ def run_serve(sess, base, prefix_cache, slots):
                                       int(hdr[7]), int(hdr[8]))
         li = 1
         cache_path = None
+        save_path = None
         if ctl != 0 and len(body) > li:
-            cache_path = body[li]; li += 1
+            if ctl & 1:
+                cache_path = body[li]; li += 1
+            if ctl & 2:
+                save_path = body[li]; li += 1
         prompt = [int(x) for x in body[li].split()] if len(body) > li else []
 
         t0 = time.time()
         stream_path = (base + ".tok") if (ctl & 4) else None
         gen = generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
                        slot, ctl, cache_path, prefix_cache, slots, slot_path,
-                       stream_path)
+                       stream_path, save_path)
         with open(resp, "w") as f:
             f.write(" ".join(map(str, gen)))
         done = rs
@@ -184,7 +188,7 @@ def truncate_prompt(prompt, limit):
 
 def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
              slot, ctl, cache_path, prefix_cache, slots, slot_path,
-             stream_path=None):
+             stream_path=None, save_path=None):
     sp = Sampling(temp, top_p, top_k, pres, rep, seed)
     maxpos = sess.maxpos()
     limit = max(1, maxpos - max_new)
@@ -242,9 +246,10 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
         print("[runner] gen prefill+decode %.1fs gen=%d pos=%d" %
               (time.time() - _t0, len(out), sess.pos()), file=sys.stderr, flush=True)
     # cache save: the KV up to the current position (prefix for the next turn)
-    if ctl & 2 and cache_path:
+    spath = save_path or cache_path
+    if ctl & 2 and spath:
         _ts = time.time()
-        sess.kv_save(cache_path)
+        sess.kv_save(spath)
         if _dbg:
             print("[runner] kv_save %.2fs" % (time.time() - _ts), file=sys.stderr, flush=True)
     elif prefix_cache and slots > 1:

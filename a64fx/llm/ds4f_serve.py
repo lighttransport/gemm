@@ -233,10 +233,15 @@ def decode(ids):
 # extends it, skipping the re-prefill of everything before the new turn.
 _conv = {"path": None, "ids": None}
 _conv_lock = threading.Lock()
+# system-prompt cache (DS4F_SERVE_SYSCACHE): the KV of the fixed prefix that
+# every conversation shares (BOS + system message + tools).  Built once with a
+# max_tokens=0 cache_save request; the runner can also preload it at startup.
+SYSCACHE = os.environ.get("DS4F_SERVE_SYSCACHE", "") or ""
+_sys = {"path": SYSCACHE or (BASE + ".sys"), "ids": None}
 
 
 def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, cache_save=False,
-          stream=False):
+          stream=False, save_path=None):
     global _seq
     # concurrent batched decode: route greedy, non-cache requests through the dispatcher (the runner
     # is in DS4F_SERVE_BATCH mode -> the single-request protocol is not served there).
@@ -252,10 +257,14 @@ def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, c
         # bit0=load-before, bit1=save-after, bit2=stream-tokens-to BASE.tok
         ctl = (1 if cache_load else 0) | (2 if cache_save else 0) | (4 if stream else 0)
         # header: "max_new temp top_p top_k presence_penalty repeat_penalty seed slot ctl"; if ctl!=0 the
-        # NEXT line is the cache path; then the prompt ids.  (runner parses this)
+        # load path line (bit0) and/or save path line (bit1) follow; then the prompt ids.  (runner parses)
         hdr = "%d %g %g %d %g %g %d %d %d" % (max_tokens, samp["temperature"], samp["top_p"], samp["top_k"],
                                               samp["presence_penalty"], samp["repeat_penalty"], seed, slot, ctl)
-        body = hdr + "\n" + ((cache_path or "") + "\n" if ctl else "") + " ".join(map(str, ids)) + "\n"
+        body = hdr + "\n"
+        if ctl:
+            if ctl & 1: body += (cache_path or "") + "\n"
+            if ctl & 2: body += ((save_path or cache_path) or "") + "\n"
+        body += " ".join(map(str, ids)) + "\n"
         with open(REQ, "w") as f:
             f.write(body)
         _seq += 1
@@ -367,6 +376,21 @@ def build_chat_prompt(messages, tools):
     return prompt
 
 
+def sys_prefix_text(messages, tools):
+    """The fixed prompt prefix every conversation shares (BOS + system + tools)."""
+    sys_txt = ""
+    for m in messages:
+        if m.get("role") == "system":
+            sys_txt += (("\n\n" if sys_txt else "") + _content_to_text(m.get("content")))
+    tool_txt = render_tools(tools)
+    if tool_txt:
+        sys_txt = (sys_txt + "\n\n" + tool_txt) if sys_txt else tool_txt
+    p = BOS
+    if sys_txt.strip():
+        p += ROLE_TAG["system"] + ": " + sys_txt.strip() + "\n"
+    return p
+
+
 def parse_completion(text, hit_eos):
     """Truncate the base-model output at the next role marker, then split off tool calls.
     Returns (content_text, tool_calls_list, finish_reason)."""
@@ -454,11 +478,36 @@ class H(http.server.BaseHTTPRequestHandler):
         max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 512)))
         samp = parse_sampling(body)
         prompt = build_chat_prompt(messages, tools)
+        # system-prompt cache: build once from the fixed prefix (BOS + system +
+        # tools) with a zero-token cache_save request; the runner restores it and
+        # prefills only the conversation tail on later requests that share it.
+        if SYSCACHE and not os.path.exists(SYSCACHE):
+            try:
+                sp_ids = encode(sys_prefix_text(messages, tools))
+                if sp_ids:
+                    infer(sys_prefix_text(messages, tools), 0,
+                          {"temperature": 0.0, "top_p": 1.0, "top_k": 0,
+                           "presence_penalty": 0.0, "repeat_penalty": 1.0, "seed": None},
+                          cache_path=SYSCACHE, cache_save=True)
+                    _sys["ids"] = sp_ids
+            except Exception:
+                pass
         with _conv_lock:
             ids_all = encode(prompt)
             prev = _conv["ids"]
-            reuse = _conv["path"] is not None and prev is not None and                 len(ids_all) >= len(prev) and ids_all[:len(prev)] == prev
+            conv_reuse = _conv["path"] is not None and prev is not None and \
+                len(ids_all) >= len(prev) and ids_all[:len(prev)] == prev
             cpath = _conv["path"] or (BASE + ".conv")
+            sys_ids = _sys["ids"]
+            sys_ready = SYSCACHE and os.path.exists(SYSCACHE) and sys_ids is not None and \
+                len(ids_all) >= len(sys_ids) and ids_all[:len(sys_ids)] == sys_ids
+            if conv_reuse:
+                reuse = True; cache_path = cpath
+            elif sys_ready:
+                reuse = True; cache_path = SYSCACHE
+            else:
+                reuse = False; cache_path = cpath
+            save_path = cpath
             _conv["ids"] = ids_all
             _conv["path"] = cpath
         t0 = time.time()
@@ -467,7 +516,8 @@ class H(http.server.BaseHTTPRequestHandler):
                        (time.time(), reuse, cpath, len(ids_all)), flush=True)
         try:
             ids, gen, raw = infer(prompt, max_tokens, samp,
-                                  cache_path=cpath, cache_load=reuse, cache_save=True)
+                                  cache_path=cache_path, cache_load=reuse, cache_save=True,
+                                  save_path=save_path)
             if _dbg: print("[chat] infer %.2f gen=%d" % (time.time() - t0, len(gen)), flush=True)
         except TimeoutError:
             return self._json(504, {"error": "runner timeout"})
@@ -502,7 +552,8 @@ class H(http.server.BaseHTTPRequestHandler):
         def _run():
             try:
                 p_ids, p_gen, _ = infer(prompt, max_tokens, samp, stream=True,
-                                        cache_path=cpath, cache_load=reuse, cache_save=True)
+                                        cache_path=cache_path, cache_load=reuse, cache_save=True,
+                                        save_path=save_path)
                 done["ids"] = p_ids
                 done["gen"] = p_gen
             except Exception as e:

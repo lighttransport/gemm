@@ -51,10 +51,14 @@ Smoke test: `sh a64fx/llm/test_ds4f_serve.sh /tmp/ds4f_single 8080`.
   conversation falls back to a fresh full prefill (the session is reset to
   position 0, so multi-turn conversations stay correct).  Measured: turn 2 of
   a conversation lands in ~8 s vs a full re-prefill.
-- **System-prompt cache** (`DS4F_SERVE_SYSCACHE`): the runner loads a
-  persisted context (built once with a `cache_save` request) into slot 0 at
-  startup.  Combined with a `cache_load` request whose prompt begins with that
-  exact prefix, the system prompt / tool definitions are never re-prefilled.
+- **System-prompt cache** (`DS4F_SERVE_SYSCACHE`): the frontend builds the
+  KV of the fixed prompt prefix every conversation shares (BOS + system message
+  + tool definitions) once with a zero-token `cache_save` request, and later
+  requests that begin with that exact prefix ask the runner to restore it and
+  prefill only the conversation tail (the load and save paths are separate
+  ctl-bit lines, so the shared cache is never overwritten).  With a long agent
+  system prompt the first-turn TTFT drops from a full re-prefill to a ~5 s KV
+  restore.  The runner can also preload the same file into slot 0 at startup.
 - **Slots** (`DS4F_SERVE_SLOTS`): per-conversation KV snapshots switched by
   the `slot` field (`<BASE>.slot.<i>` files).
 - **Truncation**: the runner caps the prompt at `max_pos - max_new`, keeping
