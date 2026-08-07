@@ -168,12 +168,13 @@ void ds4f_serve_close(ds4f_serve *s) {
     if (!s) return;
     if (s->m && getenv("DS4F_PROF") && atoi(getenv("DS4F_PROF")) != 0) {
         double acc = 0.0;
-        for (int i = 0; i <= DS4F_P_TB2PREP; ++i) acc += s->m->prof[i];
-        for (int i = 0; i <= DS4F_P_TB2PREP; ++i) {
+        for (int i = 0; i <= DS4F_P_COMM; ++i) acc += s->m->prof[i];
+        for (int i = 0; i <= DS4F_P_COMM; ++i) {
             if (s->m->prof[i] > 1e-3)
                 fprintf(stderr, "  %-9s %8.3f s %5.1f%%\n", ds4f_prof_names[i],
                         s->m->prof[i], acc > 0 ? 100.0 * s->m->prof[i] / acc : 0.0);
         }
+        fprintf(stderr, "  %-9s %8.3f s (profiled)\n", "TOTAL", acc);
     }
 #if defined(DS4F_SERVE_HIP)
     if (s->hip) hip_ds4f_dense_destroy(s->hip);
@@ -213,10 +214,19 @@ int ds4f_serve_prefill(ds4f_serve *s, const int *ids, int n, int pos0) {
 
 /* Decode one token (its id is `token`) at position `pos`.  Returns the argmax
  * of the resulting logits; logits() holds the full distribution. */
+static double dc_wall(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 int ds4f_serve_decode(ds4f_serve *s, int token, int pos) {
+    double tw0 = dc_wall();
     if (!s || token < 0 || token >= s->vocab) return -1;
     if (embed_lookup(s->m, token, s->x) != 0) return -1;
     int ar = ds4f_forward_token(s->m, s->x, pos);
+    double tw1 = dc_wall();
+    if (getenv("DS4F_SERVE_TIME") && (pos % 4) == 0)
+        fprintf(stderr, "serve decode pos=%d forward=%.1f ms\n", pos, (tw1 - tw0) * 1e3);
     if (ar < 0) return -1;
     s->pos = pos + 1;
     if (s->n_hist >= s->hist_cap) {
@@ -242,6 +252,7 @@ const float *ds4f_serve_logits(ds4f_serve *s, int *n) {
 
 /* Greedy or temperature/top-p/top-k sample over logits(). */
 int ds4f_serve_sample(ds4f_serve *s, const ds4f_serve_sampling *sp) {
+    double tw0 = dc_wall();
     if (!s || !s->logits || !sp) return -1;
     const float *lg = s->logits;
     int n = s->vocab;
@@ -254,28 +265,32 @@ int ds4f_serve_sample(ds4f_serve *s, const ds4f_serve_sampling *sp) {
     int top_k = sp->top_k > 0 ? sp->top_k : n;
     double inv = 1.0 / temp;
 
-    /* candidate list (id, logit) over the finite logits */
-    int nc = 0;
-    for (int i = 0; i < n; ++i) if (isfinite(lg[i])) nc++;
-    if (nc < 1) return greedy;
-    float *sc = (float *)malloc((size_t)nc * 2 * sizeof(float));
-    int *ids = (int *)malloc((size_t)nc * sizeof(int));
-    if (!sc || !ids) { free(sc); free(ids); return greedy; }
-    nc = 0;
-    for (int i = 0; i < n; ++i) if (isfinite(lg[i])) { sc[nc] = (float)(lg[i] * inv); ids[nc] = i; nc++; }
-    /* presence/repeat penalties: presence subtracts; repeat divides the logit
-     * of every token that appears in the recent history. */
+    /* candidate list (id, logit) over the finite logits.  The penalties
+     * (presence/repeat) adjust a copy of the const logits first. */
+    float *adj = NULL;
     if (sp->presence_penalty > 0.0 || sp->repeat_penalty > 1.0) {
+        adj = (float *)malloc((size_t)n * sizeof(float));
+        if (!adj) return greedy;
+        memcpy(adj, lg, (size_t)n * sizeof(float));
         for (int h = 0; h < s->n_hist; ++h) {
             int t = s->hist[h];
             if (t < 0 || t >= n) continue;
-            if (sp->presence_penalty > 0.0) lg[t] -= (float)sp->presence_penalty;
-            if (sp->repeat_penalty > 1.0 && lg[t] > 0.0) lg[t] /= (float)sp->repeat_penalty;
-            else if (sp->repeat_penalty > 1.0) lg[t] *= (float)sp->repeat_penalty;
+            if (sp->presence_penalty > 0.0) adj[t] -= (float)sp->presence_penalty;
+            if (sp->repeat_penalty > 1.0 && adj[t] > 0.0) adj[t] /= (float)sp->repeat_penalty;
+            else if (sp->repeat_penalty > 1.0) adj[t] *= (float)sp->repeat_penalty;
         }
-        nc = 0;
-        for (int i = 0; i < n; ++i) if (isfinite(lg[i])) { sc[nc] = (float)(lg[i] * inv); ids[nc] = i; nc++; }
+        lg = adj;
     }
+    int nc = 0;
+    for (int i = 0; i < n; ++i) if (isfinite(lg[i])) nc++;
+    if (nc < 1) { free(adj); return greedy; }
+    float *sc = (float *)malloc((size_t)nc * 2 * sizeof(float));
+    int *ids = (int *)malloc((size_t)nc * sizeof(int));
+    if (!sc || !ids) { free(sc); free(ids); free(adj); return greedy; }
+    nc = 0;
+    for (int i = 0; i < n; ++i) if (isfinite(lg[i])) { sc[nc] = (float)(lg[i] * inv); ids[nc] = i; nc++; }
+    if (adj) { free(adj); }
+
     /* sort by descending logit (qsort, O(n log n) -- the vocab is 129280, so an
      * insertion sort here was ~30 s/step) */
     for (int i = 0; i < nc; ++i) { float t = -sc[i]; sc[i] = t; }
@@ -307,6 +322,10 @@ int ds4f_serve_sample(ds4f_serve *s, const ds4f_serve_sampling *sp) {
         if (draw <= 0.0) { chosen = ids[i]; break; }
     }
     free(sc); free(ids);
+    if (getenv("DS4F_SERVE_TIME")) {
+        double tw1 = dc_wall();
+        fprintf(stderr, "serve sample %.1f ms\n", (tw1 - tw0) * 1e3);
+    }
     return chosen;
 }
 

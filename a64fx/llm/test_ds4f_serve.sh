@@ -16,7 +16,7 @@ pkill -f ds4f_serve.py 2>/dev/null || true
 sleep 1
 
 echo "[test] starting the model runner (load takes ~2 min)..."
-env DS4F_SERVE_BASE="$BASE" DS4F_STAGE_DIR="$STAGE" DS4F_SERVE_USE_HIP=0 \
+env DS4F_SERVE_BASE="$BASE" DS4F_STAGE_DIR="$STAGE" DS4F_SERVE_USE_HIP=1 \
     DS4F_MAXPOS=4096 DS4F_SERVE_LIB="$LIB" \
     python3 "$HERE/ds4f_serve_runner.py" --daemon
 

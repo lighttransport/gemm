@@ -22,7 +22,10 @@ Env: DS4F_SERVE_BASE, DS4F_STAGE_DIR (required), DS4F_SERVE_USE_HIP (1),
      DS4F_HIP_DEVICE, DS4F_MAXPOS, LLM_THREADS, DS4F_CMGS,
      DS4F_SERVE_PREFIX_CACHE (1), DS4F_SERVE_SLOTS (>=1).
 """
-import ctypes, os, sys, time
+import ctypes, os, signal, sys, time
+
+def _term(sig, frame):
+    raise KeyboardInterrupt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIB = os.environ.get("DS4F_SERVE_LIB", os.path.join(HERE, "libds4f_serve.so"))
@@ -236,6 +239,8 @@ def daemonize():
 
 
 def main():
+    signal.signal(signal.SIGTERM, _term)
+    signal.signal(signal.SIGINT, _term)
     if "--daemon" in sys.argv:
         daemonize()
     base = os.environ.get("DS4F_SERVE_BASE", "/tmp/ds4f_serve")
