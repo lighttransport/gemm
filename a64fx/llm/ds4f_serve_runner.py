@@ -204,7 +204,19 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
     return out
 
 
+def daemonize():
+    if os.fork() > 0: os._exit(0)          # first fork: parent exits
+    os.setsid()                            # new session
+    if os.fork() > 0: os._exit(0)          # second fork: detach from tty
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        try: os.dup2(devnull, fd)
+        except OSError: pass
+
+
 def main():
+    if "--daemon" in sys.argv:
+        daemonize()
     base = os.environ.get("DS4F_SERVE_BASE", "/tmp/ds4f_serve")
     stage = os.environ.get("DS4F_STAGE_DIR")
     if not stage:
