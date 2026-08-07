@@ -66,6 +66,7 @@ For the existing 11-node MPI deployment, set `DS4F_DEPLOYMENT=ep`, use
 Point Codex at `http://127.0.0.1:21274/v1` with model `ds4f` and Responses
 wire format. The llmgr port proxies the request to the DS4F frontend; it does
 not tokenize or duplicate the 160 GB model in the controller process.
+Ready-to-copy client examples are in `a64fx/llmgr/examples/`.
 
 Measure a warm single-stream run with:
 
@@ -76,8 +77,10 @@ python3 a64fx/llm/bench_ds4f_http.py \
 ```
 
 Use `--max-tokens 1` for a prefill/TTFT sample and a larger value for decode.
-The reported prefill rate includes the first decode step; compare runs with
-the same prompt and context.
+The harness reports cached and uncached prompt tokens; use `--warmup 0` for a
+cold-prefix measurement and a warmup request to verify the system-prompt cache.
+Its prefill rate is based on uncached prompt tokens and includes the first
+decode step, so compare runs with the same prompt and context.
 
 ## Quick start (inside an existing interactive allocation)
 

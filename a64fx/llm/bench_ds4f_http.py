@@ -49,12 +49,17 @@ def request(url, body):
     end = time.perf_counter()
     prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
     completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    details = usage.get("prompt_tokens_details", usage.get("input_tokens_details", {}))
+    cached_tokens = int(details.get("cached_tokens", 0) or 0) if isinstance(details, dict) else 0
+    uncached_prompt_tokens = max(prompt_tokens - cached_tokens, 0)
     first_s = (first or end) - start
     wall_s = end - start
     decode_s = max(wall_s - first_s, 1e-9)
     return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
             "ttft_s": first_s, "wall_s": wall_s,
-            "prefill_tok_s": prompt_tokens / max(first_s, 1e-9),
+            "cached_tokens": cached_tokens,
+            "uncached_prompt_tokens": uncached_prompt_tokens,
+            "prefill_tok_s": uncached_prompt_tokens / max(first_s, 1e-9),
             "decode_tok_s": completion_tokens / decode_s}
 
 
@@ -80,7 +85,7 @@ def main():
     samples = [request(args.url, body) for _ in range(args.repeat)]
     for index, sample in enumerate(samples, 1):
         print(json.dumps({"sample": index, **sample}, sort_keys=True))
-    for key in ("ttft_s", "prefill_tok_s", "decode_tok_s"):
+    for key in ("ttft_s", "prefill_tok_s", "decode_tok_s", "cached_tokens"):
         values = [sample[key] for sample in samples]
         print(json.dumps({"summary": key, "median": statistics.median(values),
                           "min": min(values), "max": max(values)}, sort_keys=True))

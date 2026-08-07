@@ -109,6 +109,11 @@ the `/v1/messages` endpoint directly; no OpenAI-to-Anthropic bridge is needed.
 
 ## Performance notes
 
+The numbers below are historical CPU-oriented measurements and are not a
+substitute for the live ROCm benchmark. Use `a64fx/llm/bench_ds4f_http.py`
+against the configured llmgr endpoint to measure the current full-weight
+single-node path; it reports cold versus cached prompt work separately.
+
 The dense bank is attached to the ROCm via the `hip_ds4f_dense` hooks (the
 default `DS4F_SERVE_USE_HIP=1`; the CPU-only path is ~4x slower).  The routed
 MXFP4 experts stay on the CPU.  Measured decode: **~240 ms/token** (2.3-4 tok/s)

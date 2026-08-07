@@ -1412,13 +1412,13 @@ static int ensure_gemm_y_tile(hip_ds4f_dense *ctx, size_t y_bytes) {
 
 static int ensure_gemm_yh_tile(hip_ds4f_dense *ctx, size_t y_bytes) {
     if (ctx->gemm_yh_tile && ctx->gemm_yh_tile_bytes >= y_bytes) return 0;
-    float *yh = NULL;
-    if (hipHostMalloc(&yh, y_bytes, 0) != hipSuccess) {
+    void *yh_mem = NULL;
+    if (hipHostMalloc(&yh_mem, y_bytes, 0) != hipSuccess) {
         fprintf(stderr, "hip_ds4f_dense: batched GEMM host tile allocation failed\n");
         return -1;
     }
     if (ctx->gemm_yh_tile) hipHostFree(ctx->gemm_yh_tile);
-    ctx->gemm_yh_tile = yh; ctx->gemm_yh_tile_bytes = y_bytes;
+    ctx->gemm_yh_tile = (float *)yh_mem; ctx->gemm_yh_tile_bytes = y_bytes;
     return 0;
 }
 
@@ -1721,7 +1721,7 @@ int hip_ds4f_dense_gemm_tensor(
     if (hipMemcpy(ctx->gemm_dx, xh, x_bytes, hipMemcpyHostToDevice) != hipSuccess)
         return -1;
 
-    const int n_in = K, n_tok = M;
+    int n_in = K, n_tok = M;
     for (int c = 0; c < nchunk; ++c) {
         int c0 = c * chunkN, cn = (c0 + chunkN <= N) ? chunkN : N - c0;
         unsigned int gx = (unsigned int)((cn + 63) / 64);

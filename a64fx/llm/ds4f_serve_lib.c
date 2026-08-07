@@ -18,7 +18,9 @@
  *
  * Build:  see the Makefile target `libds4f_serve.so`.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "common/ds4f.h"
 #if defined(DS4F_SERVE_HIP)
 #include "hetero/ds4f/hip_ds4f_dense.h"
@@ -53,6 +55,8 @@ typedef struct ds4f_serve {
     hip_ds4f_dense *hip;
 #endif
 } ds4f_serve;
+
+void ds4f_serve_close(ds4f_serve *s);
 
 static int env_i(const char *k, int d) { const char *e = getenv(k); return e && *e ? atoi(e) : d; }
 
