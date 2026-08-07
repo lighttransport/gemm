@@ -47,6 +47,8 @@ typedef struct ds4f_serve {
     int pos;           /* next position to decode into */
     uint64_t rng;
     int eos;
+    int *hist;         /* recent generated tokens (for the penalties) */
+    int n_hist, hist_cap;
 #if defined(DS4F_SERVE_HIP)
     hip_ds4f_dense *hip;
 #endif
@@ -177,6 +179,8 @@ void ds4f_serve_close(ds4f_serve *s) {
     if (s->hip) hip_ds4f_dense_destroy(s->hip);
 #endif
     if (s->m) ds4f_free(s->m);
+    free(s->hist);
+    free(s->logits);
     free(s);
 }
 
@@ -198,6 +202,7 @@ int ds4f_serve_prefill(ds4f_serve *s, const int *ids, int n, int pos0) {
         if (ds4f_forward_token(s->m, s->x, p) < 0) return -1;
     }
     s->pos = p;
+    s->n_hist = 0;
     if (s->m->cfg.vocab > (int)s->logits_cap) {
         s->logits = (float *)realloc(s->logits, (size_t)s->m->cfg.vocab * sizeof(float));
         s->logits_cap = (size_t)s->m->cfg.vocab;
@@ -214,6 +219,13 @@ int ds4f_serve_decode(ds4f_serve *s, int token, int pos) {
     int ar = ds4f_forward_token(s->m, s->x, pos);
     if (ar < 0) return -1;
     s->pos = pos + 1;
+    if (s->n_hist >= s->hist_cap) {
+        int cap = s->hist_cap ? s->hist_cap * 2 : 64;
+        int *p = (int *)realloc(s->hist, (size_t)cap * sizeof(int));
+        if (!p) return ar;
+        s->hist = p; s->hist_cap = cap;
+    }
+    s->hist[s->n_hist++] = token;
     if (s->m->cfg.vocab > (int)s->logits_cap) {
         s->logits = (float *)realloc(s->logits, (size_t)s->m->cfg.vocab * sizeof(float));
         s->logits_cap = (size_t)s->m->cfg.vocab;
@@ -251,6 +263,19 @@ int ds4f_serve_sample(ds4f_serve *s, const ds4f_serve_sampling *sp) {
     if (!sc || !ids) { free(sc); free(ids); return greedy; }
     nc = 0;
     for (int i = 0; i < n; ++i) if (isfinite(lg[i])) { sc[nc] = (float)(lg[i] * inv); ids[nc] = i; nc++; }
+    /* presence/repeat penalties: presence subtracts; repeat divides the logit
+     * of every token that appears in the recent history. */
+    if (sp->presence_penalty > 0.0 || sp->repeat_penalty > 1.0) {
+        for (int h = 0; h < s->n_hist; ++h) {
+            int t = s->hist[h];
+            if (t < 0 || t >= n) continue;
+            if (sp->presence_penalty > 0.0) lg[t] -= (float)sp->presence_penalty;
+            if (sp->repeat_penalty > 1.0 && lg[t] > 0.0) lg[t] /= (float)sp->repeat_penalty;
+            else if (sp->repeat_penalty > 1.0) lg[t] *= (float)sp->repeat_penalty;
+        }
+        nc = 0;
+        for (int i = 0; i < n; ++i) if (isfinite(lg[i])) { sc[nc] = (float)(lg[i] * inv); ids[nc] = i; nc++; }
+    }
     /* sort by descending logit (qsort, O(n log n) -- the vocab is 129280, so an
      * insertion sort here was ~30 s/step) */
     for (int i = 0; i < nc; ++i) { float t = -sc[i]; sc[i] = t; }
@@ -288,6 +313,7 @@ int ds4f_serve_sample(ds4f_serve *s, const ds4f_serve_sampling *sp) {
 int ds4f_serve_reset(ds4f_serve *s) {
     if (!s) return -1;
     s->pos = 0;
+    s->n_hist = 0;
     return 0;
 }
 
