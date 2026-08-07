@@ -1234,6 +1234,7 @@ class Handler(bhs.Handler):
             return self._err("proxy to %s failed: %s" % (adapter.name, e),
                              status=502)
         if body.get("stream"):
+            self.close_connection = True
             self.send_response(response.status)
             self.send_header("Content-Type", response.headers.get(
                 "Content-Type", "text/event-stream"))
@@ -1242,7 +1243,9 @@ class Handler(bhs.Handler):
             self.send_header("Connection", "close")
             self.end_headers()
             try:
-                for chunk in iter(lambda: response.read(65536), b""):
+                # SSE is line-delimited.  readline() preserves token timing;
+                # a large read would buffer the whole generation until EOF.
+                for chunk in iter(response.readline, b""):
                     self.wfile.write(chunk)
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):

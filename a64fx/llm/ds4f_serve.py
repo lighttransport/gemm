@@ -753,7 +753,10 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        # The stream has no Content-Length; close it after [DONE] so urllib,
+        # curl, and llmgr's wire proxy can detect end-of-response.
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
 
     def _sse(self, obj):

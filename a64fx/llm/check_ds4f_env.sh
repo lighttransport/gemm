@@ -6,12 +6,23 @@ HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 MODEL_DIR=${DS4F_MODEL_DIR:-$HOME/models/ds4f}
 STAGE_DIR=${DS4F_STAGE_DIR:-/local/ds4f}
 TOKENIZER=${DS4F_TOKENIZER:-${TOK:-$HOME/models/ds4f/tokenizer.json}}
-NSHARDS=${DS4F_NSHARDS:-46}
+NSHARDS=${DS4F_NSHARDS:-}
 LIB=${DS4F_SERVE_LIB:-$HERE/../../libds4f_serve.so}
 errors=0
 
 fail() { echo "ERROR: $*" >&2; errors=$((errors + 1)); }
 warn() { echo "WARN: $*" >&2; }
+
+if [ -z "$NSHARDS" ] && [ -d "$MODEL_DIR" ]; then
+    first=$(find "$MODEL_DIR" -maxdepth 1 -type f \
+            -name 'model-00001-of-*.safetensors' -print -quit)
+    if [ -n "$first" ]; then
+        NSHARDS=$(basename "$first" | sed -n \
+            's/.*-of-\([0-9][0-9]*\)\.safetensors/\1/p' | \
+            sed 's/^0*//; s/^$/0/')
+    fi
+fi
+NSHARDS=${NSHARDS:-46}
 
 [ -d "$MODEL_DIR" ] || fail "model directory does not exist: $MODEL_DIR"
 [ -r "$TOKENIZER" ] || fail "tokenizer is not readable: $TOKENIZER"

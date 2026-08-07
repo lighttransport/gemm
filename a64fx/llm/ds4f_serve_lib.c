@@ -94,11 +94,25 @@ static int serve_attach_hip(ds4f_serve *s, int hip_device, int verbose,
                                &z->sh_w1, &z->sh_w3, &z->sh_w2, &z->gate };
         for (int j = 0; j < 9; ++j) {
             int ordered = L < ordered_layers && ts[j]->type == DS4F_FP8;
-            int id = ts[j]->type == DS4F_BF16
-                ? hip_ds4f_dense_bind_bf16_tensor(s->hip, ts[j])
-                : ordered
+            int id;
+            if (ts[j]->type == DS4F_BF16)
+                id = hip_ds4f_dense_bind_bf16_tensor(s->hip, ts[j]);
+            else if (ts[j]->type == DS4F_MXFP4)
+                id = hip_ds4f_dense_bind_mxfp4_tensor(s->hip, ts[j]);
+            else if (ts[j]->type == DS4F_FP8)
+                id = ordered
                     ? hip_ds4f_dense_bind_fp8_ordered_tensor(s->hip, ts[j])
                     : hip_ds4f_dense_bind_tensor(s->hip, ts[j]);
+            else {
+                /* F32/PV tensors are intentionally left on the exact CPU path. */
+                ts[j]->gpu_id = -1;
+                continue;
+            }
+            if (id < 0)
+                fprintf(stderr, "ds4f_serve: HIP bind failed layer=%d tensor=%d "
+                                "type=%d rows=%d cols=%d w=%p scale=%p\n",
+                        L, j, ts[j]->type, ts[j]->rows, ts[j]->cols,
+                        ts[j]->w, ts[j]->scale);
             if (id < 0) return -1;
         }
     }

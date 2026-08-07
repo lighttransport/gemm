@@ -67,7 +67,7 @@ DS4F_NP=1 ./a64fx/llmgr/run_llmgr_ds4f.sh --daemon --verbose
 
 python3 a64fx/llmgr/llmgr_cli.py stage --model ds4f --deployment single --np 1
 python3 a64fx/llmgr/llmgr_cli.py start --model ds4f --mode serve --port 8080 \
-  --deployment single --np 1 --ctx 16384 --q8-dense 0 --fp8-bf16 1
+  --deployment single --np 1 --ctx 16384 --q8-dense 0 --fp8-bf16 0
 ```
 
 For the existing 11-node MPI deployment, set `DS4F_DEPLOYMENT=ep`, use
@@ -91,6 +91,13 @@ The harness reports cached and uncached prompt tokens; use `--warmup 0` for a
 cold-prefix measurement and a warmup request to verify the system-prompt cache.
 Its prefill rate is based on uncached prompt tokens and includes the first
 decode step, so compare runs with the same prompt and context.
+
+On the validation host (48 shards, 155.4 GiB, `gfx1201`), the full-weight
+single-node run with `--q8-dense 0 --fp8-bf16 0` loaded in 107.7 s, used 7.2 GiB
+VRAM, and measured 1.18 tok/s decode / 2.48 uncached prompt tok/s in one
+128-token sample. This is below the 17/50+ target because routed MXFP4 expert
+work remains CPU-bound. `--fp8-bf16 1` promotes dense tensors to the CPU
+BF16-PV path in this serving adapter and is not the GPU benchmark setting.
 
 ## Quick start (inside an existing interactive allocation)
 
