@@ -49,6 +49,16 @@ topology is the single-node HIP runner. It keeps the routed weight set in host
 memory and uses the 9070 XT for the dense path; `--q8-dense 0` keeps this run
 unquantized:
 
+Run the preflight before staging; it verifies every shard, tokenizer, library,
+and ROCm device without copying the model:
+
+```sh
+DS4F_MODEL_DIR=/shared/models/ds4f-full \
+DS4F_STAGE_DIR=/local/ds4f \
+DS4F_TOKENIZER=/shared/models/ds4f-full/tokenizer.json \
+  sh a64fx/llm/check_ds4f_env.sh
+```
+
 ```sh
 DS4F_MODEL_DIR=/shared/models/ds4f-full \
 DS4F_STAGE_DIR=/local/ds4f \
