@@ -154,8 +154,10 @@ def run_serve(sess, base, prefix_cache, slots):
         prompt = [int(x) for x in body[li].split()] if len(body) > li else []
 
         t0 = time.time()
+        stream_path = (base + ".tok") if (ctl & 4) else None
         gen = generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
-                       slot, ctl, cache_path, prefix_cache, slots, slot_path)
+                       slot, ctl, cache_path, prefix_cache, slots, slot_path,
+                       stream_path)
         with open(resp, "w") as f:
             f.write(" ".join(map(str, gen)))
         done = rs
@@ -181,7 +183,8 @@ def truncate_prompt(prompt, limit):
 
 
 def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
-             slot, ctl, cache_path, prefix_cache, slots, slot_path):
+             slot, ctl, cache_path, prefix_cache, slots, slot_path,
+             stream_path=None):
     sp = Sampling(temp, top_p, top_k, pres, rep, seed)
     maxpos = sess.maxpos()
     limit = max(1, maxpos - max_new)
@@ -208,6 +211,9 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
     # the generation loop: sample + decode until max_new or EOS
     out = []
     pos = sess.pos()
+    tf = None
+    if stream_path:
+        tf = open(stream_path, "w")
     for _ in range(max_new):
         tok = sess.sample(sp)
         if tok == sess.eos:
@@ -215,10 +221,15 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
         ar = sess.decode(tok, pos)
         out.append(tok)
         pos += 1
+        if tf is not None:
+            tf.write(str(tok) + "\n")
+            tf.flush()
         if ar == sess.eos:
             break
         if pos >= maxpos:
             break
+    if tf is not None:
+        tf.close()
 
     # cache save: the KV up to the current position (prefix for the next turn)
     if ctl & 2 and cache_path:

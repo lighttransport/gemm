@@ -66,7 +66,11 @@ Smoke test: `sh a64fx/llm/test_ds4f_serve.sh /tmp/ds4f_single 8080`.
 
 `ds4f_serve.py` injects the OpenAI `tools` into the prompt
 (`<tool_call>{...}</tool_call>`) and parses them back into OpenAI `tool_calls`,
-so agents can loop tool calls over the same conversation.
+so agents can loop tool calls over the same conversation.  `stream: true`
+requests are emitted as **real SSE deltas**: the runner appends each generated
+token id to `<BASE>.tok` (ctl bit2) and the frontend tails that file, decoding
+each token and sending a `chat.completion.chunk` event as it lands (finish +
+usage + `[DONE]` at the end).
 
 ## Coding-agent configs
 

@@ -228,7 +228,8 @@ def decode(ids):
             except OSError: pass
 
 
-def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, cache_save=False):
+def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, cache_save=False,
+          stream=False):
     global _seq
     # concurrent batched decode: route greedy, non-cache requests through the dispatcher (the runner
     # is in DS4F_SERVE_BATCH mode -> the single-request protocol is not served there).
@@ -241,7 +242,8 @@ def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, c
         if not ids and not cache_save:
             return [], [], ""
         seed = samp["seed"] if samp["seed"] is not None else (_seq + 1)
-        ctl = (1 if cache_load else 0) | (2 if cache_save else 0)   # bit0=load-before, bit1=save-after
+        # bit0=load-before, bit1=save-after, bit2=stream-tokens-to BASE.tok
+        ctl = (1 if cache_load else 0) | (2 if cache_save else 0) | (4 if stream else 0)
         # header: "max_new temp top_p top_k presence_penalty repeat_penalty seed slot ctl"; if ctl!=0 the
         # NEXT line is the cache path; then the prompt ids.  (runner parses this)
         hdr = "%d %g %g %d %g %g %d %d %d" % (max_tokens, samp["temperature"], samp["top_p"], samp["top_k"],
@@ -463,22 +465,50 @@ class H(http.server.BaseHTTPRequestHandler):
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
                 "usage": usage,
             })
-        # pseudo-stream: emit the already-computed turn as SSE deltas
+        # real streaming: the runner appends each generated token id to BASE.tok
+        # (ctl bit2); infer() runs in a thread and this handler tails the file,
+        # decoding each token and emitting an SSE delta as it lands.
         self._sse_headers()
         head = {"id": "chatcmpl-ds4f", "object": "chat.completion.chunk", "created": created,
                 "model": MODEL_ID}
         self._sse({**head, "choices": [{"index": 0, "delta": {"role": "assistant"},
                                         "finish_reason": None}]})
-        if tool_calls:
-            for i, tc in enumerate(tool_calls):
-                self._sse({**head, "choices": [{"index": 0, "delta": {"tool_calls": [{
-                    "index": i, "id": tc["id"], "type": "function",
-                    "function": {"name": tc["function"]["name"],
-                                 "arguments": tc["function"]["arguments"]},
-                }]}, "finish_reason": None}]})
-        elif content:
-            self._sse({**head, "choices": [{"index": 0, "delta": {"content": content},
-                                            "finish_reason": None}]})
+        tok_path = BASE + ".tok"
+        err = {}
+        done = {"gen": []}
+        def _run():
+            try:
+                p_ids, p_gen, _ = infer(prompt, max_tokens, samp, stream=True)
+                done["ids"] = p_ids
+                done["gen"] = p_gen
+            except Exception as e:
+                err["e"] = e
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        seen = 0
+        while True:
+            try:
+                lines = open(tok_path).read().splitlines()
+            except OSError:
+                lines = []
+            for tok in lines[seen:]:
+                try:
+                    text = decode([int(tok)])
+                except Exception:
+                    text = ""
+                self._sse({**head, "choices": [{"index": 0, "delta": {"content": text},
+                                                "finish_reason": None}]})
+            seen = len(lines)
+            if err:
+                return self._json(500, {"error": str(err["e"])})
+            if not t.is_alive() and seen >= len(lines):
+                break
+            time.sleep(0.02)
+        gen = done["gen"]
+        hit_eos = bool(gen and gen[-1] == 1)
+        content, tool_calls, finish = parse_completion(decode(gen), hit_eos)
+        usage = {"prompt_tokens": len(done.get("ids", ids)),
+                 "completion_tokens": len(gen), "total_tokens": len(done.get("ids", ids)) + len(gen)}
         self._sse({**head, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
                    "usage": usage})
         self.wfile.write(b"data: [DONE]\n\n")
