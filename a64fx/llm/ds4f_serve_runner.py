@@ -103,6 +103,9 @@ class Serve(object):
     def kv_restore(self, path):
         return self.lib.ds4f_serve_kv_restore(self._s, path.encode())
 
+    def reset(self):
+        return self.lib.ds4f_serve_reset(self._s)
+
     def pos(self):
         return self.lib.ds4f_serve_pos(self._s)
 
@@ -198,12 +201,20 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
     _t0 = time.time()
 
     if ctl & 1 and cache_path and os.path.exists(cache_path):
-        # load a cached prefix; prefill only the tokens after the cached length
+        # load a cached prefix; prefill only the tokens after the cached length.
+        # The cache only applies when its length is a prefix of the prompt; a
+        # longer cache (e.g. the previous turn rendered the tool call in fewer
+        # tokens than the model generated) must fall back to a fresh prefill.
         sess.kv_restore(cache_path)
         cached = sess.pos()
-        tail = prompt[cached:]
-        if tail:
-            sess.prefill(tail, cached)
+        if cached > len(prompt):
+            sess.reset()
+            if prompt:
+                sess.prefill(prompt, 0)
+        else:
+            tail = prompt[cached:]
+            if tail:
+                sess.prefill(tail, cached)
     elif prefix_cache and slots > 1 and os.path.exists(slot_path[slot % slots]):
         sess.kv_restore(slot_path[slot % slots])
         cached = sess.pos()

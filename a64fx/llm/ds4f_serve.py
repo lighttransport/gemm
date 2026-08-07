@@ -376,6 +376,65 @@ def build_chat_prompt(messages, tools):
     return prompt
 
 
+def anthropic_tools_to_openai(tools):
+    """Anthropic tool defs -> OpenAI function tools (build_chat_prompt's format)."""
+    out = []
+    for t in (tools or []):
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name", "")
+        if not name:
+            continue
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+            },
+        })
+    return out
+
+
+def anthropic_messages_to_openai(messages):
+    """Anthropic messages[] -> OpenAI messages[] the chat prompt builder expects."""
+    out = []
+    for m in (messages or []):
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+            continue
+        text_parts, tool_uses, tool_results = [], [], []
+        for b in content:
+            t = b.get("type")
+            if t == "text":
+                text_parts.append(b.get("text", ""))
+            elif t == "tool_use":
+                tool_uses.append(b)
+            elif t == "tool_result":
+                tool_results.append(b)
+        if role == "assistant":
+            msg = {"role": "assistant", "content": "".join(text_parts) or None}
+            if tool_uses:
+                tcs = []
+                for tu in tool_uses:
+                    tcs.append({"id": tu.get("id", "call_0"), "type": "function",
+                                "function": {"name": tu.get("name", ""),
+                                             "arguments": json.dumps(tu.get("input", {}),
+                                                                      ensure_ascii=False)}})
+                msg["tool_calls"] = tcs
+            out.append(msg)
+        else:
+            for tr in tool_results:
+                out.append({"role": "tool",
+                            "tool_call_id": tr.get("tool_use_id", "call_0"),
+                            "content": _content_to_text(tr.get("content"))})
+            if text_parts:
+                out.append({"role": "user", "content": "".join(text_parts)})
+    return out
+
+
 def sys_prefix_text(messages, tools):
     """The fixed prompt prefix every conversation shares (BOS + system + tools)."""
     sys_txt = ""
@@ -423,6 +482,53 @@ def parse_completion(text, hit_eos):
     return text.strip(), [], ("stop" if (hit_eos or truncated) else "length")
 
 
+def _select_cache(prompt):
+    """Decide the KV prefix to restore for this prompt (conversation reuse,
+    system-prompt reuse, or fresh) and where to save the new KV snapshot."""
+    with _conv_lock:
+        ids_all = encode(prompt)
+        prev = _conv["ids"]
+        conv_reuse = _conv["path"] is not None and prev is not None and \
+            len(ids_all) >= len(prev) and ids_all[:len(prev)] == prev
+        cpath = _conv["path"] or (BASE + ".conv")
+        sys_ids = _sys["ids"]
+        sys_ready = SYSCACHE and os.path.exists(SYSCACHE) and sys_ids is not None and \
+            len(ids_all) >= len(sys_ids) and ids_all[:len(sys_ids)] == sys_ids
+        if conv_reuse:
+            reuse = True; cache_path = cpath
+        elif sys_ready:
+            reuse = True; cache_path = SYSCACHE
+        else:
+            reuse = False; cache_path = cpath
+        save_path = cpath
+        _conv["ids"] = ids_all
+        _conv["path"] = cpath
+    return ids_all, reuse, cache_path, save_path
+
+
+def anthropic_blocks(content, tool_calls, finish, hit_eos):
+    """(content, OpenAI tool_calls, finish_reason) -> Anthropic content blocks +
+    stop_reason."""
+    blocks = []
+    if content:
+        blocks.append({"type": "text", "text": content})
+    for tc in (tool_calls or []):
+        fn = tc.get("function", {})
+        try:
+            inp = json.loads(fn.get("arguments", "{}"))
+        except (ValueError, TypeError):
+            inp = {}
+        blocks.append({"type": "tool_use", "id": tc.get("id", "call_0"),
+                       "name": fn.get("name", ""), "input": inp})
+    if tool_calls:
+        stop = "tool_use"
+    elif finish == "length":
+        stop = "max_tokens"
+    else:
+        stop = "end_turn"
+    return blocks, stop
+
+
 class H(http.server.BaseHTTPRequestHandler):
     def _json(self, code, obj):
         b = json.dumps(obj).encode()
@@ -465,6 +571,8 @@ class H(http.server.BaseHTTPRequestHandler):
         path = self.path.rstrip("/")
         if path in ("/v1/chat/completions", "/chat/completions"):
             return self.chat()
+        if path in ("/v1/messages", "/messages"):
+            return self.messages_anthropic()
         return self.completion()
 
     # ---- OpenAI chat completions (pi's path) ----
@@ -584,6 +692,117 @@ class H(http.server.BaseHTTPRequestHandler):
                  "completion_tokens": len(gen), "total_tokens": len(done.get("ids", ids)) + len(gen)}
         self._sse({**head, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
                    "usage": usage})
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    # ---- Anthropic messages API (claude-code's wire protocol) ----
+    def messages_anthropic(self):
+        body = self._read_body()
+        if body is None:
+            return self._json(400, {"error": "bad json"})
+        stream = bool(body.get("stream", False))
+        max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 512)))
+        samp = parse_sampling(body)
+        tools = anthropic_tools_to_openai(body.get("tools", []))
+        messages = anthropic_messages_to_openai(body.get("messages", []))
+        system = body.get("system")
+        if system and not any(m.get("role") == "system" for m in messages):
+            if isinstance(system, list):
+                system = "".join(b.get("text", "") for b in system if b.get("type") == "text")
+            messages.insert(0, {"role": "system", "content": system})
+        prompt = build_chat_prompt(messages, tools)
+        # the shared system-prompt cache build (same as chat)
+        if SYSCACHE and not os.path.exists(SYSCACHE):
+            try:
+                sp_ids = encode(sys_prefix_text(messages, tools))
+                if sp_ids:
+                    infer(sys_prefix_text(messages, tools), 0,
+                          {"temperature": 0.0, "top_p": 1.0, "top_k": 0,
+                           "presence_penalty": 0.0, "repeat_penalty": 1.0, "seed": None},
+                          cache_path=SYSCACHE, cache_save=True)
+                    _sys["ids"] = sp_ids
+            except Exception:
+                pass
+        _, reuse, cache_path, save_path = _select_cache(prompt)
+        t0 = time.time()
+        mid = "msg_ds4f_%d" % int(time.time())
+        if not stream:
+            try:
+                ids, gen, raw = infer(prompt, max_tokens, samp,
+                                      cache_path=cache_path, cache_load=reuse,
+                                      cache_save=True, save_path=save_path)
+            except TimeoutError:
+                return self._json(504, {"error": "runner timeout"})
+            except Exception as e:
+                return self._json(500, {"error": str(e)})
+            hit_eos = bool(gen and gen[-1] == 1)
+            content, tool_calls, finish = parse_completion(raw, hit_eos)
+            blocks, stop = anthropic_blocks(content, tool_calls, finish, hit_eos)
+            return self._json(200, {
+                "id": mid, "type": "message", "role": "assistant", "model": MODEL_ID,
+                "content": blocks, "stop_reason": stop,
+                "usage": {"input_tokens": len(ids), "output_tokens": len(gen)},
+            })
+        # streaming: content_block deltas over the .tok stream
+        self._sse_headers()
+        head = {"type": "message_start", "message": {
+            "id": mid, "type": "message", "role": "assistant", "model": MODEL_ID,
+            "content": [], "stop_reason": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}}}
+        self._sse(head)
+        self._sse({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "text", "text": ""}})
+        tok_path = BASE + ".tok"
+        err = {}
+        done = {"gen": []}
+        def _run():
+            try:
+                p_ids, p_gen, _ = infer(prompt, max_tokens, samp, stream=True,
+                                        cache_path=cache_path, cache_load=reuse,
+                                        cache_save=True, save_path=save_path)
+                done["ids"] = p_ids
+                done["gen"] = p_gen
+            except Exception as e:
+                err["e"] = e
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        seen = 0
+        while True:
+            try:
+                lines = open(tok_path).read().splitlines()
+            except OSError:
+                lines = []
+            for tok in lines[seen:]:
+                try:
+                    text = decode([int(tok)])
+                except Exception:
+                    text = ""
+                if text:
+                    self._sse({"type": "content_block_delta", "index": 0,
+                               "delta": {"type": "text_delta", "text": text}})
+            seen = len(lines)
+            if err:
+                return self._json(500, {"error": str(err["e"])})
+            if not t.is_alive() and seen >= len(lines):
+                break
+            time.sleep(0.02)
+        gen = done["gen"]
+        hit_eos = bool(gen and gen[-1] == 1)
+        content, tool_calls, finish = parse_completion(decode(gen), hit_eos)
+        blocks, stop = anthropic_blocks(content, tool_calls, finish, hit_eos)
+        self._sse({"type": "content_block_stop", "index": 0})
+        if tool_calls:
+            for i, blk in enumerate(blocks):
+                if blk.get("type") != "tool_use":
+                    continue
+                self._sse({"type": "content_block_start", "index": 1 + i,
+                           "content_block": {"type": "tool_use", "id": blk["id"],
+                                             "name": blk["name"], "input": blk["input"]}})
+                self._sse({"type": "content_block_stop", "index": 1 + i})
+        self._sse({"type": "message_delta",
+                   "delta": {"stop_reason": stop},
+                   "usage": {"output_tokens": len(gen)}})
+        self._sse({"type": "message_stop"})
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
