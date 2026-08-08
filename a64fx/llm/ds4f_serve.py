@@ -36,6 +36,7 @@ TOK = os.environ.get("TOK", os.path.expanduser("~/models/ds4f/tokenizer.json"))
 TOKCLI = os.path.join(HERE, "tools", "ds4f_tokenizer.py")
 BASE = os.environ.get("DS4F_SERVE_BASE", "/tmp/ds4f_serve")
 REQ, RESP, REQSEQ, RESPSEQ = BASE + ".req", BASE + ".resp", BASE + ".reqseq", BASE + ".respseq"
+ERROR = BASE + ".error"
 PORT = int(os.environ.get("PORT", "8080"))
 TIMEOUT = float(os.environ.get("DS4F_SERVE_TIMEOUT", "1200"))
 MODEL_ID = "ds4f"
@@ -369,6 +370,10 @@ def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, c
         body += " ".join(map(str, ids)) + "\n"
         with open(REQ, "w") as f:
             f.write(body)
+        try:
+            os.unlink(ERROR)
+        except FileNotFoundError:
+            pass
         _seq += 1
         with open(REQSEQ, "w") as f:
             f.write(str(_seq) + "\n")                # write req then bump seq -> runner reads a complete file
@@ -388,6 +393,14 @@ def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, c
                 raise TimeoutError("runner timeout")
             time.sleep(0.01)
         if _dbg: print("[infer] wait %.2f rs=%d seq=%d" % (time.time() - t0, rs, _seq), flush=True)
+        if os.path.exists(ERROR):
+            try:
+                with open(ERROR) as f:
+                    message = f.read().strip()
+            finally:
+                try: os.unlink(ERROR)
+                except FileNotFoundError: pass
+            raise RuntimeError("DS4F runner failed: %s" % (message or "unknown error"))
         with open(RESP) as f:
             gen = [int(x) for x in f.read().split()]
         return ids, gen, decode(gen)

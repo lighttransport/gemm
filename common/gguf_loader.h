@@ -119,9 +119,10 @@ typedef struct {
     uint64_t dims[4];
     uint32_t type; /* ggml_dtype */
     uint64_t offset; /* offset from start of data section */
+    uint32_t file_index; /* zero for a single file; set by gguf_open_multi */
 } gguf_tensor_info;
 
-typedef struct {
+typedef struct gguf_context {
     uint32_t version;
     uint64_t n_kv;
     uint64_t n_tensors;
@@ -142,6 +143,11 @@ typedef struct {
     size_t map_size;
     int fd;
 #endif
+    /* A multi-file context owns one ordinary context per GGUF shard.  The
+     * aggregate tensor table below keeps the public API unchanged while
+     * gguf_tensor_data() selects the owning shard. */
+    struct gguf_context **parts;
+    uint32_t n_parts;
 } gguf_context;
 
 gguf_context *gguf_open(const char *path, int use_mmap);
@@ -559,11 +565,101 @@ fail:
 }
 
 gguf_context *gguf_open_multi(const char *path, int use_mmap) {
-    return gguf_open(path, use_mmap);
+    gguf_context *first = gguf_open(path, use_mmap);
+    if (!first) return NULL;
+    int split_idx = gguf_find_key(first, "split.count");
+    uint32_t count = 1;
+    if (split_idx >= 0 && first->kv[split_idx].type == GGUF_TYPE_UINT16)
+        count = first->kv[split_idx].value.u16;
+    else if (split_idx >= 0 && first->kv[split_idx].type == GGUF_TYPE_UINT32)
+        count = first->kv[split_idx].value.u32;
+    if (count <= 1) return first;
+
+    /* Split GGUF names conventionally contain -NNNNN-of-NNNNN.  Refuse an
+     * ambiguous name instead of silently loading only shard zero. */
+    const char *of = strstr(path, "-of-");
+    if (!of) {
+        fprintf(stderr, "gguf: split.count=%u but shard path has no -of- suffix: %s\n", count, path);
+        gguf_close(first);
+        return NULL;
+    }
+    const char *ns = of;
+    while (ns > path && ns[-1] >= '0' && ns[-1] <= '9') ns--;
+    if (ns == of) {
+        fprintf(stderr, "gguf: malformed split shard name: %s\n", path);
+        gguf_close(first);
+        return NULL;
+    }
+    int width = (int)(of - ns);
+    const char *suffix = of + 4; /* skip -of- */
+    while (*suffix >= '0' && *suffix <= '9') suffix++;
+    size_t prefix_len = (size_t)(ns - path);
+    size_t path_cap = strlen(path) + 32;
+    gguf_context **parts = (gguf_context **)calloc(count, sizeof(*parts));
+    if (!parts) { gguf_close(first); return NULL; }
+    parts[0] = first;
+    for (uint32_t p = 1; p < count; p++) {
+        char *shard = (char *)malloc(path_cap);
+        if (!shard) { for (uint32_t j = 0; j < p; j++) gguf_close(parts[j]); free(parts); return NULL; }
+        int n = snprintf(shard, path_cap, "%.*s%0*u-of-%0*u%s",
+                         (int)prefix_len, path, width, p + 1, width, count, suffix);
+        gguf_context *part = (n > 0 && (size_t)n < path_cap) ? gguf_open(shard, use_mmap) : NULL;
+        if (!part) {
+            fprintf(stderr, "gguf: failed to open split shard %u/%u: %s\n", p + 1, count, shard);
+            free(shard);
+            for (uint32_t j = 0; j < p; j++) gguf_close(parts[j]);
+            free(parts);
+            return NULL;
+        }
+        free(shard);
+        parts[p] = part;
+    }
+
+    gguf_context *ctx = (gguf_context *)calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        for (uint32_t p = 0; p < count; p++) gguf_close(parts[p]);
+        free(parts);
+        return NULL;
+    }
+    ctx->version = first->version;
+    ctx->n_kv = first->n_kv;
+    ctx->kv = first->kv;
+    first->kv = NULL; first->n_kv = 0;
+    ctx->alignment = first->alignment;
+    ctx->parts = parts;
+    ctx->n_parts = count;
+    for (uint32_t p = 0; p < count; p++) ctx->n_tensors += parts[p]->n_tensors;
+    ctx->tensors = (gguf_tensor_info *)calloc(ctx->n_tensors, sizeof(*ctx->tensors));
+    if (!ctx->tensors) { gguf_close(ctx); return NULL; }
+    uint64_t out = 0;
+    for (uint32_t p = 0; p < count; p++) {
+        for (uint64_t i = 0; i < parts[p]->n_tensors; i++) {
+            gguf_tensor_info *dst = &ctx->tensors[out++];
+            *dst = parts[p]->tensors[i];
+            dst->file_index = p;
+            dst->name.str = strdup(parts[p]->tensors[i].name.str);
+            if (!dst->name.str) { gguf_close(ctx); return NULL; }
+        }
+    }
+    return ctx;
 }
 
 void gguf_close(gguf_context *ctx) {
     if (!ctx) return;
+    if (ctx->parts) {
+        if (ctx->kv) {
+            for (uint64_t i = 0; i < ctx->n_kv; i++) gguf_free_kv(&ctx->kv[i]);
+            free(ctx->kv);
+        }
+        if (ctx->tensors) {
+            for (uint64_t i = 0; i < ctx->n_tensors; i++) free(ctx->tensors[i].name.str);
+            free(ctx->tensors);
+        }
+        for (uint32_t i = 0; i < ctx->n_parts; i++) gguf_close(ctx->parts[i]);
+        free(ctx->parts);
+        free(ctx);
+        return;
+    }
     if (ctx->kv) {
         for (uint64_t i = 0; i < ctx->n_kv; i++) gguf_free_kv(&ctx->kv[i]);
         free(ctx->kv);
@@ -597,7 +693,13 @@ const char *gguf_tensor_name(const gguf_context *ctx, int i) {
 
 void *gguf_tensor_data(const gguf_context *ctx, int i) {
     if (i < 0 || (uint64_t)i >= ctx->n_tensors) return NULL;
-    return ctx->data + ctx->tensors[i].offset;
+    const gguf_tensor_info *ti = &ctx->tensors[i];
+    const gguf_context *owner = ctx;
+    if (ctx->parts) {
+        if (ti->file_index >= ctx->n_parts) return NULL;
+        owner = ctx->parts[ti->file_index];
+    }
+    return owner->data + ti->offset;
 }
 
 size_t gguf_tensor_size(const gguf_context *ctx, int i) {

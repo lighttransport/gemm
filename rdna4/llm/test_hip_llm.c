@@ -332,10 +332,24 @@ int main(int argc, char **argv) {
 
     /* Load GGUF */
     fprintf(stderr, "Loading GGUF: %s\n", model_path);
-    gguf_context *gguf = gguf_open(model_path, 1);
+    /* Split GGUFs are presented as one tensor namespace.  The loader maps
+     * each shard independently, so this does not concatenate or copy the
+     * model weights. */
+    gguf_context *gguf = gguf_open_multi(model_path, 1);
     if (!gguf) {
         fprintf(stderr, "Failed to open GGUF file\n");
         return 1;
+    }
+
+    int arch_idx = gguf_find_key(gguf, "general.architecture");
+    if (arch_idx >= 0 && gguf->kv[arch_idx].type == GGUF_TYPE_STRING &&
+        strcmp(gguf->kv[arch_idx].value.str.str, "deepseek4") == 0) {
+        fprintf(stderr, "deepseek4 GGUF detected (%u split shards, %llu tensors), "
+                "but the generic Qwen/Gemma HIP runner does not implement the "
+                "DeepSeek4 graph; use the DS4F backend or add its tensor adapter.\n",
+                gguf->n_parts, (unsigned long long)gguf->n_tensors);
+        gguf_close(gguf);
+        return 2;
     }
 
     /* Load tokenizer */

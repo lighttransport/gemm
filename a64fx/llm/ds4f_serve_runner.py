@@ -85,7 +85,9 @@ class Serve(object):
         self.logits = lib.ds4f_serve_logits(self._s, ctypes.byref(ctypes.c_int(0)))
 
     def close(self):
-        self.lib.ds4f_serve_close(self._s)
+        if self._s:
+            self.lib.ds4f_serve_close(self._s)
+            self._s = None
 
     def prefill(self, ids, pos0):
         arr = (ctypes.c_int * len(ids))(*ids)
@@ -120,6 +122,7 @@ def env_i(k, d):
 def run_serve(sess, base, prefix_cache, slots):
     req = base + ".req"; resp = base + ".resp"
     reqseq = base + ".reqseq"; respseq = base + ".respseq"
+    error = base + ".error"
     # per-slot cache paths (slot 0 is the live context; others are switched in)
     slot_path = [base + ".slot.%d" % i for i in range(slots)]
     syscache = os.environ.get("DS4F_SERVE_SYSCACHE")
@@ -141,39 +144,57 @@ def run_serve(sess, base, prefix_cache, slots):
         if rs <= done:
             time.sleep(0.005)
             continue
-        # read the request body
-        body = open(req).read().splitlines()
-        hdr = body[0].split()
-        if len(hdr) < 9:
-            print("[runner] bad header: %r" % hdr, file=sys.stderr, flush=True)
-            done = rs
-            continue
-        max_new, temp, top_p, top_k = int(hdr[0]), float(hdr[1]), float(hdr[2]), int(hdr[3])
-        pres, rep, seed, slot, ctl = (float(hdr[4]), float(hdr[5]), int(hdr[6]),
-                                      int(hdr[7]), int(hdr[8]))
-        li = 1
-        cache_path = None
-        save_path = None
-        if ctl != 0 and len(body) > li:
+        prompt = []
+        t0 = time.time()
+        try:
+            # Read and validate the complete request before touching the session.
+            with open(req) as f:
+                body = f.read().splitlines()
+            if not body:
+                raise ValueError("empty request")
+            hdr = body[0].split()
+            if len(hdr) < 9:
+                raise ValueError("bad header: %r" % hdr)
+            max_new, temp, top_p, top_k = int(hdr[0]), float(hdr[1]), float(hdr[2]), int(hdr[3])
+            pres, rep, seed, slot, ctl = (float(hdr[4]), float(hdr[5]), int(hdr[6]),
+                                          int(hdr[7]), int(hdr[8]))
+            li = 1
+            cache_path = None
+            save_path = None
             if ctl & 1:
+                if len(body) <= li: raise ValueError("missing cache path")
                 cache_path = body[li]; li += 1
             if ctl & 2:
+                if len(body) <= li: raise ValueError("missing save path")
                 save_path = body[li]; li += 1
-        prompt = [int(x) for x in body[li].split()] if len(body) > li else []
-
-        t0 = time.time()
-        stream_path = (base + ".tok") if (ctl & 4) else None
-        gen = generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
-                       slot, ctl, cache_path, prefix_cache, slots, slot_path,
-                       stream_path, save_path)
-        with open(resp, "w") as f:
-            f.write(" ".join(map(str, gen)))
+            prompt = [int(x) for x in body[li].split()] if len(body) > li else []
+            stream_path = (base + ".tok") if (ctl & 4) else None
+            gen = generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
+                           slot, ctl, cache_path, prefix_cache, slots, slot_path,
+                           stream_path, save_path)
+            payload = " ".join(map(str, gen))
+            try: os.unlink(error)
+            except FileNotFoundError: pass
+        except Exception as exc:
+            gen = []
+            payload = ""
+            message = "%s: %s" % (type(exc).__name__, exc)
+            print("[runner] seq %d FAILED: %s" % (rs, message), file=sys.stderr, flush=True)
+            tmp = "%s.tmp.%d" % (error, os.getpid())
+            with open(tmp, "w") as f:
+                f.write(message + "\n")
+            os.replace(tmp, error)
+        tmp = "%s.tmp.%d" % (resp, os.getpid())
+        with open(tmp, "w") as f:
+            f.write(payload)
+        os.replace(tmp, resp)
         done = rs
         with open(respseq, "w") as f:
             f.write(str(rs))
+        elapsed = max(time.time() - t0, 1e-6)
         print("[runner] seq %d ids=%d gen=%d %.2fs (%.2f tok/s)" %
-              (rs, len(prompt), len(gen), time.time() - t0,
-               (len(gen) / max(time.time() - t0, 1e-6)) if gen else 0.0),
+              (rs, len(prompt), len(gen), elapsed,
+               (len(gen) / elapsed) if gen else 0.0),
               file=sys.stderr, flush=True)
 
 
@@ -214,17 +235,21 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
                       file=sys.stderr, flush=True)
             sess.reset()
             if prompt:
-                sess.prefill(prompt, 0)
+                if sess.prefill(prompt, 0) != 0:
+                    raise RuntimeError("full prefill failed")
         else:
             tail = prompt[cached:]
             if tail:
-                sess.prefill(tail, cached)
+                if sess.prefill(tail, cached) != 0:
+                    raise RuntimeError("cached-tail prefill failed")
     elif prefix_cache and slots > 1 and os.path.exists(slot_path[slot % slots]):
-        sess.kv_restore(slot_path[slot % slots])
+        if sess.kv_restore(slot_path[slot % slots]) != 0:
+            raise RuntimeError("slot KV restore failed")
         cached = sess.pos()
         tail = prompt[cached:]
         if tail:
-            sess.prefill(tail, cached)
+            if sess.prefill(tail, cached) != 0:
+                raise RuntimeError("slot-tail prefill failed")
     else:
         # a fresh (no-cache, no-slot) request carries the full conversation;
         # the session must start at position 0 or the KV is written at the
@@ -232,7 +257,8 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
         if sess.pos() != 0:
             sess.reset()
         if prompt:
-            sess.prefill(prompt, 0)
+            if sess.prefill(prompt, 0) != 0:
+                raise RuntimeError("prefill failed")
 
     # the generation loop: sample + decode until max_new or EOS
     out = []
@@ -242,9 +268,13 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
         tf = open(stream_path, "w")
     for _ in range(max_new):
         tok = sess.sample(sp)
+        if tok < 0:
+            raise RuntimeError("sampling failed")
         if tok == sess.eos:
             break
         ar = sess.decode(tok, pos)
+        if ar < 0:
+            raise RuntimeError("decode failed at position %d" % pos)
         out.append(tok)
         pos += 1
         if tf is not None:
@@ -265,11 +295,14 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
     if ctl & 2 and spath:
         _ts = time.time()
         saved = sess.kv_save(spath)
+        if saved != 0:
+            raise RuntimeError("KV save failed: %s" % spath)
         if _dbg:
             print("[runner] kv_save %.2fs rc=%s" % (time.time() - _ts, saved),
                   file=sys.stderr, flush=True)
     elif prefix_cache and slots > 1:
-        sess.kv_save(slot_path[slot % slots])
+        if sess.kv_save(slot_path[slot % slots]) != 0:
+            raise RuntimeError("slot KV save failed")
     return out
 
 
