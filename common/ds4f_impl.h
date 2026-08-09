@@ -591,7 +591,7 @@ static void ds4f_matvec_blockdiag(ds4f_model *m, float *dst, const ds4f_tensor *
  * mHC mixes) falls back to a per-token matvec loop. K-tile reassociation makes the
  * result bit-SIMILAR (~1e-4) to the single-token matvec. */
 #ifndef DS4F_MAX_MTILE
-#define DS4F_MAX_MTILE 256          /* >=256 so each owned expert gets ~6 tokens to batch */
+#define DS4F_MAX_MTILE 256          /* K=256 is the measured best memory/performance point */
 #endif
 typedef struct { ds4f_model *m; float *Y; const ds4f_tensor *t;
                  const float *X; int M, Ystride, Xstride; } ds4f_gemm_task;
@@ -4679,8 +4679,12 @@ static void ds4f_hc_pre_batch(ds4f_model *m, const float *x4b, int K, const floa
                               const float *scale, const float *base, float *yb,
                               float *postb, int pstr, float *combb, int cstr, float *residb) {
     ds4f_config *c=&m->cfg; int hc=c->hc_mult,C=c->hidden,hd=hc*C,mix_hc=(2+hc)*hc;
-    if (K<1 || K>128) { fprintf(stderr,"ds4f_hc_pre_batch: K=%d\n",K); abort(); }
-    float *mixb=(float *)alloca((size_t)K*mix_hc*4), *ssb=(float *)alloca((size_t)K*4), *preb=(float *)alloca((size_t)K*hc*4);
+    if (K<1 || K>DS4F_MAX_MTILE) { fprintf(stderr,"ds4f_hc_pre_batch: K=%d\n",K); abort(); }
+    /* K=256 makes the old alloca scratch needlessly large and compiler/stack
+     * dependent.  Keep the tile temporaries heap-backed and release them only
+     * after the final pooled consumer has joined. */
+    float *mixb=(float *)malloc((size_t)K*mix_hc*4), *ssb=(float *)malloc((size_t)K*4), *preb=(float *)malloc((size_t)K*hc*4);
+    if (!mixb || !ssb || !preb) { fprintf(stderr,"ds4f_hc_pre_batch: K=%d scratch allocation failed\n",K); free(mixb); free(ssb); free(preb); abort(); }
     ds4f_hcmix_b_task mt={fn,x4b,mixb,mix_hc,hd,K};
     static int s_b8=-1; if(s_b8<0){const char *e=getenv("DS4F_HC_BATCH8");s_b8=e&&atoi(e);}
 #if defined(__ARM_FEATURE_SVE)
@@ -4694,6 +4698,7 @@ static void ds4f_hc_pre_batch(ds4f_model *m, const float *x4b, int K, const floa
     else for (int k=0;k<K;k++) ds4f_hc_sinkhorn(mixb+(size_t)k*mix_hc,scale,base,hc,c->hc_iters,c->hc_eps,
         preb+(size_t)k*hc,postb+(size_t)k*pstr,combb+(size_t)k*cstr);
     ds4f_hccol_b_task ct={x4b,preb,yb,residb,hc,C,K}; ds4f_pool_run(m->pool,ds4f_hccol_b_worker,&ct);
+    free(mixb); free(ssb); free(preb);
 }
 static void ds4f_hc_post_batch(ds4f_model *m, float *x4b, int K, const float *residb, const float *fb,
                                const float *postb, int pstr, const float *combb, int cstr) {
