@@ -11,7 +11,10 @@ int main(int argc,char **argv){
     int M=argc>2?atoi(argv[2]):3072,nthr=argc>3?atoi(argv[3]):16,ncmg=argc>4?atoi(argv[4]):2,zc=argc>5?atoi(argv[5]):1,w4a8=argc>6?atoi(argv[6]):1;setenv("DS4F_PREFILL_LAST_LOGITS","1",0);if(!getenv("DS4F_PROF"))setenv("DS4F_PROF","1",0);
     ds4f_runtime_options o;ds4f_runtime_options_init(&o);o.cfg=ds4f_default_config();o.ep_size=8;o.ep_rank=0;o.n_threads=nthr;o.n_cmgs=ncmg;o.mxfp4_w4a8=w4a8;o.zero_copy_experts=zc;
     snprintf(o.stage_dir,sizeof(o.stage_dir),"%s",argv[1]);ds4f_model *m=ds4f_load_real_opts(&o);if(!m)return 3;
-    setenv("DS4F_CUDA_MXFP4_CACHE_MB","512",0);
+    /* The 16 GiB SM120 card fits the dense bank plus a 4 GiB routed-expert
+     * cache; 512 MiB causes avoidable LRU churn, while 8 GiB cannot bind the
+     * complete dense bank.  Preserve an explicit environment override. */
+    setenv("DS4F_CUDA_MXFP4_CACHE_MB","4096",0);
     cuda_ds4f_dense *c=cuda_ds4f_dense_create(0,0);if(!c)return 4;int nbind=0;
     for(int L=0;L<m->cfg.n_layers;L++){ds4f_layer *z=&m->layers[L];ds4f_tensor *ts[]={&z->wq_a,&z->wq_b,&z->wkv,&z->wo_a,&z->wo_b,&z->sh_w1,&z->sh_w3,&z->sh_w2};
         for(size_t i=0;i<sizeof(ts)/sizeof(ts[0]);i++)if(cuda_ds4f_dense_bind_tensor(c,ts[i])<0){fprintf(stderr,"bind failed L=%d i=%zu\n",L,i);return 5;}else nbind++;}
