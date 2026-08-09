@@ -8,7 +8,7 @@
 static double now_s(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 int main(int argc,char **argv){
     if(argc<2){fprintf(stderr,"usage: %s STAGE_DIR [M] [THREADS] [CMGS] [ZEROCOPY] [W4A8]\n",argv[0]);return 2;}
-    int M=argc>2?atoi(argv[2]):3072,nthr=argc>3?atoi(argv[3]):16,ncmg=argc>4?atoi(argv[4]):2,zc=argc>5?atoi(argv[5]):1,w4a8=argc>6?atoi(argv[6]):1;setenv("DS4F_PREFILL_LAST_LOGITS","1",0);setenv("DS4F_PROF","1",0);
+    int M=argc>2?atoi(argv[2]):3072,nthr=argc>3?atoi(argv[3]):16,ncmg=argc>4?atoi(argv[4]):2,zc=argc>5?atoi(argv[5]):1,w4a8=argc>6?atoi(argv[6]):1;setenv("DS4F_PREFILL_LAST_LOGITS","1",0);if(!getenv("DS4F_PROF"))setenv("DS4F_PROF","1",0);
     ds4f_runtime_options o;ds4f_runtime_options_init(&o);o.cfg=ds4f_default_config();o.ep_size=8;o.ep_rank=0;o.n_threads=nthr;o.n_cmgs=ncmg;o.mxfp4_w4a8=w4a8;o.zero_copy_experts=zc;
     snprintf(o.stage_dir,sizeof(o.stage_dir),"%s",argv[1]);ds4f_model *m=ds4f_load_real_opts(&o);if(!m)return 3;
     setenv("DS4F_CUDA_MXFP4_CACHE_MB","512",0);
