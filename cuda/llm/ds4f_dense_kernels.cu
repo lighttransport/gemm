@@ -36,6 +36,14 @@ extern "C" __global__ void ds4f_cuda_swiglu(
 extern "C" __global__ void ds4f_cuda_scatter_group(float *dst,const float *src,
         int M,int width,int stride,int off){size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x,n=(size_t)M*width;if(i<n){int r=(int)(i/width),c=(int)(i%width);dst[(size_t)r*stride+off+c]=src[i];}}
 
+extern "C" __global__ void ds4f_cuda_argmax(int *out,const float *x,int n){
+    __shared__ float sv[256];__shared__ int si[256];int t=threadIdx.x,bi=t;float bv=-INFINITY;
+    for(int i=t;i<n;i+=blockDim.x){float v=x[i];if(v>bv||(v==bv&&i<bi)){bv=v;bi=i;}}
+    sv[t]=bv;si[t]=bi;__syncthreads();
+    for(int d=128;d;d>>=1){if(t<d){float v=sv[t+d];int i=si[t+d];if(v>sv[t]||(v==sv[t]&&i<si[t])){sv[t]=v;si[t]=i;}}__syncthreads();}
+    if(!t)*out=si[0];
+}
+
 /* Per-row, per-32 activation quantization for SM120 native MXFP8. */
 extern "C" __global__ void ds4f_cuda_quant_fp8_vec128(
         uint8_t *Q, uint8_t *scale, const float *X, int rows, int cols) {
@@ -58,6 +66,16 @@ extern "C" __global__ void ds4f_cuda_quant_fp8_vec128(
         __nv_fp8_e4m3 q = __nv_fp8_e4m3(v / s);
         Q[(size_t)r * cols + k] = *(const uint8_t *)&q;
     }
+}
+
+extern "C" __global__ void ds4f_cuda_quant_fp8_strided(
+        uint8_t *Q,uint8_t *scale,const float *X,int rows,int cols,int stride,int xoff){
+    int r=blockIdx.y,b=blockIdx.x,lane=threadIdx.x,k=b*32+lane;
+    float v=r<rows&&k<cols?X[(size_t)r*stride+xoff+k]:0.f,a=fabsf(v);
+    for(int d=16;d;d>>=1)a=fmaxf(a,__shfl_xor_sync(0xffffffff,a,d));a=__shfl_sync(0xffffffff,a,0);
+    int ep=a>0.f?(int)ceilf(log2f(a/448.f)):0;ep=max(-127,min(127,ep));float s=ldexpf(1.f,ep);
+    if(lane==0){int nb=(cols+31)/32,nti=(nb+3)/4;size_t so=(size_t)((b>>2)+(r>>7)*nti)*512+(size_t)(r&31)*16+(size_t)((r&127)>>5)*4+(b&3);scale[so]=(uint8_t)(ep+127);}
+    if(r<rows&&k<cols){__nv_fp8_e4m3 q=__nv_fp8_e4m3(v/s);Q[(size_t)r*cols+k]=*(const uint8_t *)&q;}
 }
 
 __device__ __forceinline__ float ds4f_fp8_e4m3fn(uint8_t v) {

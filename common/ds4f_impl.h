@@ -142,15 +142,15 @@ static int ds4f_pin(int tid, int nthr, int n_cmgs) {
     return pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 #elif (defined(__x86_64__) || defined(__i386__)) && defined(__linux__)
-/* One thread per PHYSICAL core while the pool fits: on Zen1 the SMT siblings
- * share the load/store unit, so they add no gather bandwidth (measured: 32
- * threads 42.7 GB/s vs 47.6 at 16 -- hetero/ds4f/README.md). CPU ids alternate
- * between the two SMT threads of a core, hence the *2. */
+/* Linux exposes this Zen1 host as physical cores 0..15 followed by their SMT
+ * siblings 16..31 (verify via lscpu -p=CPU,CORE). Keep <=16-thread pools on
+ * distinct physical cores; larger pools add the sibling range. */
 static int ds4f_pin(int tid, int nthr, int n_cmgs) {
+    (void)nthr;
     (void)n_cmgs;
     int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu <= 0) return -1;
-    int cpu = (nthr <= ncpu / 2) ? (tid * 2) : tid;
+    int cpu = tid;
     if (cpu >= ncpu) cpu = tid % ncpu;
     cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
     return pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
@@ -6546,6 +6546,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
             for (int i = 0; i < C; i++) x[i] += o[i]; }
         DS4F_TOC(DS4F_P_OPROJ); }
         /* ---- FFN: shared expert ---- */
+        int shared_async = 0;
         { DS4F_TIC();
         { ds4f_pf_rms_task t = { m, m->p_h2, m->p_x, ly->ffn_norm, C, M, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
@@ -6557,7 +6558,12 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
          * never cross host memory.  Only the untiled (non-TP) case qualifies;
          * the backend declines any tensor kind it does not handle. */
         int shared_fused = 0;
-        if (!tps && !tps2 && m->gpu_shared_ffn && !m->gpu_exact_prefill &&
+        if (!tps && !tps2 && m->gpu_shared_ffn_begin && m->gpu_shared_ffn_wait && !m->gpu_exact_prefill &&
+            ly->sh_w1.gpu_id >= 0 && ly->sh_w3.gpu_id >= 0 && ly->sh_w2.gpu_id >= 0)
+            shared_fused = shared_async = m->gpu_shared_ffn_begin(
+                m->gpu_dense_ctx, m->p_moe, &ly->sh_w1, &ly->sh_w3, &ly->sh_w2,
+                m->p_h2, M, c->shared_inter, C, c->swiglu_limit) == 0;
+        else if (!tps && !tps2 && m->gpu_shared_ffn && !m->gpu_exact_prefill &&
             ly->sh_w1.gpu_id >= 0 && ly->sh_w3.gpu_id >= 0 && ly->sh_w2.gpu_id >= 0)
             shared_fused = m->gpu_shared_ffn(
                 m->gpu_dense_ctx, m->p_moe, &ly->sh_w1, &ly->sh_w3, &ly->sh_w2,
@@ -6664,6 +6670,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
             }
         }
         DS4F_TOC(DS4F_P_EXPERTS); }
+        if(shared_async && m->gpu_shared_ffn_wait(m->gpu_dense_ctx,m->p_moe,M,C)!=0){fprintf(stderr,"ds4f: async shared FFN wait failed\n");abort();}
         /* ---- EP combine: ONE [M,C] all-reduce (amortizes the per-op latency by M). Under TP_SHARED
          * the partial shared p_moe is folded into p_route FIRST so it rides the same reduce. ---- */
         if (tps) for (int mm = 0; mm < M; mm++) {
@@ -6699,10 +6706,12 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
      * each token's local argmax (global index head_r0+best, local max value) is merged across the shards by
      * ar_argmax_cb (M small 2-float argmax all-reduces, ONCE -- cheap, unlike a full [M,vocab] logit reduce). */
     int hrows = m->head.rows, tph = (hrows < c->vocab);
-    ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, HM, hrows, C);
+    int head_on_gpu = last_only && !tph && m->gpu_head_argmax &&
+        m->gpu_head_argmax(m->gpu_dense_ctx,out_tok+M-1,&m->head,m->p_hn,C)==0;
+    if(!head_on_gpu) ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, HM, hrows, C);
     if (last_only) for (int mm = 0; mm < M - 1; ++mm) out_tok[mm] = -1;
     int *hout = last_only ? out_tok + M - 1 : out_tok;
-    { float *hval = tph ? (float *)alloca((size_t)HM*4) : NULL;
+    if(!head_on_gpu) { float *hval = tph ? (float *)alloca((size_t)HM*4) : NULL;
       ds4f_pf_argmax_task t = { m->p_logits, hout, hrows, HM, m->head_r0, hval };
       ds4f_pool_run(m->pool, ds4f_pf_argmax_worker, &t);
       if (tph && m->ar_argmax_cb)

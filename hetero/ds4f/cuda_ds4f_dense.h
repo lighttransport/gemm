@@ -21,11 +21,18 @@ int cuda_ds4f_dense_prefill_attention(void *ctx,float *dst,const float *q,
 int cuda_ds4f_dense_oproj(void *ctx,float *dst,const ds4f_tensor *wa,
     const ds4f_tensor *wb,const float *x,int M,int groups,int gin,int lora,
     int H,int C,int ointer);
+int cuda_ds4f_dense_head_argmax(void *ctx,int *token,const ds4f_tensor *head,
+    const float *x,int cols);
 int cuda_ds4f_dense_shared_ffn(void *ctx, float *dst,
                                const ds4f_tensor *w1,
                                const ds4f_tensor *w3,
                                const ds4f_tensor *w2,
                                const float *x, int M, int inter, int C,
                                float lim);
+int cuda_ds4f_dense_shared_ffn_begin(void *ctx,float *dst,
+                               const ds4f_tensor *w1,const ds4f_tensor *w3,
+                               const ds4f_tensor *w2,const float *x,int M,
+                               int inter,int C,float lim);
+int cuda_ds4f_dense_shared_ffn_wait(void *ctx,float *dst,int M,int C);
 
 #endif

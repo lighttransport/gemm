@@ -21,9 +21,11 @@ struct cuda_ds4f_dense {
     CUmodule module;
     CUfunction gemm;
     CUfunction quant;
+    CUfunction quant_strided;
     CUfunction swiglu;
     CUfunction attn;
     CUfunction scatter;
+    CUfunction argmax;
     CUstream stream;
     cublasew_context *blas;
     cuda_ds4f_mxfp4 *mx;
@@ -39,6 +41,7 @@ struct cuda_ds4f_dense {
     size_t xcap, ycap, resident;
     CUdeviceptr aq,ak,as,ay;size_t aqc,akc,asc,ayc;
     CUdeviceptr ox,ot,oi,oy;size_t oxc,otc,oic,oyc;
+    CUdeviceptr argmax_out;
     int verbose;
 };
 
@@ -63,9 +66,11 @@ cuda_ds4f_dense *cuda_ds4f_dense_create(int device_id, int verbose) {
     if (cu_ok(rc, "load ds4f_dense_kernels.cubin") ||
         cu_ok(cuModuleGetFunction(&c->gemm, c->module, "ds4f_cuda_dense_gemm"), "dense gemm") ||
         cu_ok(cuModuleGetFunction(&c->quant, c->module, "ds4f_cuda_quant_fp8_vec128"), "fp8 quant") ||
+        cu_ok(cuModuleGetFunction(&c->quant_strided,c->module,"ds4f_cuda_quant_fp8_strided"),"strided fp8 quant") ||
         cu_ok(cuModuleGetFunction(&c->swiglu, c->module, "ds4f_cuda_swiglu"), "swiglu")) goto fail;
     if(cu_ok(cuModuleGetFunction(&c->attn,c->module,"ds4f_cuda_prefill_attn"),"prefill attn"))goto fail;
     if(cu_ok(cuModuleGetFunction(&c->scatter,c->module,"ds4f_cuda_scatter_group"),"scatter group"))goto fail;
+    if(cu_ok(cuModuleGetFunction(&c->argmax,c->module,"ds4f_cuda_argmax"),"argmax"))goto fail;
     if (cublasewInit() != 0 || cublasewCreate(&c->blas, c->stream) != 0) goto fail;
     c->mx = cuda_ds4f_mxfp4_create(device_id, verbose);
     if (!c->mx) goto fail;
@@ -94,6 +99,7 @@ void cuda_ds4f_dense_destroy(cuda_ds4f_dense *c) {
     if(c->oi)cuMemFree(c->oi);
     if(c->ot)cuMemFree(c->ot);
     if(c->ox)cuMemFree(c->ox);
+    if(c->argmax_out)cuMemFree(c->argmax_out);
     if (c->ffn_y) cuMemFree(c->ffn_y);
     if (c->ffn_u) cuMemFree(c->ffn_u);
     if (c->ffn_g) cuMemFree(c->ffn_g);
@@ -197,6 +203,15 @@ static int native_gemm_device(cuda_ds4f_dense *c, CUdeviceptr dy,
                                                  c->dxq,c->dxs,M,N,K);
 }
 
+static int native_gemm_device_strided(cuda_ds4f_dense *c,CUdeviceptr dy,
+    const cuda_ds4f_matrix *a,CUdeviceptr dx,int M,int stride,int off){
+    int N=a->rows,K=a->cols,nb=(K+31)/32,nti=(nb+3)/4;size_t qb=(size_t)M*K,sb=(size_t)((M+127)/128)*nti*512;
+    if(a->kind||grow(&c->dxq,&c->xqcap,qb)||grow(&c->dxs,&c->xscap,sb))return -1;
+    cuMemsetD8Async(c->dxs,0,sb,c->stream);void *qa[]={&c->dxq,&c->dxs,&dx,&M,&K,&stride,&off};
+    if(cuLaunchKernel(c->quant_strided,(K+31)/32,M,1,32,1,1,0,c->stream,qa,NULL)!=CUDA_SUCCESS)return -1;
+    return cublasew_gemm_fp8_scaled_rowmajor_nt(c->blas,dy,a->w,a->sf,c->dxq,c->dxs,M,N,K);
+}
+
 int cuda_ds4f_dense_gemm_tensor(void *opaque, float *dst,
                                 const ds4f_tensor *t, const float *x,
                                 int M, int Ys, int Xs) {
@@ -280,14 +295,12 @@ int cuda_ds4f_dense_oproj(void *opaque,float *dst,const ds4f_tensor *wa,
     cuda_ds4f_matrix base=c->mat[wa->gpu_id],b=c->mat[wb->gpu_id];
     if(base.kind||b.kind||base.rows!=ointer||base.cols!=gin||b.rows!=C||b.cols!=ointer)return -1;
     size_t xb=(size_t)M*H*4,tb=(size_t)M*lora*4,ib=(size_t)M*ointer*4,yb=(size_t)M*C*4;
-    if(grow_host(&c->hx,&c->hxcap,xb)||grow(&c->ox,&c->oxc,xb)||grow(&c->ot,&c->otc,tb)||grow(&c->oi,&c->oic,ib)||grow(&c->oy,&c->oyc,yb))return -1;
-    for(int g=0;g<groups;g++)for(int mm=0;mm<M;mm++)memcpy(c->hx+((size_t)g*M+mm)*gin,x+(size_t)mm*H+(size_t)g*gin,(size_t)gin*4);
-    if(cuMemcpyHtoDAsync(c->ox,c->hx,xb,c->stream)!=CUDA_SUCCESS)return -1;
+    if(grow(&c->ox,&c->oxc,xb)||grow(&c->ot,&c->otc,tb)||grow(&c->oi,&c->oic,ib)||grow(&c->oy,&c->oyc,yb))return -1;
+    if(cuMemcpyHtoDAsync(c->ox,x,xb,c->stream)!=CUDA_SUCCESS)return -1;
     int nti=(((gin+31)/32)+3)/4;
     for(int g=0;g<groups;g++){
         cuda_ds4f_matrix a=base;a.rows=lora;a.w+=(size_t)g*lora*gin;a.sf+=(size_t)(g*lora/128)*nti*512;
-        CUdeviceptr gx=c->ox+(size_t)g*M*gin*4;
-        if(native_gemm_device(c,c->ot,&a,gx,M))return -1;
+        if(native_gemm_device_strided(c,c->ot,&a,c->ox,M,H,g*gin))return -1;
         int off=g*lora;size_t n=(size_t)M*lora;void *sa[]={&c->oi,&c->ot,&M,&lora,&ointer,&off};
         if(cuLaunchKernel(c->scatter,(unsigned)((n+255)/256),1,1,256,1,1,0,c->stream,sa,NULL)!=CUDA_SUCCESS)return -1;
     }
@@ -295,7 +308,26 @@ int cuda_ds4f_dense_oproj(void *opaque,float *dst,const ds4f_tensor *wa,
     return 0;
 }
 
-int cuda_ds4f_dense_shared_ffn(void *opaque, float *dst,
+int cuda_ds4f_dense_head_argmax(void *opaque,int *token,const ds4f_tensor *head,
+    const float *x,int cols){
+    cuda_ds4f_dense *c=(cuda_ds4f_dense *)opaque;
+    if(!c||!token||!head||!x||head->gpu_id<0||head->gpu_id>=c->nmat||
+       head->cols!=cols)return -1;
+    cuda_ds4f_matrix *a=&c->mat[head->gpu_id];size_t xb=(size_t)cols*4,yb=(size_t)head->rows*4;
+    if(grow(&c->dx,&c->xcap,xb)||grow(&c->dy,&c->ycap,yb)||
+       (!c->argmax_out&&cuMemAlloc(&c->argmax_out,4)!=CUDA_SUCCESS)||
+       cuMemcpyHtoDAsync(c->dx,x,xb,c->stream)!=CUDA_SUCCESS)return -1;
+    int N=head->rows,K=cols,M=1,kind=a->kind,sc=a->scale_cols;
+    void *ga[]={&c->dy,&a->w,&a->s,&c->dx,&N,&K,&M,&sc,&kind};
+    if(cuLaunchKernel(c->gemm,(N+31)/32,1,1,256,1,1,0,c->stream,ga,NULL)!=CUDA_SUCCESS)return -1;
+    void *aa[]={&c->argmax_out,&c->dy,&N};
+    if(cuLaunchKernel(c->argmax,1,1,1,256,1,1,0,c->stream,aa,NULL)!=CUDA_SUCCESS||
+       cuMemcpyDtoHAsync(token,c->argmax_out,4,c->stream)!=CUDA_SUCCESS||
+       cuStreamSynchronize(c->stream)!=CUDA_SUCCESS)return -1;
+    return 0;
+}
+
+int cuda_ds4f_dense_shared_ffn_begin(void *opaque, float *dst,
                                const ds4f_tensor *w1,
                                const ds4f_tensor *w3,
                                const ds4f_tensor *w2,
@@ -315,8 +347,20 @@ int cuda_ds4f_dense_shared_ffn(void *opaque, float *dst,
        native_gemm_device(c,c->ffn_u,b,c->ffn_x,M))return -1;
     size_t ne=(size_t)M*inter;void *sa[]={&c->ffn_g,&c->ffn_u,&ne,&lim};
     if(cuLaunchKernel(c->swiglu,(unsigned)((ne+255)/256),1,1,256,1,1,0,c->stream,sa,NULL)!=CUDA_SUCCESS||
-       native_gemm_device(c,c->ffn_y,d,c->ffn_g,M)||
-       cuMemcpyDtoHAsync(dst,c->ffn_y,xb,c->stream)!=CUDA_SUCCESS||
-       cuStreamSynchronize(c->stream)!=CUDA_SUCCESS)return -1;
+       native_gemm_device(c,c->ffn_y,d,c->ffn_g,M))return -1;
+    (void)dst;
     return 0;
+}
+
+int cuda_ds4f_dense_shared_ffn_wait(void *opaque,float *dst,int M,int C){
+    cuda_ds4f_dense *c=(cuda_ds4f_dense *)opaque;size_t xb=(size_t)M*C*4;
+    if(!c||!dst||!c->ffn_y||cuMemcpyDtoHAsync(dst,c->ffn_y,xb,c->stream)!=CUDA_SUCCESS||cuStreamSynchronize(c->stream)!=CUDA_SUCCESS)return -1;
+    return 0;
+}
+
+int cuda_ds4f_dense_shared_ffn(void *opaque,float *dst,const ds4f_tensor *w1,
+    const ds4f_tensor *w3,const ds4f_tensor *w2,const float *x,int M,int inter,
+    int C,float lim){
+    if(cuda_ds4f_dense_shared_ffn_begin(opaque,dst,w1,w3,w2,x,M,inter,C,lim))return -1;
+    return cuda_ds4f_dense_shared_ffn_wait(opaque,dst,M,C);
 }
