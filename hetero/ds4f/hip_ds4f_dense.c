@@ -133,6 +133,7 @@ struct hip_ds4f_dense {
     hipFunction_t prefill_attn;
     hipFunction_t prefill_attn_wmma;
     hipFunction_t apply_rope;
+    hipFunction_t rmsnorm_bf16;
     hipFunction_t gemm_fp8_grouped_wmma;
     hipFunction_t gemm_fp8_grouped_wmma64;
 
@@ -184,6 +185,8 @@ struct hip_ds4f_dense {
     size_t rope_c_bytes, rope_s_bytes;
     const float *rope_host_c, *rope_host_s;
     int rope_host_pos, rope_host_m, rope_host_pairs;
+    void *qkv_x, *qkv_lat, *qkv_norm, *qkv_q, *qkv_kv, *qkv_norm_w;
+    size_t qkv_x_b, qkv_lat_b, qkv_norm_b, qkv_q_b, qkv_kv_b, qkv_norm_w_b;
     void *gemm_multi_dy[HIP_DS4F_GEMM_MAX];
     size_t gemm_multi_y_bytes[HIP_DS4F_GEMM_MAX];
     const ds4f_layer *stream_layer;
@@ -403,6 +406,7 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
     hipModuleGetFunction(&ctx->prefill_attn_wmma, ctx->module,
                          "ds4f_dense_prefill_attn_wmma");
     hipModuleGetFunction(&ctx->apply_rope, ctx->module, "ds4f_apply_rope");
+    hipModuleGetFunction(&ctx->rmsnorm_bf16, ctx->module, "ds4f_rmsnorm_bf16");
     hipModuleGetFunction(&ctx->gemm_fp8_grouped_wmma, ctx->module, "ds4f_dense_fp8_grouped_wmma");
     hipModuleGetFunction(&ctx->gemm_fp8_grouped_wmma64, ctx->module, "ds4f_dense_fp8_grouped_wmma64");
     /* The fused shared-FFN SwiGLU lives in its own module, ALWAYS compiled
@@ -534,6 +538,12 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (ctx->attn_y) hipFree(ctx->attn_y);
     if (ctx->rope_c) hipFree(ctx->rope_c);
     if (ctx->rope_s) hipFree(ctx->rope_s);
+    if (ctx->qkv_x) hipFree(ctx->qkv_x);
+    if (ctx->qkv_lat) hipFree(ctx->qkv_lat);
+    if (ctx->qkv_norm) hipFree(ctx->qkv_norm);
+    if (ctx->qkv_q) hipFree(ctx->qkv_q);
+    if (ctx->qkv_kv) hipFree(ctx->qkv_kv);
+    if (ctx->qkv_norm_w) hipFree(ctx->qkv_norm_w);
     if (ctx->op_dy) hipFree(ctx->op_dy);
     if (ctx->op_di) hipFree(ctx->op_di);
     if (ctx->op_yt) hipFree(ctx->op_yt);
@@ -1784,6 +1794,34 @@ static int ensure_dev_buf(void **buf, size_t *cap, size_t bytes) {
     if (hipMalloc(&p, bytes) != hipSuccess) return -1;
     if (*buf) hipFree(*buf);
     *buf = p; *cap = bytes;
+    return 0;
+}
+
+int hip_ds4f_dense_prefill_qkv(void *opaque, float *q, float *kv, const float *x,
+    const ds4f_tensor *wqa, const ds4f_tensor *wkv, const ds4f_tensor *wqb,
+    const ds4f_tensor *qnorm, int M, int C, int q_lora, int H, int kv_lora) {
+    hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    const hip_ds4f_matrix *ma = NULL, *mk = NULL, *mb = NULL;
+    if (!ctx || !q || !kv || !x || !wqa || !wkv || !wqb || !qnorm || M < 1 ||
+        wqa->gpu_id < 0 || wkv->gpu_id < 0 || wqb->gpu_id < 0 ||
+        matrix_get(ctx, wqa->gpu_id, &ma) != 0 || matrix_get(ctx, wkv->gpu_id, &mk) != 0 ||
+        matrix_get(ctx, wqb->gpu_id, &mb) != 0 || !matrix_is_fp8(ma->kind) ||
+        !matrix_is_fp8(mk->kind) || !matrix_is_fp8(mb->kind) || qnorm->type != DS4F_BF16)
+        return -1;
+    size_t xb=(size_t)M*C*4, lb=(size_t)M*q_lora*4, kb=(size_t)M*kv_lora*4, qb=(size_t)M*H*4;
+    if (ensure_dev_buf(&ctx->qkv_x,&ctx->qkv_x_b,xb) || ensure_dev_buf(&ctx->qkv_lat,&ctx->qkv_lat_b,lb) ||
+        ensure_dev_buf(&ctx->qkv_norm,&ctx->qkv_norm_b,lb) || ensure_dev_buf(&ctx->qkv_q,&ctx->qkv_q_b,qb) ||
+        ensure_dev_buf(&ctx->qkv_kv,&ctx->qkv_kv_b,kb) || ensure_dev_buf(&ctx->qkv_norm_w,&ctx->qkv_norm_w_b,(size_t)q_lora*2)) return -1;
+    if (hipMemcpyAsync(ctx->qkv_x,x,xb,hipMemcpyHostToDevice,ctx->stream)!=hipSuccess ||
+        hipMemcpyAsync(ctx->qkv_norm_w,qnorm->w,(size_t)q_lora*2,hipMemcpyHostToDevice,ctx->stream)!=hipSuccess) return -1;
+    if (launch_gemm_dev(ctx,ma,0,ctx->qkv_lat,ctx->qkv_x,q_lora,C,M)!=0 ||
+        launch_gemm_dev(ctx,mk,0,ctx->qkv_kv,ctx->qkv_x,kv_lora,C,M)!=0) return -1;
+    int n=q_lora; float eps=1.0e-6f; void *na[]={&ctx->qkv_norm,&ctx->qkv_lat,&ctx->qkv_norm_w,&M,&n,&eps};
+    if (!ctx->rmsnorm_bf16 || hipModuleLaunchKernel(ctx->rmsnorm_bf16,(unsigned)M,1,1,256,1,1,0,ctx->stream,na,NULL)!=hipSuccess) return -1;
+    if (launch_gemm_dev(ctx,mb,0,ctx->qkv_q,ctx->qkv_norm,H,q_lora,M)!=0) return -1;
+    if (hipMemcpyAsync(q,ctx->qkv_q,qb,hipMemcpyDeviceToHost,ctx->stream)!=hipSuccess ||
+        hipMemcpyAsync(kv,ctx->qkv_kv,kb,hipMemcpyDeviceToHost,ctx->stream)!=hipSuccess ||
+        hipStreamSynchronize(ctx->stream)!=hipSuccess) return -1;
     return 0;
 }
 

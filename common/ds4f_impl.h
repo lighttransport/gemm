@@ -6484,11 +6484,18 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         { DS4F_TIC();
         { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, ly->attn_norm, C, M, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
-        ds4f_gemm_pair(m, m->p_qlat, &ly->wq_a, m->p_kvlat, &ly->wkv,
-                       m->p_hn, M, c->q_lora, KV, C);
-        { ds4f_pf_rms_task t = { m, m->p_qlat, m->p_qlat, ly->q_norm, c->q_lora, M, c->q_lora, c->q_lora };
-          ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
-        ds4f_gemm(m, m->p_q, &ly->wq_b, m->p_qlat, M, H, c->q_lora);
+        int gpu_qkv = 0;
+        if (m->gpu_prefill_qkv && getenv("DS4F_HIP_QKV_FUSE"))
+            gpu_qkv = m->gpu_prefill_qkv(m->gpu_dense_ctx, m->p_q, m->p_kvlat,
+                m->p_hn, &ly->wq_a, &ly->wkv, &ly->wq_b, &ly->q_norm,
+                M, C, c->q_lora, H, KV) == 0;
+        if (!gpu_qkv) {
+            ds4f_gemm_pair(m, m->p_qlat, &ly->wq_a, m->p_kvlat, &ly->wkv,
+                           m->p_hn, M, c->q_lora, KV, C);
+            { ds4f_pf_rms_task t = { m, m->p_qlat, m->p_qlat, ly->q_norm, c->q_lora, M, c->q_lora, c->q_lora };
+              ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
+            ds4f_gemm(m, m->p_q, &ly->wq_b, m->p_qlat, M, H, c->q_lora);
+        }
         { ds4f_pf_qnr_task t = { m, pos0, M, rcos, rsin };
           ds4f_pool_run(m->pool, ds4f_pf_qnr_worker, &t); }
         { ds4f_pf_kv_task t = { m, ly, pos0, M, rcos, rsin };

@@ -695,6 +695,9 @@ static const char hip_ds4f_dense_kernels_src[] =
 "extern \"C\" __global__ void ds4f_scatter_group(float *dst,const float *src,int M,int width,int stride,int off){\n"
 "    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x,n=(size_t)M*width;\n"
 "    if(i<n){int r=(int)(i/width),c=(int)(i%width);dst[(size_t)r*stride+off+c]=src[i];}\n"
+"}\n"
+"extern \"C\" __global__ void ds4f_rmsnorm_bf16(float *Y,const float *X,const u16 *W,int M,int N,float eps){\n"
+" __shared__ float sm[256];int tid=(int)threadIdx.x,row=(int)blockIdx.x;if(row>=M)return;float ss=0.f;for(int i=tid;i<N;i+=256){float v=X[(size_t)row*N+i];ss=fmaf(v,v,ss);}sm[tid]=ss;__syncthreads();for(int d=128;d;d>>=1){if(tid<d)sm[tid]+=sm[tid+d];__syncthreads();}float inv=rsqrtf(sm[0]/(float)N+eps);for(int i=tid;i<N;i+=256)Y[(size_t)row*N+i]=X[(size_t)row*N+i]*inv*bits_to_f32((u32)W[i]<<16);\n"
 "}\n";
 
 /* Fused shared-expert SwiGLU in its OWN HIPRTC module, always compiled precise

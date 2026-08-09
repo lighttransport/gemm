@@ -103,6 +103,9 @@ int hip_ds4f_dense_prefill_attention(
     void *ctx, float *dst, const float *q, const uint16_t *kv,
     const float *sink, int M, int pos0, int n_heads, int head_dim,
     int kv_dim, int kv_slots, int window, float scale);
+int hip_ds4f_dense_prefill_qkv(void *ctx, float *q, float *kv, const float *x,
+    const ds4f_tensor *wqa, const ds4f_tensor *wkv, const ds4f_tensor *wqb,
+    const ds4f_tensor *qnorm, int M, int C, int q_lora, int H, int kv_lora);
 int hip_ds4f_dense_prefill_attn_oproj(void *ctx,float *dst,const float *q,const uint16_t *kv,const float *sink,const float *rcos,const float *rsin,const ds4f_tensor *wa,const ds4f_tensor *wb,int M,int pos0,int n_heads,int head_dim,int kv_dim,int kv_slots,int window,float scale,int rope_offset,int rope_pairs,int groups,int gin,int lora,int H,int C,int ointer);
 /* Pre-upload one local expert layer and retain it in the dense bank. Resident
  * layers are reused by stream_layer callbacks without another H2D transfer. */
