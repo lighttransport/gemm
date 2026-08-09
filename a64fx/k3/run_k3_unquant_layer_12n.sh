@@ -9,7 +9,7 @@ export K3_THREADS=${K3_THREADS:-47}
 export K3_PROFILE=${K3_PROFILE:-1}
 export K3_COMM_DETERMINISTIC=${K3_COMM_DETERMINISTIC:-0}
 export K3_COMM_BF16=${K3_COMM_BF16:-1}
-export K3_AR_GROUPS=${K3_AR_GROUPS:-2}
+export K3_AR_GROUPS=${K3_AR_GROUPS:-3}
 export K3_MOE_SHARD_LAYOUT=${K3_MOE_SHARD_LAYOUT:-row-aligned}
 export K3_CMG_REPLICATE=${K3_CMG_REPLICATE:-1}
 export K3_BF16_PV=${K3_BF16_PV:-1}
@@ -26,9 +26,8 @@ export K3_SERIAL_VECTOR_OPS=${K3_SERIAL_VECTOR_OPS:-1}
 export K3_COMM_DEFER_TCQ=${K3_COMM_DEFER_TCQ:-1}
 export K3_COMM_DEFER_MRQ=${K3_COMM_DEFER_MRQ:-1}
 export K3_MOE_LATE_SHARED_REDUCE=${K3_MOE_LATE_SHARED_REDUCE:-1}
-# bit 0: attention output; bit 1: KDA final output; MLA final stays on the
-# measured recursive-doubling path.
-export K3_COMM_RABENSEIFNER=${K3_COMM_RABENSEIFNER:-3}
+# bit 0: attention output; bit 1: KDA final output; bit 2: MLA final output.
+export K3_COMM_RABENSEIFNER=${K3_COMM_RABENSEIFNER:-7}
 export K3_MOE_SCALE_ACTIVATION=${K3_MOE_SCALE_ACTIVATION:-1}
 
 exec "$SCRIPT_DIR/run_k3_full_12n.sh" --expert-tp "$@"

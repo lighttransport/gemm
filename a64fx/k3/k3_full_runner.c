@@ -2402,7 +2402,7 @@ static void full_tp_sum_rabenseifner(tp_comm *c, float *buf, int count) {
     if (c->nprocs == 1) return;
     /* Keep the stock path for shapes that cannot be split exactly or do not
      * fit distinct reduce/gather receive slots. */
-    if (c->deterministic || c->a2a || c->pof2 < 2 ||
+    if (c->a2a || c->pof2 < 2 ||
         count % c->pof2 || 2 * c->nrounds + 1 >= TP_AR_NSTEP) {
         tp_allreduce_sum(c, buf, count);
         return;
@@ -4353,7 +4353,12 @@ static int full_prefill_moe_batched(k3_full_model *m, k3_full_layer *l,
         for (int i = 0; i < local_hidden; ++i)
             b->moe_hidden[(size_t)t * K3_HIDDEN + hidden_start + i] +=
                 b->projection[(size_t)t * local_hidden + i];
-    if (full_prefill_sum(m, b->moe_hidden, batch, K3_HIDDEN)) return EIO;
+    for (int first = 0; first < batch; first += K3_PREFILL_COMM_PANEL) {
+        int panel = batch - first;
+        if (panel > K3_PREFILL_COMM_PANEL) panel = K3_PREFILL_COMM_PANEL;
+        if (full_sum_final(m, b->moe_hidden + (size_t)first * K3_HIDDEN,
+                           panel * K3_HIDDEN, l->is_mla)) return EIO;
+    }
 #pragma omp parallel for schedule(static)
     for (int t = 0; t < batch; ++t) {
         /* Match the scalar runner's scratch contract: full_moe_forward leaves
