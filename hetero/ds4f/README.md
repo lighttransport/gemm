@@ -650,6 +650,29 @@ approximate like the other accelerated routes (exact default stays 0/64).
 activation residual) is ~1/64 at 54.6 tok/s (batch 64), terms=1 skips the
 residual for ~56 tok/s but ~4/64.
 
+#### gfx1201 WMMA prefill experiment
+
+`DS4F_HIP_FP8_WMMA=1` selects a gfx12 WMMA kernel for ordinary FP8 dense
+prefill GEMMs at batch 128 and above. It keeps the compact FP8/E8M0 bank in
+VRAM, widens each weight tile and the F32 activations to FP16 in LDS, and uses
+native `v_wmma_f32_16x16x16_f16`. It is deliberately opt-in: activation FP16
+rounding changes the reduction path. At batch 256 it raises the exact-f32
+expert configuration from 47.9 to 51.6 tok/s; combined with
+`"mxfp4_w4a8": 1`, steady prefill reaches 59.6 tok/s versus 47.9 tok/s for the
+previous path. The combined run changed 5/256 argmaxes (the prior fast path
+changed 3/256), so it is a throughput experiment, not the exact default.
+
+For comparison, DwarfStar commit `1bf9566` on the same RX 9070 XT and exact
+0731 GGUF measured only 0.31 tok/s for a 64-token prefill. Its single-file
+runner must stream multi-GiB dense spans and the routed expert working set
+through 16 GB VRAM. The runnable discrete-GPU settings were
+`DS4_ROCM_STREAM_FREE_RESERVE_GB=2 --ssd-streaming-cold
+--ssd-streaming-cache-experts 320`; its default 16 GiB reserve leaves no
+allocatable cache on this card. Our staged EP8 path measures 43.5 tok/s at the
+same batch size, roughly 140x faster, so DwarfStar does not expose a missing
+prefill optimization to port—the remaining gap to 100 tok/s is local dense
+and routed-expert compute.
+
 The split now preloads all 29 CUDA layers: the cache is a single contiguous
 12.5 GB pool (one `cuMemAlloc`; the driver tops out at ~13 GB for one
 allocation vs ~10.8 GB for the old per-tensor 4.46 MB chunks, which

@@ -77,6 +77,15 @@ static int matrix_is_fp8_promoted(int kind) {
            kind == HIP_DS4F_MATRIX_FP8_FP16;
 }
 
+static int fp8_wmma_prefill_on(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4F_HIP_FP8_WMMA");
+        enabled = e && *e && atoi(e) != 0;
+    }
+    return enabled;
+}
+
 struct hip_ds4f_dense {
     ds4f_mem_pool *mem;
     int device_id;
@@ -88,6 +97,7 @@ struct hip_ds4f_dense {
     hipFunction_t f16_matvec;
     hipFunction_t blockdiag_matvec;
     hipFunction_t gemm_fp8;
+    hipFunction_t gemm_fp8_wmma;
     hipFunction_t gemm_fp8_ordered;
     hipFunction_t gemm_mxfp4;
     hipFunction_t gemm_mxfp4_grouped;
@@ -324,6 +334,8 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
                              "ds4f_dense_fp8_blockdiag") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_fp8, ctx->module,
                              "ds4f_dense_fp8_gemm") != hipSuccess ||
+        hipModuleGetFunction(&ctx->gemm_fp8_wmma, ctx->module,
+                             "ds4f_dense_fp8_wmma_f16_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_fp8_ordered, ctx->module,
                              "ds4f_dense_fp8_ordered_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_mxfp4, ctx->module,
@@ -1854,11 +1866,19 @@ int hip_ds4f_dense_gemm_tensor(
         } else if (matrix_is_fp8(mat->kind)) {
             void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K + (size_t)c0 * (size_t)K;
             void *ds = (uint8_t *)(void *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols + (size_t)(c0 / 128) * (size_t)mat->scale_cols;
-            void *lut = ctx->fp8_lut;
             int scale_cols = mat->scale_cols;
-            void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
-            err = hipModuleLaunchKernel(ctx->gemm_fp8, gx, gy, 1, 16, 16, 1, 0,
-                                        ctx->stream, args, NULL);
+            if (fp8_wmma_prefill_on() && M >= 128) {
+                void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok, &scale_cols };
+                err = hipModuleLaunchKernel(ctx->gemm_fp8_wmma,
+                    (unsigned int)((n_out + 127) / 128),
+                    (unsigned int)((n_tok + 127) / 128), 1,
+                    256, 1, 1, 0, ctx->stream, args, NULL);
+            } else {
+                void *lut = ctx->fp8_lut;
+                void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
+                err = hipModuleLaunchKernel(ctx->gemm_fp8, gx, gy, 1, 16, 16, 1, 0,
+                                            ctx->stream, args, NULL);
+            }
         } else if (matrix_is_bf16(mat->kind)) {
             void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t) + (size_t)c0 * (size_t)K * sizeof(uint16_t);
             void *bias = NULL;
@@ -2025,11 +2045,20 @@ int hip_ds4f_dense_gemm_tensors(
         } else if (matrix_is_fp8(mat[i]->kind)) {
             int n_out = t[i]->rows, n_in = k0, n_tok = M[i];
             int scale_cols = mat[i]->scale_cols;
-            void *lut = ctx->fp8_lut;
-            void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
-            fn = ctx->gemm_fp8;
-            err = hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0,
-                                        ctx->stream, args, NULL);
+            if (fp8_wmma_prefill_on() && M[i] >= 128) {
+                void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok, &scale_cols };
+                fn = ctx->gemm_fp8_wmma;
+                err = hipModuleLaunchKernel(fn,
+                    (unsigned int)((n_out + 127) / 128),
+                    (unsigned int)((n_tok + 127) / 128), 1,
+                    256, 1, 1, 0, ctx->stream, args, NULL);
+            } else {
+                void *lut = ctx->fp8_lut;
+                void *args[] = { &dy, &dw, &ds, &dx, &lut, &n_out, &n_in, &n_tok, &scale_cols };
+                fn = ctx->gemm_fp8;
+                err = hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0,
+                                            ctx->stream, args, NULL);
+            }
         } else if (matrix_is_bf16(mat[i]->kind)) {
             void *bias = NULL;
             int n_out = t[i]->rows, n_in = k0, n_tok = M[i];
