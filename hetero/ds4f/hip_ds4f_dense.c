@@ -172,6 +172,8 @@ struct hip_ds4f_dense {
     size_t attn_q_bytes, attn_kv_bytes, attn_sink_bytes, attn_y_bytes;
     void *rope_c, *rope_s;
     size_t rope_c_bytes, rope_s_bytes;
+    const float *rope_host_c, *rope_host_s;
+    int rope_host_pos, rope_host_m, rope_host_pairs;
     void *gemm_multi_dy[HIP_DS4F_GEMM_MAX];
     size_t gemm_multi_y_bytes[HIP_DS4F_GEMM_MAX];
     const ds4f_layer *stream_layer;
@@ -1675,7 +1677,14 @@ int hip_ds4f_dense_prefill_attn_oproj(void *opaque,float *dst,const float *q,con
  int base=pos0-window+1;if(base<0)base=0;int end=pos0+M;if(end>slots)return -1;int ns=end-base;if(ns<1)ns=1;
  size_t qb=(size_t)M*nh*hd*4,kb=(size_t)ns*kd*2,sb=(size_t)nh*4,cb=(size_t)M*rp*4,xtb=(size_t)M*gin*4,ytb=(size_t)M*lora*4,dib=(size_t)M*ointer*4,dyb=(size_t)M*C*4;
  if(hipSetDevice(c->device_id)!=hipSuccess||ensure_attn_buffer(&c->attn_q,&c->attn_q_bytes,qb)||ensure_attn_buffer(&c->attn_kv,&c->attn_kv_bytes,kb)||ensure_attn_buffer(&c->attn_sink,&c->attn_sink_bytes,sb)||ensure_attn_buffer(&c->attn_y,&c->attn_y_bytes,qb)||ensure_attn_buffer(&c->rope_c,&c->rope_c_bytes,cb)||ensure_attn_buffer(&c->rope_s,&c->rope_s_bytes,cb)||ensure_dev_buf(&c->op_xt,&c->op_xt_b,xtb)||ensure_dev_buf(&c->op_yt,&c->op_yt_b,ytb)||ensure_dev_buf(&c->op_di,&c->op_di_b,dib)||ensure_dev_buf(&c->op_dy,&c->op_dy_b,dyb))return -1;
- if(hipMemcpyAsync(c->attn_q,q,qb,hipMemcpyHostToDevice,c->stream)!=hipSuccess||hipMemcpyAsync(c->attn_kv,kv+(size_t)base*kd,kb,hipMemcpyHostToDevice,c->stream)!=hipSuccess||hipMemcpyAsync(c->attn_sink,sink,sb,hipMemcpyHostToDevice,c->stream)!=hipSuccess||hipMemcpyAsync(c->rope_c,rcos+(size_t)pos0*rp,cb,hipMemcpyHostToDevice,c->stream)!=hipSuccess||hipMemcpyAsync(c->rope_s,rsin+(size_t)pos0*rp,cb,hipMemcpyHostToDevice,c->stream)!=hipSuccess)return -1;
+ if(hipMemcpyAsync(c->attn_q,q,qb,hipMemcpyHostToDevice,c->stream)!=hipSuccess||hipMemcpyAsync(c->attn_kv,kv+(size_t)base*kd,kb,hipMemcpyHostToDevice,c->stream)!=hipSuccess||hipMemcpyAsync(c->attn_sink,sink,sb,hipMemcpyHostToDevice,c->stream)!=hipSuccess)return -1;
+ int rope_cached = c->rope_host_c == rcos && c->rope_host_s == rsin && c->rope_host_pos == pos0 &&
+                   c->rope_host_m == M && c->rope_host_pairs == rp;
+ if (!rope_cached) {
+     if(hipMemcpyAsync(c->rope_c,rcos+(size_t)pos0*rp,cb,hipMemcpyHostToDevice,c->stream)!=hipSuccess||
+        hipMemcpyAsync(c->rope_s,rsin+(size_t)pos0*rp,cb,hipMemcpyHostToDevice,c->stream)!=hipSuccess)return -1;
+     c->rope_host_c=rcos; c->rope_host_s=rsin; c->rope_host_pos=pos0; c->rope_host_m=M; c->rope_host_pairs=rp;
+ }
  void *dy=c->attn_y,*dkv=c->attn_kv,*dq=c->attn_q,*ds=c->attn_sink;int lp=pos0-base;const char *wm=getenv("DS4F_HIP_ATTN_WMMA");int use=wm&&atoi(wm)!=0&&c->prefill_attn_wmma&&hd==512&&kd==512;void *aa[]={&dy,&dkv,&dq,&ds,&M,&lp,&nh,&hd,&kd,&ns,&window,&scale};unsigned gx=(unsigned)(use?nh*((M+15)/16):M*((nh+7)>>3));
  if(hipModuleLaunchKernel(use?c->prefill_attn_wmma:c->prefill_attn,gx,1,1,256,1,1,0,c->stream,aa,NULL)!=hipSuccess)return -1;void *ra[]={&c->attn_y,&c->rope_c,&c->rope_s,&M,&hd,&H,&ro,&rp};if(hipModuleLaunchKernel(c->apply_rope,(unsigned)(((size_t)M*rp+255)/256),1,1,256,1,1,0,c->stream,ra,NULL)!=hipSuccess)return -1;
  for(int g=0;g<groups;g++){size_t n=(size_t)M*gin;int off=g*gin;void *ga[]={&c->op_xt,&c->attn_y,&M,&gin,&H,&off};if(hipModuleLaunchKernel(c->gather_group,(unsigned)((n+255)/256),1,1,256,1,1,0,c->stream,ga,NULL)!=hipSuccess||launch_gemm_dev(c,a,g*lora,c->op_yt,c->op_xt,lora,gin,M)!=0)return -1;n=(size_t)M*lora;off=g*lora;void *sa[]={&c->op_di,&c->op_yt,&M,&lora,&ointer,&off};if(hipModuleLaunchKernel(c->scatter_group,(unsigned)((n+255)/256),1,1,256,1,1,0,c->stream,sa,NULL)!=hipSuccess)return -1;}
