@@ -86,6 +86,11 @@ static int fp8_wmma_prefill_on(void) {
     return enabled;
 }
 
+static int fp8_wmma_prefill_mode(void) {
+    const char *e = getenv("DS4F_HIP_FP8_WMMA");
+    return e && *e ? atoi(e) : 0;
+}
+
 static int bf16_wmma_prefill_on(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -107,10 +112,12 @@ struct hip_ds4f_dense {
     hipFunction_t blockdiag_matvec;
     hipFunction_t gemm_fp8;
     hipFunction_t gemm_fp8_wmma;
+    hipFunction_t gemm_fp8_wmma64;
     hipFunction_t gemm_fp8_ordered;
     hipFunction_t gemm_mxfp4;
     hipFunction_t gemm_mxfp4_grouped;
     hipFunction_t gemm_mxfp4_grouped_wmma;
+    hipFunction_t gemm_mxfp4_grouped_wmma32;
     hipFunction_t mxfp4_matvec;
     hipFunction_t mxfp4_grouped_matvec;
     hipFunction_t gemm_fp8_rowscale;
@@ -355,8 +362,10 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
                              "ds4f_dense_fp8_blockdiag") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_fp8, ctx->module,
                              "ds4f_dense_fp8_gemm") != hipSuccess ||
-        hipModuleGetFunction(&ctx->gemm_fp8_wmma, ctx->module,
-                             "ds4f_dense_fp8_wmma_f16_gemm") != hipSuccess ||
+    hipModuleGetFunction(&ctx->gemm_fp8_wmma, ctx->module,
+                         "ds4f_dense_fp8_wmma_f16_gemm") != hipSuccess ||
+        hipModuleGetFunction(&ctx->gemm_fp8_wmma64, ctx->module,
+                             "ds4f_dense_fp8_wmma_f16_gemm64") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_fp8_ordered, ctx->module,
                              "ds4f_dense_fp8_ordered_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_mxfp4, ctx->module,
@@ -388,6 +397,8 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
     }
     hipModuleGetFunction(&ctx->gemm_mxfp4_grouped_wmma, ctx->module,
                          "ds4f_dense_mxfp4_grouped_wmma");
+    hipModuleGetFunction(&ctx->gemm_mxfp4_grouped_wmma32, ctx->module,
+                         "ds4f_dense_mxfp4_grouped_wmma32");
     hipModuleGetFunction(&ctx->prefill_attn_wmma, ctx->module,
                          "ds4f_dense_prefill_attn_wmma");
     hipModuleGetFunction(&ctx->apply_rope, ctx->module, "ds4f_apply_rope");
@@ -1750,10 +1761,11 @@ static int launch_gemm_dev(hip_ds4f_dense *ctx, const hip_ds4f_matrix *mat,
     void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K;
     void *ds = (uint8_t *)(void *)mat->ds + soff;
     if (matrix_is_fp8(mat->kind) && fp8_wmma_prefill_on() && M >= 128) {
+        int wm = fp8_wmma_prefill_mode();
         void *args[] = { &dY, &dw, &ds, &dX, &N, &K, &M, &scale_cols };
-        return hipModuleLaunchKernel(ctx->gemm_fp8_wmma,
-            (unsigned int)((N + 127) / 128),
-            (unsigned int)((M + 127) / 128), 1,
+        return hipModuleLaunchKernel(wm >= 2 ? ctx->gemm_fp8_wmma64 : ctx->gemm_fp8_wmma,
+            (unsigned int)((N + (wm >= 2 ? 63 : 127)) / (wm >= 2 ? 64 : 128)),
+            (unsigned int)((M + (wm >= 2 ? 63 : 127)) / (wm >= 2 ? 64 : 128)), 1,
             256, 1, 1, 0, ctx->stream, args, NULL) == hipSuccess ? 0 : -1;
     }
     void *args[] = { &dY, &dw, &ds, &dX, &lut, &n_out, &n_in, &n_tok, &scale_cols };
@@ -2008,10 +2020,11 @@ int hip_ds4f_dense_gemm_tensor(
             void *ds = (uint8_t *)(void *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols + (size_t)(c0 / 128) * (size_t)mat->scale_cols;
             int scale_cols = mat->scale_cols;
             if (fp8_wmma_prefill_on() && M >= 128) {
+                int wm = fp8_wmma_prefill_mode();
                 void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok, &scale_cols };
-                err = hipModuleLaunchKernel(ctx->gemm_fp8_wmma,
-                    (unsigned int)((n_out + 127) / 128),
-                    (unsigned int)((n_tok + 127) / 128), 1,
+                err = hipModuleLaunchKernel(wm >= 2 ? ctx->gemm_fp8_wmma64 : ctx->gemm_fp8_wmma,
+                    (unsigned int)((n_out + (wm >= 2 ? 63 : 127)) / (wm >= 2 ? 64 : 128)),
+                    (unsigned int)((n_tok + (wm >= 2 ? 63 : 127)) / (wm >= 2 ? 64 : 128)), 1,
                     256, 1, 1, 0, ctx->stream, args, NULL);
             } else {
                 void *lut = ctx->fp8_lut;
@@ -2161,17 +2174,20 @@ int hip_ds4f_dense_gemm_tensors(
             int ntasks = n;
             void *args[] = { &ctx->gemm_mxfp4_tasks, &ntasks };
             const char *we = getenv("DS4F_HIP_MXFP4_WMMA");
-            int use_wmma = we && atoi(we) != 0 && !grouped_m1 &&
+            int wmode = we ? atoi(we) : 0;
+            int use_wmma32 = wmode >= 2 && !grouped_m1 &&
+                           ctx->gemm_mxfp4_grouped_wmma32 && M[0] >= 32;
+            int use_wmma = !use_wmma32 && wmode != 0 && !grouped_m1 &&
                            ctx->gemm_mxfp4_grouped_wmma && M[0] >= 32;
-            hipFunction_t group_fn = use_wmma ? ctx->gemm_mxfp4_grouped_wmma :
-                (grouped_m1 ? ctx->mxfp4_grouped_matvec : ctx->gemm_mxfp4_grouped);
+            hipFunction_t group_fn = use_wmma32 ? ctx->gemm_mxfp4_grouped_wmma32 : (use_wmma ? ctx->gemm_mxfp4_grouped_wmma :
+                (grouped_m1 ? ctx->mxfp4_grouped_matvec : ctx->gemm_mxfp4_grouped));
             unsigned int launch_gx = grouped_m1
                 ? (unsigned int)((t[0]->rows + 7) / 8) : group_gx;
-            if (use_wmma) launch_gx = (unsigned int)((t[0]->rows + 15) / 16);
+            if (use_wmma || use_wmma32) launch_gx = (unsigned int)((t[0]->rows + (use_wmma32 ? 31 : 15)) / (use_wmma32 ? 32 : 16));
             if (hipModuleLaunchKernel(group_fn,
-                    launch_gx, use_wmma ? group_gy : (grouped_m1 ? (unsigned int)n : group_gy),
-                    use_wmma ? (unsigned int)n : (grouped_m1 ? 1u : (unsigned int)n),
-                    use_wmma ? 32u : (grouped_m1 ? 256u : 16u), use_wmma ? 1u : (grouped_m1 ? 1u : 16u), 1, 0,
+                    launch_gx, (use_wmma || use_wmma32) ? group_gy : (grouped_m1 ? (unsigned int)n : group_gy),
+                    (use_wmma || use_wmma32) ? (unsigned int)n : (grouped_m1 ? 1u : (unsigned int)n),
+                    use_wmma32 ? 64u : (use_wmma ? 32u : (grouped_m1 ? 256u : 16u)), use_wmma32 ? 1u : (use_wmma ? 1u : (grouped_m1 ? 1u : 16u)), 1, 0,
                     ctx->stream, args, NULL) != hipSuccess)
                 return -1;
         }
@@ -2211,11 +2227,12 @@ int hip_ds4f_dense_gemm_tensors(
             int n_out = t[i]->rows, n_in = k0, n_tok = M[i];
             int scale_cols = mat[i]->scale_cols;
             if (fp8_wmma_prefill_on() && M[i] >= 128) {
+                int wm = fp8_wmma_prefill_mode();
                 void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok, &scale_cols };
-                fn = ctx->gemm_fp8_wmma;
+                fn = wm >= 2 ? ctx->gemm_fp8_wmma64 : ctx->gemm_fp8_wmma;
                 err = hipModuleLaunchKernel(fn,
-                    (unsigned int)((n_out + 127) / 128),
-                    (unsigned int)((n_tok + 127) / 128), 1,
+                    (unsigned int)((n_out + (wm >= 2 ? 63 : 127)) / (wm >= 2 ? 64 : 128)),
+                    (unsigned int)((n_tok + (wm >= 2 ? 63 : 127)) / (wm >= 2 ? 64 : 128)), 1,
                     256, 1, 1, 0, ctx->stream, args, NULL);
             } else {
                 void *lut = ctx->fp8_lut;
