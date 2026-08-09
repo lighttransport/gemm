@@ -130,6 +130,14 @@ int hip_ds4f_dense_shared_ffn(void *ctx, float *dst,
                               const ds4f_tensor *w1, const ds4f_tensor *w3,
                               const ds4f_tensor *w2, const float *x,
                               int M, int inter, int C, float lim);
+int hip_ds4f_dense_shared_ffn_begin(void *ctx,float *dst,
+                              const ds4f_tensor *w1,const ds4f_tensor *w3,
+                              const ds4f_tensor *w2,const float *x,
+                              int M,int inter,int C,float lim);
+int hip_ds4f_dense_shared_ffn_wait(void *ctx,float *dst,int M,int C);
+int hip_ds4f_dense_oproj(void *ctx,float *dst,const ds4f_tensor *wa,
+    const ds4f_tensor *wb,const float *x,int M,int groups,int gin,int lora,
+    int H,int C,int ointer);
 
 /* One in-flight operation variant for CPU/GPU overlap. The input upload is
  * queued, the caller may do CPU work, and wait() synchronizes and downloads y. */

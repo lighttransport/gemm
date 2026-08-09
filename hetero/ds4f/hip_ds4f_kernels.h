@@ -543,6 +543,14 @@ static const char hip_ds4f_dense_kernels_src[] =
 "        }\n"
 "        Y[((size_t)mm * n_heads + h) * head_dim + d] = out;\n"
 "    }\n"
+"}\n"
+"extern \"C\" __global__ void ds4f_gather_group(float *dst,const float *src,int M,int width,int stride,int off){\n"
+"    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x,n=(size_t)M*width;\n"
+"    if(i<n){int r=(int)(i/width),c=(int)(i%width);dst[i]=src[(size_t)r*stride+off+c];}\n"
+"}\n"
+"extern \"C\" __global__ void ds4f_scatter_group(float *dst,const float *src,int M,int width,int stride,int off){\n"
+"    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x,n=(size_t)M*width;\n"
+"    if(i<n){int r=(int)(i/width),c=(int)(i%width);dst[(size_t)r*stride+off+c]=src[i];}\n"
 "}\n";
 
 /* Fused shared-expert SwiGLU in its OWN HIPRTC module, always compiled precise

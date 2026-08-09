@@ -432,6 +432,9 @@ static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
      * in its own always-precise HIPRTC module, so it never changes the dense
      * GEMM results or the argmax.  Opt-in; see --hip-fused-shared-ffn. */
     m->gpu_shared_ffn = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn : NULL;
+    m->gpu_shared_ffn_begin = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn_begin : NULL;
+    m->gpu_shared_ffn_wait = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn_wait : NULL;
+    m->gpu_oproj = hip_ds4f_dense_oproj;
     m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
     /* MXFP4 expert layer residency: install the HIP entry points BEFORE the
      * dual wrapper swaps gpu_dense_ctx, so dual can capture and forward them.
@@ -534,8 +537,10 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
 
     /* First run the same batched forward with all device hooks detached.  For
      * the large-batch throughput probe this reference is ~minutes; skip it
-     * (--skip-cpu-ref) and report the GPU rate only. */
+    * (--skip-cpu-ref) and report the GPU rate only. */
     if (!skip_cpu_ref) {
+        if (batch >= 512)
+            fprintf(stderr, "prefill: CPU reference batch=%d can take many minutes; use --skip-cpu-ref 1 for performance-only runs\n", batch);
         m->gpu_dense_ctx = NULL;
         m->gpu_dense_matvec = NULL;
         m->gpu_dense_async_multi = NULL;
@@ -543,6 +548,11 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
         m->gpu_dense_blockdiag = NULL;
         m->gpu_dense_gemm = NULL;
         m->gpu_dense_gemm_multi = NULL;
+        m->gpu_shared_ffn = NULL;
+        m->gpu_shared_ffn_begin = NULL;
+        m->gpu_shared_ffn_wait = NULL;
+        m->gpu_oproj = NULL;
+        m->gpu_prefill_attn = NULL;
         m->gpu_dense_mixed = 0;
         memset(m->prof, 0, sizeof(m->prof));
         if (warm_batch > 0) {
@@ -651,6 +661,10 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
     m->gpu_dense_blockdiag = NULL;
     m->gpu_dense_gemm = NULL;
     m->gpu_dense_gemm_multi = NULL;
+    m->gpu_shared_ffn = NULL;
+    m->gpu_shared_ffn_begin = NULL;
+    m->gpu_shared_ffn_wait = NULL;
+    m->gpu_oproj = NULL;
     m->gpu_prefill_attn = NULL;
     m->gpu_dense_layer_prefetch = NULL;
     m->gpu_dense_layer_begin = NULL;

@@ -107,8 +107,11 @@ struct hip_ds4f_dense {
     hipFunction_t gemm_bf16;
     hipFunction_t gemm_f16;
     hipFunction_t swiglu;
+    hipFunction_t gather_group, scatter_group;
     void *ffn_dx, *ffn_dg, *ffn_du, *ffn_dy;
     size_t ffn_dx_b, ffn_dg_b, ffn_du_b, ffn_dy_b;
+    void *op_dx,*op_xt,*op_yt,*op_di,*op_dy;
+    size_t op_dx_b,op_xt_b,op_yt_b,op_di_b,op_dy_b;
     hipFunction_t prefill_attn;
 
     hip_ds4f_matrix *matrices;
@@ -352,6 +355,10 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
                              "gemm_tiled_f16_f32") != hipSuccess ||
         hipModuleGetFunction(&ctx->prefill_attn, ctx->module,
                              "ds4f_dense_prefill_attn") != hipSuccess ||
+        hipModuleGetFunction(&ctx->gather_group,ctx->module,
+                             "ds4f_gather_group") != hipSuccess ||
+        hipModuleGetFunction(&ctx->scatter_group,ctx->module,
+                             "ds4f_scatter_group") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_fp8_rowscale, ctx->module,
                              "ds4f_dense_fp8_rowscale_gemm") != hipSuccess) {
         fprintf(stderr, "hip_ds4f_dense: failed to build matvec module\n");
@@ -486,6 +493,11 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (ctx->attn_kv) hipFree(ctx->attn_kv);
     if (ctx->attn_sink) hipFree(ctx->attn_sink);
     if (ctx->attn_y) hipFree(ctx->attn_y);
+    if (ctx->op_dy) hipFree(ctx->op_dy);
+    if (ctx->op_di) hipFree(ctx->op_di);
+    if (ctx->op_yt) hipFree(ctx->op_yt);
+    if (ctx->op_xt) hipFree(ctx->op_xt);
+    if (ctx->op_dx) hipFree(ctx->op_dx);
     if (ctx->gemm_mxfp4_tasks) hipFree(ctx->gemm_mxfp4_tasks);
     if (ctx->fp8_lut) hipFree(ctx->fp8_lut);
     for (int i = 0; i < HIP_DS4F_GEMM_MAX; ++i)
@@ -1669,6 +1681,13 @@ static int launch_gemm_dev(hip_ds4f_dense *ctx, const hip_ds4f_matrix *mat,
     else return -1;   /* promoted BF16/FP16 and MXFP4 keep the unfused path */
     void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K;
     void *ds = (uint8_t *)(void *)mat->ds + soff;
+    if (matrix_is_fp8(mat->kind) && fp8_wmma_prefill_on() && M >= 128) {
+        void *args[] = { &dY, &dw, &ds, &dX, &N, &K, &M, &scale_cols };
+        return hipModuleLaunchKernel(ctx->gemm_fp8_wmma,
+            (unsigned int)((N + 127) / 128),
+            (unsigned int)((M + 127) / 128), 1,
+            256, 1, 1, 0, ctx->stream, args, NULL) == hipSuccess ? 0 : -1;
+    }
     void *args[] = { &dY, &dw, &ds, &dX, &lut, &n_out, &n_in, &n_tok, &scale_cols };
     return hipModuleLaunchKernel(fn, gx, gy, 1, 16, 16, 1, 0,
                                  ctx->stream, args, NULL) == hipSuccess ? 0 : -1;
@@ -1690,7 +1709,7 @@ static int ensure_dev_buf(void **buf, size_t *cap, size_t bytes) {
  * once and only [M, C] comes back.  Arithmetic is unchanged: the same GEMM
  * kernels run on the same shapes and ds4f_swiglu_inplace mirrors
  * ds4f_pf_swiglu_worker term for term. */
-int hip_ds4f_dense_shared_ffn(void *opaque, float *dst,
+int hip_ds4f_dense_shared_ffn_begin(void *opaque, float *dst,
                               const ds4f_tensor *w1, const ds4f_tensor *w3,
                               const ds4f_tensor *w2, const float *x,
                               int M, int inter, int C, float lim) {
@@ -1733,6 +1752,14 @@ int hip_ds4f_dense_shared_ffn(void *opaque, float *dst,
           return -1; }
     if (launch_gemm_dev(ctx, m2, 0, ctx->ffn_dy, ctx->ffn_dg, C, inter, M) != 0)
         return -1;
+    (void)dst;
+    return 0;
+}
+
+int hip_ds4f_dense_shared_ffn_wait(void *opaque,float *dst,int M,int C) {
+    hip_ds4f_dense *ctx=(hip_ds4f_dense *)opaque;
+    size_t yb=(size_t)M*C*sizeof(float);
+    if(!ctx||!dst||!ctx->ffn_dy)return -1;
     float *out = dst;
     if (ctx->gemm_y_pack && ctx->gemm_y_pack_bytes >= yb) out = ctx->gemm_y_pack;
     if (hipMemcpyAsync(out, ctx->ffn_dy, yb, hipMemcpyDeviceToHost,
@@ -1740,6 +1767,51 @@ int hip_ds4f_dense_shared_ffn(void *opaque, float *dst,
         hipStreamSynchronize(ctx->stream) != hipSuccess)
         return -1;
     if (out != dst) memcpy(dst, out, yb);
+    return 0;
+}
+
+int hip_ds4f_dense_shared_ffn(void *opaque,float *dst,
+                              const ds4f_tensor *w1,const ds4f_tensor *w3,
+                              const ds4f_tensor *w2,const float *x,
+                              int M,int inter,int C,float lim) {
+    if(hip_ds4f_dense_shared_ffn_begin(opaque,dst,w1,w3,w2,x,M,inter,C,lim)!=0)return -1;
+    return hip_ds4f_dense_shared_ffn_wait(opaque,dst,M,C);
+}
+
+int hip_ds4f_dense_oproj(void *opaque,float *dst,const ds4f_tensor *wa,
+    const ds4f_tensor *wb,const float *x,int M,int groups,int gin,int lora,
+    int H,int C,int ointer) {
+    hip_ds4f_dense *ctx=(hip_ds4f_dense *)opaque;
+    const hip_ds4f_matrix *a=NULL,*b=NULL;
+    if(!ctx||!dst||!wa||!wb||!x||M<1||groups*gin!=H||groups*lora!=ointer||
+       wa->gpu_id<0||wb->gpu_id<0||matrix_get(ctx,wa->gpu_id,&a)!=0||
+       matrix_get(ctx,wb->gpu_id,&b)!=0||a->rows!=ointer||a->cols!=gin||
+       b->rows!=C||b->cols!=ointer||!matrix_is_fp8(a->kind)||!matrix_is_fp8(b->kind))return -1;
+    size_t dxb=(size_t)M*H*4,xtb=(size_t)M*gin*4,ytb=(size_t)M*lora*4;
+    size_t dib=(size_t)M*ointer*4,dyb=(size_t)M*C*4;
+    if(hipSetDevice(ctx->device_id)!=hipSuccess||
+       ensure_dev_buf(&ctx->op_dx,&ctx->op_dx_b,dxb)||
+       ensure_dev_buf(&ctx->op_xt,&ctx->op_xt_b,xtb)||
+       ensure_dev_buf(&ctx->op_yt,&ctx->op_yt_b,ytb)||
+       ensure_dev_buf(&ctx->op_di,&ctx->op_di_b,dib)||
+       ensure_dev_buf(&ctx->op_dy,&ctx->op_dy_b,dyb))return -1;
+    const float *xh=x;
+    if(ensure_gemm_host_pack(ctx,dxb,dyb)==0){memcpy(ctx->gemm_x_pack,x,dxb);xh=ctx->gemm_x_pack;}
+    if(hipMemcpyAsync(ctx->op_dx,xh,dxb,hipMemcpyHostToDevice,ctx->stream)!=hipSuccess)return -1;
+    for(int g=0;g<groups;g++){
+        size_t n=(size_t)M*gin;int off=g*gin;
+        void *ga[]={&ctx->op_xt,&ctx->op_dx,&M,&gin,&H,&off};
+        if(hipModuleLaunchKernel(ctx->gather_group,(unsigned)((n+255)/256),1,1,256,1,1,0,ctx->stream,ga,NULL)!=hipSuccess||
+           launch_gemm_dev(ctx,a,g*lora,ctx->op_yt,ctx->op_xt,lora,gin,M)!=0)return -1;
+        n=(size_t)M*lora;off=g*lora;
+        void *sa[]={&ctx->op_di,&ctx->op_yt,&M,&lora,&ointer,&off};
+        if(hipModuleLaunchKernel(ctx->scatter_group,(unsigned)((n+255)/256),1,1,256,1,1,0,ctx->stream,sa,NULL)!=hipSuccess)return -1;
+    }
+    if(launch_gemm_dev(ctx,b,0,ctx->op_dy,ctx->op_di,C,ointer,M)!=0)return -1;
+    float *out=dst;if(ctx->gemm_y_pack&&ctx->gemm_y_pack_bytes>=dyb)out=ctx->gemm_y_pack;
+    if(hipMemcpyAsync(out,ctx->op_dy,dyb,hipMemcpyDeviceToHost,ctx->stream)!=hipSuccess||
+       hipStreamSynchronize(ctx->stream)!=hipSuccess)return -1;
+    if(out!=dst)memcpy(dst,out,dyb);
     return 0;
 }
 
