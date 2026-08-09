@@ -17,7 +17,7 @@ extern "C" __global__ void ds4f_cuda_prefill_attn(
     __shared__ float sm[8][129];const float *q=Q+((size_t)mm*n_heads+h)*head_dim;
     for(int j=0;j<np;j++){
         const uint16_t *k=KV+(size_t)((lo+j)%kv_slots)*kv_dim;float dot=0.f;
-        for(int d=lane;d<kv_dim;d+=32)dot=fmaf(q[d],__bfloat162float(*((const __nv_bfloat16 *)(k+d))),dot);
+        for(int d=lane;d<kv_dim;d+=32)dot=fmaf(__ldg(q+d),__bfloat162float(__ldg((const __nv_bfloat16 *)(k+d))),dot);
         for(int off=16;off;off>>=1)dot+=__shfl_down_sync(0xffffffff,dot,off);
         if(lane==0)sm[warp][j]=dot*scale;
     }
@@ -33,7 +33,7 @@ extern "C" __global__ void ds4f_cuda_prefill_attn(
     float inv=1.f/den;
     for(int j=lane;j<np;j+=32)sm[warp][j]*=inv;
     __syncwarp();
-    for(int d=lane;d<head_dim;d+=32){float out=0.f;if(d<kv_dim)for(int j=0;j<np;j++){const uint16_t *v=KV+(size_t)((lo+j)%kv_slots)*kv_dim;out=fmaf(sm[warp][j]*inv,__bfloat162float(*((const __nv_bfloat16 *)(v+d))),out);}Y[((size_t)mm*n_heads+h)*head_dim+d]=out;}
+    for(int d=lane;d<head_dim;d+=32){float out=0.f;if(d<kv_dim)for(int j=0;j<np;j++){const uint16_t *v=KV+(size_t)((lo+j)%kv_slots)*kv_dim;out=fmaf(sm[warp][j]*inv,__bfloat162float(__ldg((const __nv_bfloat16 *)(v+d))),out);}Y[((size_t)mm*n_heads+h)*head_dim+d]=out;}
 }
 
 extern "C" __global__ void ds4f_cuda_swiglu(
