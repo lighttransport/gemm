@@ -3,8 +3,8 @@
 #define _GNU_SOURCE
 #endif
 
-#include "hip_ds4f_dense.h"
 #include "../../common/ds4f.h"
+#include "hip_ds4f_dense.h"
 #include "hip_ds4f_kernels.h"
 #include "../../rdna4/hip_kernels_common.h"
 #include "../../rdna4/rocew.h"
@@ -91,6 +91,8 @@ struct hip_ds4f_dense {
     hipFunction_t gemm_fp8_ordered;
     hipFunction_t gemm_mxfp4;
     hipFunction_t gemm_mxfp4_grouped;
+    hipFunction_t mxfp4_matvec;
+    hipFunction_t mxfp4_grouped_matvec;
     hipFunction_t gemm_fp8_rowscale;
     hipFunction_t gemm_bf16;
     hipFunction_t gemm_f16;
@@ -328,6 +330,10 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
                              "ds4f_dense_mxfp4_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_mxfp4_grouped, ctx->module,
                              "ds4f_dense_mxfp4_grouped_gemm") != hipSuccess ||
+        hipModuleGetFunction(&ctx->mxfp4_matvec, ctx->module,
+                             "ds4f_dense_mxfp4_matvec") != hipSuccess ||
+        hipModuleGetFunction(&ctx->mxfp4_grouped_matvec, ctx->module,
+                             "ds4f_dense_mxfp4_grouped_matvec") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_bf16, ctx->module,
                              "ds4f_dense_bf16_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_f16, ctx->module,
@@ -971,6 +977,99 @@ int hip_ds4f_dense_resident_mxfp4_layer(void *opaque, const ds4f_layer *layer, i
     return stream_layer_impl(opaque, layer, raw != 0, 1);
 }
 
+typedef struct {
+    uint64_t hits;
+    int layer, expert;
+} hip_ds4f_hot_expert;
+
+static int hot_expert_cmp(const void *ap, const void *bp) {
+    const hip_ds4f_hot_expert *a = (const hip_ds4f_hot_expert *)ap;
+    const hip_ds4f_hot_expert *b = (const hip_ds4f_hot_expert *)bp;
+    if (a->hits != b->hits) return a->hits < b->hits ? 1 : -1;
+    if (a->layer != b->layer) return a->layer - b->layer;
+    return a->expert - b->expert;
+}
+
+static size_t expert_bundle_bytes(const ds4f_layer *layer, int slot) {
+    if (!layer || slot < 0 || slot >= layer->n_owned) return 0;
+    const ds4f_tensor *t[3] = { &layer->ex_w1[slot], &layer->ex_w3[slot],
+                                &layer->ex_w2[slot] };
+    size_t total = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (t[i]->type != DS4F_MXFP4 || !valid_dims(t[i]->rows, t[i]->cols) ||
+            (t[i]->cols & 31)) return 0;
+        size_t wb = (size_t)t[i]->rows * (size_t)(t[i]->cols / 2);
+        size_t sb = (size_t)t[i]->rows * (size_t)(t[i]->cols / 32);
+        if (SIZE_MAX - total < wb + sb) return 0;
+        total += wb + sb;
+    }
+    return total;
+}
+
+int hip_ds4f_dense_cache_hot_experts(void *opaque, void *model_opaque,
+                                     int cache_mb, int reserve_mb, int stats) {
+    hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    ds4f_model *model = (ds4f_model *)model_opaque;
+    if (!ctx || !model || cache_mb == 0 || !model->route_hits ||
+        hipSetDevice(ctx->device_id) != hipSuccess) return 0;
+    const int L = model->cfg.n_layers, E = model->cfg.n_experts;
+    if (L <= 0 || E <= 0 || (size_t)L > SIZE_MAX / (size_t)E) return -1;
+    const size_t ncand = (size_t)L * (size_t)E;
+    hip_ds4f_hot_expert *cand = (hip_ds4f_hot_expert *)malloc(ncand * sizeof(*cand));
+    if (!cand) return -1;
+    size_t n = 0;
+    for (int l = 0; l < L; ++l) for (int e = 0; e < E; ++e) {
+        uint64_t hits = model->route_hits[(size_t)l * E + e];
+        if (hits && e % model->ep_size == model->ep_rank)
+            cand[n++] = (hip_ds4f_hot_expert){ hits, l, e };
+    }
+    qsort(cand, n, sizeof(*cand), hot_expert_cmp);
+
+    size_t free_bytes = 0, total_bytes = 0;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+        free(cand); return -1;
+    }
+    (void)total_bytes;
+    const size_t reserve = (size_t)(reserve_mb > 0 ? reserve_mb : 1536) * 1048576u;
+    size_t budget = free_bytes > reserve ? free_bytes - reserve : 0;
+    if (cache_mb > 0 && (size_t)cache_mb * 1048576u < budget)
+        budget = (size_t)cache_mb * 1048576u;
+    size_t used = 0;
+    uint64_t covered = 0, total_hits = 0;
+    int admitted = 0;
+    for (size_t i = 0; i < n; ++i) total_hits += cand[i].hits;
+    for (size_t i = 0; i < n; ++i) {
+        ds4f_layer *layer = &model->layers[cand[i].layer];
+        int slot = cand[i].expert / model->ep_size;
+        size_t bytes = expert_bundle_bytes(layer, slot);
+        if (!bytes || bytes > budget - used) continue;
+        ds4f_tensor *t[3] = { &layer->ex_w1[slot], &layer->ex_w3[slot],
+                              &layer->ex_w2[slot] };
+        if (t[0]->gpu_id >= 0 && t[1]->gpu_id >= 0 && t[2]->gpu_id >= 0) {
+            covered += cand[i].hits;
+            continue;
+        }
+        if (hip_ds4f_dense_bind_mxfp4_tensor(ctx, t[0]) < 0 ||
+            hip_ds4f_dense_bind_mxfp4_tensor(ctx, t[1]) < 0 ||
+            hip_ds4f_dense_bind_mxfp4_tensor(ctx, t[2]) < 0) {
+            free(cand); return -1;
+        }
+        used += bytes;
+        covered += cand[i].hits;
+        admitted++;
+    }
+    if (stats || ctx->verbose) {
+        fprintf(stderr,
+                "hip_ds4f_dense: prompt-hot expert cache bundles=%d bytes=%.3f GB "
+                "training_coverage=%.2f%% reserve=%d MB\n",
+                admitted, (double)used / 1e9,
+                total_hits ? 100.0 * (double)covered / (double)total_hits : 0.0,
+                reserve_mb > 0 ? reserve_mb : 1536);
+    }
+    free(cand);
+    return admitted;
+}
+
 int hip_ds4f_dense_bind_fp8_ordered_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t) {
     if (!ctx || !t || t->type != DS4F_FP8) return -1;
     int id = hip_ds4f_dense_bind_tensor(ctx, t);
@@ -1299,11 +1398,11 @@ int hip_ds4f_dense_matvec_id_async(hip_ds4f_dense *ctx, int id, const float *x) 
             hipStreamSynchronize(ctx->stream);
             return -1;
         }
-        int n_out = mat->rows, n_in = mat->cols, n_tok = 1;
+        int n_out = mat->rows, n_in = mat->cols;
         void *dw = mat->dw, *ds = mat->ds, *dx = ctx->dx, *dy = ctx->dy;
-        void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok };
-        hipError_t err = hipModuleLaunchKernel(ctx->gemm_mxfp4,
-            (unsigned int)((n_out + 63) / 64), 1, 1, 16, 16, 1, 0,
+        void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in };
+        hipError_t err = hipModuleLaunchKernel(ctx->mxfp4_matvec,
+            (unsigned int)((n_out + 7) / 8), 1, 1, 256, 1, 1, 0,
             ctx->stream, args, NULL);
         if (err != hipSuccess) {
             fprintf(stderr, "hip_ds4f_dense: mxfp4 matvec launch failed (%d)\n", (int)err);
@@ -1853,12 +1952,14 @@ int hip_ds4f_dense_gemm_tensors(
     if (hipMemcpy(ctx->gemm_dx, ctx->gemm_x_pack, xbytes, hipMemcpyHostToDevice) != hipSuccess)
         return -1;
     int grouped_raw = n > 1;
+    int grouped_m1 = grouped_raw;
     unsigned int group_gx = 0, group_gy = 0;
     if (grouped_raw) {
         hip_ds4f_mxfp4_task task[HIP_DS4F_GEMM_MAX];
         memset(task, 0, (size_t)n * sizeof(*task));
         for (int i = 0; i < n; ++i) {
-            if (!matrix_is_mxfp4(mat[i]->kind)) { grouped_raw = 0; break; }
+            if (!matrix_is_mxfp4(mat[i]->kind)) { grouped_raw = grouped_m1 = 0; break; }
+            if (M[i] != 1) grouped_m1 = 0;
             task[i].w = mat[i]->dw;
             task[i].s = mat[i]->ds;
             task[i].x = (uint8_t *)ctx->gemm_dx + xoff[i];
@@ -1878,8 +1979,14 @@ int hip_ds4f_dense_gemm_tensors(
                 return -1;
             int ntasks = n;
             void *args[] = { &ctx->gemm_mxfp4_tasks, &ntasks };
-            if (hipModuleLaunchKernel(ctx->gemm_mxfp4_grouped,
-                    group_gx, group_gy, (unsigned int)n, 16, 16, 1, 0,
+            hipFunction_t group_fn = grouped_m1 ? ctx->mxfp4_grouped_matvec
+                                                : ctx->gemm_mxfp4_grouped;
+            unsigned int launch_gx = grouped_m1
+                ? (unsigned int)((t[0]->rows + 7) / 8) : group_gx;
+            if (hipModuleLaunchKernel(group_fn,
+                    launch_gx, grouped_m1 ? (unsigned int)n : group_gy,
+                    grouped_m1 ? 1u : (unsigned int)n,
+                    grouped_m1 ? 256u : 16u, grouped_m1 ? 1u : 16u, 1, 0,
                     ctx->stream, args, NULL) != hipSuccess)
                 return -1;
         }

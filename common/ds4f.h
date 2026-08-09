@@ -416,6 +416,8 @@ typedef struct ds4f_runtime_options {
     int hip_mxfp4_resident_auto;         /* derive resident prefix from free VRAM */
     int hip_vram_reserve_mb;             /* safety margin for streamed/work buffers */
     int hip_mxfp4_stream_raw;            /* use compact raw MXFP4/LUT for streamed experts */
+    int hip_expert_cache_mb;              /* 0=off, -1=auto, >0 raw MXFP4 expert-cache budget */
+    int hip_expert_cache_stats;           /* report prompt-hot cache coverage and residency */
     int hip_prefill_attn;                /* experimental opt-in GPU sliding-window attention; exact default is 0 */
     int hip_exact_prefill;              /* keep M>1 prompt GEMMs on CPU reference path */
     int debug_env;
@@ -692,6 +694,7 @@ typedef struct {
      * route_hits is [n_layers,n_experts]; route_tokens counts routed tokens per
      * layer.  Keeping it model-local makes server and benchmark reports agree. */
     uint64_t *route_hits, *route_tokens;
+    int route_telemetry;
     /* per-phase wall-time profiler (seconds, accumulated; printed by runner) */
 #define DS4F_NPHASE 24
     double prof[DS4F_NPHASE];

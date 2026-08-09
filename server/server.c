@@ -2535,6 +2535,8 @@ static void usage(const char *prog) {
         "  --ds4f-hip <0|1>         attach the AMD HIP dense bank\n"
         "  --ds4f-hip-device <n>    AMD device ordinal\n"
         "  --ds4f-hip-async <0|1>   use asynchronous HIP submissions\n"
+        "  --ds4f-hip-expert-cache-mb <0|-1|MB> prompt-hot MXFP4 decode cache (-1=auto)\n"
+        "  --ds4f-hip-expert-cache-stats <0|1> report cache coverage/residency\n"
         "  --ds4f-hip-verbose <0|1> HIP diagnostics\n"
         "  --ds4f-hip-shared-bf16 <0|1>  approximate hot-shared BF16 mode\n"
         "  --ds4f-hip-shared-bf16-layers <n>  limit approximate mode layers\n"
@@ -2595,6 +2597,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--ds4f-hip") == 0 && i + 1 < argc) cfg.ds4f_options.use_hip = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-hip-device") == 0 && i + 1 < argc) cfg.ds4f_options.hip_device = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-hip-async") == 0 && i + 1 < argc) cfg.ds4f_options.hip_async = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-expert-cache-mb") == 0 && i + 1 < argc) cfg.ds4f_options.hip_expert_cache_mb = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-expert-cache-stats") == 0 && i + 1 < argc) cfg.ds4f_options.hip_expert_cache_stats = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-hip-verbose") == 0 && i + 1 < argc) cfg.ds4f_options.hip_verbose = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-hip-shared-bf16") == 0 && i + 1 < argc) cfg.ds4f_options.hip_shared_bf16 = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ds4f-hip-shared-bf16-layers") == 0 && i + 1 < argc) cfg.ds4f_options.hip_shared_bf16_layers = atoi(argv[++i]);
@@ -2648,6 +2652,10 @@ int main(int argc, char **argv) {
         envopt.hip_device = cfg.ds4f_options.hip_device;
         envopt.hip_async = cfg.ds4f_options.hip_async;
         envopt.hip_verbose = cfg.ds4f_options.hip_verbose;
+        if (cfg.ds4f_options.hip_expert_cache_mb)
+            envopt.hip_expert_cache_mb = cfg.ds4f_options.hip_expert_cache_mb;
+        if (cfg.ds4f_options.hip_expert_cache_stats)
+            envopt.hip_expert_cache_stats = cfg.ds4f_options.hip_expert_cache_stats;
         cfg.ds4f_options = envopt;
     }
     if (cfg.ds4f_model)

@@ -31,6 +31,7 @@ struct ds4f_session {
     char tokenizer_py[1024];
     int max_pos;
     ds4f_runtime_options options;
+    int expert_cache_ready;
 
     /* One exact prompt snapshot. It stores only KV rows up to cache_len, not
      * the 156 GB model. Tier-B2 has additional compressor/indexer state and is
@@ -690,6 +691,21 @@ char *ds4f_session_generate(ds4f_session *s, const char *prompt, int max_tokens,
         /* Cache is an optimization; generation remains valid without it. */
         cache_free(s);
     }
+#if defined(DIFFUSION_SERVER_ENABLE_DS4F_HIP)
+    /* Route telemetry from the real prompt is a better admission signal than
+     * a synthetic warmup. Populate once: decode never uploads cache misses. */
+    if (s->gpu && !s->expert_cache_ready && s->options.hip_expert_cache_mb != 0) {
+        int nb = hip_ds4f_dense_cache_hot_experts(s->gpu, s->m,
+            s->options.hip_expert_cache_mb, s->options.hip_vram_reserve_mb,
+            s->options.hip_expert_cache_stats);
+        if (nb < 0) {
+            ds4f_mem_pool_destroy(req);
+            set_err(err, err_cap, "DS4F HIP prompt-hot expert cache upload failed");
+            return NULL;
+        }
+        s->expert_cache_ready = 1;
+    }
+#endif
 
     int *gen = (int *)ds4f_mem_alloc(req,
                                      (size_t)(max_tokens ? max_tokens : 1) * sizeof(int),

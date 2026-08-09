@@ -31,6 +31,7 @@ static void usage(const char *prog) {
                     "--hip-mxfp4-resident-layers n "
                     "--hip-mxfp4-resident-auto 0|1 --hip-vram-reserve-mb n "
                     "--hip-mxfp4-stream-raw 0|1 "
+                    "--hip-expert-cache-mb 0|auto|MB --hip-expert-cache-stats 0|1 "
                     "--hip-prefill-attn 0|1 --hip-fused-shared-ffn 0|1 "
                     "[--dual-gpu 0|1 --cuda-device n --dual-cuda-mxfp4 0|1 --dual-cuda-terms 1|2 "
                     "--dual-cuda-small-buckets 0|1 --dual-cuda-resident-from n "
@@ -104,6 +105,18 @@ static int check_mxfp4_gemm(ds4f_model *m, hip_ds4f_dense *hip, int widened) {
     int id = widened
         ? hip_ds4f_dense_bind_mxfp4_widened_tensor(hip, t)
         : hip_ds4f_dense_bind_mxfp4_tensor(hip, t);
+    if (!widened && id >= 0) {
+        int mvrc = hip_ds4f_dense_matvec_tensor(hip, got, t, x);
+        float mvabs = 0.0f;
+        float mvrel = mvrc == 0 ? max_rel_error(ref, got, N, &mvabs) : 1.0f;
+        printf("real MXFP4 raw decode matvec: N=%d K=%d max_abs=%.8g max_rel=%.8g %s\n",
+               N, K, mvabs, mvrel,
+               mvrc == 0 && mvrel <= 2.0e-5f ? "PASS" : "FAIL");
+        if (mvrc != 0 || mvrel > 2.0e-5f) {
+            m->mxfp4_w4a8 = old_w4a8;
+            return 0;
+        }
+    }
     int rc = id >= 0 ? hip_ds4f_dense_gemm_tensor(hip, got, t, x, M, N, K) : -1;
     float absmax = 0.0f, rel = rc == 0 ? max_rel_error(ref, got, M*N, &absmax) : 1.0f;
     double t0 = wall_seconds();
@@ -332,6 +345,27 @@ static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
         ds4f_warm_tb2(m, warm);
         fprintf(stderr, "real hybrid decode: synthetic KV context warmed to %d, measuring pos %d..%d\n",
                 warm, pos0, pos0 + iters - 1);
+    }
+
+    if (opt->hip_expert_cache_mb != 0) {
+        const int train_tokens = 8;
+        double cache_t0 = wall_seconds();
+        for (int k = 0; k < train_tokens; ++k) {
+            for (int i = 0; i < C; ++i)
+                x[i] = ((float)((i * 29 + k * 17) % 101) - 50.0f) / 37.0f;
+            (void)ds4f_forward_token(m, x, k % m->cfg.max_pos);
+        }
+        int admitted = hip_ds4f_dense_cache_hot_experts(
+            hip, m, opt->hip_expert_cache_mb, opt->hip_vram_reserve_mb,
+            opt->hip_expert_cache_stats);
+        if (admitted < 0) {
+            fprintf(stderr, "real hybrid decode: prompt-hot expert cache setup failed\n");
+            return 0;
+        }
+        fprintf(stderr,
+                "real hybrid decode: expert-cache training=%d tokens bundles=%d setup=%.3fs\n",
+                train_tokens, admitted, wall_seconds() - cache_t0);
+        memset(m->prof, 0, sizeof(m->prof));
     }
 
     double t0 = wall_seconds();
@@ -738,6 +772,10 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--hip-mxfp4-resident-auto") == 0 && i + 1 < argc) opt.hip_mxfp4_resident_auto = atoi(argv[++i]);
         else if (strcmp(a, "--hip-vram-reserve-mb") == 0 && i + 1 < argc) opt.hip_vram_reserve_mb = atoi(argv[++i]);
         else if (strcmp(a, "--hip-mxfp4-stream-raw") == 0 && i + 1 < argc) opt.hip_mxfp4_stream_raw = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-expert-cache-mb") == 0 && i + 1 < argc) {
+            const char *v = argv[++i]; opt.hip_expert_cache_mb = strcmp(v, "auto") == 0 ? -1 : atoi(v);
+        }
+        else if (strcmp(a, "--hip-expert-cache-stats") == 0 && i + 1 < argc) opt.hip_expert_cache_stats = atoi(argv[++i]);
         else if (strcmp(a, "--hip-prefill-attn") == 0 && i + 1 < argc) opt.hip_prefill_attn = atoi(argv[++i]);
         else if (strcmp(a, "--dual-gpu") == 0 && i + 1 < argc) dual_gpu = atoi(argv[++i]);
         else if (strcmp(a, "--cuda-device") == 0 && i + 1 < argc) cuda_device = atoi(argv[++i]);

@@ -834,6 +834,16 @@ On 16-GB-class RDNA4 cards, `"hip_mxfp4_resident_layers": 20` keeps the first
 this measured 35.4 tok/s for full 43-layer batch-64 prefill with zero argmax
 mismatches.
 
+For single-token decode, `"hip_expert_cache_mb": 2048` instead admits complete
+prompt-hot local expert bundles (gate, up, and down) after observing the real
+prompt. Cache misses remain on the CPU and no weight transfer occurs on the
+decode critical path. The raw MXFP4 M=1 kernel assigns one wave32 to each
+output row; on RX 9070 XT with the 0731 model, EP8 rank 0 measured 20.98 tok/s
+for 32 tokens versus an 18.41 tok/s median without the cache. Use `-1` for an
+automatic free-VRAM budget and `"hip_expert_cache_stats": 1` for coverage
+reporting. Server equivalents are `--ds4f-hip-expert-cache-mb` and
+`--ds4f-hip-expert-cache-stats`.
+
 These MXFP4 expert streaming options are single-GPU HIP features. The dual
 dispatcher owns expert routing and keeps small buckets on the exact CPU path,
 so streaming would only upload weights it never uses; `--dual-gpu 1` leaves

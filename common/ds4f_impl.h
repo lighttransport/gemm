@@ -766,7 +766,8 @@ static void ds4f_matvec_multi(ds4f_model *m, const ds4f_mv1 *list, int n) {
         int all_gpu = n > 0;
         for (int s = 0; s < n; s++) {
             const ds4f_tensor *t = list[s].t;
-            if (t->type != DS4F_FP8 || t->gpu_id < 0) { all_gpu = 0; break; }
+            if ((t->type != DS4F_FP8 && t->type != DS4F_MXFP4) ||
+                t->gpu_id < 0) { all_gpu = 0; break; }
         }
         if (all_gpu) {
             for (int s = 0; s < n; s++) {
@@ -2907,6 +2908,9 @@ static ds4f_model *ds4f_alloc_synth_opts(const ds4f_runtime_options *opt) {
     m->n_threads = n_threads; m->n_cmgs = n_cmgs;
     m->gpu_exact_prefill = opt->hip_exact_prefill ? 1 : 0;
     m->mxfp4_w4a8 = opt->mxfp4_w4a8;
+    { const char *e = getenv("DS4F_ROUTE_TELEMETRY");
+      m->route_telemetry = opt->hip_expert_cache_mb != 0 || opt->hip_expert_cache_stats ||
+                           (e && *e && atoi(e) != 0); }
     ds4f_init_fp8_e4m3_lut(m->fp8_lut);
     /* Dense default is FP8 on-demand (lean ~21.6 GB/node, safe to 128K ctx).
      * DS4F_FP8_BF16=1 predequants the replicated dense to BF16 (+6 GB, faster,
@@ -3141,6 +3145,9 @@ static ds4f_runtime_options ds4f_runtime_options_debug_env(ds4f_config cfg,
     { const char *e = getenv("DS4F_HIP_MXFP4_RESIDENT_AUTO"); o.hip_mxfp4_resident_auto = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_VRAM_RESERVE_MB"); o.hip_vram_reserve_mb = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_MXFP4_STREAM_RAW"); o.hip_mxfp4_stream_raw = e && *e ? atoi(e) : 0; }
+    { const char *e = getenv("DS4F_HIP_EXPERT_CACHE_MB");
+      o.hip_expert_cache_mb = e && *e ? (strcmp(e, "auto") == 0 ? -1 : atoi(e)) : 0; }
+    { const char *e = getenv("DS4F_HIP_EXPERT_CACHE_STATS"); o.hip_expert_cache_stats = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_PREFILL_ATTN"); o.hip_prefill_attn = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_EXACT_PREFILL"); o.hip_exact_prefill = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_SPARSE"); o.sparse = e && *e ? atoi(e) : 0; }
@@ -3276,6 +3283,8 @@ static int ds4f_runtime_options_load_json(ds4f_runtime_options *o, const char *p
     o->hip_mxfp4_resident_auto = ds4f_json_int(json, "hip_mxfp4_resident_auto", o->hip_mxfp4_resident_auto);
     o->hip_vram_reserve_mb = ds4f_json_int(json, "hip_vram_reserve_mb", o->hip_vram_reserve_mb);
     o->hip_mxfp4_stream_raw = ds4f_json_int(json, "hip_mxfp4_stream_raw", o->hip_mxfp4_stream_raw);
+    o->hip_expert_cache_mb = ds4f_json_int(json, "hip_expert_cache_mb", o->hip_expert_cache_mb);
+    o->hip_expert_cache_stats = ds4f_json_int(json, "hip_expert_cache_stats", o->hip_expert_cache_stats);
     o->hip_prefill_attn = ds4f_json_int(json, "hip_prefill_attn", o->hip_prefill_attn);
     o->hip_exact_prefill = ds4f_json_int(json, "hip_exact_prefill", o->hip_exact_prefill);
     o->sparse = ds4f_json_int(json, "sparse", o->sparse);
@@ -4034,6 +4043,9 @@ static ds4f_model *ds4f_load_real_opts(const ds4f_runtime_options *opt) {
     m->n_threads = n_threads; m->n_cmgs = n_cmgs;
     m->gpu_exact_prefill = opt->hip_exact_prefill ? 1 : 0;
     m->mxfp4_w4a8 = opt->mxfp4_w4a8;
+    { const char *e = getenv("DS4F_ROUTE_TELEMETRY");
+      m->route_telemetry = opt->hip_expert_cache_mb != 0 || opt->hip_expert_cache_stats ||
+                           (e && *e && atoi(e) != 0); }
     /* real dtypes: staged dense = FP8(e4m3fn), experts = MXFP4, router/head/embed/
      * norm = BF16 row-major. DS4F_FP8_BF16=1 PROMOTES the replicated dense FP8->bf16
      * at load time (EXACT: e4m3 fits bf16) and auto-enables the pv pair-interleaved
@@ -5150,12 +5162,7 @@ static void ds4f_topk_exact(const float *logits, const float *bias, int n, int k
 }
 
 static void ds4f_route_observe(ds4f_model *m, int layer, const int *idx, int n) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *e = getenv("DS4F_ROUTE_TELEMETRY");
-        enabled = e && *e && atoi(e) != 0;
-    }
-    if (!enabled) return;
+    if (!m || !m->route_telemetry) return;
     if (!m->route_hits) {
         size_t nh = (size_t)m->cfg.n_layers * (size_t)m->cfg.n_experts;
         m->route_hits = (uint64_t *)ds4f_mem_alloc(m->mem, nh * sizeof(uint64_t), 256, 1);
@@ -7200,6 +7207,27 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         if (ds4f_dbg) { fprintf(stderr, "  L%-2d topk wt=", L);
             for (int k=0;k<c->n_active;k++) fprintf(stderr,"%.3f(e%d) ", wt[k], idx[k]);
             fprintf(stderr,"\n"); }
+        /* The shared expert normally remains in flight while all routed work
+         * runs on the CPU. A resident routed expert uses the same HIP adapter,
+         * so retire shared first only when this token has an actual cache hit. */
+        int routed_gpu_hit = 0;
+        for (int k = 0; k < c->n_active; ++k) {
+            int e = idx[k];
+            if (e < 0 || e % m->ep_size != m->ep_rank) continue;
+            int slot = e / m->ep_size;
+            if (ly->ex_w1[slot].gpu_id >= 0 && ly->ex_w3[slot].gpu_id >= 0 &&
+                ly->ex_w2[slot].gpu_id >= 0) { routed_gpu_hit = 1; break; }
+        }
+        if (shared_gpu_pending && routed_gpu_hit) {
+            DS4F_TIC();
+            if (m->gpu_dense_wait(m->gpu_dense_ctx) != 0) {
+                fprintf(stderr, "ds4f: asynchronous shared-expert wait failed\n");
+                abort();
+            }
+            ds4f_shared_finish(m, ly, L, tps2);
+            shared_gpu_pending = 0;
+            DS4F_TOC(DS4F_P_SHARED);
+        }
         /* ---- MoE: routed experts (owned-only) ---- */
         { DS4F_TIC();
         if (ds4f_expert_batch_on()) {
@@ -7212,16 +7240,24 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
                 local_k[nlocal++] = k;
             }
             if (nlocal > 0) {
-                ds4f_mv1 gateup[16];
+                ds4f_mv1 gateup_gpu[16], gateup_cpu[16];
+                int ngpu = 0, ncpu = 0;
                 for (int j = 0; j < nlocal; j++) {
                     int k = local_k[j], slot = idx[k] / m->ep_size;
-                    gateup[2*j+0] = (ds4f_mv1){ m->s_exb_g + (size_t)j * c->moe_inter,
-                                                &ly->ex_w1[slot], m->s_h2 };
-                    gateup[2*j+1] = (ds4f_mv1){ m->s_exb_u + (size_t)j * c->moe_inter,
-                                                &ly->ex_w3[slot], m->s_h2 };
+                    ds4f_mv1 a = { m->s_exb_g + (size_t)j * c->moe_inter,
+                                    &ly->ex_w1[slot], m->s_h2 };
+                    ds4f_mv1 b = { m->s_exb_u + (size_t)j * c->moe_inter,
+                                    &ly->ex_w3[slot], m->s_h2 };
+                    if (a.t->gpu_id >= 0 && b.t->gpu_id >= 0) {
+                        gateup_gpu[ngpu++] = a; gateup_gpu[ngpu++] = b;
+                    } else {
+                        gateup_cpu[ncpu++] = a; gateup_cpu[ncpu++] = b;
+                    }
                 }
-                /* One barrier for all active experts' w1/w3 projections. */
-                ds4f_matvec_multi(m, gateup, 2 * nlocal);
+                /* Cache misses stay on the exact CPU path. Cache hits use the
+                 * compact raw-MXFP4 HIP matrices and never trigger H2D here. */
+                if (ncpu) ds4f_matvec_multi(m, gateup_cpu, ncpu);
+                if (ngpu) ds4f_matvec_multi(m, gateup_gpu, ngpu);
                 for (int j = 0; j < nlocal; j++) {
                     float *g = m->s_exb_g + (size_t)j * c->moe_inter;
                     const float *u = m->s_exb_u + (size_t)j * c->moe_inter;
@@ -7231,15 +7267,18 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
                     } else
                         for (int i = 0; i < c->moe_inter; i++) g[i] = ds4f_silu(g[i]) * u[i];
                 }
-                ds4f_mv1 down[8];
+                ds4f_mv1 down_gpu[8], down_cpu[8];
+                ngpu = ncpu = 0;
                 for (int j = 0; j < nlocal; j++) {
                     int k = local_k[j], slot = idx[k] / m->ep_size;
-                    down[j] = (ds4f_mv1){ m->s_exb_o + (size_t)j * C,
-                                          &ly->ex_w2[slot],
-                                          m->s_exb_g + (size_t)j * c->moe_inter };
+                    ds4f_mv1 a = { m->s_exb_o + (size_t)j * C,
+                                    &ly->ex_w2[slot],
+                                    m->s_exb_g + (size_t)j * c->moe_inter };
+                    if (a.t->gpu_id >= 0) down_gpu[ngpu++] = a;
+                    else down_cpu[ncpu++] = a;
                 }
-                /* One barrier for all active experts' w2 projections. */
-                ds4f_matvec_multi(m, down, nlocal);
+                if (ncpu) ds4f_matvec_multi(m, down_cpu, ncpu);
+                if (ngpu) ds4f_matvec_multi(m, down_gpu, ngpu);
                 for (int j = 0; j < nlocal; j++) {
                     const float *y = m->s_exb_o + (size_t)j * C;
                     float w = wt[local_k[j]];

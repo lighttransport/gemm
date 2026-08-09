@@ -106,6 +106,11 @@ int hip_ds4f_dense_prefill_attention(
 /* Pre-upload one local expert layer and retain it in the dense bank. Resident
  * layers are reused by stream_layer callbacks without another H2D transfer. */
 int hip_ds4f_dense_resident_mxfp4_layer(void *ctx, const ds4f_layer *layer, int raw);
+/* Preload the prompt-hot routed expert bundles into otherwise free VRAM.
+ * Cache misses remain CPU-owned; this function never installs a decode-time
+ * upload path. Returns the number of complete expert bundles admitted. */
+int hip_ds4f_dense_cache_hot_experts(void *ctx, void *model,
+                                     int cache_mb, int reserve_mb, int stats);
 /* Choose the largest prefix that leaves room for the two streamed slots and
  * a caller-selected safety margin. Returns zero when no resident layer fits. */
 int hip_ds4f_dense_recommend_mxfp4_resident_layers(
