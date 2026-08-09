@@ -6,6 +6,13 @@
 
 using namespace nvcuda;
 
+extern "C" __global__ void ds4f_cuda_swiglu(
+        float *g, const float *u, size_t n, float lim) {
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n){float a=fminf(g[i],lim),b=fminf(fmaxf(u[i],-lim),lim);
+        g[i]=(a/(1.0f+expf(-a)))*b;}
+}
+
 /* Per-row, per-32 activation quantization for SM120 native MXFP8. */
 extern "C" __global__ void ds4f_cuda_quant_fp8_vec128(
         uint8_t *Q, uint8_t *scale, const float *X, int rows, int cols) {
