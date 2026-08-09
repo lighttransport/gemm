@@ -2050,6 +2050,15 @@ int hip_ds4f_dense_gemm_tensors(
     if (hipSetDevice(ctx->device_id) != hipSuccess) return -1;
     size_t xoff[HIP_DS4F_GEMM_MAX], xbytes = 0;
     for (int i = 0; i < n; ++i) {
+        /* ds4f_gemm_pair() submits projections that consume the exact same
+         * token matrix (qkv and shared w1/w3).  Pack that input once and let
+         * both device tasks read it; the old code duplicated the host copy,
+         * device upload, and cache footprint for every pair member. */
+        if (i > 0 && M[i] == M[0] && Xstride[i] == Xstride[0] &&
+            x[i] == x[0]) {
+            xoff[i] = xoff[0];
+            continue;
+        }
         xoff[i] = xbytes;
         xbytes += (size_t)M[i] * (size_t)k0 * sizeof(float);
     }
