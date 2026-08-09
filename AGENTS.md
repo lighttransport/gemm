@@ -109,7 +109,7 @@ program arguments, not `DS4F_HIP_*` environment variables. The full device-
 resident prefill chain is enabled with:
 
 ```
---hip-qkv-fuse 1 --hip-qkv-device-chain 1 --hip-attn-device-chain 1 \
+--hip-prefill-attn 1 --hip-qkv-fuse 1 --hip-qkv-device-chain 1 --hip-attn-device-chain 1 \
 --hip-attn-no-d2h 1 --hip-routed-ffn 1 --hip-fp8-wmma 2 \
 --hip-bf16-wmma 1 --hip-attn-wmma 1 --hip-oproj-group-wmma 2 \
 --hip-mxfp4-wmma 1 --hip-block-threads 128
