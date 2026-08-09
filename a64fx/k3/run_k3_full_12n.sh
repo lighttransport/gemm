@@ -22,6 +22,7 @@ PROFILE=${K3_PROFILE:-0}
 PREFILL_TOKENS=32
 NEW_TOKENS=0
 PREFILL_CHUNK=1
+PREFILL_PATH=auto
 AR_GROUPS=${K3_AR_GROUPS:-2}
 EXPERT_TP=${K3_EXPERT_TP:-0}
 MOE_SHARD_LAYOUT=${K3_MOE_SHARD_LAYOUT:-row-aligned}
@@ -47,6 +48,7 @@ usage: $0 [options]
   --prefill-tokens N
   --new-tokens N
   --prefill-chunk N
+  --prefill-path auto|scalar|batched|validate
   --threads N
   --input-seed N
   --expert-tp            stage every expert's TP slice for the fused-MoE probe
@@ -66,6 +68,7 @@ while [ "$#" -gt 0 ]; do
         --prefill-tokens) PREFILL_TOKENS=$2; shift 2;;
         --new-tokens) NEW_TOKENS=$2; shift 2;;
         --prefill-chunk) PREFILL_CHUNK=$2; shift 2;;
+        --prefill-path) PREFILL_PATH=$2; shift 2;;
         --threads) THREADS=$2; shift 2;;
         --input-seed) INPUT_SEED=$2; shift 2;;
         --ar-groups) AR_GROUPS=$2; shift 2;;
@@ -152,7 +155,7 @@ args=(--mode "$MODE" --nodes 12 --threads "$THREADS" --stage-dir "$STAGE_DIR"
       --topo "$ROOT/topology.txt" --output "$ROOT/output.txt"
       --real-layer-index "$LAYER_INDEX" --input-seed "$INPUT_SEED"
       --prefill-tokens "$PREFILL_TOKENS" --new-tokens "$NEW_TOKENS"
-      --prefill-chunk "$PREFILL_CHUNK" --max-seq 4096
+      --prefill-chunk "$PREFILL_CHUNK" --prefill-path "$PREFILL_PATH" --max-seq 4096
       --comm-deterministic "$COMM_DETERMINISTIC" --comm-bf16 "$COMM_BF16"
       --comm-robust "$COMM_ROBUST" --comm-poll-spins "$COMM_POLL_SPINS"
       --comm-a2a "$COMM_A2A" --comm-a2a-max "$COMM_A2A_MAX"

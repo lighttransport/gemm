@@ -49,8 +49,8 @@ fast-12n-decode: k3_ep_runner
 k3_ep_runner: k3_ep_runner.c k3_moe.h k3_dense.h k3_kernels.h k3_runtime.h ../utofu-tests/tp_allreduce.h ../utofu-tests/tofu_demo.h
 	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< -lm -ltofucom -o $@
 
-k3_full_runner: k3_full_runner.c k3_moe.h k3_dense.h k3_kernels.h k3_quant.h k3_runtime.h ../utofu-tests/tp_allreduce.h ../utofu-tests/tofu_demo.h
-	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< -lm -ltofucom -o $@
+k3_full_runner: k3_full_runner.c k3_moe.h k3_dense.h k3_kernels.h k3_prefill.h k3_quant.h k3_runtime.h ../utofu-tests/tp_allreduce.h ../utofu-tests/tofu_demo.h ../vlm/kernels/micro_kernel_bf16B_8x3_pv.S
+	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< ../vlm/kernels/micro_kernel_bf16B_8x3_pv.S -lm -ltofucom -o $@
 
 k3_full_convert: k3_full_convert.c k3_dense.h k3_kernels.h k3_runtime.h
 	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< -lm -o $@
