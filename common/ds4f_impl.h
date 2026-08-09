@@ -6478,15 +6478,23 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         { ds4f_pf_kv_task t = { m, ly, pos0, M, rcos, rsin };
           ds4f_pool_run(m->pool, ds4f_pf_kvpost_worker, &t); }
         DS4F_TOC(DS4F_P_QKV); }
+        int tpo = (m->oi_rows < c->o_inter);
+        int gpu_attn_oproj_ok = 0;
         /* ---- attention (sliding window + sink), over (token,head) ---- */
         { DS4F_TIC();
         int gpu_attn_ok = 0;
-        if (m->gpu_prefill_attn) {
+        if (m->gpu_prefill_attn_oproj && !tpo && ly->wo_a.gpu_id >= 0 && ly->wo_b.gpu_id >= 0) {
+            gpu_attn_oproj_ok = m->gpu_prefill_attn_oproj(m->gpu_dense_ctx, m->p_o, m->p_q,
+                ly->kv_cache, ly->attn_sink, rcos, rsin, &ly->wo_a, &ly->wo_b, M, pos0,
+                c->n_heads, HD, KV, ly->kv_slots, c->window_size, 1.0f/sqrtf((float)HD),
+                HD-c->qk_rope_dim, c->qk_rope_dim/2, og, gin, c->o_lora, H, C, c->o_inter) == 0;
+        }
+        if (!gpu_attn_oproj_ok && m->gpu_prefill_attn) {
             gpu_attn_ok = m->gpu_prefill_attn(
                 m->gpu_dense_ctx, m->p_attn, m->p_q, ly->kv_cache,
                 ly->attn_sink, M, pos0, c->n_heads, HD, KV,
                 ly->kv_slots, c->window_size, 1.0f / sqrtf((float)HD)) == 0;
-            if (gpu_attn_ok) {
+            if (gpu_attn_ok && !gpu_attn_oproj_ok) {
                 int nope = HD - c->qk_rope_dim;
                 for (int mm = 0; mm < M; ++mm)
                     for (int h = 0; h < c->n_heads; ++h)
@@ -6508,10 +6516,9 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         DS4F_TOC(DS4F_P_ATTN); }
         /* ---- grouped low-rank o-projection ---- */
         { DS4F_TIC();
-        int tpo = (m->oi_rows < c->o_inter);   /* TP_OPROJ: wo_a o_inter row-shard (wo_b full over zero-pad) */
-        int gpu_oproj = !tpo && m->gpu_oproj && ly->wo_a.gpu_id >= 0 && ly->wo_b.gpu_id >= 0 &&
+        int gpu_oproj = gpu_attn_oproj_ok || (!tpo && m->gpu_oproj && ly->wo_a.gpu_id >= 0 && ly->wo_b.gpu_id >= 0 &&
             m->gpu_oproj(m->gpu_dense_ctx,m->p_o,&ly->wo_a,&ly->wo_b,m->p_attn,
-                         M,og,gin,c->o_lora,H,C,c->o_inter)==0;
+                         M,og,gin,c->o_lora,H,C,c->o_inter)==0);
         if(!gpu_oproj){
         ds4f_gemm_task *o_tasks = (ds4f_gemm_task *)alloca((size_t)c->o_groups * sizeof(*o_tasks));
         ds4f_tensor *o_views = (ds4f_tensor *)alloca((size_t)c->o_groups * sizeof(*o_views));

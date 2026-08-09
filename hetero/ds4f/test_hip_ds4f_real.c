@@ -231,6 +231,7 @@ static void attach_decode_hooks(ds4f_model *m, hip_ds4f_dense *hip,
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
     m->gpu_dense_layer_prefetch = NULL;
     m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
+    m->gpu_prefill_attn_oproj = (opt->hip_prefill_attn && getenv("DS4F_HIP_ATTN_OPROJ")) ? hip_ds4f_dense_prefill_attn_oproj : NULL;
     m->gpu_dense_mixed = 1;
     m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
         ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_stream_layer_raw

@@ -465,6 +465,10 @@ typedef int (*ds4f_gpu_prefill_attn_fn)(
     void *ctx, float *dst, const float *q, const uint16_t *kv,
     const float *sink, int M, int pos0, int n_heads, int head_dim,
     int kv_dim, int kv_slots, int window, float scale);
+typedef int (*ds4f_gpu_prefill_attn_oproj_fn)(void *ctx, float *dst, const float *q, const uint16_t *kv,
+    const float *sink, const float *rcos, const float *rsin, const ds4f_tensor *wa, const ds4f_tensor *wb,
+    int M, int pos0, int n_heads, int head_dim, int kv_dim, int kv_slots, int window, float scale,
+    int rope_offset, int rope_pairs, int groups, int gin, int lora, int H, int C, int ointer);
 
 typedef struct {
     ds4f_config cfg;
@@ -525,6 +529,7 @@ typedef struct {
     ds4f_gpu_dense_layer_prefetch_fn gpu_dense_layer_prefetch;
     ds4f_gpu_dense_layer_fn gpu_dense_layer_begin;
     ds4f_gpu_prefill_attn_fn gpu_prefill_attn;
+    ds4f_gpu_prefill_attn_oproj_fn gpu_prefill_attn_oproj;
     int gpu_dense_stream_prefill_only;
     int gpu_dense_mixed;       /* opt-in mixed GPU/CPU independent-GEMM dispatch */
     int gpu_exact_prefill;     /* skip GPU M>1 GEMMs; retain GPU M=1 decode */

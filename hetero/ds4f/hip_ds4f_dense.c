@@ -123,6 +123,8 @@ struct hip_ds4f_dense {
     void *op_dx,*op_xt,*op_yt,*op_di,*op_dy;
     size_t op_dx_b,op_xt_b,op_yt_b,op_di_b,op_dy_b;
     hipFunction_t prefill_attn;
+    hipFunction_t prefill_attn_wmma;
+    hipFunction_t apply_rope;
 
     hip_ds4f_matrix *matrices;
     int n_matrices, cap_matrices;
@@ -168,6 +170,8 @@ struct hip_ds4f_dense {
     size_t gemm_x_pack_bytes, gemm_y_pack_bytes;
     void *attn_q, *attn_kv, *attn_sink, *attn_y;
     size_t attn_q_bytes, attn_kv_bytes, attn_sink_bytes, attn_y_bytes;
+    void *rope_c, *rope_s;
+    size_t rope_c_bytes, rope_s_bytes;
     void *gemm_multi_dy[HIP_DS4F_GEMM_MAX];
     size_t gemm_multi_y_bytes[HIP_DS4F_GEMM_MAX];
     const ds4f_layer *stream_layer;
@@ -378,6 +382,9 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
         ds4f_mem_pool_destroy(ctx->mem);
         return NULL;
     }
+    hipModuleGetFunction(&ctx->prefill_attn_wmma, ctx->module,
+                         "ds4f_dense_prefill_attn_wmma");
+    hipModuleGetFunction(&ctx->apply_rope, ctx->module, "ds4f_apply_rope");
     /* The fused shared-FFN SwiGLU lives in its own module, ALWAYS compiled
      * precise: clang's -ffast-math approximates the SiLU's division (even
      * through __fdiv_rn / __frcp_rn / double div), so it cannot ride in the
@@ -505,6 +512,8 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (ctx->attn_kv) hipFree(ctx->attn_kv);
     if (ctx->attn_sink) hipFree(ctx->attn_sink);
     if (ctx->attn_y) hipFree(ctx->attn_y);
+    if (ctx->rope_c) hipFree(ctx->rope_c);
+    if (ctx->rope_s) hipFree(ctx->rope_s);
     if (ctx->op_dy) hipFree(ctx->op_dy);
     if (ctx->op_di) hipFree(ctx->op_di);
     if (ctx->op_yt) hipFree(ctx->op_yt);
@@ -1640,17 +1649,37 @@ int hip_ds4f_dense_prefill_attention(
         return -1;
     void *dy = ctx->attn_y, *dkv = ctx->attn_kv, *dq = ctx->attn_q, *dsink = ctx->attn_sink;
     int groups = (n_heads + 7) >> 3;
-    unsigned int gx = (unsigned int)(M * groups);
+    const char *wm = getenv("DS4F_HIP_ATTN_WMMA");
+    int use_wmma = wm && atoi(wm) != 0 && ctx->prefill_attn_wmma &&
+                   head_dim == 512 && kv_dim == 512;
+    unsigned int gx = (unsigned int)(use_wmma ? n_heads * ((M + 15) / 16) : M * groups);
     int local_pos0 = pos0 - base;
     void *args[] = { &dy, &dkv, &dq, &dsink, &M, &local_pos0, &n_heads,
                      &head_dim, &kv_dim, &copy_slots, &window, &scale };
-    hipError_t err = hipModuleLaunchKernel(ctx->prefill_attn, gx, 1, 1,
-                                            256, 1, 1, 0, ctx->stream,
+    hipError_t err = hipModuleLaunchKernel(use_wmma ? ctx->prefill_attn_wmma : ctx->prefill_attn,
+                                            gx, 1, 1, 256, 1, 1, 0, ctx->stream,
                                             args, NULL);
     if (err != hipSuccess || hipStreamSynchronize(ctx->stream) != hipSuccess ||
         hipMemcpy(dst, ctx->attn_y, qb, hipMemcpyDeviceToHost) != hipSuccess)
         return -1;
     return 0;
+}
+
+static int launch_gemm_dev(hip_ds4f_dense *ctx, const hip_ds4f_matrix *mat, int row0, void *dY, void *dX, int N, int K, int M);
+static int ensure_dev_buf(void **p, size_t *have, size_t need);
+int hip_ds4f_dense_prefill_attn_oproj(void *opaque,float *dst,const float *q,const uint16_t *kv,
+ const float *sink,const float *rcos,const float *rsin,const ds4f_tensor *wa,const ds4f_tensor *wb,
+ int M,int pos0,int nh,int hd,int kd,int slots,int window,float scale,int ro,int rp,int groups,int gin,int lora,int H,int C,int ointer){
+ hip_ds4f_dense *c=(hip_ds4f_dense*)opaque; const hip_ds4f_matrix *a=NULL,*b=NULL;
+ if(!c||!dst||!q||!kv||!sink||!rcos||!rsin||!wa||!wb||!c->apply_rope||M<1||groups*gin!=H||groups*lora!=ointer||wa->gpu_id<0||wb->gpu_id<0||matrix_get(c,wa->gpu_id,&a)!=0||matrix_get(c,wb->gpu_id,&b)!=0||a->rows!=ointer||a->cols!=gin||b->rows!=C||b->cols!=ointer||!matrix_is_fp8(a->kind)||!matrix_is_fp8(b->kind))return -1;
+ int base=pos0-window+1;if(base<0)base=0;int end=pos0+M;if(end>slots)return -1;int ns=end-base;if(ns<1)ns=1;
+ size_t qb=(size_t)M*nh*hd*4,kb=(size_t)ns*kd*2,sb=(size_t)nh*4,cb=(size_t)M*rp*4,xtb=(size_t)M*gin*4,ytb=(size_t)M*lora*4,dib=(size_t)M*ointer*4,dyb=(size_t)M*C*4;
+ if(hipSetDevice(c->device_id)!=hipSuccess||ensure_attn_buffer(&c->attn_q,&c->attn_q_bytes,qb)||ensure_attn_buffer(&c->attn_kv,&c->attn_kv_bytes,kb)||ensure_attn_buffer(&c->attn_sink,&c->attn_sink_bytes,sb)||ensure_attn_buffer(&c->attn_y,&c->attn_y_bytes,qb)||ensure_attn_buffer(&c->rope_c,&c->rope_c_bytes,cb)||ensure_attn_buffer(&c->rope_s,&c->rope_s_bytes,cb)||ensure_dev_buf(&c->op_xt,&c->op_xt_b,xtb)||ensure_dev_buf(&c->op_yt,&c->op_yt_b,ytb)||ensure_dev_buf(&c->op_di,&c->op_di_b,dib)||ensure_dev_buf(&c->op_dy,&c->op_dy_b,dyb))return -1;
+ if(hipMemcpyAsync(c->attn_q,q,qb,hipMemcpyHostToDevice,c->stream)!=hipSuccess||hipMemcpyAsync(c->attn_kv,kv+(size_t)base*kd,kb,hipMemcpyHostToDevice,c->stream)!=hipSuccess||hipMemcpyAsync(c->attn_sink,sink,sb,hipMemcpyHostToDevice,c->stream)!=hipSuccess||hipMemcpyAsync(c->rope_c,rcos+(size_t)pos0*rp,cb,hipMemcpyHostToDevice,c->stream)!=hipSuccess||hipMemcpyAsync(c->rope_s,rsin+(size_t)pos0*rp,cb,hipMemcpyHostToDevice,c->stream)!=hipSuccess)return -1;
+ void *dy=c->attn_y,*dkv=c->attn_kv,*dq=c->attn_q,*ds=c->attn_sink;int lp=pos0-base;const char *wm=getenv("DS4F_HIP_ATTN_WMMA");int use=wm&&atoi(wm)!=0&&c->prefill_attn_wmma&&hd==512&&kd==512;void *aa[]={&dy,&dkv,&dq,&ds,&M,&lp,&nh,&hd,&kd,&ns,&window,&scale};unsigned gx=(unsigned)(use?nh*((M+15)/16):M*((nh+7)>>3));
+ if(hipModuleLaunchKernel(use?c->prefill_attn_wmma:c->prefill_attn,gx,1,1,256,1,1,0,c->stream,aa,NULL)!=hipSuccess)return -1;void *ra[]={&c->attn_y,&c->rope_c,&c->rope_s,&M,&hd,&H,&ro,&rp};if(hipModuleLaunchKernel(c->apply_rope,(unsigned)(((size_t)M*rp+255)/256),1,1,256,1,1,0,c->stream,ra,NULL)!=hipSuccess)return -1;
+ for(int g=0;g<groups;g++){size_t n=(size_t)M*gin;int off=g*gin;void *ga[]={&c->op_xt,&c->attn_y,&M,&gin,&H,&off};if(hipModuleLaunchKernel(c->gather_group,(unsigned)((n+255)/256),1,1,256,1,1,0,c->stream,ga,NULL)!=hipSuccess||launch_gemm_dev(c,a,g*lora,c->op_yt,c->op_xt,lora,gin,M)!=0)return -1;n=(size_t)M*lora;off=g*lora;void *sa[]={&c->op_di,&c->op_yt,&M,&lora,&ointer,&off};if(hipModuleLaunchKernel(c->scatter_group,(unsigned)((n+255)/256),1,1,256,1,1,0,c->stream,sa,NULL)!=hipSuccess)return -1;}
+ if(launch_gemm_dev(c,b,0,c->op_dy,c->op_di,C,ointer,M)!=0||hipMemcpyAsync(dst,c->op_dy,dyb,hipMemcpyDeviceToHost,c->stream)!=hipSuccess||hipStreamSynchronize(c->stream)!=hipSuccess)return -1;return 0;
 }
 
 /* Prefer pinned memory for the GEMM staging buffers.  A batch-64 wq_b GEMM
