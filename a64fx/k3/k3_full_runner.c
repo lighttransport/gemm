@@ -1683,6 +1683,31 @@ static int full_prefill_bf16(k3_full_model *m, float *out,
                                    scratch_bytes, m->threads) ? EIO : 0;
 }
 
+static void full_prefill_bf16_exact_many_strided(k3_full_model *m, float *out,
+        const k3_full_tensor *tensor, const float *input, int batch,
+        int rows, int cols, int input_stride) {
+    float *outs[batch];
+    const k3_full_tensor *tensors[batch];
+    const float *inputs[batch];
+    int row_counts[batch], col_counts[batch];
+    for (int t = 0; t < batch; ++t) {
+        outs[t] = out + (size_t)t * rows;
+        tensors[t] = tensor;
+        inputs[t] = input + (size_t)t * input_stride;
+        row_counts[t] = rows;
+        col_counts[t] = cols;
+    }
+    full_bf16_many(outs, tensors, inputs, row_counts, col_counts,
+                   batch, m->threads);
+}
+
+static void full_prefill_bf16_exact_many(k3_full_model *m, float *out,
+        const k3_full_tensor *tensor, const float *input, int batch,
+        int rows, int cols) {
+    full_prefill_bf16_exact_many_strided(m, out, tensor, input, batch,
+                                         rows, cols, cols);
+}
+
 static int full_prefill_sum(k3_full_model *m, float *data,
                             int batch, int width) {
     for (int first = 0; first < batch; first += K3_PREFILL_COMM_PANEL) {
@@ -3836,6 +3861,22 @@ typedef struct {
     float *routed_partial;
     float *routed_norm;
     float *moe_hidden;
+    float *attn_q;
+    float *attn_k;
+    float *attn_v;
+    float *attn_gate;
+    float *attn_fa;
+    float *attn_beta;
+    float *attn_decay;
+    float *attn_local;
+    float *attn_norm;
+    float *mla_qa;
+    float *mla_kva;
+    float *mla_q;
+    float *mla_kv;
+    float *mla_gate;
+    float *mla_attn;
+    float *mla_gated;
     float *expert_gathered;
     float *expert_gate;
     float *expert_up;
@@ -3856,6 +3897,7 @@ static int full_prefill_batch_alloc(k3_full_model *m, k3_full_layer *l,
     int local_shared = (int)l->shared_gate.shape[0];
     int local_inter = l->expert_count ? (int)l->experts[0].w1.shape[0] : 0;
     int local_projection = K3_HIDDEN;
+    int channels = m->local_heads * K3_HEAD_DIM;
 #define PF_ALLOC(field, count) do { \
     b->field = k3_pool_alloc(m->pool, (size_t)(count) * sizeof(*b->field)); \
     if (!b->field) return ENOMEM; \
@@ -3871,6 +3913,22 @@ static int full_prefill_batch_alloc(k3_full_model *m, k3_full_layer *l,
     PF_ALLOC(routed_partial, (size_t)batch * K3_LATENT);
     PF_ALLOC(routed_norm, (size_t)batch * K3_LATENT);
     PF_ALLOC(moe_hidden, (size_t)batch * K3_HIDDEN);
+    PF_ALLOC(attn_q, (size_t)batch * channels);
+    PF_ALLOC(attn_k, (size_t)batch * channels);
+    PF_ALLOC(attn_v, (size_t)batch * channels);
+    PF_ALLOC(attn_gate, (size_t)batch * channels);
+    PF_ALLOC(attn_fa, (size_t)batch * K3_HEAD_DIM);
+    PF_ALLOC(attn_beta, (size_t)batch * m->local_heads);
+    PF_ALLOC(attn_decay, (size_t)batch * channels);
+    PF_ALLOC(attn_local, (size_t)batch * channels);
+    PF_ALLOC(attn_norm, (size_t)batch * channels);
+    PF_ALLOC(mla_qa, (size_t)batch * 1536);
+    PF_ALLOC(mla_kva, (size_t)batch * 576);
+    PF_ALLOC(mla_q, (size_t)batch * m->local_heads * K3_FULL_MLA_QK);
+    PF_ALLOC(mla_kv, (size_t)batch * m->local_heads * 256);
+    PF_ALLOC(mla_gate, (size_t)batch * m->local_heads * K3_FULL_MLA_VALUE);
+    PF_ALLOC(mla_attn, (size_t)batch * m->local_heads * K3_FULL_MLA_VALUE);
+    PF_ALLOC(mla_gated, (size_t)batch * m->local_heads * K3_FULL_MLA_VALUE);
     PF_ALLOC(expert_gathered, (size_t)batch * K3_TOP_K * K3_LATENT);
     PF_ALLOC(expert_gate, (size_t)batch * K3_TOP_K * local_inter);
     PF_ALLOC(expert_up, (size_t)batch * K3_TOP_K * local_inter);
@@ -3899,6 +3957,206 @@ static int full_debug_attention_seeded(k3_full_model *m, k3_full_layer *l,
     full_add(m->tmp, m->attn, K3_HIDDEN);
     memcpy(prefix, m->tmp, K3_HIDDEN * sizeof(float));
     full_rmsnorm_tensor(moe_input, m->tmp, &l->post_norm, K3_HIDDEN);
+    return 0;
+}
+
+static int full_prefill_attention_kda(k3_full_model *m, k3_full_layer *l,
+                                      const k3_full_options *o,
+                                      const int *tokens, int position,
+                                      k3_prefill_batch *b) {
+    int batch = b->batch;
+    int channels = m->local_heads * K3_HEAD_DIM;
+#pragma omp parallel for schedule(static)
+    for (int ti = 0; ti < batch * K3_HIDDEN; ++ti) {
+        int t = ti / K3_HIDDEN, i = ti % K3_HIDDEN;
+        uint64_t base = o->input_seed ^ ((uint64_t)(unsigned)tokens[t] << 32) ^
+                        (uint64_t)(unsigned)(position + t);
+        uint64_t h = full_mix64(base + (uint64_t)i * UINT64_C(0x9e3779b97f4a7c15));
+        float unit = (float)((h >> 40) & UINT64_C(0xffffff)) / 16777216.0f;
+        b->prefix[ti] = (unit * 2.0f - 1.0f) * 0.02f;
+    }
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < batch; ++t) {
+        float *seeded = b->prefix + (size_t)t * K3_HIDDEN;
+        full_rmsnorm_tensor(b->moe_input + (size_t)t * K3_HIDDEN,
+                            seeded, &l->input_norm, K3_HIDDEN);
+    }
+    full_prefill_bf16_exact_many(m, b->attn_q, &l->q_proj, b->moe_input,
+                                 batch, channels, K3_HIDDEN);
+    full_prefill_bf16_exact_many(m, b->attn_k, &l->k_proj, b->moe_input,
+                                 batch, channels, K3_HIDDEN);
+    full_prefill_bf16_exact_many(m, b->attn_v, &l->v_proj, b->moe_input,
+                                 batch, channels, K3_HIDDEN);
+    full_prefill_bf16_exact_many(m, b->attn_fa, &l->f_a_proj, b->moe_input,
+                                 batch, K3_HEAD_DIM, K3_HIDDEN);
+    full_prefill_bf16_exact_many(m, b->attn_gate, &l->g_proj, b->moe_input,
+                                 batch, channels, K3_HIDDEN);
+    full_prefill_bf16_exact_many(m, b->attn_beta, &l->b_proj, b->moe_input,
+                                 batch, m->local_heads, K3_HIDDEN);
+    full_prefill_bf16_exact_many(m, b->attn_decay, &l->f_b_proj, b->attn_fa,
+                                 batch, channels, K3_HEAD_DIM);
+
+    int state_stride = channels * (K3_FULL_CONV_KERNEL - 1);
+    float *state = m->conv_state +
+        (size_t)l->state_slot * (size_t)state_stride * 3;
+    float *qstate = state, *kstate = state + state_stride;
+    float *vstate = kstate + state_stride;
+    float *recurrent = m->kda_state +
+        (size_t)l->state_slot * m->local_heads * K3_HEAD_DIM * K3_HEAD_DIM;
+    const float *a_log = (const float *)l->a_log.data;
+    for (int t = 0; t < batch; ++t) {
+        float *q = b->attn_q + (size_t)t * channels;
+        float *k = b->attn_k + (size_t)t * channels;
+        float *v = b->attn_v + (size_t)t * channels;
+        float *work = b->attn_norm + (size_t)t * channels;
+        float *beta = b->attn_beta + (size_t)t * m->local_heads;
+        float *log_decay = b->attn_decay + (size_t)t * channels;
+        memcpy(work, q, (size_t)channels * sizeof(float));
+        k3_conv_step_sve(q, work, qstate, (const float *)l->q_conv.data,
+                         NULL, channels, K3_FULL_CONV_KERNEL);
+        memcpy(work, k, (size_t)channels * sizeof(float));
+        k3_conv_step_sve(k, work, kstate, (const float *)l->k_conv.data,
+                         NULL, channels, K3_FULL_CONV_KERNEL);
+        memcpy(work, v, (size_t)channels * sizeof(float));
+        k3_conv_step_sve(v, work, vstate, (const float *)l->v_conv.data,
+                         NULL, channels, K3_FULL_CONV_KERNEL);
+        for (int h = 0; h < m->local_heads; ++h) {
+            k3_l2_normalize_sve(q + (size_t)h * K3_HEAD_DIM,
+                                K3_HEAD_DIM, 1.0e-6f);
+            k3_l2_normalize_sve(k + (size_t)h * K3_HEAD_DIM,
+                                K3_HEAD_DIM, 1.0e-6f);
+            beta[h] = k3_sigmoidf(beta[h]);
+        }
+        if (l->a_log.ndims == 1 && l->a_log.shape[0] == K3_HEADS)
+            full_kda_log_decay_heads(work, log_decay,
+                a_log + m->first_head, (const float *)l->dt_bias.data,
+                m->local_heads, K3_HEAD_DIM);
+        else if (full_fast_exp)
+            full_kda_log_decay_fast(work, log_decay, a_log,
+                (const float *)l->dt_bias.data, m->local_heads, K3_HEAD_DIM);
+        else
+            k3_kda_log_decay(work, log_decay, a_log,
+                (const float *)l->dt_bias.data, m->local_heads, K3_HEAD_DIM);
+        if (full_fast_exp) full_exp_vec(log_decay, work, channels);
+        else for (int i = 0; i < channels; ++i) log_decay[i] = expf(work[i]);
+        k3_kda_step_decay_parallel_sve(
+            b->attn_local + (size_t)t * channels, q, k, v, log_decay, beta,
+            recurrent, m->local_heads, K3_HEAD_DIM, K3_HEAD_DIM, m->threads);
+        full_gated_rmsnorm_tensor(work,
+            b->attn_local + (size_t)t * channels,
+            b->attn_gate + (size_t)t * channels, &l->o_norm, channels);
+    }
+    full_prefill_bf16_exact_many(m, b->moe_hidden, &l->o_proj, b->attn_norm,
+                                 batch, K3_HIDDEN, channels);
+    if (full_prefill_sum(m, b->moe_hidden, batch, K3_HIDDEN)) return EIO;
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < batch; ++t) {
+        float *prefix = b->prefix + (size_t)t * K3_HIDDEN;
+        const float *attn = b->moe_hidden + (size_t)t * K3_HIDDEN;
+        /* Match full_kda_forward's tmp scratch contract: gated RMSNorm
+         * overwrites tmp[0:local_channels] before the attention residual is
+         * added, while the remaining lanes still contain the seeded input. */
+        memcpy(prefix, b->attn_norm + (size_t)t * channels,
+               (size_t)channels * sizeof(float));
+        for (int i = 0; i < K3_HIDDEN; ++i) prefix[i] += attn[i];
+        full_rmsnorm_tensor(b->moe_input + (size_t)t * K3_HIDDEN,
+                            prefix, &l->post_norm, K3_HIDDEN);
+    }
+    return 0;
+}
+
+static int full_prefill_attention_mla(k3_full_model *m, k3_full_layer *l,
+                                      const k3_full_options *o,
+                                      const int *tokens, int position,
+                                      k3_prefill_batch *b) {
+    int batch = b->batch;
+    int q_channels = m->local_heads * K3_FULL_MLA_QK;
+    int gate_channels = m->local_heads * K3_FULL_MLA_VALUE;
+#pragma omp parallel for schedule(static)
+    for (int ti = 0; ti < batch * K3_HIDDEN; ++ti) {
+        int t = ti / K3_HIDDEN, i = ti % K3_HIDDEN;
+        uint64_t base = o->input_seed ^ ((uint64_t)(unsigned)tokens[t] << 32) ^
+                        (uint64_t)(unsigned)(position + t);
+        uint64_t h = full_mix64(base + (uint64_t)i * UINT64_C(0x9e3779b97f4a7c15));
+        float unit = (float)((h >> 40) & UINT64_C(0xffffff)) / 16777216.0f;
+        b->prefix[ti] = (unit * 2.0f - 1.0f) * 0.02f;
+    }
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < batch; ++t)
+        full_rmsnorm_tensor(b->moe_input + (size_t)t * K3_HIDDEN,
+            b->prefix + (size_t)t * K3_HIDDEN, &l->input_norm, K3_HIDDEN);
+    full_prefill_bf16_exact_many(m, b->mla_qa, &l->q_a_proj, b->moe_input,
+                                 batch, 1536, K3_HIDDEN);
+    full_prefill_bf16_exact_many(m, b->mla_kva, &l->kv_a_proj, b->moe_input,
+                                 batch, 576, K3_HIDDEN);
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < batch; ++t) {
+        full_rmsnorm_tensor(b->mla_qa + (size_t)t * 1536,
+            b->mla_qa + (size_t)t * 1536, &l->q_a_norm, 1536);
+        full_rmsnorm_tensor(b->mla_kva + (size_t)t * 576,
+            b->mla_kva + (size_t)t * 576, &l->kv_a_norm, 512);
+    }
+    full_prefill_bf16_exact_many(m, b->mla_q, &l->q_b_proj, b->mla_qa,
+                                 batch, q_channels, 1536);
+    full_prefill_bf16_exact_many_strided(m, b->mla_kv, &l->kv_b_proj,
+        b->mla_kva, batch, m->local_heads * 256, 512, 576);
+    full_prefill_bf16_exact_many(m, b->mla_gate, &l->mla_g_proj, b->moe_input,
+                                 batch, gate_channels, K3_HIDDEN);
+
+    int key_stride = m->max_seq * K3_FULL_MLA_QK;
+    int value_stride = m->max_seq * K3_FULL_MLA_VALUE;
+    float *layer_keys = m->mla_keys +
+        (size_t)l->cache_slot * m->local_heads * key_stride;
+    float *layer_values = m->mla_values +
+        (size_t)l->cache_slot * m->local_heads * value_stride;
+    for (int t = 0; t < batch; ++t) {
+        int pos = position + t;
+        float *kv = b->mla_kv + (size_t)t * m->local_heads * 256;
+        float *kva = b->mla_kva + (size_t)t * 576;
+        for (int h = 0; h < m->local_heads; ++h) {
+            float *kh = layer_keys + (size_t)h * key_stride +
+                        (size_t)pos * K3_FULL_MLA_QK;
+            float *vh = layer_values + (size_t)h * value_stride +
+                        (size_t)pos * K3_FULL_MLA_VALUE;
+            memcpy(kh, kv + (size_t)h * 256, 128 * sizeof(float));
+            memcpy(kh + 128, kva + 512, 64 * sizeof(float));
+            memcpy(vh, kv + (size_t)h * 256 + 128, 128 * sizeof(float));
+        }
+        float *attn = b->mla_attn + (size_t)t * gate_channels;
+        float *q = b->mla_q + (size_t)t * q_channels;
+        if (full_mla_serial_attn) {
+            for (int h = 0; h < m->local_heads; ++h)
+                k3_attention_sve(attn + (size_t)h * K3_FULL_MLA_VALUE,
+                    q + (size_t)h * K3_FULL_MLA_QK,
+                    layer_keys + (size_t)h * key_stride,
+                    layer_values + (size_t)h * value_stride,
+                    pos + 1, K3_FULL_MLA_QK, K3_FULL_MLA_VALUE);
+        } else {
+            k3_attention_heads_parallel_sve(attn, q, layer_keys, layer_values,
+                m->local_heads, pos + 1, m->max_seq, K3_FULL_MLA_QK,
+                K3_FULL_MLA_VALUE, m->threads, m->mla_scratch, m->mla_stats);
+        }
+        float *gated = b->mla_gated + (size_t)t * gate_channels;
+        float *gate = b->mla_gate + (size_t)t * gate_channels;
+        for (int i = 0; i < gate_channels; ++i)
+            gated[i] = attn[i] * k3_sigmoidf(gate[i]);
+    }
+    full_prefill_bf16_exact_many(m, b->moe_hidden, &l->mla_o_proj,
+                                 b->mla_gated, batch, K3_HIDDEN,
+                                 gate_channels);
+    if (full_prefill_sum(m, b->moe_hidden, batch, K3_HIDDEN)) return EIO;
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < batch; ++t) {
+        float *prefix = b->prefix + (size_t)t * K3_HIDDEN;
+        memcpy(prefix, b->mla_qa + (size_t)t * 1536,
+               1536 * sizeof(float));
+        memcpy(prefix, b->mla_gated + (size_t)t * gate_channels,
+               (size_t)gate_channels * sizeof(float));
+        const float *attn = b->moe_hidden + (size_t)t * K3_HIDDEN;
+        for (int i = 0; i < K3_HIDDEN; ++i) prefix[i] += attn[i];
+        full_rmsnorm_tensor(b->moe_input + (size_t)t * K3_HIDDEN,
+                            prefix, &l->post_norm, K3_HIDDEN);
+    }
     return 0;
 }
 
@@ -3939,7 +4197,10 @@ static int full_prefill_moe_batched(k3_full_model *m, k3_full_layer *l,
     if (local_latent != K3_LATENT &&
         full_split_groups(K3_LATENT, m->rank, m->nodes, 8,
                           &latent_start, &local_latent)) return EINVAL;
+    double trace_start = full_now(), trace_router = 0.0, trace_proj = 0.0,
+           trace_expert = 0.0;
     int rc = full_prefill_router_exact(m, l, b);
+    trace_router = full_now() - trace_start;
     rc |= full_prefill_bf16(m, b->projection, &l->routed_down,
         b->moe_input, batch, local_latent, K3_HIDDEN,
         b->gemm_scratch, b->gemm_scratch_bytes);
@@ -3957,6 +4218,7 @@ static int full_prefill_moe_batched(k3_full_model *m, k3_full_layer *l,
                b->projection + (size_t)t * local_latent,
                (size_t)local_latent * sizeof(float));
     if (full_prefill_sum(m, b->latent, batch, K3_LATENT)) return EIO;
+    trace_proj = full_now() - trace_start - trace_router;
     if (full_env_int("K3_PREFILL_TRACE", 0))
         fprintf(stderr, "K3_PREFILL_TRACE rank=%d stage=latent hash=%016llx\n",
             m->rank, (unsigned long long)full_hash_f32(
@@ -3975,6 +4237,7 @@ static int full_prefill_moe_batched(k3_full_model *m, k3_full_layer *l,
             b->expert_gathered, b->expert_gate, b->expert_up, m->threads, 8))
         return EIO;
     if (full_prefill_sum(m, b->routed_partial, batch, K3_LATENT)) return EIO;
+    trace_expert = full_now() - trace_start - trace_router - trace_proj;
     if (full_env_int("K3_PREFILL_TRACE", 0))
         fprintf(stderr, "K3_PREFILL_TRACE rank=%d stage=routed hash=%016llx\n",
             m->rank, (unsigned long long)full_hash_f32(
@@ -4037,6 +4300,10 @@ static int full_prefill_moe_batched(k3_full_model *m, k3_full_layer *l,
             m->rank, (unsigned long long)full_hash_f32(
                 b->prefix + (size_t)(batch - 1) * K3_HIDDEN, K3_HIDDEN),
             (unsigned long long)full_hash_f32(m->hidden, K3_HIDDEN));
+    if (full_env_int("K3_PREFILL_TRACE", 0) && m->rank == 0)
+        fprintf(stderr, "K3_PREFILL_TRACE moe_router_s=%.6f moe_projection_s=%.6f moe_expert_s=%.6f moe_finish_s=%.6f\n",
+                trace_router, trace_proj, trace_expert,
+                full_now() - trace_start - trace_router - trace_proj - trace_expert);
     return 0;
 }
 
@@ -4046,13 +4313,20 @@ static int full_debug_prefill_chunk_batched(k3_full_model *m,
                                             int position,
                                             k3_prefill_batch *b) {
     k3_full_layer *l = &m->debug_layer;
-    for (int t = 0; t < count; ++t) {
-        full_debug_seed_hidden(m->tmp, o->input_seed, tokens[t], position + t);
-        if (full_debug_attention_seeded(m, l, m->tmp, position + t,
-                b->prefix + (size_t)t * K3_HIDDEN,
-                b->moe_input + (size_t)t * K3_HIDDEN)) return EIO;
+    if (b->batch != count) return EINVAL;
+    double phase_start = full_now();
+    if (!l->is_mla) {
+        if (full_prefill_attention_kda(m, l, o, tokens, position, b)) return EIO;
+    } else if (full_prefill_attention_mla(m, l, o, tokens, position, b)) {
+        return EIO;
     }
-    return full_prefill_moe_batched(m, l, b);
+    double attention_seconds = full_now() - phase_start;
+    phase_start = full_now();
+    int rc = full_prefill_moe_batched(m, l, b);
+    if (full_env_int("K3_PREFILL_TRACE", 0) && m->rank == 0)
+        fprintf(stderr, "K3_PREFILL_TRACE phase_attention_s=%.6f phase_moe_s=%.6f\n",
+                attention_seconds, full_now() - phase_start);
+    return rc;
 }
 
 static int full_prefill_prepare_moe(k3_full_model *m, k3_full_layer *l) {
