@@ -33,6 +33,11 @@ $(BUILD)/test_hip_ds4f_dense: test_hip_ds4f_dense.c hip_ds4f_dense.c \
 	$(CC) $(CFLAGS) $(INCS) -o $@ test_hip_ds4f_dense.c hip_ds4f_dense.c \
 		../../rdna4/rocew.c $(LDFLAGS)
 
+$(BUILD)/test_cuda_ds4f_dense: test_cuda_ds4f_dense.c ../../cuda/cuew.c \
+                                ../../cuda/cuew.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) -I../../cuda -o $@ test_cuda_ds4f_dense.c \
+		../../cuda/cuew.c $(LDFLAGS)
+
 $(BUILD)/test_hip_ds4f_real: test_hip_ds4f_real.c hip_ds4f_dense.c \
                              dual_ds4f_prefill.c dual_ds4f_prefill.h \
                              cuda_ds4f_mxfp4.c cuda_ds4f_mxfp4.h \

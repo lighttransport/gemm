@@ -13,6 +13,7 @@ MOE_CUBIN = moe_gpu_kernels.cubin
 FA2_CUBIN = fa2_kernels.cubin
 MMQ_CUBIN = mmq_kernels.cubin
 MMVQ_CUBIN = mmvq_kernels.cubin
+DS4F_DENSE_CUBIN = ds4f_dense_kernels.cubin
 
 # Vendored llama.cpp MMQ headers (mmq_vendor/) + the upstream tree for the rest.
 # Override LLAMA_CUDA if llama.cpp lives elsewhere.
@@ -26,7 +27,10 @@ TARGET = test_cuda_llm
 
 all: $(MOE_CUBIN) $(FA2_CUBIN) $(MMQ_CUBIN) $(MMVQ_CUBIN) $(TARGET)
 
-cubin: $(MOE_CUBIN) $(FA2_CUBIN) $(MMQ_CUBIN) $(MMVQ_CUBIN)
+cubin: $(MOE_CUBIN) $(FA2_CUBIN) $(MMQ_CUBIN) $(MMVQ_CUBIN) $(DS4F_DENSE_CUBIN)
+
+$(DS4F_DENSE_CUBIN): ds4f_dense_kernels.cu
+	$(NVCC) -cubin -arch=sm_120 -std=c++17 -O3 -o $@ $<
 
 $(MOE_CUBIN): moe_gpu_kernels.cu
 	$(NVCC) -cubin -arch=sm_120 -o $@ $<
