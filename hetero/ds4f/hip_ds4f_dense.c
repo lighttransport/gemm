@@ -110,6 +110,7 @@ struct hip_ds4f_dense {
     hipFunction_t gemm_fp8_ordered;
     hipFunction_t gemm_mxfp4;
     hipFunction_t gemm_mxfp4_grouped;
+    hipFunction_t gemm_mxfp4_grouped_wmma;
     hipFunction_t mxfp4_matvec;
     hipFunction_t mxfp4_grouped_matvec;
     hipFunction_t gemm_fp8_rowscale;
@@ -384,6 +385,8 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
         ds4f_mem_pool_destroy(ctx->mem);
         return NULL;
     }
+    hipModuleGetFunction(&ctx->gemm_mxfp4_grouped_wmma, ctx->module,
+                         "ds4f_dense_mxfp4_grouped_wmma");
     hipModuleGetFunction(&ctx->prefill_attn_wmma, ctx->module,
                          "ds4f_dense_prefill_attn_wmma");
     hipModuleGetFunction(&ctx->apply_rope, ctx->module, "ds4f_apply_rope");
@@ -2142,14 +2145,18 @@ int hip_ds4f_dense_gemm_tensors(
                 return -1;
             int ntasks = n;
             void *args[] = { &ctx->gemm_mxfp4_tasks, &ntasks };
-            hipFunction_t group_fn = grouped_m1 ? ctx->mxfp4_grouped_matvec
-                                                : ctx->gemm_mxfp4_grouped;
+            const char *we = getenv("DS4F_HIP_MXFP4_WMMA");
+            int use_wmma = we && atoi(we) != 0 && !grouped_m1 &&
+                           ctx->gemm_mxfp4_grouped_wmma && M[0] >= 32;
+            hipFunction_t group_fn = use_wmma ? ctx->gemm_mxfp4_grouped_wmma :
+                (grouped_m1 ? ctx->mxfp4_grouped_matvec : ctx->gemm_mxfp4_grouped);
             unsigned int launch_gx = grouped_m1
                 ? (unsigned int)((t[0]->rows + 7) / 8) : group_gx;
+            if (use_wmma) launch_gx = (unsigned int)((t[0]->rows + 15) / 16);
             if (hipModuleLaunchKernel(group_fn,
-                    launch_gx, grouped_m1 ? (unsigned int)n : group_gy,
-                    grouped_m1 ? 1u : (unsigned int)n,
-                    grouped_m1 ? 256u : 16u, grouped_m1 ? 1u : 16u, 1, 0,
+                    launch_gx, use_wmma ? group_gy : (grouped_m1 ? (unsigned int)n : group_gy),
+                    use_wmma ? (unsigned int)n : (grouped_m1 ? 1u : (unsigned int)n),
+                    use_wmma ? 32u : (grouped_m1 ? 256u : 16u), use_wmma ? 1u : (grouped_m1 ? 1u : 16u), 1, 0,
                     ctx->stream, args, NULL) != hipSuccess)
                 return -1;
         }
