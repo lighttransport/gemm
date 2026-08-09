@@ -1708,6 +1708,52 @@ static void full_prefill_bf16_exact_many(k3_full_model *m, float *out,
                                          rows, cols, cols);
 }
 
+#if defined(__ARM_FEATURE_SVE)
+static void full_bf16_pv_4row_2x(float *out0, float *out1,
+        const uint16_t *p01, const uint16_t *p23,
+        const float *x0, const float *x1, int cols) {
+    svbool_t pg=svptrue_b32(),ph=svptrue_b16();
+    svuint16_t idx=svindex_u16(0,1);
+    svbool_t odd=svcmpne_n_u16(ph,svand_n_u16_x(ph,idx,1),0);
+    svfloat32_t a00=svdup_f32(0),a01=a00,a02=a00,a03=a00;
+    svfloat32_t a10=a00,a11=a00,a12=a00,a13=a00;
+    int vl=(int)svcntw();
+    for(int i=0;i<cols;i+=vl){const uint16_t*p0=p01+2*i,*p2=p23+2*i;
+        svfloat32_t w0=svreinterpret_f32(svld1_u16(odd,p0-1));
+        svfloat32_t w1=svreinterpret_f32(svld1_u16(odd,p0));
+        svfloat32_t w2=svreinterpret_f32(svld1_u16(odd,p2-1));
+        svfloat32_t w3=svreinterpret_f32(svld1_u16(odd,p2));
+        svfloat32_t v0=svld1(pg,x0+i),v1=svld1(pg,x1+i);
+        a00=svmla_x(pg,a00,w0,v0);a01=svmla_x(pg,a01,w1,v0);
+        a02=svmla_x(pg,a02,w2,v0);a03=svmla_x(pg,a03,w3,v0);
+        a10=svmla_x(pg,a10,w0,v1);a11=svmla_x(pg,a11,w1,v1);
+        a12=svmla_x(pg,a12,w2,v1);a13=svmla_x(pg,a13,w3,v1);}
+    out0[0]=svaddv(pg,a00);out0[1]=svaddv(pg,a01);
+    out0[2]=svaddv(pg,a02);out0[3]=svaddv(pg,a03);
+    out1[0]=svaddv(pg,a10);out1[1]=svaddv(pg,a11);
+    out1[2]=svaddv(pg,a12);out1[3]=svaddv(pg,a13);
+}
+#endif
+
+static void full_prefill_bf16_exact_2x(k3_full_model *m,float *out,
+        const k3_full_tensor *tensor,const float *input,int batch,
+        int rows,int cols){
+#if defined(__ARM_FEATURE_SVE)
+    if(tensor->pv&&(batch&1)==0&&rows%8==0&&cols%16==0){
+        const uint16_t*w=(const uint16_t*)tensor->data;int groups=rows/8;
+        omp_set_num_threads(m->threads);
+#pragma omp parallel for schedule(static)
+        for(int task=0;task<(batch/2)*groups*2;++task){int half=task&1;
+            int q=task>>1,group=q%groups,pair=q/groups,t=pair*2;
+            int row=group*8+half*4;const uint16_t*base=w+(size_t)group*8*cols+(size_t)half*4*cols;
+            full_bf16_pv_4row_2x(out+(size_t)t*rows+row,
+                out+(size_t)(t+1)*rows+row,base,base+(size_t)2*cols,
+                input+(size_t)t*cols,input+(size_t)(t+1)*cols,cols);}
+        return;}
+#endif
+    full_prefill_bf16_exact_many(m,out,tensor,input,batch,rows,cols);
+}
+
 static int full_prefill_sum(k3_full_model *m, float *data,
                             int batch, int width) {
     for (int first = 0; first < batch; first += K3_PREFILL_COMM_PANEL) {
@@ -2469,6 +2515,28 @@ static int full_sum_sharded(k3_full_model *m, float *data, int count) {
     return full_sum_mode(m, data, count, 1, 0);
 }
 
+static void full_router_topk(const float *logits, const float *bias,
+                             int experts, int topk, int *route,
+                             float *weight) {
+    k3_router_topk(logits, bias, experts, topk, route, weight);
+    /* Top-k score order is not semantically significant, but nearly tied
+     * scores can swap slots when an otherwise equivalent GEMM changes its
+     * reduction order.  Canonical expert-ID order keeps the selected set and
+     * paired weights intact while making expert accumulation deterministic. */
+    for (int i = 1; i < topk; ++i) {
+        int id = route[i];
+        float w = weight[i];
+        int j = i;
+        while (j > 0 && route[j - 1] > id) {
+            route[j] = route[j - 1];
+            weight[j] = weight[j - 1];
+            --j;
+        }
+        route[j] = id;
+        weight[j] = w;
+    }
+}
+
 static int full_max(k3_full_model *m, float *data, int count) {
     return m->comm_col ? tp_allreduce_max_2d_checked(m->comm, m->comm_col,
                                                       data, count) :
@@ -2766,7 +2834,7 @@ static int full_moe_forward_expert_tp(k3_full_model *m, k3_full_layer *l,
                                        full_now() - dispatch_part);
         }
     }
-    k3_router_topk(router_logits, (const float *)l->router_bias.data,
+    full_router_topk(router_logits, (const float *)l->router_bias.data,
                    K3_EXPERTS, K3_TOP_K, route, route_weight);
     if (m->prefill_capture_routes && m->prefill_capture_token >= 0)
         memcpy(m->prefill_capture_routes +
@@ -3052,7 +3120,7 @@ static int full_moe_forward(k3_full_model *m, k3_full_layer *l,
                                full_now() - subphase_start);
         subphase_start = full_now();
     }
-    k3_router_topk(router_logits, (const float *)l->router_bias.data,
+    full_router_topk(router_logits, (const float *)l->router_bias.data,
                    K3_EXPERTS, K3_TOP_K, route, route_weight);
     if (full_sum(m, m->local_latent, K3_LATENT)) return EIO;
     if (m->profile.enabled) {
@@ -3771,7 +3839,7 @@ static int full_synthetic_layer(k3_full_model *m, int layer, int position) {
         uint64_t h = full_mix64(salt + (uint64_t)(unsigned)e * UINT64_C(0x9e3779b9));
         logits[e] = mean + (float)((h >> 40) & UINT64_C(0xffff)) / 65536.0f * 0.01f;
     }
-    k3_router_topk(logits, NULL, K3_EXPERTS, K3_TOP_K, route, weights);
+    full_router_topk(logits, NULL, K3_EXPERTS, K3_TOP_K, route, weights);
     memset(m->local_latent, 0, K3_LATENT * sizeof(float));
     for (int k = 0; k < K3_TOP_K; ++k) {
         if (route[k] % m->nodes != m->rank) continue;
@@ -3981,20 +4049,22 @@ static int full_prefill_attention_kda(k3_full_model *m, k3_full_layer *l,
         full_rmsnorm_tensor(b->moe_input + (size_t)t * K3_HIDDEN,
                             seeded, &l->input_norm, K3_HIDDEN);
     }
-    full_prefill_bf16_exact_many(m, b->attn_q, &l->q_proj, b->moe_input,
-                                 batch, channels, K3_HIDDEN);
-    full_prefill_bf16_exact_many(m, b->attn_k, &l->k_proj, b->moe_input,
-                                 batch, channels, K3_HIDDEN);
-    full_prefill_bf16_exact_many(m, b->attn_v, &l->v_proj, b->moe_input,
-                                 batch, channels, K3_HIDDEN);
-    full_prefill_bf16_exact_many(m, b->attn_fa, &l->f_a_proj, b->moe_input,
-                                 batch, K3_HEAD_DIM, K3_HIDDEN);
-    full_prefill_bf16_exact_many(m, b->attn_gate, &l->g_proj, b->moe_input,
-                                 batch, channels, K3_HIDDEN);
+    int rc = full_prefill_bf16(m, b->attn_q, &l->q_proj, b->moe_input,
+        batch, channels, K3_HIDDEN, b->gemm_scratch, b->gemm_scratch_bytes);
+    if (rc) return rc;
+    full_prefill_bf16_exact_2x(m, b->attn_k, &l->k_proj, b->moe_input,
+                               batch, channels, K3_HIDDEN);
+    full_prefill_bf16_exact_2x(m, b->attn_v, &l->v_proj, b->moe_input,
+                               batch, channels, K3_HIDDEN);
+    full_prefill_bf16_exact_2x(m, b->attn_fa, &l->f_a_proj, b->moe_input,
+                               batch, K3_HEAD_DIM, K3_HIDDEN);
+    rc = full_prefill_bf16(m, b->attn_gate, &l->g_proj, b->moe_input,
+        batch, channels, K3_HIDDEN, b->gemm_scratch, b->gemm_scratch_bytes);
+    if (rc) return rc;
     full_prefill_bf16_exact_many(m, b->attn_beta, &l->b_proj, b->moe_input,
                                  batch, m->local_heads, K3_HIDDEN);
-    full_prefill_bf16_exact_many(m, b->attn_decay, &l->f_b_proj, b->attn_fa,
-                                 batch, channels, K3_HEAD_DIM);
+    full_prefill_bf16_exact_2x(m, b->attn_decay, &l->f_b_proj, b->attn_fa,
+                               batch, channels, K3_HEAD_DIM);
 
     int state_stride = channels * (K3_FULL_CONV_KERNEL - 1);
     float *state = m->conv_state +
@@ -4046,9 +4116,9 @@ static int full_prefill_attention_kda(k3_full_model *m, k3_full_layer *l,
             b->attn_local + (size_t)t * channels,
             b->attn_gate + (size_t)t * channels, &l->o_norm, channels);
     }
-    full_prefill_bf16_exact_many(m, b->moe_hidden, &l->o_proj, b->attn_norm,
-                                 batch, K3_HIDDEN, channels);
-    if (full_prefill_sum(m, b->moe_hidden, batch, K3_HIDDEN)) return EIO;
+    rc = full_prefill_bf16(m, b->moe_hidden, &l->o_proj, b->attn_norm,
+        batch, K3_HIDDEN, channels, b->gemm_scratch, b->gemm_scratch_bytes);
+    if (rc || full_prefill_sum(m, b->moe_hidden, batch, K3_HIDDEN)) return EIO;
 #pragma omp parallel for schedule(static)
     for (int t = 0; t < batch; ++t) {
         float *prefix = b->prefix + (size_t)t * K3_HIDDEN;
@@ -4085,10 +4155,12 @@ static int full_prefill_attention_mla(k3_full_model *m, k3_full_layer *l,
     for (int t = 0; t < batch; ++t)
         full_rmsnorm_tensor(b->moe_input + (size_t)t * K3_HIDDEN,
             b->prefix + (size_t)t * K3_HIDDEN, &l->input_norm, K3_HIDDEN);
-    full_prefill_bf16_exact_many(m, b->mla_qa, &l->q_a_proj, b->moe_input,
-                                 batch, 1536, K3_HIDDEN);
-    full_prefill_bf16_exact_many(m, b->mla_kva, &l->kv_a_proj, b->moe_input,
-                                 batch, 576, K3_HIDDEN);
+    int rc = full_prefill_bf16(m, b->mla_qa, &l->q_a_proj, b->moe_input,
+        batch, 1536, K3_HIDDEN, b->gemm_scratch, b->gemm_scratch_bytes);
+    if (rc) return rc;
+    rc = full_prefill_bf16(m, b->mla_kva, &l->kv_a_proj, b->moe_input,
+        batch, 576, K3_HIDDEN, b->gemm_scratch, b->gemm_scratch_bytes);
+    if (rc) return rc;
 #pragma omp parallel for schedule(static)
     for (int t = 0; t < batch; ++t) {
         full_rmsnorm_tensor(b->mla_qa + (size_t)t * 1536,
@@ -4096,12 +4168,23 @@ static int full_prefill_attention_mla(k3_full_model *m, k3_full_layer *l,
         full_rmsnorm_tensor(b->mla_kva + (size_t)t * 576,
             b->mla_kva + (size_t)t * 576, &l->kv_a_norm, 512);
     }
-    full_prefill_bf16_exact_many(m, b->mla_q, &l->q_b_proj, b->mla_qa,
-                                 batch, q_channels, 1536);
-    full_prefill_bf16_exact_many_strided(m, b->mla_kv, &l->kv_b_proj,
-        b->mla_kva, batch, m->local_heads * 256, 512, 576);
-    full_prefill_bf16_exact_many(m, b->mla_gate, &l->mla_g_proj, b->moe_input,
-                                 batch, gate_channels, K3_HIDDEN);
+    rc = full_prefill_bf16(m, b->mla_q, &l->q_b_proj, b->mla_qa,
+        batch, q_channels, 1536, b->gemm_scratch, b->gemm_scratch_bytes);
+    if (rc) return rc;
+    /* kv_b consumes the first 512 values of each 576-wide kv_a row. */
+    float *kv_compact = b->latent;
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < batch; ++t)
+        memcpy(kv_compact + (size_t)t * 512,
+               b->mla_kva + (size_t)t * 576, 512 * sizeof(float));
+    rc = full_prefill_bf16(m, b->mla_kv, &l->kv_b_proj, kv_compact,
+        batch, m->local_heads * 256, 512,
+        b->gemm_scratch, b->gemm_scratch_bytes);
+    if (rc) return rc;
+    rc = full_prefill_bf16(m, b->mla_gate, &l->mla_g_proj, b->moe_input,
+        batch, gate_channels, K3_HIDDEN,
+        b->gemm_scratch, b->gemm_scratch_bytes);
+    if (rc) return rc;
 
     int key_stride = m->max_seq * K3_FULL_MLA_QK;
     int value_stride = m->max_seq * K3_FULL_MLA_VALUE;
@@ -4141,10 +4224,10 @@ static int full_prefill_attention_mla(k3_full_model *m, k3_full_layer *l,
         for (int i = 0; i < gate_channels; ++i)
             gated[i] = attn[i] * k3_sigmoidf(gate[i]);
     }
-    full_prefill_bf16_exact_many(m, b->moe_hidden, &l->mla_o_proj,
-                                 b->mla_gated, batch, K3_HIDDEN,
-                                 gate_channels);
-    if (full_prefill_sum(m, b->moe_hidden, batch, K3_HIDDEN)) return EIO;
+    rc = full_prefill_bf16(m, b->moe_hidden, &l->mla_o_proj,
+        b->mla_gated, batch, K3_HIDDEN, gate_channels,
+        b->gemm_scratch, b->gemm_scratch_bytes);
+    if (rc || full_prefill_sum(m, b->moe_hidden, batch, K3_HIDDEN)) return EIO;
 #pragma omp parallel for schedule(static)
     for (int t = 0; t < batch; ++t) {
         float *prefix = b->prefix + (size_t)t * K3_HIDDEN;
@@ -4164,23 +4247,13 @@ static int full_prefill_attention_mla(k3_full_model *m, k3_full_layer *l,
  * kernel's accumulation order: changing that order flips a few nearly tied
  * experts in a 1K-token validation sequence. */
 static int full_prefill_router_exact(k3_full_model *m, k3_full_layer *l,
-                                     k3_prefill_batch *b) {
+    k3_prefill_batch *b) {
     int batch = b->batch;
-    float *outs[batch];
-    const k3_full_tensor *tensors[batch];
-    const float *inputs[batch];
-    int rows[batch], cols[batch];
-    for (int t = 0; t < batch; ++t) {
-        outs[t] = b->router_logits + (size_t)t * K3_EXPERTS;
-        tensors[t] = &l->router;
-        inputs[t] = b->moe_input + (size_t)t * K3_HIDDEN;
-        rows[t] = K3_EXPERTS;
-        cols[t] = K3_HIDDEN;
-    }
-    full_bf16_many(outs, tensors, inputs, rows, cols, batch, m->threads);
+    full_prefill_bf16_exact_2x(m, b->router_logits, &l->router,
+                               b->moe_input, batch, K3_EXPERTS, K3_HIDDEN);
 #pragma omp parallel for schedule(static)
     for (int t = 0; t < batch; ++t) {
-        k3_router_topk(b->router_logits + (size_t)t * K3_EXPERTS,
+        full_router_topk(b->router_logits + (size_t)t * K3_EXPERTS,
             (const float *)l->router_bias.data, K3_EXPERTS, K3_TOP_K,
             b->routes + (size_t)t * K3_TOP_K,
             b->route_weights + (size_t)t * K3_TOP_K);
@@ -4551,12 +4624,12 @@ static int full_debug_run(k3_full_options *o, tp_comm *comm, tp_comm *comm_col,
         size_t values = (size_t)o->prefill_tokens * K3_HIDDEN;
         for (int i = 0; i < o->prefill_tokens * K3_TOP_K; ++i)
             route_mismatch += reference_routes[i] != prefill_batch.routes[i];
-        if (route_mismatch && g_rank == 0) {
+        if (route_mismatch) {
             int shown = 0;
             for (int i = 0; i < o->prefill_tokens * K3_TOP_K && shown < 8; ++i) {
                 if (reference_routes[i] != prefill_batch.routes[i]) {
-                    fprintf(stderr, "K3FULL_PREFILL_ROUTE_MISMATCH token=%d slot=%d reference=%d batched=%d\n",
-                            i / K3_TOP_K, i % K3_TOP_K,
+                    fprintf(stderr, "K3FULL_PREFILL_ROUTE_MISMATCH rank=%d token=%d slot=%d reference=%d batched=%d\n",
+                            g_rank, i / K3_TOP_K, i % K3_TOP_K,
                             reference_routes[i], prefill_batch.routes[i]);
                     ++shown;
                 }

@@ -604,7 +604,7 @@ static inline void k3_expert_tp_down_routed_sve(float *out,
         svuint32_t lo=svand_n_u32_x(pg,z,15),hi=svand_n_u32_x(pg,svlsr_n_u32_x(pg,z,4),15); \
         svfloat32_t p=svmul_f32_x(pg,svtbl_f32(kv,lo),xl); \
         p=svmla_f32_x(pg,p,svtbl_f32(kv,hi),xh); \
-        A=svmla_n_f32_x(pg,A,p,rw*ggml_e8m0_to_fp32(s[(size_t)(R)*sr]));}while(0)
+        A=svmla_n_f32_x(pg,A,p,rw*k3_e8m0_tab[s[(size_t)(R)*sr]].f);}while(0)
         K3_TP_PREFILL_DOWN_ROW(0,a0);K3_TP_PREFILL_DOWN_ROW(1,a1);
         K3_TP_PREFILL_DOWN_ROW(2,a2);K3_TP_PREFILL_DOWN_ROW(3,a3);
         K3_TP_PREFILL_DOWN_ROW(4,a4);K3_TP_PREFILL_DOWN_ROW(5,a5);
