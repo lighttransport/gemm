@@ -24,6 +24,7 @@ struct cuda_ds4f_dense {
     CUfunction quant_strided;
     CUfunction swiglu;
     CUfunction attn;
+    CUfunction attn_wmma;
     CUfunction scatter;
     CUfunction argmax;
     CUstream stream;
@@ -69,6 +70,7 @@ cuda_ds4f_dense *cuda_ds4f_dense_create(int device_id, int verbose) {
         cu_ok(cuModuleGetFunction(&c->quant_strided,c->module,"ds4f_cuda_quant_fp8_strided"),"strided fp8 quant") ||
         cu_ok(cuModuleGetFunction(&c->swiglu, c->module, "ds4f_cuda_swiglu"), "swiglu")) goto fail;
     if(cu_ok(cuModuleGetFunction(&c->attn,c->module,"ds4f_cuda_prefill_attn"),"prefill attn"))goto fail;
+    cuModuleGetFunction(&c->attn_wmma,c->module,"ds4f_cuda_prefill_attn_wmma");
     if(cu_ok(cuModuleGetFunction(&c->scatter,c->module,"ds4f_cuda_scatter_group"),"scatter group"))goto fail;
     if(cu_ok(cuModuleGetFunction(&c->argmax,c->module,"ds4f_cuda_argmax"),"argmax"))goto fail;
     if (cublasewInit() != 0 || cublasewCreate(&c->blas, c->stream) != 0) goto fail;
@@ -283,7 +285,8 @@ int cuda_ds4f_dense_prefill_attention(void *opaque,float *dst,const float *q,con
     if(grow(&c->aq,&c->aqc,qb)||grow(&c->ak,&c->akc,kb)||grow(&c->as,&c->asc,sb)||grow(&c->ay,&c->ayc,qb))return -1;
     if(cuMemcpyHtoDAsync(c->aq,q,qb,c->stream)!=CUDA_SUCCESS||cuMemcpyHtoDAsync(c->ak,kv+(size_t)base*kd,kb,c->stream)!=CUDA_SUCCESS||cuMemcpyHtoDAsync(c->as,sink,sb,c->stream)!=CUDA_SUCCESS)return -1;
     int p0=pos0-base,groups=(nh+7)>>3;void *a[]={&c->ay,&c->ak,&c->aq,&c->as,&M,&p0,&nh,&hd,&kd,&ns,&window,&scale};
-    if(cuLaunchKernel(c->attn,M*groups,1,1,256,1,1,0,c->stream,a,NULL)!=CUDA_SUCCESS||cuMemcpyDtoHAsync(dst,c->ay,qb,c->stream)!=CUDA_SUCCESS||cuStreamSynchronize(c->stream)!=CUDA_SUCCESS)return -1;return 0;
+    const char *wm=getenv("DS4F_CUDA_ATTN_WMMA");int use=wm&&atoi(wm)!=0&&c->attn_wmma&&hd==512&&kd==512;
+    if(cuLaunchKernel(use?c->attn_wmma:c->attn,use?(unsigned)((nh*((M+15)/16))):M*groups,1,1,use?32:256,1,1,0,c->stream,a,NULL)!=CUDA_SUCCESS||cuMemcpyDtoHAsync(dst,c->ay,qb,c->stream)!=CUDA_SUCCESS||cuStreamSynchronize(c->stream)!=CUDA_SUCCESS)return -1;return 0;
 }
 
 int cuda_ds4f_dense_oproj(void *opaque,float *dst,const ds4f_tensor *wa,

@@ -36,6 +36,50 @@ extern "C" __global__ void ds4f_cuda_prefill_attn(
     for(int d=lane;d<head_dim;d+=32){float out=0.f;if(d<kv_dim)for(int j=0;j<np;j++){const uint16_t *v=KV+(size_t)((lo+j)%kv_slots)*kv_dim;out=fmaf(sm[warp][j]*inv,__bfloat162float(__ldg((const __nv_bfloat16 *)(v+d))),out);}Y[((size_t)mm*n_heads+h)*head_dim+d]=out;}
 }
 
+/* Opt-in SM120 tiled attention. One warp owns one head and an eight-token
+ * query tile; WMMA computes QK^T while the value accumulation remains scalar
+ * to keep shared memory below the SM120 48 KiB default. */
+extern "C" __global__ void ds4f_cuda_prefill_attn_wmma(
+        float *Y,const uint16_t *KV,const float *Q,const float *sink,
+        int M,int pos0,int n_heads,int head_dim,int kv_dim,int kv_slots,
+        int window,float scale){
+    int lane=threadIdx.x&31, tile=(int)blockIdx.x, tiles=(M+15)/16;
+    int m0=(tile%tiles)*16, h=tile/tiles;
+    if(h>=n_heads)return;
+    __shared__ half qsh[16*512], ksh[512*16];
+    __shared__ float score[16*144];
+    for(int i=lane;i<16*512;i+=32){int r=i/512,d=i%512;int m=m0+r;
+        qsh[i]=(m<M&&d<head_dim)?__float2half(Q[((size_t)m*n_heads+h)*head_dim+d]):__float2half(0.f);}
+    int pos_last=pos0+m0+15, kbase=pos0+m0-window+1;if(kbase<0)kbase=0;
+    int kend=pos_last+1;if(kend>kv_slots)kend=kv_slots;int nk=kend-kbase;if(nk<1)nk=1;
+    int kt=(nk+15)/16;if(kt>9)kt=9;
+    for(int t=0;t<kt;t++){
+        int kb=kbase+t*16;
+        for(int i=lane;i<512*16;i+=32){int d=i/16,j=i%16,k=kb+j;
+            uint16_t v=0;if(d<kv_dim&&k<kv_slots)v=KV[(size_t)k*kv_dim+d];
+            ksh[i]=__float2half(__bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(&v)));}
+        __syncwarp();
+        wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+        for(int k=0;k<512;k+=16){
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> b;
+            wmma::load_matrix_sync(a,qsh+k,512);wmma::load_matrix_sync(b,ksh+k*16,16);
+            wmma::mma_sync(acc,a,b,acc);
+        }
+        wmma::store_matrix_sync(score+t*16,acc,144,wmma::mem_row_major);
+        __syncwarp();
+    }
+    if(lane<16){int r=lane;int pos=pos0+m0+r;float mx=-1.e30f;
+        for(int j=0;j<kt*16;j++){int kp=kbase+j;float v=(j<nk&&kp<=pos&&kp>=pos-window+1)?score[r*144+j]*scale:-1.e30f;if(v>mx)mx=v;}
+        float den=expf(sink[h]-mx);
+        for(int j=0;j<kt*16;j++){int kp=kbase+j;float v=(j<nk&&kp<=pos&&kp>=pos-window+1)?expf(score[r*144+j]*scale-mx):0.f;score[r*144+j]=v;den+=v;}
+        float inv=1.f/den;for(int j=0;j<kt*16;j++)score[r*144+j]*=inv;}
+    __syncwarp();
+    for(int d=lane;d<head_dim;d+=32){for(int r=0;r<16;r++){int m=m0+r;if(m>=M)continue;float out=0.f;
+        for(int j=0;j<kt*16;j++){int kp=kbase+j;if(j<nk&&kp<kv_slots){uint16_t v=KV[(size_t)kp*kv_dim+d];out=fmaf(score[r*144+j],__bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(&v)),out);}}
+        Y[((size_t)m*n_heads+h)*head_dim+d]=out;}}
+}
+
 extern "C" __global__ void ds4f_cuda_swiglu(
         float *g, const float *u, size_t n, float lim) {
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
