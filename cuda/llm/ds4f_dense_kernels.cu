@@ -1,9 +1,34 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <mma.h>
 #include <stdint.h>
 
 using namespace nvcuda;
+
+/* Per-row, per-32 activation quantization for SM120 native MXFP8. */
+extern "C" __global__ void ds4f_cuda_quant_fp8_vec128(
+        uint8_t *Q, uint8_t *scale, const float *X, int rows, int cols) {
+    int r = blockIdx.y, b = blockIdx.x, lane = threadIdx.x;
+    int k = b * 32 + lane;
+    float v = r < rows && k < cols ? X[(size_t)r * cols + k] : 0.0f;
+    float a = fabsf(v);
+    for (int d = 16; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, d));
+    a = __shfl_sync(0xffffffff, a, 0);
+    int ep = a > 0.0f ? (int)ceilf(log2f(a / 448.0f)) : 0;
+    ep = max(-127, min(127, ep));
+    float s = ldexpf(1.0f, ep);
+    if (lane == 0) {
+        int nb=(cols+31)/32, nti=(nb+3)/4;
+        size_t off=(size_t)((b>>2)+(r>>7)*nti)*512 +
+                   (size_t)(r&31)*16 + (size_t)((r&127)>>5)*4 + (b&3);
+        scale[off] = (uint8_t)(ep + 127);
+    }
+    if (r < rows && k < cols) {
+        __nv_fp8_e4m3 q = __nv_fp8_e4m3(v / s);
+        Q[(size_t)r * cols + k] = *(const uint8_t *)&q;
+    }
+}
 
 __device__ __forceinline__ float ds4f_fp8_e4m3fn(uint8_t v) {
     int s = v >> 7, e = (v >> 3) & 15, m = v & 7;
