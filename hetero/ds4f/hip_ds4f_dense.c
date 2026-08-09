@@ -1716,8 +1716,10 @@ int hip_ds4f_dense_prefill_attention(
     hipError_t err = hipModuleLaunchKernel(use_wmma ? ctx->prefill_attn_wmma : ctx->prefill_attn,
                                             gx, 1, 1, 256, 1, 1, 0, ctx->stream,
                                             args, NULL);
+    int no_d2h = getenv("DS4F_HIP_ATTN_NO_D2H") &&
+                 getenv("DS4F_HIP_ATTN_DEVICE_CHAIN");
     if (err != hipSuccess || hipStreamSynchronize(ctx->stream) != hipSuccess ||
-        hipMemcpy(dst, ctx->attn_y, qb, hipMemcpyDeviceToHost) != hipSuccess)
+        (!no_d2h && hipMemcpy(dst, ctx->attn_y, qb, hipMemcpyDeviceToHost) != hipSuccess))
         return -1;
     if (getenv("DS4F_HIP_ATTN_DEVICE_CHAIN")) {
         ctx->attn_device_ready = 1;
