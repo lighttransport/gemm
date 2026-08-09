@@ -2063,10 +2063,14 @@ int hip_ds4f_dense_gemm_tensors(
         xbytes += (size_t)M[i] * (size_t)k0 * sizeof(float);
     }
     if (ensure_gemm_host_pack(ctx, xbytes, 0) != 0) return -1;
-    for (int i = 0; i < n; ++i)
+    for (int i = 0; i < n; ++i) {
+        if (i > 0 && xoff[i] == xoff[0] && M[i] == M[0] &&
+            Xstride[i] == Xstride[0] && x[i] == x[0])
+            continue;
         for (int mm = 0; mm < M[i]; ++mm)
             memcpy((uint8_t *)ctx->gemm_x_pack + xoff[i] + (size_t)mm*k0*sizeof(float),
                    x[i] + (size_t)mm*Xstride[i], (size_t)k0*sizeof(float));
+    }
     if (ensure_gemm_x(ctx, xbytes) != 0 ||
         ensure_gemm_multi_outputs(ctx, n, ybytes) != 0)
         return -1;
