@@ -591,7 +591,7 @@ static inline void k3_expert_tp_down_selected_sve(float *out,
 static inline void k3_expert_tp_down_routed_sve(float *out,
         const k3_mxfp4_matrix *w2,const int *route_experts,
         const int *positions,const float *route_weight,int topk,
-        const float *gate,int local,int row){
+        const float *gate,int local,int row,int preweighted){
     svbool_t pg=svptrue_b32();svfloat32_t kv=svld1(pg,ds4f_kvalues_mxfp4_f32);
     svfloat32_t a0=svdup_f32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
     size_t wr=(size_t)local/2,sr=(size_t)local/32;
@@ -599,7 +599,8 @@ static inline void k3_expert_tp_down_routed_sve(float *out,
         const uint8_t*w=w2[e].packed+(size_t)row*wr+b/2;
         const uint8_t*s=w2[e].scale+(size_t)row*sr+b/32;
         const float*x=gate+(size_t)pos*local+b;
-        svfloat32_t xl=svld1(pg,x),xh=svld1(pg,x+16);float rw=route_weight[k];
+        svfloat32_t xl=svld1(pg,x),xh=svld1(pg,x+16);
+        float rw=preweighted?1.0f:route_weight[k];
 #define K3_TP_PREFILL_DOWN_ROW(R,A) do{svuint32_t z=svld1ub_u32(pg,w+(size_t)(R)*wr); \
         svuint32_t lo=svand_n_u32_x(pg,z,15),hi=svand_n_u32_x(pg,svlsr_n_u32_x(pg,z,4),15); \
         svfloat32_t p=svmul_f32_x(pg,svtbl_f32(kv,lo),xl); \
@@ -680,6 +681,21 @@ static inline int k3_expert_tp_prefill_mxfp4(float *partial,
     for(int i=0;i<batch*topk*local;++i)gate[i]=4.0f*tanhf(gate[i]*.25f)*
         k3_sigmoidf(gate[i])*25.0f*tanhf(up[i]*.04f);
 #endif
+    int preweighted=batch>=1024;
+    if(preweighted){
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+        for(int i=0;i<batch*topk;++i){float rw=route_weight[i];
+            float*x=gate+(size_t)positions[i]*local;
+#if defined(__ARM_FEATURE_SVE)
+            int vl=(int)svcntw();for(int j=0;j<local;j+=vl){svbool_t pg=svwhilelt_b32(j,local);
+                svst1(pg,x+j,svmul_n_f32_x(pg,svld1(pg,x+j),rw));}
+#else
+            for(int j=0;j<local;++j)x[j]*=rw;
+#endif
+        }
+    }
     int g2=K3_LATENT/8;
 #if defined(__ARM_FEATURE_SVE)
 #if defined(_OPENMP)
@@ -688,7 +704,7 @@ static inline int k3_expert_tp_prefill_mxfp4(float *partial,
     for(int task=0;task<batch*g2;++task){int t=task/g2,row=(task%g2)*8;
         k3_expert_tp_down_routed_sve(partial+(size_t)t*K3_LATENT+row,w2,
             route_experts+(size_t)t*topk,positions+(size_t)t*topk,
-            route_weight+(size_t)t*topk,topk,gate,local,row);}
+            route_weight+(size_t)t*topk,topk,gate,local,row,preweighted);}
 #else
     (void)partial;return-1;
 #endif
