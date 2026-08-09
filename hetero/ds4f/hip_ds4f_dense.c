@@ -34,7 +34,7 @@ typedef struct {
 
 typedef struct {
     void *w, *s, *x, *y;
-    int n_out, n_in, n_tok;
+    int n_out, n_in, n_tok, x_stride, y_stride, x_off, y_off;
 } hip_ds4f_mxfp4_task;
 
 enum {
@@ -126,6 +126,7 @@ struct hip_ds4f_dense {
     hipFunction_t prefill_attn;
     hipFunction_t prefill_attn_wmma;
     hipFunction_t apply_rope;
+    hipFunction_t gemm_fp8_grouped_wmma;
 
     hip_ds4f_matrix *matrices;
     int n_matrices, cap_matrices;
@@ -390,6 +391,7 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
     hipModuleGetFunction(&ctx->prefill_attn_wmma, ctx->module,
                          "ds4f_dense_prefill_attn_wmma");
     hipModuleGetFunction(&ctx->apply_rope, ctx->module, "ds4f_apply_rope");
+    hipModuleGetFunction(&ctx->gemm_fp8_grouped_wmma, ctx->module, "ds4f_dense_fp8_grouped_wmma");
     /* The fused shared-FFN SwiGLU lives in its own module, ALWAYS compiled
      * precise: clang's -ffast-math approximates the SiLU's division (even
      * through __fdiv_rn / __frcp_rn / double div), so it cannot ride in the
@@ -1690,7 +1692,20 @@ int hip_ds4f_dense_prefill_attn_oproj(void *opaque,float *dst,const float *q,con
  }
  void *dy=c->attn_y,*dkv=c->attn_kv,*dq=c->attn_q,*ds=c->attn_sink;int lp=pos0-base;const char *wm=getenv("DS4F_HIP_ATTN_WMMA");int use=wm&&atoi(wm)!=0&&c->prefill_attn_wmma&&hd==512&&kd==512;void *aa[]={&dy,&dkv,&dq,&ds,&M,&lp,&nh,&hd,&kd,&ns,&window,&scale};unsigned gx=(unsigned)(use?nh*((M+15)/16):M*((nh+7)>>3));
  if(hipModuleLaunchKernel(use?c->prefill_attn_wmma:c->prefill_attn,gx,1,1,256,1,1,0,c->stream,aa,NULL)!=hipSuccess)return -1;void *ra[]={&c->attn_y,&c->rope_c,&c->rope_s,&M,&hd,&H,&ro,&rp};if(hipModuleLaunchKernel(c->apply_rope,(unsigned)(((size_t)M*rp+255)/256),1,1,256,1,1,0,c->stream,ra,NULL)!=hipSuccess)return -1;
- for(int g=0;g<groups;g++){size_t n=(size_t)M*gin;int off=g*gin;void *ga[]={&c->op_xt,&c->attn_y,&M,&gin,&H,&off};if(hipModuleLaunchKernel(c->gather_group,(unsigned)((n+255)/256),1,1,256,1,1,0,c->stream,ga,NULL)!=hipSuccess||launch_gemm_dev(c,a,g*lora,c->op_yt,c->op_xt,lora,gin,M)!=0)return -1;n=(size_t)M*lora;off=g*lora;void *sa[]={&c->op_di,&c->op_yt,&M,&lora,&ointer,&off};if(hipModuleLaunchKernel(c->scatter_group,(unsigned)((n+255)/256),1,1,256,1,1,0,c->stream,sa,NULL)!=hipSuccess)return -1;}
+ const char *og=getenv("DS4F_HIP_OPROJ_GROUP_WMMA");
+ int grouped_op = og && atoi(og)!=0 && c->gemm_fp8_grouped_wmma && matrix_is_fp8(a->kind);
+ if (grouped_op) {
+     hip_ds4f_mxfp4_task task[32]; memset(task,0,sizeof(task));
+     for (int g=0; g<groups; ++g) {
+         task[g].w=(uint8_t *)a->dw+(size_t)g*lora*gin;
+         task[g].s=(uint8_t *)a->ds+(size_t)(g*lora/128)*a->scale_cols;
+         task[g].x=c->attn_y; task[g].y=c->op_di; task[g].n_out=lora; task[g].n_in=gin; task[g].n_tok=M;
+         task[g].x_stride=H; task[g].y_stride=ointer; task[g].x_off=g*gin; task[g].y_off=g*lora;
+     }
+     if (ensure_mxfp4_task_buffer(c,groups)!=0 || hipMemcpyAsync(c->gemm_mxfp4_tasks,task,(size_t)groups*sizeof(*task),hipMemcpyHostToDevice,c->stream)!=hipSuccess)return -1;
+     int sc=a->scale_cols; void *ga[]={&c->gemm_mxfp4_tasks,&groups,&sc};
+     if (hipModuleLaunchKernel(c->gemm_fp8_grouped_wmma,(unsigned)((lora+15)/16),(unsigned)((M+15)/16),(unsigned)groups,32,1,1,0,c->stream,ga,NULL)!=hipSuccess)return -1;
+ } else for(int g=0;g<groups;g++){size_t n=(size_t)M*gin;int off=g*gin;void *ga[]={&c->op_xt,&c->attn_y,&M,&gin,&H,&off};if(hipModuleLaunchKernel(c->gather_group,(unsigned)((n+255)/256),1,1,256,1,1,0,c->stream,ga,NULL)!=hipSuccess||launch_gemm_dev(c,a,g*lora,c->op_yt,c->op_xt,lora,gin,M)!=0)return -1;n=(size_t)M*lora;off=g*lora;void *sa[]={&c->op_di,&c->op_yt,&M,&lora,&ointer,&off};if(hipModuleLaunchKernel(c->scatter_group,(unsigned)((n+255)/256),1,1,256,1,1,0,c->stream,sa,NULL)!=hipSuccess)return -1;}
  if(launch_gemm_dev(c,b,0,c->op_dy,c->op_di,C,ointer,M)!=0||hipMemcpyAsync(dst,c->op_dy,dyb,hipMemcpyDeviceToHost,c->stream)!=hipSuccess||hipStreamSynchronize(c->stream)!=hipSuccess)return -1;return 0;
 }
 
