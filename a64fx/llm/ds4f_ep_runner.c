@@ -319,7 +319,7 @@ int main(void) {
     if (g_comm_poll_spins > 64) g_comm_poll_spins = 64;
     g_comm_robust = envi("DS4F_COMM_ROBUST", 1) != 0;
     if (prefill_batch > DS4F_MAX_MTILE) prefill_batch = DS4F_MAX_MTILE;
-    if (prefill_verify > 128) prefill_verify = 128; /* batched verify supports up to 128 positions */
+    if (prefill_verify > DS4F_MAX_MTILE) prefill_verify = DS4F_MAX_MTILE;
     if (prefill_verify < 0) prefill_verify = 0;
 
     /* ---- real greedy generation mode (coding-task quality test) ----
@@ -345,6 +345,11 @@ int main(void) {
         }
         fclose(pfh);
         if (n_prompt < 1) die("DS4F_PROMPT_IDS file has no ids", -1);
+        /* Benchmark harness: allow a long fixed corpus to be measured at a
+         * shorter exact-causal length without generating another tracked
+         * artifact.  The default remains the complete prompt. */
+        int prompt_limit = envi("DS4F_PROMPT_LIMIT", 0);
+        if (prompt_limit > 0 && n_prompt > prompt_limit) n_prompt = prompt_limit;
         prefill = n_prompt;     /* prefill the whole prompt token-at-a-time */
         maxgen  = max_new;      /* decode up to max_new new tokens */
         prefill_batch = 0;      /* greedy feedback needs the per-token embedding */

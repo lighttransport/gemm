@@ -5188,9 +5188,24 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
     int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD, og = c->o_groups, gin = H/og;
     float eps = 1e-6f; int hc = c->hc_mult; size_t hcC = (size_t)hc*C;
     if (ds4f_prof_on < 0) { const char *e = getenv("DS4F_PROF"); ds4f_prof_on = e ? atoi(e) : 0; }
-    if (K > 128) { fprintf(stderr, "ds4f_forward_verify: K=%d > 128\n", K); abort(); }
+    if (K < 1 || K > DS4F_MAX_MTILE) {
+        fprintf(stderr, "ds4f_forward_verify: K=%d outside [1,%d]\n", K, DS4F_MAX_MTILE);
+        abort();
+    }
+    if (!m->p_x || m->m_tile < K) {
+        fprintf(stderr, "ds4f_forward_verify: scratch tile=%d smaller than K=%d\n", m->m_tile, K);
+        abort();
+    }
     size_t snap_stride = snaps ? ds4f_tb2_snap_bytes(m) : 0, snap_loff = 0;
-    float pa[128][16], ca[128][64], pf[128][16], cf[128][64];    /* per-position sinkhorn weights */
+    /* Heap scratch keeps larger causal tiles off the stack. */
+    float *pa = (float *)malloc((size_t)K * 16 * sizeof(float));
+    float *ca = (float *)malloc((size_t)K * 64 * sizeof(float));
+    float *pf = (float *)malloc((size_t)K * 16 * sizeof(float));
+    float *cf = (float *)malloc((size_t)K * 64 * sizeof(float));
+    if (!pa || !ca || !pf || !cf) {
+        fprintf(stderr, "ds4f_forward_verify: K=%d scratch allocation failed\n", K);
+        free(pa); free(ca); free(pf); free(cf); abort();
+    }
     if (!m->v_x4) { size_t vb = (size_t)m->m_tile*hcC*4;
         m->v_x4 = (float *)aligned_alloc(256, vb); m->v_resid = (float *)aligned_alloc(256, vb); }
     for (int k = 0; k < K; k++) for (int s = 0; s < hc; s++)   /* expand each input into hc streams */
@@ -5203,7 +5218,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         /* mHC pre: one pooled mix/RMS/sinkhorn/collapse sequence for the whole tile. */
         double tv = ds4f_prof_on ? ds4f_now() : 0.0;
         ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_attn_fn, ly->hc_attn_scale, ly->hc_attn_base,
-                          m->p_x, &pa[0][0], 16, &ca[0][0], 64, m->v_resid);
+                          m->p_x, pa, 16, ca, 64, m->v_resid);
         if (ds4f_prof_on) m->prof[DS4F_P_MHCPRE] += ds4f_now()-tv;
         /* batched q/kv projections */
         tv = ds4f_prof_on ? ds4f_now() : 0.0;
@@ -5243,16 +5258,45 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_gemm(m,m->v_cmp_score,&cwg,m->p_hn,K,cmpW_pf,C);
         }
         if (ds4f_prof_on) m->prof[DS4F_P_TB2PREP] += ds4f_now()-tv;
-        /* per-position tier-B2 attention (causal: append KV then attend, in order) */
-        for (int k = 0; k < K; k++) {
+        /* Dense (non-TierB2) layers have no stateful compressor dependency.
+         * Append the whole tile, then use the triangular prefill worker.  The
+         * no-wrap guard is required because that worker intentionally uses a
+         * contiguous KV span; wrapped/long-window tiles retain the reference
+         * causal loop below. */
+        int block_dense = (ratio == 0 && m->attn_h0 == 0 && m->attn_h1 == c->n_heads &&
+                           pos0 >= 0 && pos0 + K <= ly->kv_slots);
+        if (block_dense) {
+            ds4f_pf_kv_task kt = { m, ly, pos0, K, rcos, rsin };
+            ds4f_pool_run(m->pool, ds4f_pf_kvpost_worker, &kt);
+            ds4f_attn_pf_task at = { m, ly, pos0, K, 1.0f/sqrtf((float)HD),
+                                     c->window_size, c->qk_rope_dim/2, rcos, rsin };
+            ds4f_pool_run(m->pool, ds4f_attn_prefill_worker, &at);
+        }
+        int batch_kv = (K <= ly->kv_slots);
+        if (!block_dense && batch_kv) {
+            /* KV rows are independent of compressor/index state.  Preprocess
+             * and publish the whole tile before the ordered TierB2 loop; each
+             * query still masks future positions, and K<=ring capacity keeps
+             * the writes one-to-one even when the ring wraps. */
+            ds4f_pf_kv_task kt = { m, ly, pos0, K, rcos, rsin };
+            ds4f_pool_run(m->pool, ds4f_pf_kvpost_worker, &kt);
+        }
+        /* TierB2 and wrapped dense layers remain ordered: append KV, update
+         * compressor/index state, then attend for each position. */
+        if (!block_dense) for (int k = 0; k < K; k++) {
             int pos = pos0 + k;
             float *kvl = m->p_kvlat + (size_t)k*KV;
-            ds4f_rmsnorm(kvl, kvl, ly->kv_norm, KV, eps);
-            ds4f_rope_apply(kvl + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
-            { uint16_t *dst = ly->kv_cache + (size_t)(pos % ly->kv_slots)*KV;
-              for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kvl[d]); }
-            memcpy(m->s_hn, m->p_hn + (size_t)k*C, (size_t)C*4);     /* compressor reads s_hn */
-            memcpy(m->s_q,  m->p_q  + (size_t)k*H, (size_t)H*4);     /* indexer + attention read s_q */
+            if (!batch_kv) {
+                ds4f_rmsnorm(kvl, kvl, ly->kv_norm, KV, eps);
+                ds4f_rope_apply(kvl + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
+                uint16_t *dst = ly->kv_cache + (size_t)(pos % ly->kv_slots)*KV;
+                for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kvl[d]);
+            }
+            /* Compressor/indexer/attention consume these rows read-only.  Alias
+             * the batched projections to avoid a C+H float copy per token. */
+            float *saved_hn = m->s_hn, *saved_q = m->s_q;
+            m->s_hn = m->p_hn + (size_t)k*C;
+            m->s_q  = m->p_q  + (size_t)k*H;
             m->s_idx_qpre = idxg_pf ? m->v_idxq + (size_t)k*idxHhd : NULL;
             tv = ds4f_prof_on ? ds4f_now() : 0.0;
             if (m->tierb2 && ratio) ds4f_tb2_prepare(m,ly,ratio,pos,rcos,rsin,
@@ -5273,6 +5317,8 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                 ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
             if (ds4f_prof_on) m->prof[DS4F_P_ATTN] += ds4f_now()-tv;
             memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4);
+            m->s_hn = saved_hn;
+            m->s_q = saved_q;
         }
         if (snaps) snap_loff += ds4f_tb2_snap_layer_bytes(m, L);
         /* Batched grouped low-rank o-projection.  Under TP_OPROJ, wo_a owns
@@ -5299,12 +5345,12 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         ds4f_gemm(m,m->p_o,&ly->wo_b,m->p_o1+(ly->wo_b.cols<c->o_inter?m->oi0:0),
                   K,C,c->o_inter);
         if (tpo && m->ar_cb) m->ar_cb(m->p_o,C*K,m->ar_ctx);
-        ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, &pa[0][0], 16, &ca[0][0], 64);
+        ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, pa, 16, ca, 64);
         if (ds4f_prof_on) m->prof[DS4F_P_OPROJ] += ds4f_now()-tv;
         /* mHC pre (ffn). */
         tv = ds4f_prof_on ? ds4f_now() : 0.0;
         ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_ffn_fn, ly->hc_ffn_scale, ly->hc_ffn_base,
-                          m->p_x, &pf[0][0], 16, &cf[0][0], 64, m->v_resid);
+                          m->p_x, pf, 16, cf, 64, m->v_resid);
         if (ds4f_prof_on) m->prof[DS4F_P_MHCPRE] += ds4f_now()-tv;
         { ds4f_pf_rms_task t = { m, m->p_h2, m->p_x, ly->ffn_norm, C, K, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
@@ -5387,7 +5433,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ffn_out = m->p_o;
         }                                                             /* TP_SHARED was folded before the reduce */
         tv = ds4f_prof_on ? ds4f_now() : 0.0;
-        ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, ffn_out, &pf[0][0], 16, &cf[0][0], 64);
+        ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, ffn_out, pf, 16, cf, 64);
         if (ds4f_prof_on) m->prof[DS4F_P_MHCPOST] += ds4f_now()-tv;
     }
     /* head: per-position hc_head collapse -> out_norm (batched) -> lm_head GEMM -> per-position argmax */
@@ -5411,6 +5457,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
           m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[k] = idx; } }
     if (ds4f_prof_on) m->prof[DS4F_P_HEAD] += ds4f_now()-tv;
     if (out_hc) memcpy(out_hc, m->v_x4, (size_t)K*hcC*4);
+    free(pa); free(ca); free(pf); free(cf);
 }
 
 /* DS4F_MTP forward (STUB -- scaffold only). Predicts the token after `next_id` given the main model's
