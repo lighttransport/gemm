@@ -6496,8 +6496,10 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
               ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
             ds4f_gemm(m, m->p_q, &ly->wq_b, m->p_qlat, M, H, c->q_lora);
         }
-        { ds4f_pf_qnr_task t = { m, pos0, M, rcos, rsin };
-          ds4f_pool_run(m->pool, ds4f_pf_qnr_worker, &t); }
+        if (!(gpu_qkv && getenv("DS4F_HIP_QKV_DEVICE_CHAIN"))) {
+            ds4f_pf_qnr_task t = { m, pos0, M, rcos, rsin };
+            ds4f_pool_run(m->pool, ds4f_pf_qnr_worker, &t);
+        }
         { ds4f_pf_kv_task t = { m, ly, pos0, M, rcos, rsin };
           ds4f_pool_run(m->pool, ds4f_pf_kvpost_worker, &t); }
         DS4F_TOC(DS4F_P_QKV); }
@@ -6515,7 +6517,8 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         if (!gpu_attn_oproj_ok && m->gpu_prefill_attn) {
             gpu_attn_ok = m->gpu_prefill_attn(
                 m->gpu_dense_ctx, m->p_attn, m->p_q, ly->kv_cache,
-                ly->attn_sink, M, pos0, c->n_heads, HD, KV,
+                ly->attn_sink, rcos, rsin, HD - c->qk_rope_dim,
+                c->qk_rope_dim/2, M, pos0, c->n_heads, HD, KV,
                 ly->kv_slots, c->window_size, 1.0f / sqrtf((float)HD)) == 0;
             if (gpu_attn_ok && !gpu_attn_oproj_ok) {
                 int nope = HD - c->qk_rope_dim;

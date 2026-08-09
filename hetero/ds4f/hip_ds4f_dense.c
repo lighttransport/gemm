@@ -132,7 +132,7 @@ struct hip_ds4f_dense {
     size_t op_dx_b,op_xt_b,op_yt_b,op_di_b,op_dy_b;
     hipFunction_t prefill_attn;
     hipFunction_t prefill_attn_wmma;
-    hipFunction_t apply_rope;
+    hipFunction_t apply_rope, apply_rope_heads;
     hipFunction_t rmsnorm_bf16;
     hipFunction_t gemm_fp8_grouped_wmma;
     hipFunction_t gemm_fp8_grouped_wmma64;
@@ -181,12 +181,16 @@ struct hip_ds4f_dense {
     size_t gemm_x_pack_bytes, gemm_y_pack_bytes;
     void *attn_q, *attn_kv, *attn_sink, *attn_y;
     size_t attn_q_bytes, attn_kv_bytes, attn_sink_bytes, attn_y_bytes;
+    int attn_device_ready, attn_device_M;
+    const float *attn_device_host;
     void *rope_c, *rope_s;
     size_t rope_c_bytes, rope_s_bytes;
     const float *rope_host_c, *rope_host_s;
     int rope_host_pos, rope_host_m, rope_host_pairs;
     void *qkv_x, *qkv_lat, *qkv_norm, *qkv_q, *qkv_kv, *qkv_norm_w;
     size_t qkv_x_b, qkv_lat_b, qkv_norm_b, qkv_q_b, qkv_kv_b, qkv_norm_w_b;
+    int qkv_device_ready, qkv_device_M;
+    const float *qkv_device_host;
     void *gemm_multi_dy[HIP_DS4F_GEMM_MAX];
     size_t gemm_multi_y_bytes[HIP_DS4F_GEMM_MAX];
     const ds4f_layer *stream_layer;
@@ -406,6 +410,7 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
     hipModuleGetFunction(&ctx->prefill_attn_wmma, ctx->module,
                          "ds4f_dense_prefill_attn_wmma");
     hipModuleGetFunction(&ctx->apply_rope, ctx->module, "ds4f_apply_rope");
+    hipModuleGetFunction(&ctx->apply_rope_heads, ctx->module, "ds4f_apply_rope_heads");
     hipModuleGetFunction(&ctx->rmsnorm_bf16, ctx->module, "ds4f_rmsnorm_bf16");
     hipModuleGetFunction(&ctx->gemm_fp8_grouped_wmma, ctx->module, "ds4f_dense_fp8_grouped_wmma");
     hipModuleGetFunction(&ctx->gemm_fp8_grouped_wmma64, ctx->module, "ds4f_dense_fp8_grouped_wmma64");
@@ -1650,8 +1655,9 @@ static int ensure_attn_buffer(void **p, size_t *have, size_t need) {
 
 int hip_ds4f_dense_prefill_attention(
     void *opaque, float *dst, const float *q, const uint16_t *kv,
-    const float *sink, int M, int pos0, int n_heads, int head_dim,
-    int kv_dim, int kv_slots, int window, float scale) {
+    const float *sink, const float *rcos, const float *rsin,
+    int rope_offset, int rope_pairs, int M, int pos0, int n_heads,
+    int head_dim, int kv_dim, int kv_slots, int window, float scale) {
     hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
     if (!ctx || !dst || !q || !kv || !sink || M < 1 || n_heads < 1 ||
         head_dim < 1 || kv_dim < 1 || kv_dim > head_dim || kv_slots < 1 ||
@@ -1672,12 +1678,32 @@ int hip_ds4f_dense_prefill_attention(
         ensure_attn_buffer(&ctx->attn_sink, &ctx->attn_sink_bytes, sb) != 0 ||
         ensure_attn_buffer(&ctx->attn_y, &ctx->attn_y_bytes, qb) != 0 ||
         hipSetDevice(ctx->device_id) != hipSuccess) return -1;
-    if (hipMemcpy(ctx->attn_q, q, qb, hipMemcpyHostToDevice) != hipSuccess ||
+    ctx->attn_device_ready = 0;
+    int qchained = getenv("DS4F_HIP_QKV_DEVICE_CHAIN") &&
+                   ctx->qkv_device_ready && ctx->qkv_device_M == M &&
+                   ctx->qkv_device_host == q && ctx->apply_rope_heads &&
+                   rcos && rsin;
+    if ((!qchained && hipMemcpy(ctx->attn_q, q, qb, hipMemcpyHostToDevice) != hipSuccess) ||
         hipMemcpy(ctx->attn_kv, kv + (size_t)base * kv_dim, kb,
                   hipMemcpyHostToDevice) != hipSuccess ||
         hipMemcpy(ctx->attn_sink, sink, sb, hipMemcpyHostToDevice) != hipSuccess)
         return -1;
-    void *dy = ctx->attn_y, *dkv = ctx->attn_kv, *dq = ctx->attn_q, *dsink = ctx->attn_sink;
+    void *dy = ctx->attn_y, *dkv = ctx->attn_kv,
+         *dq = qchained ? ctx->qkv_q : ctx->attn_q, *dsink = ctx->attn_sink;
+    if (qchained) {
+        size_t cb = (size_t)M * (size_t)rope_pairs * sizeof(float);
+        if (ensure_attn_buffer(&ctx->rope_c, &ctx->rope_c_bytes, cb) != 0 ||
+            ensure_attn_buffer(&ctx->rope_s, &ctx->rope_s_bytes, cb) != 0 ||
+            hipMemcpy(ctx->rope_c, rcos + (size_t)pos0*rope_pairs, cb,
+                      hipMemcpyHostToDevice) != hipSuccess ||
+            hipMemcpy(ctx->rope_s, rsin + (size_t)pos0*rope_pairs, cb,
+                      hipMemcpyHostToDevice) != hipSuccess) return -1;
+        void *ra[] = { &ctx->qkv_q, &ctx->rope_c, &ctx->rope_s, &M,
+                       &n_heads, &head_dim, &rope_offset, &rope_pairs };
+        if (hipModuleLaunchKernel(ctx->apply_rope_heads,
+                (unsigned)(((size_t)M*n_heads*rope_pairs+255)/256),1,1,
+                256,1,1,0,ctx->stream,ra,NULL) != hipSuccess) return -1;
+    }
     int groups = (n_heads + 7) >> 3;
     const char *wm = getenv("DS4F_HIP_ATTN_WMMA");
     int use_wmma = wm && atoi(wm) != 0 && ctx->prefill_attn_wmma &&
@@ -1692,6 +1718,11 @@ int hip_ds4f_dense_prefill_attention(
     if (err != hipSuccess || hipStreamSynchronize(ctx->stream) != hipSuccess ||
         hipMemcpy(dst, ctx->attn_y, qb, hipMemcpyDeviceToHost) != hipSuccess)
         return -1;
+    if (getenv("DS4F_HIP_ATTN_DEVICE_CHAIN")) {
+        ctx->attn_device_ready = 1;
+        ctx->attn_device_M = M;
+        ctx->attn_device_host = dst;
+    }
     return 0;
 }
 
@@ -1819,9 +1850,13 @@ int hip_ds4f_dense_prefill_qkv(void *opaque, float *q, float *kv, const float *x
     int n=q_lora; float eps=1.0e-6f; void *na[]={&ctx->qkv_norm,&ctx->qkv_lat,&ctx->qkv_norm_w,&M,&n,&eps};
     if (!ctx->rmsnorm_bf16 || hipModuleLaunchKernel(ctx->rmsnorm_bf16,(unsigned)M,1,1,256,1,1,0,ctx->stream,na,NULL)!=hipSuccess) return -1;
     if (launch_gemm_dev(ctx,mb,0,ctx->qkv_q,ctx->qkv_norm,H,q_lora,M)!=0) return -1;
-    if (hipMemcpyAsync(q,ctx->qkv_q,qb,hipMemcpyDeviceToHost,ctx->stream)!=hipSuccess ||
+    int q_device_chain = getenv("DS4F_HIP_QKV_DEVICE_CHAIN") != NULL;
+    if ((!q_device_chain && hipMemcpyAsync(q,ctx->qkv_q,qb,hipMemcpyDeviceToHost,ctx->stream)!=hipSuccess) ||
         hipMemcpyAsync(kv,ctx->qkv_kv,kb,hipMemcpyDeviceToHost,ctx->stream)!=hipSuccess ||
         hipStreamSynchronize(ctx->stream)!=hipSuccess) return -1;
+    ctx->qkv_device_ready = 1;
+    ctx->qkv_device_M = M;
+    ctx->qkv_device_host = q;
     return 0;
 }
 
@@ -1918,12 +1953,17 @@ int hip_ds4f_dense_oproj(void *opaque,float *dst,const ds4f_tensor *wa,
        ensure_dev_buf(&ctx->op_yt,&ctx->op_yt_b,ytb)||
        ensure_dev_buf(&ctx->op_di,&ctx->op_di_b,dib)||
        ensure_dev_buf(&ctx->op_dy,&ctx->op_dy_b,dyb))return -1;
-    const float *xh=x;
-    if(ensure_gemm_host_pack(ctx,dxb,dyb)==0){memcpy(ctx->gemm_x_pack,x,dxb);xh=ctx->gemm_x_pack;}
-    if(hipMemcpyAsync(ctx->op_dx,xh,dxb,hipMemcpyHostToDevice,ctx->stream)!=hipSuccess)return -1;
+    int chained = ctx->attn_device_ready && ctx->attn_device_M == M &&
+                  ctx->attn_device_host == x;
+    if (!chained) {
+        const float *xh=x;
+        if(ensure_gemm_host_pack(ctx,dxb,dyb)==0){memcpy(ctx->gemm_x_pack,x,dxb);xh=ctx->gemm_x_pack;}
+        if(hipMemcpyAsync(ctx->op_dx,xh,dxb,hipMemcpyHostToDevice,ctx->stream)!=hipSuccess)return -1;
+    }
+    void *op_input = chained ? ctx->attn_y : ctx->op_dx;
     for(int g=0;g<groups;g++){
         size_t n=(size_t)M*gin;int off=g*gin;
-        void *ga[]={&ctx->op_xt,&ctx->op_dx,&M,&gin,&H,&off};
+        void *ga[]={&ctx->op_xt,&op_input,&M,&gin,&H,&off};
         if(hipModuleLaunchKernel(ctx->gather_group,(unsigned)((n+255)/256),1,1,256,1,1,0,ctx->stream,ga,NULL)!=hipSuccess||
            launch_gemm_dev(ctx,a,g*lora,ctx->op_yt,ctx->op_xt,lora,gin,M)!=0)return -1;
         n=(size_t)M*lora;off=g*lora;
@@ -1935,6 +1975,7 @@ int hip_ds4f_dense_oproj(void *opaque,float *dst,const ds4f_tensor *wa,
     if(hipMemcpyAsync(out,ctx->op_dy,dyb,hipMemcpyDeviceToHost,ctx->stream)!=hipSuccess||
        hipStreamSynchronize(ctx->stream)!=hipSuccess)return -1;
     if(out!=dst)memcpy(dst,out,dyb);
+    ctx->attn_device_ready = 0;
     return 0;
 }
 

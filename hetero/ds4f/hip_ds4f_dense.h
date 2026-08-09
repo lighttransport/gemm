@@ -101,8 +101,9 @@ int hip_ds4f_dense_prefetch_layer_raw(void *ctx, const ds4f_layer *layer);
 int hip_ds4f_dense_begin_layer(void *ctx, const ds4f_layer *layer);
 int hip_ds4f_dense_prefill_attention(
     void *ctx, float *dst, const float *q, const uint16_t *kv,
-    const float *sink, int M, int pos0, int n_heads, int head_dim,
-    int kv_dim, int kv_slots, int window, float scale);
+    const float *sink, const float *rcos, const float *rsin,
+    int rope_offset, int rope_pairs, int M, int pos0, int n_heads,
+    int head_dim, int kv_dim, int kv_slots, int window, float scale);
 int hip_ds4f_dense_prefill_qkv(void *ctx, float *q, float *kv, const float *x,
     const ds4f_tensor *wqa, const ds4f_tensor *wkv, const ds4f_tensor *wqb,
     const uint16_t *qnorm, int M, int C, int q_lora, int H, int kv_lora);

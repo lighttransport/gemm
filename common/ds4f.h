@@ -463,8 +463,9 @@ typedef int (*ds4f_gpu_dense_layer_fn)(void *ctx, const ds4f_layer *layer);
 typedef int (*ds4f_gpu_dense_layer_prefetch_fn)(void *ctx, const ds4f_layer *layer);
 typedef int (*ds4f_gpu_prefill_attn_fn)(
     void *ctx, float *dst, const float *q, const uint16_t *kv,
-    const float *sink, int M, int pos0, int n_heads, int head_dim,
-    int kv_dim, int kv_slots, int window, float scale);
+    const float *sink, const float *rcos, const float *rsin,
+    int rope_offset, int rope_pairs, int M, int pos0, int n_heads,
+    int head_dim, int kv_dim, int kv_slots, int window, float scale);
 typedef int (*ds4f_gpu_prefill_attn_oproj_fn)(void *ctx, float *dst, const float *q, const uint16_t *kv,
     const float *sink, const float *rcos, const float *rsin, const ds4f_tensor *wa, const ds4f_tensor *wb,
     int M, int pos0, int n_heads, int head_dim, int kv_dim, int kv_slots, int window, float scale,

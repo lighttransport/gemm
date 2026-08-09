@@ -271,12 +271,15 @@ static int dual_blockdiag(void *opaque, float *dst, const ds4f_tensor *t,
 }
 
 static int dual_prefill_attn(void *opaque, float *dst, const float *q,
-                             const uint16_t *kv, const float *sink, int M,
+                             const uint16_t *kv, const float *sink,
+                             const float *rcos, const float *rsin,
+                             int rope_offset, int rope_pairs, int M,
                              int pos0, int n_heads, int head_dim, int kv_dim,
                              int kv_slots, int window, float scale) {
     dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
-    return hip_ds4f_dense_prefill_attention(c->hip, dst, q, kv, sink, M, pos0,
-                                            n_heads, head_dim, kv_dim,
+    return hip_ds4f_dense_prefill_attention(c->hip, dst, q, kv, sink, rcos,
+                                            rsin, rope_offset, rope_pairs, M,
+                                            pos0, n_heads, head_dim, kv_dim,
                                             kv_slots, window, scale);
 }
 
