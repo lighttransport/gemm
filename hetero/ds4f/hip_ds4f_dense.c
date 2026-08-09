@@ -1702,8 +1702,15 @@ int hip_ds4f_dense_prefill_attention(
                                             gx, 1, 1, 256, 1, 1, 0, ctx->stream,
                                             args, NULL);
     int no_d2h = ctx->attn_no_d2h && ctx->attn_device_chain;
-    if (err != hipSuccess || hipStreamSynchronize(ctx->stream) != hipSuccess ||
-        (!no_d2h && hipMemcpy(dst, ctx->attn_y, qb, hipMemcpyDeviceToHost) != hipSuccess))
+    if (err != hipSuccess) return -1;
+    /* Attention and O-projection are queued on the same stream.  In the
+     * device-chain case O-projection consumes attn_y directly, so waiting here
+     * only inserts a host round-trip between two dependent GPU kernels.  Keep
+     * the synchronization for legacy host-visible/fallback callers. */
+    if (no_d2h) {
+        /* dependency is carried by ctx->stream; synchronize at final D2H */
+    } else if (hipStreamSynchronize(ctx->stream) != hipSuccess ||
+               hipMemcpy(dst, ctx->attn_y, qb, hipMemcpyDeviceToHost) != hipSuccess)
         return -1;
     if (ctx->attn_device_chain) {
         ctx->attn_device_ready = 1;
