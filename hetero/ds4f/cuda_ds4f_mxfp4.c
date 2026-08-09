@@ -571,8 +571,6 @@ static int cuda_ds4f_mxfp4_gemm_batch_any(cuda_ds4f_mxfp4 *c, int n,
             void *aa[] = { &B->y, &B->y2, &total };
             if (cuLaunchKernel(c->add, (total + 255) / 256, 1, 1, 256, 1, 1, 0, c->stream, aa, NULL) != CUDA_SUCCESS) return -1;
         }
-        CUresult rr=cuStreamSynchronize(c->stream);
-        if(rr!=CUDA_SUCCESS)return -1;
     }
     if (dbg) {
         clock_gettime(CLOCK_MONOTONIC, &t1);
