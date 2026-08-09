@@ -57,12 +57,22 @@ class K3FullRunnerTest(unittest.TestCase):
         for name in ("pjsub_k3_full_96n_short_1h.sh", "pjsub_k3_full_96n.sh"):
             source = (HERE / name).read_text()
             self.assertIn('--mode barrier --nodes "$NODES"', source)
-            self.assertIn('BARRIER_ITERS=${K3_BARRIER_ITERS:-128}', source)
-            self.assertIn('COMM_DETERMINISTIC=${K3_COMM_DETERMINISTIC:-1}', source)
             self.assertIn('--comm-deterministic "$COMM_DETERMINISTIC"', source)
-            self.assertIn('K3_FULL_STAGE_DIR', source)
             self.assertIn('--ar-groups "$AR_GROUPS"', source)
-            self.assertIn('K3_MOE_SHARD_LAYOUT', source)
+
+    def test_short_batch_launcher_accepts_runtime_options(self):
+        source = (HERE / "pjsub_k3_full_96n_short_1h.sh").read_text()
+        self.assertIn('--barrier-iters) need_arg "$@"; BARRIER_ITERS=$2', source)
+        self.assertIn('--comm-deterministic) need_arg "$@"; COMM_DETERMINISTIC=$2', source)
+        self.assertIn('--stage-dir) need_arg "$@"; STAGE_DIR=$2', source)
+        self.assertIn('--moe-shard-layout) need_arg "$@"; MOE_SHARD_LAYOUT=$2', source)
+
+    def test_long_batch_launcher_accepts_environment_overrides(self):
+        source = (HERE / "pjsub_k3_full_96n.sh").read_text()
+        self.assertIn('BARRIER_ITERS=${K3_BARRIER_ITERS:-128}', source)
+        self.assertIn('COMM_DETERMINISTIC=${K3_COMM_DETERMINISTIC:-1}', source)
+        self.assertIn('K3_FULL_STAGE_DIR', source)
+        self.assertIn('K3_MOE_SHARD_LAYOUT', source)
 
     def test_batch_launchers_have_no_bare_export_directives(self):
         """`#PJM -x NAME` without a value passes submission and then fails the

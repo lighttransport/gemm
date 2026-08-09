@@ -1,9 +1,11 @@
 CC = fcc
 CFLAGS ?= -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -I../../common
 WARN = -Wall -Wextra -Wpedantic -Wno-unused-function
+MODEL_DIR ?= /home/u14346/models/k3/iq1
+NODES ?= 12
 
-.PHONY: all runner full-runner full-convert full-runner-test iq1-text test real-test probe-kda probe-kda-mpi probe-moe-mpi probe-expert-tp-mpi sim validate clean
-all: k3_kernel_test k3_quant_kernel_test k3_gguf_layer_bench k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe
+.PHONY: all runner full-runner full-convert full-runner-test iq1-text iq-layer-12n native-plan tp-stage-test test real-test probe-kda probe-kda-mpi probe-moe-mpi probe-expert-tp-mpi sim validate clean
+all: k3_kernel_test k3_quant_kernel_test k3_gguf_layer_bench k3_gguf_adapter_test k3_gguf_expert_tp_test k3_gguf_iq_tp_probe k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe
 
 runner: k3_ep_runner
 
@@ -29,6 +31,17 @@ full-runner-test: k3_full_runner
 full-12n-regression: k3_full_runner
 	./run_k3_12n_regression.sh
 
+# Requires an active 12-node PJM allocation and a GGUF model directory.
+iq-layer-12n: k3_gguf_layer_bench
+	./run_k3_iq_layer_12n.sh
+
+# Header-only GGUF -> native K3 ownership/layout validation; no payload staging.
+native-plan:
+	PYTHONDONTWRITEBYTECODE=1 python3 k3_gguf_native_stage.py $(MODEL_DIR) --nodes $(NODES)
+
+tp-stage-test:
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_k3_gguf_expert_tp_stage.py
+
 # Requires an active 12-node PJM allocation and streamed rank-local staging.
 fast-12n-decode: k3_ep_runner
 	./run_k3_fast_decode_12n.sh
@@ -51,6 +64,15 @@ k3_quant_kernel_test: k3_quant_kernel_test.c k3_quant.h ../../common/ggml_dequan
 k3_gguf_layer_bench: k3_gguf_layer_bench.c k3_quant.h ../../common/ggml_dequant.h ../../common/gguf_loader.h
 	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -o $@
 
+k3_gguf_adapter_test: k3_gguf_adapter_test.c k3_gguf_graph_adapter.h
+	$(CC) $(CFLAGS) $(WARN) $< -o $@
+
+k3_gguf_expert_tp_test: k3_gguf_expert_tp_test.c k3_gguf_expert_tp.h k3_quant.h ../../common/ggml_dequant.h ../../common/gguf_loader.h
+	$(CC) $(CFLAGS) $(WARN) $< -o $@
+
+k3_gguf_iq_tp_probe: k3_gguf_iq_tp_probe.c k3_gguf_expert_tp.h k3_quant.h ../../common/ggml_dequant.h ../../common/gguf_loader.h
+	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -o $@
+
 k3_runtime_test: k3_runtime_test.c k3_runtime.h
 	$(CC) $(CFLAGS) $(WARN) $< -o $@
 
@@ -69,9 +91,11 @@ k3_dense_probe: k3_dense_probe.c k3_dense.h k3_runtime.h
 k3_prefill_probe: k3_prefill_probe.c k3_prefill.h k3_dense.h k3_runtime.h ../vlm/kernels/micro_kernel_bf16B_8x3_pv.S
 	$(CC) $(CFLAGS) $(WARN) -fopenmp $< ../vlm/kernels/micro_kernel_bf16B_8x3_pv.S -lm -o $@
 
-test: k3_kernel_test k3_quant_kernel_test k3_runtime_test full-runner-test
+test: k3_kernel_test k3_quant_kernel_test k3_gguf_adapter_test k3_gguf_expert_tp_test k3_runtime_test full-runner-test tp-stage-test
 	./k3_kernel_test
 	./k3_quant_kernel_test
+	./k3_gguf_adapter_test
+	./k3_gguf_expert_tp_test
 	./k3_runtime_test
 
 real-test: all
@@ -96,4 +120,4 @@ validate:
 	PYTHONDONTWRITEBYTECODE=1 python3 k3_stage.py --validate-all
 
 clean:
-	rm -f k3_kernel_test k3_quant_kernel_test k3_gguf_layer_bench k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe k3_ep_runner k3_full_runner k3_full_convert
+	rm -f k3_kernel_test k3_quant_kernel_test k3_gguf_layer_bench k3_gguf_adapter_test k3_gguf_expert_tp_test k3_gguf_iq_tp_probe k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe k3_ep_runner k3_full_runner k3_full_convert

@@ -24,7 +24,9 @@
 #include <unistd.h>
 #include <utofu.h>
 
+#include "k3_quant.h"
 #include "k3_moe.h"
+#include "k3_gguf_expert_tp.h"
 #include "k3_runtime.h"
 #include "../utofu-tests/tofu_demo.h"
 #include "../utofu-tests/tp_allreduce.h"
@@ -71,6 +73,7 @@ typedef struct {
     int tp_nodes;
     int layers;
     int tokens;
+    int iq_warmup_tokens;
     int cache_tokens;
     int threads;
     int layer;
@@ -92,6 +95,7 @@ typedef struct {
     k3_mode mode;
     const char *cache_load;
     const char *cache_save;
+    const char *iq_stage_dir;
     const char *stage_dir;
     const char *status_dir;
     const char *topo_path;
@@ -124,6 +128,7 @@ static void usage(const char *p){
     fprintf(stderr,
         "usage: %s [--mode dummy|real|hybrid] [--nodes N] [--tp-nodes N] [--layers N] [--tokens N] [--cache-tokens N]\n"
         "          [--threads N] [--layer N] [--stage-dir DIR]\n"
+        "          [--iq-stage-dir DIR] [--iq-warmup-tokens N]  (real GGUF IQ TP expert probe)\n"
         "          [--status-dir DIR] [--cache-load PATH] [--cache-save PATH]\n"
         "          [--topo FILE] [--profile] [--kda-threads N]\n"
         "          [--fused-threads N] [--no-fused-team]\n"
@@ -146,7 +151,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         .mla_cache_bf16=1,.heartbeat_tokens=1024,.min_available_mib=2048,
         .ar_groups=-1,.comm_robust=2,.comm_poll_spins=4,
         .fuse_kda_expert=1,.mode=K3_MODE_DUMMY,.cache_load=NULL,.cache_save=NULL,
-        .stage_dir="/local/k3-runner",.status_dir=".",.topo_path="tofu_topo.txt"};
+        .stage_dir="/local/k3-runner",.iq_stage_dir=NULL,.status_dir=".",.topo_path="tofu_topo.txt"};
     for(int i=1;i<argc;++i){const char *a=argv[i];
 #define VALUE() do{if(++i>=argc){fprintf(stderr,"k3_ep_runner: missing value for %s\n",a);usage(argv[0]);return-1;}}while(0)
         if(!strcmp(a,"--mode")){VALUE();if(!strcmp(argv[i],"dummy"))o->mode=K3_MODE_DUMMY;
@@ -157,6 +162,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--tp-nodes")){VALUE();if(parse_int(a,argv[i],1,96,&o->tp_nodes))return-1;}
         else if(!strcmp(a,"--layers")){VALUE();if(parse_int(a,argv[i],1,93,&o->layers))return-1;}
         else if(!strcmp(a,"--tokens")){VALUE();if(parse_int(a,argv[i],1,1048576,&o->tokens))return-1;}
+        else if(!strcmp(a,"--iq-warmup-tokens")){VALUE();if(parse_int(a,argv[i],0,1048576,&o->iq_warmup_tokens))return-1;}
         else if(!strcmp(a,"--cache-tokens")){VALUE();if(parse_int(a,argv[i],1,1048576,&o->cache_tokens))return-1;}
         else if(!strcmp(a,"--threads")){VALUE();if(parse_int(a,argv[i],1,48,&o->threads))return-1;}
         else if(!strcmp(a,"--kda-threads")){VALUE();if(parse_int(a,argv[i],1,48,&o->kda_threads))return-1;}
@@ -177,6 +183,7 @@ static int parse_options(int argc,char **argv,k3_options *o){
         else if(!strcmp(a,"--prefetch-threads")){VALUE();if(parse_int(a,argv[i],0,48,&o->prefetch_threads))return-1;}
         else if(!strcmp(a,"--layer")){VALUE();if(parse_int(a,argv[i],0,92,&o->layer))return-1;}
         else if(!strcmp(a,"--stage-dir")){VALUE();o->stage_dir=argv[i];}
+        else if(!strcmp(a,"--iq-stage-dir")){VALUE();o->iq_stage_dir=argv[i];}
         else if(!strcmp(a,"--status-dir")){VALUE();o->status_dir=argv[i];}
         else if(!strcmp(a,"--cache-load")){VALUE();o->cache_load=argv[i];}
         else if(!strcmp(a,"--cache-save")){VALUE();o->cache_save=argv[i];}
@@ -540,7 +547,7 @@ static int load_real_expert(k3_pool *pool,const char *stage_dir,int layer,int ex
     if(!p||!s||p->rows!=(uint64_t)(rows_)||p->cols!=(uint64_t)((cols_)/2)|| \
        s->rows!=(uint64_t)(rows_)||s->cols!=(uint64_t)((cols_)/32)){ \
         fprintf(stderr,"k3_ep_runner: invalid %s TP shape in '%s'\n",#prefix,manifest);k3_pool_free(pool,base);return-1;} \
-    out->prefix=(k3_mxfp4_matrix){base+p->offset,base+s->offset,(rows_),(cols_)}; \
+    out->prefix=(k3_mxfp4_matrix){.packed=base+p->offset,.scale=base+s->offset,.rows=(rows_),.cols=(cols_)}; \
 }while(0)
     MATRIX(w1,local,K3_LATENT);MATRIX(w2,K3_LATENT,local);MATRIX(w3,local,K3_LATENT);
 #undef MATRIX
@@ -552,9 +559,9 @@ static int make_dummy_expert(k3_pool *pool,int rank,int expert,int local,k3_load
     size_t p13=(size_t)local*K3_LATENT/2,s13=(size_t)local*K3_LATENT/32;
     size_t p2=(size_t)K3_LATENT*local/2,s2=(size_t)K3_LATENT*local/32;
     size_t total=p13+s13+p2+s2+p13+s13;uint8_t *b=k3_pool_alloc(pool,total);if(!b)return-1;
-    uint8_t *p=b;out->w1=(k3_mxfp4_matrix){p,p+p13,local,K3_LATENT};p+=p13+s13;
-    out->w2=(k3_mxfp4_matrix){p,p+p2,K3_LATENT,local};p+=p2+s2;
-    out->w3=(k3_mxfp4_matrix){p,p+p13,local,K3_LATENT};
+    uint8_t *p=b;out->w1=(k3_mxfp4_matrix){.packed=p,.scale=p+p13,.rows=local,.cols=K3_LATENT};p+=p13+s13;
+    out->w2=(k3_mxfp4_matrix){.packed=p,.scale=p+p2,.rows=K3_LATENT,.cols=local};p+=p2+s2;
+    out->w3=(k3_mxfp4_matrix){.packed=p,.scale=p+p13,.rows=local,.cols=K3_LATENT};
     k3_mxfp4_matrix *m[3]={&out->w1,&out->w2,&out->w3};
     for(int q=0;q<3;++q){size_t pn=(size_t)m[q]->rows*m[q]->cols/2,sn=(size_t)m[q]->rows*m[q]->cols/32;
         uint64_t state=mix64(UINT64_C(0x4b33000000000000)^((uint64_t)rank<<24)^((uint64_t)expert<<8)^q);
@@ -564,6 +571,380 @@ static int make_dummy_expert(k3_pool *pool,int rank,int expert,int local,k3_load
          * SiTU/tanh residual, keeping checksum drift useful as a smoke signal. */
         memset(ws,110,sn);}
     out->blob=b;out->size=total;return 0;
+}
+
+static const k3_gguf_tp_segment *iq_tp_segment(
+        const k3_gguf_tp_manifest *m,int role,int expert){
+    for(size_t i=0;i<m->count;++i)
+        if(m->segments[i].role==role&&m->segments[i].expert==expert)
+            return &m->segments[i];
+    return NULL;
+}
+
+enum {
+    IQP_ROUTER_MV,
+    IQP_ROUTER_REDUCE,
+    IQP_TOPK,
+    IQP_ROUTED_DOWN,
+    IQP_LATENT_REDUCE,
+    IQP_W1_W3,
+    IQP_SITU,
+    IQP_W2_MIX,
+    IQP_EXPERT_REDUCE,
+    IQP_NORM,
+    IQP_ROUTED_UP,
+    IQP_HIDDEN_REDUCE,
+    IQP_COUNT
+};
+
+static const char *const iq_profile_names[IQP_COUNT]={
+    "router_mv","router_reduce","topk","routed_down","latent_reduce",
+    "w1_w3","situ","w2_mix","expert_reduce","norm","routed_up",
+    "hidden_reduce"
+};
+
+static uint64_t iq_hash_f32(const float *x,int n){
+    uint64_t h=UINT64_C(1469598103934665603);
+    for(int i=0;i<n;++i){uint32_t u;memcpy(&u,x+i,sizeof u);
+        for(int b=0;b<4;++b){h^=(uint8_t)(u>>(8*b));h*=UINT64_C(1099511628211);}}
+    return h;
+}
+
+static inline void iq_profile_add(double *sum,int phase,double start,int measured){
+    if(measured)sum[phase]+=now_sec()-start;
+}
+
+typedef struct {
+    k3_quant_matrix w1,w2,w3;
+    const k3_quant_packed *p1,*p2,*p3;
+    float weight;
+} k3_iq_selected_expert;
+
+static int iq_q8_block_rows(int type){
+    return type==K3_Q_IQ3_XXS?1:16;
+}
+
+static void iq_q8_matvec_block(float *out,const k3_quant_matrix *m,
+        const k3_quant_packed *packed,const k3_quant_workspace *ws,int block){
+    int step=iq_q8_block_rows(m->type),r=block*step,nb=m->cols/256;
+    const uint8_t *p=m->data+(size_t)r*m->row_bytes;
+    if(packed&&packed->data&&step==16){
+        k3_quant_matrix sub=*m;k3_quant_packed tile=*packed;
+        sub.data=p;sub.rows=16;
+        tile.data+=(size_t)block*packed->tile_bytes;tile.rows=16;
+        if(tile.scales)tile.scales+=(size_t)block*packed->scale_tile_bytes;
+        if(tile.ds)tile.ds+=(size_t)block*packed->d_tile_bytes/sizeof(*tile.ds);
+        (void)k3_quant_matvec_packed_ws(out+r,&sub,&tile,ws);return;
+    }
+    if(m->type==K3_Q_IQ1_S)
+        k3_quant_iq1_s_q8_rows16(out+r,p,m->row_bytes,ws->q8,ws->scale,nb);
+    else if(m->type==K3_Q_IQ2_XS)
+        k3_quant_iq2_xs_q8_rows16(out+r,p,m->row_bytes,ws->q8,ws->scale,nb);
+    else if(m->type==K3_Q_IQ2_XXS)
+        k3_quant_iq2_xxs_q8_rows16(out+r,p,m->row_bytes,ws->q8,ws->scale,nb);
+    else
+        out[r]=k3_quant_iq3_xxs_q8_row((const block_iq3_xxs *)p,
+                                       ws->q8,ws->scale,nb);
+}
+
+static int iq_selected_types_supported(const k3_iq_selected_expert *selected){
+    for(int e=0;e<K3_TOP_K;++e){const k3_quant_matrix *m[3]={
+            &selected[e].w1,&selected[e].w2,&selected[e].w3};
+        for(int q=0;q<3;++q)
+            if(m[q]->type<K3_Q_IQ1_S||m[q]->type>K3_Q_IQ3_XXS||
+               m[q]->rows%iq_q8_block_rows(m[q]->type))return 0;}
+    return 1;
+}
+
+static int iq_selected_forward_q8(float *reduce,
+        const k3_iq_selected_expert *selected,const float *latent,
+        float *gate,float *up,float *down,k3_quant_workspace *latent_ws,
+        k3_quant_workspace gate_ws[K3_TOP_K],int threads,
+        double phase[IQP_COUNT],int measured){
+    if(!iq_selected_types_supported(selected))return-1;
+    k3_quant_prepare_q8(latent_ws,latent,K3_LATENT);
+    int p13[2*K3_TOP_K+1],p2[K3_TOP_K+1];p13[0]=0;p2[0]=0;
+    for(int e=0;e<K3_TOP_K;++e){
+        p13[2*e+1]=p13[2*e]+selected[e].w1.rows/iq_q8_block_rows(selected[e].w1.type);
+        p13[2*e+2]=p13[2*e+1]+selected[e].w3.rows/iq_q8_block_rows(selected[e].w3.type);
+        p2[e+1]=p2[e]+selected[e].w2.rows/iq_q8_block_rows(selected[e].w2.type);
+    }
+    int situ_chunks=(selected[0].w1.rows+15)/16;
+    double mark=measured?now_sec():0;
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel shared(mark)
+    {
+#pragma omp for schedule(static)
+        for(int task=0;task<p13[2*K3_TOP_K];++task){
+            int op=0;while(task>=p13[op+1])++op;
+            int e=op/2,which=op&1,block=task-p13[op];
+            const k3_quant_matrix *m=which?&selected[e].w3:&selected[e].w1;
+            const k3_quant_packed *packed=which?selected[e].p3:selected[e].p1;
+            float *dst=(which?up:gate)+(size_t)e*m->rows;
+            iq_q8_matvec_block(dst,m,packed,latent_ws,block);
+        }
+#pragma omp single
+        {if(measured)phase[IQP_W1_W3]+=now_sec()-mark;mark=measured?now_sec():0;}
+#pragma omp for schedule(static)
+        for(int task=0;task<K3_TOP_K*situ_chunks;++task){
+            int e=task/situ_chunks,i=(task%situ_chunks)*16,n=selected[e].w1.rows-i;
+            if(n>16)n=16;
+            k3_situ_fast_sve(gate+(size_t)e*selected[e].w1.rows+i,
+                gate+(size_t)e*selected[e].w1.rows+i,
+                up+(size_t)e*selected[e].w3.rows+i,n);
+        }
+#pragma omp for schedule(static)
+        for(int e=0;e<K3_TOP_K;++e)
+            k3_quant_prepare_q8(&gate_ws[e],gate+(size_t)e*selected[e].w1.rows,
+                                selected[e].w1.rows);
+#pragma omp single
+        {if(measured)phase[IQP_SITU]+=now_sec()-mark;mark=measured?now_sec():0;}
+#pragma omp for schedule(static)
+        for(int task=0;task<p2[K3_TOP_K];++task){
+            int e=0;while(task>=p2[e+1])++e;
+            iq_q8_matvec_block(down+(size_t)e*K3_LATENT,&selected[e].w2,selected[e].p2,
+                               &gate_ws[e],task-p2[e]);
+        }
+#pragma omp for schedule(static)
+        for(int i=0;i<K3_LATENT;++i){float sum=0;
+            for(int e=0;e<K3_TOP_K;++e)
+                sum+=selected[e].weight*down[(size_t)e*K3_LATENT+i];
+            reduce[i]=sum;
+        }
+#pragma omp single
+        {if(measured)phase[IQP_W2_MIX]+=now_sec()-mark;}
+    }
+#else
+    (void)threads;(void)phase;(void)measured;return-1;
+#endif
+    return 0;
+}
+
+/* Distributed real-IQ expert stage.  This is deliberately a narrow bridge:
+ * it exercises the actual TP ownership and the production allreduce before
+ * attention/non-expert GGUF tensors are attached to the graph. */
+static int run_iq_tp_probe(const k3_options *o,k3_pool *pool,k3_runner_comm *comm){
+    char manifest_path[1024],blob_path[1024];
+    int nm=snprintf(manifest_path,sizeof manifest_path,
+                    "%s/rank%03d.expert_tp.manifest",o->iq_stage_dir,g_rank);
+    int nb=snprintf(blob_path,sizeof blob_path,
+                    "%s/rank%03d.expert_tp.blob",o->iq_stage_dir,g_rank);
+    if(nm<0||nb<0||(size_t)nm>=sizeof manifest_path||(size_t)nb>=sizeof blob_path){
+        fprintf(stderr,"k3_ep_runner: IQ TP stage path too long\n");return 2;}
+    size_t blob_size=0;
+    uint8_t *blob=k3_pool_load_blob(pool,blob_path,&blob_size);
+    if(!blob){fprintf(stderr,"k3_ep_runner rank %d: %s\n",g_rank,k3_pool_error(pool));return 2;}
+    k3_gguf_tp_manifest manifest;
+    if(k3_gguf_tp_manifest_load(&manifest,manifest_path,g_rank,g_nodes,o->layer,blob_size)){
+        fprintf(stderr,"k3_ep_runner rank %d: invalid IQ TP manifest '%s'\n",g_rank,manifest_path);return 2;
+    }
+    const k3_gguf_tp_segment *router_segment=iq_tp_segment(&manifest,4,-1);
+    const k3_gguf_tp_segment *routed_down=iq_tp_segment(&manifest,5,-1);
+    const k3_gguf_tp_segment *routed_up=iq_tp_segment(&manifest,6,-1);
+    const k3_gguf_tp_segment *routed_norm=iq_tp_segment(&manifest,7,-1);
+    if(!router_segment||router_segment->kind!=1||router_segment->col_count!=7168||
+       !routed_down||routed_down->kind!=1||routed_down->col_count!=7168||
+       !routed_up||routed_up->kind!=1||routed_up->col_count!=3584||
+       !routed_norm||routed_norm->kind!=1||routed_norm->row_count!=3584||
+       routed_norm->col_count!=1){
+        fprintf(stderr,"k3_ep_runner rank %d: IQ TP manifest has no valid router shard\n",g_rank);
+        k3_gguf_tp_manifest_free(&manifest);return 2;
+    }
+    const k3_gguf_tp_segment *expert_segments[K3_EXPERTS][3]={{0}};
+    int experts[896],expert_count=0;
+    for(size_t i=0;i<manifest.count;++i){
+        int e=manifest.segments[i].expert,seen=0;
+        if(e>=0&&e<K3_EXPERTS&&manifest.segments[i].role>=1&&manifest.segments[i].role<=3){
+            int q=manifest.segments[i].role-1;
+            if(expert_segments[e][q]){fprintf(stderr,"k3_ep_runner rank %d: duplicate IQ expert segment e=%d role=%d\n",g_rank,e,q+1);
+                k3_gguf_tp_manifest_free(&manifest);return 2;}
+            expert_segments[e][q]=&manifest.segments[i];
+        }
+        if(e<0)continue;
+        for(int j=0;j<expert_count;++j)seen|=experts[j]==e;
+        if(!seen&&expert_count<(int)(sizeof experts/sizeof experts[0]))experts[expert_count++]=e;
+    }
+    if(expert_count<=0){k3_gguf_tp_manifest_free(&manifest);return 2;}
+    for(int j=0;j<expert_count;++j)for(int q=0;q<3;++q)
+        if(!expert_segments[experts[j]][q]){fprintf(stderr,"k3_ep_runner rank %d: incomplete IQ expert e=%d\n",g_rank,experts[j]);
+            k3_gguf_tp_manifest_free(&manifest);return 2;}
+    float *router_x=k3_pool_alloc(pool,7168*sizeof(*router_x));
+    float *latent=k3_pool_alloc(pool,3584*sizeof(*latent));
+    float *gate=k3_pool_alloc(pool,(size_t)K3_TOP_K*3072*sizeof(*gate));
+    float *up=k3_pool_alloc(pool,(size_t)K3_TOP_K*3072*sizeof(*up));
+    float *down=k3_pool_alloc(pool,(size_t)K3_TOP_K*K3_LATENT*sizeof(*down));
+    float *router_logits=k3_pool_alloc(pool,K3_EXPERTS*sizeof(*router_logits));
+    float *latent_partial=k3_pool_calloc(pool,3584,sizeof(*latent_partial));
+    float *reduce=k3_pool_calloc(pool,K3_RUN_REDUCE_FLOATS,sizeof(*reduce));
+    float *norm_scratch=k3_pool_alloc(pool,3584*sizeof(*norm_scratch));
+    float *hidden_partial=k3_pool_calloc(pool,7168,sizeof(*hidden_partial));
+    float *hidden_out=k3_pool_alloc(pool,7168*sizeof(*hidden_out));
+    if(!router_x||!latent||!gate||!up||!down||!router_logits||!latent_partial||
+       !reduce||!norm_scratch||!hidden_partial||!hidden_out){k3_gguf_tp_manifest_free(&manifest);return 2;}
+    for(int i=0;i<7168;++i)router_x[i]=((float)((i*19+o->layer*13)%97)-48.0f)*0.002f;
+    int mode=k3_quant_kernel_mode_env(),failed=0;
+    const char *fused_env=getenv("K3_IQ_FUSED");
+    int fused_q8=mode==K3_QUANT_SVE_Q8&&!(fused_env&&atoi(fused_env)==0);
+    const char *packed_env=getenv("K3_IQ_PACKED");
+    int packed_q8=fused_q8&&!(packed_env&&atoi(packed_env)==0);
+    k3_quant_packed (*packed_cache)[3]=packed_q8?
+        (k3_quant_packed (*)[3])calloc(K3_EXPERTS,sizeof(*packed_cache)):NULL;
+    if(packed_q8&&!packed_cache)failed=1;
+    int route[K3_TOP_K];float route_weight[K3_TOP_K];
+    k3_quant_workspace iq_latent_ws={0},iq_gate_ws[K3_TOP_K]={{0}};
+    if(fused_q8){
+        int local_rows=expert_segments[experts[0]][0]->row_count;
+        if(k3_quant_workspace_prepare(&iq_latent_ws,K3_LATENT,mode))failed=1;
+        for(int e=0;e<K3_TOP_K&&!failed;++e)
+            if(k3_quant_workspace_prepare(&iq_gate_ws[e],local_rows,mode))failed=1;
+    }
+    double phase[IQP_COUNT]={0};
+    runner_barrier();
+    double start=0;
+    int total_tokens=o->iq_warmup_tokens+o->tokens;
+    for(int iteration=0;iteration<total_tokens&&!failed;++iteration){
+        int measured=iteration>=o->iq_warmup_tokens;
+        int token=iteration-o->iq_warmup_tokens;
+        if(iteration==o->iq_warmup_tokens){runner_barrier();start=now_sec();}
+        double pt=measured?now_sec():0;
+        memset(router_logits,0,K3_EXPERTS*sizeof(*router_logits));
+        size_t router_rb=router_segment->nbytes/(size_t)router_segment->row_count;
+        int router_rc=k3_quant_matvec_mode(router_logits+router_segment->row_start,
+            &(k3_quant_matrix){blob+router_segment->blob_offset,router_segment->type,
+                               router_segment->row_count,router_segment->col_count,router_rb},
+            router_x,o->threads,mode);
+        iq_profile_add(phase,IQP_ROUTER_MV,pt,measured);pt=measured?now_sec():0;
+        if(router_rc||runner_allreduce_sum(comm,router_logits,K3_EXPERTS)){failed=1;break;}
+        iq_profile_add(phase,IQP_ROUTER_REDUCE,pt,measured);pt=measured?now_sec():0;
+        memset(latent_partial,0,3584*sizeof(*latent_partial));
+        size_t down_rb=routed_down->nbytes/(size_t)routed_down->row_count;
+        int down_rc=k3_quant_matvec_mode(latent_partial+routed_down->row_start,
+            &(k3_quant_matrix){blob+routed_down->blob_offset,routed_down->type,
+                               routed_down->row_count,routed_down->col_count,down_rb},
+            router_x,o->threads,mode);
+        iq_profile_add(phase,IQP_ROUTED_DOWN,pt,measured);pt=measured?now_sec():0;
+        k3_router_topk(router_logits,NULL,K3_EXPERTS,K3_TOP_K,route,route_weight);
+        iq_profile_add(phase,IQP_TOPK,pt,measured);pt=measured?now_sec():0;
+        if(down_rc||runner_allreduce_sum(comm,latent_partial,K3_LATENT)){failed=1;break;}
+        iq_profile_add(phase,IQP_LATENT_REDUCE,pt,measured);
+        memcpy(latent,latent_partial,K3_LATENT*sizeof(*latent));
+        memset(reduce,0,(size_t)K3_RUN_REDUCE_FLOATS*sizeof(*reduce));
+        pt=measured?now_sec():0;
+        if(fused_q8){
+            k3_iq_selected_expert selected[K3_TOP_K];
+            for(int ei=0;ei<K3_TOP_K;++ei){int e=route[ei];
+                const k3_gguf_tp_segment *w1=e>=0&&e<K3_EXPERTS?expert_segments[e][0]:NULL;
+                const k3_gguf_tp_segment *w2=e>=0&&e<K3_EXPERTS?expert_segments[e][1]:NULL;
+                const k3_gguf_tp_segment *w3=e>=0&&e<K3_EXPERTS?expert_segments[e][2]:NULL;
+                if(!w1||!w2||!w3||w1->kind!=1||w2->kind!=2||w3->kind!=1||
+                   w1->col_count!=K3_LATENT||w3->col_count!=K3_LATENT||w2->col_count<=0){failed=1;break;}
+                selected[ei]=(k3_iq_selected_expert){
+                    .w1={blob+w1->blob_offset,w1->type,w1->row_count,w1->col_count,
+                         w1->nbytes/(size_t)w1->row_count},
+                    .w2={blob+w2->blob_offset,w2->type,w2->row_count,w2->col_count,
+                         (size_t)w2->blob_row_bytes},
+                    .w3={blob+w3->blob_offset,w3->type,w3->row_count,w3->col_count,
+                         w3->nbytes/(size_t)w3->row_count},
+                    .weight=route_weight[ei]};
+                if(packed_q8){k3_quant_matrix *m[3]={&selected[ei].w1,
+                        &selected[ei].w2,&selected[ei].w3};
+                    const k3_quant_packed **p[3]={&selected[ei].p1,
+                        &selected[ei].p2,&selected[ei].p3};
+                    for(int q=0;q<3;++q)if(m[q]->type==K3_Q_IQ1_S||m[q]->type==K3_Q_IQ2_XS){
+                        k3_quant_packed *cache=&packed_cache[e][q];
+                        if(!cache->data){int prc=m[q]->type==K3_Q_IQ1_S?
+                                k3_quant_pack_iq_rows16_nibble(cache,m[q]):
+                                k3_quant_pack_iq_rows16(cache,m[q]);
+                            if(prc){failed=1;break;}}
+                        *p[q]=cache;}
+                }
+            }
+            if(!failed&&iq_selected_forward_q8(reduce,selected,latent,gate,up,down,
+                    &iq_latent_ws,iq_gate_ws,o->threads,phase,measured))failed=1;
+        }else for(int ei=0;ei<K3_TOP_K;++ei){
+            int e=route[ei];
+            const k3_gguf_tp_segment *w1=e>=0&&e<K3_EXPERTS?expert_segments[e][0]:NULL;
+            const k3_gguf_tp_segment *w2=e>=0&&e<K3_EXPERTS?expert_segments[e][1]:NULL;
+            const k3_gguf_tp_segment *w3=e>=0&&e<K3_EXPERTS?expert_segments[e][2]:NULL;
+            if(!w1||!w2||!w3||w1->kind!=1||w2->kind!=2||w3->kind!=1||
+               w1->col_count!=3584||w3->col_count!=3584||w2->col_count<=0){failed=1;break;}
+            size_t w1rb=w1->nbytes/(size_t)w1->row_count;
+            size_t w3rb=w3->nbytes/(size_t)w3->row_count;
+            size_t w2rb=w2->blob_row_bytes;
+            int rc=k3_quant_matvec_mode(gate,&(k3_quant_matrix){
+                blob+w1->blob_offset,w1->type,w1->row_count,w1->col_count,w1rb},
+                latent,o->threads,mode);
+            rc|=k3_quant_matvec_mode(up,&(k3_quant_matrix){
+                blob+w3->blob_offset,w3->type,w3->row_count,w3->col_count,w3rb},
+                latent,o->threads,mode);
+            iq_profile_add(phase,IQP_W1_W3,pt,measured);pt=measured?now_sec():0;
+            k3_moe_situ(gate,up,w1->row_count,o->threads);
+            iq_profile_add(phase,IQP_SITU,pt,measured);pt=measured?now_sec():0;
+            rc|=k3_quant_matvec_mode(down,&(k3_quant_matrix){
+                blob+w2->blob_offset,w2->type,w2->row_count,w2->col_count,w2rb},
+                gate,o->threads,mode);
+            if(rc){failed=1;break;}
+            for(int i=0;i<K3_LATENT;++i)reduce[i]+=route_weight[ei]*down[i];
+            iq_profile_add(phase,IQP_W2_MIX,pt,measured);pt=measured?now_sec():0;
+        }
+        /* Only the routed latent is live in this reduction.  The generic
+         * runner buffer is hidden-width sized, but reducing its unused tail
+         * here needlessly sends another 7,170 floats before routed_up. */
+        pt=measured?now_sec():0;
+        reduce[K3_LATENT]=failed?1.0f:0.0f;
+        if(runner_allreduce_sum(comm,reduce,K3_LATENT+1)){failed=1;break;}
+        iq_profile_add(phase,IQP_EXPERT_REDUCE,pt,measured);
+        if(reduce[K3_LATENT]>0||!isfinite(reduce[0]))failed=1;
+        if(failed)break;
+        /* Finish the real routed projection: norm the reduced latent, compute
+         * this rank's hidden-row shard, then sum the TP shards. */
+        const float *norm=(const float *)(blob+routed_norm->blob_offset);
+        pt=measured?now_sec():0;
+        k3_rmsnorm_sve(norm_scratch,reduce,norm,K3_LATENT,1e-5f);
+        iq_profile_add(phase,IQP_NORM,pt,measured);pt=measured?now_sec():0;
+        memset(hidden_partial,0,7168*sizeof(*hidden_partial));
+        size_t uprb=routed_up->nbytes/(size_t)routed_up->row_count;
+        int up_rc=k3_quant_matvec_mode(hidden_partial+routed_up->row_start,
+            &(k3_quant_matrix){blob+routed_up->blob_offset,routed_up->type,
+                               routed_up->row_count,routed_up->col_count,uprb},
+            norm_scratch,o->threads,mode);
+        iq_profile_add(phase,IQP_ROUTED_UP,pt,measured);pt=measured?now_sec():0;
+        if(up_rc||runner_allreduce_sum(comm,hidden_partial,K3_HIDDEN)){failed=1;break;}
+        iq_profile_add(phase,IQP_HIDDEN_REDUCE,pt,measured);
+        memcpy(hidden_out,hidden_partial,K3_HIDDEN*sizeof(*hidden_out));
+        if(!isfinite(hidden_out[(token*17)%K3_HIDDEN]))failed=1;
+    }
+    double elapsed=now_sec()-start;
+    float timing=(float)elapsed;
+    float checks[2]={0.0f,0.0f};
+    for(int i=0;i<K3_LATENT;++i)checks[0]+=reduce[i];
+    checks[1]=-checks[0];
+    int rc=runner_allreduce_max(comm,&timing,1)||runner_allreduce_max(comm,checks,2);
+    double disagreement=fabs((double)checks[0]+(double)checks[1]);
+    if(rc||failed||disagreement>1e-3)failed=1;
+    uint64_t hidden_hash=iq_hash_f32(hidden_out,K3_HIDDEN);
+    printf("K3_IQTP_RUN rank=%d layer=%d nodes=%d experts=%d staged_experts=%d warmup=%d tokens=%d mode=%s fused=%d packed=%d wall_s=%.6f ms_per_token=%.6f experts_per_s=%.3f disagreement=%.3e hidden_hash=%016llx status=%s\n",
+        g_rank,o->layer,g_nodes,K3_TOP_K,expert_count,o->iq_warmup_tokens,o->tokens,
+        mode==K3_QUANT_REFERENCE?"ref":mode==K3_QUANT_SVE_Q8?"q8":"a16",
+        fused_q8,packed_q8,timing,timing*1e3/o->tokens,(double)K3_TOP_K*(double)o->tokens/(double)(timing>0?timing:1),disagreement,
+        (unsigned long long)hidden_hash,
+        failed?"FAIL":"PASS");
+    if(o->profile&&!failed){
+        float rank_max[IQP_COUNT];
+        for(int i=0;i<IQP_COUNT;++i)rank_max[i]=(float)(phase[i]/o->tokens);
+        if(runner_allreduce_max(comm,rank_max,IQP_COUNT))failed=1;
+        if(g_rank==0&&!failed){printf("K3_IQTP_PROFILE rank_max_ms_per_token");
+            double sum=0;for(int i=0;i<IQP_COUNT;++i){double ms=rank_max[i]*1e3;
+                printf(" %s=%.6f",iq_profile_names[i],ms);sum+=ms;}
+            printf(" sum=%.6f\n",sum);}
+    }
+    k3_quant_workspace_free(&iq_latent_ws);
+    for(int e=0;e<K3_TOP_K;++e)k3_quant_workspace_free(&iq_gate_ws[e]);
+    if(packed_cache){for(int e=0;e<K3_EXPERTS;++e)for(int q=0;q<3;++q)
+        k3_quant_packed_free(&packed_cache[e][q]);free(packed_cache);}
+    k3_gguf_tp_manifest_free(&manifest);
+    return failed?1:0;
 }
 static void write_status(const k3_options *o,const char *state,const char *reason,
         int tokens_completed,int last_layer,uint64_t collective_seq,
@@ -813,6 +1194,15 @@ int main(int argc,char **argv){
         fprintf(stderr,"k3_ep_runner rank %d: all-reduce initialization failed\n",g_rank);
         utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);k3_pool_destroy(&pool);return 3;}
     runner_barrier();
+
+    if(opt.iq_stage_dir){
+        int iq_rc=run_iq_tp_probe(&opt,&pool,&comm);
+        runner_barrier();
+        runner_comm_free(&comm);
+        utofu_dereg_mem(g_vcq,g_base,0);utofu_free_vcq(g_vcq);
+        k3_pool_destroy(&pool);
+        return iq_rc;
+    }
 
     int local=partition_count(96,g_rank,g_nodes)*K3_EXPERT_TP_BLOCK,ready=1;
     k3_loaded_expert experts[K3_SELECTED];memset(experts,0,sizeof experts);

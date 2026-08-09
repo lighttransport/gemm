@@ -99,6 +99,149 @@ static inline void k3_quant_ensure_luts(void) {
     (void)pthread_once(&k3_quant_lut_once, k3_quant_init_luts);
 }
 
+/* Optional packed form for the wide IQ projections.  GGUF keeps each row
+ * compressed, but the decode kernel consumes four int8 values per output row
+ * at a time.  This layout stores one 16-row tile as
+ *
+ *     [group 0, columns 0..3, rows 0..15][columns 4..7, ...] ...
+ *
+ * so every inner-loop weight access is a contiguous 64-byte SVE load.  The
+ * packed buffer is deliberately separate from k3_quant_matrix: callers can
+ * use it as a cache without changing the on-disk format or the reference
+ * path.  It is most useful when a layer's weights are reused for many
+ * decode tokens.
+ */
+typedef struct {
+    int8_t *data;
+    int rows, cols, type;
+    size_t tile_bytes;
+    int nibble;
+    int8_t *scales;       /* per tile/group: s0[16], s1[16] */
+    uint16_t *ds;         /* per tile/block: d[16] */
+    size_t scale_tile_bytes;
+    size_t d_tile_bytes;
+} k3_quant_packed;
+
+static inline void k3_quant_packed_free(k3_quant_packed *p) {
+    if (!p) return;
+    free(p->data);
+    free(p->scales);
+    free(p->ds);
+    memset(p, 0, sizeof(*p));
+}
+
+static inline void *k3_quant_alloc_aligned(size_t bytes) {
+    void *ptr = NULL;
+    if (bytes && posix_memalign(&ptr, 64u, bytes) != 0) return NULL;
+    return ptr;
+}
+
+static inline int k3_quant_pack_iq_rows16(k3_quant_packed *p,
+                                          const k3_quant_matrix *m) {
+    if (!p || !m || m->rows <= 0 || m->cols <= 0 || (m->rows & 15) ||
+        m->cols % 256 ||
+        (m->type != K3_Q_IQ1_S && m->type != K3_Q_IQ2_XS &&
+         m->type != K3_Q_IQ2_XXS)) return -1;
+    k3_quant_ensure_luts();
+    const int nb = m->cols / 256;
+    const int tiles = m->rows / 16;
+    const size_t group_bytes = 8u * 64u;
+    const size_t tile_bytes = (size_t)nb * 8u * group_bytes;
+    int8_t *data = (int8_t *)k3_quant_alloc_aligned((size_t)tiles * tile_bytes);
+    int8_t *scales = (int8_t *)k3_quant_alloc_aligned((size_t)tiles * nb * 8u * 32u);
+    uint16_t *ds = (uint16_t *)k3_quant_alloc_aligned((size_t)tiles * nb * 16u * sizeof(*ds));
+    if (!data || !scales || !ds) { free(data); free(scales); free(ds); return -1; }
+    memset(p, 0, sizeof(*p));
+    p->data = data; p->rows = m->rows; p->cols = m->cols;
+    p->type = m->type; p->tile_bytes = tile_bytes; p->nibble = 0;
+    p->scales = scales; p->ds = ds;
+    p->scale_tile_bytes = (size_t)nb * 8u * 32u;
+    p->d_tile_bytes = (size_t)nb * 16u * sizeof(*ds);
+
+#if defined(_OPENMP)
+    /* Parallel first-touch distributes the expanded cache across CMGs. */
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int t = 0; t < tiles; ++t) {
+        for (int b = 0; b < nb; ++b) {
+            for (int ib = 0; ib < 8; ++ib) {
+                int8_t *dst = data + (size_t)t * tile_bytes +
+                              ((size_t)b * 8u + (size_t)ib) * group_bytes;
+                for (int r = 0; r < 16; ++r) {
+                    const uint8_t *row = m->data +
+                        (size_t)(t * 16 + r) * m->row_bytes;
+                    int8_t q[32];
+                    if (m->type == K3_Q_IQ1_S) {
+                        const block_iq1_s *w = (const block_iq1_s *)row + b;
+                        memcpy(ds + ((size_t)t * nb + b) * 16u + r, &w->d, sizeof(w->d));
+                        int8_t *sm = scales + (((size_t)t * nb + b) * 8u + ib) * 32u;
+                        sm[r] = (int8_t)(2 * ((w->qh[ib] >> 12) & 7) + 1);
+                        sm[16 + r] = (w->qh[ib] & 0x8000) ? -sm[r] : sm[r];
+                        for (int l = 0; l < 4; ++l) {
+                            int idx = w->qs[4 * ib + l] |
+                                (((w->qh[ib] >> (3 * l)) & 7) << 8);
+                            memcpy(q + 8 * l, k3_iq1_lut[idx], 8);
+                        }
+                    } else if (m->type == K3_Q_IQ2_XS) {
+                        const block_iq2_xs *w = (const block_iq2_xs *)row + b;
+                        memcpy(ds + ((size_t)t * nb + b) * 16u + r, &w->d, sizeof(w->d));
+                        int8_t *sm = scales + (((size_t)t * nb + b) * 8u + ib) * 32u;
+                        sm[r] = (int8_t)(2 * (w->scales[ib] & 15) + 1);
+                        sm[16 + r] = (int8_t)(2 * (w->scales[ib] >> 4) + 1);
+                        for (int l = 0; l < 4; ++l)
+                            memcpy(q + 8 * l,
+                                   k3_iq2_lut[w->qs[4 * ib + l]], 8);
+                    } else {
+                        const block_iq2_xxs *w = (const block_iq2_xxs *)row + b;
+                        uint32_t aux[2];
+                        memcpy(aux, w->qs + 4 * ib, sizeof aux);
+                        for (int l = 0; l < 4; ++l) {
+                            memcpy(q + 8 * l,
+                                   iq2xxs_grid + ((const uint8_t *)aux)[l], 8);
+                            const int8_t *sg = k3_iq_sign_lut[
+                                ksigns_iq2xs[(aux[1] >> (7 * l)) & 127]];
+                            for (int j = 0; j < 8; ++j)
+                                q[8 * l + j] = (int8_t)(q[8 * l + j] * sg[j]);
+                        }
+                    }
+                    for (int c = 0; c < 8; ++c)
+                        memcpy(dst + (size_t)c * 64u + (size_t)r * 4u,
+                               q + 4 * c, 4);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Compress an already validated IQ1 row16 tile to signed nibbles.  The IQ1
+ * grid values are in [-8, 7], so this is lossless and cuts the steady-state
+ * weight stream in half.  IQ2_XS includes values outside this range and must
+ * retain its byte-packed representation. */
+static inline int k3_quant_pack_iq_rows16_nibble(k3_quant_packed *p,
+                                                  const k3_quant_matrix *m) {
+    k3_quant_packed tmp = {0};
+    if (!m || m->type != K3_Q_IQ1_S) return -1;
+    if (k3_quant_pack_iq_rows16(&tmp, m)) return -1;
+    size_t byte_tile = tmp.tile_bytes;
+    size_t n = (size_t)(m->rows / 16) * byte_tile;
+    int8_t *data = (int8_t *)k3_quant_alloc_aligned(n / 2);
+    if (!data) { k3_quant_packed_free(&tmp); return -1; }
+    for (size_t i = 0; i < n; i += 2) {
+        uint8_t a = (uint8_t)tmp.data[i] & 15u;
+        uint8_t b = (uint8_t)tmp.data[i + 1] & 15u;
+        data[i / 2] = (int8_t)(a | (uint8_t)(b << 4));
+    }
+    free(tmp.data);
+    memset(p, 0, sizeof(*p));
+    p->data = data; p->rows = m->rows; p->cols = m->cols;
+    p->type = m->type; p->tile_bytes = byte_tile / 2; p->nibble = 1;
+    p->scales = tmp.scales; p->ds = tmp.ds;
+    p->scale_tile_bytes = tmp.scale_tile_bytes;
+    p->d_tile_bytes = tmp.d_tile_bytes;
+    return 0;
+}
+
 /* omp_set_num_threads on every matvec forces the runtime to reconsider the
  * team even when the count has not changed; a decode step issues hundreds of
  * these.  Profiling put __kmp_fork_barrier at ~13% of cycles. */
@@ -770,6 +913,9 @@ static inline void k3_quant_iq1_s_q8_rows16(float *out, const uint8_t *base,
                                             size_t row_bytes, const int8_t *x,
                                             float xd, int nb) {
     const svbool_t l16 = svwhilelt_b32(0, K3_IQ_ROWS);
+    const svbool_t p8 = svptrue_b8();
+    const svuint32_t idx0 = svindex_u32(0, 32), idx1 = svindex_u32(4, 32);
+    const svuint32_t idx2 = svindex_u32(8, 32), idx3 = svindex_u32(12, 32);
     svfloat32_t facc = svdup_f32(0.0f);
     int8_t tile[K3_IQ_ROWS * 32];
     float drow[K3_IQ_ROWS];
@@ -801,15 +947,18 @@ static inline void k3_quant_iq1_s_q8_rows16(float *out, const uint8_t *base,
             svint32_t gacc = svdup_s32(0);
             const int8_t *xg = x + 256 * b + 32 * ib;
             for (int c = 0; c < 2; ++c) {
-                svint8_t xq = svld1rq_s8(svptrue_b8(), xg + 16 * c);
-                svint8_t w0 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 0, 32)));
-                svint8_t w1 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 4, 32)));
-                svint8_t w2 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 8, 32)));
-                svint8_t w3 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 12, 32)));
+                svint8_t xq = svld1rq_s8(p8, xg + 16 * c);
+                svuint32_t i0 = idx0, i1 = idx1, i2 = idx2, i3 = idx3;
+                if (c) {
+                    i0 = svadd_n_u32_x(l16, i0, 16);
+                    i1 = svadd_n_u32_x(l16, i1, 16);
+                    i2 = svadd_n_u32_x(l16, i2, 16);
+                    i3 = svadd_n_u32_x(l16, i3, 16);
+                }
+                svint8_t w0 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i0));
+                svint8_t w1 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i1));
+                svint8_t w2 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i2));
+                svint8_t w3 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i3));
                 gacc = svdot_lane_s32(gacc, w0, xq, 0);
                 gacc = svdot_lane_s32(gacc, w1, xq, 1);
                 gacc = svdot_lane_s32(gacc, w2, xq, 2);
@@ -817,8 +966,10 @@ static inline void k3_quant_iq1_s_q8_rows16(float *out, const uint8_t *base,
             }
             /* sum(x) over the group is shared by all sixteen rows; the delta
              * term folds in as (8*acc + delta)/8 to keep the scales integral. */
-            int32_t xs = 0;
-            for (int j = 0; j < 32; ++j) xs += xg[j];
+            svint32_t xs0 = svld1sb_s32(svptrue_b32(), xg);
+            svint32_t xs1 = svld1sb_s32(svptrue_b32(), xg + 16);
+            int32_t xs = (int32_t)svaddv_s32(svptrue_b32(), xs0) +
+                         (int32_t)svaddv_s32(svptrue_b32(), xs1);
             bacc = svmla_x(l16, bacc, svlsl_n_s32_x(l16, gacc, 3),
                            svld1_s32(l16, srow));
             bacc = svmla_x(l16, bacc, svdup_s32(xs), svld1_s32(l16, sdrow));
@@ -835,6 +986,11 @@ static inline void k3_quant_iq2_xs_q8_rows16(float *out, const uint8_t *base,
                                              size_t row_bytes, const int8_t *x,
                                              float xd, int nb) {
     const svbool_t l16 = svwhilelt_b32(0, K3_IQ_ROWS);
+    const svbool_t p8 = svptrue_b8();
+    const svuint32_t idx00 = svindex_u32(0, 32), idx01 = svindex_u32(4, 32);
+    const svuint32_t idx02 = svindex_u32(8, 32), idx03 = svindex_u32(12, 32);
+    const svuint32_t idx10 = svindex_u32(16, 32), idx11 = svindex_u32(20, 32);
+    const svuint32_t idx12 = svindex_u32(24, 32), idx13 = svindex_u32(28, 32);
     svfloat32_t facc = svdup_f32(0.0f);
     int8_t tile[K3_IQ_ROWS * 32];
     float drow[K3_IQ_ROWS];
@@ -856,31 +1012,227 @@ static inline void k3_quant_iq2_xs_q8_rows16(float *out, const uint8_t *base,
                 s0row[r] = 2 * (wb->scales[ib] & 15) + 1;
                 s1row[r] = 2 * (wb->scales[ib] >> 4) + 1;
             }
-            svint32_t glo = svdup_s32(0), ghi = svdup_s32(0);
             const int8_t *xg = x + 256 * b + 32 * ib;
             for (int c = 0; c < 2; ++c) {
-                svint8_t xq = svld1rq_s8(svptrue_b8(), xg + 16 * c);
-                svint8_t w0 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 0, 32)));
-                svint8_t w1 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 4, 32)));
-                svint8_t w2 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 8, 32)));
-                svint8_t w3 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 12, 32)));
-                svint32_t *g = c ? &ghi : &glo;
-                *g = svdot_lane_s32(*g, w0, xq, 0);
-                *g = svdot_lane_s32(*g, w1, xq, 1);
-                *g = svdot_lane_s32(*g, w2, xq, 2);
-                *g = svdot_lane_s32(*g, w3, xq, 3);
+                svint8_t xq = svld1rq_s8(p8, xg + 16 * c);
+                svuint32_t i0 = c ? idx10 : idx00, i1 = c ? idx11 : idx01;
+                svuint32_t i2 = c ? idx12 : idx02, i3 = c ? idx13 : idx03;
+                svint8_t w0 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i0));
+                svint8_t w1 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i1));
+                svint8_t w2 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i2));
+                svint8_t w3 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i3));
+                svint32_t gacc = svdup_s32(0);
+                gacc = svdot_lane_s32(gacc, w0, xq, 0);
+                gacc = svdot_lane_s32(gacc, w1, xq, 1);
+                gacc = svdot_lane_s32(gacc, w2, xq, 2);
+                gacc = svdot_lane_s32(gacc, w3, xq, 3);
+                bacc = svmla_x(l16, bacc, gacc,
+                               svld1_s32(l16, c ? s1row : s0row));
             }
-            bacc = svmla_x(l16, bacc, glo, svld1_s32(l16, s0row));
-            bacc = svmla_x(l16, bacc, ghi, svld1_s32(l16, s1row));
         }
         facc = svmla_x(l16, facc, svcvt_f32_s32_x(l16, bacc),
                        svmul_n_f32_x(l16, svld1(l16, drow), 0.125f));
     }
     svst1(l16, out, svmul_n_f32_x(l16, facc, xd));
+}
+
+/* Packed counterpart: each four-column slice of a 16-row group is already
+ * contiguous, so the eight weight operands below are ordinary SVE loads. */
+#if defined(__ARM_FEATURE_SVE)
+static inline svint8_t k3_quant_unpack_iq_nibbles(const int8_t *src,
+                                                   svbool_t all,
+                                                   svbool_t p32,
+                                                   svuint8_t mask_lo,
+                                                   svbool_t odd) {
+    svuint8_t packed = svld1_u8(p32, (const uint8_t *)src);
+    packed = svsel_u8(p32, packed, svdup_u8(0));
+    svuint8_t dup = svzip1_u8(packed, packed);
+    svuint8_t lo = svand_u8_x(all, dup, mask_lo);
+    svuint8_t hi = svlsr_n_u8_x(all, dup, 4);
+    svint8_t idx = svreinterpret_s8_u8(svsel_u8(odd, hi, lo));
+    /* Four-bit values use two's-complement nibbles. */
+    idx = svlsl_n_s8_x(all, idx, 4);
+    return svasr_n_s8_x(all, idx, 4);
+}
+
+static inline svint32_t k3_quant_dot_lane4(svint32_t acc, svint8_t w,
+                                           svint8_t x, int lane) {
+    switch (lane) {
+    case 0: return svdot_lane_s32(acc, w, x, 0);
+    case 1: return svdot_lane_s32(acc, w, x, 1);
+    case 2: return svdot_lane_s32(acc, w, x, 2);
+    default: return svdot_lane_s32(acc, w, x, 3);
+    }
+}
+
+#endif
+static inline void k3_quant_iq2_xxs_q8_rows16(float *, const uint8_t *,
+                                              size_t, const int8_t *, float,
+                                              int);
+static inline void k3_quant_iq_packed_rows16(float * restrict out,
+                                             const k3_quant_packed * restrict p,
+                                             const k3_quant_matrix * restrict m,
+                                             const int8_t * restrict x, float xd) {
+    /* The packed layout is [group][4-column slice][row][4 bytes].  Use it
+     * directly: this removes eight LUT expansions and four gather loads per
+     * row/group from the decode path.  The original matrix is still needed
+     * for FP16 group scales and IQ1/IQ2 per-group metadata. */
+    if (!p || !p->data || !m || m->rows != 16 || m->cols <= 0) return;
+#if defined(__ARM_FEATURE_SVE)
+    const svbool_t l16 = svwhilelt_b32(0, 16);
+    const svbool_t p8 = svptrue_b8();
+    const svbool_t p32 = svwhilelt_b8(0, 32);
+    const svuint8_t nibble_mask = svld1_u8(p8, ((const uint8_t[]){
+        15,0,15,0,15,0,15,0,15,0,15,0,15,0,15,0,
+        15,0,15,0,15,0,15,0,15,0,15,0,15,0,15,0,
+        15,0,15,0,15,0,15,0,15,0,15,0,15,0,15,0,
+        15,0,15,0,15,0,15,0,15,0,15,0,15,0,15,0 }));
+    const svuint8_t nibble_shift = svld1_u8(p8, ((const uint8_t[]){
+        0,4,0,4,0,4,0,4,0,4,0,4,0,4,0,4,
+        0,4,0,4,0,4,0,4,0,4,0,4,0,4,0,4,
+        0,4,0,4,0,4,0,4,0,4,0,4,0,4,0,4,
+        0,4,0,4,0,4,0,4,0,4,0,4,0,4,0,4 }));
+    const svbool_t odd = svcmpeq_n_u8(p8, nibble_shift, 4);
+    const int nb = m->cols / 256;
+    const size_t wstride = p->nibble ? 32u : 64u;
+    for (int t = 0; t < m->rows; t += 16) {
+        svfloat32_t facc = svdup_f32(0.0f);
+        float drow[16];
+        for (int b = 0; b < nb; ++b) {
+            svint32_t bacc = svdup_s32(0);
+            for (int r = 0; r < 16; ++r) {
+                if (p->ds)
+                    drow[r] = ggml_fp16_to_fp32(p->ds[(size_t)b * 16u + r]);
+                else {
+                    const uint8_t *row = m->data +
+                        (size_t)(t + r) * m->row_bytes;
+                    if (m->type == K3_Q_IQ1_S)
+                        drow[r] = ggml_fp16_to_fp32(
+                            (((const block_iq1_s *)row) + b)->d);
+                    else
+                        drow[r] = ggml_fp16_to_fp32(
+                            (((const block_iq2_xs *)row) + b)->d);
+                }
+            }
+            for (int ib = 0; ib < 8; ++ib) {
+                const int8_t *group = p->data +
+                    (size_t)(t / 16) * p->tile_bytes +
+                    ((size_t)b * 8u + (size_t)ib) *
+                    (p->nibble ? 256u : 512u);
+                const int8_t *xg = x + 256 * b + 32 * ib;
+                const int8_t *sm = p->scales ?
+                    p->scales + ((size_t)b * 8u + ib) * 32u : NULL;
+                svint32_t vs0 = sm ? svld1sb_s32(l16, sm) : svdup_s32(1);
+                svint32_t vs1 = sm ? svld1sb_s32(l16, sm + 16) : svdup_s32(1);
+                svint8_t xlo = svld1rq_s8(p8, xg);
+                svint8_t xhi = svld1rq_s8(p8, xg + 16);
+                if (m->type == K3_Q_IQ2_XS) {
+                    svint32_t lo = svdup_s32(0), hi = svdup_s32(0);
+                    svint8_t wv0 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 0u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 0u * wstride);
+                    svint8_t wv1 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 1u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 1u * wstride);
+                    svint8_t wv2 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 2u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 2u * wstride);
+                    svint8_t wv3 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 3u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 3u * wstride);
+                    svint8_t wv4 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 4u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 4u * wstride);
+                    svint8_t wv5 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 5u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 5u * wstride);
+                    svint8_t wv6 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 6u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 6u * wstride);
+                    svint8_t wv7 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 7u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 7u * wstride);
+                    lo = svdot_lane_s32(lo, wv0, xlo, 0);
+                    lo = svdot_lane_s32(lo, wv1, xlo, 1);
+                    lo = svdot_lane_s32(lo, wv2, xlo, 2);
+                    lo = svdot_lane_s32(lo, wv3, xlo, 3);
+                    hi = svdot_lane_s32(hi, wv4, xhi, 0);
+                    hi = svdot_lane_s32(hi, wv5, xhi, 1);
+                    hi = svdot_lane_s32(hi, wv6, xhi, 2);
+                    hi = svdot_lane_s32(hi, wv7, xhi, 3);
+                    bacc = svmla_x(l16, bacc, lo, vs0);
+                    bacc = svmla_x(l16, bacc, hi, vs1);
+                } else {
+                    svint32_t acc = svdup_s32(0);
+                    svint8_t wv0 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 0u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 0u * wstride);
+                    svint8_t wv1 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 1u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 1u * wstride);
+                    svint8_t wv2 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 2u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 2u * wstride);
+                    svint8_t wv3 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 3u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 3u * wstride);
+                    svint8_t wv4 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 4u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 4u * wstride);
+                    svint8_t wv5 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 5u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 5u * wstride);
+                    svint8_t wv6 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 6u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 6u * wstride);
+                    svint8_t wv7 = p->nibble ? k3_quant_unpack_iq_nibbles(group + 7u * wstride, p8, p32, nibble_mask, odd) : svld1_s8(p8, group + 7u * wstride);
+                    acc = svdot_lane_s32(acc, wv0, xlo, 0);
+                    acc = svdot_lane_s32(acc, wv1, xlo, 1);
+                    acc = svdot_lane_s32(acc, wv2, xlo, 2);
+                    acc = svdot_lane_s32(acc, wv3, xlo, 3);
+                    acc = svdot_lane_s32(acc, wv4, xhi, 0);
+                    acc = svdot_lane_s32(acc, wv5, xhi, 1);
+                    acc = svdot_lane_s32(acc, wv6, xhi, 2);
+                    acc = svdot_lane_s32(acc, wv7, xhi, 3);
+                    if (m->type == K3_Q_IQ1_S) {
+                        svint32_t xs0 = svld1sb_s32(svptrue_b32(), xg);
+                        svint32_t xs1 = svld1sb_s32(svptrue_b32(), xg + 16);
+                        int32_t xs = (int32_t)svaddv_s32(svptrue_b32(), xs0) +
+                                     (int32_t)svaddv_s32(svptrue_b32(), xs1);
+                        bacc = svmla_x(l16, bacc, svlsl_n_s32_x(l16, acc, 3),
+                                       vs0);
+                        bacc = svmla_x(l16, bacc, svdup_s32(xs), vs1);
+                    } else {
+                        bacc = svmla_x(l16, bacc, acc, vs0);
+                    }
+                }
+            }
+            facc = svmla_x(l16, facc, svcvt_f32_s32_x(l16, bacc),
+                           svmul_n_f32_x(l16, svld1(l16, drow), 0.125f));
+        }
+        svst1(l16, out + t, svmul_n_f32_x(l16, facc, xd));
+    }
+#else
+    (void)out; (void)p; (void)m; (void)x; (void)xd;
+#endif
+}
+
+static inline int k3_quant_matvec_packed_ws(float *out,
+                                            const k3_quant_matrix *m,
+                                            const k3_quant_packed *p,
+                                            const k3_quant_workspace *ws) {
+    if (!out || !m || !p || !ws || m->rows != 16 ||
+        (m->type != K3_Q_IQ1_S && m->type != K3_Q_IQ2_XS) ||
+        !ws->q8) return -1;
+    k3_quant_iq_packed_rows16(out, p, m, ws->q8, ws->scale);
+    return 0;
+}
+
+
+/* Token-major prefill companion to the decode entry point above.  Every
+ * activation owns a prepared workspace; flattening token and row-tile work
+ * keeps a single OpenMP team live and exposes enough independent tiles when a
+ * TP shard has fewer rows than cores.  out_stride is measured in floats. */
+static inline int k3_quant_matvec_packed_batch(float *out, size_t out_stride,
+                                               const k3_quant_matrix *m,
+                                               const k3_quant_packed *p,
+                                               const k3_quant_workspace *ws,
+                                               int batch) {
+    if (!out || !m || !p || !ws || batch < 1 || (m->rows & 15) ||
+        out_stride < (size_t)m->rows || p->tile_bytes == 0) return -1;
+    int rc = 0;
+    int tiles = m->rows / 16;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static) reduction(|:rc)
+#endif
+    for (int task = 0; task < batch * tiles; ++task) {
+        int token = task / tiles;
+        int tile_index = task - token * tiles;
+        int r = tile_index * 16;
+        k3_quant_matrix sub = *m;
+        k3_quant_packed tile = *p;
+        sub.data += (size_t)r * m->row_bytes;
+        sub.rows = 16;
+        tile.data += (size_t)tile_index * p->tile_bytes;
+        tile.rows = 16;
+        if (tile.scales)
+            tile.scales += (size_t)tile_index * p->scale_tile_bytes;
+        if (tile.ds)
+            tile.ds += (size_t)tile_index * p->d_tile_bytes / sizeof(*tile.ds);
+        if (k3_quant_matvec_packed_ws(out + (size_t)token * out_stride + r,
+                                      &sub, &tile, ws + token)) rc |= 1;
+    }
+    return rc ? -1 : 0;
 }
 
 /* IQ2_XXS: one integer scale per group, (0.5+k)*0.25 rewritten as
@@ -889,6 +1241,11 @@ static inline void k3_quant_iq2_xxs_q8_rows16(float *out, const uint8_t *base,
                                               size_t row_bytes, const int8_t *x,
                                               float xd, int nb) {
     const svbool_t l16 = svwhilelt_b32(0, K3_IQ_ROWS);
+    const svbool_t p8 = svptrue_b8();
+    const svuint32_t idx00 = svindex_u32(0, 32), idx01 = svindex_u32(4, 32);
+    const svuint32_t idx02 = svindex_u32(8, 32), idx03 = svindex_u32(12, 32);
+    const svuint32_t idx10 = svindex_u32(16, 32), idx11 = svindex_u32(20, 32);
+    const svuint32_t idx12 = svindex_u32(24, 32), idx13 = svindex_u32(28, 32);
     svfloat32_t facc = svdup_f32(0.0f);
     int8_t tile[K3_IQ_ROWS * 32], sgt[K3_IQ_ROWS * 32];
     float drow[K3_IQ_ROWS];
@@ -925,15 +1282,13 @@ static inline void k3_quant_iq2_xxs_q8_rows16(float *out, const uint8_t *base,
             svint32_t gacc = svdup_s32(0);
             const int8_t *xg = x + 256 * b + 32 * ib;
             for (int c = 0; c < 2; ++c) {
-                svint8_t xq = svld1rq_s8(svptrue_b8(), xg + 16 * c);
-                svint8_t w0 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 0, 32)));
-                svint8_t w1 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 4, 32)));
-                svint8_t w2 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 8, 32)));
-                svint8_t w3 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(
-                    l16, (const uint32_t *)tile, svindex_u32(16u * c + 12, 32)));
+                svint8_t xq = svld1rq_s8(p8, xg + 16 * c);
+                svuint32_t i0 = c ? idx10 : idx00, i1 = c ? idx11 : idx01;
+                svuint32_t i2 = c ? idx12 : idx02, i3 = c ? idx13 : idx03;
+                svint8_t w0 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i0));
+                svint8_t w1 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i1));
+                svint8_t w2 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i2));
+                svint8_t w3 = svreinterpret_s8_u32(svld1_gather_u32offset_u32(l16, (const uint32_t *)tile, i3));
                 gacc = svdot_lane_s32(gacc, w0, xq, 0);
                 gacc = svdot_lane_s32(gacc, w1, xq, 1);
                 gacc = svdot_lane_s32(gacc, w2, xq, 2);
@@ -1123,6 +1478,45 @@ static inline void k3_quant_q8_0_a16_rows8(const uint8_t *base, size_t row_bytes
 #endif
 }
 
+/* Two-token prefill tile.  Q8 weights arrive from HBM once and are reused
+ * against two activation vectors; activation reloads hit the much smaller
+ * token workspace.  Each token retains the decode kernel's block order. */
+static inline void k3_quant_q8_0_a16_rows8_batch2(
+        const uint8_t *base, size_t row_bytes, int nrows,
+        const k3_quant_workspace *ws, int ntokens, int cols,
+        float *out, size_t out_stride) {
+#if defined(__ARM_FEATURE_SVE)
+    const svbool_t pg = svwhilelt_b16(0, 32);
+    const svbool_t pd = svptrue_b64();
+    for (int r = 0; r < nrows; ++r) {
+        svfloat64_t f0 = svdup_f64(0.0), f1 = svdup_f64(0.0);
+        for (int b = 0; b < cols / 32; ++b) {
+            const block_q8_0 *w =
+                (const block_q8_0 *)(base + (size_t)r * row_bytes);
+            svint16_t wv = svld1sb_s16(pg, w[b].qs);
+            double wd = (double)ggml_fp16_to_fp32(w[b].d);
+            svint64_t d0 = svdot_s64(svdup_s64(0), wv,
+                svld1_s16(pg, ws[0].a16 + 32 * b));
+            f0 = svmla_n_f64_x(pd, f0, svcvt_f64_s64_x(pd, d0), wd);
+            if (ntokens == 2) {
+                svint64_t d1 = svdot_s64(svdup_s64(0), wv,
+                    svld1_s16(pg, ws[1].a16 + 32 * b));
+                f1 = svmla_n_f64_x(pd, f1, svcvt_f64_s64_x(pd, d1), wd);
+            }
+        }
+        out[r] = (float)(svaddv_f64(pd, f0) * (double)ws[0].scale_a16);
+        if (ntokens == 2)
+            out[out_stride + r] =
+                (float)(svaddv_f64(pd, f1) * (double)ws[1].scale_a16);
+    }
+#else
+    for (int t = 0; t < ntokens; ++t)
+        k3_quant_q8_0_a16_rows8(base, row_bytes, nrows, ws[t].a16,
+                                ws[t].scale_a16, cols,
+                                out + (size_t)t * out_stride);
+#endif
+}
+
 /* Q8_0 W8A8: eight output rows share one pass over the quantized activation.
  * Each block owns a scale, so the int32 reduction cannot be deferred across
  * blocks; what the blocking buys is one activation load per eight rows and
@@ -1185,6 +1579,9 @@ static inline float k3_quant_sve_a16_row(const uint8_t *row, int type,
  * reference to gate the SDOT kernels against. */
 static inline int k3_quant_matvec_ref(float *out, const k3_quant_matrix *m,
                                       const float *x, int threads) {
+#if !defined(_OPENMP)
+    (void)threads;
+#endif
     if (!m || !out || !x || !k3_quant_valid_shape(m->type, m->rows, m->cols))
         return -1;
     if (m->row_bytes != k3_quant_row_bytes(m->type, m->cols)) return -1;
@@ -1219,6 +1616,9 @@ static inline int k3_quant_matvec_ws(float *out, const k3_quant_matrix *m,
                                      const float *x,
                                      const k3_quant_workspace *ws,
                                      int threads, int mode) {
+#if !defined(_OPENMP)
+    (void)threads;
+#endif
     if (!m || !out || !ws || !k3_quant_valid_shape(m->type, m->rows, m->cols))
         return -1;
     if (ws->cols < m->cols) return -1;
@@ -1313,6 +1713,38 @@ static inline int k3_quant_matvec_ws(float *out, const k3_quant_matrix *m,
     return 0;
 }
 
+/* Batch Q8_0 projections without opening one OpenMP region per token.  Q8_0
+ * consumes the activation's A16 workspace in both sve-a16 and sve-q8 modes,
+ * so each (token,row8) task is numerically identical to matvec_ws. */
+static inline int k3_quant_q8_0_matvec_batch(float *out, size_t out_stride,
+                                             const k3_quant_matrix *m,
+                                             const k3_quant_workspace *ws,
+                                             int batch, int threads) {
+    (void)threads;
+    if (!out || !m || !ws || m->type != K3_Q_Q8_0 || batch < 1 ||
+        out_stride < (size_t)m->rows ||
+        m->row_bytes != k3_quant_row_bytes(m->type, m->cols)) return -1;
+    for (int b = 0; b < batch; ++b)
+        if (!ws[b].a16 || !ws[b].a16_ready || ws[b].cols < m->cols) return -1;
+    int blocks = (m->rows + 7) / 8;
+    int token_groups = (batch + 1) / 2;
+#if defined(_OPENMP)
+    k3_quant_set_threads(threads);
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int task = 0; task < token_groups * blocks; ++task) {
+        int token = (task / blocks) * 2;
+        int r = (task % blocks) * 8;
+        int ntokens = batch - token < 2 ? batch - token : 2;
+        int nr = m->rows - r < 8 ? m->rows - r : 8;
+        float *dst = out + (size_t)token * out_stride + r;
+        k3_quant_q8_0_a16_rows8_batch2(
+            m->data + (size_t)r * m->row_bytes, m->row_bytes, nr,
+            ws + token, ntokens, m->cols, dst, out_stride);
+    }
+    return 0;
+}
+
 static inline int k3_quant_matvec_mode(float *out, const k3_quant_matrix *m,
                                        const float *x, int threads,
                                        int mode) {
@@ -1337,6 +1769,85 @@ static inline int k3_quant_matvec_mode(float *out, const k3_quant_matrix *m,
     int rc = k3_quant_matvec_ws(out, m, x, &ws, threads, mode);
     k3_quant_workspace_free(&ws);
     return rc;
+}
+
+/* GGUF MoE expert pool view: [cols, rows_per_expert, experts].  Selecting an
+ * expert is only an offset calculation; the selected plane remains in the
+ * original compressed format and uses the regular 2-D kernels. */
+static inline int k3_quant_matvec_expert3d(float *out, const uint8_t *base,
+                                           int type, int cols,
+                                           int rows_per_expert, int experts,
+                                           int expert, const float *x,
+                                           int threads, int mode) {
+    if (!base || expert < 0 || expert >= experts || cols <= 0 ||
+        rows_per_expert <= 0 || k3_quant_row_bytes(type, cols) == 0)
+        return -1;
+    size_t row_bytes = k3_quant_row_bytes(type, cols);
+    k3_quant_matrix plane = {
+        base + (size_t)expert * (size_t)rows_per_expert * row_bytes,
+        type, rows_per_expert, cols, row_bytes
+    };
+    return k3_quant_matvec_mode(out, &plane, x, threads, mode);
+}
+
+/* Select a contiguous intermediate-channel slice from an expert plane.  The
+ * w1/w3 GGUF tensors are [input_cols, intermediate_rows, experts], so their
+ * TP ownership is a row slice.  Keeping this as a view avoids expanding or
+ * copying the complete expert during rank-local staging. */
+static inline int k3_quant_matvec_expert3d_rowslice(
+        float *out, const uint8_t *base, int type, int cols,
+        int rows_per_expert, int experts, int expert, int row_start,
+        int row_count, const float *x, int threads, int mode) {
+    if (!base || expert < 0 || expert >= experts || row_start < 0 ||
+        row_count <= 0 || row_start > rows_per_expert - row_count ||
+        cols <= 0 || k3_quant_row_bytes(type, cols) == 0)
+        return -1;
+    size_t row_bytes = k3_quant_row_bytes(type, cols);
+    const uint8_t *plane = base + (size_t)expert * (size_t)rows_per_expert * row_bytes;
+    k3_quant_matrix slice = {
+        plane + (size_t)row_start * row_bytes, type, row_count, cols, row_bytes
+    };
+    return k3_quant_matvec_mode(out, &slice, x, threads, mode);
+}
+
+/* Select a contiguous input-channel slice from an expert plane.  The w2
+ * GGUF tensors are [intermediate_cols, output_rows, experts].  A column slice
+ * is quantization-block aligned and therefore can be represented by a row
+ * pointer plus a shortened row; no full-plane transpose is required. */
+static inline int k3_quant_matvec_expert3d_colslice(
+        float *out, const uint8_t *base, int type, int cols_per_expert,
+        int rows_per_expert, int experts, int expert, int col_start,
+        int col_count, const float *x, int threads, int mode) {
+    int block = (type == K3_Q_Q8_0) ? 32 : 256;
+    if (!base || expert < 0 || expert >= experts || col_start < 0 ||
+        col_count <= 0 || col_start > cols_per_expert - col_count ||
+        (col_start % block) || (col_count % block) || cols_per_expert <= 0 ||
+        rows_per_expert <= 0 || k3_quant_row_bytes(type, cols_per_expert) == 0)
+        return -1;
+    size_t full_row_bytes = k3_quant_row_bytes(type, cols_per_expert);
+    size_t slice_row_bytes = k3_quant_row_bytes(type, col_count);
+    size_t col_bytes = (size_t)(col_start / block) *
+                       (full_row_bytes / (size_t)(cols_per_expert / block));
+    const uint8_t *plane = base + (size_t)expert *
+                           (size_t)rows_per_expert * full_row_bytes;
+    k3_quant_matrix slice = {
+        plane + col_bytes, type, rows_per_expert, col_count, slice_row_bytes
+    };
+    /* Each row is strided by the original full row width, so a compact matrix
+     * view is valid only when the slice is the complete row.  The TP runtime
+     * uses the packed row-slice helper below for partial w2 columns. */
+    if (col_start == 0 && col_count == cols_per_expert)
+        return k3_quant_matvec_mode(out, &slice, x, threads, mode);
+#if defined(_OPENMP)
+    k3_quant_set_threads(threads);
+#pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows_per_expert; ++r) {
+        const uint8_t *row = plane + (size_t)r * full_row_bytes + col_bytes;
+        k3_quant_matrix one = {row, type, 1, col_count, slice_row_bytes};
+        (void)k3_quant_matvec_mode(out + r, &one, x, 1, mode);
+    }
+    return 0;
 }
 
 /* Resolved once: the full runner reads this per eight-row task, which showed

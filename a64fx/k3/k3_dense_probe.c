@@ -117,7 +117,7 @@ static int mxfp4_projection(const matrix*m,const float*x,const float*ref,int thr
     size_t n=(size_t)m->rows*m->cols,wn=n/2,sn=n/32,bytes=wn+sn;
     uint8_t*p=probe_alloc(wn),*sc=probe_alloc(sn);float*out=probe_alloc((size_t)m->rows*4);
     size_t en=(size_t)192*1024*1024/4;float*eb=probe_calloc(en,4);if(!p||!sc||!out||!eb)return 1;
-    k3_mxfp4_quantize_bf16(p,sc,m->weight,m->rows,m->cols);k3_mxfp4_matrix mm={p,sc,m->rows,m->cols};
+    k3_mxfp4_quantize_bf16(p,sc,m->weight,m->rows,m->cols);k3_mxfp4_matrix mm={.packed=p,.scale=sc,.rows=m->rows,.cols=m->cols};
     k3_mxfp4_gemm_mode(out,&mm,x,1,threads,0);double se=0,sr=0,dot=0,so=0;
     for(int i=0;i<m->rows;++i){double a=out[i],b=ref[i],d=a-b;se+=d*d;sr+=b*b;dot+=a*b;so+=a*a;}
     double rel=sqrt(se/(sr+1e-30)),cos=dot/sqrt((sr+1e-30)*(so+1e-30));int ts[]={36,40,44,47,48};

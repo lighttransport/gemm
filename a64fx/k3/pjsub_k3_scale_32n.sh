@@ -14,11 +14,16 @@ LOG="$K3/logs/pool-32n-${PJM_JOBID}"
 mkdir -p "$LOG"
 
 "$K3/run_k3_ep.sh" --mode dummy --nodes 32 --layer 1 --layers 1 --tokens 64 \
-  --threads 48 --ar-groups auto --result-dir "$LOG/dummy"
+  --threads 48 --comm-deterministic 1 --comm-robust 2 --ar-groups auto --result-dir "$LOG/dummy"
 "$K3/run_kda_probe_mpi.sh" --nodes 32 --layer 0 --head 0 2>&1 | tee "$LOG/kda.log"
+"$K3/run_kda_probe_mpi.sh" --nodes 32 --layer 0 --head 1 2>&1 | tee "$LOG/kda-head1.log"
 "$K3/run_moe_probe_mpi.sh" --nodes 32 --layer 1 --experts-per-rank 4 --threads 48 \
   --result-dir "$LOG/moe" 2>&1 | tee "$LOG/moe.log"
 "$K3/run_expert_tp_probe_mpi.sh" --nodes 32 --layer 1 --experts 16 --threads 48 \
-  --result-dir "$LOG/expert_tp" 2>&1 | tee "$LOG/expert_tp.log"
+  --logical-tp 96 --logical-waves 3 --result-dir "$LOG/expert_tp" 2>&1 | tee "$LOG/expert_tp.log"
+"$K3/run_expert_tp_probe_mpi.sh" --nodes 32 --layer 1 --experts 16 --threads 48 \
+  --prefill --logical-tp 96 --logical-waves 3 --result-dir "$LOG/expert_tp_prefill" \
+  2>&1 | tee "$LOG/expert_tp_prefill.log"
 "$K3/run_k3_ep.sh" --mode dummy --nodes 32 --layer 3 --layers 1 --tokens 256 \
-  --kda-threads 8 --mla-cache-bf16 --ar-groups auto --result-dir "$LOG/attention"
+  --kda-threads 8 --comm-deterministic 1 --comm-robust 2 --mla-cache-bf16 \
+  --ar-groups auto --result-dir "$LOG/attention"

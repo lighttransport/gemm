@@ -12,13 +12,14 @@ RANK=${4:?usage: $0 MODEL_DIR OUTPUT_DIR NODES RANK}
 CHUNK_MIB=${CHUNK_MIB:-8}
 MODE=${5:-full96}
 LAYER_INDEX=${6:-}
-EXPERT_TP=${K3_EXPERT_TP:-0}
-MOE_SHARD_LAYOUT=${K3_MOE_SHARD_LAYOUT:-replicated}
+EXPERT_TP=${7:-${K3_EXPERT_TP:-0}}
+MOE_SHARD_LAYOUT=${8:-${K3_MOE_SHARD_LAYOUT:-replicated}}
+CHUNK_MIB=${9:-${CHUNK_MIB:-8}}
 PYTHON=${K3_PYTHON:-$SCRIPT_DIR/.venv-$(uname -m)/bin/python}
 
 EXPERT_ARGS=()
 if [ "$EXPERT_TP" = 1 ]; then EXPERT_ARGS+=(--expert-tp); fi
-EXPERT_ARGS+=(--moe-shard-layout "$MOE_SHARD_LAYOUT")
+EXPERT_ARGS+=(--moe-shard-layout "$MOE_SHARD_LAYOUT" --chunk-mib "$CHUNK_MIB")
 
 if [ -n "$LAYER_INDEX" ]; then
     exec "$PYTHON" "$SCRIPT_DIR/k3_full_stage.py" \

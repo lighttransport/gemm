@@ -188,9 +188,9 @@ static int load_expert(const char *blob_path,const char *manifest_path,loaded_ex
     entry*e3=find_entry(es,ne,"w3.weight_packed"),*s3=find_entry(es,ne,"w3.weight_scale");
     if(!e1||!s1||!e2||!s2||!e3||!s3){fprintf(stderr,"k3_moe_probe: manifest '%s' lacks an expert tensor\n",manifest_path);probe_free(blob);return-1;}
     out->blob=blob;out->size=size;
-    out->w1=(k3_mxfp4_matrix){blob+e1->offset,blob+s1->offset,(int)e1->rows,(int)e1->cols*2};
-    out->w2=(k3_mxfp4_matrix){blob+e2->offset,blob+s2->offset,(int)e2->rows,(int)e2->cols*2};
-    out->w3=(k3_mxfp4_matrix){blob+e3->offset,blob+s3->offset,(int)e3->rows,(int)e3->cols*2};
+    out->w1=(k3_mxfp4_matrix){.packed=blob+e1->offset,.scale=blob+s1->offset,.rows=(int)e1->rows,.cols=(int)e1->cols*2};
+    out->w2=(k3_mxfp4_matrix){.packed=blob+e2->offset,.scale=blob+s2->offset,.rows=(int)e2->rows,.cols=(int)e2->cols*2};
+    out->w3=(k3_mxfp4_matrix){.packed=blob+e3->offset,.scale=blob+s3->offset,.rows=(int)e3->rows,.cols=(int)e3->cols*2};
     return 0;
 }
 
@@ -255,7 +255,7 @@ static int tp_slices_correctness(const loaded_expert *le, int nslice, int thread
         }
     }
     for(int i=0;i<K3_LATENT;++i)x[i]=rf()*.125f;
-    k3_mxfp4_matrix f1={p1,s1,K3_EXPERT_INTER,K3_LATENT},f2={p2,s2,K3_LATENT,K3_EXPERT_INTER},f3={p3,s3,K3_EXPERT_INTER,K3_LATENT};
+    k3_mxfp4_matrix f1={.packed=p1,.scale=s1,.rows=K3_EXPERT_INTER,.cols=K3_LATENT},f2={.packed=p2,.scale=s2,.rows=K3_LATENT,.cols=K3_EXPERT_INTER},f3={.packed=p3,.scale=s3,.rows=K3_EXPERT_INTER,.cols=K3_LATENT};
     k3_expert_forward_mxfp4(ref,&f1,&f2,&f3,x,1,g,u,threads);
     double max_ms=0,total_ms=0;
     for(int q=0;q<nslice;++q){double t=now_sec();int bad=k3_expert_tp_forward_mxfp4(part,&le[q].w1,&le[q].w2,&le[q].w3,x,1,gl,ul,threads,8);double ms=(now_sec()-t)*1e3;
@@ -266,7 +266,10 @@ static int tp_slices_correctness(const loaded_expert *le, int nslice, int thread
     probe_free(p1);probe_free(s1);probe_free(p2);probe_free(s2);probe_free(p3);probe_free(s3);probe_free(x);probe_free(ref);probe_free(sum);probe_free(part);probe_free(g);probe_free(u);probe_free(gl);probe_free(ul);return e>=2e-4||rel>=5e-4;
 }
 
-static int tp_prefill_probe(const loaded_expert *le,int nslice,int threads){
+static int tp_prefill_probe(const loaded_expert *le,int nslice,int threads,
+                            int tile_threshold){
+    const char *threshold_env=getenv("K3_PREFILL_TILE_THRESHOLD");
+    if(threshold_env&&*threshold_env)tile_threshold=atoi(threshold_env);
     enum{E=896,TK=16,MAX_B=1024};int local=le[0].w1.rows;
     if(local<K3_EXPERT_TP_BLOCK||local%K3_EXPERT_TP_BLOCK){
         fprintf(stderr,"k3_moe_probe: --prefill requires native 32-channel TP groups, got %d\n",local);return 1;}
@@ -285,7 +288,8 @@ static int tp_prefill_probe(const loaded_expert *le,int nslice,int threads){
             routes[t*TK+k]=e;rw[t*TK+k]=1.0f/TK;}}
     int fail=0;
     if(k3_expert_tp_prefill_mxfp4(partial,w1,w2,w3,E,routes,rw,2,TK,latent,
-            counts,offsets,positions,token_ids,gathered,gate,up,threads,8))fail=1;
+            counts,offsets,positions,token_ids,gathered,gate,up,threads,
+            tile_threshold))fail=1;
     for(int t=0;t<2&&!fail;++t)for(int k=0;k<TK;++k){int e=routes[t*TK+k];
         if(k3_expert_tp_forward_mxfp4(one,w1+e,w2+e,w3+e,
                 latent+(size_t)t*K3_LATENT,1,gl,ul,threads,8))fail=1;
@@ -295,10 +299,12 @@ static int tp_prefill_probe(const loaded_expert *le,int nslice,int threads){
     const int batches[]={64,256,1024};for(int bi=0;bi<3&&!fail;++bi){int b=batches[bi],reps=b<1024?5:3;double sec=0,best=1e9;int active=0;
         for(int it=0;it<reps;++it){evict(eb,en/4,threads);double t=now_sec();
             fail|=k3_expert_tp_prefill_mxfp4(partial,w1,w2,w3,E,routes,rw,b,TK,latent,
-                counts,offsets,positions,token_ids,gathered,gate,up,threads,8);double dt=now_sec()-t;sec+=dt;if(dt<best)best=dt;}
+                counts,offsets,positions,token_ids,gathered,gate,up,threads,
+                tile_threshold);double dt=now_sec()-t;sec+=dt;if(dt<best)best=dt;}
         for(int e=0;e<E;++e)active+=counts[e]>0;double mean=sec/reps,sum=0;for(int i=0;i<b*K3_LATENT;++i)sum+=partial[i];
-        printf("PROBE expert-tp-prefill M=%d active=%d assignments=%d threads=%d mean_ms=%.3f best_ms=%.3f tok/s=%.1f assignments/s=%.1f checksum=%+.6e\n",
-            b,active,b*TK,threads,mean*1e3,best*1e3,b/mean,b*TK/mean,sum);}
+        int effective_threshold=b>=1024&&tile_threshold==8?4:tile_threshold;
+        printf("PROBE expert-tp-prefill M=%d active=%d assignments=%d threads=%d threshold=%d mean_ms=%.3f best_ms=%.3f tok/s=%.1f assignments/s=%.1f checksum=%+.6e\n",
+            b,active,b*TK,threads,effective_threshold,mean*1e3,best*1e3,b/mean,b*TK/mean,sum);}
     probe_free(w1);probe_free(w2);probe_free(w3);probe_free(routes);probe_free(counts);probe_free(offsets);probe_free(positions);probe_free(token_ids);probe_free(rw);probe_free(latent);probe_free(gathered);probe_free(gate);probe_free(up);probe_free(partial);probe_free(ref);probe_free(one);probe_free(gl);probe_free(ul);probe_free(eb);return fail;
 }
 
@@ -321,7 +327,8 @@ int main(int argc,char**argv){
     int nlocal=npath/2;loaded_expert le[16];memset(le,0,sizeof(le));k3_pool_init(&probe_pool,"moe-probe");
     for(int e=0;e<nlocal;++e)if(load_expert(paths[2*e],paths[2*e+1],&le[e])){fprintf(stderr,"k3_moe_probe: load expert pair %d failed (%s, %s)\n",e,paths[2*e],paths[2*e+1]);for(int q=0;q<e;++q)probe_free(le[q].blob);k3_pool_destroy(&probe_pool);return 2;}
     k3_mxfp4_matrix w1=le[0].w1,w2=le[0].w2,w3=le[0].w3;
-    if(w1.rows!=K3_EXPERT_INTER){int fail=prefill?tp_prefill_probe(le,nlocal,threads):tp_slices_correctness(le,nlocal,threads,selected);for(int e=0;e<nlocal;++e)probe_free(le[e].blob);printf("K3 expert-TP probe: %s\n",fail?"FAIL":"PASS");int status=probe_alloc_failed?2:fail?1:0;k3_pool_destroy(&probe_pool);return status;}
+    if(w1.rows!=K3_EXPERT_INTER){int fail=prefill?tp_prefill_probe(le,nlocal,
+        threads,tile_threshold):tp_slices_correctness(le,nlocal,threads,selected);for(int e=0;e<nlocal;++e)probe_free(le[e].blob);printf("K3 expert-TP probe: %s\n",fail?"FAIL":"PASS");int status=probe_alloc_failed?2:fail?1:0;k3_pool_destroy(&probe_pool);return status;}
     int fail=dispatch_unit()|batched_correctness(&w1,&w2,&w3)|tiled_correctness(&w1,&w2,&w3)|situ_fast_correctness(&w1,&w2,&w3)|local_scheduler_correctness(&w1,&w2,&w3);
     int batches[]={1,2,4,8,16,32},thread_sweep[]={24,threads};
     if(!probe_alloc_failed)for(int ti=0;ti<2;++ti)for(int bi=0;bi<6;++bi)perf(&w1,&w2,&w3,batches[bi],thread_sweep[ti],tile_threshold);

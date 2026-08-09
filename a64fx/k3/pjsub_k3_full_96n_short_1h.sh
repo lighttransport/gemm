@@ -2,13 +2,14 @@
 # TP96 full-weight short-context end-to-end run.
 # Measures real full-model prefill and generation after rank-local staging.
 #
-# Three hours, not one: job 49931198 spent 2885 s of a 3600 s reservation on
+# Two hours is sufficient for the whole-expert baseline: prior jobs spent
+# 2885--3103 s of their reservation on
 # rank-local weight staging alone and was killed mid-validation, and 49922938
 # spent 3103 s on the same stage.  One hour cannot fit staging plus generation
 # plus validation.
 #PJM -g hp250467
 # Use the non-torus scalar placement accepted by the K3 96-node probes.
-#PJM -L "rscgrp=small,node=96,elapse=03:00:00"
+#PJM -L "rscgrp=small,node=96,elapse=02:00:00"
 #PJM -L "freq=2000,eco_state=0,retention_state=0"
 #PJM --mpi "proc=96"
 #PJM --llio localtmp-size=87Gi
@@ -22,36 +23,85 @@
 #   50001247  80Gi, no bare -x   -> ran
 # `-x NAME=value` is the supported form.  Pass launch-time overrides on the
 # pjsub command line instead:
-#   pjsub --no-check-directory -x K3_THREADS=47 -x K3_PROFILE=1 ... <script>
-# Anything not passed falls back to the defaults below.
+#   pjsub --no-check-directory <script> --threads 47 --profile
+# Runtime tuning is passed as script options; environment variables are
+# reserved for debug instrumentation only.
 #PJM -j
 set -euo pipefail
 
 REPO=/vol0006/mdt0/data/hp250467/work/gemm/k3
 K3="$REPO/a64fx/k3"
 UTOFU="$REPO/a64fx/utofu-tests"
-MODEL_DIR=${K3_MODEL_DIR:-$HOME/models/kimi-k3}
+MODEL_DIR="$HOME/models/kimi-k3"
 NODES=96
-THREADS=${K3_THREADS:-47}
-PREFILL_TOKENS=${K3_PREFILL_TOKENS:-256}
-NEW_TOKENS=${K3_NEW_TOKENS:-256}
-PREFILL_CHUNK=${K3_PREFILL_CHUNK:-64}
-BARRIER_ITERS=${K3_BARRIER_ITERS:-128}
-COMM_DETERMINISTIC=${K3_COMM_DETERMINISTIC:-1}
-COMM_BF16=${K3_COMM_BF16:-0}
-COMM_ROBUST=${K3_COMM_ROBUST:-2}
-COMM_POLL_SPINS=${K3_COMM_POLL_SPINS:-4}
-COMM_A2A=${K3_COMM_A2A:-0}
-COMM_A2A_MAX=${K3_COMM_A2A_MAX:-8192}
-PREFETCH_MIB=${K3_PREFETCH_MIB:-0}
-PROFILE=${K3_PROFILE:-0}
-AR_GROUPS=${K3_AR_GROUPS:-16}
-MOE_SHARD_LAYOUT=${K3_MOE_SHARD_LAYOUT:-row-aligned}
+THREADS=47
+PREFILL_TOKENS=256
+NEW_TOKENS=256
+PREFILL_CHUNK=64
+BARRIER_ITERS=128
+COMM_DETERMINISTIC=1
+COMM_BF16=0
+COMM_ROBUST=2
+COMM_POLL_SPINS=4
+COMM_A2A=0
+COMM_A2A_MAX=8192
+PREFETCH_MIB=0
+PROFILE=0
+AR_GROUPS=16
+# Full-checkpoint staging defaults to one complete expert per owner.  The
+# intermediate-channel TP layout is useful for bounded probes, but expands
+# the full plan to ~497k tiny records and makes 96-rank staging metadata-bound.
+# Opt into it only after a dedicated large-scale staging run proves the I/O
+# path; the whole-expert layout is the reliable end-to-end 96-node baseline.
+EXPERT_TP=0
+MOE_SHARD_LAYOUT=replicated
 JOB_TAG=${PJM_JOBID:-manual-$$}
 ROOT="$K3/logs/full-96n-short-3h-$JOB_TAG"
 STAGE_DIR="/local/$USER/k3-full-short-3h-$JOB_TAG"
-if [ -n "${K3_FULL_STAGE_DIR:-}" ]; then STAGE_DIR=$K3_FULL_STAGE_DIR; fi
 TIMING="$ROOT/stage_timing.tsv"
+
+usage() {
+    cat >&2 <<'EOF'
+usage: pjsub_k3_full_96n_short_1h.sh [options]
+  --model-dir DIR --threads N --prefill-tokens N --new-tokens N
+  --prefill-chunk N --barrier-iters N --ar-groups N
+  --comm-deterministic 0|1 --comm-bf16 0|1 --comm-robust N
+  --comm-poll-spins N --comm-a2a 0|1 --comm-a2a-max N
+  --prefetch-mib N --stage-chunk-mib N --stage-dir DIR
+  --profile --expert-tp --moe-shard-layout replicated|row-aligned
+EOF
+}
+need_arg() { (($# >= 2)) || { echo "$0: $1 requires an argument" >&2; usage; exit 2; }; }
+CHUNK_MIB=32
+while (($#)); do
+    case "$1" in
+        --model-dir) need_arg "$@"; MODEL_DIR=$2; shift 2;;
+        --threads) need_arg "$@"; THREADS=$2; shift 2;;
+        --prefill-tokens) need_arg "$@"; PREFILL_TOKENS=$2; shift 2;;
+        --new-tokens) need_arg "$@"; NEW_TOKENS=$2; shift 2;;
+        --prefill-chunk) need_arg "$@"; PREFILL_CHUNK=$2; shift 2;;
+        --barrier-iters) need_arg "$@"; BARRIER_ITERS=$2; shift 2;;
+        --ar-groups) need_arg "$@"; AR_GROUPS=$2; shift 2;;
+        --comm-deterministic) need_arg "$@"; COMM_DETERMINISTIC=$2; shift 2;;
+        --comm-bf16) need_arg "$@"; COMM_BF16=$2; shift 2;;
+        --comm-robust) need_arg "$@"; COMM_ROBUST=$2; shift 2;;
+        --comm-poll-spins) need_arg "$@"; COMM_POLL_SPINS=$2; shift 2;;
+        --comm-a2a) need_arg "$@"; COMM_A2A=$2; shift 2;;
+        --comm-a2a-max) need_arg "$@"; COMM_A2A_MAX=$2; shift 2;;
+        --prefetch-mib) need_arg "$@"; PREFETCH_MIB=$2; shift 2;;
+        --stage-chunk-mib) need_arg "$@"; CHUNK_MIB=$2; shift 2;;
+        --stage-dir) need_arg "$@"; STAGE_DIR=$2; shift 2;;
+        --profile) PROFILE=1; shift;;
+        --expert-tp) EXPERT_TP=1; shift;;
+        --moe-shard-layout) need_arg "$@"; MOE_SHARD_LAYOUT=$2; shift 2;;
+        -h|--help) usage; exit 0;;
+        *) echo "$0: unknown option $1" >&2; usage; exit 2;;
+    esac
+done
+case "$MOE_SHARD_LAYOUT" in
+    replicated|row-aligned) ;;
+    *) echo "$0: invalid --moe-shard-layout '$MOE_SHARD_LAYOUT'" >&2; exit 2;;
+esac
 
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH"
 export OMP_NUM_THREADS="$THREADS" OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLACES=cores
@@ -61,7 +111,7 @@ export OMP_NUM_THREADS="$THREADS" OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLAC
 # ms/layer, and it also removes most of the run-to-run variance.
 export OMP_WAIT_POLICY=active KMP_BLOCKTIME=infinite
 export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
-export K3_PYTHON="$K3/.venv-$(uname -m)/bin/python" K3_EXPERT_TP=1 K3_MOE_SHARD_LAYOUT="$MOE_SHARD_LAYOUT"
+export K3_PYTHON="$K3/.venv-$(uname -m)/bin/python"
 
 [[ ! -e "$ROOT" ]] || { echo "$0: result root exists: $ROOT" >&2; exit 2; }
 mkdir -p "$ROOT"
@@ -120,16 +170,8 @@ stage_begin full_weight_staging
 # 8 MiB chunks moved ~16 GB/rank in 2885 s (~5.6 MB/s) in job 49931198, far
 # under what LLIO can do.  Larger chunks are the cheapest thing to try; the
 # stage_timing row is what tells us whether it helped.
-export CHUNK_MIB=${K3_STAGE_CHUNK_MIB:-32}
-if [ -n "${K3_FULL_STAGE_DIR:-}" ]; then
-    [[ -s "$STAGE_DIR/rank000.manifest" && -s "$STAGE_DIR/rank095.manifest" ]] || {
-        echo "K3_FULL_STAGE_DIR is missing prepared rank manifests: $STAGE_DIR" >&2; exit 4;
-    }
-    echo "K3_FULL_REUSE_STAGE dir=$STAGE_DIR"
-else
-    mpiexec -np "$NODES" -of-proc "$ROOT/stage.rank" sh -c \
-        "exec '$K3/run_k3_full_stage_rank.sh' '$MODEL_DIR' '$STAGE_DIR' '$NODES' \"\${PMIX_RANK:-\${OMPI_COMM_WORLD_RANK:-\${PMI_RANK:?no MPI rank}}}\""
-fi
+mpiexec -np "$NODES" -of-proc "$ROOT/stage.rank" sh -c \
+    "exec '$K3/run_k3_full_stage_rank.sh' '$MODEL_DIR' '$STAGE_DIR' '$NODES' \"\${PMIX_RANK:-\${OMPI_COMM_WORLD_RANK:-\${PMI_RANK:?no MPI rank}}}\" full96 '' '$EXPERT_TP' '$MOE_SHARD_LAYOUT' '$CHUNK_MIB'"
 stage_end 0
 
 stage_begin full_short_generation

@@ -724,9 +724,32 @@ static inline void k3_attnres_sve(float *out, const float *candidates, const flo
 static inline void k3_router_topk(const float *logits, const float *bias, int experts, int topk,
                                   int *indices, float *weights) {
     float probability[experts], score[experts];
+    /* sigmoid is strictly monotonic, so the common bias-free route can pick
+     * from logits directly and evaluate sigmoid for only the selected experts.
+     * Besides removing most transcendental work, this preserves the selected
+     * probabilities bit-for-bit with the generic path. */
+    if (!bias) {
+        memcpy(score, logits, (size_t)experts * sizeof(*score));
+        for (int k = 0; k < topk; ++k) {
+            int best = -1; float best_score = -INFINITY;
+            for (int e = 0; e < experts; ++e) {
+                if (score[e] > best_score ||
+                    (score[e] == best_score && e < best)) {
+                    best = e; best_score = score[e];
+                }
+            }
+            indices[k] = best;
+            score[best] = -INFINITY;
+            probability[k] = k3_sigmoidf(logits[best]);
+        }
+        float sum = 0.0f;
+        for (int k = 0; k < topk; ++k) sum += probability[k];
+        for (int k = 0; k < topk; ++k) weights[k] = probability[k] / sum;
+        return;
+    }
     for (int e = 0; e < experts; ++e) {
         probability[e] = k3_sigmoidf(logits[e]);
-        score[e] = probability[e] + (bias ? bias[e] : 0.0f);
+        score[e] = probability[e] + bias[e];
     }
     for (int k = 0; k < topk; ++k) {
         int best = -1; float best_score = -INFINITY;

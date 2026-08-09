@@ -36,7 +36,7 @@
 #define TP_AR_STAG2 8                 /* second region for the 2D/hierarchical AR col sub-comm  */
 #endif
 #define TP_AR_MAXN   512              /* max ranks in a TP/EP group (covers GLM5 384-node runs) */
-#define TP_AR_NSTEP  11               /* recv slots: sid 0..nrounds+1 (bcast); 11 covers N<=512 (384-node) */
+#define TP_AR_NSTEP  13               /* recv slots: sid 0..nrounds+1; covers deterministic TP64 */
 #define TP_AR_LINE   256              /* A64FX cache line; each slot own-aligned  */
 #ifndef TP_AR_TIMEOUT
 #define TP_AR_TIMEOUT 60.0
@@ -46,6 +46,10 @@ typedef struct {
     int use_bf16, deterministic, robust;
     int poll_spins;
     int a2a, a2a_max;
+    int pipeline;
+    int compact_bf16;
+    int defer_tcq;
+    int defer_mrq;
     int ack, ack_retx;
     double ack_rtt, timeout;
     unsigned long drop_n;
@@ -73,6 +77,14 @@ typedef struct {
     /* --- TP_AR_A2A: direct all-to-all sum for small (decode-size) payloads --- */
     int             a2a;                     /* TP_AR_A2A=1: enable */
     int             a2a_max;                 /* max elems for the a2a path (TP_AR_A2A_MAX, clamped to max_count) */
+    int             pipeline;                /* pipeline payload/trailer Puts before waiting for recv */
+    int             compact_bf16;            /* place BF16 trailer after BF16 payload region */
+    int             defer_tcq;               /* defer local TCQ drain until collective end */
+    int             defer_mrq;               /* defer MRQ drain until collective end */
+    int             async_active, async_kind, async_count;
+    int             async_sparse, async_global_rank, async_global_size;
+    int             async_lo, async_hi;
+    uint64_t        async_tok;
     size_t          a2a_base, a2a_slot;      /* dedicated recv region: 2 generations x nprocs slots */
     /* --- TP_AR_ACK: ack/retransmit reliability prototype (default off) --- */
     int             ack;                     /* 1 = reliable send (bounded retransmit + ack) */
@@ -163,7 +175,12 @@ static inline void tp_ar_flag_inval(const volatile void *p) {
  * payload bytes from a previous larger transfer and falsely complete a receive.
  * send slot = 0, recv slot for step sid = (1+sid). */
 static inline size_t tp_ar_slot_off(const tp_comm *c, int s) { return (size_t)s * c->slot; }
-static inline size_t tp_ar_trailer_off(const tp_comm *c) { return (size_t)c->max_count * sizeof(float); }
+static inline size_t tp_ar_send_slot_off(const tp_comm *c, int sid) {
+    return tp_ar_slot_off(c, c->defer_tcq ? 1 + TP_AR_NSTEP + sid : 0);
+}
+static inline size_t tp_ar_trailer_off(const tp_comm *c) {
+    return (size_t)c->max_count * (c->compact_bf16 ? sizeof(uint16_t) : sizeof(float));
+}
 
 /* Drain (and discard) any pending receive-completion notices. On Tofu-D every
  * landed Put posts an RMT_PUT entry to the *receiver's* MRQ regardless of the
@@ -221,7 +238,7 @@ static inline void tp_ar_wait(tp_comm *c, volatile uint64_t *trl, uint64_t tok,
      * as robust=1 (nothing is skipped, only done less often); validated
      * bitwise vs robust=1 under the qlair sim and for 16K sequential reduces
      * on a real 12-node A64FX allocation. */
-    if (c->robust >= 2) tp_ar_drain_mrq(c);
+    if (c->robust >= 2 && !c->defer_mrq) tp_ar_drain_mrq(c);
     while (*trl < tok) {
         if (c->robust == 1) { tp_ar_drain_mrq(c); tp_ar_flag_inval(trl); }
         else if (c->robust >= 2 && (spins & c->poll_mask) == c->poll_mask) tp_ar_flag_inval(trl);
@@ -238,10 +255,10 @@ static inline void tp_ar_wait(tp_comm *c, volatile uint64_t *trl, uint64_t tok,
             "rank %d %s timeout sid=%d want=%lu got=%lu",c->my_rank,what,sid,
             (unsigned long)tok,(unsigned long)*trl);
     }
-    if (c->robust) tp_ar_drain_mrq(c);   /* consume THIS recv's RMT_PUT notice (no leak) */
+    if (c->robust && !c->defer_mrq) tp_ar_drain_mrq(c);   /* consume THIS recv's RMT_PUT notice (no leak) */
 }
 
-/* one Put with BUSY-retry + local-completion drain (pp_runner idiom). */
+/* Payload/trailer puts with BUSY-retry and optional local completion drain. */
 static void tp_ar_put(tp_comm *c, int peer, utofu_stadd_t src, utofu_stadd_t dst, size_t len) {
     const unsigned long flags = UTOFU_ONESIDED_FLAG_TCQ_NOTICE;
     int rc; void *cb;
@@ -266,11 +283,15 @@ static void tp_ar_complete_sends(tp_comm *c){if(!c->send_inflight)return;void *c
 static void tp_ar_send_puts(tp_comm *c, int peer, int sid, size_t pbytes, int contiguous) {
     if (c->drop_n && (++c->put_ctr % c->drop_n) == 0) return;   /* simulate a lost message */
     size_t tr_off = tp_ar_trailer_off(c);
-    utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
+    utofu_stadd_t src = c->base + tp_ar_send_slot_off(c, sid);
     utofu_stadd_t dst = c->peer_base[peer] + tp_ar_slot_off(c, 1 + sid);
     if(contiguous&&!c->ack)
         c->send_inflight+=tp_ar_put_nb(c,peer,src,dst,pbytes+8);
     else if (contiguous) tp_ar_put(c, peer, src, dst, pbytes + 8);
+    else if (!c->ack && c->pipeline) {
+        c->send_inflight+=tp_ar_put_nb(c,peer,src,dst,pbytes);
+        c->send_inflight+=tp_ar_put_nb(c,peer,src + tr_off,dst + tr_off,8);
+    }
     else { tp_ar_put(c, peer, src, dst, pbytes); tp_ar_put(c, peer, src + tr_off, dst + tr_off, 8); }
 }
 /* Receiver R -> sender S: Put R's ack tok into S's ack[R] slot (8 B). Never drop-injected. */
@@ -289,7 +310,7 @@ static void tp_ar_ack_send(tp_comm *c, int to_peer, uint64_t tok) {
  * Blocking on the ack here would deadlock -- recursive doubling has both partners send before either
  * recvs, and recv is what emits the ack. */
 static void tp_ar_send(tp_comm *c, int peer, int sid, const float *buf, int count, uint64_t tok) {
-    char *sb = c->region + tp_ar_slot_off(c, 0);
+    char *sb = c->region + tp_ar_send_slot_off(c, sid);
     size_t pbytes;
     if (c->use_bf16) {
         uint16_t *d = (uint16_t *)sb;
@@ -308,7 +329,7 @@ static void tp_ar_send(tp_comm *c, int peer, int sid, const float *buf, int coun
         pbytes = (size_t)count * sizeof(float);
     }
     *(volatile uint64_t *)(sb + tp_ar_trailer_off(c)) = tok;
-    int contiguous = (!c->use_bf16 && count == c->max_count);
+    int contiguous = (count == c->max_count && (!c->use_bf16 || c->compact_bf16));
     tp_ar_send_puts(c, peer, sid, pbytes, contiguous);
     if (c->ack) { c->pend_peer = peer; c->pend_sid = sid; c->pend_pbytes = pbytes; c->pend_contig = contiguous;
                   c->pend_tok = tok; c->pend_active = 1; c->pend_retx = 0; c->pend_t0 = tp_ar_now(); }
@@ -317,7 +338,7 @@ static void tp_ar_send(tp_comm *c, int peer, int sid, const float *buf, int coun
  * then proceed OPTIMISTICALLY after ack_retx tries (idempotent payload). The recv-wait loop already
  * services it too, so by here it is usually already acked. No-op when ack is off. */
 static void tp_ar_confirm(tp_comm *c) {
-    tp_ar_complete_sends(c);
+    if (!c->defer_tcq) tp_ar_complete_sends(c);
     if (!c->ack) return;
     while (!tp_ar_service_pending(c)) { if (c->robust) tp_ar_drain_mrq(c); }
 }
@@ -526,6 +547,145 @@ static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
         if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, mr + 1, buf, count, tok);   /* even: recv only (prefold already confirmed) */
         else { tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok); tp_ar_confirm(c); } /* odd: confirm the bcast send */
     }
+    if (c->defer_tcq) tp_ar_complete_sends(c);
+    if (c->defer_mrq) tp_ar_drain_mrq(c);
+}
+
+static int tp_allreduce_sum_checked(tp_comm *c, float *buf, int count);
+
+/* Start the first row-level exchange of a sum all-reduce without waiting for
+ * its receive.  The caller may execute independent work and then call finish.
+ * This is intentionally a one-round primitive: the remaining rounds still
+ * obey the normal lockstep schedule, while the first uTofu Put gets useful
+ * overlap with compute on the calling thread. */
+static void tp_allreduce_sum_start(tp_comm *c, float *buf, int count) {
+    c->async_active = 0;
+    if (c->nprocs == 1) return;
+    c->async_active = 1;
+    c->async_count = count;
+    c->async_tok = ++c->seq;
+    int mr = c->my_rank, rem = c->rem;
+    if (mr < 2 * rem) {
+        if (mr % 2 == 0) {
+            tp_ar_send(c, mr + 1, 0, buf, count, c->async_tok);
+            c->async_kind = 1; /* prefold send */
+        } else {
+            c->async_kind = 2; /* prefold receive */
+        }
+    } else if (c->newrank != -1) {
+        int pnr = c->newrank ^ 1;
+        int pr = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
+        tp_ar_send(c, pr, 1, buf, count, c->async_tok);
+        c->async_kind = 3; /* first recursive-doubling send */
+    } else {
+        c->async_active = 0;
+    }
+}
+
+static void tp_allreduce_sum_finish(tp_comm *c, float *buf) {
+    if (!c->async_active) return;
+    int count = c->async_count, mr = c->my_rank, rem = c->rem;
+    uint64_t tok = c->async_tok;
+    if (c->async_kind == 1) {
+        tp_ar_confirm(c);
+    } else if (c->async_kind == 2) {
+        tp_ar_recv_add(c, 0, mr - 1, buf, count, tok);
+    } else {
+        int pnr = c->newrank ^ 1;
+        int pr = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
+        tp_ar_recv_add(c, 1, pr, buf, count, tok);
+        tp_ar_confirm(c);
+    }
+
+    if (mr < 2 * rem) {
+        if (mr % 2 == 0) {
+            tp_ar_recv_copy(c, c->bcast_sid, mr + 1, buf, count, tok);
+        } else {
+            for (int k = 0; k < c->nrounds; k++) {
+                int pnr = c->newrank ^ (1 << k);
+                int pr = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
+                tp_ar_send(c, pr, k + 1, buf, count, tok);
+                tp_ar_recv_add(c, k + 1, pr, buf, count, tok);
+                tp_ar_confirm(c);
+            }
+            tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok);
+            tp_ar_confirm(c);
+        }
+    } else if (c->newrank != -1) {
+        for (int k = 1; k < c->nrounds; k++) {
+            int pnr = c->newrank ^ (1 << k);
+            int pr = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
+            tp_ar_send(c, pr, k + 1, buf, count, tok);
+            tp_ar_recv_add(c, k + 1, pr, buf, count, tok);
+            tp_ar_confirm(c);
+        }
+    }
+    if (c->defer_tcq) tp_ar_complete_sends(c);
+    if (c->defer_mrq) tp_ar_drain_mrq(c);
+    c->async_active = 0;
+}
+
+static void tp_allreduce_sum_2d_start(tp_comm *row, tp_comm *col,
+                                      float *buf, int count) {
+    (void)col;
+    tp_allreduce_sum_start(row, buf, count);
+}
+
+static int tp_allreduce_sum_2d_finish(tp_comm *row, tp_comm *col,
+                                      float *buf, int count) {
+    tp_allreduce_sum_finish(row, buf);
+    return col ? tp_allreduce_sum_checked(col, buf, count) : 0;
+}
+
+/* With two column groups and row-aligned TP shards, the row result is already
+ * disjoint: column rank 0 owns the first half and column rank 1 the second.
+ * Exchange only that half instead of running a full-vector sum allreduce. */
+static int tp_allreduce_sum_col_halves_checked(tp_comm *row, tp_comm *col,
+                                               float *buf, int count) {
+    if (!row || !col || col->nprocs != 2 || (count % 8))
+        return col ? tp_allreduce_sum_checked(col, buf, count) : 0;
+    int total_units = count / 8;
+    int total_ranks = row->nprocs * col->nprocs;
+    int base_units = total_units / total_ranks;
+    int rem_units = total_units % total_ranks;
+    int me = col->my_rank;
+    int peer = 1 - me;
+    int first_rank = me * row->nprocs;
+    int peer_first_rank = peer * row->nprocs;
+    int start_units = first_rank * base_units +
+                      (first_rank < rem_units ? first_rank : rem_units);
+    int peer_start_units = peer_first_rank * base_units +
+                           (peer_first_rank < rem_units ? peer_first_rank : rem_units);
+    int end_rank = first_rank + row->nprocs;
+    int peer_end_rank = peer_first_rank + row->nprocs;
+    int end_units = end_rank * base_units +
+                    (end_rank < rem_units ? end_rank : rem_units);
+    int peer_end_units = peer_end_rank * base_units +
+                         (peer_end_rank < rem_units ? peer_end_rank : rem_units);
+    int own_count = (end_units - start_units) * 8;
+    int peer_count = (peer_end_units - peer_start_units) * 8;
+    uint64_t tok = ++col->seq;
+
+    tp_ar_send(col, peer, 1, buf + start_units * 8, own_count, tok);
+    tp_ar_recv_copy(col, 1, peer, buf + peer_start_units * 8, peer_count, tok);
+    tp_ar_confirm(col);
+    if (col->defer_tcq) tp_ar_complete_sends(col);
+    if (col->defer_mrq) tp_ar_drain_mrq(col);
+    return 0;
+}
+
+/* Split form of the exact pairwise half exchange.  The caller may do local
+ * work between start and finish while the column Put is in flight. */
+static int tp_allreduce_sum_2d_halves_checked(tp_comm *row, tp_comm *col,
+                                              float *buf, int count) {
+    int rc = tp_allreduce_sum_checked(row, buf, count);
+    return rc ? rc : tp_allreduce_sum_col_halves_checked(row, col, buf, count);
+}
+
+static int tp_allreduce_sum_2d_halves_finish(tp_comm *row, tp_comm *col,
+                                             float *buf, int count) {
+    tp_allreduce_sum_finish(row, buf);
+    return tp_allreduce_sum_col_halves_checked(row, col, buf, count);
 }
 
 /* Fixed-root MAX companion.  The mathematical max is associative, but the BF16
@@ -701,7 +861,7 @@ static void tp_ar_recv_argmax_n(tp_comm *c, int sid, float *vi, int n, uint64_t 
 static void tp_ar_send_argmax_n(tp_comm *c, int peer, int sid, const float *vi, int n, uint64_t tok) {
     char *sb = c->region + tp_ar_slot_off(c, 0);
     memcpy(sb, vi, (size_t)2 * n * sizeof(float));
-    size_t tr_off = tp_ar_trailer_off(c);
+        size_t tr_off = tp_ar_trailer_off(c);
     *(volatile uint64_t *)(sb + tr_off) = tok;
     utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
     utofu_stadd_t dst = c->peer_base[peer] + tp_ar_slot_off(c, 1 + sid);
@@ -743,6 +903,10 @@ static tp_comm_config tp_comm_env_config(void) {
     o.poll_spins = getenv("TP_AR_POLL_SPINS") ? atoi(getenv("TP_AR_POLL_SPINS")) : 8;
     o.a2a = getenv("TP_AR_A2A") ? atoi(getenv("TP_AR_A2A")) : 0;
     o.a2a_max = getenv("TP_AR_A2A_MAX") ? atoi(getenv("TP_AR_A2A_MAX")) : 8192;
+    o.pipeline = getenv("TP_AR_PIPELINE") ? atoi(getenv("TP_AR_PIPELINE")) : 0;
+    o.compact_bf16 = getenv("TP_AR_COMPACT_BF16") ? atoi(getenv("TP_AR_COMPACT_BF16")) : 0;
+    o.defer_tcq = getenv("TP_AR_DEFER_TCQ") ? atoi(getenv("TP_AR_DEFER_TCQ")) : 0;
+    o.defer_mrq = getenv("TP_AR_DEFER_MRQ") ? atoi(getenv("TP_AR_DEFER_MRQ")) : 0;
     o.ack = getenv("TP_AR_ACK") ? atoi(getenv("TP_AR_ACK")) : 0;
     o.ack_retx = getenv("TP_AR_ACK_RETX") ? atoi(getenv("TP_AR_ACK_RETX")) : 64;
     o.ack_rtt = getenv("TP_AR_ACK_RTT") ? atof(getenv("TP_AR_ACK_RTT")) : 0.001;
@@ -756,7 +920,8 @@ static size_t tp_comm_region_size(int nprocs, int max_count, const tp_comm_confi
     const tp_comm_config *o = options ? options : &fallback;
     int a2a_max=o->a2a_max>0?o->a2a_max:8192;if(a2a_max>max_count)a2a_max=max_count;
     size_t slot=((size_t)max_count*sizeof(float)+8+(TP_AR_LINE-1))&~(size_t)(TP_AR_LINE-1);
-    size_t bytes=(size_t)(1+TP_AR_NSTEP)*slot+(o->ack?(size_t)(nprocs+1)*TP_AR_LINE:0);
+    size_t bytes=(size_t)(1+TP_AR_NSTEP+(o->defer_tcq ? TP_AR_NSTEP : 0))*slot+
+                 (o->ack?(size_t)(nprocs+1)*TP_AR_LINE:0);
     size_t a2a_slot=((size_t)a2a_max*sizeof(float)+8+(TP_AR_LINE-1))&~(size_t)(TP_AR_LINE-1);
     if(o->a2a)bytes+=(size_t)2*nprocs*a2a_slot;return bytes;
 }
@@ -779,11 +944,16 @@ static int tp_comm_init_region_ex(tp_comm *c, utofu_vcq_hdl_t vcq,
     c->ack=options->ack;c->ack_retx=options->ack_retx;
     c->ack_rtt=options->ack_rtt;c->timeout=options->timeout>0?options->timeout:TP_AR_TIMEOUT;
     c->drop_n=options->drop_n;c->a2a=options->a2a;
+    c->pipeline=options->pipeline;
+    c->compact_bf16=options->compact_bf16 && options->use_bf16;
+    c->defer_tcq=options->defer_tcq && c->pipeline && !c->ack;
+    c->defer_mrq=options->defer_mrq && c->robust;
 
     c->slot = ((size_t)max_count * sizeof(float) + 8 + (TP_AR_LINE - 1)) & ~(size_t)(TP_AR_LINE - 1);
     /* reliability prototype: an ack region of nprocs 8B slots (peer p writes its ack tok to ack[p])
      * plus one scratch slot the acking rank Puts FROM. Only allocated when TP_AR_ACK=1. */
-    c->ack_base = (size_t)(1 + TP_AR_NSTEP) * c->slot;
+    c->ack_base = (size_t)(1 + TP_AR_NSTEP +
+                           (c->defer_tcq ? TP_AR_NSTEP : 0)) * c->slot;
     size_t region_sz = c->ack_base + (c->ack ? (size_t)(nprocs + 1) * TP_AR_LINE : 0);
     /* TP_AR_A2A recv region: 2 generations x nprocs slots sized for a2a_max elems (small decode
      * payloads only), appended after the ack region. Generation double-buffering (slot picked by
@@ -944,6 +1114,228 @@ static int tp_allreduce_sum_2d_checked(tp_comm *row,tp_comm *col,
                                        float *buf,int count){
     int rc=tp_allreduce_sum_checked(row,buf,count);
     return rc?rc:tp_allreduce_sum_checked(col,buf,count);
+}
+
+static int tp_allreduce_sum_col_halves_checked(tp_comm *row, tp_comm *col,
+                                               float *buf, int count);
+
+/* Sharded row reduction: each global rank contributes one disjoint aligned
+ * shard, so a row allreduce can be an allgather.  The survivor schedule is the
+ * same non-power-of-two fold and recursive doubling used by tp_allreduce_sum,
+ * but each transfer carries only the contiguous block currently owned by that
+ * survivor.  The caller supplies the global rank because row->my_rank is only
+ * the rank within the row sub-communicator. */
+static int tp_allreduce_sum_sharded_row_checked(tp_comm *row, float *buf,
+                                                int count, int global_rank,
+                                                int global_size) {
+    if (!row || row->nprocs < 2 || count <= 0 || (count & 7) ||
+        global_size < row->nprocs || global_size % row->nprocs ||
+        row->deterministic) {
+        return tp_allreduce_sum_checked(row, buf, count);
+    }
+    int units = count / 8;
+    int base_units = units / global_size;
+    int rem_units = units % global_size;
+    int group_base = global_rank - row->my_rank;
+    int rem = row->rem;
+    int b = row->my_rank;
+    uint64_t tok = ++row->seq;
+    int rank_lo[TP_AR_MAXN], rank_hi[TP_AR_MAXN];
+    for (int r = 0; r < row->nprocs; ++r) {
+        int gr = group_base + r;
+        rank_lo[r] = gr * base_units + (gr < rem_units ? gr : rem_units);
+        rank_hi[r] = (gr + 1) * base_units +
+                     (gr + 1 <= rem_units ? gr + 1 : rem_units);
+    }
+    /* Match the BF16 allreduce's rounding of each rank's local contribution. */
+    for (int i = rank_lo[b] * 8; i < rank_hi[b] * 8; ++i)
+        buf[i] = tp_bf16_round(buf[i]);
+
+    if (b < 2 * rem) {
+        if ((b & 1) == 0) {
+            tp_ar_send(row, b + 1, 0, buf + rank_lo[b] * 8,
+                       (rank_hi[b] - rank_lo[b]) * 8, tok);
+            tp_ar_confirm(row);
+        } else {
+            tp_ar_recv_copy(row, 0, b - 1, buf + rank_lo[b - 1] * 8,
+                            (rank_hi[b - 1] - rank_lo[b - 1]) * 8, tok);
+        }
+    }
+    if (row->newrank != -1) {
+        int lo = (b < 2 * rem) ? rank_lo[b - 1] : rank_lo[b];
+        int hi = rank_hi[b];
+        for (int k = 0; k < row->nrounds; ++k) {
+            int pnr = row->newrank ^ (1 << k);
+            int pr = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
+            int span = 1 << k;
+            int first = pnr & ~(span - 1);
+            int last = first + span - 1;
+            int first_pr = (first < rem) ? (first * 2 + 1) : (first + rem);
+            int last_pr = (last < rem) ? (last * 2 + 1) : (last + rem);
+            int plo = (first_pr < 2 * rem) ? rank_lo[first_pr - 1] : rank_lo[first_pr];
+            int phi = rank_hi[last_pr];
+            tp_ar_send(row, pr, k + 1, buf + lo * 8, (hi - lo) * 8, tok);
+            tp_ar_recv_copy(row, k + 1, pr, buf + plo * 8,
+                            (phi - plo) * 8, tok);
+            tp_ar_confirm(row);
+            if (plo < lo) lo = plo;
+            if (phi > hi) hi = phi;
+        }
+    }
+    if (b < 2 * rem) {
+        if ((b & 1) == 0) {
+            tp_ar_recv_copy(row, row->bcast_sid, b + 1, buf,
+                            count, tok);
+        } else {
+            tp_ar_send(row, b - 1, row->bcast_sid, buf, count, tok);
+            tp_ar_confirm(row);
+        }
+    }
+    if (row->defer_tcq) tp_ar_complete_sends(row);
+    if (row->defer_mrq) tp_ar_drain_mrq(row);
+    return 0;
+}
+
+static int tp_allreduce_sum_2d_sharded_checked(tp_comm *row, tp_comm *col,
+                                               float *buf, int count,
+                                               int global_rank, int global_size) {
+    int rc = tp_allreduce_sum_sharded_row_checked(row, buf, count,
+                                                  global_rank, global_size);
+    return rc ? rc : tp_allreduce_sum_col_halves_checked(row, col, buf, count);
+}
+
+static int tp_allreduce_sum_sharded_row_start(tp_comm *row, float *buf,
+                                              int count, int global_rank,
+                                              int global_size) {
+    if (!row || row->nprocs < 2 || count <= 0 || (count & 7) ||
+        global_size < row->nprocs || global_size % row->nprocs ||
+        row->deterministic) return 0;
+    int units = count / 8, base_units = units / global_size;
+    int rem_units = units % global_size, group_base = global_rank - row->my_rank;
+    int rem = row->rem, b = row->my_rank;
+    int rank_lo[TP_AR_MAXN], rank_hi[TP_AR_MAXN];
+    for (int r = 0; r < row->nprocs; ++r) {
+        int gr = group_base + r;
+        rank_lo[r] = gr * base_units + (gr < rem_units ? gr : rem_units);
+        rank_hi[r] = (gr + 1) * base_units +
+                     (gr + 1 <= rem_units ? gr + 1 : rem_units);
+    }
+    for (int i = rank_lo[b] * 8; i < rank_hi[b] * 8; ++i)
+        buf[i] = tp_bf16_round(buf[i]);
+    row->async_active = 1;
+    row->async_sparse = 1;
+    row->async_global_rank = global_rank;
+    row->async_global_size = global_size;
+    row->async_count = count;
+    row->async_tok = ++row->seq;
+    if (b < 2 * rem) {
+        if ((b & 1) == 0) {
+            tp_ar_send(row, b + 1, 0, buf + rank_lo[b] * 8,
+                       (rank_hi[b] - rank_lo[b]) * 8, row->async_tok);
+            row->async_kind = 10; /* folded send already issued */
+        } else {
+            row->async_kind = 11; /* folded receive remains */
+        }
+    } else {
+        int pnr = row->newrank ^ 1;
+        int pr = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
+        row->async_lo = rank_lo[b];
+        row->async_hi = rank_hi[b];
+        tp_ar_send(row, pr, 1, buf + row->async_lo * 8,
+                   (row->async_hi - row->async_lo) * 8, row->async_tok);
+        row->async_kind = 12; /* first recursive send already issued */
+    }
+    return 1;
+}
+
+static void tp_allreduce_sum_sharded_row_round(tp_comm *row, float *buf,
+                                               uint64_t tok, int k,
+                                               int rank_lo[], int rank_hi[],
+                                               int *lo, int *hi) {
+    int rem = row->rem;
+    int pnr = row->newrank ^ (1 << k);
+    int pr = (pnr < rem) ? (pnr * 2 + 1) : (pnr + rem);
+    int span = 1 << k, first = pnr & ~(span - 1), last = first + span - 1;
+    int first_pr = (first < rem) ? (first * 2 + 1) : (first + rem);
+    int last_pr = (last < rem) ? (last * 2 + 1) : (last + rem);
+    int plo = (first_pr < 2 * rem) ? rank_lo[first_pr - 1] : rank_lo[first_pr];
+    int phi = rank_hi[last_pr];
+    tp_ar_send(row, pr, k + 1, buf + *lo * 8, (*hi - *lo) * 8, tok);
+    tp_ar_recv_copy(row, k + 1, pr, buf + plo * 8, (phi - plo) * 8, tok);
+    tp_ar_confirm(row);
+    if (plo < *lo) *lo = plo;
+    if (phi > *hi) *hi = phi;
+}
+
+static void tp_allreduce_sum_sharded_row_finish(tp_comm *row, float *buf) {
+    if (!row->async_active || !row->async_sparse) return;
+    int count = row->async_count, units = count / 8;
+    int base_units = units / row->async_global_size;
+    int rem_units = units % row->async_global_size;
+    int group_base = row->async_global_rank - row->my_rank;
+    int rank_lo[TP_AR_MAXN], rank_hi[TP_AR_MAXN];
+    for (int r = 0; r < row->nprocs; ++r) {
+        int gr = group_base + r;
+        rank_lo[r] = gr * base_units + (gr < rem_units ? gr : rem_units);
+        rank_hi[r] = (gr + 1) * base_units +
+                     (gr + 1 <= rem_units ? gr + 1 : rem_units);
+    }
+    int b = row->my_rank, rem = row->rem;
+    if (b < 2 * rem) {
+        if ((b & 1) == 0) {
+            tp_ar_confirm(row);
+        } else {
+            tp_ar_recv_copy(row, 0, b - 1, buf + rank_lo[b - 1] * 8,
+                            (rank_hi[b - 1] - rank_lo[b - 1]) * 8, row->async_tok);
+            row->async_lo = rank_lo[b - 1];
+            row->async_hi = rank_hi[b];
+            for (int k = 0; k < row->nrounds; ++k)
+                tp_allreduce_sum_sharded_row_round(row, buf, row->async_tok, k,
+                                                    rank_lo, rank_hi,
+                                                    &row->async_lo, &row->async_hi);
+        }
+    } else {
+        int first_pnr = row->newrank ^ 1;
+        int first_pr = (first_pnr < rem) ? (first_pnr * 2 + 1) : (first_pnr + rem);
+        int first_lo = (first_pr < 2 * rem) ? rank_lo[first_pr - 1] : rank_lo[first_pr];
+        int first_hi = rank_hi[first_pr];
+        tp_ar_recv_copy(row, 1, first_pr, buf + first_lo * 8,
+                        (first_hi - first_lo) * 8, row->async_tok);
+        row->async_lo = rank_lo[b];
+        row->async_hi = rank_hi[b];
+        if (first_lo < row->async_lo) row->async_lo = first_lo;
+        if (first_hi > row->async_hi) row->async_hi = first_hi;
+        for (int k = 1; k < row->nrounds; ++k)
+            tp_allreduce_sum_sharded_row_round(row, buf, row->async_tok, k,
+                                                rank_lo, rank_hi,
+                                                &row->async_lo, &row->async_hi);
+    }
+    if (b < 2 * rem) {
+        if ((b & 1) == 0)
+            tp_ar_recv_copy(row, row->bcast_sid, b + 1, buf, count, row->async_tok);
+        else {
+            tp_ar_send(row, b - 1, row->bcast_sid, buf, count, row->async_tok);
+            tp_ar_confirm(row);
+        }
+    }
+    if (row->defer_tcq) tp_ar_complete_sends(row);
+    if (row->defer_mrq) tp_ar_drain_mrq(row);
+    row->async_active = 0;
+    row->async_sparse = 0;
+}
+
+static int tp_allreduce_sum_2d_sharded_start(tp_comm *row, tp_comm *col,
+                                             float *buf, int count,
+                                             int global_rank, int global_size) {
+    (void)col;
+    return tp_allreduce_sum_sharded_row_start(row, buf, count, global_rank, global_size);
+}
+
+static int tp_allreduce_sum_2d_sharded_finish(tp_comm *row, tp_comm *col,
+                                              float *buf, int count) {
+    (void)count;
+    tp_allreduce_sum_sharded_row_finish(row, buf);
+    return tp_allreduce_sum_col_halves_checked(row, col, buf, row->async_count);
 }
 
 static int tp_allreduce_max_2d_checked(tp_comm *row,tp_comm *col,
