@@ -6411,6 +6411,22 @@ static void ds4f_pf_swiglu_multi_worker(void *arg, int tid, int nthr) {
     }
 }
 
+typedef struct { ds4f_model *m; const int *off; int no, C, M; } ds4f_pf_ex_gather_task;
+static void ds4f_pf_ex_gather_worker(void *arg, int tid, int nthr) {
+    ds4f_pf_ex_gather_task *T = (ds4f_pf_ex_gather_task *)arg;
+    int per = T->no / nthr, extra = T->no % nthr;
+    int s0 = per * tid + (tid < extra ? tid : extra);
+    int s1 = s0 + per + (tid < extra ? 1 : 0);
+    for (int s = s0; s < s1; ++s) {
+        int off = T->off[s];
+        for (int p = 0; p < T->m->ex_cnt[s]; ++p) {
+            int mm = T->m->ex_tok[(size_t)s*T->M + p];
+            memcpy(T->m->p_exX + (size_t)(off+p)*T->C,
+                   T->m->p_h2 + (size_t)mm*T->C, (size_t)T->C*sizeof(float));
+        }
+    }
+}
+
 /* batched argmax over [M, vocab]; out_tok[mm] = argmax_v logits[mm][v]. */
 typedef struct { const float *logits; int *out; int vocab, M; int r0; float *val; } ds4f_pf_argmax_task;
 static void ds4f_pf_argmax_worker(void *arg, int tid, int nthr) {
@@ -6640,14 +6656,11 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         ex_off[0] = 0;
         for (int s = 0; s < no; s++) ex_off[s + 1] = ex_off[s] + m->ex_cnt[s];
         int ng = 0, ns = 0, nd = 0;
+        ds4f_pf_ex_gather_task gt = { m, ex_off, no, C, M };
+        ds4f_pool_run(m->pool, ds4f_pf_ex_gather_worker, &gt);
         for (int s = 0; s < no; s++) {
             int cnt = m->ex_cnt[s]; if (cnt == 0) continue;
             int off = ex_off[s];
-            for (int p = 0; p < cnt; p++) {                       /* gather h2 of this expert's tokens */
-                const float *h2 = m->p_h2 + (size_t)m->ex_tok[(size_t)s*M + p]*C;
-                float *xe = m->p_exX + (size_t)(off + p)*C;
-                for (int i = 0; i < C; i++) xe[i] = h2[i];
-            }
             gateup[ng++] = (ds4f_gemm_task){ m,
                 m->p_exG + (size_t)off*c->moe_inter, &ly->ex_w1[s],
                 m->p_exX + (size_t)off*C, cnt, c->moe_inter, C, NULL, NULL, NULL, NULL };
