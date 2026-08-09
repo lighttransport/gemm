@@ -6669,6 +6669,32 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         int ng = 0, ns = 0, nd = 0;
         ds4f_pf_ex_gather_task gt = { m, ex_off, no, C, M };
         ds4f_pool_run(m->pool, ds4f_pf_ex_gather_worker, &gt);
+        int routed_gpu = 0;
+        if (m->gpu_routed_ffn && getenv("DS4F_HIP_ROUTED_FFN") && no <= 64) {
+            const ds4f_tensor **rw1 = (const ds4f_tensor **)alloca((size_t)no * sizeof(*rw1));
+            const ds4f_tensor **rw3 = (const ds4f_tensor **)alloca((size_t)no * sizeof(*rw3));
+            const ds4f_tensor **rw2 = (const ds4f_tensor **)alloca((size_t)no * sizeof(*rw2));
+            for (int s = 0; s < no; ++s) {
+                rw1[s] = &ly->ex_w1[s]; rw3[s] = &ly->ex_w3[s]; rw2[s] = &ly->ex_w2[s];
+            }
+            routed_gpu = m->gpu_routed_ffn(m->gpu_dense_ctx, m->p_exO, m->p_exX,
+                rw1, rw3, rw2, m->ex_cnt, ex_off, no, ex_off[no],
+                C, c->moe_inter, c->swiglu_limit) == 0;
+        }
+        if (routed_gpu) {
+            /* The GPU callback produced the same bucketed [total,C] layout;
+             * the weighted scatter below remains on CPU for exact routing. */
+            for (int s = 0; s < no; s++) {
+                int cnt = m->ex_cnt[s]; if (cnt == 0) continue;
+                int off = ex_off[s];
+                for (int p = 0; p < cnt; p++) {
+                    int mm = m->ex_tok[(size_t)s*M + p]; float w = m->ex_wt[(size_t)s*M + p];
+                    float *route = m->p_route + (size_t)mm*C;
+                    const float *o = m->p_exO + (size_t)(off+p)*C;
+                    for (int i = 0; i < C; i++) route[i] += w * o[i];
+                }
+            }
+        } else {
         for (int s = 0; s < no; s++) {
             int cnt = m->ex_cnt[s]; if (cnt == 0) continue;
             int off = ex_off[s];
@@ -6699,6 +6725,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
                 const float *o = m->p_exO + (size_t)(off + p)*C;
                 for (int i = 0; i < C; i++) route[i] += w * o[i];
             }
+        }
         }
         DS4F_TOC(DS4F_P_EXPERTS); }
         if(shared_async && m->gpu_shared_ffn_wait(m->gpu_dense_ctx,m->p_moe,M,C)!=0){fprintf(stderr,"ds4f: async shared FFN wait failed\n");abort();}

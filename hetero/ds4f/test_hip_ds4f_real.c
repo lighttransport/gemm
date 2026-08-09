@@ -434,6 +434,7 @@ static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
      * in its own always-precise HIPRTC module, so it never changes the dense
      * GEMM results or the argmax.  Opt-in; see --hip-fused-shared-ffn. */
     m->gpu_shared_ffn = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn : NULL;
+    m->gpu_routed_ffn = hip_ds4f_dense_routed_ffn;
     m->gpu_shared_ffn_begin = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn_begin : NULL;
     m->gpu_shared_ffn_wait = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn_wait : NULL;
     m->gpu_oproj = hip_ds4f_dense_oproj;
@@ -553,6 +554,7 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
         m->gpu_dense_gemm = NULL;
         m->gpu_dense_gemm_multi = NULL;
         m->gpu_shared_ffn = NULL;
+        m->gpu_routed_ffn = NULL;
         m->gpu_shared_ffn_begin = NULL;
         m->gpu_shared_ffn_wait = NULL;
         m->gpu_oproj = NULL;

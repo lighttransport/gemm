@@ -441,6 +441,10 @@ typedef int (*ds4f_gpu_shared_ffn_fn)(
     void *ctx, float *dst, const ds4f_tensor *w1, const ds4f_tensor *w3,
     const ds4f_tensor *w2, const float *x, int M, int inter, int C, float lim);
 typedef int (*ds4f_gpu_shared_ffn_wait_fn)(void *ctx,float *dst,int M,int C);
+typedef int (*ds4f_gpu_routed_ffn_fn)(void *ctx, float *dst, const float *x,
+    const ds4f_tensor *const *w1, const ds4f_tensor *const *w3,
+    const ds4f_tensor *const *w2, const int *counts, const int *offsets,
+    int n_experts, int total, int C, int inter, float lim);
 typedef int (*ds4f_gpu_oproj_fn)(void *ctx,float *dst,const ds4f_tensor *wa,
     const ds4f_tensor *wb,const float *x,int M,int groups,int gin,int lora,
     int H,int C,int ointer);
@@ -524,6 +528,7 @@ typedef struct {
     ds4f_gpu_dense_async_multi_fn gpu_dense_async_multi;
     ds4f_gpu_dense_wait_fn gpu_dense_wait;
     ds4f_gpu_shared_ffn_fn gpu_shared_ffn;
+    ds4f_gpu_routed_ffn_fn gpu_routed_ffn;
     ds4f_gpu_shared_ffn_fn gpu_shared_ffn_begin;
     ds4f_gpu_shared_ffn_wait_fn gpu_shared_ffn_wait;
     ds4f_gpu_oproj_fn gpu_oproj;

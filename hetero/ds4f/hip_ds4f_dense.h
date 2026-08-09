@@ -140,6 +140,10 @@ int hip_ds4f_dense_shared_ffn_begin(void *ctx,float *dst,
                               const ds4f_tensor *w2,const float *x,
                               int M,int inter,int C,float lim);
 int hip_ds4f_dense_shared_ffn_wait(void *ctx,float *dst,int M,int C);
+int hip_ds4f_dense_routed_ffn(void *ctx, float *dst, const float *x,
+    const ds4f_tensor *const *w1, const ds4f_tensor *const *w3,
+    const ds4f_tensor *const *w2, const int *counts, const int *offsets,
+    int n_experts, int total, int C, int inter, float lim);
 int hip_ds4f_dense_oproj(void *ctx,float *dst,const ds4f_tensor *wa,
     const ds4f_tensor *wb,const float *x,int M,int groups,int gin,int lora,
     int H,int C,int ointer);

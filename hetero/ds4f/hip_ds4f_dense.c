@@ -1801,6 +1801,16 @@ static int launch_gemm_dev(hip_ds4f_dense *ctx, const hip_ds4f_matrix *mat,
     void *lut = ctx->fp8_lut;
     hipFunction_t fn;
     size_t soff;
+    if (matrix_is_mxfp4(mat->kind)) {
+        int n_out = N, n_in = K, n_tok = M;
+        void *dy = dY;
+        void *dw = (uint8_t *)mat->dw + (size_t)row0 * (size_t)(K / 2);
+        void *ds = (uint8_t *)mat->ds + (size_t)row0 * (size_t)(K / 32);
+        void *args[] = { &dy, &dw, &ds, &dX, &n_out, &n_in, &n_tok };
+        return hipModuleLaunchKernel(ctx->gemm_mxfp4,
+            (unsigned)((N + 63) / 64), (unsigned)((M + 15) / 16), 1,
+            16, 16, 1, 0, ctx->stream, args, NULL) == hipSuccess ? 0 : -1;
+    }
     if (matrix_is_fp8_rowscale(mat->kind)) { fn = ctx->gemm_fp8_rowscale; soff = (size_t)row0 * (size_t)mat->scale_cols; }
     else if (matrix_is_fp8_ordered(mat->kind)) { fn = ctx->gemm_fp8_ordered; soff = (size_t)(row0 / 128) * (size_t)mat->scale_cols; }
     else if (matrix_is_fp8(mat->kind)) { fn = ctx->gemm_fp8; soff = (size_t)(row0 / 128) * (size_t)mat->scale_cols; }
@@ -1937,6 +1947,60 @@ int hip_ds4f_dense_shared_ffn(void *opaque,float *dst,
                               int M,int inter,int C,float lim) {
     if(hip_ds4f_dense_shared_ffn_begin(opaque,dst,w1,w3,w2,x,M,inter,C,lim)!=0)return -1;
     return hip_ds4f_dense_shared_ffn_wait(opaque,dst,M,C);
+}
+
+int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
+    const ds4f_tensor *const *w1, const ds4f_tensor *const *w3,
+    const ds4f_tensor *const *w2, const int *counts, const int *offsets,
+    int n_experts, int total, int C, int inter, float lim) {
+    hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    if (!ctx || !dst || !x || !w1 || !w3 || !w2 || !counts || !offsets ||
+        n_experts < 1 || n_experts > 64 || total < 1 || C < 1 || inter < 1 ||
+        offsets[0] != 0 || offsets[n_experts] != total)
+        return -1;
+    size_t xb = (size_t)total * C * 4, ib = (size_t)total * inter * 4;
+    if (hipSetDevice(ctx->device_id) != hipSuccess ||
+        ensure_dev_buf(&ctx->ffn_dx, &ctx->ffn_dx_b, xb) != 0 ||
+        ensure_dev_buf(&ctx->ffn_dg, &ctx->ffn_dg_b, ib) != 0 ||
+        ensure_dev_buf(&ctx->ffn_du, &ctx->ffn_du_b, ib) != 0 ||
+        ensure_dev_buf(&ctx->ffn_dy, &ctx->ffn_dy_b, xb) != 0)
+        return -1;
+    if (hipMemcpyAsync(ctx->ffn_dx, x, xb, hipMemcpyHostToDevice,
+                       ctx->stream) != hipSuccess) return -1;
+    const hip_ds4f_matrix *a = NULL, *u = NULL, *d = NULL;
+    for (int s = 0; s < n_experts; ++s) {
+        int cnt = counts[s];
+        if (cnt < 0 || offsets[s] < 0 || offsets[s] + cnt != offsets[s+1]) return -1;
+        if (cnt == 0) continue;
+        if (!w1[s] || !w3[s] || !w2[s] || w1[s]->gpu_id < 0 ||
+            w3[s]->gpu_id < 0 || w2[s]->gpu_id < 0 ||
+            matrix_get(ctx, w1[s]->gpu_id, &a) != 0 ||
+            matrix_get(ctx, w3[s]->gpu_id, &u) != 0 ||
+            matrix_get(ctx, w2[s]->gpu_id, &d) != 0 ||
+            !matrix_is_mxfp4(a->kind) || !matrix_is_mxfp4(u->kind) ||
+            !matrix_is_mxfp4(d->kind) || w1[s]->rows != inter ||
+            w1[s]->cols != C || w3[s]->rows != inter || w3[s]->cols != C ||
+            w2[s]->rows != C || w2[s]->cols != inter)
+            return -1;
+        size_t offx = (size_t)offsets[s] * C * 4;
+        size_t offi = (size_t)offsets[s] * inter * 4;
+        void *dx = (uint8_t *)ctx->ffn_dx + offx;
+        void *dg = (uint8_t *)ctx->ffn_dg + offi;
+        void *du = (uint8_t *)ctx->ffn_du + offi;
+        void *dy = (uint8_t *)ctx->ffn_dy + offx;
+        if (launch_gemm_dev(ctx, a, 0, dg, dx, inter, C, cnt) != 0 ||
+            launch_gemm_dev(ctx, u, 0, du, dx, inter, C, cnt) != 0)
+            return -1;
+        int n = cnt * inter; void *sa[] = { &dg, &du, &n, &lim };
+        if (hipModuleLaunchKernel(ctx->swiglu, (unsigned)((n+255)/256), 1, 1,
+                                  256, 1, 1, 0, ctx->stream, sa, NULL) != hipSuccess ||
+            launch_gemm_dev(ctx, d, 0, dy, dg, C, inter, cnt) != 0)
+            return -1;
+    }
+    if (hipMemcpyAsync(dst, ctx->ffn_dy, xb, hipMemcpyDeviceToHost,
+                       ctx->stream) != hipSuccess ||
+        hipStreamSynchronize(ctx->stream) != hipSuccess) return -1;
+    return 0;
 }
 
 int hip_ds4f_dense_oproj(void *opaque,float *dst,const ds4f_tensor *wa,
