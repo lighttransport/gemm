@@ -132,7 +132,7 @@ struct hip_ds4f_dense {
     size_t op_dx_b,op_xt_b,op_yt_b,op_di_b,op_dy_b;
     hipFunction_t prefill_attn;
     hipFunction_t prefill_attn_wmma;
-    hipFunction_t apply_rope, apply_rope_heads;
+    hipFunction_t apply_rope, qnorm_rope_heads;
     hipFunction_t rmsnorm_bf16;
     hipFunction_t gemm_fp8_grouped_wmma;
     hipFunction_t gemm_fp8_grouped_wmma64;
@@ -410,7 +410,7 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
     hipModuleGetFunction(&ctx->prefill_attn_wmma, ctx->module,
                          "ds4f_dense_prefill_attn_wmma");
     hipModuleGetFunction(&ctx->apply_rope, ctx->module, "ds4f_apply_rope");
-    hipModuleGetFunction(&ctx->apply_rope_heads, ctx->module, "ds4f_apply_rope_heads");
+    hipModuleGetFunction(&ctx->qnorm_rope_heads, ctx->module, "ds4f_qnorm_rope_heads");
     hipModuleGetFunction(&ctx->rmsnorm_bf16, ctx->module, "ds4f_rmsnorm_bf16");
     hipModuleGetFunction(&ctx->gemm_fp8_grouped_wmma, ctx->module, "ds4f_dense_fp8_grouped_wmma");
     hipModuleGetFunction(&ctx->gemm_fp8_grouped_wmma64, ctx->module, "ds4f_dense_fp8_grouped_wmma64");
@@ -1680,8 +1680,9 @@ int hip_ds4f_dense_prefill_attention(
         hipSetDevice(ctx->device_id) != hipSuccess) return -1;
     ctx->attn_device_ready = 0;
     int qchained = getenv("DS4F_HIP_QKV_DEVICE_CHAIN") &&
+                   getenv("DS4F_HIP_ATTN_DEVICE_CHAIN") &&
                    ctx->qkv_device_ready && ctx->qkv_device_M == M &&
-                   ctx->qkv_device_host == q && ctx->apply_rope_heads &&
+                   ctx->qkv_device_host == q && ctx->qnorm_rope_heads &&
                    rcos && rsin;
     if ((!qchained && hipMemcpy(ctx->attn_q, q, qb, hipMemcpyHostToDevice) != hipSuccess) ||
         hipMemcpy(ctx->attn_kv, kv + (size_t)base * kv_dim, kb,
@@ -1698,11 +1699,11 @@ int hip_ds4f_dense_prefill_attention(
                       hipMemcpyHostToDevice) != hipSuccess ||
             hipMemcpy(ctx->rope_s, rsin + (size_t)pos0*rope_pairs, cb,
                       hipMemcpyHostToDevice) != hipSuccess) return -1;
+        float eps = 1.0e-6f;
         void *ra[] = { &ctx->qkv_q, &ctx->rope_c, &ctx->rope_s, &M,
-                       &n_heads, &head_dim, &rope_offset, &rope_pairs };
-        if (hipModuleLaunchKernel(ctx->apply_rope_heads,
-                (unsigned)(((size_t)M*n_heads*rope_pairs+255)/256),1,1,
-                256,1,1,0,ctx->stream,ra,NULL) != hipSuccess) return -1;
+                       &n_heads, &head_dim, &rope_offset, &rope_pairs, &eps };
+        if (hipModuleLaunchKernel(ctx->qnorm_rope_heads,
+                (unsigned)(M*n_heads),1,1,256,1,1,0,ctx->stream,ra,NULL) != hipSuccess) return -1;
     }
     int groups = (n_heads + 7) >> 3;
     const char *wm = getenv("DS4F_HIP_ATTN_WMMA");
@@ -1832,6 +1833,7 @@ int hip_ds4f_dense_prefill_qkv(void *opaque, float *q, float *kv, const float *x
     const ds4f_tensor *wqa, const ds4f_tensor *wkv, const ds4f_tensor *wqb,
     const uint16_t *qnorm, int M, int C, int q_lora, int H, int kv_lora) {
     hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    if (ctx) ctx->qkv_device_ready = 0;
     const hip_ds4f_matrix *ma = NULL, *mk = NULL, *mb = NULL;
     if (!ctx || !q || !kv || !x || !wqa || !wkv || !wqb || !qnorm || M < 1 ||
         wqa->gpu_id < 0 || wkv->gpu_id < 0 || wqb->gpu_id < 0 ||
@@ -1850,7 +1852,8 @@ int hip_ds4f_dense_prefill_qkv(void *opaque, float *q, float *kv, const float *x
     int n=q_lora; float eps=1.0e-6f; void *na[]={&ctx->qkv_norm,&ctx->qkv_lat,&ctx->qkv_norm_w,&M,&n,&eps};
     if (!ctx->rmsnorm_bf16 || hipModuleLaunchKernel(ctx->rmsnorm_bf16,(unsigned)M,1,1,256,1,1,0,ctx->stream,na,NULL)!=hipSuccess) return -1;
     if (launch_gemm_dev(ctx,mb,0,ctx->qkv_q,ctx->qkv_norm,H,q_lora,M)!=0) return -1;
-    int q_device_chain = getenv("DS4F_HIP_QKV_DEVICE_CHAIN") != NULL;
+    int q_device_chain = getenv("DS4F_HIP_QKV_DEVICE_CHAIN") &&
+                         getenv("DS4F_HIP_ATTN_DEVICE_CHAIN");
     if ((!q_device_chain && hipMemcpyAsync(q,ctx->qkv_q,qb,hipMemcpyDeviceToHost,ctx->stream)!=hipSuccess) ||
         hipMemcpyAsync(kv,ctx->qkv_kv,kb,hipMemcpyDeviceToHost,ctx->stream)!=hipSuccess ||
         hipStreamSynchronize(ctx->stream)!=hipSuccess) return -1;

@@ -6496,7 +6496,8 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
               ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
             ds4f_gemm(m, m->p_q, &ly->wq_b, m->p_qlat, M, H, c->q_lora);
         }
-        if (!(gpu_qkv && getenv("DS4F_HIP_QKV_DEVICE_CHAIN"))) {
+        if (!(gpu_qkv && getenv("DS4F_HIP_QKV_DEVICE_CHAIN") &&
+              getenv("DS4F_HIP_ATTN_DEVICE_CHAIN"))) {
             ds4f_pf_qnr_task t = { m, pos0, M, rcos, rsin };
             ds4f_pool_run(m->pool, ds4f_pf_qnr_worker, &t);
         }
