@@ -330,6 +330,7 @@ int main(void) {
      * cross-rank lockstep preserved with no extra broadcast. */
     const char *prompt_ids_file = getenv("DS4F_PROMPT_IDS");
     const char *gen_out_file    = getenv("DS4F_GEN_OUT");
+    const char *prefill_out_file = getenv("DS4F_PREFILL_OUT");
     int gen_mode = (prompt_ids_file && *prompt_ids_file);
     int max_new  = envi("DS4F_MAX_NEW", 256);
     int *prompt_ids = NULL, n_prompt = 0;
@@ -571,6 +572,8 @@ int main(void) {
      * bit-identical on every rank -> replicated dense + lockstep argmax preserved. ---- */
     double t_pf0 = now_sec(); size_t pf_bytes = 0; g_ar_secs = 0; g_ar_calls = 0;
     int nan_count = 0; double xnorm = 0.0; int pf_last_tok = -1;
+    int *prefill_out = (gen_mode && prefill_out_file && *prefill_out_file)
+                     ? (int *)malloc((size_t)prefill * sizeof(int)) : NULL;
     int mtp_on = gen_mode && m->has_mtp;   /* DS4F_MTP self-spec: maintain MTP KV (prefill+decode) + measure accept rate */
     int spec_on = mtp_on && envi("DS4F_SPEC", 0);   /* DS4F_SPEC: gamma=1 speculative decode loop */
     int mtp_alpha = mtp_on && !spec_on && envi("DS4F_MTP_ALPHA", 0);  /* alpha measurement costs a draft/step --
@@ -616,6 +619,7 @@ int main(void) {
             for (int k = 0; k < K; k++) embed_lookup(m, prompt_ids[base + k], Xv + (size_t)k * C);
             m->bytes_read = 0;
             ds4f_forward_verify(m, Xv, K, base, ot, Hv, NULL);
+            if (prefill_out) memcpy(prefill_out + base, ot, (size_t)K * sizeof(int));
             pf_bytes += m->bytes_read;
             pf_last_tok = ot[K - 1];
             for (int k = 0; k < K; k++) if (tf_check && base + k + 1 < prefill) {
@@ -640,6 +644,7 @@ int main(void) {
             else for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
             m->bytes_read = 0;
             pf_last_tok = ds4f_forward_token(m, x, p);
+            if (prefill_out) prefill_out[p] = pf_last_tok;
             pf_bytes += m->bytes_read;
             if (mtp_alpha || spec_on) {   /* maintain MTP KV over the prompt: process token@(p+1) at position p+1 */
                 int nt = (p + 1 < prefill) ? prompt_ids[p+1] : pf_last_tok;
@@ -662,6 +667,8 @@ int main(void) {
     }
     double t_pf = now_sec() - t_pf0;
     double pf_ar = g_ar_secs; long pf_calls = g_ar_calls;
+    double pf_prof[DS4F_NPHASE];
+    memcpy(pf_prof, m->prof, sizeof pf_prof);
 
     barrier();   /* lockstep check between phases */
 
@@ -825,6 +832,14 @@ int main(void) {
                    prefill, t_pf/prefill*1e3, prefill/t_pf, 100.0*pf_ar/t_pf, pf_calls, pf_last_tok,
                    prefill_batch > 0 ? "  [batched]" :
                    (prefill_verify > 1 ? "  [chunked-verify]" : ""));
+        double pfsum = 0; for (int i = 0; i <= DS4F_P_TB2PREP; i++) pfsum += pf_prof[i];
+        if (pfsum > 0 && prefill > 0) {
+            logmsg("per-phase prefill (ms/tok):\n");
+            for (int i = 0; i < DS4F_NPHASE; i++) {
+                double ms = pf_prof[i]/prefill*1e3; if (ms <= 0) continue;
+                logmsg("  %-9s %7.3f ms  %5.1f%%\n", ds4f_prof_names[i], ms, 100.0*pf_prof[i]/pfsum);
+            }
+        }
         if (maxgen > 0) {
             logmsg("decode:  %d tok  %.1f ms/tok  %.2f tok/s   comm %.1f%% (%.0f us/tok)\n",
                    maxgen, t_dec/maxgen*1e3, maxgen/t_dec, 100.0*dec_ar/t_dec, dec_ar/maxgen*1e6);
@@ -853,9 +868,21 @@ int main(void) {
                 logmsg("gen: WARNING could not open DS4F_GEN_OUT=%s for write\n", gen_out_file);
             }
         }
+        if (gen_mode && prefill_out && prefill_out_file && *prefill_out_file) {
+            FILE *pf = fopen(prefill_out_file, "w");
+            if (pf) {
+                for (int i = 0; i < prefill; i++)
+                    fprintf(pf, "%d%s", prefill_out[i], i + 1 < prefill ? " " : "\n");
+                fclose(pf);
+                logmsg("prefill: wrote %d teacher argmax ids to %s\n", prefill, prefill_out_file);
+            } else {
+                logmsg("prefill: WARNING could not open DS4F_PREFILL_OUT=%s for write\n", prefill_out_file);
+            }
+        }
     }
 
     free(prompt_ids);
+    free(prefill_out);
     free(gen_ids);
     free(x);
     ds4f_free(m);

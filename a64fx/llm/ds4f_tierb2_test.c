@@ -223,9 +223,9 @@ static void run_indexer_decode(const char *tag, long base, int npos, int dim, in
                                cosb, sinb, eps, 1, kvst, scst, comp_out, NULL);
             continue;
         }
-        int T = ds4f_index_step(x + (size_t)pos * dim, dim, qr + (size_t)pos * qlora, qlora,
+        int T = ds4f_index_step(x + (size_t)pos * dim, dim, qr + (size_t)pos * qlora, NULL, qlora,
                                 H, hd, rd, ratio, pos, offset, k,
-                                wqb, wproj, 0, NULL, NULL, NULL, cwkv, cwgate, cape, cnorm,
+                                wqb, NULL, NULL, wproj, 0, cwkv, cwgate, cape, cnorm,
                                 cosb, sinb, eps, kvst, scst, idx_kv,
                                 NULL, NULL, NULL,  /* idx_kv8/idx_kv8_4/idx_pscale: f32 path */
                                 q_scr, score_scr, sel, NULL,
