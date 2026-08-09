@@ -1799,21 +1799,21 @@ static int ensure_dev_buf(void **buf, size_t *cap, size_t bytes) {
 
 int hip_ds4f_dense_prefill_qkv(void *opaque, float *q, float *kv, const float *x,
     const ds4f_tensor *wqa, const ds4f_tensor *wkv, const ds4f_tensor *wqb,
-    const ds4f_tensor *qnorm, int M, int C, int q_lora, int H, int kv_lora) {
+    const uint16_t *qnorm, int M, int C, int q_lora, int H, int kv_lora) {
     hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
     const hip_ds4f_matrix *ma = NULL, *mk = NULL, *mb = NULL;
     if (!ctx || !q || !kv || !x || !wqa || !wkv || !wqb || !qnorm || M < 1 ||
         wqa->gpu_id < 0 || wkv->gpu_id < 0 || wqb->gpu_id < 0 ||
         matrix_get(ctx, wqa->gpu_id, &ma) != 0 || matrix_get(ctx, wkv->gpu_id, &mk) != 0 ||
         matrix_get(ctx, wqb->gpu_id, &mb) != 0 || !matrix_is_fp8(ma->kind) ||
-        !matrix_is_fp8(mk->kind) || !matrix_is_fp8(mb->kind) || qnorm->type != DS4F_BF16)
+        !matrix_is_fp8(mk->kind) || !matrix_is_fp8(mb->kind))
         return -1;
     size_t xb=(size_t)M*C*4, lb=(size_t)M*q_lora*4, kb=(size_t)M*kv_lora*4, qb=(size_t)M*H*4;
     if (ensure_dev_buf(&ctx->qkv_x,&ctx->qkv_x_b,xb) || ensure_dev_buf(&ctx->qkv_lat,&ctx->qkv_lat_b,lb) ||
         ensure_dev_buf(&ctx->qkv_norm,&ctx->qkv_norm_b,lb) || ensure_dev_buf(&ctx->qkv_q,&ctx->qkv_q_b,qb) ||
         ensure_dev_buf(&ctx->qkv_kv,&ctx->qkv_kv_b,kb) || ensure_dev_buf(&ctx->qkv_norm_w,&ctx->qkv_norm_w_b,(size_t)q_lora*2)) return -1;
     if (hipMemcpyAsync(ctx->qkv_x,x,xb,hipMemcpyHostToDevice,ctx->stream)!=hipSuccess ||
-        hipMemcpyAsync(ctx->qkv_norm_w,qnorm->w,(size_t)q_lora*2,hipMemcpyHostToDevice,ctx->stream)!=hipSuccess) return -1;
+        hipMemcpyAsync(ctx->qkv_norm_w,qnorm,(size_t)q_lora*2,hipMemcpyHostToDevice,ctx->stream)!=hipSuccess) return -1;
     if (launch_gemm_dev(ctx,ma,0,ctx->qkv_lat,ctx->qkv_x,q_lora,C,M)!=0 ||
         launch_gemm_dev(ctx,mk,0,ctx->qkv_kv,ctx->qkv_x,kv_lora,C,M)!=0) return -1;
     int n=q_lora; float eps=1.0e-6f; void *na[]={&ctx->qkv_norm,&ctx->qkv_lat,&ctx->qkv_norm_w,&M,&n,&eps};

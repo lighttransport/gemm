@@ -6487,7 +6487,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         int gpu_qkv = 0;
         if (m->gpu_prefill_qkv && getenv("DS4F_HIP_QKV_FUSE"))
             gpu_qkv = m->gpu_prefill_qkv(m->gpu_dense_ctx, m->p_q, m->p_kvlat,
-                m->p_hn, &ly->wq_a, &ly->wkv, &ly->wq_b, &ly->q_norm,
+                m->p_hn, &ly->wq_a, &ly->wkv, &ly->wq_b, ly->q_norm,
                 M, C, c->q_lora, H, KV) == 0;
         if (!gpu_qkv) {
             ds4f_gemm_pair(m, m->p_qlat, &ly->wq_a, m->p_kvlat, &ly->wkv,
