@@ -22,8 +22,17 @@ extern "C" __global__ void ds4f_cuda_prefill_attn(
         if(lane==0)sm[warp][j]=dot*scale;
     }
     __syncwarp();
-    if(lane==0){float mx=-1.e30f;for(int j=0;j<np;j++)mx=fmaxf(mx,sm[warp][j]);float den=expf(sink[h]-mx);for(int j=0;j<np;j++){sm[warp][j]=expf(sm[warp][j]-mx);den+=sm[warp][j];}sm[warp][128]=1.f/den;}
-    __syncwarp();float inv=sm[warp][128];
+    float mx=-1.e30f;
+    for(int j=lane;j<np;j+=32)mx=fmaxf(mx,sm[warp][j]);
+    for(int off=16;off;off>>=1)mx=fmaxf(mx,__shfl_down_sync(0xffffffff,mx,off));
+    mx=__shfl_sync(0xffffffff,mx,0);
+    float den=lane==0?expf(sink[h]-mx):0.f;
+    for(int j=lane;j<np;j+=32){float e=expf(sm[warp][j]-mx);sm[warp][j]=e;den+=e;}
+    for(int off=16;off;off>>=1)den+=__shfl_down_sync(0xffffffff,den,off);
+    den=__shfl_sync(0xffffffff,den,0);
+    float inv=1.f/den;
+    for(int j=lane;j<np;j+=32)sm[warp][j]*=inv;
+    __syncwarp();
     for(int d=lane;d<head_dim;d+=32){float out=0.f;if(d<kv_dim)for(int j=0;j<np;j++){const uint16_t *v=KV+(size_t)((lo+j)%kv_slots)*kv_dim;out=fmaf(sm[warp][j]*inv,__bfloat162float(*((const __nv_bfloat16 *)(v+d))),out);}Y[((size_t)mm*n_heads+h)*head_dim+d]=out;}
 }
 
