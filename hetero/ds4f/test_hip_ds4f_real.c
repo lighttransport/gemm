@@ -32,7 +32,13 @@ static void usage(const char *prog) {
                     "--hip-mxfp4-resident-auto 0|1 --hip-vram-reserve-mb n "
                     "--hip-mxfp4-stream-raw 0|1 "
                     "--hip-expert-cache-mb 0|auto|MB --hip-expert-cache-stats 0|1 "
-                    "--hip-prefill-attn 0|1 --hip-fused-shared-ffn 0|1 "
+                    "--hip-prefill-attn 0|1 --hip-qkv-fuse 0|1 "
+                    "--hip-qkv-device-chain 0|1 --hip-attn-device-chain 0|1 "
+                    "--hip-attn-no-d2h 0|1 --hip-routed-ffn 0|1 "
+                    "--hip-fp8-wmma 0|1|2 --hip-bf16-wmma 0|1 "
+                    "--hip-attn-wmma 0|1 --hip-oproj-group-wmma 0|1|2 "
+                    "--hip-mxfp4-wmma 0|1|2 --hip-block-threads 64|128|256 "
+                    "--hip-fused-shared-ffn 0|1 "
                     "[--dual-gpu 0|1 --cuda-device n --dual-cuda-mxfp4 0|1 --dual-cuda-terms 1|2 "
                     "--dual-cuda-small-buckets 0|1 --dual-cuda-resident-from n "
                     "--prefill-repeat n] "
@@ -193,6 +199,12 @@ static int forward_ab(ds4f_model *m, hip_ds4f_dense *hip,
     m->gpu_dense_stream_prefill_only = 0;
     m->gpu_dense_gemm_multi = NULL;
     m->gpu_prefill_attn = NULL;
+    m->gpu_prefill_qkv = NULL;
+    m->gpu_prefill_qkv_enabled = 0;
+    m->gpu_qkv_device_chain = 0;
+    m->gpu_attn_device_chain = 0;
+    m->gpu_attn_no_d2h = 0;
+    m->gpu_routed_ffn_enabled = 0;
     m->gpu_dense_mixed = 0;
     int strict = x_rel <= 3.0e-4f && logits_rel <= 3.0e-4f;
     if (!strict && m->cfg.n_layers > 1 && cpu_best == gpu_best && finite)
@@ -231,8 +243,17 @@ static void attach_decode_hooks(ds4f_model *m, hip_ds4f_dense *hip,
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
     m->gpu_dense_layer_prefetch = NULL;
     m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
-    m->gpu_prefill_qkv = hip_ds4f_dense_prefill_qkv;
-    m->gpu_prefill_attn_oproj = (opt->hip_prefill_attn && getenv("DS4F_HIP_ATTN_OPROJ")) ? hip_ds4f_dense_prefill_attn_oproj : NULL;
+    m->gpu_prefill_qkv = opt->hip_qkv_fuse ? hip_ds4f_dense_prefill_qkv : NULL;
+    m->gpu_prefill_qkv_enabled = opt->hip_qkv_fuse;
+    m->gpu_qkv_device_chain = opt->hip_qkv_device_chain;
+    m->gpu_attn_device_chain = opt->hip_attn_device_chain;
+    m->gpu_attn_no_d2h = opt->hip_attn_no_d2h;
+    hip_ds4f_dense_set_prefill_features(hip, opt->hip_qkv_fuse,
+        opt->hip_qkv_device_chain, opt->hip_attn_device_chain,
+        opt->hip_attn_no_d2h, opt->hip_fp8_wmma, opt->hip_bf16_wmma,
+        opt->hip_attn_wmma, opt->hip_oproj_group_wmma, opt->hip_mxfp4_wmma,
+        opt->hip_block_threads);
+    m->gpu_prefill_attn_oproj = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attn_oproj : NULL;
     m->gpu_dense_mixed = 1;
     m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
         ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_stream_layer_raw
@@ -434,13 +455,23 @@ static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
      * in its own always-precise HIPRTC module, so it never changes the dense
      * GEMM results or the argmax.  Opt-in; see --hip-fused-shared-ffn. */
     m->gpu_shared_ffn = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn : NULL;
-    m->gpu_routed_ffn = hip_ds4f_dense_routed_ffn;
+    m->gpu_routed_ffn = opt->hip_routed_ffn ? hip_ds4f_dense_routed_ffn : NULL;
     m->gpu_shared_ffn_begin = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn_begin : NULL;
     m->gpu_shared_ffn_wait = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn_wait : NULL;
     m->gpu_oproj = hip_ds4f_dense_oproj;
     m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
-    m->gpu_prefill_qkv = hip_ds4f_dense_prefill_qkv;
-    m->gpu_prefill_attn_oproj = (opt->hip_prefill_attn && getenv("DS4F_HIP_ATTN_OPROJ")) ? hip_ds4f_dense_prefill_attn_oproj : NULL;
+    m->gpu_prefill_qkv = opt->hip_qkv_fuse ? hip_ds4f_dense_prefill_qkv : NULL;
+    m->gpu_prefill_qkv_enabled = opt->hip_qkv_fuse;
+    m->gpu_qkv_device_chain = opt->hip_qkv_device_chain;
+    m->gpu_attn_device_chain = opt->hip_attn_device_chain;
+    m->gpu_attn_no_d2h = opt->hip_attn_no_d2h;
+    m->gpu_routed_ffn_enabled = opt->hip_routed_ffn;
+    hip_ds4f_dense_set_prefill_features(hip, opt->hip_qkv_fuse,
+        opt->hip_qkv_device_chain, opt->hip_attn_device_chain,
+        opt->hip_attn_no_d2h, opt->hip_fp8_wmma, opt->hip_bf16_wmma,
+        opt->hip_attn_wmma, opt->hip_oproj_group_wmma, opt->hip_mxfp4_wmma,
+        opt->hip_block_threads);
+    m->gpu_prefill_attn_oproj = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attn_oproj : NULL;
     /* MXFP4 expert layer residency: install the HIP entry points BEFORE the
      * dual wrapper swaps gpu_dense_ctx, so dual can capture and forward them.
      * Dual owns expert routing and keeps small buckets on the exact CPU path,
@@ -557,6 +588,13 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
         m->gpu_routed_ffn = NULL;
         m->gpu_shared_ffn_begin = NULL;
         m->gpu_shared_ffn_wait = NULL;
+        m->gpu_routed_ffn = NULL;
+        m->gpu_prefill_qkv = NULL;
+        m->gpu_prefill_qkv_enabled = 0;
+        m->gpu_qkv_device_chain = 0;
+        m->gpu_attn_device_chain = 0;
+        m->gpu_attn_no_d2h = 0;
+        m->gpu_routed_ffn_enabled = 0;
         m->gpu_oproj = NULL;
         m->gpu_prefill_attn = NULL;
         m->gpu_dense_mixed = 0;
@@ -797,6 +835,17 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(a, "--hip-expert-cache-stats") == 0 && i + 1 < argc) opt.hip_expert_cache_stats = atoi(argv[++i]);
         else if (strcmp(a, "--hip-prefill-attn") == 0 && i + 1 < argc) opt.hip_prefill_attn = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-qkv-fuse") == 0 && i + 1 < argc) opt.hip_qkv_fuse = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-qkv-device-chain") == 0 && i + 1 < argc) opt.hip_qkv_device_chain = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-attn-device-chain") == 0 && i + 1 < argc) opt.hip_attn_device_chain = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-attn-no-d2h") == 0 && i + 1 < argc) opt.hip_attn_no_d2h = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-routed-ffn") == 0 && i + 1 < argc) opt.hip_routed_ffn = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-fp8-wmma") == 0 && i + 1 < argc) opt.hip_fp8_wmma = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-bf16-wmma") == 0 && i + 1 < argc) opt.hip_bf16_wmma = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-attn-wmma") == 0 && i + 1 < argc) opt.hip_attn_wmma = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-oproj-group-wmma") == 0 && i + 1 < argc) opt.hip_oproj_group_wmma = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-mxfp4-wmma") == 0 && i + 1 < argc) opt.hip_mxfp4_wmma = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-block-threads") == 0 && i + 1 < argc) opt.hip_block_threads = atoi(argv[++i]);
         else if (strcmp(a, "--dual-gpu") == 0 && i + 1 < argc) dual_gpu = atoi(argv[++i]);
         else if (strcmp(a, "--cuda-device") == 0 && i + 1 < argc) cuda_device = atoi(argv[++i]);
         else if (strcmp(a, "--dual-cuda-mxfp4") == 0 && i + 1 < argc) dual_cuda_mxfp4 = atoi(argv[++i]);

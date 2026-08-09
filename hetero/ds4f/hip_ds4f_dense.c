@@ -77,29 +77,6 @@ static int matrix_is_fp8_promoted(int kind) {
            kind == HIP_DS4F_MATRIX_FP8_FP16;
 }
 
-static int fp8_wmma_prefill_on(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *e = getenv("DS4F_HIP_FP8_WMMA");
-        enabled = e && *e && atoi(e) != 0;
-    }
-    return enabled;
-}
-
-static int fp8_wmma_prefill_mode(void) {
-    const char *e = getenv("DS4F_HIP_FP8_WMMA");
-    return e && *e ? atoi(e) : 0;
-}
-
-static int bf16_wmma_prefill_on(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *e = getenv("DS4F_HIP_BF16_WMMA");
-        enabled = e && *e && atoi(e) != 0;
-    }
-    return enabled;
-}
-
 struct hip_ds4f_dense {
     ds4f_mem_pool *mem;
     int device_id;
@@ -144,6 +121,8 @@ struct hip_ds4f_dense {
     size_t x_bytes, y_bytes;
 
     hipStream_t stream;
+    int qkv_fuse, qkv_device_chain, attn_device_chain, attn_no_d2h;
+    int fp8_wmma_mode, bf16_wmma, attn_wmma, oproj_group_wmma, mxfp4_wmma;
     hipEvent_t done;
     int block_threads;
     int pending;
@@ -211,6 +190,23 @@ struct hip_ds4f_dense {
     hip_ds4f_resident_layer *resident_layers;
     int n_resident_layers, cap_resident_layers;
 };
+
+void hip_ds4f_dense_set_prefill_features(hip_ds4f_dense *ctx, int qkv_fuse,
+    int qkv_chain, int attn_chain, int no_d2h, int fp8_wmma, int bf16_wmma,
+    int attn_wmma, int oproj_group_wmma, int mxfp4_wmma, int block_threads) {
+    if (!ctx) return;
+    ctx->qkv_fuse = qkv_fuse != 0;
+    ctx->qkv_device_chain = qkv_chain != 0;
+    ctx->attn_device_chain = attn_chain != 0;
+    ctx->attn_no_d2h = no_d2h != 0;
+    ctx->fp8_wmma_mode = fp8_wmma;
+    ctx->bf16_wmma = bf16_wmma != 0;
+    ctx->attn_wmma = attn_wmma != 0;
+    ctx->oproj_group_wmma = oproj_group_wmma;
+    ctx->mxfp4_wmma = mxfp4_wmma;
+    if (block_threads == 64 || block_threads == 128 || block_threads == 256)
+        ctx->block_threads = block_threads;
+}
 
 static int valid_dims(int rows, int cols) {
     return rows > 0 && cols > 0 && rows <= INT_MAX / cols;
@@ -337,15 +333,6 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
      * it halves the wave reduction/launch footprint versus the original 256,
      * while retaining enough lanes for the 1K--8K column projections. */
     ctx->block_threads = 128;
-    const char *threads_env = getenv("DS4F_HIP_BLOCK_THREADS");
-    if (threads_env) {
-        int threads = atoi(threads_env);
-        if (threads == 64 || threads == 128 || threads == 256)
-            ctx->block_threads = threads;
-        else
-            fprintf(stderr, "hip_ds4f_dense: ignoring invalid DS4F_HIP_BLOCK_THREADS=%s (use 64, 128, or 256)\n",
-                    threads_env);
-    }
     size_t common_len = strlen(hip_kernels_common_src);
     size_t dense_len = strlen(hip_ds4f_dense_kernels_src);
     char *full_src = (char *)ds4f_mem_alloc(ctx->mem, common_len + dense_len + 2, 64, 0);
@@ -1679,8 +1666,7 @@ int hip_ds4f_dense_prefill_attention(
         ensure_attn_buffer(&ctx->attn_y, &ctx->attn_y_bytes, qb) != 0 ||
         hipSetDevice(ctx->device_id) != hipSuccess) return -1;
     ctx->attn_device_ready = 0;
-    int qchained = getenv("DS4F_HIP_QKV_DEVICE_CHAIN") &&
-                   getenv("DS4F_HIP_ATTN_DEVICE_CHAIN") &&
+    int qchained = ctx->qkv_device_chain && ctx->attn_device_chain &&
                    ctx->qkv_device_ready && ctx->qkv_device_M == M &&
                    ctx->qkv_device_host == q && ctx->qnorm_rope_heads &&
                    rcos && rsin;
@@ -1706,8 +1692,7 @@ int hip_ds4f_dense_prefill_attention(
                 (unsigned)(M*n_heads),1,1,256,1,1,0,ctx->stream,ra,NULL) != hipSuccess) return -1;
     }
     int groups = (n_heads + 7) >> 3;
-    const char *wm = getenv("DS4F_HIP_ATTN_WMMA");
-    int use_wmma = wm && atoi(wm) != 0 && ctx->prefill_attn_wmma &&
+    int use_wmma = ctx->attn_wmma && ctx->prefill_attn_wmma &&
                    head_dim == 512 && kv_dim == 512;
     unsigned int gx = (unsigned int)(use_wmma ? n_heads * ((M + 15) / 16) : M * groups);
     int local_pos0 = pos0 - base;
@@ -1716,12 +1701,11 @@ int hip_ds4f_dense_prefill_attention(
     hipError_t err = hipModuleLaunchKernel(use_wmma ? ctx->prefill_attn_wmma : ctx->prefill_attn,
                                             gx, 1, 1, 256, 1, 1, 0, ctx->stream,
                                             args, NULL);
-    int no_d2h = getenv("DS4F_HIP_ATTN_NO_D2H") &&
-                 getenv("DS4F_HIP_ATTN_DEVICE_CHAIN");
+    int no_d2h = ctx->attn_no_d2h && ctx->attn_device_chain;
     if (err != hipSuccess || hipStreamSynchronize(ctx->stream) != hipSuccess ||
         (!no_d2h && hipMemcpy(dst, ctx->attn_y, qb, hipMemcpyDeviceToHost) != hipSuccess))
         return -1;
-    if (getenv("DS4F_HIP_ATTN_DEVICE_CHAIN")) {
+    if (ctx->attn_device_chain) {
         ctx->attn_device_ready = 1;
         ctx->attn_device_M = M;
         ctx->attn_device_host = dst;
@@ -1747,10 +1731,9 @@ int hip_ds4f_dense_prefill_attn_oproj(void *opaque,float *dst,const float *q,con
         hipMemcpyAsync(c->rope_s,rsin+(size_t)pos0*rp,cb,hipMemcpyHostToDevice,c->stream)!=hipSuccess)return -1;
      c->rope_host_c=rcos; c->rope_host_s=rsin; c->rope_host_pos=pos0; c->rope_host_m=M; c->rope_host_pairs=rp;
  }
- void *dy=c->attn_y,*dkv=c->attn_kv,*dq=c->attn_q,*ds=c->attn_sink;int lp=pos0-base;const char *wm=getenv("DS4F_HIP_ATTN_WMMA");int use=wm&&atoi(wm)!=0&&c->prefill_attn_wmma&&hd==512&&kd==512;void *aa[]={&dy,&dkv,&dq,&ds,&M,&lp,&nh,&hd,&kd,&ns,&window,&scale};unsigned gx=(unsigned)(use?nh*((M+15)/16):M*((nh+7)>>3));
+ void *dy=c->attn_y,*dkv=c->attn_kv,*dq=c->attn_q,*ds=c->attn_sink;int lp=pos0-base;int use=c->attn_wmma&&c->prefill_attn_wmma&&hd==512&&kd==512;void *aa[]={&dy,&dkv,&dq,&ds,&M,&lp,&nh,&hd,&kd,&ns,&window,&scale};unsigned gx=(unsigned)(use?nh*((M+15)/16):M*((nh+7)>>3));
  if(hipModuleLaunchKernel(use?c->prefill_attn_wmma:c->prefill_attn,gx,1,1,256,1,1,0,c->stream,aa,NULL)!=hipSuccess)return -1;void *ra[]={&c->attn_y,&c->rope_c,&c->rope_s,&M,&hd,&H,&ro,&rp};if(hipModuleLaunchKernel(c->apply_rope,(unsigned)(((size_t)M*rp+255)/256),1,1,256,1,1,0,c->stream,ra,NULL)!=hipSuccess)return -1;
- const char *og=getenv("DS4F_HIP_OPROJ_GROUP_WMMA");
- int omode = og ? atoi(og) : 0;
+ int omode = c->oproj_group_wmma;
  int grouped_op = omode!=0 && c->gemm_fp8_grouped_wmma && matrix_is_fp8(a->kind);
  if (grouped_op) {
      hip_ds4f_mxfp4_task task[32]; memset(task,0,sizeof(task));
@@ -1819,8 +1802,8 @@ static int launch_gemm_dev(hip_ds4f_dense *ctx, const hip_ds4f_matrix *mat,
     else return -1;   /* promoted BF16/FP16 and MXFP4 keep the unfused path */
     void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K;
     void *ds = (uint8_t *)(void *)mat->ds + soff;
-    if (matrix_is_fp8(mat->kind) && fp8_wmma_prefill_on() && M >= 128) {
-        int wm = fp8_wmma_prefill_mode();
+    if (matrix_is_fp8(mat->kind) && ctx->fp8_wmma_mode != 0 && M >= 128) {
+        int wm = ctx->fp8_wmma_mode;
         void *args[] = { &dY, &dw, &ds, &dX, &N, &K, &M, &scale_cols };
         return hipModuleLaunchKernel(wm >= 2 ? ctx->gemm_fp8_wmma64 : ctx->gemm_fp8_wmma,
             (unsigned int)((N + (wm >= 2 ? 63 : 127)) / (wm >= 2 ? 64 : 128)),
@@ -1864,8 +1847,7 @@ int hip_ds4f_dense_prefill_qkv(void *opaque, float *q, float *kv, const float *x
     int n=q_lora; float eps=1.0e-6f; void *na[]={&ctx->qkv_norm,&ctx->qkv_lat,&ctx->qkv_norm_w,&M,&n,&eps};
     if (!ctx->rmsnorm_bf16 || hipModuleLaunchKernel(ctx->rmsnorm_bf16,(unsigned)M,1,1,256,1,1,0,ctx->stream,na,NULL)!=hipSuccess) return -1;
     if (launch_gemm_dev(ctx,mb,0,ctx->qkv_q,ctx->qkv_norm,H,q_lora,M)!=0) return -1;
-    int q_device_chain = getenv("DS4F_HIP_QKV_DEVICE_CHAIN") &&
-                         getenv("DS4F_HIP_ATTN_DEVICE_CHAIN");
+    int q_device_chain = ctx->qkv_device_chain && ctx->attn_device_chain;
     if ((!q_device_chain && hipMemcpyAsync(q,ctx->qkv_q,qb,hipMemcpyDeviceToHost,ctx->stream)!=hipSuccess) ||
         hipMemcpyAsync(kv,ctx->qkv_kv,kb,hipMemcpyDeviceToHost,ctx->stream)!=hipSuccess ||
         hipStreamSynchronize(ctx->stream)!=hipSuccess) return -1;
@@ -2172,8 +2154,8 @@ int hip_ds4f_dense_gemm_tensor(
             void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K + (size_t)c0 * (size_t)K;
             void *ds = (uint8_t *)(void *)mat->ds + (size_t)(row0 / 128) * (size_t)mat->scale_cols + (size_t)(c0 / 128) * (size_t)mat->scale_cols;
             int scale_cols = mat->scale_cols;
-            if (fp8_wmma_prefill_on() && M >= 128) {
-                int wm = fp8_wmma_prefill_mode();
+            if (ctx->fp8_wmma_mode != 0 && M >= 128) {
+                int wm = ctx->fp8_wmma_mode;
                 void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok, &scale_cols };
                 err = hipModuleLaunchKernel(wm >= 2 ? ctx->gemm_fp8_wmma64 : ctx->gemm_fp8_wmma,
                     (unsigned int)((n_out + (wm >= 2 ? 63 : 127)) / (wm >= 2 ? 64 : 128)),
@@ -2187,7 +2169,7 @@ int hip_ds4f_dense_gemm_tensor(
             }
         } else if (matrix_is_bf16(mat->kind)) {
             void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t) + (size_t)c0 * (size_t)K * sizeof(uint16_t);
-            if (bf16_wmma_prefill_on() && M >= 128) {
+            if (ctx->bf16_wmma && M >= 128) {
                 void *args[] = { &dy, &dw, &dx, &n_out, &n_in, &n_tok };
                 err = hipModuleLaunchKernel(ctx->gemm_bf16_wmma,
                     (unsigned int)((n_out + 127) / 128),
@@ -2326,8 +2308,7 @@ int hip_ds4f_dense_gemm_tensors(
                 return -1;
             int ntasks = n;
             void *args[] = { &ctx->gemm_mxfp4_tasks, &ntasks };
-            const char *we = getenv("DS4F_HIP_MXFP4_WMMA");
-            int wmode = we ? atoi(we) : 0;
+            int wmode = ctx->mxfp4_wmma;
             int use_wmma32 = wmode >= 2 && !grouped_m1 &&
                            ctx->gemm_mxfp4_grouped_wmma32 && M[0] >= 32;
             int use_wmma = !use_wmma32 && wmode != 0 && !grouped_m1 &&
@@ -2379,8 +2360,8 @@ int hip_ds4f_dense_gemm_tensors(
         } else if (matrix_is_fp8(mat[i]->kind)) {
             int n_out = t[i]->rows, n_in = k0, n_tok = M[i];
             int scale_cols = mat[i]->scale_cols;
-            if (fp8_wmma_prefill_on() && M[i] >= 128) {
-                int wm = fp8_wmma_prefill_mode();
+            if (ctx->fp8_wmma_mode != 0 && M[i] >= 128) {
+                int wm = ctx->fp8_wmma_mode;
                 void *args[] = { &dy, &dw, &ds, &dx, &n_out, &n_in, &n_tok, &scale_cols };
                 fn = wm >= 2 ? ctx->gemm_fp8_wmma64 : ctx->gemm_fp8_wmma;
                 err = hipModuleLaunchKernel(fn,

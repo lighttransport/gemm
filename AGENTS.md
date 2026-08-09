@@ -101,3 +101,20 @@ short gibberish-prompt prefix is unpredictable): G=32~0.0, G=48~0.47, **G=128~0.
 G=256~0.88** — so use G>=128 to see the real rate. Headline: **8.4 tok/s @ alpha 0.78
 G=128 / 0.88 G=256**. The anon load now peaks ~26 GB with no thrash (fadvise). Guard a
 run by killing if `MemAvailable < 2 GB`. Full work log: `project_gemma4_12b_bf16` memory.
+
+### AMD ROCm DS4F runner options
+
+ROCm performance and execution tuning must be supplied as `test_hip_ds4f_real`
+program arguments, not `DS4F_HIP_*` environment variables. The full device-
+resident prefill chain is enabled with:
+
+```
+--hip-qkv-fuse 1 --hip-qkv-device-chain 1 --hip-attn-device-chain 1 \
+--hip-attn-no-d2h 1 --hip-routed-ffn 1 --hip-fp8-wmma 2 \
+--hip-bf16-wmma 1 --hip-attn-wmma 1 --hip-oproj-group-wmma 2 \
+--hip-mxfp4-wmma 1 --hip-block-threads 128
+```
+
+These flags are intentionally explicit runner arguments. Environment
+variables are reserved for diagnostics/debugging and profiling (for example
+`DS4F_DEBUG_ENV` and `DS4F_PROF`); they must not select a tuned production path.

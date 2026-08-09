@@ -6485,7 +6485,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, ly->attn_norm, C, M, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
         int gpu_qkv = 0;
-        if (m->gpu_prefill_qkv && getenv("DS4F_HIP_QKV_FUSE"))
+        if (m->gpu_prefill_qkv && m->gpu_prefill_qkv_enabled)
             gpu_qkv = m->gpu_prefill_qkv(m->gpu_dense_ctx, m->p_q, m->p_kvlat,
                 m->p_hn, &ly->wq_a, &ly->wkv, &ly->wq_b, ly->q_norm,
                 M, C, c->q_lora, H, KV) == 0;
@@ -6496,8 +6496,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
               ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
             ds4f_gemm(m, m->p_q, &ly->wq_b, m->p_qlat, M, H, c->q_lora);
         }
-        if (!(gpu_qkv && getenv("DS4F_HIP_QKV_DEVICE_CHAIN") &&
-              getenv("DS4F_HIP_ATTN_DEVICE_CHAIN"))) {
+        if (!(gpu_qkv && m->gpu_qkv_device_chain && m->gpu_attn_device_chain)) {
             ds4f_pf_qnr_task t = { m, pos0, M, rcos, rsin };
             ds4f_pool_run(m->pool, ds4f_pf_qnr_worker, &t);
         }
@@ -6670,7 +6669,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         ds4f_pf_ex_gather_task gt = { m, ex_off, no, C, M };
         ds4f_pool_run(m->pool, ds4f_pf_ex_gather_worker, &gt);
         int routed_gpu = 0;
-        if (m->gpu_routed_ffn && getenv("DS4F_HIP_ROUTED_FFN") && no <= 64) {
+        if (m->gpu_routed_ffn && m->gpu_routed_ffn_enabled && no <= 64) {
             const ds4f_tensor **rw1 = (const ds4f_tensor **)alloca((size_t)no * sizeof(*rw1));
             const ds4f_tensor **rw3 = (const ds4f_tensor **)alloca((size_t)no * sizeof(*rw3));
             const ds4f_tensor **rw2 = (const ds4f_tensor **)alloca((size_t)no * sizeof(*rw2));
