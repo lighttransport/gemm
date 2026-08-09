@@ -86,6 +86,15 @@ static int fp8_wmma_prefill_on(void) {
     return enabled;
 }
 
+static int bf16_wmma_prefill_on(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4F_HIP_BF16_WMMA");
+        enabled = e && *e && atoi(e) != 0;
+    }
+    return enabled;
+}
+
 struct hip_ds4f_dense {
     ds4f_mem_pool *mem;
     int device_id;
@@ -105,6 +114,7 @@ struct hip_ds4f_dense {
     hipFunction_t mxfp4_grouped_matvec;
     hipFunction_t gemm_fp8_rowscale;
     hipFunction_t gemm_bf16;
+    hipFunction_t gemm_bf16_wmma;
     hipFunction_t gemm_f16;
     hipFunction_t swiglu;
     hipFunction_t gather_group, scatter_group;
@@ -351,6 +361,8 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
                              "ds4f_dense_mxfp4_grouped_matvec") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_bf16, ctx->module,
                              "ds4f_dense_bf16_gemm") != hipSuccess ||
+        hipModuleGetFunction(&ctx->gemm_bf16_wmma, ctx->module,
+                             "ds4f_dense_bf16_wmma_gemm") != hipSuccess ||
         hipModuleGetFunction(&ctx->gemm_f16, ctx->module,
                              "gemm_tiled_f16_f32") != hipSuccess ||
         hipModuleGetFunction(&ctx->prefill_attn, ctx->module,
@@ -1953,10 +1965,18 @@ int hip_ds4f_dense_gemm_tensor(
             }
         } else if (matrix_is_bf16(mat->kind)) {
             void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t) + (size_t)c0 * (size_t)K * sizeof(uint16_t);
-            void *bias = NULL;
-            void *args[] = { &dy, &dw, &dx, &bias, &n_out, &n_in, &n_tok };
-            err = hipModuleLaunchKernel(ctx->gemm_bf16, gx, gy, 1, 16, 16, 1, 0,
-                                        ctx->stream, args, NULL);
+            if (bf16_wmma_prefill_on() && M >= 128) {
+                void *args[] = { &dy, &dw, &dx, &n_out, &n_in, &n_tok };
+                err = hipModuleLaunchKernel(ctx->gemm_bf16_wmma,
+                    (unsigned int)((n_out + 127) / 128),
+                    (unsigned int)((n_tok + 127) / 128), 1,
+                    256, 1, 1, 0, ctx->stream, args, NULL);
+            } else {
+                void *bias = NULL;
+                void *args[] = { &dy, &dw, &dx, &bias, &n_out, &n_in, &n_tok };
+                err = hipModuleLaunchKernel(ctx->gemm_bf16, gx, gy, 1, 16, 16, 1, 0,
+                                            ctx->stream, args, NULL);
+            }
         } else {
             void *dw = (uint8_t *)(void *)mat->dw + (size_t)row0 * (size_t)K * sizeof(uint16_t) + (size_t)c0 * (size_t)K * sizeof(uint16_t);
             void *bias = NULL;
