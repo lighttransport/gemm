@@ -7,9 +7,9 @@
 
 static double now_s(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 int main(int argc,char **argv){
-    if(argc<2){fprintf(stderr,"usage: %s STAGE_DIR [M]\n",argv[0]);return 2;}
-    int M=argc>2?atoi(argv[2]):256;setenv("DS4F_PREFILL_LAST_LOGITS","1",0);setenv("DS4F_PROF","1",0);
-    ds4f_runtime_options o;ds4f_runtime_options_init(&o);o.cfg=ds4f_default_config();o.ep_size=8;o.ep_rank=0;o.n_threads=32;o.n_cmgs=1;o.mxfp4_w4a8=1;
+    if(argc<2){fprintf(stderr,"usage: %s STAGE_DIR [M] [THREADS] [CMGS]\n",argv[0]);return 2;}
+    int M=argc>2?atoi(argv[2]):256,nthr=argc>3?atoi(argv[3]):32,ncmg=argc>4?atoi(argv[4]):2;setenv("DS4F_PREFILL_LAST_LOGITS","1",0);setenv("DS4F_PROF","1",0);
+    ds4f_runtime_options o;ds4f_runtime_options_init(&o);o.cfg=ds4f_default_config();o.ep_size=8;o.ep_rank=0;o.n_threads=nthr;o.n_cmgs=ncmg;o.mxfp4_w4a8=1;
     snprintf(o.stage_dir,sizeof(o.stage_dir),"%s",argv[1]);ds4f_model *m=ds4f_load_real_opts(&o);if(!m)return 3;
     cuda_ds4f_dense *c=cuda_ds4f_dense_create(0,0);if(!c)return 4;int nbind=0;
     for(int L=0;L<m->cfg.n_layers;L++){ds4f_layer *z=&m->layers[L];ds4f_tensor *ts[]={&z->wq_a,&z->wq_b,&z->wkv,&z->wo_a,&z->wo_b,&z->sh_w1,&z->sh_w3,&z->sh_w2};
