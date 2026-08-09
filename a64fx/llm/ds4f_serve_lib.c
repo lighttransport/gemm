@@ -51,6 +51,9 @@ typedef struct ds4f_serve {
     int eos;
     int *hist;         /* recent generated tokens (for the penalties) */
     int n_hist, hist_cap;
+    int prefill_tile;  /* logical request tile, clamped to kernel capacity */
+    float *prefill_x;  /* [prefill_tile, hidden] embedding slab */
+    int *prefill_tok;  /* [prefill_tile] argmax scratch */
 #if defined(DS4F_SERVE_HIP)
     hip_ds4f_dense *hip;
 #endif
@@ -126,6 +129,14 @@ static int serve_attach_hip(ds4f_serve *s, int hip_device, int verbose,
     m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
     m->gpu_dense_mixed = 1;
+    /* Whole-layer streaming is useful as a bandwidth experiment but an EP=1
+     * layer is ~3.4 GB; PCIe transfer dominates on a 16 GB card.  Keep the
+     * measured-slower path explicitly opt-in while selective caching evolves. */
+    if (env_i("DS4F_SERVE_HIP_EXPERT_STREAM", 0)) {
+        m->gpu_dense_layer_prefetch = hip_ds4f_dense_prefetch_layer_raw;
+        m->gpu_dense_layer_begin = hip_ds4f_dense_begin_layer;
+        m->gpu_dense_stream_prefill_only = 1;
+    }
     return 0;
 }
 #endif
@@ -165,6 +176,19 @@ ds4f_serve *ds4f_serve_open(const char *stage_dir, int use_hip, int hip_device,
     s->hidden = m->cfg.hidden;
     s->x = (float *)ds4f_mem_alloc(s->pool, (size_t)s->hidden * 4, 256, 0);
     if (!s->x) { ds4f_serve_close(s); return NULL; }
+    {
+        int requested = env_i("DS4F_SERVE_PREFILL_TILE", 4096);
+        if (requested < 1) requested = 1;
+        s->prefill_tile = requested < DS4F_MAX_MTILE ? requested : DS4F_MAX_MTILE;
+        ds4f_alloc_prefill_batch(m, s->prefill_tile);
+        s->prefill_x = (float *)malloc((size_t)s->prefill_tile * (size_t)s->hidden * sizeof(float));
+        s->prefill_tok = (int *)malloc((size_t)s->prefill_tile * sizeof(int));
+        if (!s->prefill_x || !s->prefill_tok) {
+            if (err && err_cap) snprintf(err, err_cap, "ds4f_serve_open: prefill scratch allocation failed");
+            ds4f_serve_close(s);
+            return NULL;
+        }
+    }
 #if defined(DS4F_SERVE_HIP)
     if (use_hip) {
         if (serve_attach_hip(s, hip_device, env_i("DS4F_HIP_VERBOSE", 0),
@@ -194,12 +218,15 @@ void ds4f_serve_close(ds4f_serve *s) {
         }
         fprintf(stderr, "  %-9s %8.3f s (profiled)\n", "TOTAL", acc);
     }
+    if (s->m) ds4f_route_report(s->m, stderr);
 #if defined(DS4F_SERVE_HIP)
     if (s->hip) hip_ds4f_dense_destroy(s->hip);
 #endif
     if (s->m) ds4f_free(s->m);
     free(s->hist);
     free(s->logits);
+    free(s->prefill_x);
+    free(s->prefill_tok);
     free(s);
 }
 
@@ -214,11 +241,20 @@ int ds4f_serve_eos(ds4f_serve *s) { return s ? s->eos : 1; }
  * token. */
 int ds4f_serve_prefill(ds4f_serve *s, const int *ids, int n, int pos0) {
     if (!s || !ids || n < 1) return -1;
-    int p = pos0;
-    for (int i = 0; i < n; ++i, ++p) {
-        if (ids[i] < 0 || ids[i] >= s->vocab) return -1;
-        if (embed_lookup(s->m, ids[i], s->x) != 0) return -1;
-        if (ds4f_forward_token(s->m, s->x, p) < 0) return -1;
+    int p = pos0, off = 0, last_tile = 0;
+    while (off < n) {
+        int tile = n - off;
+        if (tile > s->prefill_tile) tile = s->prefill_tile;
+        last_tile = tile;
+        for (int i = 0; i < tile; ++i) {
+            int id = ids[off + i];
+            if (id < 0 || id >= s->vocab) return -1;
+            if (embed_lookup(s->m, id, s->prefill_x + (size_t)i * s->hidden) != 0) return -1;
+        }
+        ds4f_forward_verify(s->m, s->prefill_x, tile, p,
+                            s->prefill_tok, NULL, NULL);
+        p += tile;
+        off += tile;
     }
     s->pos = p;
     s->n_hist = 0;
@@ -226,7 +262,9 @@ int ds4f_serve_prefill(ds4f_serve *s, const int *ids, int n, int pos0) {
         s->logits = (float *)realloc(s->logits, (size_t)s->m->cfg.vocab * sizeof(float));
         s->logits_cap = (size_t)s->m->cfg.vocab;
     }
-    memcpy(s->logits, s->m->s_logits, (size_t)s->vocab * sizeof(float));
+    memcpy(s->logits,
+           s->m->p_logits + (size_t)(last_tile - 1) * s->vocab,
+           (size_t)s->vocab * sizeof(float));
     return 0;
 }
 

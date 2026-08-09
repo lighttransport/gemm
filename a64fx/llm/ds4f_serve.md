@@ -42,6 +42,21 @@ python3 a64fx/llm/ds4f_serve.py
 
 Smoke test: `sh a64fx/llm/test_ds4f_serve.sh /tmp/ds4f_single 8080`.
 
+The production prefill path uses exact mHC/Tier-B2 tiles. The logical default
+is 4096 prompt tokens and the current kernel capacity processes it as 512-token
+tiles; set `DS4F_SERVE_PREFILL_TILE` to reduce the tile when memory is tight.
+Run the fixed acceptance protocol with:
+
+```sh
+python3 a64fx/llm/ds4f_serve_bench.py --stage-dir /tmp/ds4f_single \
+  --prompt-tokens 4096 --warm-decode 32 --decode-tokens 256
+```
+
+`DS4F_ROUTE_TELEMETRY=1` prints each layer's eight hottest experts and their
+coverage when the process closes. `DS4F_MXFP4_W4A8=1` enables the opt-in CPU
+expert activation-quantized path. Whole-layer raw expert streaming is retained
+for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
+
 ## Context / KV management
 
 - **Conversation prefix cache** (automatic in the frontend): the chat handler
@@ -122,3 +137,11 @@ floor (the harness's best no-compressor decode is ~185 ms/token, and neither
 the CUDA expert batch nor the ROCm MXFP4 path beats the CPU at M=1).  The
 CUDA-expert async batch (hetero/ds4f) is the follow-on accelerator for
 multi-token prefill, not the single-token decode.
+
+The exact tiled server path measured 2.52 prefill tok/s at M=128 and 3.29
+decode tok/s on the 16-core Threadripper/RX 9070 XT test host. W4A8 improved a
+short warmed decode to 4.68 tok/s. Whole-layer ROCm expert streaming regressed
+to 0.85 prefill tok/s because roughly 146 GB crossed PCIe per prompt tile, so a
+selective hot-expert cache—not full-layer streaming—is required next. These
+figures are below the 100/20 tok/s targets and are recorded as baselines, not
+as target completion.

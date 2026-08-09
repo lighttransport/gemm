@@ -260,9 +260,12 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
             if sess.prefill(prompt, 0) != 0:
                 raise RuntimeError("prefill failed")
 
+    prefill_s = max(time.time() - _t0, 1e-9)
+
     # the generation loop: sample + decode until max_new or EOS
     out = []
     pos = sess.pos()
+    decode_t0 = time.time()
     tf = None
     if stream_path:
         tf = open(stream_path, "w")
@@ -286,6 +289,14 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
             break
     if tf is not None:
         tf.close()
+
+    decode_s = max(time.time() - decode_t0, 1e-9)
+    if os.environ.get("DS4F_SERVE_BENCH"):
+        print("[bench] prefill tokens=%d seconds=%.6f tok/s=%.3f; "
+              "decode tokens=%d seconds=%.6f tok/s=%.3f" %
+              (len(prompt), prefill_s, len(prompt) / prefill_s,
+               len(out), decode_s, len(out) / decode_s if out else 0.0),
+              file=sys.stderr, flush=True)
 
     if _dbg:
         print("[runner] gen prefill+decode %.1fs gen=%d pos=%d" %

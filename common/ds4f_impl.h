@@ -397,6 +397,20 @@ static inline void ds4f_q8_xscratch(int M, int K, int8_t **xq, float **xs) {
     *xq = ds4f_xq_buf; *xs = ds4f_xs_buf;
 }
 
+/* Per-thread [M,8] accumulation scratch is shared by the SVE and AVX2 BF16
+ * GEMM workers.  Keep it outside either ISA guard. */
+static __thread float *ds4f_acc_buf = NULL;
+static __thread size_t ds4f_acc_cap = 0;
+static inline float (*ds4f_acc_scratch(size_t M))[8] {
+    size_t need = M * 8;
+    if (need > ds4f_acc_cap) {
+        ds4f_map_free(ds4f_acc_buf);
+        ds4f_acc_buf = (float *)ds4f_map_alloc(need * sizeof(float), 64, 0);
+        ds4f_acc_cap = ds4f_acc_buf ? need : 0;
+    }
+    return (float (*)[8])ds4f_acc_buf;
+}
+
 #if !defined(__ARM_FEATURE_SVE) && defined(__AVX2__) && defined(__FMA__)
 /* Activation scratch for the AVX2 MXFP4 W4A8 expert path: int8 values plus the
  * per-32-block scale and debias term. Quantized ONCE per matvec (in
@@ -422,19 +436,6 @@ static inline void ds4f_mxfp4_xscratch(int K, int8_t **xq, float **xs, float **x
  * Sized by the actual batch M instead of DS4F_MAX_MTILE: at MTILE=8192 the
  * old stack array was 256 KB and spilled, changing the reduction order (and
  * the argmax) at small batches. */
-static __thread float *ds4f_acc_buf = NULL;
-static __thread size_t ds4f_acc_cap = 0;
-static inline float (*ds4f_acc_scratch(size_t M))[8] {
-    size_t need = M * 8;
-    if (need > ds4f_acc_cap) {
-        ds4f_map_free(ds4f_acc_buf);
-        ds4f_acc_buf = (float *)ds4f_map_alloc(need * sizeof(float), 64, 0);
-        ds4f_acc_cap = ds4f_acc_buf ? need : 0;
-    }
-    return (float (*)[8])ds4f_acc_buf;
-}
-
-
 static __thread int8_t *ds4f_mxqn_buf = NULL;
 static __thread float  *ds4f_mxsn_buf = NULL;
 static __thread float  *ds4f_mxcn_buf = NULL;
@@ -5148,6 +5149,54 @@ static void ds4f_topk_exact(const float *logits, const float *bias, int n, int k
     for (int i = 0; i < k; i++) wt[i] = (selsc[i] / sum) * routed_scale;
 }
 
+static void ds4f_route_observe(ds4f_model *m, int layer, const int *idx, int n) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4F_ROUTE_TELEMETRY");
+        enabled = e && *e && atoi(e) != 0;
+    }
+    if (!enabled) return;
+    if (!m->route_hits) {
+        size_t nh = (size_t)m->cfg.n_layers * (size_t)m->cfg.n_experts;
+        m->route_hits = (uint64_t *)ds4f_mem_alloc(m->mem, nh * sizeof(uint64_t), 256, 1);
+        m->route_tokens = (uint64_t *)ds4f_mem_alloc(
+            m->mem, (size_t)m->cfg.n_layers * sizeof(uint64_t), 256, 1);
+        if (!m->route_hits || !m->route_tokens) return;
+    }
+    m->route_tokens[layer]++;
+    uint64_t *hits = m->route_hits + (size_t)layer * m->cfg.n_experts;
+    for (int i = 0; i < n; ++i)
+        if (idx[i] >= 0 && idx[i] < m->cfg.n_experts) hits[idx[i]]++;
+}
+
+static void ds4f_route_report(const ds4f_model *m, FILE *out) {
+    if (!m || !m->route_hits || !m->route_tokens || !out) return;
+    int E = m->cfg.n_experts, A = m->cfg.n_active;
+    fprintf(out, "route telemetry: layers=%d experts=%d topk=%d\n",
+            m->cfg.n_layers, E, A);
+    for (int L = 0; L < m->cfg.n_layers; ++L) {
+        const uint64_t *h = m->route_hits + (size_t)L * E;
+        uint64_t total = m->route_tokens[L] * (uint64_t)A;
+        if (!total) continue;
+        uint64_t covered = 0;
+        int chosen[8] = {0};
+        fprintf(out, "  L%02d tokens=%llu hot=", L,
+                (unsigned long long)m->route_tokens[L]);
+        for (int k = 0; k < 8 && k < E; ++k) {
+            int best = -1;
+            for (int e = 0; e < E; ++e) {
+                int used = 0;
+                for (int j = 0; j < k; ++j) if (chosen[j] == e) used = 1;
+                if (!used && (best < 0 || h[e] > h[best])) best = e;
+            }
+            chosen[k] = best; covered += h[best];
+            fprintf(out, "%s%d:%llu", k ? "," : "", best,
+                    (unsigned long long)h[best]);
+        }
+        fprintf(out, " hot8_coverage=%.2f%%\n", 100.0 * (double)covered / (double)total);
+    }
+}
+
 /* ===================== synthetic KV warm (ctx benchmark) =====================
  * Fill every layer's KV cache positions [0,npos) with bounded synthetic latents
  * so decode-attn cost at a large context can be measured WITHOUT running npos
@@ -6490,6 +6539,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
             int idx[8]; float wt[8];
             ds4f_topk_exact(m->p_router + (size_t)mm*c->n_experts, ly->gate_bias,
                             c->n_experts, c->n_active, idx, wt, c->routed_scale);
+            ds4f_route_observe(m, L, idx, c->n_active);
             float *route = m->p_route + (size_t)mm*C;
             for (int i = 0; i < C; i++) route[i] = 0.f;
             for (int k = 0; k < c->n_active; k++) {
@@ -6607,18 +6657,42 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
     ds4f_config *c = &m->cfg;
     int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD, og = c->o_groups, gin = H/og;
     float eps = 1e-6f; int hc = c->hc_mult; size_t hcC = (size_t)hc*C;
-    if (K > 128) { fprintf(stderr, "ds4f_forward_verify: K=%d > 128\n", K); abort(); }
+    if (K < 1 || K > m->m_tile) {
+        fprintf(stderr, "ds4f_forward_verify: K=%d outside allocated tile [1,%d]\n",
+                K, m->m_tile);
+        abort();
+    }
     size_t snap_stride = snaps ? ds4f_tb2_snap_bytes(m) : 0, snap_loff = 0;
-    float pa[128][16], ca[128][64], pf[128][16], cf[128][64];    /* per-position sinkhorn weights */
+    /* Per-position sinkhorn weights.  These used to be fixed [128] stack
+     * arrays because this routine was only a speculative-decode verifier.
+     * Production prompt prefill uses the same exact causal path in tiles, so
+     * size the scratch from the allocated tile instead. */
+    float *hc_scratch = (float *)malloc((size_t)K * (16 + 64 + 16 + 64) * sizeof(float));
+    if (!hc_scratch) { fprintf(stderr, "ds4f_forward_verify: sinkhorn scratch allocation failed\n"); abort(); }
+    float *pa = hc_scratch;
+    float *ca = pa + (size_t)K * 16;
+    float *pf = ca + (size_t)K * 64;
+    float *cf = pf + (size_t)K * 16;
     if (!m->v_x4) { size_t vb = (size_t)m->m_tile*hcC*4;
         m->v_x4 = (float *)ds4f_mem_alloc(m->mem, vb, 256, 1); m->v_resid = (float *)ds4f_mem_alloc(m->mem, vb, 256, 1); }
     for (int k = 0; k < K; k++) for (int s = 0; s < hc; s++)   /* expand each input into hc streams */
         memcpy(m->v_x4 + (size_t)k*hcC + (size_t)s*C, X + (size_t)k*C, (size_t)C*4);
     for (int L = 0; L < c->n_layers; L++) {
         ds4f_layer *ly = &m->layers[L];
-        if (m->gpu_dense_layer_begin &&
+        if (m->gpu_dense_layer_prefetch && m->gpu_dense_stream_prefill_only &&
+            m->gpu_dense_layer_prefetch(m->gpu_dense_ctx, ly) != 0) {
+            fprintf(stderr, "ds4f: GPU layer prefetch failed at layer %d\n", L);
+            abort();
+        }
+        if (m->gpu_dense_layer_begin && m->gpu_dense_stream_prefill_only &&
             m->gpu_dense_layer_begin(m->gpu_dense_ctx, ly) != 0) {
             fprintf(stderr, "ds4f: GPU layer residency setup failed at layer %d\n", L);
+            abort();
+        }
+        if (m->gpu_dense_layer_prefetch && m->gpu_dense_stream_prefill_only &&
+            L + 1 < c->n_layers &&
+            m->gpu_dense_layer_prefetch(m->gpu_dense_ctx, &m->layers[L + 1]) != 0) {
+            fprintf(stderr, "ds4f: GPU layer prefetch failed after layer %d\n", L);
             abort();
         }
         int ratio = c->compress_ratios[L];
@@ -6626,7 +6700,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         const float *rsin = ratio ? m->rope_comp_sin : m->rope_dense_sin;
         /* mHC pre: one pooled mix/RMS/sinkhorn/collapse sequence for the whole tile. */
         ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_attn_fn, ly->hc_attn_scale, ly->hc_attn_base,
-                          m->p_x, &pa[0][0], 16, &ca[0][0], 64);
+                          m->p_x, pa, 16, ca, 64);
         memcpy(m->v_resid, m->v_x4, (size_t)K*hcC*4);
         /* batched q/kv projections */
         { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, ly->attn_norm, C, K, C, C };
@@ -6680,10 +6754,10 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_gemm(m, m->p_o1 + (size_t)g*c->o_lora, &vg, m->p_attn + (size_t)g*gin, K, c->o_inter, H);
         }
         ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);
-        ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, &pa[0][0], 16, &ca[0][0], 64);
+        ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, pa, 16, ca, 64);
         /* mHC pre (ffn). */
         ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_ffn_fn, ly->hc_ffn_scale, ly->hc_ffn_base,
-                          m->p_x, &pf[0][0], 16, &cf[0][0], 64);
+                          m->p_x, pf, 16, cf, 64);
         memcpy(m->v_resid, m->v_x4, (size_t)K*hcC*4);
         { ds4f_pf_rms_task t = { m, m->p_h2, m->p_x, ly->ffn_norm, C, K, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
@@ -6721,6 +6795,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
               int idx[8]; float wt[8];
               ds4f_topk_exact(m->p_router + (size_t)k*c->n_experts, ly->gate_bias,
                               c->n_experts, c->n_active, idx, wt, c->routed_scale);
+              ds4f_route_observe(m, L, idx, c->n_active);
               float *route = m->p_route + (size_t)k*C;
               for (int i = 0; i < C; i++) route[i] = 0.f;
               for (int a = 0; a < c->n_active; a++) {
@@ -6752,7 +6827,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             float *mo = m->p_moe + (size_t)k*C, *ro = m->p_route + (size_t)k*C, *o = m->p_o + (size_t)k*C;
             for (int i = 0; i < C; i++) o[i] = (tps ? 0.f : mo[i]) + ro[i];
         }
-        ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, &pf[0][0], 16, &cf[0][0], 64);
+        ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, pf, 16, cf, 64);
     }
     /* head: per-position hc_head collapse -> out_norm (batched) -> lm_head GEMM -> per-position argmax */
     for (int k = 0; k < K; k++) ds4f_hc_head(m, m->v_x4 + (size_t)k*hcC, m->p_x + (size_t)k*C);
@@ -6773,6 +6848,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
       if (tph && m->ar_argmax_cb) for (int k = 0; k < K; k++) { int32_t idx = out_tok[k]; float v = hval[k];
           m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[k] = idx; } }
     if (out_hc) memcpy(out_hc, m->v_x4, (size_t)K*hcC*4);
+    free(hc_scratch);
 }
 
 /* DS4F_MTP forward (STUB -- scaffold only). Predicts the token after `next_id` given the main model's
@@ -7120,6 +7196,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             ds4f_topk_exact(m->s_router, ly->gate_bias, c->n_experts, c->n_active, idx, wt, c->routed_scale);
         else
             ds4f_topk(m->s_router, c->n_experts, c->n_active, idx, wt, c->routed_scale);
+        ds4f_route_observe(m, L, idx, c->n_active);
         if (ds4f_dbg) { fprintf(stderr, "  L%-2d topk wt=", L);
             for (int k=0;k<c->n_active;k++) fprintf(stderr,"%.3f(e%d) ", wt[k], idx[k]);
             fprintf(stderr,"\n"); }

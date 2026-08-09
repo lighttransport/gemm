@@ -972,6 +972,7 @@ int main(int argc, char **argv) {
             pass &= benchmark_prefill(m, hip, dual, prefill_batch, prefill_context, &opt, prefill_repeat, dual_cuda_small, skip_cpu_ref);
     }
     printf("%s\n", pass ? "PASS" : "FAIL");
+    ds4f_route_report(m, stderr);
 
     dual_ds4f_prefill_destroy(dual);
     hip_ds4f_dense_destroy(hip);
