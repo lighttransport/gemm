@@ -929,7 +929,7 @@ static void ds4f_matvec_blockdiag(ds4f_model *m, float *dst, const ds4f_tensor *
  * mHC mixes) falls back to a per-token matvec loop. K-tile reassociation makes the
  * result bit-SIMILAR (~1e-4) to the single-token matvec. */
 #ifndef DS4F_MAX_MTILE
-#define DS4F_MAX_MTILE 512          /* >=512: bigger routed-expert buckets amortize weight reads/decode; also unlocks the CUDA MMQ's fixed per-layer cost over larger batches */
+#define DS4F_MAX_MTILE 4096         /* large routed-expert buckets amortize weight decode; activation scratch grows on demand */
 #endif
 typedef struct { ds4f_model *m; float *Y; const ds4f_tensor *t;
                  const float *X; int M, Ystride, Xstride;
@@ -6509,6 +6509,10 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         /* ---- grouped low-rank o-projection ---- */
         { DS4F_TIC();
         int tpo = (m->oi_rows < c->o_inter);   /* TP_OPROJ: wo_a o_inter row-shard (wo_b full over zero-pad) */
+        int gpu_oproj = !tpo && m->gpu_oproj && ly->wo_a.gpu_id >= 0 && ly->wo_b.gpu_id >= 0 &&
+            m->gpu_oproj(m->gpu_dense_ctx,m->p_o,&ly->wo_a,&ly->wo_b,m->p_attn,
+                         M,og,gin,c->o_lora,H,C,c->o_inter)==0;
+        if(!gpu_oproj){
         ds4f_gemm_task *o_tasks = (ds4f_gemm_task *)alloca((size_t)c->o_groups * sizeof(*o_tasks));
         ds4f_tensor *o_views = (ds4f_tensor *)alloca((size_t)c->o_groups * sizeof(*o_views));
         int no_tasks = 0;
@@ -6537,6 +6541,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         ds4f_gemm_multi(m, o_tasks, no_tasks);
         ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, M, C, c->o_inter);   /* p_o = PARTIAL if tpo */
         if (tpo && m->ar_cb) m->ar_cb(m->p_o, C*M, m->ar_ctx);        /* attention-residual reduce (sum partials) */
+        }
         for (int mm = 0; mm < M; mm++) { float *x = m->p_x + (size_t)mm*C, *o = m->p_o + (size_t)mm*C;
             for (int i = 0; i < C; i++) x[i] += o[i]; }
         DS4F_TOC(DS4F_P_OPROJ); }

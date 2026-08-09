@@ -6,12 +6,35 @@
 
 using namespace nvcuda;
 
+extern "C" __global__ void ds4f_cuda_prefill_attn(
+        float *Y,const uint16_t *KV,const float *Q,const float *sink,
+        int M,int pos0,int n_heads,int head_dim,int kv_dim,int kv_slots,
+        int window,float scale){
+    int group=blockIdx.x,warp=threadIdx.x>>5,lane=threadIdx.x&31,groups=(n_heads+7)>>3;
+    if(group>=M*groups||warp>=8)return;
+    int mm=group/groups,h=(group%groups)*8+warp;if(h>=n_heads)return;
+    int pos=pos0+mm,lo=pos-window+1;if(lo<0)lo=0;int np=pos-lo+1;
+    __shared__ float sm[8][129];const float *q=Q+((size_t)mm*n_heads+h)*head_dim;
+    for(int j=0;j<np;j++){
+        const uint16_t *k=KV+(size_t)((lo+j)%kv_slots)*kv_dim;float dot=0.f;
+        for(int d=lane;d<kv_dim;d+=32)dot=fmaf(q[d],__bfloat162float(*((const __nv_bfloat16 *)(k+d))),dot);
+        for(int off=16;off;off>>=1)dot+=__shfl_down_sync(0xffffffff,dot,off);
+        if(lane==0)sm[warp][j]=dot*scale;
+    }
+    __syncwarp();
+    if(lane==0){float mx=-1.e30f;for(int j=0;j<np;j++)mx=fmaxf(mx,sm[warp][j]);float den=expf(sink[h]-mx);for(int j=0;j<np;j++){sm[warp][j]=expf(sm[warp][j]-mx);den+=sm[warp][j];}sm[warp][128]=1.f/den;}
+    __syncwarp();float inv=sm[warp][128];
+    for(int d=lane;d<head_dim;d+=32){float out=0.f;if(d<kv_dim)for(int j=0;j<np;j++){const uint16_t *v=KV+(size_t)((lo+j)%kv_slots)*kv_dim;out=fmaf(sm[warp][j]*inv,__bfloat162float(*((const __nv_bfloat16 *)(v+d))),out);}Y[((size_t)mm*n_heads+h)*head_dim+d]=out;}
+}
+
 extern "C" __global__ void ds4f_cuda_swiglu(
         float *g, const float *u, size_t n, float lim) {
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n){float a=fminf(g[i],lim),b=fminf(fmaxf(u[i],-lim),lim);
         g[i]=(a/(1.0f+expf(-a)))*b;}
 }
+extern "C" __global__ void ds4f_cuda_scatter_group(float *dst,const float *src,
+        int M,int width,int stride,int off){size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x,n=(size_t)M*width;if(i<n){int r=(int)(i/width),c=(int)(i%width);dst[(size_t)r*stride+off+c]=src[i];}}
 
 /* Per-row, per-32 activation quantization for SM120 native MXFP8. */
 extern "C" __global__ void ds4f_cuda_quant_fp8_vec128(

@@ -440,6 +440,9 @@ typedef int (*ds4f_gpu_dense_wait_fn)(void *ctx);
 typedef int (*ds4f_gpu_shared_ffn_fn)(
     void *ctx, float *dst, const ds4f_tensor *w1, const ds4f_tensor *w3,
     const ds4f_tensor *w2, const float *x, int M, int inter, int C, float lim);
+typedef int (*ds4f_gpu_oproj_fn)(void *ctx,float *dst,const ds4f_tensor *wa,
+    const ds4f_tensor *wb,const float *x,int M,int groups,int gin,int lora,
+    int H,int C,int ointer);
 typedef int (*ds4f_gpu_dense_blockdiag_fn)(
     void *ctx, float *dst, const ds4f_tensor *t, const float *xbase,
     int gin, int glora, int goff);
@@ -509,6 +512,7 @@ typedef struct {
     ds4f_gpu_dense_async_multi_fn gpu_dense_async_multi;
     ds4f_gpu_dense_wait_fn gpu_dense_wait;
     ds4f_gpu_shared_ffn_fn gpu_shared_ffn;
+    ds4f_gpu_oproj_fn gpu_oproj;
     ds4f_gpu_dense_blockdiag_fn gpu_dense_blockdiag;
     ds4f_gpu_dense_gemm_fn gpu_dense_gemm;
     ds4f_gpu_dense_gemm_multi_fn gpu_dense_gemm_multi;

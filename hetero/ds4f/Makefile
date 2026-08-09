@@ -42,13 +42,13 @@ $(BUILD)/test_cuda_ds4f_real_dense: test_cuda_ds4f_real_dense.c cuda_ds4f_dense.
                                      cuda_ds4f_dense.h ../../common/ds4f.h \
                                      ../../common/ds4f_impl.h ../../cuda/cuew.c | $(BUILD)
 	$(CC) $(CFLAGS) $(INCS) -I../../cuda -o $@ test_cuda_ds4f_real_dense.c \
-		cuda_ds4f_dense.c ../../cuda/cuew.c ../../cuda/cublasew.c $(LDFLAGS)
+		cuda_ds4f_dense.c cuda_ds4f_mxfp4.c ../../cuda/cuew.c ../../cuda/cublasew.c $(LDFLAGS)
 
-$(BUILD)/test_cuda_ds4f_prefill: test_cuda_ds4f_prefill.c cuda_ds4f_dense.c \
+$(BUILD)/test_cuda_ds4f_prefill: test_cuda_ds4f_prefill.c cuda_ds4f_dense.c cuda_ds4f_mxfp4.c \
                                   cuda_ds4f_dense.h ../../common/ds4f.h \
                                   ../../common/ds4f_impl.h ../../cuda/cuew.c | $(BUILD)
 	$(CC) $(CFLAGS) $(INCS) -I../../cuda -o $@ test_cuda_ds4f_prefill.c \
-		cuda_ds4f_dense.c ../../cuda/cuew.c ../../cuda/cublasew.c $(LDFLAGS)
+		cuda_ds4f_dense.c cuda_ds4f_mxfp4.c ../../cuda/cuew.c ../../cuda/cublasew.c $(LDFLAGS)
 
 $(BUILD)/test_hip_ds4f_real: test_hip_ds4f_real.c hip_ds4f_dense.c \
                              dual_ds4f_prefill.c dual_ds4f_prefill.h \

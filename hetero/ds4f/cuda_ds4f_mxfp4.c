@@ -137,8 +137,11 @@ void cuda_ds4f_mxfp4_destroy(cuda_ds4f_mxfp4 *c) {
     if (c->quant_done) cuEventDestroy(c->quant_done); if (c->stream) cuStreamDestroy(c->stream); if (c->mod) cuModuleUnload(c->mod);
     if (c->ctx) cuDevicePrimaryCtxRelease(c->dev); free(c);
 }
-int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s, int rows, int cols) {
-    if (!c || !w || !s || rows <= 0 || cols <= 0 || (cols & 127)) return -1;
+static int cuda_ds4f_mxfp4_load_any(cuda_ds4f_mxfp4 *c, const uint8_t *w,
+                                    const uint8_t *s, const uint8_t *packed,
+                                    int rows, int cols) {
+    if (!c || (!packed && (!w || !s)) || rows <= 0 || cols <= 0 || (cols & 127)) return -1;
+    const void *wkey=packed?packed:w,*skey=packed?packed:s;
     if (cuCtxSetCurrent(c->ctx) != CUDA_SUCCESS) return -1;
     size_t nb = (size_t)cols / 32, bytes = (size_t)rows * nb * 17, rb = (size_t)cols / 2;
     if (c->active_cache_slot < 0 && c->w &&
@@ -148,7 +151,7 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     }
     for (int i = 0; i < DS4F_CUDA_MXFP4_CACHE_SLOTS; ++i) {
         cuda_mxfp4_cache_entry *e = &c->cache[i];
-        if (e->valid && e->wkey == w && e->skey == s &&
+        if (e->valid && e->wkey == wkey && e->skey == skey &&
             e->rows == rows && e->cols == cols) {
             c->cache_hits++;
             e->age = ++c->cache_age;
@@ -158,15 +161,17 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
             return 0;
         }
     }
-    if (!cuMemHostAlloc || !cuMemFreeHost) return -1;
-    if (c->hwb < bytes) {
-        if (c->hw) cuMemFreeHost(c->hw);
-        c->hw = NULL; c->hwb = 0;
-        if (cuMemHostAlloc(&c->hw, bytes, 0) != CUDA_SUCCESS) return -1;
-        c->hwb = bytes;
-    }
-    uint8_t *p = (uint8_t *)c->hw;
-    for (int r = 0; r < rows; ++r) for (size_t b = 0; b < nb; ++b) {
+    uint8_t *p=(uint8_t *)packed;
+    if(!p){
+      if (!cuMemHostAlloc || !cuMemFreeHost) return -1;
+      if (c->hwb < bytes) {
+          if (c->hw) cuMemFreeHost(c->hw);
+          c->hw = NULL; c->hwb = 0;
+          if (cuMemHostAlloc(&c->hw, bytes, 0) != CUDA_SUCCESS) return -1;
+          c->hwb = bytes;
+      }
+      p = (uint8_t *)c->hw;
+      for (int r = 0; r < rows; ++r) for (size_t b = 0; b < nb; ++b) {
         uint8_t *q = p + ((size_t)r * nb + b) * 17; uint8_t e = s[(size_t)r * nb + b];
         /* DS4F's on-disk LUT is 2x the native E2M1 LUT, so e-1 plus
          * the 2x LUT is numerically equivalent to native LUT with e. */
@@ -179,6 +184,7 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
             uint8_t hi = (src[8 + j / 2] >> ((j & 1) * 4)) & 0xf;
             q[1 + j] = (uint8_t)(lo | (hi << 4));
         }
+      }
     }
     c->active_cache_slot = -1;
     int slot = -1;
@@ -231,12 +237,18 @@ int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c, const uint8_t *w, const uint8_t *s,
     }
     if (slot >= 0) {
         cuda_mxfp4_cache_entry *e = &c->cache[slot];
-        e->wkey = w; e->skey = s; e->d = d; e->bytes = bytes;
+        e->wkey = wkey; e->skey = skey; e->d = d; e->bytes = bytes;
         e->age = ++c->cache_age; e->rows = rows; e->cols = cols; e->valid = 1;
         c->cache_bytes += bytes; c->active_cache_slot = slot;
     }
     c->w = d; c->wb = bytes; c->rows = rows; c->cols = cols;
     return 0;
+}
+int cuda_ds4f_mxfp4_load(cuda_ds4f_mxfp4 *c,const uint8_t *w,const uint8_t *s,int rows,int cols){
+    return cuda_ds4f_mxfp4_load_any(c,w,s,NULL,rows,cols);
+}
+int cuda_ds4f_mxfp4_load_packed(cuda_ds4f_mxfp4 *c,const uint8_t *p,int rows,int cols){
+    return cuda_ds4f_mxfp4_load_any(c,NULL,NULL,p,rows,cols);
 }
 static int cuda_ds4f_mxfp4_gemm_once(cuda_ds4f_mxfp4 *c, float *dst,
                                      const float *x, int M, int N, int K,
@@ -420,9 +432,10 @@ int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x,
  * device pointers, and a temp (non-cached) weight would be freed underneath a
  * queued kernel, so it returns -1 and the caller falls back to the per-call
  * path. */
-int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
+static int cuda_ds4f_mxfp4_gemm_batch_any(cuda_ds4f_mxfp4 *c, int n,
     float *const *dst, const uint8_t *const *w, const uint8_t *const *s,
-    const float *const *x, const int *M, const int *rows, const int *cols) {
+    const float *const *x, const int *M, const int *rows, const int *cols,
+    int packed) {
     static int dbg = -1, dbg_cnt = 0;
     if (dbg < 0) { const char *d = getenv("DS4F_DBG_BATCH"); dbg = d ? atoi(d) : 0; }
     struct timespec t0, t1;
@@ -442,7 +455,9 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
     CUdeviceptr dw[32]; int use64[32], Mp[32], sk[32], ntx[32], fix[32];
     /* pass 1: load every weight; all must be resident (no temp). */
     for (int i = 0; i < n; ++i) {
-        if (cuda_ds4f_mxfp4_load(c, w[i], s[i], rows[i], cols[i]) != 0) return -1;
+        int lrc=packed?cuda_ds4f_mxfp4_load_packed(c,w[i],rows[i],cols[i]):
+                       cuda_ds4f_mxfp4_load(c,w[i],s[i],rows[i],cols[i]);
+        if(lrc!=0)return -1;
         if (c->active_cache_slot < 0) return -1;   /* temp: not batch-safe */
         dw[i] = c->w;
         int N = rows[i], mm = M[i];
@@ -556,15 +571,8 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
             void *aa[] = { &B->y, &B->y2, &total };
             if (cuLaunchKernel(c->add, (total + 255) / 256, 1, 1, 256, 1, 1, 0, c->stream, aa, NULL) != CUDA_SUCCESS) return -1;
         }
-        /* Drain per task: on a single FIFO stream the kernels serialize anyway,
-         * and an error here is caught at the offending task instead of the
-         * whole dispatch (which used to poison the context for everything
-         * queued behind it). */
-        CUresult rr = cuStreamSynchronize(c->stream);
-        if (rr != CUDA_SUCCESS) {
-            if (dbg > 1) { const char *es = NULL; if (cuGetErrorString) cuGetErrorString(rr, &es); fprintf(stderr, "TASK %d M=%d N=%d K=%d sync %d %s\n", i, mm, N, K, rr, es ? es : "?"); }
-            return -1;
-        }
+        CUresult rr=cuStreamSynchronize(c->stream);
+        if(rr!=CUDA_SUCCESS)return -1;
     }
     if (dbg) {
         clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -583,6 +591,12 @@ int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c, int n,
             memcpy(dst[i] + (size_t)r * N, (float *)B->hy + (size_t)r * N, (size_t)N * sizeof(float));
     }
     return 0;
+}
+int cuda_ds4f_mxfp4_gemm_batch(cuda_ds4f_mxfp4 *c,int n,float *const *dst,const uint8_t *const *w,const uint8_t *const *s,const float *const *x,const int *M,const int *rows,const int *cols){
+    return cuda_ds4f_mxfp4_gemm_batch_any(c,n,dst,w,s,x,M,rows,cols,0);
+}
+int cuda_ds4f_mxfp4_gemm_batch_packed(cuda_ds4f_mxfp4 *c,int n,float *const *dst,const uint8_t *const *p,const float *const *x,const int *M,const int *rows,const int *cols){
+    return cuda_ds4f_mxfp4_gemm_batch_any(c,n,dst,p,NULL,x,M,rows,cols,1);
 }
 
 /* Preload a weight into the cache so the async batch's loads are hits.  The
