@@ -932,7 +932,9 @@ static void ds4f_matvec_blockdiag(ds4f_model *m, float *dst, const ds4f_tensor *
 #define DS4F_MAX_MTILE 512          /* >=512: bigger routed-expert buckets amortize weight reads/decode; also unlocks the CUDA MMQ's fixed per-layer cost over larger batches */
 #endif
 typedef struct { ds4f_model *m; float *Y; const ds4f_tensor *t;
-                 const float *X; int M, Ystride, Xstride; } ds4f_gemm_task;
+                 const float *X; int M, Ystride, Xstride;
+                 const int8_t *mx_xq; const float *mx_xs, *mx_xc, *mx_xp;
+               } ds4f_gemm_task;
 /* thread-local L1 scratch for the FUSED FP8->bf16 prefill GEMM (grow-on-demand).
  * Holds 4 PV pair-buffers (4 x 2*TILE_K halfwords = 8 KB for one 8-row group's
  * current K-tile); the FP8 weight is dequanted into it tile-by-tile and consumed
@@ -1198,11 +1200,12 @@ static void ds4f_gemm_worker_x86(void *arg, int tid, int nthr) {
          * four tokens instead of repeated M times.  Per-token results are
          * bit-identical to the token-at-a-time path below. */
         if (M >= 4 && !ds4f_mxfp4_w4a8_on(T->m)) {
-            float *xp = ds4f_mxfp4_xperm_n(K, M);
+            float *xp = (float *)T->mx_xp;
+            if (!xp) xp = ds4f_mxfp4_xperm_n(K, M);
             if (xp) {
-                for (int mm = 0; mm < M; mm++)
-                    ds4f_mxfp4_perm_act_f32(T->X + (size_t)mm * Xs, K,
-                                            xp + (size_t)mm * K);
+                if (!T->mx_xp) for (int mm = 0; mm < M; mm++)
+                        ds4f_mxfp4_perm_act_f32(T->X + (size_t)mm * Xs, K,
+                                                xp + (size_t)mm * K);
                 for (int i = r0; i + 7 < r1; i += 8) {
                     const uint8_t *w = (const uint8_t *)t->w + (size_t)i * rb;
                     const uint8_t *s = t->scale + (size_t)i * sb;
@@ -1224,9 +1227,11 @@ static void ds4f_gemm_worker_x86(void *arg, int tid, int nthr) {
             }
         }
         if (M >= 4 && ds4f_mxfp4_w4a8_on(T->m)) {
-            int8_t *xq = NULL; float *xs = NULL, *xc = NULL;
-            if (ds4f_mxfp4_xscratch_n(K, M, &xq, &xs, &xc) == 0) {
-                for (int mm = 0; mm < M; mm++)
+            int8_t *xq = (int8_t *)T->mx_xq;
+            float *xs = (float *)T->mx_xs, *xc = (float *)T->mx_xc;
+            int ready = xq && xs && xc;
+            if (ready || ds4f_mxfp4_xscratch_n(K, M, &xq, &xs, &xc) == 0) {
+                if (!ready) for (int mm = 0; mm < M; mm++)
                     ds4f_mxfp4_quant_act_raw(T->X + (size_t)mm * Xs, K,
                                              xq + (size_t)mm * K,
                                              xs + (size_t)mm * (K / 32),
@@ -1369,7 +1374,7 @@ static void ds4f_gemm(ds4f_model *m, float *Y, const ds4f_tensor *t,
         t->type == DS4F_Q8_PV   || t->type == DS4F_FP8) {
         m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols)    /* read once across all M */
                        + ds4f_sbytes(t->type, t->rows, t->cols);   /* MXFP4/FP8 block scales */
-        ds4f_gemm_task T = { m, Y, t, X, M, Ystride, Xstride };
+        ds4f_gemm_task T = { m, Y, t, X, M, Ystride, Xstride, NULL, NULL, NULL, NULL };
         ds4f_pool_run(m->pool, ds4f_gemm_worker, &T);
     } else
 #elif defined(__AVX2__) && defined(__FMA__)
@@ -1377,7 +1382,7 @@ static void ds4f_gemm(ds4f_model *m, float *Y, const ds4f_tensor *t,
         t->type == DS4F_FP8) {
         m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols)
                        + ds4f_sbytes(t->type, t->rows, t->cols);
-        ds4f_gemm_task T = { m, Y, t, X, M, Ystride, Xstride };
+        ds4f_gemm_task T = { m, Y, t, X, M, Ystride, Xstride, NULL, NULL, NULL, NULL };
         ds4f_pool_run(m->pool, ds4f_gemm_worker_x86, &T);
     } else
 #endif
@@ -1400,6 +1405,46 @@ static void ds4f_gemm(ds4f_model *m, float *Y, const ds4f_tensor *t,
  * them together removes wake/barrier gaps without changing any GEMM's row or K
  * reduction order. */
 typedef struct { ds4f_gemm_task *tasks; int n; } ds4f_gemm_multi_task;
+
+/* Quantize/permute each distinct routed activation bucket once on the caller
+ * instead of once per pool worker. Gate/up tasks share the same prepared
+ * buffer. The old worker-local preparation repeated M*K work 16 times. */
+static int ds4f_gemm_prepare_mxfp4(ds4f_gemm_task *q, ds4f_gemm_task *prev,
+                                   int nprev, void **owned, int *nowned) {
+    if (!q || q->M < 4 || q->t->type != DS4F_MXFP4 || !q->m->mxfp4_raw) return 0;
+    int K = q->t->cols;
+    for (int i = 0; i < nprev; ++i) {
+        ds4f_gemm_task *p = &prev[i];
+        if (p->X == q->X && p->M == q->M && p->Xstride == q->Xstride &&
+            p->t->cols == K) {
+            q->mx_xq = p->mx_xq; q->mx_xs = p->mx_xs;
+            q->mx_xc = p->mx_xc; q->mx_xp = p->mx_xp;
+            if (q->mx_xq || q->mx_xp) return 0;
+        }
+    }
+    size_t ne = (size_t)q->M * (size_t)K;
+    if (ds4f_mxfp4_w4a8_on(q->m)) {
+        size_t nb = ne / 32;
+        uint8_t *mem = (uint8_t *)ds4f_map_alloc(ne + 2 * nb * sizeof(float), 64, 0);
+        if (!mem) return -1;
+        q->mx_xq = (int8_t *)mem; q->mx_xs = (float *)(mem + ne);
+        q->mx_xc = q->mx_xs + nb;
+        for (int mm = 0; mm < q->M; ++mm) ds4f_mxfp4_quant_act_raw(
+            q->X + (size_t)mm*q->Xstride, K,
+            (int8_t *)q->mx_xq + (size_t)mm*K,
+            (float *)q->mx_xs + (size_t)mm*(K/32),
+            (float *)q->mx_xc + (size_t)mm*(K/32));
+        owned[(*nowned)++] = mem;
+    } else {
+        float *xp = (float *)ds4f_map_alloc(ne * sizeof(float), 64, 0);
+        if (!xp) return -1;
+        q->mx_xp = xp;
+        for (int mm = 0; mm < q->M; ++mm) ds4f_mxfp4_perm_act_f32(
+            q->X + (size_t)mm*q->Xstride, K, xp + (size_t)mm*K);
+        owned[(*nowned)++] = xp;
+    }
+    return 0;
+}
 
 static void ds4f_gemm_multi_worker(void *arg, int tid, int nthr) {
     ds4f_gemm_multi_task *T = (ds4f_gemm_multi_task *)arg;
@@ -1490,8 +1535,17 @@ static void ds4f_gemm_multi(ds4f_model *m, ds4f_gemm_task *tasks, int n) {
         for (int i = 0; i < n; i++)
             m->bytes_read += ds4f_wbytes(tasks[i].t->type, tasks[i].t->rows, tasks[i].t->cols)
                            + ds4f_sbytes(tasks[i].t->type, tasks[i].t->rows, tasks[i].t->cols);
+        void **owned = (void **)alloca((size_t)n * sizeof(void *));
+        int nowned = 0;
+        for (int i = 0; i < n; i++)
+            (void)ds4f_gemm_prepare_mxfp4(&tasks[i], tasks, i, owned, &nowned);
         ds4f_gemm_multi_task T = { tasks, n };
         ds4f_pool_run(m->pool, ds4f_gemm_multi_worker, &T);
+        for (int i = 0; i < n; i++) {
+            tasks[i].mx_xq = NULL; tasks[i].mx_xs = NULL;
+            tasks[i].mx_xc = NULL; tasks[i].mx_xp = NULL;
+        }
+        for (int i = 0; i < nowned; i++) ds4f_map_free(owned[i]);
         return;
     }
 #endif
@@ -1506,8 +1560,8 @@ static void ds4f_gemm_pair(ds4f_model *m,
                            const float *X, int M,
                            int Ystride0, int Ystride1, int Xstride) {
     ds4f_gemm_task tasks[2] = {
-        { m, Y0, t0, X, M, Ystride0, Xstride },
-        { m, Y1, t1, X, M, Ystride1, Xstride }
+        { m, Y0, t0, X, M, Ystride0, Xstride, NULL, NULL, NULL, NULL },
+        { m, Y1, t1, X, M, Ystride1, Xstride, NULL, NULL, NULL, NULL }
     };
     ds4f_gemm_multi(m, tasks, 2);
 }
@@ -6472,13 +6526,13 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
                 int oi = no_tasks++;
                 o_views[oi] = ds4f_row_slice(&ly->wo_a, rlo - m->oi0, rhi - rlo);
                 o_tasks[oi] = (ds4f_gemm_task){ m, m->p_o1 + rlo, &o_views[oi],
-                    m->p_attn + (size_t)g*gin, M, c->o_inter, H };
+                    m->p_attn + (size_t)g*gin, M, c->o_inter, H, NULL, NULL, NULL, NULL };
             }
         } else for (int g = 0; g < og; g++) {
             int oi = no_tasks++;
             o_views[oi] = ds4f_row_slice(&ly->wo_a, g * c->o_lora, c->o_lora);
             o_tasks[oi] = (ds4f_gemm_task){ m, m->p_o1 + (size_t)g*c->o_lora, &o_views[oi],
-                m->p_attn + (size_t)g*gin, M, c->o_inter, H };
+                m->p_attn + (size_t)g*gin, M, c->o_inter, H, NULL, NULL, NULL, NULL };
         }
         ds4f_gemm_multi(m, o_tasks, no_tasks);
         ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, M, C, c->o_inter);   /* p_o = PARTIAL if tpo */
@@ -6516,11 +6570,11 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
          * their mixed FP8/BF16 tensor types. */
         ds4f_gemm_task shared_router[2];
         if (tps2) shared_router[0] = (ds4f_gemm_task){ m, m->p_exO, &ly->sh_w2,
-            m->p_shg, M, m->sh2_rows, c->shared_inter };
+            m->p_shg, M, m->sh2_rows, c->shared_inter, NULL, NULL, NULL, NULL };
         else shared_router[0] = (ds4f_gemm_task){ m, m->p_moe, &ly->sh_w2,
-            m->p_shg, M, C, c->shared_inter };   /* partial if tps */
+            m->p_shg, M, C, c->shared_inter, NULL, NULL, NULL, NULL };   /* partial if tps */
         shared_router[1] = (ds4f_gemm_task){ m, m->p_router, &ly->gate,
-            m->p_h2, M, c->n_experts, C };
+            m->p_h2, M, c->n_experts, C, NULL, NULL, NULL, NULL };
         if (shared_fused)   /* sh_w2 already done on the device */
             ds4f_gemm(m, m->p_router, &ly->gate, m->p_h2, M, c->n_experts, C);
         else
@@ -6578,17 +6632,17 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
             }
             gateup[ng++] = (ds4f_gemm_task){ m,
                 m->p_exG + (size_t)off*c->moe_inter, &ly->ex_w1[s],
-                m->p_exX + (size_t)off*C, cnt, c->moe_inter, C };
+                m->p_exX + (size_t)off*C, cnt, c->moe_inter, C, NULL, NULL, NULL, NULL };
             gateup[ng++] = (ds4f_gemm_task){ m,
                 m->p_exU + (size_t)off*c->moe_inter, &ly->ex_w3[s],
-                m->p_exX + (size_t)off*C, cnt, c->moe_inter, C };
+                m->p_exX + (size_t)off*C, cnt, c->moe_inter, C, NULL, NULL, NULL, NULL };
             sw[ns++] = (ds4f_pf_swiglu_task){ m,
                 m->p_exG + (size_t)off*c->moe_inter,
                 m->p_exU + (size_t)off*c->moe_inter,
                 c->moe_inter, cnt, c->moe_inter, c->moe_inter, c->swiglu_limit };
             down[nd++] = (ds4f_gemm_task){ m,
                 m->p_exO + (size_t)off*C, &ly->ex_w2[s],
-                m->p_exG + (size_t)off*c->moe_inter, cnt, C, c->moe_inter };
+                m->p_exG + (size_t)off*c->moe_inter, cnt, C, c->moe_inter, NULL, NULL, NULL, NULL };
         }
         ds4f_gemm_multi(m, gateup, ng);
         { ds4f_pf_swiglu_multi_task t = { sw, ns };
@@ -6625,9 +6679,14 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
                     sk, ds4f_trace_maxabs(m->p_kvlat, KV));
         }
     }
-    /* ---- head: out_norm + lm_head over all M tokens, then per-token argmax ---- */
+    /* ---- head: out_norm + lm_head. Production prompt ingestion needs only
+     * the final token's logits; full-token logits remain the parity-test default. */
     { DS4F_TIC();
-    { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, m->out_norm, C, M, C, C };
+    const char *last_e = getenv("DS4F_PREFILL_LAST_LOGITS");
+    int last_only = last_e && *last_e && atoi(last_e) != 0 && M > 1;
+    int HM = last_only ? 1 : M;
+    const float *hx = last_only ? m->p_x + (size_t)(M - 1) * C : m->p_x;
+    { ds4f_pf_rms_task t = { m, m->p_hn, hx, m->out_norm, C, HM, C, C };
       ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
     /* logits scratch reuses a per-token vocab buffer; allocate lazily once (sized full vocab). */
     if (!m->p_logits) m->p_logits = (float *)ds4f_mem_alloc(m->mem, (size_t)m->m_tile*(size_t)c->vocab*4, 256, 1);
@@ -6635,13 +6694,15 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
      * each token's local argmax (global index head_r0+best, local max value) is merged across the shards by
      * ar_argmax_cb (M small 2-float argmax all-reduces, ONCE -- cheap, unlike a full [M,vocab] logit reduce). */
     int hrows = m->head.rows, tph = (hrows < c->vocab);
-    ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, M, hrows, C);
-    { float *hval = tph ? (float *)alloca((size_t)M*4) : NULL;
-      ds4f_pf_argmax_task t = { m->p_logits, out_tok, hrows, M, m->head_r0, hval };
+    ds4f_gemm(m, m->p_logits, &m->head, m->p_hn, HM, hrows, C);
+    if (last_only) for (int mm = 0; mm < M - 1; ++mm) out_tok[mm] = -1;
+    int *hout = last_only ? out_tok + M - 1 : out_tok;
+    { float *hval = tph ? (float *)alloca((size_t)HM*4) : NULL;
+      ds4f_pf_argmax_task t = { m->p_logits, hout, hrows, HM, m->head_r0, hval };
       ds4f_pool_run(m->pool, ds4f_pf_argmax_worker, &t);
       if (tph && m->ar_argmax_cb)
-          for (int mm = 0; mm < M; mm++) { int32_t idx = out_tok[mm]; float v = hval[mm];
-              m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[mm] = idx; } }
+          for (int mm = 0; mm < HM; mm++) { int32_t idx = hout[mm]; float v = hval[mm];
+              m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); hout[mm] = idx; } }
     DS4F_TOC(DS4F_P_HEAD); }
 }
 
