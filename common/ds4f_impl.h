@@ -1668,6 +1668,19 @@ static void ds4f_tb2rope_worker(void *arg, int tid, int nthr) {
         ds4f_fp4_act_quant_inplace(qh, hd, 32);
     }
 }
+typedef struct { float *q; int K,H,hd,rd,pos0; const float *rcos,*rsin; } ds4f_tb2rope_batch_task;
+static void ds4f_tb2rope_batch_worker(void *arg, int tid, int nthr) {
+    ds4f_tb2rope_batch_task *T=(ds4f_tb2rope_batch_task *)arg;
+    long total=(long)T->K*T->H, per=total/nthr, ex=total%nthr;
+    long u0=per*tid+(tid<ex?tid:ex), u1=u0+per+(tid<ex?1:0);
+    for(long u=u0;u<u1;u++) {
+        int k=(int)(u/T->H), h=(int)(u%T->H);
+        float *qh=T->q+((size_t)k*T->H+h)*T->hd;
+        ds4f_rope_apply(qh+(T->hd-T->rd),T->rcos,T->rsin,T->pos0+k,T->rd/2,0);
+        ds4f_rotate_activation(qh,T->hd);
+        ds4f_fp4_act_quant_inplace(qh,T->hd,32);
+    }
+}
 
 /* Indexer decode step (model.py Indexer.forward, seqlen==1, start_pos>0): project q via wq_b,
  * per-head RoPE(last rd)+rotate+fp4; step the OWN (rotate) compressor (fills idx_kv_cache);
@@ -1691,8 +1704,10 @@ static int ds4f_index_step(
     if (s_cp_merge < 0) { const char *e = getenv("DS4F_CP_MERGE"); s_cp_merge = (e ? atoi(e) : 1); }
     int end_pos = start_pos + 1, half = rd / 2;
     double _tqp0 = ds4f_now();
+    static int s_qpre_rot=-1;
+    if (s_qpre_rot<0) { const char *e=getenv("DS4F_IDX_QPRE_ROT"); s_qpre_rot=(e&&*e)?atoi(e):1; }
     if (q_pre) {                                             /* verify prefill: q projection was batched */
-        memcpy(q_scr, q_pre, (size_t)H * hd * 4);
+        if (s_qpre_rot) q_scr=(float *)q_pre; else memcpy(q_scr, q_pre, (size_t)H * hd * 4);
     } else if (pool && wq_i8 && wq_i8_sc) {
         ds4f_i8w_matvec(pool,q_scr,wq_i8,wq_i8_sc,qr,H*hd,qlora);
     } else if (pool && w_bf16) {                             /* q = wq_b(qr), pooled bf16 */
@@ -1711,7 +1726,10 @@ static int ds4f_index_step(
     double _trp0 = ds4f_now();
     static int s_rope_par = -1;
     if (s_rope_par < 0) { const char *e = getenv("DS4F_TB2ROPE_PAR"); s_rope_par = (e && *e) ? atoi(e) : 1; }
-    if (pool && s_rope_par) {                                /* per-head RoPE+rotate+fp4, pooled (bit-exact) */
+    if (q_pre && s_qpre_rot) {
+        /* The batched verifier transformed every q_pre row once before the
+         * causal loop.  Avoid a memcpy plus a pool barrier for every token. */
+    } else if (pool && s_rope_par) {                          /* per-head RoPE+rotate+fp4, pooled (bit-exact) */
         ds4f_tb2rope_task rt = { q_scr, H, hd, rd, half, start_pos, rcos, rsin };
         ds4f_pool_run(pool, ds4f_tb2rope_worker, &rt);
     } else
@@ -5248,6 +5266,10 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             if (!m->v_idxq) m->v_idxq = (float *)aligned_alloc(256, (size_t)m->m_tile*idxHhd*4);
             ds4f_tensor idxwq = { ly->idx_wq_b, NULL, DS4F_BF16, idxHhd, c->q_lora };
             ds4f_gemm(m, m->v_idxq, &idxwq, m->p_qlat, K, idxHhd, c->q_lora);
+            { static int s_qpre_rot=-1; if(s_qpre_rot<0){const char *e=getenv("DS4F_IDX_QPRE_ROT");s_qpre_rot=(e&&*e)?atoi(e):1;}
+              if (s_qpre_rot) { ds4f_tb2rope_batch_task rt={m->v_idxq,K,c->index_n_heads, c->index_head_dim,
+                                                            c->qk_rope_dim, pos0, rcos, rsin};
+                ds4f_pool_run(m->pool,ds4f_tb2rope_batch_worker,&rt); } }
             idxg_pf = 1;
         }
         /* Layer-compressor wkv/wgate are position-independent linears.  The
