@@ -1365,6 +1365,23 @@ static void ds4f_idxsc8r_worker(void *arg, int tid, int nthr) {
         Tk->score[t] = acc;
     }
 }
+typedef struct { const int8_t *q8, *k8; const float *sq, *pscale, *weights;
+                 const int *Trow; int K, H, hd, stride; float *score; } ds4f_idxbatch_task;
+static void ds4f_idxbatch_worker(void *arg, int tid, int nthr) {
+    ds4f_idxbatch_task *T = (ds4f_idxbatch_task *)arg;
+    long total = 0; for (int k=0;k<T->K;k++) total += T->Trow[k];
+    long per=total/nthr, ex=total%nthr, u0=per*tid+(tid<ex?tid:ex), u1=u0+per+(tid<ex?1:0), base=0;
+    svbool_t pb=svptrue_b8(); int bf=(int)svcntb();
+    for (int k=0;k<T->K;k++) { int nt=T->Trow[k];
+        long a=u0>base?u0-base:0, b=u1>base?u1-base:0; if(a<nt&&b>0){if(b>nt)b=nt;
+            for(int t=(int)a;t<(int)b;t++){const int8_t *kt=T->k8+(size_t)t*T->hd;float ps=T->pscale[t],acc=0;
+                for(int h=0;h<T->H;h++){const int8_t *qh=T->q8+((size_t)k*T->H+h)*T->hd;svint32_t z=svdup_s32(0);
+                    for(int d=0;d<T->hd;d+=bf)z=svdot_s32(z,svld1_s8(pb,qh+d),svld1_s8(pb,kt+d));
+                    float dot=T->sq[(size_t)k*T->H+h]*ps*(float)svaddv_s32(svptrue_b32(),z);if(dot<0)dot=0;acc+=dot*T->weights[(size_t)k*T->H+h];}
+                T->score[(size_t)k*T->stride+t]=acc; }
+        } base+=nt;
+    }
+}
 /* int4 indexer cache (DS4F_IDX_INT4): same per-position scheme as ds4f_idx_quant_pos but +/-7,
  * 2 nibbles/byte -> idx_kv8_4 = nslot*hd/2 bytes (672->336 B/pos). The scan unpacks each
  * position's int4 key to an int8 temp (hd ops, amortized over H heads ~6%) then reuses svdot. */
@@ -3848,6 +3865,24 @@ static int ds4f_attn_tb2_gemm(ds4f_model *m,ds4f_attn_ex_task *at) {
  * indexer's q-lora input is m->s_qlat (q_norm(wq_a(s_hn))). For HCA(128) layers every
  * available compressed token is attended (arange); for CSA(4) the indexer scores them
  * and selects top-min(index_topk, T). ratio==0 (dense) => no-op, nsel=0. */
+static int ds4f_index_batch_prepare(ds4f_model *m, ds4f_layer *ly, int K, int pos0, int *sel_out) {
+    ds4f_config *c=&m->cfg; if(K<1 || pos0!=0 || !ly->idx_kv8 || ly->idx_cp_on || !m->v_idxq) return 0;
+    int H=c->index_n_heads, hd=c->index_head_dim, qd=H*hd, k=c->index_topk, C=c->hidden, ratio=4;
+    float *w=(float*)aligned_alloc(256,(size_t)K*H*4), *sq=(float*)aligned_alloc(256,(size_t)K*H*4);
+    int8_t *q8=(int8_t*)aligned_alloc(256,(size_t)K*qd), *selT=(int8_t*)0; int *tr=(int*)malloc((size_t)K*4);
+    float *sc=(float*)aligned_alloc(256,(size_t)K*(((K+ratio-1)/ratio)+1)*4); int stride=(K+ratio-1)/ratio+1;
+    if(!w||!sq||!q8||!tr||!sc){free(w);free(sq);free(q8);free(tr);free(sc);return 0;}
+    ds4f_tensor wt={ly->idx_wproj,NULL,DS4F_BF16,H,C}; ds4f_gemm(m,w,&wt,m->p_hn,K,H,C);
+    for(int z=0;z<K;z++){tr[z]=(z+1)/ratio; const float *q=m->v_idxq+(size_t)z*qd; 
+        for(int h=0;h<H;h++){float mx=0;for(int d=0;d<hd;d++){float a=q[h*hd+d];if(a<0)a=-a;if(a>mx)mx=a;}sq[(size_t)z*H+h]=mx/127.f;float iv=mx?127.f/mx:0;
+            for(int d=0;d<hd;d++){int v=(int)lrintf(q[h*hd+d]*iv);if(v>127)v=127;if(v<-127)v=-127;q8[((size_t)z*H+h)*hd+d]=(int8_t)v;}}
+        float *out=(float*)alloca((size_t)hd*4); if(ds4f_compress_step(m->p_hn+(size_t)z*C,C,hd,c->qk_rope_dim,ratio,z,ly->idx_cmp_wkv,ly->idx_cmp_wgate,1,ly->idx_cmp_ape,ly->idx_cmp_norm,m->rope_comp_cos,m->rope_comp_sin,c->norm_eps,1,ly->idx_cmp_kv_state,ly->idx_cmp_score_state,out,m->pool)){
+            int slot=z/ratio; ds4f_idx_quant_pos(out,hd,ly->idx_kv8+(size_t)slot*hd,&ly->idx_pscale[slot]); }}
+    ds4f_idxbatch_task task={q8,ly->idx_kv8,sq,ly->idx_pscale,w,tr,K,H,hd,stride,sc}; ds4f_pool_run(m->pool,ds4f_idxbatch_worker,&task);
+    for(int z=0;z<K;z++) ds4f_index_topk(sc+(size_t)z*stride,tr[z],tr[z],k,c->window_size,sel_out+(size_t)z*k);
+    free(w);free(sq);free(q8);free(tr);free(sc); (void)selT; return 1;
+}
+
 static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
                              const float *rcos, const float *rsin,
                              float *cmp_kv_pre, float *cmp_score_pre) {
@@ -3868,6 +3903,10 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
         else memcpy(ly->cmp_kv + (size_t)(pos/ratio)*KV, m->s_cmp_out, (size_t)KV*4);
     }
     m->prof[DS4F_P_TB2LCMP] += ds4f_now() - _tlc0;
+    if (m->s_idx_batch_sel && ratio == 4) {
+        int n = c->index_topk; memcpy(m->s_tb2_sel, m->s_idx_batch_sel + (size_t)pos*n, (size_t)n*sizeof(int));
+        int ns=0; while(ns<n && m->s_tb2_sel[ns]>=0){m->s_tb2_sel[ns]-=offset;ns++;} m->s_tb2_nsel=ns; return;
+    }
     int T = (pos + 1) / ratio;
     if (ratio == 4) {                                           /* CSA: indexer-selected */
         if (pos == 0) {                                         /* seed indexer compressor ring */
@@ -5285,6 +5324,12 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_gemm(m,m->v_cmp_score,&cwg,m->p_hn,K,cmpW_pf,C);
         }
         if (ds4f_prof_on) m->prof[DS4F_P_TB2PREP] += ds4f_now()-tv;
+        m->s_idx_batch_sel = NULL; m->s_idx_batch_K = 0;
+        if (getenv("DS4F_IDX_BATCH") && atoi(getenv("DS4F_IDX_BATCH")) && !snaps && ratio == 4 && !ly->idx_cp_on) {
+            int *bs=(int*)aligned_alloc(256,(size_t)K*c->index_topk*sizeof(int));
+            if (bs && ds4f_index_batch_prepare(m,ly,K,pos0,bs)) { m->s_idx_batch_sel=bs; m->s_idx_batch_K=K; }
+            else free(bs);
+        }
         /* Dense (non-TierB2) layers have no stateful compressor dependency.
          * Append the whole tile, then use the triangular prefill worker.  The
          * no-wrap guard is required because that worker intentionally uses a
@@ -5348,6 +5393,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             m->s_q = saved_q;
         }
         if (snaps) snap_loff += ds4f_tb2_snap_layer_bytes(m, L);
+        free(m->s_idx_batch_sel); m->s_idx_batch_sel=NULL; m->s_idx_batch_K=0;
         /* Batched grouped low-rank o-projection.  Under TP_OPROJ, wo_a owns
          * only [oi0,oi0+oi_rows); zero-pad those rows into the full p_o1
          * stride, run the replicated wo_b on that partial, then sum the
