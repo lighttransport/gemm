@@ -253,7 +253,12 @@ static void attach_decode_hooks(ds4f_model *m, hip_ds4f_dense *hip,
         opt->hip_attn_no_d2h, opt->hip_fp8_wmma, opt->hip_bf16_wmma,
         opt->hip_attn_wmma, opt->hip_oproj_group_wmma, opt->hip_mxfp4_wmma,
         opt->hip_block_threads);
-    m->gpu_prefill_attn_oproj = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attn_oproj : NULL;
+    /* The legacy fused callback expects host-normalized Q.  With the device
+     * QKV chain enabled, use the separate attention -> device-resident O-proj
+     * callbacks instead; this preserves residency and performs qnorm/rope in
+     * the attention callback's proven path. */
+    m->gpu_prefill_attn_oproj = (opt->hip_prefill_attn && !opt->hip_qkv_device_chain)
+        ? hip_ds4f_dense_prefill_attn_oproj : NULL;
     m->gpu_dense_mixed = 1;
     m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
         ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_stream_layer_raw
@@ -471,7 +476,8 @@ static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
         opt->hip_attn_no_d2h, opt->hip_fp8_wmma, opt->hip_bf16_wmma,
         opt->hip_attn_wmma, opt->hip_oproj_group_wmma, opt->hip_mxfp4_wmma,
         opt->hip_block_threads);
-    m->gpu_prefill_attn_oproj = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attn_oproj : NULL;
+    m->gpu_prefill_attn_oproj = (opt->hip_prefill_attn && !opt->hip_qkv_device_chain)
+        ? hip_ds4f_dense_prefill_attn_oproj : NULL;
     /* MXFP4 expert layer residency: install the HIP entry points BEFORE the
      * dual wrapper swaps gpu_dense_ctx, so dual can capture and forward them.
      * Dual owns expert routing and keeps small buckets on the exact CPU path,
