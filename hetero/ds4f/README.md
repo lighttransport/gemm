@@ -880,6 +880,22 @@ expert fallback plus the GPU dense/shared path (`--hip-ordered-fp8-layers 43
 --hip-fused-shared-ffn 1`, threads = `nproc`). The recommended stable-fast
 config is the CPU-expert dual (or single) run at 0/64 argmax mismatches.
 
+**Dual-GPU single-token decode (experimental).** The real runner can place the
+tail expert layers on the CUDA SM120 card while keeping the head layers and
+dense bank on the RX 9070 XT. On the 0731 EP8 shard, this command is stable:
+
+```bash
+./hetero/ds4f/build/test_hip_ds4f_real \
+  --dual-gpu 1 --cuda-device 0 --dual-cuda-mxfp4 1 \
+  --dual-cuda-terms 2 --dual-cuda-resident-from 16 \
+  --hip-mxfp4-resident-layers 16 --hip-mxfp4-stream-raw 1 \
+  --hip-decode-attn-oproj 1 --hip-decode-kv-resident 1
+```
+
+Measured at context 2048, 43 layers, 12 tokens: **21.9--22.0 tok/s** versus
+18.8 tok/s on HIP alone (about +17%). Argmax remains locked; CUDA MXFP4 terms
+increase full-logit drift, so this remains opt-in and is not the exact default.
+
 Why the GPU expert routes lose here, point by point (profiled):
 
 - **Streaming bandwidth, not the GEMM, dominates.** `resident-raw` with 20
