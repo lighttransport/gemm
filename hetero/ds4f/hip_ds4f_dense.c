@@ -123,6 +123,9 @@ struct hip_ds4f_dense {
     hipStream_t stream;
     int qkv_fuse, qkv_device_chain, attn_device_chain, attn_no_d2h;
     int fp8_wmma_mode, bf16_wmma, attn_wmma, oproj_group_wmma, mxfp4_wmma;
+    int decode_kv_resident;
+    const uint16_t *decode_kv_host;
+    int decode_kv_slots, decode_kv_dim;
     hipEvent_t done;
     int block_threads;
     int pending;
@@ -206,6 +209,15 @@ void hip_ds4f_dense_set_prefill_features(hip_ds4f_dense *ctx, int qkv_fuse,
     ctx->mxfp4_wmma = mxfp4_wmma;
     if (block_threads == 64 || block_threads == 128 || block_threads == 256)
         ctx->block_threads = block_threads;
+}
+
+void hip_ds4f_dense_set_decode_features(hip_ds4f_dense *ctx, int kv_resident) {
+    if (!ctx) return;
+    ctx->decode_kv_resident = kv_resident != 0;
+    if (!ctx->decode_kv_resident) {
+        ctx->decode_kv_host = NULL;
+        ctx->decode_kv_slots = ctx->decode_kv_dim = 0;
+    }
 }
 
 static int valid_dims(int rows, int cols) {
@@ -1657,6 +1669,8 @@ int hip_ds4f_dense_prefill_attention(
     if (end > kv_slots) return -1;
     int copy_slots = end - base;
     if (copy_slots < 1) copy_slots = 1;
+    int resident_kv = ctx->decode_kv_resident && M == 1;
+    if (resident_kv) { base = 0; copy_slots = kv_slots; }
     size_t qb = (size_t)M * (size_t)n_heads * (size_t)head_dim * sizeof(float);
     size_t kb = (size_t)copy_slots * (size_t)kv_dim * sizeof(uint16_t);
     size_t sb = (size_t)n_heads * sizeof(float);
@@ -1671,10 +1685,21 @@ int hip_ds4f_dense_prefill_attention(
                    ctx->qkv_device_host == q && ctx->qnorm_rope_heads &&
                    rcos && rsin;
     if ((!qchained && hipMemcpy(ctx->attn_q, q, qb, hipMemcpyHostToDevice) != hipSuccess) ||
-        hipMemcpy(ctx->attn_kv, kv + (size_t)base * kv_dim, kb,
-                  hipMemcpyHostToDevice) != hipSuccess ||
+        (!resident_kv && hipMemcpy(ctx->attn_kv, kv + (size_t)base * kv_dim, kb,
+                  hipMemcpyHostToDevice) != hipSuccess) ||
         hipMemcpy(ctx->attn_sink, sink, sb, hipMemcpyHostToDevice) != hipSuccess)
         return -1;
+    if (resident_kv) {
+        size_t full_bytes=(size_t)kv_slots*kv_dim*sizeof(uint16_t);
+        size_t one_bytes=(size_t)kv_dim*sizeof(uint16_t);
+        if (ctx->decode_kv_host != kv || ctx->decode_kv_slots != kv_slots ||
+            ctx->decode_kv_dim != kv_dim) {
+            if (hipMemcpy(ctx->attn_kv, kv, full_bytes, hipMemcpyHostToDevice) != hipSuccess) return -1;
+            ctx->decode_kv_host=kv; ctx->decode_kv_slots=kv_slots; ctx->decode_kv_dim=kv_dim;
+        } else if (hipMemcpy((uint8_t *)ctx->attn_kv + (size_t)(pos0 % kv_slots)*one_bytes,
+                             kv + (size_t)(pos0 % kv_slots)*kv_dim, one_bytes,
+                             hipMemcpyHostToDevice) != hipSuccess) return -1;
+    }
     void *dy = ctx->attn_y, *dkv = ctx->attn_kv,
          *dq = qchained ? ctx->qkv_q : ctx->attn_q, *dsink = ctx->attn_sink;
     if (qchained) {
@@ -1695,7 +1720,7 @@ int hip_ds4f_dense_prefill_attention(
     int use_wmma = ctx->attn_wmma && ctx->prefill_attn_wmma &&
                    head_dim == 512 && kv_dim == 512;
     unsigned int gx = (unsigned int)(use_wmma ? n_heads * ((M + 15) / 16) : M * groups);
-    int local_pos0 = pos0 - base;
+    int local_pos0 = resident_kv ? pos0 : pos0 - base;
     void *args[] = { &dy, &dkv, &dq, &dsink, &M, &local_pos0, &n_heads,
                      &head_dim, &kv_dim, &copy_slots, &window, &scale };
     hipError_t err = hipModuleLaunchKernel(use_wmma ? ctx->prefill_attn_wmma : ctx->prefill_attn,

@@ -424,6 +424,7 @@ typedef struct ds4f_runtime_options {
     int hip_fp8_wmma, hip_bf16_wmma, hip_attn_wmma;
     int hip_oproj_group_wmma, hip_mxfp4_wmma, hip_block_threads;
     int hip_decode_routed_ffn, hip_decode_qkv_fuse, hip_decode_attn_oproj;
+    int hip_decode_kv_resident;
     int hip_exact_prefill;              /* keep M>1 prompt GEMMs on CPU reference path */
     int debug_env;
 } ds4f_runtime_options;

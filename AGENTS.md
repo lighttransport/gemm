@@ -118,8 +118,8 @@ resident prefill chain is enabled with:
 Decode experiments are independently gated with `--hip-decode-qkv-fuse 1`,
 `--hip-decode-routed-ffn 1`, and `--hip-decode-attn-oproj 1`; each retains CPU
 fallback on unsupported or non-resident tensors. The QKV option currently
-fuses the single-upload projection stage; full device KV-cache residency remains
-a follow-up optimization.
+fuses the single-upload projection stage; persistent device KV residency is
+available through `--hip-decode-kv-resident 1` for the GPU attention path.
 
 These flags are intentionally explicit runner arguments. Environment
 variables are reserved for diagnostics/debugging and profiling (for example
