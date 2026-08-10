@@ -22,6 +22,11 @@
 #include "../common/safetensors.h"
 #include "../common/ds4f.h"
 
+/* Implemented by server.c; keeps DS4F telemetry visible through
+ * GET /v1/progress without coupling the model adapter to HTTP details. */
+extern void server_progress_llm(const char *phase, int processed, int total,
+                                int completion, int cache_hit);
+
 struct ds4f_session {
     ds4f_model *m;
     ds4f_mem_pool *mem;
@@ -235,6 +240,7 @@ static int chat_prefix_tokens(const ds4f_session *s, const char *prompt,
     if (!prefix) return nids;
     memcpy(prefix, prompt, chars); prefix[chars] = 0;
     char *encoded = NULL; size_t encoded_len = 0;
+    server_progress_llm("encode", 0, 0, 0, 0);
     if (tokenizer_run(s, "encode", prefix, &encoded, &encoded_len) != 0 || !encoded)
         return nids;
     int *pids = NULL, np = 0;
@@ -702,6 +708,8 @@ char *ds4f_session_generate(ds4f_session *s, const char *prompt, int max_tokens,
     int cache_n = chat_prefix_tokens(s, prompt, ids, nids, req);
     int pos = 0, next = -1;
     int hit = cache_restore(s, ids, nids, &pos, &next);
+    server_progress_llm(hit ? "prompt_cache" : "prompt", hit ? pos : 0,
+                        nids, 0, hit);
     for (int p = hit ? pos : 0; p < nids; p++) {
         if (embed_lookup(s->m, ids[p], x) != 0) {
             ds4f_mem_pool_destroy(req);
@@ -709,6 +717,7 @@ char *ds4f_session_generate(ds4f_session *s, const char *prompt, int max_tokens,
         }
         next = ds4f_forward_token(s->m, x, p);
         pos = p + 1;
+        server_progress_llm("prompt", pos, nids, 0, hit);
         if (!hit && cache_n < nids && pos == cache_n) {
             if (cache_save(s, ids, cache_n, next) != 0) cache_free(s);
         }
@@ -744,6 +753,7 @@ char *ds4f_session_generate(ds4f_session *s, const char *prompt, int max_tokens,
     int ng = 0;
     while (ng < max_tokens && next >= 0) {
         gen[ng++] = next;
+        server_progress_llm("decode", ng, max_tokens, 1, hit);
         if (next == 1) break;
         if (pos >= s->max_pos) break;
         if (embed_lookup(s->m, next, x) != 0) break;

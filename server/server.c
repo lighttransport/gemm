@@ -172,12 +172,21 @@ typedef struct {
     char     phase[24];     /* idle|starting|encode|dit_load|dit|vae_load|vae|done */
     int      dit_step;
     int      dit_total;
+    int      prompt_tokens;
+    int      prompt_processed;
+    int      completion_tokens;
+    int      completion_total;
+    int      cache_hit;
+    double   prompt_tps;
+    double   decode_tps;
     char     gpu[128];
     double   started_ms;
 } progress_state;
 
 static progress_state g_prog = {
-    PTHREAD_MUTEX_INITIALIZER, 0, 0, "", "", "idle", 0, 0, "", 0.0
+    .mu = PTHREAD_MUTEX_INITIALIZER, .active = 0, .job_id = 0,
+    .model = "", .precision = "", .phase = "idle",
+    .dit_step = 0, .dit_total = 0, .gpu = "", .started_ms = 0.0
 };
 
 static void progress_begin(const char *model, const char *precision) {
@@ -188,6 +197,9 @@ static void progress_begin(const char *model, const char *precision) {
     snprintf(g_prog.precision, sizeof(g_prog.precision), "%s", precision ? precision : "");
     snprintf(g_prog.phase, sizeof(g_prog.phase), "%s", "starting");
     g_prog.dit_step = 0; g_prog.dit_total = 0;
+    g_prog.prompt_tokens = 0; g_prog.prompt_processed = 0;
+    g_prog.completion_tokens = 0; g_prog.completion_total = 0;
+    g_prog.cache_hit = 0; g_prog.prompt_tps = 0.0; g_prog.decode_tps = 0.0;
     g_prog.gpu[0] = 0;
     g_prog.started_ms = now_ms();
     pthread_mutex_unlock(&g_prog.mu);
@@ -206,6 +218,27 @@ static void progress_dit(int step, int total) {
     pthread_mutex_lock(&g_prog.mu);
     snprintf(g_prog.phase, sizeof(g_prog.phase), "%s", "dit");
     g_prog.dit_step = step; g_prog.dit_total = total;
+    pthread_mutex_unlock(&g_prog.mu);
+}
+
+/* DS4F/LLM progress hook.  Kept separate from the image progress fields so
+ * GET /v1/progress remains useful while a long prompt or decode is running. */
+void server_progress_llm(const char *phase, int processed, int total,
+                         int completion, int cache_hit) {
+    pthread_mutex_lock(&g_prog.mu);
+    snprintf(g_prog.phase, sizeof(g_prog.phase), "%s", phase ? phase : "llm");
+    if (completion) {
+        g_prog.completion_tokens = processed;
+        g_prog.completion_total = total;
+        double sec = (now_ms() - g_prog.started_ms) / 1000.0;
+        if (sec > 0.0) g_prog.decode_tps = processed / sec;
+    } else {
+        g_prog.prompt_processed = processed;
+        g_prog.prompt_tokens = total;
+        if (cache_hit) g_prog.cache_hit = 1;
+        double sec = (now_ms() - g_prog.started_ms) / 1000.0;
+        if (sec > 0.0) g_prog.prompt_tps = processed / sec;
+    }
     pthread_mutex_unlock(&g_prog.mu);
 }
 static void progress_end(void) {
@@ -1644,9 +1677,15 @@ static char *progress_json(void) {
     sbuf b; sbuf_init(&b);
     sbuf_printf(&b,
         "{\"ok\":true,\"active\":%s,\"job_id\":%llu,\"model\":\"%s\",\"precision\":\"%s\","
-        "\"phase\":\"%s\",\"dit_step\":%d,\"dit_total\":%d,\"gpu\":\"%s\",\"elapsed_ms\":%.0f}",
+        "\"phase\":\"%s\",\"dit_step\":%d,\"dit_total\":%d,"
+        "\"prompt_tokens\":%d,\"prompt_processed\":%d,\"prompt_tps\":%.2f,"
+        "\"completion_tokens\":%d,\"completion_total\":%d,\"decode_tps\":%.2f,"
+        "\"cache_hit\":%s,\"gpu\":\"%s\",\"elapsed_ms\":%.0f}",
         g_prog.active ? "true" : "false", (unsigned long long)g_prog.job_id,
-        md, pr, ph, g_prog.dit_step, g_prog.dit_total, gpu, elapsed);
+        md, pr, ph, g_prog.dit_step, g_prog.dit_total,
+        g_prog.prompt_tokens, g_prog.prompt_processed, g_prog.prompt_tps,
+        g_prog.completion_tokens, g_prog.completion_total, g_prog.decode_tps,
+        g_prog.cache_hit ? "true" : "false", gpu, elapsed);
     free(gpu); free(ph); free(pr); free(md);
     pthread_mutex_unlock(&g_prog.mu);
     return b.ptr;
@@ -2140,6 +2179,8 @@ static void handle_client(int fd, server_config *cfg) {
                 free(e);
                 pthread_mutex_unlock(&g_infer_mu);
             } else {
+                progress_begin(cfg->g_llm.backend == LLM_BACKEND_DS4F ? "ds4f" : "llm",
+                               cfg->g_llm.backend == LLM_BACKEND_DS4F ? "exact" : "");
                 if (stream) {
                     char sse_hdr[256];
                     snprintf(sse_hdr, sizeof(sse_hdr),
@@ -2215,6 +2256,8 @@ static void handle_client(int fd, server_config *cfg) {
                 free(e);
                 pthread_mutex_unlock(&g_infer_mu);
             } else {
+                progress_begin(cfg->g_llm.backend == LLM_BACKEND_DS4F ? "ds4f" : "llm",
+                               cfg->g_llm.backend == LLM_BACKEND_DS4F ? "exact" : "");
                 if (stream) {
                     char sse_hdr[256];
                     snprintf(sse_hdr, sizeof(sse_hdr),
