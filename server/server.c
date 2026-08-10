@@ -1755,6 +1755,11 @@ static char *models_json(const server_config *cfg) {
             "{\"id\":\"%s\",\"tasks\":[\"chat\",\"completions\"],\"backends\":[\"%s\"],\"is_vlm\":%s}",
             mp, cfg->g_llm.backend == LLM_BACKEND_DS4F ? "ds4f-x86" : "cpu",
             cfg->g_llm.is_vlm ? "true" : "false");
+        if (cfg->g_llm.backend == LLM_BACKEND_DS4F &&
+            strcmp(cfg->g_llm.model_path, "ds4f-q3") != 0)
+            sbuf_append(&out,
+                ",{\"id\":\"ds4f-q3\",\"tasks\":[\"chat\",\"completions\"],"
+                "\"backends\":[\"ds4f-x86\"],\"is_vlm\":false}");
         free(mp);
     } else {
         sbuf_append(&out,
@@ -1762,6 +1767,20 @@ static char *models_json(const server_config *cfg) {
     }
     sbuf_append(&out, "]}");
     return out.ptr;
+}
+
+static char *model_detail_json(const server_config *cfg, const char *requested) {
+    sbuf b; sbuf_init(&b);
+    const char *id = requested && *requested ? requested : "ds4f-q3";
+    const char *backend = cfg && cfg->g_llm.backend == LLM_BACKEND_DS4F
+                        ? "ds4f-x86" : "cpu";
+    char *eid = json_escape_dup(id);
+    sbuf_printf(&b,
+        "{\"id\":\"%s\",\"object\":\"model\",\"created\":0,"
+        "\"owned_by\":\"local\",\"tasks\":[\"chat\",\"completions\"],"
+        "\"backend\":\"%s\"}", eid ? eid : "ds4f-q3", backend);
+    free(eid);
+    return b.ptr;
 }
 
 static char *health_json(void) {
@@ -2134,13 +2153,19 @@ static void handle_client(int fd, server_config *cfg) {
         char *j = health_json();
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
+    } else if (strcmp(method, "GET") == 0 && strncmp(path, "/v1/models/", 11) == 0) {
+        char *j = model_detail_json(cfg, path + 11);
+        send_response(fd, 200, "application/json", j, strlen(j));
+        free(j);
     } else if (strcmp(method, "GET") == 0 &&
                (strcmp(path, "/models") == 0 || strcmp(path, "/v1/models") == 0)) {
         char *j = models_json(cfg);
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
     } else if (strcmp(method, "GET") == 0 &&
-               (strcmp(path, "/progress") == 0 || strcmp(path, "/v1/progress") == 0)) {
+               (strcmp(path, "/progress") == 0 || strcmp(path, "/v1/progress") == 0 ||
+                strcmp(path, "/status") == 0 || strcmp(path, "/v1/status") == 0 ||
+                strcmp(path, "/v1/metrics") == 0)) {
         char *j = progress_json();
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
