@@ -1140,6 +1140,21 @@ cmake --build /tmp/ds4f-server-build -j
   --ds4f-config ds4f.json
 ```
 
+For the CPU + RX 9070 XT profile used for the 18 tok/s decode target, use the
+checked-in launcher (stage directory, port, and thread count are positional):
+
+```bash
+server/run-ds4f-9070xt.sh /mnt/nvme02/work/gemm/ds4f/hetero/ds4f/stage8 8080 16
+```
+
+It enables the persistent HIP dense bank, asynchronous submissions, exact
+decode, and the automatic prompt-hot expert cache. The OpenAI-compatible
+endpoints are `/v1/chat/completions` and `/v1/completions`; Codex and Claude
+Code can point their OpenAI-compatible base URL at `http://127.0.0.1:8080/v1`.
+The server now validates and caches the stable prefix before the final `User:`
+turn, so repeated system/tool-call prefixes reuse the KV/logit snapshot while
+each new user turn is still evaluated normally.
+
 `--ds4f-hip 1` attaches the persistent RDNA4 dense bank at startup. The server
 then uploads the eight FP8 MLA/shared tensors per layer plus the replicated
 flat-BF16 vocabulary head (345 matrices, about 6.741 GB for the 43-layer

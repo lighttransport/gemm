@@ -221,6 +221,29 @@ static int parse_ids(ds4f_mem_pool *pool, char *text, int **ids_out, int *n_out)
     return 0;
 }
 
+/* Find a reusable chat prefix without assuming that character and token
+ * boundaries coincide.  The final User turn changes from request to request;
+ * system/tool messages before it are stable for Codex/Claude-style clients.
+ * Re-encode the candidate prefix and compare token IDs before using it. */
+static int chat_prefix_tokens(const ds4f_session *s, const char *prompt,
+                              const int *ids, int nids, ds4f_mem_pool *pool) {
+    const char *last = NULL, *p = prompt;
+    while ((p = strstr(p, "User: ")) != NULL) { last = p; p += 6; }
+    if (!last || last == prompt) return nids;
+    size_t chars = (size_t)(last - prompt);
+    char *prefix = (char *)ds4f_mem_alloc(pool, chars + 1, 64, 0);
+    if (!prefix) return nids;
+    memcpy(prefix, prompt, chars); prefix[chars] = 0;
+    char *encoded = NULL; size_t encoded_len = 0;
+    if (tokenizer_run(s, "encode", prefix, &encoded, &encoded_len) != 0 || !encoded)
+        return nids;
+    int *pids = NULL, np = 0;
+    int ok = parse_ids(pool, encoded, &pids, &np) == 0 && np > 0 && np <= nids &&
+             memcmp(pids, ids, (size_t)np * sizeof(*ids)) == 0;
+    ds4f_map_free(encoded); (void)encoded_len;
+    return ok ? np : nids;
+}
+
 static int embed_lookup(const ds4f_model *m, int tok, float *x) {
     if (tok < 0 || tok >= m->cfg.vocab || m->emb_rows != m->cfg.vocab || !m->embed)
         return -1;
@@ -676,6 +699,7 @@ char *ds4f_session_generate(ds4f_session *s, const char *prompt, int max_tokens,
 
     float *x = (float *)ds4f_mem_alloc(req, (size_t)s->m->cfg.hidden * sizeof(float), 256, 0);
     if (!x) { ds4f_mem_pool_destroy(req); set_err(err, err_cap, "out of memory"); return NULL; }
+    int cache_n = chat_prefix_tokens(s, prompt, ids, nids, req);
     int pos = 0, next = -1;
     int hit = cache_restore(s, ids, nids, &pos, &next);
     for (int p = hit ? pos : 0; p < nids; p++) {
@@ -685,9 +709,12 @@ char *ds4f_session_generate(ds4f_session *s, const char *prompt, int max_tokens,
         }
         next = ds4f_forward_token(s->m, x, p);
         pos = p + 1;
+        if (!hit && cache_n < nids && pos == cache_n) {
+            if (cache_save(s, ids, cache_n, next) != 0) cache_free(s);
+        }
     }
     if (!hit && nids > 0) pos = nids;
-    if (nids > 0 && cache_save(s, ids, nids, next) != 0) {
+    if (!hit && cache_n == nids && nids > 0 && cache_save(s, ids, nids, next) != 0) {
         /* Cache is an optimization; generation remains valid without it. */
         cache_free(s);
     }
