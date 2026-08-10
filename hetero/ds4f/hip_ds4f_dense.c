@@ -2052,32 +2052,10 @@ int hip_ds4f_dense_oproj(void *opaque,float *dst,const ds4f_tensor *wa,
         if(hipMemcpyAsync(ctx->op_dx,xh,dxb,hipMemcpyHostToDevice,ctx->stream)!=hipSuccess)return -1;
     }
     void *op_input = chained ? ctx->attn_y : ctx->op_dx;
-    int grouped_op = chained && M == 1 && ctx->oproj_group_wmma != 0 &&
-                     ctx->gemm_fp8_grouped_wmma && matrix_is_fp8(a->kind);
-    if (grouped_op) {
-        hip_ds4f_mxfp4_task task[32]; memset(task, 0, sizeof(task));
-        for (int g = 0; g < groups; ++g) {
-            task[g].w = (uint8_t *)a->dw + (size_t)g * lora * gin;
-            task[g].s = (uint8_t *)a->ds + (size_t)(g * lora / 128) * a->scale_cols;
-            task[g].x = op_input; task[g].y = ctx->op_di;
-            task[g].n_out = lora; task[g].n_in = gin; task[g].n_tok = M;
-            task[g].x_stride = H; task[g].y_stride = ointer;
-            task[g].x_off = g * gin; task[g].y_off = g * lora;
-        }
-        if (ensure_mxfp4_task_buffer(ctx, groups) != 0 ||
-            hipMemcpyAsync(ctx->gemm_mxfp4_tasks, task,
-                           (size_t)groups * sizeof(*task), hipMemcpyHostToDevice,
-                           ctx->stream) != hipSuccess) return -1;
-        int sc = a->scale_cols;
-        void *ga[] = { &ctx->gemm_mxfp4_tasks, &groups, &sc };
-        hipFunction_t fn = (ctx->oproj_group_wmma >= 2 && ctx->gemm_fp8_grouped_wmma64)
-                         ? ctx->gemm_fp8_grouped_wmma64 : ctx->gemm_fp8_grouped_wmma;
-        unsigned tile = ctx->oproj_group_wmma >= 2 ? 64u : 16u;
-        unsigned threads = ctx->oproj_group_wmma >= 2 ? 256u : 32u;
-        if (hipModuleLaunchKernel(fn,
-                (unsigned)((lora + tile - 1) / tile), 1, (unsigned)groups,
-                threads, 1, 1, 0, ctx->stream, ga, NULL) != hipSuccess) return -1;
-    } else for(int g=0;g<groups;g++){
+    /* Decode stays on the well-tested gather -> per-group GEMM path.  The
+     * grouped WMMA variant is reserved for batched prefill; on M=1 its extra
+     * task upload and launch do not improve end-to-end latency. */
+    for(int g=0;g<groups;g++){
         size_t n=(size_t)M*gin;int off=g*gin;
         void *ga[]={&ctx->op_xt,&op_input,&M,&gin,&H,&off};
         if(hipModuleLaunchKernel(ctx->gather_group,(unsigned)((n+255)/256),1,1,256,1,1,0,ctx->stream,ga,NULL)!=hipSuccess||

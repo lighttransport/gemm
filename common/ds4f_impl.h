@@ -7249,9 +7249,9 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
                        HD - c->qk_rope_dim, c->qk_rope_dim/2, 1, pos,
                        c->n_heads, HD, KV, ly->kv_slots, c->window_size,
                        1.0f/sqrtf((float)HD)) == 0) {
-            /* GPU attention result is already in s_attn; O-projection keeps
-             * the existing decode path until its device-resident fusion is
-             * enabled separately. */
+            /* GPU attention result is already in s_attn.  When the decode
+             * device-chain option is enabled, O-projection consumes that
+             * device result directly; otherwise the normal CPU path follows. */
         } else if (m->exact) {
             ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                      c->window_size, c->qk_rope_dim/2, rcos, rsin };
@@ -7386,7 +7386,7 @@ decode_oproj_done:;
         /* ---- MoE: routed experts (owned-only) ---- */
         { DS4F_TIC();
         int routed_decode_gpu = 0;
-        if (m->gpu_routed_ffn && m->gpu_decode_routed_ffn_enabled) {
+        if (m->gpu_routed_ffn && m->gpu_decode_routed_ffn_enabled && c->n_active <= 8) {
             int local_k[8], nlocal = 0, all_gpu = 1;
             for (int k = 0; k < c->n_active; ++k) {
                 int e = idx[k];
@@ -7418,7 +7418,7 @@ decode_oproj_done:;
                 }
             }
         }
-        if (!routed_decode_gpu && ds4f_expert_batch_on()) {
+        if (!routed_decode_gpu && ds4f_expert_batch_on() && c->n_active <= 8) {
             /* Preserve top-k order while compacting the experts owned by this
              * rank.  EP ranks can have fewer than n_active local experts. */
             int local_k[8], nlocal = 0;
