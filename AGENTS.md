@@ -115,6 +115,11 @@ resident prefill chain is enabled with:
 --hip-mxfp4-wmma 1 --hip-block-threads 128
 ```
 
+Decode experiments are independently gated with `--hip-decode-routed-ffn 1`
+and `--hip-decode-attn-oproj 1`; both retain CPU fallback on unsupported or
+non-resident tensors. Decode QKV fusion remains disabled until its device KV
+cache path is validated.
+
 These flags are intentionally explicit runner arguments. Environment
 variables are reserved for diagnostics/debugging and profiling (for example
 `DS4F_DEBUG_ENV` and `DS4F_PROF`); they must not select a tuned production path.

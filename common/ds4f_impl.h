@@ -7235,6 +7235,15 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                      c->window_size, c->qk_rope_dim/2, rcos, rsin };
         if (!ds4f_attn_tb2_gemm(m, &at)) ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
+        } else if (m->gpu_decode_attn_enabled && m->gpu_prefill_attn &&
+                   m->gpu_prefill_attn(m->gpu_dense_ctx, m->s_attn, m->s_q,
+                       ly->kv_cache, ly->attn_sink, rcos, rsin,
+                       HD - c->qk_rope_dim, c->qk_rope_dim/2, 1, pos,
+                       c->n_heads, HD, KV, ly->kv_slots, c->window_size,
+                       1.0f/sqrtf((float)HD)) == 0) {
+            /* GPU attention result is already in s_attn; O-projection keeps
+             * the existing decode path until its device-resident fusion is
+             * enabled separately. */
         } else if (m->exact) {
             ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                      c->window_size, c->qk_rope_dim/2, rcos, rsin };
@@ -7251,6 +7260,11 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         if (m->exact) {
             int gin = H / og;                          /* 32768/8 = 4096 == C */
             int tpo = (m->oi_rows < c->o_inter);       /* TP: wo_a o_inter row-shard */
+            int decode_gpu_oproj = m->gpu_decode_attn_oproj_enabled && !tpo &&
+                m->gpu_oproj && ly->wo_a.gpu_id >= 0 && ly->wo_b.gpu_id >= 0 &&
+                m->gpu_oproj(m->gpu_dense_ctx, m->s_o, &ly->wo_a, &ly->wo_b,
+                    m->s_attn, 1, og, gin, c->o_lora, H, C, c->o_inter) == 0;
+            if (decode_gpu_oproj) goto decode_oproj_done;
             /* TP_ATTN leaves s_attn head-partial; the o_inter shard needs the FULL s_attn (each
              * owned o_inter row contracts a whole group), so sum it first (disjoint heads + zeros
              * => exact reconstruction). */
@@ -7266,6 +7280,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
                 ds4f_matvec(m, m->s_o1 + (size_t)g * c->o_lora, &vg, m->s_attn + (size_t)g * gin);
             }
             ds4f_matvec(m, m->s_o, &ly->wo_b, m->s_o1 + (ly->wo_b.cols < c->o_inter ? m->oi0 : 0));  /* col-shard: owned o_inter slice. [hidden], partial under TP */
+decode_oproj_done:;
         } else {
             for (int i = 0; i < C; i++) m->s_oin[i] = 0.f;
             for (int g = 0; g < og; g++) for (int i = 0; i < C; i++) m->s_oin[i] += m->s_attn[g*C + i];
@@ -7362,7 +7377,40 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         }
         /* ---- MoE: routed experts (owned-only) ---- */
         { DS4F_TIC();
-        if (ds4f_expert_batch_on()) {
+        int routed_decode_gpu = 0;
+        if (m->gpu_routed_ffn && m->gpu_decode_routed_ffn_enabled) {
+            int local_k[8], nlocal = 0, all_gpu = 1;
+            for (int k = 0; k < c->n_active; ++k) {
+                int e = idx[k];
+                if (e < 0 || e % m->ep_size != m->ep_rank) continue;
+                int slot = e / m->ep_size;
+                local_k[nlocal++] = k;
+                if (ly->ex_w1[slot].gpu_id < 0 || ly->ex_w3[slot].gpu_id < 0 ||
+                    ly->ex_w2[slot].gpu_id < 0) all_gpu = 0;
+            }
+            if (nlocal > 0 && all_gpu) {
+                const ds4f_tensor *rw1[8], *rw3[8], *rw2[8];
+                int counts[8], offsets[9];
+                offsets[0] = 0;
+                for (int j = 0; j < nlocal; ++j) {
+                    int slot = idx[local_k[j]] / m->ep_size;
+                    rw1[j] = &ly->ex_w1[slot]; rw3[j] = &ly->ex_w3[slot]; rw2[j] = &ly->ex_w2[slot];
+                    counts[j] = 1; offsets[j + 1] = j + 1;
+                    memcpy(m->p_exX + (size_t)j * C, m->s_h2, (size_t)C * sizeof(float));
+                }
+                if (m->gpu_routed_ffn(m->gpu_dense_ctx, m->p_exO, m->p_exX,
+                        rw1, rw3, rw2, counts, offsets, nlocal, nlocal,
+                        C, c->moe_inter, c->swiglu_limit) == 0) {
+                    for (int j = 0; j < nlocal; ++j) {
+                        float w = wt[local_k[j]];
+                        const float *y = m->p_exO + (size_t)j * C;
+                        for (int i = 0; i < C; ++i) m->s_route[i] += w * y[i];
+                    }
+                    routed_decode_gpu = 1;
+                }
+            }
+        }
+        if (!routed_decode_gpu && ds4f_expert_batch_on()) {
             /* Preserve top-k order while compacting the experts owned by this
              * rank.  EP ranks can have fewer than n_active local experts. */
             int local_k[8], nlocal = 0;

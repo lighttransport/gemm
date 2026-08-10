@@ -423,6 +423,7 @@ typedef struct ds4f_runtime_options {
     int hip_attn_device_chain, hip_attn_no_d2h, hip_routed_ffn;
     int hip_fp8_wmma, hip_bf16_wmma, hip_attn_wmma;
     int hip_oproj_group_wmma, hip_mxfp4_wmma, hip_block_threads;
+    int hip_decode_routed_ffn, hip_decode_attn_oproj;
     int hip_exact_prefill;              /* keep M>1 prompt GEMMs on CPU reference path */
     int debug_env;
 } ds4f_runtime_options;
@@ -546,7 +547,8 @@ typedef struct {
     ds4f_gpu_prefill_attn_oproj_fn gpu_prefill_attn_oproj;
     ds4f_gpu_prefill_qkv_fn gpu_prefill_qkv;
     int gpu_prefill_qkv_enabled, gpu_qkv_device_chain, gpu_attn_device_chain;
-    int gpu_attn_no_d2h, gpu_routed_ffn_enabled;
+    int gpu_attn_no_d2h, gpu_routed_ffn_enabled, gpu_decode_routed_ffn_enabled;
+    int gpu_decode_attn_enabled, gpu_decode_attn_oproj_enabled;
     int gpu_dense_stream_prefill_only;
     int gpu_dense_mixed;       /* opt-in mixed GPU/CPU independent-GEMM dispatch */
     int gpu_exact_prefill;     /* skip GPU M>1 GEMMs; retain GPU M=1 decode */
