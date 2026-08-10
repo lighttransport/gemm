@@ -115,10 +115,11 @@ resident prefill chain is enabled with:
 --hip-mxfp4-wmma 1 --hip-block-threads 128
 ```
 
-Decode experiments are independently gated with `--hip-decode-routed-ffn 1`
-and `--hip-decode-attn-oproj 1`; both retain CPU fallback on unsupported or
-non-resident tensors. Decode QKV fusion remains disabled until its device KV
-cache path is validated.
+Decode experiments are independently gated with `--hip-decode-qkv-fuse 1`,
+`--hip-decode-routed-ffn 1`, and `--hip-decode-attn-oproj 1`; each retains CPU
+fallback on unsupported or non-resident tensors. The QKV option currently
+fuses the single-upload projection stage; full device KV-cache residency remains
+a follow-up optimization.
 
 These flags are intentionally explicit runner arguments. Environment
 variables are reserved for diagnostics/debugging and profiling (for example

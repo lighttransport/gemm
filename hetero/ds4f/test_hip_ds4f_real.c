@@ -38,7 +38,8 @@ static void usage(const char *prog) {
                     "--hip-fp8-wmma 0|1|2 --hip-bf16-wmma 0|1 "
                     "--hip-attn-wmma 0|1 --hip-oproj-group-wmma 0|1|2 "
                     "--hip-mxfp4-wmma 0|1|2 --hip-block-threads 64|128|256 "
-                    "--hip-decode-routed-ffn 0|1 --hip-decode-attn-oproj 0|1 "
+                    "--hip-decode-routed-ffn 0|1 --hip-decode-qkv-fuse 0|1 "
+                    "--hip-decode-attn-oproj 0|1 "
                     "--hip-fused-shared-ffn 0|1 "
                     "[--dual-gpu 0|1 --cuda-device n --dual-cuda-mxfp4 0|1 --dual-cuda-terms 1|2 "
                     "--dual-cuda-small-buckets 0|1 --dual-cuda-resident-from n "
@@ -247,6 +248,8 @@ static void attach_decode_hooks(ds4f_model *m, hip_ds4f_dense *hip,
         ? hip_ds4f_dense_prefill_attention : NULL;
     m->gpu_decode_attn_enabled = opt->hip_decode_attn_oproj;
     m->gpu_decode_attn_oproj_enabled = opt->hip_decode_attn_oproj;
+    m->gpu_decode_qkv_enabled = opt->hip_decode_qkv_fuse;
+    if (opt->hip_decode_qkv_fuse) m->gpu_prefill_qkv = hip_ds4f_dense_prefill_qkv;
     m->gpu_oproj = hip_ds4f_dense_oproj;
     m->gpu_prefill_qkv = opt->hip_qkv_fuse ? hip_ds4f_dense_prefill_qkv : NULL;
     m->gpu_routed_ffn = opt->hip_decode_routed_ffn ? hip_ds4f_dense_routed_ffn : NULL;
@@ -612,6 +615,7 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
         m->gpu_decode_routed_ffn_enabled = 0;
         m->gpu_decode_attn_enabled = 0;
         m->gpu_decode_attn_oproj_enabled = 0;
+        m->gpu_decode_qkv_enabled = 0;
         m->gpu_oproj = NULL;
         m->gpu_prefill_attn = NULL;
         m->gpu_dense_mixed = 0;
@@ -864,6 +868,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--hip-mxfp4-wmma") == 0 && i + 1 < argc) opt.hip_mxfp4_wmma = atoi(argv[++i]);
         else if (strcmp(a, "--hip-block-threads") == 0 && i + 1 < argc) opt.hip_block_threads = atoi(argv[++i]);
         else if (strcmp(a, "--hip-decode-routed-ffn") == 0 && i + 1 < argc) opt.hip_decode_routed_ffn = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-decode-qkv-fuse") == 0 && i + 1 < argc) opt.hip_decode_qkv_fuse = atoi(argv[++i]);
         else if (strcmp(a, "--hip-decode-attn-oproj") == 0 && i + 1 < argc) opt.hip_decode_attn_oproj = atoi(argv[++i]);
         else if (strcmp(a, "--dual-gpu") == 0 && i + 1 < argc) dual_gpu = atoi(argv[++i]);
         else if (strcmp(a, "--cuda-device") == 0 && i + 1 < argc) cuda_device = atoi(argv[++i]);

@@ -7181,14 +7181,22 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         { DS4F_TIC();
         ds4f_rmsnorm(m->s_hn, asrc, ly->attn_norm, C, eps);
         ds4f_chk("attn_norm", L, m->s_hn, C);
-        if (ds4f_mv_fuse_on()) {   /* wq_a + wkv both read s_hn -> ONE dispatch (wq_b depends on wq_a, stays separate). s_kvlat is independent of the q-path -> computing it early is bit-exact. */
+        int decode_gpu_qkv = m->gpu_decode_qkv_enabled && m->gpu_prefill_qkv &&
+            m->gpu_prefill_qkv(m->gpu_dense_ctx, m->s_q + (size_t)m->attn_h0 * c->q_head_dim,
+                m->s_kvlat, m->s_hn, &ly->wq_a, &ly->wkv, &ly->wq_b,
+                ly->q_norm, 1, C, c->q_lora, H, KV) == 0;
+        if (decode_gpu_qkv) {
+            /* qnorm and wq_b are included in the device callback. */
+        } else if (ds4f_mv_fuse_on()) {   /* wq_a + wkv both read s_hn -> ONE dispatch (wq_b depends on wq_a, stays separate). s_kvlat is independent of the q-path -> computing it early is bit-exact. */
             DS4F_TIC();
             ds4f_mv1 qkv[2] = { { m->s_qlat, &ly->wq_a, m->s_hn }, { m->s_kvlat, &ly->wkv, m->s_hn } };
             ds4f_matvec_multi(m, qkv, 2);
             DS4F_TOC(DS4F_P_QKV_A);
         } else { DS4F_TIC(); ds4f_matvec(m, m->s_qlat, &ly->wq_a, m->s_hn); DS4F_TOC(DS4F_P_QKV_A); }
-        ds4f_rmsnorm(m->s_qlat, m->s_qlat, ly->q_norm, c->q_lora, eps);
-        { DS4F_TIC(); ds4f_matvec(m, m->s_q + (size_t)m->attn_h0 * c->q_head_dim, &ly->wq_b, m->s_qlat); DS4F_TOC(DS4F_P_QKV_B); } /* TP: owned heads of [n_heads*q_head_dim] */
+        if (!decode_gpu_qkv) {
+            ds4f_rmsnorm(m->s_qlat, m->s_qlat, ly->q_norm, c->q_lora, eps);
+            { DS4F_TIC(); ds4f_matvec(m, m->s_q + (size_t)m->attn_h0 * c->q_head_dim, &ly->wq_b, m->s_qlat); DS4F_TOC(DS4F_P_QKV_B); } /* TP: owned heads of [n_heads*q_head_dim] */
+        }
         if (m->exact) { DS4F_TIC();
             if (ds4f_qnr_par) ds4f_q_norm_rope_par(m, m->s_q, pos, rcos, rsin);
             else              ds4f_q_norm_rope(m, m->s_q, pos, rcos, rsin);
