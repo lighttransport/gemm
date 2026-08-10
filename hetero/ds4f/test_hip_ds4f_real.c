@@ -257,11 +257,11 @@ static void attach_decode_hooks(ds4f_model *m, hip_ds4f_dense *hip,
     m->gpu_decode_routed_ffn_enabled = opt->hip_decode_routed_ffn;
     m->gpu_prefill_qkv_enabled = opt->hip_qkv_fuse;
     m->gpu_qkv_device_chain = opt->hip_qkv_device_chain;
-    m->gpu_attn_device_chain = opt->hip_attn_device_chain;
-    m->gpu_attn_no_d2h = opt->hip_attn_no_d2h;
+    m->gpu_attn_device_chain = opt->hip_attn_device_chain || opt->hip_decode_attn_oproj;
+    m->gpu_attn_no_d2h = opt->hip_attn_no_d2h || opt->hip_decode_attn_oproj;
     hip_ds4f_dense_set_prefill_features(hip, opt->hip_qkv_fuse,
-        opt->hip_qkv_device_chain, opt->hip_attn_device_chain,
-        opt->hip_attn_no_d2h, opt->hip_fp8_wmma, opt->hip_bf16_wmma,
+        opt->hip_qkv_device_chain, m->gpu_attn_device_chain,
+        m->gpu_attn_no_d2h, opt->hip_fp8_wmma, opt->hip_bf16_wmma,
         opt->hip_attn_wmma, opt->hip_oproj_group_wmma, opt->hip_mxfp4_wmma,
         opt->hip_block_threads);
     /* The legacy fused callback expects host-normalized Q.  With the device
