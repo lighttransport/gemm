@@ -97,6 +97,9 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   KV/Tier-B2 cache sets per row. Active batch members remain in native cache
   slots across token steps and serialize only when admitted, completed, or
   stashed; cache set zero remains isolated for concurrent prompt admission.
+  Slot cache capacity is reserved with lazy anonymous pages and touched pages
+  are reclaimed when a slot is released, so RSS follows active context length
+  instead of eagerly committing `max_pos` for every configured slot.
   Default is `1` because the current RX 9070 XT
   small-M kernels are slower at B=2 and the independent long-range caches use
   substantial host RAM; use B=2..4 for throughput experiments. `/v1/progress`

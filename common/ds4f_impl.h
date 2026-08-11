@@ -50,6 +50,16 @@ static void ds4f_map_free(void *ptr) {
     size_t map_sz = ((size_t *)base)[0];
     if (map_sz) munmap(base, map_sz);
 }
+static void ds4f_map_discard(void *ptr) {
+    if (!ptr) return;
+    size_t h = ds4f_align_up(sizeof(size_t) * 2, 64);
+    uint8_t *base = (uint8_t *)ptr - h;
+    size_t map_sz = ((size_t *)base)[0];
+    long ps = sysconf(_SC_PAGESIZE); size_t page = ps > 0 ? (size_t)ps : 4096;
+    /* Keep the first page because it owns the mapping metadata. All cache
+     * payload pages beyond it become lazy zero pages again. */
+    if (map_sz > page) madvise(base + page, map_sz - page, MADV_DONTNEED);
+}
 static void *ds4f_map_realloc(void *old, size_t old_size, size_t size, size_t align) {
     if (!size) { ds4f_map_free(old); return NULL; }
     void *p = ds4f_map_alloc(size, align, 0);
@@ -6818,23 +6828,24 @@ static int ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
         int W = coff * KV, nslot = ratio ? np / ratio : 0;
         for (int k = 1; k < nseq; ++k) {
             ds4f_lseq *q = &m->dec_batch_seq[(size_t)k * NL + L];
-            q->kv_cache = (uint16_t *)aligned_alloc(256, (size_t)ly->kv_slots * KV * 2);
+            /* Large per-context stores use anonymous mappings without an
+             * eager memset. Anonymous pages read as zero and are committed
+             * only as decode/prefill reaches them, so reserving B=4 at an 8K
+             * max context no longer faults the complete capacity into RSS. */
+            q->kv_cache = (uint16_t *)ds4f_map_alloc((size_t)ly->kv_slots * KV * 2, 64, 0);
             if (!q->kv_cache) return -1;
-            memset(q->kv_cache, 0, (size_t)ly->kv_slots * KV * 2);
             if (!ratio) continue;
-            q->cmp_kv = (float *)aligned_alloc(256, (size_t)nslot * KV * 4);
+            q->cmp_kv = (float *)ds4f_map_alloc((size_t)nslot * KV * 4, 64, 0);
             q->cmp_kv_state = (float *)aligned_alloc(256, (size_t)coff * ratio * W * 4);
             q->cmp_score_state = (float *)aligned_alloc(256, (size_t)coff * ratio * W * 4);
             if (!q->cmp_kv || !q->cmp_kv_state || !q->cmp_score_state) return -1;
-            memset(q->cmp_kv, 0, (size_t)nslot * KV * 4);
             ds4f_compress_state_reset(q->cmp_kv_state, q->cmp_score_state, ratio, KV);
             if (ratio == 4) {
                 int icoff = 2, iW = icoff * ihd;
-                q->idx_kv = (float *)aligned_alloc(256, (size_t)nslot * ihd * 4);
+                q->idx_kv = (float *)ds4f_map_alloc((size_t)nslot * ihd * 4, 64, 0);
                 q->idx_cmp_kv_state = (float *)aligned_alloc(256, (size_t)icoff * ratio * iW * 4);
                 q->idx_cmp_score_state = (float *)aligned_alloc(256, (size_t)icoff * ratio * iW * 4);
                 if (!q->idx_kv || !q->idx_cmp_kv_state || !q->idx_cmp_score_state) return -1;
-                memset(q->idx_kv, 0, (size_t)nslot * ihd * 4);
                 ds4f_compress_state_reset(q->idx_cmp_kv_state, q->idx_cmp_score_state, ratio, ihd);
             }
         }
@@ -6847,13 +6858,24 @@ static void ds4f_free_decode_batch(ds4f_model *m) {
     int NL = m->cfg.n_layers;
     for (int k = 1; k < m->dec_batch_cap; ++k) for (int L = 0; L < NL; ++L) {
         ds4f_lseq *q = &m->dec_batch_seq[(size_t)k * NL + L];
-        free(q->kv_cache); free(q->cmp_kv); free(q->cmp_kv_state);
-        free(q->cmp_score_state); free(q->idx_kv);
+        ds4f_map_free(q->kv_cache); ds4f_map_free(q->cmp_kv); free(q->cmp_kv_state);
+        free(q->cmp_score_state); ds4f_map_free(q->idx_kv);
         free(q->idx_cmp_kv_state); free(q->idx_cmp_score_state);
     }
     free(m->dec_batch_seq); free(m->dec_batch_pos);
     m->dec_batch_seq = NULL; m->dec_batch_pos = NULL;
     m->dec_nseq = m->dec_batch_cap = 0;
+}
+
+static void ds4f_discard_decode_slot(ds4f_model *m, int slot) {
+    if (!m || !m->dec_batch_seq || slot <= 0 || slot >= m->dec_batch_cap) return;
+    int NL = m->cfg.n_layers;
+    for (int L = 0; L < NL; ++L) {
+        ds4f_lseq *q = &m->dec_batch_seq[(size_t)slot * NL + L];
+        ds4f_map_discard(q->kv_cache);
+        ds4f_map_discard(q->cmp_kv);
+        ds4f_map_discard(q->idx_kv);
+    }
 }
 
 /* M2b BATCHED VERIFY: run K positions [pos0, pos0+K) through the 43 layers + head with mHC + tier-B2,

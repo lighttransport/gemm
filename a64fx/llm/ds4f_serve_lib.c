@@ -477,6 +477,7 @@ int ds4f_serve_slot_sample(ds4f_serve *s, int slot, const ds4f_serve_sampling *s
 int ds4f_serve_slot_release(ds4f_serve *s, int slot) {
     if (!s || slot < 0 || slot >= s->slot_cap) return -1;
     s->slot_used[slot] = 0; s->slot_n_hist[slot] = 0;
+    ds4f_discard_decode_slot(s->m, slot + 1);
     return 0;
 }
 
