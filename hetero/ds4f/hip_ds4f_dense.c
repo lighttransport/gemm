@@ -20,6 +20,10 @@
  * slot per member lets a whole group be in flight instead of paying a
  * launch + event-sync + blocking download per tensor. */
 enum { HIP_DS4F_ASYNC_MAX = 8, HIP_DS4F_GEMM_MAX = 256 };
+/* Diagnostic: count/size of individual H2D copies issued for transient
+ * routed-expert uploads, to check whether upload cost is bandwidth-bound
+ * or call-count/latency-bound (PCIe link confirmed full Gen5 x16). */
+long ds4f_route_upload_calls = 0, ds4f_route_upload_bytes = 0;
 
 typedef struct {
     void *dw, *ds;
@@ -876,6 +880,7 @@ static int hip_ds4f_dense_bind_mxfp4_tensor_async_pool(hip_ds4f_dense *ctx,
     if (!ctx->route_pool_ev[j][slot] &&
         hipEventCreate(&ctx->route_pool_ev[j][slot]) != hipSuccess)
         return -1;
+    ds4f_route_upload_calls += 2; ds4f_route_upload_bytes += (long)(wb + sb);
     if (hipMemcpyAsync(ctx->route_pool_dw[j][slot], t->w, wb,
                        hipMemcpyHostToDevice, ctx->stream) != hipSuccess ||
         hipMemcpyAsync(ctx->route_pool_ds[j][slot], t->scale, sb,

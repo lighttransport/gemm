@@ -331,6 +331,11 @@ void ds4f_serve_close(ds4f_serve *s) {
             (double)ds4f_attn_total_nsel / ds4f_attn_gemm_hit,
             ds4f_attn_nh_hd_ws_topk[0], ds4f_attn_nh_hd_ws_topk[1],
             ds4f_attn_nh_hd_ws_topk[2], ds4f_attn_nh_hd_ws_topk[3]);
+        extern long ds4f_route_upload_calls, ds4f_route_upload_bytes;
+        if (ds4f_route_upload_calls) fprintf(stderr,
+            "  route_upload calls=%ld bytes=%.3f GB avg=%.1f KB/call\n",
+            ds4f_route_upload_calls, (double)ds4f_route_upload_bytes / 1e9,
+            (double)ds4f_route_upload_bytes / 1024.0 / ds4f_route_upload_calls);
     }
     if (s->m) ds4f_route_report(s->m, stderr);
 #if defined(DS4F_SERVE_HIP)
