@@ -103,6 +103,30 @@ int ds4f_serve_cache_hot_experts(ds4f_serve *s, int cache_mb,
 
 static int env_i(const char *k, int d) { const char *e = getenv(k); return e && *e ? atoi(e) : d; }
 
+#if defined(DS4F_SERVE_HIP)
+/* Speculative verification calls the exact token kernel directly, so it must
+ * share the ordinary decode path's adaptive-cache bookkeeping explicitly. */
+static void ds4f_serve_adaptive_cache_tick(ds4f_serve *s, int steps) {
+    if (!s || !s->hip || s->ac_period <= 0 || !s->m->route_hits || steps < 1)
+        return;
+    size_t ncand = (size_t)s->m->cfg.n_layers * (size_t)s->m->cfg.n_experts;
+    if (!s->ac_snapshot) {
+        s->ac_snapshot = (uint64_t *)calloc(ncand, sizeof(uint64_t));
+        s->ac_delta = (uint64_t *)malloc(ncand * sizeof(uint64_t));
+    }
+    if (!s->ac_snapshot || !s->ac_delta) return;
+    s->ac_decode_calls += steps;
+    if (s->ac_decode_calls < s->ac_period) return;
+    for (size_t i = 0; i < ncand; ++i)
+        s->ac_delta[i] = s->m->route_hits[i] - s->ac_snapshot[i];
+    hip_ds4f_dense_refresh_hot_experts(s->hip, s->m, s->ac_delta,
+        s->ac_cache_mb, s->ac_reserve_mb,
+        env_i("DS4F_ADAPTIVE_CACHE_STATS", 0));
+    memcpy(s->ac_snapshot, s->m->route_hits, ncand * sizeof(uint64_t));
+    s->ac_decode_calls = 0;
+}
+#endif
+
 typedef struct { float l; int id; } ds4f_pair;
 static int cmp_pair(const void *a, const void *b) {
     const ds4f_pair *pa = (const ds4f_pair *)a, *pb = (const ds4f_pair *)b;
@@ -476,26 +500,8 @@ int ds4f_serve_decode(ds4f_serve *s, int token, int pos) {
     }
     memcpy(s->logits, s->m->s_logits, (size_t)s->vocab * sizeof(float));
 #if defined(DS4F_SERVE_HIP)
-    /* Periodic adaptive hot-expert cache refresh. Safe here: this token's
-     * forward pass (including any routed-FFN GPU work) has already
-     * returned, so eviction cannot race an in-flight kernel. route_hits is
-     * cumulative; ac_snapshot lets us derive a recent-window delta without
-     * touching the per-token routing hot path. */
-    if (s->hip && s->ac_period > 0 && s->m->route_hits) {
-        size_t ncand = (size_t)s->m->cfg.n_layers * (size_t)s->m->cfg.n_experts;
-        if (!s->ac_snapshot) {
-            s->ac_snapshot = (uint64_t *)calloc(ncand, sizeof(uint64_t));
-            s->ac_delta = (uint64_t *)malloc(ncand * sizeof(uint64_t));
-        }
-        if (s->ac_snapshot && s->ac_delta && ++s->ac_decode_calls >= s->ac_period) {
-            for (size_t i = 0; i < ncand; ++i)
-                s->ac_delta[i] = s->m->route_hits[i] - s->ac_snapshot[i];
-            hip_ds4f_dense_refresh_hot_experts(s->hip, s->m, s->ac_delta,
-                s->ac_cache_mb, s->ac_reserve_mb, env_i("DS4F_ADAPTIVE_CACHE_STATS", 0));
-            memcpy(s->ac_snapshot, s->m->route_hits, ncand * sizeof(uint64_t));
-            s->ac_decode_calls = 0;
-        }
-    }
+    /* Safe here: the exact token kernel has returned before cache eviction. */
+    ds4f_serve_adaptive_cache_tick(s, 1);
 #endif
     return ar;
 }
@@ -556,6 +562,9 @@ int ds4f_serve_speculate(ds4f_serve *s, int anchor, int pos, int max_tokens,
     }
     memcpy(s->logits,s->m->s_logits,(size_t)s->vocab*sizeof(float));
     for (int k=0;k<committed;k++) s->hist[s->n_hist++]=out_tokens[k];
+#if defined(DS4F_SERVE_HIP)
+    ds4f_serve_adaptive_cache_tick(s, committed);
+#endif
     free(draft); free(draft_conf);
     return committed;
 }
