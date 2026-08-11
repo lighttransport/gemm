@@ -351,6 +351,19 @@ static int append_device_matrix(hip_ds4f_dense *ctx, void *dw, void *ds,
     return id;
 }
 
+static void release_transient_experts(hip_ds4f_dense *ctx,
+                                      const ds4f_tensor *const *w1,
+                                      const ds4f_tensor *const *w3,
+                                      const ds4f_tensor *const *w2,
+                                      int n, int transient[3][HIP_DS4F_GEMM_MAX]) {
+    const ds4f_tensor *const *w[3] = { w1, w3, w2 };
+    for (int j = 0; j < 3; ++j) for (int s = 0; s < n; ++s)
+        if (transient[j][s] >= 0) {
+            release_matrix(ctx, transient[j][s]);
+            ((ds4f_tensor *)w[j][s])->gpu_id = -1;
+        }
+}
+
 hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise_math) {
     if (rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC) != ROCEW_SUCCESS) {
         fprintf(stderr, "hip_ds4f_dense: failed to initialize HIP/hipRTC\n");
@@ -2180,20 +2193,35 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
         n_experts < 1 || n_experts > 256 || total < 1 || C < 1 || inter < 1 ||
         offsets[0] != 0 || offsets[n_experts] != total)
         return -1;
+    /* Exact mHC/Tier-B2 callers leave routed weights host-resident. Upload
+     * only non-empty expert buckets for this invocation; the temporary matrix
+     * ids are released after synchronization below. */
+    int transient[3][HIP_DS4F_GEMM_MAX];
+    memset(transient, -1, sizeof(transient));
+    for (int s = 0; s < n_experts; ++s) {
+        if (counts[s] <= 0) continue;
+        ds4f_tensor *tw[3] = { (ds4f_tensor *)w1[s], (ds4f_tensor *)w3[s],
+                               (ds4f_tensor *)w2[s] };
+        for (int j = 0; j < 3; ++j) {
+            if (!tw[j] || tw[j]->gpu_id >= 0) continue;
+            transient[j][s] = hip_ds4f_dense_bind_mxfp4_tensor(ctx, tw[j]);
+            if (transient[j][s] < 0) goto routed_transient_fail;
+        }
+    }
     size_t xb = (size_t)total * C * 4, ib = (size_t)total * inter * 4;
     if (hipSetDevice(ctx->device_id) != hipSuccess ||
         ensure_dev_buf(&ctx->ffn_dx, &ctx->ffn_dx_b, xb) != 0 ||
         ensure_dev_buf(&ctx->ffn_dg, &ctx->ffn_dg_b, ib) != 0 ||
         ensure_dev_buf(&ctx->ffn_du, &ctx->ffn_du_b, ib) != 0 ||
         ensure_dev_buf(&ctx->ffn_dy, &ctx->ffn_dy_b, xb) != 0)
-        return -1;
+        goto routed_transient_fail;
     const float *xh = x;
     if (ensure_gemm_host_pack(ctx, xb, xb) == 0) {
         memcpy(ctx->gemm_x_pack, x, xb);
         xh = ctx->gemm_x_pack;
     }
     if (hipMemcpyAsync(ctx->ffn_dx, xh, xb, hipMemcpyHostToDevice,
-                       ctx->stream) != hipSuccess) return -1;
+                       ctx->stream) != hipSuccess) goto routed_transient_fail;
     hip_ds4f_mxfp4_task gate[HIP_DS4F_GEMM_MAX];
     hip_ds4f_mxfp4_task up[HIP_DS4F_GEMM_MAX];
     hip_ds4f_mxfp4_task down[HIP_DS4F_GEMM_MAX];
@@ -2201,7 +2229,7 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
     const hip_ds4f_matrix *a = NULL, *u = NULL, *d = NULL;
     for (int s = 0; s < n_experts; ++s) {
         int cnt = counts[s];
-        if (cnt < 0 || offsets[s] < 0 || offsets[s] + cnt != offsets[s+1]) return -1;
+        if (cnt < 0 || offsets[s] < 0 || offsets[s] + cnt != offsets[s+1]) goto routed_transient_fail;
         if (cnt == 0) continue;
         if (!w1[s] || !w3[s] || !w2[s] || w1[s]->gpu_id < 0 ||
             w3[s]->gpu_id < 0 || w2[s]->gpu_id < 0 ||
@@ -2212,7 +2240,7 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
             !matrix_is_mxfp4(d->kind) || w1[s]->rows != inter ||
             w1[s]->cols != C || w3[s]->rows != inter || w3[s]->cols != C ||
             w2[s]->rows != C || w2[s]->cols != inter)
-            return -1;
+            goto routed_transient_fail;
         size_t offx = (size_t)offsets[s] * C * 4;
         size_t offi = (size_t)offsets[s] * inter * 4;
         void *dx = (uint8_t *)ctx->ffn_dx + offx;
@@ -2229,25 +2257,30 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
     }
     if (active < 1 || launch_mxfp4_tasks(ctx, gate, active) != 0 ||
         launch_mxfp4_tasks(ctx, up, active) != 0)
-        return -1;
+        goto routed_transient_fail;
     int n = total * inter;
     void *dg = ctx->ffn_dg, *du = ctx->ffn_du;
     void *sa[] = { &dg, &du, &n, &lim };
     if (hipModuleLaunchKernel(ctx->swiglu, (unsigned)((n+255)/256), 1, 1,
                               256, 1, 1, 0, ctx->stream, sa, NULL) != hipSuccess ||
         launch_mxfp4_tasks(ctx, down, active) != 0)
-        return -1;
+        goto routed_transient_fail;
     float *out = dst;
     if (ctx->gemm_y_pack && ctx->gemm_y_pack_bytes >= xb) out = ctx->gemm_y_pack;
     if (hipMemcpyAsync(out, ctx->ffn_dy, xb, hipMemcpyDeviceToHost,
                        ctx->stream) != hipSuccess ||
-        hipStreamSynchronize(ctx->stream) != hipSuccess) return -1;
+        hipStreamSynchronize(ctx->stream) != hipSuccess) goto routed_transient_fail;
     if (out != dst) memcpy(dst, out, xb);
     { struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
       ctx->prof_routed_seconds += (double)(t1.tv_sec - prof_t0.tv_sec) +
           1e-9 * (double)(t1.tv_nsec - prof_t0.tv_nsec);
       ctx->prof_routed_calls++; }
+    release_transient_experts(ctx, w1, w3, w2, n_experts, transient);
     return 0;
+
+routed_transient_fail:
+    release_transient_experts(ctx, w1, w3, w2, n_experts, transient);
+    return -1;
 }
 
 int hip_ds4f_dense_oproj(void *opaque,float *dst,const ds4f_tensor *wa,

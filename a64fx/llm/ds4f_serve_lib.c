@@ -229,9 +229,12 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
      * this disabled forced every decode token through host-side MXFP4 expert
      * execution, even after prompt-hot experts had been admitted to VRAM. */
     m->gpu_decode_routed_ffn_enabled = routed_ffn != 0;
-    m->gpu_dense_layer_prefetch = expert_stream
+    /* Exact mHC/Tier-B2 routed execution stages only the selected experts in
+     * hip_ds4f_dense_routed_ffn.  Whole-layer streaming would upload roughly
+     * 3 GB per layer before the router has even selected six experts. */
+    m->gpu_dense_layer_prefetch = expert_stream && !m->mhc && !m->tierb2
         ? hip_ds4f_dense_prefetch_layer_raw : NULL;
-    m->gpu_dense_layer_begin = expert_stream
+    m->gpu_dense_layer_begin = expert_stream && !m->mhc && !m->tierb2
         ? hip_ds4f_dense_begin_layer : NULL;
     m->gpu_dense_stream_prefill_only = expert_stream != 0;
     hip_ds4f_dense_set_prefill_features(s->hip, qkv_fuse,
