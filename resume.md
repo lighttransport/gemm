@@ -1,714 +1,188 @@
-# Resume Prompt: GLM-5.2 FP8 Fugaku Optimization
+# DS4F resume handoff
 
-You are continuing optimization work in:
+Worktree: `/mnt/nvme02/work/gemm/ds4f`
+
+## Objective
+
+Continue toward the user’s actual serving target on CPU + Radeon 9070 XT:
+
+- preserve output quality first;
+- single-stream decode around 18 tok/s;
+- prefill around 100–200 tok/s for 1K+ input;
+- prefix/system/tool-token caching for coding-agent requests;
+- harden long-context and multi-context operation.
+
+Do not redefine success around the current low benchmark. Do not push to any remote without explicit user permission.
+
+## Authoritative model and staging
+
+```text
+GGUF: /mnt/nvme02/models/ds4f-0731/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
+Stage: /tmp/ds4f_nocopy_stage
+Tokenizer: /mnt/nvme02/models/ds4f-0731/tokenizer.json
+Quality prompt IDs: /tmp/ds4f_quality_ids.txt
+Quality config: /tmp/ds4f_quality_exact.json
+```
+
+## Git/source state
+
+Latest relevant commits:
+
+```text
+004c9422 Make transient expert uploads stream ordered
+4901156c Stage only active experts for exact serving
+8329d84d Fix mHC quality diagnostics and routed decode residency
+dc170d69 Fix DS4F routing and grouped prefill
+```
+
+No uncommitted source changes as of 2026-08-11 21:30 — see "Pool-change verdict" below.
+
+Untracked runtime logs (do not commit):
+
+```text
+a64fx/llm/ds4f_frontend.log
+a64fx/llm/ds4f_runner.log
+```
+
+## Pool-change verdict (2026-08-11)
+
+The transient routed-expert upload pool described above was runtime-tested and **reverted**. Mechanically the diff looked sound (owner=1 matrices skip `hipFree` in `release_matrix`, pool storage freed in `clear_matrices`), but under `ds4f_serve_bench.py --prompt-tokens 64 --warm-decode 1 --decode-tokens 2` it hung inside `sess.prefill()` — the standalone bench process loaded its model in ~71s (matches expected load time) then produced no `prefill tokens=...` line before a 180s timeout killed it. No orphan processes, no VRAM growth (idle at ~57 MB before and after). This matches the "prior complete-layer attempt stalled" failure mode already noted below — do not retry the same pooling approach without root-causing the stall first (likely a sync/ordering issue introduced by reusing device pointers across calls while `append_device_matrix` still treats the id as fresh).
+
+`git restore hetero/ds4f/hip_ds4f_dense.c` was applied, then `make -C hetero/ds4f -j4` and `sh a64fx/llm/build_ds4f_serve.sh` both rebuilt clean (pre-existing warnings only). Re-baselined against the reverted (per-call malloc/free) routed FFN path:
+
+```text
+prefill tokens=64 seconds=18.57 tok/s=3.45
+decode  warm=1 tokens=2 seconds=0.42 tok/s=4.77
+```
+
+This matches the previously recorded baseline range and confirms the revert is stable. **Caution for future runs:** `ds4f_serve_bench.py` loads its own full 156GB model standalone — it does not talk to a separately running server. Running it while `run_ds4f_single_serve.sh` is also up causes severe CPU/memory contention (observed prefill dropped to 1.1 tok/s, decode to 0.6 tok/s, purely from resource contention, not a real regression). Stop any running server before using this benchmark script, or use the HTTP server + curl path instead if concurrent operation is required.
+
+## Phase telemetry (2026-08-11, added and measured)
+
+Added per-call phase timing inside `hip_ds4f_dense_routed_ffn` (hetero/ds4f/hip_ds4f_dense.c): `prof_route_upload_seconds` (transient expert hipMalloc + H2D memcpy queuing loop), `prof_route_launch_seconds` (buffer setup + GEMM/SwiGLU kernel launch queuing), `prof_route_sync_seconds` (final D2H copy + `hipStreamSynchronize`, where all previously-queued async stream work actually completes). Printed under the existing `DS4F_PROF=1` env flag alongside the pre-existing `hip_route` line, at context destroy.
+
+Measured with `DS4F_PROF=1` + the "Useful benchmark" command (64 prompt tokens, warm-decode 1, decode-tokens 2), no server running concurrently:
+
+```text
+hip_route     14.689 s  calls=43 avg=341.609 ms
+  upload      13.363 s  avg=310.768 ms (91.0%)
+  launch       0.049 s  avg=1.131 ms   (0.3%)
+  sync         1.278 s  avg=29.710 ms  (8.7%)
+```
+
+**Finding: 91% of routed-FFN wall time is the transient-expert upload phase** (`hipMalloc`+`hipMemcpyAsync` per active expert projection, current code has no pool — reverted above). Kernel launch overhead is negligible (0.3%); the sync/D2H tail (8.7%) is real GPU+copy time. This confirms the earlier pooling instinct was aimed at the right bottleneck, but its implementation stalled at runtime (see verdict above) — root-causing and fixing *that* stall (not abandoning the approach) is the highest-leverage next step. Suspect areas for the stall: reusing a pool slot's device pointer for a new async `hipMemcpyAsync` while a prior kernel might still be reading from it without an intervening sync/event (the old code queued per-expert async copies across multiple calls without any per-slot completion tracking), or an allocator interaction between the routed-FFN stream and the runner's own copy thread (`ctx->stream_copy_thread`).
+
+## Pool retry with per-slot events (2026-08-11, done)
+
+Re-added the transient routed-expert upload pool, this time with a `hipEvent_t` per pool slot: `hip_ds4f_dense_bind_mxfp4_tensor_async_pool()` (hetero/ds4f/hip_ds4f_dense.c) waits on a slot's event (if one was recorded) before reusing its storage, and `hip_ds4f_dense_routed_ffn` records each used slot's event right after all of that call's kernels are enqueued (before the launch-phase timestamp). Ran the same `DS4F_PROF=1` bench with a 180s timeout, no server running concurrently.
+
+**No stall this time** — completed cleanly, no orphan process, VRAM back to idle baseline (~57 MB) after exit. Quality gate re-run (mHC exact, same command as always) still passes: 8/9 argmax match, same token index [2] mismatch as the pre-existing baseline — no regression.
+
+```text
+hip_route     13.533 s  calls=43 avg=314.720 ms
+  upload      12.133 s  avg=282.169 ms (89.7%)
+  launch       0.071 s  avg=1.650 ms   (0.5%)
+  sync         1.329 s  avg=30.901 ms  (9.8%)
+prefill tokens=64 seconds=17.05 tok/s=3.753   (was 3.447)
+decode  warm=1 tokens=2 seconds=0.386 tok/s=5.176  (was 4.691)
+```
+
+**Important finding — the pool did NOT eliminate the upload cost, only ~8-9% of it.** Upload is still 89.7% of routed-FFN time (vs. 91.0% before pooling). Root cause: `release_transient_experts()` unconditionally resets `t->gpu_id = -1` after every call, so even though the pool retains the *device buffer*, the code has no per-expert-identity cache — it re-issues a full `hipMemcpyAsync` of the same weight bytes from host RAM on every call that routes to that expert, regardless of whether the last call routed the same expert to the same slot. The pool only removed `hipMalloc`/`hipFree` call overhead (a real but small win), not the dominant cost, which is genuine PCIe H2D bandwidth for re-transferring MXFP4 expert weights every single routed-FFN call.
+
+This is now committed (small in isolation, but validated stable + quality-clean): telemetry (upload/launch/sync split) and event-guarded pool are both in.
+
+**Next real lever:** cross-call expert-weight residency/caching keyed by expert identity (not just slot-buffer reuse) — e.g. an LRU or hot-expert cache that skips the `hipMemcpyAsync` entirely when the same expert's weights are already resident in a pool slot from a recent call, only re-uploading on eviction. This is different from the abandoned "full-layer resident upload" idea (which tried to keep *all* experts resident and stalled) — this only needs to cache the actually-hot experts across nearby calls with an explicit VRAM budget and eviction policy. Validate incrementally under `DS4F_PROF=1` at each step.
+
+Build already completed successfully:
 
 ```sh
-cd /mnt/nvme02/work/fugaku/work/gemm/glm5-1
+make -C hetero/ds4f -j4
+sh a64fx/llm/build_ds4f_serve.sh
 ```
 
-The real working tree on Fugaku is synced by mutagen:
+The build emits pre-existing warning noise but no compile/link error.
+
+## Quality evidence
+
+Use mHC enabled for the authoritative exact path:
 
 ```sh
-ssh fugaku 'cd ~/work/gemm/glm5-1 && ...'
-mutagen sync flush glm5-1
+hetero/ds4f/build/test_ds4f_real_tokens \
+  --config /tmp/ds4f_quality_exact.json \
+  --stage-dir /tmp/ds4f_nocopy_stage \
+  --prompt-ids /tmp/ds4f_quality_ids.txt --max-tokens 9
 ```
 
-Local git metadata may be broken or point at a Fugaku worktree. Prefer remote git commands:
+The corrected mHC route matched the reference argmax for 8/9 tokens. One W4A8 mismatch remains an expected approximation; do not claim a 9/9 exact gate. The previous large divergence was diagnosed as running the diagnostic with `mhc=0`.
+
+## Serving/performance evidence
+
+The last completed CPU + 9070 XT measurements with exact mHC/Tier-B2 serving were approximately:
+
+```text
+Prefill: 5.1 tok/s at 1024 tokens before active-only staging;
+         about 3.1 tok/s on a 64-token active-only run;
+         5.7 tok/s with DS4F_SERVE_TIERB2=0 at 256 tokens.
+Decode:  about 4.5–6.0 tok/s, depending on configuration.
+```
+
+These are far below the 18 tok/s decode and 100–200 tok/s prefill goals. Do not report the target as achieved.
+
+GPU telemetry observed while idle: total VRAM about 17.1 GB, used about 7.7 GB, leaving about 9.4 GB free.
+
+The server was not running at the end of the previous turn. Saved logs only show successful model load (~156 GB, ~67 s) and listener startup; no crash trace was present. A short benchmark was started after rebuilding the pool, but that command was interrupted before producing runtime output. Check for orphan processes before restarting.
+
+## Server restart command
+
+Restore the server only when needed, using program arguments (not performance environment variables except explicitly supported debug/profile flags):
 
 ```sh
-ssh fugaku 'cd ~/work/gemm/glm5-1 && git status --short && git log --oneline -10'
+env DS4F_STAGE_DIR=/tmp/ds4f_nocopy_stage \
+ DS4F_SERVE_BASE=/tmp/ds4f_cdx \
+ DS4F_TOKENIZER=/mnt/nvme02/models/ds4f-0731/tokenizer.json \
+ DS4F_SERVE_USE_HIP=1 DS4F_HIP_DEVICE=0 LLM_THREADS=16 DS4F_CMGS=4 \
+ ./a64fx/llm/run_ds4f_single_serve.sh \
+ --context-memory-ttl-sec 600 --context-disk-ttl-sec 86400 \
+ --context-memory-mb 512 --context-disk-mb 8192 \
+ --prefill-quantum-tokens 32 --single-prefill-quantum-tokens 2048 \
+ --agent-cache-max-tokens 14336 --runner-timeout-sec 3600 \
+ --decode-quantum-tokens 4 --scheduler-quantum-ms 250 \
+ --hip-mxfp4-wmma 1 --hip-expert-stream 1 --hip-routed-ffn 1 \
+ --hip-expert-cache-mb auto --hip-expert-cache-reserve-mb 1536 \
+ --hip-expert-cache-stats 1 --default-temperature 0.0 --default-top-p 1.0
 ```
 
-Do not push without explicit user permission.
-
-## Current State
-
-Target: GLM-5.2 FP8 real weights on Fugaku A64FX, optimizing chunked prefill and long-context viability. Weights/tokenizer are under:
+Verify with:
 
 ```sh
-~/models/glm52-fp8
+curl -s --max-time 5 http://127.0.0.1:8080/health
+curl -s --max-time 5 http://127.0.0.1:8080/v1/progress
 ```
 
-Important recent commits on remote:
+## Required next work
 
-```text
-6af832a Fix GLM5 prefill router GEMM reading bf16 gate as f32
-65deada Tier-drive MSA: auto-disable for single Tier A
-230a56d Context-tiered prefill: auto Tier A (un-sharded) -> Tier B (CP)
-4a19895 Make GLM5 EP runner barrier robust for 384-node incast
-5005c28 Add GLM5 prefill node-scaling scripts, NUMA opt, and scaling study
-7f4bb51 Raise tp_allreduce TP_AR_MAXN and NSTEP for 384-node EP groups
-d5513d3 Raise GLM5 EP runner MAX_NODES to 512 for 384-node runs
-21ec0ff Default GLM5 FP8 GEMM to 5-token blocking
-9eb2aa6 Block 4 tokens in GLM5 FP8 batched GEMM inner kernel
-2767bea Parallelize GLM5 CP prefill attention with ordered combine
-7f80fce Serialize GLM5 CP prefill combines
-d2f8fbb Cap GLM5 allreduce token window
-35e5d06 Cap GLM5 prefill allreduce payload
-9db922a Reduce GLM5 long-context allreduce slots
-46b7ff5 Optimize GLM5 FP8 prefill allreduce
-974747f Shard GLM5 shared FP8 blocks
-49c898d Optimize GLM5 FP8 batched GEMM
-afba912 Fix GLM5 FP8 192-node prefill layout
-ef7982d Optimize GLM5 FP8 block-scale decode
-8c86c41 Optimize GLM5 FP8 batched prefill
-```
+1. ~~Inspect `git diff` for the reusable pool and run a short benchmark with a timeout.~~ Done 2026-08-11: original (non-event-guarded) version stalled during prefill and was reverted. See "Pool-change verdict" above.
+2. ~~Add phase-level serving telemetry inside routed FFN.~~ Done 2026-08-11: see "Phase telemetry" above.
+3. ~~Retry pooling with per-slot event guards.~~ Done 2026-08-11: stable, quality-clean, modest win (~8-9%). See "Pool retry with per-slot events" above. **The dominant cost (upload, ~90% of routed-FFN time) is real PCIe transfer of expert weights, not allocator overhead — pooling buffers wasn't enough.**
+4. Implement cross-call expert-weight caching keyed by expert identity (skip the H2D copy on a cache hit), with an explicit VRAM budget and eviction policy — this is the next real lever per the finding in step 3. Not started. Validate incrementally under `DS4F_PROF=1`; do not attempt full-layer resident uploads (a separate prior attempt at that stalled).
+5. Test 256, 1024, and 8192-token prefills (quality gate for the pool retry already passed at 9-token scale). Watch VRAM and abort unsafe runs.
+6. Benchmark warmed single decode separately from prefill. Prefix/tool caching is implemented in the server but has not improved throughput; verify cache hit, prompt token count, and processing phase through `/v1/progress` before tuning residency.
+7. Continue committing incrementally (telemetry + event-guarded pool are already committed, see below) — after each further runtime-stable, measurably-improving change, commit with a short imperative subject and report the hash plus exact commands/results.
 
-Key files:
+**Reminder:** `ds4f_serve_bench.py` loads its own model standalone — stop any running `run_ds4f_single_serve.sh` server first, or numbers will be contention-skewed (see verdict above).
 
-```text
-a64fx/glm5/glm5_ep_runner.c
-common/glm5_impl.h
-a64fx/glm5/pjsub_glm5_prefill_fp8_96n_noncontig.sh
-a64fx/glm5/pjsub_glm5_prefill_fp8_192n.sh
-```
-
-Build command on Fugaku:
+## Useful benchmark
 
 ```sh
-ssh fugaku 'cd ~/work/gemm/glm5-1 && PATH=/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH make -C a64fx/llm glm5_stage glm5_ep_runner CC=fccpx OPENMP=1'
+timeout 180s env DS4F_STAGE_DIR=/tmp/ds4f_nocopy_stage \
+ DS4F_TOKENIZER=/mnt/nvme02/models/ds4f-0731/tokenizer.json \
+ DS4F_SERVE_USE_HIP=1 DS4F_HIP_DEVICE=0 LLM_THREADS=16 DS4F_CMGS=4 \
+ python3 a64fx/llm/ds4f_serve_bench.py \
+ --stage-dir /tmp/ds4f_nocopy_stage \
+ --tokenizer /mnt/nvme02/models/ds4f-0731/tokenizer.json \
+ --prompt-tokens 64 --warm-decode 1 --decode-tokens 2 \
+ --threads 16 --cmgs 4 --hip-device 0 --hip-mxfp4-wmma 1 \
+ --hip-routed-ffn 1 --hip-expert-stream 1 --hip-expert-cache-mb 0
 ```
 
-Expected warning: `_GNU_SOURCE macro redefined`. This warning is currently benign.
-
-## Important Runner Knobs
-
-Allreduce slot sizing:
-
-```text
-GLM5_AR_AUTO_CAP=256   # auto cap for inferred ar_tokens
-GLM5_AR_HARD_CAP=64    # hard cap, also caps explicit GLM5_AR_TOKENS unless set to 0
-GLM5_AR_TOKENS=N       # explicit requested allreduce token window
-```
-
-The hard cap was added because `GLM5_AR_TOKENS=1024` registered/reduced about 24 MiB per collective and caused `tp_ar ... bcast timeout`. With `GLM5_AR_HARD_CAP=64`, the same job succeeds.
-
-Long-context CP:
-
-```text
-GLM5_CP=1
-GLM5_INT4_KV=1
-GLM5_MSA=1
-GLM5_MAXPOS=1048576
-```
-
-For CP, `ar_tokens` defaults to 1. As of commit `2767bea`, the CP prefill attention loop in `common/glm5_impl.h` (`glm5_forward_prefill_chunk`) is split into two phases: the per-token flash-attention math runs fully OpenMP-parallel (it touches no uTofu, only per-token scratch `ms->kvb`/`ms->v`/`ms->attn` plus new per-token `ms->hmx`/`ms->hse`), and the uTofu `kv_combine_cb` is deferred to a serial token-ordered loop so every rank still issues collectives in identical order. This replaced the earlier fully-serial loop (commit `7f80fce`) that had been added to dodge the `TOQ Direct Descriptor Exception` from concurrent uTofu. Verified: no descriptor/timeout errors, NaNs=0, and 1M CP prefill went 1.07 -> 3.59 tok/s (attn 746 -> 88 ms/tok).
-
-Communication overlap:
-
-```text
-GLM5_COMM_OVERLAP=1
-```
-
-This uses a dedicated comm-driver thread for routed expert allreduce while shared expert compute runs.
-
-## Reproduction Commands
-
-Flush local changes before remote build/job submission:
-
-```sh
-mutagen sync flush glm5-1
-```
-
-Build:
-
-```sh
-ssh fugaku 'cd ~/work/gemm/glm5-1 && PATH=/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH make -C a64fx/llm glm5_stage glm5_ep_runner CC=fccpx OPENMP=1'
-```
-
-Check queue:
-
-```sh
-ssh fugaku 'pjstat | egrep "glm5|JOB_ID|492"'
-```
-
-Stable 96-node baseline (best config: `pchunk=256 + TP_SHARED=1 + COMM_OVERLAP=1`, 16.67 tok/s
-with the default tok=5 FP8 GEMM kernel):
-
-```sh
-ssh fugaku 'cd ~/work/gemm/glm5-1 && pjsub --no-check-directory \
-  -x GLM5_MAXPOS=2048 \
-  -x GLM5_PREFILL_SYNTH=1024 \
-  -x GLM5_CP=0 \
-  -x GLM5_INT4_KV=0 \
-  -x GLM5_MSA=0 \
-  -x GLM5_PCHUNK_SWEEP=256 \
-  -x GLM5_TP_SHARED=1 \
-  -x GLM5_THREAD_SWEEP=24 \
-  -x GLM5_COMM_OVERLAP=1 \
-  -x TP_AR_BF16=1 \
-  a64fx/glm5/pjsub_glm5_prefill_fp8_96n_noncontig.sh'
-```
-
-Bounded large-chunk test, explicitly asking for 1024 allreduce tokens but hard-capped to 64:
-
-```sh
-ssh fugaku 'cd ~/work/gemm/glm5-1 && pjsub --no-check-directory \
-  -x GLM5_MAXPOS=2048 \
-  -x GLM5_PREFILL_SYNTH=1024 \
-  -x GLM5_CP=0 \
-  -x GLM5_INT4_KV=0 \
-  -x GLM5_MSA=0 \
-  -x GLM5_TP_SHARED=1 \
-  -x GLM5_PCHUNK_SWEEP=1024 \
-  -x GLM5_THREAD_SWEEP=12 \
-  -x GLM5_AR_TOKENS=1024 \
-  a64fx/glm5/pjsub_glm5_prefill_fp8_96n_noncontig.sh'
-```
-
-Short 1M-context CP smoke:
-
-```sh
-ssh fugaku 'cd ~/work/gemm/glm5-1 && pjsub --no-check-directory \
-  -x GLM5_PREFILL_SYNTH=128 \
-  -x GLM5_PCHUNK_SWEEP=64 \
-  -x GLM5_THREAD_SWEEP=12 \
-  a64fx/glm5/pjsub_glm5_prefill_fp8_96n_noncontig.sh'
-```
-
-192-node stable config:
-
-```sh
-ssh fugaku 'cd ~/work/gemm/glm5-1 && pjsub --no-check-directory \
-  -x GLM5_MAXPOS=2048 \
-  -x GLM5_PREFILL_SYNTH=1024 \
-  -x GLM5_CP=0 \
-  -x GLM5_INT4_KV=0 \
-  -x GLM5_MSA=0 \
-  -x GLM5_PCHUNK_SWEEP=64 \
-  -x GLM5_THREAD_SWEEP=12 \
-  a64fx/glm5/pjsub_glm5_prefill_fp8_192n.sh'
-```
-
-Note: `pjsub_glm5_prefill_fp8_192n.sh` defaults `GLM5_TP_FFN=0` because 192-way dense FFN column shards can be 64 wide and violate FP8 128-column scale-block alignment.
-
-## Log Collection
-
-For a job id:
-
-```sh
-ssh fugaku 'cd ~/work/gemm/glm5-1 && \
-  id=49289251; \
-  d=$(ls -d a64fx/glm5/prefill_fp8_run_${id}_* 2>/dev/null | head -1); \
-  echo dir=$d; \
-  tail -200 "$d/glm5_ep_rank00.txt"; \
-  tail -120 "$d/glm5_ep_stderr_rank00.txt"; \
-  tail -120 pjsub_glm5_prefill_fp8_*${id}.out'
-```
-
-Concise metric extraction:
-
-```sh
-ssh fugaku 'cd ~/work/gemm/glm5-1 && \
-  grep -hE "allreduce:|CP ON|comm-overlap|prefill_progress:|prefill_synth:|PROFILE prefill_synth|SENTINEL|FATAL|timeout|Direct Descriptor|PLE" \
-  a64fx/glm5/prefill_fp8_run_*/glm5_ep_rank00.txt \
-  a64fx/glm5/prefill_fp8_run_*/glm5_ep_stderr_rank00.txt 2>/dev/null'
-```
-
-## Known Results
-
-### Context-tiered prefill (2026-06-22, commits 230a56d + 65deada) -- single binary auto-switches
-
-The 1M-capable CP config (CP=1/MSA=1/INT4=1) ran a flat ~2 tok/s at EVERY context length at 384n
-(per-token CP combine + 384-way comm dominate). A single binary now auto-picks the algorithm by
-context length, no env code path:
-- Tier A (ctx <= T_cp): cp_on=0 bf16, KV replicated, MSA OFF (dense, exact, faster) -- the fast path.
-- at T_cp: glm5_prefill_to_cp re-shards the KV in place (LOCAL, ~21ms: keep CP-owned blocks, bf16->int4).
-- Tier B (ctx > T_cp): cp_on=1 int4 CP-sharded, MSA on -- the 1M path.
-T_cp from the per-rank KV memory budget (GLM5_KV_BUDGET_GB, ~39k at 4GB). GLM5_CP_THRESHOLD<0 keeps
-legacy static env-CP for A/B.
-
-```text
-384n, 8k ctx (single Tier A), TP_SHARED=1:
-  CP-from-start (old):        ~2.05 tok/s    (flat across all ctx)
-  tiered, MSA=1 (TP_SHARED=0): 4.79
-  tiered, MSA auto-off:       13.26 tok/s comm 51% (with commit 7f6d620) -- 6.5x over CP-from-start
-  forced-CP 8k (batched combine): 2.30 (vs ~2.05; per-token CP combine + 384-way comm inherent)
-  (MSA=1 cripples Tier A; auto-tier disables MSA for single Tier A. 7f6d620 batched the CP combine
-   AND widened the prefill allreduce window ar_tokens 1->64 (max_count 6144->393216), cutting frags
-   ~45x (1.28M->28k) -> comm 69%->51% -> Tier A ~8 -> 13.26. Absolute still comm-bound at 384 ranks.)
-real 24n transition correctness (ctx=2048@512): re-shard 21ms, NaNs=0, SENTINEL done.
-```
-
-Recommend `TP_SHARED=1` for the tiered path. Out of scope (measured dead-end): 4-rank node scaling.
-
-### Scaling study (2026-06-22) — practical ceiling ~18.7 tok/s; 50 needs re-architecture
-
-Full study + the 4-ranks-per-node design: `a64fx/doc/glm5_prefill_scaling.md`. Short-context
-(CP=0, maxpos=2048), 96n, pchunk=256, tok=5, comm-overlap, synth=1024:
-
-```text
-threads 12/24/48:                16.5 / 18.5 / 14.1 tok/s   (th=48 REGRESSES: cross-CMG fork-join)
-th=48 + numactl interleave+pin:  16.3 (spread) / 13.2 (close)  -- still < th=24
-th=24 + numactl interleave:      18.65  (flat vs no-NUMA)
-nodes 48/96 (TP_SHARED=1):       15.7 / 16.5   (head-sharding saturates at 64 heads)
-TP_SHARED 0->1:                  +10-14%, comm 60%->35%
-TP_FFN=1:                        no gain (dense FFN only 3/78 layers)
-pure-EP (all TP off):            OOM (59 GB arena > 31 GB) -- dense must be TP-sharded
-384n short (CP=0):               15.83 tok/s  (now runs end-to-end; see 384-node enablement below)
-bf16 allreduce (TP_AR_BF16=1):   +9% CONFIRMED on torus: fp32 16.09 -> bf16 17.55, comm 43%->33%, argmax IDENTICAL
-TP_ATTN=0 (drop o_proj reduce):  3.05 tok/s  -- DEAD END (64 heads / 96 ranks: un-shard = 64x attn)
-```
-
-**Noncontig placement variance is large (~±20%)** -- it masked the bf16-AR signal. On TORUS (192n,
-consistent placement) bf16-AR is a confirmed **+9%** (16.09->17.55 tok/s, comm 43%->33%, argmax
-IDENTICAL fp32-vs-bf16 -> output-equivalent on synth). Recommend `TP_AR_BF16=1`. Router
-GEMM bf16-as-f32 over-read fixed (commit 6af832a, correctness). Multi-rank/node uTofu addressing
-fixed (commit, distinct TNI per local rank) -- 2-ranks/node now runs (17.34 tok/s, 192 ranks). 4-rank
-staging blocked on /local. **4-ranks/node MEASURED (40L test): 16.0 tok/s, WORST** (1-rank th24=40.3,
-th48=27.1). More ranks backfire: 384-way comm explodes (61%) + un-shardable replicated dense
-recomputed per rank + attention caps at 64 heads. Phase 2 CLOSED -- 2-CMG/th24 is the genuine
-optimum; ~20 tok/s (78L) is the A64FX ceiling. See a64fx/doc/glm5_prefill_scaling.md.
-
-**Best: ~18.7 tok/s** (96n, th=24, TP_SHARED=1, pchunk=256, tok=5, overlap). Three mutually
-reinforcing limits cap it: (1) OpenMP cross-CMG fork-join → usable compute ~2 of 4 CMGs;
-(2) 31 GB/node forces TP sharding (can't replicate to kill comm); (3) comm ~48% at that ceiling.
-The DUMMY comm-floor probe and pure-EP both crashed (dummy path bit-rotted; pure-EP OOM), so the
-floor was inferred. The only path to ~50 tok/s is **4 MPI ranks/node (1/CMG) sharing dense
-weights via mmap + hierarchical allreduce** — a real re-architecture, not a tuning knob (design
-in the doc). NOTE: only 12 of 48 cores/node are used today; `th=24` (2 CMGs) over the old `th=12`
-default is a free ~+12%.
-
-### 384-node enablement (2026-06-22) — 4 scaling walls fixed, now runs end-to-end
-
-A 384-node EP run hit four successive walls, each fixed:
-1. `MAX_NODES 256->512` (runner topo reader exit) — commit `d5513d3`.
-2. `TP_AR_MAXN 256->512` (tp_comm_init nprocs guard) — commit `7f4bb51`.
-3. `TP_AR_NSTEP 9->11` (recv-slot count: N=384 bcast_sid=9 hit the guard) — `7f4bb51`.
-4. Non-robust barrier hung on the 383->1 fan-in **incast** (puts drop under TNI congestion;
-   non-robust = no retry) — made `barrier()` robust, commit `4a19895`.
-Result: 384n prefill (synth=1024, CP=0, pchunk=256, TP_SHARED=1) = 15.83 tok/s, NaNs=0,
-`SENTINEL glm5_prefill_384n=done`. Slightly below 96n (16.5) — comm grows with rank count, as
-the flat node-scaling predicts. Use `a64fx/glm5/pjsub_glm5_prefill_fp8_384n_noncontig.sh`.
-
-### Latest (2026-06-21, commit `21ec0ff` — FP8 GEMM 5-token blocking)
-
-The stable path was FP8-GEMM-bound (`shared`+`qkv` ~65%). The batched GEMM
-(`glm5_gemm_mxfp8`) decodes each 8-row x 512-col tile to bf16 once, then runs the inner matvec
-over all N tokens. That inner loop is L1-load-bound on the bf16 weight tile — decoding to f32
-instead (2x tile bytes) measured 21% SLOWER (269 -> 212 Gop/s), proving weight-tile traffic, not
-FP-pipe throughput, is the limit. Fix: block more tokens per widened-weight load (`glm5_bf16_4row_
-{4,5}x_acc`) — cuts relative weight traffic and exposes more independent FMA chains. tok=5 uses
-20 acc + 4 w + 1 x = 25 SVE regs. `GLM5_FP8_GEMM_TOK` selects 5 (default), 4, or 3 (previous);
-all bit-exact (max_rel unchanged at 1.42e-6).
-
-```text
-kernel bench (1n, N=256 rows=2048 cols=6144):  tok=3 230  ->  tok=4 295  ->  tok=5 330 Gop/s
-full 96n prefill pchunk=256 TP_SHARED=1 overlap, matched A/B:
-  job 49289888 tok=3  14.52 tok/s  qkv 17.36 ms/tok  shared 29.59  wall 70.5 s
-  job 49289887 tok=4  15.70-15.84  qkv 13.6-13.8     shared 27.0
-  job 49289940 tok=5  16.67 tok/s  qkv 11.45 ms/tok  shared 25.09                <- new 96n best
-=> tok=3->5 +14.8% overall; qkv -34%, shared -15%, comm unchanged; NaNs=0.
-```
-
-pchunk sweep (TP_SHARED=1, overlap, synth=1024): pchunk=128 14.94, **256 15.84+**, 512 14.11 —
-256 is still the optimum. Best 96n stable config: `pchunk=256 + TP_SHARED=1 + COMM_OVERLAP=1` at
-16.67 tok/s (default tok=5). `shared` is still ~42% — the FP8 GEMM stays the top cost (next
-levers: tok=6 / 16-row decode tiles, or shared-expert FLOP reduction).
-
-### Earlier (2026-06-21, commit `2767bea` — CP parallel combine)
-
-1M-context CP smoke, parallel-combine vs the earlier serial combine (both 96n, synth=128, `GLM5_CP=1 INT4_KV=1 MSA=1 MAXPOS=1048576`, pchunk=64):
-
-```text
-job 49289784 (parallel combine, 2767bea): 128 tok 3.59 tok/s comm 18.5% NaNs=0
-  wall=35.70 s  attn 88.425 ms/tok (31.8%)  o_proj 75.1 (27%)  shared 51.0 (18%)  qkv 34.9 (12.5%)
-job 49289446 (serial combine, 7f80fce):   128 tok 1.07 tok/s comm  8.2% NaNs=0
-  wall=119.5 s  attn 746.539 ms/tok (80.0%)
-=> 3.35x overall, 8.4x on attention; no TOQ Direct Descriptor / bcast timeout.
-```
-
-96n stable-prefill pchunk sweep, all `GLM5_COMM_OVERLAP=1`, no CP/MSA/int4, synth=1024:
-
-```text
-job 49289788  pchunk=64                10.95 tok/s comm 56.9%
-job 49289789  pchunk=128               12.00 tok/s comm 56.3%
-job 49289790  pchunk=256               12.24 tok/s comm 54.8%
-job 49289817  pchunk=256 TP_SHARED=1   14.34 tok/s comm 37.3%   <- new 96n best
-(prior 49289533 pchunk=1024            10.54 tok/s comm 26.9%)
-```
-
-Best 96n stable config is `pchunk=256 + TP_SHARED=1 + COMM_OVERLAP=1` at 14.34 tok/s (+36% over
-the old pchunk=1024 baseline). Sharding the shared expert (`TP_SHARED=1`) cuts both per-rank
-shared-GEMM rows and comm % (54.8% -> 37.3%). Replicated `pchunk=256` alone is 12.24 tok/s; the
-pchunk optimum is mid-range, not the largest chunk. At 14.34 tok/s `shared` is still 42.3%
-(29.4 ms/tok) and `qkv_proj` 22.1% (15.3 ms/tok) — the path is FP8-GEMM-bound.
-
-192n overlap retest, `pchunk=64 COMM_OVERLAP=1`, synth=1024:
-
-```text
-job 49289786  1024 tok 10.70 tok/s comm 51.8% NaNs=0
-  qkv 15.7  attn 3.37  o_proj 23.2 (25%)  router 13.2  shared 28.4 (30.6%)  dense_ffn 6.0
-```
-
-Overlap helps 192n (vs 9.61 non-overlap job 49289532, ~5.95 old baseline) but 192n is comm-bound (o_proj allreduce 25% + 51.8% comm).
-
-### Earlier results
-
-96-node, non-contig, full 78 layers, FP8, `pchunk=64`, `GLM5_COMM_OVERLAP=1`, no CP/MSA/int4:
-
-```text
-job 49289251
-prefill_synth: 1024 tok 11.01 tok/s comm 56.9% calls=3521 frags=3521 pchunk=64 argmax=16 NaNs=0
-PROFILE wall=92.991031 s tokens=1024 comm=52.902536 s
-qkv_proj 15.733 ms/tok
-attn      3.370 ms/tok
-o_proj   24.697 ms/tok
-router   13.168 ms/tok
-experts   2.674 ms/tok
-shared   29.574 ms/tok
-```
-
-This is a major speedup from the earlier non-overlap 96-node run at about `4.25 tok/s`.
-
-96-node, non-contig, `pchunk=1024`, `TP_SHARED=1`, explicit `GLM5_AR_TOKENS=1024`, hard cap active:
-
-```text
-job 49289431
-allreduce: max_count=393216 floats ar_tokens=64 pchunk=1024 mstream=1 ar_auto_cap=256 ar_hard_cap=64
-prefill_synth: 1024 tok 10.55 tok/s comm 27.7% calls=1181 frags=3521 pchunk=1024 argmax=16 NaNs=0
-PROFILE wall=97.090014 s tokens=1024 comm=26.923229 s
-qkv_proj 26.745 ms/tok
-attn      4.883 ms/tok
-o_proj   10.211 ms/tok
-router    7.972 ms/tok
-shared   40.672 ms/tok
-```
-
-Without the hard cap, `pchunk=1024`, `ar_tokens=1024` failed:
-
-```text
-jobs 49289241, 49289242
-allreduce: max_count=6291456 floats ar_tokens=1024 pchunk=1024
-tp_ar: rank 0 bcast timeout sid=7/8 want=1025 got=1024
-```
-
-96-node, non-contig, 1M context CP smoke after CP combine serialization:
-
-```text
-job 49289446
-GLM5_CP=1 GLM5_INT4_KV=1 GLM5_MSA=1 GLM5_MAXPOS=1048576
-allreduce: max_count=6144 floats ar_tokens=1 pchunk=64
-CP ON: KV sharded block-cyclic (block=128) over 96 ranks, 11008 slots/rank, int4_kv=1
-prefill_synth: 128 tok 1.07 tok/s comm 8.2% calls=10269 frags=50049 pchunk=64 argmax=15 NaNs=0
-PROFILE wall=119.515317 s tokens=128 comm=9.812756 s
-attn 746.539 ms/tok, 80.0% of measured time
-```
-
-Before serialization, the same CP smoke failed:
-
-```text
-job 49289250
-utofu: asynchronous error: TOQ Direct Descriptor Exception on TNI 00 CQ 00
-```
-
-## Current Interpretation
-
-1. `GLM5_COMM_OVERLAP=1` is the biggest proven win for the stable 96-node prefill path.
-2. Very large allreduce registered windows are unsafe. Keep `GLM5_AR_HARD_CAP=64` unless doing controlled uTofu experiments.
-3. CP + 1M context is now both viable AND much faster: commit `2767bea` made the CP attention math OpenMP-parallel while keeping the uTofu combine serial+ordered. 1M CP went 1.07 -> 3.59 tok/s; attention fell from 80% to 31.8% of time. With attention parallelized, `o_proj` (27%) and `shared` (18%) are now the next CP costs.
-4. Best stable 96n config is `pchunk=256 + TP_SHARED=1 + COMM_OVERLAP=1` at **16.67 tok/s** (default tok=5 FP8 GEMM kernel, commit `21ec0ff`). Sweep (overlap on): pchunk 64=10.95, 128=12.00, 256=12.24 replicated; `TP_SHARED=1` -> 14.5; 4-token GEMM -> 15.8; 5-token GEMM -> 16.67. The pchunk optimum is mid-range, not the largest.
-5. The FP8 batched GEMM inner loop is L1-load-bound on the bf16 weight tile (f32 tile is slower; more token blocking is faster). At 16.67 tok/s `shared` is still ~42% — the FP8 GEMM remains the top cost. Next levers: tok=6 (24 acc + 4 w = 28 regs), 16-row decode tiles for more FP8-decode reuse, or shared-expert FLOP reduction.
-
-## Recommended Next Work
-
-Priority 1 (DONE, commit `2767bea`): CP prefill combine is now ordered-but-parallel. The
-attention math runs OpenMP-parallel; `kv_combine_cb` is deferred to a serial token-ordered
-loop. 1M CP: 1.07 -> 3.59 tok/s, attn 746 -> 88 ms/tok, NaNs=0, no uTofu descriptor errors.
-
-Priority 2: Now that attention is parallel, CP is gated by `o_proj` (27%) and `shared` (18%),
-not attention. Next CP levers:
-- Test `GLM5_AR_TOKENS=2/4/8` for CP — the combine is now ordered/serial so the uTofu ordering
-  invariant holds; CP still fragments heavily (`calls=10269 frags=50049` for 128 tokens at
-  ar_tokens=1). Raise cautiously and watch for descriptor/timeout regressions.
-- The CP combine is still fully serial over tokens; if it becomes the bottleneck at larger
-  ar_tokens, consider a comm-driver queue so one thread drains uTofu while compute prepares
-  later tokens (the `comm_driver` thread in `glm5_ep_runner.c` is a template).
-
-Priority 3 (DONE): best stable 96n config is `pchunk=256 + TP_SHARED=1 + COMM_OVERLAP=1` at
-14.34 tok/s (job 49289817). Sweep: pchunk 64=10.95, 128=12.00, 256=12.24 replicated; adding
-`TP_SHARED=1` at pchunk=256 -> 14.34 tok/s and drops comm 54.8% -> 37.3%. `TP_SHARED=1` at the
-other pchunk values is untested and may improve them too. To re-run the pchunk sweep, submit
-SEPARATE jobs per value — `pjsub -x` splits a space-separated `GLM5_PCHUNK_SWEEP="64 128 256"`
-and fails with `File open failed: 128`; loop in the shell instead:
-
-```sh
-ssh fugaku 'cd ~/work/gemm/glm5-1 && for pc in 64 128 256; do pjsub --no-check-directory \
-  -x GLM5_MAXPOS=2048 -x GLM5_PREFILL_SYNTH=1024 \
-  -x GLM5_CP=0 -x GLM5_INT4_KV=0 -x GLM5_MSA=0 \
-  -x GLM5_COMM_OVERLAP=1 -x GLM5_PCHUNK_SWEEP=$pc -x GLM5_THREAD_SWEEP=12 \
-  a64fx/glm5/pjsub_glm5_prefill_fp8_96n_noncontig.sh; done'
-```
-
-Priority 4 (DONE): 192-node overlap retest = 10.70 tok/s (job 49289786), up from 9.61 without
-overlap and ~5.95 old baseline. 192n is comm-bound (o_proj allreduce 25% + comm 51.8%); the
-next 192n lever is reducing o_proj/route allreduce volume, not pchunk.
-
-Priority 5 (PARTIALLY DONE, commits `9eb2aa6` + `21ec0ff`): The stable path is FP8-GEMM-bound.
-The batched GEMM inner loop is L1-load-bound on the bf16 weight tile (f32 tile 21% slower). Added
-token blocking (`glm5_bf16_4row_{4,5}x_acc`, `GLM5_FP8_GEMM_TOK=5` default): kernel tok=3 230 ->
-tok=5 330 Gop/s, full 96n 14.52 -> 16.67 tok/s (+14.8%, matched A/B). Remaining GEMM levers:
-- tok=6 (`glm5_bf16_4row_6x_acc`, 24 acc + 4 w = 28 SVE regs) — diminishing (load:FMA 2.22->2.40).
-- 16-row decode tiles (decode 16 rows once) to amortize the FP8->bf16 decode further; needs more
-  accumulators or a second decode-reuse pass over the staged tile.
-- shared-expert FLOP reduction (it stays ~42% of wall even after the kernel wins).
-Use the 1-node `glm5_fp8_kernel_test` for fast A/B (build `make glm5_fp8_kernel_test CC=fccpx
-OPENMP=1`; submit `pjsub_glm5_fp8_kernel_test_1n.sh` with `-x GEMM_N=256 -x GLM5_FP8_GEMM_TOK=N`);
-it prints `FP8_GEMM ... Gop/s` and checks bit-exactness. NOTE: node-to-node speed varies ~10%, so
-trust same-batch A/B deltas, not absolute Gop/s across jobs. PJM `.out` lands in the submit dir
-(`~/work/gemm/glm5-1`), not `a64fx/glm5`.
-
-## Commit Workflow
-
-After edits:
-
-```sh
-mutagen sync flush glm5-1
-ssh fugaku 'cd ~/work/gemm/glm5-1 && git diff --check'
-ssh fugaku 'cd ~/work/gemm/glm5-1 && PATH=/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH make -C a64fx/llm glm5_ep_runner CC=fccpx OPENMP=1'
-ssh fugaku 'cd ~/work/gemm/glm5-1 && git add <files> && git commit -m "<imperative subject>"'
-```
-
-Do not remove untracked run directories or PJM artifacts unless explicitly asked.
-
-## Data-parallel prefill groups + dynamic merge (glm5-2, Jun 2026)
-
-Split the N-rank EP pool into G independent groups: group-local ep_rank/ep_size, group-scoped
-gbarrier + tp_comm (PeerVcq+GBase). Each group prefills its own sequence; short context fits across
-far fewer than all ranks, so groups recover the wasted per-token collective overhead as aggregate
-throughput.
-
-Phase 1 (static, GLM5_PREFILL_GROUPS=G), 384n @ 8k, all NaNs=0:
-  1x384 = 13.3 | 2x192 = 29.0 (2.2x) | 4x96 = 60.5 tok/s (4.6x).
-  Per-group rate rises as groups shrink (cheaper collectives): 13.3 -> 14.5 -> 15.1; single ep96
-  = 15.96. pick_groups auto-selects the largest G whose Tier-A KV budget at ep=N/G holds the
-  target ctx; GLM5_PREFILL_GROUPS overrides. glm5_stage shards group-locally (rank %= ep_size);
-  384n script sets GLM5_EP_SIZE=NP/NGRP (do NOT name the bash var GROUPS - reserved array).
-
-Phase 2 (dynamic merge, GLM5_MERGE_AT=p1:p2): one job traverses 4x96->2x192->1x384 as the
-  surviving (even-subgroup) sequence grows; concurrency steps 4->2->1. Each merge:
-  - routed experts: LOCAL drop (glm5_group_expert_drop) - new owner e%2g already holds it since
-    both sibling subgroups staged the full model (no transfer);
-  - TP-dense weights: in-place re-slice from the node-local blob (glm5_group_tp_reslice) - stage
-    keeps dense un-sharded, so each rank re-slices its new ep shard locally (no transfer);
-  - KV: uTofu pairwise propagate even->odd with dc-civac cache coherence (glm5_group_kv_propagate);
-  - comm/gbarrier rebuilt over the merged group.
-  Validated LOSSLESS: 24n ep12->ep24 survivor argmax 60590 == G=1 ref, NaNs=0. 384n ladder:
-  merges 18.2s/30.2s, survivor 8192 tok NaNs=0, per-tier survivor 17.2/14.9/13.6 tok/s.
-  NOTE: pjsub -x splits on commas -> use : in GLM5_MERGE_AT. Commits on glm5-2 (unpushed):
-  288de08b 9825950c f68c632d 8e852f77 e34fd707.
-
----
-
-# Resume Prompt: DS4F-0731 A64FX 12-node optimization
-
-This section is the current DS4F handoff. Work in:
-
-```sh
-cd /vol0006/mdt0/data/hp250467/work/gemm/ds4f
-```
-
-The active allocation used for the measurements was PJM job `49921978`, with
-12 A64FX nodes/ranks. The staged 0731 weights are:
-
-```text
-/local/ds4f-0731-49921978
-```
-
-The source model/tokenizer are under `$HOME/models/ds4f-0731`. `/local` is
-session-local and may be wiped after a restart. Re-stage only if the staged
-rank blobs are missing; staging must remain chunked (`DS4F_STAGE_FLUSH_GB=1`)
-to avoid filling the page cache with the full model.
-
-## Current measured status
-
-The exact/quality-preserving profile currently measures, on the real 149-token
-C++ prompt and 512 generated tokens:
-
-```text
-prefill  30.07 tok/s   (33.3 ms/token)
-decode   15.97 tok/s   (62.6 ms/token)
-12/12 ranks, NaNs=0
-CPP_QUALITY_PASS compile=ok run=ok
-```
-
-Reference result:
-
-```text
-a64fx/llm/runs/ds4f-0731-cpp-exact-final-49921978
-```
-
-The target remains 40 prefill tok/s and 20 decode tok/s. It has not been
-reached. The best measured experimental profile was 31.48 prefill / 16.84
-decode, but its generated C++ failed the quality gate (`missing required
-main/test marker`), so it must not be promoted as a quality-preserving result:
-
-```text
-a64fx/llm/runs/ds4f-0731-cpp-full-flat-49921978
-```
-
-The exact final token stream matched the prior exact reference for all 512
-generated tokens. Keep this as the regression baseline.
-
-## Remaining bottlenecks
-
-The most useful rank-0 decode phase breakdown from the full-shared synthetic
-run is approximately:
-
-```text
-Tier-B2 prepare/latent/index path (tb2* aggregate)  ~12 ms/token
-collectives / communication                         ~12.6-14.6 ms/token
-o_proj                                                ~9.1 ms/token
-qkv_proj                                               ~6.9 ms/token
-qkv WQB / MHC preparation                             material
-```
-
-Communication is about 22-23% of exact decode. Prefill communication is only
-about 8-10%, so the prefill gap is mainly dense/routed compute and batched
-verify efficiency. The likely work required to approach 20/40 is therefore:
-
-1. Reduce or overlap the Tier-B2 preparation and latent/index work. Measure
-   each `tb2*` phase separately for real generation, not only synthetic K=128.
-2. Improve `o_proj` and `qkv_proj` compute/sharding. Do not assume
-   `TP_ATTN`/`TP_OPROJ` helps: extra reductions can erase the local GEMM gain.
-   Benchmark each change with the same 149/512 prompt and 12-rank lockstep.
-3. Investigate topology-aware communication and compute/communication
-   overlap. Reuse the saved topology file rather than repeatedly probing the
-   flaky topology helper:
-   `a64fx/llm/runs/topo.px6djO/tofu_topo.txt`.
-4. Improve batched prefill/verify dense and expert kernels. The actual
-   prefill result is compute-bound enough that transport-only changes cannot
-   provide the missing 30.07 -> 40 tok/s.
-5. Consider a true speculative/MTP path only after the single-token decode
-   path is profiled; speculative acceptance must be measured and output
-   quality must remain exact or pass the agreed quality gate.
-
-## Known rejected or experimental paths
-
-`DS4F_TP_SHARED_FULL=1` shards the shared down projection and folds its partial
-output into the existing routed-expert allreduce. It saves shared compute and
-about 0.6 GB/node, but changes contraction/reassociation enough to change the
-first generated token and produced malformed C++ in the tested fast profile.
-Keep it experimental until an exactness/quality-preserving implementation is
-proved.
-
-The following were not sufficient in the measured runs:
-
-```text
-fast full-shared + flat:  ~31.48 prefill / 16.84 decode, quality failed
-fast full-shared + A2A:   ~31.67 prefill / 16.69 decode, quality failed
-fast partial-shared+A2A:  ~31.15 prefill / 16.47 decode, quality failed
-fast 2D BF16 synthetic:   ~16.36 prefill / 16.38 decode
-```
-
-2D BF16 and A2A are therefore hypotheses to re-measure only after topology,
-message sizes, and overlap are instrumented; they are not current wins.
-
-## Rebuild and rerun commands
-
-Build and check the current tree:
-
-```sh
-make -C a64fx/llm ds4f_ep_runner CC=fcc OPENMP=1
-git diff --check
-```
-
-If staging is missing and the same 12-node interactive job is still active:
-
-```sh
-test -s /local/ds4f-0731-49921978/rank00.blob || \
-  (cd a64fx/llm && DS4F_STAGE_FLUSH_GB=1 ./run_ds4f_0731_stage_12n.sh)
-```
-
-Run the quality-preserving baseline directly in the allocation:
-
-```sh
-cd a64fx/llm
-RESULT_DIR=$PWD/runs/resume-exact-${PJM_JOBID:-manual} \
-DS4F_STAGE_DIR=/local/ds4f-0731-49921978 \
-SKIP_TOPO=1 DS4F_PROFILE=exact \
-DS4F_TP_SHARED=0 DS4F_TP_SHARED_FULL=0 DS4F_COMM_MODE=flat \
-TP_AR_BF16=0 TP_AR_A2A=0 TP_AR_ROBUST=1 \
-MAX_NEW=512 ./run_ds4f_0731_gen_12n.sh
-
-python3 validate_ds4f_cpp.py \
-  runs/resume-exact-${PJM_JOBID:-manual}/completion.cpp.txt
-```
-
-Use an absolute `RESULT_DIR`: the runner changes directory before launching
-MPI ranks. The generated `runner.stdout.txt`, per-rank perf files,
-`gen_ids.txt`, and completion are the primary evidence.
-
-For an experimental fast comparison, explicitly record every knob and never
-call it a promotion without the quality gate:
-
-```sh
-RESULT_DIR=$PWD/runs/resume-fast-${PJM_JOBID:-manual} \
-DS4F_STAGE_DIR=/local/ds4f-0731-49921978 \
-SKIP_TOPO=1 DS4F_PROFILE=fast DS4F_COMM_MODE=2d DS4F_COMM_2D_A=4 \
-DS4F_TP_SHARED=1 DS4F_TP_SHARED_FULL=1 \
-TP_AR_BF16=1 TP_AR_A2A=0 TP_AR_ROBUST=2 \
-MAX_NEW=512 ./run_ds4f_0731_gen_12n.sh
-```
-
-Validate every candidate with all of:
-
-```text
-12/12 rank completion and lockstep
-NaNs=0 on every rank
-149-token prefill and 512-token decode on the same prompt
-CPP_QUALITY_PASS compile=ok run=ok
-exact token-stream match, or an explicitly documented accepted quality delta
-```
-
-Useful source locations for the next pass:
-
-```text
-a64fx/llm/ds4f_ep_runner.c       flat/2D communication dispatch
-a64fx/utofu-tests/tp_allreduce.h 2D allreduce wrappers
-common/ds4f.h                     TP shared-full state
-common/ds4f_impl.h                shared projection and decode/prefill paths
-a64fx/llm/run_ds4f_0731_12n.sh   exact/fast profiles and environment knobs
-```
-
-Do not commit or push during the resumed investigation unless explicitly
-requested. Preserve unrelated working-tree changes and keep run artifacts in
-`a64fx/llm/runs/`.
-
-## Ready-to-paste resuming prompt
-
-```text
-Resume DS4F-0731 optimization in
-/vol0006/mdt0/data/hp250467/work/gemm/ds4f.
-
-We are targeting 20 decode tok/s and 40 prefill tok/s on the existing 12-node
-A64FX interactive job. Current quality-preserving baseline is 15.97 decode /
-30.07 prefill tok/s on the real 149-token C++ prompt with 512 generated tokens.
-The exact run is
-a64fx/llm/runs/ds4f-0731-cpp-exact-final-49921978 and passes
-CPP_QUALITY_PASS compile=ok run=ok; its 512 generated token IDs match the
-previous exact reference. Do not weaken this baseline.
-
-Use /local/ds4f-0731-49921978 if it exists; otherwise re-stage the model with
-DS4F_STAGE_FLUSH_GB=1 using run_ds4f_0731_stage_12n.sh. Build with
-make -C a64fx/llm ds4f_ep_runner CC=fcc OPENMP=1. Reuse
-a64fx/llm/runs/topo.px6djO/tofu_topo.txt and SKIP_TOPO=1 if topology probing is
-flaky. Run benchmarks directly in the 12-node allocation.
-
-The remaining decode bottlenecks are approximately: tb2 prepare/latent/index
-work ~12 ms/token, communication ~12.6-14.6 ms/token (~22-23%), o_proj ~9.1
-ms/token, qkv_proj ~6.9 ms/token, plus qkv WQB/MHC preparation. Prefill
-communication is only ~8-10%, so optimize compute and batched verify for the
-40 tok/s target. Instrument real 149/512 runs and separate compute from
-communication before choosing a kernel or transport change.
-
-DS4F_TP_SHARED_FULL=1, fast 2D BF16, and A2A variants were tested. The best
-fast result was ~31.48/16.84 but generated malformed C++, so it is experimental
-only. Do not promote any lossy/reassociated path unless it passes the C++
-quality gate and the exact-token or explicitly approved quality criterion.
-Benchmark topology-aware communication, overlap, o_proj/qkv_proj sharding,
-Tier-B2 preparation, and batched prefill in small reversible steps. Report
-before/after tok/s, phase breakdown, comm percentage, rank/NaN status, and
-quality output for each candidate. Do not commit or push; leave changes in the
-working tree unless I explicitly ask otherwise.
-```
+Do not mistake model-load time for inference throughput. The first run can spend roughly a minute loading the staged model.

@@ -201,6 +201,29 @@ struct hip_ds4f_dense {
     unsigned long prof_routed_calls;
     unsigned long prof_host_registers;
     size_t prof_host_register_bytes;
+    /* Phase split of prof_routed_seconds: time spent hipMalloc'ing/queuing
+     * transient expert uploads, time spent queuing GEMM/SwiGLU kernel
+     * launches, and time spent in the final D2H copy + hipStreamSynchronize
+     * (where queued async work on ctx->stream actually completes). */
+    double prof_route_upload_seconds;
+    double prof_route_launch_seconds;
+    double prof_route_sync_seconds;
+    /* Reusable transient routed-expert upload slots.  Exact serving cannot
+     * keep all experts resident, but repeatedly hipMalloc/hipFree'ing the
+     * same active bundles makes short decode/prefill tiles allocator-bound
+     * (measured: upload is ~91% of routed-FFN wall time).  Slots retain
+     * device storage across routed calls; matrix metadata is released after
+     * each call via release_matrix()'s owner==1 path.  Each slot carries an
+     * event recorded right after this call's kernels are enqueued, so the
+     * *next* call reusing that slot waits for it before overwriting the
+     * buffer with a new async copy -- belt-and-suspenders on top of the
+     * single-stream issue ordering HIP already guarantees. */
+    void *route_pool_dw[3][HIP_DS4F_GEMM_MAX];
+    void *route_pool_ds[3][HIP_DS4F_GEMM_MAX];
+    size_t route_pool_wb[3][HIP_DS4F_GEMM_MAX];
+    size_t route_pool_sb[3][HIP_DS4F_GEMM_MAX];
+    hipEvent_t route_pool_ev[3][HIP_DS4F_GEMM_MAX];
+    int route_pool_ev_valid[3][HIP_DS4F_GEMM_MAX];
     hip_ds4f_resident_layer *resident_layers;
     int n_resident_layers, cap_resident_layers;
 };
@@ -318,6 +341,15 @@ static void clear_matrices(hip_ds4f_dense *ctx) {
     }
     ctx->resident_layers = NULL;
     ctx->n_resident_layers = ctx->cap_resident_layers = 0;
+    for (int j = 0; j < 3; ++j) for (int s = 0; s < HIP_DS4F_GEMM_MAX; ++s) {
+        if (ctx->route_pool_dw[j][s]) hipFree(ctx->route_pool_dw[j][s]);
+        if (ctx->route_pool_ds[j][s]) hipFree(ctx->route_pool_ds[j][s]);
+        ctx->route_pool_dw[j][s] = ctx->route_pool_ds[j][s] = NULL;
+        ctx->route_pool_wb[j][s] = ctx->route_pool_sb[j][s] = 0;
+        if (ctx->route_pool_ev[j][s] && hipEventDestroy) hipEventDestroy(ctx->route_pool_ev[j][s]);
+        ctx->route_pool_ev[j][s] = NULL;
+        ctx->route_pool_ev_valid[j][s] = 0;
+    }
 }
 
 static void release_matrix(hip_ds4f_dense *ctx, int id) {
@@ -565,10 +597,23 @@ hip_ds4f_dense *hip_ds4f_dense_create(int device_id, int verbose) {
 void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (!ctx) return;
     { const char *p = getenv("DS4F_PROF");
-      if (p && atoi(p) && ctx->prof_routed_calls)
+      if (p && atoi(p) && ctx->prof_routed_calls) {
           fprintf(stderr, "  hip_route  %9.3f s  calls=%lu avg=%.3f ms\n",
                   ctx->prof_routed_seconds, ctx->prof_routed_calls,
-                  1000.0 * ctx->prof_routed_seconds / ctx->prof_routed_calls); }
+                  1000.0 * ctx->prof_routed_seconds / ctx->prof_routed_calls);
+          fprintf(stderr, "    upload   %9.3f s  avg=%.3f ms (%.1f%%)\n",
+                  ctx->prof_route_upload_seconds,
+                  1000.0 * ctx->prof_route_upload_seconds / ctx->prof_routed_calls,
+                  100.0 * ctx->prof_route_upload_seconds / ctx->prof_routed_seconds);
+          fprintf(stderr, "    launch   %9.3f s  avg=%.3f ms (%.1f%%)\n",
+                  ctx->prof_route_launch_seconds,
+                  1000.0 * ctx->prof_route_launch_seconds / ctx->prof_routed_calls,
+                  100.0 * ctx->prof_route_launch_seconds / ctx->prof_routed_seconds);
+          fprintf(stderr, "    sync     %9.3f s  avg=%.3f ms (%.1f%%)\n",
+                  ctx->prof_route_sync_seconds,
+                  1000.0 * ctx->prof_route_sync_seconds / ctx->prof_routed_calls,
+                  100.0 * ctx->prof_route_sync_seconds / ctx->prof_routed_seconds);
+      } }
     { const char *p = getenv("DS4F_PROF");
       if (p && atoi(p))
           fprintf(stderr, "  hip_hreg             calls=%lu total=%.1f GiB\n",
@@ -790,6 +835,56 @@ static int hip_ds4f_dense_bind_mxfp4_tensor_async(hip_ds4f_dense *ctx, ds4f_tens
         t->scale, t->rows, t->cols, t->cols / 32,
         (size_t)t->rows * (size_t)(t->cols / 2),
         (size_t)t->rows * (size_t)(t->cols / 32), HIP_DS4F_MATRIX_MXFP4);
+    if (id >= 0) t->gpu_id = id;
+    return id;
+}
+
+static int hip_ds4f_dense_bind_mxfp4_tensor_async_pool(hip_ds4f_dense *ctx,
+                                                        ds4f_tensor *t,
+                                                        int j, int slot) {
+    if (!ctx || !t || j < 0 || j >= 3 || slot < 0 || slot >= HIP_DS4F_GEMM_MAX ||
+        t->type != DS4F_MXFP4 || !t->w || !t->scale || !valid_dims(t->rows, t->cols) ||
+        (t->cols & 31) || ctx->pending || ctx->multi_pending ||
+        hipSetDevice(ctx->device_id) != hipSuccess) return -1;
+    /* Wait for this slot's previous consumers before reusing its storage.
+     * Single-stream issue ordering already serializes this, but the event
+     * makes the dependency explicit and cheap (no-op once signaled). */
+    if (ctx->route_pool_ev_valid[j][slot]) {
+        if (hipEventSynchronize(ctx->route_pool_ev[j][slot]) != hipSuccess) return -1;
+        ctx->route_pool_ev_valid[j][slot] = 0;
+    }
+    size_t wb = (size_t)t->rows * (size_t)(t->cols / 2);
+    size_t sb = (size_t)t->rows * (size_t)(t->cols / 32);
+    if (ctx->route_pool_dw[j][slot] &&
+        (ctx->route_pool_wb[j][slot] < wb || ctx->route_pool_sb[j][slot] < sb)) {
+        hipFree(ctx->route_pool_dw[j][slot]);
+        hipFree(ctx->route_pool_ds[j][slot]);
+        ctx->route_pool_dw[j][slot] = ctx->route_pool_ds[j][slot] = NULL;
+        ctx->route_pool_wb[j][slot] = ctx->route_pool_sb[j][slot] = 0;
+    }
+    if (!ctx->route_pool_dw[j][slot]) {
+        if (hipMalloc(&ctx->route_pool_dw[j][slot], wb) != hipSuccess ||
+            hipMalloc(&ctx->route_pool_ds[j][slot], sb) != hipSuccess) {
+            if (ctx->route_pool_dw[j][slot]) hipFree(ctx->route_pool_dw[j][slot]);
+            if (ctx->route_pool_ds[j][slot]) hipFree(ctx->route_pool_ds[j][slot]);
+            ctx->route_pool_dw[j][slot] = ctx->route_pool_ds[j][slot] = NULL;
+            return -1;
+        }
+        ctx->route_pool_wb[j][slot] = wb;
+        ctx->route_pool_sb[j][slot] = sb;
+    }
+    if (!ctx->route_pool_ev[j][slot] &&
+        hipEventCreate(&ctx->route_pool_ev[j][slot]) != hipSuccess)
+        return -1;
+    if (hipMemcpyAsync(ctx->route_pool_dw[j][slot], t->w, wb,
+                       hipMemcpyHostToDevice, ctx->stream) != hipSuccess ||
+        hipMemcpyAsync(ctx->route_pool_ds[j][slot], t->scale, sb,
+                       hipMemcpyHostToDevice, ctx->stream) != hipSuccess)
+        return -1;
+    int id = append_device_matrix(ctx, ctx->route_pool_dw[j][slot],
+                                  ctx->route_pool_ds[j][slot], t->w, t->scale,
+                                  t->rows, t->cols, t->cols / 32,
+                                  HIP_DS4F_MATRIX_MXFP4, 1);
     if (id >= 0) t->gpu_id = id;
     return id;
 }
@@ -2232,16 +2327,27 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
      * ids are released after synchronization below. */
     int transient[3][HIP_DS4F_GEMM_MAX];
     memset(transient, -1, sizeof(transient));
+    int route_slot = 0;
     for (int s = 0; s < n_experts; ++s) {
         if (counts[s] <= 0) continue;
         ds4f_tensor *tw[3] = { (ds4f_tensor *)w1[s], (ds4f_tensor *)w3[s],
                                (ds4f_tensor *)w2[s] };
+        /* One slot per active expert and projection.  Dimensions are uniform
+         * for a layer, but the pool helper grows a slot safely if a mixed
+         * manifest is encountered. */
         for (int j = 0; j < 3; ++j) {
             if (!tw[j] || tw[j]->gpu_id >= 0) continue;
-            transient[j][s] = hip_ds4f_dense_bind_mxfp4_tensor_async(ctx, tw[j]);
+            transient[j][s] = hip_ds4f_dense_bind_mxfp4_tensor_async_pool(
+                ctx, tw[j], j, route_slot);
             if (transient[j][s] < 0) goto routed_transient_fail;
         }
+        route_slot++;
     }
+    double prof_upload_s;
+    { struct timespec tu; clock_gettime(CLOCK_MONOTONIC, &tu);
+      prof_upload_s = (double)(tu.tv_sec - prof_t0.tv_sec) +
+          1e-9 * (double)(tu.tv_nsec - prof_t0.tv_nsec);
+      ctx->prof_route_upload_seconds += prof_upload_s; }
     size_t xb = (size_t)total * C * 4, ib = (size_t)total * inter * 4;
     if (hipSetDevice(ctx->device_id) != hipSuccess ||
         ensure_dev_buf(&ctx->ffn_dx, &ctx->ffn_dx_b, xb) != 0 ||
@@ -2299,6 +2405,22 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
                               256, 1, 1, 0, ctx->stream, sa, NULL) != hipSuccess ||
         launch_mxfp4_tasks(ctx, down, active) != 0)
         goto routed_transient_fail;
+    /* All kernels reading pool slots are enqueued now; recording each used
+     * slot's event here lets the next call's reuse wait only until these
+     * kernels have actually completed, not until the whole stream drains. */
+    for (int slot = 0; slot < route_slot; ++slot)
+        for (int j = 0; j < 3; ++j)
+            if (ctx->route_pool_ev[j][slot]) {
+                if (hipEventRecord(ctx->route_pool_ev[j][slot], ctx->stream) != hipSuccess)
+                    goto routed_transient_fail;
+                ctx->route_pool_ev_valid[j][slot] = 1;
+            }
+    double prof_launch_s;
+    { struct timespec tl; clock_gettime(CLOCK_MONOTONIC, &tl);
+      double t_launch = (double)(tl.tv_sec - prof_t0.tv_sec) +
+          1e-9 * (double)(tl.tv_nsec - prof_t0.tv_nsec);
+      prof_launch_s = t_launch - prof_upload_s;
+      ctx->prof_route_launch_seconds += prof_launch_s; }
     float *out = dst;
     if (ctx->gemm_y_pack && ctx->gemm_y_pack_bytes >= xb) out = ctx->gemm_y_pack;
     if (hipMemcpyAsync(out, ctx->ffn_dy, xb, hipMemcpyDeviceToHost,
@@ -2306,8 +2428,10 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
         hipStreamSynchronize(ctx->stream) != hipSuccess) goto routed_transient_fail;
     if (out != dst) memcpy(dst, out, xb);
     { struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
-      ctx->prof_routed_seconds += (double)(t1.tv_sec - prof_t0.tv_sec) +
+      double total_s = (double)(t1.tv_sec - prof_t0.tv_sec) +
           1e-9 * (double)(t1.tv_nsec - prof_t0.tv_nsec);
+      ctx->prof_routed_seconds += total_s;
+      ctx->prof_route_sync_seconds += total_s - prof_upload_s - prof_launch_s;
       ctx->prof_routed_calls++; }
     release_transient_experts(ctx, w1, w3, w2, n_experts, transient);
     return 0;
