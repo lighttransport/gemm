@@ -5997,7 +5997,11 @@ static void ds4f_hc_pre_batch(ds4f_model *m, const float *x4b, int K, const floa
                               const float *scale, const float *base, float *yb,
                               float *postb, int pstr, float *combb, int cstr) {
     ds4f_config *c=&m->cfg; int hc=c->hc_mult,C=c->hidden,hd=hc*C,mix_hc=(2+hc)*hc;
-    if (K<1 || K>128) { fprintf(stderr,"ds4f_hc_pre_batch: K=%d\n",K); abort(); }
+    if (K < 1 || K > m->m_tile) {
+        fprintf(stderr, "ds4f_hc_pre_batch: K=%d outside allocated tile [1,%d]\n",
+                K, m->m_tile);
+        abort();
+    }
     float *mixb=(float *)alloca((size_t)K*mix_hc*4), *ssb=(float *)alloca((size_t)K*4), *preb=(float *)alloca((size_t)K*hc*4);
     ds4f_hcmix_b_task mt={fn,x4b,mixb,mix_hc,hd,K};
 #if defined(__ARM_FEATURE_SVE)

@@ -265,17 +265,24 @@ class Job(object):
         self.decode_started = None
         self.cancelled = False
         self.slot = -1
+        self.cache_path = request.get("cache_path")
+        self.cache_load = bool(request.get("cache_load", False))
+        self.cache_save_path = request.get("cache_save_path")
+        self.cached_tokens = max(0, int(request.get("cached_tokens", 0)))
+        self.cache_hit = False
+        self.cache_saved = False
 
 
 class CooperativeServer(object):
     def __init__(self, sess, path, context_dir, memory_ttl, disk_ttl,
                  memory_mb, disk_mb, prefill_quantum, decode_quantum, quantum_ms,
-                 decode_batch_size):
+                 decode_batch_size, single_prefill_quantum):
         self.sess, self.path = sess, path
         self.context_dir = context_dir
         self.memory_ttl, self.disk_ttl = memory_ttl, disk_ttl
         self.memory_cap, self.disk_cap = memory_mb << 20, disk_mb << 20
         self.prefill_q = max(1, prefill_quantum)
+        self.single_prefill_q = max(self.prefill_q, single_prefill_quantum)
         self.decode_q = max(1, decode_quantum)
         self.decode_batch_size = max(1, decode_batch_size)
         self.batch_steps = self.batch_sequences = 0
@@ -384,6 +391,8 @@ class CooperativeServer(object):
                  "prompt_total": len(c.active_job.prompt) if c.active_job else 0,
                  "prompt_processed": c.active_job.off if c.active_job else 0,
                  "completion_tokens": len(c.active_job.out) if c.active_job else 0,
+                 "cache_hit": bool(c.active_job.cache_hit) if c.active_job else False,
+                 "cached_tokens": c.active_job.cached_tokens if c.active_job and c.active_job.cache_hit else 0,
                  "started": c.active_job.started if c.active_job else None,
                  "decode_started": c.active_job.decode_started if c.active_job else None}
                 for c in self.contexts.values()]
@@ -445,6 +454,17 @@ class CooperativeServer(object):
             if reuse:
                 if self.sess.context_import(ctx.blob) != 0: raise RuntimeError("context restore failed")
                 job.off = len(ctx.tokens)
+                job.cache_hit = True; job.cached_tokens = job.off
+            elif (job.cache_load and job.cache_path and
+                  os.path.isfile(job.cache_path)):
+                self.sess.reset()
+                if self.sess.kv_restore(job.cache_path) != 0:
+                    raise RuntimeError("prefix cache restore failed")
+                restored = self.sess.pos()
+                if restored != job.cached_tokens or restored > len(job.prompt):
+                    self.sess.reset()
+                    raise RuntimeError("prefix cache length mismatch")
+                job.off = restored; job.cache_hit = True
             else:
                 self.sess.reset(); job.off = 0
             job.phase = "prefill" if job.off < len(job.prompt) else "decode"
@@ -488,13 +508,18 @@ class CooperativeServer(object):
             if job.cancelled: return self.finish(job)
             deadline = time.time() + self.quantum_s
             if job.phase == "prefill":
-                end = min(len(job.prompt), job.off + self.prefill_q)
+                quantum = self.single_prefill_q if len(self.jobs) == 1 else self.prefill_q
+                end = min(len(job.prompt), job.off + quantum)
                 if end > job.off and self.sess.prefill(job.prompt[job.off:end], job.off) != 0:
                     raise RuntimeError("prefill failed at %d" % job.off)
                 job.off = end
                 self.send(job, {"event": "progress", "phase": "prefill",
                                 "processed": job.off, "total": len(job.prompt)})
                 if job.off >= len(job.prompt):
+                    if job.cache_save_path and not job.cache_saved:
+                        if self.sess.kv_save(job.cache_save_path) != 0:
+                            raise RuntimeError("prefix cache save failed")
+                        job.cache_saved = True
                     job.phase = "decode"; job.decode_started = time.time()
             if job.phase == "decode" and time.time() < deadline:
                 for _ in range(self.decode_q):
@@ -797,6 +822,11 @@ def main():
     ap.add_argument("--context-memory-mb", type=int, default=512)
     ap.add_argument("--context-disk-mb", type=int, default=8192)
     ap.add_argument("--prefill-quantum-tokens", type=int, default=32)
+    ap.add_argument("--single-prefill-quantum-tokens", type=int, default=32)
+    # Accepted here so the single-node wrapper can expose one unified program
+    # argument list; the value itself configures the HTTP frontend.
+    ap.add_argument("--agent-cache-max-tokens", type=int, default=8192)
+    ap.add_argument("--runner-timeout-sec", type=float, default=3600.0)
     ap.add_argument("--decode-quantum-tokens", type=int, default=4)
     ap.add_argument("--decode-batch-size", type=int, default=1)
     ap.add_argument("--scheduler-quantum-ms", type=int, default=250)
@@ -825,7 +855,8 @@ def main():
                               args.context_memory_ttl_sec, args.context_disk_ttl_sec,
                               args.context_memory_mb, args.context_disk_mb,
                               args.prefill_quantum_tokens, args.decode_quantum_tokens,
-                              args.scheduler_quantum_ms, args.decode_batch_size).run()
+                              args.scheduler_quantum_ms, args.decode_batch_size,
+                              args.single_prefill_quantum_tokens).run()
         else:
             run_serve(sess, base, prefix_cache, slots)
     except KeyboardInterrupt:

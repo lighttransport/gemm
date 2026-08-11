@@ -73,7 +73,12 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   IDs, model, tokenizer, and cache schema; a frontend restart therefore reuses
   only an exact compatible prefix. The first request writes the cache with a
   zero-token prefill, while later requests restore it and prefill only the
-  conversation tail. `DS4F_SERVE_SYSCACHE` remains available for the runner's
+  conversation tail. The cooperative Unix-socket runner carries cache
+  load/save metadata in each request; `--agent-cache-max-tokens` controls the
+  maximum prefix (8192 by default). A lone request uses
+  `--single-prefill-quantum-tokens` (32 by default), while competing requests
+  retain the smaller fair-share `--prefill-quantum-tokens` quantum.
+  `DS4F_SERVE_SYSCACHE` remains available for the runner's
   legacy single-file checkpoint/preload path.
 - **Slots** (`DS4F_SERVE_SLOTS`): per-conversation KV snapshots switched by
   the `slot` field (`<BASE>.slot.<i>` files).
