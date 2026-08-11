@@ -156,7 +156,17 @@ These 7 top-level phases sum to 69.16s, matching the measured 68.89s prefill wal
 
 Verified: mHC exact quality gate still 8/9 (no regression, telemetry-only change), no VRAM leak, no orphan processes.
 
-**Attention (42% of prefill) is now the clear top lever for the 100-200 tok/s prefill target — bigger than the routed-FFN/expert-upload work already done.** Not yet root-caused further (compute-bound vs. dispatch-overhead-bound) or optimized. Needs a decision on whether to dig into per-position dispatch batching vs. raw attention kernel cost before writing more code.
+**Attention (42% of prefill) is now the clear top lever for the 100-200 tok/s prefill target — bigger than the routed-FFN/expert-upload work already done.**
+
+## Attention cost is raw compute, not thread-pool dispatch overhead (2026-08-12)
+
+Root-caused whether attn's cost is per-position `ds4f_pool_run` dispatch overhead or actual compute. Added a diagnostic-only synthetic benchmark (`ds4f_noop_pool_worker` + a one-time, `DS4F_PROF`-gated loop of 20,000 `ds4f_pool_run` calls doing no real work, at the top of `ds4f_forward_verify`, common/ds4f_impl.h) that measures pure barrier/dispatch overhead using the exact same pool/thread-pinning setup as production code — no numerics touched, diagnostic only, runs once per process.
+
+Result: **2.885 μs/call, nthr=16**. Even generously assuming ~6 `ds4f_pool_run` dispatches per position per layer (one for the attention worker itself, several more nested inside `ds4f_tb2_prepare`'s sub-steps: idxsc/cmpmv/bf16mv/tb2rope workers), that's 1024 positions x 43 layers x 6 ≈ 264,000 calls x 2.885 μs ≈ **under 1 second total** — negligible against the measured 33-34s `attn` phase.
+
+**Conclusion: attention's cost is raw compute, not dispatch overhead.** This rules out "batch the per-position loop to reduce dispatch calls" as a fix. The real lever is the attention math itself — the per-position exact/tier-B2 causal attention workers (`ds4f_attn_exact_worker`, `ds4f_attn_tb2_worker`/`ds4f_attn_tb2_gemm`, common/ds4f_impl.h, called from the per-position loop at ~common/ds4f_impl.h:7108) and/or the tb2 compression math inside `ds4f_tb2_prepare` (already separately timed at 18% of attn's total). Next step would be profiling *inside* those worker functions to find which specific computation dominates (e.g., the KV-cache attention score/softmax loop scaling with growing context length, vs. the sinkhorn/mix hc math, vs. index-scan specifics) — not yet attempted.
+
+Verified: mHC exact quality gate still 8/9 (no regression, diagnostic-only addition), no VRAM leak, no orphan processes.
 
 ## Quality evidence
 
@@ -224,8 +234,9 @@ curl -s --max-time 5 http://127.0.0.1:8080/v1/progress
 5. ~~Raise `--hip-expert-cache-mb` toward full free VRAM.~~ Done 2026-08-12: no effect, `auto` already used all available headroom — see "Cache budget is not the limiter" above. Coverage is capped by prompt diversity, not budget.
 6. ~~Test 256, 1024, and 8192-token prefills.~~ Done 2026-08-12 for 1024 and 8192 (256 not yet run; low priority now that the pattern is clear). See "Prefill scaling and the real prefill bottleneck" above — scaling plateaus around 11-12 tok/s, and decode's cache coverage got worse (not better) at longer context, ruling out "just use a realistic prompt" as a fix for either target.
 7. **Decode's real lever remains raising effective cache hit rate** (unchanged from before, budget/prompt-length are now ruled out as the fix): (a) online/adaptive cache that admits/evicts based on live decode-time routing instead of a one-shot post-prefill snapshot; (b) speed up the CPU MXFP4 fallback path itself for cache misses. Not yet attempted.
-8. **Prefill's real lever is attention (42% of wall time), not routed-FFN (which is already optimized and is only ~30% via the "experts" bucket).** Root-cause whether attn's cost is per-position thread-pool dispatch overhead (~44,000 `ds4f_pool_run` calls at 1024 tokens/43 layers) or raw compute, then optimize accordingly — e.g. batching the per-position loop in `ds4f_forward_verify` (common/ds4f_impl.h:7106) across multiple positions per dispatch instead of one `ds4f_pool_run` per token. Not yet attempted.
-9. Continue committing incrementally (telemetry, event-guarded pool, decode CPU/GPU phase split, and prefill phase split are already committed, see below) — after each further runtime-stable, measurably-improving change, commit with a short imperative subject and report the hash plus exact commands/results.
+8. ~~Root-cause whether attn's cost is dispatch overhead or raw compute.~~ Done 2026-08-12: confirmed raw compute (dispatch overhead measured at 2.885 us/call, negligible even at ~264,000 calls). See "Attention cost is raw compute, not thread-pool dispatch overhead" above. **Do not pursue per-position dispatch batching — it would not help.**
+9. **Profile inside the attention worker functions themselves** (`ds4f_attn_exact_worker`, `ds4f_attn_tb2_worker`/`ds4f_attn_tb2_gemm`, and the tb2 compression sub-steps inside `ds4f_tb2_prepare`) to find which specific computation dominates the ~28s (82% of attn, excluding tb2prep) at 1024 tokens — e.g. KV-cache score/softmax cost scaling with growing context vs. other per-position math. Not yet attempted; this is the next concrete step toward the prefill target.
+10. Continue committing incrementally (telemetry, event-guarded pool, decode CPU/GPU phase split, prefill phase split, and the pool-dispatch-overhead diagnostic are already committed, see below) — after each further runtime-stable, measurably-improving change, commit with a short imperative subject and report the hash plus exact commands/results.
 
 **Reminder:** `ds4f_serve_bench.py` loads its own model standalone — stop any running `run_ds4f_single_serve.sh` server first, or numbers will be contention-skewed (see verdict above).
 

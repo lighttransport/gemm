@@ -6997,10 +6997,32 @@ static void ds4f_discard_decode_slot(ds4f_model *m, int slot) {
  * snaps (optional, [K-1] x ds4f_tb2_snap_bytes stride): mid-verify compressor-state snapshots -- slot k
  * captures every layer's ring state AFTER position pos0+k advanced it, so a partial accept of the first
  * j+1 positions restores snaps[j] directly (NO redo verify; layout matches ds4f_tb2_snap restore). */
+/* Diagnostic-only: measures pure ds4f_pool_run dispatch+barrier overhead
+ * (spin-wait sync across the pinned worker threads, no real work) using the
+ * exact same pool as production code, to separate dispatch cost from raw
+ * compute cost in the per-position attention loop below. */
+static void ds4f_noop_pool_worker(void *arg, int tid, int nthr) {
+    (void)tid; (void)nthr;
+    volatile long *ctr = (volatile long *)arg;
+    (*ctr)++;
+}
+
 static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, int *out_tok, float *out_hc, char *snaps) {
     ds4f_config *c = &m->cfg;
     int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD, og = c->o_groups, gin = H/og;
     float eps = 1e-6f; int hc = c->hc_mult; size_t hcC = (size_t)hc*C;
+    if (ds4f_prof_on < 0) { const char *e = getenv("DS4F_PROF"); ds4f_prof_on = e ? atoi(e) : 0; }
+    { static int _pf_pool_bench_done = 0;
+      if (!_pf_pool_bench_done && ds4f_prof_on) {
+          _pf_pool_bench_done = 1;
+          const int N = 20000;
+          volatile long ctr = 0;
+          double t0 = ds4f_now();
+          for (int i = 0; i < N; i++) ds4f_pool_run(m->pool, ds4f_noop_pool_worker, (void *)&ctr);
+          double dt = ds4f_now() - t0;
+          fprintf(stderr, "  pool_dispatch %d calls %.3f us/call nthr=%d (raw barrier overhead, no work)\n",
+                  N, dt * 1e6 / N, m->pool->nthr);
+      } }
     if (K < 1 || K > m->m_tile) {
         fprintf(stderr, "ds4f_forward_verify: K=%d outside allocated tile [1,%d]\n",
                 K, m->m_tile);
