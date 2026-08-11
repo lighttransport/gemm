@@ -9,6 +9,12 @@ ds4f_serve_runner.py (persistent model loop; shared-FS protocol)
 ds4f_serve.py        (OpenAI HTTP frontend; already in the tree)
 ```
 
+For the 0731 checkpoint the frontend loads the authoritative
+`encoding/encoding_dsv4.py` shipped beside `tokenizer.json`. Prompts therefore
+use `<｜User｜>/<｜Assistant｜></think>` and DSML tool calls. The former generic
+`System:/User:/Assistant:` renderer remains only as a fallback for model
+bundles that do not provide the DS4F encoder.
+
 ## Build
 
 ```sh
@@ -71,13 +77,18 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   writes durable, content-addressed KV prefixes under separate `opencode`,
   `codex`, and `claude-code` directories. Each sidecar records the exact token
   IDs, model, tokenizer, and cache schema; a frontend restart therefore reuses
-  only an exact compatible prefix. The first request writes the cache with a
-  zero-token prefill, while later requests restore it and prefill only the
-  conversation tail. The cooperative Unix-socket runner carries cache
-  load/save metadata in each request; `--agent-cache-max-tokens` controls the
-  maximum prefix (8192 by default). A lone request uses
+  only an exact compatible prefix. The cache includes stable Responses API
+  developer/repository context up to an exact tokenizer boundary before the
+  final user payload. A new long snapshot extends an existing shorter system
+  snapshot and is immediately reused by its triggering request. The
+  cooperative Unix-socket runner carries cache load/save metadata in each
+  request; `--agent-cache-max-tokens` controls the maximum prefix (14336 by
+  default). A lone request uses
   `--single-prefill-quantum-tokens` (2048 by default), while competing requests
   retain the smaller fair-share `--prefill-quantum-tokens` quantum.
+  `--hip-expert-cache-mb auto` can admit prompt-hot routed-expert bundles into
+  otherwise-free VRAM before decode; `--hip-expert-cache-reserve-mb` retains
+  scratch/KV headroom.
   `DS4F_SERVE_SYSCACHE` remains available for the runner's
   legacy single-file checkpoint/preload path.
 - **Slots** (`DS4F_SERVE_SLOTS`): per-conversation KV snapshots switched by

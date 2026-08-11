@@ -25,7 +25,7 @@ top_k (0=off), presence_penalty (0), repeat_penalty / repetition_penalty (1.0), 
 Env: PORT (8080), TOK (~/models/ds4f/tokenizer.json), DS4F_SERVE_BASE,
 DS4F_SERVE_AGENT_CACHE_DIR, DS4F_SERVE_TIMEOUT (1200s).
 Start via run_ds4f_serve_11n.sh (which launches the runner first, then this)."""
-import argparse, hashlib, http.server, json, os, re, socket, socketserver, subprocess, sys, tempfile, threading, time, uuid
+import argparse, hashlib, http.server, importlib.util, json, os, re, socket, socketserver, subprocess, sys, tempfile, threading, time, uuid
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -40,6 +40,8 @@ ERROR = BASE + ".error"
 PORT = int(os.environ.get("PORT", "8080"))
 TIMEOUT = float(os.environ.get("DS4F_SERVE_TIMEOUT", "1200"))
 MODEL_ID = "ds4f"
+DEFAULT_TEMPERATURE = 0.0
+DEFAULT_TOP_P = 1.0
 RUNNER_SOCKET = None
 RESPONSE_STATE_DIR = BASE + ".contexts/responses"
 _runner_decode_batch = {"enabled": False, "capacity": 1, "steps": 0, "sequences": 0}
@@ -253,7 +255,31 @@ def infer_socket(prompt, max_tokens, samp=None):
 BOS = "<｜begin▁of▁sentence｜>"
 ROLE_TAG = {"system": "System", "user": "User", "assistant": "Assistant", "tool": "Tool"}
 # Stop markers: the base model can run past its turn -> truncate the completion at the next role tag.
-STOP_MARKERS = ["\nUser:", "\nSystem:", "\nTool:", "\n\nUser:", BOS, "<｜end▁of▁sentence｜>"]
+STOP_MARKERS = ["\nUser:", "\nSystem:", "\nTool:", "\n\nUser:", BOS,
+                "<｜User｜>", "<｜Assistant｜>", "<｜end▁of▁sentence｜>"]
+DSV4_USER = "<｜User｜>"
+DSV4_ASSISTANT = "<｜Assistant｜>"
+DSV4_EOS = "<｜end▁of▁sentence｜>"
+_dsv4_encoding = {"path": None, "module": None}
+
+
+def dsv4_encoding():
+    """Load the authoritative encoder shipped beside the DS4F tokenizer."""
+    path = os.path.join(os.path.dirname(os.path.abspath(TOK)),
+                        "encoding", "encoding_dsv4.py")
+    if _dsv4_encoding["path"] == path:
+        return _dsv4_encoding["module"]
+    module = None
+    if os.path.isfile(path):
+        try:
+            spec = importlib.util.spec_from_file_location("ds4f_model_encoding_dsv4", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except (ImportError, OSError, AttributeError) as exc:
+            print("[ds4f-serve] DSV4 encoder load failed: %s" % exc,
+                  file=sys.stderr, flush=True)
+    _dsv4_encoding.update({"path": path, "module": module})
+    return module
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 TOOL_INSTRUCTIONS = (
     "You can call tools. To call a tool, output EXACTLY one line per call of the form\n"
@@ -307,10 +333,10 @@ _conv_lock = threading.Lock()
 AGENT_CACHE_ROOT = os.environ.get("DS4F_SERVE_AGENT_CACHE_DIR", BASE + ".agent-cache")
 _cache_lock = threading.Lock()
 _cache_stats = {"hits": 0, "misses": 0, "writes": 0}
-# Native KV snapshots are reliable for short prefixes but can terminate the
-# HIP runner on long prompt saves. Keep long requests uncached and let them
-# use the normal bounded-context prefill path instead.
-CACHE_MAX_TOKENS = 8192
+# Bound durable snapshots independently from the model context.  Current Codex
+# system instructions plus tool schemas are about 11K tokens, so the old 8192
+# default silently disabled the useful part of coding-agent prefix caching.
+CACHE_MAX_TOKENS = 14336
 
 # Responses API state is keyed by previous_response_id.  It is deliberately
 # bounded: Chat/Anthropic clients normally resend their complete history.
@@ -356,15 +382,18 @@ def _read_agent_cache(agent, prefix_ids):
             "directory": directory, "hit": True}
 
 
-def _write_agent_cache(agent, prefix_text, prefix_ids):
+def _write_agent_cache(agent, prefix_text, prefix_ids, base_cache=None):
     key, directory, kv_path, meta_path = _cache_paths(agent, prefix_ids)
     os.makedirs(directory, exist_ok=True)
     tmp_kv = "%s.tmp.%d" % (kv_path, os.getpid())
     tmp_meta = "%s.tmp.%d" % (meta_path, os.getpid())
     try:
+        base_ids = base_cache.get("ids", []) if base_cache else []
         infer(prefix_text, 0, {"temperature": 0.0, "top_p": 1.0, "top_k": 0,
                               "presence_penalty": 0.0, "repeat_penalty": 1.0,
-                              "seed": None}, cache_save=True, save_path=tmp_kv)
+                              "seed": None}, cache_path=base_cache.get("path") if base_cache else None,
+              cache_load=bool(base_cache), cached_tokens=len(base_ids),
+              cache_save=True, save_path=tmp_kv)
         if not os.path.isfile(tmp_kv) or os.path.getsize(tmp_kv) < 16:
             raise RuntimeError("runner did not produce a complete system cache")
         meta = {"schema_version": 1, "agent": agent, "model": MODEL_ID,
@@ -375,8 +404,11 @@ def _write_agent_cache(agent, prefix_text, prefix_ids):
         os.replace(tmp_kv, kv_path)
         os.replace(tmp_meta, meta_path)
         _cache_stats["writes"] += 1
+        # The snapshot was produced by a completed native prefill and is ready
+        # to restore for the request that caused the miss.  Calling it a miss
+        # here made that request prefill the same prefix a second time.
         return {"agent": agent, "key": key, "ids": prefix_ids, "path": kv_path,
-                "directory": directory, "hit": False}
+                "directory": directory, "hit": True, "created": True}
     finally:
         for path in (tmp_kv, tmp_meta):
             try:
@@ -385,14 +417,47 @@ def _write_agent_cache(agent, prefix_text, prefix_ids):
                 pass
 
 
+def agent_prefix_text(messages, tools, prompt_ids):
+    """Return the longest safe request prefix before the final user payload.
+
+    Codex sends stable environment/developer messages between its instructions
+    and the final human message.  Caching only system+tools left several
+    thousand identical tokens to prefill on every new coding-agent session.
+    The candidate must tokenize to an exact prefix of the actual prompt; BPE
+    boundary differences therefore fall back to the conservative system cache.
+    """
+    full = build_chat_prompt(messages, tools)
+    last = next((i for i in range(len(messages) - 1, -1, -1)
+                 if messages[i].get("role", "user") != "system"), None)
+    if last is not None and last == len(messages) - 1 and \
+            messages[last].get("role", "user") not in ("assistant", "tool"):
+        content = _content_to_text(messages[last].get("content"))
+        if dsv4_encoding() is not None:
+            tail = content + DSV4_ASSISTANT + "</think>"
+        else:
+            tail = content + "\n" + ROLE_TAG["assistant"] + ":"
+        if full.endswith(tail):
+            candidate = full[:-len(tail)] if tail else full
+            # A tokenizer can merge the last bytes of candidate with the first
+            # bytes of the dynamic message. Retreat to a real token boundary
+            # instead of discarding the thousands of otherwise stable tokens.
+            for trim in range(65):
+                safe = candidate[:-trim] if trim else candidate
+                candidate_ids = encode(safe)
+                if (len(candidate_ids) <= len(prompt_ids) and
+                        prompt_ids[:len(candidate_ids)] == candidate_ids):
+                    return safe, candidate_ids
+    conservative = sys_prefix_text(messages, tools)
+    return conservative, encode(conservative)
+
+
 def prepare_agent_cache(agent, messages, tools, prompt_ids):
     """Return (prompt_ids, cache_path, cache_load, cache_tokens).
 
     The metadata sidecar makes a frontend restart safe: the raw KV file is
     never restored unless its exact tokenized prefix matches this request.
     """
-    prefix_text = sys_prefix_text(messages, tools)
-    prefix_ids = encode(prefix_text)
+    prefix_text, prefix_ids = agent_prefix_text(messages, tools, prompt_ids)
     if len(prefix_ids) > CACHE_MAX_TOKENS:
         print("[cache] agent=%s SKIP prefix_tokens=%d exceeds limit=%d" %
               (agent, len(prefix_ids), CACHE_MAX_TOKENS),
@@ -404,7 +469,15 @@ def prepare_agent_cache(agent, messages, tools, prompt_ids):
         if cache is None:
             _cache_stats["misses"] += 1
             try:
-                cache = _write_agent_cache(agent, prefix_text, prefix_ids)
+                # Extend a shorter durable system snapshot instead of
+                # recomputing it when creating the richer Codex request cache.
+                sys_text = sys_prefix_text(messages, tools)
+                sys_ids = encode(sys_text)
+                base = None
+                if (len(sys_ids) < len(prefix_ids) and
+                        prefix_ids[:len(sys_ids)] == sys_ids):
+                    base = _read_agent_cache(agent, sys_ids)
+                cache = _write_agent_cache(agent, prefix_text, prefix_ids, base)
             except (OSError, RuntimeError) as e:
                 print("[cache] agent=%s WRITE_FAILED: %s" % (agent, e),
                       file=sys.stderr, flush=True)
@@ -413,7 +486,8 @@ def prepare_agent_cache(agent, messages, tools, prompt_ids):
             _cache_stats["hits"] += 1
     cached = cache["ids"] if cache and cache.get("hit") else []
     print("[cache] agent=%s %s prefix_tokens=%d key=%s" %
-          (agent, "HIT" if cache.get("hit") else "WRITE", len(cached),
+          (agent, "WRITE+USE" if cache.get("created") else
+           ("HIT" if cache.get("hit") else "MISS"), len(cached),
            cache.get("key", "none")), file=sys.stderr, flush=True)
     return prompt_ids, cache["path"], bool(cache.get("hit")), len(cached)
 
@@ -580,8 +654,8 @@ def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, c
 def parse_sampling(body):
     seed = body.get("seed", None)
     return {
-        "temperature": float(body.get("temperature", 0.0)),   # <=0 -> greedy
-        "top_p":       float(body.get("top_p", 1.0)),
+        "temperature": float(body.get("temperature", DEFAULT_TEMPERATURE)),
+        "top_p":       float(body.get("top_p", DEFAULT_TOP_P)),
         "top_k":       int(body.get("top_k", 0)),             # 0 -> disabled
         "presence_penalty": float(body.get("presence_penalty", 0.0)),
         "repeat_penalty":   float(body.get("repeat_penalty", body.get("repetition_penalty", 1.0))),
@@ -636,6 +710,16 @@ def _render_assistant(msg):
 
 def build_chat_prompt(messages, tools):
     """messages[] -> a single plain-text prompt ending in 'Assistant:' for the model to continue."""
+    enc = dsv4_encoding()
+    if enc is not None:
+        prepared = json.loads(json.dumps(messages))
+        if tools:
+            owner = next((m for m in prepared if m.get("role") == "system"), None)
+            if owner is None:
+                owner = {"role": "system", "content": ""}
+                prepared.insert(0, owner)
+            owner["tools"] = tools
+        return enc.encode_messages(prepared, thinking_mode="chat")
     sys_txt = ""
     turns = []
     for m in messages:
@@ -731,6 +815,15 @@ def anthropic_messages_to_openai(messages):
 
 def sys_prefix_text(messages, tools):
     """The fixed prompt prefix every conversation shares (BOS + system + tools)."""
+    enc = dsv4_encoding()
+    if enc is not None:
+        fixed = [json.loads(json.dumps(m)) for m in messages
+                 if m.get("role") == "system"]
+        if not fixed:
+            fixed = [{"role": "system", "content": ""}]
+        if tools:
+            fixed[0]["tools"] = tools
+        return enc.encode_messages(fixed, thinking_mode="chat")
     sys_txt = ""
     for m in messages:
         if m.get("role") == "system":
@@ -747,6 +840,26 @@ def sys_prefix_text(messages, tools):
 def parse_completion(text, hit_eos):
     """Truncate the base-model output at the next role marker, then split off tool calls.
     Returns (content_text, tool_calls_list, finish_reason)."""
+    enc = dsv4_encoding()
+    if enc is not None:
+        encoded = text
+        if hit_eos and not encoded.endswith(DSV4_EOS):
+            encoded += DSV4_EOS
+        try:
+            parsed = enc.parse_message_from_completion_text(encoded, thinking_mode="chat")
+            calls = []
+            for i, tc in enumerate(parsed.get("tool_calls") or []):
+                tc = dict(tc)
+                tc.setdefault("id", "call_%d" % i)
+                calls.append(tc)
+            return (parsed.get("content") or "").strip(), calls, \
+                ("tool_calls" if calls else "stop")
+        except (AssertionError, ValueError, TypeError, KeyError):
+            # Streaming can stop at max_tokens before EOS; retain a bounded,
+            # marker-safe text fallback instead of failing the HTTP request.
+            text = text.split(DSV4_EOS, 1)[0]
+            text = text.split(DSV4_USER, 1)[0]
+            text = text.split(DSV4_ASSISTANT, 1)[0]
     orig_len = len(text)
     cut = orig_len
     for mk in STOP_MARKERS:
@@ -954,16 +1067,18 @@ def stream_visible_delta(state, piece):
     """Return only safe visible text; hold tool-call marker/JSON until EOF."""
     state["raw"] += piece
     raw = state["raw"]
-    marker = "<tool_call>"
-    cut = raw.find(marker)
-    if cut >= 0:
-        visible = raw[:cut]
-    else:
-        visible = raw
-        for n in range(1, len(marker)):
-            if raw.endswith(marker[:n]):
-                visible = raw[:-n]
-                break
+    markers = ("<tool_call>", "\n\n<｜DSML｜tool_calls>")
+    cuts = [raw.find(marker) for marker in markers]
+    cuts = [cut for cut in cuts if cut >= 0]
+    visible = raw[:min(cuts)] if cuts else raw
+    if not cuts:
+        hold = 0
+        for marker in markers:
+            for n in range(1, len(marker)):
+                if raw.endswith(marker[:n]):
+                    hold = max(hold, n)
+        if hold:
+            visible = raw[:-hold]
     delta = visible[state["emitted"]:]
     state["emitted"] = len(visible)
     return delta
@@ -1478,11 +1593,15 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--tokenizer", default=TOK)
     ap.add_argument("--response-state-dir", default=RESPONSE_STATE_DIR)
-    ap.add_argument("--agent-cache-max-tokens", type=int, default=8192)
+    ap.add_argument("--agent-cache-max-tokens", type=int, default=14336)
+    ap.add_argument("--default-temperature", type=float, default=0.0)
+    ap.add_argument("--default-top-p", type=float, default=1.0)
     ap.add_argument("--runner-timeout-sec", type=float, default=3600.0)
     args = ap.parse_args()
     RUNNER_SOCKET, PORT, TOK = args.runner_socket, args.port, args.tokenizer
     CACHE_MAX_TOKENS = max(0, args.agent_cache_max_tokens)
+    DEFAULT_TEMPERATURE = args.default_temperature
+    DEFAULT_TOP_P = args.default_top_p
     TIMEOUT = max(1.0, args.runner_timeout_sec)
     RESPONSE_STATE_DIR = args.response_state_dir
     try:

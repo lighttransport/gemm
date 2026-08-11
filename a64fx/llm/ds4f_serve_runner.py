@@ -102,6 +102,12 @@ def load_lib(path):
     lib.ds4f_serve_decode_slots.argtypes = [ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int]
     lib.ds4f_serve_decode_slots.restype = ctypes.c_int
+    if hasattr(lib, "ds4f_serve_cache_hot_experts"):
+        lib.ds4f_serve_cache_hot_experts.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 3
+        lib.ds4f_serve_cache_hot_experts.restype = ctypes.c_int
+    if hasattr(lib, "ds4f_serve_enable_route_telemetry"):
+        lib.ds4f_serve_enable_route_telemetry.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.ds4f_serve_enable_route_telemetry.restype = ctypes.c_int
     return lib
 
 
@@ -224,6 +230,17 @@ class Serve(object):
         sa = (ctypes.c_int * n)(*slots); ta = (ctypes.c_int * n)(*tokens)
         return self.lib.ds4f_serve_decode_slots(self._s, sa, ta, n)
 
+    def cache_hot_experts(self, cache_mb, reserve_mb, stats):
+        if not hasattr(self.lib, "ds4f_serve_cache_hot_experts"):
+            return -1
+        return self.lib.ds4f_serve_cache_hot_experts(
+            self._s, int(cache_mb), int(reserve_mb), int(stats))
+
+    def enable_route_telemetry(self, enabled):
+        if not hasattr(self.lib, "ds4f_serve_enable_route_telemetry"):
+            return -1
+        return self.lib.ds4f_serve_enable_route_telemetry(self._s, int(enabled))
+
 
 def env_i(k, d):
     return int(os.environ.get(k, d))
@@ -289,7 +306,9 @@ class Job(object):
 class CooperativeServer(object):
     def __init__(self, sess, path, context_dir, memory_ttl, disk_ttl,
                  memory_mb, disk_mb, prefill_quantum, decode_quantum, quantum_ms,
-                 decode_batch_size, single_prefill_quantum):
+                 decode_batch_size, single_prefill_quantum,
+                 expert_cache_mb=0, expert_cache_reserve_mb=1536,
+                 expert_cache_stats=0):
         self.sess, self.path = sess, path
         self.context_dir = context_dir
         self.memory_ttl, self.disk_ttl = memory_ttl, disk_ttl
@@ -299,6 +318,10 @@ class CooperativeServer(object):
         self.decode_q = max(1, decode_quantum)
         self.decode_batch_size = max(1, decode_batch_size)
         self.batch_steps = self.batch_sequences = 0
+        self.expert_cache_mb = expert_cache_mb
+        self.expert_cache_reserve_mb = expert_cache_reserve_mb
+        self.expert_cache_stats = expert_cache_stats
+        self.expert_cache_initialized = False
         if self.decode_batch_size > 1 and self.sess.reserve_decode_batch(self.decode_batch_size) != 0:
             raise RuntimeError("native decode batch reservation failed")
         self.free_slots = list(range(self.decode_batch_size)) if self.decode_batch_size > 1 else []
@@ -333,6 +356,21 @@ class CooperativeServer(object):
         except OSError:
             job.cancelled = True
             return False
+
+    def maybe_cache_hot_experts(self, job, decode_ready=False):
+        if not self.expert_cache_mb or self.expert_cache_initialized:
+            return
+        cold_prompt = max(0, len(job.prompt) - int(job.cached_tokens))
+        if cold_prompt < 256 and not (decode_ready and len(job.out) >= 8):
+            return
+        admitted = self.sess.cache_hot_experts(
+            self.expert_cache_mb, self.expert_cache_reserve_mb,
+            self.expert_cache_stats)
+        if admitted < 0:
+            raise RuntimeError("HIP prompt-hot expert cache setup failed")
+        self.expert_cache_initialized = True
+        print("[runner] prompt-hot expert cache admitted=%d training_prompt=%d decode=%d" %
+              (admitted, cold_prompt, len(job.out)), file=sys.stderr, flush=True)
 
     def disk_paths(self, cid):
         key = hashlib.sha256(cid.encode()).hexdigest()
@@ -565,6 +603,7 @@ class CooperativeServer(object):
                 self.send(job, {"event": "progress", "phase": "prefill",
                                 "processed": job.off, "total": len(job.prompt)})
                 if job.off >= len(job.prompt):
+                    self.maybe_cache_hot_experts(job)
                     self.cache_prompt(job)
                     if job.cache_save_path and not job.cache_saved:
                         if self.sess.kv_save(job.cache_save_path) != 0:
@@ -581,6 +620,7 @@ class CooperativeServer(object):
                     pos = self.sess.pos()
                     if self.sess.decode(tok, pos) < 0: raise RuntimeError("decode failed at %d" % pos)
                     job.out.append(tok); self.send(job, {"event": "token", "token": tok})
+                    self.maybe_cache_hot_experts(job, decode_ready=True)
                     if time.time() >= deadline: break
         except Exception as exc:
             self.finish(job, exc)
@@ -619,6 +659,7 @@ class CooperativeServer(object):
             for job, tok in zip(ready, tokens):
                 job.out.append(tok)
                 self.send(job, {"event": "token", "token": tok, "batch": len(ready)})
+                self.maybe_cache_hot_experts(job, decode_ready=True)
                 if job.cancelled or len(job.out) >= job.max_new:
                     self.finish(job)
         except Exception as exc:
@@ -887,15 +928,26 @@ def main():
     ap.add_argument("--hip-oproj-group-wmma", type=int, choices=(0, 1, 2), default=2)
     ap.add_argument("--hip-mxfp4-wmma", type=int, choices=(0, 1, 2), default=1)
     ap.add_argument("--hip-expert-stream", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-expert-cache-mb", default="0",
+                    help="0 disables, auto uses free VRAM, or an explicit MiB budget")
+    ap.add_argument("--hip-expert-cache-reserve-mb", type=int, default=1536)
+    ap.add_argument("--hip-expert-cache-stats", type=int, choices=(0, 1), default=0)
     ap.add_argument("--hip-block-threads", type=int, choices=(64, 128, 256), default=128)
     # Accepted here so the single-node wrapper can expose one unified program
     # argument list; the value itself configures the HTTP frontend.
-    ap.add_argument("--agent-cache-max-tokens", type=int, default=8192)
+    ap.add_argument("--agent-cache-max-tokens", type=int, default=14336)
+    ap.add_argument("--default-temperature", type=float, default=0.0)
+    ap.add_argument("--default-top-p", type=float, default=1.0)
     ap.add_argument("--runner-timeout-sec", type=float, default=3600.0)
     ap.add_argument("--decode-quantum-tokens", type=int, default=4)
     ap.add_argument("--decode-batch-size", type=int, default=1)
     ap.add_argument("--scheduler-quantum-ms", type=int, default=250)
     args = ap.parse_args()
+    try:
+        expert_cache_mb = (-1 if str(args.hip_expert_cache_mb).lower() == "auto"
+                           else int(args.hip_expert_cache_mb))
+    except ValueError:
+        ap.error("--hip-expert-cache-mb must be 0, auto, or an integer MiB value")
     signal.signal(signal.SIGTERM, _term)
     signal.signal(signal.SIGINT, _term)
     if args.daemon:
@@ -921,6 +973,8 @@ def main():
                               args.hip_block_threads))
     slots = max(1, env_i("DS4F_SERVE_SLOTS", 1))
     prefix_cache = env_i("DS4F_SERVE_PREFIX_CACHE", 1)
+    if expert_cache_mb and sess.enable_route_telemetry(True) != 0:
+        sys.exit("serving library lacks routed-expert telemetry support; rebuild it")
     try:
         if args.unix_socket:
             CooperativeServer(sess, args.unix_socket,
@@ -929,7 +983,9 @@ def main():
                               args.context_memory_mb, args.context_disk_mb,
                               args.prefill_quantum_tokens, args.decode_quantum_tokens,
                               args.scheduler_quantum_ms, args.decode_batch_size,
-                              args.single_prefill_quantum_tokens).run()
+                              args.single_prefill_quantum_tokens,
+                              expert_cache_mb, args.hip_expert_cache_reserve_mb,
+                              args.hip_expert_cache_stats).run()
         else:
             run_serve(sess, base, prefix_cache, slots)
     except KeyboardInterrupt:

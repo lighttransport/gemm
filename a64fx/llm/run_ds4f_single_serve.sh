@@ -10,18 +10,28 @@ PORT=${PORT:-8080}
 TOK=${TOK:-${DS4F_TOKENIZER:-$HOME/models/ds4f/tokenizer.json}}
 RUNNER_LOG=${DS4F_RUNNER_LOG:-$HERE/ds4f_runner.log}
 FRONT_LOG=${DS4F_FRONTEND_LOG:-$HERE/ds4f_frontend.log}
-AGENT_CACHE_MAX=8192
+AGENT_CACHE_MAX=14336
 RUNNER_TIMEOUT=3600
+DEFAULT_TEMPERATURE=0.0
+DEFAULT_TOP_P=1.0
 _cache_next=0
 _timeout_next=0
+_temp_next=0
+_top_p_next=0
 for _arg in "$@"; do
   if [ "$_cache_next" = 1 ]; then AGENT_CACHE_MAX=$_arg; _cache_next=0; continue; fi
   if [ "$_timeout_next" = 1 ]; then RUNNER_TIMEOUT=$_arg; _timeout_next=0; continue; fi
+  if [ "$_temp_next" = 1 ]; then DEFAULT_TEMPERATURE=$_arg; _temp_next=0; continue; fi
+  if [ "$_top_p_next" = 1 ]; then DEFAULT_TOP_P=$_arg; _top_p_next=0; continue; fi
   case "$_arg" in
     --agent-cache-max-tokens) _cache_next=1 ;;
     --agent-cache-max-tokens=*) AGENT_CACHE_MAX=${_arg#*=} ;;
     --runner-timeout-sec) _timeout_next=1 ;;
     --runner-timeout-sec=*) RUNNER_TIMEOUT=${_arg#*=} ;;
+    --default-temperature) _temp_next=1 ;;
+    --default-temperature=*) DEFAULT_TEMPERATURE=${_arg#*=} ;;
+    --default-top-p) _top_p_next=1 ;;
+    --default-top-p=*) DEFAULT_TOP_P=${_arg#*=} ;;
   esac
 done
 
@@ -74,6 +84,7 @@ PORT="$PORT" TOK="$TOK" DS4F_SERVE_BASE="$BASE" \
   DS4F_SERVE_AGENT_CACHE_DIR="$DS4F_SERVE_AGENT_CACHE_DIR" \
   python3 "$HERE/ds4f_serve.py" --runner-socket "$SOCK" --port "$PORT" \
     --tokenizer "$TOK" --agent-cache-max-tokens "$AGENT_CACHE_MAX" \
+    --default-temperature "$DEFAULT_TEMPERATURE" --default-top-p "$DEFAULT_TOP_P" \
     --runner-timeout-sec "$RUNNER_TIMEOUT" \
     >"$FRONT_LOG" 2>&1 &
 FRONT_PID=$!

@@ -35,6 +35,12 @@ class AgentInterfaceTest(unittest.TestCase):
         self.assertEqual(serve.stream_visible_delta(state, "call>{\"name\":\"bash\"}</tool_call>"), "")
         self.assertNotIn("<tool_call>", state["raw"][:state["emitted"]])
 
+    def test_stream_holds_dsv4_tool_marker(self):
+        state = {"raw": "", "emitted": 0}
+        self.assertEqual(serve.stream_visible_delta(state, "answer\n\n<｜DS"), "answer")
+        self.assertEqual(serve.stream_visible_delta(
+            state, "ML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">"), "")
+
     def test_cache_is_durable_and_agent_specific(self):
         with tempfile.TemporaryDirectory() as root, tempfile.NamedTemporaryFile() as tok:
             old_root, old_tok = serve.AGENT_CACHE_ROOT, serve.TOK
@@ -48,7 +54,10 @@ class AgentInterfaceTest(unittest.TestCase):
                 with mock.patch.object(serve, "encode", return_value=[10, 20]), \
                      mock.patch.object(serve, "infer", side_effect=fake_infer):
                     first = serve.prepare_agent_cache("codex", [{"role": "system", "content": "x"}], [], [1, 2, 3])
-                    self.assertFalse(first[2])
+                    # A newly generated snapshot is immediately reusable; the
+                    # triggering request must not prefill the prefix twice.
+                    self.assertTrue(first[2])
+                    self.assertEqual(first[3], 2)
                     second = serve.prepare_agent_cache("codex", [{"role": "system", "content": "x"}], [], [1, 2, 3])
                     self.assertTrue(second[2])
                     other = serve.prepare_agent_cache("claude-code", [{"role": "system", "content": "x"}], [], [1, 2, 3])
@@ -56,6 +65,96 @@ class AgentInterfaceTest(unittest.TestCase):
                     self.assertTrue(os.path.isfile(first[1]))
                     with open(first[1].replace(".kv", ".json")) as f:
                         self.assertEqual(json.load(f)["agent"], "codex")
+            finally:
+                serve.AGENT_CACHE_ROOT, serve.TOK = old_root, old_tok
+
+    def test_cache_accepts_current_codex_sized_prefix(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.NamedTemporaryFile() as tok:
+            old_root, old_tok, old_limit = (serve.AGENT_CACHE_ROOT, serve.TOK,
+                                            serve.CACHE_MAX_TOKENS)
+            serve.AGENT_CACHE_ROOT, serve.TOK = root, tok.name
+            serve.CACHE_MAX_TOKENS = 14336
+            prefix = list(range(11000))
+            try:
+                def fake_infer(prompt, max_tokens, samp, **kwargs):
+                    with open(kwargs["save_path"], "wb") as f:
+                        f.write(b"0123456789abcdef")
+                    return [], [], ""
+
+                with mock.patch.object(serve, "encode", return_value=prefix), \
+                     mock.patch.object(serve, "infer", side_effect=fake_infer):
+                    got = serve.prepare_agent_cache(
+                        "codex", [{"role": "system", "content": "large"}], [], prefix + [1])
+                self.assertTrue(got[2])
+                self.assertEqual(got[3], 11000)
+            finally:
+                serve.AGENT_CACHE_ROOT, serve.TOK, serve.CACHE_MAX_TOKENS = \
+                    old_root, old_tok, old_limit
+
+    def test_agent_prefix_includes_stable_messages_before_dynamic_user(self):
+        messages = [
+            {"role": "system", "content": "instructions"},
+            {"role": "developer", "content": "stable environment"},
+            {"role": "user", "content": "dynamic question"},
+        ]
+        prompt = serve.build_chat_prompt(messages, [])
+        # A character tokenizer makes the required exact-prefix property clear.
+        with mock.patch.object(serve, "encode", side_effect=lambda s: list(map(ord, s))):
+            text, ids = serve.agent_prefix_text(messages, [], list(map(ord, prompt)))
+        self.assertTrue(text.endswith("User: "))
+        self.assertIn("stable environment", text)
+        self.assertNotIn("dynamic question", text)
+        self.assertEqual(ids, list(map(ord, text)))
+
+    def test_agent_prefix_retreats_to_token_boundary(self):
+        messages = [
+            {"role": "system", "content": "instructions"},
+            {"role": "developer", "content": "stable environment"},
+            {"role": "user", "content": "dynamic"},
+        ]
+        prompt = serve.build_chat_prompt(messages, [])
+        full_ids = list(map(ord, prompt))
+
+        def boundary_encode(text):
+            ids = list(map(ord, text))
+            # Simulate a BPE token crossing the candidate boundary while the
+            # same text one character shorter is a proper prompt prefix.
+            if text.endswith("User: "):
+                ids[-1] = 999999
+            return ids
+
+        with mock.patch.object(serve, "encode", side_effect=boundary_encode):
+            text, ids = serve.agent_prefix_text(messages, [], full_ids)
+        self.assertTrue(text.endswith("User:"))
+        self.assertEqual(ids, full_ids[:len(ids)])
+
+    def test_long_agent_cache_extends_existing_system_snapshot(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.NamedTemporaryFile() as tok:
+            old_root, old_tok = serve.AGENT_CACHE_ROOT, serve.TOK
+            serve.AGENT_CACHE_ROOT, serve.TOK = root, tok.name
+            calls = []
+            try:
+                def fake_infer(prompt, max_tokens, samp, **kwargs):
+                    calls.append(kwargs)
+                    with open(kwargs["save_path"], "wb") as f:
+                        f.write(b"0123456789abcdef")
+                    return [], [], ""
+
+                char_encode = lambda s: list(map(ord, s))
+                system = [{"role": "system", "content": "instructions"}]
+                richer = system + [
+                    {"role": "developer", "content": "stable environment"},
+                    {"role": "user", "content": "dynamic"},
+                ]
+                with mock.patch.object(serve, "encode", side_effect=char_encode), \
+                     mock.patch.object(serve, "infer", side_effect=fake_infer):
+                    system_prompt = serve.build_chat_prompt(system, [])
+                    serve.prepare_agent_cache("codex", system, [], char_encode(system_prompt))
+                    rich_prompt = serve.build_chat_prompt(richer, [])
+                    got = serve.prepare_agent_cache("codex", richer, [], char_encode(rich_prompt))
+                self.assertTrue(got[2])
+                self.assertTrue(calls[1]["cache_load"])
+                self.assertGreater(calls[1]["cached_tokens"], 0)
             finally:
                 serve.AGENT_CACHE_ROOT, serve.TOK = old_root, old_tok
 

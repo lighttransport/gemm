@@ -132,5 +132,5 @@ Serving behavior follows the same argument-only rule. Use
 `--single-prefill-quantum-tokens` for the optimized single-request tile
 (default 2048; benchmark 512/1024/2048 before changing it for another GPU),
 `--agent-cache-max-tokens` for Codex/Claude system-prefix
-caching (default 8192), and `--decode-batch-size` for opt-in multi-context
+caching (default 14336), and `--decode-batch-size` for opt-in multi-context
 decode. Do not add production tuning environment variables for these paths.

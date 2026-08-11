@@ -71,6 +71,24 @@ int ds4f_serve_context_export(ds4f_serve *s, void *dst, size_t cap);
 int ds4f_serve_context_import(ds4f_serve *s, const void *src, size_t len);
 int ds4f_serve_sample(ds4f_serve *s, const ds4f_serve_sampling *sp);
 
+int ds4f_serve_enable_route_telemetry(ds4f_serve *s, int enabled) {
+    if (!s || !s->m) return -1;
+    s->m->route_telemetry = enabled != 0;
+    return 0;
+}
+
+int ds4f_serve_cache_hot_experts(ds4f_serve *s, int cache_mb,
+                                 int reserve_mb, int stats) {
+#if defined(DS4F_SERVE_HIP)
+    if (!s || !s->m || !s->hip) return -1;
+    return hip_ds4f_dense_cache_hot_experts(s->hip, s->m, cache_mb,
+                                             reserve_mb, stats);
+#else
+    (void)s; (void)cache_mb; (void)reserve_mb; (void)stats;
+    return -1;
+#endif
+}
+
 static int env_i(const char *k, int d) { const char *e = getenv(k); return e && *e ? atoi(e) : d; }
 
 typedef struct { float l; int id; } ds4f_pair;
