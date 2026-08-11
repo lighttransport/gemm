@@ -591,7 +591,7 @@ static void ds4f_matvec_blockdiag(ds4f_model *m, float *dst, const ds4f_tensor *
  * mHC mixes) falls back to a per-token matvec loop. K-tile reassociation makes the
  * result bit-SIMILAR (~1e-4) to the single-token matvec. */
 #ifndef DS4F_MAX_MTILE
-#define DS4F_MAX_MTILE 256          /* K=256 is the measured best memory/performance point */
+#define DS4F_MAX_MTILE 512          /* compact TP scratch makes larger verify tiles practical */
 #endif
 typedef struct { ds4f_model *m; float *Y; const ds4f_tensor *t;
                  const float *X; int M, Ystride, Xstride; } ds4f_gemm_task;
