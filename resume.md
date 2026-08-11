@@ -248,6 +248,12 @@ This is the single largest real, verified win of the session: **prefill at 1024 
 
 Verified: mHC exact quality gate identical output with the new default (no env var needed), no VRAM leak, no orphan/stuck processes. 8192-token confirmation run was interrupted mid-execution by the harness (not a crash — clean state, no leak) before completing; the 256- and 1024-token results are clean and sufficient to establish the fix.
 
+## User decision: stop here, 100-200 tok/s prefill is a future-session project (2026-08-12)
+
+After the attention-vectorization fix above and a systematic (but negative) search for repeats of that bug class elsewhere in the codebase, explicitly asked the user how to handle the remaining gap to 100-200 tok/s given that closing it requires a genuinely new GPU kernel (tier-B2-aware attention, handling the compressed-KV term for 41/43 layers — the existing GPU attention kernel only covers the window term). Presented three options: stop and accept the current state; authorize a rushed same-session kernel attempt despite accuracy-validation risk; or redefine the target. **User chose to stop here and accept the current state.**
+
+This is the deliberate, authorized end of this optimization investigation, not an unresolved blocker. Do not re-open the "reach 100-200 tok/s this session" framing without the user raising it again. The next real step, when picked up, is building the tier-B2-aware GPU attention kernel described above — a scoped, multi-session project that needs proper test/validation runway against the mHC exact quality gate before any of it should be trusted, not something to attempt under time pressure.
+
 ## Quality evidence
 
 Use mHC enabled for the authoritative exact path:
