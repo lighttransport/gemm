@@ -5345,7 +5345,6 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         ds4f_gemm(m, m->p_qlat, &ly->wq_a, m->p_hn, K, c->q_lora, C);
         { ds4f_pf_rms_task t = { m, m->p_qlat, m->p_qlat, ly->q_norm, c->q_lora, K, c->q_lora, c->q_lora };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
-        if(m->attn_h1-m->attn_h0<c->n_heads) memset(m->p_q,0,(size_t)K*H*4);
         ds4f_gemm(m,m->p_q+(size_t)m->attn_h0*HD,&ly->wq_b,m->p_qlat,K,H,c->q_lora);
         { ds4f_pf_qnr_task t = { m, pos0, K, rcos, rsin };
           ds4f_pool_run(m->pool, ds4f_pf_qnr_worker, &t); }
@@ -5441,7 +5440,6 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                 ds4f_tb2_snap_layer(m, L, snaps + (size_t)k*snap_stride + snap_loff, 0);
             m->cp_gather = 0;
             tv = ds4f_prof_on ? ds4f_now() : 0.0;
-            if(m->attn_h1-m->attn_h0<c->n_heads) memset(m->s_attn,0,(size_t)H*4);
             if (m->tierb2 && ratio) { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
                 if (!ds4f_attn_tb2_gemm(m, &at)) ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
@@ -5449,7 +5447,9 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
                 ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
             if (ds4f_prof_on) m->prof[DS4F_P_ATTN] += ds4f_now()-tv;
-            memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4);
+            memcpy(m->p_attn+(size_t)k*H+(size_t)m->attn_h0*HD,
+                   m->s_attn+(size_t)m->attn_h0*HD,
+                   (size_t)(m->attn_h1-m->attn_h0)*HD*4);
             m->s_hn = saved_hn;
             m->s_q = saved_q;
         }
