@@ -228,3 +228,12 @@ window, not attention or routed WMMA arithmetic. Genuine single-request
 100+ tok/s therefore requires a larger permanently pinned host window,
 additional expert-resident accelerator memory, or expert-parallel ranks; it
 cannot be inferred from the storage-only EP8 harness.
+
+`--hip-expert-pinned-staging 1` is an explicit diagnostic alternative to the
+rolling registration path. It coalesces each layer into two pinned host slabs
+before DMA, but is disabled by default: on this 188 GiB host the two staging
+slots reduce file-cache headroom and measured 9.66 tok/s at 1024 tokens versus
+11.60 tok/s for direct streaming. The CPU fallback now groups every routed
+expert under three pool dispatches per layer; it improved the same 1024-token
+case from more than 234 seconds to 131.48 seconds (7.79 tok/s), but remains a
+fallback rather than the production profile.

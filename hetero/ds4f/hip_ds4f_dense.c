@@ -185,6 +185,9 @@ struct hip_ds4f_dense {
     size_t stream_slot_dw_bytes[2], stream_slot_ds_bytes[2];
     void *stream_slot_hreg[2];
     size_t stream_slot_hreg_bytes[2];
+    void *stream_slot_hw[2], *stream_slot_hs[2];
+    size_t stream_slot_hw_bytes[2], stream_slot_hs_bytes[2];
+    int expert_pinned_staging;
     const ds4f_layer *stream_slot_layer[2];
     int stream_active_slot, stream_pending_slot;
     const ds4f_layer *stream_pending_layer;
@@ -217,6 +220,10 @@ void hip_ds4f_dense_set_prefill_features(hip_ds4f_dense *ctx, int qkv_fuse,
     ctx->mxfp4_wmma = mxfp4_wmma;
     if (block_threads == 64 || block_threads == 128 || block_threads == 256)
         ctx->block_threads = block_threads;
+}
+
+void hip_ds4f_dense_set_expert_pinned_staging(hip_ds4f_dense *ctx, int enabled) {
+    if (ctx) ctx->expert_pinned_staging = enabled != 0;
 }
 
 void hip_ds4f_dense_set_decode_features(hip_ds4f_dense *ctx, int kv_resident) {
@@ -260,6 +267,7 @@ static void *stream_copy_worker(void *opaque) {
                                     layer ? layer->ex_w2 : NULL,
                                     layer ? layer->ex_w3 : NULL };
         size_t wo = 0, so = 0;
+        int pinned_stage = ctx->stream_slot_hw[slot] && ctx->stream_slot_hs[slot];
         for (size_t wi = 0; ok && wi < sizeof(ex) / sizeof(ex[0]); ++wi)
             if (ex[wi]) for (int e = 0; e < layer->n_owned; ++e) {
                 const ds4f_tensor *t = &ex[wi][e];
@@ -267,12 +275,21 @@ static void *stream_copy_worker(void *opaque) {
                 size_t sb = (size_t)t->rows * (size_t)(t->cols / 32);
                 void *dw = (uint8_t *)ctx->stream_slot_dw[slot] + wo;
                 void *ds = (uint8_t *)ctx->stream_slot_ds[slot] + so;
-                if (hipMemcpyAsync(dw, t->w, wb, hipMemcpyHostToDevice,
-                                    ctx->stream_copy) != hipSuccess ||
-                    hipMemcpyAsync(ds, t->scale, sb, hipMemcpyHostToDevice,
-                                   ctx->stream_copy) != hipSuccess) ok = 0;
+                if (pinned_stage) {
+                    memcpy((uint8_t *)ctx->stream_slot_hw[slot] + wo, t->w, wb);
+                    memcpy((uint8_t *)ctx->stream_slot_hs[slot] + so, t->scale, sb);
+                } else if (hipMemcpyAsync(dw, t->w, wb, hipMemcpyHostToDevice,
+                                          ctx->stream_copy) != hipSuccess ||
+                           hipMemcpyAsync(ds, t->scale, sb, hipMemcpyHostToDevice,
+                                          ctx->stream_copy) != hipSuccess) ok = 0;
                 wo += wb; so += sb;
             }
+        if (ok && pinned_stage &&
+            (hipMemcpyAsync(ctx->stream_slot_dw[slot], ctx->stream_slot_hw[slot],
+                            wo, hipMemcpyHostToDevice, ctx->stream_copy) != hipSuccess ||
+             hipMemcpyAsync(ctx->stream_slot_ds[slot], ctx->stream_slot_hs[slot],
+                            so, hipMemcpyHostToDevice, ctx->stream_copy) != hipSuccess))
+            ok = 0;
         if (ok && hipEventRecord(ctx->stream_copy_done[slot], ctx->stream_copy) != hipSuccess)
             ok = 0;
         pthread_mutex_lock(&ctx->stream_copy_mu);
@@ -588,6 +605,10 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     for (int i = 0; i < 2; ++i) {
         if (ctx->stream_slot_hreg[i] && hipHostUnregister)
             hipHostUnregister(ctx->stream_slot_hreg[i]);
+        if (ctx->stream_slot_hw[i] && hipHostFree)
+            hipHostFree(ctx->stream_slot_hw[i]);
+        if (ctx->stream_slot_hs[i] && hipHostFree)
+            hipHostFree(ctx->stream_slot_hs[i]);
         if (ctx->stream_slot_dw[i]) hipFree(ctx->stream_slot_dw[i]);
         if (ctx->stream_slot_ds[i]) hipFree(ctx->stream_slot_ds[i]);
         if (ctx->stream_copy_done[i] && hipEventDestroy) hipEventDestroy(ctx->stream_copy_done[i]);
@@ -987,6 +1008,27 @@ static int ensure_stream_slot(hip_ds4f_dense *ctx, int slot,
     return 0;
 }
 
+static int ensure_stream_host_slot(hip_ds4f_dense *ctx, int slot,
+                                   size_t wbytes, size_t sbytes) {
+    if (!ctx->expert_pinned_staging || !hipHostMalloc || !hipHostFree) return -1;
+    if (ctx->stream_slot_hw[slot] && ctx->stream_slot_hw_bytes[slot] >= wbytes &&
+        ctx->stream_slot_hs[slot] && ctx->stream_slot_hs_bytes[slot] >= sbytes)
+        return 0;
+    void *hw = NULL, *hs = NULL;
+    if (hipHostMalloc(&hw, wbytes, hipHostMallocDefault) != hipSuccess ||
+        hipHostMalloc(&hs, sbytes, hipHostMallocDefault) != hipSuccess) {
+        if (hw) hipHostFree(hw);
+        if (hs) hipHostFree(hs);
+        return -1;
+    }
+    if (ctx->stream_slot_hw[slot]) hipHostFree(ctx->stream_slot_hw[slot]);
+    if (ctx->stream_slot_hs[slot]) hipHostFree(ctx->stream_slot_hs[slot]);
+    ctx->stream_slot_hw[slot] = hw; ctx->stream_slot_hs[slot] = hs;
+    ctx->stream_slot_hw_bytes[slot] = wbytes;
+    ctx->stream_slot_hs_bytes[slot] = sbytes;
+    return 0;
+}
+
 static int prefetch_layer_raw_async(hip_ds4f_dense *ctx, const ds4f_layer *layer) {
     if (!ctx || !layer || ctx->pending || ctx->multi_pending || !ctx->stream_copy)
         return -1;
@@ -1035,11 +1077,12 @@ static int prefetch_layer_raw_async(hip_ds4f_dense *ctx, const ds4f_layer *layer
     int slot = ctx->stream_active_slot < 0 ? 0 : 1 - ctx->stream_active_slot;
     if (ctx->stream_slot_layer[slot]) release_stream_slot(ctx, slot);
     if (ensure_stream_slot(ctx, slot, wtotal, stotal) != 0) return -1;
+    int pinned_stage = ensure_stream_host_slot(ctx, slot, wtotal, stotal) == 0;
     /* The nocopy stage is one contiguous virtual mapping. Registering the
      * current layer lets ROCm DMA directly from its resident file-cache pages
      * instead of internally staging 1536 pageable tensor copies. Keep two
      * layer ranges registered so N+1 can transfer while N computes. */
-    if (hipHostRegister && host_lo < host_hi) {
+    if (!pinned_stage && hipHostRegister && host_lo < host_hi) {
         uintptr_t lo = host_lo & ~(uintptr_t)4095;
         uintptr_t hi = (host_hi + 4095) & ~(uintptr_t)4095;
         size_t span = hi - lo;

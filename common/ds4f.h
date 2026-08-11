@@ -264,6 +264,7 @@ typedef struct ds4f_layer {
     /* MoE */
     ds4f_tensor gate;                 /* BF16 [n_experts, hidden] router */
     float *gate_bias;                 /* [n_experts] F32 selection bias (exact, layers>=n_hash); NULL=hash/synth */
+    int32_t *gate_tid2eid;             /* [vocab,n_active] token-id routes for hash layers */
     ds4f_tensor sh_w1, sh_w2, sh_w3;  /* shared expert (FP8) */
     ds4f_tensor *ex_w1, *ex_w2, *ex_w3; /* owned experts (cfg.expert_qt: MXFP4 | FP8), 0..n_owned-1 */
     int *owned_eid;                   /* global expert id of each owned slot */
@@ -732,6 +733,12 @@ typedef struct {
      * layer.  Keeping it model-local makes server and benchmark reports agree. */
     uint64_t *route_hits, *route_tokens;
     int route_telemetry;
+    /* Token ids corresponding to the current forward call.  Hash-routed
+     * layers 0..n_hash_layers-1 require the original id; the embedding alone
+     * cannot recover it.  Serving code sets this immediately before a
+     * token/batch forward. */
+    const int *forward_token_ids;
+    int forward_token_count;
     /* per-phase wall-time profiler (seconds, accumulated; printed by runner) */
 #define DS4F_NPHASE 24
     double prof[DS4F_NPHASE];

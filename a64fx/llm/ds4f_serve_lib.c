@@ -182,7 +182,7 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
     int qkv_device_chain, int attn_device_chain, int attn_no_d2h,
     int routed_ffn, int fp8_wmma, int bf16_wmma, int attn_wmma,
     int oproj_group_wmma, int mxfp4_wmma, int expert_stream,
-    int block_threads) {
+    int block_threads, int expert_pinned_staging) {
     if (!s || !s->m || !s->hip) return -1;
     ds4f_model *m = s->m;
     if (!enabled) {
@@ -234,6 +234,7 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
     hip_ds4f_dense_set_prefill_features(s->hip, qkv_fuse,
         qkv_device_chain, attn_device_chain, attn_no_d2h, fp8_wmma,
         bf16_wmma, attn_wmma, oproj_group_wmma, mxfp4_wmma, block_threads);
+    hip_ds4f_dense_set_expert_pinned_staging(s->hip, expert_pinned_staging);
     m->gpu_prefill_attn_oproj = prefill_attn && !qkv_device_chain
         ? hip_ds4f_dense_prefill_attn_oproj : NULL;
     return 0;
@@ -355,6 +356,7 @@ int ds4f_serve_prefill(ds4f_serve *s, const int *ids, int n, int pos0) {
             if (id < 0 || id >= s->vocab) return -1;
             if (embed_lookup(s->m, id, s->prefill_x + (size_t)i * s->hidden) != 0) return -1;
         }
+        ds4f_set_forward_token_ids(s->m, ids + off, tile);
         ds4f_forward_verify(s->m, s->prefill_x, tile, p,
                             s->prefill_tok, NULL, NULL);
         p += tile;
@@ -383,6 +385,7 @@ int ds4f_serve_decode(ds4f_serve *s, int token, int pos) {
     double tw0 = dc_wall();
     if (!s || token < 0 || token >= s->vocab) return -1;
     if (embed_lookup(s->m, token, s->x) != 0) return -1;
+    ds4f_set_forward_token_ids(s->m, &token, 1);
     int ar = ds4f_forward_token(s->m, s->x, pos);
     double tw1 = dc_wall();
     if (getenv("DS4F_SERVE_TIME") && (pos % 4) == 0)
@@ -439,6 +442,7 @@ int ds4f_serve_decode_batch(ds4f_serve *s, const int *tokens, int n,
     }
     for (int L = 0; L < m->cfg.n_layers; ++L)
         ds4f_lseq_apply(&m->layers[L], &m->dec_batch_seq[L]);
+    ds4f_set_forward_token_ids(m, tokens, n);
     ds4f_forward_verify(m, s->prefill_x, n, 0, argmax, NULL, NULL);
     for (int k = 0; k < n; ++k) {
         for (int L = 0; L < m->cfg.n_layers; ++L)
@@ -595,6 +599,7 @@ int ds4f_serve_decode_slots(ds4f_serve *s, const int *slots,
     m->dec_nseq = n;
     int *argmax = (int *)malloc((size_t)n*sizeof(int));
     if (!argmax) { memcpy(m->dec_batch_seq, saved, (size_t)cache_cap*NL*sizeof(*saved)); free(saved); return -1; }
+    ds4f_set_forward_token_ids(m, tokens, n);
     ds4f_forward_verify(m, s->prefill_x, n, 0, argmax, NULL, NULL);
     for (int k = 0; k < n; ++k) {
         int q = slots[k], nh = s->slot_n_hist[q];

@@ -151,6 +151,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "real-token gate: invalid embedding token %d at pos %d\n", ids[pos], pos);
             nonfinite = 1; break;
         }
+        ds4f_set_forward_token_ids(ref, &ids[pos], 1);
+        ds4f_set_forward_token_ids(fast, &ids[pos], 1);
         int ar = ds4f_forward_token(ref, xr, pos);
         int af = ds4f_forward_token(fast, xf, pos);
         if (ar != af) arg_mismatch++;

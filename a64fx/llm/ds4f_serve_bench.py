@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--hip-mxfp4-wmma", type=int, choices=(0, 1, 2), default=1)
     ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-expert-stream", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-expert-pinned-staging", type=int, choices=(0, 1), default=0)
     ap.add_argument("--cpu-only", action="store_true")
     args = ap.parse_args()
 
@@ -48,7 +49,8 @@ def main():
                  # Keep the one-shot benchmark on the same tuned path as the
                  # production runner.  This tuple mirrors the runner defaults.
                  (1, 1, 1, 1, 1, 1, 1, args.hip_routed_ffn, 2, 1, 1, 2,
-                  args.hip_mxfp4_wmma, args.hip_expert_stream, 128))
+                  args.hip_mxfp4_wmma, args.hip_expert_stream, 128,
+                  args.hip_expert_pinned_staging))
     greedy = Sampling(0.0, 1.0, 1, 0.0, 1.0, 1)
     try:
         t0 = time.perf_counter()

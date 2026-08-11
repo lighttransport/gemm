@@ -49,7 +49,7 @@ def load_lib(path):
                                     ctypes.c_int, ctypes.c_int, ctypes.c_longlong,
                                     ctypes.c_char_p, ctypes.c_size_t]
     if hasattr(lib, "ds4f_serve_configure_hip_prefill"):
-        lib.ds4f_serve_configure_hip_prefill.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 15
+        lib.ds4f_serve_configure_hip_prefill.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 16
         lib.ds4f_serve_configure_hip_prefill.restype = ctypes.c_int
     lib.ds4f_serve_close.argtypes = [ctypes.c_void_p]
     lib.ds4f_serve_prefill.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
@@ -928,6 +928,8 @@ def main():
     ap.add_argument("--hip-oproj-group-wmma", type=int, choices=(0, 1, 2), default=2)
     ap.add_argument("--hip-mxfp4-wmma", type=int, choices=(0, 1, 2), default=1)
     ap.add_argument("--hip-expert-stream", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-expert-pinned-staging", type=int, choices=(0, 1), default=0,
+                    help="coalesce streamed expert weights through two pinned host buffers")
     ap.add_argument("--hip-expert-cache-mb", default="0",
                     help="0 disables, auto uses free VRAM, or an explicit MiB budget")
     ap.add_argument("--hip-expert-cache-reserve-mb", type=int, default=1536)
@@ -970,7 +972,7 @@ def main():
                               args.hip_fp8_wmma, args.hip_bf16_wmma,
                               args.hip_attn_wmma, args.hip_oproj_group_wmma,
                               args.hip_mxfp4_wmma, args.hip_expert_stream,
-                              args.hip_block_threads))
+                              args.hip_block_threads, args.hip_expert_pinned_staging))
     slots = max(1, env_i("DS4F_SERVE_SLOTS", 1))
     prefix_cache = env_i("DS4F_SERVE_PREFIX_CACHE", 1)
     if expert_cache_mb and sess.enable_route_telemetry(True) != 0:

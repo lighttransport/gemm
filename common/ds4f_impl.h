@@ -1682,13 +1682,10 @@ static void ds4f_build_freqs(ds4f_model *m) {
  *   s = 2^ceil(log2(amax/qmax))   (kernel.py fast_round_scale, exact bit trick).
  * Validated standalone against tools/ds4f_q2_ref.py (a64fx/llm/ds4f_q2_test.c).
  *
- * NOTE on FP8 kv-quant (model.py:506 act_quant(kv[..,:-rd],64,..,inplace=True)): the
- * reference's INPLACE fp8 path casts the snapped value through out_dtype=in_dtype=BF16
- * (kernel.py:86-91) and s is a power of 2, so on already-bf16 kv it is an EXACT no-op —
- * confirmed by model.py:527 ("kv could also use fp8 format, though current implementation
- * uses bf16"). The exact attention path therefore deliberately omits it (Tier-B1 #3): it
- * would not change logits. The FP4 path below is genuinely lossy (1-bit mantissa) and IS
- * applied (indexer q at model.py:414, rotate=True compressor kv at 369-370).
+ * The main KV latent also takes an E4M3 quantize/dequantize round trip over
+ * 64-wide blocks of its non-RoPE prefix.  This is not a no-op: the projection
+ * and RMSNorm accumulator is f32 at this point.  Keep it in the exact path to
+ * match the released model and DwarfStar reference runner.
  *
  * These are not yet wired (the Tier-B2 compressor/indexer is pending); kept here as the
  * canonical validated implementations the compressor/indexer will call. */
@@ -1709,6 +1706,42 @@ static inline float ds4f_bf16_round(float f) {
     if ((u & 0x7FFFFFFFu) >= 0x7F800000u) return f;             /* nan/inf passthrough */
     uint32_t r = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;/* round-to-nearest-even */
     memcpy(&f, &r, 4); return f;
+}
+
+static inline float ds4f_e4m3fn_value(int code) {
+    int exp = (code >> 3) & 15, mant = code & 7;
+    if (exp == 0) return (float)mant * 0.001953125f;
+    return (1.0f + (float)mant * 0.125f) * ldexpf(1.0f, exp - 7);
+}
+
+static inline float ds4f_e4m3fn_snap(float x) {
+    float sign = x < 0.0f ? -1.0f : 1.0f;
+    float ax = fminf(fabsf(x), 448.0f);
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (ds4f_e4m3fn_value(mid) <= ax) lo = mid; else hi = mid - 1;
+    }
+    int best = lo;
+    if (best < 126) {
+        float d0 = fabsf(ax - ds4f_e4m3fn_value(best));
+        float d1 = fabsf(ax - ds4f_e4m3fn_value(best + 1));
+        if (d1 < d0 || (d1 == d0 && ((best + 1) & 1) == 0 && (best & 1))) ++best;
+    }
+    return sign * ds4f_e4m3fn_value(best);
+}
+
+static void ds4f_fp8_kv_quant_inplace(float *x, int head_dim, int rope_dim) {
+    int nope = head_dim - rope_dim;
+    for (int off = 0; off < nope; off += 64) {
+        float amax = 0.0f;
+        for (int i = 0; i < 64; ++i) amax = fmaxf(amax, fabsf(x[off + i]));
+        if (amax < 1.0e-4f) amax = 1.0e-4f;
+        float scale = exp2f(ceilf(log2f(amax / 448.0f)));
+        for (int i = 0; i < 64; ++i)
+            x[off + i] = ds4f_e4m3fn_snap(ds4f_clampf(x[off + i] / scale,
+                                                       -448.0f, 448.0f)) * scale;
+    }
 }
 
 /* round v (|v|<=6) to nearest float4_e2m1 value, RNE. grid {0,.5,1,1.5,2,3,4,6}. */
@@ -3857,6 +3890,26 @@ static void ds4f_load_raw(ds4f_model *m, const ds4f_blob *B, void *dst,
     m->bytes_read += wb;
 }
 
+/* Safetensors publishes the hash routing table as I64 [vocab,topk], while the
+ * values are expert ids in [0,256).  Keep the compact I32 representation used
+ * by the known-good GGUF runner. */
+static void ds4f_load_i64_to_i32(ds4f_model *m, const ds4f_blob *B, int32_t *dst,
+                                 const char *name, int rows, int cols) {
+    size_t n = (size_t)rows * (size_t)cols;
+    const ds4f_mani_ent *e = ds4f_need(B, name, "I64", n * sizeof(int64_t));
+    const int64_t *src = (const int64_t *)(B->blob + e->off);
+    for (size_t i = 0; i < n; ++i) {
+        if (src[i] < 0 || src[i] >= m->cfg.n_experts) {
+            fprintf(stderr, "ds4f_load_real: %s contains invalid expert id %lld\n",
+                    name, (long long)src[i]);
+            abort();
+        }
+        dst[i] = (int32_t)src[i];
+    }
+    ds4f_blob_drop(B, e->off, n * sizeof(int64_t));
+    m->bytes_read += n * sizeof(int64_t);
+}
+
 /* ---- Tier-B2 weight conversion: real bytes -> plain f32 (the compressor/indexer
  * kernels consume float* weights + bf16 norms, so FP8/BF16 sources are widened at
  * load time). Off-arena destinations; same blob-drop discipline as the dense path. */
@@ -4216,6 +4269,8 @@ static ds4f_model *ds4f_load_real_opts(const ds4f_runtime_options *opt) {
         /* router selection bias (F32[n_experts]); only non-hash layers have it.
          * Off-arena (tiny, read single-threaded in the exact gate, not a matvec). */
         if (L >= cfg.n_hash_layers) ly->gate_bias = (float *)ds4f_mem_alloc(m->mem, (size_t)cfg.n_experts * 4, 64, 1);
+        else ly->gate_tid2eid = (int32_t *)ds4f_mem_alloc(
+            m->mem, (size_t)cfg.vocab * cfg.n_active * sizeof(int32_t), 64, 0);
         ly->sh_w1 = ds4f_new_tensor(m, dq, m->sh_rows, C);       /* TP: col-shard shared_inter */
         ly->sh_w3 = ds4f_new_tensor(m, dq, m->sh_rows, C);
         ly->sh_w2 = ds4f_new_tensor(m, dq, m->sh2_rows, cfg.shared_inter); /* TP_SHARED_FULL: hidden-row shard */
@@ -4287,6 +4342,9 @@ static ds4f_model *ds4f_load_real_opts(const ds4f_runtime_options *opt) {
         else ds4f_load_dense(m, &B, &ly->wo_b, DS4F_LN("attn.wo_b"));
         ds4f_load_raw(m, &B, ly->attn_sink, DS4F_LN("attn.attn_sink"),       DS4F_F32, 1, cfg.n_heads);
         ds4f_load_dense(m, &B, &ly->gate,   DS4F_LN("ffn.gate"));
+        if (ly->gate_tid2eid)
+            ds4f_load_i64_to_i32(m, &B, ly->gate_tid2eid,
+                                 DS4F_LN("ffn.gate.tid2eid"), cfg.vocab, cfg.n_active);
         if (ly->gate_bias)   /* noaux_tc selection bias (F32[n_experts]); non-hash layers only */
             ds4f_load_raw(m, &B, ly->gate_bias, DS4F_LN("ffn.gate.bias"), DS4F_F32, 1, cfg.n_experts);
         if (m->sh_rows < cfg.shared_inter) {                    /* TP: col-shard sh_w1/sh_w3 */
@@ -5231,6 +5289,44 @@ static void ds4f_topk_exact(const float *logits, const float *bias, int n, int k
     for (int i = 0; i < k; i++) wt[i] = (selsc[i] / sum) * routed_scale;
 }
 
+static void ds4f_set_forward_token_ids(ds4f_model *m, const int *ids, int n) {
+    if (!m) return;
+    m->forward_token_ids = ids;
+    m->forward_token_count = ids && n > 0 ? n : 0;
+}
+
+/* Hash layers select experts from tid2eid but retain router-derived,
+ * sqrt-softplus weights for those selected experts. */
+static void ds4f_select_experts(ds4f_model *m, const ds4f_layer *ly,
+                                const float *logits, int token_index,
+                                int *idx, float *wt) {
+    ds4f_config *c = &m->cfg;
+    if (!ly->gate_tid2eid || !m->forward_token_ids ||
+        token_index < 0 || token_index >= m->forward_token_count) {
+        ds4f_topk_exact(logits, ly->gate_bias, c->n_experts, c->n_active,
+                        idx, wt, c->routed_scale);
+        return;
+    }
+    int token = m->forward_token_ids[token_index];
+    if (token < 0 || token >= c->vocab) {
+        fprintf(stderr, "ds4f: hash-routing token id %d outside vocab\n", token);
+        abort();
+    }
+    const int32_t *route = ly->gate_tid2eid + (size_t)token * c->n_active;
+    float sum = 0.0f;
+    for (int k = 0; k < c->n_active; ++k) {
+        int e = route[k];
+        float z = logits[e];
+        float sp = z > 0.0f ? z + log1pf(expf(-z)) : log1pf(expf(z));
+        idx[k] = e;
+        wt[k] = sqrtf(sp < 0.0f ? 0.0f : sp);
+        sum += wt[k];
+    }
+    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    for (int k = 0; k < c->n_active; ++k)
+        wt[k] = wt[k] / sum * c->routed_scale;
+}
+
 static void ds4f_route_observe(ds4f_model *m, int layer, const int *idx, int n) {
     if (!m || !m->route_telemetry) return;
     if (!m->route_hits) {
@@ -6168,6 +6264,7 @@ static void ds4f_pf_kvpost_worker(void *arg, int tid, int nthr) {
     for (int mm = m0; mm < m1; mm++) {
         float *kv = m->p_kvlat + (size_t)mm*KV;
         ds4f_rmsnorm(kv, kv, ly->kv_norm, KV, 1e-6f);
+        ds4f_fp8_kv_quant_inplace(kv, KV, rd);
         ds4f_rope_apply(kv + (KV - rd), T->rcos, T->rsin, T->pos0 + mm, rd/2, 0);
         uint16_t *dst = ly->kv_cache + (size_t)(T->pos0 + mm)*KV;   /* f32 latent -> bf16 cache */
         for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kv[d]);
@@ -6664,8 +6761,9 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         for (int s = 0; s < no; s++) m->ex_cnt[s] = 0;
         for (int mm = 0; mm < M; mm++) {
             int idx[8]; float wt[8];
-            ds4f_topk_exact(m->p_router + (size_t)mm*c->n_experts, ly->gate_bias,
-                            c->n_experts, c->n_active, idx, wt, c->routed_scale);
+            ds4f_select_experts(m, ly,
+                                m->p_router + (size_t)mm*c->n_experts,
+                                mm, idx, wt);
             ds4f_route_observe(m, L, idx, c->n_active);
             float *route = m->p_route + (size_t)mm*C;
             for (int i = 0; i < C; i++) route[i] = 0.f;
@@ -7006,6 +7104,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                 ds4f_lseq_apply(ly, &m->dec_batch_seq[(size_t)k*c->n_layers + L]);
             float *kvl = m->p_kvlat + (size_t)k*KV;
             ds4f_rmsnorm(kvl, kvl, ly->kv_norm, KV, eps);
+            ds4f_fp8_kv_quant_inplace(kvl, KV, c->qk_rope_dim);
             ds4f_rope_apply(kvl + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
             { uint16_t *dst = ly->kv_cache + (size_t)(pos % ly->kv_slots)*KV;
               for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kvl[d]); }
@@ -7092,8 +7191,9 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
           for (int s = 0; s < no; s++) m->ex_cnt[s] = 0;
           for (int k = 0; k < K; k++) {
               int idx[8]; float wt[8];
-              ds4f_topk_exact(m->p_router + (size_t)k*c->n_experts, ly->gate_bias,
-                              c->n_experts, c->n_active, idx, wt, c->routed_scale);
+              ds4f_select_experts(m, ly,
+                                  m->p_router + (size_t)k*c->n_experts,
+                                  k, idx, wt);
               ds4f_route_observe(m, L, idx, c->n_active);
               float *route = m->p_route + (size_t)k*C;
               for (int i = 0; i < C; i++) route[i] = 0.f;
@@ -7132,20 +7232,54 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                   }
               }
           } else {
-          for (int s = 0; s < no; s++) {
-              int cnt = m->ex_cnt[s]; if (!cnt) continue;
-              for (int p = 0; p < cnt; p++) { const float *h2 = m->p_h2 + (size_t)m->ex_tok[(size_t)s*m->m_tile+p]*C;
-                  float *xe = m->p_exX + (size_t)p*C; for (int i = 0; i < C; i++) xe[i] = h2[i]; }
-              ds4f_gemm(m, m->p_exG, &ly->ex_w1[s], m->p_exX, cnt, c->moe_inter, C);
-              ds4f_gemm(m, m->p_exU, &ly->ex_w3[s], m->p_exX, cnt, c->moe_inter, C);
-              { ds4f_pf_swiglu_task t = { m, m->p_exG, m->p_exU, c->moe_inter, cnt,
-                                          c->moe_inter, c->moe_inter, c->swiglu_limit };
-                ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
-              ds4f_gemm(m, m->p_exO, &ly->ex_w2[s], m->p_exG, cnt, C, c->moe_inter);
-              for (int p = 0; p < cnt; p++) { int k = m->ex_tok[(size_t)s*m->m_tile+p]; float w = m->ex_wt[(size_t)s*m->m_tile+p];
-                  float *route = m->p_route + (size_t)k*C; const float *o = m->p_exO + (size_t)p*C;
-                  for (int i = 0; i < C; i++) route[i] += w * o[i]; }
-          }
+              /* Match the plain-prefill grouped scheduler: gather already
+               * placed every expert bucket in one assignment-major slab, so
+               * submit all gate/up matrices under one pool dispatch, all
+               * activations under one dispatch, and all down matrices under
+               * one dispatch.  The former production path performed these
+               * operations expert by expert (up to 768 pool barriers/layer). */
+              ds4f_gemm_task *gateup = (ds4f_gemm_task *)alloca(
+                  (size_t)(2 * no) * sizeof(*gateup));
+              ds4f_pf_swiglu_task *sw = (ds4f_pf_swiglu_task *)alloca(
+                  (size_t)no * sizeof(*sw));
+              ds4f_gemm_task *down = (ds4f_gemm_task *)alloca(
+                  (size_t)no * sizeof(*down));
+              int ng = 0, ns = 0, nd = 0;
+              for (int s = 0; s < no; ++s) {
+                  int cnt = m->ex_cnt[s]; if (!cnt) continue;
+                  int off = ex_off[s];
+                  gateup[ng++] = (ds4f_gemm_task){ m,
+                      m->p_exG + (size_t)off*c->moe_inter, &ly->ex_w1[s],
+                      m->p_exX + (size_t)off*C, cnt, c->moe_inter, C,
+                      NULL, NULL, NULL, NULL };
+                  gateup[ng++] = (ds4f_gemm_task){ m,
+                      m->p_exU + (size_t)off*c->moe_inter, &ly->ex_w3[s],
+                      m->p_exX + (size_t)off*C, cnt, c->moe_inter, C,
+                      NULL, NULL, NULL, NULL };
+                  sw[ns++] = (ds4f_pf_swiglu_task){ m,
+                      m->p_exG + (size_t)off*c->moe_inter,
+                      m->p_exU + (size_t)off*c->moe_inter,
+                      c->moe_inter, cnt, c->moe_inter, c->moe_inter,
+                      c->swiglu_limit };
+                  down[nd++] = (ds4f_gemm_task){ m,
+                      m->p_exO + (size_t)off*C, &ly->ex_w2[s],
+                      m->p_exG + (size_t)off*c->moe_inter, cnt, C,
+                      c->moe_inter, NULL, NULL, NULL, NULL };
+              }
+              ds4f_gemm_multi(m, gateup, ng);
+              { ds4f_pf_swiglu_multi_task t = { sw, ns };
+                ds4f_pool_run(m->pool, ds4f_pf_swiglu_multi_worker, &t); }
+              ds4f_gemm_multi(m, down, nd);
+              for (int s = 0; s < no; ++s) {
+                  int cnt = m->ex_cnt[s], off = ex_off[s];
+                  for (int p = 0; p < cnt; ++p) {
+                      int k = m->ex_tok[(size_t)s*m->m_tile+p];
+                      float w = m->ex_wt[(size_t)s*m->m_tile+p];
+                      float *route = m->p_route + (size_t)k*C;
+                      const float *o = m->p_exO + (size_t)(off+p)*C;
+                      for (int i = 0; i < C; ++i) route[i] += w * o[i];
+                  }
+              }
           } }
         if (tps) for (int k = 0; k < K; k++) {
             float *mo = m->p_moe + (size_t)k*C, *ro = m->p_route + (size_t)k*C;
@@ -7263,6 +7397,7 @@ static int ds4f_mtp_predict(ds4f_model *m, const float *hc_state, const float *x
     ds4f_q_norm_rope_par(m, m->s_q, pos, rcos, rsin);
     ds4f_matvec(m, m->s_kvlat, &mt->wkv, m->s_hn);
     ds4f_rmsnorm(m->s_kvlat, m->s_kvlat, mt->kv_norm, KV, eps);
+    ds4f_fp8_kv_quant_inplace(m->s_kvlat, KV, c->qk_rope_dim);
     ds4f_rope_apply(m->s_kvlat + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
     { uint16_t *dst = mt->kv_cache + (size_t)(pos % mt->kv_slots)*KV;
       for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(m->s_kvlat[d]); }
@@ -7394,6 +7529,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         ds4f_chk("q", L, m->s_q, H);
         if (!ds4f_mv_fuse_on()) { DS4F_TIC(); ds4f_matvec(m, m->s_kvlat, &ly->wkv, m->s_hn); DS4F_TOC(DS4F_P_QKV_KV); }  /* [kv_lora]; fused with wq_a above when MV_FUSE */
         ds4f_rmsnorm(m->s_kvlat, m->s_kvlat, ly->kv_norm, KV, eps);
+        ds4f_fp8_kv_quant_inplace(m->s_kvlat, KV, c->qk_rope_dim);
         if (m->exact)                                            /* RoPE the kv rope dims */
             ds4f_rope_apply(m->s_kvlat + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
         ds4f_chk("kvlat", L, m->s_kvlat, KV);
@@ -7545,7 +7681,7 @@ decode_oproj_done:;
         DS4F_TOC(DS4F_P_ROUTER); }
         int idx[8]; float wt[8];
         if (m->exact)
-            ds4f_topk_exact(m->s_router, ly->gate_bias, c->n_experts, c->n_active, idx, wt, c->routed_scale);
+            ds4f_select_experts(m, ly, m->s_router, 0, idx, wt);
         else
             ds4f_topk(m->s_router, c->n_experts, c->n_active, idx, wt, c->routed_scale);
         ds4f_route_observe(m, L, idx, c->n_active);
