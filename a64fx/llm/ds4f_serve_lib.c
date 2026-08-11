@@ -323,6 +323,14 @@ void ds4f_serve_close(ds4f_serve *s) {
                         s->m->prof[i], acc > 0 ? 100.0 * s->m->prof[i] / acc : 0.0);
         }
         fprintf(stderr, "  %-9s %8.3f s (profiled)\n", "TOTAL", acc);
+        fprintf(stderr, "  attn_gemm hit=%ld miss=%ld (fast 8-head-blocked path usage)\n",
+                ds4f_attn_gemm_hit, ds4f_attn_gemm_miss);
+        if (ds4f_attn_gemm_hit) fprintf(stderr,
+            "  attn_gemm avg_nP=%.1f avg_nsel=%.1f nh=%ld hd=%ld window=%ld topk=%ld\n",
+            (double)ds4f_attn_total_np / ds4f_attn_gemm_hit,
+            (double)ds4f_attn_total_nsel / ds4f_attn_gemm_hit,
+            ds4f_attn_nh_hd_ws_topk[0], ds4f_attn_nh_hd_ws_topk[1],
+            ds4f_attn_nh_hd_ws_topk[2], ds4f_attn_nh_hd_ws_topk[3]);
     }
     if (s->m) ds4f_route_report(s->m, stderr);
 #if defined(DS4F_SERVE_HIP)

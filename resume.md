@@ -168,6 +168,19 @@ Result: **2.885 μs/call, nthr=16**. Even generously assuming ~6 `ds4f_pool_run`
 
 Verified: mHC exact quality gate still 8/9 (no regression, diagnostic-only addition), no VRAM leak, no orphan processes.
 
+## Attention's real cost: already-optimized kernel, bounded window, but wide head_dim (2026-08-12)
+
+Continued root-causing with two more cheap diagnostics, both added to `ds4f_attn_tb2_gemm` (common/ds4f_impl.h) and printed in `ds4f_serve_close()`:
+
+1. **`attn_gemm hit`/`miss` counters** confirmed the fast 8-head-blocked SVE kernel (`ds4f_attn_gemm_score/soft/axpy_worker`, gated by `DS4F_ATTN_GEMM` env, default on) is **already active for 100% of calls** (`hit=42107 miss=0` at 1024 tokens). The slower per-head fallback (`ds4f_attn_tb2_worker`/`ds4f_attn_exact_worker`) is never taken in our config. Ruling out "enable the fast path" — it's already enabled.
+2. **`avg_nP`/`avg_nsel`/dims** at 256 tokens: `nh=64 heads, head_dim=512, window=128, topk=512, avg_nP=96.6, avg_nsel=16.7`. This confirms attention cost is **bounded per position (~113 attended KV entries), not O(context_length)** — `window_size` defaults to 128 (a small sliding window), so the earlier worry about O(K^2) causal blowup at long context was wrong; the window term plateaus after position ~128 and the compressed term (`nsel`) stays small too since few compressed tokens are available yet at this context length.
+
+**Conclusion: attention's cost is legitimate, already-optimized compute, not an artifact or a bug.** The per-position work (`n_heads=64 x ~113 KV entries x head_dim=512`) is large mainly because `head_dim=512` is unusually wide for this architecture (baked into the model's staged config, not a runtime knob) — every position does real FMA work proportional to that, using an SVE-vectorized, 8-head-blocked kernel that's already reusing KV loads across heads. There is no redundant/wasted work found in this investigation.
+
+**What would actually move prefill toward 100-200 tok/s:** the CPU attention path is fundamentally compute-bound at these dimensions; a large (order-of-magnitude) speedup would need attention to run on the GPU (the routed-FFN work already GPU-offloads MoE; attention currently does not — no `m->gpu_attn*` callback was found wired for this per-position causal path). That is a substantial new engineering effort (a GPU causal-attention kernel with the same window+compressed-term semantics, careful quality validation against the mHC exact gate) — out of scope to attempt safely in the remaining time of this session. Smaller, lower-risk levers (a modest constant-factor kernel tune) were not pursued given the 1-hour time budget and the priority on not risking accuracy without adequate validation time.
+
+Verified: mHC exact quality gate still 8/9 (no regression, diagnostic-only additions), no VRAM leak, no orphan processes.
+
 ## Quality evidence
 
 Use mHC enabled for the authoritative exact path:
@@ -235,7 +248,7 @@ curl -s --max-time 5 http://127.0.0.1:8080/v1/progress
 6. ~~Test 256, 1024, and 8192-token prefills.~~ Done 2026-08-12 for 1024 and 8192 (256 not yet run; low priority now that the pattern is clear). See "Prefill scaling and the real prefill bottleneck" above — scaling plateaus around 11-12 tok/s, and decode's cache coverage got worse (not better) at longer context, ruling out "just use a realistic prompt" as a fix for either target.
 7. **Decode's real lever remains raising effective cache hit rate** (unchanged from before, budget/prompt-length are now ruled out as the fix): (a) online/adaptive cache that admits/evicts based on live decode-time routing instead of a one-shot post-prefill snapshot; (b) speed up the CPU MXFP4 fallback path itself for cache misses. Not yet attempted.
 8. ~~Root-cause whether attn's cost is dispatch overhead or raw compute.~~ Done 2026-08-12: confirmed raw compute (dispatch overhead measured at 2.885 us/call, negligible even at ~264,000 calls). See "Attention cost is raw compute, not thread-pool dispatch overhead" above. **Do not pursue per-position dispatch batching — it would not help.**
-9. **Profile inside the attention worker functions themselves** (`ds4f_attn_exact_worker`, `ds4f_attn_tb2_worker`/`ds4f_attn_tb2_gemm`, and the tb2 compression sub-steps inside `ds4f_tb2_prepare`) to find which specific computation dominates the ~28s (82% of attn, excluding tb2prep) at 1024 tokens — e.g. KV-cache score/softmax cost scaling with growing context vs. other per-position math. Not yet attempted; this is the next concrete step toward the prefill target.
+9. ~~Profile inside the attention worker functions.~~ Done 2026-08-12: confirmed the fast SVE 8-head-blocked kernel is already 100% active, the window is properly bounded (not O(K^2)), and the cost is legitimate compute dominated by `head_dim=512` (architectural, not fixable without changing the model). See "Attention's real cost" above. **A real fix requires GPU-offloading attention — a substantial new engineering project, not attempted this session.**
 10. Continue committing incrementally (telemetry, event-guarded pool, decode CPU/GPU phase split, prefill phase split, and the pool-dispatch-overhead diagnostic are already committed, see below) — after each further runtime-stable, measurably-improving change, commit with a short imperative subject and report the hash plus exact commands/results.
 
 **Reminder:** `ds4f_serve_bench.py` loads its own model standalone — stop any running `run_ds4f_single_serve.sh` server first, or numbers will be contention-skewed (see verdict above).

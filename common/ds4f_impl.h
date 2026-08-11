@@ -5173,12 +5173,18 @@ static void ds4f_attn_gemm_axpy_worker(void *arg,int tid,int nthr) {
             ds4f_axpy8_f32(out,HD,ly->cmp_kv+(size_t)sel[j]*KV+d0,w,64);}
         if(d0==nope)for(int h=0;h<8;h++)ds4f_rope_apply(out+(size_t)h*HD,T->rcos,T->rsin,T->pos,T->half,1);}
 }
+static long ds4f_attn_gemm_hit = 0, ds4f_attn_gemm_miss = 0;
+static long ds4f_attn_total_np = 0, ds4f_attn_total_nsel = 0, ds4f_attn_nh_hd_ws_topk[4] = {0,0,0,0};
 static int ds4f_attn_tb2_gemm(ds4f_model *m,ds4f_attn_ex_task *at) {
     if(ds4f_attn_gemm<0){const char *e=getenv("DS4F_ATTN_GEMM");ds4f_attn_gemm=e?atoi(e):1;}
     ds4f_config *c=&m->cfg;ds4f_layer *ly=at->ly;int HD=c->q_head_dim,nope=HD-c->qk_rope_dim,nh=m->attn_h1-m->attn_h0;
-    if(!ds4f_attn_gemm||!ds4f_attn_sve||m->int8_kv||m->int8_cmp||m->int4_cmp||m->cp_gather||ly->kv_frozen||ly->cmp_frozen)return 0;
-    if(nh%8||c->qk_rope_dim!=64||HD%64||nope%64)return 0;
+    if(!ds4f_attn_gemm||!ds4f_attn_sve||m->int8_kv||m->int8_cmp||m->int4_cmp||m->cp_gather||ly->kv_frozen||ly->cmp_frozen){ds4f_attn_gemm_miss++;return 0;}
+    if(nh%8||c->qk_rope_dim!=64||HD%64||nope%64){ds4f_attn_gemm_miss++;return 0;}
+    ds4f_attn_gemm_hit++;
     int p=at->pos,lo=p-at->win+1;if(lo<0)lo=0;int nP=p-lo+1,nsel=m->s_tb2_nsel,stride=c->window_size+c->index_topk;
+    ds4f_attn_total_np += nP; ds4f_attn_total_nsel += nsel;
+    ds4f_attn_nh_hd_ws_topk[0]=nh; ds4f_attn_nh_hd_ws_topk[1]=HD;
+    ds4f_attn_nh_hd_ws_topk[2]=c->window_size; ds4f_attn_nh_hd_ws_topk[3]=c->index_topk;
     if(!m->s_attn_sc)m->s_attn_sc=(float *)ds4f_mem_alloc(m->mem,((size_t)c->n_heads*stride*4+255)&~(size_t)255,256,1);
     ds4f_attn_gemm_task T={m,ly,p,nP,lo,nsel,nP+nsel,stride,at->scale,(float)(c->qk_rope_dim/2),at->rcos,at->rsin};
     ds4f_pool_run(m->pool,ds4f_attn_gemm_score_worker,&T);ds4f_pool_run(m->pool,ds4f_attn_gemm_soft_worker,&T);ds4f_pool_run(m->pool,ds4f_attn_gemm_axpy_worker,&T);return 1;
