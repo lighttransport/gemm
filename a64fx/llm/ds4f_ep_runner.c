@@ -19,11 +19,11 @@
  * Run (after tofu_topo_helper writes tofu_topo.txt, 1 proc/node):
  *   mpiexec -n 12 -vcoordfile vcoord build/ds4f_ep_runner
  *
- * CLI (the launcher passes these explicitly; legacy environment fallbacks remain):
+ * CLI (the launcher passes these explicitly):
  *   --threads N, --prefill N, --decode N, --max-pos N, --layers N,
  *   --ctx-warm N, --prefill-batch N, --prefill-verify N,
  *   --comm-poll-spins N, --comm-robust 0|1
- * Environment (model/debug/compatibility settings):
+ * Environment (model/debug/compatibility settings only):
  *   DS4F_FP8_BF16  predequant dense FP8->BF16 (default 0 = on-demand FP8)
  *   DS4F_REQUIRE_NODES  fail fast unless topology has this many ranks
  *   DS4F_STATUS_DIR     durable per-rank state files (default current dir)
@@ -115,7 +115,7 @@ static void usage(const char *prog) {
         "  --comm-poll-spins N     bounded TCQ polling (default 1)\n"
         "  --comm-robust 0|1       retrying barriers (default 1)\n"
         "  --help                  show this text\n"
-        "Environment settings remain accepted for legacy launchers; CLI values win.\n", prog);
+        "Execution controls are intentionally CLI-only; environment is reserved for model/debug settings.\n", prog);
 }
 
 static void parse_cli(int argc, char **argv, runner_opts *o) {
@@ -353,12 +353,7 @@ static int ds4f_comm_init(ds4f_comm *dc, utofu_vcq_hdl_t vcq,
 
 int main(int argc, char **argv) {
     int rc;
-    runner_opts opt = {
-        envi("LLM_THREADS", 48), envi("DS4F_CMGS", 4), envi("DS4F_PREFILL", 8),
-        envi("DS4F_MAXGEN", 16), envi("DS4F_MAXPOS", 4096), envi("DS4F_LAYERS", 0),
-        envi("DS4F_CTX_WARM", 0), envi("DS4F_PREFILL_BATCH", 0), envi("DS4F_PREFILL_VERIFY", 0),
-        envi("DS4F_COMM_POLL_SPINS", 1), envi("DS4F_COMM_ROBUST", 1)
-    };
+    runner_opts opt = { 48, 4, 8, 16, 4096, 0, 0, 0, 0, 1, 1 };
     parse_cli(argc, argv, &opt);
     int n_threads = opt.threads, n_cmgs = opt.cmgs, prefill = opt.prefill, maxgen = opt.maxgen;
     int maxpos = opt.maxpos, layers = opt.layers, ctx_warm = opt.ctx_warm;
