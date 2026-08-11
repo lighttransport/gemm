@@ -529,7 +529,7 @@ typedef struct {
     float *v_idxq;          /* [m_tile*index_n_heads*index_head_dim] batched qproj output (lazy, verify prefill) */
     float *v_cmp_kv, *v_cmp_score; /* [m_tile*2*kv_lora] batched layer-compressor projections */
     int *s_idx_batch_sel;           /* optional tile-level CSA selections [K,index_topk] */
-    int s_idx_batch_K;
+    int s_idx_batch_K, s_idx_batch_pos0;
     /* batched (M>1) prefill scratch (only allocated by ds4f_alloc_prefill_batch;
      * NULL unless DS4F_PREFILL_BATCH is wired). Token-major [m_tile, width].
      * p_x is the carried hidden state for all M tokens. */
