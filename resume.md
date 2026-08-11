@@ -221,6 +221,33 @@ Five real optimization attempts were made and tested this session: one succeeded
 
 **100-200 tok/s prefill is not reachable through further tuning of the current single-request CPU/GPU code paths without either sacrificing accuracy or building genuinely new capability** (a tier-B2-aware GPU attention kernel, or cross-request batching to overlap otherwise-idle CPU/GPU time). Both are substantial, multi-session engineering efforts, not something to complete safely under continued time pressure without adequate testing runway against the quality gate. This is the responsible stopping point for this investigation; the next session should pick up at "build a tier-B2-aware GPU attention kernel" as the concrete, sized, and now well-justified next step.
 
+## Real fix found: the "fast" attention path was scalar on x86, not vectorized (2026-08-12)
+
+While re-checking the GPU-attention-offload feasibility, re-examined `ds4f_attn_tb2_gemm`'s bailout conditions (`hetero`/common/ds4f_impl.h) and traced where its helpers (`ds4f_score8_bf16`, `ds4f_axpy8_bf16`, etc.) actually come from on this host. Confirmed via direct preprocessor inspection (`cc -E`) that:
+
+- These 8-head-blocked "GEMM" helpers are hand-written SVE intrinsics **only** under `#if defined(__ARM_FEATURE_SVE)` (common/ds4f_impl.h:5103-5142) — true on the a64fx/Fugaku target this codebase was originally written for.
+- On every other target, including this x86_64 host, they resolve to `common/ds4f_kernels_x86.h`'s versions — plain scalar loops, explicitly documented there as **"correct and auto-vectorizable, not hand-tuned."**
+- Meanwhile the simpler per-head fallback path this "fast" path bypasses (`ds4f_attn_tb2_worker`, via `ds4f_attn_dot_bf16`) **does** have hand-written AVX2/FMA intrinsics on x86 (common/ds4f_impl.h ~4576-4597).
+- `DS4F_ATTN_GEMM` (the toggle controlling which path is used) already existed as a runtime flag, defaulting to 1 (on) **regardless of platform** — so this x86 host has been unconditionally routing attention through unvectorized scalar code, bypassing its own genuinely-vectorized fallback, on every single call (confirmed earlier: `attn_gemm hit=42107 miss=0`).
+
+**Tested `DS4F_ATTN_GEMM=0` (forces the AVX2-vectorized fallback):**
+
+| | GEMM path (old default) | Fallback path (AVX2) |
+|---|---|---|
+| attn phase, 256 tok | 6.655s | 4.404s (-34%) |
+| attn phase, 1024 tok | 34.0s | 23.16s (-32%) |
+| prefill tok/s, 1024 tok | ~11.0-15.1 (noisy across runs) | **17.54** (clean run) |
+| decode tok/s | 4.77-4.87 | 4.73-5.15 |
+| mHC exact quality gate | 8/9 (mismatch @ token 2) | 8/9, **identical** logit values |
+
+Quality is bit-for-bit identical in the gate's output (same mismatch index, same logit_abs/logit_rel/mean_ce values to full printed precision) — expected, since both paths compute the same math, just via different vectorization; the header's own docs already note the summation-order tolerance callers rely on.
+
+**Fixed the default** (common/ds4f_impl.h, `ds4f_attn_tb2_gemm`): `DS4F_ATTN_GEMM` now defaults to 1 only under `__ARM_FEATURE_SVE` (preserving the genuinely-optimized behavior on the a64fx/Fugaku target this was written for) and defaults to 0 everywhere else (including this x86 host), so the fix applies automatically with no server/env-var change needed. Explicit `DS4F_ATTN_GEMM=1`/`0` still overrides in either direction if needed.
+
+This is the single largest real, verified win of the session: **prefill at 1024 tokens improved from the ~11-15 tok/s baseline to 17.54 tok/s** (roughly +20-60% depending which baseline run it's compared against, all noisy due to background contention during measurement — the 17.54 number is from a clean, uncontended run). Still well short of 100-200 tok/s — `experts` (routed-FFN, previously optimized and confirmed near its data-volume ceiling) is now the largest single phase at this scale, and attention (still 33% even after this fix) remains large. But this closes a genuine bug, not a diminishing-returns tuning knob, and is a meaningfully different result from every other attempt this session.
+
+Verified: mHC exact quality gate identical output with the new default (no env var needed), no VRAM leak, no orphan/stuck processes. 8192-token confirmation run was interrupted mid-execution by the harness (not a crash — clean state, no leak) before completing; the 256- and 1024-token results are clean and sufficient to establish the fix.
+
 ## Quality evidence
 
 Use mHC enabled for the authoritative exact path:

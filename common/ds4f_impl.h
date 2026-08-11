@@ -5176,7 +5176,23 @@ static void ds4f_attn_gemm_axpy_worker(void *arg,int tid,int nthr) {
 static long ds4f_attn_gemm_hit = 0, ds4f_attn_gemm_miss = 0;
 static long ds4f_attn_total_np = 0, ds4f_attn_total_nsel = 0, ds4f_attn_nh_hd_ws_topk[4] = {0,0,0,0};
 static int ds4f_attn_tb2_gemm(ds4f_model *m,ds4f_attn_ex_task *at) {
-    if(ds4f_attn_gemm<0){const char *e=getenv("DS4F_ATTN_GEMM");ds4f_attn_gemm=e?atoi(e):1;}
+    /* score8_bf16/axpy8_bf16 etc. (below) are hand-tuned SVE intrinsics on
+     * __ARM_FEATURE_SVE targets, but on every other target (see
+     * ds4f_kernels_x86.h) they are plain "correct and auto-vectorizable"
+     * scalar loops -- the simpler per-head fallback path this function
+     * bypasses uses ds4f_attn_dot_bf16, which DOES have hand-written AVX2/FMA
+     * intrinsics on x86. Measured on an x86_64 host: forcing the fallback
+     * (this path off) cut the attention phase ~32-34% and raised prefill
+     * throughput from ~11-15 to ~17.5 tok/s at 1024 tokens, with an
+     * identical mHC exact quality-gate result. Default this path OFF on
+     * non-SVE targets; leave the real SVE kernel's default untouched. */
+    if(ds4f_attn_gemm<0){const char *e=getenv("DS4F_ATTN_GEMM");
+#if defined(__ARM_FEATURE_SVE)
+        ds4f_attn_gemm=e?atoi(e):1;
+#else
+        ds4f_attn_gemm=e?atoi(e):0;
+#endif
+    }
     ds4f_config *c=&m->cfg;ds4f_layer *ly=at->ly;int HD=c->q_head_dim,nope=HD-c->qk_rope_dim,nh=m->attn_h1-m->attn_h0;
     if(!ds4f_attn_gemm||!ds4f_attn_sve||m->int8_kv||m->int8_cmp||m->int4_cmp||m->cp_gather||ly->kv_frozen||ly->cmp_frozen){ds4f_attn_gemm_miss++;return 0;}
     if(nh%8||c->qk_rope_dim!=64||HD%64||nope%64){ds4f_attn_gemm_miss++;return 0;}
