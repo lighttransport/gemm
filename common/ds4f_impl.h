@@ -3937,6 +3937,48 @@ static int ds4f_attn_tb2_gemm(ds4f_model *m,ds4f_attn_ex_task *at) {
     ds4f_pool_run(m->pool,ds4f_attn_gemm_score_worker,&T);ds4f_pool_run(m->pool,ds4f_attn_gemm_soft_worker,&T);ds4f_pool_run(m->pool,ds4f_attn_gemm_axpy_worker,&T);return 1;
 }
 
+/* Tile-wide Tier-B2 attention.  Compressor state and CSA selections are
+ * already available for the complete causal tile, so distribute (token,
+ * 8-head block) units in one pool dispatch instead of three dispatches per
+ * token.  Each unit retains the score and value order of the per-token path. */
+typedef struct { ds4f_model *m; ds4f_layer *ly; int K,pos0,ratio;
+                 const int *sel; const float *rcos,*rsin; } ds4f_tb2tile_task;
+static void ds4f_attn_tb2_tile_worker(void *arg,int tid,int nthr) {
+    ds4f_tb2tile_task *T=(ds4f_tb2tile_task *)arg; ds4f_model *m=T->m; ds4f_layer *ly=T->ly;
+    ds4f_config *c=&m->cfg; int HD=c->q_head_dim,KV=c->kv_lora,nh=m->attn_h1-m->attn_h0;
+    int nhb=nh/8,QH=nh*HD,AH=QH,stride=c->window_size+c->index_topk;
+    long work=(long)T->K*nhb,per=work/nthr,ex=work%nthr,u0=per*tid+(tid<ex?tid:ex),u1=u0+per+(tid<ex?1:0);
+    float *sc=(float *)alloca((size_t)8*stride*sizeof(float)); float w[8];
+    for(long u=u0;u<u1;u++) {
+        int z=(int)(u/nhb),hb=(int)(u%nhb),pos=T->pos0+z,hg=m->attn_h0+hb*8;
+        int lo=pos-c->window_size+1;if(lo<0)lo=0;int nP=pos-lo+1,nsel=0;
+        const int *sr=NULL;
+        if(T->ratio==4) { sr=T->sel+(size_t)z*c->index_topk;
+            while(nsel<c->index_topk&&sr[nsel]>=0)nsel++; }
+        else nsel=(pos+1)/T->ratio;
+        const float *q=m->p_q+(size_t)z*QH+(size_t)hg*HD;
+        for(int j=0;j<nP;j++) { float s[8];
+            ds4f_score8_bf16(s,q,HD,ly->kv_cache+(size_t)((lo+j)%ly->kv_slots)*KV,KV);
+            for(int h=0;h<8;h++)sc[(size_t)h*stride+j]=s[h]/sqrtf((float)HD); }
+        for(int j=0;j<nsel;j++) { int ix=T->ratio==4?sr[j]-c->window_size:j; float s[8];
+            ds4f_score8_f32(s,q,HD,ly->cmp_kv+(size_t)ix*KV,KV);
+            for(int h=0;h<8;h++)sc[(size_t)h*stride+nP+j]=s[h]/sqrtf((float)HD); }
+        for(int h=0;h<8;h++) { float *s=sc+(size_t)h*stride,mx=-1e30f;
+            for(int j=0;j<nP+nsel;j++)if(s[j]>mx)mx=s[j];
+            float den=expf(ly->attn_sink[hg+h]-mx);
+            for(int j=0;j<nP+nsel;j++){s[j]=expf(s[j]-mx);den+=s[j];}
+            float iv=1.f/den;for(int j=0;j<nP+nsel;j++)s[j]*=iv; }
+        float *out=m->p_attn+(size_t)z*AH+(size_t)hb*8*HD;
+        for(int h=0;h<8;h++)for(int d=0;d<HD;d++)out[(size_t)h*HD+d]=0.f;
+        for(int j=0;j<nP;j++){for(int h=0;h<8;h++)w[h]=sc[(size_t)h*stride+j];
+            ds4f_axpy8_bf16(out,HD,ly->kv_cache+(size_t)((lo+j)%ly->kv_slots)*KV,w,HD);}
+        for(int j=0;j<nsel;j++){int ix=T->ratio==4?sr[j]-c->window_size:j;
+            for(int h=0;h<8;h++)w[h]=sc[(size_t)h*stride+nP+j];
+            ds4f_axpy8_f32(out,HD,ly->cmp_kv+(size_t)ix*KV,w,HD);}
+        for(int h=0;h<8;h++)ds4f_rope_apply(out+(size_t)h*HD+(HD-c->qk_rope_dim),T->rcos,T->rsin,pos,c->qk_rope_dim/2,1);
+    }
+}
+
 /* Step the per-layer compressor (and, on CSA layers, the indexer) for the current
  * token at absolute position `pos`, then fill m->s_tb2_sel/s_tb2_nsel with the LOCAL
  * compressed indices this query attends. Token-at-a-time: pos==0 seeds the ring state
@@ -5508,9 +5550,19 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_pf_kv_task kt = { m, ly, pos0, K, rcos, rsin };
             ds4f_pool_run(m->pool, ds4f_pf_kvpost_worker, &kt);
         }
+        static int s_tb2_tile=-1;if(s_tb2_tile<0){const char *e=getenv("DS4F_TB2_ATTN_TILE");s_tb2_tile=e?atoi(e):1;}
+        int tile_tb2_attn=s_tb2_tile && !snaps && cmpstate_batch && batch_kv &&
+            (m->attn_h1-m->attn_h0)%8==0 && (!m->int8_kv&&!m->int8_cmp&&!m->int4_cmp) &&
+            (ratio!=4 || m->s_idx_batch_sel);
+        if(tile_tb2_attn) {
+            tv=ds4f_prof_on?ds4f_now():0.0;
+            ds4f_tb2tile_task at={m,ly,K,pos0,ratio,m->s_idx_batch_sel,rcos,rsin};
+            ds4f_pool_run(m->pool,ds4f_attn_tb2_tile_worker,&at);
+            if(ds4f_prof_on)m->prof[DS4F_P_ATTN]+=ds4f_now()-tv;
+        }
         /* TierB2 and wrapped dense layers remain ordered: append KV, update
          * compressor/index state, then attend for each position. */
-        if (!block_dense) for (int k = 0; k < K; k++) {
+        if (!block_dense && !tile_tb2_attn) for (int k = 0; k < K; k++) {
             int pos = pos0 + k;
             float *kvl = m->p_kvlat + (size_t)k*KV;
             if (!batch_kv) {
