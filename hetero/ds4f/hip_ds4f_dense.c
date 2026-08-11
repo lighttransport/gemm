@@ -1450,6 +1450,98 @@ int hip_ds4f_dense_cache_hot_experts(void *opaque, void *model_opaque,
     return admitted;
 }
 
+int hip_ds4f_dense_refresh_hot_experts(void *opaque, void *model_opaque,
+                                       const uint64_t *window_hits,
+                                       int cache_mb, int reserve_mb, int stats) {
+    hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    ds4f_model *model = (ds4f_model *)model_opaque;
+    if (!ctx || !model || !window_hits || hipSetDevice(ctx->device_id) != hipSuccess) return 0;
+    const int L = model->cfg.n_layers, E = model->cfg.n_experts;
+    if (L <= 0 || E <= 0 || (size_t)L > SIZE_MAX / (size_t)E) return -1;
+    const size_t ncand = (size_t)L * (size_t)E;
+    hip_ds4f_hot_expert *cand = (hip_ds4f_hot_expert *)malloc(ncand * sizeof(*cand));
+    if (!cand) return -1;
+    size_t n = 0;
+    for (int l = 0; l < L; ++l) for (int e = 0; e < E; ++e) {
+        uint64_t hits = window_hits[(size_t)l * E + e];
+        if (hits && e % model->ep_size == model->ep_rank)
+            cand[n++] = (hip_ds4f_hot_expert){ hits, l, e };
+    }
+    qsort(cand, n, sizeof(*cand), hot_expert_cmp);
+
+    size_t free_bytes = 0, total_bytes = 0;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) { free(cand); return -1; }
+    (void)total_bytes;
+    const size_t reserve = (size_t)(reserve_mb > 0 ? reserve_mb : 1536) * 1048576u;
+    /* Currently-resident bundles already count as VRAM in use; add their
+     * bytes back to get the total budget we could occupy if we kept
+     * everything, so eviction below isn't starved by its own residents. */
+    size_t resident_bytes = 0;
+    for (int l = 0; l < L; ++l) for (int e = 0; e < E; ++e) {
+        if (e % model->ep_size != model->ep_rank) continue;
+        int slot = e / model->ep_size;
+        ds4f_layer *layer = &model->layers[l];
+        ds4f_tensor *t[3] = { &layer->ex_w1[slot], &layer->ex_w3[slot], &layer->ex_w2[slot] };
+        if (t[0]->gpu_id >= 0 && t[1]->gpu_id >= 0 && t[2]->gpu_id >= 0)
+            resident_bytes += expert_bundle_bytes(layer, slot);
+    }
+    size_t avail = free_bytes + resident_bytes;
+    size_t budget = avail > reserve ? avail - reserve : 0;
+    if (cache_mb > 0 && (size_t)cache_mb * 1048576u < budget)
+        budget = (size_t)cache_mb * 1048576u;
+
+    /* New "keep" set: top candidates by recent window hits that fit budget. */
+    char *keep = (char *)calloc(ncand, 1);
+    if (!keep) { free(cand); return -1; }
+    size_t used = 0;
+    for (size_t i = 0; i < n; ++i) {
+        int l = cand[i].layer, e = cand[i].expert;
+        int slot = e / model->ep_size;
+        size_t bytes = expert_bundle_bytes(&model->layers[l], slot);
+        if (!bytes || bytes > budget - used) continue;
+        keep[(size_t)l * E + e] = 1;
+        used += bytes;
+    }
+
+    /* Evict currently-resident experts that fell out of the keep set. */
+    int evicted = 0;
+    for (int l = 0; l < L; ++l) for (int e = 0; e < E; ++e) {
+        if (e % model->ep_size != model->ep_rank || keep[(size_t)l * E + e]) continue;
+        int slot = e / model->ep_size;
+        ds4f_layer *layer = &model->layers[l];
+        ds4f_tensor *t[3] = { &layer->ex_w1[slot], &layer->ex_w3[slot], &layer->ex_w2[slot] };
+        int any = 0;
+        for (int j = 0; j < 3; ++j)
+            if (t[j]->gpu_id >= 0) { release_matrix(ctx, t[j]->gpu_id); t[j]->gpu_id = -1; any = 1; }
+        if (any) evicted++;
+    }
+
+    /* Admit newly-hot experts from the keep set that aren't resident yet. */
+    int admitted = 0;
+    for (size_t i = 0; i < n; ++i) {
+        int l = cand[i].layer, e = cand[i].expert;
+        if (!keep[(size_t)l * E + e]) continue;
+        int slot = e / model->ep_size;
+        ds4f_layer *layer = &model->layers[l];
+        ds4f_tensor *t[3] = { &layer->ex_w1[slot], &layer->ex_w3[slot], &layer->ex_w2[slot] };
+        if (t[0]->gpu_id >= 0 && t[1]->gpu_id >= 0 && t[2]->gpu_id >= 0) continue;
+        if (hip_ds4f_dense_bind_mxfp4_tensor(ctx, t[0]) < 0 ||
+            hip_ds4f_dense_bind_mxfp4_tensor(ctx, t[1]) < 0 ||
+            hip_ds4f_dense_bind_mxfp4_tensor(ctx, t[2]) < 0) {
+            free(keep); free(cand); return -1;
+        }
+        admitted++;
+    }
+
+    if (stats || ctx->verbose)
+        fprintf(stderr,
+                "hip_ds4f_dense: adaptive expert cache refresh evicted=%d admitted=%d "
+                "bytes=%.3f GB reserve=%d MB\n",
+                evicted, admitted, (double)used / 1e9, reserve_mb > 0 ? reserve_mb : 1536);
+    free(keep); free(cand);
+    return admitted;
+}
+
 int hip_ds4f_dense_bind_fp8_ordered_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t) {
     if (!ctx || !t || t->type != DS4F_FP8) return -1;
     int id = hip_ds4f_dense_bind_tensor(ctx, t);

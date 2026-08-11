@@ -122,6 +122,17 @@ int hip_ds4f_dense_resident_mxfp4_layer(void *ctx, const ds4f_layer *layer, int 
  * upload path. Returns the number of complete expert bundles admitted. */
 int hip_ds4f_dense_cache_hot_experts(void *ctx, void *model,
                                      int cache_mb, int reserve_mb, int stats);
+/* Periodic adaptive refresh: re-rank experts by `window_hits` (a caller-owned
+ * [n_layers*n_experts] delta of route_hits accumulated since the last
+ * refresh, NOT the cumulative total), evict currently-resident experts that
+ * fall out of the new top set to free budget, then admit newly-hot ones.
+ * Must only be called when no GPU work for the current token is in flight
+ * (e.g. right after ds4f_serve_decode returns) -- eviction frees device
+ * memory immediately. Returns the number of experts admitted this call, or
+ * -1 on error. Caller is responsible for zeroing window_hits afterward. */
+int hip_ds4f_dense_refresh_hot_experts(void *ctx, void *model,
+                                       const uint64_t *window_hits,
+                                       int cache_mb, int reserve_mb, int stats);
 /* Choose the largest prefix that leaves room for the two streamed slots and
  * a caller-selected safety margin. Returns zero when no resident layer fits. */
 int hip_ds4f_dense_recommend_mxfp4_resident_layers(

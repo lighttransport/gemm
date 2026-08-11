@@ -62,6 +62,17 @@ typedef struct ds4f_serve {
     float *slot_logits;
 #if defined(DS4F_SERVE_HIP)
     hip_ds4f_dense *hip;
+    /* Adaptive hot-expert cache: route_hits is cumulative, so a snapshot
+     * taken at the last refresh lets us derive a recent-window delta
+     * (current - snapshot) without touching the per-token routing hot path.
+     * Refresh only ever runs right after ds4f_serve_decode returns, when the
+     * token's GPU work is already complete -- eviction frees device memory
+     * immediately, so it must never race a kernel still reading it. */
+    uint64_t *ac_snapshot;   /* [n_layers*n_experts], NULL until first refresh */
+    uint64_t *ac_delta;      /* scratch, same size, reused every refresh */
+    int ac_decode_calls;     /* since last refresh */
+    int ac_period;           /* DS4F_ADAPTIVE_CACHE_PERIOD tokens; 0 = disabled */
+    int ac_cache_mb, ac_reserve_mb;
 #endif
 } ds4f_serve;
 
@@ -304,6 +315,12 @@ ds4f_serve *ds4f_serve_open(const char *stage_dir, int use_hip, int hip_device,
             return NULL;
         }
     }
+    /* Adaptive hot-expert cache refresh: off by default (0 tokens = disabled)
+     * until enabled via program args / DS4F_ADAPTIVE_CACHE_PERIOD, since it
+     * only helps once a static prompt-hot admission has already run. */
+    s->ac_period = env_i("DS4F_ADAPTIVE_CACHE_PERIOD", 0);
+    s->ac_cache_mb = env_i("DS4F_ADAPTIVE_CACHE_MB", -1);
+    s->ac_reserve_mb = env_i("DS4F_ADAPTIVE_CACHE_RESERVE_MB", 1536);
 #endif
     m->want_full_logits = 1;
     s->eos = 1;
@@ -340,6 +357,7 @@ void ds4f_serve_close(ds4f_serve *s) {
     if (s->m) ds4f_route_report(s->m, stderr);
 #if defined(DS4F_SERVE_HIP)
     if (s->hip) hip_ds4f_dense_destroy(s->hip);
+    free(s->ac_snapshot); free(s->ac_delta);
 #endif
     if (s->slot_hist) for (int i = 0; i < s->slot_cap; ++i) free(s->slot_hist[i]);
     free(s->slot_used); free(s->slot_pos); free(s->slot_n_hist);
@@ -423,6 +441,28 @@ int ds4f_serve_decode(ds4f_serve *s, int token, int pos) {
         s->logits_cap = (size_t)s->m->cfg.vocab;
     }
     memcpy(s->logits, s->m->s_logits, (size_t)s->vocab * sizeof(float));
+#if defined(DS4F_SERVE_HIP)
+    /* Periodic adaptive hot-expert cache refresh. Safe here: this token's
+     * forward pass (including any routed-FFN GPU work) has already
+     * returned, so eviction cannot race an in-flight kernel. route_hits is
+     * cumulative; ac_snapshot lets us derive a recent-window delta without
+     * touching the per-token routing hot path. */
+    if (s->hip && s->ac_period > 0 && s->m->route_hits) {
+        size_t ncand = (size_t)s->m->cfg.n_layers * (size_t)s->m->cfg.n_experts;
+        if (!s->ac_snapshot) {
+            s->ac_snapshot = (uint64_t *)calloc(ncand, sizeof(uint64_t));
+            s->ac_delta = (uint64_t *)malloc(ncand * sizeof(uint64_t));
+        }
+        if (s->ac_snapshot && s->ac_delta && ++s->ac_decode_calls >= s->ac_period) {
+            for (size_t i = 0; i < ncand; ++i)
+                s->ac_delta[i] = s->m->route_hits[i] - s->ac_snapshot[i];
+            hip_ds4f_dense_refresh_hot_experts(s->hip, s->m, s->ac_delta,
+                s->ac_cache_mb, s->ac_reserve_mb, env_i("DS4F_ADAPTIVE_CACHE_STATS", 0));
+            memcpy(s->ac_snapshot, s->m->route_hits, ncand * sizeof(uint64_t));
+            s->ac_decode_calls = 0;
+        }
+    }
+#endif
     return ar;
 }
 
