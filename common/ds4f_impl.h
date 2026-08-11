@@ -2040,6 +2040,25 @@ static void ds4f_fill(ds4f_model *m, ds4f_tensor t) {
     ds4f_pool_run(m->pool, ds4f_fill_worker, &ft);
 }
 
+typedef struct { const uint16_t *src; uint16_t *dst; int rows,K; } ds4f_bf16pv_pack_task;
+static void ds4f_bf16pv_pack_worker(void *arg,int tid,int nthr){
+    ds4f_bf16pv_pack_task *T=(ds4f_bf16pv_pack_task *)arg;
+    int ng=T->rows/8,per=ng/nthr,ex=ng%nthr;
+    int g0=per*tid+(tid<ex?tid:ex),g1=g0+per+(tid<ex?1:0);
+    for(int g=g0;g<g1;g++)for(int p=0;p<4;p++){
+        const uint16_t *a=T->src+(size_t)(g*8+2*p)*T->K,*b=a+T->K;
+        uint16_t *d=T->dst+(size_t)g*8*T->K+(size_t)p*2*T->K;
+        for(int k=0;k<T->K;k++){d[2*k]=a[k];d[2*k+1]=b[k];}
+    }
+}
+static uint16_t *ds4f_bf16pv_pack(ds4f_model *m,const uint16_t *src,int rows,int K){
+    if(rows%8)return NULL;
+    uint16_t *dst=(uint16_t *)aligned_alloc(256,(size_t)rows*K*2);
+    if(!dst)return NULL;
+    ds4f_bf16pv_pack_task T={src,dst,rows,K};ds4f_pool_run(m->pool,ds4f_bf16pv_pack_worker,&T);
+    return dst;
+}
+
 /* deterministic small fill for mHC base[nbase] / scale[nscale] (the tiny F32
  * bias/gate params). Same integer hash as ds4f_mhc_ref.py so the C model and the
  * pure-Python reference share weights. base ~ [-0.1,0.1]; scale ~ 0.5,0.6,0.7. */
@@ -3115,6 +3134,9 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
             int coff = (ratio == 4) ? 2 : 1, W = coff * cfg.kv_lora;
             ds4f_load_raw        (m, &B, ly->cmp_wkv,   DS4F_LN("attn.compressor.wkv.weight"),   DS4F_BF16, W, C);
             ds4f_load_raw        (m, &B, ly->cmp_wgate, DS4F_LN("attn.compressor.wgate.weight"), DS4F_BF16, W, C);
+            { static int cmp_pv=-1;if(cmp_pv<0){const char *e=getenv("DS4F_CMP_PV");cmp_pv=e?atoi(e):1;}
+              if(cmp_pv){ly->cmp_wkv_pv=ds4f_bf16pv_pack(m,ly->cmp_wkv,W,C);
+                         ly->cmp_wgate_pv=ds4f_bf16pv_pack(m,ly->cmp_wgate,W,C);} }
             ds4f_load_raw        (m, &B, ly->cmp_ape,   DS4F_LN("attn.compressor.ape"),  DS4F_F32, ratio, W);
             ds4f_load_raw        (m, &B, ly->cmp_norm,  DS4F_LN("attn.compressor.norm.weight"), DS4F_BF16, 1, cfg.kv_lora);
             if (ratio == 4) {                          /* CSA layer => indexer present */
@@ -5377,8 +5399,9 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         int cmpW_pf = ratio ? ((ratio == 4 ? 2 : 1) * KV) : 0;
         static int s_tb2_batch=-1; if(s_tb2_batch<0){const char *e=getenv("DS4F_TB2_BATCH");s_tb2_batch=e&&atoi(e);}
         if (s_tb2_batch && m->tierb2 && ratio) {
-            ds4f_tensor cwk = { ly->cmp_wkv, NULL, DS4F_BF16, cmpW_pf, C };
-            ds4f_tensor cwg = { ly->cmp_wgate, NULL, DS4F_BF16, cmpW_pf, C };
+            int pv=ly->cmp_wkv_pv&&ly->cmp_wgate_pv;
+            ds4f_tensor cwk = { pv?ly->cmp_wkv_pv:ly->cmp_wkv, NULL, pv?DS4F_BF16_PV:DS4F_BF16, cmpW_pf, C };
+            ds4f_tensor cwg = { pv?ly->cmp_wgate_pv:ly->cmp_wgate, NULL, pv?DS4F_BF16_PV:DS4F_BF16, cmpW_pf, C };
             ds4f_gemm(m,m->v_cmp_kv,&cwk,m->p_hn,K,cmpW_pf,C);
             ds4f_gemm(m,m->v_cmp_score,&cwg,m->p_hn,K,cmpW_pf,C);
         }
