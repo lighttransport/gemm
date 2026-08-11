@@ -5544,15 +5544,12 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                                      c->window_size, c->qk_rope_dim/2, rcos, rsin };
             ds4f_pool_run(m->pool, ds4f_attn_prefill_worker, &at);
         }
-        int batch_kv = (K <= ly->kv_slots);
-        if (!block_dense && batch_kv) {
-            /* KV rows are independent of compressor/index state.  Preprocess
-             * and publish the whole tile before the ordered TierB2 loop; each
-             * query still masks future positions, and K<=ring capacity keeps
-             * the writes one-to-one even when the ring wraps. */
-            ds4f_pf_kv_task kt = { m, ly, pos0, K, rcos, rsin };
-            ds4f_pool_run(m->pool, ds4f_pf_kvpost_worker, &kt);
-        }
+        /* Tier-B2 is stateful.  Publishing a full tile into the KV ring before
+         * its causal loop changes generation logits despite the causal mask.
+         * Keep KV publication and scratch ownership strictly per-token, as in
+         * forward_token.  This also keeps the tile attention fast path gated
+         * off until it has an explicit generation-parity check. */
+        int batch_kv = 0;
         static int s_tb2_tile=-1;if(s_tb2_tile<0){const char *e=getenv("DS4F_TB2_ATTN_TILE");s_tb2_tile=e?atoi(e):1;}
         int tile_tb2_attn=s_tb2_tile && !snaps && cmpstate_batch && batch_kv &&
             (m->attn_h1-m->attn_h0)%8==0 && (!m->int8_kv&&!m->int8_cmp&&!m->int4_cmp) &&
@@ -5568,17 +5565,14 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         if (!block_dense && !tile_tb2_attn) for (int k = 0; k < K; k++) {
             int pos = pos0 + k;
             float *kvl = m->p_kvlat + (size_t)k*KV;
-            if (!batch_kv) {
-                ds4f_rmsnorm(kvl, kvl, ly->kv_norm, KV, eps);
-                ds4f_rope_apply(kvl + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
-                uint16_t *dst = ly->kv_cache + (size_t)(pos % ly->kv_slots)*KV;
-                for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kvl[d]);
-            }
-            /* Compressor/indexer/attention consume these rows read-only.  Alias
-             * the batched projections to avoid a C+H float copy per token. */
-            float *saved_hn = m->s_hn, *saved_q = m->s_q;
-            m->s_hn = m->p_hn + (size_t)k*C;
-            m->s_q  = m->p_q  + (size_t)k*QH;
+            ds4f_rmsnorm(kvl, kvl, ly->kv_norm, KV, eps);
+            ds4f_rope_apply(kvl + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
+            uint16_t *dst = ly->kv_cache + (size_t)(pos % ly->kv_slots)*KV;
+            for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kvl[d]);
+            /* Compressor/indexer helpers use these buffers as scratch; direct
+             * aliases to the batched projection tile are not generation-safe. */
+            memcpy(m->s_hn, m->p_hn + (size_t)k*C, (size_t)C*4);
+            memcpy(m->s_q,  m->p_q  + (size_t)k*QH, (size_t)QH*4);
             m->s_idx_qpre = idxg_pf ? m->v_idxq + (size_t)k*idxHhd : NULL;
             tv = ds4f_prof_on ? ds4f_now() : 0.0;
             if (m->tierb2 && ratio) ds4f_tb2_prepare(m,ly,ratio,pos,rcos,rsin,
@@ -5601,8 +5595,6 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             memcpy(m->p_attn+(size_t)k*AH,
                    m->s_attn+(size_t)m->attn_h0*HD,
                    (size_t)AH*4);
-            m->s_hn = saved_hn;
-            m->s_q = saved_q;
         }
         if (snaps) snap_loff += ds4f_tb2_snap_layer_bytes(m, L);
         free(m->s_idx_batch_sel); m->s_idx_batch_sel=NULL; m->s_idx_batch_K=0; m->s_idx_batch_pos0=0;
