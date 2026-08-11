@@ -4922,12 +4922,12 @@ static void ds4f_pf_qnr_worker(void *arg, int tid, int nthr) {
     ds4f_pf_qnr_task *T = (ds4f_pf_qnr_task *)arg;
     ds4f_model *m = T->m; ds4f_config *c = &m->cfg;
     int HD = c->q_head_dim, rd = c->qk_rope_dim, half = rd/2, nope = HD - rd, nh = c->n_heads;
-    int H = nh*HD;
-    long total = (long)T->M * nh, per = total/nthr, extra = total%nthr;
+    int noh=m->attn_h1-m->attn_h0, qstride=noh*HD;
+    long total = (long)T->M * noh, per = total/nthr, extra = total%nthr;
     long u0 = per*tid + (tid<extra?tid:extra), u1 = u0 + per + (tid<extra?1:0);
     for (long u = u0; u < u1; u++) {
-        int mm = (int)(u / nh), h = (int)(u % nh);
-        float *qh = m->p_q + (size_t)mm*H + (size_t)h*HD;
+        int mm = (int)(u / noh), h = m->attn_h0+(int)(u % noh);
+        float *qh = m->p_q + (size_t)mm*qstride + (size_t)h*HD;
         double ss = 0.0; for (int d = 0; d < HD; d++) ss += (double)qh[d]*qh[d];
         float inv = 1.0f/sqrtf((float)(ss/HD) + c->norm_eps);
         for (int d = 0; d < HD; d++) qh[d] *= inv;
@@ -5345,7 +5345,8 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         ds4f_gemm(m, m->p_qlat, &ly->wq_a, m->p_hn, K, c->q_lora, C);
         { ds4f_pf_rms_task t = { m, m->p_qlat, m->p_qlat, ly->q_norm, c->q_lora, K, c->q_lora, c->q_lora };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
-        ds4f_gemm(m,m->p_q+(size_t)m->attn_h0*HD,&ly->wq_b,m->p_qlat,K,H,c->q_lora);
+        int QH=(m->attn_h1-m->attn_h0)*HD;
+        ds4f_gemm(m,m->p_q+(size_t)m->attn_h0*HD,&ly->wq_b,m->p_qlat,K,QH,c->q_lora);
         { ds4f_pf_qnr_task t = { m, pos0, K, rcos, rsin };
           ds4f_pool_run(m->pool, ds4f_pf_qnr_worker, &t); }
         ds4f_gemm(m, m->p_kvlat, &ly->wkv, m->p_hn, K, KV, C);
@@ -5428,7 +5429,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
              * the batched projections to avoid a C+H float copy per token. */
             float *saved_hn = m->s_hn, *saved_q = m->s_q;
             m->s_hn = m->p_hn + (size_t)k*C;
-            m->s_q  = m->p_q  + (size_t)k*H;
+            m->s_q  = m->p_q  + (size_t)k*QH;
             m->s_idx_qpre = idxg_pf ? m->v_idxq + (size_t)k*idxHhd : NULL;
             tv = ds4f_prof_on ? ds4f_now() : 0.0;
             if (m->tierb2 && ratio) ds4f_tb2_prepare(m,ly,ratio,pos,rcos,rsin,
