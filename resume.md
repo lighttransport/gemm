@@ -205,6 +205,22 @@ Kept digging rather than stop at "no easy fix found." Two more tests, one negati
 
 Verified: mHC exact quality gate still 8/9 (no regression; the upload-counter addition is diagnostic-only, no logic change), no VRAM leak, no orphan/stuck processes for any of the four attempts.
 
+## Checked one more real lever: partial GPU attention offload — negligible (2026-08-12)
+
+Found that `hip_ds4f_dense_prefill_attention` (hetero/ds4f/hip_ds4f_dense.c:1956) is an *existing*, already-implemented GPU attention kernel, wired to `m->gpu_prefill_attn` and used elsewhere (common/ds4f_impl.h:6642-6643, inside the older/simpler `ds4f_forward_prefill` function) — but **not** on the exact/tierb2 path (`ds4f_forward_verify`) that our serving actually uses. Read its signature and bailout conditions carefully before considering using it: it implements *only* the sliding-window term (`window > 128` rejected, matching our `window_size=128` exactly) — it has no parameters for the compressed-KV (`nsel`/`sel`/`cmp_kv`) term that tier-B2 layers need. Using it directly on a tier-B2 layer would silently drop the compressed-term contribution to attention output — a real accuracy regression, which the goal explicitly prohibits. It would only be safe, as-is, on layers with `compress_ratios[L] == 0` (pure dense/window attention, no compression).
+
+Added a one-time diagnostic (common/ds4f_impl.h, inside `ds4f_forward_verify`, `DS4F_PROF`-gated) counting how many layers actually qualify. Result: **`dense(ratio=0)=2 tierb2(ratio>0)=41` of 43 layers.** Only 4.6% of layers are compatible with the existing kernel as-is — worth roughly ~2% of total prefill time at best. Not a meaningful lever; did not implement the wiring (no code/runtime change beyond the count itself, since there's nothing worth safely shipping here).
+
+**This closes off what was otherwise the most promising-looking remaining idea.** A *real* GPU attention win requires extending `hip_ds4f_dense_prefill_attention` (or writing a new kernel) to also handle the compressed-KV term for the 41 tier-B2 layers — i.e., the "GPU-offload attention" project already identified as the actual path to 100-200 tok/s, now confirmed to need genuinely new kernel development (not just wiring an existing one), sized at a proportional scope to the routed-FFN GPU work already done in this codebase's history, not something to rush.
+
+Verified: mHC exact quality gate still 8/9 (no regression; diagnostic-only, no logic or numerics change), no VRAM leak, no orphan/stuck processes.
+
+## Session-end assessment (2026-08-12)
+
+Five real optimization attempts were made and tested this session: one succeeded (event-guarded pool, ~8-9% gain, committed); four were tried, measured, and correctly reverted or found negligible (host-register pinning, pinned staging buffers, 32-thread config, partial GPU-attention-offload feasibility). Every remaining hypothesis available without new kernel development or a serving-architecture change (batching/pipelining across independent requests) has now been checked with hard numbers, not guesses: PCIe link confirmed at full Gen5 x16, upload transfer size/rate measured directly (64.2GB/256-token-prefill, ~4.17GB/s, ~2.1MB/call — ruling out latency as the cause), attention's kernel confirmed already using the fast SVE 8-head-blocked path with a properly bounded (non-quadratic) window, and the one plausible cheap GPU-offload shortcut found to apply to only 2 of 43 layers.
+
+**100-200 tok/s prefill is not reachable through further tuning of the current single-request CPU/GPU code paths without either sacrificing accuracy or building genuinely new capability** (a tier-B2-aware GPU attention kernel, or cross-request batching to overlap otherwise-idle CPU/GPU time). Both are substantial, multi-session engineering efforts, not something to complete safely under continued time pressure without adequate testing runway against the quality gate. This is the responsible stopping point for this investigation; the next session should pick up at "build a tier-B2-aware GPU attention kernel" as the concrete, sized, and now well-justified next step.
+
 ## Quality evidence
 
 Use mHC enabled for the authoritative exact path:

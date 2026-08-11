@@ -7029,6 +7029,18 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
           fprintf(stderr, "  pool_dispatch %d calls %.3f us/call nthr=%d (raw barrier overhead, no work)\n",
                   N, dt * 1e6 / N, m->pool->nthr);
       } }
+    { static int _pf_ratio_done = 0;
+      if (!_pf_ratio_done && ds4f_prof_on) {
+          _pf_ratio_done = 1;
+          int dense0 = 0, sparse = 0;
+          for (int L = 0; L < c->n_layers; L++)
+              if (c->compress_ratios[L]) sparse++; else dense0++;
+          fprintf(stderr, "  layer_ratio dense(ratio=0)=%d tierb2(ratio>0)=%d of %d layers "
+                  "(dense layers are window-only causal attn -- an existing GPU kernel, "
+                  "hip_ds4f_dense_prefill_attention, already implements exactly this and is "
+                  "unused on this path; tierb2 layers additionally need the compressed-KV term "
+                  "the kernel does not implement)\n", dense0, sparse, c->n_layers);
+      } }
     if (K < 1 || K > m->m_tile) {
         fprintf(stderr, "ds4f_forward_verify: K=%d outside allocated tile [1,%d]\n",
                 K, m->m_tile);
