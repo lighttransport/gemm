@@ -201,6 +201,122 @@ int main(void) {
             }
         }
     }
+    if (rc == 0) {
+        /* ds4f_dense_prefill_attn_partial must agree with the existing,
+         * already-shipped ds4f_dense_prefill_attn once its unnormalized
+         * output is divided by the sum it reports -- same math, only the
+         * final normalize step is deferred so a caller can merge in another
+         * term first. Pure window case (no second term), so this isolates
+         * the new kernel/wrapper from the merge logic that will use it. */
+        const int aM = 1, aHeads = 8, aHD = 64, aKVD = 64, aWin = 16, aSlots = 32, aPos0 = 10;
+        float *aq = (float *)malloc((size_t)aM * aHeads * aHD * sizeof(float));
+        uint16_t *akv = (uint16_t *)malloc((size_t)aSlots * aKVD * sizeof(uint16_t));
+        float *asink = (float *)malloc((size_t)aHeads * sizeof(float));
+        float *ay_old = (float *)malloc((size_t)aM * aHeads * aHD * sizeof(float));
+        float *ay_new = (float *)malloc((size_t)aM * aHeads * aHD * sizeof(float));
+        float *ay_max = (float *)malloc((size_t)aM * aHeads * sizeof(float));
+        float *ay_sum = (float *)malloc((size_t)aM * aHeads * sizeof(float));
+        if (aq && akv && asink && ay_old && ay_new && ay_max && ay_sum) {
+            for (int i = 0; i < aM * aHeads * aHD; i++)
+                aq[i] = ((float)((i * 37 + 11) % 97) - 48.0f) / 19.0f;
+            for (int i = 0; i < aSlots * aKVD; i++)
+                akv[i] = ds4f_f32bf(((float)((i * 53 + 7) % 89) - 44.0f) / 21.0f);
+            for (int i = 0; i < aHeads; i++) asink[i] = ((float)((i * 13) % 7) - 3.0f) / 5.0f;
+            int rc_old = hip_ds4f_dense_prefill_attention(ctx, ay_old, aq, akv, asink,
+                NULL, NULL, 0, 0, aM, aPos0, aHeads, aHD, aKVD, aSlots, aWin, 0.125f);
+            int rc_new = hip_ds4f_dense_prefill_attention_partial(ctx, ay_new, ay_max, ay_sum,
+                aq, akv, asink, aM, aPos0, aHeads, aHD, aKVD, aSlots, aWin, 0.125f);
+            if (rc_old != 0 || rc_new != 0) {
+                printf("HIP attn partial-vs-full: rc_old=%d rc_new=%d FAIL (call failed)\n", rc_old, rc_new);
+                rc = -1;
+            } else {
+                float amax_abs = 0.0f, amax_rel = 0.0f;
+                for (int h = 0; h < aHeads; h++) {
+                    float inv = 1.0f / ay_sum[h];
+                    for (int d = 0; d < aHD; d++) {
+                        float got = ay_new[h * aHD + d] * inv;
+                        float ref = ay_old[h * aHD + d];
+                        float e = fabsf(got - ref);
+                        if (e > amax_abs) amax_abs = e;
+                        float r = e / fmaxf(1.0f, fabsf(ref));
+                        if (r > amax_rel) amax_rel = r;
+                    }
+                }
+                int apass = amax_abs <= 1.0e-5f && amax_rel <= 1.0e-5f;
+                printf("HIP attn partial-vs-full: max_abs=%.8g max_rel=%.8g %s\n",
+                       amax_abs, amax_rel, apass ? "PASS" : "FAIL");
+                if (!apass) rc = -1;
+
+                /* Same check at pos0 >= kv_slots, forcing ring-buffer
+                 * wraparound in the partial kernel's modular slot indexing --
+                 * exactly the scenario a naive linear base/end window (rather
+                 * than always copying the full ring for M==1) would silently
+                 * get wrong for any tier-B2 decode position past the first
+                 * window_size tokens. The unmodified reference function
+                 * doesn't support this case in its simple (non-resident_kv)
+                 * mode, so compare against a direct CPU computation instead. */
+                int aPos1 = aPos0 + aSlots + 3;
+                int rc_new2 = hip_ds4f_dense_prefill_attention_partial(ctx, ay_new, ay_max, ay_sum,
+                    aq, akv, asink, aM, aPos1, aHeads, aHD, aKVD, aSlots, aWin, 0.125f);
+                if (rc_new2 != 0) {
+                    printf("HIP attn partial-vs-full (wrap): rc_new=%d FAIL (call failed)\n", rc_new2);
+                    rc = -1;
+                } else {
+                    int wlo = aPos1 - aWin + 1; if (wlo < 0) wlo = 0;
+                    int wnp = aPos1 - wlo + 1;
+                    float *wref = (float *)malloc((size_t)aHeads * aHD * sizeof(float));
+                    float *wsc = (float *)malloc((size_t)wnp * sizeof(float));
+                    for (int h = 0; h < aHeads && wref && wsc; h++) {
+                        float mx = -1e30f;
+                        for (int j = 0; j < wnp; j++) {
+                            int slot = (wlo + j) % aSlots;
+                            float dot = 0.0f;
+                            for (int d = 0; d < aKVD; d++) {
+                                uint32_t bits = (uint32_t)akv[slot * aKVD + d] << 16;
+                                float kv_f; memcpy(&kv_f, &bits, sizeof(kv_f));
+                                dot += aq[h * aHD + d] * kv_f;
+                            }
+                            dot *= 0.125f; wsc[j] = dot; if (dot > mx) mx = dot;
+                        }
+                        float den = expf(asink[h] - mx);
+                        for (int j = 0; j < wnp; j++) { wsc[j] = expf(wsc[j] - mx); den += wsc[j]; }
+                        float inv = 1.0f / den;
+                        for (int d = 0; d < aHD; d++) {
+                            float out = 0.0f;
+                            if (d < aKVD) for (int j = 0; j < wnp; j++) {
+                                int slot = (wlo + j) % aSlots;
+                                uint32_t bits = (uint32_t)akv[slot * aKVD + d] << 16;
+                                float kv_f; memcpy(&kv_f, &bits, sizeof(kv_f));
+                                out += wsc[j] * inv * kv_f;
+                            }
+                            wref[h * aHD + d] = out;
+                        }
+                    }
+                    float wmax_abs = 0.0f, wmax_rel = 0.0f;
+                    for (int h = 0; wref && h < aHeads; h++) {
+                        float inv = 1.0f / ay_sum[h];
+                        for (int d = 0; d < aHD; d++) {
+                            float got = ay_new[h * aHD + d] * inv;
+                            float ref = wref[h * aHD + d];
+                            float e = fabsf(got - ref);
+                            if (e > wmax_abs) wmax_abs = e;
+                            float r = e / fmaxf(1.0f, fabsf(ref));
+                            if (r > wmax_rel) wmax_rel = r;
+                        }
+                    }
+                    int wpass = wref && wmax_abs <= 1.0e-5f && wmax_rel <= 1.0e-5f;
+                    printf("HIP attn partial-vs-full (wrap): pos0=%d max_abs=%.8g max_rel=%.8g %s\n",
+                           aPos1, wmax_abs, wmax_rel, wpass ? "PASS" : "FAIL");
+                    if (!wpass) rc = -1;
+                    free(wref); free(wsc);
+                }
+            }
+        } else {
+            printf("HIP attn partial-vs-full: allocation failed FAIL\n");
+            rc = -1;
+        }
+        free(aq); free(akv); free(asink); free(ay_old); free(ay_new); free(ay_max); free(ay_sum);
+    }
     hip_ds4f_dense_destroy(ctx);
     if (rc != 0) {
         ds4f_mem_pool_destroy(mem);

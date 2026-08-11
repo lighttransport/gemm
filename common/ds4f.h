@@ -478,6 +478,17 @@ typedef int (*ds4f_gpu_prefill_attn_fn)(
     const float *sink, const float *rcos, const float *rsin,
     int rope_offset, int rope_pairs, int M, int pos0, int n_heads,
     int head_dim, int kv_dim, int kv_slots, int window, float scale);
+/* Same window-attention math as ds4f_gpu_prefill_attn_fn, but returns the
+ * UNNORMALIZED weighted-sum (dst) plus the per-(token,head) softmax max
+ * (dst_max) and sum (dst_sum), so a caller can merge this GPU-computed
+ * window term with a CPU-computed sparse/compressed term (tier-B2's
+ * compressed-KV) via the standard online-softmax identity before
+ * normalizing and de-rotating. Mathematically exact, not an approximation. */
+typedef int (*ds4f_gpu_prefill_attn_partial_fn)(
+    void *ctx, float *dst, float *dst_max, float *dst_sum,
+    const float *q, const uint16_t *kv, const float *sink,
+    int M, int pos0, int n_heads, int head_dim, int kv_dim,
+    int kv_slots, int window, float scale);
 typedef int (*ds4f_gpu_prefill_attn_oproj_fn)(void *ctx, float *dst, const float *q, const uint16_t *kv,
     const float *sink, const float *rcos, const float *rsin, const ds4f_tensor *wa, const ds4f_tensor *wb,
     int M, int pos0, int n_heads, int head_dim, int kv_dim, int kv_slots, int window, float scale,
@@ -548,6 +559,7 @@ typedef struct {
     ds4f_gpu_dense_layer_prefetch_fn gpu_dense_layer_prefetch;
     ds4f_gpu_dense_layer_fn gpu_dense_layer_begin;
     ds4f_gpu_prefill_attn_fn gpu_prefill_attn;
+    ds4f_gpu_prefill_attn_partial_fn gpu_prefill_attn_partial;
     ds4f_gpu_prefill_attn_oproj_fn gpu_prefill_attn_oproj;
     ds4f_gpu_prefill_qkv_fn gpu_prefill_qkv;
     int gpu_prefill_qkv_enabled, gpu_qkv_device_chain, gpu_attn_device_chain;
@@ -673,6 +685,11 @@ typedef struct {
     float *s_exb_g, *s_exb_u, *s_exb_o;
     float *s_route;         /* routed-expert partial (owned-only); EP-summed via ar_cb */
     float *s_attn_sc;       /* DS4F_ATTN_GEMM: [n_heads*(window+index_topk)] scores->softmax weights (lazy) */
+    /* DS4F_ATTN_HYBRID_GPU scratch (lazy): GPU window-partial output/max/sum
+     * and CPU compressed-partial output/max/sum, each [n_heads*head_dim] or
+     * [n_heads], merged via the online-softmax identity into s_attn. */
+    float *s_attn_hy, *s_attn_hymax, *s_attn_hysum;
+    float *s_attn_hc, *s_attn_hcmax, *s_attn_hcsum;
     float *s_attn_m;             /* DS4F_CP_COMBINE: per-head local max (lazy, [n_heads]) */
     float *s_attn_comb;          /* DS4F_CP_COMBINE: packed [acc: n_heads*q_head_dim | l: n_heads] reduced in
                                   * ONE ar_cb (min collective count on this latency-bound fabric) (lazy) */

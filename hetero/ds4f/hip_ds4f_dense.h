@@ -133,6 +133,20 @@ int hip_ds4f_dense_cache_hot_experts(void *ctx, void *model,
 int hip_ds4f_dense_refresh_hot_experts(void *ctx, void *model,
                                        const uint64_t *window_hits,
                                        int cache_mb, int reserve_mb, int stats);
+/* Same window-attention math as hip_ds4f_dense_prefill_attention, but
+ * returns the UNNORMALIZED weighted-sum (dst) plus the per-(token,head)
+ * softmax max (dst_max) and sum (dst_sum) it used, instead of the final
+ * normalized attention output. Lets a caller merge this GPU-computed window
+ * term with a CPU-computed sparse/compressed term via the standard
+ * online-softmax identity (exact, not an approximation). Returns 0 on
+ * success, -1 if the optional partial-attention kernel isn't loaded or on
+ * any other failure. dst/dst_max/dst_sum are caller-owned, sized
+ * [M*n_heads*head_dim] and [M*n_heads] respectively. */
+int hip_ds4f_dense_prefill_attention_partial(
+    void *ctx, float *dst, float *dst_max, float *dst_sum,
+    const float *q, const uint16_t *kv, const float *sink,
+    int M, int pos0, int n_heads, int head_dim, int kv_dim,
+    int kv_slots, int window, float scale);
 /* Choose the largest prefix that leaves room for the two streamed slots and
  * a caller-selected safety margin. Returns zero when no resident layer fits. */
 int hip_ds4f_dense_recommend_mxfp4_resident_layers(

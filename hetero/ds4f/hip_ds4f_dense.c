@@ -114,7 +114,10 @@ struct hip_ds4f_dense {
     void *op_dx,*op_xt,*op_yt,*op_di,*op_dy;
     size_t op_dx_b,op_xt_b,op_yt_b,op_di_b,op_dy_b;
     hipFunction_t prefill_attn;
+    hipFunction_t prefill_attn_partial;
     hipFunction_t prefill_attn_wmma;
+    void *attn_ymax, *attn_ysum;
+    size_t attn_ymax_bytes, attn_ysum_bytes;
     hipFunction_t apply_rope, qnorm_rope_heads;
     hipFunction_t rmsnorm_bf16;
     hipFunction_t gemm_fp8_grouped_wmma;
@@ -484,6 +487,8 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
         ds4f_mem_pool_destroy(ctx->mem);
         return NULL;
     }
+    hipModuleGetFunction(&ctx->prefill_attn_partial, ctx->module,
+                         "ds4f_dense_prefill_attn_partial");
     hipModuleGetFunction(&ctx->gemm_mxfp4_grouped_wmma, ctx->module,
                          "ds4f_dense_mxfp4_grouped_wmma");
     hipModuleGetFunction(&ctx->gemm_mxfp4_grouped_wmma32, ctx->module,
@@ -647,6 +652,8 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (ctx->attn_kv) hipFree(ctx->attn_kv);
     if (ctx->attn_sink) hipFree(ctx->attn_sink);
     if (ctx->attn_y) hipFree(ctx->attn_y);
+    if (ctx->attn_ymax) hipFree(ctx->attn_ymax);
+    if (ctx->attn_ysum) hipFree(ctx->attn_ysum);
     if (ctx->rope_c) hipFree(ctx->rope_c);
     if (ctx->rope_s) hipFree(ctx->rope_s);
     if (ctx->qkv_x) hipFree(ctx->qkv_x);
@@ -2135,6 +2142,67 @@ int hip_ds4f_dense_prefill_attention(
         ctx->attn_device_M = M;
         ctx->attn_device_host = dst;
     }
+    return 0;
+}
+
+int hip_ds4f_dense_prefill_attention_partial(
+    void *opaque, float *dst, float *dst_max, float *dst_sum,
+    const float *q, const uint16_t *kv, const float *sink,
+    int M, int pos0, int n_heads, int head_dim, int kv_dim,
+    int kv_slots, int window, float scale) {
+    hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    if (!ctx || !ctx->prefill_attn_partial || !dst || !dst_max || !dst_sum ||
+        !q || !kv || !sink || M < 1 || n_heads < 1 || head_dim < 1 ||
+        kv_dim < 1 || kv_dim > head_dim || kv_slots < 1 ||
+        window < 1 || window > 128 || pos0 < 0 ||
+        !valid_dims(M * n_heads, head_dim) || !valid_dims(kv_slots, kv_dim)) return -1;
+    /* kv is frequently a RING BUFFER (tier-B2 layers: kv_slots == window,
+     * indexed by pos%kv_slots) rather than a linear/contiguous array. For
+     * M==1 (the only pattern this wrapper's caller uses), copy the buffer's
+     * full ring unconditionally and pass pos0 through unmodified so the
+     * kernel's own "(lo+j) % kv_slots" indexing lines up with the source's
+     * actual layout -- this stays correct for arbitrarily large pos0, unlike
+     * a linear base/end window that only fits before the ring first wraps.
+     * M>1 keeps the original linear-window behavior (untested by any
+     * current caller, left as a safe default for a hypothetical batched
+     * future caller rather than silently reinterpreted). */
+    int ring = (M == 1);
+    int base = ring ? 0 : pos0 - window + 1;
+    if (base < 0) base = 0;
+    int end = pos0 + M;
+    if (!ring && end > kv_slots) return -1;
+    int copy_slots = ring ? kv_slots : end - base;
+    if (copy_slots < 1) copy_slots = 1;
+    size_t qb = (size_t)M * (size_t)n_heads * (size_t)head_dim * sizeof(float);
+    size_t kb = (size_t)copy_slots * (size_t)kv_dim * sizeof(uint16_t);
+    size_t sb = (size_t)n_heads * sizeof(float);
+    size_t mb = (size_t)M * (size_t)n_heads * sizeof(float);
+    if (ensure_attn_buffer(&ctx->attn_q, &ctx->attn_q_bytes, qb) != 0 ||
+        ensure_attn_buffer(&ctx->attn_kv, &ctx->attn_kv_bytes, kb) != 0 ||
+        ensure_attn_buffer(&ctx->attn_sink, &ctx->attn_sink_bytes, sb) != 0 ||
+        ensure_attn_buffer(&ctx->attn_y, &ctx->attn_y_bytes, qb) != 0 ||
+        ensure_attn_buffer(&ctx->attn_ymax, &ctx->attn_ymax_bytes, mb) != 0 ||
+        ensure_attn_buffer(&ctx->attn_ysum, &ctx->attn_ysum_bytes, mb) != 0 ||
+        hipSetDevice(ctx->device_id) != hipSuccess) return -1;
+    if (hipMemcpy(ctx->attn_q, q, qb, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(ctx->attn_kv, kv + (size_t)base * kv_dim, kb,
+                 hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(ctx->attn_sink, sink, sb, hipMemcpyHostToDevice) != hipSuccess)
+        return -1;
+    int groups = (n_heads + 7) >> 3;
+    unsigned int gx = (unsigned int)(M * groups);
+    int local_pos0 = ring ? pos0 : pos0 - base;
+    void *dy = ctx->attn_y, *dymax = ctx->attn_ymax, *dysum = ctx->attn_ysum,
+         *dkv = ctx->attn_kv, *dq = ctx->attn_q, *dsink = ctx->attn_sink;
+    void *args[] = { &dy, &dymax, &dysum, &dkv, &dq, &dsink, &M, &local_pos0,
+                     &n_heads, &head_dim, &kv_dim, &copy_slots, &window, &scale };
+    if (hipModuleLaunchKernel(ctx->prefill_attn_partial, gx, 1, 1, 256, 1, 1, 0,
+                              ctx->stream, args, NULL) != hipSuccess) return -1;
+    if (hipStreamSynchronize(ctx->stream) != hipSuccess ||
+        hipMemcpy(dst, ctx->attn_y, qb, hipMemcpyDeviceToHost) != hipSuccess ||
+        hipMemcpy(dst_max, ctx->attn_ymax, mb, hipMemcpyDeviceToHost) != hipSuccess ||
+        hipMemcpy(dst_sum, ctx->attn_ysum, mb, hipMemcpyDeviceToHost) != hipSuccess)
+        return -1;
     return 0;
 }
 

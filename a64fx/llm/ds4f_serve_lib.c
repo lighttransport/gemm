@@ -230,6 +230,7 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
     m->gpu_routed_ffn = routed_ffn ? hip_ds4f_dense_routed_ffn : NULL;
     m->gpu_oproj = hip_ds4f_dense_oproj;
     m->gpu_prefill_attn = prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
+    m->gpu_prefill_attn_partial = prefill_attn ? hip_ds4f_dense_prefill_attention_partial : NULL;
     m->gpu_prefill_qkv = qkv_fuse ? hip_ds4f_dense_prefill_qkv : NULL;
     m->gpu_prefill_qkv_enabled = qkv_fuse != 0;
     m->gpu_qkv_device_chain = qkv_device_chain != 0;
