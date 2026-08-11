@@ -14,11 +14,12 @@
 
 #include <math.h>
 #include <limits.h>
+#include <time.h>
 
 /* Decode issues independent projection groups (qkv is three tensors); one
  * slot per member lets a whole group be in flight instead of paying a
  * launch + event-sync + blocking download per tensor. */
-enum { HIP_DS4F_ASYNC_MAX = 8, HIP_DS4F_GEMM_MAX = 128 };
+enum { HIP_DS4F_ASYNC_MAX = 8, HIP_DS4F_GEMM_MAX = 256 };
 
 typedef struct {
     void *dw, *ds;
@@ -95,6 +96,7 @@ struct hip_ds4f_dense {
     hipFunction_t gemm_mxfp4_grouped;
     hipFunction_t gemm_mxfp4_grouped_wmma;
     hipFunction_t gemm_mxfp4_grouped_wmma32;
+    hipFunction_t gemm_mxfp4_grouped_wmma64;
     hipFunction_t mxfp4_matvec;
     hipFunction_t mxfp4_grouped_matvec;
     hipFunction_t gemm_fp8_rowscale;
@@ -181,6 +183,8 @@ struct hip_ds4f_dense {
     hipEvent_t stream_copy_done[2];
     void *stream_slot_dw[2], *stream_slot_ds[2];
     size_t stream_slot_dw_bytes[2], stream_slot_ds_bytes[2];
+    void *stream_slot_hreg[2];
+    size_t stream_slot_hreg_bytes[2];
     const ds4f_layer *stream_slot_layer[2];
     int stream_active_slot, stream_pending_slot;
     const ds4f_layer *stream_pending_layer;
@@ -190,6 +194,10 @@ struct hip_ds4f_dense {
     pthread_cond_t stream_copy_ready_cv;
     int stream_copy_stop, stream_copy_request, stream_copy_submitted;
     int stream_copy_result, stream_copy_request_slot;
+    double prof_routed_seconds;
+    unsigned long prof_routed_calls;
+    unsigned long prof_host_registers;
+    size_t prof_host_register_bytes;
     hip_ds4f_resident_layer *resident_layers;
     int n_resident_layers, cap_resident_layers;
 };
@@ -414,6 +422,8 @@ hip_ds4f_dense *hip_ds4f_dense_create_ex(int device_id, int verbose, int precise
                          "ds4f_dense_mxfp4_grouped_wmma");
     hipModuleGetFunction(&ctx->gemm_mxfp4_grouped_wmma32, ctx->module,
                          "ds4f_dense_mxfp4_grouped_wmma32");
+    hipModuleGetFunction(&ctx->gemm_mxfp4_grouped_wmma64, ctx->module,
+                         "ds4f_dense_mxfp4_grouped_wmma64");
     hipModuleGetFunction(&ctx->prefill_attn_wmma, ctx->module,
                          "ds4f_dense_prefill_attn_wmma");
     hipModuleGetFunction(&ctx->apply_rope, ctx->module, "ds4f_apply_rope");
@@ -524,6 +534,16 @@ hip_ds4f_dense *hip_ds4f_dense_create(int device_id, int verbose) {
 
 void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     if (!ctx) return;
+    { const char *p = getenv("DS4F_PROF");
+      if (p && atoi(p) && ctx->prof_routed_calls)
+          fprintf(stderr, "  hip_route  %9.3f s  calls=%lu avg=%.3f ms\n",
+                  ctx->prof_routed_seconds, ctx->prof_routed_calls,
+                  1000.0 * ctx->prof_routed_seconds / ctx->prof_routed_calls); }
+    { const char *p = getenv("DS4F_PROF");
+      if (p && atoi(p))
+          fprintf(stderr, "  hip_hreg             calls=%lu total=%.1f GiB\n",
+                  ctx->prof_host_registers,
+                  (double)ctx->prof_host_register_bytes / (1024.0*1024.0*1024.0)); }
     pthread_mutex_lock(&ctx->stream_copy_mu);
     ctx->stream_copy_stop = 1;
     pthread_cond_signal(&ctx->stream_copy_cv);
@@ -566,6 +586,8 @@ void hip_ds4f_dense_destroy(hip_ds4f_dense *ctx) {
     for (int i = 0; i < HIP_DS4F_GEMM_MAX; ++i)
         if (ctx->gemm_multi_dy[i]) hipFree(ctx->gemm_multi_dy[i]);
     for (int i = 0; i < 2; ++i) {
+        if (ctx->stream_slot_hreg[i] && hipHostUnregister)
+            hipHostUnregister(ctx->stream_slot_hreg[i]);
         if (ctx->stream_slot_dw[i]) hipFree(ctx->stream_slot_dw[i]);
         if (ctx->stream_slot_ds[i]) hipFree(ctx->stream_slot_ds[i]);
         if (ctx->stream_copy_done[i] && hipEventDestroy) hipEventDestroy(ctx->stream_copy_done[i]);
@@ -938,6 +960,11 @@ static void release_stream_slot(hip_ds4f_dense *ctx, int slot) {
             ds4f_tensor *t = (ds4f_tensor *)&ex[wi][e];
             if (t->gpu_id >= 0) { release_matrix(ctx, t->gpu_id); t->gpu_id = -1; }
         }
+    if (ctx->stream_slot_hreg[slot] && hipHostUnregister) {
+        hipHostUnregister(ctx->stream_slot_hreg[slot]);
+        ctx->stream_slot_hreg[slot] = NULL;
+        ctx->stream_slot_hreg_bytes[slot] = 0;
+    }
     ctx->stream_slot_layer[slot] = NULL;
 }
 
@@ -989,6 +1016,7 @@ static int prefetch_layer_raw_async(hip_ds4f_dense *ctx, const ds4f_layer *layer
 
     const ds4f_tensor *ex[] = { layer->ex_w1, layer->ex_w2, layer->ex_w3 };
     size_t wtotal = 0, stotal = 0;
+    uintptr_t host_lo = UINTPTR_MAX, host_hi = 0;
     for (size_t wi = 0; wi < sizeof(ex) / sizeof(ex[0]); ++wi)
         if (ex[wi]) for (int e = 0; e < layer->n_owned; ++e) {
             const ds4f_tensor *t = &ex[wi][e];
@@ -996,10 +1024,33 @@ static int prefetch_layer_raw_async(hip_ds4f_dense *ctx, const ds4f_layer *layer
                 (t->cols & 127)) return -1;
             wtotal += (size_t)t->rows * (size_t)(t->cols / 2);
             stotal += (size_t)t->rows * (size_t)(t->cols / 32);
+            size_t wb = (size_t)t->rows * (size_t)(t->cols / 2);
+            size_t sb = (size_t)t->rows * (size_t)(t->cols / 32);
+            uintptr_t wp = (uintptr_t)t->w, sp = (uintptr_t)t->scale;
+            if (wp < host_lo) host_lo = wp;
+            if (sp < host_lo) host_lo = sp;
+            if (wp + wb > host_hi) host_hi = wp + wb;
+            if (sp + sb > host_hi) host_hi = sp + sb;
         }
     int slot = ctx->stream_active_slot < 0 ? 0 : 1 - ctx->stream_active_slot;
     if (ctx->stream_slot_layer[slot]) release_stream_slot(ctx, slot);
     if (ensure_stream_slot(ctx, slot, wtotal, stotal) != 0) return -1;
+    /* The nocopy stage is one contiguous virtual mapping. Registering the
+     * current layer lets ROCm DMA directly from its resident file-cache pages
+     * instead of internally staging 1536 pageable tensor copies. Keep two
+     * layer ranges registered so N+1 can transfer while N computes. */
+    if (hipHostRegister && host_lo < host_hi) {
+        uintptr_t lo = host_lo & ~(uintptr_t)4095;
+        uintptr_t hi = (host_hi + 4095) & ~(uintptr_t)4095;
+        size_t span = hi - lo;
+        if (span <= (size_t)6 * 1024 * 1024 * 1024ULL &&
+            hipHostRegister((void *)lo, span, hipHostRegisterDefault) == hipSuccess) {
+            ctx->stream_slot_hreg[slot] = (void *)lo;
+            ctx->stream_slot_hreg_bytes[slot] = span;
+            ctx->prof_host_registers++;
+            ctx->prof_host_register_bytes += span;
+        }
+    }
     ctx->stream_slot_layer[slot] = layer;
 
     size_t wo = 0, so = 0;
@@ -1973,13 +2024,65 @@ int hip_ds4f_dense_shared_ffn(void *opaque,float *dst,
     return hip_ds4f_dense_shared_ffn_wait(opaque,dst,M,C);
 }
 
+/* Submit a heterogeneous batch of MXFP4 GEMMs as one 3-D launch.  Routed
+ * prefill has up to 256 expert buckets with different token counts; launching
+ * one kernel per bucket made launch latency dominate the full 43-layer model.
+ * The grouped kernel uses blockIdx.z as the task index and bounds-checks each
+ * task's token count, so the grid only needs the largest bucket dimensions. */
+static int launch_mxfp4_tasks(hip_ds4f_dense *ctx,
+                              const hip_ds4f_mxfp4_task *task, int n) {
+    unsigned int gx = 0, gy = 0;
+    int all_m1 = 1;
+    if (!ctx || !task || n < 1 || n > HIP_DS4F_GEMM_MAX ||
+        ensure_mxfp4_task_buffer(ctx, n) != 0)
+        return -1;
+    for (int i = 0; i < n; ++i) {
+        unsigned int tx = (unsigned int)((task[i].n_out + 63) / 64);
+        unsigned int ty = (unsigned int)((task[i].n_tok + 15) / 16);
+        if (tx > gx) gx = tx;
+        if (ty > gy) gy = ty;
+        if (task[i].n_tok != 1) all_m1 = 0;
+    }
+    if (hipMemcpyAsync(ctx->gemm_mxfp4_tasks, task,
+                       (size_t)n * sizeof(*task), hipMemcpyHostToDevice,
+                       ctx->stream) != hipSuccess)
+        return -1;
+    int ntasks = n;
+    void *args[] = { &ctx->gemm_mxfp4_tasks, &ntasks };
+    int use_wmma64 = ctx->mxfp4_wmma >= 2 && !all_m1 &&
+                       ctx->gemm_mxfp4_grouped_wmma64;
+    int use_wmma32 = !use_wmma64 && ctx->mxfp4_wmma >= 2 && !all_m1 && gy >= 2 &&
+                       ctx->gemm_mxfp4_grouped_wmma32;
+    int use_wmma = !use_wmma32 && ctx->mxfp4_wmma != 0 && !all_m1 &&
+                   ctx->gemm_mxfp4_grouped_wmma;
+    hipFunction_t fn = use_wmma64 ? ctx->gemm_mxfp4_grouped_wmma64 :
+                       (use_wmma32 ? ctx->gemm_mxfp4_grouped_wmma32 :
+                       (use_wmma ? ctx->gemm_mxfp4_grouped_wmma :
+                       (all_m1 ? ctx->mxfp4_grouped_matvec :
+                        ctx->gemm_mxfp4_grouped)));
+    unsigned int launch_gx = all_m1
+        ? (unsigned int)((task[0].n_out + 7) / 8)
+        : (use_wmma64 ? (unsigned int)((task[0].n_out + 63) / 64) :
+           (use_wmma32 ? (unsigned int)((task[0].n_out + 31) / 32) :
+           (use_wmma ? (unsigned int)((task[0].n_out + 15) / 16) : gx)));
+    return hipModuleLaunchKernel(fn, launch_gx,
+        use_wmma64 ? (unsigned int)((16 * gy + 63) / 64) :
+          ((use_wmma || use_wmma32) ? gy : (all_m1 ? (unsigned int)n : gy)),
+        (use_wmma || use_wmma32 || use_wmma64) ? (unsigned int)n : (all_m1 ? 1u : (unsigned int)n),
+        use_wmma64 ? 256u : (use_wmma32 ? 64u : (use_wmma ? 32u : (all_m1 ? 256u : 16u))),
+        (use_wmma || use_wmma32 || use_wmma64) ? 1u : (all_m1 ? 1u : 16u), 1, 0,
+        ctx->stream, args, NULL) == hipSuccess ? 0 : -1;
+}
+
 int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
     const ds4f_tensor *const *w1, const ds4f_tensor *const *w3,
     const ds4f_tensor *const *w2, const int *counts, const int *offsets,
     int n_experts, int total, int C, int inter, float lim) {
     hip_ds4f_dense *ctx = (hip_ds4f_dense *)opaque;
+    struct timespec prof_t0;
+    clock_gettime(CLOCK_MONOTONIC, &prof_t0);
     if (!ctx || !dst || !x || !w1 || !w3 || !w2 || !counts || !offsets ||
-        n_experts < 1 || n_experts > 64 || total < 1 || C < 1 || inter < 1 ||
+        n_experts < 1 || n_experts > 256 || total < 1 || C < 1 || inter < 1 ||
         offsets[0] != 0 || offsets[n_experts] != total)
         return -1;
     size_t xb = (size_t)total * C * 4, ib = (size_t)total * inter * 4;
@@ -1996,6 +2099,10 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
     }
     if (hipMemcpyAsync(ctx->ffn_dx, xh, xb, hipMemcpyHostToDevice,
                        ctx->stream) != hipSuccess) return -1;
+    hip_ds4f_mxfp4_task gate[HIP_DS4F_GEMM_MAX];
+    hip_ds4f_mxfp4_task up[HIP_DS4F_GEMM_MAX];
+    hip_ds4f_mxfp4_task down[HIP_DS4F_GEMM_MAX];
+    int active = 0;
     const hip_ds4f_matrix *a = NULL, *u = NULL, *d = NULL;
     for (int s = 0; s < n_experts; ++s) {
         int cnt = counts[s];
@@ -2017,21 +2124,34 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
         void *dg = (uint8_t *)ctx->ffn_dg + offi;
         void *du = (uint8_t *)ctx->ffn_du + offi;
         void *dy = (uint8_t *)ctx->ffn_dy + offx;
-        if (launch_gemm_dev(ctx, a, 0, dg, dx, inter, C, cnt) != 0 ||
-            launch_gemm_dev(ctx, u, 0, du, dx, inter, C, cnt) != 0)
-            return -1;
-        int n = cnt * inter; void *sa[] = { &dg, &du, &n, &lim };
-        if (hipModuleLaunchKernel(ctx->swiglu, (unsigned)((n+255)/256), 1, 1,
-                                  256, 1, 1, 0, ctx->stream, sa, NULL) != hipSuccess ||
-            launch_gemm_dev(ctx, d, 0, dy, dg, C, inter, cnt) != 0)
-            return -1;
+        gate[active] = (hip_ds4f_mxfp4_task){ a->dw, a->ds, dx, dg,
+                                             inter, C, cnt };
+        up[active] = (hip_ds4f_mxfp4_task){ u->dw, u->ds, dx, du,
+                                           inter, C, cnt };
+        down[active] = (hip_ds4f_mxfp4_task){ d->dw, d->ds, dg, dy,
+                                             C, inter, cnt };
+        active++;
     }
+    if (active < 1 || launch_mxfp4_tasks(ctx, gate, active) != 0 ||
+        launch_mxfp4_tasks(ctx, up, active) != 0)
+        return -1;
+    int n = total * inter;
+    void *dg = ctx->ffn_dg, *du = ctx->ffn_du;
+    void *sa[] = { &dg, &du, &n, &lim };
+    if (hipModuleLaunchKernel(ctx->swiglu, (unsigned)((n+255)/256), 1, 1,
+                              256, 1, 1, 0, ctx->stream, sa, NULL) != hipSuccess ||
+        launch_mxfp4_tasks(ctx, down, active) != 0)
+        return -1;
     float *out = dst;
     if (ctx->gemm_y_pack && ctx->gemm_y_pack_bytes >= xb) out = ctx->gemm_y_pack;
     if (hipMemcpyAsync(out, ctx->ffn_dy, xb, hipMemcpyDeviceToHost,
                        ctx->stream) != hipSuccess ||
         hipStreamSynchronize(ctx->stream) != hipSuccess) return -1;
     if (out != dst) memcpy(dst, out, xb);
+    { struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+      ctx->prof_routed_seconds += (double)(t1.tv_sec - prof_t0.tv_sec) +
+          1e-9 * (double)(t1.tv_nsec - prof_t0.tv_nsec);
+      ctx->prof_routed_calls++; }
     return 0;
 }
 

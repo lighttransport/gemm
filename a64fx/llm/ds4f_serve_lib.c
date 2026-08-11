@@ -103,6 +103,7 @@ static int serve_attach_hip(ds4f_serve *s, int hip_device, int verbose,
     if (!s->hip) return -1;
     for (int L = 0; L < m->cfg.n_layers; ++L) {
         ds4f_layer *z = &m->layers[L];
+        z->cmp_wkv_gpu_id = z->cmp_wgate_gpu_id = -1;
         ds4f_tensor *ts[9] = { &z->wq_a, &z->wq_b, &z->wkv, &z->wo_a, &z->wo_b,
                                &z->sh_w1, &z->sh_w3, &z->sh_w2, &z->gate };
         for (int j = 0; j < 9; ++j) {
@@ -127,6 +128,16 @@ static int serve_attach_hip(ds4f_serve *s, int hip_device, int verbose,
                         L, j, ts[j]->type, ts[j]->rows, ts[j]->cols,
                         ts[j]->w, ts[j]->scale);
             if (id < 0) return -1;
+        }
+        if (m->tierb2 && m->cfg.compress_ratios[L] && z->cmp_wkv && z->cmp_wgate) {
+            int cw = (m->cfg.compress_ratios[L] == 4 ? 2 : 1) * m->cfg.kv_lora;
+            ds4f_tensor ck = { z->cmp_wkv, NULL, DS4F_BF16, cw, m->cfg.hidden, -1 };
+            ds4f_tensor cg = { z->cmp_wgate, NULL, DS4F_BF16, cw, m->cfg.hidden, -1 };
+            if (hip_ds4f_dense_bind_bf16_tensor(s->hip, &ck) >= 0 &&
+                hip_ds4f_dense_bind_bf16_tensor(s->hip, &cg) >= 0) {
+                z->cmp_wkv_gpu_id = ck.gpu_id;
+                z->cmp_wgate_gpu_id = cg.gpu_id;
+            }
         }
     }
     if (m->head.type == DS4F_BF16)

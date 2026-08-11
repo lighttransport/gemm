@@ -316,6 +316,7 @@ typedef struct ds4f_layer {
      * bytes, bit-identical to the prior f32-widened arena. ape stays f32, norm bf16.
      * All NULL unless m->tierb2 && compress_ratio!=0. */
     uint16_t *cmp_wkv, *cmp_wgate;   /* layer compressor (rotate=0): [coff*kv_lora, hidden] bf16 */
+    int       cmp_wkv_gpu_id, cmp_wgate_gpu_id; /* optional serving HIP bindings */
     float    *cmp_ape;               /* [compress_ratio, coff*kv_lora] */
     uint16_t *cmp_norm;              /* [kv_lora] bf16 */
     float    *cmp_kv_state, *cmp_score_state;  /* [coff*ratio, coff*kv_lora] ring state */

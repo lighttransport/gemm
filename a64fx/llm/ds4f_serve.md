@@ -192,3 +192,28 @@ to 0.85 prefill tok/s because roughly 146 GB crossed PCIe per prompt tile, so a
 selective hot-expert cache—not full-layer streaming—is required next. These
 figures are below the 100/20 tok/s targets and are recorded as baselines, not
 as target completion.
+
+### Full-EP1 versus EP8 measurements
+
+Do not compare the single-node full model with the EP8 mechanical benchmark.
+EP8 evaluates only the experts owned by one rank unless eight ranks cooperate;
+its 47--69 tok/s tables are not a full 256-expert single-node forward.
+
+On the 188 GiB Threadripper + 16 GiB RX 9070 XT host, the August 11 full-EP1
+profile measured:
+
+- 1024-token prefill: 8.46 tok/s before serving-path wiring; 11.60 tok/s after
+  grouped 256-expert routing, HIP Tier-B2 projections, and gfx12 WMMA tiling.
+- 512-token registered streaming: 9.31 tok/s. The run registered 142.5 GiB of
+  layer spans but the 24 GiB hard memlock limit forces registration churn.
+- Isolated full-EP1 decode: 5.22 tok/s. Routed experts alone take about
+  91 ms/token; an 18 tok/s EP8 result is not evidence for full EP1.
+
+Profile-only `DS4F_PROF=1` reports `hip_route` and `hip_hreg`; production
+tuning remains controlled by runner arguments. The complete routed GPU math
+is only about 3.0 seconds for a 512-token prompt. The dominant prefill cost is
+moving the 142.5 GiB expert bank through a pageable/rolling-registered PCIe
+window, not attention or routed WMMA arithmetic. Genuine single-request
+100+ tok/s therefore requires a larger permanently pinned host window,
+additional expert-resident accelerator memory, or expert-parallel ranks; it
+cannot be inferred from the storage-only EP8 harness.

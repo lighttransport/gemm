@@ -29,6 +29,9 @@ def main():
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--cmgs", type=int, default=4)
     ap.add_argument("--hip-device", type=int, default=0)
+    ap.add_argument("--hip-mxfp4-wmma", type=int, choices=(0, 1, 2), default=1)
+    ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-expert-stream", type=int, choices=(0, 1), default=1)
     ap.add_argument("--cpu-only", action="store_true")
     args = ap.parse_args()
 
@@ -41,7 +44,11 @@ def main():
     lib_path = os.environ.get("DS4F_SERVE_LIB", os.path.join(HERE, "../../libds4f_serve.so"))
     sess = Serve(load_lib(lib_path), args.stage_dir, not args.cpu_only,
                  args.hip_device, args.threads, args.cmgs,
-                 args.prompt_tokens + args.warm_decode + args.decode_tokens + 8)
+                 args.prompt_tokens + args.warm_decode + args.decode_tokens + 8,
+                 # Keep the one-shot benchmark on the same tuned path as the
+                 # production runner.  This tuple mirrors the runner defaults.
+                 (1, 1, 1, 1, 1, 1, 1, args.hip_routed_ffn, 2, 1, 1, 2,
+                  args.hip_mxfp4_wmma, args.hip_expert_stream, 128))
     greedy = Sampling(0.0, 1.0, 1, 0.0, 1.0, 1)
     try:
         t0 = time.perf_counter()

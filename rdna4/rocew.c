@@ -99,6 +99,8 @@ thipMallocHost hipMallocHost = NULL;
 thipHostMalloc hipHostMalloc = NULL;
 thipFreeHost hipFreeHost = NULL;
 thipHostFree hipHostFree = NULL;
+thipHostRegister hipHostRegister = NULL;
+thipHostUnregister hipHostUnregister = NULL;
 thipMallocManaged hipMallocManaged = NULL;
 thipMemcpy hipMemcpy = NULL;
 thipMemcpyAsync hipMemcpyAsync = NULL;
@@ -307,6 +309,8 @@ static int loadHIP(void)
     HIP_LIBRARY_FIND(hipHostMalloc);
     HIP_LIBRARY_FIND(hipFreeHost);
     HIP_LIBRARY_FIND(hipHostFree);
+    HIP_LIBRARY_FIND(hipHostRegister);
+    HIP_LIBRARY_FIND(hipHostUnregister);
     HIP_LIBRARY_FIND(hipMallocManaged);
     HIP_LIBRARY_FIND(hipMemcpy);
     HIP_LIBRARY_FIND(hipMemcpyAsync);
