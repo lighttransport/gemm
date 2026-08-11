@@ -117,6 +117,9 @@ def load_lib(path):
     if hasattr(lib, "ds4f_serve_enable_route_telemetry"):
         lib.ds4f_serve_enable_route_telemetry.argtypes = [ctypes.c_void_p, ctypes.c_int]
         lib.ds4f_serve_enable_route_telemetry.restype = ctypes.c_int
+    if hasattr(lib, "ds4f_serve_set_adaptive_cache"):
+        lib.ds4f_serve_set_adaptive_cache.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 3
+        lib.ds4f_serve_set_adaptive_cache.restype = ctypes.c_int
     return lib
 
 
@@ -258,6 +261,12 @@ class Serve(object):
             return -1
         return self.lib.ds4f_serve_cache_hot_experts(
             self._s, int(cache_mb), int(reserve_mb), int(stats))
+
+    def set_adaptive_cache(self, period, cache_mb=-1, reserve_mb=1536):
+        if not hasattr(self.lib, "ds4f_serve_set_adaptive_cache"):
+            return -1
+        return self.lib.ds4f_serve_set_adaptive_cache(
+            self._s, int(period), int(cache_mb), int(reserve_mb))
 
     def enable_route_telemetry(self, enabled):
         if not hasattr(self.lib, "ds4f_serve_enable_route_telemetry"):

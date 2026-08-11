@@ -101,6 +101,24 @@ int ds4f_serve_cache_hot_experts(ds4f_serve *s, int cache_mb,
 #endif
 }
 
+/* Explicit serving knob for the decode-window expert cache.  Keep the
+ * environment variables as diagnostics/backward compatibility, but expose
+ * production tuning through the runner's program arguments. */
+int ds4f_serve_set_adaptive_cache(ds4f_serve *s, int period,
+                                   int cache_mb, int reserve_mb) {
+#if defined(DS4F_SERVE_HIP)
+    if (!s) return -1;
+    s->ac_period = period > 0 ? period : 0;
+    s->ac_cache_mb = cache_mb;
+    s->ac_reserve_mb = reserve_mb > 0 ? reserve_mb : 1536;
+    s->ac_decode_calls = 0;
+    return 0;
+#else
+    (void)s; (void)period; (void)cache_mb; (void)reserve_mb;
+    return -1;
+#endif
+}
+
 static int env_i(const char *k, int d) { const char *e = getenv(k); return e && *e ? atoi(e) : d; }
 
 #if defined(DS4F_SERVE_HIP)

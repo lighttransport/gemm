@@ -40,6 +40,10 @@ def main():
     ap.add_argument("--hip-expert-cache-mb", type=int, default=0,
                     help="cache prompt-hot routed experts on GPU before decode (0 disables)")
     ap.add_argument("--hip-expert-cache-reserve-mb", type=int, default=1536)
+    ap.add_argument("--adaptive-cache-period", type=int, default=0,
+                    help="refresh decode-window expert residency every N exact tokens")
+    ap.add_argument("--adaptive-cache-mb", type=int, default=-1)
+    ap.add_argument("--adaptive-cache-reserve-mb", type=int, default=1536)
     ap.add_argument("--cpu-only", action="store_true")
     args = ap.parse_args()
 
@@ -61,7 +65,8 @@ def main():
                   args.hip_decode_routed_ffn), args.speculative_tokens)
     greedy = Sampling(0.0, 1.0, 1, 0.0, 1.0, 1)
     try:
-        if args.hip_expert_cache_mb and sess.enable_route_telemetry(True) != 0:
+        if (args.hip_expert_cache_mb or args.adaptive_cache_period) and \
+                sess.enable_route_telemetry(True) != 0:
             raise RuntimeError("route telemetry is unavailable")
         t0 = time.perf_counter()
         if sess.prefill(prompt, 0) != 0:
@@ -73,6 +78,11 @@ def main():
                 args.hip_expert_cache_mb, args.hip_expert_cache_reserve_mb, 1)
             if cache_result < 0:
                 raise RuntimeError("hot expert cache initialization failed")
+        if args.adaptive_cache_period:
+            if sess.set_adaptive_cache(args.adaptive_cache_period,
+                                       args.adaptive_cache_mb,
+                                       args.adaptive_cache_reserve_mb) != 0:
+                raise RuntimeError("adaptive expert cache is unavailable")
         pos = len(prompt)
         warmed = 0
         while warmed < args.warm_decode:
