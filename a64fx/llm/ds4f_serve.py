@@ -81,6 +81,9 @@ def progress_snapshot():
     started = current.get("started") or now
     decode_started = current.get("decode_started") or now
     processed = int(current.get("prompt_processed", 0))
+    # Restored KV tokens took no prefill work in this request.  Keep them in
+    # prompt_processed for progress, but exclude them from the measured rate.
+    freshly_processed = max(0, processed - int(current.get("cached_tokens", 0)))
     completed = int(current.get("completion_tokens", 0))
     return {
         "active": active,
@@ -91,7 +94,7 @@ def progress_snapshot():
         "phase": current.get("state", "decode") if active else "idle",
         "prompt_tokens": int(current.get("prompt_total", 0)),
         "prompt_processed": processed,
-        "prompt_tps": processed / max(now - started, 1e-6),
+        "prompt_tps": freshly_processed / max(now - started, 1e-6),
         "completion_tokens": completed,
         "completion_total": completed,
         "decode_tps": completed / max(now - decode_started, 1e-6),

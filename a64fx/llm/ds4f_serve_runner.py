@@ -235,8 +235,9 @@ def prefill_chunked(sess, ids, pos0):
 
 
 class Context(object):
-    def __init__(self, cid):
+    def __init__(self, cid, internal=False):
         self.id = cid
+        self.internal = internal
         self.blob = None
         self.tokens = []
         self.disk = None
@@ -271,6 +272,7 @@ class Job(object):
         self.cached_tokens = max(0, int(request.get("cached_tokens", 0)))
         self.cache_hit = False
         self.cache_saved = False
+        self.prompt_cached = False
 
 
 class CooperativeServer(object):
@@ -299,7 +301,8 @@ class CooperativeServer(object):
                 with open(mp) as f: meta = json.load(f)
                 cid = str(meta["context_id"]); bp = mp[:-5] + ".ctx"
                 if not os.path.isfile(bp): continue
-                c = Context(cid); c.tokens = [int(x) for x in meta.get("tokens", [])]
+                c = Context(cid, bool(meta.get("internal", False)))
+                c.tokens = [int(x) for x in meta.get("tokens", [])]
                 c.last_access = float(meta.get("last_access", os.path.getmtime(mp)))
                 c.disk = bp; self.contexts[cid] = c
             except (OSError, ValueError, TypeError, KeyError):
@@ -345,7 +348,8 @@ class CooperativeServer(object):
         with open(tb, "wb") as f: f.write(ctx.blob); f.flush(); os.fsync(f.fileno())
         with open(tm, "w") as f:
             json.dump({"schema": 1, "context_id": ctx.id, "tokens": ctx.tokens,
-                       "last_access": ctx.last_access}, f, separators=(",", ":"))
+                       "last_access": ctx.last_access, "internal": ctx.internal},
+                      f, separators=(",", ":"))
             f.flush(); os.fsync(f.fileno())
         os.chmod(tb, 0o600); os.chmod(tm, 0o600)
         os.replace(tb, bp); os.replace(tm, mp)
@@ -395,7 +399,34 @@ class CooperativeServer(object):
                  "cached_tokens": c.active_job.cached_tokens if c.active_job and c.active_job.cache_hit else 0,
                  "started": c.active_job.started if c.active_job else None,
                  "decode_started": c.active_job.decode_started if c.active_job else None}
-                for c in self.contexts.values()]
+                for c in self.contexts.values() if not c.internal]
+
+    def shared_prefix(self, prompt, exclude):
+        candidates = [c for c in self.contexts.values()
+                      if c is not exclude and c.active_job is None and c.tokens and
+                      len(prompt) >= len(c.tokens) and prompt[:len(c.tokens)] == c.tokens]
+        candidates.sort(key=lambda c: len(c.tokens), reverse=True)
+        for c in candidates:
+            if self.load_context(c):
+                c.last_access = time.time()
+                return c
+        return None
+
+    def cache_prompt(self, job):
+        if job.prompt_cached or not job.prompt: return
+        raw = json.dumps(job.prompt, separators=(",", ":")).encode()
+        cid = "@prompt:" + hashlib.sha256(raw).hexdigest()
+        c = self.contexts.get(cid)
+        if c is None:
+            c = Context(cid, internal=True); self.contexts[cid] = c
+        c.blob = self.sess.context_export()
+        c.tokens = list(job.prompt); c.last_access = time.time(); c.internal = True
+        if c.disk:
+            bp, mp = self.disk_paths(c.id)
+            for p in (bp, mp):
+                try: os.unlink(p)
+                except OSError: pass
+        c.disk = None; job.prompt_cached = True
 
     def accept(self):
         while True:
@@ -455,7 +486,14 @@ class CooperativeServer(object):
                 if self.sess.context_import(ctx.blob) != 0: raise RuntimeError("context restore failed")
                 job.off = len(ctx.tokens)
                 job.cache_hit = True; job.cached_tokens = job.off
-            elif (job.cache_load and job.cache_path and
+            else:
+                shared = self.shared_prefix(job.prompt, ctx)
+                if shared is not None:
+                    if self.sess.context_import(shared.blob) != 0:
+                        raise RuntimeError("shared prefix restore failed")
+                    job.off = len(shared.tokens)
+                    job.cache_hit = True; job.cached_tokens = job.off
+            if (not job.cache_hit and job.cache_load and job.cache_path and
                   os.path.isfile(job.cache_path)):
                 self.sess.reset()
                 if self.sess.kv_restore(job.cache_path) != 0:
@@ -465,7 +503,7 @@ class CooperativeServer(object):
                     self.sess.reset()
                     raise RuntimeError("prefix cache length mismatch")
                 job.off = restored; job.cache_hit = True
-            else:
+            elif not job.cache_hit:
                 self.sess.reset(); job.off = 0
             job.phase = "prefill" if job.off < len(job.prompt) else "decode"
         self.current = job
@@ -516,6 +554,7 @@ class CooperativeServer(object):
                 self.send(job, {"event": "progress", "phase": "prefill",
                                 "processed": job.off, "total": len(job.prompt)})
                 if job.off >= len(job.prompt):
+                    self.cache_prompt(job)
                     if job.cache_save_path and not job.cache_saved:
                         if self.sess.kv_save(job.cache_save_path) != 0:
                             raise RuntimeError("prefix cache save failed")

@@ -93,6 +93,11 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   `--context-memory-mb`, `--context-disk-mb`, `--prefill-quantum-tokens`,
   `--decode-quantum-tokens`, and `--scheduler-quantum-ms`. These are program
   arguments, not production tuning environment variables.
+- After prefill, the cooperative runner stores an internal full-prompt snapshot
+  before generation. New connections reuse the longest compatible prompt or
+  completed-conversation prefix, including prior generated tokens. These
+  internal entries share the same RAM/disk limits and TTLs as conversations and
+  are omitted from the public `/v1/contexts` list.
 - In-memory and spilled version-2 context images store only populated KV rows;
   version-1 full-capacity images remain import-compatible. Batched decode also
   updates mutable context images in place, avoiding duplicate input/output
