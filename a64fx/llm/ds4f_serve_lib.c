@@ -52,6 +52,7 @@ typedef struct ds4f_serve {
     int *hist;         /* recent generated tokens (for the penalties) */
     int n_hist, hist_cap;
     int prefill_tile;  /* logical request tile, clamped to kernel capacity */
+    int speculative_tokens; /* greedy-only DSpark proposals; 0 disables */
     float *prefill_x;  /* [prefill_tile, hidden] embedding slab */
     int *prefill_tok;  /* [prefill_tile] argmax scratch */
     int slot_cap;
@@ -169,6 +170,20 @@ static int serve_attach_hip(ds4f_serve *s, int hip_device, int verbose,
             }
         }
     }
+    if (m->has_mtp) {
+        for (int st=0;st<m->dspark_n_stages;st++) {
+            ds4f_layer *z=&m->dspark[st].layer;
+            ds4f_tensor *ts[9]={&z->wq_a,&z->wq_b,&z->wkv,&z->wo_a,&z->wo_b,
+                                 &z->sh_w1,&z->sh_w3,&z->sh_w2,&z->gate};
+            for (int j=0;j<9;j++) {
+                int id=ts[j]->type==DS4F_BF16 ? hip_ds4f_dense_bind_bf16_tensor(s->hip,ts[j]) :
+                       ts[j]->type==DS4F_MXFP4 ? hip_ds4f_dense_bind_mxfp4_tensor(s->hip,ts[j]) :
+                       hip_ds4f_dense_bind_tensor(s->hip,ts[j]);
+                if (id<0) return -1;
+            }
+        }
+        if (hip_ds4f_dense_bind_tensor(s->hip,&m->dspark[0].main_proj)<0) return -1;
+    }
     if (m->head.type == DS4F_BF16)
         hip_ds4f_dense_bind_bf16_tensor(s->hip, &m->head);
     m->gpu_dense_ctx = s->hip;
@@ -263,8 +278,9 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
 }
 #endif
 
-ds4f_serve *ds4f_serve_open(const char *stage_dir, int use_hip, int hip_device,
+ds4f_serve *ds4f_serve_open_ex(const char *stage_dir, int use_hip, int hip_device,
                             int threads, int cmgs, long long max_pos,
+                            int speculative_tokens,
                             char *err, size_t err_cap) {
     if (!stage_dir || !*stage_dir) {
         if (err && err_cap) snprintf(err, err_cap, "ds4f_serve_open: no stage dir");
@@ -277,6 +293,7 @@ ds4f_serve *ds4f_serve_open(const char *stage_dir, int use_hip, int hip_device,
     o.mhc = env_i("DS4F_SERVE_MHC", 1);
     o.tierb2 = env_i("DS4F_SERVE_TIERB2", 1);
     o.exact = 1;                                  /* serve bundle */
+    o.mtp = speculative_tokens > 0;
     o.use_hip = use_hip ? 1 : 0; o.hip_device = hip_device;
     if (max_pos > 0) o.cfg.max_pos = (int)max_pos;
     ds4f_model *m = ds4f_load_real_opts(&o);
@@ -293,6 +310,7 @@ ds4f_serve *ds4f_serve_open(const char *stage_dir, int use_hip, int hip_device,
     ds4f_serve *s = (ds4f_serve *)calloc(1, sizeof(*s));
     if (!s) { ds4f_free(m); return NULL; }
     s->m = m;
+    s->speculative_tokens = m->has_mtp ? speculative_tokens : 0;
     s->pool = m->mem;
     s->vocab = m->cfg.vocab;
     s->hidden = m->cfg.hidden;
@@ -332,6 +350,13 @@ ds4f_serve *ds4f_serve_open(const char *stage_dir, int use_hip, int hip_device,
     s->rng = 0x9e3779b97f4a7c15ULL;
     if (err && err_cap) snprintf(err, err_cap, "ok");
     return s;
+}
+
+ds4f_serve *ds4f_serve_open(const char *stage_dir, int use_hip, int hip_device,
+                            int threads, int cmgs, long long max_pos,
+                            char *err, size_t err_cap) {
+    return ds4f_serve_open_ex(stage_dir,use_hip,hip_device,threads,cmgs,max_pos,
+                              0,err,err_cap);
 }
 
 void ds4f_serve_close(ds4f_serve *s) {
@@ -472,6 +497,70 @@ int ds4f_serve_decode(ds4f_serve *s, int token, int pos) {
     }
 #endif
     return ar;
+}
+
+/* Greedy DSpark step.  `anchor` is the token selected from the current main
+ * logits.  The function returns the number of committed output tokens in
+ * out_tokens (anchor plus the accepted draft prefix), advances the exact
+ * verifier state by the same amount, and leaves s->logits at the next
+ * verifier distribution.  Sampling modes bypass this API in the runner. */
+int ds4f_serve_speculate(ds4f_serve *s, int anchor, int pos, int max_tokens,
+                         int *out_tokens, float *confidence) {
+    if (!s || !s->m || !s->m->has_mtp || s->speculative_tokens<1 ||
+        anchor<0 || anchor>=s->vocab || !out_tokens) return -1;
+    int K=max_tokens;
+    if (K>s->speculative_tokens) K=s->speculative_tokens;
+    if (K>s->m->dspark_block_size) K=s->m->dspark_block_size;
+    if (K<1 || pos+K>s->m->cfg.max_pos) return -1;
+    if (s->n_hist+K>s->hist_cap) {
+        int cap=s->hist_cap ? s->hist_cap:64;
+        while (cap<s->n_hist+K) cap*=2;
+        int *q=(int *)realloc(s->hist,(size_t)cap*sizeof(int));
+        if (!q) return -1;
+        s->hist=q; s->hist_cap=cap;
+    }
+    int C=s->hidden;
+    int *draft=(int *)malloc((size_t)K*sizeof(int));
+    int *verify=(int *)malloc((size_t)K*sizeof(int));
+    float *draft_conf=confidence ? (float *)malloc((size_t)K*sizeof(float)):NULL;
+    float *X=(float *)malloc((size_t)K*(size_t)C*sizeof(float));
+    size_t ss=s->m->tierb2 ? ds4f_tb2_snap_bytes(s->m):0;
+    char *snaps=ss && K>1 ? (char *)malloc((size_t)(K-1)*ss):NULL;
+    if (!draft || !verify || !X || (confidence && !draft_conf) || (ss && K>1 && !snaps)) {
+        free(draft); free(verify); free(draft_conf); free(X); free(snaps); return -1;
+    }
+    if (ds4f_dspark_predict_block(s->m,anchor,pos,K,draft,draft_conf)!=K) {
+        free(draft); free(verify); free(draft_conf); free(X); free(snaps); return -1;
+    }
+    for (int k=0;k<K;k++) {
+        int id=k ? draft[k-1]:anchor;
+        verify[k]=id;
+        if (embed_lookup(s->m,id,X+(size_t)k*C)!=0) {
+            free(draft); free(verify); free(draft_conf); free(X); free(snaps); return -1;
+        }
+    }
+    ds4f_set_forward_token_ids(s->m,verify,K);
+    ds4f_forward_verify(s->m,X,K,pos,verify,NULL,snaps);
+    int matched=0;
+    while (matched<K-1 && verify[matched]==draft[matched]) matched++;
+    int committed=1+matched;
+    out_tokens[0]=anchor;
+    for (int k=0;k<matched;k++) out_tokens[k+1]=draft[k];
+    if (confidence) {
+        confidence[0]=-1.f;
+        for (int k=0;k<matched;k++) confidence[k+1]=draft_conf[k];
+    }
+    if (committed<K && snaps) ds4f_tb2_snap(s->m,snaps+(size_t)(committed-1)*ss,1);
+    s->pos=pos+committed;
+    if (s->m->cfg.vocab>(int)s->logits_cap) {
+        s->logits=(float *)realloc(s->logits,(size_t)s->vocab*sizeof(float));
+        s->logits_cap=(size_t)s->vocab;
+    }
+    memcpy(s->logits,s->m->p_logits+(size_t)(committed-1)*s->vocab,
+           (size_t)s->vocab*sizeof(float));
+    for (int k=0;k<committed;k++) s->hist[s->n_hist++]=out_tokens[k];
+    free(draft); free(verify); free(draft_conf); free(X); free(snaps);
+    return committed;
 }
 
 /* Decode one token for N independent serialized contexts. The stateful
@@ -809,6 +898,11 @@ static size_t context_kv_bytes_at(const ds4f_model *m, size_t pos) {
                     ? pos : (size_t)m->layers[L].kv_slots;
         n += rows * (size_t)m->cfg.kv_lora * 2;
     }
+    if (m->has_mtp) for (int st=0;st<m->dspark_n_stages;st++) {
+        const ds4f_layer *ly=&m->dspark[st].layer;
+        size_t rows=pos<(size_t)ly->kv_slots ? pos:(size_t)ly->kv_slots;
+        n+=rows*(size_t)m->cfg.kv_lora*2;
+    }
     return n;
 }
 
@@ -829,7 +923,7 @@ int ds4f_serve_context_export(ds4f_serve *s, void *dst, size_t cap) {
     size_t kvb = context_kv_bytes_at(m, (size_t)s->pos);
     size_t snap = m->tierb2 ? ds4f_tb2_snap_bytes(m) : 0;
     ds4f_context_header h = {
-        DS4F_CONTEXT_MAGIC, 2, (uint32_t)sizeof(ds4f_context_header),
+        DS4F_CONTEXT_MAGIC, 3, (uint32_t)sizeof(ds4f_context_header),
         (uint32_t)m->cfg.max_pos, (uint32_t)m->cfg.n_layers,
         (uint32_t)m->cfg.kv_lora, (uint32_t)s->vocab,
         (uint32_t)s->pos, (uint32_t)s->n_hist, s->rng, kvb, snap,
@@ -842,6 +936,12 @@ int ds4f_serve_context_export(ds4f_serve *s, void *dst, size_t cap) {
                     ? (size_t)s->pos : (size_t)m->layers[L].kv_slots;
         size_t n = rows * (size_t)m->cfg.kv_lora * 2;
         memcpy(p, m->layers[L].kv_cache, n); p += n;
+    }
+    if (m->has_mtp) for (int st=0;st<m->dspark_n_stages;st++) {
+        ds4f_layer *ly=&m->dspark[st].layer;
+        size_t rows=(size_t)s->pos<(size_t)ly->kv_slots ? (size_t)s->pos:(size_t)ly->kv_slots;
+        size_t n=rows*(size_t)m->cfg.kv_lora*2;
+        memcpy(p,ly->kv_cache,n); p+=n;
     }
     if (snap) { ds4f_tb2_snap(m, p, 0); p += snap; }
     memcpy(p, s->logits, (size_t)s->vocab * sizeof(float));
@@ -856,11 +956,12 @@ int ds4f_serve_context_import(ds4f_serve *s, const void *src, size_t len) {
     memcpy(&h, src, sizeof(h));
     ds4f_model *m = s->m;
     size_t kvb = h.version == 1 ? context_kv_bytes(m)
-                                : context_kv_bytes_at(m, (size_t)h.pos);
+                                : (h.version==2 && m->has_mtp ? 0 : context_kv_bytes_at(m,(size_t)h.pos));
     size_t snap = m->tierb2 ? ds4f_tb2_snap_bytes(m) : 0;
     size_t need = sizeof(h) + kvb + snap + (size_t)s->vocab * sizeof(float) +
                   (size_t)h.n_hist * sizeof(int);
-    if (h.magic != DS4F_CONTEXT_MAGIC || (h.version != 1 && h.version != 2) ||
+    if (h.magic != DS4F_CONTEXT_MAGIC || (h.version != 1 && h.version != 2 && h.version != 3) ||
+        (m->has_mtp && h.version<3) ||
         h.header_bytes != sizeof(h) || h.max_pos != (uint32_t)m->cfg.max_pos ||
         h.n_layers != (uint32_t)m->cfg.n_layers ||
         h.kv_lora != (uint32_t)m->cfg.kv_lora || h.vocab != (uint32_t)s->vocab ||
@@ -879,6 +980,12 @@ int ds4f_serve_context_import(ds4f_serve *s, const void *src, size_t len) {
                        ? (size_t)h.pos : (size_t)m->layers[L].kv_slots);
         size_t n = rows * (size_t)m->cfg.kv_lora * 2;
         memcpy(m->layers[L].kv_cache, p, n); p += n;
+    }
+    if (h.version>=3 && m->has_mtp) for (int st=0;st<m->dspark_n_stages;st++) {
+        ds4f_layer *ly=&m->dspark[st].layer;
+        size_t rows=(size_t)h.pos<(size_t)ly->kv_slots ? (size_t)h.pos:(size_t)ly->kv_slots;
+        size_t n=rows*(size_t)m->cfg.kv_lora*2;
+        memcpy(ly->kv_cache,p,n); p+=n;
     }
     if (snap) { ds4f_tb2_snap(m, (void *)p, 1); p += snap; }
     memcpy(s->logits, p, (size_t)s->vocab * sizeof(float));
@@ -903,13 +1010,18 @@ int ds4f_serve_kv_save(ds4f_serve *s, const char *path) {
     if (m->tierb2) snap = ds4f_tb2_snap_bytes(m);
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
-    size_t hdr[2] = { pos, snap };
+    size_t hdr[3] = { pos, snap, m->has_mtp ? DS4F_DSPARK_STAGES : 0 };
     if (fwrite(hdr, sizeof(hdr), 1, f) != 1) { fclose(f); return -1; }
     for (int L = 0; L < m->cfg.n_layers; ++L) {
         ds4f_layer *ly = &m->layers[L];
         size_t rows = (size_t)ly->kv_slots;
         size_t n = rows * (size_t)m->cfg.kv_lora;
         if (fwrite(ly->kv_cache, 2, n, f) != n) { fclose(f); return -1; }
+    }
+    if (m->has_mtp) for (int st=0;st<m->dspark_n_stages;st++) {
+        ds4f_layer *ly=&m->dspark[st].layer;
+        size_t n=(size_t)ly->kv_slots*(size_t)m->cfg.kv_lora;
+        if (fwrite(ly->kv_cache,2,n,f)!=n) { fclose(f); return -1; }
     }
     if (snap > 0) {
         char *buf = (char *)malloc(snap);
@@ -928,14 +1040,20 @@ int ds4f_serve_kv_restore(ds4f_serve *s, const char *path) {
     ds4f_model *m = s->m;
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
-    size_t hdr[2];
+    size_t hdr[3];
     if (fread(hdr, sizeof(hdr), 1, f) != 1) { fclose(f); return -1; }
     size_t pos = hdr[0], snap = hdr[1];
+    if (hdr[2]!=(size_t)(m->has_mtp ? DS4F_DSPARK_STAGES:0)) { fclose(f); return -1; }
     for (int L = 0; L < m->cfg.n_layers; ++L) {
         ds4f_layer *ly = &m->layers[L];
         size_t rows = (size_t)ly->kv_slots;
         size_t n = rows * (size_t)m->cfg.kv_lora;
         if (fread(ly->kv_cache, 2, n, f) != n) { fclose(f); return -1; }
+    }
+    if (m->has_mtp) for (int st=0;st<m->dspark_n_stages;st++) {
+        ds4f_layer *ly=&m->dspark[st].layer;
+        size_t n=(size_t)ly->kv_slots*(size_t)m->cfg.kv_lora;
+        if (fread(ly->kv_cache,2,n,f)!=n) { fclose(f); return -1; }
     }
     if (snap > 0) {
         char *buf = (char *)malloc(snap);

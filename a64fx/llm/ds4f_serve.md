@@ -132,6 +132,16 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   small-M kernels are slower at B=2 and the independent long-range caches use
   substantial host RAM; use B=2..4 for throughput experiments. `/v1/progress`
   reports actual batch steps and sequences.
+- `--speculative-tokens N` enables the checkpoint's three-stage DSpark
+  drafter for greedy requests. The staged manifest must include `mtp.*`
+  tensors (`DS4F_STAGE_MTP=1` while staging). DSpark proposes in parallel,
+  applies the rank-256 Markov bias in token order, and commits only the prefix
+  accepted by the exact main-model verifier. Sampling, penalties, and native
+  multi-context decode retain the ordinary path. The checkpoint was trained
+  with a five-position block, so values above 5 are clamped. The default is 0
+  until the 18 tok/s deployment gate is measured on the target RX 9070 XT.
+  Version-3 context images include all three DSpark KV rings; older version-2
+  contexts remain compatible when DSpark is disabled.
 - `GET /v1/contexts`, `GET /v1/contexts/<id>`, and
   `DELETE /v1/contexts/<id>` expose and manage idle context state. The progress
   endpoint reports the active context's real prefill/decode counters.

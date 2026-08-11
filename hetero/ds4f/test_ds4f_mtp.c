@@ -12,6 +12,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static double wall(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (double)ts.tv_sec+(double)ts.tv_nsec/1e9;
+}
 
 static float bf16_to_f32(uint16_t h) {
     union { uint32_t u; float f; } x;
@@ -150,15 +156,13 @@ int main(int argc, char **argv) {
         ds4f_free(m); ds4f_mem_pool_destroy(work_mem); return 0;
     }
 
-    int C = cfg.hidden, hc = cfg.hc_mult;
-    size_t hcC = (size_t)hc * (size_t)C;
+    int C = cfg.hidden;
     float *x = (float *)ds4f_mem_alloc(work_mem, (size_t)C * sizeof(float), 256, 1);
-    float *xe = (float *)ds4f_mem_alloc(work_mem, (size_t)C * sizeof(float), 256, 1);
-    float *hc_state = (float *)ds4f_mem_alloc(work_mem, hcC * sizeof(float), 256, 1);
     float *verify_inputs = (float *)ds4f_mem_alloc(work_mem, (size_t)K * (size_t)C * sizeof(float), 256, 1);
+    float *confidence = (float *)ds4f_mem_alloc(work_mem, (size_t)K * sizeof(float), 64, 1);
     int *draft = (int *)ds4f_mem_calloc(work_mem, (size_t)K, sizeof(int), 64);
     int *verify = (int *)ds4f_mem_calloc(work_mem, (size_t)K, sizeof(int), 64);
-    if (!x || !xe || !hc_state || !verify_inputs || !draft || !verify) {
+    if (!x || !confidence || !verify_inputs || !draft || !verify) {
         fprintf(stderr, "MTP probe allocation failed\n");
         ds4f_free(m); ds4f_mem_pool_destroy(work_mem);
         return 1;
@@ -174,16 +178,17 @@ int main(int argc, char **argv) {
         next = ds4f_forward_token(m, x, p);
     }
     int main_next = next;
-    memcpy(hc_state, m->s_x4, hcC * sizeof(float));
     int mtp_pos = nids;
-    for (int k = 0; k < K; k++) {
-        if (embed_lookup(m, next, xe) != 0) { draft[k] = -1; break; }
-        draft[k] = ds4f_mtp_predict(m, hc_state, xe, mtp_pos + k, NULL, 0);
-        memcpy(hc_state, m->s_x4, hcC * sizeof(float));
-        next = draft[k];
+    double td0=wall();
+    int drafted=ds4f_dspark_predict_block(m,main_next,mtp_pos,K,draft,confidence);
+    double draft_sec=wall()-td0;
+    if (drafted!=K) {
+        fprintf(stderr,"DSpark draft failed: requested=%d produced=%d\n",K,drafted);
+        ds4f_free(m); ds4f_mem_pool_destroy(work_mem); return 1;
     }
 
     int exact_batched = 0, valid = 1;
+    double tv0=wall();
     if (batch_verify && m->exact && m->mhc && m->tierb2 && !m->int8_kv) {
         for (int k = 0; k < K; k++) {
             int tok_in = k == 0 ? main_next : draft[k - 1];
@@ -210,13 +215,18 @@ int main(int argc, char **argv) {
         if (verify[k] == draft[k]) accepted++;
         next = verify[k];
     }
+    double verify_sec=wall()-tv0;
+    int prefix=0;
+    while(prefix<K && draft[prefix]==verify[prefix]) prefix++;
     printf("MTP probe: K=%d accepted=%d/%d rate=%.3f verifier=%s\n",
            K, accepted, K, (double)accepted / (double)K,
            exact_batched ? "batched" : "sequential");
+    printf("  prefix=%d draft=%.3fs verify=%.3fs effective=%.3f tok/s\n",
+           prefix,draft_sec,verify_sec,(1.0+prefix)/(draft_sec+verify_sec));
     for (int k = 0; k < K; k++)
-        printf("  k=%d draft=%d verifier=%d %s\n", k, draft[k], verify[k],
+        printf("  k=%d draft=%d verifier=%d confidence=%.5f %s\n", k, draft[k], verify[k], confidence[k],
                draft[k] == verify[k] ? "MATCH" : "REJECT");
-    printf("MTP probe note: no speedup claimed; MTP KV prefix bootstrap/rollback is not yet complete.\n");
+    printf("DSpark probe: three-stage parallel draft + sequential Markov bias; verifier remains authoritative.\n");
 
     ds4f_free(m);
     ds4f_mem_pool_destroy(work_mem);

@@ -2757,20 +2757,28 @@ static size_t ds4f_arena_size(const ds4f_config *c, int ep_rank, int ep_size, in
     {   int hc = c->hc_mult, hd = hc*c->hidden;
         total += (size_t)hc*hd*4 + (size_t)hc*4 + 4 + 3*pad;                        /* hc_head fn+base+scale */
     }
-    if (opt->mtp) {   /* MTP block: a FULL (no-TP) dense layer + experts + fusion */
-        int no = ds4f_n_owned(c->n_experts, ep_rank, ep_size), hc = c->hc_mult, mix = (2 + hc) * hc;
-        size_t mtp = 0;
-        mtp += ds4f_wbytes(dq,c->q_lora,c->hidden) + ds4f_sbytes(dq,c->q_lora,c->hidden);
-        mtp += ds4f_wbytes(dq,c->n_heads*c->q_head_dim,c->q_lora) + ds4f_sbytes(dq,c->n_heads*c->q_head_dim,c->q_lora);
-        mtp += ds4f_wbytes(dq,c->kv_lora,c->hidden) + ds4f_sbytes(dq,c->kv_lora,c->hidden);
-        mtp += ds4f_wbytes(dq,c->o_inter,c->hidden) + ds4f_sbytes(dq,c->o_inter,c->hidden);
-        mtp += ds4f_wbytes(dq,c->hidden,c->o_inter) + ds4f_sbytes(dq,c->hidden,c->o_inter);
-        mtp += ds4f_wbytes(DS4F_BF16,c->n_experts,c->hidden);                                  /* gate */
-        mtp += (size_t)no * (2*(ds4f_wbytes(DS4F_MXFP4,c->moe_inter,c->hidden)+ds4f_sbytes(DS4F_MXFP4,c->moe_inter,c->hidden))
-                            + ds4f_wbytes(DS4F_MXFP4,c->hidden,c->moe_inter)+ds4f_sbytes(DS4F_MXFP4,c->hidden,c->moe_inter));
-        mtp += 2*(ds4f_wbytes(dq,c->hidden,c->hidden)+ds4f_sbytes(dq,c->hidden,c->hidden));    /* e_proj + h_proj */
-        mtp += (size_t)2*mix*hc*c->hidden*4 + (size_t)hc*hc*c->hidden*4;                       /* hc_attn/ffn/head fn */
-        total += mtp + (size_t)64*1024*1024 + 64*pad;                                          /* norms/base/scale + slack */
+    if (opt->mtp) {   /* Three full DSpark blocks plus stage-0/stage-2 heads. */
+        int no = ds4f_n_owned(c->n_experts, ep_rank, ep_size);
+        int hc = c->hc_mult, mix = (2 + hc) * hc;
+        size_t stage = 0;
+        stage += ds4f_wbytes(dq,c->q_lora,c->hidden) + ds4f_sbytes(dq,c->q_lora,c->hidden);
+        stage += ds4f_wbytes(dq,c->n_heads*c->q_head_dim,c->q_lora) + ds4f_sbytes(dq,c->n_heads*c->q_head_dim,c->q_lora);
+        stage += ds4f_wbytes(dq,c->kv_lora,c->hidden) + ds4f_sbytes(dq,c->kv_lora,c->hidden);
+        stage += ds4f_wbytes(dq,c->o_inter,c->hidden) + ds4f_sbytes(dq,c->o_inter,c->hidden);
+        stage += ds4f_wbytes(dq,c->hidden,c->o_inter) + ds4f_sbytes(dq,c->hidden,c->o_inter);
+        stage += ds4f_wbytes(DS4F_BF16,c->n_experts,c->hidden);
+        stage += 2*(ds4f_wbytes(dq,c->shared_inter,c->hidden)+ds4f_sbytes(dq,c->shared_inter,c->hidden));
+        stage += ds4f_wbytes(dq,c->hidden,c->shared_inter)+ds4f_sbytes(dq,c->hidden,c->shared_inter);
+        if (!ds4f_arena_no_experts)
+            stage += (size_t)no * (2*(ds4f_wbytes(DS4F_MXFP4,c->moe_inter,c->hidden)+ds4f_sbytes(DS4F_MXFP4,c->moe_inter,c->hidden))
+                                  + ds4f_wbytes(DS4F_MXFP4,c->hidden,c->moe_inter)+ds4f_sbytes(DS4F_MXFP4,c->hidden,c->moe_inter));
+        stage += (size_t)2*mix*hc*c->hidden*4 + (size_t)c->window_size*c->kv_lora*2;
+        total += DS4F_DSPARK_STAGES*stage;
+        total += ds4f_wbytes(dq,c->hidden,DS4F_DSPARK_TARGET_LAYERS*c->hidden)
+               + ds4f_sbytes(dq,c->hidden,DS4F_DSPARK_TARGET_LAYERS*c->hidden);
+        total += (size_t)2*c->vocab*256*2;                    /* Markov BF16 embedding + head */
+        total += (size_t)hc*hc*c->hidden*4 + (size_t)(c->hidden+256)*2;
+        total += (size_t)96*1024*1024 + 192*pad;
     }
     total += 64u*1024*1024;                                                        /* slack */
     return total;
@@ -4402,6 +4410,7 @@ static ds4f_model *ds4f_load_real_opts(const ds4f_runtime_options *opt) {
         #undef DS4F_LN
     }
 
+    #if 0 /* obsolete one-layer MTP loader retained temporarily for history */
     /* DS4F_MTP scaffold: load the mtp.0 block (a dense transformer layer: MLA attn + 256-expert MoE,
      * NO tier-B2 compressor) + the fusion (enorm/hnorm/norm + e_proj/h_proj + own HC-head). Reuses the
      * main embed+head at forward. Experts EP-sharded; dense kept FULL (no TP) for the scaffold. The
@@ -4457,6 +4466,78 @@ static ds4f_model *ds4f_load_real_opts(const ds4f_runtime_options *opt) {
         fprintf(stderr,"ds4f_load_mtp: MTP block loaded (rank %d/%d, %d owned experts)\n", ep_rank, ep_size, no);
     }
 
+    #endif
+
+    int dspark_want = opt->mtp;
+    int dspark_present = ds4f_mani_find(&B,"mtp.0.main_proj.weight") &&
+                          ds4f_mani_find(&B,"mtp.1.attn_norm.weight") &&
+                          ds4f_mani_find(&B,"mtp.2.markov_head.markov_w2.weight");
+    if (dspark_want && !dspark_present)
+        fprintf(stderr,"ds4f_load_real: complete mtp.0..2 DSpark bundle not staged; disabled\n");
+    if (dspark_want && dspark_present) {
+        char dn[256]; int C2=cfg.hidden, hc=cfg.hc_mult, mix=(2+hc)*hc;
+        int no=ds4f_n_owned(cfg.n_experts,ep_rank,ep_size); ds4f_qtype dq=m->dense_qt;
+        for (int st=0; st<DS4F_DSPARK_STAGES; ++st) {
+            ds4f_dspark_stage *ds=&m->dspark[st]; ds4f_layer *mt=&ds->layer;
+            #define DSN(f) (snprintf(dn,sizeof dn,"mtp.%d.%s",st,f),dn)
+            mt->attn_norm=(uint16_t*)ds4f_bump(m,(size_t)C2*2,64); ds4f_load_raw(m,&B,mt->attn_norm,DSN("attn_norm.weight"),DS4F_BF16,1,C2);
+            mt->ffn_norm=(uint16_t*)ds4f_bump(m,(size_t)C2*2,64); ds4f_load_raw(m,&B,mt->ffn_norm,DSN("ffn_norm.weight"),DS4F_BF16,1,C2);
+            mt->q_norm=(uint16_t*)ds4f_bump(m,(size_t)cfg.q_lora*2,64); ds4f_load_raw(m,&B,mt->q_norm,DSN("attn.q_norm.weight"),DS4F_BF16,1,cfg.q_lora);
+            mt->kv_norm=(uint16_t*)ds4f_bump(m,(size_t)cfg.kv_lora*2,64); ds4f_load_raw(m,&B,mt->kv_norm,DSN("attn.kv_norm.weight"),DS4F_BF16,1,cfg.kv_lora);
+            mt->attn_sink=(float*)ds4f_bump(m,(size_t)cfg.n_heads*4,64); ds4f_load_raw(m,&B,mt->attn_sink,DSN("attn.attn_sink"),DS4F_F32,1,cfg.n_heads);
+            mt->wq_a=ds4f_new_tensor(m,dq,cfg.q_lora,C2); ds4f_load_dense(m,&B,&mt->wq_a,DSN("attn.wq_a"));
+            mt->wq_b=ds4f_new_tensor(m,dq,cfg.n_heads*cfg.q_head_dim,cfg.q_lora); ds4f_load_dense(m,&B,&mt->wq_b,DSN("attn.wq_b"));
+            mt->wkv=ds4f_new_tensor(m,dq,cfg.kv_lora,C2); ds4f_load_dense(m,&B,&mt->wkv,DSN("attn.wkv"));
+            mt->wo_a=ds4f_new_tensor(m,dq,cfg.o_inter,C2); ds4f_load_dense(m,&B,&mt->wo_a,DSN("attn.wo_a"));
+            mt->wo_b=ds4f_new_tensor(m,dq,C2,cfg.o_inter); ds4f_load_dense(m,&B,&mt->wo_b,DSN("attn.wo_b"));
+            mt->gate=ds4f_new_tensor(m,m->bf16_mv_qt,cfg.n_experts,C2); ds4f_load_dense(m,&B,&mt->gate,DSN("ffn.gate"));
+            mt->gate_bias=(float*)ds4f_mem_alloc(m->mem,(size_t)cfg.n_experts*4,64,1); ds4f_load_raw(m,&B,mt->gate_bias,DSN("ffn.gate.bias"),DS4F_F32,1,cfg.n_experts);
+            mt->sh_w1=ds4f_new_tensor(m,dq,cfg.shared_inter,C2); ds4f_load_dense(m,&B,&mt->sh_w1,DSN("ffn.shared_experts.w1"));
+            mt->sh_w3=ds4f_new_tensor(m,dq,cfg.shared_inter,C2); ds4f_load_dense(m,&B,&mt->sh_w3,DSN("ffn.shared_experts.w3"));
+            mt->sh_w2=ds4f_new_tensor(m,dq,C2,cfg.shared_inter); ds4f_load_dense(m,&B,&mt->sh_w2,DSN("ffn.shared_experts.w2"));
+            mt->ex_w1=(ds4f_tensor*)ds4f_mem_calloc(m->mem,(size_t)no,sizeof(ds4f_tensor),64);
+            mt->ex_w2=(ds4f_tensor*)ds4f_mem_calloc(m->mem,(size_t)no,sizeof(ds4f_tensor),64);
+            mt->ex_w3=(ds4f_tensor*)ds4f_mem_calloc(m->mem,(size_t)no,sizeof(ds4f_tensor),64);
+            mt->owned_eid=(int*)ds4f_mem_calloc(m->mem,(size_t)no,sizeof(int),64); mt->n_owned=no;
+            int slot=0; for(int e=0;e<cfg.n_experts;e++) if(e%ep_size==ep_rank){
+                if (m->mxfp4_raw) {
+                    ds4f_tensor t1={NULL,NULL,DS4F_MXFP4,cfg.moe_inter,C2,-1};
+                    ds4f_tensor t2={NULL,NULL,DS4F_MXFP4,C2,cfg.moe_inter,-1};
+                    mt->ex_w1[slot]=t1; mt->ex_w3[slot]=t1; mt->ex_w2[slot]=t2;
+                } else {
+                    mt->ex_w1[slot]=ds4f_new_tensor(m,DS4F_MXFP4,cfg.moe_inter,C2);
+                    mt->ex_w3[slot]=ds4f_new_tensor(m,DS4F_MXFP4,cfg.moe_inter,C2);
+                    mt->ex_w2[slot]=ds4f_new_tensor(m,DS4F_MXFP4,C2,cfg.moe_inter);
+                }
+                void (*ldq)(ds4f_model *,const ds4f_blob *,ds4f_tensor *,const char *)=
+                    m->mxfp4_raw ? ds4f_load_q_ref : ds4f_load_q;
+                snprintf(dn,sizeof dn,"mtp.%d.ffn.experts.%d.w1",st,e); ldq(m,&B,&mt->ex_w1[slot],dn);
+                snprintf(dn,sizeof dn,"mtp.%d.ffn.experts.%d.w3",st,e); ldq(m,&B,&mt->ex_w3[slot],dn);
+                snprintf(dn,sizeof dn,"mtp.%d.ffn.experts.%d.w2",st,e); ldq(m,&B,&mt->ex_w2[slot],dn);
+                mt->owned_eid[slot++]=e;
+            }
+            mt->hc_attn_fn=(float*)ds4f_bump(m,(size_t)mix*hc*C2*4,256); mt->hc_attn_base=(float*)ds4f_bump(m,(size_t)mix*4,64); mt->hc_attn_scale=(float*)ds4f_bump(m,12,64);
+            mt->hc_ffn_fn=(float*)ds4f_bump(m,(size_t)mix*hc*C2*4,256); mt->hc_ffn_base=(float*)ds4f_bump(m,(size_t)mix*4,64); mt->hc_ffn_scale=(float*)ds4f_bump(m,12,64);
+            ds4f_load_raw(m,&B,mt->hc_attn_fn,DSN("hc_attn_fn"),DS4F_F32,mix,hc*C2); ds4f_load_raw(m,&B,mt->hc_attn_base,DSN("hc_attn_base"),DS4F_F32,1,mix); ds4f_load_raw(m,&B,mt->hc_attn_scale,DSN("hc_attn_scale"),DS4F_F32,1,3);
+            ds4f_load_raw(m,&B,mt->hc_ffn_fn,DSN("hc_ffn_fn"),DS4F_F32,mix,hc*C2); ds4f_load_raw(m,&B,mt->hc_ffn_base,DSN("hc_ffn_base"),DS4F_F32,1,mix); ds4f_load_raw(m,&B,mt->hc_ffn_scale,DSN("hc_ffn_scale"),DS4F_F32,1,3);
+            mt->kv_slots=cfg.window_size; mt->kv_cache=(uint16_t*)ds4f_mem_calloc(m->mem,(size_t)cfg.window_size*cfg.kv_lora,sizeof(uint16_t),256);
+            #undef DSN
+        }
+        ds4f_dspark_stage *d0=&m->dspark[0],*d2=&m->dspark[2];
+        d0->main_proj=ds4f_new_tensor(m,dq,C2,3*C2); ds4f_load_dense(m,&B,&d0->main_proj,"mtp.0.main_proj");
+        d0->main_norm=(uint16_t*)ds4f_bump(m,(size_t)C2*2,64); ds4f_load_raw(m,&B,d0->main_norm,"mtp.0.main_norm.weight",DS4F_BF16,1,C2);
+        d2->norm=(uint16_t*)ds4f_bump(m,(size_t)C2*2,64); ds4f_load_raw(m,&B,d2->norm,"mtp.2.norm.weight",DS4F_BF16,1,C2);
+        d2->hc_head_fn=(float*)ds4f_bump(m,(size_t)hc*hc*C2*4,256); d2->hc_head_base=(float*)ds4f_bump(m,(size_t)hc*4,64); d2->hc_head_scale=(float*)ds4f_bump(m,4,64);
+        ds4f_load_raw(m,&B,d2->hc_head_fn,"mtp.2.hc_head_fn",DS4F_F32,hc,hc*C2); ds4f_load_raw(m,&B,d2->hc_head_base,"mtp.2.hc_head_base",DS4F_F32,1,hc); ds4f_load_raw(m,&B,d2->hc_head_scale,"mtp.2.hc_head_scale",DS4F_F32,1,1);
+        d2->markov_w1=(uint16_t*)ds4f_bump(m,(size_t)cfg.vocab*256*2,256); ds4f_load_raw(m,&B,d2->markov_w1,"mtp.2.markov_head.markov_w1.weight",DS4F_BF16,cfg.vocab,256);
+        d2->markov_w2=(uint16_t*)ds4f_bump(m,(size_t)cfg.vocab*256*2,256); ds4f_load_raw(m,&B,d2->markov_w2,"mtp.2.markov_head.markov_w2.weight",DS4F_BF16,cfg.vocab,256);
+        d2->confidence_proj=(uint16_t*)ds4f_bump(m,(size_t)(C2+256)*2,64); ds4f_load_raw(m,&B,d2->confidence_proj,"mtp.2.confidence_head.proj.weight",DS4F_BF16,1,C2+256);
+        m->dspark_n_stages=3; m->dspark_block_size=5; m->dspark_noise_token=128799; m->dspark_markov_rank=256;
+        m->dspark_target_layers[0]=40; m->dspark_target_layers[1]=41; m->dspark_target_layers[2]=42;
+        m->has_mtp=1;
+        fprintf(stderr,"ds4f_load_dspark: 3 stages loaded (rank %d/%d, %d experts/stage)\n",ep_rank,ep_size,no);
+    }
+
     if (m->mxfp4_raw) ds4f_expert_resident(m, opt->expert_resident);
 
     double loaded_gb = (double)m->bytes_read / 1e9;
@@ -4500,6 +4581,9 @@ static ds4f_model *ds4f_load_real_opts(const ds4f_runtime_options *opt) {
     m->s_x4    = (float *)ds4f_mem_alloc(m->mem, (size_t)cfg.hc_mult * C * 4, 256, 1);
     m->s_resid = (float *)ds4f_mem_alloc(m->mem, (size_t)cfg.hc_mult * C * 4, 256, 1);
     m->s_xc    = (float *)ds4f_mem_alloc(m->mem, (size_t)C * 4, 256, 1);
+    if (m->has_mtp)
+        m->dspark_main_hidden=(float *)ds4f_mem_calloc(m->mem,
+            DS4F_DSPARK_TARGET_LAYERS*(size_t)C,sizeof(float),256);
 
     double el = ds4f_wall() - t0;
     fprintf(stderr,
@@ -4967,6 +5051,37 @@ static void ds4f_attn_exact_worker(void *arg, int tid, int nthr) {
                 ds4f_attn_axpy_bf16(out, kc, w, HD, sve); }
         }
         ds4f_rope_apply(out + nope, T->rcos, T->rsin, pos, half, 1);  /* de-rotate */
+    }
+}
+
+typedef struct {
+    ds4f_model *m; ds4f_layer *ly; const uint16_t *kv;
+    int n_kv, query_pos; float scale; const float *rcos,*rsin;
+} ds4f_dspark_attn_task;
+
+/* DSpark attention is deliberately non-causal inside its proposal block:
+ * each query sees the complete main-model window followed by every parallel
+ * draft KV.  The temporary slab avoids evicting main-window rows from the
+ * persistent ring while those future draft rows are being prepared. */
+static void ds4f_attn_dspark_worker(void *arg,int tid,int nthr) {
+    ds4f_dspark_attn_task *T=(ds4f_dspark_attn_task *)arg;
+    ds4f_model *m=T->m; int HD=m->cfg.q_head_dim,KV=m->cfg.kv_lora;
+    int rd=m->cfg.qk_rope_dim,nope=HD-rd,h0,h1;
+    ds4f_head_split(m,nthr,tid,&h0,&h1);
+    float *sc=(float *)alloca((size_t)T->n_kv*sizeof(float));
+    for (int h=h0;h<h1;h++) {
+        const float *q=m->s_q+(size_t)h*HD; float mx=-INFINITY;
+        for (int j=0;j<T->n_kv;j++) {
+            float z=ds4f_attn_dot_bf16(q,T->kv+(size_t)j*KV,KV,ds4f_attn_sve)*T->scale;
+            sc[j]=z; if(z>mx) mx=z;
+        }
+        float denom=expf(T->ly->attn_sink[h]-mx);
+        for (int j=0;j<T->n_kv;j++) { sc[j]=expf(sc[j]-mx); denom+=sc[j]; }
+        float *o=m->s_attn+(size_t)h*HD;
+        for (int d=0;d<HD;d++) o[d]=0.f;
+        for (int j=0;j<T->n_kv;j++)
+            ds4f_attn_axpy_bf16(o,T->kv+(size_t)j*KV,sc[j]/denom,HD,ds4f_attn_sve);
+        ds4f_rope_apply(o+nope,T->rcos,T->rsin,T->query_pos,rd/2,1);
     }
 }
 
@@ -6432,6 +6547,9 @@ static void ds4f_alloc_prefill_batch(ds4f_model *m, int m_tile) {
     m->p_tb2_nsel = (int *)ds4f_mem_alloc(m->mem, T * sizeof(int), 256, 1);
     m->p_tb2_kv = (uint16_t *)ds4f_mem_alloc(
         m->mem, (T + (size_t)c->window_size) * (size_t)c->kv_lora * sizeof(uint16_t), 256, 1);
+    if (m->has_mtp)
+        m->dspark_tile_hidden=(float *)ds4f_mem_calloc(m->mem,
+            T*DS4F_DSPARK_TARGET_LAYERS*(size_t)C,sizeof(float),256);
 }
 
 /* batched RMSNorm: dst[mm] = rmsnorm(src[mm], w) for mm in [0,M). token-parallel. */
@@ -7232,6 +7350,32 @@ static void ds4f_noop_pool_worker(void *arg, int tid, int nthr) {
     (*ctr)++;
 }
 
+/* Project the three main-model tap states and append that token to every
+ * DSpark stage's independent dense-window KV ring.  DSpark prefill executes
+ * attention only; doing the projection here is equivalent and lets normal
+ * prefill and decode share one state transition. */
+static void ds4f_dspark_append_main(ds4f_model *m, const float *hidden, int K, int pos0) {
+    if (!m->has_mtp || !hidden || K<1) return;
+    ds4f_config *c=&m->cfg; int C=c->hidden,KV=c->kv_lora,rd=c->qk_rope_dim;
+    ds4f_alloc_prefill_batch(m,K);
+    ds4f_gemm(m,m->p_hn,&m->dspark[0].main_proj,hidden,K,C,3*C);
+    { ds4f_pf_rms_task t={m,m->p_x,m->p_hn,m->dspark[0].main_norm,C,K,C,C};
+      ds4f_pool_run(m->pool,ds4f_pf_rmsnorm_worker,&t); }
+    for (int st=0;st<m->dspark_n_stages;st++) {
+        ds4f_layer *ly=&m->dspark[st].layer;
+        ds4f_gemm(m,m->p_kvlat,&ly->wkv,m->p_x,K,KV,C);
+        { ds4f_pf_rms_task t={m,m->p_kvlat,m->p_kvlat,ly->kv_norm,KV,K,KV,KV};
+          ds4f_pool_run(m->pool,ds4f_pf_rmsnorm_worker,&t); }
+        for (int k=0;k<K;k++) {
+            float *kv=m->p_kvlat+(size_t)k*KV; int pos=pos0+k;
+            ds4f_fp8_kv_quant_inplace(kv,KV,rd);
+            ds4f_rope_apply(kv+(KV-rd),m->rope_dense_cos,m->rope_dense_sin,pos,rd/2,0);
+            uint16_t *dst=ly->kv_cache+(size_t)(pos%ly->kv_slots)*KV;
+            for (int d=0;d<KV;d++) dst[d]=ds4f_f32bf(kv[d]);
+        }
+    }
+}
+
 static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, int *out_tok, float *out_hc, char *snaps) {
     ds4f_config *c = &m->cfg;
     int C = c->hidden, HD = c->q_head_dim, KV = c->kv_lora, H = c->n_heads*HD, og = c->o_groups, gin = H/og;
@@ -7369,7 +7513,9 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         int linear_prefix = 0;
         int independent_batch = m->dec_batch_seq && m->dec_nseq == K;
         if (!independent_batch && !m->int8_kv && ly->kv_cache && m->p_tb2_kv) {
-            linear_prefix = pos0 < c->window_size - 1 ? pos0 : c->window_size - 1;
+            linear_prefix = m->dspark_forward
+                ? (pos0<c->window_size ? pos0:c->window_size)
+                : (pos0<c->window_size-1 ? pos0:c->window_size-1);
             int first = pos0 - linear_prefix;
             for (int p = 0; p < linear_prefix; ++p)
                 memcpy(m->p_tb2_kv + (size_t)p * KV,
@@ -7430,6 +7576,10 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             if (m->tierb2 && ratio) { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
                 if (!ds4f_attn_tb2_hybrid_gpu(m, &at) && !ds4f_attn_tb2_gemm(m, &at)) ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
+            } else if (m->dspark_forward) {
+                ds4f_dspark_attn_task at={m,ly,m->p_tb2_kv,linear_prefix+K,pos,
+                    1.0f/sqrtf((float)HD),rcos,rsin};
+                ds4f_pool_run(m->pool,ds4f_attn_dspark_worker,&at);
             } else { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
                 ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
@@ -7607,8 +7757,24 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             for (int i = 0; i < C; i++) o[i] = (tps ? 0.f : mo[i]) + ro[i];
         }
         ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, pf, 16, cf, 64);
+        if (m->has_mtp && !m->dspark_forward && m->dspark_tile_hidden) {
+            int ti=-1;
+            for (int j=0;j<DS4F_DSPARK_TARGET_LAYERS;j++)
+                if (L==m->dspark_target_layers[j]) { ti=j; break; }
+            if (ti>=0) for (int k=0;k<K;k++) {
+                const float *xh=m->v_x4+(size_t)k*hcC;
+                float *dst=m->dspark_tile_hidden+
+                    ((size_t)k*DS4F_DSPARK_TARGET_LAYERS+ti)*C;
+                for (int i=0;i<C;i++) { float v=0.f;
+                    for (int s=0;s<hc;s++) v+=xh[(size_t)s*C+i];
+                    dst[i]=v/(float)hc;
+                }
+            }
+        }
         if (ds4f_prof_on) m->prof[DS4F_P_EXPERTS] += ds4f_now() - _pf_t_experts0;
     }
+    if (m->has_mtp && !m->dspark_forward)
+        ds4f_dspark_append_main(m,m->dspark_tile_hidden,K,pos0);
     double _pf_t_head0 = ds4f_prof_on ? ds4f_now() : 0.0;
     /* head: per-position hc_head collapse -> out_norm (batched) -> lm_head GEMM -> per-position argmax */
     for (int k = 0; k < K; k++) ds4f_hc_head(m, m->v_x4 + (size_t)k*hcC, m->p_x + (size_t)k*C);
@@ -7685,6 +7851,7 @@ static void ds4f_tb2_snap(ds4f_model *m, char *buf, int restore) {
 }
 /* skip_head=1: KV-maintenance-only call (backfill an MTP-KV ring hole) -- runs the fusion + layer
  * (appends mt->kv_cache@pos, leaves the MTP hidden in m->s_x4) but skips the lm_head; returns -1. */
+#if 0 /* replaced by the parallel three-stage DSpark forward below */
 static int ds4f_mtp_predict(ds4f_model *m, const float *hc_state, const float *xe, int pos, float *logits_out, int skip_head) {
     if (!m->has_mtp) return -1;
     ds4f_config *c = &m->cfg;
@@ -7764,6 +7931,83 @@ static int ds4f_mtp_predict(ds4f_model *m, const float *hc_state, const float *x
     m->attn_h0=s_h0; m->attn_h1=s_h1; m->oi0=s_oi0; m->oi_rows=s_oir; m->sh_r0=s_shr0; m->sh_rows=s_shr;
     return best;
 }
+#endif
+static int ds4f_dspark_predict_block(ds4f_model *m, int anchor_id, int pos,
+                                     int K, int *draft, float *confidence) {
+    if (!m->has_mtp || m->head.rows!=m->cfg.vocab || m->emb_rows!=m->cfg.vocab ||
+        anchor_id<0 || anchor_id>=m->cfg.vocab || K<1) return -1;
+    if (K>m->dspark_block_size) K=m->dspark_block_size;
+    int C=m->cfg.hidden,V=m->cfg.vocab,hc=m->cfg.hc_mult;
+    ds4f_alloc_prefill_batch(m,K);
+    float *X=(float *)malloc((size_t)K*C*sizeof(float));
+    int *raw=(int *)malloc((size_t)K*sizeof(int));
+    if (!X || !raw) { free(X); free(raw); return -1; }
+    for (int k=0;k<K;k++) {
+        int id=k ? m->dspark_noise_token : anchor_id;
+        const uint16_t *e=m->embed+(size_t)id*C;
+        for (int i=0;i<C;i++) X[(size_t)k*C+i]=ds4f_bf16f(e[i]);
+    }
+
+    ds4f_config saved_cfg=m->cfg;
+    ds4f_layer *saved_layers=m->layers;
+    uint16_t *saved_norm=m->out_norm;
+    float *saved_fn=m->hc_head_fn,*saved_base=m->hc_head_base,*saved_scale=m->hc_head_scale;
+    int saved_tierb2=m->tierb2,saved_sparse=m->sparse,saved_forward=m->dspark_forward;
+    int saved_h0=m->attn_h0,saved_h1=m->attn_h1;
+    int saved_oi0=m->oi0,saved_oir=m->oi_rows;
+    int saved_sh0=m->sh_r0,saved_shrows=m->sh_rows;
+    int saved_sh20=m->sh2_r0,saved_sh2rows=m->sh2_rows;
+    ds4f_layer stages[DS4F_DSPARK_STAGES];
+    for (int st=0;st<DS4F_DSPARK_STAGES;st++) stages[st]=m->dspark[st].layer;
+    m->layers=stages; m->cfg.n_layers=DS4F_DSPARK_STAGES; m->cfg.n_hash_layers=0;
+    for (int st=0;st<DS4F_DSPARK_STAGES;st++) m->cfg.compress_ratios[st]=0;
+    m->out_norm=m->dspark[2].norm;
+    m->hc_head_fn=m->dspark[2].hc_head_fn;
+    m->hc_head_base=m->dspark[2].hc_head_base;
+    m->hc_head_scale=m->dspark[2].hc_head_scale;
+    m->tierb2=0; m->sparse=0; m->dspark_forward=1;
+    m->attn_h0=0; m->attn_h1=m->cfg.n_heads;
+    m->oi0=0; m->oi_rows=m->cfg.o_inter;
+    m->sh_r0=0; m->sh_rows=m->cfg.shared_inter;
+    m->sh2_r0=0; m->sh2_rows=C;
+    ds4f_forward_verify(m,X,K,pos,raw,NULL,NULL);
+
+    /* The transformer logits are parallel, while the low-rank Markov bias is
+     * deliberately sequential: output i selects the bias token for i+1. */
+    ds4f_dspark_stage *d2=&m->dspark[2]; int token=anchor_id;
+    for (int k=0;k<K;k++) {
+        const uint16_t *me=d2->markov_w1+(size_t)token*m->dspark_markov_rank;
+        const float *base=m->p_logits+(size_t)k*V;
+        int best=0; float bv=-INFINITY;
+        for (int v=0;v<V;v++) {
+            const uint16_t *w=d2->markov_w2+(size_t)v*m->dspark_markov_rank;
+            float b=0.f;
+            for (int r=0;r<m->dspark_markov_rank;r++)
+                b+=ds4f_bf16f(me[r])*ds4f_bf16f(w[r]);
+            float z=base[v]+b; if (z>bv) { bv=z; best=v; }
+        }
+        draft[k]=token=best;
+        if (confidence) {
+            const uint16_t *cp=d2->confidence_proj; const float *h=m->p_x+(size_t)k*C;
+            float z=0.f;
+            for (int i=0;i<C;i++) z+=h[i]*ds4f_bf16f(cp[i]);
+            for (int r=0;r<m->dspark_markov_rank;r++)
+                z+=ds4f_bf16f(me[r])*ds4f_bf16f(cp[C+r]);
+            confidence[k]=1.f/(1.f+expf(-z));
+        }
+    }
+    m->cfg=saved_cfg; m->layers=saved_layers; m->out_norm=saved_norm;
+    m->hc_head_fn=saved_fn; m->hc_head_base=saved_base; m->hc_head_scale=saved_scale;
+    m->tierb2=saved_tierb2; m->sparse=saved_sparse; m->dspark_forward=saved_forward;
+    m->attn_h0=saved_h0; m->attn_h1=saved_h1;
+    m->oi0=saved_oi0; m->oi_rows=saved_oir;
+    m->sh_r0=saved_sh0; m->sh_rows=saved_shrows;
+    m->sh2_r0=saved_sh20; m->sh2_rows=saved_sh2rows;
+    free(X); free(raw);
+    (void)hc;
+    return K;
+}
+
 /* Finish the shared expert after its two up/gate projections.  The helper is
  * also used after an asynchronous GPU launch has overlapped the CPU router
  * and routed experts. */
@@ -8180,6 +8424,19 @@ decode_oproj_done:;
               ds4f_hc_post(m, m->s_x4, m->s_resid, m->s_o, post_f, comb_f);         /* expand 1->4 */
               DS4F_TOC(DS4F_P_MHCPOST); }
         } else for (int i = 0; i < C; i++) x[i] += (tps ? 0.f : m->s_moe[i]) + m->s_route[i];  /* shared(local|folded)+routed */
+        if (m->has_mtp && !m->dspark_forward) {
+            int ti=-1;
+            for (int j=0;j<DS4F_DSPARK_TARGET_LAYERS;j++)
+                if (L==m->dspark_target_layers[j]) { ti=j; break; }
+            if (ti>=0) {
+                float *dst=m->dspark_main_hidden+(size_t)ti*C;
+                const float *xh=m->mhc ? m->s_x4 : x;
+                for (int i=0;i<C;i++) { float v=0.f;
+                    for (int s=0;s<(m->mhc?hc:1);s++) v+=xh[(size_t)s*C+i];
+                    dst[i]=v/(float)(m->mhc?hc:1);
+                }
+            }
+        }
         ds4f_chk("x+moe", L, m->mhc ? m->s_x4 : x, C);
         if (layer_stats) {
             const float *z = m->mhc ? m->s_x4 : x;
@@ -8194,6 +8451,8 @@ decode_oproj_done:;
                     L, mn, mx, sqrt(ss / (double)nz));
         }
     }
+    if (m->has_mtp && !m->dspark_forward)
+        ds4f_dspark_append_main(m,m->dspark_main_hidden,1,pos);
     /* head: mHC collapse 4 streams -> 1 (no sinkhorn), then out_norm + lm_head */
     float *hsrc = x;
     if (m->mhc) { ds4f_hc_head(m, m->s_x4, m->s_xc); hsrc = m->s_xc; ds4f_chk("hc_head", -1, hsrc, C); }

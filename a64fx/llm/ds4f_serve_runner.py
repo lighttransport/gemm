@@ -48,6 +48,15 @@ def load_lib(path):
     lib.ds4f_serve_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int,
                                     ctypes.c_int, ctypes.c_int, ctypes.c_longlong,
                                     ctypes.c_char_p, ctypes.c_size_t]
+    if hasattr(lib, "ds4f_serve_open_ex"):
+        lib.ds4f_serve_open_ex.restype = ctypes.c_void_p
+        lib.ds4f_serve_open_ex.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_longlong, ctypes.c_int,
+            ctypes.c_char_p, ctypes.c_size_t]
+    if hasattr(lib, "ds4f_serve_speculate"):
+        lib.ds4f_serve_speculate.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_float)]
+        lib.ds4f_serve_speculate.restype = ctypes.c_int
     if hasattr(lib, "ds4f_serve_configure_hip_prefill"):
         lib.ds4f_serve_configure_hip_prefill.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 18
         lib.ds4f_serve_configure_hip_prefill.restype = ctypes.c_int
@@ -113,13 +122,18 @@ def load_lib(path):
 
 class Serve(object):
     def __init__(self, lib, stage_dir, use_hip, hip_device, threads, cmgs, max_pos,
-                 hip_prefill):
+                 hip_prefill, speculative_tokens=0):
         err = ctypes.create_string_buffer(512)
-        self._s = lib.ds4f_serve_open(stage_dir.encode(), int(use_hip), int(hip_device),
-                                      int(threads), int(cmgs), int(max_pos), err, len(err))
+        if speculative_tokens and hasattr(lib, "ds4f_serve_open_ex"):
+            self._s = lib.ds4f_serve_open_ex(stage_dir.encode(), int(use_hip), int(hip_device),
+                int(threads), int(cmgs), int(max_pos), int(speculative_tokens), err, len(err))
+        else:
+            self._s = lib.ds4f_serve_open(stage_dir.encode(), int(use_hip), int(hip_device),
+                                          int(threads), int(cmgs), int(max_pos), err, len(err))
         if not self._s:
             sys.exit("ds4f_serve_open failed: %s" % err.value.decode())
         self.lib = lib
+        self.speculative_tokens = int(speculative_tokens)
         if use_hip and hip_prefill[0]:
             if not hasattr(lib, "ds4f_serve_configure_hip_prefill"):
                 sys.exit("serving library lacks tuned HIP prefill support; rebuild it")
@@ -142,6 +156,15 @@ class Serve(object):
 
     def decode(self, token, pos):
         return self.lib.ds4f_serve_decode(self._s, int(token), int(pos))
+
+    def speculate(self, token, pos, limit):
+        nmax = min(self.speculative_tokens, int(limit))
+        out = (ctypes.c_int * nmax)()
+        conf = (ctypes.c_float * nmax)()
+        n = self.lib.ds4f_serve_speculate(self._s, int(token), int(pos), nmax, out, conf)
+        if n < 0:
+            raise RuntimeError("DSpark speculative step failed at %d" % pos)
+        return list(out[:n]), list(conf[:n])
 
     def sample(self, sp):
         return self.lib.ds4f_serve_sample(self._s, ctypes.byref(sp))
@@ -618,6 +641,23 @@ class CooperativeServer(object):
                     if tok < 0: raise RuntimeError("sampling failed")
                     if tok == self.sess.eos: return self.finish(job)
                     pos = self.sess.pos()
+                    greedy = (self.sess.speculative_tokens > 0 and
+                              job.sp.temperature == 0.0 and job.sp.top_p >= 1.0 and
+                              job.sp.top_k == 0 and job.sp.presence_penalty == 0.0 and
+                              job.sp.repeat_penalty in (0.0, 1.0))
+                    if greedy:
+                        room = min(job.max_new - len(job.out), self.sess.maxpos() - pos)
+                        toks, conf = self.sess.speculate(tok, pos, room)
+                        for i, accepted in enumerate(toks):
+                            if accepted == self.sess.eos: return self.finish(job)
+                            job.out.append(accepted)
+                            self.send(job, {"event": "token", "token": accepted,
+                                           "speculative": True,
+                                           "confidence": (conf[i] if i < len(conf) and conf[i] >= 0
+                                                          else None)})
+                        self.maybe_cache_hot_experts(job, decode_ready=True)
+                        if time.time() >= deadline: break
+                        continue
                     if self.sess.decode(tok, pos) < 0: raise RuntimeError("decode failed at %d" % pos)
                     job.out.append(tok); self.send(job, {"event": "token", "token": tok})
                     self.maybe_cache_hot_experts(job, decode_ready=True)
@@ -947,6 +987,8 @@ def main():
     ap.add_argument("--runner-timeout-sec", type=float, default=3600.0)
     ap.add_argument("--decode-quantum-tokens", type=int, default=4)
     ap.add_argument("--decode-batch-size", type=int, default=1)
+    ap.add_argument("--speculative-tokens", type=int, default=0,
+                    help="greedy DSpark block size (0 disables; checkpoint supports up to 5)")
     ap.add_argument("--scheduler-quantum-ms", type=int, default=250)
     args = ap.parse_args()
     try:
@@ -969,6 +1011,7 @@ def main():
                  threads=env_i("LLM_THREADS", 16),
                  cmgs=env_i("DS4F_CMGS", 1),
                  max_pos=env_i("DS4F_MAXPOS", 16384),
+                 speculative_tokens=args.speculative_tokens,
                  hip_prefill=(args.hip_prefill_tuned, args.hip_fused_shared_ffn,
                               args.hip_prefill_attn, args.hip_qkv_fuse,
                               args.hip_qkv_device_chain, args.hip_attn_device_chain,

@@ -367,6 +367,27 @@ typedef struct ds4f_layer {
     int      *sel_cache; int sel_cache_n, sel_cache_pos;
 } ds4f_layer;
 
+#define DS4F_DSPARK_STAGES 3
+#define DS4F_DSPARK_TARGET_LAYERS 3
+#define DS4F_DSPARK_TRAINED_BLOCK 5
+#define DS4F_DSPARK_DEFAULT_DRAFT DS4F_DSPARK_TRAINED_BLOCK
+
+/* DeepSeek-V4 DSpark is stored under the mtp.* namespace but is not the
+ * legacy autoregressive MTP block.  It is a three-block parallel drafter;
+ * stage 0 owns the target-hidden projection and stage 2 owns the output
+ * heads.  The transformer body is represented by ds4f_layer so it can reuse
+ * the exact MLA/mHC/MoE kernels. */
+typedef struct {
+    ds4f_layer layer;
+    ds4f_tensor main_proj;       /* stage 0: [hidden, 3*hidden] */
+    uint16_t *main_norm;         /* stage 0: [hidden] */
+    uint16_t *norm;              /* stage 2: [hidden] */
+    float *hc_head_fn, *hc_head_base, *hc_head_scale;
+    uint16_t *markov_w1;         /* stage 2: [vocab, markov_rank] */
+    uint16_t *markov_w2;         /* stage 2: [vocab, markov_rank] */
+    uint16_t *confidence_proj;   /* stage 2: [hidden+markov_rank] */
+} ds4f_dspark_stage;
+
 /* Batched concurrent decode (DS4F_DECODE_BATCH): the per-sequence DATA/STATE cache buffers for one
  * (sequence, layer). The batched forward swaps these into ds4f_layer per batch element so the tested
  * per-position attn/tb2/KV-append run unchanged. Weights (cmp_wkv, idx_wq_b, ...) are shared, never
@@ -504,11 +525,12 @@ typedef struct {
     int ep_rank, ep_size;
     ds4f_mem_pool *mem;                       /* owns all model-side allocations */
     ds4f_layer *layers;
-    /* DS4F_MTP: the multi-token-prediction module (config num_nextn_predict_layers=1, tensors mtp.0.*).
-     * A full transformer Block (reuses ds4f_layer: attn + MoE) + the MTP fusion:
-     *   x' = e_proj(enorm(embed(next_id))) + h_proj(hnorm(x));  block(x'); head -> logits.
-     * Scaffolded (load + forward stub); the draft/verify spec-decode loop is the follow-on. */
-    int       has_mtp;                         /* DS4F_MTP loaded */
+    /* Three-stage DSpark parallel drafter (checkpoint namespace mtp.0..2). */
+    int       has_mtp;                         /* complete DSpark bundle loaded */
+    int       dspark_n_stages, dspark_block_size, dspark_noise_token;
+    int       dspark_markov_rank;
+    int       dspark_target_layers[DS4F_DSPARK_TARGET_LAYERS];
+    ds4f_dspark_stage dspark[DS4F_DSPARK_STAGES];
     /* DS4F_DECODE_BATCH: when dec_batch_seq!=NULL, ds4f_forward_verify decodes dec_nseq INDEPENDENT
      * sequences (batch elem k at position dec_batch_pos[k], reading cache set dec_batch_seq[k*L+layer])
      * instead of K consecutive tokens of one sequence. Set 0 aliases the layers' own live buffers. */
@@ -516,10 +538,6 @@ typedef struct {
     int        dec_batch_cap;
     int       *dec_batch_pos;                  /* [dec_nseq] per-sequence positions (NULL = consecutive) */
     ds4f_lseq *dec_batch_seq;                  /* [dec_nseq * n_layers] cache sets (NULL = single-stream) */
-    ds4f_layer mtp;                            /* the MTP block (attn + MoE), like a main layer */
-    uint16_t *mtp_enorm, *mtp_hnorm, *mtp_norm;/* BF16 [hidden] RMSNorm weights (embed/hidden/final) */
-    ds4f_tensor mtp_e_proj, mtp_h_proj;        /* [hidden,hidden] dense fusion projections */
-    float    *mtp_hc_fn, *mtp_hc_base, *mtp_hc_scale;  /* MTP head's HC params */
     uint16_t *embed;        /* BF16 [vocab, hidden] (unused in synth decode) */
     ds4f_tensor head;       /* BF16 [vocab, hidden] (TP: only this node's vocab-shard rows) */
     int head_r0;            /* DS4F_TP_HEAD: global vocab offset of this node's head shard
@@ -753,6 +771,11 @@ typedef struct {
     float  *s_cp_cand_slot; /* [ep_size*index_topk] CP idx-merge: gathered candidate slots (as float) */
     float  *s_cp_cand_score;/* [ep_size*index_topk] CP idx-merge: gathered candidate scores */
     float  *v_x4, *v_resid; /* [K*hc_mult*hidden] M2b batched verify: the K positions' mHC states + residual */
+    /* DSpark consumes the mean mHC state after main-model layers 40..42.
+     * The single-token buffer is always available when DSpark is loaded;
+     * the tiled buffer is allocated with the verifier scratch. */
+    float *dspark_main_hidden, *dspark_tile_hidden;
+    int dspark_forward;      /* suppress recursive main-hidden capture while drafting */
     /* perf accounting (weight HBM bytes touched, reset per token by the runner) */
     size_t bytes_read;
     /* Optional routing telemetry, lazily allocated when DS4F_ROUTE_TELEMETRY=1.
