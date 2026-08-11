@@ -2290,7 +2290,8 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
         ly->gate = ds4f_new_tensor(m, m->bf16_mv_qt, cfg.n_experts, C); /* router matvec -> pv when enabled */
         ly->sh_w1 = ds4f_new_tensor(m, dq, m->sh_rows, C);       /* TP: col-shard shared_inter */
         ly->sh_w3 = ds4f_new_tensor(m, dq, m->sh_rows, C);
-        ly->sh_w2 = ds4f_new_tensor(m, dq, m->sh2_rows, cfg.shared_inter); /* TP_SHARED_FULL: hidden-row shard */
+        ly->sh_w2 = ds4f_new_tensor(m, dq, m->sh2_rows,
+            (m->sh_rows < cfg.shared_inter && m->sh2_rows == C) ? m->sh_rows : cfg.shared_inter);
         ly->ex_w1 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
         ly->ex_w2 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
         ly->ex_w3 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
@@ -3015,7 +3016,8 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
         if (L >= cfg.n_hash_layers) ly->gate_bias = (float *)aligned_alloc(64, (size_t)cfg.n_experts * 4);
         ly->sh_w1 = ds4f_new_tensor(m, dq, m->sh_rows, C);       /* TP: col-shard shared_inter */
         ly->sh_w3 = ds4f_new_tensor(m, dq, m->sh_rows, C);
-        ly->sh_w2 = ds4f_new_tensor(m, dq, m->sh2_rows, cfg.shared_inter); /* TP_SHARED_FULL: hidden-row shard */
+        ly->sh_w2 = ds4f_new_tensor(m, dq, m->sh2_rows,
+            (m->sh_rows < cfg.shared_inter && m->sh2_rows == C) ? m->sh_rows : cfg.shared_inter);
         ly->ex_w1 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
         ly->ex_w2 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
         ly->ex_w3 = (ds4f_tensor *)calloc(no, sizeof(ds4f_tensor));
@@ -3087,7 +3089,9 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
             ds4f_load_dense(m, &B, &ly->sh_w1,  DS4F_LN("ffn.shared_experts.w1"));
             ds4f_load_dense(m, &B, &ly->sh_w3,  DS4F_LN("ffn.shared_experts.w3"));
         }
-        if (m->sh2_rows < C)
+        if (ly->sh_w2.cols < cfg.shared_inter)
+            ds4f_load_dense_cshard(m, &B, &ly->sh_w2, DS4F_LN("ffn.shared_experts.w2"), m->sh_r0, cfg.shared_inter);
+        else if (m->sh2_rows < C)
             ds4f_load_dense_vshard(m, &B, &ly->sh_w2, DS4F_LN("ffn.shared_experts.w2"), m->sh2_r0, C);
         else ds4f_load_dense(m, &B, &ly->sh_w2, DS4F_LN("ffn.shared_experts.w2"));
         for (int s = 0; s < no; s++) {
@@ -5183,14 +5187,13 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         { DS4F_TIC();
         { ds4f_pf_rms_task t = { m, m->p_h2, m->p_x, ly->ffn_norm, C, M, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
-        /* TP_SHARED: sh_w1/w3 col-shard -> write the [sh_r0, sh_r0+sh_rows) columns of a zero-padded
-         * [M, shared_inter] buffer (Ystride=shared_inter); full sh_w2 over the zero-pad -> per-node
-         * PARTIAL p_moe, folded into the routed [M,C] reduce below (one reduce, like the decode path). */
-        if (tps) { memset(m->p_shg, 0, (size_t)M*c->shared_inter*4); memset(m->p_shu, 0, (size_t)M*c->shared_inter*4); }
-        ds4f_gemm(m, m->p_shg + m->sh_r0, &ly->sh_w1, m->p_h2, M, c->shared_inter, C);
-        ds4f_gemm(m, m->p_shu + m->sh_r0, &ly->sh_w3, m->p_h2, M, c->shared_inter, C);
-        { ds4f_pf_swiglu_task t = { m, m->p_shg, m->p_shu, c->shared_inter, M,
-                                    c->shared_inter, c->shared_inter, c->swiglu_limit };
+        /* With input-only TP_SHARED, keep the owned intermediate compact and
+         * feed it directly to the matching sh_w2 column shard. */
+        int shs=(tps&&!tps2)?m->sh_rows:c->shared_inter;
+        if (tps2) { memset(m->p_shg,0,(size_t)M*c->shared_inter*4); memset(m->p_shu,0,(size_t)M*c->shared_inter*4); }
+        ds4f_gemm(m,m->p_shg+(tps2?m->sh_r0:0),&ly->sh_w1,m->p_h2,M,shs,C);
+        ds4f_gemm(m,m->p_shu+(tps2?m->sh_r0:0),&ly->sh_w3,m->p_h2,M,shs,C);
+        { ds4f_pf_swiglu_task t = { m, m->p_shg, m->p_shu, shs, M, shs, shs, c->swiglu_limit };
           ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
         if (tps2) {
             ds4f_gemm(m, m->p_exO, &ly->sh_w2, m->p_shg, M, m->sh2_rows, c->shared_inter);
@@ -5200,7 +5203,7 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
                 memcpy(mo + m->sh2_r0, m->p_exO + (size_t)mm*m->sh2_rows,
                        (size_t)m->sh2_rows * sizeof(float));
             }
-        } else ds4f_gemm(m, m->p_moe, &ly->sh_w2, m->p_shg, M, C, c->shared_inter);   /* partial if tps */
+        } else ds4f_gemm(m,m->p_moe,&ly->sh_w2,m->p_shg,M,C,shs);   /* partial if tps */
         DS4F_TOC(DS4F_P_SHARED); }
         /* ---- FFN: router ---- */
         { DS4F_TIC();
@@ -5488,16 +5491,14 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         int tps = (m->sh_rows < c->shared_inter);
         int tps2 = tps && (m->sh2_rows < C);
         tv = ds4f_prof_on ? ds4f_now() : 0.0;
-        if (tps) {
+        if (tps2) {
             memset(m->p_shg, 0, (size_t)K * c->shared_inter * sizeof(float));
             memset(m->p_shu, 0, (size_t)K * c->shared_inter * sizeof(float));
         }
-        ds4f_gemm(m, m->p_shg + (tps ? m->sh_r0 : 0), &ly->sh_w1,
-                  m->p_h2, K, c->shared_inter, C);
-        ds4f_gemm(m, m->p_shu + (tps ? m->sh_r0 : 0), &ly->sh_w3,
-                  m->p_h2, K, c->shared_inter, C);
-        { ds4f_pf_swiglu_task t = { m, m->p_shg, m->p_shu, c->shared_inter, K,
-                                    c->shared_inter, c->shared_inter, c->swiglu_limit };
+        int shs=(tps&&!tps2)?m->sh_rows:c->shared_inter;
+        ds4f_gemm(m,m->p_shg+(tps2?m->sh_r0:0),&ly->sh_w1,m->p_h2,K,shs,C);
+        ds4f_gemm(m,m->p_shu+(tps2?m->sh_r0:0),&ly->sh_w3,m->p_h2,K,shs,C);
+        { ds4f_pf_swiglu_task t = { m, m->p_shg, m->p_shu, shs, K, shs, shs, c->swiglu_limit };
           ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
         if (tps2) {
             ds4f_gemm(m, m->p_exO, &ly->sh_w2, m->p_shg, K, m->sh2_rows, c->shared_inter);
@@ -5507,7 +5508,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                 memcpy(mo + m->sh2_r0, m->p_exO + (size_t)k*m->sh2_rows,
                        (size_t)m->sh2_rows * sizeof(float));
             }
-        } else ds4f_gemm(m, m->p_moe, &ly->sh_w2, m->p_shg, K, C, c->shared_inter);
+        } else ds4f_gemm(m,m->p_moe,&ly->sh_w2,m->p_shg,K,C,shs);
         if (ds4f_prof_on) m->prof[DS4F_P_SHARED] += ds4f_now()-tv;
         /* router + routed experts (bucketed batched GEMM, reuse the prefill scheme) */
         tv = ds4f_prof_on ? ds4f_now() : 0.0;
