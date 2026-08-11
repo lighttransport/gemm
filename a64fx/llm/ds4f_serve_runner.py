@@ -130,28 +130,44 @@ class Serve(object):
 
     def context_export(self):
         n = self.lib.ds4f_serve_context_bytes(self._s)
-        buf = ctypes.create_string_buffer(n)
+        blob = bytearray(n)
+        buf = (ctypes.c_char * n).from_buffer(blob)
         if not n or self.lib.ds4f_serve_context_export(self._s, buf, n) != 0:
             raise RuntimeError("context export failed")
-        return buf.raw
+        return blob
 
     def context_import(self, blob):
-        buf = ctypes.create_string_buffer(blob, len(blob))
+        if isinstance(blob, bytearray):
+            buf = (ctypes.c_char * len(blob)).from_buffer(blob)
+        else:
+            buf = ctypes.create_string_buffer(blob, len(blob))
         return self.lib.ds4f_serve_context_import(self._s, buf, len(blob))
 
     def decode_batch(self, blobs, tokens):
         n = len(blobs)
-        ib = [ctypes.create_string_buffer(b, len(b)) for b in blobs]
-        ob = [ctypes.create_string_buffer(len(b) + 4096) for b in blobs]
-        ia = (ctypes.c_void_p * n)(*[ctypes.addressof(b) for b in ib])
-        oa = (ctypes.c_void_p * n)(*[ctypes.addressof(b) for b in ob])
-        il = (ctypes.c_size_t * n)(*[len(b) for b in blobs])
-        oc = (ctypes.c_size_t * n)(*[len(b) + 4096 for b in blobs])
+        # Context images are hundreds of MiB at an 8K window. Keep one mutable
+        # image per job and let the native batch call update it in place. The
+        # previous input-buffer + output-buffer scheme temporarily tripled the
+        # live context memory and copied every image twice per generated token.
+        work = [b if isinstance(b, bytearray) else bytearray(b) for b in blobs]
+        ilen = [len(b) for b in work]
+        # A compact v2 image grows by one KV row per layer plus one history
+        # token. One MiB covers the current model with ample format headroom.
+        for b in work: b.extend(b"\0" * (1 << 20))
+        views = [(ctypes.c_char * len(b)).from_buffer(b) for b in work]
+        ia = (ctypes.c_void_p * n)(*[ctypes.addressof(v) for v in views])
+        oa = (ctypes.c_void_p * n)(*[ctypes.addressof(v) for v in views])
+        il = (ctypes.c_size_t * n)(*ilen)
+        oc = (ctypes.c_size_t * n)(*[len(b) for b in work])
         ol = (ctypes.c_size_t * n)()
         ta = (ctypes.c_int * n)(*tokens)
         rc = self.lib.ds4f_serve_decode_batch(self._s, ta, n, ia, il, oa, oc, ol)
         if rc != 0: raise RuntimeError("batched decode failed rc=%d" % rc)
-        return [ob[k].raw[:ol[k]] for k in range(n)]
+        del views
+        for k, b in enumerate(work):
+            if ol[k] > len(b): raise RuntimeError("batched decode returned oversized context")
+            del b[ol[k]:]
+        return work
 
     def reserve_decode_batch(self, capacity):
         return self.lib.ds4f_serve_decode_batch_reserve(self._s, int(capacity))

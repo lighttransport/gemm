@@ -490,13 +490,23 @@ static size_t context_kv_bytes(const ds4f_model *m) {
     return n;
 }
 
+static size_t context_kv_bytes_at(const ds4f_model *m, size_t pos) {
+    size_t n = 0;
+    for (int L = 0; L < m->cfg.n_layers; ++L) {
+        size_t rows = pos < (size_t)m->layers[L].kv_slots
+                    ? pos : (size_t)m->layers[L].kv_slots;
+        n += rows * (size_t)m->cfg.kv_lora * 2;
+    }
+    return n;
+}
+
 /* Complete, process-local context image used by the cooperative server.  In
  * contrast to the legacy prefix file this also carries logits and sampler
  * state, so a decode can be paused between tokens and resumed bit-exactly. */
 size_t ds4f_serve_context_bytes(ds4f_serve *s) {
     if (!s || !s->m) return 0;
     size_t snap = s->m->tierb2 ? ds4f_tb2_snap_bytes(s->m) : 0;
-    return sizeof(ds4f_context_header) + context_kv_bytes(s->m) + snap +
+    return sizeof(ds4f_context_header) + context_kv_bytes_at(s->m, (size_t)s->pos) + snap +
            (size_t)s->vocab * sizeof(float) + (size_t)s->n_hist * sizeof(int);
 }
 
@@ -504,10 +514,10 @@ int ds4f_serve_context_export(ds4f_serve *s, void *dst, size_t cap) {
     size_t need = ds4f_serve_context_bytes(s);
     if (!s || !s->m || !dst || cap < need) return -1;
     ds4f_model *m = s->m;
-    size_t kvb = context_kv_bytes(m);
+    size_t kvb = context_kv_bytes_at(m, (size_t)s->pos);
     size_t snap = m->tierb2 ? ds4f_tb2_snap_bytes(m) : 0;
     ds4f_context_header h = {
-        DS4F_CONTEXT_MAGIC, 1, (uint32_t)sizeof(ds4f_context_header),
+        DS4F_CONTEXT_MAGIC, 2, (uint32_t)sizeof(ds4f_context_header),
         (uint32_t)m->cfg.max_pos, (uint32_t)m->cfg.n_layers,
         (uint32_t)m->cfg.kv_lora, (uint32_t)s->vocab,
         (uint32_t)s->pos, (uint32_t)s->n_hist, s->rng, kvb, snap,
@@ -516,7 +526,9 @@ int ds4f_serve_context_export(ds4f_serve *s, void *dst, size_t cap) {
     unsigned char *p = (unsigned char *)dst;
     memcpy(p, &h, sizeof(h)); p += sizeof(h);
     for (int L = 0; L < m->cfg.n_layers; ++L) {
-        size_t n = (size_t)m->layers[L].kv_slots * (size_t)m->cfg.kv_lora * 2;
+        size_t rows = (size_t)s->pos < (size_t)m->layers[L].kv_slots
+                    ? (size_t)s->pos : (size_t)m->layers[L].kv_slots;
+        size_t n = rows * (size_t)m->cfg.kv_lora * 2;
         memcpy(p, m->layers[L].kv_cache, n); p += n;
     }
     if (snap) { ds4f_tb2_snap(m, p, 0); p += snap; }
@@ -531,11 +543,12 @@ int ds4f_serve_context_import(ds4f_serve *s, const void *src, size_t len) {
     ds4f_context_header h;
     memcpy(&h, src, sizeof(h));
     ds4f_model *m = s->m;
-    size_t kvb = context_kv_bytes(m);
+    size_t kvb = h.version == 1 ? context_kv_bytes(m)
+                                : context_kv_bytes_at(m, (size_t)h.pos);
     size_t snap = m->tierb2 ? ds4f_tb2_snap_bytes(m) : 0;
     size_t need = sizeof(h) + kvb + snap + (size_t)s->vocab * sizeof(float) +
                   (size_t)h.n_hist * sizeof(int);
-    if (h.magic != DS4F_CONTEXT_MAGIC || h.version != 1 ||
+    if (h.magic != DS4F_CONTEXT_MAGIC || (h.version != 1 && h.version != 2) ||
         h.header_bytes != sizeof(h) || h.max_pos != (uint32_t)m->cfg.max_pos ||
         h.n_layers != (uint32_t)m->cfg.n_layers ||
         h.kv_lora != (uint32_t)m->cfg.kv_lora || h.vocab != (uint32_t)s->vocab ||
@@ -549,7 +562,10 @@ int ds4f_serve_context_import(ds4f_serve *s, const void *src, size_t len) {
     }
     const unsigned char *p = (const unsigned char *)src + sizeof(h);
     for (int L = 0; L < m->cfg.n_layers; ++L) {
-        size_t n = (size_t)m->layers[L].kv_slots * (size_t)m->cfg.kv_lora * 2;
+        size_t rows = h.version == 1 ? (size_t)m->layers[L].kv_slots
+                    : ((size_t)h.pos < (size_t)m->layers[L].kv_slots
+                       ? (size_t)h.pos : (size_t)m->layers[L].kv_slots);
+        size_t n = rows * (size_t)m->cfg.kv_lora * 2;
         memcpy(m->layers[L].kv_cache, p, n); p += n;
     }
     if (snap) { ds4f_tb2_snap(m, (void *)p, 1); p += snap; }

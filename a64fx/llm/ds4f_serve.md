@@ -88,6 +88,10 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   `--context-memory-mb`, `--context-disk-mb`, `--prefill-quantum-tokens`,
   `--decode-quantum-tokens`, and `--scheduler-quantum-ms`. These are program
   arguments, not production tuning environment variables.
+- In-memory and spilled version-2 context images store only populated KV rows;
+  version-1 full-capacity images remain import-compatible. Batched decode also
+  updates mutable context images in place, avoiding duplicate input/output
+  images on every generated token.
 - `--decode-batch-size N` enables native multi-context decode batching. It
   batches dense, shared/routed-FFN, and head work while retaining independent
   KV/Tier-B2 cache sets per row. Default is `1` because the current RX 9070 XT
