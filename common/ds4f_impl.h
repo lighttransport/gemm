@@ -4758,6 +4758,30 @@ static void ds4f_hcpost_b_worker(void *arg, int tid, int nthr) {
         for (int kk=0;kk<T->hc;kk++) { float v=post[kk]*f[d]; for (int j=0;j<T->hc;j++) v+=comb[j*T->hc+kk]*res[(size_t)j*T->C+d]; x4[(size_t)kk*T->C+d]=v; }
     }
 }
+#if defined(__ARM_FEATURE_SVE)
+/* Vectorize across the contiguous hidden dimension.  hc is tiny (4 in the
+ * production model), so keeping one output vector live preserves the scalar
+ * j accumulation order while avoiding a divide/modulo and four strided scalar
+ * streams for every element. */
+static void ds4f_hcpost_b_sve_worker(void *arg, int tid, int nthr) {
+    ds4f_hcpost_b_task *T=(ds4f_hcpost_b_task *)arg;
+    int vl=(int)svcntw(), nb=(T->C+vl-1)/vl; size_t hcC=(size_t)T->hc*T->C;
+    long tot=(long)T->K*nb, per=tot/nthr, ex=tot%nthr;
+    long u0=per*tid+(tid<ex?tid:ex),u1=u0+per+(tid<ex?1:0);
+    for(long u=u0;u<u1;u++){
+        int k=(int)(u/nb),d=(int)(u%nb)*vl;
+        svbool_t pg=svwhilelt_b32(d,T->C);
+        float *x4=T->x4b+(size_t)k*hcC;const float *res=T->residb+(size_t)k*hcC;
+        const float *f=T->fb+(size_t)k*T->C,*post=T->postb+(size_t)k*T->pstr,*comb=T->combb+(size_t)k*T->cstr;
+        svfloat32_t fv=svld1_f32(pg,f+d);
+        for(int kk=0;kk<T->hc;kk++){
+            svfloat32_t v=svmul_x(pg,fv,svdup_f32(post[kk]));
+            for(int j=0;j<T->hc;j++)v=svmla_x(pg,v,svld1_f32(pg,res+(size_t)j*T->C+d),svdup_f32(comb[j*T->hc+kk]));
+            svst1_f32(pg,x4+(size_t)kk*T->C+d,v);
+        }
+    }
+}
+#endif
 static void ds4f_hc_pre_batch(ds4f_model *m, const float *x4b, int K, const float *fn,
                               const float *scale, const float *base, float *yb,
                               float *postb, int pstr, float *combb, int cstr, float *residb) {
@@ -4786,6 +4810,10 @@ static void ds4f_hc_pre_batch(ds4f_model *m, const float *x4b, int K, const floa
 static void ds4f_hc_post_batch(ds4f_model *m, float *x4b, int K, const float *residb, const float *fb,
                                const float *postb, int pstr, const float *combb, int cstr) {
     ds4f_hcpost_b_task pt={x4b,residb,fb,postb,combb,m->cfg.hc_mult,m->cfg.hidden,K,pstr,cstr};
+#if defined(__ARM_FEATURE_SVE)
+    static int s_hcpost_sve=-1;if(s_hcpost_sve<0){const char *e=getenv("DS4F_HCPOST_SVE");s_hcpost_sve=e?atoi(e):1;}
+    if(s_hcpost_sve){ds4f_pool_run(m->pool,ds4f_hcpost_b_sve_worker,&pt);return;}
+#endif
     ds4f_pool_run(m->pool,ds4f_hcpost_b_worker,&pt);
 }
 
