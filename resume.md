@@ -338,6 +338,20 @@ Baseline with the attention-vectorization fix already in place but no other chan
 
 **Current decode state: ~5.5 tok/s, still ~3.3x short of the 18 tok/s target.** Both cheap real fixes found this round (attention vectorization inherited from the prefill work, plus MV_FUSE) are committed. Remaining cost is dominated by `exp_cpu` (CPU fallback for the ~53% of expert accesses the hot-expert cache doesn't cover) — already established in the earlier decode-cache investigation (see "Decode does not use the routed-FFN path we optimized" and "Cache budget is not the limiter" above) that raising this coverage needs an online/adaptive cache, not a budget or prompt-length change. That remains the concrete next step for decode, same conclusion as before, now re-confirmed after the two new fixes.
 
+## Adaptive hot-expert cache: built, safe, but net-neutral (2026-08-12)
+
+User explicitly authorized building the periodic batched re-admission design after being warned that a naive per-token on-demand swap would regress decode (a single fresh expert upload costs ~3.4ms vs ~0.16ms for an already-resident matvec at M=1 — upload latency isn't amortized over any batch for a single decode token).
+
+**Implementation** (commit a6ecc5ea): `hip_ds4f_dense_refresh_hot_experts` (hetero/ds4f/hip_ds4f_dense.c) re-ranks experts by a caller-supplied recent-window hit delta, evicts residents that fall out of the new top set, admits newly-hot ones into the freed budget — reusing the exact same `release_matrix`/`hip_ds4f_dense_bind_mxfp4_tensor` paths the existing one-shot post-prefill cache already uses (already proven correct by every quality gate run this session). Wired into `ds4f_serve_decode` (a64fx/llm/ds4f_serve_lib.c) via a snapshot/delta of the existing cumulative `route_hits` counter, so the per-token routing hot path itself is untouched. Refresh only runs after `decode()` returns (GPU work for that token already complete), so eviction can never race an in-flight kernel. Off by default (`DS4F_ADAPTIVE_CACHE_PERIOD=0`).
+
+**Tuning found a real failure mode worth remembering**: period=8 (refresh every 8 decode tokens) was too frequent — each layer only sees ~48 routing samples per window, far too noisy to produce a stable top-K ranking, causing destructive churn (up to 310 fresh expert uploads every 8 tokens) that dropped decode to 4.13 tok/s, worse than no adaptive cache at all. **Do not use a short period.**
+
+**At period=64 over a realistic 200-decode-token run, the mechanism is stable and has a real, measurable effect, but nets to zero throughput change**: `exp_cpu` dropped 14.06→11.44s (-19%, genuine work shifted from CPU to GPU) and `exp_gpu` rose 3.44→5.33s (+55%), but total decode throughput was 5.174 vs 5.173 tok/s baseline — statistically identical. The refresh's own upload cost (155-224 experts churned per cycle, several GB at a time) almost exactly offsets the CPU time it saves. Verified: no crash, no VRAM leak, no orphan process across 3 real eviction/re-admission cycles at this longer scale.
+
+**Left in the tree as opt-in** (inert by default, zero risk to existing behavior) rather than reverted, since this session's only available test scenario is a synthetic repeated-prompt decode where the static post-prefill cache already captures most of the achievable coverage — a real, long, topically-shifting conversation might show a different (better) result, but that can't be validated in this environment. Do not enable by default without re-testing on a more representative workload first.
+
+**Decode remains at ~5.2-5.5 tok/s, still ~3.3x short of the 18 tok/s target.** With this result, every readily-available lever for decode (short of a genuinely different cache eviction policy, a much smarter admission heuristic, or the same GPU tier-B2 attention kernel identified for prefill) has now been tried and measured, not just theorized about.
+
 ## Useful benchmark
 
 ```sh
