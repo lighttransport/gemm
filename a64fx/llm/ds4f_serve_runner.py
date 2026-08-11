@@ -83,6 +83,22 @@ def load_lib(path):
     lib.ds4f_serve_decode_batch.restype = ctypes.c_int
     lib.ds4f_serve_decode_batch_reserve.argtypes = [ctypes.c_void_p, ctypes.c_int]
     lib.ds4f_serve_decode_batch_reserve.restype = ctypes.c_int
+    lib.ds4f_serve_slot_import.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                           ctypes.c_void_p, ctypes.c_size_t]
+    lib.ds4f_serve_slot_import.restype = ctypes.c_int
+    lib.ds4f_serve_slot_context_bytes.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.ds4f_serve_slot_context_bytes.restype = ctypes.c_size_t
+    lib.ds4f_serve_slot_export.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                           ctypes.c_void_p, ctypes.c_size_t]
+    lib.ds4f_serve_slot_export.restype = ctypes.c_int
+    lib.ds4f_serve_slot_sample.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                           ctypes.POINTER(Sampling)]
+    lib.ds4f_serve_slot_sample.restype = ctypes.c_int
+    lib.ds4f_serve_slot_release.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.ds4f_serve_slot_release.restype = ctypes.c_int
+    lib.ds4f_serve_decode_slots.argtypes = [ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+    lib.ds4f_serve_decode_slots.restype = ctypes.c_int
     return lib
 
 
@@ -172,6 +188,31 @@ class Serve(object):
     def reserve_decode_batch(self, capacity):
         return self.lib.ds4f_serve_decode_batch_reserve(self._s, int(capacity))
 
+    def slot_import(self, slot, blob):
+        if isinstance(blob, bytearray):
+            buf = (ctypes.c_char * len(blob)).from_buffer(blob)
+        else:
+            buf = ctypes.create_string_buffer(blob, len(blob))
+        return self.lib.ds4f_serve_slot_import(self._s, slot, buf, len(blob))
+
+    def slot_export(self, slot):
+        n = self.lib.ds4f_serve_slot_context_bytes(self._s, slot)
+        blob = bytearray(n); buf = (ctypes.c_char * n).from_buffer(blob)
+        if not n or self.lib.ds4f_serve_slot_export(self._s, slot, buf, n) != 0:
+            raise RuntimeError("slot export failed")
+        return blob
+
+    def slot_sample(self, slot, sp):
+        return self.lib.ds4f_serve_slot_sample(self._s, slot, ctypes.byref(sp))
+
+    def slot_release(self, slot):
+        return self.lib.ds4f_serve_slot_release(self._s, slot)
+
+    def decode_slots(self, slots, tokens):
+        n = len(slots)
+        sa = (ctypes.c_int * n)(*slots); ta = (ctypes.c_int * n)(*tokens)
+        return self.lib.ds4f_serve_decode_slots(self._s, sa, ta, n)
+
 
 def env_i(k, d):
     return int(os.environ.get(k, d))
@@ -223,6 +264,7 @@ class Job(object):
         self.prefill_started = self.started
         self.decode_started = None
         self.cancelled = False
+        self.slot = -1
 
 
 class CooperativeServer(object):
@@ -239,6 +281,7 @@ class CooperativeServer(object):
         self.batch_steps = self.batch_sequences = 0
         if self.decode_batch_size > 1 and self.sess.reserve_decode_batch(self.decode_batch_size) != 0:
             raise RuntimeError("native decode batch reservation failed")
+        self.free_slots = list(range(self.decode_batch_size)) if self.decode_batch_size > 1 else []
         self.quantum_s = max(0.001, quantum_ms / 1000.0)
         self.contexts, self.jobs, self.current = {}, [], None
         os.makedirs(context_dir, mode=0o700, exist_ok=True)
@@ -409,6 +452,13 @@ class CooperativeServer(object):
 
     def finish(self, job, error=None):
         ctx = self.contexts[job.context_id]
+        if job.slot >= 0:
+            try:
+                job.working = self.sess.slot_export(job.slot)
+            except Exception as exc:
+                if error is None: error = exc
+            self.sess.slot_release(job.slot); self.free_slots.append(job.slot)
+            job.slot = -1; self.current = None
         if not job.cancelled and error is None:
             ctx.blob = job.working if job.working is not None and self.current is not job \
                        else self.sess.context_export()
@@ -461,47 +511,44 @@ class CooperativeServer(object):
             self.finish(job, exc)
 
     def step_decode_batch(self, batch):
-        ready, tokens, blobs = [], [], []
+        ready, tokens, slots = [], [], []
         try:
             # Sampling remains per-context (temperature/history/RNG), then the
             # expensive transformer forward is shared across the group.
             for job in batch:
-                self.activate(job)
-                if job.cancelled or len(job.out) >= job.max_new or self.sess.pos() >= self.sess.maxpos():
+                if job.slot < 0:
+                    self.activate(job)
+                    blob = self.sess.context_export()
+                    if not self.free_slots: raise RuntimeError("no native decode slot available")
+                    job.slot = self.free_slots.pop(0)
+                    if self.sess.slot_import(job.slot, blob) != 0:
+                        self.free_slots.append(job.slot); job.slot = -1
+                        raise RuntimeError("native decode slot import failed")
+                    job.working = None; self.current = None
+                if job.cancelled or len(job.out) >= job.max_new or \
+                        len(job.prompt) + len(job.out) >= self.sess.maxpos():
                     self.finish(job); continue
-                tok = self.sess.sample(job.sp)
+                tok = self.sess.slot_sample(job.slot, job.sp)
                 if tok < 0: raise RuntimeError("sampling failed")
                 if tok == self.sess.eos: self.finish(job); continue
-                job.working = self.sess.context_export()
-                ready.append(job); tokens.append(tok); blobs.append(job.working)
-                self.current = None
-            if len(ready) < 2:
-                for job, tok in zip(ready, tokens):
-                    if self.sess.context_import(job.working) != 0:
-                        raise RuntimeError("single decode restore failed")
-                    pos = self.sess.pos()
-                    if self.sess.decode(tok, pos) < 0:
-                        raise RuntimeError("decode failed at %d" % pos)
-                    job.working = self.sess.context_export(); job.out.append(tok)
-                    self.current = None
-                    self.send(job, {"event": "token", "token": tok, "batch": 1})
-                    if job.cancelled or len(job.out) >= job.max_new: self.finish(job)
-                return
-            updated = self.sess.decode_batch(blobs, tokens)
+                ready.append(job); tokens.append(tok); slots.append(job.slot)
+            if not ready: return
+            if self.sess.decode_slots(slots, tokens) != 0:
+                raise RuntimeError("native slot decode failed")
             self.batch_steps += 1; self.batch_sequences += len(ready)
             if self.batch_steps == 1 or (self.batch_steps % 32) == 0:
                 print("[runner] decode_batch steps=%d last_n=%d sequences=%d" %
                       (self.batch_steps, len(ready), self.batch_sequences),
                       file=sys.stderr, flush=True)
             self.current = None
-            for job, tok, blob in zip(ready, tokens, updated):
-                job.working = blob; job.out.append(tok)
+            for job, tok in zip(ready, tokens):
+                job.out.append(tok)
                 self.send(job, {"event": "token", "token": tok, "batch": len(ready)})
                 if job.cancelled or len(job.out) >= job.max_new:
                     self.finish(job)
         except Exception as exc:
             self.current = None
-            for job in ready:
+            for job in batch:
                 if job in self.jobs: self.finish(job, exc)
 
     def run(self):
@@ -516,7 +563,8 @@ class CooperativeServer(object):
                 if (self.decode_batch_size > 1 and admitting and
                         len(self.jobs) <= self.decode_batch_size):
                     job = admitting[0]; self.jobs.remove(job); self.jobs.append(job); self.step(job)
-                elif len(decode) >= 2 and self.decode_batch_size > 1:
+                elif (decode and self.decode_batch_size > 1 and
+                      (len(decode) >= 2 or decode[0].slot >= 0)):
                     self.step_decode_batch(decode[:self.decode_batch_size])
                 elif self.jobs:
                     job = self.jobs.pop(0); self.jobs.append(job); self.step(job)

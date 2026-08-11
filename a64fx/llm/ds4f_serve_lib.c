@@ -54,6 +54,12 @@ typedef struct ds4f_serve {
     int prefill_tile;  /* logical request tile, clamped to kernel capacity */
     float *prefill_x;  /* [prefill_tile, hidden] embedding slab */
     int *prefill_tok;  /* [prefill_tile] argmax scratch */
+    int slot_cap;
+    unsigned char *slot_used;
+    int *slot_pos, *slot_n_hist, *slot_hist_cap;
+    uint64_t *slot_rng;
+    int **slot_hist;
+    float *slot_logits;
 #if defined(DS4F_SERVE_HIP)
     hip_ds4f_dense *hip;
 #endif
@@ -63,6 +69,7 @@ void ds4f_serve_close(ds4f_serve *s);
 size_t ds4f_serve_context_bytes(ds4f_serve *s);
 int ds4f_serve_context_export(ds4f_serve *s, void *dst, size_t cap);
 int ds4f_serve_context_import(ds4f_serve *s, const void *src, size_t len);
+int ds4f_serve_sample(ds4f_serve *s, const ds4f_serve_sampling *sp);
 
 static int env_i(const char *k, int d) { const char *e = getenv(k); return e && *e ? atoi(e) : d; }
 
@@ -225,6 +232,10 @@ void ds4f_serve_close(ds4f_serve *s) {
 #if defined(DS4F_SERVE_HIP)
     if (s->hip) hip_ds4f_dense_destroy(s->hip);
 #endif
+    if (s->slot_hist) for (int i = 0; i < s->slot_cap; ++i) free(s->slot_hist[i]);
+    free(s->slot_used); free(s->slot_pos); free(s->slot_n_hist);
+    free(s->slot_hist_cap); free(s->slot_rng); free(s->slot_hist);
+    free(s->slot_logits);
     if (s->m) ds4f_free_decode_batch(s->m);
     if (s->m) ds4f_free(s->m);
     free(s->hist);
@@ -373,9 +384,148 @@ done:
 
 int ds4f_serve_decode_batch_reserve(ds4f_serve *s, int capacity) {
     if (!s || !s->m || capacity < 2 || capacity > s->prefill_tile) return -1;
-    int rc = ds4f_alloc_decode_batch(s->m, capacity);
+    /* Cache set zero remains the cooperative runner's prefill/import working
+     * context. Persistent decode slots use sets [1, capacity], so admitting a
+     * new prompt cannot overwrite an already-active slot. */
+    int rc = ds4f_alloc_decode_batch(s->m, capacity + 1);
+    if (rc == 0 && !s->slot_cap) {
+        s->slot_used = (unsigned char *)calloc((size_t)capacity, 1);
+        s->slot_pos = (int *)calloc((size_t)capacity, sizeof(int));
+        s->slot_n_hist = (int *)calloc((size_t)capacity, sizeof(int));
+        s->slot_hist_cap = (int *)calloc((size_t)capacity, sizeof(int));
+        s->slot_rng = (uint64_t *)calloc((size_t)capacity, sizeof(uint64_t));
+        s->slot_hist = (int **)calloc((size_t)capacity, sizeof(int *));
+        s->slot_logits = (float *)malloc((size_t)capacity * (size_t)s->vocab * sizeof(float));
+        if (!s->slot_used || !s->slot_pos || !s->slot_n_hist || !s->slot_hist_cap ||
+            !s->slot_rng || !s->slot_hist || !s->slot_logits) rc = -1;
+        else s->slot_cap = capacity;
+    }
     if (rc == 0) s->m->dec_nseq = 0;
     return rc;
+}
+
+static int serve_slot_meta_store(ds4f_serve *s, int slot) {
+    if (slot < 0 || slot >= s->slot_cap) return -1;
+    if (s->slot_hist_cap[slot] < s->n_hist) {
+        int *p = (int *)realloc(s->slot_hist[slot], (size_t)s->n_hist * sizeof(int));
+        if (!p && s->n_hist) return -1;
+        s->slot_hist[slot] = p; s->slot_hist_cap[slot] = s->n_hist;
+    }
+    s->slot_pos[slot] = s->pos; s->slot_rng[slot] = s->rng;
+    s->slot_n_hist[slot] = s->n_hist;
+    if (s->n_hist) memcpy(s->slot_hist[slot], s->hist, (size_t)s->n_hist * sizeof(int));
+    memcpy(s->slot_logits + (size_t)slot*s->vocab, s->logits,
+           (size_t)s->vocab * sizeof(float));
+    s->slot_used[slot] = 1;
+    return 0;
+}
+
+static int serve_slot_meta_load(ds4f_serve *s, int slot) {
+    if (slot < 0 || slot >= s->slot_cap || !s->slot_used[slot]) return -1;
+    int n = s->slot_n_hist[slot];
+    if (s->hist_cap < n) {
+        int *p = (int *)realloc(s->hist, (size_t)n * sizeof(int));
+        if (!p && n) return -1;
+        s->hist = p; s->hist_cap = n;
+    }
+    s->pos = s->slot_pos[slot]; s->rng = s->slot_rng[slot]; s->n_hist = n;
+    if (n) memcpy(s->hist, s->slot_hist[slot], (size_t)n * sizeof(int));
+    memcpy(s->logits, s->slot_logits + (size_t)slot*s->vocab,
+           (size_t)s->vocab * sizeof(float));
+    return 0;
+}
+
+static void serve_slot_apply(ds4f_serve *s, int slot) {
+    for (int L = 0; L < s->m->cfg.n_layers; ++L)
+        ds4f_lseq_apply(&s->m->layers[L],
+            &s->m->dec_batch_seq[(size_t)(slot + 1)*s->m->cfg.n_layers + L]);
+}
+
+int ds4f_serve_slot_import(ds4f_serve *s, int slot, const void *src, size_t len) {
+    if (!s || slot < 0 || slot >= s->slot_cap) return -1;
+    serve_slot_apply(s, slot);
+    int rc = ds4f_serve_context_import(s, src, len);
+    if (rc == 0) rc = serve_slot_meta_store(s, slot);
+    for (int L = 0; L < s->m->cfg.n_layers; ++L)
+        ds4f_lseq_apply(&s->m->layers[L], &s->m->dec_batch_seq[L]);
+    s->m->dec_nseq = 0;
+    return rc;
+}
+
+size_t ds4f_serve_slot_context_bytes(ds4f_serve *s, int slot) {
+    if (serve_slot_meta_load(s, slot) != 0) return 0;
+    return ds4f_serve_context_bytes(s);
+}
+
+int ds4f_serve_slot_export(ds4f_serve *s, int slot, void *dst, size_t cap) {
+    if (!s || serve_slot_meta_load(s, slot) != 0) return -1;
+    serve_slot_apply(s, slot);
+    int rc = ds4f_serve_context_export(s, dst, cap);
+    for (int L = 0; L < s->m->cfg.n_layers; ++L)
+        ds4f_lseq_apply(&s->m->layers[L], &s->m->dec_batch_seq[L]);
+    s->m->dec_nseq = 0;
+    return rc;
+}
+
+int ds4f_serve_slot_sample(ds4f_serve *s, int slot, const ds4f_serve_sampling *sp) {
+    if (serve_slot_meta_load(s, slot) != 0) return -1;
+    int tok = ds4f_serve_sample(s, sp);
+    s->slot_rng[slot] = s->rng;
+    return tok;
+}
+
+int ds4f_serve_slot_release(ds4f_serve *s, int slot) {
+    if (!s || slot < 0 || slot >= s->slot_cap) return -1;
+    s->slot_used[slot] = 0; s->slot_n_hist[slot] = 0;
+    return 0;
+}
+
+int ds4f_serve_decode_slots(ds4f_serve *s, const int *slots,
+                            const int *tokens, int n) {
+    if (!s || !slots || !tokens || n < 1 || n > s->slot_cap) return -1;
+    ds4f_model *m = s->m; int NL = m->cfg.n_layers;
+    int cache_cap = s->slot_cap + 1;
+    ds4f_lseq *saved = (ds4f_lseq *)malloc((size_t)cache_cap*NL*sizeof(*saved));
+    if (!saved) return -1;
+    memcpy(saved, m->dec_batch_seq, (size_t)cache_cap*NL*sizeof(*saved));
+    for (int k = 0; k < n; ++k) {
+        int q = slots[k];
+        if (q < 0 || q >= s->slot_cap || !s->slot_used[q] ||
+            tokens[k] < 0 || tokens[k] >= s->vocab) {
+            memcpy(m->dec_batch_seq, saved, (size_t)cache_cap*NL*sizeof(*saved));
+            free(saved); return -1;
+        }
+        memcpy(m->dec_batch_seq + (size_t)k*NL,
+               saved + (size_t)(q + 1)*NL, (size_t)NL*sizeof(*saved));
+        m->dec_batch_pos[k] = s->slot_pos[q];
+        if (embed_lookup(m, tokens[k], s->prefill_x + (size_t)k*s->hidden) != 0) {
+            memcpy(m->dec_batch_seq, saved, (size_t)cache_cap*NL*sizeof(*saved)); free(saved); return -1;
+        }
+    }
+    m->dec_nseq = n;
+    int *argmax = (int *)malloc((size_t)n*sizeof(int));
+    if (!argmax) { memcpy(m->dec_batch_seq, saved, (size_t)cache_cap*NL*sizeof(*saved)); free(saved); return -1; }
+    ds4f_forward_verify(m, s->prefill_x, n, 0, argmax, NULL, NULL);
+    for (int k = 0; k < n; ++k) {
+        int q = slots[k], nh = s->slot_n_hist[q];
+        if (s->slot_hist_cap[q] < nh + 1) {
+            int cap = nh + 16; int *p = (int *)realloc(s->slot_hist[q], (size_t)cap*sizeof(int));
+            if (!p) { free(argmax); memcpy(m->dec_batch_seq, saved, (size_t)cache_cap*NL*sizeof(*saved)); free(saved); return -1; }
+            s->slot_hist[q] = p; s->slot_hist_cap[q] = cap;
+        }
+        s->slot_hist[q][nh] = tokens[k]; s->slot_n_hist[q] = nh + 1;
+        s->slot_pos[q]++;
+        memcpy(s->slot_logits + (size_t)q*s->vocab,
+               m->p_logits + (size_t)k*s->vocab, (size_t)s->vocab*sizeof(float));
+    }
+    free(argmax);
+    memcpy(m->dec_batch_seq, saved, (size_t)cache_cap*NL*sizeof(*saved)); free(saved);
+    for (int L = 0; L < NL; ++L) ds4f_lseq_apply(&m->layers[L], &m->dec_batch_seq[L]);
+    m->dec_nseq = 0;
+#if defined(DS4F_SERVE_HIP)
+    if (s->hip) hip_ds4f_dense_invalidate_decode_kv(s->hip);
+#endif
+    return 0;
 }
 
 const float *ds4f_serve_logits(ds4f_serve *s, int *n) {

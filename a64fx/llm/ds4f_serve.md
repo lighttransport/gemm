@@ -94,7 +94,10 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   images on every generated token.
 - `--decode-batch-size N` enables native multi-context decode batching. It
   batches dense, shared/routed-FFN, and head work while retaining independent
-  KV/Tier-B2 cache sets per row. Default is `1` because the current RX 9070 XT
+  KV/Tier-B2 cache sets per row. Active batch members remain in native cache
+  slots across token steps and serialize only when admitted, completed, or
+  stashed; cache set zero remains isolated for concurrent prompt admission.
+  Default is `1` because the current RX 9070 XT
   small-M kernels are slower at B=2 and the independent long-range caches use
   substantial host RAM; use B=2..4 for throughput experiments. `/v1/progress`
   reports actual batch steps and sequences.
