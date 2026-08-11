@@ -19,12 +19,11 @@
  * Run (after tofu_topo_helper writes tofu_topo.txt, 1 proc/node):
  *   mpiexec -n 12 -vcoordfile vcoord build/ds4f_ep_runner
  *
- * Env (in addition to ds4f.h's DS4F_*):
- *   LLM_THREADS    compute threads (default 48)
- *   DS4F_PREFILL   synthetic prefill tokens (default 8)
- *   DS4F_MAXGEN    synthetic decode tokens (default 16)
- *   DS4F_MAXPOS    KV cache capacity / max position (default 4096)
- *   DS4F_LAYERS    override n_layers (default 43)
+ * CLI (the launcher passes these explicitly; legacy environment fallbacks remain):
+ *   --threads N, --prefill N, --decode N, --max-pos N, --layers N,
+ *   --ctx-warm N, --prefill-batch N, --prefill-verify N,
+ *   --comm-poll-spins N, --comm-robust 0|1
+ * Environment (model/debug/compatibility settings):
  *   DS4F_FP8_BF16  predequant dense FP8->BF16 (default 0 = on-demand FP8)
  *   DS4F_REQUIRE_NODES  fail fast unless topology has this many ranks
  *   DS4F_STATUS_DIR     durable per-rank state files (default current dir)
@@ -95,6 +94,55 @@ static double now_sec(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 static int envi(const char *k, int d) { const char *v = getenv(k); return (v && *v) ? atoi(v) : d; }
+
+typedef struct {
+    int threads, cmgs, prefill, maxgen, maxpos, layers, ctx_warm;
+    int prefill_batch, prefill_verify, comm_poll_spins, comm_robust;
+} runner_opts;
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "usage: %s [options]\n"
+        "  --threads N             compute threads (default 48)\n"
+        "  --cmgs N                CMG count (default 4)\n"
+        "  --prefill N             synthetic prefill tokens (default 8)\n"
+        "  --decode N              synthetic decode tokens (default 16)\n"
+        "  --max-pos N             KV capacity (default 4096)\n"
+        "  --layers N              layer override (default model)\n"
+        "  --ctx-warm N            warm synthetic context (default 0)\n"
+        "  --prefill-batch N       batched prefill size (default 0)\n"
+        "  --prefill-verify N      verify prefill size (default 0)\n"
+        "  --comm-poll-spins N     bounded TCQ polling (default 1)\n"
+        "  --comm-robust 0|1       retrying barriers (default 1)\n"
+        "  --help                  show this text\n"
+        "Environment settings remain accepted for legacy launchers; CLI values win.\n", prog);
+}
+
+static void parse_cli(int argc, char **argv, runner_opts *o) {
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--help")) { usage(argv[0]); exit(0); }
+        int *dst = NULL;
+        if (!strcmp(a, "--threads") || !strcmp(a, "--cmgs") || !strcmp(a, "--prefill") ||
+            !strcmp(a, "--decode") || !strcmp(a, "--max-pos") || !strcmp(a, "--layers") ||
+            !strcmp(a, "--ctx-warm") || !strcmp(a, "--prefill-batch") ||
+            !strcmp(a, "--prefill-verify") || !strcmp(a, "--comm-poll-spins") ||
+            !strcmp(a, "--comm-robust")) {
+            if (i + 1 >= argc) { fprintf(stderr, "%s needs an integer\n", a); exit(2); }
+            if (!strcmp(a, "--threads")) dst=&o->threads; else if (!strcmp(a, "--cmgs")) dst=&o->cmgs;
+            else if (!strcmp(a, "--prefill")) dst=&o->prefill; else if (!strcmp(a, "--decode")) dst=&o->maxgen;
+            else if (!strcmp(a, "--max-pos")) dst=&o->maxpos; else if (!strcmp(a, "--layers")) dst=&o->layers;
+            else if (!strcmp(a, "--ctx-warm")) dst=&o->ctx_warm; else if (!strcmp(a, "--prefill-batch")) dst=&o->prefill_batch;
+            else if (!strcmp(a, "--prefill-verify")) dst=&o->prefill_verify; else if (!strcmp(a, "--comm-poll-spins")) dst=&o->comm_poll_spins;
+            else dst=&o->comm_robust;
+            char *end = NULL; long v = strtol(argv[++i], &end, 10);
+            if (!end || *end || v < -2147483647L || v > 2147483647L) { fprintf(stderr, "invalid integer for %s\n", a); exit(2); }
+            *dst = (int)v;
+        } else {
+            fprintf(stderr, "unknown option: %s\n", a); usage(argv[0]); exit(2);
+        }
+    }
+}
 
 static int file_exists(const char *path) {
     struct stat st;
@@ -303,21 +351,22 @@ static int ds4f_comm_init(ds4f_comm *dc, utofu_vcq_hdl_t vcq,
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     int rc;
-    int n_threads = envi("LLM_THREADS", 48);
-    int n_cmgs    = envi("DS4F_CMGS", 4);
-    int prefill   = envi("DS4F_PREFILL", 8);
-    int maxgen    = envi("DS4F_MAXGEN", 16);
-    int maxpos    = envi("DS4F_MAXPOS", 4096);
-    int layers    = envi("DS4F_LAYERS", 0);
-    int ctx_warm  = envi("DS4F_CTX_WARM", 0);   /* fill synthetic KV+compressed to this ctx, decode from there */
-    int prefill_batch = envi("DS4F_PREFILL_BATCH", 0);   /* >0: batched M-token GEMM prefill (needs exact + dense bf16) */
-    int prefill_verify = envi("DS4F_PREFILL_VERIFY", 0); /* real mHC/Tier-B2 prompt chunks through verify */
-    g_comm_poll_spins = envi("DS4F_COMM_POLL_SPINS", 1);
+    runner_opts opt = {
+        envi("LLM_THREADS", 48), envi("DS4F_CMGS", 4), envi("DS4F_PREFILL", 8),
+        envi("DS4F_MAXGEN", 16), envi("DS4F_MAXPOS", 4096), envi("DS4F_LAYERS", 0),
+        envi("DS4F_CTX_WARM", 0), envi("DS4F_PREFILL_BATCH", 0), envi("DS4F_PREFILL_VERIFY", 0),
+        envi("DS4F_COMM_POLL_SPINS", 1), envi("DS4F_COMM_ROBUST", 1)
+    };
+    parse_cli(argc, argv, &opt);
+    int n_threads = opt.threads, n_cmgs = opt.cmgs, prefill = opt.prefill, maxgen = opt.maxgen;
+    int maxpos = opt.maxpos, layers = opt.layers, ctx_warm = opt.ctx_warm;
+    int prefill_batch = opt.prefill_batch, prefill_verify = opt.prefill_verify;
+    g_comm_poll_spins = opt.comm_poll_spins;
     if (g_comm_poll_spins < 1) g_comm_poll_spins = 1;
     if (g_comm_poll_spins > 64) g_comm_poll_spins = 64;
-    g_comm_robust = envi("DS4F_COMM_ROBUST", 1) != 0;
+    g_comm_robust = opt.comm_robust != 0;
     if (prefill_batch > DS4F_MAX_MTILE) prefill_batch = DS4F_MAX_MTILE;
     if (prefill_verify > DS4F_MAX_MTILE) prefill_verify = DS4F_MAX_MTILE;
     if (prefill_verify < 0) prefill_verify = 0;
