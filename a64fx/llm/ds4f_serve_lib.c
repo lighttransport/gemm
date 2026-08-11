@@ -389,6 +389,99 @@ int ds4f_serve_reset(ds4f_serve *s) {
     if (!s) return -1;
     s->pos = 0;
     s->n_hist = 0;
+#if defined(DS4F_SERVE_HIP)
+    if (s->hip) hip_ds4f_dense_invalidate_decode_kv(s->hip);
+#endif
+    return 0;
+}
+
+typedef struct {
+    uint64_t magic;
+    uint32_t version, header_bytes;
+    uint32_t max_pos, n_layers, kv_lora, vocab;
+    uint32_t pos, n_hist;
+    uint64_t rng, kv_bytes, snap_bytes, logits_bytes;
+} ds4f_context_header;
+
+#define DS4F_CONTEXT_MAGIC UINT64_C(0x4453344643545831) /* DS4FCTX1 */
+
+static size_t context_kv_bytes(const ds4f_model *m) {
+    size_t n = 0;
+    for (int L = 0; L < m->cfg.n_layers; ++L)
+        n += (size_t)m->layers[L].kv_slots * (size_t)m->cfg.kv_lora * 2;
+    return n;
+}
+
+/* Complete, process-local context image used by the cooperative server.  In
+ * contrast to the legacy prefix file this also carries logits and sampler
+ * state, so a decode can be paused between tokens and resumed bit-exactly. */
+size_t ds4f_serve_context_bytes(ds4f_serve *s) {
+    if (!s || !s->m) return 0;
+    size_t snap = s->m->tierb2 ? ds4f_tb2_snap_bytes(s->m) : 0;
+    return sizeof(ds4f_context_header) + context_kv_bytes(s->m) + snap +
+           (size_t)s->vocab * sizeof(float) + (size_t)s->n_hist * sizeof(int);
+}
+
+int ds4f_serve_context_export(ds4f_serve *s, void *dst, size_t cap) {
+    size_t need = ds4f_serve_context_bytes(s);
+    if (!s || !s->m || !dst || cap < need) return -1;
+    ds4f_model *m = s->m;
+    size_t kvb = context_kv_bytes(m);
+    size_t snap = m->tierb2 ? ds4f_tb2_snap_bytes(m) : 0;
+    ds4f_context_header h = {
+        DS4F_CONTEXT_MAGIC, 1, (uint32_t)sizeof(ds4f_context_header),
+        (uint32_t)m->cfg.max_pos, (uint32_t)m->cfg.n_layers,
+        (uint32_t)m->cfg.kv_lora, (uint32_t)s->vocab,
+        (uint32_t)s->pos, (uint32_t)s->n_hist, s->rng, kvb, snap,
+        (uint64_t)s->vocab * sizeof(float)
+    };
+    unsigned char *p = (unsigned char *)dst;
+    memcpy(p, &h, sizeof(h)); p += sizeof(h);
+    for (int L = 0; L < m->cfg.n_layers; ++L) {
+        size_t n = (size_t)m->layers[L].kv_slots * (size_t)m->cfg.kv_lora * 2;
+        memcpy(p, m->layers[L].kv_cache, n); p += n;
+    }
+    if (snap) { ds4f_tb2_snap(m, p, 0); p += snap; }
+    memcpy(p, s->logits, (size_t)s->vocab * sizeof(float));
+    p += (size_t)s->vocab * sizeof(float);
+    if (s->n_hist) memcpy(p, s->hist, (size_t)s->n_hist * sizeof(int));
+    return 0;
+}
+
+int ds4f_serve_context_import(ds4f_serve *s, const void *src, size_t len) {
+    if (!s || !s->m || !src || len < sizeof(ds4f_context_header)) return -1;
+    ds4f_context_header h;
+    memcpy(&h, src, sizeof(h));
+    ds4f_model *m = s->m;
+    size_t kvb = context_kv_bytes(m);
+    size_t snap = m->tierb2 ? ds4f_tb2_snap_bytes(m) : 0;
+    size_t need = sizeof(h) + kvb + snap + (size_t)s->vocab * sizeof(float) +
+                  (size_t)h.n_hist * sizeof(int);
+    if (h.magic != DS4F_CONTEXT_MAGIC || h.version != 1 ||
+        h.header_bytes != sizeof(h) || h.max_pos != (uint32_t)m->cfg.max_pos ||
+        h.n_layers != (uint32_t)m->cfg.n_layers ||
+        h.kv_lora != (uint32_t)m->cfg.kv_lora || h.vocab != (uint32_t)s->vocab ||
+        h.pos > (uint32_t)m->cfg.max_pos || h.kv_bytes != kvb ||
+        h.snap_bytes != snap || h.logits_bytes != (uint64_t)s->vocab * sizeof(float) ||
+        need != len) return -1;
+    if ((int)h.n_hist > s->hist_cap) {
+        int *q = (int *)realloc(s->hist, (size_t)h.n_hist * sizeof(int));
+        if (!q && h.n_hist) return -1;
+        s->hist = q; s->hist_cap = (int)h.n_hist;
+    }
+    const unsigned char *p = (const unsigned char *)src + sizeof(h);
+    for (int L = 0; L < m->cfg.n_layers; ++L) {
+        size_t n = (size_t)m->layers[L].kv_slots * (size_t)m->cfg.kv_lora * 2;
+        memcpy(m->layers[L].kv_cache, p, n); p += n;
+    }
+    if (snap) { ds4f_tb2_snap(m, (void *)p, 1); p += snap; }
+    memcpy(s->logits, p, (size_t)s->vocab * sizeof(float));
+    p += (size_t)s->vocab * sizeof(float);
+    if (h.n_hist) memcpy(s->hist, p, (size_t)h.n_hist * sizeof(int));
+    s->pos = (int)h.pos; s->n_hist = (int)h.n_hist; s->rng = h.rng;
+#if defined(DS4F_SERVE_HIP)
+    if (s->hip) hip_ds4f_dense_invalidate_decode_kv(s->hip);
+#endif
     return 0;
 }
 

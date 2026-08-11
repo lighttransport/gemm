@@ -22,7 +22,7 @@ Env: DS4F_SERVE_BASE, DS4F_STAGE_DIR (required), DS4F_SERVE_USE_HIP (1),
      DS4F_HIP_DEVICE, DS4F_MAXPOS, LLM_THREADS, DS4F_CMGS,
      DS4F_SERVE_PREFIX_CACHE (1), DS4F_SERVE_SLOTS (>=1).
 """
-import ctypes, os, signal, sys, time
+import argparse, ctypes, hashlib, json, os, selectors, signal, socket, sys, time
 
 def _term(sig, frame):
     raise KeyboardInterrupt
@@ -69,6 +69,12 @@ def load_lib(path):
     lib.ds4f_serve_vocab.restype = ctypes.c_int
     lib.ds4f_serve_maxpos.argtypes = [ctypes.c_void_p]
     lib.ds4f_serve_maxpos.restype = ctypes.c_int
+    lib.ds4f_serve_context_bytes.argtypes = [ctypes.c_void_p]
+    lib.ds4f_serve_context_bytes.restype = ctypes.c_size_t
+    lib.ds4f_serve_context_export.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+    lib.ds4f_serve_context_export.restype = ctypes.c_int
+    lib.ds4f_serve_context_import.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+    lib.ds4f_serve_context_import.restype = ctypes.c_int
     return lib
 
 
@@ -114,9 +120,307 @@ class Serve(object):
     def maxpos(self):
         return self.lib.ds4f_serve_maxpos(self._s)
 
+    def context_export(self):
+        n = self.lib.ds4f_serve_context_bytes(self._s)
+        buf = ctypes.create_string_buffer(n)
+        if not n or self.lib.ds4f_serve_context_export(self._s, buf, n) != 0:
+            raise RuntimeError("context export failed")
+        return buf.raw
+
+    def context_import(self, blob):
+        buf = ctypes.create_string_buffer(blob, len(blob))
+        return self.lib.ds4f_serve_context_import(self._s, buf, len(blob))
+
 
 def env_i(k, d):
     return int(os.environ.get(k, d))
+
+
+# The current HIP prefill path is unstable for very long single requests.
+# Keep a head/tail window until the long-context kernel is hardened; this
+# prevents a native crash from wedging the HTTP frontend indefinitely.
+PREFILL_MAX_TOKENS = env_i("DS4F_SERVE_PREFILL_MAX_TOKENS", 2048)
+PREFILL_CHUNK_TOKENS = max(1, env_i("DS4F_SERVE_PREFILL_CHUNK_TOKENS", 32))
+
+
+def prefill_chunked(sess, ids, pos0):
+    """Prefill in small HIP-safe chunks instead of one large dispatch."""
+    for off in range(0, len(ids), PREFILL_CHUNK_TOKENS):
+        chunk = ids[off:off + PREFILL_CHUNK_TOKENS]
+        if chunk and sess.prefill(chunk, pos0 + off) != 0:
+            return -1
+    return 0
+
+
+class Context(object):
+    def __init__(self, cid):
+        self.id = cid
+        self.blob = None
+        self.tokens = []
+        self.disk = None
+        self.last_access = time.time()
+        self.active_job = None
+
+
+class Job(object):
+    def __init__(self, sock, request):
+        self.sock, self.request = sock, request
+        self.id = str(request.get("job_id") or ("job-%x" % id(self)))
+        self.context_id = str(request.get("context_id") or self.id)
+        self.ephemeral = bool(request.get("ephemeral", False))
+        self.prompt = [int(x) for x in request.get("prompt", [])]
+        self.max_new = max(0, int(request.get("max_new", 512)))
+        self.sp = Sampling(float(request.get("temperature", 0.0)),
+                           float(request.get("top_p", 1.0)),
+                           int(request.get("top_k", 0)),
+                           float(request.get("presence_penalty", 0.0)),
+                           float(request.get("repeat_penalty", 1.0)),
+                           int(request.get("seed", 1)))
+        self.phase, self.off, self.out = "prepare", 0, []
+        self.working = None
+        self.started = time.time()
+        self.prefill_started = self.started
+        self.decode_started = None
+        self.cancelled = False
+
+
+class CooperativeServer(object):
+    def __init__(self, sess, path, context_dir, memory_ttl, disk_ttl,
+                 memory_mb, disk_mb, prefill_quantum, decode_quantum, quantum_ms):
+        self.sess, self.path = sess, path
+        self.context_dir = context_dir
+        self.memory_ttl, self.disk_ttl = memory_ttl, disk_ttl
+        self.memory_cap, self.disk_cap = memory_mb << 20, disk_mb << 20
+        self.prefill_q = max(1, prefill_quantum)
+        self.decode_q = max(1, decode_quantum)
+        self.quantum_s = max(0.001, quantum_ms / 1000.0)
+        self.contexts, self.jobs, self.current = {}, [], None
+        os.makedirs(context_dir, mode=0o700, exist_ok=True)
+        for name in os.listdir(context_dir):
+            if not name.endswith(".json"): continue
+            try:
+                mp = os.path.join(context_dir, name)
+                with open(mp) as f: meta = json.load(f)
+                cid = str(meta["context_id"]); bp = mp[:-5] + ".ctx"
+                if not os.path.isfile(bp): continue
+                c = Context(cid); c.tokens = [int(x) for x in meta.get("tokens", [])]
+                c.last_access = float(meta.get("last_access", os.path.getmtime(mp)))
+                c.disk = bp; self.contexts[cid] = c
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+        try: os.unlink(path)
+        except FileNotFoundError: pass
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(path); os.chmod(path, 0o600); self.listener.listen(64)
+        self.listener.setblocking(False)
+        print("[runner] cooperative socket=%s context_dir=%s" % (path, context_dir),
+              file=sys.stderr, flush=True)
+
+    def send(self, job, event):
+        try:
+            job.sock.sendall((json.dumps(event, separators=(",", ":")) + "\n").encode())
+            return True
+        except OSError:
+            job.cancelled = True
+            return False
+
+    def disk_paths(self, cid):
+        key = hashlib.sha256(cid.encode()).hexdigest()
+        return os.path.join(self.context_dir, key + ".ctx"), os.path.join(self.context_dir, key + ".json")
+
+    def load_context(self, ctx):
+        if ctx.blob is not None: return True
+        bp, mp = self.disk_paths(ctx.id)
+        try:
+            with open(bp, "rb") as f: ctx.blob = f.read()
+            with open(mp) as f: meta = json.load(f)
+            if meta.get("context_id") != ctx.id: raise ValueError("identity mismatch")
+            ctx.tokens = [int(x) for x in meta.get("tokens", [])]
+            ctx.disk = bp
+            return True
+        except (OSError, ValueError, TypeError):
+            ctx.blob = None; ctx.tokens = []
+            return False
+
+    def spill(self, ctx):
+        if ctx.blob is None or ctx.active_job is not None: return
+        bp, mp = self.disk_paths(ctx.id)
+        tb, tm = bp + ".tmp.%d" % os.getpid(), mp + ".tmp.%d" % os.getpid()
+        with open(tb, "wb") as f: f.write(ctx.blob); f.flush(); os.fsync(f.fileno())
+        with open(tm, "w") as f:
+            json.dump({"schema": 1, "context_id": ctx.id, "tokens": ctx.tokens,
+                       "last_access": ctx.last_access}, f, separators=(",", ":"))
+            f.flush(); os.fsync(f.fileno())
+        os.chmod(tb, 0o600); os.chmod(tm, 0o600)
+        os.replace(tb, bp); os.replace(tm, mp)
+        ctx.disk, ctx.blob = bp, None
+
+    def maintain(self):
+        now = time.time()
+        warm = [c for c in self.contexts.values() if c.blob is not None and c.active_job is None]
+        for c in warm:
+            if now - c.last_access >= self.memory_ttl: self.spill(c)
+        warm = sorted((c for c in self.contexts.values() if c.blob is not None and c.active_job is None),
+                      key=lambda c: c.last_access)
+        used = sum(len(c.blob) for c in warm)
+        for c in warm:
+            if used <= self.memory_cap: break
+            n = len(c.blob); self.spill(c); used -= n
+        for c in list(self.contexts.values()):
+            if c.active_job is None and c.disk and now - c.last_access >= self.disk_ttl:
+                bp, mp = self.disk_paths(c.id)
+                for p in (bp, mp):
+                    try: os.unlink(p)
+                    except OSError: pass
+                self.contexts.pop(c.id, None)
+        disk = sorted((c for c in self.contexts.values() if c.disk), key=lambda c: c.last_access)
+        used = sum(os.path.getsize(c.disk) for c in disk if os.path.exists(c.disk))
+        for c in disk:
+            if used <= self.disk_cap: break
+            bp, mp = self.disk_paths(c.id); n = os.path.getsize(bp) if os.path.exists(bp) else 0
+            for p in (bp, mp):
+                try: os.unlink(p)
+                except OSError: pass
+            c.disk = None; used -= n
+            if c.blob is None: self.contexts.pop(c.id, None)
+
+    def status(self):
+        now = time.time()
+        return [{"id": c.id, "state": (c.active_job.phase if c.active_job else "warm" if c.blob is not None else "disk"),
+                 "tokens": len(c.tokens), "last_access": c.last_access,
+                 "idle_seconds": max(0, now - c.last_access),
+                 "bytes": len(c.blob) if c.blob is not None else
+                          (os.path.getsize(c.disk) if c.disk and os.path.exists(c.disk) else 0),
+                 "active_job": c.active_job.id if c.active_job else None,
+                 "prompt_total": len(c.active_job.prompt) if c.active_job else 0,
+                 "prompt_processed": c.active_job.off if c.active_job else 0,
+                 "completion_tokens": len(c.active_job.out) if c.active_job else 0,
+                 "started": c.active_job.started if c.active_job else None,
+                 "decode_started": c.active_job.decode_started if c.active_job else None}
+                for c in self.contexts.values()]
+
+    def accept(self):
+        while True:
+            try: conn, _ = self.listener.accept()
+            except BlockingIOError: return
+            conn.settimeout(0.05)
+            try:
+                data = b""
+                while b"\n" not in data:
+                    part = conn.recv(65536)
+                    if not part: raise ValueError("closed request")
+                    data += part
+                req = json.loads(data.split(b"\n", 1)[0])
+                op = req.get("op", "generate")
+                if op == "contexts":
+                    conn.sendall((json.dumps({"event": "contexts", "data": self.status()}) + "\n").encode()); conn.close(); continue
+                if op == "delete":
+                    cid = str(req.get("context_id", "")); c = self.contexts.get(cid)
+                    if c and c.active_job: code = 409
+                    else:
+                        if c:
+                            bp, mp = self.disk_paths(cid)
+                            for p in (bp, mp):
+                                try: os.unlink(p)
+                                except OSError: pass
+                            self.contexts.pop(cid, None)
+                        code = 204
+                    conn.sendall((json.dumps({"event": "deleted", "status": code}) + "\n").encode()); conn.close(); continue
+                job = Job(conn, req); ctx = self.contexts.setdefault(job.context_id, Context(job.context_id))
+                if ctx.active_job is not None:
+                    conn.sendall(b'{"event":"error","status":409,"error":"context busy"}\n'); conn.close(); continue
+                ctx.active_job = job; self.jobs.append(job)
+                self.send(job, {"event": "accepted", "job_id": job.id, "context_id": job.context_id})
+            except Exception as exc:
+                try: conn.sendall((json.dumps({"event": "error", "error": str(exc)}) + "\n").encode()); conn.close()
+                except OSError: pass
+
+    def activate(self, job):
+        if self.current is job: return
+        if self.current and not self.current.cancelled and self.current.phase not in ("done", "error"):
+            self.current.working = self.sess.context_export()
+        if job.working is not None:
+            if self.sess.context_import(job.working) != 0: raise RuntimeError("working context restore failed")
+        else:
+            ctx = self.contexts[job.context_id]
+            limit = max(1, self.sess.maxpos() - min(job.max_new, self.sess.maxpos() - 1))
+            if len(job.prompt) > limit:
+                job.prompt = truncate_prompt(job.prompt, limit)
+            self.load_context(ctx)
+            reuse = bool(ctx.blob is not None and len(job.prompt) >= len(ctx.tokens) and
+                         job.prompt[:len(ctx.tokens)] == ctx.tokens)
+            if reuse:
+                if self.sess.context_import(ctx.blob) != 0: raise RuntimeError("context restore failed")
+                job.off = len(ctx.tokens)
+            else:
+                self.sess.reset(); job.off = 0
+            job.phase = "prefill" if job.off < len(job.prompt) else "decode"
+        self.current = job
+
+    def finish(self, job, error=None):
+        ctx = self.contexts[job.context_id]
+        if not job.cancelled and error is None:
+            ctx.blob = self.sess.context_export()
+            ctx.tokens = job.prompt + job.out
+            ctx.last_access = time.time()
+            if ctx.disk:
+                bp, mp = self.disk_paths(ctx.id)
+                for p in (bp, mp):
+                    try: os.unlink(p)
+                    except OSError: pass
+            ctx.disk = None
+            self.send(job, {"event": "final", "tokens": job.out,
+                            "context_id": job.context_id,
+                            "elapsed_ms": int((time.time() - job.started) * 1000)})
+        elif error is not None:
+            self.send(job, {"event": "error", "error": str(error)})
+        ctx.active_job = None; job.phase = "done"
+        try: job.sock.close()
+        except OSError: pass
+        if job in self.jobs: self.jobs.remove(job)
+        if self.current is job: self.current = None
+        if job.ephemeral: self.contexts.pop(job.context_id, None)
+
+    def step(self, job):
+        try:
+            self.activate(job)
+            if job.cancelled: return self.finish(job)
+            deadline = time.time() + self.quantum_s
+            if job.phase == "prefill":
+                end = min(len(job.prompt), job.off + self.prefill_q)
+                if end > job.off and self.sess.prefill(job.prompt[job.off:end], job.off) != 0:
+                    raise RuntimeError("prefill failed at %d" % job.off)
+                job.off = end
+                self.send(job, {"event": "progress", "phase": "prefill",
+                                "processed": job.off, "total": len(job.prompt)})
+                if job.off >= len(job.prompt):
+                    job.phase = "decode"; job.decode_started = time.time()
+            if job.phase == "decode" and time.time() < deadline:
+                for _ in range(self.decode_q):
+                    if len(job.out) >= job.max_new or self.sess.pos() >= self.sess.maxpos():
+                        return self.finish(job)
+                    tok = self.sess.sample(job.sp)
+                    if tok < 0: raise RuntimeError("sampling failed")
+                    if tok == self.sess.eos: return self.finish(job)
+                    pos = self.sess.pos()
+                    if self.sess.decode(tok, pos) < 0: raise RuntimeError("decode failed at %d" % pos)
+                    job.out.append(tok); self.send(job, {"event": "token", "token": tok})
+                    if time.time() >= deadline: break
+        except Exception as exc:
+            self.finish(job, exc)
+
+    def run(self):
+        try:
+            while True:
+                self.accept()
+                if self.jobs:
+                    job = self.jobs.pop(0); self.jobs.append(job); self.step(job)
+                else: time.sleep(0.005)
+                self.maintain()
+        finally:
+            self.listener.close()
+            try: os.unlink(self.path)
+            except OSError: pass
 
 
 def run_serve(sess, base, prefix_cache, slots):
@@ -216,8 +520,11 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
              stream_path=None, save_path=None):
     sp = Sampling(temp, top_p, top_k, pres, rep, seed)
     maxpos = sess.maxpos()
-    limit = max(1, maxpos - max_new)
-    prompt = truncate_prompt(prompt, limit)
+    limit = max(1, min(maxpos - max_new, PREFILL_MAX_TOKENS))
+    if len(prompt) > limit:
+        print("[runner] truncating prompt %d -> %d tokens" % (len(prompt), limit),
+              file=sys.stderr, flush=True)
+        prompt = truncate_prompt(prompt, limit)
     start = sess.pos()
     _dbg = os.environ.get("DS4F_SERVE_DEBUG")
     _t0 = time.time()
@@ -235,12 +542,12 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
                       file=sys.stderr, flush=True)
             sess.reset()
             if prompt:
-                if sess.prefill(prompt, 0) != 0:
+                if prefill_chunked(sess, prompt, 0) != 0:
                     raise RuntimeError("full prefill failed")
         else:
             tail = prompt[cached:]
             if tail:
-                if sess.prefill(tail, cached) != 0:
+                if prefill_chunked(sess, tail, cached) != 0:
                     raise RuntimeError("cached-tail prefill failed")
     elif prefix_cache and slots > 1 and os.path.exists(slot_path[slot % slots]):
         if sess.kv_restore(slot_path[slot % slots]) != 0:
@@ -248,7 +555,7 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
         cached = sess.pos()
         tail = prompt[cached:]
         if tail:
-            if sess.prefill(tail, cached) != 0:
+            if prefill_chunked(sess, tail, cached) != 0:
                 raise RuntimeError("slot-tail prefill failed")
     else:
         # a fresh (no-cache, no-slot) request carries the full conversation;
@@ -257,7 +564,7 @@ def generate(sess, prompt, max_new, temp, top_p, top_k, pres, rep, seed,
         if sess.pos() != 0:
             sess.reset()
         if prompt:
-            if sess.prefill(prompt, 0) != 0:
+            if prefill_chunked(sess, prompt, 0) != 0:
                 raise RuntimeError("prefill failed")
 
     prefill_s = max(time.time() - _t0, 1e-9)
@@ -328,9 +635,21 @@ def daemonize():
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--daemon", action="store_true")
+    ap.add_argument("--unix-socket")
+    ap.add_argument("--context-dir")
+    ap.add_argument("--context-memory-ttl-sec", type=int, default=600)
+    ap.add_argument("--context-disk-ttl-sec", type=int, default=86400)
+    ap.add_argument("--context-memory-mb", type=int, default=512)
+    ap.add_argument("--context-disk-mb", type=int, default=8192)
+    ap.add_argument("--prefill-quantum-tokens", type=int, default=32)
+    ap.add_argument("--decode-quantum-tokens", type=int, default=4)
+    ap.add_argument("--scheduler-quantum-ms", type=int, default=250)
+    args = ap.parse_args()
     signal.signal(signal.SIGTERM, _term)
     signal.signal(signal.SIGINT, _term)
-    if "--daemon" in sys.argv:
+    if args.daemon:
         daemonize()
     base = os.environ.get("DS4F_SERVE_BASE", "/tmp/ds4f_serve")
     stage = os.environ.get("DS4F_STAGE_DIR")
@@ -346,7 +665,15 @@ def main():
     slots = max(1, env_i("DS4F_SERVE_SLOTS", 1))
     prefix_cache = env_i("DS4F_SERVE_PREFIX_CACHE", 1)
     try:
-        run_serve(sess, base, prefix_cache, slots)
+        if args.unix_socket:
+            CooperativeServer(sess, args.unix_socket,
+                              args.context_dir or (base + ".contexts"),
+                              args.context_memory_ttl_sec, args.context_disk_ttl_sec,
+                              args.context_memory_mb, args.context_disk_mb,
+                              args.prefill_quantum_tokens, args.decode_quantum_tokens,
+                              args.scheduler_quantum_ms).run()
+        else:
+            run_serve(sess, base, prefix_cache, slots)
     except KeyboardInterrupt:
         pass
     finally:

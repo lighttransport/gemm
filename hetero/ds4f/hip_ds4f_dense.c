@@ -220,6 +220,14 @@ void hip_ds4f_dense_set_decode_features(hip_ds4f_dense *ctx, int kv_resident) {
     }
 }
 
+void hip_ds4f_dense_invalidate_decode_kv(hip_ds4f_dense *ctx) {
+    if (!ctx) return;
+    ctx->decode_kv_host = NULL;
+    ctx->decode_kv_slots = 0;
+    ctx->decode_kv_dim = 0;
+    ctx->qkv_device_ready = 0;
+}
+
 static int valid_dims(int rows, int cols) {
     return rows > 0 && cols > 0 && rows <= INT_MAX / cols;
 }

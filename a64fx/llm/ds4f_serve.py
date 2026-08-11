@@ -25,7 +25,7 @@ top_k (0=off), presence_penalty (0), repeat_penalty / repetition_penalty (1.0), 
 Env: PORT (8080), TOK (~/models/ds4f/tokenizer.json), DS4F_SERVE_BASE,
 DS4F_SERVE_AGENT_CACHE_DIR, DS4F_SERVE_TIMEOUT (1200s).
 Start via run_ds4f_serve_11n.sh (which launches the runner first, then this)."""
-import hashlib, http.server, json, os, re, socketserver, subprocess, sys, tempfile, threading, time, uuid
+import argparse, hashlib, http.server, json, os, re, socket, socketserver, subprocess, sys, tempfile, threading, time, uuid
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -40,8 +40,60 @@ ERROR = BASE + ".error"
 PORT = int(os.environ.get("PORT", "8080"))
 TIMEOUT = float(os.environ.get("DS4F_SERVE_TIMEOUT", "1200"))
 MODEL_ID = "ds4f"
+RUNNER_SOCKET = None
+RESPONSE_STATE_DIR = BASE + ".contexts/responses"
 _lock = threading.Lock()        # the runner is single-stream: serialize requests
 _seq = 0
+_started_at = time.time()
+
+
+def progress_snapshot():
+    """Return a llama.cpp-style lightweight progress snapshot.
+
+    The file-backed runner has no token callback while idle, so report the
+    request queue state and stable zero counters rather than returning 404.
+    """
+    req = os.path.exists(REQ)
+    try:
+        seq = int(open(REQSEQ).read().strip() or 0)
+    except (OSError, ValueError):
+        seq = 0
+    try:
+        resp_seq = int(open(RESPSEQ).read().strip() or 0)
+    except (OSError, ValueError):
+        resp_seq = 0
+    contexts = runner_contexts() if RUNNER_SOCKET else []
+    live = [c for c in contexts if c.get("state") == "active"]
+    if not live:
+        live = [c for c in contexts if c.get("state") in ("prepare", "prefill", "decode")]
+    active = bool(live) if RUNNER_SOCKET else bool(req and seq > resp_seq)
+    current = live[0] if live else {}
+    now = time.time()
+    started = current.get("started") or now
+    decode_started = current.get("decode_started") or now
+    processed = int(current.get("prompt_processed", 0))
+    completed = int(current.get("completion_tokens", 0))
+    return {
+        "active": active,
+        "job_id": (live[0].get("active_job") if live else None) if RUNNER_SOCKET else
+                  (str(seq) if active else None),
+        "model": MODEL_ID,
+        "precision": "ds4f",
+        "phase": current.get("state", "decode") if active else "idle",
+        "prompt_tokens": int(current.get("prompt_total", 0)),
+        "prompt_processed": processed,
+        "prompt_tps": processed / max(now - started, 1e-6),
+        "completion_tokens": completed,
+        "completion_total": completed,
+        "decode_tps": completed / max(now - decode_started, 1e-6),
+        "cache_hit": False,
+        "gpu": "hip" if os.environ.get("DS4F_SERVE_USE_HIP", "0") == "1" else "cpu",
+        "elapsed_ms": int(((now - started) if active else (now - _started_at)) * 1000),
+        "queue_depth": max(0, len(live) - 1),
+        "contexts": {"active": len(live),
+                     "warm": sum(c.get("state") == "warm" for c in contexts),
+                     "disk": sum(c.get("state") == "disk" for c in contexts)},
+    }
 
 # ---- concurrent batched decode (DS4F_SERVE_BATCH>1): a dispatcher thread collects queued requests
 # within a short window and submits them as ONE "BATCH" request the runner decodes together (dense
@@ -242,10 +294,15 @@ _conv_lock = threading.Lock()
 AGENT_CACHE_ROOT = os.environ.get("DS4F_SERVE_AGENT_CACHE_DIR", BASE + ".agent-cache")
 _cache_lock = threading.Lock()
 _cache_stats = {"hits": 0, "misses": 0, "writes": 0}
+# Native KV snapshots are reliable for short prefixes but can terminate the
+# HIP runner on long prompt saves. Keep long requests uncached and let them
+# use the normal bounded-context prefill path instead.
+CACHE_MAX_TOKENS = int(os.environ.get("DS4F_SERVE_CACHE_MAX_TOKENS", "2048"))
 
 # Responses API state is keyed by previous_response_id.  It is deliberately
 # bounded: Chat/Anthropic clients normally resend their complete history.
 _response_contexts = {}
+_response_context_ids = {}
 _response_context_order = []
 _response_context_lock = threading.Lock()
 _MAX_RESPONSE_CONTEXTS = int(os.environ.get("DS4F_SERVE_MAX_RESPONSE_CONTEXTS", "256"))
@@ -323,6 +380,11 @@ def prepare_agent_cache(agent, messages, tools, prompt_ids):
     """
     prefix_text = sys_prefix_text(messages, tools)
     prefix_ids = encode(prefix_text)
+    if len(prefix_ids) > CACHE_MAX_TOKENS:
+        print("[cache] agent=%s SKIP prefix_tokens=%d exceeds limit=%d" %
+              (agent, len(prefix_ids), CACHE_MAX_TOKENS),
+              file=sys.stderr, flush=True)
+        return prompt_ids, None, False, 0
     cache = None
     with _cache_lock:
         cache = _read_agent_cache(agent, prefix_ids)
@@ -343,9 +405,71 @@ def prepare_agent_cache(agent, messages, tools, prompt_ids):
     return prompt_ids, cache["path"], bool(cache.get("hit")), len(cached)
 
 
+def _runner_rpc(payload, streaming=False):
+    if not RUNNER_SOCKET:
+        raise RuntimeError("cooperative runner socket is not configured")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(TIMEOUT)
+    s.connect(RUNNER_SOCKET)
+    s.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+    f = s.makefile("r")
+    if streaming:
+        return s, f
+    try:
+        line = f.readline()
+        return json.loads(line) if line else {"event": "error", "error": "runner closed"}
+    finally:
+        f.close(); s.close()
+
+
+def runner_contexts():
+    try:
+        reply = _runner_rpc({"op": "contexts"})
+        return reply.get("data", []) if reply.get("event") == "contexts" else []
+    except (OSError, ValueError, RuntimeError):
+        return []
+
+
+def runner_delete_context(context_id):
+    return _runner_rpc({"op": "delete", "context_id": context_id})
+
+
+def infer_cooperative(prompt, max_tokens, samp, context_id=None, stream_path=None):
+    ids = encode(prompt)
+    ephemeral = context_id is None
+    req = {"op": "generate", "job_id": uuid.uuid4().hex,
+           "context_id": context_id or ("stateless-" + uuid.uuid4().hex),
+           "ephemeral": ephemeral,
+           "prompt": ids, "max_new": max_tokens,
+           "temperature": samp["temperature"], "top_p": samp["top_p"],
+           "top_k": samp["top_k"], "presence_penalty": samp["presence_penalty"],
+           "repeat_penalty": samp["repeat_penalty"],
+           "seed": samp["seed"] if samp["seed"] is not None else 1}
+    s, f = _runner_rpc(req, streaming=True)
+    gen = []
+    tf = open(stream_path, "w") if stream_path else None
+    try:
+        for line in f:
+            event = json.loads(line)
+            if event.get("event") == "token":
+                tok = int(event["token"]); gen.append(tok)
+                if tf: tf.write(str(tok) + "\n"); tf.flush()
+            elif event.get("event") == "final":
+                gen = [int(x) for x in event.get("tokens", gen)]
+                break
+            elif event.get("event") == "error":
+                raise RuntimeError(event.get("error", "runner error"))
+    finally:
+        if tf: tf.close()
+        f.close(); s.close()
+    return ids, gen, decode(gen)
+
+
 def infer(prompt, max_tokens, samp, slot=0, cache_path=None, cache_load=False, cache_save=False,
-          stream=False, save_path=None):
+          stream=False, save_path=None, context_id=None, stream_path=None):
     global _seq
+    if RUNNER_SOCKET:
+        return infer_cooperative(prompt, max_tokens, samp, context_id, stream_path)
     # concurrent batched decode: route greedy, non-cache requests through the dispatcher (the runner
     # is in DS4F_SERVE_BATCH mode -> the single-request protocol is not served there).
     if BATCH > 1 and not (cache_load or cache_save):
@@ -666,6 +790,8 @@ def _response_context_messages(body):
     with _response_context_lock:
         saved = _response_contexts.get(previous)
     if saved is None:
+        saved = _load_response_state(previous)
+    if saved is None:
         raise KeyError(previous)
     messages = json.loads(json.dumps(saved))
     # Continuation requests carry only new function_call_output items.
@@ -675,20 +801,57 @@ def _response_context_messages(body):
     return messages
 
 
-def _remember_response(response_id, messages):
+def _remember_response(response_id, messages, context_id=None):
     with _response_context_lock:
         _response_contexts[response_id] = json.loads(json.dumps(messages))
+        if context_id: _response_context_ids[response_id] = context_id
         if response_id in _response_context_order:
             _response_context_order.remove(response_id)
         _response_context_order.append(response_id)
         while len(_response_context_order) > _MAX_RESPONSE_CONTEXTS:
             old = _response_context_order.pop(0)
             _response_contexts.pop(old, None)
+            _response_context_ids.pop(old, None)
+    if context_id:
+        os.makedirs(RESPONSE_STATE_DIR, mode=0o700, exist_ok=True)
+        key = hashlib.sha256(response_id.encode()).hexdigest()
+        path = os.path.join(RESPONSE_STATE_DIR, key + ".json")
+        tmp = path + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as f:
+            json.dump({"schema": 1, "response_id": response_id,
+                       "context_id": context_id, "messages": messages,
+                       "saved_at": time.time()}, f, separators=(",", ":"))
+            f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, 0o600); os.replace(tmp, path)
+
+
+def _load_response_state(response_id):
+    key = hashlib.sha256(str(response_id).encode()).hexdigest()
+    try:
+        with open(os.path.join(RESPONSE_STATE_DIR, key + ".json")) as f: state = json.load(f)
+        if state.get("schema") != 1 or state.get("response_id") != response_id: return None
+        with _response_context_lock:
+            _response_contexts[response_id] = state["messages"]
+            _response_context_ids[response_id] = state.get("context_id")
+        return state["messages"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _body_context_id(body, headers=None):
+    cid = body.get("context_id") if isinstance(body, dict) else None
+    if not cid and headers is not None: cid = headers.get("X-DS4F-Context-ID")
+    if cid is None: return None
+    cid = str(cid)
+    if not cid or len(cid) > 256: raise ValueError("invalid context_id")
+    return cid
 
 
 def _select_cache(agent, messages, tools, prompt):
     """Decide the KV prefix to restore for this prompt (conversation reuse,
     system-prompt reuse, or fresh) and where to save the new KV snapshot."""
+    if RUNNER_SOCKET:
+        return encode(prompt), False, None, None, 0
     with _conv_lock:
         ids_all = encode(prompt)
         prev = _conv["ids"]
@@ -704,7 +867,11 @@ def _select_cache(agent, messages, tools, prompt):
             cached_tokens = len(prev)
         else:
             _, cache_path, reuse, cached_tokens = prepare_agent_cache(agent, messages, tools, ids_all)
-        save_path = cpath
+        save_path = cpath if len(ids_all) <= CACHE_MAX_TOKENS else None
+        if save_path is None:
+            print("[cache] agent=%s SKIP conversation_tokens=%d exceeds limit=%d" %
+                  (agent, len(ids_all), CACHE_MAX_TOKENS),
+                  file=sys.stderr, flush=True)
         _conv["agent"] = agent
         _conv["ids"] = ids_all
         _conv["path"] = cpath
@@ -779,13 +946,31 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/health", "/"):
             self._json(200, {"status": "ok", "model": MODEL_ID})
+        elif self.path.rstrip("/") in ("/progress", "/v1/progress", "/status",
+                                        "/v1/status", "/v1/metrics"):
+            self._json(200, progress_snapshot())
         elif self.path.rstrip("/") in ("/v1/models", "/models"):
             self._json(200, {"object": "list", "data": [{
                 "id": MODEL_ID, "object": "model", "created": 0, "owned_by": "deepseek-ai",
                 "context_window": 16384, "max_tokens": 4096,
             }]})
+        elif self.path.rstrip("/") == "/v1/contexts":
+            self._json(200, {"object": "list", "data": runner_contexts()})
+        elif self.path.startswith("/v1/contexts/"):
+            cid = self.path.split("/", 3)[-1]
+            match = next((c for c in runner_contexts() if c.get("id") == cid), None)
+            self._json(200 if match else 404, match or {"error": "context not found"})
         else:
             self._json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        if not self.path.startswith("/v1/contexts/"):
+            return self._json(404, {"error": "not found"})
+        cid = self.path.split("/", 3)[-1]
+        try: reply = runner_delete_context(cid)
+        except Exception as exc: return self._json(503, {"error": str(exc)})
+        status = int(reply.get("status", 500))
+        self._json(status, {} if status == 204 else reply)
 
     def _read_body(self):
         n = int(self.headers.get("Content-Length", 0))
@@ -816,6 +1001,8 @@ class H(http.server.BaseHTTPRequestHandler):
         stream = bool(body.get("stream", False))
         max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 512)))
         samp = parse_sampling(body)
+        try: context_id = _body_context_id(body, self.headers)
+        except ValueError as exc: return self._json(400, {"error": str(exc)})
         prompt = build_chat_prompt(messages, tools)
         ids_all, reuse, cache_path, save_path, cached_tokens = _select_cache(
             "opencode", messages, tools, prompt)
@@ -827,7 +1014,7 @@ class H(http.server.BaseHTTPRequestHandler):
             try:
                 ids, gen, raw = infer(prompt, max_tokens, samp,
                                       cache_path=cache_path, cache_load=reuse, cache_save=True,
-                                      save_path=save_path)
+                                      save_path=save_path, context_id=context_id)
                 if _dbg: print("[chat] infer %.2f gen=%d" % (time.time() - t0, len(gen)), flush=True)
             except TimeoutError:
                 return self._json(504, {"error": "runner timeout"})
@@ -854,7 +1041,7 @@ class H(http.server.BaseHTTPRequestHandler):
                 "model": MODEL_ID}
         self._sse({**head, "choices": [{"index": 0, "delta": {"role": "assistant"},
                                         "finish_reason": None}]})
-        tok_path = BASE + ".tok"
+        tok_path = (BASE + ".tok." + uuid.uuid4().hex) if RUNNER_SOCKET else BASE + ".tok"
         err = {}
         done = {"gen": []}
         stream_state = {"raw": "", "emitted": 0}
@@ -862,7 +1049,8 @@ class H(http.server.BaseHTTPRequestHandler):
             try:
                 p_ids, p_gen, _ = infer(prompt, max_tokens, samp, stream=True,
                                         cache_path=cache_path, cache_load=reuse, cache_save=True,
-                                        save_path=save_path)
+                                        save_path=save_path, context_id=context_id,
+                                        stream_path=tok_path)
                 done["ids"] = p_ids
                 done["gen"] = p_gen
             except Exception as e:
@@ -933,6 +1121,8 @@ class H(http.server.BaseHTTPRequestHandler):
         stream = bool(body.get("stream", False))
         max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 512)))
         samp = parse_sampling(body)
+        try: context_id = _body_context_id(body, self.headers)
+        except ValueError as exc: return self._json(400, {"error": str(exc)})
         tools = anthropic_tools_to_openai(body.get("tools", []))
         messages = anthropic_messages_to_openai(body.get("messages", []))
         system = body.get("system")
@@ -949,7 +1139,8 @@ class H(http.server.BaseHTTPRequestHandler):
             try:
                 ids, gen, raw = infer(prompt, max_tokens, samp,
                                       cache_path=cache_path, cache_load=reuse,
-                                      cache_save=True, save_path=save_path)
+                                      cache_save=True, save_path=save_path,
+                                      context_id=context_id)
             except TimeoutError:
                 return self._json(504, {"error": "runner timeout"})
             except Exception as e:
@@ -972,7 +1163,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self._sse(head)
         self._sse({"type": "content_block_start", "index": 0,
                    "content_block": {"type": "text", "text": ""}})
-        tok_path = BASE + ".tok"
+        tok_path = (BASE + ".tok." + uuid.uuid4().hex) if RUNNER_SOCKET else BASE + ".tok"
         err = {}
         done = {"gen": []}
         stream_state = {"raw": "", "emitted": 0}
@@ -980,7 +1171,8 @@ class H(http.server.BaseHTTPRequestHandler):
             try:
                 p_ids, p_gen, _ = infer(prompt, max_tokens, samp, stream=True,
                                         cache_path=cache_path, cache_load=reuse,
-                                        cache_save=True, save_path=save_path)
+                                        cache_save=True, save_path=save_path,
+                                        context_id=context_id, stream_path=tok_path)
                 done["ids"] = p_ids
                 done["gen"] = p_gen
             except Exception as e:
@@ -1049,12 +1241,19 @@ class H(http.server.BaseHTTPRequestHandler):
             "codex", messages, tools, prompt)
         t0 = time.time()
         rid = "resp_ds4f_" + uuid.uuid4().hex
+        try: explicit_context = _body_context_id(body, self.headers)
+        except ValueError as exc: return self._json(400, {"error": str(exc)})
+        previous = body.get("previous_response_id")
+        with _response_context_lock:
+            inherited_context = _response_context_ids.get(previous) if previous else None
+        context_id = explicit_context or inherited_context or ("ctx_" + uuid.uuid4().hex)
         use = {"input_tokens": 0, "output_tokens": 0}
         if not stream:
             try:
                 ids, gen, raw = infer(prompt, max_tokens, samp,
                                       cache_path=cache_path, cache_load=reuse,
-                                      cache_save=True, save_path=save_path)
+                                      cache_save=True, save_path=save_path,
+                                      context_id=context_id)
             except TimeoutError:
                 return self._json(504, {"error": "runner timeout"})
             except Exception as e:
@@ -1073,7 +1272,7 @@ class H(http.server.BaseHTTPRequestHandler):
             assistant = {"role": "assistant", "content": content or None}
             if tool_calls:
                 assistant["tool_calls"] = tool_calls
-            _remember_response(rid, messages + [assistant])
+            _remember_response(rid, messages + [assistant], context_id)
             return self._json(200, {
                 "id": rid, "object": "response", "created_at": int(t0), "model": MODEL_ID,
                 "status": "completed", "output": output,
@@ -1096,7 +1295,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self._sse({"type": "response.content_part.added", "item_id": mid,
                    "output_index": 0, "content_index": 0,
                    "part": {"type": "output_text", "text": "", "annotations": []}})
-        tok_path = BASE + ".tok"
+        tok_path = (BASE + ".tok." + rid) if RUNNER_SOCKET else BASE + ".tok"
         err = {}
         done = {"gen": []}
         stream_state = {"raw": "", "emitted": 0}
@@ -1104,7 +1303,8 @@ class H(http.server.BaseHTTPRequestHandler):
             try:
                 p_ids, p_gen, _ = infer(prompt, max_tokens, samp, stream=True,
                                         cache_path=cache_path, cache_load=reuse,
-                                        cache_save=True, save_path=save_path)
+                                        cache_save=True, save_path=save_path,
+                                        context_id=context_id, stream_path=tok_path)
                 done["ids"] = p_ids
                 done["gen"] = p_gen
             except Exception as e:
@@ -1173,7 +1373,10 @@ class H(http.server.BaseHTTPRequestHandler):
         assistant = {"role": "assistant", "content": content or None}
         if tool_calls:
             assistant["tool_calls"] = tool_calls
-        _remember_response(rid, messages + [assistant])
+        _remember_response(rid, messages + [assistant], context_id)
+        if RUNNER_SOCKET:
+            try: os.unlink(tok_path)
+            except OSError: pass
         self._sse({"type": "response.completed", "response": {
             "id": rid, "object": "response", "created_at": int(t0), "model": MODEL_ID,
             "status": "completed", "output": output, "usage": use}})
@@ -1215,6 +1418,14 @@ class H(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runner-socket")
+    ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--tokenizer", default=TOK)
+    ap.add_argument("--response-state-dir", default=RESPONSE_STATE_DIR)
+    args = ap.parse_args()
+    RUNNER_SOCKET, PORT, TOK = args.runner_socket, args.port, args.tokenizer
+    RESPONSE_STATE_DIR = args.response_state_dir
     try:
         with open(RESPSEQ, "w") as f:
             f.write("0\n")                    # clear any stale response marker

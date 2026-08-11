@@ -101,6 +101,26 @@ class AgentInterfaceTest(unittest.TestCase):
         self.assertEqual(got[-1]["role"], "tool")
         self.assertEqual(got[-1]["tool_call_id"], "call-1")
 
+    def test_response_context_survives_frontend_memory_reset(self):
+        with tempfile.TemporaryDirectory() as root:
+            old_root = serve.RESPONSE_STATE_DIR
+            serve.RESPONSE_STATE_DIR = root
+            try:
+                serve._remember_response("resp-durable", [{"role": "user", "content": "hello"}],
+                                         "ctx-durable")
+                serve._response_contexts.clear(); serve._response_context_ids.clear()
+                got = serve._response_context_messages({
+                    "previous_response_id": "resp-durable", "input": "again"})
+                self.assertEqual(got[0]["content"], "hello")
+                self.assertEqual(serve._response_context_ids["resp-durable"], "ctx-durable")
+            finally:
+                serve.RESPONSE_STATE_DIR = old_root
+
+    def test_context_id_validation(self):
+        self.assertEqual(serve._body_context_id({"context_id": "ctx-1"}), "ctx-1")
+        with self.assertRaises(ValueError):
+            serve._body_context_id({"context_id": "x" * 257})
+
 
 if __name__ == "__main__":
     unittest.main()

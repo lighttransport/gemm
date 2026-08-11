@@ -19,6 +19,7 @@ void hip_ds4f_dense_set_prefill_features(hip_ds4f_dense *ctx, int qkv_fuse,
     int qkv_chain, int attn_chain, int no_d2h, int fp8_wmma, int bf16_wmma,
     int attn_wmma, int oproj_group_wmma, int mxfp4_wmma, int block_threads);
 void hip_ds4f_dense_set_decode_features(hip_ds4f_dense *ctx, int kv_resident);
+void hip_ds4f_dense_invalidate_decode_kv(hip_ds4f_dense *ctx);
 
 /* DS4F_HIP_BLOCK_THREADS selects the one-row block size (64, 128, or 256).
  * The default is 128 on gfx1201; it can be overridden for another GPU. */

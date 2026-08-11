@@ -77,6 +77,20 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   legacy single-file checkpoint/preload path.
 - **Slots** (`DS4F_SERVE_SLOTS`): per-conversation KV snapshots switched by
   the `slot` field (`<BASE>.slot.<i>` files).
+- **Cooperative multi-context serving** (single-node wrapper default): the
+  frontend and runner use a Unix socket, admit independent requests between
+  prefill/decode quanta, and keep the 156 GB weights loaded once. Responses API
+  chains inherit a context through `previous_response_id`; Chat Completions and
+  Anthropic Messages may supply `context_id` or `X-DS4F-Context-ID`.
+- Completed contexts stay in RAM for 600 seconds, then atomically spill to disk
+  for 24 hours. Defaults are 512 MiB RAM and 8 GiB disk. Configure the wrapper
+  with `--context-memory-ttl-sec`, `--context-disk-ttl-sec`,
+  `--context-memory-mb`, `--context-disk-mb`, `--prefill-quantum-tokens`,
+  `--decode-quantum-tokens`, and `--scheduler-quantum-ms`. These are program
+  arguments, not production tuning environment variables.
+- `GET /v1/contexts`, `GET /v1/contexts/<id>`, and
+  `DELETE /v1/contexts/<id>` expose and manage idle context state. The progress
+  endpoint reports the active context's real prefill/decode counters.
 - **Truncation**: the runner caps the prompt at `max_pos - max_new`, keeping
   the head (system prompt + tools) and the recent tail whole.
 - The model's own sliding-window (128) + compressed long-range (tierb2)

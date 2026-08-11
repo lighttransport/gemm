@@ -1755,11 +1755,17 @@ static char *models_json(const server_config *cfg) {
             "{\"id\":\"%s\",\"tasks\":[\"chat\",\"completions\"],\"backends\":[\"%s\"],\"is_vlm\":%s}",
             mp, cfg->g_llm.backend == LLM_BACKEND_DS4F ? "ds4f-x86" : "cpu",
             cfg->g_llm.is_vlm ? "true" : "false");
-        if (cfg->g_llm.backend == LLM_BACKEND_DS4F &&
-            strcmp(cfg->g_llm.model_path, "ds4f-q3") != 0)
-            sbuf_append(&out,
-                ",{\"id\":\"ds4f-q3\",\"tasks\":[\"chat\",\"completions\"],"
-                "\"backends\":[\"ds4f-x86\"],\"is_vlm\":false}");
+        if (cfg->g_llm.backend == LLM_BACKEND_DS4F) {
+            /* Expose stable logical aliases in addition to the staged path. */
+            if (strcmp(cfg->g_llm.model_path, "ds4f-q3") != 0)
+                sbuf_append(&out,
+                    ",{\"id\":\"ds4f-q3\",\"tasks\":[\"chat\",\"completions\"],"
+                    "\"backends\":[\"ds4f-x86\"],\"is_vlm\":false}");
+            if (strcmp(cfg->g_llm.model_path, "ds4f") != 0)
+                sbuf_append(&out,
+                    ",{\"id\":\"ds4f\",\"tasks\":[\"chat\",\"completions\"],"
+                    "\"backends\":[\"ds4f-x86\"],\"is_vlm\":false}");
+        }
         free(mp);
     } else {
         sbuf_append(&out,
