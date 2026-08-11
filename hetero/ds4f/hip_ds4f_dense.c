@@ -731,6 +731,29 @@ static int hip_ds4f_dense_add_storage(hip_ds4f_dense *ctx,
     return id;
 }
 
+/* Upload a transient matrix on the compute stream.  The synchronous helper
+ * above is appropriate for permanent dense bindings, but routed serving binds
+ * up to eighteen expert matrices per layer; blocking on every copy turns PCIe
+ * latency into the dominant term. */
+static int hip_ds4f_dense_add_storage_async(hip_ds4f_dense *ctx,
+                                            const uint8_t *w, const uint8_t *s,
+                                            int rows, int cols, int scale_cols,
+                                            size_t w_bytes, size_t s_bytes, int kind) {
+    if (!ctx || !w || !s || !valid_dims(rows, cols) || ctx->pending || ctx->multi_pending ||
+        hipSetDevice(ctx->device_id) != hipSuccess) return -1;
+    void *dw = NULL, *ds = NULL;
+    if (hipMalloc(&dw, w_bytes) != hipSuccess || hipMalloc(&ds, s_bytes) != hipSuccess) {
+        if (dw) hipFree(dw); if (ds) hipFree(ds); return -1;
+    }
+    if (hipMemcpyAsync(dw, w, w_bytes, hipMemcpyHostToDevice, ctx->stream) != hipSuccess ||
+        hipMemcpyAsync(ds, s, s_bytes, hipMemcpyHostToDevice, ctx->stream) != hipSuccess) {
+        hipFree(dw); hipFree(ds); return -1;
+    }
+    int id = append_device_matrix(ctx, dw, ds, w, s, rows, cols, scale_cols, kind, 0);
+    if (id < 0) { hipFree(dw); hipFree(ds); }
+    return id;
+}
+
 int hip_ds4f_dense_add(hip_ds4f_dense *ctx,
                        const uint8_t *w, const uint8_t *s,
                        int rows, int cols) {
@@ -753,6 +776,17 @@ int hip_ds4f_dense_bind_mxfp4_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t) {
     if (!ctx || !t || t->type != DS4F_MXFP4 || !t->w || !t->scale ||
         !valid_dims(t->rows, t->cols) || (t->cols & 31)) return -1;
     int id = hip_ds4f_dense_add_storage(ctx, (const uint8_t *)t->w,
+        t->scale, t->rows, t->cols, t->cols / 32,
+        (size_t)t->rows * (size_t)(t->cols / 2),
+        (size_t)t->rows * (size_t)(t->cols / 32), HIP_DS4F_MATRIX_MXFP4);
+    if (id >= 0) t->gpu_id = id;
+    return id;
+}
+
+static int hip_ds4f_dense_bind_mxfp4_tensor_async(hip_ds4f_dense *ctx, ds4f_tensor *t) {
+    if (!ctx || !t || t->type != DS4F_MXFP4 || !t->w || !t->scale ||
+        !valid_dims(t->rows, t->cols) || (t->cols & 31)) return -1;
+    int id = hip_ds4f_dense_add_storage_async(ctx, (const uint8_t *)t->w,
         t->scale, t->rows, t->cols, t->cols / 32,
         (size_t)t->rows * (size_t)(t->cols / 2),
         (size_t)t->rows * (size_t)(t->cols / 32), HIP_DS4F_MATRIX_MXFP4);
@@ -2204,7 +2238,7 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
                                (ds4f_tensor *)w2[s] };
         for (int j = 0; j < 3; ++j) {
             if (!tw[j] || tw[j]->gpu_id >= 0) continue;
-            transient[j][s] = hip_ds4f_dense_bind_mxfp4_tensor(ctx, tw[j]);
+            transient[j][s] = hip_ds4f_dense_bind_mxfp4_tensor_async(ctx, tw[j]);
             if (transient[j][s] < 0) goto routed_transient_fail;
         }
     }
