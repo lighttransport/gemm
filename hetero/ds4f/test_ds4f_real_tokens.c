@@ -55,17 +55,37 @@ static float cross_entropy(const float *logits, int n, int target) {
     return (float)(log(sum) + mx - logits[target]);
 }
 
+static int dump_logits_json(const char *path, const float *logits, int n,
+                            int prompt_tokens) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    int best = 0;
+    for (int i = 1; i < n; ++i) if (logits[i] > logits[best]) best = i;
+    fprintf(f, "{\n  \"source\":\"ds4f-real-token-gate\",\n"
+               "  \"prompt_tokens\":%d,\n  \"vocab\":%d,\n"
+               "  \"argmax_token\":%d,\n  \"argmax_logit\":%.9g,\n"
+               "  \"logits\":[\n    ", prompt_tokens, n, best, logits[best]);
+    for (int i = 0; i < n; ++i) {
+        if (i) fputc(',', f);
+        if (i && i % 8 == 0) fputs("\n    ", f);
+        fprintf(f, "%.9g", logits[i]);
+    }
+    fputs("\n  ]\n}\n", f);
+    return fclose(f) == 0 ? 0 : -1;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s --stage-dir dir --prompt-ids file [--config file.json] "
                     "[--model flash|ds4p|ds4fbase] [--ep-size n --ep-rank n "
-                    "--threads n --cmgs n --max-pos n] [--debug-env]\n", prog);
+                    "--threads n --cmgs n --max-pos n] [--dump-exact-logits file] "
+                    "[--debug-env]\n", prog);
 }
 
 int main(int argc, char **argv) {
     ds4f_runtime_options opt;
     ds4f_runtime_options_init(&opt);
-    char config_path[1024] = {0}, prompt_path[1024] = {0};
-    int debug_env = 0;
+    char config_path[1024] = {0}, prompt_path[1024] = {0}, dump_path[1024] = {0};
+    int debug_env = 0, max_tokens = 0, layer_stats = 0;
     for (int i = 1; i + 1 < argc; i++)
         if (strcmp(argv[i], "--config") == 0)
             snprintf(config_path, sizeof(config_path), "%s", argv[i + 1]);
@@ -86,6 +106,10 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--threads") == 0 && i + 1 < argc) opt.n_threads = atoi(argv[++i]);
         else if (strcmp(a, "--cmgs") == 0 && i + 1 < argc) opt.n_cmgs = atoi(argv[++i]);
         else if (strcmp(a, "--max-pos") == 0 && i + 1 < argc) opt.cfg.max_pos = atoi(argv[++i]);
+        else if (strcmp(a, "--dump-exact-logits") == 0 && i + 1 < argc)
+            snprintf(dump_path, sizeof(dump_path), "%s", argv[++i]);
+        else if (strcmp(a, "--max-tokens") == 0 && i + 1 < argc) max_tokens = atoi(argv[++i]);
+        else if (strcmp(a, "--layer-stats") == 0) layer_stats = 1;
         else if (strcmp(a, "--debug-env") == 0) debug_env = 1;
         else { usage(argv[0]); return 2; }
     }
@@ -106,6 +130,7 @@ int main(int argc, char **argv) {
         printf("SKIP: pass --stage-dir and --prompt-ids (or --debug-env for legacy paths)\n");
         return 0;
     }
+    if (layer_stats) setenv("DS4F_LAYER_STATS", "1", 1);
 
     ds4f_mem_pool *work_mem = ds4f_mem_pool_create();
     if (!work_mem) { fprintf(stderr, "real-token gate: allocation pool failed\n"); return 1; }
@@ -115,6 +140,7 @@ int main(int argc, char **argv) {
         ds4f_mem_pool_destroy(work_mem);
         return 1;
     }
+    if (max_tokens > 0 && n_ids > max_tokens) n_ids = max_tokens;
     ds4f_config cfg = opt.cfg;
     if (cfg.max_pos < n_ids + 2) cfg.max_pos = n_ids + 2;
     opt.cfg = cfg;
@@ -183,6 +209,10 @@ int main(int argc, char **argv) {
            "mean_ce_exact=%.8g mean_ce_w4a8=%.8g delta=%.8g\n",
            n_ids, arg_mismatch, nonfinite ? "FAIL" : "PASS",
            worst_abs, worst_rel, ce_ref, ce_fast, ce_fast - ce_ref);
+    if (dump_path[0] && dump_logits_json(dump_path, ref->s_logits, V, n_ids) != 0) {
+        fprintf(stderr, "cannot write exact logits: %s\n", dump_path);
+        nonfinite = 1;
+    }
 
     ds4f_free(fast); ds4f_free(ref); ds4f_mem_pool_destroy(work_mem);
     return (!nonfinite && arg_mismatch == 0) ? 0 : 1;

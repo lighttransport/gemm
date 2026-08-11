@@ -225,7 +225,10 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
     m->gpu_attn_device_chain = attn_device_chain != 0;
     m->gpu_attn_no_d2h = attn_no_d2h != 0;
     m->gpu_routed_ffn_enabled = routed_ffn != 0;
-    m->gpu_decode_routed_ffn_enabled = 0;
+    /* The same routed callback is valid for the single-token path.  Keeping
+     * this disabled forced every decode token through host-side MXFP4 expert
+     * execution, even after prompt-hot experts had been admitted to VRAM. */
+    m->gpu_decode_routed_ffn_enabled = routed_ffn != 0;
     m->gpu_dense_layer_prefetch = expert_stream
         ? hip_ds4f_dense_prefetch_layer_raw : NULL;
     m->gpu_dense_layer_begin = expert_stream

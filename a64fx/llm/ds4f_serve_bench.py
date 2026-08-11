@@ -33,6 +33,9 @@ def main():
     ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-expert-stream", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-expert-pinned-staging", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--hip-expert-cache-mb", type=int, default=0,
+                    help="cache prompt-hot routed experts on GPU before decode (0 disables)")
+    ap.add_argument("--hip-expert-cache-reserve-mb", type=int, default=1536)
     ap.add_argument("--cpu-only", action="store_true")
     args = ap.parse_args()
 
@@ -53,10 +56,18 @@ def main():
                   args.hip_expert_pinned_staging))
     greedy = Sampling(0.0, 1.0, 1, 0.0, 1.0, 1)
     try:
+        if args.hip_expert_cache_mb and sess.enable_route_telemetry(True) != 0:
+            raise RuntimeError("route telemetry is unavailable")
         t0 = time.perf_counter()
         if sess.prefill(prompt, 0) != 0:
             raise RuntimeError("prefill failed")
         prefill_s = time.perf_counter() - t0
+        cache_result = None
+        if args.hip_expert_cache_mb:
+            cache_result = sess.cache_hot_experts(
+                args.hip_expert_cache_mb, args.hip_expert_cache_reserve_mb, 1)
+            if cache_result < 0:
+                raise RuntimeError("hot expert cache initialization failed")
         pos = len(prompt)
         for _ in range(args.warm_decode):
             token = sess.sample(greedy)
@@ -74,6 +85,8 @@ def main():
         decode_s = time.perf_counter() - t0
         print("prefill tokens=%d seconds=%.6f tok/s=%.3f" %
               (len(prompt), prefill_s, len(prompt) / prefill_s))
+        if cache_result is not None:
+            print("hot expert cache result=%d" % cache_result)
         print("decode warm=%d tokens=%d seconds=%.6f tok/s=%.3f" %
               (args.warm_decode, completed, decode_s, completed / decode_s))
     finally:

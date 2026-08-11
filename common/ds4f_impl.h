@@ -7485,6 +7485,13 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
     int hc = c->hc_mult; size_t hcC = (size_t)hc*C;
     float post_a[16], comb_a[64], post_f[16], comb_f[64];   /* per-block sinkhorn weights */
     if (m->mhc) for (int k = 0; k < hc; k++) memcpy(m->s_x4 + (size_t)k*C, x, (size_t)C*4);
+    if (ds4f_dbg && pos == 0) {
+        fprintf(stderr, "  embedding=");
+        for (int i = 0; i < 8; ++i) fprintf(stderr, " %.9g", x[i]);
+        fputc('\n', stderr);
+    }
+    int layer_stats = 0;
+    { const char *e = getenv("DS4F_LAYER_STATS"); layer_stats = e && atoi(e) != 0; }
     for (int L = 0; L < c->n_layers; L++) {
         ds4f_layer *ly = &m->layers[L];
         /* exact RoPE table for this layer: sparse layers (compress_ratio!=0) use
@@ -7639,12 +7646,22 @@ decode_oproj_done:;
             ds4f_hc_pre(m, m->s_x4, ly->hc_ffn_fn, ly->hc_ffn_scale, ly->hc_ffn_base,
                         m->s_xc, post_f, comb_f);
             fsrc = m->s_xc;
+            if (ds4f_dbg && L == 0) {
+                fprintf(stderr, "  L0 ffn_cur=");
+                for (int i = 0; i < 8; ++i) fprintf(stderr, " %.9g", fsrc[i]);
+                fputc('\n', stderr);
+            }
             DS4F_TOC(DS4F_P_MHCPRE);
             { DS4F_TIC(); memcpy(m->s_resid, m->s_x4, hcC*4); DS4F_TOC(DS4F_P_MHCCPY); }
         }
         /* ---- MoE: shared expert ---- */
         ds4f_rmsnorm(m->s_h2, fsrc, ly->ffn_norm, C, eps);
         ds4f_chk("ffn_norm", L, m->s_h2, C);
+        if (ds4f_dbg && L == 0) {
+            fprintf(stderr, "  L0 router_x=");
+            for (int i = 0; i < 8; ++i) fprintf(stderr, " %.9g", m->s_h2[i]);
+            fputc('\n', stderr);
+        }
         for (int i = 0; i < C; i++) { m->s_moe[i] = 0.f; m->s_route[i] = 0.f; }
         int tps = (m->sh_rows < c->shared_inter);              /* TP shared-expert (sh_w1/w3 col-shard) */
         int tps2 = tps && (m->sh2_rows < C);                  /* optional sh_w2 hidden-row shard */
@@ -7842,6 +7859,18 @@ decode_oproj_done:;
               DS4F_TOC(DS4F_P_MHCPOST); }
         } else for (int i = 0; i < C; i++) x[i] += (tps ? 0.f : m->s_moe[i]) + m->s_route[i];  /* shared(local|folded)+routed */
         ds4f_chk("x+moe", L, m->mhc ? m->s_x4 : x, C);
+        if (layer_stats) {
+            const float *z = m->mhc ? m->s_x4 : x;
+            size_t nz = m->mhc ? hcC : (size_t)C;
+            float mn = z[0], mx = z[0]; double ss = 0.0;
+            for (size_t i = 0; i < nz; ++i) {
+                if (z[i] < mn) mn = z[i];
+                if (z[i] > mx) mx = z[i];
+                ss += (double)z[i] * z[i];
+            }
+            fprintf(stderr, "ds4f-layer[%d] min=%g max=%g rms=%g\n",
+                    L, mn, mx, sqrt(ss / (double)nz));
+        }
     }
     /* head: mHC collapse 4 streams -> 1 (no sinkhorn), then out_norm + lm_head */
     float *hsrc = x;

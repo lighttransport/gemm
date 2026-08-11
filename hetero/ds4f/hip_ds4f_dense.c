@@ -1163,12 +1163,24 @@ typedef struct {
     int layer, expert;
 } hip_ds4f_hot_expert;
 
+typedef struct {
+    uint64_t hits;
+    int layer;
+} hip_ds4f_hot_layer;
+
 static int hot_expert_cmp(const void *ap, const void *bp) {
     const hip_ds4f_hot_expert *a = (const hip_ds4f_hot_expert *)ap;
     const hip_ds4f_hot_expert *b = (const hip_ds4f_hot_expert *)bp;
     if (a->hits != b->hits) return a->hits < b->hits ? 1 : -1;
     if (a->layer != b->layer) return a->layer - b->layer;
     return a->expert - b->expert;
+}
+
+static int hot_layer_cmp(const void *ap, const void *bp) {
+    const hip_ds4f_hot_layer *a = (const hip_ds4f_hot_layer *)ap;
+    const hip_ds4f_hot_layer *b = (const hip_ds4f_hot_layer *)bp;
+    if (a->hits != b->hits) return a->hits < b->hits ? 1 : -1;
+    return a->layer - b->layer;
 }
 
 static size_t expert_bundle_bytes(const ds4f_layer *layer, int slot) {
@@ -1238,6 +1250,46 @@ int hip_ds4f_dense_cache_hot_experts(void *opaque, void *model_opaque,
         used += bytes;
         covered += cand[i].hits;
         admitted++;
+    }
+
+    /* A routed decode can use the GPU callback only when all six selected
+     * experts in a layer are resident.  Prompt-hot admission normally leaves
+     * most of the VRAM budget unused because only experts observed in the
+     * prompt are candidates.  Fill that slack with complete hot layers so a
+     * future decode token gets an all-GPU routed step instead of paying a
+     * host fallback for a partially cached layer. */
+    hip_ds4f_hot_layer *layers = (hip_ds4f_hot_layer *)calloc((size_t)L, sizeof(*layers));
+    if (layers) {
+        for (int l = 0; l < L; ++l) layers[l].layer = l;
+        for (int l = 0; l < L; ++l)
+            for (int e = 0; e < E; ++e)
+                if (e % model->ep_size == model->ep_rank)
+                    layers[l].hits += model->route_hits[(size_t)l * E + e];
+        qsort(layers, (size_t)L, sizeof(*layers), hot_layer_cmp);
+        for (int li = 0; li < L; ++li) {
+            int l = layers[li].layer;
+            size_t layer_bytes = 0;
+            for (int e = 0; e < E; ++e) if (e % model->ep_size == model->ep_rank)
+                layer_bytes += expert_bundle_bytes(&model->layers[l], e / model->ep_size);
+            if (!layer_bytes || layer_bytes > budget - used) continue;
+            for (int e = 0; e < E; ++e) {
+                if (e % model->ep_size != model->ep_rank) continue;
+                ds4f_tensor *t[3] = {
+                    &model->layers[l].ex_w1[e / model->ep_size],
+                    &model->layers[l].ex_w3[e / model->ep_size],
+                    &model->layers[l].ex_w2[e / model->ep_size] };
+                if (t[0]->gpu_id < 0 || t[1]->gpu_id < 0 || t[2]->gpu_id < 0) {
+                    if (hip_ds4f_dense_bind_mxfp4_tensor(ctx, t[0]) < 0 ||
+                        hip_ds4f_dense_bind_mxfp4_tensor(ctx, t[1]) < 0 ||
+                        hip_ds4f_dense_bind_mxfp4_tensor(ctx, t[2]) < 0) {
+                        free(layers); free(cand); return -1;
+                    }
+                }
+            }
+            used += layer_bytes;
+            admitted += E / model->ep_size;
+        }
+        free(layers);
     }
     if (stats || ctx->verbose) {
         fprintf(stderr,
