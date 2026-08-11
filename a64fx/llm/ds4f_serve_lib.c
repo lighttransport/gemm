@@ -112,6 +112,16 @@ int ds4f_serve_set_adaptive_cache(ds4f_serve *s, int period,
     s->ac_cache_mb = cache_mb;
     s->ac_reserve_mb = reserve_mb > 0 ? reserve_mb : 1536;
     s->ac_decode_calls = 0;
+    /* The setter is normally called after prefill.  Snapshot now so the
+     * first refresh ranks experts from decode traffic only, rather than
+     * accidentally treating the entire prompt as a decode window. */
+    if (s->ac_period > 0 && s->m && s->m->route_hits) {
+        size_t n = (size_t)s->m->cfg.n_layers * (size_t)s->m->cfg.n_experts;
+        if (!s->ac_snapshot) s->ac_snapshot = (uint64_t *)malloc(n * sizeof(uint64_t));
+        if (!s->ac_delta) s->ac_delta = (uint64_t *)malloc(n * sizeof(uint64_t));
+        if (!s->ac_snapshot || !s->ac_delta) return -1;
+        memcpy(s->ac_snapshot, s->m->route_hits, n * sizeof(uint64_t));
+    }
     return 0;
 #else
     (void)s; (void)period; (void)cache_mb; (void)reserve_mb;
