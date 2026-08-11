@@ -119,6 +119,45 @@ exp_gpu   0.470 s   6.8% of profiled total
 
 **This means the pool/telemetry work above (upload/launch/sync split) only affects prefill, not the harder 18 tok/s decode target.** The real decode lever is raising the effective cache hit rate — either a bigger/smarter admission budget, an online/adaptive cache instead of the current static post-prefill snapshot, or speeding up the CPU fallback path itself. Not yet attempted; needs a decision on approach before more code.
 
+## Cache budget is not the limiter; longer prompts don't help decode either (2026-08-12)
+
+Tested raising `--hip-expert-cache-mb` from `auto` toward the full free VRAM (tried 20000 MB with 1536 MB reserve, vs. `auto`/-1 which already computes `free_bytes - reserve` when no explicit cap is given). **Identical result to `auto`**: `bundles=449 bytes=6.003GB training_coverage=47.24%`, decode still ~5.0 tok/s. `auto` was already using all available headroom — the 47% coverage ceiling is set by how many distinct experts the 64-token prompt actually touched, not by VRAM budget. There was nothing more to admit.
+
+Tested prompt length directly as a fix (1024 and 8192 tokens, `--hip-expert-cache-mb auto`): coverage got *worse*, not better, as context grew (47.2% -> 41.9% -> 28.1%), and decode throughput dropped correspondingly (5.00 -> 3.23 -> 3.25 tok/s). Longer prompts spread routing across more distinct experts (diluting the fixed-size hot-cache's coverage of total routing mass) and their larger prefill activation buffers eat into the free VRAM available at cache-admission time (449 -> 336 -> 177 bundles admitted as prompt length grew, despite `auto` still targeting max headroom each time). **Rules out "use a longer/more realistic prompt" as a decode-cache fix — it's a headwind, not a help.** The online/adaptive-cache and CPU-fallback-speedup options from the prior finding remain the live candidates for decode; still not attempted.
+
+## Prefill scaling and the real prefill bottleneck (2026-08-12)
+
+Prefill throughput by prompt length (`--hip-expert-cache-mb auto`, `DS4F_PROF=1`):
+
+| tokens | tok/s |
+|---|---|
+| 64 | 3.75 |
+| 1024 | 11.03 |
+| 8192 | 11.65 |
+
+Scaling plateaus fast: 1024->8192 (8x tokens) only gained ~6%. At 8192 tokens, `hip_route` (the routed-FFN GPU work the pool/telemetry above targets) was only 63s of 703s total prefill wall time — 9%. The other 91% was invisible to any existing telemetry, because **the actual prefill compute function, `ds4f_forward_verify` (common/ds4f_impl.h:7000-7315, called from `ds4f_serve_prefill` in a64fx/llm/ds4f_serve_lib.c:353), had zero `DS4F_TIC`/`DS4F_TOC` instrumentation** — every phase name printed under `DS4F_PROF=1` (qkv_proj, attn, experts, tb2*, etc.) was actually reporting only the tiny per-token *decode* function's (`ds4f_forward_token`) contribution, not prefill's.
+
+**Retraction:** the earlier "tb2scan = 75.5s across 6 decode tokens, likely a one-time ctx-scaling stall" finding was a measurement artifact of this same gap, not a real anomaly — that number was decode-only and had nothing to do with the 8192-token prefill that preceded it. Disregard it.
+
+Added phase timers directly inside `ds4f_forward_verify`, reusing the same `DS4F_P_*` ids as decode (manually-scoped local timestamps rather than the `DS4F_TIC`/`DS4F_TOC` macro in the outer per-layer scope, since the macro's fixed `_t0` name would collide across sibling blocks not wrapped in their own braces; the existing `DS4F_TIC()` macro is still used for the per-position `ds4f_tb2_prepare` sub-timer since each `k` loop iteration is already a fresh scope). Measured at 1024 tokens, cache disabled to isolate prefill:
+
+```text
+attn        34.019 s  41.7%   <- now the single largest phase, not experts
+experts     24.215 s  29.7%   (hip_route's 21.977s + ~2s CPU-side routing overhead)
+qkv_proj     4.271 s   5.2%
+head         2.085 s   2.6%
+shared       2.488 s   3.1%
+o_proj       1.949 s   2.4%
+router       0.158 s   0.2%
+  tb2prep (nested in attn)   5.984 s -- only 18% of attn's total
+```
+
+These 7 top-level phases sum to 69.16s, matching the measured 68.89s prefill wall time almost exactly — full accounting, nothing left unexplained. Within `attn`, `tb2prep` (the per-position index/compression scan) is a real but minority contributor (18%); the majority (~82%, ~28s) is the actual attention compute itself. The attention block dispatches the thread pool once per token per layer (`ds4f_pool_run` inside a `for k in K` loop, ~1024 x 43 ≈ 44,000 calls at this prompt length) — a strong candidate for per-position dispatch overhead dominating over raw compute, distinct from anything the routed-FFN work touches.
+
+Verified: mHC exact quality gate still 8/9 (no regression, telemetry-only change), no VRAM leak, no orphan processes.
+
+**Attention (42% of prefill) is now the clear top lever for the 100-200 tok/s prefill target — bigger than the routed-FFN/expert-upload work already done.** Not yet root-caused further (compute-bound vs. dispatch-overhead-bound) or optimized. Needs a decision on whether to dig into per-position dispatch batching vs. raw attention kernel cost before writing more code.
+
 ## Quality evidence
 
 Use mHC enabled for the authoritative exact path:
@@ -182,9 +221,11 @@ curl -s --max-time 5 http://127.0.0.1:8080/v1/progress
 2. ~~Add phase-level serving telemetry inside routed FFN.~~ Done 2026-08-11: see "Phase telemetry" above.
 3. ~~Retry pooling with per-slot event guards.~~ Done 2026-08-11: stable, quality-clean, modest win (~8-9%). See "Pool retry with per-slot events" above. **The dominant cost (upload, ~90% of routed-FFN time) is real PCIe transfer of expert weights, not allocator overhead — pooling buffers wasn't enough.**
 4. ~~Implement cross-call expert-weight caching.~~ Superseded 2026-08-11: this already existed (`hip_ds4f_dense_cache_hot_experts`) and tested as producing no measurable decode speedup — see "Decode does not use the routed-FFN path we optimized" above. Do not re-attempt a pool-side cache for decode; the bottleneck is elsewhere.
-5. **Raise decode's effective cache hit rate — the real lever, not yet attempted.** `exp_cpu` (CPU fallback for cache misses) is measured at ~2.7x the cost of `exp_gpu` (cache-hit GPU path) and dominates decode wall time given ~25-55% per-layer hot8_coverage. Candidate directions: (a) increase `--hip-expert-cache-mb` budget toward using more of the ~9GB free VRAM (currently `auto` picked 6GB/449 bundles at 47% coverage — check whether raising it meaningfully raises coverage and hit rate); (b) replace the static post-prefill snapshot cache with an online/adaptive cache that admits/evicts based on live decode-time routing, not just the one-shot prompt stats; (c) speed up the CPU MXFP4 fallback path itself for cache misses. Needs a decision on approach before writing code — these are different-sized efforts.
-6. Test 256, 1024, and 8192-token prefills (quality gate for the pool retry already passed at 9-token scale). Watch VRAM and abort unsafe runs.
-7. Continue committing incrementally (telemetry, event-guarded pool, and decode CPU/GPU phase split are already committed, see below) — after each further runtime-stable, measurably-improving change, commit with a short imperative subject and report the hash plus exact commands/results.
+5. ~~Raise `--hip-expert-cache-mb` toward full free VRAM.~~ Done 2026-08-12: no effect, `auto` already used all available headroom — see "Cache budget is not the limiter" above. Coverage is capped by prompt diversity, not budget.
+6. ~~Test 256, 1024, and 8192-token prefills.~~ Done 2026-08-12 for 1024 and 8192 (256 not yet run; low priority now that the pattern is clear). See "Prefill scaling and the real prefill bottleneck" above — scaling plateaus around 11-12 tok/s, and decode's cache coverage got worse (not better) at longer context, ruling out "just use a realistic prompt" as a fix for either target.
+7. **Decode's real lever remains raising effective cache hit rate** (unchanged from before, budget/prompt-length are now ruled out as the fix): (a) online/adaptive cache that admits/evicts based on live decode-time routing instead of a one-shot post-prefill snapshot; (b) speed up the CPU MXFP4 fallback path itself for cache misses. Not yet attempted.
+8. **Prefill's real lever is attention (42% of wall time), not routed-FFN (which is already optimized and is only ~30% via the "experts" bucket).** Root-cause whether attn's cost is per-position thread-pool dispatch overhead (~44,000 `ds4f_pool_run` calls at 1024 tokens/43 layers) or raw compute, then optimize accordingly — e.g. batching the per-position loop in `ds4f_forward_verify` (common/ds4f_impl.h:7106) across multiple positions per dispatch instead of one `ds4f_pool_run` per token. Not yet attempted.
+9. Continue committing incrementally (telemetry, event-guarded pool, decode CPU/GPU phase split, and prefill phase split are already committed, see below) — after each further runtime-stable, measurably-improving change, commit with a short imperative subject and report the hash plus exact commands/results.
 
 **Reminder:** `ds4f_serve_bench.py` loads its own model standalone — stop any running `run_ds4f_single_serve.sh` server first, or numbers will be contention-skewed (see verdict above).
 

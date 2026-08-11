@@ -7042,6 +7042,11 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         int ratio = c->compress_ratios[L];
         const float *rcos = ratio ? m->rope_comp_cos : m->rope_dense_cos;
         const float *rsin = ratio ? m->rope_comp_sin : m->rope_dense_sin;
+        /* Prefill (ds4f_forward_verify) had no phase telemetry at all before
+         * this instrumentation -- DS4F_PROF output only ever reflected the
+         * per-token decode function. These TIC/TOC calls reuse the same
+         * phase ids as decode so the two are directly comparable. */
+        double _pf_t_qkv0 = ds4f_prof_on ? ds4f_now() : 0.0;
         /* mHC pre: one pooled mix/RMS/sinkhorn/collapse sequence for the whole tile. */
         ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_attn_fn, ly->hc_attn_scale, ly->hc_attn_base,
                           m->p_x, pa, 16, ca, 64);
@@ -7097,7 +7102,9 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                 cmp_kv_pf = cmp_score_pf = NULL;
             }
         }
+        if (ds4f_prof_on) m->prof[DS4F_P_QKV] += ds4f_now() - _pf_t_qkv0;
         /* per-position tier-B2 attention (causal: append KV then attend, in order) */
+        double _pf_t_attn0 = ds4f_prof_on ? ds4f_now() : 0.0;
         for (int k = 0; k < K; k++) {
             int pos = m->dec_batch_pos && m->dec_nseq == K ? m->dec_batch_pos[k] : pos0 + k;
             if (m->dec_batch_seq && m->dec_nseq == K)
@@ -7111,10 +7118,13 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             memcpy(m->s_hn, m->p_hn + (size_t)k*C, (size_t)C*4);     /* compressor reads s_hn */
             memcpy(m->s_q,  m->p_q  + (size_t)k*H, (size_t)H*4);     /* indexer + attention read s_q */
             m->s_idx_qpre = idxg_pf ? m->v_idxq + (size_t)k*idxHhd : NULL;
-            if (m->tierb2 && ratio)
+            if (m->tierb2 && ratio) {
+                DS4F_TIC();
                 ds4f_tb2_prepare(m, ly, ratio, pos, rcos, rsin,
                     cmp_kv_pf ? cmp_kv_pf + (size_t)k*cmpW : NULL,
                     cmp_score_pf ? cmp_score_pf + (size_t)k*cmpW : NULL);
+                DS4F_TOC(DS4F_P_TB2PREP);
+            }
             m->s_idx_qpre = NULL;
             if (snaps && ratio && k < K-1)                           /* state after THIS position, this layer */
                 ds4f_tb2_snap_layer(m, L, snaps + (size_t)k*snap_stride + snap_loff, 0);
@@ -7127,11 +7137,13 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                 ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
             memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4);
         }
+        if (ds4f_prof_on) m->prof[DS4F_P_ATTN] += ds4f_now() - _pf_t_attn0;
         if (cmp_kv_pf) ds4f_map_free(cmp_kv_pf);
         if (cmp_score_pf) ds4f_map_free(cmp_score_pf);
         if (m->dec_batch_seq && m->dec_nseq == K)
             ds4f_lseq_apply(ly, &m->dec_batch_seq[L]);
         if (snaps) snap_loff += ds4f_tb2_snap_layer_bytes(m, L);
+        double _pf_t_oproj0 = ds4f_prof_on ? ds4f_now() : 0.0;
         /* batched grouped low-rank o-projection (no-TP) */
         int gpu_oproj = m->gpu_oproj && ly->wo_a.gpu_id >= 0 &&
             ly->wo_b.gpu_id >= 0 && m->gpu_oproj(m->gpu_dense_ctx, m->p_o,
@@ -7144,6 +7156,8 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             }
             ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);
         }
+        if (ds4f_prof_on) m->prof[DS4F_P_OPROJ] += ds4f_now() - _pf_t_oproj0;
+        double _pf_t_shared0 = ds4f_prof_on ? ds4f_now() : 0.0;
         ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, pa, 16, ca, 64);
         /* mHC pre (ffn). */
         ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_ffn_fn, ly->hc_ffn_scale, ly->hc_ffn_base,
@@ -7185,8 +7199,12 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             }
         } else if (!shared_fused)
             ds4f_gemm(m, m->p_moe, &ly->sh_w2, m->p_shg, K, C, c->shared_inter);
+        if (ds4f_prof_on) m->prof[DS4F_P_SHARED] += ds4f_now() - _pf_t_shared0;
         /* router + routed experts (bucketed batched GEMM, reuse the prefill scheme) */
+        double _pf_t_router0 = ds4f_prof_on ? ds4f_now() : 0.0;
         ds4f_gemm(m, m->p_router, &ly->gate, m->p_h2, K, c->n_experts, C);
+        if (ds4f_prof_on) m->prof[DS4F_P_ROUTER] += ds4f_now() - _pf_t_router0;
+        double _pf_t_experts0 = ds4f_prof_on ? ds4f_now() : 0.0;
         { int no = ly->n_owned;
           for (int s = 0; s < no; s++) m->ex_cnt[s] = 0;
           for (int k = 0; k < K; k++) {
@@ -7291,7 +7309,9 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             for (int i = 0; i < C; i++) o[i] = (tps ? 0.f : mo[i]) + ro[i];
         }
         ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, pf, 16, cf, 64);
+        if (ds4f_prof_on) m->prof[DS4F_P_EXPERTS] += ds4f_now() - _pf_t_experts0;
     }
+    double _pf_t_head0 = ds4f_prof_on ? ds4f_now() : 0.0;
     /* head: per-position hc_head collapse -> out_norm (batched) -> lm_head GEMM -> per-position argmax */
     for (int k = 0; k < K; k++) ds4f_hc_head(m, m->v_x4 + (size_t)k*hcC, m->p_x + (size_t)k*C);
     { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, m->out_norm, C, K, C, C };
@@ -7311,6 +7331,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
       if (tph && m->ar_argmax_cb) for (int k = 0; k < K; k++) { int32_t idx = out_tok[k]; float v = hval[k];
           m->ar_argmax_cb(&v, &idx, m->ar_argmax_ctx); out_tok[k] = idx; } }
     if (out_hc) memcpy(out_hc, m->v_x4, (size_t)K*hcC*4);
+    if (ds4f_prof_on) m->prof[DS4F_P_HEAD] += ds4f_now() - _pf_t_head0;
     free(hc_scratch);
 }
 
