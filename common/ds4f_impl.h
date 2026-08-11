@@ -5447,9 +5447,10 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
                 ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
             if (ds4f_prof_on) m->prof[DS4F_P_ATTN] += ds4f_now()-tv;
-            memcpy(m->p_attn+(size_t)k*H+(size_t)m->attn_h0*HD,
+            int AH=(m->attn_h1-m->attn_h0)*HD;
+            memcpy(m->p_attn+(size_t)k*AH,
                    m->s_attn+(size_t)m->attn_h0*HD,
-                   (size_t)(m->attn_h1-m->attn_h0)*HD*4);
+                   (size_t)AH*4);
             m->s_hn = saved_hn;
             m->s_q = saved_q;
         }
@@ -5463,11 +5464,12 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         if (tpo) {
             int olora=c->o_lora, g_lo=m->oi0/olora;
             int g_hi=(m->oi0+m->oi_rows-1)/olora;
+            int ah0=m->attn_h0*HD, AH=(m->attn_h1-m->attn_h0)*HD;
             for (int g=g_lo; g<=g_hi; g++) {
                 int rlo=g*olora > m->oi0 ? g*olora : m->oi0;
                 int rhi=(g+1)*olora < m->oi0+m->oi_rows ? (g+1)*olora : m->oi0+m->oi_rows;
                 ds4f_tensor vg=ds4f_row_slice(&ly->wo_a,rlo-m->oi0,rhi-rlo);
-                ds4f_gemm(m,m->p_o1+(rlo-m->oi0),&vg,m->p_attn+(size_t)g*gin,K,m->oi_rows,H);
+                ds4f_gemm(m,m->p_o1+(rlo-m->oi0),&vg,m->p_attn+(size_t)(g*gin-ah0),K,m->oi_rows,AH);
             }
         } else for (int g = 0; g < og; g++) {
             ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g*c->o_lora, c->o_lora);
