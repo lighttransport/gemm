@@ -32,7 +32,7 @@ static void usage(const char *prog) {
                     "--hip-mxfp4-resident-auto 0|1 --hip-vram-reserve-mb n "
                     "--hip-mxfp4-stream-raw 0|1 "
                     "--hip-expert-cache-mb 0|auto|MB --hip-expert-cache-stats 0|1 "
-                    "--hip-prefill-attn 0|1 --hip-qkv-fuse 0|1 "
+                    "--hip-prefill-attn 0|1 --hip-tb2-batch 0|1 --hip-qkv-fuse 0|1 "
                     "--hip-qkv-device-chain 0|1 --hip-attn-device-chain 0|1 "
                     "--hip-attn-no-d2h 0|1 --hip-routed-ffn 0|1 "
                     "--hip-fp8-wmma 0|1|2 --hip-bf16-wmma 0|1 "
@@ -360,6 +360,9 @@ static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
     m->gpu_dense_layer_prefetch = NULL;
     m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
+    m->gpu_prefill_attn_partial = opt->hip_prefill_attn
+        ? hip_ds4f_dense_prefill_attention_partial : NULL;
+    m->gpu_tb2_batch_enabled = opt->hip_prefill_attn && opt->hip_tb2_batch;
     /* Mixed dispatch is not a precision mode.  Without it a group holding
      * one CPU-only member (the router gate beside shared w2) sends every
      * member to the CPU; each member keeps its own arithmetic either way. */
@@ -857,6 +860,7 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(a, "--hip-expert-cache-stats") == 0 && i + 1 < argc) opt.hip_expert_cache_stats = atoi(argv[++i]);
         else if (strcmp(a, "--hip-prefill-attn") == 0 && i + 1 < argc) opt.hip_prefill_attn = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-tb2-batch") == 0 && i + 1 < argc) opt.hip_tb2_batch = atoi(argv[++i]);
         else if (strcmp(a, "--hip-qkv-fuse") == 0 && i + 1 < argc) opt.hip_qkv_fuse = atoi(argv[++i]);
         else if (strcmp(a, "--hip-qkv-device-chain") == 0 && i + 1 < argc) opt.hip_qkv_device_chain = atoi(argv[++i]);
         else if (strcmp(a, "--hip-attn-device-chain") == 0 && i + 1 < argc) opt.hip_attn_device_chain = atoi(argv[++i]);

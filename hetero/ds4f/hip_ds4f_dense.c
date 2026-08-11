@@ -231,6 +231,8 @@ struct hip_ds4f_dense {
     size_t route_pool_sb[3][HIP_DS4F_GEMM_MAX];
     hipEvent_t route_pool_ev[3][HIP_DS4F_GEMM_MAX];
     int route_pool_ev_valid[3][HIP_DS4F_GEMM_MAX];
+    void *route_pack_hw[3], *route_pack_hs[3];
+    size_t route_pack_hw_bytes[3], route_pack_hs_bytes[3];
     hip_ds4f_resident_layer *resident_layers;
     int n_resident_layers, cap_resident_layers;
 };
@@ -356,6 +358,12 @@ static void clear_matrices(hip_ds4f_dense *ctx) {
         if (ctx->route_pool_ev[j][s] && hipEventDestroy) hipEventDestroy(ctx->route_pool_ev[j][s]);
         ctx->route_pool_ev[j][s] = NULL;
         ctx->route_pool_ev_valid[j][s] = 0;
+    }
+    for (int j = 0; j < 3; ++j) {
+        if (ctx->route_pack_hw[j] && hipHostFree) hipHostFree(ctx->route_pack_hw[j]);
+        if (ctx->route_pack_hs[j] && hipHostFree) hipHostFree(ctx->route_pack_hs[j]);
+        ctx->route_pack_hw[j] = ctx->route_pack_hs[j] = NULL;
+        ctx->route_pack_hw_bytes[j] = ctx->route_pack_hs_bytes[j] = 0;
     }
 }
 
@@ -899,6 +907,75 @@ static int hip_ds4f_dense_bind_mxfp4_tensor_async_pool(hip_ds4f_dense *ctx,
                                   HIP_DS4F_MATRIX_MXFP4, 1);
     if (id >= 0) t->gpu_id = id;
     return id;
+}
+
+/* Pack every active tensor for one routed projection into a single pinned
+ * host slab and submit two H2D copies (weights and scales).  PCIe transaction
+ * setup dominated the exact path when it submitted two copies per expert. */
+static int hip_ds4f_dense_bind_mxfp4_projection_batch(
+    hip_ds4f_dense *ctx, const ds4f_tensor *const *src, const int *counts,
+    int n_experts, int projection, int *ids) {
+    if (!ctx || !src || !counts || !ids || projection < 0 || projection >= 3 ||
+        !ctx->expert_pinned_staging || !hipHostMalloc || !hipHostFree)
+        return -1;
+    size_t total_w = 0, total_s = 0;
+    for (int e = 0; e < n_experts; ++e) if (counts[e] > 0 && src[e]->gpu_id < 0) {
+        const ds4f_tensor *t = src[e];
+        if (!t || t->type != DS4F_MXFP4 || !t->w || !t->scale ||
+            !valid_dims(t->rows, t->cols) || (t->cols & 31)) return -1;
+        total_w += (size_t)t->rows * (size_t)(t->cols / 2);
+        total_s += (size_t)t->rows * (size_t)(t->cols / 32);
+    }
+    if (!total_w) return 0;
+    int j = projection;
+    if (ctx->route_pool_ev_valid[j][0]) {
+        if (hipEventSynchronize(ctx->route_pool_ev[j][0]) != hipSuccess) return -1;
+        ctx->route_pool_ev_valid[j][0] = 0;
+    }
+    if (ctx->route_pool_wb[j][0] < total_w || ctx->route_pool_sb[j][0] < total_s) {
+        void *dw = NULL, *ds = NULL;
+        if (hipMalloc(&dw, total_w) != hipSuccess || hipMalloc(&ds, total_s) != hipSuccess) {
+            if (dw) hipFree(dw);
+            if (ds) hipFree(ds);
+            return -1;
+        }
+        if (ctx->route_pool_dw[j][0]) hipFree(ctx->route_pool_dw[j][0]);
+        if (ctx->route_pool_ds[j][0]) hipFree(ctx->route_pool_ds[j][0]);
+        ctx->route_pool_dw[j][0] = dw; ctx->route_pool_ds[j][0] = ds;
+        ctx->route_pool_wb[j][0] = total_w; ctx->route_pool_sb[j][0] = total_s;
+    }
+    if (ensure_pinned(&ctx->route_pack_hw[j], &ctx->route_pack_hw_bytes[j], total_w) ||
+        ensure_pinned(&ctx->route_pack_hs[j], &ctx->route_pack_hs_bytes[j], total_s))
+        return -1;
+    size_t wo = 0, so = 0;
+    for (int e = 0; e < n_experts; ++e) if (counts[e] > 0 && src[e]->gpu_id < 0) {
+        const ds4f_tensor *t = src[e];
+        size_t wb = (size_t)t->rows * (size_t)(t->cols / 2);
+        size_t sb = (size_t)t->rows * (size_t)(t->cols / 32);
+        memcpy((uint8_t *)ctx->route_pack_hw[j] + wo, t->w, wb);
+        memcpy((uint8_t *)ctx->route_pack_hs[j] + so, t->scale, sb);
+        wo += wb; so += sb;
+    }
+    if (hipMemcpyAsync(ctx->route_pool_dw[j][0], ctx->route_pack_hw[j], total_w,
+                       hipMemcpyHostToDevice, ctx->stream) != hipSuccess ||
+        hipMemcpyAsync(ctx->route_pool_ds[j][0], ctx->route_pack_hs[j], total_s,
+                       hipMemcpyHostToDevice, ctx->stream) != hipSuccess) return -1;
+    ds4f_route_upload_calls += 2; ds4f_route_upload_bytes += (long)(total_w + total_s);
+    wo = so = 0;
+    for (int e = 0; e < n_experts; ++e) if (counts[e] > 0 && src[e]->gpu_id < 0) {
+        ds4f_tensor *t = (ds4f_tensor *)src[e];
+        size_t wb = (size_t)t->rows * (size_t)(t->cols / 2);
+        size_t sb = (size_t)t->rows * (size_t)(t->cols / 32);
+        int id = append_device_matrix(ctx, (uint8_t *)ctx->route_pool_dw[j][0] + wo,
+            (uint8_t *)ctx->route_pool_ds[j][0] + so, t->w, t->scale,
+            t->rows, t->cols, t->cols / 32, HIP_DS4F_MATRIX_MXFP4, 1);
+        if (id < 0) return -1;
+        t->gpu_id = id; ids[e] = id;
+        wo += wb; so += sb;
+    }
+    if (!ctx->route_pool_ev[j][0] &&
+        hipEventCreate(&ctx->route_pool_ev[j][0]) != hipSuccess) return -1;
+    return 0;
 }
 
 int hip_ds4f_dense_bind_mxfp4_widened_tensor(hip_ds4f_dense *ctx, ds4f_tensor *t) {
@@ -2493,6 +2570,16 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
     int transient[3][HIP_DS4F_GEMM_MAX];
     memset(transient, -1, sizeof(transient));
     int route_slot = 0;
+    if (ctx->expert_pinned_staging) {
+        if (hip_ds4f_dense_bind_mxfp4_projection_batch(ctx, w1, counts,
+                n_experts, 0, transient[0]) != 0 ||
+            hip_ds4f_dense_bind_mxfp4_projection_batch(ctx, w3, counts,
+                n_experts, 1, transient[1]) != 0 ||
+            hip_ds4f_dense_bind_mxfp4_projection_batch(ctx, w2, counts,
+                n_experts, 2, transient[2]) != 0)
+            goto routed_transient_fail;
+        route_slot = 1;
+    }
     for (int s = 0; s < n_experts; ++s) {
         if (counts[s] <= 0) continue;
         ds4f_tensor *tw[3] = { (ds4f_tensor *)w1[s], (ds4f_tensor *)w3[s],
@@ -2500,13 +2587,13 @@ int hip_ds4f_dense_routed_ffn(void *opaque, float *dst, const float *x,
         /* One slot per active expert and projection.  Dimensions are uniform
          * for a layer, but the pool helper grows a slot safely if a mixed
          * manifest is encountered. */
-        for (int j = 0; j < 3; ++j) {
+        for (int j = 0; j < 3 && !ctx->expert_pinned_staging; ++j) {
             if (!tw[j] || tw[j]->gpu_id >= 0) continue;
             transient[j][s] = hip_ds4f_dense_bind_mxfp4_tensor_async_pool(
                 ctx, tw[j], j, route_slot);
             if (transient[j][s] < 0) goto routed_transient_fail;
         }
-        route_slot++;
+        if (!ctx->expert_pinned_staging) route_slot++;
     }
     double prof_upload_s;
     { struct timespec tu; clock_gettime(CLOCK_MONOTONIC, &tu);

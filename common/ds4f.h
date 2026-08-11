@@ -421,6 +421,7 @@ typedef struct ds4f_runtime_options {
     int hip_expert_cache_mb;              /* 0=off, -1=auto, >0 raw MXFP4 expert-cache budget */
     int hip_expert_cache_stats;           /* report prompt-hot cache coverage and residency */
     int hip_prefill_attn;                /* experimental opt-in GPU sliding-window attention; exact default is 0 */
+    int hip_tb2_batch;                   /* batch exact Tier-B2 window partials per prefill tile */
     int hip_qkv_fuse, hip_qkv_device_chain;
     int hip_attn_device_chain, hip_attn_no_d2h, hip_routed_ffn;
     int hip_fp8_wmma, hip_bf16_wmma, hip_attn_wmma;
@@ -560,6 +561,7 @@ typedef struct {
     ds4f_gpu_dense_layer_fn gpu_dense_layer_begin;
     ds4f_gpu_prefill_attn_fn gpu_prefill_attn;
     ds4f_gpu_prefill_attn_partial_fn gpu_prefill_attn_partial;
+    int gpu_tb2_batch_enabled;
     ds4f_gpu_prefill_attn_oproj_fn gpu_prefill_attn_oproj;
     ds4f_gpu_prefill_qkv_fn gpu_prefill_qkv;
     int gpu_prefill_qkv_enabled, gpu_qkv_device_chain, gpu_attn_device_chain;
@@ -690,6 +692,14 @@ typedef struct {
      * [n_heads], merged via the online-softmax identity into s_attn. */
     float *s_attn_hy, *s_attn_hymax, *s_attn_hysum;
     float *s_attn_hc, *s_attn_hcmax, *s_attn_hcsum;
+    /* Batched tier-B2 hybrid attention.  The compressor/indexer recurrence is
+     * still stepped in causal order, but its per-position selections and a
+     * chronological BF16 window+tile KV slab are retained so the GPU window
+     * partial is issued once for the whole tile instead of once per token. */
+    float *p_attn_hy, *p_attn_hymax, *p_attn_hysum;
+    uint16_t *p_tb2_kv;
+    int *p_tb2_sel, *p_tb2_nsel;
+    int p_tb2_sel_stride;
     float *s_attn_m;             /* DS4F_CP_COMBINE: per-head local max (lazy, [n_heads]) */
     float *s_attn_comb;          /* DS4F_CP_COMBINE: packed [acc: n_heads*q_head_dim | l: n_heads] reduced in
                                   * ONE ar_cb (min collective count on this latency-bound fabric) (lazy) */

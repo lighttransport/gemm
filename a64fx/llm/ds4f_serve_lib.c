@@ -193,7 +193,8 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
     int qkv_device_chain, int attn_device_chain, int attn_no_d2h,
     int routed_ffn, int fp8_wmma, int bf16_wmma, int attn_wmma,
     int oproj_group_wmma, int mxfp4_wmma, int expert_stream,
-    int block_threads, int expert_pinned_staging) {
+    int block_threads, int expert_pinned_staging, int tb2_batch,
+    int decode_routed_ffn) {
     if (!s || !s->m || !s->hip) return -1;
     ds4f_model *m = s->m;
     if (!enabled) {
@@ -204,6 +205,7 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
         m->gpu_oproj = NULL;
         m->gpu_prefill_attn = NULL;
         m->gpu_prefill_attn_oproj = NULL;
+        m->gpu_tb2_batch_enabled = 0;
         m->gpu_prefill_qkv = NULL;
         m->gpu_prefill_qkv_enabled = 0;
         m->gpu_qkv_device_chain = 0;
@@ -227,10 +229,12 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
     m->gpu_shared_ffn = fused_shared_ffn ? hip_ds4f_dense_shared_ffn : NULL;
     m->gpu_shared_ffn_begin = fused_shared_ffn ? hip_ds4f_dense_shared_ffn_begin : NULL;
     m->gpu_shared_ffn_wait = fused_shared_ffn ? hip_ds4f_dense_shared_ffn_wait : NULL;
-    m->gpu_routed_ffn = routed_ffn ? hip_ds4f_dense_routed_ffn : NULL;
+    m->gpu_routed_ffn = (routed_ffn || decode_routed_ffn)
+        ? hip_ds4f_dense_routed_ffn : NULL;
     m->gpu_oproj = hip_ds4f_dense_oproj;
     m->gpu_prefill_attn = prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
     m->gpu_prefill_attn_partial = prefill_attn ? hip_ds4f_dense_prefill_attention_partial : NULL;
+    m->gpu_tb2_batch_enabled = prefill_attn && tb2_batch;
     m->gpu_prefill_qkv = qkv_fuse ? hip_ds4f_dense_prefill_qkv : NULL;
     m->gpu_prefill_qkv_enabled = qkv_fuse != 0;
     m->gpu_qkv_device_chain = qkv_device_chain != 0;
@@ -240,7 +244,7 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
     /* The same routed callback is valid for the single-token path.  Keeping
      * this disabled forced every decode token through host-side MXFP4 expert
      * execution, even after prompt-hot experts had been admitted to VRAM. */
-    m->gpu_decode_routed_ffn_enabled = routed_ffn != 0;
+    m->gpu_decode_routed_ffn_enabled = decode_routed_ffn != 0;
     /* Exact mHC/Tier-B2 routed execution stages only the selected experts in
      * hip_ds4f_dense_routed_ffn.  Whole-layer streaming would upload roughly
      * 3 GB per layer before the router has even selected six experts. */

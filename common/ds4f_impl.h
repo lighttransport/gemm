@@ -3253,6 +3253,7 @@ static ds4f_runtime_options ds4f_runtime_options_debug_env(ds4f_config cfg,
       o.hip_expert_cache_mb = e && *e ? (strcmp(e, "auto") == 0 ? -1 : atoi(e)) : 0; }
     { const char *e = getenv("DS4F_HIP_EXPERT_CACHE_STATS"); o.hip_expert_cache_stats = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_PREFILL_ATTN"); o.hip_prefill_attn = e && *e ? atoi(e) : 0; }
+    { const char *e = getenv("DS4F_HIP_TB2_BATCH"); o.hip_tb2_batch = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_HIP_EXACT_PREFILL"); o.hip_exact_prefill = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_SPARSE"); o.sparse = e && *e ? atoi(e) : 0; }
     { const char *e = getenv("DS4F_MHC"); o.mhc = e && *e ? atoi(e) : 0; }
@@ -3390,6 +3391,7 @@ static int ds4f_runtime_options_load_json(ds4f_runtime_options *o, const char *p
     o->hip_expert_cache_mb = ds4f_json_int(json, "hip_expert_cache_mb", o->hip_expert_cache_mb);
     o->hip_expert_cache_stats = ds4f_json_int(json, "hip_expert_cache_stats", o->hip_expert_cache_stats);
     o->hip_prefill_attn = ds4f_json_int(json, "hip_prefill_attn", o->hip_prefill_attn);
+    o->hip_tb2_batch = ds4f_json_int(json, "hip_tb2_batch", o->hip_tb2_batch);
     o->hip_exact_prefill = ds4f_json_int(json, "hip_exact_prefill", o->hip_exact_prefill);
     o->sparse = ds4f_json_int(json, "sparse", o->sparse);
     o->mhc = ds4f_json_int(json, "mhc", o->mhc);
@@ -5324,6 +5326,80 @@ static int ds4f_attn_tb2_hybrid_gpu(ds4f_model *m, ds4f_attn_ex_task *at) {
     return 1;
 }
 
+/* Tile-batched form of ds4f_attn_tb2_hybrid_gpu.  `kv_linear` contains a
+ * chronological prefix (up to window-1 entries) followed by all K new tile
+ * entries, and local_pos0 is the index of the first new entry.  Compressor
+ * selections were captured while the state machine was stepped and are
+ * replayed only for the CPU compressed partial.  This preserves the exact
+ * causal state transition while amortizing the GPU upload/launch/sync across
+ * every position in the tile. */
+static int ds4f_attn_tb2_hybrid_gpu_batch(ds4f_model *m, ds4f_layer *ly,
+                                          int K, int abs_pos0, int local_pos0,
+                                          const float *rcos, const float *rsin) {
+    if (!m->gpu_tb2_batch_enabled || !m->gpu_prefill_attn_partial || K <= 1)
+        return 0;
+    ds4f_config *c = &m->cfg;
+    int HD = c->q_head_dim, H = c->n_heads * HD, nh = c->n_heads;
+    int nope = HD - c->qk_rope_dim;
+    if (m->int8_kv || m->int8_cmp || m->int4_cmp || m->cp_gather ||
+        ly->kv_frozen || ly->cmp_frozen || !m->p_tb2_kv ||
+        !m->p_tb2_sel || !m->p_tb2_nsel)
+        return 0;
+    size_t y = (size_t)m->m_tile * (size_t)H;
+    size_t h = (size_t)m->m_tile * (size_t)nh;
+    if (!m->p_attn_hy) {
+        m->p_attn_hy = (float *)ds4f_mem_alloc(m->mem, y * sizeof(float), 256, 1);
+        m->p_attn_hymax = (float *)ds4f_mem_alloc(m->mem, h * sizeof(float), 256, 1);
+        m->p_attn_hysum = (float *)ds4f_mem_alloc(m->mem, h * sizeof(float), 256, 1);
+    }
+    if (!m->p_attn_hy || !m->p_attn_hymax || !m->p_attn_hysum) return 0;
+    int kv_slots = local_pos0 + K;
+    float scale = 1.0f / sqrtf((float)HD);
+    if (m->gpu_prefill_attn_partial(m->gpu_dense_ctx, m->p_attn_hy,
+            m->p_attn_hymax, m->p_attn_hysum, m->p_q, m->p_tb2_kv,
+            ly->attn_sink, K, local_pos0, nh, HD, c->kv_lora,
+            kv_slots, c->window_size, scale) != 0)
+        return 0;
+
+    /* Reuse the validated single-position compressed-partial worker.  Its
+     * input globals are rebound to the retained row, while every output row
+     * is merged into the batched attention destination. */
+    size_t row_y = (size_t)nh * HD, row_h = (size_t)nh;
+    if (!m->s_attn_hc) {
+        m->s_attn_hc = (float *)ds4f_mem_alloc(m->mem, row_y * 4, 256, 1);
+        m->s_attn_hcmax = (float *)ds4f_mem_alloc(m->mem, row_h * 4, 256, 1);
+        m->s_attn_hcsum = (float *)ds4f_mem_alloc(m->mem, row_h * 4, 256, 1);
+    }
+    if (!m->s_attn_hc || !m->s_attn_hcmax || !m->s_attn_hcsum) return 0;
+    for (int k = 0; k < K; ++k) {
+        memcpy(m->s_q, m->p_q + (size_t)k * H, (size_t)H * sizeof(float));
+        m->s_tb2_nsel = m->p_tb2_nsel[k];
+        memcpy(m->s_tb2_sel,
+               m->p_tb2_sel + (size_t)k * m->p_tb2_sel_stride,
+               (size_t)m->s_tb2_nsel * sizeof(int));
+        ds4f_attn_cmp_task T = { m, ly, scale, m->s_attn_hcmax,
+                                 m->s_attn_hcsum, m->s_attn_hc };
+        ds4f_pool_run(m->pool, ds4f_attn_cmp_partial_worker, &T);
+        int nsel = m->s_tb2_nsel;
+        for (int head = 0; head < nh; ++head) {
+            size_t hi = (size_t)k * nh + head;
+            float mA = m->p_attn_hymax[hi], lA = m->p_attn_hysum[hi];
+            float mB = m->s_attn_hcmax[head], lB = m->s_attn_hcsum[head];
+            float mrg = mA > mB ? mA : mB;
+            float sA = expf(mA - mrg), sB = nsel ? expf(mB - mrg) : 0.f;
+            float inv = 1.0f / (lA * sA + lB * sB);
+            float *out = m->p_attn + ((size_t)k * nh + head) * HD;
+            const float *oa = m->p_attn_hy + ((size_t)k * nh + head) * HD;
+            const float *ob = m->s_attn_hc + (size_t)head * HD;
+            for (int d = 0; d < HD; ++d) out[d] = (oa[d] * sA + ob[d] * sB) * inv;
+            ds4f_rope_apply(out + nope, rcos, rsin, abs_pos0 + k,
+                            c->qk_rope_dim / 2, 1);
+        }
+    }
+    ds4f_attn_hybrid_hit += K;
+    return 1;
+}
+
 /* Step the per-layer compressor (and, on CSA layers, the indexer) for the current
  * token at absolute position `pos`, then fill m->s_tb2_sel/s_tb2_nsel with the LOCAL
  * compressed indices this query attends. Token-at-a-time: pos==0 seeds the ring state
@@ -6347,6 +6423,15 @@ static void ds4f_alloc_prefill_batch(ds4f_model *m, int m_tile) {
     m->p_exG   = (float *)ds4f_mem_alloc(m->mem, ET*(size_t)c->moe_inter*4, 256, 1);
     m->p_exU   = (float *)ds4f_mem_alloc(m->mem, ET*(size_t)c->moe_inter*4, 256, 1);
     m->p_exO   = (float *)ds4f_mem_alloc(m->mem, ET*(size_t)C*4, 256, 1);
+    /* Batched tier-B2 retained state. HCA selects every compressed slot, but
+     * at worst max_pos/128 of them; CSA is capped by index_topk. */
+    int hca_cap = (c->max_pos + 127) / 128;
+    m->p_tb2_sel_stride = hca_cap > c->index_topk ? hca_cap : c->index_topk;
+    m->p_tb2_sel = (int *)ds4f_mem_alloc(
+        m->mem, T * (size_t)m->p_tb2_sel_stride * sizeof(int), 256, 1);
+    m->p_tb2_nsel = (int *)ds4f_mem_alloc(m->mem, T * sizeof(int), 256, 1);
+    m->p_tb2_kv = (uint16_t *)ds4f_mem_alloc(
+        m->mem, (T + (size_t)c->window_size) * (size_t)c->kv_lora * sizeof(uint16_t), 256, 1);
 }
 
 /* batched RMSNorm: dst[mm] = rmsnorm(src[mm], w) for mm in [0,M). token-parallel. */
@@ -7277,8 +7362,23 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             }
         }
         if (ds4f_prof_on) m->prof[DS4F_P_QKV] += ds4f_now() - _pf_t_qkv0;
-        /* per-position tier-B2 attention (causal: append KV then attend, in order) */
+        /* Preserve the pre-tile chronological tail before the ring is
+         * overwritten.  It lets the batched GPU kernel address a linear
+         * [prefix,tile] history while the persistent cache remains a ring. */
         double _pf_t_attn0 = ds4f_prof_on ? ds4f_now() : 0.0;
+        int linear_prefix = 0;
+        int independent_batch = m->dec_batch_seq && m->dec_nseq == K;
+        if (!independent_batch && !m->int8_kv && ly->kv_cache && m->p_tb2_kv) {
+            linear_prefix = pos0 < c->window_size - 1 ? pos0 : c->window_size - 1;
+            int first = pos0 - linear_prefix;
+            for (int p = 0; p < linear_prefix; ++p)
+                memcpy(m->p_tb2_kv + (size_t)p * KV,
+                       ly->kv_cache + (size_t)((first + p) % ly->kv_slots) * KV,
+                       (size_t)KV * sizeof(uint16_t));
+        }
+        /* Step the stateful compressor/indexer in order and retain the
+         * selections. Attention itself is deliberately deferred until every
+         * row is prepared, permitting one batched GPU window invocation. */
         for (int k = 0; k < K; k++) {
             int pos = m->dec_batch_pos && m->dec_nseq == K ? m->dec_batch_pos[k] : pos0 + k;
             if (m->dec_batch_seq && m->dec_nseq == K)
@@ -7288,7 +7388,10 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_fp8_kv_quant_inplace(kvl, KV, c->qk_rope_dim);
             ds4f_rope_apply(kvl + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
             { uint16_t *dst = ly->kv_cache + (size_t)(pos % ly->kv_slots)*KV;
-              for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kvl[d]); }
+              for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kvl[d]);
+              if (!independent_batch && m->p_tb2_kv)
+                  memcpy(m->p_tb2_kv + (size_t)(linear_prefix + k) * KV,
+                         dst, (size_t)KV * sizeof(uint16_t)); }
             memcpy(m->s_hn, m->p_hn + (size_t)k*C, (size_t)C*4);     /* compressor reads s_hn */
             memcpy(m->s_q,  m->p_q  + (size_t)k*H, (size_t)H*4);     /* indexer + attention read s_q */
             m->s_idx_qpre = idxg_pf ? m->v_idxq + (size_t)k*idxHhd : NULL;
@@ -7300,9 +7403,30 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                 DS4F_TOC(DS4F_P_TB2PREP);
             }
             m->s_idx_qpre = NULL;
+            m->p_tb2_nsel[k] = m->s_tb2_nsel;
+            if (m->s_tb2_nsel > m->p_tb2_sel_stride) {
+                fprintf(stderr, "ds4f: tier-B2 selection count %d exceeds batch stride %d\n",
+                        m->s_tb2_nsel, m->p_tb2_sel_stride);
+                abort();
+            }
+            memcpy(m->p_tb2_sel + (size_t)k * m->p_tb2_sel_stride,
+                   m->s_tb2_sel, (size_t)m->s_tb2_nsel * sizeof(int));
             if (snaps && ratio && k < K-1)                           /* state after THIS position, this layer */
                 ds4f_tb2_snap_layer(m, L, snaps + (size_t)k*snap_stride + snap_loff, 0);
-            m->cp_gather = 0;
+        }
+        m->cp_gather = 0;
+        int batched_hybrid = m->tierb2 && ratio && !independent_batch &&
+            ds4f_attn_tb2_hybrid_gpu_batch(m, ly, K, pos0, linear_prefix,
+                                            rcos, rsin);
+        if (!batched_hybrid) for (int k = 0; k < K; ++k) {
+            int pos = m->dec_batch_pos && m->dec_nseq == K ? m->dec_batch_pos[k] : pos0 + k;
+            if (independent_batch)
+                ds4f_lseq_apply(ly, &m->dec_batch_seq[(size_t)k*c->n_layers + L]);
+            memcpy(m->s_q, m->p_q + (size_t)k*H, (size_t)H*sizeof(float));
+            m->s_tb2_nsel = m->p_tb2_nsel[k];
+            memcpy(m->s_tb2_sel,
+                   m->p_tb2_sel + (size_t)k*m->p_tb2_sel_stride,
+                   (size_t)m->s_tb2_nsel*sizeof(int));
             if (m->tierb2 && ratio) { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
                 if (!ds4f_attn_tb2_hybrid_gpu(m, &at) && !ds4f_attn_tb2_gemm(m, &at)) ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
