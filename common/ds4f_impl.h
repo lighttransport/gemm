@@ -705,7 +705,10 @@ static void ds4f_gemm_worker(void *arg, int tid, int nthr) {
              * exact + relL2~1e-6 vs per-token matvec (bf16 trunc lossless; K-tile
              * reassoc only). Assumes vl==16 (A64FX SVE-512): each 16-elem chunk is
              * exactly the lo (cc%32==0) or hi (cc%32==16) nibbles of one 32-block. */
-            const int TK = 512;                       /* K-tile (mult of 32); 8x512 bf16 = 8 KB L1 */
+            static int mx_tk=-1;
+            if(mx_tk<0){const char *e=getenv("DS4F_MXFP4_TILE_K");mx_tk=(e&&atoi(e)>0)?atoi(e):2048;
+                if(mx_tk<32)mx_tk=32;if(mx_tk>8192)mx_tk=8192;mx_tk=(mx_tk+31)&~31;}
+            const int TK = mx_tk;
             uint16_t *pv = ds4f_fp8bf16_tile((size_t)4 * 2 * TK);
             svbool_t pg = svptrue_b32(); svbool_t ph = svptrue_b16();
             svfloat32_t kv = svld1(pg, ds4f_kvalues_mxfp4_f32);
