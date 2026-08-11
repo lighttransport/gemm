@@ -493,7 +493,14 @@ class CooperativeServer(object):
             while True:
                 self.accept()
                 decode = [j for j in self.jobs if j.phase == "decode" and not j.cancelled]
-                if len(decode) >= 2 and self.decode_batch_size > 1:
+                admitting = [j for j in self.jobs if j.phase != "decode" and not j.cancelled]
+                # Fill one batch cohort before decoding it. Without this gate,
+                # the first two completed prefills form a permanent B=2 group
+                # and starve the remaining members that would have made B=4.
+                if (self.decode_batch_size > 1 and admitting and
+                        len(self.jobs) <= self.decode_batch_size):
+                    job = admitting[0]; self.jobs.remove(job); self.jobs.append(job); self.step(job)
+                elif len(decode) >= 2 and self.decode_batch_size > 1:
                     self.step_decode_batch(decode[:self.decode_batch_size])
                 elif self.jobs:
                     job = self.jobs.pop(0); self.jobs.append(job); self.step(job)
