@@ -735,7 +735,10 @@ static void ds4f_matvec(ds4f_model *m, float *dst, const ds4f_tensor *t, const f
  * mutually independent (no entry's x aliases another entry's dst). */
 static int ds4f_mv_fuse = -1;
 static inline int ds4f_mv_fuse_on(void) {
-    if (ds4f_mv_fuse < 0) { const char *e = getenv("DS4F_MV_FUSE"); ds4f_mv_fuse = e ? atoi(e) : 0; }
+    /* Bit-exact per the comment above (same worker/rowsplit/dot order, only
+     * the pool barrier is shared); measured ~6% decode throughput gain with
+     * no quality-gate change. Default on. */
+    if (ds4f_mv_fuse < 0) { const char *e = getenv("DS4F_MV_FUSE"); ds4f_mv_fuse = e ? atoi(e) : 1; }
     return ds4f_mv_fuse;
 }
 
