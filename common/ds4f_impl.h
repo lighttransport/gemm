@@ -6945,13 +6945,22 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         /* batched q/kv projections */
         { ds4f_pf_rms_task t = { m, m->p_hn, m->p_x, ly->attn_norm, C, K, C, C };
           ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
-        ds4f_gemm(m, m->p_qlat, &ly->wq_a, m->p_hn, K, c->q_lora, C);
-        { ds4f_pf_rms_task t = { m, m->p_qlat, m->p_qlat, ly->q_norm, c->q_lora, K, c->q_lora, c->q_lora };
-          ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
-        ds4f_gemm(m, m->p_q, &ly->wq_b, m->p_qlat, K, H, c->q_lora);
+        int gpu_qkv = m->gpu_prefill_qkv && m->gpu_prefill_qkv_enabled &&
+            m->gpu_prefill_qkv(m->gpu_dense_ctx, m->p_q, m->p_kvlat,
+                m->p_hn, &ly->wq_a, &ly->wkv, &ly->wq_b, ly->q_norm,
+                K, C, c->q_lora, H, KV) == 0;
+        if (!gpu_qkv) {
+            ds4f_gemm(m, m->p_qlat, &ly->wq_a, m->p_hn, K, c->q_lora, C);
+            { ds4f_pf_rms_task t = { m, m->p_qlat, m->p_qlat, ly->q_norm, c->q_lora, K, c->q_lora, c->q_lora };
+              ds4f_pool_run(m->pool, ds4f_pf_rmsnorm_worker, &t); }
+            ds4f_gemm(m, m->p_q, &ly->wq_b, m->p_qlat, K, H, c->q_lora);
+            ds4f_gemm(m, m->p_kvlat, &ly->wkv, m->p_hn, K, KV, C);
+        }
+        /* Tier-B2 still consumes Q/KV on the host for compression and sparse
+         * attention, so the serving profile disables the device-only QKV
+         * chain and applies RoPE here after the fused projections copy back. */
         { ds4f_pf_qnr_task t = { m, pos0, K, rcos, rsin };
           ds4f_pool_run(m->pool, ds4f_pf_qnr_worker, &t); }
-        ds4f_gemm(m, m->p_kvlat, &ly->wkv, m->p_hn, K, KV, C);
         /* CSA indexer q-projection is independent per prompt position. Reuse
          * the same batched GEMM strategy as the main q projection; the
          * per-position index scan below consumes one row through s_idx_qpre. */
@@ -6993,11 +7002,17 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_lseq_apply(ly, &m->dec_batch_seq[L]);
         if (snaps) snap_loff += ds4f_tb2_snap_layer_bytes(m, L);
         /* batched grouped low-rank o-projection (no-TP) */
-        for (int g = 0; g < og; g++) {
-            ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g*c->o_lora, c->o_lora);
-            ds4f_gemm(m, m->p_o1 + (size_t)g*c->o_lora, &vg, m->p_attn + (size_t)g*gin, K, c->o_inter, H);
+        int gpu_oproj = m->gpu_oproj && ly->wo_a.gpu_id >= 0 &&
+            ly->wo_b.gpu_id >= 0 && m->gpu_oproj(m->gpu_dense_ctx, m->p_o,
+                &ly->wo_a, &ly->wo_b, m->p_attn, K, og, gin, c->o_lora,
+                H, C, c->o_inter) == 0;
+        if (!gpu_oproj) {
+            for (int g = 0; g < og; g++) {
+                ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g*c->o_lora, c->o_lora);
+                ds4f_gemm(m, m->p_o1 + (size_t)g*c->o_lora, &vg, m->p_attn + (size_t)g*gin, K, c->o_inter, H);
+            }
+            ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);
         }
-        ds4f_gemm(m, m->p_o, &ly->wo_b, m->p_o1, K, C, c->o_inter);
         ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, pa, 16, ca, 64);
         /* mHC pre (ffn). */
         ds4f_hc_pre_batch(m, m->v_x4, K, ly->hc_ffn_fn, ly->hc_ffn_scale, ly->hc_ffn_base,
@@ -7015,14 +7030,21 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             memset(m->p_shg, 0, (size_t)K * c->shared_inter * sizeof(float));
             memset(m->p_shu, 0, (size_t)K * c->shared_inter * sizeof(float));
         }
-        ds4f_gemm(m, m->p_shg + (tps ? m->sh_r0 : 0), &ly->sh_w1,
-                  m->p_h2, K, c->shared_inter, C);
-        ds4f_gemm(m, m->p_shu + (tps ? m->sh_r0 : 0), &ly->sh_w3,
-                  m->p_h2, K, c->shared_inter, C);
-        { ds4f_pf_swiglu_task t = { m, m->p_shg, m->p_shu, c->shared_inter, K,
-                                    c->shared_inter, c->shared_inter, c->swiglu_limit };
-          ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
-        if (tps2) {
+        int shared_fused = !tps && !tps2 && m->gpu_shared_ffn &&
+            ly->sh_w1.gpu_id >= 0 && ly->sh_w3.gpu_id >= 0 &&
+            ly->sh_w2.gpu_id >= 0 && m->gpu_shared_ffn(m->gpu_dense_ctx,
+                m->p_moe, &ly->sh_w1, &ly->sh_w3, &ly->sh_w2, m->p_h2,
+                K, c->shared_inter, C, c->swiglu_limit) == 0;
+        if (!shared_fused) {
+            ds4f_gemm(m, m->p_shg + (tps ? m->sh_r0 : 0), &ly->sh_w1,
+                      m->p_h2, K, c->shared_inter, C);
+            ds4f_gemm(m, m->p_shu + (tps ? m->sh_r0 : 0), &ly->sh_w3,
+                      m->p_h2, K, c->shared_inter, C);
+            { ds4f_pf_swiglu_task t = { m, m->p_shg, m->p_shu, c->shared_inter, K,
+                                        c->shared_inter, c->shared_inter, c->swiglu_limit };
+              ds4f_pool_run(m->pool, ds4f_pf_swiglu_worker, &t); }
+        }
+        if (!shared_fused && tps2) {
             ds4f_gemm(m, m->p_exO, &ly->sh_w2, m->p_shg, K, m->sh2_rows, c->shared_inter);
             for (int k = 0; k < K; k++) {
                 float *mo = m->p_moe + (size_t)k*C;
@@ -7030,7 +7052,8 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                 memcpy(mo + m->sh2_r0, m->p_exO + (size_t)k*m->sh2_rows,
                        (size_t)m->sh2_rows * sizeof(float));
             }
-        } else ds4f_gemm(m, m->p_moe, &ly->sh_w2, m->p_shg, K, C, c->shared_inter);
+        } else if (!shared_fused)
+            ds4f_gemm(m, m->p_moe, &ly->sh_w2, m->p_shg, K, C, c->shared_inter);
         /* router + routed experts (bucketed batched GEMM, reuse the prefill scheme) */
         ds4f_gemm(m, m->p_router, &ly->gate, m->p_h2, K, c->n_experts, C);
         { int no = ly->n_owned;

@@ -139,14 +139,74 @@ static int serve_attach_hip(ds4f_serve *s, int hip_device, int verbose,
     m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
     m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
     m->gpu_dense_mixed = 1;
-    /* Whole-layer streaming is useful as a bandwidth experiment but an EP=1
-     * layer is ~3.4 GB; PCIe transfer dominates on a 16 GB card.  Keep the
-     * measured-slower path explicitly opt-in while selective caching evolves. */
-    if (env_i("DS4F_SERVE_HIP_EXPERT_STREAM", 0)) {
-        m->gpu_dense_layer_prefetch = hip_ds4f_dense_prefetch_layer_raw;
-        m->gpu_dense_layer_begin = hip_ds4f_dense_begin_layer;
-        m->gpu_dense_stream_prefill_only = 1;
+    /* Expert streaming is selected later by the runner's explicit
+     * --hip-expert-stream program argument. */
+    return 0;
+}
+
+/* Install the same full-batch callbacks used by test_hip_ds4f_real.  Keep
+ * this separate from open() so the Python runner can select the production
+ * profile with explicit program arguments rather than tuning environment
+ * variables. */
+int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
+    int fused_shared_ffn, int prefill_attn, int qkv_fuse,
+    int qkv_device_chain, int attn_device_chain, int attn_no_d2h,
+    int routed_ffn, int fp8_wmma, int bf16_wmma, int attn_wmma,
+    int oproj_group_wmma, int mxfp4_wmma, int expert_stream,
+    int block_threads) {
+    if (!s || !s->m || !s->hip) return -1;
+    ds4f_model *m = s->m;
+    if (!enabled) {
+        m->gpu_shared_ffn = NULL;
+        m->gpu_shared_ffn_begin = NULL;
+        m->gpu_shared_ffn_wait = NULL;
+        m->gpu_routed_ffn = NULL;
+        m->gpu_oproj = NULL;
+        m->gpu_prefill_attn = NULL;
+        m->gpu_prefill_attn_oproj = NULL;
+        m->gpu_prefill_qkv = NULL;
+        m->gpu_prefill_qkv_enabled = 0;
+        m->gpu_qkv_device_chain = 0;
+        m->gpu_attn_device_chain = 0;
+        m->gpu_attn_no_d2h = 0;
+        m->gpu_routed_ffn_enabled = 0;
+        m->gpu_dense_layer_prefetch = NULL;
+        m->gpu_dense_layer_begin = NULL;
+        m->gpu_dense_stream_prefill_only = 0;
+        return 0;
     }
+    /* mHC/Tier-B2 prefill performs compressor/indexer work and sparse
+     * attention on the host. It can use fused QKV, but Q and KV must return to
+     * host memory; the device-only QKV->attention chain is for the plain
+     * batched prefill path. */
+    if (m->mhc || m->tierb2) {
+        qkv_device_chain = 0;
+        attn_device_chain = 0;
+        attn_no_d2h = 0;
+    }
+    m->gpu_shared_ffn = fused_shared_ffn ? hip_ds4f_dense_shared_ffn : NULL;
+    m->gpu_shared_ffn_begin = fused_shared_ffn ? hip_ds4f_dense_shared_ffn_begin : NULL;
+    m->gpu_shared_ffn_wait = fused_shared_ffn ? hip_ds4f_dense_shared_ffn_wait : NULL;
+    m->gpu_routed_ffn = routed_ffn ? hip_ds4f_dense_routed_ffn : NULL;
+    m->gpu_oproj = hip_ds4f_dense_oproj;
+    m->gpu_prefill_attn = prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
+    m->gpu_prefill_qkv = qkv_fuse ? hip_ds4f_dense_prefill_qkv : NULL;
+    m->gpu_prefill_qkv_enabled = qkv_fuse != 0;
+    m->gpu_qkv_device_chain = qkv_device_chain != 0;
+    m->gpu_attn_device_chain = attn_device_chain != 0;
+    m->gpu_attn_no_d2h = attn_no_d2h != 0;
+    m->gpu_routed_ffn_enabled = routed_ffn != 0;
+    m->gpu_decode_routed_ffn_enabled = 0;
+    m->gpu_dense_layer_prefetch = expert_stream
+        ? hip_ds4f_dense_prefetch_layer_raw : NULL;
+    m->gpu_dense_layer_begin = expert_stream
+        ? hip_ds4f_dense_begin_layer : NULL;
+    m->gpu_dense_stream_prefill_only = expert_stream != 0;
+    hip_ds4f_dense_set_prefill_features(s->hip, qkv_fuse,
+        qkv_device_chain, attn_device_chain, attn_no_d2h, fp8_wmma,
+        bf16_wmma, attn_wmma, oproj_group_wmma, mxfp4_wmma, block_threads);
+    m->gpu_prefill_attn_oproj = prefill_attn && !qkv_device_chain
+        ? hip_ds4f_dense_prefill_attn_oproj : NULL;
     return 0;
 }
 #endif

@@ -130,7 +130,7 @@ variables are reserved for diagnostics/debugging and profiling (for example
 Serving behavior follows the same argument-only rule. Use
 `--prefill-quantum-tokens` for contended fair-share prefill,
 `--single-prefill-quantum-tokens` for the optimized single-request tile
-(default 32; larger tiles are currently slower in the full serving path),
+(default 2048; benchmark 512/1024/2048 before changing it for another GPU),
 `--agent-cache-max-tokens` for Codex/Claude system-prefix
 caching (default 8192), and `--decode-batch-size` for opt-in multi-context
 decode. Do not add production tuning environment variables for these paths.

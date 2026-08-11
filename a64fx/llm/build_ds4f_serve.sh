@@ -3,7 +3,8 @@
 #
 # Produces ./libds4f_serve.so (ctypes-loadable by ds4f_serve_runner.py).  The
 # model math is the exact/tierb2/mHC forward; the dense bank goes to the ROCm
-# when DS4F_SERVE_HIP is defined.  The routed MXFP4 experts stay on the CPU.
+# when DS4F_SERVE_HIP is defined. Large prompt tiles may stream each layer's
+# raw MXFP4 experts through the GPU via --hip-expert-stream.
 #
 # Run from the repo root:
 #   sh a64fx/llm/build_ds4f_serve.sh

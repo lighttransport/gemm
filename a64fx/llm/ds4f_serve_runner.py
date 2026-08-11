@@ -48,6 +48,9 @@ def load_lib(path):
     lib.ds4f_serve_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int,
                                     ctypes.c_int, ctypes.c_int, ctypes.c_longlong,
                                     ctypes.c_char_p, ctypes.c_size_t]
+    if hasattr(lib, "ds4f_serve_configure_hip_prefill"):
+        lib.ds4f_serve_configure_hip_prefill.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 15
+        lib.ds4f_serve_configure_hip_prefill.restype = ctypes.c_int
     lib.ds4f_serve_close.argtypes = [ctypes.c_void_p]
     lib.ds4f_serve_prefill.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
                                        ctypes.c_int, ctypes.c_int]
@@ -103,13 +106,21 @@ def load_lib(path):
 
 
 class Serve(object):
-    def __init__(self, lib, stage_dir, use_hip, hip_device, threads, cmgs, max_pos):
+    def __init__(self, lib, stage_dir, use_hip, hip_device, threads, cmgs, max_pos,
+                 hip_prefill):
         err = ctypes.create_string_buffer(512)
         self._s = lib.ds4f_serve_open(stage_dir.encode(), int(use_hip), int(hip_device),
                                       int(threads), int(cmgs), int(max_pos), err, len(err))
         if not self._s:
             sys.exit("ds4f_serve_open failed: %s" % err.value.decode())
         self.lib = lib
+        if use_hip and hip_prefill[0]:
+            if not hasattr(lib, "ds4f_serve_configure_hip_prefill"):
+                sys.exit("serving library lacks tuned HIP prefill support; rebuild it")
+            rc = lib.ds4f_serve_configure_hip_prefill(self._s,
+                                                       *map(int, hip_prefill))
+            if rc != 0:
+                sys.exit("failed to configure tuned HIP prefill (rc=%d)" % rc)
         self.vocab = lib.ds4f_serve_vocab(self._s)
         self.eos = lib.ds4f_serve_eos(self._s)
         self.logits = lib.ds4f_serve_logits(self._s, ctypes.byref(ctypes.c_int(0)))
@@ -861,7 +872,22 @@ def main():
     ap.add_argument("--context-memory-mb", type=int, default=512)
     ap.add_argument("--context-disk-mb", type=int, default=8192)
     ap.add_argument("--prefill-quantum-tokens", type=int, default=32)
-    ap.add_argument("--single-prefill-quantum-tokens", type=int, default=32)
+    ap.add_argument("--single-prefill-quantum-tokens", type=int, default=2048)
+    ap.add_argument("--hip-prefill-tuned", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-fused-shared-ffn", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-prefill-attn", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-qkv-fuse", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-qkv-device-chain", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-attn-device-chain", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-attn-no-d2h", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-fp8-wmma", type=int, choices=(0, 1, 2), default=2)
+    ap.add_argument("--hip-bf16-wmma", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-attn-wmma", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-oproj-group-wmma", type=int, choices=(0, 1, 2), default=2)
+    ap.add_argument("--hip-mxfp4-wmma", type=int, choices=(0, 1, 2), default=1)
+    ap.add_argument("--hip-expert-stream", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-block-threads", type=int, choices=(64, 128, 256), default=128)
     # Accepted here so the single-node wrapper can expose one unified program
     # argument list; the value itself configures the HTTP frontend.
     ap.add_argument("--agent-cache-max-tokens", type=int, default=8192)
@@ -884,7 +910,15 @@ def main():
                  hip_device=env_i("DS4F_HIP_DEVICE", 0),
                  threads=env_i("LLM_THREADS", 16),
                  cmgs=env_i("DS4F_CMGS", 1),
-                 max_pos=env_i("DS4F_MAXPOS", 16384))
+                 max_pos=env_i("DS4F_MAXPOS", 16384),
+                 hip_prefill=(args.hip_prefill_tuned, args.hip_fused_shared_ffn,
+                              args.hip_prefill_attn, args.hip_qkv_fuse,
+                              args.hip_qkv_device_chain, args.hip_attn_device_chain,
+                              args.hip_attn_no_d2h, args.hip_routed_ffn,
+                              args.hip_fp8_wmma, args.hip_bf16_wmma,
+                              args.hip_attn_wmma, args.hip_oproj_group_wmma,
+                              args.hip_mxfp4_wmma, args.hip_expert_stream,
+                              args.hip_block_threads))
     slots = max(1, env_i("DS4F_SERVE_SLOTS", 1))
     prefix_cache = env_i("DS4F_SERVE_PREFIX_CACHE", 1)
     try:

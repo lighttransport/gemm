@@ -76,7 +76,7 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   conversation tail. The cooperative Unix-socket runner carries cache
   load/save metadata in each request; `--agent-cache-max-tokens` controls the
   maximum prefix (8192 by default). A lone request uses
-  `--single-prefill-quantum-tokens` (32 by default), while competing requests
+  `--single-prefill-quantum-tokens` (2048 by default), while competing requests
   retain the smaller fair-share `--prefill-quantum-tokens` quantum.
   `DS4F_SERVE_SYSCACHE` remains available for the runner's
   legacy single-file checkpoint/preload path.
@@ -93,6 +93,13 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   `--context-memory-mb`, `--context-disk-mb`, `--prefill-quantum-tokens`,
   `--decode-quantum-tokens`, and `--scheduler-quantum-ms`. These are program
   arguments, not production tuning environment variables.
+- With HIP enabled, `--hip-prefill-tuned 1` (the default) installs the same
+  QKV/device-attention/O-projection, fused shared-FFN, routed-FFN, and gfx12
+  WMMA callbacks used by the real-weight benchmark. The individual
+  `--hip-*` arguments can disable or retune each component; no production
+  tuning environment variables are required. `--hip-expert-stream 1`
+  streams each layer's raw MXFP4 expert bank for large prompt tiles; disable
+  it when PCIe transfer cannot amortize over the selected tile.
 - After prefill, the cooperative runner stores an internal full-prompt snapshot
   before generation. New connections reuse the longest compatible prompt or
   completed-conversation prefix, including prior generated tokens. These
