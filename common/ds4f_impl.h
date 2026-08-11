@@ -3869,6 +3869,11 @@ static int ds4f_index_batch_prepare(ds4f_model *m, ds4f_layer *ly, int K, int po
     ds4f_config *c=&m->cfg; if(K<1 || pos0<0 || pos0+K>c->max_pos || !ly->idx_kv8 || ly->idx_cp_on) return 0;
     int H=c->index_n_heads, hd=c->index_head_dim, qd=H*hd, k=c->index_topk, C=c->hidden, ratio=4;
     int maxT=(pos0+K)/ratio, score_needed=maxT>k;
+    /* If the configured run can never contain more compressed entries than
+     * top-k, index keys are unobservable: every entry is always selected.
+     * Avoid advancing an index compressor whose output can never be read. */
+    if(c->max_pos<=ratio*k){for(int z=0;z<K;z++){int T=(pos0+z+1)/ratio,*sel=sel_out+(size_t)z*k,n=0;
+        for(;n<T;n++)sel[n]=n+c->window_size;for(;n<k;n++)sel[n]=-1;}return 1;}
     if(score_needed && !m->v_idxq)return 0;
     size_t whb=((size_t)K*H*4+255)&~(size_t)255, q8b=((size_t)K*qd+255)&~(size_t)255;
     int cmpW=2*hd; size_t cb=((size_t)K*cmpW*4+255)&~(size_t)255;
@@ -3926,6 +3931,10 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
     }
     int T = (pos + 1) / ratio;
     if (ratio == 4) {                                           /* CSA: indexer-selected */
+        if (c->max_pos <= ratio*c->index_topk) {                /* top-k always contains all entries */
+            int n=0; for(;n<T;n++)m->s_tb2_sel[n]=n;
+            m->s_tb2_nsel=n; return;
+        }
         if (pos == 0) {                                         /* seed indexer compressor ring */
             float *seed = (float *)alloca((size_t)ihd * 4);     /* index_step drives it for pos>=1 */
             ds4f_compress_step(m->s_hn, c->hidden, ihd, rd, ratio, 0,
