@@ -326,6 +326,18 @@ curl -s --max-time 5 http://127.0.0.1:8080/v1/progress
 
 **Reminder:** `ds4f_serve_bench.py` loads its own model standalone — stop any running `run_ds4f_single_serve.sh` server first, or numbers will be contention-skewed (see verdict above).
 
+## Decode optimization round: 18 tok/s target (2026-08-12)
+
+Baseline with the attention-vectorization fix already in place but no other changes: decode 5.13 tok/s (no cache) / 5.48 tok/s (hot-expert cache enabled), at 64-token prompt / 32 decode tokens. `exp_cpu` (CPU MXFP4 fallback for cache-missed experts) is ~52% of decode's own wall time with no cache, still the dominant cost.
+
+**Checked whether decode's CPU expert matvec has the same SVE/x86 vectorization bug as attention did — it does not.** `ds4f_mv_worker`'s MXFP4 path (common/ds4f_impl.h:655-697) has a genuine x86-specific branch calling into `common/ds4f_matvec_avx2.h`, confirmed to contain real AVX2/SSE intrinsics (119 occurrences of `_mm256_`/`__m256`-family instructions, e.g. `matvec_mxfp4_1row_i8_raw` using `_mm_shuffle_epi8`/`_mm_madd_epi16`/`_mm_fmadd_ps`). This is not a repeat of the attention bug; decode's CPU expert path is already properly vectorized.
+
+**Found and fixed a second real, bit-exact default bug**, same class of issue as `DS4F_ATTN_GEMM`: `DS4F_MV_FUSE` (fuses several independent matvec dispatches into one `pool_run`, avoiding a separate thread-wake/barrier per matvec) defaulted to **off**, despite its own comment quantifying the gap it closes as decode-specific: "decode does ~10 pool_run/layer; in-loop matvec BW is ~247 GB/s vs ~610 GB/s... the gap is dispatch/serial-gap overhead, not the kernel." Per the same comment, this is bit-exact (identical worker/rowsplit/dot order, only the barrier is shared). Verified: mHC exact quality gate identical output with `DS4F_MV_FUSE=1`. Measured: decode 5.131 -> 5.458 tok/s (~6%) alone; combined with the hot-expert cache it doesn't compound further (5.437-5.479, within noise of either alone). **Flipped the default to on** (common/ds4f_impl.h, commit 9907c69c) — applies automatically, no server config change needed.
+
+**Checked whether decode attention/QKV could use GPU offload (idle GPU during CPU-bound decode) — same limitation as prefill's attention.** `ds4f_serve_configure_hip_prefill` (a64fx/llm/ds4f_serve_lib.c:180) wires `m->gpu_prefill_attn` to `hip_ds4f_dense_prefill_attention` (the window-only GPU kernel already found incompatible with tier-B2's compressed-KV term), but this callback is never invoked by `ds4f_forward_verify` or the tier-B2 branch of `ds4f_forward_token` — same as prefill. `m->gpu_decode_attn_enabled` is never set to 1 anywhere in that configure function, so it's off by construction, and even if enabled it would hit the identical compressed-term-dropping accuracy problem. No safe lever here without the same new tier-B2-aware GPU kernel identified for prefill.
+
+**Current decode state: ~5.5 tok/s, still ~3.3x short of the 18 tok/s target.** Both cheap real fixes found this round (attention vectorization inherited from the prefill work, plus MV_FUSE) are committed. Remaining cost is dominated by `exp_cpu` (CPU fallback for the ~53% of expert accesses the hot-expert cache doesn't cover) — already established in the earlier decode-cache investigation (see "Decode does not use the routed-FFN path we optimized" and "Cache budget is not the limiter" above) that raising this coverage needs an online/adaptive cache, not a budget or prompt-length change. That remains the concrete next step for decode, same conclusion as before, now re-confirmed after the two new fixes.
+
 ## Useful benchmark
 
 ```sh
