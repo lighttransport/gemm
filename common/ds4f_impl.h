@@ -5154,28 +5154,27 @@ static void ds4f_forward_prefill(ds4f_model *m, const float *X, int M, int pos0,
         DS4F_TOC(DS4F_P_ATTN); }
         /* ---- grouped low-rank o-projection ---- */
         { DS4F_TIC();
-        int tpo = (m->oi_rows < c->o_inter);   /* TP_OPROJ: wo_a o_inter row-shard (wo_b full over zero-pad) */
+        int tpo = (m->oi_rows < c->o_inter);   /* TP_OPROJ: compact local o_inter rows */
         if (tpo) {
             /* Only the owned o_inter rows [oi0, oi0+oi_rows) are computed. wo_a is block-diagonal:
              * o_inter row r belongs to group r/o_lora, contracting that group's gin inputs. The shard
-             * may straddle group boundaries, so loop the overlapping groups and slice within the shard
-             * (local row = global - oi0). Then full wo_b over the zero-padded p_o1 -> per-node PARTIAL
-             * p_o, summed by the [M,C] attention-residual reduce below (mirrors the decode TP_OPROJ). */
-            memset(m->p_o1, 0, (size_t)M*c->o_inter*4);
+             * may straddle group boundaries, so loop the overlapping groups and slice within the shard.
+             * Store the result as compact [M,oi_rows]; column-sharded wo_b consumes precisely this local
+             * slice, avoiding the old [M,o_inter] zero fill and global-stride traffic. */
             int olora = c->o_lora, g_lo = m->oi0 / olora, g_hi = (m->oi0 + m->oi_rows - 1) / olora;
             for (int g = g_lo; g <= g_hi; g++) {
                 int rlo = g*olora > m->oi0 ? g*olora : m->oi0;
                 int rhi = (g+1)*olora < m->oi0 + m->oi_rows ? (g+1)*olora : m->oi0 + m->oi_rows;
                 ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, rlo - m->oi0, rhi - rlo);
-                ds4f_gemm(m, m->p_o1 + rlo, &vg, m->p_attn + (size_t)g*gin, M, c->o_inter, H);
+                ds4f_gemm(m, m->p_o1 + (rlo-m->oi0), &vg, m->p_attn + (size_t)g*gin, M, m->oi_rows, H);
             }
         } else for (int g = 0; g < og; g++) {
             ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g * c->o_lora, c->o_lora);
             ds4f_gemm(m, m->p_o1 + (size_t)g*c->o_lora, &vg, m->p_attn + (size_t)g*gin,
                       M, c->o_inter, H);
         }
-        ds4f_gemm(m,m->p_o,&ly->wo_b,m->p_o1+(ly->wo_b.cols<c->o_inter?m->oi0:0),
-                  M,C,c->o_inter);                              /* p_o = PARTIAL if tpo */
+        ds4f_gemm(m,m->p_o,&ly->wo_b,m->p_o1,
+                  M,C,tpo?m->oi_rows:c->o_inter);                /* p_o = PARTIAL if tpo */
         if (tpo && m->ar_cb) m->ar_cb(m->p_o, C*M, m->ar_ctx);        /* attention-residual reduce (sum partials) */
         for (int mm = 0; mm < M; mm++) { float *x = m->p_x + (size_t)mm*C, *o = m->p_o + (size_t)mm*C;
             for (int i = 0; i < C; i++) x[i] += o[i]; }
@@ -5453,29 +5452,25 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         }
         if (snaps) snap_loff += ds4f_tb2_snap_layer_bytes(m, L);
         free(m->s_idx_batch_sel); m->s_idx_batch_sel=NULL; m->s_idx_batch_K=0; m->s_idx_batch_pos0=0;
-        /* Batched grouped low-rank o-projection.  Under TP_OPROJ, wo_a owns
-         * only [oi0,oi0+oi_rows); zero-pad those rows into the full p_o1
-         * stride, run the replicated wo_b on that partial, then sum the
-         * [K,C] results.  This mirrors ds4f_forward_prefill and M=1 decode,
-         * and amortizes the extra collective across the whole verify tile. */
+        /* Batched grouped low-rank o-projection.  Under TP_OPROJ, keep the
+         * owned [oi0,oi0+oi_rows) result compact; column-sharded wo_b consumes
+         * that slice directly, then the existing [K,C] collective sums it. */
         int tpo = (m->oi_rows < c->o_inter);
         tv = ds4f_prof_on ? ds4f_now() : 0.0;
         if (tpo) {
-            memset(m->p_o1, 0, (size_t)K*c->o_inter*4);
             int olora=c->o_lora, g_lo=m->oi0/olora;
             int g_hi=(m->oi0+m->oi_rows-1)/olora;
             for (int g=g_lo; g<=g_hi; g++) {
                 int rlo=g*olora > m->oi0 ? g*olora : m->oi0;
                 int rhi=(g+1)*olora < m->oi0+m->oi_rows ? (g+1)*olora : m->oi0+m->oi_rows;
                 ds4f_tensor vg=ds4f_row_slice(&ly->wo_a,rlo-m->oi0,rhi-rlo);
-                ds4f_gemm(m,m->p_o1+rlo,&vg,m->p_attn+(size_t)g*gin,K,c->o_inter,H);
+                ds4f_gemm(m,m->p_o1+(rlo-m->oi0),&vg,m->p_attn+(size_t)g*gin,K,m->oi_rows,H);
             }
         } else for (int g = 0; g < og; g++) {
             ds4f_tensor vg = ds4f_row_slice(&ly->wo_a, g*c->o_lora, c->o_lora);
             ds4f_gemm(m, m->p_o1 + (size_t)g*c->o_lora, &vg, m->p_attn + (size_t)g*gin, K, c->o_inter, H);
         }
-        ds4f_gemm(m,m->p_o,&ly->wo_b,m->p_o1+(ly->wo_b.cols<c->o_inter?m->oi0:0),
-                  K,C,c->o_inter);
+        ds4f_gemm(m,m->p_o,&ly->wo_b,m->p_o1,K,C,tpo?m->oi_rows:c->o_inter);
         if (tpo && m->ar_cb) m->ar_cb(m->p_o,C*K,m->ar_ctx);
         ds4f_hc_post_batch(m, m->v_x4, K, m->v_resid, m->p_o, pa, 16, ca, 64);
         if (ds4f_prof_on) m->prof[DS4F_P_OPROJ] += ds4f_now()-tv;
