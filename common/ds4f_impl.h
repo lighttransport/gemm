@@ -5209,6 +5209,121 @@ static int ds4f_attn_tb2_gemm(ds4f_model *m,ds4f_attn_ex_task *at) {
     ds4f_pool_run(m->pool,ds4f_attn_gemm_score_worker,&T);ds4f_pool_run(m->pool,ds4f_attn_gemm_soft_worker,&T);ds4f_pool_run(m->pool,ds4f_attn_gemm_axpy_worker,&T);return 1;
 }
 
+/* Compressed-KV-only partial for the hybrid GPU/CPU path below: same math as
+ * the compressed-term loop inside ds4f_attn_tb2_worker, but computes ONLY
+ * that term's local (max, sum, unnormalized weighted-V) instead of merging
+ * it with the window term inline -- the merge happens separately via the
+ * online-softmax identity once the GPU has returned its own window-only
+ * partial. Restricted to the plain-f32 compressed-KV case (no int8/int4
+ * quantized or CP-gathered compressed storage) to match the same bailout
+ * conditions ds4f_attn_tb2_gemm already uses for its GPU path; nsel==0
+ * correctly produces an all-zero, non-contributing partial (mx=-inf). */
+typedef struct { ds4f_model *m; ds4f_layer *ly; float scale;
+                 float *cmx, *csum, *cout; } ds4f_attn_cmp_task;
+static void ds4f_attn_cmp_partial_worker(void *arg, int tid, int nthr) {
+    ds4f_attn_cmp_task *T = (ds4f_attn_cmp_task *)arg;
+    ds4f_model *m = T->m; ds4f_layer *ly = T->ly;
+    int HD = m->cfg.q_head_dim, KV = m->cfg.kv_lora;
+    int nsel = m->s_tb2_nsel;
+    const int *sel = m->s_tb2_sel; const float *cmp = ly->cmp_kv;
+    int sve = ds4f_attn_sve;
+    int h0, h1; ds4f_head_split(m, nthr, tid, &h0, &h1);
+    float *sc = (float *)alloca((size_t)(nsel > 0 ? nsel : 1) * sizeof(float));
+    for (int h = h0; h < h1; h++) {
+        const float *q = m->s_q + (size_t)h * HD;
+        float *out = T->cout + (size_t)h * HD;
+        for (int d = 0; d < HD; d++) out[d] = 0.f;
+        if (nsel <= 0) { T->cmx[h] = -1e30f; T->csum[h] = 0.f; continue; }
+        float mx = -1e30f;
+        for (int j = 0; j < nsel; j++) {
+            const float *kc = cmp + (size_t)sel[j] * KV;
+            float s;
+            if (sve) s = ds4f_sve_dot_f32(q, kc, KV);
+            else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d] * kc[d]; }
+            s *= T->scale; sc[j] = s; if (s > mx) mx = s;
+        }
+        float sum = 0.f;
+        for (int j = 0; j < nsel; j++) { sc[j] = expf(sc[j] - mx); sum += sc[j]; }
+        for (int j = 0; j < nsel; j++) {
+            const float *kc = cmp + (size_t)sel[j] * KV;
+            float w = sc[j];
+            if (sve) ds4f_sve_axpy_f32(out, kc, w, HD);
+            else for (int d = 0; d < HD; d++) out[d] += w * kc[d];
+        }
+        T->cmx[h] = mx; T->csum[h] = sum;
+    }
+}
+
+/* Hybrid GPU-window + CPU-compressed tier-B2 attention. Computes the window
+ * (+sink) term on GPU via gpu_prefill_attn_partial (unnormalized) and the
+ * compressed term on CPU via ds4f_attn_cmp_partial_worker (unnormalized),
+ * then merges the two partials with the standard online-softmax identity:
+ *   m = max(mA, mB); l = lA*exp(mA-m) + lB*exp(mB-m);
+ *   O = OA*exp(mA-m) + OB*exp(mB-m); final = O / l.
+ * This is mathematically exact (not an approximation) regardless of how the
+ * terms were partitioned, then de-rotates the merged, normalized output --
+ * matching ds4f_attn_tb2_worker's own order (RoPE after the weighted sum).
+ * Off by default (DS4F_ATTN_HYBRID_GPU); returns 0 (caller falls back to the
+ * existing CPU path) on any bailout condition or GPU-call failure, so a
+ * disabled/unavailable/misconfigured path never silently produces wrong
+ * output -- it just doesn't engage. */
+static int ds4f_attn_hybrid_gpu = -1;
+static long ds4f_attn_hybrid_hit = 0, ds4f_attn_hybrid_miss = 0, ds4f_attn_hybrid_nsel_hit = 0;
+static int ds4f_attn_tb2_hybrid_gpu(ds4f_model *m, ds4f_attn_ex_task *at) {
+    if (ds4f_attn_hybrid_gpu < 0) {
+        const char *e = getenv("DS4F_ATTN_HYBRID_GPU");
+        ds4f_attn_hybrid_gpu = e ? atoi(e) : 0;
+    }
+    if (!ds4f_attn_hybrid_gpu || !m->gpu_prefill_attn_partial) return 0;
+    ds4f_config *c = &m->cfg; ds4f_layer *ly = at->ly;
+    int HD = c->q_head_dim, nope = HD - c->qk_rope_dim, nh = c->n_heads;
+    if (m->int8_kv || m->int8_cmp || m->int4_cmp || m->cp_gather ||
+        ly->kv_frozen || ly->cmp_frozen) {
+        ds4f_attn_hybrid_miss++;
+        return 0;
+    }
+    int pos = at->pos;
+    size_t yb = (size_t)nh * HD, mb = (size_t)nh;
+    if (!m->s_attn_hy) {
+        m->s_attn_hy  = (float *)ds4f_mem_alloc(m->mem, yb * 4, 256, 1);
+        m->s_attn_hymax = (float *)ds4f_mem_alloc(m->mem, mb * 4, 256, 1);
+        m->s_attn_hysum = (float *)ds4f_mem_alloc(m->mem, mb * 4, 256, 1);
+        m->s_attn_hc  = (float *)ds4f_mem_alloc(m->mem, yb * 4, 256, 1);
+        m->s_attn_hcmax = (float *)ds4f_mem_alloc(m->mem, mb * 4, 256, 1);
+        m->s_attn_hcsum = (float *)ds4f_mem_alloc(m->mem, mb * 4, 256, 1);
+    }
+    if (!m->s_attn_hy || !m->s_attn_hymax || !m->s_attn_hysum ||
+        !m->s_attn_hc || !m->s_attn_hcmax || !m->s_attn_hcsum) {
+        ds4f_attn_hybrid_miss++;
+        return 0;
+    }
+    if (m->gpu_prefill_attn_partial(m->gpu_dense_ctx, m->s_attn_hy,
+            m->s_attn_hymax, m->s_attn_hysum, m->s_q, ly->kv_cache,
+            ly->attn_sink, 1, pos, nh, HD, c->kv_lora, ly->kv_slots,
+            at->win, at->scale) != 0) {
+        ds4f_attn_hybrid_miss++;
+        return 0;
+    }
+    ds4f_attn_hybrid_hit++;
+    int nsel = m->s_tb2_nsel;
+    if (nsel > 0) ds4f_attn_hybrid_nsel_hit++;
+    ds4f_attn_cmp_task T = { m, ly, at->scale, m->s_attn_hcmax, m->s_attn_hcsum, m->s_attn_hc };
+    ds4f_pool_run(m->pool, ds4f_attn_cmp_partial_worker, &T);
+    for (int h = 0; h < nh; h++) {
+        float mA = m->s_attn_hymax[h], lA = m->s_attn_hysum[h];
+        float mB = m->s_attn_hcmax[h], lB = m->s_attn_hcsum[h];
+        float mrg = mA > mB ? mA : mB;
+        float sA = expf(mA - mrg), sB = nsel > 0 ? expf(mB - mrg) : 0.f;
+        float l = lA * sA + lB * sB;
+        float inv = 1.0f / l;
+        float *out = m->s_attn + (size_t)h * HD;
+        const float *oa = m->s_attn_hy + (size_t)h * HD, *ob = m->s_attn_hc + (size_t)h * HD;
+        for (int d = 0; d < HD; d++) out[d] = (oa[d] * sA + ob[d] * sB) * inv;
+        ds4f_rope_apply(out + nope, at->rcos, at->rsin, pos, at->half, 1);
+    }
+    return 1;
+}
+
 /* Step the per-layer compressor (and, on CSA layers, the indexer) for the current
  * token at absolute position `pos`, then fill m->s_tb2_sel/s_tb2_nsel with the LOCAL
  * compressed indices this query attends. Token-at-a-time: pos==0 seeds the ring state
@@ -7190,7 +7305,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             m->cp_gather = 0;
             if (m->tierb2 && ratio) { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
-                if (!ds4f_attn_tb2_gemm(m, &at)) ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
+                if (!ds4f_attn_tb2_hybrid_gpu(m, &at) && !ds4f_attn_tb2_gemm(m, &at)) ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
             } else { ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                           c->window_size, c->qk_rope_dim/2, rcos, rsin };
                 ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
@@ -7655,7 +7770,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
             /* window + indexer-selected compressed term (prepare ran above). */
             ds4f_attn_ex_task at = { m, ly, pos, 1.0f/sqrtf((float)HD),
                                      c->window_size, c->qk_rope_dim/2, rcos, rsin };
-        if (!ds4f_attn_tb2_gemm(m, &at)) ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
+        if (!ds4f_attn_tb2_hybrid_gpu(m, &at) && !ds4f_attn_tb2_gemm(m, &at)) ds4f_pool_run(m->pool, ds4f_attn_tb2_worker, &at);
         } else if (m->gpu_decode_attn_enabled && m->gpu_prefill_attn &&
                    m->gpu_prefill_attn(m->gpu_dense_ctx, m->s_attn, m->s_q,
                        ly->kv_cache, ly->attn_sink, rcos, rsin,
