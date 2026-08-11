@@ -75,6 +75,14 @@ def load_lib(path):
     lib.ds4f_serve_context_export.restype = ctypes.c_int
     lib.ds4f_serve_context_import.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
     lib.ds4f_serve_context_import.restype = ctypes.c_int
+    lib.ds4f_serve_decode_batch.argtypes = [ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t)]
+    lib.ds4f_serve_decode_batch.restype = ctypes.c_int
+    lib.ds4f_serve_decode_batch_reserve.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.ds4f_serve_decode_batch_reserve.restype = ctypes.c_int
     return lib
 
 
@@ -131,6 +139,23 @@ class Serve(object):
         buf = ctypes.create_string_buffer(blob, len(blob))
         return self.lib.ds4f_serve_context_import(self._s, buf, len(blob))
 
+    def decode_batch(self, blobs, tokens):
+        n = len(blobs)
+        ib = [ctypes.create_string_buffer(b, len(b)) for b in blobs]
+        ob = [ctypes.create_string_buffer(len(b) + 4096) for b in blobs]
+        ia = (ctypes.c_void_p * n)(*[ctypes.addressof(b) for b in ib])
+        oa = (ctypes.c_void_p * n)(*[ctypes.addressof(b) for b in ob])
+        il = (ctypes.c_size_t * n)(*[len(b) for b in blobs])
+        oc = (ctypes.c_size_t * n)(*[len(b) + 4096 for b in blobs])
+        ol = (ctypes.c_size_t * n)()
+        ta = (ctypes.c_int * n)(*tokens)
+        rc = self.lib.ds4f_serve_decode_batch(self._s, ta, n, ia, il, oa, oc, ol)
+        if rc != 0: raise RuntimeError("batched decode failed rc=%d" % rc)
+        return [ob[k].raw[:ol[k]] for k in range(n)]
+
+    def reserve_decode_batch(self, capacity):
+        return self.lib.ds4f_serve_decode_batch_reserve(self._s, int(capacity))
+
 
 def env_i(k, d):
     return int(os.environ.get(k, d))
@@ -186,13 +211,18 @@ class Job(object):
 
 class CooperativeServer(object):
     def __init__(self, sess, path, context_dir, memory_ttl, disk_ttl,
-                 memory_mb, disk_mb, prefill_quantum, decode_quantum, quantum_ms):
+                 memory_mb, disk_mb, prefill_quantum, decode_quantum, quantum_ms,
+                 decode_batch_size):
         self.sess, self.path = sess, path
         self.context_dir = context_dir
         self.memory_ttl, self.disk_ttl = memory_ttl, disk_ttl
         self.memory_cap, self.disk_cap = memory_mb << 20, disk_mb << 20
         self.prefill_q = max(1, prefill_quantum)
         self.decode_q = max(1, decode_quantum)
+        self.decode_batch_size = max(1, decode_batch_size)
+        self.batch_steps = self.batch_sequences = 0
+        if self.decode_batch_size > 1 and self.sess.reserve_decode_batch(self.decode_batch_size) != 0:
+            raise RuntimeError("native decode batch reservation failed")
         self.quantum_s = max(0.001, quantum_ms / 1000.0)
         self.contexts, self.jobs, self.current = {}, [], None
         os.makedirs(context_dir, mode=0o700, exist_ok=True)
@@ -313,7 +343,11 @@ class CooperativeServer(object):
                 req = json.loads(data.split(b"\n", 1)[0])
                 op = req.get("op", "generate")
                 if op == "contexts":
-                    conn.sendall((json.dumps({"event": "contexts", "data": self.status()}) + "\n").encode()); conn.close(); continue
+                    conn.sendall((json.dumps({"event": "contexts", "data": self.status(),
+                        "decode_batch": {"enabled": self.decode_batch_size > 1,
+                                         "capacity": self.decode_batch_size,
+                                         "steps": self.batch_steps,
+                                         "sequences": self.batch_sequences}}) + "\n").encode()); conn.close(); continue
                 if op == "delete":
                     cid = str(req.get("context_id", "")); c = self.contexts.get(cid)
                     if c and c.active_job: code = 409
@@ -360,7 +394,8 @@ class CooperativeServer(object):
     def finish(self, job, error=None):
         ctx = self.contexts[job.context_id]
         if not job.cancelled and error is None:
-            ctx.blob = self.sess.context_export()
+            ctx.blob = job.working if job.working is not None and self.current is not job \
+                       else self.sess.context_export()
             ctx.tokens = job.prompt + job.out
             ctx.last_access = time.time()
             if ctx.disk:
@@ -409,11 +444,58 @@ class CooperativeServer(object):
         except Exception as exc:
             self.finish(job, exc)
 
+    def step_decode_batch(self, batch):
+        ready, tokens, blobs = [], [], []
+        try:
+            # Sampling remains per-context (temperature/history/RNG), then the
+            # expensive transformer forward is shared across the group.
+            for job in batch:
+                self.activate(job)
+                if job.cancelled or len(job.out) >= job.max_new or self.sess.pos() >= self.sess.maxpos():
+                    self.finish(job); continue
+                tok = self.sess.sample(job.sp)
+                if tok < 0: raise RuntimeError("sampling failed")
+                if tok == self.sess.eos: self.finish(job); continue
+                job.working = self.sess.context_export()
+                ready.append(job); tokens.append(tok); blobs.append(job.working)
+                self.current = None
+            if len(ready) < 2:
+                for job, tok in zip(ready, tokens):
+                    if self.sess.context_import(job.working) != 0:
+                        raise RuntimeError("single decode restore failed")
+                    pos = self.sess.pos()
+                    if self.sess.decode(tok, pos) < 0:
+                        raise RuntimeError("decode failed at %d" % pos)
+                    job.working = self.sess.context_export(); job.out.append(tok)
+                    self.current = None
+                    self.send(job, {"event": "token", "token": tok, "batch": 1})
+                    if job.cancelled or len(job.out) >= job.max_new: self.finish(job)
+                return
+            updated = self.sess.decode_batch(blobs, tokens)
+            self.batch_steps += 1; self.batch_sequences += len(ready)
+            if self.batch_steps == 1 or (self.batch_steps % 32) == 0:
+                print("[runner] decode_batch steps=%d last_n=%d sequences=%d" %
+                      (self.batch_steps, len(ready), self.batch_sequences),
+                      file=sys.stderr, flush=True)
+            self.current = None
+            for job, tok, blob in zip(ready, tokens, updated):
+                job.working = blob; job.out.append(tok)
+                self.send(job, {"event": "token", "token": tok, "batch": len(ready)})
+                if job.cancelled or len(job.out) >= job.max_new:
+                    self.finish(job)
+        except Exception as exc:
+            self.current = None
+            for job in ready:
+                if job in self.jobs: self.finish(job, exc)
+
     def run(self):
         try:
             while True:
                 self.accept()
-                if self.jobs:
+                decode = [j for j in self.jobs if j.phase == "decode" and not j.cancelled]
+                if len(decode) >= 2 and self.decode_batch_size > 1:
+                    self.step_decode_batch(decode[:self.decode_batch_size])
+                elif self.jobs:
                     job = self.jobs.pop(0); self.jobs.append(job); self.step(job)
                 else: time.sleep(0.005)
                 self.maintain()
@@ -645,6 +727,7 @@ def main():
     ap.add_argument("--context-disk-mb", type=int, default=8192)
     ap.add_argument("--prefill-quantum-tokens", type=int, default=32)
     ap.add_argument("--decode-quantum-tokens", type=int, default=4)
+    ap.add_argument("--decode-batch-size", type=int, default=1)
     ap.add_argument("--scheduler-quantum-ms", type=int, default=250)
     args = ap.parse_args()
     signal.signal(signal.SIGTERM, _term)
@@ -671,7 +754,7 @@ def main():
                               args.context_memory_ttl_sec, args.context_disk_ttl_sec,
                               args.context_memory_mb, args.context_disk_mb,
                               args.prefill_quantum_tokens, args.decode_quantum_tokens,
-                              args.scheduler_quantum_ms).run()
+                              args.scheduler_quantum_ms, args.decode_batch_size).run()
         else:
             run_serve(sess, base, prefix_cache, slots)
     except KeyboardInterrupt:

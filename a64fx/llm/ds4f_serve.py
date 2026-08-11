@@ -42,6 +42,7 @@ TIMEOUT = float(os.environ.get("DS4F_SERVE_TIMEOUT", "1200"))
 MODEL_ID = "ds4f"
 RUNNER_SOCKET = None
 RESPONSE_STATE_DIR = BASE + ".contexts/responses"
+_runner_decode_batch = {"enabled": False, "capacity": 1, "steps": 0, "sequences": 0}
 _lock = threading.Lock()        # the runner is single-stream: serialize requests
 _seq = 0
 _started_at = time.time()
@@ -93,6 +94,7 @@ def progress_snapshot():
         "contexts": {"active": len(live),
                      "warm": sum(c.get("state") == "warm" for c in contexts),
                      "disk": sum(c.get("state") == "disk" for c in contexts)},
+        "decode_batch": dict(_runner_decode_batch),
     }
 
 # ---- concurrent batched decode (DS4F_SERVE_BATCH>1): a dispatcher thread collects queued requests
@@ -423,8 +425,10 @@ def _runner_rpc(payload, streaming=False):
 
 
 def runner_contexts():
+    global _runner_decode_batch
     try:
         reply = _runner_rpc({"op": "contexts"})
+        _runner_decode_batch = reply.get("decode_batch", _runner_decode_batch)
         return reply.get("data", []) if reply.get("event") == "contexts" else []
     except (OSError, ValueError, RuntimeError):
         return []

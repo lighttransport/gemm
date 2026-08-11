@@ -60,6 +60,9 @@ typedef struct ds4f_serve {
 } ds4f_serve;
 
 void ds4f_serve_close(ds4f_serve *s);
+size_t ds4f_serve_context_bytes(ds4f_serve *s);
+int ds4f_serve_context_export(ds4f_serve *s, void *dst, size_t cap);
+int ds4f_serve_context_import(ds4f_serve *s, const void *src, size_t len);
 
 static int env_i(const char *k, int d) { const char *e = getenv(k); return e && *e ? atoi(e) : d; }
 
@@ -222,6 +225,7 @@ void ds4f_serve_close(ds4f_serve *s) {
 #if defined(DS4F_SERVE_HIP)
     if (s->hip) hip_ds4f_dense_destroy(s->hip);
 #endif
+    if (s->m) ds4f_free_decode_batch(s->m);
     if (s->m) ds4f_free(s->m);
     free(s->hist);
     free(s->logits);
@@ -298,6 +302,80 @@ int ds4f_serve_decode(ds4f_serve *s, int token, int pos) {
     }
     memcpy(s->logits, s->m->s_logits, (size_t)s->vocab * sizeof(float));
     return ar;
+}
+
+/* Decode one token for N independent serialized contexts. The stateful
+ * attention rows use separate ds4f_lseq cache sets while all dense/MoE/head
+ * projections execute as one M=N forward. Context images are returned in
+ * caller-owned buffers and can be scheduled or stashed normally. */
+int ds4f_serve_decode_batch(ds4f_serve *s, const int *tokens, int n,
+                            const void *const *inputs, const size_t *input_bytes,
+                            void *const *outputs, const size_t *output_caps,
+                            size_t *output_bytes) {
+    if (!s || !s->m || !tokens || !inputs || !input_bytes || !outputs ||
+        !output_caps || !output_bytes || n < 2 || n > s->prefill_tile) return -1;
+    ds4f_model *m = s->m;
+    if (ds4f_alloc_decode_batch(m, n) != 0) return -2;
+    int *pos = (int *)malloc((size_t)n * sizeof(int));
+    uint64_t *rng = (uint64_t *)malloc((size_t)n * sizeof(uint64_t));
+    int *nh = (int *)malloc((size_t)n * sizeof(int));
+    int **hist = (int **)calloc((size_t)n, sizeof(int *));
+    int *argmax = (int *)malloc((size_t)n * sizeof(int));
+    if (!pos || !rng || !nh || !hist || !argmax) { free(pos); free(rng); free(nh); free(hist); free(argmax); return -1; }
+    int rc = -1;
+    for (int k = 0; k < n; ++k) {
+        for (int L = 0; L < m->cfg.n_layers; ++L)
+            ds4f_lseq_apply(&m->layers[L], &m->dec_batch_seq[(size_t)k*m->cfg.n_layers + L]);
+        if (ds4f_serve_context_import(s, inputs[k], input_bytes[k]) != 0) goto done;
+        pos[k] = s->pos; rng[k] = s->rng; nh[k] = s->n_hist;
+        if (nh[k]) {
+            hist[k] = (int *)malloc((size_t)nh[k] * sizeof(int));
+            if (!hist[k]) goto done;
+            memcpy(hist[k], s->hist, (size_t)nh[k] * sizeof(int));
+        }
+        if (tokens[k] < 0 || tokens[k] >= s->vocab ||
+            embed_lookup(m, tokens[k], s->prefill_x + (size_t)k*s->hidden) != 0) goto done;
+        m->dec_batch_pos[k] = pos[k];
+    }
+    for (int L = 0; L < m->cfg.n_layers; ++L)
+        ds4f_lseq_apply(&m->layers[L], &m->dec_batch_seq[L]);
+    ds4f_forward_verify(m, s->prefill_x, n, 0, argmax, NULL, NULL);
+    for (int k = 0; k < n; ++k) {
+        for (int L = 0; L < m->cfg.n_layers; ++L)
+            ds4f_lseq_apply(&m->layers[L], &m->dec_batch_seq[(size_t)k*m->cfg.n_layers + L]);
+        s->pos = pos[k] + 1; s->rng = rng[k]; s->n_hist = nh[k];
+        if (s->hist_cap < nh[k] + 1) {
+            int cap = nh[k] + 16;
+            int *q = (int *)realloc(s->hist, (size_t)cap * sizeof(int));
+            if (!q) goto done;
+            s->hist = q; s->hist_cap = cap;
+        }
+        if (nh[k]) memcpy(s->hist, hist[k], (size_t)nh[k] * sizeof(int));
+        s->hist[s->n_hist++] = tokens[k];
+        memcpy(s->logits, m->p_logits + (size_t)k*s->vocab,
+               (size_t)s->vocab * sizeof(float));
+        size_t need = ds4f_serve_context_bytes(s);
+        output_bytes[k] = need;
+        if (output_caps[k] < need || ds4f_serve_context_export(s, outputs[k], output_caps[k]) != 0)
+            goto done;
+    }
+    rc = 0;
+done:
+    for (int L = 0; L < m->cfg.n_layers; ++L)
+        ds4f_lseq_apply(&m->layers[L], &m->dec_batch_seq[L]);
+#if defined(DS4F_SERVE_HIP)
+    if (s->hip) hip_ds4f_dense_invalidate_decode_kv(s->hip);
+#endif
+    for (int k = 0; k < n; ++k) free(hist[k]);
+    free(pos); free(rng); free(nh); free(hist); free(argmax);
+    return rc;
+}
+
+int ds4f_serve_decode_batch_reserve(ds4f_serve *s, int capacity) {
+    if (!s || !s->m || capacity < 2 || capacity > s->prefill_tile) return -1;
+    int rc = ds4f_alloc_decode_batch(s->m, capacity);
+    if (rc == 0) s->m->dec_nseq = 0;
+    return rc;
 }
 
 const float *ds4f_serve_logits(ds4f_serve *s, int *n) {

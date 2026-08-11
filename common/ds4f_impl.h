@@ -6120,7 +6120,9 @@ static void ds4f_pf_qnr_worker(void *arg, int tid, int nthr) {
         double ss = 0.0; for (int d = 0; d < HD; d++) ss += (double)qh[d]*qh[d];
         float inv = 1.0f/sqrtf((float)(ss/HD) + c->norm_eps);
         for (int d = 0; d < HD; d++) qh[d] *= inv;
-        ds4f_rope_apply(qh + nope, T->rcos, T->rsin, T->pos0 + mm, half, 0);
+        int pos = m->dec_batch_pos && m->dec_nseq == T->M
+                ? m->dec_batch_pos[mm] : T->pos0 + mm;
+        ds4f_rope_apply(qh + nope, T->rcos, T->rsin, pos, half, 0);
     }
 }
 
@@ -6781,6 +6783,79 @@ static size_t ds4f_tb2_snap_bytes(ds4f_model *m);                               
 static size_t ds4f_tb2_snap_layer(ds4f_model *m, int L, char *buf, int restore);
 static size_t ds4f_tb2_snap_layer_bytes(ds4f_model *m, int L);
 
+/* Independent-sequence cache sets for concurrent decode. Dense projections,
+ * routed experts and the head stay batched; only stateful attention swaps the
+ * per-sequence cache pointers while processing each row. */
+static inline void ds4f_lseq_apply(ds4f_layer *ly, const ds4f_lseq *s) {
+    ly->kv_cache = s->kv_cache;
+    ly->cmp_kv = s->cmp_kv; ly->cmp_kv_state = s->cmp_kv_state;
+    ly->cmp_score_state = s->cmp_score_state;
+    ly->idx_kv = s->idx_kv; ly->idx_cmp_kv_state = s->idx_cmp_kv_state;
+    ly->idx_cmp_score_state = s->idx_cmp_score_state;
+}
+
+static int ds4f_alloc_decode_batch(ds4f_model *m, int nseq) {
+    if (nseq < 1 || m->int8_kv || m->int8_cmp || m->int4_cmp) return -1;
+    if (m->dec_batch_seq && m->dec_batch_cap >= nseq) { m->dec_nseq = nseq; return 0; }
+    ds4f_config *c = &m->cfg;
+    int KV = c->kv_lora, ihd = c->index_head_dim, np = c->max_pos, NL = c->n_layers;
+    /* Serving fixes the batch width at startup. Refuse resizing rather than
+     * leaking cache sets or invalidating live slot pointers. */
+    if (m->dec_batch_seq) return -1;
+    m->dec_batch_pos = (int *)calloc((size_t)nseq, sizeof(int));
+    m->dec_batch_seq = (ds4f_lseq *)calloc((size_t)nseq * NL, sizeof(ds4f_lseq));
+    if (!m->dec_batch_pos || !m->dec_batch_seq) return -1;
+    m->dec_nseq = nseq; m->dec_batch_cap = nseq;
+    for (int L = 0; L < NL; ++L) {
+        ds4f_layer *ly = &m->layers[L];
+        ds4f_lseq *s0 = &m->dec_batch_seq[L];
+        s0->kv_cache = ly->kv_cache;
+        s0->cmp_kv = ly->cmp_kv; s0->cmp_kv_state = ly->cmp_kv_state;
+        s0->cmp_score_state = ly->cmp_score_state;
+        s0->idx_kv = ly->idx_kv; s0->idx_cmp_kv_state = ly->idx_cmp_kv_state;
+        s0->idx_cmp_score_state = ly->idx_cmp_score_state;
+        int ratio = c->compress_ratios[L], coff = ratio == 4 ? 2 : 1;
+        int W = coff * KV, nslot = ratio ? np / ratio : 0;
+        for (int k = 1; k < nseq; ++k) {
+            ds4f_lseq *q = &m->dec_batch_seq[(size_t)k * NL + L];
+            q->kv_cache = (uint16_t *)aligned_alloc(256, (size_t)ly->kv_slots * KV * 2);
+            if (!q->kv_cache) return -1;
+            memset(q->kv_cache, 0, (size_t)ly->kv_slots * KV * 2);
+            if (!ratio) continue;
+            q->cmp_kv = (float *)aligned_alloc(256, (size_t)nslot * KV * 4);
+            q->cmp_kv_state = (float *)aligned_alloc(256, (size_t)coff * ratio * W * 4);
+            q->cmp_score_state = (float *)aligned_alloc(256, (size_t)coff * ratio * W * 4);
+            if (!q->cmp_kv || !q->cmp_kv_state || !q->cmp_score_state) return -1;
+            memset(q->cmp_kv, 0, (size_t)nslot * KV * 4);
+            ds4f_compress_state_reset(q->cmp_kv_state, q->cmp_score_state, ratio, KV);
+            if (ratio == 4) {
+                int icoff = 2, iW = icoff * ihd;
+                q->idx_kv = (float *)aligned_alloc(256, (size_t)nslot * ihd * 4);
+                q->idx_cmp_kv_state = (float *)aligned_alloc(256, (size_t)icoff * ratio * iW * 4);
+                q->idx_cmp_score_state = (float *)aligned_alloc(256, (size_t)icoff * ratio * iW * 4);
+                if (!q->idx_kv || !q->idx_cmp_kv_state || !q->idx_cmp_score_state) return -1;
+                memset(q->idx_kv, 0, (size_t)nslot * ihd * 4);
+                ds4f_compress_state_reset(q->idx_cmp_kv_state, q->idx_cmp_score_state, ratio, ihd);
+            }
+        }
+    }
+    return 0;
+}
+
+static void ds4f_free_decode_batch(ds4f_model *m) {
+    if (!m || !m->dec_batch_seq) return;
+    int NL = m->cfg.n_layers;
+    for (int k = 1; k < m->dec_batch_cap; ++k) for (int L = 0; L < NL; ++L) {
+        ds4f_lseq *q = &m->dec_batch_seq[(size_t)k * NL + L];
+        free(q->kv_cache); free(q->cmp_kv); free(q->cmp_kv_state);
+        free(q->cmp_score_state); free(q->idx_kv);
+        free(q->idx_cmp_kv_state); free(q->idx_cmp_score_state);
+    }
+    free(m->dec_batch_seq); free(m->dec_batch_pos);
+    m->dec_batch_seq = NULL; m->dec_batch_pos = NULL;
+    m->dec_nseq = m->dec_batch_cap = 0;
+}
+
 /* M2b BATCHED VERIFY: run K positions [pos0, pos0+K) through the 43 layers + head with mHC + tier-B2,
  * BATCHING the dense GEMMs + the per-layer reduce (the amortization) and LOOPING the per-position tier-B2
  * attention in causal order (position k sees k-1's appended KV). COHERENT, not byte-identical to M=1 decode
@@ -6864,7 +6939,9 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         }
         /* per-position tier-B2 attention (causal: append KV then attend, in order) */
         for (int k = 0; k < K; k++) {
-            int pos = pos0 + k;
+            int pos = m->dec_batch_pos && m->dec_nseq == K ? m->dec_batch_pos[k] : pos0 + k;
+            if (m->dec_batch_seq && m->dec_nseq == K)
+                ds4f_lseq_apply(ly, &m->dec_batch_seq[(size_t)k*c->n_layers + L]);
             float *kvl = m->p_kvlat + (size_t)k*KV;
             ds4f_rmsnorm(kvl, kvl, ly->kv_norm, KV, eps);
             ds4f_rope_apply(kvl + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
@@ -6886,6 +6963,8 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
                 ds4f_pool_run(m->pool, ds4f_attn_exact_worker, &at); }
             memcpy(m->p_attn + (size_t)k*H, m->s_attn, (size_t)H*4);
         }
+        if (m->dec_batch_seq && m->dec_nseq == K)
+            ds4f_lseq_apply(ly, &m->dec_batch_seq[L]);
         if (snaps) snap_loff += ds4f_tb2_snap_layer_bytes(m, L);
         /* batched grouped low-rank o-projection (no-TP) */
         for (int g = 0; g < og; g++) {

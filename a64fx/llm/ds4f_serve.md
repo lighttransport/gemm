@@ -88,6 +88,12 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   `--context-memory-mb`, `--context-disk-mb`, `--prefill-quantum-tokens`,
   `--decode-quantum-tokens`, and `--scheduler-quantum-ms`. These are program
   arguments, not production tuning environment variables.
+- `--decode-batch-size N` enables native multi-context decode batching. It
+  batches dense, shared/routed-FFN, and head work while retaining independent
+  KV/Tier-B2 cache sets per row. Default is `1` because the current RX 9070 XT
+  small-M kernels are slower at B=2 and the independent long-range caches use
+  substantial host RAM; use B=2..4 for throughput experiments. `/v1/progress`
+  reports actual batch steps and sequences.
 - `GET /v1/contexts`, `GET /v1/contexts/<id>`, and
   `DELETE /v1/contexts/<id>` expose and manage idle context state. The progress
   endpoint reports the active context's real prefill/decode counters.

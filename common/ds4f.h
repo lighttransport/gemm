@@ -499,6 +499,7 @@ typedef struct {
      * sequences (batch elem k at position dec_batch_pos[k], reading cache set dec_batch_seq[k*L+layer])
      * instead of K consecutive tokens of one sequence. Set 0 aliases the layers' own live buffers. */
     int        dec_nseq;
+    int        dec_batch_cap;
     int       *dec_batch_pos;                  /* [dec_nseq] per-sequence positions (NULL = consecutive) */
     ds4f_lseq *dec_batch_seq;                  /* [dec_nseq * n_layers] cache sets (NULL = single-stream) */
     ds4f_layer mtp;                            /* the MTP block (attn + MoE), like a main layer */
