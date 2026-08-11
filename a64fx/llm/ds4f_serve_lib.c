@@ -183,6 +183,7 @@ static int serve_attach_hip(ds4f_serve *s, int hip_device, int verbose,
             }
         }
         if (hip_ds4f_dense_bind_tensor(s->hip,&m->dspark[0].main_proj)<0) return -1;
+        if (hip_ds4f_dense_bind_bf16_tensor(s->hip,&m->dspark[2].markov_w2)<0) return -1;
     }
     if (m->head.type == DS4F_BF16)
         hip_ds4f_dense_bind_bf16_tensor(s->hip, &m->head);
@@ -519,47 +520,43 @@ int ds4f_serve_speculate(ds4f_serve *s, int anchor, int pos, int max_tokens,
         if (!q) return -1;
         s->hist=q; s->hist_cap=cap;
     }
-    int C=s->hidden;
     int *draft=(int *)malloc((size_t)K*sizeof(int));
-    int *verify=(int *)malloc((size_t)K*sizeof(int));
     float *draft_conf=confidence ? (float *)malloc((size_t)K*sizeof(float)):NULL;
-    float *X=(float *)malloc((size_t)K*(size_t)C*sizeof(float));
-    size_t ss=s->m->tierb2 ? ds4f_tb2_snap_bytes(s->m):0;
-    char *snaps=ss && K>1 ? (char *)malloc((size_t)(K-1)*ss):NULL;
-    if (!draft || !verify || !X || (confidence && !draft_conf) || (ss && K>1 && !snaps)) {
-        free(draft); free(verify); free(draft_conf); free(X); free(snaps); return -1;
+    if (!draft || (confidence && !draft_conf)) {
+        free(draft); free(draft_conf); return -1;
     }
     if (ds4f_dspark_predict_block(s->m,anchor,pos,K,draft,draft_conf)!=K) {
-        free(draft); free(verify); free(draft_conf); free(X); free(snaps); return -1;
+        free(draft); free(draft_conf); return -1;
     }
+    /* Use the ordinary token kernel as the verifier.  Unlike the batched
+     * prefill GEMM it has exactly the same accumulation order as baseline
+     * greedy decode. Stop immediately at the first rejected proposal, so no
+     * main-model KV or Tier-B2 rollback is required. */
+    int matched=0,committed=0;
     for (int k=0;k<K;k++) {
         int id=k ? draft[k-1]:anchor;
-        verify[k]=id;
-        if (embed_lookup(s->m,id,X+(size_t)k*C)!=0) {
-            free(draft); free(verify); free(draft_conf); free(X); free(snaps); return -1;
-        }
+        if (embed_lookup(s->m,id,s->x)!=0) { free(draft); free(draft_conf); return -1; }
+        ds4f_set_forward_token_ids(s->m,&id,1);
+        int next=ds4f_forward_token(s->m,s->x,pos+k);
+        if (next<0) { free(draft); free(draft_conf); return -1; }
+        committed++;
+        if (k<K-1 && next==draft[k]) { matched++; continue; }
+        break;
     }
-    ds4f_set_forward_token_ids(s->m,verify,K);
-    ds4f_forward_verify(s->m,X,K,pos,verify,NULL,snaps);
-    int matched=0;
-    while (matched<K-1 && verify[matched]==draft[matched]) matched++;
-    int committed=1+matched;
     out_tokens[0]=anchor;
     for (int k=0;k<matched;k++) out_tokens[k+1]=draft[k];
     if (confidence) {
         confidence[0]=-1.f;
         for (int k=0;k<matched;k++) confidence[k+1]=draft_conf[k];
     }
-    if (committed<K && snaps) ds4f_tb2_snap(s->m,snaps+(size_t)(committed-1)*ss,1);
     s->pos=pos+committed;
     if (s->m->cfg.vocab>(int)s->logits_cap) {
         s->logits=(float *)realloc(s->logits,(size_t)s->vocab*sizeof(float));
         s->logits_cap=(size_t)s->vocab;
     }
-    memcpy(s->logits,s->m->p_logits+(size_t)(committed-1)*s->vocab,
-           (size_t)s->vocab*sizeof(float));
+    memcpy(s->logits,s->m->s_logits,(size_t)s->vocab*sizeof(float));
     for (int k=0;k<committed;k++) s->hist[s->n_hist++]=out_tokens[k];
-    free(draft); free(verify); free(draft_conf); free(X); free(snaps);
+    free(draft); free(draft_conf);
     return committed;
 }
 

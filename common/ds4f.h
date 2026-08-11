@@ -384,7 +384,7 @@ typedef struct {
     uint16_t *norm;              /* stage 2: [hidden] */
     float *hc_head_fn, *hc_head_base, *hc_head_scale;
     uint16_t *markov_w1;         /* stage 2: [vocab, markov_rank] */
-    uint16_t *markov_w2;         /* stage 2: [vocab, markov_rank] */
+    ds4f_tensor markov_w2;       /* stage 2: [vocab, markov_rank] */
     uint16_t *confidence_proj;   /* stage 2: [hidden+markov_rank] */
 } ds4f_dspark_stage;
 

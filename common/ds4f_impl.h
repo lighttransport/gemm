@@ -4530,7 +4530,8 @@ static ds4f_model *ds4f_load_real_opts(const ds4f_runtime_options *opt) {
         d2->hc_head_fn=(float*)ds4f_bump(m,(size_t)hc*hc*C2*4,256); d2->hc_head_base=(float*)ds4f_bump(m,(size_t)hc*4,64); d2->hc_head_scale=(float*)ds4f_bump(m,4,64);
         ds4f_load_raw(m,&B,d2->hc_head_fn,"mtp.2.hc_head_fn",DS4F_F32,hc,hc*C2); ds4f_load_raw(m,&B,d2->hc_head_base,"mtp.2.hc_head_base",DS4F_F32,1,hc); ds4f_load_raw(m,&B,d2->hc_head_scale,"mtp.2.hc_head_scale",DS4F_F32,1,1);
         d2->markov_w1=(uint16_t*)ds4f_bump(m,(size_t)cfg.vocab*256*2,256); ds4f_load_raw(m,&B,d2->markov_w1,"mtp.2.markov_head.markov_w1.weight",DS4F_BF16,cfg.vocab,256);
-        d2->markov_w2=(uint16_t*)ds4f_bump(m,(size_t)cfg.vocab*256*2,256); ds4f_load_raw(m,&B,d2->markov_w2,"mtp.2.markov_head.markov_w2.weight",DS4F_BF16,cfg.vocab,256);
+        d2->markov_w2=ds4f_new_tensor(m,DS4F_BF16,cfg.vocab,256);
+        ds4f_load_dense(m,&B,&d2->markov_w2,"mtp.2.markov_head.markov_w2");
         d2->confidence_proj=(uint16_t*)ds4f_bump(m,(size_t)(C2+256)*2,64); ds4f_load_raw(m,&B,d2->confidence_proj,"mtp.2.confidence_head.proj.weight",DS4F_BF16,1,C2+256);
         m->dspark_n_stages=3; m->dspark_block_size=5; m->dspark_noise_token=128799; m->dspark_markov_rank=256;
         m->dspark_target_layers[0]=40; m->dspark_target_layers[1]=41; m->dspark_target_layers[2]=42;
@@ -7978,13 +7979,11 @@ static int ds4f_dspark_predict_block(ds4f_model *m, int anchor_id, int pos,
     for (int k=0;k<K;k++) {
         const uint16_t *me=d2->markov_w1+(size_t)token*m->dspark_markov_rank;
         const float *base=m->p_logits+(size_t)k*V;
+        for (int r=0;r<m->dspark_markov_rank;r++) m->s_qlat[r]=ds4f_bf16f(me[r]);
+        ds4f_matvec(m,m->s_logits,&d2->markov_w2,m->s_qlat);
         int best=0; float bv=-INFINITY;
         for (int v=0;v<V;v++) {
-            const uint16_t *w=d2->markov_w2+(size_t)v*m->dspark_markov_rank;
-            float b=0.f;
-            for (int r=0;r<m->dspark_markov_rank;r++)
-                b+=ds4f_bf16f(me[r])*ds4f_bf16f(w[r]);
-            float z=base[v]+b; if (z>bv) { bv=z; best=v; }
+            float z=base[v]+m->s_logits[v]; if (z>bv) { bv=z; best=v; }
         }
         draft[k]=token=best;
         if (confidence) {
