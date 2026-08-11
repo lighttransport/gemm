@@ -102,6 +102,23 @@ sh a64fx/llm/build_ds4f_serve.sh
 
 The build emits pre-existing warning noise but no compile/link error.
 
+## Decode does not use the routed-FFN path we optimized (2026-08-11, important correction)
+
+Tested the pre-existing prompt-hot expert cache (`hip_ds4f_dense_cache_hot_experts`, hetero/ds4f/hip_ds4f_dense.c:1341 — admits hot experts by identity into permanent GPU residency after prefill, budgeted by `--hip-expert-cache-mb`/`--hip-expert-cache-reserve-mb`) before writing any new caching code, since it already does exactly what "expert-weight caching" would mean. At matched settings (same 64-token prompt, warm=1/decode=2), decode was **5.163 tok/s with the cache vs. 5.176 tok/s without — no measurable difference.**
+
+Root cause: decode's per-token expert compute does not go through `hip_ds4f_dense_routed_ffn` (the function the pool/telemetry above targets) except in the rare case where *all* of a token's top-k routed experts are simultaneously GPU-resident (common/ds4f_impl.h:7732, `c->n_active <= 8` all-GPU fast path). Confirmed via `hip_route` call counts staying flat (~44-46) regardless of whether decode ran 2 or 16 tokens — decode almost never takes that path. The actual decode dispatch (common/ds4f_impl.h:7764-7818, `ds4f_expert_batch_on()` path) splits each token's active experts into a GPU bucket (per-expert matvec for tensors with `gpu_id >= 0`) and a CPU bucket (exact CPU MXFP4 for the rest) — mixed per-expert, not all-or-nothing.
+
+Added new DS4F_PROF sub-timers `exp_cpu`/`exp_gpu` (common/ds4f.h: `DS4F_P_EXPERTS_CPU=24`, `DS4F_P_EXPERTS_GPU=25`, extended `DS4F_NPHASE` 24->26; instrumented in common/ds4f_impl.h around the `gateup_cpu`/`gateup_gpu`/`down_cpu`/`down_gpu` `ds4f_matvec_multi` calls and the all-GPU `m->gpu_routed_ffn` call; loop bounds in `ds4f_serve_close()` (a64fx/llm/ds4f_serve_lib.c:319-320) widened from `DS4F_P_COMM` to `DS4F_NPHASE` to print them). Measured with the hot cache enabled (449 bundles, 6GB, 47% training coverage) over a 64-token prompt + 20 decode tokens:
+
+```text
+exp_cpu   1.290 s  18.6% of profiled total
+exp_gpu   0.470 s   6.8% of profiled total
+```
+
+**CPU fallback costs ~2.7x the GPU-hit path for the same aggregate expert work.** This matches the `hot8_coverage` numbers already printed by the cache (~25-55% per layer, from a single short prompt) — most decode-time expert accesses miss the cache and pay the slower CPU path. Verified: telemetry-only change, mHC exact quality gate still 8/9 (no regression), no VRAM leak, no orphan processes.
+
+**This means the pool/telemetry work above (upload/launch/sync split) only affects prefill, not the harder 18 tok/s decode target.** The real decode lever is raising the effective cache hit rate — either a bigger/smarter admission budget, an online/adaptive cache instead of the current static post-prefill snapshot, or speeding up the CPU fallback path itself. Not yet attempted; needs a decision on approach before more code.
+
 ## Quality evidence
 
 Use mHC enabled for the authoritative exact path:
@@ -164,10 +181,10 @@ curl -s --max-time 5 http://127.0.0.1:8080/v1/progress
 1. ~~Inspect `git diff` for the reusable pool and run a short benchmark with a timeout.~~ Done 2026-08-11: original (non-event-guarded) version stalled during prefill and was reverted. See "Pool-change verdict" above.
 2. ~~Add phase-level serving telemetry inside routed FFN.~~ Done 2026-08-11: see "Phase telemetry" above.
 3. ~~Retry pooling with per-slot event guards.~~ Done 2026-08-11: stable, quality-clean, modest win (~8-9%). See "Pool retry with per-slot events" above. **The dominant cost (upload, ~90% of routed-FFN time) is real PCIe transfer of expert weights, not allocator overhead — pooling buffers wasn't enough.**
-4. Implement cross-call expert-weight caching keyed by expert identity (skip the H2D copy on a cache hit), with an explicit VRAM budget and eviction policy — this is the next real lever per the finding in step 3. Not started. Validate incrementally under `DS4F_PROF=1`; do not attempt full-layer resident uploads (a separate prior attempt at that stalled).
-5. Test 256, 1024, and 8192-token prefills (quality gate for the pool retry already passed at 9-token scale). Watch VRAM and abort unsafe runs.
-6. Benchmark warmed single decode separately from prefill. Prefix/tool caching is implemented in the server but has not improved throughput; verify cache hit, prompt token count, and processing phase through `/v1/progress` before tuning residency.
-7. Continue committing incrementally (telemetry + event-guarded pool are already committed, see below) — after each further runtime-stable, measurably-improving change, commit with a short imperative subject and report the hash plus exact commands/results.
+4. ~~Implement cross-call expert-weight caching.~~ Superseded 2026-08-11: this already existed (`hip_ds4f_dense_cache_hot_experts`) and tested as producing no measurable decode speedup — see "Decode does not use the routed-FFN path we optimized" above. Do not re-attempt a pool-side cache for decode; the bottleneck is elsewhere.
+5. **Raise decode's effective cache hit rate — the real lever, not yet attempted.** `exp_cpu` (CPU fallback for cache misses) is measured at ~2.7x the cost of `exp_gpu` (cache-hit GPU path) and dominates decode wall time given ~25-55% per-layer hot8_coverage. Candidate directions: (a) increase `--hip-expert-cache-mb` budget toward using more of the ~9GB free VRAM (currently `auto` picked 6GB/449 bundles at 47% coverage — check whether raising it meaningfully raises coverage and hit rate); (b) replace the static post-prefill snapshot cache with an online/adaptive cache that admits/evicts based on live decode-time routing, not just the one-shot prompt stats; (c) speed up the CPU MXFP4 fallback path itself for cache misses. Needs a decision on approach before writing code — these are different-sized efforts.
+6. Test 256, 1024, and 8192-token prefills (quality gate for the pool retry already passed at 9-token scale). Watch VRAM and abort unsafe runs.
+7. Continue committing incrementally (telemetry, event-guarded pool, and decode CPU/GPU phase split are already committed, see below) — after each further runtime-stable, measurably-improving change, commit with a short imperative subject and report the hash plus exact commands/results.
 
 **Reminder:** `ds4f_serve_bench.py` loads its own model standalone — stop any running `run_ds4f_single_serve.sh` server first, or numbers will be contention-skewed (see verdict above).
 

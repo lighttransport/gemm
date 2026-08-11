@@ -316,8 +316,8 @@ void ds4f_serve_close(ds4f_serve *s) {
     if (!s) return;
     if (s->m && getenv("DS4F_PROF") && atoi(getenv("DS4F_PROF")) != 0) {
         double acc = 0.0;
-        for (int i = 0; i <= DS4F_P_COMM; ++i) acc += s->m->prof[i];
-        for (int i = 0; i <= DS4F_P_COMM; ++i) {
+        for (int i = 0; i < DS4F_NPHASE; ++i) acc += s->m->prof[i];
+        for (int i = 0; i < DS4F_NPHASE; ++i) {
             if (s->m->prof[i] > 1e-3)
                 fprintf(stderr, "  %-9s %8.3f s %5.1f%%\n", ds4f_prof_names[i],
                         s->m->prof[i], acc > 0 ? 100.0 * s->m->prof[i] / acc : 0.0);

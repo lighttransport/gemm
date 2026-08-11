@@ -740,7 +740,7 @@ typedef struct {
     const int *forward_token_ids;
     int forward_token_count;
     /* per-phase wall-time profiler (seconds, accumulated; printed by runner) */
-#define DS4F_NPHASE 24
+#define DS4F_NPHASE 26
     double prof[DS4F_NPHASE];
 } ds4f_model;
 
@@ -763,12 +763,16 @@ enum { DS4F_P_QKV=0, DS4F_P_ATTN=1, DS4F_P_OPROJ=2, DS4F_P_SHARED=3,
        /* QKV_A..QKV_ROPE are SUB-timers of QKV (like TB2SCAN.. are of TB2PREP) */
        DS4F_P_QKV_A=16, DS4F_P_QKV_B=17, DS4F_P_QKV_KV=18, DS4F_P_QKV_ROPE=19,
        /* mHC + comm decode sub-timers (mhc* are inside "other"/oproj/experts; comm = ar_cb) */
-       DS4F_P_MHCPRE=20, DS4F_P_MHCPOST=21, DS4F_P_MHCCPY=22, DS4F_P_COMM=23 };
-static const char *ds4f_prof_names[24] = {
+       DS4F_P_MHCPRE=20, DS4F_P_MHCPOST=21, DS4F_P_MHCCPY=22, DS4F_P_COMM=23,
+       /* Decode-time MoE sub-timers (inside "experts"): CPU fallback for
+        * cache-missed experts vs. GPU matvec/routed-ffn for cache hits. */
+       DS4F_P_EXPERTS_CPU=24, DS4F_P_EXPERTS_GPU=25 };
+static const char *ds4f_prof_names[26] = {
     "qkv_proj","attn","o_proj","shared","router","experts","head","other","tb2prep","tb2scan",
     "tb2qproj","tb2rope","tb2icmp","tb2wproj","tb2lcmp","tb2topk",
     "qkv_wqa","qkv_wqb","qkv_wkv","qkv_rope",
-    "mhc_pre","mhc_post","mhc_cpy","comm" };
+    "mhc_pre","mhc_post","mhc_cpy","comm",
+    "exp_cpu","exp_gpu" };
 
 /* ===================== thread pool (pinned, spin) ===================== */
 typedef void (*ds4f_fn)(void *arg, int tid, int nthr);

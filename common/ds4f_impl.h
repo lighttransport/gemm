@@ -7749,9 +7749,12 @@ decode_oproj_done:;
                     counts[j] = 1; offsets[j + 1] = j + 1;
                     memcpy(m->p_exX + (size_t)j * C, m->s_h2, (size_t)C * sizeof(float));
                 }
-                if (m->gpu_routed_ffn(m->gpu_dense_ctx, m->p_exO, m->p_exX,
+                DS4F_TIC();
+                int routed_gpu_rc = m->gpu_routed_ffn(m->gpu_dense_ctx, m->p_exO, m->p_exX,
                         rw1, rw3, rw2, counts, offsets, nlocal, nlocal,
-                        C, c->moe_inter, c->swiglu_limit) == 0) {
+                        C, c->moe_inter, c->swiglu_limit);
+                DS4F_TOC(DS4F_P_EXPERTS_GPU);
+                if (routed_gpu_rc == 0) {
                     for (int j = 0; j < nlocal; ++j) {
                         float w = wt[local_k[j]];
                         const float *y = m->p_exO + (size_t)j * C;
@@ -7787,8 +7790,8 @@ decode_oproj_done:;
                 }
                 /* Cache misses stay on the exact CPU path. Cache hits use the
                  * compact raw-MXFP4 HIP matrices and never trigger H2D here. */
-                if (ncpu) ds4f_matvec_multi(m, gateup_cpu, ncpu);
-                if (ngpu) ds4f_matvec_multi(m, gateup_gpu, ngpu);
+                if (ncpu) { DS4F_TIC(); ds4f_matvec_multi(m, gateup_cpu, ncpu); DS4F_TOC(DS4F_P_EXPERTS_CPU); }
+                if (ngpu) { DS4F_TIC(); ds4f_matvec_multi(m, gateup_gpu, ngpu); DS4F_TOC(DS4F_P_EXPERTS_GPU); }
                 for (int j = 0; j < nlocal; j++) {
                     float *g = m->s_exb_g + (size_t)j * c->moe_inter;
                     const float *u = m->s_exb_u + (size_t)j * c->moe_inter;
@@ -7808,8 +7811,8 @@ decode_oproj_done:;
                     if (a.t->gpu_id >= 0) down_gpu[ngpu++] = a;
                     else down_cpu[ncpu++] = a;
                 }
-                if (ncpu) ds4f_matvec_multi(m, down_cpu, ncpu);
-                if (ngpu) ds4f_matvec_multi(m, down_gpu, ngpu);
+                if (ncpu) { DS4F_TIC(); ds4f_matvec_multi(m, down_cpu, ncpu); DS4F_TOC(DS4F_P_EXPERTS_CPU); }
+                if (ngpu) { DS4F_TIC(); ds4f_matvec_multi(m, down_gpu, ngpu); DS4F_TOC(DS4F_P_EXPERTS_GPU); }
                 for (int j = 0; j < nlocal; j++) {
                     const float *y = m->s_exb_o + (size_t)j * C;
                     float w = wt[local_k[j]];
