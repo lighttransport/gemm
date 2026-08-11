@@ -1645,6 +1645,60 @@ static int ds4f_compress_step(
         rcos,rsin,eps,rotate,kv_state,score_state,out,pool,NULL,NULL);
 }
 
+/* Batched layer-compressor state update.  Projection rows have already been
+ * produced by GEMM.  Compressor dimensions are independent until the final
+ * RMSNorm, so give each worker a disjoint dimension range and keep token order
+ * locally.  This replaces K serial scalar dimension sweeps with one dispatch. */
+typedef struct {
+    ds4f_layer *ly; const float *kv, *score; float *raw;
+    int K, pos0, d, ratio;
+} ds4f_cmpstate_batch_task;
+static void ds4f_cmpstate_batch_worker(void *arg, int tid, int nthr) {
+    ds4f_cmpstate_batch_task *T=(ds4f_cmpstate_batch_task *)arg;
+    int d=T->d, ratio=T->ratio, overlap=(ratio==4), W=(overlap?2:1)*d;
+    int e0=d*tid/nthr, e1=d*(tid+1)/nthr;
+    float *ks=T->ly->cmp_kv_state, *ss=T->ly->cmp_score_state;
+    for(int e=e0;e<e1;e++) for(int z=0;z<T->K;z++) {
+        int pos=T->pos0+z, apr=pos%ratio, should=((pos+1)%ratio)==0;
+        const float *kv=T->kv+(size_t)z*W, *sc=T->score+(size_t)z*W;
+        if(pos==0) {
+            int slot=overlap?ratio:0;
+            ks[(size_t)slot*W+e]=kv[e]; ss[(size_t)slot*W+e]=sc[e]+T->ly->cmp_ape[e];
+            if(overlap) { ks[(size_t)slot*W+d+e]=kv[d+e];
+                ss[(size_t)slot*W+d+e]=sc[d+e]+T->ly->cmp_ape[d+e]; }
+            continue;
+        }
+        int slot=overlap?ratio+apr:apr;
+        ks[(size_t)slot*W+e]=kv[e];
+        ss[(size_t)slot*W+e]=sc[e]+T->ly->cmp_ape[(size_t)apr*W+e];
+        if(overlap) {
+            ks[(size_t)slot*W+d+e]=kv[d+e];
+            ss[(size_t)slot*W+d+e]=sc[d+e]+T->ly->cmp_ape[(size_t)apr*W+d+e];
+        }
+        if(!should) continue;
+        float mx=-1e30f, den=0.f, acc=0.f;
+        if(overlap) {
+            for(int p=0;p<ratio;p++){float v=ss[(size_t)p*W+e];if(v>mx)mx=v;}
+            for(int p=0;p<ratio;p++){float v=ss[(size_t)(ratio+p)*W+d+e];if(v>mx)mx=v;}
+            for(int p=0;p<ratio;p++)den+=expf(ss[(size_t)p*W+e]-mx);
+            for(int p=0;p<ratio;p++)den+=expf(ss[(size_t)(ratio+p)*W+d+e]-mx);
+            for(int p=0;p<ratio;p++){float q=expf(ss[(size_t)p*W+e]-mx)/den;acc+=ks[(size_t)p*W+e]*q;}
+            for(int p=0;p<ratio;p++){float q=expf(ss[(size_t)(ratio+p)*W+d+e]-mx)/den;acc+=ks[(size_t)(ratio+p)*W+d+e]*q;}
+            for(int p=0;p<ratio;p++) {
+                ks[(size_t)p*W+e]=ks[(size_t)(ratio+p)*W+e];
+                ss[(size_t)p*W+e]=ss[(size_t)(ratio+p)*W+e];
+                ks[(size_t)p*W+d+e]=ks[(size_t)(ratio+p)*W+d+e];
+                ss[(size_t)p*W+d+e]=ss[(size_t)(ratio+p)*W+d+e];
+            }
+        } else {
+            for(int p=0;p<ratio;p++){float v=ss[(size_t)p*W+e];if(v>mx)mx=v;}
+            for(int p=0;p<ratio;p++)den+=expf(ss[(size_t)p*W+e]-mx);
+            for(int p=0;p<ratio;p++)acc+=ks[(size_t)p*W+e]*(expf(ss[(size_t)p*W+e]-mx)/den);
+        }
+        T->raw[(size_t)(pos/ratio)*d+e]=acc;
+    }
+}
+
 /* get_window_topk_idxs (decode, seqlen==1, start_pos>0): window-ring SLOT indices, newest
  * window in chronological order, -1 for not-yet-filled. Always fills `window` columns. */
 static inline int ds4f_window_idx_decode(int window, int start_pos, int *row) {
@@ -3930,7 +3984,7 @@ static int ds4f_index_batch_prepare(ds4f_model *m, ds4f_layer *ly, int K, int po
 
 static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
                              const float *rcos, const float *rsin,
-                             float *cmp_kv_pre, float *cmp_score_pre) {
+                             float *cmp_kv_pre, float *cmp_score_pre, int skip_lcmp) {
     m->s_tb2_nsel = 0;
     if (ratio == 0) return;
     ds4f_config *c = &m->cfg;
@@ -3938,7 +3992,7 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
     int offset = c->window_size;                                /* decode combined-buffer offset */
     /* layer compressor (rotate=0): input s_hn -> cmp_kv[pos/ratio] on a boundary */
     double _tlc0 = ds4f_now();
-    if (ds4f_compress_step_pre(m->s_hn, c->hidden, KV, rd, ratio, pos,
+    if (!skip_lcmp && ds4f_compress_step_pre(m->s_hn, c->hidden, KV, rd, ratio, pos,
                            ly->cmp_wkv, ly->cmp_wgate, 1, ly->cmp_ape, ly->cmp_norm,
                            rcos, rsin, eps, 0,
                            ly->cmp_kv_state, ly->cmp_score_state, m->s_cmp_out, m->pool,
@@ -5398,12 +5452,29 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
          * causal compressor ring update. */
         int cmpW_pf = ratio ? ((ratio == 4 ? 2 : 1) * KV) : 0;
         static int s_tb2_batch=-1; if(s_tb2_batch<0){const char *e=getenv("DS4F_TB2_BATCH");s_tb2_batch=e&&atoi(e);}
+        int cmpstate_batch = 0;
         if (s_tb2_batch && m->tierb2 && ratio) {
             int pv=ly->cmp_wkv_pv&&ly->cmp_wgate_pv;
             ds4f_tensor cwk = { pv?ly->cmp_wkv_pv:ly->cmp_wkv, NULL, pv?DS4F_BF16_PV:DS4F_BF16, cmpW_pf, C };
             ds4f_tensor cwg = { pv?ly->cmp_wgate_pv:ly->cmp_wgate, NULL, pv?DS4F_BF16_PV:DS4F_BF16, cmpW_pf, C };
             ds4f_gemm(m,m->v_cmp_kv,&cwk,m->p_hn,K,cmpW_pf,C);
             ds4f_gemm(m,m->v_cmp_score,&cwg,m->p_hn,K,cmpW_pf,C);
+            static int s_cmpstate=-1; if(s_cmpstate<0){const char *e=getenv("DS4F_CMPSTATE_BATCH");s_cmpstate=e?atoi(e):1;}
+            if(s_cmpstate && !snaps) {
+                double cs0=ds4f_prof_on?ds4f_now():0.0;
+                ds4f_cmpstate_batch_task ct={ly,m->v_cmp_kv,m->v_cmp_score,ly->cmp_kv,K,pos0,KV,ratio};
+                ds4f_pool_run(m->pool,ds4f_cmpstate_batch_worker,&ct);
+                /* The softmax/state recurrence is dimension-separable; RMSNorm
+                 * and RoPE are applied after each completed boundary row. */
+                for(int z=0;z<K;z++) { int pos=pos0+z;
+                    if(((pos+1)%ratio)!=0)continue;
+                    float *out=ly->cmp_kv+(size_t)(pos/ratio)*KV;
+                    ds4f_rmsnorm(out,out,ly->cmp_norm,KV,c->norm_eps);
+                    ds4f_rope_apply(out+(KV-c->qk_rope_dim),rcos,rsin,pos+1-ratio,c->qk_rope_dim/2,0);
+                }
+                if(ds4f_prof_on)m->prof[DS4F_P_TB2LCMP]+=ds4f_now()-cs0;
+                cmpstate_batch=1;
+            }
         }
         if (ds4f_prof_on) m->prof[DS4F_P_TB2PREP] += ds4f_now()-tv;
         m->s_idx_batch_sel = NULL; m->s_idx_batch_K = 0; m->s_idx_batch_pos0=0;
@@ -5457,7 +5528,7 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             tv = ds4f_prof_on ? ds4f_now() : 0.0;
             if (m->tierb2 && ratio) ds4f_tb2_prepare(m,ly,ratio,pos,rcos,rsin,
                 s_tb2_batch?m->v_cmp_kv+(size_t)k*cmpW_pf:NULL,
-                s_tb2_batch?m->v_cmp_score+(size_t)k*cmpW_pf:NULL);
+                s_tb2_batch?m->v_cmp_score+(size_t)k*cmpW_pf:NULL, cmpstate_batch);
             if (ds4f_prof_on) m->prof[DS4F_P_TB2PREP] += ds4f_now()-tv;
             m->s_idx_qpre = NULL;
             if (snaps && ratio && k < K-1)                           /* state after THIS position, this layer */
@@ -5802,7 +5873,7 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
         DS4F_TOC(DS4F_P_QKV); }
         /* ---- Tier-B2 compressor/indexer step (timed apart from the attn worker) ---- */
         if (m->tierb2 && ratio) { DS4F_TIC();
-            ds4f_tb2_prepare(m,ly,ratio,pos,rcos,rsin,NULL,NULL);  /* fills s_tb2_sel/nsel */
+            ds4f_tb2_prepare(m,ly,ratio,pos,rcos,rsin,NULL,NULL,0);  /* fills s_tb2_sel/nsel */
             DS4F_TOC(DS4F_P_TB2PREP); }
         /* ---- CP gather-selected (CSA only): dequant the selected cmp_q4 latents to f32 and ar_cb-SUM
          * so every node holds the full selected set even though cmp_q4 is slot-sharded; attention reads
