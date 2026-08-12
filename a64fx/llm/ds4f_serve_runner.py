@@ -1023,7 +1023,7 @@ def main():
     ap.add_argument("--runner-timeout-sec", type=float, default=3600.0)
     ap.add_argument("--decode-quantum-tokens", type=int, default=4)
     ap.add_argument("--decode-batch-size", type=int, default=1)
-    ap.add_argument("--speculative-tokens", type=int, default=0,
+    ap.add_argument("--speculative-tokens", type=int, default=4,
                     help="greedy DSpark block size (0 disables; checkpoint supports up to 5)")
     ap.add_argument("--scheduler-quantum-ms", type=int, default=250)
     args = ap.parse_args()
@@ -1040,6 +1040,25 @@ def main():
     stage = os.environ.get("DS4F_STAGE_DIR")
     if not stage:
         sys.exit("DS4F_STAGE_DIR is required (the single-node staged manifest dir)")
+    spec_tokens = args.speculative_tokens
+    if spec_tokens:
+        # MTP tensors are optional in ordinary serving stages.  Keep the
+        # performance default safe by disabling DSpark when this image has no
+        # drafter instead of making startup fail in ds4f_serve_open_ex.
+        manifests = [os.path.join(stage, n) for n in os.listdir(stage)
+                     if n.endswith(".manifest")]
+        has_mtp = False
+        for manifest in manifests:
+            try:
+                with open(manifest, errors="ignore") as f:
+                    has_mtp = any(" mtp." in line for line in f)
+            except OSError:
+                pass
+            if has_mtp:
+                break
+        if not has_mtp:
+            print("[runner] no MTP tensors; disabling speculative decode", file=sys.stderr)
+            spec_tokens = 0
     lib = load_lib(os.environ.get("DS4F_SERVE_LIB", LIB))
     sess = Serve(lib, stage,
                  use_hip=env_i("DS4F_SERVE_USE_HIP", 0),
@@ -1047,7 +1066,7 @@ def main():
                  threads=env_i("LLM_THREADS", 16),
                  cmgs=env_i("DS4F_CMGS", 1),
                  max_pos=env_i("DS4F_MAXPOS", 16384),
-                 speculative_tokens=args.speculative_tokens,
+                 speculative_tokens=spec_tokens,
                  hip_prefill=(args.hip_prefill_tuned, args.hip_fused_shared_ffn,
                               args.hip_prefill_attn, args.hip_qkv_fuse,
                               args.hip_qkv_device_chain, args.hip_attn_device_chain,

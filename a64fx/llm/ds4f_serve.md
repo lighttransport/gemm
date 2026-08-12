@@ -138,8 +138,10 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   applies the rank-256 Markov bias in token order, and commits only the prefix
   accepted by the exact main-model verifier. Sampling, penalties, and native
   multi-context decode retain the ordinary path. The checkpoint was trained
-  with a five-position block, so values above 5 are clamped. The default is 0
-  until the 18 tok/s deployment gate is measured on the target RX 9070 XT.
+  with a five-position block, so values above 5 are clamped. The HTTP runner
+  defaults to 4 when the staged manifest contains `mtp.*` tensors and
+  automatically disables DSpark for ordinary non-MTP stages. Pass 0 for a
+  scalar baseline.
   Version-3 context images include all three DSpark KV rings; older version-2
   contexts remain compatible when DSpark is disabled.
 - `GET /v1/contexts`, `GET /v1/contexts/<id>`, and
