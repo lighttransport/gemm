@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--hip-tb2-batch", type=int, choices=(0, 1), default=0)
     ap.add_argument("--hip-attn-hybrid", type=int, choices=(0, 1), default=0,
                     help="exact GPU window + CPU compressed Tier-B2 attention")
+    ap.add_argument("--hip-attn-cmp-fast", type=int, choices=(0, 1), default=0,
+                    help="AVX2/FMA compressed-attention dot path (parity-gated)")
     ap.add_argument("--hip-expert-stream", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-expert-pinned-staging", type=int, choices=(0, 1), default=0)
     ap.add_argument("--hip-expert-cache-mb", type=int, default=0,
@@ -91,6 +93,8 @@ def main():
                 raise RuntimeError("adaptive expert cache is unavailable")
         if args.hip_attn_hybrid and sess.set_attn_hybrid(1) != 0:
             raise RuntimeError("exact attention hybrid is unavailable")
+        if args.hip_attn_cmp_fast and sess.set_attn_cmp_fast(1) != 0:
+            raise RuntimeError("fast compressed attention is unavailable")
         pos = len(prompt)
         warmed = 0
         while warmed < args.warm_decode:

@@ -139,6 +139,16 @@ int ds4f_serve_set_attn_hybrid(int enabled) {
 #endif
 }
 
+int ds4f_serve_set_attn_cmp_fast(int enabled) {
+#if defined(DS4F_SERVE_HIP)
+    ds4f_attn_cmp_fast = enabled != 0;
+    return 0;
+#else
+    (void)enabled;
+    return -1;
+#endif
+}
+
 static int env_i(const char *k, int d) { const char *e = getenv(k); return e && *e ? atoi(e) : d; }
 
 #if defined(DS4F_SERVE_HIP)

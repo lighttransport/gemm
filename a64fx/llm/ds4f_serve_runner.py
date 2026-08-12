@@ -128,6 +128,9 @@ def load_lib(path):
     if hasattr(lib, "ds4f_serve_set_attn_hybrid"):
         lib.ds4f_serve_set_attn_hybrid.argtypes = [ctypes.c_int]
         lib.ds4f_serve_set_attn_hybrid.restype = ctypes.c_int
+    if hasattr(lib, "ds4f_serve_set_attn_cmp_fast"):
+        lib.ds4f_serve_set_attn_cmp_fast.argtypes = [ctypes.c_int]
+        lib.ds4f_serve_set_attn_cmp_fast.restype = ctypes.c_int
     return lib
 
 
@@ -284,6 +287,11 @@ class Serve(object):
         if not hasattr(self.lib, "ds4f_serve_set_attn_hybrid"):
             return -1
         return self.lib.ds4f_serve_set_attn_hybrid(int(enabled))
+
+    def set_attn_cmp_fast(self, enabled):
+        if not hasattr(self.lib, "ds4f_serve_set_attn_cmp_fast"):
+            return -1
+        return self.lib.ds4f_serve_set_attn_cmp_fast(int(enabled))
 
     def enable_route_telemetry(self, enabled):
         if not hasattr(self.lib, "ds4f_serve_enable_route_telemetry"):

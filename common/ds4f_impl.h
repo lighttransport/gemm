@@ -5338,8 +5338,25 @@ static int ds4f_attn_tb2_gemm(ds4f_model *m,ds4f_attn_ex_task *at) {
  * correctly produces an all-zero, non-contributing partial (mx=-inf). */
 typedef struct { ds4f_model *m; ds4f_layer *ly; float scale;
                  float *cmx, *csum, *cout; } ds4f_attn_cmp_task;
+static int ds4f_attn_cmp_fast = -1;
+#if defined(__AVX2__) && defined(__FMA__)
+static inline float ds4f_attn_dot_f32_fast(const float *q, const float *k, int n) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(); int d = 0;
+    for (; d + 15 < n; d += 16) {
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(q+d), _mm256_loadu_ps(k+d), a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(q+d+8), _mm256_loadu_ps(k+d+8), a1);
+    }
+    a0 = _mm256_add_ps(a0, a1);
+    __m128 lo = _mm256_castps256_ps128(a0), hi = _mm256_extractf128_ps(a0, 1);
+    lo = _mm_add_ps(lo, hi); lo = _mm_hadd_ps(lo, lo); lo = _mm_hadd_ps(lo, lo);
+    float s = _mm_cvtss_f32(lo);
+    for (; d < n; ++d) s += q[d] * k[d];
+    return s;
+}
+#endif
 static void ds4f_attn_cmp_partial_worker(void *arg, int tid, int nthr) {
     ds4f_attn_cmp_task *T = (ds4f_attn_cmp_task *)arg;
+    if (ds4f_attn_cmp_fast < 0) { const char *e = getenv("DS4F_ATTN_CMP_FAST"); ds4f_attn_cmp_fast = e ? atoi(e) : 0; }
     ds4f_model *m = T->m; ds4f_layer *ly = T->ly;
     int HD = m->cfg.q_head_dim, KV = m->cfg.kv_lora;
     int nsel = m->s_tb2_nsel;
@@ -5357,7 +5374,13 @@ static void ds4f_attn_cmp_partial_worker(void *arg, int tid, int nthr) {
             const float *kc = cmp + (size_t)sel[j] * KV;
             float s;
             if (sve) s = ds4f_sve_dot_f32(q, kc, KV);
-            else { s = 0.f; for (int d = 0; d < KV; d++) s += q[d] * kc[d]; }
+            else {
+#if defined(__AVX2__) && defined(__FMA__)
+                if (ds4f_attn_cmp_fast) s = ds4f_attn_dot_f32_fast(q, kc, KV);
+                else
+#endif
+                { s = 0.f; for (int d = 0; d < KV; d++) s += q[d] * kc[d]; }
+            }
             s *= T->scale; sc[j] = s; if (s > mx) mx = s;
         }
         float sum = 0.f;
