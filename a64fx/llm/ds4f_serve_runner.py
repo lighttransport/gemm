@@ -997,8 +997,8 @@ def main():
     ap.add_argument("--hip-qkv-device-chain", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-attn-device-chain", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-attn-no-d2h", type=int, choices=(0, 1), default=1)
-    ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=1,
-                    help="stream routed experts to GPU during prefill")
+    ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=0,
+                    help="stream routed experts to GPU during prefill (CPU fallback is faster on Gen3 PCIe)")
     ap.add_argument("--hip-decode-routed-ffn", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-fp8-wmma", type=int, choices=(0, 1, 2), default=2)
     ap.add_argument("--hip-bf16-wmma", type=int, choices=(0, 1), default=1)
@@ -1023,7 +1023,7 @@ def main():
     ap.add_argument("--runner-timeout-sec", type=float, default=3600.0)
     ap.add_argument("--decode-quantum-tokens", type=int, default=4)
     ap.add_argument("--decode-batch-size", type=int, default=1)
-    ap.add_argument("--speculative-tokens", type=int, default=4,
+    ap.add_argument("--speculative-tokens", type=int, default=0,
                     help="greedy DSpark block size (0 disables; checkpoint supports up to 5)")
     ap.add_argument("--scheduler-quantum-ms", type=int, default=250)
     args = ap.parse_args()
