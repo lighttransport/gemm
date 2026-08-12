@@ -239,6 +239,12 @@ window, not attention or routed WMMA arithmetic. Genuine single-request
 additional expert-resident accelerator memory, or expert-parallel ranks; it
 cannot be inferred from the storage-only EP8 harness.
 
+For the parity-preserving compressed-attention micro-optimization, pass
+`--hip-attn-cmp-fast 1` to `ds4f_serve_runner.py`. It selects the AVX2/FMA
+dot/axpy implementation without changing the compressed representation or
+sampling behavior; leave it at the default `0` when validating a scalar
+reference run.
+
 `--hip-expert-pinned-staging 1` is an explicit diagnostic alternative to the
 rolling registration path. It coalesces each layer into two pinned host slabs
 before DMA, but is disabled by default: on this 188 GiB host the two staging

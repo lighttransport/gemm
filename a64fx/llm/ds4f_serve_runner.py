@@ -1013,6 +1013,8 @@ def main():
     ap.add_argument("--hip-expert-cache-reserve-mb", type=int, default=1536)
     ap.add_argument("--hip-expert-cache-stats", type=int, choices=(0, 1), default=0)
     ap.add_argument("--hip-block-threads", type=int, choices=(64, 128, 256), default=128)
+    ap.add_argument("--hip-attn-cmp-fast", type=int, choices=(0, 1), default=0,
+                    help="use parity-gated AVX2/FMA compressed attention dot/axpy")
     # Accepted here so the single-node wrapper can expose one unified program
     # argument list; the value itself configures the HTTP frontend.
     ap.add_argument("--agent-cache-max-tokens", type=int, default=14336)
@@ -1055,6 +1057,10 @@ def main():
                               args.hip_mxfp4_wmma, args.hip_expert_stream,
                               args.hip_block_threads, args.hip_expert_pinned_staging,
                               args.hip_tb2_batch, args.hip_decode_routed_ffn))
+    # This path is exact (the compressed representation is unchanged); expose
+    # it as an explicit serving knob so HTTP uses can match one-shot tuning.
+    if args.hip_attn_cmp_fast and sess.set_attn_cmp_fast(args.hip_attn_cmp_fast) != 0:
+        print("[runner] warning: compressed attention fast path unavailable", file=sys.stderr)
     slots = max(1, env_i("DS4F_SERVE_SLOTS", 1))
     prefix_cache = env_i("DS4F_SERVE_PREFIX_CACHE", 1)
     if expert_cache_mb and sess.enable_route_telemetry(True) != 0:
