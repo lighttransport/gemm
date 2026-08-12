@@ -51,6 +51,7 @@ def main():
                     help="refresh decode-window expert residency every N exact tokens")
     ap.add_argument("--adaptive-cache-mb", type=int, default=-1)
     ap.add_argument("--adaptive-cache-reserve-mb", type=int, default=1536)
+    ap.add_argument("--logical-ep-lanes", type=int, default=0)
     ap.add_argument("--cpu-only", action="store_true")
     args = ap.parse_args()
 
@@ -73,6 +74,8 @@ def main():
                  args.ep_rank, args.ep_size)
     greedy = Sampling(0.0, 1.0, 1, 0.0, 1.0, 1)
     try:
+        if args.logical_ep_lanes and sess.set_logical_ep_lanes(args.logical_ep_lanes) != 0:
+            raise RuntimeError("logical EP lane setup failed")
         if (args.hip_expert_cache_mb or args.adaptive_cache_period) and \
                 sess.enable_route_telemetry(True) != 0:
             raise RuntimeError("route telemetry is unavailable")

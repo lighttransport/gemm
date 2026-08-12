@@ -763,6 +763,38 @@ static void ds4f_mv_multi_worker(void *arg, int tid, int nthr) {
         ds4f_mv_worker(&sub, tid, nthr);
     }
 }
+/* Logical-EP lane dispatch: one pool barrier, with fixed worker subsets per
+ * lane. Each lane owns disjoint output buffers, so the existing row-parallel
+ * matvec worker can be reused without nested pool barriers. */
+typedef struct {
+    ds4f_model *m;
+    const ds4f_mv1 *list[32];
+    int count[32];
+    int lanes;
+} ds4f_mv_lane_task;
+static void ds4f_mv_lane_worker(void *arg, int tid, int nthr) {
+    ds4f_mv_lane_task *T = (ds4f_mv_lane_task *)arg;
+    int lanes = T->lanes > 0 ? T->lanes : 1;
+    int lane = tid % lanes;
+    int local_tid = tid / lanes;
+    int local_nthr = (nthr + lanes - 1) / lanes;
+    if (lane >= lanes || T->count[lane] <= 0) return;
+    ds4f_mv_multi_task sub = { T->m, T->list[lane], T->count[lane] };
+    ds4f_mv_multi_worker(&sub, local_tid, local_nthr);
+}
+static void ds4f_matvec_multi_lanes(ds4f_model *m, ds4f_mv1 (*lists)[16],
+                                     const int *counts, int lanes) {
+    if (!m || lanes < 2) return;
+    if (lanes > 32) lanes = 32;
+    ds4f_mv_lane_task T;
+    memset(&T, 0, sizeof(T));
+    T.m = m; T.lanes = lanes;
+    for (int l = 0; l < lanes; ++l) {
+        T.list[l] = lists[l];
+        T.count[l] = counts[l];
+    }
+    ds4f_pool_run(m->pool, ds4f_mv_lane_worker, &T);
+}
 /* Must not exceed the dense adapter's async slot count. */
 #define DS4F_MV_ASYNC_MAX 8
 /* DS4F_MV_ASYNC: put a fused GPU matvec group in flight on separate streams
@@ -8383,6 +8415,8 @@ decode_oproj_done:;
             }
             if (nlocal > 0) {
                 ds4f_mv1 gateup_gpu[16], gateup_cpu[16];
+                ds4f_mv1 lane_gateup[32][16];
+                int lane_gateup_n[32] = {0};
                 int ngpu = 0, ncpu = 0;
                 for (int j = 0; j < nlocal; j++) {
                     int k = local_k[j], slot = idx[k] / m->ep_size;
@@ -8390,7 +8424,15 @@ decode_oproj_done:;
                                     &ly->ex_w1[slot], m->s_h2 };
                     ds4f_mv1 b = { m->s_exb_u + (size_t)j * c->moe_inter,
                                     &ly->ex_w3[slot], m->s_h2 };
-                    if (a.t->gpu_id >= 0 && b.t->gpu_id >= 0) {
+                    if (m->logical_ep_lanes) {
+                        int lane = idx[k] % m->logical_ep_lanes;
+                        int q = lane_gateup_n[lane];
+                        if (q + 1 < 16) {
+                            lane_gateup[lane][q] = a;
+                            lane_gateup[lane][q + 1] = b;
+                            lane_gateup_n[lane] = q + 2;
+                        }
+                    } else if (a.t->gpu_id >= 0 && b.t->gpu_id >= 0) {
                         gateup_gpu[ngpu++] = a; gateup_gpu[ngpu++] = b;
                     } else {
                         gateup_cpu[ncpu++] = a; gateup_cpu[ncpu++] = b;
@@ -8398,8 +8440,14 @@ decode_oproj_done:;
                 }
                 /* Cache misses stay on the exact CPU path. Cache hits use the
                  * compact raw-MXFP4 HIP matrices and never trigger H2D here. */
-                if (ncpu) { DS4F_TIC(); ds4f_matvec_multi(m, gateup_cpu, ncpu); DS4F_TOC(DS4F_P_EXPERTS_CPU); }
-                if (ngpu) { DS4F_TIC(); ds4f_matvec_multi(m, gateup_gpu, ngpu); DS4F_TOC(DS4F_P_EXPERTS_GPU); }
+                if (m->logical_ep_lanes) {
+                    int lanes = m->logical_ep_lanes < m->n_threads ? m->logical_ep_lanes : m->n_threads;
+                    if (lanes < 2) lanes = 2;
+                    DS4F_TIC(); ds4f_matvec_multi_lanes(m, lane_gateup, lane_gateup_n, lanes); DS4F_TOC(DS4F_P_EXPERTS_CPU);
+                } else {
+                    if (ncpu) { DS4F_TIC(); ds4f_matvec_multi(m, gateup_cpu, ncpu); DS4F_TOC(DS4F_P_EXPERTS_CPU); }
+                    if (ngpu) { DS4F_TIC(); ds4f_matvec_multi(m, gateup_gpu, ngpu); DS4F_TOC(DS4F_P_EXPERTS_GPU); }
+                }
                 for (int j = 0; j < nlocal; j++) {
                     float *g = m->s_exb_g + (size_t)j * c->moe_inter;
                     const float *u = m->s_exb_u + (size_t)j * c->moe_inter;
@@ -8410,17 +8458,29 @@ decode_oproj_done:;
                         for (int i = 0; i < c->moe_inter; i++) g[i] = ds4f_silu(g[i]) * u[i];
                 }
                 ds4f_mv1 down_gpu[8], down_cpu[8];
+                ds4f_mv1 lane_down[32][16];
+                int lane_down_n[32] = {0};
                 ngpu = ncpu = 0;
                 for (int j = 0; j < nlocal; j++) {
                     int k = local_k[j], slot = idx[k] / m->ep_size;
                     ds4f_mv1 a = { m->s_exb_o + (size_t)j * C,
                                     &ly->ex_w2[slot],
                                     m->s_exb_g + (size_t)j * c->moe_inter };
-                    if (a.t->gpu_id >= 0) down_gpu[ngpu++] = a;
+                    if (m->logical_ep_lanes) {
+                        int lane = idx[k] % m->logical_ep_lanes;
+                        int q = lane_down_n[lane];
+                        if (q < 16) lane_down[lane][q] = a, lane_down_n[lane] = q + 1;
+                    } else if (a.t->gpu_id >= 0) down_gpu[ngpu++] = a;
                     else down_cpu[ncpu++] = a;
                 }
-                if (ncpu) { DS4F_TIC(); ds4f_matvec_multi(m, down_cpu, ncpu); DS4F_TOC(DS4F_P_EXPERTS_CPU); }
-                if (ngpu) { DS4F_TIC(); ds4f_matvec_multi(m, down_gpu, ngpu); DS4F_TOC(DS4F_P_EXPERTS_GPU); }
+                if (m->logical_ep_lanes) {
+                    int lanes = m->logical_ep_lanes < m->n_threads ? m->logical_ep_lanes : m->n_threads;
+                    if (lanes < 2) lanes = 2;
+                    DS4F_TIC(); ds4f_matvec_multi_lanes(m, lane_down, lane_down_n, lanes); DS4F_TOC(DS4F_P_EXPERTS_CPU);
+                } else {
+                    if (ncpu) { DS4F_TIC(); ds4f_matvec_multi(m, down_cpu, ncpu); DS4F_TOC(DS4F_P_EXPERTS_CPU); }
+                    if (ngpu) { DS4F_TIC(); ds4f_matvec_multi(m, down_gpu, ngpu); DS4F_TOC(DS4F_P_EXPERTS_GPU); }
+                }
                 for (int j = 0; j < nlocal; j++) {
                     const float *y = m->s_exb_o + (size_t)j * C;
                     float w = wt[local_k[j]];

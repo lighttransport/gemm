@@ -260,6 +260,10 @@ lane partials, and reconstructs the routed vector in original top-k order. This
 is an exact scheduling/profiling mode today; it is opt-in (`0` default) until a
 lane worker implementation supplies real parallel execution and clears the
 10 tok/s decode gate.
+The first 8-lane CPU measurement was 0.338 tok/s versus 0.364 tok/s for the
+existing fused EP1 dispatch, so it remains diagnostic rather than a production
+default; on this single CPU, six active experts do not amortize eight lane
+barriers.
 
 `--hip-expert-pinned-staging 1` is an explicit diagnostic alternative to the
 rolling registration path. It coalesces each layer into two pinned host slabs
