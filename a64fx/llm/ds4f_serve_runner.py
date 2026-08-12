@@ -1013,7 +1013,7 @@ def main():
     ap.add_argument("--hip-expert-cache-reserve-mb", type=int, default=1536)
     ap.add_argument("--hip-expert-cache-stats", type=int, choices=(0, 1), default=0)
     ap.add_argument("--hip-block-threads", type=int, choices=(64, 128, 256), default=128)
-    ap.add_argument("--hip-attn-cmp-fast", type=int, choices=(0, 1), default=0,
+    ap.add_argument("--hip-attn-cmp-fast", type=int, choices=(0, 1), default=1,
                     help="use parity-gated AVX2/FMA compressed attention dot/axpy")
     # Accepted here so the single-node wrapper can expose one unified program
     # argument list; the value itself configures the HTTP frontend.
