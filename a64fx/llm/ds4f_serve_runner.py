@@ -991,14 +991,14 @@ def main():
     ap.add_argument("--hip-prefill-tuned", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-fused-shared-ffn", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-prefill-attn", type=int, choices=(0, 1), default=1)
-    ap.add_argument("--hip-tb2-batch", type=int, choices=(0, 1), default=0,
+    ap.add_argument("--hip-tb2-batch", type=int, choices=(0, 1), default=1,
                     help="issue one exact Tier-B2 GPU window partial per layer/tile")
     ap.add_argument("--hip-qkv-fuse", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-qkv-device-chain", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-attn-device-chain", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-attn-no-d2h", type=int, choices=(0, 1), default=1)
-    ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=0,
-                    help="stream routed experts to GPU during prefill (CPU is faster on Gen3 PCIe)")
+    ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=1,
+                    help="stream routed experts to GPU during prefill")
     ap.add_argument("--hip-decode-routed-ffn", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-fp8-wmma", type=int, choices=(0, 1, 2), default=2)
     ap.add_argument("--hip-bf16-wmma", type=int, choices=(0, 1), default=1)
@@ -1008,7 +1008,7 @@ def main():
     ap.add_argument("--hip-expert-stream", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-expert-pinned-staging", type=int, choices=(0, 1), default=0,
                     help="coalesce streamed expert weights through two pinned host buffers")
-    ap.add_argument("--hip-expert-cache-mb", default="0",
+    ap.add_argument("--hip-expert-cache-mb", default="auto",
                     help="0 disables, auto uses free VRAM, or an explicit MiB budget")
     ap.add_argument("--hip-expert-cache-reserve-mb", type=int, default=1536)
     ap.add_argument("--hip-expert-cache-stats", type=int, choices=(0, 1), default=0)

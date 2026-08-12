@@ -242,8 +242,13 @@ cannot be inferred from the storage-only EP8 harness.
 For the parity-preserving compressed-attention micro-optimization, pass
 `--hip-attn-cmp-fast 1` to `ds4f_serve_runner.py`. It selects the AVX2/FMA
 dot/axpy implementation without changing the compressed representation or
-sampling behavior; leave it at the default `0` when validating a scalar
-reference run.
+sampling behavior. It is enabled by default in the HTTP runner; pass
+`--hip-attn-cmp-fast 0` when validating a scalar reference run. Exact GPU
+Tier-B2 window batching is likewise enabled by default with
+`--hip-tb2-batch 1`; disable it only for scalar baseline comparisons.
+The runner also defaults to `--hip-expert-cache-mb auto`, admitting prompt-hot
+expert bundles into otherwise-free VRAM before decode. Use `--hip-expert-cache-mb 0`
+for a transfer-only baseline.
 
 `--hip-expert-pinned-staging 1` is an explicit diagnostic alternative to the
 rolling registration path. It coalesces each layer into two pinned host slabs
