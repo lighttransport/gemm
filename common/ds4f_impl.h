@@ -5569,10 +5569,14 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             ds4f_rope_apply(kvl + (KV - c->qk_rope_dim), rcos, rsin, pos, c->qk_rope_dim/2, 0);
             uint16_t *dst = ly->kv_cache + (size_t)(pos % ly->kv_slots)*KV;
             for (int d = 0; d < KV; d++) dst[d] = ds4f_f32bf(kvl[d]);
-            /* Compressor/indexer helpers use these buffers as scratch; direct
-             * aliases to the batched projection tile are not generation-safe. */
-            memcpy(m->s_hn, m->p_hn + (size_t)k*C, (size_t)C*4);
-            memcpy(m->s_q,  m->p_q  + (size_t)k*QH, (size_t)QH*4);
+            /* The compressor/indexer and attention workers consume the current
+             * rows read-only. Temporarily alias their scalar scratch views to
+             * the already-computed tile rows; this removes two per-token copies
+             * while preserving the full-H stride of p_q and restoring ownership
+             * before the next layer uses the persistent scratch buffers. */
+            float *saved_hn = m->s_hn, *saved_q = m->s_q;
+            m->s_hn = m->p_hn + (size_t)k*C;
+            m->s_q  = m->p_q  + (size_t)k*H;
             m->s_idx_qpre = idxg_pf ? m->v_idxq + (size_t)k*idxHhd : NULL;
             tv = ds4f_prof_on ? ds4f_now() : 0.0;
             if (m->tierb2 && ratio) ds4f_tb2_prepare(m,ly,ratio,pos,rcos,rsin,
@@ -5595,6 +5599,8 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
             memcpy(m->p_attn+(size_t)k*AH,
                    m->s_attn+(size_t)m->attn_h0*HD,
                    (size_t)AH*4);
+            m->s_hn = saved_hn;
+            m->s_q = saved_q;
         }
         if (snaps) snap_loff += ds4f_tb2_snap_layer_bytes(m, L);
         free(m->s_idx_batch_sel); m->s_idx_batch_sel=NULL; m->s_idx_batch_K=0; m->s_idx_batch_pos0=0;
