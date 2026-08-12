@@ -254,6 +254,13 @@ The runner also defaults to `--hip-expert-cache-mb auto`, admitting prompt-hot
 expert bundles into otherwise-free VRAM before decode. Use `--hip-expert-cache-mb 0`
 for a transfer-only baseline.
 
+`--logical-ep-lanes N` enables the single-process logical-EP topology. It keeps
+the model physically EP1, partitions selected routed experts into `N` stable
+lane partials, and reconstructs the routed vector in original top-k order. This
+is an exact scheduling/profiling mode today; it is opt-in (`0` default) until a
+lane worker implementation supplies real parallel execution and clears the
+10 tok/s decode gate.
+
 `--hip-expert-pinned-staging 1` is an explicit diagnostic alternative to the
 rolling registration path. It coalesces each layer into two pinned host slabs
 before DMA, but is disabled by default: on this 188 GiB host the two staging

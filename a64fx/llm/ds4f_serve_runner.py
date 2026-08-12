@@ -131,6 +131,9 @@ def load_lib(path):
     if hasattr(lib, "ds4f_serve_set_attn_cmp_fast"):
         lib.ds4f_serve_set_attn_cmp_fast.argtypes = [ctypes.c_int]
         lib.ds4f_serve_set_attn_cmp_fast.restype = ctypes.c_int
+    if hasattr(lib, "ds4f_serve_set_logical_ep_lanes"):
+        lib.ds4f_serve_set_logical_ep_lanes.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.ds4f_serve_set_logical_ep_lanes.restype = ctypes.c_int
     return lib
 
 
@@ -292,6 +295,11 @@ class Serve(object):
         if not hasattr(self.lib, "ds4f_serve_set_attn_cmp_fast"):
             return -1
         return self.lib.ds4f_serve_set_attn_cmp_fast(int(enabled))
+
+    def set_logical_ep_lanes(self, lanes):
+        if not hasattr(self.lib, "ds4f_serve_set_logical_ep_lanes"):
+            return -1
+        return self.lib.ds4f_serve_set_logical_ep_lanes(self._s, int(lanes))
 
     def enable_route_telemetry(self, enabled):
         if not hasattr(self.lib, "ds4f_serve_enable_route_telemetry"):
@@ -1015,6 +1023,8 @@ def main():
     ap.add_argument("--hip-block-threads", type=int, choices=(64, 128, 256), default=128)
     ap.add_argument("--hip-attn-cmp-fast", type=int, choices=(0, 1), default=1,
                     help="use parity-gated AVX2/FMA compressed attention dot/axpy")
+    ap.add_argument("--logical-ep-lanes", type=int, default=0,
+                    help="single-process exact routed-expert lane topology (0 disables)")
     # Accepted here so the single-node wrapper can expose one unified program
     # argument list; the value itself configures the HTTP frontend.
     ap.add_argument("--agent-cache-max-tokens", type=int, default=14336)
@@ -1080,6 +1090,8 @@ def main():
     # it as an explicit serving knob so HTTP uses can match one-shot tuning.
     if args.hip_attn_cmp_fast and sess.set_attn_cmp_fast(args.hip_attn_cmp_fast) != 0:
         print("[runner] warning: compressed attention fast path unavailable", file=sys.stderr)
+    if args.logical_ep_lanes and sess.set_logical_ep_lanes(args.logical_ep_lanes) != 0:
+        sys.exit("logical EP lane setup failed")
     slots = max(1, env_i("DS4F_SERVE_SLOTS", 1))
     prefix_cache = env_i("DS4F_SERVE_PREFIX_CACHE", 1)
     if expert_cache_mb and sess.enable_route_telemetry(True) != 0:

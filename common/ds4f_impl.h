@@ -3017,6 +3017,7 @@ static ds4f_model *ds4f_alloc_synth_opts(const ds4f_runtime_options *opt) {
     if (!m) { ds4f_mem_pool_destroy(mem); return NULL; }
     m->mem = mem;
     m->cfg = cfg; m->ep_rank = ep_rank; m->ep_size = ep_size;
+    m->logical_ep_lanes = opt->logical_ep_lanes > 1 ? opt->logical_ep_lanes : 0;
     m->n_threads = n_threads; m->n_cmgs = n_cmgs;
     m->gpu_exact_prefill = opt->hip_exact_prefill ? 1 : 0;
     m->mxfp4_w4a8 = opt->mxfp4_w4a8;
@@ -3202,6 +3203,8 @@ static ds4f_model *ds4f_alloc_synth_opts(const ds4f_runtime_options *opt) {
     m->s_exb_o = (float *)ds4f_mem_alloc(m->mem, (size_t)cfg.n_active * C * 4, 256, 1);
     m->s_moe   = (float *)ds4f_mem_alloc(m->mem, (size_t)C*4, 256, 1);
     m->s_route = (float *)ds4f_mem_alloc(m->mem, (size_t)C*4, 256, 1);
+    if (m->logical_ep_lanes) m->s_lane_route = (float *)ds4f_mem_alloc(
+        m->mem, (size_t)m->logical_ep_lanes * (size_t)C * 4, 256, 1);
     m->s_logits= (float *)ds4f_mem_alloc(m->mem, (size_t)cfg.vocab*4, 256, 1);
     /* sparse-indexer scratch: block scores reuse as the selected-score buffer,
      * so the per-thread stride must cover both the worst-case block count
@@ -3323,6 +3326,7 @@ static void ds4f_runtime_options_init(ds4f_runtime_options *o) {
     o->cfg = ds4f_default_config();
     o->ep_size = 1; o->n_threads = ds4f_physical_cores(); o->n_cmgs = 1;
     o->bf16_pv = -1; o->int8kv_cal = 256; o->int8cmp_cal = 64;
+    o->logical_ep_lanes = 0;
     o->exact = 1; o->zero_copy_experts = 1; o->load_drop_blob = 1;
     o->hip_async = 1;
 }
@@ -3373,6 +3377,7 @@ static int ds4f_runtime_options_load_json(ds4f_runtime_options *o, const char *p
     (void)ds4f_json_string(json, "tokenizer_py", o->tokenizer_py, sizeof(o->tokenizer_py));
     o->ep_rank = ds4f_json_int(json, "ep_rank", o->ep_rank);
     o->ep_size = ds4f_json_int(json, "ep_size", o->ep_size);
+    o->logical_ep_lanes = ds4f_json_int(json, "logical_ep_lanes", o->logical_ep_lanes);
     o->n_threads = ds4f_json_int(json, "threads", o->n_threads);
     o->n_cmgs = ds4f_json_int(json, "cmgs", o->n_cmgs);
     o->cfg.max_pos = ds4f_json_int(json, "max_pos", o->cfg.max_pos);
@@ -4175,6 +4180,7 @@ static ds4f_model *ds4f_load_real_opts(const ds4f_runtime_options *opt) {
     m->mem = mem;
     m->cfg = cfg; m->ep_rank = ep_rank; m->ep_size = ep_size;
     m->n_threads = n_threads; m->n_cmgs = n_cmgs;
+    m->logical_ep_lanes = opt->logical_ep_lanes > 1 ? opt->logical_ep_lanes : 0;
     m->gpu_exact_prefill = opt->hip_exact_prefill ? 1 : 0;
     m->mxfp4_w4a8 = opt->mxfp4_w4a8;
     { const char *e = getenv("DS4F_ROUTE_TELEMETRY");
@@ -4575,6 +4581,8 @@ static ds4f_model *ds4f_load_real_opts(const ds4f_runtime_options *opt) {
     m->s_exb_o = (float *)ds4f_mem_alloc(m->mem, (size_t)cfg.n_active * C * 4, 256, 1);
     m->s_moe   = (float *)ds4f_mem_alloc(m->mem, (size_t)C * 4, 256, 1);
     m->s_route = (float *)ds4f_mem_alloc(m->mem, (size_t)C * 4, 256, 1);
+    if (m->logical_ep_lanes) m->s_lane_route = (float *)ds4f_mem_alloc(
+        m->mem, (size_t)m->logical_ep_lanes * (size_t)C * 4, 256, 1);
     m->s_logits= (float *)ds4f_mem_alloc(m->mem, (size_t)cfg.vocab * 4, 256, 1);
     m->idx_blk_stride = cfg.max_pos > cfg.index_topk ? cfg.max_pos : cfg.index_topk;
     m->s_idx_scores = (float *)ds4f_mem_alloc(m->mem, (size_t)n_threads * m->idx_blk_stride * 4, 256, 1);
@@ -8261,6 +8269,8 @@ decode_oproj_done:;
             fputc('\n', stderr);
         }
         for (int i = 0; i < C; i++) { m->s_moe[i] = 0.f; m->s_route[i] = 0.f; }
+        if (m->s_lane_route)
+            memset(m->s_lane_route, 0, (size_t)m->logical_ep_lanes * (size_t)C * sizeof(float));
         int tps = (m->sh_rows < c->shared_inter);              /* TP shared-expert (sh_w1/w3 col-shard) */
         int tps2 = tps && (m->sh2_rows < C);                  /* optional sh_w2 hidden-row shard */
         int shared_gpu_pending = 0;
@@ -8327,7 +8337,7 @@ decode_oproj_done:;
         /* ---- MoE: routed experts (owned-only) ---- */
         { DS4F_TIC();
         int routed_decode_gpu = 0;
-        if (m->gpu_routed_ffn && m->gpu_decode_routed_ffn_enabled && c->n_active <= 8) {
+        if (!m->logical_ep_lanes && m->gpu_routed_ffn && m->gpu_decode_routed_ffn_enabled && c->n_active <= 8) {
             int local_k[8], nlocal = 0, all_gpu = 1;
             for (int k = 0; k < c->n_active; ++k) {
                 int e = idx[k];
@@ -8362,7 +8372,7 @@ decode_oproj_done:;
                 }
             }
         }
-        if (!routed_decode_gpu && ds4f_expert_batch_on() && c->n_active <= 8) {
+        if (!routed_decode_gpu && (ds4f_expert_batch_on() || m->logical_ep_lanes) && c->n_active <= 8) {
             /* Preserve top-k order while compacting the experts owned by this
              * rank.  EP ranks can have fewer than n_active local experts. */
             int local_k[8], nlocal = 0;
@@ -8414,7 +8424,23 @@ decode_oproj_done:;
                 for (int j = 0; j < nlocal; j++) {
                     const float *y = m->s_exb_o + (size_t)j * C;
                     float w = wt[local_k[j]];
-                    for (int i = 0; i < C; i++) m->s_route[i] += w * y[i];
+                    int lane = m->logical_ep_lanes
+                        ? (idx[local_k[j]] % m->logical_ep_lanes) : 0;
+                    float *lane_y = m->s_lane_route
+                        ? m->s_lane_route + (size_t)lane * C : m->s_route;
+                    for (int i = 0; i < C; i++) lane_y[i] += w * y[i];
+                }
+                if (m->s_lane_route) {
+                    /* Reconstruct in original top-k order. This keeps the
+                     * logical-lane topology greedy-exact while lane partials
+                     * remain independently observable for a future parallel
+                     * worker implementation. */
+                    for (int j = 0; j < nlocal; ++j) {
+                        int lane = idx[local_k[j]] % m->logical_ep_lanes;
+                        const float *y = m->s_exb_o + (size_t)j * C;
+                        float w = wt[local_k[j]];
+                        for (int i = 0; i < C; ++i) m->s_route[i] += w * y[i];
+                    }
                 }
             }
         } else for (int k = 0; k < c->n_active; k++) {

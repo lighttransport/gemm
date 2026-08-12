@@ -149,6 +149,20 @@ int ds4f_serve_set_attn_cmp_fast(int enabled) {
 #endif
 }
 
+int ds4f_serve_set_logical_ep_lanes(ds4f_serve *s, int lanes) {
+    if (!s || !s->m) return -1;
+    if (lanes < 0) lanes = 0;
+    if (lanes > 32) lanes = 32;
+    s->m->logical_ep_lanes = lanes > 1 ? lanes : 0;
+    if (s->m->logical_ep_lanes && !s->m->s_lane_route) {
+        s->m->s_lane_route = (float *)ds4f_mem_alloc(
+            s->m->mem, (size_t)s->m->logical_ep_lanes *
+            (size_t)s->m->cfg.hidden * sizeof(float), 256, 1);
+        if (!s->m->s_lane_route) return -1;
+    }
+    return 0;
+}
+
 static int env_i(const char *k, int d) { const char *e = getenv(k); return e && *e ? atoi(e) : d; }
 
 #if defined(DS4F_SERVE_HIP)

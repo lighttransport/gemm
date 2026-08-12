@@ -427,6 +427,7 @@ typedef struct ds4f_runtime_options {
     int int8_kv, int8_cmp, int4_cmp, cp;
     int tp_head, tp_shared, tp_shared_full, tp_attn, tp_oproj, tp_embed, tp_wob;
     int mtp, expert_resident;
+    int logical_ep_lanes;               /* single-process exact routed-expert lane topology */
     int int8kv_cal, int8cmp_cal;
     int zero_copy_experts, load_drop_blob;
     int use_hip, hip_device, hip_async, hip_verbose;
@@ -704,6 +705,8 @@ typedef struct {
      * serial path continues to use s_exg/s_exu/s_o. */
     float *s_exb_g, *s_exb_u, *s_exb_o;
     float *s_route;         /* routed-expert partial (owned-only); EP-summed via ar_cb */
+    int logical_ep_lanes;
+    float *s_lane_route;    /* optional [logical_ep_lanes, hidden] lane partials */
     float *s_attn_sc;       /* DS4F_ATTN_GEMM: [n_heads*(window+index_topk)] scores->softmax weights (lazy) */
     /* DS4F_ATTN_HYBRID_GPU scratch (lazy): GPU window-partial output/max/sum
      * and CPU compressed-partial output/max/sum, each [n_heads*head_dim] or
