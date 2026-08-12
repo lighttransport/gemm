@@ -1,0 +1,23 @@
+# Local compiler outputs and benchmark executables.
+build/
+ds4f_*_test
+ds4f_*_bench
+ds4f_stage
+
+# Scheduler/rank logs and one-off diagnostic dumps.
+*.log
+build_err.txt
+*_rank*.txt
+gen_*.txt
+exact_*.txt
+mhc_*.txt
+q2_*.txt
+tierb2_*.txt
+vc_*.txt
+vcoord_*.txt
+tofu_topo.txt
+
+# Per-job output trees and generated token corpora.
+runs/
+output.*/
+prompt_ids.txt
