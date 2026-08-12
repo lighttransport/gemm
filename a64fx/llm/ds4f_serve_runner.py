@@ -125,6 +125,9 @@ def load_lib(path):
     if hasattr(lib, "ds4f_serve_set_adaptive_cache"):
         lib.ds4f_serve_set_adaptive_cache.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 3
         lib.ds4f_serve_set_adaptive_cache.restype = ctypes.c_int
+    if hasattr(lib, "ds4f_serve_set_attn_hybrid"):
+        lib.ds4f_serve_set_attn_hybrid.argtypes = [ctypes.c_int]
+        lib.ds4f_serve_set_attn_hybrid.restype = ctypes.c_int
     return lib
 
 
@@ -276,6 +279,11 @@ class Serve(object):
             return -1
         return self.lib.ds4f_serve_set_adaptive_cache(
             self._s, int(period), int(cache_mb), int(reserve_mb))
+
+    def set_attn_hybrid(self, enabled):
+        if not hasattr(self.lib, "ds4f_serve_set_attn_hybrid"):
+            return -1
+        return self.lib.ds4f_serve_set_attn_hybrid(int(enabled))
 
     def enable_route_telemetry(self, enabled):
         if not hasattr(self.lib, "ds4f_serve_enable_route_telemetry"):
