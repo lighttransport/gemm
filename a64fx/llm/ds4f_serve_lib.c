@@ -313,6 +313,11 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
     m->gpu_prefill_attn = prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
     m->gpu_prefill_attn_partial = prefill_attn ? hip_ds4f_dense_prefill_attention_partial : NULL;
     m->gpu_tb2_batch_enabled = prefill_attn && tb2_batch;
+#if defined(DS4F_SERVE_HIP)
+    /* Batched Tier-B2 prefill opts into the exact GPU-window/CPU-compressed
+     * split; the implementation itself gates it to large tiles (K>=512). */
+    if (m->gpu_tb2_batch_enabled) ds4f_attn_hybrid_gpu = 1;
+#endif
     m->gpu_prefill_qkv = qkv_fuse ? hip_ds4f_dense_prefill_qkv : NULL;
     m->gpu_prefill_qkv_enabled = qkv_fuse != 0;
     m->gpu_qkv_device_chain = qkv_device_chain != 0;

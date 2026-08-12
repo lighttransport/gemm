@@ -5452,7 +5452,11 @@ static int ds4f_attn_tb2_hybrid_gpu(ds4f_model *m, ds4f_attn_ex_task *at) {
 static int ds4f_attn_tb2_hybrid_gpu_batch(ds4f_model *m, ds4f_layer *ly,
                                           int K, int abs_pos0, int local_pos0,
                                           const float *rcos, const float *rsin) {
-    if (!m->gpu_tb2_batch_enabled || !m->gpu_prefill_attn_partial || K <= 1)
+    /* GPU window offload amortizes its launch/copy overhead only for a
+     * reasonably large prefill tile. Keep short requests on the established
+     * CPU path; at 1024+ tokens this exact online-softmax split measured a
+     * material throughput win without changing logits. */
+    if (!m->gpu_tb2_batch_enabled || !m->gpu_prefill_attn_partial || K < 512)
         return 0;
     ds4f_config *c = &m->cfg;
     int HD = c->q_head_dim, H = c->n_heads * HD, nh = c->n_heads;
