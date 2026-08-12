@@ -84,8 +84,10 @@ for experiments as `DS4F_SERVE_HIP_EXPERT_STREAM=1`; it is off by default.
   cooperative Unix-socket runner carries cache load/save metadata in each
   request; `--agent-cache-max-tokens` controls the maximum prefix (14336 by
   default). A lone request uses
-  `--single-prefill-quantum-tokens` (2048 by default), while competing requests
-  retain the smaller fair-share `--prefill-quantum-tokens` quantum.
+  `--single-prefill-quantum-tokens` (1024 by default), while competing requests
+  retain the smaller fair-share `--prefill-quantum-tokens` quantum. 1024 is the
+  RX 9070 XT default because exact Tier-B2 measured better at 1024 than 2048;
+  benchmark 512/2048 before changing it for another GPU.
   `--hip-expert-cache-mb auto` can admit prompt-hot routed-expert bundles into
   otherwise-free VRAM before decode; `--hip-expert-cache-reserve-mb` retains
   scratch/KV headroom.

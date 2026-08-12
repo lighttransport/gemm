@@ -987,7 +987,7 @@ def main():
     ap.add_argument("--context-memory-mb", type=int, default=512)
     ap.add_argument("--context-disk-mb", type=int, default=8192)
     ap.add_argument("--prefill-quantum-tokens", type=int, default=32)
-    ap.add_argument("--single-prefill-quantum-tokens", type=int, default=2048)
+    ap.add_argument("--single-prefill-quantum-tokens", type=int, default=1024)
     ap.add_argument("--hip-prefill-tuned", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-fused-shared-ffn", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-prefill-attn", type=int, choices=(0, 1), default=1)
