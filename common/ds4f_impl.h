@@ -5353,6 +5353,12 @@ static inline float ds4f_attn_dot_f32_fast(const float *q, const float *k, int n
     for (; d < n; ++d) s += q[d] * k[d];
     return s;
 }
+static inline void ds4f_attn_axpy_f32_fast(float *out, const float *k, float w, int n) {
+    __m256 ww = _mm256_set1_ps(w); int d = 0;
+    for (; d + 7 < n; d += 8)
+        _mm256_storeu_ps(out+d, _mm256_fmadd_ps(ww, _mm256_loadu_ps(k+d), _mm256_loadu_ps(out+d)));
+    for (; d < n; ++d) out[d] += w * k[d];
+}
 #endif
 static void ds4f_attn_cmp_partial_worker(void *arg, int tid, int nthr) {
     ds4f_attn_cmp_task *T = (ds4f_attn_cmp_task *)arg;
@@ -5389,6 +5395,9 @@ static void ds4f_attn_cmp_partial_worker(void *arg, int tid, int nthr) {
             const float *kc = cmp + (size_t)sel[j] * KV;
             float w = sc[j];
             if (sve) ds4f_sve_axpy_f32(out, kc, w, HD);
+#if defined(__AVX2__) && defined(__FMA__)
+            else if (ds4f_attn_cmp_fast) ds4f_attn_axpy_f32_fast(out, kc, w, HD);
+#endif
             else for (int d = 0; d < HD; d++) out[d] += w * kc[d];
         }
         T->cmx[h] = mx; T->csum[h] = sum;
