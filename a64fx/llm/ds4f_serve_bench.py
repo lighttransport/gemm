@@ -31,6 +31,9 @@ def main():
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--cmgs", type=int, default=4)
     ap.add_argument("--hip-device", type=int, default=0)
+    ap.add_argument("--ep-rank", type=int, default=0)
+    ap.add_argument("--ep-size", type=int, default=1,
+                    help="expert-parallel shard count (requires matching staged manifest)")
     ap.add_argument("--hip-mxfp4-wmma", type=int, choices=(0, 1, 2), default=1)
     ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=0)
     ap.add_argument("--hip-decode-routed-ffn", type=int, choices=(0, 1), default=1)
@@ -60,9 +63,10 @@ def main():
                  # Keep the one-shot benchmark on the same tuned path as the
                  # production runner.  This tuple mirrors the runner defaults.
                  (1, 1, 1, 1, 1, 1, 1, args.hip_routed_ffn, 2, 1, 1, 2,
-                  args.hip_mxfp4_wmma, args.hip_expert_stream, 128,
+                 args.hip_mxfp4_wmma, args.hip_expert_stream, 128,
                   args.hip_expert_pinned_staging, args.hip_tb2_batch,
-                  args.hip_decode_routed_ffn), args.speculative_tokens)
+                  args.hip_decode_routed_ffn), args.speculative_tokens,
+                 args.ep_rank, args.ep_size)
     greedy = Sampling(0.0, 1.0, 1, 0.0, 1.0, 1)
     try:
         if (args.hip_expert_cache_mb or args.adaptive_cache_period) and \

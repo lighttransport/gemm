@@ -53,6 +53,11 @@ def load_lib(path):
         lib.ds4f_serve_open_ex.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int, ctypes.c_longlong, ctypes.c_int,
             ctypes.c_char_p, ctypes.c_size_t]
+    if hasattr(lib, "ds4f_serve_open_ex_ep"):
+        lib.ds4f_serve_open_ex_ep.restype = ctypes.c_void_p
+        lib.ds4f_serve_open_ex_ep.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_longlong, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
     if hasattr(lib, "ds4f_serve_speculate"):
         lib.ds4f_serve_speculate.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_float)]
@@ -125,9 +130,13 @@ def load_lib(path):
 
 class Serve(object):
     def __init__(self, lib, stage_dir, use_hip, hip_device, threads, cmgs, max_pos,
-                 hip_prefill, speculative_tokens=0):
+                 hip_prefill, speculative_tokens=0, ep_rank=0, ep_size=1):
         err = ctypes.create_string_buffer(512)
-        if speculative_tokens and hasattr(lib, "ds4f_serve_open_ex"):
+        if (ep_size != 1 or ep_rank != 0) and hasattr(lib, "ds4f_serve_open_ex_ep"):
+            self._s = lib.ds4f_serve_open_ex_ep(stage_dir.encode(), int(use_hip), int(hip_device),
+                int(threads), int(cmgs), int(max_pos), int(speculative_tokens),
+                int(ep_rank), int(ep_size), err, len(err))
+        elif speculative_tokens and hasattr(lib, "ds4f_serve_open_ex"):
             self._s = lib.ds4f_serve_open_ex(stage_dir.encode(), int(use_hip), int(hip_device),
                 int(threads), int(cmgs), int(max_pos), int(speculative_tokens), err, len(err))
         else:

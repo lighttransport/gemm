@@ -331,9 +331,10 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
 }
 #endif
 
-ds4f_serve *ds4f_serve_open_ex(const char *stage_dir, int use_hip, int hip_device,
+static ds4f_serve *ds4f_serve_open_ep(const char *stage_dir, int use_hip, int hip_device,
                             int threads, int cmgs, long long max_pos,
                             int speculative_tokens,
+                            int ep_rank, int ep_size,
                             char *err, size_t err_cap) {
     if (!stage_dir || !*stage_dir) {
         if (err && err_cap) snprintf(err, err_cap, "ds4f_serve_open: no stage dir");
@@ -342,7 +343,8 @@ ds4f_serve *ds4f_serve_open_ex(const char *stage_dir, int use_hip, int hip_devic
     ds4f_runtime_options o = ds4f_runtime_options_debug_env(
         ds4f_default_config(), stage_dir, 0, 1, threads > 0 ? threads : 16,
         cmgs > 0 ? cmgs : 1);
-    o.ep_rank = 0; o.ep_size = 1;                 /* single-node full load */
+    o.ep_rank = ep_rank >= 0 ? ep_rank : 0;
+    o.ep_size = ep_size > 0 ? ep_size : 1;
     o.mhc = env_i("DS4F_SERVE_MHC", 1);
     o.tierb2 = env_i("DS4F_SERVE_TIERB2", 1);
     o.exact = 1;                                  /* serve bundle */
@@ -405,11 +407,28 @@ ds4f_serve *ds4f_serve_open_ex(const char *stage_dir, int use_hip, int hip_devic
     return s;
 }
 
+ds4f_serve *ds4f_serve_open_ex_ep(const char *stage_dir, int use_hip, int hip_device,
+                            int threads, int cmgs, long long max_pos,
+                            int speculative_tokens, int ep_rank, int ep_size,
+                            char *err, size_t err_cap) {
+    return ds4f_serve_open_ep(stage_dir, use_hip, hip_device, threads, cmgs,
+                              max_pos, speculative_tokens, ep_rank, ep_size,
+                              err, err_cap);
+}
+
+ds4f_serve *ds4f_serve_open_ex(const char *stage_dir, int use_hip, int hip_device,
+                            int threads, int cmgs, long long max_pos,
+                            int speculative_tokens,
+                            char *err, size_t err_cap) {
+    return ds4f_serve_open_ep(stage_dir, use_hip, hip_device, threads, cmgs,
+                              max_pos, speculative_tokens, 0, 1, err, err_cap);
+}
+
 ds4f_serve *ds4f_serve_open(const char *stage_dir, int use_hip, int hip_device,
                             int threads, int cmgs, long long max_pos,
                             char *err, size_t err_cap) {
-    return ds4f_serve_open_ex(stage_dir,use_hip,hip_device,threads,cmgs,max_pos,
-                              0,err,err_cap);
+    return ds4f_serve_open_ep(stage_dir,use_hip,hip_device,threads,cmgs,max_pos,
+                              0, 0, 1, err, err_cap);
 }
 
 void ds4f_serve_close(ds4f_serve *s) {
