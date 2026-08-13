@@ -37,6 +37,10 @@ def main():
     ap.add_argument("--hip-mxfp4-wmma", type=int, choices=(0, 1, 2), default=1)
     ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=0)
     ap.add_argument("--hip-decode-routed-ffn", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-decode-qkv-fuse", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--hip-block-threads", type=int, choices=(64, 128, 256), default=64)
+    ap.add_argument("--hip-fp8-wmma", type=int, choices=(0, 1, 2), default=2)
+    ap.add_argument("--hip-decode-attn-oproj", type=int, choices=(0, 1), default=0)
     ap.add_argument("--hip-tb2-batch", type=int, choices=(0, 1), default=0)
     ap.add_argument("--hip-attn-hybrid", type=int, choices=(0, 1), default=0,
                     help="exact GPU window + CPU compressed Tier-B2 attention")
@@ -67,10 +71,14 @@ def main():
                  args.prompt_tokens + args.warm_decode + args.decode_tokens + 8,
                  # Keep the one-shot benchmark on the same tuned path as the
                  # production runner.  This tuple mirrors the runner defaults.
-                 (1, 1, 1, 1, 1, 1, 1, args.hip_routed_ffn, 2, 1, 1, 2,
-                 args.hip_mxfp4_wmma, args.hip_expert_stream, 128,
+                 (1, 1, 1, 1, 1, 1, 1, args.hip_routed_ffn,
+                 args.hip_fp8_wmma, 1, 1, 2,
+                 args.hip_mxfp4_wmma, args.hip_expert_stream,
+                 args.hip_block_threads,
                   args.hip_expert_pinned_staging, args.hip_tb2_batch,
-                  args.hip_decode_routed_ffn), args.speculative_tokens,
+                  args.hip_decode_routed_ffn,
+                  args.hip_decode_qkv_fuse, args.hip_decode_attn_oproj),
+                 args.speculative_tokens,
                  args.ep_rank, args.ep_size)
     greedy = Sampling(0.0, 1.0, 1, 0.0, 1.0, 1)
     try:

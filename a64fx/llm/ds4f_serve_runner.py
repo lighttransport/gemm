@@ -63,7 +63,7 @@ def load_lib(path):
             ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_float)]
         lib.ds4f_serve_speculate.restype = ctypes.c_int
     if hasattr(lib, "ds4f_serve_configure_hip_prefill"):
-        lib.ds4f_serve_configure_hip_prefill.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 18
+        lib.ds4f_serve_configure_hip_prefill.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 20
         lib.ds4f_serve_configure_hip_prefill.restype = ctypes.c_int
     lib.ds4f_serve_close.argtypes = [ctypes.c_void_p]
     lib.ds4f_serve_prefill.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
@@ -1008,6 +1008,10 @@ def main():
     ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=0,
                     help="stream routed experts to GPU during prefill (CPU fallback is faster on Gen3 PCIe)")
     ap.add_argument("--hip-decode-routed-ffn", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--hip-decode-qkv-fuse", type=int, choices=(0, 1), default=0,
+                    help="use the fused single-upload QKV stage at M=1 decode")
+    ap.add_argument("--hip-decode-attn-oproj", type=int, choices=(0, 1), default=0,
+                    help="use the grouped device o-projection at M=1 decode")
     ap.add_argument("--hip-fp8-wmma", type=int, choices=(0, 1, 2), default=2)
     ap.add_argument("--hip-bf16-wmma", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-attn-wmma", type=int, choices=(0, 1), default=1)
@@ -1020,7 +1024,10 @@ def main():
                     help="0 disables, auto uses free VRAM, or an explicit MiB budget")
     ap.add_argument("--hip-expert-cache-reserve-mb", type=int, default=1536)
     ap.add_argument("--hip-expert-cache-stats", type=int, choices=(0, 1), default=0)
-    ap.add_argument("--hip-block-threads", type=int, choices=(64, 128, 256), default=128)
+    ap.add_argument("--hip-block-threads", type=int, choices=(64, 128, 256), default=64,
+                    help="GPU dense kernel block size. 64 measured +2.7%% decode over "
+                         "the 128 the standalone harness profile uses, greedy-identical, "
+                         "and neutral on prefill (RX 9070 XT / gfx1201)")
     ap.add_argument("--hip-attn-cmp-fast", type=int, choices=(0, 1), default=1,
                     help="use parity-gated AVX2/FMA compressed attention dot/axpy")
     ap.add_argument("--logical-ep-lanes", type=int, default=0,
@@ -1114,7 +1121,8 @@ def main():
                               args.hip_attn_wmma, args.hip_oproj_group_wmma,
                               args.hip_mxfp4_wmma, args.hip_expert_stream,
                               args.hip_block_threads, args.hip_expert_pinned_staging,
-                              args.hip_tb2_batch, args.hip_decode_routed_ffn))
+                              args.hip_tb2_batch, args.hip_decode_routed_ffn,
+                              args.hip_decode_qkv_fuse, args.hip_decode_attn_oproj))
     # This path is exact (the compressed representation is unchanged); expose
     # it as an explicit serving knob so HTTP uses can match one-shot tuning.
     if args.hip_attn_cmp_fast and sess.set_attn_cmp_fast(args.hip_attn_cmp_fast) != 0:

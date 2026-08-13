@@ -559,3 +559,59 @@ Re-verified after the fix, and what still stands:
 The one claim that was an artifact: the earlier remark that W4A8's output "moved
 onto the exact path" after the tb2 AVX2 change compared two runs that were both
 in fact W4A8-off. Disregard it; the W4A8 divergence itself is real.
+
+### 2026-08-13 — qkv_proj and o_proj: mostly negative, one small win
+
+`qkv_proj` and `o_proj` are ~20 ms/token each (~8% of decode apiece). Both are
+already GPU-resident FP8 projections, so the question was where the time goes.
+
+Arithmetic: the per-layer dense reads are wq_a 4.2 MB + wq_b 33.6 + wkv 2.1 +
+wo_a 33.6 + wo_b 33.6 = 107 MB, i.e. **4.6 GB/token**, which at the card's
+~640 GB/s would be 7.2 ms. Measured is ~40 ms for the two phases. Per-call
+timing (`qkv_wqa` 0.157 ms, `qkv_wqb` 0.172 ms per layer-call) shows a 33.6 MB
+matvec taking ~0.17 ms = **~200 GB/s**, matching the in-tree kernel measurement
+of ~280 GB/s for `wq_b` at M=1. So these phases are **GPU-kernel bandwidth
+bound at roughly a third of peak**, not launch-bound and not CPU-bound.
+
+Tried and rejected (all measured, W4A8 + group split + GPU tb2, decode tok/s):
+
+| change | decode | vs base 5.360 |
+|---|---:|---:|
+| `--hip-decode-qkv-fuse 1` | 4.346 | **-19%** |
+| `--hip-decode-attn-oproj 1` | 3.249 | **-39%** |
+| both | 2.922 | **-45%** |
+| `HSA_ENABLE_INTERRUPT=0` (poll waits) | 5.437 | +1.4% (and -22% prefill) |
+| `GPU_MAX_HW_QUEUES=1` | 5.449 | +1.7% (noise) |
+
+The first two are the decode gates AGENTS.md documents
+(`--hip-decode-qkv-fuse`, `--hip-decode-attn-oproj`). They were **never wired
+into the serving runner** -- `gpu_decode_qkv_enabled` and
+`gpu_decode_attn_oproj_enabled` were never assigned, so the fused decode paths
+were dead code. They are now wired and selectable, and measured clearly worse
+than the generic `ds4f_matvec` / `ds4f_matvec_multi` route (which benefits from
+`DS4F_MV_FUSE` + `DS4F_MV_ASYNC`), so both default to 0. Wiring them at least
+makes the negative result reproducible instead of unreachable.
+
+**The one win: `--hip-block-threads 64`** (was 128). Paired adjacent runs, which
+control for the ~10% drift between runs:
+
+| pair | 128 | 64 |
+|---|---:|---:|
+| a | 4.949 | 5.088 (+2.8%) |
+| b | 5.471 | 5.613 (+2.6%) |
+
+Greedy output is **identical**, and prefill is neutral-to-slightly-better
+(14.64 vs 14.28-14.50). Default changed to 64 for the serving runner. Note this
+deviates from the `--hip-block-threads 128` in AGENTS.md's standalone-harness
+profile; that profile was tuned for batched prefill, this default is for the
+M=1 serving path.
+
+Further gains here need a better M=1 FP8 matvec kernel (currently ~1/3 of peak
+VRAM bandwidth), which is GPU kernel work, not flag tuning. The structural
+alternative -- keeping a whole layer device-side so the CPU never round-trips --
+requires GPU attention, and the tree already measured that ~3x slower per
+position (`DS4F_ATTN_HYBRID_GPU`, off).
+
+Also exposed `--hip-block-threads` and `--hip-fp8-wmma` on `ds4f_serve_bench.py`
+(they were hard-coded), and updated it for the widened
+`ds4f_serve_configure_hip_prefill` signature (18 -> 20 ints).
