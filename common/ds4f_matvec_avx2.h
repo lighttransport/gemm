@@ -585,6 +585,43 @@ static inline void matvec_mxfp4_1row_f32_raw_4x(float *dst, int Ys,
         dst[(size_t)t * Ys] = ds4f_avx2_hsum(_mm256_add_ps(a0[t], a1[t]));
 }
 
+/* Decode a row once for reuse across a complete prefill tile. MXFP4 values
+ * times E8M0 scales are exactly representable in f32; this keeps activation
+ * quality identical to the exact path (only dot-product reassociation differs). */
+static inline void ds4f_mxfp4_dequant_row_f32(float *dst, const uint8_t *w,
+                                               const uint8_t *s, int K) {
+    for (int b = 0; b < K / 32; ++b) {
+        __m256 wv[4];
+        ds4f_mxfp4_unpack16(w + (size_t)b * 16, wv);
+        __m256 sc = _mm256_set1_ps(ds4f_mxfp4_raw_scale(s[b]));
+        _mm256_storeu_ps(dst + (size_t)b * 32,      _mm256_mul_ps(wv[0], sc));
+        _mm256_storeu_ps(dst + (size_t)b * 32 + 8,  _mm256_mul_ps(wv[1], sc));
+        _mm256_storeu_ps(dst + (size_t)b * 32 + 16, _mm256_mul_ps(wv[2], sc));
+        _mm256_storeu_ps(dst + (size_t)b * 32 + 24, _mm256_mul_ps(wv[3], sc));
+    }
+}
+
+static inline void ds4f_mxfp4_decoded_row_4x(float *dst, int Ys,
+                                              const float *w, const float *x,
+                                              int Xs, int K) {
+    __m256 a0[4], a1[4];
+    for (int t = 0; t < 4; ++t) { a0[t] = _mm256_setzero_ps(); a1[t] = _mm256_setzero_ps(); }
+    for (int b = 0; b < K / 32; ++b) {
+        const float *wb = w + (size_t)b * 32;
+        for (int t = 0; t < 4; ++t) {
+            const float *xb = x + (size_t)t * Xs + (size_t)b * 32;
+            __m256 p0 = _mm256_mul_ps(_mm256_loadu_ps(wb), _mm256_loadu_ps(xb));
+            p0 = _mm256_fmadd_ps(_mm256_loadu_ps(wb + 8), _mm256_loadu_ps(xb + 8), p0);
+            __m256 p1 = _mm256_mul_ps(_mm256_loadu_ps(wb + 16), _mm256_loadu_ps(xb + 16));
+            p1 = _mm256_fmadd_ps(_mm256_loadu_ps(wb + 24), _mm256_loadu_ps(xb + 24), p1);
+            if (b & 1) { a1[t] = _mm256_add_ps(a1[t], p0); a1[t] = _mm256_add_ps(a1[t], p1); }
+            else       { a0[t] = _mm256_add_ps(a0[t], p0); a0[t] = _mm256_add_ps(a0[t], p1); }
+        }
+    }
+    for (int t = 0; t < 4; ++t)
+        dst[(size_t)t * Ys] = ds4f_avx2_hsum(_mm256_add_ps(a0[t], a1[t]));
+}
+
 static inline void matvec_mxfp4_1row_i8_raw(float *dst, const uint8_t *w, const uint8_t *s,
                                             const int8_t *xq, const float *xs,
                                             const float *xc, int K) {

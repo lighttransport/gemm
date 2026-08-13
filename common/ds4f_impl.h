@@ -1333,6 +1333,54 @@ static void ds4f_gemm_worker_x86(void *arg, int tid, int nthr) {
                 return;
             }
         }
+        /* Grouped-MoE reuse: decode each 8-row MXFP4 tile once, then consume
+         * it across all routed tokens. This mirrors llama.cpp's mul_mat_id
+         * scheduling while retaining f32 activations (W4A8 remains opt-in). */
+        if (M >= 8 && !ds4f_mxfp4_w4a8_on(T->m)) {
+            static int tile_on = -1;
+            if (tile_on < 0) {
+                const char *e = getenv("DS4F_MXFP4_DEQUANT_TILE");
+                tile_on = !(e && *e && atoi(e) == 0);
+            }
+            if (tile_on) {
+                float *tile = (float *)_mm_malloc((size_t)8 * (size_t)K * sizeof(float), 64);
+                if (tile) {
+                    for (int i = r0; i + 7 < r1; i += 8) {
+                        const uint8_t *w = (const uint8_t *)t->w + (size_t)i * rb;
+                        const uint8_t *s = t->scale + (size_t)i * sb;
+                        for (int r = 0; r < 8; ++r)
+                            ds4f_mxfp4_dequant_row_f32(tile + (size_t)r * K,
+                                w + (size_t)r * rb, s + (size_t)r * sb, K);
+                        for (int r = 0; r < 8; ++r) {
+                            int mm = 0;
+                            for (; mm + 3 < M; mm += 4)
+                                ds4f_mxfp4_decoded_row_4x(
+                                    T->Y + (size_t)mm * Ys + i + r, Ys,
+                                    tile + (size_t)r * K,
+                                    T->X + (size_t)mm * Xs, Xs, K);
+                            for (; mm < M; ++mm) {
+                                float *y = T->Y + (size_t)mm * Ys + i + r;
+                                const float *x = T->X + (size_t)mm * Xs;
+                                const float *ww = tile + (size_t)r * K;
+                                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                                for (int b = 0; b < K / 32; ++b) {
+                                    const float *wb = ww + (size_t)b * 32;
+                                    const float *xb = x + (size_t)b * 32;
+                                    __m256 p = _mm256_mul_ps(_mm256_loadu_ps(wb), _mm256_loadu_ps(xb));
+                                    p = _mm256_fmadd_ps(_mm256_loadu_ps(wb + 8), _mm256_loadu_ps(xb + 8), p);
+                                    p = _mm256_fmadd_ps(_mm256_loadu_ps(wb + 16), _mm256_loadu_ps(xb + 16), p);
+                                    p = _mm256_fmadd_ps(_mm256_loadu_ps(wb + 24), _mm256_loadu_ps(xb + 24), p);
+                                    if (b & 1) a1 = _mm256_add_ps(a1, p); else a0 = _mm256_add_ps(a0, p);
+                                }
+                                *y = ds4f_avx2_hsum(_mm256_add_ps(a0, a1));
+                            }
+                        }
+                    }
+                    _mm_free(tile);
+                    return;
+                }
+            }
+        }
         if (M >= 4 && ds4f_mxfp4_w4a8_on(T->m)) {
             int8_t *xq = (int8_t *)T->mx_xq;
             float *xs = (float *)T->mx_xs, *xc = (float *)T->mx_xc;
