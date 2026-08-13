@@ -45,6 +45,8 @@ python3 a64fx/llm/ds4f_serve_runner.py --daemon
 # python3 a64fx/llm/ds4f_serve_runner.py --balanced-prefill --daemon
 # Balanced mode also enables ordered FP8 reductions and disables WMMA reduction
 # shortcuts for closer CPU agreement (cosine >0.999 in the batch-64 gate).
+# Decode defaults enable the measured fused QKV and grouped device o-projection
+# path; on RX9070XT this is about 13.1 tok/s versus 12.3 tok/s baseline.
 
 # terminal 2: the OpenAI frontend
 TOK=/mnt/disk1/models/ds4f-0731/tokenizer.json \
