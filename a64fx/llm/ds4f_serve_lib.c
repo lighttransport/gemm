@@ -221,10 +221,10 @@ static int serve_attach_hip(ds4f_serve *s, int hip_device, int verbose,
     ds4f_model *m = s->m;
     s->hip = hip_ds4f_dense_create_ex(hip_device, verbose, 1);
     if (!s->hip) return -1;
-    /* Decode attention reuses the same KV ring every token. Keep it resident
-     * on the GPU by default for serving; the standalone benchmark measured a
-     * stable ~17 tok/s with this enabled versus ~13 tok/s without it. */
-    hip_ds4f_dense_set_decode_features(s->hip, 1);
+    /* GPU-resident decode KV is deliberately left off in serving until the
+     * multi-token CPU/GPU greedy gate passes. It is a fast benchmark option,
+     * not a quality-safe default. */
+    hip_ds4f_dense_set_decode_features(s->hip, 0);
     for (int L = 0; L < m->cfg.n_layers; ++L) {
         ds4f_layer *z = &m->layers[L];
         z->cmp_wkv_gpu_id = z->cmp_wgate_gpu_id = z->idx_wq_b_gpu_id = -1;

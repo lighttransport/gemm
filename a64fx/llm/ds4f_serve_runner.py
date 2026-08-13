@@ -1012,9 +1012,9 @@ def main():
     ap.add_argument("--hip-routed-ffn", type=int, choices=(0, 1), default=0,
                     help="stream routed experts to GPU during prefill (CPU fallback is faster on Gen3 PCIe)")
     ap.add_argument("--hip-decode-routed-ffn", type=int, choices=(0, 1), default=1)
-    ap.add_argument("--hip-decode-qkv-fuse", type=int, choices=(0, 1), default=1,
+    ap.add_argument("--hip-decode-qkv-fuse", type=int, choices=(0, 1), default=0,
                     help="use the fused single-upload QKV stage at M=1 decode")
-    ap.add_argument("--hip-decode-attn-oproj", type=int, choices=(0, 1), default=1,
+    ap.add_argument("--hip-decode-attn-oproj", type=int, choices=(0, 1), default=0,
                     help="use the grouped device o-projection at M=1 decode")
     ap.add_argument("--hip-fp8-wmma", type=int, choices=(0, 1, 2), default=2)
     ap.add_argument("--hip-bf16-wmma", type=int, choices=(0, 1), default=1)
