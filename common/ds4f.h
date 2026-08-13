@@ -230,7 +230,9 @@ typedef struct ds4f_tensor {
     uint8_t *scale;   /* E8M0 scale bytes (NULL for BF16/F32) */
     ds4f_qtype type;
     int rows, cols;   /* logical [rows, cols] */
-    int gpu_id;       /* optional shared dense-device-bank id; -1 means CPU */
+    /* Optional device-bank id.  -1 is CPU; -2 is the CUDA expert cache used
+     * by the dual-GPU decode adapter (it is not a HIP bank index). */
+    int gpu_id;
 } ds4f_tensor;
 
 /* bytes of the weight body for a logical [rows,cols] of the given type */

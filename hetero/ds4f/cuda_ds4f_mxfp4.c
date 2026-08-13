@@ -10,7 +10,7 @@
 typedef struct { unsigned int x, y, z; } ds4f_u3;
 /* ~1000 slots = ~12 GB of expert tensors (the whole owned bank is ~16.5 GB;
  * a resident-weight server keeps what fits and streams the rest). */
-#define DS4F_CUDA_MXFP4_CACHE_SLOTS 4096
+#define DS4F_CUDA_MXFP4_CACHE_SLOTS 32768
 typedef struct {
     const void *wkey, *skey;
     CUdeviceptr d;
@@ -41,6 +41,7 @@ struct cuda_ds4f_mxfp4 {
     struct { size_t off, size; } pool_free[128];
     int n_pool_free;
     int active_cache_slot;
+    int cache_no_evict;
     int rows, cols, nsm; int verbose; int terms;
     cuda_batch_buf *b;
     int n_batch, cap_batch;
@@ -58,11 +59,12 @@ static int ck(CUresult r, const char *what) {
     fprintf(stderr, "cuda_ds4f_mxfp4: %s: %s (%d)\n", what, s ? s : "error", (int)r);
     return -1;
 }
-cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
+cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create_ex(int device_id, int verbose,
+                                            int cache_mb) {
     if (cuewInit(CUEW_INIT_CUDA) != CUEW_SUCCESS || cuInit(0) != CUDA_SUCCESS) return NULL;
     cuda_ds4f_mxfp4 *c = (cuda_ds4f_mxfp4 *)calloc(1, sizeof(*c)); if (!c) return NULL;
     c->verbose = verbose;
-    c->cache_limit = (size_t)(12000ull * 1024 * 1024);
+    c->cache_limit = (size_t)(cache_mb > 0 ? cache_mb : 12000) * 1024 * 1024;
     {   const char *e = getenv("DS4F_CUDA_MXFP4_CACHE_MB");
         if (e && *e) {
             long mb = atol(e);
@@ -98,12 +100,25 @@ cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
     if (sh < 65536) sh = 65536;
     cuFuncSetAttribute(c->gemm, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, sh);
     cuFuncSetAttribute(c->gemm64, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, sh);
+    /* Keep an operator-selected reserve free for display/compositor and CUDA
+     * work buffers.  The configured limit is an upper bound, never permission
+     * to consume memory already in use by the desktop. */
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cuMemGetInfo(&free_bytes, &total_bytes) != CUDA_SUCCESS) goto fail;
+    const size_t reserve = 4096ull * 1024 * 1024;
+    size_t usable = free_bytes > reserve ? free_bytes - reserve : 0;
+    if (c->cache_limit > usable) c->cache_limit = usable;
+    if (c->cache_limit < 256ull * 1024 * 1024) goto fail;
     /* One contiguous pool avoids the small-allocation fragmentation ceiling. */
     if (cuMemAlloc(&c->cache_pool, c->cache_limit) != CUDA_SUCCESS)
         c->cache_pool = 0;
     c->cache_pool_size = c->cache_pool ? c->cache_limit : 0;
     return c;
 fail: cuda_ds4f_mxfp4_destroy(c); return NULL;
+}
+
+cuda_ds4f_mxfp4 *cuda_ds4f_mxfp4_create(int device_id, int verbose) {
+    return cuda_ds4f_mxfp4_create_ex(device_id, verbose, 12000);
 }
 void cuda_ds4f_mxfp4_destroy(cuda_ds4f_mxfp4 *c) {
     if (!c) return; if (c->stream) cuStreamSynchronize(c->stream);
@@ -189,6 +204,8 @@ static int cuda_ds4f_mxfp4_load_any(cuda_ds4f_mxfp4 *c, const uint8_t *w,
     c->active_cache_slot = -1;
     int slot = -1;
     if (bytes <= c->cache_limit) {
+        if (c->cache_no_evict && c->cache_bytes + bytes > c->cache_limit)
+            return -1;
         while (c->cache_bytes + bytes > c->cache_limit) {
             int victim = -1;
             for (int i = 0; i < DS4F_CUDA_MXFP4_CACHE_SLOTS; ++i)
@@ -381,6 +398,10 @@ void cuda_ds4f_mxfp4_set_terms(cuda_ds4f_mxfp4 *c, int terms) {
     if (c) c->terms = terms < 2 ? 1 : 2;
 }
 
+void cuda_ds4f_mxfp4_set_no_evict(cuda_ds4f_mxfp4 *c, int enabled) {
+    if (c) c->cache_no_evict = enabled != 0;
+}
+
 int cuda_ds4f_mxfp4_gemm(cuda_ds4f_mxfp4 *c, float *dst, const float *x,
                          int M, int N, int K) {
     /* Pass 0 as the output so gemm_once() grabs the current c->y: evaluating
@@ -510,19 +531,19 @@ static int cuda_ds4f_mxfp4_gemm_batch_any(cuda_ds4f_mxfp4 *c, int n,
         if (B->hxb < xb) {
             if (B->hx) cuMemFreeHost(B->hx);
             B->hx = NULL; B->hxb = 0;
-            if (cuMemHostAlloc(&B->hx, xb, 0) != CUDA_SUCCESS) return -1;
+            if (cuMemHostAlloc((void **)&B->hx, xb, 0) != CUDA_SUCCESS) return -1;
             B->hxb = xb;
         }
         if (B->hyb2 < (size_t)mm * N * sizeof(float)) {
             if (B->hy) cuMemFreeHost(B->hy);
             B->hy = NULL; B->hyb2 = 0;
-            if (cuMemHostAlloc(&B->hy, (size_t)mm * N * sizeof(float), 0) != CUDA_SUCCESS) return -1;
+            if (cuMemHostAlloc((void **)&B->hy, (size_t)mm * N * sizeof(float), 0) != CUDA_SUCCESS) return -1;
             B->hyb2 = (size_t)mm * N * sizeof(float);
         }
         if (terms == 2 && B->hresb < xb) {
             if (B->hres) cuMemFreeHost(B->hres);
             B->hres = NULL; B->hresb = 0;
-            if (cuMemHostAlloc(&B->hres, xb, 0) != CUDA_SUCCESS) return -1;
+            if (cuMemHostAlloc((void **)&B->hres, xb, 0) != CUDA_SUCCESS) return -1;
             B->hresb = xb;
         }
     }

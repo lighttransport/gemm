@@ -28,8 +28,8 @@ fi
 
 $CC $CFLAGS -o libds4f_serve.so \
     a64fx/llm/ds4f_serve_lib.c \
-    hetero/ds4f/hip_ds4f_dense.c \
-    cuda/cuew.c rdna4/rocew.c \
+    hetero/ds4f/hip_ds4f_dense.c hetero/ds4f/dual_ds4f_prefill.c \
+    hetero/ds4f/cuda_ds4f_mxfp4.c cuda/cuew.c rdna4/rocew.c \
     $HIP_LIBS -ldl -lm
 
 echo "built ./libds4f_serve.so"$([ -n "$ROCM_LIB" ] && echo " (ROCm: $ROCM_LIB)" || echo " (CPU-only)")

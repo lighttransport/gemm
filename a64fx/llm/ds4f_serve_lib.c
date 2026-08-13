@@ -24,6 +24,7 @@
 #include "common/ds4f.h"
 #if defined(DS4F_SERVE_HIP)
 #include "hetero/ds4f/hip_ds4f_dense.h"
+#include "hetero/ds4f/dual_ds4f_prefill.h"
 #endif
 
 #include <math.h>
@@ -63,6 +64,7 @@ typedef struct ds4f_serve {
     float *slot_logits;
 #if defined(DS4F_SERVE_HIP)
     hip_ds4f_dense *hip;
+    dual_ds4f_prefill *dual;
     /* Adaptive hot-expert cache: route_hits is cumulative, so a snapshot
      * taken at the last refresh lets us derive a recent-window delta
      * (current - snapshot) without touching the per-token routing hot path.
@@ -97,6 +99,65 @@ int ds4f_serve_cache_hot_experts(ds4f_serve *s, int cache_mb,
                                              reserve_mb, stats);
 #else
     (void)s; (void)cache_mb; (void)reserve_mb; (void)stats;
+    return -1;
+#endif
+}
+
+/* Admit complete tail expert layers to CUDA under a fixed allocation budget.
+ * CUDA ownership is deliberately all-or-nothing per layer; a missed preload
+ * leaves the layer on the exact CPU path. */
+int ds4f_serve_enable_cuda_balanced(ds4f_serve *s, int cuda_device,
+                                    int cuda_cache_mb, int first_layer) {
+#if defined(DS4F_SERVE_HIP)
+    if (!s || !s->m || !s->hip || s->dual || cuda_cache_mb < 1) return -1;
+    ds4f_model *m = s->m;
+    if (first_layer < 0) first_layer = 0;
+    if (first_layer >= m->cfg.n_layers) return -1;
+    s->dual = dual_ds4f_prefill_wrap_hip_budget(s->hip, cuda_device, 0,
+                                                 cuda_cache_mb);
+    if (!s->dual) return -1;
+    dual_ds4f_prefill_set_cuda_mxfp4(s->dual, 1);
+    dual_ds4f_prefill_set_cuda_no_evict(s->dual, 1);
+    dual_ds4f_prefill_set_cuda_small_buckets(s->dual, 1);
+    dual_ds4f_prefill_set_max_batch(s->dual, 1);
+    int admitted = 0;
+    for (int L = first_layer; L < m->cfg.n_layers; ++L) {
+        ds4f_layer *z = &m->layers[L];
+        int ok = 1;
+        for (int e = 0; e < z->n_owned; ++e)
+            if (dual_ds4f_prefill_warm(s->dual, &z->ex_w1[e]) != 0 ||
+                dual_ds4f_prefill_warm(s->dual, &z->ex_w3[e]) != 0 ||
+                dual_ds4f_prefill_warm(s->dual, &z->ex_w2[e]) != 0) {
+                ok = 0; break;
+            }
+        if (!ok) break;
+        for (int e = 0; e < z->n_owned; ++e)
+            z->ex_w1[e].gpu_id = z->ex_w3[e].gpu_id = z->ex_w2[e].gpu_id = -2;
+        ++admitted;
+    }
+    if (!admitted) {
+        dual_ds4f_prefill_destroy(s->dual); s->dual = NULL;
+        return 0;
+    }
+    dual_ds4f_prefill_attach_model(m, s->dual);
+    /* The dual wrapper forwards generic dense callbacks, but the fused QKV,
+     * attention and async shared entry points take a raw HIP context.  They
+     * are not part of balanced decode, so disable them rather than passing the
+     * wrapper pointer to a HIP-only callback. */
+    m->gpu_prefill_qkv = NULL;
+    m->gpu_prefill_attn = NULL;
+    m->gpu_prefill_attn_partial = NULL;
+    m->gpu_prefill_attn_oproj = NULL;
+    m->gpu_oproj = NULL;
+    m->gpu_shared_ffn_begin = NULL;
+    m->gpu_shared_ffn_wait = NULL;
+    m->gpu_routed_ffn = dual_ds4f_prefill_routed_ffn;
+    m->gpu_decode_routed_ffn_enabled = 1;
+    fprintf(stderr, "[serve] balanced CUDA: dev=%d cache=%dMiB layers=%d..%d\n",
+            cuda_device, cuda_cache_mb, first_layer, first_layer + admitted - 1);
+    return admitted;
+#else
+    (void)s; (void)cuda_device; (void)cuda_cache_mb; (void)first_layer;
     return -1;
 #endif
 }
@@ -565,6 +626,7 @@ void ds4f_serve_close(ds4f_serve *s) {
     }
     if (s->m) ds4f_route_report(s->m, stderr);
 #if defined(DS4F_SERVE_HIP)
+    if (s->dual) { dual_ds4f_prefill_destroy(s->dual); s->dual = NULL; }
     if (s->hip) hip_ds4f_dense_destroy(s->hip);
     free(s->ac_snapshot); free(s->ac_delta);
 #endif

@@ -52,11 +52,16 @@ Decode has the same explicit quality tiers.  `--decode-mode safe` is the
 default token-parity baseline (currently about 5 tok/s on the RX 9070 XT);
 `--decode-mode balanced` retains the same arithmetic and uses pinned selected-
 expert staging; `--decode-mode fast` enables fused QKV, GPU attention/O-proj,
-resident KV, Tier-B2 GPU projections, and W4A8 experts.  Fast is opt-in and
-must not be promoted until the decode gate reports minimum logit cosine
-`>= 0.999` across a warmed multi-token history.  The intended targets are
-balanced 9 tok/s and fast 12+ tok/s; balanced currently has no qualified
-throughput win over safe.
+resident KV, Tier-B2 GPU projections, and W4A8 experts.  The experimental
+two-GPU routed-expert candidate is enabled only with `--balanced-cuda 1`; it
+caps CUDA expert cache allocation at 12288 MiB and dynamically preserves a
+4 GiB display reserve.  It is not a qualified balanced path: the current
+MMQ activation-quantized CUDA kernel diverges on the greedy rollout and is
+slower than safe.  Fast and CUDA experiments must not be promoted until the
+decode gate reports minimum logit cosine `>= 0.999` across a warmed
+multi-token history and the real greedy-ID parity fixture remains exact.
+The intended targets are balanced 9 tok/s and fast 12+ tok/s; balanced
+currently has no qualified throughput win over safe.
 
 The standalone HIP gate accepts the cosine threshold explicitly:
 

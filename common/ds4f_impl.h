@@ -8557,8 +8557,11 @@ decode_oproj_done:;
             int e = idx[k];
             if (e < 0 || e % m->ep_size != m->ep_rank) continue;
             int slot = e / m->ep_size;
-            if (ly->ex_w1[slot].gpu_id >= 0 && ly->ex_w3[slot].gpu_id >= 0 &&
-                ly->ex_w2[slot].gpu_id >= 0) { routed_gpu_hit = 1; break; }
+            if ((ly->ex_w1[slot].gpu_id >= 0 || ly->ex_w1[slot].gpu_id == -2) &&
+                (ly->ex_w3[slot].gpu_id >= 0 || ly->ex_w3[slot].gpu_id == -2) &&
+                (ly->ex_w2[slot].gpu_id >= 0 || ly->ex_w2[slot].gpu_id == -2)) {
+                routed_gpu_hit = 1; break;
+            }
         }
         if (shared_gpu_pending && routed_gpu_hit) {
             DS4F_TIC();
@@ -8581,8 +8584,9 @@ decode_oproj_done:;
                 if (e < 0 || e % m->ep_size != m->ep_rank) continue;
                 int slot = e / m->ep_size;
                 local_k[nlocal++] = k;
-                if (ly->ex_w1[slot].gpu_id < 0 || ly->ex_w3[slot].gpu_id < 0 ||
-                    ly->ex_w2[slot].gpu_id < 0) all_gpu = 0;
+                if ((ly->ex_w1[slot].gpu_id < 0 && ly->ex_w1[slot].gpu_id != -2) ||
+                    (ly->ex_w3[slot].gpu_id < 0 && ly->ex_w3[slot].gpu_id != -2) ||
+                    (ly->ex_w2[slot].gpu_id < 0 && ly->ex_w2[slot].gpu_id != -2)) all_gpu = 0;
             }
             if (nlocal > 0 && all_gpu) {
                 const ds4f_tensor *rw1[8], *rw3[8], *rw2[8];

@@ -151,8 +151,9 @@ dual_ds4f_prefill *dual_ds4f_prefill_create(int hip_device, int cuda_device,
     return c;
 }
 
-dual_ds4f_prefill *dual_ds4f_prefill_wrap_hip(hip_ds4f_dense *hip,
-                                              int cuda_device, int verbose) {
+dual_ds4f_prefill *dual_ds4f_prefill_wrap_hip_budget(hip_ds4f_dense *hip,
+                                                     int cuda_device, int verbose,
+                                                     int cuda_cache_mb) {
     if (!hip) return NULL;
     dual_ds4f_prefill *c = (dual_ds4f_prefill *)calloc(1, sizeof(*c));
     if (!c) return NULL;
@@ -160,12 +161,17 @@ dual_ds4f_prefill *dual_ds4f_prefill_wrap_hip(hip_ds4f_dense *hip,
     c->verbose = verbose;
     c->cuda_mxfp4 = 1;
     pthread_mutex_init(&c->cuda_lock, NULL);
-    c->cuda = cuda_ds4f_mxfp4_create(cuda_device, verbose);
+    c->cuda = cuda_ds4f_mxfp4_create_ex(cuda_device, verbose, cuda_cache_mb);
     if (!c->cuda) {
         dual_ds4f_prefill_destroy(c);
         return NULL;
     }
     return c;
+}
+
+dual_ds4f_prefill *dual_ds4f_prefill_wrap_hip(hip_ds4f_dense *hip,
+                                              int cuda_device, int verbose) {
+    return dual_ds4f_prefill_wrap_hip_budget(hip, cuda_device, verbose, 12000);
 }
 
 void dual_ds4f_prefill_destroy(dual_ds4f_prefill *c) {
@@ -182,6 +188,10 @@ void dual_ds4f_prefill_set_cuda_mxfp4(dual_ds4f_prefill *c, int enabled) {
 
 void dual_ds4f_prefill_set_cuda_terms(dual_ds4f_prefill *c, int terms) {
     if (c) cuda_ds4f_mxfp4_set_terms(c->cuda, terms);
+}
+
+void dual_ds4f_prefill_set_cuda_no_evict(dual_ds4f_prefill *c, int enabled) {
+    if (c) cuda_ds4f_mxfp4_set_no_evict(c->cuda, enabled);
 }
 
 void dual_ds4f_prefill_set_max_batch(dual_ds4f_prefill *c, int max_batch) {
@@ -328,6 +338,65 @@ void dual_ds4f_prefill_attach_model(ds4f_model *m, dual_ds4f_prefill *c) {
         m->gpu_dense_layer_prefetch = NULL;
     }
     m->gpu_dense_mixed = c ? 1 : 0;
+}
+
+int dual_ds4f_prefill_routed_ffn(void *opaque, float *dst, const float *x,
+    const ds4f_tensor *const *w1, const ds4f_tensor *const *w3,
+    const ds4f_tensor *const *w2, const int *counts, const int *offsets,
+    int n_experts, int total, int C, int inter, float lim) {
+    dual_ds4f_prefill *c = (dual_ds4f_prefill *)opaque;
+    if (!c || !c->cuda || !dst || !x || !w1 || !w3 || !w2 || !counts ||
+        !offsets || n_experts < 1 || n_experts > 8 || total < 1 ||
+        offsets[0] != 0 || offsets[n_experts] != total)
+        return -1;
+    /* gpu_id==-2 is the CUDA ownership sentinel established during preload.
+     * Require an entire selected bundle on CUDA: mixing a partial route would
+     * change scheduling/accumulation and is slower than the exact CPU group. */
+    for (int e = 0; e < n_experts; ++e)
+        if (counts[e] != 1 || w1[e]->gpu_id != -2 || w3[e]->gpu_id != -2 ||
+            w2[e]->gpu_id != -2)
+            return -1;
+    float *gate = (float *)malloc((size_t)total * (size_t)inter * sizeof(float));
+    float *up = (float *)malloc((size_t)total * (size_t)inter * sizeof(float));
+    if (!gate || !up) { free(gate); free(up); return -1; }
+    float *gd[8], *ud[8], *yd[8];
+    const float *xe[8], *gx[8];
+    const uint8_t *gw[8], *gs[8], *uw[8], *us[8], *dw[8], *ds[8];
+    int one[8], grow[8], gcol[8], drow[8], dcol[8];
+    for (int e = 0; e < n_experts; ++e) {
+        int row = offsets[e];
+        xe[e] = x + (size_t)row * C;
+        gd[e] = gate + (size_t)row * inter;
+        ud[e] = up + (size_t)row * inter;
+        yd[e] = dst + (size_t)row * C;
+        gw[e] = (const uint8_t *)w1[e]->w; gs[e] = w1[e]->scale;
+        uw[e] = (const uint8_t *)w3[e]->w; us[e] = w3[e]->scale;
+        dw[e] = (const uint8_t *)w2[e]->w; ds[e] = w2[e]->scale;
+        one[e] = 1; grow[e] = inter; gcol[e] = C;
+        drow[e] = C; dcol[e] = inter;
+    }
+    /* Dispatch all selected experts in one CUDA stream batch per projection.
+     * M=1 launch/synchronization overhead dominated the original sequential
+     * adapter, and hid any benefit from keeping the full expert layers hot. */
+    int rc = 0;
+    if (cuda_ds4f_mxfp4_gemm_batch(c->cuda, n_experts, gd, gw, gs, xe,
+                                   one, grow, gcol) != 0 ||
+        cuda_ds4f_mxfp4_gemm_batch(c->cuda, n_experts, ud, uw, us, xe,
+                                   one, grow, gcol) != 0) rc = -1;
+    for (int e = 0; e < n_experts && !rc; ++e) {
+        float *ge = gd[e], *ue = ud[e];
+        for (int j = 0; j < inter; ++j) {
+            float v = ge[j];
+            if (v > lim) v = lim;
+            if (v < -lim) v = -lim;
+            ge[j] = v / (1.0f + expf(-v)) * ue[j];
+        }
+        gx[e] = ge;
+    }
+    if (!rc && cuda_ds4f_mxfp4_gemm_batch(c->cuda, n_experts, yd, dw, ds, gx,
+                                           one, drow, dcol) != 0) rc = -1;
+    free(up); free(gate);
+    return rc;
 }
 
 int dual_ds4f_prefill_gemm(void *opaque, float *dst, const ds4f_tensor *t,
