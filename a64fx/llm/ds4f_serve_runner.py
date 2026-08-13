@@ -997,6 +997,10 @@ def main():
     ap.add_argument("--prefill-quantum-tokens", type=int, default=32)
     ap.add_argument("--single-prefill-quantum-tokens", type=int, default=1024)
     ap.add_argument("--hip-prefill-tuned", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--fast-prefill", action="store_true",
+                    help="opt into the high-throughput GPU prefill path; exact CPU prefill is default")
+    ap.add_argument("--balanced-prefill", action="store_true",
+                    help="GPU GEMMs with CPU attention/compression; quality-oriented middle mode")
     ap.add_argument("--hip-fused-shared-ffn", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-prefill-attn", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-tb2-batch", type=int, choices=(0, 1), default=1,
@@ -1074,6 +1078,22 @@ def main():
     signal.signal(signal.SIGINT, _term)
     if args.daemon:
         daemonize()
+    # Fast prefill is deliberately opt-in for serving: the exact path is the
+    # quality-safe default. The library reads this before model load, so set it
+    # here rather than mutating the model after initialization.
+    if args.fast_prefill and args.balanced_prefill:
+        ap.error("--fast-prefill and --balanced-prefill are mutually exclusive")
+    if args.balanced_prefill:
+        # Keep dense/GEMM offload, but leave attention and Tier-B2 state on the
+        # CPU. This avoids the large distribution drift of the full GPU chain.
+        args.hip_prefill_attn = 0
+        args.hip_tb2_batch = 0
+        args.hip_qkv_device_chain = 0
+        args.hip_attn_device_chain = 0
+        args.hip_attn_no_d2h = 0
+        os.environ["DS4F_HIP_EXACT_PREFILL"] = "0"
+    else:
+        os.environ["DS4F_HIP_EXACT_PREFILL"] = "0" if args.fast_prefill else "1"
     # Forward-path tuning reaches the C library through its documented
     # environment names, and passing it as a runner argument keeps a deployment
     # reproducible from the command line (AGENTS.md).  These are read at model

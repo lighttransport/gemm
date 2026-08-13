@@ -39,6 +39,11 @@ DS4F_SERVE_BASE=/tmp/ds4f_serve DS4F_STAGE_DIR=/tmp/ds4f_single \
 DS4F_SERVE_USE_HIP=1 DS4F_MAXPOS=16384 \
 python3 a64fx/llm/ds4f_serve_runner.py --daemon
 
+# Exact CPU prefill is the default. Opt into the high-throughput GPU path:
+# python3 a64fx/llm/ds4f_serve_runner.py --fast-prefill --daemon
+# Or use the quality-oriented middle mode (GPU GEMMs, CPU attention):
+# python3 a64fx/llm/ds4f_serve_runner.py --balanced-prefill --daemon
+
 # terminal 2: the OpenAI frontend
 TOK=/mnt/disk1/models/ds4f-0731/tokenizer.json \
 DS4F_SERVE_BASE=/tmp/ds4f_serve \
