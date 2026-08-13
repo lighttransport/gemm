@@ -63,6 +63,8 @@ def main():
                     help="run decode Tier-B2 projections on the resident GPU bank")
     ap.add_argument("--expert-active", type=int, choices=range(2, 7), default=6,
                     help="opt-in routed expert count (native default: 6)")
+    ap.add_argument("--hip-mtp-dense", type=int, choices=(0, 1), default=1,
+                    help="resident DSpark dense bank (0 selects exact CPU fallback)")
     ap.add_argument("--cpu-only", action="store_true")
     args = ap.parse_args()
 
@@ -72,6 +74,7 @@ def main():
     os.environ["DS4F_MXFP4_W4A8"] = str(args.mxfp4_w4a8)
     os.environ["DS4F_TB2_GPU"] = str(args.hip_tb2_decode)
     os.environ["DS4F_EXPERT_ACTIVE"] = str(args.expert_active)
+    os.environ["DS4F_HIP_MTP_DENSE"] = str(args.hip_mtp_dense)
 
     tokenizer = DS4FTokenizer(args.tokenizer)
     unit = tokenizer.encode(DEFAULT_TEXT, add_bos=True)
@@ -98,10 +101,10 @@ def main():
     try:
         print("benchmark config: prompt=%d warm=%d decode=%d threads=%d "
               "w4a8=%d tb2_decode=%d tb2_batch=%d expert_active=%d "
-              "expert_cache_mb=%d" %
+              "mtp_dense=%d expert_cache_mb=%d" %
               (args.prompt_tokens, args.warm_decode, args.decode_tokens,
                args.threads, args.mxfp4_w4a8, args.hip_tb2_decode,
-               args.hip_tb2_batch, args.expert_active,
+               args.hip_tb2_batch, args.expert_active, args.hip_mtp_dense,
                args.hip_expert_cache_mb), flush=True)
         if args.logical_ep_lanes and sess.set_logical_ep_lanes(args.logical_ep_lanes) != 0:
             raise RuntimeError("logical EP lane setup failed")

@@ -7574,6 +7574,17 @@ static void ds4f_noop_pool_worker(void *arg, int tid, int nthr) {
 static void ds4f_dspark_append_main(ds4f_model *m, const float *hidden, int K, int pos0) {
     if (!m->has_mtp || !hidden || K<1) return;
     ds4f_config *c=&m->cfg; int C=c->hidden,KV=c->kv_lora,rd=c->qk_rope_dim;
+    /* DSpark uses dense sliding-window attention.  During a large prompt tile,
+     * projecting taps that are already outside that window only streams the
+     * draft weights and fills KV rows which the first draft can never read.
+     * Keep the live suffix; its absolute positions and hidden-row layout are
+     * unchanged, so this is exactly equivalent for every future query. */
+    if (K>c->window_size) {
+        int skip=K-c->window_size;
+        hidden+=(size_t)skip*DS4F_DSPARK_TARGET_LAYERS*C;
+        pos0+=skip;
+        K=c->window_size;
+    }
     ds4f_alloc_prefill_batch(m,K);
     ds4f_gemm(m,m->p_hn,&m->dspark[0].main_proj,hidden,K,C,3*C);
     { ds4f_pf_rms_task t={m,m->p_x,m->p_hn,m->dspark[0].main_norm,C,K,C,C};

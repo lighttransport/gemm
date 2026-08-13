@@ -1059,6 +1059,8 @@ def main():
                          "CHANGES greedy output; default 0 keeps token parity")
     ap.add_argument("--expert-active", type=int, choices=range(2, 7), default=6,
                     help="opt-in fast-profile routed expert count (native default: 6)")
+    ap.add_argument("--hip-mtp-dense", type=int, choices=(0, 1), default=1,
+                    help="resident DSpark dense bank (0 selects exact CPU fallback)")
     ap.add_argument("--speculative-tokens", type=int, default=0,
                     help="greedy DSpark block size (0 disables; checkpoint supports up to 5)")
     ap.add_argument("--scheduler-quantum-ms", type=int, default=250)
@@ -1089,6 +1091,7 @@ def main():
         if flag is not None:
             os.environ[var] = str(flag)
     os.environ["DS4F_EXPERT_ACTIVE"] = str(args.expert_active)
+    os.environ["DS4F_HIP_MTP_DENSE"] = str(args.hip_mtp_dense)
     base = os.environ.get("DS4F_SERVE_BASE", "/tmp/ds4f_serve")
     stage = os.environ.get("DS4F_STAGE_DIR")
     if not stage:

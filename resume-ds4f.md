@@ -36,6 +36,29 @@ quality/performance control. Hash-routed layers keep the checkpoint's native
 six-entry row stride and consume only the requested prefix, renormalized to
 the original routed mass. Exact defaults are unchanged.
 
+### Exact MTP follow-up
+
+The three-stage DSpark path is fully wired and produces coherent,
+greedy-authoritative output. Prompt bootstrap now retains only the final 128
+tap positions because the drafter's dense attention window cannot read an
+older KV row. `--hip-mtp-dense 1` is explicit and defaults on; `0` provides an
+exact CPU fallback for VRAM diagnostics.
+
+Acceptance run (`1024` prompt / `16` warm / `64` measured, K=5, six experts):
+
+| draft dense path | prefill tok/s | decode tok/s | committed/block |
+|---|---:|---:|---:|
+| GPU resident | 8.18 | 3.40 | 2.46 measured loop / 2.58 including warm |
+| CPU fallback | 8.44 | 3.13 | 2.46 measured loop / 2.58 including warm |
+
+The decoded text was identical between both paths. MTP remains slower than
+the 4.82 tok/s non-speculative exact baseline because sequential verification
+still performs one authoritative 43-layer pass per committed token, plus the
+three-layer draft. The previously measured batched verifier is also linear in
+the number of positions because top-6/256 routes almost-disjoint experts and
+was state-incorrect on partial rejection. Consequently exact MTP is complete
+but cannot provide a route to 12 tok/s on this single CPU/GPU host.
+
 ---
 
 ## Resuming prompt

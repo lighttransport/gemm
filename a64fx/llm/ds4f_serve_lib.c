@@ -270,7 +270,10 @@ static int serve_attach_hip(ds4f_serve *s, int hip_device, int verbose,
                 z->idx_wq_b_gpu_id = iq.gpu_id;
         }
     }
-    if (m->has_mtp) {
+    /* DSpark residency is independent of whether speculation is enabled in
+     * the scheduler.  Keep an explicit opt-out for reduced-VRAM diagnostics;
+     * every unbound tensor has the same exact CPU fallback. */
+    if (m->has_mtp && env_i("DS4F_HIP_MTP_DENSE", 1)) {
         for (int st=0;st<m->dspark_n_stages;st++) {
             ds4f_layer *z=&m->dspark[st].layer;
             ds4f_tensor *ts[9]={&z->wq_a,&z->wq_b,&z->wkv,&z->wo_a,&z->wo_b,

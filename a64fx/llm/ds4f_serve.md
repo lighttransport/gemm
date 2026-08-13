@@ -280,6 +280,19 @@ N=5 measured 16.38 prefill / 5.16 decode tok/s, while N=2 measured 21.15 /
 6.28 but produced severe repetitive degeneration. It is not a path to the
 40/12 targets on this host.
 
+`--speculative-tokens K` enables the checkpoint's three-stage DSpark/MTP
+drafter; `--hip-mtp-dense 1` keeps its dense projections resident on the GPU
+and is the default whenever MTP is loaded. The prompt bootstrap now projects
+only the final 128 positions into DSpark KV, matching its sliding attention
+window exactly. Older draft KV is unreachable and is therefore omitted
+without changing proposals. Greedy verification remains authoritative and
+sequential: a rejected proposal never changes emitted tokens or retained
+state. On the 1024/16/64 acceptance workload, K=5 accepted 2.58 committed
+tokens/block but reached only 3.40 tok/s versus 4.82 without speculation.
+Leave speculation disabled for throughput; exact MTP cannot reach 12 tok/s
+until a verifier can process multiple routed positions for less than their
+linear expert-streaming cost.
+
 `--hip-expert-pinned-staging 1` is an explicit diagnostic alternative to the
 rolling registration path. It coalesces each layer into two pinned host slabs
 before DMA, but is disabled by default: on this 188 GiB host the two staging
