@@ -6174,9 +6174,14 @@ static void ds4f_hc_sinkhorn(const float *mixes, const float *scale, const float
  * independent reduction over k in fixed order => BIT-EXACT to the serial path (mirrors the
  * validated ds4f_q_norm_rope_par / DS4F_TB2ROPE_PAR pattern). The RMS reduction + matvec +
  * sinkhorn are left untouched (RMS would reassociate; matvec is already a pool_run). */
-static int ds4f_hc_par = -1;             /* 1=pool-parallel, 0=serial ref (default) */
+/* Default ON since 2026-08-13: the collapse/expand loops are ~12 ms/token of
+ * single-threaded tid0 work on this x86 host (43 layers x 2 mHC steps).  The
+ * split is over disjoint ranges of the hidden dim with the reduction order
+ * unchanged, so it is bit-exact -- verified by identical greedy output on both
+ * fixtures -- and measured +3.5%% to +14%% decode in paired runs. */
+static int ds4f_hc_par = -1;             /* 1=pool-parallel (default), 0=serial ref */
 static inline int ds4f_hc_par_on(void) {
-    if (ds4f_hc_par < 0) { const char *e = getenv("DS4F_HC_PAR"); ds4f_hc_par = e ? atoi(e) : 0; }
+    if (ds4f_hc_par < 0) { const char *e = getenv("DS4F_HC_PAR"); ds4f_hc_par = e && *e ? atoi(e) : 1; }
     return ds4f_hc_par;
 }
 /* collapse: y[d] = Σ_k pre[k]·x4[k*C+d]  (used by hc_pre and hc_head_p) */

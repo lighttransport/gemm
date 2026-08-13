@@ -615,3 +615,39 @@ position (`DS4F_ATTN_HYBRID_GPU`, off).
 Also exposed `--hip-block-threads` and `--hip-fp8-wmma` on `ds4f_serve_bench.py`
 (they were hard-coded), and updated it for the widened
 `ds4f_serve_configure_hip_prefill` signature (18 -> 20 ints).
+
+### 2026-08-13 — mHC: a bit-exact win that was switched off
+
+mHC (multi-head hyper-connections, `hc_mult`=4, 20 sinkhorn iterations) runs
+twice per layer -- collapse 4 streams to 1 before attention and before the FFN,
+expand back after each -- so 86 collapse/expand pairs per token, ~12 ms.
+
+The collapse/expand loops were running **single-threaded on tid0**. A
+pool-parallel version already existed (`ds4f_hccol_worker` /
+`ds4f_hcpost_worker`, WS1, `DS4F_HC_PAR`), documented bit-exact -- each output
+element is an independent reduction over a disjoint range of the hidden dim
+with the k-order unchanged -- and recorded at +22% tok/s on A64FX. It was
+**default off**.
+
+Measured here (W4A8 + group split + GPU tb2 + block-threads 64), paired runs:
+
+| pair | HC_PAR=0 | HC_PAR=1 |
+|---|---:|---:|
+| single | 5.565 | 5.775 (+3.8%) |
+| a | 5.462 | 5.652 (+3.5%) |
+| b | 5.040 | 5.761 (+14.3%) |
+
+Greedy output is **identical** on both fixtures, confirming the bit-exactness
+claim. Default flipped to on in `ds4f_hc_par_on()`, and exposed as
+`--hc-parallel` for A/B.
+
+Rejected: `DS4F_HC_RMSPAR=1` (fuse the mHC RMS sum-of-squares into the mixes
+matvec). It adds only ~1% decode on top of HC_PAR and costs **-19% prefill**
+(14.5 -> 12.0 tok/s), and it reassociates the sum so it is not bit-exact.
+Left off.
+
+Not pursued: `ds4f_hcmix_worker`'s inner F32 dot is a scalar loop
+(`acc += w[j]*x4[j]` over hd = hc*hidden = 16384, 24 rows), like the bf16
+workers fixed earlier. Vectorising it would change the reduction order, so
+unlike the tb2 fix it would not be bit-exact, and the tensor is only 1.6 MB per
+layer -- far less headroom than tb2's 872 MB/token.

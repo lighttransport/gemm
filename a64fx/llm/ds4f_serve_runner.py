@@ -1042,6 +1042,9 @@ def main():
     ap.add_argument("--decode-batch-size", type=int, default=1)
     ap.add_argument("--threads", type=int, default=None,
                     help="model thread pool size (default: LLM_THREADS, else 16)")
+    ap.add_argument("--hc-parallel", type=int, choices=(0, 1), default=None,
+                    help="pool-parallelize the mHC collapse/expand loops "
+                         "(bit-exact; default on in the library)")
     ap.add_argument("--mv-group-split", type=int, choices=(0, 1), default=None,
                     help="split a fused matvec group's concatenated row space "
                          "across the pool instead of slicing every matrix "
@@ -1076,7 +1079,8 @@ def main():
     # default unconditionally silently clobbers an operator's environment and
     # makes env-based A/B a no-op.  The library's own defaults are group split
     # on, W4A8 off, GPU tb2 off.
-    for flag, var in ((args.mv_group_split, "DS4F_MV_GROUP_SPLIT"),
+    for flag, var in ((args.hc_parallel, "DS4F_HC_PAR"),
+                      (args.mv_group_split, "DS4F_MV_GROUP_SPLIT"),
                       (args.mxfp4_w4a8, "DS4F_MXFP4_W4A8"),
                       (args.hip_tb2_decode, "DS4F_TB2_GPU"),
                       (args.threads, "LLM_THREADS")):
