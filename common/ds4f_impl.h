@@ -607,6 +607,8 @@ typedef struct {
      * existing positional initializer produces) means "derive the range from
      * tid/nthr", which is the historical behaviour. */
     int r0, r1;
+    /* Optional shared, raw-MXFP4 activation in on-disk nibble order. */
+    const float *xperm;
 } ds4f_mv_task;
 
 static void ds4f_mv_worker(void *arg, int tid, int nthr) {
@@ -682,8 +684,11 @@ static void ds4f_mv_worker(void *arg, int tid, int nthr) {
                                          sbase + (size_t)i * sb, xq, xs, xc, K);
             }
         } else if (raw) {
-            float *xp = ds4f_mxfp4_xperm(K);
-            ds4f_mxfp4_perm_act_f32(x, K, xp);
+            float *xp = (float *)T->xperm;
+            if (!xp) {
+                xp = ds4f_mxfp4_xperm(K);
+                ds4f_mxfp4_perm_act_f32(x, K, xp);
+            }
             for (int i = r0; i < r1; i++)
                 matvec_mxfp4_1row_f32_raw(dst + i, base + (size_t)i * rb,
                                           sbase + (size_t)i * sb, xp, K);
@@ -761,7 +766,12 @@ static inline int ds4f_expert_batch_on(void) {
     return ds4f_expert_batch;
 }
 typedef struct { float *dst; const ds4f_tensor *t; const float *x; } ds4f_mv1;
-typedef struct { ds4f_model *m; const ds4f_mv1 *list; int n; } ds4f_mv_multi_task;
+typedef struct {
+    ds4f_model *m;
+    const ds4f_mv1 *list;
+    int n;
+    const float *const *xperm; /* optional prepared activation for each list item */
+} ds4f_mv_multi_task;
 /* DS4F_MV_GROUP_SPLIT: split the group's CONCATENATED row space across the
  * pool instead of giving every thread a 1/nthr slice of every matrix.
  *
@@ -799,7 +809,8 @@ static void ds4f_mv_multi_worker(void *arg, int tid, int nthr) {
     if (!ds4f_mv_group_split_on() || T->n < 2) {
         for (int s = 0; s < T->n; s++) {
             ds4f_mv_task sub = { T->m, T->list[s].dst,
-                                 (const ds4f_tensor *)T->list[s].t, T->list[s].x, 0, 0 };
+                                 (const ds4f_tensor *)T->list[s].t, T->list[s].x, 0, 0,
+                                 T->xperm ? T->xperm[s] : NULL };
             ds4f_mv_worker(&sub, tid, nthr);
         }
         return;
@@ -819,7 +830,8 @@ static void ds4f_mv_multi_worker(void *arg, int tid, int nthr) {
         if (hi > lo) {
             int r0 = (int)(lo * 8), r1 = (int)(hi * 8);
             if (r1 > t->rows) r1 = t->rows;
-            ds4f_mv_task sub = { T->m, T->list[s].dst, t, T->list[s].x, r0, r1 };
+            ds4f_mv_task sub = { T->m, T->list[s].dst, t, T->list[s].x, r0, r1,
+                                 T->xperm ? T->xperm[s] : NULL };
             ds4f_mv_worker(&sub, tid, nthr);
         }
         base += blk;
@@ -841,7 +853,7 @@ static void ds4f_mv_lane_worker(void *arg, int tid, int nthr) {
     int local_tid = tid / lanes;
     int local_nthr = (nthr + lanes - 1) / lanes;
     if (lane >= lanes || T->count[lane] <= 0) return;
-    ds4f_mv_multi_task sub = { T->m, T->list[lane], T->count[lane] };
+    ds4f_mv_multi_task sub = { T->m, T->list[lane], T->count[lane], NULL };
     ds4f_mv_multi_worker(&sub, local_tid, local_nthr);
 }
 static void ds4f_matvec_multi_lanes(ds4f_model *m, ds4f_mv1 (*lists)[16],
@@ -917,8 +929,36 @@ static void ds4f_matvec_multi(ds4f_model *m, const ds4f_mv1 *list, int n) {
         const ds4f_tensor *t = list[s].t;
         m->bytes_read += ds4f_wbytes(t->type, t->rows, t->cols) + ds4f_sbytes(t->type, t->rows, t->cols);
     }
-    ds4f_mv_multi_task T = { m, list, n };
+    /* Raw MXFP4 uses an activation permutation for the on-disk nibble order.
+     * Gate/up has twelve matrices sharing s_h2; formerly every worker rebuilt
+     * the identical permutation for every matrix. Prepare it once per unique
+     * input here, outside the pool, without changing any dot-product order. */
+    const float *xperm[n > 0 ? n : 1];
+    void *owned_xperm[n > 0 ? n : 1];
+    memset(xperm, 0, (size_t)(n > 0 ? n : 1) * sizeof(*xperm));
+    int nowned_xperm = 0;
+#if !defined(__ARM_FEATURE_SVE) && defined(__AVX2__) && defined(__FMA__)
+    if (!ds4f_mxfp4_w4a8_on(m)) {
+        for (int s = 0; s < n; ++s) {
+            const ds4f_tensor *t = list[s].t;
+            if (!t || t->type != DS4F_MXFP4 || !m->mxfp4_raw) continue;
+            for (int p = 0; p < s; ++p)
+                if (list[p].x == list[s].x && list[p].t->cols == t->cols) {
+                    xperm[s] = xperm[p];
+                    break;
+                }
+            if (xperm[s]) continue;
+            float *xp = (float *)ds4f_map_alloc((size_t)t->cols * sizeof(float), 64, 0);
+            if (!xp) continue; /* worker retains its established scratch fallback */
+            ds4f_mxfp4_perm_act_f32(list[s].x, t->cols, xp);
+            xperm[s] = xp;
+            owned_xperm[nowned_xperm++] = xp;
+        }
+    }
+#endif
+    ds4f_mv_multi_task T = { m, list, n, xperm };
     ds4f_pool_run(m->pool, ds4f_mv_multi_worker, &T);
+    for (int i = 0; i < nowned_xperm; ++i) ds4f_map_free(owned_xperm[i]);
 }
 
 /* ---- block-diagonal matvec: the grouped o-proj wo_a [o_groups*glora rows, cols].

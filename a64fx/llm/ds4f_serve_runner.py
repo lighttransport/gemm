@@ -66,7 +66,7 @@ def load_lib(path):
         lib.ds4f_serve_configure_hip_prefill.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 21
         lib.ds4f_serve_configure_hip_prefill.restype = ctypes.c_int
     if hasattr(lib, "ds4f_serve_enable_cuda_balanced"):
-        lib.ds4f_serve_enable_cuda_balanced.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 3
+        lib.ds4f_serve_enable_cuda_balanced.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 4
         lib.ds4f_serve_enable_cuda_balanced.restype = ctypes.c_int
     lib.ds4f_serve_close.argtypes = [ctypes.c_void_p]
     lib.ds4f_serve_prefill.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
@@ -304,11 +304,11 @@ class Serve(object):
             return -1
         return self.lib.ds4f_serve_set_logical_ep_lanes(self._s, int(lanes))
 
-    def enable_cuda_balanced(self, device, cache_mb, first_layer):
+    def enable_cuda_balanced(self, device, cache_mb, first_layer, terms):
         if not hasattr(self.lib, "ds4f_serve_enable_cuda_balanced"):
             return -1
         return self.lib.ds4f_serve_enable_cuda_balanced(
-            self._s, int(device), int(cache_mb), int(first_layer))
+            self._s, int(device), int(cache_mb), int(first_layer), int(terms))
 
     def enable_route_telemetry(self, enabled):
         if not hasattr(self.lib, "ds4f_serve_enable_route_telemetry"):
@@ -1036,6 +1036,8 @@ def main():
                     help="hard CUDA MXFP4 cache cap; 12288 reserves 4 GiB on a 16 GiB display GPU")
     ap.add_argument("--balanced-cuda-first-layer", type=int, default=15,
                     help="first complete expert layer admitted to CUDA in balanced mode")
+    ap.add_argument("--balanced-cuda-terms", type=int, choices=(1, 2), default=2,
+                    help="MXFP4 input residual terms; 2 is the quality-oriented balanced setting")
     ap.add_argument("--balanced-cuda", type=int, choices=(0, 1), default=0,
                     help="enable experimental CUDA experts for balanced decode; default keeps the parity-safe path")
     ap.add_argument("--hip-fp8-wmma", type=int, choices=(0, 1, 2), default=2)
@@ -1224,7 +1226,8 @@ def main():
     if args.decode_mode == "balanced" and args.balanced_cuda:
         admitted = sess.enable_cuda_balanced(args.balanced_cuda_device,
                                               args.balanced_cuda_cache_mb,
-                                              args.balanced_cuda_first_layer)
+                                              args.balanced_cuda_first_layer,
+                                              args.balanced_cuda_terms)
         if admitted <= 0:
             print("[runner] balanced CUDA unavailable; retaining exact CPU expert fallback",
                   file=sys.stderr, flush=True)

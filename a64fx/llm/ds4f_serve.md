@@ -55,7 +55,8 @@ expert staging; `--decode-mode fast` enables fused QKV, GPU attention/O-proj,
 resident KV, Tier-B2 GPU projections, and W4A8 experts.  The experimental
 two-GPU routed-expert candidate is enabled only with `--balanced-cuda 1`; it
 caps CUDA expert cache allocation at 12288 MiB and dynamically preserves a
-4 GiB display reserve.  It is not a qualified balanced path: the current
+4 GiB display reserve.  It defaults to two MXFP4 activation residual terms
+(`--balanced-cuda-terms 2`) to prioritize accuracy. It is not a qualified balanced path: the current
 MMQ activation-quantized CUDA kernel diverges on the greedy rollout and is
 slower than safe.  Fast and CUDA experiments must not be promoted until the
 decode gate reports minimum logit cosine `>= 0.999` across a warmed

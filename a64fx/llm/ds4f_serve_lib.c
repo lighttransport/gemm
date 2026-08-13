@@ -107,7 +107,8 @@ int ds4f_serve_cache_hot_experts(ds4f_serve *s, int cache_mb,
  * CUDA ownership is deliberately all-or-nothing per layer; a missed preload
  * leaves the layer on the exact CPU path. */
 int ds4f_serve_enable_cuda_balanced(ds4f_serve *s, int cuda_device,
-                                    int cuda_cache_mb, int first_layer) {
+                                    int cuda_cache_mb, int first_layer,
+                                    int cuda_terms) {
 #if defined(DS4F_SERVE_HIP)
     if (!s || !s->m || !s->hip || s->dual || cuda_cache_mb < 1) return -1;
     ds4f_model *m = s->m;
@@ -117,6 +118,9 @@ int ds4f_serve_enable_cuda_balanced(ds4f_serve *s, int cuda_device,
                                                  cuda_cache_mb);
     if (!s->dual) return -1;
     dual_ds4f_prefill_set_cuda_mxfp4(s->dual, 1);
+    /* Two residual terms substantially reduce input-MXFP4 error.  Balanced
+     * mode is deliberately accuracy-first; it remains promotion-gated. */
+    dual_ds4f_prefill_set_cuda_terms(s->dual, cuda_terms >= 2 ? 2 : 1);
     dual_ds4f_prefill_set_cuda_no_evict(s->dual, 1);
     dual_ds4f_prefill_set_cuda_small_buckets(s->dual, 1);
     dual_ds4f_prefill_set_max_batch(s->dual, 1);
@@ -158,6 +162,7 @@ int ds4f_serve_enable_cuda_balanced(ds4f_serve *s, int cuda_device,
     return admitted;
 #else
     (void)s; (void)cuda_device; (void)cuda_cache_mb; (void)first_layer;
+    (void)cuda_terms;
     return -1;
 #endif
 }
