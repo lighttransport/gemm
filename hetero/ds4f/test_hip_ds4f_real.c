@@ -752,7 +752,9 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
                        cpu_tok[mm], gpu_tok[mm], a[cb], b[cb], b[gb], a[gb]);
             }
             double kl, ce_r, ce_g; int top10;
-            report_distribution_metrics(a, b, hrows, cpu_tok[mm] - m->head_r0,
+            int target = cpu_tok[mm] - m->head_r0;
+            if (target < 0 || target >= hrows) target = 0;
+            report_distribution_metrics(a, b, hrows, target,
                                         &kl, &ce_r, &ce_g, &top10);
             sum_kl += kl; sum_ce_ref += ce_r; sum_ce_gpu += ce_g; sum_top10 += top10;
             kls[mm] = (float)kl;
