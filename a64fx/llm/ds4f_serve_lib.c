@@ -416,6 +416,15 @@ static ds4f_serve *ds4f_serve_open_ep(const char *stage_dir, int use_hip, int hi
         if (err && err_cap) snprintf(err, err_cap, "ds4f_serve_open: ds4f_load_real_opts failed");
         return NULL;
     }
+    /* The checkpoint's hash-routing table always retains its native row
+     * stride. The opt-in fast profile may consume only the first N routes;
+     * all buffers were allocated at the native width, so shrinking the live
+     * count after load is safe and leaves the exact default untouched. */
+    m->route_n_active = m->cfg.n_active;
+    int expert_active = env_i("DS4F_EXPERT_ACTIVE", m->cfg.n_active);
+    if (expert_active < 2) expert_active = 2;
+    if (expert_active > m->route_n_active) expert_active = m->route_n_active;
+    m->cfg.n_active = expert_active;
     if (m->emb_rows != m->cfg.vocab || m->head.rows != m->cfg.vocab) {
         if (err && err_cap) snprintf(err, err_cap,
             "ds4f_serve_open: single-node serve needs replicated embed/head");
@@ -469,10 +478,11 @@ static ds4f_serve *ds4f_serve_open_ep(const char *stage_dir, int use_hip, int hi
      * unsupported dtype combinations), so reporting the requested value is
      * not enough. */
     fprintf(stderr, "[serve] forward: exact=%d mhc=%d tierb2=%d sparse=%d mtp=%d "
-            "mxfp4_raw=%d w4a8=%d group_split=%d int8_kv=%d int8_cmp=%d "
+            "mxfp4_raw=%d w4a8=%d group_split=%d active=%d/%d int8_kv=%d int8_cmp=%d "
             "max_pos=%d threads=%d spec=%d\n",
             m->exact, m->mhc, m->tierb2, m->sparse, m->has_mtp,
             m->mxfp4_raw, m->mxfp4_w4a8, ds4f_mv_group_split_on(),
+            m->cfg.n_active, m->route_n_active,
             m->int8_kv, m->int8_cmp, m->cfg.max_pos,
             threads > 0 ? threads : 16, s->speculative_tokens);
     if (err && err_cap) snprintf(err, err_cap, "ok");

@@ -5832,7 +5832,8 @@ static void ds4f_select_experts(ds4f_model *m, const ds4f_layer *ly,
         fprintf(stderr, "ds4f: hash-routing token id %d outside vocab\n", token);
         abort();
     }
-    const int32_t *route = ly->gate_tid2eid + (size_t)token * c->n_active;
+    int route_stride = m->route_n_active > 0 ? m->route_n_active : c->n_active;
+    const int32_t *route = ly->gate_tid2eid + (size_t)token * route_stride;
     float sum = 0.0f;
     for (int k = 0; k < c->n_active; ++k) {
         int e = route[k];

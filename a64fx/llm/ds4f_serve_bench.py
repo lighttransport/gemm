@@ -23,9 +23,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage-dir", default=os.environ.get("DS4F_STAGE_DIR", "/tmp/ds4f_single"))
     ap.add_argument("--tokenizer", default="/mnt/disk1/models/ds4f-0731/tokenizer.json")
-    ap.add_argument("--prompt-tokens", type=int, default=4096)
-    ap.add_argument("--warm-decode", type=int, default=32)
-    ap.add_argument("--decode-tokens", type=int, default=256)
+    ap.add_argument("--prompt-tokens", type=int, default=1024)
+    ap.add_argument("--warm-decode", type=int, default=16)
+    ap.add_argument("--decode-tokens", type=int, default=64)
     ap.add_argument("--speculative-tokens", type=int, default=0,
                     help="enable greedy DSpark blocks (checkpoint maximum: 5)")
     ap.add_argument("--threads", type=int, default=16)
@@ -41,10 +41,11 @@ def main():
     ap.add_argument("--hip-block-threads", type=int, choices=(64, 128, 256), default=64)
     ap.add_argument("--hip-fp8-wmma", type=int, choices=(0, 1, 2), default=2)
     ap.add_argument("--hip-decode-attn-oproj", type=int, choices=(0, 1), default=0)
-    ap.add_argument("--hip-tb2-batch", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--hip-tb2-batch", type=int, choices=(0, 1), default=1,
+                    help="batch exact Tier-B2 window partials (production default: 1)")
     ap.add_argument("--hip-attn-hybrid", type=int, choices=(0, 1), default=0,
                     help="exact GPU window + CPU compressed Tier-B2 attention")
-    ap.add_argument("--hip-attn-cmp-fast", type=int, choices=(0, 1), default=0,
+    ap.add_argument("--hip-attn-cmp-fast", type=int, choices=(0, 1), default=1,
                     help="AVX2/FMA compressed-attention dot path (parity-gated)")
     ap.add_argument("--hip-expert-stream", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-expert-pinned-staging", type=int, choices=(0, 1), default=0)
@@ -56,8 +57,21 @@ def main():
     ap.add_argument("--adaptive-cache-mb", type=int, default=-1)
     ap.add_argument("--adaptive-cache-reserve-mb", type=int, default=1536)
     ap.add_argument("--logical-ep-lanes", type=int, default=0)
+    ap.add_argument("--mxfp4-w4a8", type=int, choices=(0, 1), default=0,
+                    help="quantize routed-expert activations (changes greedy output)")
+    ap.add_argument("--hip-tb2-decode", type=int, choices=(0, 1), default=0,
+                    help="run decode Tier-B2 projections on the resident GPU bank")
+    ap.add_argument("--expert-active", type=int, choices=range(2, 7), default=6,
+                    help="opt-in routed expert count (native default: 6)")
     ap.add_argument("--cpu-only", action="store_true")
     args = ap.parse_args()
+
+    # Match the production runner's explicit argument contract.  The library
+    # consumes these settings while loading/attaching the model, so translate
+    # them before load_lib/Serve rather than relying on caller-set diagnostics.
+    os.environ["DS4F_MXFP4_W4A8"] = str(args.mxfp4_w4a8)
+    os.environ["DS4F_TB2_GPU"] = str(args.hip_tb2_decode)
+    os.environ["DS4F_EXPERT_ACTIVE"] = str(args.expert_active)
 
     tokenizer = DS4FTokenizer(args.tokenizer)
     unit = tokenizer.encode(DEFAULT_TEXT, add_bos=True)
@@ -82,11 +96,25 @@ def main():
                  args.ep_rank, args.ep_size)
     greedy = Sampling(0.0, 1.0, 1, 0.0, 1.0, 1)
     try:
+        print("benchmark config: prompt=%d warm=%d decode=%d threads=%d "
+              "w4a8=%d tb2_decode=%d tb2_batch=%d expert_active=%d "
+              "expert_cache_mb=%d" %
+              (args.prompt_tokens, args.warm_decode, args.decode_tokens,
+               args.threads, args.mxfp4_w4a8, args.hip_tb2_decode,
+               args.hip_tb2_batch, args.expert_active,
+               args.hip_expert_cache_mb), flush=True)
         if args.logical_ep_lanes and sess.set_logical_ep_lanes(args.logical_ep_lanes) != 0:
             raise RuntimeError("logical EP lane setup failed")
         if (args.hip_expert_cache_mb or args.adaptive_cache_period) and \
                 sess.enable_route_telemetry(True) != 0:
             raise RuntimeError("route telemetry is unavailable")
+        # These affect prompt ingestion too. Configure them before the timed
+        # prefill; doing it afterward silently benchmarked the scalar path and
+        # only changed decode.
+        if args.hip_attn_hybrid and sess.set_attn_hybrid(1) != 0:
+            raise RuntimeError("exact attention hybrid is unavailable")
+        if args.hip_attn_cmp_fast and sess.set_attn_cmp_fast(1) != 0:
+            raise RuntimeError("fast compressed attention is unavailable")
         t0 = time.perf_counter()
         if sess.prefill(prompt, 0) != 0:
             raise RuntimeError("prefill failed")
@@ -102,10 +130,6 @@ def main():
                                        args.adaptive_cache_mb,
                                        args.adaptive_cache_reserve_mb) != 0:
                 raise RuntimeError("adaptive expert cache is unavailable")
-        if args.hip_attn_hybrid and sess.set_attn_hybrid(1) != 0:
-            raise RuntimeError("exact attention hybrid is unavailable")
-        if args.hip_attn_cmp_fast and sess.set_attn_cmp_fast(1) != 0:
-            raise RuntimeError("fast compressed attention is unavailable")
         pos = len(prompt)
         warmed = 0
         while warmed < args.warm_decode:

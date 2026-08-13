@@ -7,6 +7,35 @@ file, including the old "40 prompt tok/s / 9 decode tok/s acceptance reference"
 
 Last updated 2026-08-13, at commit `1a1a4690` (branch `ds4f`, unpushed).
 
+## 2026-08-13 target audit (post-handoff)
+
+The in-process benchmark now defaults to the agreed acceptance protocol
+(`1024` prompt, `16` warm decode, `64` measured decode), matches production's
+`--hip-tb2-batch 1` and `--hip-attn-cmp-fast 1` defaults, and exposes W4A8 and
+GPU Tier-B2 as explicit arguments instead of caller-set environment state.
+
+Production-aligned fast-profile measurements, no expert cache:
+
+| active experts | prefill tok/s | decode tok/s | observation |
+|---:|---:|---:|---|
+| 6 (native) | 14.73 | 4.82 | coherent baseline |
+| 5 | 16.38 | 5.16 | coherent sample, output-changing; full recall eval pending |
+| 2 | 21.15 | 6.28 | severe repetitive degeneration; rejected |
+
+This falsifies expert-count reduction as a route to the requested 40/12 on
+this host: removing two thirds of routed expert work still reaches only
+21.15/6.28 and already destroys output quality. A Q2 expert transcode cannot
+close the remaining 1.9x prefill / 1.9x decode gaps either; it reduces only
+the expert fraction and would require a new 70--100 GB execution format across
+all CPU/GPU GEMM paths. Do not build that format under the claim that it can
+meet 40/12. The targets require another accelerator/expert-parallel rank or a
+materially different model-quality budget (for example layer skipping).
+
+`--expert-active 2..6` is retained as an explicit, default-6 experimental
+quality/performance control. Hash-routed layers keep the checkpoint's native
+six-entry row stride and consume only the requested prefix, renormalized to
+the original routed mass. Exact defaults are unchanged.
+
 ---
 
 ## Resuming prompt

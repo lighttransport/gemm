@@ -271,6 +271,15 @@ existing fused EP1 dispatch, so it remains diagnostic rather than a production
 default; on this single CPU, six active experts do not amortize eight lane
 barriers.
 
+`--expert-active N` (2 through 6, default 6) is an experimental fast-profile
+quality knob. It truncates each routed top-6 selection to its first N experts
+and renormalizes their weights; hash-routing tables retain their native
+six-entry storage stride. Values below 6 change model output and remain
+default-off behavior. On the full EP1 Threadripper/RX 9070 XT acceptance run,
+N=5 measured 16.38 prefill / 5.16 decode tok/s, while N=2 measured 21.15 /
+6.28 but produced severe repetitive degeneration. It is not a path to the
+40/12 targets on this host.
+
 `--hip-expert-pinned-staging 1` is an explicit diagnostic alternative to the
 rolling registration path. It coalesces each layer into two pinned host slabs
 before DMA, but is disabled by default: on this 188 GiB host the two staging

@@ -524,6 +524,7 @@ typedef int (*ds4f_gpu_prefill_qkv_fn)(void *ctx, float *q, float *kv,
 
 typedef struct {
     ds4f_config cfg;
+    int route_n_active; /* checkpoint tid2eid row stride before fast-profile truncation */
     int ep_rank, ep_size;
     ds4f_mem_pool *mem;                       /* owns all model-side allocations */
     ds4f_layer *layers;
