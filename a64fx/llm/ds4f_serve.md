@@ -43,6 +43,7 @@ python3 a64fx/llm/ds4f_serve_runner.py --daemon
 # python3 a64fx/llm/ds4f_serve_runner.py --fast-prefill --daemon
 # Or use the quality-oriented middle mode (GPU GEMMs, CPU attention):
 # python3 a64fx/llm/ds4f_serve_runner.py --balanced-prefill --daemon
+# Balanced mode also enables ordered FP8 reductions for closer CPU agreement.
 
 # terminal 2: the OpenAI frontend
 TOK=/mnt/disk1/models/ds4f-0731/tokenizer.json \

@@ -1091,6 +1091,9 @@ def main():
         args.hip_qkv_device_chain = 0
         args.hip_attn_device_chain = 0
         args.hip_attn_no_d2h = 0
+        # Ordered FP8 accumulation matches the CPU reduction order more
+        # closely than the fastest WMMA reduction, while retaining GPU GEMM.
+        os.environ.setdefault("DS4F_HIP_ORDERED_FP8_LAYERS", "43")
         os.environ["DS4F_HIP_EXACT_PREFILL"] = "0"
     else:
         os.environ["DS4F_HIP_EXACT_PREFILL"] = "0" if args.fast_prefill else "1"
