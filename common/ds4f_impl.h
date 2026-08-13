@@ -1309,7 +1309,11 @@ static void ds4f_gemm_worker_x86(void *arg, int tid, int nthr) {
         static int dequant_tile_on = -1;
         if (dequant_tile_on < 0) {
             const char *e = getenv("DS4F_MXFP4_DEQUANT_TILE");
-            dequant_tile_on = !(e && *e && atoi(e) == 0);
+            /* Keep the historical accumulation order by default. The tile
+             * path is exact in representation but reassociates the dot; it
+             * is enabled explicitly for performance measurements until a
+             * full-model greedy parity gate has been run. */
+            dequant_tile_on = e && *e && atoi(e) != 0;
         }
         if (M >= 4 && !ds4f_mxfp4_w4a8_on(T->m) && !(M >= 8 && dequant_tile_on)) {
             float *xp = (float *)T->mx_xp;
