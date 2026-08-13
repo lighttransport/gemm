@@ -92,6 +92,54 @@ static float max_rel_error(const float *a, const float *b, int n, float *max_abs
     return rel;
 }
 
+static int cmp_float_asc(const void *pa, const void *pb) {
+    float a = *(const float *)pa, b = *(const float *)pb;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/* Distribution-level comparison for a reference/GPU logit pair. Log-sum-exp
+ * keeps the metrics stable even when logits have large magnitudes. The target
+ * is the reference argmax here because this synthetic prefill probe has no
+ * teacher-forced token labels; real-token gates can pass actual labels later. */
+static void report_distribution_metrics(const float *ref, const float *got,
+                                         int n, int ref_tok, double *kl_out,
+                                         double *ce_ref_out, double *ce_got_out,
+                                         int *top10_out) {
+    float mr = ref[0], mg = got[0];
+    for (int i = 0; i < n; ++i) {
+        if (ref[i] > mr) mr = ref[i];
+        if (got[i] > mg) mg = got[i];
+    }
+    double sr = 0.0, sg = 0.0;
+    for (int i = 0; i < n; ++i) { sr += exp((double)ref[i] - mr); sg += exp((double)got[i] - mg); }
+    double kl = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double pr = exp((double)ref[i] - mr) / sr;
+        double pg = exp((double)got[i] - mg) / sg;
+        if (pr > 0.0 && pg > 0.0) kl += pr * log(pr / pg);
+    }
+    int k = 10, top = 0;
+    int *ri = (int *)malloc((size_t)k * sizeof(*ri));
+    int *gi = (int *)malloc((size_t)k * sizeof(*gi));
+    for (int j = 0; j < k; ++j) { ri[j] = gi[j] = -1; }
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < k; ++j) if (ri[j] < 0 || ref[i] > ref[ri[j]]) {
+            for (int z = k - 1; z > j; --z) ri[z] = ri[z-1];
+            ri[j] = i; break;
+        }
+        for (int j = 0; j < k; ++j) if (gi[j] < 0 || got[i] > got[gi[j]]) {
+            for (int z = k - 1; z > j; --z) gi[z] = gi[z-1];
+            gi[j] = i; break;
+        }
+    }
+    for (int i = 0; i < k; ++i) for (int j = 0; j < k; ++j) if (ri[i] == gi[j]) top++;
+    double prt = exp((double)ref[ref_tok] - mr) / sr;
+    double pgt = exp((double)got[ref_tok] - mg) / sg;
+    *kl_out = kl; *ce_ref_out = -log(fmax(prt, 1e-30)); *ce_got_out = -log(fmax(pgt, 1e-30));
+    *top10_out = top;
+    free(ri); free(gi);
+}
+
 static int check_mxfp4_gemm(ds4f_model *m, hip_ds4f_dense *hip, int widened) {
     if (!m || !m->mxfp4_raw || !m->layers[0].ex_w1 ||
         m->layers[0].ex_w1[0].type != DS4F_MXFP4) {
@@ -683,6 +731,9 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
     putchar('\n');
     if (diag) {
         float max_abs = 0.0f, max_rel = 0.0f;
+        double sum_kl = 0.0, sum_ce_ref = 0.0, sum_ce_gpu = 0.0;
+        double sum_sq = 0.0, sum_dot = 0.0, sum_nr = 0.0, sum_ng = 0.0;
+        int sum_top10 = 0; float *kls = (float *)malloc((size_t)batch * sizeof(*kls));
         for (int mm = 0; mm < batch; mm++) {
             const float *a = cpu_logits + (size_t)mm * hrows;
             const float *b = m->p_logits + (size_t)mm * hrows;
@@ -700,9 +751,31 @@ static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
                        "gpu_logit=%.8g cpu_at_gpu=%.8g\n", mm,
                        cpu_tok[mm], gpu_tok[mm], a[cb], b[cb], b[gb], a[gb]);
             }
+            double kl, ce_r, ce_g; int top10;
+            report_distribution_metrics(a, b, hrows, cpu_tok[mm] - m->head_r0,
+                                        &kl, &ce_r, &ce_g, &top10);
+            sum_kl += kl; sum_ce_ref += ce_r; sum_ce_gpu += ce_g; sum_top10 += top10;
+            kls[mm] = (float)kl;
+            double ar=0, ag=0, dot=0;
+            for (int v=0; v<hrows; ++v) {
+                double da = (double)a[v] - b[v];
+                sum_sq += da * da;
+                ar += (double)a[v]*a[v]; ag += (double)b[v]*b[v]; dot += (double)a[v]*b[v];
+            }
+            sum_nr += ar; sum_ng += ag; sum_dot += dot;
         }
         printf("real hybrid prefill logits: max_abs=%.8g max_rel=%.8g\n",
                max_abs, max_rel);
+        qsort(kls, (size_t)batch, sizeof(*kls), cmp_float_asc);
+        float p95 = kls[(int)(0.95 * (batch - 1))];
+        printf("real hybrid prefill quality: rmse=%.8g cosine=%.8g "
+               "mean_kl=%.8g p95_kl=%.8g refargmax_ce=%.8g gpu_ce=%.8g "
+               "top10_overlap=%.2f/10\n",
+               sqrt(sum_sq / fmax(1.0, (double)batch * hrows)),
+               sum_dot / sqrt(fmax(1e-30, sum_nr * sum_ng)),
+               sum_kl / batch, p95, sum_ce_ref / batch, sum_ce_gpu / batch,
+               (double)sum_top10 / batch);
+        free(kls);
     }
     const char *prof = getenv("DS4F_PROF");
     if (prof && atoi(prof) != 0) {
