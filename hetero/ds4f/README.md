@@ -1118,6 +1118,12 @@ python3 ../../a64fx/llm/tools/ds4f_tokenizer.py decode \
 
 `DS4F_MXFP4_W4A8=0` selects the exact-f32 expert kernel instead of W4A8.
 
+For prefill throughput experiments, `DS4F_MXFP4_DEQUANT_TILE=1` enables the
+llama.cpp-style grouped expert schedule: each 8-row MXFP4 tile is decoded once
+and reused across the routed token bucket. It keeps f32 activations and exact
+MXFP4 values, but changes dot-product reassociation; it is therefore off by
+default pending a full-model greedy parity check.
+
 The native x86 OpenAI server adapter is an opt-in CMake feature. It loads the
 same staged no-copy model, invokes the stdlib-only tokenizer as a child
 process, serves `/v1/completions` and `/v1/chat/completions` with greedy or
