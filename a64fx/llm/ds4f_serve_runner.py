@@ -1035,15 +1035,15 @@ def main():
     ap.add_argument("--decode-batch-size", type=int, default=1)
     ap.add_argument("--threads", type=int, default=None,
                     help="model thread pool size (default: LLM_THREADS, else 16)")
-    ap.add_argument("--mv-group-split", type=int, choices=(0, 1), default=1,
+    ap.add_argument("--mv-group-split", type=int, choices=(0, 1), default=None,
                     help="split a fused matvec group's concatenated row space "
                          "across the pool instead of slicing every matrix "
                          "(bit-exact; measured +26%% decode with --mxfp4-w4a8 1)")
-    ap.add_argument("--hip-tb2-decode", type=int, choices=(0, 1), default=0,
+    ap.add_argument("--hip-tb2-decode", type=int, choices=(0, 1), default=None,
                     help="run the decode Tier-B2 compressor and indexer "
                          "q-projections on the GPU dense bank (their weights "
                          "are already resident there for prefill)")
-    ap.add_argument("--mxfp4-w4a8", type=int, choices=(0, 1), default=0,
+    ap.add_argument("--mxfp4-w4a8", type=int, choices=(0, 1), default=None,
                     help="quantize routed-expert activations to int8 per 32-element "
                          "block (weights stay exact MXFP4). Much faster, but it "
                          "CHANGES greedy output; default 0 keeps token parity")
@@ -1061,14 +1061,20 @@ def main():
     if args.daemon:
         daemonize()
     # Forward-path tuning reaches the C library through its documented
-    # environment names, but the runner argument is the source of truth so the
-    # deployment is reproducible from the command line (AGENTS.md).  These are
-    # read at model load / first matvec, so they must be set before load_lib.
-    os.environ["DS4F_MV_GROUP_SPLIT"] = str(args.mv_group_split)
-    os.environ["DS4F_MXFP4_W4A8"] = str(args.mxfp4_w4a8)
-    os.environ["DS4F_TB2_GPU"] = str(args.hip_tb2_decode)
-    if args.threads is not None:
-        os.environ["LLM_THREADS"] = str(args.threads)
+    # environment names, and passing it as a runner argument keeps a deployment
+    # reproducible from the command line (AGENTS.md).  These are read at model
+    # load / first matvec, so they must be set before load_lib.
+    #
+    # Only override when the flag was actually given: assigning the argparse
+    # default unconditionally silently clobbers an operator's environment and
+    # makes env-based A/B a no-op.  The library's own defaults are group split
+    # on, W4A8 off, GPU tb2 off.
+    for flag, var in ((args.mv_group_split, "DS4F_MV_GROUP_SPLIT"),
+                      (args.mxfp4_w4a8, "DS4F_MXFP4_W4A8"),
+                      (args.hip_tb2_decode, "DS4F_TB2_GPU"),
+                      (args.threads, "LLM_THREADS")):
+        if flag is not None:
+            os.environ[var] = str(flag)
     base = os.environ.get("DS4F_SERVE_BASE", "/tmp/ds4f_serve")
     stage = os.environ.get("DS4F_STAGE_DIR")
     if not stage:

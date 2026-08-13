@@ -486,3 +486,76 @@ The bit-exact default path gains little on its own: the group split needs W4A8
 to pay (the f32 expert kernel is dequant-bound, not bandwidth-bound), and the
 tb2 AVX2 fix is worth a few percent. Both flags that carry the real speedup
 change greedy tokens and are off by default.
+
+### 2026-08-13 — Phase 2 (batched speculative verification): NEGATIVE, do not retry
+
+The plan's primary lever was to replace the sequential verifier in
+`ds4f_serve_speculate` (one full `ds4f_forward_token` per COMMITTED token, so
+speculation cannot win) with one batched M=K forward, amortising the routed
+expert weight stream over the block.
+
+The machinery already existed: `ds4f_forward_verify` is documented as "M2b
+BATCHED VERIFY", returns `out_tok[K]` per-position argmax, exposes per-position
+logits in `m->p_logits`, and emits mid-verify Tier-B2 snapshots (slot j = ring
+state after position pos0+j) explicitly so a partial accept can be restored
+without a redo. The main-model and DSpark KV rings index by absolute position,
+so rejected positions are overwritten rather than needing rollback.
+
+It was wired up and measured (W4A8 + group split + GPU tb2, 1024-token prompt):
+
+| verifier | decode tok/s | accepted/block | of drafted |
+|---|---:|---:|---:|
+| speculation off | **5.535** | - | - |
+| sequential, K=4 | 4.343 | 3.20 | 84.2% |
+| batched, K=4 | 2.626 | 2.11 | 53.3% |
+| batched, K=5 | 2.901 | 2.35 | 50.3% |
+
+**Why it cannot work here.** A K=4 block costs **193 ms per verified position**
+against **181 ms for a standalone M=1 forward** -- batching four positions costs
+the same as four independent forwards. There is *no* expert amortisation,
+because with top-6 of 256 experts the tokens in a block select a nearly disjoint
+expert set (union ~6K, not ~6), so every routed-expert bucket holds exactly one
+token. This is the same effect `hetero/ds4f/README.md` records for prefill at
+batch 64 ("~1-2 tokens/expert, bucket M=1-2, per-token decode").
+
+With verify cost linear in K, committed tokens <= K means speculation is bounded
+by one forward per token -- the plain-decode cost -- and pays the drafter on top.
+At the observed block cost, even a *perfect* 4.00 accepted/block only reaches
+5.54 tok/s, exactly the no-speculation baseline.
+
+The batched implementation was also **incorrect** -- it dropped tokens
+("ZEPHYR-4417" -> "ZEPHYR-447", "Dr. Okonkwo" -> "Dr. Onkwo") and acceptance
+decayed across blocks, so the snapshot restore does not fully undo a partial
+accept. It was **removed** rather than shipped behind a default-off flag: fixing
+it could not change the conclusion above, and a latent-broken path is a trap.
+
+What was kept: **acceptance telemetry** (`speculate blocks= drafted= committed=
+accepted=`, printed at close). It is what proves the sequential verifier is a
+net loss, and it should be checked before anyone re-opens this.
+
+**Recommendation: leave `--speculative-tokens` at 0.** Speculative decode on
+this model needs either sublinear verify cost (impossible at top-6-of-256
+without expert-bucket sharing) or a drastically cheaper drafter.
+
+#### Correction to the quality gates recorded above
+
+The runner change that routes `--mv-group-split` / `--mxfp4-w4a8` /
+`--hip-tb2-decode` into the library's environment variables was writing the
+**argparse default unconditionally**, so it clobbered any operator-set env and
+made env-based A/B a silent no-op. Several capture runs above therefore ran a
+different configuration than their label says. Fixed: those flags now default to
+`None` and only override the environment when actually passed.
+
+Re-verified after the fix, and what still stands:
+
+- greedy decode **is deterministic** run to run (two identical runs byte-identical,
+  even though prompt-hot expert admission differed, 487 vs 514 bundles);
+- group-split dispatch is **bit-exact** (two independent comparisons, identical);
+- the tb2 AVX2 fix is **greedy-identical**;
+- `--mxfp4-w4a8 1` **changes** greedy output (both sides env-respecting);
+- `--hip-tb2-decode 1` **changes** greedy output -- re-tested cleanly with
+  explicit arguments after the fix, and it still differs.
+
+The one claim that was an artifact: the earlier remark that W4A8's output "moved
+onto the exact path" after the tb2 AVX2 change compared two runs that were both
+in fact W4A8-off. Disregard it; the W4A8 divergence itself is real.

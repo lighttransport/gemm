@@ -165,6 +165,10 @@ int ds4f_serve_set_logical_ep_lanes(ds4f_serve *s, int lanes) {
 
 static int env_i(const char *k, int d) { const char *e = getenv(k); return e && *e ? atoi(e) : d; }
 
+/* Acceptance telemetry: without it there is no way to tell a speculation win
+ * from a drafting loss. */
+static long ds4f_spec_blocks = 0, ds4f_spec_drafted = 0, ds4f_spec_committed = 0;
+
 #if defined(DS4F_SERVE_HIP)
 /* Speculative verification calls the exact token kernel directly, so it must
  * share the ordinary decode path's adaptive-cache bookkeeping explicitly. */
@@ -494,6 +498,12 @@ ds4f_serve *ds4f_serve_open(const char *stage_dir, int use_hip, int hip_device,
 
 void ds4f_serve_close(ds4f_serve *s) {
     if (!s) return;
+    if (ds4f_spec_blocks)
+        fprintf(stderr, "  speculate blocks=%ld drafted=%ld committed=%ld "
+                "accepted=%.2f tokens/block (%.1f%% of drafted)\n",
+                ds4f_spec_blocks, ds4f_spec_drafted, ds4f_spec_committed,
+                (double)ds4f_spec_committed / ds4f_spec_blocks,
+                100.0 * ds4f_spec_committed / (double)ds4f_spec_drafted);
     if (ds4f_expbw_on() && ds4f_expbw_s > 0.0)
         fprintf(stderr, "  expert_bw %.3f GB in %.3f s = %.1f GB/s "
                 "(%llu CPU experts, %.2f ms per expert)\n",
@@ -660,11 +670,11 @@ int ds4f_serve_speculate(ds4f_serve *s, int anchor, int pos, int max_tokens,
     if (ds4f_dspark_predict_block(s->m,anchor,pos,K,draft,draft_conf)!=K) {
         free(draft); free(draft_conf); return -1;
     }
+    int matched=0,committed=0;
     /* Use the ordinary token kernel as the verifier.  Unlike the batched
      * prefill GEMM it has exactly the same accumulation order as baseline
      * greedy decode. Stop immediately at the first rejected proposal, so no
      * main-model KV or Tier-B2 rollback is required. */
-    int matched=0,committed=0;
     for (int k=0;k<K;k++) {
         int id=k ? draft[k-1]:anchor;
         if (embed_lookup(s->m,id,s->x)!=0) { free(draft); free(draft_conf); return -1; }
@@ -688,6 +698,7 @@ int ds4f_serve_speculate(ds4f_serve *s, int anchor, int pos, int max_tokens,
     }
     memcpy(s->logits,s->m->s_logits,(size_t)s->vocab*sizeof(float));
     for (int k=0;k<committed;k++) s->hist[s->n_hist++]=out_tokens[k];
+    ds4f_spec_blocks++; ds4f_spec_drafted += K; ds4f_spec_committed += committed;
 #if defined(DS4F_SERVE_HIP)
     ds4f_serve_adaptive_cache_tick(s, committed);
 #endif
