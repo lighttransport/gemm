@@ -1306,7 +1306,12 @@ static void ds4f_gemm_worker_x86(void *arg, int tid, int nthr) {
          * the token loop so each weight block's nibble decode is shared by
          * four tokens instead of repeated M times.  Per-token results are
          * bit-identical to the token-at-a-time path below. */
-        if (M >= 4 && !ds4f_mxfp4_w4a8_on(T->m)) {
+        static int dequant_tile_on = -1;
+        if (dequant_tile_on < 0) {
+            const char *e = getenv("DS4F_MXFP4_DEQUANT_TILE");
+            dequant_tile_on = !(e && *e && atoi(e) == 0);
+        }
+        if (M >= 4 && !ds4f_mxfp4_w4a8_on(T->m) && !(M >= 8 && dequant_tile_on)) {
             float *xp = (float *)T->mx_xp;
             if (!xp) xp = ds4f_mxfp4_xperm_n(K, M);
             if (xp) {
@@ -1337,12 +1342,7 @@ static void ds4f_gemm_worker_x86(void *arg, int tid, int nthr) {
          * it across all routed tokens. This mirrors llama.cpp's mul_mat_id
          * scheduling while retaining f32 activations (W4A8 remains opt-in). */
         if (M >= 8 && !ds4f_mxfp4_w4a8_on(T->m)) {
-            static int tile_on = -1;
-            if (tile_on < 0) {
-                const char *e = getenv("DS4F_MXFP4_DEQUANT_TILE");
-                tile_on = !(e && *e && atoi(e) == 0);
-            }
-            if (tile_on) {
+            if (dequant_tile_on) {
                 float *tile = (float *)_mm_malloc((size_t)8 * (size_t)K * sizeof(float), 64);
                 if (tile) {
                     for (int i = r0; i + 7 < r1; i += 8) {
