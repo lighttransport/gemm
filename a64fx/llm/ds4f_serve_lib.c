@@ -317,7 +317,8 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
     int routed_ffn, int fp8_wmma, int bf16_wmma, int attn_wmma,
     int oproj_group_wmma, int mxfp4_wmma, int expert_stream,
     int block_threads, int expert_pinned_staging, int tb2_batch,
-    int decode_routed_ffn, int decode_qkv_fuse, int decode_attn_oproj) {
+    int decode_routed_ffn, int decode_qkv_fuse, int decode_attn_oproj,
+    int decode_kv_resident) {
     if (!s || !s->m || !s->hip) return -1;
     ds4f_model *m = s->m;
     if (!enabled) {
@@ -380,6 +381,7 @@ int ds4f_serve_configure_hip_prefill(ds4f_serve *s, int enabled,
      * round trip per projection. */
     m->gpu_decode_qkv_enabled = decode_qkv_fuse != 0;
     m->gpu_decode_attn_oproj_enabled = decode_attn_oproj != 0;
+    hip_ds4f_dense_set_decode_features(s->hip, decode_kv_resident != 0);
     /* Exact mHC/Tier-B2 routed execution stages only the selected experts in
      * hip_ds4f_dense_routed_ffn.  Whole-layer streaming would upload roughly
      * 3 GB per layer before the router has even selected six experts. */

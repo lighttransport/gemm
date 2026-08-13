@@ -63,7 +63,7 @@ def load_lib(path):
             ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_float)]
         lib.ds4f_serve_speculate.restype = ctypes.c_int
     if hasattr(lib, "ds4f_serve_configure_hip_prefill"):
-        lib.ds4f_serve_configure_hip_prefill.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 20
+        lib.ds4f_serve_configure_hip_prefill.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 21
         lib.ds4f_serve_configure_hip_prefill.restype = ctypes.c_int
     lib.ds4f_serve_close.argtypes = [ctypes.c_void_p]
     lib.ds4f_serve_prefill.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
@@ -1016,6 +1016,11 @@ def main():
                     help="use the fused single-upload QKV stage at M=1 decode")
     ap.add_argument("--hip-decode-attn-oproj", type=int, choices=(0, 1), default=0,
                     help="use the grouped device o-projection at M=1 decode")
+    ap.add_argument("--hip-decode-kv-resident", type=int, choices=(0, 1), default=0,
+                    help="keep decode KV on the GPU; fast-mode only until its cosine gate passes")
+    ap.add_argument("--decode-mode", choices=("safe", "balanced", "fast"), default="safe",
+                    help="safe: token-parity baseline; balanced: quality-gated Tier-B2 GPU; "
+                         "fast: opt-in fused/resident decode experiment")
     ap.add_argument("--hip-fp8-wmma", type=int, choices=(0, 1, 2), default=2)
     ap.add_argument("--hip-bf16-wmma", type=int, choices=(0, 1), default=1)
     ap.add_argument("--hip-attn-wmma", type=int, choices=(0, 1), default=1)
@@ -1083,6 +1088,36 @@ def main():
     # here rather than mutating the model after initialization.
     if args.fast_prefill and args.balanced_prefill:
         ap.error("--fast-prefill and --balanced-prefill are mutually exclusive")
+    # Decode profiles are explicit bundles, mirroring prefill.  safe preserves
+    # the known token-parity path; balanced keeps the same math but coalesces
+    # selected-expert transfers through pinned staging; fast enables the
+    # broader residency/fusion experiment and must be admitted by the cosine
+    # gate.  Tier-B2 GPU decode is intentionally excluded: a real rollout
+    # diverged and it is not a quality-preserving optimization.
+    if args.decode_mode == "safe":
+        args.hip_decode_routed_ffn = 1
+        args.hip_decode_qkv_fuse = 0
+        args.hip_decode_attn_oproj = 0
+        args.hip_decode_kv_resident = 0
+        args.hip_tb2_decode = 0
+        args.mxfp4_w4a8 = 0
+        args.hip_expert_pinned_staging = 0
+    elif args.decode_mode == "balanced":
+        args.hip_decode_routed_ffn = 1
+        args.hip_decode_qkv_fuse = 0
+        args.hip_decode_attn_oproj = 0
+        args.hip_decode_kv_resident = 0
+        args.hip_tb2_decode = 0
+        args.mxfp4_w4a8 = 0
+        args.hip_expert_pinned_staging = 1
+    else:
+        args.hip_decode_routed_ffn = 1
+        args.hip_decode_qkv_fuse = 1
+        args.hip_decode_attn_oproj = 1
+        args.hip_decode_kv_resident = 1
+        args.hip_tb2_decode = 1
+        args.mxfp4_w4a8 = 1
+        args.hip_expert_pinned_staging = 1
     if args.balanced_prefill:
         # Keep dense/GEMM offload, but leave attention and Tier-B2 state on the
         # CPU. This avoids the large distribution drift of the full GPU chain.
@@ -1167,7 +1202,8 @@ def main():
                               args.hip_mxfp4_wmma, args.hip_expert_stream,
                               args.hip_block_threads, args.hip_expert_pinned_staging,
                               args.hip_tb2_batch, args.hip_decode_routed_ffn,
-                              args.hip_decode_qkv_fuse, args.hip_decode_attn_oproj))
+                              args.hip_decode_qkv_fuse, args.hip_decode_attn_oproj,
+                              args.hip_decode_kv_resident))
     # This path is exact (the compressed representation is unchanged); expose
     # it as an explicit serving knob so HTTP uses can match one-shot tuning.
     if args.hip_attn_cmp_fast and sess.set_attn_cmp_fast(args.hip_attn_cmp_fast) != 0:

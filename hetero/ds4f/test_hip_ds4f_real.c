@@ -20,7 +20,7 @@ static double wall_seconds(void) {
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [--config file.json] [--stage-dir dir] [--model flash|ds4p|ds4fbase] "
                     "[--ep-size n --ep-rank n --threads n --cmgs n --max-pos n] "
-                    "[--layers n --bank-layers n --iters n --pos0 n --warm n --decode-verify n "
+                    "[--layers n --bank-layers n --iters n --pos0 n --warm n --decode-verify n --decode-min-cosine f "
                     "--prefill-batch n --prefill-context n] "
                     "[--hip-device n --hip-verbose 0|1 --hip-async 0|1 "
                     "--hip-shared-bf16 0|1 --hip-shared-bf16-layers n "
@@ -338,7 +338,8 @@ static void attach_decode_hooks(ds4f_model *m, hip_ds4f_dense *hip,
  * comparison is teacher-forced rather than a free-running rollout (which
  * diverges chaotically after any single flip and proves nothing). */
 static int decode_verify(ds4f_model *m, hip_ds4f_dense *hip, int steps,
-                         int pos0, int warm, const ds4f_runtime_options *opt) {
+                         int pos0, int warm, float min_cosine,
+                         const ds4f_runtime_options *opt) {
     const int C = m->cfg.hidden, V = m->cfg.vocab;
     float *x_cpu = (float *)ds4f_mem_alloc(m->mem, (size_t)C * sizeof(float), 256, 0);
     float *x_gpu = (float *)ds4f_mem_alloc(m->mem, (size_t)C * sizeof(float), 256, 0);
@@ -355,6 +356,8 @@ static int decode_verify(ds4f_model *m, hip_ds4f_dense *hip, int steps,
     }
     int mismatches = 0;
     float worst_logit_rel = 0.0f;
+    double cosine_sum = 0.0;
+    float cosine_min = 1.0f;
     int worst_step = -1;
     for (int t = 0; t < steps; ++t) {
         int pos = pos0 + t;
@@ -371,6 +374,15 @@ static int decode_verify(ds4f_model *m, hip_ds4f_dense *hip, int steps,
 
         float abs_err = 0.0f;
         float rel = max_rel_error(lg_cpu, m->s_logits, V, &abs_err);
+        double dot = 0.0, nr = 0.0, ng = 0.0;
+        for (int i = 0; i < V; ++i) {
+            dot += (double)lg_cpu[i] * m->s_logits[i];
+            nr += (double)lg_cpu[i] * lg_cpu[i];
+            ng += (double)m->s_logits[i] * m->s_logits[i];
+        }
+        float cosine = (float)(dot / sqrt(fmax(1e-30, nr * ng)));
+        cosine_sum += cosine;
+        if (cosine < cosine_min) cosine_min = cosine;
         if (rel > worst_logit_rel) { worst_logit_rel = rel; worst_step = t; }
         if (cpu_best != gpu_best) {
             ++mismatches;
@@ -386,9 +398,13 @@ static int decode_verify(ds4f_model *m, hip_ds4f_dense *hip, int steps,
     }
     detach_gpu_hooks(m);
     printf("real decode verify: steps=%d pos %d..%d argmax_mismatch=%d "
-           "worst_logit_rel=%.6g (step %d)\n",
-           steps, pos0, pos0 + steps - 1, mismatches, worst_logit_rel, worst_step);
-    return mismatches == 0;
+           "worst_logit_rel=%.6g (step %d) cosine_mean=%.8g cosine_min=%.8g",
+           steps, pos0, pos0 + steps - 1, mismatches, worst_logit_rel, worst_step,
+           cosine_sum / steps, cosine_min);
+    if (min_cosine >= 0.0f) printf(" min_cosine=%.8g %s", min_cosine,
+        cosine_min >= min_cosine ? "PASS" : "FAIL");
+    putchar('\n');
+    return mismatches == 0 && (min_cosine < 0.0f || cosine_min >= min_cosine);
 }
 
 static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
@@ -883,6 +899,7 @@ int main(int argc, char **argv) {
     int prefill_repeat = 1;
     int skip_cpu_ref = 0;
     int decode_verify_steps = 0, gemm_bench_m = 0;
+    float decode_min_cosine = -1.0f;
     /* Load JSON first so explicit command-line values have the conventional
      * higher precedence regardless of where --config appears in argv. */
     for (int i = 1; i + 1 < argc; i++)
@@ -910,6 +927,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--pos0") == 0 && i + 1 < argc) pos0 = atoi(argv[++i]);
         else if (strcmp(a, "--warm") == 0 && i + 1 < argc) warm = atoi(argv[++i]);
         else if (strcmp(a, "--decode-verify") == 0 && i + 1 < argc) decode_verify_steps = atoi(argv[++i]);
+        else if (strcmp(a, "--decode-min-cosine") == 0 && i + 1 < argc) decode_min_cosine = strtof(argv[++i], NULL);
         else if (strcmp(a, "--gemm-bench") == 0 && i + 1 < argc) gemm_bench_m = atoi(argv[++i]);
         else if (strcmp(a, "--hip-fused-shared-ffn") == 0 && i + 1 < argc) ds4f_fused_shared_ffn_on = atoi(argv[++i]);
         else if (strcmp(a, "--prefill-batch") == 0 && i + 1 < argc) prefill_batch = atoi(argv[++i]);
@@ -1178,7 +1196,8 @@ int main(int argc, char **argv) {
         if (gemm_bench_m > 0) gemm_bench(m, hip, gemm_bench_m);
         pass &= forward_ab(m, hip, &opt);
         if (decode_verify_steps > 0)
-            pass &= decode_verify(m, hip, decode_verify_steps, pos0, warm, &opt);
+            pass &= decode_verify(m, hip, decode_verify_steps, pos0, warm,
+                                  decode_min_cosine, &opt);
         if (iters > 0) pass &= benchmark_forward(m, hip, iters, pos0, warm, &opt);
         if (prefill_batch > 1)
             pass &= benchmark_prefill(m, hip, dual, prefill_batch, prefill_context, &opt, prefill_repeat, dual_cuda_small, skip_cpu_ref);

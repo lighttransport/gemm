@@ -48,6 +48,23 @@ python3 a64fx/llm/ds4f_serve_runner.py --daemon
 # Fused GPU decode QKV, device o-projection, and GPU-resident KV are benchmark
 # paths only for now: the warmed-history greedy gate still detects drift.
 
+Decode has the same explicit quality tiers.  `--decode-mode safe` is the
+default token-parity baseline (currently about 5 tok/s on the RX 9070 XT);
+`--decode-mode balanced` retains the same arithmetic and uses pinned selected-
+expert staging; `--decode-mode fast` enables fused QKV, GPU attention/O-proj,
+resident KV, Tier-B2 GPU projections, and W4A8 experts.  Fast is opt-in and
+must not be promoted until the decode gate reports minimum logit cosine
+`>= 0.999` across a warmed multi-token history.  The intended targets are
+balanced 9 tok/s and fast 12+ tok/s; balanced currently has no qualified
+throughput win over safe.
+
+The standalone HIP gate accepts the cosine threshold explicitly:
+
+```sh
+hetero/ds4f/build/test_hip_ds4f_real --stage-dir /tmp/ds4f_single \
+  --decode-verify 8 --decode-min-cosine 0.999 --pos0 64 --warm 64
+```
+
 # terminal 2: the OpenAI frontend
 TOK=/mnt/disk1/models/ds4f-0731/tokenizer.json \
 DS4F_SERVE_BASE=/tmp/ds4f_serve \
