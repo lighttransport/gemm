@@ -48,6 +48,12 @@ python3 a64fx/llm/ds4f_serve.py
 
 Smoke test: `sh a64fx/llm/test_ds4f_serve.sh /tmp/ds4f_single 8080`.
 
+For the coding-agent acceptance run, use llama.cpp as the behavioral reference
+and measure this GEMM runner with `bench_ds4f_http.py`.  The reference profile
+is **40 prompt tok/s** on uncached input and **9 decode tok/s**; the benchmark
+prints both rates and whether their medians meet those values.  Cached turns
+must report the restored prefix separately rather than counting it as prefill.
+
 The production prefill path uses exact mHC/Tier-B2 tiles. The logical default
 is 4096 prompt tokens and the current kernel capacity processes it as 512-token
 tiles; set `DS4F_SERVE_PREFILL_TILE` to reduce the tile when memory is tight.

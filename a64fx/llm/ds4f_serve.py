@@ -42,6 +42,11 @@ TIMEOUT = float(os.environ.get("DS4F_SERVE_TIMEOUT", "1200"))
 MODEL_ID = "ds4f"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
+# Reference rates for the coding-agent deployment profile.  These are
+# acceptance targets, not sampling or scheduling knobs: the llama.cpp run is
+# the behavioral baseline and this runner must retain its exact output path.
+REFERENCE_PREFILL_TOK_S = 40.0
+REFERENCE_DECODE_TOK_S = 9.0
 RUNNER_SOCKET = None
 RESPONSE_STATE_DIR = BASE + ".contexts/responses"
 _runner_decode_batch = {"enabled": False, "capacity": 1, "steps": 0, "sequences": 0}
@@ -108,6 +113,8 @@ def progress_snapshot():
                      "warm": sum(c.get("state") == "warm" for c in contexts),
                      "disk": sum(c.get("state") == "disk" for c in contexts)},
         "decode_batch": dict(_runner_decode_batch),
+        "reference_targets": {"prefill_tok_s": REFERENCE_PREFILL_TOK_S,
+                               "decode_tok_s": REFERENCE_DECODE_TOK_S},
     }
 
 # ---- concurrent batched decode (DS4F_SERVE_BATCH>1): a dispatcher thread collects queued requests
@@ -417,7 +424,7 @@ def _write_agent_cache(agent, prefix_text, prefix_ids, base_cache=None):
                 pass
 
 
-def agent_prefix_text(messages, tools, prompt_ids):
+def agent_prefix_text(messages, tools, prompt_ids, full=None):
     """Return the longest safe request prefix before the final user payload.
 
     Codex sends stable environment/developer messages between its instructions
@@ -426,7 +433,10 @@ def agent_prefix_text(messages, tools, prompt_ids):
     The candidate must tokenize to an exact prefix of the actual prompt; BPE
     boundary differences therefore fall back to the conservative system cache.
     """
-    full = build_chat_prompt(messages, tools)
+    # Callers already rendered the prompt before tokenizing it.  Re-rendering
+    # here was pure context-processing overhead on every coding-agent turn.
+    if full is None:
+        full = build_chat_prompt(messages, tools)
     last = next((i for i in range(len(messages) - 1, -1, -1)
                  if messages[i].get("role", "user") != "system"), None)
     if last is not None and last == len(messages) - 1 and \
@@ -451,13 +461,13 @@ def agent_prefix_text(messages, tools, prompt_ids):
     return conservative, encode(conservative)
 
 
-def prepare_agent_cache(agent, messages, tools, prompt_ids):
+def prepare_agent_cache(agent, messages, tools, prompt_ids, full=None):
     """Return (prompt_ids, cache_path, cache_load, cache_tokens).
 
     The metadata sidecar makes a frontend restart safe: the raw KV file is
     never restored unless its exact tokenized prefix matches this request.
     """
-    prefix_text, prefix_ids = agent_prefix_text(messages, tools, prompt_ids)
+    prefix_text, prefix_ids = agent_prefix_text(messages, tools, prompt_ids, full)
     if len(prefix_ids) > CACHE_MAX_TOKENS:
         print("[cache] agent=%s SKIP prefix_tokens=%d exceeds limit=%d" %
               (agent, len(prefix_ids), CACHE_MAX_TOKENS),
@@ -1012,7 +1022,7 @@ def _select_cache(agent, messages, tools, prompt):
     if RUNNER_SOCKET:
         ids_all = encode(prompt)
         _, cache_path, reuse, cached_tokens = prepare_agent_cache(
-            agent, messages, tools, ids_all)
+            agent, messages, tools, ids_all, prompt)
         return ids_all, reuse, cache_path, None, cached_tokens
     with _conv_lock:
         ids_all = encode(prompt)
@@ -1028,7 +1038,8 @@ def _select_cache(agent, messages, tools, prompt):
             cache_path = cpath
             cached_tokens = len(prev)
         else:
-            _, cache_path, reuse, cached_tokens = prepare_agent_cache(agent, messages, tools, ids_all)
+            _, cache_path, reuse, cached_tokens = prepare_agent_cache(agent, messages, tools,
+                                                                        ids_all, prompt)
         save_path = cpath if len(ids_all) <= CACHE_MAX_TOKENS else None
         if save_path is None:
             print("[cache] agent=%s SKIP conversation_tokens=%d exceeds limit=%d" %

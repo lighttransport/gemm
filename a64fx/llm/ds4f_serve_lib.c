@@ -219,7 +219,7 @@ static int serve_attach_hip(ds4f_serve *s, int hip_device, int verbose,
     if (!s->hip) return -1;
     for (int L = 0; L < m->cfg.n_layers; ++L) {
         ds4f_layer *z = &m->layers[L];
-        z->cmp_wkv_gpu_id = z->cmp_wgate_gpu_id = -1;
+        z->cmp_wkv_gpu_id = z->cmp_wgate_gpu_id = z->idx_wq_b_gpu_id = -1;
         ds4f_tensor *ts[9] = { &z->wq_a, &z->wq_b, &z->wkv, &z->wo_a, &z->wo_b,
                                &z->sh_w1, &z->sh_w3, &z->sh_w2, &z->gate };
         for (int j = 0; j < 9; ++j) {
@@ -254,6 +254,16 @@ static int serve_attach_hip(ds4f_serve *s, int hip_device, int verbose,
                 z->cmp_wkv_gpu_id = ck.gpu_id;
                 z->cmp_wgate_gpu_id = cg.gpu_id;
             }
+        }
+        /* Indexer q-projection: [index_n_heads*index_head_dim, q_lora] bf16 on
+         * the CSA layers only.  Unlike the compressor this was never bound, so
+         * both decode and the batched prefill GEMM read it from host DRAM. */
+        if (m->tierb2 && m->cfg.compress_ratios[L] == 4 && z->idx_wq_b) {
+            ds4f_tensor iq = { z->idx_wq_b, NULL, DS4F_BF16,
+                               m->cfg.index_n_heads * m->cfg.index_head_dim,
+                               m->cfg.q_lora, -1 };
+            if (hip_ds4f_dense_bind_bf16_tensor(s->hip, &iq) >= 0)
+                z->idx_wq_b_gpu_id = iq.gpu_id;
         }
     }
     if (m->has_mtp) {
@@ -442,6 +452,18 @@ static ds4f_serve *ds4f_serve_open_ep(const char *stage_dir, int use_hip, int hi
     m->want_full_logits = 1;
     s->eos = 1;
     s->rng = 0x9e3779b97f4a7c15ULL;
+    /* Echo the forward-path configuration that actually took effect.  The
+     * decode cost depends on these far more than on any tuning flag, and
+     * several of them are silently downgraded during load (missing tensors,
+     * unsupported dtype combinations), so reporting the requested value is
+     * not enough. */
+    fprintf(stderr, "[serve] forward: exact=%d mhc=%d tierb2=%d sparse=%d mtp=%d "
+            "mxfp4_raw=%d w4a8=%d group_split=%d int8_kv=%d int8_cmp=%d "
+            "max_pos=%d threads=%d spec=%d\n",
+            m->exact, m->mhc, m->tierb2, m->sparse, m->has_mtp,
+            m->mxfp4_raw, m->mxfp4_w4a8, ds4f_mv_group_split_on(),
+            m->int8_kv, m->int8_cmp, m->cfg.max_pos,
+            threads > 0 ? threads : 16, s->speculative_tokens);
     if (err && err_cap) snprintf(err, err_cap, "ok");
     return s;
 }
@@ -472,6 +494,13 @@ ds4f_serve *ds4f_serve_open(const char *stage_dir, int use_hip, int hip_device,
 
 void ds4f_serve_close(ds4f_serve *s) {
     if (!s) return;
+    if (ds4f_expbw_on() && ds4f_expbw_s > 0.0)
+        fprintf(stderr, "  expert_bw %.3f GB in %.3f s = %.1f GB/s "
+                "(%llu CPU experts, %.2f ms per expert)\n",
+                ds4f_expbw_bytes / 1e9, ds4f_expbw_s,
+                ds4f_expbw_bytes / 1e9 / ds4f_expbw_s,
+                (unsigned long long)ds4f_expbw_experts,
+                ds4f_expbw_experts ? 1e3 * ds4f_expbw_s / ds4f_expbw_experts : 0.0);
     if (s->m && getenv("DS4F_PROF") && atoi(getenv("DS4F_PROF")) != 0) {
         double acc = 0.0;
         for (int i = 0; i < DS4F_NPHASE; ++i) acc += s->m->prof[i];
@@ -565,6 +594,17 @@ static double dc_wall(void) {
 int ds4f_serve_decode(ds4f_serve *s, int token, int pos) {
     double tw0 = dc_wall();
     if (!s || token < 0 || token >= s->vocab) return -1;
+    /* One-shot: report the attention regime the decode path actually enters.
+     * Prefill and decode read the same m->tierb2, but only prefill was
+     * observed spending time in the Tier-B2 phases, so record which branch
+     * this path takes rather than inferring it from the load-time flag. */
+    { static int once = 0;
+      if (!once) { once = 1;
+          fprintf(stderr, "[serve] decode attn: tierb2=%d sparse=%d ratio[2]=%d "
+                  "kv_slots[2]=%d window=%d gpu_attn=%d\n",
+                  s->m->tierb2, s->m->sparse, s->m->cfg.compress_ratios[2],
+                  s->m->layers[2].kv_slots, s->m->cfg.window_size,
+                  s->m->gpu_decode_attn_enabled); } }
     if (embed_lookup(s->m, token, s->x) != 0) return -1;
     ds4f_set_forward_token_ids(s->m, &token, 1);
     int ar = ds4f_forward_token(s->m, s->x, pos);

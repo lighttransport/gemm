@@ -73,6 +73,10 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--no-stream", action="store_true")
+    parser.add_argument("--expected-prefill-tok-s", type=float, default=40.0,
+                        help="coding-agent reference prefill rate (default: 40)")
+    parser.add_argument("--expected-decode-tok-s", type=float, default=9.0,
+                        help="coding-agent reference decode rate (default: 9)")
     args = parser.parse_args()
     if args.prompt_file:
         with open(args.prompt_file) as f:
@@ -89,6 +93,13 @@ def main():
         values = [sample[key] for sample in samples]
         print(json.dumps({"summary": key, "median": statistics.median(values),
                           "min": min(values), "max": max(values)}, sort_keys=True))
+    prefill = statistics.median([sample["prefill_tok_s"] for sample in samples])
+    decode = statistics.median([sample["decode_tok_s"] for sample in samples])
+    print(json.dumps({"reference": {"prefill_tok_s": args.expected_prefill_tok_s,
+                                     "decode_tok_s": args.expected_decode_tok_s},
+                      "reference_status": {
+                          "prefill": prefill >= args.expected_prefill_tok_s,
+                          "decode": decode >= args.expected_decode_tok_s}}, sort_keys=True))
 
 
 if __name__ == "__main__":

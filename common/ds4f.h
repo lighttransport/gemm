@@ -318,6 +318,7 @@ typedef struct ds4f_layer {
      * All NULL unless m->tierb2 && compress_ratio!=0. */
     uint16_t *cmp_wkv, *cmp_wgate;   /* layer compressor (rotate=0): [coff*kv_lora, hidden] bf16 */
     int       cmp_wkv_gpu_id, cmp_wgate_gpu_id; /* optional serving HIP bindings */
+    int       idx_wq_b_gpu_id;       /* ditto for the indexer q-projection (-1 = CPU) */
     float    *cmp_ape;               /* [compress_ratio, coff*kv_lora] */
     uint16_t *cmp_norm;              /* [kv_lora] bf16 */
     float    *cmp_kv_state, *cmp_score_state;  /* [coff*ratio, coff*kv_lora] ring state */
@@ -727,6 +728,11 @@ typedef struct {
     float *p_attn_comb, *p_attn_m;  /* DS4F_CP_COMBINE verify/prefill: the K positions' partials collected so the
                                   * cross-node combine is ONE reduce for the whole chunk (m_tile-sized, lazy) */
     float *s_idx_qpre;      /* batched-prefill: pre-projected indexer q for the current pos (NULL=compute in index_step) */
+    /* Decode-time GPU tb2 precompute targets.  ds4f_compress_step and
+     * ds4f_index_step already accept precomputed projections (kv_pre/score_pre
+     * and q_pre); these hold the device results so the CPU never reads the
+     * compressor / indexer weight banks during decode. */
+    float *s_tb2_kvpre, *s_tb2_scpre, *s_tb2_qpre;
     float *v_idxq;          /* [m_tile*index_n_heads*index_head_dim] batched qproj output (lazy, verify prefill) */
     /* batched (M>1) prefill scratch (only allocated by ds4f_alloc_prefill_batch;
      * NULL unless DS4F_PREFILL_BATCH is wired). Token-major [m_tile, width].

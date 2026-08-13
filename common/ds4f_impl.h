@@ -603,13 +603,19 @@ static void ds4f_q8_promote_dense(ds4f_model *m) {
 /* ===================== matvec dispatch ===================== */
 typedef struct {
     ds4f_model *m; float *dst; const ds4f_tensor *t; const float *x;
+    /* Explicit 8-aligned row range.  r1 <= r0 (the zero-initialized case every
+     * existing positional initializer produces) means "derive the range from
+     * tid/nthr", which is the historical behaviour. */
+    int r0, r1;
 } ds4f_mv_task;
 
 static void ds4f_mv_worker(void *arg, int tid, int nthr) {
     ds4f_mv_task *T = (ds4f_mv_task *)arg;
     const ds4f_tensor *t = T->t; const float *x = T->x; float *dst = T->dst;
     int K = t->cols;
-    int r0, r1; ds4f_rowsplit8(t->rows, nthr, tid, &r0, &r1);
+    int r0, r1;
+    if (T->r1 > T->r0) { r0 = T->r0; r1 = T->r1; }
+    else ds4f_rowsplit8(t->rows, nthr, tid, &r0, &r1);
     if (t->type == DS4F_BF16) {
         const uint16_t *base = (const uint16_t *)t->w;
         for (int i = r0; i + 7 < r1; i += 8) {
@@ -756,11 +762,67 @@ static inline int ds4f_expert_batch_on(void) {
 }
 typedef struct { float *dst; const ds4f_tensor *t; const float *x; } ds4f_mv1;
 typedef struct { ds4f_model *m; const ds4f_mv1 *list; int n; } ds4f_mv_multi_task;
+/* DS4F_MV_GROUP_SPLIT: split the group's CONCATENATED row space across the
+ * pool instead of giving every thread a 1/nthr slice of every matrix.
+ *
+ * The routed-expert gate/up group is 12 matrices (6 experts x w1,w3).  Under
+ * the per-matrix split each thread reads ~300 KB of one matrix, then jumps to
+ * the next matrix -- twelve short streams per phase, which is what keeps the
+ * model path near 21 GB/s against a 39 GB/s single-stream kernel roofline on
+ * this Zen1 host.  Splitting the concatenation instead lands each thread on a
+ * contiguous multi-MB run, usually inside a single expert matrix.
+ *
+ * Bit-exact: every output row is still produced by exactly one thread running
+ * the identical inner k-loop, so only WHICH thread computes a row changes. */
+/* DS4F_TB2_GPU: run the decode-time Tier-B2 compressor and indexer
+ * q-projections on the dense device bank.  Their weights are already resident
+ * there for prefill, and on this host they are 872 MB/token of bf16 that the
+ * CPU otherwise streams from DRAM at the read roofline. */
+static int ds4f_tb2_gpu = -1;
+static inline int ds4f_tb2_gpu_on(void) {
+    if (ds4f_tb2_gpu < 0) {
+        const char *e = getenv("DS4F_TB2_GPU");
+        ds4f_tb2_gpu = e && *e ? atoi(e) : 0;
+    }
+    return ds4f_tb2_gpu;
+}
+static int ds4f_mv_group_split = -1;
+static inline int ds4f_mv_group_split_on(void) {
+    if (ds4f_mv_group_split < 0) {
+        const char *e = getenv("DS4F_MV_GROUP_SPLIT");
+        ds4f_mv_group_split = e && *e ? atoi(e) : 1;
+    }
+    return ds4f_mv_group_split;
+}
 static void ds4f_mv_multi_worker(void *arg, int tid, int nthr) {
     ds4f_mv_multi_task *T = (ds4f_mv_multi_task *)arg;
-    for (int s = 0; s < T->n; s++) {
-        ds4f_mv_task sub = { T->m, T->list[s].dst, (const ds4f_tensor *)T->list[s].t, T->list[s].x };
-        ds4f_mv_worker(&sub, tid, nthr);
+    if (!ds4f_mv_group_split_on() || T->n < 2) {
+        for (int s = 0; s < T->n; s++) {
+            ds4f_mv_task sub = { T->m, T->list[s].dst,
+                                 (const ds4f_tensor *)T->list[s].t, T->list[s].x, 0, 0 };
+            ds4f_mv_worker(&sub, tid, nthr);
+        }
+        return;
+    }
+    long total = 0;
+    for (int s = 0; s < T->n; s++) total += (T->list[s].t->rows + 7) / 8;
+    long per = total / nthr, extra = total % nthr;
+    long g0 = per * tid + (tid < extra ? tid : extra);
+    long g1 = g0 + per + (tid < extra ? 1 : 0);
+    long base = 0;
+    for (int s = 0; s < T->n && base < g1; s++) {
+        const ds4f_tensor *t = (const ds4f_tensor *)T->list[s].t;
+        long blk = (t->rows + 7) / 8;
+        long lo = g0 - base, hi = g1 - base;
+        if (lo < 0) lo = 0;
+        if (hi > blk) hi = blk;
+        if (hi > lo) {
+            int r0 = (int)(lo * 8), r1 = (int)(hi * 8);
+            if (r1 > t->rows) r1 = t->rows;
+            ds4f_mv_task sub = { T->m, T->list[s].dst, t, T->list[s].x, r0, r1 };
+            ds4f_mv_worker(&sub, tid, nthr);
+        }
+        base += blk;
     }
 }
 /* Logical-EP lane dispatch: one pool barrier, with fixed worker subsets per
@@ -2068,6 +2130,10 @@ static void ds4f_bf16mv_worker(void *arg, int tid, int nthr) {
     }
 }
 #else
+/* x86: the indexer q-projection ([n_heads*index_head_dim, q_lora] = 8192x1024
+ * bf16, 16 MiB per CSA layer) runs here every decoded token, so the scalar
+ * reference below left the tb2 q-projection ~4x off the bf16 matvec roofline.
+ * ds4f_avx2_dot_bf16 is the same widen-and-FMA the SVE branch performs. */
 static void ds4f_bf16mv_worker(void *arg, int tid, int nthr) {
     ds4f_bf16mv_task *T = (ds4f_bf16mv_task *)arg;
     int rows = T->rows, cols = T->cols;
@@ -2077,9 +2143,13 @@ static void ds4f_bf16mv_worker(void *arg, int tid, int nthr) {
     const float *x = T->x;
     for (int o = o0; o < o1; o++) {
         const uint16_t *w = T->w + (size_t)o * cols;
+#if defined(__AVX2__) && defined(__FMA__)
+        T->out[o] = ds4f_avx2_dot_bf16(x, w, cols);
+#else
         float acc = 0.f;
         for (int i = 0; i < cols; i++) acc += ds4f_bf16_to_f32(w[i]) * x[i];
         T->out[o] = acc;
+#endif
     }
 }
 #endif /* __ARM_FEATURE_SVE */
@@ -2118,6 +2188,14 @@ static void ds4f_cmpmv_bf16_worker(void *arg, int tid, int nthr) {
     const float *x = T->x;
     for (int o = o0; o < o1; o++) {
         const uint16_t *wk = T->wkv + (size_t)o * dim, *wg = T->wgate + (size_t)o * dim;
+#if defined(__AVX2__) && defined(__FMA__)
+        /* The layer compressor runs on all 41 sparse layers every decoded
+         * token (two [<=1024, 4096] bf16 projections each), so this is the
+         * largest tb2_prepare term; the scalar reference below is kept for
+         * non-AVX2 x86 only. */
+        T->kv[o]    = ds4f_avx2_dot_bf16(x, wk, dim);
+        T->score[o] = ds4f_avx2_dot_bf16(x, wg, dim);
+#else
         float a = 0.f, b = 0.f;
         for (int i = 0; i < dim; i++) {
             float xv = x[i];
@@ -2125,6 +2203,7 @@ static void ds4f_cmpmv_bf16_worker(void *arg, int tid, int nthr) {
             b += ds4f_bf16_to_f32(wg[i]) * xv;
         }
         T->kv[o] = a; T->score[o] = b;
+#endif
     }
 }
 #endif /* __ARM_FEATURE_SVE */
@@ -2943,6 +3022,11 @@ static void ds4f_alloc_tb2(ds4f_model *m, int fill) {
     /* model-level per-token scratch (allocated once) */
     m->s_cmp_out   = (float *)DS4F_TB2_ALLOC((size_t)KV*4, 256);
     m->s_idx_q     = (float *)DS4F_TB2_ALLOC((size_t)iH*ihd*4, 256);
+    /* GPU tb2 precompute targets: the compressor emits coff*kv_lora (coff<=2)
+     * values per projection, the indexer q-projection iH*ihd. */
+    m->s_tb2_kvpre = (float *)DS4F_TB2_ALLOC((size_t)2*KV*4, 256);
+    m->s_tb2_scpre = (float *)DS4F_TB2_ALLOC((size_t)2*KV*4, 256);
+    m->s_tb2_qpre  = (float *)DS4F_TB2_ALLOC((size_t)iH*ihd*4, 256);
     m->s_idx_score = (float *)DS4F_TB2_ALLOC((size_t)nsel_cap*4, 256);
     m->s_tb2_sel   = (int   *)DS4F_TB2_ALLOC((size_t)nsel_cap*4, 256);
     m->s_cmp_gather = (float *)DS4F_TB2_ALLOC((size_t)c->index_topk*KV*4, 256);  /* CP: gathered selected cmp latents
@@ -5610,6 +5694,23 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
     int offset = c->window_size;                                /* decode combined-buffer offset */
     /* layer compressor (rotate=0): input s_hn -> cmp_kv[pos/ratio] on a boundary */
     double _tlc0 = ds4f_now();
+    /* Device-side compressor projection.  compress_step already takes
+     * precomputed kv/score (the batched-prefill hook), so filling those here
+     * removes the whole cmp_wkv/cmp_wgate host read without touching the
+     * token-ordered recurrence that follows it. */
+    if (!cmp_kv_pre && !cmp_score_pre && ds4f_tb2_gpu_on() && m->gpu_dense_matvec &&
+        ly->cmp_wkv_gpu_id >= 0 && ly->cmp_wgate_gpu_id >= 0 &&
+        m->s_tb2_kvpre && m->s_tb2_scpre) {
+        int cw = (ratio == 4 ? 2 : 1) * KV;
+        ds4f_tensor ck = { ly->cmp_wkv, NULL, DS4F_BF16, cw, c->hidden, ly->cmp_wkv_gpu_id };
+        ds4f_tensor cg = { ly->cmp_wgate, NULL, DS4F_BF16, cw, c->hidden, ly->cmp_wgate_gpu_id };
+        /* Two separate ds4f_matvec calls, not ds4f_matvec_multi: the fused
+         * group path only takes the device when every member is FP8 or MXFP4,
+         * so a BF16 pair silently falls back to the CPU there. */
+        ds4f_matvec(m, m->s_tb2_kvpre, &ck, m->s_hn);
+        ds4f_matvec(m, m->s_tb2_scpre, &cg, m->s_hn);
+        cmp_kv_pre = m->s_tb2_kvpre; cmp_score_pre = m->s_tb2_scpre;
+    }
     if (ds4f_compress_step(m->s_hn, cmp_kv_pre, cmp_score_pre,
                            c->hidden, KV, rd, ratio, pos,
                            ly->cmp_wkv, ly->cmp_wgate, 1, ly->cmp_ape, ly->cmp_norm,
@@ -5633,7 +5734,18 @@ static void ds4f_tb2_prepare(ds4f_model *m, ds4f_layer *ly, int ratio, int pos,
         int k = c->index_topk;
         double _sc_snap = ds4f_g_tb2scan, _qp_snap = ds4f_g_tb2qproj, _rp_snap = ds4f_g_tb2rope,
                _ic_snap = ds4f_g_tb2icmp, _wp_snap = ds4f_g_tb2wproj, _tk_snap = ds4f_g_tb2topk;
-        ds4f_index_step(m->s_hn, c->hidden, m->s_qlat, m->s_idx_qpre, c->q_lora,
+        /* Same idea for the indexer q-projection ([iH*ihd, q_lora] bf16,
+         * 16 MiB per CSA layer): index_step's q_pre hook takes the result. */
+        const float *qpre = m->s_idx_qpre;
+        if (!qpre && ds4f_tb2_gpu_on() && m->gpu_dense_matvec &&
+            ly->idx_wq_b_gpu_id >= 0 && m->s_tb2_qpre) {
+            ds4f_tensor qw = { ly->idx_wq_b, NULL, DS4F_BF16,
+                               c->index_n_heads * c->index_head_dim, c->q_lora,
+                               ly->idx_wq_b_gpu_id };
+            ds4f_matvec(m, m->s_tb2_qpre, &qw, m->s_qlat);
+            qpre = m->s_tb2_qpre;
+        }
+        ds4f_index_step(m->s_hn, c->hidden, m->s_qlat, qpre, c->q_lora,
                         c->index_n_heads, ihd, rd, ratio, pos, offset, k,
                         ly->idx_wq_b, ly->idx_wproj, 1,
                         ly->idx_cmp_wkv, ly->idx_cmp_wgate, ly->idx_cmp_ape, ly->idx_cmp_norm,
@@ -5960,6 +6072,28 @@ static inline double ds4f_now(void) {
 /* TIC/TOC accumulate into m->prof[id] when DS4F_PROF=1 */
 #define DS4F_TIC() double _t0 = ds4f_prof_on ? ds4f_now() : 0.0
 #define DS4F_TOC(id) do { if (ds4f_prof_on) m->prof[id] += ds4f_now() - _t0; } while (0)
+
+/* DS4F_EXPERT_BW=1: measure the routed-expert phase on its own.
+ *
+ * DS4F_PROF brackets every phase and inflates the whole decode by ~30% on this
+ * host, so phase shares taken from it cannot be turned into a GB/s figure.
+ * This counter takes two clock reads per layer (~2 us/token) and counts the
+ * bytes of the experts that actually executed on the CPU, which is what the
+ * bench_expert_bw roofline is comparable against. */
+static int ds4f_expbw = -1;
+static double ds4f_expbw_s = 0.0;
+static uint64_t ds4f_expbw_bytes = 0;
+static uint64_t ds4f_expbw_experts = 0;
+static inline int ds4f_expbw_on(void) {
+    if (ds4f_expbw < 0) { const char *e = getenv("DS4F_EXPERT_BW"); ds4f_expbw = e && *e ? atoi(e) : 0; }
+    return ds4f_expbw;
+}
+/* One routed expert's CPU-side footprint: three MXFP4 matrices over
+ * hidden x moe_inter, each a half-byte weight plus a per-32 E8M0 scale. */
+static inline uint64_t ds4f_expert_cpu_bytes(const ds4f_config *c) {
+    uint64_t elems = (uint64_t)c->hidden * (uint64_t)c->moe_inter;
+    return 3u * (elems / 2u + elems / 32u);
+}
 
 static int ds4f_dbg = -1;
 static void ds4f_chk(const char *tag, int L, const float *v, int n) {
@@ -7557,7 +7691,8 @@ static void ds4f_forward_verify(ds4f_model *m, const float *X, int K, int pos0, 
         if (m->tierb2 && ratio == 4 && ly->idx_wq_b) {
             idxHhd = c->index_n_heads * c->index_head_dim;
             if (!m->v_idxq) m->v_idxq = (float *)ds4f_mem_alloc(m->mem, (size_t)m->m_tile*idxHhd*4, 256, 1);
-            ds4f_tensor idxwq = { ly->idx_wq_b, NULL, DS4F_BF16, idxHhd, c->q_lora, -1 };
+            ds4f_tensor idxwq = { ly->idx_wq_b, NULL, DS4F_BF16, idxHhd, c->q_lora,
+                                  ds4f_tb2_gpu_on() ? ly->idx_wq_b_gpu_id : -1 };
             ds4f_gemm(m, m->v_idxq, &idxwq, m->p_qlat, K, idxHhd, c->q_lora);
             idxg_pf = 1;
         }
@@ -8368,6 +8503,7 @@ decode_oproj_done:;
         }
         /* ---- MoE: routed experts (owned-only) ---- */
         { DS4F_TIC();
+        double _ebw0 = ds4f_expbw_on() ? ds4f_now() : 0.0;
         int routed_decode_gpu = 0;
         if (!m->logical_ep_lanes && m->gpu_routed_ffn && m->gpu_decode_routed_ffn_enabled && c->n_active <= 8) {
             int local_k[8], nlocal = 0, all_gpu = 1;
@@ -8522,6 +8658,17 @@ decode_oproj_done:;
                 for (int i = 0; i < c->moe_inter; i++) m->s_exg[i] = ds4f_silu(m->s_exg[i]) * m->s_exu[i];
             ds4f_matvec(m, m->s_o, &ly->ex_w2[slot], m->s_exg);
             for (int i = 0; i < C; i++) m->s_route[i] += wt[k] * m->s_o[i];
+        }
+        if (ds4f_expbw_on()) {
+            for (int k = 0; k < c->n_active; ++k) {
+                int e = idx[k];
+                if (e < 0 || e % m->ep_size != m->ep_rank) continue;
+                int slot = e / m->ep_size;
+                if (ly->ex_w1[slot].gpu_id >= 0) continue;   /* served from VRAM */
+                ds4f_expbw_bytes += ds4f_expert_cpu_bytes(c);
+                ds4f_expbw_experts++;
+            }
+            ds4f_expbw_s += ds4f_now() - _ebw0;
         }
         DS4F_TOC(DS4F_P_EXPERTS); }
         if (shared_gpu_pending) {

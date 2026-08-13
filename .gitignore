@@ -324,3 +324,8 @@ ryzen/bench_nn_ops
 *_stderr.txt
 .rocprofv3/
 *.so
+
+# DS4F single-node serving runtime state (sockets, KV/agent caches, logs)
+a64fx/llm/.ds4f_serve*
+a64fx/llm/ds4f_runner.log
+a64fx/llm/ds4f_frontend.log
