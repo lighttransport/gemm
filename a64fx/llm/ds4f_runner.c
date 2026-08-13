@@ -175,9 +175,24 @@ int main(void) {
     int real_weights = envi("DS4F_REAL", 0);
     const char *blob_dir = getenv("DS4F_STAGE_DIR");
     double t_alloc0 = now_sec();
-    ds4f_model *m = real_weights
-        ? ds4f_load_real(cfg, ep_rank, ep_size, blob_dir, n_threads, n_cmgs)
-        : ds4f_alloc_synth(cfg, ep_rank, ep_size, n_threads, n_cmgs);
+    /* The real Flash checkpoint's exact graph includes mHC and Tier-B2.  The
+     * legacy ds4f_load_real wrapper only mirrors environment switches, so a
+     * standalone `DS4F_EXACT=1` generation previously omitted both unless the
+     * caller knew to set two additional implementation flags.  That evaluates
+     * an incompatible graph and produces incoherent continuations.  Match the
+     * serving loader's real-exact configuration here. */
+    ds4f_model *m;
+    if (real_weights) {
+        ds4f_runtime_options load_opt = ds4f_runtime_options_debug_env(
+            cfg, blob_dir, ep_rank, ep_size, n_threads, n_cmgs);
+        if (load_opt.exact) {
+            load_opt.mhc = 1;
+            load_opt.tierb2 = 1;
+        }
+        m = ds4f_load_real_opts(&load_opt);
+    } else {
+        m = ds4f_alloc_synth(cfg, ep_rank, ep_size, n_threads, n_cmgs);
+    }
     if (!m) { fprintf(stderr, "model alloc/load failed\n"); return 1; }
     double t_alloc = now_sec() - t_alloc0;
     size_t rss = rss_bytes();
