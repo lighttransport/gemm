@@ -1119,6 +1119,15 @@ def main():
     os.environ["DS4F_EXPERT_ACTIVE"] = str(args.expert_active)
     os.environ["DS4F_HIP_MTP_DENSE"] = str(args.hip_mtp_dense)
     base = os.environ.get("DS4F_SERVE_BASE", "/tmp/ds4f_serve")
+    # A file-backed runner has no listening socket to probe during model load.
+    # Publish readiness only after Serve() has completely opened the model, so
+    # integration tests and launch scripts never mistake an old request file
+    # (or a spinning worker pool) for a ready server.
+    ready_path = base + ".ready"
+    try:
+        os.unlink(ready_path)
+    except FileNotFoundError:
+        pass
     stage = os.environ.get("DS4F_STAGE_DIR")
     if not stage:
         sys.exit("DS4F_STAGE_DIR is required (the single-node staged manifest dir)")
@@ -1169,6 +1178,10 @@ def main():
     prefix_cache = env_i("DS4F_SERVE_PREFIX_CACHE", 1)
     if expert_cache_mb and sess.enable_route_telemetry(True) != 0:
         sys.exit("serving library lacks routed-expert telemetry support; rebuild it")
+    ready_tmp = "%s.tmp.%d" % (ready_path, os.getpid())
+    with open(ready_tmp, "w") as f:
+        f.write("ready\n")
+    os.replace(ready_tmp, ready_path)
     try:
         if args.unix_socket:
             CooperativeServer(sess, args.unix_socket,
@@ -1186,6 +1199,10 @@ def main():
         pass
     finally:
         sess.close()
+        try:
+            os.unlink(ready_path)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
