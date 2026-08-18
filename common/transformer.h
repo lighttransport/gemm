@@ -96,9 +96,29 @@ typedef struct {
                             * derived from attn_k rows / head_dim. 0 = use model default */
 } transformer_layer;
 
+/* Qwen3.5/3.6/3.8 native NextN block.  GGUF counts this after the trunk in
+ * block_count, but it is not part of the ordinary autoregressive layer loop. */
+typedef struct {
+    transformer_layer layer;
+    qtensor eh_proj;             /* [2*n_embd, n_embd] */
+    qtensor enorm;               /* embedding RMS norm */
+    qtensor hnorm;               /* target-hidden RMS norm */
+    qtensor shared_head_norm;    /* draft-head RMS norm */
+    qtensor embed_tokens;        /* optional private embedding */
+    qtensor shared_head_head;    /* optional private LM head */
+    int layer_index;
+    int loaded;
+    float *key_cache;          /* private draft KV [max_seq_len, kv_dim] */
+    float *value_cache;
+    float *hidden;             /* recurrent draft hidden [n_embd] */
+    float *fusion;             /* [2*n_embd] normalized embedding + hidden */
+} transformer_nextn;
+
 typedef struct {
     /* Hyperparameters */
     int n_layers;
+    int n_layers_all;
+    int n_nextn_layers;
     int n_embd;
     int n_heads;
     int n_kv_heads;
@@ -169,6 +189,7 @@ typedef struct {
 
     /* Per-layer weights */
     transformer_layer *layers;
+    transformer_nextn nextn;
 
     /* KV cache: [n_layers][max_seq_len * n_kv_heads * head_dim] */
     float **key_cache;
@@ -293,6 +314,14 @@ float *transformer_forward_partial(transformer_model *model, int cache_pos,
 float *transformer_compute_logits(transformer_model *model);
 /* TP vocab-parallel: logits for rows [v0,v1) into model->logits[0..v1-v0). */
 float *transformer_compute_logits_slice(transformer_model *model, int v0, int v1);
+
+/* Run the native Qwen NextN head for one draft position. target_hidden is the
+ * trunk hidden associated with prev_token. Returns draft logits [n_vocab] and
+ * stores the recurrent auxiliary hidden internally for callers that generate
+ * K>1 drafts (pass transformer_nextn_hidden() as target_hidden on later steps). */
+float *transformer_nextn_logits(transformer_model *model, int32_t prev_token,
+                                const float *target_hidden, int position);
+const float *transformer_nextn_hidden(const transformer_model *model);
 
 /* Copy hidden state into/out of model->x for MPI communication */
 float *transformer_get_hidden(transformer_model *model);
@@ -2918,7 +2947,15 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->n_embd      = tf_get_int(gguf, ARCH_KEY("embedding_length"), 4096);
     m->n_heads     = tf_get_int(gguf, ARCH_KEY("attention.head_count"), 32);
     m->n_kv_heads  = tf_get_int(gguf, ARCH_KEY("attention.head_count_kv"), 8);
-    m->n_layers    = tf_get_int(gguf, ARCH_KEY("block_count"), 36);
+    m->n_layers_all = tf_get_int(gguf, ARCH_KEY("block_count"), 36);
+    m->n_nextn_layers = tf_get_int(gguf, ARCH_KEY("nextn_predict_layers"), 0);
+    if (m->n_nextn_layers < 0 || m->n_nextn_layers >= m->n_layers_all) {
+        fprintf(stderr, "transformer: invalid nextn layer count %d for block_count=%d\n",
+                m->n_nextn_layers, m->n_layers_all);
+        free(m);
+        return NULL;
+    }
+    m->n_layers = m->n_layers_all - m->n_nextn_layers;
     m->n_ff        = tf_get_int(gguf, ARCH_KEY("feed_forward_length"), 12288);
     m->n_vocab     = tf_get_int(gguf, ARCH_KEY("vocab_size"), 0);
     m->rms_norm_eps = tf_get_float(gguf, ARCH_KEY("attention.layer_norm_rms_epsilon"), 1e-6f);
@@ -3078,6 +3115,9 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
     fprintf(stderr, "transformer: n_embd=%d n_heads=%d n_kv_heads=%d n_layers=%d n_ff=%d head_dim=%d\n",
             m->n_embd, m->n_heads, m->n_kv_heads, m->n_layers, m->n_ff, m->head_dim);
+    if (m->n_nextn_layers)
+        fprintf(stderr, "transformer: NextN trunk=%d auxiliary=%d total=%d\n",
+                m->n_layers, m->n_nextn_layers, m->n_layers_all);
     fprintf(stderr, "transformer: rope_freq_base=%.0f rms_norm_eps=%.1e max_seq_len=%d\n",
             m->rope_freq_base, m->rms_norm_eps, max_seq_len);
     if (m->use_moe) {
@@ -3359,6 +3399,44 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         #undef LOAD
         #undef REQUIRE_SUPPORTED
     }
+    if (m->n_nextn_layers) {
+        if (m->n_nextn_layers != 1 || !m->is_hybrid) {
+            fprintf(stderr, "transformer: only one Qwen35 NextN block is supported\n");
+            missing_required = 1;
+        } else {
+            transformer_nextn *nn = &m->nextn;
+            transformer_layer *L = &nn->layer;
+            int l = m->n_layers;
+            char name[128];
+            nn->layer_index = l;
+#define NN_LOAD(field, suffix, req) do { \
+                snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
+                (field) = tf_load_tensor(gguf, name, req); \
+                if ((req) && !(field).data) missing_required = 1; \
+            } while (0)
+            NN_LOAD(L->attn_norm, "attn_norm", 1);
+            NN_LOAD(L->attn_q, "attn_q", 1);
+            NN_LOAD(L->attn_k, "attn_k", 1);
+            NN_LOAD(L->attn_v, "attn_v", 1);
+            NN_LOAD(L->attn_q_norm, "attn_q_norm", 1);
+            NN_LOAD(L->attn_k_norm, "attn_k_norm", 1);
+            NN_LOAD(L->attn_output, "attn_output", 1);
+            NN_LOAD(L->ffn_norm, "post_attention_norm", 1);
+            NN_LOAD(L->ffn_gate, "ffn_gate", 1);
+            NN_LOAD(L->ffn_up, "ffn_up", 1);
+            NN_LOAD(L->ffn_down, "ffn_down", 1);
+            NN_LOAD(nn->eh_proj, "nextn.eh_proj", 1);
+            NN_LOAD(nn->enorm, "nextn.enorm", 1);
+            NN_LOAD(nn->hnorm, "nextn.hnorm", 1);
+            NN_LOAD(nn->shared_head_norm, "nextn.shared_head_norm", 0);
+            NN_LOAD(nn->embed_tokens, "nextn.embed_tokens", 0);
+            NN_LOAD(nn->shared_head_head, "nextn.shared_head_head", 0);
+#undef NN_LOAD
+            nn->loaded = !missing_required;
+            if (nn->loaded)
+                fprintf(stderr, "transformer: loaded Qwen NextN block %d\n", l);
+        }
+    }
     if (missing_required) {
         fprintf(stderr, "transformer: aborting due to missing required per-layer tensors\n");
         transformer_free(m);
@@ -3454,6 +3532,20 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         m->conv_w_trans = (float *)malloc((size_t)m->ssm_conv_kernel * m->ssm_qkv_dim * sizeof(float));
     } else {
         m->conv_w_trans = NULL;
+    }
+
+    if (m->nextn.loaded) {
+        size_t nkv = (size_t)max_seq_len * m->n_kv_heads * m->head_dim;
+        m->nextn.key_cache = (float *)tf_aligned_calloc(256, nkv, sizeof(float));
+        m->nextn.value_cache = (float *)tf_aligned_calloc(256, nkv, sizeof(float));
+        m->nextn.hidden = (float *)tf_aligned_calloc(256, m->n_embd, sizeof(float));
+        m->nextn.fusion = (float *)tf_aligned_calloc(256, 2 * m->n_embd, sizeof(float));
+        if (!m->nextn.key_cache || !m->nextn.value_cache ||
+            !m->nextn.hidden || !m->nextn.fusion) {
+            fprintf(stderr, "transformer: cannot allocate NextN runtime buffers\n");
+            transformer_free(m);
+            return NULL;
+        }
     }
 
     /* Allocate scratch buffers */
@@ -3559,6 +3651,10 @@ void transformer_free(transformer_model *model) {
         free(model->value_cache);
     }
     free(model->layers);
+    free(model->nextn.key_cache);
+    free(model->nextn.value_cache);
+    free(model->nextn.hidden);
+    free(model->nextn.fusion);
     /* Gemma4 resources */
     free(model->swa_pattern);
     free(model->rope_freq_factors);
@@ -6238,6 +6334,73 @@ float *transformer_compute_logits_slice(transformer_model *model, int v0, int v1
     if (v1 <= v0) return NULL;
     tf_qmatvec_row_slice(model, model->logits, &model->output, model->x, v0, v1);
     return model->logits;
+}
+
+const float *transformer_nextn_hidden(const transformer_model *model) {
+    return model && model->nextn.loaded ? model->nextn.hidden : NULL;
+}
+
+float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
+                                const float *target_hidden, int position) {
+    if (!m || !m->nextn.loaded || !target_hidden || prev_token < 0 ||
+        prev_token >= m->n_vocab || position < 0 || position >= m->max_seq_len)
+        return NULL;
+
+    transformer_nextn *nn = &m->nextn;
+    transformer_layer *L = &nn->layer;
+    const qtensor *emb = nn->embed_tokens.data ? &nn->embed_tokens : &m->token_embd;
+    const qtensor *head = nn->shared_head_head.data ? &nn->shared_head_head : &m->output;
+    int ne = m->n_embd, hd = m->head_dim;
+    int nh = m->n_heads, nkh = m->n_kv_heads;
+    int qd = nh * hd, kvd = nkh * hd, gqa = nh / nkh;
+
+    /* The target pointer is commonly model->x; preserve it before using shared scratch. */
+    memcpy(nn->hidden, target_hidden, (size_t)ne * sizeof(float));
+    tf_dequant_row(emb, prev_token, m->xb);
+    tf_rmsnorm(nn->fusion, m->xb, &nn->enorm, ne, m->rms_norm_eps, m->matvec_tmp);
+    tf_rmsnorm(nn->fusion + ne, nn->hidden, &nn->hnorm, ne,
+               m->rms_norm_eps, m->matvec_tmp);
+    tf_qmatvec_pool(m, m->x, &nn->eh_proj, nn->fusion, ne);
+
+    tf_rmsnorm(m->xb, m->x, &L->attn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
+    tf_qmatvec_fused_qkv_pool(m, m->xb2, &L->attn_q, 2 * qd,
+                              m->k, &L->attn_k, m->v, &L->attn_v, kvd);
+    for (int h = 0; h < nh; h++) {
+        memcpy(m->q + h * hd, m->xb2 + h * 2 * hd, (size_t)hd * sizeof(float));
+        memcpy(m->ffn_buf1 + h * hd, m->xb2 + h * 2 * hd + hd,
+               (size_t)hd * sizeof(float));
+    }
+    tf_qk_norm(m->q, nh, hd, &L->attn_q_norm, m->rms_norm_eps, m->matvec_tmp);
+    tf_qk_norm(m->k, nkh, hd, &L->attn_k_norm, m->rms_norm_eps, m->matvec_tmp);
+    tf_apply_rope(m, m->q, m->k, nh, nkh, hd, position, position, position);
+    memcpy(nn->key_cache + (size_t)position * kvd, m->k, (size_t)kvd * sizeof(float));
+    memcpy(nn->value_cache + (size_t)position * kvd, m->v, (size_t)kvd * sizeof(float));
+
+    tf_attn_task task = {m->q, m->att, m->xb2, nn->key_cache, nn->value_cache,
+                         0, nh, hd, kvd, gqa, position + 1, m->max_seq_len,
+                         1.0f / sqrtf((float)hd)};
+    memset(m->xb2, 0, (size_t)qd * sizeof(float));
+    tf_attn_worker(&task);
+    for (int i = 0; i < qd; i++)
+        m->xb2[i] *= 1.0f / (1.0f + expf(-m->ffn_buf1[i]));
+    tf_qmatvec_pool(m, m->xb, &L->attn_output, m->xb2, ne);
+    tf_vadd(m->x, m->xb, ne);
+
+    tf_rmsnorm(m->xb, m->x, &L->ffn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
+    tf_qmatvec_fused2_pool(m, m->ffn_buf1, &L->ffn_gate,
+                           m->ffn_buf2, &L->ffn_up, m->xb, m->n_ff);
+    tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, m->n_ff);
+    tf_qmatvec_pool(m, m->xb, &L->ffn_down, m->ffn_buf3, ne);
+    tf_vadd(m->x, m->xb, ne);
+    memcpy(nn->hidden, m->x, (size_t)ne * sizeof(float));
+
+    if (nn->shared_head_norm.data)
+        tf_rmsnorm(m->xb, m->x, &nn->shared_head_norm, ne,
+                   m->rms_norm_eps, m->matvec_tmp);
+    else
+        memcpy(m->xb, m->x, (size_t)ne * sizeof(float));
+    tf_qmatvec_pool(m, m->logits, head, m->xb, m->n_vocab);
+    return m->logits;
 }
 
 float *transformer_forward_partial(transformer_model *m, int cache_pos,

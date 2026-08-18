@@ -121,7 +121,7 @@ typedef struct {
     uint64_t offset; /* offset from start of data section */
 } gguf_tensor_info;
 
-typedef struct {
+typedef struct gguf_context_s {
     uint32_t version;
     uint64_t n_kv;
     uint64_t n_tensors;
@@ -132,6 +132,14 @@ typedef struct {
     uint8_t *data;      /* pointer to tensor data (mmap'd or malloc'd) */
     size_t data_size;
     int use_mmap;
+    /* Split-GGUF support.  A merged context owns the metadata/tensor catalogue,
+     * while each tensor remains backed by the mmap belonging to its source
+     * shard.  Single-file contexts leave these fields NULL/zero. */
+    void **tensor_data;
+    int *tensor_fds;
+    uint64_t *tensor_file_offsets;
+    struct gguf_context_s **shards;
+    int n_shards;
 #ifdef _WIN32
     void *map_handle;
     void *file_handle;
@@ -478,7 +486,9 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         ctx->map_size = (size_t)st.st_size;
         {
             int flags = MAP_PRIVATE;
-            if (!getenv("NUMA_DISTRIBUTE")) flags |= MAP_POPULATE;
+            if (use_mmap == 1 && !getenv("NUMA_DISTRIBUTE") &&
+                !(getenv("GGUF_LAZY_MMAP") && atoi(getenv("GGUF_LAZY_MMAP"))))
+                flags |= MAP_POPULATE;
             ctx->map_base = mmap(NULL, ctx->map_size, PROT_READ, flags, ctx->fd, 0);
         }
         if (ctx->map_base == MAP_FAILED) { ctx->map_base = NULL; goto fail; }
@@ -559,11 +569,108 @@ fail:
 }
 
 gguf_context *gguf_open_multi(const char *path, int use_mmap) {
-    return gguf_open(path, use_mmap);
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    size_t blen = strlen(base);
+    if (blen < 16 || strcmp(base + blen - 5, ".gguf") != 0)
+        return gguf_open(path, use_mmap);
+
+    /* Recognize ...-00001-of-00002.gguf (width is not assumed). */
+    const char *of = NULL;
+    for (const char *p = base; (p = strstr(p, "-of-")) != NULL; p += 4) of = p;
+    if (!of) return gguf_open(path, use_mmap);
+    const char *idx_dash = of;
+    while (idx_dash > base && idx_dash[-1] != '-') idx_dash--;
+    if (idx_dash <= base || idx_dash[-1] != '-') return gguf_open(path, use_mmap);
+    const char *tot_begin = of + 4;
+    char *endp = NULL;
+    long total = strtol(tot_begin, &endp, 10);
+    if (total < 1 || !endp || strcmp(endp, ".gguf") != 0)
+        return gguf_open(path, use_mmap);
+    int idx_width = (int)(of - idx_dash);
+    int total_width = (int)(endp - tot_begin);
+    if (idx_width < 1 || total_width < 1 || total > 10000)
+        return gguf_open(path, use_mmap);
+
+    size_t dir_len = (size_t)(base - path);
+    size_t prefix_len = (size_t)(idx_dash - base - 1);
+    gguf_context **parts = (gguf_context **)calloc((size_t)total, sizeof(*parts));
+    if (!parts) return NULL;
+    uint64_t tensor_total = 0;
+    for (long s = 0; s < total; s++) {
+        size_t cap = strlen(path) + 64;
+        char *sp = (char *)malloc(cap);
+        if (!sp) goto multi_fail;
+        snprintf(sp, cap, "%.*s%.*s-%0*ld-of-%0*ld.gguf",
+                 (int)dir_len, path, (int)prefix_len, base,
+                 idx_width, s + 1, total_width, total);
+        /* mode 2 means lazy mmap even when the caller did not set the legacy env. */
+        parts[s] = gguf_open(sp, use_mmap ? 2 : 0);
+        free(sp);
+        if (!parts[s]) goto multi_fail;
+        tensor_total += parts[s]->n_tensors;
+    }
+
+    gguf_context *ctx = (gguf_context *)calloc(1, sizeof(*ctx));
+    if (!ctx) goto multi_fail;
+    ctx->version = parts[0]->version;
+    ctx->alignment = parts[0]->alignment;
+    ctx->n_kv = parts[0]->n_kv;
+    ctx->kv = parts[0]->kv;          /* transfer metadata ownership */
+    parts[0]->n_kv = 0;
+    parts[0]->kv = NULL;
+    ctx->n_tensors = tensor_total;
+    ctx->tensors = (gguf_tensor_info *)calloc((size_t)tensor_total, sizeof(*ctx->tensors));
+    ctx->tensor_data = (void **)calloc((size_t)tensor_total, sizeof(*ctx->tensor_data));
+    ctx->tensor_fds = (int *)calloc((size_t)tensor_total, sizeof(*ctx->tensor_fds));
+    ctx->tensor_file_offsets = (uint64_t *)calloc((size_t)tensor_total, sizeof(*ctx->tensor_file_offsets));
+    if (!ctx->tensors || !ctx->tensor_data || !ctx->tensor_fds || !ctx->tensor_file_offsets) {
+        gguf_close(ctx);
+        goto multi_fail;
+    }
+    uint64_t out = 0;
+    for (long s = 0; s < total; s++) {
+        gguf_context *sctx = parts[s];
+        for (uint64_t j = 0; j < sctx->n_tensors; j++, out++) {
+            ctx->tensors[out] = sctx->tensors[j];
+            ctx->tensors[out].name.str = strdup(sctx->tensors[j].name.str);
+            if (!ctx->tensors[out].name.str) {
+                ctx->n_tensors = out;
+                gguf_close(ctx);
+                goto multi_fail;
+            }
+            ctx->tensor_data[out] = gguf_tensor_data(sctx, (int)j);
+#ifdef _WIN32
+            ctx->tensor_fds[out] = -1;
+#else
+            ctx->tensor_fds[out] = sctx->fd;
+#endif
+            ctx->tensor_file_offsets[out] =
+                (uint64_t)sctx->data_offset + sctx->tensors[j].offset;
+            ctx->data_size += gguf_tensor_size(sctx, (int)j);
+        }
+    }
+    ctx->shards = parts;
+    ctx->n_shards = (int)total;
+    fprintf(stderr, "gguf: merged %ld shards, %llu tensors (lazy=%d)\n",
+            total, (unsigned long long)tensor_total, use_mmap != 0);
+    return ctx;
+
+multi_fail:
+    for (long s = 0; s < total; s++) if (parts[s]) gguf_close(parts[s]);
+    free(parts);
+    return NULL;
 }
 
 void gguf_close(gguf_context *ctx) {
     if (!ctx) return;
+    if (ctx->shards) {
+        for (int i = 0; i < ctx->n_shards; i++) gguf_close(ctx->shards[i]);
+        free(ctx->shards);
+    }
+    free(ctx->tensor_data);
+    free(ctx->tensor_fds);
+    free(ctx->tensor_file_offsets);
     if (ctx->kv) {
         for (uint64_t i = 0; i < ctx->n_kv; i++) gguf_free_kv(&ctx->kv[i]);
         free(ctx->kv);
@@ -597,6 +704,7 @@ const char *gguf_tensor_name(const gguf_context *ctx, int i) {
 
 void *gguf_tensor_data(const gguf_context *ctx, int i) {
     if (i < 0 || (uint64_t)i >= ctx->n_tensors) return NULL;
+    if (ctx->tensor_data) return ctx->tensor_data[i];
     return ctx->data + ctx->tensors[i].offset;
 }
 

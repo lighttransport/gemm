@@ -10,7 +10,7 @@
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s model.gguf [tensor_substr]\n", argv[0]); return 1; }
     const char *filt = argc > 2 ? argv[2] : NULL;
-    gguf_context *g = gguf_open(argv[1], 1);
+    gguf_context *g = gguf_open_multi(argv[1], 1);
     if (!g) { fprintf(stderr, "open fail\n"); return 1; }
     printf("=== METADATA (%llu kv) ===\n", (unsigned long long)g->n_kv);
     for (uint64_t i = 0; i < g->n_kv; i++) {
