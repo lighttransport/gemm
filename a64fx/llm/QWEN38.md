@@ -39,7 +39,8 @@ Current validation:
 - Q4, Q8, and split BF16 metadata: 866 tensors, trunk 64, NextN 1.
 - Q4 anonymous single-node greedy decode: completed on A64FX.
 - Q4 native NextN execution: completed with K=1 and greedy comparison.
-- PP binaries compile with the Fujitsu MPI stack. A live multinode inference
-  run still needs to be recorded.
+- Two-node Q4 PP completed on the live allocation with byte-balanced ranges
+  `[0,32)` and `[32,64)` (380.906 s correctness run).
+- Q8 and BF16 PP still need live inference runs; their metadata/load paths pass.
 - TP remains disabled because the legacy runner references a removed tensor/KV
   slicing API. It must not be presented as working until that path is ported.
