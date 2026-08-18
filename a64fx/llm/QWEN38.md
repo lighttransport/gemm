@@ -52,6 +52,8 @@ Current validation:
 - Two-node Q4 PP completed on the live allocation with byte-balanced ranges
   `[0,32)` and `[32,64)` (380.906 s correctness run).
 - Q8 two-node TP completed with 12 Q heads, two KV heads, FFN 8704/rank.
+- Q8 twelve-node PP completed with ranges beginning `[0,5)` and generated
+  `Please` from token ID 1 (549.864 s for two serial pipeline passes).
 - Q8 twelve-node TP completed; the correctness-first non-divisible-KV topology
   reproduces token ID 3165 while sharding FFN/SSM/vocab.
 - BF16 twelve-node PP completed from split GGUF and generated `Please` from
