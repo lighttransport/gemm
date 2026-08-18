@@ -770,7 +770,9 @@ int main(int argc, char **argv) {
     char *prompt_file_text = NULL;
     const char *prompt = prompt_env;
     int  max_gen           = (int)envl("TP_MAXGEN", 64);
+    int  spec_k            = (int)envl("TP_SPEC_K", 0);
     int  llm_threads       = (int)envl("LLM_THREADS", 48);
+    if (spec_k < 0 || spec_k > 4) die("TP_SPEC_K must be in [0,4]", -1);
     int  ignore_eos        = (int)envl("TP_IGNORE_EOS", 0);  /* long-ctx perf sweep: don't stop at EOS */
     int  prefill_only      = envb("TP_PREFILL_ONLY", 0);
     int  do_prefill_gemm   = envb("TP_PREFILL_GEMM", 1);      /* 1=batched prefill, fallback to token loop */
@@ -838,7 +840,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    gguf_context *gguf = gguf_open_multi(model_path, 1);   /* lazy mmap */
+    gguf_context *gguf = gguf_open_multi(model_path, 2);   /* lazy mmap */
     if (!gguf) die("gguf_open_multi", -1);
     bpe_vocab *vocab = bpe_vocab_load(gguf);
     if (!vocab) die("bpe_vocab_load", -1);
@@ -895,7 +897,8 @@ int main(int argc, char **argv) {
     if (transformer_tp_slice_weights(m, MyRank, N, ssm_shard) != 0)
         die("transformer_tp_slice_weights (check n_heads/n_kv/n_ff/ssm_dt % N)", -1);
     double tp0 = now_sec();
-    transformer_build_panels(m);                  /* repack the local shard */
+    if (!envb("TF_NO_PANEL", 0))
+        transformer_build_panels(m);              /* repack the local shard */
     double tp1 = now_sec();
     if (dry_mode) {
         if (dry_ar_steps <= 0) dry_ar_steps = 2;
@@ -1059,6 +1062,7 @@ int main(int argc, char **argv) {
     int n_gen = 0;
     double t_prefill = 0.0;
     double t_fwd = 0.0;
+    long mtp_match = 0, mtp_total = 0;
     double t_comm = 0.0;
     long pcnt = 0, ar_calls = 0;
     int32_t in_tok = (P > 0) ? ptoks[0] : 0;
@@ -1135,6 +1139,12 @@ int main(int argc, char **argv) {
                 transformer_embed_token(m, ptoks[p]);
                 double _ta = now_sec();
                 transformer_forward_partial(m, p, 0, n_layers);
+                if (spec_k && m->nextn.loaded) {
+                    float *target_h = (float *)alloca((size_t)n_embd * sizeof(float));
+                    memcpy(target_h, transformer_get_hidden(m), (size_t)n_embd * sizeof(float));
+                    transformer_nextn_logits(m, ptoks[p], target_h, p);
+                    transformer_set_hidden(m, target_h);
+                }
                 t_fwd += now_sec() - _ta;
             }
             float *lg = transformer_compute_logits(m);  /* only final prompt token matters */
@@ -1205,6 +1215,19 @@ int main(int argc, char **argv) {
             transformer_forward_partial(m, p, 0, n_layers);
             float *lg = transformer_compute_logits(m);
             nt = sample_argmax(m, lg, &c, &ar_step, &ar_calls_step);
+            if (spec_k && m->nextn.loaded) {
+                const float *draft_h = transformer_get_hidden(m);
+                int prev = in_tok;
+                for (int k = 0; k < spec_k; k++) {
+                    float *dlg = transformer_nextn_logits(m, prev, draft_h, p + k);
+                    int draft = 0;
+                    for (int v = 1; v < m->n_vocab; v++)
+                        if (dlg[v] > dlg[draft]) draft = v;
+                    if (k == 0) { mtp_match += draft == nt; mtp_total++; }
+                    prev = draft;
+                    draft_h = transformer_nextn_hidden(m);
+                }
+            }
         }
 
         double _tb = now_sec();
@@ -1231,6 +1254,9 @@ int main(int argc, char **argv) {
 
 done:
     barrier();
+    if (is_first && mtp_total)
+        logmsg("MTP greedy match=%ld/%ld alpha=%.4f K=%d\n",
+               mtp_match, mtp_total, (double)mtp_match / mtp_total, spec_k);
     {   char pn[64]; snprintf(pn, sizeof pn, "tp_perf_rank%02d.txt", MyRank);
         FILE *pf2 = fopen(pn, "w");
         if (pf2) {

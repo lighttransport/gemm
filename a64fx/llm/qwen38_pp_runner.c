@@ -21,19 +21,19 @@ static void cuts(const gguf_context*g,int nl,int nr,int*c){
     for(int l=0;l<nl;l++)sum+=w[l];c[0]=0;int l=0;uint64_t a=0;
     for(int r=1;r<nr;r++){uint64_t goal=sum*(uint64_t)r/nr;while(l<nl&&a+w[l]/2<goal)a+=w[l++];c[r]=l;}c[nr]=nl;free(w);
 }
-static void usage(const char*p){fprintf(stderr,"usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] [--threads N] [--spec-k 0..4]\n",p);}
+static void usage(const char*p){fprintf(stderr,"usage: %s MODEL [--prompt TEXT|--token-id ID] [--max-gen N] [--max-seq N] [--threads N] [--spec-k 0..4]\n",p);}
 
 int main(int ac,char**av){
     MPI_Init(&ac,&av);int rank,nr;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);
-    const char*path=NULL,*prompt="Hello";int ngen=16,nseq=512,nth=48,sk=0;
-    for(int i=1;i<ac;i++){if(!strcmp(av[i],"--prompt")&&++i<ac)prompt=av[i];else if(!strcmp(av[i],"--max-gen")&&++i<ac)ngen=atoi(av[i]);else if(!strcmp(av[i],"--max-seq")&&++i<ac)nseq=atoi(av[i]);else if(!strcmp(av[i],"--threads")&&++i<ac)nth=atoi(av[i]);else if(!strcmp(av[i],"--spec-k")&&++i<ac)sk=atoi(av[i]);else if(av[i][0]!='-'&&!path)path=av[i];else{if(!rank)usage(av[0]);MPI_Abort(MPI_COMM_WORLD,2);}}
+    const char*path=NULL,*prompt="Hello";int ngen=16,nseq=512,nth=48,sk=0,synth=-1;
+    for(int i=1;i<ac;i++){if(!strcmp(av[i],"--prompt")&&++i<ac)prompt=av[i];else if(!strcmp(av[i],"--token-id")&&++i<ac)synth=atoi(av[i]);else if(!strcmp(av[i],"--max-gen")&&++i<ac)ngen=atoi(av[i]);else if(!strcmp(av[i],"--max-seq")&&++i<ac)nseq=atoi(av[i]);else if(!strcmp(av[i],"--threads")&&++i<ac)nth=atoi(av[i]);else if(!strcmp(av[i],"--spec-k")&&++i<ac)sk=atoi(av[i]);else if(av[i][0]!='-'&&!path)path=av[i];else{if(!rank)usage(av[0]);MPI_Abort(MPI_COMM_WORLD,2);}}
     if(!path||nr<2||sk<0||sk>4){if(!rank)usage(av[0]);MPI_Abort(MPI_COMM_WORLD,2);}
     /* Mode 2 maps tensor shards lazily. Each rank touches only its assigned layers. */
     gguf_context*g=gguf_open_multi(path,2);if(!g)MPI_Abort(MPI_COMM_WORLD,1);
     bpe_vocab*v=bpe_vocab_load(g);transformer_model*m=transformer_load(g,nseq);if(!v||!m)MPI_Abort(MPI_COMM_WORLD,1);
     transformer_set_threads(m,nth);int*c=malloc((size_t)(nr+1)*sizeof(*c));cuts(g,m->n_layers,nr,c);int l0=c[rank],l1=c[rank+1];transformer_free_unused_kv(m,l0,l1);
     fprintf(stderr,"qwen38-pp rank=%d/%d layers=[%d,%d)\n",rank,nr,l0,l1);
-    int32_t*ts=NULL;int nt=0;if(!rank){ts=malloc((size_t)nseq*sizeof(*ts));nt=bpe_tokenize(v,prompt,-1,ts,nseq);}MPI_Bcast(&nt,1,MPI_INT,0,MPI_COMM_WORLD);if(nt<=0||nt+ngen+sk>=nseq)MPI_Abort(MPI_COMM_WORLD,2);
+    int32_t*ts=NULL;int nt=0;if(!rank){ts=malloc((size_t)nseq*sizeof(*ts));if(synth>=0){ts[0]=synth;nt=1;}else nt=bpe_tokenize(v,prompt,-1,ts,nseq);}MPI_Bcast(&nt,1,MPI_INT,0,MPI_COMM_WORLD);if(nt<=0||nt+ngen+sk>=nseq)MPI_Abort(MPI_COMM_WORLD,2);
     float*h=transformer_get_hidden(m);int cur=0,pending=-1;long ok=0,all=0;double t0=qtime();
     for(int pos=0;pos<nt+ngen;pos++){
         int token;if(pos<nt){if(!rank)token=ts[pos];MPI_Bcast(&token,1,MPI_INT,0,MPI_COMM_WORLD);}else token=cur;

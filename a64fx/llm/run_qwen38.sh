@@ -41,8 +41,28 @@ case "$mode" in
         exec mpiexec -np "$nodes" "$here/build/qwen38_pp_runner" "$model" --threads "$threads" "$@"
         ;;
     tp)
-        echo "Qwen3.8 TP is not available: the repository TP slicing API must be restored before this mode is safe." >&2
-        exit 3
+        [ "$nodes" -ge 2 ] || { echo "tp mode requires at least two nodes" >&2; exit 2; }
+        prompt=Hello; maxgen=16; maxseq=512; speck=0; token_id=
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --prompt) prompt=$2; shift 2 ;;
+                --max-gen) maxgen=$2; shift 2 ;;
+                --max-seq) maxseq=$2; shift 2 ;;
+                --spec-k) speck=$2; shift 2 ;;
+                --token-id) token_id=$2; shift 2 ;;
+                *) echo "unsupported TP option: $1" >&2; exit 2 ;;
+            esac
+        done
+        make -C "$here" tp_runner CC=fcc OPENMP=1
+        (cd "$here" && OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43 \
+            mpiexec -np "$nodes" ../utofu-tests/tofu_topo_helper)
+        export TP_PROMPT=$prompt TP_MAXGEN=$maxgen TP_MAXSEQ=$maxseq TP_SPEC_K=$speck
+        export TP_PREFILL_GEMM=${TP_PREFILL_GEMM:-0} TF_NO_PANEL=${TF_NO_PANEL:-1}
+        if [ -n "$token_id" ]; then
+            export TP_SYNTH_TOKENS=1 TP_SYNTH_TOKEN_ID=$token_id
+        fi
+        cd "$here"
+        exec mpiexec -np "$nodes" ./build/tp_runner "$model"
         ;;
     *) usage ;;
 esac

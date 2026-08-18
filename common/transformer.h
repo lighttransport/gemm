@@ -43,6 +43,7 @@ typedef struct {
     int      podd_packed; /* 1 = data is k-major-interleaved for the p_odd BF16 GEMM */
     int8_t  *i8;          /* optional int8 W8A8 weights [n_rows*n_cols], row-major */
     float   *i8s;         /* per-row int8 scale [n_rows] (w ~= i8 * i8s[row]) */
+    void    *tp_owned_data; /* owned contiguous TP column repack, if any */
 } qtensor;
 
 typedef struct {
@@ -241,6 +242,13 @@ typedef struct {
     int tp_size;               /* size of the TP group (1 if no TP) */
     void (*tp_allreduce_fn)(float *buf, int count, void *ctx);  /* allreduce callback */
     void *tp_allreduce_ctx;    /* opaque context passed to allreduce (e.g. parallel_config*) */
+    int tp_attn_sharded, tp_ffn_sharded, tp_ssm_sharded;
+    int tp_qhead_offset, tp_kv_head_base, tp_kv_head_count;
+    int ssm_head_offset;
+    int tp_vocab_sharded, tp_vocab_lo, tp_vocab_loc;
+    int gqa_group;
+    int kv_dtype, kv_elem_bytes, kv_k_transposed, kv_k_dp;
+    float **key_scales, **value_scales;
 
     /* NUMA allocator state */
     struct {
@@ -342,6 +350,8 @@ void transformer_embed_token(transformer_model *model, int32_t token_id);
 void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
                          void (*allreduce_fn)(float *buf, int count, void *ctx),
                          void *allreduce_ctx);
+int transformer_tp_slice_weights(transformer_model *model, int tp_rank, int tp_size,
+                                  int ssm_shard);
 
 /* --- Distributed memory management --- */
 
@@ -2649,13 +2659,14 @@ typedef struct {
     int head_start, head_end;
     int head_dim, kv_dim, gqa_ratio, seq_len, max_seq_len;
     float scale;
+    int q_head_offset;
 } tf_attn_task;
 
 static void *tf_attn_worker(void *arg) {
     tf_attn_task *t = (tf_attn_task *)arg;
     int hd = t->head_dim;
     for (int h = t->head_start; h < t->head_end; h++) {
-        int kv_h = h / t->gqa_ratio;
+        int kv_h = (t->q_head_offset + h) / t->gqa_ratio;
         const float *q_h = t->q + h * hd;
         float *att_h = t->att + h * t->max_seq_len;
         int seq_len = t->seq_len;
@@ -3582,6 +3593,11 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->tp_size = 1;
     m->tp_allreduce_fn = NULL;
     m->tp_allreduce_ctx = NULL;
+    m->tp_kv_head_count = m->n_kv_heads;
+    m->tp_vocab_loc = m->n_vocab;
+    m->gqa_group = m->n_heads / m->n_kv_heads;
+    m->kv_dtype = 0;
+    m->kv_elem_bytes = (int)sizeof(float);
     m->thread_tmp = (float **)calloc(1, sizeof(float *));
     m->thread_tmp[0] = m->matvec_tmp;
 
@@ -3650,6 +3666,16 @@ void transformer_free(transformer_model *model) {
         free(model->key_cache);
         free(model->value_cache);
     }
+    if (model->layers) {
+        for (int l = 0; l < model->n_layers; l++) {
+            free(model->layers[l].attn_output.tp_owned_data);
+            free(model->layers[l].ffn_down.tp_owned_data);
+            free(model->layers[l].ssm_qkv.tp_owned_data);
+            free(model->layers[l].ssm_conv1d.tp_owned_data);
+            free(model->layers[l].ssm_out.tp_owned_data);
+        }
+    }
+    free(model->output.tp_owned_data);
     free(model->layers);
     free(model->nextn.key_cache);
     free(model->nextn.value_cache);
@@ -4544,9 +4570,10 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
         tf_dequant_row(&layer->ssm_a, 0, a_buf);
         tf_dequant_row(&layer->ssm_dt_bias, 0, dt_bias_buf);
         for (int i = 0; i < dt_rank; i++) {
-            float val = alpha[i] + dt_bias_buf[i];
+            int gh = m->ssm_head_offset + i;
+            float val = alpha[i] + dt_bias_buf[gh];
             float sp = (val > 20.0f) ? val : logf(1.0f + expf(val));
-            alpha[i] = sp * a_buf[i]; /* negative since ssm_a < 0 */
+            alpha[i] = sp * a_buf[gh]; /* negative since ssm_a < 0 */
         }
     }
 
@@ -4672,10 +4699,13 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     /* dt_rank=48, n_group=16: 3 bulk copies of n_group*d_state instead of 96 memcpys */
     {
         size_t tile_bytes = (size_t)n_group * d_state * sizeof(float);
-        int n_repeat = dt_rank / n_group;
-        for (int r = n_repeat - 1; r >= 0; r--) {
-            memcpy(Q_exp + r * n_group * d_state, Q_raw, tile_bytes);
-            memcpy(K_exp + r * n_group * d_state, K_raw, tile_bytes);
+        (void)tile_bytes;
+        for (int h = 0; h < dt_rank; h++) {
+            int g = (m->ssm_head_offset + h) % n_group;
+            memcpy(Q_exp + (size_t)h * d_state, Q_raw + (size_t)g * d_state,
+                   (size_t)d_state * sizeof(float));
+            memcpy(K_exp + (size_t)h * d_state, K_raw + (size_t)g * d_state,
+                   (size_t)d_state * sizeof(float));
         }
     }
 
@@ -4765,6 +4795,8 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
 
     /* 8. Output projection: xb = ssm_out @ out_buf */
     tf_qmatvec_pool(m, m->xb, &layer->ssm_out, out_buf, n_embd);
+    if (m->tp_ssm_sharded && m->tp_allreduce_fn)
+        m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
 }
 
 static inline float tf_gelu_exact_scalar(float g) {
@@ -5034,7 +5066,7 @@ static void *tf_persistent_worker(void *arg) {
     int head_dim = m->head_dim;
     int kv_dim = n_kv_heads * head_dim;
     int q_dim = n_heads * head_dim;
-    int gqa_ratio = n_heads / n_kv_heads;
+    int gqa_ratio = m->tp_attn_sharded ? m->gqa_group : n_heads / n_kv_heads;
     int n_ff = m->n_ff;
     /* Head partition for attention */
     int h_per = n_heads / nt, h_extra = n_heads % nt;
@@ -5902,7 +5934,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                     int hcount = heads_per + (t < heads_extra ? 1 : 0);
                     atasks[t] = (tf_attn_task){m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
                                                hoff, hoff + hcount, head_dim, kv_dim, gqa_ratio, seq_len,
-                                               m->max_seq_len, scale};
+                                               m->max_seq_len, scale, m->tp_qhead_offset};
                     hoff += hcount;
                 }
                 tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
@@ -5910,7 +5942,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                 /* Single-threaded fallback — dispatch through tf_attn_worker for AVX2 */
                 tf_attn_task st = {m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
                                    0, n_heads, head_dim, kv_dim, gqa_ratio, seq_len,
-                                   m->max_seq_len, scale};
+                                   m->max_seq_len, scale, m->tp_qhead_offset};
                 memset(m->xb2, 0, q_dim * sizeof(float));
                 tf_attn_worker(&st);
             }
@@ -5940,6 +5972,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             /* Output projection */
             TF_PROF_BEGIN("out_proj", l, "matvec", "FP32");
             tf_qmatvec_pool(m, m->xb, &layer->attn_output, m->xb2, n_embd);
+            if (m->tp_attn_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
             TF_PROF_END("out_proj", 2.0 * n_embd * q_dim, 0);
         } else {
             /* --- Standard attention (non-hybrid) --- */
@@ -6144,6 +6178,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
 
             TF_PROF_BEGIN("ffn_down", l, "matvec", "FP32");
             tf_qmatvec_pool(m, m->xb, &layer->ffn_down, m->ffn_buf3, n_embd);
+            if (m->tp_ffn_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
             TF_PROF_END("ffn_down", 2.0 * n_embd * m->n_ff, 0);
 
             tf_vadd(m->x, m->xb, n_embd);
@@ -6186,6 +6222,167 @@ void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
     model->tp_size = tp_size;
     model->tp_allreduce_fn = allreduce_fn;
     model->tp_allreduce_ctx = allreduce_ctx;
+}
+
+static void tf_tp_slice_rows(qtensor *t, int r0, int r1) {
+    if (!t->data || r1 <= r0) return;
+    size_t rb = tf_row_bytes(t->type, t->n_cols);
+    t->data = (uint8_t *)t->data + (size_t)r0 * rb;
+    t->n_rows = r1 - r0;
+}
+
+static int tf_tp_repack_cols(qtensor *t, int c0, int c1) {
+    if (!t->data || c1 <= c0) return 0;
+    int bs = ggml_type_info[t->type].block_size;
+    if (bs <= 0 || c0 % bs || c1 % bs) {
+        fprintf(stderr, "tp_slice: columns [%d,%d) not aligned to type %u block %d\n",
+                c0, c1, t->type, bs);
+        return -1;
+    }
+    size_t src_rb = tf_row_bytes(t->type, t->n_cols);
+    size_t dst_rb = tf_row_bytes(t->type, c1 - c0);
+    size_t byte0 = tf_row_bytes(t->type, c0);
+    void *dst = tf_aligned_calloc(256, (size_t)t->n_rows, dst_rb);
+    if (!dst) return -1;
+    for (int r = 0; r < t->n_rows; r++)
+        memcpy((uint8_t *)dst + (size_t)r * dst_rb,
+               (const uint8_t *)t->data + (size_t)r * src_rb + byte0, dst_rb);
+    t->data = dst;
+    t->tp_owned_data = dst;
+    t->n_cols = c1 - c0;
+    return 0;
+}
+
+static int tf_tp_repack_ssm_rows(qtensor *t, int qk_rows, int v0, int v1) {
+    if (!t->data || v1 <= v0) return -1;
+    size_t rb = tf_row_bytes(t->type, t->n_cols);
+    int nr = qk_rows + v1 - v0;
+    void *dst = tf_aligned_calloc(256, (size_t)nr, rb);
+    if (!dst) return -1;
+    memcpy(dst, t->data, (size_t)qk_rows * rb);
+    memcpy((uint8_t *)dst + (size_t)qk_rows * rb,
+           (const uint8_t *)t->data + (size_t)v0 * rb,
+           (size_t)(v1 - v0) * rb);
+    t->data = dst;
+    t->tp_owned_data = dst;
+    t->n_rows = nr;
+    return 0;
+}
+
+static void tf_tp_range(int n, int parts, int rank, int *lo, int *hi) {
+    int base = n / parts, rem = n % parts;
+    *lo = rank * base + (rank < rem ? rank : rem);
+    *hi = *lo + base + (rank < rem);
+}
+
+static size_t tf_runtime_kv_len_for_layer(const transformer_model *m, int layer) {
+    (void)layer;
+    return (size_t)m->max_seq_len;
+}
+
+static int tf_runtime_kv_dim_for_layer(const transformer_model *m, int layer) {
+    if (m->is_gemma4 && layer >= 0 && layer < m->n_layers) {
+        int hd = m->layers[layer].is_swa ? m->head_dim_swa : m->head_dim_full;
+        return m->layers[layer].n_kv_heads * hd;
+    }
+    return m->n_kv_heads * m->head_dim;
+}
+
+int transformer_tp_slice_weights(transformer_model *m, int rank, int size,
+                                  int ssm_shard) {
+    if (!m || size <= 1) return 0;
+    if (rank < 0 || rank >= size || m->use_moe) return -1;
+    int oh = m->n_heads, okv = m->n_kv_heads, off = m->n_ff, hd = m->head_dim;
+    int q0, q1, k0, k1;
+    tf_tp_range(oh, size, rank, &q0, &q1);
+    int kv_rep = okv % size != 0;
+    if (kv_rep) { k0 = 0; k1 = okv; }
+    else tf_tp_range(okv, size, rank, &k0, &k1);
+    int chunk = ((off + size - 1) / size + 255) & ~255;
+    int f0 = rank * chunk, f1 = f0 + chunk;
+    if (f0 > off) f0 = off;
+    if (f1 > off) f1 = off;
+    if (q1 <= q0 || f1 <= f0) return -1;
+    int qstride = m->is_hybrid ? 2 * hd : hd;
+    /* Query-only sharding with replicated KV is not greedy-exact in the current
+     * attention kernel. Keep the whole attention mixer replicated when KV heads
+     * do not divide the TP group; FFN/SSM/vocab remain sharded. */
+    int do_attn = getenv("TP_SKIP_ATTN") == NULL && !kv_rep;
+    int do_ffn = getenv("TP_SKIP_FFN") == NULL;
+    int sh0 = 0, sh1 = m->ssm_dt_rank;
+    if (ssm_shard) tf_tp_range(m->ssm_dt_rank, size, rank, &sh0, &sh1);
+
+    for (int l = 0; l < m->n_layers; l++) {
+        transformer_layer *L = &m->layers[l];
+        if (do_attn && !(m->is_hybrid && L->is_ssm)) {
+            tf_tp_slice_rows(&L->attn_q, q0 * qstride, q1 * qstride);
+            if (!kv_rep) {
+                tf_tp_slice_rows(&L->attn_k, k0 * hd, k1 * hd);
+                tf_tp_slice_rows(&L->attn_v, k0 * hd, k1 * hd);
+            }
+            if (tf_tp_repack_cols(&L->attn_output, q0 * hd, q1 * hd)) return -1;
+        } else if (m->is_hybrid && L->is_ssm && ssm_shard) {
+            int ds = m->ssm_d_state;
+            int qk = 2 * m->ssm_n_group * ds;
+            int v0s = qk + sh0 * ds, v1s = qk + sh1 * ds;
+            if (tf_tp_repack_ssm_rows(&L->ssm_qkv, qk, v0s, v1s)) return -1;
+            if (tf_tp_repack_ssm_rows(&L->ssm_conv1d, qk, v0s, v1s)) return -1;
+            tf_tp_slice_rows(&L->ssm_gate, sh0 * ds, sh1 * ds);
+            tf_tp_slice_rows(&L->ssm_alpha, sh0, sh1);
+            tf_tp_slice_rows(&L->ssm_beta, sh0, sh1);
+            if (tf_tp_repack_cols(&L->ssm_out, sh0 * ds, sh1 * ds)) return -1;
+        }
+        if (do_ffn) {
+            tf_tp_slice_rows(&L->ffn_gate, f0, f1);
+            tf_tp_slice_rows(&L->ffn_up, f0, f1);
+            if (tf_tp_repack_cols(&L->ffn_down, f0, f1)) return -1;
+        }
+    }
+
+    if (m->nextn.loaded && !m->nextn.shared_head_head.data)
+        m->nextn.shared_head_head = m->output; /* retain the full native MTP head */
+    int vchunk = ((m->n_vocab + size - 1) / size + 31) & ~31;
+    int v0 = rank * vchunk, v1 = v0 + vchunk;
+    if (v0 > m->n_vocab) v0 = m->n_vocab;
+    if (v1 > m->n_vocab) v1 = m->n_vocab;
+    if (!getenv("TP_NO_VOCAB_SHARD") && m->output.data &&
+        m->output.data != m->token_embd.data && v1 > v0) {
+        tf_tp_slice_rows(&m->output, v0, v1);
+        m->tp_vocab_sharded = 1;
+        m->tp_vocab_lo = v0;
+        m->tp_vocab_loc = v1 - v0;
+    } else {
+        m->tp_vocab_lo = 0;
+        m->tp_vocab_loc = m->n_vocab;
+    }
+    if (do_attn) {
+        m->n_heads = q1 - q0;
+        if (!kv_rep) m->n_kv_heads = k1 - k0;
+    }
+    if (do_ffn) m->n_ff = f1 - f0;
+    m->tp_qhead_offset = do_attn && kv_rep ? q0 : 0;
+    m->tp_kv_head_base = do_attn && !kv_rep ? k0 : 0;
+    m->tp_kv_head_count = m->n_kv_heads;
+    m->gqa_group = oh / okv;
+    m->tp_attn_sharded = do_attn;
+    m->tp_ffn_sharded = do_ffn;
+    if (ssm_shard) {
+        m->ssm_head_offset = sh0;
+        m->ssm_dt_rank = sh1 - sh0;
+        m->ssm_d_inner = m->ssm_dt_rank * m->ssm_d_state;
+        m->ssm_qkv_dim = 2 * m->ssm_n_group * m->ssm_d_state + m->ssm_d_inner;
+        m->tp_ssm_sharded = 1;
+    }
+    m->tp_rank = rank;
+    m->tp_size = size;
+    fprintf(stderr, "tp_slice: rank %d/%d heads=%d kv=%d ff=%d vocab=%d@%d SSM=%s dt=%d@%d\n",
+            rank, size, m->n_heads, m->n_kv_heads, m->n_ff,
+            m->tp_vocab_loc, m->tp_vocab_lo, ssm_shard ? "sharded" : "replicated",
+            m->ssm_dt_rank, m->ssm_head_offset);
+    if (kv_rep)
+        fprintf(stderr, "tp_slice: attention replicated (%d KV heads not divisible by %d ranks)\n",
+                okv, size);
+    return 0;
 }
 
 /* ---- Distributed memory management ---- */
@@ -6316,7 +6513,7 @@ void transformer_set_hidden(transformer_model *model, const float *hidden) {
 float *transformer_compute_logits(transformer_model *model) {
     if (!model || !model->has_lm_head) return NULL;
     TF_PROF_BEGIN("lm_head", -1, "matvec", "FP32");
-    tf_qmatvec_pool(model, model->logits, &model->output, model->x, model->n_vocab);
+    tf_qmatvec_pool(model, model->logits, &model->output, model->x, model->output.n_rows);
     TF_PROF_END("lm_head", 2.0 * model->n_vocab * model->n_embd, 0);
     return model->logits;
 }
@@ -6351,7 +6548,9 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     const qtensor *emb = nn->embed_tokens.data ? &nn->embed_tokens : &m->token_embd;
     const qtensor *head = nn->shared_head_head.data ? &nn->shared_head_head : &m->output;
     int ne = m->n_embd, hd = m->head_dim;
-    int nh = m->n_heads, nkh = m->n_kv_heads;
+    int nh = L->attn_q.n_rows / (2 * hd);
+    int nkh = L->attn_k.n_rows / hd;
+    int nff = L->ffn_gate.n_rows;
     int qd = nh * hd, kvd = nkh * hd, gqa = nh / nkh;
 
     /* The target pointer is commonly model->x; preserve it before using shared scratch. */
@@ -6388,8 +6587,8 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
 
     tf_rmsnorm(m->xb, m->x, &L->ffn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
     tf_qmatvec_fused2_pool(m, m->ffn_buf1, &L->ffn_gate,
-                           m->ffn_buf2, &L->ffn_up, m->xb, m->n_ff);
-    tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, m->n_ff);
+                           m->ffn_buf2, &L->ffn_up, m->xb, nff);
+    tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, nff);
     tf_qmatvec_pool(m, m->xb, &L->ffn_down, m->ffn_buf3, ne);
     tf_vadd(m->x, m->xb, ne);
     memcpy(nn->hidden, m->x, (size_t)ne * sizeof(float));
