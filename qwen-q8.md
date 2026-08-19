@@ -75,13 +75,167 @@ also fails even the short greedy-output gate. `auto` therefore remains the
 resident GGUF Q8 reference path; the experimental modes require explicit
 `--q8-mode row` or `--q8-mode block64`.
 
-## Root cause
+## Original root cause (addressed)
 
-The persistent Qwen worker parallelizes attention and dense FFN rows, but for
-each of the 48 SSM layers thread 0 disables the pool and calls the complete SSM
-forward routine while the other 47 cores wait. This serializes the large QKV,
-gate, and output projections as well as convolution and recurrence. Fixing this
-execution structure precedes further kernel tuning.
+The persistent Qwen worker parallelized attention and dense FFN rows, but for
+each of the 48 SSM layers thread 0 disabled the pool and called the complete SSM
+forward routine while the other 47 cores waited. This serialized the large QKV,
+gate, and output projections as well as convolution and recurrence. The first
+implementation pass fixed this execution structure before further kernel tuning.
+
+The projection and recurrence serialization described above is now fixed. The
+remaining work is dominated by the still-unclassified half of token time,
+serial SSM preparation, the 1.35 GB vocabulary head, repeated activation
+quantization, and kernel/NUMA behavior that falls far below the cold-pool
+microbenchmark.
+
+## Next tasks and implementation plan
+
+Work in this order. Do not make either experimental format the default until it
+passes all numerical gates.
+
+### 1. Obtain a low-overhead token-time ledger
+
+The current per-stage profiler perturbs decode by about 8–20%, and roughly half
+of reference-Q8 token time is not assigned to a stage. Replace hundreds of
+per-layer clock calls with per-thread cycle counters accumulated in registers
+and sampled only at coarse boundaries.
+
+Implementation:
+
+1. Add counters for final RMSNorm, LM head, residual/norm work, barriers, SSM
+   alpha/beta projections, convolution, Q/K normalization and expansion,
+   recurrence, and SSM output normalization/gating.
+2. Read the A64FX virtual counter (`cntvct_el0`) or one monotonic timestamp once
+   around each whole category, not each individual matrix. Accumulate locally
+   and publish after the token dispatch.
+3. Count actual resident bytes from the active layout (`reference`, `row`, or
+   `block64`) and report effective GB/s per category.
+4. Add a no-print sampling mode that profiles one token after at least eight
+   warm tokens. Require less than 2% timing difference from profiling disabled.
+
+Deliverable: a ledger whose categories sum to at least 95% of wall time and a
+32-token uninstrumented reference baseline.
+
+### 2. Remove serial SSM preparation
+
+`ssm_core` is still about 300 ms/token for Q8 despite parallel recurrence, far
+above Q4. Split and measure it before changing arithmetic.
+
+Implementation:
+
+1. Pre-dequantize the depthwise convolution weights once during model loading
+   into the transposed `[conv_k][qkv_dim]` layout; stop rebuilding it for every
+   layer and token.
+2. Compute alpha and beta cooperatively. Their output has only 48 rows, so use
+   one worker per row and avoid a nested pool dispatch.
+3. Channel-split convolution and SiLU across all workers. Give each worker a
+   fixed channel range and update the circular history for that range.
+4. Parallelize Q/K L2 normalization and head expansion by group/head. Preserve
+   the current per-head recurrence assignment and first-touch recurrent state
+   from the same worker that will update it.
+5. Fuse recurrence output RMSNorm and gate SiLU into the recurrence worker so
+   the head output remains hot.
+
+Gate: identical Q8-reference logits within the existing F32 reduction tolerance,
+identical 128-token greedy output, and `ssm_core < 75 ms/token`.
+
+### 3. Optimize the vocabulary head separately
+
+The output matrix is 1.35 GB and is read once per generated token. It must be
+reported independently instead of being hidden in serial time.
+
+Implementation:
+
+1. Add a standalone LM-head benchmark using the actual `[248320, 5120]` tensor,
+   the production worker mapping, and warm resident pages.
+2. Partition rows on eight-row boundaries and first-touch each partition from
+   its consuming CMG. Compare static contiguous, CMG-striped, and work-stealing
+   mappings.
+3. Fuse argmax into each worker's row sweep and reduce 48 local maxima after the
+   matvec. Do not write or reread the full logits array during greedy decode.
+4. Keep an opt-in full-logits path for callers that need sampling or logprobs.
+
+Gate: greedy token identical to the full-logits reference and at least 400 GB/s
+effective LM-head bandwidth. Record the time saved by fused argmax separately.
+
+### 4. Build an exact Q8_0 multi-row kernel before further lossy packing
+
+The current `block64` format re-quantizes two original 32-value blocks and is
+both slower and less exact than desired. Implement a kernel that consumes the
+resident GGUF Q8_0 bytes directly, retaining both original FP16 scales.
+
+Implementation:
+
+1. Quantize the F32 activation once per 32-value block and cache its int8 values
+   and FP32 scales for reuse by every projection consuming that activation.
+2. Process eight output rows together. Load each row's original 32 Q8 bytes,
+   issue eight SVE `sdot` operations per activation block, convert the lane
+   accumulators once, and apply the eight independent weight scales.
+3. Unroll two or four 32-value blocks while keeping row accumulators live.
+   Benchmark scalar scale conversion, vector FP16 conversion, and pre-expanded
+   FP32 scale sidecars. A sidecar is acceptable only if total single-node
+   residency stays above the 2 GB reserve.
+4. Add software prefetch two block groups ahead and compare CMG-local tensor
+   placement against process-wide interleave.
+5. Route only large dense projections through this kernel initially; retain the
+   reference F32 path for narrow alpha/beta and convolution tensors.
+
+Gate: projection cosine at least 0.9999, relative L2 at most 1%, 128-token
+greedy agreement, and at least 500 GB/s on the cold-pool and real-shape tests.
+
+### 5. Reuse activation quantization and fuse paired projections
+
+The current experimental paths quantize the same activation independently in
+each worker and again for gate/up or Q/K/V consumers.
+
+Implementation:
+
+1. Add per-token, per-source activation caches for normalized hidden state,
+   attention input, SSM input, and FFN input. Store block32 int8 values plus
+   FP32 scales, generation-tagged so no stale cache can be used.
+2. Have workers cooperatively quantize disjoint blocks once, followed by one
+   barrier.
+3. Fuse FFN gate/up row panels in one dispatch and interleave their weight
+   streams only if the real-shape benchmark shows a gain. Reuse the same cached
+   activation for attention Q/K/V and SSM QKV/gate pairs.
+4. Count activation-quantization time explicitly and ensure caching does not
+   add more barriers than it removes.
+
+Gate: at least 1.5x over the exact-Q8 single-matrix production kernel for the
+FFN gate/up pair, with unchanged numerical gates.
+
+### 6. Fix placement and measure sustained model bandwidth
+
+The isolated kernels reach 400–550 GB/s, while end-to-end decode implies only
+tens of GB/s. Verify placement rather than assuming interleave is effective.
+
+Implementation:
+
+1. Record page residency per CMG for representative tensors after selective
+   loading and after eight decode tokens.
+2. Change selective materialization so each worker first-touches exactly the
+   rows it later consumes. Keep row partitions stable across all tokens.
+3. Pin the four 12-thread worker groups to their CMGs and use the A64FX hardware
+   barrier only for cross-CMG synchronization points.
+4. Add hardware-counter collection for HBM bytes, L2 misses, SVE instructions,
+   and barrier wait cycles around one warmed token.
+
+Gate: real dense projections sustain at least 70% of their cold-pool bandwidth;
+otherwise document the counter evidence before changing the kernel again.
+
+### 7. Close modes and then return to Q4
+
+Run a minimum of 32 warm decode tokens with `max_seq=64` for all surviving Q8
+paths. Validate ordinary English, multilingual text, code, long-context input,
+and the activation-spike prompt. Promote a mode to `auto` only if it passes all
+quality gates and is faster than reference by at least 10%.
+
+If exact Q8 remains below 20 tok/s after tasks 1–6, publish the measured
+single-node ceiling and its bandwidth/serial-time decomposition rather than
+weakening accuracy. Then apply the proven execution, placement, fused-argmax,
+and activation-reuse changes to Q4; do not carry over a Q8 packing format merely
+because it exists.
 
 ## Implementation design
 
