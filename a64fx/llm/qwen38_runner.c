@@ -24,6 +24,9 @@ extern void fapp_stop(const char *, int, int);
 extern double tf_decode_matvec_ms;
 extern double tf_decode_matvec_bytes;
 extern long tf_decode_matvec_cnt;
+extern double tf_decode_attn_qkv_ms, tf_decode_attn_out_ms;
+extern double tf_decode_ssm_in_ms, tf_decode_ssm_core_ms, tf_decode_ssm_out_ms;
+extern double tf_decode_ffn_gateup_ms, tf_decode_ffn_down_ms;
 
 static double now_sec(void) {
     struct timespec t;
@@ -39,11 +42,13 @@ static int argmax(const float *x, int n) {
 
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
-                    "[--threads N] [--spec-k 0..4] [--mmap]\n", p);
+                    "[--threads N] [--spec-k 0..4] [--mmap] "
+                    "[--q8-mode auto|reference|block64|row]\n", p);
 }
 
 int main(int argc, char **argv) {
     const char *path = NULL, *prompt = "Hello";
+    const char *q8_mode = "auto";
     int max_gen = 16, max_seq = 512, threads = 48, spec_k = 0, mmap_weights = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--prompt") && ++i < argc) prompt = argv[i];
@@ -51,6 +56,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--max-seq") && ++i < argc) max_seq = atoi(argv[i]);
         else if (!strcmp(argv[i], "--threads") && ++i < argc) threads = atoi(argv[i]);
         else if (!strcmp(argv[i], "--spec-k") && ++i < argc) spec_k = atoi(argv[i]);
+        else if (!strcmp(argv[i], "--q8-mode") && ++i < argc) q8_mode = argv[i];
         else if (!strcmp(argv[i], "--mmap")) mmap_weights = 1;
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else { usage(argv[0]); return 2; }
@@ -59,18 +65,48 @@ int main(int argc, char **argv) {
         usage(argv[0]); return 2;
     }
 
+    if (strcmp(q8_mode, "auto") && strcmp(q8_mode, "reference") &&
+        strcmp(q8_mode, "block64") && strcmp(q8_mode, "row")) {
+        usage(argv[0]); return 2;
+    }
     double load0 = now_sec();
-    gguf_context *g = gguf_open_multi(path, mmap_weights ? 1 : 0);
+    /* Inspect through a lazy mapping first. Q8 cannot afford a full anonymous
+     * GGUF allocation, while smaller formats are reopened through the normal
+     * anonymous/NUMA loader. */
+    setenv("GGUF_LAZY_MMAP", "1", 0);
+    gguf_context *g = gguf_open_multi(path, 1);
     if (!g) return 1;
+    int q8_tensors = 0;
+    for (uint64_t i = 0; i < g->n_tensors; i++)
+        if (g->tensors[i].type == GGML_TYPE_Q8_0 && g->tensors[i].n_dims >= 2)
+            q8_tensors++;
+    int q8_model = q8_tensors > 100;
+    if (!q8_model && !mmap_weights) {
+        gguf_close(g);
+        g = gguf_open_multi(path, 0);
+        if (!g) return 1;
+    }
     bpe_vocab *v = bpe_vocab_load(g);
     transformer_model *m = transformer_load(g, max_seq);
     if (!v || !m) return 1;
     if (threads > 1) transformer_set_threads(m, threads);
-    transformer_numa_setup(m, g);
+    size_t q8_resident = 0;
+    if (q8_model && !mmap_weights) {
+        if (spec_k) {
+            fprintf(stderr, "qwen38: selective Q8 residency currently requires --spec-k 0\n");
+            return 1;
+        }
+        int resident_mode = !strcmp(q8_mode, "row") ? 1 :
+                            !strcmp(q8_mode, "block64") ? 2 : 0;
+        q8_resident = transformer_materialize_q8_decode(m, g, resident_mode);
+        if (!q8_resident) return 1;
+    } else if (!mmap_weights) {
+        transformer_numa_setup(m, g);
+    }
     if (!getenv("TF_NO_PANEL")) transformer_build_panels(m);
     fprintf(stderr, "qwen38: load=%.3fs trunk=%d nextn=%d format=%s\n",
             now_sec() - load0, m->n_layers, m->n_nextn_layers,
-            mmap_weights ? "mmap" : "anonymous");
+            mmap_weights ? "mmap" : (q8_resident ? "selective-q8" : "anonymous"));
     if (spec_k && !m->nextn.loaded) {
         fprintf(stderr, "qwen38: --spec-k requires native NextN tensors\n");
         return 1;
@@ -93,6 +129,9 @@ int main(int argc, char **argv) {
     tf_decode_matvec_ms = 0.0;
     tf_decode_matvec_bytes = 0.0;
     tf_decode_matvec_cnt = 0;
+    tf_decode_attn_qkv_ms = tf_decode_attn_out_ms = 0.0;
+    tf_decode_ssm_in_ms = tf_decode_ssm_core_ms = tf_decode_ssm_out_ms = 0.0;
+    tf_decode_ffn_gateup_ms = tf_decode_ffn_down_ms = 0.0;
     double dec0 = now_sec();
     fapp_start("qwen38_decode", 1, 0);
     long mtp_match = 0, mtp_total = 0;
@@ -137,6 +176,13 @@ int main(int argc, char **argv) {
                 mat_ms / (pos - nt), (dt * 1000.0 - mat_ms) / (pos - nt),
                 100.0 * mat_ms / (dt * 1000.0), mat_bw,
                 tf_decode_matvec_cnt / (pos - nt));
+        fprintf(stderr, "qwen38: stages ms/tok attn_qkv=%.1f attn_out=%.1f "
+                        "ssm_in=%.1f ssm_core=%.1f ssm_out=%.1f "
+                        "ffn_gateup=%.1f ffn_down=%.1f\n",
+                tf_decode_attn_qkv_ms / (pos - nt), tf_decode_attn_out_ms / (pos - nt),
+                tf_decode_ssm_in_ms / (pos - nt), tf_decode_ssm_core_ms / (pos - nt),
+                tf_decode_ssm_out_ms / (pos - nt),
+                tf_decode_ffn_gateup_ms / (pos - nt), tf_decode_ffn_down_ms / (pos - nt));
     }
 
     free(tok);

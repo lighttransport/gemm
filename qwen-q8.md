@@ -38,6 +38,43 @@ scale conversion, and scale application are material costs. A 20 tok/s result
 requires roughly 540 GB/s over 27 GB before non-matvec work, so the aggressive
 row-scaled path must remain gated by end-to-end quality.
 
+## Implemented measurements
+
+The first implementation pass fixed the serialized SSM projections and split
+the 48 independent recurrent heads across the 48 persistent workers. It also
+added selective Q8 residency and two explicitly selected experimental SDOT
+formats. Four-token measurements on `a35-1110s` are:
+
+| Mode | Resident decode weights | Load | Decode | Greedy output for prompt `x` |
+| --- | ---: | ---: | ---: | --- |
+| Q4 reference | 17.9 GB | 16.094 s | **1.195 tok/s** | unchanged: `ĊThá»©ĠBa,` |
+| Q8 `reference` | 27.223 GB | 61.127 s | **0.843 tok/s** (8 tokens, profiling off) | `ĊThá»©Ġhai,Ġ19/` |
+| Q8 `row` | 25.639 GB | 70.443 s | **0.822 tok/s** | differs: `ĊThá»©ĠBa,` |
+| Q8 `block64` | 26.423 GB | 76.857 s | **0.868 tok/s** | matches reference on this short prompt |
+
+For Q4, cooperative SSM execution reduced `ssm_core` from 89.4 to 45.9
+ms/token and improved the earlier 1.144 tok/s intermediate result to 1.195
+tok/s. For resident reference Q8, the measured stage costs were 10.8 ms
+attention QKV, 4.9 ms attention output, 36.7 ms SSM input projections, 300.6
+ms SSM core, 15.6 ms SSM output, 102.5 ms FFN gate/up, and 53.8 ms FFN down per
+token. The remaining unclassified time, including the very large vocabulary
+head, norms, barriers, and serial SSM preparation, is now the dominant part of
+the 1.056 s/token total.
+
+Stage instrumentation is measurably intrusive on this machine: a final
+instrumented reference run was 0.773 tok/s versus 0.843 tok/s without it. The
+table therefore uses the uninstrumented timing and the stage numbers only for
+attribution. A final Q4 mmap correctness rerun also reproduced
+`ĊThá»©ĠBa,`; as expected for faulting the 17.9 GB file every token, it achieved
+only 0.031 tok/s. A second anonymous Q4 load was killed by the batch node, so
+the earlier successful 1.195 tok/s anonymous result is retained as its speed
+measurement.
+
+Neither experimental SDOT representation passes the performance gate. `row`
+also fails even the short greedy-output gate. `auto` therefore remains the
+resident GGUF Q8 reference path; the experimental modes require explicit
+`--q8-mode row` or `--q8-mode block64`.
+
 ## Root cause
 
 The persistent Qwen worker parallelizes attention and dense FFN rows, but for
@@ -60,8 +97,8 @@ execution structure precedes further kernel tuning.
    tensor, and abort loading before `MemAvailable` falls below 2 GB.
 4. Provide three Q8 modes:
    - `reference`: resident GGUF Q8_0 with F32 activations.
-   - `block64`: eight-row, 64-column panels retaining original Q8 values and
-     block scales, with per-64 activation quantization and SVE SDOT.
+   - `block64`: eight-row, 64-column panels re-quantized to one weight scale per
+     64 values, with per-64 activation quantization and SVE SDOT.
    - `row`: eight-row int8 panels with one weight and activation scale, full-K
      int32 accumulation, and scale application once per output row.
 5. Quantize each source activation once and reuse it for gate/up and Q/K/V.
