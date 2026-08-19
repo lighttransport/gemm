@@ -2,17 +2,18 @@
 set -eu
 
 usage() {
-    echo "usage: $0 --model PATH --mode single|pp|tp --nodes N [runner options]" >&2
+    echo "usage: $0 --model PATH --mode single|pp|tp --nodes N [--stage-dir DIR] [runner options]" >&2
     exit 2
 }
 
-model= mode= nodes=
+model= mode= nodes= stage_dir=
 rest=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --model) [ "$#" -ge 2 ] || usage; model=$2; shift 2 ;;
         --mode) [ "$#" -ge 2 ] || usage; mode=$2; shift 2 ;;
         --nodes) [ "$#" -ge 2 ] || usage; nodes=$2; shift 2 ;;
+        --stage-dir) [ "$#" -ge 2 ] || usage; stage_dir=$2; shift 2 ;;
         --) shift; break ;;
         *) break ;;
     esac
@@ -26,6 +27,17 @@ threads=${LLM_THREADS:-48}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$threads}
 export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
 export OMP_PLACES=${OMP_PLACES:-cores}
+
+if [ -n "$stage_dir" ]; then
+    staged_model=$stage_dir/$(basename -- "$model")
+    if [ "$nodes" -eq 1 ]; then
+        "$here/stage_gguf_shards.sh" "$model" "$stage_dir"
+    else
+        export OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43
+        mpiexec -np "$nodes" "$here/stage_gguf_shards.sh" "$model" "$stage_dir"
+    fi
+    model=$staged_model
+fi
 
 case "$mode" in
     single)

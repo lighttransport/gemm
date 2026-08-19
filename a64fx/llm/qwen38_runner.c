@@ -13,6 +13,18 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef QWEN38_FAPP
+extern void fapp_start(const char *, int, int);
+extern void fapp_stop(const char *, int, int);
+#else
+#define fapp_start(...) ((void)0)
+#define fapp_stop(...)  ((void)0)
+#endif
+
+extern double tf_decode_matvec_ms;
+extern double tf_decode_matvec_bytes;
+extern long tf_decode_matvec_cnt;
+
 static double now_sec(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -78,7 +90,11 @@ int main(int argc, char **argv) {
         if (spec_k) transformer_nextn_logits(m, tok[pos], transformer_get_hidden(m), pos);
     }
     int32_t cur = argmax(logits, m->n_vocab);
+    tf_decode_matvec_ms = 0.0;
+    tf_decode_matvec_bytes = 0.0;
+    tf_decode_matvec_cnt = 0;
     double dec0 = now_sec();
+    fapp_start("qwen38_decode", 1, 0);
     long mtp_match = 0, mtp_total = 0;
     int pending_draft = -1;
     for (int n = 0; n < max_gen; n++, pos++) {
@@ -107,12 +123,21 @@ int main(int argc, char **argv) {
         if (cur == v->eos_id || cur == v->eot_id) break;
     }
     fputc('\n', stdout);
+    fapp_stop("qwen38_decode", 1, 0);
     double dt = now_sec() - dec0;
     fprintf(stderr, "qwen38: decode=%d tokens %.3fs %.3f tok/s",
             pos - nt, dt, dt > 0 ? (pos - nt) / dt : 0.0);
     if (mtp_total) fprintf(stderr, " mtp_greedy_match=%ld/%ld alpha=%.4f",
                            mtp_match, mtp_total, (double)mtp_match / mtp_total);
     fputc('\n', stderr);
+    if (getenv("TF_DPROF")) {
+        double mat_ms = tf_decode_matvec_ms;
+        double mat_bw = mat_ms > 0.0 ? tf_decode_matvec_bytes / (mat_ms * 1e6) : 0.0;
+        fprintf(stderr, "qwen38: dprof matvec=%.1f ms/tok serial=%.1f ms/tok matvec=%.1f%% BW=%.1f GB/s dispatches=%ld/tok\n",
+                mat_ms / (pos - nt), (dt * 1000.0 - mat_ms) / (pos - nt),
+                100.0 * mat_ms / (dt * 1000.0), mat_bw,
+                tf_decode_matvec_cnt / (pos - nt));
+    }
 
     free(tok);
     transformer_free(m);

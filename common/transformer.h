@@ -820,6 +820,62 @@ static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_byte
                                   const float *x, int n_cols, int row_start, int row_end);
 
 #if defined(__ARM_FEATURE_SVE)
+/* Q4_K and the other K-quants use the generic dequantizer below.  Keep that
+ * conversion intact, but reduce the resulting F32 row with SVE rather than
+ * scalar C. */
+static inline float tf_f32_dot_sve(const float *a, const float *b, int n) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t acc = svdup_f32(0.0f);
+    int i = 0;
+    int vl = (int)svcntw();
+    for (; i + vl <= n; i += vl)
+        acc = svmla_x(pg, acc, svld1(pg, a + i), svld1(pg, b + i));
+    float sum = svaddv_f32(pg, acc);
+    if (i < n) {
+        svbool_t tail = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+        sum += svaddv_f32(tail, svmul_x(tail, svld1(tail, a + i), svld1(tail, b + i)));
+    }
+    return sum;
+}
+
+/* Fused Q4_K dequantization and dot product.  A Q4_K super-block contains
+ * eight 32-value sub-blocks: each pair shares one byte slice, with low and
+ * high nibbles forming the two sub-blocks. */
+static inline float tf_q4_k_dot_sve(const block_q4_K *blocks, const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const int vl = (int)svcntw();
+    svfloat32_t acc = svdup_f32(0.0f);
+    const int nb = n / 256;
+    for (int ib = 0; ib < nb; ib++) {
+        const block_q4_K *b = &blocks[ib];
+        const float d = ggml_fp16_to_fp32(b->d);
+        const float dmin = ggml_fp16_to_fp32(b->dmin);
+        int is = 0;
+        for (int g = 0; g < 256; g += 64, is += 2) {
+            uint8_t sc, mv;
+            get_scale_min_k4(is, b->scales, &sc, &mv);
+            const float d0 = d * sc, m0 = dmin * mv;
+            get_scale_min_k4(is + 1, b->scales, &sc, &mv);
+            const float d1 = d * sc, m1 = dmin * mv;
+            const svfloat32_t vd0 = svdup_f32(d0), vm0 = svdup_f32(m0);
+            const svfloat32_t vd1 = svdup_f32(d1), vm1 = svdup_f32(m1);
+            const uint8_t *q = b->qs + (g / 64) * 32;
+            for (int k = 0; k < 32; k += vl) {
+                svbool_t pt = (k + vl <= 32) ? pg : svwhilelt_b32((uint64_t)k, (uint64_t)32);
+                svuint32_t qv = svld1ub_u32(pt, q + k);
+                svfloat32_t xv = svld1(pt, x + ib * 256 + g + k);
+                svfloat32_t wv = svsub_x(pt, svmul_x(pt, svcvt_f32_u32_x(pt, svand_n_u32_x(pt, qv, 0x0f)), vd0), vm0);
+                acc = svmla_m(pt, acc, wv, xv);
+                qv = svld1ub_u32(pt, q + k);
+                xv = svld1(pt, x + ib * 256 + g + 32 + k);
+                wv = svsub_x(pt, svmul_x(pt, svcvt_f32_u32_x(pt, svlsr_n_u32_x(pt, qv, 4)), vd1), vm1);
+                acc = svmla_m(pt, acc, wv, xv);
+            }
+        }
+    }
+    return svaddv_f32(pg, acc);
+}
+
 /* int8 SDOT row dot: sum(w[k]*x[k]) over K via svdot (4 int8 MAC / int32 lane). */
 static inline int32_t tf_int8_dot(const int8_t *w, const int8_t *x, int K) {
     svint32_t a = svdup_s32(0); svbool_t pb = svptrue_b8(); int vlb = (int)svcntb();
@@ -915,6 +971,15 @@ static void *tf_qmatvec_worker(void *arg) {
                               t->x, n_cols, t->row_start, t->row_end);
         return NULL;
     }
+#if defined(__ARM_FEATURE_SVE)
+    if (t->mat->type == GGML_TYPE_Q4_K) {
+        size_t row_bytes = (size_t)(n_cols / 256) * sizeof(block_q4_K);
+        const block_q4_K *base = (const block_q4_K *)t->mat->data;
+        for (int i = t->row_start; i < t->row_end; i++)
+            t->dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * row_bytes), t->x, n_cols);
+        return NULL;
+    }
+#endif
     for (int i = t->row_start; i < t->row_end; i++) {
         tf_dequant_row(t->mat, i, t->tmp);
 #if defined(__AVX2__) && defined(__FMA__)
@@ -938,8 +1003,12 @@ static void *tf_qmatvec_worker(void *arg) {
         float sum = _mm_cvtss_f32(s4);
         for (; j < n_cols; j++) sum += t->tmp[j] * t->x[j];
 #else
+#if defined(__ARM_FEATURE_SVE)
+        float sum = tf_f32_dot_sve(t->tmp, t->x, n_cols);
+#else
         float sum = 0.0f;
         for (int j = 0; j < n_cols; j++) sum += t->tmp[j] * t->x[j];
+#endif
 #endif
         t->dst[i] = sum;
     }
@@ -2291,13 +2360,24 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
     } else if (mat->type == GGML_TYPE_Q4_0) {
         size_t rb = (size_t)(n_cols / 32) * sizeof(block_q4_0);
         tf_matvec_q4_0_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
+#if defined(__ARM_FEATURE_SVE)
+    } else if (mat->type == GGML_TYPE_Q4_K) {
+        size_t rb = (size_t)(n_cols / 256) * sizeof(block_q4_K);
+        const block_q4_K *base = (const block_q4_K *)mat->data;
+        for (int i = row_start; i < row_end; i++)
+            dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * rb), x, n_cols);
+#endif
     } else {
         float *tmp = (float *)malloc(n_cols * sizeof(float));
         if (!tmp) return;
         for (int i = row_start; i < row_end; i++) {
             tf_dequant_row(mat, i, tmp);
+#if defined(__ARM_FEATURE_SVE)
+            float sum = tf_f32_dot_sve(tmp, x, n_cols);
+#else
             float sum = 0.0f;
             for (int j = 0; j < n_cols; j++) sum += tmp[j] * x[j];
+#endif
             dst[i] = sum;
         }
         free(tmp);
@@ -2399,6 +2479,15 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         tf_matvec_q4_0_rows(dst, (const uint8_t *)mat->data, row_bytes, x, n_cols, 0, n_rows);
         return;
     }
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->type == GGML_TYPE_Q4_K) {
+        size_t row_bytes = (size_t)(n_cols / 256) * sizeof(block_q4_K);
+        const block_q4_K *base = (const block_q4_K *)mat->data;
+        for (int i = 0; i < n_rows; i++)
+            dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * row_bytes), x, n_cols);
+        return;
+    }
+#endif
     for (int i = 0; i < n_rows; i++) {
         tf_dequant_row(mat, i, tmp);
 #if defined(__AVX2__) && defined(__FMA__)
@@ -2422,8 +2511,12 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         float sum = _mm_cvtss_f32(s4);
         for (; j < n_cols; j++) sum += tmp[j] * x[j];
 #else
+#if defined(__ARM_FEATURE_SVE)
+        float sum = tf_f32_dot_sve(tmp, x, n_cols);
+#else
         float sum = 0.0f;
         for (int j = 0; j < n_cols; j++) sum += tmp[j] * x[j];
+#endif
 #endif
         dst[i] = sum;
     }
@@ -4028,7 +4121,10 @@ static void tf_numa_init(transformer_model *m) {
     if ((env = getenv("NUMA_N_CMGS")))       m->numa.n_cmgs = atoi(env);
     if ((env = getenv("NUMA_CMG_BUDGET_GB"))) m->numa.per_cmg_budget = (size_t)(atof(env) * 1024.0 * 1024.0 * 1024.0);
     if ((env = getenv("NUMA_ALIGNMENT")))     m->numa.alignment = (size_t)atol(env);
-    if (getenv("NUMA_DISTRIBUTE"))            m->numa.enabled = 1;
+    /* NUMA_INTERLEAVE is sufficient for anonymous weights, but when the
+     * loader has a file descriptor available we can do better: parallel
+     * first-touch places each tensor row range on the CMG that consumes it. */
+    if (getenv("NUMA_DISTRIBUTE") || getenv("NUMA_INTERLEAVE")) m->numa.enabled = 1;
 }
 
 /* Distribute a buffer across threads via parallel memset (first-touch placement) */
@@ -4282,6 +4378,14 @@ static void tf_l2_norm(float *v, int n, float eps) {
     for (; i + 7 < n; i += 8)
         _mm256_storeu_ps(v + i, _mm256_mul_ps(_mm256_loadu_ps(v + i), vinv));
     for (; i < n; i++) v[i] *= inv;
+#elif defined(__ARM_FEATURE_SVE)
+    float ss = tf_f32_dot_sve(v, v, n);
+    float inv = 1.0f / sqrtf(ss + eps);
+    svfloat32_t vi = svdup_f32(inv);
+    for (int i = 0; i < n; i += (int)svcntw()) {
+        svbool_t pt = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+        svst1(pt, v + i, svmul_x(pt, svld1(pt, v + i), vi));
+    }
 #else
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += v[i] * v[i];
@@ -4506,6 +4610,41 @@ static void *tf_ssm_recurrence_worker(void *arg) {
                 o_h[r] = _mm_cvtss_f32(s4);
             }
         }
+#elif defined(__ARM_FEATURE_SVE)
+        /* A64FX path: the old fallback was scalar C for the three 128x128
+         * state matvecs.  Keep the same update order, but use SVE dot/FMA. */
+        {
+            svfloat32_t vs = svdup_f32(t->scale);
+            for (int i = 0; i < ds; i += (int)svcntw()) {
+                svbool_t pt = svwhilelt_b32((uint64_t)i, (uint64_t)ds);
+                svst1(pt, q_h + i, svmul_x(pt, svld1(pt, q_h + i), vs));
+            }
+            float decay = expf(t->alpha[h]);
+            svfloat32_t vd = svdup_f32(decay);
+            for (int i = 0; i < d2; i += (int)svcntw()) {
+                svbool_t pt = svwhilelt_b32((uint64_t)i, (uint64_t)d2);
+                svst1(pt, state + i, svmul_x(pt, svld1(pt, state + i), vd));
+            }
+            float sk[128], delta[128];
+            for (int r = 0; r < ds; r++)
+                sk[r] = tf_f32_dot_sve(state + r * ds, k_h, ds);
+            svfloat32_t vb = svdup_f32(t->beta_arr[h]);
+            for (int i = 0; i < ds; i += (int)svcntw()) {
+                svbool_t pt = svwhilelt_b32((uint64_t)i, (uint64_t)ds);
+                svst1(pt, delta + i, svmul_x(pt,
+                    svsub_x(pt, svld1(pt, v_h + i), svld1(pt, sk + i)), vb));
+            }
+            for (int r = 0; r < ds; r++) {
+                svfloat32_t vr = svdup_f32(delta[r]);
+                float *row = state + r * ds;
+                for (int c = 0; c < ds; c += (int)svcntw()) {
+                    svbool_t pt = svwhilelt_b32((uint64_t)c, (uint64_t)ds);
+                    svst1(pt, row + c, svmla_x(pt, svld1(pt, row + c), vr, svld1(pt, k_h + c)));
+                }
+            }
+            for (int r = 0; r < ds; r++)
+                o_h[r] = tf_f32_dot_sve(state + r * ds, q_h, ds);
+        }
 #else
         /* Scalar fallback */
         for (int i = 0; i < ds; i++) q_h[i] *= t->scale;
@@ -4647,6 +4786,16 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
                     s += w_trans[f * qkv_dim + j] * conv_st[row_off[f] + j];
                 conv_out[j] = s + w_trans[n_hist * qkv_dim + j] * qkv_buf[j];
             }
+        }
+#elif defined(__ARM_FEATURE_SVE)
+        for (int j = 0; j < qkv_dim; j += (int)svcntw()) {
+            svbool_t pt = svwhilelt_b32((uint64_t)j, (uint64_t)qkv_dim);
+            svfloat32_t sum = svmul_x(pt, svld1(pt, w_trans + n_hist * qkv_dim + j),
+                                      svld1(pt, qkv_buf + j));
+            for (int f = 0; f < n_hist; f++)
+                sum = svmla_x(pt, sum, svld1(pt, w_trans + f * qkv_dim + j),
+                              svld1(pt, conv_st + row_off[f] + j));
+            svst1(pt, conv_out + j, sum);
         }
 #else
         for (int j = 0; j < qkv_dim; j++) {

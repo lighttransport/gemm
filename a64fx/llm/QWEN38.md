@@ -36,6 +36,12 @@ a64fx/llm/run_qwen38.sh --model MODEL.gguf --mode tp --nodes 12 -- \
   --token-id 1 --max-gen 1 --spec-k 1
 ```
 
+On a fresh allocation, add `--stage-dir /local/qwen38/27b` before the runner
+options. The launcher fans the source file (and every split shard) out once per
+node using direct I/O for whole-MiB blocks, fsyncs the small tail, and reuses an
+existing same-size local file. This avoids accumulating source and dirty
+destination pages in the 32 GB HBM page cache.
+
 PP assigns byte-balanced contiguous trunk ranges. Each rank lazily maps the
 GGUF and faults only its range; rank 0 owns embedding work and the last rank
 owns final normalization, vocabulary projection, and NextN. This avoids ever
@@ -62,3 +68,7 @@ Current validation:
   token, and the same second token ID (`3165`) as Q8/two-node controls.
 - Native TP MTP K=1 was exercised on both Q8 and BF16; the corrected topology
   reported its first-draft greedy miss as `0/1` for this one-token prefix.
+- Q8 two-node TP from node-local storage reproduced token ID `3165`; the
+  one-token baseline measured 33.177 s prefill and 26.203 s decode. The current
+  `transformer_build_panels()` hook is a no-op, so `TF_NO_PANEL=0` is not an
+  optimization (the parity trial measured 25.987/26.923 s).
