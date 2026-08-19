@@ -1,6 +1,147 @@
 # Qwen3.8-27B Q8 on one A64FX node
 
+## Current model location and safe staging procedure
+
+The Qwen3.8 27B model directory is:
+
+```text
+/home/u14346/models/qwen38/27b
+```
+
+Available files on the model filesystem are:
+
+| File | Size | Intended use |
+| --- | ---: | --- |
+| `Qwen3.8-27B-Q8_0.gguf` | 29,047,086,048 bytes | Single-node Q8 decode target |
+| `Qwen3.8-27B-UD-Q4_K_XL.gguf` | 17,923,394,624 bytes | Q4 comparison path |
+| `bf16/Qwen3.8-27B-BF16-00001-of-00002.gguf` | 49,986,159,616 bytes | BF16 reference shards; too large for this single-node Q8 run |
+| `bf16/Qwen3.8-27B-BF16-00002-of-00002.gguf` | 4,671,576,000 bytes | BF16 reference shard |
+
+`/local` has approximately 60 GB free in the current allocation. Stage the Q8
+file into `/local/u14346/qwen38` with the repository helper:
+
+```sh
+MODEL=/home/u14346/models/qwen38/27b/Qwen3.8-27B-Q8_0.gguf
+STAGE=/local/u14346/qwen38
+sh a64fx/llm/stage_gguf_shards.sh "$MODEL" "$STAGE"
+```
+
+The helper copies aligned 1 MiB blocks with direct I/O, fsyncs the tail, checks
+the final size, and publishes atomically. It is idempotent and reuses a staged
+file whose size already matches. Do not use `cp` or an unbounded whole-file
+read for this 29 GB model: the node has 32 GB HBM and page-cache accumulation
+can stall or kill the interactive session.
+
+The staged model is then:
+
+```text
+/local/u14346/qwen38/Qwen3.8-27B-Q8_0.gguf
+```
+
+## Single-node staged decode benchmark
+
+Build and run the selective-resident Q8 reference path from the repository
+root. This keeps the embedding and unused NextN tensors file-backed while
+materializing ordinary decode tensors anonymously:
+
+```sh
+make -C a64fx/llm qwen38_runner CC=fcc OPENMP=1
+LLM_THREADS=48 OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  numactl --interleave=all sh a64fx/llm/run_qwen38.sh \
+  --model /home/u14346/models/qwen38/27b/Qwen3.8-27B-Q8_0.gguf \
+  --mode single --nodes 1 --stage-dir /local/u14346/qwen38 \
+  --prompt x --max-gen 32 --max-seq 64 --q8-mode reference
+```
+
+For a profiling comparison, add `TF_DPROF=1`; use the uninstrumented run for
+the headline throughput. Monitor `MemAvailable` during loading and decode and
+  terminate the run before it falls below 2 GB. The expected correctness gate is
+the same greedy output as the Q8 reference and stable decode over at least 32
+generated tokens. Record load time, resident bytes, decode tokens, tok/s, and
+the stage ledger in this document after each benchmark.
+
+On the current node, `numactl --interleave=all` is important for the staged
+anonymous Q8 buffers. A warmed 32-token corrected reference run measured
+3.627 tok/s with it versus 2.820 tok/s without it, with identical output.
+Explicit `NUMA_DISTRIBUTE=1 NUMA_N_CMGS=4` pinning measured 3.387 tok/s and
+was slower than interleaving. The process-local `NUMA_INTERLEAVE=1` policy
+also works, but measured 3.203 tok/s in one repeat; use the external
+`numactl` launch for the current headline.
+
 ## Measured baseline
+
+## Latest staged benchmark (2026-08-20)
+
+The Q8 model was staged from
+`/home/u14346/models/qwen38/27b/Qwen3.8-27B-Q8_0.gguf` to
+`/local/u14346/qwen38/Qwen3.8-27B-Q8_0.gguf` using
+`stage_gguf_shards.sh`. The corrected persistent-worker build was run with 48
+threads, `max_seq=64`, prompt `x`, no NextN draft, and `--q8-mode reference`.
+
+| Run | Load | Decode | Throughput | Resident Q8 | Greedy output prefix |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 32-token uninstrumented | 66.787 s | 11.405 s / 32 | **2.806 tok/s** | 27.223 GB | `ĊThá»© Ġhai, Ġ19/09/2022 Ġ14:30` |
+| 8-token uninstrumented repeat 1 | 71.410 s | 3.908 s / 8 | 2.047 tok/s | 27.223 GB | `ĊThá»© Ġhai, Ġ19/` |
+| 8-token uninstrumented repeat 2 | 70.294 s | 4.002 s / 8 | 1.999 tok/s | 27.223 GB | `ĊThá»© Ġhai, Ġ19/` |
+
+The 32-token run reported `MemAvailable=3948.7 MB` immediately after
+materialization and completed without OOM or memory thrashing. Its output
+matches the established Q8-reference prefix. A corrected profiled 8-token run
+reported 2.229 tok/s and the following approximate stage ledger (profiling is
+intrusive and is not the headline rate):
+
+```text
+attn_qkv=14.4 ms  attn_out=6.2 ms  ssm_in=47.6 ms
+ssm_prepare=53.9 ms  ssm_core=18.7 ms  ssm_out=17.8 ms
+ffn_gateup=134.6 ms  ffn_down=74.7 ms  lm_head=12.6 ms
+```
+
+The persistent Qwen trunk does not update the older pooled-matvec profiler;
+its `matvec=0` report is expected. The stage values above are the useful
+ledger for this path. An earlier 2.774 tok/s measurement from the first
+cooperative-Q/K implementation was discarded because a missing barrier caused
+nondeterministic output; the normalization-to-expansion barrier is now present,
+and repeated runs are deterministic.
+
+### Exact fused gate/up follow-up (2026-08-20)
+
+The persistent dense FFN now uses an exact four-row fused gate/up Q8 kernel.
+It streams the gate and up matrices together and loads the shared F32
+activation vector once, while retaining the reference Q8_0 dequantization and
+accumulation order. Other tensor types and block64/row experimental formats
+fall back to the previous path automatically; no activation quantization is
+enabled.
+
+Build and short validation command:
+
+```sh
+make -C a64fx/llm qwen38_runner CC=fcc OPENMP=1
+OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./a64fx/llm/build/qwen38_runner /local/u14346/qwen38/Qwen3.8-27B-Q8_0.gguf \
+  --threads 48 --prompt x --max-gen 8 --max-seq 64 --q8-mode reference
+```
+
+The post-change run produced the same greedy prefix `ĊThá»©Ġhai,Ġ19/` and
+measured 1.903 tok/s. An intrusive profiled run measured 1.982 tok/s and gave:
+
+```text
+attn_qkv=13.8 ms  attn_out=6.1 ms  ssm_in=48.9 ms
+ssm_prepare=75.3 ms  ssm_core=25.7 ms  ssm_out=17.6 ms
+ffn_gateup=121.7 ms  ffn_down=68.2 ms  lm_head=11.6 ms
+```
+
+Compared with the earlier profiled ledger, gate/up fell from 134.6 to 121.7
+ms/token and down fell from 74.7 to 68.2 ms/token, but the short uninstrumented
+rate remains within the observed ~2 tok/s variance. This is therefore kept as
+an accuracy-preserving optimization, not yet claimed as a headline throughput
+gain. A warmed 32-token run is still required before promotion.
+
+The warmed 32-token post-change run completed at 2.820 tok/s
+(11.349 s / 32 tokens), with resident Q8 decode weights still 27.223 GB,
+\`MemAvailable=3935.2 MB\` after materialization, and the same output prefix
+through `ĊThá»©Ġ19/09/2022Ġ14:30`. This is effectively tied with the earlier
+2.806 tok/s 32-token result, so the fused kernel is retained for its lower
+projection time but not presented as a large end-to-end gain.
 
 Measurements used the second node (`a35-1110s`) of job 50639255 so the Codex
 process did not consume the model node's HBM. Both model runs used 48 cores,
@@ -70,10 +211,18 @@ only 0.031 tok/s. A second anonymous Q4 load was killed by the batch node, so
 the earlier successful 1.195 tok/s anonymous result is retained as its speed
 measurement.
 
-Neither experimental SDOT representation passes the performance gate. `row`
-also fails even the short greedy-output gate. `auto` therefore remains the
-resident GGUF Q8 reference path; the experimental modes require explicit
-`--q8-mode row` or `--q8-mode block64`.
+Under the current interleaved-HBM launch, the original packed SDOT reached
+5.729 tok/s for 32 tokens and 4.981 tok/s for 128 tokens, but diverged from
+exact Q8 after the shared 32-token prefix. The packed decode layout has since
+been hardened to preserve the original Q8_0 weight bytes and both FP16
+scales; activation quantization remains approximate. This fidelity-preserving
+layout measured 4.335 tok/s for 32 tokens and 4.931 tok/s for 128 tokens, and
+still diverged at 128 tokens. FFN-only packing reached 4.596 tok/s for 32
+tokens and 4.643 tok/s for 128 tokens, with the same divergence. The row mode
+now routes correctly through its int8 kernel (the previous dispatch bug could
+SIGSEGV), but produces corrupted text at 3.892 tok/s. `auto` therefore
+remains the resident GGUF Q8 reference path; all packed modes require explicit
+selection and fail the quality gate.
 
 ## Original root cause (addressed)
 
@@ -249,10 +398,13 @@ because it exists.
 3. Open Q8 lazily and selectively materialize decode tensors. Keep embeddings
    mmap-backed, skip NextN for `spec_k=0`, discard source pages after each
    tensor, and abort loading before `MemAvailable` falls below 2 GB.
-4. Provide three Q8 modes:
+4. Provide Q8 modes:
    - `reference`: resident GGUF Q8_0 with F32 activations.
-   - `block64`: eight-row, 64-column panels re-quantized to one weight scale per
-     64 values, with per-64 activation quantization and SVE SDOT.
+   - `block64`: eight-row, 64-column panels retaining original Q8_0 weight
+     bytes/scales, with per-64 activation quantization and SVE SDOT.
+   - `block64-ffn`: packed SDOT for FFN gate/up/down only; exact elsewhere.
+   - `block64-exact`: packed original Q8_0 bytes/scales with F32 activations;
+     layout-only quality-preserving experiment.
    - `row`: eight-row int8 panels with one weight and activation scale, full-K
      int32 accumulation, and scale application once per output row.
 5. Quantize each source activation once and reuse it for gate/up and Q/K/V.
@@ -279,3 +431,288 @@ because it exists.
 
 Q4-specific packing is deferred until Q8 is closed, although Q4 receives the
 shared persistent-SSM parallelism and is remeasured for regression coverage.
+
+## Null-GEMM bandwidth probe (2026-08-20)
+
+Before judging the exact Q8 kernels against the 20 tok/s goal, use the guarded
+`TF_NULL_GEMM=1` mode. It preserves the persistent decode schedule and worker
+partitioning, reads every resident Q8 weight cache line, skips dequantization
+and dot products, and writes zero projection outputs. This is a decode-shaped
+streaming lower-compute bound; RMSNorm, recurrent/attention bookkeeping, and
+barriers still remain in the runner.
+
+Build after changing `common/transformer.h` or the runner (the Makefile does not
+track all common-header dependencies):
+
+```sh
+make -B -C a64fx/llm qwen38_runner CC=fcc OPENMP=1
+```
+
+Run against the staged model with interleaved HBM placement:
+
+```sh
+numactl --interleave=all env TF_NULL_GEMM=1 \
+  OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./a64fx/llm/build/qwen38_runner \
+  /local/u14346/qwen38/Qwen3.8-27B-Q8_0.gguf \
+  --threads 48 --prompt x --max-gen 32 --max-seq 64 --q8-mode reference
+```
+
+Observed output on the A64FX node:
+
+```text
+q8 resident: 27.223GB decode weights (reference-q8)
+decode=32 tokens 6.647s 4.814 tok/s
+null-stream=27.223 GB/tok 131.1 GB/s
+20 tok/s requires 544.5 GB/s (equiv 4.81 tok/s)
+```
+
+Thus the current decode-shaped memory-only ceiling is about 4.8 tok/s, or
+131 GB/s sustained by this path. The 20 tok/s goal requires roughly 4.15x more
+sustained bandwidth than the probe delivered. This result should be treated as
+the baseline for placement and stream-efficiency work; `TF_NULL_GEMM` is
+diagnostic only and is never selected by `auto`.
+
+### CMG-local placement follow-up
+
+The original `NUMA_DISTRIBUTE` worker affinity was round-robin (`tid % 4`),
+so contiguous row slices were consumed by remote CMGs. It now uses contiguous
+groups:
+
+```text
+tid  0..11 -> CMG0 / NUMA node 4 / cores 12..23
+tid 12..23 -> CMG1 / NUMA node 5 / cores 24..35
+tid 24..35 -> CMG2 / NUMA node 6 / cores 36..47
+tid 36..47 -> CMG3 / NUMA node 7 / cores 48..59
+```
+
+The Q8 materializer splits each tensor into the same contiguous row ranges, so
+destination pages are first-touched by the workers that later read them. Use
+the documented A64FX placement and large-page settings:
+
+```sh
+numactl -C 12-59 -m 4-7 env \
+  XOS_MMM_L_HPAGE_TYPE=hugetlbfs \
+  XOS_MMM_L_PAGING_POLICY=demand:demand:demand \
+  XOS_MMM_L_ARENA_FREE=2 XOS_MMM_L_HUGETLB_FALLBACK=1 \
+  NUMA_DISTRIBUTE=1 NUMA_N_CMGS=4 NUMA_CMG_BUDGET_GB=7 \
+  NUMA_ALIGNMENT=2097152 TF_NULL_GEMM=1 \
+  OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./a64fx/llm/build/qwen38_runner \
+  /local/u14346/qwen38/Qwen3.8-27B-Q8_0.gguf \
+  --threads 48 --prompt x --max-gen 32 --max-seq 64 --q8-mode reference
+```
+
+Set `NUMA_REPORT=1` for a non-invasive `/proc/self/numa_maps` check. The
+verified large tensors were 2 MiB hugepage mappings distributed over all four
+nodes; a representative report was `N4=11 N5=13 N6=11 N7=10`. Small tensors
+can legitimately occupy one node because they are smaller than one hugepage.
+
+The null scanner first used one SVE 512-bit load per cache line and measured
+162.1 GB/s (5.96 equivalent tok/s). It now uses eight independent SVE load
+streams, matching the A64FX raw-stream benchmark structure; the CMG-local run
+measured:
+
+```text
+null-stream=27.223 GB/tok 307.2 GB/s; 20 tok/s requires 544.5 GB/s
+equivalent throughput: 11.28 tok/s
+```
+
+The earlier interleaved baseline was 131.1 GB/s with the older scalar scanner,
+so the full progression reflects both correct CMG placement and sufficient
+outstanding loads. Hugepage settings alone changed little (151.9 GB/s in one
+repeat), so they are retained for TLB stability but are not the primary
+bandwidth fix. The remaining gap to 544.5 GB/s is now a decode-shaped stream
+and projection-scheduling problem rather than the original round-robin NUMA
+placement problem.
+
+For a pure hardware ceiling, use `TF_NULL_GEMM=2`. This skips transformer
+forward after loading and scans all 497 resident Q8 tensors as one batched pool
+stream, with the same CMG row ownership:
+
+```sh
+numactl -C 12-59 -m 4-7 env \
+  XOS_MMM_L_HPAGE_TYPE=hugetlbfs \
+  XOS_MMM_L_PAGING_POLICY=demand:demand:demand \
+  XOS_MMM_L_ARENA_FREE=2 XOS_MMM_L_HUGETLB_FALLBACK=1 \
+  NUMA_DISTRIBUTE=1 NUMA_N_CMGS=4 NUMA_CMG_BUDGET_GB=7 \
+  NUMA_ALIGNMENT=2097152 TF_NULL_GEMM=2 \
+  OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./a64fx/llm/build/qwen38_runner \
+  /local/u14346/qwen38/Qwen3.8-27B-Q8_0.gguf \
+  --threads 48 --prompt x --max-gen 32 --max-seq 64 --q8-mode reference
+```
+
+Measured result:
+
+```text
+null-batched tensors=497 27.223 GB/pass 761.3 GB/s (3 passes)
+```
+
+This reaches the expected near-800 GB/s hardware ceiling. The 307.2 GB/s
+decode-shaped result is therefore caused by per-projection scheduling and exact
+Q8 compute/dequant work, not an inter-CMG placement failure.
+
+### Packed exact-layout experiment
+
+`--q8-mode block64-exact` reorders each eligible Q8 tensor into contiguous
+8-row × 64-column groups while retaining every original Q8_0 scale and byte.
+Its F32-activation kernel is numerically quality-preserving in principle and
+matched the reference output prefix in the 32-token probe, but it measured only
+2.363 tok/s versus 3.857 tok/s for the current reference layout under the same
+CMG-local launch. It therefore remains explicit-only and is not a candidate for
+`auto`.
+
+### Exact FFN gate/up register-pressure optimization
+
+The production exact Q8 path now uses a two-row-per-projection fused gate/up
+kernel by default. It keeps the original Q8_0 scales, F32 activations, and two
+partial sums per output, but reduces live SVE state versus the four-row pair.
+Set `TF_Q8_FUSED_2ROW=0` to restore the previous kernel for an A/B check.
+
+Under the CMG-local launch, a 128-token comparison measured 4.210 tok/s with
+the new kernel versus 4.075 tok/s before it. The generated stdout was
+byte-identical (`cmp=0`). The 32-token run produced the same output prefix;
+short runs have more timing noise. This is now the default exact gate/up path.
+
+An FP32 sidecar for all Q8 block scales was also tested to remove repeated
+FP16-to-F32 conversion. It exceeded the 32 GB HBM budget during materialization
+(the process was OOM-killed), so no sidecar allocation remains in production.
+
+A two-SDOT split-int16 activation experiment was also rejected: it produced
+corrupted output and only 1.433 tok/s at 32 tokens. Its code was removed.
+
+Native NextN selective residency was tested separately. With `--spec-k 4`, the
+target-model greedy check accepted only 9/31 drafts and throughput fell to
+2.604 tok/s, so selective Q8 mode continues to require `--spec-k 0`.
+
+### Compiler scheduling
+
+`qwen38_runner` now adds Fujitsu `-Kfast` only for the `fcc` build. A 128-token
+run measured 4.295 tok/s versus 4.075 tok/s with the prior flags, and generated
+stdout was byte-identical to the reference (`cmp=0`). Other Makefile targets do
+not inherit this flag.
+
+### Four-CMG ownership and barrier check
+
+The production launch uses four CMGs explicitly:
+
+```text
+numactl -C 12-59 -m 4-7 env NUMA_DISTRIBUTE=1 NUMA_N_CMGS=4 \\
+  NUMA_CMG_BUDGET_GB=7 NUMA_ALIGNMENT=2097152 \\
+  XOS_MMM_L_HPAGE_TYPE=hugetlbfs \\
+  XOS_MMM_L_PAGING_POLICY=demand:demand:demand \\
+  XOS_MMM_L_HUGETLB_FALLBACK=1 ...
+```
+
+With 48 workers, IDs 0--11 bind to cores 12--23 (CMG0), 12--23 to
+cores 24--35 (CMG1), 24--35 to cores 36--47 (CMG2), and 36--47 to cores
+48--59 (CMG3). Large tensors are split into contiguous row ranges and each
+range is loaded/first-touched by its owning worker. This avoids the previous
+round-robin worker affinity, where each contiguous tensor slice was commonly
+remote from its consumer. Small tensors below the worker split threshold may
+remain on CMG0; they are negligible compared with the 27.223 GB Q8 decode
+working set.
+
+The resulting four-CMG placement was checked with `NUMA_REPORT=1`: representative
+large mappings used 2 MiB pages across N4--N7 (`N4=11 N5=13 N6=11 N7=10`). The
+batched null scan reached 761.3 GB/s, or about 190 GB/s per CMG when divided
+evenly, so the memory system is no longer limited to a single inter-CMG stream.
+
+An opt-in A64FX W0 hardware-barrier variant was tested (`TF_HW_BARRIER=1`) but
+deadlocked before the first decode token with workers spanning four CMGs. It is
+not part of the production path; the default WFE/SEV software barrier remains
+enabled. The barrier experiment did not change model data or output, and the
+source was reverted after the hang.
+
+### Exact Q8 row blocking
+
+Individual Q8 projections now default to an exact four-row SVE kernel. The
+previous eight-row kernel kept 16 vector accumulators live and was slower on
+A64FX, likely from register pressure. Both kernels preserve the original
+Q8_0 block order, FP16 scale conversion, and FP32 accumulation structure.
+`TF_Q8_ROWS=8` restores the old kernel for comparison.
+
+On identical 32-token runs with separate stdout capture:
+
+```text
+TF_Q8_ROWS=4   4.022 tok/s
+TF_Q8_ROWS=8   3.606 tok/s
+stdout cmp     0 (identical SHA-256)
+```
+
+The four-row kernel is therefore the production default; this optimization
+changes scheduling/register pressure only and does not change model quality.
+The two-row experimental kernel also passed the 64-token output check but
+measured 4.308 tok/s versus 4.361 tok/s for four rows in the longer A/B, so
+`TF_Q8_ROWS=2` remains available for hardware-specific testing and is not the
+default.
+
+### Hierarchical four-CMG barrier
+
+The persistent decoder now uses a software hierarchical barrier by default.
+Each CMG first synchronizes its 12 workers on a cache-line-local counter; only
+the four CMG leaders then exchange the global sense. This removes the
+48-thread inter-CMG atomic counter from every layer stage. Set
+`TF_HIER_BARRIER=0` to restore the old barrier for an A/B check.
+
+With the same four-row exact Q8 kernel and 48-core/four-CMG launch:
+
+```text
+old barrier, 32 tokens     3.975 tok/s
+hierarchical, 32 tokens    4.465 tok/s
+hierarchical, 64 tokens    4.463 tok/s
+stdout cmp                 0 (32- and 64-token checks)
+```
+
+The hierarchical path is now production default. It changes only worker
+synchronization; the generated output remained byte-identical.
+
+An exact scale-after arithmetic variant was also tested. Applying each
+Q8_0 block scale after its local dot reduction changed the floating-point
+rounding order and required four horizontal reductions per block; it measured
+only 2.764 tok/s and failed the stdout comparison. It was removed from the
+production source.
+
+A distance-8 software-prefetch variant of the four-row kernel was also tested
+at 4.333 tok/s with identical output. It was within normal run noise of the
+default and added instruction overhead, so it was removed.
+
+### Packed FFN default
+
+The `block64-ffn` mode packs only FFN gate/up weights into 8-row × 64-column
+groups and uses the A64FX SDOT path with per-64 activation quantization.
+Attention, SSM, FFN down, and the output head remain on the reference exact
+Q8 path. Greedy stdout was byte-identical to `reference` for 32 generated
+tokens from three probes (`x`, `Hello`, and `The quick brown fox jumps over
+the lazy dog.`); the 64-token `x` probe also matched.
+
+Measured decode rates:
+
+```text
+prompt                  reference     block64-ffn
+x, 64 tokens              4.463          5.448 tok/s
+Hello, 32 tokens          4.372          4.699 tok/s
+fox prompt, 32 tokens     4.868          6.042 tok/s
+```
+
+`--q8-mode auto` remains the reference exact path. `--q8-mode block64-ffn`
+is explicit-only: it passed the 32/64-token probes above but diverged from
+reference at 128 generated tokens (first output difference around byte 327).
+The packed mode is therefore a useful speed experiment, not a quality-safe
+default; its activation quantization must not be used when accuracy is the
+requirement.
+
+Finer per-32 and per-16 activation-scale variants were tested while chasing
+the 128-token divergence. Per-32 remained divergent; per-16 restored the
+128-token output but fell to 3.073 tok/s. Both experiments were removed, and
+the explicit packed mode is back to its faster per-64 scale implementation.
+
+An A64FX sector-1 pointer-tag experiment for Q8 weight streams was also
+rejected: with the documented `FLIB_SCCR_*` settings it produced identical
+output but only 4.020 tok/s, below the untagged exact path. No sector tagging
+remains in production.
+
+Compiler reassociation was tested with an additional `-Ofast` flag. It kept
+the 32-token greedy output identical but measured only 4.189 tok/s, below the
+normal `-O3 -Kfast` build, so the production flags were restored.
