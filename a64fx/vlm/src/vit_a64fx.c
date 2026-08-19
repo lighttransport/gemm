@@ -23,6 +23,7 @@
 /* These give us vision_model / vision_block / vision_deepstack / qtensor
  * and the dequant_row symbol. We pull declarations only — the writer TU
  * (vlm_runner.c) provides the implementation via *_IMPLEMENTATION macros. */
+#include <stdlib.h>   /* getenv used inside ggml_dequant.h */
 #include "../../../common/gguf_loader.h"
 #include "../../../common/ggml_dequant.h"
 #include "../../../common/qtensor_utils.h"   /* qtensor struct (TRANSFORMER_H not set) */
@@ -34,6 +35,7 @@
 #include "../kernels/bf16_gemm.h"
 #include "../kernels/fp16_gemm.h"
 #include "../kernels/fp32_gemm.h"
+#include "../kernels/conv2d_sve.h"
 
 #include <arm_sve.h>
 #include <float.h>
@@ -1767,14 +1769,12 @@ static void patch_embed_gemm_mt(vlm_pool *pool,
                                 const float *patch_BTP_fp,
                                 const float *bias,
                                 float *out) {
-    int n_patches = gw * gh;
-    int ks = ps * ps * 3;
-    float *patches = xmalloc_f((size_t)n_patches * ks);
-    patch_gather_args ga = { rgb_norm, width, ps, gw, ks, patches };
-    vlm_parallel_for(pool, n_patches, 1, patch_gather_body, &ga);
-    vit_gemm_bias_BT_mt(pool, out, patch_BTP_fp, bias, patches,
-                        n_patches, dim, ks);
-    free(patches);
+    (void)pool; (void)gw;
+    /* Fused dual-conv2d (SVE): gathers the tile pixels straight into the
+     * 8x48 microkernel A layout and runs the merged-K0+K1 GEMM + bias in one
+     * pass — no intermediate [n_patches, ks] buffer, no separate pack_A pass.
+     * patch_BTP_fp is already in the 8x48 BTP layout (pack_B_fp32, NR=48). */
+    conv2d_sve_full(rgb_norm, width, gh * ps, ps, dim, patch_BTP_fp, bias, out);
 }
 
 /* ───────────────────────── M-RoPE ───────────────────────── */
