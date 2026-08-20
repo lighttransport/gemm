@@ -822,3 +822,32 @@ produced 5840 and was much slower.  Therefore 24.55 tok/s is a valid performance
 result for the current source-equivalent TP4 execution, but the historical
 cross-topology greedy gate remains open and must be resolved before calling TP4
 model quality production-validated.
+
+### Four-node BF16 follow-up optimization sweep
+
+The safe 24.55 tok/s result is not improved by the following measured changes:
+
+- `TF_PODD_MV=1`: 42.95 ms/token (23.28 tok/s); row-major predicated loads
+  lost bandwidth despite removing widening instructions.
+- 44 rather than 48 workers: 43.39 ms/token (23.05 tok/s).
+- `TP_AR_BF16=1`: 45.69 ms/token (21.89 tok/s) and a different token stream;
+  conversion and rank-arrival overhead exceed the payload saving.
+- `-mcpu=a64fx`: 42.53 ms/token (23.51 tok/s), slower than the generic
+  Armv8.2+SVE build.
+- Sparse software L2 prefetch over the eight row streams caused a rank-0
+  memory-queue stall and 138.68 ms/token, so it was removed.
+- An exact-order pair-packed prototype retained two accumulators per row but
+  failed the token gate; it was removed rather than exposed as a selectable
+  mode.
+
+The 40 tok/s target is 25 ms/token.  With 6--9 ms of unavoidable current uTofu
+synchronization, exact single-token decode would need to execute 14.321 GB of
+BF16 projections in roughly 16--19 ms, or 754--895 GB/s including widening and
+FMA.  That is at or above the 828 GB/s load-only ceiling.  Therefore 40 tok/s on
+four nodes is not reachable by another small M=1 kernel or environment tweak.
+The remaining algorithmic route is multi-token MTP speculative verification:
+batch several drafted positions through the trunk so one weight scan verifies
+multiple tokens.  The existing `TP_SPEC_K` path only measures draft agreement
+and still performs one trunk scan per accepted token; it must be extended with
+batched state checkpoint/rollback and greedy acceptance before it can raise
+exact accepted-token throughput.
