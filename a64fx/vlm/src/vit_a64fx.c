@@ -43,6 +43,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
+#include <time.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -1553,9 +1555,36 @@ static void qkv_extract_body(int tid, int w0, int w1, void *arg) {
  * divisible by 8) and K tail (positions not divisible by 48) drop through
  * to qk_vert_1q, which keeps 8 K-tile accumulators per single query.
  */
+/* Attention sub-stage profiler (VLM_ATTN_PROFILE=1). Accumulates nanoseconds
+ * across all (head, q-tile) work units into 4 buckets: extract, QK^T, softmax,
+ * AV. Multi-threaded, so atomic. */
+static _Atomic long long attn_prof_ns[4];   /* 0 extract, 1 qk, 2 softmax, 3 av */
+static int attn_prof_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VLM_ATTN_PROFILE"); v = (e && *e && *e != '0'); }
+    return v;
+}
+static inline long long attn_now_ns(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+static void attn_prof_print(void) {
+    if (!attn_prof_on()) return;
+    const char *names[4] = { "extract", "qk_t", "softmax", "attn_v" };
+    double tot = 0;
+    fprintf(stderr, "attn sub-breakdown (across all blocks):\n");
+    for (int i = 0; i < 4; i++) {
+        double s = 1e-9 * (double)atomic_load_explicit(&attn_prof_ns[i], memory_order_relaxed);
+        tot += s;
+        fprintf(stderr, "  %-8s %.3f s\n", names[i], s);
+    }
+    fprintf(stderr, "  %-8s %.3f s\n", "sum", tot);
+}
+
 static void attn_body(int tid, int w0, int w1, void *arg) {
     attn_args *a = (attn_args *)arg;
     int np = a->n_patches;
+    const int prof = attn_prof_on();
     int dim = a->dim;
     int hd = a->head_dim;
     float scale = a->scale;
@@ -1577,7 +1606,9 @@ static void attn_body(int tid, int w0, int w1, void *arg) {
         const float *KT_h = a->KT_hm + (size_t)h * hd * np;
         const float *V_h  = a->V_hm  + (size_t)h * np * hd;
 
+        long long _t0 = 0, _t1 = 0;
         /* Q · Kᵀ — process 8 queries × 48 K positions per inner call. */
+        if (prof) _t0 = attn_now_ns();
         int qi = q0;
         for (; qi + 8 <= q1; qi += 8) {
             const float *qh_base = Q_h + (size_t)qi * hd;
@@ -1604,9 +1635,13 @@ static void attn_body(int tid, int w0, int w1, void *arg) {
             qk_vert_1q(qh, KT_h, hd, np, np, scale, att_row);
         }
 
+        if (prof) { _t1 = attn_now_ns(); atomic_fetch_add_explicit(&attn_prof_ns[1], _t1 - _t0, memory_order_relaxed); }
+        if (prof) _t0 = attn_now_ns();
         /* softmax per row (SVE FEXPA) */
         for (int qi2 = q0; qi2 < q1; qi2++)
             softmax_row(att + (size_t)(qi2 - q0) * np, np);
+        if (prof) { _t1 = attn_now_ns(); atomic_fetch_add_explicit(&attn_prof_ns[2], _t1 - _t0, memory_order_relaxed); }
+        if (prof) _t0 = attn_now_ns();
         /* attn · V — batch 4 queries per V_h sweep to amortise the 96 KB
          * V_h read (out-of-L1 per head). 16 SVE accumulators keep FMA
          * pipes saturated; V_h is loaded q_tile/4 times instead of q_tile. */
@@ -1621,6 +1656,7 @@ static void attn_body(int tid, int w0, int w1, void *arg) {
             const float *att_row = att + (size_t)(qi2 - q0) * np;
             attn_av_1q(att_row, V_h, np, hd, out);
         }
+        if (prof) { _t1 = attn_now_ns(); atomic_fetch_add_explicit(&attn_prof_ns[3], _t1 - _t0, memory_order_relaxed); }
     }
 }
 
@@ -1642,7 +1678,11 @@ static void attention_mt(vlm_pool *pool,
     if (np_chunks > n_patches) np_chunks = n_patches;
     qkv_extract_args ex = { qkv, Q_hm, KT_hm, V_hm,
                             n_patches, dim, head_dim, n_heads, np_chunks };
+    long long _et0 = 0;
+    if (attn_prof_on()) _et0 = attn_now_ns();
     vlm_parallel_for(pool, n_heads * np_chunks, 1, qkv_extract_body, &ex);
+    if (attn_prof_on())
+        atomic_fetch_add_explicit(&attn_prof_ns[0], attn_now_ns() - _et0, memory_order_relaxed);
 
     /* 2) Per-(head, q-tile) attention.
      *
@@ -2349,6 +2389,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
     free(mm_buf); free(mm_out);
 
     st_print(&st);
+    attn_prof_print();
 
     if (out_n_merged) *out_n_merged = n_merged;
     if (out_embd)     *out_embd     = total_embd;

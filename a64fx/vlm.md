@@ -58,23 +58,31 @@ this part** — reuse the 8×48 kernel (24 accumulators, 4 `ld1rw` × 3
 `VLM_STAGE_TIMING=1`, 48 threads, no CMG (CMG is *slower* here — see
 §3.1). Reflects the **nb-outer GEMM schedule** (new default, §3.1).
 
-| Stage | Time | % | Notes |
-|---|---|---|---|
-| **attn** (softmax/SDPA) | ~50 ms | **~21%** | fp16 attention, 96 tokens ×24 — **now the top stage** |
-| **deepstack** (fc1/fc2) | ~46 ms | ~19% | 3 layers, 96×2048 GEMMs |
-| **ffn_down** (`BT_d`) | ~42 ms | ~18% | 96×4096 → 96×1024, ×24 blocks |
-| **qkv** (`BT_qkv`) | ~34 ms | ~14% | 96×1024 → 96×3072, ×24 blocks |
-| **ffn_up** (`BT_u`) | ~35 ms | ~15% | 96×1024 → 96×4096, ×24 blocks |
-| attn_out (`BT_o`) | ~11 ms | ~5% | 96×1024 → 96×1024, ×24 |
-| **patch_embed** (fused) | ~1 ms | **~0.5%** | **not a bottleneck** |
-| layernorm / gelu / mrope / pos / mm_proj | ~15 ms | ~6% | elementwise / small |
+| Stage | CPU-s | Notes |
+|---|---|---|
+| **ffn_down** (`BT_d`) | ~0.5 s | 96×4096 → 96×1024, ×24 blocks — GEMM, dominant |
+| **ffn_up** (`BT_u`) | ~0.45 s | 96×1024 → 96×4096, ×24 blocks — GEMM |
+| **qkv** (`BT_qkv`) | ~0.35 s | 96×1024 → 96×3072, ×24 blocks — GEMM |
+| **attn** | 0.83 s CPU / **~7% wall** | QK^T + AV, fp32, well-parallelized (see §3.2) |
+| **deepstack** (fc1/fc2) | ~0.15 s | 3 layers, 96×2048 GEMMs |
+| attn_out (`BT_o`) | ~0.10 s | 96×1024 → 96×1024, ×24 — GEMM |
+| **patch_embed** (fused) | ~1 ms wall | **not a bottleneck** |
+| layernorm / gelu / mrope / pos / mm_proj | ~0.1 s | elementwise / small |
 
-**Total ≈ 0.24 s, ~390 tok/s** at 48T no-CMG (was ~0.33 s / ~280 tok/s
-before the nb-outer schedule).
+**Total ≈ 0.16–0.32 s (median ~0.32 s) at 48T no-CMG.**
 
-Headline: **the transformer GEMMs are ~67% of the encode and attention is
-the single largest stage (21%).** patch_embed (the fused-conv2d target)
-is 0.5% and was never the bottleneck.
+> ⚠️ **This shared Fugaku node has ~1.5–2× run-to-run variance** (HBM/NUMA
+> state, background load): the total swings 0.16 s (fast) to 0.46 s (slow)
+> for identical commands. **Always A/B with `--bench ≥ 8` back-to-back** and
+> trust the *relative* delta (which is stable), not a single absolute number.
+> The per-stage `%` from one `VLM_STAGE_TIMING` run is unreliable for the same
+> reason — an early run made `attn` look like 21% when it is really ~7%.
+
+Headline: **the transformer GEMMs (ffn_down/up, qkv, attn_out, deepstack)
+are the dominant cost** and are already at their W-HBM-bound limit after the
+nb-outer schedule (§3.1). Attention is a distant ~7% and fp32-FMA-bound
+(§3.2). patch_embed (the fused-conv2d target) is 0.5% and was never the
+bottleneck.
 
 ### The GEMM is W-traffic bound, and that is now fixed (mostly)
 
@@ -100,9 +108,10 @@ W-slice is read **once per GEMM** instead of once per M-block. This is a
 pure schedule change (swap the `collapse(2)` loop order, bounds swapped so
 the pragma still directly precedes the loop) — no kernel change.
 
-- **Measured: ~30–40% faster on the whole VLM** (0.33 s → 0.24 s;
-  ~280 → ~390 tok/s, 48T fp16, 384×256). ffn_up 106→59 ms, ffn_down
-  66→42 ms, qkv 63→34 ms.
+- **Measured: ~28% faster on the whole VLM** (back-to-back `--bench 8`,
+  48T fp16, 384×256): nb-outer median ~0.32 s (~300 tok/s) vs mb-outer
+  ~0.44 s (~217 tok/s). The delta is stable even as absolute numbers swing
+  with node state (see the §2 variance note).
 - Toggle: `VLM_GEMM_NB=0` reverts to the old mb-outer for A/B. Bit-
   identical output either way (norm 455.6237).
 - The `collapse(2)` must directly precede the `for` — an `if/else` around
@@ -117,23 +126,29 @@ reads local and adds replication/mbind overhead. **Remaining GEMM ideas**
 (lower payoff now): larger M-tile (16-row compute + two 8-row store passes
 to dodge the §1 erratum), and fp16 activations (§3.2).
 
-### 3.2 Attention (~21% — now the single largest stage)
+### 3.2 Attention (~7% — fp32-FMA-bound, low priority)
 
-With the GEMMs sped up by nb-outer (§3.1), **`attn` is now the top stage**
-(~50 ms, 96 tokens × 24 blocks). It is a separate SVE kernel from the
-GEMMs (QK^T, softmax, PV). Next optimization target. Ideas: fuse QK^T+softmax
-+PV (avoid the materialized S matrix), exploit the small 96×96 S (fits in
-LLC/L2), fp16 throughout, and check whether the attention is running at the
-same ~30–40% efficiency gap the GEMMs had before nb-outer (memory vs
-compute). Profile it on its own first (it is now ~50 ms, worth the effort).
+Profiled with `VLM_ATTN_PROFILE=1` (per-phase CPU-seconds, stable across
+runs): **QK^T 0.40 s + AV 0.38 s = 94%**, softmax 0.05 s, extract 0.003 s;
+sum ~0.83 s CPU. It is **well-parallelized** (the CPU-sum stays ~0.75–0.83 s
+at 12–48 threads while wall-clock scales cleanly → only ~7% of the encode at
+48T). The QK^T kernel (`qk_vert_8q_48k`) already runs at **full fp32 FMA
+peak** (24 `svmla` per d-iter = 16 lane-FMA/cycle), so there is no fp32
+headroom — the only lever is **fp16 QK^T/AV** (2× FMA rate → ~3% overall,
+but hard to measure given the §2 variance, and AV mixes an fp32 score with an
+fp16 V so it needs a fp32-accumulate trick). Low priority: ~7% ceiling.
 
-### 3.3 Store the activations in fp16 (A is currently fp32)
+> Note: an earlier single-run `VLM_STAGE_TIMING` showed attn at ~21%; that was
+> node-state variance (see §2). The stable sub-profile puts it at ~7%.
 
-`hidden` / `Y` / `ffn_buf` are `float` (fp32). Converting A to fp16 would
-halve A traffic (now the re-read operand in the nb-outer schedule) and let
-the kernel run fp16×fp16 (2× FMA rate). Cost: an A-conversion pass per
-layer (A is regenerated from layernorm each block). Composes with
-nb-outer; worth measuring.
+### 3.3 Store the activations in fp16 (A is currently fp32) — likely small
+
+`hidden` / `Y` / `ffn_buf` are `float` (fp32). In the nb-outer schedule A is
+the *streamed* operand, but it is only 384 KB and stays **L2-resident**, so
+halving it to fp16 cuts L2 (not HBM) traffic — modest. The 2× fp16×fp16 FMA
+rate does **not** help because the in-situ GEMM is **W-HBM-bound, not
+compute-bound** (W is read from HBM once per GEMM; the FMA pipe idles waiting
+on W). So fp16-A is expected to be a small win; measure before investing.
 
 ### 3.4 Elementwise / glue (~6%, low priority)
 
@@ -147,6 +162,9 @@ touching if 3.1–3.3 are exhausted. The layernorm SVE kernel already exists
   prior GEMM path. Done.
 - **A wider hand-rolled SVE GEMM kernel.** The §1 erratum makes wide
   `ld1rw`×8 inner loops unreliable; the 8×48 kernel is the safe ceiling.
+- **Chasing single-run stage-timing deltas.** The §2 node variance (~1.5–2×)
+  swamps any <5% change; A/B with `--bench ≥ 8` back-to-back or trust the
+  stable CPU-second sub-profiles (`VLM_ATTN_PROFILE=1`) instead.
 
 ---
 
