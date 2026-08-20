@@ -7,7 +7,9 @@
 extern void gemm_fp16_BTP(int M,int K,int N,const float*A,int lda,const uint16_t*BTP,float*C,int ldc);
 extern void pack_B_fp16(int K,int N,const uint16_t*BT,int ldb,uint16_t*BTP);
 extern size_t packed_B_fp16_size(int K,int N);
-static double now(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+ts.tv_nsec*1e-9; }
+// clock_gettime(CLOCK_MONOTONIC) is UNRELIABLE on this A64FX node after SVE asm
+// (returns huge deltas); use the CNTVCT_EL0 hardware counter (100 MHz).
+static double now(void){ uint64_t v; __asm__ volatile("mrs %0, cntvct_el0":"=r"(v)); return (double)v*1e-8; }
 /* Simulate 24 transformer blocks: each block has a DIFFERENT W (qkv/o/u/d).
  * nw W matrices of size K×N fp16, rotated per "block". */
 static void bench24(const char*name,int M,int K,int N,int nw){

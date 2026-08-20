@@ -1,3 +1,4 @@
+#include <stdint.h>
 /*
  * vlm_runner.c - CLI for the a64fx Qwen3-VL vision encoder runner.
  *
@@ -256,12 +257,18 @@ int main(int argc, char **argv) {
         /* only dump on first iter to keep dumps deterministic and cheap */
         opts.dump = (it == 0 && writer.enabled) ? &writer : NULL;
         double t0 = mono_sec();
+        uint64_t c0; __asm__ volatile("mrs %0, cntvct_el0":"=r"(c0));
         embd = vit_a64fx_encode(vm, img_norm, img_w, img_h, &opts,
                                 &n_merged, &embd_dim);
         double t1 = mono_sec();
+        uint64_t c1; __asm__ volatile("mrs %0, cntvct_el0":"=r"(c1));
         times[it] = t1 - t0;
         if (!embd) { fprintf(stderr, "encode failed (iter %d)\n", it); return 1; }
-        fprintf(stderr, "iter %d/%d: %.3f s\n", it + 1, bench, times[it]);
+        if (getenv("VLM_CNTCHECK"))
+            fprintf(stderr, "iter %d/%d: %.3f s (clock_gettime) | %.3f s (CNTVCT)\n",
+                    it + 1, bench, times[it], (double)(c1 - c0) * 1e-8);
+        else
+            fprintf(stderr, "iter %d/%d: %.3f s\n", it + 1, bench, times[it]);
     }
     free(img_norm);
     vlmd_writer_close(&writer);

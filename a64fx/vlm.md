@@ -153,7 +153,36 @@ headroom.
 > Note: an earlier single-run `VLM_STAGE_TIMING` showed attn at ~21%; that was
 > node-state variance (see §2). The stable sub-profile puts it at ~7%.
 
-### 3.3 Store the activations in fp16 (A is currently fp32) — likely small
+### 3.3 ⭐ INT8 SDOT GEMM — the big remaining lever (~3–5× on GEMMs)
+
+A64FX has **INT8 SDOT** (`sdot z.s, z.b, z.b`, 3-operand — no predicate; the
+4-operand `p/m` form does NOT assemble on this binutils 2.30). Peak is
+**512 GOPS/core** (2 FPU × 2 SDOT/cy × 64 int8-MAC @ 2 GHz) = **8× the fp32-FMA
+MAC rate** (32 MAC/cy). **INT16 has no dot product** in SVE (only `SMULL`, slower
+than fp32 FMA) → **quantize to int8, not int16.**
+
+Benchmarked (`int8-new/bench_int8_nb.c`: nb-outer + prepacked B + 48T, **24
+different W**, same conditions as the fp16 `vlm/tools/bench_gemm.c`):
+
+| GEMM (VLM shape)        | fp16 nb-outer | int8 nb-outer | speedup |
+|-------------------------|---------------|---------------|---------|
+| ffn_up   96×4096×1024   | 0.784 ms      | 0.283 ms      | **2.8×** |
+| ffn_down 96×1024×4096   | 1.071 ms      | 0.196 ms      | **5.5×** |
+| qkv      96×3072×1024   | 0.737 ms      | 0.245 ms      | **3.0×** |
+
+The win = (a) int8 W is **half the bytes** of fp16 → half the HBM traffic (the
+GEMMs are W-HBM-bound), and (b) the 8× compute rate. The existing `int8-new`
+driver is **mb-outer + re-packs B per K-chunk** → only ~5 GOPS for M=96 (1% of
+peak); the nb-outer + prepacked schedule is what reaches ~2800 GOPS/call (48T).
+
+**Not yet integrated.** To use it in the VLM: quantize W→int8 (offline),
+quantize A→int8 per layer (online), run the int8 GEMM, dequant the int32
+accumulator (scale by a_scale·w_scale). The main risk is **accuracy**: int8
+(8-bit) is coarser than fp16 (11-bit mantissa) → the VLM output norm would
+shift. Since the GEMMs dominate the encode, a 3–5× GEMM win → ~1.5–2× on the
+whole VLM.
+
+### 3.4 Store the activations in fp16 (A is currently fp32) — likely small
 
 `hidden` / `Y` / `ffn_buf` are `float` (fp32). In the nb-outer schedule A is
 the *streamed* operand, but it is only 384 KB and stays **L2-resident**, so
@@ -162,13 +191,13 @@ rate does **not** help because the in-situ GEMM is **W-HBM-bound, not
 compute-bound** (W is read from HBM once per GEMM; the FMA pipe idles waiting
 on W). So fp16-A is expected to be a small win; measure before investing.
 
-### 3.4 Elementwise / glue (~6%, low priority)
+### 3.5 Elementwise / glue (~6%, low priority)
 
 layernorm, gelu, mrope, pos_emb, mm_proj are each a few % or less. Only worth
 touching if 3.1–3.3 are exhausted. The layernorm SVE kernel already exists
 (`norm_sve.c`); gelu is fused into the ffn stages.
 
-### 3.5 What is *not* worth doing
+### 3.6 What is *not* worth doing
 
 - **Further patch_embed work.** It is 0.4% and bit-identical to the
   prior GEMM path. Done.
@@ -219,6 +248,13 @@ FCC -O3 -fopenmp -o build/test_conv2d_sve build/test_conv2d_sve.o \
   current build gives `455.6237` (bit-identical across 12T/48T). The gap
   is a stale reference (older model/build), **not** a regression — the
   fused patch_embed is provably bit-identical to the prior path.
+- **`clock_gettime(CLOCK_MONOTONIC)` is unreliable after tight SVE loops** on
+  this node — it returns a huge (wrong) delta (observed ~1e6–1e7 s) around a
+  sustained SVE microbenchmark, while `CNTVCT_EL0` is correct. It is **not**
+  affected in the VLM runner (SVE kernels are interspersed with C; the runner's
+  clock_gettime matches CNTVCT exactly — verify with `VLM_CNTCHECK=1`).
+  **Use `CNTVCT_EL0` for any tight-loop microbenchmark** (`bench_gemm.c` and the
+  int8 benches already do).
 - **`getenv` build break (fixed)** — `common/ggml_dequant.h:1553` calls
   `getenv` without `stdlib.h`; `src/vit_a64fx.c` now includes `<stdlib.h>`
   before pulling in `ggml_dequant.h`.
