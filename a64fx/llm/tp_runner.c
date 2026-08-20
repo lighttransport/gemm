@@ -770,6 +770,7 @@ int main(int argc, char **argv) {
     char *prompt_file_text = NULL;
     const char *prompt = prompt_env;
     int  max_gen           = (int)envl("TP_MAXGEN", 64);
+    int  perf_warmup       = (int)envl("TP_PERF_WARMUP", 0);
     int  spec_k            = (int)envl("TP_SPEC_K", 0);
     int  llm_threads       = (int)envl("LLM_THREADS", 48);
     if (spec_k < 0 || spec_k > 4) die("TP_SPEC_K must be in [0,4]", -1);
@@ -896,6 +897,12 @@ int main(int argc, char **argv) {
     int ssm_shard = m->is_hybrid && !getenv("TP_NO_SSM_SHARD");
     if (transformer_tp_slice_weights(m, MyRank, N, ssm_shard) != 0)
         die("transformer_tp_slice_weights (check n_heads/n_kv/n_ff/ssm_dt % N)", -1);
+    size_t tp_stage_bytes = 0;
+    const char *tp_stage_dir = envs_opt("TP_STAGE_DIR", "");
+    if (tp_stage_dir[0]) {
+        tp_stage_bytes = transformer_tp_load_stage(m, tp_stage_dir, MyRank, N);
+        if (!tp_stage_bytes) die("transformer_tp_load_stage", -1);
+    }
     double tp0 = now_sec();
     if (!envb("TF_NO_PANEL", 0))
         transformer_build_panels(m);              /* repack the local shard */
@@ -907,11 +914,12 @@ int main(int argc, char **argv) {
     }
     {   char tname[64]; snprintf(tname, sizeof tname, "tp_load_rank%02d.txt", MyRank);
         FILE *tf = fopen(tname, "w");
-        if (tf) { fprintf(tf, "rank %d: transformer_load=%.1fs build_panels=%.1fs "
+        if (tf) { fprintf(tf, "rank %d: transformer_load=%.1fs build_panels=%.1fs stage=%.3fGB "
                           "(n_heads=%d n_kv=%d n_ff=%d hybrid=%d ssm_shard=%d "
                           "ssm_dt=%d ssm_qkv=%d ssm_d_inner=%d head_off=%d "
                           "vocab_shard=%d vocab_loc=%d vocab_lo=%d)\n",
-                          MyRank, tl1 - tl0, tp1 - tp0, m->n_heads, m->n_kv_heads, m->n_ff,
+                          MyRank, tl1 - tl0, tp1 - tp0, (double)tp_stage_bytes/1e9,
+                          m->n_heads, m->n_kv_heads, m->n_ff,
                           m->is_hybrid, m->tp_ssm_sharded, m->ssm_dt_rank, m->ssm_qkv_dim,
                           m->ssm_d_inner, m->ssm_head_offset,
                           m->tp_vocab_sharded, m->tp_vocab_loc, m->tp_vocab_lo); fclose(tf); }
@@ -993,6 +1001,32 @@ int main(int argc, char **argv) {
                          ar_max, ar_batch, (double)(9L * ar_max * 4) / (1024*1024));
     transformer_set_tp(m, MyRank, N, tp_ar_callback, &c);
     barrier();
+
+    int null_stream_passes = (int)envl("TP_NULL_STREAM_PASSES", 0);
+    if (null_stream_passes > 0) {
+        double bw = transformer_null_stream_bench(m, null_stream_passes);
+        barrier();
+        char pn[64];
+        snprintf(pn, sizeof pn, "tp_null_stream_rank%02d.txt", MyRank);
+        FILE *pf = fopen(pn, "w");
+        if (pf) {
+            fprintf(pf, "rank %d: passes=%d stage=%.3fGB bandwidth=%.1fGB/s\n",
+                    MyRank, null_stream_passes, (double)tp_stage_bytes / 1e9, bw);
+            fclose(pf);
+        }
+        if (is_first)
+            logmsg("TP null-batched: passes=%d local_stage=%.3f GB bandwidth=%.1f GB/s/rank\n",
+                   null_stream_passes, (double)tp_stage_bytes / 1e9, bw);
+        transformer_free(m);
+        tp_comm_free(&c);
+        utofu_dereg_mem(Vcq, Base, 0);
+        utofu_free_vcq(Vcq);
+        free(ptoks); free(Region);
+        if (g_log) fclose(g_log);
+        if (g_curve) fclose(g_curve);
+        if (g_tokdump) fclose(g_tokdump);
+        return 0;
+    }
 
     int cache_loaded = 0;
     int cache_prefill_used = 0;
@@ -1248,7 +1282,11 @@ int main(int argc, char **argv) {
         if (g_curve) { fprintf(g_curve, "%d %d %.3f %.3f\n",
                                p, p + 1, 1000.0 * (_tb - _ta), 1000.0 * (g_ar_secs + ar_step));
                          fflush(g_curve); }
-        if (stop_eos || n_gen >= max_gen) break;
+        if (perf_warmup > 0 && n_gen == perf_warmup) {
+            t_fwd = 0.0; t_comm = 0.0; ar_calls = 0; pcnt = 0;
+            transformer_pool_profile_reset();
+        }
+        if (stop_eos || n_gen >= max_gen + perf_warmup) break;
         in_tok = nt;
     }
 
@@ -1286,6 +1324,20 @@ done:
         if (cache_prefill_used && cache_prefill_skipped > 0)
             logmsg("cache-skipped=%d prompt toks, ck_pos=%lld\n", cache_prefill_skipped, (long long)ck_pos);
         logmsg("decode(%d tok)=%.3f s = %.2f tok/s\n", n_gen, t_dec, n_gen > 0 ? n_gen / t_dec : 0.0);
+    }
+    if (getenv("TF_DPROF") && pcnt > 0) {
+        double mat_bw = tf_decode_matvec_ms > 0.0
+                      ? tf_decode_matvec_bytes / (tf_decode_matvec_ms * 1e6) : 0.0;
+        fprintf(stderr, "rank %d dprof: matvec=%.2fms/tok BW=%.1fGB/s dispatches=%.1f/tok "
+                        "attn_qkv=%.2f attn_out=%.2f ssm_in=%.2f ssm_prepare=%.2f "
+                        "ssm_core=%.2f ssm_out=%.2f ffn_gateup=%.2f ffn_down=%.2f lm_head=%.2f\n",
+                MyRank, tf_decode_matvec_ms / pcnt, mat_bw,
+                (double)tf_decode_matvec_cnt / pcnt,
+                tf_decode_attn_qkv_ms / pcnt, tf_decode_attn_out_ms / pcnt,
+                tf_decode_ssm_in_ms / pcnt, tf_decode_ssm_prepare_ms / pcnt,
+                tf_decode_ssm_core_ms / pcnt, tf_decode_ssm_out_ms / pcnt,
+                tf_decode_ffn_gateup_ms / pcnt, tf_decode_ffn_down_ms / pcnt,
+                tf_decode_lm_head_ms / pcnt);
     }
 
     if (cache_save && have_cache_path) {

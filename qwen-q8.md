@@ -716,3 +716,109 @@ remains in production.
 Compiler reassociation was tested with an additional `-Ofast` flag. It kept
 the 32-token greedy output identical but measured only 4.189 tok/s, below the
 normal `-O3 -Kfast` build, so the production flags were restored.
+
+## Four-node BF16 tensor parallel decode (2026-08-20)
+
+The split Qwen3.8-27B BF16 model is now staged as final rank-local TP4 slices
+rather than mapping the 54.66 GB source on every node.  The stage contains 497
+decode tensors per rank and deliberately omits the embedding and NextN weights.
+The exact rank payload is 14.321 GB (14,323,023,872-byte file including the
+2 MiB header), broken down as approximately 2.013 GB of replicated SSM Q/K and
+one quarter of the remaining decode weights.  Runtime dimensions are six Q
+heads, one KV head, FFN 4352, SSM dt-rank 12, and vocabulary 62080 per rank.
+
+Build, stage, verify, and measure with:
+
+```sh
+make -B -C a64fx/llm qwen38_tp_stage tp_runner CC=fcc OPENMP=1
+./a64fx/llm/run_qwen38_bf16_tp4.sh plan
+./a64fx/llm/run_qwen38_bf16_tp4.sh stage
+TP_STAGE_VERIFY=1 TP_NULL_STREAM_PASSES=1 \
+  ./a64fx/llm/run_qwen38_bf16_tp4.sh stream
+TP_NULL_STREAM_PASSES=10 ./a64fx/llm/run_qwen38_bf16_tp4.sh stream
+TP_MAXGEN=64 TP_PERF_WARMUP=32 \
+  ./a64fx/llm/run_qwen38_bf16_tp4.sh bench
+```
+
+Staging uses bounded 64 MiB reads, periodic `fdatasync`, source-page
+`POSIX_FADV_DONTNEED`, and an atomic partial-file rename.  A valid same-size TP
+file is reused.  The loader verifies the header and optional full tensor hashes,
+aborts below 2 GB `MemAvailable`, and leaves approximately 16 GB available after
+the resident load on these nodes.
+
+### Placement and memory ceiling
+
+The first TP2 arena used the Fujitsu large-page allocation path and achieved
+only 180--189 GB/s, effectively one CMG.  TP4 uses a demand-paged anonymous
+mapping with `MADV_NOHUGEPAGE`; the 48 pinned loader workers first-touch the same
+contiguous ranges they consume (workers 0--11 through 36--47 own CMGs 4--7).
+All four full-file checksums passed.  The ten-pass batched stream measured:
+
+```text
+rank 0  828.2 GB/s
+rank 1  839.2 GB/s
+rank 2  841.7 GB/s
+rank 3  843.1 GB/s
+```
+
+Thus 700 GB/s per node is not merely a hardware estimate; the real 14.321 GB
+rank shards sustain at least 828 GB/s.  At 700 GB/s the weight-only floor is
+20.46 ms/token (48.9 tok/s), and at the measured slow-rank stream it is
+17.29 ms/token (57.8 tok/s).  Each node performs about 7.16 GMAC or 14.32 GFLOP
+per token, so an exact FP32-activation/BF16-weight kernel at 700 GB/s needs only
+about 700 GFLOP/s and remains bandwidth-bound.  Eight independent row results
+provide the instruction-level overlap between weight loads, BF16 widening, and
+FMA; a separate compute/load pipeline is not required.
+
+The live four-node uTofu topology is a compact 2x2 group.  Its 16 KiB FP32
+all-reduce measured 13.88 us warm and 25.40 us after a 32 MiB eviction.  The
+model performs 129 reductions/token, giving a 1.8--3.3 ms transport floor.  The
+accepted long run spends 5.55--7.91 ms/token in communication including rank
+arrival skew.  Communication cannot generally cross a layer's residual/norm
+dependency, so reducing skew and projection time is more useful than pretending
+all uTofu time can be hidden behind the next layer.
+
+### Decode implementation and result
+
+An experimental pair-interleaved eight-row BF16 layout and SVE kernel were also
+implemented.  It reuses each FP32 activation load across eight output rows, but
+a final comparison found divergence from row-major at generated token 14.
+Consequently `TP_STAGE_BF16_PV=0` is the launcher default and all accepted
+numbers below use the source-equivalent row-major layout.  The experimental
+path remains available only for diagnosis.  Software prefetch was slightly
+slower end to end and also defaults off.
+
+The larger win was scheduling: `transformer_forward_partial()` previously used
+the legacy path and issued 578 pool dispatches/token.  Full-range TP decode now
+uses one persistent worker dispatch, with rank all-reduces after SSM/attention
+output and FFN down.  The hierarchical CMG barrier caused seconds of rank skew
+in this TP path, so the TP4 launcher fixes `TF_HIER_BARRIER=0`; the ordinary
+SEV/WFE barrier is stable.  `TP_PERF_WARMUP` excludes first-use recurrent-state
+faults from measured decode statistics.
+
+Final safe row-major `-O3` result, 32 warm tokens followed by 64 measured
+tokens:
+
+```text
+rank 0  40.72 ms/token  compute 34.66 ms  comm 6.06 ms  24.55 tok/s
+rank 1  40.81 ms/token  compute 34.37 ms  comm 6.44 ms
+rank 2  40.81 ms/token  compute 32.18 ms  comm 8.62 ms
+rank 3  40.81 ms/token  compute 33.35 ms  comm 7.45 ms
+```
+
+This clears the required 20 tok/s exact-path performance target.  The 40 tok/s
+stretch goal is not yet reached: 25 ms/token would require moving projection
+execution from the current effective 413--445 GB/s toward the 828 GB/s resident
+stream ceiling while also cutting the 6.1--8.6 ms synchronization component.
+The next targets are the short-K SSM output projection, FFN gate/up/down, and
+rank-0 SSM serial work.  `TP_AR_ROBUST=2` was neutral.  `TP_AR_A2A=1` was
+slightly slower and changed the token stream at token 14.  Fujitsu `-Kfast` was
+also slower and diverged at token 14, so all three remain rejected.
+
+Correctness caveat: accepted TP4 uses row-major staged tensors whose hashes
+match the source slices.  It starts with synthetic second-token ID 5840, not
+the historical TP2/TP12 control ID 3165.  A deterministic reduction still
+produced 5840 and was much slower.  Therefore 24.55 tok/s is a valid performance
+result for the current source-equivalent TP4 execution, but the historical
+cross-topology greedy gate remains open and must be resolved before calling TP4
+model quality production-validated.

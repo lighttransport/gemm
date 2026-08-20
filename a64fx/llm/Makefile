@@ -75,6 +75,16 @@ CFLAGS  := $(BASE_CFLAGS) -std=c11 -D_GNU_SOURCE \
            -I$(VLM_INC) -I$(VLM_KERNELS) -I$(VLM_SRC) -I$(COMMON)
 LDFLAGS := -lm -lpthread $(HWBLIB)
 
+# Qwen's exact Q8 decode path benefits from Fujitsu's fast scalar/SVE
+# scheduling while retaining the same generated greedy output in the 128-token
+# comparison. Keep this target-specific so unrelated runners retain their
+# existing floating-point flags.
+ifeq ($(CC),fcc)
+QWEN_CFLAGS := -Kfast
+else
+QWEN_CFLAGS :=
+endif
+
 ifdef OPENMP
     CFLAGS  += $(OMP_FLAG) -DUSE_OPENMP=1
     LDFLAGS += $(OMP_FLAG)
@@ -130,18 +140,22 @@ GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COM
 # ── Targets ────────────────────────────────────────────────────────────
 # ds4f_bake MUST be here: the alias target name matches ds4f_bake.c, so without .PHONY make's
 # built-in "%: %.c" rule fires and re-links the finished binary as if it were an object.
-.PHONY: all clean vlm_objs qwen38_runner qwen38_pp_runner pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
+.PHONY: all clean vlm_objs qwen38_runner qwen38_pp_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
 
 all: $(BUILD)/llm_runner
 
 qwen38_runner: $(BUILD)/qwen38_runner
 $(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)qwen38_runner.c $(LDFLAGS)
+	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -o $@ $(LLM_DIR)qwen38_runner.c $(LDFLAGS)
 
 qwen38_pp_runner: $(BUILD)/qwen38_pp_runner
 $(BUILD)/qwen38_pp_runner: $(LLM_DIR)qwen38_pp_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h | $(BUILD)
 	OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43 /opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifcc \
 		$(CFLAGS) -o $@ $(LLM_DIR)qwen38_pp_runner.c $(LDFLAGS)
+
+qwen38_tp_stage: $(BUILD)/qwen38_tp_stage
+$(BUILD)/qwen38_tp_stage: $(LLM_DIR)qwen38_tp_stage.c $(LLM_DIR)qwen38_tp_stage.h $(COMMON)/gguf_loader.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)qwen38_tp_stage.c -lm
 
 $(BUILD):
 	@mkdir -p $(BUILD)
