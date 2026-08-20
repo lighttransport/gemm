@@ -126,7 +126,7 @@ reads local and adds replication/mbind overhead. **Remaining GEMM ideas**
 (lower payoff now): larger M-tile (16-row compute + two 8-row store passes
 to dodge the §1 erratum), and fp16 activations (§3.2).
 
-### 3.2 Attention (~7% — fp32-FMA-bound, low priority)
+### 3.2 Attention (~7% — fp32-FMA-bound; fp16 is NOT viable on A64FX)
 
 Profiled with `VLM_ATTN_PROFILE=1` (per-phase CPU-seconds, stable across
 runs): **QK^T 0.40 s + AV 0.38 s = 94%**, softmax 0.05 s, extract 0.003 s;
@@ -134,9 +134,21 @@ sum ~0.83 s CPU. It is **well-parallelized** (the CPU-sum stays ~0.75–0.83 s
 at 12–48 threads while wall-clock scales cleanly → only ~7% of the encode at
 48T). The QK^T kernel (`qk_vert_8q_48k`) already runs at **full fp32 FMA
 peak** (24 `svmla` per d-iter = 16 lane-FMA/cycle), so there is no fp32
-headroom — the only lever is **fp16 QK^T/AV** (2× FMA rate → ~3% overall,
-but hard to measure given the §2 variance, and AV mixes an fp32 score with an
-fp16 V so it needs a fp32-accumulate trick). Low priority: ~7% ceiling.
+headroom.
+
+> **fp16 attention investigated and ruled out (A64FX hardware limit).** A
+> fast fp16 dot product needs `FMLA Z.S, P/M, Z.H, Z.H` (fp16×fp16 → **fp32**
+> accumulate). That instruction is **FEAT_SVE_FP16**, which the A64FX does
+> **not** implement — `/proc/cpuinfo` lists only `sve` (no `svefp16`/`sve2`),
+> and `as -march=armv8.2-a+sve` rejects it. Measured FMA rates confirm the
+> split: fp16-**accumulate** (`FMLA Z.H`) is 2× fp32 (32 vs 16 lanes, same
+> cycles/iter), but fp16 accumulate over a 64-term QK^T is numerically
+> marginal (~0.1–1% score error → borderline softmax). The GEMM's
+> fp16-load+`FCVT`+fp32-FMA path gives **no FMA gain** (fp32 rate) and adds
+> FCVT overhead — and the attention is FMA-bound, so fp16's halved memory
+> traffic does not apply. Net: fp16 attention would be a ~1–2% marginal gain
+> at real precision cost; not worth it. The GEMMs hit the same wall (A is
+> fp32, so they use FCVT and are fp32-FMA-rate limited too).
 
 > Note: an earlier single-run `VLM_STAGE_TIMING` showed attn at ~21%; that was
 > node-state variance (see §2). The stable sub-profile puts it at ~7%.
