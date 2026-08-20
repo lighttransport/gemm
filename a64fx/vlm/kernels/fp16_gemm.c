@@ -236,6 +236,39 @@ void pack_B_fp16(int K, int N,
     }
 }
 
+/* Schedule for the (mb,nb) tile loop. Default = NB-OUTER: each core owns an
+ * N-slice and streams the small A across all M-blocks, so the W-slice is read
+ * once per GEMM instead of once per M-block. Measured ~30% faster on the VLM
+ * (384x256, 96 tokens, 48T): 0.33s -> 0.22s. The win comes from W living in
+ * HBM (not LLC) in the real VLM — intervening stages evict it, so re-reading
+ * it 12x (once per M-block, the old mb-outer) was the bottleneck. Set
+ * VLM_GEMM_NB=0 to revert to the old mb-outer schedule for A/B testing. */
+static int gemm_fp16_nb_outer(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VLM_GEMM_NB"); v = (e && *e) ? (atoi(e) != 0) : 1; }
+    return v;
+}
+
+#define FP16_TILE(mb, nb) do { \
+        int m_start = (mb) * MR, n_start = (nb) * NR; \
+        int m_count = (m_start + MR <= M) ? MR : M - m_start; \
+        int n_count = (n_start + NR <= N) ? NR : N - n_start; \
+        const float    *A_tile = A_packed + (size_t)(mb) * K_rounded * MR; \
+        const uint16_t *B_tile = BTP      + (size_t)(nb) * K_rounded * NR; \
+        if (m_count == MR && n_count == NR) { \
+            float *C_tile = C + (size_t)m_start * ldc + n_start; \
+            micro_kernel_fp16B_8x3_unroll4(A_tile, B_tile, C_tile, \
+                (int64_t)K_rounded, 0, (int64_t)ldc * sizeof(float)); \
+        } else { \
+            float local_buf[MR * NR] __attribute__((aligned(64))); \
+            micro_kernel_fp16B_8x3_unroll4(A_tile, B_tile, local_buf, \
+                (int64_t)K_rounded, 0, (int64_t)NR * sizeof(float)); \
+            for (int m = 0; m < m_count; m++) \
+                for (int n = 0; n < n_count; n++) \
+                    C[(size_t)(m_start + m) * ldc + n_start + n] = local_buf[m * NR + n]; \
+        } \
+    } while (0)
+
 /* GEMM C[M,N] = A[M,K] @ BT^T (i.e. BT was packed from row-major BT[K,N]).
  * A is FP32, BTP is the pre-packed FP16, C is FP32. Initializes C to zero. */
 void gemm_fp16_BTP(int M, int K, int N,
@@ -273,40 +306,23 @@ void gemm_fp16_BTP(int M, int K, int N,
 #endif
         for (int m = 0; m < M; m++) memset(C + (size_t)m * ldc, 0, N * sizeof(float));
 
+        /* Tile loop. nb_outer=1 (default): o=nb, i=mb — each core owns an N-slice
+     * and streams the small A across all M-blocks, so the W-slice is read once
+     * per GEMM (not once per M-block). nb_outer=0 (VLM_GEMM_NB=0): o=mb, i=nb
+     * — the old mb-outer. Bounds are swapped so the collapse(2) pragma directly
+     * precedes the loop (required by OpenMP; an if/else around two worksharing
+     * loops aborts in libfjomp). */
+    const int nb_outer = gemm_fp16_nb_outer();
+    const int outer_max = nb_outer ? N_blocks : M_blocks;
+    const int inner_max = nb_outer ? M_blocks : N_blocks;
 #ifdef _OPENMP
     #pragma omp for collapse(2) schedule(static)
 #endif
-    for (int mb = 0; mb < M_blocks; mb++) {
-        for (int nb = 0; nb < N_blocks; nb++) {
-            int m_start = mb * MR;
-            int n_start = nb * NR;
-            int m_count = (m_start + MR <= M) ? MR : M - m_start;
-            int n_count = (n_start + NR <= N) ? NR : N - n_start;
-
-            const float    *A_tile = A_packed + (size_t)mb * K_rounded * MR;
-            const uint16_t *B_tile = BTP      + (size_t)nb * K_rounded * NR;
-
-            if (m_count == MR && n_count == NR) {
-                float *C_tile = C + (size_t)m_start * ldc + n_start;
-                micro_kernel_fp16B_8x3_unroll4(
-                    A_tile, B_tile, C_tile,
-                    (int64_t)K_rounded, 0,
-                    (int64_t)ldc * sizeof(float));
-            } else {
-                /* Edge tile: kernel writes a full MR×NR block; spill to a
-                 * local buffer then copy the valid portion. */
-                float local_buf[MR * NR] __attribute__((aligned(64)));
-                micro_kernel_fp16B_8x3_unroll4(
-                    A_tile, B_tile, local_buf,
-                    (int64_t)K_rounded, 0,
-                    (int64_t)NR * sizeof(float));
-                for (int m = 0; m < m_count; m++) {
-                    for (int n = 0; n < n_count; n++) {
-                        C[(size_t)(m_start + m) * ldc + n_start + n] =
-                            local_buf[m * NR + n];
-                    }
-                }
-            }
+    for (int o = 0; o < outer_max; o++) {
+        for (int i = 0; i < inner_max; i++) {
+            int mb = nb_outer ? i : o;
+            int nb = nb_outer ? o : i;
+            FP16_TILE(mb, nb);
         }
     }
     } /* omp parallel */

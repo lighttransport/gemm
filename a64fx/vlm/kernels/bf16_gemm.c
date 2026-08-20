@@ -246,6 +246,34 @@ void pack_B_bf16(int K, int N,
     }
 }
 
+/* NB-outer schedule (see fp16_gemm.c gemm_fp16_nb_outer for the rationale:
+ * W read once per GEMM instead of once per M-block; ~30% faster on the VLM).
+ * VLM_GEMM_NB=0 reverts to mb-outer. */
+static int gemm_bf16_nb_outer(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VLM_GEMM_NB"); v = (e && *e) ? (atoi(e) != 0) : 1; }
+    return v;
+}
+#define BF16_TILE(mb, nb) do { \
+        int m_start = (mb) * MR, n_start = (nb) * NR; \
+        int m_count = (m_start + MR <= M) ? MR : M - m_start; \
+        int n_count = (n_start + NR <= N) ? NR : N - n_start; \
+        const float    *A_tile = A_packed + (size_t)(mb) * K_rounded * MR; \
+        const uint16_t *B_tile = BTP      + (size_t)(nb) * K_rounded * NR; \
+        if (m_count == MR && n_count == NR) { \
+            float *C_tile = C + (size_t)m_start * ldc + n_start; \
+            micro_kernel_bf16B_8x3_unroll4(A_tile, B_tile, C_tile, \
+                (int64_t)K_rounded, 0, (int64_t)ldc * sizeof(float)); \
+        } else { \
+            float local_buf[MR * NR] __attribute__((aligned(64))); \
+            micro_kernel_bf16B_8x3_unroll4(A_tile, B_tile, local_buf, \
+                (int64_t)K_rounded, 0, (int64_t)NR * sizeof(float)); \
+            for (int m = 0; m < m_count; m++) \
+                for (int n = 0; n < n_count; n++) \
+                    C[(size_t)(m_start + m) * ldc + n_start + n] = local_buf[m * NR + n]; \
+        } \
+    } while (0)
+
 void gemm_bf16_BTP(int M, int K, int N,
                    const float    *A,    int lda,
                    const uint16_t *BTP,
@@ -279,38 +307,17 @@ void gemm_bf16_BTP(int M, int K, int N,
 #endif
         for (int m = 0; m < M; m++) memset(C + (size_t)m * ldc, 0, N * sizeof(float));
 
+        const int nb_outer = gemm_bf16_nb_outer();
+        const int outer_max = nb_outer ? N_blocks : M_blocks;
+        const int inner_max = nb_outer ? M_blocks : N_blocks;
 #ifdef _OPENMP
         #pragma omp for collapse(2) schedule(static)
 #endif
-        for (int mb = 0; mb < M_blocks; mb++) {
-            for (int nb = 0; nb < N_blocks; nb++) {
-                int m_start = mb * MR;
-                int n_start = nb * NR;
-                int m_count = (m_start + MR <= M) ? MR : M - m_start;
-                int n_count = (n_start + NR <= N) ? NR : N - n_start;
-
-                const float    *A_tile = A_packed + (size_t)mb * K_rounded * MR;
-                const uint16_t *B_tile = BTP      + (size_t)nb * K_rounded * NR;
-
-                if (m_count == MR && n_count == NR) {
-                    float *C_tile = C + (size_t)m_start * ldc + n_start;
-                    micro_kernel_bf16B_8x3_unroll4(
-                        A_tile, B_tile, C_tile,
-                        (int64_t)K_rounded, 0,
-                        (int64_t)ldc * sizeof(float));
-                } else {
-                    float local_buf[MR * NR] __attribute__((aligned(64)));
-                    micro_kernel_bf16B_8x3_unroll4(
-                        A_tile, B_tile, local_buf,
-                        (int64_t)K_rounded, 0,
-                        (int64_t)NR * sizeof(float));
-                    for (int m = 0; m < m_count; m++) {
-                        for (int n = 0; n < n_count; n++) {
-                            C[(size_t)(m_start + m) * ldc + n_start + n] =
-                                local_buf[m * NR + n];
-                        }
-                    }
-                }
+        for (int o = 0; o < outer_max; o++) {
+            for (int i = 0; i < inner_max; i++) {
+                int mb = nb_outer ? i : o;
+                int nb = nb_outer ? o : i;
+                BF16_TILE(mb, nb);
             }
         }
     } /* omp parallel */

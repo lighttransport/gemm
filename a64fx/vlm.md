@@ -55,82 +55,89 @@ this part** — reuse the 8×48 kernel (24 accumulators, 4 `ld1rw` × 3
 
 ## 2. Current performance profile
 
-`VLM_STAGE_TIMING=1`. No-CMG, 48 threads (the current best on this node;
-see §3.1 — CMG+numactl is *slower* here).
+`VLM_STAGE_TIMING=1`, 48 threads, no CMG (CMG is *slower* here — see
+§3.1). Reflects the **nb-outer GEMM schedule** (new default, §3.1).
 
 | Stage | Time | % | Notes |
 |---|---|---|---|
-| **ffn_up** (`BT_u`) | ~96 ms | ~24–30% | 96×1024 → 96×4096, ×24 blocks |
-| **ffn_down** (`BT_d`) | ~70 ms | ~22–38% | 96×4096 → 96×1024, ×24 blocks |
-| **qkv** (`BT_qkv`) | ~51 ms | ~16–17% | 96×1024 → 96×3072, ×24 blocks |
-| **deepstack** (fc1/fc2) | ~40–63 ms | ~7–20% | 3 layers, 96×2048 GEMMs |
-| attn_out (`BT_o`) | ~14–60 ms | ~4–11% | 96×1024 → 96×1024, ×24 |
-| attn (softmax/SDPA) | ~18 ms | ~5–6% | fp16 attention |
-| **patch_embed** (fused) | **1 ms** | **~0.4%** | **not a bottleneck** |
-| layernorm / gelu / mrope / pos / mm_proj | ~10 ms | ~3% | elementwise / small |
+| **attn** (softmax/SDPA) | ~50 ms | **~21%** | fp16 attention, 96 tokens ×24 — **now the top stage** |
+| **deepstack** (fc1/fc2) | ~46 ms | ~19% | 3 layers, 96×2048 GEMMs |
+| **ffn_down** (`BT_d`) | ~42 ms | ~18% | 96×4096 → 96×1024, ×24 blocks |
+| **qkv** (`BT_qkv`) | ~34 ms | ~14% | 96×1024 → 96×3072, ×24 blocks |
+| **ffn_up** (`BT_u`) | ~35 ms | ~15% | 96×1024 → 96×4096, ×24 blocks |
+| attn_out (`BT_o`) | ~11 ms | ~5% | 96×1024 → 96×1024, ×24 |
+| **patch_embed** (fused) | ~1 ms | **~0.5%** | **not a bottleneck** |
+| layernorm / gelu / mrope / pos / mm_proj | ~15 ms | ~6% | elementwise / small |
 
-**Total ≈ 320–450 ms** (median ~450 ms, ~214 tok/s) at 48T no-CMG.
+**Total ≈ 0.24 s, ~390 tok/s** at 48T no-CMG (was ~0.33 s / ~280 tok/s
+before the nb-outer schedule).
 
-Headline: **the transformer GEMMs are ~85% of the encode.** patch_embed
-(the fused-conv2d target) is 0.4% and was already fast — it was never the
-bottleneck.
+Headline: **the transformer GEMMs are ~67% of the encode and attention is
+the single largest stage (21%).** patch_embed (the fused-conv2d target)
+is 0.5% and was never the bottleneck.
 
-### GEMM efficiency is the problem, not throughput
+### The GEMM is W-traffic bound, and that is now fixed (mostly)
 
-The GEMMs run at **~200 GFLOP/s** across 48 cores. Even against a
-conservative A64FX fp16 peak (~256 GFLOP/s/core → ~12 TFLOP/s on 48
-cores), that is **~1–2% of peak** — i.e. the GEMMs are **memory /
-W-traffic bound, not compute bound**. For M=96 the 8×48 kernel makes 12
-M-blocks, and each M-block **re-streams the whole layer W** (e.g. ffn_up
-W = 1024×4096×2 B = 8 MB ⇒ ~96 MB per layer). That re-streaming, fought
-over the LLC by 48 threads, is the dominant cost.
+A standalone micro-benchmark of `gemm_fp16_BTP` (ffn_up shape, 96×1024→
+4096) shows the *kernel* is efficient: with W LLC-warm it hits ~2.7
+TFLOP/s (≈ compute-bound), but with 24 different W matrices (the real
+VLM, one per block) it drops to ~1 TFLOP/s, and in-situ to ~0.3 TFLOP/s.
+The gap is **W re-streaming**: the old **mb-outer** tile loop made each of
+the 12 M-blocks re-read the whole 8 MB layer W from HBM (12× = 96 MB per
+GEMM). The **nb-outer** schedule (below) cuts that to reading W once per
+GEMM, which recovers most of the gap.
 
 ---
 
 ## 3. Optimization opportunities (ranked)
 
-### 3.1 Kill the W re-streaming in the transformer GEMMs (biggest win, ~85% of encode)
+### 3.1 ✅ GEMM W re-streaming — FIXED via the nb-outer schedule
 
-The 96-token M dimension is small; the 8×48 tile re-reads each layer's W
-once per 8-row M-block. Options, roughly in order of expected payoff:
+**Done.** `gemm_fp16_BTP` / `gemm_bf16_BTP` now use an **nb-outer** tile
+loop by default: each core owns a slice of N and streams the small A
+(96×1024×4 B = 384 KB, L2-resident) across all 12 M-blocks, so the
+W-slice is read **once per GEMM** instead of once per M-block. This is a
+pure schedule change (swap the `collapse(2)` loop order, bounds swapped so
+the pragma still directly precedes the loop) — no kernel change.
 
-1. **Per-core W replicas (CMG) *with working NUMA pinning*.** The code
-   already has `gemm_fp16_BTP_cmg` / `gemm_bf16_BTP_cmg` + `VLM_NUMA=N`.
-   On **this node the readme's `numactl -C 12-59 -m 4-7` config is
-   slower** (450 ms → 550 ms) than no-CMG — the 2B model is small enough
-   that the replica + cross-NUMA traffic hurts, and the core pinning
-   fights OMP. Investigate: pin to the node's *actual* usable
-   core/NUMA map (not the hardcoded 12–59 / nodes 4–7), or try
-   `VLM_NUMA=2`, or `mbind` replicas to the cores that own them. This is
-   config, not code.
-2. **W-sliced (N-parallel) schedule.** Give each thread a *slice of N*
-   (a set of 48-channel blocks) and have it stream the *small* A
-   (96×1024×4 B = 384 KB, easily L2-resident) across all its N-slice.
-   The thread's W-slice stays L2-resident; A is re-read but tiny. This
-   inverts the current M-parallel re-streaming. Needs a
-   `collapse(2)`-friendly schedule (N outer, M inner) in
-   `gemm_fp16_BTP` / the cmg variants.
-3. **Larger M-tile for the small-M case.** A 16- or 32-row A-tile halves /
-   quarters the M-blocks (and thus W re-streams). A 16-row *store* hits
-   the §1 erratum, but the tile can compute 16 rows and **store in two
-   8-row passes** (safe). More kernel work; higher risk.
+- **Measured: ~30–40% faster on the whole VLM** (0.33 s → 0.24 s;
+  ~280 → ~390 tok/s, 48T fp16, 384×256). ffn_up 106→59 ms, ffn_down
+  66→42 ms, qkv 63→34 ms.
+- Toggle: `VLM_GEMM_NB=0` reverts to the old mb-outer for A/B. Bit-
+  identical output either way (norm 455.6237).
+- The `collapse(2)` must directly precede the `for` — an `if/else` around
+  two worksharing loops is an **invalid** OpenMP construct (the Fujitsu
+  libfjomp aborts in `__kmpc_for_static_init_4`). Swap the *bounds*
+  instead.
 
-### 3.2 Store the activations in fp16 (A is currently fp32)
+**Tested and rejected:** per-core W replicas (CMG, `VLM_NUMA=4` +
+`numactl -C 12-59 -m 4-7`) is *slower* here (0.35 s vs 0.24 s) — each
+node's ~768 MB W-replica is far larger than the LLC, so it just moves HBM
+reads local and adds replication/mbind overhead. **Remaining GEMM ideas**
+(lower payoff now): larger M-tile (16-row compute + two 8-row store passes
+to dodge the §1 erratum), and fp16 activations (§3.2).
+
+### 3.2 Attention (~21% — now the single largest stage)
+
+With the GEMMs sped up by nb-outer (§3.1), **`attn` is now the top stage**
+(~50 ms, 96 tokens × 24 blocks). It is a separate SVE kernel from the
+GEMMs (QK^T, softmax, PV). Next optimization target. Ideas: fuse QK^T+softmax
++PV (avoid the materialized S matrix), exploit the small 96×96 S (fits in
+LLC/L2), fp16 throughout, and check whether the attention is running at the
+same ~30–40% efficiency gap the GEMMs had before nb-outer (memory vs
+compute). Profile it on its own first (it is now ~50 ms, worth the effort).
+
+### 3.3 Store the activations in fp16 (A is currently fp32)
 
 `hidden` / `Y` / `ffn_buf` are `float` (fp32). Converting A to fp16 would
-halve A traffic and let the kernel run fp16×fp16 (2× FMA rate). Cost: an
-A-conversion pass per layer (A is regenerated from layernorm each block).
-Worth measuring against 3.1 — the two compose.
+halve A traffic (now the re-read operand in the nb-outer schedule) and let
+the kernel run fp16×fp16 (2× FMA rate). Cost: an A-conversion pass per
+layer (A is regenerated from layernorm each block). Composes with
+nb-outer; worth measuring.
 
-### 3.3 Attention (~5–6%)
+### 3.4 Elementwise / glue (~6%, low priority)
 
-`attn` (softmax/SDPA) is a separate kernel from the GEMMs. Profile it on
-its own; at 96 tokens it is small in absolute terms (~18 ms) so it is
-lower priority than the GEMMs, but it is the one non-GEMM hot spot.
-
-### 3.4 Elementwise / glue (~3%, low priority)
-
-layernorm, gelu, mrope, pos_emb, mm_proj are each <1.4%. Only worth
+layernorm, gelu, mrope, pos_emb, mm_proj are each a few % or less. Only worth
 touching if 3.1–3.3 are exhausted. The layernorm SVE kernel already exists
 (`norm_sve.c`); gelu is fused into the ffn stages.
 
