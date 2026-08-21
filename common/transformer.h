@@ -1707,8 +1707,9 @@ static inline void tf_matvec_q4_0_int8_prequant_rows(float *dst,
     const int8_t *base = cache->wi8;
     const int nb_pairs = cache->nb_pairs;
     const float scale_w = cache->scale_w;
-#if defined(__ARM_FEATURE_SVE)
-    /* Hoist x quantize: done ONCE per call, not per batch. */
+    /* Hoist x quantize: done ONCE per call, not per batch. Portable (SVE or
+     * scalar) -- must be OUTSIDE the SVE block below because the scalar 1-row
+     * tail (non-SVE build) also reads xi8/inv. */
     static int8_t *xi8 = NULL;
     static int xi8_alloc = 0;
     int xi8_need = (cache->n_cols + 63) & ~63;
@@ -1720,6 +1721,7 @@ static inline void tf_matvec_q4_0_int8_prequant_rows(float *dst,
     float x_inv;
     tf_quantize_f32_to_int8(x, xi8, cache->n_cols, &x_inv);
     const float inv = 1.0f / (scale_w * x_inv);
+#if defined(__ARM_FEATURE_SVE)
     /* 8-row batches: inlined for minimum overhead. 2x K-unroll:
      * process 2 pairs per iteration using 2 different x vectors
      * to break the SDOT dependency on x. */

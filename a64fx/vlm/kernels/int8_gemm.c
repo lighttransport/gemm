@@ -41,7 +41,6 @@ static void pack_A_6x256(const int8_t *A, int lda, int8_t *Apack, int M) {
 }
 static void pack_B_64x256(const int8_t *B, int ldb, int8_t *Bpack, int N) {
     for (int n0 = 0; n0 < N; n0 += I8_NR) {
-        int nr = (n0 + I8_NR <= N) ? I8_NR : (N - n0);
         for (int k = 0; k < I8_KC; k += 4)
             for (int vec = 0; vec < 4; vec++)
                 for (int col = 0; col < 16; col++) {

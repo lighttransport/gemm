@@ -106,8 +106,12 @@ $(BUILD)/test_cmg_pool: $(TOOLS)/test_cmg_pool.c $(BUILD)/src_cmg_pool.o | $(BUI
 
 # Optional: rebuild cpu/vlm test_vision with dump hooks for reference dumps.
 # Invoked as `make REF=1`. The cpu Makefile uses gcc — this just kicks it.
+# -D_GNU_SOURCE is required: transformer.h uses the GNU CPU_ZERO/CPU_SET
+# affinity macros (plain POSIX <sched.h> on this glibc only defines the sized
+# __CPU_*_S variants), so without it they are parsed as function calls and the
+# reference binary fails to link.
 ref:
-	$(MAKE) -C $(COMMON)/../cpu/vlm CFLAGS="-O2 -DVLM_DUMP_REFERENCE=1 -Wall -Wextra"
+	$(MAKE) -C $(COMMON)/../cpu/vlm CFLAGS="-O2 -D_GNU_SOURCE -DVLM_DUMP_REFERENCE=1 -Wall -Wextra"
 
 clean:
 	rm -rf $(BUILD)

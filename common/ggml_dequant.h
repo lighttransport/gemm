@@ -21,6 +21,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>   /* getenv (TF_* env toggles) -- must be direct, not transitive */
 #include "gguf_loader.h"
 
 #ifdef __cplusplus

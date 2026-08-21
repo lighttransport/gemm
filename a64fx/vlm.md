@@ -317,9 +317,20 @@ FCC -O3 -fopenmp -o build/test_conv2d_sve build/test_conv2d_sve.o \
 
 ### Known issues (not from the fused-conv2d work)
 
-- **CPU reference does not build** — `common/transformer.h:1847: 'xi8'
-  undeclared` (and `:1849 'inv'`), so `make REF=1` + `tensor_diff`
-  (the gold-standard dump comparison) is unavailable until that is fixed.
+- **CPU reference build (fixed)** — `common/transformer.h:1848` used `xi8`
+  / `inv` in the scalar 1-row tail that sat *outside* the
+  `#if defined(__ARM_FEATURE_SVE)` block where they were declared, so any
+  non-SVE build (the CPU reference) failed with `'xi8' undeclared`. Fixed by
+  hoisting the x-quantize (portable `tf_quantize_f32_to_int8`) + `inv` above
+  the SVE `#if`. Separately, the `ref:` target was missing `-D_GNU_SOURCE`
+  (this glibc only defines the sized `__CPU_*_S` macros otherwise, so
+  `CPU_ZERO`/`CPU_SET` in transformer.h's NUMA binder linked as bare symbols).
+  `make ref` now builds `cpu/vlm/test_vision`. Note the reference **dump**
+  flag `VLM_DUMP_REFERENCE` is stale (no code honours it), so a full
+  `tensor_diff` dump comparison still needs the dump hooks re-wired in the CPU
+  vision path — but the reference binary itself builds and runs.
+  (Verified: the SVE VLM numerics are unchanged — fp16 455.6237 / int8
+  452.0263 / int16 458.2751.)
 - **Stale norm reference** — the readme documents `norm=455.7341`; the
   current build gives `455.6237` (bit-identical across 12T/48T). The gap
   is a stale reference (older model/build), **not** a regression — the
@@ -332,5 +343,8 @@ FCC -O3 -fopenmp -o build/test_conv2d_sve build/test_conv2d_sve.o \
   **Use `CNTVCT_EL0` for any tight-loop microbenchmark** (`bench_gemm.c` and the
   int8 benches already do).
 - **`getenv` build break (fixed)** — `common/ggml_dequant.h:1553` calls
-  `getenv` without `stdlib.h`; `src/vit_a64fx.c` now includes `<stdlib.h>`
-  before pulling in `ggml_dequant.h`.
+  `getenv` (for the `TF_*` env toggles) but never included `<stdlib.h>` →
+  "implicit declaration" warning under `-std=c11 -Wall`. Fixed by adding
+  `#include <stdlib.h>` to `ggml_dequant.h` itself (a header should include
+  what it uses; the transitive include via `gguf_loader.h` did not reliably
+  reach the use site).
