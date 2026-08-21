@@ -8,4 +8,16 @@ int8_t *take_int8_packed(float **pbt, int K, int N, float **scale_out);
 void gemm_int8_BTP(int M, int K, int N, const float *X, int lda,
                    const int8_t *Bpack, const float *w_scale,
                    float *Y, int ldc);
+
+// ── int16 (hi/lo int8 split; A64FX has no 16-bit dot product / int16 FMA) ─
+size_t packed_int16_B_size(int K, int N);
+// Quantize a [K][N] fp32 BT to int16 per-n, split hi/lo, pre-pack both halves
+// (contiguous [hi][lo]) + per-col sums. Takes ownership of *pbt. *scale_out =
+// per-n scale (length NP). *colsum_out = int32[2*NP]: [0,NP)=Σ bhi, [NP,2NP)=Σ blo.
+int8_t *take_int16_packed(float **pbt, int K, int N, float **scale_out,
+                          int32_t **colsum_out);
+// C[M][N] = X * W^T, W pre-quantized int16, A quantized int16 per-row.
+void gemm_int16_BTP(int M, int K, int N, const float *X, int lda,
+                    const int8_t *Bpack, const float *w_scale, const int32_t *colsum,
+                    float *Y, int ldc);
 #endif

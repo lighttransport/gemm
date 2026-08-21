@@ -26,6 +26,7 @@ enum vit_dtype {
     VIT_DTYPE_BF16 = 1,   /* M3 */
     VIT_DTYPE_FP16 = 2,   /* M4 */
     VIT_DTYPE_INT8 = 3,   /* W8A8 int8 SDOT */
+    VIT_DTYPE_INT16 = 4,  /* int16 via hi/lo int8 split (near-exact, ~fp16 speed) */
 };
 
 typedef struct vit_a64fx_opts {

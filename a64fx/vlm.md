@@ -158,8 +158,11 @@ headroom.
 A64FX has **INT8 SDOT** (`sdot z.s, z.b, z.b`, 3-operand — no predicate; the
 4-operand `p/m` form does NOT assemble on this binutils 2.30). Peak is
 **512 GOPS/core** (2 FPU × 2 SDOT/cy × 64 int8-MAC @ 2 GHz) = **8× the fp32-FMA
-MAC rate** (32 MAC/cy). **INT16 has no dot product** in SVE (only `SMULL`, slower
-than fp32 FMA) → **quantize to int8, not int16.**
+MAC rate** (32 MAC/cy). **INT16 has no dot product** in SVE — and on this node
++ binutils 2.30 even `smla`/`smlal`/`smull` won't assemble (see the int16
+section below) → **quantize to int8, not int16.** (An int16 path was still
+built, via a hi/lo int8 split, for precision comparison: it is near-exact but
+**slower than fp16**, so it is not a production win.)
 
 Benchmarked (`int8-new/bench_int8_nb.c`: nb-outer + prepacked B + 48T, **24
 different W**, same conditions as the fp16 `vlm/tools/bench_gemm.c`):
@@ -182,17 +185,47 @@ channel** (per-n) + pre-packed at cache build; activations are quantized
 **per row** (per-m, no global-max barrier) per GEMM. Dequant: `C[m][n] =
 C_i32[m][n] · a_scale[m] · w_scale[n]`.
 
-Result on this node (384×256, 96 tokens, 48T, `--bench 8` median):
+Result on this node (384×256, 96 tokens, 48T, `--bench 8` median; node speed
+varies session-to-session, so the *relative* columns are what matter):
 
-| | fp16 | int8 | |
-|---|---|---|---|
-| total | 0.335 s (286 tok/s) | **0.232 s (414 tok/s)** | **1.44× faster** |
-| output norm | 455.6237 | 452.0263 | **0.79% delta** |
+| dtype | output norm | Δ vs fp16 | tok/s | vs fp16 |
+|-------|-------------|-----------|-------|---------|
+| fp16  | 455.6237    | ref       | 356.6 | 1.00×   |
+| **int8**  | 452.0263 | **0.79%** | 546.5 | **1.53× faster** |
+| int16 | 458.2751    | 0.58%     | 248.8 | **0.70× (43% slower)** |
 
-The whole-VLM win (1.44×) is well below the 3–5× GEMM win because the int8
-path adds per-GEMM overhead (quantize A + pack A + dequant, ~3 extra parallel
-regions each) that partly offsets the GEMM speedup. Future: fuse the
-quantize/pack into the GEMM prologue, or cache the per-row A scale.
+**int8 is the production win** (1.53× faster, small 0.79% norm delta). The
+whole-VLM win is well below the 3–5× GEMM win because the int8 path adds
+per-GEMM overhead (quantize A + pack A + dequant, ~3 extra parallel regions
+each) that partly offsets the GEMM speedup. Future: fuse the quantize/pack
+into the GEMM prologue, or cache the per-row A scale.
+
+### 3.3a INT16 (hi/lo int8 split) — near-exact, but dominated by fp16
+
+A64FX has **no 16-bit dot product**, and this node's **binutils 2.30 does not
+even assemble** the SVE 16-bit integer multiplies (`smla` → "unknown
+mnemonic", `smlal`/`smulla`/`smull` → fail; `fmla z.s, z.h, z.h` needs
+FEAT_SVE_FP16, which A64FX lacks). So int16 is done by splitting each int16
+into a high int8 + low int8 and expanding into **3 int8 SDOT GEMMs**
+(`kernels/int8_gemm.c: gemm_int16_BTP`):
+
+    x16 = xhi*256 + xlo_s + 128
+    Σ a16·b16 = 2¹⁶·Σahi·bhi + 2⁸·Σahi·blo + 2⁸·Σalo·bhi
+              + 2¹⁵·Σahi + 2⁷·Σalo + 2¹⁵·Σbhi + 2⁷·Σblo + 2¹⁴·K
+    (the alo·blo term is dropped: a √K random walk vs the K·signal, ~1e-5 rel.)
+
+i.e. 3 int8 GEMMs + 2 per-row + 2 per-col reductions + an **int64** combine
+(SVE has no int64 accumulate, so the combine is scalar; the GEMMs stay SVE).
+
+Standalone GEMM (96×4096×1024, 48T, vs fp32 ref): **int16 rel(L2)=2.6e-5**
+vs **int8 rel(L2)=5.6e-3** → int16 is **~215× more accurate** and effectively
+exact. But it costs **3× the int8 GEMM**, so in the VLM it lands **0.70×
+fp16 (slower)** while only marginally closer to fp16 than int8 (0.58% vs
+0.79% norm delta). **Conclusion: int16 is dominated by fp16** (slower and
+less accurate) — keep it as a precision/validation reference, not a
+production path. One bug found while integrating: the dispatch shared the
+int8 `w_scale` slot, which is NULL under `--dtype int16` → segfault; fixed by
+giving int16 its own scale param.
 
 Two bugs found while integrating (both fixed):
 - **A-pack race** — `pack_A_6x256` was called with `M-mb*6` rows (packing
@@ -243,9 +276,21 @@ MM=~/models/mmproj-Qwen3VL-2B-Instruct-F16.gguf
 OMP_NUM_THREADS=48 ./build/vlm_runner $M $MM ~/fujisan.jpg \
     --dtype fp16 --threads 48 --bench 3
 
-# int8 (W8A8, ~1.44× faster, norm 452.03 vs fp16 455.62 — see 3.3):
+# int8 (W8A8, ~1.5× faster, norm 452.03 vs fp16 455.62 — see 3.3):
 OMP_NUM_THREADS=48 ./build/vlm_runner $M $MM ~/fujisan.jpg \
     --dtype int8 --threads 48 --bench 3
+
+# int16 (hi/lo int8 split; near-exact but SLOWER than fp16 — see 3.3a):
+OMP_NUM_THREADS=48 ./build/vlm_runner $M $MM ~/fujisan.jpg \
+    --dtype int16 --threads 48 --bench 3
+
+# int16 GEMM unit test (vs fp32 ref; expect rel(L2) ~2.6e-5; 1T == 48T):
+make CC=fcc OPENMP=1
+fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -std=c11 -fopenmp -Ikernels -I. \
+    -o /tmp/ti tools/test_int8_gemm.c kernels/int8_gemm.c kernels/kernel_6x4_int8.S -lm
+OMP_NUM_THREADS=48 /tmp/ti        # int16 correctness
+OMP_NUM_THREADS=48 /tmp/ti bench  # int8 vs int16 GEMM speed
+OMP_NUM_THREADS=48 /tmp/ti 8      # int8 correctness
 
 # int8 GEMM unit test (vs fp32 ref; expect rel(L2) ~0.0056, 1T == 48T):
 make CC=fcc OPENMP=1

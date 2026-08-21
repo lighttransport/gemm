@@ -55,7 +55,8 @@ static int parse_dtype(const char *s) {
     if (!strcasecmp(s, "fp32")) return VIT_DTYPE_FP32;
     if (!strcasecmp(s, "bf16")) return VIT_DTYPE_BF16;
     if (!strcasecmp(s, "fp16")) return VIT_DTYPE_FP16;
-    if (!strcasecmp(s, "int8")) return VIT_DTYPE_INT8;
+    if (!strcasecmp(s, "int8"))  return VIT_DTYPE_INT8;
+    if (!strcasecmp(s, "int16")) return VIT_DTYPE_INT16;
     return -1;
 }
 
@@ -64,7 +65,8 @@ static const char *dtype_name(int dt) {
         case VIT_DTYPE_FP32: return "fp32";
         case VIT_DTYPE_BF16: return "bf16";
         case VIT_DTYPE_FP16: return "fp16";
-        case VIT_DTYPE_INT8: return "int8";
+        case VIT_DTYPE_INT8:  return "int8";
+        case VIT_DTYPE_INT16: return "int16";
         default:             return "?";
     }
 }

@@ -151,6 +151,11 @@ typedef struct {
     int8_t  *BT_o_i8;   float *sc_o;
     int8_t  *BT_u_i8;   float *sc_u;
     int8_t  *BT_d_i8;   float *sc_d;
+    /* INT16 mirrors (non-NULL when cache dtype == INT16): pre-packed hi/lo + scale + colsums */
+    int8_t   *BT_qkv_i16; float *sc_qkv16; int32_t *cs_qkv16;
+    int8_t   *BT_o_i16;   float *sc_o16;   int32_t *cs_o16;
+    int8_t   *BT_u_i16;   float *sc_u16;   int32_t *cs_u16;
+    int8_t   *BT_d_i16;   float *sc_d16;   int32_t *cs_d16;
     /* CMG replicas (populated by vit_a64fx_cache_replicate). When active,
      * BT_*_fp and BT_*_bf above point at p[0] of the corresponding repl. */
     btp_repl qkv_r, o_r, u_r, d_r;
@@ -166,6 +171,8 @@ typedef struct {
     uint16_t *BT_fc2_fp;
     int8_t   *BT_fc1_i8; float *sc_fc1;
     int8_t   *BT_fc2_i8; float *sc_fc2;
+    int8_t   *BT_fc1_i16; float *sc_fc116; int32_t *cs_fc116;
+    int8_t   *BT_fc2_i16; float *sc_fc216; int32_t *cs_fc216;
     btp_repl fc1_r, fc2_r;
 } deepstack_cache;
 
@@ -201,6 +208,8 @@ struct vit_a64fx_cache {
     uint16_t *BT_mm2_fp;
     int8_t   *BT_mm0_i8; float *sc_mm0;
     int8_t   *BT_mm2_i8; float *sc_mm2;
+    int8_t   *BT_mm0_i16; float *sc_mm016; int32_t *cs_mm016;
+    int8_t   *BT_mm2_i16; float *sc_mm216; int32_t *cs_mm216;
     btp_repl mm0_r, mm2_r;
 
     /* CMG replication state. n_cmgs > 0 after vit_a64fx_cache_replicate succeeds;
@@ -565,6 +574,31 @@ struct vit_a64fx_cache *vit_a64fx_cache_build(struct vision_model *vm, int dtype
         }
         c->BT_mm0_i8 = take_int8_packed(&c->BT_mm0, merged, merged,       &c->sc_mm0);
         c->BT_mm2_i8 = take_int8_packed(&c->BT_mm2, merged, vm->proj_dim, &c->sc_mm2);
+    } else if (dtype == VIT_DTYPE_INT16) {
+        /* int16: quantize + split hi/lo + pre-pack each weight (per-n scale +
+         * precomputed per-col sums). Takes ownership of the fp32 BT. */
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 1)
+#endif
+        for (int l = 0; l < vm->n_blocks; l++) {
+            block_cache *bc = &c->blocks[l];
+            bc->BT_qkv_i16 = take_int16_packed(&bc->BT_qkv, dim,     3 * dim, &bc->sc_qkv16, &bc->cs_qkv16);
+            bc->BT_o_i16   = take_int16_packed(&bc->BT_o,   dim,     dim,     &bc->sc_o16,   &bc->cs_o16);
+            bc->BT_u_i16   = take_int16_packed(&bc->BT_u,   dim,     ffn_dim, &bc->sc_u16,   &bc->cs_u16);
+            bc->BT_d_i16   = take_int16_packed(&bc->BT_d,   ffn_dim, dim,     &bc->sc_d16,   &bc->cs_d16);
+        }
+        if (c->deepstack) {
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(dynamic, 1)
+#endif
+            for (int d = 0; d < vm->n_deepstack; d++) {
+                deepstack_cache *dc = &c->deepstack[d];
+                dc->BT_fc1_i16 = take_int16_packed(&dc->BT_fc1, merged, merged,       &dc->sc_fc116, &dc->cs_fc116);
+                dc->BT_fc2_i16 = take_int16_packed(&dc->BT_fc2, merged, vm->proj_dim, &dc->sc_fc216, &dc->cs_fc216);
+            }
+        }
+        c->BT_mm0_i16 = take_int16_packed(&c->BT_mm0, merged, merged,       &c->sc_mm016, &c->cs_mm016);
+        c->BT_mm2_i16 = take_int16_packed(&c->BT_mm2, merged, vm->proj_dim, &c->sc_mm216, &c->cs_mm216);
     } else { /* VIT_DTYPE_FP32 */
         /* Pre-pack each transposed weight into [N_blocks][K_rounded][NR] FP32
          * BTP form once. This collapses the per-call pack_B_fp32 + serial
@@ -731,6 +765,10 @@ void vit_a64fx_cache_free(struct vit_a64fx_cache *c) {
                 free(b->BT_o_i8);   free(b->sc_o);
                 free(b->BT_u_i8);   free(b->sc_u);
                 free(b->BT_d_i8);   free(b->sc_d);
+                free(b->BT_qkv_i16); free(b->sc_qkv16); free(b->cs_qkv16);
+                free(b->BT_o_i16);   free(b->sc_o16);   free(b->cs_o16);
+                free(b->BT_u_i16);   free(b->sc_u16);   free(b->cs_u16);
+                free(b->BT_d_i16);   free(b->sc_d16);   free(b->cs_d16);
             }
         }
         free(c->blocks);
@@ -749,6 +787,8 @@ void vit_a64fx_cache_free(struct vit_a64fx_cache *c) {
                 free(dc->BT_fc1_fp); free(dc->BT_fc2_fp);
                 free(dc->BT_fc1_i8); free(dc->sc_fc1);
                 free(dc->BT_fc2_i8); free(dc->sc_fc2);
+                free(dc->BT_fc1_i16); free(dc->sc_fc116); free(dc->cs_fc116);
+                free(dc->BT_fc2_i16); free(dc->sc_fc216); free(dc->cs_fc216);
             }
         }
         free(c->deepstack);
@@ -764,6 +804,8 @@ void vit_a64fx_cache_free(struct vit_a64fx_cache *c) {
         free(c->BT_mm0_fp); free(c->BT_mm2_fp);
         free(c->BT_mm0_i8); free(c->sc_mm0);
         free(c->BT_mm2_i8); free(c->sc_mm2);
+        free(c->BT_mm0_i16); free(c->sc_mm016); free(c->cs_mm016);
+        free(c->BT_mm2_i16); free(c->sc_mm216); free(c->cs_mm216);
     }
     free(c);
 }
@@ -1060,7 +1102,27 @@ static void vit_gemm_bias_BT_int8_mt(vlm_pool *pool,
     add_bias_mt(pool, Y, bias, n_tokens, n_out);
 }
 
-/* Dispatch helper: picks INT8 → FP16 → BF16 → FP32 based on which mirror is set.
+/* int16 path: B is pre-packed hi/lo int8 (take_int16_packed) with per-n scale
+ * + precomputed per-col sums. GEMM (3 int8 SDOTs + int64 combine) + dequant;
+ * bias added after. */
+static void vit_gemm_bias_BT_int16_mt(vlm_pool *pool,
+                                      float *Y,
+                                      const int8_t  *Bpack_i16,
+                                      const float    *w_scale,
+                                      const int32_t  *colsum,
+                                      const float    *bias,
+                                      const float    *X,
+                                      int n_tokens, int n_out, int n_in)
+{
+    (void)pool;
+    gemm_int16_BTP(n_tokens, n_in, n_out,
+                   X, n_in,
+                   Bpack_i16, w_scale, colsum,
+                   Y, n_out);
+    add_bias_mt(pool, Y, bias, n_tokens, n_out);
+}
+
+/* Dispatch helper: picks INT8/INT16 → FP16 → BF16 → FP32 based on which mirror is set.
  * When `r` is non-NULL and r->p[1] is populated (i.e. cache_replicate has run),
  * route through the CMG-aware GEMM so each OMP thread reads its CMG-local copy. */
 static inline void gemm_BT_dispatch(vlm_pool *pool, float *Y,
@@ -1069,6 +1131,9 @@ static inline void gemm_BT_dispatch(vlm_pool *pool, float *Y,
                                     const uint16_t *BT_fp16,
                                     const int8_t   *BT_int8,
                                     const float    *w_scale,
+                                    const int8_t   *BT_int16,
+                                    const float    *w_scale16,
+                                    const int32_t  *cs_int16,
                                     const btp_repl *r,
                                     int n_cmgs,
                                     const float    *bias,
@@ -1077,6 +1142,10 @@ static inline void gemm_BT_dispatch(vlm_pool *pool, float *Y,
 {
     if (BT_int8) {
         vit_gemm_bias_BT_int8_mt(pool, Y, BT_int8, w_scale, bias, X, n_tokens, n_out, n_in);
+        return;
+    }
+    if (BT_int16) {
+        vit_gemm_bias_BT_int16_mt(pool, Y, BT_int16, w_scale16, cs_int16, bias, X, n_tokens, n_out, n_in);
         return;
     }
     int replicated = (r && n_cmgs > 1 && r->p[1] != NULL);
@@ -2109,6 +2178,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
         if (cache->dtype == VIT_DTYPE_BF16)      storage = "bf16";
         else if (cache->dtype == VIT_DTYPE_FP16) { storage = "fp16"; set_fpcr_fz16(); }
         else if (cache->dtype == VIT_DTYPE_INT8)  storage = "int8";
+        else if (cache->dtype == VIT_DTYPE_INT16) storage = "int16";
     }
     /* If the cache has been NUMA-replicated, pin OMP workers to CMG-aligned
      * cores so the linear tid → CMG mapping used inside the CMG GEMM kernels
@@ -2229,7 +2299,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
 
         /* QKV proj */
         if (bc) {
-            gemm_BT_dispatch(pool, qkv, bc->BT_qkv, bc->BT_qkv_bf, bc->BT_qkv_fp, bc->BT_qkv_i8, bc->sc_qkv,
+            gemm_BT_dispatch(pool, qkv, bc->BT_qkv, bc->BT_qkv_bf, bc->BT_qkv_fp, bc->BT_qkv_i8, bc->sc_qkv, bc->BT_qkv_i16, bc->sc_qkv16, bc->cs_qkv16,
                              &bc->qkv_r, cache->n_cmgs, bc->b_qkv,
                              ln_buf, n_patches, 3 * dim, dim);
         } else {
@@ -2254,7 +2324,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
 
         /* Attn out proj */
         if (bc) {
-            gemm_BT_dispatch(pool, hidden2, bc->BT_o, bc->BT_o_bf, bc->BT_o_fp, bc->BT_o_i8, bc->sc_o,
+            gemm_BT_dispatch(pool, hidden2, bc->BT_o, bc->BT_o_bf, bc->BT_o_fp, bc->BT_o_i8, bc->sc_o, bc->BT_o_i16, bc->sc_o16, bc->cs_o16,
                              &bc->o_r, cache->n_cmgs, bc->b_o,
                              attn_out, n_patches, dim, dim);
         } else {
@@ -2284,7 +2354,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
 
         /* FFN up */
         if (bc) {
-            gemm_BT_dispatch(pool, ffn_buf, bc->BT_u, bc->BT_u_bf, bc->BT_u_fp, bc->BT_u_i8, bc->sc_u,
+            gemm_BT_dispatch(pool, ffn_buf, bc->BT_u, bc->BT_u_bf, bc->BT_u_fp, bc->BT_u_i8, bc->sc_u, bc->BT_u_i16, bc->sc_u16, bc->cs_u16,
                              &bc->u_r, cache->n_cmgs, bc->b_u,
                              ln_buf, n_patches, ffn_dim, dim);
         } else {
@@ -2303,7 +2373,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
 
         /* FFN down */
         if (bc) {
-            gemm_BT_dispatch(pool, hidden2, bc->BT_d, bc->BT_d_bf, bc->BT_d_fp, bc->BT_d_i8, bc->sc_d,
+            gemm_BT_dispatch(pool, hidden2, bc->BT_d, bc->BT_d_bf, bc->BT_d_fp, bc->BT_d_i8, bc->sc_d, bc->BT_d_i16, bc->sc_d16, bc->cs_d16,
                              &bc->d_r, cache->n_cmgs, bc->b_d,
                              ffn_buf, n_patches, dim, ffn_dim);
         } else {
@@ -2343,7 +2413,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
             /* fc1 → merged_dim */
             float *ds_buf = xmalloc_f((size_t)n_merged * merged_dim);
             if (dc) {
-                gemm_BT_dispatch(pool, ds_buf, dc->BT_fc1, dc->BT_fc1_bf, dc->BT_fc1_fp, dc->BT_fc1_i8, dc->sc_fc1,
+                gemm_BT_dispatch(pool, ds_buf, dc->BT_fc1, dc->BT_fc1_bf, dc->BT_fc1_fp, dc->BT_fc1_i8, dc->sc_fc1, dc->BT_fc1_i16, dc->sc_fc116, dc->cs_fc116,
                                  &dc->fc1_r, cache->n_cmgs, dc->b_fc1,
                                  merge_buf, n_merged, merged_dim, merged_dim);
             } else {
@@ -2360,7 +2430,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
             /* fc2 → proj_dim */
             float *ds_out = xmalloc_f((size_t)n_merged * vm->proj_dim);
             if (dc) {
-                gemm_BT_dispatch(pool, ds_out, dc->BT_fc2, dc->BT_fc2_bf, dc->BT_fc2_fp, dc->BT_fc2_i8, dc->sc_fc2,
+                gemm_BT_dispatch(pool, ds_out, dc->BT_fc2, dc->BT_fc2_bf, dc->BT_fc2_fp, dc->BT_fc2_i8, dc->sc_fc2, dc->BT_fc2_i16, dc->sc_fc216, dc->cs_fc216,
                                  &dc->fc2_r, cache->n_cmgs, dc->b_fc2,
                                  ds_buf, n_merged, vm->proj_dim, merged_dim);
             } else {
@@ -2407,7 +2477,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
     float *mm_out = xmalloc_f((size_t)n_merged * vm->proj_dim);
 
     if (cache) {
-        gemm_BT_dispatch(pool, mm_buf, cache->BT_mm0, cache->BT_mm0_bf, cache->BT_mm0_fp, cache->BT_mm0_i8, cache->sc_mm0,
+        gemm_BT_dispatch(pool, mm_buf, cache->BT_mm0, cache->BT_mm0_bf, cache->BT_mm0_fp, cache->BT_mm0_i8, cache->sc_mm0, cache->BT_mm0_i16, cache->sc_mm016, cache->cs_mm016,
                          &cache->mm0_r, cache->n_cmgs, cache->b_mm0,
                          merge_buf, n_merged, merged_dim, merged_dim);
     } else {
@@ -2423,7 +2493,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
     dump2(dump, "mm_gelu", -1, n_merged, merged_dim, mm_buf);
 
     if (cache) {
-        gemm_BT_dispatch(pool, mm_out, cache->BT_mm2, cache->BT_mm2_bf, cache->BT_mm2_fp, cache->BT_mm2_i8, cache->sc_mm2,
+        gemm_BT_dispatch(pool, mm_out, cache->BT_mm2, cache->BT_mm2_bf, cache->BT_mm2_fp, cache->BT_mm2_i8, cache->sc_mm2, cache->BT_mm2_i16, cache->sc_mm216, cache->cs_mm216,
                          &cache->mm2_r, cache->n_cmgs, cache->b_mm2,
                          mm_buf, n_merged, vm->proj_dim, merged_dim);
     } else {
