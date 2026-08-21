@@ -195,10 +195,18 @@ varies session-to-session, so the *relative* columns are what matter):
 | int16 | 458.2751    | 0.58%     | 248.8 | **0.70× (43% slower)** |
 
 **int8 is the production win** (1.53× faster, small 0.79% norm delta). The
-whole-VLM win is well below the 3–5× GEMM win because the int8 path adds
-per-GEMM overhead (quantize A + pack A + dequant, ~3 extra parallel regions
-each) that partly offsets the GEMM speedup. Future: fuse the quantize/pack
-into the GEMM prologue, or cache the per-row A scale.
+whole-VLM win is well below the 3–5× standalone-GEMM win. `INT8_STEP_PROF=1`
+(kernels/int8_gemm.c) breaks the int8 GEMM-BTP into per-row-A quant (~22%),
+A-pack (~1%), SDOT GEMM (~71%), dequant (~6%). The SDOT GEMM runs ~5× slower
+in-situ than standalone (≈500 vs ≈2400 GOPS) because **each block's W is
+streamed from HBM once** (24 distinct W, nb-outer reads W a single time) —
+the same regime that bounds the fp16 path, so the int8/fp16 ratio is
+preserved. Ruled out (measured): OMP team creation ≈0.4 µs/region and temp-
+buffer page faults ≈0.1 µs — both negligible; the per-step in-situ numbers are
+HBM-contended and node-variance-noisy, so read the split, not the absolute ms.
+Further whole-VLM gains need the SDOT GEMM closer to HBM-roofline (it is already
+memory-bound on W) — fusing the dequant into the kernel (drop the int32 C
+buffer, ~3%) is the only clear small win; bigger wins are int8 on the LLM side.
 
 **Per-stage validation** (`--dump` + `tensor_diff`, enabled by the §Known-
 issues build fixes — the fp16 A64FX output is the reference proxy). Confirms
