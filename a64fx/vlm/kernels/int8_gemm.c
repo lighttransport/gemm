@@ -30,6 +30,25 @@ static void *xal(size_t n) {
     return p;
 }
 
+/* INT8_STEP_PROF=1 : accumulate master-thread wall time (CNTVCT, 100 MHz) of
+ * each step of gemm_int8_BTP across all calls, print at exit. Diagnostic only
+ * (off by default). NOTE: in-situ per-step wall times include HBM contention +
+ * node variance, so absolute values are noisy; use the RELATIVE split only. */
+static uint64_t cntvct_now(void) { uint64_t t; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t)); return t; }
+static struct { uint64_t quant, pack, gemm, dequant; long calls; } i8prof;
+static int i8prof_on(void) { static int e = -1; if (e < 0) { const char *v = getenv("INT8_STEP_PROF"); e = (v && *v && *v != '0'); } return e; }
+static void i8prof_print(void) {
+    if (!i8prof.calls) return;
+    double ms = 1e-5;   /* cycles / 1e5 = ms at 100 MHz */
+    uint64_t tot = i8prof.quant + i8prof.pack + i8prof.gemm + i8prof.dequant;
+    fprintf(stderr, "\n[int8 step profile] %ld gemm_int8_BTP calls, per-call (ms, HBM-noisy):\n", i8prof.calls);
+    fprintf(stderr, "  quant   (per-row A)  %8.4f  (%.1f%%)\n", i8prof.quant*ms/i8prof.calls, 100.0*i8prof.quant/tot);
+    fprintf(stderr, "  pack    (A tiles)    %8.4f  (%.1f%%)\n", i8prof.pack*ms/i8prof.calls, 100.0*i8prof.pack/tot);
+    fprintf(stderr, "  gemm    (SDOT)       %8.4f  (%.1f%%)\n", i8prof.gemm*ms/i8prof.calls, 100.0*i8prof.gemm/tot);
+    fprintf(stderr, "  dequant (C->Y)       %8.4f  (%.1f%%)\n", i8prof.dequant*ms/i8prof.calls, 100.0*i8prof.dequant/tot);
+    fprintf(stderr, "  total                %8.4f\n", tot*ms/i8prof.calls);
+}
+
 /* ── packing (copied from int8-new/gemm_pack.c) ───────────────────────── */
 static void pack_A_6x256(const int8_t *A, int lda, int8_t *Apack, int M) {
     for (int m0 = 0; m0 < M; m0 += I8_MR) {
@@ -103,6 +122,10 @@ void gemm_int8_BTP(int M, int K, int N, const float *X, int lda,
     int NB = NP / I8_NR;
     int KC = K / I8_KC;
 
+    const int prof = i8prof_on();
+    if (prof && i8prof.calls == 0) atexit(i8prof_print);
+    uint64_t pt0 = cntvct_now();
+
     // 1+2) per-ROW activation quantize (each row has its own scale -> no global
     // max barrier, more accurate than per-tensor). One parallel region over rows.
     float *a_scale = (float *)xal((size_t)M * 4);
@@ -120,6 +143,7 @@ void gemm_int8_BTP(int M, int K, int N, const float *X, int lda,
             X8[(size_t)m * K + k] = (int8_t)v;
         }
     }
+    uint64_t pt1 = cntvct_now();
 
     // 3) pack A per (mb, kc)
     int8_t *Apack = (int8_t *)xal((size_t)MB * KC * I8_MR * I8_KC);
@@ -132,6 +156,7 @@ void gemm_int8_BTP(int M, int K, int N, const float *X, int lda,
             pack_A_6x256(X8 + (size_t)(mb * I8_MR) * K + kc * I8_KC, K,
                          Apack + (size_t)(mb * KC + kc) * I8_MR * I8_KC, mr);
         }
+    uint64_t pt2 = cntvct_now();
 
     // 4) GEMM (nb-outer, accumulating over K-chunks) into int32 C [MB*6][NB*64]
     int32_t *C = (int32_t *)xal((size_t)(MB * I8_MR) * NP * 4);
@@ -145,6 +170,7 @@ void gemm_int8_BTP(int M, int K, int N, const float *X, int lda,
                                     Bpack + (size_t)(nb * KC + kc) * I8_NR * I8_KC,
                                     Ct, NP * 4);
         }
+    uint64_t pt3 = cntvct_now();
 
     // 5) dequant Y[m][n] = C[m][n] * a_scale[m] * w_scale[n]  (valid [M][N])
     const svbool_t pg = svptrue_b32();
@@ -161,7 +187,21 @@ void gemm_int8_BTP(int M, int K, int N, const float *X, int lda,
             svst1_f32(pg2, yr + n, zr);
         }
     }
+    uint64_t pt4 = cntvct_now();
+
     free(C); free(X8); free(Apack); free(a_scale);
+    // Allocs/memset are folded into the step that follows them:
+    //   quant  = a_scale/X8 alloc + quant region
+    //   pack   = Apack alloc + pack region
+    //   gemm   = C alloc + memset + GEMM region
+    //   dequant= dequant region
+    if (prof) {
+        i8prof.calls++;
+        i8prof.quant  += pt1 - pt0;
+        i8prof.pack   += pt2 - pt1;
+        i8prof.gemm   += pt3 - pt2;
+        i8prof.dequant+= pt4 - pt3;
+    }
 }
 
 
