@@ -175,12 +175,33 @@ GEMMs are W-HBM-bound), and (b) the 8× compute rate. The existing `int8-new`
 driver is **mb-outer + re-packs B per K-chunk** → only ~5 GOPS for M=96 (1% of
 peak); the nb-outer + prepacked schedule is what reaches ~2800 GOPS/call (48T).
 
-**Not yet integrated.** To use it in the VLM: quantize W→int8 (offline),
-quantize A→int8 per layer (online), run the int8 GEMM, dequant the int32
-accumulator (scale by a_scale·w_scale). The main risk is **accuracy**: int8
-(8-bit) is coarser than fp16 (11-bit mantissa) → the VLM output norm would
-shift. Since the GEMMs dominate the encode, a 3–5× GEMM win → ~1.5–2× on the
-whole VLM.
+**Integrated** (`--dtype int8`). `kernels/int8_gemm.c` +
+`kernels/kernel_6x4_int8.S` (the 6×4 kernel made to **accumulate** so K>256
+correctly sums over K/256 chunks). Weights are quantized to int8 **per output
+channel** (per-n) + pre-packed at cache build; activations are quantized
+**per row** (per-m, no global-max barrier) per GEMM. Dequant: `C[m][n] =
+C_i32[m][n] · a_scale[m] · w_scale[n]`.
+
+Result on this node (384×256, 96 tokens, 48T, `--bench 8` median):
+
+| | fp16 | int8 | |
+|---|---|---|---|
+| total | 0.335 s (286 tok/s) | **0.232 s (414 tok/s)** | **1.44× faster** |
+| output norm | 455.6237 | 452.0263 | **0.79% delta** |
+
+The whole-VLM win (1.44×) is well below the 3–5× GEMM win because the int8
+path adds per-GEMM overhead (quantize A + pack A + dequant, ~3 extra parallel
+regions each) that partly offsets the GEMM speedup. Future: fuse the
+quantize/pack into the GEMM prologue, or cache the per-row A scale.
+
+Two bugs found while integrating (both fixed):
+- **A-pack race** — `pack_A_6x256` was called with `M-mb*6` rows (packing
+  multiple 6-row tiles into one slot), overwriting neighbouring slots; masked
+  at 1 thread, corrupted the 2nd M-tile under threads. Fixed to pack exactly
+  one 6-row tile per (mb,kc).
+- The 6×4 kernel **clobbers z8–z31**; `int8_gemm.c`'s SVE dequant keeps values
+  live across the call, so the kernel now saves/restores the callee-saved SVE
+  vectors (z8–z15, z28–z31).
 
 ### 3.4 Store the activations in fp16 (A is currently fp32) — likely small
 
@@ -221,6 +242,16 @@ MM=~/models/mmproj-Qwen3VL-2B-Instruct-F16.gguf
 # current best on this node (no CMG — see 3.1):
 OMP_NUM_THREADS=48 ./build/vlm_runner $M $MM ~/fujisan.jpg \
     --dtype fp16 --threads 48 --bench 3
+
+# int8 (W8A8, ~1.44× faster, norm 452.03 vs fp16 455.62 — see 3.3):
+OMP_NUM_THREADS=48 ./build/vlm_runner $M $MM ~/fujisan.jpg \
+    --dtype int8 --threads 48 --bench 3
+
+# int8 GEMM unit test (vs fp32 ref; expect rel(L2) ~0.0056, 1T == 48T):
+make CC=fcc OPENMP=1
+fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -std=c11 -fopenmp -Ikernels -I. \
+    -o /tmp/ti tools/test_int8_gemm.c kernels/int8_gemm.c kernels/kernel_6x4_int8.S -lm
+OMP_NUM_THREADS=48 /tmp/ti
 
 # stage breakdown:
 VLM_STAGE_TIMING=1 OMP_NUM_THREADS=48 ./build/vlm_runner $M $MM ~/fujisan.jpg \
