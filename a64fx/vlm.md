@@ -200,6 +200,21 @@ per-GEMM overhead (quantize A + pack A + dequant, ~3 extra parallel regions
 each) that partly offsets the GEMM speedup. Future: fuse the quantize/pack
 into the GEMM prologue, or cache the per-row A scale.
 
+**Per-stage validation** (`--dump` + `tensor_diff`, enabled by the §Known-
+issues build fixes — the fp16 A64FX output is the reference proxy). Confirms
+int8/int16 are *correct* (pure quantization noise, no corruption): error is
+0.0000 before the first GEMM (patch_embed/pos_emb/ln1), appears at `qkv`, and
+accumulates smoothly through the 24-block residual — `block_out` rmse vs fp16:
+
+    block  0      6      9     12     18     23
+    int8   2.0e-2 3.8e-2 4.3e-2 4.6e-1 5.7e-1 1.7e+1
+    int16  4.9e-3 9.4e-3 1.4e-2 2.4e-1 3.2e-1 7.5e+0
+
+The steps at blocks ~11 and ~22 are the **deepstack injections** (layers
+5/11/17) + final merge, which add large residual terms that amplify the
+(correct) noise — not a bug (no isolated spike). int16 is ~4× smaller per
+block, ~2× at the final embedding.
+
 ### 3.3a INT16 (hi/lo int8 split) — near-exact, but dominated by fp16
 
 A64FX has **no 16-bit dot product**, and this node's **binutils 2.30 does not
