@@ -18,6 +18,12 @@ export PJM_MPI_PROC=$TP_SIZE
 # compute outlier, charging the other ranks' wait as all-reduce time.  Keep it
 # overrideable for topology-specific experiments.
 export OMP_PROC_BIND=${OMP_PROC_BIND:-spread} OMP_PLACES=${OMP_PLACES:-cores}
+# Keep the verifier's many small OpenMP regions hot briefly, then park those
+# workers before the pthread-based native NextN pool runs.  Zero block time
+# repeatedly sleeps/wakes the matrix teams; an unbounded active wait
+# oversubscribes all 48 cores during draft generation.
+export OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-passive}
+export KMP_BLOCKTIME=${KMP_BLOCKTIME:-1} OMP_DYNAMIC=${OMP_DYNAMIC:-false}
 export NUMA_DISTRIBUTE=${NUMA_DISTRIBUTE:-1} NUMA_N_CMGS=${NUMA_N_CMGS:-4}
 export NUMA_CMG_BUDGET_GB=${NUMA_CMG_BUDGET_GB:-7} NUMA_ALIGNMENT=${NUMA_ALIGNMENT:-2097152}
 # TP_STAGE_DIR is a complete rank-local image.  The runner parses only GGUF
