@@ -1952,7 +1952,7 @@ static inline void matvec_bf16_8row_pv(float *dst,
      * pair stream, to L2 (locality=2). With ~12 threads/CMG × 4 pair streams
      * the HW prefetcher's ~16 slots/CMG are oversubscribed; an L2-only hint
      * provides headroom without blowing the L1. Guarded by TF_BF16PV_PREFETCH=1. */
-    static int pf_env_done = 0, pf_dist = 0;
+    static _Thread_local int pf_env_done = 0, pf_dist = 0;
     if (__builtin_expect(!pf_env_done, 0)) {
         const char *e = getenv("TF_BF16PV_PREFETCH");
         if (e && *e && *e != '0') pf_dist = atoi(e);

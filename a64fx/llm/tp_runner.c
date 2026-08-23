@@ -1041,6 +1041,8 @@ int main(int argc, char **argv) {
         if (P > tok_cap) die("tokenization budget overflow", -1);
         free(text);
     }
+    int prompt_token_limit = (int)envl_opt("TP_PROMPT_TOKEN_LIMIT", 0);
+    if (prompt_token_limit > 0 && P > prompt_token_limit) P = prompt_token_limit;
 
     int cfg_max_seq = (int)envl("TP_MAXSEQ", 0);
     int need_seq = P + max_gen + 16;
@@ -1317,6 +1319,9 @@ int main(int argc, char **argv) {
     double t_prefill = 0.0;
     double t_fwd = 0.0;
     long mtp_match = 0, mtp_total = 0;
+    long mtp_horizon_match[4] = {0}, mtp_horizon_total[4] = {0};
+    long mtp_teacher_match = 0, mtp_teacher_total = 0;
+    long mtp_teacher_offset_match[7] = {0};  /* expected token index p + [-1..5] */
     int32_t *mtp_token_counts = spec_k > 0
         ? (int32_t *)calloc((size_t)m->n_vocab, sizeof(int32_t)) : NULL;
     int mtp_unique_targets = 0, mtp_max_target_count = 0;
@@ -1397,12 +1402,6 @@ int main(int argc, char **argv) {
         }
         if (!prefill_gemm_used) {
             double pf0 = now_sec();
-            if (spec_k && m->nextn.loaded && prefill_from == 0) {
-                /* Match llama.cpp's right-shift catch-up: position zero pairs
-                 * the first prompt token with an all-zero pending hidden row. */
-                memset(mtp_seed_hidden, 0, (size_t)n_embd * sizeof(float));
-                transformer_nextn_logits(m, ptoks[0], mtp_seed_hidden, 0);
-            }
             for (int p = prefill_from; p < P; p++) {
                 transformer_embed_token(m, ptoks[p]);
                 double _ta = now_sec();
@@ -1410,21 +1409,28 @@ int main(int argc, char **argv) {
                 if (spec_k && m->nextn.loaded) {
                     float *target_h = (float *)alloca((size_t)n_embd * sizeof(float));
                     memcpy(target_h, transformer_get_hidden(m), (size_t)n_embd * sizeof(float));
-                    const float *mtp_target = envb_opt("TP_MTP_RAW_HIDDEN", 1)
+                    const float *mtp_target = envb_opt("TP_MTP_RAW_HIDDEN", 0)
                         ? transformer_nextn_target_hidden(m) : transformer_get_hidden(m);
                     memcpy(mtp_seed_hidden, mtp_target, (size_t)n_embd * sizeof(float));
                     /* Teacher-force the known next prompt token.  The draft
                      * head consumes (h[p], token[p+1]) and predicts token[p+2]. */
                     if (p + 1 < P) {
                         float *catchup_logits = transformer_nextn_logits(
-                            m, ptoks[p + 1], mtp_seed_hidden, p + 1);
-                        if (envb_opt("TP_MTP_TRACE", 0) && p + 2 < P) {
+                            m, ptoks[p + 1], mtp_seed_hidden, p);
+                        if (p + 2 < P) {
                             double catchup_ar = 0.0; long catchup_calls = 0;
                             int32_t catchup = sample_argmax(
                                 m, catchup_logits, &c, &catchup_ar, &catchup_calls);
-                            if (is_first)
+                            mtp_teacher_match += catchup == ptoks[p + 2];
+                            mtp_teacher_total++;
+                            for (int oi = 0; oi < 7; oi++) {
+                                int expected_pos = p + oi - 1;
+                                if (expected_pos >= 0 && expected_pos < P)
+                                    mtp_teacher_offset_match[oi] += catchup == ptoks[expected_pos];
+                            }
+                            if (is_first && envb_opt("TP_MTP_TRACE", 0))
                                 logmsg("MTP catchup pos=%d input=%d draft=%d expected=%d\n",
-                                       p + 1, ptoks[p + 1], catchup, ptoks[p + 2]);
+                                       p, ptoks[p + 1], catchup, ptoks[p + 2]);
                         }
                     }
                     transformer_set_hidden(m, target_h);
@@ -1445,7 +1451,7 @@ int main(int argc, char **argv) {
                 const float *dh = mtp_seed_hidden;
                 int32_t prev = in_tok;
                 for (int k = 0; k < spec_k; k++) {
-                    float *dlg = transformer_nextn_logits(m, prev, dh, P + k);
+                    float *dlg = transformer_nextn_logits(m, prev, dh, P - 1 + k);
                     double da = 0.0; long dc = 0;
                     mtp_pending[k] = sample_argmax(m, dlg, &c, &da, &dc);
                     t_comm += da; ar_calls += dc;
@@ -1517,35 +1523,51 @@ int main(int argc, char **argv) {
             float *lg = transformer_compute_logits(m);
             nt = sample_argmax(m, lg, &c, &ar_step, &ar_calls_step);
             if (spec_k && m->nextn.loaded) {
+                int regenerate_drafts = 1;
                 if (is_first && envb_opt("TP_MTP_TRACE", 0))
                     logmsg("MTP trunk pos=%d input=%d target=%d\n", p, in_tok, nt);
                 if (mtp_pending_n > 0) {
                     if (is_first && envb_opt("TP_MTP_TRACE", 0))
                         logmsg("MTP compare pos=%d draft=%d target=%d\n",
                                p, mtp_pending[0], nt);
-                    mtp_match += mtp_pending[0] == nt;
+                    int accepted = mtp_pending[0] == nt;
+                    int horizon = spec_k - mtp_pending_n;
+                    mtp_match += accepted;
                     mtp_total++;
+                    if (horizon >= 0 && horizon < 4) {
+                        mtp_horizon_match[horizon] += accepted;
+                        mtp_horizon_total[horizon]++;
+                    }
                     if (mtp_token_counts && nt >= 0 && nt < m->n_vocab) {
                         int count = ++mtp_token_counts[nt];
                         if (count == 1) mtp_unique_targets++;
                         if (count > mtp_max_target_count) mtp_max_target_count = count;
                     }
+                    if (accepted && mtp_pending_n > 1) {
+                        memmove(mtp_pending, mtp_pending + 1,
+                                (size_t)(mtp_pending_n - 1) * sizeof(mtp_pending[0]));
+                        mtp_pending_n--;
+                        regenerate_drafts = 0;
+                    } else {
+                        mtp_pending_n = 0;
+                    }
                 }
-                /* Qwen3.5 exports h_nextn after the trunk output RMSNorm. */
-                const float *draft_h = envb_opt("TP_MTP_RAW_HIDDEN", 1)
-                    ? transformer_nextn_target_hidden(m) : transformer_get_hidden(m);
-                int prev = nt;
-                for (int k = 0; k < spec_k; k++) {
-                    float *dlg = transformer_nextn_logits(m, prev, draft_h, p + 1 + k);
-                    double draft_ar = 0.0; long draft_calls = 0;
-                    int32_t draft = sample_argmax(m, dlg, &c, &draft_ar, &draft_calls);
-                    ar_step += draft_ar;
-                    ar_calls_step += draft_calls;
-                    mtp_pending[k] = draft;
-                    prev = draft;
-                    draft_h = transformer_nextn_hidden(m);
+                if (regenerate_drafts) {
+                    const float *draft_h = envb_opt("TP_MTP_RAW_HIDDEN", 0)
+                        ? transformer_nextn_target_hidden(m) : transformer_get_hidden(m);
+                    int prev = nt;
+                    for (int k = 0; k < spec_k; k++) {
+                        float *dlg = transformer_nextn_logits(m, prev, draft_h, p + k);
+                        double draft_ar = 0.0; long draft_calls = 0;
+                        int32_t draft = sample_argmax(m, dlg, &c, &draft_ar, &draft_calls);
+                        ar_step += draft_ar;
+                        ar_calls_step += draft_calls;
+                        mtp_pending[k] = draft;
+                        prev = draft;
+                        draft_h = transformer_nextn_hidden(m);
+                    }
+                    mtp_pending_n = spec_k;
                 }
-                mtp_pending_n = spec_k;
             }
         }
 
@@ -1585,6 +1607,20 @@ done:
                mtp_unique_targets, (double)mtp_max_target_count / mtp_total,
                mtp_unique_targets >= 8 && mtp_max_target_count * 10 < mtp_total * 9
                    ? "nondegenerate" : "REJECT-DEGENERATE");
+    if (is_first && mtp_total) {
+        logmsg("MTP horizons:");
+        for (int k = 0; k < spec_k; k++)
+            logmsg(" h%d=%ld/%ld", k + 1, mtp_horizon_match[k], mtp_horizon_total[k]);
+        logmsg("\n");
+    }
+    if (is_first && mtp_teacher_total)
+        logmsg("MTP teacher match=%ld/%ld alpha=%.4f offsets[p-1..p+5]="
+               "%ld,%ld,%ld,%ld,%ld,%ld,%ld\n", mtp_teacher_match,
+               mtp_teacher_total, (double)mtp_teacher_match / mtp_teacher_total,
+               mtp_teacher_offset_match[0], mtp_teacher_offset_match[1],
+               mtp_teacher_offset_match[2], mtp_teacher_offset_match[3],
+               mtp_teacher_offset_match[4], mtp_teacher_offset_match[5],
+               mtp_teacher_offset_match[6]);
     {   char pn[64]; snprintf(pn, sizeof pn, "tp_perf_rank%02d.txt", MyRank);
         FILE *pf2 = fopen(pn, "w");
         if (pf2) {

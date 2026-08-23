@@ -10,7 +10,7 @@
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s model.gguf [tensor_substr]\n", argv[0]); return 1; }
     const char *filt = argc > 2 ? argv[2] : NULL;
-    gguf_context *g = gguf_open_multi(argv[1], 1);
+    gguf_context *g = gguf_open_multi(argv[1], 3);  /* metadata only; never map weights */
     if (!g) { fprintf(stderr, "open fail\n"); return 1; }
     printf("=== METADATA (%llu kv) ===\n", (unsigned long long)g->n_kv);
     for (uint64_t i = 0; i < g->n_kv; i++) {
@@ -44,6 +44,18 @@ int main(int argc, char **argv) {
         for (uint32_t d = 0; d < t->n_dims; d++)
             printf("%llu%s", (unsigned long long)t->dims[d], d + 1 < t->n_dims ? "," : "");
         printf("] type=%s\n", ggml_type_name(t->type));
+        if (filt && t->type == GGML_TYPE_F32) {
+            int fd = g->tensor_fds ? g->tensor_fds[i] : g->fd;
+            uint64_t off = g->tensor_file_offsets ? g->tensor_file_offsets[i]
+                                                   : (uint64_t)g->data_offset + t->offset;
+            float v[16]; size_t bytes = gguf_tensor_size(g, (int)i);
+            size_t take = bytes < sizeof(v) ? bytes : sizeof(v);
+            if (fd >= 0 && pread(fd, v, take, (off_t)off) == (ssize_t)take) {
+                float lo = v[0], hi = v[0], sum = 0.0f; size_t n = take / sizeof(float);
+                for (size_t j = 0; j < n; j++) { if (v[j] < lo) lo=v[j]; if(v[j]>hi)hi=v[j]; sum+=v[j]; }
+                printf("    first%zu min=%g max=%g mean=%g\n", n, lo, hi, sum/n);
+            }
+        }
     }
     return 0;
 }
