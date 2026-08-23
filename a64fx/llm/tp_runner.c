@@ -826,6 +826,32 @@ static int32_t sample_argmax(transformer_model *m, float *lg, tp_comm *c,
     return nt;
 }
 
+static void sample_argmax_n(transformer_model *m, float *logits, int stride,
+                            int n, int32_t *tokens, tp_comm *c,
+                            double *ar_secs_out, long *ar_calls_out) {
+    float vi[10];
+    int nloc = m->tp_vocab_sharded ? m->tp_vocab_loc : m->n_vocab;
+    for (int k = 0; k < n; k++) {
+        float best = -1e30f;
+        int32_t nt = 0;
+        float *lg = logits + (size_t)k * stride;
+        for (int v = 0; v < nloc; v++) {
+            if (lg[v] > best) { best = lg[v]; nt = v; }
+        }
+        nt += m->tp_vocab_lo;
+        vi[2*k] = best;
+        memcpy(&vi[2*k+1], &nt, sizeof(nt));
+    }
+    if (m->tp_vocab_sharded) {
+        double t0 = now_sec();
+        tp_allreduce_argmax_n(c, vi, n);
+        if (ar_secs_out) *ar_secs_out += now_sec() - t0;
+        if (ar_calls_out) (*ar_calls_out)++;
+    }
+    for (int k = 0; k < n; k++)
+        memcpy(&tokens[k], &vi[2*k+1], sizeof(tokens[k]));
+}
+
 static void print_token(const bpe_vocab *vocab, int32_t nt) {
     const char *s = bpe_token_to_str(vocab, nt);
     if (!s) return;
@@ -1685,9 +1711,8 @@ int main(int argc, char **argv) {
             if (!batch_ok || !batch_hidden) die("Qwen MTP batched verify", -1);
 
             double argmax_ar = 0.0; long argmax_calls = 0;
-            for (int j = 0; j < spec_k; j++)
-                target[j] = sample_argmax(m, all_logits + (size_t)j * vlogits,
-                                          &c, &argmax_ar, &argmax_calls);
+            sample_argmax_n(m, all_logits, vlogits, spec_k, target, &c,
+                            &argmax_ar, &argmax_calls);
             int accepted = 0;
             while (accepted < verify_drafts && mtp_pending[accepted] == target[accepted])
                 accepted++;
