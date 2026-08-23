@@ -829,14 +829,14 @@ static float tf_sum_squares(const float *v, int n) {
 static int tf_g_f64_accum = 0;
 
 static void tf_rmsnorm(float *dst, const float *x, const qtensor *w, int n, float eps, float *w_buf) {
-    /* Dequant weight */
-    tf_dequant_row(w, 0, w_buf);
+    const float *wv = w->type == GGML_TYPE_F32 ? (const float *)w->data : w_buf;
+    if (wv == w_buf) tf_dequant_row(w, 0, w_buf);
 
     if (tf_g_f64_accum) {
         double ss = 0.0;
         for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
         float inv = (float)(1.0 / sqrt(ss / n + (double)eps));
-        for (int i = 0; i < n; i++) dst[i] = x[i] * inv * w_buf[i];
+        for (int i = 0; i < n; i++) dst[i] = x[i] * inv * wv[i];
         return;
     }
 
@@ -862,10 +862,10 @@ static void tf_rmsnorm(float *dst, const float *x, const qtensor *w, int n, floa
     i = 0;
     for (; i + 7 < n; i += 8) {
         __m256 vx = _mm256_loadu_ps(x + i);
-        __m256 vw = _mm256_loadu_ps(w_buf + i);
+        __m256 vw = _mm256_loadu_ps(wv + i);
         _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_mul_ps(vx, vscale), vw));
     }
-    for (; i < n; i++) dst[i] = x[i] * ss * w_buf[i];
+    for (; i < n; i++) dst[i] = x[i] * ss * wv[i];
 #elif defined(__ARM_FEATURE_SVE)
     svbool_t pt = svptrue_b32(); int vl = (int)svcntw();
     svfloat32_t vss = svdup_f32(0);
@@ -874,12 +874,12 @@ static void tf_rmsnorm(float *dst, const float *x, const qtensor *w, int n, floa
     float ss = 1.0f / sqrtf(svaddv(pt, vss) / n + eps);
     svfloat32_t vsc = svdup_f32(ss);
     for (int i = 0; i < n; i += vl) { svbool_t pg = svwhilelt_b32(i, n);
-        svst1(pg, dst + i, svmul_x(pg, svmul_x(pg, svld1(pg, x + i), vsc), svld1(pg, w_buf + i))); }
+        svst1(pg, dst + i, svmul_x(pg, svmul_x(pg, svld1(pg, x + i), vsc), svld1(pg, wv + i))); }
 #else
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
     ss = 1.0f / sqrtf(ss / n + eps);
-    for (int i = 0; i < n; i++) dst[i] = x[i] * ss * w_buf[i];
+    for (int i = 0; i < n; i++) dst[i] = x[i] * ss * wv[i];
 #endif
 }
 
@@ -11112,7 +11112,8 @@ static void tf_rope_mrope_batch(float *bq, float *bk, int N, int n_heads, int n_
 /* Batched RMSNorm: apply to N tokens. bx[i] = rmsnorm(bx_in[i], w) */
 static void tf_rmsnorm_batch(float *dst, const float *src, const qtensor *w,
                               int n_embd, int N, float eps, float *w_buf) {
-    tf_dequant_row(w, 0, w_buf);
+    const float *wv = w->type == GGML_TYPE_F32 ? (const float *)w->data : w_buf;
+    if (wv == w_buf) tf_dequant_row(w, 0, w_buf);
     /* per-token independent (w_buf shared read-only) -> parallelize over tokens */
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static) if(N >= 8)
@@ -11139,8 +11140,8 @@ static void tf_rmsnorm_batch(float *dst, const float *src, const qtensor *w,
         i = 0;
         for (; i + 7 < n_embd; i += 8)
             _mm256_storeu_ps(yi + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xi + i), vscale),
-                                                     _mm256_loadu_ps(w_buf + i)));
-        for (; i < n_embd; i++) yi[i] = xi[i] * ss * w_buf[i];
+                                                     _mm256_loadu_ps(wv + i)));
+        for (; i < n_embd; i++) yi[i] = xi[i] * ss * wv[i];
 #elif defined(__ARM_FEATURE_SVE)
         svbool_t pt = svptrue_b32(); int vl = (int)svcntw();
         svfloat32_t vss = svdup_f32(0);
@@ -11149,12 +11150,12 @@ static void tf_rmsnorm_batch(float *dst, const float *src, const qtensor *w,
         float ss = 1.0f / sqrtf(svaddv(pt, vss) / n_embd + eps);
         svfloat32_t vsc = svdup_f32(ss);
         for (int i = 0; i < n_embd; i += vl) { svbool_t pg = svwhilelt_b32(i, n_embd);
-            svst1(pg, yi + i, svmul_x(pg, svmul_x(pg, svld1(pg, xi + i), vsc), svld1(pg, w_buf + i))); }
+            svst1(pg, yi + i, svmul_x(pg, svmul_x(pg, svld1(pg, xi + i), vsc), svld1(pg, wv + i))); }
 #else
         float ss = 0.0f;
         for (int i = 0; i < n_embd; i++) ss += xi[i] * xi[i];
         ss = 1.0f / sqrtf(ss / n_embd + eps);
-        for (int i = 0; i < n_embd; i++) yi[i] = xi[i] * ss * w_buf[i];
+        for (int i = 0; i < n_embd; i++) yi[i] = xi[i] * ss * wv[i];
 #endif
     }
 }
