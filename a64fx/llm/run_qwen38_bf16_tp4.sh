@@ -25,6 +25,7 @@ export NUMA_CMG_BUDGET_GB=${NUMA_CMG_BUDGET_GB:-7} NUMA_ALIGNMENT=${NUMA_ALIGNME
 unset GGUF_LAZY_MMAP TF_FORCE_MMAP
 export TF_LOAD_KEEPCACHE=0
 export TF_HIER_BARRIER=${TF_HIER_BARRIER:-0} TF_BF16PV_PREFETCH=${TF_BF16PV_PREFETCH:-8}
+export TF_BF16PV_PREFETCH_MTP2=${TF_BF16PV_PREFETCH_MTP2:-12}
 # The pair-interleaved layout uses the same low/high accumulation order as the
 # row-major kernel and now passes the long greedy-token gate.  Set PV=0 for the
 # original source-equivalent layout.

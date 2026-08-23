@@ -2061,6 +2061,56 @@ static inline void matvec_bf16_8row_pv_acc(float *acc,
     acc[6] += svaddv(pg, a6); acc[7] += svaddv(pg, a7);
 }
 
+/* Register-blocked 8-row x 2-token PV kernel.  K=2 is the useful exact-MTP
+ * operating point for Qwen3.8: loading each BF16 weight vector once here avoids
+ * replaying the full resident matrix for the second verifier token. */
+static inline void matvec_bf16_8x2_pv(float *dst0, float *dst1,
+                                      const uint16_t *pAB, const uint16_t *pCD,
+                                      const uint16_t *pEF, const uint16_t *pGH,
+                                      const float *x0, const float *x1, int n) {
+    svbool_t pg = svptrue_b32();
+    svbool_t p_all_h = svptrue_b16();
+    svuint16_t idx_h = svindex_u16(0, 1);
+    svbool_t p_odd = svcmpne_n_u16(p_all_h,
+                                    svand_n_u16_x(p_all_h, idx_h, 1), 0);
+    int vl = (int)svcntw();
+    svfloat32_t a00=svdup_f32(0),a10=svdup_f32(0),a20=svdup_f32(0),a30=svdup_f32(0);
+    svfloat32_t a40=svdup_f32(0),a50=svdup_f32(0),a60=svdup_f32(0),a70=svdup_f32(0);
+    svfloat32_t a01=svdup_f32(0),a11=svdup_f32(0),a21=svdup_f32(0),a31=svdup_f32(0);
+    svfloat32_t a41=svdup_f32(0),a51=svdup_f32(0),a61=svdup_f32(0),a71=svdup_f32(0);
+    static _Thread_local int pf_env_done = 0, pf_dist = 0;
+    if (__builtin_expect(!pf_env_done, 0)) {
+        const char *e = getenv("TF_BF16PV_PREFETCH_MTP2");
+        if (!e || !*e) e = getenv("TF_BF16PV_PREFETCH");
+        if (e && *e && *e != '0') pf_dist = atoi(e);
+        if (pf_dist == 1) pf_dist = 8;
+        pf_env_done = 1;
+    }
+    const int pfd_hw = pf_dist * 2 * vl;
+    for (int i = 0; i + vl - 1 < n; i += vl) {
+        const uint16_t *ab=pAB+2*i,*cd=pCD+2*i,*ef=pEF+2*i,*gh=pGH+2*i;
+        if (pf_dist) {
+            __builtin_prefetch(ab + pfd_hw, 0, 2);
+            __builtin_prefetch(cd + pfd_hw, 0, 2);
+            __builtin_prefetch(ef + pfd_hw, 0, 2);
+            __builtin_prefetch(gh + pfd_hw, 0, 2);
+        }
+        svfloat32_t vx0=svld1(pg,x0+i),vx1=svld1(pg,x1+i),w;
+        w=svreinterpret_f32(svld1_u16(p_odd,ab-1));a00=svmla_x(pg,a00,w,vx0);a01=svmla_x(pg,a01,w,vx1);
+        w=svreinterpret_f32(svld1_u16(p_odd,ab  ));a10=svmla_x(pg,a10,w,vx0);a11=svmla_x(pg,a11,w,vx1);
+        w=svreinterpret_f32(svld1_u16(p_odd,cd-1));a20=svmla_x(pg,a20,w,vx0);a21=svmla_x(pg,a21,w,vx1);
+        w=svreinterpret_f32(svld1_u16(p_odd,cd  ));a30=svmla_x(pg,a30,w,vx0);a31=svmla_x(pg,a31,w,vx1);
+        w=svreinterpret_f32(svld1_u16(p_odd,ef-1));a40=svmla_x(pg,a40,w,vx0);a41=svmla_x(pg,a41,w,vx1);
+        w=svreinterpret_f32(svld1_u16(p_odd,ef  ));a50=svmla_x(pg,a50,w,vx0);a51=svmla_x(pg,a51,w,vx1);
+        w=svreinterpret_f32(svld1_u16(p_odd,gh-1));a60=svmla_x(pg,a60,w,vx0);a61=svmla_x(pg,a61,w,vx1);
+        w=svreinterpret_f32(svld1_u16(p_odd,gh  ));a70=svmla_x(pg,a70,w,vx0);a71=svmla_x(pg,a71,w,vx1);
+    }
+    dst0[0]=svaddv(pg,a00);dst0[1]=svaddv(pg,a10);dst0[2]=svaddv(pg,a20);dst0[3]=svaddv(pg,a30);
+    dst0[4]=svaddv(pg,a40);dst0[5]=svaddv(pg,a50);dst0[6]=svaddv(pg,a60);dst0[7]=svaddv(pg,a70);
+    dst1[0]=svaddv(pg,a01);dst1[1]=svaddv(pg,a11);dst1[2]=svaddv(pg,a21);dst1[3]=svaddv(pg,a31);
+    dst1[4]=svaddv(pg,a41);dst1[5]=svaddv(pg,a51);dst1[6]=svaddv(pg,a61);dst1[7]=svaddv(pg,a71);
+}
+
 /* Register-blocked 8-row x 3-token accumulating pv GEMM microkernel.
  *
  * matvec_bf16_8row_pv_acc replayed per token loads the 8 weight-row vectors from

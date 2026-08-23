@@ -10576,6 +10576,12 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
         for (int g = 0; g < groups; g++) {
             const uint16_t *p = base + (size_t)g * 8 * K;
             int t = 0;
+            if (N == 2) {
+                matvec_bf16_8x2_pv(Y_out + g*8, Y_out + out_stride + g*8,
+                                    p, p + 2*K, p + 4*K, p + 6*K,
+                                    X, X + X_stride, K);
+                continue;
+            }
             for (; t + 2 < N; t += 3) {
                 float a0[8] = {0}, a1[8] = {0}, a2[8] = {0};
                 matvec_bf16_8x3_pv_acc(a0, a1, a2, p, p + 2*K,
