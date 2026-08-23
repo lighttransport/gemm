@@ -63,7 +63,7 @@ this part** — reuse the 8×48 kernel (24 accumulators, 4 `ld1rw` × 3
 | **ffn_down** (`BT_d`) | ~0.5 s | 96×4096 → 96×1024, ×24 blocks — GEMM, dominant |
 | **ffn_up** (`BT_u`) | ~0.45 s | 96×1024 → 96×4096, ×24 blocks — GEMM |
 | **qkv** (`BT_qkv`) | ~0.35 s | 96×1024 → 96×3072, ×24 blocks — GEMM |
-| **attn** | 0.83 s CPU / **~7% wall** | QK^T + AV, fp32, well-parallelized (see §3.2) |
+| **attn** | 0.83 s CPU / **~7% wall** | QK^T + AV, fp32. ⚠️ **only** parallel with the **OpenMP** backend — the C11-thrd default serializes it (~65% wall). See the build gotcha in §3.3. |
 | **deepstack** (fc1/fc2) | ~0.15 s | 3 layers, 96×2048 GEMMs |
 | attn_out (`BT_o`) | ~0.10 s | 96×1024 → 96×1024, ×24 — GEMM |
 | **patch_embed** (fused) | ~1 ms wall | **not a bottleneck** |
@@ -80,8 +80,10 @@ this part** — reuse the 8×48 kernel (24 accumulators, 4 `ld1rw` × 3
 
 Headline: **the transformer GEMMs (ffn_down/up, qkv, attn_out, deepstack)
 are the dominant cost** and are already at their W-HBM-bound limit after the
-nb-outer schedule (§3.1). Attention is a distant ~7% and fp32-FMA-bound
-(§3.2). patch_embed (the fused-conv2d target) is 0.5% and was never the
+nb-outer schedule (§3.1). Attention is fp32-FMA-bound (§3.2) and ~7% *only
+with the OpenMP build* (the C11-thrd default serializes it to ~65% wall —
+see the build gotcha in §3.3, now fixed by defaulting `make CC=fcc` to
+OpenMP). patch_embed (the fused-conv2d target) is 0.5% and was never the
 bottleneck.
 
 ### The GEMM is W-traffic bound, and that is now fixed (mostly)
@@ -185,21 +187,35 @@ channel** (per-n) + pre-packed at cache build; activations are quantized
 **per row** (per-m, no global-max barrier) per GEMM. Dequant: `C[m][n] =
 C_i32[m][n] · a_scale[m] · w_scale[n]`.
 
-Result on this node (384×256, 96 tokens, `--bench 3–4` median; node speed
+Result on this node (384×256, 96 tokens, `--bench 16` median; node speed
 varies session-to-session, so the *relative* columns are what matter):
 
-| dtype    | output norm | Δ vs fp16 | vs fp16 (12T / 24T / 48T)      |
-|----------|-------------|-----------|--------------------------------|
-| fp16     | 455.6237    | ref       | 1.00×                          |
-| **int8** | 452.0263    | **0.79%** | **~3.3× / 3.3× / 2.9×** faster |
-| int16    | 458.2751    | 0.58%     | ~0.7× (43% slower)             |
+| dtype    | output norm | Δ vs fp16 | vs fp16 (12T / 24T / 48T) | tok/s int8 (12T/24T/48T) |
+|----------|-------------|-----------|---------------------------|--------------------------|
+| fp16     | 455.6237    | ref       | 1.00×                     | 187 / 340 / 474          |
+| **int8** | 452.0263    | **0.79%** | **3.0× / 3.1× / 2.7×**    | **567 / 1050 / 1274**    |
+| int16    | 458.2751    | 0.58%     | ~0.7× (43% slower)        | —                        |
+
+> **⚠️ Build gotcha (fixed this session, big win):** the encode is
+> **dominated by attention (~27–65% of the wall)**, and attention runs on
+> `vlm_parallel_for`. The Makefile historically defaulted to the **C11-thrd
+> backend** (`OPENMP ?=` empty), whose worker threads **cluster on a few cores
+> on A64FX and scale only ~1.4× over 48 cores** (vs ~25× for OpenMP) — so the
+> attention was effectively **serial**, capping the whole encode at ~72 tok/s
+> (48T) no matter how fast the GEMMs were. `make CC=fcc` now **defaults
+> `OPENMP=1`** (fcc supports `-fopenmp`, and the OpenMP backend spreads the
+> threads): the encode scales 52 → **1274 tok/s** (1T → 48T) and int8/fp16 is
+> **3.0× / 3.1× / 2.7×**. `OPENMP=0` forces the old C11 path. **Always build
+> with OpenMP** (`make CC=fcc`, now the default) or the attention silently
+> serializes.
 
 **This session took int8 from 1.53× (pre-session, scalar quant + separate
-dequant) to ~2.9–3.3× faster than fp16** — via the fused GEMM+dequant kernel
-(§3.3b) and the SVE activation quantize (§3.3c). The ratio is *higher* at
-fewer threads (less HBM contention → the HBM-efficient int8 W wins more).
-The norm is unchanged throughout (bit-identical int8 path: 452.0263 at every
-thread count).
+dequant) to ~2.7–3.1× faster than fp16** — via the fused GEMM+dequant kernel
+(§3.3b), the SVE activation quantize (§3.3c), and fixing the serial attention
+build above. The ratio is *higher* at fewer threads (less HBM contention →
+the HBM-efficient int8 W wins more). The norm is unchanged throughout
+(bit-identical int8 path: 452.0263 at every thread count; verified bit-
+identical across 1T/48T via `--dump` + md5 of all 255 tensors).
 
 **int8 is the production win** (1.53× faster, small 0.79% norm delta). The
 whole-VLM win is well below the 3–5× standalone-GEMM win. `INT8_STEP_PROF=1`
@@ -406,7 +422,9 @@ touching if 3.1–3.3 are exhausted. The layernorm SVE kernel already exists
 
 ```sh
 cd a64fx/vlm
-make CC=fcc OPENMP=1            # -> build/vlm_runner, build/tensor_diff
+make CC=fcc                     # OpenMP is the default for fcc (required — the
+                                 # C11-thrd path serializes attention; OPENMP=0
+                                 # forces it). -> build/vlm_runner, build/tensor_diff
 
 M=~/models/Qwen3VL-2B-Instruct-F16.gguf
 MM=~/models/mmproj-Qwen3VL-2B-Instruct-F16.gguf

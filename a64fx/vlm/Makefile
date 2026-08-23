@@ -55,6 +55,19 @@ endif
 CFLAGS  := $(BASE_CFLAGS) -std=c11 -D_GNU_SOURCE -I$(INC) -I$(KERNELS) -I$(COMMON)
 LDFLAGS := -lm -lpthread
 
+# fcc/fccpx support OpenMP, and the OpenMP backend of vlm_parallel scales far
+# better than the C11-thrd fallback (which clusters its worker threads on a few
+# cores on A64FX: ~1.4x over 48 cores vs ~25x for OpenMP, and the attention is
+# the dominant stage). Default to OpenMP for the Fujitsu compilers; pass
+# OPENMP=0 to force the C11-thrd backend.
+ifeq ($(OPENMP),)
+  ifeq ($(CC),fcc)
+    OPENMP := 1
+  else ifeq ($(CC),fccpx)
+    OPENMP := 1
+  endif
+endif
+
 ifdef OPENMP
     CFLAGS  += $(OMP_FLAG) -DUSE_OPENMP=1
     LDFLAGS += $(OMP_FLAG)
