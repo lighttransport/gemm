@@ -1744,6 +1744,46 @@ second 17.7 GB weight arena.
    batch or piggyback the tiny draft-token messages; and test a hand-scheduled
    exact 4x5 assembly kernel using build scratch under `/local`, never `/tmp`.
 
+### BF16 256-token revalidation and MTP opportunity probes (2026-08-24)
+
+The sustained gate was rerun after the Q8 cleanup using the anonymous BF16 TP4
+stage (`17.724 GB/rank`) and a fresh K=0 oracle.  The shared runner's
+`TP_PROMPT_REPEAT` option was restored because the BF16 long-context gate uses
+it; removing it as part of a Q8-only cleanup had been a regression.  The
+current untracked prompt is not the historical 359-token input: duplicated, it
+tokenizes to 367 tokens and has substantially lower draft agreement.  These
+results therefore validate the current input but do not supersede the accepted
+53.43 tok/s historical result.
+
+The new K=0 oracle and all three deterministic K=5 runs have SHA256
+`ddc0237f13a7d712e523ac97ef67ffe76564f5a31a1098f07dff0d3e6e94df6d`.
+The MTP runs reached 37.42, 38.19, and 37.09 tok/s, using 72 rounds with alpha
+0.715--0.719.  The plain K=0 run was 29.06 tok/s.  All ranks loaded the complete
+stage into anonymous HBM; worst reported post-load `MemAvailable` was 11.41 GB.
+The draft token reductions themselves are global, so every rank consumes the
+same pending queue.  Logs and token files are retained under
+`/local/u14346/q38-bf16-mtp-gate`.
+
+Two item-8 candidates were measured and rejected:
+
+- A BF16 NextN head-projection/greedy-max fusion avoided writing and rescanning
+  62,080 local logits, but disturbed the initial draft/verifier handoff.  It
+  inserted a wrong first token, reduced alpha to 0.695, and slowed to 36.55
+  tok/s.  The code was fully reverted.
+- The robust non-deterministic reduction topology reduced accumulated
+  collective time from about 1.11 s to 0.74 s and reached 39.17/38.99/39.16
+  tok/s.  Only the first run matched the oracle; the next two agreed with each
+  other but diverged later in the verified stream.  Deterministic reduction
+  remains mandatory for the BF16 exact path.
+
+The 4x5 BF16-PV kernel was also compiled to assembly under `/local`.  It has a
+144-byte scalar/callee-save frame but no SVE accumulator spills: all twenty
+accumulators remain in registers.  A hand assembly rewrite therefore has no
+obvious spill-removal win; its remaining opportunity is instruction scheduling
+and prefetch, with the existing exact distance 16 as the baseline.  The next
+meaningful scheduler attack must preserve deterministic reduction ordering and
+fix the draft/verifier queue boundary before attempting fused local argmax.
+
 ### Q8 TP2--TP4 decode and MTP attack (2026-08-24)
 
 Qwen3.8 Q8_0 now has complete anonymous-HBM rank stages for TP2, TP3, and TP4.
