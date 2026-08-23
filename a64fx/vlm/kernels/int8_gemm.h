@@ -8,6 +8,11 @@ int8_t *take_int8_packed(float **pbt, int K, int N, float **scale_out);
 void gemm_int8_BTP(int M, int K, int N, const float *X, int lda,
                    const int8_t *Bpack, const float *w_scale,
                    float *Y, int ldc);
+// Fused variant (GEMM + dequant in one kernel, no int32 C buffer). Same result
+// as gemm_int8_BTP; use when the separate dequant pass / C traffic matters.
+void gemm_int8_BTP_fused(int M, int K, int N, const float *X, int lda,
+                         const int8_t *Bpack, const float *w_scale,
+                         float *Y, int ldc);
 
 // ── int16 (hi/lo int8 split; A64FX has no 16-bit dot product / int16 FMA) ─
 size_t packed_int16_B_size(int K, int N);

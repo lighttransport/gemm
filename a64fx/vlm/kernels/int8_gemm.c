@@ -23,6 +23,17 @@
 
 extern void kernel_int8_6x4_256(const int8_t *Apack, const int8_t *Bpack,
                                 int32_t *C, int ldc);
+// Fused variant: register accumulation over all K/256 chunks + dequant to float Y
+// in-kernel (no int32 C buffer, no separate dequant pass).
+//   A_base = Apack + mb*KC*(6*256), B_base = Bpack + nb*KC*(64*256),
+//   Y_tile = Y + (mb*6)*ldc + nb*64, a_scale_ptr = a_scale + mb*6, w_scale_ptr = w_scale + nb*64.
+//   mr = number of valid rows in this tile (1..6); tail rows are computed but
+//   NOT stored (Y is M rows, not MB*6). N must be a multiple of 64 (tiles are
+//   stored as full 64-col vectors) and a_scale must be padded to MB*6 floats.
+extern void kernel_int8_6x4_fused(const int8_t *A_base, const int8_t *B_base, int KC,
+                                  float *Y_tile, int ldc_bytes,
+                                  const float *a_scale_ptr, const float *w_scale_ptr,
+                                  int mr);
 
 static void *xal(size_t n) {
     void *p = aligned_alloc(64, (n + 63) & ~(size_t)63);
@@ -202,6 +213,67 @@ void gemm_int8_BTP(int M, int K, int N, const float *X, int lda,
         i8prof.gemm   += pt3 - pt2;
         i8prof.dequant+= pt4 - pt3;
     }
+}
+
+/* FUSED driver: same as gemm_int8_BTP but the GEMM kernel accumulates in
+ * registers over all K/256 chunks and dequantizes to float Y in-kernel, so
+ * there is NO int32 C buffer (no alloc/memset/write/read) and NO separate
+ * dequant pass. Same quantize + pack as the non-fused path. */
+void gemm_int8_BTP_fused(int M, int K, int N, const float *X, int lda,
+                         const int8_t *Bpack, const float *w_scale,
+                         float *Y, int ldc) {
+    if (K % I8_KC) { fprintf(stderr, "gemm_int8_BTP_fused: K=%d not multiple of %d\n", K, I8_KC); return; }
+    // The fused kernel stores full 64-col tiles (and 6-row tiles, guarded by
+    // mr); Y must therefore be at least [M][N_pad64]. Fall back to the
+    // non-fused path for odd N.
+    if (N % I8_NR) { gemm_int8_BTP(M, K, N, X, lda, Bpack, w_scale, Y, ldc); return; }
+    int MB = (M + I8_MR - 1) / I8_MR;
+    int NB = N / I8_NR;
+    int KC = K / I8_KC;
+
+    // 1+2) per-ROW activation quantize (identical to gemm_int8_BTP)
+    // a_scale padded to MB*6: the fused kernel reads 6 scales per tile.
+    float *a_scale = (float *)xal((size_t)(MB * I8_MR) * 4);
+    memset(a_scale, 0, (size_t)(MB * I8_MR) * 4);
+    int8_t *X8 = (int8_t *)xal((size_t)M * K);
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const float *xr = X + (size_t)m * lda;
+        float mx = 0;
+        for (int k = 0; k < K; k++) { float v = fabsf(xr[k]); if (v > mx) mx = v; }
+        float inv = (mx > 1e-9f) ? (127.0f / mx) : 1.0f;
+        a_scale[m] = (mx > 1e-9f) ? (mx / 127.0f) : 1.0f;
+        for (int k = 0; k < K; k++) {
+            int v = (int)lroundf(xr[k] * inv);
+            if (v > 127) v = 127; if (v < -127) v = -127;
+            X8[(size_t)m * K + k] = (int8_t)v;
+        }
+    }
+
+    // 3) pack A per (mb, kc)
+    int8_t *Apack = (int8_t *)xal((size_t)MB * KC * I8_MR * I8_KC);
+    #pragma omp parallel for schedule(static)
+    for (int mb = 0; mb < MB; mb++)
+        for (int kc = 0; kc < KC; kc++) {
+            int mr = (M - mb * I8_MR < I8_MR) ? (M - mb * I8_MR) : I8_MR;
+            pack_A_6x256(X8 + (size_t)(mb * I8_MR) * K + kc * I8_KC, K,
+                         Apack + (size_t)(mb * KC + kc) * I8_MR * I8_KC, mr);
+        }
+
+    // 4) FUSED GEMM + dequant (nb-outer). No C buffer, no separate dequant.
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int nb = 0; nb < NB; nb++)
+        for (int mb = 0; mb < MB; mb++) {
+            int mr = M - mb * I8_MR;
+            if (mr > I8_MR) mr = I8_MR;
+            const int8_t *A_base = Apack + (size_t)(mb * KC) * (I8_MR * I8_KC);
+            const int8_t *B_base = Bpack + (size_t)(nb * KC) * (I8_NR * I8_KC);
+            float *Y_tile = Y + (size_t)(mb * I8_MR) * ldc + (nb * I8_NR);
+            kernel_int8_6x4_fused(A_base, B_base, KC, Y_tile, ldc * 4,
+                                  a_scale + mb * I8_MR, w_scale + nb * I8_NR, mr);
+        }
+
+    free(X8); free(Apack); free(a_scale);
 }
 
 

@@ -185,14 +185,17 @@ channel** (per-n) + pre-packed at cache build; activations are quantized
 **per row** (per-m, no global-max barrier) per GEMM. Dequant: `C[m][n] =
 C_i32[m][n] · a_scale[m] · w_scale[n]`.
 
-Result on this node (384×256, 96 tokens, 48T, `--bench 8` median; node speed
+Result on this node (384×256, 96 tokens, 48T, `--bench 4–5` median; node speed
 varies session-to-session, so the *relative* columns are what matter):
 
-| dtype | output norm | Δ vs fp16 | tok/s | vs fp16 |
-|-------|-------------|-----------|-------|---------|
-| fp16  | 455.6237    | ref       | 356.6 | 1.00×   |
-| **int8**  | 452.0263 | **0.79%** | 546.5 | **1.53× faster** |
-| int16 | 458.2751    | 0.58%     | 248.8 | **0.70× (43% slower)** |
+| dtype    | output norm | Δ vs fp16 | tok/s      | vs fp16            |
+|----------|-------------|-----------|------------|--------------------|
+| fp16     | 455.6237    | ref       | ~330–372   | 1.00×              |
+| **int8** | 452.0263    | **0.79%** | **~660–810** | **1.8–2.3× faster** |
+| int16    | 458.2751    | 0.58%     | 248.8      | **0.70× (43% slower)** |
+
+(int8 was 546.5 tok/s / 1.53× before the fused dequant kernel, §3.3b; the norm
+is unchanged by the fusion — bit-identical path.)
 
 **int8 is the production win** (1.53× faster, small 0.79% norm delta). The
 whole-VLM win is well below the 3–5× standalone-GEMM win. `INT8_STEP_PROF=1`
@@ -206,7 +209,7 @@ buffer page faults ≈0.1 µs — both negligible; the per-step in-situ numbers 
 HBM-contended and node-variance-noisy, so read the split, not the absolute ms.
 Further whole-VLM gains need the SDOT GEMM closer to HBM-roofline (it is already
 memory-bound on W) — fusing the dequant into the kernel (drop the int32 C
-buffer, ~3%) is the only clear small win; bigger wins are int8 on the LLM side.
+buffer) is **done** (§3.3b); bigger wins are int8 on the LLM side.
 
 **Per-stage validation** (`--dump` + `tensor_diff`, enabled by the §Known-
 issues build fixes — the fp16 A64FX output is the reference proxy). Confirms
@@ -258,6 +261,58 @@ Two bugs found while integrating (both fixed):
 - The 6×4 kernel **clobbers z8–z31**; `int8_gemm.c`'s SVE dequant keeps values
   live across the call, so the kernel now saves/restores the callee-saved SVE
   vectors (z8–z15, z28–z31).
+
+### 3.3b Fused int8 GEMM + dequant (`kernel_int8_6x4_fused`) — DONE, ~2.5× on the GEMM
+
+The last in-situ int8 cost was the non-fused pipeline's int32 **C buffer**
+(alloc + memset + per-kc-chunk write + read) and the separate SVE **dequant
+pass** (~6% of the GEMM-BTP per `INT8_STEP_PROF`). `kernel_int8_6x4_fused`
+(`kernels/kernel_6x4_int8.S`) removes both: the kernel zeroes 24
+accumulators, loops over **all** K/256 chunks in registers, then dequantizes
+`Y = C·(a_scale[m]·w_scale[n])` and stores the 6×64 float tile in-kernel.
+`gemm_int8_BTP_fused` (`kernels/int8_gemm.c`) is the driver (same quantize +
+pack; falls back to `gemm_int8_BTP` when N%64≠0 or K%256≠0); the int8 VLM
+path (`vit_gemm_bias_BT_int8_mt`) now calls it.
+
+**Bit-identical** to the non-fused path: the unit test
+(`tools/test_int8_gemm.c fused`) compares `gemm_int8_BTP_fused` vs
+`gemm_int8_BTP` element-exactly (1T and 48T, incl. odd M=49), and the VLM
+end-to-end norm is unchanged: **452.0263** (int8) / 455.6237 (fp16). The
+epilogue reproduces the dequant's exact FP order (`t = a_scale*w_scale` per
+column, then `C*t`) — a different order is only ULP-correct, not bit-exact.
+
+Standalone GEMM (96×1024×4096, 48T; bit-identical to non-fused):
+
+| threads | non-fused | fused    | speedup |
+|---------|-----------|----------|---------|
+| 48      | 0.325 ms  | 0.127 ms | **2.6×** |
+| 12      | 0.640 ms  | 0.359 ms | **1.8×** |
+
+End-to-end (384×256, 96 tokens, 48T): int8 546 → **660–810 tok/s**, i.e. the
+int8/fp16 ratio rises **1.53× → 1.8–2.3×** (back-to-back A/B; the spread is
+session/node variance). 12T: ~429 tok/s.
+
+Bugs found while integrating (all fixed — each one masked at 1 call / 1 tile):
+- **Truncated K loop** — the first draft copied only 2 of the original body's
+  8 unrolled SDOT groups, so the fused kernel computed 1/4 of K — and ran ~4×
+  *faster*. A speedup that is too good is a bug; diff the unroll count.
+- **`x30` (link register) clobbered** — the epilogue used `w30` as the
+  valid-row counter; `ret` then jumped to the row count. Epilogue scratch
+  must be caller-saved (`x9`).
+- **`x25` clobbered without save** — a callee-saved reg used for `mr` while
+  the prologue only saves `x19–x24`; the *first* kernel call worked, later
+  calls corrupted the caller's loop vars → wrong/garbage tiles ("only tile
+  (0,0) correct") and an ASan heap-buffer-overflow in the test. This is why
+  SVE kernel bugs can look shape-dependent (they depend on which register the
+  compiler parked the caller's state in).
+- **Tail-row store** — the epilogue must store only `mr` valid rows (Y is M
+  rows, not MB×6); the kernel takes `mr` as an arg and guards each row's
+  stores. The non-fused path hides this by padding C to MB×6.
+- **Y alignment** — the in-kernel `st1w … [x, #i, mul vl]` stores need
+  64-byte-aligned Y; the VLM's `xcalloc_f`/`xmalloc_f` now return
+  `aligned_alloc(64, …)` (SVE-friendly for all paths).
+- **a_scale tail** — the epilogue reads 6 a_scales per tile, so the driver
+  pads `a_scale` to MB×6 floats.
 
 ### 3.4 Store the activations in fp16 (A is currently fp32) — likely small
 
@@ -320,6 +375,10 @@ make CC=fcc OPENMP=1
 fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -std=c11 -fopenmp -Ikernels -I. \
     -o /tmp/ti tools/test_int8_gemm.c kernels/int8_gemm.c kernels/kernel_6x4_int8.S -lm
 OMP_NUM_THREADS=48 /tmp/ti
+
+# fused int8 GEMM unit test (expect BIT-IDENTICAL vs non-fused, 0 differ):
+OMP_NUM_THREADS=48 /tmp/ti fused           # 1T too: OMP_NUM_THREADS=1
+OMP_NUM_THREADS=48 /tmp/ti fused bench     # fused vs non-fused GEMM speed
 
 # stage breakdown:
 VLM_STAGE_TIMING=1 OMP_NUM_THREADS=48 ./build/vlm_runner $M $MM ~/fujisan.jpg \
