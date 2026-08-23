@@ -1,5 +1,11 @@
 # Repository Guidelines
 
+## For coding agent.
+
+don't use /tmp
+
+use /local if available. otherwise use tmp/ in the repo folder.
+
 ## Project Structure & Module Organization
 This repository is organized by hardware backend. Use top-level folders as module boundaries:
 - `a64fx/`: A64FX SVE kernels, microbenchmarks, and optimization notes.
