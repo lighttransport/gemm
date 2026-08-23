@@ -53,6 +53,9 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <utofu.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define GGUF_LOADER_IMPLEMENTATION
 #include "../../common/gguf_loader.h"
@@ -1655,6 +1658,13 @@ int main(int argc, char **argv) {
         int p = (int)decode_start;
         int measured = perf_warmup == 0;
         int mtp_detail = envb_opt("TP_MTP_PROFILE_DETAIL", 0);
+        int mtp_omp_park = envb_opt("TP_MTP_OMP_PARK", 0);
+#ifndef _OPENMP
+        mtp_omp_park = 0;
+#endif
+        pthread_mutex_t mtp_park_mu = PTHREAD_MUTEX_INITIALIZER;
+        pthread_cond_t mtp_park_cv = PTHREAD_COND_INITIALIZER;
+        int mtp_park_done = 0;
         double mtp_verify_sec = 0.0, mtp_restore_sec = 0.0, mtp_draft_sec = 0.0;
         long mtp_detail_rounds = 0;
         while (n_gen < max_gen + perf_warmup) {
@@ -1749,16 +1759,40 @@ int main(int argc, char **argv) {
              * committed input.  The auxiliary head is TP-sharded and its
              * argmax reduction is included in the communication ledger. */
             int prev = in_tok;
-            if (envb_opt("TP_MTP_SKIP_DRAFT", 0)) {
-                for (int k = 0; k < verify_drafts; k++) mtp_pending[k] = prev;
-            } else {
-                for (int k = 0; k < verify_drafts; k++) {
-                    float *dlg = transformer_nextn_logits(m, prev, draft_h, p - 1 + k);
-                    double da = 0.0; long dc = 0;
-                    mtp_pending[k] = sample_argmax(m, dlg, &c, &da, &dc);
-                    argmax_ar += da; argmax_calls += dc;
-                    prev = mtp_pending[k];
-                    draft_h = transformer_nextn_hidden(m);
+            mtp_park_done = 0;
+            #ifdef _OPENMP
+            #pragma omp parallel num_threads(48) if(mtp_omp_park) \
+                shared(mtp_park_done, prev, draft_h, argmax_ar, argmax_calls)
+            #endif
+            {
+                int park_tid = 0;
+                #ifdef _OPENMP
+                park_tid = omp_get_thread_num();
+                #endif
+                if (park_tid == 0) {
+                    if (envb_opt("TP_MTP_SKIP_DRAFT", 0)) {
+                        for (int k = 0; k < verify_drafts; k++) mtp_pending[k] = prev;
+                    } else {
+                        for (int k = 0; k < verify_drafts; k++) {
+                            float *dlg = transformer_nextn_logits(m, prev, draft_h, p - 1 + k);
+                            double da = 0.0; long dc = 0;
+                            mtp_pending[k] = sample_argmax(m, dlg, &c, &da, &dc);
+                            argmax_ar += da; argmax_calls += dc;
+                            prev = mtp_pending[k];
+                            draft_h = transformer_nextn_hidden(m);
+                        }
+                    }
+                    if (mtp_omp_park) {
+                        pthread_mutex_lock(&mtp_park_mu);
+                        mtp_park_done = 1;
+                        pthread_cond_broadcast(&mtp_park_cv);
+                        pthread_mutex_unlock(&mtp_park_mu);
+                    }
+                } else {
+                    pthread_mutex_lock(&mtp_park_mu);
+                    while (!mtp_park_done)
+                        pthread_cond_wait(&mtp_park_cv, &mtp_park_mu);
+                    pthread_mutex_unlock(&mtp_park_mu);
                 }
             }
             mtp_pending_n = verify_drafts;
@@ -1810,6 +1844,8 @@ int main(int argc, char **argv) {
         tf_batch_ssm_snapshots = NULL;
         tf_batch_ssm_snapshot_slots = NULL;
         tf_batch_ssm_layer_stride = tf_batch_ssm_slot_stride = 0;
+        pthread_cond_destroy(&mtp_park_cv);
+        pthread_mutex_destroy(&mtp_park_mu);
         for (int l = 0; l < n_layers; l++) {
             if (!m->layers[l].is_ssm) continue;
             float *ls = batch_ssm_current + (size_t)l * snap_layer;
