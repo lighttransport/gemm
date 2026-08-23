@@ -6012,6 +6012,13 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     tf_ssm_deltanet_forward_parts(m, layer_idx, 1, 1, 0, 0, 0, 0);
 }
 
+/* Optional speculative-verify state capture. Layout is
+ * [token][layer][conv_state,recurrent_state], in floats.  The runner owns the
+ * anonymous buffer and publishes strides before a batched Qwen forward. */
+float *tf_batch_ssm_snapshots = NULL;
+size_t tf_batch_ssm_layer_stride = 0;
+size_t tf_batch_ssm_slot_stride = 0;
+
 /* Batched causal depthwise convolution for Qwen hybrid prefill.  Time remains
  * strictly ordered within each channel, while channels are independent and
  * distributed across cores. qkv_rows is overwritten with conv+SiLU output. */
@@ -6035,6 +6042,12 @@ static void tf_ssm_conv_batch(transformer_model *m,int layer_idx,float*qkv_rows,
             s+=w[(size_t)nh*qd+j]*x;
             for(int f=0;f+1<nh;f++)hist[f]=hist[f+1];hist[nh-1]=x;
             *xp=s;
+            if(tf_batch_ssm_snapshots){
+                int nwr=(wr+t+1)%nh;
+                float*sn=tf_batch_ssm_snapshots+(size_t)t*tf_batch_ssm_slot_stride+
+                    (size_t)layer_idx*tf_batch_ssm_layer_stride;
+                for(int f=0;f<nh;f++)sn[(size_t)((nwr+f)%nh)*qd+j]=hist[f];
+            }
         }
         int nwr=(wr+N)%nh;
         for(int f=0;f<nh;f++)st[((nwr+f)%nh)*(size_t)qd+j]=hist[f];
@@ -8575,23 +8588,33 @@ size_t transformer_tp_load_stage(transformer_model *m, const char *stage_dir,
             if (!L->is_ssm || !L->ssm_conv1d.data || m->conv_w_trans_layers[l]) continue;
             char conv_name[96];
             snprintf(conv_name, sizeof(conv_name), "blk.%d.ssm_conv1d.weight", l);
-            int conv_dim = m->ssm_qkv_dim;
+            int source_conv_dim = m->ssm_qkv_dim;
             for (uint32_t i = 0; i < h->n_entries; i++)
                 if (!strcmp(h->entries[i].name, conv_name)) {
-                    conv_dim = (int)h->entries[i].source_rows;
+                    source_conv_dim = (int)h->entries[i].source_rows;
                     break;
                 }
-            size_t conv_count = (size_t)m->ssm_conv_kernel * conv_dim;
+            int local_conv_dim = m->ssm_qkv_dim;
+            int qk_dim = 2 * m->ssm_n_group * m->ssm_d_state;
+            int v_source0 = qk_dim + m->ssm_head_offset * m->ssm_d_state;
+            if (source_conv_dim < qk_dim ||
+                v_source0 + local_conv_dim - qk_dim > source_conv_dim) {
+                fprintf(stderr, "tp_stage: invalid SSM conv slice layer=%d source=%d local=%d v0=%d\n",
+                        l, source_conv_dim, local_conv_dim, v_source0);
+                free(h); close(fd); return 0;
+            }
+            size_t conv_count = (size_t)m->ssm_conv_kernel * local_conv_dim;
             float *w = (float *)malloc(conv_count * sizeof(float));
             if (!w) { free(h); close(fd); return 0; }
             size_t crb = tf_row_bytes(L->ssm_conv1d.type, L->ssm_conv1d.n_cols);
             const uint8_t *base = (const uint8_t *)L->ssm_conv1d.data;
-            for (int j = 0; j < conv_dim; j++) {
+            for (int j = 0; j < local_conv_dim; j++) {
+                int source_j = j < qk_dim ? j : v_source0 + j - qk_dim;
                 float wb[8];
-                dequant_row(L->ssm_conv1d.type, base + (size_t)j * crb,
+                dequant_row(L->ssm_conv1d.type, base + (size_t)source_j * crb,
                             wb, m->ssm_conv_kernel);
                 for (int f = 0; f < m->ssm_conv_kernel; f++)
-                    w[(size_t)f * conv_dim + j] = wb[f];
+                    w[(size_t)f * local_conv_dim + j] = wb[f];
             }
             m->conv_w_trans_layers[l] = w;
         }
@@ -12330,6 +12353,16 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                         m->ssm_d_state, rec_scale
                     };
                     tf_ssm_recurrence_worker(&rt);
+                    if (tf_batch_ssm_snapshots) {
+                        size_t conv_count = (size_t)(m->ssm_conv_kernel - 1) * lq;
+                        size_t d2 = (size_t)m->ssm_d_state * m->ssm_d_state;
+                        float *sn = tf_batch_ssm_snapshots +
+                            (size_t)t * tf_batch_ssm_slot_stride +
+                            (size_t)l * tf_batch_ssm_layer_stride + conv_count +
+                            (size_t)h * d2;
+                        memcpy(sn, m->recurrent_state[l] + (size_t)h * d2,
+                               d2 * sizeof(float));
+                    }
                     float *o = inner + (size_t)t * ld + (size_t)h * m->ssm_d_state;
                     float *z = gate + (size_t)t * ld + (size_t)h * m->ssm_d_state;
                     float ss = 0.0f;

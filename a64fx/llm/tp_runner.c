@@ -1135,11 +1135,11 @@ int main(int argc, char **argv) {
     int ssm_shard = m->is_hybrid && !getenv("TP_NO_SSM_SHARD");
     if (transformer_tp_slice_weights(m, MyRank, N, ssm_shard) != 0)
         die("transformer_tp_slice_weights (check n_heads/n_kv/n_ff/ssm_dt % N)", -1);
+    const char *tp_stage_dir = envs_opt("TP_STAGE_DIR", "");
     if ((spec_k > 0 || envs_opt("TP_STAGE_DIR", "")[0]) && m->nextn.loaded &&
         transformer_tp_slice_nextn(m, MyRank, N) != 0)
         die("transformer_tp_slice_nextn", -1);
     size_t tp_stage_bytes = 0;
-    const char *tp_stage_dir = envs_opt("TP_STAGE_DIR", "");
     if (tp_stage_dir[0]) {
         tp_stage_bytes = transformer_tp_load_stage(m, tp_stage_dir, MyRank, N);
         if (!tp_stage_bytes) die("transformer_tp_load_stage", -1);
@@ -1457,13 +1457,42 @@ int main(int argc, char **argv) {
             in_tok = (P > 0) ? tp_next_token_synth(in_tok, 1, m->n_vocab) : in_tok;
         } else if (do_prefill_gemm) {
             double pf0 = now_sec();
+            float *pf_hidden = NULL;
+            if (spec_k && m->nextn.loaded) tf_batch_hidden_out = &pf_hidden;
             float *lg = transformer_prefill_gemm(m, ptoks + prefill_from, prefill_tokens, prefill_from);
+            tf_batch_hidden_out = NULL;
             if (lg) {
                 double ar_step = 0.0; long ar_calls_step = 0;
                 in_tok = sample_argmax(m, lg, &c, &ar_step, &ar_calls_step);
                 t_prefill = now_sec() - pf0;
                 t_comm += ar_step; ar_calls += ar_calls_step;
                 prefill_gemm_used = 1;
+                if (spec_k && m->nextn.loaded && pf_hidden && prefill_from == 0) {
+                    float *th = (float *)alloca((size_t)n_embd * sizeof(float));
+                    for (int p = 0; p < P; p++) {
+                        const float *raw = pf_hidden + (size_t)p * n_embd;
+                        if (envb_opt("TP_MTP_RAW_HIDDEN", 0)) memcpy(th, raw, (size_t)n_embd*sizeof(float));
+                        else tf_rmsnorm(th, raw, &m->output_norm, n_embd,
+                                        m->rms_norm_eps, m->matvec_tmp);
+                        memcpy(mtp_seed_hidden, th, (size_t)n_embd * sizeof(float));
+                        if (p + 1 < P) {
+                            float *dlg = transformer_nextn_logits(m, ptoks[p + 1], th, p);
+                            if (p + 2 < P) {
+                                int32_t d = sample_argmax(m, dlg, &c, &ar_step, &ar_calls_step);
+                                mtp_teacher_match += d == ptoks[p + 2]; mtp_teacher_total++;
+                            }
+                        }
+                    }
+                    int prev = in_tok;
+                    const float *dh = mtp_seed_hidden;
+                    for (int k = 0; k < spec_k; k++) {
+                        float *dlg = transformer_nextn_logits(m, prev, dh, P - 1 + k);
+                        mtp_pending[k] = sample_argmax(m, dlg, &c, &ar_step, &ar_calls_step);
+                        prev = mtp_pending[k]; dh = transformer_nextn_hidden(m);
+                    }
+                    mtp_pending_n = spec_k;
+                    t_comm += ar_step; ar_calls += ar_calls_step;
+                }
             } else if (is_first) {
                 fprintf(stderr, "warning: prefill_gemm unavailable; fallback to per-token prefill\n");
             }
@@ -1583,7 +1612,18 @@ int main(int argc, char **argv) {
         int vlogits = m->output.n_rows;
         float *all_logits = (float *)malloc((size_t)spec_k * vlogits * sizeof(float));
         float *batch_hidden = NULL;
-        if (!all_logits) die("MTP batch logits alloc", -1);
+        size_t snap_conv = (size_t)(m->ssm_conv_kernel - 1) * m->ssm_qkv_dim;
+        size_t snap_rec = (size_t)m->ssm_dt_rank * m->ssm_d_state * m->ssm_d_state;
+        size_t snap_layer = snap_conv + snap_rec;
+        size_t snap_slot = (size_t)n_layers * snap_layer;
+        float *batch_ssm = NULL;
+        if (posix_memalign((void **)&batch_ssm, 256,
+                           (size_t)spec_k * snap_slot * sizeof(float)) != 0)
+            batch_ssm = NULL;
+        if (!all_logits || !batch_ssm) die("MTP batch scratch alloc", -1);
+        tf_batch_ssm_snapshots = batch_ssm;
+        tf_batch_ssm_layer_stride = snap_layer;
+        tf_batch_ssm_slot_stride = snap_slot;
         if (is_first)
             logmsg("MTP batched verify: K=%d vocab/rank=%d recurrent_snapshot=%.1fMB\n",
                    spec_k, vlogits, (double)ss.bytes / (1024.0 * 1024.0));
@@ -1597,7 +1637,8 @@ int main(int argc, char **argv) {
             for (int j = 1; j < spec_k; j++) batch[j] = mtp_pending[j - 1];
 
             double ta = now_sec();
-            tp_spec_state_save(&ss, m);
+            for (int l = 0; l < n_layers; l++)
+                ss.conv_pos[l] = m->conv_state_pos ? m->conv_state_pos[l] : 0;
             g_ar_secs = 0.0; g_ar_calls = 0;
             tf_batch_all_logits = all_logits;
             tf_batch_hidden_out = &batch_hidden;
@@ -1628,16 +1669,25 @@ int main(int argc, char **argv) {
             int emitted = accepted < spec_k ? accepted + 1 : spec_k;
             const float *draft_h = NULL;
             if (accepted < spec_k) {
-                /* The batch advanced all K destructive SSM states.  Return to
-                 * the round boundary and replay only the committed inputs;
-                 * attention KV in later slots is harmless and self-overwrites. */
-                tp_spec_state_restore(&ss, m);
-                for (int j = 0; j < emitted; j++) {
-                    transformer_embed_token(m, batch[j]);
-                    transformer_forward_partial(m, p + j, 0, n_layers);
+                /* Select the state captured immediately after the last
+                 * committed input. No trunk replay is needed. */
+                const float *slot = batch_ssm + (size_t)(emitted - 1) * snap_slot;
+                for (int l = 0; l < n_layers; l++) {
+                    if (!m->layers[l].is_ssm) continue;
+                    const float *ls = slot + (size_t)l * snap_layer;
+                    memcpy(m->conv_state[l], ls, snap_conv * sizeof(float));
+                    memcpy(m->recurrent_state[l], ls + snap_conv,
+                           snap_rec * sizeof(float));
+                    m->conv_state_pos[l] =
+                        (ss.conv_pos[l] + emitted) % (m->ssm_conv_kernel - 1);
                 }
-                draft_h = envb_opt("TP_MTP_RAW_HIDDEN", 0)
-                    ? transformer_nextn_target_hidden(m) : transformer_get_hidden(m);
+                const float *last_hidden = batch_hidden + (size_t)(emitted - 1) * n_embd;
+                if (envb_opt("TP_MTP_RAW_HIDDEN", 0)) draft_h = last_hidden;
+                else {
+                    tf_rmsnorm(mtp_seed_hidden, last_hidden, &m->output_norm,
+                               n_embd, m->rms_norm_eps, m->matvec_tmp);
+                    draft_h = mtp_seed_hidden;
+                }
             } else {
                 const float *last_hidden = batch_hidden + (size_t)(spec_k - 1) * n_embd;
                 if (envb_opt("TP_MTP_RAW_HIDDEN", 0)) {
@@ -1714,6 +1764,9 @@ int main(int argc, char **argv) {
                    bp.out_proj_ms, bp.ffn_proj_ms, bp.ffn_act_ms,
                    bp.ffn_down_ms, bp.collective_ms);
         }
+        tf_batch_ssm_snapshots = NULL;
+        tf_batch_ssm_layer_stride = tf_batch_ssm_slot_stride = 0;
+        free(batch_ssm);
         free(all_logits);
         tp_spec_state_free(&ss);
         goto done;
