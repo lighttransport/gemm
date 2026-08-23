@@ -1540,3 +1540,112 @@ there is no honest accepted-token speedup and the 50 tok/s MTP target is not
 met.  `run_qwen38_bf16_tp4.sh mtp-check` reproduces the greedy-agreement probe;
 normal `bench` keeps `TP_SPEC_K=0`.  Batched verification must remain disabled
 until this probe reports nonzero, stable agreement against the exact stream.
+
+### TP4 BF16 MTP status and remaining work (2026-08-24)
+
+This section supersedes the zero-agreement conclusion immediately above.  The
+NextN alignment, recurrent rollback, and batched verifier are now functional
+and greedy-exact on four A64FX nodes.  Rank-local BF16 shards are staged under
+`/local/u14346/qwen38-bf16-tp4` and uploaded into anonymous HBM2; no weight mmap
+is used.  Each rank holds about 17.72 GB of staged weights, remaining safely
+below the 32 GB/node limit.
+
+The long-context performance gate duplicates `tmp/qwen38_mtp_prompt.txt` for a
+359-token prompt and generates 64 tokens with `TP_IGNORE_EOS=1`.  The accepted
+oracle is `/local/u14346/build-tmp/q38-longctx-oracle64.tokens`, SHA256
+`17b19d8bed7200ee15f147858e55841c468d0343635077b13acd219b13b8e701`.
+All accepted MTP results below match that file byte-for-byte.
+
+| mode | draft agreement | verifier | draft | result |
+|---|---:|---:|---:|---:|
+| trunk, K=0 | n/a | n/a | n/a | 28.35 tok/s |
+| MTP K=3 | 42/44 (0.955) | 59.51 ms/round | 9.21 ms/round | 39.05 tok/s |
+| MTP K=4 | 49/51 (0.961) | 65.95 ms/round | 13.91 ms/round | **42.70 tok/s** |
+| MTP K=5, representative | 53/56 (0.946) | 75.13 ms/round | 19.75 ms/round | 42.55 tok/s |
+| MTP K=5, best profiled | 53/56 (0.946) | 72.56 ms/round | 17.98 ms/round | **44.57 tok/s wall; 50.48 forward tok/s** |
+
+K=5 horizon agreement was `13/14, 13/14, 14/14, 13/14`; the draft is useful
+and non-degenerate.  The best profiled run reached 826 GB/s/node aggregate
+effective bandwidth.  Runs vary enough that 50.48 forward tok/s is a best
+observation, not a sustained 50 tok/s wall result.  The requested 50 tok/s
+decode gate and 70 tok/s final gate therefore remain open.
+
+Implemented foundations include:
+
+- snapshot-free selection of the committed recurrent state and direct writes
+  into rollback slots;
+- removal of redundant initial/final NextN proposals;
+- native exact BF16 PV verifier kernels for K=2 through K=5, including split
+  4-row x 3-token and native 4-row x 4/5-token SVE kernels;
+- fused DeltaNet state/output dots and persistent-pool NextN attention;
+- parking the OpenMP verifier team while the pthread NextN pool drafts;
+- one batched TP argmax collective for all verifier columns;
+- optional `TP_BUFFER_OUTPUT=1` to avoid synchronous filesystem flushes in a
+  benchmark while preserving interactive streaming by default.
+
+#### Remaining tasks, in priority order
+
+1. **Replace the serial linear draft critical path.**  K=5 performs four
+   dependent NextN calls and spends about 18--20 ms/round drafting.  Implement
+   tree or asynchronous drafting so independent candidates/heads run together,
+   or overlap useful draft work with verifier completion.  First inspect the
+   GGUF NextN tensors to determine whether multiple independent prediction
+   heads exist; do not emulate a tree by duplicating the same recurrent head.
+   Preserve exact verification and rollback for every selected branch.
+
+2. **Remove verifier/draft synchronization bubbles.**  The K=5 verifier is
+   about 73 ms/round and its collective phase is about 11 ms/round.  Pipeline
+   rank-local projection completion with TP reductions where dependencies
+   permit, retain the batched verifier argmax, and reduce persistent-pool
+   handoffs between trunk and NextN execution.  Draft argmax reductions remain
+   sequential when each predicted token feeds the next NextN call.
+
+3. **Raise batched PV bandwidth from 826 toward 880 GB/s/node.**  Inspect the
+   compiler output of `matvec_bf16_4x5_pv` for spills and load/FMA scheduling,
+   then benchmark a hand-scheduled assembly version under `/local`, not in the
+   repository or `/tmp`.  Sweep per-shape prefetch carefully: distance 16 was
+   best for K=4/K=5; 0, 8, and 24 were slower.  Validate the full token oracle,
+   because numerically different packing/reduction orders can sharply reduce
+   draft acceptance even when final verified tokens remain exact.
+
+4. **Measure decode wall time at the actual decode boundaries.**  The current
+   `t_total - t_prefill` report includes setup, final barrier/reporting, and
+   token-output costs that are outside `t_fwd`.  Add explicit decode-loop start
+   and stop timestamps and report both compute/communication throughput and
+   user-visible streaming throughput.  This is measurement cleanup, not a
+   substitute for meeting the wall target.  `TP_BUFFER_OUTPUT=1` improved one
+   comparable wall run only from 42.55 to 43.26 tok/s.
+
+5. **Validate sustained 50 tok/s before pursuing 70.**  Use at least 256
+   generated tokens, repeat three times, and require identical greedy tokens.
+   For the current K=5 acceptance (64 tokens in 14 rounds), 50 tok/s needs at
+   most 1.28 seconds total, roughly 11 ms/round less than the best 1.436-second
+   wall run.  At the same 4.57 emitted tokens/round, 70 tok/s requires a round
+   below about 65 ms, versus the current roughly 91 ms.  Reaching 70 therefore
+   needs substantial verifier/draft overlap or a wider accurate tree, not a
+   small prefetch adjustment.
+
+6. **Only deepen linear K after a native-kernel model.**  K=4 and K=5 have
+   nearly identical wall throughput despite excellent horizon-4 accuracy;
+   added verifier compute and another serial draft cancel the extra accepted
+   token.  Do not extend arrays to K=6+ without first predicting round cost and
+   supplying a native no-reread verifier kernel.
+
+#### Rejected or non-default experiments
+
+- Packing the replicated NextN matrices into the trunk PV layout preserved the
+  verified output but changed draft numerics: agreement fell from about 0.95 to
+  0.58 and throughput to 28.49 tok/s.  It was reverted.
+- Active OpenMP workers competing with the NextN pthread pool made drafting
+  catastrophically slow.  Keep the verifier-team parking protocol and the
+  launcher defaults `OMP_WAIT_POLICY=active`, `KMP_BLOCKTIME=1`, and
+  `TP_MTP_OMP_PARK=1` unless a complete scheduler replacement is measured.
+- Approximate SSM scalar/pre-exp combinations can produce degenerate, non-exact
+  streams and misleading throughput.  They are not accepted optimizations.
+- Increasing linear depth alone is not the route to 70 tok/s; K=5 already
+  demonstrates the diminishing-return point.
+
+Relevant commits, newest first: `9d169b59` (buffered benchmark output),
+`73643277` (batched verifier argmax), `18fe8553` (K=4/K=5 verifier kernels),
+`f8a9b471` (parallel NextN attention), `65c1fd65` (fused MTP SSM dots), and
+`79ff4e37` (split K=3 verifier kernel).
