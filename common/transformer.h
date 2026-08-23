@@ -6044,11 +6044,13 @@ static void tf_ssm_conv_batch(transformer_model *m,int layer_idx,float*qkv_rows,
             for(int f=0;f+1<nh;f++)hist[f]=hist[f+1];hist[nh-1]=x;
             *xp=s;
             if(tf_batch_ssm_snapshots){
-                int nwr=(wr+t+1)%nh;
-                float*sn=(tf_batch_ssm_snapshot_slots?tf_batch_ssm_snapshot_slots[t]:
-                    tf_batch_ssm_snapshots+(size_t)t*tf_batch_ssm_slot_stride)+
-                    (size_t)layer_idx*tf_batch_ssm_layer_stride;
-                for(int f=0;f<nh;f++)sn[(size_t)((nwr+f)%nh)*qd+j]=hist[f];
+                float*slot=tf_batch_ssm_snapshot_slots?tf_batch_ssm_snapshot_slots[t]:
+                    tf_batch_ssm_snapshots+(size_t)t*tf_batch_ssm_slot_stride;
+                if(slot){
+                    int nwr=(wr+t+1)%nh;
+                    float*sn=slot+(size_t)layer_idx*tf_batch_ssm_layer_stride;
+                    for(int f=0;f<nh;f++)sn[(size_t)((nwr+f)%nh)*qd+j]=hist[f];
+                }
             }
         }
         int nwr=(wr+N)%nh;
@@ -12365,13 +12367,15 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                     if (tf_batch_ssm_snapshots) {
                         size_t conv_count = (size_t)(m->ssm_conv_kernel - 1) * lq;
                         size_t d2 = (size_t)m->ssm_d_state * m->ssm_d_state;
-                        float *sn = (tf_batch_ssm_snapshot_slots ?
+                        float *slot = tf_batch_ssm_snapshot_slots ?
                             tf_batch_ssm_snapshot_slots[t] :
-                            tf_batch_ssm_snapshots + (size_t)t * tf_batch_ssm_slot_stride) +
-                            (size_t)l * tf_batch_ssm_layer_stride + conv_count +
-                            (size_t)h * d2;
-                        memcpy(sn, m->recurrent_state[l] + (size_t)h * d2,
-                               d2 * sizeof(float));
+                            tf_batch_ssm_snapshots + (size_t)t * tf_batch_ssm_slot_stride;
+                        if (slot) {
+                            float *sn = slot + (size_t)l * tf_batch_ssm_layer_stride +
+                                conv_count + (size_t)h * d2;
+                            memcpy(sn, m->recurrent_state[l] + (size_t)h * d2,
+                                   d2 * sizeof(float));
+                        }
                     }
                     float *o = inner + (size_t)t * ld + (size_t)h * m->ssm_d_state;
                     float *z = gate + (size_t)t * ld + (size_t)h * m->ssm_d_state;

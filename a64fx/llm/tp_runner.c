@@ -1620,13 +1620,15 @@ int main(int argc, char **argv) {
         float **batch_ssm_slots = (float **)alloca((size_t)spec_k * sizeof(*batch_ssm_slots));
         float **orig_conv = (float **)alloca((size_t)n_layers * sizeof(*orig_conv));
         float **orig_rec = (float **)alloca((size_t)n_layers * sizeof(*orig_rec));
+        int verify_drafts = spec_k - 1;
         if (posix_memalign((void **)&batch_ssm, 256,
-                           (size_t)(spec_k + 1) * snap_slot * sizeof(float)) != 0)
+                           (size_t)spec_k * snap_slot * sizeof(float)) != 0)
             batch_ssm = NULL;
         if (!all_logits || !batch_ssm) die("MTP batch scratch alloc", -1);
         for (int k = 0; k < spec_k; k++)
-            batch_ssm_slots[k] = batch_ssm + (size_t)k * snap_slot;
-        float *batch_ssm_current = batch_ssm + (size_t)spec_k * snap_slot;
+            batch_ssm_slots[k] = k < verify_drafts
+                ? batch_ssm + (size_t)k * snap_slot : NULL;
+        float *batch_ssm_current = batch_ssm + (size_t)verify_drafts * snap_slot;
         for (int l = 0; l < n_layers; l++) {
             orig_conv[l] = m->conv_state ? m->conv_state[l] : NULL;
             orig_rec[l] = m->recurrent_state ? m->recurrent_state[l] : NULL;
@@ -1650,7 +1652,6 @@ int main(int argc, char **argv) {
 
         int p = (int)decode_start;
         int measured = perf_warmup == 0;
-        int verify_drafts = spec_k - 1;
         int mtp_detail = envb_opt("TP_MTP_PROFILE_DETAIL", 0);
         double mtp_verify_sec = 0.0, mtp_restore_sec = 0.0, mtp_draft_sec = 0.0;
         long mtp_detail_rounds = 0;
