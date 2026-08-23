@@ -75,18 +75,20 @@ static void quant_row_sve(const float *xr, int K, int8_t *x8row, float *scale_m)
  * (off by default). NOTE: in-situ per-step wall times include HBM contention +
  * node variance, so absolute values are noisy; use the RELATIVE split only. */
 static uint64_t cntvct_now(void) { uint64_t t; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t)); return t; }
-static struct { uint64_t quant, pack, gemm, dequant; long calls; } i8prof;
+static struct { uint64_t quant, pack, gemm, dequant; long calls; double gemm_flops; } i8prof;
 static int i8prof_on(void) { static int e = -1; if (e < 0) { const char *v = getenv("INT8_STEP_PROF"); e = (v && *v && *v != '0'); } return e; }
 static void i8prof_print(void) {
     if (!i8prof.calls) return;
     double ms = 1e-5;   /* cycles / 1e5 = ms at 100 MHz */
     uint64_t tot = i8prof.quant + i8prof.pack + i8prof.gemm + i8prof.dequant;
-    fprintf(stderr, "\n[int8 step profile] %ld gemm_int8_BTP calls, per-call (ms, HBM-noisy):\n", i8prof.calls);
+    double gops = i8prof.gemm ? (i8prof.gemm_flops / (i8prof.gemm * ms * 1e-3) / 1e9) : 0.0;
+    fprintf(stderr, "\n[int8 step profile] %ld gemm calls, per-call (ms, HBM-noisy):\n", i8prof.calls);
     fprintf(stderr, "  quant   (per-row A)  %8.4f  (%.1f%%)\n", i8prof.quant*ms/i8prof.calls, 100.0*i8prof.quant/tot);
     fprintf(stderr, "  pack    (A tiles)    %8.4f  (%.1f%%)\n", i8prof.pack*ms/i8prof.calls, 100.0*i8prof.pack/tot);
     fprintf(stderr, "  gemm    (SDOT)       %8.4f  (%.1f%%)\n", i8prof.gemm*ms/i8prof.calls, 100.0*i8prof.gemm/tot);
     fprintf(stderr, "  dequant (C->Y)       %8.4f  (%.1f%%)\n", i8prof.dequant*ms/i8prof.calls, 100.0*i8prof.dequant/tot);
     fprintf(stderr, "  total                %8.4f\n", tot*ms/i8prof.calls);
+    fprintf(stderr, "  in-situ SDOT GEMM    %8.0f GOPS aggregate (peak 512/core)\n", gops);
 }
 
 /* ── packing (copied from int8-new/gemm_pack.c) ───────────────────────── */
@@ -232,6 +234,7 @@ void gemm_int8_BTP(int M, int K, int N, const float *X, int lda,
         i8prof.pack   += pt2 - pt1;
         i8prof.gemm   += pt3 - pt2;
         i8prof.dequant+= pt4 - pt3;
+        i8prof.gemm_flops += 2.0 * M * N * K;
     }
 }
 
@@ -295,6 +298,7 @@ void gemm_int8_BTP_fused(int M, int K, int N, const float *X, int lda,
         i8prof.calls++;
         i8prof.quant  += ft1 - ft0;   // allocs + quantize + pack (pack folded in, tiny)
         i8prof.gemm   += ft2 - ft1;   // fused GEMM + dequant
+        i8prof.gemm_flops += 2.0 * M * N * K;
     }
 }
 
