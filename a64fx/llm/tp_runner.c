@@ -1006,7 +1006,7 @@ int main(int argc, char **argv) {
     /* Opt in until the batched-vs-token greedy gate is exact for long runs. */
     int  mtp_batch         = envb("TP_MTP_BATCH", 0);
     int  llm_threads       = (int)envl("LLM_THREADS", 48);
-    if (spec_k < 0 || spec_k > 4) die("TP_SPEC_K must be in [0,4]", -1);
+    if (spec_k < 0 || spec_k > 5) die("TP_SPEC_K must be in [0,5]", -1);
     int  ignore_eos        = (int)envl("TP_IGNORE_EOS", 0);  /* long-ctx perf sweep: don't stop at EOS */
     int  prefill_only      = envb("TP_PREFILL_ONLY", 0);
     int  do_prefill_gemm   = envb("TP_PREFILL_GEMM", 1);      /* 1=batched prefill, fallback to token loop */
@@ -1390,13 +1390,13 @@ int main(int argc, char **argv) {
     double t_prefill = 0.0;
     double t_fwd = 0.0;
     long mtp_match = 0, mtp_total = 0;
-    long mtp_horizon_match[4] = {0}, mtp_horizon_total[4] = {0};
+    long mtp_horizon_match[5] = {0}, mtp_horizon_total[5] = {0};
     long mtp_teacher_match = 0, mtp_teacher_total = 0;
     long mtp_teacher_offset_match[7] = {0};  /* expected token index p + [-1..5] */
     int32_t *mtp_token_counts = spec_k > 0
         ? (int32_t *)calloc((size_t)m->n_vocab, sizeof(int32_t)) : NULL;
     int mtp_unique_targets = 0, mtp_max_target_count = 0;
-    int32_t mtp_pending[4] = {-1, -1, -1, -1};
+    int32_t mtp_pending[5] = {-1, -1, -1, -1, -1};
     int mtp_pending_n = 0;
     float *mtp_seed_hidden = spec_k > 0
         ? (float *)malloc((size_t)n_embd * sizeof(float)) : NULL;
@@ -1669,7 +1669,7 @@ int main(int argc, char **argv) {
         long mtp_detail_rounds = 0;
         while (n_gen < max_gen + perf_warmup) {
             if (mtp_pending_n < verify_drafts) die("MTP draft queue not full", -1);
-            int32_t batch[4], target[4];
+            int32_t batch[5], target[5];
             batch[0] = in_tok;
             for (int j = 1; j < spec_k; j++) batch[j] = mtp_pending[j - 1];
 

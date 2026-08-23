@@ -2126,7 +2126,7 @@ static inline void matvec_bf16_4x3_pv(float *d0, float *d1, float *d2,
     svfloat32_t a00=svdup_f32(0),a10=svdup_f32(0),a20=svdup_f32(0),a30=svdup_f32(0);
     svfloat32_t a01=svdup_f32(0),a11=svdup_f32(0),a21=svdup_f32(0),a31=svdup_f32(0);
     svfloat32_t a02=svdup_f32(0),a12=svdup_f32(0),a22=svdup_f32(0),a32=svdup_f32(0);
-    static _Thread_local int pf_done=0,pf_dist=8;
+    static _Thread_local int pf_done=0,pf_dist=16;
     if(__builtin_expect(!pf_done,0)){
         const char*e=getenv("TF_BF16PV_PREFETCH_MTP3");
         if(e&&*e)pf_dist=atoi(e);
@@ -2145,6 +2145,86 @@ static inline void matvec_bf16_4x3_pv(float *d0, float *d1, float *d2,
     d0[0]=svaddv(pg,a00);d0[1]=svaddv(pg,a10);d0[2]=svaddv(pg,a20);d0[3]=svaddv(pg,a30);
     d1[0]=svaddv(pg,a01);d1[1]=svaddv(pg,a11);d1[2]=svaddv(pg,a21);d1[3]=svaddv(pg,a31);
     d2[0]=svaddv(pg,a02);d2[1]=svaddv(pg,a12);d2[2]=svaddv(pg,a22);d2[3]=svaddv(pg,a32);
+}
+
+/* Four weight rows by four verifier tokens.  A64FX has enough SVE registers
+ * for the 16 accumulators plus four activation vectors, so each BF16 weight
+ * vector is loaded once instead of replaying the matrix for the fourth token. */
+static inline void matvec_bf16_4x4_pv(float *d0, float *d1, float *d2, float *d3,
+                                      const uint16_t *pAB,
+                                      const uint16_t *pCD,
+                                      const float *x0, const float *x1,
+                                      const float *x2, const float *x3, int n) {
+    svbool_t pg=svptrue_b32(),ph=svptrue_b16();
+    svuint16_t ix=svindex_u16(0,1);
+    svbool_t po=svcmpne_n_u16(ph,svand_n_u16_x(ph,ix,1),0);
+    svfloat32_t a00=svdup_f32(0),a10=svdup_f32(0),a20=svdup_f32(0),a30=svdup_f32(0);
+    svfloat32_t a01=svdup_f32(0),a11=svdup_f32(0),a21=svdup_f32(0),a31=svdup_f32(0);
+    svfloat32_t a02=svdup_f32(0),a12=svdup_f32(0),a22=svdup_f32(0),a32=svdup_f32(0);
+    svfloat32_t a03=svdup_f32(0),a13=svdup_f32(0),a23=svdup_f32(0),a33=svdup_f32(0);
+    static _Thread_local int pf_done=0,pf_dist=8;
+    if(__builtin_expect(!pf_done,0)){
+        const char*e=getenv("TF_BF16PV_PREFETCH_MTP4");
+        if(e&&*e)pf_dist=atoi(e);
+        pf_done=1;
+    }
+    int vl=(int)svcntw(),pfd=pf_dist*2*vl;
+    for(int i=0;i<n;i+=vl){
+        const uint16_t*ab=pAB+2*i,*cd=pCD+2*i;
+        if(pf_dist){__builtin_prefetch(ab+pfd,0,2);__builtin_prefetch(cd+pfd,0,2);}
+        svfloat32_t v0=svld1(pg,x0+i),v1=svld1(pg,x1+i);
+        svfloat32_t v2=svld1(pg,x2+i),v3=svld1(pg,x3+i),w;
+        w=svreinterpret_f32(svld1_u16(po,ab-1));a00=svmla_x(pg,a00,w,v0);a01=svmla_x(pg,a01,w,v1);a02=svmla_x(pg,a02,w,v2);a03=svmla_x(pg,a03,w,v3);
+        w=svreinterpret_f32(svld1_u16(po,ab));a10=svmla_x(pg,a10,w,v0);a11=svmla_x(pg,a11,w,v1);a12=svmla_x(pg,a12,w,v2);a13=svmla_x(pg,a13,w,v3);
+        w=svreinterpret_f32(svld1_u16(po,cd-1));a20=svmla_x(pg,a20,w,v0);a21=svmla_x(pg,a21,w,v1);a22=svmla_x(pg,a22,w,v2);a23=svmla_x(pg,a23,w,v3);
+        w=svreinterpret_f32(svld1_u16(po,cd));a30=svmla_x(pg,a30,w,v0);a31=svmla_x(pg,a31,w,v1);a32=svmla_x(pg,a32,w,v2);a33=svmla_x(pg,a33,w,v3);
+    }
+    d0[0]=svaddv(pg,a00);d0[1]=svaddv(pg,a10);d0[2]=svaddv(pg,a20);d0[3]=svaddv(pg,a30);
+    d1[0]=svaddv(pg,a01);d1[1]=svaddv(pg,a11);d1[2]=svaddv(pg,a21);d1[3]=svaddv(pg,a31);
+    d2[0]=svaddv(pg,a02);d2[1]=svaddv(pg,a12);d2[2]=svaddv(pg,a22);d2[3]=svaddv(pg,a32);
+    d3[0]=svaddv(pg,a03);d3[1]=svaddv(pg,a13);d3[2]=svaddv(pg,a23);d3[3]=svaddv(pg,a33);
+}
+
+/* Four rows by five verifier tokens.  Twenty accumulators plus the activation
+ * vectors fit in A64FX's 32-register SVE file and amortize each weight load
+ * across the deepest supported linear MTP chain. */
+static inline void matvec_bf16_4x5_pv(float *d0, float *d1, float *d2,
+                                      float *d3, float *d4,
+                                      const uint16_t *pAB,
+                                      const uint16_t *pCD,
+                                      const float *x0, const float *x1,
+                                      const float *x2, const float *x3,
+                                      const float *x4, int n) {
+    svbool_t pg=svptrue_b32(),ph=svptrue_b16();
+    svuint16_t ix=svindex_u16(0,1);
+    svbool_t po=svcmpne_n_u16(ph,svand_n_u16_x(ph,ix,1),0);
+    svfloat32_t a00=svdup_f32(0),a10=svdup_f32(0),a20=svdup_f32(0),a30=svdup_f32(0);
+    svfloat32_t a01=svdup_f32(0),a11=svdup_f32(0),a21=svdup_f32(0),a31=svdup_f32(0);
+    svfloat32_t a02=svdup_f32(0),a12=svdup_f32(0),a22=svdup_f32(0),a32=svdup_f32(0);
+    svfloat32_t a03=svdup_f32(0),a13=svdup_f32(0),a23=svdup_f32(0),a33=svdup_f32(0);
+    svfloat32_t a04=svdup_f32(0),a14=svdup_f32(0),a24=svdup_f32(0),a34=svdup_f32(0);
+    static _Thread_local int pf_done=0,pf_dist=16;
+    if(__builtin_expect(!pf_done,0)){
+        const char*e=getenv("TF_BF16PV_PREFETCH_MTP5");
+        if(e&&*e)pf_dist=atoi(e);
+        pf_done=1;
+    }
+    int vl=(int)svcntw(),pfd=pf_dist*2*vl;
+    for(int i=0;i<n;i+=vl){
+        const uint16_t*ab=pAB+2*i,*cd=pCD+2*i;
+        if(pf_dist){__builtin_prefetch(ab+pfd,0,2);__builtin_prefetch(cd+pfd,0,2);}
+        svfloat32_t v0=svld1(pg,x0+i),v1=svld1(pg,x1+i),v2=svld1(pg,x2+i);
+        svfloat32_t v3=svld1(pg,x3+i),v4=svld1(pg,x4+i),w;
+        w=svreinterpret_f32(svld1_u16(po,ab-1));a00=svmla_x(pg,a00,w,v0);a01=svmla_x(pg,a01,w,v1);a02=svmla_x(pg,a02,w,v2);a03=svmla_x(pg,a03,w,v3);a04=svmla_x(pg,a04,w,v4);
+        w=svreinterpret_f32(svld1_u16(po,ab));a10=svmla_x(pg,a10,w,v0);a11=svmla_x(pg,a11,w,v1);a12=svmla_x(pg,a12,w,v2);a13=svmla_x(pg,a13,w,v3);a14=svmla_x(pg,a14,w,v4);
+        w=svreinterpret_f32(svld1_u16(po,cd-1));a20=svmla_x(pg,a20,w,v0);a21=svmla_x(pg,a21,w,v1);a22=svmla_x(pg,a22,w,v2);a23=svmla_x(pg,a23,w,v3);a24=svmla_x(pg,a24,w,v4);
+        w=svreinterpret_f32(svld1_u16(po,cd));a30=svmla_x(pg,a30,w,v0);a31=svmla_x(pg,a31,w,v1);a32=svmla_x(pg,a32,w,v2);a33=svmla_x(pg,a33,w,v3);a34=svmla_x(pg,a34,w,v4);
+    }
+    d0[0]=svaddv(pg,a00);d0[1]=svaddv(pg,a10);d0[2]=svaddv(pg,a20);d0[3]=svaddv(pg,a30);
+    d1[0]=svaddv(pg,a01);d1[1]=svaddv(pg,a11);d1[2]=svaddv(pg,a21);d1[3]=svaddv(pg,a31);
+    d2[0]=svaddv(pg,a02);d2[1]=svaddv(pg,a12);d2[2]=svaddv(pg,a22);d2[3]=svaddv(pg,a32);
+    d3[0]=svaddv(pg,a03);d3[1]=svaddv(pg,a13);d3[2]=svaddv(pg,a23);d3[3]=svaddv(pg,a33);
+    d4[0]=svaddv(pg,a04);d4[1]=svaddv(pg,a14);d4[2]=svaddv(pg,a24);d4[3]=svaddv(pg,a34);
 }
 
 /* Register-blocked 8-row x 3-token accumulating pv GEMM microkernel.

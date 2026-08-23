@@ -10603,6 +10603,33 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
                                     X, X + X_stride, K);
                 continue;
             }
+            if (N == 4) {
+                float *y0=Y_out+g*8,*y1=Y_out+out_stride+g*8;
+                float *y2=Y_out+2*(size_t)out_stride+g*8;
+                float *y3=Y_out+3*(size_t)out_stride+g*8;
+                const float *x0=X,*x1=X+X_stride;
+                const float *x2=X+2*(size_t)X_stride;
+                const float *x3=X+3*(size_t)X_stride;
+                matvec_bf16_4x4_pv(y0,y1,y2,y3,p,p+2*K,x0,x1,x2,x3,K);
+                matvec_bf16_4x4_pv(y0+4,y1+4,y2+4,y3+4,p+4*K,p+6*K,
+                                    x0,x1,x2,x3,K);
+                continue;
+            }
+            if (N == 5) {
+                float *y0=Y_out+g*8,*y1=Y_out+out_stride+g*8;
+                float *y2=Y_out+2*(size_t)out_stride+g*8;
+                float *y3=Y_out+3*(size_t)out_stride+g*8;
+                float *y4=Y_out+4*(size_t)out_stride+g*8;
+                const float *x0=X,*x1=X+X_stride;
+                const float *x2=X+2*(size_t)X_stride;
+                const float *x3=X+3*(size_t)X_stride;
+                const float *x4=X+4*(size_t)X_stride;
+                matvec_bf16_4x5_pv(y0,y1,y2,y3,y4,p,p+2*K,
+                                    x0,x1,x2,x3,x4,K);
+                matvec_bf16_4x5_pv(y0+4,y1+4,y2+4,y3+4,y4+4,p+4*K,p+6*K,
+                                    x0,x1,x2,x3,x4,K);
+                continue;
+            }
             for (; t + 2 < N; t += 3) {
                 float *y0=Y_out+(size_t)t*out_stride+g*8;
                 float *y1=Y_out+(size_t)(t+1)*out_stride+g*8;
