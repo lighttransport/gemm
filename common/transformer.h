@@ -12455,7 +12455,33 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
     if (hidden_io) memcpy(hidden_io, cur, nf * (size_t)ne * sizeof(float));
     memcpy(m->x, cur + (size_t)(N - 1) * ne, (size_t)ne * sizeof(float));
     float *result = m->x;
-    if (flags & TF_PREFILL_LOGITS) {
+    if ((flags & TF_PREFILL_LOGITS) && tf_batch_all_logits) {
+        /* Speculative verification needs every position's target logits.  Keep
+         * the whole operation token-major so the (large) shared output matrix
+         * is streamed once for all K candidates.  A TP caller may assign each
+         * rank a disjoint vocabulary interval and reduce only K argmax pairs. */
+        tf_rmsnorm_batch(norm, cur, &m->output_norm, ne, N,
+                         m->rms_norm_eps, m->matvec_tmp);
+        int lv0 = tf_batch_logit_v0, lv1 = tf_batch_logit_v1;
+        if (lv0 >= 0 && lv1 > lv0 && lv1 <= m->output.n_rows) {
+            qtensor osl = m->output;
+            osl.data = (void *)((uint8_t *)m->output.data +
+                (size_t)lv0 * tf_row_bytes(m->output.type, m->output.n_cols));
+            osl.n_rows = lv1 - lv0;
+            tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &osl, norm,
+                                      lv1 - lv0, N, lv1 - lv0, ne,
+                                      m->n_threads);
+        } else {
+            tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &m->output, norm,
+                                      m->output.n_rows, N, m->output.n_rows,
+                                      ne, m->n_threads);
+        }
+        result = tf_batch_all_logits + (size_t)(N - 1) *
+            ((lv0 >= 0 && lv1 > lv0) ? (lv1 - lv0) : m->output.n_rows);
+        if (m->logits && m->output.n_rows == m->n_vocab &&
+            !(lv0 >= 0 && lv1 > lv0))
+            memcpy(m->logits, result, (size_t)m->n_vocab * sizeof(float));
+    } else if (flags & TF_PREFILL_LOGITS) {
         tf_rmsnorm(m->x, m->x, &m->output_norm, ne, m->rms_norm_eps, m->matvec_tmp);
         result = transformer_compute_logits(m);
     }
