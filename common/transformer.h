@@ -5361,6 +5361,7 @@ typedef struct {
     int head_start, head_end;
     int d_state;
     float scale;
+    float *rec_state_out;   /* optional out-of-place next state */
 } tf_ssm_recurrence_task;
 
 static void *tf_ssm_recurrence_worker(void *arg) {
@@ -5371,7 +5372,9 @@ static void *tf_ssm_recurrence_worker(void *arg) {
     if(!preexp_done){const char*e=getenv("TF_SSM_PREEXP");preexp=e&&atoi(e)!=0;preexp_done=1;}
 
     for (int h = t->head_start; h < t->head_end; h++) {
-        float *state = t->rec_state + (size_t)h * d2;
+        const float *state_in = t->rec_state + (size_t)h * d2;
+        float *state = (t->rec_state_out ? t->rec_state_out : t->rec_state) +
+                       (size_t)h * d2;
         float *q_h = t->Q_exp + h * ds;
         float *k_h = t->K_exp + h * ds;
         float *v_h = t->V_raw + h * ds;
@@ -5393,8 +5396,8 @@ static void *tf_ssm_recurrence_worker(void *arg) {
             __m256 vdecay = _mm256_set1_ps(decay);
             int i = 0;
             for (; i + 7 < d2; i += 8)
-                _mm256_storeu_ps(state + i, _mm256_mul_ps(_mm256_loadu_ps(state + i), vdecay));
-            for (; i < d2; i++) state[i] *= decay;
+                _mm256_storeu_ps(state + i, _mm256_mul_ps(_mm256_loadu_ps(state_in + i), vdecay));
+            for (; i < d2; i++) state[i] = state_in[i] * decay;
         }
 
         /* Read: sk = state @ k (2-row to share k loads) */
@@ -5580,7 +5583,7 @@ static void *tf_ssm_recurrence_worker(void *arg) {
             svfloat32_t vd = svdup_f32(decay);
             for (int i = 0; i < d2; i += (int)svcntw()) {
                 svbool_t pt = svwhilelt_b32((uint64_t)i, (uint64_t)d2);
-                svst1(pt, state + i, svmul_x(pt, svld1(pt, state + i), vd));
+                svst1(pt, state + i, svmul_x(pt, svld1(pt, state_in + i), vd));
             }
             float sk[128], old_o[128], delta[128];
             static int ssm_pair_done = 0, ssm_pair = 0, ssm_fused = 0;
@@ -5644,7 +5647,7 @@ static void *tf_ssm_recurrence_worker(void *arg) {
         /* Scalar fallback */
         for (int i = 0; i < ds; i++) q_h[i] *= t->scale;
         float decay = preexp ? t->alpha[h] : expf(t->alpha[h]);
-        for (int i = 0; i < d2; i++) state[i] *= decay;
+        for (int i = 0; i < d2; i++) state[i] = state_in[i] * decay;
 
         float sk[128];
         for (int r = 0; r < ds; r++) {
@@ -12356,27 +12359,32 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             #endif
             for (int h = 0; h < m->ssm_dt_rank; h++) {
                 for (int t = 0; t < N; t++) {
+                    size_t conv_count = (size_t)(m->ssm_conv_kernel - 1) * lq;
+                    float *src_slot = NULL, *dst_slot = NULL;
+                    if (tf_batch_ssm_snapshots) {
+                        if (t > 0) src_slot = tf_batch_ssm_snapshot_slots
+                            ? tf_batch_ssm_snapshot_slots[t - 1]
+                            : tf_batch_ssm_snapshots + (size_t)(t - 1) *
+                              tf_batch_ssm_slot_stride;
+                        dst_slot = tf_batch_ssm_snapshot_slots
+                            ? tf_batch_ssm_snapshot_slots[t]
+                            : tf_batch_ssm_snapshots + (size_t)t *
+                              tf_batch_ssm_slot_stride;
+                    }
+                    float *rec_in = src_slot
+                        ? src_slot + (size_t)l * tf_batch_ssm_layer_stride + conv_count
+                        : m->recurrent_state[l];
+                    float *rec_out = dst_slot
+                        ? dst_slot + (size_t)l * tf_batch_ssm_layer_stride + conv_count
+                        : m->recurrent_state[l];
                     tf_ssm_recurrence_task rt = {
-                        m->recurrent_state[l], proj + (size_t)t * lq,
+                        rec_in, proj + (size_t)t * lq,
                         attout + (size_t)t * qdim, up + (size_t)t * max_inner,
                         inner + (size_t)t * ld, kv + (size_t)t * m->ssm_dt_rank,
                         vv + (size_t)t * m->ssm_dt_rank, h, h + 1,
-                        m->ssm_d_state, rec_scale
+                        m->ssm_d_state, rec_scale, rec_out
                     };
                     tf_ssm_recurrence_worker(&rt);
-                    if (tf_batch_ssm_snapshots) {
-                        size_t conv_count = (size_t)(m->ssm_conv_kernel - 1) * lq;
-                        size_t d2 = (size_t)m->ssm_d_state * m->ssm_d_state;
-                        float *slot = tf_batch_ssm_snapshot_slots ?
-                            tf_batch_ssm_snapshot_slots[t] :
-                            tf_batch_ssm_snapshots + (size_t)t * tf_batch_ssm_slot_stride;
-                        if (slot) {
-                            float *sn = slot + (size_t)l * tf_batch_ssm_layer_stride +
-                                conv_count + (size_t)h * d2;
-                            memcpy(sn, m->recurrent_state[l] + (size_t)h * d2,
-                                   d2 * sizeof(float));
-                        }
-                    }
                     float *o = inner + (size_t)t * ld + (size_t)h * m->ssm_d_state;
                     float *z = gate + (size_t)t * ld + (size_t)h * m->ssm_d_state;
                     float ss = 0.0f;
