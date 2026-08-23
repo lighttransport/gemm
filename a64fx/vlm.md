@@ -185,17 +185,21 @@ channel** (per-n) + pre-packed at cache build; activations are quantized
 **per row** (per-m, no global-max barrier) per GEMM. Dequant: `C[m][n] =
 C_i32[m][n] · a_scale[m] · w_scale[n]`.
 
-Result on this node (384×256, 96 tokens, 48T, `--bench 4–5` median; node speed
+Result on this node (384×256, 96 tokens, `--bench 3–4` median; node speed
 varies session-to-session, so the *relative* columns are what matter):
 
-| dtype    | output norm | Δ vs fp16 | tok/s      | vs fp16            |
-|----------|-------------|-----------|------------|--------------------|
-| fp16     | 455.6237    | ref       | ~330–372   | 1.00×              |
-| **int8** | 452.0263    | **0.79%** | **~660–810** | **1.8–2.3× faster** |
-| int16    | 458.2751    | 0.58%     | 248.8      | **0.70× (43% slower)** |
+| dtype    | output norm | Δ vs fp16 | vs fp16 (12T / 24T / 48T)      |
+|----------|-------------|-----------|--------------------------------|
+| fp16     | 455.6237    | ref       | 1.00×                          |
+| **int8** | 452.0263    | **0.79%** | **~3.3× / 3.3× / 2.9×** faster |
+| int16    | 458.2751    | 0.58%     | ~0.7× (43% slower)             |
 
-(int8 was 546.5 tok/s / 1.53× before the fused dequant kernel, §3.3b; the norm
-is unchanged by the fusion — bit-identical path.)
+**This session took int8 from 1.53× (pre-session, scalar quant + separate
+dequant) to ~2.9–3.3× faster than fp16** — via the fused GEMM+dequant kernel
+(§3.3b) and the SVE activation quantize (§3.3c). The ratio is *higher* at
+fewer threads (less HBM contention → the HBM-efficient int8 W wins more).
+The norm is unchanged throughout (bit-identical int8 path: 452.0263 at every
+thread count).
 
 **int8 is the production win** (1.53× faster, small 0.79% norm delta). The
 whole-VLM win is well below the 3–5× standalone-GEMM win. `INT8_STEP_PROF=1`
