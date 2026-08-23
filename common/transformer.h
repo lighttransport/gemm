@@ -11115,7 +11115,7 @@ static void tf_rmsnorm_batch(float *dst, const float *src, const qtensor *w,
     tf_dequant_row(w, 0, w_buf);
     /* per-token independent (w_buf shared read-only) -> parallelize over tokens */
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if(N >= 8)
     #endif
     for (int t = 0; t < N; t++) {
         const float *xi = src + (size_t)t * n_embd;
