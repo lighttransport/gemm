@@ -1483,14 +1483,15 @@ int main(int argc, char **argv) {
                             }
                         }
                     }
+                    int seed_drafts = mtp_batch ? spec_k - 1 : spec_k;
                     int prev = in_tok;
                     const float *dh = mtp_seed_hidden;
-                    for (int k = 0; k < spec_k; k++) {
+                    for (int k = 0; k < seed_drafts; k++) {
                         float *dlg = transformer_nextn_logits(m, prev, dh, P - 1 + k);
                         mtp_pending[k] = sample_argmax(m, dlg, &c, &ar_step, &ar_calls_step);
                         prev = mtp_pending[k]; dh = transformer_nextn_hidden(m);
                     }
-                    mtp_pending_n = spec_k;
+                    mtp_pending_n = seed_drafts;
                     t_comm += ar_step; ar_calls += ar_calls_step;
                 }
             } else if (is_first) {
@@ -1545,9 +1546,10 @@ int main(int argc, char **argv) {
              * logits above already provide in_tok; NextN predicts the token
              * after it, so agreement is checked on the following trunk step. */
             if (spec_k && m->nextn.loaded && mtp_seed_hidden) {
+                int seed_drafts = mtp_batch ? spec_k - 1 : spec_k;
                 const float *dh = mtp_seed_hidden;
                 int32_t prev = in_tok;
-                for (int k = 0; k < spec_k; k++) {
+                for (int k = 0; k < seed_drafts; k++) {
                     float *dlg = transformer_nextn_logits(m, prev, dh, P - 1 + k);
                     double da = 0.0; long dc = 0;
                     mtp_pending[k] = sample_argmax(m, dlg, &c, &da, &dc);
@@ -1555,7 +1557,7 @@ int main(int argc, char **argv) {
                     prev = mtp_pending[k];
                     dh = transformer_nextn_hidden(m);
                 }
-                mtp_pending_n = spec_k;
+                mtp_pending_n = seed_drafts;
             }
         }
     } else {
