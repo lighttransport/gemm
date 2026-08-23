@@ -41,6 +41,35 @@ static void *xal(size_t n) {
     return p;
 }
 
+/* SVE per-row activation quantize — matches the scalar path EXACTLY so the
+ * int8 output is bit-identical to before:
+ *   - max |x| via svabs+svmax (exact, same mx)
+ *   - inv = 127/mx, scale = mx/127 (scalar, same as before)
+ *   - per element: svrinta (round ties AWAY from zero == lroundf), clamp [-127,127]
+ * K must be a multiple of 16 (it is: K%256==0). */
+static const uint8_t i8_q_idx[16] __attribute__((aligned(16))) =
+    {0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60};
+static void quant_row_sve(const float *xr, int K, int8_t *x8row, float *scale_m) {
+    const svbool_t pg = svptrue_b32();
+    const svuint8_t idx = svld1_u8(svptrue_b8(), i8_q_idx);
+    svfloat32_t vmax = svdup_f32(0.0f);
+    for (int k = 0; k < K; k += 16)
+        vmax = svmax_f32_x(pg, vmax, svabs_f32_x(pg, svld1(pg, xr + k)));
+    float mx = svmaxv_f32(pg, vmax);
+    float inv = (mx > 1e-9f) ? (127.0f / mx) : 1.0f;
+    *scale_m = (mx > 1e-9f) ? (mx / 127.0f) : 1.0f;
+    const svfloat32_t vind = svdup_f32(inv);
+    const svfloat32_t vlo  = svdup_f32(-127.0f);
+    const svfloat32_t vhi  = svdup_f32(127.0f);
+    for (int k = 0; k < K; k += 16) {
+        svfloat32_t vs = svmul_x(pg, svld1(pg, xr + k), vind);
+        svfloat32_t vr = svrinta_f32_x(pg, vs);   // lroundf (ties away)
+        svfloat32_t vc = svmin_x(pg, svmax_x(pg, vr, vlo), vhi);
+        svint8_t  v8   = svtbl_s8(svreinterpret_s8_s32(svcvt_s32_f32_x(pg, vc)), idx);
+        svst1_s8(svwhilelt_b8(0, 16), x8row + k, v8);
+    }
+}
+
 /* INT8_STEP_PROF=1 : accumulate master-thread wall time (CNTVCT, 100 MHz) of
  * each step of gemm_int8_BTP across all calls, print at exit. Diagnostic only
  * (off by default). NOTE: in-situ per-step wall times include HBM contention +
@@ -139,21 +168,12 @@ void gemm_int8_BTP(int M, int K, int N, const float *X, int lda,
 
     // 1+2) per-ROW activation quantize (each row has its own scale -> no global
     // max barrier, more accurate than per-tensor). One parallel region over rows.
+    // SVE-vectorized (quant_row_sve); bit-identical to the prior scalar loop.
     float *a_scale = (float *)xal((size_t)M * 4);
     int8_t *X8 = (int8_t *)xal((size_t)M * K);
     #pragma omp parallel for schedule(static)
-    for (int m = 0; m < M; m++) {
-        const float *xr = X + (size_t)m * lda;
-        float mx = 0;
-        for (int k = 0; k < K; k++) { float v = fabsf(xr[k]); if (v > mx) mx = v; }
-        float inv = (mx > 1e-9f) ? (127.0f / mx) : 1.0f;
-        a_scale[m] = (mx > 1e-9f) ? (mx / 127.0f) : 1.0f;
-        for (int k = 0; k < K; k++) {
-            int v = (int)lroundf(xr[k] * inv);
-            if (v > 127) v = 127; if (v < -127) v = -127;
-            X8[(size_t)m * K + k] = (int8_t)v;
-        }
-    }
+    for (int m = 0; m < M; m++)
+        quant_row_sve(X + (size_t)m * lda, K, X8 + (size_t)m * K, &a_scale[m]);
     uint64_t pt1 = cntvct_now();
 
     // 3) pack A per (mb, kc)
@@ -231,24 +251,19 @@ void gemm_int8_BTP_fused(int M, int K, int N, const float *X, int lda,
     int NB = N / I8_NR;
     int KC = K / I8_KC;
 
+    const int fprof = i8prof_on();
+    if (fprof && i8prof.calls == 0) atexit(i8prof_print);
+    uint64_t ft0 = cntvct_now();
+
     // 1+2) per-ROW activation quantize (identical to gemm_int8_BTP)
     // a_scale padded to MB*6: the fused kernel reads 6 scales per tile.
+    // SVE-vectorized (quant_row_sve); bit-identical to the prior scalar loop.
     float *a_scale = (float *)xal((size_t)(MB * I8_MR) * 4);
     memset(a_scale, 0, (size_t)(MB * I8_MR) * 4);
     int8_t *X8 = (int8_t *)xal((size_t)M * K);
     #pragma omp parallel for schedule(static)
-    for (int m = 0; m < M; m++) {
-        const float *xr = X + (size_t)m * lda;
-        float mx = 0;
-        for (int k = 0; k < K; k++) { float v = fabsf(xr[k]); if (v > mx) mx = v; }
-        float inv = (mx > 1e-9f) ? (127.0f / mx) : 1.0f;
-        a_scale[m] = (mx > 1e-9f) ? (mx / 127.0f) : 1.0f;
-        for (int k = 0; k < K; k++) {
-            int v = (int)lroundf(xr[k] * inv);
-            if (v > 127) v = 127; if (v < -127) v = -127;
-            X8[(size_t)m * K + k] = (int8_t)v;
-        }
-    }
+    for (int m = 0; m < M; m++)
+        quant_row_sve(X + (size_t)m * lda, K, X8 + (size_t)m * K, &a_scale[m]);
 
     // 3) pack A per (mb, kc)
     int8_t *Apack = (int8_t *)xal((size_t)MB * KC * I8_MR * I8_KC);
@@ -259,6 +274,7 @@ void gemm_int8_BTP_fused(int M, int K, int N, const float *X, int lda,
             pack_A_6x256(X8 + (size_t)(mb * I8_MR) * K + kc * I8_KC, K,
                          Apack + (size_t)(mb * KC + kc) * I8_MR * I8_KC, mr);
         }
+    uint64_t ft1 = cntvct_now();
 
     // 4) FUSED GEMM + dequant (nb-outer). No C buffer, no separate dequant.
     #pragma omp parallel for collapse(2) schedule(static)
@@ -272,8 +288,14 @@ void gemm_int8_BTP_fused(int M, int K, int N, const float *X, int lda,
             kernel_int8_6x4_fused(A_base, B_base, KC, Y_tile, ldc * 4,
                                   a_scale + mb * I8_MR, w_scale + nb * I8_NR, mr);
         }
+    uint64_t ft2 = cntvct_now();
 
     free(X8); free(Apack); free(a_scale);
+    if (fprof) {
+        i8prof.calls++;
+        i8prof.quant  += ft1 - ft0;   // allocs + quantize + pack (pack folded in, tiny)
+        i8prof.gemm   += ft2 - ft1;   // fused GEMM + dequant
+    }
 }
 
 

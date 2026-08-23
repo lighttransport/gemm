@@ -314,6 +314,28 @@ Bugs found while integrating (all fixed — each one masked at 1 call / 1 tile):
 - **a_scale tail** — the epilogue reads 6 a_scales per tile, so the driver
   pads `a_scale` to MB×6 floats.
 
+### 3.3c SVE activation quantize — DONE, ~1.2× end-to-end
+
+After fusing the dequant, `INT8_STEP_PROF` showed the per-row activation
+quantize (step 1 of the int8 GEMM) was the **single biggest int8 cost**: it
+read each row's fp32 input twice (max + quantize) with a **scalar**
+`fabsf`/`lroundf` loop — **54% of a GEMM call** (0.365 ms) vs 46% for the SDOT
+GEMM itself. `quant_row_sve` (`kernels/int8_gemm.c`) vectorizes it: SVE
+`svabs`+`svmax` for the row max, `svmul` + **`svrinta`** (round ties *away*
+from zero = exactly `lroundf`) + clamp [−127,127] for the quantize, `svtbl`
+byte-extract for the int8 store. Because `svrinta` reproduces `lroundf`
+bit-for-bit, the int8 output — and the VLM norm (**452.0263**) — are
+**unchanged**.
+
+Result: the quantize step drops **0.365 → 0.132 ms/call (2.8×)**, from 54% to
+~21% of the GEMM call. End-to-end back-to-back A/B (scalar vs SVE quant, 48T,
+384×256, `--bench 3`): **1.105× / 1.306× / 1.162×** (~**1.2×** on the whole
+encode). Now the SDOT GEMM (W-HBM-bound) is the dominant int8 cost again.
+
+Note: the old arm_sve.h (clang-7 / binutils 2.30) lacks `svcvtn_s8_f32_x`
+(narrowing fp32→int8), so the byte store uses the `svcvt_s32_f32` + `svtbl`
+extract trick (as in `tf_quantize_f32_to_int8`).
+
 ### 3.4 Store the activations in fp16 (A is currently fp32) — likely small
 
 `hidden` / `Y` / `ffn_buf` are `float` (fp32). In the nb-outer schedule A is
