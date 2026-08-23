@@ -27,6 +27,9 @@ VLM_KERNELS := $(VLM_DIR)/kernels
 VLM_SRC     := $(VLM_DIR)/src
 VLM_BUILD   := $(VLM_DIR)/build
 BUILD       := $(LLM_DIR)build
+Q8V2_KERNEL := $(ROOT)/gemma4-kernels/kernel_q8v2_3x4.S
+Q8B6_KERNEL := $(ROOT)/int8-cmg/micro_kernel_6x4_no_sector.S
+BF16_PODD_KERNEL := $(ROOT)/gemma4-kernels/sgemm_bf16_2x12.S
 
 # ── Compiler-specific flags ────────────────────────────────────────────
 ifeq ($(CC),fcc)
@@ -140,7 +143,7 @@ GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COM
 # ── Targets ────────────────────────────────────────────────────────────
 # ds4f_bake MUST be here: the alias target name matches ds4f_bake.c, so without .PHONY make's
 # built-in "%: %.c" rule fires and re-links the finished binary as if it were an object.
-.PHONY: all clean vlm_objs qwen38_runner qwen38_pp_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
+.PHONY: all clean vlm_objs qwen38_runner qwen38_pp_runner qwen38_prefill_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
 
 all: $(BUILD)/llm_runner
 
@@ -152,6 +155,12 @@ qwen38_pp_runner: $(BUILD)/qwen38_pp_runner
 $(BUILD)/qwen38_pp_runner: $(LLM_DIR)qwen38_pp_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h | $(BUILD)
 	OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43 /opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifcc \
 		$(CFLAGS) -o $@ $(LLM_DIR)qwen38_pp_runner.c $(LDFLAGS)
+
+qwen38_prefill_runner: $(BUILD)/qwen38_prefill_runner
+$(BUILD)/qwen38_prefill_runner: $(LLM_DIR)qwen38_prefill_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h $(ROOT)/utofu-tests/tp_allreduce.h $(ROOT)/utofu-tests/tp_rsag4.h $(VLM_KERNELS)/micro_kernel_bf16B_8x3_pv.S $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) | $(BUILD)
+	OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43 /opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifcc \
+		$(filter-out -g -rdynamic,$(CFLAGS)) -DTF_LINK_BF16PV48 -DTF_LINK_PODD -DTF_HAVE_Q8V2 $(QWEN_CFLAGS) -o $@ \
+		$(LLM_DIR)qwen38_prefill_runner.c $(VLM_KERNELS)/micro_kernel_bf16B_8x3_pv.S $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(LDFLAGS) -ltofucom
 
 qwen38_tp_stage: $(BUILD)/qwen38_tp_stage
 $(BUILD)/qwen38_tp_stage: $(LLM_DIR)qwen38_tp_stage.c $(LLM_DIR)qwen38_tp_stage.h $(COMMON)/gguf_loader.h | $(BUILD)
@@ -176,7 +185,7 @@ $(BUILD)/pp_runner: $(PP_SRC) vlm_objs | $(BUILD)
 # Multi-node tensor-parallel decode runner (pure uTofu, no MPI in the binary).
 tp_runner: $(BUILD)/tp_runner
 $(BUILD)/tp_runner: $(TP_SRC) $(COMMON)/transformer.h $(COMMON)/gguf_loader.h | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $(TP_SRC) $(LDFLAGS) -ltofucom
+	$(CC) $(filter-out -g -rdynamic,$(CFLAGS)) $(QWEN_CFLAGS) -o $@ $(TP_SRC) $(LDFLAGS) -ltofucom
 
 # Same as tp_runner but with -DTF_POOL_PROFILE: dumps the per-dispatch work-vs-wait
 # and per-tid matvec/barrier/attn decode breakdown at pool shutdown. Separate binary

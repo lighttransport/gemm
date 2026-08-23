@@ -310,11 +310,56 @@ static void row8_pv_pf(float *dst,
     dst[4]=svaddv(pg,a4); dst[5]=svaddv(pg,a5); dst[6]=svaddv(pg,a6); dst[7]=svaddv(pg,a7);
 }
 
+/* Exact decode reduction order (alternating chunks into low/high accumulator
+ * sets), with an optional tunable L2 prefetch distance. */
+static void row8_pv_exact(float *dst,
+                          const bf16_t *pAB, const bf16_t *pCD,
+                          const bf16_t *pEF, const bf16_t *pGH,
+                          const float *x, int K) {
+    svbool_t pg = svptrue_b32(), ph = svptrue_b16();
+    svuint16_t ih = svindex_u16(0, 1);
+    svbool_t po = svcmpne_n_u16(ph, svand_n_u16_x(ph, ih, 1), 0);
+    svfloat32_t a0l=svdup_f32(0),a1l=svdup_f32(0),a2l=svdup_f32(0),a3l=svdup_f32(0);
+    svfloat32_t a4l=svdup_f32(0),a5l=svdup_f32(0),a6l=svdup_f32(0),a7l=svdup_f32(0);
+    svfloat32_t a0h=svdup_f32(0),a1h=svdup_f32(0),a2h=svdup_f32(0),a3h=svdup_f32(0);
+    svfloat32_t a4h=svdup_f32(0),a5h=svdup_f32(0),a6h=svdup_f32(0),a7h=svdup_f32(0);
+    int vl = (int)svcntw();
+    const char *pe = getenv("TF_BF16PV_PFD");
+    int pfd = pe ? atoi(pe) : 0;
+    for (int i = 0; i + vl - 1 < K; i += vl) {
+        const uint16_t *p[4] = {pAB + 2*i, pCD + 2*i, pEF + 2*i, pGH + 2*i};
+        if (pfd > 0) for (int q = 0; q < 4; q++)
+            __builtin_prefetch(p[q] + pfd * 2 * vl, 0, 2);
+        svuint16_t w0=svld1_u16(po,p[0]-1),w1=svld1_u16(po,p[0]);
+        svuint16_t w2=svld1_u16(po,p[1]-1),w3=svld1_u16(po,p[1]);
+        svuint16_t w4=svld1_u16(po,p[2]-1),w5=svld1_u16(po,p[2]);
+        svuint16_t w6=svld1_u16(po,p[3]-1),w7=svld1_u16(po,p[3]);
+        svfloat32_t vx = svld1(pg, x + i);
+        if ((i / vl) & 1) {
+            a0h=svmla_x(pg,a0h,svreinterpret_f32(w0),vx); a1h=svmla_x(pg,a1h,svreinterpret_f32(w1),vx);
+            a2h=svmla_x(pg,a2h,svreinterpret_f32(w2),vx); a3h=svmla_x(pg,a3h,svreinterpret_f32(w3),vx);
+            a4h=svmla_x(pg,a4h,svreinterpret_f32(w4),vx); a5h=svmla_x(pg,a5h,svreinterpret_f32(w5),vx);
+            a6h=svmla_x(pg,a6h,svreinterpret_f32(w6),vx); a7h=svmla_x(pg,a7h,svreinterpret_f32(w7),vx);
+        } else {
+            a0l=svmla_x(pg,a0l,svreinterpret_f32(w0),vx); a1l=svmla_x(pg,a1l,svreinterpret_f32(w1),vx);
+            a2l=svmla_x(pg,a2l,svreinterpret_f32(w2),vx); a3l=svmla_x(pg,a3l,svreinterpret_f32(w3),vx);
+            a4l=svmla_x(pg,a4l,svreinterpret_f32(w4),vx); a5l=svmla_x(pg,a5l,svreinterpret_f32(w5),vx);
+            a6l=svmla_x(pg,a6l,svreinterpret_f32(w6),vx); a7l=svmla_x(pg,a7l,svreinterpret_f32(w7),vx);
+        }
+    }
+    dst[0]=svaddv(pg,svadd_x(pg,a0l,a0h)); dst[1]=svaddv(pg,svadd_x(pg,a1l,a1h));
+    dst[2]=svaddv(pg,svadd_x(pg,a2l,a2h)); dst[3]=svaddv(pg,svadd_x(pg,a3l,a3h));
+    dst[4]=svaddv(pg,svadd_x(pg,a4l,a4h)); dst[5]=svaddv(pg,svadd_x(pg,a5l,a5h));
+    dst[6]=svaddv(pg,svadd_x(pg,a6l,a6h)); dst[7]=svaddv(pg,svadd_x(pg,a7l,a7h));
+}
+
 /* dispatch one 8-row group by variant. pvgrp = pair-interleaved group base,
  * rmgrp = row-major group base (variant 2 only). */
 static inline void do_group(int variant, float *y, const bf16_t *pvgrp,
                             const bf16_t *rmgrp, const float *x, int K) {
-    if (variant == 3)
+    if (variant == 4)
+        row8_pv_exact(y, pvgrp+0*2*K, pvgrp+1*2*K, pvgrp+2*2*K, pvgrp+3*2*K, x, K);
+    else if (variant == 3)
         row8_pv_pf(y, pvgrp+0*2*K, pvgrp+1*2*K, pvgrp+2*2*K, pvgrp+3*2*K, x, K);
     else if (variant == 2)
         row8_lsl(y, rmgrp+0*K, rmgrp+1*K, rmgrp+2*K, rmgrp+3*K,
@@ -533,7 +578,8 @@ int main(int argc, char **argv) {
     }
 
     double tot_bytes = (double)gbytes * ncmg;
-    const char *vname = variant == 2 ? "row8_lsl  " :
+    const char *vname = variant == 4 ? "row8_exact " :
+                        variant == 2 ? "row8_lsl  " :
                         variant == 1 ? "row8_pv_v1" : "row8_pv   ";
     printf("  sve_sum   (ceiling)  %.3f ms  %7.2f GB/s  (%.1f%% of ceiling below)\n",
            t_ceiling * 1e3, tot_bytes / t_ceiling / 1e9, 100.0);

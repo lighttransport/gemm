@@ -23,10 +23,12 @@ extern void fapp_stop(const char *, int, int);
 
 extern double tf_decode_matvec_ms;
 extern double tf_decode_matvec_bytes;
+extern double tf_decode_null_bytes;
 extern long tf_decode_matvec_cnt;
 extern double tf_decode_attn_qkv_ms, tf_decode_attn_out_ms;
-extern double tf_decode_ssm_in_ms, tf_decode_ssm_core_ms, tf_decode_ssm_out_ms;
+extern double tf_decode_ssm_in_ms, tf_decode_ssm_prepare_ms, tf_decode_ssm_core_ms, tf_decode_ssm_out_ms;
 extern double tf_decode_ffn_gateup_ms, tf_decode_ffn_down_ms;
+extern double tf_decode_lm_head_ms;
 
 static double now_sec(void) {
     struct timespec t;
@@ -43,7 +45,7 @@ static int argmax(const float *x, int n) {
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
                     "[--threads N] [--spec-k 0..4] [--mmap] "
-                    "[--q8-mode auto|reference|block64|row]\n", p);
+                    "[--q8-mode auto|reference|block64|block64-ffn|block64-exact|row]\n", p);
 }
 
 int main(int argc, char **argv) {
@@ -66,7 +68,8 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(q8_mode, "auto") && strcmp(q8_mode, "reference") &&
-        strcmp(q8_mode, "block64") && strcmp(q8_mode, "row")) {
+        strcmp(q8_mode, "block64") && strcmp(q8_mode, "block64-ffn") &&
+        strcmp(q8_mode, "block64-exact") && strcmp(q8_mode, "row")) {
         usage(argv[0]); return 2;
     }
     double load0 = now_sec();
@@ -97,7 +100,9 @@ int main(int argc, char **argv) {
             return 1;
         }
         int resident_mode = !strcmp(q8_mode, "row") ? 1 :
-                            !strcmp(q8_mode, "block64") ? 2 : 0;
+                            !strcmp(q8_mode, "block64") ? 2 :
+                            !strcmp(q8_mode, "block64-ffn") ? 3 :
+                            !strcmp(q8_mode, "block64-exact") ? 4 : 0;
         q8_resident = transformer_materialize_q8_decode(m, g, resident_mode);
         if (!q8_resident) return 1;
     } else if (!mmap_weights) {
@@ -107,6 +112,13 @@ int main(int argc, char **argv) {
     fprintf(stderr, "qwen38: load=%.3fs trunk=%d nextn=%d format=%s\n",
             now_sec() - load0, m->n_layers, m->n_nextn_layers,
             mmap_weights ? "mmap" : (q8_resident ? "selective-q8" : "anonymous"));
+    if (getenv("TF_NULL_GEMM") && atoi(getenv("TF_NULL_GEMM")) == 2) {
+        transformer_null_stream_bench(m, 3);
+        transformer_free(m);
+        bpe_vocab_free(v);
+        gguf_close(g);
+        return 0;
+    }
     if (spec_k && !m->nextn.loaded) {
         fprintf(stderr, "qwen38: --spec-k requires native NextN tensors\n");
         return 1;
@@ -125,13 +137,15 @@ int main(int argc, char **argv) {
         logits = transformer_forward_logits(m, tok[pos], pos);
         if (spec_k) transformer_nextn_logits(m, tok[pos], transformer_get_hidden(m), pos);
     }
-    int32_t cur = argmax(logits, m->n_vocab);
+    int32_t cur = transformer_last_argmax(m);
     tf_decode_matvec_ms = 0.0;
     tf_decode_matvec_bytes = 0.0;
+    tf_decode_null_bytes = 0.0;
     tf_decode_matvec_cnt = 0;
     tf_decode_attn_qkv_ms = tf_decode_attn_out_ms = 0.0;
-    tf_decode_ssm_in_ms = tf_decode_ssm_core_ms = tf_decode_ssm_out_ms = 0.0;
+    tf_decode_ssm_in_ms = tf_decode_ssm_prepare_ms = tf_decode_ssm_core_ms = tf_decode_ssm_out_ms = 0.0;
     tf_decode_ffn_gateup_ms = tf_decode_ffn_down_ms = 0.0;
+    tf_decode_lm_head_ms = 0.0;
     double dec0 = now_sec();
     fapp_start("qwen38_decode", 1, 0);
     long mtp_match = 0, mtp_total = 0;
@@ -145,7 +159,7 @@ int main(int argc, char **argv) {
         if (piece) fputs(piece, stdout);
         fflush(stdout);
         logits = transformer_forward_logits(m, cur, pos);
-        int32_t next = argmax(logits, m->n_vocab);
+        int32_t next = transformer_last_argmax(m);
         pending_draft = -1;
         if (spec_k) {
             const float *h = transformer_get_hidden(m);
@@ -177,12 +191,23 @@ int main(int argc, char **argv) {
                 100.0 * mat_ms / (dt * 1000.0), mat_bw,
                 tf_decode_matvec_cnt / (pos - nt));
         fprintf(stderr, "qwen38: stages ms/tok attn_qkv=%.1f attn_out=%.1f "
-                        "ssm_in=%.1f ssm_core=%.1f ssm_out=%.1f "
-                        "ffn_gateup=%.1f ffn_down=%.1f\n",
+                        "ssm_in=%.1f ssm_prepare=%.1f ssm_core=%.1f ssm_out=%.1f "
+                        "ffn_gateup=%.1f ffn_down=%.1f lm_head=%.1f\n",
                 tf_decode_attn_qkv_ms / (pos - nt), tf_decode_attn_out_ms / (pos - nt),
-                tf_decode_ssm_in_ms / (pos - nt), tf_decode_ssm_core_ms / (pos - nt),
+                tf_decode_ssm_in_ms / (pos - nt), tf_decode_ssm_prepare_ms / (pos - nt),
+                tf_decode_ssm_core_ms / (pos - nt),
                 tf_decode_ssm_out_ms / (pos - nt),
-                tf_decode_ffn_gateup_ms / (pos - nt), tf_decode_ffn_down_ms / (pos - nt));
+                tf_decode_ffn_gateup_ms / (pos - nt), tf_decode_ffn_down_ms / (pos - nt),
+                tf_decode_lm_head_ms / (pos - nt));
+    }
+    if (getenv("TF_NULL_GEMM") && pos > nt) {
+        double stream_gbs = tf_decode_null_bytes / (dt * 1e9);
+        double bytes_per_tok = tf_decode_null_bytes / (double)(pos - nt);
+        fprintf(stderr, "qwen38: null-stream=%.3f GB/tok %.1f GB/s; "
+                "20 tok/s requires %.1f GB/s (equiv %.2f tok/s)\n",
+                bytes_per_tok / 1e9, stream_gbs,
+                20.0 * bytes_per_tok / 1e9,
+                stream_gbs / (bytes_per_tok / 1e9));
     }
 
     free(tok);

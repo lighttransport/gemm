@@ -24,6 +24,8 @@
 
 static void die(const char *s) { perror(s); exit(1); }
 static long env_rank(void) {
+    const char *logical = getenv("Q38TP_RANK");
+    if (logical && *logical) return strtol(logical, NULL, 10);
     const char *names[] = {"PMIX_RANK", "OMPI_COMM_WORLD_RANK", "PMI_RANK", "MV2_COMM_WORLD_RANK"};
     for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
         const char *v = getenv(names[i]); if (v && *v) return strtol(v, NULL, 10);
@@ -31,6 +33,8 @@ static long env_rank(void) {
     return -1;
 }
 static long env_size(void) {
+    const char *logical = getenv("Q38TP_SIZE");
+    if (logical && *logical) return strtol(logical, NULL, 10);
     const char *names[] = {"PMIX_SIZE", "OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MV2_COMM_WORLD_SIZE", "PJM_MPI_PROC"};
     for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
         const char *v = getenv(names[i]); if (v && *v) return strtol(v, NULL, 10);
@@ -41,6 +45,16 @@ static void tp_range(int n, int parts, int rank, int *lo, int *hi) {
     int base = n / parts, rem = n % parts;
     *lo = rank * base + (rank < rem ? rank : rem);
     *hi = *lo + base + (rank < rem);
+}
+/* Keep this in lockstep with transformer_tp_slice_weights().  The runtime
+ * rounds the FFN shard width to 256 so the local SVE kernels retain their
+ * preferred tile shape; the final rank is clipped to the source width. */
+static void tp_chunk_range(int n, int parts, int rank, int *lo, int *hi) {
+    int chunk = ((n + parts - 1) / parts + 255) & ~255;
+    *lo = rank * chunk;
+    *hi = *lo + chunk;
+    if (*lo > n) *lo = n;
+    if (*hi > n) *hi = n;
 }
 static uint64_t align_up(uint64_t x, uint64_t a) { return (x + a - 1) & ~(a - 1); }
 static int mkdir_p(const char *path) {
@@ -128,25 +142,52 @@ static int tensor_index(const gguf_context *g, const char *name) {
     return -1;
 }
 
+static uint64_t tensor_row_bytes(uint32_t type, int cols) {
+    if (type == GGML_TYPE_BF16 || type == GGML_TYPE_F16) return (uint64_t)cols * 2u;
+    if (type == GGML_TYPE_Q8_0) {
+        if (cols <= 0 || (cols % 32) != 0) return 0;
+        return (uint64_t)(cols / 32) * 34u;
+    }
+    return 0;
+}
+
 static int make_entry(const gguf_context *g, int ti, int rank, int size,
                       q38tp_entry *e) {
     const char *name = gguf_tensor_name(g, ti), *suf = NULL;
     int l = -1, kind = 0, r0 = 0, r1 = 0, c0 = 0, c1 = 0, qk = 0;
     const gguf_tensor_info *t = &g->tensors[ti];
-    if (t->n_dims != 2 || t->type != GGML_TYPE_BF16) return 0;
+    if (t->n_dims != 2 || (t->type != GGML_TYPE_BF16 && t->type != GGML_TYPE_Q8_0)) return 0;
     int cols = (int)t->dims[0], rows = (int)t->dims[1];
+    uint64_t src_rb = tensor_row_bytes(t->type, cols);
+    if (!src_rb) return 0;
     if (!strcmp(name, "output.weight")) {
-        kind = Q38TP_SLICE_ROWS; tp_range(rows, size, rank, &r0, &r1); c1 = cols;
+        kind = Q38TP_SLICE_ROWS;
+        int chunk = ((rows + size - 1) / size + 31) & ~31;
+        r0 = rank * chunk; r1 = r0 + chunk;
+        if (r0 > rows) r0 = rows;
+        if (r1 > rows) r1 = rows;
+        c1 = cols;
     } else if (parse_block_name(name, &l, &suf) && l >= 0 && l < 64) {
         int attn = ((l + 1) % 4 == 0);
+        int kv_rep = 4 % size != 0;
         if (!strcmp(suf, "ffn_gate.weight") || !strcmp(suf, "ffn_up.weight")) {
-            kind = Q38TP_SLICE_ROWS; tp_range(rows, size, rank, &r0, &r1); c1 = cols;
+            kind = Q38TP_SLICE_ROWS; tp_chunk_range(rows, size, rank, &r0, &r1); c1 = cols;
         } else if (!strcmp(suf, "ffn_down.weight")) {
-            kind = Q38TP_SLICE_COLS; r1 = rows; tp_range(cols, size, rank, &c0, &c1);
-        } else if (attn && (!strcmp(suf, "attn_q.weight") || !strcmp(suf, "attn_k.weight") || !strcmp(suf, "attn_v.weight"))) {
-            kind = Q38TP_SLICE_ROWS; tp_range(rows, size, rank, &r0, &r1); c1 = cols;
+            kind = Q38TP_SLICE_COLS; r1 = rows; tp_chunk_range(cols, size, rank, &c0, &c1);
+        } else if (attn && !strcmp(suf, "attn_q.weight")) {
+            kind = Q38TP_SLICE_ROWS;
+            int h0,h1,nh=rows/(2*128);tp_range(nh,size,rank,&h0,&h1);
+            r0=h0*2*128;r1=h1*2*128;
+            c1 = cols;
+        } else if (attn && (!strcmp(suf, "attn_k.weight") || !strcmp(suf, "attn_v.weight"))) {
+            kind = Q38TP_SLICE_ROWS;
+            if (kv_rep) { r0 = 0; r1 = rows; }
+            else { tp_range(rows, size, rank, &r0, &r1); }
+            c1 = cols;
         } else if (attn && !strcmp(suf, "attn_output.weight")) {
-            kind = Q38TP_SLICE_COLS; r1 = rows; tp_range(cols, size, rank, &c0, &c1);
+            kind = Q38TP_SLICE_COLS; r1 = rows;
+            int h0,h1,nh=cols/128;tp_range(nh,size,rank,&h0,&h1);
+            c0=h0*128;c1=h1*128;
         } else if (!attn && (!strcmp(suf, "attn_gate.weight") || !strcmp(suf, "ssm_alpha.weight") || !strcmp(suf, "ssm_beta.weight"))) {
             kind = Q38TP_SLICE_ROWS; tp_range(rows, size, rank, &r0, &r1); c1 = cols;
         } else if (!attn && !strcmp(suf, "attn_qkv.weight")) {
@@ -166,7 +207,10 @@ static int make_entry(const gguf_context *g, int ti, int rank, int size,
     e->col0 = (uint32_t)c0; e->col1 = (uint32_t)c1; e->qk_rows = (uint32_t)qk;
     e->local_rows = (uint32_t)(kind == Q38TP_SLICE_SSM_ROWS ? qk + r1 - r0 : r1 - r0);
     e->local_cols = (uint32_t)(kind == Q38TP_SLICE_COLS ? c1 - c0 : cols);
-    e->byte_length = (uint64_t)e->local_rows * e->local_cols * 2u;
+    e->source_row_bytes = src_rb;
+    e->local_row_bytes = tensor_row_bytes(t->type, (int)e->local_cols);
+    if (!e->local_row_bytes) return 0;
+    e->byte_length = (uint64_t)e->local_rows * e->local_row_bytes;
     return 1;
 }
 
@@ -175,8 +219,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s MODEL-00001-of-N.gguf STAGE_DIR\n", argv[0]); return 2;
     }
     long rank = env_rank(), size = env_size();
-    if (rank < 0 || (size != 2 && size != 4) || rank >= size) {
-        fprintf(stderr, "qwen38_tp_stage: requires an mpiexec -np 2 or -np 4 launch (rank=%ld size=%ld)\n", rank, size); return 2;
+    if (rank < 0 || (size != 4 && size != 6 && size != 12) || rank >= size) {
+        fprintf(stderr, "qwen38_tp_stage: requires an mpiexec -np 4, -np 6, or -np 12 launch (rank=%ld size=%ld)\n", rank, size); return 2;
     }
     gguf_context *g = gguf_open_multi(argv[1], 2);
     if (!g) { fprintf(stderr, "qwen38_tp_stage: cannot open %s\n", argv[1]); return 3; }
@@ -232,16 +276,27 @@ int main(int argc, char **argv) {
         q38tp_entry *e = &h->entries[i];
         int ti = tensor_index(g, e->name); if (ti < 0) { fprintf(stderr, "missing %s\n", e->name); return 5; }
         const gguf_tensor_info *t = &g->tensors[ti];
-        uint64_t src_rb = (uint64_t)t->dims[0] * 2u;
-        int sfd = g->tensor_fds[ti]; uint64_t soff = g->tensor_file_offsets[ti];
+        uint64_t src_rb = tensor_row_bytes(t->type, (int)t->dims[0]);
+        if (!src_rb || src_rb != e->source_row_bytes || e->local_row_bytes !=
+            tensor_row_bytes(t->type, (int)e->local_cols)) {
+            fprintf(stderr, "qwen38_tp_stage: row layout mismatch %s\n", e->name);
+            return 5;
+        }
+        int sfd = g->tensor_fds ? g->tensor_fds[ti] : g->fd;
+        uint64_t soff = g->tensor_file_offsets ? g->tensor_file_offsets[ti]
+                                               : (uint64_t)g->data_offset + t->offset;
         off = align_up(off, 256); e->file_offset = off; uint64_t hash = 0;
         int rc = 0;
         if (e->kind == Q38TP_SLICE_ROWS) {
             uint64_t n = (uint64_t)(e->row1 - e->row0) * src_rb;
             rc = copy_contiguous(sfd, soff + (uint64_t)e->row0 * src_rb, out, off, n, &hash);
         } else if (e->kind == Q38TP_SLICE_COLS) {
+            uint64_t byte0 = t->type == GGML_TYPE_Q8_0
+                           ? (uint64_t)(e->col0 / 32u) * 34u
+                           : (uint64_t)e->col0 * 2u;
             rc = copy_columns(sfd, soff, out, off, e->source_rows, src_rb,
-                              (uint64_t)e->col0 * 2u, (uint64_t)e->local_cols * 2u, &hash);
+                              byte0,
+                              e->local_row_bytes, &hash);
         } else {
             uint64_t qbytes = (uint64_t)e->qk_rows * src_rb;
             rc = copy_contiguous(sfd, soff, out, off, qbytes, &hash);

@@ -1191,6 +1191,251 @@ static inline float vec_dot_q8_0_f32(const void *q8_row, const float *x, int K) 
     return svaddv_f32(pg, svadd_x(pg, acc0, acc1));
 }
 
+/* Exact four-row Q8_0 matvec.  This is the lower-register-pressure sibling
+ * of the eight-row kernel.  The block traversal and two partial sums per row
+ * intentionally match vec_dot_q8_0_f32. */
+static inline void matvec_q8_0_4row_f32(float *dst, const void *q8_rows,
+                                         const float *x, int K) {
+    const size_t row_bytes = (size_t)(K / 32) * sizeof(block_q8_0);
+    const block_q8_0 *r = (const block_q8_0 *)q8_rows;
+    const int vl = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    svfloat32_t a00=svdup_f32(0), a01=svdup_f32(0), a10=svdup_f32(0), a11=svdup_f32(0);
+    svfloat32_t a20=svdup_f32(0), a21=svdup_f32(0), a30=svdup_f32(0), a31=svdup_f32(0);
+    const int nb = K / 32;
+    for (int b = 0; b < nb; b++) {
+        const block_q8_0 *w0 = (const block_q8_0 *)((const uint8_t *)r + 0 * row_bytes) + b;
+        const block_q8_0 *w1 = (const block_q8_0 *)((const uint8_t *)r + 1 * row_bytes) + b;
+        const block_q8_0 *w2 = (const block_q8_0 *)((const uint8_t *)r + 2 * row_bytes) + b;
+        const block_q8_0 *w3 = (const block_q8_0 *)((const uint8_t *)r + 3 * row_bytes) + b;
+        const svfloat32_t d0=svdup_f32(ggml_fp16_to_fp32(w0->d));
+        const svfloat32_t d1=svdup_f32(ggml_fp16_to_fp32(w1->d));
+        const svfloat32_t d2=svdup_f32(ggml_fp16_to_fp32(w2->d));
+        const svfloat32_t d3=svdup_f32(ggml_fp16_to_fp32(w3->d));
+        const float *xp = x + b * 32;
+        for (int j = 0; j < 32; j += vl) {
+            svbool_t pt = (j + vl <= 32) ? pg : svwhilelt_b32((uint64_t)j, (uint64_t)32);
+            svfloat32_t xv = svld1(pt, xp + j);
+            svfloat32_t v0=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,w0->qs+j)), d0);
+            svfloat32_t v1=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,w1->qs+j)), d1);
+            svfloat32_t v2=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,w2->qs+j)), d2);
+            svfloat32_t v3=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,w3->qs+j)), d3);
+            if ((j / vl) & 1) {
+                a01=svmla_x(pt,a01,v0,xv); a11=svmla_x(pt,a11,v1,xv);
+                a21=svmla_x(pt,a21,v2,xv); a31=svmla_x(pt,a31,v3,xv);
+            } else {
+                a00=svmla_x(pt,a00,v0,xv); a10=svmla_x(pt,a10,v1,xv);
+                a20=svmla_x(pt,a20,v2,xv); a30=svmla_x(pt,a30,v3,xv);
+            }
+        }
+    }
+    dst[0]=svaddv_f32(pg,svadd_x(pg,a00,a01)); dst[1]=svaddv_f32(pg,svadd_x(pg,a10,a11));
+    dst[2]=svaddv_f32(pg,svadd_x(pg,a20,a21)); dst[3]=svaddv_f32(pg,svadd_x(pg,a30,a31));
+}
+
+/* Exact two-row Q8_0 matvec.  The activation load is shared by the pair and
+ * the small live state leaves the compiler maximum freedom to keep the
+ * accumulators in registers. */
+static inline void matvec_q8_0_2row_f32(float *dst, const void *q8_rows,
+                                         const float *x, int K) {
+    const size_t row_bytes = (size_t)(K / 32) * sizeof(block_q8_0);
+    const block_q8_0 *r = (const block_q8_0 *)q8_rows;
+    const int vl = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    svfloat32_t a00=svdup_f32(0), a01=svdup_f32(0), a10=svdup_f32(0), a11=svdup_f32(0);
+    const int nb = K / 32;
+    for (int b = 0; b < nb; b++) {
+        const block_q8_0 *w0 = (const block_q8_0 *)((const uint8_t *)r + 0 * row_bytes) + b;
+        const block_q8_0 *w1 = (const block_q8_0 *)((const uint8_t *)r + 1 * row_bytes) + b;
+        const svfloat32_t d0=svdup_f32(ggml_fp16_to_fp32(w0->d));
+        const svfloat32_t d1=svdup_f32(ggml_fp16_to_fp32(w1->d));
+        const float *xp = x + b * 32;
+        for (int j = 0; j < 32; j += vl) {
+            svbool_t pt = (j + vl <= 32) ? pg : svwhilelt_b32((uint64_t)j, (uint64_t)32);
+            svfloat32_t xv = svld1(pt, xp + j);
+            svfloat32_t v0=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,w0->qs+j)), d0);
+            svfloat32_t v1=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,w1->qs+j)), d1);
+            if ((j / vl) & 1) {
+                a01=svmla_x(pt,a01,v0,xv); a11=svmla_x(pt,a11,v1,xv);
+            } else {
+                a00=svmla_x(pt,a00,v0,xv); a10=svmla_x(pt,a10,v1,xv);
+            }
+        }
+    }
+    dst[0]=svaddv_f32(pg,svadd_x(pg,a00,a01)); dst[1]=svaddv_f32(pg,svadd_x(pg,a10,a11));
+}
+
+/* Exact Q8_0 eight-row matvec for decode.  Every row uses the same two
+ * accumulators and block order as vec_dot_q8_0_f32; rows are merely evaluated
+ * together so the activation vectors are loaded once for all eight rows. */
+static inline void matvec_q8_0_8row_f32(float *dst, const void *q8_rows,
+                                         const float *x, int K) {
+    const size_t row_bytes = (size_t)(K / 32) * sizeof(block_q8_0);
+    const block_q8_0 *r = (const block_q8_0 *)q8_rows;
+    const int vl = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    svfloat32_t a00=svdup_f32(0), a01=svdup_f32(0), a10=svdup_f32(0), a11=svdup_f32(0);
+    svfloat32_t a20=svdup_f32(0), a21=svdup_f32(0), a30=svdup_f32(0), a31=svdup_f32(0);
+    svfloat32_t a40=svdup_f32(0), a41=svdup_f32(0), a50=svdup_f32(0), a51=svdup_f32(0);
+    svfloat32_t a60=svdup_f32(0), a61=svdup_f32(0), a70=svdup_f32(0), a71=svdup_f32(0);
+    const int nb = K / 32;
+    for (int b = 0; b < nb; b++) {
+        const block_q8_0 *w0 = (const block_q8_0 *)((const uint8_t *)r + 0 * row_bytes) + b;
+        const block_q8_0 *w1 = (const block_q8_0 *)((const uint8_t *)r + 1 * row_bytes) + b;
+        const block_q8_0 *w2 = (const block_q8_0 *)((const uint8_t *)r + 2 * row_bytes) + b;
+        const block_q8_0 *w3 = (const block_q8_0 *)((const uint8_t *)r + 3 * row_bytes) + b;
+        const block_q8_0 *w4 = (const block_q8_0 *)((const uint8_t *)r + 4 * row_bytes) + b;
+        const block_q8_0 *w5 = (const block_q8_0 *)((const uint8_t *)r + 5 * row_bytes) + b;
+        const block_q8_0 *w6 = (const block_q8_0 *)((const uint8_t *)r + 6 * row_bytes) + b;
+        const block_q8_0 *w7 = (const block_q8_0 *)((const uint8_t *)r + 7 * row_bytes) + b;
+        const svfloat32_t d0=svdup_f32(ggml_fp16_to_fp32(w0->d));
+        const svfloat32_t d1=svdup_f32(ggml_fp16_to_fp32(w1->d));
+        const svfloat32_t d2=svdup_f32(ggml_fp16_to_fp32(w2->d));
+        const svfloat32_t d3=svdup_f32(ggml_fp16_to_fp32(w3->d));
+        const svfloat32_t d4=svdup_f32(ggml_fp16_to_fp32(w4->d));
+        const svfloat32_t d5=svdup_f32(ggml_fp16_to_fp32(w5->d));
+        const svfloat32_t d6=svdup_f32(ggml_fp16_to_fp32(w6->d));
+        const svfloat32_t d7=svdup_f32(ggml_fp16_to_fp32(w7->d));
+        const int8_t *q0=w0->qs, *q1=w1->qs, *q2=w2->qs, *q3=w3->qs;
+        const int8_t *q4=w4->qs, *q5=w5->qs, *q6=w6->qs, *q7=w7->qs;
+        const float *xp = x + b * 32;
+        for (int j = 0; j < 32; j += vl) {
+            svbool_t pt = (j + vl <= 32) ? pg : svwhilelt_b32((uint64_t)j, (uint64_t)32);
+            svfloat32_t xv = svld1(pt, xp + j);
+            svfloat32_t v0=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,q0+j)), d0);
+            svfloat32_t v1=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,q1+j)), d1);
+            svfloat32_t v2=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,q2+j)), d2);
+            svfloat32_t v3=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,q3+j)), d3);
+            svfloat32_t v4=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,q4+j)), d4);
+            svfloat32_t v5=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,q5+j)), d5);
+            svfloat32_t v6=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,q6+j)), d6);
+            svfloat32_t v7=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,q7+j)), d7);
+            if ((j / vl) & 1) {
+                a01=svmla_x(pt,a01,v0,xv); a11=svmla_x(pt,a11,v1,xv);
+                a21=svmla_x(pt,a21,v2,xv); a31=svmla_x(pt,a31,v3,xv);
+                a41=svmla_x(pt,a41,v4,xv); a51=svmla_x(pt,a51,v5,xv);
+                a61=svmla_x(pt,a61,v6,xv); a71=svmla_x(pt,a71,v7,xv);
+            } else {
+                a00=svmla_x(pt,a00,v0,xv); a10=svmla_x(pt,a10,v1,xv);
+                a20=svmla_x(pt,a20,v2,xv); a30=svmla_x(pt,a30,v3,xv);
+                a40=svmla_x(pt,a40,v4,xv); a50=svmla_x(pt,a50,v5,xv);
+                a60=svmla_x(pt,a60,v6,xv); a70=svmla_x(pt,a70,v7,xv);
+            }
+        }
+    }
+    dst[0]=svaddv_f32(pg,svadd_x(pg,a00,a01)); dst[1]=svaddv_f32(pg,svadd_x(pg,a10,a11));
+    dst[2]=svaddv_f32(pg,svadd_x(pg,a20,a21)); dst[3]=svaddv_f32(pg,svadd_x(pg,a30,a31));
+    dst[4]=svaddv_f32(pg,svadd_x(pg,a40,a41)); dst[5]=svaddv_f32(pg,svadd_x(pg,a50,a51));
+    dst[6]=svaddv_f32(pg,svadd_x(pg,a60,a61)); dst[7]=svaddv_f32(pg,svadd_x(pg,a70,a71));
+}
+
+/* Exact four-row pair.  This is used for SwiGLU gate/up: both matrices see
+ * the same activation, so load it once while retaining the scalar reference's
+ * two-accumulator block order for every output row. */
+static inline void matvec_q8_0_4row_fused2_f32(
+        float *d1, float *d2, const void *w1_rows, const void *w2_rows,
+        const float *x, int K) {
+    const size_t row_bytes = (size_t)(K / 32) * sizeof(block_q8_0);
+    const block_q8_0 *a = (const block_q8_0 *)w1_rows;
+    const block_q8_0 *b = (const block_q8_0 *)w2_rows;
+    const int vl = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    svfloat32_t a00=svdup_f32(0), a01=svdup_f32(0), a10=svdup_f32(0), a11=svdup_f32(0);
+    svfloat32_t a20=svdup_f32(0), a21=svdup_f32(0), a30=svdup_f32(0), a31=svdup_f32(0);
+    svfloat32_t b00=svdup_f32(0), b01=svdup_f32(0), b10=svdup_f32(0), b11=svdup_f32(0);
+    svfloat32_t b20=svdup_f32(0), b21=svdup_f32(0), b30=svdup_f32(0), b31=svdup_f32(0);
+    const int nb = K / 32;
+    for (int k = 0; k < nb; k++) {
+        const block_q8_0 *a0 = (const block_q8_0 *)((const uint8_t *)a + 0 * row_bytes) + k;
+        const block_q8_0 *a1 = (const block_q8_0 *)((const uint8_t *)a + 1 * row_bytes) + k;
+        const block_q8_0 *a2 = (const block_q8_0 *)((const uint8_t *)a + 2 * row_bytes) + k;
+        const block_q8_0 *a3 = (const block_q8_0 *)((const uint8_t *)a + 3 * row_bytes) + k;
+        const block_q8_0 *b0 = (const block_q8_0 *)((const uint8_t *)b + 0 * row_bytes) + k;
+        const block_q8_0 *b1 = (const block_q8_0 *)((const uint8_t *)b + 1 * row_bytes) + k;
+        const block_q8_0 *b2 = (const block_q8_0 *)((const uint8_t *)b + 2 * row_bytes) + k;
+        const block_q8_0 *b3 = (const block_q8_0 *)((const uint8_t *)b + 3 * row_bytes) + k;
+        const svfloat32_t da0=svdup_f32(ggml_fp16_to_fp32(a0->d));
+        const svfloat32_t da1=svdup_f32(ggml_fp16_to_fp32(a1->d));
+        const svfloat32_t da2=svdup_f32(ggml_fp16_to_fp32(a2->d));
+        const svfloat32_t da3=svdup_f32(ggml_fp16_to_fp32(a3->d));
+        const svfloat32_t db0=svdup_f32(ggml_fp16_to_fp32(b0->d));
+        const svfloat32_t db1=svdup_f32(ggml_fp16_to_fp32(b1->d));
+        const svfloat32_t db2=svdup_f32(ggml_fp16_to_fp32(b2->d));
+        const svfloat32_t db3=svdup_f32(ggml_fp16_to_fp32(b3->d));
+        const float *xp = x + k * 32;
+        for (int j = 0; j < 32; j += vl) {
+            svbool_t pt = (j + vl <= 32) ? pg : svwhilelt_b32((uint64_t)j, (uint64_t)32);
+            svfloat32_t xv = svld1(pt, xp + j);
+            svfloat32_t va0=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,a0->qs+j)), da0);
+            svfloat32_t va1=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,a1->qs+j)), da1);
+            svfloat32_t va2=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,a2->qs+j)), da2);
+            svfloat32_t va3=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,a3->qs+j)), da3);
+            svfloat32_t vb0=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,b0->qs+j)), db0);
+            svfloat32_t vb1=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,b1->qs+j)), db1);
+            svfloat32_t vb2=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,b2->qs+j)), db2);
+            svfloat32_t vb3=svmul_x(pt, svcvt_f32_s32_x(pt, svld1sb_s32(pt,b3->qs+j)), db3);
+            if ((j / vl) & 1) {
+                a01=svmla_x(pt,a01,va0,xv); a11=svmla_x(pt,a11,va1,xv);
+                a21=svmla_x(pt,a21,va2,xv); a31=svmla_x(pt,a31,va3,xv);
+                b01=svmla_x(pt,b01,vb0,xv); b11=svmla_x(pt,b11,vb1,xv);
+                b21=svmla_x(pt,b21,vb2,xv); b31=svmla_x(pt,b31,vb3,xv);
+            } else {
+                a00=svmla_x(pt,a00,va0,xv); a10=svmla_x(pt,a10,va1,xv);
+                a20=svmla_x(pt,a20,va2,xv); a30=svmla_x(pt,a30,va3,xv);
+                b00=svmla_x(pt,b00,vb0,xv); b10=svmla_x(pt,b10,vb1,xv);
+                b20=svmla_x(pt,b20,vb2,xv); b30=svmla_x(pt,b30,vb3,xv);
+            }
+        }
+    }
+    d1[0]=svaddv_f32(pg,svadd_x(pg,a00,a01)); d1[1]=svaddv_f32(pg,svadd_x(pg,a10,a11));
+    d1[2]=svaddv_f32(pg,svadd_x(pg,a20,a21)); d1[3]=svaddv_f32(pg,svadd_x(pg,a30,a31));
+    d2[0]=svaddv_f32(pg,svadd_x(pg,b00,b01)); d2[1]=svaddv_f32(pg,svadd_x(pg,b10,b11));
+    d2[2]=svaddv_f32(pg,svadd_x(pg,b20,b21)); d2[3]=svaddv_f32(pg,svadd_x(pg,b30,b31));
+}
+
+/* Lower-register exact gate/up pair.  It computes two rows from each matrix
+ * per call, retaining the same two partial sums as vec_dot_q8_0_f32. */
+static inline void matvec_q8_0_2row_fused2_f32(
+        float *d1, float *d2, const void *w1_rows, const void *w2_rows,
+        const float *x, int K) {
+    const size_t row_bytes = (size_t)(K / 32) * sizeof(block_q8_0);
+    const block_q8_0 *a = (const block_q8_0 *)w1_rows;
+    const block_q8_0 *b = (const block_q8_0 *)w2_rows;
+    const int vl = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    svfloat32_t a00=svdup_f32(0),a01=svdup_f32(0),a10=svdup_f32(0),a11=svdup_f32(0);
+    svfloat32_t b00=svdup_f32(0),b01=svdup_f32(0),b10=svdup_f32(0),b11=svdup_f32(0);
+    const int nb = K / 32;
+    for (int k = 0; k < nb; k++) {
+        const block_q8_0 *a0=(const block_q8_0 *)((const uint8_t *)a+0*row_bytes)+k;
+        const block_q8_0 *a1=(const block_q8_0 *)((const uint8_t *)a+1*row_bytes)+k;
+        const block_q8_0 *b0=(const block_q8_0 *)((const uint8_t *)b+0*row_bytes)+k;
+        const block_q8_0 *b1=(const block_q8_0 *)((const uint8_t *)b+1*row_bytes)+k;
+        svfloat32_t da0=svdup_f32(ggml_fp16_to_fp32(a0->d));
+        svfloat32_t da1=svdup_f32(ggml_fp16_to_fp32(a1->d));
+        svfloat32_t db0=svdup_f32(ggml_fp16_to_fp32(b0->d));
+        svfloat32_t db1=svdup_f32(ggml_fp16_to_fp32(b1->d));
+        const float *xp=x+k*32;
+        for (int j=0;j<32;j+=vl) {
+            svbool_t pt=(j+vl<=32)?pg:svwhilelt_b32((uint64_t)j,(uint64_t)32);
+            svfloat32_t xv=svld1(pt,xp+j);
+            svfloat32_t va0=svmul_x(pt,svcvt_f32_s32_x(pt,svld1sb_s32(pt,a0->qs+j)),da0);
+            svfloat32_t va1=svmul_x(pt,svcvt_f32_s32_x(pt,svld1sb_s32(pt,a1->qs+j)),da1);
+            svfloat32_t vb0=svmul_x(pt,svcvt_f32_s32_x(pt,svld1sb_s32(pt,b0->qs+j)),db0);
+            svfloat32_t vb1=svmul_x(pt,svcvt_f32_s32_x(pt,svld1sb_s32(pt,b1->qs+j)),db1);
+            if ((j/vl)&1) {
+                a01=svmla_x(pt,a01,va0,xv); a11=svmla_x(pt,a11,va1,xv);
+                b01=svmla_x(pt,b01,vb0,xv); b11=svmla_x(pt,b11,vb1,xv);
+            } else {
+                a00=svmla_x(pt,a00,va0,xv); a10=svmla_x(pt,a10,va1,xv);
+                b00=svmla_x(pt,b00,vb0,xv); b10=svmla_x(pt,b10,vb1,xv);
+            }
+        }
+    }
+    d1[0]=svaddv_f32(pg,svadd_x(pg,a00,a01)); d1[1]=svaddv_f32(pg,svadd_x(pg,a10,a11));
+    d2[0]=svaddv_f32(pg,svadd_x(pg,b00,b01)); d2[1]=svaddv_f32(pg,svadd_x(pg,b10,b11));
+}
+
 static inline void matvec_q8_0_f32(float *dst, const void *q8_row, const float *x, int K) {
     *dst = vec_dot_q8_0_f32(q8_row, x, K);
 }
@@ -1198,10 +1443,43 @@ static inline void matvec_q8_0_f32(float *dst, const void *q8_row, const float *
 static inline void gemm_q8_0_f32_tokmajor(float *Y, const void *W, const float *X,
                                             int n_rows, int K, int N, int Y_stride, int X_stride) {
     const size_t row_bytes = (size_t)(K / 32) * sizeof(block_q8_0);
+    const int nb = K / 32, vl = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
     for (int r = 0; r < n_rows; r++) {
-        const void *wr = (const uint8_t *)W + (size_t)r * row_bytes;
-        for (int t = 0; t < N; t++)
-            Y[t * Y_stride + r] = vec_dot_q8_0_f32(wr, X + (size_t)t * X_stride, K);
+        const block_q8_0 *wr = (const block_q8_0 *)((const uint8_t *)W + (size_t)r * row_bytes);
+        int t = 0;
+        for (; t + 3 < N; t += 4) {
+            const float *x0=X+(size_t)(t+0)*X_stride,*x1=X+(size_t)(t+1)*X_stride;
+            const float *x2=X+(size_t)(t+2)*X_stride,*x3=X+(size_t)(t+3)*X_stride;
+            svfloat32_t a00=svdup_f32(0),a01=svdup_f32(0),a10=svdup_f32(0),a11=svdup_f32(0);
+            svfloat32_t a20=svdup_f32(0),a21=svdup_f32(0),a30=svdup_f32(0),a31=svdup_f32(0);
+            for (int b = 0; b < nb; b++) {
+                svfloat32_t d = svdup_f32(ggml_fp16_to_fp32(wr[b].d));
+                int base = b * 32;
+                for (int j = 0; j < 32; j += vl) {
+                    svbool_t pt = j + vl <= 32 ? pg : svwhilelt_b32((uint64_t)j, (uint64_t)32);
+                    svfloat32_t q = svmul_x(pt,
+                        svcvt_f32_s32_x(pt, svld1sb_s32(pt, wr[b].qs + j)), d);
+                    if ((j / vl) & 1) {
+                        a01=svmla_x(pt,a01,q,svld1(pt,x0+base+j));
+                        a11=svmla_x(pt,a11,q,svld1(pt,x1+base+j));
+                        a21=svmla_x(pt,a21,q,svld1(pt,x2+base+j));
+                        a31=svmla_x(pt,a31,q,svld1(pt,x3+base+j));
+                    } else {
+                        a00=svmla_x(pt,a00,q,svld1(pt,x0+base+j));
+                        a10=svmla_x(pt,a10,q,svld1(pt,x1+base+j));
+                        a20=svmla_x(pt,a20,q,svld1(pt,x2+base+j));
+                        a30=svmla_x(pt,a30,q,svld1(pt,x3+base+j));
+                    }
+                }
+            }
+            Y[(size_t)(t+0)*Y_stride+r]=svaddv_f32(pg,svadd_x(pg,a00,a01));
+            Y[(size_t)(t+1)*Y_stride+r]=svaddv_f32(pg,svadd_x(pg,a10,a11));
+            Y[(size_t)(t+2)*Y_stride+r]=svaddv_f32(pg,svadd_x(pg,a20,a21));
+            Y[(size_t)(t+3)*Y_stride+r]=svaddv_f32(pg,svadd_x(pg,a30,a31));
+        }
+        for (; t < N; t++)
+            Y[(size_t)t * Y_stride + r] = vec_dot_q8_0_f32(wr, X + (size_t)t * X_stride, K);
     }
 }
 
@@ -1396,8 +1674,34 @@ static inline void matvec_bf16_8row(float *dst,
     svbool_t pg = svptrue_b32(), pgh = svptrue_b16();
     svuint16_t zero = svdup_u16(0);
 
+    /* Optional two-stage HBM->cache prefetch for the source-equivalent BF16
+     * layout.  The PV layout has its own prefetch path below; this is the
+     * production TP4 layout (TP_STAGE_BF16_PV=0).  Keep it opt-in because
+     * A64FX's hardware prefetch depth is topology-sensitive. */
+    static int pf_done = 0, pf_on = 0, pf_dist = 8;
+    if (__builtin_expect(!pf_done, 0)) {
+        const char *e = getenv("TF_BF16_ROW_PREFETCH");
+        pf_on = e && *e && *e != '0';
+        const char *d = getenv("TF_BF16_ROW_PREFETCH_DIST");
+        if (d && *d) {
+            int v = atoi(d);
+            if (v >= 1 && v <= 64) pf_dist = v;
+        }
+        pf_done = 1;
+    }
+
     /* zip widen, 2*VL/iter: x loaded once (lo+hi), amortized across 8 weight streams */
     for (; i + vlh - 1 < n; i += vlh) {
+        if (pf_on && i + pf_dist < n) {
+            __builtin_prefetch(w0 + i + pf_dist, 0, 0);
+            __builtin_prefetch(w1 + i + pf_dist, 0, 0);
+            __builtin_prefetch(w2 + i + pf_dist, 0, 0);
+            __builtin_prefetch(w3 + i + pf_dist, 0, 0);
+            __builtin_prefetch(w4 + i + pf_dist, 0, 0);
+            __builtin_prefetch(w5 + i + pf_dist, 0, 0);
+            __builtin_prefetch(w6 + i + pf_dist, 0, 0);
+            __builtin_prefetch(w7 + i + pf_dist, 0, 0);
+        }
         svfloat32_t vxl = svld1(pg, &x[i]), vxh = svld1(pg, &x[i + vl]);
         svfloat32_t wl, wh;
         SVE_BF16_ZIP(svld1_u16(pgh,&w0[i]),zero,wl,wh); a0l=svmla_x(pg,a0l,wl,vxl); a0h=svmla_x(pg,a0h,wh,vxh);
@@ -1635,33 +1939,40 @@ static inline void matvec_bf16_8row_pv(float *dst,
                                     svand_n_u16_x(p_all_h, idx_h, 1), 0);
 
     int vl = (int)svcntw();
-    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
-    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
-    svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f);
-    svfloat32_t a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
+    /* Match matvec_bf16_8row's reduction tree: alternate 16-element
+     * chunks into low/high accumulators, then add the two halves.  The
+     * previous single accumulator was faster but changed rounding order and
+     * caused greedy-token divergence after several decode steps. */
+    svfloat32_t a0l=svdup_f32(0),a1l=svdup_f32(0),a2l=svdup_f32(0),a3l=svdup_f32(0);
+    svfloat32_t a4l=svdup_f32(0),a5l=svdup_f32(0),a6l=svdup_f32(0),a7l=svdup_f32(0);
+    svfloat32_t a0h=svdup_f32(0),a1h=svdup_f32(0),a2h=svdup_f32(0),a3h=svdup_f32(0);
+    svfloat32_t a4h=svdup_f32(0),a5h=svdup_f32(0),a6h=svdup_f32(0),a7h=svdup_f32(0);
     int i = 0;
     /* Lighter SW prefetch: distance 8 iters = 2 × 256 B = 2 cachelines per
      * pair stream, to L2 (locality=2). With ~12 threads/CMG × 4 pair streams
      * the HW prefetcher's ~16 slots/CMG are oversubscribed; an L2-only hint
      * provides headroom without blowing the L1. Guarded by TF_BF16PV_PREFETCH=1. */
-    static int pf_env_done = 0, pf_on = 0;
+    static int pf_env_done = 0, pf_dist = 0;
     if (__builtin_expect(!pf_env_done, 0)) {
         const char *e = getenv("TF_BF16PV_PREFETCH");
-        pf_on = (e && *e && *e != '0');
+        if (e && *e && *e != '0') pf_dist = atoi(e);
+        /* Preserve the original boolean interface while allowing measured
+         * distances to be selected directly (2, 4, 8, 12, ... chunks). */
+        if (pf_dist == 1) pf_dist = 8;
         pf_env_done = 1;
     }
-    const int PFD_HW = 8 * 32;  /* halfwords = 2 × 256-B cachelines */
+    const int pfd_hw = pf_dist * 2 * vl;
     for (; i + vl - 1 < n; i += vl) {
         /* pair[hw_base = 2*i] points at chunk c = i/vl */
         const uint16_t *ab = pAB + 2 * i;
         const uint16_t *cd = pCD + 2 * i;
         const uint16_t *ef = pEF + 2 * i;
         const uint16_t *gh = pGH + 2 * i;
-        if (pf_on) {
-            __builtin_prefetch(ab + PFD_HW, 0, 2);
-            __builtin_prefetch(cd + PFD_HW, 0, 2);
-            __builtin_prefetch(ef + PFD_HW, 0, 2);
-            __builtin_prefetch(gh + PFD_HW, 0, 2);
+        if (pf_dist) {
+            __builtin_prefetch(ab + pfd_hw, 0, 2);
+            __builtin_prefetch(cd + pfd_hw, 0, 2);
+            __builtin_prefetch(ef + pfd_hw, 0, 2);
+            __builtin_prefetch(gh + pfd_hw, 0, 2);
         }
         svuint16_t vA = svld1_u16(p_odd, ab - 1);
         svuint16_t vB = svld1_u16(p_odd, ab);
@@ -1672,21 +1983,36 @@ static inline void matvec_bf16_8row_pv(float *dst,
         svuint16_t vG = svld1_u16(p_odd, gh - 1);
         svuint16_t vH = svld1_u16(p_odd, gh);
         svfloat32_t vx = svld1(pg, &x[i]);
-        a0 = svmla_x(pg, a0, svreinterpret_f32(vA), vx);
-        a1 = svmla_x(pg, a1, svreinterpret_f32(vB), vx);
-        a2 = svmla_x(pg, a2, svreinterpret_f32(vC), vx);
-        a3 = svmla_x(pg, a3, svreinterpret_f32(vD), vx);
-        a4 = svmla_x(pg, a4, svreinterpret_f32(vE), vx);
-        a5 = svmla_x(pg, a5, svreinterpret_f32(vF), vx);
-        a6 = svmla_x(pg, a6, svreinterpret_f32(vG), vx);
-        a7 = svmla_x(pg, a7, svreinterpret_f32(vH), vx);
+        if (((i / vl) & 1) == 0) {
+            a0l = svmla_x(pg, a0l, svreinterpret_f32(vA), vx);
+            a1l = svmla_x(pg, a1l, svreinterpret_f32(vB), vx);
+            a2l = svmla_x(pg, a2l, svreinterpret_f32(vC), vx);
+            a3l = svmla_x(pg, a3l, svreinterpret_f32(vD), vx);
+            a4l = svmla_x(pg, a4l, svreinterpret_f32(vE), vx);
+            a5l = svmla_x(pg, a5l, svreinterpret_f32(vF), vx);
+            a6l = svmla_x(pg, a6l, svreinterpret_f32(vG), vx);
+            a7l = svmla_x(pg, a7l, svreinterpret_f32(vH), vx);
+        } else {
+            a0h = svmla_x(pg, a0h, svreinterpret_f32(vA), vx);
+            a1h = svmla_x(pg, a1h, svreinterpret_f32(vB), vx);
+            a2h = svmla_x(pg, a2h, svreinterpret_f32(vC), vx);
+            a3h = svmla_x(pg, a3h, svreinterpret_f32(vD), vx);
+            a4h = svmla_x(pg, a4h, svreinterpret_f32(vE), vx);
+            a5h = svmla_x(pg, a5h, svreinterpret_f32(vF), vx);
+            a6h = svmla_x(pg, a6h, svreinterpret_f32(vG), vx);
+            a7h = svmla_x(pg, a7h, svreinterpret_f32(vH), vx);
+        }
     }
     /* n is required to be a multiple of vl by the panel build constraint;
      * no tail handling needed in the kernel. */
-    dst[0] = svaddv(pg, a0); dst[1] = svaddv(pg, a1);
-    dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
-    dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
-    dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+    a0l=svadd_x(pg,a0l,a0h); a1l=svadd_x(pg,a1l,a1h);
+    a2l=svadd_x(pg,a2l,a2h); a3l=svadd_x(pg,a3l,a3h);
+    a4l=svadd_x(pg,a4l,a4h); a5l=svadd_x(pg,a5l,a5h);
+    a6l=svadd_x(pg,a6l,a6h); a7l=svadd_x(pg,a7l,a7h);
+    dst[0] = svaddv(pg, a0l); dst[1] = svaddv(pg, a1l);
+    dst[2] = svaddv(pg, a2l); dst[3] = svaddv(pg, a3l);
+    dst[4] = svaddv(pg, a4l); dst[5] = svaddv(pg, a5l);
+    dst[6] = svaddv(pg, a6l); dst[7] = svaddv(pg, a7l);
 }
 
 /* Accumulating K-tile variant of matvec_bf16_8row_pv, for the batched (M>1)
@@ -1817,7 +2143,7 @@ static inline void matvec_sdot_8row(float *dst,
         const uint8_t *blk = group + (size_t)b * 528;
         const uint16_t *scl = (const uint16_t *)blk;
         const int8_t *qs    = (const int8_t *)(blk + 16);
-        float xs = xscale[b];   /* fp32 activation scale (WS6: fp16 overflowed to Inf for amax>~8.3e6 -> 0*Inf=NaN) */
+        float xs = xscale[b];
         svint8_t xv = svld1_s8(pb, xq + (size_t)b * 64);
         #define SDOT_ROW(R, ACC)                                              \
             do {                                                              \
@@ -1835,6 +2161,78 @@ static inline void matvec_sdot_8row(float *dst,
     dst[2] = svaddv(pg, a2); dst[3] = svaddv(pg, a3);
     dst[4] = svaddv(pg, a4); dst[5] = svaddv(pg, a5);
     dst[6] = svaddv(pg, a6); dst[7] = svaddv(pg, a7);
+}
+
+/* Decode-only packed Q8_0 layout: original per-32 scales and q bytes are
+ * retained, with a 544-byte block (16 fp16 scales + 512 q bytes). */
+static inline void matvec_sdot_8row_q8orig(float *dst, const uint8_t *group,
+                                            const int8_t *xq, const float *xscale,
+                                            int K) {
+    svbool_t pg = svptrue_b32();
+    svbool_t pb = svwhilelt_b8((uint64_t)0, (uint64_t)32);
+    svfloat32_t a0=svdup_f32(0), a1=svdup_f32(0), a2=svdup_f32(0), a3=svdup_f32(0);
+    svfloat32_t a4=svdup_f32(0), a5=svdup_f32(0), a6=svdup_f32(0), a7=svdup_f32(0);
+    for (int b = 0; b < K / 64; b++) {
+        const uint8_t *blk = group + (size_t)b * 544;
+        const uint16_t *scl = (const uint16_t *)blk;
+        const int8_t *qs = (const int8_t *)(blk + 32);
+        for (int h = 0; h < 2; h++) {
+            svint8_t xv = svld1_s8(pb, xq + (size_t)b * 64 + h * 32);
+            #define SDOT_ORIG_ROW(R, ACC) do {                                \
+                svint8_t wv = svld1_s8(pb, qs + (size_t)(R) * 64 + h * 32); \
+                svint32_t d = svdot_s32(svdup_s32(0), wv, xv);                 \
+                ACC = svmla_x(pg, ACC, svcvt_f32_s32_x(pg, d),               \
+                              svdup_f32(ggml_fp16_to_fp32(scl[(R)*2+h]) * xscale[b])); \
+            } while (0)
+            SDOT_ORIG_ROW(0,a0); SDOT_ORIG_ROW(1,a1); SDOT_ORIG_ROW(2,a2); SDOT_ORIG_ROW(3,a3);
+            SDOT_ORIG_ROW(4,a4); SDOT_ORIG_ROW(5,a5); SDOT_ORIG_ROW(6,a6); SDOT_ORIG_ROW(7,a7);
+            #undef SDOT_ORIG_ROW
+        }
+    }
+    dst[0]=svaddv(pg,a0); dst[1]=svaddv(pg,a1); dst[2]=svaddv(pg,a2); dst[3]=svaddv(pg,a3);
+    dst[4]=svaddv(pg,a4); dst[5]=svaddv(pg,a5); dst[6]=svaddv(pg,a6); dst[7]=svaddv(pg,a7);
+}
+
+/* Exact F32-activation kernel for the same packed layout.  Unlike the SDOT
+ * variant above, this keeps the original Q8_0 scales and uses the original
+ * F32 activation, so it is a layout-only optimization with no quality loss. */
+static inline void matvec_q8orig_8row_f32(float *dst, const uint8_t *group,
+                                           const float *x, int K) {
+    const int vl = (int)svcntw();
+    const svbool_t pg = svptrue_b32();
+    svfloat32_t a00=svdup_f32(0),a01=svdup_f32(0),a10=svdup_f32(0),a11=svdup_f32(0);
+    svfloat32_t a20=svdup_f32(0),a21=svdup_f32(0),a30=svdup_f32(0),a31=svdup_f32(0);
+    svfloat32_t a40=svdup_f32(0),a41=svdup_f32(0),a50=svdup_f32(0),a51=svdup_f32(0);
+    svfloat32_t a60=svdup_f32(0),a61=svdup_f32(0),a70=svdup_f32(0),a71=svdup_f32(0);
+    for (int b = 0; b < K / 64; b++) {
+        const uint8_t *blk = group + (size_t)b * 544;
+        const uint16_t *scl = (const uint16_t *)blk;
+        const int8_t *qs = (const int8_t *)(blk + 32);
+        for (int h = 0; h < 2; h++) {
+            const float *xp = x + b * 64 + h * 32;
+            for (int j = 0; j < 32; j += vl) {
+                svbool_t pt = (j + vl <= 32) ? pg :
+                    svwhilelt_b32((uint64_t)j, (uint64_t)32);
+                svfloat32_t xv = svld1(pt, xp + j);
+#define Q8ORIG_ROW(R, A0, A1) do { \
+                svfloat32_t qv = svmul_x(pt, \
+                    svcvt_f32_s32_x(pt, svld1sb_s32(pt, qs + (size_t)(R) * 64 + h * 32 + j)), \
+                    svdup_f32(ggml_fp16_to_fp32(scl[(R) * 2 + h]))); \
+                if ((j / vl) & 1) (A1) = svmla_x(pt, (A1), qv, xv); \
+                else (A0) = svmla_x(pt, (A0), qv, xv); \
+            } while (0)
+                Q8ORIG_ROW(0,a00,a01); Q8ORIG_ROW(1,a10,a11);
+                Q8ORIG_ROW(2,a20,a21); Q8ORIG_ROW(3,a30,a31);
+                Q8ORIG_ROW(4,a40,a41); Q8ORIG_ROW(5,a50,a51);
+                Q8ORIG_ROW(6,a60,a61); Q8ORIG_ROW(7,a70,a71);
+#undef Q8ORIG_ROW
+            }
+        }
+    }
+    dst[0]=svaddv_f32(pg,svadd_x(pg,a00,a01)); dst[1]=svaddv_f32(pg,svadd_x(pg,a10,a11));
+    dst[2]=svaddv_f32(pg,svadd_x(pg,a20,a21)); dst[3]=svaddv_f32(pg,svadd_x(pg,a30,a31));
+    dst[4]=svaddv_f32(pg,svadd_x(pg,a40,a41)); dst[5]=svaddv_f32(pg,svadd_x(pg,a50,a51));
+    dst[6]=svaddv_f32(pg,svadd_x(pg,a60,a61)); dst[7]=svaddv_f32(pg,svadd_x(pg,a70,a71));
 }
 
 /* 8-row x 3-token int8 svdot (prefill weight reuse): same q8_pv group layout as

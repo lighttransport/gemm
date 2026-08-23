@@ -575,6 +575,11 @@ the new kernel versus 4.075 tok/s before it. The generated stdout was
 byte-identical (`cmp=0`). The 32-token run produced the same output prefix;
 short runs have more timing noise. This is now the default exact gate/up path.
 
+An A64FX SVE SiLU×mul replacement for the persistent BF16 path was also
+tested with the same four-rank launch. It measured 46.91 ms/token versus
+39.82 ms/token for the reference `expf` path and was removed; exact BF16
+decode therefore keeps the scalar activation.
+
 An FP32 sidecar for all Q8 block scales was also tested to remove repeated
 FP16-to-F32 conversion. It exceeded the 32 GB HBM budget during materialization
 (the process was OOM-killed), so no sidecar allocation remains in production.
@@ -778,15 +783,46 @@ arrival skew.  Communication cannot generally cross a layer's residual/norm
 dependency, so reducing skew and projection time is more useful than pretending
 all uTofu time can be hidden behind the next layer.
 
+### TP4/TP6/TP12 sweep after the 12-node restart (2026-08-21)
+
+The launcher now accepts `TP_SIZE=4`, `6`, or `12` and stages each configuration
+under `/local/u14346/qwen38-bf16-tp${TP_SIZE}`.  All three rank-local sets fit in
+the 87 GiB node-local filesystem.  The measured rank-0 files, including their
+headers, were:
+
+| configuration | rank file | attention layout | runtime FFN | steady decode |
+|---|---:|---|---:|---:|
+| TP4 | 14.323 GB | 6 Q / 1 KV head per rank | 4352 | 21.95 tok/s |
+| TP6 | 13.352 GB | replicated attention (4 KV heads) | 3072 | 21.12 tok/s |
+| TP12 | 9.362 GB | replicated attention (4 KV heads) | 1536 | 18.47 tok/s |
+
+The benchmark used the same synthetic one-token prompt, `TP_MAXSEQ=128`,
+`TP_PERF_WARMUP=8`, and `TP_MAXGEN=16`.  Rank-0 steady timings were 45.47 ms
+(TP4), 47.26 ms (TP6), and 54.04 ms (TP12) per token.  The corresponding
+compute/communication splits were 39.21/6.27, 38.07/9.19, and 40.82/13.22
+ms/token.  TP6 and TP12 cannot shard the four KV heads evenly, so the runtime
+keeps attention replicated; this explains both their larger per-rank attention
+payload and the extra all-reduce cost.  On this live topology TP4 remains the
+best BF16 decode configuration; neither wider group reaches the 40 tok/s target.
+
+Reproduce the sweep with:
+
+```sh
+for n in 4 6 12; do TP_SIZE=$n ./a64fx/llm/run_qwen38_bf16_tp4.sh stage; done
+for n in 4 6 12; do TP_SIZE=$n TP_MAXGEN=16 TP_PERF_WARMUP=8 \
+  ./a64fx/llm/run_qwen38_bf16_tp4.sh bench; done
+```
+
 ### Decode implementation and result
 
 An experimental pair-interleaved eight-row BF16 layout and SVE kernel were also
-implemented.  It reuses each FP32 activation load across eight output rows, but
-a final comparison found divergence from row-major at generated token 14.
-Consequently `TP_STAGE_BF16_PV=0` is the launcher default and all accepted
-numbers below use the source-equivalent row-major layout.  The experimental
-path remains available only for diagnosis.  Software prefetch was slightly
-slower end to end and also defaults off.
+implemented.  The initial single-accumulator version diverged from row-major at
+generated token 14.  The kernel now mirrors the row-major low/high accumulation
+order; matched 64-token dumps are identical, while the live run improved from
+39.05 to 36.55 ms/token (25.61 to 27.36 tok/s).  Therefore
+`TP_STAGE_BF16_PV=1` is now the launcher default, with `PV=0` retained as the
+source-equivalent rollback.  Software prefetch was slightly slower end to end
+and remains off.
 
 The larger win was scheduling: `transformer_forward_partial()` previously used
 the legacy path and issued 578 pool dispatches/token.  Full-range TP decode now
@@ -851,3 +887,656 @@ multiple tokens.  The existing `TP_SPEC_K` path only measures draft agreement
 and still performs one trunk scan per accepted token; it must be extended with
 batched state checkpoint/rollback and greedy acceptance before it can raise
 exact accepted-token throughput.
+
+### Live TP4 follow-up rejection tests (2026-08-21)
+
+The compact BF16-to-W8A8 SDOT prepack is valid only from row-major stage data.
+Running it with `TP_STAGE_BF16_PV=0` fixed the earlier packed-layout misuse and
+produced finite tokens, but measured only **8.0 tok/s** (124.62 ms/token,
+120 GB/s) for 8 tokens. Its one-time prepack converted 401 tensors to 7.378
+GB. Activation quantization, SDOT conversion, and scale application outweigh
+the reduced weight traffic, so it remains rejected.
+
+The resident W8A8 path now caches each thread's per-block activation
+quantization while the same activation vector is reused by adjacent
+projections. In a matched 16-token/8-warmup TP4 probe, disabling the cache
+measured 119.44 ms/token (8.37 tok/s), while the default cache measured
+107.91 ms/token (9.27 tok/s). The cache reuses the exact int8 values and
+scales, so it does not change the SDOT result; `TF_W8_ACT_CACHE=0` restores
+the uncached A/B path.
+
+An SVE vectorized replacement for the per-64 activation quantizer was rejected:
+its first TP4 token changed from the exact reference (`5840` to `23`), so the
+reference scalar rounding remains in production.
+
+An `svld2` interleaved-load variant of the exact BF16 PV kernel was also
+compiled and tested. The A64FX compiler lowered it poorly: it diverged on the
+first token and ran at 104.32 ms/token. It was removed. The restored exact
+`svld1` PV8 path reproduced the accepted prefix
+`5840,22456,2228,9867,72452,5840,174427,174342,198,58024,220,248046`.
+
+The SSM SVE recurrence was also given an opt-in two-row dot path
+(`TF_SSM_SVE2=1`) that shares Q/K vector loads while preserving each row's
+reduction order. It reproduced 32/32 tokens and measured 36.81 ms/token
+(27.17 tok/s), effectively tied with the 27.36 tok/s PV8 reference, so it is
+retained as an opt-in A/B path rather than made default. A fused greedy-only
+LM-head argmax was then rechecked under the current TP4 run and diverged at
+token 14; it remains disabled and full logits remain the default.
+
+The live `TP_SPEC_K=1` probe remains unusable for throughput: with NextN
+materialization it measured 1.76 tok/s for four generated tokens, issued 132
+all-reduce calls/token, and reported `MTP greedy match=0/4 alpha=0`. Since the
+current driver still runs the full trunk once per token and does not checkpoint
+or batch-verify the draft sequence, speculative mode is not enabled by the
+BF16 launcher.
+
+The TP4 launcher now defaults to `OMP_PROC_BIND=spread` rather than `close`.
+On the live four-node session, the exact PV8 binary measured 37.37 ms/token
+(26.76 tok/s) with spread and 51.73 ms/token (19.33 tok/s) with close; both
+streams matched the saved 32-token greedy output.  Spread kept rank compute
+times within about 3 ms, while close left ranks 1--3 waiting roughly 20--22
+ms/token for a rank-0 compute outlier.  The setting remains overrideable.
+
+I also tested `TP_AR_BATCH=1` to make the 5120-float decode reduction use a
+single contiguous payload-plus-trailer Put.  Although this removes one Put per
+round, the live run slowed to 42.75 ms/token and diverged after the shared
+prefix.  The uTofu combined-Put ordering is therefore not safe for this
+trailer protocol; TP4 keeps the validated split payload/trailer transfers.
+
+An exact compiler A/B with `-funroll-loops` was also rejected: matched 64-token
+streams measured 38.31 ms/token with unrolling versus 37.48 ms/token for the
+normal `-Kfast` build.
+
+An exact BF16 gate/up fused microkernel was prototyped to share activation
+loads, but its opt-in run diverged immediately under the longer-context test.
+It was removed rather than exposed as a selectable path.
+
+The live TP runner also now inherits the existing Fujitsu `-Kfast` Qwen build
+flag. It was previously applied only to the single-node Qwen target, not
+`tp_runner`; a four-node BF16 PV A/B preserved 32/32 tokens and measured 36.59
+ms/token (31.99 ms compute), versus approximately 36.8 ms/token without it.
+The repository's older `-Kocl,hpctag` suggestion is incompatible with this
+`-Nclang` compiler (`unknown argument: -Khpctag`), while `-Kocl` alone built
+successfully but slowed the live run to 43.02 ms/token, so neither is enabled.
+
+## Q8 TP4 staging implementation (2026-08-20)
+
+The TP stage format now supports both BF16 and native Q8_0 tensors. Version 2
+records source and local row byte sizes, preserves Q8_0's 32-value blocks and
+FP16 scales, and validates those layouts when loading a rank blob. Single-file
+GGUF inputs are supported in addition to split GGUF inputs.
+
+The Q8 source was staged safely to `/local/u14346/qwen38-q8-source` and rank
+shards were generated under `/local/u14346/qwen38-q8-tp4`:
+
+```text
+source: 29,047,086,048 bytes
+rank00..rank03: 7,607,992,320-byte payload each
+entries per rank: 497
+stage format: q38tp-v2
+```
+
+After the live-session restart, the native Q8 TP4 stage was regenerated from
+`/home/u14346/models/qwen38/27b/Qwen3.8-27B-Q8_0.gguf` and measured 173.5
+ms/token (5.76 tok/s) with spread affinity.  The exact block64 repack was also
+tested; it reached 170.75 ms/token (5.86 tok/s), but changed the greedy stream
+and is therefore not an exact replacement.  Neither Q8 layout is competitive
+with the exact BF16 PV8 path, so no Q8 default was changed.
+
+The launcher is `a64fx/llm/run_qwen38_q8_tp4.sh`. It uses exact resident Q8_0
+weights, disables panel repacking, and provides `plan`, `stage`, `stream`,
+`null`, `check`, `bench`, and `profile` modes. A four-node uTofu decode run is
+still required to establish the TP4 correctness and throughput baseline.
+
+### BF16 NextN materialization and TP vocabulary fix (2026-08-20)
+
+The TP4 launcher now accepts `TP_SPEC_K` instead of forcing it to zero. When
+drafting is enabled, the auxiliary NextN tensors are copied once into
+NUMA-distributed anonymous memory; the staged shared vocabulary shard is reused
+without duplication. This reduced the live four-node BF16 `K=1` probe from
+approximately 0.006 tok/s to 6.69 tok/s for four generated tokens.
+
+The TP NextN head also now computes only its local vocabulary rows and uses the
+same TP argmax reduction as the trunk. The current probe reports `MTP greedy
+match=0/4`, so batched accepted-token verification and the model-specific draft
+quality gate remain open.
+
+The standalone BF16-PV UF2 kernel candidate was also checked at K=5120: the
+current kernel sustained 800.78 GB/s with zero error, while UF2 sustained
+712.59 GB/s and differed by 1.76e-5 absolute (2.94e-7 relative). It was not
+integrated into TP4.
+
+NextN attention and FFN projections were then TP-sharded across the four ranks
+and their partial outputs were all-reduced. The live `K=1` probe measured 6.40
+tok/s versus 6.69 tok/s before sharding; the extra reductions offset the saved
+auxiliary weight traffic. The sharding is retained for correctness and as a
+foundation for multi-position verification, but it is not an end-to-end gain
+for single-draft decoding.
+
+### TP4 BF16 reduction topology check (2026-08-21)
+
+An opt-in two-level TP all-reduce was tested on the live four-node BF16 path,
+using rank groups `{0,1},{2,3}` followed by `{0,2},{1,3}` and routing both
+hidden-state sums and vocab argmax through the same hierarchy. It preserved
+the checked greedy prefix, but was slower in the matched runs: flat TP was
+36.07 ms/token (27.72 tok/s) versus 37.10 ms/token (26.95 tok/s); an earlier
+pair was 38.09 versus 37.90 ms/token. The experimental runner integration
+was removed; the flat reduction remains the production path.
+
+The existing `TP_OVERLAP=1` tiled projection experiment was also rechecked.
+With 1024-row tiles it changed the first token and increased reductions from
+129 to 641 per token, measuring 80.90 ms/token (12.36 tok/s). It is rejected:
+the tile-level reductions do not preserve the live TP4 lockstep/stream and
+their extra synchronization overwhelms any attempted compute/communication
+overlap.
+
+### Persistent SSM projection barrier removal (2026-08-21)
+
+The persistent BF16 decoder now lets the independent SSM QKV/gate and
+alpha/beta projections proceed without an intermediate worker barrier. The
+existing barrier after alpha/beta still protects convolution and recurrent
+state preparation. The first 13 token IDs remained identical; matched live
+32-token probes were 39.48/41.53 ms/token with the change versus
+53.44/37.09 ms/token with the original barrier. A longer 64-token/32-warmup
+pair measured 36.51 and 36.93 ms/token with the change, compared with the
+previous flat-path 36.07 and 38.09 ms/token. It is retained as a safe,
+small BF16 improvement; a 128-token/64-warmup run remained on the expected
+prefix and measured 39.04 ms/token. Live-run jitter remains significant.
+
+An attempted TP4 SSM Q/K traffic reduction was rejected. Each rank was made to
+project only the Q/K groups used by its local dt-head interval while retaining
+all local V rows. It matched the first 13 IDs but diverged at token 14 and
+measured 46.04 ms/token, so the reference replicated-Q/K projection remains.
+
+Distributing the post-convolution QKV/state copies across the persistent
+workers also passed the 32-token prefix check, but was neutral at 64 tokens
+(36.92 ms/token versus 36.51/36.93 ms/token for the scalar-copy baseline).
+It was reverted to keep the SSM path simpler.
+
+The runner now exposes an opt-in `TP_INT8_MODE=block64-ffn` experiment that
+packs only BF16 FFN gate/up/down projections into compact W8A8 SDOT weights;
+SSM, attention, and the output head remain BF16. It requires
+`TP_STAGE_BF16_PV=0` because the packer consumes row-major staged weights.
+This mode is implemented but awaits a TP4 live allocation for correctness and
+throughput validation.
+
+### Qwen3.8 BF16 batched prefill and TP handoff (2026-08-21)
+
+The TP runner now has a Qwen hybrid batched-prefill path. SSM state updates and
+causal attention remain in prompt order, while the large BF16 projections use
+token-major GEMMs. Prefill forces the row-major staged-weight layout (`PV=0`);
+the packed decode layout is not valid for these GEMMs.
+
+On TP12, the live measurements were 19.94 tok/s for 128 prompt tokens and
+25.35 tok/s for 512 prompt tokens. The path preserved the checked TP12
+row-major greedy result (2005) against the token-loop implementation. This is
+well below the 120--200 tok/s target; the remaining serial causal SSM/attention
+work and replicated attention on TP12 are the dominant limitation.
+
+TP12 per-rank checkpoint state now includes SSM convolution and recurrent
+state, and a 12-to-4 repartitioner reconstructs all 64 layer records. The
+repartition operation completes, but the first end-to-end continuation did not
+yet match direct TP4 prefill (71930 versus 2918 in the smoke test), so the
+handoff is retained as an experimental path and is not claimed numerically
+equivalent.
+
+### Twelve-node PP3 x TP4 prefill prototype (2026-08-21)
+
+An additive single-sequence pipeline runner, `qwen38_prefill_runner`, now uses
+three pipeline stages with four TP lanes each and layer cuts `[0,21)`,
+`[21,43)`, and `[43,64)`. Each physical node reuses the normal TP4 blob chosen
+by `world_rank % 4`; explicit logical stager rank/size overrides prepare all
+twelve node-local copies in one bounded, page-cache-safe launch.
+
+The range-prefill API exchanges token-major FP32 hidden blocks between stages.
+Stage-owned BF16 projections use the existing 8-token x 48-row A64FX packed
+kernel with FP32 activations/accumulation. SSM preparation remains in prompt
+order, followed by one head-parallel scan over each chunk while preserving
+sequential recurrence within a head.
+
+All ranks completed the live sweep in lockstep. PV48 and row-major execution
+gave the same distributed next token on the checked 128-token case (`98709`).
+
+| prompt | chunk | elapsed | throughput | next token |
+|---:|---:|---:|---:|---:|
+| 128 | 64 | 7.041 s | 18.18 tok/s | 98709 |
+| 512 | 128 | 9.710 s | 52.73 tok/s | 98709 |
+| 1024 | 256 | 12.318 s | 83.13 tok/s | 74723 |
+| 4096 | 256 | 30.665 s | **133.57 tok/s** | 23145 |
+| 4096 | 1024 | 27.834 s | **147.16 tok/s** | 23145 |
+
+This improves substantially over the TP12 512-token result but does **not**
+meet the full 120--200+ tok/s sweep target: it reaches the lower bound only at
+4096 tokens. Parallel `(token,head)` attention cut the 4096-token result from
+73.685 seconds / 55.59 tok/s to 30.665 seconds / 133.57 tok/s without changing
+the next token. Stage compute at 1024 tokens was approximately
+8.76/7.12/6.78 seconds; at 4096 it was 22.96/20.19/25.06 seconds. The next
+required work is a packed/tiled QK/PV kernel, uTofu subgroup collectives instead
+of MPI all-reduce, and measured layer cuts. TP4 decode-state handoff is not yet
+implemented for this prototype and remains a production correctness gate.
+
+#### 4K profiling and quantized experiments (2026-08-22)
+
+The range API now accumulates phase timers and the runner writes them to each
+rank log.  On the exact BF16 4096/1024 run, stage 0 spent 17.29 seconds in
+compute and stage 2 spent 17.19 seconds; end-to-end time was 27.834 seconds.
+The remaining gap is dominated by single-sequence pipeline fill/drain plus TP
+collectives, not causal attention (about 0.94--1.11 seconds per stage).  A
+double-buffered `MPI_Isend`/`MPI_Irecv` test preserved `next=23145` but produced
+the same 147.16 tok/s because this MPI configuration made no useful progress
+during compute, so it was removed.
+
+`Q38_PREFILL_QUANT=int8|int16` now converts only the PP-owned BF16 projections
+in place. `int8` is W8A8 SDOT; `int16` is an accurate-at-short-context W8A16
+mimic (INT8 weights, INT16 activations, INT64 SDOT accumulation). They are
+explicit experiments, not defaults:
+
+| mode | prompt/chunk | throughput | next token | result |
+|---|---:|---:|---:|---|
+| BF16 PV48 | 4096/1024 | **147.16 tok/s** | 23145 | accepted |
+| W8A8 | 128/64 | 17.79 tok/s | 33014 | divergent |
+| W8A16 mimic | 128/64 | 16.50 tok/s | 98709 | short check matches |
+| W8A8 | 4096/1024 | 87.38 tok/s | 42161 | slower, divergent |
+| W8A16 mimic | 4096/1024 | 51.16 tok/s | 100393 | slower, divergent |
+
+The current row-outer quantized GEMMs are rejected for performance: at 4K the
+W8A8 FFN projection time grows to roughly 13.4 seconds versus 5.0 seconds for
+PV48 BF16. A competitive W8 path needs an 8-row by 4--5-token register-blocked
+kernel and group scales, followed by long-context quality validation. Reaching
+250 tok/s with PP3 also requires eliminating the single-prompt pipeline bubble
+(or changing the topology) and replacing the high-latency MPI TP reductions.
+
+### Native Q8 12-node prefill experiment (2026-08-22)
+
+`run_qwen38_q8_prefill_12n.sh` stages the native Q8_0 model as PP3 x TP4.
+The old A64FX Q8 token-major GEMM was a row-by-token loop around the decode
+dot product, repeating Q8-to-F32 conversion for every token. An exact 1-row x
+4-token SVE tile now amortizes that conversion while retaining original Q8_0
+block scales and F32 activations.
+
+The launcher defaults to `Q38_PREFILL_Q8=w8a8`: each PP-owned Q8 projection is
+repacked to 8-row x 64-column blocks, activations are quantized per 64 values,
+and the 8-row x 3-token SVE SDOT kernel is used.
+
+| path | prompt/chunk | elapsed | throughput | next token |
+|---|---:|---:|---:|---:|
+| native Q8, F32 activation | 128/64 | 100.37 s | 1.28 tok/s | 1293 |
+| Q8-derived W8A8, SDOT 8x3 | 128/64 | 6.94 s | **18.45 tok/s** | 1293 |
+| Q8-derived W8A8, SDOT 8x3 | 4096/1024 | 42.33 s | **96.77 tok/s** | 62842 |
+| rejected SDOT 1x16 | 128/64 | 6.52 s | 19.64 tok/s | 1293 |
+| rejected SDOT 1x16 | 4096/1024 | 47.90 s | 85.50 tok/s | 62842 |
+
+The 1x16 intrinsic tile was removed because compiler register spills outweighed
+its nominal weight reuse at large N. The retained 8x3 path improves the native
+Q8 short run 14.4x and matches its checked next token. Long-context quality is
+not established because a native-Q8 4K oracle would take too long.
+
+The two-V100 result is not a direct aggregate-bandwidth prediction for this
+implementation. PP3 has single-sequence pipeline fill/drain, TP4 performs
+latency-sensitive reductions, and the current SDOT tile reloads weights once
+per three tokens. A 500 tok/s A64FX design needs a spill-free assembly GEMM
+with a wider token tile plus a topology that removes the single-sequence PP
+bubble, rather than Q8 storage alone.
+
+#### Native per-block Q8v2 assembly integration
+
+The Q8 prefill launcher now defaults to `Q38_PREFILL_Q8=q8v2`. Native Q8_0
+bytes are repacked without requantization into the existing A64FX
+`kernel_q8v2_3x4.S` layout (3 tokens x 64 outputs); FP16 block scales are
+expanded to FP32 and activations are quantized per 32 values. Original Q8_0
+storage remains available for tails and A/B checks. The runner links the
+assembly explicitly with `TF_HAVE_Q8V2`.
+
+Activation packs are cached across projections sharing the same input matrix:
+Q/K/V, SSM QKV/gate/alpha/beta, and FFN gate/up. This removed repeated
+quantization and allocator churn without changing checked tokens.
+
+| path | prompt/chunk | elapsed | throughput | next token |
+|---|---:|---:|---:|---:|
+| Q8v2 before activation reuse | 1024/1024 | 16.67 s | 61.45 tok/s | 1293 |
+| Q8v2 + activation reuse | 1024/1024 | 12.77 s | **80.17 tok/s** | 1293 |
+| Q8v2 + activation reuse | 4096/1024 | 26.04 s | **157.31 tok/s** | 62842 |
+| Q8v2, smaller pipeline tile | 4096/512 | 36.18 s | 113.21 tok/s | 62842 |
+
+The accepted 4K result is 62.6% faster than the retained compact-W8A8 result
+(96.77 tok/s), but it does not meet 250 tok/s. Profiling still attributes most
+time to projections plus TP collectives. A wider spill-free assembly token tile
+(for example 6x32) is the next kernel step; 3x64 reloads a weight panel for
+every three tokens.
+
+The runner and stager accept PP3xTP4, PP2xTP6, and PP1xTP12 via
+`Q38_PREFILL_TP_SIZE=4|6|12`. TP4 remains the default.
+
+#### Wider-kernel and topology follow-up
+
+Two additional assembly schedules were implemented and measured:
+
+- A per-block 6-token x 32-output Q8v2 kernel is numerically correct
+  (`maxrel=2.07e-5`) but reaches 187.0 GIOPS/core versus 196.6 GIOPS/core for
+  3x64. Extra activation broadcasts outweigh the reduced weight-panel reads.
+- `q8blk6` reuses `int8-cmg/micro_kernel_6x4_no_sector.S` once per 64-wide K
+  block and applies validated per-64 scales outside the integer kernel. It
+  preserves checked tokens but reaches 151.02 tok/s at 4096/1024, below Q8v2.
+
+The existing `kernel_q8v2_3x4_arow` path is exposed as `q8v2_arow`. It reaches
+162.33 tok/s at 4096/1024 but changes the long-context next token from 62842 to
+1293, so the coarser activation scale is rejected by the quality gate.
+
+TP12 initially corrupted the heap at its first attention layer. Replicated
+attention has `qdim=5120`, while its temporary gate buffer was incorrectly
+sized to the rank-local FFN width. Sizing scratch to `max(qdim, local_ff,
+local_ssm)` fixes the abort. Query heads and output-projection columns are now
+sharded even when the four KV heads must be replicated; the batched attention
+worker also receives the global query-head offset.
+
+Live corrected topology results for Q8v2 at 4096/1024:
+
+| topology | throughput | attention time/rank | next token |
+|---|---:|---:|---:|
+| PP3 x TP4 | **157.31 tok/s** | 0.95--1.14 s | 62842 |
+| PP2 x TP6 | 141.96 tok/s | 3.23--3.25 s | 9587 |
+| PP1 x TP12 | 126.14 tok/s | 3.48 s | 1 |
+
+Native Q8 and Q8v2 agree within TP12 on the 128-token check (`next=1`), so the
+packed kernel passes the within-topology quality comparison. TP6/TP12 differ
+from TP4 because their replicated-KV partition and reduction order are not
+greedy-equivalent. TP4 remains both the fastest and the accepted topology.
+
+#### Padded assembly tails and 250+ tok/s result
+
+The largest remaining regression was not the main assembly loop. Q8v2 used
+`N/3` complete microkernel tiles and sent every one- or two-token remainder to
+the native Q8/F32 GEMM. Thus common chunk sizes 256, 512, 896, and 1024 invoked
+the extremely slow fallback in every projection and every layer. Multiples of
+three such as 768 appeared anomalously fast.
+
+The dispatcher now rounds the tile count up, zero-pads missing activation rows,
+runs one final `kernel_q8v2_3x4` tile, and copies only valid output rows from a
+small temporary tile. Quantization and valid-row arithmetic are unchanged.
+This preserves both checked tokens: 1293 at 128 and 62842 at 4096.
+
+The scale-out schedule was also reordered from twelve adjacent
+`scvtf -> fmul -> fmla` chains into conversion/multiply/accumulate waves. The
+L1-resident microbenchmark improves from 1835 to 1784 cycles (2.8%); K=5120 is
+approximately flat because panel traffic dominates.
+
+Final PP3 x TP4 Q8v2 sweep at 4096 tokens:
+
+| chunk | elapsed | throughput | next token |
+|---:|---:|---:|---:|
+| 1024, old native tail | 26.04 s | 157.31 tok/s | 62842 |
+| 768, padded tail | 19.13 s | 214.14 tok/s | 62842 |
+| 512, padded tail | 16.25 s | 252.09 tok/s | 62842 |
+| 384, padded tail | 15.38 s | 266.31 tok/s | 62842 |
+| **256, padded tail** | **14.74 s** | **277.80 tok/s** | **62842** |
+| 192, padded tail | 14.84 s | 275.93 tok/s | 62842 |
+
+Chunk 256 is the measured optimum and is now the Q8 launcher default. It is
+2.87x the earlier compact-W8A8 result (96.77 tok/s), 1.77x the first accepted
+Q8v2 result (157.31 tok/s), and exceeds the requested 250 tok/s target.
+
+#### Post-restart SSM optimization and practical ceiling
+
+After restaging the wiped node-local TP4 shards, the 4096/256 baseline reproduced
+at 278.44 tok/s once the session was warm. Two quality-preserving SSM changes
+then reduced non-GEMM time:
+
+- Depthwise causal convolution is evaluated as one channel-parallel batch per
+  SSM layer. Each worker walks prompt time in strict order for its channels and
+  writes the final circular history back in the original layout. This removes
+  the single-core token-by-token convolution without changing recurrence order.
+- Convolution SiLU and the recurrent output gate use the existing A64FX SVE
+  FEXPA sigmoid approximation instead of scalar `expf` loops.
+
+Both 128-token (`next=1293`) and 4096-token (`next=62842`) gates remain stable.
+The accepted live result is now:
+
+| prompt/chunk | elapsed | throughput | next token |
+|---:|---:|---:|---:|
+| **4096/256** | **13.924 s** | **294.17 tok/s** | **62842** |
+
+Stage compute is balanced at 11.73/11.97/11.53 seconds. Chunk 224 was slower
+(288.67 tok/s) because increased send/range-call overhead outweighed its smaller
+pipeline bubble. `OMP_PROC_BIND=close` was neutral versus `spread`.
+
+Based on the measured phase floor, the practical ceiling of the current exact
+PP3xTP4/Q8v2 dataflow is approximately 310--330 tok/s. Reaching 350--450 tok/s
+requires lower-cost TP collectives and/or a wider microkernel that retains
+per-group activation scales. 500 tok/s remains an aggressive redesign target,
+not a plausible outcome from chunk or thread-placement tuning alone.
+
+#### Batched DeltaNet preparation and BF16 follow-up
+
+The post-convolution DeltaNet preparation no longer round-trips every prompt
+row through the model's single-token scratch buffers.  Alpha/beta transforms,
+Q/K normalization, head expansion, and V extraction are token-parallel, while
+the recurrent scan remains sequential within each head.  Both Q8 gates remain
+unchanged (`next=1293` at 128 and `next=62842` at 4096).
+
+On the restarted allocation the warmed Q8 MPI baseline was 283.75 tok/s.  The
+batched preparation reduced critical-stage `ssm_prepare` from 1.5--1.7 seconds
+to 0.72 seconds and produced **310.96 tok/s** at 4096/chunk256.  Nearby chunks
+192, 224, 288, and 320 reached 293.14, 290.03, 305.28, and 300.20 tok/s;
+chunk256 remains the accepted default.
+
+Two uTofu prefill collectives were implemented behind `Q38_PREFILL_COMM`:
+the existing full-buffer recursive-doubling tree and a TP4 direct
+reduce-scatter/all-gather using three TNIs.  Both preserved the Q8 tokens, but
+were slower than Fujitsu MPI for the 5 MiB payload: 272.90 and 269.46 tok/s,
+respectively, versus 283.75 for the matched pre-change MPI run.  MPI therefore
+remains the default; `utofu-tree` and `utofu` are retained for transport A/Bs.
+
+The safely restaged exact BF16 PV48 path improved from the old 147.16 tok/s to
+**205.53 tok/s** at 4096/chunk256, preserving `next=23145`.  Chunk1024 now
+reaches only 136.67 tok/s because its large MPI reductions cost 6.5 seconds on
+the critical stage.  Exact BF16 is still bounded by FP32 activation/accumulation
+and did not approach 300 tok/s.
+
+An explicitly experimental `Q38_PREFILL_BF16=bf16-act` mode links the existing
+Clair `sgemm_bf16_2x12.S`, pre-packs only the owned pipeline range in place, and
+uses BF16 activations with FP32 accumulation.  Its natural 12-token tile favors
+chunk252 and reaches **305.98 tok/s** at 4096 tokens.  It produces `next=35349`
+instead of the exact BF16 `23145`, so it is not an accepted exact path and is
+never selected by default.  Use `Q38_PREFILL_BF16=exact` for the canonical
+model and `bf16-act` only for labeled throughput/quality experiments.
+
+#### Eight-node PP2 x TP4 topology
+
+The runner and launcher also accept `Q38_PREFILL_NODES=8`, retaining TP4 and
+using two pipeline stages.  This is numerically preferable to inventing a TP3
+partition: the native Q8 short and 4K gates remain `1293` and `62842`.
+
+At 4096 tokens, the Q8 chunk sweep with the initial 32/32 cut measured 227.68,
+219.25, and 211.58 tok/s for chunks 256, 384, and 512.  Sweeping the layer cut
+at chunk256 found 31/33 best:
+
+| nodes/topology | cut | chunk | throughput | next |
+|---|---:|---:|---:|---:|
+| 8 / PP2xTP4 | 30/34 | 256 | 223.19 tok/s | 62842 |
+| **8 / PP2xTP4** | **31/33** | **256** | **231.15 tok/s** | **62842** |
+| 8 / PP2xTP4 | 32/32 | 256 | 227.68 tok/s | 62842 |
+| 8 / PP2xTP4 | 33/31 | 256 | 228.81 tok/s | 62842 |
+| 8 / PP2xTP4 | 34/30 | 256 | 220.75 tok/s | 62842 |
+
+The PP2 default cut is therefore 31.  It is more node-efficient than the
+12-node 310.96 tok/s result (28.89 versus 25.91 tok/s per node), but slower in
+absolute single-prompt throughput because each stage executes about 50% more
+layers.  Exact BF16 at the same eight-node 31/33, chunk256 configuration was
+120.22 tok/s with `next=23145`, so BF16 does not reverse the conclusion.
+
+#### Fused DeltaNet state dots
+
+The A64FX recurrent scan can now calculate each state row's `state*K` and
+`state*Q` reductions together, sharing the state load.  After the unchanged
+rank-one state update, the output is formed by the equivalent identity
+`old_state*Q + delta*(K*Q)`.  The Q8 launcher enables this with
+`TF_SSM_FUSED_DOTS=1`; setting it to zero restores the previous two-pass scan.
+
+The 128-token gate remains `next=1293`, and repeated 4096-token runs retain
+`next=62842`.  Scan time on rank 0 fell from roughly 1.33 seconds to
+1.08--1.09 seconds.  The best live 4096/chunk256 result is **321.36 tok/s**
+(12.746 seconds), up from the accepted 310.96 tok/s result.  End-to-end repeats
+vary with TP collective and pipeline handoff time (one repeat was 307.76
+tok/s), so 321.36 is a best observed result rather than a sustained floor.
+
+Forcing Open MPI's generic tuned collectives did not improve the 5 MiB TP
+reduction: Rabenseifner reached 241.24 tok/s, while ring and recursive doubling
+reached 296.47 and 296.03 tok/s.  Fujitsu's default mtofu collective remains
+selected.  The approximate scalar SSM transforms (`TF_SSM_FAST_SCALARS=1`)
+also provided no repeatable end-to-end gain and remain opt-in.
+
+#### Post-restart bulk SiLU optimization
+
+Allocation 50725516 was restaged with the bounded Q8 TP4 builder after `/local`
+was wiped. The exact 128-token gate reproduced at `next=1293`, and the warm
+4096/chunk256 fused-SSM baseline reproduced at 317.51 tok/s with `next=62842`.
+
+The A64FX FFN SiLU-multiply pass previously fell through to a scalar `expf`
+loop. `TF_SILU_SVE=1` now evaluates the full contiguous pass with SVE FEXPA,
+one reciprocal estimate plus Newton refinement, and parallel static chunks.
+The Q8 launcher enables it by default. Rank-0 FFN activation time fell from
+about 533 ms to **53--58 ms** while retaining both exact next-token gates.
+
+| prompt/chunk | elapsed | throughput | next token |
+|---:|---:|---:|---:|
+| 4096/256 | **12.288 s** | **333.33 tok/s** | **62842** |
+| 4096/256 repeat | 12.616 s | 324.68 tok/s | 62842 |
+
+An attempted gate/up macro-fusion was rejected. Although it removed the
+separate activation pass, interleaving the two large packed weight panels
+destroyed the static schedule's cache locality: rank-0 FFN projection time rose
+from about 1.6 seconds to 16.1 seconds and throughput fell to 140.24 tok/s.
+The implementation was removed rather than retained as a misleading option.
+
+#### Exact-path follow-up after 333 tok/s
+
+The next two non-projection experiments did not justify changing the default:
+
+- A fixed-scale signed-16 TP allreduce reduced the 4K collective phase from
+  roughly 1.49 seconds to 1.15 seconds and reached 343.91 tok/s. Scale 4096
+  already failed the short gate (`next=67577`); scale 16384 passed the short
+  gate but failed the long gate (`next=141330`). The implementation was removed.
+- Moving DeltaNet decay `expf` from the head-serial scan into token-parallel
+  preparation preserves `1293`/`62842`, but scan time remained 1.08 seconds and
+  throughput was 331.25 tok/s. It remains opt-in as `TF_SSM_PREEXP=1`.
+- Explicit SVE for the attention output sigmoid also preserves both gates. A
+  335.23 tok/s run was observed, but the measured attention phase was unchanged
+  at about 0.96 seconds, so this is treated as run variance and remains opt-in
+  as `TF_ATTN_GATE_SVE=1`.
+
+The exact 12-node default therefore remains Q8v2 + fused DeltaNet dots + bulk
+SVE FFN SiLU, with **333.33 tok/s best accepted** and 324.68 tok/s repeat.
+
+#### BF16 prefill optimization on the restaged allocation
+
+The BF16 TP4 shards were rebuilt on allocation 50725516 with the bounded
+rank-local stager. Exact BF16 retains FP32 activations and accumulators and
+continues to produce `next=23145` at 4096 tokens (`next=98709` at 128).
+
+The generic BF16 launcher now enables the datatype-independent fused DeltaNet
+dots and bulk SVE SiLU defaults. At 4096/chunk256 this raised the best exact run
+from the cold 171.39 tok/s baseline to **231.15 tok/s**:
+
+| BF16 mode | prompt/chunk | throughput | next token | status |
+|---|---:|---:|---:|---|
+| exact PV48, cold baseline | 4096/256 | 171.39 tok/s | 23145 | exact |
+| **exact PV48, optimized best** | **4096/256** | **231.15 tok/s** | **23145** | **accepted** |
+| exact PV48, later repeat | 4096/256 | 205.71 tok/s | 23145 | exact; MPI noisy |
+| BF16-activation `2x12` asm | 4096/252 | **329.56 tok/s** | 35349 | experimental |
+
+PV48 now reuses its persistent activation pack for consecutive Q/K/V and
+gate/up projections when `N<=256`. This preserves multiplication and
+accumulation order. On a balanced run it reduced rank-0 projection compute by
+about 0.66 seconds, although end-to-end repeats were dominated by collective
+variance: rank collective time ranged from roughly 1.84 to 3.85 seconds and
+could move the whole run between 183.91 and 231.15 tok/s.
+
+The `Q38_PREFILL_BF16=bf16-act` path benefits from the same SSM/SiLU work and
+improves over its previous 305.98 tok/s result to 329.56 tok/s. It quantizes
+activations to BF16 for `sgemm_bf16_2x12.S`, changes the 4K next token, and is
+therefore reported separately rather than replacing exact PV48.
+
+#### Decode revisit on allocation 50725516
+
+The restaged BF16 TP4 decode remains the fastest real single-stream
+configuration. With `TP_STAGE_BF16_PV=1`, 48 spread workers, ordinary barriers,
+`TP_MAXSEQ=128`, eight warmup tokens, and sixteen measured tokens, the live run
+reported **25.21 tok/s** including all 24 generated tokens. The post-warmup
+forward interval was 36.09 ms/token: 31.63 ms compute plus 4.46 ms communication,
+or **27.71 forward tok/s**. The phase profile attributes about 15.37 ms to FFN,
+9.95 ms to SSM projections, and 2.12 ms to attention projections.
+
+No exact 40+ tok/s configuration was found:
+
+- TP6 and TP12 remain slower because four KV heads cannot be evenly sharded;
+  their recorded rates are 21.12 and 18.47 tok/s.
+- Native Q8 TP4 remains around 6--7 tok/s and is not competitive with BF16.
+- Source-row-major BF16 with the existing exact 8-row SVE kernel reached only
+  23.14 tok/s overall and 40.91 ms/token post-warmup, so the integration was
+  removed and PV8 retained.
+- `TF_SSM_SVE2=1` reached 24.94 tok/s overall and 38.93 ms/token post-warmup,
+  below the default.
+- Current NextN drafting has measured alpha zero and still performs one trunk
+  scan per generated token, so `TP_SPEC_K` is not a speculative speedup.
+
+Forty tok/s requires at most 25 ms/token. The live default already spends
+4.46 ms in 129 reductions and streams 14.31 GB of weights per rank at an
+effective 452 GB/s. Meeting 25 ms would require roughly 697 GB/s for all
+projection work after communication, close to the 828 GB/s load-only stream
+ceiling and well above the measured compute kernel. The viable route to 40+
+accepted tokens/s is therefore batched speculative verification with a useful
+draft model, not another existing single-token environment configuration.
+### Single-token BF16 PV8 bandwidth attack (2026-08-22, job 50725516)
+
+The production-exact low/high reduction kernel was added to
+`a64fx/tools/mv_bench_bf16_8row.c` as variant 4.  With four-CMG first-touch and
+48 pinned workers, the no-prefetch kernel reached 593/720/772 GB/s at
+K=4352/5120/6144.  L2 software prefetch lifted these to 759/833/851 GB/s at
+distance 8 chunks (distance 12 was slightly better only at K=4352).  The raw
+stream roof in the same harness was 919 GB/s at K=5120.
+
+`TF_BF16PV_PREFETCH` now accepts a chunk distance (legacy value `1` maps to 8),
+and the TP4 BF16 launcher defaults to the measured distance 8.  Exact TP4 A/B,
+16 measured tokens after 8 warmups:
+
+- old default: 36.09 ms forward, 31.63 ms compute, 4.46 ms communication,
+  452 GB/s effective, 25.21 tok/s overall;
+- distance 8: 31.64 ms forward, 26.65 ms compute, 4.98 ms communication,
+  537 GB/s effective, 30.58 tok/s overall.
+
+The emitted token stream was identical.  Distance 4 was slower (32.40 ms,
+516 GB/s), and alternating gate/up PV groups was also slower (32.03 ms,
+519 GB/s), so the latter experiment was removed.  The isolated kernel exceeds
+700 GB/s without token batching; the remaining model-level loss comes from 129
+short projection/collective phases per token rather than the steady-state
+microkernel.
+
+### TP4 BF16 decode and MTP follow-up (2026-08-23, job 50782148)
+
+The four BF16 shards were restaged and verified on fresh node-local storage.
+A 128-token exact baseline produced token SHA256
+`38630a0a8022e55e8424680855f0dcdb44f7550207ea1788f0211260e0cd4bd1`.
+It reached 27.24 tok/s cold; after 32 warmup tokens the default distance-8 run
+reported 34.02 ms/token on rank 0 (28.33 ms compute plus 5.69 ms communication),
+or 29.20 tok/s including warmup.  The requested 33 tok/s sustained decode target
+was therefore not met.
+
+The exact low/high reduction microkernel remains bandwidth-limited by the
+projection shape.  At 2.0 GHz, distances 8/10/12 measured 754/772/755 GB/s for
+K=4352, 826/836/824 GB/s for K=5120, and 844/850/845 GB/s for K=6144.  The best
+result was **850.36 GB/s**, below the 880 GB/s target but 92.6% of the harness's
+919 GB/s stream ceiling.  Model-level prefetch and collective sweeps sometimes
+changed the greedy stream, so no faster setting replaced the exact distance-8
+default.  In particular, the fastest short distance-10 run reached 32.31
+ms/token but failed the token gate.
+
+The TP NextN path now slices its optional private vocabulary head per rank,
+applies the trunk output RMSNorm when a private draft-head norm is absent, and
+right-shifts prompt hidden states while warming the draft cache.  This cuts
+NextN materialization from 2.774 GB to 0.866 GB per node and prevents the draft
+head from collapsing to tiny local IDs.  However, the current draft remains
+misaligned with the trunk (`MTP greedy match=0/4` in the traced validation), so
+there is no honest accepted-token speedup and the 50 tok/s MTP target is not
+met.  `run_qwen38_bf16_tp4.sh mtp-check` reproduces the greedy-agreement probe;
+normal `bench` keeps `TP_SPEC_K=0`.  Batched verification must remain disabled
+until this probe reports nonzero, stable agreement against the exact stream.

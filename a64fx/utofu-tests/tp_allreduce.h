@@ -622,10 +622,10 @@ static int tp_allreduce_max_checked(tp_comm *c,float *buf,int count){
 static void tp_ar_send_argmax(tp_comm *c, int peer, int sid, const float *vi, uint64_t tok) {
     char *sb = c->region + tp_ar_slot_off(c, 0);
     memcpy(sb, vi, 2 * sizeof(float));
-    size_t tr_off = (size_t)c->max_count * sizeof(float);
-    *(volatile uint64_t *)(sb + tr_off) = tok;
     utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
     utofu_stadd_t dst = c->peer_base[peer] + tp_ar_slot_off(c, 1 + sid);
+    size_t tr_off = (size_t)c->max_count * sizeof(float);
+    *(volatile uint64_t *)(sb + tr_off) = tok;
     tp_ar_put(c, peer, src, dst, 2 * sizeof(float));
     tp_ar_put(c, peer, src + tr_off, dst + tr_off, 8);
 }

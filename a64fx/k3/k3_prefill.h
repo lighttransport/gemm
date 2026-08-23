@@ -73,9 +73,9 @@ static inline void k3_prefill_pack_activation_block(float *dst,
 
 /* C[M,N] = X[M,K] * W[N,K]^T. The caller owns both persistent packed
  * weights and activation scratch, so this path performs no allocation. */
-static inline int k3_prefill_gemm_bf16_pv(float *out,const float *x,int batch,
+static inline int k3_prefill_gemm_bf16_pv_ex(float *out,const float *x,int batch,
         const k3_bf16_matrix *matrix,const uint16_t *packed,
-        float *scratch,size_t scratch_bytes,int threads){
+        float *scratch,size_t scratch_bytes,int threads,int pack_activation){
     if(!out||!x||!matrix||!packed||!scratch||batch<1||threads<1||
        matrix->rows<1||matrix->cols<1||matrix->cols%4||
        scratch_bytes<k3_prefill_bf16_scratch_bytes(batch,matrix->cols))return-1;
@@ -90,10 +90,14 @@ static inline int k3_prefill_gemm_bf16_pv(float *out,const float *x,int batch,
     omp_set_num_threads(threads);
 #pragma omp parallel
     {
+#endif
+    if(pack_activation){
+#if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
-    for(int mb=0;mb<mblocks;++mb)k3_prefill_pack_activation_block(
-        scratch+(size_t)mb*kround*K3_PREFILL_MR,panel_x,panel,matrix->cols,mb,kround);
+        for(int mb=0;mb<mblocks;++mb)k3_prefill_pack_activation_block(
+            scratch+(size_t)mb*kround*K3_PREFILL_MR,panel_x,panel,matrix->cols,mb,kround);
+    }
 #if defined(_OPENMP)
 #pragma omp for collapse(2) schedule(static)
 #endif
@@ -117,6 +121,13 @@ static inline int k3_prefill_gemm_bf16_pv(float *out,const float *x,int batch,
 #endif
     }
     return 0;
+}
+
+static inline int k3_prefill_gemm_bf16_pv(float *out,const float *x,int batch,
+        const k3_bf16_matrix *matrix,const uint16_t *packed,
+        float *scratch,size_t scratch_bytes,int threads){
+    return k3_prefill_gemm_bf16_pv_ex(out,x,batch,matrix,packed,scratch,
+                                      scratch_bytes,threads,1);
 }
 
 #endif

@@ -331,19 +331,19 @@ static int tf_cache_kv_dim_for_layer(const transformer_model *m, int l) {
 static tp_layer_cache tp_layer_cache_bytes(const transformer_model *m, int l) {
     tp_layer_cache x = {0,0,0,0,0,0};
     if (!m || l < 0 || l >= m->n_layers) return x;
-    if (!m->key_cache || !m->value_cache) return x;
-    if (!m->key_cache[l] || !m->value_cache[l]) return x;
-    if (m->is_hybrid && m->layers && m->layers[l].is_ssm) return x;
-    if (m->is_gemma4 && m->layers && m->layers[l].shared_kv_source >= 0) return x;
-
-    size_t seq = tf_cache_seq_len_for_layer(m, l);
-    int kv_dim = tf_cache_kv_dim_for_layer(m, l);
-    x.key_bytes = (int64_t)seq * kv_dim * (int64_t)m->kv_elem_bytes;
-    x.value_bytes = x.key_bytes;
-    if (m->key_scales && m->key_scales[l])
-        x.key_scale_bytes = (int64_t)seq * (int64_t)m->n_kv_heads * (int64_t)sizeof(float);
-    if (m->value_scales && m->value_scales[l])
-        x.value_scale_bytes = x.key_scale_bytes;
+    int is_ssm = m->is_hybrid && m->layers && m->layers[l].is_ssm;
+    if (!is_ssm && m->key_cache && m->value_cache &&
+        m->key_cache[l] && m->value_cache[l] &&
+        !(m->is_gemma4 && m->layers && m->layers[l].shared_kv_source >= 0)) {
+        size_t seq = tf_cache_seq_len_for_layer(m, l);
+        int kv_dim = tf_cache_kv_dim_for_layer(m, l);
+        x.key_bytes = (int64_t)seq * kv_dim * (int64_t)m->kv_elem_bytes;
+        x.value_bytes = x.key_bytes;
+        if (m->key_scales && m->key_scales[l])
+            x.key_scale_bytes = (int64_t)seq * (int64_t)m->n_kv_heads * (int64_t)sizeof(float);
+        if (m->value_scales && m->value_scales[l])
+            x.value_scale_bytes = x.key_scale_bytes;
+    }
     if (m->conv_state && m->conv_state[l] && m->ssm_conv_kernel > 1 && m->ssm_qkv_dim > 0) {
         x.conv_state_bytes = (int64_t)(m->ssm_conv_kernel - 1) * (int64_t)m->ssm_qkv_dim * (int64_t)sizeof(float);
     }
@@ -540,6 +540,169 @@ static int tp_checkpoint_load(transformer_model *m, const char *path,
 
     fclose(f);
     return 0;
+}
+
+/* Load a TP12 prefill checkpoint into a TP4 decode rank.  TP12 keeps full KV
+ * for the four attention heads and owns four SSM V heads; TP4 owns one KV head
+ * and twelve SSM V heads.  The checkpoint files are intentionally per-source
+ * rank so the repartitioner can combine them without an MPI dependency. */
+static int tp_checkpoint_load_repartition(transformer_model *m,
+                                          const char *root,
+                                          const char *model_path,
+                                          const char *tag,
+                                          int src_size, int target_rank,
+                                          int64_t *cache_pos,
+                                          int32_t *next_token) {
+    if (!m || !root || !*root || src_size != 12 || m->tp_size != 4) return -1;
+    FILE *fs[12] = {0};
+    tp_cache_header hs[12];
+    for (int r = 0; r < src_size; r++) {
+        char p[PATH_MAX];
+        if (tp_build_cache_path(p, sizeof(p), m, model_path, NULL, root, tag, r, 0) != 0)
+            goto fail;
+        fs[r] = fopen(p, "rb");
+        if (!fs[r] || read_full(fs[r], &hs[r], sizeof(hs[r])) != 0) {
+            fprintf(stderr, "tp repartition open/read failed rank=%d path=%s errno=%d\n", r, p, errno);
+            goto fail;
+        }
+        if (hs[r].magic != TP_CACHE_MAGIC || hs[r].version != TP_CACHE_VERSION ||
+            hs[r].tp_size != src_size || hs[r].n_layers != m->n_layers ||
+            hs[r].n_embd != m->n_embd || hs[r].n_heads != m->n_heads * m->tp_size ||
+            hs[r].n_kv_heads != m->n_kv_heads * m->tp_size || hs[r].n_head_dim != m->head_dim ||
+            !hs[r].is_hybrid || hs[r].cache_pos < 0 || hs[r].cache_pos > m->max_seq_len) {
+            fprintf(stderr, "tp repartition header mismatch rank=%d magic=%x ver=%u tp=%d layers=%d hybrid=%d pos=%d\n",
+                    r, hs[r].magic, hs[r].version, hs[r].tp_size, hs[r].n_layers,
+                    hs[r].is_hybrid, hs[r].cache_pos);
+            goto fail;
+        }
+        if (r > 0 && (hs[r].cache_pos != hs[0].cache_pos || hs[r].next_token != hs[0].next_token))
+            goto fail;
+    }
+    if (cache_pos) *cache_pos = hs[0].cache_pos;
+    if (next_token) *next_token = hs[0].next_token;
+
+    int src_dt = 48 / src_size;
+    int dst_dt = m->ssm_dt_rank;
+    int ds = m->ssm_d_state;
+    int qk = 2 * m->ssm_n_group * ds;
+    int src_qkv = qk + src_dt * ds;
+    int dst_qkv = qk + dst_dt * ds;
+    int dst_kv_heads = m->tp_kv_head_count;
+    int dst_kv_dim = dst_kv_heads * m->head_dim;
+    size_t src_seq = (size_t)hs[0].max_seq_len;
+    for (int l = 0; l < m->n_layers; l++) {
+        tp_layer_cache lc[12];
+        for (int r = 0; r < src_size; r++) {
+            if (read_i64(fs[r], &lc[r].key_bytes) != 0 ||
+                read_i64(fs[r], &lc[r].value_bytes) != 0 ||
+                read_i64(fs[r], &lc[r].key_scale_bytes) != 0 ||
+                read_i64(fs[r], &lc[r].value_scale_bytes) != 0 ||
+                read_i64(fs[r], &lc[r].conv_state_bytes) != 0 ||
+                read_i64(fs[r], &lc[r].recurrent_state_bytes) != 0) goto fail;
+        }
+        int is_attn = !(m->layers[l].is_ssm);
+        if (is_attn && m->key_cache && m->key_cache[l] && lc[0].key_bytes > 0) {
+            size_t src_row = (size_t)m->n_kv_heads * m->head_dim * m->kv_elem_bytes;
+            size_t dst_row = (size_t)dst_kv_dim * m->kv_elem_bytes;
+            uint8_t *all = (uint8_t *)malloc((size_t)lc[0].key_bytes);
+            if (!all || read_full(fs[0], all, (size_t)lc[0].key_bytes) != 0) { free(all); goto fail; }
+            int head = m->tp_kv_head_base;
+            size_t rows = (size_t)lc[0].key_bytes / src_row;
+            if (rows > src_seq) rows = src_seq;
+            for (size_t t = 0; t < rows; t++) {
+                memcpy((uint8_t *)m->key_cache[l] + t * dst_row,
+                       all + t * src_row + (size_t)head * m->head_dim * m->kv_elem_bytes, dst_row);
+            }
+            free(all);
+            for (int r = 1; r < src_size; r++)
+                if (lc[r].key_bytes && fseek(fs[r], (long)lc[r].key_bytes, SEEK_CUR) != 0) goto fail;
+        } else {
+            for (int r = 0; r < src_size; r++)
+                if (lc[r].key_bytes && fseek(fs[r], (long)lc[r].key_bytes, SEEK_CUR) != 0) goto fail;
+        }
+        for (int r = 0; r < src_size; r++) {
+            if (lc[r].value_bytes && (is_attn && r == 0 && m->value_cache && m->value_cache[l])) {
+                size_t src_row = (size_t)m->n_kv_heads * m->head_dim * m->kv_elem_bytes;
+                size_t dst_row = (size_t)dst_kv_dim * m->kv_elem_bytes;
+                uint8_t *all = (uint8_t *)malloc((size_t)lc[r].value_bytes);
+                if (!all || read_full(fs[r], all, (size_t)lc[r].value_bytes) != 0) { free(all); goto fail; }
+                int head = m->tp_kv_head_base;
+                size_t rows = (size_t)lc[r].value_bytes / src_row;
+                if (rows > src_seq) rows = src_seq;
+                for (size_t t = 0; t < rows; t++) {
+                    memcpy((uint8_t *)m->value_cache[l] + t * dst_row,
+                           all + t * src_row + (size_t)head * m->head_dim * m->kv_elem_bytes, dst_row);
+                }
+                free(all);
+            } else if (lc[r].value_bytes && fseek(fs[r], (long)lc[r].value_bytes, SEEK_CUR) != 0) goto fail;
+            if (lc[r].key_scale_bytes && fseek(fs[r], (long)lc[r].key_scale_bytes, SEEK_CUR) != 0) goto fail;
+            if (lc[r].value_scale_bytes && fseek(fs[r], (long)lc[r].value_scale_bytes, SEEK_CUR) != 0) goto fail;
+        }
+        if (!is_attn) {
+            float *conv[12] = {0}, *rec[12] = {0};
+            for (int r = 0; r < src_size; r++) {
+                if (lc[r].conv_state_bytes != (int64_t)(m->ssm_conv_kernel - 1) * src_qkv * sizeof(float) ||
+                    lc[r].recurrent_state_bytes != (int64_t)src_dt * ds * ds * sizeof(float)) {
+                    for (int j = 0; j < src_size; j++) { free(conv[j]); free(rec[j]); }
+                    goto fail;
+                }
+                conv[r] = (float *)malloc((size_t)lc[r].conv_state_bytes);
+                rec[r] = (float *)malloc((size_t)lc[r].recurrent_state_bytes);
+                if (!conv[r] || !rec[r] ||
+                    read_full(fs[r], conv[r], (size_t)lc[r].conv_state_bytes) != 0 ||
+                    read_full(fs[r], rec[r], (size_t)lc[r].recurrent_state_bytes) != 0) {
+                    for (int j = 0; j < src_size; j++) { free(conv[j]); free(rec[j]); }
+                    goto fail;
+                }
+            }
+            if (m->conv_state && m->conv_state[l]) {
+                int nh = m->ssm_conv_kernel - 1;
+                for (int h = 0; h < nh; h++) {
+                    memcpy(m->conv_state[l] + (size_t)h * dst_qkv,
+                           conv[0] + (size_t)h * src_qkv, (size_t)qk * sizeof(float));
+                    float *d = m->conv_state[l] + (size_t)h * dst_qkv + qk;
+                    for (int j = 0; j < 3; j++) {
+                        int sr = target_rank * 3 + j;
+                        memcpy(d + (size_t)j * src_dt * ds,
+                               conv[sr] + (size_t)h * src_qkv + qk,
+                               (size_t)src_dt * ds * sizeof(float));
+                    }
+                }
+            }
+            if (m->recurrent_state && m->recurrent_state[l]) {
+                for (int j = 0; j < 3; j++) {
+                    int sr = target_rank * 3 + j;
+                    memcpy(m->recurrent_state[l] + (size_t)j * src_dt * ds * ds,
+                           rec[sr], (size_t)src_dt * ds * ds * sizeof(float));
+                }
+            }
+            for (int r = 0; r < src_size; r++) { free(conv[r]); free(rec[r]); }
+        } else {
+            for (int r = 0; r < src_size; r++) {
+                if (lc[r].conv_state_bytes && fseek(fs[r], (long)lc[r].conv_state_bytes, SEEK_CUR) != 0) goto fail;
+                if (lc[r].recurrent_state_bytes && fseek(fs[r], (long)lc[r].recurrent_state_bytes, SEEK_CUR) != 0) goto fail;
+            }
+        }
+    }
+    if (m->conv_state_pos) {
+        for (int r = 0; r < src_size; r++) {
+            for (int l = 0; l < m->n_layers; l++) {
+                int32_t p;
+                if (read_i32(fs[r], &p) != 0) goto fail;
+                if (r == 0) m->conv_state_pos[l] = p;
+            }
+        }
+    }
+    for (int r = 0; r < src_size; r++) fclose(fs[r]);
+    if (target_rank == 0)
+        fprintf(stderr, "tp cache repartition complete: source TP%d -> target TP%d pos=%d\n",
+                src_size, m->tp_size, hs[0].cache_pos);
+    return 0;
+
+fail:
+    fprintf(stderr, "tp repartition failed rank=%d\n", target_rank);
+    for (int r = 0; r < src_size; r++) if (fs[r]) fclose(fs[r]);
+    return -1;
 }
 
 static int tp_checkpoint_probe(const transformer_model *m, const char *path,
@@ -787,6 +950,8 @@ int main(int argc, char **argv) {
     int  dry_token_step   = (int)envl_opt("TP_DRY_TOKEN_STEP", 1);
     int  cache_load         = envb_opt("TP_CACHE_LOAD", 0);
     int  cache_save         = envb_opt("TP_CACHE_SAVE", 0);
+    int  cache_autosave     = envb_opt("TP_CACHE_AUTOSAVE", 1);
+    int  cache_repartition_from = (int)envl_opt("TP_CACHE_REPARTITION_FROM", 0);
     const char *cache_shared_s = envs_opt("TP_CACHE_SHARED", "auto");
     const char *cache_dir = envs_opt("TP_CACHE_DIR", "");
     const char *cache_path_env = envs_opt("TP_CACHE_PATH", "");
@@ -897,11 +1062,49 @@ int main(int argc, char **argv) {
     int ssm_shard = m->is_hybrid && !getenv("TP_NO_SSM_SHARD");
     if (transformer_tp_slice_weights(m, MyRank, N, ssm_shard) != 0)
         die("transformer_tp_slice_weights (check n_heads/n_kv/n_ff/ssm_dt % N)", -1);
+    if (spec_k > 0 && m->nextn.loaded &&
+        transformer_tp_slice_nextn(m, MyRank, N) != 0)
+        die("transformer_tp_slice_nextn", -1);
     size_t tp_stage_bytes = 0;
     const char *tp_stage_dir = envs_opt("TP_STAGE_DIR", "");
     if (tp_stage_dir[0]) {
         tp_stage_bytes = transformer_tp_load_stage(m, tp_stage_dir, MyRank, N);
         if (!tp_stage_bytes) die("transformer_tp_load_stage", -1);
+    }
+    /* Q8 TP shards can be converted once to row-major W8A8.  This selects the
+     * native SVE SDOT matvec path; keep it opt-in because it is lossy and only
+     * applies to Q8_0 models. */
+    const char *q8_mode_env = getenv("TP_Q8_MODE");
+    int is_q8_model = m->layers &&
+        (m->layers[0].attn_q.type == GGML_TYPE_Q8_0 ||
+         m->layers[0].ssm_qkv.type == GGML_TYPE_Q8_0 ||
+         m->layers[0].ffn_gate.type == GGML_TYPE_Q8_0);
+    if (q8_mode_env && is_q8_model) {
+        int q8_mode = !strcmp(q8_mode_env, "row") ? 1 :
+                      !strcmp(q8_mode_env, "block64") ? 2 :
+                      !strcmp(q8_mode_env, "block64-ffn") ? 3 :
+                      !strcmp(q8_mode_env, "block64-exact") ? 4 : 0;
+        size_t q8_bytes = transformer_materialize_q8_decode(m, gguf, q8_mode);
+        if (!q8_bytes) die("transformer_materialize_q8_decode", -1);
+        if (MyRank == 0) logmsg("TP_Q8_MODE=%s resident=%.3fGB\n", q8_mode_env,
+                                (double)q8_bytes / 1e9);
+    }
+    if (getenv("TP_INT8_MODE") && *getenv("TP_INT8_MODE")) {
+        if (m->layers[0].ffn_gate.type != GGML_TYPE_BF16)
+            die("TP_INT8_MODE requires BF16 TP shards", -1);
+        if (!strcmp(getenv("TP_INT8_MODE"), "block64-ffn"))
+            transformer_prepack_int8_block64_ffn(m);
+        else if (!strcmp(getenv("TP_INT8_MODE"), "block64"))
+            transformer_prepack_int8_block64(m);
+        else
+            transformer_prepack_int8(m);
+        if (MyRank == 0) logmsg("TP_INT8_MODE=%s enabled for resident BF16 projections\n",
+                                getenv("TP_INT8_MODE"));
+    }
+    if (spec_k > 0 && m->nextn.loaded &&
+        envb("TP_MATERIALIZE_NEXTN", 1)) {
+        size_t nextn_bytes = transformer_materialize_nextn(m);
+        if (!nextn_bytes) die("transformer_materialize_nextn", -1);
     }
     double tp0 = now_sec();
     if (!envb("TF_NO_PANEL", 0))
@@ -1065,7 +1268,7 @@ int main(int argc, char **argv) {
             have_cache_path = 1;
     }
 
-    if (cache_path_env[0] || cache_dir[0]) {
+    if (cache_autosave && (cache_path_env[0] || cache_dir[0])) {
         if (!cache_load)  cache_load = 1;
         if (!cache_save)  cache_save = 1;
     }
@@ -1073,14 +1276,28 @@ int main(int argc, char **argv) {
     if (cache_load && have_cache_path) {
         int64_t probe_pos = -1; int32_t probe_next = -1;
         int cache_rank = cache_shared ? -1 : MyRank;
-        int probe_ok = (tp_checkpoint_probe(m, cache_path, &probe_pos, &probe_next,
-                                          N, cache_rank, max_seq, cache_shared) == 0);
+        int probe_ok;
+        if (cache_repartition_from > 0) {
+            if (is_first) fprintf(stderr, "tp cache repartition source=%d dir=%s target=%d\n",
+                                  cache_repartition_from, cache_dir, N);
+            probe_ok = cache_dir[0] && cache_repartition_from != N &&
+                tp_checkpoint_load_repartition(m, cache_dir, model_path, cache_tag,
+                                               cache_repartition_from, MyRank,
+                                               &probe_pos, &probe_next) == 0;
+        } else {
+            probe_ok = (tp_checkpoint_probe(m, cache_path, &probe_pos, &probe_next,
+                                             N, cache_rank, max_seq, cache_shared) == 0);
+        }
         float all_probe = probe_ok ? 1.0f : 0.0f;
         tp_allreduce_sum(&c, &all_probe, 1);
         int all_ranks_probe = ((int)(all_probe + 0.5f) == N);
         if (all_ranks_probe) {
-            cache_loaded = (tp_checkpoint_load(m, cache_path, &ck_pos, &ck_next,
-                                             cache_rank, N, cache_shared) == 0);
+            if (cache_repartition_from > 0) {
+                ck_pos = probe_pos; ck_next = probe_next; cache_loaded = 1;
+            } else {
+                cache_loaded = (tp_checkpoint_load(m, cache_path, &ck_pos, &ck_next,
+                                                 cache_rank, N, cache_shared) == 0);
+            }
             if (cache_loaded) cache_prefill_used = 1;
             if (!cache_loaded && is_first)
                 logmsg("TP cache load failed on rank0 after pre-check: %s\n", cache_path);
@@ -1097,6 +1314,11 @@ int main(int argc, char **argv) {
     double t_prefill = 0.0;
     double t_fwd = 0.0;
     long mtp_match = 0, mtp_total = 0;
+    int32_t mtp_pending[4] = {-1, -1, -1, -1};
+    int mtp_pending_n = 0;
+    float *mtp_seed_hidden = spec_k > 0
+        ? (float *)malloc((size_t)n_embd * sizeof(float)) : NULL;
+    if (spec_k > 0 && !mtp_seed_hidden) die("MTP hidden allocation", -1);
     double t_comm = 0.0;
     long pcnt = 0, ar_calls = 0;
     int32_t in_tok = (P > 0) ? ptoks[0] : 0;
@@ -1169,6 +1391,12 @@ int main(int argc, char **argv) {
         }
         if (!prefill_gemm_used) {
             double pf0 = now_sec();
+            if (spec_k && m->nextn.loaded && prefill_from == 0) {
+                /* Match llama.cpp's right-shift catch-up: position zero pairs
+                 * the first prompt token with an all-zero pending hidden row. */
+                memset(mtp_seed_hidden, 0, (size_t)n_embd * sizeof(float));
+                transformer_nextn_logits(m, ptoks[0], mtp_seed_hidden, 0);
+            }
             for (int p = prefill_from; p < P; p++) {
                 transformer_embed_token(m, ptoks[p]);
                 double _ta = now_sec();
@@ -1176,7 +1404,12 @@ int main(int argc, char **argv) {
                 if (spec_k && m->nextn.loaded) {
                     float *target_h = (float *)alloca((size_t)n_embd * sizeof(float));
                     memcpy(target_h, transformer_get_hidden(m), (size_t)n_embd * sizeof(float));
-                    transformer_nextn_logits(m, ptoks[p], target_h, p);
+                    memcpy(mtp_seed_hidden, transformer_get_hidden(m),
+                           (size_t)n_embd * sizeof(float));
+                    /* Teacher-force the known next prompt token.  The draft
+                     * head consumes (h[p], token[p+1]) and predicts token[p+2]. */
+                    if (p + 1 < P)
+                        transformer_nextn_logits(m, ptoks[p + 1], mtp_seed_hidden, p + 1);
                     transformer_set_hidden(m, target_h);
                 }
                 t_fwd += now_sec() - _ta;
@@ -1187,6 +1420,23 @@ int main(int argc, char **argv) {
             in_tok = sample_argmax(m, lg, &c, &ar_step, &ar_calls_step);
             t_prefill = now_sec() - pf0;
             t_comm += ar_step; ar_calls += ar_calls_step;
+
+            /* Seed predictions beyond the first target token.  The trunk
+             * logits above already provide in_tok; NextN predicts the token
+             * after it, so agreement is checked on the following trunk step. */
+            if (spec_k && m->nextn.loaded && mtp_seed_hidden) {
+                const float *dh = mtp_seed_hidden;
+                int32_t prev = in_tok;
+                for (int k = 0; k < spec_k; k++) {
+                    float *dlg = transformer_nextn_logits(m, prev, dh, P + k);
+                    double da = 0.0; long dc = 0;
+                    mtp_pending[k] = sample_argmax(m, dlg, &c, &da, &dc);
+                    t_comm += da; ar_calls += dc;
+                    prev = mtp_pending[k];
+                    dh = transformer_nextn_hidden(m);
+                }
+                mtp_pending_n = spec_k;
+            }
         }
     } else {
         if (cache_loaded && token_in_vocab(vocab, ck_next)) {
@@ -1250,17 +1500,27 @@ int main(int argc, char **argv) {
             float *lg = transformer_compute_logits(m);
             nt = sample_argmax(m, lg, &c, &ar_step, &ar_calls_step);
             if (spec_k && m->nextn.loaded) {
+                if (mtp_pending_n > 0) {
+                    if (is_first && getenv("TP_MTP_TRACE"))
+                        logmsg("MTP compare pos=%d draft=%d target=%d\n",
+                               p, mtp_pending[0], nt);
+                    mtp_match += mtp_pending[0] == nt;
+                    mtp_total++;
+                }
+                /* Qwen3.5 exports h_nextn after the trunk output RMSNorm. */
                 const float *draft_h = transformer_get_hidden(m);
-                int prev = in_tok;
+                int prev = nt;
                 for (int k = 0; k < spec_k; k++) {
-                    float *dlg = transformer_nextn_logits(m, prev, draft_h, p + k);
-                    int draft = 0;
-                    for (int v = 1; v < m->n_vocab; v++)
-                        if (dlg[v] > dlg[draft]) draft = v;
-                    if (k == 0) { mtp_match += draft == nt; mtp_total++; }
+                    float *dlg = transformer_nextn_logits(m, prev, draft_h, p + 1 + k);
+                    double draft_ar = 0.0; long draft_calls = 0;
+                    int32_t draft = sample_argmax(m, dlg, &c, &draft_ar, &draft_calls);
+                    ar_step += draft_ar;
+                    ar_calls_step += draft_calls;
+                    mtp_pending[k] = draft;
                     prev = draft;
                     draft_h = transformer_nextn_hidden(m);
                 }
+                mtp_pending_n = spec_k;
             }
         }
 
@@ -1291,6 +1551,7 @@ int main(int argc, char **argv) {
     }
 
 done:
+    free(mtp_seed_hidden);
     barrier();
     if (is_first && mtp_total)
         logmsg("MTP greedy match=%ld/%ld alpha=%.4f K=%d\n",

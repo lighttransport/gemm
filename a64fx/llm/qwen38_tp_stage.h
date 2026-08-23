@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 #define Q38TP_MAGIC "Q38TPB1"
-#define Q38TP_VERSION 1u
+#define Q38TP_VERSION 2u
 #define Q38TP_MAX_ENTRIES 768u
 #define Q38TP_NAME_BYTES 96u
 #define Q38TP_HEADER_BYTES (2u * 1024u * 1024u)
@@ -30,6 +30,8 @@ typedef struct {
     uint32_t col1;
     uint32_t qk_rows;
     uint32_t reserved;
+    uint64_t source_row_bytes;
+    uint64_t local_row_bytes;
     uint64_t file_offset;
     uint64_t byte_length;
     uint64_t checksum;

@@ -121,44 +121,43 @@ kernel_q8v2_3x4:
     ld1rw   { z25.s }, p1/z, [x11, #4]           // ad row1
     ld1rw   { z26.s }, p1/z, [x11, #8]           // ad row2
 
-    // row0
+    // Conversion, weight scaling, and activation accumulation are issued in
+    // separate waves so independent vectors hide SCVTF/FMUL latency.
     scvtf   z12.s, p1/m, z12.s
-    fmul    z12.s, z12.s, z27.s
-    fmla    z0.s, p1/m, z12.s, z24.s
     scvtf   z13.s, p1/m, z13.s
-    fmul    z13.s, z13.s, z28.s
-    fmla    z1.s, p1/m, z13.s, z24.s
     scvtf   z14.s, p1/m, z14.s
-    fmul    z14.s, z14.s, z29.s
-    fmla    z2.s, p1/m, z14.s, z24.s
     scvtf   z15.s, p1/m, z15.s
-    fmul    z15.s, z15.s, z30.s
-    fmla    z3.s, p1/m, z15.s, z24.s
-    // row1
     scvtf   z16.s, p1/m, z16.s
-    fmul    z16.s, z16.s, z27.s
-    fmla    z4.s, p1/m, z16.s, z25.s
     scvtf   z17.s, p1/m, z17.s
-    fmul    z17.s, z17.s, z28.s
-    fmla    z5.s, p1/m, z17.s, z25.s
     scvtf   z18.s, p1/m, z18.s
-    fmul    z18.s, z18.s, z29.s
-    fmla    z6.s, p1/m, z18.s, z25.s
     scvtf   z19.s, p1/m, z19.s
-    fmul    z19.s, z19.s, z30.s
-    fmla    z7.s, p1/m, z19.s, z25.s
-    // row2
     scvtf   z20.s, p1/m, z20.s
-    fmul    z20.s, z20.s, z27.s
-    fmla    z8.s, p1/m, z20.s, z26.s
     scvtf   z21.s, p1/m, z21.s
-    fmul    z21.s, z21.s, z28.s
-    fmla    z9.s, p1/m, z21.s, z26.s
     scvtf   z22.s, p1/m, z22.s
-    fmul    z22.s, z22.s, z29.s
-    fmla    z10.s, p1/m, z22.s, z26.s
     scvtf   z23.s, p1/m, z23.s
+    fmul    z12.s, z12.s, z27.s
+    fmul    z13.s, z13.s, z28.s
+    fmul    z14.s, z14.s, z29.s
+    fmul    z15.s, z15.s, z30.s
+    fmul    z16.s, z16.s, z27.s
+    fmul    z17.s, z17.s, z28.s
+    fmul    z18.s, z18.s, z29.s
+    fmul    z19.s, z19.s, z30.s
+    fmul    z20.s, z20.s, z27.s
+    fmul    z21.s, z21.s, z28.s
+    fmul    z22.s, z22.s, z29.s
     fmul    z23.s, z23.s, z30.s
+    fmla    z0.s, p1/m, z12.s, z24.s
+    fmla    z1.s, p1/m, z13.s, z24.s
+    fmla    z2.s, p1/m, z14.s, z24.s
+    fmla    z3.s, p1/m, z15.s, z24.s
+    fmla    z4.s, p1/m, z16.s, z25.s
+    fmla    z5.s, p1/m, z17.s, z25.s
+    fmla    z6.s, p1/m, z18.s, z25.s
+    fmla    z7.s, p1/m, z19.s, z25.s
+    fmla    z8.s, p1/m, z20.s, z26.s
+    fmla    z9.s, p1/m, z21.s, z26.s
+    fmla    z10.s, p1/m, z22.s, z26.s
     fmla    z11.s, p1/m, z23.s, z26.s
 
     // advance per-block pointers
@@ -342,3 +341,162 @@ kernel_q8v2_3x4_arow:
     ldp     d8, d9,  [sp], #16
     ret
     .size kernel_q8v2_3x4_arow, .-kernel_q8v2_3x4_arow
+
+// ===========================================================================
+// kernel_q8v2_6x2: per-block scales, 6 token rows x 32 output columns.
+// Two calls cover the same 6x64 output area for which 3x4 needs four calls,
+// halving B-panel loads while retaining the exact per-32 quantization scheme.
+// bq/bd may point at either 32-column half of a packed 64-column panel.
+// aq=[nb][6][32], ad=[nb][6], bq block stride=2048, bd block stride=256.
+// ===========================================================================
+    .align 6
+    .global kernel_q8v2_6x2
+    .type kernel_q8v2_6x2, @function
+kernel_q8v2_6x2:
+    stp d8, d9, [sp, #-16]!
+    stp d10, d11, [sp, #-16]!
+    stp d12, d13, [sp, #-16]!
+    stp d14, d15, [sp, #-16]!
+    ptrue p0.b
+    ptrue p1.s
+    dup z0.s,#0
+    dup z1.s,#0
+    dup z2.s,#0
+    dup z3.s,#0
+    dup z4.s,#0
+    dup z5.s,#0
+    dup z6.s,#0
+    dup z7.s,#0
+    dup z8.s,#0
+    dup z9.s,#0
+    dup z10.s,#0
+    dup z11.s,#0
+    mov x7,x0
+    mov x8,x2
+    mov x9,x3
+    mov x10,x1
+.L6x2_block:
+    dup z12.s,#0
+    dup z13.s,#0
+    dup z14.s,#0
+    dup z15.s,#0
+    dup z16.s,#0
+    dup z17.s,#0
+    dup z18.s,#0
+    dup z19.s,#0
+    dup z20.s,#0
+    dup z21.s,#0
+    dup z22.s,#0
+    dup z23.s,#0
+    mov x11,x7
+    add x12,x7,#32
+    add x13,x7,#64
+    add x14,x7,#96
+    add x15,x7,#128
+    add x16,x7,#160
+    mov x17,x8
+    mov x0,#8
+.L6x2_kg:
+    ld1rw {z24.s},p1/z,[x11]
+    ld1rw {z25.s},p1/z,[x12]
+    ld1rw {z26.s},p1/z,[x13]
+    ld1rw {z27.s},p1/z,[x14]
+    ld1rw {z28.s},p1/z,[x15]
+    ld1rw {z29.s},p1/z,[x16]
+    ld1b {z30.b},p0/z,[x17,#0,mul vl]
+    ld1b {z31.b},p0/z,[x17,#1,mul vl]
+    sdot z12.s,z24.b,z30.b
+    sdot z13.s,z24.b,z31.b
+    sdot z14.s,z25.b,z30.b
+    sdot z15.s,z25.b,z31.b
+    sdot z16.s,z26.b,z30.b
+    sdot z17.s,z26.b,z31.b
+    sdot z18.s,z27.b,z30.b
+    sdot z19.s,z27.b,z31.b
+    sdot z20.s,z28.b,z30.b
+    sdot z21.s,z28.b,z31.b
+    sdot z22.s,z29.b,z30.b
+    sdot z23.s,z29.b,z31.b
+    add x11,x11,#4
+    add x12,x12,#4
+    add x13,x13,#4
+    add x14,x14,#4
+    add x15,x15,#4
+    add x16,x16,#4
+    add x17,x17,#256
+    subs x0,x0,#1
+    b.gt .L6x2_kg
+    ld1w {z30.s},p1/z,[x9,#0,mul vl]
+    ld1w {z31.s},p1/z,[x9,#1,mul vl]
+    ld1rw {z24.s},p1/z,[x10]
+    ld1rw {z25.s},p1/z,[x10,#4]
+    ld1rw {z26.s},p1/z,[x10,#8]
+    ld1rw {z27.s},p1/z,[x10,#12]
+    ld1rw {z28.s},p1/z,[x10,#16]
+    ld1rw {z29.s},p1/z,[x10,#20]
+    scvtf z12.s,p1/m,z12.s
+    fmul z12.s,z12.s,z30.s
+    fmla z0.s,p1/m,z12.s,z24.s
+    scvtf z13.s,p1/m,z13.s
+    fmul z13.s,z13.s,z31.s
+    fmla z1.s,p1/m,z13.s,z24.s
+    scvtf z14.s,p1/m,z14.s
+    fmul z14.s,z14.s,z30.s
+    fmla z2.s,p1/m,z14.s,z25.s
+    scvtf z15.s,p1/m,z15.s
+    fmul z15.s,z15.s,z31.s
+    fmla z3.s,p1/m,z15.s,z25.s
+    scvtf z16.s,p1/m,z16.s
+    fmul z16.s,z16.s,z30.s
+    fmla z4.s,p1/m,z16.s,z26.s
+    scvtf z17.s,p1/m,z17.s
+    fmul z17.s,z17.s,z31.s
+    fmla z5.s,p1/m,z17.s,z26.s
+    scvtf z18.s,p1/m,z18.s
+    fmul z18.s,z18.s,z30.s
+    fmla z6.s,p1/m,z18.s,z27.s
+    scvtf z19.s,p1/m,z19.s
+    fmul z19.s,z19.s,z31.s
+    fmla z7.s,p1/m,z19.s,z27.s
+    scvtf z20.s,p1/m,z20.s
+    fmul z20.s,z20.s,z30.s
+    fmla z8.s,p1/m,z20.s,z28.s
+    scvtf z21.s,p1/m,z21.s
+    fmul z21.s,z21.s,z31.s
+    fmla z9.s,p1/m,z21.s,z28.s
+    scvtf z22.s,p1/m,z22.s
+    fmul z22.s,z22.s,z30.s
+    fmla z10.s,p1/m,z22.s,z29.s
+    scvtf z23.s,p1/m,z23.s
+    fmul z23.s,z23.s,z31.s
+    fmla z11.s,p1/m,z23.s,z29.s
+    add x7,x7,#192
+    add x8,x8,#2048
+    add x9,x9,#256
+    add x10,x10,#24
+    subs x4,x4,#1
+    b.gt .L6x2_block
+    mov x11,x5
+    st1w {z0.s},p1,[x11,#0,mul vl]
+    st1w {z1.s},p1,[x11,#1,mul vl]
+    add x11,x11,x6
+    st1w {z2.s},p1,[x11,#0,mul vl]
+    st1w {z3.s},p1,[x11,#1,mul vl]
+    add x11,x11,x6
+    st1w {z4.s},p1,[x11,#0,mul vl]
+    st1w {z5.s},p1,[x11,#1,mul vl]
+    add x11,x11,x6
+    st1w {z6.s},p1,[x11,#0,mul vl]
+    st1w {z7.s},p1,[x11,#1,mul vl]
+    add x11,x11,x6
+    st1w {z8.s},p1,[x11,#0,mul vl]
+    st1w {z9.s},p1,[x11,#1,mul vl]
+    add x11,x11,x6
+    st1w {z10.s},p1,[x11,#0,mul vl]
+    st1w {z11.s},p1,[x11,#1,mul vl]
+    ldp d14,d15,[sp],#16
+    ldp d12,d13,[sp],#16
+    ldp d10,d11,[sp],#16
+    ldp d8,d9,[sp],#16
+    ret
+    .size kernel_q8v2_6x2, .-kernel_q8v2_6x2
