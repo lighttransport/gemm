@@ -1650,11 +1650,12 @@ int main(int argc, char **argv) {
 
         int p = (int)decode_start;
         int measured = perf_warmup == 0;
+        int verify_drafts = spec_k - 1;
         int mtp_detail = envb_opt("TP_MTP_PROFILE_DETAIL", 0);
         double mtp_verify_sec = 0.0, mtp_restore_sec = 0.0, mtp_draft_sec = 0.0;
         long mtp_detail_rounds = 0;
         while (n_gen < max_gen + perf_warmup) {
-            if (mtp_pending_n != spec_k) die("MTP draft queue not full", -1);
+            if (mtp_pending_n < verify_drafts) die("MTP draft queue not full", -1);
             int32_t batch[4], target[4];
             batch[0] = in_tok;
             for (int j = 1; j < spec_k; j++) batch[j] = mtp_pending[j - 1];
@@ -1675,11 +1676,11 @@ int main(int argc, char **argv) {
                 target[j] = sample_argmax(m, all_logits + (size_t)j * vlogits,
                                           &c, &argmax_ar, &argmax_calls);
             int accepted = 0;
-            while (accepted < spec_k && mtp_pending[accepted] == target[accepted])
+            while (accepted < verify_drafts && mtp_pending[accepted] == target[accepted])
                 accepted++;
             double td_verify = mtp_detail ? now_sec() : 0.0;
-            if (envb_opt("TP_MTP_FORCE_ACCEPT", 0)) accepted = spec_k;
-            for (int j = 0; j < spec_k; j++) {
+            if (envb_opt("TP_MTP_FORCE_ACCEPT", 0)) accepted = verify_drafts;
+            for (int j = 0; j < verify_drafts; j++) {
                 int hit = mtp_pending[j] == target[j];
                 mtp_match += hit; mtp_total++;
                 mtp_horizon_match[j] += hit; mtp_horizon_total[j]++;
@@ -1690,9 +1691,9 @@ int main(int argc, char **argv) {
                 }
             }
 
-            int emitted = accepted < spec_k ? accepted + 1 : spec_k;
+            int emitted = accepted + 1;
             const float *draft_h = NULL;
-            if (accepted < spec_k) {
+            if (accepted < verify_drafts) {
                 /* Select the state captured immediately after the last
                  * committed input. No trunk replay is needed. */
                 int selected = emitted - 1;
@@ -1746,9 +1747,9 @@ int main(int argc, char **argv) {
              * argmax reduction is included in the communication ledger. */
             int prev = in_tok;
             if (envb_opt("TP_MTP_SKIP_DRAFT", 0)) {
-                for (int k = 0; k < spec_k; k++) mtp_pending[k] = prev;
+                for (int k = 0; k < verify_drafts; k++) mtp_pending[k] = prev;
             } else {
-                for (int k = 0; k < spec_k; k++) {
+                for (int k = 0; k < verify_drafts; k++) {
                     float *dlg = transformer_nextn_logits(m, prev, draft_h, p - 1 + k);
                     double da = 0.0; long dc = 0;
                     mtp_pending[k] = sample_argmax(m, dlg, &c, &da, &dc);
@@ -1757,7 +1758,7 @@ int main(int argc, char **argv) {
                     draft_h = transformer_nextn_hidden(m);
                 }
             }
-            mtp_pending_n = spec_k;
+            mtp_pending_n = verify_drafts;
             double td_draft = mtp_detail ? now_sec() : 0.0;
 
             double tb = now_sec();
