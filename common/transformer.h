@@ -8841,11 +8841,25 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     memcpy(nn->key_cache + (size_t)position * kvd, m->k, (size_t)kvd * sizeof(float));
     memcpy(nn->value_cache + (size_t)position * kvd, m->v, (size_t)kvd * sizeof(float));
 
-    tf_attn_task task = {m->q, m->att, m->xb2, nn->key_cache, nn->value_cache,
-                         0, nh, hd, kvd, gqa, position + 1, m->max_seq_len,
-                         1.0f / sqrtf((float)hd)};
     memset(m->xb2, 0, (size_t)qd * sizeof(float));
-    tf_attn_worker(&task);
+    if (m->pool_alive && m->n_threads > 1 && nh > 1) {
+        int nt=m->n_threads,hoff=0;
+        tf_attn_task *tasks=(tf_attn_task*)alloca((size_t)nt*sizeof(*tasks));
+        int hp=nh/nt,hx=nh%nt;
+        for(int t=0;t<nt;t++){
+            int hc=hp+(t<hx?1:0);
+            tasks[t]=(tf_attn_task){m->q,m->att,m->xb2,nn->key_cache,
+                nn->value_cache,hoff,hoff+hc,hd,kvd,gqa,position+1,
+                m->max_seq_len,1.0f/sqrtf((float)hd),0};
+            hoff+=hc;
+        }
+        tf_pool_dispatch(m,tf_attn_worker,tasks,sizeof(*tasks));
+    } else {
+        tf_attn_task task = {m->q, m->att, m->xb2, nn->key_cache, nn->value_cache,
+                             0, nh, hd, kvd, gqa, position + 1, m->max_seq_len,
+                             1.0f / sqrtf((float)hd)};
+        tf_attn_worker(&task);
+    }
     for (int i = 0; i < qd; i++)
         m->xb2[i] *= 1.0f / (1.0f + expf(-m->ffn_buf1[i]));
     tf_qmatvec_pool(m, m->xb, &L->attn_output, m->xb2, ne);
