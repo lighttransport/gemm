@@ -1617,11 +1617,31 @@ int main(int argc, char **argv) {
         size_t snap_layer = snap_conv + snap_rec;
         size_t snap_slot = (size_t)n_layers * snap_layer;
         float *batch_ssm = NULL;
+        float **batch_ssm_slots = (float **)alloca((size_t)spec_k * sizeof(*batch_ssm_slots));
+        float **orig_conv = (float **)alloca((size_t)n_layers * sizeof(*orig_conv));
+        float **orig_rec = (float **)alloca((size_t)n_layers * sizeof(*orig_rec));
         if (posix_memalign((void **)&batch_ssm, 256,
-                           (size_t)spec_k * snap_slot * sizeof(float)) != 0)
+                           (size_t)(spec_k + 1) * snap_slot * sizeof(float)) != 0)
             batch_ssm = NULL;
         if (!all_logits || !batch_ssm) die("MTP batch scratch alloc", -1);
+        for (int k = 0; k < spec_k; k++)
+            batch_ssm_slots[k] = batch_ssm + (size_t)k * snap_slot;
+        float *batch_ssm_current = batch_ssm + (size_t)spec_k * snap_slot;
+        for (int l = 0; l < n_layers; l++) {
+            orig_conv[l] = m->conv_state ? m->conv_state[l] : NULL;
+            orig_rec[l] = m->recurrent_state ? m->recurrent_state[l] : NULL;
+            if (!m->layers[l].is_ssm) continue;
+            float *ls = batch_ssm_current + (size_t)l * snap_layer;
+            memcpy(ls, orig_conv[l], snap_conv * sizeof(float));
+            memcpy(ls + snap_conv, orig_rec[l], snap_rec * sizeof(float));
+            m->conv_state[l] = ls;
+            m->recurrent_state[l] = ls + snap_conv;
+        }
+        /* The old pre-round copy is no longer needed; retain its byte count for
+         * reporting and its conv_pos array for the round boundary. */
+        free(ss.data); ss.data = NULL;
         tf_batch_ssm_snapshots = batch_ssm;
+        tf_batch_ssm_snapshot_slots = batch_ssm_slots;
         tf_batch_ssm_layer_stride = snap_layer;
         tf_batch_ssm_slot_stride = snap_slot;
         if (is_first)
@@ -1630,6 +1650,9 @@ int main(int argc, char **argv) {
 
         int p = (int)decode_start;
         int measured = perf_warmup == 0;
+        int mtp_detail = envb_opt("TP_MTP_PROFILE_DETAIL", 0);
+        double mtp_verify_sec = 0.0, mtp_restore_sec = 0.0, mtp_draft_sec = 0.0;
+        long mtp_detail_rounds = 0;
         while (n_gen < max_gen + perf_warmup) {
             if (mtp_pending_n != spec_k) die("MTP draft queue not full", -1);
             int32_t batch[4], target[4];
@@ -1654,6 +1677,7 @@ int main(int argc, char **argv) {
             int accepted = 0;
             while (accepted < spec_k && mtp_pending[accepted] == target[accepted])
                 accepted++;
+            double td_verify = mtp_detail ? now_sec() : 0.0;
             if (envb_opt("TP_MTP_FORCE_ACCEPT", 0)) accepted = spec_k;
             for (int j = 0; j < spec_k; j++) {
                 int hit = mtp_pending[j] == target[j];
@@ -1671,13 +1695,15 @@ int main(int argc, char **argv) {
             if (accepted < spec_k) {
                 /* Select the state captured immediately after the last
                  * committed input. No trunk replay is needed. */
-                const float *slot = batch_ssm + (size_t)(emitted - 1) * snap_slot;
+                int selected = emitted - 1;
+                float *old_current = batch_ssm_current;
+                batch_ssm_current = batch_ssm_slots[selected];
+                batch_ssm_slots[selected] = old_current;
                 for (int l = 0; l < n_layers; l++) {
                     if (!m->layers[l].is_ssm) continue;
-                    const float *ls = slot + (size_t)l * snap_layer;
-                    memcpy(m->conv_state[l], ls, snap_conv * sizeof(float));
-                    memcpy(m->recurrent_state[l], ls + snap_conv,
-                           snap_rec * sizeof(float));
+                    float *ls = batch_ssm_current + (size_t)l * snap_layer;
+                    m->conv_state[l] = ls;
+                    m->recurrent_state[l] = ls + snap_conv;
                     m->conv_state_pos[l] =
                         (ss.conv_pos[l] + emitted) % (m->ssm_conv_kernel - 1);
                 }
@@ -1698,6 +1724,7 @@ int main(int argc, char **argv) {
                     draft_h = mtp_seed_hidden;
                 }
             }
+            double td_restore = mtp_detail ? now_sec() : 0.0;
 
             int stop = 0, committed = 0;
             for (int j = 0; j < emitted && n_gen < max_gen + perf_warmup; j++) {
@@ -1731,6 +1758,7 @@ int main(int argc, char **argv) {
                 }
             }
             mtp_pending_n = spec_k;
+            double td_draft = mtp_detail ? now_sec() : 0.0;
 
             double tb = now_sec();
             if (measured) {
@@ -1738,6 +1766,12 @@ int main(int argc, char **argv) {
                 t_comm += g_ar_secs + argmax_ar;
                 ar_calls += g_ar_calls + argmax_calls;
                 pcnt += committed;
+                if (mtp_detail) {
+                    mtp_verify_sec += td_verify - ta;
+                    mtp_restore_sec += td_restore - td_verify;
+                    mtp_draft_sec += td_draft - td_restore;
+                    mtp_detail_rounds++;
+                }
             } else if (n_gen >= perf_warmup) {
                 measured = 1;
                 t_fwd = t_comm = 0.0; ar_calls = 0; pcnt = 0;
@@ -1763,9 +1797,23 @@ int main(int argc, char **argv) {
                    bp.ssm_scan_ms, bp.attn_prepare_ms, bp.attn_kernel_ms,
                    bp.out_proj_ms, bp.ffn_proj_ms, bp.ffn_act_ms,
                    bp.ffn_down_ms, bp.collective_ms);
+            if (mtp_detail && mtp_detail_rounds)
+                logmsg("MTP round profile: rounds=%ld verify=%.2f restore=%.2f draft=%.2f ms/round\n",
+                       mtp_detail_rounds, 1000.0 * mtp_verify_sec / mtp_detail_rounds,
+                       1000.0 * mtp_restore_sec / mtp_detail_rounds,
+                       1000.0 * mtp_draft_sec / mtp_detail_rounds);
         }
         tf_batch_ssm_snapshots = NULL;
+        tf_batch_ssm_snapshot_slots = NULL;
         tf_batch_ssm_layer_stride = tf_batch_ssm_slot_stride = 0;
+        for (int l = 0; l < n_layers; l++) {
+            if (!m->layers[l].is_ssm) continue;
+            float *ls = batch_ssm_current + (size_t)l * snap_layer;
+            memcpy(orig_conv[l], ls, snap_conv * sizeof(float));
+            memcpy(orig_rec[l], ls + snap_conv, snap_rec * sizeof(float));
+            m->conv_state[l] = orig_conv[l];
+            m->recurrent_state[l] = orig_rec[l];
+        }
         free(batch_ssm);
         free(all_logits);
         tp_spec_state_free(&ss);
