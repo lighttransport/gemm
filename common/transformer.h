@@ -10590,15 +10590,14 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
                 continue;
             }
             for (; t + 2 < N; t += 3) {
-                float a0[8] = {0}, a1[8] = {0}, a2[8] = {0};
-                matvec_bf16_8x3_pv_acc(a0, a1, a2, p, p + 2*K,
-                                       p + 4*K, p + 6*K,
-                                       X + (size_t)t * X_stride,
-                                       X + (size_t)(t + 1) * X_stride,
-                                       X + (size_t)(t + 2) * X_stride, K);
-                memcpy(Y_out + (size_t)t * out_stride + g*8, a0, sizeof(a0));
-                memcpy(Y_out + (size_t)(t+1) * out_stride + g*8, a1, sizeof(a1));
-                memcpy(Y_out + (size_t)(t+2) * out_stride + g*8, a2, sizeof(a2));
+                float *y0=Y_out+(size_t)t*out_stride+g*8;
+                float *y1=Y_out+(size_t)(t+1)*out_stride+g*8;
+                float *y2=Y_out+(size_t)(t+2)*out_stride+g*8;
+                const float *x0=X+(size_t)t*X_stride;
+                const float *x1=X+(size_t)(t+1)*X_stride;
+                const float *x2=X+(size_t)(t+2)*X_stride;
+                matvec_bf16_4x3_pv(y0,y1,y2,p,p+2*K,x0,x1,x2,K);
+                matvec_bf16_4x3_pv(y0+4,y1+4,y2+4,p+4*K,p+6*K,x0,x1,x2,K);
             }
             for (; t < N; t++)
                 matvec_bf16_8row_pv(Y_out + (size_t)t * out_stride + g*8,

@@ -2111,6 +2111,42 @@ static inline void matvec_bf16_8x2_pv(float *dst0, float *dst1,
     dst1[4]=svaddv(pg,a41);dst1[5]=svaddv(pg,a51);dst1[6]=svaddv(pg,a61);dst1[7]=svaddv(pg,a71);
 }
 
+/* Four weight rows by three verifier tokens.  Splitting an eight-row panel in
+ * half reduces live accumulators from 24 to 12; activations are L1-resident,
+ * so reloading them for the second half is much cheaper than spilling or
+ * throttling the full 8x3 kernel on A64FX. */
+static inline void matvec_bf16_4x3_pv(float *d0, float *d1, float *d2,
+                                      const uint16_t *pAB,
+                                      const uint16_t *pCD,
+                                      const float *x0, const float *x1,
+                                      const float *x2, int n) {
+    svbool_t pg=svptrue_b32(),ph=svptrue_b16();
+    svuint16_t ix=svindex_u16(0,1);
+    svbool_t po=svcmpne_n_u16(ph,svand_n_u16_x(ph,ix,1),0);
+    svfloat32_t a00=svdup_f32(0),a10=svdup_f32(0),a20=svdup_f32(0),a30=svdup_f32(0);
+    svfloat32_t a01=svdup_f32(0),a11=svdup_f32(0),a21=svdup_f32(0),a31=svdup_f32(0);
+    svfloat32_t a02=svdup_f32(0),a12=svdup_f32(0),a22=svdup_f32(0),a32=svdup_f32(0);
+    static _Thread_local int pf_done=0,pf_dist=8;
+    if(__builtin_expect(!pf_done,0)){
+        const char*e=getenv("TF_BF16PV_PREFETCH_MTP3");
+        if(e&&*e)pf_dist=atoi(e);
+        pf_done=1;
+    }
+    int vl=(int)svcntw(),pfd=pf_dist*2*vl;
+    for(int i=0;i<n;i+=vl){
+        const uint16_t*ab=pAB+2*i,*cd=pCD+2*i;
+        if(pf_dist){__builtin_prefetch(ab+pfd,0,2);__builtin_prefetch(cd+pfd,0,2);}
+        svfloat32_t v0=svld1(pg,x0+i),v1=svld1(pg,x1+i),v2=svld1(pg,x2+i),w;
+        w=svreinterpret_f32(svld1_u16(po,ab-1));a00=svmla_x(pg,a00,w,v0);a01=svmla_x(pg,a01,w,v1);a02=svmla_x(pg,a02,w,v2);
+        w=svreinterpret_f32(svld1_u16(po,ab));a10=svmla_x(pg,a10,w,v0);a11=svmla_x(pg,a11,w,v1);a12=svmla_x(pg,a12,w,v2);
+        w=svreinterpret_f32(svld1_u16(po,cd-1));a20=svmla_x(pg,a20,w,v0);a21=svmla_x(pg,a21,w,v1);a22=svmla_x(pg,a22,w,v2);
+        w=svreinterpret_f32(svld1_u16(po,cd));a30=svmla_x(pg,a30,w,v0);a31=svmla_x(pg,a31,w,v1);a32=svmla_x(pg,a32,w,v2);
+    }
+    d0[0]=svaddv(pg,a00);d0[1]=svaddv(pg,a10);d0[2]=svaddv(pg,a20);d0[3]=svaddv(pg,a30);
+    d1[0]=svaddv(pg,a01);d1[1]=svaddv(pg,a11);d1[2]=svaddv(pg,a21);d1[3]=svaddv(pg,a31);
+    d2[0]=svaddv(pg,a02);d2[1]=svaddv(pg,a12);d2[2]=svaddv(pg,a22);d2[3]=svaddv(pg,a32);
+}
+
 /* Register-blocked 8-row x 3-token accumulating pv GEMM microkernel.
  *
  * matvec_bf16_8row_pv_acc replayed per token loads the 8 weight-row vectors from
