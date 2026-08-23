@@ -20,7 +20,10 @@ export PJM_MPI_PROC=$TP_SIZE
 export OMP_PROC_BIND=${OMP_PROC_BIND:-spread} OMP_PLACES=${OMP_PLACES:-cores}
 export NUMA_DISTRIBUTE=${NUMA_DISTRIBUTE:-1} NUMA_N_CMGS=${NUMA_N_CMGS:-4}
 export NUMA_CMG_BUDGET_GB=${NUMA_CMG_BUDGET_GB:-7} NUMA_ALIGNMENT=${NUMA_ALIGNMENT:-2097152}
-export GGUF_LAZY_MMAP=1 TF_FORCE_MMAP=1 TF_LOAD_KEEPCACHE=0
+# TP_STAGE_DIR is a complete rank-local image.  The runner parses only GGUF
+# metadata and explicitly reads the stage into anonymous HBM-resident memory.
+unset GGUF_LAZY_MMAP TF_FORCE_MMAP
+export TF_LOAD_KEEPCACHE=0
 export TF_HIER_BARRIER=${TF_HIER_BARRIER:-0} TF_BF16PV_PREFETCH=${TF_BF16PV_PREFETCH:-8}
 # The pair-interleaved layout uses the same low/high accumulation order as the
 # row-major kernel and now passes the long greedy-token gate.  Set PV=0 for the
@@ -47,7 +50,12 @@ case "$MODE" in
                 export TP_NULL_STREAM_PASSES=${TP_NULL_STREAM_PASSES:-10} TP_MAXGEN=1
                 ;;
             null) export TF_NULL_GEMM=1 TP_MAXGEN=${TP_MAXGEN:-32} ;;
-            check) unset TF_NULL_GEMM; export TP_MAXGEN=${TP_MAXGEN:-1} TP_DUMP_TOKENS=1 ;;
+            check)
+                unset TF_NULL_GEMM
+                export TP_AR_DETERMINISTIC=${TP_AR_DETERMINISTIC:-1}
+                export TP_STAGE_BF16_PV=${TP_STAGE_BF16_PV_CHECK:-0}
+                export TP_MAXGEN=${TP_MAXGEN:-1} TP_DUMP_TOKENS=1
+                ;;
             source-check)
                 unset TP_STAGE_DIR TF_NULL_GEMM
                 export TP_MAXGEN=${TP_MAXGEN:-1} TP_DUMP_TOKENS=1
@@ -62,6 +70,8 @@ case "$MODE" in
                 # runs the draft head alongside exact trunk decode; it does
                 # not count unverified draft tokens as generated tokens.
                 unset TF_NULL_GEMM
+                export TP_AR_DETERMINISTIC=${TP_AR_DETERMINISTIC:-1}
+                export TP_STAGE_BF16_PV=${TP_STAGE_BF16_PV_CHECK:-0}
                 export TP_SPEC_K=${TP_SPEC_K:-1} TP_MTP_TRACE=${TP_MTP_TRACE:-1}
                 export TP_MAXGEN=${TP_MAXGEN:-8} TP_PERF_WARMUP=0
                 export TP_IGNORE_EOS=1 TP_DUMP_TOKENS=1

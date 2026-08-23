@@ -126,6 +126,7 @@ typedef struct {
     float *key_cache;          /* private draft KV [max_seq_len, kv_dim] */
     float *value_cache;
     float *hidden;             /* recurrent draft hidden [n_embd] */
+    float *target_hidden;      /* raw trunk final-layer hidden [n_embd] */
     float *fusion;             /* [2*n_embd] normalized embedding + hidden */
 } transformer_nextn;
 
@@ -413,6 +414,7 @@ int transformer_last_argmax(const transformer_model *model);
 float *transformer_nextn_logits(transformer_model *model, int32_t prev_token,
                                 const float *target_hidden, int position);
 const float *transformer_nextn_hidden(const transformer_model *model);
+const float *transformer_nextn_target_hidden(const transformer_model *model);
 
 /* Copy hidden state into/out of model->x for MPI communication */
 float *transformer_get_hidden(transformer_model *model);
@@ -504,6 +506,8 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
 #include <errno.h>
 #include <limits.h>
 #include <sys/mman.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include "../a64fx/llm/qwen38_tp_stage.h"
 #if defined(TF_LINK_BF16PV48) && defined(__ARM_FEATURE_SVE)
 #include "../a64fx/k3/k3_prefill.h"
@@ -4061,7 +4065,7 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         size_t conv_w_count = (size_t)m->ssm_conv_kernel * m->ssm_qkv_dim;
         m->conv_w_trans = (float *)malloc(conv_w_count * sizeof(float));
         m->conv_w_trans_layers = (float **)calloc(nl, sizeof(float *));
-        if (m->conv_w_trans_layers) {
+        if (m->conv_w_trans_layers && gguf->use_mmap != 3) {
             for (int l = 0; l < m->n_layers; l++) {
                 if (!m->layers[l].is_ssm || !m->layers[l].ssm_conv1d.data) continue;
                 float *w = (float *)malloc(conv_w_count * sizeof(float));
@@ -4083,20 +4087,23 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         m->conv_w_trans = NULL;
         m->conv_w_trans_layers = NULL;
     }
+    if (getenv("TP_LOAD_TRACE")) fprintf(stderr, "transformer: load trace conv-ready\n");
 
     if (m->nextn.loaded) {
         size_t nkv = (size_t)max_seq_len * m->n_kv_heads * m->head_dim;
         m->nextn.key_cache = (float *)tf_aligned_calloc(256, nkv, sizeof(float));
         m->nextn.value_cache = (float *)tf_aligned_calloc(256, nkv, sizeof(float));
         m->nextn.hidden = (float *)tf_aligned_calloc(256, m->n_embd, sizeof(float));
+        m->nextn.target_hidden = (float *)tf_aligned_calloc(256, m->n_embd, sizeof(float));
         m->nextn.fusion = (float *)tf_aligned_calloc(256, 2 * m->n_embd, sizeof(float));
         if (!m->nextn.key_cache || !m->nextn.value_cache ||
-            !m->nextn.hidden || !m->nextn.fusion) {
+            !m->nextn.hidden || !m->nextn.target_hidden || !m->nextn.fusion) {
             fprintf(stderr, "transformer: cannot allocate NextN runtime buffers\n");
             transformer_free(m);
             return NULL;
         }
     }
+    if (getenv("TP_LOAD_TRACE")) fprintf(stderr, "transformer: load trace nextn-buffers-ready\n");
 
     /* Allocate scratch buffers */
     int max_ff = tf_compute_max_ff(m);
@@ -4128,6 +4135,7 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->last_argmax = 0;
     m->matvec_tmp = (float *)tf_aligned_calloc(256, max_dim, sizeof(float));
     m->trace_hidden_norms = 1;
+    if (getenv("TP_LOAD_TRACE")) fprintf(stderr, "transformer: load trace scratch-ready\n");
 
     /* Default: single-threaded, no tensor parallelism */
     m->n_threads = 1;
@@ -4163,6 +4171,8 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             m->rope_mrope_inv_freq = NULL;
         }
     }
+
+    if (getenv("TP_LOAD_TRACE")) fprintf(stderr, "transformer: load trace rope-ready\n");
 
     /* Gemma4: precompute SWA RoPE table and per-layer embedding buffers */
     if (m->is_gemma4) {
@@ -4222,6 +4232,7 @@ void transformer_free(transformer_model *model) {
     free(model->nextn.key_cache);
     free(model->nextn.value_cache);
     free(model->nextn.hidden);
+    free(model->nextn.target_hidden);
     free(model->nextn.fusion);
     /* Gemma4 resources */
     free(model->swa_pattern);
@@ -4258,7 +4269,8 @@ void transformer_free(transformer_model *model) {
     free(model->lm_head_best_val);
     if (model->tp_stage_data) {
 #if defined(__linux__)
-        if (model->tp_stage_is_mmap) munmap(model->tp_stage_data, model->tp_stage_bytes);
+        if (model->tp_stage_is_mmap == 2) shmdt(model->tp_stage_data);
+        else if (model->tp_stage_is_mmap) munmap(model->tp_stage_data, model->tp_stage_bytes);
         else
 #endif
             free(model->tp_stage_data);
@@ -7075,6 +7087,8 @@ static void *tf_persistent_worker(void *arg) {
 
     /* Final norm: thread 0 only */
     if (tid == 0) {
+        if (m->nextn.target_hidden)
+            memcpy(m->nextn.target_hidden, m->x, (size_t)n_embd * sizeof(float));
         tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
     }
     if (tf_g4p_want_logits && m->has_lm_head) {
@@ -7298,8 +7312,11 @@ static void *tf_gemma4_persistent_worker(void *arg) {
 
     /* Final RMSNorm only on the LAST stage (pp_l1 == n_layers); PP middle/first stages
      * hand off the raw post-block residual to the next stage. */
-    if (tid == 0 && pp_l1 == m->n_layers && m->output_norm.data)
+    if (tid == 0 && pp_l1 == m->n_layers && m->output_norm.data) {
+        if (m->nextn.target_hidden)
+            memcpy(m->nextn.target_hidden, m->x, (size_t)n_embd * sizeof(float));
         tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, eps, m->matvec_tmp);
+    }
 
     /* Lever 2: fold lm_head into the same dispatch (no separate cond_broadcast,
      * threads stay engaged). Row-split the [n_vocab, n_embd] output matvec, then
@@ -8091,6 +8108,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
     /* Final RMSNorm (only if we processed through the last layer) */
     if (layer_end >= m->n_layers) {
         TF_PROF_BEGIN("final_norm", -1, "rmsnorm", "FP32");
+        if (m->nextn.target_hidden)
+            memcpy(m->nextn.target_hidden, m->x, (size_t)n_embd * sizeof(float));
         tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         TF_PROF_END("final_norm", 5.0 * n_embd, 0);
     }
@@ -8227,7 +8246,7 @@ int transformer_tp_slice_weights(transformer_model *m, int rank, int size,
             int v0s = qk + sh0 * ds, v1s = qk + sh1 * ds;
             if (staged) {
                 tf_tp_slice_ssm_metadata(&L->ssm_qkv, qk, v0s, v1s);
-                if (tf_tp_repack_ssm_rows(&L->ssm_conv1d, qk, v0s, v1s)) return -1;
+                tf_tp_slice_ssm_metadata(&L->ssm_conv1d, qk, v0s, v1s);
             } else {
                 if (tf_tp_repack_ssm_rows(&L->ssm_qkv, qk, v0s, v1s)) return -1;
                 if (tf_tp_repack_ssm_rows(&L->ssm_conv1d, qk, v0s, v1s)) return -1;
@@ -8303,10 +8322,15 @@ int transformer_tp_slice_nextn(transformer_model *m, int rank, int size) {
     tf_tp_range(nkh, size, rank, &k0, &k1);
     if (q1 <= q0 || k1 <= k0 || nh % size || nkh % size) return -1;
 
+    int staged = getenv("TP_STAGE_DIR") && *getenv("TP_STAGE_DIR");
+    int shard_block = !staged || (getenv("TP_NEXTN_SHARD") && atoi(getenv("TP_NEXTN_SHARD")));
+    if (!shard_block) goto slice_head;
+
     tf_tp_slice_rows(&L->attn_q, q0 * 2 * hd, q1 * 2 * hd);
     tf_tp_slice_rows(&L->attn_k, k0 * hd, k1 * hd);
     tf_tp_slice_rows(&L->attn_v, k0 * hd, k1 * hd);
-    if (tf_tp_repack_cols(&L->attn_output, q0 * hd, q1 * hd)) return -1;
+    if (staged) tf_tp_slice_cols_metadata(&L->attn_output, q0 * hd, q1 * hd);
+    else if (tf_tp_repack_cols(&L->attn_output, q0 * hd, q1 * hd)) return -1;
 
     int ff = L->ffn_gate.n_rows;
     int f0, f1;
@@ -8314,8 +8338,10 @@ int transformer_tp_slice_nextn(transformer_model *m, int rank, int size) {
     if (f1 <= f0 || ff % size) return -1;
     tf_tp_slice_rows(&L->ffn_gate, f0, f1);
     tf_tp_slice_rows(&L->ffn_up, f0, f1);
-    if (tf_tp_repack_cols(&L->ffn_down, f0, f1)) return -1;
+    if (staged) tf_tp_slice_cols_metadata(&L->ffn_down, f0, f1);
+    else if (tf_tp_repack_cols(&L->ffn_down, f0, f1)) return -1;
 
+slice_head:
     /* The optional NextN head (or the full-head alias installed by the trunk
      * slicer) must follow the trunk vocabulary partition.  Leaving it full
      * made every rank score rows 0..tp_vocab_loc and then apply a different
@@ -8326,19 +8352,32 @@ int transformer_tp_slice_nextn(transformer_model *m, int rank, int size) {
         tf_tp_slice_rows(&m->nextn.shared_head_head, v0, v1);
     }
 
-    L->n_kv_heads = k1 - k0;
+    if (shard_block) L->n_kv_heads = k1 - k0;
     fprintf(stderr, "tp_slice_nextn: rank %d/%d q=%d@%d kv=%d@%d ff=%d@%d\n",
-            rank, size, q1 - q0, q0, k1 - k0, k0, f1 - f0, f0);
+            rank, size, shard_block ? q1-q0 : nh, shard_block ? q0 : 0,
+            shard_block ? k1-k0 : nkh, shard_block ? k0 : 0,
+            shard_block ? f1-f0 : L->ffn_gate.n_rows, shard_block ? f0 : 0);
     return 0;
 }
 
 static qtensor *tf_tp_stage_tensor(transformer_model *m, const char *name) {
+    if (!strcmp(name, "token_embd.weight")) return &m->token_embd;
+    if (!strcmp(name, "output_norm.weight")) return &m->output_norm;
     if (!strcmp(name, "output.weight")) return &m->output;
     int l = -1, n = 0;
-    if (sscanf(name, "blk.%d.%n", &l, &n) != 1 || n <= 0 || l < 0 || l >= m->n_layers)
+    if (sscanf(name, "blk.%d.%n", &l, &n) != 1 || n <= 0 || l < 0 || l > m->n_layers)
         return NULL;
     const char *s = name + n;
-    transformer_layer *L = &m->layers[l];
+    transformer_layer *L = l == m->n_layers ? &m->nextn.layer : &m->layers[l];
+    if (l == m->n_layers) {
+        if (!strcmp(s, "nextn.eh_proj.weight")) return &m->nextn.eh_proj;
+        if (!strcmp(s, "nextn.enorm.weight")) return &m->nextn.enorm;
+        if (!strcmp(s, "nextn.hnorm.weight")) return &m->nextn.hnorm;
+        if (!strcmp(s, "nextn.shared_head_norm.weight")) return &m->nextn.shared_head_norm;
+        if (!strcmp(s, "nextn.embed_tokens.weight")) return &m->nextn.embed_tokens;
+        if (!strcmp(s, "nextn.shared_head_head.weight")) return &m->nextn.shared_head_head;
+    }
+    if (!strcmp(s, "attn_norm.weight")) return &L->attn_norm;
     if (!strcmp(s, "ffn_gate.weight")) return &L->ffn_gate;
     if (!strcmp(s, "ffn_up.weight")) return &L->ffn_up;
     if (!strcmp(s, "ffn_down.weight")) return &L->ffn_down;
@@ -8346,12 +8385,18 @@ static qtensor *tf_tp_stage_tensor(transformer_model *m, const char *name) {
     if (!strcmp(s, "attn_k.weight")) return &L->attn_k;
     if (!strcmp(s, "attn_v.weight")) return &L->attn_v;
     if (!strcmp(s, "attn_output.weight")) return &L->attn_output;
+    if (!strcmp(s, "attn_q_norm.weight")) return &L->attn_q_norm;
+    if (!strcmp(s, "attn_k_norm.weight")) return &L->attn_k_norm;
     if (!strcmp(s, "attn_qkv.weight")) return &L->ssm_qkv;
     if (!strcmp(s, "attn_gate.weight")) return &L->ssm_gate;
     if (!strcmp(s, "ssm_alpha.weight")) return &L->ssm_alpha;
     if (!strcmp(s, "ssm_beta.weight")) return &L->ssm_beta;
     if (!strcmp(s, "ssm_conv1d.weight")) return &L->ssm_conv1d;
+    if (!strcmp(s, "ssm_norm.weight")) return &L->ssm_norm;
+    if (!strcmp(s, "ssm_a")) return &L->ssm_a;
+    if (!strcmp(s, "ssm_dt.bias")) return &L->ssm_dt_bias;
     if (!strcmp(s, "ssm_out.weight")) return &L->ssm_out;
+    if (!strcmp(s, "post_attention_norm.weight")) return &L->ffn_norm;
     return NULL;
 }
 
@@ -8363,12 +8408,19 @@ typedef struct {
 
 static void *tf_bf16_pv_pack_worker(void *arg) {
     tf_bf16_pv_pack_task *t = (tf_bf16_pv_pack_task *)arg;
+    size_t group_bytes = (size_t)8 * t->cols * sizeof(uint16_t);
+    uint16_t *scratch = (uint16_t *)malloc(group_bytes);
+    if (!scratch) return (void *)(uintptr_t)1;
     int groups = t->rows / 8;
     int g0 = groups * t->tid / t->nt;
     int g1 = groups * (t->tid + 1) / t->nt;
     for (int g = g0; g < g1; g++) {
         const uint16_t *s = t->src + (size_t)g * 8 * t->cols;
         uint16_t *d = t->dst + (size_t)g * 8 * t->cols;
+        if (s == d) {
+            memcpy(scratch, s, group_bytes);
+            s = scratch;
+        }
         for (int pair = 0; pair < 4; pair++) {
             const uint16_t *a = s + (size_t)(2 * pair) * t->cols;
             const uint16_t *b = a + t->cols;
@@ -8379,6 +8431,7 @@ static void *tf_bf16_pv_pack_worker(void *arg) {
             }
         }
     }
+    free(scratch);
     return NULL;
 }
 
@@ -8413,35 +8466,30 @@ size_t transformer_tp_load_stage(transformer_model *m, const char *stage_dir,
     }
     size_t alloc = (size_t)((h->data_bytes + (2u<<20) - 1) & ~((uint64_t)(2u<<20) - 1));
     void *arena = NULL;
-#if defined(__linux__)
-    /* Use a demand-paged mapping rather than the Fujitsu large-page malloc
-     * arena.  The latter can assign the whole 26.6 GB allocation to the
-     * allocating (main-thread) CMG before the pool performs its parallel
-     * pread, limiting a four-CMG scan to roughly one CMG of bandwidth. */
-    arena = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (arena == MAP_FAILED) arena = NULL;
-#ifdef MADV_NOHUGEPAGE
-    /* A64FX's huge-page allocator can establish the whole arena on the main
-     * thread's CMG before the parallel pread first-touch.  Normal demand pages
-     * preserve the worker/CMG ownership and are substantially faster here. */
-    if (arena) madvise(arena, alloc, MADV_NOHUGEPAGE);
-#endif
-#else
-    if (posix_memalign(&arena, 2u<<20, alloc) != 0) arena = NULL;
-#endif
+    /* Anonymous System-V memory avoids both file mapping and Fujitsu's eager
+     * large-page malloc placement. Parallel pread first-touches its pages on
+     * the CMGs that consume them. The segment survives only while attached. */
+    int stage_shmid = shmget(IPC_PRIVATE, alloc, IPC_CREAT | 0600);
+    if (stage_shmid >= 0) {
+        arena = shmat(stage_shmid, NULL, 0);
+        if (arena == (void *)-1) arena = NULL;
+        shmctl(stage_shmid, IPC_RMID, NULL);
+    }
     if (!arena) { fprintf(stderr, "tp_stage: allocation failed %.3f GB\n", (double)alloc/1e9); free(h); close(fd); return 0; }
     m->tp_stage_data = arena; m->tp_stage_bytes = alloc;
-#if defined(__linux__)
-    m->tp_stage_is_mmap = 1;
-#endif
+    m->tp_stage_is_mmap = 2;
     tf_numa_init(m);
     int nt = m->n_threads > 1 ? m->n_threads : 1;
     int verify = getenv("TP_STAGE_VERIFY") && atoi(getenv("TP_STAGE_VERIFY"));
+    int staged_private_nextn_head = 0;
     for (uint32_t i = 0; i < h->n_entries; i++) {
         q38tp_entry *e = &h->entries[i];
+        if (!strcmp(e->name, "blk.64.nextn.shared_head_head.weight"))
+            staged_private_nextn_head = 1;
         qtensor *t = tf_tp_stage_tensor(m, e->name);
-        if (!t || t->type != e->type || t->n_rows != (int)e->local_rows ||
+        int full_conv = strstr(e->name, ".ssm_conv1d.weight") != NULL;
+        if (!t || t->type != e->type ||
+            (!full_conv && t->n_rows != (int)e->local_rows) ||
             t->n_cols != (int)e->local_cols || e->file_offset < h->header_bytes ||
             e->file_offset + e->byte_length > h->header_bytes + h->data_bytes) {
             fprintf(stderr, "tp_stage: tensor mismatch %s local=%dx%d stage=%ux%u\n",
@@ -8486,28 +8534,21 @@ size_t transformer_tp_load_stage(transformer_model *m, const char *stage_dir,
          * 16-accumulator register pressure of the row-major widening kernel. */
         const char *pv_env = getenv("TP_STAGE_BF16_PV");
         int use_pv = !pv_env || atoi(pv_env) != 0;
-        if (use_pv && t->type == GGML_TYPE_BF16 && (t->n_rows % 8) == 0 &&
+        if (use_pv && e->kind != Q38TP_REPLICATE &&
+            t->type == GGML_TYPE_BF16 && (t->n_rows % 8) == 0 &&
             (t->n_cols % 16) == 0 && t->n_rows >= 8) {
-            void *tmp = mmap(NULL, (size_t)e->byte_length, PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (tmp == MAP_FAILED) {
-                fprintf(stderr, "tp_stage: BF16 PV scratch failed %s\n", e->name);
-                free(h); close(fd); return 0;
-            }
-            memcpy(tmp, dst, (size_t)e->byte_length);
             if (nt > 1 && m->pool_alive) {
                 tf_bf16_pv_pack_task *tasks = (tf_bf16_pv_pack_task *)alloca((size_t)nt * sizeof(*tasks));
                 for (int k = 0; k < nt; k++)
-                    tasks[k] = (tf_bf16_pv_pack_task){(const uint16_t *)tmp,
+                    tasks[k] = (tf_bf16_pv_pack_task){(const uint16_t *)dst,
                                                        (uint16_t *)dst,
                                                        t->n_rows, t->n_cols, k, nt};
                 tf_pool_dispatch(m, tf_bf16_pv_pack_worker, tasks, sizeof(*tasks));
             } else {
-                tf_bf16_pv_pack_task task = {(const uint16_t *)tmp, (uint16_t *)dst,
+                tf_bf16_pv_pack_task task = {(const uint16_t *)dst, (uint16_t *)dst,
                                               t->n_rows, t->n_cols, 0, 1};
                 tf_bf16_pv_pack_worker(&task);
             }
-            munmap(tmp, (size_t)e->byte_length);
             t->bf16_pv = 1;
         }
         t->data = dst;
@@ -8517,6 +8558,37 @@ size_t transformer_tp_load_stage(transformer_model *m, const char *stage_dir,
                 fprintf(stderr, "tp_stage: MemAvailable %.2f GB below 2 GB guard\n", avail);
                 free(h); close(fd); return 0;
             }
+        }
+    }
+    if (m->nextn.loaded && !staged_private_nextn_head)
+        m->nextn.shared_head_head = m->output;
+    /* Metadata-only construction deliberately deferred this source-reading
+     * transpose.  Build it now from the complete HBM-resident stage. */
+    if (m->is_hybrid && m->conv_w_trans_layers) {
+        for (int l = 0; l < m->n_layers; l++) {
+            transformer_layer *L = &m->layers[l];
+            if (!L->is_ssm || !L->ssm_conv1d.data || m->conv_w_trans_layers[l]) continue;
+            char conv_name[96];
+            snprintf(conv_name, sizeof(conv_name), "blk.%d.ssm_conv1d.weight", l);
+            int conv_dim = m->ssm_qkv_dim;
+            for (uint32_t i = 0; i < h->n_entries; i++)
+                if (!strcmp(h->entries[i].name, conv_name)) {
+                    conv_dim = (int)h->entries[i].source_rows;
+                    break;
+                }
+            size_t conv_count = (size_t)m->ssm_conv_kernel * conv_dim;
+            float *w = (float *)malloc(conv_count * sizeof(float));
+            if (!w) { free(h); close(fd); return 0; }
+            size_t crb = tf_row_bytes(L->ssm_conv1d.type, L->ssm_conv1d.n_cols);
+            const uint8_t *base = (const uint8_t *)L->ssm_conv1d.data;
+            for (int j = 0; j < conv_dim; j++) {
+                float wb[8];
+                dequant_row(L->ssm_conv1d.type, base + (size_t)j * crb,
+                            wb, m->ssm_conv_kernel);
+                for (int f = 0; f < m->ssm_conv_kernel; f++)
+                    w[(size_t)f * conv_dim + j] = wb[f];
+            }
+            m->conv_w_trans_layers[l] = w;
         }
     }
     fprintf(stderr, "tp_stage: rank %d loaded %u tensors %.3f GB from %s verify=%d MemAvailable=%.2fGB\n",
@@ -8686,8 +8758,14 @@ const float *transformer_nextn_hidden(const transformer_model *model) {
     return model && model->nextn.loaded ? model->nextn.hidden : NULL;
 }
 
+const float *transformer_nextn_target_hidden(const transformer_model *model) {
+    return model && model->nextn.loaded ? model->nextn.target_hidden : NULL;
+}
+
 float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
                                 const float *target_hidden, int position) {
+    const char *pos_off_env = getenv("TP_MTP_POS_OFFSET");
+    if (pos_off_env) position += atoi(pos_off_env);
     if (!m || !m->nextn.loaded || !target_hidden || prev_token < 0 ||
         prev_token >= m->n_vocab || position < 0 || position >= m->max_seq_len)
         return NULL;
@@ -8705,8 +8783,12 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     /* The target pointer is commonly model->x; preserve it before using shared scratch. */
     memcpy(nn->hidden, target_hidden, (size_t)ne * sizeof(float));
     tf_dequant_row(emb, prev_token, m->xb);
-    tf_rmsnorm(nn->fusion, m->xb, &nn->enorm, ne, m->rms_norm_eps, m->matvec_tmp);
-    tf_rmsnorm(nn->fusion + ne, nn->hidden, &nn->hnorm, ne,
+    int hidden_first = getenv("TP_MTP_HIDDEN_FIRST") &&
+                       atoi(getenv("TP_MTP_HIDDEN_FIRST"));
+    float *e_dst = nn->fusion + (hidden_first ? ne : 0);
+    float *h_dst = nn->fusion + (hidden_first ? 0 : ne);
+    tf_rmsnorm(e_dst, m->xb, &nn->enorm, ne, m->rms_norm_eps, m->matvec_tmp);
+    tf_rmsnorm(h_dst, nn->hidden, &nn->hnorm, ne,
                m->rms_norm_eps, m->matvec_tmp);
     tf_qmatvec_pool(m, m->x, &nn->eh_proj, nn->fusion, ne);
 
@@ -8732,20 +8814,20 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     for (int i = 0; i < qd; i++)
         m->xb2[i] *= 1.0f / (1.0f + expf(-m->ffn_buf1[i]));
     tf_qmatvec_pool(m, m->xb, &L->attn_output, m->xb2, ne);
-    if (m->tp_attn_sharded && m->tp_allreduce_fn)
+    int nextn_sharded = !getenv("TP_STAGE_DIR") ||
+        (getenv("TP_NEXTN_SHARD") && atoi(getenv("TP_NEXTN_SHARD")));
+    if (nextn_sharded && m->tp_attn_sharded && m->tp_allreduce_fn)
         m->tp_allreduce_fn(m->xb, ne, m->tp_allreduce_ctx);
     tf_vadd(m->x, m->xb, ne);
-
     tf_rmsnorm(m->xb, m->x, &L->ffn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
     tf_qmatvec_fused2_pool(m, m->ffn_buf1, &L->ffn_gate,
                            m->ffn_buf2, &L->ffn_up, m->xb, nff);
     tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, nff);
     tf_qmatvec_pool(m, m->xb, &L->ffn_down, m->ffn_buf3, ne);
-    if (m->tp_ffn_sharded && m->tp_allreduce_fn)
+    if (nextn_sharded && m->tp_ffn_sharded && m->tp_allreduce_fn)
         m->tp_allreduce_fn(m->xb, ne, m->tp_allreduce_ctx);
     tf_vadd(m->x, m->xb, ne);
     memcpy(nn->hidden, m->x, (size_t)ne * sizeof(float));
-
     /* Qwen3.5 NextN shares the trunk output norm/head when the optional
      * nextn-specific tensors are absent.  Skipping the fallback RMSNorm makes
      * the vocabulary head collapse to tiny token IDs and yields alpha=0. */

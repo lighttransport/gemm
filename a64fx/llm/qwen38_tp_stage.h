@@ -5,8 +5,8 @@
 #include <stddef.h>
 
 #define Q38TP_MAGIC "Q38TPB1"
-#define Q38TP_VERSION 2u
-#define Q38TP_MAX_ENTRIES 768u
+#define Q38TP_VERSION 6u
+#define Q38TP_MAX_ENTRIES 1024u
 #define Q38TP_NAME_BYTES 96u
 #define Q38TP_HEADER_BYTES (2u * 1024u * 1024u)
 
@@ -14,6 +14,7 @@ enum q38tp_slice_kind {
     Q38TP_SLICE_ROWS = 1,
     Q38TP_SLICE_COLS = 2,
     Q38TP_SLICE_SSM_ROWS = 3,
+    Q38TP_REPLICATE = 4,
 };
 
 typedef struct {

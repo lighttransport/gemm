@@ -445,6 +445,26 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         ctx->data_size = max_end;
     }
 
+    /* Metadata-only mode keeps the source fd for explicit chunked pread but
+     * neither maps nor allocates the tensor payload.  Rank-local stage builders
+     * use this to create HBM-resident shards without transiently mapping the
+     * full shared model. */
+    if (use_mmap == 3) {
+#ifdef _WIN32
+        goto fail;
+#else
+        ctx->fd = dup(fileno(f));
+        fclose(f); f = NULL;
+        if (ctx->fd < 0) goto fail;
+        /* Preserve tensor-presence semantics for metadata consumers.  The
+         * pointer is never dereferenced by a metadata-only caller; a complete
+         * resident stage must replace every tensor before inference. */
+        ctx->data = (uint8_t *)(uintptr_t)1;
+        fprintf(stderr, "gguf: metadata-only source (no tensor mmap/load)\n");
+        return ctx;
+#endif
+    }
+
     /* Default to anonymous RAM load when the model fits comfortably in RAM:
      * file-backed mmap pages are NUMA-mis-placed for the GEMM threads (reads stay
      * ~storage-slow even when resident), while anonymous memory is first-touched
@@ -604,8 +624,8 @@ gguf_context *gguf_open_multi(const char *path, int use_mmap) {
         snprintf(sp, cap, "%.*s%.*s-%0*ld-of-%0*ld.gguf",
                  (int)dir_len, path, (int)prefix_len, base,
                  idx_width, s + 1, total_width, total);
-        /* mode 2 means lazy mmap even when the caller did not set the legacy env. */
-        parts[s] = gguf_open(sp, use_mmap ? 2 : 0);
+        /* mode 2 means lazy mmap; mode 3 is metadata + source fd only. */
+        parts[s] = gguf_open(sp, use_mmap == 3 ? 3 : (use_mmap ? 2 : 0));
         free(sp);
         if (!parts[s]) goto multi_fail;
         tensor_total += parts[s]->n_tensors;
@@ -614,6 +634,7 @@ gguf_context *gguf_open_multi(const char *path, int use_mmap) {
     gguf_context *ctx = (gguf_context *)calloc(1, sizeof(*ctx));
     if (!ctx) goto multi_fail;
     ctx->version = parts[0]->version;
+    ctx->use_mmap = use_mmap;
     ctx->alignment = parts[0]->alignment;
     ctx->n_kv = parts[0]->n_kv;
     ctx->kv = parts[0]->kv;          /* transfer metadata ownership */
@@ -705,7 +726,8 @@ const char *gguf_tensor_name(const gguf_context *ctx, int i) {
 void *gguf_tensor_data(const gguf_context *ctx, int i) {
     if (i < 0 || (uint64_t)i >= ctx->n_tensors) return NULL;
     if (ctx->tensor_data) return ctx->tensor_data[i];
-    return ctx->data + ctx->tensors[i].offset;
+    if (ctx->use_mmap == 3) return (void *)(uintptr_t)(16u * (unsigned)(i + 1));
+    return ctx->data ? ctx->data + ctx->tensors[i].offset : NULL;
 }
 
 size_t gguf_tensor_size(const gguf_context *ctx, int i) {

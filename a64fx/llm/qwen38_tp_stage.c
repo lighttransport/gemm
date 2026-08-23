@@ -2,8 +2,9 @@
  *
  * The source split GGUF remains on the shared filesystem.  Each MPI rank writes
  * only its final TP tensor slices to its node-local /local filesystem.  The
- * output is consumed by tp_runner through TP_STAGE_DIR and never contains the
- * large token embedding or the optional NextN layer. */
+ * output is consumed by tp_runner through TP_STAGE_DIR.  The complete stage includes
+ * the embedding, norms, and TP-sliced NextN block so decode never faults model
+ * weights from the shared GGUF after the rank-local HBM2 upload. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -143,6 +144,7 @@ static int tensor_index(const gguf_context *g, const char *name) {
 }
 
 static uint64_t tensor_row_bytes(uint32_t type, int cols) {
+    if (type == GGML_TYPE_F32) return (uint64_t)cols * 4u;
     if (type == GGML_TYPE_BF16 || type == GGML_TYPE_F16) return (uint64_t)cols * 2u;
     if (type == GGML_TYPE_Q8_0) {
         if (cols <= 0 || (cols % 32) != 0) return 0;
@@ -156,18 +158,33 @@ static int make_entry(const gguf_context *g, int ti, int rank, int size,
     const char *name = gguf_tensor_name(g, ti), *suf = NULL;
     int l = -1, kind = 0, r0 = 0, r1 = 0, c0 = 0, c1 = 0, qk = 0;
     const gguf_tensor_info *t = &g->tensors[ti];
-    if (t->n_dims != 2 || (t->type != GGML_TYPE_BF16 && t->type != GGML_TYPE_Q8_0)) return 0;
-    int cols = (int)t->dims[0], rows = (int)t->dims[1];
+    if ((t->n_dims != 1 && t->n_dims != 2) ||
+        (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_BF16 &&
+         t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q8_0)) return 0;
+    int cols = (int)t->dims[0], rows = t->n_dims == 1 ? 1 : (int)t->dims[1];
     uint64_t src_rb = tensor_row_bytes(t->type, cols);
     if (!src_rb) return 0;
-    if (!strcmp(name, "output.weight")) {
+    if (!strcmp(name, "token_embd.weight") || !strcmp(name, "output_norm.weight")) {
+        kind = Q38TP_REPLICATE; r1 = rows; c1 = cols;
+    } else if (!strcmp(name, "output.weight")) {
         kind = Q38TP_SLICE_ROWS;
         int chunk = ((rows + size - 1) / size + 31) & ~31;
         r0 = rank * chunk; r1 = r0 + chunk;
         if (r0 > rows) r0 = rows;
         if (r1 > rows) r1 = rows;
         c1 = cols;
-    } else if (parse_block_name(name, &l, &suf) && l >= 0 && l < 64) {
+    } else if (parse_block_name(name, &l, &suf) && l >= 0 && l <= 64) {
+        if (l == 64) {
+            if (!strcmp(suf, "nextn.shared_head_head.weight")) {
+                kind = Q38TP_SLICE_ROWS;
+                int chunk=((rows+size-1)/size+31)&~31;r0=rank*chunk;r1=r0+chunk;
+                if(r0>rows)r0=rows;if(r1>rows)r1=rows;c1=cols;
+            } else {
+                uint64_t bytes=(uint64_t)rows*src_rb;
+                if (bytes <= (768u<<20) || !strcmp(suf,"nextn.embed_tokens.weight"))
+                    kind=Q38TP_REPLICATE,r1=rows,c1=cols;
+            }
+        } else {
         int attn = ((l + 1) % 4 == 0);
         int kv_rep = 4 % size != 0;
         if (!strcmp(suf, "ffn_gate.weight") || !strcmp(suf, "ffn_up.weight")) {
@@ -194,8 +211,16 @@ static int make_entry(const gguf_context *g, int ti, int rank, int size,
             kind = Q38TP_SLICE_SSM_ROWS; qk = 4096;
             int v0, v1; tp_range(rows - qk, size, rank, &v0, &v1);
             r0 = qk + v0; r1 = qk + v1; c1 = cols;
+        } else if (!attn && !strcmp(suf, "ssm_conv1d.weight")) {
+            /* Preserve the established decode arithmetic: the cached
+             * convolution transpose is built from the full native tensor
+             * before SSM V-head slicing. */
+            kind = Q38TP_REPLICATE; r1 = rows; c1 = cols;
         } else if (!attn && !strcmp(suf, "ssm_out.weight")) {
             kind = Q38TP_SLICE_COLS; r1 = rows; tp_range(cols, size, rank, &c0, &c1);
+        } else if ((uint64_t)rows * src_rb <= (1u<<20)) {
+            kind = Q38TP_REPLICATE; r1 = rows; c1 = cols;
+        }
         }
     }
     if (!kind) return 0;
@@ -222,7 +247,7 @@ int main(int argc, char **argv) {
     if (rank < 0 || (size != 4 && size != 6 && size != 12) || rank >= size) {
         fprintf(stderr, "qwen38_tp_stage: requires an mpiexec -np 4, -np 6, or -np 12 launch (rank=%ld size=%ld)\n", rank, size); return 2;
     }
-    gguf_context *g = gguf_open_multi(argv[1], 2);
+    gguf_context *g = gguf_open_multi(argv[1], 3);
     if (!g) { fprintf(stderr, "qwen38_tp_stage: cannot open %s\n", argv[1]); return 3; }
     q38tp_header *h = (q38tp_header *)calloc(1, sizeof(*h)); if (!h) die("calloc header");
     memcpy(h->magic, Q38TP_MAGIC, 8); h->version = Q38TP_VERSION; h->header_bytes = Q38TP_HEADER_BYTES;
@@ -232,8 +257,8 @@ int main(int argc, char **argv) {
         q38tp_entry e;
         if (make_entry(g, (int)i, (int)rank, (int)size, &e)) h->entries[h->n_entries++] = e;
     }
-    if (h->n_entries != 497) {
-        fprintf(stderr, "qwen38_tp_stage: expected 497 decode tensors, found %u\n", h->n_entries); return 4;
+    if (h->n_entries < 700) {
+        fprintf(stderr, "qwen38_tp_stage: incomplete v3 shard, found only %u tensors\n", h->n_entries); return 4;
     }
     if (getenv("Q38TP_PLAN") && atoi(getenv("Q38TP_PLAN"))) {
         uint64_t planned = Q38TP_HEADER_BYTES;
@@ -244,6 +269,14 @@ int main(int argc, char **argv) {
         printf("qwen38_tp_stage plan rank=%ld/%ld entries=%u data=%.3fGB file=%.3fGB\n",
                rank, size, h->n_entries, (double)(planned-Q38TP_HEADER_BYTES)/1e9,
                (double)planned/1e9);
+        if (getenv("Q38TP_VERBOSE"))
+            for (uint32_t i = 0; i < h->n_entries; i++)
+                if (!strncmp(h->entries[i].name, "blk.64.", 7))
+                    printf("  %s kind=%u src=%ux%u local=%ux%u %.3fMB\n",
+                           h->entries[i].name, h->entries[i].kind,
+                           h->entries[i].source_rows, h->entries[i].source_cols,
+                           h->entries[i].local_rows, h->entries[i].local_cols,
+                           (double)h->entries[i].byte_length / 1e6);
         free(h); gguf_close(g); return 0;
     }
     if (mkdir_p(argv[2])) die("mkdir stage");
@@ -287,7 +320,7 @@ int main(int argc, char **argv) {
                                                : (uint64_t)g->data_offset + t->offset;
         off = align_up(off, 256); e->file_offset = off; uint64_t hash = 0;
         int rc = 0;
-        if (e->kind == Q38TP_SLICE_ROWS) {
+        if (e->kind == Q38TP_SLICE_ROWS || e->kind == Q38TP_REPLICATE) {
             uint64_t n = (uint64_t)(e->row1 - e->row0) * src_rb;
             rc = copy_contiguous(sfd, soff + (uint64_t)e->row0 * src_rb, out, off, n, &hash);
         } else if (e->kind == Q38TP_SLICE_COLS) {

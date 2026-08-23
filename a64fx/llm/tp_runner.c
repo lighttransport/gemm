@@ -1006,7 +1006,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    gguf_context *gguf = gguf_open_multi(model_path, 2);   /* lazy mmap */
+    /* A complete TP stage owns every tensor used by decode.  Parse only
+     * source metadata in that mode; never mmap or allocate the 54 GB GGUF. */
+    gguf_context *gguf = gguf_open_multi(model_path,
+                                         envs_opt("TP_STAGE_DIR", "")[0] ? 3 : 0);
     if (!gguf) die("gguf_open_multi", -1);
     bpe_vocab *vocab = bpe_vocab_load(gguf);
     if (!vocab) die("bpe_vocab_load", -1);
@@ -1062,7 +1065,7 @@ int main(int argc, char **argv) {
     int ssm_shard = m->is_hybrid && !getenv("TP_NO_SSM_SHARD");
     if (transformer_tp_slice_weights(m, MyRank, N, ssm_shard) != 0)
         die("transformer_tp_slice_weights (check n_heads/n_kv/n_ff/ssm_dt % N)", -1);
-    if (spec_k > 0 && m->nextn.loaded &&
+    if ((spec_k > 0 || envs_opt("TP_STAGE_DIR", "")[0]) && m->nextn.loaded &&
         transformer_tp_slice_nextn(m, MyRank, N) != 0)
         die("transformer_tp_slice_nextn", -1);
     size_t tp_stage_bytes = 0;
@@ -1101,7 +1104,7 @@ int main(int argc, char **argv) {
         if (MyRank == 0) logmsg("TP_INT8_MODE=%s enabled for resident BF16 projections\n",
                                 getenv("TP_INT8_MODE"));
     }
-    if (spec_k > 0 && m->nextn.loaded &&
+    if (!tp_stage_bytes && spec_k > 0 && m->nextn.loaded &&
         envb("TP_MATERIALIZE_NEXTN", 1)) {
         size_t nextn_bytes = transformer_materialize_nextn(m);
         if (!nextn_bytes) die("transformer_materialize_nextn", -1);
@@ -1314,6 +1317,9 @@ int main(int argc, char **argv) {
     double t_prefill = 0.0;
     double t_fwd = 0.0;
     long mtp_match = 0, mtp_total = 0;
+    int32_t *mtp_token_counts = spec_k > 0
+        ? (int32_t *)calloc((size_t)m->n_vocab, sizeof(int32_t)) : NULL;
+    int mtp_unique_targets = 0, mtp_max_target_count = 0;
     int32_t mtp_pending[4] = {-1, -1, -1, -1};
     int mtp_pending_n = 0;
     float *mtp_seed_hidden = spec_k > 0
@@ -1404,12 +1410,23 @@ int main(int argc, char **argv) {
                 if (spec_k && m->nextn.loaded) {
                     float *target_h = (float *)alloca((size_t)n_embd * sizeof(float));
                     memcpy(target_h, transformer_get_hidden(m), (size_t)n_embd * sizeof(float));
-                    memcpy(mtp_seed_hidden, transformer_get_hidden(m),
-                           (size_t)n_embd * sizeof(float));
+                    const float *mtp_target = envb_opt("TP_MTP_RAW_HIDDEN", 1)
+                        ? transformer_nextn_target_hidden(m) : transformer_get_hidden(m);
+                    memcpy(mtp_seed_hidden, mtp_target, (size_t)n_embd * sizeof(float));
                     /* Teacher-force the known next prompt token.  The draft
                      * head consumes (h[p], token[p+1]) and predicts token[p+2]. */
-                    if (p + 1 < P)
-                        transformer_nextn_logits(m, ptoks[p + 1], mtp_seed_hidden, p + 1);
+                    if (p + 1 < P) {
+                        float *catchup_logits = transformer_nextn_logits(
+                            m, ptoks[p + 1], mtp_seed_hidden, p + 1);
+                        if (envb_opt("TP_MTP_TRACE", 0) && p + 2 < P) {
+                            double catchup_ar = 0.0; long catchup_calls = 0;
+                            int32_t catchup = sample_argmax(
+                                m, catchup_logits, &c, &catchup_ar, &catchup_calls);
+                            if (is_first)
+                                logmsg("MTP catchup pos=%d input=%d draft=%d expected=%d\n",
+                                       p + 1, ptoks[p + 1], catchup, ptoks[p + 2]);
+                        }
+                    }
                     transformer_set_hidden(m, target_h);
                 }
                 t_fwd += now_sec() - _ta;
@@ -1500,15 +1517,23 @@ int main(int argc, char **argv) {
             float *lg = transformer_compute_logits(m);
             nt = sample_argmax(m, lg, &c, &ar_step, &ar_calls_step);
             if (spec_k && m->nextn.loaded) {
+                if (is_first && envb_opt("TP_MTP_TRACE", 0))
+                    logmsg("MTP trunk pos=%d input=%d target=%d\n", p, in_tok, nt);
                 if (mtp_pending_n > 0) {
-                    if (is_first && getenv("TP_MTP_TRACE"))
+                    if (is_first && envb_opt("TP_MTP_TRACE", 0))
                         logmsg("MTP compare pos=%d draft=%d target=%d\n",
                                p, mtp_pending[0], nt);
                     mtp_match += mtp_pending[0] == nt;
                     mtp_total++;
+                    if (mtp_token_counts && nt >= 0 && nt < m->n_vocab) {
+                        int count = ++mtp_token_counts[nt];
+                        if (count == 1) mtp_unique_targets++;
+                        if (count > mtp_max_target_count) mtp_max_target_count = count;
+                    }
                 }
                 /* Qwen3.5 exports h_nextn after the trunk output RMSNorm. */
-                const float *draft_h = transformer_get_hidden(m);
+                const float *draft_h = envb_opt("TP_MTP_RAW_HIDDEN", 1)
+                    ? transformer_nextn_target_hidden(m) : transformer_get_hidden(m);
                 int prev = nt;
                 for (int k = 0; k < spec_k; k++) {
                     float *dlg = transformer_nextn_logits(m, prev, draft_h, p + 1 + k);
@@ -1552,10 +1577,14 @@ int main(int argc, char **argv) {
 
 done:
     free(mtp_seed_hidden);
+    free(mtp_token_counts);
     barrier();
     if (is_first && mtp_total)
-        logmsg("MTP greedy match=%ld/%ld alpha=%.4f K=%d\n",
-               mtp_match, mtp_total, (double)mtp_match / mtp_total, spec_k);
+        logmsg("MTP greedy match=%ld/%ld alpha=%.4f K=%d diversity=%d max_share=%.4f gate=%s\n",
+               mtp_match, mtp_total, (double)mtp_match / mtp_total, spec_k,
+               mtp_unique_targets, (double)mtp_max_target_count / mtp_total,
+               mtp_unique_targets >= 8 && mtp_max_target_count * 10 < mtp_total * 9
+                   ? "nondegenerate" : "REJECT-DEGENERATE");
     {   char pn[64]; snprintf(pn, sizeof pn, "tp_perf_rank%02d.txt", MyRank);
         FILE *pf2 = fopen(pn, "w");
         if (pf2) {
