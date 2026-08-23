@@ -340,6 +340,41 @@ Note: the old arm_sve.h (clang-7 / binutils 2.30) lacks `svcvtn_s8_f32_x`
 (narrowing fp32→int8), so the byte store uses the `svcvt_s32_f32` + `svtbl`
 extract trick (as in `tf_quantize_f32_to_int8`).
 
+### 3.3d Pre-broadcast A kernel rewrite — TRIED, reverted (slower)
+
+The fused kernel's per-group A path is 6× `ldr w` (scalar) + 6× `mov z.s,w`
+(broadcast the 4 A-bytes to all 16 int32 lanes). Tight isolated probes (A/B
+const in registers, single core) showed the A path is the main non-SDOT
+overhead: **floor 512 / A-path 348 / B-path 494 GFLOP/s**. So I tried
+**pre-broadcasting A**: pack each 4-byte A group already tiled to 16 lanes
+(24576 B vs 1536 B per kc-chunk = **16×**), so the kernel does one `ld1b`/row
+(no `ldr w`, no `mov`). In the isolated probe that A-load hit **512** (floor),
+so the idea looked like a ~1.5× on the GEMM compute.
+
+**It does not transfer to the real kernel — it's a loss.** End-to-end A/B
+(384×256, int8, 48T, `--bench 4`): PB **0.90–0.94×** (slower); single-thread
+GEMM (OMP_NUM_THREADS=1): PB **1.31× slower** (2.95→3.87 ms on ffn_up). The
+isolated probe was misleading: its A buffer was tiny (L1-resident), so only
+the `mov` cost showed. In the real kernel the **16× A data** is streamed and
+the A-pack write is 16× bigger → the A path goes memory-bound and the net is
+negative. (Reverted; `VLM_INT8_PB` removed.)
+
+Two measurements worth keeping from this:
+
+- **The real single-core GEMM is ~271 GFLOP/s (ffn_up) = 53% of the 512
+  SDOT floor** — not the "~100/core" in-situ number, which is the **48-core
+  aggregate** (W-HBM-bound). ⚠️ `taskset -c N` does **not** pin OpenMP
+  threads; per-core GEMM benchmarks need `OMP_NUM_THREADS=1` or the "per-core"
+  figure is actually the multi-core aggregate (looks absurdly above peak).
+- **A B-pack rewrite won't help**: B (W) is already well-cached — one HBM
+  read per nb-tile (~4 MB minimum for ffn_up), the ~16 re-reads per nb hit
+  L2/LLC. The kernel is compute-bound on the A path, not B-memory-bound, and
+  the A `mov` broadcast can't be removed without the 16× A-data penalty
+  (above). So the fused int8 GEMM kernel is **near its practical limit**;
+  the remaining ~47% to the SDOT floor is the A-load/mov + B-load + loop
+  issue overhead, which the register file (32 Z: 24 accum + 6 A + 2 B) won't
+  let us amortize away.
+
 ### 3.4 Store the activations in fp16 (A is currently fp32) — likely small
 
 `hidden` / `Y` / `ffn_buf` are `float` (fp32). In the nb-outer schedule A is
