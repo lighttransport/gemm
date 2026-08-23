@@ -1634,6 +1634,7 @@ int main(int argc, char **argv) {
     int decode_started = 0;
     transformer_pool_profile_reset();
     final_cache_pos = decode_start;
+    double t_decode_wall = 0.0;
 
     if (!dry_decode && mtp_batch && spec_k > 0 && m->nextn.loaded) {
         tp_spec_state ss;
@@ -1694,6 +1695,7 @@ int main(int argc, char **argv) {
         int mtp_park_done = 0;
         double mtp_verify_sec = 0.0, mtp_restore_sec = 0.0, mtp_draft_sec = 0.0;
         long mtp_detail_rounds = 0;
+        double decode_wall_start = now_sec();
         while (n_gen < max_gen + perf_warmup) {
             if (mtp_pending_n < verify_drafts) die("MTP draft queue not full", -1);
             int32_t batch[5], target[5];
@@ -1851,6 +1853,7 @@ int main(int argc, char **argv) {
                        p - committed, accepted, spec_k, committed, in_tok);
             if (stop) break;
         }
+        t_decode_wall = now_sec() - decode_wall_start;
         if (is_first) {
             transformer_prefill_profile bp;
             transformer_prefill_profile_get(&bp);
@@ -1886,6 +1889,7 @@ int main(int argc, char **argv) {
         goto done;
     }
 
+    double decode_wall_start = now_sec();
     for (int p = (int)decode_start; ; p++) {
         double _ta = now_sec();
         double ar_step = 0.0; long ar_calls_step = 0;
@@ -1977,6 +1981,7 @@ int main(int argc, char **argv) {
         if (stop_eos || n_gen >= max_gen + perf_warmup) break;
         in_tok = nt;
     }
+    t_decode_wall = now_sec() - decode_wall_start;
 
 done:
     free(mtp_seed_hidden);
@@ -2027,7 +2032,7 @@ done:
     }
     double t_total = now_sec() - t0_all;
     if (is_first) {
-        double t_dec = t_total - t_prefill;
+        double t_dec = t_decode_wall > 0.0 ? t_decode_wall : t_total - t_prefill;
         logmsg("\n\n=== done: %d tokens generated ===\n", n_gen);
         logmsg("prefill(%d tok)=%.3f s (%.2f tok/s)%s\n", prefill_tokens, t_prefill,
                prefill_tokens > 0 ? (double)prefill_tokens / t_prefill : 0.0,

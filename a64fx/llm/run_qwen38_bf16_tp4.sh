@@ -34,6 +34,12 @@ export TF_LOAD_KEEPCACHE=0
 export TF_HIER_BARRIER=${TF_HIER_BARRIER:-0} TF_BF16PV_PREFETCH=${TF_BF16PV_PREFETCH:-8}
 export TF_BF16PV_PREFETCH_MTP2=${TF_BF16PV_PREFETCH_MTP2:-12}
 export TF_SSM_FUSED_DOTS=${TF_SSM_FUSED_DOTS:-1}
+# Exact-token validated on both trunk and K=5 MTP.  Avoid scalar expf in the
+# verifier and replicated NextN FFN activation passes.
+export TF_SILU_SVE=${TF_SILU_SVE:-1}
+# Packing only the replicated NextN embedding/hidden fusion projection retains
+# the long-context 53/56 agreement and saves about one percent end-to-end.
+export TP_NEXTN_PV_MASK=${TP_NEXTN_PV_MASK:-1}
 # The pair-interleaved layout uses the same low/high accumulation order as the
 # row-major kernel and now passes the long greedy-token gate.  Set PV=0 for the
 # original source-equivalent layout.

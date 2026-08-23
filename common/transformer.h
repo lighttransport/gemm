@@ -8559,7 +8559,13 @@ size_t transformer_tp_load_stage(transformer_model *m, const char *stage_dir,
          * 16-accumulator register pressure of the row-major widening kernel. */
         const char *pv_env = getenv("TP_STAGE_BF16_PV");
         int use_pv = !pv_env || atoi(pv_env) != 0;
-        if (use_pv && e->kind != Q38TP_REPLICATE &&
+        int nextn_pv = 0;
+        const char *nextn_pv_env = getenv("TP_NEXTN_PV_MASK");
+        if (nextn_pv_env && !strncmp(e->name, "blk.64.", 7)) {
+            int mask = atoi(nextn_pv_env);
+            if ((mask & 1) && strstr(e->name, "nextn.eh_proj.weight")) nextn_pv = 1;
+        }
+        if (use_pv && (e->kind != Q38TP_REPLICATE || nextn_pv) &&
             t->type == GGML_TYPE_BF16 && (t->n_rows % 8) == 0 &&
             (t->n_cols % 16) == 0 && t->n_rows >= 8) {
             if (nt > 1 && m->pool_alive) {
