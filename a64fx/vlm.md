@@ -128,15 +128,26 @@ reads local and adds replication/mbind overhead. **Remaining GEMM ideas**
 (lower payoff now): larger M-tile (16-row compute + two 8-row store passes
 to dodge the §1 erratum), and fp16 activations (§3.2).
 
-### 3.2 Attention (~7% — fp32-FMA-bound; fp16 is NOT viable on A64FX)
+### 3.2 Attention (fp32-FMA; load-bound, ~27% of the int8 encode at 48T)
 
 Profiled with `VLM_ATTN_PROFILE=1` (per-phase CPU-seconds, stable across
-runs): **QK^T 0.40 s + AV 0.38 s = 94%**, softmax 0.05 s, extract 0.003 s;
-sum ~0.83 s CPU. It is **well-parallelized** (the CPU-sum stays ~0.75–0.83 s
-at 12–48 threads while wall-clock scales cleanly → only ~7% of the encode at
-48T). The QK^T kernel (`qk_vert_8q_48k`) already runs at **full fp32 FMA
-peak** (24 `svmla` per d-iter = 16 lane-FMA/cycle), so there is no fp32
-headroom.
+runs): **QK^T + AV = ~87%**, softmax ~6%, extract ~2%. It is
+**well-parallelized** across 16 heads × 12 q-tiles (192 units / 48 threads)
+*only with the OpenMP backend* — the C11-thrd default serializes it (see the
+build gotcha in §3.3). Post-int8 (GEMMs fast), attention is **~27% of the
+encode at 48T**.
+
+**Benchmarked (standalone, per core, `tools/bench_attn.c`):** the fp32 FMA
+floor (8 independent chains, no loads) is **49.8 GFLOP/s**; the full attention
+(QK^T+AV, K/V 96 KB/head in L2) is **29.3 GFLOP/s = 58% of the FMA floor** —
+so it is **load-bound, not FMA-bound**: the 8 scalar Q loads + 3 K-vector loads
+per QK^T d-iter (and 4 att + 4 V per AV row) bound it, not the 24 `svmla`.
+In-situ it drops to **~19% of the FMA floor** (a further ~3.2× memory/
+scheduling penalty from 48 threads' K/V contending for L2/LLC), so the kernel
+headroom (58%→100%) does not fully translate end-to-end. int8 attention
+(Q/K/V → int8, SDOT) is the only big lever but is precision-risky (the
+softmax is sensitive to the int8 score error; int16 was already "marginal
+~0.1–1%") — not implemented.
 
 > **fp16 attention investigated and ruled out (A64FX hardware limit).** A
 > fast fp16 dot product needs `FMLA Z.S, P/M, Z.H, Z.H` (fp16×fp16 → **fp32**
