@@ -175,10 +175,27 @@ static int make_entry(const gguf_context *g, int ti, int rank, int size,
         c1 = cols;
     } else if (parse_block_name(name, &l, &suf) && l >= 0 && l <= 64) {
         if (l == 64) {
+            int shard_nextn = getenv("TP_NEXTN_SHARD") &&
+                              atoi(getenv("TP_NEXTN_SHARD")) != 0;
             if (!strcmp(suf, "nextn.shared_head_head.weight")) {
                 kind = Q38TP_SLICE_ROWS;
                 int chunk=((rows+size-1)/size+31)&~31;r0=rank*chunk;r1=r0+chunk;
                 if(r0>rows)r0=rows;if(r1>rows)r1=rows;c1=cols;
+            } else if (shard_nextn &&
+                       (!strcmp(suf, "attn_q.weight") ||
+                        !strcmp(suf, "attn_k.weight") ||
+                        !strcmp(suf, "attn_v.weight") ||
+                        !strcmp(suf, "ffn_gate.weight") ||
+                        !strcmp(suf, "ffn_up.weight"))) {
+                kind = Q38TP_SLICE_ROWS;
+                tp_range(rows, size, rank, &r0, &r1);
+                c1 = cols;
+            } else if (shard_nextn &&
+                       (!strcmp(suf, "attn_output.weight") ||
+                        !strcmp(suf, "ffn_down.weight"))) {
+                kind = Q38TP_SLICE_COLS;
+                r1 = rows;
+                tp_range(cols, size, rank, &c0, &c1);
             } else {
                 uint64_t bytes=(uint64_t)rows*src_rb;
                 if (bytes <= (768u<<20) || !strcmp(suf,"nextn.embed_tokens.weight"))
@@ -244,8 +261,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s MODEL-00001-of-N.gguf STAGE_DIR\n", argv[0]); return 2;
     }
     long rank = env_rank(), size = env_size();
-    if (rank < 0 || (size != 4 && size != 6 && size != 12) || rank >= size) {
-        fprintf(stderr, "qwen38_tp_stage: requires an mpiexec -np 4, -np 6, or -np 12 launch (rank=%ld size=%ld)\n", rank, size); return 2;
+    if (rank < 0 || (size != 2 && size != 3 && size != 4 &&
+                     size != 6 && size != 12) || rank >= size) {
+        fprintf(stderr, "qwen38_tp_stage: requires an mpiexec -np 2, -np 3, -np 4, -np 6, or -np 12 launch (rank=%ld size=%ld)\n",
+                rank, size); return 2;
+    }
+    if (getenv("TP_NEXTN_SHARD") && atoi(getenv("TP_NEXTN_SHARD")) != 0 &&
+        (4 % size) != 0) {
+        fprintf(stderr, "qwen38_tp_stage: TP_NEXTN_SHARD requires TP size dividing four KV heads (size=%ld)\n",
+                size);
+        return 2;
     }
     gguf_context *g = gguf_open_multi(argv[1], 3);
     if (!g) { fprintf(stderr, "qwen38_tp_stage: cannot open %s\n", argv[1]); return 3; }

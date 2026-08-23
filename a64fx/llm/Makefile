@@ -184,8 +184,9 @@ $(BUILD)/pp_runner: $(PP_SRC) vlm_objs | $(BUILD)
 
 # Multi-node tensor-parallel decode runner (pure uTofu, no MPI in the binary).
 tp_runner: $(BUILD)/tp_runner
-$(BUILD)/tp_runner: $(TP_SRC) $(COMMON)/transformer.h $(COMMON)/gguf_loader.h | $(BUILD)
-	$(CC) $(filter-out -g -rdynamic,$(CFLAGS)) $(QWEN_CFLAGS) -o $@ $(TP_SRC) $(LDFLAGS) -ltofucom
+$(BUILD)/tp_runner: $(TP_SRC) $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(Q8V2_KERNEL) $(Q8B6_KERNEL) | $(BUILD)
+	$(CC) $(filter-out -g -rdynamic,$(CFLAGS)) -DTF_HAVE_Q8V2 $(QWEN_CFLAGS) -o $@ \
+		$(TP_SRC) $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(LDFLAGS) -ltofucom
 
 # Same as tp_runner but with -DTF_POOL_PROFILE: dumps the per-dispatch work-vs-wait
 # and per-tid matvec/barrier/attn decode breakdown at pool shutdown. Separate binary

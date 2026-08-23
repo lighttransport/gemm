@@ -1743,3 +1743,159 @@ second 17.7 GB weight arena.
    62,080 logits; pipeline verifier projection completion with its TP reduction;
    batch or piggyback the tiny draft-token messages; and test a hand-scheduled
    exact 4x5 assembly kernel using build scratch under `/local`, never `/tmp`.
+
+### Q8 TP2--TP4 decode and MTP attack (2026-08-24)
+
+Qwen3.8 Q8_0 now has complete anonymous-HBM rank stages for TP2, TP3, and TP4.
+The launcher reads model metadata only, uploads the selected rank blob into a
+System-V anonymous arena, and never mmaps weights.  The source GGUF is
+`/home/u14346/models/qwen38/27b/Qwen3.8-27B-Q8_0.gguf`; session-local rank
+stages are under `/local/u14346/qwen38-q8-tp{2,3,4}`.
+
+| topology | rank-0 stage | short native-Q8 decode | result |
+|---|---:|---:|---|
+| TP2 | 15.959 GB | 8.44 tok/s | too much weight traffic per rank |
+| TP3 | 11.808 GB | 11.17 tok/s | replicated four-head KV attention |
+| TP4 | 9.421 GB | **14.09 tok/s** | best topology in the requested range |
+
+The TP3 staged path keeps the small NextN block replicated, so its four KV
+heads no longer incorrectly reject a three-rank launch.  Empty `TP_Q8_MODE`
+also no longer materializes a second Q8 copy; that bug was the cause of the
+earlier TP2 OOM.  All three stages and runs remained below 32 GB/node.  TP4 is
+the decisive 2--4-node choice: adding ranks reduces the per-node streamed
+weight set more than the extra collectives cost.
+
+On the 188-token long-context prompt, native Q8 TP4 generated 64 exact tokens
+at **13.39 tok/s**.  The token SHA256 is
+`03fdeecf744db006497cd1bc12ca5a065a95d61c3c38f570293641f3941afd7d`.
+The same stream is used as the Q8 oracle below.  A 32-token warm run reached
+14.09 tok/s with SHA256
+`79c41776ee6b7caf5fd210dff14aa9e9375f914c0b0d669bbf3d626940b80498`.
+
+#### Native-Q8 MTP result
+
+The generic small-N verifier used to create and join 48 pthreads for every Q8
+projection.  Reusing the hot pinned OpenMP team reduced a 16-token K=5 run from
+49.75 seconds to 1.42 seconds without changing its SHA.  Packing the trunk for
+the existing exact Q8v2 3x4 verifier then produced:
+
+- 64 exact tokens in 2.990 seconds, or **21.40 tok/s**;
+- 15 rounds, 162.13 ms verification and 37.15 ms drafting per round;
+- agreement 52/60 (`alpha=0.8667`), horizons 15/15, 14/15, 13/15, 10/15;
+- 7.691 GB of additional Q8v2 verifier panels, still below 32 GB/node.
+
+This is the best accepted result that executes the trunk directly as Q8.  It
+does not beat the BF16 baselines, so it must not be reported as meeting the
+30 tok/s plain or 50+/53.43 tok/s MTP targets.
+
+#### Q8 checkpoint with guarded BF16-PV runtime expansion
+
+An opt-in bridge, `TP_Q8_EXPAND_BF16=1`, dequantizes the resident Q8 rank stage
+once into the pair-interleaved BF16 layout used by the proven A64FX kernels.
+This still loads and stages only the Q8 checkpoint, but the active dense
+decode weights are BF16 after startup; it is therefore a Q8-storage result,
+not a native-Q8-compute result.
+
+The expansion is deliberately not a malloc or weight mmap.  It allocates one
+anonymous System-V arena, then the model's pinned 48-thread pool first-touches
+the same row partitions that decode will consume.  A malloc-backed prototype
+placed the 14.309 GB arena poorly and achieved only 5.81--5.96 tok/s.  The
+System-V arena reached 27.99 tok/s, and enabling the validated PV prefetch
+distance 8 raised the 32-token run to **31.37 tok/s**.  Its SHA was the exact
+Q8 32-token oracle above.  This clears the approximately 30 tok/s BF16 plain
+baseline by 4.6%, although it does not clear the earlier 33 tok/s stretch goal.
+
+Before allocating, the converter sums every eligible tensor and checks
+`MemAvailable`; the default reserve is 3 GB and cannot be configured below
+2 GB.  Plain decode expands 401 tensors / 14.309 GB in addition to the 9.421 GB
+Q8 stage.  Rank 1, the tightest node in the measured run, retained 5.9 GB after
+expansion.  No mmap, `/tmp`, llama.cpp, or filesystem-backed runtime weights
+are involved.
+
+For MTP, selected draft tensors can share the same arena.  Mask 53 expands the
+EH fusion projection, attention output, FFN down projection, and local draft
+LM head.  Those four components preserved the oracle stream and the original
+draft agreement.  With the ordinary replicated NextN stage, K=4 reached
+43.98 tok/s.
+
+The stage builder now also supports `TP_NEXTN_SHARD=1`.  It slices NextN Q/K/V
+and gate/up rows plus attention-output/FFN-down columns across the four ranks;
+the existing runtime performs the two required draft all-reduces.  The stage
+shrinks from 9.421 to 9.124 GB/rank, and the direct all-to-all small-buffer
+collective remains exact.  The best 188-token-prompt result was:
+
+- **47.77 tok/s** wall for 64 exact tokens with K=4;
+- SHA256 `03fdeecf744db006497cd1bc12ca5a065a95d61c3c38f570293641f3941afd7d`;
+- 18 rounds, agreement 48/54 (`alpha=0.8889`), horizons 18/18, 15/18, 15/18;
+- 15.110 GB expanded arena plus the 9.124 GB sharded-NextN Q8 stage; observed
+  `MemAvailable` remained at least 5.47 GB/rank after expansion.
+
+K=5 retained agreement 52/60 and reached 46.78 tok/s, so K=4 is the current
+selection.  This improves substantially over native-Q8 MTP and confirms that
+more nodes help when the draft block is actually sharded, but remains below
+both the 50 tok/s requested gate and the sustained BF16 result of 53.43 tok/s.
+The remaining gaps are 2.23 and 5.66 tok/s respectively.
+
+The reproducible optimized commands are:
+
+```sh
+# Plain Q8-storage / BF16-PV runtime decode.
+TP_SIZE=4 TP_Q8_EXPAND_BF16=1 TP_MAXGEN=32 TP_PERF_WARMUP=8 \
+  TP_MAXSEQ=512 ./a64fx/llm/run_qwen38_q8_tp4.sh bench
+
+# Build the separate stage whose NextN transformer is also TP-sharded.
+TP_SIZE=4 TP_NEXTN_SHARD=1 ./a64fx/llm/run_qwen38_q8_tp4.sh stage
+
+# Exact K=4 MTP on the long-context Q8 oracle.  The launcher defaults the
+# small-buffer direct all-to-all path for a sharded NextN stage.
+TP_SIZE=4 TP_NEXTN_SHARD=1 TP_Q8_EXPAND_BF16=1 \
+  TP_Q8_EXPAND_NEXTN_MASK=53 TF_BF16PV_PREFETCH=12 \
+  TP_SPEC_K=4 TP_PROMPT_FILE="$PWD/tmp/qwen38_mtp_prompt.txt" \
+  TP_MAXSEQ=512 TP_MAXGEN=64 ./a64fx/llm/run_qwen38_q8_tp4.sh mtp-check
+
+# Native-Q8 verifier path (no BF16 runtime expansion).
+TP_SIZE=4 TP_Q8_VERIFY=q8v2 TP_SPEC_K=5 \
+  TP_PROMPT_FILE="$PWD/tmp/qwen38_mtp_prompt.txt" TP_MAXSEQ=512 \
+  ./a64fx/llm/run_qwen38_q8_tp4.sh mtp-check
+```
+
+#### Rejected experiments and remaining work
+
+- Hierarchical barriers preserved tokens but reduced native TP4 from 14.09 to
+  7.78 tok/s.  Flat barriers remain the default.
+- `block64-ffn` W8A8 changed later tokens and fell to 9.74 tok/s.
+- The Q8v2 6x2 verifier, K=6/Q8B6 verifier, and a Q8v2 M=1 decode path were
+  slower; K=6 and M=1 also changed the accepted stream.
+- Expanding all NextN projections produced an invalid draft: agreement
+  collapsed to 2/248.  Q, K, V, FFN gate, and FFN up are individually exposed
+  for diagnostics but are not in accepted mask 53.  A corrected aligned
+  BF16-PV fused gate/up dispatch preserved agreement but slowed sharded MTP to
+  46.07 tok/s, so it too was reverted.
+- Exact four-row and fused-two-matrix Q8 kernels in the standalone NextN pool
+  were 1--3% slower at model level and were reverted.
+- Repeating the prompt to 367 tokens did not reproduce BF16's higher agreement;
+  Q8 agreement fell to 55/68, confirming that checkpoint quantization, not
+  merely short context, limits this draft.
+
+The highest-value remaining tasks are:
+
+1. Build a native M=1 Q8 panel/kernel that keeps Q8 bytes in HBM, shares each
+   activation load across rows, and preserves the current two-accumulator
+   reduction exactly.  The native plain gap is still 13.39 to 30+ tok/s.
+2. Replace the 7.691 GB Q8v2 MTP verifier panels with a compact no-reread
+   K=4/K=5 layout.  It must beat 162 ms/round without changing the Q8 oracle.
+3. Accelerate the remaining sharded NextN QKV and FFN gate/up directly in Q8.
+   Straight BF16-PV gate/up conversion is exact after aligned dispatch but is
+   slower at model level; Q8 needs a lower-byte kernel to reduce draft time.
+4. Raise draft agreement for the quantized checkpoint.  At alpha 0.889, K=4
+   emits only 64/18=3.56 tokens/round, so even reduced verifier time has a hard
+   ceiling.  Test quantization-aware calibration of only the draft block and
+   head against the Q8 trunk oracle, without borrowing BF16 model weights.
+5. Compact the few tensors that must remain Q8 after runtime expansion, then
+   detach the original 9.421 GB stage arena.  This would increase HBM headroom
+   and permit safer verifier/draft experiments, but it is a storage-mode
+   optimization rather than native-Q8 compute.
+6. Run a 256-token, three-repeat sustained gate for every future accepted path.
+   Require the K=0 SHA, stable rank-local pending queues, memory below 32 GB,
+   and separate setup/prefill/decode timing.  The open targets remain native
+   Q8 above BF16 for both modes and **50+ tok/s MTP** (then 53.43+).

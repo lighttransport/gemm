@@ -242,6 +242,8 @@ typedef struct {
     void *tp_stage_data;  /* anonymous rank-local staged-weight arena */
     size_t tp_stage_bytes;
     int tp_stage_is_mmap;
+    void *q8_bf16_arena; /* anonymous System-V expansion arena, if enabled */
+    size_t q8_bf16_arena_bytes;
     float *matvec_tmp; /* max(n_embd, n_ff) for row dequant (thread 0) */
     float ssm_alpha_tmp[64]; /* shared persistent-worker SSM scalars */
     float ssm_beta_tmp[64];
@@ -337,6 +339,14 @@ size_t transformer_prepack_q8v2_range(transformer_model *model,
                                       int layer_start, int layer_end);
 size_t transformer_prepack_q8b6_range(transformer_model *model,
                                       int layer_start, int layer_end);
+/* Expand resident Q8_0 trunk weights into the pair-interleaved BF16 layout
+ * used by the exact A64FX decode/verifier kernels.  The Q8 rank stage remains
+ * the source of truth; expansion is anonymous memory and is guarded by
+ * MemAvailable so a rank cannot consume the node's final HBM headroom. */
+size_t transformer_expand_q8_bf16_pv_range(transformer_model *model,
+                                            int layer_start, int layer_end,
+                                            int include_output,
+                                            int nextn_mask);
 /* Pack BF16 projections owned by [layer_start,layer_end) for the exact
  * FP32-activation 8x48 A64FX prefill kernel. */
 size_t transformer_prepack_prefill_pv48_range(transformer_model *model,
@@ -2322,7 +2332,7 @@ static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_byte
 }
 
 static void tf_matvec_bf16_rows(float *dst, const uint8_t *base, size_t row_bytes,
-                                  const float *x, int n_cols, int row_start, int row_end) {
+                                 const float *x, int n_cols, int row_start, int row_end) {
     int i = row_start;
 #if defined(__ARM_FEATURE_SVE)
     static int rows8 = -1;
@@ -4286,6 +4296,9 @@ void transformer_free(transformer_model *model) {
 #endif
             free(model->tp_stage_data);
     }
+#if defined(__linux__)
+    if (model->q8_bf16_arena) shmdt(model->q8_bf16_arena);
+#endif
     free(model->matvec_tmp);
     free(model->rope_inv_freq);
     free(model->rope_mrope_inv_freq);
@@ -4591,6 +4604,8 @@ transformer_model *transformer_nextn_context_create(
     ctx->tp_stage_data = NULL;
     ctx->tp_stage_bytes = 0;
     ctx->tp_stage_is_mmap = 0;
+    ctx->q8_bf16_arena = NULL;
+    ctx->q8_bf16_arena_bytes = 0;
     ctx->decode_owned = NULL;
     ctx->decode_owned_count = ctx->decode_owned_cap = 0;
     memset(&ctx->mpool, 0, sizeof(ctx->mpool));
@@ -8485,12 +8500,16 @@ int transformer_tp_slice_nextn(transformer_model *m, int rank, int size) {
     int nh = L->attn_q.n_rows / (2 * hd);
     int nkh = L->attn_k.n_rows / hd;
     int q0, q1, k0, k1;
-    tf_tp_range(nh, size, rank, &q0, &q1);
-    tf_tp_range(nkh, size, rank, &k0, &k1);
-    if (q1 <= q0 || k1 <= k0 || nh % size || nkh % size) return -1;
-
     int staged = getenv("TP_STAGE_DIR") && *getenv("TP_STAGE_DIR");
     int shard_block = !staged || (getenv("TP_NEXTN_SHARD") && atoi(getenv("TP_NEXTN_SHARD")));
+    tf_tp_range(nh, size, rank, &q0, &q1);
+    tf_tp_range(nkh, size, rank, &k0, &k1);
+    /* A complete rank stage keeps the small NextN transformer block
+     * replicated unless TP_NEXTN_SHARD is explicitly requested.  In that
+     * mode only the vocabulary head is sliced, so odd TP sizes do not need to
+     * divide the NextN KV-head count. */
+    if (shard_block && (q1 <= q0 || k1 <= k0 || nh % size || nkh % size))
+        return -1;
     if (!shard_block) goto slice_head;
 
     tf_tp_slice_rows(&L->attn_q, q0 * 2 * hd, q1 * 2 * hd);
@@ -9569,6 +9588,183 @@ size_t transformer_prepack_q8v2_range(transformer_model *m,int l0,int l1){
     }
     fprintf(stderr,"q8v2 range pack: layers=[%d,%d) tensors=%d %.3fGB\n",
             l0,l1,count,(double)total/1e9);
+    return total;
+}
+
+static uint16_t tf_q8_bf16_rne(float v) {
+    uint32_t u;
+    __builtin_memcpy(&u, &v, sizeof(u));
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
+
+static size_t tf_q8_bf16_pv_bytes(const qtensor *w) {
+    if (!w || !w->data || w->type != GGML_TYPE_Q8_0 ||
+        w->n_rows <= 0 || w->n_cols <= 0 || (w->n_rows & 7) ||
+        (w->n_cols & 31)) return 0;
+    return (size_t)w->n_rows * (size_t)w->n_cols * sizeof(uint16_t);
+}
+
+typedef struct {
+    const block_q8_0 *src;
+    uint16_t *dst;
+    int rows, cols, tid, nt;
+} tf_q8_bf16_pv_task;
+
+static void *tf_q8_bf16_pv_worker(void *arg) {
+    tf_q8_bf16_pv_task *t = (tf_q8_bf16_pv_task *)arg;
+    int groups = t->rows / 8, nb = t->cols / 32;
+    int g0 = groups * t->tid / t->nt;
+    int g1 = groups * (t->tid + 1) / t->nt;
+    for (int g = g0; g < g1; g++) {
+        uint16_t *gd = t->dst + (size_t)g * 8 * t->cols;
+        for (int pair = 0; pair < 4; pair++) {
+            int r0 = g * 8 + 2 * pair, r1 = r0 + 1;
+            uint16_t *pd = gd + (size_t)pair * 2 * t->cols;
+            for (int b = 0; b < nb; b++) {
+                const block_q8_0 *s0 = t->src + (size_t)r0 * nb + b;
+                const block_q8_0 *s1 = t->src + (size_t)r1 * nb + b;
+                float d0 = ggml_fp16_to_fp32(s0->d);
+                float d1 = ggml_fp16_to_fp32(s1->d);
+                for (int j = 0; j < 32; j++) {
+                    size_t k = (size_t)b * 32 + j;
+                    pd[2 * k] = tf_q8_bf16_rne(d0 * s0->qs[j]);
+                    pd[2 * k + 1] = tf_q8_bf16_rne(d1 * s1->qs[j]);
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static int tf_expand_q8_bf16_pv_tensor(transformer_model *m, qtensor *w,
+                                        uint16_t *dst) {
+    size_t bytes = tf_q8_bf16_pv_bytes(w);
+    if (!bytes) return 0;
+    const block_q8_0 *src = (const block_q8_0 *)w->data;
+    int nt = m->n_threads > 1 ? m->n_threads : 1;
+    tf_q8_bf16_pv_task *tasks =
+        (tf_q8_bf16_pv_task *)alloca((size_t)nt * sizeof(*tasks));
+    for (int tid = 0; tid < nt; tid++) {
+        tasks[tid] = (tf_q8_bf16_pv_task){src, dst, w->n_rows,
+                                          w->n_cols, tid, nt};
+    }
+    if (nt > 1 && m->pool_alive)
+        tf_pool_dispatch(m, tf_q8_bf16_pv_worker, tasks, sizeof(*tasks));
+    else
+        tf_q8_bf16_pv_worker(&tasks[0]);
+    w->data = dst;
+    w->type = GGML_TYPE_BF16;
+    w->bf16_pv = 1;
+    return 1;
+}
+
+size_t transformer_expand_q8_bf16_pv_range(transformer_model *m,
+                                             int l0, int l1,
+                                             int include_output,
+                                             int nextn_mask) {
+    if (!m || !m->layers) return 0;
+    if (l0 < 0) l0 = 0;
+    if (l1 > m->n_layers) l1 = m->n_layers;
+    if (l0 >= l1) return 0;
+    size_t planned = 0;
+    int planned_count = 0;
+    for (int l = l0; l < l1; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ssm_qkv,&L->ssm_gate,&L->ssm_alpha,&L->ssm_beta,&L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            size_t n = tf_q8_bf16_pv_bytes(ws[i]);
+            if (n) { planned += n; planned_count++; }
+        }
+    }
+    if (include_output) {
+        size_t n = tf_q8_bf16_pv_bytes(&m->output);
+        if (n) { planned += n; planned_count++; }
+    }
+    if (nextn_mask && m->nextn.loaded) {
+        transformer_layer *L = &m->nextn.layer;
+        qtensor *ws[] = {&m->nextn.eh_proj,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &m->nextn.shared_head_head};
+        const int bits[] = {1,2,128,256,4,8,64,16,32};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            if (!(nextn_mask & bits[i])) continue;
+            size_t n = tf_q8_bf16_pv_bytes(ws[i]);
+            if (n) { planned += n; planned_count++; }
+        }
+    }
+    const char *reserve_env = getenv("TP_Q8_BF16_RESERVE_GB");
+    double reserve_gb = reserve_env && *reserve_env ? atof(reserve_env) : 3.0;
+    if (reserve_gb < 2.0) reserve_gb = 2.0;
+    long avail_kb = tf_mem_available_kb();
+    double avail_gb = avail_kb > 0 ? (double)avail_kb / (1024.0 * 1024.0) : -1.0;
+    fprintf(stderr, "q8->bf16 PV plan: tensors=%d %.3fGB MemAvailable=%.2fGB reserve=%.2fGB\n",
+            planned_count, (double)planned / 1e9, avail_gb, reserve_gb);
+    if (!planned || (avail_kb > 0 &&
+        (double)planned / (1024.0 * 1024.0 * 1024.0) + reserve_gb > avail_gb)) {
+        fprintf(stderr, "q8->bf16 PV: rejected by HBM headroom guard\n");
+        return 0;
+    }
+    size_t arena_bytes = (planned + (2u << 20) - 1) & ~((size_t)(2u << 20) - 1);
+    int shmid = shmget(IPC_PRIVATE, arena_bytes, IPC_CREAT | 0600);
+    void *arena = shmid >= 0 ? shmat(shmid, NULL, 0) : (void *)-1;
+    if (shmid >= 0) shmctl(shmid, IPC_RMID, NULL);
+    if (arena == (void *)-1) {
+        fprintf(stderr, "q8->bf16 PV: anonymous System-V arena allocation failed\n");
+        return 0;
+    }
+    m->q8_bf16_arena = arena;
+    m->q8_bf16_arena_bytes = arena_bytes;
+    size_t total = 0;
+    int count = 0;
+    for (int l = l0; l < l1; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ssm_qkv,&L->ssm_gate,&L->ssm_alpha,&L->ssm_beta,&L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            size_t n = tf_q8_bf16_pv_bytes(ws[i]);
+            if (!n) continue;
+            if (tf_expand_q8_bf16_pv_tensor(m, ws[i],
+                    (uint16_t *)((uint8_t *)arena + total)) < 0) return 0;
+            total += n;
+            count++;
+        }
+    }
+    if (include_output) {
+        size_t n = tf_q8_bf16_pv_bytes(&m->output);
+        if (n) {
+            if (tf_expand_q8_bf16_pv_tensor(m, &m->output,
+                    (uint16_t *)((uint8_t *)arena + total)) < 0) return 0;
+            total += n;
+            count++;
+        }
+    }
+    if (nextn_mask && m->nextn.loaded) {
+        transformer_layer *L = &m->nextn.layer;
+        qtensor *ws[] = {&m->nextn.eh_proj,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &m->nextn.shared_head_head};
+        const int bits[] = {1,2,128,256,4,8,64,16,32};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            if (!(nextn_mask & bits[i])) continue;
+            size_t n = tf_q8_bf16_pv_bytes(ws[i]);
+            if (!n) continue;
+            if (tf_expand_q8_bf16_pv_tensor(m, ws[i],
+                    (uint16_t *)((uint8_t *)arena + total)) < 0) return 0;
+            total += n;
+            count++;
+        }
+    }
+    fprintf(stderr, "q8->bf16 PV: tensors=%d expanded=%.3fGB MemAvailable=%.2fGB%s\n",
+            count, (double)total / 1e9,
+            (double)tf_mem_available_kb() / (1024.0 * 1024.0),
+            nextn_mask ? " +lm_head+selected-NextN" :
+            (include_output ? " +lm_head" : ""));
     return total;
 }
 
@@ -10900,6 +11096,27 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
             gemm_q8_0_f32_tokmajor(Y_out, mat->data, X, n_rows, K, N, out_stride, X_stride);
             return;
         }
+#ifdef _OPENMP
+        /* Small-N speculative verification calls this path for every trunk
+         * projection.  Creating and joining 48 raw pthreads per matrix costs
+         * tens of milliseconds on A64FX and previously dominated Q8 MTP.
+         * Reuse the hot, pinned OpenMP team just as the BF16 small-N path does.
+         * Each row retains the same Q8 block traversal and reduction order. */
+        int nt = n_threads > 1 ? n_threads : 1;
+        size_t row_bytes = (size_t)(K / 32) * sizeof(block_q8_0);
+        #pragma omp parallel num_threads(nt)
+        {
+            int tid = omp_get_thread_num();
+            int team = omp_get_num_threads();
+            int row0 = n_rows * tid / team;
+            int row1 = n_rows * (tid + 1) / team;
+            if (row1 > row0)
+                gemm_q8_0_f32_tokmajor(Y_out + row0,
+                    (const uint8_t *)mat->data + (size_t)row0 * row_bytes,
+                    X, row1 - row0, K, N, out_stride, X_stride);
+        }
+        return;
+#else
         pthread_t *threads = (pthread_t *)alloca(n_threads * sizeof(pthread_t));
         tf_gemm_q8_tm_task *tasks = (tf_gemm_q8_tm_task *)alloca(n_threads * sizeof(tf_gemm_q8_tm_task));
         int rows_per = n_rows / n_threads, extra = n_rows % n_threads, offset = 0;
@@ -10915,6 +11132,7 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
         }
         for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
         return;
+#endif
     }
     if (mat->type == GGML_TYPE_BF16) {
         /* BF16 GEMM path */

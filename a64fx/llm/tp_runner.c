@@ -1026,6 +1026,7 @@ int main(int argc, char **argv) {
     const char *prompt_env = envs("TP_PROMPT", "Hello, who are you?");
     const char *prompt_file = envs("TP_PROMPT_FILE", "");
     char *prompt_file_text = NULL;
+    char *prompt_repeat_text = NULL;
     const char *prompt = prompt_env;
     int  max_gen           = (int)envl("TP_MAXGEN", 64);
     int  perf_warmup       = (int)envl("TP_PERF_WARMUP", 0);
@@ -1101,6 +1102,25 @@ int main(int argc, char **argv) {
                 prompt_file_text[read_len - 1] = 0;
             prompt = prompt_file_text;
         }
+    }
+    int prompt_repeat = (int)envl_opt("TP_PROMPT_REPEAT", 1);
+    if (prompt_repeat < 1 || prompt_repeat > 16)
+        die("TP_PROMPT_REPEAT must be in [1,16]", -1);
+    if (prompt_repeat > 1) {
+        size_t one = strlen(prompt);
+        if (one > (SIZE_MAX - (size_t)prompt_repeat) / (size_t)prompt_repeat)
+            die("TP_PROMPT_REPEAT overflow", -1);
+        size_t bytes = one * (size_t)prompt_repeat + (size_t)prompt_repeat;
+        prompt_repeat_text = (char *)malloc(bytes);
+        if (!prompt_repeat_text) die("malloc(repeated prompt)", -1);
+        char *d = prompt_repeat_text;
+        for (int i = 0; i < prompt_repeat; i++) {
+            if (i) *d++ = ' ';
+            memcpy(d, prompt, one);
+            d += one;
+        }
+        *d = 0;
+        prompt = prompt_repeat_text;
     }
 
     /* A complete TP stage owns every tensor used by decode.  Parse only
@@ -1182,7 +1202,7 @@ int main(int argc, char **argv) {
         (m->layers[0].attn_q.type == GGML_TYPE_Q8_0 ||
          m->layers[0].ssm_qkv.type == GGML_TYPE_Q8_0 ||
          m->layers[0].ffn_gate.type == GGML_TYPE_Q8_0);
-    if (q8_mode_env && is_q8_model) {
+    if (q8_mode_env && *q8_mode_env && is_q8_model) {
         int q8_mode = !strcmp(q8_mode_env, "row") ? 1 :
                       !strcmp(q8_mode_env, "block64") ? 2 :
                       !strcmp(q8_mode_env, "block64-ffn") ? 3 :
@@ -1191,6 +1211,30 @@ int main(int argc, char **argv) {
         if (!q8_bytes) die("transformer_materialize_q8_decode", -1);
         if (MyRank == 0) logmsg("TP_Q8_MODE=%s resident=%.3fGB\n", q8_mode_env,
                                 (double)q8_bytes / 1e9);
+    }
+    const char *q8_expand = getenv("TP_Q8_EXPAND_BF16");
+    if (q8_expand && *q8_expand && atoi(q8_expand) != 0 && is_q8_model) {
+        if (q8_mode_env && *q8_mode_env)
+            die("TP_Q8_EXPAND_BF16 conflicts with TP_Q8_MODE", -1);
+        if (getenv("TP_Q8_VERIFY") && *getenv("TP_Q8_VERIFY"))
+            die("TP_Q8_EXPAND_BF16 conflicts with TP_Q8_VERIFY", -1);
+        int nextn_mask = spec_k > 0 ? (int)envl("TP_Q8_EXPAND_NEXTN_MASK", 0) : 0;
+        size_t expanded = transformer_expand_q8_bf16_pv_range(
+            m, 0, m->n_layers, 1, nextn_mask);
+        if (!expanded) die("Q8 to BF16 PV expansion", -1);
+        if (MyRank == 0) logmsg("TP_Q8_EXPAND_BF16=1 expanded=%.3fGB\n",
+                                (double)expanded / 1e9);
+    }
+    const char *q8_verify = getenv("TP_Q8_VERIFY");
+    if (q8_verify && *q8_verify && is_q8_model) {
+        size_t verify_bytes = 0;
+        if (!strcmp(q8_verify, "q8v2"))
+            verify_bytes = transformer_prepack_q8v2_range(m, 0, m->n_layers);
+        else
+            die("TP_Q8_VERIFY must be q8v2", -1);
+        if (!verify_bytes) die("Q8 verifier prepack", -1);
+        if (MyRank == 0) logmsg("TP_Q8_VERIFY=%s packed=%.3fGB\n",
+                                q8_verify, (double)verify_bytes / 1e9);
     }
     if (getenv("TP_INT8_MODE") && *getenv("TP_INT8_MODE")) {
         if (m->layers[0].ffn_gate.type != GGML_TYPE_BF16)
@@ -2103,6 +2147,7 @@ done:
     utofu_dereg_mem(Vcq, Base, 0);
     utofu_free_vcq(Vcq);
     free(ptoks); free(Region);
+    free(prompt_repeat_text); free(prompt_file_text);
     if (g_log) fclose(g_log);
     if (g_curve) fclose(g_curve);
     if (g_tokdump) fclose(g_tokdump);
