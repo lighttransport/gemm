@@ -265,6 +265,7 @@ typedef struct {
     volatile int pool_phase;   /* incremented to signal work */
     volatile int pool_done;    /* number of workers done */
     int pool_alive;            /* 1 if pool is running */
+    int pool_paused;           /* workers retained asleep while OMP batch owns cores */
     pthread_mutex_t pool_mutex;/* protects pool_phase signaling */
     pthread_cond_t pool_cond;  /* workers sleep here between dispatches */
     volatile int bar_count;    /* barrier arrival counter */
@@ -4381,12 +4382,15 @@ static void *tf_pool_worker_main(void *arg) {
     while (1) {
         /* Sleep until dispatcher signals new work via cond_broadcast. */
         pthread_mutex_lock(&m->pool_mutex);
-        while (m->pool_phase == last_phase && m->pool_alive)
+        while (m->pool_phase == last_phase && (m->pool_alive || m->pool_paused))
             pthread_cond_wait(&m->pool_cond, &m->pool_mutex);
         pthread_mutex_unlock(&m->pool_mutex);
 
         last_phase = m->pool_phase;
-        if (!m->pool_alive) return NULL;
+        if (!m->pool_alive) {
+            if (m->pool_paused) continue;
+            return NULL;
+        }
 
         /* Execute work */
         void *task = (char *)m->pool_args + (size_t)tid * m->pool_arg_stride;
@@ -4420,6 +4424,7 @@ static void tf_pool_start(transformer_model *model) {
     model->pool_phase = 0;
     model->pool_done = 0;
     model->pool_alive = 1;
+    model->pool_paused = 0;
     pthread_mutex_init(&model->pool_mutex, NULL);
     pthread_cond_init(&model->pool_cond, NULL);
     __sync_synchronize();
@@ -10534,6 +10539,38 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
     }
 #endif
 #if defined(__ARM_FEATURE_SVE)
+    if (mat->type == GGML_TYPE_BF16 && mat->bf16_pv && !mat->i8) {
+        /* Resident TP decode shards use the 8-row pair-interleaved layout.
+         * Verify K candidates directly from that layout: the 8x3 kernel loads
+         * each weight vector once for three token columns, while the tail uses
+         * the exact single-token PV reduction. */
+        int K = mat->n_cols, nt = n_threads > 1 ? n_threads : 1;
+        int groups = n_rows / 8;
+        const uint16_t *base = (const uint16_t *)mat->data;
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(nt) schedule(static)
+        #endif
+        for (int g = 0; g < groups; g++) {
+            const uint16_t *p = base + (size_t)g * 8 * K;
+            int t = 0;
+            for (; t + 2 < N; t += 3) {
+                float a0[8] = {0}, a1[8] = {0}, a2[8] = {0};
+                matvec_bf16_8x3_pv_acc(a0, a1, a2, p, p + 2*K,
+                                       p + 4*K, p + 6*K,
+                                       X + (size_t)t * X_stride,
+                                       X + (size_t)(t + 1) * X_stride,
+                                       X + (size_t)(t + 2) * X_stride, K);
+                memcpy(Y_out + (size_t)t * out_stride + g*8, a0, sizeof(a0));
+                memcpy(Y_out + (size_t)(t+1) * out_stride + g*8, a1, sizeof(a1));
+                memcpy(Y_out + (size_t)(t+2) * out_stride + g*8, a2, sizeof(a2));
+            }
+            for (; t < N; t++)
+                matvec_bf16_8row_pv(Y_out + (size_t)t * out_stride + g*8,
+                                    p, p + 2*K, p + 4*K, p + 6*K,
+                                    X + (size_t)t * X_stride, K);
+        }
+        return;
+    }
     if (mat->i8) {   /* W8A8 int8 SDOT GEMM: quantize X per-token, row-outer/token-inner
                       * (weight row read once from HBM, reused across N tokens from L1). */
         int K = mat->n_cols, nt = n_threads > 1 ? n_threads : 1;
@@ -11887,6 +11924,12 @@ int tf_batch_logit_v0 = -1, tf_batch_logit_v1 = -1;
 /* If set, prefill_batch points this at the [N x n_embd] post-block hidden states (the
  * pre-output-norm residual stream) so an MTP/draft head can fuse them. */
 float **tf_batch_hidden_out = NULL;
+/* Qwen's hybrid prefill uses transient malloc scratch (unlike Gemma's model
+ * pool), so retain a small reusable copy when the speculative caller requests
+ * all per-position hidden rows.  K is normally <=4: this is kilobytes, not a
+ * second weight/state allocation. */
+static float *tf_qwen_batch_hidden = NULL;
+static size_t tf_qwen_batch_hidden_cap = 0;
 static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *tokens,
                                       int n_tokens, int start_pos) {
     if (!m || !tokens || n_tokens <= 0 || !m->is_gemma4) return NULL;
@@ -12230,9 +12273,11 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
     }
 
     int pool_was_alive = m->pool_alive;
-    if (pool_was_alive) tf_pool_shutdown(m);
+    int pool_retained = pool_was_alive && tf_batch_keep_pool;
+    if (pool_was_alive && !pool_retained) tf_pool_shutdown(m);
     int saved_pool_alive = m->pool_alive;
-    m->pool_alive = 0; /* SSM helper must not dispatch into a stopped pool. */
+    if (pool_retained) m->pool_paused = 1;
+    m->pool_alive = 0; /* Batch helpers must not dispatch into the decode pool. */
 
     pprof->calls++;
     for (int l = layer_start; l < layer_end; l++) {
@@ -12453,6 +12498,18 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
     }
 
     if (hidden_io) memcpy(hidden_io, cur, nf * (size_t)ne * sizeof(float));
+    if (tf_batch_hidden_out) {
+        size_t hidden_count = nf * (size_t)ne;
+        if (hidden_count > tf_qwen_batch_hidden_cap) {
+            float *grown = (float *)realloc(tf_qwen_batch_hidden,
+                                            hidden_count * sizeof(float));
+            if (!grown) goto fail;
+            tf_qwen_batch_hidden = grown;
+            tf_qwen_batch_hidden_cap = hidden_count;
+        }
+        memcpy(tf_qwen_batch_hidden, cur, hidden_count * sizeof(float));
+        *tf_batch_hidden_out = tf_qwen_batch_hidden;
+    }
     memcpy(m->x, cur + (size_t)(N - 1) * ne, (size_t)ne * sizeof(float));
     float *result = m->x;
     if ((flags & TF_PREFILL_LOGITS) && tf_batch_all_logits) {
@@ -12485,14 +12542,15 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
         tf_rmsnorm(m->x, m->x, &m->output_norm, ne, m->rms_norm_eps, m->matvec_tmp);
         result = transformer_compute_logits(m);
     }
-    m->pool_alive = saved_pool_alive;
+    m->pool_alive = pool_retained ? 1 : saved_pool_alive;
+    if (pool_retained) m->pool_paused = 0;
     /* Pipeline-prefill runners do not return to token decode between chunks.
      * Keep the decode pthread pool stopped after the first range call instead
      * of paying shutdown/start for every chunk; transformer_free handles an
      * already-stopped pool. */
     static int keep_pool_off=-1;
     if(keep_pool_off<0){const char*e=getenv("TF_PREFILL_KEEP_POOL_OFF");keep_pool_off=e&&atoi(e)!=0;}
-    if (pool_was_alive && !keep_pool_off) tf_pool_start(m);
+    if (pool_was_alive && !pool_retained && !keep_pool_off) tf_pool_start(m);
     free(cur); free(norm); free(proj); free(kv); free(vv); free(attout);
     free(inner); free(gate); free(up); free(out);
     return result;
