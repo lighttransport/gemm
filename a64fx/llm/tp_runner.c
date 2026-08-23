@@ -859,8 +859,9 @@ static void print_token(const bpe_vocab *vocab, int32_t nt) {
     char *dec = bpe_byte_decode(s, (int)strlen(s), &dec_len);
     const char *out = dec ? dec : s;
     int len = dec ? dec_len : (int)strlen(s);
-    if (g_log) { fwrite(out, 1, len, g_log); fflush(g_log); }
-    fwrite(out, 1, len, stdout); fflush(stdout);
+    int buffered = getenv("TP_BUFFER_OUTPUT") != NULL;
+    if (g_log) { fwrite(out, 1, len, g_log); if (!buffered) fflush(g_log); }
+    fwrite(out, 1, len, stdout); if (!buffered) fflush(stdout);
     free(dec);
 }
 
@@ -1980,6 +1981,10 @@ int main(int argc, char **argv) {
 done:
     free(mtp_seed_hidden);
     free(mtp_token_counts);
+    if (getenv("TP_BUFFER_OUTPUT")) {
+        if (g_log) fflush(g_log);
+        fflush(stdout);
+    }
     barrier();
     if (is_first && mtp_total)
         logmsg("MTP greedy match=%ld/%ld alpha=%.4f K=%d diversity=%d max_share=%.4f gate=%s\n",
