@@ -1839,25 +1839,31 @@ The remaining gaps are 2.23 and 5.66 tok/s respectively.
 The reproducible optimized commands are:
 
 ```sh
-# Plain Q8-storage / BF16-PV runtime decode.
-TP_SIZE=4 TP_Q8_EXPAND_BF16=1 TP_MAXGEN=32 TP_PERF_WARMUP=8 \
-  TP_MAXSEQ=512 ./a64fx/llm/run_qwen38_q8_tp4.sh bench
+# Plain Q8-storage / BF16-PV runtime decode.  The named profile supplies the
+# accepted expansion, sequence-length, generation, and warmup settings.
+TP_SIZE=4 ./a64fx/llm/run_qwen38_q8_tp4.sh bf16-bench
 
 # Build the separate stage whose NextN transformer is also TP-sharded.
 TP_SIZE=4 TP_NEXTN_SHARD=1 ./a64fx/llm/run_qwen38_q8_tp4.sh stage
 
-# Exact K=4 MTP on the long-context Q8 oracle.  The launcher defaults the
-# small-buffer direct all-to-all path for a sharded NextN stage.
-TP_SIZE=4 TP_NEXTN_SHARD=1 TP_Q8_EXPAND_BF16=1 \
-  TP_Q8_EXPAND_NEXTN_MASK=53 TF_BF16PV_PREFETCH=12 \
-  TP_SPEC_K=4 TP_PROMPT_FILE="$PWD/tmp/qwen38_mtp_prompt.txt" \
-  TP_MAXSEQ=512 TP_MAXGEN=64 ./a64fx/llm/run_qwen38_q8_tp4.sh mtp-check
+# Exact K=4 MTP on the long-context Q8 oracle.  bf16-mtp selects the sharded
+# stage, mask 53, PV prefetch 12, direct small-buffer all-to-all, and K=4.
+TP_SIZE=4 TP_PROMPT_FILE="$PWD/tmp/qwen38_mtp_prompt.txt" \
+  ./a64fx/llm/run_qwen38_q8_tp4.sh bf16-mtp
 
 # Native-Q8 verifier path (no BF16 runtime expansion).
 TP_SIZE=4 TP_Q8_VERIFY=q8v2 TP_SPEC_K=5 \
   TP_PROMPT_FILE="$PWD/tmp/qwen38_mtp_prompt.txt" TP_MAXSEQ=512 \
   ./a64fx/llm/run_qwen38_q8_tp4.sh mtp-check
 ```
+
+`bf16-mtp` deliberately rejects TP2/TP3: the polished performance profile is
+the measured TP4 configuration.  The generic `mtp-check` mode remains
+available for diagnostic topology, mask, and K sweeps.  BF16 expansion now
+also requires a complete TP stage and rejects unknown NextN-mask bits, so it
+cannot silently fall back to source-file-backed weights or accept a mistyped
+profile.  The launcher uses ordinary incremental builds rather than forcing a
+full rebuild for every benchmark.
 
 #### Rejected experiments and remaining work
 

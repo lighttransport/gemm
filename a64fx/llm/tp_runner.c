@@ -1026,7 +1026,6 @@ int main(int argc, char **argv) {
     const char *prompt_env = envs("TP_PROMPT", "Hello, who are you?");
     const char *prompt_file = envs("TP_PROMPT_FILE", "");
     char *prompt_file_text = NULL;
-    char *prompt_repeat_text = NULL;
     const char *prompt = prompt_env;
     int  max_gen           = (int)envl("TP_MAXGEN", 64);
     int  perf_warmup       = (int)envl("TP_PERF_WARMUP", 0);
@@ -1103,26 +1102,6 @@ int main(int argc, char **argv) {
             prompt = prompt_file_text;
         }
     }
-    int prompt_repeat = (int)envl_opt("TP_PROMPT_REPEAT", 1);
-    if (prompt_repeat < 1 || prompt_repeat > 16)
-        die("TP_PROMPT_REPEAT must be in [1,16]", -1);
-    if (prompt_repeat > 1) {
-        size_t one = strlen(prompt);
-        if (one > (SIZE_MAX - (size_t)prompt_repeat) / (size_t)prompt_repeat)
-            die("TP_PROMPT_REPEAT overflow", -1);
-        size_t bytes = one * (size_t)prompt_repeat + (size_t)prompt_repeat;
-        prompt_repeat_text = (char *)malloc(bytes);
-        if (!prompt_repeat_text) die("malloc(repeated prompt)", -1);
-        char *d = prompt_repeat_text;
-        for (int i = 0; i < prompt_repeat; i++) {
-            if (i) *d++ = ' ';
-            memcpy(d, prompt, one);
-            d += one;
-        }
-        *d = 0;
-        prompt = prompt_repeat_text;
-    }
-
     /* A complete TP stage owns every tensor used by decode.  Parse only
      * source metadata in that mode; never mmap or allocate the 54 GB GGUF. */
     gguf_context *gguf = gguf_open_multi(model_path,
@@ -1219,6 +1198,10 @@ int main(int argc, char **argv) {
         if (getenv("TP_Q8_VERIFY") && *getenv("TP_Q8_VERIFY"))
             die("TP_Q8_EXPAND_BF16 conflicts with TP_Q8_VERIFY", -1);
         int nextn_mask = spec_k > 0 ? (int)envl("TP_Q8_EXPAND_NEXTN_MASK", 0) : 0;
+        if (nextn_mask & ~0x1ff)
+            die("TP_Q8_EXPAND_NEXTN_MASK contains unsupported bits", -1);
+        if (!tp_stage_bytes)
+            die("TP_Q8_EXPAND_BF16 requires a complete anonymous TP stage", -1);
         size_t expanded = transformer_expand_q8_bf16_pv_range(
             m, 0, m->n_layers, 1, nextn_mask);
         if (!expanded) die("Q8 to BF16 PV expansion", -1);
@@ -2147,7 +2130,7 @@ done:
     utofu_dereg_mem(Vcq, Base, 0);
     utofu_free_vcq(Vcq);
     free(ptoks); free(Region);
-    free(prompt_repeat_text); free(prompt_file_text);
+    free(prompt_file_text);
     if (g_log) fclose(g_log);
     if (g_curve) fclose(g_curve);
     if (g_tokdump) fclose(g_tokdump);
