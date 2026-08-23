@@ -1679,6 +1679,18 @@ int main(int argc, char **argv) {
         tf_batch_ssm_snapshot_slots = batch_ssm_slots;
         tf_batch_ssm_layer_stride = snap_layer;
         tf_batch_ssm_slot_stride = snap_slot;
+        int mtp_shadow_threads = (int)envl_opt("TP_MTP_SHADOW_THREADS", 0);
+        transformer_model *mtp_draft_model = m;
+        if (mtp_shadow_threads > 0) {
+            mtp_draft_model = transformer_nextn_context_create(m, mtp_shadow_threads);
+            if (!mtp_draft_model) die("MTP shadow context alloc", -1);
+            transformer_nextn_context_copy_state(mtp_draft_model, m);
+            /* Tensor-parallel fields and callback are copied from m; only the
+             * mutable NextN runtime and worker pool are private. */
+            if (is_first)
+                logmsg("MTP shadow context: threads=%d independent scratch/KV/pool\n",
+                       mtp_shadow_threads);
+        }
         if (is_first)
             logmsg("MTP batched verify: K=%d vocab/rank=%d recurrent_snapshot=%.1fMB\n",
                    spec_k, vlogits, (double)ss.bytes / (1024.0 * 1024.0));
@@ -1802,12 +1814,14 @@ int main(int argc, char **argv) {
                         for (int k = 0; k < verify_drafts; k++) mtp_pending[k] = prev;
                     } else {
                         for (int k = 0; k < verify_drafts; k++) {
-                            float *dlg = transformer_nextn_logits(m, prev, draft_h, p - 1 + k);
+                            float *dlg = transformer_nextn_logits(
+                                mtp_draft_model, prev, draft_h, p - 1 + k);
                             double da = 0.0; long dc = 0;
-                            mtp_pending[k] = sample_argmax(m, dlg, &c, &da, &dc);
+                            mtp_pending[k] = sample_argmax(
+                                mtp_draft_model, dlg, &c, &da, &dc);
                             argmax_ar += da; argmax_calls += dc;
                             prev = mtp_pending[k];
-                            draft_h = transformer_nextn_hidden(m);
+                            draft_h = transformer_nextn_hidden(mtp_draft_model);
                         }
                     }
                     if (mtp_omp_park) {
@@ -1885,6 +1899,8 @@ int main(int argc, char **argv) {
         }
         free(batch_ssm);
         free(all_logits);
+        if (mtp_draft_model != m)
+            transformer_nextn_context_free(mtp_draft_model);
         tp_spec_state_free(&ss);
         goto done;
     }

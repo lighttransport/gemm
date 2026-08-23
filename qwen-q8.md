@@ -1649,3 +1649,97 @@ Relevant commits, newest first: `9d169b59` (buffered benchmark output),
 `73643277` (batched verifier argmax), `18fe8553` (K=4/K=5 verifier kernels),
 `f8a9b471` (parallel NextN attention), `65c1fd65` (fused MTP SSM dots), and
 `79ff4e37` (split K=3 verifier kernel).
+
+### Sustained 50 tok/s milestone and post-restart MTP work (2026-08-24)
+
+The first target is now met.  Commit `a746072a` moved the decode wall timer to
+the actual loop boundaries, enabled the exact SVE SiLU path, and retained only
+the useful packed NextN hidden-fusion projection.  With the same 359-token
+long-context prompt, K=5 produced three exact 64-token repeats at
+52.13/52.12/51.42 tok/s.  The stronger sustained gate generated 256 tokens in
+4.790 seconds, or **53.43 tok/s**, byte-identical to the K=0 oracle:
+
+- oracle SHA256: `7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`;
+- 55 verifier rounds, 68.79 ms verify plus 18.26 ms draft per round;
+- greedy agreement 205/220, alpha 0.9318;
+- horizon agreement 53/55, 52/55, 53/55, 47/55;
+- rank-0 forward 4.7888 seconds and reported 868 GB/s/node effective bandwidth.
+
+After the session restart, the four rank-local blobs were restaged under
+`/local/u14346/qwen38-bf16-tp4`.  Each node uploads 17.724 GB into anonymous
+HBM2 from metadata-only GGUF input; rank 0 retained 12.67 GB `MemAvailable`
+after upload.  No weight mmap or llama.cpp path is involved.  A clean rebuild
+reproduced the 256-token oracle at 53.45 tok/s and 870 GB/s/node.  A later noisy
+64-token default run was exact at 49.86 tok/s; the sustained result above remains
+the headline rather than selecting the best short repeat.
+
+This work also adds a weights-sharing NextN runtime context.  It owns private
+NextN KV, hidden/fusion buffers, transformer scratch, logits, and a pthread
+pool, while sharing the immutable anonymous staged weights and RoPE tables.
+`TP_MTP_SHADOW_THREADS` selects it for the sequential correctness path, and
+`TP_MTP_SHADOW_CORE_OFFSET` can place a future background pool on a reserved
+A64FX CMG.  The isolated 48-thread context reproduced the exact 64-token oracle,
+53/56 agreement, and 51.00 tok/s.  It adds only runtime scratch/state, not a
+second 17.7 GB weight arena.
+
+#### New rejected experiments
+
+- A separate second-TNI/tag-8 communicator plus background five-step lookahead
+  retained the rank-0 exact output, but concurrent traffic/compute raised the
+  verifier from about 69 ms to 282.68 ms and reduced throughput to 12.12 tok/s.
+  Prefetched tails were not lockstep-identical across ranks.  The async runner
+  path and communicator were removed; only the safe context isolation remains.
+- Scoring the already-replicated `token_embd.weight` locally avoided the draft
+  collective, but Qwen3.8 has a distinct trained output head.  Agreement
+  collapsed to zero and rank-local numerical drift produced different draft
+  chains.  This path was removed.
+- The safe generic BF16 PV K=6 verifier was greedy-exact, unlike the earlier
+  rejected specialized 4x6 kernel, but reached only 45.54 tok/s: 93.97 ms
+  verification plus 23.08 ms drafting per round.  K=6 exposure was reverted.
+- Selective packed or W8A8 NextN attention/output/down/QKV/FFN variants were
+  neutral, slower, or damaged agreement.  Only packed `nextn.eh_proj.weight`
+  remains enabled.  Prefetch distance 18 was also noisy and lost to the default
+  distance 16 on the sustained gate.
+
+#### Remaining decode and MTP tasks
+
+1. **Design overlap around the one real recurrent NextN head.**  GGUF reports
+   `nextn_predict_layers=1`; there are no independent native tree heads.  Keep
+   the new private runtime, but do not duplicate the same recurrence and call it
+   a tree.  A useful pipeline must precompute beyond the current queue and reuse
+   it only after both the verified prefix and predicted correction match.
+
+2. **Give background drafting deterministic tokens without a concurrent
+   all-reduce.**  The most promising design is to stage the trained full
+   `output.weight` only where needed (the embedding matrix is not equivalent),
+   let a designated draft rank select tokens, and send each tiny token on an
+   isolated one-way channel.  Other ranks must consume the same token before
+   advancing their replicated NextN state.  Measure this transport alone before
+   reconnecting it to verification.
+
+3. **Partition cores/CMGs instead of oversubscribing 48+draft workers.**  Use
+   `TP_MTP_SHADOW_CORE_OFFSET=36` for a 12-core CMG3 draft pool and benchmark the
+   verifier with 36 reserved trunk workers.  Sweep 8/12/16 draft workers and
+   32/36/40 verifier workers.  Require rank-identical pending queues and compare
+   verifier time against the 68.79 ms sustained baseline; overlap that slows the
+   verifier more than the hidden draft time is a rejection.
+
+4. **Reduce verifier time below its current theoretical ceiling.**  K=5 emits
+   256/55 = 4.65 tokens/round.  Even zero-cost drafting with a 68.79 ms verifier
+   yields only about 67.6 tok/s, so the 70 tok/s gate also needs roughly 2--3 ms
+   removed from verification or a slightly higher emitted-token ratio.  Profile
+   the 4x5 PV kernel for spills, preserve its exact accumulation order, and
+   attack the 10.2 ms/round collective phase without changing greedy tokens.
+
+5. **Validate every scheduler change at 256 tokens before acceptance.**  Require
+   the SHA above, identical pending tokens on all four ranks, at least three
+   repeats, 55-ish rounds with alpha near 0.93, and memory below 32 GB/node.
+   Report decode-loop wall time separately from setup/final barriers.  The final
+   goal remains sustained **70+ tok/s**; the current accepted result is
+   **53.43 tok/s** and 870 GB/s/node.
+
+6. **Further improvement opportunities after overlap is stable.**  Fuse the
+   local NextN head projection with greedy maximum reduction to avoid writing
+   62,080 logits; pipeline verifier projection completion with its TP reduction;
+   batch or piggyback the tiny draft-token messages; and test a hand-scheduled
+   exact 4x5 assembly kernel using build scratch under `/local`, never `/tmp`.

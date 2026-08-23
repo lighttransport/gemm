@@ -266,6 +266,7 @@ typedef struct {
     volatile int pool_done;    /* number of workers done */
     int pool_alive;            /* 1 if pool is running */
     int pool_paused;           /* workers retained asleep while OMP batch owns cores */
+    int pool_core_offset;      /* optional A64FX core offset for an isolated pool */
     pthread_mutex_t pool_mutex;/* protects pool_phase signaling */
     pthread_cond_t pool_cond;  /* workers sleep here between dispatches */
     volatile int bar_count;    /* barrier arrival counter */
@@ -416,6 +417,15 @@ float *transformer_nextn_logits(transformer_model *model, int32_t prev_token,
                                 const float *target_hidden, int position);
 const float *transformer_nextn_hidden(const transformer_model *model);
 const float *transformer_nextn_target_hidden(const transformer_model *model);
+/* Create a weights-sharing NextN-only runtime.  It owns independent scratch,
+ * KV state, logits, and worker threads, but never owns the trunk/staged weights.
+ * This is the isolation boundary needed to overlap a speculative NextN chain
+ * with target-model verification without racing transformer_model scratch. */
+transformer_model *transformer_nextn_context_create(
+    const transformer_model *source, int n_threads);
+void transformer_nextn_context_copy_state(transformer_model *dst,
+                                          const transformer_model *source);
+void transformer_nextn_context_free(transformer_model *context);
 
 /* Copy hidden state into/out of model->x for MPI communication */
 float *transformer_get_hidden(transformer_model *model);
@@ -4306,7 +4316,8 @@ typedef struct {
     int tid;
 } tf_pool_worker_ctx;
 
-static void tf_bind_current_thread_for_numa(int tid) {
+static void tf_bind_current_thread_for_numa(const transformer_model *model,
+                                            int tid) {
     const char *enabled = getenv("NUMA_DISTRIBUTE");
     if (!enabled || atoi(enabled) == 0) {
         (void)tid;
@@ -4322,9 +4333,12 @@ static void tf_bind_current_thread_for_numa(int tid) {
      * CMG0, 12..23 to CMG1, etc.  The old round-robin mapping (tid % 4)
      * scattered every tensor slice across all CMGs and made first-touch
      * placement remote for three quarters of each slice. */
+    int logical_tid = tid + (model ? model->pool_core_offset : 0);
+    logical_tid %= 48;
+    if (logical_tid < 0) logical_tid += 48;
     int per_cmg = 48 / n_cmgs;
-    int cmg = tid / per_cmg;
-    int local = tid % per_cmg;
+    int cmg = logical_tid / per_cmg;
+    int local = logical_tid % per_cmg;
     if (cmg >= n_cmgs) cmg = n_cmgs - 1;
     if (local >= 12) local %= 12;
     int core = 12 + cmg * 12 + local;
@@ -4340,7 +4354,8 @@ static void tf_bind_current_thread_for_numa(int tid) {
 #endif
 }
 
-static int tf_bind_current_thread_for_numa_saved(int tid, cpu_set_t *old_set) {
+static int tf_bind_current_thread_for_numa_saved(const transformer_model *model,
+                                                 int tid, cpu_set_t *old_set) {
     const char *enabled = getenv("NUMA_DISTRIBUTE");
     if (!enabled || atoi(enabled) == 0) {
         (void)tid;
@@ -4349,7 +4364,7 @@ static int tf_bind_current_thread_for_numa_saved(int tid, cpu_set_t *old_set) {
     }
 #if defined(__linux__)
     if (sched_getaffinity(0, sizeof(*old_set), old_set) != 0) return 0;
-    tf_bind_current_thread_for_numa(tid);
+    tf_bind_current_thread_for_numa(model, tid);
     return 1;
 #else
     (void)tid;
@@ -4372,7 +4387,7 @@ static void *tf_pool_worker_main(void *arg) {
     transformer_model *m = ctx->model;
     int tid = ctx->tid;
     free(ctx);
-    tf_bind_current_thread_for_numa(tid);
+    tf_bind_current_thread_for_numa(m, tid);
 
     /* NOTE: a spin-then-sleep on pool_phase was tried to cut the cond_broadcast
      * wake-from-sleep latency (~0.4ms/dispatch x 169/tok) but it only ever HURT
@@ -4458,7 +4473,7 @@ static void tf_pool_dispatch(transformer_model *model, void *(*fn)(void *),
     void *task0 = (char *)args;
 #if defined(__linux__)
     cpu_set_t old_set;
-    int restore_affinity = tf_bind_current_thread_for_numa_saved(0, &old_set);
+    int restore_affinity = tf_bind_current_thread_for_numa_saved(model, 0, &old_set);
 #endif
     fn(task0);
 #if defined(__linux__)
@@ -4561,6 +4576,133 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
 #if defined(__ARM_FEATURE_SVE)
     fprintf(stderr, "transformer: A64FX SVE kernels enabled (BF16/F16/Q4_0)\n");
 #endif
+}
+
+transformer_model *transformer_nextn_context_create(
+        const transformer_model *source, int n_threads) {
+    if (!source || !source->nextn.loaded) return NULL;
+
+    transformer_model *ctx = (transformer_model *)calloc(1, sizeof(*ctx));
+    if (!ctx) return NULL;
+    /* Tensor descriptors, RoPE tables, and all staged tensor payloads are
+     * immutable after staging, so a shallow copy is intentional.  Every
+     * mutable/owned pointer used by NextN is replaced below. */
+    *ctx = *source;
+    ctx->tp_stage_data = NULL;
+    ctx->tp_stage_bytes = 0;
+    ctx->tp_stage_is_mmap = 0;
+    ctx->decode_owned = NULL;
+    ctx->decode_owned_count = ctx->decode_owned_cap = 0;
+    memset(&ctx->mpool, 0, sizeof(ctx->mpool));
+    ctx->key_cache = ctx->value_cache = NULL;
+    ctx->key_cache_raw = ctx->value_cache_raw = NULL;
+    ctx->conv_state = NULL;
+    ctx->conv_state_pos = NULL;
+    ctx->recurrent_state = NULL;
+    ctx->conv_w_trans = NULL;
+    ctx->conv_w_trans_layers = NULL;
+    ctx->ple_buf = ctx->ple_proj_buf = NULL;
+
+    ctx->x = ctx->xb = ctx->xb2 = NULL;
+    ctx->q = ctx->k = ctx->v = ctx->att = NULL;
+    ctx->ffn_buf1 = ctx->ffn_buf2 = ctx->ffn_buf3 = NULL;
+    ctx->logits = ctx->matvec_tmp = NULL;
+    ctx->lm_head_best_idx = NULL;
+    ctx->lm_head_best_val = NULL;
+    ctx->thread_tmp = NULL;
+    ctx->pool_threads = NULL;
+    ctx->pool_fn = NULL;
+    ctx->pool_args = NULL;
+    ctx->pool_alive = ctx->pool_paused = 0;
+    ctx->n_threads = 1;
+    {
+        const char *offset = getenv("TP_MTP_SHADOW_CORE_OFFSET");
+        ctx->pool_core_offset = offset ? atoi(offset) : 0;
+    }
+    ctx->nextn.key_cache = ctx->nextn.value_cache = NULL;
+    ctx->nextn.hidden = ctx->nextn.target_hidden = ctx->nextn.fusion = NULL;
+
+    transformer_layer *L = &ctx->nextn.layer;
+    int ne = ctx->n_embd, hd = ctx->head_dim;
+    int nh = L->attn_q.n_rows / (2 * hd);
+    int nkh = L->attn_k.n_rows / hd;
+    int qd = nh * hd, kvd = nkh * hd;
+    int nff = L->ffn_gate.n_rows;
+    int work = nff > qd ? nff : qd;
+    int tmp = ne > ctx->ssm_qkv_dim ? ne : ctx->ssm_qkv_dim;
+    if (tmp < work) tmp = work;
+    size_t nkv = (size_t)ctx->max_seq_len * kvd;
+    int nlogits = ctx->output.n_rows > 0 ? ctx->output.n_rows : ctx->n_vocab;
+
+#define TF_NN_CTX_ALLOC(field, count) do { \
+        ctx->field = (float *)tf_aligned_calloc(256, (size_t)(count), sizeof(float)); \
+        if (!ctx->field) goto fail; \
+    } while (0)
+    TF_NN_CTX_ALLOC(x, ne);
+    TF_NN_CTX_ALLOC(xb, ne);
+    TF_NN_CTX_ALLOC(xb2, qd > ne ? 2 * qd : 2 * ne);
+    TF_NN_CTX_ALLOC(q, qd);
+    TF_NN_CTX_ALLOC(k, kvd);
+    TF_NN_CTX_ALLOC(v, kvd);
+    TF_NN_CTX_ALLOC(att, (size_t)nh * ctx->max_seq_len);
+    TF_NN_CTX_ALLOC(ffn_buf1, work);
+    TF_NN_CTX_ALLOC(ffn_buf2, work);
+    TF_NN_CTX_ALLOC(ffn_buf3, work);
+    TF_NN_CTX_ALLOC(logits, nlogits);
+    TF_NN_CTX_ALLOC(matvec_tmp, tmp);
+    TF_NN_CTX_ALLOC(nextn.key_cache, nkv);
+    TF_NN_CTX_ALLOC(nextn.value_cache, nkv);
+    TF_NN_CTX_ALLOC(nextn.hidden, ne);
+    TF_NN_CTX_ALLOC(nextn.target_hidden, ne);
+    TF_NN_CTX_ALLOC(nextn.fusion, 2 * ne);
+#undef TF_NN_CTX_ALLOC
+
+    ctx->lm_head_best_idx = (int *)calloc(1, sizeof(int));
+    ctx->lm_head_best_val = (float *)calloc(1, sizeof(float));
+    ctx->thread_tmp = (float **)calloc(1, sizeof(float *));
+    if (!ctx->lm_head_best_idx || !ctx->lm_head_best_val || !ctx->thread_tmp)
+        goto fail;
+    ctx->thread_tmp[0] = ctx->matvec_tmp;
+    if (n_threads < 1) n_threads = 1;
+    if (n_threads > 1) transformer_set_threads(ctx, n_threads);
+    return ctx;
+
+fail:
+    transformer_nextn_context_free(ctx);
+    return NULL;
+}
+
+void transformer_nextn_context_copy_state(transformer_model *dst,
+                                           const transformer_model *source) {
+    if (!dst || !source || !dst->nextn.loaded || !source->nextn.loaded) return;
+    int kvd = dst->nextn.layer.attn_k.n_rows;
+    size_t nkv = (size_t)dst->max_seq_len * kvd;
+    memcpy(dst->nextn.key_cache, source->nextn.key_cache, nkv * sizeof(float));
+    memcpy(dst->nextn.value_cache, source->nextn.value_cache, nkv * sizeof(float));
+    memcpy(dst->nextn.hidden, source->nextn.hidden,
+           (size_t)dst->n_embd * sizeof(float));
+    memcpy(dst->nextn.target_hidden, source->nextn.target_hidden,
+           (size_t)dst->n_embd * sizeof(float));
+    memcpy(dst->nextn.fusion, source->nextn.fusion,
+           (size_t)2 * dst->n_embd * sizeof(float));
+}
+
+void transformer_nextn_context_free(transformer_model *ctx) {
+    if (!ctx) return;
+    tf_pool_shutdown(ctx);
+    if (ctx->thread_tmp) {
+        for (int t = 1; t < ctx->n_threads; t++) free(ctx->thread_tmp[t]);
+        free(ctx->thread_tmp);
+    }
+    free(ctx->x); free(ctx->xb); free(ctx->xb2);
+    free(ctx->q); free(ctx->k); free(ctx->v); free(ctx->att);
+    free(ctx->ffn_buf1); free(ctx->ffn_buf2); free(ctx->ffn_buf3);
+    free(ctx->logits); free(ctx->matvec_tmp);
+    free(ctx->lm_head_best_idx); free(ctx->lm_head_best_val);
+    free(ctx->nextn.key_cache); free(ctx->nextn.value_cache);
+    free(ctx->nextn.hidden); free(ctx->nextn.target_hidden);
+    free(ctx->nextn.fusion);
+    free(ctx);
 }
 
 void transformer_build_panels(transformer_model *model) {
