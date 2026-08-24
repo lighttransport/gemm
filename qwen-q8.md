@@ -1802,6 +1802,39 @@ K=5 used 55 rounds with alpha 0.932--0.936.  Post-load `MemAvailable` remained
 dedicated 2x8 PV kernel it changed the 64-token target stream and reached only
 20.55 tok/s, so the supported exact maximum remains K=5.
 
+### BF16 MTP coding-agent quality gate (2026-08-24)
+
+The accepted BF16 TP4/K=5 path was exercised with the tracked
+`a64fx/llm/qwen38_coding_quality_prompt.txt`: a request for one self-contained
+C++20 durable key-value database, its CLI, and extensive recovery/randomized
+tests.  The run used anonymous HBM weights, `TP_MAXSEQ=16660`, and generated
+exactly 16,384 tokens.  HBM headroom stayed stable at about 10.2 GB.
+
+The workload is substantially harder for the draft model than the repeated
+performance paragraph.  The complete run used 4,298 verification rounds,
+alpha 0.7926, 95.19 ms verification and 40.12 ms drafting per round, and took
+581.816 seconds: **28.16 tok/s**.  A like-for-like 512-token screen measured
+28.02 tok/s at K=0 and 34.89 tok/s at K=5 (alpha 0.6966).  Both 512-token files
+had SHA256 `c74323766ad0844800abf7b24af78ccbe8f7e39fbfa71a56bf1f887cd7ea0704`,
+proving that verified MTP did not alter coding output.
+
+Quality did not pass.  The model emitted a coherent 1,573-line/54,045-byte
+partial implementation with WAL, checksums, ordered versioned index,
+compaction, snapshots, and many tests, but exhausted 16,384 tokens in the
+middle of `test_prefix_scan_deleted`; it never emitted `main` or
+`CEDARDB_COMPLETE`, and it never produced EOS.  Compilation also found defects
+that precede truncation: missing `FileDescriptor::fd_`, an invalid generic
+`Result<void>`, and move-only values returned through a const accessor.  The
+artifact therefore does not compile and is not suitable as a one-shot 16K
+coding-agent result.  Logs, extracted source, token IDs, and compiler output are
+under `/local/u14346/q38-coding-quality`.
+
+This test also exposed a deployment hazard: `/local` is node-local, so an
+unstaged prompt file can tokenize differently on each TP rank and desynchronize
+collectives.  The runner now checks prompt length and a token hash across ranks
+before prefill and fails coherently on mismatch.  Shared repository prompt
+paths or explicit per-node staging are required.
+
 ### Q8 TP2--TP4 decode and MTP attack (2026-08-24)
 
 Qwen3.8 Q8_0 now has complete anonymous-HBM rank stages for TP2, TP3, and TP4.

@@ -826,6 +826,32 @@ static int32_t sample_argmax(transformer_model *m, float *lg, tp_comm *c,
     return nt;
 }
 
+/* All TP ranks must tokenize the same prompt.  This is easy to violate with a
+ * node-local TP_PROMPT_FILE under /local: one rank can read it while peers fall
+ * back to TP_PROMPT.  Detect that before prefill instead of desynchronizing the
+ * collective sequence and hanging.  Values are masked to 23 bits so their
+ * float representation remains exact. */
+static void tp_check_prompt_signature(tp_comm *c, const int32_t *tokens, int n,
+                                      int rank) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < n; i++) {
+        uint32_t x = (uint32_t)tokens[i];
+        for (int b = 0; b < 4; b++) {
+            h ^= (x >> (8 * b)) & 0xffu;
+            h *= 16777619u;
+        }
+    }
+    float max_n = (float)n, neg_min_n = -(float)n;
+    float max_h = (float)(h & 0x7fffffu), neg_min_h = -max_h;
+    int32_t owner = rank;
+    tp_allreduce_argmax(c, &max_n, &owner);
+    owner = rank; tp_allreduce_argmax(c, &neg_min_n, &owner);
+    owner = rank; tp_allreduce_argmax(c, &max_h, &owner);
+    owner = rank; tp_allreduce_argmax(c, &neg_min_h, &owner);
+    if (max_n != -neg_min_n || max_h != -neg_min_h)
+        die("prompt tokens differ across TP ranks; use a shared path or stage TP_PROMPT_FILE on every node", -1);
+}
+
 static void sample_argmax_n(transformer_model *m, float *logits, int stride,
                             int n, int32_t *tokens, tp_comm *c,
                             double *ar_secs_out, long *ar_calls_out) {
@@ -1354,6 +1380,7 @@ int main(int argc, char **argv) {
                          ar_max, ar_batch, (double)(9L * ar_max * 4) / (1024*1024));
     transformer_set_tp(m, MyRank, N, tp_ar_callback, &c);
     barrier();
+    tp_check_prompt_signature(&c, ptoks, P, MyRank);
 
     int null_stream_passes = (int)envl("TP_NULL_STREAM_PASSES", 0);
     if (null_stream_passes > 0) {
