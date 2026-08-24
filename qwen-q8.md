@@ -1750,14 +1750,14 @@ The sustained gate was rerun after the Q8 cleanup using the anonymous BF16 TP4
 stage (`17.724 GB/rank`) and a fresh K=0 oracle.  The shared runner's
 `TP_PROMPT_REPEAT` option was restored because the BF16 long-context gate uses
 it; removing it as part of a Q8-only cleanup had been a regression.  The
-current untracked prompt is not the historical 359-token input: duplicated, it
-tokenizes to 367 tokens and has substantially lower draft agreement.  These
-results therefore validate the current input but do not supersede the accepted
-53.43 tok/s historical result.
+apparent 367-token prompt and low agreement reported initially were caused by
+omitting `TP_RAW_PROMPT=1`, which wrapped the benchmark paragraph in the chat
+template.  They were not evidence of prompt drift.
 
-The new K=0 oracle and all three deterministic K=5 runs have SHA256
+For reference, the obsolete chat-wrapped diagnostic's K=0 oracle and all three
+deterministic K=5 runs had SHA256
 `ddc0237f13a7d712e523ac97ef67ffe76564f5a31a1098f07dff0d3e6e94df6d`.
-The MTP runs reached 37.42, 38.19, and 37.09 tok/s, using 72 rounds with alpha
+Its MTP runs reached 37.42, 38.19, and 37.09 tok/s, using 72 rounds with alpha
 0.715--0.719.  The plain K=0 run was 29.06 tok/s.  All ranks loaded the complete
 stage into anonymous HBM; worst reported post-load `MemAvailable` was 11.41 GB.
 The draft token reductions themselves are global, so every rank consumes the
@@ -1783,6 +1783,24 @@ obvious spill-removal win; its remaining opportunity is instruction scheduling
 and prefetch, with the existing exact distance 16 as the baseline.  The next
 meaningful scheduler attack must preserve deterministic reduction ordering and
 fix the draft/verifier queue boundary before attempting fused local argmax.
+
+The reproducible raw-prompt gate is now a named launcher mode and its prompt is
+tracked as `a64fx/llm/qwen38_mtp_prompt.txt`:
+
+```sh
+TP_SIZE=4 ./a64fx/llm/run_qwen38_bf16_tp4.sh stage
+TP_SIZE=4 ./a64fx/llm/run_qwen38_bf16_tp4.sh mtp-sustained
+```
+
+It sets raw prompting, repeats the paragraph twice, and uses K=5, batch verify,
+`TP_MAXSEQ=768`, and 256 generated tokens.  A 2026-08-24 rebuild of the exact
+source produced a K=0 oracle at 27.83 tok/s and three K=5 runs at 52.66, 52.56,
+and 52.80 tok/s.  Every run produced token SHA256
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`;
+K=5 used 55 rounds with alpha 0.932--0.936.  Post-load `MemAvailable` remained
+11.8 GB or higher.  An experimental K=8 verifier was rejected: even with a
+dedicated 2x8 PV kernel it changed the 64-token target stream and reached only
+20.55 tok/s, so the supported exact maximum remains K=5.
 
 ### Q8 TP2--TP4 decode and MTP attack (2026-08-24)
 

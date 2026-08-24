@@ -52,11 +52,11 @@ case "$MODE" in
         if [ "$MODE" = plan ]; then export Q38TP_PLAN=1; fi
         exec mpiexec -np "$TP_SIZE" ./build/qwen38_tp_stage "$MODEL" "$STAGE"
         ;;
-    stream|null|check|source-check|bench|mtp-check|prefill|handoff|profile)
+    stream|null|check|source-check|bench|mtp-check|mtp-sustained|prefill|handoff|profile)
         make tp_runner CC=fcc OPENMP=1
         make -C ../utofu-tests tofu_topo_helper >/dev/null
         mpiexec -np "$TP_SIZE" ../utofu-tests/tofu_topo_helper
-        export TP_SYNTH_TOKEN_ID=1 TP_MAXSEQ=${TP_MAXSEQ:-128}
+        export TP_SYNTH_TOKEN_ID=1
         export TP_PREFILL_GEMM=${TP_PREFILL_GEMM:-0}
         export TP_CACHE_LOAD=${TP_CACHE_LOAD:-0} TP_CACHE_SAVE=${TP_CACHE_SAVE:-0} TF_NO_PANEL=1
         case "$MODE" in
@@ -91,6 +91,18 @@ case "$MODE" in
                 export TP_MAXGEN=${TP_MAXGEN:-8} TP_PERF_WARMUP=0
                 export TP_IGNORE_EOS=1 TP_DUMP_TOKENS=1
                 ;;
+            mtp-sustained)
+                unset TF_NULL_GEMM
+                export TP_RAW_PROMPT=1
+                export TP_PROMPT_FILE=${TP_PROMPT_FILE:-$HERE/qwen38_mtp_prompt.txt}
+                export TP_PROMPT_REPEAT=${TP_PROMPT_REPEAT:-2}
+                export TP_SPEC_K=${TP_SPEC_K:-5} TP_MTP_BATCH=${TP_MTP_BATCH:-1}
+                export TP_MAXSEQ=${TP_MAXSEQ:-768} TP_MAXGEN=${TP_MAXGEN:-256}
+                export TP_PERF_WARMUP=${TP_PERF_WARMUP:-0} TP_BUFFER_OUTPUT=${TP_BUFFER_OUTPUT:-1}
+                export TP_MTP_TRACE=${TP_MTP_TRACE:-0} TP_MTP_PROFILE_DETAIL=${TP_MTP_PROFILE_DETAIL:-1}
+                export TP_AR_DETERMINISTIC=${TP_AR_DETERMINISTIC:-0}
+                export TP_IGNORE_EOS=1 TP_DUMP_TOKENS=1
+                ;;
             prefill)
                 unset TF_NULL_GEMM
                 export TP_SYNTH_TOKENS=${TP_SYNTH_TOKENS:-128}
@@ -114,9 +126,10 @@ case "$MODE" in
                 export TP_IGNORE_EOS=1 TP_DUMP_TOKENS=1
                 ;;
         esac
+        export TP_MAXSEQ=${TP_MAXSEQ:-128}
         rm -f tp_run_*.txt tp_load_rank*.txt tp_perf_rank*.txt tp_stderr_rank*.txt \
               tp_tokens_rank00.txt tp_null_stream_rank*.txt
         exec mpiexec -np "$TP_SIZE" ./build/tp_runner "$MODEL"
         ;;
-    *) echo "usage: TP_SIZE={4|6|12} $0 {plan|stage|stream|null|check|source-check|bench|mtp-check|prefill|handoff|profile}" >&2; exit 2 ;;
+    *) echo "usage: TP_SIZE={4|6|12} $0 {plan|stage|stream|null|check|source-check|bench|mtp-check|mtp-sustained|prefill|handoff|profile}" >&2; exit 2 ;;
 esac
