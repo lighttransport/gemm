@@ -1996,3 +1996,55 @@ The highest-value remaining tasks are:
    Require the K=0 SHA, stable rank-local pending queues, memory below 32 GB,
    and separate setup/prefill/decode timing.  The open targets remain native
    Q8 above BF16 for both modes and **50+ tok/s MTP** (then 53.43+).
+
+### Resident PP3xTP4 prefill to three concurrent TP4 decoders (2026-08-24)
+
+`qwen38_mixed_runner` implements a single-process-lifetime topology switch on
+12 nodes.  Every node loads its complete 9.421 GB TP4 Q8 stage once.  The
+runner builds only its PP-owned Q8v2 prefill panels, prefills three independent
+requests, serializes mutable KV/SSM state into memory, transposes those blobs
+across equal TP lanes, releases the prefill panels, expands the retained Q8
+stage to the 14.309 GB BF16-PV decode layout, and then runs three TP4 decode
+replicas.  No weight is reread from `/local` at the transition.
+
+The in-memory state API is `transformer_runtime_state_size/pack/unpack` in
+`common/transformer.h`.  State transfer is range-addressed by PP layer ownership
+and contains no tensor weights or scratch buffers.  The launcher is:
+
+```sh
+./a64fx/llm/run_qwen38_q8_mixed_12n.sh
+```
+
+A 12-node smoke with three synthetic eight-token prompts validated the complete
+lifecycle.  Per node it retained 9.421 GB of Q8, temporarily held 2.508--2.654
+GB of Q8v2 panels, released those panels, and expanded 14.309 GB for decode.
+The state transpose moved 41.258 MB/rank in 19 ms.  All four ranks within each
+decode replica produced identical token hashes.
+
+The sustained 32-token concurrent result was:
+
+| replica | decode time | throughput | token hash |
+|---:|---:|---:|---:|
+| 0 | 3.107 s | 10.30 tok/s | `a7f258fc628d5923` |
+| 1 | 3.003 s | 10.66 tok/s | `6865a015d2e5b483` |
+| 2 | 3.019 s | 10.60 tok/s | `7c1af6a9cc995633` |
+
+This is **30.9 aggregate tok/s**, not the expected approximately 94 tok/s from
+three isolated 31 tok/s replicas.  Decode collectives account for only
+0.64--0.81 seconds of each 32-token run; most of the regression is local
+forward bandwidth while all 12 nodes decode.  Compact torus rectangle grouping
+and parking the OpenMP prefill team did not improve aggregate throughput.  The
+non-compact grouping remains the default because it preserved the established
+state/request mapping and hashes.
+
+One transition hazard was isolated: immediately decoding transferred hybrid
+state without a full state walk produced a severe first-touch/placement stall.
+The runner now validates and warms every transferred convolution/recurrent
+state page before rebuilding the persistent decode pool.  No IEEE subnormals
+were present in the accepted run.  Dropping the transferred state was used only
+as a diagnostic and is not enabled by the launcher.
+
+Next work should measure HBM counters and page residency during simultaneous
+decode, then compare three independently launched TP4 controls in the same
+12-node allocation.  Until aggregate bandwidth scales, this topology is a
+correct resident-weight prototype rather than a throughput win.

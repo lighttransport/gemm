@@ -321,6 +321,19 @@ void transformer_set_threads(transformer_model *model, int n_threads);
 void transformer_build_panels(transformer_model *model);
 void transformer_pool_profile_reset(void);
 void transformer_reset_runtime_state(transformer_model *model);
+/* Serialize only mutable inference state for [layer_start,layer_end).  The
+ * resulting blob is position-bounded (attention KV rows [0,cache_pos)) and
+ * contains no weights or scratch buffers, so it can be moved directly when a
+ * PP prefill rank is regrouped into a TP decode replica. */
+size_t transformer_runtime_state_size(const transformer_model *model,
+                                      int layer_start, int layer_end,
+                                      int cache_pos);
+int transformer_runtime_state_pack(const transformer_model *model,
+                                   int layer_start, int layer_end,
+                                   int cache_pos, void *blob, size_t blob_size);
+int transformer_runtime_state_unpack(transformer_model *model,
+                                     const void *blob, size_t blob_size,
+                                     int *cache_pos);
 void transformer_set_trace_hidden_norms(transformer_model *model, int enable);
 /* Enable double-precision accumulation in matvec/rmsnorm for a higher-fidelity
  * (closer to F64) CPU reference. Slower; intended for oracle/verification use. */
@@ -336,6 +349,10 @@ size_t transformer_prepack_q8_w8a8_range(transformer_model *model,
                                          int layer_start, int layer_end,
                                          int include_output);
 size_t transformer_prepack_q8v2_range(transformer_model *model,
+                                      int layer_start, int layer_end);
+/* Release transient Q8v2 batched-prefill panels while retaining the native
+ * resident TP stage.  Used before expanding that same stage for decode. */
+size_t transformer_release_q8v2_range(transformer_model *model,
                                       int layer_start, int layer_end);
 size_t transformer_prepack_q8b6_range(transformer_model *model,
                                       int layer_start, int layer_end);
@@ -4763,6 +4780,147 @@ void transformer_reset_runtime_state(transformer_model *model) {
             }
         }
     }
+}
+
+#define TF_RUNTIME_STATE_MAGIC 0x54535254u /* "TRST" */
+#define TF_RUNTIME_STATE_VERSION 1u
+typedef struct {
+    uint32_t magic, version;
+    int32_t n_layers, layer_start, layer_end, cache_pos;
+    int32_t max_seq_len, tp_size, tp_rank, kv_elem_bytes;
+    int32_t tp_kv_head_count, head_dim, ssm_dt_rank, ssm_d_state;
+    int32_t ssm_qkv_dim, ssm_conv_kernel;
+    uint64_t payload_bytes;
+} tf_runtime_state_header;
+typedef struct {
+    uint64_t key_bytes, value_bytes, conv_bytes, recurrent_bytes;
+    int32_t conv_pos;
+    int32_t reserved;
+} tf_runtime_state_layer;
+
+static int tf_runtime_state_layout(const transformer_model *m, int l0, int l1,
+                                   int pos, size_t *total) {
+    if (!m || !total || l0 < 0 || l1 > m->n_layers || l0 >= l1 ||
+        pos < 0 || pos > m->max_seq_len || m->kv_elem_bytes <= 0) return -1;
+    size_t n = sizeof(tf_runtime_state_header) +
+               (size_t)(l1 - l0) * sizeof(tf_runtime_state_layer);
+    int kv_heads = m->tp_kv_head_count > 0 ? m->tp_kv_head_count : m->n_kv_heads;
+    for (int l = l0; l < l1; l++) {
+        size_t add = 0;
+        if (m->key_cache_raw && m->value_cache_raw &&
+            m->key_cache_raw[l] && m->value_cache_raw[l]) {
+            size_t row = (size_t)kv_heads * m->head_dim * m->kv_elem_bytes;
+            if ((size_t)pos > SIZE_MAX / row) return -1;
+            add = 2 * (size_t)pos * row;
+        }
+        if (m->conv_state && m->conv_state[l]) {
+            size_t x = (size_t)(m->ssm_conv_kernel - 1) * m->ssm_qkv_dim * sizeof(float);
+            if (add > SIZE_MAX - x) return -1;
+            add += x;
+        }
+        if (m->recurrent_state && m->recurrent_state[l]) {
+            size_t x = (size_t)m->ssm_dt_rank * m->ssm_d_state *
+                       m->ssm_d_state * sizeof(float);
+            if (add > SIZE_MAX - x) return -1;
+            add += x;
+        }
+        if (n > SIZE_MAX - add) return -1;
+        n += add;
+    }
+    *total = n;
+    return 0;
+}
+
+size_t transformer_runtime_state_size(const transformer_model *m,
+                                      int l0, int l1, int pos) {
+    size_t n = 0;
+    return tf_runtime_state_layout(m, l0, l1, pos, &n) == 0 ? n : 0;
+}
+
+int transformer_runtime_state_pack(const transformer_model *m, int l0, int l1,
+                                   int pos, void *blob, size_t blob_size) {
+    size_t need = 0;
+    if (!blob || tf_runtime_state_layout(m, l0, l1, pos, &need) || blob_size < need)
+        return -1;
+    tf_runtime_state_header *h = (tf_runtime_state_header *)blob;
+    *h = (tf_runtime_state_header){
+        TF_RUNTIME_STATE_MAGIC, TF_RUNTIME_STATE_VERSION, m->n_layers, l0, l1, pos,
+        m->max_seq_len, m->tp_size, m->tp_rank, m->kv_elem_bytes,
+        m->tp_kv_head_count, m->head_dim, m->ssm_dt_rank, m->ssm_d_state,
+        m->ssm_qkv_dim, m->ssm_conv_kernel,
+        need - sizeof(*h) - (uint64_t)(l1 - l0) * sizeof(tf_runtime_state_layer)
+    };
+    tf_runtime_state_layer *rec = (tf_runtime_state_layer *)(h + 1);
+    uint8_t *p = (uint8_t *)(rec + (l1 - l0));
+    int kv_heads = m->tp_kv_head_count > 0 ? m->tp_kv_head_count : m->n_kv_heads;
+    size_t kv_bytes = (size_t)pos * kv_heads * m->head_dim * m->kv_elem_bytes;
+    for (int l = l0; l < l1; l++, rec++) {
+        memset(rec, 0, sizeof(*rec));
+        if (m->key_cache_raw && m->value_cache_raw &&
+            m->key_cache_raw[l] && m->value_cache_raw[l]) {
+            rec->key_bytes = rec->value_bytes = kv_bytes;
+            memcpy(p, m->key_cache_raw[l], kv_bytes); p += kv_bytes;
+            memcpy(p, m->value_cache_raw[l], kv_bytes); p += kv_bytes;
+        }
+        if (m->conv_state && m->conv_state[l]) {
+            rec->conv_bytes = (uint64_t)(m->ssm_conv_kernel - 1) *
+                              m->ssm_qkv_dim * sizeof(float);
+            rec->conv_pos = m->conv_state_pos ? m->conv_state_pos[l] : 0;
+            memcpy(p, m->conv_state[l], (size_t)rec->conv_bytes); p += rec->conv_bytes;
+        }
+        if (m->recurrent_state && m->recurrent_state[l]) {
+            rec->recurrent_bytes = (uint64_t)m->ssm_dt_rank * m->ssm_d_state *
+                                   m->ssm_d_state * sizeof(float);
+            memcpy(p, m->recurrent_state[l], (size_t)rec->recurrent_bytes);
+            p += rec->recurrent_bytes;
+        }
+    }
+    return (size_t)(p - (uint8_t *)blob) == need ? 0 : -1;
+}
+
+int transformer_runtime_state_unpack(transformer_model *m, const void *blob,
+                                     size_t blob_size, int *cache_pos) {
+    if (!m || !blob || blob_size < sizeof(tf_runtime_state_header)) return -1;
+    const tf_runtime_state_header *h = (const tf_runtime_state_header *)blob;
+    if (h->magic != TF_RUNTIME_STATE_MAGIC || h->version != TF_RUNTIME_STATE_VERSION ||
+        h->n_layers != m->n_layers || h->layer_start < 0 || h->layer_end > m->n_layers ||
+        h->layer_start >= h->layer_end || h->cache_pos < 0 ||
+        h->cache_pos > m->max_seq_len || h->tp_size != m->tp_size ||
+        h->tp_rank != m->tp_rank || h->kv_elem_bytes != m->kv_elem_bytes ||
+        h->tp_kv_head_count != m->tp_kv_head_count || h->head_dim != m->head_dim ||
+        h->ssm_dt_rank != m->ssm_dt_rank || h->ssm_d_state != m->ssm_d_state ||
+        h->ssm_qkv_dim != m->ssm_qkv_dim || h->ssm_conv_kernel != m->ssm_conv_kernel)
+        return -1;
+    int nr = h->layer_end - h->layer_start;
+    size_t meta = sizeof(*h) + (size_t)nr * sizeof(tf_runtime_state_layer);
+    if (meta > blob_size || h->payload_bytes != blob_size - meta) return -1;
+    const tf_runtime_state_layer *rec = (const tf_runtime_state_layer *)(h + 1);
+    const uint8_t *p = (const uint8_t *)(rec + nr), *end = (const uint8_t *)blob + blob_size;
+    int kv_heads = m->tp_kv_head_count > 0 ? m->tp_kv_head_count : m->n_kv_heads;
+    size_t kv_bytes = (size_t)h->cache_pos * kv_heads * m->head_dim * m->kv_elem_bytes;
+    for (int l = h->layer_start; l < h->layer_end; l++, rec++) {
+        size_t cb = (m->conv_state && m->conv_state[l]) ?
+            (size_t)(m->ssm_conv_kernel - 1) * m->ssm_qkv_dim * sizeof(float) : 0;
+        size_t rb = (m->recurrent_state && m->recurrent_state[l]) ?
+            (size_t)m->ssm_dt_rank * m->ssm_d_state * m->ssm_d_state * sizeof(float) : 0;
+        int have_kv = m->key_cache_raw && m->value_cache_raw &&
+                      m->key_cache_raw[l] && m->value_cache_raw[l];
+        if (rec->key_bytes != (have_kv ? kv_bytes : 0) ||
+            rec->value_bytes != (have_kv ? kv_bytes : 0) ||
+            rec->conv_bytes != cb || rec->recurrent_bytes != rb ||
+            rec->key_bytes + rec->value_bytes + rec->conv_bytes + rec->recurrent_bytes >
+                (uint64_t)(end - p)) return -1;
+        if (rec->key_bytes) { memcpy(m->key_cache_raw[l], p, kv_bytes); p += kv_bytes; }
+        if (rec->value_bytes) { memcpy(m->value_cache_raw[l], p, kv_bytes); p += kv_bytes; }
+        if (rec->conv_bytes) {
+            memcpy(m->conv_state[l], p, cb); p += cb;
+            if (m->conv_state_pos) m->conv_state_pos[l] = rec->conv_pos;
+        }
+        if (rec->recurrent_bytes) { memcpy(m->recurrent_state[l], p, rb); p += rb; }
+    }
+    if (p != end) return -1;
+    if (cache_pos) *cache_pos = h->cache_pos;
+    return 0;
 }
 
 void transformer_set_trace_hidden_norms(transformer_model *model, int enable) {
@@ -9588,6 +9746,41 @@ size_t transformer_prepack_q8v2_range(transformer_model *m,int l0,int l1){
     }
     fprintf(stderr,"q8v2 range pack: layers=[%d,%d) tensors=%d %.3fGB\n",
             l0,l1,count,(double)total/1e9);
+    return total;
+}
+
+static size_t tf_release_q8v2_tensor(transformer_model *m, qtensor *w) {
+    if (!m || !w || (!w->prefill_q8v2_q && !w->prefill_q8v2_d)) return 0;
+    size_t bytes = 0;
+    if (w->n_rows > 0 && w->n_cols > 0) {
+        int panels = w->n_rows / 64, nb = w->n_cols / 32;
+        bytes = (size_t)panels * ((size_t)nb * 64 * 32 +
+                                 (size_t)nb * 64 * sizeof(float));
+    }
+    void *ptrs[2] = {w->prefill_q8v2_q, w->prefill_q8v2_d};
+    for (int j = 0; j < 2; j++) if (ptrs[j]) {
+        for (int i = 0; i < m->decode_owned_count; i++)
+            if (m->decode_owned[i] == ptrs[j]) { m->decode_owned[i] = NULL; break; }
+        free(ptrs[j]);
+    }
+    w->prefill_q8v2_q = NULL;
+    w->prefill_q8v2_d = NULL;
+    return bytes;
+}
+
+size_t transformer_release_q8v2_range(transformer_model *m, int l0, int l1) {
+    if (!m || !m->layers) return 0;
+    if (l0 < 0) l0 = 0;
+    if (l1 > m->n_layers) l1 = m->n_layers;
+    size_t total = 0;
+    for (int l = l0; l < l1; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ssm_qkv,&L->ssm_gate,&L->ssm_alpha,&L->ssm_beta,&L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws)/sizeof(ws[0]); i++)
+            total += tf_release_q8v2_tensor(m, ws[i]);
+    }
     return total;
 }
 

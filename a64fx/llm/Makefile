@@ -143,7 +143,7 @@ GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COM
 # ── Targets ────────────────────────────────────────────────────────────
 # ds4f_bake MUST be here: the alias target name matches ds4f_bake.c, so without .PHONY make's
 # built-in "%: %.c" rule fires and re-links the finished binary as if it were an object.
-.PHONY: all clean vlm_objs qwen38_runner qwen38_pp_runner qwen38_prefill_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
+.PHONY: all clean vlm_objs qwen38_runner qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
 
 all: $(BUILD)/llm_runner
 
@@ -161,6 +161,12 @@ $(BUILD)/qwen38_prefill_runner: $(LLM_DIR)qwen38_prefill_runner.c $(COMMON)/tran
 	OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43 /opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifcc \
 		$(filter-out -g -rdynamic,$(CFLAGS)) -DTF_LINK_BF16PV48 -DTF_LINK_PODD -DTF_HAVE_Q8V2 $(QWEN_CFLAGS) -o $@ \
 		$(LLM_DIR)qwen38_prefill_runner.c $(VLM_KERNELS)/micro_kernel_bf16B_8x3_pv.S $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(LDFLAGS) -ltofucom
+
+qwen38_mixed_runner: $(BUILD)/qwen38_mixed_runner
+$(BUILD)/qwen38_mixed_runner: $(LLM_DIR)qwen38_mixed_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) | $(BUILD)
+	OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43 /opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifcc \
+		$(filter-out -g -rdynamic,$(CFLAGS)) -DTF_LINK_PODD -DTF_HAVE_Q8V2 $(QWEN_CFLAGS) -o $@ \
+		$(LLM_DIR)qwen38_mixed_runner.c $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(LDFLAGS) -ltofucom
 
 qwen38_tp_stage: $(BUILD)/qwen38_tp_stage
 $(BUILD)/qwen38_tp_stage: $(LLM_DIR)qwen38_tp_stage.c $(LLM_DIR)qwen38_tp_stage.h $(COMMON)/gguf_loader.h | $(BUILD)
