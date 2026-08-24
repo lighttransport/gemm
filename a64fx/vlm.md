@@ -17,8 +17,9 @@ tokens**.
 > attention is memory/LLC-bound in-situ (int8 attention rejected as too lossy),
 > and GELU is tanh-compute-bound. The single biggest win was defaulting
 > `make CC=fcc` to **OpenMP** (the C11-thrd backend silently serialized the
-> attention, ~1.6×). `--dtype int8` is the default benchmark target; fp16/int16
-> are the correctness references.
+> attention, ~1.6×). The code default is `--dtype fp32` (safest reference);
+> `--dtype int8` is the headline benchmark target (fastest, norm 452.03); fp16/
+> int16 are the other correctness references.
 
 ---
 

@@ -55,6 +55,21 @@ endif
 CFLAGS  := $(BASE_CFLAGS) -std=c11 -D_GNU_SOURCE -I$(INC) -I$(KERNELS) -I$(COMMON)
 LDFLAGS := -lm -lpthread
 
+# C++ test (test_conv2d_sve.cpp) is compiled with the SAME compiler as the C
+# kernels (fcc in C++ mode) so the OpenMP runtime matches — g++'s libgomp does
+# not resolve fcc's __kmpc_* symbols. Headers have extern "C" guards, so the C
+# kernel objects link in cleanly.
+ifeq ($(CC),fcc)
+    CXXFLAGS := -Nclang -O2 -march=armv8.2-a+sve -std=c++17 -D_GNU_SOURCE -I$(INC) -I$(KERNELS) -I$(COMMON)
+else ifeq ($(CC),fccpx)
+    CXXFLAGS := -Nclang -O2 -march=armv8.2-a+sve -std=c++17 -D_GNU_SOURCE -I$(INC) -I$(KERNELS) -I$(COMMON)
+else
+    CXXFLAGS := -O2 -march=armv8.2-a+sve -std=c++17 -D_GNU_SOURCE -I$(INC) -I$(KERNELS) -I$(COMMON)
+endif
+ifdef OPENMP
+    CXXFLAGS += $(OMP_FLAG)
+endif
+
 # fcc/fccpx support OpenMP, and the OpenMP backend of vlm_parallel scales far
 # better than the C11-thrd fallback (which clusters its worker threads on a few
 # cores on A64FX: ~1.4x over 48 cores vs ~25x for OpenMP, and the attention is
@@ -89,7 +104,7 @@ KERNEL_OBJ := $(patsubst $(KERNELS)/%.c,$(BUILD)/kernels_%.o,$(KERNEL_C)) \
 RUNTIME_OBJ := $(patsubst $(SRC)/%.c,$(BUILD)/src_%.o,$(RUNTIME))
 
 # ── Targets ────────────────────────────────────────────────────────────
-.PHONY: all clean ref
+.PHONY: all clean ref test
 
 all: $(BUILD)/vlm_runner $(BUILD)/tensor_diff $(BUILD)/test_cmg_pool
 
@@ -116,6 +131,26 @@ $(BUILD)/tensor_diff: $(TOOLS)/tensor_diff.c $(SRC)/tensor_dump.c | $(BUILD)
 
 $(BUILD)/test_cmg_pool: $(TOOLS)/test_cmg_pool.c $(BUILD)/src_cmg_pool.o | $(BUILD)
 	$(CC) $(CFLAGS) -I$(SRC) -o $@ $< $(BUILD)/src_cmg_pool.o $(LDFLAGS)
+
+$(BUILD)/test_int8_gemm: $(TOOLS)/test_int8_gemm.c $(BUILD)/kernels_int8_gemm.o $(BUILD)/kernels_kernel_6x4_int8.o | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< $(BUILD)/kernels_int8_gemm.o $(BUILD)/kernels_kernel_6x4_int8.o $(LDFLAGS)
+
+$(BUILD)/test_conv2d_sve: $(TOOLS)/test_conv2d_sve.cpp $(BUILD)/kernels_conv2d_sve.o $(BUILD)/kernels_micro_kernel_fp32_8x3.o | $(BUILD)
+	$(CC) $(CXXFLAGS) -o $@ $< $(BUILD)/kernels_conv2d_sve.o $(BUILD)/kernels_micro_kernel_fp32_8x3.o -lstdc++ $(LDFLAGS)
+
+# `make test` — build + run the kernel unit tests (regression gate); each exits
+# non-zero on failure. int8 GEMM: rel(L2) < 5% vs the fp32 ref. fused: must be
+# bit-identical to the non-fused path. conv2d SVE: within 1e-3 of the scalar ref.
+test: $(BUILD)/test_int8_gemm $(BUILD)/test_conv2d_sve $(BUILD)/test_cmg_pool
+	@echo "=== int8 GEMM vs fp32 ref (expect rel L2 < 5%, OK) ==="
+	$(BUILD)/test_int8_gemm 8
+	@echo "=== fused int8 GEMM (expect BIT-IDENTICAL, OK) ==="
+	$(BUILD)/test_int8_gemm fused
+	@echo "=== conv2d SVE vs scalar ref (expect PASS) ==="
+	$(BUILD)/test_conv2d_sve
+	@echo "=== cmg pool NUMA sanity (expect OK) ==="
+	$(BUILD)/test_cmg_pool
+	@echo "ALL VLM UNIT TESTS PASSED"
 
 # Optional: rebuild cpu/vlm test_vision with dump hooks for reference dumps.
 # Invoked as `make REF=1`. The cpu Makefile uses gcc — this just kicks it.

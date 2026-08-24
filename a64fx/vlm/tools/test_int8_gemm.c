@@ -8,7 +8,7 @@
 #include <string.h>
 #include <omp.h>
 #include <arm_sve.h>
-#include "kernels/int8_gemm.h"
+#include "int8_gemm.h"
 
 static uint64_t cntvct(void) { uint64_t t; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t)); return t; }
 
@@ -23,7 +23,7 @@ static float *ref_gemm(const float *X, const float *W, int M, int K, int N) {
         }
     return C;
 }
-static void test(const char *name, int M, int K, int N) {
+static int test(const char *name, int M, int K, int N) {
     float *X = (float *)malloc((size_t)M * K * 4);
     float *W = (float *)malloc((size_t)N * K * 4);   // [N][K]
     srand(1);
@@ -52,11 +52,12 @@ static void test(const char *name, int M, int K, int N) {
     }
     double rel = sqrt(sumerr / sumref);
     double mean_abs = re / (M * N);
-    printf("%-10s M=%d K=%d N=%d : maxabs=%.4f  rel(L2)=%.4f  mean|err|=%.4f\n",
-           name, M, K, N, maxabs, rel, mean_abs);
+    printf("%-10s M=%d K=%d N=%d : maxabs=%.4f  rel(L2)=%.4f  mean|err|=%.4f %s\n",
+           name, M, K, N, maxabs, rel, mean_abs, rel <= 0.05 ? "OK" : "FAIL");
     free(X); free(W); free(Cref); free(Ci8); free(Bpack); free(scale);
+    return (rel > 0.05) ? 1 : 0;   /* int8 quantization is a few % */
 }
-static void test16(const char *name, int M, int K, int N) {
+static int test16(const char *name, int M, int K, int N) {
     float *X = (float *)malloc((size_t)M * K * 4);
     float *W = (float *)malloc((size_t)N * K * 4);   // [N][K]
     srand(1);
@@ -76,9 +77,11 @@ static void test16(const char *name, int M, int K, int N) {
         if (fabsf(d) > maxabs) maxabs = fabsf(d);
         sumref += Cref[i] * Cref[i]; sumerr += d * d; re += fabsf(d);
     }
-    printf("i16 %-10s M=%d K=%d N=%d : maxabs=%.4f  rel(L2)=%.6f  mean|err|=%.5f\n",
-           name, M, K, N, maxabs, sqrt(sumref>0?sumerr/sumref:0), re/(M*N));
+    double rel16 = sqrt(sumref > 0 ? sumerr / sumref : 0);
+    printf("i16 %-10s M=%d K=%d N=%d : maxabs=%.4f  rel(L2)=%.6f  mean|err|=%.5f %s\n",
+           name, M, K, N, maxabs, rel16, re/(M*N), rel16 <= 1e-4 ? "OK" : "FAIL");
     free(X); free(W); free(Cref); free(Ci16); free(Bpack); free(scale); free(colsum);
+    return (rel16 > 1e-4) ? 1 : 0;   /* int16 is near-exact */
 }
 
 // Time int8 vs int16 for the VLM shapes (48 threads), CNTVCT.
@@ -115,7 +118,7 @@ static void bench16(void) {
 
 /* Fused-path test: gemm_int8_BTP_fused must match gemm_int8_BTP exactly
  * (same quantize + pack + kernel math; only the C-buffer/dequant split differs). */
-static void testfused(const char *name, int M, int K, int N) {
+static int testfused(const char *name, int M, int K, int N) {
     float *X = (float *)malloc((size_t)M * K * 4);
     float *W = (float *)malloc((size_t)N * K * 4);   // [N][K]
     srand(1);
@@ -141,9 +144,11 @@ static void testfused(const char *name, int M, int K, int N) {
             if (d > maxdiff) maxdiff = d;
         }
     }
-    printf("%-10s M=%d K=%d N=%d : fused vs non-fused %s (%d/%d differ, maxdiff=%.3g)\n",
-           name, M, K, N, neq == 0 ? "BIT-IDENTICAL" : "MISMATCH", neq, M * N, maxdiff);
+    printf("%-10s M=%d K=%d N=%d : fused vs non-fused %s (%d/%d differ, maxdiff=%.3g) %s\n",
+           name, M, K, N, neq == 0 ? "BIT-IDENTICAL" : "MISMATCH", neq, M * N, maxdiff,
+           neq == 0 ? "OK" : "FAIL");
     free(X); free(W); free(BT); free(Bpack); free(scale); free(Ca); free(Cb);
+    return (neq != 0) ? 1 : 0;   /* fused must be bit-identical */
 }
 
 static void benchfused(void) {
@@ -173,22 +178,23 @@ static void benchfused(void) {
 }
 
 int main(int argc, char **argv) {
+    int fails = 0;
     if (argc > 1 && !strcmp(argv[1], "fused")) {
-        testfused("ffn_up", 96, 1024, 4096);
-        testfused("qkv", 96, 1024, 3072);
-        testfused("odd_M", 49, 1024, 1024);
+        fails += testfused("ffn_up", 96, 1024, 4096);
+        fails += testfused("qkv", 96, 1024, 3072);
+        fails += testfused("odd_M", 49, 1024, 1024);
         if (argc > 2 && !strcmp(argv[2], "bench")) benchfused();
-        return 0;
+        return fails;
     }
     if (argc > 1 && argv[1][0] == '8') {
-        test("ffn_up", 96, 1024, 4096);
-        test("qkv", 96, 1024, 3072);
-        test("odd_M", 49, 1024, 1024);
-    } else {
-        test16("ffn_up", 96, 1024, 4096);
-        test16("qkv", 96, 1024, 3072);
-        test16("odd_M", 49, 1024, 1024);
-        if (argc > 1 && !strcmp(argv[1], "bench")) bench16();
+        fails += test("ffn_up", 96, 1024, 4096);
+        fails += test("qkv", 96, 1024, 3072);
+        fails += test("odd_M", 49, 1024, 1024);
+        return fails;
     }
-    return 0;
+    fails += test16("ffn_up", 96, 1024, 4096);
+    fails += test16("qkv", 96, 1024, 3072);
+    fails += test16("odd_M", 49, 1024, 1024);
+    if (argc > 1 && !strcmp(argv[1], "bench")) bench16();
+    return fails;
 }
