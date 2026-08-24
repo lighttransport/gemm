@@ -1847,6 +1847,8 @@ static void attention_mt(vlm_pool *pool,
     int min_qtiles = (target_units + n_heads - 1) / n_heads;
     if (min_qtiles < 1) min_qtiles = 1;
     int q_tile = (n_patches + min_qtiles - 1) / min_qtiles;
+    const char *qt_env = getenv("VLM_QTILE");
+    if (qt_env && *qt_env) q_tile = atoi(qt_env);
     if (q_tile > 32) q_tile = 32;
     if (q_tile > 8) q_tile = (q_tile / 8) * 8;
     if (q_tile < 8) q_tile = 8;

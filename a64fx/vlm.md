@@ -440,6 +440,20 @@ touching if 3.1–3.3 are exhausted. The layernorm SVE kernel already exists
 - **Chasing single-run stage-timing deltas.** The §2 node variance (~1.5–2×)
   swamps any <5% change; A/B with `--bench ≥ 8` back-to-back or trust the
   stable CPU-second sub-profiles (`VLM_ATTN_PROFILE=1`) instead.
+- **Attention `q_tile` tuning (`VLM_QTILE`).** Swept 8/16/24/32: single-run
+  stage-timing suggested `q_tile=8` was ~1.6× faster on the attn stage, but a
+  rigorous interleaved A/B (8× each) showed it's within node variance (q16
+  actually ~2% faster). The 8×48=384-unit target (q_tile=16, 24 KB L1-resident
+  att buffer) is the default; `VLM_QTILE=N` overrides it for tuning.
+- **CMG weight replication for the GEMMs (`VLM_NUMA=N`).** Only implemented for
+  bf16/fp16 (int8 cache returns -1). On the fp16 path it *hurt* (340 vs 505
+  tok/s at 48T — the pinned-thread affinity is suboptimal and the fp32-FMA
+  GEMMs are compute-bound, not HBM-bound). Not a lever.
+
+**Bottom line:** with int8 SDOT GEMMs (HBM-bound), fp32-FMA attention
+(memory-bound in-situ, int8 too lossy), and tanh-compute GELU, the int8 VLM is
+at its practical compute limit. Remaining headroom is <2% (system-level) or
+needs a different model/architecture.
 
 ---
 
