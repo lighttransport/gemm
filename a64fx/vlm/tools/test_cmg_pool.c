@@ -7,7 +7,9 @@
  * Build: handled by the main Makefile (see tools/test_cmg_pool target).
  * Run:   ./build/test_cmg_pool
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "cmg_pool.h"
 
 #include <pthread.h>

@@ -8,7 +8,17 @@ the ranked optimization opportunities.
 Reference model for all numbers below: **Qwen3VL-2B-Instruct-F16**
 (dim=1024, heads=16, blocks=24, ffn=4096, deepstack=3 @ blocks 5/11/17,
 proj=2048, patch=16), `~/fujisan.jpg` 384×256 → 384 patches → **96 merged
-tokens**, `--dtype fp16`.
+tokens**.
+
+> **Current status (final):** the **int8 W8A8** build is the headline —
+> ~1300–1650 tok/s (48T, no-CMG, high node variance), **2.7–3.4× faster than
+> fp16** (~380–500 tok/s), norm 452.0263 (fp16 455.6237). The encoder is at
+> its **practical compute limit**: int8 SDOT GEMMs are HBM-bound, the fp32-FMA
+> attention is memory/LLC-bound in-situ (int8 attention rejected as too lossy),
+> and GELU is tanh-compute-bound. The single biggest win was defaulting
+> `make CC=fcc` to **OpenMP** (the C11-thrd backend silently serialized the
+> attention, ~1.6×). `--dtype int8` is the default benchmark target; fp16/int16
+> are the correctness references.
 
 ---
 
@@ -56,35 +66,37 @@ this part** — reuse the 8×48 kernel (24 accumulators, 4 `ld1rw` × 3
 ## 2. Current performance profile
 
 `VLM_STAGE_TIMING=1`, 48 threads, no CMG (CMG is *slower* here — see
-§3.1). Reflects the **nb-outer GEMM schedule** (new default, §3.1).
+§3.1). int8 (W8A8) build. Reflects the fused int8 SDOT GEMMs (§3.3b/c),
+the SVE quantize, and the OpenMP-default attention (§3.3 build note).
 
-| Stage | CPU-s | Notes |
+| Stage | wall % (48T) | Notes |
 |---|---|---|
-| **ffn_down** (`BT_d`) | ~0.5 s | 96×4096 → 96×1024, ×24 blocks — GEMM, dominant |
-| **ffn_up** (`BT_u`) | ~0.45 s | 96×1024 → 96×4096, ×24 blocks — GEMM |
-| **qkv** (`BT_qkv`) | ~0.35 s | 96×1024 → 96×3072, ×24 blocks — GEMM |
-| **attn** | 0.83 s CPU / **~7% wall** | QK^T + AV, fp32. ⚠️ **only** parallel with the **OpenMP** backend — the C11-thrd default serializes it (~65% wall). See the build gotcha in §3.3. |
-| **deepstack** (fc1/fc2) | ~0.15 s | 3 layers, 96×2048 GEMMs |
-| attn_out (`BT_o`) | ~0.10 s | 96×1024 → 96×1024, ×24 — GEMM |
-| **patch_embed** (fused) | ~1 ms wall | **not a bottleneck** |
-| layernorm / gelu / mrope / pos / mm_proj | ~0.1 s | elementwise / small |
+| **attn** | **~25–35%** | QK^T + AV, fp32-FMA. Single biggest stage; memory/LLC-bound in-situ (§3.2). int8 rejected (too lossy). |
+| **ffn_down** (`BT_d`) | ~16–30% | 96×4096 → 96×1024, ×24 blocks — int8 SDOT GEMM, HBM-bound |
+| **ffn_up** (`BT_u`) | ~13–16% | 96×1024 → 96×4096, ×24 blocks — int8 SDOT GEMM |
+| **qkv** (`BT_qkv`) | ~11–13% | 96×1024 → 96×3072, ×24 blocks — int8 SDOT GEMM |
+| **attn_out** (`BT_o`) | ~5–9% | 96×1024 → 96×1024, ×24 — int8 SDOT GEMM |
+| gelu / deepstack / patch_embed | ~3–5% each | tanh-compute GELU; fc1/fc2 GEMMs; fused conv2d |
+| layernorm / mrope / mm_proj / pos | ~1–2% each | elementwise / small |
 
-**Total ≈ 0.16–0.32 s (median ~0.32 s) at 48T no-CMG.**
+**Total ≈ 0.06–0.13 s (wall) at 48T no-CMG** → int8 ~1300–1650 tok/s, fp16
+~380–500 tok/s, **int8/fp16 ≈ 2.7–3.4×**.
 
 > ⚠️ **This shared Fugaku node has ~1.5–2× run-to-run variance** (HBM/NUMA
-> state, background load): the total swings 0.16 s (fast) to 0.46 s (slow)
-> for identical commands. **Always A/B with `--bench ≥ 8` back-to-back** and
-> trust the *relative* delta (which is stable), not a single absolute number.
-> The per-stage `%` from one `VLM_STAGE_TIMING` run is unreliable for the same
-> reason — an early run made `attn` look like 21% when it is really ~7%.
+> state, background load): the total swings 0.06 s (fast) to 0.13+ s (slow)
+> for identical commands, and the *per-stage %* swings with it (e.g. one run
+> spiked patch_embed to 31%). **Always A/B with `--bench ≥ 8` back-to-back**
+> and trust the *relative* delta (stable), not a single absolute number or a
+> single run's per-stage %.
 
-Headline: **the transformer GEMMs (ffn_down/up, qkv, attn_out, deepstack)
-are the dominant cost** and are already at their W-HBM-bound limit after the
-nb-outer schedule (§3.1). Attention is fp32-FMA-bound (§3.2) and ~7% *only
-with the OpenMP build* (the C11-thrd default serializes it to ~65% wall —
-see the build gotcha in §3.3, now fixed by defaulting `make CC=fcc` to
-OpenMP). patch_embed (the fused-conv2d target) is 0.5% and was never the
-bottleneck.
+Headline: **the int8 SDOT GEMMs (ffn_down/up, qkv, attn_out) and the fp32-FMA
+attention together are ~85% of the encode** and are at their compute limit
+(GEMMs HBM-bound after the fused int8 + nb-outer schedule, §3.1/3.3; attention
+memory/LLC-bound in-situ, §3.2, with int8 rejected as too lossy). Elementwise
+(GELU tanh-compute) is ~15%. The encoder is at its practical compute limit;
+remaining headroom is <2% (system-level) or needs a different model/arch.
+Attention is *only* parallel with the **OpenMP** backend — the C11-thrd default
+serializes it; `make CC=fcc` now defaults to OpenMP (§3.3 build note).
 
 ### The GEMM is W-traffic bound, and that is now fixed (mostly)
 

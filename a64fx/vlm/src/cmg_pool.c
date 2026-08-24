@@ -6,7 +6,9 @@
  * mbind reference: man 2 mbind. MPOL_BIND with single-node mask guarantees
  * pages allocated for the region resolve from the bound HBM2 node.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "cmg_pool.h"
 
 #include <errno.h>
