@@ -493,27 +493,27 @@ OMP_NUM_THREADS=48 ./build/vlm_runner $M $MM ~/fujisan.jpg \
 OMP_NUM_THREADS=48 ./build/vlm_runner $M $MM ~/fujisan.jpg \
     --dtype int16 --threads 48 --bench 3
 
-# int16 GEMM unit test (vs fp32 ref; expect rel(L2) ~2.6e-5; 1T == 48T):
-make CC=fcc OPENMP=1
-fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -std=c11 -fopenmp -Ikernels -I. \
-    -o /tmp/ti tools/test_int8_gemm.c kernels/int8_gemm.c kernels/kernel_6x4_int8.S -lm
-OMP_NUM_THREADS=48 /tmp/ti        # int16 correctness
-OMP_NUM_THREADS=48 /tmp/ti bench  # int8 vs int16 GEMM speed
-OMP_NUM_THREADS=48 /tmp/ti 8      # int8 correctness
+# kernel unit tests (regression gate): int8/int16 GEMM vs fp32 ref, fused
+# bit-identical, conv2d SVE vs scalar ref, cmg pool NUMA sanity.
+make CC=fcc test
 
-# int8 GEMM unit test (vs fp32 ref; expect rel(L2) ~0.0056, 1T == 48T):
-make CC=fcc OPENMP=1
-fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -std=c11 -fopenmp -Ikernels -I. \
-    -o /tmp/ti tools/test_int8_gemm.c kernels/int8_gemm.c kernels/kernel_6x4_int8.S -lm
-OMP_NUM_THREADS=48 /tmp/ti
-
-# fused int8 GEMM unit test (expect BIT-IDENTICAL vs non-fused, 0 differ):
-OMP_NUM_THREADS=48 /tmp/ti fused           # 1T too: OMP_NUM_THREADS=1
-OMP_NUM_THREADS=48 /tmp/ti fused bench     # fused vs non-fused GEMM speed
+# individual test binaries (built by `make test`), each exits non-zero on fail:
+OMP_NUM_THREADS=48 ./build/test_int8_gemm          # int16 (rel L2 ~2.6e-5)
+OMP_NUM_THREADS=48 ./build/test_int8_gemm 8        # int8  (rel L2 ~0.0056)
+OMP_NUM_THREADS=48 ./build/test_int8_gemm fused    # fused vs non-fused (BIT-IDENTICAL)
+./build/test_conv2d_sve                            # conv2d SVE vs scalar ref (PASS)
+./build/test_cmg_pool                              # CMG NUMA sanity
 
 # stage breakdown:
 VLM_STAGE_TIMING=1 OMP_NUM_THREADS=48 ./build/vlm_runner $M $MM ~/fujisan.jpg \
-    --dtype fp16 --threads 48 --bench 1 2>&1 | grep -A16 "stage timings"
+    --dtype int8 --threads 48 --bench 1 2>&1 | grep -A16 "stage timings"
+
+# larger-image correctness (confirms the O(n²) attention scales): --image-size
+# 768 -> 768x512 -> 1536 patches, 384 merged tokens (4x the default 384). The
+# norm is bit-identical across thread counts (934.5060 at 1T and 48T); ~465
+# tok/s at 48T (the O(n²) attention dominates over the 4x tokens).
+OMP_NUM_THREADS=48 ./build/vlm_runner $M $MM ~/fujisan.jpg \
+    --image-size 768 --dtype int8 --threads 48 --bench 1   # expect norm=934.5060
 
 # fused-conv2d unit test (correctness vs scalar + micro-bench):
 fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -std=c11 -Ikernels -Iinclude \
