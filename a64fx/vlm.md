@@ -144,10 +144,20 @@ so it is **load-bound, not FMA-bound**: the 8 scalar Q loads + 3 K-vector loads
 per QK^T d-iter (and 4 att + 4 V per AV row) bound it, not the 24 `svmla`.
 In-situ it drops to **~19% of the FMA floor** (a further ~3.2× memory/
 scheduling penalty from 48 threads' K/V contending for L2/LLC), so the kernel
-headroom (58%→100%) does not fully translate end-to-end. int8 attention
-(Q/K/V → int8, SDOT) is the only big lever but is precision-risky (the
-softmax is sensitive to the int8 score error; int16 was already "marginal
-~0.1–1%") — not implemented.
+headroom (58%→100%) does not fully translate end-to-end.
+
+> **int8 attention tested and rejected (precision).** A precision probe
+> (`tools/attn_int8_probe2.c`, per-row int8 Q/K/attn, V per-head, run on real
+> per-block qkv dumps) measured the int8 attention-output rel-L2 vs the fp32
+> path. **Full int8** (int8 QK^T + int8 AV) is too lossy: the per-block error
+> grows with depth as the softmax sharpens — block 0 **1.1% avg / 2.4% worst**,
+> block 12 **3.1% / 7.4%**, block 23 **3.0% / 10.2%** (the int8 AV quantizes
+> the peaked attention weights and drops the tail). That would add a several-%
+> norm delta on top of the int8 GEMM's 0.79% — not acceptable. **QK^T-only
+> int8** (int8 scores, fp32 softmax + fp32 AV) is safe (~**1.0%** worst across
+> all blocks) but only speeds the QK^T (~12% of the encode) → **~1.07×
+> end-to-end** — marginal for one new SDOT kernel + Q/K quantize. So int8
+> attention is not worth it; the attention stays fp32.
 
 > **fp16 attention investigated and ruled out (A64FX hardware limit).** A
 > fast fp16 dot product needs `FMLA Z.S, P/M, Z.H, Z.H` (fp16×fp16 → **fp32**
