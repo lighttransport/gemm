@@ -146,18 +146,22 @@ In-situ it drops to **~19% of the FMA floor** (a further ~3.2× memory/
 scheduling penalty from 48 threads' K/V contending for L2/LLC), so the kernel
 headroom (58%→100%) does not fully translate end-to-end.
 
-> **int8 attention tested and rejected (precision).** A precision probe
-> (`tools/attn_int8_probe2.c`, per-row int8 Q/K/attn, V per-head, run on real
-> per-block qkv dumps) measured the int8 attention-output rel-L2 vs the fp32
-> path. **Full int8** (int8 QK^T + int8 AV) is too lossy: the per-block error
-> grows with depth as the softmax sharpens — block 0 **1.1% avg / 2.4% worst**,
-> block 12 **3.1% / 7.4%**, block 23 **3.0% / 10.2%** (the int8 AV quantizes
-> the peaked attention weights and drops the tail). That would add a several-%
-> norm delta on top of the int8 GEMM's 0.79% — not acceptable. **QK^T-only
-> int8** (int8 scores, fp32 softmax + fp32 AV) is safe (~**1.0%** worst across
-> all blocks) but only speeds the QK^T (~12% of the encode) → **~1.07×
-> end-to-end** — marginal for one new SDOT kernel + Q/K quantize. So int8
-> attention is not worth it; the attention stays fp32.
+> **int8 attention tested and rejected (precision + speed).** A precision
+> probe (`tools/attn_int8_probe2.c`, per-row int8 Q/K/attn, V per-head, run on
+> real per-block qkv dumps) and a **full implementation** (int8 QK^T kernel +
+> per-row Q/K quantize, gated `VLM_INT8_QK`) both agree int8 attention is a
+> loss:
+> - **Full int8** (int8 QK^T + int8 AV): too lossy — the per-block error grows
+>   with depth as the softmax sharpens (block 0 1.1% → block 23 3.0% avg, 10%
+>   worst); the int8 AV quantizes peaked attention weights and drops the tail.
+> - **QK^T-only int8** (int8 scores, fp32 softmax + AV): the per-block error is
+>   only ~1%, but it **accumulates over the 24 blocks to a 6.4% norm delta**
+>   (452.03 → 480.82) — far beyond the int8 GEMM's 0.79% — *and* it was
+>   **slower** (630 vs 802 tok/s at 48T): the per-`[q,k]` `svaddv_s32` dequant +
+>   the Q/K quantize overhead outweigh the SDOT. The per-block probe
+>   **underestimates** the full-model error (it doesn't see the 24-block
+>   accumulation).
+> So int8 attention is not worth it; the attention stays fp32. (Reverted.)
 
 > **fp16 attention investigated and ruled out (A64FX hardware limit).** A
 > fast fp16 dot product needs `FMLA Z.S, P/M, Z.H, Z.H` (fp16×fp16 → **fp32**
