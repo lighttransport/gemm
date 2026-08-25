@@ -163,10 +163,10 @@ $(BUILD)/qwen38_prefill_runner: $(LLM_DIR)qwen38_prefill_runner.c $(COMMON)/tran
 		$(LLM_DIR)qwen38_prefill_runner.c $(VLM_KERNELS)/micro_kernel_bf16B_8x3_pv.S $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(LDFLAGS) -ltofucom
 
 qwen38_mixed_runner: $(BUILD)/qwen38_mixed_runner
-$(BUILD)/qwen38_mixed_runner: $(LLM_DIR)qwen38_mixed_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) | $(BUILD)
+$(BUILD)/qwen38_mixed_runner: $(LLM_DIR)qwen38_mixed_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h $(VLM_KERNELS)/micro_kernel_bf16B_8x3_pv.S $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) | $(BUILD)
 	OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43 /opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifcc \
-		$(filter-out -g -rdynamic,$(CFLAGS)) -DTF_LINK_PODD -DTF_HAVE_Q8V2 $(QWEN_CFLAGS) -o $@ \
-		$(LLM_DIR)qwen38_mixed_runner.c $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(LDFLAGS) -ltofucom
+		$(filter-out -g -rdynamic,$(CFLAGS)) -DTF_LINK_BF16PV48 -DTF_LINK_PODD -DTF_HAVE_Q8V2 $(QWEN_CFLAGS) -o $@ \
+		$(LLM_DIR)qwen38_mixed_runner.c $(VLM_KERNELS)/micro_kernel_bf16B_8x3_pv.S $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(LDFLAGS) -ltofucom
 
 qwen38_tp_stage: $(BUILD)/qwen38_tp_stage
 $(BUILD)/qwen38_tp_stage: $(LLM_DIR)qwen38_tp_stage.c $(LLM_DIR)qwen38_tp_stage.h $(COMMON)/gguf_loader.h | $(BUILD)

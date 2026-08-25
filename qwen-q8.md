@@ -2048,3 +2048,39 @@ Next work should measure HBM counters and page residency during simultaneous
 decode, then compare three independently launched TP4 controls in the same
 12-node allocation.  Until aggregate bandwidth scales, this topology is a
 correct resident-weight prototype rather than a throughput win.
+
+### Native-BF16 PP3xTP4 prefill and independent TP4 decode (2026-08-25)
+
+`run_qwen38_bf16_mixed_12n.sh` is the accepted 12-node launcher for the BF16
+weights.  It stages one native TP4 shard per node, builds exact BF16 PV48
+panels only for the PP-owned layers, prefills three requests, transposes their
+runtime state in memory, releases the transient panels, and repacks the
+resident row-major BF16 weights in place to the PV8 decode layout.  It never
+rereads or quantizes the weights at the phase boundary.
+
+```sh
+./a64fx/llm/run_qwen38_bf16_mixed_12n.sh stage
+./a64fx/llm/run_qwen38_bf16_mixed_12n.sh direct # 3 independent TP4 K=0 streams
+./a64fx/llm/run_qwen38_bf16_mixed_12n.sh bench  # PP3xTP4, 4096 then decode
+```
+
+The 4096-token prefill measured 221.6--225.4 tok/s per request.  Releasing
+4.49--4.76 GB/rank of PP-local PV48 panels and repacking 14.309 GB/rank took
+0.17--0.18 seconds; the warm weight stream sustained 856--869 GB/s.  The
+independent 256-token K=0 decode streams measured 31.81, 32.42, and 31.61
+tok/s, with identical hashes on all four ranks in each replica.  These are
+per-context rates, not an aggregate number.
+
+Flat worker barriers (`TF_HIER_BARRIER=0`) are required.  Omitting that setting
+was the cause of the earlier 10--11 tok/s mixed-runner result; it was not HBM
+contention between the three replicas.  `OMP_WAIT_POLICY=passive` and
+`KMP_BLOCKTIME=0` keep the prefill OpenMP team from competing with decode.
+
+Decode that continues with the complete 4096-token KV cache is a different,
+attention-bound workload.  Splitting QK positions over all 48 cores preserves
+the token hashes and raises it from 21.05--23.54 to 24.74--25.06 tok/s, but it
+does not meet 30 tok/s.  A value-dimension split was tested and rejected: it
+fell to 21.77--22.83 tok/s and one replica diverged.  The accepted launcher
+therefore meets the 30+ target for the requested independent decode contexts
+and the 120+ target for each prefill request, while reporting long-context
+continuation separately.

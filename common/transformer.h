@@ -368,6 +368,15 @@ size_t transformer_expand_q8_bf16_pv_range(transformer_model *model,
  * FP32-activation 8x48 A64FX prefill kernel. */
 size_t transformer_prepack_prefill_pv48_range(transformer_model *model,
                                                int layer_start, int layer_end);
+/* Reclaim exact-BF16 prefill panels before switching a resident model to
+ * single-token decode. */
+size_t transformer_release_prefill_pv48_range(transformer_model *model,
+                                               int layer_start, int layer_end);
+/* Convert resident row-major BF16 projections to the exact eight-row
+ * pair-interleaved decode layout without allocating a second weight arena. */
+size_t transformer_pack_bf16_pv_range_inplace(transformer_model *model,
+                                               int layer_start, int layer_end,
+                                               int include_output);
 void transformer_prefill_profile_reset(void);
 void transformer_prefill_profile_get(transformer_prefill_profile *out);
 /* Diagnostic only: scan all resident Q8 decode tensors as one batched stream,
@@ -3220,6 +3229,8 @@ typedef struct {
     int head_dim, kv_dim, gqa_ratio, seq_len, max_seq_len;
     float scale;
     int q_head_offset;
+    int phase;              /* 0=full, 1=QK score slice, 2=softmax+PV */
+    int seq_start, seq_end; /* score interval for phase 1 */
 } tf_attn_task;
 
 static void *tf_attn_worker(void *arg) {
@@ -3364,7 +3375,10 @@ static void *tf_attn_worker(void *arg) {
         {
             /* SVE attention with prefetch */
             svbool_t pg = svptrue_b32();
-            for (int p = 0; p < seq_len; p++) {
+            int score_start = t->phase == 1 ? t->seq_start : 0;
+            int score_end = t->phase == 1 ? t->seq_end :
+                            t->phase == 2 ? 0 : seq_len;
+            for (int p = score_start; p < score_end; p++) {
                 const float *k_p = t->key_cache + (size_t)p * t->kv_dim + kv_h * hd;
                 if (p + 2 < seq_len)
                     __builtin_prefetch(t->key_cache + (size_t)(p+2) * t->kv_dim + kv_h * hd, 0, 1);
@@ -3378,6 +3392,7 @@ static void *tf_attn_worker(void *arg) {
                 }
                 att_h[p] = svaddv(pg, acc) * t->scale;
             }
+            if (t->phase == 1) continue;
             tf_softmax(att_h, seq_len);
             float *out_h = t->xb2 + h * hd;
             /* Zero output with SVE */
@@ -7310,14 +7325,46 @@ static void *tf_persistent_worker(void *arg) {
             }
             tf_spin_barrier(m, &local_sense, nt);  /* B3: Q/K ready for attention */
 
-            /* Attention: each thread handles its head partition */
+            /* Attention.  TP4 leaves only six local query heads, so at long
+             * context split independent QK positions eight ways per head.  A
+             * head owner still performs softmax and PV in original sequence
+             * order, preserving the exact accumulation result. */
             {
                 int seq_len = position + 1;
                 float scale = 1.0f / sqrtf((float)head_dim);
-                if (h_count > 0) {
+                static int seq_split = -1;
+                if (seq_split < 0) {
+                    const char *e = getenv("TF_ATTN_SEQ_SPLIT");
+                    seq_split = e && atoi(e) != 0;
+                }
+                int split = seq_split && seq_len >= 512 && n_heads < nt &&
+                            (nt % n_heads) == 0;
+                if (split) {
+                    int lanes = nt / n_heads;
+                    int sh = tid % n_heads;
+                    int lane = tid / n_heads;
+                    int p0 = seq_len * lane / lanes;
+                    int p1 = seq_len * (lane + 1) / lanes;
+                    tf_attn_task scores = {m->q, m->att, m->xb2,
+                        m->key_cache[l], m->value_cache[l], sh, sh + 1,
+                        head_dim, kv_dim, gqa_ratio, seq_len, m->max_seq_len,
+                        scale, m->tp_qhead_offset, 1, p0, p1};
+                    tf_attn_worker(&scores);
+                    tf_spin_barrier(m, &local_sense, nt);
+                    if (tid < n_heads) {
+                        memset(m->xb2 + tid * head_dim, 0,
+                               (size_t)head_dim * sizeof(float));
+                        tf_attn_task finish = {m->q, m->att, m->xb2,
+                            m->key_cache[l], m->value_cache[l], tid, tid + 1,
+                            head_dim, kv_dim, gqa_ratio, seq_len, m->max_seq_len,
+                            scale, m->tp_qhead_offset, 2, 0, 0};
+                        tf_attn_worker(&finish);
+                    }
+                } else if (h_count > 0) {
                     tf_attn_task at = {m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
                                        h_start, h_start + h_count, head_dim, kv_dim, gqa_ratio,
-                                       seq_len, m->max_seq_len, scale};
+                                       seq_len, m->max_seq_len, scale,
+                                       m->tp_qhead_offset, 0, 0, 0};
                     memset(m->xb2 + h_start * head_dim, 0, (size_t)h_count * head_dim * sizeof(float));
                     tf_attn_worker(&at);
                 }
@@ -11475,6 +11522,96 @@ size_t transformer_prepack_prefill_pv48_range(transformer_model *m,
 #else
     (void)m; (void)layer_start; (void)layer_end; return 0;
 #endif
+}
+
+static size_t tf_release_prefill_pv48_tensor(transformer_model *m, qtensor *w) {
+    if (!m || !w || !w->prefill_pv48) return 0;
+    size_t bytes = 0;
+#if defined(TF_LINK_BF16PV48) && defined(__ARM_FEATURE_SVE)
+    if (w->n_rows > 0 && w->n_cols > 0)
+        bytes = k3_prefill_bf16_packed_bytes(w->n_rows, w->n_cols);
+#endif
+    void *p = w->prefill_pv48;
+    for (int i = 0; i < m->decode_owned_count; i++) {
+        if (m->decode_owned[i] == p) {
+            m->decode_owned[i] = NULL;
+            break;
+        }
+    }
+    free(p);
+    w->prefill_pv48 = NULL;
+    return bytes;
+}
+
+size_t transformer_release_prefill_pv48_range(transformer_model *m,
+                                               int layer_start, int layer_end) {
+    if (!m || !m->layers) return 0;
+    if (layer_start < 0) layer_start = 0;
+    if (layer_end > m->n_layers) layer_end = m->n_layers;
+    size_t total = 0;
+    int count = 0;
+    for (int l = layer_start; l < layer_end; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+            &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta, &L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            size_t n = tf_release_prefill_pv48_tensor(m, ws[i]);
+            if (n) { total += n; count++; }
+        }
+    }
+    fprintf(stderr, "prefill pv48: released layers=[%d,%d) tensors=%d %.3fGB\n",
+            layer_start, layer_end, count, (double)total / 1e9);
+    return total;
+}
+
+static size_t tf_pack_bf16_pv_tensor_inplace(transformer_model *m, qtensor *w) {
+    if (!m || !w || !w->data || w->type != GGML_TYPE_BF16 || w->bf16_pv ||
+        w->i8 || (w->n_rows & 7) || (w->n_cols & 15) || w->n_rows < 8)
+        return 0;
+    int nt = m->n_threads > 1 && m->pool_alive ? m->n_threads : 1;
+    if (nt > 1) {
+        tf_bf16_pv_pack_task *tasks =
+            (tf_bf16_pv_pack_task *)alloca((size_t)nt * sizeof(*tasks));
+        for (int t = 0; t < nt; t++)
+            tasks[t] = (tf_bf16_pv_pack_task){(const uint16_t *)w->data,
+                (uint16_t *)w->data, w->n_rows, w->n_cols, t, nt};
+        tf_pool_dispatch(m, tf_bf16_pv_pack_worker, tasks, sizeof(*tasks));
+    } else {
+        tf_bf16_pv_pack_task task = {(const uint16_t *)w->data,
+            (uint16_t *)w->data, w->n_rows, w->n_cols, 0, 1};
+        tf_bf16_pv_pack_worker(&task);
+    }
+    w->bf16_pv = 1;
+    return (size_t)w->n_rows * (size_t)w->n_cols * sizeof(uint16_t);
+}
+
+size_t transformer_pack_bf16_pv_range_inplace(transformer_model *m,
+                                               int layer_start, int layer_end,
+                                               int include_output) {
+    if (!m || !m->layers) return 0;
+    if (layer_start < 0) layer_start = 0;
+    if (layer_end > m->n_layers) layer_end = m->n_layers;
+    size_t total = 0;
+    int count = 0;
+    for (int l = layer_start; l < layer_end; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+            &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta, &L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            size_t n = tf_pack_bf16_pv_tensor_inplace(m, ws[i]);
+            if (n) { total += n; count++; }
+        }
+    }
+    if (include_output) {
+        size_t n = tf_pack_bf16_pv_tensor_inplace(m, &m->output);
+        if (n) { total += n; count++; }
+    }
+    fprintf(stderr, "bf16 pv8 inplace: layers=[%d,%d) tensors=%d %.3fGB%s\n",
+            layer_start, layer_end, count, (double)total / 1e9,
+            include_output ? " +lm_head" : "");
+    return total;
 }
 
 /* Fused dual-matrix threaded GEMM: compute gate and up simultaneously, reading X once */

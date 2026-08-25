@@ -1,6 +1,6 @@
-/* Persistent Qwen3.8 service experiment: PP3xTP4 prefill of three requests,
- * in-memory state transpose, then three concurrent TP4 decode replicas.
- * The complete TP4 rank stage is loaded once and remains anonymous/resident. */
+/* Persistent native-BF16 Qwen3.8 service experiment: PP3xTP4 prefill of three
+ * requests, in-memory state transpose, then three independent TP4 K=0 decode
+ * replicas.  The rank stage changes layout in place and is never reread. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -50,7 +50,10 @@ static const char *env_s(const char *name, const char *def) {
 }
 static void fail(int rank, const char *msg) {
     fprintf(stderr, "qwen38-mixed rank=%d FATAL %s\n", rank, msg);
-    MPI_Abort(MPI_COMM_WORLD, 2);
+    int finalized = 0;
+    MPI_Finalized(&finalized);
+    if (!finalized) MPI_Abort(MPI_COMM_WORLD, 2);
+    exit(2);
 }
 static void reduce_sum(float *buf, int count, void *opaque) {
     reduce_ctx *c = (reduce_ctx *)opaque;
@@ -103,7 +106,8 @@ static void init_decode_utofu(int wrank, int group, int tp_rank,
         utofu_set_vcq_id_path(&peers[r], NULL);
     }
     g_init_comm = group_comm;
-    if (tp_comm_init(out, *vcq, peers, tp_rank, 4, 5120, init_barrier) != 0)
+    if (tp_comm_init(out, *vcq, peers, tp_rank, 4, 2 * 1024 * 1024,
+                     init_barrier) != 0)
         fail(wrank, "initialize decode uTofu TP4");
 }
 static int local_argmax(transformer_model *m, const float *logits, MPI_Comm comm) {
@@ -116,6 +120,22 @@ static int local_argmax(transformer_model *m, const float *logits, MPI_Comm comm
     }
     MPI_Allreduce(&local, &global, 1, MPI_FLOAT_INT, MPI_MAXLOC, comm);
     return global.index;
+}
+static int tofu_argmax(transformer_model *m, const float *logits, tp_comm *comm) {
+    float best = -INFINITY;
+    int32_t token = 0;
+    for (int i = 0; i < m->output.n_rows; i++) {
+        if (logits[i] > best) {
+            best = logits[i];
+            token = m->tp_vocab_lo + i;
+        }
+    }
+    tp_allreduce_argmax(comm, &best, &token);
+    return token;
+}
+static void tofu_group_barrier(tp_comm *comm) {
+    float zero = 0.0f;
+    tp_allreduce_sum(comm, &zero, 1);
 }
 static uint64_t hash_token(uint64_t h, int32_t token) {
     h ^= (uint32_t)token;
@@ -156,6 +176,8 @@ int main(int argc, char **argv) {
         if (!wrank) fprintf(stderr, "usage: mpiexec -np 12 %s MODEL.gguf\n", argv[0]);
         MPI_Abort(MPI_COMM_WORLD, 2);
     }
+    /* Required by the production TP4 row-parallel staged layout. */
+    setenv("TF_KEEP_BF16_SRC", "1", 1);
 
     const int tp_size = 4, pp_size = 3, requests = 3;
     const int tp_rank = wrank % tp_size, pp_rank = wrank / tp_size;
@@ -193,16 +215,88 @@ int main(int argc, char **argv) {
     transformer_model *m = transformer_load(g, maxseq);
     if (!m) fail(wrank, "load model metadata");
     transformer_set_threads(m, threads);
-    const char *stage = env_s("TP_STAGE_DIR", "/local/u14346/qwen38-q8-tp4");
+    const char *stage = env_s("TP_STAGE_DIR", "/local/u14346/qwen38-bf16-tp4");
     setenv("TP_STAGE_DIR", stage, 1);
+    int direct_decode = env_i("Q38_MIXED_DIRECT_DECODE", 0) != 0;
+    /* Exact batched prefill consumes ordinary BF16 rows.  A fresh decode-only
+     * process asks the stage loader to perform the same PV8 conversion. */
+    setenv("TP_STAGE_BF16_PV", direct_decode ? "1" : "0", 1);
     if (transformer_tp_slice_weights(m, tp_rank, tp_size, 1)) fail(wrank, "TP slice");
     size_t stage_bytes = transformer_tp_load_stage(m, stage, tp_rank, tp_size);
     if (!stage_bytes) fail(wrank, "load resident TP4 stage");
+    int native_bf16 = m->layers[0].attn_q.type == GGML_TYPE_BF16 ||
+        m->layers[0].ssm_qkv.type == GGML_TYPE_BF16 ||
+        m->layers[0].ffn_gate.type == GGML_TYPE_BF16;
+    int native_q8 = m->layers[0].attn_q.type == GGML_TYPE_Q8_0 ||
+        m->layers[0].ssm_qkv.type == GGML_TYPE_Q8_0 ||
+        m->layers[0].ffn_gate.type == GGML_TYPE_Q8_0;
+    if (!native_bf16 && !native_q8)
+        fail(wrank, "mixed runner requires BF16 or Q8_0 stage");
     transformer_resize_kv_for_tp(m, 0, m->n_layers,
                                  m->tp_kv_head_count * m->head_dim);
     transformer_set_tp(m, tp_rank, tp_size, reduce_sum, &rc);
-    size_t prefill_bytes = transformer_prepack_q8v2_range(m, l0, l1);
-    if (!prefill_bytes) fail(wrank, "build transient Q8v2 prefill panels");
+    if (direct_decode) {
+        if (!native_bf16) fail(wrank, "direct decode requires native BF16 stage");
+        rc.comm = decode_tp;
+        tp_comm direct_utofu;
+        utofu_vcq_hdl_t direct_vcq;
+        init_decode_utofu(wrank, decode_group, tp_rank, compact_groups,
+                          decode_tp, &direct_utofu, &direct_vcq);
+        rc.tofu = &direct_utofu;
+        rc.reduce_s = 0.0;
+        rc.reduce_calls = 0;
+        transformer_set_tp(m, tp_rank, tp_size, reduce_sum, &rc);
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Comm_free(&decode_tp);
+        MPI_Comm_free(&pipeline);
+        MPI_Comm_free(&prefill_tp);
+        MPI_Finalize();
+        setenv("TP_LMHEAD_ARGMAX", "1", 1);
+        int in_tok = env_i("Q38_MIXED_DIRECT_TOKEN", decode_group + 1);
+        int replica_gen = decode_group < active_replicas ? maxgen : 0;
+        uint64_t token_hash = UINT64_C(1469598103934665603);
+        tofu_group_barrier(&direct_utofu);
+        double begin = wall(), forward_s = 0.0, logits_s = 0.0;
+        for (int i = 0; i < replica_gen; i++) {
+            token_hash = hash_token(token_hash, in_tok);
+            transformer_embed_token(m, in_tok);
+            double phase = wall();
+            if (!transformer_forward_partial(m, i, 0, m->n_layers))
+                fail(wrank, "direct decode forward");
+            forward_s += wall() - phase;
+            phase = wall();
+            float *logits = transformer_compute_logits(m);
+            if (!logits) fail(wrank, "direct decode logits");
+            in_tok = tofu_argmax(m, logits, &direct_utofu);
+            logits_s += wall() - phase;
+        }
+        tofu_group_barrier(&direct_utofu);
+        double elapsed = wall() - begin;
+        fprintf(rank_log, "direct_decode replica=%d tokens=%d time=%.6f tok/s=%.2f "
+                "forward=%.6f logits=%.6f reduce=%.6f calls=%ld hash=%016llx\n",
+                decode_group, replica_gen, elapsed,
+                replica_gen ? replica_gen / elapsed : 0.0, forward_s, logits_s,
+                rc.reduce_s, rc.reduce_calls, (unsigned long long)token_hash);
+        if (tp_rank == 0) {
+            printf("qwen38-bf16-direct replica=%d tokens=%d time=%.6f tok/s=%.2f "
+                   "hash=%016llx\n", decode_group, replica_gen, elapsed,
+                   replica_gen ? replica_gen / elapsed : 0.0,
+                   (unsigned long long)token_hash);
+            fflush(stdout);
+        }
+        transformer_free(m);
+        gguf_close(g);
+        tp_comm_free(&direct_utofu);
+        utofu_free_vcq(direct_vcq);
+        fclose(rank_log);
+        return 0;
+    }
+    size_t prefill_bytes = native_bf16
+        ? transformer_prepack_prefill_pv48_range(m, l0, l1)
+        : transformer_prepack_q8v2_range(m, l0, l1);
+    if (!prefill_bytes) fail(wrank, native_bf16
+        ? "build transient BF16 PV48 prefill panels"
+        : "build transient Q8v2 prefill panels");
     fprintf(rank_log, "load stage=%.3fGB prefill_pack=%.3fGB layers=%d:%d\n",
             stage_bytes / 1e9, prefill_bytes / 1e9, l0, l1);
 
@@ -213,11 +307,18 @@ int main(int argc, char **argv) {
     void *states[requests];
     size_t state_sizes[requests];
     int next[requests];
+    double prefill_req_s[requests];
     memset(states, 0, sizeof(states));
 
     MPI_Barrier(MPI_COMM_WORLD);
     double prefill_begin = wall();
+    /* Preserve the originally pinned persistent pthread pool.  Batched prefill
+     * temporarily parks it while OpenMP owns the cores; recreating the pool
+     * after OpenMP has rebound the main thread destroys decode affinity. */
+    tf_batch_keep_pool = 1;
     for (int req = 0; req < requests; req++) {
+        MPI_Barrier(MPI_COMM_WORLD);
+        double request_begin = wall();
         transformer_reset_runtime_state(m);
         int token_id = env_i(req == 0 ? "Q38_MIXED_TOKEN0" :
                              req == 1 ? "Q38_MIXED_TOKEN1" : "Q38_MIXED_TOKEN2",
@@ -253,9 +354,14 @@ int main(int argc, char **argv) {
         if (!states[req] || transformer_runtime_state_pack(
                 m, l0, l1, ntok, states[req], state_sizes[req]))
             fail(wrank, "pack in-memory prefill state");
+        MPI_Barrier(MPI_COMM_WORLD);
+        prefill_req_s[req] = wall() - request_begin;
+        fprintf(rank_log, "prefill request=%d tokens=%d time=%.6f tok/s=%.2f next=%d\n",
+                req, ntok, prefill_req_s[req], ntok / prefill_req_s[req], next[req]);
     }
     MPI_Barrier(MPI_COMM_WORLD);
     double prefill_s = wall() - prefill_begin;
+    tf_batch_keep_pool = 0;
     fprintf(rank_log, "prefill requests=3 tokens=%d time=%.6f\n", ntok, prefill_s);
 
     /* On each same-TP-lane pipeline communicator, source PP stage s sends its
@@ -301,12 +407,9 @@ int main(int argc, char **argv) {
     for (int r = 0; r < requests; r++) free(states[r]);
     free(sendbuf); free(recvbuf); free(hidden); free(tokens);
 
-    size_t released = transformer_release_q8v2_range(m, l0, l1);
-    /* Batched prefill temporarily owns the OpenMP team and cycles the decode
-     * pthread pool.  Recreate it at the service topology boundary so decode
-     * starts from the same pinned-worker state as the standalone TP runner. */
-    transformer_set_threads(m, 1);
-    transformer_set_threads(m, threads);
+    size_t released = native_bf16
+        ? transformer_release_prefill_pv48_range(m, l0, l1)
+        : transformer_release_q8v2_range(m, l0, l1);
     rc.comm = decode_tp;
     tp_comm decode_utofu;
     utofu_vcq_hdl_t decode_vcq;
@@ -317,17 +420,32 @@ int main(int argc, char **argv) {
     rc.reduce_calls = 0;
     transformer_set_tp(m, tp_rank, tp_size, reduce_sum, &rc);
     MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Comm_free(&decode_tp);
+    MPI_Comm_free(&pipeline);
+    MPI_Comm_free(&prefill_tp);
+    MPI_Finalize();
+
     double expand_begin = wall();
-    size_t expanded = transformer_expand_q8_bf16_pv_range(m, 0, m->n_layers, 1, 0);
-    if (!expanded) fail(wrank, "resident Q8 to BF16-PV decode expansion");
-    MPI_Barrier(MPI_COMM_WORLD);
+    size_t expanded = native_bf16
+        ? transformer_pack_bf16_pv_range_inplace(m, 0, m->n_layers, 1)
+        : transformer_expand_q8_bf16_pv_range(m, 0, m->n_layers, 1, 0);
+    if (!expanded) fail(wrank, native_bf16
+        ? "resident BF16 row-major to PV8 transition"
+        : "resident Q8 to BF16-PV expansion");
+    setenv("TP_LMHEAD_ARGMAX", "1", 1);
+    int warm_passes = env_i("Q38_MIXED_WEIGHT_WARM_PASSES", 1);
+    double warm_bw = warm_passes > 0
+        ? transformer_null_stream_bench(m, warm_passes) : 0.0;
+    tofu_group_barrier(&decode_utofu);
     double expand_s = wall() - expand_begin;
-    fprintf(rank_log, "transition released=%.3fGB expanded=%.3fGB time=%.6f\n",
-            released / 1e9, expanded / 1e9, expand_s);
+    fprintf(rank_log, "transition released=%.3fGB repacked=%.3fGB time=%.6f "
+            "warm_passes=%d warm_bw=%.1fGB/s pool_alive=%d paused=%d threads=%d\n",
+            released / 1e9, expanded / 1e9, expand_s, warm_passes, warm_bw,
+            m->pool_alive, m->pool_paused, m->n_threads);
 
     int in_tok = next[decode_group];
     uint64_t token_hash = UINT64_C(1469598103934665603);
-    MPI_Barrier(MPI_COMM_WORLD);
+    tofu_group_barrier(&decode_utofu);
     double decode_begin = wall();
     double forward_s = 0.0, logits_s = 0.0;
     int replica_gen = decode_group < active_replicas ? maxgen : 0;
@@ -341,12 +459,11 @@ int main(int argc, char **argv) {
         phase = wall();
         float *logits = transformer_compute_logits(m);
         if (!logits) fail(wrank, "decode logits");
-        in_tok = local_argmax(m, logits, decode_tp);
+        in_tok = tofu_argmax(m, logits, &decode_utofu);
         logits_s += wall() - phase;
     }
-    MPI_Barrier(decode_tp);
+    tofu_group_barrier(&decode_utofu);
     double decode_s = wall() - decode_begin;
-    MPI_Barrier(MPI_COMM_WORLD);
     fprintf(rank_log, "decode replica=%d tokens=%d time=%.6f tok/s=%.2f "
             "forward=%.6f logits=%.6f reduce=%.6f calls=%ld hash=%016llx\n",
             decode_group, replica_gen, decode_s,
@@ -354,21 +471,24 @@ int main(int argc, char **argv) {
             forward_s, logits_s,
             rc.reduce_s, rc.reduce_calls,
             (unsigned long long)token_hash);
-    double decode_max = 0.0;
-    MPI_Reduce(&decode_s, &decode_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (tp_rank == 0) {
-        printf("qwen38-mixed replica=%d prefill_next=%d decode=%d time=%.6f tok/s=%.2f hash=%016llx\n",
-               decode_group, next[decode_group], maxgen, decode_s, maxgen / decode_s,
+        printf("qwen38-bf16-mixed replica=%d prefill_next=%d decode=%d time=%.6f tok/s=%.2f hash=%016llx\n",
+               decode_group, next[decode_group], replica_gen, decode_s,
+               replica_gen > 0 ? replica_gen / decode_s : 0.0,
                (unsigned long long)token_hash);
         fflush(stdout);
     }
     if (!wrank) {
-        printf("qwen38-mixed PP3xTP4->3xTP4 prefill=%d/request time=%.6f aggregate=%.2f tok/s "
-               "transpose=%.6f expand=%.6f decode_aggregate=%.2f tok/s "
-               "stage=%.3fGB prefill_pack=%.3fGB released=%.3fGB expanded=%.3fGB\n",
-               ntok, prefill_s, (double)(requests * ntok) / prefill_s,
-               transpose_s, expand_s, (double)(requests * maxgen) / decode_max,
+        printf("qwen38-bf16-mixed PP3xTP4->3xTP4 prefill=%d/request "
+               "req_tok/s=%.2f/%.2f/%.2f total=%.6f aggregate=%.2f tok/s "
+               "transpose=%.6f repack=%.6f replica0=%.2f tok/s "
+               "stage=%.3fGB prefill_pack=%.3fGB released=%.3fGB repacked=%.3fGB\n",
+               ntok, ntok / prefill_req_s[0], ntok / prefill_req_s[1],
+               ntok / prefill_req_s[2], prefill_s,
+               (double)(requests * ntok) / prefill_s,
+               transpose_s, expand_s,
+               replica_gen > 0 ? replica_gen / decode_s : 0.0,
                stage_bytes / 1e9, prefill_bytes / 1e9, released / 1e9, expanded / 1e9);
         fflush(stdout);
     }
@@ -378,9 +498,5 @@ int main(int argc, char **argv) {
     tp_comm_free(&decode_utofu);
     utofu_free_vcq(decode_vcq);
     fclose(rank_log);
-    MPI_Comm_free(&decode_tp);
-    MPI_Comm_free(&pipeline);
-    MPI_Comm_free(&prefill_tp);
-    MPI_Finalize();
     return 0;
 }
