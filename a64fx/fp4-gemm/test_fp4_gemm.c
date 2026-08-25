@@ -15,7 +15,7 @@ int main(void){
     for(int b=0;b<=0x7e;++b){float x=fp4_e4m3_decode_positive((uint8_t)b);
         uint8_t q=fp4_e4m3_encode_positive(x);
         if(q!=(uint8_t)b && !(b==0x7f)){fprintf(stderr,"e4m3 %d -> %d\n",b,q);return 1;}}
-    enum{M=7,N=128,K=64}; float*w=malloc((size_t)N*K*4),*ref=malloc((size_t)M*N*4),*got=malloc((size_t)M*N*4),*got2=malloc((size_t)M*N*4);
+    enum{M=7,N=256,K=64}; float*w=malloc((size_t)N*K*4),*ref=malloc((size_t)M*N*4),*got=malloc((size_t)M*N*4),*got2=malloc((size_t)M*N*4);
     _Float16*a=malloc((size_t)M*K*2);if(!w||!ref||!got||!got2||!a)return 1;
     for(int i=0;i<N*K;++i)w[i]=rnd()*0.25f;for(int i=0;i<M*K;++i)a[i]=(_Float16)(rnd()*0.5f);
     for(int f=0;f<3;++f){fp4_matrix p;if(fp4_matrix_alloc(&p,(fp4_format)f,N,K)||fp4_quantize_f32(&p,w)||fp4_matrix_prepare_n32(&p)||fp4_matrix_prepare_u8(&p))return 1;

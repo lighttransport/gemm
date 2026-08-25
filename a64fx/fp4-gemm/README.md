@@ -104,7 +104,9 @@ sharing. Bind both CPUs and memory to one CMG when benchmarking it.
 
 `fp4_gemm_f16_n32_omp` contains the optimized decode/matvec path. For M=1 it
 processes four N32 tiles concurrently, broadcasts each activation once, and
-uses four vector FMLAs instead of indexed scalar FMLAs. Recommended CMG
+uses four vector FMLAs instead of indexed scalar FMLAs. The MXFP4 fast path is
+hand-scheduled assembly and pipelines two K steps so the second set of decode
+operations covers part of the six-cycle `ZIP1`/`TBL` latency. Recommended CMG
 dispatch is direct N32 for M<=6 and the decoded L2 panel for M>=12.
 
 `fp4_matrix_prepare_u8` plus `fp4_gemm_f16_u8tbl_omp` is an opt-in experiment

@@ -115,8 +115,10 @@ The A64FX instruction database shows `ZIP1` and `TBL` are FLA-only with
 latencies 6 and 6, while vector FMLA/FMUL and vector-vector bit operations can
 use either FL pipe. Immediate `AND` is also FLA-only. The optimized decoder
 therefore hoists one vector mask, uses vector-vector `AND`, and schedules four
-independent tiles. M=1 broadcasts each activation once and uses four one-uop
-vector FMLAs instead of four two-uop indexed FMLAs.
+independent tiles. The hand-written MXFP4 loop also pipelines two K steps: the
+second four-vector decode separates the first `TBL` group from its dependent
+`FMUL`. M=1 broadcasts each activation once and uses four one-uop vector FMLAs
+instead of four two-uop indexed FMLAs.
 
 Full 72 MiB MXFP4 streaming results on one 12-core CMG, K=256 promotion:
 
@@ -127,8 +129,10 @@ Full 72 MiB MXFP4 streaming results on one 12-core CMG, K=256 promotion:
 | 24 | Full-K L2 panel | 591 | 6.92 |
 | 128 | Full-K L2 panel | 621 | 1.37 |
 
-Pure FP16 M=1 reaches about 290 GFLOP/s and 81.4 GB/s. An eight-tile variant
-was rejected because register spills reduced it to 131 GFLOP/s. At an assumed
+Pure FP16 M=1 reaches 293 GFLOP/s and 82.3 GB/s. A hand-written eight-tile
+variant was rejected at 95 GFLOP/s; widening concentrates still more
+`ZIP1`/`TBL` work on FLA and requires callee-save vector state. (The earlier
+compiler-generated eight-tile attempt reached 131 GFLOP/s.) At an assumed
 230 GB/s CMG HBM rate, the MXFP4 plus prepared-scale bandwidth roof is about
 818 GFLOP/s. The current M=1 kernel reaches 34% of that roof; FLA-only nibble
 interleave/table lookup remains the principal execution limit.

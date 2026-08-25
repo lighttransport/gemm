@@ -386,6 +386,7 @@ static inline void gemm_n32_m1_t4_segment(float*c,const _Float16*a,
         0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6};
     svbool_t ph=svptrue_b16(),ps=svptrue_b32(),p16=svwhilelt_b16(0,16);
     svfloat16_t tab=svld1_f16(ph,table_data),h0=svdup_f16(0),h1=h0,h2=h0,h3=h0;
+    svuint16_t nibble_mask=svdup_u16(15);
     int bs=w->format==FP4_MX?32:16,nb=w->k/bs;
     const uint8_t*q0=w->codes_n32+(size_t)(tile+0)*w->k*16;
     const uint8_t*q1=w->codes_n32+(size_t)(tile+1)*w->k*16;
@@ -401,7 +402,7 @@ static inline void gemm_n32_m1_t4_segment(float*c,const _Float16*a,
       svfloat16_t sc3=svld1_f16(ph,(const __fp16*)(s3+(size_t)b*32));
       for(int k=b*bs;k<(b+1)*bs;++k){svfloat16_t x=svdup_f16((__fp16)a[k]);
 #define DECODE_T4(Q,SC,H) do{const uint8_t*q=(Q)+(size_t)k*16; \
-        svuint16_t z=svld1ub_u16(p16,q),lo=svand_n_u16_x(p16,z,15); \
+        svuint16_t z=svld1ub_u16(p16,q),lo=svand_u16_x(p16,z,nibble_mask); \
         svuint16_t hi=svlsr_n_u16_x(p16,z,4),idx=svzip1_u16(lo,hi); \
         svfloat16_t v=svmul_f16_x(ph,svtbl_f16(tab,idx),(SC)); \
         (H)=svmla_f16_x(ph,(H),v,x);}while(0)
@@ -456,6 +457,28 @@ static inline void gemm_u8tbl_m1_t4_segment(float*c,const _Float16*a,
     STORE_U8(0,h0);STORE_U8(1,h1);STORE_U8(2,h2);STORE_U8(3,h3);
 #undef STORE_U8
 }
+
+typedef struct {
+    const uint8_t*q[4];const _Float16*s[4];const _Float16*a;_Float16*out;
+    int k_count,bs;
+} fp4_m1_t4_args;
+extern void fp4_mx_m1_t4_asm(const fp4_m1_t4_args*);
+
+static inline void gemm_mx_m1_t4_asm_segment(float*c,const _Float16*a,
+        const fp4_matrix*w,int tile,int kbegin,int kend,int add){
+    _Float16 tmp[4*32] __attribute__((aligned(256)));
+    int nb=w->k/32;fp4_m1_t4_args x;
+    for(int i=0;i<4;++i){x.q[i]=w->codes_n32+(size_t)(tile+i)*w->k*16+(size_t)kbegin*16;
+        x.s[i]=w->scales_n32+(size_t)(tile+i)*nb*32+(size_t)(kbegin/32)*32;}
+    x.a=a+kbegin;x.out=tmp;x.k_count=kend-kbegin;x.bs=32;
+    fp4_mx_m1_t4_asm(&x);
+    svbool_t ph=svptrue_b16(),ps=svptrue_b32();
+    for(int i=0;i<4;++i){svuint16_t hb=svreinterpret_u16_f16(svld1_f16(ph,(const __fp16*)(tmp+i*32)));
+      svfloat32_t lo=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpklo_u32(hb)));
+      svfloat32_t hi=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpkhi_u32(hb)));
+      float*d=c+(tile+i)*32;if(add){lo=svadd_f32_x(ps,lo,svld1_f32(ps,d));
+        hi=svadd_f32_x(ps,hi,svld1_f32(ps,d+16));}svst1_f32(ps,d,lo);svst1_f32(ps,d+16,hi);}
+}
 #endif
 
 int fp4_gemm_f16_n32_omp(float*c,const _Float16*a,const fp4_matrix*w,int m,
@@ -468,7 +491,8 @@ int fp4_gemm_f16_n32_omp(float*c,const _Float16*a,const fp4_matrix*w,int m,
 #pragma omp parallel for num_threads(threads) schedule(static)
       for(int t=0;t<w->n/32;t+=4)for(int kb=0;kb<w->k;kb+=span){
         int ke=kb+span<w->k?kb+span:w->k;
-        gemm_n32_m1_t4_segment(c,a,w,t,kb,ke,kb!=0);
+        if(w->format==FP4_MX)gemm_mx_m1_t4_asm_segment(c,a,w,t,kb,ke,kb!=0);
+        else gemm_n32_m1_t4_segment(c,a,w,t,kb,ke,kb!=0);
       }
       return 0;
     }
