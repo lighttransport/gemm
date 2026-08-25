@@ -50,6 +50,15 @@ class AnthropicApiTest(unittest.TestCase):
             "message": {}, "finish_reason": "stop"}]} )["delta"]["stop_reason"],
                          "end_turn")
 
+    def test_metadata_cache_fields_are_forwarded(self):
+        got = anthropic_api.request({
+            "metadata": {"prompt_cache_key": "claude-prefix",
+                          "cache_load": "/shared/cache"},
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4})
+        self.assertEqual(got["prompt_cache_key"], "claude-prefix")
+        self.assertEqual(got["cache_load"], "/shared/cache")
+
 
 if __name__ == "__main__":
     unittest.main()

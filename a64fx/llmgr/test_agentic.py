@@ -56,6 +56,24 @@ class ContextRegistryTest(unittest.TestCase):
         one.join(2); two.join(2)
         self.assertEqual(order, ["first", "second"])
 
+    def test_system_prompt_identity_is_stable_without_exposing_prompt(self):
+        one = agentic.system_prompt_identity(
+            "k3", "k3-tokenizer", "k3-v2", "tp96", "bf16", "keep edits local")
+        two = agentic.system_prompt_identity(
+            "k3", "k3-tokenizer", "k3-v2", "tp96", "bf16", "keep edits local")
+        other = agentic.system_prompt_identity(
+            "k3", "k3-tokenizer", "k3-v2", "tp96", "bf16", "different")
+        self.assertEqual(one, two)
+        self.assertNotEqual(one, other)
+        self.assertNotIn("keep edits local", one)
+
+    def test_context_rejects_system_prompt_change(self):
+        context = agentic.ContextState("ctx", "k3")
+        context.bind_system_prompt("sys-a")
+        context.bind_system_prompt("sys-a")
+        with self.assertRaises(agentic.ContextError):
+            context.bind_system_prompt("sys-b")
+
 
 class ManagedCacheTest(unittest.TestCase):
     def test_publish_and_validate_complete_shard_set(self):

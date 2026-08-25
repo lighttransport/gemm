@@ -61,6 +61,7 @@ import models                    # noqa: E402
 import laguna_openai             # noqa: E402
 import agentic                   # noqa: E402
 import anthropic_api             # noqa: E402
+import long_context              # noqa: E402
 
 try:
     from http.server import ThreadingHTTPServer
@@ -73,6 +74,8 @@ DEFAULT_PORT = 21274          # bash-over-http owns 21264; stay clear of it
 LOG_DIR = os.path.join(HERE, "logs")
 STATE_DIR = os.path.join(HERE, "state")
 PROF_DIR = os.path.join(HERE, "prof")
+os.environ.setdefault("LLMGR_LONG_CONTEXT_ROOT",
+                      os.path.join(STATE_DIR, "long-context"))
 
 # After every rank reports "loaded", wait this long before admitting traffic.
 # Cheap insurance: the readiness signal is a log line, not a handshake.
@@ -682,33 +685,76 @@ def _cache_set_stats(path, expected=None, shard_prefix=None):
 
 
 def _apply_prompt_cache(body, adapter):
-    """Map the OpenAI prompt-cache key to a private, shared K3 cache set.
+    """Map a prompt/system/context cache request to a private K3 cache set.
 
     Explicit runner paths are deliberately left untouched.  The key is
     hashed and scoped by layout-affecting runner settings so arbitrary client
     strings never become filesystem paths and incompatible K3 layouts do not
-    share a cache directory.
+    share a cache directory.  ``system_prompt`` is hashed and never written to
+    the path; ``cache_scope=context`` additionally binds the cache to the
+    llmgr context, which is the safe choice for a coding-agent continuation.
     """
     key = body.get("prompt_cache_key")
+    system_prompt = body.get("system_prompt")
+    system_key = body.get("system_prompt_cache_key")
     if key is None or adapter.name != "k3":
-        return body
+        if adapter.name != "k3" or (system_prompt is None and system_key is None):
+            return body
+        key = system_key or "system-prompt"
     if not isinstance(key, str) or not key or len(key) > 512 or "\0" in key:
-        raise ValueError("prompt_cache_key must be a non-empty string of at most 512 characters")
+        raise ValueError("prompt cache key must be a non-empty string of at most 512 characters")
+    if system_prompt is not None:
+        if not isinstance(system_prompt, str) or not system_prompt:
+            raise ValueError("system_prompt must be a non-empty string")
+        if len(system_prompt) > 1024 * 1024:
+            raise ValueError("system_prompt is too large (maximum is 1 MiB)")
+        prompt_identity = agentic.system_prompt_identity(
+            body.get("model", "k3"), body.get("tokenizer", "k3"),
+            body.get("runner_abi", "k3-v2"),
+            body.get("layout", body.get("variant", "default")),
+            body.get("dtype", body.get("mla_cache", "bf16")), system_prompt)
+    elif system_key is not None:
+        if not isinstance(system_key, str) or not system_key or len(system_key) > 512:
+            raise ValueError("system_prompt_cache_key must be a non-empty string of at most 512 characters")
+        prompt_identity = agentic.system_prompt_identity(
+            body.get("model", "k3"), body.get("tokenizer", "k3"),
+            body.get("runner_abi", "k3-v2"),
+            body.get("layout", body.get("variant", "default")),
+            body.get("dtype", body.get("mla_cache", "bf16")),
+            "cache-key:" + system_key)
+    else:
+        prompt_identity = None
+    scope_name = body.get("cache_scope", "system" if prompt_identity else "request")
+    if scope_name not in ("system", "context", "request"):
+        raise ValueError("cache_scope must be system, context, or request")
+    if scope_name == "context" and not body.get("context_id"):
+        raise ValueError("cache_scope=context requires context_id")
     if body.get("cache_load") is not None or body.get("cache_save") is not None:
-        return body
+        if not prompt_identity:
+            return body
+        out = dict(body)
+        out["system_prompt_identity"] = prompt_identity
+        out["cache_scope"] = scope_name
+        return out
     fields = [
         body.get("model", "k3"), body.get("variant", "default"),
         body.get("np", adapter.default_np()), body.get("tp_np", "auto"),
         body.get("layer", 1), body.get("layers", 1),
         body.get("threads", 48), body.get("kda_threads", 8),
         body.get("mla_cache", body.get("mla_cache_dtype", "bf16")),
+        prompt_identity,
+        body.get("context_id") if scope_name == "context" else None,
     ]
     scope = "\x1f".join(str(x) for x in fields)
     digest = hashlib.sha256((scope + "\x1e" + key).encode("utf-8")).hexdigest()
-    path = os.path.join(STATE_DIR, "openai-cache", "k3-" + digest)
+    path = os.path.join(STATE_DIR, "k3-cache", "k3-" + digest)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     out = dict(body)
     out["cache_save"] = path
+    out["cache_identity"] = "k3-" + digest
+    out["cache_scope"] = scope_name
+    if prompt_identity:
+        out["system_prompt_identity"] = prompt_identity
     try:
         expected = int(body.get("np", adapter.default_np()))
     except (TypeError, ValueError):
@@ -888,6 +934,10 @@ class Handler(bhs.Handler):
             if path == "/contexts":
                 return self._send_json({"object": "list",
                                         "data": _contexts.info()})
+            long_result = long_context.handle_get(path)
+            if long_result is not None:
+                status, result = long_result
+                return self._send_json(result, status=status)
             if path.startswith("/contexts/") and path.endswith("/checkpoints"):
                 context_id = path.split("/")[2]
                 context = _contexts.get(context_id)
@@ -924,6 +974,8 @@ class Handler(bhs.Handler):
             pass
         except models.ConfigError as e:
             self._err(str(e))
+        except long_context.LongContextError as e:
+            self._err(str(e), status=400)
         except Exception as e:                    # noqa: BLE001 -- stay up
             try:
                 self._err(str(e), status=500)
@@ -1079,6 +1131,10 @@ class Handler(bhs.Handler):
             if path == "/v1/contexts" or path.startswith("/v1/contexts/"):
                 path = path[3:]
             body = self._body if isinstance(self._body, dict) else {}
+            long_result = long_context.handle_post(path, body)
+            if long_result is not None:
+                status, result = long_result
+                return self._send_json(result, status=status)
             if path == "/build":
                 return self._post_simple(body, "build")
             if path == "/stage":
@@ -1116,6 +1172,8 @@ class Handler(bhs.Handler):
             pass
         except models.ConfigError as e:
             self._err(str(e))
+        except long_context.LongContextError as e:
+            self._err(str(e), status=400)
         except NotImplementedError as e:
             self._err(str(e))
         except Exception as e:                    # noqa: BLE001 -- stay up
@@ -1161,6 +1219,15 @@ class Handler(bhs.Handler):
         if mode == "serve" and not adapter.supports_serve:
             return self._err("%s has no serve mode -- use mode=generate "
                              "(one-shot) and read the log" % adapter.name)
+        body = dict(body)
+        context = None
+        if adapter.name == "k3":
+            context_id = body.get("context_id")
+            if context_id:
+                context = _contexts.get_or_create(context_id, model=adapter.name)
+            body = _apply_prompt_cache(body, adapter)
+            if context is not None and body.get("system_prompt_identity"):
+                context.bind_system_prompt(body["system_prompt_identity"])
         if mode == "serve":
             with _children_lock:
                 active = [x for x in _children.values()
@@ -1181,14 +1248,20 @@ class Handler(bhs.Handler):
                            port=port, meta={"model": adapter.name,
                                             "adapter": adapter,
                                             "runner_bin": _runner_bin(adapter, body),
-                                            "config": body})
+                                            "config": body,
+                                            "context_id": context.context_id
+                                            if context else None})
         else:
             argv, env, cwd = adapter.launch("generate", body)
             c = _new_child("oneshot", "generate:%s" % adapter.name,
                            argv, env, cwd,
                            meta={"model": adapter.name, "config": body,
                                  "runner_bin": _runner_bin(adapter, body),
-                                 "result_path": adapter.result_path(body)})
+                                 "result_path": adapter.result_path(body),
+                                 "context_id": context.context_id
+                                 if context else None,
+                                 "cache_identity": body.get("cache_identity"),
+                                 "cache_scope": body.get("cache_scope")})
         self._send_json({"id": c.id, "state": c.state, "port": c.port,
                          "log": c.log_path, "argv": argv}, status=202)
 
@@ -1263,8 +1336,20 @@ class Handler(bhs.Handler):
 
     def _anthropic_context_id(self, body):
         metadata = body.get("metadata") or {}
-        return (body.get("context_id") or metadata.get("context_id") or
-                metadata.get("llmgr_context_id"))
+        explicit = (body.get("context_id") or metadata.get("context_id") or
+                    metadata.get("llmgr_context_id"))
+        if explicit:
+            return explicit
+        for message in body.get("messages") or []:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    owner = _contexts.find_tool_call(block.get("tool_use_id"))
+                    if owner is not None:
+                        return owner.context_id
+        return None
 
     def _accept_anthropic_tool_continuation(self, context, body):
         results = []

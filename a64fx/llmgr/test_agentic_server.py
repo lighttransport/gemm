@@ -91,6 +91,28 @@ class AgenticServerTest(unittest.TestCase):
         self.assertEqual(out["body"]["cache_load"], context.checkpoint["path"])
         server._contexts.delete("checkpoint-test")
 
+    def test_k3_system_prompt_cache_is_hashed_and_context_scoped(self):
+        body = {
+            "model": "k3", "np": 12, "layer": 1, "layers": 1,
+            "threads": 48, "context_id": "agent-1",
+            "system_prompt": "You are a careful coding agent.",
+            "cache_scope": "context",
+        }
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(server, "STATE_DIR", root):
+            got = server._apply_prompt_cache(body, server.models.get("k3"))
+        self.assertTrue(got["cache_save"].startswith(os.path.join(root, "k3-cache")))
+        self.assertEqual(got["cache_scope"], "context")
+        self.assertTrue(got["system_prompt_identity"].startswith("sys-"))
+        self.assertNotIn("careful coding", got["cache_save"])
+        self.assertNotIn("careful coding", got["system_prompt_identity"])
+
+    def test_k3_context_cache_requires_context_id(self):
+        with self.assertRaises(ValueError):
+            server._apply_prompt_cache(
+                {"model": "k3", "system_prompt_cache_key": "codex",
+                 "cache_scope": "context"}, server.models.get("k3"))
+
     def test_stream_batch_tags_interleaved_context_events(self):
         h, _out = self._handler()
         h.send_response = lambda status: None
@@ -177,6 +199,16 @@ class AgenticServerTest(unittest.TestCase):
                 "messages": [{"role": "user", "content": "hello"}]})
         self.assertEqual(out["status"], 200)
         self.assertEqual(out["body"], {"input_tokens": 3})
+
+    def test_anthropic_tool_result_finds_owner_without_metadata_context(self):
+        context = server._contexts.get_or_create("auto-claude", "laguna")
+        context.record_response("msg-tool", [{"id": "tool-auto"}])
+        owner = server.Handler._anthropic_context_id(
+            object.__new__(server.Handler), {
+                "messages": [{"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tool-auto"}]}]})
+        self.assertEqual(owner, "auto-claude")
+        server._contexts.delete("auto-claude")
 
 
 if __name__ == "__main__":

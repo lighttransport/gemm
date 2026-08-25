@@ -47,6 +47,30 @@ def cache_identity(model, tokenizer, runner_abi, layout, dtype, cache_key,
     return "pfx-" + digest
 
 
+def system_prompt_identity(model, tokenizer, runner_abi, layout, dtype,
+                           system_prompt):
+    """Return a stable, non-secret identity for a system prompt.
+
+    The prompt text is intentionally hashed rather than persisted in a path or
+    manifest.  This lets a coding agent reuse a prompt cache while keeping
+    instructions, repository hints, and credentials out of llmgr metadata.
+    """
+    if not isinstance(system_prompt, str) or not system_prompt:
+        raise ContextError("system_prompt must be a non-empty string")
+    if len(system_prompt) > 1024 * 1024:
+        raise ContextError("system_prompt is too large (maximum is 1 MiB)")
+    payload = {
+        "model": model,
+        "tokenizer": tokenizer,
+        "runner_abi": runner_abi,
+        "layout": layout,
+        "dtype": dtype,
+        "system_prompt": system_prompt,
+    }
+    digest = hashlib.sha256(_json_bytes(payload)).hexdigest()
+    return "sys-" + digest
+
+
 class ManagedCacheStore(object):
     """Atomic, manifest-first storage for complete distributed cache sets."""
 
@@ -156,6 +180,17 @@ class ContextState(object):
         self.pending_tools = {}
         self.checkpoint = None
         self.prefix_identity = None
+        self.system_prompt_identity = None
+
+    def bind_system_prompt(self, identity):
+        """Bind one immutable system prompt identity to this conversation."""
+        if not isinstance(identity, str) or not _SAFE_NAME.match(identity):
+            raise ContextError("invalid system prompt identity")
+        if (self.system_prompt_identity is not None and
+                self.system_prompt_identity != identity):
+            raise ContextError("context system prompt cannot change")
+        self.system_prompt_identity = identity
+        self.updated = time.time()
 
     def reserve(self):
         return self.lock
@@ -217,6 +252,13 @@ class ContextRegistry(object):
                     return context
         return None
 
+    def find_tool_call(self, call_id):
+        with self._lock:
+            for context in self._contexts.values():
+                if call_id in context.pending_tools:
+                    return context
+        return None
+
     def delete(self, context_id):
         with self._lock:
             return self._contexts.pop(context_id, None) is not None
@@ -227,7 +269,8 @@ class ContextRegistry(object):
                      "created": c.created, "updated": c.updated,
                      "last_response_id": c.last_response_id,
                      "pending_tools": len(c.pending_tools),
-                     "checkpoint": c.checkpoint}
+                     "checkpoint": c.checkpoint,
+                     "system_prompt_identity": c.system_prompt_identity}
                     for c in self._contexts.values()]
 
 

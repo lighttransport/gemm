@@ -49,8 +49,34 @@ MONITOR_INTERVAL=${MONITOR_INTERVAL:-15}
 HEALTH_EVERY=${HEALTH_EVERY:-8}
 KEEPALIVE_SECONDS=${KEEPALIVE_SECONDS:-0}   # >0: self-exit after this long
 
+# MPI is used once, during allocation bootstrap, only to discover the Tofu
+# coordinates.  The resident service below is plain Python and never launches
+# MPI for bash-over-HTTP requests.  Keeping this file in the job working tree
+# lets subsequent K3 commands reuse it without nested mpiexec.
+TOPOLOGY_FILE=${TOPOLOGY_FILE:-$REPO/tofu_topo.txt}
+TOPO_HELPER=${TOPO_HELPER:-$REPO/a64fx/utofu-tests/tofu_topo_helper}
+TOPOLOGY_NODES=${TOPOLOGY_NODES:-${PJM_MPI_PROC:-${PJM_NODE:-12}}}
+
 mkdir -p "$LOGDIR"
 cd "$REPO" || { echo "ERROR cannot cd to REPO=$REPO"; exit 1; }
+
+if [[ ! -s "$TOPOLOGY_FILE" || "${REFRESH_TOPOLOGY:-1}" == 1 ]]; then
+    if [[ ! -x "$TOPO_HELPER" ]]; then
+        echo "ERROR topology helper is missing or not executable: $TOPO_HELPER" >&2
+        exit 1
+    fi
+    TOPOLOGY_LOG="$LOGDIR/topology.${PJM_JOBID:-nojob}.log"
+    echo "$(date -u +%FT%TZ) discovering Tofu topology with one MPI bootstrap" \
+        "($TOPOLOGY_NODES ranks)"
+    mpiexec -np "$TOPOLOGY_NODES" -of-proc "$LOGDIR/topology.rank" \
+        "$TOPO_HELPER" >"$TOPOLOGY_LOG" 2>&1
+    [[ -s "$TOPOLOGY_FILE" ]] || {
+        echo "ERROR topology helper did not produce $TOPOLOGY_FILE" >&2
+        tail -40 "$TOPOLOGY_LOG" >&2 || true
+        exit 1
+    }
+    echo "$(date -u +%FT%TZ) topology ready: $TOPOLOGY_FILE"
+fi
 
 SERVER_LOG="$LOGDIR/llmgr.${PJM_JOBID:-nojob}.log"
 TUNNEL_LOG="$LOGDIR/tunnel.${PJM_JOBID:-nojob}.log"

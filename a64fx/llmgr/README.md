@@ -110,7 +110,7 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 | GET | `/profile/<id>/artifacts` | the fapp CSV/text reports a profile produced |
 | POST | `/build` | `{model, variant, clean}` |
 | POST | `/stage` | `{model, variant, stage_dir, model_dir, np}` |
-| POST | `/runner/start` | `{model, mode:serve\|generate, port, maxpos, layers, np, tp_np, extra:[…], env:{…}, cache_load, cache_save}` |
+| POST | `/runner/start` | `{model, mode:serve\|generate, port, maxpos, layers, np, tp_np, extra:[…], env:{…}, cache_load, cache_save, context_id, system_prompt, system_prompt_cache_key, cache_scope}` |
 | POST | `/runner/stop` | `{id, grace}` |
 | POST | `/generate` | `{ids:[…], max_new, sample, temp, top_k, top_p, seed}` — queued native API |
 | POST | `/v1/chat/completions`, `/chat/completions` | OpenAI chat; supports SSE, reasoning, function tools, and runner-specific `cache_load`/`cache_save` extensions |
@@ -132,6 +132,14 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 | `laguna` | `int4` (default), `bf16`, `fp8` | yes | no | `a64fx/laguna-s21/run_laguna_s21_12n.sh` |
 | `gemma4` | `tp` (default), `pp` | no — one-shot only | no | `a64fx/gemma4-mn/run_gemma4_tp.sh` / `run_gemma4_pp.sh` |
 | `k3` | `partial` | no — one-shot only | yes | `a64fx/k3/run_k3_ep.sh` |
+
+For K3 coding-agent runs, `system_prompt` is hashed into a non-secret cache
+identity. Use `cache_scope=system` to share it across contexts, or
+`cache_scope=context` with `context_id` to bind the distributed cache to one
+conversation. A context rejects attempts to change its bound system prompt.
+Explicit `cache_load`/`cache_save` paths still take precedence. This is a
+runner-state cache contract; K3's partial runner remains a measured latent
+kernel path rather than a text-serving endpoint.
 
 Exactly one serving child per model may be starting or ready. All semantic and native
 requests share one bounded FIFO (capacity 8 by default, configurable with

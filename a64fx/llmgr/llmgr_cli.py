@@ -187,6 +187,11 @@ def main(argv=None):
     r.add_argument("--min-available-mib", type=int)
     r.add_argument("--cache-load", help="K3: pass --cache-load PATH to the runner")
     r.add_argument("--cache-save", help="K3: pass --cache-save PATH to the runner")
+    r.add_argument("--context-id", help="bind a runner cache to a coding-agent context")
+    r.add_argument("--system-prompt", help="K3 system prompt (hashed for cache identity)")
+    r.add_argument("--system-prompt-cache-key", help="stable K3 system prompt cache key")
+    r.add_argument("--cache-scope", choices=("system", "context", "request"),
+                   help="K3 cache sharing scope (default: system)")
     r.add_argument("--prompt")
     r.add_argument("--ids", help="path to an ids file (generate mode)")
     r.add_argument("--prompt-ids", help="path to a prompt ids file (Gemma4)")
@@ -232,6 +237,10 @@ def main(argv=None):
     ch.add_argument("--seed", type=int)
     ch.add_argument("--cache-load", help="OpenAI request cache-load path hint")
     ch.add_argument("--cache-save", help="OpenAI request cache-save path hint")
+    ch.add_argument("--context-id", help="reuse one coding-agent conversation context")
+    ch.add_argument("--system-prompt-cache-key", help="stable system prompt cache key")
+    ch.add_argument("--cache-scope", choices=("system", "context", "request"),
+                    help="K3 cache sharing scope (default: system)")
     ch.add_argument("--no-think", action="store_true")
     ch.add_argument("--stream", action="store_true")
 
@@ -312,6 +321,8 @@ def main(argv=None):
                              "comm_poll_spins", "layers",
                              "np", "tp_np", "max_new", "tokens", "layer", "experts",
                              "cache_load", "cache_save",
+                             "context_id", "system_prompt", "system_prompt_cache_key",
+                             "cache_scope",
                              "stage_dir", "model_dir", "result_dir",
                              "heartbeat_tokens", "min_available_mib",
                              "prompt", "ids", "prompt_ids",
@@ -341,7 +352,8 @@ def main(argv=None):
                 "temperature": args.temperature,
                 "enable_thinking": not args.no_think,
                 "stream": args.stream}
-        body.update(opt("top_k", "top_p", "min_p", "seed", "cache_load", "cache_save"))
+        body.update(opt("top_k", "top_p", "min_p", "seed", "cache_load", "cache_save",
+                        "context_id", "system_prompt_cache_key", "cache_scope"))
         if args.stream:
             call(args, "POST", "/v1/chat/completions", body,
                  stream=True, timeout=None)

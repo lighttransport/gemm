@@ -82,6 +82,28 @@ class LlmgCliTest(unittest.TestCase):
         self.assertEqual(body["model"], "k3")
         self.assertNotIn("tp_np", body)
 
+    def test_start_forwards_context_and_system_cache_contract(self):
+        calls = []
+
+        def fake_call(args, method, path, body=None, stream=False, timeout=None):
+            calls.append((method, path, body))
+            return {"id": "run-1"}
+
+        with mock.patch.object(cli, "call", side_effect=fake_call):
+            rc = cli.main([
+                "start", "--model", "k3", "--context-id", "agent-1",
+                "--system-prompt", "You are a coding agent.",
+                "--system-prompt-cache-key", "repo-main",
+                "--cache-scope", "context", "--np", "12", "--layer", "1",
+                "--tokens", "8", "--result-dir", "/shared/k3-run",
+            ])
+        self.assertEqual(rc, 0)
+        body = calls[0][2]
+        self.assertEqual(body["context_id"], "agent-1")
+        self.assertEqual(body["system_prompt"], "You are a coding agent.")
+        self.assertEqual(body["system_prompt_cache_key"], "repo-main")
+        self.assertEqual(body["cache_scope"], "context")
+
     def test_start_forwards_context_parallel_hint_to_runner(self):
         calls = []
 

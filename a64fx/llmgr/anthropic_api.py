@@ -76,13 +76,17 @@ def request(body):
     out = {"model": "laguna-s21", "messages": messages,
            "max_tokens": int(body.get("max_tokens", 256)),
            "stream": bool(body.get("stream"))}
+    metadata = body.get("metadata") or {}
     for source, target in (("temperature", "temperature"),
                            ("top_p", "top_p"), ("stop_sequences", "stop"),
                            ("prompt_cache_key", "prompt_cache_key"),
                            ("cache_load", "cache_load"),
                            ("cache_save", "cache_save")):
-        if body.get(source) is not None:
-            out[target] = body[source]
+        value = body.get(source)
+        if value is None:
+            value = metadata.get(source)
+        if value is not None:
+            out[target] = value
     tools = body.get("tools") or []
     if tools:
         out["tools"] = [{"type": "function", "function": {
