@@ -6511,6 +6511,42 @@ static void tf_ssm_conv_batch(transformer_model *m,int layer_idx,float*qkv_rows,
     float*w=m->conv_w_trans_layers?m->conv_w_trans_layers[layer_idx]:m->conv_w_trans;
     if(!w||nh<=0)return;
     int nt=m->n_threads>1?m->n_threads:1;
+#if defined(__ARM_FEATURE_SVE)
+    /* Qwen uses kernel size four. Walk a vector of adjacent channels through
+     * time so every long-stride token-row access consumes a full cache line;
+     * the scalar channel loop below consumed only one float from each line. */
+    if(nh==3&&!tf_batch_ssm_snapshots){
+        int vl=(int)svcntw();
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(nt) schedule(static)
+        #endif
+        for(int j=0;j<qd;j+=vl){
+            svbool_t pg=svwhilelt_b32((uint64_t)j,(uint64_t)qd);
+            svfloat32_t h0=svld1(pg,st+(size_t)((wr+0)%3)*qd+j);
+            svfloat32_t h1=svld1(pg,st+(size_t)((wr+1)%3)*qd+j);
+            svfloat32_t h2=svld1(pg,st+(size_t)((wr+2)%3)*qd+j);
+            svfloat32_t w0=svld1(pg,w+(size_t)0*qd+j);
+            svfloat32_t w1=svld1(pg,w+(size_t)1*qd+j);
+            svfloat32_t w2=svld1(pg,w+(size_t)2*qd+j);
+            svfloat32_t w3=svld1(pg,w+(size_t)3*qd+j);
+            for(int t=0;t<N;t++){
+                float*xp=qkv_rows+(size_t)t*stride+j;
+                svfloat32_t x=svld1(pg,xp);
+                svfloat32_t s=svmul_f32_x(pg,w0,h0);
+                s=svmla_f32_x(pg,s,w1,h1);
+                s=svmla_f32_x(pg,s,w2,h2);
+                s=svmla_f32_x(pg,s,w3,x);
+                svst1(pg,xp,s);h0=h1;h1=h2;h2=x;
+            }
+            int nwr=(wr+N)%3;
+            svst1(pg,st+(size_t)((nwr+0)%3)*qd+j,h0);
+            svst1(pg,st+(size_t)((nwr+1)%3)*qd+j,h1);
+            svst1(pg,st+(size_t)((nwr+2)%3)*qd+j,h2);
+        }
+        m->conv_state_pos[layer_idx]=(wr+N)%nh;
+    }else
+#endif
+    {
     #ifdef _OPENMP
     #pragma omp parallel for num_threads(nt) schedule(static)
     #endif
@@ -6537,6 +6573,7 @@ static void tf_ssm_conv_batch(transformer_model *m,int layer_idx,float*qkv_rows,
         for(int f=0;f<nh;f++)st[((nwr+f)%nh)*(size_t)qd+j]=hist[f];
     }
     m->conv_state_pos[layer_idx]=(wr+N)%nh;
+    }
     #if defined(__ARM_FEATURE_SVE)
     size_t total=(size_t)N*stride;
     #ifdef _OPENMP

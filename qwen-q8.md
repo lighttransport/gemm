@@ -2194,3 +2194,13 @@ preparation, and precomputed decay by default for `bf16-act`; exact BF16 retains
 the conservative paths.  Query-blocked attention (404.93 tok/s), chunk280
 (452.52), chunk256 (456.12), and MPI nonblocking pipeline sends (no asynchronous
 progress, 413.47) were measured and rejected.
+
+The remaining preparation bottleneck was the batched depthwise convolution.
+Its scalar channel-parallel schedule walked token-major rows at a roughly
+10K-float stride and used only one float from each fetched cache line.  The
+Qwen kernel-size-4 path now advances an SVE vector of adjacent channels through
+time, retaining its three history vectors in registers and preserving the
+circular-state update exactly.  SSM preparation falls from about **0.52 s to
+0.097 s**.  Combined with the barrier-free scan, the accepted 12-node BF16 run
+reaches **500.93 tok/s** (4096/chunk252, 8.1769 s, `next=62842`); the short gate
+remains `next=1293`.
