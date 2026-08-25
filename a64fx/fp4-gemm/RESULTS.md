@@ -263,6 +263,15 @@ expert zero from its native MXFP4 values produced relative weight errors of
 W1/W2/W3. These format-conversion errors are separate from the accumulation
 errors in the performance tables.
 
+## FP4 to INT8 SDOT
+
+The exact E2M1-times-two re-encoding and K4 activation quantizer sustain
+409.1 GFLOP/s (217.3 GB/s) on the 128 MiB expanded stream. Scalar INT32 and
+assembly results agree within 4.7e-8 relative L2. Across layer-0 expert-zero
+W1/W2/W3, worst relative L2 is 3.94e-3 and minimum cosine similarity is
+0.999992. Larger activation groups trade accuracy for a modest peak of
+419.8 GFLOP/s at K32.
+
 ## Conclusion
 
 Promoting every 256 K values is the useful balanced mode on these workloads:

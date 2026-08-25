@@ -128,4 +128,31 @@ workspace is 256 KiB, so it resides in L2 rather than the 64 KiB L1. Use direct
 N32 FP4 for M<12 and the L2 panel path for M>=12. GEMM timing includes panel
 dequantization and its L2 write/read traffic.
 
+## INT8 SDOT re-encoding
+
+`fp4_matrix_prepare_sdot` maps E2M1 exactly to signed integers by multiplying
+the value by two (`0, +/-1, +/-2, +/-3, +/-4, +/-6, +/-8, +/-12`) and packs four
+adjacent K values per SVE lane. `fp4_gemv_i8_sdot_omp` uses INT8 activations,
+INT32 SDOT accumulation, and converts/rescales to FP32 only at the activation
+group boundary. Per-output MXFP4/NVFP4 scales remain FP16 and are unpacked
+after each integer dot group. The representation uses one byte per weight,
+the same capacity as the byte-expanded table path, and introduces no weight
+requantization error.
+
+For a 128 MiB expanded MXFP4 stream on one 12-core CMG:
+
+| Activation K group | GFLOP/s | Source GB/s | DeepSeek expert worst rel-L2 |
+|---:|---:|---:|---:|
+| 32 | 419.8 | 223.0 | 1.122% |
+| 16 | 417.5 | 221.8 | 0.799% |
+| 8 | 416.8 | 221.4 | 0.570% |
+| 4 | **409.1** | **217.3** | **0.394%** |
+
+K4 is the accuracy-qualified default because it remains above 400 GFLOP/s and
+passes the 0.5% gate over W1/W2/W3 from DeepSeek layer 0, with minimum cosine
+similarity 0.999992. Set the fifth `bench_fp4_stream` argument to select another
+group; `FP4_SDOT_ONLY=1` skips unrelated kernels. `bench_fp4_sdot_error`
+validates the three native expert projections directly from the staged raw
+file without loading the full 3.3 GiB subset.
+
 See [RESULTS.md](RESULTS.md) for measured A64FX results.

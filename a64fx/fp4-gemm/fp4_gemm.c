@@ -18,6 +18,10 @@ static const float e2m1_values[16] = {
    -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f,
 };
 
+typedef struct {const int8_t*q,*a;const _Float16*ws;const float*as;float*out;
+    int k,weight_group,act_group;} fp4_sdot_args;
+extern void fp4_i8_sdot_m1_asm(const fp4_sdot_args*);
+
 /* Scalar AArch64 producer LUT: packed FP4 byte -> two FP16 bit patterns. */
 uint32_t fp4_pair_lut[256] __attribute__((aligned(1024)));
 static int fp4_pair_lut_ready;
@@ -108,6 +112,7 @@ int fp4_matrix_alloc(fp4_matrix *p, fp4_format f, int n, int k) {
 void fp4_matrix_free(fp4_matrix *p) {
     if (!p) return;
     free(p->codes); free(p->scales); free(p->codes_n32); free(p->codes_u8);
+    free(p->codes_sdot);free(p->scales_sdot);
     free(p->codes_bitplane);
     free(p->scales_n32); memset(p, 0, sizeof(*p));
 }
@@ -177,8 +182,10 @@ static float row_scale(const fp4_matrix *p,int r,int c){
 int fp4_matrix_prepare_n32(fp4_matrix *p){
     if(!p||!p->codes||!p->scales||p->n%32||p->k%32)return -1;
     prepare_pair_lut();
-    free(p->codes_n32);free(p->codes_u8);free(p->codes_bitplane);free(p->scales_n32);
-    p->codes_n32=NULL;p->codes_u8=NULL;p->codes_bitplane=NULL;p->scales_n32=NULL;
+    free(p->codes_n32);free(p->codes_u8);free(p->codes_sdot);free(p->codes_bitplane);
+    free(p->scales_n32);free(p->scales_sdot);
+    p->codes_n32=NULL;p->codes_u8=NULL;p->codes_sdot=NULL;p->codes_bitplane=NULL;
+    p->scales_n32=NULL;p->scales_sdot=NULL;
     int nt=p->n/32,bs=p->format==FP4_MX?32:16,nb=p->k/bs;
     p->scales_n32_count=(size_t)nt*nb*32;
     if(posix_memalign((void**)&p->codes_n32,256,p->code_bytes)||
@@ -220,6 +227,28 @@ int fp4_matrix_prepare_bitplane(fp4_matrix*p){
         d[b]|=(uint32_t)((q[j]>>b)&1)<<j;
         d[b]|=(uint32_t)((q[j]>>(b+4))&1)<<(16+j);
       }
+    }return 0;
+}
+
+int fp4_matrix_prepare_sdot(fp4_matrix*p){
+    if(!p||!p->codes_u8||!p->scales_n32||p->n%128||p->k%32)return-1;
+    int bs=p->format==FP4_MX?32:16,nb=p->k/bs;
+    free(p->codes_sdot);free(p->scales_sdot);p->codes_sdot=NULL;p->scales_sdot=NULL;
+    if(posix_memalign((void**)&p->codes_sdot,256,(size_t)p->n*p->k)||
+       posix_memalign((void**)&p->scales_sdot,256,
+                      (size_t)(p->n/128)*nb*128*sizeof(_Float16))){
+        free(p->codes_sdot);free(p->scales_sdot);p->codes_sdot=NULL;p->scales_sdot=NULL;return-1;
+    }
+    static const int8_t values[16]={0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
+    for(int g=0;g<p->n/128;++g)for(int b=0;b<nb;++b){
+      for(int pg=0;pg<bs/4;++pg)for(int v=0;v<8;++v)for(int lane=0;lane<16;++lane)
+        for(int j=0;j<4;++j){int k=b*bs+pg*4+j,nlane=v*16+lane;
+          size_t src=((size_t)g*p->k+k)*128+nlane;
+          size_t dst=((((size_t)g*nb+b)*(bs/4)+pg)*8+v)*64+lane*4+j;
+          p->codes_sdot[dst]=values[p->codes_u8[src]&15];}
+      _Float16*d=p->scales_sdot+((size_t)g*nb+b)*128;
+      for(int t=0;t<4;++t){const _Float16*s=p->scales_n32+
+          ((size_t)(g*4+t)*nb+b)*32;memcpy(d+t*32,s,32*sizeof(_Float16));}
     }return 0;
 }
 
@@ -809,4 +838,45 @@ int fp4_gemm_f16(float*c,const _Float16*a,const fp4_matrix*w,int m,int promotion
                 if(used)s+=(float)h;c[(size_t)(m0+i)*w->n+r]=s;}
 #endif
         }}return 0;
+}
+
+static int fp4_quant_i8(float x,float inverse){
+    long q=lrintf(x*inverse);if(q>127)q=127;else if(q< -127)q=-127;return(int)q;
+}
+
+int fp4_i8_activation_prepare(fp4_i8_activation*q,const float*a,int k,int group){
+    if(!q||!a||k<=0||k%32||group<4||group>32||(group&(group-1))||k%group)return-1;
+    if(!q->codes||!q->scales||q->k!=k){fp4_i8_activation_free(q);q->k=k;
+      if(posix_memalign((void**)&q->codes,256,(size_t)k)||
+         posix_memalign((void**)&q->scales,256,(size_t)(k/4)*sizeof(float))){
+          fp4_i8_activation_free(q);return-1;}}
+    q->scale_group=group;
+    for(int b=0;b<k/group;++b){float m=0.0f;
+      for(int j=0;j<group;++j){float x=fabsf(a[b*group+j]);if(x>m)m=x;}
+      float s=m>0.0f?m/127.0f:1.0f,inv=1.0f/s;q->scales[b]=s*0.5f;
+      for(int j=0;j<group;++j)q->codes[b*group+j]=
+          (int8_t)fp4_quant_i8(a[b*group+j],inv);
+    }return 0;
+}
+
+void fp4_i8_activation_free(fp4_i8_activation*q){
+    if(!q)return;free(q->codes);free(q->scales);memset(q,0,sizeof(*q));
+}
+
+int fp4_gemv_i8_sdot_omp(float*c,const fp4_i8_activation*a,
+                          const fp4_matrix*w,int threads){
+    if(!c||!a||!w||!a->codes||!a->scales||!w->codes_sdot||!w->scales_sdot||
+       a->k!=w->k||threads<1)return-1;
+    int wg=w->format==FP4_MX?32:16;if(wg%a->scale_group)return-1;
+#if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
+    int nb=w->k/wg;
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for(int g=0;g<w->n/128;++g){fp4_sdot_args x={
+      w->codes_sdot+(size_t)g*w->k*128,a->codes,
+      w->scales_sdot+(size_t)g*nb*128,a->scales,c+g*128,w->k,wg,a->scale_group};
+      fp4_i8_sdot_m1_asm(&x);}
+    return 0;
+#else
+    (void)threads;return-1;
+#endif
 }
