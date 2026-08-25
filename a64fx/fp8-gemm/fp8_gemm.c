@@ -7,9 +7,11 @@
 #include <arm_sve.h>
 #endif
 
-typedef struct {const uint8_t*q;const float*a;const float*s;float*out;int k;const uint32_t*lut;} fp8_m1_args;
+typedef struct {const uint8_t*q;const float*a;const float*s;float*out;int k,scale_group,lane_group,pad;const uint32_t*lut;} fp8_m1_args;
 extern void fp8_e4m3fn_m1_asm(const fp8_m1_args*);
 extern void fp8_e4m3fn_lut_m1_asm(const fp8_m1_args*);
+extern void fp8_i8_m1_asm(const fp8_m1_args*);
+extern void fp8_i8x4_m1_asm(const fp8_m1_args*);
 static uint32_t fp8_lut[256] __attribute__((aligned(256)));
 static int fp8_lut_ready;
 
@@ -30,6 +32,83 @@ float fp8_e4m3fn_decode(uint8_t x){
     else if(e==15&&m==7)v=0.0f;
     else v=ldexpf(1.0f+(float)m*.125f,e-7);
     return s?-v:v;
+}
+
+int fp8_i8_matrix_alloc(fp8_i8_matrix*w,int n,int k){
+    if(!w||n<=0||k<=0||n%128||k%128)return-1;
+    memset(w,0,sizeof(*w));w->n=n;w->k=k;
+    if(posix_memalign((void**)&w->codes,256,(size_t)n*k)||
+       posix_memalign((void**)&w->scales,256,
+                      (size_t)(n/32)*k*sizeof(float))){
+        fp8_i8_matrix_free(w);return-1;
+    }return 0;
+}
+
+void fp8_i8_matrix_free(fp8_i8_matrix*w){
+    if(!w)return;free(w->codes);free(w->scales);memset(w,0,sizeof(*w));
+}
+
+static int quant_i8(float x,float inverse){
+    long q=lrintf(x*inverse);
+    if(q>127)q=127;else if(q< -127)q=-127;
+    return(int)q;
+}
+
+int fp8_matrix_prepare_i8(const fp8_matrix*src,fp8_i8_matrix*dst,
+                          fp8_i8_policy policy){
+    return fp8_matrix_prepare_i8_group(src,dst,policy,128);
+}
+
+int fp8_matrix_prepare_i8_group(const fp8_matrix*src,fp8_i8_matrix*dst,
+                                fp8_i8_policy policy,int scale_group){
+    return fp8_matrix_prepare_i8_tile(src,dst,policy,scale_group,128);
+}
+
+int fp8_matrix_prepare_i8_tile(const fp8_matrix*src,fp8_i8_matrix*dst,
+                               fp8_i8_policy policy,int scale_group,int lane_group){
+    if(!src||!dst||!src->codes||!src->scales||
+       (policy!=FP8_I8_ABSMAX&&policy!=FP8_I8_MSE)||scale_group<2||
+       scale_group>128||(scale_group&(scale_group-1))||src->k%scale_group||
+       (lane_group!=32&&lane_group!=128))return-1;
+    if((!dst->codes||!dst->scales||dst->n!=src->n||dst->k!=src->k)&&
+       fp8_i8_matrix_alloc(dst,src->n,src->k))return-1;
+    dst->scale_group=scale_group;dst->lane_group=lane_group;
+    int scale_count=src->k/scale_group,lane_tiles=128/lane_group;
+    for(int g=0;g<src->n/128;++g)for(int kb=0;kb<scale_count;++kb)
+      for(int lt=0;lt<lane_tiles;++lt){
+        uint32_t hist[256]={0};float maxv=0.0f;
+        for(int kk=0;kk<scale_group;++kk){
+            const uint8_t*q=src->codes+((size_t)g*src->k+kb*scale_group+kk)*128;
+            for(int lane=lt*lane_group;lane<(lt+1)*lane_group;++lane)++hist[q[lane]];
+        }
+        for(int c=0;c<256;++c)if(hist[c]){
+            float v=fabsf(fp8_e4m3fn_decode((uint8_t)c));if(v>maxv)maxv=v;
+        }
+        float threshold=maxv;
+        if(policy==FP8_I8_MSE&&maxv>0.0f){
+            double best=HUGE_VAL;
+            for(int step=0;step<=64;++step){
+                float t=maxv*(1.0f-(float)step/128.0f),inv=127.0f/t;
+                double error=0.0;
+                for(int c=0;c<256;++c)if(hist[c]){
+                    float v=fp8_e4m3fn_decode((uint8_t)c);
+                    float d=v-(float)quant_i8(v,inv)*(t/127.0f);
+                    error+=(double)hist[c]*d*d;
+                }
+                if(error<best){best=error;threshold=t;}
+            }
+        }
+        float qscale=maxv>0.0f?threshold/127.0f:1.0f;
+        float inv=1.0f/qscale;
+        dst->scales[((size_t)g*scale_count+kb)*lane_tiles+lt]=
+            src->scales[(size_t)g*(src->k/128)+(kb*scale_group)/128]*qscale;
+        for(int kk=0;kk<scale_group;++kk){
+            size_t off=((size_t)g*src->k+kb*scale_group+kk)*128;
+            for(int lane=lt*lane_group;lane<(lt+1)*lane_group;++lane)
+                dst->codes[off+lane]=(int8_t)quant_i8(
+                    fp8_e4m3fn_decode(src->codes[off+lane]),inv);
+        }
+    }return 0;
 }
 static void prepare_lut(void){if(fp8_lut_ready)return;for(int i=0;i<256;++i){float x=fp8_e4m3fn_decode((uint8_t)i);memcpy(fp8_lut+i,&x,4);}fp8_lut_ready=1;}
 
@@ -57,6 +136,18 @@ int fp8_gemv_reference(float*out,const float*a,const fp8_matrix*w){
     for(int r=0;r<w->n;++r){double z=0;int g=r/128,t=(r%128)/32,l=r%32;
       for(int k=0;k<w->k;++k){const uint8_t*q=w->codes+(((size_t)g*w->k+k)*4+t)*32;
         z+=(double)a[k]*fp8_e4m3fn_decode(q[l])*w->scales[(size_t)g*(w->k/128)+k/128];}
+      out[r]=(float)z;
+    }return 0;
+}
+
+int fp8_i8_gemv_reference(float*out,const float*a,const fp8_i8_matrix*w){
+    if(!out||!a||!w||!w->codes||!w->scales)return-1;
+    int lane_tiles=128/w->lane_group;
+    for(int r=0;r<w->n;++r){double z=0.0;int g=r/128,lane=r%128;
+      for(int k=0;k<w->k;++k){size_t off=((size_t)g*w->k+k)*128+lane;
+        z+=(double)a[k]*w->codes[off]*
+           w->scales[((size_t)g*(w->k/w->scale_group)+k/w->scale_group)*lane_tiles+
+                     lane/w->lane_group];}
       out[r]=(float)z;
     }return 0;
 }
@@ -144,12 +235,12 @@ int fp8_gemv_f32_omp(float*out,const float*a,const fp8_matrix*w,int threads,fp8_
     }else if(exact==2){prepare_lut();
 #pragma omp parallel for num_threads(threads) schedule(static)
       for(int g=0;g<w->n/128;++g){fp8_m1_args x={w->codes+(size_t)g*w->k*128,
-          a,w->scales+(size_t)g*(w->k/128),out+g*128,w->k,fp8_lut};fp8_e4m3fn_lut_m1_asm(&x);correct_group(out,a,w,g);}
+          a,w->scales+(size_t)g*(w->k/128),out+g*128,w->k,0,0,0,fp8_lut};fp8_e4m3fn_lut_m1_asm(&x);correct_group(out,a,w,g);}
       return 0;
     }else if(!exact){
 #pragma omp parallel for num_threads(threads) schedule(static)
       for(int g=0;g<w->n/128;++g){fp8_m1_args x={w->codes+(size_t)g*w->k*128,
-          a,w->scales+(size_t)g*(w->k/128),out+g*128,w->k,NULL};fp8_e4m3fn_m1_asm(&x);correct_group(out,a,w,g);}
+          a,w->scales+(size_t)g*(w->k/128),out+g*128,w->k,0,0,0,NULL};fp8_e4m3fn_m1_asm(&x);correct_group(out,a,w,g);}
       return 0;
     }
 #pragma omp parallel for num_threads(threads) schedule(static)
@@ -157,5 +248,23 @@ int fp8_gemv_f32_omp(float*out,const float*a,const fp8_matrix*w,int threads,fp8_
     return 0;
 #else
     (void)exact;(void)threads;return-1;
+#endif
+}
+
+
+int fp8_i8_gemv_f32_omp(float*out,const float*a,const fp8_i8_matrix*w,int threads){
+    if(!out||!a||!w||!w->codes||!w->scales||threads<1)return-1;
+#if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for(int g=0;g<w->n/128;++g){
+        int lane_tiles=128/w->lane_group;
+        fp8_m1_args x={(const uint8_t*)w->codes+(size_t)g*w->k*128,
+            a,w->scales+(size_t)g*(w->k/w->scale_group)*lane_tiles,out+g*128,w->k,
+            w->scale_group,w->lane_group,0,NULL};
+        if(w->lane_group==32)fp8_i8x4_m1_asm(&x);else fp8_i8_m1_asm(&x);
+    }
+    return 0;
+#else
+    (void)threads;return fp8_i8_gemv_reference(out,a,w);
 #endif
 }
