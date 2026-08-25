@@ -128,6 +128,27 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "PASS (tol 1e-3*max(1,|ref|))\n");
 
+    /* ── determinism: conv2d_sve_full must be bit-reproducible. Regression
+     *    guard for the gather/apply `nowait` race: the (mb,nb) GEMM loop reads
+     *    A_packed, so with `nowait` it could start while other threads were still
+     *    gathering -> non-deterministic patch_embed (surfaced at some geometries,
+     *    e.g. Kimi-K3 ps=14). The race is timing-dependent, so run several times; any
+     *    divergence fails. ── */
+    {
+        std::vector<float> base((size_t)n_patches * dim), cur((size_t)n_patches * dim);
+        conv2d_sve_full(rgb.data(), W, H, ps, dim, Wp.data(), bias.data(), base.data());
+        const int runs = 8;
+        for (int r = 0; r < runs; r++) {
+            conv2d_sve_full(rgb.data(), W, H, ps, dim, Wp.data(), bias.data(), cur.data());
+            for (size_t i = 0; i < base.size(); i++)
+                if (base[i] != cur[i]) {
+                    fprintf(stderr, "FAIL: conv2d_sve_full non-deterministic on run %d (gather/apply race)\n", r + 1);
+                    return 3;
+                }
+        }
+        fprintf(stderr, "determinism (x%d conv2d_sve_full): PASS (bit-identical)\n", runs);
+    }
+
     /* ── benchmark ── */
     double flops_dual = 2.0 * n_patches * dim * ks * 2.0; /* both convs, as the profiler counts */
     double flops_fused = 2.0 * n_patches * dim * ks;      /* merged kernel: one GEMM */

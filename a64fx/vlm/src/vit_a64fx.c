@@ -107,8 +107,8 @@ static float *deq_W_T(const qtensor *t) {
 }
 
 static float *deq_vec_xalloc(const qtensor *t, int n) {
-    if (!t || !t->data) return NULL;
     float *v = xcalloc_f(n);
+    if (!t || !t->data) return v;   /* zero for an absent bias (bias-free models) */
     dequant_row(t->type, t->data, v, t->n_cols);
     return v;
 }
@@ -185,7 +185,7 @@ struct vit_a64fx_cache {
     int dtype;                    /* enum vit_dtype: VIT_DTYPE_FP32 or BF16 */
     int n_blocks;
     int n_deepstack;
-    int dim, ffn_dim, merged_dim, proj_dim;
+    int dim, attn_dim, ffn_dim, merged_dim, proj_dim;
 
     /* patch embed (kept row-major; not used by gemm) */
     float *patch_k0, *patch_k1, *patch_b;
@@ -413,6 +413,7 @@ struct vit_a64fx_cache *vit_a64fx_cache_build(struct vision_model *vm, int dtype
     if (!c) return NULL;
 
     int dim     = vm->dim;
+    int attn_dim = vm->attn_dim;
     int ffn_dim = vm->ffn_dim;
     int sm      = vm->spatial_merge;
     int merged  = dim * sm * sm;
@@ -423,6 +424,7 @@ struct vit_a64fx_cache *vit_a64fx_cache_build(struct vision_model *vm, int dtype
     c->n_blocks    = vm->n_blocks;
     c->n_deepstack = vm->n_deepstack;
     c->dim         = dim;
+    c->attn_dim    = attn_dim;
     c->ffn_dim     = ffn_dim;
     c->merged_dim  = merged;
     c->proj_dim    = vm->proj_dim;
@@ -469,7 +471,7 @@ struct vit_a64fx_cache *vit_a64fx_cache_build(struct vision_model *vm, int dtype
         vision_block *blk = &vm->blocks[l];
         block_cache *bc = &c->blocks[l];
         bc->BT_qkv = deq_W_T(&blk->attn_qkv_w);
-        bc->b_qkv  = deq_vec_xalloc(&blk->attn_qkv_b, 3 * dim);
+        bc->b_qkv  = deq_vec_xalloc(&blk->attn_qkv_b, 3 * attn_dim);
         bc->BT_o   = deq_W_T(&blk->attn_out_w);
         bc->b_o    = deq_vec_xalloc(&blk->attn_out_b, dim);
         bc->BT_u   = deq_W_T(&blk->ffn_up_w);
@@ -514,8 +516,8 @@ struct vit_a64fx_cache *vit_a64fx_cache_build(struct vision_model *vm, int dtype
 #endif
         for (int l = 0; l < vm->n_blocks; l++) {
             block_cache *bc = &c->blocks[l];
-            bc->BT_qkv_bf = take_bf16_packed(&bc->BT_qkv, dim,     3 * dim);
-            bc->BT_o_bf   = take_bf16_packed(&bc->BT_o,   dim,     dim);
+            bc->BT_qkv_bf = take_bf16_packed(&bc->BT_qkv, dim,     3 * attn_dim);
+            bc->BT_o_bf   = take_bf16_packed(&bc->BT_o,   attn_dim, dim);
             bc->BT_u_bf   = take_bf16_packed(&bc->BT_u,   dim,     ffn_dim);
             bc->BT_d_bf   = take_bf16_packed(&bc->BT_d,   ffn_dim, dim);
         }
@@ -537,8 +539,8 @@ struct vit_a64fx_cache *vit_a64fx_cache_build(struct vision_model *vm, int dtype
 #endif
         for (int l = 0; l < vm->n_blocks; l++) {
             block_cache *bc = &c->blocks[l];
-            bc->BT_qkv_fp = take_fp16_packed(&bc->BT_qkv, dim,     3 * dim);
-            bc->BT_o_fp   = take_fp16_packed(&bc->BT_o,   dim,     dim);
+            bc->BT_qkv_fp = take_fp16_packed(&bc->BT_qkv, dim,     3 * attn_dim);
+            bc->BT_o_fp   = take_fp16_packed(&bc->BT_o,   attn_dim, dim);
             bc->BT_u_fp   = take_fp16_packed(&bc->BT_u,   dim,     ffn_dim);
             bc->BT_d_fp   = take_fp16_packed(&bc->BT_d,   ffn_dim, dim);
         }
@@ -562,8 +564,8 @@ struct vit_a64fx_cache *vit_a64fx_cache_build(struct vision_model *vm, int dtype
 #endif
         for (int l = 0; l < vm->n_blocks; l++) {
             block_cache *bc = &c->blocks[l];
-            bc->BT_qkv_i8 = take_int8_packed(&bc->BT_qkv, dim,     3 * dim, &bc->sc_qkv);
-            bc->BT_o_i8   = take_int8_packed(&bc->BT_o,   dim,     dim,     &bc->sc_o);
+            bc->BT_qkv_i8 = take_int8_packed(&bc->BT_qkv, dim,     3 * attn_dim, &bc->sc_qkv);
+            bc->BT_o_i8   = take_int8_packed(&bc->BT_o,   attn_dim, dim,     &bc->sc_o);
             bc->BT_u_i8   = take_int8_packed(&bc->BT_u,   dim,     ffn_dim, &bc->sc_u);
             bc->BT_d_i8   = take_int8_packed(&bc->BT_d,   ffn_dim, dim,     &bc->sc_d);
         }
@@ -587,8 +589,8 @@ struct vit_a64fx_cache *vit_a64fx_cache_build(struct vision_model *vm, int dtype
 #endif
         for (int l = 0; l < vm->n_blocks; l++) {
             block_cache *bc = &c->blocks[l];
-            bc->BT_qkv_i16 = take_int16_packed(&bc->BT_qkv, dim,     3 * dim, &bc->sc_qkv16, &bc->cs_qkv16);
-            bc->BT_o_i16   = take_int16_packed(&bc->BT_o,   dim,     dim,     &bc->sc_o16,   &bc->cs_o16);
+            bc->BT_qkv_i16 = take_int16_packed(&bc->BT_qkv, dim,     3 * attn_dim, &bc->sc_qkv16, &bc->cs_qkv16);
+            bc->BT_o_i16   = take_int16_packed(&bc->BT_o,   attn_dim, dim,     &bc->sc_o16,   &bc->cs_o16);
             bc->BT_u_i16   = take_int16_packed(&bc->BT_u,   dim,     ffn_dim, &bc->sc_u16,   &bc->cs_u16);
             bc->BT_d_i16   = take_int16_packed(&bc->BT_d,   ffn_dim, dim,     &bc->sc_d16,   &bc->cs_d16);
         }
@@ -615,8 +617,8 @@ struct vit_a64fx_cache *vit_a64fx_cache_build(struct vision_model *vm, int dtype
         for (int l = 0; l < vm->n_blocks; l++) {
             block_cache *bc = &c->blocks[l];
             float *p;
-            p = take_fp32_packed(&bc->BT_qkv, dim,     3 * dim); bc->BT_qkv = p;
-            p = take_fp32_packed(&bc->BT_o,   dim,     dim);     bc->BT_o   = p;
+            p = take_fp32_packed(&bc->BT_qkv, dim,     3 * attn_dim); bc->BT_qkv = p;
+            p = take_fp32_packed(&bc->BT_o,   attn_dim, dim);     bc->BT_o   = p;
             p = take_fp32_packed(&bc->BT_u,   dim,     ffn_dim); bc->BT_u   = p;
             p = take_fp32_packed(&bc->BT_d,   ffn_dim, dim);     bc->BT_d   = p;
         }
@@ -655,6 +657,7 @@ int vit_a64fx_cache_replicate(struct vit_a64fx_cache *c, int n_cmgs) {
     }
 
     int dim     = c->dim;
+    int attn_dim = c->attn_dim;
     int ffn_dim = c->ffn_dim;
     int merged  = c->merged_dim;
     int proj    = c->proj_dim;
@@ -663,8 +666,8 @@ int vit_a64fx_cache_replicate(struct vit_a64fx_cache *c, int n_cmgs) {
     size_t fc1_bytes, fc2_bytes, mm0_bytes, mm2_bytes;
     int is_fp16 = (c->dtype == /* VIT_DTYPE_FP16 */ 2);
     if (is_fp16) {
-        qkv_bytes = packed_B_fp16_size(dim,     3 * dim);
-        o_bytes   = packed_B_fp16_size(dim,     dim);
+        qkv_bytes = packed_B_fp16_size(dim,     3 * attn_dim);
+        o_bytes   = packed_B_fp16_size(attn_dim, dim);
         u_bytes   = packed_B_fp16_size(dim,     ffn_dim);
         d_bytes   = packed_B_fp16_size(ffn_dim, dim);
         fc1_bytes = packed_B_fp16_size(merged,  merged);
@@ -675,8 +678,8 @@ int vit_a64fx_cache_replicate(struct vit_a64fx_cache *c, int n_cmgs) {
         size_t (*sz)(int,int) = vit_bf16_pv_enabled()
                                  ? packed_B_bf16_pv_size
                                  : packed_B_bf16_size;
-        qkv_bytes = sz(dim,     3 * dim);
-        o_bytes   = sz(dim,     dim);
+        qkv_bytes = sz(dim,     3 * attn_dim);
+        o_bytes   = sz(attn_dim, dim);
         u_bytes   = sz(dim,     ffn_dim);
         d_bytes   = sz(ffn_dim, dim);
         fc1_bytes = sz(merged,  merged);
@@ -2168,6 +2171,7 @@ float *vit_a64fx_encode(struct vision_model *vm,
 
     int ps       = vm->patch_size;
     int dim      = vm->dim;
+    int attn_dim = vm->attn_dim;
     int n_heads  = vm->n_heads;
     int head_dim = vm->head_dim;
     int ffn_dim  = vm->ffn_dim;
@@ -2208,8 +2212,8 @@ float *vit_a64fx_encode(struct vision_model *vm,
     /* Allocate stage buffers */
     float *hidden    = xcalloc_f((size_t)n_patches * dim);
     float *hidden2   = xcalloc_f((size_t)n_patches * dim);
-    float *qkv       = xcalloc_f((size_t)n_patches * 3 * dim);
-    float *attn_out  = xcalloc_f((size_t)n_patches * dim);
+    float *qkv       = xcalloc_f((size_t)n_patches * 3 * attn_dim);
+    float *attn_out  = xcalloc_f((size_t)n_patches * attn_dim);
     /* Head-major Q/V scratch and TRANSPOSED head-major K scratch for the
      * attn stage. Same total bytes as qkv (3 * n_heads * n_patches *
      * head_dim == n_patches * 3 * dim). Q/V are laid out [n_heads, np, hd]
@@ -2314,36 +2318,36 @@ float *vit_a64fx_encode(struct vision_model *vm,
         if (bc) {
             gemm_BT_dispatch(pool, qkv, bc->BT_qkv, bc->BT_qkv_bf, bc->BT_qkv_fp, bc->BT_qkv_i8, bc->sc_qkv, bc->BT_qkv_i16, bc->sc_qkv16, bc->cs_qkv16,
                              &bc->qkv_r, cache->n_cmgs, bc->b_qkv,
-                             ln_buf, n_patches, 3 * dim, dim);
+                             ln_buf, n_patches, 3 * attn_dim, dim);
         } else {
             float *Wqkv = deq_W(&blk->attn_qkv_w);
-            float *bqkv = xcalloc_f(3 * dim);  deq_vec(&blk->attn_qkv_b, bqkv);
-            vit_gemm_bias_mt(pool, qkv, Wqkv, bqkv, ln_buf, n_patches, 3 * dim, dim);
+            float *bqkv = xcalloc_f(3 * attn_dim);  deq_vec(&blk->attn_qkv_b, bqkv);
+            vit_gemm_bias_mt(pool, qkv, Wqkv, bqkv, ln_buf, n_patches, 3 * attn_dim, dim);
             free(Wqkv); free(bqkv);
         }
         st_tick(&st, ST_QKV);
-        dump2(dump, "qkv", l, n_patches, 3 * dim, qkv);
+        dump2(dump, "qkv", l, n_patches, 3 * attn_dim, qkv);
 
         /* M-RoPE on Q, K (not V) */
-        mrope_apply_mt(pool, qkv, n_patches, n_heads, head_dim, dim, rope_cos, rope_sin);
+        mrope_apply_mt(pool, qkv, n_patches, n_heads, head_dim, attn_dim, rope_cos, rope_sin);
         st_tick(&st, ST_ROPE);
-        dump2(dump, "mrope", l, n_patches, 3 * dim, qkv);
+        dump2(dump, "mrope", l, n_patches, 3 * attn_dim, qkv);
 
         /* Attention */
         attention_mt(pool, qkv, Q_hm, KT_hm, V_hm, attn_out,
-                     n_patches, dim, n_heads, head_dim);
+                     n_patches, attn_dim, n_heads, head_dim);
         st_tick(&st, ST_ATTN);
-        dump2(dump, "attn", l, n_patches, dim, attn_out);
+        dump2(dump, "attn", l, n_patches, attn_dim, attn_out);
 
         /* Attn out proj */
         if (bc) {
             gemm_BT_dispatch(pool, hidden2, bc->BT_o, bc->BT_o_bf, bc->BT_o_fp, bc->BT_o_i8, bc->sc_o, bc->BT_o_i16, bc->sc_o16, bc->cs_o16,
                              &bc->o_r, cache->n_cmgs, bc->b_o,
-                             attn_out, n_patches, dim, dim);
+                             attn_out, n_patches, dim, attn_dim);
         } else {
             float *Wo = deq_W(&blk->attn_out_w);
             float *bo = xcalloc_f(dim);  deq_vec(&blk->attn_out_b, bo);
-            vit_gemm_bias_mt(pool, hidden2, Wo, bo, attn_out, n_patches, dim, dim);
+            vit_gemm_bias_mt(pool, hidden2, Wo, bo, attn_out, n_patches, dim, attn_dim);
             free(Wo); free(bo);
         }
         st_tick(&st, ST_AOUT);

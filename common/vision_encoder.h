@@ -49,6 +49,7 @@ typedef struct vision_model {
     int dim;          /* embedding_length (1024 for 2B) */
     int n_heads;
     int head_dim;
+    int attn_dim;     /* attention inner dim = n_heads*head_dim (may differ from dim) */
     int ffn_dim;
     int patch_size;
     int image_size;
@@ -432,6 +433,7 @@ vision_model *vision_load(gguf_context *g) {
     vm->proj_dim    = vit_get_int(g, "clip.vision.projection_dim", 2048);
     vm->spatial_merge = vit_get_int(g, "clip.vision.spatial_merge_size", 2);
     vm->ln_eps      = vit_get_float(g, "clip.vision.attention.layer_norm_epsilon", 1e-6f);
+    vm->attn_dim    = vm->dim;   /* default: attention inner dim == model dim */
     vm->head_dim    = vm->dim / vm->n_heads;
 
     int ps = vm->patch_size;
@@ -471,18 +473,26 @@ vision_model *vision_load(gguf_context *g) {
             snprintf(name, sizeof(name), "v.blk.%d." suffix, l); \
             vm->blocks[l].field = vit_load(g, name, req);
         VL(attn_qkv_w, "attn_qkv.weight", 1)
-        VL(attn_qkv_b, "attn_qkv.bias", 1)
+        VL(attn_qkv_b, "attn_qkv.bias", 0)
         VL(attn_out_w, "attn_out.weight", 1)
-        VL(attn_out_b, "attn_out.bias", 1)
+        VL(attn_out_b, "attn_out.bias", 0)
         VL(ffn_up_w, "ffn_up.weight", 1)
-        VL(ffn_up_b, "ffn_up.bias", 1)
+        VL(ffn_up_b, "ffn_up.bias", 0)
         VL(ffn_down_w, "ffn_down.weight", 1)
-        VL(ffn_down_b, "ffn_down.bias", 1)
+        VL(ffn_down_b, "ffn_down.bias", 0)
         VL(ln1_w, "ln1.weight", 1)
-        VL(ln1_b, "ln1.bias", 1)
+        VL(ln1_b, "ln1.bias", 0)
         VL(ln2_w, "ln2.weight", 1)
-        VL(ln2_b, "ln2.bias", 1)
+        VL(ln2_b, "ln2.bias", 0)
         #undef VL
+    }
+
+    /* Attention inner dim = (QKV rows)/3. May differ from the model dim
+     * (Kimi-K3: dim=1024, QKV rows=4608 -> attn_dim=1536, head_dim=128).
+     * The default (attn_dim==dim) covers the standard Qwen3-VL case. */
+    if (vm->n_blocks > 0 && vm->blocks[0].attn_qkv_w.data) {
+        vm->attn_dim = vm->blocks[0].attn_qkv_w.n_rows / 3;
+        if (vm->n_heads > 0) vm->head_dim = vm->attn_dim / vm->n_heads;
     }
 
     /* DeepStack */
@@ -520,13 +530,18 @@ vision_model *vision_load(gguf_context *g) {
 
     /* Post LN */
     vm->post_ln_w = vit_load(g, "v.post_ln.weight", 1);
-    vm->post_ln_b = vit_load(g, "v.post_ln.bias", 1);
+    vm->post_ln_b = vit_load(g, "v.post_ln.bias", 0);
 
-    /* MM projection */
-    vm->mm0_w = vit_load(g, "mm.0.weight", 1);
-    vm->mm0_b = vit_load(g, "mm.0.bias", 1);
-    vm->mm2_w = vit_load(g, "mm.2.weight", 1);
-    vm->mm2_b = vit_load(g, "mm.2.bias", 1);
+    /* MM projection. Qwen3-VL: mm.0 (Linear) + GELU + mm.2 (Linear).
+     * Kimi-K3 "kimik3": mm.1 (Linear) + act + mm.2 (Linear) -- no mm.0.
+     * Try mm.0 first, fall back to mm.1 for the first linear. Biases are
+     * optional (both layouts here are bias-free). */
+    vm->mm0_w = vit_load(g, "mm.0.weight", 0);
+    if (!vm->mm0_w.data) vm->mm0_w = vit_load(g, "mm.1.weight", 0);
+    vm->mm0_b = vit_load(g, "mm.0.bias", 0);
+    if (!vm->mm0_b.data) vm->mm0_b = vit_load(g, "mm.1.bias", 0);
+    vm->mm2_w = vit_load(g, "mm.2.weight", 0);
+    vm->mm2_b = vit_load(g, "mm.2.bias", 0);
 
     return vm;
 }

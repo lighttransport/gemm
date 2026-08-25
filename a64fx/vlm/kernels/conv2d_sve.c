@@ -167,7 +167,11 @@ void conv2d_sve_full(const float *rgb, int width, int height, int ps,
 
     #pragma omp parallel
     {
-        #pragma omp for schedule(static) nowait
+        /* NO `nowait`: the (mb,nb) GEMM loop below reads A_packed, so all
+         * gathers must complete first. `nowait` let apply_block start while
+         * other threads were still writing A_packed -> race -> non-deterministic
+         * patch_embed (only surfaced at some geometries, e.g. Kimi-K3 ps=14). */
+        #pragma omp for schedule(static)
         for (int mb = 0; mb < M_blocks; mb++) {
             int m_start = mb * CONV2D_TILE;
             int m_count = (m_start + CONV2D_TILE <= M) ? CONV2D_TILE : M - m_start;
