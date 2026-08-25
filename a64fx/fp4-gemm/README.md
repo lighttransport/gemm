@@ -155,4 +155,23 @@ group; `FP4_SDOT_ONLY=1` skips unrelated kernels. `bench_fp4_sdot_error`
 validates the three native expert projections directly from the staged raw
 file without loading the full 3.3 GiB subset.
 
+### Scalar EX packed-FP4 producer
+
+`bench_fp4_ex` also measures a packed-FP4 producer using only scalar AArch64
+integer/load/store instructions. Its input is reordered offline so eight low
+nibbles and eight high nibbles can be emitted without a permutation. The
+nibble-only upper bound needs one load, two masks/shifts, and two stores; the
+exact path additionally maps E2M1 to signed SDOT coefficients with SWAR bit
+operations. On 12 CMG cores with a 64 MiB packed stream:
+
+| Scalar producer | Packed GB/s | Expanded GB/s | Maximum FP4 GFLOP/s |
+|---|---:|---:|---:|
+| Nibble split only | 40.6 | 81.1 | 162.3 |
+| Exact E2M1 signed bytes | 6.06 | 12.1 | 24.2 |
+
+The exact L1-resident single-core producer reaches only 1.01 billion weights/s.
+Consequently scalar EX production cannot feed either the 409 GFLOP/s expanded
+SDOT kernel or an 800 GFLOP/s packed-stream target, even with perfect EX/FL
+overlap. The fused double-buffer design was rejected at this producer gate.
+
 See [RESULTS.md](RESULTS.md) for measured A64FX results.

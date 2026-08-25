@@ -272,6 +272,12 @@ W1/W2/W3, worst relative L2 is 3.94e-3 and minimum cosine similarity is
 0.999992. Larger activation groups trade accuracy for a modest peak of
 419.8 GFLOP/s at K32.
 
+An EX-only packed producer was rejected before fusion. A layout-friendly
+nibble split reaches 40.6 GB/s packed input across 12 cores, a downstream roof
+of 162 GFLOP/s. Exact SWAR E2M1 mapping reaches only 6.06 GB/s and 24.2
+GFLOP/s. Both are far below the roughly 220 GB/s packed rate required for an
+800 GFLOP/s CMG kernel.
+
 ## Conclusion
 
 Promoting every 256 K values is the useful balanced mode on these workloads:
