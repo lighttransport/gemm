@@ -25,10 +25,12 @@ typedef struct {
     uint8_t *codes_u8;
     int8_t *codes_sdot;
     uint8_t *codes_pair;
+    uint8_t *codes_t8;
     uint32_t *codes_bitplane;
     _Float16 *scales_n32;
     _Float16 *scales_sdot;
     _Float16 *scales_pair;
+    _Float16 *scales_t8;
     size_t scales_n32_count;
 } fp4_matrix;
 

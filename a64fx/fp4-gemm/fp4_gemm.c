@@ -117,6 +117,7 @@ void fp4_matrix_free(fp4_matrix *p) {
     if (!p) return;
     free(p->codes); free(p->scales); free(p->codes_n32); free(p->codes_u8);
     free(p->codes_sdot);free(p->scales_sdot);free(p->codes_pair);free(p->scales_pair);
+    free(p->codes_t8);free(p->scales_t8);
     free(p->codes_bitplane);
     free(p->scales_n32); memset(p, 0, sizeof(*p));
 }
@@ -186,10 +187,10 @@ static float row_scale(const fp4_matrix *p,int r,int c){
 int fp4_matrix_prepare_n32(fp4_matrix *p){
     if(!p||!p->codes||!p->scales||p->n%32||p->k%32)return -1;
     prepare_pair_lut();
-    free(p->codes_n32);free(p->codes_u8);free(p->codes_sdot);free(p->codes_pair);free(p->codes_bitplane);
-    free(p->scales_n32);free(p->scales_sdot);free(p->scales_pair);
+    free(p->codes_n32);free(p->codes_u8);free(p->codes_sdot);free(p->codes_pair);free(p->codes_bitplane);free(p->codes_t8);
+    free(p->scales_n32);free(p->scales_sdot);free(p->scales_pair);free(p->scales_t8);
     p->codes_n32=NULL;p->codes_u8=NULL;p->codes_sdot=NULL;p->codes_pair=NULL;p->codes_bitplane=NULL;
-    p->scales_n32=NULL;p->scales_sdot=NULL;p->scales_pair=NULL;
+    p->scales_n32=NULL;p->scales_sdot=NULL;p->scales_pair=NULL;p->codes_t8=NULL;p->scales_t8=NULL;
     int nt=p->n/32,bs=p->format==FP4_MX?32:16,nb=p->k/bs;
     p->scales_n32_count=(size_t)nt*nb*32;
     if(posix_memalign((void**)&p->codes_n32,256,p->code_bytes)||
@@ -204,6 +205,21 @@ int fp4_matrix_prepare_n32(fp4_matrix *p){
                 q[j]=(uint8_t)(qa|(qb<<4));}}
         for(int b=0;b<nb;++b){_Float16*s=p->scales_n32+((size_t)t*nb+b)*32;
             for(int j=0;j<32;++j)s[j]=(_Float16)row_scale(p,t*32+j,b*bs);}
+    }
+    if(p->n%256==0){
+      if(posix_memalign((void**)&p->codes_t8,256,p->code_bytes)||
+         posix_memalign((void**)&p->scales_t8,256,p->scales_n32_count*sizeof(_Float16))){
+        free(p->codes_t8);free(p->scales_t8);p->codes_t8=NULL;p->scales_t8=NULL;return-1;}
+      int groups=p->n/256;
+      for(int g=0;g<groups;++g)for(int b=0;b<nb;++b){
+        uint8_t*dq=p->codes_t8+(((size_t)g*nb+b)*bs)*128;
+        _Float16*ds=p->scales_t8+((size_t)g*nb+b)*256;
+        for(int t=0;t<8;++t){const _Float16*ss=p->scales_n32+
+            ((size_t)(g*8+t)*nb+b)*32;memcpy(ds+t*32,ss,64);}
+        for(int kk=0;kk<bs;++kk)for(int t=0;t<8;++t){const uint8_t*sq=p->codes_n32+
+            ((size_t)(g*8+t)*p->k+b*bs+kk)*16;
+          memcpy(dq+((size_t)kk*8+t)*16,sq,16);}
+      }
     }
     return 0;
 }
@@ -590,6 +606,22 @@ typedef struct {
 } fp4_m1_t4_args;
 extern void fp4_mx_m1_t4_asm(const fp4_m1_t4_args*);
 extern void fp4_mx_u8_m1_t4_asm(const fp4_m1_t4_args*);
+typedef struct {const uint8_t*q;const _Float16*s,*a;_Float16*out;int k_count;} fp4_m1_t8_args;
+extern void fp4_mx_m1_t8_asm(const fp4_m1_t8_args*);
+
+static inline void gemm_mx_m1_t8_asm_segment(float*c,const _Float16*tables,
+        const fp4_matrix*w,int tile,int kbegin,int kend,int add){
+    _Float16 tmp[8*32] __attribute__((aligned(256)));int nb=w->k/32,g=tile/8,b=kbegin/32;
+    fp4_m1_t8_args x={w->codes_t8+(((size_t)g*nb+b)*32)*128,
+      w->scales_t8+((size_t)g*nb+b)*256,tables+(size_t)kbegin*32,tmp,kend-kbegin};
+    fp4_mx_m1_t8_asm(&x);svbool_t ph=svptrue_b16(),ps=svptrue_b32();
+    for(int i=0;i<8;++i){svuint16_t hb=svreinterpret_u16_f16(
+        svld1_f16(ph,(const __fp16*)(tmp+i*32)));
+      svfloat32_t lo=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpklo_u32(hb)));
+      svfloat32_t hi=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpkhi_u32(hb)));
+      float*d=c+(tile+i)*32;if(add){lo=svadd_f32_x(ps,lo,svld1_f32(ps,d));
+        hi=svadd_f32_x(ps,hi,svld1_f32(ps,d+16));}svst1_f32(ps,d,lo);svst1_f32(ps,d+16,hi);}
+}
 
 static inline void gemm_mx_m1_t4_asm_segment(float*c,const _Float16*a,
         const fp4_matrix*w,int tile,int kbegin,int kend,int add){
@@ -630,6 +662,20 @@ int fp4_gemm_f16_n32_omp(float*c,const _Float16*a,const fp4_matrix*w,int m,
        (promotion_k&&((promotion_k%32)||promotion_k>w->k)))return-1;
 #if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
     int span=promotion_k?promotion_k:w->k;
+    if(m==1&&w->format==FP4_MX&&w->codes_t8&&w->scales_t8&&w->n%256==0){
+      static const __fp16 td[32] __attribute__((aligned(64)))={
+        0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6,
+        0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6};
+      _Float16*tables=NULL;if(posix_memalign((void**)&tables,256,(size_t)w->k*64))return-1;
+      svbool_t ph=svptrue_b16();svfloat16_t tab=svld1_f16(ph,td);
+      for(int k=0;k<w->k;++k)svst1_f16(ph,(__fp16*)(tables+(size_t)k*32),
+          svmul_n_f16_x(ph,tab,(__fp16)a[k]));
+#pragma omp parallel for num_threads(threads) schedule(static)
+      for(int t=0;t<w->n/32;t+=8)for(int kb=0;kb<w->k;kb+=span){
+        int ke=kb+span<w->k?kb+span:w->k;
+        gemm_mx_m1_t8_asm_segment(c,tables,w,t,kb,ke,kb!=0);
+      }free(tables);return 0;
+    }
     if(m==1&&w->n%128==0){
 #pragma omp parallel for num_threads(threads) schedule(static)
       for(int t=0;t<w->n/32;t+=4)for(int kb=0;kb<w->k;kb+=span){

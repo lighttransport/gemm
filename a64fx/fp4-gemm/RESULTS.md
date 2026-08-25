@@ -124,16 +124,18 @@ Full 72 MiB MXFP4 streaming results on one 12-core CMG, K=256 promotion:
 
 | M | Selected path | CMG GFLOP/s | Source GB/s |
 |---:|---|---:|---:|
-| 1 | Four-tile activation-table direct | **300.5** | **84.5** |
+| 1 | Eight-tile shared activation-table direct | **400.0** | **112.5** |
 | 6 | Direct six-row | 511 | 24.0 |
 | 24 | Full-K L2 panel | 591 | 6.92 |
 | 128 | Full-K L2 panel | 621 | 1.37 |
 
-The M1 kernel scales the 16-entry E2M1 table by each activation once, then
-uses the decoded products directly with the four row-scale vectors. Reloading
-the constant table from L1 uses EAG capacity instead of FLA `MOV`s. This
-removes six vector FMULs from each Kx2 loop and improves the previous direct
-result from about 280 to 300.5 GFLOP/s while retaining four-bit density.
+The M1 path first improved to 300.5 GFLOP/s by scaling the 16-entry E2M1 table
+by each activation once and using decoded products directly with row scales.
+The current layout interleaves eight N32 tiles block-major and hoists all K
+activation tables into one shared 256 KiB workspace. This removes redundant
+per-core table FMULs, exposes eight output chains, and reaches 400 GFLOP/s
+while retaining four-bit density. K32 scale-at-boundary spilling (383.5
+GFLOP/s) and scalar-offset loads (383.7 GFLOP/s) were measured and rejected.
 
 Pure FP16 M=1 reaches 293 GFLOP/s and 82.3 GB/s. A hand-written eight-tile
 variant was rejected at 95 GFLOP/s; widening concentrates still more

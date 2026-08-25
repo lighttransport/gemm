@@ -177,11 +177,18 @@ tables per packed K pair. It is also exact, but doubles the table-operation
 count needed to cover 128 rows and reaches only 84.5 GFLOP/s at K4; it is a
 pipeline diagnostic rather than a selected kernel.
 
-The selected packed MXFP4 M1 assembly now scales the E2M1 table by the scalar
-activation once per K and performs FMLA directly against each row-scale
-vector. Two L1 table reloads use the load pipes instead of FLA register moves.
-This raises the N=32768, K=4096, K256-promotion result from roughly 280 to
-300.5 GFLOP/s (84.5 GB/s packed source) on one 12-core CMG.
+The selected packed MXFP4 M1 path additionally interleaves eight N32 tiles at
+each K step. It prepares one shared 32-lane activation-scaled E2M1 table per K,
+so the 12 cores only load the finished table instead of redundantly scaling it
+inside every output kernel. Eight FP16 accumulator and row-scale vectors stay
+resident while two four-vector decode batches stream sequentially. This raises
+the N=32768, K=4096, K256-promotion result from roughly 280 to **400 GFLOP/s**
+(112.5 GB/s packed source) on one 12-core CMG.
+
+Two variants were rejected: applying row scales only at K32 boundaries costs
+extra FP16 workspace traffic and reaches 383.5 GFLOP/s; scalar-offset SVE loads
+in place of sequential pointer updates constrain address generation and reach
+383.7 GFLOP/s.
 
 ### Scalar EX packed-FP4 producer
 
