@@ -1,1 +1,11 @@
+# build artifacts
 build/
+
+# VLMD tensor dumps (vlm_runner --dump DIR): per-stage .vlmd files + manifest
+*.vlmd
+manifest.txt
+
+# editor / OS noise
+*.o
+*.log
+.DS_Store
