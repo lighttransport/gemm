@@ -57,6 +57,25 @@ static int env_i(const char *name, int def) {
 static const char *env_s(const char *name, const char *def) {
     const char *v = getenv(name); return v && *v ? v : def;
 }
+static void f32_to_bf16(uint16_t *dst, const float *src, size_t n, int threads) {
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads) schedule(static)
+#endif
+    for (size_t i = 0; i < n; i++) {
+        uint32_t u;
+        memcpy(&u, src + i, sizeof(u));
+        dst[i] = (uint16_t)(u >> 16);
+    }
+}
+static void bf16_to_f32(float *dst, const uint16_t *src, size_t n, int threads) {
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads) schedule(static)
+#endif
+    for (size_t i = 0; i < n; i++) {
+        uint32_t u = (uint32_t)src[i] << 16;
+        memcpy(dst + i, &u, sizeof(u));
+    }
+}
 static void fail(int rank, const char *what) {
     fprintf(stderr, "qwen38-prefill rank=%d FATAL %s\n", rank, what);
     char path[64]; snprintf(path, sizeof(path), "q38_prefill_error_rank%02d.txt", rank);
@@ -255,8 +274,13 @@ int main(int argc, char **argv) {
         for (int i = 0; i < ntok; i++) tokens[i] = synth;
     }
     float *hidden = NULL;
+    uint16_t *hidden_bf16 = NULL;
     if (posix_memalign((void **)&hidden, 256, (size_t)chunk * m->n_embd * sizeof(float)))
         fail(wrank, "hidden allocation");
+    int pipe_bf16 = env_i("Q38_PREFILL_PIPE_BF16", 0);
+    if (pipe_bf16 && posix_memalign((void **)&hidden_bf16, 256,
+            (size_t)chunk * m->n_embd * sizeof(uint16_t)))
+        fail(wrank, "BF16 pipeline buffer allocation");
 
     const char *comm_name = env_s("Q38_PREFILL_COMM", "mpi");
     if (!strcmp(comm_name, "utofu") || !strcmp(comm_name, "utofu-rsag"))
@@ -280,8 +304,16 @@ int main(int argc, char **argv) {
         int p0 = ci * chunk, n = ntok - p0; if (n > chunk) n = chunk;
         size_t nf = (size_t)n * m->n_embd;
         double phase = wall();
-        if (pp_rank > 0)
-            MPI_Recv(hidden, (int)nf, MPI_FLOAT, pp_rank - 1, ci, pp_comm, MPI_STATUS_IGNORE);
+        if (pp_rank > 0) {
+            if (pipe_bf16) {
+                MPI_Recv(hidden_bf16, (int)nf, MPI_UINT16_T, pp_rank - 1,
+                         ci, pp_comm, MPI_STATUS_IGNORE);
+                bf16_to_f32(hidden, hidden_bf16, nf, threads);
+            } else {
+                MPI_Recv(hidden, (int)nf, MPI_FLOAT, pp_rank - 1, ci,
+                         pp_comm, MPI_STATUS_IGNORE);
+            }
+        }
         recv_s += wall() - phase;
         unsigned flags = pp_rank == 0 ? TF_PREFILL_EMBED : 0;
         if (pp_rank == pp_size - 1 && ci == nchunk - 1) flags |= TF_PREFILL_LOGITS;
@@ -291,8 +323,15 @@ int main(int argc, char **argv) {
         compute_s += wall() - phase;
         if (!last_logits) fail(wrank, "range prefill");
         phase = wall();
-        if (pp_rank < pp_size - 1)
-            MPI_Send(hidden, (int)nf, MPI_FLOAT, pp_rank + 1, ci, pp_comm);
+        if (pp_rank < pp_size - 1) {
+            if (pipe_bf16) {
+                f32_to_bf16(hidden_bf16, hidden, nf, threads);
+                MPI_Send(hidden_bf16, (int)nf, MPI_UINT16_T, pp_rank + 1,
+                         ci, pp_comm);
+            } else {
+                MPI_Send(hidden, (int)nf, MPI_FLOAT, pp_rank + 1, ci, pp_comm);
+            }
+        }
         send_s += wall() - phase;
     }
     MPI_Barrier(MPI_COMM_WORLD);
@@ -336,7 +375,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
     }
 
-    free(hidden); free(tokens);
+    free(hidden_bf16); free(hidden); free(tokens);
     transformer_free(m); bpe_vocab_free(vocab); gguf_close(g);
     if (tc.kind == TP_COMM_UTOFU_RSAG4) tp_rsag4_free(&tc.rsag4);
     if (tc.kind == TP_COMM_UTOFU_TREE) tp_comm_free(&tc.tofu);

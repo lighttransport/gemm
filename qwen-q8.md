@@ -2091,13 +2091,14 @@ At the allocation's 2.0 GHz setting, the conservative dense-compute roofs are:
 
 | path | 12-node arithmetic roof | 27B dense-token roof | requested target |
 |---|---:|---:|---:|
-| BF16 storage, FP32 FMA | 36.864 TFLOP/s | 683 tok/s | 500 tok/s (73% of peak) |
+| BF16 storage, FP32 FMA | 73.728 TFLOP/s | 1365 tok/s | 500 tok/s (37% of peak) |
 | Q8 SDOT, one vector issue/cycle | 147.456 TOP/s | 2731 tok/s | 1000 tok/s (37% of peak) |
 | measured Q8v2 kernel, 187 GIOPS/core | 107.7 TOP/s | 1994 tok/s | 1000 tok/s (50% of kernel roof) |
 
 The calculation uses two operations per parameter, 48 cores/node, 16 FP32 SVE
-lanes, two FP FMA pipes, and a conservative single SDOT issue rate.  It is an
-arithmetic upper bound: causal attention, DeltaNet recurrence, activation
+lanes, two FP FMA pipes, and a conservative single SDOT issue rate.  The prior
+36.864 TFLOP/s figure accidentally omitted the second operation in each FMA.
+It is an arithmetic upper bound: causal attention, DeltaNet recurrence, activation
 packing, pipeline bubbles, and communication all lower application throughput.
 At chunk 256 the weight-stream bandwidth roof is far higher, because each
 packed panel is reused by 256 tokens; prefill is compute/communication bound,
@@ -2118,6 +2119,23 @@ useful topology diagnostic, but the first 4096/chunk128 run reached only 62.04
 tok/s: the stages were imbalanced, full-width attention was costly, and the
 last stage faulted the tied LM head from the shared GGUF.  This is not an
 accepted performance path.  The measured results establish the next kernel
-work: BF16 needs a projection path above 73% machine FP peak plus cheaper
+work: BF16 needs substantially higher projection efficiency plus cheaper
 non-GEMM phases; Q8 needs a wider/reused-activation SDOT schedule and reductions
 below the present PP3xTP4 critical path.
+
+The first BF16-activation driver pass now stores complete 12-token p-odd tiles
+directly to their final token-major destination and reuses the packed activation
+for consecutive matrices with the same input.  The old temporary tile remains
+available with `TF_PODD_DIRECT_OUT=0`, and activation reuse can be disabled with
+`TF_PODD_REUSE_X=0`.  The current short gate remains `next=192550`; the 4096
+gate remains `next=226343`.  On this allocation the full run is still about
+230--232 tok/s, so these lossless driver changes alone do not approach 500.
+
+A one-region grouped projection dispatcher reduced short-run time but changed
+attention and FFN results and was rejected.  BF16 pipeline payloads are retained
+behind `Q38_PREFILL_PIPE_BF16=1`; they preserved the measured gates but were
+end-to-end neutral.  The launcher now leaves the decode pthread pool off after
+the first chunk.  An actual-shape `252x5120x3840` p-odd microbenchmark measured
+2.56 TFLOP/s/node including its legacy weight pack and output transpose,
+confirming driver headroom while also showing that communication and non-GEMM
+phases must be reduced alongside GEMM.

@@ -10067,6 +10067,9 @@ size_t transformer_prepack_q8b6_range(transformer_model*m,int l0,int l1){
 extern void sgemm_bf16_2x12(int64_t K, const void *A, const void *B, float *C, int64_t ldc);
 static uint16_t *tf_podd_Wp = NULL, *tf_podd_Xa = NULL;
 static size_t tf_podd_Wcap = 0, tf_podd_Xcap = 0;
+static const float *tf_podd_cache_x = NULL;
+static int tf_podd_cache_n = 0, tf_podd_cache_k = 0, tf_podd_cache_xs = 0;
+static float tf_podd_cache_tag[8];
 /* pack one [n_rows][K] BF16 weight -> k-major interleaved (the p_odd A layout). */
 static void tf_podd_pack_w(const uint16_t *W, uint16_t *Wp, int n_rows, int K, int nt) {
     const int PMR = 32; int FT = n_rows / PMR;
@@ -10094,13 +10097,24 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
         tf_podd_pack_w(W, tf_podd_Wp, n_rows, K, nt);
         Wp = tf_podd_Wp;
     }
-    if (xn > tf_podd_Xcap) { free(tf_podd_Xa); tf_podd_Xa = (uint16_t *)malloc(xn); tf_podd_Xcap = tf_podd_Xa ? xn : 0; }
+    if (xn > tf_podd_Xcap) { free(tf_podd_Xa); tf_podd_Xa = (uint16_t *)malloc(xn); tf_podd_Xcap = tf_podd_Xa ? xn : 0; tf_podd_cache_x = NULL; }
     if (!tf_podd_Xa) return 0;
     uint16_t *Xa = tf_podd_Xa;
+    static int reuse_x = -1;
+    if (reuse_x < 0) {
+        const char *e = getenv("TF_PODD_REUSE_X");
+        reuse_x = !e || atoi(e) != 0;
+    }
+    float xtag[8]; size_t xcount = (size_t)N * Xs;
+    for (int i = 0; i < 8; i++) xtag[i] = X[xcount * (size_t)i / 8];
+    int xhit = reuse_x && tf_podd_cache_x == X && tf_podd_cache_n == N &&
+               tf_podd_cache_k == K && tf_podd_cache_xs == Xs;
+    for (int i = 0; i < 8 && xhit; i++) xhit = tf_podd_cache_tag[i] == xtag[i];
     /* pack X -> k-major BF16 (transpose + fp32->BF16). SVE: per token, load contiguous
      * fp32, BF16 = top 16 bits (lsr#16 + halfword scatter to Xb[k*12+n], stride 12). */
     /* collapse(tt,n): TT*PNR work units so ALL nt threads pack (was TT-only -> for
      * ffn_down TT=10 starved 38 threads while K=15360 made each unit 4x heavier). */
+    if (!xhit) {
     #ifdef _OPENMP
     #pragma omp parallel for num_threads(nt) schedule(static) collapse(2)
     #endif
@@ -10114,6 +10128,12 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
                 svuint32_t hu = svlsr_n_u32_x(pg, svreinterpret_u32_f32(svld1_f32(pg, xr + k)), 16);
                 svuint32_t idx = svadd_n_u32_x(pg, lanes, (uint32_t)(k*PNR + n));
                 svst1h_scatter_u32index_u32(pg, (uint16_t *)Xb, idx, hu); } }
+    }
+    if (!xhit) {
+        tf_podd_cache_x = X; tf_podd_cache_n = N;
+        tf_podd_cache_k = K; tf_podd_cache_xs = Xs;
+        for (int i = 0; i < 8; i++) tf_podd_cache_tag[i] = xtag[i];
+    }
     /* kernel per (feat-tile, tok-tile); transpose col-major C -> token-major Y.
      * For large K (e.g. ffn_down K=15360) the 32xK W strip (983 KB) x12 cores
      * overflows the 8 MB CMG L2 -> thrashes, re-streaming W across tok-tiles
@@ -10131,7 +10151,7 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
           for (int kp = 0; kp < NP; kp++) {
               int k0 = kp * Kc, kk = (K - k0 < Kc) ? (K - k0) : Kc;
               #ifdef _OPENMP
-              #pragma omp for schedule(static) collapse(2)
+    #pragma omp for schedule(static) collapse(2) nowait
               #endif
               for (int ft = 0; ft < FT; ft++) for (int tt = 0; tt < TT; tt++) {
                   sgemm_bf16_2x12(kk, Wp + (size_t)ft*K*PMR + (size_t)k0*PMR,
@@ -10142,17 +10162,40 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
                       else         for (int mm = 0; mm < PMR; mm++) yp[mm] += Ct[mm + n*PMR]; } } } }
         return 1;
     }
+    static int direct_out = -1;
+    if (direct_out < 0) {
+        const char *e = getenv("TF_PODD_DIRECT_OUT");
+        direct_out = !e || atoi(e) != 0;
+    }
     #ifdef _OPENMP
     #pragma omp parallel num_threads(nt)
     #endif
     { float Ct[32 * 12];
       #ifdef _OPENMP
-      #pragma omp for schedule(static) collapse(2)
+    #pragma omp for schedule(static) collapse(2) nowait
       #endif
       for (int ft = 0; ft < FT; ft++) for (int tt = 0; tt < TT; tt++) {
-          sgemm_bf16_2x12(K, Wp + (size_t)ft*K*PMR, Xa + (size_t)tt*K*PNR, Ct, PMR);
-          for (int n = 0; n < PNR; n++) { int tok = tt*PNR + n; if (tok >= N) continue;
-              for (int mm = 0; mm < PMR; mm++) Y[(size_t)tok * Ys + ft*PMR + mm] = Ct[mm + n*PMR]; } } }
+          int tok0 = tt * PNR;
+          if (direct_out && tok0 + PNR <= N) {
+              sgemm_bf16_2x12(K, Wp + (size_t)ft*K*PMR,
+                              Xa + (size_t)tt*K*PNR,
+                              Y + (size_t)tok0*Ys + ft*PMR, Ys);
+          } else {
+              sgemm_bf16_2x12(K, Wp + (size_t)ft*K*PMR,
+                              Xa + (size_t)tt*K*PNR, Ct, PMR);
+              for (int n = 0; n < PNR; n++) {
+                  int tok = tok0 + n; if (tok >= N) continue;
+                  float *yp = Y + (size_t)tok * Ys + ft*PMR;
+#if defined(__ARM_FEATURE_SVE)
+                  svbool_t pg = svptrue_b32();
+                  svst1(pg, yp, svld1(pg, Ct + n*PMR));
+                  svst1(pg, yp + 16, svld1(pg, Ct + n*PMR + 16));
+#else
+                  memcpy(yp, Ct + n*PMR, PMR * sizeof(float));
+#endif
+              }
+          }
+      } }
     return 1;
 }
 /* Combined QKV podd GEMM: q/k/v share the SAME input X and K, so pack X ONCE and run
@@ -10169,6 +10212,7 @@ static int tf_gemm_bf16_podd_qkv(float *Yq, float *Yk, float *Yv,
     size_t xn = (size_t)TT * K * PNR * 2;
     if (xn > tf_podd_Xcap) { free(tf_podd_Xa); tf_podd_Xa = (uint16_t *)malloc(xn); tf_podd_Xcap = tf_podd_Xa ? xn : 0; }
     if (!tf_podd_Xa) return 0;
+    tf_podd_cache_x = NULL;
     uint16_t *Xa = tf_podd_Xa;
     #ifdef _OPENMP
     #pragma omp parallel for num_threads(nt) schedule(static) collapse(2)
@@ -10183,21 +10227,31 @@ static int tf_gemm_bf16_podd_qkv(float *Yq, float *Yk, float *Yv,
                 svuint32_t hu = svlsr_n_u32_x(pg, svreinterpret_u32_f32(svld1_f32(pg, xs + k)), 16);
                 svuint32_t idx = svadd_n_u32_x(pg, lanes, (uint32_t)(k*PNR + n));
                 svst1h_scatter_u32index_u32(pg, (uint16_t *)Xb, idx, hu); } }
+    static int direct_out = -1;
+    if (direct_out < 0) {
+        const char *e = getenv("TF_PODD_DIRECT_OUT");
+        direct_out = !e || atoi(e) != 0;
+    }
     #ifdef _OPENMP
     #pragma omp parallel num_threads(nt)
     #endif
     { float Ct[32 * 12];
       #define TF_QKV_TILE(FT, W, Y, Ys) \
         for (int ft = 0; ft < (FT); ft++) for (int tt = 0; tt < TT; tt++) { \
-            sgemm_bf16_2x12(K, (W) + (size_t)ft*K*PMR, Xa + (size_t)tt*K*PNR, Ct, PMR); \
-            for (int n = 0; n < PNR; n++) { int tok = tt*PNR + n; if (tok >= N) continue; \
-                for (int mm = 0; mm < PMR; mm++) (Y)[(size_t)tok*(Ys) + ft*PMR + mm] = Ct[mm + n*PMR]; } }
+            int tok0 = tt * PNR; \
+            if (direct_out && tok0 + PNR <= N) { \
+                sgemm_bf16_2x12(K, (W) + (size_t)ft*K*PMR, Xa + (size_t)tt*K*PNR, \
+                    (Y) + (size_t)tok0*(Ys) + ft*PMR, (Ys)); \
+            } else { \
+                sgemm_bf16_2x12(K, (W) + (size_t)ft*K*PMR, Xa + (size_t)tt*K*PNR, Ct, PMR); \
+                for (int n = 0; n < PNR; n++) { int tok = tok0+n; if (tok >= N) continue; \
+                    memcpy((Y)+(size_t)tok*(Ys)+ft*PMR, Ct+n*PMR, PMR*sizeof(float)); } } }
       #ifdef _OPENMP
-      #pragma omp for schedule(static) collapse(2) nowait
+      #pragma omp for schedule(static) collapse(2)
       #endif
       TF_QKV_TILE(rq / PMR, Wq, Yq, Ysq)
       #ifdef _OPENMP
-      #pragma omp for schedule(static) collapse(2) nowait
+      #pragma omp for schedule(static) collapse(2)
       #endif
       TF_QKV_TILE(rk / PMR, Wk, Yk, Ysk)
       #ifdef _OPENMP
@@ -13069,11 +13123,11 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                                       lq, ne, m->n_threads);
             tf_gemm_f16_mt_tokenmajor(gate, &L->ssm_gate, norm, ld, N,
                                       ld, ne, m->n_threads);
-            /* kv/vv are idle during SSM projection and provide separate scalar
-             * storage; inner is overwritten by each token's recurrent output. */
             tf_gemm_f16_mt_tokenmajor(kv, &L->ssm_alpha, norm,
                                       m->ssm_dt_rank, N, m->ssm_dt_rank,
                                       ne, m->n_threads);
+            /* kv/vv are idle during SSM projection and provide separate scalar
+             * storage; inner is overwritten by each token's recurrent output. */
             tf_gemm_f16_mt_tokenmajor(vv, &L->ssm_beta, norm,
                                       m->ssm_dt_rank, N, m->ssm_dt_rank,
                                       ne, m->n_threads);
