@@ -21,6 +21,10 @@ keeps FP16 accumulators across the full K dimension.
 ```sh
 make -C a64fx/fp4-gemm
 make -C a64fx/fp4-gemm test
+
+# Scalar base-ISA arithmetic microbenchmark (no SIMD/SVE/FP/TBL)
+OMP_NUM_THREADS=1 OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./a64fx/fp4-gemm/bench_fp4_ex
 ```
 
 The implementation requires `N` and `K` divisible by 32. Arbitrary `M` is

@@ -5,6 +5,27 @@ Measured on one A64FX node with 48 cores, Fujitsu Compiler 4.12.2,
 loaded into anonymous HBM; `MemAvailable` remained approximately 26.3 GiB.
 Offline staging and quantization are excluded from GEMM timing.
 
+## Scalar EX-only FP4 arithmetic
+
+Before GEMM integration, a standalone assembly microbenchmark measured
+LUT-free scalar AArch64 arithmetic. It contains no NEON, SVE, floating-point,
+or `TBL` instructions. E2M1 magnitude uses fixed shifts and a `MADD` to map
+`0..7` exactly to the doubled integers `0,1,2,3,4,6,8,12`; sign is applied by
+integer mask arithmetic. The kernels write int16 results so the measurement
+includes the intended L1 exchange store.
+
+With a 32 KiB packed working set and 4096 repetitions on one core:
+
+| Kernel | Rate | Time per FP4 value |
+|---|---:|---:|
+| FP4 dequantize to signed integer | 0.212 Gvalue/s | 4.72 ns |
+| FP4 x FP4 signed integer product | 0.106 Gproduct/s | 9.43 ns |
+
+Counting one multiply and one eventual accumulation as two GEMM operations,
+the product kernel represents only about 0.21 effective GFLOP/s. Consequently,
+per-nibble scalar arithmetic is not suitable as the producer for the SVE GEMM;
+it would starve the FL consumer despite using a separate execution pipe.
+
 ## Optimized single-core N32 kernel
 
 The output-vectorized SVE kernel was measured on one pinned core with synthetic
