@@ -177,6 +177,12 @@ tables per packed K pair. It is also exact, but doubles the table-operation
 count needed to cover 128 rows and reaches only 84.5 GFLOP/s at K4; it is a
 pipeline diagnostic rather than a selected kernel.
 
+The selected packed MXFP4 M1 assembly now scales the E2M1 table by the scalar
+activation once per K and performs FMLA directly against each row-scale
+vector. Two L1 table reloads use the load pipes instead of FLA register moves.
+This raises the N=32768, K=4096, K256-promotion result from roughly 280 to
+300.5 GFLOP/s (84.5 GB/s packed source) on one 12-core CMG.
+
 ### Scalar EX packed-FP4 producer
 
 `bench_fp4_ex` also measures a packed-FP4 producer using only scalar AArch64

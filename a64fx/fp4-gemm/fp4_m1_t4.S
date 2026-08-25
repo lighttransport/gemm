@@ -23,6 +23,7 @@ fp4_mx_m1_t4_asm:
     adrp    x13, .Le2m1_t4
     add     x13, x13, :lo12:.Le2m1_t4
     ld1h    z0.h, p0/z, [x13]
+    mov     x14, x13
     dup     z1.h, #15
     eor     z2.d, z2.d, z2.d
     eor     z3.d, z3.d, z3.d
@@ -77,33 +78,29 @@ fp4_mx_m1_t4_asm:
     zip1    z9.h, z9.h, z19.h
     zip1    z10.h, z10.h, z20.h
     zip1    z11.h, z11.h, z21.h
-    tbl     z22.h, {z0.h}, z22.h
-    tbl     z23.h, {z0.h}, z23.h
-    tbl     z24.h, {z0.h}, z24.h
-    tbl     z25.h, {z0.h}, z25.h
-    tbl     z8.h, {z0.h}, z8.h
-    tbl     z9.h, {z0.h}, z9.h
-    tbl     z10.h, {z0.h}, z10.h
-    tbl     z11.h, {z0.h}, z11.h
-    fmul    z22.h, p0/m, z22.h, z6.h
-    fmul    z23.h, p0/m, z23.h, z7.h
-    fmul    z24.h, p0/m, z24.h, z16.h
-    fmul    z25.h, p0/m, z25.h, z17.h
-    fmul    z8.h, p0/m, z8.h, z6.h
-    fmul    z9.h, p0/m, z9.h, z7.h
-    fmul    z10.h, p0/m, z10.h, z16.h
-    fmul    z11.h, p0/m, z11.h, z17.h
-    ld1rh   z26.h, p0/z, [x9]
-    ld1rh   z27.h, p0/z, [x9, #2]
+    ld1rh   z28.h, p0/z, [x9]
+    ld1rh   z29.h, p0/z, [x9, #2]
     add     x9, x9, #4
-    fmla    z2.h, p0/m, z22.h, z26.h
-    fmla    z3.h, p0/m, z23.h, z26.h
-    fmla    z4.h, p0/m, z24.h, z26.h
-    fmla    z5.h, p0/m, z25.h, z26.h
-    fmla    z2.h, p0/m, z8.h, z27.h
-    fmla    z3.h, p0/m, z9.h, z27.h
-    fmla    z4.h, p0/m, z10.h, z27.h
-    fmla    z5.h, p0/m, z11.h, z27.h
+    ld1h    z26.h, p0/z, [x14]
+    ld1h    z27.h, p0/z, [x14]
+    fmul    z26.h, p0/m, z26.h, z28.h
+    fmul    z27.h, p0/m, z27.h, z29.h
+    tbl     z22.h, {z26.h}, z22.h
+    tbl     z23.h, {z26.h}, z23.h
+    tbl     z24.h, {z26.h}, z24.h
+    tbl     z25.h, {z26.h}, z25.h
+    tbl     z8.h, {z27.h}, z8.h
+    tbl     z9.h, {z27.h}, z9.h
+    tbl     z10.h, {z27.h}, z10.h
+    tbl     z11.h, {z27.h}, z11.h
+    fmla    z2.h, p0/m, z22.h, z6.h
+    fmla    z3.h, p0/m, z23.h, z7.h
+    fmla    z4.h, p0/m, z24.h, z16.h
+    fmla    z5.h, p0/m, z25.h, z17.h
+    fmla    z2.h, p0/m, z8.h, z6.h
+    fmla    z3.h, p0/m, z9.h, z7.h
+    fmla    z4.h, p0/m, z10.h, z16.h
+    fmla    z5.h, p0/m, z11.h, z17.h
     add     x1, x1, #16
     add     x2, x2, #16
     add     x3, x3, #16
