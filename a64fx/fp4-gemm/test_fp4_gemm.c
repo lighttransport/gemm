@@ -15,10 +15,10 @@ int main(void){
     for(int b=0;b<=0x7e;++b){float x=fp4_e4m3_decode_positive((uint8_t)b);
         uint8_t q=fp4_e4m3_encode_positive(x);
         if(q!=(uint8_t)b && !(b==0x7f)){fprintf(stderr,"e4m3 %d -> %d\n",b,q);return 1;}}
-    enum{M=7,N=32,K=64}; float*w=malloc((size_t)N*K*4),*ref=malloc((size_t)M*N*4),*got=malloc((size_t)M*N*4),*got2=malloc((size_t)M*N*4);
+    enum{M=7,N=128,K=64}; float*w=malloc((size_t)N*K*4),*ref=malloc((size_t)M*N*4),*got=malloc((size_t)M*N*4),*got2=malloc((size_t)M*N*4);
     _Float16*a=malloc((size_t)M*K*2);if(!w||!ref||!got||!got2||!a)return 1;
     for(int i=0;i<N*K;++i)w[i]=rnd()*0.25f;for(int i=0;i<M*K;++i)a[i]=(_Float16)(rnd()*0.5f);
-    for(int f=0;f<3;++f){fp4_matrix p;if(fp4_matrix_alloc(&p,(fp4_format)f,N,K)||fp4_quantize_f32(&p,w)||fp4_matrix_prepare_n32(&p))return 1;
+    for(int f=0;f<3;++f){fp4_matrix p;if(fp4_matrix_alloc(&p,(fp4_format)f,N,K)||fp4_quantize_f32(&p,w)||fp4_matrix_prepare_n32(&p)||fp4_matrix_prepare_u8(&p))return 1;
         fp4_gemm_reference(ref,a,&p,M,1);
         for(int kc=0;kc<=64;kc+=32){if(fp4_gemm_f16(got,a,&p,M,kc,2)||fp4_gemm_f16_n32(got2,a,&p,M,kc))return 1;double num=0,den=0,num2=0;
             for(int i=0;i<M*N;++i){double d=got[i]-ref[i],d2=got2[i]-ref[i];num+=d*d;num2+=d2*d2;den+=(double)ref[i]*ref[i];}
@@ -32,6 +32,10 @@ int main(void){
         if(fp4_gemm_f16_l2(got,a,&p,M,32))return 1;
         double np=0,dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
         double rp=sqrt(np/(dp+1e-30));printf("%s l2panel_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
+        if(!isfinite(rp)||rp>0.08)return 1;
+        if(fp4_gemm_f16_u8tbl_omp(got,a,&p,1,32,2))return 1;
+        np=0;dp=0;for(int i=0;i<N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
+        rp=sqrt(np/(dp+1e-30));printf("%s u8tbl_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
         if(!isfinite(rp)||rp>0.08)return 1;
         if(fp4_gemm_f16_n32_omp(got,a,&p,M,32,2))return 1;
         np=0;dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}

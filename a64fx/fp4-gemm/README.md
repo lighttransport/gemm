@@ -107,6 +107,10 @@ processes four N32 tiles concurrently, broadcasts each activation once, and
 uses four vector FMLAs instead of indexed scalar FMLAs. Recommended CMG
 dispatch is direct N32 for M<=6 and the decoded L2 panel for M>=12.
 
+`fp4_matrix_prepare_u8` plus `fp4_gemm_f16_u8tbl_omp` is an opt-in experiment
+that stores one nibble per byte. It removes `ZIP1` but doubles code traffic and
+is slower in useful GFLOP/s. Normal preparation does not allocate this sidecar.
+
 `fp4_gemm_f16_l2` instead dequantizes one packed `N32 x K` weight panel into a
 K-major FP16 workspace and reuses it for every activation row. At K=4096 the
 workspace is 256 KiB, so it resides in L2 rather than the 64 KiB L1. Use direct

@@ -27,12 +27,18 @@ static void run_direct_omp(float*c,const _Float16*a,const fp4_matrix*w,int m,int
     printf("kernel=directfused threads=%d M=%d kc=%d ms=%.2f gflops=%.2f source_GB/s=%.2f\n",threads,m,kc,best*1e3,
         2.0*m*w->n*w->k/best/1e9,src*passes/best/1e9);
 }
+static void run_u8_omp(float*c,const _Float16*a,const fp4_matrix*w,int kc,size_t src,int threads){
+    fp4_gemm_f16_u8tbl_omp(c,a,w,1,kc,threads);double best=1e9;
+    for(int r=0;r<3;++r){double t=now();fp4_gemm_f16_u8tbl_omp(c,a,w,1,kc,threads);double d=now()-t;if(d<best)best=d;}
+    printf("kernel=u8tbl threads=%d M=1 kc=%d ms=%.2f gflops=%.2f source_GB/s=%.2f\n",threads,kc,best*1e3,
+        2.0*w->n*w->k/best/1e9,src/best/1e9);
+}
 int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(argv[2]):4096;
     int kc=argc>3?atoi(argv[3]):256;
     if(n%32||k%32)return 2;fp4_matrix w;if(fp4_matrix_alloc(&w,FP4_MX,n,k))return 1;
     for(size_t i=0;i<w.code_bytes;++i)w.codes[i]=(uint8_t)rnd();
     for(size_t i=0;i<w.scale_bytes;++i)w.scales[i]=124; /* 2^-3 */
-    if(fp4_matrix_prepare_n32(&w))return 1;
+    if(fp4_matrix_prepare_n32(&w)||fp4_matrix_prepare_u8(&w))return 1;
     size_t source=w.code_bytes+w.scales_n32_count*sizeof(_Float16);
     printf("streaming MXFP4 N=%d K=%d packed=%.1f MiB prepared_scales=%.1f MiB source=%.1f MiB\n",n,k,
         w.code_bytes/1048576.,w.scales_n32_count*2/1048576.,source/1048576.);
@@ -61,5 +67,6 @@ int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(arg
       run("l2full",fp4_gemm_f16_l2,c,a,&w,m,kc,source);
       if(kc)run("l1panel",fp4_gemm_f16_l1panel,c,a,&w,m,kc,source);
       run_direct_omp(c,a,&w,m,kc,source,12);
+      if(m==1)run_u8_omp(c,a,&w,kc,(size_t)n*k+w.scales_n32_count*2,12);
       run_omp(c,a,&w,m,kc,source,12);
       free(a);free(c);}fp4_matrix_free(&w);return 0;}

@@ -133,6 +133,25 @@ was rejected because register spills reduced it to 131 GFLOP/s. At an assumed
 818 GFLOP/s. The current M=1 kernel reaches 34% of that roof; FLA-only nibble
 interleave/table lookup remains the principal execution limit.
 
+#### Removing ZIP1 and TBL
+
+The BF16 `p_odd` load works because every BF16 already occupies a separate
+16-bit memory position. Two FP4 values share one byte, so placing them directly
+in alternating halfword lanes requires either a permutation or padding to one
+byte per nibble. An opt-in 1-byte/nibble sidecar measured that trade-off:
+
+| Representation and decode | GFLOP/s | Source GB/s |
+|---|---:|---:|
+| Packed FP4, `ZIP1` + `TBL` | 280 | 78.6 |
+| One-byte nibble, no `ZIP1`, one `TBL` | 226 | 120.3 |
+| One-byte nibble, no `ZIP1`/`TBL`, arithmetic bits | 167 | 88.9 |
+
+All results use M=1, K=256 promotion, and one 12-core CMG. Removing `ZIP1`
+raises byte bandwidth, but the padded representation doubles weight traffic
+and lowers useful throughput. Arithmetic E2M1 construction replaces one
+six-cycle FLA `TBL` with about ten mask/shift/predicate operations and is also
+slower. Packed FP4 remains the selected representation.
+
 The result is below the 256 GFLOP/s/core dense-FP16 peak because A64FX has no
 FP4 arithmetic. Every 32-output FMA step also requires a 16-byte packed load,
 byte-to-halfword expansion, two nibble operations, interleave, table lookup,
