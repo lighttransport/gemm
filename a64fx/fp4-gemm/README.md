@@ -190,6 +190,15 @@ extra FP16 workspace traffic and reaches 383.5 GFLOP/s; scalar-offset SVE loads
 in place of sequential pointer updates constrain address generation and reach
 383.7 GFLOP/s.
 
+`fp4_gemv_i8_sdot4_omp` is an exact-density packed K4 SDOT experiment. Each
+64-byte load contains 32 rows by four K values; byte `TBL`, `ZIP1/ZIP2`, and
+two SDOTs produce 32 INT32 outputs. Four chunks are kept in flight and FP32
+promotion is transposed across eight independent vectors. It matches expanded
+K4 SDOT within 1e-7 relative L2, but A64FX byte-table/permutation execution
+limits it to 83.5 GFLOP/s (about 26 GB/s including its FP32 scale sidecar).
+It is retained as a negative control, not selected over the 400 GFLOP/s t8
+FP16 path or 410 GFLOP/s expanded SDOT path.
+
 ### Scalar EX packed-FP4 producer
 
 `bench_fp4_ex` also measures a packed-FP4 producer using only scalar AArch64

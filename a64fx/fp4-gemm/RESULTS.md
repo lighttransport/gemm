@@ -306,6 +306,20 @@ as the limiter. Indexed `LD1SH` is the measured ceiling, so this route is kept
 as a packed-density control rather than replacing the 409.1 GFLOP/s K4 SDOT
 kernel.
 
+### Packed K4 SDOT
+
+A second exact-density SDOT layout packs `32 rows x K4` into each 64-byte SVE
+load. Two byte table decodes plus `ZIP1/ZIP2` feed two SDOT vectors, with all
+four N128 chunks in flight. FP32 activation scaling and accumulation are
+scheduled across eight independent vectors. Synthetic MXFP4/NVFP4 results
+match expanded K4 SDOT within 1e-7 relative L2.
+
+Despite the lower static operation count, byte `TBL` plus byte permutation is
+only 83.5 GFLOP/s on one CMG. Its 64 MiB codes plus 16 MiB FP32 row-scale
+sidecar move at roughly 26 GB/s. This rejects packed byte-table SDOT as the
+route to 800 GFLOP/s; expanded sequential SDOT remains about 410 GFLOP/s and
+the packed FP16 t8 kernel remains about 400 GFLOP/s.
+
 A second packed experiment replaced each 256-entry gather with two sequential
 16-entry `TBL`s, one for each activation in a packed K pair. It is exact and
 removes indexed loads, but requires 16 `TBL`s per K pair to cover 128 rows.

@@ -24,6 +24,7 @@ typedef struct {
     uint8_t *codes_n32;
     uint8_t *codes_u8;
     int8_t *codes_sdot;
+    uint8_t *codes_sdot4;
     uint8_t *codes_pair;
     uint8_t *codes_t8;
     uint32_t *codes_bitplane;
@@ -31,6 +32,7 @@ typedef struct {
     _Float16 *scales_sdot;
     _Float16 *scales_pair;
     _Float16 *scales_t8;
+    float *scales_sdot4;
     size_t scales_n32_count;
 } fp4_matrix;
 
@@ -58,6 +60,7 @@ int fp4_matrix_prepare_n32(fp4_matrix *matrix);
 int fp4_matrix_prepare_u8(fp4_matrix *matrix);
 int fp4_matrix_prepare_bitplane(fp4_matrix *matrix);
 int fp4_matrix_prepare_sdot(fp4_matrix *matrix);
+int fp4_matrix_prepare_sdot4(fp4_matrix *matrix);
 int fp4_matrix_prepare_pair(fp4_matrix *matrix);
 float fp4_dequant_value(const fp4_matrix *matrix, int row, int col);
 
@@ -87,6 +90,8 @@ int fp4_i8_activation_prepare(fp4_i8_activation *q, const float *a, int k,
 void fp4_i8_activation_free(fp4_i8_activation *q);
 int fp4_gemv_i8_sdot_omp(float *c, const fp4_i8_activation *a,
                           const fp4_matrix *w, int threads);
+int fp4_gemv_i8_sdot4_omp(float *c, const fp4_i8_activation *a,
+                           const fp4_matrix *w, int threads);
 int fp4_pair_activation_prepare(fp4_pair_activation *q, const float *a,
                                  int k, int scale_group);
 void fp4_pair_activation_free(fp4_pair_activation *q);
