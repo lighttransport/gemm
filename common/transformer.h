@@ -281,6 +281,8 @@ typedef struct {
     int tp_rank;               /* this rank's position in the TP group (0 if no TP) */
     int tp_size;               /* size of the TP group (1 if no TP) */
     void (*tp_allreduce_fn)(float *buf, int count, void *ctx);  /* allreduce callback */
+    void (*tp_reduce_add_fn)(float *buf, float *residual, int count,
+                             void *ctx); /* optional fused allreduce + residual add */
     void *tp_allreduce_ctx;    /* opaque context passed to allreduce (e.g. parallel_config*) */
     int tp_attn_sharded, tp_ffn_sharded, tp_ssm_sharded;
     int tp_qhead_offset, tp_kv_head_base, tp_kv_head_count;
@@ -482,6 +484,9 @@ void transformer_embed_token(transformer_model *model, int32_t token_id);
 void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
                          void (*allreduce_fn)(float *buf, int count, void *ctx),
                          void *allreduce_ctx);
+void transformer_set_tp_reduce_add(transformer_model *model,
+                         void (*reduce_add_fn)(float *buf, float *residual,
+                                               int count, void *ctx));
 int transformer_tp_slice_weights(transformer_model *model, int tp_rank, int tp_size,
                                   int ssm_shard);
 size_t transformer_tp_load_stage(transformer_model *model, const char *stage_dir,
@@ -8701,6 +8706,11 @@ void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
     model->tp_allreduce_ctx = allreduce_ctx;
 }
 
+void transformer_set_tp_reduce_add(transformer_model *model,
+        void (*reduce_add_fn)(float *buf, float *residual, int count, void *ctx)) {
+    if (model) model->tp_reduce_add_fn = reduce_add_fn;
+}
+
 static void tf_tp_slice_rows(qtensor *t, int r0, int r1) {
     if (!t->data || r1 <= r0) return;
     size_t rb = tf_row_bytes(t->type, t->n_cols);
@@ -10566,6 +10576,44 @@ static int tf_podd_compute_packed(float *Y, const uint16_t *Wp,
     return 1;
 }
 
+/* Run 2-3 same-input, prepacked p-odd projections in one barrier-free tile
+ * queue. All Qwen input projections have K=5120, so no large-K accumulation
+ * is required here. */
+static int tf_podd_compute_multi(float *Y0, const uint16_t *W0, int R0, int Ys0,
+        float *Y1, const uint16_t *W1, int R1, int Ys1,
+        float *Y2, const uint16_t *W2, int R2, int Ys2,
+        const uint16_t *Xa, int K, int N, int nt) {
+    const int PMR=32,PNR=12;
+    if(!Y0||!W0||!Y1||!W1||!Xa||K>6144||R0%PMR||R1%PMR||
+       (Y2&&(!W2||R2%PMR)))return 0;
+    int TT=(N+PNR-1)/PNR;
+    int n0=(R0/PMR)*TT,n1=(R1/PMR)*TT,n2=Y2?(R2/PMR)*TT:0;
+    int total=n0+n1+n2;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for(int z=0;z<total;z++){
+        float *Y;const uint16_t*W;int Ys,u;
+        if(z<n0){Y=Y0;W=W0;Ys=Ys0;u=z;}
+        else if(z<n0+n1){Y=Y1;W=W1;Ys=Ys1;u=z-n0;}
+        else{Y=Y2;W=W2;Ys=Ys2;u=z-n0-n1;}
+        int ft=u/TT,tt=u%TT,tok0=tt*PNR;
+        if(tok0+PNR<=N){
+            sgemm_bf16_2x12(K,W+(size_t)ft*K*PMR,
+                Xa+(size_t)tt*K*PNR,Y+(size_t)tok0*Ys+ft*PMR,Ys);
+        }else{
+            float Ct[PMR*PNR];
+            sgemm_bf16_2x12(K,W+(size_t)ft*K*PMR,
+                Xa+(size_t)tt*K*PNR,Ct,PMR);
+            for(int n=0;n<PNR;n++){
+                int tok=tok0+n;if(tok>=N)continue;
+                memcpy(Y+(size_t)tok*Ys+ft*PMR,Ct+n*PMR,PMR*sizeof(float));
+            }
+        }
+    }
+    return 1;
+}
+
 /* Gate has already populated Ygate and left its normalized input in tf_podd_Xa.
  * Evaluate up, apply the production SVE SiLU, truncate directly into the p_odd
  * activation layout required by down, then run down without FP32 up/inner
@@ -12329,6 +12377,79 @@ static void tf_rmsnorm_batch(float *dst, const float *src, const qtensor *w,
     }
 }
 
+/* RMSNorm plus the p-odd token pack consumed by the following BF16
+ * projections. The FP32 dst is retained for fallback/small projections, while
+ * the first p-odd GEMM observes a cache hit and skips its separate pack pass. */
+static int tf_rmsnorm_batch_pack_podd(float *dst, const float *src,
+        const qtensor *w, int K, int N, float eps, float *w_buf, int nt) {
+#if defined(TF_HAVE_BF16_PODD) && defined(__ARM_FEATURE_SVE)
+    const int PNR = 12;
+    const char *cmg = getenv("TF_PODD_CMG");
+    if (cmg && atoi(cmg) != 0) return 0;
+    int TT = (N + PNR - 1) / PNR;
+    size_t xn = (size_t)TT * K * PNR * sizeof(uint16_t);
+    if (xn > tf_podd_Xcap) {
+        free(tf_podd_Xa);
+        tf_podd_Xa = (uint16_t *)tf_aligned_alloc_notouch(256, xn);
+        tf_podd_Xcap = tf_podd_Xa ? xn : 0;
+    }
+    if (!tf_podd_Xa) return 0;
+    const float *wv = w->type == GGML_TYPE_F32 ? (const float *)w->data : w_buf;
+    if (wv == w_buf) tf_dequant_row(w, 0, w_buf);
+    int vl = (int)svcntw();
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int tok = 0; tok < TT * PNR; tok++) {
+        int tt = tok / PNR, n = tok % PNR;
+        uint16_t *xb = tf_podd_Xa + (size_t)tt * K * PNR;
+        svuint32_t lanes = svindex_u32((uint32_t)n, (uint32_t)PNR);
+        if (tok >= N) {
+            for (int i = 0; i < K; i += vl) {
+                svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)K);
+                svst1h_scatter_u32index_u32(pg, xb,
+                    svadd_n_u32_x(pg, lanes, (uint32_t)(i * PNR)),
+                    svdup_u32(0));
+            }
+            continue;
+        }
+        const float *xi = src + (size_t)tok * K;
+        float *yi = dst ? dst + (size_t)tok * K : NULL;
+        svbool_t pt = svptrue_b32();
+        svfloat32_t ss = svdup_f32(0);
+        for (int i = 0; i < K; i += vl) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)K);
+            svfloat32_t x = svld1(pg, xi + i);
+            ss = svmla_f32_m(pg, ss, x, x);
+        }
+        svfloat32_t sc = svdup_f32(1.0f /
+            sqrtf(svaddv_f32(pt, ss) / K + eps));
+        for (int i = 0; i < K; i += vl) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)K);
+            svfloat32_t y = svmul_f32_x(pg,
+                svmul_f32_x(pg, svld1(pg, xi + i), sc), svld1(pg, wv + i));
+            if (yi) svst1(pg, yi + i, y);
+            svuint32_t hi = svlsr_n_u32_x(pg, svreinterpret_u32_f32(y), 16);
+            svst1h_scatter_u32index_u32(pg, xb,
+                svadd_n_u32_x(pg, lanes, (uint32_t)(i * PNR)), hi);
+        }
+    }
+    if (dst) {
+        tf_podd_cache_x = dst; tf_podd_cache_n = N;
+        tf_podd_cache_k = K; tf_podd_cache_xs = K;
+        size_t count = (size_t)N * K;
+        for (int i = 0; i < 8; i++)
+            tf_podd_cache_tag[i] = dst[count * (size_t)i / 8];
+    } else {
+        tf_podd_cache_x = NULL;
+    }
+    return 1;
+#else
+    (void)dst; (void)src; (void)w; (void)K; (void)N;
+    (void)eps; (void)w_buf; (void)nt; return 0;
+#endif
+}
+
 /* Batched QK-norm: per-head RMSNorm for N tokens */
 static void tf_qk_norm_batch(float *vec, int n_heads, int head_dim, int N,
                                const qtensor *norm_w, float eps, float *w_buf) {
@@ -13482,12 +13603,32 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
     m->pool_alive = 0; /* Batch helpers must not dispatch into the decode pool. */
 
     pprof->calls++;
+    static int fused_norm_pack = -1;
+    if (fused_norm_pack < 0) {
+        const char *e = getenv("TF_TP_FUSED_NORM_PACK");
+        const char *p = getenv("TF_PODD");
+        fused_norm_pack = e ? atoi(e) != 0 : (p && atoi(p) != 0);
+    }
+    static int packed_proj = -1;
+    if (packed_proj < 0) {
+        const char *e = getenv("TF_TP_PACKED_PROJ");
+        const char *p = getenv("TF_PODD");
+        packed_proj = e ? atoi(e) != 0 : (p && atoi(p) != 0);
+    }
     for (int l = layer_start; l < layer_end; l++) {
         pprof->layers++;
         transformer_layer *L = &m->layers[l];
         double pt = tf_time_ms();
-        tf_rmsnorm_batch(norm, cur, &L->attn_norm, ne, N,
-                         m->rms_norm_eps, m->matvec_tmp);
+        int attn_norm_packed = packed_proj && !L->is_ssm &&
+            L->attn_q.podd_packed && L->attn_k.podd_packed &&
+            L->attn_v.podd_packed &&
+            tf_rmsnorm_batch_pack_podd(NULL, cur, &L->attn_norm, ne, N,
+                m->rms_norm_eps, m->matvec_tmp, m->n_threads);
+        if (!attn_norm_packed && (!fused_norm_pack ||
+            !tf_rmsnorm_batch_pack_podd(norm, cur, &L->attn_norm, ne, N,
+                m->rms_norm_eps, m->matvec_tmp, m->n_threads)))
+            tf_rmsnorm_batch(norm, cur, &L->attn_norm, ne, N,
+                             m->rms_norm_eps, m->matvec_tmp);
         pprof->norm_ms += tf_time_ms() - pt;
 
         if (L->is_ssm) {
@@ -13602,21 +13743,34 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                                       ne, ld, m->n_threads);
             pprof->out_proj_ms += tf_time_ms() - pt;
             pt = tf_time_ms();
-            if (m->tp_ssm_sharded && m->tp_allreduce_fn)
+            int reduced_added = 0;
+            if (m->tp_ssm_sharded && m->tp_reduce_add_fn) {
+                m->tp_reduce_add_fn(out, cur, N * ne, m->tp_allreduce_ctx);
+                reduced_added = 1;
+            } else if (m->tp_ssm_sharded && m->tp_allreduce_fn)
                 m->tp_allreduce_fn(out, N * ne, m->tp_allreduce_ctx);
             pprof->collective_ms += tf_time_ms() - pt;
-            for (int t = 0; t < N; t++)
-                tf_vadd(cur + (size_t)t * ne, out + (size_t)t * ne, ne);
+            if (!reduced_added)
+                for (int t = 0; t < N; t++)
+                    tf_vadd(cur + (size_t)t * ne, out + (size_t)t * ne, ne);
         } else {
             int q2 = 2 * qdim;
             int ld = m->n_ff;
             pt = tf_time_ms();
-            tf_gemm_f16_mt_tokenmajor(proj, &L->attn_q, norm, q2, N,
-                                      q2, ne, m->n_threads);
-            tf_gemm_f16_mt_tokenmajor(kv, &L->attn_k, norm, kvdim, N,
-                                      kvdim, ne, m->n_threads);
-            tf_gemm_f16_mt_tokenmajor(vv, &L->attn_v, norm, kvdim, N,
-                                      kvdim, ne, m->n_threads);
+            int packed_qkv = attn_norm_packed && L->attn_q.podd_packed &&
+                L->attn_k.podd_packed && L->attn_v.podd_packed &&
+                tf_podd_compute_multi(proj,(const uint16_t *)L->attn_q.data,q2,q2,
+                    kv,(const uint16_t *)L->attn_k.data,kvdim,kvdim,
+                    vv,(const uint16_t *)L->attn_v.data,kvdim,kvdim,
+                    tf_podd_Xa,ne,N,m->n_threads);
+            if (!packed_qkv) {
+                tf_gemm_f16_mt_tokenmajor(proj, &L->attn_q, norm, q2, N,
+                                          q2, ne, m->n_threads);
+                tf_gemm_f16_mt_tokenmajor(kv, &L->attn_k, norm, kvdim, N,
+                                          kvdim, ne, m->n_threads);
+                tf_gemm_f16_mt_tokenmajor(vv, &L->attn_v, norm, kvdim, N,
+                                          kvdim, ne, m->n_threads);
+            }
             pprof->proj_ms += tf_time_ms() - pt;
             /* Prepare Q/K/V and cache rows in prompt order. Compact Q in the
              * first qdim values of its projected row; keep the sigmoid gate in
@@ -13700,16 +13854,28 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                                       ne, qdim, m->n_threads);
             pprof->out_proj_ms += tf_time_ms() - pt;
             pt = tf_time_ms();
-            if (m->tp_attn_sharded && m->tp_allreduce_fn)
+            int reduced_added = 0;
+            if (m->tp_attn_sharded && m->tp_reduce_add_fn) {
+                m->tp_reduce_add_fn(out, cur, N * ne, m->tp_allreduce_ctx);
+                reduced_added = 1;
+            } else if (m->tp_attn_sharded && m->tp_allreduce_fn)
                 m->tp_allreduce_fn(out, N * ne, m->tp_allreduce_ctx);
             pprof->collective_ms += tf_time_ms() - pt;
-            for (int t = 0; t < N; t++)
-                tf_vadd(cur + (size_t)t * ne, out + (size_t)t * ne, ne);
+            if (!reduced_added)
+                for (int t = 0; t < N; t++)
+                    tf_vadd(cur + (size_t)t * ne, out + (size_t)t * ne, ne);
         }
 
         pt = tf_time_ms();
-        tf_rmsnorm_batch(norm, cur, &L->ffn_norm, ne, N,
-                         m->rms_norm_eps, m->matvec_tmp);
+        int ffn_norm_packed = packed_proj && L->ffn_gate.podd_packed &&
+            L->ffn_up.podd_packed &&
+            tf_rmsnorm_batch_pack_podd(NULL, cur, &L->ffn_norm, ne, N,
+                m->rms_norm_eps, m->matvec_tmp, m->n_threads);
+        if (!ffn_norm_packed && (!fused_norm_pack ||
+            !tf_rmsnorm_batch_pack_podd(norm, cur, &L->ffn_norm, ne, N,
+                m->rms_norm_eps, m->matvec_tmp, m->n_threads)))
+            tf_rmsnorm_batch(norm, cur, &L->ffn_norm, ne, N,
+                             m->rms_norm_eps, m->matvec_tmp);
         pprof->norm_ms += tf_time_ms() - pt;
         int ld = L->ffn_gate.n_rows;
         static int podd_ffn_pipe = -1;
@@ -13719,8 +13885,20 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
         }
         int ffn_piped = 0;
         pt = tf_time_ms();
-        tf_gemm_f16_mt_tokenmajor(gate, &L->ffn_gate, norm, ld, N,
-                                  ld, ne, m->n_threads);
+        int packed_up = 0;
+        int packed_gate = ffn_norm_packed && !podd_ffn_pipe &&
+            L->ffn_gate.podd_packed && L->ffn_up.podd_packed &&
+            tf_podd_compute_multi(gate,(const uint16_t *)L->ffn_gate.data,ld,ld,
+                up,(const uint16_t *)L->ffn_up.data,ld,ld,
+                NULL,NULL,0,0,tf_podd_Xa,ne,N,m->n_threads);
+        packed_up = packed_gate;
+        if (!packed_gate)
+            packed_gate = ffn_norm_packed && L->ffn_gate.podd_packed &&
+                tf_podd_compute_packed(gate,(const uint16_t *)L->ffn_gate.data,
+                    tf_podd_Xa,ld,ne,N,ld,m->n_threads);
+        if (!packed_gate)
+            tf_gemm_f16_mt_tokenmajor(gate, &L->ffn_gate, norm, ld, N,
+                                      ld, ne, m->n_threads);
         pprof->ffn_proj_ms += tf_time_ms() - pt;
         if (podd_ffn_pipe) {
             pt = tf_time_ms();
@@ -13731,8 +13909,11 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
         }
         if (!ffn_piped) {
             pt = tf_time_ms();
-            tf_gemm_f16_mt_tokenmajor(up, &L->ffn_up, norm, ld, N,
-                                      ld, ne, m->n_threads);
+            if (!packed_up && !(ffn_norm_packed && L->ffn_up.podd_packed &&
+                  tf_podd_compute_packed(up, (const uint16_t *)L->ffn_up.data,
+                    tf_podd_Xa, ld, ne, N, ld, m->n_threads)))
+                tf_gemm_f16_mt_tokenmajor(up, &L->ffn_up, norm, ld, N,
+                                          ld, ne, m->n_threads);
             pprof->ffn_proj_ms += tf_time_ms() - pt;
             pt = tf_time_ms();
             tf_silu_mul_avx2(inner, gate, up, N * ld);
@@ -13743,11 +13924,16 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             pprof->ffn_down_ms += tf_time_ms() - pt;
         }
         pt = tf_time_ms();
-        if (m->tp_ffn_sharded && m->tp_allreduce_fn)
+        int reduced_added = 0;
+        if (m->tp_ffn_sharded && m->tp_reduce_add_fn) {
+            m->tp_reduce_add_fn(out, cur, N * ne, m->tp_allreduce_ctx);
+            reduced_added = 1;
+        } else if (m->tp_ffn_sharded && m->tp_allreduce_fn)
             m->tp_allreduce_fn(out, N * ne, m->tp_allreduce_ctx);
         pprof->collective_ms += tf_time_ms() - pt;
-        for (int t = 0; t < N; t++)
-            tf_vadd(cur + (size_t)t * ne, out + (size_t)t * ne, ne);
+        if (!reduced_added)
+            for (int t = 0; t < N; t++)
+                tf_vadd(cur + (size_t)t * ne, out + (size_t)t * ne, ne);
     }
 
     if (hidden_io) memcpy(hidden_io, cur, nf * (size_t)ne * sizeof(float));

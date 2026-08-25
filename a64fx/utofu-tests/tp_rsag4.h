@@ -204,7 +204,8 @@ static inline int tp_rsag4_sum(tp_rsag4 *c, float *buf, int count) {
  * 0..3 in deterministic order, truncates the reduced shard for all-gather,
  * and every receiver widens the gathered result back into buf. Network bytes
  * are exactly half of tp_rsag4_sum while all additions remain FP32. */
-static inline int tp_rsag4_sum_bf16(tp_rsag4 *c, float *buf, int count) {
+static inline int tp_rsag4_sum_bf16_impl(tp_rsag4 *c, float *buf,
+                                         float *residual, int count) {
     if (count < 1 || count > c->max_count) return -1;
     uint64_t seq = ++c->seq;
     int shard = (count + 3) / 4;
@@ -312,16 +313,144 @@ static inline int tp_rsag4_sum_bf16(tp_rsag4 *c, float *buf, int count) {
         for (int i = 0; i < n; i += (int)svcntw()) {
             svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
             svuint32_t u = svlsl_n_u32_x(pg, svld1uh_u32(pg, g + i), 16);
-            svst1(pg, buf + start + i, svreinterpret_f32_u32(u));
+            svfloat32_t v = svreinterpret_f32_u32(u);
+            if (residual)
+                svst1(pg, residual + start + i,
+                      svadd_f32_x(pg, svld1(pg, residual + start + i), v));
+            else
+                svst1(pg, buf + start + i, v);
         }
 #else
         for (int i = 0; i < n; i++) {
             uint32_t u = (uint32_t)g[i] << 16;
-            memcpy(buf + start + i, &u, sizeof(u));
+            float v; memcpy(&v, &u, sizeof(v));
+            if (residual) residual[start + i] += v;
+            else buf[start + i] = v;
         }
 #endif
     }
     return 0;
+}
+
+static inline int tp_rsag4_sum_bf16(tp_rsag4 *c, float *buf, int count) {
+    return tp_rsag4_sum_bf16_impl(c, buf, NULL, count);
+}
+
+static inline int tp_rsag4_sum_bf16_add(tp_rsag4 *c, float *buf,
+                                        float *residual, int count) {
+    return tp_rsag4_sum_bf16_impl(c, buf, residual, count);
+}
+
+#if defined(__ARM_FEATURE_SVE)
+static inline void tp_rsag4_i8_quant_block(const float *src,int n,int b,
+                                            int8_t *q,float *sc){
+    const int BS=256,vl=(int)svcntw();int i0=b*BS,i1=i0+BS;
+    if(i1>n)i1=n;float mx=0;
+    for(int i=i0;i<i1;i+=vl){svbool_t pg=svwhilelt_b32(i,i1);
+        float z=svmaxv_f32(pg,svabs_f32_x(pg,svld1(pg,src+i)));if(z>mx)mx=z;}
+    float s=mx>0?mx/127.0f:1.0f,inv=1.0f/s;sc[b]=s;
+    for(int i=i0;i<i1;i+=vl){svbool_t pg=svwhilelt_b32(i,i1);
+        svfloat32_t x=svmul_n_f32_x(pg,svld1(pg,src+i),inv);
+        svint32_t z=svcvt_s32_f32_x(pg,svrintn_f32_x(pg,x));
+        svst1b_s32(pg,q+i,z);}
+}
+static inline void tp_rsag4_i8_quant(const float *src,int n,int8_t *q,float *sc){
+    const int BS=256;int nb=(n+BS-1)/BS;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for(int b=0;b<nb;b++)tp_rsag4_i8_quant_block(src,n,b,q,sc);
+}
+#endif
+
+/* Block-scaled INT8 wire experiment: one signed byte/value plus one FP32 scale
+ * per 256 values. Rank partials and the reduced shard are quantized; owners
+ * dequantize and add ranks 0..3 in FP32 order. */
+static inline int tp_rsag4_sum_i8_impl(tp_rsag4*c,float*buf,float*residual,int count){
+#if defined(__ARM_FEATURE_SVE)
+    if(count<1||count>c->max_count)return-1;
+    const int BS=256;uint64_t seq=++c->seq;int shard=(count+3)/4;
+    int nb=(shard+BS-1)/BS;size_t bytes=(size_t)shard+sizeof(float)*(size_t)nb;
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+    #endif
+    for(int d=0;d<4;d++)for(int b=0;b<nb;b++){
+        char*p=c->region+tp_rsag4_send(c,d);int start=d*shard,n=count-start;
+        if(n>shard)n=shard;if(n<0)n=0;
+        tp_rsag4_i8_quant_block(buf+(start<count?start:count),n,b,
+            (int8_t*)p,(float*)(p+shard));
+    }
+    for(int d=0;d<4;d++){
+        char*p=c->region+tp_rsag4_send(c,d);int start=d*shard,n=count-start;
+        if(n>shard)n=shard;if(n<0)n=0;if(n<shard)memset(p+n,0,(size_t)(shard-n));
+        *(volatile uint64_t*)(p+c->trailer)=seq;
+    }
+    memcpy(c->region+tp_rsag4_recv(c,c->rank),c->region+tp_rsag4_send(c,c->rank),bytes);
+    *(volatile uint64_t*)(c->region+tp_rsag4_recv(c,c->rank)+c->trailer)=seq;
+    int issued[TP_RSAG4_MAX_TNI]={0},di=0;
+    for(int d=0;d<4;d++)if(d!=c->rank){int k=di++%c->ntni;
+        int x=tp_rsag4_put_nb(c,d,tp_rsag4_send(c,d),tp_rsag4_recv(c,c->rank),bytes,k);
+        if(x<0)return-1;issued[k]+=x;}
+    if(tp_rsag4_drain_tcq(c,issued))return-1;
+    memset(issued,0,sizeof(issued));di=0;
+    for(int d=0;d<4;d++)if(d!=c->rank){int k=di++%c->ntni;
+        int x=tp_rsag4_put_nb(c,d,tp_rsag4_send(c,d)+c->trailer,
+            tp_rsag4_recv(c,c->rank)+c->trailer,8,k);if(x<0)return-1;issued[k]+=x;}
+    if(tp_rsag4_drain_tcq(c,issued))return-1;
+    for(int s=0;s<4;s++)if(tp_rsag4_wait(c,tp_rsag4_recv(c,s),seq))return-1;
+    float*sum=(float*)(c->region+tp_rsag4_reduced(c));int vl=(int)svcntw();
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for(int b=0;b<nb;b++){
+        int i0=b*BS,i1=i0+BS;if(i1>shard)i1=shard;
+        for(int i=i0;i<i1;i+=vl){svbool_t pg=svwhilelt_b32(i,i1);
+            svfloat32_t acc=svdup_f32(0);
+            for(int s=0;s<4;s++){char*p=c->region+tp_rsag4_recv(c,s);
+                float sc=((float*)(p+shard))[b];
+                acc=svmla_n_f32_x(pg,acc,svcvt_f32_s32_x(pg,
+                    svld1sb_s32(pg,(const int8_t*)p+i)),sc);}
+            svst1(pg,sum+i,acc);}
+    }
+    char*red=c->region+tp_rsag4_gather(c,c->rank);
+    tp_rsag4_i8_quant(sum,shard,(int8_t*)red,(float*)(red+shard));
+    *(volatile uint64_t*)(red+c->trailer)=seq;
+    memset(issued,0,sizeof(issued));di=0;
+    for(int d=0;d<4;d++)if(d!=c->rank){int k=di++%c->ntni;
+        int x=tp_rsag4_put_nb(c,d,tp_rsag4_gather(c,c->rank),
+            tp_rsag4_gather(c,c->rank),bytes,k);
+        /* Destination is the sender-rank gather slot on every peer. */
+        if(x<0)return-1;issued[k]+=x;}
+    if(tp_rsag4_drain_tcq(c,issued))return-1;
+    memset(issued,0,sizeof(issued));di=0;
+    for(int d=0;d<4;d++)if(d!=c->rank){int k=di++%c->ntni;
+        int x=tp_rsag4_put_nb(c,d,tp_rsag4_gather(c,c->rank)+c->trailer,
+            tp_rsag4_gather(c,c->rank)+c->trailer,8,k);if(x<0)return-1;issued[k]+=x;}
+    if(tp_rsag4_drain_tcq(c,issued))return-1;
+    for(int s=0;s<4;s++)if(tp_rsag4_wait(c,tp_rsag4_gather(c,s),seq))return-1;
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+    #endif
+    for(int s=0;s<4;s++)for(int b=0;b<nb;b++){
+        int start=s*shard,n=count-start;if(n>shard)n=shard;if(n<=0)continue;
+        int i0=b*BS,i1=i0+BS;if(i1>n)i1=n;
+        char*p=c->region+tp_rsag4_gather(c,s);float*sc=(float*)(p+shard);
+        for(int i=i0;i<i1;i+=vl){svbool_t pg=svwhilelt_b32(i,i1);
+            svfloat32_t v=svmul_n_f32_x(pg,svcvt_f32_s32_x(pg,
+                svld1sb_s32(pg,(const int8_t*)p+i)),sc[b]);
+            float*dst=residual?residual+start+i:buf+start+i;
+            if(residual)v=svadd_f32_x(pg,svld1(pg,dst),v);svst1(pg,dst,v);}
+    }
+    return 0;
+#else
+    (void)c;(void)buf;(void)residual;(void)count;return-1;
+#endif
+}
+static inline int tp_rsag4_sum_i8(tp_rsag4*c,float*buf,int count){
+    return tp_rsag4_sum_i8_impl(c,buf,NULL,count);
+}
+static inline int tp_rsag4_sum_i8_add(tp_rsag4*c,float*buf,float*residual,int count){
+    return tp_rsag4_sum_i8_impl(c,buf,residual,count);
 }
 
 static inline void tp_rsag4_free(tp_rsag4 *c) {

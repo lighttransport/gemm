@@ -2204,3 +2204,26 @@ circular-state update exactly.  SSM preparation falls from about **0.52 s to
 0.097 s**.  Combined with the barrier-free scan, the accepted 12-node BF16 run
 reaches **500.93 tok/s** (4096/chunk252, 8.1769 s, `next=62842`); the short gate
 remains `next=1293`.
+
+#### TP4 grouped projections and 600 tok/s BF16 prefill (2026-08-25)
+
+The TP4 prefill schedule now packs RMS-normalized activations directly into the
+p-odd input layout.  Attention Q/K/V and FFN gate/up projections share one
+barrier-free OpenMP task queue, eliminating the projection-local team barriers
+and the unused FP32 normalized buffer.  The packed-only path is guarded by all
+of the destination weights being p-odd packed; exact BF16/PV48 continues through
+the original FP32 normalization and GEMM path.
+
+TP output reductions can add directly into the residual.  The accepted narrow
+wire is block-scaled signed INT8 (256 values per FP32 scale): all four outgoing
+TP shards are quantized in one parallel region, owners sum ranks 0..3 in FP32,
+and all four gathered shards are dequantized and residual-added in one region.
+This retains the checked tokens (`1293` at 128 and `62842` at 4096) while reducing
+rank-0 accumulated collective time from about 1.17 seconds to 0.75--0.80 seconds.
+
+The 12-node BF16-activation launcher therefore defaults to PP3 x TP4, layer cuts
+20/42, chunk252, grouped packed projections, fused residual reductions, and the
+INT8 uTofu wire.  Two consecutive 4096-token runs measured **603.57 tok/s**
+(6.7863 s) and **600.35 tok/s** (6.8227 s), both with `next=62842`.  An exact
+BF16/MPI 128-token fallback check remained `next=1293` with unpacked PV48
+weights.

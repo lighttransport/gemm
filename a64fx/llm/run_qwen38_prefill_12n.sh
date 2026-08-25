@@ -34,9 +34,15 @@ else
     export TF_SSM_PREEXP=${TF_SSM_PREEXP:-0}
 fi
 if [ -z "${Q38_PREFILL_COMM:-}" ]; then
-    if [ "$Q38_PREFILL_BF16" = bf16-act ]; then export Q38_PREFILL_COMM=utofu-bf16
+    if [ "$Q38_PREFILL_BF16" = bf16-act ]; then export Q38_PREFILL_COMM=utofu-i8
     else export Q38_PREFILL_COMM=mpi
     fi
+fi
+if [ "$Q38_PREFILL_BF16" = bf16-act ]; then
+    export Q38_PREFILL_CUT1=${Q38_PREFILL_CUT1:-20}
+    export Q38_PREFILL_CUT2=${Q38_PREFILL_CUT2:-42}
+    export TF_TP_FUSED_NORM_PACK=${TF_TP_FUSED_NORM_PACK:-1}
+    export TF_TP_PACKED_PROJ=${TF_TP_PACKED_PROJ:-1}
 fi
 if [ -z "${Q38_PREFILL_CHUNK:-}" ]; then
     if [ "$Q38_PREFILL_BF16" = bf16-act ]; then export Q38_PREFILL_CHUNK=252
@@ -63,7 +69,7 @@ case "$MODE" in
     check|bench|profile)
         make qwen38_prefill_runner CC=fcc OPENMP=1
         case "${Q38_PREFILL_COMM:-mpi}" in
-            utofu|utofu-rsag|utofu-bf16|utofu-tree)
+            utofu|utofu-rsag|utofu-bf16|utofu-i8|utofu-tree)
                 make -C ../utofu-tests tofu_topo_helper >/dev/null
                 mpiexec -np "$NODES" ../utofu-tests/tofu_topo_helper
                 ;;

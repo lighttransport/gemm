@@ -34,6 +34,7 @@ typedef struct {
     utofu_vcq_hdl_t vcq[TP_RSAG4_MAX_TNI];
     int nvcq;
     int bf16_wire;
+    int i8_wire;
 } tp_reduce_ctx;
 static MPI_Comm g_tp_init_barrier = MPI_COMM_NULL;
 static void tp_init_barrier(void) { MPI_Barrier(g_tp_init_barrier); }
@@ -41,7 +42,8 @@ static void tp_sum(float *buf, int count, void *opaque) {
     tp_reduce_ctx *c = (tp_reduce_ctx *)opaque;
     if (c->kind == TP_COMM_UTOFU_TREE) tp_allreduce_sum(&c->tofu, buf, count);
     else if (c->kind == TP_COMM_UTOFU_RSAG4) {
-        int rc = c->bf16_wire ? tp_rsag4_sum_bf16(&c->rsag4, buf, count) :
+        int rc = c->i8_wire ? tp_rsag4_sum_i8(&c->rsag4,buf,count) :
+                 c->bf16_wire ? tp_rsag4_sum_bf16(&c->rsag4, buf, count) :
                                 tp_rsag4_sum(&c->rsag4, buf, count);
         if (rc) {
             fprintf(stderr, "qwen38-prefill FATAL uTofu RSAG4 failure\n");
@@ -49,6 +51,20 @@ static void tp_sum(float *buf, int count, void *opaque) {
         }
     }
     else MPI_Allreduce(MPI_IN_PLACE, buf, count, MPI_FLOAT, MPI_SUM, c->mpi);
+}
+static void tp_sum_add(float *buf, float *residual, int count, void *opaque) {
+    tp_reduce_ctx *c = (tp_reduce_ctx *)opaque;
+    if (c->kind == TP_COMM_UTOFU_RSAG4 && (c->bf16_wire||c->i8_wire)) {
+        int rc=c->i8_wire?tp_rsag4_sum_i8_add(&c->rsag4,buf,residual,count):
+            tp_rsag4_sum_bf16_add(&c->rsag4,buf,residual,count);
+        if (rc) {
+            fprintf(stderr, "qwen38-prefill FATAL uTofu RSAG4 add failure\n");
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        }
+        return;
+    }
+    tp_sum(buf, count, opaque);
+    for (int i = 0; i < count; i++) residual[i] += buf[i];
 }
 static double wall(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -265,7 +281,9 @@ int main(int argc, char **argv) {
         if (!transformer_prepack_int8_range(m, l0, l1, pp_rank == pp_size - 1))
             fail(wrank, "quantize owned stage");
     }
-    if (tp_size > 1) transformer_set_tp(m, tp_rank, tp_size, tp_sum, &tc);
+    if (tp_size > 1) {
+        transformer_set_tp(m, tp_rank, tp_size, tp_sum, &tc);
+    }
 
     int32_t *tokens = malloc((size_t)ntok * sizeof(*tokens));
     if (!tokens) fail(wrank, "token allocation");
@@ -292,17 +310,22 @@ int main(int argc, char **argv) {
 
     const char *comm_name = env_s("Q38_PREFILL_COMM", "mpi");
     if (!strcmp(comm_name, "utofu") || !strcmp(comm_name, "utofu-rsag") ||
-        !strcmp(comm_name, "utofu-bf16")) {
+        !strcmp(comm_name, "utofu-bf16") || !strcmp(comm_name,"utofu-i8")) {
         init_utofu_tp(&tc, wrank, world, pp_rank, tp_size,
                       chunk * m->n_embd, tp_comm, 1);
         tc.bf16_wire = !strcmp(comm_name, "utofu-bf16");
-        if (tc.bf16_wire && strcmp(bf16_mode, "bf16-act"))
-            fail(wrank, "utofu-bf16 requires Q38_PREFILL_BF16=bf16-act");
+        tc.i8_wire = !strcmp(comm_name,"utofu-i8");
+        if ((tc.bf16_wire||tc.i8_wire) && strcmp(bf16_mode, "bf16-act"))
+            fail(wrank, "narrow uTofu wire requires Q38_PREFILL_BF16=bf16-act");
     } else if (!strcmp(comm_name, "utofu-tree"))
         init_utofu_tp(&tc, wrank, world, pp_rank, tp_size,
                       chunk * m->n_embd, tp_comm, 0);
     else if (strcmp(comm_name, "mpi"))
-        fail(wrank, "Q38_PREFILL_COMM must be mpi, utofu, utofu-bf16, or utofu-tree");
+        fail(wrank, "Q38_PREFILL_COMM must be mpi, utofu, utofu-bf16, utofu-i8, or utofu-tree");
+
+    if (tp_size > 1 && env_i("TF_TP_FUSED_PREFILL", 1) &&
+        (tc.bf16_wire || tc.i8_wire))
+        transformer_set_tp_reduce_add(m, tp_sum_add);
 
     MPI_Barrier(MPI_COMM_WORLD);
     transformer_prefill_profile_reset();
