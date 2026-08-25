@@ -102,6 +102,11 @@ transitions and partial-output traffic outweigh the smaller workspace.
 compute concurrently without queues, locks, duplicate decoding, or output
 sharing. Bind both CPUs and memory to one CMG when benchmarking it.
 
+`fp4_gemm_f16_n32_omp` contains the optimized decode/matvec path. For M=1 it
+processes four N32 tiles concurrently, broadcasts each activation once, and
+uses four vector FMLAs instead of indexed scalar FMLAs. Recommended CMG
+dispatch is direct N32 for M<=6 and the decoded L2 panel for M>=12.
+
 `fp4_gemm_f16_l2` instead dequantizes one packed `N32 x K` weight panel into a
 K-major FP16 workspace and reuses it for every activation row. At K=4096 the
 workspace is 256 KiB, so it resides in L2 rather than the 64 KiB L1. Use direct

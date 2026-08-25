@@ -109,6 +109,30 @@ read and write. M=1 FP4 generation therefore uses about 41% of this measured
 source-read rate and remains instruction/dequant limited. At larger M, FP16
 FMA and FP32 promotion dominate while source traffic is amortized.
 
+### Pipe-aware direct matvec optimization
+
+The A64FX instruction database shows `ZIP1` and `TBL` are FLA-only with
+latencies 6 and 6, while vector FMLA/FMUL and vector-vector bit operations can
+use either FL pipe. Immediate `AND` is also FLA-only. The optimized decoder
+therefore hoists one vector mask, uses vector-vector `AND`, and schedules four
+independent tiles. M=1 broadcasts each activation once and uses four one-uop
+vector FMLAs instead of four two-uop indexed FMLAs.
+
+Full 72 MiB MXFP4 streaming results on one 12-core CMG, K=256 promotion:
+
+| M | Selected path | CMG GFLOP/s | Source GB/s |
+|---:|---|---:|---:|
+| 1 | Four-tile direct | 280 | 78.8 |
+| 6 | Direct six-row | 511 | 24.0 |
+| 24 | Full-K L2 panel | 591 | 6.92 |
+| 128 | Full-K L2 panel | 621 | 1.37 |
+
+Pure FP16 M=1 reaches about 290 GFLOP/s and 81.4 GB/s. An eight-tile variant
+was rejected because register spills reduced it to 131 GFLOP/s. At an assumed
+230 GB/s CMG HBM rate, the MXFP4 plus prepared-scale bandwidth roof is about
+818 GFLOP/s. The current M=1 kernel reaches 34% of that roof; FLA-only nibble
+interleave/table lookup remains the principal execution limit.
+
 The result is below the 256 GFLOP/s/core dense-FP16 peak because A64FX has no
 FP4 arithmetic. Every 32-output FMA step also requires a 16-byte packed load,
 byte-to-halfword expansion, two nibble operations, interleave, table lookup,

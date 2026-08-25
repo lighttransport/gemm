@@ -367,6 +367,76 @@ int fp4_gemm_f16_n32(float*c,const _Float16*a,const fp4_matrix*w,int m,int promo
         }}return 0;
 }
 
+#if defined(__ARM_FEATURE_SVE)
+static inline void gemm_n32_m1_t4_segment(float*c,const _Float16*a,
+        const fp4_matrix*w,int tile,int kbegin,int kend,int add){
+    static const __fp16 table_data[32] __attribute__((aligned(64)))={
+        0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6,
+        0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6};
+    svbool_t ph=svptrue_b16(),ps=svptrue_b32(),p16=svwhilelt_b16(0,16);
+    svfloat16_t tab=svld1_f16(ph,table_data),h0=svdup_f16(0),h1=h0,h2=h0,h3=h0;
+    int bs=w->format==FP4_MX?32:16,nb=w->k/bs;
+    const uint8_t*q0=w->codes_n32+(size_t)(tile+0)*w->k*16;
+    const uint8_t*q1=w->codes_n32+(size_t)(tile+1)*w->k*16;
+    const uint8_t*q2=w->codes_n32+(size_t)(tile+2)*w->k*16;
+    const uint8_t*q3=w->codes_n32+(size_t)(tile+3)*w->k*16;
+    const _Float16*s0=w->scales_n32+(size_t)(tile+0)*nb*32;
+    const _Float16*s1=w->scales_n32+(size_t)(tile+1)*nb*32;
+    const _Float16*s2=w->scales_n32+(size_t)(tile+2)*nb*32;
+    const _Float16*s3=w->scales_n32+(size_t)(tile+3)*nb*32;
+    for(int b=kbegin/bs;b<kend/bs;++b){svfloat16_t sc0=svld1_f16(ph,(const __fp16*)(s0+(size_t)b*32));
+      svfloat16_t sc1=svld1_f16(ph,(const __fp16*)(s1+(size_t)b*32));
+      svfloat16_t sc2=svld1_f16(ph,(const __fp16*)(s2+(size_t)b*32));
+      svfloat16_t sc3=svld1_f16(ph,(const __fp16*)(s3+(size_t)b*32));
+      for(int k=b*bs;k<(b+1)*bs;++k){svfloat16_t x=svdup_f16((__fp16)a[k]);
+#define DECODE_T4(Q,SC,H) do{const uint8_t*q=(Q)+(size_t)k*16; \
+        svuint16_t z=svld1ub_u16(p16,q),lo=svand_n_u16_x(p16,z,15); \
+        svuint16_t hi=svlsr_n_u16_x(p16,z,4),idx=svzip1_u16(lo,hi); \
+        svfloat16_t v=svmul_f16_x(ph,svtbl_f16(tab,idx),(SC)); \
+        (H)=svmla_f16_x(ph,(H),v,x);}while(0)
+        DECODE_T4(q0,sc0,h0);DECODE_T4(q1,sc1,h1);
+        DECODE_T4(q2,sc2,h2);DECODE_T4(q3,sc3,h3);
+#undef DECODE_T4
+      }
+    }
+#define STORE_T4(I,H) do{svuint16_t hb=svreinterpret_u16_f16(H); \
+      svfloat32_t lo=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpklo_u32(hb))); \
+      svfloat32_t hi=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpkhi_u32(hb))); \
+      float*d=c+(tile+(I))*32;if(add){lo=svadd_f32_x(ps,lo,svld1_f32(ps,d)); \
+      hi=svadd_f32_x(ps,hi,svld1_f32(ps,d+16));}svst1_f32(ps,d,lo);svst1_f32(ps,d+16,hi);}while(0)
+    STORE_T4(0,h0);STORE_T4(1,h1);STORE_T4(2,h2);STORE_T4(3,h3);
+#undef STORE_T4
+}
+#endif
+
+int fp4_gemm_f16_n32_omp(float*c,const _Float16*a,const fp4_matrix*w,int m,
+        int promotion_k,int threads){
+    if(!c||!a||!w||!w->codes_n32||!w->scales_n32||m<1||threads<1||promotion_k<0||
+       (promotion_k&&((promotion_k%32)||promotion_k>w->k)))return-1;
+#if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
+    int span=promotion_k?promotion_k:w->k;
+    if(m==1&&w->n%128==0){
+#pragma omp parallel for num_threads(threads) schedule(static)
+      for(int t=0;t<w->n/32;t+=4)for(int kb=0;kb<w->k;kb+=span){
+        int ke=kb+span<w->k?kb+span:w->k;
+        gemm_n32_m1_t4_segment(c,a,w,t,kb,ke,kb!=0);
+      }
+      return 0;
+    }
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for(int t=0;t<w->n/32;++t){
+      for(int m0=0;m0<m;m0+=6){int mr=m-m0<6?m-m0:6;
+        for(int kb=0;kb<w->k;kb+=span){int ke=kb+span<w->k?kb+span:w->k;
+          if(mr==6)gemm_n32_m6_full_segment(c+(size_t)m0*w->n,a+(size_t)m0*w->k,w,t,kb,ke,kb!=0);
+          else gemm_n32_m12_segment(c+(size_t)m0*w->n,a+(size_t)m0*w->k,mr,w,t,kb,ke,kb!=0);
+        }
+      }
+    }return 0;
+#else
+    (void)threads;return-1;
+#endif
+}
+
 #if defined(__aarch64__)
 typedef struct {
     const uint8_t *cp;
@@ -417,6 +487,7 @@ int fp4_gemm_f16_l1(float*c,const _Float16*a,const fp4_matrix*w,int m,int promot
 }
 
 #if defined(__ARM_FEATURE_SVE)
+extern void fp4_dequant_mx_n32_asm(_Float16*,const uint8_t*,const _Float16*,int);
 static inline void dequant_n32_panel(_Float16*panel,const fp4_matrix*w,int tile,
         int kbegin,int kend){
     static const __fp16 table_data[32] __attribute__((aligned(64)))={
@@ -427,6 +498,8 @@ static inline void dequant_n32_panel(_Float16*panel,const fp4_matrix*w,int tile,
     int bs=w->format==FP4_MX?32:16,nb=w->k/bs;
     const uint8_t*cp=w->codes_n32+(size_t)tile*w->k*16;
     const _Float16*sp=w->scales_n32+(size_t)tile*nb*32;
+    if(w->format==FP4_MX){fp4_dequant_mx_n32_asm(panel,cp+(size_t)kbegin*16,
+        sp+(size_t)(kbegin/32)*32,kend-kbegin);return;}
     for(int b=kbegin/bs;b<kend/bs;++b){svfloat16_t scale=svld1_f16(ph,(const __fp16*)(sp+(size_t)b*32));
       for(int k=b*bs;k<(b+1)*bs;++k){const uint8_t*q=cp+(size_t)k*16;
         svuint16_t z=svld1ub_u16(p16,q),lo=svand_n_u16_x(p16,z,15);
