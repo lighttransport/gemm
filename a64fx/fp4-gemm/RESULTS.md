@@ -320,6 +320,18 @@ sidecar move at roughly 26 GB/s. This rejects packed byte-table SDOT as the
 route to 800 GFLOP/s; expanded sequential SDOT remains about 410 GFLOP/s and
 the packed FP16 t8 kernel remains about 400 GFLOP/s.
 
+The A64FX instruction data also explains why the nominal 818 GFLOP/s HBM
+roof is not attainable by this exact packed decoder. For every K value, its
+eight output vectors require eight vector `ZIP1` and eight `TBL` operations.
+Both are single-uop, FLA-only instructions, so they consume at least 16 FLA
+issue slots for 512 useful FLOPs. At 2.2 GHz and 12 cores this is an 845
+GFLOP/s zero-overhead bound, before issuing the eight FMLAs, loads, branches,
+or handling six-cycle permutation/table latency. Thus 800 GFLOP/s would
+require over 94% of that ideal bound while doing all remaining work for free.
+K-promotion sweeps (K64 through K4096) span only 378--403 GFLOP/s, and explicit
+1/2 KiB look-ahead prefetch remains 397--400 GFLOP/s. These controls rule out
+FP32 spill frequency and ordinary cache-miss latency as the missing factor.
+
 A second packed experiment replaced each 256-entry gather with two sequential
 16-entry `TBL`s, one for each activation in a packed K pair. It is exact and
 removes indexed loads, but requires 16 `TBL`s per K pair to cover 128 rows.
