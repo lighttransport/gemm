@@ -33,6 +33,10 @@ int main(void){
         double np=0,dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
         double rp=sqrt(np/(dp+1e-30));printf("%s l2panel_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
         if(!isfinite(rp)||rp>0.08)return 1;
+        if(fp4_gemm_f16_l2_omp(got,a,&p,M,32,2))return 1;
+        np=0;dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
+        rp=sqrt(np/(dp+1e-30));printf("%s l2omp_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
+        if(!isfinite(rp)||rp>0.08)return 1;
         if(fp4_gemm_f16_l1panel(got,a,&p,M,32))return 1;
         np=0;dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
         rp=sqrt(np/(dp+1e-30));printf("%s l1panel_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);

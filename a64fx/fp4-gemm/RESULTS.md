@@ -90,6 +90,25 @@ limited, not HBM2-bandwidth limited. The L1 panel does not help: it ties the
 full panel at M<=6 and becomes 12% slower at M=128. Retaining the full-K panel
 in L2 gives the best reuse and traversal order.
 
+### Fused 12-core CMG baseline
+
+The fused OpenMP kernel assigns disjoint N32 tiles to all 12 cores. Every core
+owns a private 256 KiB decoded panel and immediately computes all M rows after
+decoding, with no producer queue or cross-core output sharing.
+
+| M | Time | CMG GFLOP/s | FP4/scale source rate |
+|---:|---:|---:|---:|
+| 1 | 2.77 ms | 97 | 27.3 GB/s |
+| 6 | 3.56 ms | 452 | 21.2 GB/s |
+| 24 | 10.98 ms | 586 | 6.87 GB/s |
+| 128 | 54.90 ms | 626 | 1.38 GB/s |
+
+This is an 11.6--11.8x speedup over one core. A 12-core parallel `memcpy` of
+the same buffers reaches 66.6 GB/s source bandwidth, or 133.1 GB/s counting
+read and write. M=1 FP4 generation therefore uses about 41% of this measured
+source-read rate and remains instruction/dequant limited. At larger M, FP16
+FMA and FP32 promotion dominate while source traffic is amortized.
+
 The result is below the 256 GFLOP/s/core dense-FP16 peak because A64FX has no
 FP4 arithmetic. Every 32-output FMA step also requires a 16-byte packed load,
 byte-to-halfword expansion, two nibble operations, interleave, table lookup,

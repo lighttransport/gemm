@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <omp.h>
 #include <time.h>
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC_RAW,&t);return t.tv_sec+1e-9*t.tv_nsec;}
 static void*aa(size_t n){void*p=0;return posix_memalign(&p,256,(n+255)&~255ULL)?0:p;}
@@ -11,6 +12,12 @@ typedef int(*kernel)(float*,const _Float16*,const fp4_matrix*,int,int);
 static void run(const char*name,kernel fn,float*c,const _Float16*a,const fp4_matrix*w,int m,int kc,size_t src){
     fn(c,a,w,m,kc);double best=1e9;for(int r=0;r<3;++r){double t=now();fn(c,a,w,m,kc);double d=now()-t;if(d<best)best=d;}
     printf("kernel=%s M=%d kc=%d ms=%.2f gflops=%.2f source_GB/s=%.2f\n",name,m,kc,best*1e3,
+        2.0*m*w->n*w->k/best/1e9,src/best/1e9);
+}
+static void run_omp(float*c,const _Float16*a,const fp4_matrix*w,int m,int kc,size_t src,int threads){
+    fp4_gemm_f16_l2_omp(c,a,w,m,kc,threads);double best=1e9;
+    for(int r=0;r<3;++r){double t=now();fp4_gemm_f16_l2_omp(c,a,w,m,kc,threads);double d=now()-t;if(d<best)best=d;}
+    printf("kernel=l2fused threads=%d M=%d kc=%d ms=%.2f gflops=%.2f source_GB/s=%.2f\n",threads,m,kc,best*1e3,
         2.0*m*w->n*w->k/best/1e9,src/best/1e9);
 }
 int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(argv[2]):4096;
@@ -27,10 +34,23 @@ int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(arg
       guard^=((unsigned char*)copy)[(size_t)r*4096];if(d<cbest)cbest=d;}
     printf("pure_memcpy ms=%.2f source_GB/s=%.2f total_read_write_GB/s=%.2f guard=%u\n",
         cbest*1e3,source/cbest/1e9,2.0*source/cbest/1e9,(unsigned)guard);free(copy);
+    copy=aa(source);cbest=1e9;
+    for(int r=0;r<5;++r){double t=now();
+#pragma omp parallel num_threads(12)
+      {int id=omp_get_thread_num(),nt=omp_get_num_threads();
+       size_t q0=w.code_bytes*id/nt,q1=w.code_bytes*(id+1)/nt;
+       size_t sn=w.scales_n32_count*2,s0=sn*id/nt,s1=sn*(id+1)/nt;
+       memcpy((char*)copy+q0,w.codes_n32+q0,q1-q0);
+       memcpy((char*)copy+w.code_bytes+s0,(char*)w.scales_n32+s0,s1-s0);}
+      double d=now()-t;if(d<cbest)cbest=d;}
+    guard^=((unsigned char*)copy)[4096];
+    printf("pure_memcpy_12c ms=%.2f source_GB/s=%.2f total_read_write_GB/s=%.2f guard=%u\n",
+        cbest*1e3,source/cbest/1e9,2.0*source/cbest/1e9,(unsigned)guard);free(copy);
     int ms[]={1,6,24,128};for(int z=0;z<4;++z){int m=ms[z];
       _Float16*a=aa((size_t)m*k*2);float*c=aa((size_t)m*n*4);if(!a||!c)return 1;
       for(size_t i=0;i<(size_t)m*k;++i)a[i]=(_Float16)((int)(rnd()&255)-128)/512;
       run("direct",fp4_gemm_f16_n32,c,a,&w,m,256,source*((m+5)/6));
       run("l2full",fp4_gemm_f16_l2,c,a,&w,m,256,source);
       run("l1k256",fp4_gemm_f16_l1panel,c,a,&w,m,256,source);
+      run_omp(c,a,&w,m,256,source,12);
       free(a);free(c);}fp4_matrix_free(&w);return 0;}

@@ -97,6 +97,11 @@ the default because the scalar producer is slower than direct SVE dequant.
 It ties the full L2 panel at small M but loses at large M because repeated block
 transitions and partial-output traffic outweigh the smaller workspace.
 
+`fp4_gemm_f16_l2_omp` is the fused CMG baseline. Each worker owns a private
+256 KiB panel and statically owns disjoint N32 tiles, so all 12 cores decode and
+compute concurrently without queues, locks, duplicate decoding, or output
+sharing. Bind both CPUs and memory to one CMG when benchmarking it.
+
 `fp4_gemm_f16_l2` instead dequantizes one packed `N32 x K` weight panel into a
 K-major FP16 workspace and reuses it for every activation row. At K=4096 the
 workspace is 256 KiB, so it resides in L2 rather than the 64 KiB L1. Use direct

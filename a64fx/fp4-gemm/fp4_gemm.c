@@ -494,6 +494,33 @@ int fp4_gemm_f16_l1panel(float*c,const _Float16*a,const fp4_matrix*w,int m,int p
 #endif
 }
 
+int fp4_gemm_f16_l2_omp(float*c,const _Float16*a,const fp4_matrix*w,int m,
+        int promotion_k,int threads){
+    if(!c||!a||!w||!w->codes_n32||!w->scales_n32||m<1||threads<1||promotion_k<0||
+       (promotion_k&&((promotion_k%32)||promotion_k>w->k)))return-1;
+#if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
+    size_t panel_elems=(size_t)w->k*32,panel_bytes=panel_elems*sizeof(_Float16);
+    _Float16*work=NULL;if(posix_memalign((void**)&work,256,panel_bytes*(size_t)threads))return-1;
+    int span=promotion_k?promotion_k:w->k;
+#pragma omp parallel num_threads(threads)
+    {
+      int tid=omp_get_thread_num();_Float16*panel=work+(size_t)tid*panel_elems;
+#pragma omp for schedule(static)
+      for(int t=0;t<w->n/32;++t){
+        dequant_n32_panel(panel,w,t,0,w->k);
+        for(int m0=0;m0<m;m0+=6){int mr=m-m0<6?m-m0:6;
+          for(int kb=0;kb<w->k;kb+=span){int ke=kb+span<w->k?kb+span:w->k;
+            dense_panel_m6(c+(size_t)m0*w->n,a+(size_t)m0*w->k,panel,w->k,w->n,t,kb,ke,0,mr,kb!=0);
+          }
+        }
+      }
+    }
+    free(work);return 0;
+#else
+    (void)threads;return-1;
+#endif
+}
+
 int fp4_gemm_f16(float*c,const _Float16*a,const fp4_matrix*w,int m,int promotion_k,int threads){
     if(!c||!a||!w||m<1||promotion_k<0||(promotion_k&&((promotion_k%32)||promotion_k>w->k)))return -1;
     if(threads<1)threads=1;
