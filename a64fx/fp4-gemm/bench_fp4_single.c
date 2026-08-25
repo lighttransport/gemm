@@ -20,4 +20,7 @@ int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):2048,k=argc>2?atoi(argv
             for(int ci=0;ci<2;++ci){int kc=kcs[ci];fp4_gemm_f16_n32(c,a,&w,m,kc);
                 double best=1e9;for(int rep=0;rep<5;++rep){double t=now();fp4_gemm_f16_n32(c,a,&w,m,kc);double d=now()-t;if(d<best)best=d;}
                 printf("format=%s M=%d kc=%d ms=%.3f gflops=%.2f\n",fp4_format_name((fp4_format)f),m,kc,best*1e3,2.0*m*n*k/best/1e9);}
+            if(m%6==0)for(int ci=0;ci<2;++ci){int kc=kcs[ci];fp4_gemm_f16_l1(c,a,&w,m,kc);
+                double best=1e9;for(int rep=0;rep<5;++rep){double t=now();fp4_gemm_f16_l1(c,a,&w,m,kc);double d=now()-t;if(d<best)best=d;}
+                printf("format=%s kernel=l1asm M=%d kc=%d ms=%.3f gflops=%.2f\n",fp4_format_name((fp4_format)f),m,kc,best*1e3,2.0*m*n*k/best/1e9);}
             free(a);free(c);}fp4_matrix_free(&w);}free(src);return 0;}

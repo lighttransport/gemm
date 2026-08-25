@@ -36,6 +36,26 @@ appropriate expectation unless the implementation either reuses each decoded
 weight across a substantially larger register tile or moves dequantization
 outside the timed kernel (which would no longer measure FP4 GEMM).
 
+### Scalar AArch64 dequantization experiment
+
+A hand-written double-buffered variant uses only scalar base-ISA GPR
+instructions for dequantization. It loads two packed 64-bit words, extracts 16
+bytes, performs 16 indexed accesses to a 256-entry pair LUT, and stores one
+64-byte FP16 vector into alternating L1 cache lines. SVE consumes the other
+line for scaling and six-row FP16 FMA. Object-code inspection confirms that
+the producer contains no NEON instructions.
+
+| Format | FP32 promotion K=256 | Pure FP16 accumulation |
+|---|---:|---:|
+| MXFP4 | 10.8 GFLOP/s | 13.7--13.8 GFLOP/s |
+| NVFP4 1D | 10.4 GFLOP/s | 13.3--13.4 GFLOP/s |
+| NVFP4 2D | 10.5 GFLOP/s | 13.4 GFLOP/s |
+
+This is slower than direct SVE dequantization. Although EX and FL execution
+can overlap, each K step requires 16 `AND`, 16 LUT `LDR`, 16 `STR`, the byte
+shift chains, and a 64-byte SVE reload. The scalar producer cannot feed the SVE
+consumer quickly enough; separate pipes do not offset the expansion count.
+
 ## Attention projections
 
 The table reports the median across WKV, WQ_A, WQ_B, WO_A, and WO_B. Each entry

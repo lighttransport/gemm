@@ -39,6 +39,8 @@ int fp4_gemm_f16(float *c, const _Float16 *a, const fp4_matrix *w,
                   int m, int promotion_k, int threads);
 int fp4_gemm_f16_n32(float *c, const _Float16 *a, const fp4_matrix *w,
                       int m, int promotion_k);
+int fp4_gemm_f16_l1(float *c, const _Float16 *a, const fp4_matrix *w,
+                     int m, int promotion_k);
 int fp4_gemm_reference(float *c, const _Float16 *a, const fp4_matrix *w,
                         int m, int fp16_products);
 

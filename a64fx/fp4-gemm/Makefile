@@ -2,18 +2,19 @@ CC = fcc
 CFLAGS ?= -Nclang -O3 -std=c11 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp
 WARN = -Wall -Wextra -Wpedantic
 LDLIBS = -lm
+ASM = fp4_n32_l1.S
 
 .PHONY: all test clean
 all: test_fp4_gemm bench_fp4_gemm bench_fp4_single
 
-test_fp4_gemm: test_fp4_gemm.c fp4_gemm.c fp4_gemm.h
-	$(CC) $(CFLAGS) $(WARN) test_fp4_gemm.c fp4_gemm.c $(LDLIBS) -o $@
+test_fp4_gemm: test_fp4_gemm.c fp4_gemm.c fp4_gemm.h $(ASM)
+	$(CC) $(CFLAGS) $(WARN) test_fp4_gemm.c fp4_gemm.c $(ASM) $(LDLIBS) -o $@
 
-bench_fp4_gemm: bench_fp4_gemm.c fp4_gemm.c fp4_gemm.h
-	$(CC) $(CFLAGS) $(WARN) bench_fp4_gemm.c fp4_gemm.c $(LDLIBS) -o $@
+bench_fp4_gemm: bench_fp4_gemm.c fp4_gemm.c fp4_gemm.h $(ASM)
+	$(CC) $(CFLAGS) $(WARN) bench_fp4_gemm.c fp4_gemm.c $(ASM) $(LDLIBS) -o $@
 
-bench_fp4_single: bench_fp4_single.c fp4_gemm.c fp4_gemm.h
-	$(CC) $(CFLAGS) $(WARN) bench_fp4_single.c fp4_gemm.c $(LDLIBS) -o $@
+bench_fp4_single: bench_fp4_single.c fp4_gemm.c fp4_gemm.h $(ASM)
+	$(CC) $(CFLAGS) $(WARN) bench_fp4_single.c fp4_gemm.c $(ASM) $(LDLIBS) -o $@
 
 test: test_fp4_gemm
 	./test_fp4_gemm

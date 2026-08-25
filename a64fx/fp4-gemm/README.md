@@ -80,4 +80,10 @@ E2M1 values with SVE table lookup, applies a predecoded FP16 scale vector, then
 reuses that vector across a six-row activation microtile. Scale decoding and
 repacking are setup costs and are outside timed GEMM execution.
 
+`fp4_gemm_f16_l1` is an experimental assembly path testing A64FX pipeline
+separation. Its producer uses only scalar AArch64 GPR/load/store instructions
+and a 256-entry packed-byte LUT; its consumer uses SVE FP16 multiply/FMA. Two
+alternating 64-byte L1 buffers carry decoded weights between them. It is not
+the default because the scalar producer is slower than direct SVE dequant.
+
 See [RESULTS.md](RESULTS.md) for measured A64FX results.

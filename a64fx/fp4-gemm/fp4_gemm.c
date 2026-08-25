@@ -18,6 +18,17 @@ static const float e2m1_values[16] = {
    -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f,
 };
 
+/* Scalar AArch64 producer LUT: packed FP4 byte -> two FP16 bit patterns. */
+uint32_t fp4_pair_lut[256] __attribute__((aligned(1024)));
+static int fp4_pair_lut_ready;
+static void prepare_pair_lut(void){
+    if(fp4_pair_lut_ready)return;
+    for(int b=0;b<256;++b){_Float16 lo=(_Float16)e2m1_values[b&15];
+        _Float16 hi=(_Float16)e2m1_values[b>>4];uint16_t l,h;
+        memcpy(&l,&lo,2);memcpy(&h,&hi,2);fp4_pair_lut[b]=(uint32_t)l|((uint32_t)h<<16);}
+    fp4_pair_lut_ready=1;
+}
+
 const char *fp4_format_name(fp4_format f) {
     static const char *names[] = {"mxfp4", "nvfp4-1d", "nvfp4-2d"};
     return (unsigned)f < 3 ? names[f] : "unknown";
@@ -164,6 +175,7 @@ static float row_scale(const fp4_matrix *p,int r,int c){
 
 int fp4_matrix_prepare_n32(fp4_matrix *p){
     if(!p||!p->codes||!p->scales||p->n%32||p->k%32)return -1;
+    prepare_pair_lut();
     free(p->codes_n32);free(p->scales_n32);p->codes_n32=NULL;p->scales_n32=NULL;
     int nt=p->n/32,bs=p->format==FP4_MX?32:16,nb=p->k/bs;
     p->scales_n32_count=(size_t)nt*nb*32;
@@ -353,6 +365,55 @@ int fp4_gemm_f16_n32(float*c,const _Float16*a,const fp4_matrix*w,int m,int promo
 #endif
           }
         }}return 0;
+}
+
+#if defined(__aarch64__)
+typedef struct {
+    const uint8_t *cp;
+    const _Float16 *sp;
+    const _Float16 *a;
+    _Float16 *out;
+    int k, kbegin, kend, bs;
+} fp4_l1_args;
+extern void fp4_n32_m6_l1_asm(const fp4_l1_args *args);
+
+static inline void l1_store6(float*c,const _Float16*tmp,const fp4_matrix*w,
+        int m0,int tile,int add){
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t ph=svptrue_b16(),ps=svptrue_b32();
+    for(int i=0;i<6;++i){
+        svuint16_t hb=svreinterpret_u16_f16(svld1_f16(ph,(const __fp16*)(tmp+i*32)));
+        svfloat32_t lo=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpklo_u32(hb)));
+        svfloat32_t hi=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpkhi_u32(hb)));
+        float*d=c+(size_t)(m0+i)*w->n+tile*32;
+        if(add){lo=svadd_f32_x(ps,lo,svld1_f32(ps,d));hi=svadd_f32_x(ps,hi,svld1_f32(ps,d+16));}
+        svst1_f32(ps,d,lo);svst1_f32(ps,d+16,hi);
+    }
+#else
+    (void)c;(void)tmp;(void)w;(void)m0;(void)tile;(void)add;
+#endif
+}
+#endif
+
+int fp4_gemm_f16_l1(float*c,const _Float16*a,const fp4_matrix*w,int m,int promotion_k){
+    if(!c||!a||!w||!w->codes_n32||!w->scales_n32||m<1||m%6||promotion_k<0||
+       (promotion_k&&((promotion_k%32)||promotion_k>w->k)))return-1;
+#if defined(__aarch64__)
+    int bs=w->format==FP4_MX?32:16,nb=w->k/bs,span=promotion_k?promotion_k:w->k;
+    _Float16 tmp[6*32] __attribute__((aligned(256)));
+    for(int m0=0;m0<m;m0+=6)for(int kb=0;kb<w->k;kb+=span){
+      int ke=kb+span<w->k?kb+span:w->k;
+      for(int t=0;t<w->n/32;++t){
+        fp4_l1_args x={w->codes_n32+(size_t)t*w->k*16,
+            w->scales_n32+(size_t)t*nb*32,a+(size_t)m0*w->k,tmp,
+            w->k,kb,ke,bs};
+        fp4_n32_m6_l1_asm(&x);
+        l1_store6(c,tmp,w,m0,t,kb!=0);
+      }
+    }return 0;
+#else
+    return -1;
+#endif
 }
 
 int fp4_gemm_f16(float*c,const _Float16*a,const fp4_matrix*w,int m,int promotion_k,int threads){
