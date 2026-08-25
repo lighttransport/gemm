@@ -1587,9 +1587,78 @@ static inline void attn_av_1q(const float *att, const float *V_h, int np,
         svst1_f32(pg, out + 3 * VL,   a3);
         return;
     }
+    if (hd == 8 * VL) {
+        /* Kimi-K3 case (hd=128, VL=16): 8 independent SVE accumulators.
+         * Keeps `out` in registers across the whole np-sum (no per-row
+         * load-modify-store), vs the AXPY fallback which is ~3x slower. */
+        svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f), a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+        svfloat32_t a4 = svdup_f32(0.0f), a5 = svdup_f32(0.0f), a6 = svdup_f32(0.0f), a7 = svdup_f32(0.0f);
+        for (int vi = 0; vi < np; vi++) {
+            float w = att[vi];
+            const float *vh = V_h + (size_t)vi * hd;
+            svfloat32_t v0 = svld1_f32(pg, vh);
+            svfloat32_t v1 = svld1_f32(pg, vh + VL);
+            svfloat32_t v2 = svld1_f32(pg, vh + 2 * VL);
+            svfloat32_t v3 = svld1_f32(pg, vh + 3 * VL);
+            svfloat32_t v4 = svld1_f32(pg, vh + 4 * VL);
+            svfloat32_t v5 = svld1_f32(pg, vh + 5 * VL);
+            svfloat32_t v6 = svld1_f32(pg, vh + 6 * VL);
+            svfloat32_t v7 = svld1_f32(pg, vh + 7 * VL);
+            a0 = svmla_n_f32_x(pg, a0, v0, w); a1 = svmla_n_f32_x(pg, a1, v1, w);
+            a2 = svmla_n_f32_x(pg, a2, v2, w); a3 = svmla_n_f32_x(pg, a3, v3, w);
+            a4 = svmla_n_f32_x(pg, a4, v4, w); a5 = svmla_n_f32_x(pg, a5, v5, w);
+            a6 = svmla_n_f32_x(pg, a6, v6, w); a7 = svmla_n_f32_x(pg, a7, v7, w);
+        }
+        svst1_f32(pg, out,            a0);
+        svst1_f32(pg, out + VL,       a1);
+        svst1_f32(pg, out + 2 * VL,   a2);
+        svst1_f32(pg, out + 3 * VL,   a3);
+        svst1_f32(pg, out + 4 * VL,   a4);
+        svst1_f32(pg, out + 5 * VL,   a5);
+        svst1_f32(pg, out + 6 * VL,   a6);
+        svst1_f32(pg, out + 7 * VL,   a7);
+        return;
+    }
     memset(out, 0, hd * sizeof(float));
     for (int vi = 0; vi < np; vi++)
         sve_axpy_hd(out, V_h + (size_t)vi * hd, att[vi], hd);
+}
+
+/* 2-query batched AV for hd == 8*VL (Kimi-K3, hd=128): 16 SVE accumulators
+ * (2q x 8 hd-vecs). Sweeps V_h once for 2 queries, halving the V_h read
+ * bandwidth vs two attn_av_1q calls (V_h is the load-bound term for hd=128;
+ * a 4-query batch would need 32 accumulators = the whole Z-reg file). */
+static inline void attn_av_2q(const float *att, int att_qstride,
+                              const float *V_h, int np, int hd,
+                              float *out, int out_qstride) {
+    const svbool_t pg = svptrue_b32();
+    const int VL = (int)svcntw();
+    if (hd != 8 * VL) {
+        for (int qq = 0; qq < 2; qq++)
+            attn_av_1q(att + (size_t)qq * att_qstride, V_h, np, hd,
+                       out + (size_t)qq * out_qstride);
+        return;
+    }
+    svfloat32_t b0=svdup_f32(0.0f),b1=svdup_f32(0.0f),b2=svdup_f32(0.0f),b3=svdup_f32(0.0f);
+    svfloat32_t b4=svdup_f32(0.0f),b5=svdup_f32(0.0f),b6=svdup_f32(0.0f),b7=svdup_f32(0.0f);
+    svfloat32_t c0=svdup_f32(0.0f),c1=svdup_f32(0.0f),c2=svdup_f32(0.0f),c3=svdup_f32(0.0f);
+    svfloat32_t c4=svdup_f32(0.0f),c5=svdup_f32(0.0f),c6=svdup_f32(0.0f),c7=svdup_f32(0.0f);
+    const float *att0 = att, *att1 = att + att_qstride;
+    for (int vi = 0; vi < np; vi++) {
+        const float *vh = V_h + (size_t)vi * hd;
+        float w0 = att0[vi], w1 = att1[vi];
+        svfloat32_t v0=svld1_f32(pg,vh),v1=svld1_f32(pg,vh+VL),v2=svld1_f32(pg,vh+2*VL),v3=svld1_f32(pg,vh+3*VL);
+        svfloat32_t v4=svld1_f32(pg,vh+4*VL),v5=svld1_f32(pg,vh+5*VL),v6=svld1_f32(pg,vh+6*VL),v7=svld1_f32(pg,vh+7*VL);
+        b0=svmla_n_f32_x(pg,b0,v0,w0); b1=svmla_n_f32_x(pg,b1,v1,w0); b2=svmla_n_f32_x(pg,b2,v2,w0); b3=svmla_n_f32_x(pg,b3,v3,w0);
+        b4=svmla_n_f32_x(pg,b4,v4,w0); b5=svmla_n_f32_x(pg,b5,v5,w0); b6=svmla_n_f32_x(pg,b6,v6,w0); b7=svmla_n_f32_x(pg,b7,v7,w0);
+        c0=svmla_n_f32_x(pg,c0,v0,w1); c1=svmla_n_f32_x(pg,c1,v1,w1); c2=svmla_n_f32_x(pg,c2,v2,w1); c3=svmla_n_f32_x(pg,c3,v3,w1);
+        c4=svmla_n_f32_x(pg,c4,v4,w1); c5=svmla_n_f32_x(pg,c5,v5,w1); c6=svmla_n_f32_x(pg,c6,v6,w1); c7=svmla_n_f32_x(pg,c7,v7,w1);
+    }
+    float *o0 = out, *o1 = out + out_qstride;
+    svst1_f32(pg,o0,b0); svst1_f32(pg,o0+VL,b1); svst1_f32(pg,o0+2*VL,b2); svst1_f32(pg,o0+3*VL,b3);
+    svst1_f32(pg,o0+4*VL,b4); svst1_f32(pg,o0+5*VL,b5); svst1_f32(pg,o0+6*VL,b6); svst1_f32(pg,o0+7*VL,b7);
+    svst1_f32(pg,o1,c0); svst1_f32(pg,o1+VL,c1); svst1_f32(pg,o1+2*VL,c2); svst1_f32(pg,o1+3*VL,c3);
+    svst1_f32(pg,o1+4*VL,c4); svst1_f32(pg,o1+5*VL,c5); svst1_f32(pg,o1+6*VL,c6); svst1_f32(pg,o1+7*VL,c7);
 }
 
 /* 4-query batched AV — sweeps V_h once and accumulates 4 query outputs in
@@ -1607,6 +1676,13 @@ static inline void attn_av_4q(const float *att, int att_qstride,
                               float *out, int out_qstride) {
     const svbool_t pg = svptrue_b32();
     const int VL = (int)svcntw();
+    if (hd == 8 * VL) {
+        /* Kimi-K3 hd=128: two 2-query batches (halves V_h reads vs 4x 1q). */
+        attn_av_2q(att, att_qstride, V_h, np, hd, out, out_qstride);
+        attn_av_2q(att + 2 * att_qstride, att_qstride, V_h, np, hd,
+                   out + 2 * out_qstride, out_qstride);
+        return;
+    }
     if (hd != 4 * VL) {
         for (int qq = 0; qq < 4; qq++)
             attn_av_1q(att + (size_t)qq * att_qstride, V_h, np, hd,
