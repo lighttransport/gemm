@@ -26,7 +26,7 @@ if [ -z "${Q38_PREFILL_CHUNK:-}" ]; then
     fi
 fi
 
-case "$TP_SIZE" in 4|6|12) ;; *) echo "Q38_PREFILL_TP_SIZE must be 4, 6, or 12" >&2; exit 2;; esac
+case "$TP_SIZE" in 1|4|6|12) ;; *) echo "Q38_PREFILL_TP_SIZE must be 1, 4, 6, or 12" >&2; exit 2;; esac
 
 cd "$HERE"
 case "$MODE" in

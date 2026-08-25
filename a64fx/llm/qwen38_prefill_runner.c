@@ -145,13 +145,14 @@ int main(int argc, char **argv) {
         MPI_Abort(MPI_COMM_WORLD, 2);
     }
     const int tp_size = env_i("Q38_PREFILL_TP_SIZE", 4);
-    if (tp_size != 4 && tp_size != 6 && tp_size != 12)
-        fail(wrank, "Q38_PREFILL_TP_SIZE must be 4, 6, or 12");
-    if (world % tp_size || world / tp_size > 3)
-        fail(wrank, "world size must be divisible by TP size with PP<=3");
+    if (tp_size != 1 && tp_size != 4 && tp_size != 6 && tp_size != 12)
+        fail(wrank, "Q38_PREFILL_TP_SIZE must be 1, 4, 6, or 12");
+    if (world % tp_size || world / tp_size > 12)
+        fail(wrank, "world size must be divisible by TP size with PP<=12");
     const int pp_size = world / tp_size;
     const int tp_rank = wrank % tp_size, pp_rank = wrank / tp_size;
-    int cuts[4] = {0, 64, 64, 64};
+    int cuts[13] = {0};
+    cuts[pp_size] = 64;
     for (int p = 1; p < pp_size; p++) cuts[p] = 64 * p / pp_size;
     if (pp_size == 1) cuts[1] = env_i("Q38_PREFILL_LAYER_END", 64);
     if (pp_size == 2) cuts[1] = env_i("Q38_PREFILL_CUT1", 31);
@@ -159,7 +160,6 @@ int main(int argc, char **argv) {
         cuts[1] = env_i("Q38_PREFILL_CUT1", 21);
         cuts[2] = env_i("Q38_PREFILL_CUT2", 43);
     }
-    if (pp_size != 1) cuts[pp_size] = 64;
     for (int p = 0; p < pp_size; p++)
         if (cuts[p] < 0 || cuts[p + 1] <= cuts[p] || cuts[p + 1] > 64)
             fail(wrank, "invalid pipeline layer cuts");
@@ -180,6 +180,18 @@ int main(int argc, char **argv) {
     int max_seq = env_i("Q38_PREFILL_MAXSEQ", ntok + 16);
     if (max_seq < ntok + 1) max_seq = ntok + 1;
 
+    /* Pure pipeline mode loads only this rank's layers from the source GGUF.
+     * Their prefill panels become anonymous resident copies, so the shared
+     * filesystem is not touched by the timed GEMMs. */
+    if (tp_size == 1) {
+        char lo[16], hi[16];
+        snprintf(lo, sizeof(lo), "%d", l0);
+        snprintf(hi, sizeof(hi), "%d", l1);
+        setenv("TF_PP_L0", lo, 1);
+        setenv("TF_PP_L1", hi, 1);
+        unsetenv("TP_STAGE_DIR");
+    }
+
     gguf_context *g = gguf_open_multi(argv[1], 2);
     if (!g) fail(wrank, "open model metadata");
     bpe_vocab *vocab = bpe_vocab_load(g);
@@ -188,11 +200,13 @@ int main(int argc, char **argv) {
     if (!m) fail(wrank, "load model metadata");
     transformer_set_threads(m, threads);
     const char *stage = env_s("Q38_PREFILL_STAGE", "/local/u14346/qwen38-bf16-tp4");
-    /* Tell metadata slicing that final dense column shards already exist in
-     * the stage file; otherwise it needlessly repacks them from the GGUF. */
-    setenv("TP_STAGE_DIR", stage, 1);
-    if (transformer_tp_slice_weights(m, tp_rank, tp_size, 1)) fail(wrank, "TP slice");
-    if (!transformer_tp_load_stage(m, stage, tp_rank, tp_size)) fail(wrank, "load TP stage");
+    if (tp_size > 1) {
+        /* Tell metadata slicing that final dense column shards already exist in
+         * the stage file; otherwise it needlessly repacks them from the GGUF. */
+        setenv("TP_STAGE_DIR", stage, 1);
+        if (transformer_tp_slice_weights(m, tp_rank, tp_size, 1)) fail(wrank, "TP slice");
+        if (!transformer_tp_load_stage(m, stage, tp_rank, tp_size)) fail(wrank, "load TP stage");
+    }
     transformer_free_unused_kv(m, l0, l1);
     const char *bf16_mode=env_s("Q38_PREFILL_BF16","exact");
     if(!strcmp(bf16_mode,"bf16-act")){
@@ -224,7 +238,7 @@ int main(int argc, char **argv) {
         if (!transformer_prepack_int8_range(m, l0, l1, pp_rank == pp_size - 1))
             fail(wrank, "quantize owned stage");
     }
-    transformer_set_tp(m, tp_rank, tp_size, tp_sum, &tc);
+    if (tp_size > 1) transformer_set_tp(m, tp_rank, tp_size, tp_sum, &tc);
 
     int32_t *tokens = malloc((size_t)ntok * sizeof(*tokens));
     if (!tokens) fail(wrank, "token allocation");

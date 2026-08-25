@@ -2084,3 +2084,40 @@ fell to 21.77--22.83 tok/s and one replica diverged.  The accepted launcher
 therefore meets the 30+ target for the requested independent decode contexts
 and the 120+ target for each prefill request, while reporting long-context
 continuation separately.
+
+### Twelve-node prefill ceilings and 500/1000 attack (2026-08-25)
+
+At the allocation's 2.0 GHz setting, the conservative dense-compute roofs are:
+
+| path | 12-node arithmetic roof | 27B dense-token roof | requested target |
+|---|---:|---:|---:|
+| BF16 storage, FP32 FMA | 36.864 TFLOP/s | 683 tok/s | 500 tok/s (73% of peak) |
+| Q8 SDOT, one vector issue/cycle | 147.456 TOP/s | 2731 tok/s | 1000 tok/s (37% of peak) |
+| measured Q8v2 kernel, 187 GIOPS/core | 107.7 TOP/s | 1994 tok/s | 1000 tok/s (50% of kernel roof) |
+
+The calculation uses two operations per parameter, 48 cores/node, 16 FP32 SVE
+lanes, two FP FMA pipes, and a conservative single SDOT issue rate.  It is an
+arithmetic upper bound: causal attention, DeltaNet recurrence, activation
+packing, pipeline bubbles, and communication all lower application throughput.
+At chunk 256 the weight-stream bandwidth roof is far higher, because each
+packed panel is reused by 256 tokens; prefill is compute/communication bound,
+unlike M=1 decode.
+
+The exact BF16 4096/chunk256 profile measured 221.95 tok/s.  On stage 0 its
+18.455 seconds comprised 15.633 seconds of range compute and 0.626 seconds of
+pipeline send.  The accumulated phase costs were 9.356 seconds in projection
+GEMMs, 3.407 seconds in TP reductions, and about 2.57 seconds in recurrent,
+attention, normalization, and activation work.  Consequently, perfecting the
+GEMM alone cannot reach 500 in PP3xTP4.  uTofu RSAG4 reduced the reported
+collective phase to 2.720 seconds but did not improve end-to-end throughput
+(222.20 tok/s); chunk 512 increased pipeline bubbles and fell to 205.45 tok/s.
+
+The runner now exposes experimental PP12xTP1 (`Q38_PREFILL_TP_SIZE=1`) using
+the transformer's layer-range loader.  It eliminates TP reductions and is a
+useful topology diagnostic, but the first 4096/chunk128 run reached only 62.04
+tok/s: the stages were imbalanced, full-width attention was costly, and the
+last stage faulted the tied LM head from the shared GGUF.  This is not an
+accepted performance path.  The measured results establish the next kernel
+work: BF16 needs a projection path above 73% machine FP peak plus cheaper
+non-GEMM phases; Q8 needs a wider/reused-activation SDOT schedule and reductions
+below the present PP3xTP4 critical path.
