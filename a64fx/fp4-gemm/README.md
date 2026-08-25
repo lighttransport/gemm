@@ -90,4 +90,10 @@ and a 256-entry packed-byte LUT; its consumer uses SVE FP16 multiply/FMA. Two
 alternating 64-byte L1 buffers carry decoded weights between them. It is not
 the default because the scalar producer is slower than direct SVE dequant.
 
+`fp4_gemm_f16_l2` instead dequantizes one packed `N32 x K` weight panel into a
+K-major FP16 workspace and reuses it for every activation row. At K=4096 the
+workspace is 256 KiB, so it resides in L2 rather than the 64 KiB L1. Use direct
+N32 FP4 for M<12 and the L2 panel path for M>=12. GEMM timing includes panel
+dequantization and its L2 write/read traffic.
+
 See [RESULTS.md](RESULTS.md) for measured A64FX results.

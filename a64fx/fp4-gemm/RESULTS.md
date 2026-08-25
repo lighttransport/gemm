@@ -45,6 +45,30 @@ M=12 and M=24 sustain the same per-operation rates because dispatch repeats
 the six-row microkernel. A 12-row intrinsic variant was rejected: register
 spills reduced pure-FP16 throughput to about 22--23 GFLOP/s.
 
+### Pre-dequantized L2 panel
+
+An alternative path reads each packed FP4 `N32 x K` panel once, expands it to
+a K-major FP16 workspace with SVE, and then reuses that panel for all M rows.
+For K=4096 the panel is 256 KiB and therefore resides in L2. Reported timing
+includes dequantization, the FP16 panel store, its reload, and GEMM.
+
+| Format | M | K=256 promotion | Pure FP16 |
+|---|---:|---:|---:|
+| MXFP4 | 6 | 19.5 | 31.5 |
+| MXFP4 | 24 | 22.9 | 41.5 |
+| MXFP4 | 48 | 23.6 | 43.7 |
+| MXFP4 | 128 | 23.8 | 44.5 |
+| NVFP4 1D | 24 | 22.0 | 40.9 |
+| NVFP4 1D | 128 | 22.9 | 43.7 |
+| NVFP4 2D | 24 | 22.5 | 41.1 |
+| NVFP4 2D | 128 | 23.2 | 44.1 |
+
+Values are GFLOP/s/core at N=2048, K=4096. M=1 falls to 6.4--7.5 GFLOP/s
+because the expanded panel is consumed only once. The crossover is around
+M=12. At M=128 the L2 path is 33--35% faster for pure FP16 and 24--28% faster
+with K=256 promotion. It saves HBM2 traffic by fetching packed weights once per
+N32 panel, at the cost of a local 4x-expanded FP16 write/read stream.
+
 The result is below the 256 GFLOP/s/core dense-FP16 peak because A64FX has no
 FP4 arithmetic. Every 32-output FMA step also requires a 16-byte packed load,
 byte-to-halfword expansion, two nibble operations, interleave, table lookup,

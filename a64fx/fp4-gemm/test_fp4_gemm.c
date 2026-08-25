@@ -29,6 +29,10 @@ int main(void){
             double nl=0,dl=0;for(int i=0;i<6*N;++i){double d=got[i]-ref[i];nl+=d*d;dl+=(double)ref[i]*ref[i];}
             double rl=sqrt(nl/(dl+1e-30));printf("%s kc=%d l1asm_rel=%.6g\n",fp4_format_name((fp4_format)f),kc,rl);
             if(!isfinite(rl)||rl>0.08)return 1;}
+        if(fp4_gemm_f16_l2(got,a,&p,M,32))return 1;
+        double np=0,dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
+        double rp=sqrt(np/(dp+1e-30));printf("%s l2panel_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
+        if(!isfinite(rp)||rp>0.08)return 1;
         fp4_matrix_free(&p);}
     free(w);free(ref);free(got);free(got2);free(a);puts("FP4 GEMM tests: PASS");return 0;
 }

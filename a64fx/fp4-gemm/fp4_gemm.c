@@ -416,6 +416,65 @@ int fp4_gemm_f16_l1(float*c,const _Float16*a,const fp4_matrix*w,int m,int promot
 #endif
 }
 
+#if defined(__ARM_FEATURE_SVE)
+static inline void dequant_n32_panel(_Float16*panel,const fp4_matrix*w,int tile){
+    static const __fp16 table_data[32] __attribute__((aligned(64)))={
+        0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6,
+        0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6};
+    svbool_t ph=svptrue_b16(),p16=svwhilelt_b16(0,16);
+    svfloat16_t tab=svld1_f16(ph,table_data);
+    int bs=w->format==FP4_MX?32:16,nb=w->k/bs;
+    const uint8_t*cp=w->codes_n32+(size_t)tile*w->k*16;
+    const _Float16*sp=w->scales_n32+(size_t)tile*nb*32;
+    for(int b=0;b<nb;++b){svfloat16_t scale=svld1_f16(ph,(const __fp16*)(sp+(size_t)b*32));
+      for(int k=b*bs;k<(b+1)*bs;++k){const uint8_t*q=cp+(size_t)k*16;
+        svuint16_t z=svld1ub_u16(p16,q),lo=svand_n_u16_x(p16,z,15);
+        svuint16_t hi=svlsr_n_u16_x(p16,z,4),idx=svzip1_u16(lo,hi);
+        svst1_f16(ph,(__fp16*)(panel+(size_t)k*32),
+            svmul_f16_x(ph,svtbl_f16(tab,idx),scale));
+      }
+    }
+}
+
+static inline void dense_panel_m6(float*c,const _Float16*a,const _Float16*p,
+        int k,int n,int tile,int kbegin,int kend,int rows,int add){
+    svbool_t ph=svptrue_b16(),ps=svptrue_b32();
+    svfloat16_t h0=svdup_f16(0),h1=h0,h2=h0,h3=h0,h4=h0,h5=h0;
+    for(int x=kbegin;x<kend;++x){svfloat16_t wv=svld1_f16(ph,(const __fp16*)(p+(size_t)x*32));
+#define PANEL_FMA(I,H) do{if(rows>(I))(H)=svmla_n_f16_x(ph,(H),wv,(__fp16)a[(size_t)(I)*k+x]);}while(0)
+        PANEL_FMA(0,h0);PANEL_FMA(1,h1);PANEL_FMA(2,h2);
+        PANEL_FMA(3,h3);PANEL_FMA(4,h4);PANEL_FMA(5,h5);
+#undef PANEL_FMA
+    }
+#define PANEL_STORE(I,H) do{if(rows>(I)){svuint16_t hb=svreinterpret_u16_f16(H); \
+        svfloat32_t lo=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpklo_u32(hb))); \
+        svfloat32_t hi=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpkhi_u32(hb))); \
+        float*d=c+(size_t)(I)*n+tile*32;if(add){lo=svadd_f32_x(ps,lo,svld1_f32(ps,d)); \
+        hi=svadd_f32_x(ps,hi,svld1_f32(ps,d+16));}svst1_f32(ps,d,lo);svst1_f32(ps,d+16,hi);}}while(0)
+    PANEL_STORE(0,h0);PANEL_STORE(1,h1);PANEL_STORE(2,h2);
+    PANEL_STORE(3,h3);PANEL_STORE(4,h4);PANEL_STORE(5,h5);
+#undef PANEL_STORE
+}
+#endif
+
+int fp4_gemm_f16_l2(float*c,const _Float16*a,const fp4_matrix*w,int m,int promotion_k){
+    if(!c||!a||!w||!w->codes_n32||!w->scales_n32||m<1||promotion_k<0||
+       (promotion_k&&((promotion_k%32)||promotion_k>w->k)))return-1;
+#if defined(__ARM_FEATURE_SVE)
+    _Float16*panel=NULL;size_t bytes=(size_t)w->k*32*sizeof(*panel);
+    if(posix_memalign((void**)&panel,256,bytes))return-1;
+    int span=promotion_k?promotion_k:w->k;
+    for(int t=0;t<w->n/32;++t){dequant_n32_panel(panel,w,t);
+      for(int m0=0;m0<m;m0+=6){int mr=m-m0<6?m-m0:6;
+        for(int kb=0;kb<w->k;kb+=span){int ke=kb+span<w->k?kb+span:w->k;
+          dense_panel_m6(c+(size_t)m0*w->n,a+(size_t)m0*w->k,panel,w->k,w->n,t,kb,ke,mr,kb!=0);
+        }}
+    }free(panel);return 0;
+#else
+    return-1;
+#endif
+}
+
 int fp4_gemm_f16(float*c,const _Float16*a,const fp4_matrix*w,int m,int promotion_k,int threads){
     if(!c||!a||!w||m<1||promotion_k<0||(promotion_k&&((promotion_k%32)||promotion_k>w->k)))return -1;
     if(threads<1)threads=1;
