@@ -66,3 +66,29 @@ OMP_NUM_THREADS=12 OMP_PROC_BIND=close OMP_PLACES=cores \
 `FP8_I8_GROUP`, `FP8_I8_LANES`, and `FP8_I8_POLICY=mse` select alternative
 encodings. A third positional argument writes converted codes and scales to
 the explicitly supplied directory.
+
+## INT8 SDOT path
+
+`fp8_i8_matrix_prepare_sdot` repacks the 128x128 INT8 representation so each
+SVE lane receives four adjacent K values. Activations are symmetrically
+quantized with `fp8_i8_activation_prepare_group`. The assembly accumulates
+each activation group with `SDOT` into INT32, then performs `SCVTF` and FP32
+rescaling once at the group boundary. FP32 accumulation is retained between
+groups, preventing incompatible DeepSeek K128 weight scales from being mixed
+in one integer accumulator.
+
+On the same 128 MiB stream, K16 activation groups reach **443.3 GFLOP/s** and
+221.7 GB/s. K128 reaches 443.8 GFLOP/s, so the additional conversions have no
+measurable streaming penalty. Across the five real attention tensors and 12
+activation cases each:
+
+- K128 activation quantization adds at most 1.92% relative L2 versus the same
+  INT8 weights evaluated with FP32 activations.
+- K16 reduces that isolated delta to 0.715%.
+- K16 SDOT reaches 1.55% worst-case relative L2 versus exact FP8; at that
+  point the 128x128 weight re-encoding, rather than INT32 accumulation, is the
+  dominant error.
+
+The stream benchmark accepts an activation group as its sixth argument, for
+example `bench_fp8_stream 32768 4096 128 128 16`. The real-weight validator
+uses K16 by default and accepts `FP8_I8_ACT_GROUP` for comparisons.

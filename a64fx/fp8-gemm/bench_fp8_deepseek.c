@@ -113,36 +113,52 @@ int main(int argc,char**argv){
     policy_name=policy==FP8_I8_MSE?"mse":"absmax";
     int group=getenv("FP8_I8_GROUP")?atoi(getenv("FP8_I8_GROUP")):2;
     int lane_group=getenv("FP8_I8_LANES")?atoi(getenv("FP8_I8_LANES")):32;
+    int act_group=getenv("FP8_I8_ACT_GROUP")?atoi(getenv("FP8_I8_ACT_GROUP")):16;
     int fd=open(raw,O_RDONLY);if(fd<0){perror(raw);return 1;}
-    double worst=0.0,min_cos=1.0;
+    double worst=0.0,min_cos=1.0,sdot_exact_worst=0.0,sdot_fma_worst=0.0;
     for(size_t ti=0;ti<sizeof(tensor_names)/sizeof(tensor_names[0]);++ti){
         char wn[320],sn[320];snprintf(wn,sizeof(wn),"%s.weight",tensor_names[ti]);
         snprintf(sn,sizeof(sn),"%s.scale",tensor_names[ti]);tensor_record wr,sr;
         if(find_record(manifest,wn,&wr)||find_record(manifest,sn,&sr)){fprintf(stderr,"missing %s\n",tensor_names[ti]);return 1;}
-        fp8_matrix w;fp8_i8_matrix q={0};
+        fp8_matrix w;fp8_i8_matrix q={0},qdot={0};fp8_i8_activation aq={0};
         if(load_tensor(fd,&wr,&sr,&w)||fp8_matrix_prepare_i8_tile(&w,&q,policy,group,lane_group))return 1;
+        if(fp8_matrix_prepare_i8(&w,&qdot,FP8_I8_ABSMAX)||fp8_i8_matrix_prepare_sdot(&qdot))return 1;
         double wrq=weight_rel_l2(&w,&q);
         if(write_encoded(outdir,tensor_names[ti],policy_name,&q)){perror("write encoded");return 1;}
         if(fp8_matrix_prepare_fast(&w))return 1;
         float*a=aligned_alloc(256,(size_t)w.k*sizeof(float));
         float*ref=aligned_alloc(256,(size_t)w.n*sizeof(float));
-        float*got=aligned_alloc(256,(size_t)w.n*sizeof(float));if(!a||!ref||!got)return 1;
+        float*got=aligned_alloc(256,(size_t)w.n*sizeof(float));
+        float*fma=aligned_alloc(256,(size_t)w.n*sizeof(float));if(!a||!ref||!got||!fma)return 1;
         double tensor_worst=0.0,tensor_cos=1.0,max_abs=0.0;
+        double tensor_sdot_exact=0.0,tensor_sdot_fma=0.0,tensor_sdot_cos=1.0;
         for(int dist=0;dist<4;++dist)for(int seed=0;seed<3;++seed){
-            fill_activation(a,w.k,dist,seed);double rel,cosine,ma;
+            fill_activation(a,w.k,dist,seed);double rel,cosine,ma,re,rf,cs,unused;
             fp8_gemv_f32_omp(ref,a,&w,12,FP8_DECODE_SPARSE_EXACT);
             fp8_i8_gemv_f32_omp(got,a,&q,12);errors(ref,got,w.n,&rel,&cosine,&ma);
             if(rel>tensor_worst)tensor_worst=rel;if(cosine<tensor_cos)tensor_cos=cosine;
             if(ma>max_abs)max_abs=ma;
+            fp8_i8_gemv_f32_omp(fma,a,&qdot,12);
+            if(fp8_i8_activation_prepare_group(&aq,a,w.k,act_group)||
+               fp8_i8_gemv_sdot_omp(got,&aq,&qdot,12))return 1;
+            errors(ref,got,w.n,&re,&cs,&unused);errors(fma,got,w.n,&rf,&cosine,&unused);
+            if(re>tensor_sdot_exact)tensor_sdot_exact=re;
+            if(rf>tensor_sdot_fma)tensor_sdot_fma=rf;if(cs<tensor_sdot_cos)tensor_sdot_cos=cs;
         }
         printf("tensor=%s N=%d K=%d policy=%s G=%dx%d weight_rel_l2=%.6g "
-               "gemv_worst_rel_l2=%.6g min_cos=%.9f max_abs=%.6g\n",tensor_names[ti],
-               w.n,w.k,policy_name,lane_group,group,wrq,tensor_worst,tensor_cos,max_abs);fflush(stdout);
+               "gemv_worst_rel_l2=%.6g min_cos=%.9f max_abs=%.6g "
+               "sdot_A%d_vs_exact=%.6g sdot_vs_fma=%.6g sdot_cos=%.9f\n",tensor_names[ti],
+               w.n,w.k,policy_name,lane_group,group,wrq,tensor_worst,tensor_cos,max_abs,
+               act_group,tensor_sdot_exact,tensor_sdot_fma,tensor_sdot_cos);fflush(stdout);
         if(tensor_worst>worst)worst=tensor_worst;if(tensor_cos<min_cos)min_cos=tensor_cos;
-        free(a);free(ref);free(got);fp8_i8_matrix_free(&q);fp8_matrix_free(&w);
+        if(tensor_sdot_exact>sdot_exact_worst)sdot_exact_worst=tensor_sdot_exact;
+        if(tensor_sdot_fma>sdot_fma_worst)sdot_fma_worst=tensor_sdot_fma;
+        free(a);free(ref);free(got);free(fma);fp8_i8_activation_free(&aq);
+        fp8_i8_matrix_free(&q);fp8_i8_matrix_free(&qdot);fp8_matrix_free(&w);
     }
     close(fd);printf("summary policy=%s G=%dx%d worst_rel=%.6g min_cos=%.9f "
-        "gate_rel=0.005 gate_cos=0.9999 result=%s\n",policy_name,lane_group,group,worst,min_cos,
-        worst<=.005&&min_cos>=.9999?"PASS":"FAIL");
+        "gate_rel=0.005 gate_cos=0.9999 result=%s sdot128_vs_exact=%.6g "
+        "sdot_A%d_activation_delta=%.6g\n",policy_name,lane_group,group,worst,min_cos,
+        worst<=.005&&min_cos>=.9999?"PASS":"FAIL",sdot_exact_worst,act_group,sdot_fma_worst);
     return 0;
 }

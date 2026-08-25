@@ -12,6 +12,8 @@ extern void fp8_e4m3fn_m1_asm(const fp8_m1_args*);
 extern void fp8_e4m3fn_lut_m1_asm(const fp8_m1_args*);
 extern void fp8_i8_m1_asm(const fp8_m1_args*);
 extern void fp8_i8x4_m1_asm(const fp8_m1_args*);
+typedef struct {const int8_t*q,*a;const float*ws,*as;float*out;int k,act_group;} fp8_sdot_args;
+extern void fp8_i8_sdot_m1_asm(const fp8_sdot_args*);
 static uint32_t fp8_lut[256] __attribute__((aligned(256)));
 static int fp8_lut_ready;
 
@@ -45,7 +47,7 @@ int fp8_i8_matrix_alloc(fp8_i8_matrix*w,int n,int k){
 }
 
 void fp8_i8_matrix_free(fp8_i8_matrix*w){
-    if(!w)return;free(w->codes);free(w->scales);memset(w,0,sizeof(*w));
+    if(!w)return;free(w->codes);free(w->sdot_codes);free(w->scales);memset(w,0,sizeof(*w));
 }
 
 static int quant_i8(float x,float inverse){
@@ -72,6 +74,7 @@ int fp8_matrix_prepare_i8_tile(const fp8_matrix*src,fp8_i8_matrix*dst,
        (lane_group!=32&&lane_group!=128))return-1;
     if((!dst->codes||!dst->scales||dst->n!=src->n||dst->k!=src->k)&&
        fp8_i8_matrix_alloc(dst,src->n,src->k))return-1;
+    free(dst->sdot_codes);dst->sdot_codes=NULL;
     dst->scale_group=scale_group;dst->lane_group=lane_group;
     int scale_count=src->k/scale_group,lane_tiles=128/lane_group;
     for(int g=0;g<src->n/128;++g)for(int kb=0;kb<scale_count;++kb)
@@ -150,6 +153,49 @@ int fp8_i8_gemv_reference(float*out,const float*a,const fp8_i8_matrix*w){
                      lane/w->lane_group];}
       out[r]=(float)z;
     }return 0;
+}
+
+int fp8_i8_matrix_prepare_sdot(fp8_i8_matrix*w){
+    if(!w||!w->codes||!w->scales||w->scale_group!=128||w->lane_group!=128)return-1;
+    free(w->sdot_codes);w->sdot_codes=NULL;
+    if(posix_memalign((void**)&w->sdot_codes,256,(size_t)w->n*w->k))return-1;
+    for(int g=0;g<w->n/128;++g)for(int b=0;b<w->k/128;++b)
+      for(int p=0;p<32;++p)for(int v=0;v<8;++v)for(int lane=0;lane<16;++lane)
+        for(int j=0;j<4;++j){
+            int k=b*128+p*4+j,nlane=v*16+lane;
+            size_t src=((size_t)g*w->k+k)*128+nlane;
+            size_t dst=((((size_t)g*(w->k/128)+b)*32+p)*8+v)*64+lane*4+j;
+            w->sdot_codes[dst]=w->codes[src];
+        }
+    return 0;
+}
+
+int fp8_i8_activation_prepare(fp8_i8_activation*q,const float*a,int k){
+    return fp8_i8_activation_prepare_group(q,a,k,128);
+}
+
+int fp8_i8_activation_prepare_group(fp8_i8_activation*q,const float*a,int k,
+                                    int scale_group){
+    if(!q||!a||k<=0||k%128||scale_group<4||scale_group>128||
+       (scale_group&(scale_group-1)))return-1;
+    if((!q->codes||!q->scales||q->k!=k)){
+        fp8_i8_activation_free(q);q->k=k;
+        if(posix_memalign((void**)&q->codes,256,(size_t)k)||
+           posix_memalign((void**)&q->scales,256,(size_t)(k/4)*sizeof(float))){
+            fp8_i8_activation_free(q);return-1;
+        }
+    }
+    q->scale_group=scale_group;
+    for(int b=0;b<k/scale_group;++b){float m=0.0f;
+        for(int j=0;j<scale_group;++j){float x=fabsf(a[b*scale_group+j]);if(x>m)m=x;}
+        float scale=m>0.0f?m/127.0f:1.0f,inv=1.0f/scale;q->scales[b]=scale;
+        for(int j=0;j<scale_group;++j)q->codes[b*scale_group+j]=
+            (int8_t)quant_i8(a[b*scale_group+j],inv);
+    }return 0;
+}
+
+void fp8_i8_activation_free(fp8_i8_activation*q){
+    if(!q)return;free(q->codes);free(q->scales);memset(q,0,sizeof(*q));
 }
 
 #if defined(__ARM_FEATURE_SVE)
@@ -266,5 +312,23 @@ int fp8_i8_gemv_f32_omp(float*out,const float*a,const fp8_i8_matrix*w,int thread
     return 0;
 #else
     (void)threads;return fp8_i8_gemv_reference(out,a,w);
+#endif
+}
+
+
+int fp8_i8_gemv_sdot_omp(float*out,const fp8_i8_activation*a,
+                         const fp8_i8_matrix*w,int threads){
+    if(!out||!a||!w||!a->codes||!a->scales||!w->sdot_codes||!w->scales||
+       a->k!=w->k||w->scale_group!=128||w->lane_group!=128||threads<1)return-1;
+#if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for(int g=0;g<w->n/128;++g){
+        fp8_sdot_args x={w->sdot_codes+(size_t)g*w->k*128,a->codes,
+            w->scales+(size_t)g*(w->k/128),a->scales,out+g*128,w->k,a->scale_group};
+        fp8_i8_sdot_m1_asm(&x);
+    }
+    return 0;
+#else
+    (void)threads;return-1;
 #endif
 }
