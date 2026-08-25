@@ -25,6 +25,7 @@ typedef struct {
     int active, fd;
     int n_prompt, n_cached, pos, ngen, max_new, hit_eos;
     int stream, client_gone;
+    long disagree_start;
     int *ids, *gen;
     laguna_sampler smp;
     double t_admit, t_prefill_done;

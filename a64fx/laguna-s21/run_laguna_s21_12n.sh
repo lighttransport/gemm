@@ -33,7 +33,7 @@ PROMPT="The capital of France is"
 IDS=""; MAX_NEW=48; MAX_NEW_SET=0; LAYERS=48; DO_STAGE=1; VARIANT=int4; CHAT=0; SYSMSG=""; NOTHINK=0; KV_FP16=0
 QUALITY_CPP=0; PROMPT_CACHE=""
 MODEL=""; STAGE=""; NSHARDS=""; PORT=""; MAXPOS=""
-AR_GROUPS=""; COMM_ROBUST=2; COMM_POLL_SPINS=4
+AR_GROUPS=""; EXPERT_GROUPS=1; COMM_ROBUST=2; COMM_POLL_SPINS=4
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -55,6 +55,7 @@ while [ $# -gt 0 ]; do
       case "$2" in /*) PROMPT_CACHE="$2";; *) PROMPT_CACHE="$PWD/$2";; esac
       shift 2;;
     --ar-groups) AR_GROUPS="$2"; shift 2;;
+    --expert-groups) EXPERT_GROUPS="$2"; shift 2;;
     --comm-robust) COMM_ROBUST="$2"; shift 2;;
     --comm-poll-spins) COMM_POLL_SPINS="$2"; shift 2;;
     --bf16)    VARIANT=bf16; shift;;
@@ -78,6 +79,9 @@ case "$COMM_POLL_SPINS" in 1|2|4|8|16|32|64|128|256|512|1024) ;;
   *) echo "--comm-poll-spins must be a power of two in [1,1024]" >&2; exit 2;; esac
 if [ -n "$AR_GROUPS" ] && { [ "$AR_GROUPS" -lt 1 ] || [ $((NP % AR_GROUPS)) -ne 0 ]; }; then
   echo "--ar-groups must be a positive divisor of --np" >&2; exit 2
+fi
+if [ "$EXPERT_GROUPS" -lt 1 ] || [ $((NP % EXPERT_GROUPS)) -ne 0 ]; then
+  echo "--expert-groups must be a positive divisor of --np" >&2; exit 2
 fi
 
 # int4 (production, default), pure-bf16 reference, or fp8 (bf16 linears + fp8
@@ -111,7 +115,7 @@ case "$MODE" in
   stage)
     exec mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$HERE/build/laguna_s21_stage" \
         --model-dir "$MODEL" --stage-dir "$STAGE" --ep-size "$NP" \
-        --nshards "$NSHARDS" "${PASS[@]}" ;;
+        --expert-groups "$EXPERT_GROUPS" --nshards "$NSHARDS" "${PASS[@]}" ;;
   generate|serve) ;;  # handled below
   *) echo "usage: $0 {self-test|stage|generate|serve} [flags]" >&2; exit 2;;
 esac
@@ -133,7 +137,7 @@ if [ "$DO_STAGE" = 1 ]; then
   echo "staging weights to $STAGE (this takes a few minutes) ..."
   mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$HERE/build/laguna_s21_stage" \
       --model-dir "$MODEL" --stage-dir "$STAGE" --status-dir "$RUN_DIR" \
-      --ep-size "$NP" --nshards "$NSHARDS" >stage.stdout 2>stage.stderr
+      --ep-size "$NP" --expert-groups "$EXPERT_GROUPS" --nshards "$NSHARDS" >stage.stdout 2>stage.stderr
   staged=$(find "$RUN_DIR" -maxdepth 1 -name 'laguna_stage_rank*.txt' | wc -l)
   [ "$staged" -eq "$NP" ] || { echo "staging incomplete: $staged/$NP" >&2; exit 4; }
 fi
@@ -190,6 +194,7 @@ export OMP_PROC_BIND="${OMP_PROC_BIND:-close}" OMP_PLACES="${OMP_PLACES:-cores}"
 export XOS_MMM_L_PAGING_POLICY="${XOS_MMM_L_PAGING_POLICY:-demand:demand:demand}"
 export TP_AR_ROBUST="$COMM_ROBUST" TP_AR_POLL_SPINS="$COMM_POLL_SPINS"
 [ -n "$AR_GROUPS" ] && export LAGUNA_AR_GROUPS="$AR_GROUPS"
+RUNNER_PASS=(--expert-groups "$EXPERT_GROUPS" "${PASS[@]}")
 
 if [ "$MODE" = serve ]; then
   [ -n "$PORT" ] || { echo "serve needs --port N" >&2; exit 2; }
@@ -198,14 +203,14 @@ if [ "$MODE" = serve ]; then
   echo "  LAGUNA_TOKENIZER=$MODEL/tokenizer.json python3 $HERE/tools/laguna_cli.py --port $PORT chat 'hello'"
   exec mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$RUNNER" --serve \
       --port "$PORT" --maxpos "$MAXPOS" --layers "$LAYERS" \
-      --stage-dir "$STAGE" "${PCACHE_ARGS[@]}" "${PASS[@]}"
+      --stage-dir "$STAGE" "${PCACHE_ARGS[@]}" "${RUNNER_PASS[@]}"
 fi
 
 run_generate() {
   local prompt_ids="$1" gen_out="$2"
   mpiexec -np "$NP" "${OFP[@]+"${OFP[@]}"}" "$RUNNER" --generate \
       --ids "$prompt_ids" --max-new "$MAX_NEW" --layers "$LAYERS" \
-      --stage-dir "$STAGE" --gen-out "$gen_out" "${PCACHE_ARGS[@]}" "${PASS[@]}"
+      --stage-dir "$STAGE" --gen-out "$gen_out" "${PCACHE_ARGS[@]}" "${RUNNER_PASS[@]}"
 }
 
 run_generate "$IDS" "$RUN_DIR/gen.ids"

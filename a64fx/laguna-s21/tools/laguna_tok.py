@@ -35,7 +35,8 @@ def render_chat(messages, add_generation_prompt=True, enable_thinking=True, tool
     except ImportError:
         sys.exit("chat mode needs jinja2 (pip install --user jinja2), or pass "
                  "pre-rendered text to `encode`")
-    src = open(CHAT_TEMPLATE).read()
+    with open(CHAT_TEMPLATE) as f:
+        src = f.read()
     src = re.sub(r"\{%-?\s*(end)?generation\s*-?%\}", "", src)
     env = jinja2.Environment(trim_blocks=False, lstrip_blocks=False)
     env.policies["json.dumps_kwargs"] = {"ensure_ascii": False}
@@ -127,7 +128,9 @@ def _split_isolated(text):
 
 class Tok:
     def __init__(self, path):
-        j = json.load(open(path)); m = j["model"]
+        with open(path) as f:
+            j = json.load(f)
+        m = j["model"]
         if m.get("type") != "BPE" or m.get("byte_fallback", False):
             raise ValueError("Laguna tokenizer must be BPE without byte_fallback")
         pts = j.get("pre_tokenizer", {}).get("pretokenizers", [])
@@ -210,7 +213,9 @@ def main():
     if cmd=="encode":
         print(" ".join(str(i) for i in t.encode(argv[2], "--bos" in argv)))
     elif cmd=="encode-file":
-        print(" ".join(str(i) for i in t.encode(open(argv[2]).read(), "--bos" in argv)))
+        with open(argv[2]) as f:
+            text = f.read()
+        print(" ".join(str(i) for i in t.encode(text, "--bos" in argv)))
     elif cmd=="system-prefix":
         sysmsg = _opt(argv,"--system")
         msgs = [{"role":"system","content":sysmsg}] if sysmsg is not None else []
@@ -219,7 +224,11 @@ def main():
         if "--show-prompt" in argv: sys.stderr.write(text+"\n")
         print(" ".join(str(i) for i in t.encode(text)))
     elif cmd in ("chat","chat-file"):
-        user = open(argv[2]).read() if cmd=="chat-file" else argv[2]
+        if cmd == "chat-file":
+            with open(argv[2]) as f:
+                user = f.read()
+        else:
+            user = argv[2]
         msgs = []
         sysmsg = _opt(argv,"--system")
         if sysmsg is not None: msgs.append({"role":"system","content":sysmsg})
@@ -232,7 +241,9 @@ def main():
     elif cmd=="decode":
         print(t.decode([int(x) for x in argv[2].split()], "--raw" in argv))
     elif cmd=="decode-file":
-        print(t.decode([int(x) for x in open(argv[2]).read().split()], "--raw" in argv))
+        with open(argv[2]) as f:
+            ids = [int(x) for x in f.read().split()]
+        print(t.decode(ids, "--raw" in argv))
     else: print(__doc__); sys.exit(1)
 
 if __name__=="__main__": main()

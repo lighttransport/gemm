@@ -301,17 +301,21 @@ static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
         lbat_step st; memset(&st, 0, sizeof st);
 
         if (MyRank == 0) {
-            /* Admit whatever is waiting into free slots.  Block on accept() only
-             * when the batch is empty, so an idle server does not spin and a busy
-             * one never stalls a step waiting for a new client. */
-            int nactive = 0;
-            for (int i=0;i<B.nslot;i++) if (B.slot[i].active) nactive++;
+            /* Admit whatever is waiting into free slots.  accept() stays
+             * nonblocking so rank 0 cannot get ahead of the collective control
+             * path when the batch is empty. */
             for (;;) {
                 int free_slot = -1;
                 for (int i=0;i<B.nslot;i++) if (!B.slot[i].active) { free_slot = i; break; }
                 if (free_slot < 0) break;
+                /* Rank 0 must not block in accept() while the other ranks are
+                 * entering lbat_bcast().  That used to deadlock every idle
+                 * transition: with an empty batch rank 0 waited for a client,
+                 * while ranks 1..N-1 advanced to the next collective and timed
+                 * out.  Polling is cheap here; the empty-step sleep below keeps
+                 * the idle path from spinning. */
                 int fl = fcntl(listen_fd, F_GETFL, 0);
-                fcntl(listen_fd, F_SETFL, nactive ? (fl|O_NONBLOCK) : (fl&~O_NONBLOCK));
+                fcntl(listen_fd, F_SETFL, fl|O_NONBLOCK);
                 int cfd = accept(listen_fd, NULL, NULL);
                 if (cfd < 0) break;                       /* nothing pending */
                 int one=1; setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -325,11 +329,10 @@ static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
                 int admit = lsrv_accept_into(s, cfd, raw, body, maxpos, N, m->n_layers, defaults, pc);
                 free(raw);
                 if (!admit) { close(cfd); continue; }
-                s->active = 1; s->t_admit = now_sec();
+                s->active = 1; s->t_admit = now_sec(); s->disagree_start = disagree;
                 st.adm_slot[st.n_admit] = free_slot;
                 st.adm_len[st.n_admit]  = s->n_prompt;
                 st.n_admit++;
-                nactive++;
             }
             /* everything already running steps this round */
             for (int i=0;i<B.nslot;i++) {
@@ -346,7 +349,10 @@ static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
 
         if (lbat_bcast(&B, &st) != 0) break;
         if (st.quit) break;
-        if (st.n_active == 0 && st.n_admit == 0) continue;   /* nothing to do */
+        if (st.n_active == 0 && st.n_admit == 0) {
+            usleep(5000);                                    /* idle poll; stay lockstep */
+            continue;
+        }
 
         /* --- admitted sequences: prefill each into its own slot's KV --- */
         for (int i=0;i<st.n_admit;i++) {
@@ -433,7 +439,7 @@ static int lsrv_run(laguna_model *m, laguna_scratch *sc, int port, int maxpos,
                 if (MyRank == 0) {
                     logmsg("slot %d done: %d prompt + %d gen tok%s\n",
                            i, s->n_prompt, s->ngen, s->hit_eos?" (eos)":"");
-                    lsrv_finish(s, now_sec(), disagree);
+                    lsrv_finish(s, now_sec(), disagree - s->disagree_start);
                 } else { s->active = 0; s->fd = -1; }
             }
         }

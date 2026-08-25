@@ -910,6 +910,38 @@ static inline void laguna_fp8_to_i8blk(laguna_w8b *o, const uint8_t *W,
     }
 }
 
+/* Convert a contiguous column slice of a row-major FP8 matrix.  Down projections
+ * are [hidden, expert_inter], so expert TP sharding takes columns rather than rows.
+ * The source rows retain the full checkpoint stride while the destination is packed
+ * as [rows, cols] for the normal int8 kernels. */
+static inline void laguna_fp8_to_i8blk_colslice(laguna_w8b *o, const uint8_t *W,
+                                                const uint16_t *bs, int rows,
+                                                int full_cols, int col0, int cols) {
+    int cblk = cols / LAGUNA_FP8_BLK, full_cblk = full_cols / LAGUNA_FP8_BLK;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t *wr = W + (size_t)r*full_cols + col0;
+        const uint16_t *sr = bs + (size_t)r*full_cblk + col0/LAGUNA_FP8_BLK;
+        for (int cb = 0; cb < cblk; ++cb) {
+            const uint8_t *wb = wr + cb*LAGUNA_FP8_BLK;
+            float mx = 0.0f;
+            for (int j = 0; j < LAGUNA_FP8_BLK; ++j) {
+                float a = fabsf(laguna_fp8_lut[wb[j]]); if (a > mx) mx = a;
+            }
+            float blk = laguna_bf16_to_f32(sr[cb]);
+            o->s[(size_t)r*cblk + cb] = mx > 0.0f ? blk*mx/127.0f : blk;
+            float inv = mx > 0.0f ? 127.0f/mx : 0.0f;
+            int8_t *qb = o->q + (size_t)r*cols + cb*LAGUNA_FP8_BLK;
+            for (int j = 0; j < LAGUNA_FP8_BLK; ++j) {
+                int v = (int)lrintf(laguna_fp8_lut[wb[j]]*inv);
+                qb[j] = (int8_t)(v < -127 ? -127 : v > 127 ? 127 : v);
+            }
+        }
+    }
+}
+
 #if defined(__ARM_FEATURE_SVE)
 /* Rows [r,r+nr) (nr<=8) of y = W8B * x.  8 rows share each x load; 8 | 128 so an
  * 8-row group never crosses a block-scale row boundary.
@@ -1238,13 +1270,15 @@ static inline void laguna_lin_mm(float *Y, const laguna_lin *w, const float *X,
 typedef struct { const uint8_t *gate, *up, *down;   /* fp8 e4m3 [rows,cols]     */
                  const uint16_t *gs, *us, *ds;      /* bf16 block scales        */
                  laguna_w8b qg, qu, qd;             /* int8-per-block (default) */
+                 int row0, nrows;                   /* expert TP slice           */
                  int present; } laguna_expert;
 #elif defined(LAGUNA_BF16)
-typedef struct { const uint16_t *gate, *up, *down; int present; } laguna_expert;
+typedef struct { const uint16_t *gate, *up, *down; int row0, nrows, present; } laguna_expert;
 #else
 typedef struct {
     const uint32_t *gp, *up, *dp;   /* weight_packed (uint32) */
     const uint16_t *gs, *us, *ds;   /* weight_scale  (bf16)   */
+    int row0, nrows;
     int present;                    /* owned by this rank      */
 } laguna_expert;
 #endif

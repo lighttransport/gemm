@@ -48,6 +48,8 @@ float laguna_fp8_lut[256];   /* definition for the extern in laguna_s21.h */
 /* ============================ small helpers ============================ */
 static FILE *g_log = NULL;
 static int   g_rank = 0;
+/* Expert replication factor, consumed by the included uTofu option parser. */
+static int   g_expert_groups = 1;
 static void logmsg(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     if (g_log) { va_list a2; va_copy(a2, ap); vfprintf(g_log, fmt, a2); va_end(a2); fflush(g_log); }
@@ -573,6 +575,20 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
     m->n_seq = n_seq > 0 ? n_seq : 1;
 #if defined(LAGUNA_FP8)
     laguna_fp8_init_lut();
+    if (g_expert_groups < 1 || ep_size % g_expert_groups != 0) {
+        fprintf(stderr, "FATAL: expert-groups=%d must divide EP size %d\n",
+                g_expert_groups, ep_size);
+        exit(1);
+    }
+    if (g_expert_groups > 1 && g_fp8_exact) {
+        fprintf(stderr, "FATAL: expert-groups>1 requires the int8 FP8 path\n");
+        exit(1);
+    }
+#else
+    if (g_expert_groups != 1) {
+        fprintf(stderr, "FATAL: expert-groups is only supported by the FP8 runner\n");
+        exit(1);
+    }
 #endif
     m->n_layers=n_layers; m->max_pos=max_pos; m->ep_rank=rank; m->ep_size=ep_size;
     m->embed      = stage_req(s,"model.embed_tokens.weight");
@@ -615,9 +631,18 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
               if (stage_dtype_is_bf16(s,nm)) { const uint16_t *b=bp; for(int e=0;e<LAGUNA_EXPERTS;++e) bias[e]=laguna_bf16_to_f32(b[e]); }
               else { memcpy(bias, bp, LAGUNA_EXPERTS*sizeof(float)); }
               ly->router_bias=bias; }
+            int expert_mod = ep_size / g_expert_groups;
+            int shard_inter = LAGUNA_EXPERT_INTER / g_expert_groups;
+            if (LAGUNA_EXPERT_INTER % g_expert_groups != 0) {
+                fprintf(stderr, "FATAL: expert intermediate %d not divisible by groups %d\n",
+                        LAGUNA_EXPERT_INTER, g_expert_groups);
+                exit(1);
+            }
             for (int e=0;e<LAGUNA_EXPERTS;++e) {
-                if (e % ep_size != rank) continue;   /* not owned by this rank */
+                if (e % expert_mod != rank % expert_mod) continue;
                 laguna_expert *ex=&ly->experts[e];
+                ex->row0 = (rank / expert_mod) * shard_inter;
+                ex->nrows = g_expert_groups > 1 ? shard_inter : LAGUNA_EXPERT_INTER;
 #if defined(LAGUNA_FP8)
                 snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.gate_proj.weight",      L,e); ex->gate=stage_req(s,nm);
                 snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.gate_proj.weight_scale",L,e); ex->gs  =stage_req(s,nm);
@@ -628,10 +653,16 @@ static void model_build(laguna_model *m, const laguna_stage *s, int n_layers,
                 if (!g_fp8_exact) {
                     /* Re-quantize e4m3 -> int8 per 128-col block (halves the bytes and
                      * drops the LUT gather; see laguna_fp8_to_i8blk). */
-                    int inter=LAGUNA_EXPERT_INTER;
-                    alloc_w8b(&ex->qg, inter, H); laguna_fp8_to_i8blk(&ex->qg, ex->gate, ex->gs, inter, H);
-                    alloc_w8b(&ex->qu, inter, H); laguna_fp8_to_i8blk(&ex->qu, ex->up,   ex->us, inter, H);
-                    alloc_w8b(&ex->qd, H, inter); laguna_fp8_to_i8blk(&ex->qd, ex->down, ex->ds, H, inter);
+                    int inter=ex->nrows;
+                    alloc_w8b(&ex->qg, inter, H);
+                    laguna_fp8_to_i8blk(&ex->qg, ex->gate + (size_t)ex->row0*H,
+                                        ex->gs + (size_t)ex->row0*(H/LAGUNA_FP8_BLK), inter, H);
+                    alloc_w8b(&ex->qu, inter, H);
+                    laguna_fp8_to_i8blk(&ex->qu, ex->up + (size_t)ex->row0*H,
+                                        ex->us + (size_t)ex->row0*(H/LAGUNA_FP8_BLK), inter, H);
+                    alloc_w8b(&ex->qd, H, inter);
+                    laguna_fp8_to_i8blk_colslice(&ex->qd, ex->down, ex->ds, H,
+                                                 LAGUNA_EXPERT_INTER, ex->row0, inter);
                 }
 #elif defined(LAGUNA_BF16)
                 snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.gate_proj.weight",L,e); ex->gate=stage_req(s,nm);
@@ -1317,7 +1348,7 @@ static void swiglu_lin(laguna_scratch *sc, const laguna_lin *gate_w, const lagun
 /* One routed expert's SwiGLU into `out` (hidden). inter=1024. INT4 (production)
  * or bf16 (-DLAGUNA_BF16). */
 static void expert_mv(laguna_scratch *sc, const laguna_expert *ex, const float *x, float *out) {
-    int inter=LAGUNA_EXPERT_INTER;
+    int inter=ex->nrows > 0 ? ex->nrows : LAGUNA_EXPERT_INTER;
 #if defined(LAGUNA_FP8)
     if (g_fp8_exact) {
         laguna_matvec_fp8blk(sc->inter_a, ex->gate, ex->gs, x, inter, LAGUNA_HIDDEN);
@@ -1482,15 +1513,19 @@ static void laguna_mlp_chunk(const laguna_model *m, laguna_scratch *sc, float *X
 #if defined(LAGUNA_FP8)
         /* BATCHED experts: for each owned expert, gather its tokens and run one
          * (dequant-once) fp8 GEMM -> the fp8 gather is amortized across tokens. */
-        int inter=LAGUNA_EXPERT_INTER; int tok[LAGUNA_PCHUNK]; float wgt[LAGUNA_PCHUNK];
-        for (int e=m->ep_rank; e<LAGUNA_EXPERTS; e+=m->ep_size) {
+        int tok[LAGUNA_PCHUNK]; float wgt[LAGUNA_PCHUNK];
+        for (int e=0; e<LAGUNA_EXPERTS; ++e) {
             const laguna_expert *ex=&ly->experts[e]; if(!ex->present) continue;
+            int inter=ex->nrows > 0 ? ex->nrows : LAGUNA_EXPERT_INTER;
             int ne=0;
             for (int c=0;c<C;++c){ const int *id=sc->rids+(size_t)c*LAGUNA_ACTIVE;
                 for (int k=0;k<LAGUNA_ACTIVE;++k) if(id[k]==e){ tok[ne]=c; wgt[ne]=sc->rrw[(size_t)c*LAGUNA_ACTIVE+k]; ne++; break; } }
             if(ne==0) continue;
             for (int i=0;i<ne;++i) memcpy(sc->xe+(size_t)i*H, sc->cn2+(size_t)tok[i]*H, (size_t)H*sizeof(float));
             if (g_fp8_exact) {
+                if (ex->row0 != 0 || inter != LAGUNA_EXPERT_INTER) {
+                    fprintf(stderr, "FATAL: exact FP8 expert slice encountered\n"); exit(1);
+                }
                 laguna_matmat_fp8blk(sc->cia, ex->gate, ex->gs, sc->xe, inter, H, ne);
                 laguna_matmat_fp8blk(sc->cib, ex->up,   ex->us, sc->xe, inter, H, ne);
                 for (long i=0;i<(long)ne*inter;++i) sc->cia[i]=laguna_silu(sc->cia[i])*sc->cib[i];
@@ -1506,8 +1541,9 @@ static void laguna_mlp_chunk(const laguna_model *m, laguna_scratch *sc, float *X
         }
 #else
         int tok[LAGUNA_PCHUNK]; float wgt[LAGUNA_PCHUNK];
-        for (int e=m->ep_rank; e<LAGUNA_EXPERTS; e+=m->ep_size) {
+        for (int e=0; e<LAGUNA_EXPERTS; ++e) {
             const laguna_expert *ex=&ly->experts[e]; if(!ex->present) continue;
+            int inter=ex->nrows > 0 ? ex->nrows : LAGUNA_EXPERT_INTER;
             int ne=0;
             for (int c=0;c<C;++c) {
                 const int *id=sc->rids+(size_t)c*LAGUNA_ACTIVE;
@@ -1519,10 +1555,10 @@ static void laguna_mlp_chunk(const laguna_model *m, laguna_scratch *sc, float *X
             for (int i=0;i<ne;++i)
                 memcpy(sc->xe+(size_t)i*H, sc->cn2+(size_t)tok[i]*H, (size_t)H*sizeof(float));
             laguna_matmat_i4g32_dual(sc->cia, sc->cib, ex->gp, ex->gs, ex->up, ex->us,
-                                     sc->xe, LAGUNA_EXPERT_INTER, H, ne);
-            for (long i=0;i<(long)ne*LAGUNA_EXPERT_INTER;++i)
+                                     sc->xe, inter, H, ne);
+            for (long i=0;i<(long)ne*inter;++i)
                 sc->cia[i]=laguna_silu(sc->cia[i])*sc->cib[i];
-            laguna_matmat_i4g32(sc->ye, ex->dp, ex->ds, sc->cia, H, LAGUNA_EXPERT_INTER, ne);
+            laguna_matmat_i4g32(sc->ye, ex->dp, ex->ds, sc->cia, H, inter, ne);
             for (int i=0;i<ne;++i) {
                 float *pc=sc->cpart+(size_t)tok[i]*H; const float *ye=sc->ye+(size_t)i*H;
                 float w=wgt[i];
