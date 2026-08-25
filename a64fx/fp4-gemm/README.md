@@ -51,6 +51,14 @@ quantized to each FP4 format.
 
 ```sh
 cd a64fx/fp4-gemm
+# Focused single-core output-vectorized kernel
+OMP_NUM_THREADS=1 OMP_PROC_BIND=close OMP_PLACES=cores ./bench_fp4_single
+
+# Real checkpoint shapes/data, using the N32 compute layout
+OMP_NUM_THREADS=1 OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./bench_fp4_gemm --kernel n32 --threads 1 --experts 1 --full
+
+# Original output-row kernel, for multi-core comparison
 OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
   ./bench_fp4_gemm --threads 48 --experts 256 --reps 1
 
@@ -66,5 +74,10 @@ OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
 Reported relative L2 error compares the SVE result with FP32 accumulation of
 the same FP16 activation and FP16-rounded dequantized FP4 weights. Thus it
 isolates accumulation error from format conversion error.
+
+The `n32` path repacks 32 output channels together. Each K step expands 32
+E2M1 values with SVE table lookup, applies a predecoded FP16 scale vector, then
+reuses that vector across a six-row activation microtile. Scale decoding and
+repacking are setup costs and are outside timed GEMM execution.
 
 See [RESULTS.md](RESULTS.md) for measured A64FX results.

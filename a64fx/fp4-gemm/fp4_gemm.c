@@ -96,7 +96,8 @@ int fp4_matrix_alloc(fp4_matrix *p, fp4_format f, int n, int k) {
 
 void fp4_matrix_free(fp4_matrix *p) {
     if (!p) return;
-    free(p->codes); free(p->scales); memset(p, 0, sizeof(*p));
+    free(p->codes); free(p->scales); free(p->codes_n32);
+    free(p->scales_n32); memset(p, 0, sizeof(*p));
 }
 
 static float block_amax_1d(const float *w, int k, int row, int col, int bs) {
@@ -161,6 +162,27 @@ static float row_scale(const fp4_matrix *p,int r,int c){
     return p->global_scale*fp4_e4m3_decode_positive(p->scales[(size_t)(r/16)*(p->k/16)+c/16]);
 }
 
+int fp4_matrix_prepare_n32(fp4_matrix *p){
+    if(!p||!p->codes||!p->scales||p->n%32||p->k%32)return -1;
+    free(p->codes_n32);free(p->scales_n32);p->codes_n32=NULL;p->scales_n32=NULL;
+    int nt=p->n/32,bs=p->format==FP4_MX?32:16,nb=p->k/bs;
+    p->scales_n32_count=(size_t)nt*nb*32;
+    if(posix_memalign((void**)&p->codes_n32,256,p->code_bytes)||
+       posix_memalign((void**)&p->scales_n32,256,p->scales_n32_count*sizeof(_Float16))){
+        free(p->codes_n32);free(p->scales_n32);p->codes_n32=NULL;p->scales_n32=NULL;return-1;}
+    for(int t=0;t<nt;++t){
+        for(int k=0;k<p->k;++k){uint8_t*q=p->codes_n32+((size_t)t*p->k+k)*16;
+            for(int j=0;j<16;++j){int r=t*32+2*j;
+                uint8_t a=p->codes[(size_t)r*(p->k/2)+k/2];
+                uint8_t b=p->codes[(size_t)(r+1)*(p->k/2)+k/2];
+                uint8_t qa=(a>>((k&1)*4))&15,qb=(b>>((k&1)*4))&15;
+                q[j]=(uint8_t)(qa|(qb<<4));}}
+        for(int b=0;b<nb;++b){_Float16*s=p->scales_n32+((size_t)t*nb+b)*32;
+            for(int j=0;j<32;++j)s[j]=(_Float16)row_scale(p,t*32+j,b*bs);}
+    }
+    return 0;
+}
+
 float fp4_dequant_value(const fp4_matrix*p,int r,int c){
     uint8_t b=p->codes[(size_t)r*(p->k/2)+c/2];
     return fp4_e2m1_decode((uint8_t)((b>>((c&1)*4))&15))*row_scale(p,r,c);
@@ -217,6 +239,121 @@ static inline void dot_rows6_sve(float*out,const _Float16*a,int astride,int rows
     for(int i=0;i<rows;++i)out[(size_t)i*w->n+r]=shadow[i];
 }
 #endif
+
+#if defined(__ARM_FEATURE_SVE)
+static inline void gemm_n32_m6_full_segment(float*c,const _Float16*a,
+        const fp4_matrix*w,int tile,int kbegin,int kend,int add){
+    static const __fp16 table_data[32] __attribute__((aligned(64)))={
+        0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6,
+        0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6};
+    svbool_t ph=svptrue_b16(),ps=svptrue_b32(),p16=svwhilelt_b16(0,16);
+    svfloat16_t tab=svld1_f16(ph,table_data),scale=svdup_f16(0);
+    svfloat16_t h0=svdup_f16(0),h1=h0,h2=h0,h3=h0,h4=h0,h5=h0;
+    int bs=w->format==FP4_MX?32:16,nb=w->k/bs;
+    const uint8_t*cp=w->codes_n32+(size_t)tile*w->k*16;
+    const _Float16*sp=w->scales_n32+(size_t)tile*nb*32;
+    for(int b=kbegin/bs;b<kend/bs;++b){
+      scale=svld1_f16(ph,(const __fp16*)(sp+(size_t)b*32));
+      for(int k=b*bs;k<(b+1)*bs;++k){
+        const uint8_t*q=cp+(size_t)k*16;
+        svuint16_t z=svld1ub_u16(p16,q),lo=svand_n_u16_x(p16,z,15);
+        svuint16_t hi=svlsr_n_u16_x(p16,z,4),idx=svzip1_u16(lo,hi);
+        svfloat16_t weight=svmul_f16_x(ph,svtbl_f16(tab,idx),scale);
+        h0=svmla_n_f16_x(ph,h0,weight,(__fp16)a[k]);
+        h1=svmla_n_f16_x(ph,h1,weight,(__fp16)a[(size_t)w->k+k]);
+        h2=svmla_n_f16_x(ph,h2,weight,(__fp16)a[(size_t)2*w->k+k]);
+        h3=svmla_n_f16_x(ph,h3,weight,(__fp16)a[(size_t)3*w->k+k]);
+        h4=svmla_n_f16_x(ph,h4,weight,(__fp16)a[(size_t)4*w->k+k]);
+        h5=svmla_n_f16_x(ph,h5,weight,(__fp16)a[(size_t)5*w->k+k]);
+      }
+    }
+#define N32_STORE6(I,H) do {svuint16_t hb=svreinterpret_u16_f16(H); \
+        svfloat32_t lo=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpklo_u32(hb))); \
+        svfloat32_t hi=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpkhi_u32(hb))); \
+        float*d=c+(size_t)(I)*w->n+tile*32; \
+        if(add){lo=svadd_f32_x(ps,lo,svld1_f32(ps,d));hi=svadd_f32_x(ps,hi,svld1_f32(ps,d+16));} \
+        svst1_f32(ps,d,lo);svst1_f32(ps,d+16,hi);}while(0)
+    N32_STORE6(0,h0);N32_STORE6(1,h1);N32_STORE6(2,h2);
+    N32_STORE6(3,h3);N32_STORE6(4,h4);N32_STORE6(5,h5);
+#undef N32_STORE6
+}
+
+static inline void gemm_n32_m12_segment(float*c,const _Float16*a,int m,
+        const fp4_matrix*w,int tile,int kbegin,int kend,int add){
+    static const __fp16 table_data[32] __attribute__((aligned(64)))={
+        0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6,
+        0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6};
+    svbool_t ph=svptrue_b16(),ps=svptrue_b32(),p16=svwhilelt_b16(0,16);
+    svfloat16_t tab=svld1_f16(ph,table_data),scale=svdup_f16(0);
+    svfloat16_t h0=svdup_f16(0),h1=h0,h2=h0,h3=h0,h4=h0,h5=h0;
+    svfloat16_t h6=h0,h7=h0,h8=h0,h9=h0,h10=h0,h11=h0;
+    int bs=w->format==FP4_MX?32:16,nb=w->k/bs;
+    const uint8_t*cp=w->codes_n32+(size_t)tile*w->k*16;
+    const _Float16*sp=w->scales_n32+(size_t)tile*nb*32;
+    if(m==12){
+      for(int b=kbegin/bs;b<kend/bs;++b){
+       scale=svld1_f16(ph,(const __fp16*)(sp+(size_t)b*32));
+       for(int k=b*bs;k<(b+1)*bs;++k){
+        const uint8_t*q=cp+(size_t)k*16;
+        svuint16_t z=svld1ub_u16(p16,q),lo=svand_n_u16_x(p16,z,15);
+        svuint16_t hi=svlsr_n_u16_x(p16,z,4),idx=svzip1_u16(lo,hi);
+        svfloat16_t weight=svmul_f16_x(ph,svtbl_f16(tab,idx),scale);
+        h0=svmla_n_f16_x(ph,h0,weight,(__fp16)a[k]);
+        h1=svmla_n_f16_x(ph,h1,weight,(__fp16)a[(size_t)w->k+k]);
+        h2=svmla_n_f16_x(ph,h2,weight,(__fp16)a[(size_t)2*w->k+k]);
+        h3=svmla_n_f16_x(ph,h3,weight,(__fp16)a[(size_t)3*w->k+k]);
+        h4=svmla_n_f16_x(ph,h4,weight,(__fp16)a[(size_t)4*w->k+k]);
+        h5=svmla_n_f16_x(ph,h5,weight,(__fp16)a[(size_t)5*w->k+k]);
+        h6=svmla_n_f16_x(ph,h6,weight,(__fp16)a[(size_t)6*w->k+k]);
+        h7=svmla_n_f16_x(ph,h7,weight,(__fp16)a[(size_t)7*w->k+k]);
+        h8=svmla_n_f16_x(ph,h8,weight,(__fp16)a[(size_t)8*w->k+k]);
+        h9=svmla_n_f16_x(ph,h9,weight,(__fp16)a[(size_t)9*w->k+k]);
+        h10=svmla_n_f16_x(ph,h10,weight,(__fp16)a[(size_t)10*w->k+k]);
+        h11=svmla_n_f16_x(ph,h11,weight,(__fp16)a[(size_t)11*w->k+k]);
+      }}
+    }else for(int k=kbegin;k<kend;++k){
+        if(k%bs==0)scale=svld1_f16(ph,(const __fp16*)(sp+(size_t)(k/bs)*32));
+        const uint8_t*q=cp+(size_t)k*16;
+        svuint16_t z=svld1ub_u16(p16,q),lo=svand_n_u16_x(p16,z,15);
+        svuint16_t hi=svlsr_n_u16_x(p16,z,4),idx=svzip1_u16(lo,hi);
+        svfloat16_t weight=svmul_f16_x(ph,svtbl_f16(tab,idx),scale);
+#define N32_FMA12(I,H) do {if(m>(I))(H)=svmla_n_f16_x(ph,(H),weight,(__fp16)a[(size_t)(I)*w->k+k]);}while(0)
+        N32_FMA12(0,h0);N32_FMA12(1,h1);N32_FMA12(2,h2);N32_FMA12(3,h3);
+        N32_FMA12(4,h4);N32_FMA12(5,h5);N32_FMA12(6,h6);N32_FMA12(7,h7);
+        N32_FMA12(8,h8);N32_FMA12(9,h9);N32_FMA12(10,h10);N32_FMA12(11,h11);
+#undef N32_FMA12
+    }
+#define N32_STORE12(I,H) do {if(m>(I)){ \
+        svuint16_t hb=svreinterpret_u16_f16(H); \
+        svfloat32_t lo=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpklo_u32(hb))); \
+        svfloat32_t hi=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpkhi_u32(hb))); \
+        float*d=c+(size_t)(I)*w->n+tile*32; \
+        if(add){lo=svadd_f32_x(ps,lo,svld1_f32(ps,d));hi=svadd_f32_x(ps,hi,svld1_f32(ps,d+16));} \
+        svst1_f32(ps,d,lo);svst1_f32(ps,d+16,hi);}}while(0)
+    N32_STORE12(0,h0);N32_STORE12(1,h1);N32_STORE12(2,h2);N32_STORE12(3,h3);
+    N32_STORE12(4,h4);N32_STORE12(5,h5);N32_STORE12(6,h6);N32_STORE12(7,h7);
+    N32_STORE12(8,h8);N32_STORE12(9,h9);N32_STORE12(10,h10);N32_STORE12(11,h11);
+#undef N32_STORE12
+}
+
+#endif
+
+int fp4_gemm_f16_n32(float*c,const _Float16*a,const fp4_matrix*w,int m,int promotion_k){
+    if(!c||!a||!w||!w->codes_n32||!w->scales_n32||m<1||promotion_k<0||
+       (promotion_k&&((promotion_k%32)||promotion_k>w->k)))return-1;
+    int span=promotion_k?promotion_k:w->k;
+    for(int m0=0;m0<m;m0+=6){int mr=m-m0<6?m-m0:6;
+        for(int kb=0;kb<w->k;kb+=span){int ke=kb+span<w->k?kb+span:w->k;
+          for(int t=0;t<w->n/32;++t){
+#if defined(__ARM_FEATURE_SVE)
+            if(mr==6)gemm_n32_m6_full_segment(c+(size_t)m0*w->n,a+(size_t)m0*w->k,w,t,kb,ke,kb!=0);
+            else gemm_n32_m12_segment(c+(size_t)m0*w->n,a+(size_t)m0*w->k,mr,w,t,kb,ke,kb!=0);
+#else
+            (void)t;return-1;
+#endif
+          }
+        }}return 0;
+}
 
 int fp4_gemm_f16(float*c,const _Float16*a,const fp4_matrix*w,int m,int promotion_k,int threads){
     if(!c||!a||!w||m<1||promotion_k<0||(promotion_k&&((promotion_k%32)||promotion_k>w->k)))return -1;

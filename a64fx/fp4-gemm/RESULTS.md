@@ -5,6 +5,37 @@ Measured on one A64FX node with 48 cores, Fujitsu Compiler 4.12.2,
 loaded into anonymous HBM; `MemAvailable` remained approximately 26.3 GiB.
 Offline staging and quantization are excluded from GEMM timing.
 
+## Optimized single-core N32 kernel
+
+The output-vectorized SVE kernel was measured on one pinned core with synthetic
+`N=2048, K=4096` matrices, representative of LLM projection dimensions. These
+are median timed GEMMs; FP4 repacking and scale preparation are excluded.
+
+| Format | M | FP32 promotion K=256 | Pure FP16 accumulation |
+|---|---:|---:|---:|
+| MXFP4 | 1 | 7.3 GFLOP/s | 8.9 GFLOP/s |
+| MXFP4 | 6 | 19.6 GFLOP/s | 33.9 GFLOP/s |
+| NVFP4 1D | 1 | 7.3 GFLOP/s | 9.0 GFLOP/s |
+| NVFP4 1D | 6 | 18.4 GFLOP/s | 32.9 GFLOP/s |
+| NVFP4 2D | 1 | 7.3 GFLOP/s | 9.1 GFLOP/s |
+| NVFP4 2D | 6 | 18.6 GFLOP/s | 33.3 GFLOP/s |
+
+M=12 and M=24 sustain the same per-operation rates because dispatch repeats
+the six-row microkernel. A 12-row intrinsic variant was rejected: register
+spills reduced pure-FP16 throughput to about 22--23 GFLOP/s.
+
+The result is below the 256 GFLOP/s/core dense-FP16 peak because A64FX has no
+FP4 arithmetic. Every 32-output FMA step also requires a 16-byte packed load,
+byte-to-halfword expansion, two nibble operations, interleave, table lookup,
+and FP16 scale multiply. At M=1 that dequantization is amortized over only one
+FMA and dominates. M=6 reuses each decoded vector six times, but the loop still
+issues six dependent FP16 accumulator chains plus scalar activation loads.
+FP32 promotion additionally converts 192 FP16 lanes per output tile and
+reads/writes FP32 partial sums every 256 K values. Thus 128 GFLOP/s is not an
+appropriate expectation unless the implementation either reuses each decoded
+weight across a substantially larger register tile or moves dequantization
+outside the timed kernel (which would no longer measure FP4 GEMM).
+
 ## Attention projections
 
 The table reports the median across WKV, WQ_A, WQ_B, WO_A, and WO_B. Each entry

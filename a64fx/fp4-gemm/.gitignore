@@ -1,3 +1,4 @@
 bench_fp4_gemm
+bench_fp4_single
 test_fp4_gemm
 __pycache__/
