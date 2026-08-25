@@ -19,7 +19,7 @@ int main(void){
     _Float16*a=malloc((size_t)M*K*2);float*fa=malloc((size_t)K*4);if(!w||!ref||!got||!got2||!a||!fa)return 1;
     for(int i=0;i<N*K;++i)w[i]=rnd()*0.25f;for(int i=0;i<M*K;++i)a[i]=(_Float16)(rnd()*0.5f);
     for(int i=0;i<K;++i)fa[i]=(float)a[i];
-    for(int f=0;f<3;++f){fp4_matrix p;if(fp4_matrix_alloc(&p,(fp4_format)f,N,K)||fp4_quantize_f32(&p,w)||fp4_matrix_prepare_n32(&p)||fp4_matrix_prepare_u8(&p)||fp4_matrix_prepare_bitplane(&p))return 1;
+    for(int f=0;f<3;++f){fp4_matrix p;if(fp4_matrix_alloc(&p,(fp4_format)f,N,K)||fp4_quantize_f32(&p,w)||fp4_matrix_prepare_n32(&p)||fp4_matrix_prepare_u8(&p)||fp4_matrix_prepare_bitplane(&p)||fp4_matrix_prepare_pair(&p))return 1;
         fp4_gemm_reference(ref,a,&p,M,1);
         for(int kc=0;kc<=64;kc+=32){if(fp4_gemm_f16(got,a,&p,M,kc,2)||fp4_gemm_f16_n32(got2,a,&p,M,kc))return 1;double num=0,den=0,num2=0;
             for(int i=0;i<M*N;++i){double d=got[i]-ref[i],d2=got2[i]-ref[i];num+=d*d;num2+=d2*d2;den+=(double)ref[i]*ref[i];}
@@ -59,6 +59,19 @@ int main(void){
         printf("%s sdot_asm_rel=%.6g sdot_vs_fp4=%.6g\n",fp4_format_name((fp4_format)f),
           sqrt(nq/(dp+1e-30)),sqrt(np/(dp+1e-30)));
         if(sqrt(nq/(dp+1e-30))>2e-6)return 1;fp4_i8_activation_free(&qa);
+        fp4_pair_activation pa={0};if(fp4_pair_activation_prepare(&pa,fa,K,16)||
+          fp4_gemv_pair_lut_omp(got,&pa,&p,2))return 1;
+        np=0;dp=0;nq=0;
+        for(int row=0;row<N;++row){double exact=0.0,qref=0.0;int g=row/128;
+          for(int b=0;b<nb;++b){float ws=(float)p.scales_pair[((size_t)b*(N/128)+g)*128+row%128];
+            for(int pair=0;pair<wg/2;++pair){size_t qo=(((size_t)b*(N/128)+g)*(wg/2)+pair)*128+row%128;
+              int kp=b*wg+pair*2;qref+=(double)pa.tables[(size_t)(kp/2)*256+p.codes_pair[qo]]*
+                ws*pa.scales[kp/16];}}
+          for(int k=0;k<K;++k)exact+=(double)fa[k]*fp4_dequant_value(&p,row,k);
+          double d=got[row]-qref,e=got[row]-exact;nq+=d*d;np+=e*e;dp+=exact*exact;}
+        printf("%s pair_asm_rel=%.6g pair_vs_fp4=%.6g\n",fp4_format_name((fp4_format)f),
+          sqrt(nq/(dp+1e-30)),sqrt(np/(dp+1e-30)));
+        if(sqrt(nq/(dp+1e-30))>2e-6)return 1;fp4_pair_activation_free(&pa);
         if(fp4_gemm_f16_l2_omp(got,a,&p,M,32,2))return 1;
         np=0;dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
         rp=sqrt(np/(dp+1e-30));printf("%s l2omp_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);

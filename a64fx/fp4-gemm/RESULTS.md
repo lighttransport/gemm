@@ -278,6 +278,26 @@ of 162 GFLOP/s. Exact SWAR E2M1 mapping reaches only 6.06 GB/s and 24.2
 GFLOP/s. Both are far below the roughly 220 GB/s packed rate required for an
 800 GFLOP/s CMG kernel.
 
+## Packed activation-pair LUT
+
+An exact activation-dependent 256-entry INT16 LUT removes FP4 decode from the
+hot loop while retaining the original four-bit weight stream. Eight
+independent SVE gather chains process 128 rows, and FP32 conversion/rescaling
+occurs only at the requested activation-group boundary.
+
+| Activation K group | Kernel GFLOP/s | Packed source GB/s |
+|---:|---:|---:|
+| 32 | 178.9 | 50.3 |
+| 8 | 177.2 | 49.8 |
+| 4 | 178.7 | 50.3 |
+
+Configuration: MXFP4 N=32768, K=4096, 12 cores pinned to one CMG. Synthetic
+unit tests agree with the corresponding expanded SDOT output within 5e-8
+relative L2. The invariant speed across K32/K8/K4 rules out scale promotion
+as the limiter. Indexed `LD1SH` is the measured ceiling, so this route is kept
+as a packed-density control rather than replacing the 409.1 GFLOP/s K4 SDOT
+kernel.
+
 ## Conclusion
 
 Promoting every 256 K values is the useful balanced mode on these workloads:

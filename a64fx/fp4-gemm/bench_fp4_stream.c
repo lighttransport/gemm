@@ -48,13 +48,20 @@ static void run_sdot_omp(float*c,const fp4_i8_activation*a,const fp4_matrix*w,si
     double med=dt[3];printf("kernel=fp4_i8_sdot threads=%d A_G=%d median_ms=%.3f gflops=%.2f source_GB/s=%.2f checksum=%.7g\n",
       threads,a->scale_group,med*1e3,2.0*w->n*w->k/med/1e9,src/med/1e9,c[w->n/3]);
 }
+static double run_pair_omp(float*c,const fp4_pair_activation*a,const fp4_matrix*w,size_t src,int threads){
+    double dt[7];fp4_gemv_pair_lut_omp(c,a,w,threads);
+    for(int r=0;r<7;++r){double t=now();fp4_gemv_pair_lut_omp(c,a,w,threads);dt[r]=now()-t;}
+    for(int i=1;i<7;++i){double x=dt[i];int j=i;while(j&&dt[j-1]>x){dt[j]=dt[j-1];--j;}dt[j]=x;}
+    double med=dt[3];printf("kernel=fp4_pair_lut threads=%d A_G=%d median_ms=%.3f gflops=%.2f packed_GB/s=%.2f checksum=%.7g\n",
+      threads,a->scale_group,med*1e3,2.0*w->n*w->k/med/1e9,src/med/1e9,c[w->n/3]);return med;
+}
 int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(argv[2]):4096;
     int kc=argc>3?atoi(argv[3]):256;
     if(n%32||k%32)return 2;fp4_matrix w;if(fp4_matrix_alloc(&w,FP4_MX,n,k))return 1;
     for(size_t i=0;i<w.code_bytes;++i)w.codes[i]=(uint8_t)rnd();
     for(size_t i=0;i<w.scale_bytes;++i)w.scales[i]=124; /* 2^-3 */
     double pt=now();if(fp4_matrix_prepare_n32(&w)||fp4_matrix_prepare_u8(&w)||
-      fp4_matrix_prepare_bitplane(&w)||fp4_matrix_prepare_sdot(&w))return 1;
+      fp4_matrix_prepare_bitplane(&w)||fp4_matrix_prepare_sdot(&w)||fp4_matrix_prepare_pair(&w))return 1;
     printf("all_layout_prepare_ms=%.3f\n",(now()-pt)*1e3);
     size_t source=w.code_bytes+w.scales_n32_count*sizeof(_Float16);
     printf("streaming MXFP4 N=%d K=%d packed=%.1f MiB prepared_scales=%.1f MiB source=%.1f MiB\n",n,k,
@@ -84,6 +91,14 @@ int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(arg
       if(fp4_i8_activation_prepare(&qa,af,k,ag))return 1;
       run_sdot_omp(c,&qa,&w,(size_t)n*k+w.scales_n32_count*2,12);
       fp4_i8_activation_free(&qa);free(ah);free(af);free(c);fp4_matrix_free(&w);return 0;}
+    if(getenv("FP4_PAIR_ONLY")){int ag=argc>4?atoi(argv[4]):4;
+      float*af=aa((size_t)k*4),*c=aa((size_t)n*4);fp4_pair_activation qa={0};
+      if(!af||!c)return 1;for(int i=0;i<k;++i)af[i]=(float)((int)(rnd()&255)-128)/512;
+      double qt=now();if(fp4_pair_activation_prepare(&qa,af,k,ag))return 1;qt=now()-qt;
+      printf("pair_activation_prepare A_G=%d ms=%.3f table_MiB=%.2f\n",ag,qt*1e3,(double)k*256/1048576.);
+      double kt=run_pair_omp(c,&qa,&w,source,12);
+      printf("pair_end_to_end_once gflops=%.2f\n",2.0*n*k/(qt+kt)/1e9);
+      fp4_pair_activation_free(&qa);free(af);free(c);fp4_matrix_free(&w);return 0;}
     int ms[]={1,6,24,128};for(int z=0;z<4;++z){int m=ms[z];
       _Float16*a=aa((size_t)m*k*2);float*c=aa((size_t)m*n*4);if(!a||!c)return 1;
       for(size_t i=0;i<(size_t)m*k;++i)a[i]=(_Float16)((int)(rnd()&255)-128)/512;

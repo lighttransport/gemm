@@ -24,9 +24,11 @@ typedef struct {
     uint8_t *codes_n32;
     uint8_t *codes_u8;
     int8_t *codes_sdot;
+    uint8_t *codes_pair;
     uint32_t *codes_bitplane;
     _Float16 *scales_n32;
     _Float16 *scales_sdot;
+    _Float16 *scales_pair;
     size_t scales_n32_count;
 } fp4_matrix;
 
@@ -37,6 +39,14 @@ typedef struct {
     float *scales;        /* activation quantizer scale divided by two */
 } fp4_i8_activation;
 
+typedef struct {
+    int k;
+    int scale_group;
+    int8_t *codes;
+    float *scales;        /* activation quantizer scale divided by two */
+    int16_t *tables;      /* [K/2][256], activation-dependent pair dots */
+} fp4_pair_activation;
+
 const char *fp4_format_name(fp4_format format);
 int fp4_matrix_alloc(fp4_matrix *matrix, fp4_format format, int n, int k);
 void fp4_matrix_free(fp4_matrix *matrix);
@@ -45,6 +55,7 @@ int fp4_matrix_prepare_n32(fp4_matrix *matrix);
 int fp4_matrix_prepare_u8(fp4_matrix *matrix);
 int fp4_matrix_prepare_bitplane(fp4_matrix *matrix);
 int fp4_matrix_prepare_sdot(fp4_matrix *matrix);
+int fp4_matrix_prepare_pair(fp4_matrix *matrix);
 float fp4_dequant_value(const fp4_matrix *matrix, int row, int col);
 
 /* C[M,N] = A[M,K] * W[N,K]^T. A is FP16 and C is FP32. promotion_k is
@@ -73,6 +84,11 @@ int fp4_i8_activation_prepare(fp4_i8_activation *q, const float *a, int k,
 void fp4_i8_activation_free(fp4_i8_activation *q);
 int fp4_gemv_i8_sdot_omp(float *c, const fp4_i8_activation *a,
                           const fp4_matrix *w, int threads);
+int fp4_pair_activation_prepare(fp4_pair_activation *q, const float *a,
+                                 int k, int scale_group);
+void fp4_pair_activation_free(fp4_pair_activation *q);
+int fp4_gemv_pair_lut_omp(float *c, const fp4_pair_activation *a,
+                           const fp4_matrix *w, int threads);
 int fp4_gemm_reference(float *c, const _Float16 *a, const fp4_matrix *w,
                         int m, int fp16_products);
 

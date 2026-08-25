@@ -21,6 +21,9 @@ static const float e2m1_values[16] = {
 typedef struct {const int8_t*q,*a;const _Float16*ws;const float*as;float*out;
     int k,weight_group,act_group;} fp4_sdot_args;
 extern void fp4_i8_sdot_m1_asm(const fp4_sdot_args*);
+typedef struct {const uint8_t*q;const _Float16*ws;const int16_t*tab;
+    const float*as;float*out;int ng,g0,gcount,nb,pairs,act_group;} fp4_pair_args;
+extern void fp4_pair_lut_m1_asm(const fp4_pair_args*);
 
 /* Scalar AArch64 producer LUT: packed FP4 byte -> two FP16 bit patterns. */
 uint32_t fp4_pair_lut[256] __attribute__((aligned(1024)));
@@ -112,7 +115,7 @@ int fp4_matrix_alloc(fp4_matrix *p, fp4_format f, int n, int k) {
 void fp4_matrix_free(fp4_matrix *p) {
     if (!p) return;
     free(p->codes); free(p->scales); free(p->codes_n32); free(p->codes_u8);
-    free(p->codes_sdot);free(p->scales_sdot);
+    free(p->codes_sdot);free(p->scales_sdot);free(p->codes_pair);free(p->scales_pair);
     free(p->codes_bitplane);
     free(p->scales_n32); memset(p, 0, sizeof(*p));
 }
@@ -182,10 +185,10 @@ static float row_scale(const fp4_matrix *p,int r,int c){
 int fp4_matrix_prepare_n32(fp4_matrix *p){
     if(!p||!p->codes||!p->scales||p->n%32||p->k%32)return -1;
     prepare_pair_lut();
-    free(p->codes_n32);free(p->codes_u8);free(p->codes_sdot);free(p->codes_bitplane);
-    free(p->scales_n32);free(p->scales_sdot);
-    p->codes_n32=NULL;p->codes_u8=NULL;p->codes_sdot=NULL;p->codes_bitplane=NULL;
-    p->scales_n32=NULL;p->scales_sdot=NULL;
+    free(p->codes_n32);free(p->codes_u8);free(p->codes_sdot);free(p->codes_pair);free(p->codes_bitplane);
+    free(p->scales_n32);free(p->scales_sdot);free(p->scales_pair);
+    p->codes_n32=NULL;p->codes_u8=NULL;p->codes_sdot=NULL;p->codes_pair=NULL;p->codes_bitplane=NULL;
+    p->scales_n32=NULL;p->scales_sdot=NULL;p->scales_pair=NULL;
     int nt=p->n/32,bs=p->format==FP4_MX?32:16,nb=p->k/bs;
     p->scales_n32_count=(size_t)nt*nb*32;
     if(posix_memalign((void**)&p->codes_n32,256,p->code_bytes)||
@@ -249,6 +252,26 @@ int fp4_matrix_prepare_sdot(fp4_matrix*p){
       _Float16*d=p->scales_sdot+((size_t)g*nb+b)*128;
       for(int t=0;t<4;++t){const _Float16*s=p->scales_n32+
           ((size_t)(g*4+t)*nb+b)*32;memcpy(d+t*32,s,32*sizeof(_Float16));}
+    }return 0;
+}
+
+int fp4_matrix_prepare_pair(fp4_matrix*p){
+    if(!p||!p->codes||!p->scales_n32||p->n%128||p->k%32)return-1;
+    int bs=p->format==FP4_MX?32:16,nb=p->k/bs,ng=p->n/128,pairs=bs/2;
+    free(p->codes_pair);free(p->scales_pair);p->codes_pair=NULL;p->scales_pair=NULL;
+    if(posix_memalign((void**)&p->codes_pair,256,p->code_bytes)||
+       posix_memalign((void**)&p->scales_pair,256,(size_t)nb*ng*128*sizeof(_Float16))){
+        free(p->codes_pair);free(p->scales_pair);p->codes_pair=NULL;p->scales_pair=NULL;return-1;}
+    for(int b=0;b<nb;++b)for(int g=0;g<ng;++g){
+      uint8_t*d=p->codes_pair+(((size_t)b*ng+g)*pairs)*128;
+      for(int pair=0;pair<pairs;++pair)for(int v=0;v<8;++v)for(int lane=0;lane<16;++lane){
+        int r=g*128+v*16+lane,k=b*bs+pair*2;
+        uint8_t lo=p->codes[(size_t)r*(p->k/2)+k/2]&15;
+        uint8_t hi=p->codes[(size_t)r*(p->k/2)+(k+1)/2]>>4;
+        d[((size_t)pair*8+v)*16+lane]=(uint8_t)(lo|(hi<<4));}
+      _Float16*s=p->scales_pair+((size_t)b*ng+g)*128;
+      for(int t=0;t<4;++t)memcpy(s+t*32,p->scales_n32+
+        ((size_t)(g*4+t)*nb+b)*32,32*sizeof(_Float16));
     }return 0;
 }
 
@@ -861,6 +884,52 @@ int fp4_i8_activation_prepare(fp4_i8_activation*q,const float*a,int k,int group)
 
 void fp4_i8_activation_free(fp4_i8_activation*q){
     if(!q)return;free(q->codes);free(q->scales);memset(q,0,sizeof(*q));
+}
+
+int fp4_pair_activation_prepare(fp4_pair_activation*q,const float*a,int k,int group){
+    static const int16_t values[16]={0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
+    if(!q||!a||k<=0||k%32||group<4||group>32||(group&(group-1))||k%group)return-1;
+    if(!q->codes||!q->scales||!q->tables||q->k!=k){
+      fp4_pair_activation_free(q);q->k=k;
+      if(posix_memalign((void**)&q->codes,256,(size_t)k)||
+         posix_memalign((void**)&q->scales,256,(size_t)(k/4)*sizeof(float))||
+         posix_memalign((void**)&q->tables,256,(size_t)k*256)){
+          fp4_pair_activation_free(q);return-1;}}
+    q->scale_group=group;
+    for(int b=0;b<k/group;++b){float m=0.0f;
+      for(int j=0;j<group;++j){float x=fabsf(a[b*group+j]);if(x>m)m=x;}
+      float s=m>0.0f?m/127.0f:1.0f,inv=1.0f/s;q->scales[b]=s*0.5f;
+      for(int j=0;j<group;++j)q->codes[b*group+j]=
+          (int8_t)fp4_quant_i8(a[b*group+j],inv);
+    }
+    for(int p=0;p<k/2;++p){int a0=q->codes[p*2],a1=q->codes[p*2+1];
+      int16_t*t=q->tables+(size_t)p*256;
+      for(int c=0;c<256;++c)t[c]=(int16_t)(values[c&15]*a0+values[c>>4]*a1);
+    }return 0;
+}
+
+void fp4_pair_activation_free(fp4_pair_activation*q){
+    if(!q)return;free(q->codes);free(q->scales);free(q->tables);memset(q,0,sizeof(*q));
+}
+
+int fp4_gemv_pair_lut_omp(float*c,const fp4_pair_activation*a,
+                           const fp4_matrix*w,int threads){
+    if(!c||!a||!w||!a->scales||!a->tables||!w->codes_pair||!w->scales_pair||
+       a->k!=w->k||threads<1||w->n%128)return-1;
+    int wg=w->format==FP4_MX?32:16;if(wg%a->scale_group)return-1;
+#if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
+    int ng=w->n/128,nb=w->k/wg,pairs=wg/2;
+#pragma omp parallel num_threads(threads)
+    {
+      int tid=omp_get_thread_num(),nt=omp_get_num_threads();
+      int g0=ng*tid/nt,g1=ng*(tid+1)/nt;
+      fp4_pair_args x={w->codes_pair,w->scales_pair,a->tables,a->scales,c,
+                       ng,g0,g1-g0,nb,pairs,a->scale_group};
+      if(g1>g0)fp4_pair_lut_m1_asm(&x);
+    }return 0;
+#else
+    (void)threads;return-1;
+#endif
 }
 
 int fp4_gemv_i8_sdot_omp(float*c,const fp4_i8_activation*a,

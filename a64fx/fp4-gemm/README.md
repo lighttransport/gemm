@@ -155,6 +155,24 @@ group; `FP4_SDOT_ONLY=1` skips unrelated kernels. `bench_fp4_sdot_error`
 validates the three native expert projections directly from the staged raw
 file without loading the full 3.3 GiB subset.
 
+## Packed pair-LUT experiment
+
+`fp4_matrix_prepare_pair` keeps the weight stream at four bits per element and
+orders it as `[weight block][N128][K pair][8 SVE vectors]`. For each activation
+pair, `fp4_pair_activation_prepare` builds a 256-entry INT16 table containing
+the exact two-term E2M1 dot product. `fp4_gemv_pair_lut_omp` uses eight
+independent indexed-load/INT32-add chains, followed by FP32 scale accumulation.
+It is numerically identical to the expanded SDOT path for the same activation
+quantizer (relative difference below 5e-8 in the unit test).
+
+The indexed-load path does not reach the packed-stream roof on A64FX. With
+N=32768, K=4096 on one 12-core CMG it measures 177--179 GFLOP/s and about
+50 GB/s of packed source traffic for activation groups K32, K8, and K4. The
+flat result across promotion intervals identifies `LD1SH` gather throughput,
+not FP32 conversion or HBM2, as the bottleneck. Set `FP4_PAIR_ONLY=1` to run
+this control. The expanded K4 SDOT kernel remains the production fallback at
+409 GFLOP/s because its sequential byte stream reaches roughly 217 GB/s.
+
 ### Scalar EX packed-FP4 producer
 
 `bench_fp4_ex` also measures a packed-FP4 producer using only scalar AArch64
