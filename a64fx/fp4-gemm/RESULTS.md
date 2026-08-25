@@ -156,6 +156,26 @@ and lowers useful throughput. Arithmetic E2M1 construction replaces one
 six-cycle FLA `TBL` with about ten mask/shift/predicate operations and is also
 slower. Packed FP4 remains the selected representation.
 
+#### Four-bit bitplane arithmetic
+
+A same-density layout stores the four code bits as four 32-bit planes for each
+N32/K step. Even outputs occupy the low half and odd outputs the high half, so
+`LD1RW` plus lane-dependent shifts reconstruct normal output order without a
+permutation. Three exact mappings were measured on the M=1, K=256, 12-core
+stream:
+
+| Mapping | CMG GFLOP/s | Source GB/s |
+|---|---:|---:|
+| Magic `MUL 0x3800` FP16-bit construction | 69.4 | 19.5 |
+| Shift/substitute FP16-bit construction | 66.7 | 18.8 |
+| Signed fixed-point plus `SCVTF` | 54.8 | 15.4 |
+
+The winning loop has no `ZIP1` or `TBL`, but each vector instead needs four
+plane broadcasts, four variable shifts, four masks, and roughly eleven
+bit-construction operations. Some compiler-generated loads also become GPR
+loads plus vector `MOV`. This overwhelms the saved FLA work, so the bitplane
+path remains opt-in and the 280 GFLOP/s packed path stays the default.
+
 The result is below the 256 GFLOP/s/core dense-FP16 peak because A64FX has no
 FP4 arithmetic. Every 32-output FMA step also requires a 16-byte packed load,
 byte-to-halfword expansion, two nibble operations, interleave, table lookup,

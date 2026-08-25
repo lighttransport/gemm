@@ -113,6 +113,12 @@ dispatch is direct N32 for M<=6 and the decoded L2 panel for M>=12.
 that stores one nibble per byte. It removes `ZIP1` but doubles code traffic and
 is slower in useful GFLOP/s. Normal preparation does not allocate this sidecar.
 
+`fp4_matrix_prepare_bitplane` plus `fp4_gemm_f16_bitplane_omp` is a same-density
+M=1 experiment. It transposes each N32 group into four 32-bit bitplanes. Its
+inner loop uses broadcast loads, shifts, masks, and a magic `0x3800` multiply
+to construct FP16 bits, with no per-K `ZIP1` or `TBL`. It remains opt-in because
+the added FL arithmetic is slower than the packed decoder.
+
 `fp4_gemm_f16_l2` instead dequantizes one packed `N32 x K` weight panel into a
 K-major FP16 workspace and reuses it for every activation row. At K=4096 the
 workspace is 256 KiB, so it resides in L2 rather than the 64 KiB L1. Use direct
