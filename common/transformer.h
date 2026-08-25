@@ -6049,7 +6049,8 @@ static inline svfloat32_t tf_exp2_fexpa_approx_sve(svbool_t pg,
  * local heads after TP4. The old head-parallel loop used 12/48 cores. Split
  * each 128-row recurrent state into four disjoint 32-row slices. Every worker
  * retains its rows for the complete token sequence, preserving recurrence
- * order; the lane-0 full-head RMS dot preserves the old reduction order. */
+ * order. Output normalization is deferred until the scan completes: it does
+ * not feed the recurrent state, and this avoids two four-way barriers/token. */
 static void tf_ssm_scan4_batch(float *rec_state, float *Q, float *K,
         float *V, float *out, const float *alpha, const float *beta,
         const float *gate, const float *norm_w, float *scratch,
@@ -6057,6 +6058,11 @@ static void tf_ssm_scan4_batch(float *rec_state, float *Q, float *K,
         int out_stride, int gate_stride, float scale, float eps, int nt) {
     float *kq = scratch;
     float *decay = scratch + (size_t)N * nh;
+    static int preexp = -1;
+    if (preexp < 0) {
+        const char *e = getenv("TF_SSM_PREEXP");
+        preexp = e && atoi(e) != 0;
+    }
     #ifdef _OPENMP
     #pragma omp parallel for num_threads(nt) schedule(static)
     #endif
@@ -6070,12 +6076,12 @@ static void tf_ssm_scan4_batch(float *rec_state, float *Q, float *K,
             svst1(pg, q + i, svmul_f32_x(pg, svld1(pg, q + i), vs));
         }
         kq[z] = tf_f32_dot_sve(k, q, ds);
-        decay[z] = expf(alpha[(size_t)t * nh + h]);
+        decay[z] = preexp ? alpha[(size_t)t * nh + h]
+                          : expf(alpha[(size_t)t * nh + h]);
     }
 
-    float inv_norm[64];
     #ifdef _OPENMP
-    #pragma omp parallel num_threads(nt) shared(inv_norm)
+    #pragma omp parallel num_threads(nt)
     #endif
     {
         int tid = 0, team = 1;
@@ -6113,33 +6119,30 @@ static void tf_ssm_scan4_batch(float *rec_state, float *Q, float *K,
                     }
                     o[r] = old_o + delta * hkq;
                 }
-                #ifdef _OPENMP
-                #pragma omp barrier
-                #endif
-                if (lane == 0) {
-                    float ss = tf_f32_dot_sve(o, o, ds);
-                    inv_norm[h] = 1.0f / sqrtf(ss / ds + eps);
-                }
-                #ifdef _OPENMP
-                #pragma omp barrier
-                #endif
-                float ns = inv_norm[h];
-                const float *g = gate + (size_t)t * gate_stride + h * ds;
-                for (int i = r0; i < r1; i += (int)svcntw()) {
-                    svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)r1);
-                    svfloat32_t zv = svld1(pg, g + i);
-                    svfloat32_t et = svmul_n_f32_x(pg, zv, -1.4426950408889634f);
-                    et = svmax_n_f32_x(pg, svmin_n_f32_x(pg, et, 80.0f), -80.0f);
-                    svfloat32_t den = svadd_n_f32_x(pg,
-                        tf_exp2_fexpa_approx_sve(pg, et), 1.0f);
-                    svfloat32_t inv = svrecpe_f32(den);
-                    inv = svmul_f32_x(pg, inv, svrecps_f32(den, inv));
-                    svfloat32_t y = svmul_n_f32_x(pg, svld1(pg, o + i), ns);
-                    y = svmul_f32_x(pg, y, svld1(pg, norm_w + i));
-                    y = svmul_f32_x(pg, y, svmul_f32_x(pg, zv, inv));
-                    svst1(pg, o + i, y);
-                }
             }
+        }
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int z = 0; z < N * nh; z++) {
+        int t = z / nh, h = z % nh;
+        float *o = out + (size_t)t * out_stride + h * ds;
+        const float *g = gate + (size_t)t * gate_stride + h * ds;
+        float ns = 1.0f / sqrtf(tf_f32_dot_sve(o, o, ds) / ds + eps);
+        for (int i = 0; i < ds; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)ds);
+            svfloat32_t zv = svld1(pg, g + i);
+            svfloat32_t et = svmul_n_f32_x(pg, zv, -1.4426950408889634f);
+            et = svmax_n_f32_x(pg, svmin_n_f32_x(pg, et, 80.0f), -80.0f);
+            svfloat32_t den = svadd_n_f32_x(pg,
+                tf_exp2_fexpa_approx_sve(pg, et), 1.0f);
+            svfloat32_t inv = svrecpe_f32(den);
+            inv = svmul_f32_x(pg, inv, svrecps_f32(den, inv));
+            svfloat32_t y = svmul_n_f32_x(pg, svld1(pg, o + i), ns);
+            y = svmul_f32_x(pg, y, svld1(pg, norm_w + i));
+            y = svmul_f32_x(pg, y, svmul_f32_x(pg, zv, inv));
+            svst1(pg, o + i, y);
         }
     }
 }
@@ -13091,6 +13094,7 @@ float **tf_batch_hidden_out = NULL;
  * second weight/state allocation. */
 static float *tf_qwen_batch_hidden = NULL;
 static size_t tf_qwen_batch_hidden_cap = 0;
+
 static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *tokens,
                                       int n_tokens, int start_pos) {
     if (!m || !tokens || n_tokens <= 0 || !m->is_gemma4) return NULL;

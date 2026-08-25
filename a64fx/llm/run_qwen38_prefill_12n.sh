@@ -24,7 +24,15 @@ export Q38_PREFILL_BF16=${Q38_PREFILL_BF16:-exact}
 export TP_STAGE_BF16_PV=0
 export TF_SOFTMAX_SVE=${TF_SOFTMAX_SVE:-1}
 export TF_PODD_FFN_PIPE=${TF_PODD_FFN_PIPE:-0}
-export TF_SSM_SCAN4=${TF_SSM_SCAN4:-0}
+if [ "$Q38_PREFILL_BF16" = bf16-act ]; then
+    export TF_SSM_SCAN4=${TF_SSM_SCAN4:-1}
+    export TF_SSM_FAST_SCALARS=${TF_SSM_FAST_SCALARS:-1}
+    export TF_SSM_PREEXP=${TF_SSM_PREEXP:-1}
+else
+    export TF_SSM_SCAN4=${TF_SSM_SCAN4:-0}
+    export TF_SSM_FAST_SCALARS=${TF_SSM_FAST_SCALARS:-0}
+    export TF_SSM_PREEXP=${TF_SSM_PREEXP:-0}
+fi
 if [ -z "${Q38_PREFILL_COMM:-}" ]; then
     if [ "$Q38_PREFILL_BF16" = bf16-act ]; then export Q38_PREFILL_COMM=utofu-bf16
     else export Q38_PREFILL_COMM=mpi

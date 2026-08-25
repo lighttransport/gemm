@@ -2172,3 +2172,25 @@ four-worker-per-head DeltaNet scan (1.68 vs 1.04 s scan), and direct FFN
 up/SiLU/down packing (405.65 vs 408.10 tok/s corrected MPI) were all neutral or
 slower and remain opt-in diagnostics.  Chunk192 reached 422.21 tok/s, so
 chunk252 remains the default.
+
+#### Barrier-free 48-core DeltaNet scan and 479 tok/s (2026-08-25)
+
+The original four-worker-per-head experiment synchronized each group twice per
+token so lane 0 could compute the output RMS norm.  That synchronization is not
+required for recurrence: normalized/gated output is consumed only by the SSM
+output projection and never feeds the recurrent state.  The accepted schedule
+therefore assigns four workers disjoint 32-row state slices for the complete
+token sequence, then normalizes and gates all completed token/head outputs in a
+separate 48-thread pass.  It preserves recurrence order within every state row
+without any scan-loop barriers.  `TF_SSM_PREEXP=1` also precomputes the scalar
+decay once; the scan honors that representation rather than exponentiating it
+again.
+
+On 12 nodes, PP3xTP4, BF16 activation, BF16-wire uTofu, 4096/chunk252, this
+reduces the accumulated DeltaNet scan from about **1.01 s to 0.38 s** and reaches
+**479.17 tok/s** (`8.548 s`, `next=62842`).  The 128-token correctness gate is
+still `next=1293`.  The launcher enables the barrier-free scan, fast scalar
+preparation, and precomputed decay by default for `bf16-act`; exact BF16 retains
+the conservative paths.  Query-blocked attention (404.93 tok/s), chunk280
+(452.52), chunk256 (456.12), and MPI nonblocking pipeline sends (no asynchronous
+progress, 413.47) were measured and rejected.
