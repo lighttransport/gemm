@@ -54,10 +54,10 @@ fp4_mx_m1_t4_asm:
     and     z23.d, z19.d, z1.d
     and     z24.d, z20.d, z1.d
     and     z25.d, z21.d, z1.d
-    lsr     z18.h, z18.h, #4
-    lsr     z19.h, z19.h, #4
-    lsr     z20.h, z20.h, #4
-    lsr     z21.h, z21.h, #4
+    lsr     z18.h, p0/m, z18.h, #4
+    lsr     z19.h, p0/m, z19.h, #4
+    lsr     z20.h, p0/m, z20.h, #4
+    lsr     z21.h, p0/m, z21.h, #4
     zip1    z22.h, z22.h, z18.h
     zip1    z23.h, z23.h, z19.h
     zip1    z24.h, z24.h, z20.h
@@ -70,10 +70,10 @@ fp4_mx_m1_t4_asm:
     and     z9.d, z19.d, z1.d
     and     z10.d, z20.d, z1.d
     and     z11.d, z21.d, z1.d
-    lsr     z18.h, z18.h, #4
-    lsr     z19.h, z19.h, #4
-    lsr     z20.h, z20.h, #4
-    lsr     z21.h, z21.h, #4
+    lsr     z18.h, p0/m, z18.h, #4
+    lsr     z19.h, p0/m, z19.h, #4
+    lsr     z20.h, p0/m, z20.h, #4
+    lsr     z21.h, p0/m, z21.h, #4
     zip1    z8.h, z8.h, z18.h
     zip1    z9.h, z9.h, z19.h
     zip1    z10.h, z10.h, z20.h
