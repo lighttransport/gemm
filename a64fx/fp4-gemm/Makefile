@@ -5,7 +5,7 @@ LDLIBS = -lm
 ASM = fp4_n32_l1.S
 
 .PHONY: all test clean
-all: test_fp4_gemm bench_fp4_gemm bench_fp4_single bench_fp4_ex
+all: test_fp4_gemm bench_fp4_gemm bench_fp4_single bench_fp4_ex bench_fp4_stream
 
 test_fp4_gemm: test_fp4_gemm.c fp4_gemm.c fp4_gemm.h $(ASM)
 	$(CC) $(CFLAGS) $(WARN) test_fp4_gemm.c fp4_gemm.c $(ASM) $(LDLIBS) -o $@
@@ -19,8 +19,11 @@ bench_fp4_single: bench_fp4_single.c fp4_gemm.c fp4_gemm.h $(ASM)
 bench_fp4_ex: bench_fp4_ex.c fp4_ex_only.S
 	$(CC) $(CFLAGS) $(WARN) bench_fp4_ex.c fp4_ex_only.S -o $@
 
+bench_fp4_stream: bench_fp4_stream.c fp4_gemm.c fp4_gemm.h $(ASM)
+	$(CC) $(CFLAGS) $(WARN) bench_fp4_stream.c fp4_gemm.c $(ASM) $(LDLIBS) -o $@
+
 test: test_fp4_gemm
 	./test_fp4_gemm
 
 clean:
-	rm -f test_fp4_gemm bench_fp4_gemm bench_fp4_single bench_fp4_ex
+	rm -f test_fp4_gemm bench_fp4_gemm bench_fp4_single bench_fp4_ex bench_fp4_stream

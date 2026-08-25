@@ -1,0 +1,36 @@
+#define _POSIX_C_SOURCE 200112L
+#include "fp4_gemm.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC_RAW,&t);return t.tv_sec+1e-9*t.tv_nsec;}
+static void*aa(size_t n){void*p=0;return posix_memalign(&p,256,(n+255)&~255ULL)?0:p;}
+static unsigned rng=7;static unsigned rnd(void){rng=rng*1664525u+1013904223u;return rng;}
+typedef int(*kernel)(float*,const _Float16*,const fp4_matrix*,int,int);
+static void run(const char*name,kernel fn,float*c,const _Float16*a,const fp4_matrix*w,int m,int kc,size_t src){
+    fn(c,a,w,m,kc);double best=1e9;for(int r=0;r<3;++r){double t=now();fn(c,a,w,m,kc);double d=now()-t;if(d<best)best=d;}
+    printf("kernel=%s M=%d kc=%d ms=%.2f gflops=%.2f source_GB/s=%.2f\n",name,m,kc,best*1e3,
+        2.0*m*w->n*w->k/best/1e9,src/best/1e9);
+}
+int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(argv[2]):4096;
+    if(n%32||k%32)return 2;fp4_matrix w;if(fp4_matrix_alloc(&w,FP4_MX,n,k))return 1;
+    for(size_t i=0;i<w.code_bytes;++i)w.codes[i]=(uint8_t)rnd();
+    for(size_t i=0;i<w.scale_bytes;++i)w.scales[i]=124; /* 2^-3 */
+    if(fp4_matrix_prepare_n32(&w))return 1;
+    size_t source=w.code_bytes+w.scales_n32_count*sizeof(_Float16);
+    printf("streaming MXFP4 N=%d K=%d packed=%.1f MiB prepared_scales=%.1f MiB source=%.1f MiB\n",n,k,
+        w.code_bytes/1048576.,w.scales_n32_count*2/1048576.,source/1048576.);
+    void*copy=aa(source);double cbest=1e9;volatile unsigned char guard=0;
+    for(int r=0;r<5;++r){double t=now();memcpy(copy,w.codes_n32,w.code_bytes);
+      memcpy((char*)copy+w.code_bytes,w.scales_n32,w.scales_n32_count*2);double d=now()-t;
+      guard^=((unsigned char*)copy)[(size_t)r*4096];if(d<cbest)cbest=d;}
+    printf("pure_memcpy ms=%.2f source_GB/s=%.2f total_read_write_GB/s=%.2f guard=%u\n",
+        cbest*1e3,source/cbest/1e9,2.0*source/cbest/1e9,(unsigned)guard);free(copy);
+    int ms[]={1,6,24,128};for(int z=0;z<4;++z){int m=ms[z];
+      _Float16*a=aa((size_t)m*k*2);float*c=aa((size_t)m*n*4);if(!a||!c)return 1;
+      for(size_t i=0;i<(size_t)m*k;++i)a[i]=(_Float16)((int)(rnd()&255)-128)/512;
+      run("direct",fp4_gemm_f16_n32,c,a,&w,m,256,source*((m+5)/6));
+      run("l2full",fp4_gemm_f16_l2,c,a,&w,m,256,source);
+      run("l1k256",fp4_gemm_f16_l1panel,c,a,&w,m,256,source);
+      free(a);free(c);}fp4_matrix_free(&w);return 0;}

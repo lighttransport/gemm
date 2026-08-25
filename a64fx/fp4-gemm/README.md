@@ -25,6 +25,9 @@ make -C a64fx/fp4-gemm test
 # Scalar base-ISA arithmetic microbenchmark (no SIMD/SVE/FP/TBL)
 OMP_NUM_THREADS=1 OMP_PROC_BIND=close OMP_PLACES=cores \
   ./a64fx/fp4-gemm/bench_fp4_ex
+
+# 72 MiB cold-sized FP4 stream, local to one HBM NUMA domain
+numactl --physcpubind=12 --membind=4 ./a64fx/fp4-gemm/bench_fp4_stream
 ```
 
 The implementation requires `N` and `K` divisible by 32. Arbitrary `M` is
@@ -89,6 +92,10 @@ separation. Its producer uses only scalar AArch64 GPR/load/store instructions
 and a 256-entry packed-byte LUT; its consumer uses SVE FP16 multiply/FMA. Two
 alternating 64-byte L1 buffers carry decoded weights between them. It is not
 the default because the scalar producer is slower than direct SVE dequant.
+
+`fp4_gemm_f16_l1panel` uses one promotion-sized panel: K=256 occupies 16 KiB.
+It ties the full L2 panel at small M but loses at large M because repeated block
+transitions and partial-output traffic outweigh the smaller workspace.
 
 `fp4_gemm_f16_l2` instead dequantizes one packed `N32 x K` weight panel into a
 K-major FP16 workspace and reuses it for every activation row. At K=4096 the

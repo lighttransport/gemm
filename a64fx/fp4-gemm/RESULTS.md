@@ -69,6 +69,27 @@ M=12. At M=128 the L2 path is 33--35% faster for pure FP16 and 24--28% faster
 with K=256 promotion. It saves HBM2 traffic by fetching packed weights once per
 N32 panel, at the cost of a local 4x-expanded FP16 write/read stream.
 
+### Full-layer streaming and L1 panel comparison
+
+To exceed the 8 MiB CMG L2, `bench_fp4_stream` uses N=32768, K=4096: 64 MiB
+packed MXFP4 plus 8 MiB prepared FP16 scales. CPU 12 and memory node 4 were
+explicitly bound with `numactl`. The K=256 L1 panel occupies 16 KiB; the full-K
+L2 panel occupies 256 KiB.
+
+| Kernel | M=1 | M=6 | M=24 | M=128 |
+|---|---:|---:|---:|---:|
+| Direct inline dequant | 8.26 | 36.69 | 36.36 | 35.70 |
+| Full-K L2 panel | 8.36 | 38.60 | 50.33 | 53.49 |
+| K=256 L1 panel | 8.42 | 38.64 | 48.67 | 46.85 |
+
+Values are GFLOP/s/core with K=256 FP32 promotion. At M=1 the panel paths read
+only 2.35--2.37 GB/s of FP4 plus prepared scales. The same 72 MiB buffers reach
+9.84 GB/s source bandwidth with the platform `memcpy` (19.68 GB/s counting
+both read and write). Therefore even the full-layer test remains dequantization
+limited, not HBM2-bandwidth limited. The L1 panel does not help: it ties the
+full panel at M<=6 and becomes 12% slower at M=128. Retaining the full-K panel
+in L2 gives the best reuse and traversal order.
+
 The result is below the 256 GFLOP/s/core dense-FP16 peak because A64FX has no
 FP4 arithmetic. Every 32-output FMA step also requires a 16-byte packed load,
 byte-to-halfword expansion, two nibble operations, interleave, table lookup,
