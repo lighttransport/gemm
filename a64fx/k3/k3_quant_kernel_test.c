@@ -82,14 +82,93 @@ static int check_type(const char *name, int type, int cols) {
                    mrc == 0 && mrel < 0.08 ? "OK" : "FAIL");
             bad |= mrc || mrel >= 0.08;
         }
+        /* The exact IQ1 path is intentionally separate from the throughput
+         * kernels: it must agree with GGML without an activation quantizer.
+         * For the other IQ formats it falls back to the established reference
+         * implementation, so retain the same strict reference tolerance. */
+        int erc = k3_quant_matvec_mode(got, &m, x, 48, K3_QUANT_IQ_EXACT);
+        double ese = 0.0, esr = 0.0;
+        for (int r = 0; r < rows; ++r) {
+            double d = (double)got[r] - ref[r];
+            ese += d * d; esr += (double)ref[r] * ref[r];
+        }
+        double erel = sqrt(ese / (esr + 1e-30));
+        printf("[%s exact] rel_l2=%.3e %s\n", name, erel,
+               erc == 0 && erel < 1e-6 ? "OK" : "FAIL");
+        bad |= erc || erel >= 1e-6;
+
+        /* A populated fast workspace must not change exact-mode dispatch.
+         * This mirrors the full runner, which shares activation workspaces
+         * among independent projections. */
+        k3_quant_workspace ews = {0};
+        int ewrc = k3_quant_workspace_prepare(&ews, cols, K3_QUANT_SVE_Q8);
+        if (!ewrc) {
+            k3_quant_prepare_q8(&ews, x, cols);
+            k3_quant_prepare_a16(&ews, x, cols);
+            ews.scale_a16 = ews.scale;
+            ews.a16_ready = 1;
+            ewrc = k3_quant_matvec_ws(got, &m, x, &ews, 48,
+                                      K3_QUANT_IQ_EXACT);
+        }
+        double ewse = 0.0, ewsr = 0.0;
+        for (int r = 0; r < rows; ++r) {
+            double d = (double)got[r] - ref[r];
+            ewse += d * d; ewsr += (double)ref[r] * ref[r];
+        }
+        double ewrel = sqrt(ewse / (ewsr + 1e-30));
+        printf("[%s exact-ws] rel_l2=%.3e %s\n", name, ewrel,
+               ewrc == 0 && ewrel < 1e-6 ? "OK" : "FAIL");
+        bad |= ewrc || ewrel >= 1e-6;
+        k3_quant_workspace_free(&ews);
     }
+#if defined(__ARM_FEATURE_SVE)
+    if (type == K3_Q_IQ1_S) {
+        /* Compare the row tile with the established per-row implementation;
+         * reference tolerances alone can hide a lane/gather permutation. */
+        k3_quant_workspace tws = {0};
+        float tiled[16], scalar[16];
+        int trc = k3_quant_workspace_prepare(&tws, cols, K3_QUANT_SVE_Q8);
+        if (!trc) {
+            k3_quant_prepare_q8(&tws, x, cols);
+            k3_quant_iq1_s_q8_rows16(tiled, w, rb, tws.q8, tws.scale,
+                                     cols / 256);
+            for (int r = 0; r < 16; ++r)
+                scalar[r] = k3_quant_iq1_s_q8_row(
+                    (const block_iq1_s *)(w + (size_t)r * rb), tws.q8,
+                    tws.scale, cols / 256);
+            double tse = 0.0, tsr = 0.0;
+            for (int r = 0; r < 16; ++r) {
+                double d = (double)tiled[r] - scalar[r];
+                tse += d * d;
+                tsr += (double)scalar[r] * scalar[r];
+            }
+            double trel = sqrt(tse / (tsr + 1e-30));
+            printf("[%s rows16-vs-row] rel_l2=%.3e %s\n", name, trel,
+                   trel < 1e-5 ? "OK" : "FAIL");
+            bad |= trel >= 1e-5;
+        } else {
+            bad = 1;
+            puts("[IQ1_S rows16-vs-row] workspace setup FAIL");
+        }
+        k3_quant_workspace_free(&tws);
+    }
+#endif
+#if defined(__ARM_FEATURE_SVE)
     if (type == K3_Q_Q8_0) {
-        enum { QBATCH = 4 };
+        enum { QBATCH = 8 };
         float *qx = malloc((size_t)QBATCH * cols * sizeof(*qx));
         float *qgot = malloc((size_t)QBATCH * rows * sizeof(*qgot));
+        float *qscaled = malloc((size_t)QBATCH * rows * sizeof(*qscaled));
         float *qone = malloc((size_t)QBATCH * rows * sizeof(*qone));
+        float *qscales = malloc((size_t)rows * (cols / 32) * sizeof(*qscales));
         k3_quant_workspace qws[QBATCH] = {{0}};
-        int qrc = !qx || !qgot || !qone;
+        int qrc = !qx || !qgot || !qscaled || !qone || !qscales;
+        for (int r = 0; r < rows && !qrc; ++r) {
+            const block_q8_0 *qw = (const block_q8_0 *)(w + (size_t)r * rb);
+            for (int b = 0; b < cols / 32; ++b)
+                qscales[(size_t)r * (cols / 32) + b] =
+                    ggml_fp16_to_fp32(qw[b].d);
+        }
         for (int b = 0; b < QBATCH && !qrc; ++b) {
             for (int c = 0; c < cols; ++c)
                 qx[(size_t)b * cols + c] = x[c] * (1.0f + 0.125f * b);
@@ -101,20 +180,27 @@ static int check_type(const char *name, int type, int cols) {
             }
         }
         if (!qrc) qrc = k3_quant_q8_0_matvec_batch(qgot, rows, &m,
-                                                    qws, QBATCH, 48);
+                                                    qws, QBATCH, 48, NULL);
+        if (!qrc) qrc = k3_quant_q8_0_matvec_batch(qscaled, rows, &m,
+                                                    qws, QBATCH, 48, qscales);
         for (int b = 0; b < QBATCH && !qrc; ++b)
             qrc |= k3_quant_matvec_ws(qone + (size_t)b * rows, &m,
                                       qx + (size_t)b * cols, &qws[b],
                                       48, K3_QUANT_SVE_Q8);
         int exact = !qrc && !memcmp(qgot, qone,
-                                    sizeof(*qgot) * QBATCH * rows);
+                                    sizeof(*qgot) * QBATCH * rows) &&
+                    !memcmp(qgot, qscaled,
+                            sizeof(*qgot) * QBATCH * rows);
         printf("[%s q8-batch4] batch=%d exact=%s %s\n", name, QBATCH,
                exact ? "yes" : "no", exact ? "OK" : "FAIL");
         bad |= !exact;
         for (int b = 0; b < QBATCH; ++b) k3_quant_workspace_free(&qws[b]);
-        free(qx); free(qgot); free(qone);
+        free(qx); free(qgot); free(qscaled); free(qone); free(qscales);
     }
-    if (type == K3_Q_IQ1_S || type == K3_Q_IQ2_XS) {
+#endif
+#if defined(__ARM_FEATURE_SVE)
+    if (type == K3_Q_IQ1_S || type == K3_Q_IQ2_XS ||
+        type == K3_Q_IQ2_XXS) {
         const int prow = 16;
         uint8_t *pw = calloc((size_t)prow, rb);
         float *pout = malloc((size_t)prow * sizeof(*pout));
@@ -220,6 +306,7 @@ packed_done:
         k3_quant_packed_free(&packed4);
         free(pw); free(pout); free(pref);
     }
+#endif
     free(w); free(x); free(ref); free(got);
     return bad;
 }

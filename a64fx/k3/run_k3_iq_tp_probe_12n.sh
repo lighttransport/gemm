@@ -31,7 +31,9 @@ while (($#)); do
     esac
 done
 case "$FORMAT" in
-    iq1) DEFAULT_MODEL="$HOME/models/k3/iq1"; THREADS=${THREADS:-40};;
+    # IQ1's packed 16-row path benefits from four additional compute threads;
+    # 44 was repeatable at 0.869 ms/token on the live 12-node stage.
+    iq1) DEFAULT_MODEL="$HOME/models/k3/iq1"; THREADS=${THREADS:-44};;
     q2) DEFAULT_MODEL="$HOME/models/k3/q2"; THREADS=${THREADS:-36};;
     *) echo "$0: format must be iq1 or q2" >&2; exit 2;;
 esac

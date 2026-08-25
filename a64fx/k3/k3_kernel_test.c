@@ -40,11 +40,11 @@ static void router_topk_uncached(const float *logits,const float *bias,int exper
 static float mxfp4_ref(const uint8_t *w, const uint8_t *scale, const float *x, int n) {
     double sum = 0.0;
     for (int b = 0; b < n / 32; ++b) {
-        float s = ggml_e8m0_to_fp32(scale[b]);
+        float s = 0.5f * ggml_e8m0_to_fp32(scale[b]);
         for (int j = 0; j < 16; ++j) {
             uint8_t p = w[b * 16 + j];
-            sum += (double)ds4f_kvalues_mxfp4_f32[p & 15] * s * x[b * 32 + j];
-            sum += (double)ds4f_kvalues_mxfp4_f32[p >> 4] * s * x[b * 32 + j + 16];
+            sum += (double)ds4f_kvalues_mxfp4_f32[p & 15] * s * x[b * 32 + 2*j];
+            sum += (double)ds4f_kvalues_mxfp4_f32[p >> 4] * s * x[b * 32 + 2*j + 1];
         }
     }
     return (float)sum;
@@ -82,12 +82,27 @@ int main(void) {
     float *q = malloc(qn * 4), *key = malloc(qn * 4), *val = malloc(vn * 4);
     float *gate = malloc(qn * 4), beta[H], *s0 = calloc(sn, 4), *s1 = calloc(sn, 4), *s2 = calloc(sn, 4);
     float *kr = malloc(vn * 4), *ko = malloc(vn * 4), *kp = malloc(vn * 4), *decay2 = malloc(qn * 4);
+    {
+        float g_raw[H * K], dt_bias[H * K], a_head[H], decay_ref[H * K];
+        fill(g_raw, H * K, 0.7f);
+        fill(dt_bias, H * K, 0.4f);
+        a_head[0] = -0.5f;
+        a_head[1] = -2.0f;
+        for (int h = 0; h < H; ++h)
+            for (int d = 0; d < K; ++d) {
+                int i = h * K + d;
+                decay_ref[i] = -5.0f * k3_sigmoidf(
+                    (-a_head[h]) * (g_raw[i] + dt_bias[i]));
+            }
+        k3_kda_log_decay(gate, g_raw, a_head, dt_bias, H, K);
+        fail |= check("kda-safe-gate", decay_ref, gate, H * K, 0.0f);
+    }
     for (int step = 0; step < 5; ++step) {
         fill(q, qn, 1); fill(key, qn, 1); fill(val, vn, 1); fill(gate, qn, .2f);
-        float alog[K], draw[H*K];
+        float a_head[H], draw[H*K];
         memset(draw, 0, sizeof(draw));
-        for (int d=0;d<K;++d) alog[d]=-1.0f+.01f*d;
-        k3_kda_log_decay(gate, gate, alog, draw, H, K);
+        for (int h=0;h<H;++h) a_head[h]=-0.75f-.5f*h;
+        k3_kda_log_decay(gate, gate, a_head, draw, H, K);
         for (int h = 0; h < H; ++h) { k3_l2_normalize_ref(q + h*K, K, 1e-6f); k3_l2_normalize_ref(key+h*K,K,1e-6f); beta[h] = .2f + .6f * (rnd()+1)*.5f; }
         k3_kda_step_ref(kr, q, key, val, gate, beta, s0, H, K, V);
         k3_kda_step_sve(ko, q, key, val, gate, beta, s1, H, K, V);
@@ -112,6 +127,43 @@ int main(void) {
         ak+(size_t)h*AT*K,av+(size_t)h*AT*V,AT,K,V);
     k3_attention_heads_parallel_sve(ap,aq,ak,av,AH,AT,AT,K,V,AP,as,ast);
     fail |= check("mla-parallel", ao2, ap, AH*V, 2e-5f);
+
+    /* Flash8 QK tile: query-lane SVE reduction must match the scalar dot for
+     * every causal tile width, including the partial tail. */
+    enum { FQK = 576, FQ = 16 };
+    float fq[FQ][FQK], fqt[FQK][16], fk[FQK], fs[FQ], fv[FQ];
+    for (int qi = 0; qi < FQ; ++qi) fill(fq[qi], FQK, 0.2f);
+    fill(fk, FQK, 0.2f);
+    for (int qi = 0; qi < FQ; ++qi) {
+        for (int d = 0; d < FQK; ++d) fqt[d][qi] = fq[qi][d];
+        for (int d = FQ; d < 16; ++d) fqt[0][d] = 0.0f;
+    }
+    for (int qn = 1; qn <= FQ; ++qn) {
+        k3_dot8_tile_sve(fs, fqt, fk, qn, FQK);
+        for (int qi = 0; qi < qn; ++qi) fv[qi] = k3_dot_sve(fq[qi], fk, FQK);
+        fail |= check(qn == 1 ? "qk-tile-1" : qn == 2 ? "qk-tile-2" :
+                      qn == 8 ? "qk-tile-8" : "qk-tile-16",
+                      fs, fv, qn, 2e-4f);
+    }
+    enum { FH = 2, FB = 16, FC = 16, FV = 128 };
+    float *fa = malloc((size_t)FB * FH * FQK * sizeof(float));
+    float *fkey = malloc((size_t)FH * FC * FQK * sizeof(float));
+    float *fval = malloc((size_t)FH * FC * FV * sizeof(float));
+    float *fo0 = malloc((size_t)FB * FH * FV * sizeof(float));
+    float *fo1 = malloc((size_t)FB * FH * FV * sizeof(float));
+    float *fo2 = malloc((size_t)FB * FH * FV * sizeof(float));
+    fill(fa, (size_t)FB * FH * FQK, .2f);
+    fill(fkey, (size_t)FH * FC * FQK, .2f);
+    fill(fval, (size_t)FH * FC * FV, .2f);
+    k3_attention_heads_flash8_sve(fo0, fa, fkey, fval, FB, 0, FH, FC,
+                                  FQK, FV, 8, 0);
+    k3_attention_heads_flash8_sve(fo1, fa, fkey, fval, FB, 0, FH, FC,
+                                  FQK, FV, 8, 1);
+    k3_attention_heads_flash8_sve(fo2, fa, fkey, fval, FB, 0, FH, FC,
+                                  FQK, FV, 8, 2);
+    fail |= check("flash8-qk", fo0, fo1, (size_t)FB * FH * FV, 3e-4f);
+    fail |= check("flash16-scalar", fo0, fo2, (size_t)FB * FH * FV, 3e-4f);
+    free(fa); free(fkey); free(fval); free(fo0); free(fo1); free(fo2);
     uint16_t *abk=malloc((size_t)AH*AT*K*2),*abv=malloc((size_t)AH*AT*V*2);
     float *abr=malloc((size_t)AH*V*4),*abo=malloc((size_t)AH*V*4);
     for(int i=0;i<AH*AT*K;++i)abk[i]=k3_f32_to_bf16_rne(ak[i]);
@@ -153,6 +205,7 @@ int main(void) {
     fail |= !unique || fabsf(wsum-1) >= 1e-6f || memcmp(idx,ref_idx,sizeof idx) ||
             memcmp(weights,ref_weights,sizeof weights);
 
+#if defined(__ARM_FEATURE_SVE)
     enum { MK = 3584, MR = 8, MI = 2000 };
     uint8_t *mw = malloc((size_t)MR * MK / 2), *ms = malloc((size_t)MR * MK / 32);
     float *mx = malloc(MK * sizeof(float)), mout[MR], mref[MR];
@@ -178,6 +231,7 @@ int main(void) {
     double mbytes=(double)MI*MR*(MK/2+MK/32);
     printf("CALIBRATION mxfp4_gbps=%.3f mxfp4_us=%.3f sink=%g\n",
            mbytes/mdt/1e9,mdt/MI*1e6,(double)msink);
+#endif
 
     enum { BK = 128, BV = 128, BI = 250 };
     float *bq=aligned_alloc(256,BK*4), *bk=aligned_alloc(256,BK*4), *bv=aligned_alloc(256,BV*4);
@@ -230,7 +284,9 @@ int main(void) {
     free(xq);free(xk);free(xv);free(xr);free(xo);free(xs);free(xst);
     free(bq);free(bk);free(bv);free(bg);free(bs);free(bo);
     free(pq);free(pk);free(pv);free(pd);free(pb);free(po0);free(po1);free(ps0);free(ps1);
+#if defined(__ARM_FEATURE_SVE)
     free(mw);free(ms);free(mx);
+#endif
     printf("K3 kernel tests: %s\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;
 }

@@ -64,6 +64,27 @@ static inline float k3_dot_sve(const float *a, const float *b, int n) {
 #endif
 }
 
+/* QK tile with query lanes.  qt is packed as [qk_dim][16]; A64FX has 16
+ * FP32 lanes, so one streamed K element updates a full 16-query tile. */
+static inline void k3_dot8_tile_sve(float *scores, const float qt[][16],
+                                    const float *k, int qn,
+                                    int qk_dim) {
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svwhilelt_b32(0, qn);
+    svfloat32_t sum = svdup_f32(0.0f);
+    for (int d = 0; d < qk_dim; ++d)
+        sum = svmla_n_f32_x(pg, sum, svld1(pg, qt[d]), k[d]);
+    float tmp[16];
+    svst1(pg, tmp, sum);
+    for (int qi = 0; qi < qn; ++qi) scores[qi] = tmp[qi];
+#else
+    for (int qi = 0; qi < qn; ++qi) {
+        scores[qi] = 0.0f;
+        for (int d = 0; d < qk_dim; ++d) scores[qi] += qt[d][qi] * k[d];
+    }
+#endif
+}
+
 static inline void k3_l2_normalize_ref(float *x, int n, float eps) {
     float inv = 1.0f / sqrtf(k3_dot_ref(x, x, n) + eps);
     for (int i = 0; i < n; ++i) x[i] *= inv;
@@ -201,17 +222,15 @@ static inline void k3_conv_step_sve(float *out, const float *x, float *state,
     k3_conv_step_ref(out, x, state, weight, bias, channels, kernel);
 }
 
-/* Kimi's safe lower-bounded gate. The release checkpoint stores A_log[key_dim]
- * (128), shared over heads, despite the bundled Python constructor declaring
- * A_log[num_heads]. The checkpoint shape is the runtime contract. */
-static inline void k3_kda_log_decay(float *out, const float *g_raw, const float *a_log,
+/* GGUF stores A=-exp(A_log), one scalar per head.  K3 uses the bounded
+ * safe-gate form with lower_bound=-5. */
+static inline void k3_kda_log_decay(float *out, const float *g_raw, const float *a,
                                     const float *dt_bias, int heads, int key_dim) {
-    float a_scale[key_dim];
-    for (int d = 0; d < key_dim; ++d) a_scale[d] = expf(a_log[d]);
     for (int h = 0; h < heads; ++h) {
         for (int d = 0; d < key_dim; ++d) {
             int i = h * key_dim + d;
-            out[i] = -5.0f * k3_sigmoidf(a_scale[d] * (g_raw[i] + dt_bias[i]));
+            float z = (-a[h]) * (g_raw[i] + dt_bias[i]);
+            out[i] = -5.0f * k3_sigmoidf(z);
         }
     }
 }
@@ -263,7 +282,11 @@ static inline void k3_kda_step_decay_sve(float *out, const float *q, const float
 #else
             for (int d = 0; d < key_dim; ++d) row[d] *= dh[d];
 #endif
-            float delta = beta[h] * (v[h * value_dim + j] - k3_dot_sve(kh, row, key_dim));
+            /* Match k3_kda_step_ref: the recurrent prediction is accumulated
+             * in FP64 before narrowing to float.  The SVE FP32 reduction is
+             * fast but its small error compounds over 69 KDA layers and can
+             * change greedy logits after a few tokens. */
+            float delta = beta[h] * (v[h * value_dim + j] - k3_dot_ref(kh, row, key_dim));
 #if defined(__ARM_FEATURE_SVE)
             int vl2 = (int)svcntw();
             for (int d = 0; d < key_dim; d += vl2) {
@@ -274,7 +297,7 @@ static inline void k3_kda_step_decay_sve(float *out, const float *q, const float
 #else
             for (int d = 0; d < key_dim; ++d) row[d] += kh[d] * delta;
 #endif
-            out[h * value_dim + j] = k3_dot_sve(qh, row, key_dim) * scale;
+            out[h * value_dim + j] = k3_dot_ref(qh, row, key_dim) * scale;
         }
     }
 }
@@ -296,7 +319,7 @@ static inline void k3_kda_step_decay_row_sve(float *out, const float *q,
 #else
     for(int d=0;d<key_dim;++d)row[d]*=dh[d];
 #endif
-    float delta=beta[h]*(v[(size_t)h*value_dim+j]-k3_dot_sve(kh,row,key_dim));
+    float delta=beta[h]*(v[(size_t)h*value_dim+j]-k3_dot_ref(kh,row,key_dim));
 #if defined(__ARM_FEATURE_SVE)
     int vl2=(int)svcntw();
     for(int d=0;d<key_dim;d+=vl2){svbool_t pg=svwhilelt_b32(d,key_dim);
@@ -304,7 +327,7 @@ static inline void k3_kda_step_decay_row_sve(float *out, const float *q,
 #else
     for(int d=0;d<key_dim;++d)row[d]+=kh[d]*delta;
 #endif
-    out[(size_t)h*value_dim+j]=k3_dot_sve(qh,row,key_dim)*scale;
+    out[(size_t)h*value_dim+j]=k3_dot_ref(qh,row,key_dim)*scale;
 }
 
 /* Orphaned workshare: every thread in an existing OpenMP team must call it. */
@@ -684,6 +707,208 @@ static inline void k3_attention_heads_parallel_sve(float *out, const float *q,
 #if defined(_OPENMP)
     }
 #endif
+}
+
+/* Chunked prefill attention.  The scalar API above launches one OpenMP team
+ * per query.  For long prefill chunks that makes team startup dominate the
+ * MLA scan.  Keep one team for all query/head/position partitions; each query
+ * still uses its own causal prefix and exact online-softmax merge. */
+static inline void k3_attention_heads_batched_sve(float *out, const float *q,
+        const float *keys, const float *values, int batch, int start_pos,
+        int heads, int cache_tokens, int qk_dim, int v_dim, int threads,
+        float *scratch, float *stats) {
+    int parts = (threads + heads - 1) / heads;
+    if (parts < 1) parts = 1;
+    size_t scratch_stride = (size_t)heads * parts * v_dim;
+    size_t stats_stride = (size_t)heads * parts * 2 + (size_t)heads * 2;
+    float scale = 1.0f / sqrtf((float)qk_dim);
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+#endif
+        for (long task = 0; task < (long)batch * heads * parts; ++task) {
+            int t = (int)(task / (heads * parts));
+            int rem = (int)(task % (heads * parts));
+            int h = rem / parts, p = rem % parts;
+            int tokens = start_pos + t + 1;
+            int begin = (tokens * p) / parts;
+            int end = (tokens * (p + 1)) / parts;
+            float *num = scratch + (size_t)t * scratch_stride +
+                         (size_t)rem * v_dim;
+            const float *qh = q + (size_t)t * heads * qk_dim +
+                              (size_t)h * qk_dim;
+            const float *kh = keys + (size_t)h * cache_tokens * qk_dim;
+            const float *vh = values + (size_t)h * cache_tokens * v_dim;
+            for (int j = 0; j < v_dim; ++j) num[j] = 0.0f;
+            float mm = -INFINITY, ll = 0.0f;
+            for (int pos = begin; pos < end; ++pos) {
+                float score = k3_dot_sve(qh, kh + (size_t)pos * qk_dim,
+                                         qk_dim) * scale;
+                float nm, old, add;
+                if (score <= mm) {
+                    nm = mm; old = 1.0f; add = expf(score - mm);
+                } else {
+                    nm = score; old = expf(mm - score); add = 1.0f;
+                }
+#if defined(__ARM_FEATURE_SVE)
+                int vl = (int)svcntw();
+                for (int j = 0; j < v_dim; j += vl) {
+                    svbool_t pg = svwhilelt_b32(j, v_dim);
+                    svfloat32_t z = svmul_n_f32_x(pg, svld1(pg, num + j), old);
+                    z = svmla_n_f32_x(pg, z,
+                        svld1(pg, vh + (size_t)pos * v_dim + j), add);
+                    svst1(pg, num + j, z);
+                }
+#else
+                for (int j = 0; j < v_dim; ++j)
+                    num[j] = num[j] * old + vh[(size_t)pos * v_dim + j] * add;
+#endif
+                ll = ll * old + add;
+                mm = nm;
+            }
+            size_t s = (size_t)t * stats_stride + (size_t)rem * 2;
+            stats[s] = mm; stats[s + 1] = ll;
+        }
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+        for (long task = 0; task < (long)batch * heads; ++task) {
+            int t = (int)(task / heads), h = (int)(task % heads);
+            size_t base = (size_t)t * stats_stride;
+            float mm = -INFINITY; double ll = 0.0;
+            for (int p = 0; p < parts; ++p)
+                mm = fmaxf(mm, stats[base + (size_t)(h * parts + p) * 2]);
+            for (int p = 0; p < parts; ++p) {
+                size_t s = base + (size_t)(h * parts + p) * 2;
+                float weight = expf(stats[s] - mm);
+                ll += (double)stats[s + 1] * weight;
+                stats[s] = weight;
+            }
+            size_t g = base + (size_t)heads * parts * 2 + (size_t)h * 2;
+            stats[g] = mm; stats[g + 1] = (float)ll;
+        }
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+        for (long task = 0; task < (long)batch * heads * v_dim; ++task) {
+            int t = (int)(task / (heads * v_dim));
+            int rem = (int)(task % (heads * v_dim));
+            int h = rem / v_dim, j = rem % v_dim;
+            size_t base = (size_t)t * stats_stride;
+            size_t g = base + (size_t)heads * parts * 2 + (size_t)h * 2;
+            double z = 0.0;
+            for (int p = 0; p < parts; ++p) {
+                size_t s = base + (size_t)(h * parts + p) * 2;
+                z += (double)scratch[(size_t)t * scratch_stride +
+                                     (size_t)(h * parts + p) * v_dim + j] * stats[s];
+            }
+            out[(size_t)t * heads * v_dim + (size_t)h * v_dim + j] =
+                (float)(z / stats[g + 1]);
+        }
+#if defined(_OPENMP)
+    }
+#endif
+}
+
+/* Query-tiled MLA prefill kernel.  Vector mode uses sixteen queries to fill
+ * the A64FX SVE register; scalar mode retains eight queries.  Queries share
+ * every KV load and the
+ * online-softmax/value update is fused.  The ordinary batched kernel remains
+ * available as a correctness fallback. */
+static inline void k3_attention_heads_flash8_sve(float *out, const float *q,
+        const float *keys, const float *values, int batch, int start_pos,
+        int heads, int cache_tokens, int qk_dim, int v_dim, int threads,
+        int vector_qk) {
+    int block = vector_qk ? 16 : 8;
+    int packed_qk = vector_qk == 1;
+    int qblocks = (batch + block - 1) / block;
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int h = 0; h < heads; ++h)
+        for (int qb = 0; qb < qblocks; ++qb) {
+            int q0 = qb * block, qn = batch - q0;
+            if (qn > block) qn = block;
+            float acc[16][v_dim];
+            float mm[16], ll[16];
+            for (int qi = 0; qi < qn; ++qi) {
+                for (int j = 0; j < v_dim; ++j) acc[qi][j] = 0.0f;
+                mm[qi] = -INFINITY; ll[qi] = 0.0f;
+            }
+            const float *kh = keys + (size_t)h * cache_tokens * qk_dim;
+            const float *vh = values + (size_t)h * cache_tokens * v_dim;
+            float scale = 1.0f / sqrtf((float)qk_dim);
+            float qt[576][16];
+            if (packed_qk) {
+                for (int d = 0; d < qk_dim; ++d) {
+                    for (int qi = 0; qi < qn; ++qi)
+                        qt[d][qi] = q[(size_t)(q0 + qi) * heads * qk_dim +
+                                      (size_t)h * qk_dim + d];
+                    for (int qi = qn; qi < 16; ++qi) qt[d][qi] = 0.0f;
+                }
+            }
+            for (int pos = 0; pos < start_pos + q0 + qn; ++pos) {
+                float scores[16] = {0};
+                int qi_start = pos - (start_pos + q0);
+                if (qi_start < 0) qi_start = 0;
+                if (qi_start >= qn) continue;
+                if (packed_qk) {
+                    k3_dot8_tile_sve(scores, qt,
+                        kh + (size_t)pos * qk_dim, qn, qk_dim);
+                    for (int qi = qi_start; qi < qn; ++qi) scores[qi] *= scale;
+                } else {
+                    for (int qi = qi_start; qi < qn; ++qi) {
+                        const float *qh = q + (size_t)(q0 + qi) * heads * qk_dim +
+                                          (size_t)h * qk_dim;
+                        scores[qi] = k3_dot_sve(qh,
+                            kh + (size_t)pos * qk_dim, qk_dim) * scale;
+                    }
+                }
+                float old[16], add[16];
+                for (int qi = qi_start; qi < qn; ++qi) {
+                    float score = scores[qi];
+                    float nm;
+                    if (score <= mm[qi]) {
+                        nm = mm[qi]; old[qi] = 1.0f;
+                        add[qi] = expf(score - mm[qi]);
+                    } else {
+                        nm = score; old[qi] = expf(mm[qi] - score);
+                        add[qi] = 1.0f;
+                    }
+                    ll[qi] = ll[qi] * old[qi] + add[qi];
+                    mm[qi] = nm;
+                }
+#if defined(__ARM_FEATURE_SVE)
+                /* The V row is common to every query in this block.  Keep it
+                 * in an SVE register while updating all live queries, avoiding
+                 * qn redundant cache-line loads. */
+                int vl = (int)svcntw();
+                for (int j = 0; j < v_dim; j += vl) {
+                    svbool_t pg = svwhilelt_b32(j, v_dim);
+                    svfloat32_t vv = svld1(pg, vh + (size_t)pos * v_dim + j);
+                    for (int qi = qi_start; qi < qn; ++qi) {
+                        svfloat32_t z = svmul_n_f32_x(pg, svld1(pg, acc[qi] + j), old[qi]);
+                        z = svmla_n_f32_x(pg, z, vv, add[qi]);
+                        svst1(pg, acc[qi] + j, z);
+                    }
+                }
+#else
+                for (int qi = qi_start; qi < qn; ++qi) {
+                    for (int j = 0; j < v_dim; ++j)
+                        acc[qi][j] = acc[qi][j] * old[qi] +
+                            vh[(size_t)pos * v_dim + j] * add[qi];
+                }
+#endif
+            }
+            for (int qi = 0; qi < qn; ++qi) {
+                float *dst = out + (size_t)(q0 + qi) * heads * v_dim +
+                             (size_t)h * v_dim;
+                for (int j = 0; j < v_dim; ++j) dst[j] = acc[qi][j] / ll[qi];
+            }
+        }
 }
 
 /* Attention residual mixture: scores are normalized with softmax over candidates. */

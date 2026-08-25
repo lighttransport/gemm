@@ -40,5 +40,26 @@ class MlaMaterializeTest(unittest.TestCase):
             self.assertEqual(first_v[0], bf16(100))
             self.assertEqual(first_v[1], bf16(101))
 
+    def test_f32_preserves_q8_dequant_values(self):
+        with tempfile.TemporaryDirectory(prefix="k3-mla-f32-test-") as d:
+            src = os.path.join(d, "q8.bin")
+            with open(src, "wb") as f:
+                f.write(q8_plane(128, 512, 7))
+                v_off = f.tell()
+                f.write(q8_plane(512, 128, 101))
+            kr = {"type": "Q8_0", "dims": [128, 512, 96],
+                  "data_start": 0, "row_bytes": 136, "source": src}
+            vr = {"type": "Q8_0", "dims": [512, 128, 96],
+                  "data_start": v_off, "row_bytes": 544, "source": src}
+            out = os.path.join(d, "kv.f32")
+            materialize_combined(kr, vr, out, head_count=1, dtype="F32")
+            self.assertEqual(os.path.getsize(out), 256 * 512 * 4)
+            with open(out, "rb") as f:
+                first_k = struct.unpack("<512f", f.read(512 * 4))
+                f.seek(128 * 512 * 4)
+                first_v = struct.unpack("<512f", f.read(512 * 4))
+            self.assertEqual(first_k[:2], (7.0, 8.0))
+            self.assertEqual(first_v[:2], (101.0, 102.0))
+
 if __name__ == "__main__":
     unittest.main()

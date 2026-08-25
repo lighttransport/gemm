@@ -45,7 +45,18 @@ typedef enum {
     K3_QUANT_REFERENCE = 0,
     K3_QUANT_SVE_A16 = 1,
     K3_QUANT_SVE_Q8 = 2,
+    K3_QUANT_IQ_EXACT = 3,
 } k3_quant_kernel_mode;
+
+static inline const char *k3_quant_kernel_mode_name(int mode) {
+    switch (mode) {
+    case K3_QUANT_REFERENCE: return "reference";
+    case K3_QUANT_SVE_A16: return "sve-a16";
+    case K3_QUANT_SVE_Q8: return "sve-q8";
+    case K3_QUANT_IQ_EXACT: return "exact";
+    default: return "unknown";
+    }
+}
 
 typedef struct {
     int16_t *a16;
@@ -195,6 +206,12 @@ static inline int k3_quant_pack_iq_rows16(k3_quant_packed *p,
                         const block_iq2_xxs *w = (const block_iq2_xxs *)row + b;
                         uint32_t aux[2];
                         memcpy(aux, w->qs + 4 * ib, sizeof aux);
+                        memcpy(ds + ((size_t)t * nb + b) * 16u + r,
+                               &w->d, sizeof(w->d));
+                        int8_t *sm = scales +
+                            (((size_t)t * nb + b) * 8u + ib) * 32u;
+                        sm[r] = (int8_t)(1 + 2 * (int)(aux[1] >> 28));
+                        sm[16 + r] = sm[r];
                         for (int l = 0; l < 4; ++l) {
                             memcpy(q + 8 * l,
                                    iq2xxs_grid + ((const uint8_t *)aux)[l], 8);
@@ -330,6 +347,54 @@ static inline float k3_quant_dot_row_ref(const uint8_t *row, int type,
     for (int i = 0; i < cols; ++i) sum += (double)tmp[i] * x[i];
     free(tmp);
     return (float)sum;
+}
+
+/* Exact IQ1_S dot without the reference path's temporary fp32 dequantized
+ * row.  This preserves the GGML equation directly:
+ *
+ *   d * S * (grid + sign(delta) / 8) * activation
+ *
+ * and accumulates in fp64.  It is intended for quality audits and sensitive
+ * layers; unlike k3_quant_dot_row_ref it performs no allocation per row. */
+static inline float k3_quant_iq1_s_dot_exact(const block_iq1_s *w,
+                                             const float *x, int cols) {
+    int nb = cols / 256;
+    double total = 0.0;
+    for (int b = 0; b < nb; ++b) {
+        const block_iq1_s *wb = w + b;
+        double block = 0.0;
+        for (int ib = 0; ib < 8; ++ib) {
+            int s = 2 * ((wb->qh[ib] >> 12) & 7) + 1;
+            int sd = (wb->qh[ib] & 0x8000) ? -s : s;
+            for (int l = 0; l < 4; ++l) {
+                int idx = wb->qs[4 * ib + l] |
+                    (((wb->qh[ib] >> (3 * l)) & 7) << 8);
+                const int8_t *grid = (const int8_t *)(iq1s_grid + idx);
+                const float *xp = x + b * 256 + ib * 32 + l * 8;
+                for (int j = 0; j < 8; ++j)
+                    block += (double)(s * grid[j]) * xp[j] +
+                             0.125 * (double)sd * xp[j];
+            }
+        }
+        total += (double)ggml_fp16_to_fp32(wb->d) * block;
+    }
+    return (float)total;
+}
+
+/* Q8_0 has no secondary group scales or lookup tables.  Evaluate its stored
+ * FP16 block scale and signed bytes directly, retaining the reference path's
+ * FP32 weight reconstruction and FP64 dot accumulation. */
+static inline float k3_quant_q8_0_dot_exact(const block_q8_0 *w,
+                                            const float *x, int cols) {
+    double total = 0.0;
+    for (int b = 0; b < cols / 32; ++b) {
+        float d = ggml_fp16_to_fp32(w[b].d);
+        for (int j = 0; j < 32; ++j) {
+            float weight = d * (float)w[b].qs[j];
+            total += (double)weight * x[32 * b + j];
+        }
+    }
+    return (float)total;
 }
 
 static inline int k3_quant_dequant_row(float *out, const uint8_t *row,
@@ -1192,7 +1257,8 @@ static inline int k3_quant_matvec_packed_ws(float *out,
                                             const k3_quant_packed *p,
                                             const k3_quant_workspace *ws) {
     if (!out || !m || !p || !ws || m->rows != 16 ||
-        (m->type != K3_Q_IQ1_S && m->type != K3_Q_IQ2_XS) ||
+        (m->type != K3_Q_IQ1_S && m->type != K3_Q_IQ2_XS &&
+         m->type != K3_Q_IQ2_XXS) ||
         !ws->q8) return -1;
     k3_quant_iq_packed_rows16(out, p, m, ws->q8, ws->scale);
     return 0;
@@ -1517,6 +1583,98 @@ static inline void k3_quant_q8_0_a16_rows8_batch2(
 #endif
 }
 
+/* Multi-token tile: amortize each Q8_0 weight load across independent
+ * activation dots while preserving each token's block accumulation order. */
+static inline void k3_quant_q8_0_a16_rows8_batch4(
+        const uint8_t *base, size_t row_bytes, int nrows,
+        const k3_quant_workspace *ws, int ntokens, int cols,
+        float *out, size_t out_stride, const float *scales) {
+#if defined(__ARM_FEATURE_SVE)
+    const svbool_t pg = svwhilelt_b16(0, 32);
+    const svbool_t pd = svptrue_b64();
+    for (int r = 0; r < nrows; ++r) {
+        svfloat64_t f0 = svdup_f64(0.0), f1 = svdup_f64(0.0);
+        svfloat64_t f2 = svdup_f64(0.0), f3 = svdup_f64(0.0);
+        svfloat64_t f4 = svdup_f64(0.0), f5 = svdup_f64(0.0);
+        svfloat64_t f6 = svdup_f64(0.0), f7 = svdup_f64(0.0);
+        const block_q8_0 *w =
+            (const block_q8_0 *)(base + (size_t)r * row_bytes);
+        for (int b = 0; b < cols / 32; ++b) {
+            svint16_t wv = svld1sb_s16(pg, w[b].qs);
+            double wd = (double)(scales ? scales[(size_t)r * (cols / 32) + b] :
+                                           ggml_fp16_to_fp32(w[b].d));
+#define K3_Q8_BATCH_DOT(T, F) do { if (ntokens > (T)) { \
+            svint64_t d = svdot_s64(svdup_s64(0), wv, \
+                svld1_s16(pg, ws[T].a16 + 32 * b)); \
+            F = svmla_n_f64_x(pd, F, svcvt_f64_s64_x(pd, d), wd); \
+        } } while (0)
+            K3_Q8_BATCH_DOT(0, f0); K3_Q8_BATCH_DOT(1, f1);
+            K3_Q8_BATCH_DOT(2, f2); K3_Q8_BATCH_DOT(3, f3);
+            K3_Q8_BATCH_DOT(4, f4); K3_Q8_BATCH_DOT(5, f5);
+            K3_Q8_BATCH_DOT(6, f6); K3_Q8_BATCH_DOT(7, f7);
+#undef K3_Q8_BATCH_DOT
+        }
+        out[r] = (float)(svaddv_f64(pd, f0) * (double)ws[0].scale_a16);
+        if (ntokens > 1) out[out_stride + r] =
+            (float)(svaddv_f64(pd, f1) * (double)ws[1].scale_a16);
+        if (ntokens > 2) out[2 * out_stride + r] =
+            (float)(svaddv_f64(pd, f2) * (double)ws[2].scale_a16);
+        if (ntokens > 3) out[3 * out_stride + r] =
+            (float)(svaddv_f64(pd, f3) * (double)ws[3].scale_a16);
+        if (ntokens > 4) out[4 * out_stride + r] =
+            (float)(svaddv_f64(pd, f4) * (double)ws[4].scale_a16);
+        if (ntokens > 5) out[5 * out_stride + r] =
+            (float)(svaddv_f64(pd, f5) * (double)ws[5].scale_a16);
+        if (ntokens > 6) out[6 * out_stride + r] =
+            (float)(svaddv_f64(pd, f6) * (double)ws[6].scale_a16);
+        if (ntokens > 7) out[7 * out_stride + r] =
+            (float)(svaddv_f64(pd, f7) * (double)ws[7].scale_a16);
+    }
+#else
+    (void)scales;
+    for (int t = 0; t < ntokens; ++t)
+        k3_quant_q8_0_a16_rows8(base, row_bytes, nrows, ws[t].a16,
+                                ws[t].scale_a16, cols,
+                                out + (size_t)t * out_stride);
+#endif
+}
+
+static inline void k3_quant_q8_0_a16_rows8_batch8(
+        const uint8_t *base, size_t row_bytes, int nrows,
+        const k3_quant_workspace *ws, int cols, float *out,
+        size_t out_stride, const float *scales) {
+#if defined(__ARM_FEATURE_SVE)
+    const svbool_t pg = svwhilelt_b16(0, 32);
+    const svbool_t pd = svptrue_b64();
+    int nb = cols / 32;
+    for (int r = 0; r < nrows; ++r) {
+        svfloat64_t f0=svdup_f64(0),f1=svdup_f64(0),f2=svdup_f64(0),f3=svdup_f64(0);
+        svfloat64_t f4=svdup_f64(0),f5=svdup_f64(0),f6=svdup_f64(0),f7=svdup_f64(0);
+        const block_q8_0 *w=(const block_q8_0 *)(base+(size_t)r*row_bytes);
+        for(int b=0;b<nb;++b){
+            svint16_t v=svld1sb_s16(pg,w[b].qs);
+            double d=(double)(scales?scales[(size_t)r*nb+b]:ggml_fp16_to_fp32(w[b].d));
+#define K3_Q8_FULL8(T,F) do { svint64_t z=svdot_s64(svdup_s64(0),v, \
+            svld1_s16(pg,ws[T].a16+32*b)); \
+            F=svmla_n_f64_x(pd,F,svcvt_f64_s64_x(pd,z),d); } while(0)
+            K3_Q8_FULL8(0,f0);K3_Q8_FULL8(1,f1);K3_Q8_FULL8(2,f2);K3_Q8_FULL8(3,f3);
+            K3_Q8_FULL8(4,f4);K3_Q8_FULL8(5,f5);K3_Q8_FULL8(6,f6);K3_Q8_FULL8(7,f7);
+#undef K3_Q8_FULL8
+        }
+#define K3_Q8_FULL8_STORE(T,F) out[(size_t)(T)*out_stride+r]= \
+            (float)(svaddv_f64(pd,F)*(double)ws[T].scale_a16)
+        K3_Q8_FULL8_STORE(0,f0);K3_Q8_FULL8_STORE(1,f1);
+        K3_Q8_FULL8_STORE(2,f2);K3_Q8_FULL8_STORE(3,f3);
+        K3_Q8_FULL8_STORE(4,f4);K3_Q8_FULL8_STORE(5,f5);
+        K3_Q8_FULL8_STORE(6,f6);K3_Q8_FULL8_STORE(7,f7);
+#undef K3_Q8_FULL8_STORE
+    }
+#else
+    k3_quant_q8_0_a16_rows8_batch4(base,row_bytes,nrows,ws,8,cols,out,
+                                    out_stride,scales);
+#endif
+}
+
 /* Q8_0 W8A8: eight output rows share one pass over the quantized activation.
  * Each block owns a scale, so the int32 reduction cannot be deferred across
  * blocks; what the blocking buys is one activation load per eight rows and
@@ -1609,6 +1767,22 @@ static inline int k3_quant_q8_0_rows8_enabled(void) {
     return cached;
 }
 
+static inline int k3_quant_iq1_rows16_enabled(void) {
+    /* The IQ1 16-row kernel is opt-in: its different reduction order can
+     * perturb nearly tied logits even though elementwise error is tiny. */
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("K3_IQ1_ROWS16");
+        cached = (s && *s == '1');
+    }
+    return cached;
+}
+
+/* Defined below matvec_ws; exact mode must bypass any prebuilt activation
+ * workspace so it cannot accidentally enter an A16/Q8 branch. */
+static inline int k3_quant_matvec_mode(float *out, const k3_quant_matrix *m,
+                                       const float *x, int threads, int mode);
+
 /* Run one matvec against an activation that the caller already quantized.
  * Projections issue many eight-row blocks against the same input; preparing
  * the workspace per block re-scanned the whole activation once per block. */
@@ -1622,6 +1796,8 @@ static inline int k3_quant_matvec_ws(float *out, const k3_quant_matrix *m,
     if (!m || !out || !ws || !k3_quant_valid_shape(m->type, m->rows, m->cols))
         return -1;
     if (ws->cols < m->cols) return -1;
+    if (mode == K3_QUANT_IQ_EXACT)
+        return k3_quant_matvec_mode(out, m, x, threads, mode);
     if (m->type == K3_Q_Q8_0 && ws->a16 && ws->a16_ready) {
         int blocks = (m->rows + 7) / 8;
 #if defined(_OPENMP)
@@ -1645,9 +1821,11 @@ static inline int k3_quant_matvec_ws(float *out, const k3_quant_matrix *m,
         return 0;
     }
 #if defined(__ARM_FEATURE_SVE)
-    if (mode == K3_QUANT_SVE_Q8 && m->rows >= K3_IQ_ROWS &&
+    if (mode == K3_QUANT_SVE_Q8 &&
+        m->rows >= K3_IQ_ROWS &&
         (m->type == K3_Q_IQ1_S || m->type == K3_Q_IQ2_XS ||
-         m->type == K3_Q_IQ2_XXS)) {
+         m->type == K3_Q_IQ2_XXS) &&
+        (m->type != K3_Q_IQ1_S || k3_quant_iq1_rows16_enabled())) {
         int blocks = m->rows / K3_IQ_ROWS, nb = m->cols / 256;
 #if defined(_OPENMP)
         k3_quant_set_threads(threads);
@@ -1719,7 +1897,8 @@ static inline int k3_quant_matvec_ws(float *out, const k3_quant_matrix *m,
 static inline int k3_quant_q8_0_matvec_batch(float *out, size_t out_stride,
                                              const k3_quant_matrix *m,
                                              const k3_quant_workspace *ws,
-                                             int batch, int threads) {
+                                             int batch, int threads,
+                                             const float *scales) {
     (void)threads;
     if (!out || !m || !ws || m->type != K3_Q_Q8_0 || batch < 1 ||
         out_stride < (size_t)m->rows ||
@@ -1727,20 +1906,28 @@ static inline int k3_quant_q8_0_matvec_batch(float *out, size_t out_stride,
     for (int b = 0; b < batch; ++b)
         if (!ws[b].a16 || !ws[b].a16_ready || ws[b].cols < m->cols) return -1;
     int blocks = (m->rows + 7) / 8;
-    int token_groups = (batch + 1) / 2;
+    int token_tile = 8;
+    int token_groups = (batch + token_tile - 1) / token_tile;
 #if defined(_OPENMP)
     k3_quant_set_threads(threads);
     #pragma omp parallel for schedule(static)
 #endif
     for (int task = 0; task < token_groups * blocks; ++task) {
-        int token = (task / blocks) * 2;
+        int token = (task / blocks) * token_tile;
         int r = (task % blocks) * 8;
-        int ntokens = batch - token < 2 ? batch - token : 2;
+        int ntokens = batch - token < token_tile ? batch - token : token_tile;
         int nr = m->rows - r < 8 ? m->rows - r : 8;
         float *dst = out + (size_t)token * out_stride + r;
-        k3_quant_q8_0_a16_rows8_batch2(
-            m->data + (size_t)r * m->row_bytes, m->row_bytes, nr,
-            ws + token, ntokens, m->cols, dst, out_stride);
+        const float *tile_scales = scales ?
+            scales + (size_t)r * (m->cols / 32) : NULL;
+        if (ntokens == 8)
+            k3_quant_q8_0_a16_rows8_batch8(
+                m->data + (size_t)r * m->row_bytes, m->row_bytes, nr,
+                ws + token, m->cols, dst, out_stride, tile_scales);
+        else
+            k3_quant_q8_0_a16_rows8_batch4(
+                m->data + (size_t)r * m->row_bytes, m->row_bytes, nr,
+                ws + token, ntokens, m->cols, dst, out_stride, tile_scales);
     }
     return 0;
 }
@@ -1750,6 +1937,65 @@ static inline int k3_quant_matvec_mode(float *out, const k3_quant_matrix *m,
                                        int mode) {
     if (mode == K3_QUANT_REFERENCE)
         return k3_quant_matvec_ref(out, m, x, threads);
+    if (mode == K3_QUANT_IQ_EXACT) {
+        if (!m || !out || !x || !k3_quant_valid_shape(m->type, m->rows, m->cols))
+            return -1;
+        if (m->type == K3_Q_IQ1_S || m->type == K3_Q_Q8_0) {
+            if (m->type == K3_Q_IQ1_S) k3_quant_ensure_luts();
+            k3_quant_set_threads(threads);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+            for (int r = 0; r < m->rows; ++r) {
+                const uint8_t *row = m->data + (size_t)r * m->row_bytes;
+                out[r] = m->type == K3_Q_IQ1_S ?
+                    k3_quant_iq1_s_dot_exact((const block_iq1_s *)row,
+                                             x, m->cols) :
+                    k3_quant_q8_0_dot_exact((const block_q8_0 *)row,
+                                            x, m->cols);
+            }
+            return 0;
+        }
+        /* Mixed expert layers also contain IQ2/IQ3 rows.  Keep their exact
+         * GGML dequantization, but reuse one scratch row per worker instead of
+         * malloc/free for every output row. */
+        k3_quant_set_threads(threads);
+#if defined(_OPENMP)
+#pragma omp parallel
+        {
+            float *tmp = (float *)malloc((size_t)m->cols * sizeof(*tmp));
+#pragma omp for schedule(static)
+            for (int r = 0; r < m->rows; ++r) {
+                const uint8_t *row = m->data + (size_t)r * m->row_bytes;
+                if (!tmp || dequant_row(k3_quant_ggml_type(m->type), row,
+                                        tmp, m->cols)) {
+                    out[r] = NAN;
+                    continue;
+                }
+                double sum = 0.0;
+                for (int c = 0; c < m->cols; ++c)
+                    sum += (double)tmp[c] * x[c];
+                out[r] = (float)sum;
+            }
+            free(tmp);
+        }
+#else
+        float *tmp = (float *)malloc((size_t)m->cols * sizeof(*tmp));
+        if (!tmp) return -1;
+        for (int r = 0; r < m->rows; ++r) {
+            const uint8_t *row = m->data + (size_t)r * m->row_bytes;
+            if (dequant_row(k3_quant_ggml_type(m->type), row, tmp, m->cols)) {
+                free(tmp); return -1;
+            }
+            double sum = 0.0;
+            for (int c = 0; c < m->cols; ++c)
+                sum += (double)tmp[c] * x[c];
+            out[r] = (float)sum;
+        }
+        free(tmp);
+#endif
+        return 0;
+    }
     if (!m || !out || !x || !k3_quant_valid_shape(m->type, m->rows, m->cols))
         return -1;
     k3_quant_ensure_luts();
@@ -1857,9 +2103,21 @@ static inline int k3_quant_kernel_mode_env(void) {
     int m = cached;
     if (m < 0) {
         const char *s = getenv("K3_QUANT_KERNEL");
+        const char *quality = getenv("K3_QUANT_QUALITY");
         m = K3_QUANT_SVE_Q8;
         if (s && !strcmp(s, "reference")) m = K3_QUANT_REFERENCE;
         else if (s && !strcmp(s, "sve-a16")) m = K3_QUANT_SVE_A16;
+        else if (quality && (!strcmp(quality, "exact") ||
+                             !strcmp(quality, "fp64"))) m = K3_QUANT_IQ_EXACT;
+        /* IQ weights are already aggressively quantized.  A second global
+         * int8 activation quantizer can move recurrent KDA projections enough
+         * to alter later MoE routing.  Keep the fast Q8 default, but provide a
+         * clear quality switch that uses the 16-bit activation path without
+         * requiring callers to know the implementation name. */
+        if (quality && (!strcmp(quality, "1") || !strcmp(quality, "yes") ||
+                        !strcmp(quality, "true")) &&
+            (!s || strcmp(s, "reference")))
+            m = K3_QUANT_SVE_A16;
         cached = m;
     }
     return m;

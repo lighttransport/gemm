@@ -26,6 +26,7 @@ ALIGN = 256
 CHUNK = 8 * 1024 * 1024
 HIDDEN = 7168
 HEADS = 96
+KDA_HEADS = 96
 HEAD_DIM = 128
 LAYERS = 93
 EXPERTS = 896
@@ -176,6 +177,42 @@ def add_record(all_headers, records, name, mode="full", rank=0, size=1):
     records.extend(copy_record(rec, mode, rank, size))
 
 
+def copy_head_rows(rec, rank, size, head_dim, heads=HEADS):
+    """Slice matrix/vector leading rows without splitting attention heads."""
+    first_head, local_heads = split_dim(heads, rank, size)
+    first = first_head * head_dim
+    count = local_heads * head_dim
+    shape = rec["shape"]
+    row_elems = 1
+    for dim in shape[1:]:
+        row_elems *= dim
+    row_bytes = row_elems * {"BF16": 2, "F32": 4}[rec["dtype"]]
+    out = dict(rec)
+    out["shape"] = [count] + list(shape[1:])
+    out["segments"] = [(rec["source_offset"] + first * row_bytes,
+                         count * row_bytes)]
+    out["nbytes"] = count * row_bytes
+    return out
+
+
+def copy_head_cols(rec, rank, size, head_dim, heads=HEADS):
+    """Slice matrix columns in complete attention-head units."""
+    rows, cols = rec["shape"]
+    first_head, local_heads = split_dim(heads, rank, size)
+    first = first_head * head_dim
+    count = local_heads * head_dim
+    dtype_size = {"BF16": 2, "F32": 4}[rec["dtype"]]
+    row_bytes = cols * dtype_size
+    out = dict(rec)
+    out["shape"] = [rows, count]
+    # Use the blocked rectangular-copy descriptor.  A tuple per row would
+    # reopen the same shard thousands of times for every projection.
+    out["segments"] = ("rows", rec["source_offset"], rows, row_bytes,
+                       first * dtype_size, count * dtype_size)
+    out["nbytes"] = rows * count * dtype_size
+    return out
+
+
 def is_mla(layer):
     # Config lists are one-based; checkpoint layer names are zero-based.
     return (layer + 1) in set((4, 8, 12, 16, 20, 24, 28, 32, 36, 40,
@@ -239,6 +276,13 @@ def make_plan(all_headers, rank, size, layer_indices=None, include_global=True,
         add_record(all_headers, records, "language_model.model.embed_tokens.weight",
                    "rows", rank, size)
         add_record(all_headers, records, "language_model.model.norm.weight")
+        # Kimi applies one final model-level attention residual after the last
+        # decoder layer and before the final RMSNorm.  These small full tensors
+        # must be present on every rank.
+        add_record(all_headers, records,
+                   "language_model.model.output_attn_res_norm.weight")
+        add_record(all_headers, records,
+                   "language_model.model.output_attn_res_proj.weight")
         head = locate(all_headers, "language_model.lm_head.weight")
         records.extend(copy_record(head, "rows", rank, size))
 
@@ -304,11 +348,19 @@ def make_plan(all_headers, rank, size, layer_indices=None, include_global=True,
             for suffix in sorted(kda_full):
                 add_record(all_headers, records, prefix + suffix)
             for suffix in sorted(kda_row_head):
-                add_record(all_headers, records, prefix + suffix, "rows", rank, size)
+                raw = locate(all_headers, prefix + suffix)
+                records.append(copy_head_rows(raw, rank, size, HEAD_DIM,
+                                              KDA_HEADS))
             add_record(all_headers, records, prefix + "self_attn.f_a_proj.weight")
-            add_record(all_headers, records, prefix + "self_attn.dt_bias", "rows", rank, size)
-            add_record(all_headers, records, prefix + "self_attn.b_proj.weight", "rows", rank, size)
-            add_record(all_headers, records, prefix + "self_attn.o_proj.weight", "cols", rank, size)
+            records.append(copy_head_rows(locate(all_headers,
+                prefix + "self_attn.dt_bias"), rank, size, HEAD_DIM,
+                KDA_HEADS))
+            records.append(copy_head_rows(locate(all_headers,
+                prefix + "self_attn.b_proj.weight"), rank, size, 1,
+                KDA_HEADS))
+            records.append(copy_head_cols(locate(all_headers,
+                prefix + "self_attn.o_proj.weight"), rank, size, HEAD_DIM,
+                KDA_HEADS))
 
         if layer == 0:
             for suffix in ("mlp.gate_proj.weight", "mlp.up_proj.weight"):

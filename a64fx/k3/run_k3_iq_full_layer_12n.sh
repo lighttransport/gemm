@@ -30,7 +30,7 @@ while (($#)); do
     esac
 done
 case "$FORMAT" in
-    iq1) MODEL_DIR=${MODEL_DIR:-$HOME/models/k3/iq1}; THREADS=${THREADS:-44};;
+    iq1) MODEL_DIR=${MODEL_DIR:-$HOME/models/k3/iq1}; THREADS=${THREADS:-48};;
     q2) MODEL_DIR=${MODEL_DIR:-$HOME/models/k3/q2}; THREADS=${THREADS:-40};;
     *) echo "$0: format must be iq1 or q2" >&2; exit 2;;
 esac
@@ -47,6 +47,7 @@ if [[ -e "$RESULT_DIR" ]]; then echo "$0: result directory exists: $RESULT_DIR" 
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH"
 export OMP_NUM_THREADS="$THREADS" OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLACES=cores
 export OMP_WAIT_POLICY=active KMP_BLOCKTIME=infinite
+export K3_PREFILL_PROJ_THREADS=${K3_PREFILL_PROJ_THREADS:-48}
 export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
 mkdir -p "$RESULT_DIR" "$STAGE_DIR"
 "$SCRIPT_DIR/k3_setup_python.sh"
@@ -61,7 +62,7 @@ mv tofu_topo.txt topology.txt
 }
 
 mpiexec -np 12 -of-proc "$RESULT_DIR/stage.rank" sh -c \
-    "rank=\${PMIX_RANK:-\${OMPI_COMM_WORLD_RANK:-\${PMI_RANK:?no rank}}}; \
+    "rank=\${PMIX_RANK:-\${OMPI_COMM_WORLD_RANK:-\${PJM_MPI_RANK:-\${PMI_RANK:?no rank}}}}; \
      exec '$SCRIPT_DIR/k3_python.sh' '$SCRIPT_DIR/k3_gguf_native_stage.py' \
           '$MODEL_DIR' --nodes 12 --rank \"\$rank\" --layer '$LAYER' \
           --output-dir '$STAGE_DIR' --expert-tp --force"

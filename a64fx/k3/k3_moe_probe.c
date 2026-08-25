@@ -278,17 +278,17 @@ static int tp_prefill_probe(const loaded_expert *le,int nslice,int threads,
     int*offsets=probe_alloc((E+1)*sizeof(*offsets)),*positions=probe_alloc((size_t)MAX_B*TK*sizeof(*positions));
     int*token_ids=probe_alloc((size_t)MAX_B*TK*sizeof(*token_ids));
     float*rw=probe_alloc((size_t)MAX_B*TK*4),*latent=probe_alloc((size_t)MAX_B*K3_LATENT*4);
-    float*gathered=probe_alloc((size_t)MAX_B*TK*K3_LATENT*4),*gate=probe_alloc((size_t)MAX_B*TK*local*4),*up=probe_alloc((size_t)MAX_B*TK*local*4);
+    float*gate=probe_alloc((size_t)MAX_B*TK*local*4),*up=probe_alloc((size_t)MAX_B*TK*local*4);
     float*partial=probe_alloc((size_t)MAX_B*K3_LATENT*4),*ref=probe_calloc(2*K3_LATENT,4),*one=probe_alloc((size_t)K3_LATENT*4);
     float*gl=probe_alloc((size_t)local*4),*ul=probe_alloc((size_t)local*4);size_t en=(size_t)128<<20;float*eb=probe_calloc(en/4,4);
-    if(!w1||!w2||!w3||!routes||!counts||!offsets||!positions||!token_ids||!rw||!latent||!gathered||!gate||!up||!partial||!ref||!one||!gl||!ul||!eb)return 1;
+    if(!w1||!w2||!w3||!routes||!counts||!offsets||!positions||!token_ids||!rw||!latent||!gate||!up||!partial||!ref||!one||!gl||!ul||!eb)return 1;
     for(int e=0;e<E;++e){w1[e]=le[e%nslice].w1;w2[e]=le[e%nslice].w2;w3[e]=le[e%nslice].w3;}
     for(int t=0;t<MAX_B;++t){for(int i=0;i<K3_LATENT;++i)latent[(size_t)t*K3_LATENT+i]=rf()*.125f;
         for(int k=0;k<TK;++k){int e,unique;do{e=(int)(rn()%E);unique=1;for(int q=0;q<k;++q)unique&=routes[t*TK+q]!=e;}while(!unique);
             routes[t*TK+k]=e;rw[t*TK+k]=1.0f/TK;}}
     int fail=0;
     if(k3_expert_tp_prefill_mxfp4(partial,w1,w2,w3,E,routes,rw,2,TK,latent,
-            counts,offsets,positions,token_ids,gathered,gate,up,threads,
+            counts,offsets,positions,token_ids,gate,up,threads,
             tile_threshold))fail=1;
     for(int t=0;t<2&&!fail;++t)for(int k=0;k<TK;++k){int e=routes[t*TK+k];
         if(k3_expert_tp_forward_mxfp4(one,w1+e,w2+e,w3+e,
@@ -299,13 +299,13 @@ static int tp_prefill_probe(const loaded_expert *le,int nslice,int threads,
     const int batches[]={64,256,1024};for(int bi=0;bi<3&&!fail;++bi){int b=batches[bi],reps=b<1024?5:3;double sec=0,best=1e9;int active=0;
         for(int it=0;it<reps;++it){evict(eb,en/4,threads);double t=now_sec();
             fail|=k3_expert_tp_prefill_mxfp4(partial,w1,w2,w3,E,routes,rw,b,TK,latent,
-                counts,offsets,positions,token_ids,gathered,gate,up,threads,
+                counts,offsets,positions,token_ids,gate,up,threads,
                 tile_threshold);double dt=now_sec()-t;sec+=dt;if(dt<best)best=dt;}
         for(int e=0;e<E;++e)active+=counts[e]>0;double mean=sec/reps,sum=0;for(int i=0;i<b*K3_LATENT;++i)sum+=partial[i];
-        int effective_threshold=b>=1024&&tile_threshold==8?4:tile_threshold;
+        int effective_threshold=b>=1024&&tile_threshold==8?6:tile_threshold;
         printf("PROBE expert-tp-prefill M=%d active=%d assignments=%d threads=%d threshold=%d mean_ms=%.3f best_ms=%.3f tok/s=%.1f assignments/s=%.1f checksum=%+.6e\n",
             b,active,b*TK,threads,effective_threshold,mean*1e3,best*1e3,b/mean,b*TK/mean,sum);}
-    probe_free(w1);probe_free(w2);probe_free(w3);probe_free(routes);probe_free(counts);probe_free(offsets);probe_free(positions);probe_free(token_ids);probe_free(rw);probe_free(latent);probe_free(gathered);probe_free(gate);probe_free(up);probe_free(partial);probe_free(ref);probe_free(one);probe_free(gl);probe_free(ul);probe_free(eb);return fail;
+    probe_free(w1);probe_free(w2);probe_free(w3);probe_free(routes);probe_free(counts);probe_free(offsets);probe_free(positions);probe_free(token_ids);probe_free(rw);probe_free(latent);probe_free(gate);probe_free(up);probe_free(partial);probe_free(ref);probe_free(one);probe_free(gl);probe_free(ul);probe_free(eb);return fail;
 }
 
 static int parse_int_arg(const char*flag,const char*text,int lo,int hi,int*out){

@@ -23,6 +23,59 @@ typedef struct {
     char dtype[16], name[512];
 } entry;
 
+typedef struct {
+    char name[64];
+    uint32_t shape[4], ndim;
+    uint64_t count;
+    const float *data;
+} trace_tensor;
+
+static int load_trace(const char *path, uint8_t **owner,
+                      trace_tensor *ts, int cap, int *out_n) {
+    FILE *f = fopen(path, "rb"); if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) || ftell(f) < 20 || fseek(f, 0, SEEK_SET)) { fclose(f); return -1; }
+    long n = ftell(f); if (n <= 0 || fseek(f, 0, SEEK_SET)) { fclose(f); return -1; }
+    uint8_t *b = (uint8_t *)malloc((size_t)n); if (!b) { fclose(f); return -1; }
+    if (fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); fclose(f); return -1; }
+    fclose(f);
+    if (memcmp(b, "K3TRC001", 8) != 0) { free(b); return -1; }
+    size_t p = 8; uint32_t version, layer, count;
+    memcpy(&version, b+p, 4); p += 4; memcpy(&layer, b+p, 4); p += 4; memcpy(&count, b+p, 4); p += 4;
+    (void)version; (void)layer;
+    if (count > (uint32_t)cap) { free(b); return -1; }
+    for (uint32_t i = 0; i < count; ++i) {
+        uint16_t nl, nd;
+        if (p + 2 > (size_t)n) { free(b); return -1; } memcpy(&nl, b+p, 2); p += 2;
+        if (!nl || nl >= sizeof ts[i].name || p + nl + 2 > (size_t)n) { free(b); return -1; }
+        memcpy(ts[i].name, b+p, nl); ts[i].name[nl] = 0; p += nl;
+        memcpy(&nd, b+p, 2); p += 2; if (!nd || nd > 4 || p + (size_t)nd*4 + 8 > (size_t)n) { free(b); return -1; }
+        ts[i].ndim = nd; memset(ts[i].shape, 0, sizeof ts[i].shape);
+        for (uint32_t d = 0; d < nd; ++d) { memcpy(&ts[i].shape[d], b+p, 4); p += 4; }
+        memcpy(&ts[i].count, b+p, 8); p += 8;
+        if (ts[i].count > ((size_t)n-p)/sizeof(float)) { free(b); return -1; }
+        ts[i].data = (const float *)(b+p); p += (size_t)ts[i].count*sizeof(float);
+    }
+    *owner = b; *out_n = (int)count; return 0;
+}
+
+static const trace_tensor *trace_find(const trace_tensor *ts, int n, const char *name) {
+    for (int i = 0; i < n; ++i) if (!strcmp(ts[i].name, name)) return ts+i;
+    return NULL;
+}
+
+static int trace_compare(const char *label, const float *got,
+                         const trace_tensor *ref, int offset, int count) {
+    double se=0.0, sr=0.0; float maxe=0.0f; int maxi=-1;
+    if (!ref || offset < 0 || (uint64_t)offset + (uint64_t)count > ref->count) {
+        printf("K3TRACE %s missing-or-short\n", label); return 1;
+    }
+    for (int i=0; i<count; ++i) { double d=(double)got[i]-ref->data[offset+i];
+        float a=fabsf((float)d); if(a>maxe){maxe=a;maxi=i;} se+=d*d; sr+=(double)ref->data[offset+i]*ref->data[offset+i]; }
+    double rel=sqrt(se/(sr+1e-30)); int bad=maxe>2e-4f && rel>2e-4;
+    printf("K3TRACE %s max_abs=%.3e rel_l2=%.3e first=%d %s\n",label,maxe,rel,maxi,bad?"FAIL":"PASS");
+    return bad;
+}
+
 static k3_pool probe_pool;
 static int probe_alloc_failed;
 static void *probe_alloc(size_t bytes){void*p=k3_pool_alloc(&probe_pool,bytes);if(!p){probe_alloc_failed=1;fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));}return p;}
@@ -178,7 +231,7 @@ static double kda_probe(float*out,const float*q,const float*k,const float*v,cons
 }
 
 int main(int argc,char**argv){
-    if(argc!=3){fprintf(stderr,"usage: %s BLOB MANIFEST\n",argv[0]);return 2;}
+    if(argc!=3 && argc!=4){fprintf(stderr,"usage: %s BLOB MANIFEST [KTRACE]\n",argv[0]);return 2;}
     k3_pool_init(&probe_pool,"kda-probe");
     entry es[20];int ne=load_manifest(argv[2],es,20);if(ne!=13){fprintf(stderr,"k3_kda_probe: invalid manifest '%s': expected 13 tensors, got %d\n",argv[2],ne);k3_pool_destroy(&probe_pool);return 2;}
     size_t blob_size=0;uint8_t*blob=k3_pool_load_blob(&probe_pool,argv[1],&blob_size);if(!blob){fprintf(stderr,"%s\n",k3_pool_error(&probe_pool));k3_pool_destroy(&probe_pool);return 2;}
@@ -193,9 +246,19 @@ int main(int argc,char**argv){
     const float *qcw=PTR("q_conv1d.weight",float),*kcw=PTR("k_conv1d.weight",float),*vcw=PTR("v_conv1d.weight",float);
     const float *dt=PTR("dt_bias",float),*alog=PTR("A_log",float),*onorm=PTR("o_norm.weight",float);
 #undef PTR
-    float*x=probe_alloc(K3_HIDDEN*4),q[128],k[128],v[128],gout[128],fa[128],graw[128],decay[128],o[128];
+    uint8_t *trace_blob=NULL; trace_tensor traces[32]; int ntrace=0;
+    if (argc == 4 && load_trace(argv[3], &trace_blob, traces, 32, &ntrace)) {
+        fprintf(stderr,"k3_kda_probe: invalid trace %s\n",argv[3]); k3_pool_destroy(&probe_pool); return 2;
+    }
+    const trace_tensor *tr_input=trace_blob?trace_find(traces,ntrace,"input"):NULL;
+    if (trace_blob && (!tr_input || tr_input->count < K3_HIDDEN)) {
+        fprintf(stderr,"k3_kda_probe: trace input must contain %d floats\n",K3_HIDDEN); free(trace_blob); k3_pool_destroy(&probe_pool); return 2;
+    }
+    float*x=probe_alloc(K3_HIDDEN*4),q[128],k[128],v[128],gout[128],fa[128],graw[128],decay[128],logdecay[128],o[128],recurrent[128];
     float qstate[128*3]={0},kstate[128*3]={0},vstate[128*3]={0};float*state=probe_calloc(128*128,4);
-    if(!x||!state){k3_pool_destroy(&probe_pool);return 2;}for(int i=0;i<K3_HIDDEN;++i)x[i]=rnd()*.125f;
+    if(!x||!state){free(trace_blob);k3_pool_destroy(&probe_pool);return 2;}
+    if (tr_input) memcpy(x, tr_input->data, (size_t)K3_HIDDEN*sizeof(float));
+    else for(int i=0;i<K3_HIDDEN;++i)x[i]=rnd()*.125f;
     float*outs[4]={q,k,v,gout};const uint16_t*ws[4]={qw,kw,vw,gw};
     float*outs5[5]={q,k,v,gout,fa};const uint16_t*ws5[5]={qw,kw,vw,gw,faw};
     projection4(outs,ws,x,1);
@@ -207,9 +270,22 @@ int main(int argc,char**argv){
     float cq[128],ck[128],cv[128];k3_conv_step_sve(cq,q,qstate,qcw,NULL,128,4);k3_conv_step_sve(ck,k,kstate,kcw,NULL,128,4);k3_conv_step_sve(cv,v,vstate,vcw,NULL,128,4);
     for(int i=0;i<128;++i){cq[i]*=k3_sigmoidf(cq[i]);ck[i]*=k3_sigmoidf(ck[i]);cv[i]*=k3_sigmoidf(cv[i]);}
     k3_l2_normalize_sve(cq,128,1e-6f);k3_l2_normalize_sve(ck,128,1e-6f);
-    k3_kda_log_decay(decay,graw,alog,dt,1,128);for(int i=0;i<128;++i)decay[i]=expf(decay[i]);
-    float beta=k3_sigmoidf(beta_raw);k3_kda_step_decay_sve(o,cq,ck,cv,decay,&beta,state,1,128,128);
+    k3_kda_log_decay(logdecay,graw,alog,dt,1,128);for(int i=0;i<128;++i)decay[i]=expf(logdecay[i]);
+    float beta=k3_sigmoidf(beta_raw);k3_kda_step_decay_sve(recurrent,cq,ck,cv,decay,&beta,state,1,128,128);
+    memcpy(o,recurrent,sizeof o);
     k3_gated_rmsnorm_sve(o,o,gout,onorm,128,1e-6f);
+    int trace_failures=0;
+    if (trace_blob) {
+        int failures=0;
+        failures += trace_compare("q_proj", q, trace_find(traces,ntrace,"q_proj"), 0, 128);
+        failures += trace_compare("q_norm", cq, trace_find(traces,ntrace,"q_norm"), 0, 128);
+        failures += trace_compare("k_norm", ck, trace_find(traces,ntrace,"k_norm"), 0, 128);
+        failures += trace_compare("decay_log", logdecay, trace_find(traces,ntrace,"decay"), 0, 128);
+        failures += trace_compare("recurrent", recurrent, trace_find(traces,ntrace,"recurrent"), 0, 128);
+        failures += trace_compare("gated", o, trace_find(traces,ntrace,"gated"), 0, 128);
+        trace_failures = failures;
+        printf("K3TRACE summary failures=%d\n", failures);
+    }
     double sum=0,ss=0;int finite=1;for(int i=0;i<128;++i){sum+=o[i];ss+=(double)o[i]*o[i];finite&=isfinite(o[i]);}
     printf("[real-kda] beta=%.6f checksum=%+.9e l2=%.9e finite=%s\n",beta,sum,sqrt(ss),finite?"yes":"NO");
     printf("\nReal one-head BF16 projection scaling (four 128x7168 matrices):\n");
@@ -224,6 +300,8 @@ int main(int argc,char**argv){
     printf("\nReal-activation KDA recurrence scaling (128x128 FP32 state):\n");
     double r1=0;
     for(int i=0;i<8;++i){double t=kda_probe(o,cq,ck,cv,decay,beta,state,ts[i],300);if(i==0)r1=t;printf("PROBE recurrence_eff threads=%2d efficiency=%.3f\n",ts[i],r1/(t*ts[i]));}
-    probe_free(blob);probe_free(x);probe_free(state);
-    int status=probe_alloc_failed?2:finite?0:1;fprintf(stderr,"k3 KDA pool: peak=%.2f MiB reserved=%.2f MiB\n",probe_pool.peak_active_bytes/1048576.0,probe_pool.reserved_bytes/1048576.0);k3_pool_destroy(&probe_pool);return status;
+    probe_free(blob);probe_free(x);probe_free(state);free(trace_blob);
+    int status=probe_alloc_failed?2:finite?0:1;
+    if (trace_failures) status=1;
+    fprintf(stderr,"k3 KDA pool: peak=%.2f MiB reserved=%.2f MiB\n",probe_pool.peak_active_bytes/1048576.0,probe_pool.reserved_bytes/1048576.0);k3_pool_destroy(&probe_pool);return status;
 }

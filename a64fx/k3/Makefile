@@ -4,8 +4,8 @@ WARN = -Wall -Wextra -Wpedantic -Wno-unused-function
 MODEL_DIR ?= /home/u14346/models/k3/iq1
 NODES ?= 12
 
-.PHONY: all runner full-runner full-convert full-runner-test iq1-text iq-layer-12n native-plan tp-stage-test test real-test probe-kda probe-kda-mpi probe-moe-mpi probe-expert-tp-mpi sim validate clean
-all: k3_kernel_test k3_quant_kernel_test k3_gguf_layer_bench k3_gguf_adapter_test k3_gguf_expert_tp_test k3_gguf_iq_tp_probe k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe
+.PHONY: all runner full-runner full-convert full-runner-test torch-ref-run torch-ref-test torch-ref-self-test torch-cu129-setup iq1-text iq-layer-12n native-plan tp-stage-test test real-test probe-kda probe-kda-mpi probe-moe-mpi probe-expert-tp-mpi sim validate clean
+all: k3_kernel_test k3_quant_kernel_test k3_decode_ids k3_prompt_ids k3_gguf_layer_bench k3_gguf_adapter_test k3_gguf_expert_tp_test k3_gguf_iq_tp_probe k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe
 
 runner: k3_ep_runner
 
@@ -27,6 +27,18 @@ full-convert: k3_full_convert
 full-runner-test: k3_full_runner
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test_k3_full_runner
 
+torch-ref-test:
+	cd ../../cuda/llm/k3 && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_k3_torch_partial_ref
+
+torch-ref-run:
+	../../cuda/llm/k3/run_k3_torch_ref.sh
+
+torch-ref-self-test:
+	cd ../../cuda/llm/k3 && PYTHONDONTWRITEBYTECODE=1 python3 k3_torch_partial_ref.py --self-test
+
+torch-cu129-setup:
+	../../cuda/llm/k3/k3_setup_torch_cuda129.sh
+
 # Requires an active 12-node PJM allocation; deliberately model-free.
 full-12n-regression: k3_full_runner
 	./run_k3_12n_regression.sh
@@ -40,7 +52,10 @@ native-plan:
 	PYTHONDONTWRITEBYTECODE=1 python3 k3_gguf_native_stage.py $(MODEL_DIR) --nodes $(NODES)
 
 tp-stage-test:
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_k3_gguf_expert_tp_stage.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
+		test_k3_gguf_expert_tp_stage.py test_k3_gguf_native_stage.py \
+		test_k3_gguf_mla_materialize.py test_make_k3_prompt_ids.py \
+		test_validate_k3_codegen.py
 
 # Requires an active 12-node PJM allocation and streamed rank-local staging.
 fast-12n-decode: k3_ep_runner
@@ -60,6 +75,12 @@ k3_kernel_test: k3_kernel_test.c k3_kernels.h
 
 k3_quant_kernel_test: k3_quant_kernel_test.c k3_quant.h ../../common/ggml_dequant.h ../../common/gguf_loader.h
 	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -o $@
+
+k3_decode_ids: k3_decode_ids.c ../../common/gguf_loader.h ../../common/bpe_tokenizer.h
+	$(CC) $(CFLAGS) $(WARN) $< -lm -o $@
+
+k3_prompt_ids: k3_prompt_ids.c ../../common/gguf_loader.h ../../common/bpe_tokenizer.h
+	$(CC) $(CFLAGS) $(WARN) $< -lm -o $@
 
 k3_gguf_layer_bench: k3_gguf_layer_bench.c k3_quant.h ../../common/ggml_dequant.h ../../common/gguf_loader.h
 	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -o $@
@@ -120,4 +141,4 @@ validate:
 	PYTHONDONTWRITEBYTECODE=1 python3 k3_stage.py --validate-all
 
 clean:
-	rm -f k3_kernel_test k3_quant_kernel_test k3_gguf_layer_bench k3_gguf_adapter_test k3_gguf_expert_tp_test k3_gguf_iq_tp_probe k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe k3_ep_runner k3_full_runner k3_full_convert
+	rm -f k3_kernel_test k3_quant_kernel_test k3_decode_ids k3_prompt_ids k3_gguf_layer_bench k3_gguf_adapter_test k3_gguf_expert_tp_test k3_gguf_iq_tp_probe k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe k3_ep_runner k3_full_runner k3_full_convert

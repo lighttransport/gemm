@@ -3,6 +3,8 @@
 
 #include <limits.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #if defined(_OPENMP)
@@ -53,7 +55,7 @@ static inline size_t k3_mxfp4_matrix_bytes(int rows, int cols) {
 
 /* Offline-style BF16 -> OCP MXFP4 conversion used by bounded real-weight
  * probes and the future stage path.  Each 32-value block uses the smallest
- * E8M0 power-of-two scale whose E2M1 maximum (12) covers the block. */
+ * E8M0 power-of-two scale whose standard E2M1 maximum (6) covers the block. */
 static inline void k3_mxfp4_quantize_bf16(uint8_t *packed, uint8_t *scale,
         const uint16_t *src, int rows, int cols) {
     int blocks=cols/32;
@@ -64,13 +66,13 @@ static inline void k3_mxfp4_quantize_bf16(uint8_t *packed, uint8_t *scale,
         uint8_t *qr=packed+(size_t)r*cols/2,*sr=scale+(size_t)r*blocks;
         for(int b=0;b<blocks;++b){float amax=0;
             for(int j=0;j<32;++j)amax=fmaxf(amax,fabsf(bf16_to_f32_scalar(row[b*32+j])));
-            int e=0;if(amax>0) e=(int)ceilf(log2f(amax/12.0f));
+            int e=0;if(amax>0) e=(int)ceilf(log2f(amax/6.0f));
             if(e < -126)e=-126;if(e>127)e=127;sr[b]=(uint8_t)(e+127);
             float inv=1.0f/ldexpf(1.0f,e);
             for(int j=0;j<16;++j){uint8_t code[2];
-                for(int h=0;h<2;++h){float v=bf16_to_f32_scalar(row[b*32+j+h*16])*inv;
+                for(int h=0;h<2;++h){float v=bf16_to_f32_scalar(row[b*32+2*j+h])*inv;
                     int sign=v<0, best=0;float av=fabsf(v),err=av;
-                    for(int q=1;q<8;++q){float d=fabsf(av-ds4f_kvalues_mxfp4_f32[q]);if(d<err){err=d;best=q;}}
+                    for(int q=1;q<8;++q){float d=fabsf(av-0.5f*ds4f_kvalues_mxfp4_f32[q]);if(d<err){err=d;best=q;}}
                     code[h]=(uint8_t)(best|(sign&&best?8:0));}
                 qr[b*16+j]=(uint8_t)(code[0]|(code[1]<<4));}}
     }
@@ -190,11 +192,23 @@ static inline void k3_moe_finish_reduce_q8w16(float *hidden_out,
 #ifndef K3_MXFP4_PREFETCH_BLOCKS
 #define K3_MXFP4_PREFETCH_BLOCKS 16
 #endif
+#ifndef K3_MXFP4_TILE_SCALE_LUT
+#define K3_MXFP4_TILE_SCALE_LUT 1
+#endif
 #ifndef K3_SITU_FEXPA
 #define K3_SITU_FEXPA 1
 #endif
 #ifndef K3_TP_FUSED_DOWN32
 #define K3_TP_FUSED_DOWN32 1
+#endif
+#ifndef K3_EXPERT_PREFILL_DYNAMIC
+#define K3_EXPERT_PREFILL_DYNAMIC 0
+#endif
+#ifndef K3_TP_DOWN_ROWS
+#define K3_TP_DOWN_ROWS 8
+#endif
+#if K3_TP_DOWN_ROWS != 8 && K3_TP_DOWN_ROWS != 16
+#error "K3_TP_DOWN_ROWS must be 8 or 16"
 #endif
 
 static inline void k3_moe_situ(float *gate, const float *up, int n,
@@ -316,11 +330,12 @@ static inline void k3_matvec_mxfp4_8row(float *dst,
             __builtin_prefetch(w4+(size_t)pb*16,0,2);__builtin_prefetch(w5+(size_t)pb*16,0,2);
             __builtin_prefetch(w6+(size_t)pb*16,0,2);__builtin_prefetch(w7+(size_t)pb*16,0,2);}
 #endif
-        svfloat32_t xl=svld1(pg,x+(size_t)b*32),xh=svld1(pg,x+(size_t)b*32+16);
+        svfloat32_t xa=svld1(pg,x+(size_t)b*32),xb=svld1(pg,x+(size_t)b*32+16);
+        svfloat32_t xl=svuzp1_f32(xa,xb),xh=svuzp2_f32(xa,xb);
 #define K3_MXROW(W,S,A) do{svuint32_t z=svld1ub_u32(pg,(W)+(size_t)b*16); \
         svuint32_t lo=svand_n_u32_x(pg,z,15),hi=svand_n_u32_x(pg,svlsr_n_u32_x(pg,z,4),15); \
         svfloat32_t p=svmul_x(pg,svtbl_f32(kv,lo),xl);p=svmla_x(pg,p,svtbl_f32(kv,hi),xh); \
-        (A)=svmla_n_f32_x(pg,(A),p,k3_e8m0_tab[(S)[b]].f);}while(0)
+        (A)=svmla_n_f32_x(pg,(A),p,0.5f*k3_e8m0_tab[(S)[b]].f);}while(0)
         K3_MXROW(w0,s0,a0);K3_MXROW(w1,s1,a1);K3_MXROW(w2,s2,a2);K3_MXROW(w3,s3,a3);
         K3_MXROW(w4,s4,a4);K3_MXROW(w5,s5,a5);K3_MXROW(w6,s6,a6);K3_MXROW(w7,s7,a7);
 #undef K3_MXROW
@@ -387,16 +402,14 @@ static inline void k3_mxfp4_group_svtbl_indexed(float *y,int ystride,
 static inline void k3_mxfp4_group_tile(float *y, int ystride,
                                        const uint8_t *w, const uint8_t *s,
                                        const float *x, int xstride,
-                                       int batch, int k) {
+                                       int batch, int k,
+                                       const int *token_ids) {
     const int tk = batch >= 24 ? K3_MXFP4_TILE_K_LARGE
                                : K3_MXFP4_TILE_K_SMALL;
     uint16_t pv[4 * 2 * K3_MXFP4_TILE_K_LARGE] __attribute__((aligned(256)));
     float acc[K3_MOE_MAX_BATCH][8];
     memset(acc, 0, (size_t)batch * 8 * sizeof(float));
     size_t rb = (size_t)k / 2, sb = (size_t)k / 32;
-    svbool_t pg = svptrue_b32(), ph = svptrue_b16();
-    svfloat32_t kv = svld1(pg, ds4f_kvalues_mxfp4_f32);
-    int vl = (int)svcntw();
     for (int k0 = 0; k0 < k; k0 += tk) {
         int klen = k - k0 < tk ? k - k0 : tk;
         for (int pr = 0; pr < 4; ++pr) {
@@ -405,28 +418,25 @@ static inline void k3_mxfp4_group_tile(float *y, int ystride,
             const uint8_t *wb = wa + rb;
             const uint8_t *sa = s + (size_t)(2 * pr) * sb;
             const uint8_t *ssb = sa + sb;
-            for (int c = 0; c < klen; c += vl) {
+            for (int c = 0; c < klen; ++c) {
                 int col = k0 + c, blk = col >> 5;
-                int high = (col & 16) != 0;
-                svuint32_t ra = svld1ub_u32(pg, wa + (size_t)blk * 16);
-                svuint32_t rbv = svld1ub_u32(pg, wb + (size_t)blk * 16);
-                svuint32_t na = high
-                    ? svand_n_u32_x(pg, svlsr_n_u32_x(pg, ra, 4), 15)
-                    : svand_n_u32_x(pg, ra, 15);
-                svuint32_t nb = high
-                    ? svand_n_u32_x(pg, svlsr_n_u32_x(pg, rbv, 4), 15)
-                    : svand_n_u32_x(pg, rbv, 15);
-                svfloat32_t fa = svmul_n_f32_x(pg, svtbl_f32(kv, na),
-                                               ggml_e8m0_to_fp32(sa[blk]));
-                svfloat32_t fb = svmul_n_f32_x(pg, svtbl_f32(kv, nb),
-                                               ggml_e8m0_to_fp32(ssb[blk]));
-                svuint16_t a16 = svreinterpret_u16_u32(svlsr_n_u32_x(
-                    pg, svreinterpret_u32_f32(fa), 16));
-                svuint16_t b16 = svreinterpret_u16_u32(svlsr_n_u32_x(
-                    pg, svreinterpret_u32_f32(fb), 16));
-                svuint16_t ca = svuzp1_u16(a16, a16);
-                svuint16_t cb = svuzp1_u16(b16, b16);
-                svst1_u16(ph, pb + 2 * c, svzip1_u16(ca, cb));
+                int byte = (col & 31) >> 1;
+                int shift = (col & 1) * 4;
+#if K3_MXFP4_TILE_SCALE_LUT
+                float scale_a = 0.5f * k3_e8m0_tab[sa[blk]].f;
+                float scale_b = 0.5f * k3_e8m0_tab[ssb[blk]].f;
+#else
+                float scale_a = 0.5f * ggml_e8m0_to_fp32(sa[blk]);
+                float scale_b = 0.5f * ggml_e8m0_to_fp32(ssb[blk]);
+#endif
+                int ca = (wa[(size_t)blk * 16 + byte] >> shift) & 15;
+                int cb = (wb[(size_t)blk * 16 + byte] >> shift) & 15;
+                float fa = ds4f_kvalues_mxfp4_f32[ca] * scale_a;
+                float fb = ds4f_kvalues_mxfp4_f32[cb] * scale_b;
+                uint32_t ua, ub;
+                memcpy(&ua, &fa, sizeof ua); memcpy(&ub, &fb, sizeof ub);
+                pb[2 * c] = (uint16_t)(ua >> 16);
+                pb[2 * c + 1] = (uint16_t)(ub >> 16);
             }
         }
         const uint16_t *p0 = pv, *p2 = pv + 2 * tk;
@@ -435,26 +445,63 @@ static inline void k3_mxfp4_group_tile(float *y, int ystride,
         for (; m + 2 < batch; m += 3)
             matvec_bf16_8x3_pv_acc(acc[m], acc[m + 1], acc[m + 2],
                                     p0, p2, p4, p6,
-                                    x + (size_t)m * xstride + k0,
-                                    x + (size_t)(m + 1) * xstride + k0,
-                                    x + (size_t)(m + 2) * xstride + k0, klen);
+                                    x + (size_t)(token_ids ? token_ids[m] : m) * xstride + k0,
+                                    x + (size_t)(token_ids ? token_ids[m + 1] : m + 1) * xstride + k0,
+                                    x + (size_t)(token_ids ? token_ids[m + 2] : m + 2) * xstride + k0, klen);
         for (; m < batch; ++m)
             matvec_bf16_8row_pv_acc(acc[m], p0, p2, p4, p6,
-                                     x + (size_t)m * xstride + k0, klen);
+                                     x + (size_t)(token_ids ? token_ids[m] : m) * xstride + k0, klen);
     }
     for (int m = 0; m < batch; ++m)
         memcpy(y + (size_t)m * ystride, acc[m], 8 * sizeof(float));
 }
 #endif
 
+static inline int k3_mxfp4_scalar_enabled(void) {
+    static int scalar_mode = -1;
+    if (scalar_mode < 0) {
+        const char *env = getenv("K3_MXFP4_SCALAR");
+        scalar_mode = env && *env ? atoi(env) != 0 : 0;
+    }
+    return scalar_mode;
+}
+
 static inline void k3_mxfp4_group_batch(float *y, int ystride,
                                         const uint8_t *w, const uint8_t *s,
                                         const float *x, int xstride,
                                         int batch, int k, int tile_threshold) {
+    /* Debug escape hatch for semantic validation.  Native K3 expert weights
+     * are MXFP4, so the BF16/quant reference switches do not exercise them. */
+    if (k3_mxfp4_scalar_enabled()) {
+        size_t wr = (size_t)k / 2, sr = (size_t)k / 32;
+        for (int m = 0; m < batch; ++m) {
+            const float *xm = x + (size_t)m * xstride;
+            float *ym = y + (size_t)m * ystride;
+            for (int r = 0; r < 8; ++r) {
+                const uint8_t *wrp = w + (size_t)r * wr;
+                const uint8_t *srp = s + (size_t)r * sr;
+                double sum = 0.0;
+                for (int b = 0; b < k / 32; ++b) {
+                    /* compressed-tensors stores standard OCP E2M1
+                     * {0,.5,1,1.5,2,3,4,6}; ds4f's legacy table is 2x. */
+                    float scale = 0.5f * ggml_e8m0_to_fp32(srp[b]);
+                    for (int j = 0; j < 16; ++j) {
+                        uint8_t packed = wrp[(size_t)b * 16 + j];
+                        sum += (double)ds4f_kvalues_mxfp4_f32[packed & 15] *
+                               scale * xm[b * 32 + 2 * j];
+                        sum += (double)ds4f_kvalues_mxfp4_f32[packed >> 4] *
+                               scale * xm[b * 32 + 2 * j + 1];
+                    }
+                }
+                ym[r] = (float)sum;
+            }
+        }
+        return;
+    }
 #if defined(__ARM_FEATURE_SVE)
     if (tile_threshold > 0 && batch >= tile_threshold &&
         batch <= K3_MOE_MAX_BATCH) {
-        k3_mxfp4_group_tile(y, ystride, w, s, x, xstride, batch, k);
+        k3_mxfp4_group_tile(y, ystride, w, s, x, xstride, batch, k, NULL);
         return;
     }
 #else
@@ -574,7 +621,7 @@ static inline void k3_expert_tp_down_selected_sve(float *out,
         svuint32_t lo=svand_n_u32_x(pg,z,15),hi=svand_n_u32_x(pg,svlsr_n_u32_x(pg,z,4),15); \
         svfloat32_t p=svmul_f32_x(pg,svtbl_f32(kv,lo),xl); \
         p=svmla_f32_x(pg,p,svtbl_f32(kv,hi),xh); \
-        A=svmla_n_f32_x(pg,A,p,rw*k3_e8m0_tab[s[(size_t)(R)*sr]].f);}while(0)
+        A=svmla_n_f32_x(pg,A,p,0.5f*rw*k3_e8m0_tab[s[(size_t)(R)*sr]].f);}while(0)
         K3_TP_DOWN_ROW(0,a0);K3_TP_DOWN_ROW(1,a1);K3_TP_DOWN_ROW(2,a2);K3_TP_DOWN_ROW(3,a3);
         K3_TP_DOWN_ROW(4,a4);K3_TP_DOWN_ROW(5,a5);K3_TP_DOWN_ROW(6,a6);K3_TP_DOWN_ROW(7,a7);
 #undef K3_TP_DOWN_ROW
@@ -594,48 +641,66 @@ static inline void k3_expert_tp_down_routed_sve(float *out,
         const float *gate,int local,int row,int preweighted){
     svbool_t pg=svptrue_b32();svfloat32_t kv=svld1(pg,ds4f_kvalues_mxfp4_f32);
     svfloat32_t a0=svdup_f32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
+#if K3_TP_DOWN_ROWS >= 16
+    svfloat32_t a8=a0,a9=a0,a10=a0,a11=a0,a12=a0,a13=a0,a14=a0,a15=a0;
+#endif
     size_t wr=(size_t)local/2,sr=(size_t)local/32;
-    for(int k=0;k<topk;++k)for(int b=0;b<local;b+=K3_EXPERT_TP_BLOCK){int e=route_experts[k],pos=positions[k];
+    for(int k=0;k<topk;++k){
+        int e=route_experts[k],pos=positions[k];
+        float rw=preweighted?1.0f:route_weight[k];
+        for(int b=0;b<local;b+=K3_EXPERT_TP_BLOCK){
         const uint8_t*w=w2[e].packed+(size_t)row*wr+b/2;
         const uint8_t*s=w2[e].scale+(size_t)row*sr+b/32;
         const float*x=gate+(size_t)pos*local+b;
         svfloat32_t xl=svld1(pg,x),xh=svld1(pg,x+16);
-        float rw=preweighted?1.0f:route_weight[k];
 #define K3_TP_PREFILL_DOWN_ROW(R,A) do{svuint32_t z=svld1ub_u32(pg,w+(size_t)(R)*wr); \
         svuint32_t lo=svand_n_u32_x(pg,z,15),hi=svand_n_u32_x(pg,svlsr_n_u32_x(pg,z,4),15); \
         svfloat32_t p=svmul_f32_x(pg,svtbl_f32(kv,lo),xl); \
         p=svmla_f32_x(pg,p,svtbl_f32(kv,hi),xh); \
-        A=svmla_n_f32_x(pg,A,p,rw*k3_e8m0_tab[s[(size_t)(R)*sr]].f);}while(0)
+        A=svmla_n_f32_x(pg,A,p,0.5f*rw*k3_e8m0_tab[s[(size_t)(R)*sr]].f);}while(0)
         K3_TP_PREFILL_DOWN_ROW(0,a0);K3_TP_PREFILL_DOWN_ROW(1,a1);
         K3_TP_PREFILL_DOWN_ROW(2,a2);K3_TP_PREFILL_DOWN_ROW(3,a3);
         K3_TP_PREFILL_DOWN_ROW(4,a4);K3_TP_PREFILL_DOWN_ROW(5,a5);
         K3_TP_PREFILL_DOWN_ROW(6,a6);K3_TP_PREFILL_DOWN_ROW(7,a7);
+#if K3_TP_DOWN_ROWS >= 16
+        K3_TP_PREFILL_DOWN_ROW(8,a8);K3_TP_PREFILL_DOWN_ROW(9,a9);
+        K3_TP_PREFILL_DOWN_ROW(10,a10);K3_TP_PREFILL_DOWN_ROW(11,a11);
+        K3_TP_PREFILL_DOWN_ROW(12,a12);K3_TP_PREFILL_DOWN_ROW(13,a13);
+        K3_TP_PREFILL_DOWN_ROW(14,a14);K3_TP_PREFILL_DOWN_ROW(15,a15);
+#endif
 #undef K3_TP_PREFILL_DOWN_ROW
+        }
     }
     out[0]=svaddv(pg,a0);out[1]=svaddv(pg,a1);out[2]=svaddv(pg,a2);out[3]=svaddv(pg,a3);
     out[4]=svaddv(pg,a4);out[5]=svaddv(pg,a5);out[6]=svaddv(pg,a6);out[7]=svaddv(pg,a7);
+#if K3_TP_DOWN_ROWS >= 16
+    out[8]=svaddv(pg,a8);out[9]=svaddv(pg,a9);out[10]=svaddv(pg,a10);out[11]=svaddv(pg,a11);
+    out[12]=svaddv(pg,a12);out[13]=svaddv(pg,a13);out[14]=svaddv(pg,a14);out[15]=svaddv(pg,a15);
+#endif
 }
+
 #endif
 
 /* Expert-TP prefill over a token chunk. W1/W3 retain expert buckets so their
  * long-K weights are reused across routed tokens. W2 is fused by token/top-k,
  * eliminating the otherwise dominant expert-output materialization. Scratch:
  * counts[nexpert], offsets[nexpert+1], positions/token_ids[batch*topk],
- * gathered[batch*topk,7168], gate/up[batch*topk,local]. */
+ * gate/up[batch*topk,local]. */
 static inline int k3_expert_tp_prefill_mxfp4(float *partial,
         const k3_mxfp4_matrix *w1,const k3_mxfp4_matrix *w2,
         const k3_mxfp4_matrix *w3,int nexpert,const int *route_experts,
         const float *route_weight,int batch,int topk,const float *latent,
-        int *counts,int *offsets,int *positions,int *token_ids,float *gathered,
+        int *counts,int *offsets,int *positions,int *token_ids,
         float *gate,float *up,int threads,int tile_threshold){
     if(!partial||!route_experts||!route_weight||!latent||!counts||!offsets||
-        !positions||!token_ids||!gathered||!gate||!up||nexpert<1||nexpert>4096||
+        !positions||!token_ids||!gate||!up||nexpert<1||nexpert>4096||
         batch<1||topk<1||topk>nexpert||batch>INT_MAX/topk||threads<1||
         !k3_expert_tp_selected_layout_valid(w1,w2,w3,nexpert))return-1;
-    /* At 1K, expert buckets average ~18 tokens.  The live 12-rank sweep put
-     * threshold 4 at 5,972 critical-rank tok/s versus 5,863 for threshold 8.
-     * Smaller chunks retain 8: threshold 4 regressed M=64/256. */
-    if(batch>=1024&&tile_threshold==8)tile_threshold=4;
+    /* At 1K, expert buckets average ~18 tokens.  After eliminating the
+     * activation gather, threshold 6 won the controlled live sweep while
+     * preserving the exact hidden hash. Smaller chunks retain the caller's
+     * setting because their buckets are too small to amortize the tile. */
+    if(batch>=1024&&tile_threshold==8)tile_threshold=6;
     int local=w1[0].rows;if(local<K3_EXPERT_TP_BLOCK||local%K3_EXPERT_TP_BLOCK)return-1;
     memset(counts,0,(size_t)nexpert*sizeof(*counts));
     for(int i=0;i<batch*topk;++i){int e=route_experts[i];if(e<0||e>=nexpert)return-1;counts[e]++;}
@@ -643,35 +708,63 @@ static inline int k3_expert_tp_prefill_mxfp4(float *partial,
     int cursor[nexpert];memcpy(cursor,offsets,(size_t)nexpert*sizeof(*cursor));
     for(int i=0;i<batch*topk;++i){int pos=cursor[route_experts[i]]++;positions[i]=pos;token_ids[pos]=i/topk;}
 #if defined(_OPENMP)
+    int trace = getenv("K3_PREFILL_EXPERT_TRACE") != NULL;
+    double trace_start = 0.0;
     omp_set_num_threads(threads);
 #pragma omp parallel
     {
-#pragma omp for schedule(static)
+#pragma omp single
+        if (trace) trace_start = omp_get_wtime();
+#pragma omp barrier
+#else
+    int trace = 0;
+    double trace_start = 0.0;
 #endif
-    for(int i=0;i<batch*topk;++i){int e=route_experts[i];if(tile_threshold>0&&counts[e]>=tile_threshold)
-        memcpy(gathered+(size_t)positions[i]*K3_LATENT,
-            latent+(size_t)(i/topk)*K3_LATENT,(size_t)K3_LATENT*sizeof(float));}
+    /* Tiled buckets read latent rows through token_ids directly; no large
+     * gathered[] copy is needed before W1/W3. */
+    if (trace && omp_get_thread_num() == 0)
+        fprintf(stderr, "K3_EXPERT_TRACE gather_ms=%.3f\n",
+                (omp_get_wtime() - trace_start) * 1000.0);
     int g13=local/8;
 #if defined(_OPENMP)
+#if K3_EXPERT_PREFILL_DYNAMIC
+#pragma omp for schedule(dynamic,1)
+#else
 #pragma omp for schedule(static)
+#endif
 #endif
     for(int task=0;task<nexpert*g13;++task){int e=task/g13,r=(task%g13)*8,m=counts[e];if(!m)continue;
         size_t wr=(size_t)K3_LATENT/2,sr=(size_t)K3_LATENT/32;
         float*g=gate+(size_t)offsets[e]*local+r,*u=up+(size_t)offsets[e]*local+r;
-        if(tile_threshold>0&&m>=tile_threshold){const float*x=gathered+(size_t)offsets[e]*K3_LATENT;
+        if(tile_threshold>0&&m>=tile_threshold){
+#if defined(__ARM_FEATURE_SVE)
+            const int *ids=token_ids+offsets[e];
+            k3_mxfp4_group_tile(g,local,w1[e].packed+(size_t)r*wr,
+                w1[e].scale+(size_t)r*sr,latent,K3_LATENT,m,K3_LATENT,ids);
+            k3_mxfp4_group_tile(u,local,w3[e].packed+(size_t)r*wr,
+                w3[e].scale+(size_t)r*sr,latent,K3_LATENT,m,K3_LATENT,ids);
+#else
             k3_mxfp4_group_batch(g,local,w1[e].packed+(size_t)r*wr,
-                w1[e].scale+(size_t)r*sr,x,K3_LATENT,m,K3_LATENT,tile_threshold);
+                w1[e].scale+(size_t)r*sr,latent,K3_LATENT,m,K3_LATENT,tile_threshold);
             k3_mxfp4_group_batch(u,local,w3[e].packed+(size_t)r*wr,
-                w3[e].scale+(size_t)r*sr,x,K3_LATENT,m,K3_LATENT,tile_threshold);
+                w3[e].scale+(size_t)r*sr,latent,K3_LATENT,m,K3_LATENT,tile_threshold);
+#endif
         }else{const int*ids=token_ids+offsets[e];
             k3_mxfp4_group_svtbl_indexed(g,local,w1[e].packed+(size_t)r*wr,
                 w1[e].scale+(size_t)r*sr,latent,K3_LATENT,ids,m,K3_LATENT);
-            k3_mxfp4_group_svtbl_indexed(u,local,w3[e].packed+(size_t)r*wr,
+                k3_mxfp4_group_svtbl_indexed(u,local,w3[e].packed+(size_t)r*wr,
                 w3[e].scale+(size_t)r*sr,latent,K3_LATENT,ids,m,K3_LATENT);}}
+    if (trace && omp_get_thread_num() == 0)
+        fprintf(stderr, "K3_EXPERT_TRACE gateup_ms=%.3f\n",
+                (omp_get_wtime() - trace_start) * 1000.0);
 #if defined(__ARM_FEATURE_SVE) && K3_SITU_FEXPA
     {int total=batch*topk*local,vl=(int)svcntw();
 #if defined(_OPENMP)
+#if K3_EXPERT_PREFILL_DYNAMIC
+#pragma omp for schedule(dynamic,1)
+#else
 #pragma omp for schedule(static)
+#endif
 #endif
     for(int i=0;i<total;i+=vl)k3_situ_fast_sve(gate+i,gate+i,up+i,total-i<vl?total-i:vl);}
 #else
@@ -681,6 +774,9 @@ static inline int k3_expert_tp_prefill_mxfp4(float *partial,
     for(int i=0;i<batch*topk*local;++i)gate[i]=4.0f*tanhf(gate[i]*.25f)*
         k3_sigmoidf(gate[i])*25.0f*tanhf(up[i]*.04f);
 #endif
+    if (trace && omp_get_thread_num() == 0)
+        fprintf(stderr, "K3_EXPERT_TRACE situ_ms=%.3f\n",
+                (omp_get_wtime() - trace_start) * 1000.0);
     int preweighted=batch>=1024;
     if(preweighted){
 #if defined(_OPENMP)
@@ -695,16 +791,23 @@ static inline int k3_expert_tp_prefill_mxfp4(float *partial,
             for(int j=0;j<local;++j)x[j]*=rw;
 #endif
         }
+        if (trace && omp_get_thread_num() == 0)
+            fprintf(stderr, "K3_EXPERT_TRACE weight_ms=%.3f\n",
+                    (omp_get_wtime() - trace_start) * 1000.0);
     }
-    int g2=K3_LATENT/8;
+    int g2=K3_LATENT/K3_TP_DOWN_ROWS;
 #if defined(__ARM_FEATURE_SVE)
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
-    for(int task=0;task<batch*g2;++task){int t=task/g2,row=(task%g2)*8;
+    for(int task=0;task<batch*g2;++task){int t=task/g2,row=(task%g2)*K3_TP_DOWN_ROWS;
         k3_expert_tp_down_routed_sve(partial+(size_t)t*K3_LATENT+row,w2,
             route_experts+(size_t)t*topk,positions+(size_t)t*topk,
             route_weight+(size_t)t*topk,topk,gate,local,row,preweighted);}
+    if (trace && omp_get_thread_num() == 0)
+        fprintf(stderr, "K3_EXPERT_TRACE down_ms=%.3f total_ms=%.3f\n",
+                (omp_get_wtime() - trace_start) * 1000.0,
+                (omp_get_wtime() - trace_start) * 1000.0);
 #else
     (void)partial;return-1;
 #endif
@@ -750,7 +853,8 @@ static inline void k3_expert_tp_forward_selected_team_mxfp4(
 #endif
     for(int gr=0;gr<g2;++gr){int r=gr*8;
 #if defined(__ARM_FEATURE_SVE) && K3_TP_FUSED_DOWN32
-        if(local%K3_EXPERT_TP_BLOCK==0){k3_expert_tp_down_selected_sve(latent_partial+r,
+        if(!k3_mxfp4_scalar_enabled() && local%K3_EXPERT_TP_BLOCK==0){
+            k3_expert_tp_down_selected_sve(latent_partial+r,
                 w2_packed,w2_scale,gate,route_weight,selected,local,r);continue;}
 #endif
         float sum[8]={0},tmp[8];

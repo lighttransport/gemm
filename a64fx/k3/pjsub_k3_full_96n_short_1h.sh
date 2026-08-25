@@ -37,7 +37,7 @@ NODES=96
 THREADS=47
 PREFILL_TOKENS=256
 NEW_TOKENS=256
-PREFILL_CHUNK=64
+PREFILL_CHUNK=1024
 BARRIER_ITERS=128
 COMM_DETERMINISTIC=1
 COMM_BF16=0
@@ -67,12 +67,13 @@ usage: pjsub_k3_full_96n_short_1h.sh [options]
   --prefill-chunk N --barrier-iters N --ar-groups N
   --comm-deterministic 0|1 --comm-bf16 0|1 --comm-robust N
   --comm-poll-spins N --comm-a2a 0|1 --comm-a2a-max N
-  --prefetch-mib N --stage-chunk-mib N --stage-dir DIR
+  --prefetch-mib N --stage-chunk-mib N --stage-limit-seconds N --stage-dir DIR
   --profile --expert-tp --moe-shard-layout replicated|row-aligned
 EOF
 }
 need_arg() { (($# >= 2)) || { echo "$0: $1 requires an argument" >&2; usage; exit 2; }; }
 CHUNK_MIB=32
+STAGE_LIMIT_SECONDS=${K3_STAGE_LIMIT_SECONDS:-5400}
 while (($#)); do
     case "$1" in
         --model-dir) need_arg "$@"; MODEL_DIR=$2; shift 2;;
@@ -90,6 +91,7 @@ while (($#)); do
         --comm-a2a-max) need_arg "$@"; COMM_A2A_MAX=$2; shift 2;;
         --prefetch-mib) need_arg "$@"; PREFETCH_MIB=$2; shift 2;;
         --stage-chunk-mib) need_arg "$@"; CHUNK_MIB=$2; shift 2;;
+        --stage-limit-seconds) need_arg "$@"; STAGE_LIMIT_SECONDS=$2; shift 2;;
         --stage-dir) need_arg "$@"; STAGE_DIR=$2; shift 2;;
         --profile) PROFILE=1; shift;;
         --expert-tp) EXPERT_TP=1; shift;;
@@ -102,6 +104,13 @@ case "$MOE_SHARD_LAYOUT" in
     replicated|row-aligned) ;;
     *) echo "$0: invalid --moe-shard-layout '$MOE_SHARD_LAYOUT'" >&2; exit 2;;
 esac
+case "$STAGE_LIMIT_SECONDS" in
+    ''|*[!0-9]*) echo "$0: invalid stage limit '$STAGE_LIMIT_SECONDS'" >&2; exit 2;;
+esac
+if ((STAGE_LIMIT_SECONDS < 1)); then
+    echo "$0: stage limit must be positive" >&2
+    exit 2
+fi
 
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:$PATH"
 export OMP_NUM_THREADS="$THREADS" OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLACES=cores
@@ -112,6 +121,13 @@ export OMP_NUM_THREADS="$THREADS" OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLAC
 export OMP_WAIT_POLICY=active KMP_BLOCKTIME=infinite
 export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
 export K3_PYTHON="$K3/.venv-$(uname -m)/bin/python"
+# At 96 nodes, dense BF16 TP shards can be confined to one CMG. Replication
+# avoids the resulting cross-CMG read bottleneck; disable explicitly if memory
+# headroom is insufficient (about 4.14 GiB/rank for the full 93-layer image).
+export K3_CMG_REPLICATE=${K3_CMG_REPLICATE:-1}
+export K3_MLA_FLASH8=${K3_MLA_FLASH8:-1} K3_MLA_QK_MODE=${K3_MLA_QK_MODE:-auto}
+export K3_COMM_ASYNC_LATENT=${K3_COMM_ASYNC_LATENT:-1}
+export K3_PREFILL_PIPELINE=${K3_PREFILL_PIPELINE:-on}
 
 [[ ! -e "$ROOT" ]] || { echo "$0: result root exists: $ROOT" >&2; exit 2; }
 mkdir -p "$ROOT"
@@ -122,6 +138,8 @@ printf 'K3_FULL_CONFIG nodes=%s threads=%s barrier_iters=%s comm_deterministic=%
 printf 'prefill_tokens=%s new_tokens=%s prefill_chunk=%s\n' \
     "$PREFILL_TOKENS" "$NEW_TOKENS" "$PREFILL_CHUNK" | tee -a "$ROOT/config.txt"
 printf 'stage_dir=%s ar_groups=%s moe_shard_layout=%s\n' "$STAGE_DIR" "$AR_GROUPS" "$MOE_SHARD_LAYOUT" | tee -a "$ROOT/config.txt"
+printf 'cmg_replicate=%s\n' "$K3_CMG_REPLICATE" | tee -a "$ROOT/config.txt"
+printf 'stage_limit_seconds=%s\n' "$STAGE_LIMIT_SECONDS" | tee -a "$ROOT/config.txt"
 "$K3/k3_setup_python.sh"
 
 stage_begin() {
@@ -170,8 +188,9 @@ stage_begin full_weight_staging
 # 8 MiB chunks moved ~16 GB/rank in 2885 s (~5.6 MB/s) in job 49931198, far
 # under what LLIO can do.  Larger chunks are the cheapest thing to try; the
 # stage_timing row is what tells us whether it helped.
-mpiexec -np "$NODES" -of-proc "$ROOT/stage.rank" sh -c \
-    "exec '$K3/run_k3_full_stage_rank.sh' '$MODEL_DIR' '$STAGE_DIR' '$NODES' \"\${PMIX_RANK:-\${OMPI_COMM_WORLD_RANK:-\${PMI_RANK:?no MPI rank}}}\" full96 '' '$EXPERT_TP' '$MOE_SHARD_LAYOUT' '$CHUNK_MIB'"
+timeout --signal=TERM --kill-after=60 "$STAGE_LIMIT_SECONDS" \
+    mpiexec -np "$NODES" -of-proc "$ROOT/stage.rank" sh -c \
+        "exec '$K3/run_k3_full_stage_rank.sh' '$MODEL_DIR' '$STAGE_DIR' '$NODES' \"\${PMIX_RANK:-\${OMPI_COMM_WORLD_RANK:-\${PJM_MPI_RANK:?no MPI rank}}}\" full96 '' '$EXPERT_TP' '$MOE_SHARD_LAYOUT' '$CHUNK_MIB'"
 stage_end 0
 
 stage_begin full_short_generation
@@ -181,7 +200,7 @@ mpiexec -np "$NODES" -of-proc "$ROOT/run.rank" \
     "$K3/k3_full_runner" --mode full96 --stage-dir "$STAGE_DIR" \
     --topo "$ROOT/tofu_topo.txt" --prompt-ids "$ROOT/prompt.ids" \
     --output "$ROOT/output.txt" --prefill-tokens "$PREFILL_TOKENS" \
-    --new-tokens "$NEW_TOKENS" --prefill-chunk "$PREFILL_CHUNK" \
+        --new-tokens "$NEW_TOKENS" --prefill-chunk "$PREFILL_CHUNK" --prefill-path batched \
     --max-seq "$((PREFILL_TOKENS + NEW_TOKENS))" --threads "$THREADS" \
     --comm-deterministic "$COMM_DETERMINISTIC" --comm-bf16 "$COMM_BF16" \
     --comm-robust "$COMM_ROBUST" --comm-poll-spins "$COMM_POLL_SPINS" \

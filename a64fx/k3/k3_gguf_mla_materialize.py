@@ -67,8 +67,9 @@ def split_range(total, rank, nodes):
     base, rem = divmod(total, nodes)
     return rank * base + min(rank, rem), base + (rank < rem)
 
-def materialize_combined(krec, vrec, out_path, head_start=0, head_count=None):
-    """Write native [heads*256, 512] BF16 rows: K-head then V-head."""
+def materialize_combined_into(krec, vrec, dst, head_start=0, head_count=None,
+                              dtype="BF16"):
+    """Write native [heads*256, 512] rows: K-head then V-head."""
     if krec["type"] != "Q8_0" or vrec["type"] != "Q8_0":
         raise ValueError("MLA K/V materialization currently requires Q8_0")
     if tuple(krec["dims"]) != (128, 512, 96) or tuple(vrec["dims"]) != (512, 128, 96):
@@ -81,9 +82,18 @@ def materialize_combined(krec, vrec, out_path, head_start=0, head_count=None):
         head_count = heads - head_start
     if head_start < 0 or head_count < 0 or head_start + head_count > heads:
         raise ValueError("invalid head range")
+    if dtype not in ("BF16", "F32"):
+        raise ValueError("unsupported MLA materialization dtype %s" % dtype)
+
+    def write_row(values):
+        if dtype == "BF16":
+            dst.write(struct.pack("<%dH" % len(values),
+                                  *(bf16(x) for x in values)))
+        else:
+            dst.write(struct.pack("<%df" % len(values), *values))
+
     with open(krec["source"], "rb", buffering=0) as ksrc, \
-         open(vrec["source"], "rb", buffering=0) as vsrc, \
-         open(out_path, "wb") as dst:
+         open(vrec["source"], "rb", buffering=0) as vsrc:
         for h in range(head_start, head_start + head_count):
             kb = krec["data_start"] + h * krows * krec["row_bytes"]
             vb = vrec["data_start"] + h * vrows * vrec["row_bytes"]
@@ -96,11 +106,17 @@ def materialize_combined(krec, vrec, out_path, head_start=0, head_count=None):
             kplane = [read_q8_row(kdata, i * krec["row_bytes"], kcols)
                       for i in range(krows)]
             for o in range(kcols):
-                dst.write(struct.pack("<%dH" % krows,
-                                      *(bf16(kplane[i][o]) for i in range(krows))))
+                write_row([kplane[i][o] for i in range(krows)])
             for i in range(vrows):
                 row = read_q8_row(vdata, i * vrec["row_bytes"], vcols)
-                dst.write(struct.pack("<%dH" % vcols, *(bf16(x) for x in row)))
+                write_row(row)
+
+def materialize_combined(krec, vrec, out_path, head_start=0, head_count=None,
+                         dtype="BF16"):
+    """Materialize native combined K/V rows to a standalone file."""
+    with open(out_path, "wb") as dst:
+        materialize_combined_into(krec, vrec, dst, head_start, head_count,
+                                  dtype)
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)

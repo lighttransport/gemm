@@ -6,8 +6,9 @@ model_dir=$HOME/models/kimi-k3
 layer=0
 head=0
 stage_root=/tmp
+trace=
 usage() {
-    echo "usage: $0 [--model-dir DIR] [--layer N] [--head N] [--stage-root DIR]" >&2
+    echo "usage: $0 [--model-dir DIR] [--layer N] [--head N] [--stage-root DIR] [--trace FILE]" >&2
 }
 need_value() {
     if [ "$#" -lt 2 ]; then
@@ -22,6 +23,7 @@ while [ "$#" -gt 0 ]; do
         --layer) need_value "$@"; layer=$2; shift 2 ;;
         --head) need_value "$@"; head=$2; shift 2 ;;
         --stage-root) need_value "$@"; stage_root=$2; shift 2 ;;
+        --trace) need_value "$@"; trace=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "$0: unknown argument: $1" >&2; usage; exit 2 ;;
     esac
@@ -44,5 +46,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$script_dir/k3_kda_stage.py" \
 
 stem="layer$(printf '%02d' "$layer")_head$(printf '%02d' "$head")"
 export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
-OMP_PROC_BIND=close OMP_PLACES=cores "$script_dir/k3_kda_probe" \
-    "$stage_dir/$stem.blob" "$stage_dir/$stem.manifest"
+if [ -n "$trace" ]; then
+    OMP_PROC_BIND=close OMP_PLACES=cores "$script_dir/k3_kda_probe" \
+        "$stage_dir/$stem.blob" "$stage_dir/$stem.manifest" "$trace"
+else
+    OMP_PROC_BIND=close OMP_PLACES=cores "$script_dir/k3_kda_probe" \
+        "$stage_dir/$stem.blob" "$stage_dir/$stem.manifest"
+fi

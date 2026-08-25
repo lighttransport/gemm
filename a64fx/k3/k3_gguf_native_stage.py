@@ -4,11 +4,15 @@ from __future__ import print_function
 
 import argparse
 import os
+import re
 from pathlib import Path
 
 from k3_gguf_stage import ALIGN, TYPE_INFO, discover
+from k3_gguf_mla_materialize import materialize_combined_into
 
 LAYERS = 93
+EXPERT_INTER = 3072
+IQ_BLOCK = 256
 MLA = {3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47,
        51, 55, 59, 63, 67, 71, 75, 79, 83, 87, 91, 92}
 
@@ -25,7 +29,15 @@ def plan(model_dir, nodes):
     _, all_records, split_count = discover(model_dir)
     records = {r["name"]: r for r in all_records}
     out = []
-    for name in ("token_embd.weight", "output.weight", "output_norm.weight"):
+    # Full-model native images keep vocabulary rows local to the owning rank;
+    # the final norm is replicated.  These names match k3_full_runner.c.
+    for g, n, mode in (("token_embd.weight", "language_model.model.embed_tokens.weight", "head-rows"),
+                       ("output.weight", "language_model.lm_head.weight", "head-rows"),
+                       ("output_norm.weight", "language_model.model.norm.weight", "full"),
+                       ("output_res_score.weight", "language_model.model.output_attn_res_norm.weight", "full")):
+        add(out, records, g, n, mode, "global")
+    for name in ("token_embd.weight", "output.weight", "output_norm.weight",
+                 "output_res_score.weight"):
         if name not in records:
             raise ValueError("missing global tensor %s" % name)
     for l in range(LAYERS):
@@ -86,9 +98,12 @@ def plan(model_dir, nodes):
                 ("ffn_down_shexp.weight", "block_sparse_moe.shared_experts.down_proj.weight", "cols"),
             ):
                 add(out, records, p + g, native_name(l, n), mode, "moe")
-            for g, tag in (("ffn_up_exps.weight", "w1"),
+            # Native expert kernels follow the checkpoint convention:
+            # w1=gate, w2=down, w3=up.  SiTU is asymmetric, so swapping the
+            # equally-shaped gate/up planes is a silent but severe quality bug.
+            for g, tag in (("ffn_gate_exps.weight", "w1"),
                            ("ffn_down_exps.weight", "w2"),
-                           ("ffn_gate_exps.weight", "w3")):
+                           ("ffn_up_exps.weight", "w3")):
                 add(out, records, p + g,
                     native_name(l, "block_sparse_moe.experts.<id>.%s.weight_quant" % tag),
                     "expert-slice", "iq-expert")
@@ -104,6 +119,12 @@ def split_groups(total, rank, nodes, group):
                          (total, group))
     first, count = split_dim(total // group, rank, nodes)
     return first * group, count * group
+
+def validate_expert_tp_nodes(nodes):
+    """Require every IQ W2 column slice to contain complete 256-value blocks."""
+    if EXPERT_INTER % nodes or (EXPERT_INTER // nodes) % IQ_BLOCK:
+        raise ValueError("IQ expert TP requires 3072/nodes to be a multiple "
+                         "of 256 (nodes must divide 12), got nodes=%d" % nodes)
 
 def native_shape(rec):
     dims = tuple(rec["dims"])
@@ -131,13 +152,14 @@ def stage_layer(model_dir, output_dir, nodes, rank, layer, force=False,
     _, all_records, _ = discover(model_dir)
     records = {r["name"]: r for r in all_records}
     items, _ = plan(model_dir, nodes)
-    prefix = "language_model.model.layers.%d." % layer
-    items = [x for x in items if x[0].startswith(prefix)]
+    if layer is not None:
+        prefix = "language_model.model.layers.%d." % layer
+        items = [x for x in items if x[0].startswith(prefix)]
+        # Layer debug images do not need global tensors.
+        items = [x for x in items if ".model.embed_tokens." not in x[0] and
+                 ".lm_head." not in x[0] and ".model.norm." not in x[0]]
     if not items:
         raise ValueError("no native items for layer %d" % layer)
-    if any(x[5] == "mla" for x in items):
-        raise ValueError("executable MLA transpose staging is not implemented")
-
     # GGUF has one residual-score vector for each join.  The safetensor graph
     # names its two multiplicands separately; alias the same immutable payload
     # so full_attn_res can execute the native graph without fabricating data.
@@ -147,6 +169,9 @@ def stage_layer(model_dir, output_dir, nodes, rank, layer, force=False,
             aliases.append((native.replace("_norm.weight", "_proj.weight"),
                             gguf, mode, dims, typ, detail))
         if native.endswith("mlp_res_norm.weight"):
+            aliases.append((native.replace("_norm.weight", "_proj.weight"),
+                            gguf, mode, dims, typ, detail))
+        if native.endswith("output_attn_res_norm.weight"):
             aliases.append((native.replace("_norm.weight", "_proj.weight"),
                             gguf, mode, dims, typ, detail))
     items += aliases
@@ -163,7 +188,32 @@ def stage_layer(model_dir, output_dir, nodes, rank, layer, force=False,
     pos = 0
     with open(str(blob_tmp), "wb", buffering=0) as out:
         try:
+            mla_layers = sorted(set(int(x[0].split(".")[3]) for x in items
+                                    if x[2] == "mla-transpose-dequant"))
+            for mla_layer in mla_layers:
+                mla_parts = [x for x in items if x[2] == "mla-transpose-dequant" and
+                             x[0].startswith("language_model.model.layers.%d." % mla_layer)]
+                if len(mla_parts) != 2:
+                    raise ValueError("MLA staging requires exactly one K/V pair")
+                by_gguf = {x[1]: records[x[1]] for x in mla_parts}
+                kname = "blk.%d.attn_k_b.weight" % mla_layer
+                vname = "blk.%d.attn_v_b.weight" % mla_layer
+                if kname not in by_gguf or vname not in by_gguf:
+                    raise ValueError("MLA staging could not identify K/V tensors")
+                first, count = split_dim(96, rank, nodes)
+                pos = (pos + ALIGN - 1) // ALIGN * ALIGN
+                if out.tell() < pos:
+                    out.write(b"\0" * (pos - out.tell()))
+                begin = pos
+                materialize_combined_into(by_gguf[kname], by_gguf[vname], out,
+                                          first, count, "F32")
+                pos = out.tell()
+                name = native_name(mla_layer, "self_attn.kv_b_proj.weight")
+                entries.append((begin, pos - begin, "F32",
+                                (count * 256, 512), name))
             for native, gguf, mode, _, _, detail in items:
+                if mode == "mla-transpose-dequant":
+                    continue
                 rec = records[gguf]
                 if mode == "expert-slice":
                     cols, rows, experts = rec["dims"]
@@ -279,10 +329,13 @@ def stage_layer(model_dir, output_dir, nodes, rank, layer, force=False,
         os.fsync(out.fileno())
     entries.sort(key=lambda x: x[4])
     with open(str(manifest_tmp), "w") as out:
-        stage_mode = "layer12-iq-expert-tp" if expert_tp else "layer12-iq"
-        out.write("# K3FULLV3 mode=%s rank=%d nodes=%d layer_index=%d "
-                  "tensors=%d blob_bytes=%d\n" %
-                  (stage_mode, rank, nodes, layer, len(entries), pos))
+        stage_mode = (("layer12-iq-expert-tp" if expert_tp else "layer12-iq")
+                      if layer is not None else
+                      ("full96-iq-expert-tp" if expert_tp else "full96-iq"))
+        out.write("# K3FULLV3 mode=%s rank=%s nodes=%s layer_index=%s "
+                  "tensors=%s blob_bytes=%s expert_roles=gate-w1-up-w3\n" %
+                  (stage_mode, rank, nodes, -1 if layer is None else layer,
+                   len(entries), pos))
         for off, size, typ, shape, name in entries:
             out.write("%d %d %s %d %s %s\n" %
                       (off, size, typ, len(shape),
@@ -292,28 +345,144 @@ def stage_layer(model_dir, output_dir, nodes, rank, layer, force=False,
     os.replace(str(blob_tmp), str(blob))
     os.replace(str(manifest_tmp), str(manifest))
 
+def fix_expert_roles(output_dir, rank):
+    """Repair pre-fix native manifests without rewriting their large blobs.
+
+    Old stages put the up plane under w1 and gate under w3.  Their shape,
+    dtype, and byte size are identical, so swapping only the two manifest
+    names is exact and leaves all blob offsets valid.
+    """
+    manifest = output_dir / ("rank%03d.manifest" % rank)
+    if not manifest.exists():
+        raise ValueError("missing existing manifest for rank %d" % rank)
+    lines = manifest.read_text().splitlines()
+    if not lines or not lines[0].startswith("# K3FULLV3"):
+        raise ValueError("unrecognized manifest %s" % manifest)
+    marker = "expert_roles=gate-w1-up-w3"
+    if marker in lines[0]:
+        return False
+    w1 = ".w1.weight_quant"
+    w3 = ".w3.weight_quant"
+    seen1 = sum(w1 in line for line in lines[1:])
+    seen3 = sum(w3 in line for line in lines[1:])
+    if not seen1 or seen1 != seen3:
+        raise ValueError("manifest has inconsistent expert roles: w1=%d w3=%d" %
+                         (seen1, seen3))
+    repaired = [lines[0] + " " + marker]
+    for line in lines[1:]:
+        if w1 in line:
+            line = line.replace(w1, w3)
+        elif w3 in line:
+            line = line.replace(w3, w1)
+        repaired.append(line)
+    manifest_tmp = Path(str(manifest) + ".tmp")
+    with open(str(manifest_tmp), "w") as out:
+        for line in repaired:
+            out.write(line + "\n")
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(str(manifest_tmp), str(manifest))
+    return True
+
+def augment_output_res_score(model_dir, output_dir, rank):
+    """Append the final fused residual score to an existing full stage.
+
+    This is deliberately tiny (two 28 KiB F32 payloads) and avoids a costly
+    full-model restage when upgrading older native GGUF images.
+    """
+    _, all_records, _ = discover(model_dir)
+    records = {r["name"]: r for r in all_records}
+    rec = records.get("output_res_score.weight")
+    if rec is None:
+        raise ValueError("missing output_res_score.weight")
+    blob = output_dir / ("rank%03d.blob" % rank)
+    manifest = output_dir / ("rank%03d.manifest" % rank)
+    if not blob.exists() or not manifest.exists():
+        raise ValueError("missing existing full stage for rank %d" % rank)
+    lines = manifest.read_text().splitlines()
+    names = {line.rsplit(" ", 1)[-1] for line in lines[1:] if line and not line.startswith("#")}
+    wanted = ("language_model.model.output_attn_res_norm.weight",
+              "language_model.model.output_attn_res_proj.weight")
+    if all(name in names for name in wanted):
+        return
+    if any(name in names for name in wanted):
+        raise ValueError("partial output residual stage for rank %d" % rank)
+    pos = blob.stat().st_size
+    entries = []
+    with open(blob, "ab", buffering=0) as out, open(rec["source"], "rb", buffering=0) as src:
+        for name in wanted:
+            pos = (pos + ALIGN - 1) // ALIGN * ALIGN
+            if out.tell() < pos:
+                out.write(b"\0" * (pos - out.tell()))
+            begin = pos
+            _copy(src, out, rec["data_start"], rec["nbytes"])
+            pos += rec["nbytes"]
+            entries.append((begin, rec["nbytes"], rec["type"], (7168,), name))
+        out.flush()
+        os.fsync(out.fileno())
+    header = lines[0]
+    tensors = re.search(r"tensors=(\d+)", header)
+    if not tensors:
+        raise ValueError("unrecognized manifest header: %r" % header)
+    header = header.replace("tensors=" + tensors.group(1),
+                            "tensors=" + str(int(tensors.group(1)) + len(entries)))
+    header = re.sub(r"blob_bytes=\d+", "blob_bytes=" + str(pos), header)
+    manifest_tmp = Path(str(manifest) + ".tmp")
+    with open(manifest_tmp, "w") as out:
+        out.write(header + "\n")
+        for line in lines[1:]:
+            out.write(line + "\n")
+        for off, size, typ, shape, name in entries:
+            out.write("%d %d %s %d %s %s\n" %
+                      (off, size, typ, len(shape), " ".join(map(str, shape)), name))
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(str(manifest_tmp), str(manifest))
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("model_dir", type=Path)
     ap.add_argument("--nodes", type=int, default=12)
     ap.add_argument("--rank", type=int)
     ap.add_argument("--layer", type=int, default=1)
+    ap.add_argument("--full", action="store_true",
+                    help="stage all globals and all 93 layers in one rank image")
     ap.add_argument("--output-dir", type=Path)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--expert-tp", action="store_true",
                     help="stage every expert with a 1/nodes intermediate slice")
+    ap.add_argument("--augment-output-res-score", action="store_true",
+                    help="append missing final residual score to an existing full stage")
+    ap.add_argument("--fix-expert-roles", action="store_true",
+                    help="swap old GGUF-native w1/w3 manifest labels without rewriting blobs")
     args = ap.parse_args()
     if args.nodes <= 0 or 96 % args.nodes:
         raise ValueError("nodes must divide 96 heads")
+    if args.expert_tp:
+        validate_expert_tp_nodes(args.nodes)
     if args.output_dir is not None:
         if args.rank is None or not 0 <= args.rank < args.nodes:
             raise ValueError("--rank is required and must be in [0,nodes)")
+        if args.fix_expert_roles:
+            changed = fix_expert_roles(args.output_dir, args.rank)
+            print("K3_GGUF_NATIVE_STAGE PASS fix-expert-roles rank=%d changed=%d output=%s" %
+                  (args.rank, int(changed), args.output_dir))
+            return
+        if args.augment_output_res_score:
+            if not args.full:
+                raise ValueError("--augment-output-res-score requires --full")
+            augment_output_res_score(args.model_dir, args.output_dir, args.rank)
+            print("K3_GGUF_NATIVE_STAGE PASS augment-output-res-score rank=%d output=%s" %
+                  (args.rank, args.output_dir))
+            return
         if not 0 <= args.layer < LAYERS:
             raise ValueError("layer is out of range")
+        layer = None if args.full else args.layer
         stage_layer(args.model_dir, args.output_dir, args.nodes, args.rank,
-                    args.layer, args.force, args.expert_tp)
-        print("K3_GGUF_NATIVE_STAGE PASS layer=%d rank=%d nodes=%d output=%s" %
-              (args.layer, args.rank, args.nodes, args.output_dir))
+                    layer, args.force, args.expert_tp)
+        label = "full" if layer is None else "layer=%d" % layer
+        print("K3_GGUF_NATIVE_STAGE PASS %s rank=%d nodes=%d output=%s" %
+              (label, args.rank, args.nodes, args.output_dir))
         return 0
     items, split_count = plan(args.model_dir, args.nodes)
     counts = {}

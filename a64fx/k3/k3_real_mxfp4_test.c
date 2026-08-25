@@ -12,6 +12,7 @@
 
 #include "k3_kernels.h"
 #include "ggml_dequant.h"
+#include "k3_moe.h"
 
 typedef struct {
     uint64_t offset, nbytes, rows, cols;
@@ -39,9 +40,8 @@ static int load_manifest(const char *path, tensor_entry *entries, int capacity) 
         unsigned long long off, bytes, rows, cols;
         int n = sscanf(line, "%llu %llu %15s %d %llu %llu %511s",
                        &off, &bytes, e.dtype, &ndims, &rows, &cols, e.name);
-        if (n != 7 || ndims != 2 || count >= capacity) {
-            fclose(f); return -1;
-        }
+        if (n != 7 || ndims != 2) continue;
+        if (count >= capacity) { fclose(f); return -1; }
         e.offset = off; e.nbytes = bytes; e.rows = rows; e.cols = cols;
         entries[count++] = e;
     }
@@ -69,11 +69,13 @@ static float random_float(void) { return ((rng_next() >> 40) / 8388608.0f) - 1.0
 static float mxfp4_ref(const uint8_t *w, const uint8_t *scale, const float *x, int k) {
     double sum = 0.0;
     for (int b = 0; b < k / 32; ++b) {
-        float s = ggml_e8m0_to_fp32(scale[b]);
+        /* compressed-tensors packs consecutive values and uses standard OCP
+         * E2M1.  ds4f_kvalues_mxfp4_f32 is the legacy doubled table. */
+        float s = 0.5f * ggml_e8m0_to_fp32(scale[b]);
         for (int j = 0; j < 16; ++j) {
             uint8_t p = w[b * 16 + j];
-            sum += (double)ds4f_kvalues_mxfp4_f32[p & 15] * s * x[b * 32 + j];
-            sum += (double)ds4f_kvalues_mxfp4_f32[p >> 4] * s * x[b * 32 + j + 16];
+            sum += (double)ds4f_kvalues_mxfp4_f32[p & 15] * s * x[b * 32 + 2*j];
+            sum += (double)ds4f_kvalues_mxfp4_f32[p >> 4] * s * x[b * 32 + 2*j + 1];
         }
     }
     return (float)sum;
@@ -110,6 +112,28 @@ static int test_matrix(int fd, tensor_entry *packed, tensor_entry *scale, int fi
     int bad = max_rel > 3e-5 && max_abs > 3e-4;
     printf("[real-%s] rows=%d..%d K=%d max_abs=%.3e max_rel=%.3e %s\n",
            which, first_row, first_row + 7, k, max_abs, max_rel, bad ? "FAIL" : "OK");
+    enum { batch = 8 };
+    float *xb = malloc((size_t)batch * k * sizeof(float));
+    float tiled[batch * 8], tiled_ref[batch * 8];
+    if (!xb) return 1;
+    for (int m = 0; m < batch; ++m)
+        for (int i = 0; i < k; ++i) xb[(size_t)m * k + i] = random_float();
+    k3_mxfp4_group_tile(tiled, 8, w, s, xb, k, batch, k, NULL);
+    for (int m = 0; m < batch; ++m)
+        for (int r = 0; r < 8; ++r)
+            tiled_ref[m * 8 + r] = mxfp4_ref(wr[r], sr[r], xb + (size_t)m * k, k);
+    double tile_abs = 0.0, tile_rel = 0.0;
+    for (int i = 0; i < batch * 8; ++i) {
+        double ae = fabs((double)tiled[i] - tiled_ref[i]);
+        double re = ae / (fabs((double)tiled_ref[i]) + 1e-6);
+        if (ae > tile_abs) tile_abs = ae;
+        if (re > tile_rel) tile_rel = re;
+    }
+    int tile_bad = tile_rel > 3e-3 && tile_abs > 3e-3;
+    printf("[real-%s-tile] batch=%d max_abs=%.3e max_rel=%.3e %s\n",
+           which, batch, tile_abs, tile_rel, tile_bad ? "FAIL" : "OK");
+    bad |= tile_bad;
+    free(xb);
     free(w); free(s); free(x);
     return bad;
 }
@@ -190,8 +214,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s BLOB MANIFEST [FIRST_ROW]\n", argv[0]); return 2;
     }
     int first_row = argc == 4 ? atoi(argv[3]) : 0;
-    tensor_entry entries[8]; int count = load_manifest(argv[2], entries, 8);
-    if (count != 6) { fprintf(stderr, "expected 6 manifest entries, got %d\n", count); return 2; }
+    tensor_entry *entries = calloc(10000, sizeof(*entries));
+    if (!entries) return 2;
+    int count = load_manifest(argv[2], entries, 10000);
+    if (count < 6) { fprintf(stderr, "expected at least 6 manifest entries, got %d\n", count); return 2; }
     int fd = open(argv[1], O_RDONLY);
     if (fd < 0) { perror("open blob"); return 2; }
     int fail = 0;
@@ -203,6 +229,7 @@ int main(int argc, char **argv) {
                         find_entry(entries,count,"w3.weight_scale"), first_row);
     fail |= test_full_expert(fd, entries, count);
     close(fd);
+    free(entries);
     printf("K3 real MXFP4 partial test: %s\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;
 }

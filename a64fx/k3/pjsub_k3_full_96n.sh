@@ -1,7 +1,7 @@
 #!/bin/bash
 # End-to-end full K3 C11 inference run.
 # The two workload legs intentionally use separate contexts:
-#   codegen: 1K prompt -> 4K generated IDs (decode throughput)
+#   codegen: natural chat prompt -> fixed generated-ID budget (quality)
 #   source:  8K prompt, no generation (prefill throughput)
 #PJM -g hp250467
 # Use the non-torus scalar placement accepted by the K3 96-node probes.
@@ -21,10 +21,12 @@ REPO=/vol0006/mdt0/data/hp250467/work/gemm/k3
 K3="$REPO/a64fx/k3"
 UTOFU="$REPO/a64fx/utofu-tests"
 MODEL_DIR=${K3_MODEL_DIR:-$HOME/models/kimi-k3}
+TOKENIZER_GGUF=${K3_TOKENIZER_GGUF:-/home/u14346/models/k3/iq1/Kimi-K3-UD-IQ1_M-00001-of-00015.gguf}
 NODES=96
 THREADS=${K3_THREADS:-47}
 BARRIER_ITERS=${K3_BARRIER_ITERS:-128}
 COMM_DETERMINISTIC=${K3_COMM_DETERMINISTIC:-1}
+SOURCE_COMM_DETERMINISTIC=${K3_SOURCE_COMM_DETERMINISTIC:-0}
 COMM_BF16=${K3_COMM_BF16:-0}
 COMM_ROBUST=${K3_COMM_ROBUST:-2}
 COMM_POLL_SPINS=${K3_COMM_POLL_SPINS:-4}
@@ -34,6 +36,10 @@ PREFETCH_MIB=${K3_PREFETCH_MIB:-0}
 PROFILE=${K3_PROFILE:-0}
 AR_GROUPS=${K3_AR_GROUPS:-16}
 MOE_SHARD_LAYOUT=${K3_MOE_SHARD_LAYOUT:-row-aligned}
+CODEGEN_PROMPT_MAX=${K3_CODEGEN_PROMPT_MAX:-1024}
+CODEGEN_NEW_TOKENS=${K3_CODEGEN_NEW_TOKENS:-4096}
+CODEGEN_QUALITY=${K3_CODEGEN_QUALITY:-1}
+SOURCE_QUALITY=${K3_SOURCE_QUALITY:-0}
 JOB_TAG=${PJM_JOBID:-manual-$$}
 ROOT="$K3/logs/full-96n-$JOB_TAG"
 STAGE_DIR="/local/$USER/k3-full-$JOB_TAG"
@@ -47,6 +53,17 @@ export OMP_NUM_THREADS="$THREADS" OMP_DYNAMIC=false OMP_PROC_BIND=close OMP_PLAC
 export OMP_WAIT_POLICY=active KMP_BLOCKTIME=infinite
 export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
 export K3_PYTHON="$K3/.venv-$(uname -m)/bin/python" K3_EXPERT_TP=1 K3_MOE_SHARD_LAYOUT="$MOE_SHARD_LAYOUT"
+# At 96 nodes, each TP shard's dense BF16 projection is smaller than a 2 MiB
+# page and is therefore commonly owned by one CMG. Replicate those projections
+# across CMGs to avoid the cross-CMG read bottleneck. This costs about 4.14 GiB
+# per rank over the full 93-layer image; retain an explicit escape hatch for
+# memory-constrained allocations.
+export K3_CMG_REPLICATE=${K3_CMG_REPLICATE:-1}
+# The causal flash8 MLA path is numerically equivalent on the validated
+# batched layer probe and is faster than the generic batched attention path.
+export K3_MLA_FLASH8=${K3_MLA_FLASH8:-1} K3_MLA_QK_MODE=${K3_MLA_QK_MODE:-auto}
+export K3_COMM_ASYNC_LATENT=${K3_COMM_ASYNC_LATENT:-1}
+export K3_PREFILL_PIPELINE=${K3_PREFILL_PIPELINE:-on}
 
 [[ ! -e "$ROOT" ]] || { echo "$0: result root exists: $ROOT" >&2; exit 2; }
 mkdir -p "$ROOT/codegen" "$ROOT/source"
@@ -54,10 +71,15 @@ printf 'K3_FULL_CONFIG nodes=%s threads=%s barrier_iters=%s comm_deterministic=%
     "$NODES" "$THREADS" "$BARRIER_ITERS" "$COMM_DETERMINISTIC" "$COMM_BF16" \
     "$COMM_ROBUST" "$COMM_POLL_SPINS" "$COMM_A2A" "$COMM_A2A_MAX" "$PREFETCH_MIB" "$PROFILE" \
     | tee "$ROOT/config.txt"
-printf 'stage_dir=%s ar_groups=%s moe_shard_layout=%s\n' "$STAGE_DIR" "$AR_GROUPS" "$MOE_SHARD_LAYOUT" | tee -a "$ROOT/config.txt"
+printf 'stage_dir=%s ar_groups=%s moe_shard_layout=%s codegen_prompt_max=%s codegen_new_tokens=%s codegen_quality=%s source_quality=%s\n' \
+    "$STAGE_DIR" "$AR_GROUPS" "$MOE_SHARD_LAYOUT" "$CODEGEN_PROMPT_MAX" \
+    "$CODEGEN_NEW_TOKENS" "$CODEGEN_QUALITY" "$SOURCE_QUALITY" | tee -a "$ROOT/config.txt"
+printf 'source_comm_deterministic=%s prefill_pipeline=%s mla_flash8=%s\n' \
+    "$SOURCE_COMM_DETERMINISTIC" "${K3_PREFILL_PIPELINE:-on}" "${K3_MLA_FLASH8:-1}" | tee -a "$ROOT/config.txt"
+printf 'cmg_replicate=%s\n' "$K3_CMG_REPLICATE" | tee -a "$ROOT/config.txt"
 "$K3/k3_setup_python.sh"
 
-make -C "$K3" full-runner >/dev/null
+make -C "$K3" full-runner k3_prompt_ids k3_decode_ids >/dev/null
 make -C "$UTOFU" tofu_topo_helper >/dev/null
 
 mpiexec -np "$NODES" "$UTOFU/tofu_topo_helper" >"$ROOT/topology.log"
@@ -108,14 +130,17 @@ void Reactor::submit(WorkItem item) {
 }
 EOF
 
-# Tokenization happens before the 1.56-TB checkpoint staging, so missing Python
-# tokenizer dependencies fail cheaply.  The C runner consumes only integer IDs.
-"$K3/k3_python.sh" "$K3/make_k3_prompt_ids.py" --vocab "$MODEL_DIR/tiktoken.model" \
-    --text "$ROOT/codegen_prompt.txt" --output "$ROOT/codegen.ids" \
-    --tokens 1024 --bos --repeat-to
-"$K3/k3_python.sh" "$K3/make_k3_prompt_ids.py" --vocab "$MODEL_DIR/tiktoken.model" \
-    --text "$ROOT/source_prompt.txt" --output "$ROOT/source.ids" \
-    --tokens 8192 --bos --repeat-to
+# Tokenization happens before the 1.56-TB checkpoint staging.  The semantic
+# code-generation probe keeps the natural user-message length: repeating one
+# instruction until it fills 1K tokens strongly biases the completion and is
+# not a meaningful quality test.  The independent 8K source leg remains a
+# fixed-size throughput benchmark.
+"$K3/k3_prompt_ids" "$TOKENIZER_GGUF" "$ROOT/codegen_prompt.txt" \
+    "$ROOT/codegen.ids" "$CODEGEN_PROMPT_MAX" --chat --thinking --natural-length
+CODEGEN_TOKENS=$(wc -w < "$ROOT/codegen.ids")
+CODEGEN_MAX_SEQ=$((CODEGEN_TOKENS + CODEGEN_NEW_TOKENS))
+"$K3/k3_prompt_ids" "$TOKENIZER_GGUF" "$ROOT/source_prompt.txt" \
+    "$ROOT/source.ids" 8192 --chat --thinking --repeat-to
 
 # One rank per node writes its own /local image unless a prepared mixed image
 # is supplied through K3_FULL_STAGE_DIR.
@@ -135,11 +160,16 @@ if [ "$PROFILE" -ne 0 ]; then
     CODEGEN_PROFILE_ARGS=(--profile "$ROOT/codegen/profile.txt")
     SOURCE_PROFILE_ARGS=(--profile "$ROOT/source/profile.txt")
 fi
+# A16 activations avoid applying a second int8 quantizer on top of IQ weights
+# during the semantic quality probe.  It is deliberately configurable because
+# the fast Q8 path remains the appropriate decode-throughput measurement.
+export K3_QUANT_QUALITY="$CODEGEN_QUALITY"
 mpiexec -np "$NODES" -of-proc "$ROOT/codegen/rank" \
     "$K3/k3_full_runner" --mode full96 --stage-dir "$STAGE_DIR" \
     --topo "$ROOT/tofu_topo.txt" --prompt-ids "$ROOT/codegen.ids" \
-    --output "$ROOT/codegen/output.txt" --prefill-tokens 1024 \
-    --new-tokens 4096 --prefill-chunk 256 --max-seq 5120 --threads "$THREADS" \
+    --output "$ROOT/codegen/output.txt" --prefill-tokens "$CODEGEN_TOKENS" \
+    --new-tokens "$CODEGEN_NEW_TOKENS" --prefill-chunk "$CODEGEN_TOKENS" \
+    --prefill-path batched --max-seq "$CODEGEN_MAX_SEQ" --threads "$THREADS" \
     --comm-deterministic "$COMM_DETERMINISTIC" --comm-bf16 "$COMM_BF16" \
     --comm-robust "$COMM_ROBUST" --comm-poll-spins "$COMM_POLL_SPINS" \
     --comm-a2a "$COMM_A2A" --comm-a2a-max "$COMM_A2A_MAX" \
@@ -147,16 +177,22 @@ mpiexec -np "$NODES" -of-proc "$ROOT/codegen/rank" \
     --ar-groups "$AR_GROUPS" "${CODEGEN_PROFILE_ARGS[@]}"
 "$K3/k3_python.sh" "$K3/validate_k3_full_output.py" "$ROOT/codegen/output.txt" \
     --nodes "$NODES" | tee "$ROOT/codegen/validation.txt"
-"$K3/k3_python.sh" "$K3/decode_k3_output.py" "$ROOT/codegen/output.txt" \
-    --vocab "$MODEL_DIR/tiktoken.model" \
-    --text-output "$ROOT/codegen/generated.cpp.txt" | tee "$ROOT/codegen/decode.txt"
+GENERATED_IDS=$(sed -n 's/^generated_ids://p' "$ROOT/codegen/output.txt")
+# The runner generates a fixed token budget for reproducible timing. Present
+# only the semantic response: anything after K3's end-of-message token belongs
+# to a subsequent turn and makes a correct completion look corrupted.
+"$K3/k3_decode_ids" "$TOKENIZER_GGUF" --stop-after 163586 $GENERATED_IDS \
+    | tee "$ROOT/codegen/generated.cpp.txt" "$ROOT/codegen/decode.txt"
+"$K3/k3_python.sh" "$K3/validate_k3_codegen.py" \
+    "$ROOT/codegen/generated.cpp.txt" | tee "$ROOT/codegen/quality.txt"
 
+export K3_QUANT_QUALITY="$SOURCE_QUALITY"
 mpiexec -np "$NODES" -of-proc "$ROOT/source/rank" \
     "$K3/k3_full_runner" --mode full96 --stage-dir "$STAGE_DIR" \
     --topo "$ROOT/tofu_topo.txt" --prompt-ids "$ROOT/source.ids" \
     --output "$ROOT/source/output.txt" --prefill-tokens 8192 \
-    --new-tokens 0 --prefill-only --prefill-chunk 256 --max-seq 8192 \
-    --threads "$THREADS" --comm-deterministic "$COMM_DETERMINISTIC" \
+    --new-tokens 0 --prefill-only --prefill-chunk 1024 --prefill-path batched --max-seq 8192 \
+    --threads "$THREADS" --comm-deterministic "$SOURCE_COMM_DETERMINISTIC" \
     --comm-bf16 "$COMM_BF16" --comm-robust "$COMM_ROBUST" \
     --comm-poll-spins "$COMM_POLL_SPINS" --comm-a2a "$COMM_A2A" \
     --comm-a2a-max "$COMM_A2A_MAX" --ar-groups "$AR_GROUPS" \

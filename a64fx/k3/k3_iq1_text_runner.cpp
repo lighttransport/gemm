@@ -12,6 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#include <cerrno>
+#include <climits>
 #include <string>
 #include <vector>
 
@@ -61,8 +64,16 @@ int main(int argc, char ** argv) {
     const std::string rpc_list = argv[2];
     const char * output_path = argv[3];
     const char * prompt = argv[4];
-    int n_predict = argc == 6 ? std::atoi(argv[5]) : 64;
-    if (n_predict < 1 || n_predict > 512) return 2;
+    int n_predict = 64;
+    if (argc == 6) {
+        char *end = nullptr;
+        errno = 0;
+        long parsed = std::strtol(argv[5], &end, 10);
+        if (errno || end == argv[5] || *end != '\0' ||
+            parsed < 1 || parsed > 512 || parsed > INT_MAX)
+            return 2;
+        n_predict = static_cast<int>(parsed);
+    }
 
     ggml_backend_load_all();
     if (!register_rpc(rpc_list)) return 3;
@@ -115,25 +126,47 @@ int main(int argc, char ** argv) {
     llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
     FILE * out = std::fopen(output_path, "w");
     if (!out) return 7;
+    auto fail_run = [&](int rc) {
+        std::fclose(out);
+        llama_sampler_free(sampler);
+        llama_free(ctx);
+        llama_model_free(model);
+        return rc;
+    };
     std::fprintf(out, "K3_IQ1_TEXT_V1 prompt_tokens=%d requested=%d\n", n_prompt, n_predict);
     std::fprintf(out, "prompt: %s\nresponse: ", prompt);
-    if (llama_decode(ctx, batch)) return 8;
+    const auto prefill_begin = std::chrono::steady_clock::now();
+    if (llama_decode(ctx, batch)) return fail_run(8);
+    const auto prefill_end = std::chrono::steady_clock::now();
+    const auto decode_begin = prefill_end;
     int generated = 0;
-    for (; generated < n_predict; ++generated) {
+    for (int step = 0; step < n_predict; ++step) {
         llama_token token = llama_sampler_sample(sampler, ctx, -1);
         if (llama_vocab_is_eog(vocab, token)) break;
         char piece[4096];
         int n = llama_token_to_piece(vocab, token, piece, sizeof(piece), 0, true);
-        if (n < 0) return 9;
-        std::fwrite(piece, 1, (size_t)n, out);
+        if (n < 0 ||
+            std::fwrite(piece, 1, static_cast<size_t>(n), out) !=
+                static_cast<size_t>(n))
+            return fail_run(9);
         std::fflush(out);
+        ++generated;
+        if (generated == n_predict)
+            break;
         batch = llama_batch_get_one(&token, 1);
-        if (llama_decode(ctx, batch)) return 8;
+        if (llama_decode(ctx, batch)) return fail_run(8);
     }
+    const auto decode_end = std::chrono::steady_clock::now();
+    const double prefill_s = std::chrono::duration<double>(prefill_end - prefill_begin).count();
+    const double decode_s = std::chrono::duration<double>(decode_end - decode_begin).count();
     std::fprintf(out, "\nstatus=PASS generated_tokens=%d\n", generated);
     std::fclose(out);
-    std::fprintf(stderr, "K3_IQ1_TEXT_PASS prompt_tokens=%d generated_tokens=%d output=%s\n",
-                 n_prompt, generated, output_path);
+    std::fprintf(stderr, "K3_IQ_TEXT_PASS prompt_tokens=%d generated_tokens=%d "
+                 "prefill_seconds=%.6f prefill_tok_s=%.3f decode_seconds=%.6f "
+                 "decode_tok_s=%.3f output=%s\n", n_prompt, generated,
+                 prefill_s, prefill_s > 0.0 ? n_prompt / prefill_s : 0.0,
+                 decode_s, decode_s > 0.0 ? generated / decode_s : 0.0,
+                 output_path);
     llama_sampler_free(sampler);
     llama_free(ctx);
     llama_model_free(model);
