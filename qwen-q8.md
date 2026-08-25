@@ -2227,3 +2227,28 @@ INT8 uTofu wire.  Two consecutive 4096-token runs measured **603.57 tok/s**
 (6.7863 s) and **600.35 tok/s** (6.8227 s), both with `next=62842`.  An exact
 BF16/MPI 128-token fallback check remained `next=1293` with unpacked PV48
 weights.
+
+#### BF16 750 tok/s follow-up (2026-08-25)
+
+The block-scaled INT8 TP collective now retains one OpenMP team across outgoing
+quantization, owner reduction, reduced-shard quantization, and gathered residual
+addition. Network operations execute in single-thread regions between work
+sharing phases. This preserves `1293`/`62842`, reduces the accumulated
+collective phase to about 0.79--0.81 seconds, and measures about 602--607 tok/s
+end to end; it is accepted as the default implementation.
+
+Two larger redesigns remain opt-in diagnostics. `TF_QWEN_ATTN_BLOCK=1` groups
+causal queries to reuse GQA K/V rows, but score-workspace traffic leaves the
+attention phase neutral at about 0.66 seconds. `Q38_PREFILL_PP_COMM=utofu` uses
+directional double-buffered uTofu payload slots, sequence trailers, and reverse
+credits. It cuts explicit PP send time from 0.5--0.7 seconds to about 0.02
+seconds, but only removes backpressure accounting: the slowest pipeline stage
+still determines the 6.75--6.80 second wall time, so MPI remains the default.
+
+The existing FP16 kernel was evaluated as a route to twice-width arithmetic.
+Full-K FP16 accumulation reaches 276.9 GFLOP/s/core but has roughly 6.2% relative
+error at K=5120. Splitting K into 64--1024 element FP16 partials and accumulating
+them in FP32 reaches only 49--108 GFLOP/s/core, below the 137 GFLOP/s/core BF16
+p-odd kernel, while retaining unstable error. It was rejected. The two-run 750
+tok/s gate remains open; reaching it requires a new mixed-precision kernel or a
+materially different parallel decomposition, not additional PP handoff tuning.

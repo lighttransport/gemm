@@ -3444,6 +3444,86 @@ static void *tf_attn_worker(void *arg) {
     return NULL;
 }
 
+/* Qwen prefill attention specialized for the TP-local GQA shape.  A query
+ * block shares each K/V cache row across all of its query tokens and the query
+ * heads mapped to one KV head.  Each output still accumulates positions in
+ * increasing order, matching the scalar task schedule's causal semantics. */
+static int tf_qwen_attention_blocked(transformer_model *m, int layer,
+        const float *q, int q_stride, float *out, int qdim, int kvdim,
+        int start_pos, int N) {
+#if defined(__ARM_FEATURE_SVE)
+    static int enabled = -1, bq = 0;
+    if (enabled < 0) {
+        const char *e = getenv("TF_QWEN_ATTN_BLOCK");
+        enabled = e && atoi(e) != 0;
+        const char *b = getenv("TF_QWEN_ATTN_BQ");
+        bq = b ? atoi(b) : 4;
+    }
+    if (!enabled || bq < 1 || bq > 8 || m->head_dim != 128 ||
+        m->n_heads < 1 || m->n_kv_heads < 1 || m->gqa_group < 1)
+        return 0;
+    int nh = m->n_heads, nkh = m->n_kv_heads, hd = m->head_dim;
+    int nqb = (N + bq - 1) / bq, max_seq = start_pos + N;
+    float scale = 1.0f / sqrtf((float)hd);
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(m->n_threads)
+    #endif
+    {
+        size_t sn = (size_t)bq * nh * max_seq;
+        float *scores = (float *)malloc(sn * sizeof(float));
+        #ifdef _OPENMP
+        #pragma omp for schedule(static)
+        #endif
+        for (int task = 0; task < nqb * nkh; task++) {
+            int qb = task / nkh, kvh = task % nkh;
+            int t0 = qb * bq, tn = N - t0; if (tn > bq) tn = bq;
+            int h0 = 0, h1 = 0;
+            while (h0 < nh && (m->tp_qhead_offset + h0) / m->gqa_group < kvh) h0++;
+            h1 = h0;
+            while (h1 < nh && (m->tp_qhead_offset + h1) / m->gqa_group == kvh) h1++;
+            if (h0 == h1) continue;
+            svbool_t pg = svptrue_b32();
+            for (int ti = 0; ti < tn; ti++) for (int h = h0; h < h1; h++) {
+                const float *qh = q + (size_t)(t0 + ti) * q_stride + h * hd;
+                float *sc = scores + ((size_t)ti * nh + h) * max_seq;
+                int sl = start_pos + t0 + ti + 1;
+                for (int p = 0; p < sl; p++) {
+                    const float *kp = m->key_cache[layer] + (size_t)p * kvdim + kvh * hd;
+                    svfloat32_t acc = svdup_f32(0.0f);
+                    for (int d = 0; d < hd; d += (int)svcntw())
+                        acc = svmla_f32_x(pg, acc, svld1(pg, qh + d), svld1(pg, kp + d));
+                    sc[p] = svaddv_f32(pg, acc) * scale;
+                }
+                tf_softmax(sc, sl);
+                float *oh = out + (size_t)(t0 + ti) * qdim + h * hd;
+                for (int d = 0; d < hd; d += (int)svcntw())
+                    svst1(pg, oh + d, svdup_f32(0.0f));
+            }
+            int slmax = start_pos + t0 + tn;
+            for (int p = 0; p < slmax; p++) {
+                const float *vp = m->value_cache[layer] + (size_t)p * kvdim + kvh * hd;
+                for (int ti = 0; ti < tn; ti++) {
+                    if (p >= start_pos + t0 + ti + 1) continue;
+                    for (int h = h0; h < h1; h++) {
+                        float *sc = scores + ((size_t)ti * nh + h) * max_seq;
+                        float *oh = out + (size_t)(t0 + ti) * qdim + h * hd;
+                        svfloat32_t w = svdup_f32(sc[p]);
+                        for (int d = 0; d < hd; d += (int)svcntw())
+                            svst1(pg, oh + d, svmla_f32_x(pg, svld1(pg, oh + d),
+                                                         w, svld1(pg, vp + d)));
+                    }
+                }
+            }
+        }
+        free(scores);
+    }
+    return 1;
+#else
+    (void)m; (void)layer; (void)q; (void)q_stride; (void)out;
+    (void)qdim; (void)kvdim; (void)start_pos; (void)N; return 0;
+#endif
+}
+
 #if defined(__AVX2__) && defined(__FMA__)
 /* Fast AVX2 exp approximation — defined early so tf_softmax can use it. */
 static inline __m256 fast_exp_avx2(__m256 x);
@@ -13805,6 +13885,9 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             pprof->attn_prepare_ms += tf_time_ms() - pt;
             memset(attout, 0, nf * (size_t)qdim * sizeof(float));
             pt = tf_time_ms();
+            int blocked_attn = tf_qwen_attention_blocked(m, l, proj, q2,
+                attout, qdim, kvdim, start_pos, N);
+            if (!blocked_attn) {
             #ifdef _OPENMP
             #pragma omp parallel num_threads(m->n_threads)
             #endif
@@ -13847,6 +13930,31 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                         oh[i] *= 1.0f / (1.0f + expf(-gh[i]));
                 }
                 free(scores);
+            }
+            } else {
+                #ifdef _OPENMP
+                #pragma omp parallel for collapse(2) num_threads(m->n_threads) schedule(static)
+                #endif
+                for (int t = 0; t < N; t++) for (int h = 0; h < m->n_heads; h++) {
+                    float *gh = up + (size_t)t * max_inner + (size_t)h * m->head_dim;
+                    float *oh = attout + (size_t)t * qdim + (size_t)h * m->head_dim;
+#if defined(__ARM_FEATURE_SVE)
+                    for (int i = 0; i < m->head_dim; i += (int)svcntw()) {
+                        svbool_t pg = svwhilelt_b32((uint64_t)i,(uint64_t)m->head_dim);
+                        svfloat32_t g = svld1(pg, gh + i);
+                        svfloat32_t x = svmul_n_f32_x(pg,g,-1.4426950408889634f);
+                        x = svmax_n_f32_x(pg,svmin_n_f32_x(pg,x,80.0f),-80.0f);
+                        svfloat32_t den = svadd_n_f32_x(pg,
+                            tf_exp2_fexpa_approx_sve(pg,x),1.0f);
+                        svfloat32_t inv = svrecpe_f32(den);
+                        inv = svmul_f32_x(pg,inv,svrecps_f32(den,inv));
+                        svst1(pg,oh+i,svmul_f32_x(pg,svld1(pg,oh+i),inv));
+                    }
+#else
+                    for (int i = 0; i < m->head_dim; i++)
+                        oh[i] *= 1.0f / (1.0f + expf(-gh[i]));
+#endif
+                }
             }
             pprof->attn_kernel_ms += tf_time_ms() - pt;
             pt = tf_time_ms();

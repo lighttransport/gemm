@@ -371,8 +371,14 @@ static inline int tp_rsag4_sum_i8_impl(tp_rsag4*c,float*buf,float*residual,int c
     if(count<1||count>c->max_count)return-1;
     const int BS=256;uint64_t seq=++c->seq;int shard=(count+3)/4;
     int nb=(shard+BS-1)/BS;size_t bytes=(size_t)shard+sizeof(float)*(size_t)nb;
+    float*sum=(float*)(c->region+tp_rsag4_reduced(c));int vl=(int)svcntw(),rc=0;
+    char*red=c->region+tp_rsag4_gather(c,c->rank);
     #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel shared(rc)
+    #endif
+    {
+    #ifdef _OPENMP
+    #pragma omp for collapse(2) schedule(static)
     #endif
     for(int d=0;d<4;d++)for(int b=0;b<nb;b++){
         char*p=c->region+tp_rsag4_send(c,d);int start=d*shard,n=count-start;
@@ -380,6 +386,10 @@ static inline int tp_rsag4_sum_i8_impl(tp_rsag4*c,float*buf,float*residual,int c
         tp_rsag4_i8_quant_block(buf+(start<count?start:count),n,b,
             (int8_t*)p,(float*)(p+shard));
     }
+    #ifdef _OPENMP
+    #pragma omp single
+    #endif
+    {
     for(int d=0;d<4;d++){
         char*p=c->region+tp_rsag4_send(c,d);int start=d*shard,n=count-start;
         if(n>shard)n=shard;if(n<0)n=0;if(n<shard)memset(p+n,0,(size_t)(shard-n));
@@ -390,17 +400,17 @@ static inline int tp_rsag4_sum_i8_impl(tp_rsag4*c,float*buf,float*residual,int c
     int issued[TP_RSAG4_MAX_TNI]={0},di=0;
     for(int d=0;d<4;d++)if(d!=c->rank){int k=di++%c->ntni;
         int x=tp_rsag4_put_nb(c,d,tp_rsag4_send(c,d),tp_rsag4_recv(c,c->rank),bytes,k);
-        if(x<0)return-1;issued[k]+=x;}
-    if(tp_rsag4_drain_tcq(c,issued))return-1;
+        if(x<0)rc=-1;else issued[k]+=x;}
+    if(tp_rsag4_drain_tcq(c,issued))rc=-1;
     memset(issued,0,sizeof(issued));di=0;
     for(int d=0;d<4;d++)if(d!=c->rank){int k=di++%c->ntni;
         int x=tp_rsag4_put_nb(c,d,tp_rsag4_send(c,d)+c->trailer,
-            tp_rsag4_recv(c,c->rank)+c->trailer,8,k);if(x<0)return-1;issued[k]+=x;}
-    if(tp_rsag4_drain_tcq(c,issued))return-1;
-    for(int s=0;s<4;s++)if(tp_rsag4_wait(c,tp_rsag4_recv(c,s),seq))return-1;
-    float*sum=(float*)(c->region+tp_rsag4_reduced(c));int vl=(int)svcntw();
+            tp_rsag4_recv(c,c->rank)+c->trailer,8,k);if(x<0)rc=-1;else issued[k]+=x;}
+    if(tp_rsag4_drain_tcq(c,issued))rc=-1;
+    for(int s=0;s<4;s++)if(tp_rsag4_wait(c,tp_rsag4_recv(c,s),seq))rc=-1;
+    }
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     #endif
     for(int b=0;b<nb;b++){
         int i0=b*BS,i1=i0+BS;if(i1>shard)i1=shard;
@@ -412,24 +422,33 @@ static inline int tp_rsag4_sum_i8_impl(tp_rsag4*c,float*buf,float*residual,int c
                     svld1sb_s32(pg,(const int8_t*)p+i)),sc);}
             svst1(pg,sum+i,acc);}
     }
-    char*red=c->region+tp_rsag4_gather(c,c->rank);
-    tp_rsag4_i8_quant(sum,shard,(int8_t*)red,(float*)(red+shard));
+    #ifdef _OPENMP
+    #pragma omp for schedule(static)
+    #endif
+    for(int b=0;b<nb;b++)tp_rsag4_i8_quant_block(sum,shard,b,
+        (int8_t*)red,(float*)(red+shard));
+    #ifdef _OPENMP
+    #pragma omp single
+    #endif
+    {
     *(volatile uint64_t*)(red+c->trailer)=seq;
+    int issued[TP_RSAG4_MAX_TNI]={0},di=0;
     memset(issued,0,sizeof(issued));di=0;
     for(int d=0;d<4;d++)if(d!=c->rank){int k=di++%c->ntni;
         int x=tp_rsag4_put_nb(c,d,tp_rsag4_gather(c,c->rank),
             tp_rsag4_gather(c,c->rank),bytes,k);
         /* Destination is the sender-rank gather slot on every peer. */
-        if(x<0)return-1;issued[k]+=x;}
-    if(tp_rsag4_drain_tcq(c,issued))return-1;
+        if(x<0)rc=-1;else issued[k]+=x;}
+    if(tp_rsag4_drain_tcq(c,issued))rc=-1;
     memset(issued,0,sizeof(issued));di=0;
     for(int d=0;d<4;d++)if(d!=c->rank){int k=di++%c->ntni;
         int x=tp_rsag4_put_nb(c,d,tp_rsag4_gather(c,c->rank)+c->trailer,
-            tp_rsag4_gather(c,c->rank)+c->trailer,8,k);if(x<0)return-1;issued[k]+=x;}
-    if(tp_rsag4_drain_tcq(c,issued))return-1;
-    for(int s=0;s<4;s++)if(tp_rsag4_wait(c,tp_rsag4_gather(c,s),seq))return-1;
+            tp_rsag4_gather(c,c->rank)+c->trailer,8,k);if(x<0)rc=-1;else issued[k]+=x;}
+    if(tp_rsag4_drain_tcq(c,issued))rc=-1;
+    for(int s=0;s<4;s++)if(tp_rsag4_wait(c,tp_rsag4_gather(c,s),seq))rc=-1;
+    }
     #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp for collapse(2) schedule(static)
     #endif
     for(int s=0;s<4;s++)for(int b=0;b<nb;b++){
         int start=s*shard,n=count-start;if(n>shard)n=shard;if(n<=0)continue;
@@ -441,7 +460,8 @@ static inline int tp_rsag4_sum_i8_impl(tp_rsag4*c,float*buf,float*residual,int c
             float*dst=residual?residual+start+i:buf+start+i;
             if(residual)v=svadd_f32_x(pg,svld1(pg,dst),v);svst1(pg,dst,v);}
     }
-    return 0;
+    }
+    return rc;
 #else
     (void)c;(void)buf;(void)residual;(void)count;return-1;
 #endif

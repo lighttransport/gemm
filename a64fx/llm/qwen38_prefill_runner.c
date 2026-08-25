@@ -32,10 +32,20 @@ typedef struct {
     tp_comm tofu;
     tp_rsag4 rsag4;
     utofu_vcq_hdl_t vcq[TP_RSAG4_MAX_TNI];
+    utofu_tni_id_t tni[TP_RSAG4_MAX_TNI];
     int nvcq;
     int bf16_wire;
     int i8_wire;
 } tp_reduce_ctx;
+typedef struct {
+    utofu_vcq_hdl_t vcq;
+    utofu_vcq_id_t prev_vcq, next_vcq;
+    utofu_stadd_t base, prev_base, next_base;
+    char *region;
+    size_t payload, slot, bytes;
+    int have_prev, have_next;
+} pp_utofu_ctx;
+#define Q38_PP_STAG 10
 static MPI_Comm g_tp_init_barrier = MPI_COMM_NULL;
 static void tp_init_barrier(void) { MPI_Barrier(g_tp_init_barrier); }
 static void tp_sum(float *buf, int count, void *opaque) {
@@ -75,6 +85,82 @@ static int env_i(const char *name, int def) {
 }
 static const char *env_s(const char *name, const char *def) {
     const char *v = getenv(name); return v && *v ? v : def;
+}
+static void fail(int rank, const char *what);
+static int read_topology(uint8_t coords[][TOFU_NCOORDS], int cap);
+static inline void pp_inval(const void *p, size_t n) {
+    const char *q = (const char *)p;
+    for (size_t i = 0; i < n; i += 256)
+        __asm__ __volatile__("dc civac, %0" :: "r"(q + i) : "memory");
+    __asm__ __volatile__("dsb sy" ::: "memory");
+}
+static int pp_put_wait(pp_utofu_ctx *p, utofu_vcq_id_t peer,
+        utofu_stadd_t src, utofu_stadd_t dst, size_t n) {
+    void *cb; int rc;
+    do { rc = utofu_put(p->vcq, peer, src, dst, n, 0,
+             UTOFU_ONESIDED_FLAG_TCQ_NOTICE, NULL);
+         if (rc == UTOFU_ERR_BUSY) utofu_poll_tcq(p->vcq, 0, &cb);
+    } while (rc == UTOFU_ERR_BUSY);
+    if (rc != UTOFU_SUCCESS) return -1;
+    do { rc = utofu_poll_tcq(p->vcq, 0, &cb); } while (rc == UTOFU_ERR_NOT_FOUND);
+    return rc == UTOFU_SUCCESS ? 0 : -1;
+}
+static void pp_wait_word(volatile uint64_t *v, uint64_t seq) {
+    unsigned spin = 0;
+    while (*v < seq) if ((++spin & 7u) == 0) pp_inval((const void *)v, 8);
+}
+static void init_utofu_pp(pp_utofu_ctx *p, tp_reduce_ctx *tc, int wrank,
+        int world, int pp_rank, int pp_size, int tp_size, size_t payload) {
+    memset(p, 0, sizeof(*p)); p->vcq = tc->vcq[0];
+    p->payload = payload; p->slot = (payload + 8 + 255) & ~(size_t)255;
+    p->bytes = 4 * p->slot + 1024;
+    if (posix_memalign((void **)&p->region, 256, p->bytes)) fail(wrank,"PP region allocation");
+    memset(p->region, 0, p->bytes);
+    if (utofu_reg_mem_with_stag(p->vcq,p->region,p->bytes,Q38_PP_STAG,0,&p->base)!=UTOFU_SUCCESS)
+        fail(wrank,"register PP region");
+    uint8_t topo[32][TOFU_NCOORDS];
+    if (world > 32 || read_topology(topo,32) != world) fail(wrank,"read PP topology");
+    p->have_prev = pp_rank > 0; p->have_next = pp_rank + 1 < pp_size;
+    int lane = wrank % tp_size;
+    if (p->have_prev) {
+        int r=(pp_rank-1)*tp_size+lane;
+        if (utofu_construct_vcq_id(topo[r],tc->tni[0],DEMO_CQ_ID,DEMO_CMP_ID,&p->prev_vcq)!=UTOFU_SUCCESS)
+            fail(wrank,"construct previous PP VCQ");
+        utofu_set_vcq_id_path(&p->prev_vcq,NULL);
+    }
+    if (p->have_next) {
+        int r=(pp_rank+1)*tp_size+lane;
+        if (utofu_construct_vcq_id(topo[r],tc->tni[0],DEMO_CQ_ID,DEMO_CMP_ID,&p->next_vcq)!=UTOFU_SUCCESS)
+            fail(wrank,"construct next PP VCQ");
+        utofu_set_vcq_id_path(&p->next_vcq,NULL);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (p->have_prev && utofu_query_stadd(p->prev_vcq,Q38_PP_STAG,&p->prev_base)!=UTOFU_SUCCESS)
+        fail(wrank,"query previous PP address");
+    if (p->have_next && utofu_query_stadd(p->next_vcq,Q38_PP_STAG,&p->next_base)!=UTOFU_SUCCESS)
+        fail(wrank,"query next PP address");
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+static int pp_recv(pp_utofu_ctx *p, float *dst, size_t bytes, uint64_t seq) {
+    int s=(int)((seq-1)&1);size_t off=(size_t)s*p->slot;
+    volatile uint64_t *tr=(volatile uint64_t*)(p->region+off+p->payload);
+    pp_wait_word(tr,seq);pp_inval(p->region+off,bytes);memcpy(dst,p->region+off,bytes);
+    size_t ack_src=4*p->slot+(size_t)s*256;
+    size_t ack_dst=4*p->slot+512+(size_t)s*256;
+    volatile uint64_t *ack=(volatile uint64_t*)(p->region+ack_src);
+    *ack=seq;
+    return pp_put_wait(p,p->prev_vcq,p->base+ack_src,p->prev_base+ack_dst,8);
+}
+static int pp_send(pp_utofu_ctx *p, const float *src, size_t bytes, uint64_t seq) {
+    int s=(int)((seq-1)&1);size_t dst_off=(size_t)s*p->slot;
+    size_t src_off=(size_t)(2+s)*p->slot;
+    if(seq>2){volatile uint64_t *ack=(volatile uint64_t*)(p->region+4*p->slot+512+(size_t)s*256);
+        pp_wait_word(ack,seq-2);}
+    memcpy(p->region+src_off,src,bytes);
+    *(volatile uint64_t*)(p->region+src_off+p->payload)=seq;
+    if(pp_put_wait(p,p->next_vcq,p->base+src_off,p->next_base+dst_off,bytes))return-1;
+    return pp_put_wait(p,p->next_vcq,p->base+src_off+p->payload,
+        p->next_base+dst_off+p->payload,8);
 }
 static void f32_to_bf16(uint16_t *dst, const float *src, size_t n, int threads) {
 #ifdef _OPENMP
@@ -140,6 +226,7 @@ static void init_utofu_tp(tp_reduce_ctx *ctx, int wrank, int world,
     utofu_vcq_id_t peers[TP_RSAG4_MAX_TNI][4];
     for (int k = 0; k < use_tni; k++) {
         tni = tnis[k];
+        ctx->tni[k] = tni;
         rc = utofu_create_vcq_with_cmp_id(tni, DEMO_CMP_ID, 0, &vcqs[k]);
         if (rc != UTOFU_SUCCESS) fail(wrank, "create uTofu VCQ");
         utofu_vcq_id_t mine;
@@ -326,6 +413,12 @@ int main(int argc, char **argv) {
     if (tp_size > 1 && env_i("TF_TP_FUSED_PREFILL", 1) &&
         (tc.bf16_wire || tc.i8_wire))
         transformer_set_tp_reduce_add(m, tp_sum_add);
+    pp_utofu_ctx pc;
+    int use_pp_utofu = pp_size > 1 && tc.kind == TP_COMM_UTOFU_RSAG4 &&
+        !strcmp(env_s("Q38_PREFILL_PP_COMM", "mpi"), "utofu");
+    if (use_pp_utofu)
+        init_utofu_pp(&pc,&tc,wrank,world,pp_rank,pp_size,tp_size,
+                      (size_t)chunk*m->n_embd*sizeof(float));
 
     MPI_Barrier(MPI_COMM_WORLD);
     transformer_prefill_profile_reset();
@@ -340,7 +433,10 @@ int main(int argc, char **argv) {
         size_t nf = (size_t)n * m->n_embd;
         double phase = wall();
         if (pp_rank > 0) {
-            if (pipe_bf16) {
+            if (use_pp_utofu) {
+                if (pp_recv(&pc,hidden,nf*sizeof(float),(uint64_t)ci+1))
+                    fail(wrank,"uTofu PP receive");
+            } else if (pipe_bf16) {
                 MPI_Recv(hidden_bf16, (int)nf, MPI_UINT16_T, pp_rank - 1,
                          ci, pp_comm, MPI_STATUS_IGNORE);
                 bf16_to_f32(hidden, hidden_bf16, nf, threads);
@@ -359,7 +455,10 @@ int main(int argc, char **argv) {
         if (!last_logits) fail(wrank, "range prefill");
         phase = wall();
         if (pp_rank < pp_size - 1) {
-            if (pipe_bf16) {
+            if (use_pp_utofu) {
+                if (pp_send(&pc,hidden,nf*sizeof(float),(uint64_t)ci+1))
+                    fail(wrank,"uTofu PP send");
+            } else if (pipe_bf16) {
                 f32_to_bf16(hidden_bf16, hidden, nf, threads);
                 MPI_Send(hidden_bf16, (int)nf, MPI_UINT16_T, pp_rank + 1,
                          ci, pp_comm);
