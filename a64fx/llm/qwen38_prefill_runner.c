@@ -33,6 +33,7 @@ typedef struct {
     tp_rsag4 rsag4;
     utofu_vcq_hdl_t vcq[TP_RSAG4_MAX_TNI];
     int nvcq;
+    int bf16_wire;
 } tp_reduce_ctx;
 static MPI_Comm g_tp_init_barrier = MPI_COMM_NULL;
 static void tp_init_barrier(void) { MPI_Barrier(g_tp_init_barrier); }
@@ -40,7 +41,9 @@ static void tp_sum(float *buf, int count, void *opaque) {
     tp_reduce_ctx *c = (tp_reduce_ctx *)opaque;
     if (c->kind == TP_COMM_UTOFU_TREE) tp_allreduce_sum(&c->tofu, buf, count);
     else if (c->kind == TP_COMM_UTOFU_RSAG4) {
-        if (tp_rsag4_sum(&c->rsag4, buf, count)) {
+        int rc = c->bf16_wire ? tp_rsag4_sum_bf16(&c->rsag4, buf, count) :
+                                tp_rsag4_sum(&c->rsag4, buf, count);
+        if (rc) {
             fprintf(stderr, "qwen38-prefill FATAL uTofu RSAG4 failure\n");
             MPI_Abort(MPI_COMM_WORLD, 2);
         }
@@ -198,6 +201,7 @@ int main(int argc, char **argv) {
     if (ntok < 1 || chunk < 1 || threads < 1 || threads > 48) fail(wrank, "invalid tokens/chunk/threads");
     int max_seq = env_i("Q38_PREFILL_MAXSEQ", ntok + 16);
     if (max_seq < ntok + 1) max_seq = ntok + 1;
+    const char *bf16_mode = env_s("Q38_PREFILL_BF16", "exact");
 
     /* Pure pipeline mode loads only this rank's layers from the source GGUF.
      * Their prefill panels become anonymous resident copies, so the shared
@@ -220,6 +224,11 @@ int main(int argc, char **argv) {
     transformer_set_threads(m, threads);
     const char *stage = env_s("Q38_PREFILL_STAGE", "/local/u14346/qwen38-bf16-tp4");
     if (tp_size > 1) {
+        /* Both PV48 and p_odd prepackers consume native row-major BF16. The
+         * stage loader otherwise defaults to the decode-only PV8 transform,
+         * which silently made prefill repack and dispatch the wrong layout. */
+        if (!strcmp(bf16_mode, "exact") || !strcmp(bf16_mode, "bf16-act"))
+            setenv("TP_STAGE_BF16_PV", "0", 1);
         /* Tell metadata slicing that final dense column shards already exist in
          * the stage file; otherwise it needlessly repacks them from the GGUF. */
         setenv("TP_STAGE_DIR", stage, 1);
@@ -227,7 +236,6 @@ int main(int argc, char **argv) {
         if (!transformer_tp_load_stage(m, stage, tp_rank, tp_size)) fail(wrank, "load TP stage");
     }
     transformer_free_unused_kv(m, l0, l1);
-    const char *bf16_mode=env_s("Q38_PREFILL_BF16","exact");
     if(!strcmp(bf16_mode,"bf16-act")){
         setenv("TF_PODD","1",1);
         if(!transformer_prepack_podd_range(m,l0,l1))fail(wrank,"pack stage BF16 p_odd");
@@ -283,14 +291,18 @@ int main(int argc, char **argv) {
         fail(wrank, "BF16 pipeline buffer allocation");
 
     const char *comm_name = env_s("Q38_PREFILL_COMM", "mpi");
-    if (!strcmp(comm_name, "utofu") || !strcmp(comm_name, "utofu-rsag"))
+    if (!strcmp(comm_name, "utofu") || !strcmp(comm_name, "utofu-rsag") ||
+        !strcmp(comm_name, "utofu-bf16")) {
         init_utofu_tp(&tc, wrank, world, pp_rank, tp_size,
                       chunk * m->n_embd, tp_comm, 1);
-    else if (!strcmp(comm_name, "utofu-tree"))
+        tc.bf16_wire = !strcmp(comm_name, "utofu-bf16");
+        if (tc.bf16_wire && strcmp(bf16_mode, "bf16-act"))
+            fail(wrank, "utofu-bf16 requires Q38_PREFILL_BF16=bf16-act");
+    } else if (!strcmp(comm_name, "utofu-tree"))
         init_utofu_tp(&tc, wrank, world, pp_rank, tp_size,
                       chunk * m->n_embd, tp_comm, 0);
     else if (strcmp(comm_name, "mpi"))
-        fail(wrank, "Q38_PREFILL_COMM must be mpi, utofu, or utofu-tree");
+        fail(wrank, "Q38_PREFILL_COMM must be mpi, utofu, utofu-bf16, or utofu-tree");
 
     MPI_Barrier(MPI_COMM_WORLD);
     transformer_prefill_profile_reset();
@@ -365,6 +377,19 @@ int main(int argc, char **argv) {
                     pf.ssm_prepare_ms, pf.ssm_scan_ms, pf.attn_prepare_ms,
                     pf.attn_kernel_ms, pf.out_proj_ms, pf.ffn_proj_ms,
                     pf.ffn_act_ms, pf.ffn_down_ms, pf.collective_ms);
+            fprintf(f, "shape ne=%d ff=%d ffn_gate=%ux%dx%d packed=%d pv=%d pv48=%d "
+                    "ffn_up=%ux%dx%d packed=%d pv=%d pv48=%d "
+                    "ffn_down=%ux%dx%d packed=%d pv=%d pv48=%d\n",
+                    m->n_embd, m->n_ff,
+                    m->layers[l0].ffn_gate.type, m->layers[l0].ffn_gate.n_rows,
+                    m->layers[l0].ffn_gate.n_cols, m->layers[l0].ffn_gate.podd_packed,
+                    m->layers[l0].ffn_gate.bf16_pv, !!m->layers[l0].ffn_gate.prefill_pv48,
+                    m->layers[l0].ffn_up.type, m->layers[l0].ffn_up.n_rows,
+                    m->layers[l0].ffn_up.n_cols, m->layers[l0].ffn_up.podd_packed,
+                    m->layers[l0].ffn_up.bf16_pv, !!m->layers[l0].ffn_up.prefill_pv48,
+                    m->layers[l0].ffn_down.type, m->layers[l0].ffn_down.n_rows,
+                    m->layers[l0].ffn_down.n_cols, m->layers[l0].ffn_down.podd_packed,
+                    m->layers[l0].ffn_down.bf16_pv, !!m->layers[l0].ffn_down.prefill_pv48);
             fclose(f);
         }
     }

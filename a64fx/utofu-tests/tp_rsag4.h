@@ -199,6 +199,131 @@ static inline int tp_rsag4_sum(tp_rsag4 *c, float *buf, int count) {
     return 0;
 }
 
+/* BF16-wire TP4 all-reduce for BF16-activation prefill. Each rank truncates
+ * its FP32 partials before reduce-scatter; the owner widens and sums ranks
+ * 0..3 in deterministic order, truncates the reduced shard for all-gather,
+ * and every receiver widens the gathered result back into buf. Network bytes
+ * are exactly half of tp_rsag4_sum while all additions remain FP32. */
+static inline int tp_rsag4_sum_bf16(tp_rsag4 *c, float *buf, int count) {
+    if (count < 1 || count > c->max_count) return -1;
+    uint64_t seq = ++c->seq;
+    int shard = (count + 3) / 4;
+    size_t bytes = (size_t)shard * sizeof(uint16_t);
+
+    for (int d = 0; d < 4; d++) {
+        uint16_t *s = (uint16_t *)(c->region + tp_rsag4_send(c, d));
+        int start = d * shard, n = count - start;
+        if (n > shard) n = shard;
+        if (n < 0) n = 0;
+#if defined(__ARM_FEATURE_SVE)
+        int i = 0;
+        for (; i < n; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+            svuint32_t u = svlsr_n_u32_x(pg,
+                svreinterpret_u32_f32(svld1(pg, buf + start + i)), 16);
+            svst1h_u32(pg, s + i, u);
+        }
+#else
+        for (int i = 0; i < n; i++) {
+            uint32_t u; memcpy(&u, buf + start + i, sizeof(u));
+            s[i] = (uint16_t)(u >> 16);
+        }
+#endif
+        if (n < shard) memset(s + n, 0, (size_t)(shard - n) * sizeof(*s));
+        *(volatile uint64_t *)((char *)s + c->trailer) = seq;
+    }
+    memcpy(c->region + tp_rsag4_recv(c, c->rank),
+           c->region + tp_rsag4_send(c, c->rank), bytes);
+    *(volatile uint64_t *)(c->region + tp_rsag4_recv(c, c->rank) + c->trailer) = seq;
+
+    int issued[TP_RSAG4_MAX_TNI] = {0};
+    int di = 0;
+    for (int d = 0; d < 4; d++) if (d != c->rank) {
+        int k = di++ % c->ntni;
+        int x = tp_rsag4_put_nb(c, d, tp_rsag4_send(c, d),
+                                tp_rsag4_recv(c, c->rank), bytes, k);
+        if (x < 0) return -1; issued[k] += x;
+    }
+    if (tp_rsag4_drain_tcq(c, issued)) return -1;
+    memset(issued, 0, sizeof(issued)); di = 0;
+    for (int d = 0; d < 4; d++) if (d != c->rank) {
+        int k = di++ % c->ntni;
+        int x = tp_rsag4_put_nb(c, d, tp_rsag4_send(c, d) + c->trailer,
+                                tp_rsag4_recv(c, c->rank) + c->trailer, 8, k);
+        if (x < 0) return -1; issued[k] += x;
+    }
+    if (tp_rsag4_drain_tcq(c, issued)) return -1;
+    for (int s = 0; s < 4; s++)
+        if (tp_rsag4_wait(c, tp_rsag4_recv(c, s), seq)) return -1;
+
+    uint16_t *sum = (uint16_t *)(c->region + tp_rsag4_reduced(c));
+#if defined(__ARM_FEATURE_SVE)
+    for (int i = 0; i < shard; i += (int)svcntw()) {
+        svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)shard);
+        const uint16_t *v0 = (const uint16_t *)(c->region + tp_rsag4_recv(c, 0)) + i;
+        svuint32_t u = svlsl_n_u32_x(pg, svld1uh_u32(pg, v0), 16);
+        svfloat32_t acc = svreinterpret_f32_u32(u);
+        for (int s = 1; s < 4; s++) {
+            const uint16_t *v = (const uint16_t *)(c->region + tp_rsag4_recv(c, s)) + i;
+            u = svlsl_n_u32_x(pg, svld1uh_u32(pg, v), 16);
+            acc = svadd_f32_x(pg, acc, svreinterpret_f32_u32(u));
+        }
+        u = svlsr_n_u32_x(pg, svreinterpret_u32_f32(acc), 16);
+        svst1h_u32(pg, sum + i, u);
+    }
+#else
+    for (int i = 0; i < shard; i++) {
+        float acc = 0.0f;
+        for (int s = 0; s < 4; s++) {
+            uint16_t b = ((const uint16_t *)(c->region + tp_rsag4_recv(c, s)))[i];
+            uint32_t u = (uint32_t)b << 16; float v; memcpy(&v, &u, sizeof(v));
+            acc += v;
+        }
+        uint32_t u; memcpy(&u, &acc, sizeof(u)); sum[i] = (uint16_t)(u >> 16);
+    }
+#endif
+    *(volatile uint64_t *)(c->region + tp_rsag4_reduced(c) + c->trailer) = seq;
+    memcpy(c->region + tp_rsag4_gather(c, c->rank), sum, bytes);
+    *(volatile uint64_t *)(c->region + tp_rsag4_gather(c, c->rank) + c->trailer) = seq;
+
+    memset(issued, 0, sizeof(issued)); di = 0;
+    for (int d = 0; d < 4; d++) if (d != c->rank) {
+        int k = di++ % c->ntni;
+        int x = tp_rsag4_put_nb(c, d, tp_rsag4_reduced(c),
+                                tp_rsag4_gather(c, c->rank), bytes, k);
+        if (x < 0) return -1; issued[k] += x;
+    }
+    if (tp_rsag4_drain_tcq(c, issued)) return -1;
+    memset(issued, 0, sizeof(issued)); di = 0;
+    for (int d = 0; d < 4; d++) if (d != c->rank) {
+        int k = di++ % c->ntni;
+        int x = tp_rsag4_put_nb(c, d, tp_rsag4_reduced(c) + c->trailer,
+                                tp_rsag4_gather(c, c->rank) + c->trailer, 8, k);
+        if (x < 0) return -1; issued[k] += x;
+    }
+    if (tp_rsag4_drain_tcq(c, issued)) return -1;
+    for (int s = 0; s < 4; s++) {
+        if (tp_rsag4_wait(c, tp_rsag4_gather(c, s), seq)) return -1;
+        int start = s * shard, n = count - start;
+        if (n > shard) n = shard;
+        if (n <= 0) continue;
+        const uint16_t *g = (const uint16_t *)(c->region + tp_rsag4_gather(c, s));
+#if defined(__ARM_FEATURE_SVE)
+        for (int i = 0; i < n; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+            svuint32_t u = svlsl_n_u32_x(pg, svld1uh_u32(pg, g + i), 16);
+            svst1(pg, buf + start + i, svreinterpret_f32_u32(u));
+        }
+#else
+        for (int i = 0; i < n; i++) {
+            uint32_t u = (uint32_t)g[i] << 16;
+            memcpy(buf + start + i, &u, sizeof(u));
+        }
+#endif
+    }
+    return 0;
+}
+
 static inline void tp_rsag4_free(tp_rsag4 *c) {
     if (!c || !c->region) return;
     for (int k = 0; k < c->ntni; k++) utofu_dereg_mem(c->vcq[k], c->base[k], 0);

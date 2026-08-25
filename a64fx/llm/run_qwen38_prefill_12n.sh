@@ -15,11 +15,21 @@ export OMP_NUM_THREADS=$LLM_THREADS OMP_PROC_BIND=${OMP_PROC_BIND:-spread} OMP_P
 export NUMA_DISTRIBUTE=1 NUMA_N_CMGS=4 TF_HIER_BARRIER=0 TF_NO_PANEL=1
 export GGUF_LAZY_MMAP=1 TF_FORCE_MMAP=1 TF_LOAD_KEEPCACHE=0
 export TF_PREFILL_KEEP_POOL_OFF=${TF_PREFILL_KEEP_POOL_OFF:-1}
+export TF_PODD_CMG=${TF_PODD_CMG:-0}
 export TF_SSM_FUSED_DOTS=${TF_SSM_FUSED_DOTS:-1}
 export TF_SILU_SVE=${TF_SILU_SVE:-1}
 export Q38_PREFILL_STAGE=$STAGE
 export Q38_PREFILL_TP_SIZE=$TP_SIZE
 export Q38_PREFILL_BF16=${Q38_PREFILL_BF16:-exact}
+export TP_STAGE_BF16_PV=0
+export TF_SOFTMAX_SVE=${TF_SOFTMAX_SVE:-1}
+export TF_PODD_FFN_PIPE=${TF_PODD_FFN_PIPE:-0}
+export TF_SSM_SCAN4=${TF_SSM_SCAN4:-0}
+if [ -z "${Q38_PREFILL_COMM:-}" ]; then
+    if [ "$Q38_PREFILL_BF16" = bf16-act ]; then export Q38_PREFILL_COMM=utofu-bf16
+    else export Q38_PREFILL_COMM=mpi
+    fi
+fi
 if [ -z "${Q38_PREFILL_CHUNK:-}" ]; then
     if [ "$Q38_PREFILL_BF16" = bf16-act ]; then export Q38_PREFILL_CHUNK=252
     else export Q38_PREFILL_CHUNK=256
@@ -45,7 +55,7 @@ case "$MODE" in
     check|bench|profile)
         make qwen38_prefill_runner CC=fcc OPENMP=1
         case "${Q38_PREFILL_COMM:-mpi}" in
-            utofu|utofu-rsag|utofu-tree)
+            utofu|utofu-rsag|utofu-bf16|utofu-tree)
                 make -C ../utofu-tests tofu_topo_helper >/dev/null
                 mpiexec -np "$NODES" ../utofu-tests/tofu_topo_helper
                 ;;

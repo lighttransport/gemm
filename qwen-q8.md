@@ -2139,3 +2139,36 @@ the first chunk.  An actual-shape `252x5120x3840` p-odd microbenchmark measured
 2.56 TFLOP/s/node including its legacy weight pack and output transpose,
 confirming driver headroom while also showing that communication and non-GEMM
 phases must be reduced alongside GEMM.
+
+#### Corrected BF16 prefill layout and 424 tok/s (2026-08-25)
+
+The earlier 230--232 tok/s BF16-activation ceiling was invalidated by a layout
+initialization bug.  `transformer_tp_load_stage` defaults native BF16 tensors to
+the decode-only PV8 layout, while the prefill runner set `TF_PODD` only after
+loading and then treated those PV8 bytes as row-major input to the p-odd packer.
+The dispatcher selected PV8 before p-odd, so the advertised `2x12` projection
+path was not actually running.  The runner and launcher now force
+`TP_STAGE_BF16_PV=0` before the stage load for both PV48 and BF16-activation
+prefill.
+
+With genuine row-major-to-p-odd weights, the 128-token gate changes from the
+corrupted-path `192550` to **`1293`**, matching native Q8.  At 4096/chunk252 the
+MPI path reaches **408.10 tok/s**, with projection phases roughly halved.  A
+deterministic BF16-wire uTofu RSAG truncates rank partials to BF16, sums ranks
+0..3 in FP32, and all-gathers BF16; it preserves `1293`/`62842` and reaches
+**423.97 tok/s**:
+
+| phase, rank 0 | corrected MPI | BF16-wire uTofu |
+|---|---:|---:|
+| projection + output + FFN GEMMs | 4.12 s | 4.10 s |
+| TP collectives | 1.77 s | 1.36 s |
+| attention kernel | 0.67 s | 0.67 s |
+| end-to-end | 10.037 s | **9.661 s** |
+
+SVE FEXPA softmax is enabled for prefill and reduced the attention kernel from
+about 0.89 s to 0.67--0.71 s without changing either corrected gate.  CMG-local
+activation replication (227.53 vs 225.60 tok/s on the old broken layout), a
+four-worker-per-head DeltaNet scan (1.68 vs 1.04 s scan), and direct FFN
+up/SiLU/down packing (405.65 vs 408.10 tok/s corrected MPI) were all neutral or
+slower and remain opt-in diagnostics.  Chunk192 reached 422.21 tok/s, so
+chunk252 remains the default.

@@ -3217,6 +3217,10 @@ static void tf_qk_norm(float *vec, int n_heads, int head_dim, const qtensor *nor
 /* Forward declarations — defined after fast_exp_avx2 */
 static void tf_softmax(float *x, int n);
 static void tf_silu_mul_avx2(float *out, const float *gate, const float *up, int n);
+#if defined(__ARM_FEATURE_SVE)
+static inline svfloat32_t tf_exp2_fexpa_approx_sve(svbool_t pg,
+                                                   svfloat32_t x);
+#endif
 
 /* Multi-head attention worker for threading */
 typedef struct {
@@ -3483,6 +3487,43 @@ static void tf_softmax(float *x, int n) {
         _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vinv));
     float inv_sum = 1.0f / sum;
     for (; i < n; i++) x[i] *= inv_sum;
+#elif defined(__ARM_FEATURE_SVE)
+    static int softmax_sve = -1;
+    if (softmax_sve < 0) {
+        const char *e = getenv("TF_SOFTMAX_SVE");
+        softmax_sve = e && atoi(e) != 0;
+    }
+    if (softmax_sve) {
+        svbool_t all = svptrue_b32();
+        svfloat32_t vmax = svdup_f32(-INFINITY);
+        for (int i = 0; i < n; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+            vmax = svmax_f32_m(pg, vmax, svld1(pg, x + i));
+        }
+        float max_val = svmaxv_f32(all, vmax);
+        svfloat32_t vsum = svdup_f32(0.0f);
+        for (int i = 0; i < n; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+            svfloat32_t z = svmul_n_f32_x(pg,
+                svsub_n_f32_x(pg, svld1(pg, x + i), max_val),
+                1.4426950408889634f);
+            z = svmax_n_f32_x(pg, z, -126.0f);
+            svfloat32_t e = tf_exp2_fexpa_approx_sve(pg, z);
+            svst1(pg, x + i, e);
+            vsum = svadd_f32_m(pg, vsum, e);
+        }
+        float inv = 1.0f / svaddv_f32(all, vsum);
+        for (int i = 0; i < n; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+            svst1(pg, x + i, svmul_n_f32_x(pg, svld1(pg, x + i), inv));
+        }
+        return;
+    }
+    float max_val = x[0];
+    for (int i = 1; i < n; i++) if (x[i] > max_val) max_val = x[i];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - max_val); sum += x[i]; }
+    for (int i = 0; i < n; i++) x[i] /= sum;
 #else
     float max_val = x[0];
     for (int i = 1; i < n; i++) if (x[i] > max_val) max_val = x[i];
@@ -6000,6 +6041,109 @@ static void *tf_ssm_recurrence_worker(void *arg) {
     }
     return NULL;
 }
+
+#if defined(__ARM_FEATURE_SVE)
+static inline svfloat32_t tf_exp2_fexpa_approx_sve(svbool_t pg,
+                                                   svfloat32_t x);
+/* TP4 batched DeltaNet scan: Qwen3.8 has 48 global V heads, hence only 12
+ * local heads after TP4. The old head-parallel loop used 12/48 cores. Split
+ * each 128-row recurrent state into four disjoint 32-row slices. Every worker
+ * retains its rows for the complete token sequence, preserving recurrence
+ * order; the lane-0 full-head RMS dot preserves the old reduction order. */
+static void tf_ssm_scan4_batch(float *rec_state, float *Q, float *K,
+        float *V, float *out, const float *alpha, const float *beta,
+        const float *gate, const float *norm_w, float *scratch,
+        int N, int nh, int ds, int q_stride, int k_stride, int v_stride,
+        int out_stride, int gate_stride, float scale, float eps, int nt) {
+    float *kq = scratch;
+    float *decay = scratch + (size_t)N * nh;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int z = 0; z < N * nh; z++) {
+        int t = z / nh, h = z % nh;
+        float *q = Q + (size_t)t * q_stride + h * ds;
+        const float *k = K + (size_t)t * k_stride + h * ds;
+        svfloat32_t vs = svdup_f32(scale);
+        for (int i = 0; i < ds; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)ds);
+            svst1(pg, q + i, svmul_f32_x(pg, svld1(pg, q + i), vs));
+        }
+        kq[z] = tf_f32_dot_sve(k, q, ds);
+        decay[z] = expf(alpha[(size_t)t * nh + h]);
+    }
+
+    float inv_norm[64];
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt) shared(inv_norm)
+    #endif
+    {
+        int tid = 0, team = 1;
+        #ifdef _OPENMP
+        tid = omp_get_thread_num(); team = omp_get_num_threads();
+        #endif
+        if (team == nh * 4 && ds % 4 == 0) {
+            int h = tid / 4, lane = tid % 4;
+            int r0 = lane * ds / 4, r1 = (lane + 1) * ds / 4;
+            float *state_h = rec_state + (size_t)h * ds * ds;
+            for (int t = 0; t < N; t++) {
+                float *q = Q + (size_t)t * q_stride + h * ds;
+                const float *k = K + (size_t)t * k_stride + h * ds;
+                const float *v = V + (size_t)t * v_stride + h * ds;
+                float *o = out + (size_t)t * out_stride + h * ds;
+                float vd = decay[(size_t)t * nh + h];
+                float vb = beta[(size_t)t * nh + h];
+                float hkq = kq[(size_t)t * nh + h];
+                for (int r = r0; r < r1; r++) {
+                    float *row = state_h + (size_t)r * ds;
+                    svfloat32_t vdecay = svdup_f32(vd);
+                    for (int c = 0; c < ds; c += (int)svcntw()) {
+                        svbool_t pg = svwhilelt_b32((uint64_t)c, (uint64_t)ds);
+                        svst1(pg, row + c,
+                              svmul_f32_x(pg, svld1(pg, row + c), vdecay));
+                    }
+                    float sk, old_o;
+                    tf_f32_dot_sve_2vec(&sk, &old_o, row, k, q, ds);
+                    float delta = (v[r] - sk) * vb;
+                    svfloat32_t vdelta = svdup_f32(delta);
+                    for (int c = 0; c < ds; c += (int)svcntw()) {
+                        svbool_t pg = svwhilelt_b32((uint64_t)c, (uint64_t)ds);
+                        svst1(pg, row + c, svmla_f32_x(pg, svld1(pg, row + c),
+                                                       vdelta, svld1(pg, k + c)));
+                    }
+                    o[r] = old_o + delta * hkq;
+                }
+                #ifdef _OPENMP
+                #pragma omp barrier
+                #endif
+                if (lane == 0) {
+                    float ss = tf_f32_dot_sve(o, o, ds);
+                    inv_norm[h] = 1.0f / sqrtf(ss / ds + eps);
+                }
+                #ifdef _OPENMP
+                #pragma omp barrier
+                #endif
+                float ns = inv_norm[h];
+                const float *g = gate + (size_t)t * gate_stride + h * ds;
+                for (int i = r0; i < r1; i += (int)svcntw()) {
+                    svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)r1);
+                    svfloat32_t zv = svld1(pg, g + i);
+                    svfloat32_t et = svmul_n_f32_x(pg, zv, -1.4426950408889634f);
+                    et = svmax_n_f32_x(pg, svmin_n_f32_x(pg, et, 80.0f), -80.0f);
+                    svfloat32_t den = svadd_n_f32_x(pg,
+                        tf_exp2_fexpa_approx_sve(pg, et), 1.0f);
+                    svfloat32_t inv = svrecpe_f32(den);
+                    inv = svmul_f32_x(pg, inv, svrecps_f32(den, inv));
+                    svfloat32_t y = svmul_n_f32_x(pg, svld1(pg, o + i), ns);
+                    y = svmul_f32_x(pg, y, svld1(pg, norm_w + i));
+                    y = svmul_f32_x(pg, y, svmul_f32_x(pg, zv, inv));
+                    svst1(pg, o + i, y);
+                }
+            }
+        }
+    }
+}
+#endif
 
 /* SSM Delta-Net forward for one layer.
  * Input:  m->xb (post-norm hidden state [n_embd])
@@ -10067,6 +10211,8 @@ size_t transformer_prepack_q8b6_range(transformer_model*m,int l0,int l1){
 extern void sgemm_bf16_2x12(int64_t K, const void *A, const void *B, float *C, int64_t ldc);
 static uint16_t *tf_podd_Wp = NULL, *tf_podd_Xa = NULL;
 static size_t tf_podd_Wcap = 0, tf_podd_Xcap = 0;
+static uint16_t *tf_podd_Xnext = NULL;
+static size_t tf_podd_Xnext_cap = 0;
 static const float *tf_podd_cache_x = NULL;
 static int tf_podd_cache_n = 0, tf_podd_cache_k = 0, tf_podd_cache_xs = 0;
 static float tf_podd_cache_tag[8];
@@ -10087,6 +10233,12 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
     if (n_rows % PMR) return 0;
     int FT = n_rows / PMR, TT = (N + PNR - 1) / PNR;
     size_t xn = (size_t)TT * K * PNR * 2;
+    static int cmg_local = -1;
+    if (cmg_local < 0) {
+        const char *e = getenv("TF_PODD_CMG");
+        cmg_local = e && atoi(e) != 0;
+    }
+    int ncmg = cmg_local && nt >= 4 ? 4 : 1;
     const uint16_t *Wp;
     if (prepacked) {
         Wp = W;   /* data already k-major interleaved (packed at load) */
@@ -10097,7 +10249,13 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
         tf_podd_pack_w(W, tf_podd_Wp, n_rows, K, nt);
         Wp = tf_podd_Wp;
     }
-    if (xn > tf_podd_Xcap) { free(tf_podd_Xa); tf_podd_Xa = (uint16_t *)malloc(xn); tf_podd_Xcap = tf_podd_Xa ? xn : 0; tf_podd_cache_x = NULL; }
+    size_t xalloc = xn * (size_t)ncmg;
+    if (xalloc > tf_podd_Xcap) {
+        free(tf_podd_Xa);
+        tf_podd_Xa = (uint16_t *)tf_aligned_alloc_notouch(256, xalloc);
+        tf_podd_Xcap = tf_podd_Xa ? xalloc : 0;
+        tf_podd_cache_x = NULL;
+    }
     if (!tf_podd_Xa) return 0;
     uint16_t *Xa = tf_podd_Xa;
     static int reuse_x = -1;
@@ -10116,18 +10274,38 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
      * ffn_down TT=10 starved 38 threads while K=15360 made each unit 4x heavier). */
     if (!xhit) {
     #ifdef _OPENMP
-    #pragma omp parallel for num_threads(nt) schedule(static) collapse(2)
+    #pragma omp parallel num_threads(nt)
     #endif
-    for (int tt = 0; tt < TT; tt++) for (int n = 0; n < PNR; n++) {
-            uint16_t *Xb = Xa + (size_t)tt * K * PNR;
-            int tok = tt*PNR + n;
-            if (tok >= N) { for (int k = 0; k < K; k++) Xb[k*PNR + n] = 0; continue; }
+    {
+        int tid = 0, team = 1;
+    #ifdef _OPENMP
+        tid = omp_get_thread_num(); team = omp_get_num_threads();
+    #endif
+        int cmg = ncmg == 4 ? 4 * tid / team : 0;
+        int t0 = ncmg == 4 ? team * cmg / 4 : 0;
+        int t1 = ncmg == 4 ? team * (cmg + 1) / 4 : team;
+        int ltid = tid - t0, lteam = t1 - t0;
+        uint16_t *Xc = Xa + (size_t)cmg * xn / 2;
+        for (int z = ltid; z < TT * PNR; z += lteam) {
+            int tt = z / PNR, n = z % PNR;
+            uint16_t *Xb = Xc + (size_t)tt * K * PNR;
+            int tok = tt * PNR + n;
+            if (tok >= N) {
+                for (int k = 0; k < K; k++) Xb[k * PNR + n] = 0;
+                continue;
+            }
             const float *xr = X + (size_t)tok * Xs;
-            svuint32_t lanes = svindex_u32(0, (uint32_t)PNR);   /* j*12 */
-            for (int k = 0; k < K; k += (int)svcntw()) { svbool_t pg = svwhilelt_b32(k, K);
-                svuint32_t hu = svlsr_n_u32_x(pg, svreinterpret_u32_f32(svld1_f32(pg, xr + k)), 16);
-                svuint32_t idx = svadd_n_u32_x(pg, lanes, (uint32_t)(k*PNR + n));
-                svst1h_scatter_u32index_u32(pg, (uint16_t *)Xb, idx, hu); } }
+            svuint32_t lanes = svindex_u32(0, (uint32_t)PNR);
+            for (int k = 0; k < K; k += (int)svcntw()) {
+                svbool_t pg = svwhilelt_b32(k, K);
+                svuint32_t hu = svlsr_n_u32_x(pg,
+                    svreinterpret_u32_f32(svld1_f32(pg, xr + k)), 16);
+                svuint32_t idx = svadd_n_u32_x(pg, lanes,
+                                               (uint32_t)(k * PNR + n));
+                svst1h_scatter_u32index_u32(pg, Xb, idx, hu);
+            }
+        }
+    }
     }
     if (!xhit) {
         tf_podd_cache_x = X; tf_podd_cache_n = N;
@@ -10147,19 +10325,33 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
         #ifdef _OPENMP
         #pragma omp parallel num_threads(nt)
         #endif
-        { float Ct[32 * 12];
-          for (int kp = 0; kp < NP; kp++) {
+        {
+          float Ct[32 * 12]; int tid = 0, team = 1;
+          #ifdef _OPENMP
+          tid = omp_get_thread_num(); team = omp_get_num_threads();
+          #endif
+          int cmg = ncmg == 4 ? 4 * tid / team : 0;
+          int t0 = ncmg == 4 ? team * cmg / 4 : 0;
+          int t1 = ncmg == 4 ? team * (cmg + 1) / 4 : team;
+          int ltid = tid - t0, lteam = t1 - t0;
+          int ft0 = ncmg == 4 ? FT * cmg / 4 : 0;
+          int ft1 = ncmg == 4 ? FT * (cmg + 1) / 4 : FT;
+          const uint16_t *Xc = Xa + (size_t)cmg * xn / 2;
+          for (int ft = ft0 + ltid; ft < ft1; ft += lteam) {
+            for (int kp = 0; kp < NP; kp++) {
               int k0 = kp * Kc, kk = (K - k0 < Kc) ? (K - k0) : Kc;
-              #ifdef _OPENMP
-    #pragma omp for schedule(static) collapse(2) nowait
-              #endif
-              for (int ft = 0; ft < FT; ft++) for (int tt = 0; tt < TT; tt++) {
+              for (int tt = 0; tt < TT; tt++) {
                   sgemm_bf16_2x12(kk, Wp + (size_t)ft*K*PMR + (size_t)k0*PMR,
-                                  Xa + (size_t)tt*K*PNR + (size_t)k0*PNR, Ct, PMR);
+                                  Xc + (size_t)tt*K*PNR + (size_t)k0*PNR, Ct, PMR);
                   for (int n = 0; n < PNR; n++) { int tok = tt*PNR + n; if (tok >= N) continue;
                       float *yp = Y + (size_t)tok * Ys + ft*PMR;
                       if (kp == 0) for (int mm = 0; mm < PMR; mm++) yp[mm]  = Ct[mm + n*PMR];
-                      else         for (int mm = 0; mm < PMR; mm++) yp[mm] += Ct[mm + n*PMR]; } } } }
+                      else         for (int mm = 0; mm < PMR; mm++) yp[mm] += Ct[mm + n*PMR];
+                  }
+              }
+            }
+          }
+        }
         return 1;
     }
     static int direct_out = -1;
@@ -10170,19 +10362,27 @@ static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
     #ifdef _OPENMP
     #pragma omp parallel num_threads(nt)
     #endif
-    { float Ct[32 * 12];
+    {
+      float Ct[32 * 12]; int tid = 0, team = 1;
       #ifdef _OPENMP
-    #pragma omp for schedule(static) collapse(2) nowait
+      tid = omp_get_thread_num(); team = omp_get_num_threads();
       #endif
-      for (int ft = 0; ft < FT; ft++) for (int tt = 0; tt < TT; tt++) {
+      int cmg = ncmg == 4 ? 4 * tid / team : 0;
+      int t0 = ncmg == 4 ? team * cmg / 4 : 0;
+      int t1 = ncmg == 4 ? team * (cmg + 1) / 4 : team;
+      int ltid = tid - t0, lteam = t1 - t0;
+      int ft0 = ncmg == 4 ? FT * cmg / 4 : 0;
+      int ft1 = ncmg == 4 ? FT * (cmg + 1) / 4 : FT;
+      const uint16_t *Xc = Xa + (size_t)cmg * xn / 2;
+      for (int ft = ft0 + ltid; ft < ft1; ft += lteam) for (int tt = 0; tt < TT; tt++) {
           int tok0 = tt * PNR;
           if (direct_out && tok0 + PNR <= N) {
               sgemm_bf16_2x12(K, Wp + (size_t)ft*K*PMR,
-                              Xa + (size_t)tt*K*PNR,
+                              Xc + (size_t)tt*K*PNR,
                               Y + (size_t)tok0*Ys + ft*PMR, Ys);
           } else {
               sgemm_bf16_2x12(K, Wp + (size_t)ft*K*PMR,
-                              Xa + (size_t)tt*K*PNR, Ct, PMR);
+                              Xc + (size_t)tt*K*PNR, Ct, PMR);
               for (int n = 0; n < PNR; n++) {
                   int tok = tok0 + n; if (tok >= N) continue;
                   float *yp = Y + (size_t)tok * Ys + ft*PMR;
@@ -10262,6 +10462,140 @@ static int tf_gemm_bf16_podd_qkv(float *Yq, float *Yk, float *Yv,
     }
     return 1;
 }
+
+/* Consume an already p_odd-packed activation without inspecting/repacking a
+ * token-major FP32 source. Used by the fused FFN up->SiLU->down path. */
+static int tf_podd_compute_packed(float *Y, const uint16_t *Wp,
+        const uint16_t *Xa, int n_rows, int K, int N, int Ys, int nt) {
+    const int PMR = 32, PNR = 12;
+    if (!Wp || !Xa || n_rows % PMR) return 0;
+    int FT = n_rows / PMR, TT = (N + PNR - 1) / PNR;
+    if (K > 6144) {
+        const int Kc = 4096; int NP = (K + Kc - 1) / Kc;
+        #ifdef _OPENMP
+        #pragma omp parallel num_threads(nt)
+        #endif
+        {
+            int tid = 0, team = 1; float Ct[PMR * PNR];
+            #ifdef _OPENMP
+            tid = omp_get_thread_num(); team = omp_get_num_threads();
+            #endif
+            for (int ft = tid; ft < FT; ft += team) for (int kp = 0; kp < NP; kp++) {
+                int k0 = kp * Kc, kk = K - k0 < Kc ? K - k0 : Kc;
+                for (int tt = 0; tt < TT; tt++) {
+                    sgemm_bf16_2x12(kk, Wp + (size_t)ft * K * PMR + (size_t)k0 * PMR,
+                        Xa + (size_t)tt * K * PNR + (size_t)k0 * PNR, Ct, PMR);
+                    for (int n = 0; n < PNR; n++) {
+                        int tok = tt * PNR + n; if (tok >= N) continue;
+                        float *yp = Y + (size_t)tok * Ys + ft * PMR;
+                        for (int m = 0; m < PMR; m++) {
+                            float v = Ct[m + n * PMR];
+                            if (kp == 0) yp[m] = v; else yp[m] += v;
+                        }
+                    }
+                }
+            }
+        }
+        return 1;
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    {
+        int tid = 0, team = 1; float Ct[PMR * PNR];
+        #ifdef _OPENMP
+        tid = omp_get_thread_num(); team = omp_get_num_threads();
+        #endif
+        for (int ft = tid; ft < FT; ft += team) for (int tt = 0; tt < TT; tt++) {
+            int tok0 = tt * PNR;
+            if (tok0 + PNR <= N)
+                sgemm_bf16_2x12(K, Wp + (size_t)ft * K * PMR,
+                    Xa + (size_t)tt * K * PNR,
+                    Y + (size_t)tok0 * Ys + ft * PMR, Ys);
+            else {
+                sgemm_bf16_2x12(K, Wp + (size_t)ft * K * PMR,
+                    Xa + (size_t)tt * K * PNR, Ct, PMR);
+                for (int n = 0; n < PNR; n++) {
+                    int tok = tok0 + n; if (tok >= N) continue;
+                    memcpy(Y + (size_t)tok * Ys + ft * PMR,
+                           Ct + n * PMR, PMR * sizeof(float));
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+/* Gate has already populated Ygate and left its normalized input in tf_podd_Xa.
+ * Evaluate up, apply the production SVE SiLU, truncate directly into the p_odd
+ * activation layout required by down, then run down without FP32 up/inner
+ * buffers or a separate activation pack. */
+static int tf_gemm_bf16_podd_ffn_up_down(float *Y, float *Ygate,
+        const uint16_t *Wup, const uint16_t *Wdown, int local_ff,
+        int ne, int N, int nt) {
+    const int PMR = 32, PNR = 12;
+    if (!Wup || !Wdown || !tf_podd_Xa || local_ff % PMR || ne % PMR) return 0;
+    int FT = local_ff / PMR, TT = (N + PNR - 1) / PNR;
+    size_t elems = (size_t)TT * local_ff * PNR;
+    size_t bytes = elems * sizeof(uint16_t);
+    if (bytes > tf_podd_Xnext_cap) {
+        free(tf_podd_Xnext);
+        tf_podd_Xnext = (uint16_t *)tf_aligned_alloc_notouch(256, bytes);
+        tf_podd_Xnext_cap = tf_podd_Xnext ? bytes : 0;
+    }
+    if (!tf_podd_Xnext) return 0;
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    {
+        int tid = 0, team = 1; float Ct[PMR * PNR];
+        #ifdef _OPENMP
+        tid = omp_get_thread_num(); team = omp_get_num_threads();
+        #endif
+        for (int ft = tid; ft < FT; ft += team) for (int tt = 0; tt < TT; tt++) {
+            sgemm_bf16_2x12(ne, Wup + (size_t)ft * ne * PMR,
+                tf_podd_Xa + (size_t)tt * ne * PNR, Ct, PMR);
+            uint16_t *Xd = tf_podd_Xnext + (size_t)tt * local_ff * PNR;
+            for (int n = 0; n < PNR; n++) {
+                int tok = tt * PNR + n;
+#if defined(__ARM_FEATURE_SVE)
+                for (int m = 0; m < PMR; m += (int)svcntw()) {
+                    svbool_t pg = svwhilelt_b32((uint64_t)m, (uint64_t)PMR);
+                    svfloat32_t y = svdup_f32(0.0f);
+                    if (tok < N) {
+                        svfloat32_t g = svld1(pg,
+                            Ygate + (size_t)tok * local_ff + ft * PMR + m);
+                        svfloat32_t z = svmul_n_f32_x(pg, g, -1.4426950408889634f);
+                        z = svmax_n_f32_x(pg, svmin_n_f32_x(pg, z, 80.0f), -80.0f);
+                        svfloat32_t den = svadd_n_f32_x(pg,
+                            tf_exp2_fexpa_approx_sve(pg, z), 1.0f);
+                        svfloat32_t inv = svrecpe_f32(den);
+                        inv = svmul_f32_x(pg, inv, svrecps_f32(den, inv));
+                        y = svmul_f32_x(pg, svmul_f32_x(pg, g, inv),
+                                       svld1(pg, Ct + n * PMR + m));
+                    }
+                    svuint32_t u = svlsr_n_u32_x(pg, svreinterpret_u32_f32(y), 16);
+                    svuint32_t idx = svindex_u32((uint32_t)((ft * PMR + m) * PNR + n),
+                                                 (uint32_t)PNR);
+                    svst1h_scatter_u32index_u32(pg, Xd, idx, u);
+                }
+#else
+                for (int m = 0; m < PMR; m++) {
+                    float y = 0.0f;
+                    if (tok < N) {
+                        float g = Ygate[(size_t)tok * local_ff + ft * PMR + m];
+                        y = g / (1.0f + expf(-g)) * Ct[m + n * PMR];
+                    }
+                    uint32_t u; memcpy(&u, &y, sizeof(u));
+                    Xd[((size_t)ft * PMR + m) * PNR + n] = (uint16_t)(u >> 16);
+                }
+#endif
+            }
+        }
+    }
+    return tf_podd_compute_packed(Y, Wdown, tf_podd_Xnext,
+                                  ne, local_ff, N, ne, nt);
+}
 /* Pre-pack small-K BF16 weights (gate/up/q/k/v) IN-PLACE to k-major-interleaved so
  * the p_odd GEMM skips the per-call W-pack (~2.5x the on-the-fly podd: 1767->4499 GF
  * standalone). In-place via one temp (no extra steady memory). This changes the row-
@@ -10278,14 +10612,14 @@ int transformer_prepack_podd_range(transformer_model *m,int l0,int l1) {
                          &m->layers[l].ssm_gate,&m->layers[l].ssm_alpha,
                          &m->layers[l].ssm_beta,&m->layers[l].ssm_out};
         for (int i = 0; i < 12; i++) if (ws[i]->data && ws[i]->type == GGML_TYPE_BF16) {
-            size_t s = (size_t)ws[i]->n_rows * ws[i]->n_cols * 2; if (s > maxsz) maxsz = s; }
+            size_t s = (size_t)ws[i]->n_rows * ws[i]->n_cols * 2;
+            if (s > maxsz) maxsz = s;
+        }
     }
     if (!maxsz) return 0;
     uint16_t *tmp = (uint16_t *)malloc(maxsz);
     if (!tmp) { fprintf(stderr, "podd prepack: tmp alloc failed (%zu)\n", maxsz); return 0; }
     int nt = m->n_threads > 1 ? m->n_threads : 1, cnt = 0;
-    /* pre-packed -> pack-free podd at ANY K (the K<4096 limit was only for the
-     * on-the-fly per-GEMM pack cost; with prepack large-K ffn_down/out benefit too). */
     for (int l = l0; l < l1; l++) {
         qtensor *ws[] = {&m->layers[l].ffn_gate, &m->layers[l].ffn_up, &m->layers[l].ffn_down,
                          &m->layers[l].attn_q, &m->layers[l].attn_k, &m->layers[l].attn_v,
@@ -13144,6 +13478,21 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             tf_dequant_row(&L->ssm_norm, 0, ssm_norm_w);
             float rec_scale = 1.0f / sqrtf((float)m->ssm_d_state);
             pt = tf_time_ms();
+            static int ssm_scan4 = -1;
+            if (ssm_scan4 < 0) {
+                const char *e = getenv("TF_SSM_SCAN4");
+                ssm_scan4 = e && atoi(e) != 0;
+            }
+#if defined(__ARM_FEATURE_SVE)
+            if (ssm_scan4 && !tf_batch_ssm_snapshots && m->ssm_dt_rank == 12 &&
+                m->ssm_d_state == 128 && m->n_threads == 48) {
+                tf_ssm_scan4_batch(m->recurrent_state[l], proj, attout, up,
+                    inner, kv, vv, gate, ssm_norm_w, out, N, m->ssm_dt_rank,
+                    m->ssm_d_state, lq, qdim, max_inner, ld, ld,
+                    rec_scale, m->rms_norm_eps, m->n_threads);
+            } else
+#endif
+            {
             #ifdef _OPENMP
             #pragma omp parallel for num_threads(m->n_threads) schedule(static)
             #endif
@@ -13204,6 +13553,7 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                                (z[i] / (1.0f + expf(-z[i])));
 #endif
                 }
+            }
             }
             pprof->ssm_scan_ms += tf_time_ms() - pt;
             pt = tf_time_ms();
@@ -13321,19 +13671,36 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                          m->rms_norm_eps, m->matvec_tmp);
         pprof->norm_ms += tf_time_ms() - pt;
         int ld = L->ffn_gate.n_rows;
+        static int podd_ffn_pipe = -1;
+        if (podd_ffn_pipe < 0) {
+            const char *e = getenv("TF_PODD_FFN_PIPE");
+            podd_ffn_pipe = e && atoi(e) != 0;
+        }
+        int ffn_piped = 0;
         pt = tf_time_ms();
         tf_gemm_f16_mt_tokenmajor(gate, &L->ffn_gate, norm, ld, N,
                                   ld, ne, m->n_threads);
-        tf_gemm_f16_mt_tokenmajor(up, &L->ffn_up, norm, ld, N,
-                                  ld, ne, m->n_threads);
         pprof->ffn_proj_ms += tf_time_ms() - pt;
-        pt = tf_time_ms();
-        tf_silu_mul_avx2(inner, gate, up, N * ld);
-        pprof->ffn_act_ms += tf_time_ms() - pt;
-        pt = tf_time_ms();
-        tf_gemm_f16_mt_tokenmajor(out, &L->ffn_down, inner, ne, N,
-                                  ne, ld, m->n_threads);
-        pprof->ffn_down_ms += tf_time_ms() - pt;
+        if (podd_ffn_pipe) {
+            pt = tf_time_ms();
+            ffn_piped = tf_gemm_bf16_podd_ffn_up_down(out, gate,
+                (const uint16_t *)L->ffn_up.data,
+                (const uint16_t *)L->ffn_down.data, ld, ne, N, m->n_threads);
+            pprof->ffn_down_ms += tf_time_ms() - pt;
+        }
+        if (!ffn_piped) {
+            pt = tf_time_ms();
+            tf_gemm_f16_mt_tokenmajor(up, &L->ffn_up, norm, ld, N,
+                                      ld, ne, m->n_threads);
+            pprof->ffn_proj_ms += tf_time_ms() - pt;
+            pt = tf_time_ms();
+            tf_silu_mul_avx2(inner, gate, up, N * ld);
+            pprof->ffn_act_ms += tf_time_ms() - pt;
+            pt = tf_time_ms();
+            tf_gemm_f16_mt_tokenmajor(out, &L->ffn_down, inner, ne, N,
+                                      ne, ld, m->n_threads);
+            pprof->ffn_down_ms += tf_time_ms() - pt;
+        }
         pt = tf_time_ms();
         if (m->tp_ffn_sharded && m->tp_allreduce_fn)
             m->tp_allreduce_fn(out, N * ne, m->tp_allreduce_ctx);
