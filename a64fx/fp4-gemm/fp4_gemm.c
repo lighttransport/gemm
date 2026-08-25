@@ -198,12 +198,12 @@ int fp4_matrix_prepare_n32(fp4_matrix *p){
 }
 
 int fp4_matrix_prepare_u8(fp4_matrix*p){
-    if(!p||!p->codes_n32||p->n%32||p->k%32)return-1;
+    if(!p||!p->codes_n32||p->n%128||p->k%32)return-1;
     free(p->codes_u8);p->codes_u8=NULL;
     if(posix_memalign((void**)&p->codes_u8,256,(size_t)p->n*p->k))return-1;
-    for(int t=0;t<p->n/32;++t)for(int k=0;k<p->k;++k){
-      const uint8_t*q=p->codes_n32+((size_t)t*p->k+k)*16;
-      uint8_t*d=p->codes_u8+((size_t)t*p->k+k)*32;
+    for(int g=0;g<p->n/32;g+=4)for(int k=0;k<p->k;++k)for(int i=0;i<4;++i){
+      const uint8_t*q=p->codes_n32+((size_t)(g+i)*p->k+k)*16;
+      uint8_t*d=p->codes_u8+(((size_t)(g/4)*p->k+k)*4+i)*32;
       for(int j=0;j<16;++j){d[2*j]=q[j]&15;d[2*j+1]=q[j]>>4;}
     }return 0;
 }
@@ -445,10 +445,10 @@ static inline void gemm_u8tbl_m1_t4_segment(float*c,const _Float16*a,
     svbool_t ph=svptrue_b16(),ps=svptrue_b32();
     svfloat16_t tab=svld1_f16(ph,table_data),h0=svdup_f16(0),h1=h0,h2=h0,h3=h0;
     int bs=w->format==FP4_MX?32:16,nb=w->k/bs;
-    const uint8_t*q0=w->codes_u8+(size_t)(tile+0)*w->k*32;
-    const uint8_t*q1=w->codes_u8+(size_t)(tile+1)*w->k*32;
-    const uint8_t*q2=w->codes_u8+(size_t)(tile+2)*w->k*32;
-    const uint8_t*q3=w->codes_u8+(size_t)(tile+3)*w->k*32;
+    const uint8_t*q0=w->codes_u8+(size_t)(tile/4)*w->k*128+0*32;
+    const uint8_t*q1=w->codes_u8+(size_t)(tile/4)*w->k*128+1*32;
+    const uint8_t*q2=w->codes_u8+(size_t)(tile/4)*w->k*128+2*32;
+    const uint8_t*q3=w->codes_u8+(size_t)(tile/4)*w->k*128+3*32;
     const _Float16*s0=w->scales_n32+(size_t)(tile+0)*nb*32;
     const _Float16*s1=w->scales_n32+(size_t)(tile+1)*nb*32;
     const _Float16*s2=w->scales_n32+(size_t)(tile+2)*nb*32;
@@ -458,7 +458,7 @@ static inline void gemm_u8tbl_m1_t4_segment(float*c,const _Float16*a,
       svfloat16_t sc2=svld1_f16(ph,(const __fp16*)(s2+(size_t)b*32));
       svfloat16_t sc3=svld1_f16(ph,(const __fp16*)(s3+(size_t)b*32));
       for(int k=b*bs;k<(b+1)*bs;++k){svfloat16_t x=svdup_f16((__fp16)a[k]);
-#define DECODE_U8(Q,SC,H) do{svuint16_t q=svld1ub_u16(ph,(Q)+(size_t)k*32); \
+#define DECODE_U8(Q,SC,H) do{svuint16_t q=svld1ub_u16(ph,(Q)+(size_t)k*128); \
         svfloat16_t v=svmul_f16_x(ph,svtbl_f16(tab,q),(SC)); \
         (H)=svmla_f16_x(ph,(H),v,x);}while(0)
         DECODE_U8(q0,sc0,h0);DECODE_U8(q1,sc1,h1);
@@ -536,6 +536,7 @@ typedef struct {
     int k_count,bs;
 } fp4_m1_t4_args;
 extern void fp4_mx_m1_t4_asm(const fp4_m1_t4_args*);
+extern void fp4_mx_u8_m1_t4_asm(const fp4_m1_t4_args*);
 
 static inline void gemm_mx_m1_t4_asm_segment(float*c,const _Float16*a,
         const fp4_matrix*w,int tile,int kbegin,int kend,int add){
@@ -545,6 +546,22 @@ static inline void gemm_mx_m1_t4_asm_segment(float*c,const _Float16*a,
         x.s[i]=w->scales_n32+(size_t)(tile+i)*nb*32+(size_t)(kbegin/32)*32;}
     x.a=a+kbegin;x.out=tmp;x.k_count=kend-kbegin;x.bs=32;
     fp4_mx_m1_t4_asm(&x);
+    svbool_t ph=svptrue_b16(),ps=svptrue_b32();
+    for(int i=0;i<4;++i){svuint16_t hb=svreinterpret_u16_f16(svld1_f16(ph,(const __fp16*)(tmp+i*32)));
+      svfloat32_t lo=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpklo_u32(hb)));
+      svfloat32_t hi=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpkhi_u32(hb)));
+      float*d=c+(tile+i)*32;if(add){lo=svadd_f32_x(ps,lo,svld1_f32(ps,d));
+        hi=svadd_f32_x(ps,hi,svld1_f32(ps,d+16));}svst1_f32(ps,d,lo);svst1_f32(ps,d+16,hi);}
+}
+
+static inline void gemm_mx_u8_m1_t4_asm_segment(float*c,const _Float16*a,
+        const fp4_matrix*w,int tile,int kbegin,int kend,int add){
+    _Float16 tmp[4*32] __attribute__((aligned(256)));
+    int nb=w->k/32;fp4_m1_t4_args x;
+    for(int i=0;i<4;++i){x.q[i]=w->codes_u8+(size_t)(tile/4)*w->k*128+(size_t)kbegin*128+i*32;
+        x.s[i]=w->scales_n32+(size_t)(tile+i)*nb*32+(size_t)(kbegin/32)*32;}
+    x.a=a+kbegin;x.out=tmp;x.k_count=kend-kbegin;x.bs=32;
+    fp4_mx_u8_m1_t4_asm(&x);
     svbool_t ph=svptrue_b16(),ps=svptrue_b32();
     for(int i=0;i<4;++i){svuint16_t hb=svreinterpret_u16_f16(svld1_f16(ph,(const __fp16*)(tmp+i*32)));
       svfloat32_t lo=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpklo_u32(hb)));
@@ -592,7 +609,8 @@ int fp4_gemm_f16_u8tbl_omp(float*c,const _Float16*a,const fp4_matrix*w,int m,
 #pragma omp parallel for num_threads(threads) schedule(static)
     for(int t=0;t<w->n/32;t+=4)for(int kb=0;kb<w->k;kb+=span){
       int ke=kb+span<w->k?kb+span:w->k;
-      gemm_u8tbl_m1_t4_segment(c,a,w,t,kb,ke,kb!=0);
+      if(w->format==FP4_MX)gemm_mx_u8_m1_t4_asm_segment(c,a,w,t,kb,ke,kb!=0);
+      else gemm_u8tbl_m1_t4_segment(c,a,w,t,kb,ke,kb!=0);
     }
     return 0;
 #else

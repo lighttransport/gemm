@@ -110,8 +110,11 @@ operations covers part of the six-cycle `ZIP1`/`TBL` latency. Recommended CMG
 dispatch is direct N32 for M<=6 and the decoded L2 panel for M>=12.
 
 `fp4_matrix_prepare_u8` plus `fp4_gemm_f16_u8tbl_omp` is an opt-in experiment
-that stores one nibble per byte. It removes `ZIP1` but doubles code traffic and
-is slower in useful GFLOP/s. Normal preparation does not allocate this sidecar.
+that stores one nibble per byte. Groups of four N32 tiles are interleaved at
+each K step to form a sequential A64FX stream. The hand-scheduled MXFP4 kernel
+pipelines two K steps and needs only `LD1B`, `TBL`, scale multiply, and FMA for
+each weight vector. It is the fastest M=1 path, but doubles code storage and
+HBM traffic; normal preparation does not allocate this sidecar.
 
 `fp4_matrix_prepare_bitplane` plus `fp4_gemm_f16_bitplane_omp` is a same-density
 M=1 experiment. It transposes each N32 group into four 32-bit bitplanes. Its
