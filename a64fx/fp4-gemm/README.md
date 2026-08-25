@@ -28,6 +28,14 @@ OMP_NUM_THREADS=1 OMP_PROC_BIND=close OMP_PLACES=cores \
 
 # 72 MiB cold-sized FP4 stream, local to one HBM NUMA domain
 numactl --physcpubind=12 --membind=4 ./a64fx/fp4-gemm/bench_fp4_stream
+
+# fapp region contains only warmed, repeated fused M=1 calls.
+make -C a64fx/fp4-gemm fapp
+cd a64fx/fp4-gemm
+OMP_PROC_BIND=close OMP_PLACES=cores \
+  numactl --physcpubind=12-23 --membind=4 \
+  fapp -C -d fapp_fp4_pa1 -Icpupa -Hevent=pa1 \
+  ./bench_fp4_fapp 32768 4096 256 400 12
 ```
 
 The implementation requires `N` and `K` divisible by 32. Arbitrary `M` is

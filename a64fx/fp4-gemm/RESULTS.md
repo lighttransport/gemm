@@ -332,6 +332,34 @@ K-promotion sweeps (K64 through K4096) span only 378--403 GFLOP/s, and explicit
 1/2 KiB look-ahead prefetch remains 397--400 GFLOP/s. These controls rule out
 FP32 spill frequency and ordinary cache-miss latency as the missing factor.
 
+### fapp bottleneck measurement
+
+`bench_fp4_fapp` places an `fp4_m1_t8` fapp region around 400 warmed iterations
+of only the fused M1 call. With N=32768, K=4096, K256 promotion, threads pinned
+to cores 12--23, raw PMU counters summed over the 12 active threads report:
+
+| event | cycles or utilization |
+|---|---:|
+| `STALL_BACKEND` (0x0024) | 29.00% |
+| `FL_COMP_WAIT` (0x018a) | **25.11%** |
+| `LD_COMP_WAIT` (0x0184) | 4.44% |
+| `LD_COMP_WAIT_L1_MISS` (0x0182) | 1.05% |
+| `LD_COMP_WAIT_L2_MISS` (0x0180) | 2.10% |
+| `LD_COMP_WAIT_PFP_BUSY` (0x0186) | 0.02% |
+| FLA valid (0x01a4) | **64.80%** |
+| FLB valid (0x01a5) | **56.87%** |
+| `STALL_FRONTEND` (0x0023) | 0.31% |
+
+The single-core control makes the diagnosis clearer: FLA is valid 76.07%, FLB
+66.80%, `FL_COMP_WAIT` rises to 29.53%, while `LD_COMP_WAIT` falls to 1.72%.
+Therefore the actual bottleneck is the floating-point/permutation dependency
+network, not HBM2, frontend delivery, or the load/prefetch ports. In particular,
+each decoded vector has the serial `ZIP1` (six cycles) -> `TBL` (six cycles) ->
+`FMLA` chain; `ZIP1` and `TBL` are both restricted to FLA. Eight independent
+output chains hide only part of those completion latencies. This also explains
+why prefetching and longer FP16 accumulation blocks do not materially improve
+the kernel.
+
 A second packed experiment replaced each 256-entry gather with two sequential
 16-entry `TBL`s, one for each activation in a packed K pair. It is exact and
 removes indexed loads, but requires 16 `TBL`s per K pair to cover 128 rows.
