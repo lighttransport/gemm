@@ -1959,8 +1959,8 @@ static inline void matvec_fp8e4m3_8row_magic(float *dst,
 /* Split-layout MXFP4 (e2m1) expert matvec, 8 rows, W4A16 f32 (svtbl unpack).
  * Weight = row-major packed nibbles (K/2 B/row); scale = per-32-block E8M0
  * (K/32 B/row, per-row, unlike FP8's shared block). DRAM ~0.53 B/elem.
- * Layout per 32-block of 16 bytes (matches dequantize_row_mxfp4): byte j low
- * nibble -> element j, high nibble -> element j+16. Unpack both halves to f32
+ * Layout per 32-block of 16 bytes: byte j low nibble -> element 2*j,
+ * high nibble -> element 2*j+1. Unpack adjacent pairs to f32
  * via svtbl_f32 over the 16-entry kvalues table, accumulate the unscaled block
  * dot, fold the per-row E8M0 scalar via one svmla. K must be a multiple of 32.
  *   wr[r]: K/2 nibble bytes;  sr[r]: K/32 E8M0 bytes. */
@@ -1978,8 +1978,10 @@ static inline void matvec_mxfp4_8row(float *dst,
     svfloat32_t a6 = svdup_f32(0.f), a7 = svdup_f32(0.f);
     int nb = K / 32;
     for (int b = 0; b < nb; b++) {
-        svfloat32_t vxlo = svld1(pg, &x[b * 32]);
-        svfloat32_t vxhi = svld1(pg, &x[b * 32 + 16]);
+        svfloat32_t xa = svld1(pg, &x[b * 32]);
+        svfloat32_t xb = svld1(pg, &x[b * 32 + 16]);
+        svfloat32_t vxlo = svuzp1_f32(xa, xb);
+        svfloat32_t vxhi = svuzp2_f32(xa, xb);
         #define MXFP4_ROW(W, S, ACC) do {                                      \
             svuint32_t braw = svld1ub_u32(pg, (W) + (size_t)b * 16);            \
             svuint32_t lo = svand_n_u32_x(pg, braw, 0xf);                       \
@@ -1988,7 +1990,7 @@ static inline void matvec_mxfp4_8row(float *dst,
             svfloat32_t whi = svtbl_f32(kv, hi);                               \
             svfloat32_t p = svmul_x(pg, wlo, vxlo);                            \
             p = svmla_x(pg, p, whi, vxhi);                                     \
-            float sc = ggml_e8m0_to_fp32((S)[b]);                             \
+            float sc = 0.5f * ggml_e8m0_to_fp32((S)[b]);                      \
             ACC = svmla_x(pg, ACC, p, svdup_f32(sc));                          \
         } while (0)
         MXFP4_ROW(w0, s0, a0); MXFP4_ROW(w1, s1, a1);
@@ -2025,15 +2027,17 @@ static inline void matvec_mxfp4_8row_2x(float *dst0, float *dst1,
     svfloat32_t b4=svdup_f32(0.f),b5=svdup_f32(0.f),b6=svdup_f32(0.f),b7=svdup_f32(0.f);
     int nb = K / 32;
     for (int b = 0; b < nb; b++) {
-        svfloat32_t vxlo0 = svld1(pg, &x0[b*32]), vxhi0 = svld1(pg, &x0[b*32+16]);
-        svfloat32_t vxlo1 = svld1(pg, &x1[b*32]), vxhi1 = svld1(pg, &x1[b*32+16]);
+        svfloat32_t xa0 = svld1(pg, &x0[b*32]), xb0 = svld1(pg, &x0[b*32+16]);
+        svfloat32_t xa1 = svld1(pg, &x1[b*32]), xb1 = svld1(pg, &x1[b*32+16]);
+        svfloat32_t vxlo0 = svuzp1_f32(xa0, xb0), vxhi0 = svuzp2_f32(xa0, xb0);
+        svfloat32_t vxlo1 = svuzp1_f32(xa1, xb1), vxhi1 = svuzp2_f32(xa1, xb1);
         #define MXFP4_ROW2(W, S, ACCA, ACCB) do {                              \
             svuint32_t braw = svld1ub_u32(pg, (W) + (size_t)b * 16);           \
             svuint32_t lo = svand_n_u32_x(pg, braw, 0xf);                      \
             svuint32_t hi = svand_n_u32_x(pg, svlsr_n_u32_x(pg, braw, 4), 0xf);\
             svfloat32_t wlo = svtbl_f32(kv, lo);                              \
             svfloat32_t whi = svtbl_f32(kv, hi);                              \
-            svfloat32_t vsc = svdup_f32(ggml_e8m0_to_fp32((S)[b]));           \
+            svfloat32_t vsc = svdup_f32(0.5f * ggml_e8m0_to_fp32((S)[b]));    \
             svfloat32_t pa = svmul_x(pg, wlo, vxlo0);                         \
             pa = svmla_x(pg, pa, whi, vxhi0);                                 \
             ACCA = svmla_x(pg, ACCA, pa, vsc);                                \
