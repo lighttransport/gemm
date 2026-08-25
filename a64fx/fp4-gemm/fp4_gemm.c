@@ -24,6 +24,7 @@ extern void fp4_i8_sdot_m1_asm(const fp4_sdot_args*);
 typedef struct {const uint8_t*q;const _Float16*ws;const int16_t*tab;
     const float*as;float*out;int ng,g0,gcount,nb,pairs,act_group;} fp4_pair_args;
 extern void fp4_pair_lut_m1_asm(const fp4_pair_args*);
+extern void fp4_pair_tbl_m1_asm(const fp4_pair_args*);
 
 /* Scalar AArch64 producer LUT: packed FP4 byte -> two FP16 bit patterns. */
 uint32_t fp4_pair_lut[256] __attribute__((aligned(1024)));
@@ -889,11 +890,12 @@ void fp4_i8_activation_free(fp4_i8_activation*q){
 int fp4_pair_activation_prepare(fp4_pair_activation*q,const float*a,int k,int group){
     static const int16_t values[16]={0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
     if(!q||!a||k<=0||k%32||group<4||group>32||(group&(group-1))||k%group)return-1;
-    if(!q->codes||!q->scales||!q->tables||q->k!=k){
+    if(!q->codes||!q->scales||!q->tables||!q->tables16||q->k!=k){
       fp4_pair_activation_free(q);q->k=k;
       if(posix_memalign((void**)&q->codes,256,(size_t)k)||
          posix_memalign((void**)&q->scales,256,(size_t)(k/4)*sizeof(float))||
-         posix_memalign((void**)&q->tables,256,(size_t)k*256)){
+         posix_memalign((void**)&q->tables,256,(size_t)k*256)||
+         posix_memalign((void**)&q->tables16,256,(size_t)k*64)){
           fp4_pair_activation_free(q);return-1;}}
     q->scale_group=group;
     for(int b=0;b<k/group;++b){float m=0.0f;
@@ -905,11 +907,32 @@ int fp4_pair_activation_prepare(fp4_pair_activation*q,const float*a,int k,int gr
     for(int p=0;p<k/2;++p){int a0=q->codes[p*2],a1=q->codes[p*2+1];
       int16_t*t=q->tables+(size_t)p*256;
       for(int c=0;c<256;++c)t[c]=(int16_t)(values[c&15]*a0+values[c>>4]*a1);
-    }return 0;
+    }
+    for(int x=0;x<k;++x)for(int c=0;c<32;++c)
+      q->tables16[(size_t)x*32+c]=(int16_t)(values[c&15]*q->codes[x]);
+    return 0;
 }
 
 void fp4_pair_activation_free(fp4_pair_activation*q){
-    if(!q)return;free(q->codes);free(q->scales);free(q->tables);memset(q,0,sizeof(*q));
+    if(!q)return;free(q->codes);free(q->scales);free(q->tables);free(q->tables16);memset(q,0,sizeof(*q));
+}
+
+int fp4_gemv_pair_tbl_omp(float*c,const fp4_pair_activation*a,
+                           const fp4_matrix*w,int threads){
+    if(!c||!a||!w||!a->scales||!a->tables16||!w->codes_pair||!w->scales_pair||
+       a->k!=w->k||threads<1||w->n%128||a->scale_group>16)return-1;
+    int wg=w->format==FP4_MX?32:16;if(wg%a->scale_group)return-1;
+#if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
+    int ng=w->n/128,nb=w->k/wg,pairs=wg/2;
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for(int g=0;g<ng;++g){
+      fp4_pair_args x={w->codes_pair,w->scales_pair,a->tables16,a->scales,c,
+                       ng,g,1,nb,pairs,a->scale_group};
+      fp4_pair_tbl_m1_asm(&x);
+    }return 0;
+#else
+    (void)threads;return-1;
+#endif
 }
 
 int fp4_gemv_pair_lut_omp(float*c,const fp4_pair_activation*a,

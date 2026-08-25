@@ -2,7 +2,7 @@ CC = fcc
 CFLAGS ?= -Nclang -O3 -std=c11 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp
 WARN = -Wall -Wextra -Wpedantic
 LDLIBS = -lm
-ASM = fp4_n32_l1.S fp4_dequant_sve.S fp4_m1_t4.S fp4_sdot_m1.S fp4_pair_lut_m1.S
+ASM = fp4_n32_l1.S fp4_dequant_sve.S fp4_m1_t4.S fp4_sdot_m1.S fp4_pair_lut_m1.S fp4_pair_tbl_m1.S
 
 .PHONY: all test clean
 all: test_fp4_gemm bench_fp4_gemm bench_fp4_single bench_fp4_ex bench_fp4_stream bench_fp4_sdot_error

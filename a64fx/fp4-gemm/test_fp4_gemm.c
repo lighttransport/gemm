@@ -71,6 +71,15 @@ int main(void){
           double d=got[row]-qref,e=got[row]-exact;nq+=d*d;np+=e*e;dp+=exact*exact;}
         printf("%s pair_asm_rel=%.6g pair_vs_fp4=%.6g\n",fp4_format_name((fp4_format)f),
           sqrt(nq/(dp+1e-30)),sqrt(np/(dp+1e-30)));
+        if(sqrt(nq/(dp+1e-30))>2e-6)return 1;
+        if(fp4_gemv_pair_tbl_omp(got,&pa,&p,2))return 1;nq=0;
+        for(int row=0;row<N;++row){double qref=0.0;int g=row/128;
+          for(int b=0;b<nb;++b){float ws=(float)p.scales_pair[((size_t)b*(N/128)+g)*128+row%128];
+            for(int pair=0;pair<wg/2;++pair){size_t qo=(((size_t)b*(N/128)+g)*(wg/2)+pair)*128+row%128;
+              int kp=b*wg+pair*2;qref+=(double)pa.tables[(size_t)(kp/2)*256+p.codes_pair[qo]]*
+                ws*pa.scales[kp/16];}}
+          double d=got[row]-qref;nq+=d*d;}
+        printf("%s pair_tbl_rel=%.6g\n",fp4_format_name((fp4_format)f),sqrt(nq/(dp+1e-30)));
         if(sqrt(nq/(dp+1e-30))>2e-6)return 1;fp4_pair_activation_free(&pa);
         if(fp4_gemm_f16_l2_omp(got,a,&p,M,32,2))return 1;
         np=0;dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}

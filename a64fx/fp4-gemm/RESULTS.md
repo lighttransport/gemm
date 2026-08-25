@@ -298,6 +298,14 @@ as the limiter. Indexed `LD1SH` is the measured ceiling, so this route is kept
 as a packed-density control rather than replacing the 409.1 GFLOP/s K4 SDOT
 kernel.
 
+A second packed experiment replaced each 256-entry gather with two sequential
+16-entry `TBL`s, one for each activation in a packed K pair. It is exact and
+removes indexed loads, but requires 16 `TBL`s per K pair to cover 128 rows.
+Even with two independent row chunks in flight it reaches only 84.5 GFLOP/s
+(23.8 GB/s packed). The doubled FLA table-operation count is worse than both
+the gather control and the original row-paired `ZIP1`/`TBL` kernel, so this is
+retained only as a negative control.
+
 ## Conclusion
 
 Promoting every 256 K values is the useful balanced mode on these workloads:

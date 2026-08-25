@@ -172,6 +172,10 @@ flat result across promotion intervals identifies `LD1SH` gather throughput,
 not FP32 conversion or HBM2, as the bottleneck. Set `FP4_PAIR_ONLY=1` to run
 this control. The expanded K4 SDOT kernel remains the production fallback at
 409 GFLOP/s because its sequential byte stream reaches roughly 217 GB/s.
+The alternative `fp4_gemv_pair_tbl_omp` replaces gathers with two 16-entry
+tables per packed K pair. It is also exact, but doubles the table-operation
+count needed to cover 128 rows and reaches only 84.5 GFLOP/s at K4; it is a
+pipeline diagnostic rather than a selected kernel.
 
 ### Scalar EX packed-FP4 producer
 

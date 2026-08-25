@@ -45,6 +45,7 @@ typedef struct {
     int8_t *codes;
     float *scales;        /* activation quantizer scale divided by two */
     int16_t *tables;      /* [K/2][256], activation-dependent pair dots */
+    int16_t *tables16;    /* [K][32], duplicated 16-entry nibble dots */
 } fp4_pair_activation;
 
 const char *fp4_format_name(fp4_format format);
@@ -88,6 +89,8 @@ int fp4_pair_activation_prepare(fp4_pair_activation *q, const float *a,
                                  int k, int scale_group);
 void fp4_pair_activation_free(fp4_pair_activation *q);
 int fp4_gemv_pair_lut_omp(float *c, const fp4_pair_activation *a,
+                           const fp4_matrix *w, int threads);
+int fp4_gemv_pair_tbl_omp(float *c, const fp4_pair_activation *a,
                            const fp4_matrix *w, int threads);
 int fp4_gemm_reference(float *c, const _Float16 *a, const fp4_matrix *w,
                         int m, int fp16_products);
