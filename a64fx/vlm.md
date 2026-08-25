@@ -561,3 +561,52 @@ FCC -O3 -fopenmp -o build/test_conv2d_sve build/test_conv2d_sve.o \
   `#include <stdlib.h>` to `ggml_dequant.h` itself (a header should include
   what it uses; the transitive include via `gguf_loader.h` did not reliably
   reach the use site).
+
+## 5. Kimi-K3 (head_dim=128) encoder support & AV fast path
+
+The VLM also runs the **Kimi-K3 CLIP projector** (`mmproj-{BF16,F16,F32}.gguf`,
+447M params, bias-free), whose geometry differs from Qwen3-VL:
+`dim=1024`, `attn_dim=1536` (≠dim), **`head_dim=128`** (≠dim/heads=85),
+`heads=12`, `blocks=27`, `patch=14`, `image=896` (max 4096 patches), `proj=7168`,
+**no bias tensors**, and the projector uses `mm.1`/`mm.2` (not `mm.0`).
+Support added: `vision_model.attn_dim` (=qkv rows/3), optional (zero-filled)
+biases, an `mm.0`→`mm.1` projector fallback, `deq_vec_xalloc` returns a zero
+vector for an absent bias, and `attn_dim` threaded through the QKV/attn-out
+GEMMs, M-RoPE, attention, and buffer sizing. A latent `conv2d_sve_full` gather
+`nowait` race (let `apply_block` read `A_packed` mid-gather) was fixed and is
+guarded by a determinism check in `test_conv2d_sve`. Output is deterministic
+(bf16=fp32 `44.4191` @468 / `163.3558` @896; fp16 `44.2761`) but **unverified**
+(no Kimi-K3 reference).
+
+### 5.1 ⭐ AV fast path for head_dim=128 (8·VL) — 2.4× at 896×896
+
+Profile at 896×896 (4096 patches): attention was **89%** of the encode and the
+AV (attn·V) was **74%** of the attention. For `head_dim=128` the AV skipped
+both fast paths (`hd==4*VL`, i.e. 64) and fell back to the scalar
+`sve_axpy_hd` chain, which load-modify-stores `out` for **every V row** —
+load-bound, ~3× slower than the register-resident form. Added two SVE paths for
+`hd == 8*VL` (VL=16):
+- `attn_av_1q`: 8 SVE accumulators, `out` held in registers across the np-sum.
+- `attn_av_2q`: 2-query batch (16 accumulators) sweeping V_h once for 2
+  queries — halves the V_h read bandwidth. `attn_av_4q` dispatches to two
+  `attn_av_2q` for `hd==8*VL` (a 4-query batch needs 32 accumulators = the
+  whole Z-reg file, so 2 is the max feasible batch).
+
+The AV accumulates over `vi` in the same order as the old AXPY chain, so the
+result is **bit-identical** (bf16/fp16/fp32 norms unchanged); Qwen3-VL (hd=64)
+uses the separate `hd==4*VL` path and is unaffected. `make test` passes.
+
+Throughput (bf16, A/B on the same node state, 48T, cmgs=0):
+
+| size | before | after | speedup |
+|---|---|---|---|
+| 4096 patches (896×896) | 17.2 s | 7.1 s | **2.4×** (59→145 tok/s) |
+| 2304 patches (672) | — | 2.06 s | 280 tok/s |
+| 468 patches (fujisan) | 0.31 s | 0.27 s | 1.14× (382→436 tok/s) |
+
+**Remaining bottleneck:** the QK^T (`qk_vert_8q_48k`, now ~49% of the
+attention) is FMA-bound in its inner loop (384 FMAs ≫ 11 loads per d-step), so
+its ~21%-of-FMA-peak is parallelism/overhead, not addressable loads — left for
+a separate pass. The whole attention (QK^T+AV) sits at ~20% of the 49.8
+GFLOP/s/core FMA floor at hd=128 (vs 58% for Qwen3-VL hd=64): hd=128 does 2×
+the FMA per byte of K/V data, so the loads amortize less.
