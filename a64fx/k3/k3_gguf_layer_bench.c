@@ -216,6 +216,10 @@ int main(int argc, char **argv) {
                        (a[i].type == K3_Q_IQ1_S ||
                         a[i].type == K3_Q_IQ2_XS) &&
                        !((expert_pool ? rows_per_expert : rows) & 31);
+        int use_quad = use_packed && getenv("K3_QUANT_PACKED_QUAD2") &&
+                       atoi(getenv("K3_QUANT_PACKED_QUAD2")) != 0 &&
+                       a[i].type == K3_Q_IQ1_S &&
+                       !((expert_pool ? rows_per_expert : rows) & 63);
         k3_quant_packed expert_packed[8] = {{0}};
         k3_quant_matrix expert_m[8];
         int expert_packed_ok = 0;
@@ -226,7 +230,9 @@ int main(int argc, char **argv) {
                 expert_m[e] = (k3_quant_matrix){
                     blob + a[i].off + (size_t)e * rows_per_expert * erb,
                     a[i].type, rows_per_expert, cols, erb};
-                int prc = use_pair ?
+                int prc = use_quad ?
+                    k3_quant_pack_iq1_rows64_quad2(&expert_packed[e], &expert_m[e]) :
+                    use_pair ?
                     (a[i].type == K3_Q_IQ1_S ?
                      k3_quant_pack_iq1_rows32_pair(&expert_packed[e], &expert_m[e]) :
                      k3_quant_pack_iq2_rows32_pair(&expert_packed[e], &expert_m[e])) :
@@ -245,7 +251,8 @@ int main(int argc, char **argv) {
                 use_packed = 0;
             }
         } else if (use_packed) {
-            use_packed = !(use_pair ?
+            use_packed = !(use_quad ?
+                           k3_quant_pack_iq1_rows64_quad2(&packed, &m) : use_pair ?
                            (a[i].type == K3_Q_IQ1_S ?
                             k3_quant_pack_iq1_rows32_pair(&packed, &m) :
                             k3_quant_pack_iq2_rows32_pair(&packed, &m)) : use_nibble ?
@@ -334,7 +341,8 @@ int main(int argc, char **argv) {
         double gflops = 2.0 * (double)op_rows * cols * batch /
                         (ms * 1.0e6);
         printf("K3_QBENCH mode=%s tensor=%s type=%s rows=%d cols=%d experts=%d batch=%d ms=%.3f gflops=%.1f tok/s=%.3f\n",
-               use_packed ? (use_pair ? (a[i].type == K3_Q_IQ1_S ?
+               use_packed ? (use_quad ? "packed-iq1-quad2-sve-q8" :
+                             use_pair ? (a[i].type == K3_Q_IQ1_S ?
                                           "packed-iq4-pair-sve-q8" :
                                           "packed-iq2-semantic4-pair-sve-q8") :
                              use_nibble ? "packed-iq4-sve-q8" : "packed-sve-q8") : mode == K3_QUANT_REFERENCE ? "reference" :

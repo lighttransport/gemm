@@ -146,6 +146,10 @@ extern void k3_iq1_pair32_asm(float *out, const int8_t *data,
                               const int8_t *scales, const float *d32,
                               const int8_t *q8, const int32_t *q8_sum32,
                               int blocks, float activation_scale);
+extern void k3_iq1_quad64_asm(float *out, const int8_t *data,
+                              const int8_t *scales, const float *d32,
+                              const int8_t *q8, const int32_t *q8_sum32,
+                              int blocks, float activation_scale);
 extern void k3_iq2_pair32_asm(float *out, const int8_t *data,
                               const int8_t *scales, const float *d32,
                               const int8_t *q8, const int32_t *unused,
@@ -362,6 +366,81 @@ static inline uint8_t k3_quant_iq2_semantic_code(int8_t q) {
     case -8: return 3; case -25: return 4; case -43: return 5;
     default: return 15;
     }
+}
+
+/* IQ1 is ternary, so four rows fit losslessly in one byte using signed 2-bit
+ * fields.  A 64-byte operand then supplies four 16-row SDOT vectors while
+ * retaining a single sequential weight stream. */
+static inline int k3_quant_pack_iq1_rows64_quad2(k3_quant_packed *p,
+                                                 const k3_quant_matrix *m) {
+    k3_quant_packed tmp = {0};
+    if (!p || !m || m->type != K3_Q_IQ1_S || (m->rows & 63) ||
+        k3_quant_pack_iq_rows16(&tmp, m)) return -1;
+    const int nb = m->cols / 256;
+    const int tiles = m->rows / 64;
+    const size_t tile_bytes = (size_t)nb * 8u * 8u * 64u;
+    const size_t scale_tile_bytes = (size_t)nb * 8u * 64u;
+    const size_t d_tile_bytes = (size_t)nb * 64u * sizeof(float);
+    int8_t *data = (int8_t *)k3_quant_alloc_aligned((size_t)tiles * tile_bytes);
+    int8_t *scales = (int8_t *)k3_quant_alloc_aligned(
+        (size_t)tiles * scale_tile_bytes);
+    float *d32 = (float *)k3_quant_alloc_aligned(
+        (size_t)tiles * d_tile_bytes);
+    if (!data || !scales || !d32) {
+        free(data); free(scales); free(d32); k3_quant_packed_free(&tmp);
+        return -1;
+    }
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int t = 0; t < tiles; ++t) {
+        for (int b = 0; b < nb; ++b) {
+            float *dd = d32 + ((size_t)t * nb + b) * 64u;
+            for (int q = 0; q < 4; ++q) {
+                const uint16_t *ds = tmp.ds +
+                    ((size_t)(4 * t + q) * nb + b) * 16u;
+                for (int r = 0; r < 16; ++r)
+                    dd[16 * q + r] = ggml_fp16_to_fp32(ds[r]);
+            }
+            for (int ib = 0; ib < 8; ++ib) {
+                int8_t *sd = scales +
+                    (((size_t)t * nb + b) * 8u + ib) * 64u;
+                for (int q = 0; q < 4; ++q) {
+                    const int8_t *sq = tmp.scales +
+                        (((size_t)(4 * t + q) * nb + b) * 8u + ib) * 32u;
+                    memcpy(sd + 16 * q, sq + 16, 16);
+                }
+                for (int c = 0; c < 8; ++c) {
+                    const int8_t *q0 = tmp.data +
+                        (size_t)(4 * t + 0) * tmp.tile_bytes +
+                        ((size_t)b * 8u + ib) * 512u + (size_t)c * 64u;
+                    const int8_t *q1 = tmp.data +
+                        (size_t)(4 * t + 1) * tmp.tile_bytes +
+                        ((size_t)b * 8u + ib) * 512u + (size_t)c * 64u;
+                    const int8_t *q2 = tmp.data +
+                        (size_t)(4 * t + 2) * tmp.tile_bytes +
+                        ((size_t)b * 8u + ib) * 512u + (size_t)c * 64u;
+                    const int8_t *q3 = tmp.data +
+                        (size_t)(4 * t + 3) * tmp.tile_bytes +
+                        ((size_t)b * 8u + ib) * 512u + (size_t)c * 64u;
+                    int8_t *qd = data + (size_t)t * tile_bytes +
+                        ((size_t)b * 8u + ib) * 512u + (size_t)c * 64u;
+                    for (int j = 0; j < 64; ++j)
+                        qd[j] = (int8_t)(((uint8_t)q0[j] & 3u) |
+                            (((uint8_t)q1[j] & 3u) << 2) |
+                            (((uint8_t)q2[j] & 3u) << 4) |
+                            (((uint8_t)q3[j] & 3u) << 6));
+                }
+            }
+        }
+    }
+    k3_quant_packed_free(&tmp);
+    memset(p, 0, sizeof(*p));
+    p->data = data; p->scales = scales; p->d32 = d32;
+    p->rows = m->rows; p->cols = m->cols; p->type = m->type;
+    p->tile_rows = 64; p->tile_bytes = tile_bytes; p->nibble = 3;
+    p->scale_tile_bytes = scale_tile_bytes; p->d_tile_bytes = d_tile_bytes;
+    return 0;
 }
 
 /* Lossless IQ2_XS cache layout matching the IQ1 row-paired tile.  A nibble
@@ -1575,6 +1654,14 @@ static inline int k3_quant_matvec_packed_ws(float *out,
                           ws->q8_sum32, m->cols / 256, ws->scale);
 #else
         k3_quant_iq1_packed_rows32_pair(out, p, ws);
+#endif
+    }
+    else if (tile_rows == 64 && m->type == K3_Q_IQ1_S) {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+        k3_iq1_quad64_asm(out, p->data, p->scales, p->d32, ws->q8,
+                          ws->q8_sum32, m->cols / 256, ws->scale);
+#else
+        return -1;
 #endif
     }
     else if (tile_rows == 32 && m->type == K3_Q_IQ2_XS) {

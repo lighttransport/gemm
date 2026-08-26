@@ -285,7 +285,7 @@ static int check_type(const char *name, int type, int cols) {
                 free(bx); free(bout); free(bone);
             }
             if (type == K3_Q_IQ2_XS) {
-                enum { PAIR_ROWS = 32 };
+                enum { PAIR_ROWS = 64 };
                 uint8_t *pair_w = calloc(PAIR_ROWS, rb);
                 float pair_out[PAIR_ROWS], pair_ref[PAIR_ROWS];
                 k3_quant_packed pair = {0};
@@ -299,8 +299,8 @@ static int check_type(const char *name, int type, int cols) {
                 if (!pair_rc)
                     pair_rc = k3_quant_pack_iq2_rows32_pair(&pair, &pair_m);
                 if (!pair_rc)
-                    pair_rc = k3_quant_matvec_packed_ws(
-                        pair_out, &pair_m, &pair, &pws);
+                    pair_rc = k3_quant_matvec_packed_batch(
+                        pair_out, PAIR_ROWS, &pair_m, &pair, &pws, 1);
                 for (int r = 0; r < PAIR_ROWS && !pair_rc; ++r)
                     pair_ref[r] = k3_quant_iq2_xs_q8_row(
                         (const block_iq2_xs *)(pair_w + (size_t)r * rb),
@@ -339,7 +339,7 @@ static int check_type(const char *name, int type, int cols) {
                  * and rows 16..31 from high nibbles.  Compare it directly
                  * against the established per-row Q8 implementation so a
                  * lane permutation cannot hide behind quantization error. */
-                enum { PAIR_ROWS = 32 };
+                enum { PAIR_ROWS = 64 };
                 uint8_t *pair_w = calloc(PAIR_ROWS, rb);
                 float pair_out[PAIR_ROWS], pair_ref[PAIR_ROWS];
                 k3_quant_packed pair = {0};
@@ -351,10 +351,10 @@ static int check_type(const char *name, int type, int cols) {
                     pair_w, type, PAIR_ROWS, cols, rb
                 };
                 if (!pair_rc)
-                    pair_rc = k3_quant_pack_iq1_rows32_pair(&pair, &pair_m);
+                    pair_rc = k3_quant_pack_iq1_rows64_quad2(&pair, &pair_m);
                 if (!pair_rc)
-                    pair_rc = k3_quant_matvec_packed_ws(
-                        pair_out, &pair_m, &pair, &pws);
+                    pair_rc = k3_quant_matvec_packed_batch(
+                        pair_out, PAIR_ROWS, &pair_m, &pair, &pws, 1);
                 for (int r = 0; r < PAIR_ROWS && !pair_rc; ++r)
                     pair_ref[r] = k3_quant_iq1_s_q8_row(
                         (const block_iq1_s *)(pair_w + (size_t)r * rb),
@@ -367,7 +367,7 @@ static int check_type(const char *name, int type, int cols) {
                 }
                 double pair_rel = pair_rc ? INFINITY :
                     sqrt(pair_se / (pair_sr + 1e-30));
-                printf("[%s packed-pair32] rel_l2=%.3e %s\n", name,
+                printf("[%s packed-quad64] rel_l2=%.3e %s\n", name,
                        pair_rel, pair_rel < 1e-5 ? "OK" : "FAIL");
                 bad |= pair_rel >= 1e-5;
                 k3_quant_packed_free(&pair);

@@ -1,7 +1,7 @@
 CC = fcc
 CFLAGS ?= -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -I../../common
 WARN = -Wall -Wextra -Wpedantic -Wno-unused-function
-IQ_ASM = k3_iq1_pair32.S k3_iq2_pair32.S
+IQ_ASM = k3_iq1_pair32.S k3_iq1_quad64.S k3_iq2_pair32.S
 MODEL_DIR ?= /home/u14346/models/k3/iq1
 NODES ?= 12
 

@@ -222,3 +222,33 @@ GFLOP/s roof before activation metadata and loop/dispatch cost.  IQ2's two
 half-group scales make its exact roof lower.  At a true 230 GB/s stream the
 corresponding IQ1 ideal is 841 GFLOP/s, but the measured 720.6 result already
 uses about 92% of the 214 GB/s combined-stream roof.
+
+### Lossless IQ1 two-bit row-quad cache
+
+IQ1_S is ternary, so the signed-nibble cache still carried one redundant bit
+per weight. A new 64-row cache packs four signed two-bit values into each
+byte. The assembly kernel extracts the four fields with LSL/ASR, broadcasts
+each Q8 activation once, and issues four vector SDOTs. Unlike the rejected
+64-row composition of two pair32 tiles, it retains one sequential weight
+stream and halves weight traffic from 0.5 to 0.25 byte/weight. The GGUF
+payload and numerical format are unchanged.
+
+`k3_quant_kernel_test` reports `1.028e-7` relative L2 against the established
+IQ1 per-row Q8 path. On the same pinned 12-core CMG command above, replacing
+`K3_QUANT_PACKED_PAIR=1` with `K3_QUANT_PACKED_QUAD2=1` gives:
+
+| Real projection | Pair32 GFLOP/s | Quad64 two-bit GFLOP/s |
+|---|---:|---:|
+| gate, 24576 x 3584 | 720.6 | 980.4 |
+| up, 24576 x 3584 | 717.7 | 977.9 |
+| down, 28672 x 3072 | 677.7 | 972.7 |
+
+The gate result is a 36.1% improvement and passes the 800 GFLOP/s target.
+Three additional gate measurements were stable at roughly 975--983 GFLOP/s.
+
+IQ2_XS cannot use the same representation because its exact grid has six
+values. Three matched alternatives were rejected: vector rather than indexed
+SDOT was about 3% slower, packing its scale side stream to nibbles added too
+much decode work, and composing two pair32 weight streams damaged hardware
+prefetch. The exact semantic-nibble pair32 IQ2 kernel therefore remains the
+best measured path.
