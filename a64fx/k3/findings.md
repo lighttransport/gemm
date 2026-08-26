@@ -163,3 +163,62 @@ Current hard limit: the measured IQ1/IQ2 layer proxy remains multiple
 milliseconds, far above the requested 0.25/0.50 ms targets.  Reaching those
 targets requires a different kernel/dataflow (for example a fused multi-
 projection or packed weight layout), not another small gather/unroll tweak.
+
+## Compact IQ decode cache and row-paired assembly (2026-08-26)
+
+The different dataflow is now implemented and measured on one A64FX CMG with
+12 cores.  The GGUF payload remains unchanged; a one-time, lossless decode
+cache is built after loading weights:
+
+- IQ1_S pairs output rows 0..15 and 16..31 in the low/high nibbles of each
+  byte.  Sign extension produces two 16-row SDOT operands without ZIP/TBL.
+- IQ2_XS stores a four-bit semantic index for the exact six-value grid
+  `+/-{8,25,43}`.  Two SVE TBL instructions expand the paired rows in
+  registers; no weight approximation is introduced.
+- FP16 block scales are converted once to FP32, Q8 activation sums are
+  prepared once, and FP32 accumulation occurs at every K=256 block.
+- Assembly preloads the next 512-byte group before applying the current
+  scales, covering SVE load latency without a second register bank.
+
+Correctness (`k3_quant_kernel_test`) passes.  Pair32 versus the established
+per-row Q8 path is `1.025e-7` relative L2 for IQ1_S and `8.906e-8` for
+IQ2_XS.  Packed and unpacked paths have identical activation-quantization
+quality.
+
+Real layer-1 expert planes were staged from `~/models/k3/{iq1,q2}`.  The
+measurement flattens the eight decode-selected expert planes into one OpenMP
+dispatch and pins cores 12-23 to CMG 1:
+
+```sh
+OMP_NUM_THREADS=12 OMP_PROC_BIND=close OMP_PLACES=cores \
+K3_QUANT_KERNEL=sve-q8 K3_QUANT_PACKED=1 K3_QUANT_PACKED_PAIR=1 \
+K3_EXPERT_FLAT=1 K3_ACTIVE_EXPERTS=8 K3_ONLY_TENSOR=ffn_gate_exps \
+numactl --physcpubind=12-23 --membind=4 ./k3_gguf_layer_bench \
+  /local/u14346/k3-iq-decode-iq1/rank000.manifest \
+  /local/u14346/k3-iq-decode-iq1/rank000.blob 501
+```
+
+| Real projection | IQ1_S GFLOP/s | IQ2_XS GFLOP/s |
+|---|---:|---:|
+| gate, 24576 x 3584 | 720.6 | 686.9 |
+| up, 24576 x 3584 | 717.7 | 674.6 |
+| down, 28672 x 3072 | 677.7 | 609.8 |
+
+For gate, native GGUF decode measured 30.6/22.9 GFLOP/s and the older
+byte-expanded packed cache measured 190.0/363.2 GFLOP/s (IQ1/IQ2).  Thus the
+row-paired kernels are 23.5x/30.0x faster than native and 3.79x/1.89x faster
+than the byte-packed cache.
+
+FAPP reports 15.29 GB/s per core for IQ1 and 15.84 GB/s per core for IQ2
+(about 183 and 190 GB/s per CMG) with IPC 1.31 and 1.38.  The kernels are
+simultaneously close to the available memory stream and constrained by SVE
+decode/SDOT issue; software separation of decode from consumers and explicit
+prefetch both regressed.
+
+The 800 GFLOP/s target is above the lossless roof at the previously measured
+214 GB/s HBM rate once metadata is counted.  IQ1 streams 0.546875 bytes per
+weight (nibbles, signed group scale, FP32 block scale), giving a 782.6
+GFLOP/s roof before activation metadata and loop/dispatch cost.  IQ2's two
+half-group scales make its exact roof lower.  At a true 230 GB/s stream the
+corresponding IQ1 ideal is 841 GFLOP/s, but the measured 720.6 result already
+uses about 92% of the 214 GB/s combined-stream roof.

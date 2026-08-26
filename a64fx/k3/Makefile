@@ -1,10 +1,11 @@
 CC = fcc
 CFLAGS ?= -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -I../../common
 WARN = -Wall -Wextra -Wpedantic -Wno-unused-function
+IQ_ASM = k3_iq1_pair32.S k3_iq2_pair32.S
 MODEL_DIR ?= /home/u14346/models/k3/iq1
 NODES ?= 12
 
-.PHONY: all runner full-runner full-convert full-runner-test torch-ref-run torch-ref-test torch-ref-self-test torch-cu129-setup iq1-text iq-layer-12n native-plan tp-stage-test test real-test probe-kda probe-kda-mpi probe-moe-mpi probe-expert-tp-mpi sim validate clean
+.PHONY: all runner full-runner full-convert full-runner-test torch-ref-run torch-ref-test torch-ref-self-test torch-cu129-setup iq1-text iq-layer-12n iq-decode-fapp native-plan tp-stage-test test real-test probe-kda probe-kda-mpi probe-moe-mpi probe-expert-tp-mpi sim validate clean
 all: k3_kernel_test k3_quant_kernel_test k3_decode_ids k3_prompt_ids k3_gguf_layer_bench k3_gguf_adapter_test k3_gguf_expert_tp_test k3_gguf_iq_tp_probe k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe
 
 runner: k3_ep_runner
@@ -61,11 +62,11 @@ tp-stage-test:
 fast-12n-decode: k3_ep_runner
 	./run_k3_fast_decode_12n.sh
 
-k3_ep_runner: k3_ep_runner.c k3_moe.h k3_dense.h k3_kernels.h k3_runtime.h ../utofu-tests/tp_allreduce.h ../utofu-tests/tofu_demo.h
-	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< -lm -ltofucom -o $@
+k3_ep_runner: k3_ep_runner.c k3_moe.h k3_dense.h k3_kernels.h k3_runtime.h $(IQ_ASM) ../utofu-tests/tp_allreduce.h ../utofu-tests/tofu_demo.h
+	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< $(IQ_ASM) -lm -ltofucom -o $@
 
-k3_full_runner: k3_full_runner.c k3_moe.h k3_dense.h k3_kernels.h k3_prefill.h k3_quant.h k3_runtime.h ../utofu-tests/tp_allreduce.h ../utofu-tests/tofu_demo.h ../vlm/kernels/micro_kernel_bf16B_8x3_pv.S
-	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< ../vlm/kernels/micro_kernel_bf16B_8x3_pv.S -lm -ltofucom -o $@
+k3_full_runner: k3_full_runner.c k3_moe.h k3_dense.h k3_kernels.h k3_prefill.h k3_quant.h k3_runtime.h $(IQ_ASM) ../utofu-tests/tp_allreduce.h ../utofu-tests/tofu_demo.h ../vlm/kernels/micro_kernel_bf16B_8x3_pv.S
+	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< $(IQ_ASM) ../vlm/kernels/micro_kernel_bf16B_8x3_pv.S -lm -ltofucom -o $@
 
 k3_full_convert: k3_full_convert.c k3_dense.h k3_kernels.h k3_runtime.h
 	$(CC) $(CFLAGS) $(WARN) -fopenmp -pthread $< -lm -o $@
@@ -73,8 +74,8 @@ k3_full_convert: k3_full_convert.c k3_dense.h k3_kernels.h k3_runtime.h
 k3_kernel_test: k3_kernel_test.c k3_kernels.h
 	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -o $@
 
-k3_quant_kernel_test: k3_quant_kernel_test.c k3_quant.h ../../common/ggml_dequant.h ../../common/gguf_loader.h
-	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -o $@
+k3_quant_kernel_test: k3_quant_kernel_test.c k3_quant.h $(IQ_ASM) ../../common/ggml_dequant.h ../../common/gguf_loader.h
+	$(CC) $(CFLAGS) $(WARN) -fopenmp $< $(IQ_ASM) -lm -o $@
 
 k3_decode_ids: k3_decode_ids.c ../../common/gguf_loader.h ../../common/bpe_tokenizer.h
 	$(CC) $(CFLAGS) $(WARN) $< -lm -o $@
@@ -82,8 +83,13 @@ k3_decode_ids: k3_decode_ids.c ../../common/gguf_loader.h ../../common/bpe_token
 k3_prompt_ids: k3_prompt_ids.c ../../common/gguf_loader.h ../../common/bpe_tokenizer.h
 	$(CC) $(CFLAGS) $(WARN) $< -lm -o $@
 
-k3_gguf_layer_bench: k3_gguf_layer_bench.c k3_quant.h ../../common/ggml_dequant.h ../../common/gguf_loader.h
-	$(CC) $(CFLAGS) $(WARN) -fopenmp $< -lm -o $@
+k3_gguf_layer_bench: k3_gguf_layer_bench.c k3_quant.h $(IQ_ASM) ../../common/ggml_dequant.h ../../common/gguf_loader.h
+	$(CC) $(CFLAGS) $(WARN) -fopenmp $< $(IQ_ASM) -lm -o $@
+
+k3_gguf_layer_bench_fapp: k3_gguf_layer_bench.c k3_quant.h $(IQ_ASM) ../../common/ggml_dequant.h ../../common/gguf_loader.h
+	$(CC) $(CFLAGS) $(WARN) -fopenmp -DUSE_FAPP $< $(IQ_ASM) -lm -o $@
+
+iq-decode-fapp: k3_gguf_layer_bench_fapp
 
 k3_gguf_adapter_test: k3_gguf_adapter_test.c k3_gguf_graph_adapter.h
 	$(CC) $(CFLAGS) $(WARN) $< -o $@
@@ -141,4 +147,4 @@ validate:
 	PYTHONDONTWRITEBYTECODE=1 python3 k3_stage.py --validate-all
 
 clean:
-	rm -f k3_kernel_test k3_quant_kernel_test k3_decode_ids k3_prompt_ids k3_gguf_layer_bench k3_gguf_adapter_test k3_gguf_expert_tp_test k3_gguf_iq_tp_probe k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe k3_ep_runner k3_full_runner k3_full_convert
+	rm -f k3_kernel_test k3_quant_kernel_test k3_decode_ids k3_prompt_ids k3_gguf_layer_bench k3_gguf_layer_bench_fapp k3_gguf_adapter_test k3_gguf_expert_tp_test k3_gguf_iq_tp_probe k3_runtime_test k3_real_mxfp4_test k3_kda_probe k3_moe_probe k3_dense_probe k3_prefill_probe k3_ep_runner k3_full_runner k3_full_convert

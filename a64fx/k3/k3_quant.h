@@ -61,6 +61,7 @@ static inline const char *k3_quant_kernel_mode_name(int mode) {
 typedef struct {
     int16_t *a16;
     int8_t *q8;
+    int32_t *q8_sum32;
     int cols;
     float scale;      /* scale of the activation the selected mode uses */
     float scale_a16;  /* valid whenever a16_ready is set */
@@ -77,6 +78,11 @@ static int8_t k3_iq2_lut[65536][8];
 static int8_t k3_iq_sign_lut[256][8];
 static int8_t k3_iq_ones[32];
 static int8_t k3_iq_ones64[64];
+/* IQ2_XS has exactly six signed grid values.  The compact cache stores the
+ * table index in a nibble and expands it in-register with one SVE TBL. */
+static const int8_t k3_iq2_semantic_lut[64] __attribute__((aligned(64))) = {
+     8, 25, 43, -8, -25, -43
+};
 static pthread_once_t k3_quant_lut_once = PTHREAD_ONCE_INIT;
 
 /* Every grid entry is eight bytes wide, so a whole group moves as one 64-bit
@@ -125,19 +131,39 @@ static inline void k3_quant_ensure_luts(void) {
 typedef struct {
     int8_t *data;
     int rows, cols, type;
+    int tile_rows;
     size_t tile_bytes;
     int nibble;
     int8_t *scales;       /* per tile/group: s0[16], s1[16] */
     uint16_t *ds;         /* per tile/block: d[16] */
+    float *d32;           /* optional preconverted block scales */
     size_t scale_tile_bytes;
     size_t d_tile_bytes;
 } k3_quant_packed;
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+extern void k3_iq1_pair32_asm(float *out, const int8_t *data,
+                              const int8_t *scales, const float *d32,
+                              const int8_t *q8, const int32_t *q8_sum32,
+                              int blocks, float activation_scale);
+extern void k3_iq2_pair32_asm(float *out, const int8_t *data,
+                              const int8_t *scales, const float *d32,
+                              const int8_t *q8, const int32_t *unused,
+                              int blocks, float activation_scale);
+#endif
+
+/* The software-pipelined assembly variant is the A64FX default.  Keep the
+ * intrinsic implementation as a portable fallback and scheduling reference. */
+#ifndef K3_IQ1_PAIR_USE_ASM
+#define K3_IQ1_PAIR_USE_ASM 1
+#endif
 
 static inline void k3_quant_packed_free(k3_quant_packed *p) {
     if (!p) return;
     free(p->data);
     free(p->scales);
     free(p->ds);
+    free(p->d32);
     memset(p, 0, sizeof(*p));
 }
 
@@ -164,7 +190,8 @@ static inline int k3_quant_pack_iq_rows16(k3_quant_packed *p,
     if (!data || !scales || !ds) { free(data); free(scales); free(ds); return -1; }
     memset(p, 0, sizeof(*p));
     p->data = data; p->rows = m->rows; p->cols = m->cols;
-    p->type = m->type; p->tile_bytes = tile_bytes; p->nibble = 0;
+    p->type = m->type; p->tile_rows = 16;
+    p->tile_bytes = tile_bytes; p->nibble = 0;
     p->scales = scales; p->ds = ds;
     p->scale_tile_bytes = (size_t)nb * 8u * 32u;
     p->d_tile_bytes = (size_t)nb * 16u * sizeof(*ds);
@@ -252,10 +279,162 @@ static inline int k3_quant_pack_iq_rows16_nibble(k3_quant_packed *p,
     free(tmp.data);
     memset(p, 0, sizeof(*p));
     p->data = data; p->rows = m->rows; p->cols = m->cols;
-    p->type = m->type; p->tile_bytes = byte_tile / 2; p->nibble = 1;
+    p->type = m->type; p->tile_rows = 16;
+    p->tile_bytes = byte_tile / 2; p->nibble = 1;
     p->scales = tmp.scales; p->ds = tmp.ds;
     p->scale_tile_bytes = tmp.scale_tile_bytes;
     p->d_tile_bytes = tmp.d_tile_bytes;
+    return 0;
+}
+
+/* Lossless IQ1 layout for a 32-row SDOT tile.  Each byte pairs the same four
+ * K values from rows r and r+16.  Sign-extending the low and high nibbles
+ * yields two ready-to-dot vectors, avoiding the ZIP1 needed when adjacent K
+ * values share a byte.  Preparation is offline and deliberately reuses the
+ * validated byte-expanded decoder. */
+static inline int k3_quant_pack_iq1_rows32_pair(k3_quant_packed *p,
+                                                const k3_quant_matrix *m) {
+    k3_quant_packed tmp = {0};
+    if (!p || !m || m->type != K3_Q_IQ1_S || (m->rows & 31) ||
+        k3_quant_pack_iq_rows16(&tmp, m)) return -1;
+    const int nb = m->cols / 256;
+    const int tiles = m->rows / 32;
+    const size_t tile_bytes = (size_t)nb * 8u * 8u * 64u;
+    const size_t scale_tile_bytes = (size_t)nb * 8u * 32u;
+    const size_t d_tile_bytes = (size_t)nb * 32u * sizeof(float);
+    int8_t *data = (int8_t *)k3_quant_alloc_aligned((size_t)tiles * tile_bytes);
+    int8_t *scales = (int8_t *)k3_quant_alloc_aligned(
+        (size_t)tiles * scale_tile_bytes);
+    float *d32 = (float *)k3_quant_alloc_aligned(
+        (size_t)tiles * d_tile_bytes);
+    if (!data || !scales || !d32) {
+        free(data); free(scales); free(d32); k3_quant_packed_free(&tmp);
+        return -1;
+    }
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int t = 0; t < tiles; ++t) {
+        const int t0 = 2 * t, t1 = t0 + 1;
+        for (int b = 0; b < nb; ++b) {
+            const uint16_t *d0 = tmp.ds + ((size_t)t0 * nb + b) * 16u;
+            const uint16_t *d1 = tmp.ds + ((size_t)t1 * nb + b) * 16u;
+            float *dd = d32 + ((size_t)t * nb + b) * 32u;
+            for (int r = 0; r < 16; ++r) {
+                dd[r] = ggml_fp16_to_fp32(d0[r]);
+                dd[16 + r] = ggml_fp16_to_fp32(d1[r]);
+            }
+            for (int ib = 0; ib < 8; ++ib) {
+                const int8_t *s0 = tmp.scales +
+                    (((size_t)t0 * nb + b) * 8u + ib) * 32u;
+                const int8_t *s1 = tmp.scales +
+                    (((size_t)t1 * nb + b) * 8u + ib) * 32u;
+                int8_t *sd = scales +
+                    (((size_t)t * nb + b) * 8u + ib) * 32u;
+                memcpy(sd, s0 + 16, 16);
+                memcpy(sd + 16, s1 + 16, 16);
+                for (int c = 0; c < 8; ++c) {
+                    const int8_t *q0 = tmp.data + (size_t)t0 * tmp.tile_bytes +
+                        ((size_t)b * 8u + ib) * 512u + (size_t)c * 64u;
+                    const int8_t *q1 = tmp.data + (size_t)t1 * tmp.tile_bytes +
+                        ((size_t)b * 8u + ib) * 512u + (size_t)c * 64u;
+                    int8_t *qd = data + (size_t)t * tile_bytes +
+                        ((size_t)b * 8u + ib) * 512u + (size_t)c * 64u;
+                    for (int j = 0; j < 64; ++j)
+                        qd[j] = (int8_t)(((uint8_t)q0[j] & 15u) |
+                                         (((uint8_t)q1[j] & 15u) << 4));
+                }
+            }
+        }
+    }
+    k3_quant_packed_free(&tmp);
+    memset(p, 0, sizeof(*p));
+    p->data = data; p->scales = scales; p->d32 = d32;
+    p->rows = m->rows; p->cols = m->cols; p->type = m->type;
+    p->tile_rows = 32; p->tile_bytes = tile_bytes; p->nibble = 1;
+    p->scale_tile_bytes = scale_tile_bytes; p->d_tile_bytes = d_tile_bytes;
+    return 0;
+}
+
+static inline uint8_t k3_quant_iq2_semantic_code(int8_t q) {
+    switch (q) {
+    case 8: return 0; case 25: return 1; case 43: return 2;
+    case -8: return 3; case -25: return 4; case -43: return 5;
+    default: return 15;
+    }
+}
+
+/* Lossless IQ2_XS cache layout matching the IQ1 row-paired tile.  A nibble
+ * is a semantic code rather than a signed integer because the IQ2 grid is
+ * non-linear.  Scales remain expanded initially so decode and bandwidth
+ * costs can be measured independently; a later scale-nibble variant can
+ * reduce that 64-byte/group side stream to 32 bytes. */
+static inline int k3_quant_pack_iq2_rows32_pair(k3_quant_packed *p,
+                                                const k3_quant_matrix *m) {
+    k3_quant_packed tmp = {0};
+    if (!p || !m || m->type != K3_Q_IQ2_XS || (m->rows & 31) ||
+        k3_quant_pack_iq_rows16(&tmp, m)) return -1;
+    const int nb = m->cols / 256;
+    const int tiles = m->rows / 32;
+    const size_t tile_bytes = (size_t)nb * 8u * 8u * 64u;
+    const size_t scale_tile_bytes = (size_t)nb * 8u * 64u;
+    const size_t d_tile_bytes = (size_t)nb * 32u * sizeof(float);
+    int8_t *data = (int8_t *)k3_quant_alloc_aligned((size_t)tiles * tile_bytes);
+    int8_t *scales = (int8_t *)k3_quant_alloc_aligned(
+        (size_t)tiles * scale_tile_bytes);
+    float *d32 = (float *)k3_quant_alloc_aligned(
+        (size_t)tiles * d_tile_bytes);
+    if (!data || !scales || !d32) {
+        free(data); free(scales); free(d32); k3_quant_packed_free(&tmp);
+        return -1;
+    }
+    int invalid = 0;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static) reduction(|:invalid)
+#endif
+    for (int t = 0; t < tiles; ++t) {
+        const int t0 = 2 * t, t1 = t0 + 1;
+        for (int b = 0; b < nb; ++b) {
+            const uint16_t *d0 = tmp.ds + ((size_t)t0 * nb + b) * 16u;
+            const uint16_t *d1 = tmp.ds + ((size_t)t1 * nb + b) * 16u;
+            float *dd = d32 + ((size_t)t * nb + b) * 32u;
+            for (int r = 0; r < 16; ++r) {
+                dd[r] = ggml_fp16_to_fp32(d0[r]);
+                dd[16 + r] = ggml_fp16_to_fp32(d1[r]);
+            }
+            for (int ib = 0; ib < 8; ++ib) {
+                const int8_t *s0 = tmp.scales +
+                    (((size_t)t0 * nb + b) * 8u + ib) * 32u;
+                const int8_t *s1 = tmp.scales +
+                    (((size_t)t1 * nb + b) * 8u + ib) * 32u;
+                int8_t *sd = scales +
+                    (((size_t)t * nb + b) * 8u + ib) * 64u;
+                memcpy(sd, s0, 32);
+                memcpy(sd + 32, s1, 32);
+                for (int c = 0; c < 8; ++c) {
+                    const int8_t *q0 = tmp.data + (size_t)t0 * tmp.tile_bytes +
+                        ((size_t)b * 8u + ib) * 512u + (size_t)c * 64u;
+                    const int8_t *q1 = tmp.data + (size_t)t1 * tmp.tile_bytes +
+                        ((size_t)b * 8u + ib) * 512u + (size_t)c * 64u;
+                    int8_t *qd = data + (size_t)t * tile_bytes +
+                        ((size_t)b * 8u + ib) * 512u + (size_t)c * 64u;
+                    for (int j = 0; j < 64; ++j) {
+                        uint8_t lo = k3_quant_iq2_semantic_code(q0[j]);
+                        uint8_t hi = k3_quant_iq2_semantic_code(q1[j]);
+                        invalid |= lo == 15 || hi == 15;
+                        qd[j] = (int8_t)(lo | (uint8_t)(hi << 4));
+                    }
+                }
+            }
+        }
+    }
+    k3_quant_packed_free(&tmp);
+    if (invalid) { free(data); free(scales); free(d32); return -1; }
+    memset(p, 0, sizeof(*p));
+    p->data = data; p->scales = scales; p->d32 = d32;
+    p->rows = m->rows; p->cols = m->cols; p->type = m->type;
+    p->tile_rows = 32; p->tile_bytes = tile_bytes; p->nibble = 2;
+    p->scale_tile_bytes = scale_tile_bytes; p->d_tile_bytes = d_tile_bytes;
     return 0;
 }
 
@@ -434,7 +613,7 @@ static inline int k3_quant_workspace_prepare(k3_quant_workspace *ws,
         (mode == K3_QUANT_SVE_A16 || ws->q8)) {
         return 0;
     }
-    free(ws->a16); free(ws->q8);
+    free(ws->a16); free(ws->q8); free(ws->q8_sum32);
     memset(ws, 0, sizeof(*ws));
     ws->cols = cols;
     /* The int16 activation is always allocated: Q8_0 blocks are 32 elements,
@@ -445,14 +624,20 @@ static inline int k3_quant_workspace_prepare(k3_quant_workspace *ws,
     if (!ws->a16) return -1;
     if (mode == K3_QUANT_SVE_Q8) {
         ws->q8 = (int8_t *)malloc((size_t)cols * sizeof(*ws->q8));
-        if (!ws->q8) { free(ws->a16); ws->a16 = NULL; return -1; }
+        ws->q8_sum32 = (int32_t *)malloc((size_t)(cols / 32) *
+                                         sizeof(*ws->q8_sum32));
+        if (!ws->q8 || !ws->q8_sum32) {
+            free(ws->a16); free(ws->q8); free(ws->q8_sum32);
+            memset(ws, 0, sizeof(*ws)); return -1;
+        }
     }
     return 0;
 }
 
 static inline void k3_quant_workspace_free(k3_quant_workspace *ws) {
     if (!ws) return;
-    free(ws->a16); free(ws->q8); memset(ws, 0, sizeof(*ws));
+    free(ws->a16); free(ws->q8); free(ws->q8_sum32);
+    memset(ws, 0, sizeof(*ws));
 }
 
 static inline float k3_quant_fabs(float x) { return x < 0.0f ? -x : x; }
@@ -483,6 +668,12 @@ static inline void k3_quant_prepare_q8(k3_quant_workspace *ws,
         int v = (int)lrintf(x[i] * inv);
         ws->q8[i] = (int8_t)(v > 127 ? 127 : v < -127 ? -127 : v);
     }
+    if (ws->q8_sum32)
+        for (int b = 0; b < cols / 32; ++b) {
+            int32_t sum = 0;
+            for (int j = 0; j < 32; ++j) sum += ws->q8[32 * b + j];
+            ws->q8_sum32[b] = sum;
+        }
 }
 
 /* IQ2_XS carries a separate scale for each half of a 32-element group.  Doing
@@ -1252,15 +1443,150 @@ static inline void k3_quant_iq_packed_rows16(float * restrict out,
 #endif
 }
 
+static inline void k3_quant_iq1_packed_rows32_pair(
+        float * restrict out, const k3_quant_packed * restrict p,
+        const k3_quant_workspace * restrict ws) {
+#if defined(__ARM_FEATURE_SVE)
+    const svbool_t lanes = svwhilelt_b32(0, 16);
+    const svbool_t all = svptrue_b8();
+    const int nb = p->cols / 256;
+    svfloat32_t f0 = svdup_f32(0.0f), f1 = svdup_f32(0.0f);
+    for (int b = 0; b < nb; ++b) {
+        svint32_t b0 = svdup_s32(0), b1 = svdup_s32(0);
+        svfloat32_t d0 = svld1_f32(lanes, p->d32 + (size_t)b * 32u);
+        svfloat32_t d1 = svld1_f32(lanes, p->d32 + (size_t)b * 32u + 16u);
+        for (int ib = 0; ib < 8; ++ib) {
+            const int8_t *group = p->data +
+                ((size_t)b * 8u + ib) * 512u;
+            const int8_t *xg = ws->q8 + 256 * b + 32 * ib;
+            const int8_t *sm = p->scales +
+                ((size_t)b * 8u + ib) * 32u;
+            svint8_t xlo = svld1rq_s8(all, xg);
+            svint8_t xhi = svld1rq_s8(all, xg + 16);
+            svint32_t a0 = svdup_s32(0), a1 = svdup_s32(0);
+#define K3_IQ1_PAIR_DOT(C, X, L) do { \
+            svint8_t qp = svld1_s8(all, group + (size_t)(C) * 64u); \
+            svint8_t qh = svasr_n_s8_x(all, qp, 4); \
+            svint8_t ql = svasr_n_s8_x(all, svlsl_n_s8_x(all, qp, 4), 4); \
+            a0 = svdot_lane_s32(a0, ql, (X), (L)); \
+            a1 = svdot_lane_s32(a1, qh, (X), (L)); \
+        } while (0)
+            K3_IQ1_PAIR_DOT(0, xlo, 0); K3_IQ1_PAIR_DOT(1, xlo, 1);
+            K3_IQ1_PAIR_DOT(2, xlo, 2); K3_IQ1_PAIR_DOT(3, xlo, 3);
+            K3_IQ1_PAIR_DOT(4, xhi, 0); K3_IQ1_PAIR_DOT(5, xhi, 1);
+            K3_IQ1_PAIR_DOT(6, xhi, 2); K3_IQ1_PAIR_DOT(7, xhi, 3);
+#undef K3_IQ1_PAIR_DOT
+            svint32_t sd0 = svld1sb_s32(lanes, sm);
+            svint32_t sd1 = svld1sb_s32(lanes, sm + 16);
+            svint32_t s0 = svabs_s32_x(lanes, sd0);
+            svint32_t s1 = svabs_s32_x(lanes, sd1);
+            int32_t xs = ws->q8_sum32 ? ws->q8_sum32[8 * b + ib] : 0;
+            svint32_t xv = svdup_s32(xs);
+            b0 = svmla_s32_x(lanes, b0, svlsl_n_s32_x(lanes, a0, 3), s0);
+            b1 = svmla_s32_x(lanes, b1, svlsl_n_s32_x(lanes, a1, 3), s1);
+            b0 = svmla_s32_x(lanes, b0, xv, sd0);
+            b1 = svmla_s32_x(lanes, b1, xv, sd1);
+        }
+        f0 = svmla_f32_x(lanes, f0, svcvt_f32_s32_x(lanes, b0),
+            svmul_n_f32_x(lanes, d0, 0.125f));
+        f1 = svmla_f32_x(lanes, f1, svcvt_f32_s32_x(lanes, b1),
+            svmul_n_f32_x(lanes, d1, 0.125f));
+    }
+    svst1_f32(lanes, out, svmul_n_f32_x(lanes, f0, ws->scale));
+    svst1_f32(lanes, out + 16, svmul_n_f32_x(lanes, f1, ws->scale));
+#else
+    (void)out; (void)p; (void)ws;
+#endif
+}
+
+static inline void k3_quant_iq2_packed_rows32_pair(
+        float * restrict out, const k3_quant_packed * restrict p,
+        const k3_quant_workspace * restrict ws) {
+#if defined(__ARM_FEATURE_SVE)
+    const svbool_t lanes = svwhilelt_b32(0, 16);
+    const svbool_t all = svptrue_b8();
+    const svint8_t table = svld1_s8(all, k3_iq2_semantic_lut);
+    const int nb = p->cols / 256;
+    svfloat32_t f0 = svdup_f32(0.0f), f1 = svdup_f32(0.0f);
+    for (int b = 0; b < nb; ++b) {
+        svint32_t b0 = svdup_s32(0), b1 = svdup_s32(0);
+        svfloat32_t d0 = svld1_f32(lanes, p->d32 + (size_t)b * 32u);
+        svfloat32_t d1 = svld1_f32(lanes, p->d32 + (size_t)b * 32u + 16u);
+        for (int ib = 0; ib < 8; ++ib) {
+            const int8_t *group = p->data +
+                ((size_t)b * 8u + ib) * 512u;
+            const int8_t *xg = ws->q8 + 256 * b + 32 * ib;
+            const int8_t *sm = p->scales +
+                ((size_t)b * 8u + ib) * 64u;
+            svint8_t xlo = svld1rq_s8(all, xg);
+            svint8_t xhi = svld1rq_s8(all, xg + 16);
+            svint32_t a00 = svdup_s32(0), a01 = svdup_s32(0);
+            svint32_t a10 = svdup_s32(0), a11 = svdup_s32(0);
+#define K3_IQ2_PAIR_DOT(C, X, L, A0, A1) do { \
+            svuint8_t qp = svreinterpret_u8_s8( \
+                svld1_s8(all, group + (size_t)(C) * 64u)); \
+            svuint8_t il = svand_n_u8_x(all, qp, 15); \
+            svuint8_t ih = svlsr_n_u8_x(all, qp, 4); \
+            (A0) = svdot_lane_s32((A0), svtbl_s8(table, il), (X), (L)); \
+            (A1) = svdot_lane_s32((A1), svtbl_s8(table, ih), (X), (L)); \
+        } while (0)
+            K3_IQ2_PAIR_DOT(0, xlo, 0, a00, a10);
+            K3_IQ2_PAIR_DOT(1, xlo, 1, a00, a10);
+            K3_IQ2_PAIR_DOT(2, xlo, 2, a00, a10);
+            K3_IQ2_PAIR_DOT(3, xlo, 3, a00, a10);
+            K3_IQ2_PAIR_DOT(4, xhi, 0, a01, a11);
+            K3_IQ2_PAIR_DOT(5, xhi, 1, a01, a11);
+            K3_IQ2_PAIR_DOT(6, xhi, 2, a01, a11);
+            K3_IQ2_PAIR_DOT(7, xhi, 3, a01, a11);
+#undef K3_IQ2_PAIR_DOT
+            svint32_t s00 = svld1sb_s32(lanes, sm);
+            svint32_t s01 = svld1sb_s32(lanes, sm + 16);
+            svint32_t s10 = svld1sb_s32(lanes, sm + 32);
+            svint32_t s11 = svld1sb_s32(lanes, sm + 48);
+            b0 = svmla_s32_x(lanes, b0, a00, s00);
+            b0 = svmla_s32_x(lanes, b0, a01, s01);
+            b1 = svmla_s32_x(lanes, b1, a10, s10);
+            b1 = svmla_s32_x(lanes, b1, a11, s11);
+        }
+        f0 = svmla_f32_x(lanes, f0, svcvt_f32_s32_x(lanes, b0),
+            svmul_n_f32_x(lanes, d0, 0.125f));
+        f1 = svmla_f32_x(lanes, f1, svcvt_f32_s32_x(lanes, b1),
+            svmul_n_f32_x(lanes, d1, 0.125f));
+    }
+    svst1_f32(lanes, out, svmul_n_f32_x(lanes, f0, ws->scale));
+    svst1_f32(lanes, out + 16, svmul_n_f32_x(lanes, f1, ws->scale));
+#else
+    (void)out; (void)p; (void)ws;
+#endif
+}
+
 static inline int k3_quant_matvec_packed_ws(float *out,
                                             const k3_quant_matrix *m,
                                             const k3_quant_packed *p,
                                             const k3_quant_workspace *ws) {
-    if (!out || !m || !p || !ws || m->rows != 16 ||
+    int tile_rows = p && p->tile_rows ? p->tile_rows : 16;
+    if (!out || !m || !p || !ws || m->rows != tile_rows ||
         (m->type != K3_Q_IQ1_S && m->type != K3_Q_IQ2_XS &&
          m->type != K3_Q_IQ2_XXS) ||
         !ws->q8) return -1;
-    k3_quant_iq_packed_rows16(out, p, m, ws->q8, ws->scale);
+    if (tile_rows == 32 && m->type == K3_Q_IQ1_S) {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && K3_IQ1_PAIR_USE_ASM
+        k3_iq1_pair32_asm(out, p->data, p->scales, p->d32, ws->q8,
+                          ws->q8_sum32, m->cols / 256, ws->scale);
+#else
+        k3_quant_iq1_packed_rows32_pair(out, p, ws);
+#endif
+    }
+    else if (tile_rows == 32 && m->type == K3_Q_IQ2_XS) {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+        k3_iq2_pair32_asm(out, p->data, p->scales, p->d32, ws->q8,
+                          NULL, m->cols / 256, ws->scale);
+#else
+        k3_quant_iq2_packed_rows32_pair(out, p, ws);
+#endif
+    }
+    else
+        k3_quant_iq_packed_rows16(out, p, m, ws->q8, ws->scale);
     return 0;
 }
 
@@ -1274,27 +1600,30 @@ static inline int k3_quant_matvec_packed_batch(float *out, size_t out_stride,
                                                const k3_quant_packed *p,
                                                const k3_quant_workspace *ws,
                                                int batch) {
-    if (!out || !m || !p || !ws || batch < 1 || (m->rows & 15) ||
+    int tile_rows = p && p->tile_rows ? p->tile_rows : 16;
+    if (!out || !m || !p || !ws || batch < 1 || m->rows % tile_rows ||
         out_stride < (size_t)m->rows || p->tile_bytes == 0) return -1;
     int rc = 0;
-    int tiles = m->rows / 16;
+    int tiles = m->rows / tile_rows;
 #if defined(_OPENMP)
     #pragma omp parallel for schedule(static) reduction(|:rc)
 #endif
     for (int task = 0; task < batch * tiles; ++task) {
         int token = task / tiles;
         int tile_index = task - token * tiles;
-        int r = tile_index * 16;
+        int r = tile_index * tile_rows;
         k3_quant_matrix sub = *m;
         k3_quant_packed tile = *p;
         sub.data += (size_t)r * m->row_bytes;
-        sub.rows = 16;
+        sub.rows = tile_rows;
         tile.data += (size_t)tile_index * p->tile_bytes;
-        tile.rows = 16;
+        tile.rows = tile_rows;
         if (tile.scales)
             tile.scales += (size_t)tile_index * p->scale_tile_bytes;
         if (tile.ds)
             tile.ds += (size_t)tile_index * p->d_tile_bytes / sizeof(*tile.ds);
+        if (tile.d32)
+            tile.d32 += (size_t)tile_index * p->d_tile_bytes / sizeof(*tile.d32);
         if (k3_quant_matvec_packed_ws(out + (size_t)token * out_stride + r,
                                       &sub, &tile, ws + token)) rc |= 1;
     }

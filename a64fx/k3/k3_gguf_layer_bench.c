@@ -14,6 +14,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef USE_FAPP
+#include <fj_tool/fapp.h>
+#endif
+
 typedef struct {
     size_t off, nbytes;
     int type, ndims;
@@ -152,6 +156,8 @@ int main(int argc, char **argv) {
     double layer_ms = 0.0;
     int measured = 0;
     for (int i = 0; i < n; ++i) {
+        const char *only = getenv("K3_ONLY_TENSOR");
+        if (only && *only && !strstr(a[i].name, only)) continue;
         if (a[i].ndims < 2) continue;
         int cols = (int)a[i].shape[0];
         size_t rows64 = 1;
@@ -160,6 +166,7 @@ int main(int argc, char **argv) {
         int expert_pool = a[i].ndims == 3 && strstr(a[i].name, "exps") != NULL;
         int active_experts = 1;
         int rows_per_expert = (int)rows64;
+        int flat_experts = 0;
         if (expert_pool) {
             /* One decode token routes a small expert set, not all 896 experts.
              * Select actual planes; flattening the expert axis would measure
@@ -170,7 +177,10 @@ int main(int argc, char **argv) {
                 atoi(active_env) < active_experts)
                 active_experts = atoi(active_env);
             rows_per_expert = (int)a[i].shape[1];
-            bench_rows64 = (size_t)rows_per_expert;
+            flat_experts = getenv("K3_EXPERT_FLAT") &&
+                           atoi(getenv("K3_EXPERT_FLAT")) != 0;
+            bench_rows64 = (size_t)rows_per_expert *
+                           (size_t)(flat_experts ? active_experts : 1);
         }
         if (rows64 > 1000000 || bench_rows64 > 1000000 ||
             !k3_quant_valid_shape(a[i].type, 1, cols)) continue;
@@ -201,17 +211,26 @@ int main(int argc, char **argv) {
         int use_nibble = use_packed && getenv("K3_QUANT_PACKED_NIBBLE") &&
                          atoi(getenv("K3_QUANT_PACKED_NIBBLE")) != 0 &&
                          a[i].type == K3_Q_IQ1_S;
+        int use_pair = use_packed && getenv("K3_QUANT_PACKED_PAIR") &&
+                       atoi(getenv("K3_QUANT_PACKED_PAIR")) != 0 &&
+                       (a[i].type == K3_Q_IQ1_S ||
+                        a[i].type == K3_Q_IQ2_XS) &&
+                       !((expert_pool ? rows_per_expert : rows) & 31);
         k3_quant_packed expert_packed[8] = {{0}};
         k3_quant_matrix expert_m[8];
         int expert_packed_ok = 0;
-        if (use_packed && expert_pool) {
+        if (use_packed && expert_pool && !flat_experts) {
             expert_packed_ok = 1;
             size_t erb = a[i].nbytes / ((size_t)a[i].shape[1] * a[i].shape[2]);
             for (int e = 0; e < active_experts; ++e) {
                 expert_m[e] = (k3_quant_matrix){
                     blob + a[i].off + (size_t)e * rows_per_expert * erb,
                     a[i].type, rows_per_expert, cols, erb};
-                int prc = (use_nibble && a[i].type == K3_Q_IQ1_S) ?
+                int prc = use_pair ?
+                    (a[i].type == K3_Q_IQ1_S ?
+                     k3_quant_pack_iq1_rows32_pair(&expert_packed[e], &expert_m[e]) :
+                     k3_quant_pack_iq2_rows32_pair(&expert_packed[e], &expert_m[e])) :
+                    (use_nibble && a[i].type == K3_Q_IQ1_S) ?
                     k3_quant_pack_iq_rows16_nibble(&expert_packed[e], &expert_m[e]) :
                     k3_quant_pack_iq_rows16(&expert_packed[e], &expert_m[e]);
                 if (prc) { expert_packed_ok = 0; break; }
@@ -226,7 +245,10 @@ int main(int argc, char **argv) {
                 use_packed = 0;
             }
         } else if (use_packed) {
-            use_packed = !(use_nibble ?
+            use_packed = !(use_pair ?
+                           (a[i].type == K3_Q_IQ1_S ?
+                            k3_quant_pack_iq1_rows32_pair(&packed, &m) :
+                            k3_quant_pack_iq2_rows32_pair(&packed, &m)) : use_nibble ?
                            k3_quant_pack_iq_rows16_nibble(&packed, &m) :
                            k3_quant_pack_iq_rows16(&packed, &m));
             for (int b = 0; b < batch && use_packed; ++b) {
@@ -246,14 +268,15 @@ int main(int argc, char **argv) {
                 pws[b].a16_ready = 1;
             }
         }
-        if (use_packed && expert_pool)
+        if (use_packed && expert_pool && !flat_experts)
             for (int e = 0; e < active_experts; ++e)
                 (void)k3_quant_matvec_packed_batch(y, rows, &expert_m[e],
                                                    &expert_packed[e], pws, batch);
         else if (use_packed)
             (void)k3_quant_matvec_packed_batch(y, rows, &m, &packed, pws, batch);
         else if (use_q8_batch)
-            (void)k3_quant_q8_0_matvec_batch(y, rows, &m, pws, batch, threads);
+            (void)k3_quant_q8_0_matvec_batch(y, rows, &m, pws, batch, threads,
+                                              NULL);
         else if (batch == 1 && expert_pool && expert_parallel) {
 #pragma omp parallel for schedule(static)
             for (int e = 0; e < active_experts; ++e)
@@ -271,15 +294,19 @@ int main(int argc, char **argv) {
             (void)k3_quant_matvec_mode(y + (size_t)b * rows, &m,
                                        x + (size_t)b * cols, threads, mode);
         double t0 = now_s();
+#ifdef USE_FAPP
+        fapp_start("k3_iq_decode", 1, 0);
+#endif
         for (int r = 0; r < reps; ++r) {
-            if (use_packed && expert_pool)
+            if (use_packed && expert_pool && !flat_experts)
                 for (int e = 0; e < active_experts; ++e)
                     (void)k3_quant_matvec_packed_batch(y, rows, &expert_m[e],
                                                        &expert_packed[e], pws, batch);
             else if (use_packed)
                 (void)k3_quant_matvec_packed_batch(y, rows, &m, &packed, pws, batch);
             else if (use_q8_batch)
-                (void)k3_quant_q8_0_matvec_batch(y, rows, &m, pws, batch, threads);
+                (void)k3_quant_q8_0_matvec_batch(y, rows, &m, pws, batch,
+                                                  threads, NULL);
             else if (batch == 1 && expert_pool && expert_parallel) {
 #pragma omp parallel for schedule(static)
                 for (int e = 0; e < active_experts; ++e)
@@ -297,13 +324,23 @@ int main(int argc, char **argv) {
                 (void)k3_quant_matvec_mode(y + (size_t)b * rows, &m,
                                            x + (size_t)b * cols, threads, mode);
         }
+#ifdef USE_FAPP
+        fapp_stop("k3_iq_decode", 1, 0);
+#endif
         double ms = (now_s() - t0) * 1000.0 / reps;
         layer_ms += ms; ++measured;
-        printf("K3_QBENCH mode=%s tensor=%s type=%s rows=%d cols=%d experts=%d batch=%d ms=%.3f tok/s=%.3f\n",
-               use_packed ? (use_nibble ? "packed-iq4-sve-q8" : "packed-sve-q8") : mode == K3_QUANT_REFERENCE ? "reference" :
+        size_t op_rows = (size_t)rows *
+            (size_t)(expert_pool && !flat_experts ? active_experts : 1);
+        double gflops = 2.0 * (double)op_rows * cols * batch /
+                        (ms * 1.0e6);
+        printf("K3_QBENCH mode=%s tensor=%s type=%s rows=%d cols=%d experts=%d batch=%d ms=%.3f gflops=%.1f tok/s=%.3f\n",
+               use_packed ? (use_pair ? (a[i].type == K3_Q_IQ1_S ?
+                                          "packed-iq4-pair-sve-q8" :
+                                          "packed-iq2-semantic4-pair-sve-q8") :
+                             use_nibble ? "packed-iq4-sve-q8" : "packed-sve-q8") : mode == K3_QUANT_REFERENCE ? "reference" :
                mode == K3_QUANT_SVE_Q8 ? "sve-q8" : "sve-a16",
                a[i].name, k3_quant_type_name(a[i].type), rows, cols,
-               expert_pool ? active_experts : 1, batch, ms,
+               expert_pool ? active_experts : 1, batch, ms, gflops,
                ms > 0.0 ? batch * 1000.0 / ms : 0.0);
         free(x); free(y);
         for (int b = 0; b < batch; ++b) k3_quant_workspace_free(&pws[b]);
