@@ -102,6 +102,12 @@ int main(void){
         np=0;dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
         rp=sqrt(np/(dp+1e-30));printf("%s l2omp_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
         if(!isfinite(rp)||rp>0.08)return 1;
+        if(fp4_matrix_prepare_bf16(&p,2) ||
+           fp4_gemm_f16_bf16cache_omp(got,a,&p,M,32,2)) return 1;
+        np=0;dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
+        rp=sqrt(np/(dp+1e-30));printf("%s bf16cache_rel=%.6g bytes=%zu\n",
+            fp4_format_name((fp4_format)f),rp,p.weights_bf16_bytes);
+        if(!isfinite(rp)||rp>0.08)return 1;
         if(fp4_gemm_f16_l1panel(got,a,&p,M,32))return 1;
         np=0;dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
         rp=sqrt(np/(dp+1e-30));printf("%s l1panel_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);

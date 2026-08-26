@@ -123,7 +123,7 @@ void fp4_matrix_free(fp4_matrix *p) {
     free(p->codes_t8);free(p->codes_t8_half);free(p->codes_t12);free(p->codes_t8_affine);
     free(p->scales_t8);free(p->scales_t12);free(p->scales_sdot4);
     free(p->codes_bitplane);
-    free(p->scales_n32); memset(p, 0, sizeof(*p));
+    free(p->scales_n32); free(p->weights_bf16); memset(p, 0, sizeof(*p));
 }
 
 static float block_amax_1d(const float *w, int k, int row, int col, int bs) {
@@ -1006,6 +1006,54 @@ static inline void dense_panel_m6(float*c,const _Float16*a,const _Float16*p,
 #undef PANEL_STORE
 }
 #endif
+
+int fp4_matrix_prepare_bf16(fp4_matrix *p, int threads) {
+    if (!p || !p->codes_n32 || !p->scales_n32 || threads < 1) return -1;
+#if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
+    size_t tile_elems = (size_t)p->k * 32;
+    size_t total = (size_t)(p->n / 32) * tile_elems;
+    _Float16 *cache = NULL;
+    if (posix_memalign((void **)&cache, 256, total * sizeof(*cache))) return -1;
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (int tile = 0; tile < p->n / 32; ++tile)
+        dequant_n32_panel(cache + (size_t)tile * tile_elems, p, tile, 0, p->k);
+    free(p->weights_bf16);
+    p->weights_bf16 = cache;
+    p->weights_bf16_bytes = total * sizeof(*cache);
+    return 0;
+#else
+    (void)threads;
+    return -1;
+#endif
+}
+
+int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
+        const fp4_matrix *w, int m, int promotion_k, int threads) {
+    if (!c || !a || !w || !w->weights_bf16 || m < 1 || threads < 1 ||
+        promotion_k < 0 || (promotion_k &&
+        ((promotion_k % 32) || promotion_k > w->k))) return -1;
+#if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
+    int span = promotion_k ? promotion_k : w->k;
+    size_t tile_elems = (size_t)w->k * 32;
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (int tile = 0; tile < w->n / 32; ++tile) {
+        const _Float16 *panel = w->weights_bf16 + (size_t)tile * tile_elems;
+        for (int m0 = 0; m0 < m; m0 += 6) {
+            int mr = m - m0 < 6 ? m - m0 : 6;
+            for (int kb = 0; kb < w->k; kb += span) {
+                int ke = kb + span < w->k ? kb + span : w->k;
+                dense_panel_m6(c + (size_t)m0 * w->n,
+                    a + (size_t)m0 * w->k, panel, w->k, w->n,
+                    tile, kb, ke, 0, mr, kb != 0);
+            }
+        }
+    }
+    return 0;
+#else
+    (void)threads;
+    return -1;
+#endif
+}
 
 int fp4_gemm_f16_l2(float*c,const _Float16*a,const fp4_matrix*w,int m,int promotion_k){
     if(!c||!a||!w||!w->codes_n32||!w->scales_n32||m<1||promotion_k<0||

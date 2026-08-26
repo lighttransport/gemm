@@ -2416,7 +2416,9 @@ static ds4f_model *ds4f_alloc_synth(ds4f_config cfg, int ep_rank, int ep_size,
     {   const char *e = getenv("DS4F_FP8_MAGIC");
         m->fp8_magic = (e && *e && atoi(e)) ? 1 : 0; }
     {   const char *e = getenv("DS4F_MXFP4_GEMM_TILE");
-        m->mxfp4_gemm_tile = (e && *e) ? atoi(e) : 0; }
+        /* M>1 FP4 prefill: decode each 8-row group once into the L1 BF16
+         * panel, then reuse it across tokens. M=1 keeps the packed decoder. */
+        m->mxfp4_gemm_tile = (e && *e) ? atoi(e) : 8; }
     {   const char *e = getenv("DS4F_SPARSE");
         m->sparse = (e && *e && atoi(e)) ? 1 : 0; }
     {   const char *e = getenv("DS4F_MHC");
@@ -3267,7 +3269,7 @@ static ds4f_model *ds4f_load_real(ds4f_config cfg, int ep_rank, int ep_size,
                                 "(no bf16 promote, no load peak)\n", e);
         } }
     { const char *e = getenv("DS4F_FP8_MAGIC"); m->fp8_magic = (e && *e && atoi(e)) ? 1 : 0; }
-    { const char *e = getenv("DS4F_MXFP4_GEMM_TILE"); m->mxfp4_gemm_tile = (e && *e) ? atoi(e) : 0; }
+    { const char *e = getenv("DS4F_MXFP4_GEMM_TILE"); m->mxfp4_gemm_tile = (e && *e) ? atoi(e) : 8; }
     { const char *e = getenv("DS4F_SPARSE");    m->sparse    = (e && *e && atoi(e)) ? 1 : 0; }
     { const char *e = getenv("DS4F_MHC");       m->mhc       = (e && *e && atoi(e)) ? 1 : 0; }
     { const char *e = getenv("DS4F_EXACT");     m->exact     = (e && *e && atoi(e)) ? 1 : 0; }
@@ -6459,4 +6461,3 @@ static int ds4f_forward_token(ds4f_model *m, float *x, int pos) {
     DS4F_TOC(DS4F_P_HEAD);
     return best; }
 }
-

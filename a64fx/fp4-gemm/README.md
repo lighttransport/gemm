@@ -136,6 +136,13 @@ workspace is 256 KiB, so it resides in L2 rather than the 64 KiB L1. Use direct
 N32 FP4 for M<12 and the L2 panel path for M>=12. GEMM timing includes panel
 dequantization and its L2 write/read traffic.
 
+`fp4_matrix_prepare_bf16` builds a persistent K-major BF16 sidecar for every
+N32 tile. `fp4_gemm_f16_bf16cache_omp` reuses that sidecar across M tokens and
+uses the BF16 8x3 microkernel with FP32 accumulators. This is preferred when a
+matrix is reused for multiple M>1 GEMMs: it costs 4x the packed weight storage
+but removes FP4 decode from the timed GEMM. The sidecar is validated against
+the FP4 reference for MXFP4 and both NVFP4 layouts.
+
 ## INT8 SDOT re-encoding
 
 `fp4_matrix_prepare_sdot` maps E2M1 exactly to signed integers by multiplying

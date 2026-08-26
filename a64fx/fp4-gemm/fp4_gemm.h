@@ -31,6 +31,9 @@ typedef struct {
     uint8_t *codes_t12;
     uint8_t *codes_t8_affine;
     uint32_t *codes_bitplane;
+    /* Persistent K-major BF16 sidecar: one [K][32] tile per N32 group. */
+    _Float16 *weights_bf16;
+    size_t weights_bf16_bytes;
     _Float16 *scales_n32;
     _Float16 *scales_sdot;
     _Float16 *scales_pair;
@@ -69,6 +72,7 @@ int fp4_matrix_prepare_bitplane(fp4_matrix *matrix);
 int fp4_matrix_prepare_sdot(fp4_matrix *matrix);
 int fp4_matrix_prepare_sdot4(fp4_matrix *matrix);
 int fp4_matrix_prepare_pair(fp4_matrix *matrix);
+int fp4_matrix_prepare_bf16(fp4_matrix *matrix, int threads);
 float fp4_dequant_value(const fp4_matrix *matrix, int row, int col);
 
 /* C[M,N] = A[M,K] * W[N,K]^T. A is FP16 and C is FP32. promotion_k is
@@ -87,6 +91,9 @@ int fp4_gemm_f16_l2_omp(float *c, const _Float16 *a, const fp4_matrix *w,
                          int m, int promotion_k, int threads);
 int fp4_gemm_f16_n32_omp(float *c, const _Float16 *a, const fp4_matrix *w,
                           int m, int promotion_k, int threads);
+int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
+                                const fp4_matrix *w, int m,
+                                int promotion_k, int threads);
 int fp4_gemm_f16_half_omp(float *c, const _Float16 *a, const fp4_matrix *w,
                            int m, int promotion_k, int threads);
 int fp4_gemm_f16_t12_omp(float *c, const _Float16 *a, const fp4_matrix *w,
