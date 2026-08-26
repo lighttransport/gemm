@@ -29,6 +29,7 @@ int main(int argc, char **argv)
     int promotion_k = argc > 3 ? atoi(argv[3]) : 256;
     int iterations = argc > 4 ? atoi(argv[4]) : 200;
     int threads = argc > 5 ? atoi(argv[5]) : 12;
+    int use_half = getenv("FP4_FAPP_HALF") != NULL;
     fp4_matrix w;
     _Float16 *a;
     float *c;
@@ -44,6 +45,8 @@ int main(int argc, char **argv)
         w.scales[i] = 124;
     if (fp4_matrix_prepare_n32(&w))
         return 1;
+    if (use_half && fp4_matrix_prepare_half(&w))
+        return 1;
 
     a = aligned_alloc_256((size_t)k * sizeof(*a));
     c = aligned_alloc_256((size_t)n * sizeof(*c));
@@ -52,20 +55,23 @@ int main(int argc, char **argv)
     for (int i = 0; i < k; ++i)
         a[i] = (_Float16)((int)(next_random() & 255) - 128) / 512;
 
-    if (fp4_gemm_f16_n32_omp(c, a, &w, 1, promotion_k, threads))
+    if ((use_half ? fp4_gemm_f16_half_omp(c, a, &w, 1, promotion_k, threads) :
+                    fp4_gemm_f16_n32_omp(c, a, &w, 1, promotion_k, threads)))
         return 1;
 #ifdef USE_FAPP
     fapp_start("fp4_m1_t8", 1, 0);
 #endif
     for (int i = 0; i < iterations; ++i)
-        if (fp4_gemm_f16_n32_omp(c, a, &w, 1, promotion_k, threads))
+        if ((use_half ? fp4_gemm_f16_half_omp(c, a, &w, 1, promotion_k, threads) :
+                        fp4_gemm_f16_n32_omp(c, a, &w, 1, promotion_k, threads)))
             return 1;
 #ifdef USE_FAPP
     fapp_stop("fp4_m1_t8", 1, 0);
 #endif
 
-    printf("N=%d K=%d promotion_k=%d iterations=%d threads=%d checksum=%.9g\n",
-           n, k, promotion_k, iterations, threads, c[n / 3]);
+    printf("kernel=%s N=%d K=%d promotion_k=%d iterations=%d threads=%d checksum=%.9g\n",
+           use_half ? "half" : "baseline", n, k, promotion_k, iterations,
+           threads, c[n / 3]);
     free(a);
     free(c);
     fp4_matrix_free(&w);

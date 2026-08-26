@@ -207,6 +207,15 @@ limits it to 83.5 GFLOP/s (about 26 GB/s including its FP32 scale sidecar).
 It is retained as a negative control, not selected over the 400 GFLOP/s t8
 FP16 path or 410 GFLOP/s expanded SDOT path.
 
+Three further exact M1 controls attack the measured FLA completion stalls.
+`fp4_gemm_f16_half_omp` pairs rows 0--15 with rows 16--31 and uses two
+overlapping half-predicate loads plus `ORR` instead of vector `ZIP1`.
+`fp4_gemm_f16_t12_omp` widens the original decoder to twelve N32 tiles.
+`fp4_gemm_f16_affine_omp` re-encodes E2M1 so FP16 bits can be constructed with
+shift/add/predicate operations and removes `TBL`. Set `FP4_HALF_ONLY=1`,
+`FP4_T12_ONLY=1`, or `FP4_AFFINE_ONLY=1` on `bench_fp4_stream` to isolate them.
+They are diagnostics rather than default dispatch paths.
+
 ### Scalar EX packed-FP4 producer
 
 `bench_fp4_ex` also measures a packed-FP4 producer using only scalar AArch64

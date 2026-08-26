@@ -19,7 +19,7 @@ int main(void){
     _Float16*a=malloc((size_t)M*K*2);float*fa=malloc((size_t)K*4);if(!w||!ref||!got||!got2||!a||!fa)return 1;
     for(int i=0;i<N*K;++i)w[i]=rnd()*0.25f;for(int i=0;i<M*K;++i)a[i]=(_Float16)(rnd()*0.5f);
     for(int i=0;i<K;++i)fa[i]=(float)a[i];
-    for(int f=0;f<3;++f){fp4_matrix p;if(fp4_matrix_alloc(&p,(fp4_format)f,N,K)||fp4_quantize_f32(&p,w)||fp4_matrix_prepare_n32(&p)||fp4_matrix_prepare_u8(&p)||fp4_matrix_prepare_bitplane(&p)||fp4_matrix_prepare_pair(&p)||fp4_matrix_prepare_sdot4(&p))return 1;
+    for(int f=0;f<3;++f){fp4_matrix p;if(fp4_matrix_alloc(&p,(fp4_format)f,N,K)||fp4_quantize_f32(&p,w)||fp4_matrix_prepare_n32(&p)||fp4_matrix_prepare_u8(&p)||fp4_matrix_prepare_bitplane(&p)||fp4_matrix_prepare_pair(&p)||fp4_matrix_prepare_sdot4(&p)||(f==FP4_MX&&(fp4_matrix_prepare_half(&p)||fp4_matrix_prepare_affine(&p))))return 1;
         fp4_gemm_reference(ref,a,&p,M,1);
         for(int kc=0;kc<=64;kc+=32){if(fp4_gemm_f16(got,a,&p,M,kc,2)||fp4_gemm_f16_n32(got2,a,&p,M,kc))return 1;double num=0,den=0,num2=0;
             for(int i=0;i<M*N;++i){double d=got[i]-ref[i],d2=got2[i]-ref[i];num+=d*d;num2+=d2*d2;den+=(double)ref[i]*ref[i];}
@@ -42,6 +42,14 @@ int main(void){
         np=0;dp=0;for(int i=0;i<M*N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
         rp=sqrt(np/(dp+1e-30));printf("%s n32omp_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
         if(!isfinite(rp)||rp>0.08)return 1;
+        if(f==FP4_MX){if(fp4_gemm_f16_half_omp(got,a,&p,1,32,2))return 1;
+          np=0;dp=0;for(int i=0;i<N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
+          rp=sqrt(np/(dp+1e-30));printf("%s half_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
+          if(!isfinite(rp)||rp>0.08)return 1;
+          if(fp4_gemm_f16_affine_omp(got,a,&p,1,32,2))return 1;
+          np=0;dp=0;for(int i=0;i<N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
+          rp=sqrt(np/(dp+1e-30));printf("%s affine_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
+          if(!isfinite(rp)||rp>0.08)return 1;}
         if(fp4_gemm_f16_bitplane_omp(got,a,&p,1,32,2))return 1;
         np=0;dp=0;for(int i=0;i<N;++i){double d=got[i]-ref[i];np+=d*d;dp+=(double)ref[i]*ref[i];}
         rp=sqrt(np/(dp+1e-30));printf("%s bitplane_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
@@ -99,5 +107,13 @@ int main(void){
         rp=sqrt(np/(dp+1e-30));printf("%s l1panel_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
         if(!isfinite(rp)||rp>0.08)return 1;
         fp4_matrix_free(&p);}
+    {enum{TN=384,TK=64};float*tw=malloc((size_t)TN*TK*4),*tr=malloc((size_t)TN*4),*tg=malloc((size_t)TN*4);
+      _Float16*ta=malloc((size_t)TK*2);fp4_matrix tp;if(!tw||!tr||!tg||!ta)return 1;
+      for(int i=0;i<TN*TK;++i)tw[i]=rnd()*.25f;for(int i=0;i<TK;++i)ta[i]=(_Float16)(rnd()*.5f);
+      if(fp4_matrix_alloc(&tp,FP4_MX,TN,TK)||fp4_quantize_f32(&tp,tw)||fp4_matrix_prepare_n32(&tp)||fp4_matrix_prepare_t12(&tp)||
+         fp4_gemm_reference(tr,ta,&tp,1,1)||fp4_gemm_f16_t12_omp(tg,ta,&tp,1,32,2))return 1;
+      double np=0,dp=0;for(int i=0;i<TN;++i){double d=tg[i]-tr[i];np+=d*d;dp+=(double)tr[i]*tr[i];}
+      double rp=sqrt(np/(dp+1e-30));printf("mxfp4 t12_rel=%.6g\n",rp);if(!isfinite(rp)||rp>.08)return 1;
+      fp4_matrix_free(&tp);free(tw);free(tr);free(tg);free(ta);}
     free(w);free(ref);free(got);free(got2);free(a);free(fa);puts("FP4 GEMM tests: PASS");return 0;
 }

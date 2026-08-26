@@ -360,6 +360,39 @@ output chains hide only part of those completion latencies. This also explains
 why prefetching and longer FP16 accumulation blocks do not materially improve
 the kernel.
 
+### ZIP/TBL removal follow-up
+
+The fapp result motivated three same-density exact controls:
+
+| kernel | configuration | GFLOP/s | result |
+|---|---:|---:|---|
+| baseline t8 | N32768 K4096 K256 | 397--403 | selected |
+| row-half, no `ZIP1` | N32768 K4096 K256 | 378--382 | rejected |
+| row-half Kx2 pipeline | N32768 K4096 K256 | 363--365 | rejected |
+| t12 wider chains | N36864 K4096 K256 | 400--402 | rejected; t8 is 416.6 at the same N |
+| affine E2M1, no `TBL` | N32768 K4096 K256 | 135.1 | rejected |
+
+The row-half layout stores row `j` in the low nibble and row `16+j` in the
+high nibble. Two predicated loads of the same 16 bytes place those codes in
+the lower and upper vector halves, and `ORR` replaces `ZIP1`. It remains exact,
+but fapp reports FLA valid 62.88%, FLB valid 60.50%, `FL_COMP_WAIT` 25.55%, and
+`LD_COMP_WAIT` 4.13%. Thus the extra load is inexpensive, but replacing ZIP
+does not break the remaining `ORR -> TBL -> FMLA` completion chain.
+
+The affine layout stores sign in bit zero and remaps E2M1 magnitude to
+`{1,0,2,3,4,5,6,7}`. It constructs the FP16 magnitude as
+`(r << 9) + 0x3800`, predicates `r==1` to zero, inserts the sign, and multiplies
+by the activation. This exactly removes `TBL`, but the added FL operations are
+three times slower than the table kernel. A predicate-plane representation is
+also statically rejected: four plane loads plus eight PRX `PUNPK` operations
+are followed by at least four serial predicated code-building operations per
+output vector, giving more FL work than the baseline before lookup/FMA.
+
+Finally, a best-case approximate symmetric INT4 fallback was evaluated with a
+separate per-row K32 scale on staged DeepSeek W1/W2/W3. Its worst relative L2
+error is 10.56%, far beyond the agreed 0.5% gate, so it is not implemented as
+a performance kernel.
+
 A second packed experiment replaced each 256-entry gather with two sequential
 16-entry `TBL`s, one for each activation in a packed K pair. It is exact and
 removes indexed loads, but requires 16 `TBL`s per K pair to cover 128 rows.

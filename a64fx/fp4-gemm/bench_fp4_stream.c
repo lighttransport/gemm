@@ -27,6 +27,24 @@ static void run_direct_omp(float*c,const _Float16*a,const fp4_matrix*w,int m,int
     printf("kernel=directfused threads=%d M=%d kc=%d ms=%.2f gflops=%.2f source_GB/s=%.2f\n",threads,m,kc,best*1e3,
         2.0*m*w->n*w->k/best/1e9,src*passes/best/1e9);
 }
+static void run_half_omp(float*c,const _Float16*a,const fp4_matrix*w,int kc,size_t src,int threads){
+    fp4_gemm_f16_half_omp(c,a,w,1,kc,threads);double best=1e9;
+    for(int r=0;r<7;++r){double t=now();fp4_gemm_f16_half_omp(c,a,w,1,kc,threads);double d=now()-t;if(d<best)best=d;}
+    printf("kernel=halfpack threads=%d M=1 kc=%d ms=%.3f gflops=%.2f source_GB/s=%.2f\n",threads,kc,best*1e3,
+        2.0*w->n*w->k/best/1e9,src/best/1e9);
+}
+static void run_t12_omp(float*c,const _Float16*a,const fp4_matrix*w,int kc,size_t src,int threads){
+    fp4_gemm_f16_t12_omp(c,a,w,1,kc,threads);double best=1e9;
+    for(int r=0;r<7;++r){double t=now();fp4_gemm_f16_t12_omp(c,a,w,1,kc,threads);double d=now()-t;if(d<best)best=d;}
+    printf("kernel=t12 threads=%d M=1 kc=%d ms=%.3f gflops=%.2f source_GB/s=%.2f\n",threads,kc,best*1e3,
+        2.0*w->n*w->k/best/1e9,src/best/1e9);
+}
+static void run_affine_omp(float*c,const _Float16*a,const fp4_matrix*w,int kc,size_t src,int threads){
+    fp4_gemm_f16_affine_omp(c,a,w,1,kc,threads);double best=1e9;
+    for(int r=0;r<7;++r){double t=now();fp4_gemm_f16_affine_omp(c,a,w,1,kc,threads);double d=now()-t;if(d<best)best=d;}
+    printf("kernel=affine threads=%d M=1 kc=%d ms=%.3f gflops=%.2f source_GB/s=%.2f\n",threads,kc,best*1e3,
+        2.0*w->n*w->k/best/1e9,src/best/1e9);
+}
 static void run_u8_omp(float*c,const _Float16*a,const fp4_matrix*w,int kc,size_t src,int threads){
     fp4_gemm_f16_u8tbl_omp(c,a,w,1,kc,threads);double best=1e9;
     for(int r=0;r<3;++r){double t=now();fp4_gemm_f16_u8tbl_omp(c,a,w,1,kc,threads);double d=now()-t;if(d<best)best=d;}
@@ -77,6 +95,8 @@ int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(arg
     double pt=now();if(fp4_matrix_prepare_n32(&w)||fp4_matrix_prepare_u8(&w)||
       fp4_matrix_prepare_bitplane(&w)||fp4_matrix_prepare_sdot(&w)||fp4_matrix_prepare_pair(&w)||
       fp4_matrix_prepare_sdot4(&w))return 1;
+    if((n%256==0)&&(fp4_matrix_prepare_half(&w)||fp4_matrix_prepare_affine(&w)))return 1;
+    if((n%384==0)&&fp4_matrix_prepare_t12(&w))return 1;
     printf("all_layout_prepare_ms=%.3f\n",(now()-pt)*1e3);
     size_t source=w.code_bytes+w.scales_n32_count*sizeof(_Float16);
     size_t source_sdot4=w.code_bytes+w.scales_n32_count*sizeof(float);
@@ -100,6 +120,15 @@ int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(arg
     guard^=((unsigned char*)copy)[4096];
     printf("pure_memcpy_12c ms=%.2f source_GB/s=%.2f total_read_write_GB/s=%.2f guard=%u\n",
         cbest*1e3,source/cbest/1e9,2.0*source/cbest/1e9,(unsigned)guard);free(copy);
+    if(getenv("FP4_HALF_ONLY")){_Float16*a=aa((size_t)k*2);float*c=aa((size_t)n*4);
+      if(!a||!c)return 1;for(int i=0;i<k;++i)a[i]=(_Float16)((int)(rnd()&255)-128)/512;
+      run_half_omp(c,a,&w,kc,source,12);free(a);free(c);fp4_matrix_free(&w);return 0;}
+    if(getenv("FP4_T12_ONLY")){_Float16*a=aa((size_t)k*2);float*c=aa((size_t)n*4);
+      if(!a||!c)return 1;for(int i=0;i<k;++i)a[i]=(_Float16)((int)(rnd()&255)-128)/512;
+      run_t12_omp(c,a,&w,kc,source,12);free(a);free(c);fp4_matrix_free(&w);return 0;}
+    if(getenv("FP4_AFFINE_ONLY")){_Float16*a=aa((size_t)k*2);float*c=aa((size_t)n*4);
+      if(!a||!c)return 1;for(int i=0;i<k;++i)a[i]=(_Float16)((int)(rnd()&255)-128)/512;
+      run_affine_omp(c,a,&w,kc,source,12);free(a);free(c);fp4_matrix_free(&w);return 0;}
     if(getenv("FP4_SDOT_ONLY")){int ag=argc>4?atoi(argv[4]):4;
       _Float16*ah=aa((size_t)k*2);float*af=aa((size_t)k*4),*c=aa((size_t)n*4);
       fp4_i8_activation qa={0};if(!ah||!af||!c)return 1;
@@ -129,6 +158,7 @@ int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(arg
       run("l2full",fp4_gemm_f16_l2,c,a,&w,m,kc,source);
       if(kc)run("l1panel",fp4_gemm_f16_l1panel,c,a,&w,m,kc,source);
       run_direct_omp(c,a,&w,m,kc,source,12);
+      if(m==1)run_half_omp(c,a,&w,kc,source,12);
       if(m==1)run_u8_omp(c,a,&w,kc,(size_t)n*k+w.scales_n32_count*2,12);
       if(m==1)run_bitplane_omp(c,a,&w,kc,source,12);
       if(m==1){int ag=argc>4?atoi(argv[4]):4;float*fa=aa((size_t)k*4);fp4_i8_activation qa={0};

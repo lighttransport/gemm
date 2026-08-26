@@ -27,11 +27,15 @@ typedef struct {
     uint8_t *codes_sdot4;
     uint8_t *codes_pair;
     uint8_t *codes_t8;
+    uint8_t *codes_t8_half;
+    uint8_t *codes_t12;
+    uint8_t *codes_t8_affine;
     uint32_t *codes_bitplane;
     _Float16 *scales_n32;
     _Float16 *scales_sdot;
     _Float16 *scales_pair;
     _Float16 *scales_t8;
+    _Float16 *scales_t12;
     float *scales_sdot4;
     size_t scales_n32_count;
 } fp4_matrix;
@@ -57,6 +61,9 @@ int fp4_matrix_alloc(fp4_matrix *matrix, fp4_format format, int n, int k);
 void fp4_matrix_free(fp4_matrix *matrix);
 int fp4_quantize_f32(fp4_matrix *matrix, const float *weights);
 int fp4_matrix_prepare_n32(fp4_matrix *matrix);
+int fp4_matrix_prepare_half(fp4_matrix *matrix);
+int fp4_matrix_prepare_affine(fp4_matrix *matrix);
+int fp4_matrix_prepare_t12(fp4_matrix *matrix);
 int fp4_matrix_prepare_u8(fp4_matrix *matrix);
 int fp4_matrix_prepare_bitplane(fp4_matrix *matrix);
 int fp4_matrix_prepare_sdot(fp4_matrix *matrix);
@@ -80,6 +87,12 @@ int fp4_gemm_f16_l2_omp(float *c, const _Float16 *a, const fp4_matrix *w,
                          int m, int promotion_k, int threads);
 int fp4_gemm_f16_n32_omp(float *c, const _Float16 *a, const fp4_matrix *w,
                           int m, int promotion_k, int threads);
+int fp4_gemm_f16_half_omp(float *c, const _Float16 *a, const fp4_matrix *w,
+                           int m, int promotion_k, int threads);
+int fp4_gemm_f16_t12_omp(float *c, const _Float16 *a, const fp4_matrix *w,
+                          int m, int promotion_k, int threads);
+int fp4_gemm_f16_affine_omp(float *c, const _Float16 *a, const fp4_matrix *w,
+                             int m, int promotion_k, int threads);
 int fp4_gemm_f16_u8tbl_omp(float *c, const _Float16 *a, const fp4_matrix *w,
                          int m, int promotion_k, int threads);
 int fp4_gemm_f16_bitplane_omp(float *c, const _Float16 *a,
