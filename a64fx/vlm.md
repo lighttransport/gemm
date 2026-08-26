@@ -605,8 +605,21 @@ Throughput (bf16, A/B on the same node state, 48T, cmgs=0):
 | 468 patches (fujisan) | 0.31 s | 0.27 s | 1.14× (382→436 tok/s) |
 
 **Remaining bottleneck:** the QK^T (`qk_vert_8q_48k`, now ~49% of the
-attention) is FMA-bound in its inner loop (384 FMAs ≫ 11 loads per d-step), so
-its ~21%-of-FMA-peak is parallelism/overhead, not addressable loads — left for
-a separate pass. The whole attention (QK^T+AV) sits at ~20% of the 49.8
-GFLOP/s/core FMA floor at hd=128 (vs 58% for Qwen3-VL hd=64): hd=128 does 2×
-the FMA per byte of K/V data, so the loads amortize less.
+attention). Its inner loop is FMA-bound (384 FMAs ≫ 11 loads per d-step), so
+its ~21%-of-FMA-peak is parallelism/overhead, not addressable loads.
+
+> **12q×32k QK^T tile tried and reverted (slower).** A `qk_vert_12q_32k`
+> kernel (12 queries × 2 K-sub-vectors = 24 accs, the same Z-reg budget as
+> 8q×48k but 12 queries per K-read instead of 8) was expected to cut the K
+> re-streaming bandwidth ~33%. Measured A/B (896×896): **slower** — 8q
+> (qt=16) 8.45 s vs 12q (qt=24) 8.82 s / (qt=12) 13.7 s. So the QK^T is *not*
+> K-read-bound (the K stays in L2); the 12q tile's extra Q loads + extra
+> 32-key k-tiles cost more than the K re-read savings. Reverted; the 8q tile
+> is the practical optimum. (Also: `qt` must be a multiple of the inner
+> q-group, else the Q-tail re-reads the full K per tail query — qt=16 with a
+> 12q tile is ~3× worse on K traffic.)
+
+The whole attention (QK^T+AV) sits at ~20% of the 49.8 GFLOP/s/core FMA floor
+at hd=128 (vs 58% for Qwen3-VL hd=64): hd=128 does 2× the FMA per byte of
+K/V data, so the loads amortize less, and both the QK^T (8q) and AV (2q)
+batches are at the max the 32-Zreg file allows.
