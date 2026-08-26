@@ -623,3 +623,27 @@ The whole attention (QK^T+AV) sits at ~20% of the 49.8 GFLOP/s/core FMA floor
 at hd=128 (vs 58% for Qwen3-VL hd=64): hd=128 does 2× the FMA per byte of
 K/V data, so the loads amortize less, and both the QK^T (8q) and AV (2q)
 batches are at the max the 32-Zreg file allows.
+
+### 5.2 dtype options — int8 GEMM is a ready-made 2.1× lever
+
+The GEMM dtypes (`--dtype fp32|bf16|fp16|int8|int16`) all work on the Kimi-K3
+projector. The **int8 (W8A8 SDOT)** path is the big speed lever (the GEMMs are
+~60% of a small image, and SDOT is ~10× the fp32-FMA floor); **bf16 is the
+fastest bit-exact** dtype (bf16→fp32 FMA, no FPCR-FZ16 needed like fp16).
+
+Full sweep at 468 patches (fujisan, bf16 ref norm 44.4191):
+
+| dtype | norm (Δ) | time | tok/s | vs bf16 |
+|---|---|---|---|---|
+| **int8** | 46.04 (+3.6%) | **0.166 s** | 706 | **2.1×** |
+| bf16 | 44.4191 (0%) | 0.355 s | 329 | 1.0× |
+| fp16 | 44.63 (+0.5%) | 0.430 s | 272 | 0.8× |
+| int16 | 44.81 (+0.9%) | 0.613 s | 191 | 0.6× |
+| fp32 | 44.4191 (0%) | 0.791 s | 148 | 0.4× |
+
+At 896×896 (4096 patches, attention-dominated) the int8 win shrinks to ~1.3×
+(6.7 s vs bf16 8.7 s) since the GEMMs are only ~17% there. **Recommendation:**
+`--dtype int8` for max throughput (2–4% norm cost, acceptable for a VLM),
+`--dtype bf16` for the fastest bit-exact result. int16 is near-exact but
+slower than bf16 (the hi/lo int8 split adds a second SDOT pass), so it is
+rarely worth it over bf16.
