@@ -13,6 +13,11 @@
 #include <omp.h>
 #endif
 
+static inline const _Float16 *fp4_sector_tag_f16(const _Float16 *p,
+        unsigned tag) {
+    return (const _Float16 *)((uintptr_t)p | ((uintptr_t)(tag & 15) << 56));
+}
+
 static const float e2m1_values[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
    -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f,
@@ -31,6 +36,10 @@ extern void fp4_pair_tbl_m1_asm(const fp4_pair_args*);
 extern void fp4_dense_m12n64_init(const _Float16 *, const _Float16 *,
     float *, int64_t, int64_t, int64_t);
 extern void fp4_dense_m12n64_accum(const _Float16 *, const _Float16 *,
+    float *, int64_t, int64_t, int64_t);
+extern void fp4_dense_m8n64_init(const _Float16 *, const _Float16 *,
+    float *, int64_t, int64_t, int64_t);
+extern void fp4_dense_m8n64_accum(const _Float16 *, const _Float16 *,
     float *, int64_t, int64_t, int64_t);
 
 /* Scalar AArch64 producer LUT: packed FP4 byte -> two FP16 bit patterns. */
@@ -1064,9 +1073,18 @@ int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
     int mb_count = (m + 11) / 12;
     int tile_count = (w->n + 63) / 64;
     size_t packed_elems = (size_t)mb_count * w->k * 12;
+    int sector_tags = getenv("FP4_NO_SECTOR_TAGS") == NULL;
+    unsigned activation_tag = getenv("FP4_A_TAG") ?
+        (unsigned)strtoul(getenv("FP4_A_TAG"), NULL, 0) : 0x9;
+    unsigned weight_tag = getenv("FP4_B_TAG") ?
+        (unsigned)strtoul(getenv("FP4_B_TAG"), NULL, 0) : 0xb;
     _Float16 *packed_a = NULL;
     if (posix_memalign((void **)&packed_a, 256,
             packed_elems * sizeof(*packed_a))) return -1;
+    const _Float16 *panel_base = sector_tags ?
+        fp4_sector_tag_f16(w->weights_bf16, weight_tag) : w->weights_bf16;
+    const _Float16 *packed_base = sector_tags ?
+        fp4_sector_tag_f16(packed_a, activation_tag) : packed_a;
 #pragma omp parallel num_threads(threads)
     {
 #pragma omp for collapse(2) schedule(static)
@@ -1078,7 +1096,7 @@ int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
     }
 #pragma omp for schedule(static)
     for (int tile = 0; tile < tile_count; ++tile) {
-        const _Float16 *panel = w->weights_bf16 + (size_t)tile * w->k * 64;
+        const _Float16 *panel = panel_base + (size_t)tile * w->k * 64;
         int nr = w->n - tile * 64 < 64 ? w->n - tile * 64 : 64;
         for (int mb = 0; mb < mb_count; ++mb) {
             int m0 = mb * 12;
@@ -1092,13 +1110,20 @@ int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
             int64_t ldc = (int64_t)(direct ? w->n : 64) * sizeof(*c);
             for (int kb = 0; kb < w->k; kb += span) {
                 int ke = kb + span < w->k ? kb + span : w->k;
-                const _Float16 *ap = packed_a +
+                const _Float16 *ap = packed_base +
                     ((size_t)mb * w->k + kb) * 12;
                 const _Float16 *bp = panel + (size_t)kb * 64;
-                if (kb == 0)
-                    fp4_dense_m12n64_init(ap, bp, dst, ke - kb, 0, ldc);
-                else
-                    fp4_dense_m12n64_accum(ap, bp, dst, ke - kb, 0, ldc);
+                if (mr <= 8) {
+                    if (kb == 0)
+                        fp4_dense_m8n64_init(ap, bp, dst, ke - kb, 0, ldc);
+                    else
+                        fp4_dense_m8n64_accum(ap, bp, dst, ke - kb, 0, ldc);
+                } else {
+                    if (kb == 0)
+                        fp4_dense_m12n64_init(ap, bp, dst, ke - kb, 0, ldc);
+                    else
+                        fp4_dense_m12n64_accum(ap, bp, dst, ke - kb, 0, ldc);
+                }
             }
             if (!direct) for (int r = 0; r < mr; ++r)
                 memcpy(c + (size_t)(m0 + r) * w->n + tile * 64,

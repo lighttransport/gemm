@@ -123,6 +123,32 @@ the 32 KiB weight block from L1 and fell to 1.94 TFLOP/s, while the latter was
 neutral. The retained K=256 M12 path is within roughly 1.5--3.6% of 2.2
 TFLOP/s depending on run-to-run HBM variation; pure FP16 reaches 2.20 TFLOP/s.
 
+#### Stable 2.2 and 2.4 TFLOP/s follow-up
+
+The final M tail now dispatches a hand-written MR8x64 kernel instead of
+padding to MR12. Packed activations use A64FX strong-reuse tag `0x9`, while
+the one-pass decoded-weight stream uses L1-bypass tag `0xb`. On the original
+N=8192, K=4096, M=128, K=256 benchmark, five independent runs before making
+the cache policy default measured 2.221--2.236 TFLOP/s. Three default-path
+confirmation runs measured 2.209--2.229 TFLOP/s. Thus K=256 is stably above
+2.2 TFLOP/s.
+
+N64 tile balance accounts for the next step. N=8192 produces 128 tiles, so
+12 workers receive either 10 or 11 tiles. N=9216 produces 144 tiles, exactly
+12 per worker. With N=9216, K=4096, and M=192, five independent runs give:
+
+| FP32 promotion interval | Stable CMG throughput |
+|---:|---:|
+| K=256 | 2.358--2.370 TFLOP/s |
+| K=1024 | **2.404--2.420 TFLOP/s** |
+| Pure FP16 | **2.507--2.516 TFLOP/s** |
+
+The 2.4 TFLOP/s target is therefore met with K=1024 promotion and exceeded by
+about 4.5% in pure FP16 mode. K=256 remains approximately 1.3% below 2.4 on
+the balanced shape. MR16x32, K-block-first reuse, cyclic tile scheduling, and
+split-B scheduling were measured and rejected; they reached approximately
+1.60, 2.00, 1.97, and 2.24 TFLOP/s respectively.
+
 The sidecar occupies 64 MiB for this matrix (4x the packed FP4 weight storage).
 Unit tests pass for MXFP4, NVFP4 1D, and NVFP4 2D with the same numerical error
 as the existing panel path.

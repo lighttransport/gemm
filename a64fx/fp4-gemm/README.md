@@ -151,6 +151,15 @@ reported kernel time. Padded M and N tails use a private output tile, so the
 public requirement remains only that N and K are divisible by 32. The sidecar
 is validated against the FP4 reference for MXFP4 and both NVFP4 layouts.
 
+On A64FX the cache path tags packed activations for strong L1 reuse and tags
+the decoded-weight stream to bypass L1. This is the default because each
+weight vector is consumed by the register tile and then discarded, while the
+activation K block must survive the stream. Set `FP4_NO_SECTOR_TAGS=1` for the
+untagged control. `FP4_A_TAG` and `FP4_B_TAG` override the raw tag values for
+experiments; the selected defaults are `0x9` and `0xb`. An MR8x64 assembly
+tail avoids executing four padded rows when the final M block has at most
+eight live rows.
+
 ## INT8 SDOT re-encoding
 
 `fp4_matrix_prepare_sdot` maps E2M1 exactly to signed integers by multiplying

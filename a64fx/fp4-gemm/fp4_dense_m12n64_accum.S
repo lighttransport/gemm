@@ -443,4 +443,3 @@ fp4_dense_m12n64_accum:
     ldp d8, d9, [sp], #64
     ret
     .size fp4_dense_m12n64_accum, .-fp4_dense_m12n64_accum
-

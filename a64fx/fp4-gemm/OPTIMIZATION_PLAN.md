@@ -208,3 +208,12 @@ one shared OpenMP packing/compute region, this raises K=256 M=12 to
 2.12--2.17 TFLOP/s and M=24 to 2.08--2.10 TFLOP/s. The remaining M12 gap to
 2.2 TFLOP/s is 1.5--3.6%, while the pure-FP16 path already reaches 2.20
 TFLOP/s.
+
+The next iteration adds an MR8x64 assembly tail and A64FX cache tags: packed A
+uses strong-reuse tag `0x9`, and the decoded-weight stream bypasses L1 with
+tag `0xb`. K=256 N=8192 M=128 then sustains 2.209--2.236 TFLOP/s across
+independent runs. With a balanced 144-tile N=9216 projection and M=192, K=1024
+promotion sustains 2.404--2.420 TFLOP/s and pure FP16 sustains
+2.507--2.516 TFLOP/s. The stable 2.2 and 2.4 targets are met, with the latter
+requiring either K=1024 promotion or pure FP16 accumulation; K=256 reaches
+2.358--2.370 TFLOP/s on the balanced shape.

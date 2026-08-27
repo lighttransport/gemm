@@ -359,4 +359,3 @@ fp4_dense_m12n64_init:
     ldp d8, d9, [sp], #64
     ret
     .size fp4_dense_m12n64_init, .-fp4_dense_m12n64_init
-
