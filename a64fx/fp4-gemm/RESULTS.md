@@ -99,18 +99,29 @@ accumulators. On a pinned 12-core CMG with N=8192 and K=4096:
 
 | M | K=256 FP32 promotion | Pure FP16 accumulation |
 |---:|---:|---:|
-| 1 | 187 GFLOP/s | 185 GFLOP/s |
-| 6 | 1,089 GFLOP/s | 1,125 GFLOP/s |
-| 8 | **1,459 GFLOP/s** | **1,444 GFLOP/s** |
-| 12 | **1,808 GFLOP/s** | **2,187 GFLOP/s** |
-| 24 | **1,794 GFLOP/s** | **2,202 GFLOP/s** |
-| 128 | **1,712 GFLOP/s** | **2,167 GFLOP/s** |
+| 1 | 186 GFLOP/s | 185 GFLOP/s |
+| 6 | 1,092 GFLOP/s | 1,125 GFLOP/s |
+| 8 | **1,481 GFLOP/s** | **1,444 GFLOP/s** |
+| 12 | **2,122--2,167 GFLOP/s** | **2,187 GFLOP/s** |
+| 24 | **2,075--2,097 GFLOP/s** | **2,202 GFLOP/s** |
+| 128 | **2,013--2,054 GFLOP/s** | **2,167 GFLOP/s** |
 
 These timings include activation packing and padded-tail handling, but exclude
 the persistent sidecar preparation. M=8 computes a zero-padded 12-row tile and
 copies the eight live output rows, yet still exceeds the 800 GFLOP/s target by
 82%. Complete M12 blocks reach 71% of the 3.072 TFLOP/s hardware peak and 84%
 of the previously measured 2.612 TFLOP/s streaming-FP16 software ceiling.
+
+The K=256 follow-up keeps all 12x64 FP32 partial sums in a contiguous 3 KiB
+scratch tile until the final store. Previously, row-major partial sums at
+N=8192 were 32 KiB apart and repeatedly mapped 12 rows onto the same L1 sets
+for all 16 promotion blocks. Removing that conflict raises M=12 from 1.82 to
+as much as 2.17 TFLOP/s. Combining activation packing and compute in one
+OpenMP region removes another fork/join. A two-panel activation-reuse schedule
+and a four-K assembly unroll were measured and rejected: the former displaced
+the 32 KiB weight block from L1 and fell to 1.94 TFLOP/s, while the latter was
+neutral. The retained K=256 M12 path is within roughly 1.5--3.6% of 2.2
+TFLOP/s depending on run-to-run HBM variation; pure FP16 reaches 2.20 TFLOP/s.
 
 The sidecar occupies 64 MiB for this matrix (4x the packed FP4 weight storage).
 Unit tests pass for MXFP4, NVFP4 1D, and NVFP4 2D with the same numerical error

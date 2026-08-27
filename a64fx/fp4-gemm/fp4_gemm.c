@@ -1067,14 +1067,16 @@ int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
     _Float16 *packed_a = NULL;
     if (posix_memalign((void **)&packed_a, 256,
             packed_elems * sizeof(*packed_a))) return -1;
-#pragma omp parallel for collapse(2) num_threads(threads) schedule(static)
+#pragma omp parallel num_threads(threads)
+    {
+#pragma omp for collapse(2) schedule(static)
     for (int mb = 0; mb < mb_count; ++mb) for (int x = 0; x < w->k; ++x) {
         int m0 = mb * 12;
         _Float16 *dst = packed_a + ((size_t)mb * w->k + x) * 12;
         for (int r = 0; r < 12; ++r)
             dst[r] = m0 + r < m ? a[(size_t)(m0 + r) * w->k + x] : 0;
     }
-#pragma omp parallel for num_threads(threads) schedule(static)
+#pragma omp for schedule(static)
     for (int tile = 0; tile < tile_count; ++tile) {
         const _Float16 *panel = w->weights_bf16 + (size_t)tile * w->k * 64;
         int nr = w->n - tile * 64 < 64 ? w->n - tile * 64 : 64;
@@ -1082,7 +1084,10 @@ int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
             int m0 = mb * 12;
             int mr = m - m0 < 12 ? m - m0 : 12;
             _Alignas(256) float scratch[12 * 64];
-            int direct = mr == 12 && nr == 64;
+            /* Promotion revisits C once per K block.  A row-major tile has a
+             * very large ldc (32 KiB at N=8192), making all 12 rows alias a
+             * few L1 sets.  Keep the FP32 shadow contiguous until final C. */
+            int direct = !promotion_k && mr == 12 && nr == 64;
             float *dst = direct ? c + (size_t)m0 * w->n + tile * 64 : scratch;
             int64_t ldc = (int64_t)(direct ? w->n : 64) * sizeof(*c);
             for (int kb = 0; kb < w->k; kb += span) {
@@ -1099,6 +1104,7 @@ int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
                 memcpy(c + (size_t)(m0 + r) * w->n + tile * 64,
                     scratch + (size_t)r * 64, (size_t)nr * sizeof(*c));
         }
+    }
     }
     free(packed_a);
     return 0;

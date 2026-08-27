@@ -201,3 +201,10 @@ M=12, 1.794 TFLOP/s at M=24, and 1.712 TFLOP/s at M=128.  Pure FP16 reaches
 2.20 TFLOP/s at M=24.  The primary 800 GFLOP/s gate and the 1.5 TFLOP/s
 stretch gate are therefore satisfied.  All three FP4 format tests retain the
 same relative-L2 error as the previous decoded-panel path.
+
+A promotion-path follow-up stores FP32 partial sums in a contiguous 3 KiB
+tile rather than revisiting row-major C at a 32 KiB row stride. Together with
+one shared OpenMP packing/compute region, this raises K=256 M=12 to
+2.12--2.17 TFLOP/s and M=24 to 2.08--2.10 TFLOP/s. The remaining M12 gap to
+2.2 TFLOP/s is 1.5--3.6%, while the pure-FP16 path already reaches 2.20
+TFLOP/s.

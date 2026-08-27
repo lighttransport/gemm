@@ -162,6 +162,10 @@ int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(arg
     double sidecar_t=now();if(fp4_matrix_prepare_bf16(&w,12))return 1;sidecar_t=now()-sidecar_t;
     printf("f16_sidecar_prepare_ms=%.3f sidecar_MiB=%.2f\n",
       sidecar_t*1e3,w.weights_bf16_bytes/1048576.0);
+    if(getenv("FP4_CACHE_ONLY")){int m=getenv("FP4_CACHE_M")?atoi(getenv("FP4_CACHE_M")):12;
+      _Float16*a=aa((size_t)m*k*2);float*c=aa((size_t)m*n*4);if(!a||!c||m<1)return 1;
+      for(size_t i=0;i<(size_t)m*k;++i)a[i]=(_Float16)((int)(rnd()&255)-128)/512;
+      run_cache(c,a,&w,m,kc,12);free(a);free(c);fp4_matrix_free(&w);return 0;}
     int ms[]={1,6,8,12,24,128};for(int z=0;z<6;++z){int m=ms[z];
       _Float16*a=aa((size_t)m*k*2);float*c=aa((size_t)m*n*4);if(!a||!c)return 1;
       for(size_t i=0;i<(size_t)m*k;++i)a[i]=(_Float16)((int)(rnd()&255)-128)/512;

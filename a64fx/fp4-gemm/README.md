@@ -141,7 +141,10 @@ dequantization and its L2 write/read traffic.
 sidecar arranged as `[N/64][K][64]`. `fp4_gemm_f16_bf16cache_omp` packs each
 12-row activation tile as `[K][12]` and invokes a hand-scheduled 12x64 SVE
 microkernel with 24 FP16 accumulators. K-block boundaries convert to FP32 and
-accumulate into the FP32 output. This is preferred when a matrix is reused for
+accumulate into a contiguous 3 KiB FP32 shadow tile; the final tile is
+scattered to row-major C only once. This avoids L1 set conflicts when ldc is a
+large power-of-two stride. Activation packing and GEMM share one OpenMP region
+to avoid a second fork/join. This is preferred when a matrix is reused for
 multiple M>1 GEMMs: it costs 4x the packed weight storage but removes FP4
 decode from the timed repeated GEMM. Activation packing remains inside the
 reported kernel time. Padded M and N tails use a private output tile, so the
