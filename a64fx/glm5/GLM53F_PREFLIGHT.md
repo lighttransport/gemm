@@ -43,6 +43,18 @@ cc -std=c11 -Wall -Wextra -Wpedantic -I../../common test_glm53f_arch.c -o test_g
 ./test_glm53f_arch
 ```
 
+`common/glm53f_safetensors.h` provides the corresponding sharded-checkpoint
+boundary for the eventual runner. It resolves Hugging Face tensor names across
+all shards and exposes dtype/shape/data offsets while keeping ownership of the
+shard mappings. The contract test opens metadata and validates the required
+GLM5.3F names; it does not dequantize or copy model weights:
+
+```bash
+cc -std=c11 -Wall -Wextra -Wpedantic -D_GNU_SOURCE -I../../common \
+  test_glm53f_safetensors.c -o test_glm53f_safetensors
+./test_glm53f_safetensors ~/models/glm53f
+```
+
 After the GLM5.3F graph and safetensors mapper land, the EP runner accepts the
 same path directly with `--prompt-text TEXT`; it renders the C template and
 tokenizes on every rank, so a separate Python tokenizer process is not needed.
