@@ -18,6 +18,14 @@ static inline const _Float16 *fp4_sector_tag_f16(const _Float16 *p,
     return (const _Float16 *)((uintptr_t)p | ((uintptr_t)(tag & 15) << 56));
 }
 
+static inline const _Float16 *fp4_cache_tag_f16(const _Float16 *p,
+        const char *environment_name, unsigned default_tag) {
+    if (getenv("FP4_NO_SECTOR_TAGS")) return p;
+    const char *value = getenv(environment_name);
+    unsigned tag = value ? (unsigned)strtoul(value, NULL, 0) : default_tag;
+    return fp4_sector_tag_f16(p, tag);
+}
+
 static const float e2m1_values[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
    -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f,
@@ -1063,16 +1071,56 @@ int fp4_matrix_prepare_bf16(fp4_matrix *p, int threads) {
 #endif
 }
 
+static inline int fp4_m12_block_count(int m) {
+    return m / 12 + (m % 12 != 0);
+}
+
 size_t fp4_packed_a_m12_bytes(int m, int k) {
-    return m > 0 && k > 0 ? (size_t)((m + 11) / 12) * k * 12 *
+    return m > 0 && k > 0 ? (size_t)fp4_m12_block_count(m) * k * 12 *
         sizeof(_Float16) : 0;
 }
+
+#if defined(__ARM_FEATURE_SVE)
+static inline void dense_cache_m12_tile(float *c, const _Float16 *packed_a,
+        const _Float16 *panel, const fp4_matrix *w, int m, int promotion_k,
+        int span, int mb, int tile) {
+    int m0 = mb * 12;
+    int mr = m - m0 < 12 ? m - m0 : 12;
+    int nr = w->n - tile * 64 < 64 ? w->n - tile * 64 : 64;
+    _Alignas(256) float scratch[12 * 64];
+    /* Promotion revisits C once per K block. A row-major tile has a large
+     * ldc, so keep its FP32 shadow contiguous until the final scatter. */
+    int direct = !promotion_k && mr == 12 && nr == 64;
+    float *dst = direct ? c + (size_t)m0 * w->n + tile * 64 : scratch;
+    int64_t ldc = (int64_t)(direct ? w->n : 64) * sizeof(*c);
+
+    for (int kb = 0; kb < w->k; kb += span) {
+        int ke = kb + span < w->k ? kb + span : w->k;
+        const _Float16 *ap = packed_a + ((size_t)mb * w->k + kb) * 12;
+        const _Float16 *bp = panel + (size_t)kb * 64;
+        if (mr <= 8) {
+            if (kb == 0)
+                fp4_dense_m8n64_init(ap, bp, dst, ke - kb, 0, ldc);
+            else
+                fp4_dense_m8n64_accum(ap, bp, dst, ke - kb, 0, ldc);
+        } else {
+            if (kb == 0)
+                fp4_dense_m12n64_init(ap, bp, dst, ke - kb, 0, ldc);
+            else
+                fp4_dense_m12n64_accum(ap, bp, dst, ke - kb, 0, ldc);
+        }
+    }
+    if (!direct) for (int r = 0; r < mr; ++r)
+        memcpy(c + (size_t)(m0 + r) * w->n + tile * 64,
+            scratch + (size_t)r * 64, (size_t)nr * sizeof(*c));
+}
+#endif
 
 int fp4_pack_a_m12(_Float16 *packed_a, const _Float16 *a, int m, int k,
         int threads) {
     if (!packed_a || !a || m < 1 || k < 1 || threads < 1) return -1;
 #if defined(_OPENMP)
-    int mb_count = (m + 11) / 12;
+    int mb_count = fp4_m12_block_count(m);
 #pragma omp parallel for collapse(2) num_threads(threads) schedule(static)
     for (int mb = 0; mb < mb_count; ++mb) for (int x = 0; x < k; ++x) {
         int m0 = mb * 12;
@@ -1095,49 +1143,18 @@ int fp4_gemm_f16_bf16cache_prepacked_omp(float *c,
         ((promotion_k % 32) || promotion_k > w->k))) return -1;
 #if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
     int span = promotion_k ? promotion_k : w->k;
-    int mb_count = (m + 11) / 12;
+    int mb_count = fp4_m12_block_count(m);
     int tile_count = (w->n + 63) / 64;
-    int sector_tags = getenv("FP4_NO_SECTOR_TAGS") == NULL;
-    unsigned activation_tag = getenv("FP4_A_TAG") ?
-        (unsigned)strtoul(getenv("FP4_A_TAG"), NULL, 0) : 0x9;
-    unsigned weight_tag = getenv("FP4_B_TAG") ?
-        (unsigned)strtoul(getenv("FP4_B_TAG"), NULL, 0) : 0xb;
-    const _Float16 *panel_base = sector_tags ?
-        fp4_sector_tag_f16(w->weights_bf16, weight_tag) : w->weights_bf16;
-    const _Float16 *packed_base = sector_tags ?
-        fp4_sector_tag_f16(packed_a, activation_tag) : packed_a;
+    const _Float16 *panel_base = fp4_cache_tag_f16(
+        w->weights_bf16, "FP4_B_TAG", 0xb);
+    const _Float16 *packed_base = fp4_cache_tag_f16(
+        packed_a, "FP4_A_TAG", 0x9);
 #pragma omp parallel for num_threads(threads) schedule(static)
     for (int tile = 0; tile < tile_count; ++tile) {
         const _Float16 *panel = panel_base + (size_t)tile * w->k * 64;
-        int nr = w->n - tile * 64 < 64 ? w->n - tile * 64 : 64;
-        for (int mb = 0; mb < mb_count; ++mb) {
-            int m0 = mb * 12;
-            int mr = m - m0 < 12 ? m - m0 : 12;
-            _Alignas(256) float scratch[12 * 64];
-            int direct = !promotion_k && mr == 12 && nr == 64;
-            float *dst = direct ? c + (size_t)m0 * w->n + tile * 64 : scratch;
-            int64_t ldc = (int64_t)(direct ? w->n : 64) * sizeof(*c);
-            for (int kb = 0; kb < w->k; kb += span) {
-                int ke = kb + span < w->k ? kb + span : w->k;
-                const _Float16 *ap = packed_base +
-                    ((size_t)mb * w->k + kb) * 12;
-                const _Float16 *bp = panel + (size_t)kb * 64;
-                if (mr <= 8) {
-                    if (kb == 0) fp4_dense_m8n64_init(ap, bp, dst,
-                        ke - kb, 0, ldc);
-                    else fp4_dense_m8n64_accum(ap, bp, dst,
-                        ke - kb, 0, ldc);
-                } else {
-                    if (kb == 0) fp4_dense_m12n64_init(ap, bp, dst,
-                        ke - kb, 0, ldc);
-                    else fp4_dense_m12n64_accum(ap, bp, dst,
-                        ke - kb, 0, ldc);
-                }
-            }
-            if (!direct) for (int r = 0; r < mr; ++r)
-                memcpy(c + (size_t)(m0 + r) * w->n + tile * 64,
-                    scratch + (size_t)r * 64, (size_t)nr * sizeof(*c));
-        }
+        for (int mb = 0; mb < mb_count; ++mb)
+            dense_cache_m12_tile(c, packed_base, panel, w, m, promotion_k,
+                span, mb, tile);
     }
     return 0;
 #else
@@ -1153,21 +1170,16 @@ int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
         ((promotion_k % 32) || promotion_k > w->k))) return -1;
 #if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
     int span = promotion_k ? promotion_k : w->k;
-    int mb_count = (m + 11) / 12;
+    int mb_count = fp4_m12_block_count(m);
     int tile_count = (w->n + 63) / 64;
     size_t packed_elems = (size_t)mb_count * w->k * 12;
-    int sector_tags = getenv("FP4_NO_SECTOR_TAGS") == NULL;
-    unsigned activation_tag = getenv("FP4_A_TAG") ?
-        (unsigned)strtoul(getenv("FP4_A_TAG"), NULL, 0) : 0x9;
-    unsigned weight_tag = getenv("FP4_B_TAG") ?
-        (unsigned)strtoul(getenv("FP4_B_TAG"), NULL, 0) : 0xb;
     _Float16 *packed_a = NULL;
     if (posix_memalign((void **)&packed_a, 256,
             packed_elems * sizeof(*packed_a))) return -1;
-    const _Float16 *panel_base = sector_tags ?
-        fp4_sector_tag_f16(w->weights_bf16, weight_tag) : w->weights_bf16;
-    const _Float16 *packed_base = sector_tags ?
-        fp4_sector_tag_f16(packed_a, activation_tag) : packed_a;
+    const _Float16 *panel_base = fp4_cache_tag_f16(
+        w->weights_bf16, "FP4_B_TAG", 0xb);
+    const _Float16 *packed_base = fp4_cache_tag_f16(
+        packed_a, "FP4_A_TAG", 0x9);
 #pragma omp parallel num_threads(threads)
     {
 #pragma omp for collapse(2) schedule(static)
@@ -1180,38 +1192,9 @@ int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
 #pragma omp for schedule(static)
     for (int tile = 0; tile < tile_count; ++tile) {
         const _Float16 *panel = panel_base + (size_t)tile * w->k * 64;
-        int nr = w->n - tile * 64 < 64 ? w->n - tile * 64 : 64;
-        for (int mb = 0; mb < mb_count; ++mb) {
-            int m0 = mb * 12;
-            int mr = m - m0 < 12 ? m - m0 : 12;
-            _Alignas(256) float scratch[12 * 64];
-            /* Promotion revisits C once per K block.  A row-major tile has a
-             * very large ldc (32 KiB at N=8192), making all 12 rows alias a
-             * few L1 sets.  Keep the FP32 shadow contiguous until final C. */
-            int direct = !promotion_k && mr == 12 && nr == 64;
-            float *dst = direct ? c + (size_t)m0 * w->n + tile * 64 : scratch;
-            int64_t ldc = (int64_t)(direct ? w->n : 64) * sizeof(*c);
-            for (int kb = 0; kb < w->k; kb += span) {
-                int ke = kb + span < w->k ? kb + span : w->k;
-                const _Float16 *ap = packed_base +
-                    ((size_t)mb * w->k + kb) * 12;
-                const _Float16 *bp = panel + (size_t)kb * 64;
-                if (mr <= 8) {
-                    if (kb == 0)
-                        fp4_dense_m8n64_init(ap, bp, dst, ke - kb, 0, ldc);
-                    else
-                        fp4_dense_m8n64_accum(ap, bp, dst, ke - kb, 0, ldc);
-                } else {
-                    if (kb == 0)
-                        fp4_dense_m12n64_init(ap, bp, dst, ke - kb, 0, ldc);
-                    else
-                        fp4_dense_m12n64_accum(ap, bp, dst, ke - kb, 0, ldc);
-                }
-            }
-            if (!direct) for (int r = 0; r < mr; ++r)
-                memcpy(c + (size_t)(m0 + r) * w->n + tile * 64,
-                    scratch + (size_t)r * 64, (size_t)nr * sizeof(*c));
-        }
+        for (int mb = 0; mb < mb_count; ++mb)
+            dense_cache_m12_tile(c, packed_base, panel, w, m, promotion_k,
+                span, mb, tile);
     }
     }
     free(packed_a);

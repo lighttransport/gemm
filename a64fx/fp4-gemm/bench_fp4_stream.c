@@ -30,7 +30,7 @@ static void run_direct_omp(float*c,const _Float16*a,const fp4_matrix*w,int m,int
 static void run_cache(float*c,const _Float16*a,const fp4_matrix*w,int m,int kc,int threads){
     fp4_gemm_f16_bf16cache_omp(c,a,w,m,kc,threads); double best=1e9;
     for(int r=0;r<3;++r){double t=now();fp4_gemm_f16_bf16cache_omp(c,a,w,m,kc,threads);double d=now()-t;if(d<best)best=d;}
-    size_t packed_a=(size_t)((m+11)/12)*w->k*12*sizeof(*a);
+    size_t packed_a=fp4_packed_a_m12_bytes(m,w->k);
     printf("kernel=f16cache_m12n64 threads=%d M=%d kc=%d ms=%.2f gflops=%.2f sidecar_MiB=%.2f packed_A_KiB=%.1f\n",
         threads,m,kc,best*1e3,2.0*m*w->n*w->k/best/1e9,
         w->weights_bf16_bytes/1048576.0,packed_a/1024.0);
