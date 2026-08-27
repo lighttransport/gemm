@@ -109,7 +109,7 @@ export DS4F_FP8_BF16=${DS4F_FP8_BF16:-1}
 export DS4F_BF16_PV=${DS4F_BF16_PV:-1}
 export DS4F_Q8_DENSE=${DS4F_Q8_DENSE:-1}
 export DS4F_GEMM_TILE_K=${DS4F_GEMM_TILE_K:-4096}
-export DS4F_MXFP4_GEMM_TILE=${DS4F_MXFP4_GEMM_TILE:-16}
+export DS4F_MXFP4_GEMM_TILE=${DS4F_MXFP4_GEMM_TILE:-8}
 export DS4F_TP_HEAD=${DS4F_TP_HEAD:-1}
 export DS4F_TP_SHARED
 export DS4F_TP_SHARED_FULL
@@ -167,7 +167,13 @@ fi
     fi
     [ "$topo_ok" -eq 1 ] || { echo "unable to establish ${NP}-rank topology" >&2; exit 5; }
     echo "DS4F_0731_TOPO_PASS nodes=$NP result=$RESULT_DIR"
-    mpiexec -np "$NP" -vcoordfile "$VCOORD" "$BIN"
+    mpiexec -np "$NP" -vcoordfile "$VCOORD" "$BIN" \
+        --threads "$LLM_THREADS" --cmgs "$DS4F_CMGS" \
+        --prefill "$DS4F_PREFILL" --decode "$DS4F_MAXGEN" \
+        --max-pos "$DS4F_MAXPOS" --layers "$DS4F_LAYERS" \
+        --ctx-warm "$DS4F_CTX_WARM" --prefill-batch "$DS4F_PREFILL_BATCH" \
+        --prefill-verify "$DS4F_PREFILL_VERIFY" \
+        --comm-poll-spins "$DS4F_COMM_POLL_SPINS" --comm-robust "$DS4F_COMM_ROBUST"
 )
 
 echo "=== DS4F-0731 12-node result: $RESULT_DIR ==="

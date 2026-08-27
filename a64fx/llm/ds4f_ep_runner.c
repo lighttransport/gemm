@@ -19,12 +19,11 @@
  * Run (after tofu_topo_helper writes tofu_topo.txt, 1 proc/node):
  *   mpiexec -n 12 -vcoordfile vcoord build/ds4f_ep_runner
  *
- * Env (in addition to ds4f.h's DS4F_*):
- *   LLM_THREADS    compute threads (default 48)
- *   DS4F_PREFILL   synthetic prefill tokens (default 8)
- *   DS4F_MAXGEN    synthetic decode tokens (default 16)
- *   DS4F_MAXPOS    KV cache capacity / max position (default 4096)
- *   DS4F_LAYERS    override n_layers (default 43)
+ * CLI (the launcher passes these explicitly):
+ *   --threads N, --prefill N, --decode N, --max-pos N, --layers N,
+ *   --ctx-warm N, --prefill-batch N, --prefill-verify N,
+ *   --comm-poll-spins N, --comm-robust 0|1
+ * Environment (model/debug/compatibility settings only):
  *   DS4F_FP8_BF16  predequant dense FP8->BF16 (default 0 = on-demand FP8)
  *   DS4F_REQUIRE_NODES  fail fast unless topology has this many ranks
  *   DS4F_STATUS_DIR     durable per-rank state files (default current dir)
@@ -95,6 +94,55 @@ static double now_sec(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 static int envi(const char *k, int d) { const char *v = getenv(k); return (v && *v) ? atoi(v) : d; }
+
+typedef struct {
+    int threads, cmgs, prefill, maxgen, maxpos, layers, ctx_warm;
+    int prefill_batch, prefill_verify, comm_poll_spins, comm_robust;
+} runner_opts;
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "usage: %s [options]\n"
+        "  --threads N             compute threads (default 48)\n"
+        "  --cmgs N                CMG count (default 4)\n"
+        "  --prefill N             synthetic prefill tokens (default 8)\n"
+        "  --decode N              synthetic decode tokens (default 16)\n"
+        "  --max-pos N             KV capacity (default 4096)\n"
+        "  --layers N              layer override (default model)\n"
+        "  --ctx-warm N            warm synthetic context (default 0)\n"
+        "  --prefill-batch N       batched prefill size (default 0)\n"
+        "  --prefill-verify N      verify prefill size (default 0)\n"
+        "  --comm-poll-spins N     bounded TCQ polling (default 1)\n"
+        "  --comm-robust 0|1       retrying barriers (default 1)\n"
+        "  --help                  show this text\n"
+        "Execution controls are intentionally CLI-only; environment is reserved for model/debug settings.\n", prog);
+}
+
+static void parse_cli(int argc, char **argv, runner_opts *o) {
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--help")) { usage(argv[0]); exit(0); }
+        int *dst = NULL;
+        if (!strcmp(a, "--threads") || !strcmp(a, "--cmgs") || !strcmp(a, "--prefill") ||
+            !strcmp(a, "--decode") || !strcmp(a, "--max-pos") || !strcmp(a, "--layers") ||
+            !strcmp(a, "--ctx-warm") || !strcmp(a, "--prefill-batch") ||
+            !strcmp(a, "--prefill-verify") || !strcmp(a, "--comm-poll-spins") ||
+            !strcmp(a, "--comm-robust")) {
+            if (i + 1 >= argc) { fprintf(stderr, "%s needs an integer\n", a); exit(2); }
+            if (!strcmp(a, "--threads")) dst=&o->threads; else if (!strcmp(a, "--cmgs")) dst=&o->cmgs;
+            else if (!strcmp(a, "--prefill")) dst=&o->prefill; else if (!strcmp(a, "--decode")) dst=&o->maxgen;
+            else if (!strcmp(a, "--max-pos")) dst=&o->maxpos; else if (!strcmp(a, "--layers")) dst=&o->layers;
+            else if (!strcmp(a, "--ctx-warm")) dst=&o->ctx_warm; else if (!strcmp(a, "--prefill-batch")) dst=&o->prefill_batch;
+            else if (!strcmp(a, "--prefill-verify")) dst=&o->prefill_verify; else if (!strcmp(a, "--comm-poll-spins")) dst=&o->comm_poll_spins;
+            else dst=&o->comm_robust;
+            char *end = NULL; long v = strtol(argv[++i], &end, 10);
+            if (!end || *end || v < -2147483647L || v > 2147483647L) { fprintf(stderr, "invalid integer for %s\n", a); exit(2); }
+            *dst = (int)v;
+        } else {
+            fprintf(stderr, "unknown option: %s\n", a); usage(argv[0]); exit(2);
+        }
+    }
+}
 
 static int file_exists(const char *path) {
     struct stat st;
@@ -303,23 +351,19 @@ static int ds4f_comm_init(ds4f_comm *dc, utofu_vcq_hdl_t vcq,
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     int rc;
-    int n_threads = envi("LLM_THREADS", 48);
-    int n_cmgs    = envi("DS4F_CMGS", 4);
-    int prefill   = envi("DS4F_PREFILL", 8);
-    int maxgen    = envi("DS4F_MAXGEN", 16);
-    int maxpos    = envi("DS4F_MAXPOS", 4096);
-    int layers    = envi("DS4F_LAYERS", 0);
-    int ctx_warm  = envi("DS4F_CTX_WARM", 0);   /* fill synthetic KV+compressed to this ctx, decode from there */
-    int prefill_batch = envi("DS4F_PREFILL_BATCH", 0);   /* >0: batched M-token GEMM prefill (needs exact + dense bf16) */
-    int prefill_verify = envi("DS4F_PREFILL_VERIFY", 0); /* real mHC/Tier-B2 prompt chunks through verify */
-    g_comm_poll_spins = envi("DS4F_COMM_POLL_SPINS", 1);
+    runner_opts opt = { 48, 4, 8, 16, 4096, 0, 0, 0, 0, 1, 1 };
+    parse_cli(argc, argv, &opt);
+    int n_threads = opt.threads, n_cmgs = opt.cmgs, prefill = opt.prefill, maxgen = opt.maxgen;
+    int maxpos = opt.maxpos, layers = opt.layers, ctx_warm = opt.ctx_warm;
+    int prefill_batch = opt.prefill_batch, prefill_verify = opt.prefill_verify;
+    g_comm_poll_spins = opt.comm_poll_spins;
     if (g_comm_poll_spins < 1) g_comm_poll_spins = 1;
     if (g_comm_poll_spins > 64) g_comm_poll_spins = 64;
-    g_comm_robust = envi("DS4F_COMM_ROBUST", 1) != 0;
+    g_comm_robust = opt.comm_robust != 0;
     if (prefill_batch > DS4F_MAX_MTILE) prefill_batch = DS4F_MAX_MTILE;
-    if (prefill_verify > 128) prefill_verify = 128; /* batched verify supports up to 128 positions */
+    if (prefill_verify > DS4F_MAX_MTILE) prefill_verify = DS4F_MAX_MTILE;
     if (prefill_verify < 0) prefill_verify = 0;
 
     /* ---- real greedy generation mode (coding-task quality test) ----
@@ -330,6 +374,7 @@ int main(void) {
      * cross-rank lockstep preserved with no extra broadcast. */
     const char *prompt_ids_file = getenv("DS4F_PROMPT_IDS");
     const char *gen_out_file    = getenv("DS4F_GEN_OUT");
+    const char *prefill_out_file = getenv("DS4F_PREFILL_OUT");
     int gen_mode = (prompt_ids_file && *prompt_ids_file);
     int max_new  = envi("DS4F_MAX_NEW", 256);
     int *prompt_ids = NULL, n_prompt = 0;
@@ -344,6 +389,11 @@ int main(void) {
         }
         fclose(pfh);
         if (n_prompt < 1) die("DS4F_PROMPT_IDS file has no ids", -1);
+        /* Benchmark harness: allow a long fixed corpus to be measured at a
+         * shorter exact-causal length without generating another tracked
+         * artifact.  The default remains the complete prompt. */
+        int prompt_limit = envi("DS4F_PROMPT_LIMIT", 0);
+        if (prompt_limit > 0 && n_prompt > prompt_limit) n_prompt = prompt_limit;
         prefill = n_prompt;     /* prefill the whole prompt token-at-a-time */
         maxgen  = max_new;      /* decode up to max_new new tokens */
         prefill_batch = 0;      /* greedy feedback needs the per-token embedding */
@@ -571,6 +621,8 @@ int main(void) {
      * bit-identical on every rank -> replicated dense + lockstep argmax preserved. ---- */
     double t_pf0 = now_sec(); size_t pf_bytes = 0; g_ar_secs = 0; g_ar_calls = 0;
     int nan_count = 0; double xnorm = 0.0; int pf_last_tok = -1;
+    int *prefill_out = (gen_mode && prefill_out_file && *prefill_out_file)
+                     ? (int *)malloc((size_t)prefill * sizeof(int)) : NULL;
     int mtp_on = gen_mode && m->has_mtp;   /* DS4F_MTP self-spec: maintain MTP KV (prefill+decode) + measure accept rate */
     int spec_on = mtp_on && envi("DS4F_SPEC", 0);   /* DS4F_SPEC: gamma=1 speculative decode loop */
     int mtp_alpha = mtp_on && !spec_on && envi("DS4F_MTP_ALPHA", 0);  /* alpha measurement costs a draft/step --
@@ -616,6 +668,7 @@ int main(void) {
             for (int k = 0; k < K; k++) embed_lookup(m, prompt_ids[base + k], Xv + (size_t)k * C);
             m->bytes_read = 0;
             ds4f_forward_verify(m, Xv, K, base, ot, Hv, NULL);
+            if (prefill_out) memcpy(prefill_out + base, ot, (size_t)K * sizeof(int));
             pf_bytes += m->bytes_read;
             pf_last_tok = ot[K - 1];
             for (int k = 0; k < K; k++) if (tf_check && base + k + 1 < prefill) {
@@ -640,6 +693,7 @@ int main(void) {
             else for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
             m->bytes_read = 0;
             pf_last_tok = ds4f_forward_token(m, x, p);
+            if (prefill_out) prefill_out[p] = pf_last_tok;
             pf_bytes += m->bytes_read;
             if (mtp_alpha || spec_on) {   /* maintain MTP KV over the prompt: process token@(p+1) at position p+1 */
                 int nt = (p + 1 < prefill) ? prompt_ids[p+1] : pf_last_tok;
@@ -662,6 +716,8 @@ int main(void) {
     }
     double t_pf = now_sec() - t_pf0;
     double pf_ar = g_ar_secs; long pf_calls = g_ar_calls;
+    double pf_prof[DS4F_NPHASE];
+    memcpy(pf_prof, m->prof, sizeof pf_prof);
 
     barrier();   /* lockstep check between phases */
 
@@ -825,6 +881,14 @@ int main(void) {
                    prefill, t_pf/prefill*1e3, prefill/t_pf, 100.0*pf_ar/t_pf, pf_calls, pf_last_tok,
                    prefill_batch > 0 ? "  [batched]" :
                    (prefill_verify > 1 ? "  [chunked-verify]" : ""));
+        double pfsum = 0; for (int i = 0; i <= DS4F_P_TB2PREP; i++) pfsum += pf_prof[i];
+        if (pfsum > 0 && prefill > 0) {
+            logmsg("per-phase prefill (ms/tok):\n");
+            for (int i = 0; i < DS4F_NPHASE; i++) {
+                double ms = pf_prof[i]/prefill*1e3; if (ms <= 0) continue;
+                logmsg("  %-9s %7.3f ms  %5.1f%%\n", ds4f_prof_names[i], ms, 100.0*pf_prof[i]/pfsum);
+            }
+        }
         if (maxgen > 0) {
             logmsg("decode:  %d tok  %.1f ms/tok  %.2f tok/s   comm %.1f%% (%.0f us/tok)\n",
                    maxgen, t_dec/maxgen*1e3, maxgen/t_dec, 100.0*dec_ar/t_dec, dec_ar/maxgen*1e6);
@@ -853,9 +917,21 @@ int main(void) {
                 logmsg("gen: WARNING could not open DS4F_GEN_OUT=%s for write\n", gen_out_file);
             }
         }
+        if (gen_mode && prefill_out && prefill_out_file && *prefill_out_file) {
+            FILE *pf = fopen(prefill_out_file, "w");
+            if (pf) {
+                for (int i = 0; i < prefill; i++)
+                    fprintf(pf, "%d%s", prefill_out[i], i + 1 < prefill ? " " : "\n");
+                fclose(pf);
+                logmsg("prefill: wrote %d teacher argmax ids to %s\n", prefill, prefill_out_file);
+            } else {
+                logmsg("prefill: WARNING could not open DS4F_PREFILL_OUT=%s for write\n", prefill_out_file);
+            }
+        }
     }
 
     free(prompt_ids);
+    free(prefill_out);
     free(gen_ids);
     free(x);
     ds4f_free(m);
