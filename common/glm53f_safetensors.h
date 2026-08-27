@@ -29,6 +29,7 @@ typedef struct {
 } glm53f_st_entry;
 
 typedef struct {
+    char *model_dir;
     glm53f_st_shard *shards;
     int n_shards;
     glm53f_st_entry *entries;
@@ -45,6 +46,9 @@ int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose);
  * safetensors row-major order (the checkpoint's output/input convention). */
 int glm53f_st_expect(const glm53f_st_context *ctx, const char *name,
                      const char *dtype, int n_dims, const uint64_t *shape);
+/* Read a bounded tensor slice without mapping the shard payload. */
+int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
+                   size_t offset, void *dst, size_t nbytes);
 
 #ifdef GLM53F_SAFETENSORS_IMPLEMENTATION
 
@@ -113,6 +117,8 @@ glm53f_st_context *glm53f_st_open(const char *model_dir) {
         wm->type != JSON_OBJECT) { json_free(root); return NULL; }
     ctx = (glm53f_st_context *)calloc(1, sizeof(*ctx));
     if (!ctx) { json_free(root); return NULL; }
+    ctx->model_dir = glm53f_st_dup(model_dir);
+    if (!ctx->model_dir) goto fail;
     for (i = 0; i < wm->obj.count; ++i) {
         json_val *v = &wm->obj.vals[i];
         int sid, tid;
@@ -144,7 +150,7 @@ void glm53f_st_close(glm53f_st_context *ctx) {
         free(ctx->shards[i].name);
         safetensors_close(ctx->shards[i].st);
     }
-    free(ctx->entries); free(ctx->shards); free(ctx);
+    free(ctx->model_dir); free(ctx->entries); free(ctx->shards); free(ctx);
 }
 
 const st_tensor_info *glm53f_st_find(const glm53f_st_context *ctx, const char *name,
@@ -167,6 +173,24 @@ int glm53f_st_expect(const glm53f_st_context *ctx, const char *name,
     if (!t || (dtype && strcmp(t->dtype_str, dtype)) || t->n_dims != n_dims) return -1;
     for (d = 0; d < n_dims; ++d) if (t->shape[d] != shape[d]) return -1;
     return 0;
+}
+
+int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
+                   size_t offset, void *dst, size_t nbytes) {
+    const st_context *owner = NULL;
+    const st_tensor_info *t = glm53f_st_find(ctx, name, &owner);
+    int i, fd, rc = -1;
+    char path[4096];
+    if (!t || !owner || offset > t->nbytes || nbytes > t->nbytes - offset || !dst) return -1;
+    for (i = 0; i < ctx->n_shards; ++i) if (ctx->shards[i].st == owner) break;
+    if (i == ctx->n_shards || snprintf(path, sizeof(path), "%s/%s", ctx->model_dir,
+                                        ctx->shards[i].name) >= (int)sizeof(path)) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    if (pread(fd, dst, nbytes, (off_t)(owner->data_offset + t->offset + offset)) == (ssize_t)nbytes)
+        rc = 0;
+    close(fd);
+    return rc;
 }
 
 int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose) {

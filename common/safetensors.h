@@ -73,6 +73,7 @@ typedef struct {
     size_t          map_size;
     uint8_t        *data;          /* = map_base + 8 + header_size */
     int             header_only;   /* map_base is malloc'd header storage */
+    size_t          data_offset;   /* file offset of the tensor data section */
 } st_context;
 
 st_context     *safetensors_open(const char *path);
@@ -377,6 +378,7 @@ static st_context *safetensors_parse_header(void *map, size_t map_size,
     if (!ctx) { for (i = 0; i < n_tensors; i++) free(tensors[i].name); free(tensors); return NULL; }
     ctx->tensors = tensors; ctx->n_tensors = n_tensors; ctx->map_base = map;
     ctx->map_size = map_size; ctx->data = header_only ? NULL : (uint8_t *)map + 8 + header_size;
+    ctx->data_offset = (size_t)(8 + header_size);
     ctx->header_only = header_only;
     return ctx;
 }
@@ -506,6 +508,7 @@ st_context *safetensors_open(const char *path) {
     ctx->map_size = file_size;
     ctx->data = (uint8_t *)map + 8 + header_size;
     ctx->header_only = 0;
+    ctx->data_offset = (size_t)(8 + header_size);
     return ctx;
 }
 

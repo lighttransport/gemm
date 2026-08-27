@@ -55,6 +55,21 @@ cc -std=c11 -Wall -Wextra -Wpedantic -D_GNU_SOURCE -I../../common \
 ./test_glm53f_safetensors ~/models/glm53f
 ```
 
+For a one-node runner smoke test, use the bounded validator. The second
+argument limits binding to decoder layers 1--3; the optional third argument
+selects an embedding row. It reads only that row's payload and reports the
+logical bytes belonging to the selected layers:
+
+```bash
+cc -std=c11 -Wall -Wextra -Wpedantic -I../../common \
+  glm53f_runner.c -o glm53f_runner
+./glm53f_runner ~/models/glm53f 3 0
+```
+
+This is intentionally a checkpoint/runner validation executable, not an
+inference claim. The numerical GLM5.3F graph still needs linear-attention
+state, sparse index selection, MHC, FP8/MoE kernels, and distributed sharding.
+
 After the GLM5.3F graph and safetensors mapper land, the EP runner accepts the
 same path directly with `--prompt-text TEXT`; it renders the C template and
 tokenizes on every rank, so a separate Python tokenizer process is not needed.
