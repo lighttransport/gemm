@@ -22,10 +22,20 @@ Configuration:
 """
 
 import json
+import os
 
 import requests
 
-BASE_URL = "http://127.0.0.1:21264"
+try:
+    from config import environment, load
+    _CONFIG, _CONFIG_FILES = load()
+    _CONFIG_ENV = environment(_CONFIG)
+except (ImportError, ValueError):
+    _CONFIG_ENV, _CONFIG_FILES = {}, []
+
+BASE_URL = os.environ.get(
+    "CLAIR_BASH_HTTP_URL",
+    "http://127.0.0.1:%s" % _CONFIG_ENV.get("LOCAL_PORT", 42386))
 AUTH_TOKEN = None   # set if the server was started with --token
 
 # Pooled connection reuse across calls (keep-alive).

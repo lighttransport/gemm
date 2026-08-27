@@ -25,6 +25,16 @@ Run commands from repo root unless noted:
 - `./vulkan/build/test_vision_encoder` (or `test_vision_multimodal`) runs Vulkan-side validation.
 - `make -C a64fx/int8-new 5x4 COMPILER=fcc` builds an A64FX target; use `make -C <dir> clean` to reset artifacts.
 
+### A64FX development on Fugaku
+
+Follow [a64fx/remote-dev-procedure.md](a64fx/remote-dev-procedure.md) for
+remote development through Fugaku. It documents the `rsync` deployment,
+login1 SSH forwarding, PJM allocation, and the persistent bash-over-HTTP
+workflow. The canonical bridge scripts are in
+`a64fx/tools/bash-over-http/`; use the project-local `.bash-over-http.json`
+or user-global `${XDG_CONFIG_HOME:-$HOME/.config}/bash-over-http/setup.json`
+for connection defaults.
+
 ## Coding Style & Naming Conventions
 - Languages: C, C++, and architecture-specific `.S` assembly.
 - Use 4-space indentation and keep brace/style conventions consistent with nearby files.

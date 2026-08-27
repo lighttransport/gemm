@@ -29,6 +29,8 @@
 #define GLM5_IMPL
 #include "glm5.h"
 #include "glm5_impl.h"
+#include "../../common/glm5_bpe.h"
+#include "../../common/glm5_chat_template.h"
 #include "../utofu-tests/tofu_demo.h"
 #include "../utofu-tests/tp_allreduce.h"
 
@@ -1171,7 +1173,8 @@ static void glm5_cli_usage(void){
       "  --real N            0=synthetic structural benchmark path\n"
       "\n generation:\n"
       "  --max-new N         decode tokens        --min-new N       floor decode tokens\n"
-      "  --prompt-ids FILE   space-separated ids  --prompt-tokens FILE  packed uint32 prompt\n"
+      "  --prompt-ids FILE   space-separated ids  --prompt-text TEXT   render+tokenize GLM5.3F\n"
+      "  --prompt-tokens FILE  packed uint32 prompt\n"
       "  --gen-out FILE      write generated ids  --gen-new N       generate-after-prefill count\n"
       "  --kv-save FILE      save KV after prefill --kv-load FILE    resume from saved KV\n"
       "  --temp F --topp F --rep-pen F --seed N    sampler (temp<=0 => greedy)\n"
@@ -1226,7 +1229,7 @@ static void glm5_cli(int argc,char**argv){
         MAP("tp","GLM5_TP")             MAP("tp-shared","GLM5_TP_SHARED")
         /* generation */
         MAP("max-new","GLM5_MAX_NEW")   MAP("min-new","GLM5_MIN_NEW") MAP("gen-new","GLM5_GEN_NEW")
-        MAP("prompt-ids","GLM5_PROMPT_IDS") MAP("prompt-tokens","GLM5_PROMPT_TOKENS")
+        MAP("prompt-ids","GLM5_PROMPT_IDS") MAP("prompt-text","GLM5_PROMPT_TEXT") MAP("prompt-tokens","GLM5_PROMPT_TOKENS")
         MAP("gen-out","GLM5_GEN_OUT")   MAP("kv-save","GLM5_KV_SAVE") MAP("kv-load","GLM5_KV_LOAD")
         MAP("temp","GLM5_TEMP")         MAP("topp","GLM5_TOPP")       MAP("rep-pen","GLM5_REP_PEN")
         MAP("seed","GLM5_SEED")
@@ -1543,14 +1546,33 @@ int main(int argc,char**argv){
      * Every rank reads the SAME prompt file and (under TP_HEAD) computes the SAME
      * global argmax -> identical token feedback -> lockstep, no extra broadcast. */
     const char*prompt_file=getenv("GLM5_PROMPT_IDS");
+    const char*prompt_text=getenv("GLM5_PROMPT_TEXT");
     const char*gen_out=getenv("GLM5_GEN_OUT");
-    if(prompt_file&&*prompt_file){
+    if((prompt_file&&*prompt_file)||(prompt_text&&*prompt_text)){
         int max_new=envi("GLM5_MAX_NEW",64);
         int min_new=envi("GLM5_MIN_NEW",0);
-        FILE*pf=fopen(prompt_file,"r"); if(!pf) die("cannot open GLM5_PROMPT_IDS",-1);
         int cap=1024,n_prompt=0,*prompt=glm5_amalloc((size_t)cap*sizeof(int)),v;
-        while(fscanf(pf,"%d",&v)==1){ if(n_prompt>=cap){int oc=cap;cap*=2;prompt=glm5_arealloc(prompt,(size_t)oc*sizeof(int),(size_t)cap*sizeof(int));} prompt[n_prompt++]=v; }
-        fclose(pf); if(n_prompt<1) die("empty prompt",-1);
+        if(prompt_file&&*prompt_file){
+            FILE*pf=fopen(prompt_file,"r"); if(!pf) die("cannot open GLM5_PROMPT_IDS",-1);
+            while(fscanf(pf,"%d",&v)==1){ if(n_prompt>=cap){int oc=cap;cap*=2;prompt=glm5_arealloc(prompt,(size_t)oc*sizeof(int),(size_t)cap*sizeof(int));} prompt[n_prompt++]=v; }
+            fclose(pf);
+        } else {
+            const char *tok_path=getenv("GLM5_TOKENIZER");
+            char default_tok[4096];
+            if(!tok_path||!*tok_path){ const char *home=getenv("HOME"); snprintf(default_tok,sizeof default_tok,"%s/models/glm53f/tokenizer.json",home?home:""); tok_path=default_tok; }
+            glm5_bpe bpe; char *rendered; size_t text_len=strlen(prompt_text), render_cap=text_len+512;
+            glm5_chat_message msg={"user",prompt_text,NULL};
+            if(glm5_bpe_load(tok_path,&bpe)!=0) die("cannot load GLM5_TOKENIZER",-1);
+            rendered=malloc(render_cap); if(!rendered) die("prompt template allocation",-1);
+            if(glm5_chat_template_render(&msg,1,getenv("GLM5_REASONING_EFFORT"),1,rendered,render_cap)<0){ free(rendered);glm5_bpe_free(&bpe);die("prompt template too long",-1); }
+            int need=(int)(render_cap/2); if(need<1024)need=1024;
+            prompt=glm5_arealloc(prompt,(size_t)cap*sizeof(int),(size_t)need*sizeof(int)); cap=need;
+            n_prompt=glm5_bpe_encode(&bpe,rendered,prompt,cap);
+            free(rendered); glm5_bpe_free(&bpe);
+            if(n_prompt<1) die("empty tokenized prompt",-1);
+            if(MyRank==0) logmsg("prompt-text: tokenizer=%s rendered=%zu bytes tokens=%d\n",tok_path,strlen(prompt_text),n_prompt);
+        }
+        if(n_prompt<1) die("empty prompt",-1);
         /* A prompt longer than the context makes max_new negative, which downstream
            becomes an undersized allocation and a corrupted heap far from the cause.
            Fail here with the two numbers the user needs (raise --ctx). */

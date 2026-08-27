@@ -18,6 +18,8 @@
 set -uo pipefail   # not -e: transient ssh failures must not kill the watcher
 
 HERE=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$HERE/../../.." && pwd)
+eval "$(python3 "$HERE/config.py" --project-dir "$REPO_ROOT" --shell)"
 
 LOGIN_NODE=${LOGIN_NODE:-1}
 if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
@@ -27,7 +29,7 @@ elif [[ -d /local ]]; then
 else
     CONTROL_ROOT=tmp
 fi
-CONTROL_DIR=${CONTROL_DIR:-$CONTROL_ROOT/clair-bash-http-${USER}}
+CONTROL_DIR=${CONTROL_DIR:-${BASH_HTTP_CONTROL_DIR:-$CONTROL_ROOT/clair-bash-http-${USER}}}
 CONTROL_PATH=${CONTROL_PATH:-$CONTROL_DIR/cm-%r@%h:%p}
 STATE_FILE=${STATE_FILE:-$CONTROL_DIR/state.env}
 MAX_RETRY=${MAX_RETRY:-10}
@@ -39,7 +41,7 @@ if [[ -f "$STATE_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$STATE_FILE"
 fi
-REMOTE=${REMOTE_ENV:-${REMOTE:-fugaku1}}
+REMOTE=${REMOTE_ENV:-${REMOTE:-${BASH_HTTP_REMOTE:-fugaku1}}}
 
 ts() { date -u +%FT%TZ; }
 master_alive() { ssh -o ControlPath="$CONTROL_PATH" -O check "$REMOTE" >/dev/null 2>&1; }

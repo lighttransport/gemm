@@ -28,6 +28,21 @@ python3 bash_http_example.py
 The demo proves state persistence, incremental streaming, and output
 truncation.
 
+## Connection configuration
+
+The tools load settings from the user file
+`${XDG_CONFIG_HOME:-$HOME/.config}/bash-over-http/setup.json`. When invoked
+from a checkout, `.bash-over-http.json` in the project root overrides that
+user-wide file. `BASH_HTTP_CONFIG=/path/to/file.json` selects an explicit file.
+Environment variables such as `REMOTE`, `LOCAL_PORT`, and `SERVER_PORT` take
+precedence over JSON values.
+
+Use `setup.json.example` as a starting point. The `local` and `remote` objects
+define checkout directories and SSH/forward ports; `server` defines the
+compute-side listener; and `job` contains PJM defaults. The launcher scripts
+use the same configuration loader, so the tunnel and submission commands
+agree on the selected endpoint.
+
 ## Configuration
 
 Flags (CLI) override environment variables, which override defaults:

@@ -1,13 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$HERE/../../.." && pwd)
+eval "$(python3 "$HERE/config.py" --project-dir "$REPO_ROOT" --shell)"
+
 # Pin the local forward to the configured SSH target. The repository's
 # `fugaku1` alias resolves to login1; set REMOTE to use another login host.
 LOGIN_NODE=${LOGIN_NODE:-1}
 case "$LOGIN_NODE" in [1-8]) ;; *) echo "LOGIN_NODE must be 1..8 (got '$LOGIN_NODE')" >&2; exit 2 ;; esac
-REMOTE=${REMOTE:-fugaku1}
-LOCAL_PORT=${LOCAL_PORT:-42386}
-REMOTE_PORT=${REMOTE_PORT:-32386}
+REMOTE=${REMOTE:-${BASH_HTTP_REMOTE:-fugaku1}}
+LOCAL_PORT=${LOCAL_PORT:-${BASH_HTTP_LOCAL_PORT:-42386}}
+REMOTE_PORT=${REMOTE_PORT:-${BASH_HTTP_REMOTE_PORT:-32386}}
 if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
     CONTROL_ROOT=$XDG_RUNTIME_DIR
 elif [[ -d /local ]]; then
@@ -15,7 +19,7 @@ elif [[ -d /local ]]; then
 else
     CONTROL_ROOT=tmp
 fi
-CONTROL_DIR=${CONTROL_DIR:-$CONTROL_ROOT/clair-bash-http-${USER}}
+CONTROL_DIR=${CONTROL_DIR:-${BASH_HTTP_CONTROL_DIR:-$CONTROL_ROOT/clair-bash-http-${USER}}}
 CONTROL_PATH=${CONTROL_PATH:-$CONTROL_DIR/cm-%r@%h:%p}
 STATE_FILE=${STATE_FILE:-$CONTROL_DIR/state.env}
 

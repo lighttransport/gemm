@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$HERE/../../.." && pwd)
+eval "$(python3 "$HERE/config.py" --project-dir "$REPO_ROOT" --shell)"
+
 # Submit the compute-side bash-over-HTTP bridge through a pinned Fugaku login
 # node. Run open_local_tunnel.sh first so REMOTE and the forwarded ports are
 # recorded in the shared local state file.
@@ -18,7 +22,7 @@ elif [[ -d /local ]]; then
 else
     CONTROL_ROOT=tmp
 fi
-CONTROL_DIR=${CONTROL_DIR:-$CONTROL_ROOT/clair-bash-http-${USER}}
+CONTROL_DIR=${CONTROL_DIR:-${BASH_HTTP_CONTROL_DIR:-$CONTROL_ROOT/clair-bash-http-${USER}}}
 STATE_FILE=${STATE_FILE:-$CONTROL_DIR/state.env}
 
 # Explicit environment values win over state recorded by open_local_tunnel.sh.
@@ -30,21 +34,21 @@ if [[ -f "$STATE_FILE" ]]; then
     source "$STATE_FILE"
 fi
 
-REMOTE=${REMOTE_ENV:-${REMOTE:-fugaku1}}
-FRONTEND_SSH_TARGET=${FRONTEND_SSH_TARGET_ENV:-${FRONTEND_SSH_TARGET:-login${LOGIN_NODE}.fugaku.r-ccs.riken.jp}}
-FRONTEND_HOST=${FRONTEND_HOST:-$FRONTEND_SSH_TARGET}
-FRONTEND_PORT=${FRONTEND_PORT_ENV:-${REMOTE_PORT:-32386}}
-SERVER_HOST=${SERVER_HOST:-127.0.0.1}
-SERVER_PORT=${SERVER_PORT:-21264}
+REMOTE=${REMOTE_ENV:-${REMOTE:-${BASH_HTTP_REMOTE:-fugaku1}}}
+FRONTEND_SSH_TARGET=${FRONTEND_SSH_TARGET_ENV:-${FRONTEND_SSH_TARGET:-${BASH_HTTP_FRONTEND_SSH_TARGET:-login${LOGIN_NODE}.fugaku.r-ccs.riken.jp}}}
+FRONTEND_HOST=${FRONTEND_HOST:-${BASH_HTTP_FRONTEND_HOST:-$FRONTEND_SSH_TARGET}}
+FRONTEND_PORT=${FRONTEND_PORT_ENV:-${BASH_HTTP_FRONTEND_PORT:-${BASH_HTTP_REMOTE_PORT:-32386}}}
+SERVER_HOST=${SERVER_HOST:-${BASH_HTTP_SERVER_HOST:-127.0.0.1}}
+SERVER_PORT=${SERVER_PORT:-${BASH_HTTP_SERVER_PORT:-21264}}
 
-PROJECT_ID=${PROJECT_ID:-hp250467}
-RSCGRP=${RSCGRP:-small}
-NODES=${NODES:-1}
-ELAPSE=${ELAPSE:-08:00:00}
-A64FX_MODE=${A64FX_MODE:-normal}
-GFSCACHE=${GFSCACHE:-/vol0004}
-LOCALTMP_SIZE=${LOCALTMP_SIZE:-87Gi}
-REMOTE_REPO=${REMOTE_REPO:-\$HOME/work/gemm/glm53f}
+PROJECT_ID=${PROJECT_ID:-${BASH_HTTP_PROJECT_ID:-hp250467}}
+RSCGRP=${RSCGRP:-${BASH_HTTP_RSCGRP:-small}}
+NODES=${NODES:-${BASH_HTTP_NODES:-1}}
+ELAPSE=${ELAPSE:-${BASH_HTTP_ELAPSE:-08:00:00}}
+A64FX_MODE=${A64FX_MODE:-${BASH_HTTP_A64FX_MODE:-normal}}
+GFSCACHE=${GFSCACHE:-${BASH_HTTP_GFSCACHE:-/vol0004}}
+LOCALTMP_SIZE=${LOCALTMP_SIZE:-${BASH_HTTP_LOCALTMP_SIZE:-87Gi}}
+REMOTE_REPO=${REMOTE_REPO:-${BASH_HTTP_REMOTE_REPO:-\$HOME/work/gemm/glm53f}}
 JOB_SCRIPT=${JOB_SCRIPT:-a64fx/tools/bash-over-http/pjsub_bash_http.sh}
 MAX_RETRY=${MAX_RETRY:-10}
 MONITOR_INTERVAL=${MONITOR_INTERVAL:-15}

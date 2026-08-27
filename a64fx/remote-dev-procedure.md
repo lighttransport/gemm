@@ -19,8 +19,8 @@ bash_http_server.py -> persistent Bash sessions
 
 All three listeners use loopback addresses and the two network hops are SSH
 forwards. HTTP bearer-token authentication is optional and disabled by default;
-do not change any listener
-bind address to `0.0.0.0` or expose these ports outside the SSH path.
+do not change any listener bind address to `0.0.0.0` or expose these ports
+outside the SSH path.
 
 ## Prerequisites
 
@@ -35,20 +35,57 @@ bind address to `0.0.0.0` or expose these ports outside the SSH path.
 
 Run all local commands below from the Gemm repository root.
 
+## Connection configuration
+
+Copy `a64fx/tools/bash-over-http/setup.json.example` to
+`${XDG_CONFIG_HOME:-$HOME/.config}/bash-over-http/setup.json` for user-wide
+defaults. A project-local `.bash-over-http.json` in the repository root takes
+precedence over the user file. Set `BASH_HTTP_CONFIG=/path/to/file.json` to
+select an explicit file. Environment variables such as `REMOTE` and
+`LOCAL_PORT` still override JSON settings.
+
+The JSON template covers the local checkout and port, SSH hostname, remote
+checkout and forwarded port, server bind/port, and PJM job settings. For
+example, project-specific connection settings can be kept in:
+
+```json
+{
+  "local": { "dir": ".", "port": 42386 },
+  "remote": {
+    "ssh_host": "fugaku1",
+    "hostname": "login1.fugaku.r-ccs.riken.jp",
+    "port": 32386,
+    "dir": "$HOME/work/gemm/glm53f"
+  },
+  "server": { "host": "127.0.0.1", "port": 21264 }
+}
+```
+
+The deployment command should be run from `local.dir`; it synchronizes the
+bundle to `remote.dir`. The project config is synchronized alongside the
+bundle when present.
+
 ## Deploy the bridge
 
 Synchronize only the bridge and this procedure. The commands do not delete or
 overwrite unrelated remote artifacts.
 
 ```bash
+REMOTE=fugaku1
+REMOTE_DIR='~/work/gemm/glm53f'
 rsync -av a64fx/tools/bash-over-http/ \
-  fugaku1:~/work/gemm/glm53f/a64fx/tools/bash-over-http/
+  "$REMOTE:$REMOTE_DIR/a64fx/tools/bash-over-http/"
 rsync -av a64fx/remote-dev-procedure.md \
-  fugaku1:~/work/gemm/glm53f/a64fx/remote-dev-procedure.md
+  "$REMOTE:$REMOTE_DIR/a64fx/remote-dev-procedure.md"
+# If this checkout has project-local settings, sync them too:
+test ! -f .bash-over-http.json || rsync -av .bash-over-http.json \
+  "$REMOTE:$REMOTE_DIR/.bash-over-http.json"
 ```
 
-When the scripts change, repeat the same two commands before submitting a new
-job. A running server keeps using the code loaded when its job started.
+When the scripts or project config change, repeat these `rsync` commands before
+submitting a new job. A running server keeps using the code loaded when its job
+started. Replace `REMOTE` and `REMOTE_DIR` with the values from your config
+when using another login host or checkout.
 
 ## Open the local forward
 
@@ -81,12 +118,18 @@ nohup a64fx/tools/bash-over-http/watch_local_tunnel.sh \
 
 ## Submit a job
 
-The standard one-node, eight-hour remote-development allocation is:
+The standard one-node, 12-hour remote-development allocation is:
 
 ```bash
-NODES=1 ELAPSE=08:00:00 \
+REMOTE=login1.fugaku.r-ccs.riken.jp \
+FRONTEND_SSH_TARGET=login1.fugaku.r-ccs.riken.jp \
+NODES=1 ELAPSE=12:00:00 \
   a64fx/tools/bash-over-http/submit_bash_http_job.sh
 ```
+
+The wrapper submits `pjsub` through login1 and the job opens the reverse SSH
+tunnel back to that same login node. It prints `JOB_ID=<id>` after submission;
+use that ID in the readiness and cleanup commands below.
 
 For boost-eco execution (2.2 GHz, 10% higher HBM2 bandwidth, and FLB disabled),
 select the named mode:
@@ -98,12 +141,12 @@ A64FX_MODE=boost-eco NODES=1 ELAPSE=08:00:00 \
 
 This changes the PJM resource selection to `freq=2200,eco_state=2`.
 
-The submission wrapper executes `pjsub` through `ssh fugaku1` with these exact
-resource settings:
+The submission wrapper executes `pjsub` through the configured SSH target with
+these resource settings for the 12-hour example:
 
 ```text
 -g hp250467
--L freq=2000,eco_state=0,rscgrp=small,node=1,elapse=08:00:00
+-L freq=2000,eco_state=0,rscgrp=small,node=1,elapse=12:00:00
 --no-check-directory
 -x PJM_LLIO_GFSCACHE=/vol0004
 --llio localtmp-size=87Gi
@@ -130,7 +173,7 @@ The main configurable values are:
 | `RSCGRP` | `small` | PJM resource group |
 | `NODES` | `1` | Integer from 1 through 12 |
 | `A64FX_MODE` | `normal` | `normal` or `boost-eco` |
-| `ELAPSE` | `08:00:00` | `HH:MM:SS` |
+| `ELAPSE` | `08:00:00` | `HH:MM:SS`; use up to `12:00:00` for the standard batch job |
 | `GFSCACHE` | `/vol0004` | `PJM_LLIO_GFSCACHE` value |
 | `LOCALTMP_SIZE` | `87Gi` | LLIO local temporary capacity |
 | `FRONTEND_SSH_TARGET` | `login1.fugaku.r-ccs.riken.jp` | Compute-to-login reverse SSH target |

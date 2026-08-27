@@ -16,17 +16,21 @@
 set -uo pipefail   # not -e: the supervisor loop relies on non-zero returns
 umask 077
 
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$HERE/../../.." && pwd)
+eval "$(python3 "$HERE/config.py" --project-dir "$REPO_ROOT" --shell)"
+
 # Frontend to reverse-tunnel back to. LOGIN_NODE (1..8) -> loginN.fugaku.r-ccs.riken.jp;
 # submit_bash_http_job.sh overrides FRONTEND_* explicitly via pjsub -x.
 LOGIN_NODE=${LOGIN_NODE:-1}
-FRONTEND_HOST=${FRONTEND_HOST:-login${LOGIN_NODE}.fugaku.r-ccs.riken.jp}
+FRONTEND_HOST=${FRONTEND_HOST:-${BASH_HTTP_FRONTEND_HOST:-login${LOGIN_NODE}.fugaku.r-ccs.riken.jp}}
 FRONTEND_SSH_TARGET=${FRONTEND_SSH_TARGET:-$FRONTEND_HOST}
 FRONTEND_SSH_TARGETS=${FRONTEND_SSH_TARGETS:-$FRONTEND_SSH_TARGET}
-FRONTEND_PORT=${FRONTEND_PORT:-32386}
-SERVER_PORT=${SERVER_PORT:-21264}
-SERVER_HOST=${SERVER_HOST:-127.0.0.1}
-A64FX_MODE=${A64FX_MODE:-normal}
-WORKDIR=${WORKDIR:-$HOME/work/gemm/glm53f}
+FRONTEND_PORT=${FRONTEND_PORT:-${BASH_HTTP_FRONTEND_PORT:-${BASH_HTTP_REMOTE_PORT:-32386}}}
+SERVER_PORT=${SERVER_PORT:-${BASH_HTTP_SERVER_PORT:-21264}}
+SERVER_HOST=${SERVER_HOST:-${BASH_HTTP_SERVER_HOST:-127.0.0.1}}
+A64FX_MODE=${A64FX_MODE:-${BASH_HTTP_A64FX_MODE:-normal}}
+WORKDIR=${WORKDIR:-${BASH_HTTP_REMOTE_REPO:-$HOME/work/gemm/glm53f}}
 LOGDIR=${LOGDIR:-$WORKDIR/a64fx/tools/bash-over-http/job-logs}
 SSH_KNOWN_HOSTS=${SSH_KNOWN_HOSTS:-$LOGDIR/known_hosts}
 
