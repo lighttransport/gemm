@@ -217,3 +217,12 @@ promotion sustains 2.404--2.420 TFLOP/s and pure FP16 sustains
 2.507--2.516 TFLOP/s. The stable 2.2 and 2.4 targets are met, with the latter
 requiring either K=1024 promotion or pure FP16 accumulation; K=256 reaches
 2.358--2.370 TFLOP/s on the balanced shape.
+
+The 2.6 TFLOP/s follow-up makes the existing `[K][12]` activation pack an
+explicit reusable input. `fp4_pack_a_m12` prepares it once and
+`fp4_gemm_f16_bf16cache_prepacked_omp` consumes it for each same-K
+projection. Pure FP16 accumulation is stable at 2.634--2.638 TFLOP/s for
+M=192, N=9216, K=4096; K=1024 FP32 promotion reaches 2.550 TFLOP/s. This
+retains FP32 output and bit-identical arithmetic while moving the 0.25 ms pack
+outside repeated projection calls. MR13 and small-group K-block reuse were
+measured and rejected before selecting this path.

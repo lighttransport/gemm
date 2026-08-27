@@ -1063,6 +1063,89 @@ int fp4_matrix_prepare_bf16(fp4_matrix *p, int threads) {
 #endif
 }
 
+size_t fp4_packed_a_m12_bytes(int m, int k) {
+    return m > 0 && k > 0 ? (size_t)((m + 11) / 12) * k * 12 *
+        sizeof(_Float16) : 0;
+}
+
+int fp4_pack_a_m12(_Float16 *packed_a, const _Float16 *a, int m, int k,
+        int threads) {
+    if (!packed_a || !a || m < 1 || k < 1 || threads < 1) return -1;
+#if defined(_OPENMP)
+    int mb_count = (m + 11) / 12;
+#pragma omp parallel for collapse(2) num_threads(threads) schedule(static)
+    for (int mb = 0; mb < mb_count; ++mb) for (int x = 0; x < k; ++x) {
+        int m0 = mb * 12;
+        _Float16 *dst = packed_a + ((size_t)mb * k + x) * 12;
+        for (int r = 0; r < 12; ++r)
+            dst[r] = m0 + r < m ? a[(size_t)(m0 + r) * k + x] : 0;
+    }
+    return 0;
+#else
+    (void)threads;
+    return -1;
+#endif
+}
+
+int fp4_gemm_f16_bf16cache_prepacked_omp(float *c,
+        const _Float16 *packed_a, const fp4_matrix *w, int m,
+        int promotion_k, int threads) {
+    if (!c || !packed_a || !w || !w->weights_bf16 || m < 1 || threads < 1 ||
+        promotion_k < 0 || (promotion_k &&
+        ((promotion_k % 32) || promotion_k > w->k))) return -1;
+#if defined(__ARM_FEATURE_SVE) && defined(_OPENMP)
+    int span = promotion_k ? promotion_k : w->k;
+    int mb_count = (m + 11) / 12;
+    int tile_count = (w->n + 63) / 64;
+    int sector_tags = getenv("FP4_NO_SECTOR_TAGS") == NULL;
+    unsigned activation_tag = getenv("FP4_A_TAG") ?
+        (unsigned)strtoul(getenv("FP4_A_TAG"), NULL, 0) : 0x9;
+    unsigned weight_tag = getenv("FP4_B_TAG") ?
+        (unsigned)strtoul(getenv("FP4_B_TAG"), NULL, 0) : 0xb;
+    const _Float16 *panel_base = sector_tags ?
+        fp4_sector_tag_f16(w->weights_bf16, weight_tag) : w->weights_bf16;
+    const _Float16 *packed_base = sector_tags ?
+        fp4_sector_tag_f16(packed_a, activation_tag) : packed_a;
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (int tile = 0; tile < tile_count; ++tile) {
+        const _Float16 *panel = panel_base + (size_t)tile * w->k * 64;
+        int nr = w->n - tile * 64 < 64 ? w->n - tile * 64 : 64;
+        for (int mb = 0; mb < mb_count; ++mb) {
+            int m0 = mb * 12;
+            int mr = m - m0 < 12 ? m - m0 : 12;
+            _Alignas(256) float scratch[12 * 64];
+            int direct = !promotion_k && mr == 12 && nr == 64;
+            float *dst = direct ? c + (size_t)m0 * w->n + tile * 64 : scratch;
+            int64_t ldc = (int64_t)(direct ? w->n : 64) * sizeof(*c);
+            for (int kb = 0; kb < w->k; kb += span) {
+                int ke = kb + span < w->k ? kb + span : w->k;
+                const _Float16 *ap = packed_base +
+                    ((size_t)mb * w->k + kb) * 12;
+                const _Float16 *bp = panel + (size_t)kb * 64;
+                if (mr <= 8) {
+                    if (kb == 0) fp4_dense_m8n64_init(ap, bp, dst,
+                        ke - kb, 0, ldc);
+                    else fp4_dense_m8n64_accum(ap, bp, dst,
+                        ke - kb, 0, ldc);
+                } else {
+                    if (kb == 0) fp4_dense_m12n64_init(ap, bp, dst,
+                        ke - kb, 0, ldc);
+                    else fp4_dense_m12n64_accum(ap, bp, dst,
+                        ke - kb, 0, ldc);
+                }
+            }
+            if (!direct) for (int r = 0; r < mr; ++r)
+                memcpy(c + (size_t)(m0 + r) * w->n + tile * 64,
+                    scratch + (size_t)r * 64, (size_t)nr * sizeof(*c));
+        }
+    }
+    return 0;
+#else
+    (void)promotion_k; (void)threads;
+    return -1;
+#endif
+}
+
 int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
         const fp4_matrix *w, int m, int promotion_k, int threads) {
     if (!c || !a || !w || !w->weights_bf16 || m < 1 || threads < 1 ||

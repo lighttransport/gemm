@@ -35,6 +35,16 @@ static void run_cache(float*c,const _Float16*a,const fp4_matrix*w,int m,int kc,i
         threads,m,kc,best*1e3,2.0*m*w->n*w->k/best/1e9,
         w->weights_bf16_bytes/1048576.0,packed_a/1024.0);
 }
+static void run_cache_prepacked(float*c,const _Float16*a,const fp4_matrix*w,int m,int kc,int threads){
+    size_t bytes=fp4_packed_a_m12_bytes(m,w->k);_Float16*pa=aa(bytes);
+    double pt=now();if(!pa||fp4_pack_a_m12(pa,a,m,w->k,threads))exit(1);pt=now()-pt;
+    fp4_gemm_f16_bf16cache_prepacked_omp(c,pa,w,m,kc,threads);double best=1e9;
+    for(int r=0;r<7;++r){double t=now();fp4_gemm_f16_bf16cache_prepacked_omp(c,pa,w,m,kc,threads);double d=now()-t;if(d<best)best=d;}
+    double work=2.0*m*w->n*w->k/1e9;
+    printf("kernel=f16cache_prepacked threads=%d M=%d kc=%d ms=%.2f gflops=%.2f pack_ms=%.3f reuse2_gflops=%.2f reuse4_gflops=%.2f packed_A_KiB=%.1f\n",
+        threads,m,kc,best*1e3,work/best,pt*1e3,2*work/(pt+2*best),
+        4*work/(pt+4*best),bytes/1024.0);free(pa);
+}
 static void run_half_omp(float*c,const _Float16*a,const fp4_matrix*w,int kc,size_t src,int threads){
     fp4_gemm_f16_half_omp(c,a,w,1,kc,threads);double best=1e9;
     for(int r=0;r<7;++r){double t=now();fp4_gemm_f16_half_omp(c,a,w,1,kc,threads);double d=now()-t;if(d<best)best=d;}
@@ -166,7 +176,9 @@ int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(arg
       int ct=getenv("FP4_CACHE_THREADS")?atoi(getenv("FP4_CACHE_THREADS")):12;
       _Float16*a=aa((size_t)m*k*2);float*c=aa((size_t)m*n*4);if(!a||!c||m<1)return 1;
       for(size_t i=0;i<(size_t)m*k;++i)a[i]=(_Float16)((int)(rnd()&255)-128)/512;
-      run_cache(c,a,&w,m,kc,ct);free(a);free(c);fp4_matrix_free(&w);return 0;}
+      if(getenv("FP4_CACHE_PREPACKED"))run_cache_prepacked(c,a,&w,m,kc,ct);
+      else run_cache(c,a,&w,m,kc,ct);
+      free(a);free(c);fp4_matrix_free(&w);return 0;}
     int ms[]={1,6,8,12,24,128};for(int z=0;z<6;++z){int m=ms[z];
       _Float16*a=aa((size_t)m*k*2);float*c=aa((size_t)m*n*4);if(!a||!c)return 1;
       for(size_t i=0;i<(size_t)m*k;++i)a[i]=(_Float16)((int)(rnd()&255)-128)/512;

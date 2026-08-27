@@ -149,6 +149,23 @@ the balanced shape. MR16x32, K-block-first reuse, cyclic tile scheduling, and
 split-B scheduling were measured and rejected; they reached approximately
 1.60, 2.00, 1.97, and 2.24 TFLOP/s respectively.
 
+#### Reusable activation pack: stable 2.6 TFLOP/s
+
+Packing A once as `[K][12]` and reusing it across projections removes a
+0.245--0.254 ms transpose from every subsequent GEMM. On the balanced
+M=192, N=9216, K=4096 shape, five independent pure-FP16 runs sustain
+**2.634--2.638 TFLOP/s** (5.50 ms). K=1024 FP32 promotion reaches 2.550
+TFLOP/s and K=256 reaches 2.478 TFLOP/s. The 1.5 MiB packed A is shared by
+same-K attention or FFN projections; its one-time cost amortizes to about
+2.61 TFLOP/s across four projections. Unit tests show bit-identical output
+to the original packing-inclusive path for all three FP4 formats.
+
+Two alternatives were rejected while pursuing this result. MR13x64 reaches
+2.45 TFLOP/s because four A broadcast temporaries do not cover load latency
+as well as MR12's six. K-block-first FP16 partial accumulation reaches only
+1.86--2.38 TFLOP/s: partial-tile traffic and kernel re-entry cost exceed the
+benefit of retaining a 16--32 KiB B slab in L1.
+
 The sidecar occupies 64 MiB for this matrix (4x the packed FP4 weight storage).
 Unit tests pass for MXFP4, NVFP4 1D, and NVFP4 2D with the same numerical error
 as the existing panel path.

@@ -94,6 +94,15 @@ int fp4_gemm_f16_n32_omp(float *c, const _Float16 *a, const fp4_matrix *w,
 int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
                                 const fp4_matrix *w, int m,
                                 int promotion_k, int threads);
+/* Pack A as [ceil(M/12)][K][12]. The caller owns the buffer and may reuse it
+ * for any number of same-K weight projections while the source A is fixed. */
+size_t fp4_packed_a_m12_bytes(int m, int k);
+int fp4_pack_a_m12(_Float16 *packed_a, const _Float16 *a, int m, int k,
+                    int threads);
+int fp4_gemm_f16_bf16cache_prepacked_omp(float *c,
+                                          const _Float16 *packed_a,
+                                          const fp4_matrix *w, int m,
+                                          int promotion_k, int threads);
 int fp4_gemm_f16_half_omp(float *c, const _Float16 *a, const fp4_matrix *w,
                            int m, int promotion_k, int threads);
 int fp4_gemm_f16_t12_omp(float *c, const _Float16 *a, const fp4_matrix *w,

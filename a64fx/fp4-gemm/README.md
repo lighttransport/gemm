@@ -151,6 +151,15 @@ reported kernel time. Padded M and N tails use a private output tile, so the
 public requirement remains only that N and K are divisible by 32. The sidecar
 is validated against the FP4 reference for MXFP4 and both NVFP4 layouts.
 
+When several projections consume the same activation matrix, allocate
+`fp4_packed_a_m12_bytes(M, K)` bytes, call `fp4_pack_a_m12` once, and pass the
+result to `fp4_gemm_f16_bf16cache_prepacked_omp` for each weight. This is the
+2.6 TFLOP/s path. It preserves the exact kernel and accumulation order; only
+the redundant per-projection activation pack is removed. The packed buffer is
+`ceil(M/12) * K * 12` FP16 values and may be reused only while A is unchanged.
+Attention projections and FFN gate/up projections are the intended reuse
+sites.
+
 On A64FX the cache path tags packed activations for strong L1 reuse and tags
 the decoded-weight stream to bypass L1. This is the default because each
 weight vector is consumed by the register tile and then discarded, while the
