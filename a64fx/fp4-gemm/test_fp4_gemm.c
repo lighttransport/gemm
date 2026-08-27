@@ -113,6 +113,20 @@ int main(void){
         rp=sqrt(np/(dp+1e-30));printf("%s l1panel_rel=%.6g\n",fp4_format_name((fp4_format)f),rp);
         if(!isfinite(rp)||rp>0.08)return 1;
         fp4_matrix_free(&p);}
+    {enum{DM=12,DN=128,DK=64};float*dw=malloc((size_t)DN*DK*4);
+      float*dr=malloc((size_t)DM*DN*4),*dg=malloc((size_t)DM*DN*4);
+      _Float16*da=malloc((size_t)DM*DK*2);if(!dw||!dr||!dg||!da)return 1;
+      for(int i=0;i<DN*DK;++i)dw[i]=rnd()*.25f;
+      for(int i=0;i<DM*DK;++i)da[i]=(_Float16)(rnd()*.5f);
+      for(int f=0;f<3;++f){fp4_matrix dp;
+        if(fp4_matrix_alloc(&dp,(fp4_format)f,DN,DK)||fp4_quantize_f32(&dp,dw)||
+           fp4_matrix_prepare_n32(&dp)||fp4_matrix_prepare_bf16(&dp,2)||
+           fp4_gemm_reference(dr,da,&dp,DM,1)||
+           fp4_gemm_f16_bf16cache_omp(dg,da,&dp,DM,32,2))return 1;
+        double ne=0,de=0;for(int i=0;i<DM*DN;++i){double d=dg[i]-dr[i];ne+=d*d;de+=(double)dr[i]*dr[i];}
+        double re=sqrt(ne/(de+1e-30));printf("%s f16cache_m12n64_rel=%.6g\n",fp4_format_name((fp4_format)f),re);
+        if(!isfinite(re)||re>.08)return 1;fp4_matrix_free(&dp);}
+      free(dw);free(dr);free(dg);free(da);}
     {enum{TN=384,TK=64};float*tw=malloc((size_t)TN*TK*4),*tr=malloc((size_t)TN*4),*tg=malloc((size_t)TN*4);
       _Float16*ta=malloc((size_t)TK*2);fp4_matrix tp;if(!tw||!tr||!tg||!ta)return 1;
       for(int i=0;i<TN*TK;++i)tw[i]=rnd()*.25f;for(int i=0;i<TK;++i)ta[i]=(_Float16)(rnd()*.5f);

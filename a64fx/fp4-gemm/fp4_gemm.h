@@ -31,7 +31,7 @@ typedef struct {
     uint8_t *codes_t12;
     uint8_t *codes_t8_affine;
     uint32_t *codes_bitplane;
-    /* Persistent K-major BF16 sidecar: one [K][32] tile per N32 group. */
+    /* Persistent K-major FP16 sidecar: one [K][64] tile per N64 group. */
     _Float16 *weights_bf16;
     size_t weights_bf16_bytes;
     _Float16 *scales_n32;

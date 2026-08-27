@@ -90,23 +90,31 @@ limited, not HBM2-bandwidth limited. The L1 panel does not help: it ties the
 full panel at M<=6 and becomes 12% slower at M=128. Retaining the full-K panel
 in L2 gives the best reuse and traversal order.
 
-### Persistent BF16 sidecar for M>1
+### Persistent FP16 sidecar for M>1
 
-`fp4_matrix_prepare_bf16` decodes each N32 tile once into a K-major BF16
-sidecar. `fp4_gemm_f16_bf16cache_omp` reuses it across all M tokens with the
-BF16 8x3 microkernel and FP32 accumulation. On a pinned 12-core CMG with
-N=8192, K=4096, and K256 promotion:
+`fp4_matrix_prepare_bf16` (legacy API name) decodes adjacent N32 tiles into a
+K-major `[N/64][K][64]` FP16 sidecar. The timed GEMM packs A into `[K][12]`
+microtiles and uses a hand-scheduled 12x64 kernel with 24 resident FP16
+accumulators. On a pinned 12-core CMG with N=8192 and K=4096:
 
-| M | Existing L2 panel | Persistent BF16 sidecar |
+| M | K=256 FP32 promotion | Pure FP16 accumulation |
 |---:|---:|---:|
-| 6 | 39.0 GFLOP/s | 629.7 GFLOP/s |
-| 24 | 50.4 GFLOP/s | 638.5 GFLOP/s |
-| 128 | 54.0 GFLOP/s | 620.3 GFLOP/s |
+| 1 | 187 GFLOP/s | 185 GFLOP/s |
+| 6 | 1,089 GFLOP/s | 1,125 GFLOP/s |
+| 8 | **1,459 GFLOP/s** | **1,444 GFLOP/s** |
+| 12 | **1,808 GFLOP/s** | **2,187 GFLOP/s** |
+| 24 | **1,794 GFLOP/s** | **2,202 GFLOP/s** |
+| 128 | **1,712 GFLOP/s** | **2,167 GFLOP/s** |
 
-The sidecar occupies 64 MiB for this matrix (4x the packed FP4 weight
-storage). Preparation is outside repeated GEMM timing and is amortized when a
-matrix serves multiple M>1 operations. Unit tests pass for MXFP4, NVFP4 1D,
-and NVFP4 2D with the same numerical error as the existing panel path.
+These timings include activation packing and padded-tail handling, but exclude
+the persistent sidecar preparation. M=8 computes a zero-padded 12-row tile and
+copies the eight live output rows, yet still exceeds the 800 GFLOP/s target by
+82%. Complete M12 blocks reach 71% of the 3.072 TFLOP/s hardware peak and 84%
+of the previously measured 2.612 TFLOP/s streaming-FP16 software ceiling.
+
+The sidecar occupies 64 MiB for this matrix (4x the packed FP4 weight storage).
+Unit tests pass for MXFP4, NVFP4 1D, and NVFP4 2D with the same numerical error
+as the existing panel path.
 
 ### Fused 12-core CMG baseline
 

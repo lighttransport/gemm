@@ -39,7 +39,8 @@ OMP_PROC_BIND=close OMP_PLACES=cores \
 ```
 
 The implementation requires `N` and `K` divisible by 32. Arbitrary `M` is
-handled in groups of at most six activation rows.
+supported. The direct packed path uses groups of at most six activation rows;
+the persistent decoded-weight path uses padded 12-row by 64-column tiles.
 
 ## Stage DeepSeek-V4-Flash data
 
@@ -136,12 +137,16 @@ workspace is 256 KiB, so it resides in L2 rather than the 64 KiB L1. Use direct
 N32 FP4 for M<12 and the L2 panel path for M>=12. GEMM timing includes panel
 dequantization and its L2 write/read traffic.
 
-`fp4_matrix_prepare_bf16` builds a persistent K-major BF16 sidecar for every
-N32 tile. `fp4_gemm_f16_bf16cache_omp` reuses that sidecar across M tokens and
-uses the BF16 8x3 microkernel with FP32 accumulators. This is preferred when a
-matrix is reused for multiple M>1 GEMMs: it costs 4x the packed weight storage
-but removes FP4 decode from the timed GEMM. The sidecar is validated against
-the FP4 reference for MXFP4 and both NVFP4 layouts.
+`fp4_matrix_prepare_bf16` (legacy API name) builds a persistent K-major FP16
+sidecar arranged as `[N/64][K][64]`. `fp4_gemm_f16_bf16cache_omp` packs each
+12-row activation tile as `[K][12]` and invokes a hand-scheduled 12x64 SVE
+microkernel with 24 FP16 accumulators. K-block boundaries convert to FP32 and
+accumulate into the FP32 output. This is preferred when a matrix is reused for
+multiple M>1 GEMMs: it costs 4x the packed weight storage but removes FP4
+decode from the timed repeated GEMM. Activation packing remains inside the
+reported kernel time. Padded M and N tails use a private output tile, so the
+public requirement remains only that N and K are divisible by 32. The sidecar
+is validated against the FP4 reference for MXFP4 and both NVFP4 layouts.
 
 ## INT8 SDOT re-encoding
 

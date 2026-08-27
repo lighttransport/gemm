@@ -192,3 +192,12 @@ the intended workload, or materially reduces memory without dropping below
 - Memory accounting: benchmark output distinguishes packed model bytes,
   decoded sidecar bytes, packed-A workspace, and timed preparation cost.
 
+## First implementation result
+
+The N64 sidecar and MR12 x NR64 assembly phases were implemented after this
+plan was committed.  With N=8192, K=4096, 12 pinned cores, and HBM node 4, the
+packing-inclusive K=256 results are 1.459 TFLOP/s at M=8, 1.808 TFLOP/s at
+M=12, 1.794 TFLOP/s at M=24, and 1.712 TFLOP/s at M=128.  Pure FP16 reaches
+2.20 TFLOP/s at M=24.  The primary 800 GFLOP/s gate and the 1.5 TFLOP/s
+stretch gate are therefore satisfied.  All three FP4 format tests retain the
+same relative-L2 error as the previous decoded-panel path.

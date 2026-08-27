@@ -30,8 +30,10 @@ static void run_direct_omp(float*c,const _Float16*a,const fp4_matrix*w,int m,int
 static void run_cache(float*c,const _Float16*a,const fp4_matrix*w,int m,int kc,int threads){
     fp4_gemm_f16_bf16cache_omp(c,a,w,m,kc,threads); double best=1e9;
     for(int r=0;r<3;++r){double t=now();fp4_gemm_f16_bf16cache_omp(c,a,w,m,kc,threads);double d=now()-t;if(d<best)best=d;}
-    printf("kernel=bf16cache threads=%d M=%d kc=%d ms=%.2f gflops=%.2f sidecar_MiB=%.2f\n",
-        threads,m,kc,best*1e3,2.0*m*w->n*w->k/best/1e9,w->weights_bf16_bytes/1048576.0);
+    size_t packed_a=(size_t)((m+11)/12)*w->k*12*sizeof(*a);
+    printf("kernel=f16cache_m12n64 threads=%d M=%d kc=%d ms=%.2f gflops=%.2f sidecar_MiB=%.2f packed_A_KiB=%.1f\n",
+        threads,m,kc,best*1e3,2.0*m*w->n*w->k/best/1e9,
+        w->weights_bf16_bytes/1048576.0,packed_a/1024.0);
 }
 static void run_half_omp(float*c,const _Float16*a,const fp4_matrix*w,int kc,size_t src,int threads){
     fp4_gemm_f16_half_omp(c,a,w,1,kc,threads);double best=1e9;
@@ -157,8 +159,10 @@ int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):32768,k=argc>2?atoi(arg
       if(ag<=16){kt=run_pair_tbl_omp(c,&qa,&w,source,12);
         printf("pair_tbl_end_to_end_once gflops=%.2f\n",2.0*n*k/(qt+kt)/1e9);}
       fp4_pair_activation_free(&qa);free(af);free(c);fp4_matrix_free(&w);return 0;}
-    if(fp4_matrix_prepare_bf16(&w,12))return 1;
-    int ms[]={1,6,24,128};for(int z=0;z<4;++z){int m=ms[z];
+    double sidecar_t=now();if(fp4_matrix_prepare_bf16(&w,12))return 1;sidecar_t=now()-sidecar_t;
+    printf("f16_sidecar_prepare_ms=%.3f sidecar_MiB=%.2f\n",
+      sidecar_t*1e3,w.weights_bf16_bytes/1048576.0);
+    int ms[]={1,6,8,12,24,128};for(int z=0;z<6;++z){int m=ms[z];
       _Float16*a=aa((size_t)m*k*2);float*c=aa((size_t)m*n*4);if(!a||!c)return 1;
       for(size_t i=0;i<(size_t)m*k;++i)a[i]=(_Float16)((int)(rnd()&255)-128)/512;
       run("direct",fp4_gemm_f16_n32,c,a,&w,m,kc,source*((m+5)/6));
