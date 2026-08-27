@@ -1807,6 +1807,133 @@ static void attn_prof_print(void) {
     fprintf(stderr, "  %-8s %.3f s\n", "sum", tot);
 }
 
+/* ── flash-attention-style body (gated by VLM_FLASH=1) ──
+ * Folds the softmax into the QK^T/AV loop so the only live per-thread scratch
+ * is O (q_tile x head_dim), m/l (q_tile) and the current K-tile scores
+ * (q_tile x K_TILE) -- ~11 KB, inside L1, instead of the full q_tile x np
+ * score matrix (256 KB, L2). Cost: the output O is rescaled every K-tile
+ * (O = O*alpha + P . V), which is the trade we are testing. */
+static inline float flash_softmax_tile(float *row, int kt, float *m, float *l) {
+    const svbool_t pg = svptrue_b32();
+    const int VL = (int)svcntw();
+    const svfloat32_t vlog2e = svdup_f32(LOG2E);
+    const svfloat32_t vshift = svdup_f32(fexpa_shift_f32());
+    svfloat32_t vmax = svdup_f32(-FLT_MAX);
+    int nv = kt - (kt % VL);
+    for (int i = 0; i < nv; i += VL)
+        vmax = svmax_f32_x(pg, vmax, svld1_f32(pg, row + i));
+    if (nv < kt) {
+        svbool_t pt = svwhilelt_b32_s32(nv, kt);
+        vmax = svmax_f32_m(pt, vmax, svld1_f32(pt, row + nv));
+    }
+    float m_new = fmaxf(*m, svmaxv_f32(pg, vmax));
+    float alpha = expf(*m - m_new);   /* first tile: expf(-inf)=0 */
+    svfloat32_t vsum = svdup_f32(0.0f);
+    const svfloat32_t vmn = svdup_f32(m_new);
+    for (int i = 0; i < nv; i += VL) {
+        svfloat32_t v = svsub_f32_x(pg, svld1_f32(pg, row + i), vmn);
+        svfloat32_t e = sve_exp_fexpa(pg, v, vlog2e, vshift);
+        vsum = svadd_f32_x(pg, vsum, e);
+        svst1_f32(pg, row + i, e);
+    }
+    if (nv < kt) {
+        svbool_t pt = svwhilelt_b32_s32(nv, kt);
+        svfloat32_t v = svsub_f32_m(pt, svld1_f32(pt, row + nv), vmn);
+        svfloat32_t e = sve_exp_fexpa(pt, v, vlog2e, vshift);
+        vsum = svadd_f32_m(pt, vsum, e);
+        svst1_f32(pt, row + nv, e);
+    }
+    *l = (*l) * alpha + svaddv_f32(pg, vsum);
+    *m = m_new;
+    return alpha;
+}
+
+/* O = O*alpha + P . V over np keys, head_dim = 8*VL (Kimi-K3 hd=128). Loads O
+ * once (rescaled by alpha), accumulates P . V, stores O once. */
+static inline void av_acc_rescale(const float *P, const float *V_h, int np,
+                                  int hd, float alpha, float *O) {
+    const svbool_t pg = svptrue_b32();
+    const int VL = (int)svcntw();
+    if (hd != 8 * VL) {
+        for (int d = 0; d < hd; d++) {
+            float acc = O[d] * alpha;
+            for (int k = 0; k < np; k++) acc += P[k] * V_h[(size_t)k * hd + d];
+            O[d] = acc;
+        }
+        return;
+    }
+    svfloat32_t a0=svld1_f32(pg,O),a1=svld1_f32(pg,O+VL),a2=svld1_f32(pg,O+2*VL),a3=svld1_f32(pg,O+3*VL);
+    svfloat32_t a4=svld1_f32(pg,O+4*VL),a5=svld1_f32(pg,O+5*VL),a6=svld1_f32(pg,O+6*VL),a7=svld1_f32(pg,O+7*VL);
+    const svfloat32_t va = svdup_f32(alpha);
+    a0=svmul_f32_x(pg,a0,va);a1=svmul_f32_x(pg,a1,va);a2=svmul_f32_x(pg,a2,va);a3=svmul_f32_x(pg,a3,va);
+    a4=svmul_f32_x(pg,a4,va);a5=svmul_f32_x(pg,a5,va);a6=svmul_f32_x(pg,a6,va);a7=svmul_f32_x(pg,a7,va);
+    for (int k = 0; k < np; k++) {
+        const float *vh = V_h + (size_t)k * hd;
+        float w = P[k];
+        svfloat32_t v0=svld1_f32(pg,vh),v1=svld1_f32(pg,vh+VL),v2=svld1_f32(pg,vh+2*VL),v3=svld1_f32(pg,vh+3*VL);
+        svfloat32_t v4=svld1_f32(pg,vh+4*VL),v5=svld1_f32(pg,vh+5*VL),v6=svld1_f32(pg,vh+6*VL),v7=svld1_f32(pg,vh+7*VL);
+        a0=svmla_n_f32_x(pg,a0,v0,w);a1=svmla_n_f32_x(pg,a1,v1,w);a2=svmla_n_f32_x(pg,a2,v2,w);a3=svmla_n_f32_x(pg,a3,v3,w);
+        a4=svmla_n_f32_x(pg,a4,v4,w);a5=svmla_n_f32_x(pg,a5,v5,w);a6=svmla_n_f32_x(pg,a6,v6,w);a7=svmla_n_f32_x(pg,a7,v7,w);
+    }
+    svst1_f32(pg,O,a0);svst1_f32(pg,O+VL,a1);svst1_f32(pg,O+2*VL,a2);svst1_f32(pg,O+3*VL,a3);
+    svst1_f32(pg,O+4*VL,a4);svst1_f32(pg,O+5*VL,a5);svst1_f32(pg,O+6*VL,a6);svst1_f32(pg,O+7*VL,a7);
+}
+
+static void flash_attn_body(int tid, int w0, int w1, void *arg) {
+    attn_args *a = (attn_args *)arg;
+    int np = a->n_patches, dim = a->dim, hd = a->head_dim, qt = a->q_tile, nqt = a->n_qtiles;
+    float scale = a->scale;
+    const int KT = 48;
+    /* one scratch: O[qtile*hd] | m[qtile] | l[qtile] | S[qtile*KT] */
+    float *sc = (float *)vlm_pool_scratch(a->pool, tid,
+        (size_t)qt * (hd + KT + 2) * sizeof(float));
+    float *O = sc;
+    float *m = sc + (size_t)qt * hd;
+    float *l = sc + (size_t)qt * hd + qt;
+    float *S = sc + (size_t)qt * hd + 2 * qt;
+    for (int w = w0; w < w1; w++) {
+        int h = w / nqt, q0 = (w % nqt) * qt;
+        int q1 = q0 + qt; if (q1 > np) q1 = np;
+        int nq = q1 - q0;
+        const float *Q_h  = a->Q_hm  + (size_t)h * np * hd;
+        const float *KT_h = a->KT_hm + (size_t)h * hd * np;
+        const float *V_h  = a->V_hm  + (size_t)h * np * hd;
+        memset(O, 0, (size_t)nq * hd * sizeof(float));
+        for (int i = 0; i < nq; i++) { m[i] = -INFINITY; l[i] = 0.0f; }
+        for (int ki = 0; ki < np; ki += KT) {
+            int kt = KT; if (ki + kt > np) kt = np - ki;
+            /* QK^T -> score tile (scale folded into the softmax). The 8q x 48k
+             * kernel reads 48 K keys, so it is only valid for full K-tiles; the
+             * last (partial) K-tile must use the per-query 1q kernel. */
+            if (kt == KT) {
+                for (int qi2 = 0; qi2 + 8 <= nq; qi2 += 8)
+                    qk_vert_8q_48k(Q_h + (size_t)(q0 + qi2) * hd, KT_h + ki, hd, np,
+                                   scale, S + (size_t)qi2 * KT, KT);
+                for (int qi2 = (nq / 8) * 8; qi2 < nq; qi2++)
+                    qk_vert_1q(Q_h + (size_t)(q0 + qi2) * hd, KT_h + ki, hd, kt, np,
+                               scale, S + (size_t)qi2 * KT);
+            } else {
+                for (int qi2 = 0; qi2 < nq; qi2++)
+                    qk_vert_1q(Q_h + (size_t)(q0 + qi2) * hd, KT_h + ki, hd, kt, np,
+                               scale, S + (size_t)qi2 * KT);
+            }
+            /* fused softmax + rescale-accumulate AV */
+            for (int qi2 = 0; qi2 < nq; qi2++) {
+                float alpha = flash_softmax_tile(S + (size_t)qi2 * KT, kt, &m[qi2], &l[qi2]);
+                av_acc_rescale(S + (size_t)qi2 * KT, V_h + (size_t)ki * hd, kt, hd,
+                               alpha, O + (size_t)qi2 * hd);
+            }
+        }
+        /* normalize and write to the interleaved attn_out [np, dim] */
+        for (int qi2 = 0; qi2 < nq; qi2++) {
+            float invl = 1.0f / l[qi2];
+            float *o = O + (size_t)qi2 * hd;
+            float *dst = a->attn_out + (size_t)(q0 + qi2) * dim + h * hd;
+            for (int d = 0; d < hd; d++) dst[d] = o[d] * invl;
+        }
+    }
+}
+
 static void attn_body(int tid, int w0, int w1, void *arg) {
     attn_args *a = (attn_args *)arg;
     int np = a->n_patches;
@@ -1934,7 +2061,11 @@ static void attention_mt(vlm_pool *pool,
     int n_qtiles = (n_patches + q_tile - 1) / q_tile;
     attn_args a = { Q_hm, KT_hm, V_hm, attn_out, n_patches, dim, head_dim,
                     n_heads, scale, q_tile, n_qtiles, pool };
-    vlm_parallel_for(pool, n_heads * n_qtiles, 1, attn_body, &a);
+    const char *flash_env = getenv("VLM_FLASH");
+    if (flash_env && atoi(flash_env))
+        vlm_parallel_for(pool, n_heads * n_qtiles, 1, flash_attn_body, &a);
+    else
+        vlm_parallel_for(pool, n_heads * n_qtiles, 1, attn_body, &a);
 }
 
 /* ───────────────────────── patch embedding ───────────────────────── */
