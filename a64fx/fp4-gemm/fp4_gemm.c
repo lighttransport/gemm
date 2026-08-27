@@ -1005,6 +1005,30 @@ static inline void dense_panel_m6(float*c,const _Float16*a,const _Float16*p,
     PANEL_STORE(3,h3);PANEL_STORE(4,h4);PANEL_STORE(5,h5);
 #undef PANEL_STORE
 }
+
+/* Eight-row variant used by the persistent decoded-weight path.  Keeping one
+ * weight vector live across eight tokens avoids reloading the sidecar for the
+ * common M>=8 batched GEMM case. */
+static inline void dense_panel_m8(float*c,const _Float16*a,const _Float16*p,
+        int k,int n,int tile,int kbegin,int kend,int panel_k0,int rows,int add){
+    svbool_t ph=svptrue_b16(),ps=svptrue_b32();
+    svfloat16_t h0=svdup_f16(0),h1=h0,h2=h0,h3=h0,h4=h0,h5=h0,h6=h0,h7=h0;
+    for(int x=kbegin;x<kend;++x){svfloat16_t wv=svld1_f16(ph,(const __fp16*)(p+(size_t)(x-panel_k0)*32));
+#define PANEL8_FMA(I,H) do{if(rows>(I))(H)=svmla_n_f16_x(ph,(H),wv,(__fp16)a[(size_t)(I)*k+x]);}while(0)
+        PANEL8_FMA(0,h0);PANEL8_FMA(1,h1);PANEL8_FMA(2,h2);PANEL8_FMA(3,h3);
+        PANEL8_FMA(4,h4);PANEL8_FMA(5,h5);PANEL8_FMA(6,h6);PANEL8_FMA(7,h7);
+#undef PANEL8_FMA
+    }
+#define PANEL8_STORE(I,H) do{if(rows>(I)){svuint16_t hb=svreinterpret_u16_f16(H); \
+        svfloat32_t lo=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpklo_u32(hb))); \
+        svfloat32_t hi=svcvt_f32_f16_x(ps,svreinterpret_f16_u32(svunpkhi_u32(hb))); \
+        float*d=c+(size_t)(I)*n+tile*32;if(add){lo=svadd_f32_x(ps,lo,svld1_f32(ps,d)); \
+        hi=svadd_f32_x(ps,hi,svld1_f32(ps,d+16));}svst1_f32(ps,d,lo);svst1_f32(ps,d+16,hi);}}while(0)
+    PANEL8_STORE(0,h0);PANEL8_STORE(1,h1);PANEL8_STORE(2,h2);PANEL8_STORE(3,h3);
+    PANEL8_STORE(4,h4);PANEL8_STORE(5,h5);PANEL8_STORE(6,h6);PANEL8_STORE(7,h7);
+#undef PANEL8_STORE
+}
+
 #endif
 
 int fp4_matrix_prepare_bf16(fp4_matrix *p, int threads) {
@@ -1038,11 +1062,11 @@ int fp4_gemm_f16_bf16cache_omp(float *c, const _Float16 *a,
 #pragma omp parallel for num_threads(threads) schedule(static)
     for (int tile = 0; tile < w->n / 32; ++tile) {
         const _Float16 *panel = w->weights_bf16 + (size_t)tile * tile_elems;
-        for (int m0 = 0; m0 < m; m0 += 6) {
-            int mr = m - m0 < 6 ? m - m0 : 6;
+        for (int m0 = 0; m0 < m; m0 += 8) {
+            int mr = m - m0 < 8 ? m - m0 : 8;
             for (int kb = 0; kb < w->k; kb += span) {
                 int ke = kb + span < w->k ? kb + span : w->k;
-                dense_panel_m6(c + (size_t)m0 * w->n,
+                dense_panel_m8(c + (size_t)m0 * w->n,
                     a + (size_t)m0 * w->k, panel, w->k, w->n,
                     tile, kb, ke, 0, mr, kb != 0);
             }
