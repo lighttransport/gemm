@@ -41,6 +41,11 @@ const st_tensor_info *glm53f_st_find(const glm53f_st_context *ctx, const char *n
                                      const st_context **owner);
 int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose);
 
+/* Validate one role before binding it to a graph buffer.  Shapes are in
+ * safetensors row-major order (the checkpoint's output/input convention). */
+int glm53f_st_expect(const glm53f_st_context *ctx, const char *name,
+                     const char *dtype, int n_dims, const uint64_t *shape);
+
 #ifdef GLM53F_SAFETENSORS_IMPLEMENTATION
 
 #include <stdio.h>
@@ -155,6 +160,15 @@ const st_tensor_info *glm53f_st_find(const glm53f_st_context *ctx, const char *n
     return NULL;
 }
 
+int glm53f_st_expect(const glm53f_st_context *ctx, const char *name,
+                     const char *dtype, int n_dims, const uint64_t *shape) {
+    const st_tensor_info *t = glm53f_st_find(ctx, name, NULL);
+    int d;
+    if (!t || (dtype && strcmp(t->dtype_str, dtype)) || t->n_dims != n_dims) return -1;
+    for (d = 0; d < n_dims; ++d) if (t->shape[d] != shape[d]) return -1;
+    return 0;
+}
+
 int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose) {
     const char *required[] = {
         "model.language_model.embed_tokens.weight",
@@ -164,10 +178,37 @@ int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose) {
         "model.language_model.layers.3.self_attn.indexer.k_norm.weight",
         "model.language_model.layers.3.mlp.gate.weight"
     };
-    int i, missing = 0, layers = 0, experts = 0;
+    int i, missing = 0, layers = 0, experts = 0, shape_errors = 0;
     char name[128];
+    static const uint64_t s_embed[] = {154880, 4096};
+    static const uint64_t s_hidden[] = {4096};
+    static const uint64_t s_l0_q[] = {8192, 4096};
+    static const uint64_t s_l0_ffn[] = {12288, 4096};
+    static const uint64_t s_l3_qa[] = {1536, 4096};
+    static const uint64_t s_l3_qb[] = {16384, 1536};
+    static const uint64_t s_l3_kvb[] = {32768, 512};
+    static const uint64_t s_l3_gate[] = {288, 4096};
+    static const uint64_t s_mtp[] = {4096, 8192};
+    struct spec { const char *n, *dt; int nd; const uint64_t *sh; };
+    static const struct spec specs[] = {
+        {"model.language_model.embed_tokens.weight", "BF16", 2, s_embed},
+        {"model.language_model.norm.weight", "BF16", 1, s_hidden},
+        {"lm_head.weight", "BF16", 2, s_embed},
+        {"model.language_model.layers.0.self_attn.q_proj.weight", "BF16", 2, s_l0_q},
+        {"model.language_model.layers.0.mlp.gate_proj.weight", "F8_E4M3", 2, s_l0_ffn},
+        {"model.language_model.layers.3.self_attn.q_a_proj.weight", "F8_E4M3", 2, s_l3_qa},
+        {"model.language_model.layers.3.self_attn.q_b_proj.weight", "F8_E4M3", 2, s_l3_qb},
+        {"model.language_model.layers.3.self_attn.kv_b_proj.weight", "BF16", 2, s_l3_kvb},
+        {"model.language_model.layers.3.mlp.gate.weight", "BF16", 2, s_l3_gate},
+        {"model.language_model.layers.45.eh_proj.weight", "BF16", 2, s_mtp}
+    };
     for (i = 0; i < (int)(sizeof(required) / sizeof(required[0])); ++i)
         if (!glm53f_st_find(ctx, required[i], NULL)) { missing++; if (verbose) fprintf(stderr, "missing %s\n", required[i]); }
+    for (i = 0; i < (int)(sizeof(specs) / sizeof(specs[0])); ++i)
+        if (glm53f_st_expect(ctx, specs[i].n, specs[i].dt, specs[i].nd, specs[i].sh) != 0) {
+            shape_errors++;
+            if (verbose) fprintf(stderr, "shape/dtype mismatch %s (expected %s)\n", specs[i].n, specs[i].dt);
+        }
     for (i = 0; i <= 45; ++i) {
         snprintf(name, sizeof(name), "model.language_model.layers.%d.input_layernorm.weight", i);
         if (glm53f_st_find(ctx, name, NULL)) layers++;
@@ -178,7 +219,7 @@ int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose) {
     }
     if (verbose) fprintf(stderr, "glm53f_st: entries=%d shards=%d layers=%d moe_layers=%d\n",
                          ctx ? ctx->n_entries : 0, ctx ? ctx->n_shards : 0, layers, experts);
-    return ctx && missing == 0 && layers == 46 && experts == 43 ? 0 : -1;
+    return ctx && missing == 0 && shape_errors == 0 && layers == 46 && experts == 43 ? 0 : -1;
 }
 
 #endif
