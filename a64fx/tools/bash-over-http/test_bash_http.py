@@ -10,6 +10,7 @@ side needs `requests`.
     python3 test_bash_http.py
 """
 
+import os
 import threading
 import time
 import unittest
@@ -20,6 +21,7 @@ import bash_http_server as srv
 import bash_http_client as bh
 
 _httpd = None
+TEST_CWD = os.path.dirname(os.path.abspath(__file__))
 
 
 def setUpModule():
@@ -50,12 +52,12 @@ class CoreBehavior(unittest.TestCase):
             pass
 
     def test_state_persists_across_runs(self):
-        bh.run(self.sid, "cd /tmp")
+        bh.run(self.sid, "cd " + TEST_CWD)
         bh.run(self.sid, "X=42")
         r = bh.run(self.sid, "echo $X; pwd")
         self.assertEqual(r["code"], 0)
         self.assertIn("42", r["stdout"])
-        self.assertIn("/tmp", r["stdout"])
+        self.assertIn(TEST_CWD, r["stdout"])
 
     def test_exit_code_propagates(self):
         self.assertEqual(bh.run(self.sid, "true")["code"], 0)
@@ -188,10 +190,10 @@ class Introspection(unittest.TestCase):
     def test_sessions_lists_cwd_and_busy(self):
         sid = bh.new_session()
         self.addCleanup(lambda: bh.close(sid))
-        bh.run(sid, "cd /tmp")
+        bh.run(sid, "cd " + TEST_CWD)
         infos = {s["session"]: s for s in bh.sessions()}
         self.assertIn(sid, infos)
-        self.assertTrue(infos[sid]["cwd"].endswith("/tmp"))
+        self.assertEqual(infos[sid]["cwd"], TEST_CWD)
         self.assertFalse(infos[sid]["busy"])  # idle right now
 
 
@@ -219,8 +221,8 @@ class NewFeatures(unittest.TestCase):
     def test_shell_context_manager(self):
         with bh.Shell() as sh:
             sid = sh.id
-            sh.run("cd /tmp")
-            self.assertEqual(sh.run("pwd").stdout.strip(), "/tmp")
+            sh.run("cd " + TEST_CWD)
+            self.assertEqual(sh.run("pwd").stdout.strip(), TEST_CWD)
         # session auto-closed on exit
         self.assertNotIn(sid, {s["session"] for s in bh.sessions()})
 

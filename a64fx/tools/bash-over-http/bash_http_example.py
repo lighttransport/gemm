@@ -10,13 +10,15 @@ Then run this example:
     python3 bash_http_example.py
 
 Demonstrates, against a single session:
-  1. cd /tmp && pwd
+  1. cd to the current remote working directory and print it
   2. X=42; echo set
-  3. echo $X; pwd          -> 42 and /tmp (state persists across calls)
+  3. echo $X; pwd          -> 42 and the same directory (state persists)
   4. a streaming job        -> printed incrementally via on_stdout
   5. a truncation demo      -> truncated: true with a tiny max_bytes
 """
 
+import os
+import shlex
 import sys
 
 import bash_http_client as bh
@@ -25,9 +27,11 @@ import bash_http_client as bh
 def main():
     sid = bh.new_session()
     print("session: %s\n" % sid)
+    workdir = os.getcwd()
+    cd_workdir = "cd " + shlex.quote(workdir)
 
-    print("== 1. cd /tmp && pwd ==")
-    r = bh.run(sid, "cd /tmp && pwd")
+    print("== 1. cd to the current remote working directory && pwd ==")
+    r = bh.run(sid, cd_workdir + " && pwd")
     print("output: %r  code=%s\n" % (r["stdout"].strip(), r["code"]))
 
     print("== 2. X=42; echo set ==")
@@ -37,7 +41,7 @@ def main():
     print("== 3. echo $X; pwd  (proves state persistence) ==")
     r = bh.run(sid, "echo $X; pwd")
     print("output: %r  code=%s" % (r["stdout"].strip(), r["code"]))
-    assert "42" in r["stdout"] and "/tmp" in r["stdout"], "state did not persist!"
+    assert "42" in r["stdout"] and workdir in r["stdout"], "state did not persist!"
     print("state persisted ✓\n")
 
     print("== 4. streaming: for i in 1 2 3; do echo $i; sleep 1; done ==")

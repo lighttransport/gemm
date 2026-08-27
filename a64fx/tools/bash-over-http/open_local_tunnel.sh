@@ -1,19 +1,27 @@
 #!/bin/bash
 set -euo pipefail
 
-# Fugaku frontend login node to pin (1..8) -> loginN.fugaku.r-ccs.riken.jp.
-# Set this (or REMOTE) before launch to choose the frontend; the node is recorded
-# in state.env so submit/close follow it.
+# Pin the local forward to the configured SSH target. The repository's
+# `fugaku1` alias resolves to login1; set REMOTE to use another login host.
 LOGIN_NODE=${LOGIN_NODE:-1}
 case "$LOGIN_NODE" in [1-8]) ;; *) echo "LOGIN_NODE must be 1..8 (got '$LOGIN_NODE')" >&2; exit 2 ;; esac
-REMOTE=${REMOTE:-login${LOGIN_NODE}.fugaku.r-ccs.riken.jp}
-LOCAL_PORT=${LOCAL_PORT:-21364}
-REMOTE_PORT=${REMOTE_PORT:-21364}
-CONTROL_DIR=${CONTROL_DIR:-/tmp/ds4p-bash-http}
+REMOTE=${REMOTE:-fugaku1}
+LOCAL_PORT=${LOCAL_PORT:-42386}
+REMOTE_PORT=${REMOTE_PORT:-32386}
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    CONTROL_ROOT=$XDG_RUNTIME_DIR
+elif [[ -d /local ]]; then
+    CONTROL_ROOT=/local
+else
+    CONTROL_ROOT=tmp
+fi
+CONTROL_DIR=${CONTROL_DIR:-$CONTROL_ROOT/clair-bash-http-${USER}}
 CONTROL_PATH=${CONTROL_PATH:-$CONTROL_DIR/cm-%r@%h:%p}
 STATE_FILE=${STATE_FILE:-$CONTROL_DIR/state.env}
 
+umask 077
 mkdir -p "$CONTROL_DIR"
+chmod 700 "$CONTROL_DIR"
 
 if ssh -o ControlPath="$CONTROL_PATH" -O check "$REMOTE" >/dev/null 2>&1; then
     :
@@ -41,6 +49,8 @@ REMOTE_PORT=$REMOTE_PORT
 CONTROL_PATH=$CONTROL_PATH
 STATE_FILE=$STATE_FILE
 EOF
+
+chmod 600 "$STATE_FILE"
 
 echo "REMOTE_HOST=$REMOTE_HOST"
 echo "REMOTE_IPV4=$REMOTE_IPV4"

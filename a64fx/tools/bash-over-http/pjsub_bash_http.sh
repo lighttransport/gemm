@@ -1,32 +1,33 @@
 #!/bin/bash
-# One-node Fugaku batch job that exposes bash-over-http from the compute node
+# Fugaku batch job that exposes bash-over-http from the compute node
 # back to a pinned frontend through an SSH reverse tunnel.
 #
 # The reverse tunnel is SUPERVISED: if it drops (network blip, frontend bounce),
 # it is re-established — re-selecting a reachable frontend target each time — up
 # to MAX_RETRY consecutive failures before the job gives up. The job stays up
-# until PJM's elapse limit (small rscgrp allows up to 72:00:00) or, if
+# until PJM's elapse limit or, if
 # KEEPALIVE_SECONDS>0, that many seconds after the bridge first comes up.
 
 #PJM -g hp250467
-#PJM -L "rscgrp=small,node=1,elapse=00:20:00"
+#PJM -L "rscgrp=small,node=1,elapse=08:00:00"
 #PJM -L "freq=2000,eco_state=0"
 #PJM -j
 
 set -uo pipefail   # not -e: the supervisor loop relies on non-zero returns
+umask 077
 
 # Frontend to reverse-tunnel back to. LOGIN_NODE (1..8) -> loginN.fugaku.r-ccs.riken.jp;
-# submit_bash_http_1n_over_ssh.sh overrides FRONTEND_* explicitly via pjsub -x.
+# submit_bash_http_job.sh overrides FRONTEND_* explicitly via pjsub -x.
 LOGIN_NODE=${LOGIN_NODE:-1}
 FRONTEND_HOST=${FRONTEND_HOST:-login${LOGIN_NODE}.fugaku.r-ccs.riken.jp}
 FRONTEND_SSH_TARGET=${FRONTEND_SSH_TARGET:-$FRONTEND_HOST}
 FRONTEND_SSH_TARGETS=${FRONTEND_SSH_TARGETS:-$FRONTEND_SSH_TARGET}
-FRONTEND_PORT=${FRONTEND_PORT:-21364}
+FRONTEND_PORT=${FRONTEND_PORT:-32386}
 SERVER_PORT=${SERVER_PORT:-21264}
 SERVER_HOST=${SERVER_HOST:-127.0.0.1}
-WORKDIR=${WORKDIR:-$HOME/work/gemm/ds4p}
-TOKEN=${TOKEN:-${DS4P_BASH_HTTP_TOKEN:?set DS4P_BASH_HTTP_TOKEN (bash-over-http bearer token) before submitting}}
-LOGDIR=${LOGDIR:-$WORKDIR/tools/bash_http_job}
+A64FX_MODE=${A64FX_MODE:-normal}
+WORKDIR=${WORKDIR:-$HOME/work/gemm/glm53f}
+LOGDIR=${LOGDIR:-$WORKDIR/a64fx/tools/bash-over-http/job-logs}
 SSH_KNOWN_HOSTS=${SSH_KNOWN_HOSTS:-$LOGDIR/known_hosts}
 
 # Reconnection / lifetime knobs.
@@ -36,6 +37,7 @@ HEALTH_EVERY=${HEALTH_EVERY:-8}           # deep (through-frontend) health probe
 KEEPALIVE_SECONDS=${KEEPALIVE_SECONDS:-0} # >0: self-exit after this long; 0: run until PJM elapse
 
 mkdir -p "$LOGDIR"
+chmod 700 "$LOGDIR"
 cd "$WORKDIR" || { echo "ERROR cannot cd to WORKDIR=$WORKDIR"; exit 1; }
 
 SERVER_LOG="$LOGDIR/server.${PJM_JOBID:-nojob}.log"
@@ -50,11 +52,15 @@ echo "frontend_ssh_target=$FRONTEND_SSH_TARGET"
 echo "frontend_ssh_targets=$FRONTEND_SSH_TARGETS"
 echo "frontend_port=$FRONTEND_PORT"
 echo "server_port=$SERVER_PORT"
+echo "a64fx_mode=$A64FX_MODE"
 echo "workdir=$WORKDIR"
 echo "logdir=$LOGDIR"
 echo "max_retry=$MAX_RETRY monitor_interval=${MONITOR_INTERVAL}s keepalive_seconds=$KEEPALIVE_SECONDS"
 
 SSH_OPTS=(
+    # Required when this script is fed to `pjsub --interact` on stdin: no
+    # nested ssh command may consume the remainder of the supervisor script.
+    -n
     -o BatchMode=yes
     -o ConnectTimeout=5
     -o ExitOnForwardFailure=yes
@@ -79,11 +85,10 @@ ts() { date -u +%FT%TZ; }
 
 # Probe the local server directly (compute loopback).
 server_healthy() {
-    python3 - "$SERVER_PORT" "$TOKEN" <<'PY' >/dev/null 2>&1
+    python3 - "$SERVER_PORT" <<'PY' >/dev/null 2>&1
 import json, sys, urllib.request
-port = int(sys.argv[1]); token = sys.argv[2]
-req = urllib.request.Request("http://127.0.0.1:%d/health" % port,
-                             headers={"Authorization": "Bearer " + token})
+port = int(sys.argv[1])
+req = urllib.request.Request("http://127.0.0.1:%d/health" % port)
 with urllib.request.urlopen(req, timeout=2.0) as r:
     sys.exit(0 if json.loads(r.read().decode()).get("ok") else 1)
 PY
@@ -92,11 +97,10 @@ PY
 # Deep probe: from the frontend, curl the forwarded port (verifies the reverse tunnel end to end).
 tunnel_healthy() {
     ssh "${SSH_OPTS[@]}" "$FRONTEND_SSH_TARGET" \
-        "python3 - '$FRONTEND_PORT' '$TOKEN' <<'PY'
+        "python3 - '$FRONTEND_PORT' <<'PY'
 import json, sys, urllib.request
-port = int(sys.argv[1]); token = sys.argv[2]
-req = urllib.request.Request('http://127.0.0.1:%d/health' % port,
-                             headers={'Authorization': 'Bearer ' + token})
+port = int(sys.argv[1])
+req = urllib.request.Request('http://127.0.0.1:%d/health' % port)
 with urllib.request.urlopen(req, timeout=5.0) as r:
     sys.exit(0 if json.loads(r.read().decode()).get('ok') else 1)
 PY" >/dev/null 2>&1
@@ -124,8 +128,8 @@ open_reverse_tunnel() {
 }
 
 # --- start the bash-over-http server on the compute node ---
-python3 tools/bash_http_server.py \
-    --host "$SERVER_HOST" --port "$SERVER_PORT" --token "$TOKEN" --verbose \
+python3 a64fx/tools/bash-over-http/bash_http_server.py \
+    --host "$SERVER_HOST" --port "$SERVER_PORT" --verbose \
     >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -166,10 +170,11 @@ FRONTEND_SSH_TARGET=$FRONTEND_SSH_TARGET
 FRONTEND_SSH_TARGETS=$FRONTEND_SSH_TARGETS
 FRONTEND_PORT=$FRONTEND_PORT
 SERVER_PORT=$SERVER_PORT
-TOKEN=$TOKEN
+A64FX_MODE=$A64FX_MODE
 SERVER_LOG=$SERVER_LOG
 TUNNEL_LOG=$TUNNEL_LOG
 EOF
+chmod 600 "$RUNTIME_ENV"
 
 echo "SENTINEL bash_http_batch_ready=OK"
 echo "runtime_env=$RUNTIME_ENV"

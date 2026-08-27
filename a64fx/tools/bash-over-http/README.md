@@ -125,7 +125,7 @@ bh.close(sid)       # terminate the shell
 
 # context-manager style (auto-closes the session)
 with bh.Shell() as sh:
-    sh.run("cd /tmp")
+    sh.run("pwd")
     print(sh.run("pwd").stdout)
 
 bh.health()         # {ok, version, uptime_seconds, sessions}

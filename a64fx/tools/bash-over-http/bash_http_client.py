@@ -154,7 +154,6 @@ class Shell:
     """Context manager wrapping one session; auto-closes on exit.
 
         with bh.Shell() as sh:
-            sh.run("cd /tmp")
             print(sh.run("pwd").stdout)
     """
 

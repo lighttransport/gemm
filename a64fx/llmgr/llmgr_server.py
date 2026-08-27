@@ -23,7 +23,7 @@ Design notes
   desynchronises every rank.  Readiness is therefore read from the runner's own
   per-rank files -- see Adapter.readiness() and Child._check_ready().
 * Arbitrary shell -- the actual point of the exercise -- is delegated wholesale
-  to tools/bash_http_server.py under /bash/*, which already implements
+  to a64fx/tools/bash-over-http/bash_http_server.py under /bash/*, which already implements
   persistent PTY sessions with NDJSON streaming.
 
 Standard library only.  Binds loopback.  Bearer auth is optional (set

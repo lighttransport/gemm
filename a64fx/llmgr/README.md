@@ -25,7 +25,7 @@ invariant — *every accepted connection must reach `lsrv_bcast` exactly once, o
 the other ranks strand inside the allreduce* — stays inside the C code where it
 is already correct. llmgr never opens a rank-0 socket of its own.
 
-Arbitrary shell is delegated wholesale to `tools/bash_http_server.py` under
+Arbitrary shell is delegated wholesale to `a64fx/tools/bash-over-http/bash_http_server.py` under
 `/bash/*` (persistent PTY sessions, NDJSON streaming, `cwd` and shell variables
 survive between calls).
 
