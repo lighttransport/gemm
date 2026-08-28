@@ -159,3 +159,24 @@ FP8/MXFP4+MTP design unless real chained acceptance is effectively perfect and
 the omitted graph work is somehow free. The practical 100+ route is continuous
 batching across independent requests; MTP may still improve latency/throughput,
 but must first be evaluated in a token-correct full forward runner.
+
+### MTP numerical stability and quality gate
+
+Two independent 10,000-step, 12-rank layer-45 runs completed without NaNs,
+OOM, or collective failures. Both produced the bit-identical checksum
+`-0.000212714513`; expert compute was 0.362 ms/draft in both runs and wall
+throughput was 2,005.5 / 1,956.7 partial drafts/s. Rank-0 MemAvailable stayed
+near 29.05 GiB. The stager's full-payload scan rejects E4M3 `0x7f/0xff`, and all
+12 routed/shared stages completed that contract.
+
+`glm53f_mtp_expert_check.c` validates a real staged rank-0 layer-45 expert shard
+against the scalar FP8 reference. The 48-thread SVE path is finite and passes at
+`max_abs=4.002e-11`, `rel_l2=3.618e-7` for the full gate/up/SiLU/down operation.
+
+This establishes payload and expert-kernel numerical stability, not language
+quality. Draft acceptance alpha, greedy token agreement, and long-text quality
+cannot be measured by the present partial runner because attention projections,
+cache semantics, `eh_proj`, normalization, and the vocabulary head are not yet
+connected into a token-correct GLM-5.3F forward graph. Any alpha reported before
+that graph exists would be synthetic and must not be used for the speculative
+decode decision.
