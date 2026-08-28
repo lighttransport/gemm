@@ -187,8 +187,16 @@ int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
                                         ctx->shards[i].name) >= (int)sizeof(path)) return -1;
     fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
-    if (pread(fd, dst, nbytes, (off_t)(owner->data_offset + t->offset + offset)) == (ssize_t)nbytes)
+    if (pread(fd, dst, nbytes, (off_t)(owner->data_offset + t->offset + offset)) == (ssize_t)nbytes) {
         rc = 0;
+#if defined(POSIX_FADV_DONTNEED)
+        /* Staging reads tens of GiB into bounded scratch.  Do not let source
+         * pages evict resident weights or create a transient 2x footprint. */
+        if (!getenv("GLM53F_STAGE_KEEPCACHE"))
+            posix_fadvise(fd, (off_t)(owner->data_offset + t->offset + offset),
+                          (off_t)nbytes, POSIX_FADV_DONTNEED);
+#endif
+    }
     close(fd);
     return rc;
 }
