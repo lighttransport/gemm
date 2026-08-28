@@ -84,4 +84,16 @@ static inline void glm53f_balanced_slice(int n, int part, int parts, int *begin,
     if (count) *count = b - a;
 }
 
+static inline int glm53f_block_aligned_slice(
+        int n, int block, int part, int parts, int *begin, int *count) {
+    if (n < 1 || block < 1 || n % block || parts < 1 || part < 0 || part >= parts)
+        return -1;
+    int blocks = n / block;
+    int a = blocks * part / parts, b = blocks * (part + 1) / parts;
+    if (a == b) return -1;
+    if (begin) *begin = a * block;
+    if (count) *count = (b - a) * block;
+    return 0;
+}
+
 #endif

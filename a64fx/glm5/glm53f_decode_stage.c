@@ -34,10 +34,12 @@ static int read_tensor(glm53f_st_context*st,const char*name,void**buf,size_t*cap
 static int put_rows(int fd,uint64_t*off,FILE*mf,glm53f_st_context*st,const char*src,
                     const char*dst,int r0,int nr,int manifest_rows,int fuse_append,void**buf,size_t*cap){
     const st_tensor_info*t;size_t rowb,nb;uint64_t begin;
-    if(read_tensor(st,src,buf,cap,&t)||t->n_dims!=2)return-1;
+    t=glm53f_st_find(st,src,NULL);if(!t||t->n_dims!=2)return-1;
     rowb=t->nbytes/(size_t)t->shape[0];begin=(uint64_t)r0*rowb;nb=(size_t)nr*rowb;
+    if(*cap<nb){void*p=realloc(*buf,nb);if(!p)return-1;*buf=p;*cap=nb;}
+    if(glm53f_st_read(st,src,(size_t)begin,*buf,nb))return-1;
     if(!fuse_append&&align_fd(fd,off))return-1;
-    if(write_all(fd,(unsigned char*)*buf+begin,nb))return-1;
+    if(write_all(fd,*buf,nb))return-1;
     if(!fuse_append)fprintf(mf,"%"PRIu64" %s %d %d %"PRIu64" axis=0 begin=%d global=%"PRIu64" %s\n",
                             *off,t->dtype_str,2,manifest_rows,t->shape[1],r0,t->shape[0],dst);
     *off+=nb;return 0;
@@ -63,13 +65,17 @@ int main(int argc,char**argv){
     uint64_t off=0,last_sync=0,flush=1ull<<30;int nt=0,fd=-1;FILE*mf=NULL;double t0=now_sec();
     if(!model){const char*h=getenv("HOME");snprintf(model_dflt,sizeof model_dflt,"%s/models/glm53f",h?h:".");model=model_dflt;}
     if(!out||!*out){snprintf(out_dflt,sizeof out_dflt,"/local/glm53f-decode-%s",getenv("PJM_JOBID")?getenv("PJM_JOBID"):"manual");out=out_dflt;}
-    if(rank<0||rank>=ranks||parts<1||ranks%parts||first<3||last>45||first>=last)return 2;
+    if(rank<0||rank>=ranks||parts<1||parts>16||ranks%parts||first<3||last>45||first>=last)return 2;
     mkdir(out,0755);snprintf(bp,sizeof bp,"%s/rank%02d.blob",out,rank);snprintf(mp,sizeof mp,"%s/rank%02d.manifest",out,rank);
     st=glm53f_st_open(model);if(!st||glm53f_st_validate_contract(st,0)){fprintf(stderr,"checkpoint failed\n");return 2;}
     fd=open(bp,O_CREAT|O_TRUNC|O_WRONLY,0644);mf=fopen(mp,"w");if(fd<0||!mf){perror("stage output");return 2;}
     fprintf(mf,"# GLM53F_DECODE rank=%d ranks=%d expert_parts=%d layers=%d:%d\n",rank,ranks,parts,first,last);
     for(int l=first;l<last;l++)for(int e=0;e<288;e++){
-        int p=owned_part(e,rank,parts,ranks),b,n;if(p<0)continue;glm53f_balanced_slice(2048,p,parts,&b,&n);
+        int p=owned_part(e,rank,parts,ranks),b,n;if(p<0)continue;
+        /* F8 scales cover 128x128 blocks, so expert partitions must start and
+         * end on a scale-block boundary. This is identical to equal slicing
+         * for 1/2/4 parts and gives valid 128/256-row shards for 12 parts. */
+        if(glm53f_block_aligned_slice(2048,128,p,parts,&b,&n))goto fail;
 #define NM(S) snprintf(name,sizeof name,"model.language_model.layers.%d.mlp.experts.%d.%s",l,e,S)
 #define VM(S) snprintf(virt,sizeof virt,"model.language_model.layers.%d.mlp.experts.%d.%s",l,e,S)
         NM("gate_proj.weight");VM("gate_up_fused.weight");if(put_rows(fd,&off,mf,st,name,virt,b,n,2*n,0,&buf,&cap))goto fail;

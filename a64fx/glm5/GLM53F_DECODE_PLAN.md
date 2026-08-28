@@ -15,6 +15,12 @@
   A four-task/four-CMG kernel reduces the measured batch critical path to
   **1.13 ms mean / 0.424 ms best** while the background full-model stager is
   active. Repeat the steady-state number after staging exits.
+- Full 42-layer, 12-rank four-way expert decode with 23.631 GiB anonymous
+  weights/rank and one real 4096-float MPI combine/layer: **47.39 tok/s** over
+  200 tokens (**21.104 ms/token**). Compute is 12.615 ms/token; combine plus
+  arrival wait is 8.617 ms/token. An unloaded MPI baseline is 73.2 us/call,
+  or 3.075 ms/token, leaving **5.56 ms/token of rank-arrival skew**. Resident
+  MemAvailable is 6.0--6.45 GiB/rank.
 
 ## Decode decomposition
 
@@ -28,6 +34,13 @@ Use one process per A64FX node and all 12 ranks as the expert group.
   `{0,3,6,9}` has the lowest top-8 slowest-rank occupancy: mean 4.061 tasks,
   p95/p99 6/6. Execute local hits concurrently as independent CMG teams; the
   existing MLP hidden-vector sum combines the partial outputs.
+- Quantization-aligned 12-way slicing is the next decode experiment. Partition
+  the 16 FP8 intermediate block rows, not 2048 raw elements: each expert has
+  eight 128-wide and four 256-wide rank shards. This preserves the compressed
+  128x128 scale grid, gives every rank all eight routed tasks, and reduces the
+  simulated slowest-rank work from 16.244 to **12.061 block rows/layer**
+  (p95/p99 14/14). The full 12-way stage must beat the verified four-way
+  47.39 tok/s result before replacing the default.
 - KDA layers: partition 64 heads as balanced contiguous ranges (5 or 6/rank).
   Q/K/V, gates, convolution channels, and recurrent state follow head ownership.
   `o_proj` is column-parallel; one hidden-vector sum completes attention.
