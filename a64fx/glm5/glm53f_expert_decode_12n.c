@@ -150,6 +150,8 @@ static void route8(int token, int layer, int expert[8]) {
 
 int main(int argc, char **argv) {
     int rank, ranks, tokens = argc > 2 ? atoi(argv[2]) : 20;
+    int attention_combine = getenv("GLM53F_ATTENTION_COMBINE") ?
+        atoi(getenv("GLM53F_ATTENTION_COMBINE")) : 0;
     const char *stage = argc > 1 ? argv[1] : getenv("GLM53F_STAGE_DIR");
     const char *shared_stage = getenv("GLM53F_SHARED_STAGE_DIR");
     char blob_path[512], manifest_path[512];
@@ -158,7 +160,7 @@ int main(int argc, char **argv) {
     size_t blob_bytes = 0, shared_bytes = 0;
     shared_offset shared[NLAYERS];
     float *x, *up, *act, *out, *sum;
-    double compute = 0, combine = 0, wall0, wire_call;
+    double compute = 0, combine = 0, attention = 0, wall0, wire_call;
     long local_tasks = 0;
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -202,10 +204,22 @@ int main(int argc, char **argv) {
     int total_tokens = tokens + 1;
     wall0 = now_sec();
     for (int tok = 0; tok < total_tokens; ++tok) {
-        if (tok == 1) { MPI_Barrier(MPI_COMM_WORLD); wall0 = now_sec(); compute = combine = 0; local_tasks = 0; }
+        if (tok == 1) {
+            MPI_Barrier(MPI_COMM_WORLD);
+            wall0 = now_sec();
+            compute = combine = attention = 0;
+            local_tasks = 0;
+        }
         for (int li = 0; li < NLAYERS; ++li) {
             int selected[8], n = 0;
             glm53f_expert_part part[9];
+            if (attention_combine) {
+                memset(sum, 0, 4096 * sizeof(float));
+                double t0 = now_sec();
+                MPI_Allreduce(MPI_IN_PLACE, sum, 4096, MPI_FLOAT, MPI_SUM,
+                              MPI_COMM_WORLD);
+                attention += now_sec() - t0;
+            }
             route8(tok, li + FIRST_LAYER, selected);
             for (int k = 0; k < 8; ++k) {
                 expert_offset *p = &table[li * NEXPERTS + selected[k]];
@@ -239,18 +253,20 @@ int main(int argc, char **argv) {
             x[(li * 97 + tok) & 4095] += sum[(li * 131 + tok) & 4095] * 1e-5f;
         }
     }
-    double wall = now_sec() - wall0, max_wall, max_compute, max_combine;
+    double wall = now_sec() - wall0, max_wall, max_compute, max_combine, max_attention;
     long max_tasks;
     MPI_Reduce(&wall, &max_wall, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&compute, &max_compute, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&combine, &max_combine, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&attention, &max_attention, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_tasks, &max_tasks, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
-    if (!rank) printf("GLM53F_EXPERT_DECODE_12N tokens=%d layers=%d expert_parts_rank=%d weight_GiB_rank=%.3f max_tasks=%ld wall_ms_tok=%.3f compute_ms_tok=%.3f combine_ms_tok=%.3f wire_us_call=%.3f wire_ms_tok=%.3f arrival_ms_tok=%.3f tok_s=%.3f checksum=%.9g\n",
-        tokens, NLAYERS, manifest_entries / (NLAYERS * 4), (blob_bytes + shared_bytes) / 1073741824.0, max_tasks,
+    if (!rank) printf("GLM53F_EXPERT_DECODE_12N tokens=%d layers=%d attention_combine=%d expert_parts_rank=%d weight_GiB_rank=%.3f max_tasks=%ld wall_ms_tok=%.3f compute_ms_tok=%.3f combine_ms_tok=%.3f attention_ms_tok=%.3f wire_us_call=%.3f wire_ms_tok=%.3f arrival_ms_tok=%.3f tok_s=%.3f checksum=%.9g\n",
+        tokens, NLAYERS, attention_combine, manifest_entries / (NLAYERS * 4), (blob_bytes + shared_bytes) / 1073741824.0, max_tasks,
         max_wall * 1e3 / tokens, max_compute * 1e3 / tokens,
-        max_combine * 1e3 / tokens, wire_call * 1e6,
-        wire_call * NLAYERS * 1e3,
-        max_combine * 1e3 / tokens - wire_call * NLAYERS * 1e3,
+        max_combine * 1e3 / tokens, max_attention * 1e3 / tokens,
+        wire_call * 1e6, wire_call * NLAYERS * (attention_combine + 1) * 1e3,
+        (max_combine + max_attention) * 1e3 / tokens -
+            wire_call * NLAYERS * (attention_combine + 1) * 1e3,
         tokens / max_wall, sum[0]);
     free(sum); free(out); free(act); free(up); free(x); free(shared_blob); free(blob); free(table);
     MPI_Finalize();

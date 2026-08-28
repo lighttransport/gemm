@@ -36,6 +36,14 @@
   **2.833 ms/token** for a narrow shard and **4.234 ms/token** for a wide shard.
   Add its partial hidden output to the routed partial before the existing MLP
   combine; it does not require another collective.
+- Adding the otherwise-unloaded attention hidden-vector reduction to the matched
+  aligned routed+shared run gives **45.788 tok/s (21.840 ms/token)** over 200
+  tokens. Expert/shared compute is 15.758 ms/token, the MLP combine is 4.906 ms,
+  and the added attention combine is **2.209 ms**. The measured 84-call bare-wire
+  contribution is 6.122 ms/token and total arrival overhead is only 0.993 ms.
+  This communication-inclusive number is the current decode ceiling; it still
+  excludes attention projection GEMVs, KDA/DSA math, router, norms, mHC, and the
+  final vocabulary projection.
 
 ## Decode decomposition
 
