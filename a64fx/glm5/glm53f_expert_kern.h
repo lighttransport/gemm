@@ -4,6 +4,8 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 typedef struct {
     const uint8_t *gate_up;
@@ -118,6 +120,84 @@ static inline void glm53f_mv_fp8_block128_bits_2(
     for (int r = n1 * 8; r < rows1; ++r)
         y1[r] = glm53f_dot_fp8_block128(
             w1 + (size_t)r * cols, s1 + (size_t)(r / 128) * blocks, x, cols);
+}
+
+static inline svfloat32_t glm53f_load_bf16_f32(svbool_t pg,
+                                                const uint16_t *p) {
+    svuint32_t u = svlsl_n_u32_x(pg, svld1uh_u32(pg, p), 16);
+    return svreinterpret_f32_u32(u);
+}
+
+static inline float glm53f_dot_bf16_sve(const uint16_t *w,
+                                         const float *x, int n) {
+    svfloat32_t acc = svdup_f32(0.0f);
+    int vl = (int)svcntw();
+    for (int i = 0; i < n; i += vl) {
+        svbool_t pg = svwhilelt_b32(i, n);
+        acc = svmla_x(pg, acc, glm53f_load_bf16_f32(pg, w + i),
+                      svld1(pg, x + i));
+    }
+    return svaddv_f32(svptrue_b32(), acc);
+}
+
+/* Decode-optimized compressed-latent MLA. Parallelism is over attention
+ * heads, keeping all per-head temporary state private and eliminating K/V
+ * expansion for every selected cache entry. */
+static inline int glm53f_mla_absorbed_sve(float *out, const float *query,
+        const float *latent_cache, const uint16_t *kv_b, const int *selected,
+        int n_selected, int heads, int key_dim, int value_dim, int latent_dim) {
+    float *qlat = NULL, *vacc = NULL, *logit = NULL;
+    if (n_selected <= 0) return -1;
+    if (posix_memalign((void **)&qlat, 256, (size_t)heads * latent_dim * 4) ||
+        posix_memalign((void **)&vacc, 256, (size_t)heads * latent_dim * 4) ||
+        posix_memalign((void **)&logit, 256, (size_t)heads * n_selected * 4)) {
+        free(logit); free(vacc); free(qlat); return -1;
+    }
+#pragma omp parallel for schedule(static)
+    for (int h = 0; h < heads; ++h) {
+        const uint16_t *wk = kv_b + (size_t)h * (key_dim + value_dim) * latent_dim;
+        const uint16_t *wv = wk + (size_t)key_dim * latent_dim;
+        float *qz = qlat + (size_t)h * latent_dim;
+        float *vz = vacc + (size_t)h * latent_dim;
+        float *ls = logit + (size_t)h * n_selected;
+        int vl = (int)svcntw();
+        for (int d = 0; d < latent_dim; d += vl) {
+            svbool_t pg = svwhilelt_b32(d, latent_dim);
+            svfloat32_t a = svdup_f32(0.0f);
+            for (int j = 0; j < key_dim; ++j)
+                a = svmla_n_f32_x(pg, a,
+                    glm53f_load_bf16_f32(pg, wk + (size_t)j * latent_dim + d),
+                    query[(size_t)h * key_dim + j]);
+            svst1(pg, qz + d, svmul_n_f32_x(pg, a, 1.0f / sqrtf((float)key_dim)));
+        }
+        float mx = -INFINITY, sum = 0.0f;
+        for (int p = 0; p < n_selected; ++p) {
+            ls[p] = 0.0f;
+            const float *z = latent_cache + (size_t)selected[p] * latent_dim;
+            svfloat32_t a = svdup_f32(0.0f);
+            for (int d = 0; d < latent_dim; d += vl) {
+                svbool_t pg = svwhilelt_b32(d, latent_dim);
+                a = svmla_x(pg, a, svld1(pg, qz + d), svld1(pg, z + d));
+            }
+            ls[p] = svaddv_f32(svptrue_b32(), a);
+            if (ls[p] > mx) mx = ls[p];
+        }
+        for (int p = 0; p < n_selected; ++p) { ls[p] = expf(ls[p] - mx); sum += ls[p]; }
+        memset(vz, 0, (size_t)latent_dim * 4);
+        for (int p = 0; p < n_selected; ++p) {
+            const float *z = latent_cache + (size_t)selected[p] * latent_dim;
+            float a = ls[p] / sum;
+            for (int d = 0; d < latent_dim; d += vl) {
+                svbool_t pg = svwhilelt_b32(d, latent_dim);
+                svst1(pg, vz + d, svmla_n_f32_x(pg, svld1(pg, vz + d), svld1(pg, z + d), a));
+            }
+        }
+        for (int j = 0; j < value_dim; ++j)
+            out[(size_t)h * value_dim + j] =
+                glm53f_dot_bf16_sve(wv + (size_t)j * latent_dim, vz, latent_dim);
+    }
+    free(logit); free(vacc); free(qlat);
+    return 0;
 }
 
 /* Run `batch` independent quarter experts concurrently. Threads are divided

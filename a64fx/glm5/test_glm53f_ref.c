@@ -25,6 +25,9 @@ int main(void) {
     float mx[4] = {1, 2, 3, 4}, mb[8] = {0}, ms[3] = {0};
     uint16_t mf[32] = {0};
     float mc[2] = {0}, mp[2] = {0}, mm[4] = {0}, mr[4], mo[2] = {10, 20};
+    float aq[2] = {.25f, -.5f}, az[6] = {.1f,.2f,.3f, -.2f,.4f,.1f};
+    uint16_t aw[12] = {0x3f80,0,0, 0,0x3f80,0, 0,0,0x3f80, 0x3f80,0x3f80,0};
+    int ai[2] = {0, 1}; float ad[1] = {0}, aa[1] = {0};
     glm53f_l2norm(q, 2, 1e-6f); glm53f_l2norm(k, 2, 1e-6f);
     glm53f_kda_step(s, q, k, v, 0.0f, 1.0f, 2, 3, out);
     glm53f_kda_step_streamed(s2, q, k, v, 0.0f, 1.0f, 2, 3, out2, work);
@@ -56,6 +59,9 @@ int main(void) {
     if (fabsf(mc[0] - 2.0f) > 1e-5f || fabsf(mc[1] - 3.0f) > 1e-5f ||
         fabsf(mx[0] - 12.0f) > 2e-5f || fabsf(mx[1] - 23.0f) > 2e-5f ||
         fabsf(mx[2] - 12.0f) > 2e-5f || fabsf(mx[3] - 23.0f) > 2e-5f) return 12;
-    printf("GLM53F_REF kda=ok router=ok mhc=ok cp=ok norm=ok topk=ok index=ok fusion=ok head=ok mhc_site=ok\n");
+    glm53f_mla_selected_bf16(ad, aq, az, aw, ai, 2, 1, 2, 1, 3);
+    if (glm53f_mla_selected_absorbed_bf16(aa, aq, az, aw, ai, 2, 1, 2, 1, 3) ||
+        fabsf(ad[0] - aa[0]) > 2e-7f) return 13;
+    printf("GLM53F_REF kda=ok router=ok mhc=ok cp=ok norm=ok topk=ok index=ok fusion=ok head=ok mhc_site=ok mla_absorb=ok\n");
     return 0;
 }

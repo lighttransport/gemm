@@ -205,6 +205,63 @@ static inline void glm53f_mla_selected_bf16(float *out, const float *query,
     free(value); free(logit);
 }
 
+/* Algebraically absorbed form of the selected MLA reference. It avoids
+ * expanding K/V for every cached token:
+ *   q_latent = q @ Wk; logits = q_latent @ latent;
+ *   v_latent = softmax(logits) @ latent; out = Wv @ v_latent.
+ * Accumulation order differs from the direct oracle, so callers should compare
+ * with a numerical tolerance rather than requiring bit identity. */
+static inline int glm53f_mla_selected_absorbed_bf16(float *out,
+        const float *query, const float *latent_cache, const uint16_t *kv_b,
+        const int *selected, int n_selected, int heads, int key_dim,
+        int value_dim, int latent_dim) {
+    float *q_latent, *v_latent, *logit;
+    int h, j, p, d;
+    if (n_selected <= 0) return -1;
+    q_latent = (float *)malloc((size_t)latent_dim * sizeof(float));
+    v_latent = (float *)malloc((size_t)latent_dim * sizeof(float));
+    logit = (float *)malloc((size_t)n_selected * sizeof(float));
+    if (!q_latent || !v_latent || !logit) {
+        free(logit); free(v_latent); free(q_latent); return -1;
+    }
+    for (h = 0; h < heads; ++h) {
+        const uint16_t *wk = kv_b + (size_t)h * (key_dim + value_dim) * latent_dim;
+        const uint16_t *wv = wk + (size_t)key_dim * latent_dim;
+        float mx = -INFINITY, sum = 0.0f;
+        for (d = 0; d < latent_dim; ++d) {
+            double v = 0.0;
+            for (j = 0; j < key_dim; ++j)
+                v += (double)query[(size_t)h * key_dim + j] *
+                     glm53f_bf16_to_f32(wk[(size_t)j * latent_dim + d]);
+            q_latent[d] = (float)(v / sqrt((double)key_dim));
+        }
+        for (p = 0; p < n_selected; ++p) {
+            const float *z = latent_cache + (size_t)selected[p] * latent_dim;
+            double v = 0.0;
+            for (d = 0; d < latent_dim; ++d) v += (double)q_latent[d] * z[d];
+            logit[p] = (float)v;
+            if (logit[p] > mx) mx = logit[p];
+        }
+        for (p = 0; p < n_selected; ++p) {
+            logit[p] = expf(logit[p] - mx); sum += logit[p];
+        }
+        memset(v_latent, 0, (size_t)latent_dim * sizeof(float));
+        for (p = 0; p < n_selected; ++p) {
+            const float *z = latent_cache + (size_t)selected[p] * latent_dim;
+            float a = logit[p] / sum;
+            for (d = 0; d < latent_dim; ++d) v_latent[d] += a * z[d];
+        }
+        for (j = 0; j < value_dim; ++j) {
+            double v = 0.0;
+            for (d = 0; d < latent_dim; ++d)
+                v += (double)glm53f_bf16_to_f32(wv[(size_t)j * latent_dim + d]) * v_latent[d];
+            out[(size_t)h * value_dim + j] = (float)v;
+        }
+    }
+    free(logit); free(v_latent); free(q_latent);
+    return 0;
+}
+
 static inline void glm53f_l2norm(float *x, int n, float eps) {
     double ss = 0.0;
     int i;
