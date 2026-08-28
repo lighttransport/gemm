@@ -208,7 +208,9 @@ int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose) {
         "lm_head.weight",
         "model.language_model.layers.0.input_layernorm.weight",
         "model.language_model.layers.3.self_attn.indexer.k_norm.weight",
-        "model.language_model.layers.3.mlp.gate.weight"
+        "model.language_model.layers.3.mlp.gate.weight",
+        "model.language_model.layers.44.hc_attn_fn",
+        "model.language_model.layers.44.hc_ffn_fn"
     };
     int i, missing = 0, layers = 0, experts = 0, shape_errors = 0;
     char name[128];
@@ -251,6 +253,14 @@ int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose) {
     }
     if (verbose) fprintf(stderr, "glm53f_st: entries=%d shards=%d layers=%d moe_layers=%d\n",
                          ctx ? ctx->n_entries : 0, ctx ? ctx->n_shards : 0, layers, experts);
+    /* Layer 45 is the single-stream MTP block. Unlike target layers 0..44 it
+     * deliberately has no learned mHC sites; treating it as four-stream would
+     * silently change draft logits and acceptance. */
+    if (ctx && (glm53f_st_find(ctx, "model.language_model.layers.45.hc_attn_fn", NULL) ||
+                glm53f_st_find(ctx, "model.language_model.layers.45.hc_ffn_fn", NULL))) {
+        shape_errors++;
+        if (verbose) fprintf(stderr, "unexpected mHC tensors on MTP layer 45\n");
+    }
     return ctx && missing == 0 && shape_errors == 0 && layers == 46 && experts == 43 ? 0 : -1;
 }
 

@@ -22,6 +22,9 @@ int main(void) {
     uint16_t fw[8] = {0x3f80, 0, 0, 0, 0, 0, 0, 0x3f80};
     uint16_t head[6] = {0x3f80, 0, 0, 0x3f80, 0xbf80, 0};
     float hn[2], best_logit;
+    float mx[4] = {1, 2, 3, 4}, mb[8] = {0}, ms[3] = {0};
+    uint16_t mf[32] = {0};
+    float mc[2] = {0}, mp[2] = {0}, mm[4] = {0}, mr[4], mo[2] = {10, 20};
     glm53f_l2norm(q, 2, 1e-6f); glm53f_l2norm(k, 2, 1e-6f);
     glm53f_kda_step(s, q, k, v, 0.0f, 1.0f, 2, 3, out);
     glm53f_kda_step_streamed(s2, q, k, v, 0.0f, 1.0f, 2, 3, out2, work);
@@ -47,6 +50,12 @@ int main(void) {
     if (glm53f_vocab_argmax_bf16(fused, one, head, 2, 7, 3, 1e-5f,
                                   hn, &best_logit) != 8 ||
         !isfinite(best_logit)) return 11;
-    printf("GLM53F_REF kda=ok router=ok mhc=ok cp=ok norm=ok topk=ok index=ok fusion=ok head=ok\n");
+    memcpy(mr, mx, sizeof(mx));
+    glm53f_mhc_pre(mc, mp, mm, mx, mf, mb, ms, 2, 2, 20, 1e-5f, 1e-6f);
+    glm53f_mhc_post(mx, mr, mo, mp, mm, 2, 2);
+    if (fabsf(mc[0] - 2.0f) > 1e-5f || fabsf(mc[1] - 3.0f) > 1e-5f ||
+        fabsf(mx[0] - 12.0f) > 2e-5f || fabsf(mx[1] - 23.0f) > 2e-5f ||
+        fabsf(mx[2] - 12.0f) > 2e-5f || fabsf(mx[3] - 23.0f) > 2e-5f) return 12;
+    printf("GLM53F_REF kda=ok router=ok mhc=ok cp=ok norm=ok topk=ok index=ok fusion=ok head=ok mhc_site=ok\n");
     return 0;
 }

@@ -317,6 +317,55 @@ static inline void glm53f_mhc_sinkhorn(float *comb, int hc, int iters, float eps
     }
 }
 
+/* Scalar checkpoint mHC site oracle. fn is BF16 [(2+hc)*hc, hc*width],
+ * while base and scale are F32. */
+static inline void glm53f_mhc_pre(float *collapsed, float *post, float *comb,
+        const float *streams, const uint16_t *fn, const float *base,
+        const float *scale, int hc, int width, int iters, float norm_eps,
+        float hc_eps) {
+    int flat = hc * width, mix = (2 + hc) * hc, m, k, d;
+    double ss = 0.0;
+    float *logits = (float *)malloc((size_t)mix * sizeof(float));
+    if (!logits) return;
+    for (d = 0; d < flat; ++d) ss += (double)streams[d] * streams[d];
+    {
+        float inv = 1.0f / sqrtf((float)(ss / flat) + norm_eps);
+        for (m = 0; m < mix; ++m) {
+            double v = 0.0;
+            for (d = 0; d < flat; ++d)
+                v += (double)glm53f_bf16_to_f32(fn[(size_t)m * flat + d]) * streams[d];
+            logits[m] = (float)v * inv;
+        }
+    }
+    for (k = 0; k < hc; ++k) {
+        logits[k] = glm53f_sigmoid(logits[k] * scale[0] + base[k]) + hc_eps;
+        post[k] = 2.0f * glm53f_sigmoid(logits[hc + k] * scale[1] + base[hc + k]);
+    }
+    for (m = 0; m < hc * hc; ++m)
+        comb[m] = logits[2 * hc + m] * scale[2] + base[2 * hc + m];
+    glm53f_mhc_sinkhorn(comb, hc, iters, hc_eps);
+    for (d = 0; d < width; ++d) {
+        double v = 0.0;
+        for (k = 0; k < hc; ++k) v += (double)logits[k] * streams[(size_t)k * width + d];
+        collapsed[d] = (float)v;
+    }
+    free(logits);
+}
+
+static inline void glm53f_mhc_post(float *streams, const float *residual,
+        const float *sublayer, const float *post, const float *comb,
+        int hc, int width) {
+    int k, j, d;
+    for (k = 0; k < hc; ++k)
+        for (d = 0; d < width; ++d) {
+            double v = (double)post[k] * sublayer[d];
+            for (j = 0; j < hc; ++j)
+                v += (double)comb[(size_t)j * hc + k] *
+                     residual[(size_t)j * width + d];
+            streams[(size_t)k * width + d] = (float)v;
+        }
+}
+
 static inline size_t glm53f_cp_slots(size_t ctx, int ranks) {
     return (ctx + (size_t)ranks - 1) / (size_t)ranks;
 }
