@@ -11,6 +11,9 @@
 - 78 back-to-back reductions: **5.02 ms/token**. Robust modes 0/1/2 are equal;
   changing completion mode is not a useful optimization.
 - Physical 1M CP cache allocation: 12/12 ranks pass with 1.28 GiB/rank committed.
+- Conservative checkpoint planner (2 GiB scratch + 1 GiB OS reserve) fits all
+  requested contexts: **28.986 GiB/rank at 256K** (3.014 GiB headroom),
+  **29.273 GiB at 512K** (2.727 GiB), and **29.845 GiB at 1M** (2.155 GiB).
 - Real staged F8_E4M3 quarter-expert (1024x4096 gate/up + 4096x512 down),
   anonymous resident weights: **0.438 ms/task mean** at 24 threads with the
   exact gather-free decoder, versus 0.477 ms/task with the LUT-gather decoder.
@@ -24,6 +27,9 @@
   arrival wait is 8.617 ms/token. An unloaded MPI baseline is 73.2 us/call,
   or 3.075 ms/token, leaving **5.56 ms/token of rank-arrival skew**. Resident
   MemAvailable is 6.0--6.45 GiB/rank.
+- Aligned 12-way routed-only decode reaches **55.778 tok/s** over 200 tokens:
+  17.928 ms/token wall, 14.114 ms compute, and 0.803 ms arrival skew. This is
+  17.7% faster than the original four-way routed-only result.
 - The checkpoint shared expert is 2048-wide (not the early synthetic 171-wide
   assumption). Block-TP across 12 ranks gives 128/256-wide shards with 63.0 /
   126.0 MiB weights/rank. The real 42-layer persistent-team stream costs
@@ -43,13 +49,16 @@ Use one process per A64FX node and all 12 ranks as the expert group.
   `{0,3,6,9}` has the lowest top-8 slowest-rank occupancy: mean 4.061 tasks,
   p95/p99 6/6. Execute local hits concurrently as independent CMG teams; the
   existing MLP hidden-vector sum combines the partial outputs.
-- Quantization-aligned 12-way slicing is the next decode experiment. Partition
+- Quantization-aligned 12-way slicing is the decode default. Partition
   the 16 FP8 intermediate block rows, not 2048 raw elements: each expert has
   eight 128-wide and four 256-wide rank shards. This preserves the compressed
   128x128 scale grid, gives every rank all eight routed tasks, and reduces the
   simulated slowest-rank work from 16.244 to **12.061 block rows/layer**
-  (p95/p99 14/14). The full 12-way stage must beat the verified four-way
-  47.39 tok/s result before replacing the default.
+  (p95/p99 14/14). With the real shared shard fused into the same MLP combine,
+  **12-way delivers 50.776 tok/s (19.694 ms/token)** versus **44.466 tok/s
+  (22.489 ms/token)** for the matched four-way control, a 14.2% gain. Compute
+  is 15.763 vs 14.096 ms/token, but arrival skew falls from 5.881 to 1.781 ms.
+  Both layouts produce the identical benchmark checksum `1.41924829e-05`.
 - KDA layers: partition 64 heads as balanced contiguous ranges (5 or 6/rank).
   Q/K/V, gates, convolution channels, and recurrent state follow head ownership.
   `o_proj` is column-parallel; one hidden-vector sum completes attention.
