@@ -52,6 +52,34 @@ static inline void glm53f_kda_step(float *state, const float *q, const float *k,
     }
 }
 
+/* Same recurrence with state-streaming loop order.  This is the A64FX decode
+ * layout: two contiguous passes over [key_dim,value_dim], no strided loads. */
+static inline void glm53f_kda_step_streamed(float *state, const float *q, const float *k,
+                                            const float *v, float log_decay, float beta,
+                                            int key_dim, int value_dim, float *out,
+                                            float *work) {
+    float decay = expf(log_decay), scale = 1.0f / sqrtf((float)key_dim);
+    int d, j;
+    memset(work, 0, (size_t)value_dim * sizeof(*work));
+    for (d = 0; d < key_dim; ++d) {
+        float *row = state + (size_t)d * value_dim;
+        float kd = k[d];
+        for (j = 0; j < value_dim; ++j) {
+            row[j] *= decay;
+            work[j] += row[j] * kd;
+        }
+    }
+    for (j = 0; j < value_dim; ++j) { work[j] = (v[j] - work[j]) * beta; out[j] = 0.0f; }
+    for (d = 0; d < key_dim; ++d) {
+        float *row = state + (size_t)d * value_dim;
+        float kd = k[d], qd = q[d] * scale;
+        for (j = 0; j < value_dim; ++j) {
+            row[j] += kd * work[j];
+            out[j] += row[j] * qd;
+        }
+    }
+}
+
 static inline float glm53f_sigmoid(float x) {
     return x >= 0.0f ? 1.0f / (1.0f + expf(-x)) : expf(x) / (1.0f + expf(x));
 }
