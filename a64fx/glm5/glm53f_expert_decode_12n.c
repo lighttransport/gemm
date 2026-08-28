@@ -19,7 +19,7 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { FIRST_LAYER = 3, LAST_LAYER = 45, NLAYERS = 42, NEXPERTS = 288 };
+enum { FIRST_LAYER = 3, LAST_LAYER = 46, NLAYERS = 43, NEXPERTS = 288 };
 
 typedef struct {
     uint64_t gate_up, gate_up_scale, down, down_scale;
@@ -150,6 +150,10 @@ static void route8(int token, int layer, int expert[8]) {
 
 int main(int argc, char **argv) {
     int rank, ranks, tokens = argc > 2 ? atoi(argv[2]) : 20;
+    int first_layer = getenv("GLM53F_FIRST_LAYER") ?
+        atoi(getenv("GLM53F_FIRST_LAYER")) : FIRST_LAYER;
+    int run_layers = getenv("GLM53F_LAYER_COUNT") ?
+        atoi(getenv("GLM53F_LAYER_COUNT")) : 42;
     int attention_combine = getenv("GLM53F_ATTENTION_COMBINE") ?
         atoi(getenv("GLM53F_ATTENTION_COMBINE")) : 0;
     const char *stage = argc > 1 ? argv[1] : getenv("GLM53F_STAGE_DIR");
@@ -165,7 +169,8 @@ int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-    if (!stage || ranks != 12 || tokens < 1) {
+    if (!stage || ranks != 12 || tokens < 1 || first_layer < FIRST_LAYER ||
+        run_layers < 1 || first_layer + run_layers > LAST_LAYER) {
         if (!rank) fprintf(stderr, "usage: %s STAGE_DIR [tokens=20] (requires 12 ranks)\n", argv[0]);
         MPI_Abort(MPI_COMM_WORLD, 2);
     }
@@ -173,7 +178,7 @@ int main(int argc, char **argv) {
     snprintf(manifest_path, sizeof(manifest_path), "%s/rank%02d.manifest", stage, rank);
     table = malloc((size_t)NLAYERS * NEXPERTS * sizeof(*table));
     int manifest_entries = table ? load_manifest(manifest_path, table) : -1;
-    if (manifest_entries < NLAYERS * 96 * 4 || manifest_entries % (NLAYERS * 4)) {
+    if (manifest_entries < run_layers * 96 * 4 || manifest_entries % (run_layers * 4)) {
         fprintf(stderr, "rank=%d manifest contract failed: %s\n", rank, manifest_path);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
@@ -183,7 +188,7 @@ int main(int argc, char **argv) {
     if (shared_stage) {
         snprintf(blob_path, sizeof(blob_path), "%s/rank%02d.blob", shared_stage, rank);
         snprintf(manifest_path, sizeof(manifest_path), "%s/rank%02d.manifest", shared_stage, rank);
-        if (load_shared_manifest(manifest_path, shared) != NLAYERS * 4 ||
+        if (load_shared_manifest(manifest_path, shared) != run_layers * 4 ||
             !(shared_blob = load_anon(blob_path, &shared_bytes, rank))) MPI_Abort(MPI_COMM_WORLD, 1);
     }
     posix_memalign((void **)&x, 256, 4096 * sizeof(float));
@@ -210,7 +215,8 @@ int main(int argc, char **argv) {
             compute = combine = attention = 0;
             local_tasks = 0;
         }
-        for (int li = 0; li < NLAYERS; ++li) {
+        for (int li = 0; li < run_layers; ++li) {
+            int layer_index = first_layer - FIRST_LAYER + li;
             int selected[8], n = 0;
             glm53f_expert_part part[9];
             if (attention_combine) {
@@ -220,9 +226,9 @@ int main(int argc, char **argv) {
                               MPI_COMM_WORLD);
                 attention += now_sec() - t0;
             }
-            route8(tok, li + FIRST_LAYER, selected);
+            route8(tok, first_layer + li, selected);
             for (int k = 0; k < 8; ++k) {
-                expert_offset *p = &table[li * NEXPERTS + selected[k]];
+                expert_offset *p = &table[layer_index * NEXPERTS + selected[k]];
                 if (p->gate_up == UINT64_MAX) continue;
                 part[n].gate_up = blob + p->gate_up;
                 part[n].gate_up_scale = (const float *)(blob + p->gate_up_scale);
@@ -232,7 +238,7 @@ int main(int argc, char **argv) {
                 n++;
             }
             if (shared_blob) {
-                shared_offset *p = &shared[li];
+                shared_offset *p = &shared[layer_index];
                 part[n].gate_up = shared_blob + p->gate_up;
                 part[n].gate_up_scale = (const float *)(shared_blob + p->gate_up_scale);
                 part[n].down = shared_blob + p->down;
@@ -261,12 +267,12 @@ int main(int argc, char **argv) {
     MPI_Reduce(&attention, &max_attention, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_tasks, &max_tasks, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!rank) printf("GLM53F_EXPERT_DECODE_12N tokens=%d layers=%d attention_combine=%d expert_parts_rank=%d weight_GiB_rank=%.3f max_tasks=%ld wall_ms_tok=%.3f compute_ms_tok=%.3f combine_ms_tok=%.3f attention_ms_tok=%.3f wire_us_call=%.3f wire_ms_tok=%.3f arrival_ms_tok=%.3f tok_s=%.3f checksum=%.9g\n",
-        tokens, NLAYERS, attention_combine, manifest_entries / (NLAYERS * 4), (blob_bytes + shared_bytes) / 1073741824.0, max_tasks,
+        tokens, run_layers, attention_combine, manifest_entries / (run_layers * 4), (blob_bytes + shared_bytes) / 1073741824.0, max_tasks,
         max_wall * 1e3 / tokens, max_compute * 1e3 / tokens,
         max_combine * 1e3 / tokens, max_attention * 1e3 / tokens,
-        wire_call * 1e6, wire_call * NLAYERS * (attention_combine + 1) * 1e3,
+        wire_call * 1e6, wire_call * run_layers * (attention_combine + 1) * 1e3,
         (max_combine + max_attention) * 1e3 / tokens -
-            wire_call * NLAYERS * (attention_combine + 1) * 1e3,
+            wire_call * run_layers * (attention_combine + 1) * 1e3,
         tokens / max_wall, sum[0]);
     free(sum); free(out); free(act); free(up); free(x); free(shared_blob); free(blob); free(table);
     MPI_Finalize();

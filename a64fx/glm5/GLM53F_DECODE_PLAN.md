@@ -121,3 +121,41 @@ token/s target therefore requires multi-token/speculative verification (where
 the measured INT8 register-blocked kernel amortizes activation quantization),
 or a lower-bit expert representation plus fewer/overlapped collectives. It is
 not a scheduler-only target.
+
+### Real layer-45 MTP/speculative probe
+
+Layer 45 is a complete independent sparse-attention+MoE draft block with 288
+routed experts, a shared expert, router, `eh_proj [4096,8192]`, and the shared
+vocabulary head. It is not merely an auxiliary logits head. The layer-selectable
+stager and distributed benchmark measured its real 12-way routed/shared expert
+path over 5,000 drafts:
+
+- 0.564 GiB weights/rank;
+- **0.524 ms/draft** wall;
+- 0.369 ms expert/shared compute;
+- 0.138 ms MLP combine and 0.049 ms unloaded attention combine;
+- 1,908 partial drafts/s.
+
+This is a lower bound on draft cost because sparse-attention projections,
+`eh_proj`, the vocabulary projection, cache update, and sampling are not yet in
+the runner. The original 42-layer path still passes after the layer-selection
+change: 48.619 tok/s over 50 tokens, 14.470 ms expert compute, and 20.568 ms wall.
+
+Cold-HBM A64FX measurements put MXFP4 expert throughput at 102--155 GB/s versus
+148--174 GB/s for FP8 magic. Accounting for half-sized MXFP4 weights gives about
+a **1.45x**, not 2x, effective expert speedup. `glm53f_spec_ceiling.py` combines
+that result with measured routed/shared, wire, and partial MTP costs. It makes
+deliberately impossible-best assumptions: all shared weights are read once per
+verification batch, one collective sequence serves the whole batch, and every
+unimplemented graph operation costs zero. Even then:
+
+- K=1: 84.2 tok/s at impossible-perfect alpha=1.0;
+- K=2: 95.6 tok/s at alpha=1.0;
+- K=3: 102.5 tok/s only at alpha=1.0, but 88.2 tok/s at alpha=0.9;
+- K=3 at alpha=0.8: 75.7 tok/s.
+
+Therefore 100+ single-stream delivered tok/s is rejected for this 12-node
+FP8/MXFP4+MTP design unless real chained acceptance is effectively perfect and
+the omitted graph work is somehow free. The practical 100+ route is continuous
+batching across independent requests; MTP may still improve latency/throughput,
+but must first be evaluated in a token-correct full forward runner.

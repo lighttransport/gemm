@@ -72,7 +72,7 @@ int main(int argc,char**argv){
     uint64_t off=0,last_sync=0,flush=1ull<<30;int nt=0,fd=-1;FILE*mf=NULL;double t0=now_sec();
     if(!model){const char*h=getenv("HOME");snprintf(model_dflt,sizeof model_dflt,"%s/models/glm53f",h?h:".");model=model_dflt;}
     if(!out||!*out){snprintf(out_dflt,sizeof out_dflt,"/local/glm53f-decode-%s",getenv("PJM_JOBID")?getenv("PJM_JOBID"):"manual");out=out_dflt;}
-    if(rank<0||rank>=ranks||parts<1||parts>16||ranks%parts||first<3||last>45||first>=last)return 2;
+    if(rank<0||rank>=ranks||parts<1||parts>16||ranks%parts||first<3||last>46||first>=last)return 2;
     mkdir(out,0755);snprintf(bp,sizeof bp,"%s/rank%02d.blob",out,rank);snprintf(mp,sizeof mp,"%s/rank%02d.manifest",out,rank);
     st=glm53f_st_open(model);if(!st||glm53f_st_validate_contract(st,0)){fprintf(stderr,"checkpoint failed\n");return 2;}
     fd=open(bp,O_CREAT|O_TRUNC|O_WRONLY,0644);mf=fopen(mp,"w");if(fd<0||!mf){perror("stage output");return 2;}
