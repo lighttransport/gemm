@@ -6,6 +6,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 static inline float glm53f_bf16_to_f32(uint16_t x) {
@@ -13,6 +14,149 @@ static inline float glm53f_bf16_to_f32(uint16_t x) {
     float f;
     memcpy(&f, &u, sizeof(f));
     return f;
+}
+
+static inline void glm53f_rmsnorm_bf16(float *out, const float *x,
+                                       const uint16_t *weight, int n, float eps) {
+    double ss = 0.0;
+    int i;
+    for (i = 0; i < n; ++i) ss += (double)x[i] * x[i];
+    {
+        float inv = 1.0f / sqrtf((float)(ss / n) + eps);
+        for (i = 0; i < n; ++i)
+            out[i] = x[i] * inv * glm53f_bf16_to_f32(weight[i]);
+    }
+}
+
+static inline void glm53f_layernorm_bf16(float *out, const float *x,
+        const uint16_t *weight, const uint16_t *bias, int n, float eps) {
+    double sum = 0.0, ss = 0.0;
+    int i;
+    for (i = 0; i < n; ++i) sum += x[i];
+    {
+        float mean = (float)(sum / n);
+        for (i = 0; i < n; ++i) {
+            double d = (double)x[i] - mean;
+            ss += d * d;
+        }
+        float inv = 1.0f / sqrtf((float)(ss / n) + eps);
+        for (i = 0; i < n; ++i)
+            out[i] = (x[i] - mean) * inv * glm53f_bf16_to_f32(weight[i]) +
+                     glm53f_bf16_to_f32(bias[i]);
+    }
+}
+
+/* Stable greedy top-k. Equal scores retain the lower source index, which makes
+ * the CPU oracle deterministic across thread counts and MPI layouts. */
+static inline void glm53f_topk_stable(const float *score, int n, int k,
+                                      int *index) {
+    int i, j;
+    for (j = 0; j < k; ++j) index[j] = -1;
+    for (i = 0; i < n; ++i) {
+        for (j = 0; j < k; ++j) {
+            int old = index[j];
+            if (old < 0 || score[i] > score[old] ||
+                (score[i] == score[old] && i < old)) {
+                int z;
+                for (z = k - 1; z > j; --z) index[z] = index[z - 1];
+                index[j] = i;
+                break;
+            }
+        }
+    }
+}
+
+/* Decode-time k-pool indexer for an unpadded causal sequence. Complete pools
+ * compete by their learned compressed key; the current incomplete tail is
+ * appended as raw indices and never competes with complete pools. */
+static inline int glm53f_index_select_decode(float *pool_keys, int *selected,
+        const float *query, const float *head_weight, const float *key_cache,
+        const float *gate_cache, const float *ape, int tokens, int kpool,
+        int index_topk, int heads, int dim) {
+    int pools = tokens / kpool;
+    int choose = index_topk / kpool;
+    int p, h, d, z, out = 0;
+    float *score;
+    int *picked;
+    if (choose > pools) choose = pools;
+    score = (float *)malloc((size_t)(pools ? pools : 1) * sizeof(float));
+    picked = (int *)malloc((size_t)(choose ? choose : 1) * sizeof(int));
+    if (!score || !picked) { free(score); free(picked); return -1; }
+    for (p = 0; p < pools; ++p) {
+        float *pk = pool_keys + (size_t)p * dim;
+        for (d = 0; d < dim; ++d) {
+            float mx = -INFINITY, den = 0.0f, val = 0.0f;
+            for (z = 0; z < kpool; ++z) {
+                float a = gate_cache[(size_t)(p * kpool + z) * dim + d] +
+                          ape[(size_t)z * dim + d];
+                if (a > mx) mx = a;
+            }
+            for (z = 0; z < kpool; ++z) {
+                float a = expf(gate_cache[(size_t)(p * kpool + z) * dim + d] +
+                                ape[(size_t)z * dim + d] - mx);
+                den += a;
+                val += a * key_cache[(size_t)(p * kpool + z) * dim + d];
+            }
+            pk[d] = val / den;
+        }
+        score[p] = 0.0f;
+        for (h = 0; h < heads; ++h) {
+            double dot = 0.0;
+            for (d = 0; d < dim; ++d)
+                dot += (double)query[(size_t)h * dim + d] * pk[d];
+            if (dot > 0.0)
+                score[p] += head_weight[h] * (float)(dot / sqrt((double)dim)) /
+                            sqrtf((float)heads);
+        }
+    }
+    glm53f_topk_stable(score, pools, choose, picked);
+    for (z = 0; z < choose; ++z)
+        for (d = 0; d < kpool; ++d) selected[out++] = picked[z] * kpool + d;
+    for (z = pools * kpool; z < tokens; ++z) selected[out++] = z;
+    free(picked); free(score);
+    return out;
+}
+
+/* Exact decode reference for NoPE compressed-latent MLA after sparse indices
+ * have been selected. kv_b is [heads*(key_dim+value_dim), latent_dim] BF16. */
+static inline void glm53f_mla_selected_bf16(float *out, const float *query,
+        const float *latent_cache, const uint16_t *kv_b, const int *selected,
+        int n_selected, int heads, int key_dim, int value_dim, int latent_dim) {
+    int h, j, p, d;
+    float *logit = (float *)malloc((size_t)n_selected * sizeof(float));
+    float *value = (float *)malloc((size_t)n_selected * value_dim * sizeof(float));
+    if (!logit || !value) { free(logit); free(value); return; }
+    for (h = 0; h < heads; ++h) {
+        float mx = -INFINITY, sum = 0.0f;
+        const uint16_t *wk = kv_b + (size_t)h * (key_dim + value_dim) * latent_dim;
+        const uint16_t *wv = wk + (size_t)key_dim * latent_dim;
+        for (p = 0; p < n_selected; ++p) {
+            const float *z = latent_cache + (size_t)selected[p] * latent_dim;
+            double qk = 0.0;
+            for (j = 0; j < key_dim; ++j) {
+                double kval = 0.0;
+                for (d = 0; d < latent_dim; ++d)
+                    kval += (double)glm53f_bf16_to_f32(wk[(size_t)j * latent_dim + d]) * z[d];
+                qk += (double)query[(size_t)h * key_dim + j] * kval;
+            }
+            logit[p] = (float)(qk / sqrt((double)key_dim));
+            if (logit[p] > mx) mx = logit[p];
+            for (j = 0; j < value_dim; ++j) {
+                double v = 0.0;
+                for (d = 0; d < latent_dim; ++d)
+                    v += (double)glm53f_bf16_to_f32(wv[(size_t)j * latent_dim + d]) * z[d];
+                value[(size_t)p * value_dim + j] = (float)v;
+            }
+        }
+        for (p = 0; p < n_selected; ++p) { logit[p] = expf(logit[p] - mx); sum += logit[p]; }
+        for (j = 0; j < value_dim; ++j) {
+            double y = 0.0;
+            for (p = 0; p < n_selected; ++p)
+                y += (double)(logit[p] / sum) * value[(size_t)p * value_dim + j];
+            out[(size_t)h * value_dim + j] = (float)y;
+        }
+    }
+    free(value); free(logit);
 }
 
 static inline void glm53f_l2norm(float *x, int n, float eps) {

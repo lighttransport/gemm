@@ -9,6 +9,15 @@ int main(void) {
     float logits[6] = {-3, 2, 0, 4, -1, 1}, bias[6] = {0};
     float w[2], comb[4] = {1, 2, 3, 4};
     int ids[2];
+    uint16_t one[4] = {0x3f80, 0x3f80, 0x3f80, 0x3f80};
+    uint16_t zero[4] = {0, 0, 0, 0};
+    float nx[4] = {1, 2, 3, 4}, nr[4], ln[4];
+    float tied[4] = {2, 3, 3, 1};
+    int ti[2];
+    float iq[2] = {1, 0}, iw[1] = {1};
+    float ik[6] = {1, 0, 3, 0, 0, 2};
+    float ig[6] = {0}, ia[4] = {0}, ip[2];
+    int isel[3];
     glm53f_l2norm(q, 2, 1e-6f); glm53f_l2norm(k, 2, 1e-6f);
     glm53f_kda_step(s, q, k, v, 0.0f, 1.0f, 2, 3, out);
     glm53f_kda_step_streamed(s2, q, k, v, 0.0f, 1.0f, 2, 3, out2, work);
@@ -19,6 +28,15 @@ int main(void) {
     glm53f_mhc_sinkhorn(comb, 2, 20, 1e-6f);
     if (fabsf(comb[0] + comb[1] - 1.0f) > 1e-4f || fabsf(comb[0] + comb[2] - 1.0f) > 1e-4f) return 3;
     if (glm53f_cp_owner(25, 12) != 1 || glm53f_cp_slot(25, 12) != 2 || glm53f_cp_slots(26, 12) != 3) return 4;
-    printf("GLM53F_REF kda=ok router=ok mhc=ok cp=ok\n");
+    glm53f_rmsnorm_bf16(nr, nx, one, 4, 1e-5f);
+    if (fabsf(nr[3] - 4.0f / sqrtf(7.5f + 1e-5f)) > 1e-6f) return 6;
+    glm53f_layernorm_bf16(ln, nx, one, zero, 4, 1e-5f);
+    if (fabsf(ln[0] + 1.3416355f) > 2e-5f || fabsf(ln[3] - 1.3416355f) > 2e-5f) return 7;
+    glm53f_topk_stable(tied, 4, 2, ti);
+    if (ti[0] != 1 || ti[1] != 2) return 8;
+    if (glm53f_index_select_decode(ip, isel, iq, iw, ik, ig, ia,
+                                   3, 2, 2, 1, 2) != 3 ||
+        isel[0] != 0 || isel[1] != 1 || isel[2] != 2) return 9;
+    printf("GLM53F_REF kda=ok router=ok mhc=ok cp=ok norm=ok topk=ok index=ok\n");
     return 0;
 }
