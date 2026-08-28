@@ -69,4 +69,19 @@ static inline int glm53f_is_moe(size_t layer) {
 
 static inline int glm53f_is_mtp(size_t layer) { return layer == 45; }
 
+/* Split each routed expert's intermediate dimension across `parts` ranks.
+ * parts=4 on 12 A64FX nodes gives the best measured decode critical path.
+ * The offsets keep every part on a distinct rank and balance 288 experts. */
+static inline int glm53f_expert_part_owner(int expert, int part, int parts, int ranks) {
+    if (expert < 0 || part < 0 || part >= parts || parts < 1 || ranks < parts || ranks % parts)
+        return -1;
+    return (expert % ranks + part * (ranks / parts)) % ranks;
+}
+
+static inline void glm53f_balanced_slice(int n, int part, int parts, int *begin, int *count) {
+    int a = n * part / parts, b = n * (part + 1) / parts;
+    if (begin) *begin = a;
+    if (count) *count = b - a;
+}
+
 #endif

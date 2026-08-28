@@ -14,7 +14,11 @@
 
 Use one process per A64FX node and all 12 ranks as the expert group.
 
-- Routed experts: expert `e` belongs to `e % 12`; each rank holds 24 experts.
+- Routed experts: split every expert four ways over its intermediate dimension.
+  Part `p` belongs to `(e % 12 + p*3) % 12`; each rank holds 96 quarter-experts.
+  A synthetic occupancy simulation plus exact-shape GEMVs reduced the expected
+  slowest-rank expert critical path from ~0.47 to ~0.29 ms/layer versus whole
+  experts. The existing MLP hidden-vector sum combines the partial outputs.
 - KDA layers: partition 64 heads as balanced contiguous ranges (5 or 6/rank).
   Q/K/V, gates, convolution channels, and recurrent state follow head ownership.
   `o_proj` is column-parallel; one hidden-vector sum completes attention.
