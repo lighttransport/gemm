@@ -46,6 +46,52 @@ static inline void glm53f_layernorm_bf16(float *out, const float *x,
     }
 }
 
+static inline float glm53f_dot_bf16(const uint16_t *weight,
+                                    const float *x, int n) {
+    double sum = 0.0;
+    int i;
+    for (i = 0; i < n; ++i)
+        sum += (double)glm53f_bf16_to_f32(weight[i]) * x[i];
+    return (float)sum;
+}
+
+/* GLM-5.3F MTP fusion. The embedding of the already accepted token and the
+ * target model hidden state are normalized independently, concatenated in
+ * that order, then projected back to hidden width by eh_proj [H, 2H]. */
+static inline void glm53f_mtp_fuse_bf16(float *out, float *scratch_2h,
+        const float *embedding, const float *hidden,
+        const uint16_t *enorm, const uint16_t *hnorm,
+        const uint16_t *eh_proj, int width, float eps) {
+    int r;
+    glm53f_rmsnorm_bf16(scratch_2h, embedding, enorm, width, eps);
+    glm53f_rmsnorm_bf16(scratch_2h + width, hidden, hnorm, width, eps);
+    for (r = 0; r < width; ++r)
+        out[r] = glm53f_dot_bf16(eh_proj + (size_t)r * 2 * width,
+                                 scratch_2h, 2 * width);
+}
+
+/* Return the global vocabulary ID for this row shard. Ties retain the lower
+ * global ID, allowing MPI reductions to reproduce a single-rank argmax. */
+static inline int glm53f_vocab_argmax_bf16(const float *hidden,
+        const uint16_t *norm, const uint16_t *head_rows, int width,
+        int row_begin, int rows, float eps, float *normalized,
+        float *best_logit) {
+    int r, best = -1;
+    float value = -INFINITY;
+    glm53f_rmsnorm_bf16(normalized, hidden, norm, width, eps);
+    for (r = 0; r < rows; ++r) {
+        float z = glm53f_dot_bf16(head_rows + (size_t)r * width,
+                                  normalized, width);
+        int id = row_begin + r;
+        if (best < 0 || z > value || (z == value && id < best)) {
+            best = id;
+            value = z;
+        }
+    }
+    if (best_logit) *best_logit = value;
+    return best;
+}
+
 /* Stable greedy top-k. Equal scores retain the lower source index, which makes
  * the CPU oracle deterministic across thread counts and MPI layouts. */
 static inline void glm53f_topk_stable(const float *score, int n, int k,

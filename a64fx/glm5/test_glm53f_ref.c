@@ -18,6 +18,10 @@ int main(void) {
     float ik[6] = {1, 0, 3, 0, 0, 2};
     float ig[6] = {0}, ia[4] = {0}, ip[2];
     int isel[3];
+    float fe[2] = {3, 4}, fh[2] = {0, 5}, fused[2], fs[4];
+    uint16_t fw[8] = {0x3f80, 0, 0, 0, 0, 0, 0, 0x3f80};
+    uint16_t head[6] = {0x3f80, 0, 0, 0x3f80, 0xbf80, 0};
+    float hn[2], best_logit;
     glm53f_l2norm(q, 2, 1e-6f); glm53f_l2norm(k, 2, 1e-6f);
     glm53f_kda_step(s, q, k, v, 0.0f, 1.0f, 2, 3, out);
     glm53f_kda_step_streamed(s2, q, k, v, 0.0f, 1.0f, 2, 3, out2, work);
@@ -37,6 +41,12 @@ int main(void) {
     if (glm53f_index_select_decode(ip, isel, iq, iw, ik, ig, ia,
                                    3, 2, 2, 1, 2) != 3 ||
         isel[0] != 0 || isel[1] != 1 || isel[2] != 2) return 9;
-    printf("GLM53F_REF kda=ok router=ok mhc=ok cp=ok norm=ok topk=ok index=ok\n");
+    glm53f_mtp_fuse_bf16(fused, fs, fe, fh, one, one, fw, 2, 1e-5f);
+    if (fabsf(fused[0] - 3.0f / sqrtf(12.5f + 1e-5f)) > 1e-6f ||
+        fabsf(fused[1] - 5.0f / sqrtf(12.5f + 1e-5f)) > 1e-6f) return 10;
+    if (glm53f_vocab_argmax_bf16(fused, one, head, 2, 7, 3, 1e-5f,
+                                  hn, &best_logit) != 8 ||
+        !isfinite(best_logit)) return 11;
+    printf("GLM53F_REF kda=ok router=ok mhc=ok cp=ok norm=ok topk=ok index=ok fusion=ok head=ok\n");
     return 0;
 }
