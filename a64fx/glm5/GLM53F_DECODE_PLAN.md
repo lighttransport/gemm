@@ -44,6 +44,15 @@
   This communication-inclusive number is the current decode ceiling; it still
   excludes attention projection GEMVs, KDA/DSA math, router, norms, mHC, and the
   final vocabulary projection.
+- The checkpoint contains no E4M3 NaN payloads (a 0.1 GiB staged sample also
+  measured 0.00077% zeros and 0.01071% subnormals). Removing the redundant NaN
+  compares/select from the exact inner-loop decoder reduces expert/shared
+  compute from 15.758 to **14.49--14.57 ms/token**. Two matched 200-token runs
+  deliver **48.513 and 47.023 tok/s**, both with checksum `1.41924829e-05`.
+  The stager now rejects `0x7f/0xff`, making this a checked payload contract.
+  The INT8 SDOT alternative is not a single-token win: 4096x4096 SDOT measured
+  434 Gop/s versus 688 Gop/s for W8A16. Its 64-token register-blocked kernel is
+  2.37x faster, so retain it as a speculative/batched verification candidate.
 
 ## Decode decomposition
 
@@ -100,3 +109,15 @@ effective collective latency around 0.66 ms when expert work was imbalanced.
 Every benchmark must report kernel time, collective time, arrival-wait time,
 weight bytes/rank, and end-to-end tokens/s. A tight-loop collective number alone
 is not an end-to-end communication claim.
+
+## 100 tok/s assessment
+
+Strict single-token decode cannot reach 100 tok/s with the current FP8 graph:
+84 measured hidden-vector reductions already cost 6.12 ms/token, and the
+routed/shared path alone costs about 14.5 ms/token. Perfectly overlapping those
+two terms still caps this partial graph near 69 tok/s before attention
+projections, router/norm/mHC, and the vocabulary head. A credible 100+ delivered
+token/s target therefore requires multi-token/speculative verification (where
+the measured INT8 register-blocked kernel amortizes activation quantization),
+or a lower-bit expert representation plus fewer/overlapped collectives. It is
+not a scheduler-only target.

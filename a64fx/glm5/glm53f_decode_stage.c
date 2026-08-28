@@ -24,6 +24,7 @@ static int rank_id(void){const char*k[]={"PMIX_RANK","PJM_MPI_RANK","OMPI_COMM_W
 static int write_all(int fd,const void*p,size_t n){const unsigned char*b=p;while(n){ssize_t z=write(fd,b,n);if(z<0){if(errno==EINTR)continue;return -1;}b+=z;n-=(size_t)z;}return 0;}
 static int align_fd(int fd,uint64_t*off){uint64_t a=(*off+ALIGN-1)&~(uint64_t)(ALIGN-1);if(a!=*off&&lseek(fd,(off_t)a,SEEK_SET)<0)return-1;*off=a;return 0;}
 static int owned_part(int expert,int rank,int parts,int ranks){for(int p=0;p<parts;p++)if(glm53f_expert_part_owner(expert,p,parts,ranks)==rank)return p;return-1;}
+static int fp8_has_nan(const unsigned char*p,size_t n){for(size_t i=0;i<n;i++)if((p[i]&0x7f)==0x7f)return 1;return 0;}
 
 static int read_tensor(glm53f_st_context*st,const char*name,void**buf,size_t*cap,const st_tensor_info**ti){
     const st_tensor_info*t=glm53f_st_find(st,name,NULL);if(!t)return-1;
@@ -38,6 +39,7 @@ static int put_rows(int fd,uint64_t*off,FILE*mf,glm53f_st_context*st,const char*
     rowb=t->nbytes/(size_t)t->shape[0];begin=(uint64_t)r0*rowb;nb=(size_t)nr*rowb;
     if(*cap<nb){void*p=realloc(*buf,nb);if(!p)return-1;*buf=p;*cap=nb;}
     if(glm53f_st_read(st,src,(size_t)begin,*buf,nb))return-1;
+    if(!strcmp(t->dtype_str,"F8_E4M3")&&fp8_has_nan(*buf,nb)){errno=EDOM;return-1;}
     if(!fuse_append&&align_fd(fd,off))return-1;
     if(write_all(fd,*buf,nb))return-1;
     if(!fuse_append)fprintf(mf,"%"PRIu64" %s %d %d %"PRIu64" axis=0 begin=%d global=%"PRIu64" %s\n",
@@ -52,7 +54,11 @@ static int put_cols(int fd,uint64_t*off,FILE*mf,glm53f_st_context*st,const char*
     uint64_t start;
     if(!es||align_fd(fd,off))return-1;
     start=*off;
-    for(uint64_t r=0;r<t->shape[0];r++)if(write_all(fd,(unsigned char*)*buf+r*rowb+(size_t)c0*es,outrow))return-1;
+    for(uint64_t r=0;r<t->shape[0];r++){
+        unsigned char*p=(unsigned char*)*buf+r*rowb+(size_t)c0*es;
+        if(!strcmp(t->dtype_str,"F8_E4M3")&&fp8_has_nan(p,outrow)){errno=EDOM;return-1;}
+        if(write_all(fd,p,outrow))return-1;
+    }
     fprintf(mf,"%"PRIu64" %s 2 %"PRIu64" %d axis=1 begin=%d global=%"PRIu64" %s\n",
             start,t->dtype_str,t->shape[0],nc,c0,t->shape[1],dst);*off+=(uint64_t)t->shape[0]*outrow;return 0;
 }

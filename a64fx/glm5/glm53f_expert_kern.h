@@ -44,9 +44,8 @@ static inline svfloat32_t glm53f_fp8_e4m3_bits(svbool_t pg, const uint8_t *w, in
     svuint32_t bits = svsel_u32(
         svcmpne_n_u32(pg, exponent, 0), normal,
         svorr_u32_x(pg, svreinterpret_u32_f32(subnormal), sign));
-    svbool_t nan = svand_b_z(
-        pg, svcmpeq_n_u32(pg, exponent, 15), svcmpeq_n_u32(pg, mantissa, 7));
-    bits = svsel_u32(nan, svorr_n_u32_x(pg, sign, 0x7fc00000u), bits);
+    /* The staged checkpoint contract excludes E4M3 NaNs (0x7f/0xff).
+     * Avoid two compares and a select in the decode-token inner loop. */
     return svreinterpret_f32_u32(bits);
 }
 
