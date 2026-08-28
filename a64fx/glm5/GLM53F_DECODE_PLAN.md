@@ -24,6 +24,12 @@
   arrival wait is 8.617 ms/token. An unloaded MPI baseline is 73.2 us/call,
   or 3.075 ms/token, leaving **5.56 ms/token of rank-arrival skew**. Resident
   MemAvailable is 6.0--6.45 GiB/rank.
+- The checkpoint shared expert is 2048-wide (not the early synthetic 171-wide
+  assumption). Block-TP across 12 ranks gives 128/256-wide shards with 63.0 /
+  126.0 MiB weights/rank. The real 42-layer persistent-team stream costs
+  **2.833 ms/token** for a narrow shard and **4.234 ms/token** for a wide shard.
+  Add its partial hidden output to the routed partial before the existing MLP
+  combine; it does not require another collective.
 
 ## Decode decomposition
 

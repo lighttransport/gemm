@@ -60,6 +60,7 @@ static int put_cols(int fd,uint64_t*off,FILE*mf,glm53f_st_context*st,const char*
 int main(int argc,char**argv){
     const char*model=argc>1?argv[1]:getenv("GLM53F_MODEL_DIR");const char*out=getenv("GLM53F_STAGE_DIR");
     int rank=rank_id(),ranks=env_i("GLM53F_RANKS",12),parts=env_i("GLM53F_EXPERT_PARTS",4);
+    int shared_only=env_i("GLM53F_STAGE_SHARED_ONLY",0);
     int first=env_i("GLM53F_STAGE_FIRST_LAYER",3),last=env_i("GLM53F_STAGE_LAYERS",45);
     char model_dflt[256],out_dflt[256],bp[512],mp[512],name[512],virt[512];glm53f_st_context*st;void*buf=NULL;size_t cap=0;
     uint64_t off=0,last_sync=0,flush=1ull<<30;int nt=0,fd=-1;FILE*mf=NULL;double t0=now_sec();
@@ -70,7 +71,7 @@ int main(int argc,char**argv){
     st=glm53f_st_open(model);if(!st||glm53f_st_validate_contract(st,0)){fprintf(stderr,"checkpoint failed\n");return 2;}
     fd=open(bp,O_CREAT|O_TRUNC|O_WRONLY,0644);mf=fopen(mp,"w");if(fd<0||!mf){perror("stage output");return 2;}
     fprintf(mf,"# GLM53F_DECODE rank=%d ranks=%d expert_parts=%d layers=%d:%d\n",rank,ranks,parts,first,last);
-    for(int l=first;l<last;l++)for(int e=0;e<288;e++){
+    if(!shared_only)for(int l=first;l<last;l++)for(int e=0;e<288;e++){
         int p=owned_part(e,rank,parts,ranks),b,n;if(p<0)continue;
         /* F8 scales cover 128x128 blocks, so expert partitions must start and
          * end on a scale-block boundary. This is identical to equal slicing
@@ -88,6 +89,19 @@ int main(int argc,char**argv){
 #undef VM
         if(off-last_sync>=flush){fdatasync(fd);posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);last_sync=off;}
         if(e%48==47){printf("rank=%d layer=%d expert=%d staged=%.3fGiB sec=%.1f\n",rank,l,e,off/1073741824.0,now_sec()-t0);fflush(stdout);}
+    }
+    if(shared_only)for(int l=first;l<last;l++){
+        int b,n;glm53f_block_aligned_slice(2048,128,rank,ranks,&b,&n);
+#define SN(S) snprintf(name,sizeof name,"model.language_model.layers.%d.mlp.shared_experts.%s",l,S)
+#define SV(S) snprintf(virt,sizeof virt,"model.language_model.layers.%d.mlp.shared_experts.%s",l,S)
+        SN("gate_proj.weight");SV("gate_up_fused.weight");if(put_rows(fd,&off,mf,st,name,virt,b,n,2*n,0,&buf,&cap))goto fail;
+        SN("up_proj.weight");if(put_rows(fd,&off,mf,st,name,virt,b,n,2*n,1,&buf,&cap))goto fail;nt++;
+        SN("gate_proj.weight_scale_inv");SV("gate_up_fused.weight_scale_inv");if(put_rows(fd,&off,mf,st,name,virt,b/128,n/128,2*(n/128),0,&buf,&cap))goto fail;
+        SN("up_proj.weight_scale_inv");if(put_rows(fd,&off,mf,st,name,virt,b/128,n/128,2*(n/128),1,&buf,&cap))goto fail;nt++;
+        SN("down_proj.weight");SV("down_proj.weight");if(put_cols(fd,&off,mf,st,name,virt,b,n,&buf,&cap))goto fail;nt++;
+        SN("down_proj.weight_scale_inv");SV("down_proj.weight_scale_inv");if(put_cols(fd,&off,mf,st,name,virt,b/128,n/128,&buf,&cap))goto fail;nt++;
+#undef SN
+#undef SV
     }
     fdatasync(fd);posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);fclose(mf);close(fd);free(buf);glm53f_st_close(st);
     { const char*sd=getenv("GLM53F_STATUS_DIR"); if(sd&&*sd){char sp[512];snprintf(sp,sizeof sp,"%s/rank%02d.status",sd,rank);

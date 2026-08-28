@@ -13,6 +13,23 @@ typedef struct {
     int inter;
 } glm53f_expert_part;
 
+static inline float glm53f_fp8_e4m3_scalar(uint8_t q) {
+    int sign = q >> 7, exponent = (q >> 3) & 15, mantissa = q & 7;
+    float v;
+    if (!exponent) v = (float)mantissa / 512.0f;
+    else if (exponent == 15 && mantissa == 7) return NAN;
+    else v = ldexpf(1.0f + (float)mantissa / 8.0f, exponent - 7);
+    return sign ? -v : v;
+}
+
+static inline float glm53f_dot_fp8_block128(
+        const uint8_t *w, const float *scale, const float *x, int cols) {
+    double acc = 0;
+    for (int c = 0; c < cols; ++c)
+        acc += (double)glm53f_fp8_e4m3_scalar(w[c]) * scale[c / 128] * x[c];
+    return (float)acc;
+}
+
 #if defined(__ARM_FEATURE_SVE)
 static inline svfloat32_t glm53f_fp8_e4m3_bits(svbool_t pg, const uint8_t *w, int c) {
     svuint32_t q = svld1ub_u32(pg, w + c);
@@ -65,6 +82,45 @@ static inline void glm53f_matvec_fp8_bits_8(
     dst[6] = svaddv_f32(pt, a6); dst[7] = svaddv_f32(pt, a7);
 }
 
+static inline void glm53f_mv_fp8_block128_bits(
+        float *y, const uint8_t *w, const float *scale,
+        const float *x, int rows, int cols) {
+    int blocks = (cols + 127) / 128, n8 = rows / 8;
+#pragma omp parallel for schedule(static)
+    for (int bi = 0; bi < n8; ++bi) {
+        int r = bi * 8;
+        glm53f_matvec_fp8_bits_8(
+            y + r, w + (size_t)r * cols,
+            scale + (size_t)(r / 128) * blocks, x, cols);
+    }
+    for (int r = n8 * 8; r < rows; ++r)
+        y[r] = glm53f_dot_fp8_block128(
+            w + (size_t)r * cols, scale + (size_t)(r / 128) * blocks, x, cols);
+}
+
+static inline void glm53f_mv_fp8_block128_bits_2(
+        float *y0, const uint8_t *w0, const float *s0, int rows0,
+        float *y1, const uint8_t *w1, const float *s1, int rows1,
+        const float *x, int cols) {
+    int blocks = (cols + 127) / 128, n0 = rows0 / 8, n1 = rows1 / 8;
+#pragma omp parallel for schedule(static)
+    for (int bi = 0; bi < n0 + n1; ++bi) {
+        int second = bi >= n0, r = (second ? bi - n0 : bi) * 8;
+        const uint8_t *w = second ? w1 : w0;
+        const float *s = second ? s1 : s0;
+        float *y = second ? y1 : y0;
+        glm53f_matvec_fp8_bits_8(
+            y + r, w + (size_t)r * cols,
+            s + (size_t)(r / 128) * blocks, x, cols);
+    }
+    for (int r = n0 * 8; r < rows0; ++r)
+        y0[r] = glm53f_dot_fp8_block128(
+            w0 + (size_t)r * cols, s0 + (size_t)(r / 128) * blocks, x, cols);
+    for (int r = n1 * 8; r < rows1; ++r)
+        y1[r] = glm53f_dot_fp8_block128(
+            w1 + (size_t)r * cols, s1 + (size_t)(r / 128) * blocks, x, cols);
+}
+
 /* Run `batch` independent quarter experts concurrently. Threads are divided
  * into equal teams; batch=4 and 48 threads maps one 12-core team to each CMG. */
 static inline void glm53f_expert_batch_bits(
@@ -74,9 +130,15 @@ static inline void glm53f_expert_batch_bits(
 #pragma omp parallel
     {
         int tid = omp_get_thread_num(), nth = omp_get_num_threads();
-        int lanes = nth / batch;
-        int task = lanes ? tid / lanes : batch;
-        int lane = lanes ? tid % lanes : 0;
+        int total_units = 0, task = batch, lane = 0, lanes = 0, prefix = 0;
+        for (int j = 0; j < batch; ++j) total_units += part[j].inter / 128;
+        for (int j = 0; j < batch; ++j) {
+            int units = part[j].inter / 128;
+            int begin = nth * prefix / total_units;
+            int end = nth * (prefix + units) / total_units;
+            if (tid >= begin && tid < end) { task = j; lane = tid - begin; lanes = end - begin; }
+            prefix += units;
+        }
         if (task < batch) {
             int inter = part[task].inter, gate_up = 2 * inter;
             for (int bi = lane; bi < gate_up / 8; bi += lanes) {
