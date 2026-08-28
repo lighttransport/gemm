@@ -4,7 +4,9 @@
 
 - Full 34-layer/64-head KDA recurrent update, 136 MiB replicated test state:
   **1.483 ms/token** best at 24 threads. The production head-TP layout owns only
-  5--6 heads/rank, so KDA state arithmetic is not the primary limiter.
+  5--6 heads/rank. The measured six-head/rank shape is **0.047 ms best /
+  0.049 ms mean** at 48 threads, confirming KDA state arithmetic is not the
+  primary limiter.
 - Production uTofu all-reduce, 12 ranks, 4096 f32 values: **105.9 us**.
 - 78 back-to-back reductions: **5.02 ms/token**. Robust modes 0/1/2 are equal;
   changing completion mode is not a useful optimization.
@@ -14,7 +16,8 @@
   exact gather-free decoder, versus 0.477 ms/task with the LUT-gather decoder.
   A four-task/four-CMG kernel reduces the measured batch critical path to
   **1.13 ms mean / 0.424 ms best** while the background full-model stager is
-  active. Repeat the steady-state number after staging exits.
+  active; the distributed steady-state result below supersedes this isolated
+  estimate.
 - Full 42-layer, 12-rank four-way expert decode with 23.631 GiB anonymous
   weights/rank and one real 4096-float MPI combine/layer: **47.39 tok/s** over
   200 tokens (**21.104 ms/token**). Compute is 12.615 ms/token; combine plus

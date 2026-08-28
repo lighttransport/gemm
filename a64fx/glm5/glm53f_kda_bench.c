@@ -10,12 +10,14 @@
 
 static double now_sec(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
 int main(void) {
-    enum { L=34, H=64, D=128, NH=L*H };
+    enum { L=34, D=128 };
+    int H=getenv("HEADS_PER_RANK")?atoi(getenv("HEADS_PER_RANK")):64;
+    int NH=L*H;
     size_t nelem=(size_t)NH*D*D, bytes=nelem*sizeof(float);
     int reps=getenv("REPS")?atoi(getenv("REPS")):20, r, h;
     float *state=NULL, *q=NULL, *k=NULL, *v=NULL, *out=NULL, *work=NULL;
     double best=1e30, sum=0; volatile double sink=0;
-    if(posix_memalign((void**)&state,256,bytes)||posix_memalign((void**)&q,256,(size_t)NH*D*4)||
+    if(H<1||H>64||posix_memalign((void**)&state,256,bytes)||posix_memalign((void**)&q,256,(size_t)NH*D*4)||
        posix_memalign((void**)&k,256,(size_t)NH*D*4)||posix_memalign((void**)&v,256,(size_t)NH*D*4)||
        posix_memalign((void**)&out,256,(size_t)NH*D*4)||posix_memalign((void**)&work,256,(size_t)NH*D*4)) return 2;
 #pragma omp parallel for schedule(static)
