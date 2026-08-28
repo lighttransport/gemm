@@ -9,6 +9,12 @@
 - 78 back-to-back reductions: **5.02 ms/token**. Robust modes 0/1/2 are equal;
   changing completion mode is not a useful optimization.
 - Physical 1M CP cache allocation: 12/12 ranks pass with 1.28 GiB/rank committed.
+- Real staged F8_E4M3 quarter-expert (1024x4096 gate/up + 4096x512 down),
+  anonymous resident weights: **0.438 ms/task mean** at 24 threads with the
+  exact gather-free decoder, versus 0.477 ms/task with the LUT-gather decoder.
+  A four-task/four-CMG kernel reduces the measured batch critical path to
+  **1.13 ms mean / 0.424 ms best** while the background full-model stager is
+  active. Repeat the steady-state number after staging exits.
 
 ## Decode decomposition
 
@@ -18,7 +24,10 @@ Use one process per A64FX node and all 12 ranks as the expert group.
   Part `p` belongs to `(e % 12 + p*3) % 12`; each rank holds 96 quarter-experts.
   A synthetic occupancy simulation plus exact-shape GEMVs reduced the expected
   slowest-rank expert critical path from ~0.47 to ~0.29 ms/layer versus whole
-  experts. The existing MLP hidden-vector sum combines the partial outputs.
+  experts. An exhaustive search of all translated four-owner offset sets confirms
+  `{0,3,6,9}` has the lowest top-8 slowest-rank occupancy: mean 4.061 tasks,
+  p95/p99 6/6. Execute local hits concurrently as independent CMG teams; the
+  existing MLP hidden-vector sum combines the partial outputs.
 - KDA layers: partition 64 heads as balanced contiguous ranges (5 or 6/rank).
   Q/K/V, gates, convolution channels, and recurrent state follow head ownership.
   `o_proj` is column-parallel; one hidden-vector sum completes attention.
@@ -40,7 +49,9 @@ effective collective latency around 0.66 ms when expert work was imbalanced.
 ## Optimization order
 
 1. Decode-only rank-owned stager; do not stage vision or unused MTP tensors.
-2. BF16 KDA projection GEMVs and FP8 routed/shared-expert GEMVs.
+2. BF16 KDA projection GEMVs and FP8 routed/shared-expert GEMVs. Keep checkpoint
+   scales compressed at one F32 value per 128x128 block; use the exact SVE
+   bit-decode path rather than LUT gathers.
 3. Short-context head-TP forward with exactly two reductions/layer.
 4. Expert scheduling sorted by local hit count to reduce rank skew.
 5. Continuous batch after single-stream correctness; decode FP8 weights once per
