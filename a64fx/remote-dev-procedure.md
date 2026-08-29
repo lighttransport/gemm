@@ -258,6 +258,24 @@ compute-to-login SSH calls, so health probes cannot consume the remainder of
 the supervisor script. This path was validated end to end on 2026-08-23 with
 interactive job 50790829.
 
+The 12-node GLM-5.3F continuation allocation was relaunched on 2026-08-30 as
+interactive job **51086028**, with the maximum six-hour elapsed limit. It uses
+the next port pair after the prior GLM session:
+
+```text
+local HTTP port    42396
+login reverse port 32396
+compute HTTP port  21264
+nodes              12
+elapsed limit      06:00:00
+compute host       d27-7002c
+```
+
+The persistent shell session is `ed377c9e2d1e4f0e8bad648f6d15b114`. The local
+launcher is kept in the `codex-a64fx-12n` tmux session, with log
+`tmp/codex-remote-dev-42396/interactive-tmux.log`; open the matching tunnel
+with `LOCAL_PORT=42396 REMOTE_PORT=32396`.
+
 ## Wait for readiness
 
 Inspect the saved job ID and PJM state:
