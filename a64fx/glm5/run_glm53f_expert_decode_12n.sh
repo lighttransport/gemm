@@ -8,7 +8,7 @@ if [ "$np" -ne 12 ]; then
     exit 2
 fi
 
-stage=${GLM53F_STAGE_DIR:-/local/glm53f-decode-${PJM_JOBID}}
+stage=${GLM53F_STAGE_DIR:-/local/glm53f-target-routed-${PJM_JOBID}}
 tokens=${GLM53F_DECODE_TOKENS:-20}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-48}
 export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
