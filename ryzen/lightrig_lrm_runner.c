@@ -1,0 +1,9 @@
+#include "lightrig_mlp2.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define SAFETENSORS_IMPLEMENTATION
+#include "../common/safetensors.h"
+static const float *tensor(st_context *s,const char*n,uint32_t rows,uint32_t cols){int i=safetensors_find(s,n);const uint64_t *sh;if(i<0||strcmp(safetensors_dtype(s,i),"F32")||safetensors_ndims(s,i)!=(rows==1?1:2))return NULL;sh=safetensors_shape(s,i);if((rows==1?sh[0]!=cols:sh[0]!=rows||sh[1]!=cols))return NULL;return safetensors_data(s,i);}
+int main(int argc,char **argv){st_context*s;int i;const uint64_t*a,*b;uint32_t in,h,out;const float*w1,*b1,*w2,*b2,*mean,*scale,*omean,*oscale;float*x,*scratch,*y;if(argc!=3){fprintf(stderr,"usage: %s MODEL.lrm INPUT.txt\n",argv[0]);return 2;}s=safetensors_open(argv[1]);if(!s)return 1;i=safetensors_find(s,"fc1.weight");if(i<0||safetensors_ndims(s,i)!=2)return 1;a=safetensors_shape(s,i);i=safetensors_find(s,"fc2.weight");if(i<0||safetensors_ndims(s,i)!=2)return 1;b=safetensors_shape(s,i);if(a[0]>65536||a[1]>65536||b[0]>65536||b[1]!=a[0])return 1;h=a[0];in=a[1];out=b[0];w1=tensor(s,"fc1.weight",h,in);b1=tensor(s,"fc1.bias",1,h);w2=tensor(s,"fc2.weight",out,h);b2=tensor(s,"fc2.bias",1,out);if(!w1||!b1||!w2||!b2)return 1;x=malloc(in*4);scratch=malloc(h*4);y=malloc(out*4);if(!x||!scratch||!y)return 1;FILE*f=fopen(argv[2],"r");if(!f)return 1;for(uint32_t k=0;k<in;++k)if(fscanf(f,"%f",x+k)!=1)return 1;fclose(f);mean=tensor(s,"input.mean",1,in);scale=tensor(s,"input.scale",1,in);omean=tensor(s,"output.mean",1,out);oscale=tensor(s,"output.scale",1,out);if((mean||scale)&&(!mean||!scale))return 1;for(uint32_t k=0;k<in;++k)if(mean)x[k]=(x[k]-mean[k])*scale[k];lt_mlp2_f32(x,w1,b1,w2,b2,scratch,y,in,h,out);for(uint32_t k=0;k<out;++k)printf("%s%.9g",k?",":"",omean?y[k]*oscale[k]+omean[k]:y[k]);puts("");free(x);free(scratch);free(y);safetensors_close(s);return 0;}
