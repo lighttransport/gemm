@@ -325,3 +325,10 @@ output projection, and **0.934 ms all-reduce** (rank variation is 0.30--0.52 ms
 for the local graph). This identifies collective latency/overlap as the next
 KDA optimization target; further standalone projection micro-optimizations are
 unlikely to move end-to-end decode materially.
+
+An MLA head-dimension parallelization experiment (commit `58dee7e5`) preserved
+the exact token stream but regressed the 12-node target to **17.624 tok/s**
+(56.742 ms/token); attention rose to 25.084 ms/token. The additional OpenMP
+regions and working-set effects outweigh the extra parallelism for 5--6 local
+heads, so the experiment is reverted and the 18.140 tok/s implementation stays
+as the performance baseline.
