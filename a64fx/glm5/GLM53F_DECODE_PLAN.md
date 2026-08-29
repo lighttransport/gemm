@@ -226,6 +226,10 @@ helpers is exact and improves the 16-token profiled target run from 59.812 to
 58.657 ms/token (16.719 to 17.048 tok/s); attention falls from 25.761 to
 24.689 ms/token.
 
+The same build improves the 8-cycle MTP-3 run from 9.634 to **9.683 delivered
+tok/s** (alpha 0.4167, 26 delivered tokens, PASS); target/verify phases are
+66.022/247.587 ms per cycle.
+
 Runtime context allocation tests establish **256K as the minimum-safe target
 and 512K as the preferred maximum** for the current 32 GiB/rank layout. The
 planner's theoretical 1M estimate above does not satisfy the runtime 2 GiB
