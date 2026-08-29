@@ -280,6 +280,7 @@ static inline int glm53f_mla_absorbed_sve(float *out, const float *query,
      * caller's stack avoids two allocator round-trips for every KDA layer;
      * SVE loads/stores are valid for the natural VLA alignment. */
     float qlat[(size_t)heads * latent_dim];
+    float vacc[(size_t)heads * latent_dim];
     float logit[(size_t)heads * n_selected];
 #pragma omp parallel for schedule(static)
     for (int h = 0; h < heads; ++h) {
