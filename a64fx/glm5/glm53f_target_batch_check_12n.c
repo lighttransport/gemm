@@ -73,6 +73,7 @@ int main(int argc, char **argv) {
     for (int t = 0; t < TOKENS; t++) glm53f_target_snapshot_free_12n(after[t]);
     glm53f_target_snapshot_free_12n(seq_final);
     glm53f_target_snapshot_free_12n(initial);
+    glm53f_target_profile_report_12n(m, "batch_check");
     glm53f_target_model_free_12n(m);
     glm53f_collective_free_12n();
     MPI_Finalize();
