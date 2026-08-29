@@ -12,6 +12,7 @@
 #include "glm53f_sparse_12n.h"
 #include "glm53f_target_head_12n.h"
 #include "glm53f_target_layer_12n.h"
+#include "glm53f_target_model_12n.h"
 
 enum { LAYERS = 45, HIDDEN = 4096, STREAMS = 4, FLAT = 16384, MIX = 24 };
 
@@ -55,18 +56,135 @@ static int load_layer(glm53f_st_context *st, int layer,
            w->input_norm&&w->post_attention_norm?0:-1;
 }
 
-int main(int argc, char **argv) {
-    int rank, ranks, token, steps, capacity;
-    glm53f_st_context *st;
+struct glm53f_target_model_12n {
     glm53f_target_layer_weights_12n layer_weight[LAYERS];
-    glm53f_kda_context_12n *kda[LAYERS] = {0};
-    glm53f_sparse_context_12n *sparse[LAYERS] = {0};
-    glm53f_dense_ffn_context_12n *dense[3] = {0};
+    glm53f_kda_context_12n *kda[LAYERS];
+    glm53f_sparse_context_12n *sparse[LAYERS];
+    glm53f_dense_ffn_context_12n *dense[3];
     glm53f_moe_stage_context_12n *moe;
     glm53f_embedding_context_12n *embedding;
     glm53f_target_head_context_12n *head;
     glm53f_target_layer_scratch_12n *scratch;
     float *streams;
+};
+struct glm53f_target_snapshot_12n {
+    unsigned char *kda_state;
+    size_t kda_bytes;
+    int sparse_length[LAYERS];
+};
+
+glm53f_target_model_12n *glm53f_target_model_create_12n(
+        const char *model_dir, const char *routed, const char *shared,
+        int capacity) {
+    int ranks;
+    glm53f_st_context *st;
+    glm53f_target_model_12n *m = calloc(1, sizeof(*m));
+    if (!m || capacity < 1) goto fail;
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+    if (ranks != 12) goto fail;
+    st = glm53f_st_open(model_dir);
+    if (!st) goto fail;
+    for (int l = 0; l < LAYERS; ++l)
+        if (load_layer(st, l, &m->layer_weight[l])) {
+            glm53f_st_close(st);
+            goto fail;
+        }
+    glm53f_st_close(st);
+    m->embedding = glm53f_embedding_create_12n(model_dir);
+    m->head = glm53f_target_head_create_12n(model_dir);
+    for (int l = 0; l < LAYERS; ++l) {
+        if (l % 4 == 3) m->sparse[l] = glm53f_sparse_create_12n(model_dir, l, capacity);
+        else m->kda[l] = glm53f_kda_create_12n(model_dir, l);
+        if (!m->sparse[l] && !m->kda[l]) goto fail;
+    }
+    for (int l = 0; l < 3; ++l) {
+        m->dense[l] = glm53f_dense_ffn_create_12n(model_dir, l);
+        if (!m->dense[l]) goto fail;
+    }
+    m->moe = glm53f_moe_stage_create_12n(routed, shared, model_dir, 3, 42);
+    m->scratch = a256(sizeof(*m->scratch));
+    m->streams = a256((size_t)FLAT * sizeof(float));
+    if (!m->embedding || !m->head || !m->moe || !m->scratch || !m->streams) goto fail;
+    return m;
+fail:
+    glm53f_target_model_free_12n(m);
+    return NULL;
+}
+
+int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
+        int *next_token, float *next_logit, float *target_hidden) {
+    if (!m || !next_token || !next_logit ||
+        glm53f_embedding_streams_12n(m->embedding, token, m->streams)) return -1;
+    for (int l = 0; l < LAYERS; ++l) {
+        glm53f_target_sublayer_12n attention = m->kda[l] ?
+            glm53f_kda_sublayer_12n : glm53f_sparse_sublayer_12n;
+        void *attention_context = m->kda[l] ?
+            (void *)m->kda[l] : (void *)m->sparse[l];
+        glm53f_target_sublayer_12n ffn;
+        void *ffn_context;
+        if (l < 3) {
+            ffn = glm53f_dense_ffn_sublayer_12n;
+            ffn_context = m->dense[l];
+        } else {
+            glm53f_moe_stage_set_layer_12n(m->moe, l);
+            ffn = glm53f_moe_stage_sublayer_12n;
+            ffn_context = m->moe;
+        }
+        if (glm53f_target_layer_forward_12n(m->streams, &m->layer_weight[l],
+                attention, attention_context, ffn, ffn_context, m->scratch)) return -1;
+    }
+    if (target_hidden) {
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < HIDDEN; ++i) {
+            float z = 0.0f;
+            for (int s = 0; s < STREAMS; ++s) z += m->streams[(size_t)s * HIDDEN + i];
+            target_hidden[i] = z / STREAMS;
+        }
+    }
+    return glm53f_target_head_argmax_12n(m->head, m->streams, next_token, next_logit);
+}
+
+glm53f_target_snapshot_12n *glm53f_target_snapshot_create_12n(
+        const glm53f_target_model_12n *m) {
+    if (!m) return NULL;
+    glm53f_target_snapshot_12n *s = calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    for (int l = 0; l < LAYERS; ++l)
+        s->kda_bytes += glm53f_kda_state_bytes_12n(m->kda[l]);
+    s->kda_state = a256(s->kda_bytes ? s->kda_bytes : 1);
+    if (!s->kda_state) { free(s); return NULL; }
+    return s;
+}
+void glm53f_target_snapshot_free_12n(glm53f_target_snapshot_12n*s){if(s){free(s->kda_state);free(s);}}
+int glm53f_target_snapshot_save_12n(const glm53f_target_model_12n*m,glm53f_target_snapshot_12n*s){if(!m||!s)return-1;size_t off=0;for(int l=0;l<LAYERS;l++){size_t n=glm53f_kda_state_bytes_12n(m->kda[l]);if(n&&glm53f_kda_save_state_12n(m->kda[l],s->kda_state+off,n))return-1;off+=n;s->sparse_length[l]=glm53f_sparse_length_12n(m->sparse[l]);}return off==s->kda_bytes?0:-1;}
+int glm53f_target_snapshot_restore_12n(glm53f_target_model_12n*m,const glm53f_target_snapshot_12n*s){if(!m||!s)return-1;size_t off=0;for(int l=0;l<LAYERS;l++){size_t n=glm53f_kda_state_bytes_12n(m->kda[l]);if(n&&glm53f_kda_restore_state_12n(m->kda[l],s->kda_state+off,n))return-1;off+=n;if(m->sparse[l]&&glm53f_sparse_restore_length_12n(m->sparse[l],s->sparse_length[l]))return-1;}return off==s->kda_bytes?0:-1;}
+
+void glm53f_target_model_free_12n(glm53f_target_model_12n *m) {
+    if (!m) return;
+    free(m->streams); free(m->scratch);
+    glm53f_moe_stage_free_12n(m->moe);
+    for (int l = 0; l < 3; ++l) glm53f_dense_ffn_free_12n(m->dense[l]);
+    for (int l = 0; l < LAYERS; ++l) {
+        glm53f_sparse_free_12n(m->sparse[l]);
+        glm53f_kda_free_12n(m->kda[l]);
+        free((void *)m->layer_weight[l].post_attention_norm);
+        free((void *)m->layer_weight[l].input_norm);
+        free((void *)m->layer_weight[l].ffn_mhc.scale);
+        free((void *)m->layer_weight[l].ffn_mhc.base);
+        free((void *)m->layer_weight[l].ffn_mhc.fn);
+        free((void *)m->layer_weight[l].attention_mhc.scale);
+        free((void *)m->layer_weight[l].attention_mhc.base);
+        free((void *)m->layer_weight[l].attention_mhc.fn);
+    }
+    glm53f_target_head_free_12n(m->head);
+    glm53f_embedding_free_12n(m->embedding);
+    free(m);
+}
+
+#ifndef GLM53F_TARGET_MODEL_NO_MAIN
+int main(int argc, char **argv) {
+    int rank, ranks, token, steps;
+    glm53f_target_model_12n *model;
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
@@ -76,39 +194,17 @@ int main(int argc, char **argv) {
     }
     token=argc>4?atoi(argv[4]):1;steps=argc>5?atoi(argv[5]):1;
     if(token<0||token>=154880||steps<1||steps>32)MPI_Abort(MPI_COMM_WORLD,2);
-    capacity=steps;
-    st=glm53f_st_open(argv[1]);if(!st)MPI_Abort(MPI_COMM_WORLD,2);
-    for(int l=0;l<LAYERS;l++)if(load_layer(st,l,&layer_weight[l]))MPI_Abort(MPI_COMM_WORLD,2);
-    glm53f_st_close(st);
-    embedding=glm53f_embedding_create_12n(argv[1]);
-    head=glm53f_target_head_create_12n(argv[1]);
-    for(int l=0;l<LAYERS;l++){
-        if(l%4==3)sparse[l]=glm53f_sparse_create_12n(argv[1],l,capacity);
-        else kda[l]=glm53f_kda_create_12n(argv[1],l);
-    }
-    for(int l=0;l<3;l++)dense[l]=glm53f_dense_ffn_create_12n(argv[1],l);
-    moe=glm53f_moe_stage_create_12n(argv[2],argv[3],argv[1],3,42);
-    scratch=a256(sizeof(*scratch));streams=a256((size_t)FLAT*sizeof(float));
-    if(!embedding||!head||!moe||!scratch||!streams)MPI_Abort(MPI_COMM_WORLD,2);
+    model=glm53f_target_model_create_12n(argv[1],argv[2],argv[3],steps);
+    if(!model)MPI_Abort(MPI_COMM_WORLD,2);
     MPI_Barrier(MPI_COMM_WORLD);double begin=MPI_Wtime();
     for(int step=0;step<steps;step++){
-        if(glm53f_embedding_streams_12n(embedding,token,streams))MPI_Abort(MPI_COMM_WORLD,2);
-        for(int l=0;l<LAYERS;l++){
-            glm53f_target_sublayer_12n attention=kda[l]?glm53f_kda_sublayer_12n:glm53f_sparse_sublayer_12n;
-            void*attention_context=kda[l]?(void*)kda[l]:(void*)sparse[l];
-            glm53f_target_sublayer_12n ffn;
-            void*ffn_context;
-            if(l<3){ffn=glm53f_dense_ffn_sublayer_12n;ffn_context=dense[l];}
-            else{glm53f_moe_stage_set_layer_12n(moe,l);ffn=glm53f_moe_stage_sublayer_12n;ffn_context=moe;}
-            if(glm53f_target_layer_forward_12n(streams,&layer_weight[l],attention,
-                    attention_context,ffn,ffn_context,scratch))MPI_Abort(MPI_COMM_WORLD,2);
-        }
         float value;
-        if(glm53f_target_head_argmax_12n(head,streams,&token,&value))MPI_Abort(MPI_COMM_WORLD,2);
+        if(glm53f_target_model_step_12n(model,token,&token,&value,NULL))MPI_Abort(MPI_COMM_WORLD,2);
         if(!rank)printf("GLM53F_TARGET_TOKEN step=%d token=%d logit=%.9g\n",step,token,value);
     }
     double elapsed=MPI_Wtime()-begin,max_elapsed;MPI_Reduce(&elapsed,&max_elapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     if(!rank)printf("GLM53F_TARGET_DECODE_12N steps=%d ms_tok=%.3f tok_s=%.3f final_token=%d PASS\n",steps,max_elapsed*1e3/steps,steps/max_elapsed,token);
-    glm53f_moe_stage_free_12n(moe);glm53f_target_head_free_12n(head);glm53f_embedding_free_12n(embedding);
+    glm53f_target_model_free_12n(model);
     MPI_Finalize();return 0;
 }
+#endif

@@ -62,6 +62,9 @@ int glm53f_kda_sublayer_12n(void*context,float*out,const float*x){glm53f_kda_con
 #pragma omp parallel for schedule(static)
     for(int r=0;r<H;r++)c->partial[r]=dot1(w->op+(size_t)r*qd,c->normed,qd);double t2=MPI_Wtime();int rc=MPI_Allreduce(c->partial,out,H,MPI_FLOAT,MPI_SUM,MPI_COMM_WORLD);double t3=MPI_Wtime();c->phase[0]=t1-t0;c->phase[1]=t2-t1;c->phase[2]=t3-t2;return rc==MPI_SUCCESS?0:-1;}
 void glm53f_kda_last_phase_12n(const glm53f_kda_context_12n*c,double p[3]){memcpy(p,c->phase,sizeof(c->phase));}
+size_t glm53f_kda_state_bytes_12n(const glm53f_kda_context_12n*c){return c?((size_t)c->hn*D*D+(size_t)3*c->qd*KERNEL)*sizeof(float):0;}
+int glm53f_kda_save_state_12n(const glm53f_kda_context_12n*c,void*dst,size_t bytes){size_t sb=c?(size_t)c->hn*D*D*sizeof(float):0,need=glm53f_kda_state_bytes_12n(c);if(!c||!dst||bytes<need)return-1;memcpy(dst,c->state,sb);memcpy((unsigned char*)dst+sb,c->conv,need-sb);return 0;}
+int glm53f_kda_restore_state_12n(glm53f_kda_context_12n*c,const void*src,size_t bytes){size_t sb=c?(size_t)c->hn*D*D*sizeof(float):0,need=glm53f_kda_state_bytes_12n(c);if(!c||!src||bytes<need)return-1;memcpy(c->state,src,sb);memcpy(c->conv,(const unsigned char*)src+sb,need-sb);return 0;}
 void glm53f_kda_free_12n(glm53f_kda_context_12n*c){if(!c)return;free(c->partial);free(c->state);free(c->conv);free(c->work);free(c->normed);free(c->core);free(c->beta);free(c->decay);free(c->gate);free(c->small);free(c->qkv);free(c->w.op);free(c->w.on);free(c->w.ga);free(c->w.fa);free(c->w.gb);free(c->w.b);free(c->w.fb);free(c->w.vc);free(c->w.kc);free(c->w.qc);free(c->w.v);free(c->w.k);free(c->w.q);free(c->w.dt);free(c->w.al);free(c);}
 
 #ifndef GLM53F_KDA_NO_MAIN
