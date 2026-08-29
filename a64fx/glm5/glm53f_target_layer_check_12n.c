@@ -8,6 +8,7 @@
 #include "../../common/glm53f_safetensors.h"
 #include "glm53f_kda_12n.h"
 #include "glm53f_moe_stage_12n.h"
+#include "glm53f_sparse_12n.h"
 #include "glm53f_target_layer_12n.h"
 
 enum { HIDDEN = 4096, STREAMS = 4, FLAT = HIDDEN * STREAMS, MIX = 24 };
@@ -58,6 +59,7 @@ int main(int argc, char **argv) {
     glm53f_target_layer_weights_12n weights;
     glm53f_target_layer_scratch_12n *scratch;
     glm53f_kda_context_12n *kda;
+    glm53f_sparse_context_12n *sparse;
     glm53f_moe_stage_context_12n *moe;
     float *initial, *streams[2];
     double elapsed[2], max_elapsed;
@@ -70,9 +72,12 @@ int main(int argc, char **argv) {
     st = glm53f_st_open(argv[1]);
     if (!st || load_layer_weights(st, layer, &weights)) MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_st_close(st);
-    kda = glm53f_kda_create_12n(argv[1], layer);
+    kda = NULL;
+    sparse = NULL;
+    if (layer % 4 == 3) sparse = glm53f_sparse_create_12n(argv[1], layer, 8);
+    else kda = glm53f_kda_create_12n(argv[1], layer);
     moe = glm53f_moe_stage_create_12n(argv[2], argv[3], argv[1], 3, 42);
-    if (!kda || !moe) MPI_Abort(MPI_COMM_WORLD, 2);
+    if ((!kda && !sparse) || !moe) MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_moe_stage_set_layer_12n(moe, layer);
     scratch = aligned_alloc_256(sizeof(*scratch));
     initial = aligned_alloc_256((size_t)FLAT * sizeof(float));
@@ -83,11 +88,14 @@ int main(int argc, char **argv) {
         initial[i] = (float)(((i * 17 + 3) % 251) - 125) / 125.0f;
     for (int pass = 0; pass < 2; ++pass) {
         memcpy(streams[pass], initial, (size_t)FLAT * sizeof(float));
-        glm53f_kda_reset_12n(kda);
+        if (kda) glm53f_kda_reset_12n(kda);
+        else glm53f_sparse_reset_12n(sparse);
         MPI_Barrier(MPI_COMM_WORLD);
         double begin = MPI_Wtime();
         local_ok = !glm53f_target_layer_forward_12n(
-            streams[pass], &weights, glm53f_kda_sublayer_12n, kda,
+            streams[pass], &weights,
+            kda ? glm53f_kda_sublayer_12n : glm53f_sparse_sublayer_12n,
+            kda ? (void *)kda : (void *)sparse,
             glm53f_moe_stage_sublayer_12n, moe, scratch);
         elapsed[pass] = MPI_Wtime() - begin;
         if (!local_ok) MPI_Abort(MPI_COMM_WORLD, 2);
@@ -101,11 +109,13 @@ int main(int argc, char **argv) {
     MPI_Allreduce(&local_ok, &ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     MPI_Reduce(&elapsed[1], &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!rank)
-        printf("GLM53F_TARGET_LAYER_12N layer=%d real_kda=1 real_router_moe=1 "
+        printf("GLM53F_TARGET_LAYER_12N layer=%d attention=%s real_router_moe=1 "
                "max_ms=%.3f repeat=%s checksum=%.9g %s\n", layer,
-               max_elapsed * 1e3, ok ? "BIT_EXACT" : "FAIL", checksum,
+               kda ? "KDA" : "SPARSE", max_elapsed * 1e3,
+               ok ? "BIT_EXACT" : "FAIL", checksum,
                ok ? "PASS" : "FAIL");
     glm53f_moe_stage_free_12n(moe);
+    glm53f_sparse_free_12n(sparse);
     glm53f_kda_free_12n(kda);
     MPI_Finalize();
     return ok ? 0 : 1;
