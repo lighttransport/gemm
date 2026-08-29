@@ -8,7 +8,7 @@ if [ "$np" -ne 12 ]; then
     exit 2
 fi
 
-stage=${GLM53F_SHARED_STAGE_DIR:-/local/glm53f-shared-${PJM_JOBID}}
+stage=${GLM53F_SHARED_STAGE_DIR:-/local/glm53f-target-shared-${PJM_JOBID}}
 status=${GLM53F_SHARED_STATUS_DIR:-$PWD/stage_status_${PJM_JOBID}_shared}
 mkdir -p "$stage" "$status"
 export GLM53F_RANKS=12

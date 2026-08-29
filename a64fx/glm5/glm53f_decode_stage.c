@@ -1,4 +1,4 @@
-/* Stage four-way sliced GLM-5.3F routed experts to node-local storage. */
+/* Stage block-aligned 12-way GLM-5.3F experts to node-local storage. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -65,13 +65,13 @@ static int put_cols(int fd,uint64_t*off,FILE*mf,glm53f_st_context*st,const char*
 
 int main(int argc,char**argv){
     const char*model=argc>1?argv[1]:getenv("GLM53F_MODEL_DIR");const char*out=getenv("GLM53F_STAGE_DIR");
-    int rank=rank_id(),ranks=env_i("GLM53F_RANKS",12),parts=env_i("GLM53F_EXPERT_PARTS",4);
+    int rank=rank_id(),ranks=env_i("GLM53F_RANKS",12),parts=env_i("GLM53F_EXPERT_PARTS",12);
     int shared_only=env_i("GLM53F_STAGE_SHARED_ONLY",0);
     int first=env_i("GLM53F_STAGE_FIRST_LAYER",3),last=env_i("GLM53F_STAGE_LAYERS",45);
     char model_dflt[256],out_dflt[256],bp[512],mp[512],name[512],virt[512];glm53f_st_context*st;void*buf=NULL;size_t cap=0;
     uint64_t off=0,last_sync=0,flush=1ull<<30;int nt=0,fd=-1;FILE*mf=NULL;double t0=now_sec();
     if(!model){const char*h=getenv("HOME");snprintf(model_dflt,sizeof model_dflt,"%s/models/glm53f",h?h:".");model=model_dflt;}
-    if(!out||!*out){snprintf(out_dflt,sizeof out_dflt,"/local/glm53f-decode-%s",getenv("PJM_JOBID")?getenv("PJM_JOBID"):"manual");out=out_dflt;}
+    if(!out||!*out){snprintf(out_dflt,sizeof out_dflt,"/local/glm53f-target-routed-%s",getenv("PJM_JOBID")?getenv("PJM_JOBID"):"manual");out=out_dflt;}
     if(rank<0||rank>=ranks||parts<1||parts>16||ranks%parts||first<3||last>46||first>=last)return 2;
     mkdir(out,0755);snprintf(bp,sizeof bp,"%s/rank%02d.blob",out,rank);snprintf(mp,sizeof mp,"%s/rank%02d.manifest",out,rank);
     st=glm53f_st_open(model);if(!st||glm53f_st_validate_contract(st,0)){fprintf(stderr,"checkpoint failed\n");return 2;}

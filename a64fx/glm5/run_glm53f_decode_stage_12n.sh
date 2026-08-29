@@ -9,18 +9,18 @@ if [ "$np" -ne 12 ]; then
     exit 2
 fi
 
-stage=${GLM53F_STAGE_DIR:-/local/glm53f-decode-${PJM_JOBID}}
+stage=${GLM53F_STAGE_DIR:-/local/glm53f-target-routed-${PJM_JOBID}}
 status=${GLM53F_STATUS_DIR:-$PWD/stage_status_${PJM_JOBID}_full}
 mkdir -p "$stage" "$status"
 
 export GLM53F_RANKS=12
-export GLM53F_EXPERT_PARTS=4
+export GLM53F_EXPERT_PARTS=12
 export GLM53F_STAGE_FIRST_LAYER=3
 export GLM53F_STAGE_LAYERS=45
 export GLM53F_STAGE_DIR=$stage
 export GLM53F_STATUS_DIR=$status
 
-echo "GLM53F full expert stage job=$PJM_JOBID stage=$stage status=$status"
+echo "GLM53F 12-way target expert stage job=$PJM_JOBID stage=$stage status=$status"
 date
 mpiexec -np 12 ./glm53f_decode_stage "$HOME/models/glm53f"
 cat "$status"/*.status

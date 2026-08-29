@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 repo=$(cd ../.. && pwd)
 job=${PJM_JOBID:?PJM_JOBID is required}
 model=${GLM53F_MODEL_DIR:-$HOME/models/glm53f}
-routed=${GLM53F_STAGE_DIR:-/local/glm53f-target-p12-$job}
+routed=${GLM53F_STAGE_DIR:-/local/glm53f-target-routed-$job}
 shared=${GLM53F_SHARED_STAGE_DIR:-/local/glm53f-target-shared-$job}
 logdir=${GLM53F_FINAL_LOG_DIR:-$repo/tmp/final-validation-$job}
 mkdir -p "$logdir"
@@ -25,6 +25,7 @@ mpiexec -np 12 -of-proc "$logdir/head" \
 mpiexec -np 12 -of-proc "$logdir/sparse-callback" \
     ./glm53f_sparse_callback_check "$model" 43
 mpiexec -np 12 -of-proc "$logdir/full-target" \
-    ./glm53f_target_decode_12n "$model" "$routed" "$shared" 1 1
+    ./glm53f_target_decode_12n "$model" "$routed" "$shared" 1 \
+    "${GLM53F_TARGET_STEPS:-128}"
 
 echo "SENTINEL glm53f_final_validation_12n=OK"

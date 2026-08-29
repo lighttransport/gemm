@@ -94,9 +94,14 @@ int main(int argc, char **argv) {
     double sec=MPI_Wtime()-begin,max_sec;MPI_Reduce(&sec,&max_sec,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     double max_phase[4];MPI_Reduce(phase,max_phase,4,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     if(!rank)printf("GLM53F_SPEC_PHASE ms_cycle target=%.3f draft=%.3f verify=%.3f rebase=%.3f\n",max_phase[0]*1e3/cycles,max_phase[1]*1e3/cycles,max_phase[2]*1e3/cycles,max_phase[3]*1e3/cycles);
-    if(!rank)printf("GLM53F_SPEC_DECODE_12N cycles=%d drafts=%d accepted=%ld/%ld alpha=%.6f delivered=%ld tok_s=%.3f final_token=%d PASS\n",cycles,ndraft,accepted_total,proposed_total,proposed_total?(double)accepted_total/proposed_total:0.0,delivered,delivered/max_sec,token);
+    double alpha=proposed_total?(double)accepted_total/proposed_total:0.0;
+    int pass=1;const char*gate;
+    gate=getenv("GLM53F_SPEC_MIN_ALPHA");if(gate&&*gate&&alpha<strtod(gate,NULL))pass=0;
+    gate=getenv("GLM53F_SPEC_EXPECT_ACCEPTED");if(gate&&*gate&&accepted_total!=strtol(gate,NULL,10))pass=0;
+    gate=getenv("GLM53F_SPEC_EXPECT_FINAL");if(gate&&*gate&&token!=strtol(gate,NULL,10))pass=0;
+    if(!rank)printf("GLM53F_SPEC_DECODE_12N cycles=%d drafts=%d accepted=%ld/%ld alpha=%.6f delivered=%ld tok_s=%.3f final_token=%d %s\n",cycles,ndraft,accepted_total,proposed_total,alpha,delivered,delivered/max_sec,token,pass?"PASS":"FAIL");
     glm53f_target_profile_report_12n(target_model,"spec");
     for(int i=0;i<ndraft+2;i++)glm53f_target_snapshot_free_12n(snapshot[i]);
     free(verify_hidden);glm53f_mtp_free_12n(mtp);glm53f_target_model_free_12n(target_model);glm53f_collective_free_12n();
-    MPI_Finalize();return 0;
+    MPI_Finalize();return pass?0:1;
 }

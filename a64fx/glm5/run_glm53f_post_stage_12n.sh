@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 repo=$(cd ../.. && pwd)
 job=${PJM_JOBID:?PJM_JOBID is required}
 model=${GLM53F_MODEL_DIR:-$HOME/models/glm53f}
-routed=${GLM53F_STAGE_DIR:-/local/glm53f-target-p12-$job}
+routed=${GLM53F_STAGE_DIR:-/local/glm53f-target-routed-$job}
 shared=${GLM53F_SHARED_STAGE_DIR:-/local/glm53f-target-shared-$job}
 logdir=${GLM53F_POST_LOG_DIR:-$repo/tmp/post-stage-$job}
 mkdir -p "$logdir"
