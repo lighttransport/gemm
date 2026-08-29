@@ -247,3 +247,9 @@ target decode **17.654 tok/s** (56.643 ms/token, final token 432, PASS), with
 attention 23.394 ms and FFN 21.061 ms. MTP-3 improved to **9.933 delivered
 tok/s**, alpha 0.4167, 26/26 committed tokens, PASS; target/verify phases are
 64.298/240.950 ms per cycle.
+
+With the same build, MTP-2 is the better throughput/quality point: **11.904
+delivered tok/s**, alpha 0.625 (10/16 draft matches), target/verify phases
+64.498/190.441 ms per cycle, final token 3669, PASS. Keep `drafts=2` for the
+current best speculative-decode setting; the runner still accepts explicit
+draft counts for experiments.
