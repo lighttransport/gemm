@@ -9,6 +9,9 @@ void glm53f_sparse_reset_12n(glm53f_sparse_context_12n *context);
 void glm53f_sparse_free_12n(glm53f_sparse_context_12n *context);
 int glm53f_sparse_sublayer_12n(
     void *context, float *output, const float *normalized_input);
+int glm53f_sparse_sublayer_batch_12n(
+    glm53f_sparse_context_12n *context, float *output,
+    const float *normalized_input, int tokens);
 int glm53f_sparse_length_12n(const glm53f_sparse_context_12n *context);
 int glm53f_sparse_restore_length_12n(
     glm53f_sparse_context_12n *context, int length);
