@@ -246,10 +246,9 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
         }
         if (m->profile) m->batch_phase[2] += MPI_Wtime() - begin;
         begin = m->profile ? MPI_Wtime() : 0.0;
-        for (int t = 0; t < tokens; t++)
-            glm53f_mhc_post_sve(m->batch_streams + (size_t)t * FLAT,
-                                m->batch_output + (size_t)t * HIDDEN,
-                                &m->batch_scratch[t].mhc);
+        glm53f_mhc_post_batch_sve(m->batch_streams, m->batch_output,
+                                  &m->batch_scratch[0].mhc, tokens,
+                                  sizeof(m->batch_scratch[0]));
         glm53f_mhc_pre_batch_sve(&m->batch_scratch[0].mhc, m->batch_streams,
                                  &w->ffn_mhc, w->post_attention_norm, tokens,
                                  sizeof(*m->batch_scratch),
@@ -279,10 +278,9 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
         }
         if (m->profile) m->batch_phase[3] += MPI_Wtime() - begin;
         begin = m->profile ? MPI_Wtime() : 0.0;
-        for (int t = 0; t < tokens; t++)
-            glm53f_mhc_post_sve(m->batch_streams + (size_t)t * FLAT,
-                                m->batch_output + (size_t)t * HIDDEN,
-                                &m->batch_scratch[t].mhc);
+        glm53f_mhc_post_batch_sve(m->batch_streams, m->batch_output,
+                                  &m->batch_scratch[0].mhc, tokens,
+                                  sizeof(m->batch_scratch[0]));
         if (m->profile) m->batch_phase[1] += MPI_Wtime() - begin;
     }
     if (after && state_off != after[0]->kda_bytes)

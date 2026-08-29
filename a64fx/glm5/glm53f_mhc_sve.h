@@ -4,6 +4,7 @@
 #include <arm_sve.h>
 #include <math.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 #include <omp.h>
 #include "../../common/glm53f_ref.h"
@@ -127,6 +128,32 @@ static inline void glm53f_mhc_post_sve(
         float *streams, const float *sublayer, const glm53f_mhc_scratch *scratch) {
     glm53f_mhc_post(streams, scratch->residual, sublayer, scratch->post,
                     scratch->combine, GLM53F_MHC_STREAMS, GLM53F_MHC_WIDTH);
+}
+
+/* Batch-only post mix.  Verification positions are independent at this
+ * point, so distribute the (otherwise scalar) mHC post over token/head
+ * pairs.  The inner accumulation order is identical to glm53f_mhc_post,
+ * preserving target-token decisions while removing four serial calls. */
+static inline void glm53f_mhc_post_batch_sve(
+        float *streams, const float *sublayer,
+        const glm53f_mhc_scratch *scratch, int tokens, size_t stride) {
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int t = 0; t < tokens; ++t)
+        for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
+            float *dst = streams + (size_t)t * GLM53F_MHC_FLAT +
+                         (size_t)k * GLM53F_MHC_WIDTH;
+            const float *res = (const float *)((const unsigned char *)scratch +
+                              (size_t)t * stride + offsetof(glm53f_mhc_scratch, residual));
+            const glm53f_mhc_scratch *s = (const glm53f_mhc_scratch *)
+                              ((const unsigned char *)scratch + (size_t)t * stride);
+            for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {
+                double v = (double)s->post[k] * sublayer[(size_t)t * GLM53F_MHC_WIDTH + d];
+                for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)
+                    v += (double)s->combine[(size_t)j * GLM53F_MHC_STREAMS + k] *
+                         res[(size_t)j * GLM53F_MHC_WIDTH + d];
+                dst[d] = (float)v;
+            }
+        }
 }
 
 #endif
