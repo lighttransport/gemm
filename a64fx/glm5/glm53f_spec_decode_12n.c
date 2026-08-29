@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "glm53f_mtp_12n.h"
+#include "glm53f_collective_12n.h"
 #include "glm53f_target_model_12n.h"
 
 enum { HIDDEN = 4096, MAX_DRAFT = 4 };
@@ -34,6 +35,7 @@ int main(int argc, char **argv) {
     ndraft=argc>8?atoi(argv[8]):1;
     warmup=argc>9?atoi(argv[9]):128;
     if(token<0||token>=154880||cycles<1||ndraft<1||ndraft>MAX_DRAFT||warmup<0)MPI_Abort(MPI_COMM_WORLD,2);
+    if(getenv("GLM53F_UTOFU")){const char*topo=getenv("TOFU_TOPO_PATH");if(!topo)topo="../utofu-tests/tofu_topo.txt";if(glm53f_collective_init_12n(topo,5*HIDDEN))MPI_Abort(MPI_COMM_WORLD,2);}
     capacity=warmup+cycles*(ndraft+2)+1;
     target_model=glm53f_target_model_create_12n(argv[1],argv[2],argv[3],capacity);
     mtp=glm53f_mtp_create_12n(argv[1],argv[4],argv[5],capacity);
@@ -93,6 +95,6 @@ int main(int argc, char **argv) {
     if(!rank)printf("GLM53F_SPEC_PHASE ms_cycle target=%.3f draft=%.3f verify=%.3f rebase=%.3f\n",max_phase[0]*1e3/cycles,max_phase[1]*1e3/cycles,max_phase[2]*1e3/cycles,max_phase[3]*1e3/cycles);
     if(!rank)printf("GLM53F_SPEC_DECODE_12N cycles=%d drafts=%d accepted=%ld/%ld alpha=%.6f delivered=%ld tok_s=%.3f final_token=%d PASS\n",cycles,ndraft,accepted_total,proposed_total,proposed_total?(double)accepted_total/proposed_total:0.0,delivered,delivered/max_sec,token);
     for(int i=0;i<ndraft+2;i++)glm53f_target_snapshot_free_12n(snapshot[i]);
-    free(verify_hidden);glm53f_mtp_free_12n(mtp);glm53f_target_model_free_12n(target_model);
+    free(verify_hidden);glm53f_mtp_free_12n(mtp);glm53f_target_model_free_12n(target_model);glm53f_collective_free_12n();
     MPI_Finalize();return 0;
 }

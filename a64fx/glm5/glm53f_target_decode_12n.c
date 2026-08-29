@@ -13,6 +13,7 @@
 #include "glm53f_target_head_12n.h"
 #include "glm53f_target_layer_12n.h"
 #include "glm53f_target_model_12n.h"
+#include "glm53f_collective_12n.h"
 
 enum { LAYERS = 45, HIDDEN = 4096, STREAMS = 4, FLAT = 16384, MIX = 24 };
 
@@ -219,6 +220,7 @@ int main(int argc, char **argv) {
     if(token<0||token>=154880||steps<1||steps>32)MPI_Abort(MPI_COMM_WORLD,2);
     int capacity=getenv("GLM53F_CAPACITY")?atoi(getenv("GLM53F_CAPACITY")):steps;
     if(capacity<steps)MPI_Abort(MPI_COMM_WORLD,2);
+    if(getenv("GLM53F_UTOFU")){const char*topo=getenv("TOFU_TOPO_PATH");if(!topo)topo="../utofu-tests/tofu_topo.txt";if(glm53f_collective_init_12n(topo,5*HIDDEN))MPI_Abort(MPI_COMM_WORLD,2);}
     model=glm53f_target_model_create_12n(argv[1],argv[2],argv[3],capacity);
     if(!model)MPI_Abort(MPI_COMM_WORLD,2);
     MPI_Barrier(MPI_COMM_WORLD);double begin=MPI_Wtime();
@@ -229,7 +231,7 @@ int main(int argc, char **argv) {
     }
     double elapsed=MPI_Wtime()-begin,max_elapsed;MPI_Reduce(&elapsed,&max_elapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     if(!rank)printf("GLM53F_TARGET_DECODE_12N steps=%d capacity=%d ms_tok=%.3f tok_s=%.3f final_token=%d PASS\n",steps,capacity,max_elapsed*1e3/steps,steps/max_elapsed,token);
-    glm53f_target_model_free_12n(model);
+    glm53f_target_model_free_12n(model);glm53f_collective_free_12n();
     MPI_Finalize();return 0;
 }
 #endif

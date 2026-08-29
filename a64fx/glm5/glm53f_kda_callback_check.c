@@ -3,27 +3,34 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "glm53f_collective_12n.h"
 #include "glm53f_kda_12n.h"
 
-enum { HIDDEN = 4096, TOKENS = 5 };
+enum { HIDDEN = 4096, MAX_TOKENS = 5 };
 
 int main(int argc, char **argv) {
     int rank, size, local_ok, ok;
     int layer = argc > 2 ? atoi(argv[2]) : 44;
-    float x[TOKENS][HIDDEN], a[TOKENS][HIDDEN], b[TOKENS][HIDDEN];
+    int tokens = argc > 3 ? atoi(argv[3]) : MAX_TOKENS;
+    float x[MAX_TOKENS][HIDDEN], a[MAX_TOKENS][HIDDEN], b[MAX_TOKENS][HIDDEN];
     double seq_begin, seq_elapsed, batch_begin, batch_elapsed;
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-    if (argc < 2 || size != 12) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (argc < 2 || size != 12 || tokens < 1 || tokens > MAX_TOKENS)
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    const char *topology = getenv("TOFU_TOPO_PATH");
+    if (getenv("GLM53F_UTOFU") &&
+            glm53f_collective_init_12n(topology, MAX_TOKENS * HIDDEN))
+        MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_kda_context_12n *ca = glm53f_kda_create_12n(argv[1], layer);
     glm53f_kda_context_12n *cb = glm53f_kda_create_12n(argv[1], layer);
     if (!ca || !cb) MPI_Abort(MPI_COMM_WORLD, 2);
     size_t state_bytes = glm53f_kda_state_bytes_12n(ca);
-    unsigned char *seq_state = malloc(TOKENS * state_bytes);
-    unsigned char *batch_state = malloc(TOKENS * state_bytes);
+    unsigned char *seq_state = malloc((size_t)tokens * state_bytes);
+    unsigned char *batch_state = malloc((size_t)tokens * state_bytes);
     if (!seq_state || !batch_state) MPI_Abort(MPI_COMM_WORLD, 2);
-    for (int t = 0; t < TOKENS; ++t)
+    for (int t = 0; t < tokens; ++t)
         for (int i = 0; i < HIDDEN; ++i)
             x[t][i] = (float)(((i * 29 + t * 17 + 7) % 257) - 128) / 128.0f;
     /* Remove OpenMP and page-touch first-use costs from both paths. */
@@ -34,7 +41,7 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     seq_begin = MPI_Wtime();
     local_ok = 1;
-    for (int t = 0; t < TOKENS; ++t) {
+    for (int t = 0; t < tokens; ++t) {
         local_ok &= !glm53f_kda_sublayer_12n(ca, a[t], x[t]);
         local_ok &= !glm53f_kda_save_state_12n(
             ca, seq_state + (size_t)t * state_bytes, state_bytes);
@@ -43,10 +50,10 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     batch_begin = MPI_Wtime();
     local_ok &= !glm53f_kda_sublayer_batch_capture_12n(
-        cb, b[0], x[0], TOKENS, batch_state, state_bytes);
+        cb, b[0], x[0], tokens, batch_state, state_bytes);
     batch_elapsed = MPI_Wtime() - batch_begin;
     double diff2 = 0.0, ref2 = 0.0;
-    for (int t = 0; t < TOKENS; ++t)
+    for (int t = 0; t < tokens; ++t)
         for (int i = 0; i < HIDDEN; ++i) {
             double d = (double)a[t][i] - b[t][i];
             diff2 += d * d;
@@ -54,26 +61,31 @@ int main(int argc, char **argv) {
         }
     double rel_l2 = sqrt(diff2 / (ref2 + 1e-30));
     local_ok &= rel_l2 < 2e-6;
-    int state_ok = !memcmp(seq_state, batch_state, TOKENS * state_bytes);
+    int state_ok = !memcmp(seq_state, batch_state, (size_t)tokens * state_bytes);
     local_ok &= state_ok;
-    for (int t = 0; t < TOKENS; ++t)
+    for (int t = 0; t < tokens; ++t)
         for (int i = 0; i < HIDDEN; ++i)
             local_ok &= isfinite(a[t][i]);
     int all_state_ok;
     MPI_Allreduce(&local_ok, &ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     MPI_Allreduce(&state_ok, &all_state_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    double seq_max, batch_max;
+    double seq_max, batch_max, phase[3], max_phase[3];
+    glm53f_kda_last_phase_12n(cb, phase);
+    MPI_Reduce(phase, max_phase, 3, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&seq_elapsed, &seq_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&batch_elapsed, &batch_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!rank)
         printf("GLM53F_KDA_CALLBACK layer=%d tokens=%d batch=%s state=%s "
-               "rel_l2=%.9g seq_ms=%.3f batch_ms=%.3f speedup=%.3f %s\n", layer, TOKENS,
+               "rel_l2=%.9g seq_ms=%.3f batch_ms=%.3f speedup=%.3f "
+               "front_ms=%.3f oproj_ms=%.3f allreduce_ms=%.3f %s\n", layer, tokens,
                ok ? "REL_L2_OK" : "FAIL", all_state_ok ? "BIT_EXACT" : "FAIL",
                rel_l2, seq_max * 1e3, batch_max * 1e3, seq_max / batch_max,
+               max_phase[0] * 1e3, max_phase[1] * 1e3, max_phase[2] * 1e3,
                ok ? "PASS" : "FAIL");
     glm53f_kda_free_12n(cb);
     glm53f_kda_free_12n(ca);
     free(batch_state); free(seq_state);
+    glm53f_collective_free_12n();
     MPI_Finalize();
     return ok ? 0 : 1;
 }

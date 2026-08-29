@@ -3,6 +3,7 @@
 #include "glm53f_sparse_core_12n.c"
 #undef main
 #include "glm53f_sparse_12n.h"
+#include "glm53f_collective_12n.h"
 #include <limits.h>
 
 enum { QA=1536,IH=32,ID=128,KPOOL=4,TOPK=2048 };
@@ -72,7 +73,7 @@ static int sparse_attention_local_cp(glm53f_sparse_context_12n*c,float*attn,cons
 static int sparse_attention_local(glm53f_sparse_context_12n*c,float*attn,const float*x){return c->cp?sparse_attention_local_cp(c,attn,x):sparse_attention_local_replicated(c,attn,x);}
 int glm53f_sparse_sublayer_12n(void*context,float*out,const float*x){glm53f_sparse_context_12n*c=context;if(!c||sparse_attention_local(c,c->attn,x))return-1;int local_cols=c->hn*VD,local_blocks=local_cols/128;
 #pragma omp parallel for schedule(static)
-    for(int r=0;r<H;r++)c->partial[r]=fp8dot(c->op+(size_t)r*local_cols,c->ops+(size_t)(r/128)*local_blocks,c->attn,local_cols);return MPI_Allreduce(c->partial,out,H,MPI_FLOAT,MPI_SUM,MPI_COMM_WORLD)==MPI_SUCCESS?0:-1;}
+    for(int r=0;r<H;r++)c->partial[r]=fp8dot(c->op+(size_t)r*local_cols,c->ops+(size_t)(r/128)*local_blocks,c->attn,local_cols);return glm53f_sum_allreduce_12n(c->partial,out,H);}
 int glm53f_sparse_sublayer_batch_12n(glm53f_sparse_context_12n*c,float*out,const float*x,int tokens){if(!c||!out||!x||tokens<1||tokens>5||c->length+tokens>c->capacity)return-1;for(int t=0;t<tokens;t++)if(glm53f_sparse_sublayer_12n(c,out+(size_t)t*H,x+(size_t)t*H))return-1;return 0;}
 void glm53f_sparse_free_12n(glm53f_sparse_context_12n*c){if(!c)return;free(c->cp_candidate_gather);free(c->cp_candidate_local);free(c->cp_pack_index);free(c->cp_cur_gate);free(c->cp_cur_key);free(c->cp_cur_latent);free(c->cp_exchange);free(c->cp_pack);free(c->cp_pool);free(c->cp_gate);free(c->cp_key);free(c->cp_latent);free(c->apef);free(c->selected);free(c->partial);free(c->attn);free(c->pool);free(c->iw);free(c->iq);free(c->gcache);free(c->key);free(c->latent);free(c->query);free(c->qres);free(c->wp);free(c->wqb);free(c->ape);free(c->gatew);free(c->knb);free(c->knw);free(c->wk);free(c->ops);free(c->op);free(c->kvb);free(c->kvan);free(c->kvas);free(c->kva);free(c->qbs);free(c->qb);free(c->qan);free(c->qas);free(c->qa);free(c);}
 #ifndef GLM53F_SPARSE_NO_MAIN

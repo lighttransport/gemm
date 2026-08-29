@@ -2,6 +2,7 @@
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "glm53f_collective_12n.h"
 #include "glm53f_target_model_12n.h"
 
 enum { TOKENS = 5 };
@@ -15,6 +16,10 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 4 || ranks != 12) MPI_Abort(MPI_COMM_WORLD, 2);
+    const char *topology = getenv("TOFU_TOPO_PATH");
+    if (getenv("GLM53F_UTOFU") &&
+            glm53f_collective_init_12n(topology, TOKENS * 4096))
+        MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_target_model_12n *m = glm53f_target_model_create_12n(
         argv[1], argv[2], argv[3], TOKENS + 1);
     glm53f_target_snapshot_12n *initial = glm53f_target_snapshot_create_12n(m);
@@ -69,6 +74,7 @@ int main(int argc, char **argv) {
     glm53f_target_snapshot_free_12n(seq_final);
     glm53f_target_snapshot_free_12n(initial);
     glm53f_target_model_free_12n(m);
+    glm53f_collective_free_12n();
     MPI_Finalize();
     return ok ? 0 : 1;
 }

@@ -16,6 +16,7 @@
 #endif
 #include "glm53f_expert_kern.h"
 #include "glm53f_dense_ffn_12n.h"
+#include "glm53f_collective_12n.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -42,10 +43,10 @@ int glm53f_dense_ffn_sublayer_12n(void*context,float*out,const float*x){glm53f_d
 #pragma omp parallel for schedule(static)
     for(int j=0;j<c->in;j++){float a=c->gv[j]>10?10:c->gv[j],b=c->uv[j]>10?10:c->uv[j]<-10?-10:c->uv[j];c->act[j]=a/(1+expf(-a))*b;}
 #pragma omp parallel for schedule(static)
-    for(int r=0;r<H;r++)c->part[r]=dot(c->d+(size_t)r*c->in,c->ds+(size_t)(r/B)*c->lb,c->act,c->in);return MPI_Allreduce(c->part,out,H,MPI_FLOAT,MPI_SUM,MPI_COMM_WORLD)==MPI_SUCCESS?0:-1;}
+    for(int r=0;r<H;r++)c->part[r]=dot(c->d+(size_t)r*c->in,c->ds+(size_t)(r/B)*c->lb,c->act,c->in);return glm53f_sum_allreduce_12n(c->part,out,H);}
 int glm53f_dense_ffn_sublayer_batch_12n(glm53f_dense_ffn_context_12n*c,float*out,const float*x,int tokens){if(!c||!out||!x||tokens<1||tokens>4)return-1;glm53f_mv_fp8_block128_bits_batch(c->bgv,c->g,c->gs,x,tokens,c->in,H);glm53f_mv_fp8_block128_bits_batch(c->buv,c->u,c->us,x,tokens,c->in,H);
 #pragma omp parallel for schedule(static)
-    for(int q=0;q<tokens*c->in;q++){float a=c->bgv[q]>10?10:c->bgv[q],b=c->buv[q]>10?10:c->buv[q]<-10?-10:c->buv[q];c->bact[q]=a/(1+expf(-a))*b;}glm53f_mv_fp8_block128_bits_batch(c->bpart,c->d,c->ds,c->bact,tokens,H,c->in);return MPI_Allreduce(c->bpart,out,tokens*H,MPI_FLOAT,MPI_SUM,MPI_COMM_WORLD)==MPI_SUCCESS?0:-1;}
+    for(int q=0;q<tokens*c->in;q++){float a=c->bgv[q]>10?10:c->bgv[q],b=c->buv[q]>10?10:c->buv[q]<-10?-10:c->buv[q];c->bact[q]=a/(1+expf(-a))*b;}glm53f_mv_fp8_block128_bits_batch(c->bpart,c->d,c->ds,c->bact,tokens,H,c->in);return glm53f_sum_allreduce_12n(c->bpart,out,tokens*H);}
 #ifndef GLM53F_DENSE_NO_MAIN
 int main(int argc,char**argv){int rank,nr,layer=argc>2?atoi(argv[2]):0,i0,in;char n[256];glm53f_st_context*st;uint8_t*g,*u,*d;float*gs,*us,*ds,*x,*gv,*uv,*act,*part,*out[2];MPI_Init(&argc,&argv);MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(argc<2||nr!=12||layer<0||layer>2){if(!rank)fprintf(stderr,"usage: mpiexec -np 12 %s MODEL_DIR [layer=0]\n",argv[0]);MPI_Finalize();return 2;}if(glm53f_block_aligned_slice(I,B,rank,nr,&i0,&in))MPI_Abort(MPI_COMM_WORLD,2);st=glm53f_st_open(argv[1]);if(!st)MPI_Abort(MPI_COMM_WORLD,2);
 #define N(S) snprintf(n,sizeof n,"model.language_model.layers.%d.mlp.%s",layer,S)
