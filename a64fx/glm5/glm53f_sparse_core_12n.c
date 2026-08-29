@@ -2,8 +2,10 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#ifndef GLM53F_EXTERNAL_ST_IMPLEMENTATION
 #define SAFETENSORS_IMPLEMENTATION
 #define GLM53F_SAFETENSORS_IMPLEMENTATION
+#endif
 #include "../../common/glm53f_safetensors.h"
 #include "../../common/glm53f_ref.h"
 #include "../../common/glm53f_arch.h"
