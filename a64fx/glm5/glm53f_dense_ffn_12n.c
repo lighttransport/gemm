@@ -39,7 +39,12 @@ glm53f_dense_ffn_context_12n*glm53f_dense_ffn_create_12n(const char*model,int la
 #undef N
     glm53f_st_close(st);c->gv=a256(in*4);c->uv=a256(in*4);c->act=a256(in*4);c->part=a256(H*4);c->bgv=a256((size_t)4*in*4);c->buv=a256((size_t)4*in*4);c->bact=a256((size_t)4*in*4);c->bpart=a256((size_t)4*H*4);return c;}
 void glm53f_dense_ffn_free_12n(glm53f_dense_ffn_context_12n*c){if(!c)return;free(c->bpart);free(c->bact);free(c->buv);free(c->bgv);free(c->part);free(c->act);free(c->uv);free(c->gv);free(c->ds);free(c->d);free(c->us);free(c->gs);free(c->u);free(c->g);free(c);}
-int glm53f_dense_ffn_sublayer_12n(void*context,float*out,const float*x){glm53f_dense_ffn_context_12n*c=context;if(!c)return-1;mv(c->gv,c->g,c->gs,x,c->in,H);mv(c->uv,c->u,c->us,x,c->in,H);
+int glm53f_dense_ffn_sublayer_12n(void*context,float*out,const float*x){glm53f_dense_ffn_context_12n*c=context;if(!c)return-1;
+    /* Gate and up projections have identical shape and input.  Run them in
+     * one OpenMP team so the short decode path pays one launch/barrier while
+     * retaining the original row order and arithmetic. */
+    glm53f_mv_fp8_block128_bits_2(c->gv,c->g,c->gs,c->in,
+                                  c->uv,c->u,c->us,c->in,x,H);
 #pragma omp parallel for schedule(static)
     for(int j=0;j<c->in;j++){float a=c->gv[j]>10?10:c->gv[j],b=c->uv[j]>10?10:c->uv[j]<-10?-10:c->uv[j];c->act[j]=a/(1+expf(-a))*b;}
 #pragma omp parallel for schedule(static)
