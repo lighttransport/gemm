@@ -21,6 +21,9 @@ cflags=(-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp
 if [ "${GLM53F_FAST_MATH:-0}" = 1 ]; then
     cflags+=(-ffast-math)
 fi
+if [ "${GLM53F_NO_MATH_ERRNO:-0}" = 1 ]; then
+    cflags+=(-fno-math-errno)
+fi
 ldflags=(-L"$mpi_lib" -lmpi -lm -ltofucom)
 external=(-DGLM53F_EXTERNAL_ST_IMPLEMENTATION)
 
