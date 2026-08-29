@@ -327,6 +327,75 @@ static inline void glm53f_kda_step_streamed(float *state, const float *q, const 
     }
 }
 
+/* GLM-5.3F uses a separate log-decay for every key channel, not one scalar
+ * decay per head.  This is the token-correct decode recurrence used by the
+ * real linear-attention layer. */
+static inline void glm53f_kda_step_vec(float *state, const float *q,
+        const float *k, const float *v, const float *log_decay, float beta,
+        int key_dim, int value_dim, float *out) {
+    float scale = 1.0f / sqrtf((float)key_dim);
+    int d, j;
+    for (j = 0; j < value_dim; ++j) {
+        float mem = 0.0f;
+        for (d = 0; d < key_dim; ++d) {
+            size_t z = (size_t)d * value_dim + j;
+            state[z] *= expf(log_decay[d]);
+            mem += state[z] * k[d];
+        }
+        {
+            float delta = (v[j] - mem) * beta;
+            float y = 0.0f;
+            for (d = 0; d < key_dim; ++d) {
+                size_t z = (size_t)d * value_dim + j;
+                state[z] += k[d] * delta;
+                y += state[z] * (q[d] * scale);
+            }
+            out[j] = y;
+        }
+    }
+}
+
+static inline void glm53f_kda_step_vec_streamed(float *state, const float *q,
+        const float *k, const float *v, const float *log_decay, float beta,
+        int key_dim, int value_dim, float *out, float *work) {
+    float scale = 1.0f / sqrtf((float)key_dim);
+    int d, j;
+    memset(work, 0, (size_t)value_dim * sizeof(*work));
+    for (d = 0; d < key_dim; ++d) {
+        float *row = state + (size_t)d * value_dim;
+        float decay = expf(log_decay[d]), kd = k[d];
+        for (j = 0; j < value_dim; ++j) {
+            row[j] *= decay;
+            work[j] += row[j] * kd;
+        }
+    }
+    for (j = 0; j < value_dim; ++j) {
+        work[j] = (v[j] - work[j]) * beta;
+        out[j] = 0.0f;
+    }
+    for (d = 0; d < key_dim; ++d) {
+        float *row = state + (size_t)d * value_dim;
+        float kd = k[d], qd = q[d] * scale;
+        for (j = 0; j < value_dim; ++j) {
+            row[j] += kd * work[j];
+            out[j] += row[j] * qd;
+        }
+    }
+}
+
+/* Safe forget gate from Glm5NextTextForgetGate. */
+static inline void glm53f_kda_safe_log_decay(float *out, const float *gate,
+        const float *dt_bias, float a_log, float lower_bound, int n) {
+    float rate = expf(a_log);
+    int i;
+    for (i = 0; i < n; ++i) {
+        float x = rate * (gate[i] + dt_bias[i]);
+        float sigmoid = x >= 0.0f ? 1.0f / (1.0f + expf(-x))
+                                  : expf(x) / (1.0f + expf(x));
+        out[i] = lower_bound * sigmoid;
+    }
+}
+
 static inline float glm53f_sigmoid(float x) {
     return x >= 0.0f ? 1.0f / (1.0f + expf(-x)) : expf(x) / (1.0f + expf(x));
 }

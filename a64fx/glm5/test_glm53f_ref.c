@@ -6,6 +6,9 @@
 int main(void) {
     float s[6] = {0}, q[2] = {3, 4}, k[2] = {0, 1}, v[3] = {2, 4, 6}, out[3];
     float s2[6] = {0}, out2[3], work[3];
+    float sv1[6] = {.1f,-.2f,.3f,.4f,-.5f,.6f};
+    float sv2[6], ov1[3], ov2[3], ld[2] = {-.1f, -.7f};
+    float gate[2] = {-2.0f, 3.0f}, dt[2] = {.5f, -.25f}, safe[2];
     float logits[6] = {-3, 2, 0, 4, -1, 1}, bias[6] = {0};
     float w[2], comb[4] = {1, 2, 3, 4};
     int ids[2];
@@ -33,6 +36,20 @@ int main(void) {
     glm53f_kda_step_streamed(s2, q, k, v, 0.0f, 1.0f, 2, 3, out2, work);
     if (fabsf(out[0] - 1.1313708f) > 2e-5f || fabsf(out[2] - 3.3941125f) > 2e-5f) return 1;
     if (fabsf(out2[0] - out[0]) > 2e-6f || fabsf(out2[2] - out[2]) > 2e-6f) return 5;
+    memcpy(sv2, sv1, sizeof(sv1));
+    glm53f_kda_step_vec(sv1, q, k, v, ld, .75f, 2, 3, ov1);
+    glm53f_kda_step_vec_streamed(sv2, q, k, v, ld, .75f, 2, 3,
+                                 ov2, work);
+    for (int z = 0; z < 6; ++z)
+        if (fabsf(sv1[z] - sv2[z]) > 2e-6f) return 14;
+    for (int z = 0; z < 3; ++z)
+        if (fabsf(ov1[z] - ov2[z]) > 2e-6f) return 15;
+    /* A scalar decay would make both state rows shrink equally; require the
+     * channel-wise oracle to preserve the official unequal decay. */
+    if (fabsf(sv1[0] - sv1[3]) < 1e-3f) return 16;
+    glm53f_kda_safe_log_decay(safe, gate, dt, logf(2.0f), -5.0f, 2);
+    if (!(safe[0] < 0.0f && safe[0] > -5.0f &&
+          safe[1] < safe[0] && safe[1] > -5.0f)) return 17;
     glm53f_router_topk(logits, bias, 6, 2, 2.5f, ids, w);
     if (ids[0] != 3 || ids[1] != 1 || fabsf(w[0] + w[1] - 2.5f) > 1e-6f) return 2;
     glm53f_mhc_sinkhorn(comb, 2, 20, 1e-6f);
@@ -62,6 +79,6 @@ int main(void) {
     glm53f_mla_selected_bf16(ad, aq, az, aw, ai, 2, 1, 2, 1, 3);
     if (glm53f_mla_selected_absorbed_bf16(aa, aq, az, aw, ai, 2, 1, 2, 1, 3) ||
         fabsf(ad[0] - aa[0]) > 2e-7f) return 13;
-    printf("GLM53F_REF kda=ok router=ok mhc=ok cp=ok norm=ok topk=ok index=ok fusion=ok head=ok mhc_site=ok mla_absorb=ok\n");
+    printf("GLM53F_REF kda=ok kda_vec=ok safe_gate=ok router=ok mhc=ok cp=ok norm=ok topk=ok index=ok fusion=ok head=ok mhc_site=ok mla_absorb=ok\n");
     return 0;
 }
