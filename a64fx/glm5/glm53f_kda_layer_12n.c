@@ -46,6 +46,11 @@ static void mv3(float*y0,float*y1,float*y2,const uint16_t*w0,const uint16_t*w1,
 #pragma omp parallel for schedule(static)
     for(int r=nb*8;r<rows;r++){size_t off=(size_t)r*cols;y0[r]=dot1(w0+off,x,cols);y1[r]=dot1(w1+off,x,cols);y2[r]=dot1(w2+off,x,cols);}
 }
+static void conv3(float*q,float*k,float*v,float*state,const uint16_t*qw,
+        const uint16_t*kw,const uint16_t*vw,int channels){
+#pragma omp parallel for schedule(static)
+    for(int j=0;j<3*channels;j++){int which=j/channels,c=j-which*channels;float*out=which==0?q:(which==1?k:v);const uint16_t*w=which==0?qw:(which==1?kw:vw);float*s=state+(size_t)j*KERNEL,y=0.0f;memmove(s,s+1,(KERNEL-1)*sizeof(*s));s[KERNEL-1]=out[c];for(int z=0;z<KERNEL;z++)y+=s[z]*glm53f_bf16_to_f32(w[(size_t)c*KERNEL+z]);out[c]=y/(1.0f+expf(-y));}
+}
 static void read_part(glm53f_st_context*st,const char*n,size_t off,void*p,size_t z,int rank){if(glm53f_st_read(st,n,off,p,z)){fprintf(stderr,"rank=%d read %s failed\n",rank,n);MPI_Abort(MPI_COMM_WORLD,2);}}
 static void read_cols(glm53f_st_context*st,const char*n,uint16_t*p,int rows,int cols,int c0,int cn,int rank){(void)rows;if(glm53f_st_read_columns(st,n,(size_t)cols*sizeof(uint16_t),(size_t)c0*sizeof(uint16_t),(size_t)cn*sizeof(uint16_t),p)){fprintf(stderr,"rank=%d read columns %s failed\n",rank,n);MPI_Abort(MPI_COMM_WORLD,2);}}
 static void name(char*out,int l,const char*s){snprintf(out,256,"model.language_model.layers.%d.self_attn.%s",l,s);}
@@ -71,9 +76,7 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     double t0=MPI_Wtime();float*q=c->qkv,*k=q+qd,*v=k+qd;
     mv3(q,k,v,w->q,w->k,w->v,x,qd,H);
     if(c->detail_profile){double t=MPI_Wtime();c->detail[0]=t-td;td=t;}
-    glm53f_causal_conv1d_silu_bf16(q,c->conv,q,w->qc,qd,KERNEL);
-    glm53f_causal_conv1d_silu_bf16(k,c->conv+(size_t)qd*KERNEL,k,w->kc,qd,KERNEL);
-    glm53f_causal_conv1d_silu_bf16(v,c->conv+(size_t)2*qd*KERNEL,v,w->vc,qd,KERNEL);
+    conv3(q,k,v,c->conv,w->qc,w->kc,w->vc,qd);
     if(c->detail_profile){double t=MPI_Wtime();c->detail[1]=t-td;td=t;}
     mv(c->small,w->fa,x,D,H);mv(c->gate,w->fb,c->small,qd,D);mv(c->beta,w->b,x,hn,H);
     for(int h=0;h<hn;h++){glm53f_l2norm(q+(size_t)h*D,D,1e-6f);glm53f_l2norm(k+(size_t)h*D,D,1e-6f);glm53f_kda_safe_log_decay(c->decay+(size_t)h*D,c->gate+(size_t)h*D,w->dt+(size_t)h*D,w->al[h],-5.0f,D);c->beta[h]=glm53f_sigmoid(c->beta[h]);}
