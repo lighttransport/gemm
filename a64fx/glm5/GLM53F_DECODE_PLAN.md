@@ -230,6 +230,11 @@ The same build improves the 8-cycle MTP-3 run from 9.634 to **9.683 delivered
 tok/s** (alpha 0.4167, 26 delivered tokens, PASS); target/verify phases are
 66.022/247.587 ms per cycle.
 
+Routed verifier scratch (`up`, activation, and per-route output) is now
+persistent per MoE context instead of allocated per layer/cycle. Exact batch
+verification remains 92/92 PASS, and MTP-3 rises to **9.728 delivered tok/s**
+(alpha 0.4167; verify 245.824 ms/cycle).
+
 Runtime context allocation tests establish **256K as the minimum-safe target
 and 512K as the preferred maximum** for the current 32 GiB/rank layout. The
 planner's theoretical 1M estimate above does not satisfy the runtime 2 GiB

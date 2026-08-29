@@ -171,6 +171,7 @@ struct glm53f_moe_stage_context_12n {
     float *router_bias, *router_logits;
     glm53f_moe_scratch_12n *scratch;
     float *batch_up, *batch_activation, *batch_shared, *batch_local;
+    float *task_up, *task_activation, *task_output;
 };
 
 glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
@@ -192,8 +193,8 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
         for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;parts[t*MAXP+npart]=(glm53f_expert_part){c->blob+p->gate_up,(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,(const float*)(c->blob+p->down_scale),p->inter};weights[t*MAXP+npart++]=route_weight[k];}
         counts[t]=npart;
     }
-    size_t task_count=(size_t)tokens*MAXP; float*up=calloc(task_count*1024,sizeof(float)); float*act=calloc(task_count*512,sizeof(float)); float*y=calloc(task_count*H,sizeof(float));
-    if(!up||!act||!y){free(y);free(act);free(up);return-1;}
+    if(!c->task_up){if(posix_memalign((void**)&c->task_up,256,4*9*1024*4)||posix_memalign((void**)&c->task_activation,256,4*9*512*4)||posix_memalign((void**)&c->task_output,256,4*9*H*4))return-1;}
+    float*up=c->task_up; float*act=c->task_activation; float*y=c->task_output;
     /* Keep a full expert team per token: cross-token task partitioning leaves
      * too few lanes per matvec on A64FX and regresses decode throughput. */
     for(int t=0;t<tokens;t++)
@@ -205,9 +206,9 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
     glm53f_expert_tokens_bits(&shared,tokens,x,c->batch_up,c->batch_activation,c->batch_shared);
 #pragma omp parallel for schedule(static)
     for(int q=0;q<tokens*H;q++){int t=q/H,i=q-t*H;float v=0.0f;for(int k=0;k<counts[t];k++)v+=weights[t*MAXP+k]*y[((size_t)t*MAXP+k)*H+i];c->batch_local[q]=v+c->batch_shared[q];}
-    int rc=glm53f_sum_allreduce_12n(c->batch_local,out,tokens*H);free(y);free(act);free(up);return rc;
+    int rc=glm53f_sum_allreduce_12n(c->batch_local,out,tokens*H);return rc;
 }
-void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
+void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;free(c->task_output);free(c->task_activation);free(c->task_up);free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
 
 #ifndef GLM53F_EXPERT_NO_MAIN
 int main(int argc, char **argv) {
