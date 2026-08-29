@@ -325,6 +325,30 @@ static inline void glm53f_expert_batch_bits(
         }
     }
 }
+
+/* One expert evaluated for up to four token vectors.  This is the guaranteed
+ * reuse case for the shared expert in every MoE layer. */
+static inline void glm53f_expert_tokens_bits(
+        const glm53f_expert_part *part, int tokens, const float *x,
+        float *up, float *act, float *y) {
+    enum { HIDDEN = 4096 };
+    int inter = part->inter, gate_up = 2 * inter;
+    glm53f_mv_fp8_block128_bits_batch(up, part->gate_up,
+        part->gate_up_scale, x, tokens, gate_up, HIDDEN);
+#pragma omp parallel for schedule(static)
+    for (int q = 0; q < tokens * inter; ++q) {
+        int t = q / inter, i = q - t * inter;
+        float g = up[(size_t)t * gate_up + i];
+        float u = up[(size_t)t * gate_up + inter + i];
+        if (g > 10) g = 10;
+        if (g < -100) g = -100;
+        if (u > 10) u = 10;
+        if (u < -10) u = -10;
+        act[(size_t)t * inter + i] = (g / (1 + expf(-g))) * u;
+    }
+    glm53f_mv_fp8_block128_bits_batch(y, part->down,
+        part->down_scale, act, tokens, HIDDEN, inter);
+}
 #endif
 
 #endif
