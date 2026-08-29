@@ -273,3 +273,12 @@ A 32-token sustained scalar run with the same two-row/c+64 prefetch and
 48-thread close binding reaches **18.094 tok/s** (55.268 ms/token, final token
 25, PASS). Profile maxima are mHC 9.698 ms, attention 23.990 ms, FFN 21.018 ms,
 and head 1.185 ms per token.
+
+The next 12-node rerun is job **51094320** (6-hour interactive allocation,
+ports offset by +10). Its target routed stage is being rebuilt under
+`/local/glm53f-target-routed-51094320`; the MPI stage is deliberately allowed
+to finish before launching decode benchmarks. Two arithmetic-neutral MLA
+overhead reductions are in the current tree: remove the unused `vacc` buffer
+and keep the per-call query/logit scratch on the stack (`6f596b70`, `b6907db6`).
+They must be rechecked against greedy-exact output and the 16/32-token target
+profiles after staging.
