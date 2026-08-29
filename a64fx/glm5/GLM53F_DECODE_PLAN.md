@@ -326,6 +326,13 @@ for the local graph). This identifies collective latency/overlap as the next
 KDA optimization target; further standalone projection micro-optimizations are
 unlikely to move end-to-end decode materially.
 
+An optional `GLM53F_FAST_MATH=1` build was tested on job 51094320. The build
+completed, but the 12-node 32-token target run failed the lockstep stability
+gate: after about six minutes one rank remained active without synchronized
+token output (the baseline completes in about 3.5 minutes). The isolated run
+was terminated and fast-math is rejected for deployment; the default strict
+floating-point build remains required.
+
 The real-weight sparse layer-43 benchmark is also exact (`BIT_EXACT PASS`):
 1.437 ms/layer at 128 cached tokens, comprising 0.460 ms indexer/front,
 0.221 ms MLA, 0.105 ms output projection, and **0.800 ms all-reduce**. Thus
