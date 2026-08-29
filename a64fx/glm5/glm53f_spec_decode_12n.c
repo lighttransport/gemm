@@ -14,7 +14,7 @@ static void *a256(size_t n) {
 }
 
 int main(int argc, char **argv) {
-    int rank, ranks, token, cycles, ndraft, capacity;
+    int rank, ranks, token, cycles, ndraft, warmup, capacity;
     int draft[MAX_DRAFT], target[MAX_DRAFT + 1];
     long accepted_total = 0, proposed_total = 0, delivered = 0;
     glm53f_target_model_12n *target_model;
@@ -25,18 +25,26 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 7 || ranks != 12) {
-        if (!rank) fprintf(stderr,"usage: %s MODEL TARGET_ROUTED TARGET_SHARED MTP_ROUTED MTP_SHARED [token=1] [cycles=1] [drafts=4]\n",argv[0]);
+        if (!rank) fprintf(stderr,"usage: %s MODEL TARGET_ROUTED TARGET_SHARED MTP_ROUTED MTP_SHARED [token=1] [cycles=1] [drafts=4] [warmup=128]\n",argv[0]);
         MPI_Abort(MPI_COMM_WORLD,2);
     }
     token=argc>6?atoi(argv[6]):1;cycles=argc>7?atoi(argv[7]):1;
     ndraft=argc>8?atoi(argv[8]):MAX_DRAFT;
-    if(token<0||token>=154880||cycles<1||ndraft<1||ndraft>MAX_DRAFT)MPI_Abort(MPI_COMM_WORLD,2);
-    capacity=cycles*(ndraft+2)+1;
+    warmup=argc>9?atoi(argv[9]):128;
+    if(token<0||token>=154880||cycles<1||ndraft<1||ndraft>MAX_DRAFT||warmup<0)MPI_Abort(MPI_COMM_WORLD,2);
+    capacity=warmup+cycles*(ndraft+2)+1;
     target_model=glm53f_target_model_create_12n(argv[1],argv[2],argv[3],capacity);
     mtp=glm53f_mtp_create_12n(argv[1],argv[4],argv[5],capacity);
     target_hidden=a256(HIDDEN*4);draft_hidden[0]=a256(HIDDEN*4);draft_hidden[1]=a256(HIDDEN*4);
     if(!target_model||!mtp||!target_hidden||!draft_hidden[0]||!draft_hidden[1])MPI_Abort(MPI_COMM_WORLD,2);
     for(int i=0;i<ndraft+2;i++){snapshot[i]=glm53f_target_snapshot_create_12n(target_model);if(!snapshot[i])MPI_Abort(MPI_COMM_WORLD,2);}
+    for(int i=0;i<warmup;i++){
+        int next,ignored;float next_logit,ignored_logit;
+        if(glm53f_target_model_step_12n(target_model,token,&next,&next_logit,target_hidden))MPI_Abort(MPI_COMM_WORLD,2);
+        if(glm53f_mtp_forward_12n(mtp,next,target_hidden,&ignored,&ignored_logit,draft_hidden[0]))MPI_Abort(MPI_COMM_WORLD,2);
+        token=next;
+    }
+    if(!rank)printf("GLM53F_SPEC_WARMUP tokens=%d next_token=%d target_cache=%d mtp_cache=%d\n",warmup,token,warmup,glm53f_mtp_length_12n(mtp));
     MPI_Barrier(MPI_COMM_WORLD);double begin=MPI_Wtime();
     for(int cycle=0;cycle<cycles;cycle++){
         int first_token;
