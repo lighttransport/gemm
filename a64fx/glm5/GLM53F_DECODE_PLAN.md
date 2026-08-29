@@ -312,3 +312,9 @@ accepted (alpha 0.71875), final token 16320, PASS**, at **12.482 tok/s**. Its
 mean phases are target 65.567 ms, draft 9.468 ms, verify 190.468 ms, and rebase
 10.251 ms. Thus 2 drafts improve agreement but reduce delivered throughput;
 retain MTP-1 as the deployment default until verification batching is optimized.
+
+A controlled 36-thread scalar rerun on job 51094320 is slower: **17.003 tok/s**
+(58.813 ms/token, greedy PASS) versus 48-thread close binding at 18.140
+tok/s. Its profile shifts FFN to 26.923 ms/token
+(versus 20.785 ms at 48 threads), confirming 48 threads/close binding as the
+current target configuration.
