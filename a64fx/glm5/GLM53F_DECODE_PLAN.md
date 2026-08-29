@@ -136,10 +136,10 @@ path over 5,000 drafts:
 - 0.138 ms MLP combine and 0.049 ms unloaded attention combine;
 - 1,908 partial drafts/s.
 
-This is a lower bound on draft cost because sparse-attention projections,
-`eh_proj`, the vocabulary projection, cache update, and sampling are not yet in
-the runner. The original 42-layer path still passes after the layer-selection
-change: 48.619 tok/s over 50 tokens, 14.470 ms expert compute, and 20.568 ms wall.
+This was a lower bound on draft cost at the time of the partial probe. The
+token-correct integrated runner described below supersedes it; sparse attention,
+`eh_proj`, normalization, vocabulary projection, cache update, greedy sampling,
+target verification, and rollback are now connected.
 
 Cold-HBM A64FX measurements put MXFP4 expert throughput at 102--155 GB/s versus
 148--174 GB/s for FP8 magic. Accounting for half-sized MXFP4 weights gives about
@@ -173,10 +173,48 @@ near 29.05 GiB. The stager's full-payload scan rejects E4M3 `0x7f/0xff`, and all
 against the scalar FP8 reference. The 48-thread SVE path is finite and passes at
 `max_abs=4.002e-11`, `rel_l2=3.618e-7` for the full gate/up/SiLU/down operation.
 
-This establishes payload and expert-kernel numerical stability, not language
-quality. Draft acceptance alpha, greedy token agreement, and long-text quality
-cannot be measured by the present partial runner because attention projections,
-cache semantics, `eh_proj`, normalization, and the vocabulary head are not yet
-connected into a token-correct GLM-5.3F forward graph. Any alpha reported before
-that graph exists would be synthetic and must not be used for the speculative
-decode decision.
+This establishes payload and expert-kernel numerical stability. It remains a
+useful isolated check, but the integrated measurements below are the quality
+gate for speculative decode.
+
+### Token-correct integrated target/MTP runner (job 51077354)
+
+The 12-rank runner now connects the real embedding, 45 target layers, 12-way
+KDA and sparse-attention projections/state, mHC, routed and shared experts,
+normalization, shared vocabulary head, and the independent layer-45 MTP graph.
+Verification snapshots contain every KDA recurrent/convolution state and every
+sparse-attention cache length. Rejection restores the selected target snapshot;
+the committed MTP suffix is replayed from exact target hidden states.
+
+Correctness and stability evidence:
+
+- scalar versus five-position batched KDA output has relative L2
+  `6.93943709e-08`; all captured recurrent and convolution snapshots are
+  bit-exact;
+- a sustained 128-token target run produces the same token trajectory through
+  final token `271` before and after the decode optimizations;
+- G1 after a 128-token warmup repeatedly produces the identical 16-cycle
+  acceptance pattern, `10/16` accepted drafts (`alpha=0.625000`), 42 delivered
+  tokens, and final token `40591`;
+- target plus MTP weights and capacity-177 caches leave 3.70 GiB
+  `MemAvailable` on rank 0, with no NaNs, OOM, or collective failure.
+
+The validated KDA changes fuse Q/K/V projection launches, parallelize the three
+depthwise convolution channel sets, and parallelize independent local-head
+normalization/decay and gated RMSNorm. On the controlled 128-token target test,
+latency improved from 68.500 to **62.413 ms/token**, or **14.599 to 16.022
+tok/s** (+9.75%), with the token trajectory unchanged. The best matching G1
+run is **11.936 delivered tok/s** with unchanged acceptance and final token.
+
+The optimized scalar target profile is 25.696 ms attention, 22.579 ms FFN,
+12.596 ms mHC, 1.178 ms vocabulary head, and 0.373 ms embedding per position
+(component maxima are reduced independently across ranks and need not sum to
+the end-to-end maximum). This makes attention/FFN the next optimization targets;
+MTP remains latency-negative at the measured alpha because target verification
+dominates.
+
+Runtime context allocation tests establish **256K as the minimum-safe target
+and 512K as the preferred maximum** for the current 32 GiB/rank layout. The
+planner's theoretical 1M estimate above does not satisfy the runtime 2 GiB
+headroom guard once the complete integrated graph and working buffers are
+resident, so 1M is not a supported launch configuration in this implementation.
