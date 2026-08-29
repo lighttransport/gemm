@@ -345,3 +345,9 @@ the exact token stream but regressed the 12-node target to **17.624 tok/s**
 regions and working-set effects outweigh the extra parallelism for 5--6 local
 heads, so the experiment is reverted and the 18.140 tok/s implementation stays
 as the performance baseline.
+
+After restoring the strict build, a repeat 32-token run remained greedy-exact
+(`final_token=25`, PASS) but measured **17.443 tok/s** (57.331 ms/token;
+attention 25.739 ms, FFN 21.592 ms). The token stream is identical to the
+18.140 tok/s run, so this is retained as a run-to-run A64FX variance datapoint,
+not a replacement for the established best result.
