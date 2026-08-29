@@ -221,6 +221,11 @@ performance path uses one full OpenMP team per token and measures MTP-3 at 9.63
 tok/s, alpha 0.4167, PASS. `OMP_PROC_BIND=spread` was tested at 15.62 tok/s and
 is slower than the default close binding.
 
+Eliminating empty remainder OpenMP regions in the KDA `mv`/`mv3` projection
+helpers is exact and improves the 16-token profiled target run from 59.812 to
+58.657 ms/token (16.719 to 17.048 tok/s); attention falls from 25.761 to
+24.689 ms/token.
+
 Runtime context allocation tests establish **256K as the minimum-safe target
 and 512K as the preferred maximum** for the current 32 GiB/rank layout. The
 planner's theoretical 1M estimate above does not satisfy the runtime 2 GiB

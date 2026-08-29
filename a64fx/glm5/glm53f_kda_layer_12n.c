@@ -36,15 +36,19 @@ static inline float dot1(const uint16_t*w,const float*x,int n){svfloat32_t a=svd
 static void mv(float*y,const uint16_t*w,const float*x,int rows,int cols){int nb=rows/8;
 #pragma omp parallel for schedule(static)
     for(int b=0;b<nb;b++)dot8(y+b*8,w+(size_t)b*8*cols,x,cols);
+    if(rows&7){
 #pragma omp parallel for schedule(static)
-    for(int r=nb*8;r<rows;r++)y[r]=dot1(w+(size_t)r*cols,x,cols);
+        for(int r=nb*8;r<rows;r++)y[r]=dot1(w+(size_t)r*cols,x,cols);
+    }
 }
 static void mv3(float*y0,float*y1,float*y2,const uint16_t*w0,const uint16_t*w1,
         const uint16_t*w2,const float*x,int rows,int cols){int nb=rows/8;
 #pragma omp parallel for schedule(static)
     for(int b=0;b<nb;b++){size_t off=(size_t)b*8*cols;dot8(y0+b*8,w0+off,x,cols);dot8(y1+b*8,w1+off,x,cols);dot8(y2+b*8,w2+off,x,cols);}
+    if(rows&7){
 #pragma omp parallel for schedule(static)
-    for(int r=nb*8;r<rows;r++){size_t off=(size_t)r*cols;y0[r]=dot1(w0+off,x,cols);y1[r]=dot1(w1+off,x,cols);y2[r]=dot1(w2+off,x,cols);}
+        for(int r=nb*8;r<rows;r++){size_t off=(size_t)r*cols;y0[r]=dot1(w0+off,x,cols);y1[r]=dot1(w1+off,x,cols);y2[r]=dot1(w2+off,x,cols);}
+    }
 }
 static void conv3(float*q,float*k,float*v,float*state,const uint16_t*qw,
         const uint16_t*kw,const uint16_t*vw,int channels){
