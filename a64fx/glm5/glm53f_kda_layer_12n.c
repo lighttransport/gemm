@@ -86,7 +86,8 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     for(int h=0;h<hn;h++)glm53f_kda_step_vec_streamed(c->state+(size_t)h*D*D,q+(size_t)h*D,k+(size_t)h*D,v+(size_t)h*D,c->decay+(size_t)h*D,c->beta[h],D,D,c->core+(size_t)h*D,c->work+(size_t)h*D);
     if(c->detail_profile){double t=MPI_Wtime();c->detail[3]=t-td;td=t;}
     mv(c->small,w->ga,x,D,H);mv(c->gate,w->gb,c->small,qd,D);
-    glm53f_rmsnorm_gated_bf16(c->normed,c->core,c->gate,w->on,hn,D,1e-5f);
+#pragma omp parallel for schedule(static)
+    for(int h=0;h<hn;h++)glm53f_rmsnorm_gated_bf16(c->normed+(size_t)h*D,c->core+(size_t)h*D,c->gate+(size_t)h*D,w->on,1,D,1e-5f);
     if(c->detail_profile)c->detail[4]=MPI_Wtime()-td;
     double t1=MPI_Wtime();
 #pragma omp parallel for schedule(static)
