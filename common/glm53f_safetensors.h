@@ -49,6 +49,11 @@ int glm53f_st_expect(const glm53f_st_context *ctx, const char *name,
 /* Read a bounded tensor slice without mapping the shard payload. */
 int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
                    size_t offset, void *dst, size_t nbytes);
+/* Pack the same contiguous column interval from every row of a 2-D tensor.
+ * The shard is opened once, avoiding thousands of open/close pairs. */
+int glm53f_st_read_columns(const glm53f_st_context *ctx, const char *name,
+                           size_t row_bytes, size_t column_offset,
+                           size_t column_bytes, void *dst);
 
 #ifdef GLM53F_SAFETENSORS_IMPLEMENTATION
 
@@ -197,6 +202,40 @@ int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
                           (off_t)nbytes, POSIX_FADV_DONTNEED);
 #endif
     }
+    close(fd);
+    return rc;
+}
+
+int glm53f_st_read_columns(const glm53f_st_context *ctx, const char *name,
+                           size_t row_bytes, size_t column_offset,
+                           size_t column_bytes, void *dst) {
+    const st_context *owner = NULL;
+    const st_tensor_info *t = glm53f_st_find(ctx, name, &owner);
+    char path[4096];
+    size_t rows;
+    int i, fd, rc = -1;
+    if (!t || !owner || t->n_dims != 2 || !row_bytes || !column_bytes ||
+        column_offset > row_bytes || column_bytes > row_bytes - column_offset ||
+        t->nbytes % row_bytes || !dst) return -1;
+    rows = t->nbytes / row_bytes;
+    for (i = 0; i < ctx->n_shards; ++i) if (ctx->shards[i].st == owner) break;
+    if (i == ctx->n_shards || snprintf(path, sizeof(path), "%s/%s", ctx->model_dir,
+                                        ctx->shards[i].name) >= (int)sizeof(path)) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    for (size_t row = 0; row < rows; ++row) {
+        off_t offset = (off_t)(owner->data_offset + t->offset + row * row_bytes +
+                               column_offset);
+        if (pread(fd, (unsigned char *)dst + row * column_bytes,
+                  column_bytes, offset) != (ssize_t)column_bytes) goto done;
+    }
+    rc = 0;
+#if defined(POSIX_FADV_DONTNEED)
+    if (!getenv("GLM53F_STAGE_KEEPCACHE"))
+        posix_fadvise(fd, (off_t)(owner->data_offset + t->offset),
+                      (off_t)t->nbytes, POSIX_FADV_DONTNEED);
+#endif
+done:
     close(fd);
     return rc;
 }
