@@ -126,8 +126,15 @@ static inline void glm53f_mhc_pre_batch_sve(
 
 static inline void glm53f_mhc_post_sve(
         float *streams, const float *sublayer, const glm53f_mhc_scratch *scratch) {
-    glm53f_mhc_post(streams, scratch->residual, sublayer, scratch->post,
-                    scratch->combine, GLM53F_MHC_STREAMS, GLM53F_MHC_WIDTH);
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int k = 0; k < GLM53F_MHC_STREAMS; ++k)
+        for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {
+            double v = (double)scratch->post[k] * sublayer[d];
+            for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)
+                v += (double)scratch->combine[(size_t)j * GLM53F_MHC_STREAMS + k] *
+                     scratch->residual[(size_t)j * GLM53F_MHC_WIDTH + d];
+            streams[(size_t)k * GLM53F_MHC_WIDTH + d] = (float)v;
+        }
 }
 
 /* Batch-only post mix.  Verification positions are independent at this
