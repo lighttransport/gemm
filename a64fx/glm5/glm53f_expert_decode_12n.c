@@ -194,7 +194,13 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
     }
     size_t task_count=(size_t)tokens*MAXP; float*up=calloc(task_count*1024,sizeof(float)); float*act=calloc(task_count*512,sizeof(float)); float*y=calloc(task_count*H,sizeof(float));
     if(!up||!act||!y){free(y);free(act);free(up);return-1;}
-    glm53f_expert_tasks_bits(parts,counts,tokens,x,up,act,y);
+    /* Keep a full expert team per token: cross-token task partitioning leaves
+     * too few lanes per matvec on A64FX and regresses decode throughput. */
+    for(int t=0;t<tokens;t++)
+        glm53f_expert_batch_bits(parts+t*MAXP,counts[t],x+(size_t)t*H,
+                                 up+(size_t)t*MAXP*1024,
+                                 act+(size_t)t*MAXP*512,
+                                 y+(size_t)t*MAXP*H);
     shared_offset*sp=&c->shared[table_layer];glm53f_expert_part shared={c->shared_blob+sp->gate_up,(const float*)(c->shared_blob+sp->gate_up_scale),c->shared_blob+sp->down,(const float*)(c->shared_blob+sp->down_scale),sp->inter};
     glm53f_expert_tokens_bits(&shared,tokens,x,c->batch_up,c->batch_activation,c->batch_shared);
 #pragma omp parallel for schedule(static)
