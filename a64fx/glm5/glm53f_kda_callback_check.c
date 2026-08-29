@@ -19,6 +19,7 @@ int main(int argc, char **argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     if (argc < 2 || size != 12 || tokens < 1 || tokens > MAX_TOKENS)
         MPI_Abort(MPI_COMM_WORLD, 2);
+    setenv("GLM53F_KDA_DETAIL", "1", 0);
     const char *topology = getenv("TOFU_TOPO_PATH");
     if (getenv("GLM53F_UTOFU") &&
             glm53f_collective_init_12n(topology, MAX_TOKENS * HIDDEN))
@@ -69,9 +70,11 @@ int main(int argc, char **argv) {
     int all_state_ok;
     MPI_Allreduce(&local_ok, &ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     MPI_Allreduce(&state_ok, &all_state_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    double seq_max, batch_max, phase[3], max_phase[3];
+    double seq_max, batch_max, phase[3], max_phase[3], detail[5], max_detail[5];
     glm53f_kda_last_phase_12n(cb, phase);
+    glm53f_kda_last_detail_12n(cb, detail);
     MPI_Reduce(phase, max_phase, 3, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(detail, max_detail, 5, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&seq_elapsed, &seq_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&batch_elapsed, &batch_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!rank)
@@ -82,6 +85,12 @@ int main(int argc, char **argv) {
                rel_l2, seq_max * 1e3, batch_max * 1e3, seq_max / batch_max,
                max_phase[0] * 1e3, max_phase[1] * 1e3, max_phase[2] * 1e3,
                ok ? "PASS" : "FAIL");
+    if (!rank)
+        printf("GLM53F_KDA_DETAIL qkv_ms=%.3f conv_ms=%.3f prep_ms=%.3f "
+               "recur_ms=%.3f gate_norm_ms=%.3f\n",
+               max_detail[0] * 1e3, max_detail[1] * 1e3,
+               max_detail[2] * 1e3, max_detail[3] * 1e3,
+               max_detail[4] * 1e3);
     glm53f_kda_free_12n(cb);
     glm53f_kda_free_12n(ca);
     free(batch_state); free(seq_state);

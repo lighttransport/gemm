@@ -19,6 +19,8 @@ int glm53f_kda_sublayer_batch_capture_12n(
     void *state_after_each_token, size_t state_stride);
 void glm53f_kda_last_phase_12n(
     const glm53f_kda_context_12n *context, double phase_seconds[3]);
+void glm53f_kda_last_detail_12n(
+    const glm53f_kda_context_12n *context, double phase_seconds[5]);
 size_t glm53f_kda_state_bytes_12n(const glm53f_kda_context_12n *context);
 int glm53f_kda_save_state_12n(
     const glm53f_kda_context_12n *context, void *snapshot, size_t bytes);

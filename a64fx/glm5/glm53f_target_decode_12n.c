@@ -400,7 +400,7 @@ int main(int argc, char **argv) {
         MPI_Abort(MPI_COMM_WORLD,2);
     }
     token=argc>4?atoi(argv[4]):1;steps=argc>5?atoi(argv[5]):1;
-    if(token<0||token>=154880||steps<1||steps>32)MPI_Abort(MPI_COMM_WORLD,2);
+    if(token<0||token>=154880||steps<1||steps>128)MPI_Abort(MPI_COMM_WORLD,2);
     int capacity=getenv("GLM53F_CAPACITY")?atoi(getenv("GLM53F_CAPACITY")):steps;
     if(capacity<steps)MPI_Abort(MPI_COMM_WORLD,2);
     if(getenv("GLM53F_UTOFU")){const char*topo=getenv("TOFU_TOPO_PATH");if(!topo)topo="../utofu-tests/tofu_topo.txt";if(glm53f_collective_init_12n(topo,5*HIDDEN))MPI_Abort(MPI_COMM_WORLD,2);}
