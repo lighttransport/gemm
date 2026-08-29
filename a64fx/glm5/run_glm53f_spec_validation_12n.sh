@@ -24,6 +24,6 @@ export OMP_PLACES=cores
 
 mpiexec -np 12 -of-proc "$logdir/spec" \
     ./glm53f_spec_decode_12n "$model" "$target_routed" "$target_shared" \
-    "$mtp_routed" "$mtp_shared" 1 1 4
+    "$mtp_routed" "$mtp_shared" 1 1 "${GLM53F_SPEC_DRAFTS:-1}"
 
 echo "SENTINEL glm53f_spec_validation_12n=OK"

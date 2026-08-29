@@ -25,11 +25,11 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 7 || ranks != 12) {
-        if (!rank) fprintf(stderr,"usage: %s MODEL TARGET_ROUTED TARGET_SHARED MTP_ROUTED MTP_SHARED [token=1] [cycles=1] [drafts=4] [warmup=128]\n",argv[0]);
+        if (!rank) fprintf(stderr,"usage: %s MODEL TARGET_ROUTED TARGET_SHARED MTP_ROUTED MTP_SHARED [token=1] [cycles=1] [drafts=1] [warmup=128]\n",argv[0]);
         MPI_Abort(MPI_COMM_WORLD,2);
     }
     token=argc>6?atoi(argv[6]):1;cycles=argc>7?atoi(argv[7]):1;
-    ndraft=argc>8?atoi(argv[8]):MAX_DRAFT;
+    ndraft=argc>8?atoi(argv[8]):1;
     warmup=argc>9?atoi(argv[9]):128;
     if(token<0||token>=154880||cycles<1||ndraft<1||ndraft>MAX_DRAFT||warmup<0)MPI_Abort(MPI_COMM_WORLD,2);
     capacity=warmup+cycles*(ndraft+2)+1;
