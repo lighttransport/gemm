@@ -19,6 +19,10 @@ int main(int argc, char **argv) {
     glm53f_kda_context_12n *ca = glm53f_kda_create_12n(argv[1], layer);
     glm53f_kda_context_12n *cb = glm53f_kda_create_12n(argv[1], layer);
     if (!ca || !cb) MPI_Abort(MPI_COMM_WORLD, 2);
+    size_t state_bytes = glm53f_kda_state_bytes_12n(ca);
+    unsigned char *seq_state = malloc(TOKENS * state_bytes);
+    unsigned char *batch_state = malloc(TOKENS * state_bytes);
+    if (!seq_state || !batch_state) MPI_Abort(MPI_COMM_WORLD, 2);
     for (int t = 0; t < TOKENS; ++t)
         for (int i = 0; i < HIDDEN; ++i)
             x[t][i] = (float)(((i * 29 + t * 17 + 7) % 257) - 128) / 128.0f;
@@ -30,12 +34,16 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     seq_begin = MPI_Wtime();
     local_ok = 1;
-    for (int t = 0; t < TOKENS; ++t)
+    for (int t = 0; t < TOKENS; ++t) {
         local_ok &= !glm53f_kda_sublayer_12n(ca, a[t], x[t]);
+        local_ok &= !glm53f_kda_save_state_12n(
+            ca, seq_state + (size_t)t * state_bytes, state_bytes);
+    }
     seq_elapsed = MPI_Wtime() - seq_begin;
     MPI_Barrier(MPI_COMM_WORLD);
     batch_begin = MPI_Wtime();
-    local_ok &= !glm53f_kda_sublayer_batch_12n(cb, b[0], x[0], TOKENS);
+    local_ok &= !glm53f_kda_sublayer_batch_capture_12n(
+        cb, b[0], x[0], TOKENS, batch_state, state_bytes);
     batch_elapsed = MPI_Wtime() - batch_begin;
     double diff2 = 0.0, ref2 = 0.0;
     for (int t = 0; t < TOKENS; ++t)
@@ -46,13 +54,8 @@ int main(int argc, char **argv) {
         }
     double rel_l2 = sqrt(diff2 / (ref2 + 1e-30));
     local_ok &= rel_l2 < 2e-6;
-    size_t state_bytes = glm53f_kda_state_bytes_12n(ca);
-    void *sa = malloc(state_bytes), *sb = malloc(state_bytes);
-    int state_ok = sa && sb && !glm53f_kda_save_state_12n(ca, sa, state_bytes) &&
-                !glm53f_kda_save_state_12n(cb, sb, state_bytes) &&
-                !memcmp(sa, sb, state_bytes);
+    int state_ok = !memcmp(seq_state, batch_state, TOKENS * state_bytes);
     local_ok &= state_ok;
-    free(sb); free(sa);
     for (int t = 0; t < TOKENS; ++t)
         for (int i = 0; i < HIDDEN; ++i)
             local_ok &= isfinite(a[t][i]);
@@ -70,6 +73,7 @@ int main(int argc, char **argv) {
                ok ? "PASS" : "FAIL");
     glm53f_kda_free_12n(cb);
     glm53f_kda_free_12n(ca);
+    free(batch_state); free(seq_state);
     MPI_Finalize();
     return ok ? 0 : 1;
 }
