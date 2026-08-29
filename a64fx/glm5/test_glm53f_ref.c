@@ -12,6 +12,8 @@ int main(void) {
     float cs[6] = {0}, cs_checkpoint[6], ci[2] = {1, 2}, co[2];
     float co_replay[2], cx[4] = {1,2,3,4}, cg[4] = {0,0,0,0}, cgo[4];
     uint16_t cw[6] = {0x3f80,0x3f80,0x3f80, 0x3f80,0,0x3f80};
+    int sd[3] = {11,12,13}, st0[4] = {21,22,23,24};
+    int st1[4] = {11,22,23,24}, st3[4] = {11,12,13,24};
     float logits[6] = {-3, 2, 0, 4, -1, 1}, bias[6] = {0};
     float w[2], comb[4] = {1, 2, 3, 4};
     int ids[2];
@@ -65,6 +67,12 @@ int main(void) {
     glm53f_rmsnorm_gated_bf16(cgo, cx, cg, one, 2, 2, 1e-6f);
     if (fabsf(cgo[0] - .5f / sqrtf(2.5f + 1e-6f)) > 1e-6f ||
         fabsf(cgo[3] - 2.0f / sqrtf(12.5f + 1e-6f)) > 1e-6f) return 20;
+    glm53f_spec_result sr = glm53f_spec_verify_greedy(sd, st0, 3);
+    if (sr.accepted != 0 || sr.next_token != 21 || sr.committed_steps != 1) return 21;
+    sr = glm53f_spec_verify_greedy(sd, st1, 3);
+    if (sr.accepted != 1 || sr.next_token != 22 || sr.committed_steps != 2) return 22;
+    sr = glm53f_spec_verify_greedy(sd, st3, 3);
+    if (sr.accepted != 3 || sr.next_token != 24 || sr.committed_steps != 4) return 23;
     glm53f_router_topk(logits, bias, 6, 2, 2.5f, ids, w);
     if (ids[0] != 3 || ids[1] != 1 || fabsf(w[0] + w[1] - 2.5f) > 1e-6f) return 2;
     glm53f_mhc_sinkhorn(comb, 2, 20, 1e-6f);
@@ -94,6 +102,6 @@ int main(void) {
     glm53f_mla_selected_bf16(ad, aq, az, aw, ai, 2, 1, 2, 1, 3);
     if (glm53f_mla_selected_absorbed_bf16(aa, aq, az, aw, ai, 2, 1, 2, 1, 3) ||
         fabsf(ad[0] - aa[0]) > 2e-7f) return 13;
-    printf("GLM53F_REF kda=ok kda_vec=ok safe_gate=ok conv_state=ok gated_norm=ok rollback=ok router=ok mhc=ok cp=ok norm=ok topk=ok index=ok fusion=ok head=ok mhc_site=ok mla_absorb=ok\n");
+    printf("GLM53F_REF kda=ok kda_vec=ok safe_gate=ok conv_state=ok gated_norm=ok rollback=ok spec_commit=ok router=ok mhc=ok cp=ok norm=ok topk=ok index=ok fusion=ok head=ok mhc_site=ok mla_absorb=ok\n");
     return 0;
 }

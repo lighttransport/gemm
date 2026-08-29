@@ -540,4 +540,26 @@ static inline size_t glm53f_cp_slots(size_t ctx, int ranks) {
 static inline int glm53f_cp_owner(size_t pos, int ranks) { return (int)(pos % (size_t)ranks); }
 static inline size_t glm53f_cp_slot(size_t pos, int ranks) { return pos / (size_t)ranks; }
 
+/* Greedy speculative verification transaction. target[i] is the target
+ * model's next-token result after consuming input i (current token followed
+ * by draft tokens). Only a consecutive matching prefix is committed.
+ * The target cache always commits the current-token step plus every accepted
+ * draft; later verification states must be rolled back. */
+typedef struct {
+    int accepted;
+    int next_token;
+    int committed_steps;
+} glm53f_spec_result;
+
+static inline glm53f_spec_result glm53f_spec_verify_greedy(
+        const int *draft, const int *target, int n_draft) {
+    glm53f_spec_result r = {0, target[0], 1};
+    while (r.accepted < n_draft && target[r.accepted] == draft[r.accepted]) {
+        ++r.accepted;
+        ++r.committed_steps;
+        r.next_token = target[r.accepted];
+    }
+    return r;
+}
+
 #endif
