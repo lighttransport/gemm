@@ -63,6 +63,11 @@ static inline void glm53f_matvec_fp8_bits_8(
         int end = b + 128 < cols ? b + 128 : cols;
         int block = b / 128;
         for (int c = b; c < end; c += vl) {
+            if (c + 64 < end) {
+                __builtin_prefetch(x + c + 64, 0, 1);
+                __builtin_prefetch(w + c + 64, 0, 0);
+                __builtin_prefetch(w + (size_t)cols + c + 64, 0, 0);
+            }
             svbool_t pg = svwhilelt_b32(c, end);
             svfloat32_t xv = svld1(pg, x + c);
             svfloat32_t xs = svmul_n_f32_x(pg, xv, scale[block]);

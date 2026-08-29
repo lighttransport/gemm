@@ -240,3 +240,10 @@ and 512K as the preferred maximum** for the current 32 GiB/rank layout. The
 planner's theoretical 1M estimate above does not satisfy the runtime 2 GiB
 headroom guard once the complete integrated graph and working buffers are
 resident, so 1M is not a supported launch configuration in this implementation.
+
+FP8 8-row matvec prefetching (next input vector plus two weight rows) is
+arithmetic-neutral and produced the best sustained result so far: 16-token
+target decode **17.654 tok/s** (56.643 ms/token, final token 432, PASS), with
+attention 23.394 ms and FFN 21.061 ms. MTP-3 improved to **9.933 delivered
+tok/s**, alpha 0.4167, 26/26 committed tokens, PASS; target/verify phases are
+64.298/240.950 ms per cycle.
