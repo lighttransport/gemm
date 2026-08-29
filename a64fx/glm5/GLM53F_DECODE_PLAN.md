@@ -326,6 +326,12 @@ for the local graph). This identifies collective latency/overlap as the next
 KDA optimization target; further standalone projection micro-optimizations are
 unlikely to move end-to-end decode materially.
 
+The real-weight sparse layer-43 benchmark is also exact (`BIT_EXACT PASS`):
+1.437 ms/layer at 128 cached tokens, comprising 0.460 ms indexer/front,
+0.221 ms MLA, 0.105 ms output projection, and **0.800 ms all-reduce**. Thus
+the sparse-attention side independently confirms that communication, rather
+than MLA arithmetic, is the limiting component.
+
 An MLA head-dimension parallelization experiment (commit `58dee7e5`) preserved
 the exact token stream but regressed the 12-node target to **17.624 tok/s**
 (56.742 ms/token); attention rose to 25.084 ms/token. The additional OpenMP
