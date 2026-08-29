@@ -253,3 +253,8 @@ delivered tok/s**, alpha 0.625 (10/16 draft matches), target/verify phases
 64.498/190.441 ms per cycle, final token 3669, PASS. Keep `drafts=2` for the
 current best speculative-decode setting; the runner still accepts explicit
 draft counts for experiments.
+
+A 32-token sustained scalar run with the same two-row/c+64 prefetch and
+48-thread close binding reaches **18.094 tok/s** (55.268 ms/token, final token
+25, PASS). Profile maxima are mHC 9.698 ms, attention 23.990 ms, FFN 21.018 ms,
+and head 1.185 ms per token.
