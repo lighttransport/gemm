@@ -2,10 +2,14 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#define SAFETENSORS_IMPLEMENTATION
+#define GLM53F_SAFETENSORS_IMPLEMENTATION
 #include <arm_sve.h>
 #include <mpi.h>
 #include <omp.h>
 #include "glm53f_expert_kern.h"
+#include "../../common/glm53f_safetensors.h"
+#include "../../common/glm53f_ref.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -158,12 +162,16 @@ int main(int argc, char **argv) {
         atoi(getenv("GLM53F_ATTENTION_COMBINE")) : 0;
     const char *stage = argc > 1 ? argv[1] : getenv("GLM53F_STAGE_DIR");
     const char *shared_stage = getenv("GLM53F_SHARED_STAGE_DIR");
+    const char *model_dir = getenv("GLM53F_MODEL_DIR");
     char blob_path[512], manifest_path[512];
     expert_offset *table;
     unsigned char *blob, *shared_blob = NULL;
     size_t blob_bytes = 0, shared_bytes = 0;
     shared_offset shared[NLAYERS];
     float *x, *up, *act, *out, *sum;
+    uint16_t *router_w = NULL;
+    float *router_bias = NULL, *router_logits = NULL, route_weight[8];
+    int router_check = 1;
     double compute = 0, combine = 0, attention = 0, wall0, wire_call;
     long local_tasks = 0;
     MPI_Init(&argc, &argv);
@@ -197,7 +205,48 @@ int main(int argc, char **argv) {
     posix_memalign((void **)&out, 256, 9 * 4096 * sizeof(float));
     posix_memalign((void **)&sum, 256, 4096 * sizeof(float));
     if (!x || !up || !act || !out || !sum) MPI_Abort(MPI_COMM_WORLD, 1);
+    if (model_dir) {
+        glm53f_st_context *st = glm53f_st_open(model_dir);
+        char name[256];
+        size_t wn = (size_t)run_layers * NEXPERTS * 4096 * sizeof(uint16_t);
+        size_t bn = (size_t)run_layers * NEXPERTS * sizeof(float);
+        if (!st || posix_memalign((void **)&router_w, 256, wn) ||
+            posix_memalign((void **)&router_bias, 256, bn) ||
+            posix_memalign((void **)&router_logits, 256, NEXPERTS * sizeof(float)))
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        for (int li = 0; li < run_layers; ++li) {
+            snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.gate.weight", first_layer + li);
+            if (glm53f_st_read(st, name, 0, router_w + (size_t)li * NEXPERTS * 4096,
+                               (size_t)NEXPERTS * 4096 * sizeof(uint16_t))) MPI_Abort(MPI_COMM_WORLD, 1);
+            snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.gate.e_score_correction_bias", first_layer + li);
+            if (glm53f_st_read(st, name, 0, router_bias + (size_t)li * NEXPERTS,
+                               NEXPERTS * sizeof(float))) MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        glm53f_st_close(st);
+    }
     for (int i = 0; i < 4096; ++i) x[i] = (float)((i % 29) - 14) * .001f;
+    if (router_w) {
+        float ref_logits[NEXPERTS], ref_weight[8], sve_weight[8];
+        int ref_id[8], sve_id[8];
+#pragma omp parallel for schedule(static)
+        for (int e = 0; e < NEXPERTS; ++e) {
+            const uint16_t *w = router_w + (size_t)e * 4096;
+            router_logits[e] = glm53f_dot_bf16_sve(w, x, 4096);
+            ref_logits[e] = glm53f_dot_bf16(w, x, 4096);
+        }
+        glm53f_router_topk(router_logits, router_bias, NEXPERTS, 8, 2.5f,
+                           sve_id, sve_weight);
+        glm53f_router_topk(ref_logits, router_bias, NEXPERTS, 8, 2.5f,
+                           ref_id, ref_weight);
+        for (int k = 0; k < 8; ++k)
+            router_check &= sve_id[k] == ref_id[k] &&
+                            fabsf(sve_weight[k] - ref_weight[k]) < 2e-6f;
+        int all_router_check;
+        MPI_Allreduce(&router_check, &all_router_check, 1, MPI_INT, MPI_MIN,
+                      MPI_COMM_WORLD);
+        router_check = all_router_check;
+        if (!router_check) MPI_Abort(MPI_COMM_WORLD, 1);
+    }
     MPI_Barrier(MPI_COMM_WORLD);
     memset(sum, 0, 4096 * sizeof(float));
     double wire0 = now_sec();
@@ -226,7 +275,19 @@ int main(int argc, char **argv) {
                               MPI_COMM_WORLD);
                 attention += now_sec() - t0;
             }
-            route8(tok, first_layer + li, selected);
+            double t0 = now_sec();
+            if (router_w) {
+#pragma omp parallel for schedule(static)
+                for (int e = 0; e < NEXPERTS; ++e)
+                    router_logits[e] = glm53f_dot_bf16_sve(
+                        router_w + ((size_t)li * NEXPERTS + e) * 4096, x, 4096);
+                glm53f_router_topk(router_logits,
+                    router_bias + (size_t)li * NEXPERTS, NEXPERTS, 8, 2.5f,
+                    selected, route_weight);
+            } else {
+                route8(tok, first_layer + li, selected);
+                for (int k = 0; k < 8; ++k) route_weight[k] = 1.0f;
+            }
             for (int k = 0; k < 8; ++k) {
                 expert_offset *p = &table[layer_index * NEXPERTS + selected[k]];
                 if (p->gate_up == UINT64_MAX) continue;
@@ -246,11 +307,12 @@ int main(int argc, char **argv) {
                 part[n].inter = p->inter;
                 n++;
             }
-            double t0 = now_sec();
             if (n) glm53f_expert_batch_bits(part, n, x, up, act, out);
             memset(sum, 0, 4096 * sizeof(float));
-            for (int k = 0; k < n; ++k)
-                for (int i = 0; i < 4096; ++i) sum[i] += out[(size_t)k * 4096 + i];
+            for (int k = 0; k < n; ++k) {
+                float wk = k < 8 ? route_weight[k] : 1.0f;
+                for (int i = 0; i < 4096; ++i) sum[i] += wk * out[(size_t)k * 4096 + i];
+            }
             compute += now_sec() - t0;
             t0 = now_sec();
             MPI_Allreduce(MPI_IN_PLACE, sum, 4096, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
@@ -266,14 +328,26 @@ int main(int argc, char **argv) {
     MPI_Reduce(&combine, &max_combine, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&attention, &max_attention, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_tasks, &max_tasks, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
-    if (!rank) printf("GLM53F_EXPERT_DECODE_12N tokens=%d layers=%d attention_combine=%d expert_parts_rank=%d weight_GiB_rank=%.3f max_tasks=%ld wall_ms_tok=%.3f compute_ms_tok=%.3f combine_ms_tok=%.3f attention_ms_tok=%.3f wire_us_call=%.3f wire_ms_tok=%.3f arrival_ms_tok=%.3f tok_s=%.3f checksum=%.9g\n",
-        tokens, run_layers, attention_combine, manifest_entries / (run_layers * 4), (blob_bytes + shared_bytes) / 1073741824.0, max_tasks,
-        max_wall * 1e3 / tokens, max_compute * 1e3 / tokens,
-        max_combine * 1e3 / tokens, max_attention * 1e3 / tokens,
-        wire_call * 1e6, wire_call * run_layers * (attention_combine + 1) * 1e3,
-        (max_combine + max_attention) * 1e3 / tokens -
-            wire_call * run_layers * (attention_combine + 1) * 1e3,
-        tokens / max_wall, sum[0]);
+    if (!rank) {
+        char line[2048];
+        snprintf(line, sizeof(line), "GLM53F_EXPERT_DECODE_12N tokens=%d layers=%d attention_combine=%d real_router=%d router_check=%s expert_parts_rank=%d weight_GiB_rank=%.3f max_tasks=%ld wall_ms_tok=%.3f compute_ms_tok=%.3f combine_ms_tok=%.3f attention_ms_tok=%.3f wire_us_call=%.3f wire_ms_tok=%.3f arrival_ms_tok=%.3f tok_s=%.3f checksum=%.9g\n",
+            tokens, run_layers, attention_combine, router_w != NULL,
+            router_check ? "PASS" : "FAIL",
+            manifest_entries / (run_layers * 4), (blob_bytes + shared_bytes) / 1073741824.0, max_tasks,
+            max_wall * 1e3 / tokens, max_compute * 1e3 / tokens,
+            max_combine * 1e3 / tokens, max_attention * 1e3 / tokens,
+            wire_call * 1e6, wire_call * run_layers * (attention_combine + 1) * 1e3,
+            (max_combine + max_attention) * 1e3 / tokens -
+                wire_call * run_layers * (attention_combine + 1) * 1e3,
+            tokens / max_wall, sum[0]);
+        fputs(line, stdout); fflush(stdout);
+        const char *status_path = getenv("GLM53F_BENCH_STATUS");
+        if (status_path && *status_path) {
+            FILE *status = fopen(status_path, "w");
+            if (status) { fputs(line, status); fclose(status); }
+        }
+    }
+    free(router_logits); free(router_bias); free(router_w);
     free(sum); free(out); free(act); free(up); free(x); free(shared_blob); free(blob); free(table);
     MPI_Finalize();
     return 0;

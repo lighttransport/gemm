@@ -9,6 +9,8 @@
 
 #include <mpi.h>
 #include <omp.h>
+#include <arm_sve.h>
+#include "glm53f_expert_kern.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,7 +38,7 @@ static void rmsnorm(float *out, const float *x, const uint16_t *w) {
 static void matvec(float *out, const uint16_t *w, const float *x, int rows, int cols) {
 #pragma omp parallel for schedule(static)
     for (int r = 0; r < rows; ++r)
-        out[r] = glm53f_dot_bf16(w + (size_t)r * cols, x, cols);
+        out[r] = glm53f_dot_bf16_sve(w + (size_t)r * cols, x, cols);
 }
 
 int main(int argc, char **argv) {
