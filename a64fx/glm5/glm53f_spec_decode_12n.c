@@ -17,6 +17,7 @@ int main(int argc, char **argv) {
     int rank, ranks, token, cycles, ndraft, warmup, capacity;
     int draft[MAX_DRAFT], target[MAX_DRAFT + 1], verify_input[MAX_DRAFT + 1];
     float verify_logit[MAX_DRAFT + 1];
+    double phase[4] = {0.0, 0.0, 0.0, 0.0};
     long accepted_total = 0, proposed_total = 0, delivered = 0;
     glm53f_target_model_12n *target_model;
     glm53f_mtp_context_12n *mtp;
@@ -49,7 +50,9 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);double begin=MPI_Wtime();
     for(int cycle=0;cycle<cycles;cycle++){
         int first_token;
+        double phase_begin=MPI_Wtime();
         if(glm53f_target_model_step_12n(target_model,token,&first_token,&target_logit,target_hidden))MPI_Abort(MPI_COMM_WORLD,2);
+        phase[0]+=MPI_Wtime()-phase_begin;phase_begin=MPI_Wtime();
         delivered++;
         if(glm53f_target_snapshot_save_12n(target_model,snapshot[0]))MPI_Abort(MPI_COMM_WORLD,2);
         int mtp_base=glm53f_mtp_length_12n(mtp),input=first_token;
@@ -59,6 +62,7 @@ int main(int argc, char **argv) {
             if(glm53f_mtp_forward_12n(mtp,input,hidden,&draft[j],&draft_logit,out_hidden))MPI_Abort(MPI_COMM_WORLD,2);
             input=draft[j];hidden=out_hidden;
         }
+        phase[1]+=MPI_Wtime()-phase_begin;phase_begin=MPI_Wtime();
         proposed_total+=ndraft;
         verify_input[0]=first_token;
         for(int j=0;j<ndraft;j++)verify_input[j+1]=draft[j];
@@ -67,6 +71,7 @@ int main(int argc, char **argv) {
         int accepted=0,committed=ndraft+1,next_token=target[ndraft];
         for(int j=0;j<ndraft;j++)if(target[j]==draft[j])accepted++;else{committed=j+1;next_token=target[j];break;}
         if(glm53f_target_snapshot_restore_12n(target_model,snapshot[committed]))MPI_Abort(MPI_COMM_WORLD,2);
+        phase[2]+=MPI_Wtime()-phase_begin;phase_begin=MPI_Wtime();
         /* Rebuild the committed MTP suffix from target hidden states. Draft
          * hidden states are approximate, and retaining them after rejection
          * leaves the cache one position behind the target sequence. */
@@ -78,11 +83,14 @@ int main(int argc, char **argv) {
         for(int j=0;j<committed;j++)if(glm53f_mtp_forward_12n(mtp,target[j],
                 verify_hidden+(size_t)j*HIDDEN,&ignored,&ignored_logit,
                 replay_hidden))MPI_Abort(MPI_COMM_WORLD,2);
+        phase[3]+=MPI_Wtime()-phase_begin;
         int mtp_commit=committed+1;
         accepted_total+=accepted;delivered+=accepted+1;token=next_token;
         if(!rank)printf("GLM53F_SPEC_CYCLE cycle=%d first=%d accepted=%d/%d fallback=%d target_steps=%d mtp_steps=%d\n",cycle,first_token,accepted,ndraft,next_token,committed,mtp_commit);
     }
     double sec=MPI_Wtime()-begin,max_sec;MPI_Reduce(&sec,&max_sec,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    double max_phase[4];MPI_Reduce(phase,max_phase,4,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    if(!rank)printf("GLM53F_SPEC_PHASE ms_cycle target=%.3f draft=%.3f verify=%.3f rebase=%.3f\n",max_phase[0]*1e3/cycles,max_phase[1]*1e3/cycles,max_phase[2]*1e3/cycles,max_phase[3]*1e3/cycles);
     if(!rank)printf("GLM53F_SPEC_DECODE_12N cycles=%d drafts=%d accepted=%ld/%ld alpha=%.6f delivered=%ld tok_s=%.3f final_token=%d PASS\n",cycles,ndraft,accepted_total,proposed_total,proposed_total?(double)accepted_total/proposed_total:0.0,delivered,delivered/max_sec,token);
     for(int i=0;i<ndraft+2;i++)glm53f_target_snapshot_free_12n(snapshot[i]);
     free(verify_hidden);glm53f_mtp_free_12n(mtp);glm53f_target_model_free_12n(target_model);
