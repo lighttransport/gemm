@@ -289,3 +289,20 @@ replacement stage is detached under the same allocation so MPI can run to
 completion independently of bridge request lifetime. The integrated build
 script now passes explicit `-I.` and `-I../../common` paths for Fujitsu
 compiler local-header lookup; the corrected build completed successfully.
+
+Fresh job-51094320 validation completed the target stage on all 12 ranks. The
+target batch gate remains exact (`probe=92/92 PASS`, matching logits) and reports
+5-token batch speedup 1.356x. A 32-token profiled scalar decode reaches
+**18.140 tok/s** (55.128 ms/token, final token 25, PASS); profile is embed 0.287,
+mHC 10.113, attention 24.216, FFN 20.785, and head 1.168 ms/token. This is
+effectively unchanged from the prior 18.094 tok/s result, so attention and mHC
+remain the primary optimization targets. MTP staging has been launched next
+under the same 12-node allocation; its quality/performance result is pending.
+
+The follow-on MTP stage completed all 24 rank checks. Standard 16-cycle
+speculative validation is exact and stable (`accepted=10/16`, alpha 0.625,
+final token 40591, PASS), delivering **12.803 tok/s**. Mean phases are target
+64.863 ms, draft 5.532 ms, verify 128.106 ms, and rebase 6.898 ms per cycle.
+This is a small improvement over the previous 12.749 tok/s baseline; verify
+plus target latency still prevents the 30+ tok/s target, so further work should
+focus on attention/KDA and verification batching rather than draft quality.
