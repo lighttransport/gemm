@@ -86,9 +86,39 @@ int glm53f_collective_is_utofu_12n(void) { return glm53f_utofu_active; }
 
 int glm53f_sum_allreduce_12n(const float *input, float *output, int count) {
     if (!input || !output || count < 1) return -1;
-    if (!glm53f_utofu_active)
+    if (!glm53f_utofu_active) {
+        /* Optional payload-sharded experiment.  Reduce-scatter computes each
+         * rank's disjoint output slice, then an allgatherv reconstructs the
+         * full vector.  The default MPI_Allreduce path remains unchanged. */
+        if (getenv("GLM53F_SPLIT_AR")) {
+            int rank, nr, rc[GLM53F_COLLECTIVE_MAX_NODES], ds[GLM53F_COLLECTIVE_MAX_NODES];
+            static float *slice;
+            static int slice_cap;
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+            MPI_Comm_size(MPI_COMM_WORLD, &nr);
+            if (nr > GLM53F_COLLECTIVE_MAX_NODES) return -1;
+            int off = 0;
+            for (int r = 0; r < nr; ++r) {
+                rc[r] = count / nr + (r < count % nr);
+                ds[r] = off;
+                off += rc[r];
+            }
+            if (slice_cap < rc[rank]) {
+                float *p = realloc(slice, (size_t)rc[rank] * sizeof(*slice));
+                if (!p) return -1;
+                slice = p;
+                slice_cap = rc[rank];
+            }
+            if (MPI_Reduce_scatter(input, slice, rc, MPI_FLOAT, MPI_SUM,
+                                   MPI_COMM_WORLD) != MPI_SUCCESS ||
+                MPI_Allgatherv(slice, rc[rank], MPI_FLOAT, output, rc, ds,
+                               MPI_FLOAT, MPI_COMM_WORLD) != MPI_SUCCESS)
+                return -1;
+            return 0;
+        }
         return MPI_Allreduce(input, output, count, MPI_FLOAT, MPI_SUM,
                              MPI_COMM_WORLD) == MPI_SUCCESS ? 0 : -1;
+    }
     if (input != output) memcpy(output, input, (size_t)count * sizeof(float));
     tp_allreduce_sum(&glm53f_comm, output, count);
     return 0;
