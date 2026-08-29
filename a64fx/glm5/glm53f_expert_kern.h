@@ -99,6 +99,75 @@ static inline void glm53f_mv_fp8_block128_bits(
             w + (size_t)r * cols, scale + (size_t)(r / 128) * blocks, x, cols);
 }
 
+/* Matrix x up-to-four-token microkernel.  Four output rows leave enough SVE
+ * registers for four token accumulators per row while reusing each FP8 weight
+ * vector across all tokens.  Inputs and outputs are token-major. */
+static inline void glm53f_matvec_fp8_bits_4x4(
+        float *dst, int dst_stride, const uint8_t *w, const float *scale,
+        const float *x, int tokens, int cols) {
+    svfloat32_t a00=svdup_f32(0),a01=svdup_f32(0),a02=svdup_f32(0),a03=svdup_f32(0);
+    svfloat32_t a10=svdup_f32(0),a11=svdup_f32(0),a12=svdup_f32(0),a13=svdup_f32(0);
+    svfloat32_t a20=svdup_f32(0),a21=svdup_f32(0),a22=svdup_f32(0),a23=svdup_f32(0);
+    svfloat32_t a30=svdup_f32(0),a31=svdup_f32(0),a32=svdup_f32(0),a33=svdup_f32(0);
+    int vl = (int)svcntw();
+    for (int b = 0; b < cols; b += 128) {
+        int end = b + 128 < cols ? b + 128 : cols;
+        int block = b / 128;
+        for (int c = b; c < end; c += vl) {
+            svbool_t pg = svwhilelt_b32(c, end);
+            svfloat32_t w0=glm53f_fp8_e4m3_bits(pg,w,c);
+            svfloat32_t w1=glm53f_fp8_e4m3_bits(pg,w+(size_t)cols,c);
+            svfloat32_t w2=glm53f_fp8_e4m3_bits(pg,w+(size_t)2*cols,c);
+            svfloat32_t w3=glm53f_fp8_e4m3_bits(pg,w+(size_t)3*cols,c);
+#define GLM53F_TOKEN4(T,A0,A1,A2,A3) do { \
+    svfloat32_t xv=svmul_n_f32_x(pg,svld1(pg,x+(size_t)(T)*cols+c),scale[block]); \
+    A0=svmla_x(pg,A0,w0,xv); A1=svmla_x(pg,A1,w1,xv); \
+    A2=svmla_x(pg,A2,w2,xv); A3=svmla_x(pg,A3,w3,xv); \
+} while(0)
+            GLM53F_TOKEN4(0,a00,a01,a02,a03);
+            if(tokens>1)GLM53F_TOKEN4(1,a10,a11,a12,a13);
+            if(tokens>2)GLM53F_TOKEN4(2,a20,a21,a22,a23);
+            if(tokens>3)GLM53F_TOKEN4(3,a30,a31,a32,a33);
+#undef GLM53F_TOKEN4
+        }
+    }
+    svbool_t pt = svptrue_b32();
+#define GLM53F_STORE4(T,A0,A1,A2,A3) do { \
+    dst[(size_t)(T)*dst_stride]=svaddv_f32(pt,A0); \
+    dst[(size_t)(T)*dst_stride+1]=svaddv_f32(pt,A1); \
+    dst[(size_t)(T)*dst_stride+2]=svaddv_f32(pt,A2); \
+    dst[(size_t)(T)*dst_stride+3]=svaddv_f32(pt,A3); \
+} while(0)
+    GLM53F_STORE4(0,a00,a01,a02,a03);
+    if(tokens>1)GLM53F_STORE4(1,a10,a11,a12,a13);
+    if(tokens>2)GLM53F_STORE4(2,a20,a21,a22,a23);
+    if(tokens>3)GLM53F_STORE4(3,a30,a31,a32,a33);
+#undef GLM53F_STORE4
+}
+
+static inline void glm53f_mv_fp8_block128_bits_batch(
+        float *y, const uint8_t *w, const float *scale, const float *x,
+        int tokens, int rows, int cols) {
+    if (tokens == 1) {
+        glm53f_mv_fp8_block128_bits(y, w, scale, x, rows, cols);
+        return;
+    }
+    if (tokens < 1 || tokens > 4) return;
+    int blocks = (cols + 127) / 128, n4 = rows / 4;
+#pragma omp parallel for schedule(static)
+    for (int bi = 0; bi < n4; ++bi) {
+        int r = bi * 4;
+        glm53f_matvec_fp8_bits_4x4(y + r, rows,
+            w + (size_t)r * cols, scale + (size_t)(r / 128) * blocks,
+            x, tokens, cols);
+    }
+    for (int t = 0; t < tokens; ++t)
+        for (int r = n4 * 4; r < rows; ++r)
+            y[(size_t)t * rows + r] = glm53f_dot_fp8_block128(
+                w + (size_t)r * cols, scale + (size_t)r * blocks,
+                x + (size_t)t * cols, cols);
+}
+
 static inline void glm53f_mv_fp8_block128_bits_2(
         float *y0, const uint8_t *w0, const float *s0, int rows0,
         float *y1, const uint8_t *w1, const float *s1, int rows1,
