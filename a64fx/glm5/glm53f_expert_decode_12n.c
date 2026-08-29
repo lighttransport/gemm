@@ -180,11 +180,27 @@ void glm53f_moe_stage_set_layer_12n(glm53f_moe_stage_context_12n*c,int layer){if
 int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_moe_stage_context_12n*c=context;int li=c->active_layer-c->first_layer,selected[8],npart=0;float route_weight[8],part_weight[9];glm53f_expert_part part[9];if(li<0||li>=c->layer_count)return-1;
 #pragma omp parallel for schedule(static)
     for(int e=0;e<NEXPERTS;e++)c->router_logits[e]=glm53f_dot_bf16_sve(c->router_w+((size_t)li*NEXPERTS+e)*4096,x,4096);glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);int table_layer=c->active_layer-FIRST_LAYER;for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,(const float*)(c->blob+p->down_scale),p->inter};part_weight[npart++]=route_weight[k];}if(c->shared_blob){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter};part_weight[npart++]=1.0f;}glm53f_moe_local_12n(c->scratch->local_output,part,part_weight,npart,x,c->scratch);return glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);}
-int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out,const float*x,int tokens){int li=c?c->active_layer-c->first_layer:-1,table_layer=c?c->active_layer-FIRST_LAYER:-1;if(!c||!out||!x||tokens<1||tokens>4||li<0||li>=c->layer_count||!c->shared_blob)return-1;for(int t=0;t<tokens;t++){int selected[8],npart=0;float route_weight[8],part_weight[8];glm53f_expert_part part[8];const float*xt=x+(size_t)t*4096;
+int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out,const float*x,int tokens){
+    int li=c?c->active_layer-c->first_layer:-1,table_layer=c?c->active_layer-FIRST_LAYER:-1;
+    if(!c||!out||!x||tokens<1||tokens>4||li<0||li>=c->layer_count||!c->shared_blob)return-1;
+    enum{MAXP=9,H=4096}; glm53f_expert_part parts[4*MAXP]; float weights[4*MAXP]; int counts[4];
+    memset(parts,0,sizeof(parts)); memset(weights,0,sizeof(weights));
+    for(int t=0;t<tokens;t++){int selected[8],npart=0;float route_weight[8];const float*xt=x+(size_t)t*H;
 #pragma omp parallel for schedule(static)
-        for(int e=0;e<NEXPERTS;e++)c->router_logits[e]=glm53f_dot_bf16_sve(c->router_w+((size_t)li*NEXPERTS+e)*4096,xt,4096);glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,(const float*)(c->blob+p->down_scale),p->inter};part_weight[npart++]=route_weight[k];}glm53f_moe_local_12n(c->batch_local+(size_t)t*4096,part,part_weight,npart,xt,c->scratch);}shared_offset*p=&c->shared[table_layer];glm53f_expert_part shared={c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter};glm53f_expert_tokens_bits(&shared,tokens,x,c->batch_up,c->batch_activation,c->batch_shared);
+        for(int e=0;e<NEXPERTS;e++)c->router_logits[e]=glm53f_dot_bf16_sve(c->router_w+((size_t)li*NEXPERTS+e)*H,xt,H);
+        glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);
+        for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;parts[t*MAXP+npart]=(glm53f_expert_part){c->blob+p->gate_up,(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,(const float*)(c->blob+p->down_scale),p->inter};weights[t*MAXP+npart++]=route_weight[k];}
+        counts[t]=npart;
+    }
+    size_t task_count=(size_t)tokens*MAXP; float*up=calloc(task_count*1024,sizeof(float)); float*act=calloc(task_count*512,sizeof(float)); float*y=calloc(task_count*H,sizeof(float));
+    if(!up||!act||!y){free(y);free(act);free(up);return-1;}
+    glm53f_expert_tasks_bits(parts,counts,tokens,x,up,act,y);
+    shared_offset*sp=&c->shared[table_layer];glm53f_expert_part shared={c->shared_blob+sp->gate_up,(const float*)(c->shared_blob+sp->gate_up_scale),c->shared_blob+sp->down,(const float*)(c->shared_blob+sp->down_scale),sp->inter};
+    glm53f_expert_tokens_bits(&shared,tokens,x,c->batch_up,c->batch_activation,c->batch_shared);
 #pragma omp parallel for schedule(static)
-    for(int i=0;i<tokens*4096;i++)c->batch_local[i]+=c->batch_shared[i];return glm53f_sum_allreduce_12n(c->batch_local,out,tokens*4096);}
+    for(int q=0;q<tokens*H;q++){int t=q/H,i=q-t*H;float v=0.0f;for(int k=0;k<counts[t];k++)v+=weights[t*MAXP+k]*y[((size_t)t*MAXP+k)*H+i];c->batch_local[q]=v+c->batch_shared[q];}
+    int rc=glm53f_sum_allreduce_12n(c->batch_local,out,tokens*H);free(y);free(act);free(up);return rc;
+}
 void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
 
 #ifndef GLM53F_EXPERT_NO_MAIN

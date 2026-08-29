@@ -381,6 +381,74 @@ static inline void glm53f_expert_batch_bits(
     }
 }
 
+/* Multi-position routed-expert execution.  Each token/part task shares one
+ * OpenMP team; output aggregation remains in the caller's original route
+ * order, so verification arithmetic is unchanged. */
+static inline void glm53f_expert_tasks_bits(
+        const glm53f_expert_part *parts, const int *counts, int tokens,
+        const float *x, float *up, float *act, float *y) {
+    enum { HIDDEN = 4096, INTER_STRIDE = 512, GATE_UP_STRIDE = 1024,
+           MAX_PARTS = 9 };
+    int total_tasks = 0;
+    for (int t = 0; t < tokens; ++t)
+        total_tasks += counts[t];
+    if (total_tasks <= 0) return;
+#pragma omp parallel
+    {
+        int tid = omp_get_thread_num(), nth = omp_get_num_threads();
+        int task_t = -1, task_k = -1, lane = 0, lanes = 1, prefix = 0;
+        for (int t = 0; t < tokens; ++t)
+            for (int k = 0; k < counts[t]; ++k) {
+                /* Assign whole tasks first: unit-weight partitioning can
+                 * produce zero-thread tasks when 128-row units < threads. */
+                int begin = nth * prefix / total_tasks;
+                int end = nth * (prefix + 1) / total_tasks;
+                if (tid >= begin && tid < end) {
+                    task_t = t; task_k = k; lane = tid - begin;
+                    lanes = end - begin;
+                }
+                prefix++;
+            }
+        if (task_t >= 0) {
+            const glm53f_expert_part *p = &parts[task_t * MAX_PARTS + task_k];
+            size_t base = ((size_t)task_t * MAX_PARTS + task_k);
+            for (int bi = lane; bi < (2 * p->inter) / 8; bi += lanes) {
+                int r = bi * 8;
+                glm53f_matvec_fp8_bits_8(
+                    up + base * GATE_UP_STRIDE + r,
+                    p->gate_up + (size_t)r * HIDDEN,
+                    p->gate_up_scale + (size_t)(r / 128) * (HIDDEN / 128),
+                    x + (size_t)task_t * HIDDEN, HIDDEN);
+            }
+        }
+#pragma omp barrier
+        if (task_t >= 0) {
+            const glm53f_expert_part *p = &parts[task_t * MAX_PARTS + task_k];
+            size_t base = ((size_t)task_t * MAX_PARTS + task_k);
+            for (int i = lane; i < p->inter; i += lanes) {
+                float g = up[base * GATE_UP_STRIDE + i];
+                float u = up[base * GATE_UP_STRIDE + p->inter + i];
+                if (g > 10) g = 10; if (g < -100) g = -100;
+                if (u > 10) u = 10; if (u < -10) u = -10;
+                act[base * INTER_STRIDE + i] = (g / (1 + expf(-g))) * u;
+            }
+        }
+#pragma omp barrier
+        if (task_t >= 0) {
+            const glm53f_expert_part *p = &parts[task_t * MAX_PARTS + task_k];
+            size_t base = ((size_t)task_t * MAX_PARTS + task_k);
+            for (int bi = lane; bi < HIDDEN / 8; bi += lanes) {
+                int r = bi * 8;
+                glm53f_matvec_fp8_bits_8(
+                    y + base * HIDDEN + r,
+                    p->down + (size_t)r * p->inter,
+                    p->down_scale + (size_t)(r / 128) * (p->inter / 128),
+                    act + base * INTER_STRIDE, p->inter);
+            }
+        }
+    }
+}
+
 /* One expert evaluated for up to four token vectors.  This is the guaranteed
  * reuse case for the shared expert in every MoE layer. */
 static inline void glm53f_expert_tokens_bits(
