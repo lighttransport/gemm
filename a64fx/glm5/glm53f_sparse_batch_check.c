@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <math.h>
 #include <mpi.h>
 #include <stdio.h>
@@ -18,8 +19,11 @@ int main(int argc, char **argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 2 || ranks != 12 || warm < 0 || !x || !a || !b)
         MPI_Abort(MPI_COMM_WORLD, 2);
+    int compare_cp = getenv("GLM53F_SPARSE_COMPARE_CP") != NULL;
+    if (compare_cp) setenv("GLM53F_SPARSE_CP", "0", 1);
     glm53f_sparse_context_12n *ca = glm53f_sparse_create_12n(
         argv[1], layer, warm + TOKENS);
+    if (compare_cp) setenv("GLM53F_SPARSE_CP", "1", 1);
     glm53f_sparse_context_12n *cb = glm53f_sparse_create_12n(
         argv[1], layer, warm + TOKENS);
     if (!ca || !cb) MPI_Abort(MPI_COMM_WORLD, 2);
@@ -53,14 +57,21 @@ int main(int argc, char **argv) {
     }
     double rel = sqrt(d2 / (r2 + 1e-30));
     local_ok &= rel < 3e-6;
+    double rollback_d2=0.0,rollback_r2=0.0;
+    if(warm>=1){local_ok&=!glm53f_sparse_restore_length_12n(ca,warm+1);
+        local_ok&=!glm53f_sparse_restore_length_12n(cb,warm+1);
+        for(int t=1;t<TOKENS;t++){local_ok&=!glm53f_sparse_sublayer_12n(ca,a,x+(size_t)(warm+t)*HIDDEN);local_ok&=!glm53f_sparse_sublayer_12n(cb,b,x+(size_t)(warm+t)*HIDDEN);for(int i=0;i<HIDDEN;i++){double d=(double)a[i]-b[i];rollback_d2+=d*d;rollback_r2+=(double)a[i]*a[i];}}}
+    double rollback_rel=sqrt(rollback_d2/(rollback_r2+1e-30));
+    local_ok &= rollback_rel < 3e-6;
     MPI_Allreduce(&local_ok, &ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     double sm, bm;
     MPI_Reduce(&seq, &sm, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&bat, &bm, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!rank)
-        printf("GLM53F_SPARSE_BATCH layer=%d warm=%d tokens=%d rel_l2=%.9g "
+        printf("GLM53F_SPARSE_BATCH mode=%s layer=%d warm=%d tokens=%d rel_l2=%.9g rollback_rel_l2=%.9g "
                "seq_ms=%.3f batch_ms=%.3f speedup=%.3f %s\n",
-               layer, warm, TOKENS, rel, sm * 1e3, bm * 1e3, sm / bm,
+               compare_cp ? "replicated-vs-cp" : "replicated",
+               layer, warm, TOKENS, rel,rollback_rel,sm * 1e3, bm * 1e3, sm / bm,
                ok ? "PASS" : "FAIL");
     glm53f_sparse_free_12n(cb);
     glm53f_sparse_free_12n(ca);

@@ -41,5 +41,13 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_target_decode_12n.c \
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_spec_decode_12n.c \
     "${objects[@]}" "$build_dir/target.o" "$build_dir/mtp.o" \
     "${ldflags[@]}" -o glm53f_spec_decode_12n
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_target_batch_check_12n.c \
+    "${objects[@]}" "$build_dir/target.o" \
+    "${ldflags[@]}" -o glm53f_target_batch_check_12n
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_kda_callback_check.c \
+    "$build_dir/kda.o" "${ldflags[@]}" -o glm53f_kda_callback_check
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
+    -DGLM53F_SPARSE_NO_MAIN glm53f_sparse_batch_check.c \
+    glm53f_sparse_layer_12n.c "${ldflags[@]}" -o glm53f_sparse_batch_check
 
 echo "SENTINEL glm53f_integrated_build_12n=OK build_dir=$build_dir"

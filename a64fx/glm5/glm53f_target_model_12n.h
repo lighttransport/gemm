@@ -11,6 +11,10 @@ void glm53f_target_model_free_12n(glm53f_target_model_12n *model);
 int glm53f_target_model_step_12n(
     glm53f_target_model_12n *model, int input_token,
     int *next_token, float *next_logit, float *target_hidden);
+int glm53f_target_model_step_batch_12n(
+    glm53f_target_model_12n *model, const int *input_tokens, int tokens,
+    int *next_tokens, float *next_logits, float *target_hidden,
+    glm53f_target_snapshot_12n **state_after_each_token);
 glm53f_target_snapshot_12n *glm53f_target_snapshot_create_12n(
     const glm53f_target_model_12n *model);
 void glm53f_target_snapshot_free_12n(glm53f_target_snapshot_12n *snapshot);

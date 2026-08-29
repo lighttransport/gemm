@@ -15,12 +15,13 @@ static void *a256(size_t n) {
 
 int main(int argc, char **argv) {
     int rank, ranks, token, cycles, ndraft, warmup, capacity;
-    int draft[MAX_DRAFT], target[MAX_DRAFT + 1];
+    int draft[MAX_DRAFT], target[MAX_DRAFT + 1], verify_input[MAX_DRAFT + 1];
+    float verify_logit[MAX_DRAFT + 1];
     long accepted_total = 0, proposed_total = 0, delivered = 0;
     glm53f_target_model_12n *target_model;
     glm53f_mtp_context_12n *mtp;
     glm53f_target_snapshot_12n *snapshot[MAX_DRAFT + 2] = {0};
-    float *target_hidden, *draft_hidden[2], target_logit, draft_logit;
+    float *target_hidden, *verify_hidden, *draft_hidden[2], target_logit, draft_logit;
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
@@ -35,8 +36,8 @@ int main(int argc, char **argv) {
     capacity=warmup+cycles*(ndraft+2)+1;
     target_model=glm53f_target_model_create_12n(argv[1],argv[2],argv[3],capacity);
     mtp=glm53f_mtp_create_12n(argv[1],argv[4],argv[5],capacity);
-    target_hidden=a256(HIDDEN*4);draft_hidden[0]=a256(HIDDEN*4);draft_hidden[1]=a256(HIDDEN*4);
-    if(!target_model||!mtp||!target_hidden||!draft_hidden[0]||!draft_hidden[1])MPI_Abort(MPI_COMM_WORLD,2);
+    target_hidden=a256(HIDDEN*4);verify_hidden=a256((MAX_DRAFT+1)*HIDDEN*4);draft_hidden[0]=a256(HIDDEN*4);draft_hidden[1]=a256(HIDDEN*4);
+    if(!target_model||!mtp||!target_hidden||!verify_hidden||!draft_hidden[0]||!draft_hidden[1])MPI_Abort(MPI_COMM_WORLD,2);
     for(int i=0;i<ndraft+2;i++){snapshot[i]=glm53f_target_snapshot_create_12n(target_model);if(!snapshot[i])MPI_Abort(MPI_COMM_WORLD,2);}
     for(int i=0;i<warmup;i++){
         int next,ignored;float next_logit,ignored_logit;
@@ -59,28 +60,31 @@ int main(int argc, char **argv) {
             input=draft[j];hidden=out_hidden;
         }
         proposed_total+=ndraft;
-        int accepted=0,committed=0,verify_input=first_token,next_token=-1;
-        for(int j=0;j<ndraft;j++){
-            if(glm53f_target_model_step_12n(target_model,verify_input,&target[j],&target_logit,target_hidden))MPI_Abort(MPI_COMM_WORLD,2);
-            if(glm53f_target_snapshot_save_12n(target_model,snapshot[j+1]))MPI_Abort(MPI_COMM_WORLD,2);
-            committed=j+1;
-            if(target[j]!=draft[j]){next_token=target[j];break;}
-            accepted++;verify_input=draft[j];
-        }
-        if(accepted==ndraft){
-            if(glm53f_target_model_step_12n(target_model,draft[ndraft-1],&target[ndraft],&target_logit,target_hidden))MPI_Abort(MPI_COMM_WORLD,2);
-            if(glm53f_target_snapshot_save_12n(target_model,snapshot[ndraft+1]))MPI_Abort(MPI_COMM_WORLD,2);
-            committed=ndraft+1;next_token=target[ndraft];
-        }
+        verify_input[0]=first_token;
+        for(int j=0;j<ndraft;j++)verify_input[j+1]=draft[j];
+        if(glm53f_target_model_step_batch_12n(target_model,verify_input,ndraft+1,
+                target,verify_logit,verify_hidden,snapshot+1))MPI_Abort(MPI_COMM_WORLD,2);
+        int accepted=0,committed=ndraft+1,next_token=target[ndraft];
+        for(int j=0;j<ndraft;j++)if(target[j]==draft[j])accepted++;else{committed=j+1;next_token=target[j];break;}
         if(glm53f_target_snapshot_restore_12n(target_model,snapshot[committed]))MPI_Abort(MPI_COMM_WORLD,2);
-        int mtp_commit=accepted==ndraft?ndraft:accepted+1;
-        if(glm53f_mtp_restore_length_12n(mtp,mtp_base+mtp_commit))MPI_Abort(MPI_COMM_WORLD,2);
+        /* Rebuild the committed MTP suffix from target hidden states. Draft
+         * hidden states are approximate, and retaining them after rejection
+         * leaves the cache one position behind the target sequence. */
+        /* The first draft call already used first_token with the exact scalar
+         * target hidden state, so retain that cache entry and replay only the
+         * suffix whose draft hidden states were approximate. */
+        if(glm53f_mtp_restore_length_12n(mtp,mtp_base+1))MPI_Abort(MPI_COMM_WORLD,2);
+        int ignored;float ignored_logit;float*replay_hidden=draft_hidden[0];
+        for(int j=0;j<committed;j++)if(glm53f_mtp_forward_12n(mtp,target[j],
+                verify_hidden+(size_t)j*HIDDEN,&ignored,&ignored_logit,
+                replay_hidden))MPI_Abort(MPI_COMM_WORLD,2);
+        int mtp_commit=committed+1;
         accepted_total+=accepted;delivered+=accepted+1;token=next_token;
         if(!rank)printf("GLM53F_SPEC_CYCLE cycle=%d first=%d accepted=%d/%d fallback=%d target_steps=%d mtp_steps=%d\n",cycle,first_token,accepted,ndraft,next_token,committed,mtp_commit);
     }
     double sec=MPI_Wtime()-begin,max_sec;MPI_Reduce(&sec,&max_sec,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     if(!rank)printf("GLM53F_SPEC_DECODE_12N cycles=%d drafts=%d accepted=%ld/%ld alpha=%.6f delivered=%ld tok_s=%.3f final_token=%d PASS\n",cycles,ndraft,accepted_total,proposed_total,proposed_total?(double)accepted_total/proposed_total:0.0,delivered,delivered/max_sec,token);
     for(int i=0;i<ndraft+2;i++)glm53f_target_snapshot_free_12n(snapshot[i]);
-    glm53f_mtp_free_12n(mtp);glm53f_target_model_free_12n(target_model);
+    free(verify_hidden);glm53f_mtp_free_12n(mtp);glm53f_target_model_free_12n(target_model);
     MPI_Finalize();return 0;
 }

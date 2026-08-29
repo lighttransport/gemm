@@ -5,7 +5,7 @@
 #include <string.h>
 #include "glm53f_kda_12n.h"
 
-enum { HIDDEN = 4096, TOKENS = 3 };
+enum { HIDDEN = 4096, TOKENS = 5 };
 
 int main(int argc, char **argv) {
     int rank, size, local_ok, ok;
