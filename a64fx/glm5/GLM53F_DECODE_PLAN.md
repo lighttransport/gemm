@@ -213,6 +213,14 @@ the end-to-end maximum). This makes attention/FFN the next optimization targets;
 MTP remains latency-negative at the measured alpha because target verification
 dominates.
 
+Latest 12-node Fugaku reruns (job 51086028) measured 17.21 tok/s unprofiled
+(58.107 ms/token) and 16.72 tok/s with profiling enabled. A cross-token routed
+expert scheduler restored exact logits (92/92 probes) but reduced batch speedup
+to 1.25x and MTP-3 to 8.86 tok/s; it is retained only as infrastructure. The
+performance path uses one full OpenMP team per token and measures MTP-3 at 9.63
+tok/s, alpha 0.4167, PASS. `OMP_PROC_BIND=spread` was tested at 15.62 tok/s and
+is slower than the default close binding.
+
 Runtime context allocation tests establish **256K as the minimum-safe target
 and 512K as the preferred maximum** for the current 32 GiB/rank layout. The
 planner's theoretical 1M estimate above does not satisfy the runtime 2 GiB
