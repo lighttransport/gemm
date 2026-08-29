@@ -16,7 +16,7 @@ while pgrep -f '^/bin/bash ./run_glm53f_final_validation_12n.sh$' >/dev/null; do
     sleep 20
 done
 
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-47}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-48}
 export OMP_DYNAMIC=false
 export OMP_WAIT_POLICY=active
 export OMP_PROC_BIND=close
