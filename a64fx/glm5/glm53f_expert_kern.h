@@ -282,13 +282,15 @@ static inline int glm53f_mla_absorbed_sve(float *out, const float *query,
     float qlat[(size_t)heads * latent_dim];
     float vacc[(size_t)heads * latent_dim];
     float logit[(size_t)heads * n_selected];
-    int vl = (int)svcntw();
-#pragma omp parallel for collapse(2) schedule(static)
-    for (int h = 0; h < heads; ++h)
-        for (int b = 0; b < (latent_dim + vl - 1) / vl; ++b) {
-            int d = b * vl;
-            const uint16_t *wk = kv_b + (size_t)h * (key_dim + value_dim) * latent_dim;
-            float *qz = qlat + (size_t)h * latent_dim;
+#pragma omp parallel for schedule(static)
+    for (int h = 0; h < heads; ++h) {
+        const uint16_t *wk = kv_b + (size_t)h * (key_dim + value_dim) * latent_dim;
+        const uint16_t *wv = wk + (size_t)key_dim * latent_dim;
+        float *qz = qlat + (size_t)h * latent_dim;
+        float *vz = vacc + (size_t)h * latent_dim;
+        float *ls = logit + (size_t)h * n_selected;
+        int vl = (int)svcntw();
+        for (int d = 0; d < latent_dim; d += vl) {
             svbool_t pg = svwhilelt_b32(d, latent_dim);
             svfloat32_t a = svdup_f32(0.0f);
             for (int j = 0; j < key_dim; ++j)
@@ -297,50 +299,32 @@ static inline int glm53f_mla_absorbed_sve(float *out, const float *query,
                     query[(size_t)h * key_dim + j]);
             svst1(pg, qz + d, svmul_n_f32_x(pg, a, 1.0f / sqrtf((float)key_dim)));
         }
-#pragma omp parallel for collapse(2) schedule(static)
-    for (int h = 0; h < heads; ++h)
+        float mx = -INFINITY, sum = 0.0f;
         for (int p = 0; p < n_selected; ++p) {
-            const float *qz = qlat + (size_t)h * latent_dim;
+            ls[p] = 0.0f;
             const float *z = latent_cache + (size_t)selected[p] * latent_dim;
-            float *ls = logit + (size_t)h * n_selected;
-            int vl = (int)svcntw();
             svfloat32_t a = svdup_f32(0.0f);
             for (int d = 0; d < latent_dim; d += vl) {
                 svbool_t pg = svwhilelt_b32(d, latent_dim);
                 a = svmla_x(pg, a, svld1(pg, qz + d), svld1(pg, z + d));
             }
             ls[p] = svaddv_f32(svptrue_b32(), a);
+            if (ls[p] > mx) mx = ls[p];
         }
-    for (int h = 0; h < heads; ++h) {
-        float *ls = logit + (size_t)h * n_selected;
-        float mx = -INFINITY, sum = 0.0f;
-        for (int p = 0; p < n_selected; ++p) if (ls[p] > mx) mx = ls[p];
         for (int p = 0; p < n_selected; ++p) { ls[p] = expf(ls[p] - mx); sum += ls[p]; }
-        for (int p = 0; p < n_selected; ++p) ls[p] /= sum;
-    }
- #pragma omp parallel for collapse(2) schedule(static)
-    for (int h = 0; h < heads; ++h)
-        for (int b = 0; b < (latent_dim + vl - 1) / vl; ++b) {
-            int d = b * vl;
-            float *vz = vacc + (size_t)h * latent_dim;
-            float *ls = logit + (size_t)h * n_selected;
-            svbool_t pg = svwhilelt_b32(d, latent_dim);
-            svfloat32_t a = svdup_f32(0.0f);
-            for (int p = 0; p < n_selected; ++p) {
-                const float *z = latent_cache + (size_t)selected[p] * latent_dim;
-                a = svmla_n_f32_x(pg, a, svld1(pg, z + d), ls[p]);
+        memset(vz, 0, (size_t)latent_dim * 4);
+        for (int p = 0; p < n_selected; ++p) {
+            const float *z = latent_cache + (size_t)selected[p] * latent_dim;
+            float a = ls[p] / sum;
+            for (int d = 0; d < latent_dim; d += vl) {
+                svbool_t pg = svwhilelt_b32(d, latent_dim);
+                svst1(pg, vz + d, svmla_n_f32_x(pg, svld1(pg, vz + d), svld1(pg, z + d), a));
             }
-            svst1(pg, vz + d, a);
         }
-#pragma omp parallel for collapse(2) schedule(static)
-    for (int h = 0; h < heads; ++h)
-        for (int j = 0; j < value_dim; ++j) {
-            const uint16_t *wv = kv_b + (size_t)h * (key_dim + value_dim) * latent_dim +
-                                 (size_t)key_dim * latent_dim;
+        for (int j = 0; j < value_dim; ++j)
             out[(size_t)h * value_dim + j] =
-                glm53f_dot_bf16_sve(wv + (size_t)j * latent_dim,
-                                    vacc + (size_t)h * latent_dim, latent_dim);
-        }
+                glm53f_dot_bf16_sve(wv + (size_t)j * latent_dim, vz, latent_dim);
+    }
     return 0;
 }
 
