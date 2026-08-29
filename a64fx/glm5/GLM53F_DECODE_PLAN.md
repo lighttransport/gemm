@@ -351,3 +351,9 @@ After restoring the strict build, a repeat 32-token run remained greedy-exact
 attention 25.739 ms, FFN 21.592 ms). The token stream is identical to the
 18.140 tok/s run, so this is retained as a run-to-run A64FX variance datapoint,
 not a replacement for the established best result.
+
+The optional `GLM53F_NO_MATH_ERRNO=1` build was repeated: it remained
+greedy-exact (`final_token=25`, PASS) but measured **17.752 tok/s** (56.330
+ms/token), versus 18.191 tok/s on the first run. The spread matches the
+observed A64FX run variance, so the flag is not claimed as a reliable gain and
+is left disabled by default.
