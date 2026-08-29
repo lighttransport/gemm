@@ -263,6 +263,12 @@ A longer 16-cycle MTP-2 run confirms stability: **12.337 delivered tok/s**,
 23/32 draft matches (alpha 0.71875), final token 16320, PASS. Mean cycle phases
 are target 66.202 ms, draft 9.580 ms, verify 192.990 ms, and rebase 10.219 ms.
 
+For sustained deployment, the 16-cycle MTP-1 run is faster: **12.749 delivered
+tok/s**, 10/16 matches (alpha 0.625), final token 40591, PASS. Its phases are
+target 65.354 ms, draft 5.486 ms, verify 128.563 ms, and rebase 6.867 ms.
+Use the runner's default `drafts=1` for maximum delivered throughput; MTP-2 is
+useful when measuring multi-token verification scaling.
+
 A 32-token sustained scalar run with the same two-row/c+64 prefetch and
 48-thread close binding reaches **18.094 tok/s** (55.268 ms/token, final token
 25, PASS). Profile maxima are mHC 9.698 ms, attention 23.990 ms, FFN 21.018 ms,
