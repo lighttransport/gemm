@@ -79,6 +79,7 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     conv3(q,k,v,c->conv,w->qc,w->kc,w->vc,qd);
     if(c->detail_profile){double t=MPI_Wtime();c->detail[1]=t-td;td=t;}
     mv(c->small,w->fa,x,D,H);mv(c->gate,w->fb,c->small,qd,D);mv(c->beta,w->b,x,hn,H);
+#pragma omp parallel for schedule(static)
     for(int h=0;h<hn;h++){glm53f_l2norm(q+(size_t)h*D,D,1e-6f);glm53f_l2norm(k+(size_t)h*D,D,1e-6f);glm53f_kda_safe_log_decay(c->decay+(size_t)h*D,c->gate+(size_t)h*D,w->dt+(size_t)h*D,w->al[h],-5.0f,D);c->beta[h]=glm53f_sigmoid(c->beta[h]);}
     if(c->detail_profile){double t=MPI_Wtime();c->detail[2]=t-td;td=t;}
 #pragma omp parallel for schedule(static)
