@@ -37,6 +37,7 @@ typedef struct {
     int hc_mult;                 /* 4 */
     int hc_sinkhorn_iters;       /* 20 */
     int short_conv_kernel_size;  /* 4 */
+    float linear_lower_bound;    /* -5.0 safe KDA forget-gate bound */
     float routed_scaling_factor; /* 2.5 */
 } glm53f_arch;
 
@@ -51,6 +52,7 @@ static inline glm53f_arch glm53f_arch_default(void) {
     a.moe_intermediate_size=2048; a.first_k_dense_replace=3;
     a.mtp_layers=1; a.mhc_enabled=1; a.hc_mult=4; a.hc_sinkhorn_iters=20;
     a.short_conv_kernel_size=4;
+    a.linear_lower_bound=-5.0f;
     a.routed_scaling_factor=2.5f;
     return a;
 }

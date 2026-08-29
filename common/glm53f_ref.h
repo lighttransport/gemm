@@ -396,6 +396,48 @@ static inline void glm53f_kda_safe_log_decay(float *out, const float *gate,
     }
 }
 
+/* Decode update for the depthwise q/k/v convolution.  Each channel keeps the
+ * last kernel_size samples in oldest-to-newest order, matching Conv1d's
+ * cross-correlation convention. */
+static inline void glm53f_causal_conv1d_silu_bf16(float *out, float *state,
+        const float *input, const uint16_t *weight, int channels,
+        int kernel_size) {
+    int c, z;
+    for (c = 0; c < channels; ++c) {
+        float *s = state + (size_t)c * kernel_size;
+        float y = 0.0f;
+        memmove(s, s + 1, (size_t)(kernel_size - 1) * sizeof(*s));
+        s[kernel_size - 1] = input[c];
+        for (z = 0; z < kernel_size; ++z)
+            y += s[z] * glm53f_bf16_to_f32(
+                weight[(size_t)c * kernel_size + z]);
+        out[c] = y / (1.0f + expf(-y));
+    }
+}
+
+static inline void glm53f_rmsnorm_gated_bf16(float *out, const float *x,
+        const float *gate, const uint16_t *weight, int heads, int head_dim,
+        float eps) {
+    int h, d;
+    for (h = 0; h < heads; ++h) {
+        double ss = 0.0;
+        for (d = 0; d < head_dim; ++d) {
+            float v = x[(size_t)h * head_dim + d];
+            ss += (double)v * v;
+        }
+        {
+            float inv = 1.0f / sqrtf((float)(ss / head_dim) + eps);
+            for (d = 0; d < head_dim; ++d) {
+                size_t z = (size_t)h * head_dim + d;
+                float sig = gate[z] >= 0.0f
+                    ? 1.0f / (1.0f + expf(-gate[z]))
+                    : expf(gate[z]) / (1.0f + expf(gate[z]));
+                out[z] = x[z] * inv * glm53f_bf16_to_f32(weight[d]) * sig;
+            }
+        }
+    }
+}
+
 static inline float glm53f_sigmoid(float x) {
     return x >= 0.0f ? 1.0f / (1.0f + expf(-x)) : expf(x) / (1.0f + expf(x));
 }
