@@ -282,3 +282,10 @@ overhead reductions are in the current tree: remove the unused `vacc` buffer
 and keep the per-call query/logit scratch on the stack (`6f596b70`, `b6907db6`).
 They must be rechecked against greedy-exact output and the 16/32-token target
 profiles after staging.
+
+The first foreground staging attempt was interrupted by the bash-over-HTTP
+30-minute request limit (SIGINT at 16.4 GiB, with no rank status files). The
+replacement stage is detached under the same allocation so MPI can run to
+completion independently of bridge request lifetime. The integrated build
+script now passes explicit `-I.` and `-I../../common` paths for Fujitsu
+compiler local-header lookup; the corrected build completed successfully.
