@@ -339,6 +339,12 @@ The real-weight sparse layer-43 benchmark is also exact (`BIT_EXACT PASS`):
 the sparse-attention side independently confirms that communication, rather
 than MLA arithmetic, is the limiting component.
 
+An opt-in `GLM53F_SPLIT_AR=1` prototype (MPI reduce-scatter plus allgatherv)
+was tested on real KDA weights. It remains numerically exact (`finite=YES
+PASS`) and trims the nominal reduction portion from 0.934 to 0.928 ms, but
+two-collective overhead raises total layer time from 1.266 to 1.288 ms. It is
+therefore rejected for deployment and left disabled by default.
+
 An MLA head-dimension parallelization experiment (commit `58dee7e5`) preserved
 the exact token stream but regressed the 12-node target to **17.624 tok/s**
 (56.742 ms/token); attention rose to 25.084 ms/token. The additional OpenMP
