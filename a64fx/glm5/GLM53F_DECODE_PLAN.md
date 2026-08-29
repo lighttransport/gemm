@@ -318,3 +318,10 @@ A controlled 36-thread scalar rerun on job 51094320 is slower: **17.003 tok/s**
 tok/s. Its profile shifts FFN to 26.923 ms/token
 (versus 20.785 ms at 48 threads), confirming 48 threads/close binding as the
 current target configuration.
+
+A detailed 12-node KDA layer-44 run (`GLM53F_KDA_DETAIL=1`) is exact and
+stable. The slowest rank takes 1.266 ms/layer: 0.518 ms local graph, 0.066 ms
+output projection, and **0.934 ms all-reduce** (rank variation is 0.30--0.52 ms
+for the local graph). This identifies collective latency/overlap as the next
+KDA optimization target; further standalone projection micro-optimizations are
+unlikely to move end-to-end decode materially.
