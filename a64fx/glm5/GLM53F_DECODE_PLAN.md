@@ -306,3 +306,9 @@ final token 40591, PASS), delivering **12.803 tok/s**. Mean phases are target
 This is a small improvement over the previous 12.749 tok/s baseline; verify
 plus target latency still prevents the 30+ tok/s target, so further work should
 focus on attention/KDA and verification batching rather than draft quality.
+
+The same allocation's 2-draft comparison is also exact and stable: **23/32
+accepted (alpha 0.71875), final token 16320, PASS**, at **12.482 tok/s**. Its
+mean phases are target 65.567 ms, draft 9.468 ms, verify 190.468 ms, and rebase
+10.251 ms. Thus 2 drafts improve agreement but reduce delivered throughput;
+retain MTP-1 as the deployment default until verification batching is optimized.
