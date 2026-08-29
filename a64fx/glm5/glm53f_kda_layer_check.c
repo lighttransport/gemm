@@ -47,6 +47,26 @@ static inline float dot_bf16_sve(const uint16_t *w,const float *x,int n) {
     }
     return svaddv_f32(svptrue_b32(),acc);
 }
+static inline void dot_bf16_sve_8(float *y,const uint16_t *w,
+                                  const float *x,int n) {
+    svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+    svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+    int vl=(int)svcntw();
+    for(int i=0;i<n;i+=vl){
+        svbool_t pg=svwhilelt_b32(i,n); svfloat32_t xv=svld1(pg,x+i);
+#define ROW(R,A) do { svuint32_t bits=svlsl_n_u32_x(pg, \
+            svld1uh_u32(pg,w+(size_t)(R)*n+i),16); \
+            A=svmla_x(pg,A,svreinterpret_f32_u32(bits),xv); } while(0)
+        ROW(0,a0);ROW(1,a1);ROW(2,a2);ROW(3,a3);
+        ROW(4,a4);ROW(5,a5);ROW(6,a6);ROW(7,a7);
+#undef ROW
+    }
+    svbool_t pg=svptrue_b32();
+    y[0]=svaddv_f32(pg,a0);y[1]=svaddv_f32(pg,a1);
+    y[2]=svaddv_f32(pg,a2);y[3]=svaddv_f32(pg,a3);
+    y[4]=svaddv_f32(pg,a4);y[5]=svaddv_f32(pg,a5);
+    y[6]=svaddv_f32(pg,a6);y[7]=svaddv_f32(pg,a7);
+}
 static void *get_tensor(glm53f_st_context *st,const char *name) {
     const st_tensor_info *t=glm53f_st_find(st,name,NULL); void *p;
     if(!t){fprintf(stderr,"missing %s\n",name);return NULL;}
@@ -57,8 +77,11 @@ static void *get_tensor(glm53f_st_context *st,const char *name) {
     return p;
 }
 static void mv(float *y,const uint16_t *w,const float *x,int rows,int cols) {
+    int blocks=rows/8;
 #pragma omp parallel for schedule(static)
-    for(int r=0;r<rows;r++)
+    for(int b=0;b<blocks;b++)
+        dot_bf16_sve_8(y+b*8,w+(size_t)b*8*cols,x,cols);
+    for(int r=blocks*8;r<rows;r++)
         y[r]=dot_bf16_sve(w+(size_t)r*cols,x,cols);
 }
 static int alloc_cache(kda_cache *c) {
