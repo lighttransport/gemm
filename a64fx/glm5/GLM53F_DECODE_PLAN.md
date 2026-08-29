@@ -254,6 +254,11 @@ delivered tok/s**, alpha 0.625 (10/16 draft matches), target/verify phases
 current best speculative-decode setting; the runner still accepts explicit
 draft counts for experiments.
 
+On the dedicated 12-node allocation, `OMP_WAIT_POLICY=active` improves MTP-2
+slightly to **11.948 delivered tok/s** (target 64.265 ms, verify 189.649 ms per
+cycle; alpha 0.625, final token 3669, PASS) versus 11.904 tok/s with the default
+wait policy. Use active waiting when CPU isolation is guaranteed.
+
 A 32-token sustained scalar run with the same two-row/c+64 prefetch and
 48-thread close binding reaches **18.094 tok/s** (55.268 ms/token, final token
 25, PASS). Profile maxima are mHC 9.698 ms, attention 23.990 ms, FFN 21.018 ms,
