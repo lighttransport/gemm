@@ -2,8 +2,10 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#ifndef GLM53F_EXTERNAL_ST_IMPLEMENTATION
 #define SAFETENSORS_IMPLEMENTATION
 #define GLM53F_SAFETENSORS_IMPLEMENTATION
+#endif
 #include "../../common/glm53f_safetensors.h"
 #include "../../common/glm53f_ref.h"
 #include "glm53f_target_head_12n.h"
@@ -30,4 +32,6 @@ int glm53f_target_head_argmax_12n(glm53f_target_head_context_12n*c,const float*s
 #pragma omp parallel for schedule(static)
     for(int r=0;r<c->rn;r++)c->logits[r]=dot(c->head+(size_t)r*H,c->x,H);in.value=-INFINITY;in.index=-1;for(int r=0;r<c->rn;r++){int id=c->r0+r;if(c->logits[r]>in.value||(c->logits[r]==in.value&&id<in.index)){in.value=c->logits[r];in.index=id;}}double t2=MPI_Wtime();int rc=MPI_Allreduce(&in,&best,1,MPI_FLOAT_INT,MPI_MAXLOC,MPI_COMM_WORLD);double t3=MPI_Wtime();c->phase[0]=t1-t0;c->phase[1]=t2-t1;c->phase[2]=t3-t2;*token=best.index;*value=best.value;return rc==MPI_SUCCESS?0:-1;}
 void glm53f_target_head_last_phase_12n(const glm53f_target_head_context_12n*c,double p[3]){memcpy(p,c->phase,sizeof(c->phase));}
+#ifndef GLM53F_TARGET_HEAD_NO_MAIN
 int main(int argc,char**argv){int rank,nr,token[2],ok,all;float value[2],*streams;double phase[3],max_phase[3];MPI_Init(&argc,&argv);MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(argc<2||nr!=12){if(!rank)fprintf(stderr,"usage: mpiexec -np 12 %s MODEL_DIR\n",argv[0]);MPI_Finalize();return 2;}glm53f_target_head_context_12n*c=glm53f_target_head_create_12n(argv[1]);if(!c)MPI_Abort(MPI_COMM_WORLD,2);streams=a256((size_t)HC*H*4);for(int h=0;h<HC;h++)for(int i=0;i<H;i++)streams[(size_t)h*H+i]=(float)((((h+1)*31+i*17+3)%251)-125)/125.0f;for(int p=0;p<2;p++)if(glm53f_target_head_argmax_12n(c,streams,&token[p],&value[p]))MPI_Abort(MPI_COMM_WORLD,2);ok=token[0]==token[1]&&value[0]==value[1];MPI_Allreduce(&ok,&all,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD);glm53f_target_head_last_phase_12n(c,phase);MPI_Allreduce(phase,max_phase,3,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);if(!rank)printf("GLM53F_TARGET_HEAD token=%d logit=%.9g max_ms=%.3f collapse_norm_ms=%.3f vocab_ms=%.3f argmax_ms=%.3f repeat=%s %s\n",token[0],value[0],(max_phase[0]+max_phase[1]+max_phase[2])*1e3,max_phase[0]*1e3,max_phase[1]*1e3,max_phase[2]*1e3,all?"BIT_EXACT":"FAIL",all?"PASS":"FAIL");glm53f_target_head_free_12n(c);MPI_Finalize();return all?0:1;}
+#endif
