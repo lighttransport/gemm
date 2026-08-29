@@ -275,12 +275,12 @@ static inline float glm53f_dot_bf16_sve(const uint16_t *w,
 static inline int glm53f_mla_absorbed_sve(float *out, const float *query,
         const float *latent_cache, const uint16_t *kv_b, const int *selected,
         int n_selected, int heads, int key_dim, int value_dim, int latent_dim) {
-    float *qlat = NULL, *logit = NULL;
     if (n_selected <= 0) return -1;
-    if (posix_memalign((void **)&qlat, 256, (size_t)heads * latent_dim * 4) ||
-        posix_memalign((void **)&logit, 256, (size_t)heads * n_selected * 4)) {
-        free(logit); free(qlat); return -1;
-    }
+    /* These are per-call decode scratch buffers.  Keeping them on the
+     * caller's stack avoids two allocator round-trips for every KDA layer;
+     * SVE loads/stores are valid for the natural VLA alignment. */
+    float qlat[(size_t)heads * latent_dim];
+    float logit[(size_t)heads * n_selected];
 #pragma omp parallel for schedule(static)
     for (int h = 0; h < heads; ++h) {
         const uint16_t *wk = kv_b + (size_t)h * (key_dim + value_dim) * latent_dim;
@@ -324,7 +324,6 @@ static inline int glm53f_mla_absorbed_sve(float *out, const float *query,
             out[(size_t)h * value_dim + j] =
                 glm53f_dot_bf16_sve(wv + (size_t)j * latent_dim, vz, latent_dim);
     }
-    free(logit); free(qlat);
     return 0;
 }
 
