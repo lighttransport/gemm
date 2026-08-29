@@ -161,5 +161,7 @@ int main(int argc,char **argv) {
     for(int i=0;i<H;i++)ss+=(double)out[i]*out[i];
     printf("GLM53F_KDA_LAYER layer=%d first_ms=%.3f decode_ms=%.3f rms=%.9g rollback_replay=%s %s\n",
            layer,first*1e3,decode*1e3,sqrt(ss/H),exact?"BIT_EXACT":"FAIL",exact?"PASS":"FAIL");
+    const char *dump=getenv("GLM53F_KDA_OUTPUT");
+    if(dump&&*dump){FILE*f=fopen(dump,"wb");if(!f||fwrite(out,sizeof(float),H,f)!=(size_t)H)return 2;fclose(f);}
     return exact?0:1;
 }

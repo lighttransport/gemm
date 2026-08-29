@@ -74,5 +74,6 @@ int main(int argc,char**argv){
     double ss=0.0,sum=0.0;for(int i=0;i<H;i++){ss+=(double)out[1][i]*out[1][i];sum+=out[1][i];}
     if(!rank)printf("GLM53F_KDA_12N layer=%d heads=64 local_heads=%d..%d max_ms=%.3f local_graph_ms=%.3f oproj_ms=%.3f allreduce_ms=%.3f rms=%.9g sum=%.9g finite=%s %s\n",layer,h0,h0+hn,maxe*1e3f,maxp[0]*1e3f,maxp[1]*1e3f,maxp[2]*1e3f,sqrt(ss/H),sum,allstable?"YES":"NO",allstable?"PASS":"FAIL");
     if(!rank){printf("GLM53F_KDA_12N_RANK_MS");for(int r=0;r<12;r++)printf(" r%d=%.3f/%.3f/%.3f",r,rank_phase[r][0]*1e3f,rank_phase[r][1]*1e3f,rank_phase[r][2]*1e3f);putchar('\n');}
+    if(!rank){const char*dump=getenv("GLM53F_KDA_OUTPUT");if(dump&&*dump){FILE*f=fopen(dump,"wb");if(!f||fwrite(out[1],sizeof(float),H,f)!=(size_t)H)MPI_Abort(MPI_COMM_WORLD,2);fclose(f);}}
     MPI_Finalize();return allstable?0:1;
 }
