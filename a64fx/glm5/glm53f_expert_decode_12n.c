@@ -2,12 +2,19 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#ifndef GLM53F_EXTERNAL_ST_IMPLEMENTATION
 #define SAFETENSORS_IMPLEMENTATION
 #define GLM53F_SAFETENSORS_IMPLEMENTATION
+#endif
 #include <arm_sve.h>
 #include <mpi.h>
 #include <omp.h>
+#ifndef __ARM_FEATURE_SVE
+#define __ARM_FEATURE_SVE 1
+#endif
 #include "glm53f_expert_kern.h"
+#include "glm53f_moe_12n.h"
+#include "glm53f_moe_stage_12n.h"
 #include "../../common/glm53f_safetensors.h"
 #include "../../common/glm53f_ref.h"
 
@@ -134,6 +141,7 @@ static unsigned char *load_anon(const char *path, size_t *bytes, int rank) {
     return data;
 }
 
+#ifndef GLM53F_EXPERT_NO_MAIN
 static uint64_t mix64(uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -151,7 +159,28 @@ static void route8(int token, int layer, int expert[8]) {
         if (!duplicate) expert[n++] = e;
     }
 }
+#endif
 
+struct glm53f_moe_stage_context_12n {
+    int rank, first_layer, layer_count, active_layer;
+    expert_offset *table;
+    shared_offset shared[NLAYERS];
+    unsigned char *blob, *shared_blob;
+    uint16_t *router_w;
+    float *router_bias, *router_logits;
+    glm53f_moe_scratch_12n *scratch;
+};
+
+glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
+        const char*routed_stage,const char*shared_stage,const char*model_dir,
+        int first_layer,int layer_count){int rank,nr;char path[512];size_t bytes;glm53f_moe_stage_context_12n*c;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12||first_layer<FIRST_LAYER||layer_count<1||first_layer+layer_count>45)return NULL;c=calloc(1,sizeof(*c));if(!c)return NULL;c->rank=rank;c->first_layer=first_layer;c->layer_count=layer_count;c->active_layer=first_layer;c->table=malloc((size_t)NLAYERS*NEXPERTS*sizeof(*c->table));if(!c->table)goto fail;snprintf(path,sizeof(path),"%s/rank%02d.manifest",routed_stage,rank);if(load_manifest(path,c->table)<layer_count*NEXPERTS*4)goto fail;snprintf(path,sizeof(path),"%s/rank%02d.blob",routed_stage,rank);c->blob=load_anon(path,&bytes,rank);if(!c->blob)goto fail;if(shared_stage){snprintf(path,sizeof(path),"%s/rank%02d.manifest",shared_stage,rank);if(load_shared_manifest(path,c->shared)!=layer_count*4)goto fail;snprintf(path,sizeof(path),"%s/rank%02d.blob",shared_stage,rank);c->shared_blob=load_anon(path,&bytes,rank);if(!c->shared_blob)goto fail;}glm53f_st_context*st=glm53f_st_open(model_dir);if(!st)goto fail;size_t wn=(size_t)layer_count*NEXPERTS*4096*sizeof(uint16_t),bn=(size_t)layer_count*NEXPERTS*sizeof(float);if(posix_memalign((void**)&c->router_w,256,wn)||posix_memalign((void**)&c->router_bias,256,bn)||posix_memalign((void**)&c->router_logits,256,NEXPERTS*sizeof(float))||posix_memalign((void**)&c->scratch,256,sizeof(*c->scratch)))MPI_Abort(MPI_COMM_WORLD,2);for(int li=0;li<layer_count;li++){char n[256];snprintf(n,sizeof(n),"model.language_model.layers.%d.mlp.gate.weight",first_layer+li);if(glm53f_st_read(st,n,0,c->router_w+(size_t)li*NEXPERTS*4096,(size_t)NEXPERTS*4096*sizeof(uint16_t)))MPI_Abort(MPI_COMM_WORLD,2);snprintf(n,sizeof(n),"model.language_model.layers.%d.mlp.gate.e_score_correction_bias",first_layer+li);if(glm53f_st_read(st,n,0,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS*sizeof(float)))MPI_Abort(MPI_COMM_WORLD,2);}glm53f_st_close(st);return c;fail:glm53f_moe_stage_free_12n(c);return NULL;}
+void glm53f_moe_stage_set_layer_12n(glm53f_moe_stage_context_12n*c,int layer){if(c)c->active_layer=layer;}
+int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_moe_stage_context_12n*c=context;int li=c->active_layer-c->first_layer,selected[8],npart=0;float route_weight[8],part_weight[9];glm53f_expert_part part[9];if(li<0||li>=c->layer_count)return-1;
+#pragma omp parallel for schedule(static)
+    for(int e=0;e<NEXPERTS;e++)c->router_logits[e]=glm53f_dot_bf16_sve(c->router_w+((size_t)li*NEXPERTS+e)*4096,x,4096);glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);int table_layer=c->active_layer-FIRST_LAYER;for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,(const float*)(c->blob+p->down_scale),p->inter};part_weight[npart++]=route_weight[k];}if(c->shared_blob){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter};part_weight[npart++]=1.0f;}return glm53f_moe_forward_12n(out,part,part_weight,npart,x,c->scratch,MPI_COMM_WORLD);}
+void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
+
+#ifndef GLM53F_EXPERT_NO_MAIN
 int main(int argc, char **argv) {
     int rank, ranks, tokens = argc > 2 ? atoi(argv[2]) : 20;
     int first_layer = getenv("GLM53F_FIRST_LAYER") ?
@@ -168,7 +197,8 @@ int main(int argc, char **argv) {
     unsigned char *blob, *shared_blob = NULL;
     size_t blob_bytes = 0, shared_bytes = 0;
     shared_offset shared[NLAYERS];
-    float *x, *up, *act, *out, *sum;
+    float *x, *sum;
+    glm53f_moe_scratch_12n *moe_scratch;
     uint16_t *router_w = NULL;
     float *router_bias = NULL, *router_logits = NULL, route_weight[8];
     int router_check = 1;
@@ -200,11 +230,9 @@ int main(int argc, char **argv) {
             !(shared_blob = load_anon(blob_path, &shared_bytes, rank))) MPI_Abort(MPI_COMM_WORLD, 1);
     }
     posix_memalign((void **)&x, 256, 4096 * sizeof(float));
-    posix_memalign((void **)&up, 256, 9 * 1024 * sizeof(float));
-    posix_memalign((void **)&act, 256, 9 * 512 * sizeof(float));
-    posix_memalign((void **)&out, 256, 9 * 4096 * sizeof(float));
+    posix_memalign((void **)&moe_scratch, 256, sizeof(*moe_scratch));
     posix_memalign((void **)&sum, 256, 4096 * sizeof(float));
-    if (!x || !up || !act || !out || !sum) MPI_Abort(MPI_COMM_WORLD, 1);
+    if (!x || !moe_scratch || !sum) MPI_Abort(MPI_COMM_WORLD, 1);
     if (model_dir) {
         glm53f_st_context *st = glm53f_st_open(model_dir);
         char name[256];
@@ -268,6 +296,7 @@ int main(int argc, char **argv) {
             int layer_index = first_layer - FIRST_LAYER + li;
             int selected[8], n = 0;
             glm53f_expert_part part[9];
+            float part_weight[9];
             if (attention_combine) {
                 memset(sum, 0, 4096 * sizeof(float));
                 double t0 = now_sec();
@@ -296,6 +325,7 @@ int main(int argc, char **argv) {
                 part[n].down = blob + p->down;
                 part[n].down_scale = (const float *)(blob + p->down_scale);
                 part[n].inter = p->inter;
+                part_weight[n] = route_weight[k];
                 n++;
             }
             if (shared_blob) {
@@ -305,14 +335,10 @@ int main(int argc, char **argv) {
                 part[n].down = shared_blob + p->down;
                 part[n].down_scale = (const float *)(shared_blob + p->down_scale);
                 part[n].inter = p->inter;
+                part_weight[n] = 1.0f;
                 n++;
             }
-            if (n) glm53f_expert_batch_bits(part, n, x, up, act, out);
-            memset(sum, 0, 4096 * sizeof(float));
-            for (int k = 0; k < n; ++k) {
-                float wk = k < 8 ? route_weight[k] : 1.0f;
-                for (int i = 0; i < 4096; ++i) sum[i] += wk * out[(size_t)k * 4096 + i];
-            }
+            glm53f_moe_local_12n(sum, part, part_weight, n, x, moe_scratch);
             compute += now_sec() - t0;
             t0 = now_sec();
             MPI_Allreduce(MPI_IN_PLACE, sum, 4096, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
@@ -348,7 +374,8 @@ int main(int argc, char **argv) {
         }
     }
     free(router_logits); free(router_bias); free(router_w);
-    free(sum); free(out); free(act); free(up); free(x); free(shared_blob); free(blob); free(table);
+    free(sum); free(moe_scratch); free(x); free(shared_blob); free(blob); free(table);
     MPI_Finalize();
     return 0;
 }
+#endif
