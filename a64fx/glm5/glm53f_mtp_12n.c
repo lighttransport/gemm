@@ -51,7 +51,13 @@ glm53f_mtp_context_12n*glm53f_mtp_create_12n(const char*model,const char*routed,
     glm53f_st_close(st);c->embedding=glm53f_embedding_create_12n(model);c->attention=glm53f_sparse_create_12n(model,45,capacity);c->moe=glm53f_moe_stage_create_12n(routed,shared,model,45,1);c->head=glm53f_target_head_create_with_norm_12n(model,"model.language_model.layers.45.shared_head.norm.weight");c->embed_streams=mtp_a256((size_t)MTP_STREAMS*MTP_H*4);c->pair=mtp_a256((size_t)2*MTP_H*4);c->fusion=mtp_a256(MTP_H*4);c->normalized=mtp_a256(MTP_H*4);c->sublayer=mtp_a256(MTP_H*4);c->head_streams=mtp_a256((size_t)MTP_STREAMS*MTP_H*4);if(!c->embedding||!c->attention||!c->moe||!c->head||!c->embed_streams||!c->pair||!c->fusion||!c->normalized||!c->sublayer||!c->head_streams)goto fail;return c;
 fail_st:glm53f_st_close(st);fail:glm53f_mtp_free_12n(c);return NULL;}
 
-int glm53f_mtp_forward_12n(glm53f_mtp_context_12n*c,int token,const float*hidden,int*draft,float*logit,float*draft_hidden){if(!c||!hidden||!draft||!logit)return-1;if(glm53f_embedding_streams_12n(c->embedding,token,c->embed_streams))return-1;mtp_norm(c->pair,c->embed_streams,c->enorm);mtp_norm(c->pair+MTP_H,hidden,c->hnorm);
+int glm53f_mtp_forward_12n(glm53f_mtp_context_12n*c,int token,const float*hidden,int*draft,float*logit,float*draft_hidden){if(!c||!hidden||!draft||!logit)return-1;if(glm53f_embedding_streams_12n(c->embedding,token,c->embed_streams))return-1;
+    /* Training shifts the token embedding by one position.  There is no
+     * predecessor at MTP position zero, so the checkpoint contract masks that
+     * embedding before enorm (the previous target hidden state is retained). */
+    if(glm53f_sparse_length_12n(c->attention)==0)
+        memset(c->embed_streams,0,(size_t)MTP_STREAMS*MTP_H*4);
+    mtp_norm(c->pair,c->embed_streams,c->enorm);mtp_norm(c->pair+MTP_H,hidden,c->hnorm);
 #pragma omp parallel for schedule(static)
     for(int r=0;r<c->rows;r++)c->fusion[c->row0+r]=glm53f_dot_bf16_sve(c->eh+(size_t)r*2*MTP_H,c->pair,2*MTP_H);int counts[12],displs[12];for(int r=0;r<c->ranks;r++){displs[r]=(int)((long long)MTP_H*r/c->ranks);counts[r]=(int)((long long)MTP_H*(r+1)/c->ranks)-displs[r];}if(MPI_Allgatherv(MPI_IN_PLACE,0,MPI_FLOAT,c->fusion,counts,displs,MPI_FLOAT,MPI_COMM_WORLD)!=MPI_SUCCESS)return-1;memcpy(c->head_streams,c->fusion,MTP_H*4);mtp_norm(c->normalized,c->fusion,c->input_norm);if(glm53f_sparse_sublayer_12n(c->attention,c->sublayer,c->normalized))return-1;
 #pragma omp parallel for schedule(static)
