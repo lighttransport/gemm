@@ -18,6 +18,9 @@ mpi_lib=${FJMPI_LIB:-/opt/FJSVxtclanga/tcsds-1.2.43/lib64}
 cc=${FJCC:-fcc}
 cflags=(-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp
         -Wall -Wextra -I"$mpi_include" -I. -I../../common)
+if [ "${GLM53F_FAST_MATH:-0}" = 1 ]; then
+    cflags+=(-ffast-math)
+fi
 ldflags=(-L"$mpi_lib" -lmpi -lm -ltofucom)
 external=(-DGLM53F_EXTERNAL_ST_IMPLEMENTATION)
 
