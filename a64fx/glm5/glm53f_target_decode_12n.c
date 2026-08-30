@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "../../common/glm53f_safetensors.h"
 #include "glm53f_dense_ffn_12n.h"
 #include "glm53f_embedding_12n.h"
@@ -20,6 +21,25 @@ enum { LAYERS = 45, HIDDEN = 4096, STREAMS = 4, FLAT = 16384, MIX = 24 };
 static void *a256(size_t bytes) {
     void *p = NULL;
     return posix_memalign(&p, 256, bytes) ? NULL : p;
+}
+
+static void target_memtrace(int rank, const char *phase) {
+    const char *dir = getenv("GLM53F_MEMTRACE_DIR");
+    char path[512], line[256];
+    FILE *in, *out;
+    long rss = -1, avail = -1;
+    if (!dir || !*dir) return;
+    in = fopen("/proc/self/status", "r");
+    while (in && fgets(line, sizeof(line), in))
+        if (sscanf(line, "VmRSS: %ld kB", &rss) == 1) break;
+    if (in) fclose(in);
+    in = fopen("/proc/meminfo", "r");
+    while (in && fgets(line, sizeof(line), in))
+        if (sscanf(line, "MemAvailable: %ld kB", &avail) == 1) break;
+    if (in) fclose(in);
+    snprintf(path, sizeof(path), "%s/rank%02d.mem", dir, rank);
+    out = fopen(path, "a");
+    if (out) { fprintf(out, "%s rss_kb=%ld mem_available_kb=%ld\n", phase, rss, avail); fclose(out); }
 }
 
 static void *load_exact(glm53f_st_context *st, const char *name, size_t bytes) {
@@ -100,18 +120,24 @@ glm53f_target_model_12n *glm53f_target_model_create_12n(
             goto fail;
         }
     glm53f_st_close(st);
+    target_memtrace(rank, "layer_stack");
     m->embedding = glm53f_embedding_create_12n(model_dir);
     m->head = glm53f_target_head_create_12n(model_dir);
+    target_memtrace(rank, "embedding_head");
     for (int l = 0; l < LAYERS; ++l) {
         if (l % 4 == 3) m->sparse[l] = glm53f_sparse_create_12n(model_dir, l, capacity);
         else m->kda[l] = glm53f_kda_create_12n(model_dir, l);
         if (!m->sparse[l] && !m->kda[l]) goto fail;
     }
+    target_memtrace(rank, "attention");
     for (int l = 0; l < 3; ++l) {
         m->dense[l] = glm53f_dense_ffn_create_12n(model_dir, l);
         if (!m->dense[l]) goto fail;
     }
+    target_memtrace(rank, "dense");
+    target_memtrace(rank, "moe_before");
     m->moe = glm53f_moe_stage_create_12n(routed, shared, model_dir, 3, 42);
+    target_memtrace(rank, "moe_after");
     m->scratch = a256(sizeof(*m->scratch));
     m->streams = a256((size_t)FLAT * sizeof(float));
     m->batch_scratch = a256((size_t)5 * sizeof(*m->batch_scratch));
