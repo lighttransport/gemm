@@ -6,6 +6,10 @@
 #include <string.h>
 #include "glm53f_expert_kern.h"
 
+#ifndef GLM53F_MOE_FUSED_WEIGHTED
+#define GLM53F_MOE_FUSED_WEIGHTED 1
+#endif
+
 enum {
     GLM53F_MOE_HIDDEN = 4096,
     GLM53F_MOE_MAX_PARTS = 9,
@@ -34,9 +38,17 @@ static inline void glm53f_moe_local_12n(
         float *output, const glm53f_expert_part *part,
         const float *part_weight, int count, const float *x,
         glm53f_moe_scratch_12n *scratch) {
-    if (count > 0)
-        glm53f_expert_batch_bits(part, count, x, scratch->up,
-                                 scratch->activation, scratch->part_output);
+    if (count <= 0) {
+        memset(output, 0, GLM53F_MOE_HIDDEN * sizeof(*output));
+        return;
+    }
+#if GLM53F_MOE_FUSED_WEIGHTED
+        glm53f_expert_batch_weighted_bits(part, part_weight, count, x,
+                                           scratch->up, scratch->activation,
+                                           output);
+#else
+    glm53f_expert_batch_bits(part, count, x, scratch->up,
+                             scratch->activation, scratch->part_output);
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < GLM53F_MOE_HIDDEN; ++i) {
         float value = 0.0f;
@@ -45,6 +57,7 @@ static inline void glm53f_moe_local_12n(
                      scratch->part_output[(size_t)k * GLM53F_MOE_HIDDEN + i];
         output[i] = value;
     }
+#endif
 }
 
 static inline int glm53f_moe_forward_12n(

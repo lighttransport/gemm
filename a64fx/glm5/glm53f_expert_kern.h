@@ -330,9 +330,10 @@ static inline int glm53f_mla_absorbed_sve(float *out, const float *query,
 
 /* Run `batch` independent quarter experts concurrently. Threads are divided
  * into equal teams; batch=4 and 48 threads maps one 12-core team to each CMG. */
-static inline void glm53f_expert_batch_bits(
+static inline void glm53f_expert_batch_bits_impl(
         const glm53f_expert_part *part, int batch, const float *x,
-        float *up, float *act, float *y) {
+        float *up, float *act, float *y,
+        const float *part_weight, float *weighted_output) {
     enum { HIDDEN = 4096, INTER_STRIDE = 512, GATE_UP_STRIDE = 1024 };
 #pragma omp parallel
     {
@@ -371,7 +372,22 @@ static inline void glm53f_expert_batch_bits(
             }
         }
 #pragma omp barrier
-        if (task < batch) {
+        if (part_weight && weighted_output) {
+            for (int bi = tid; bi < HIDDEN / 8; bi += nth) {
+                int r = bi * 8;
+                float sum[8] = {0}, value[8];
+                for (int k = 0; k < batch; ++k) {
+                    int inter = part[k].inter;
+                    glm53f_matvec_fp8_bits_8(
+                        value, part[k].down + (size_t)r * inter,
+                        part[k].down_scale + (size_t)(r / 128) * (inter / 128),
+                        act + (size_t)k * INTER_STRIDE, inter);
+                    for (int j = 0; j < 8; ++j)
+                        sum[j] += part_weight[k] * value[j];
+                }
+                memcpy(weighted_output + r, sum, sizeof(sum));
+            }
+        } else if (task < batch) {
             int inter = part[task].inter;
             for (int bi = lane; bi < HIDDEN / 8; bi += lanes) {
                 int r = bi * 8;
@@ -383,6 +399,19 @@ static inline void glm53f_expert_batch_bits(
             }
         }
     }
+}
+
+static inline void glm53f_expert_batch_bits(
+        const glm53f_expert_part *part, int batch, const float *x,
+        float *up, float *act, float *y) {
+    glm53f_expert_batch_bits_impl(part, batch, x, up, act, y, NULL, NULL);
+}
+
+static inline void glm53f_expert_batch_weighted_bits(
+        const glm53f_expert_part *part, const float *part_weight, int batch,
+        const float *x, float *up, float *act, float *output) {
+    glm53f_expert_batch_bits_impl(part, batch, x, up, act, NULL,
+                                  part_weight, output);
 }
 
 /* Multi-position routed-expert execution.  Each token/part task shares one

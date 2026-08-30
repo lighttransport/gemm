@@ -45,6 +45,9 @@ fi
 if [ "${GLM53F_MHC_POST_FLOAT:-0}" = 1 ]; then
     cflags+=(-DGLM53F_MHC_POST_FLOAT=1)
 fi
+if [ -n "${GLM53F_MOE_FUSED_WEIGHTED:-}" ]; then
+    cflags+=("-DGLM53F_MOE_FUSED_WEIGHTED=$GLM53F_MOE_FUSED_WEIGHTED")
+fi
 # The MPI wrapper supplies its matching MPI include and link flags.  uTofu is
 # deliberately explicit because the model's collective implementation uses it
 # directly when GLM53F_UTOFU=1.
