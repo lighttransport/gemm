@@ -457,3 +457,8 @@ PASS`) and 32 tokens measured **15.756 tok/s** (`final_token=25 PASS`). The
 16-token result is 3.2% above the same-allocation strict 16-token baseline
 (14.529 tok/s). A same-allocation strict 32-token control is still pending;
 the float path remains opt-in until that control is recorded.
+
+The same-allocation 32-token strict control then measured **15.694 tok/s**
+(`final_token=25 PASS`) versus **15.756 tok/s** (`final_token=25 PASS`) for
+the float post-mix build, a modest **0.4%** gain. Both streams are exact; the
+float path remains opt-in because this delta is close to observed run variance.
