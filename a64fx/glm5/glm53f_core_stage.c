@@ -52,23 +52,27 @@ int main(int argc, char **argv) {
     char src_blob[4096], src_manifest[4096], dst_blob[4096], dst_manifest[4096];
     char tmp_blob[4096], tmp_manifest[4096];
     int rank = argc > 3 ? atoi(argv[3]) : rank_id();
+    const char *kind = argc > 4 ? argv[4] : "core";
+    const char *middle;
     struct stat sb, sm;
-    if (argc < 3 || rank < 0 || rank >= 12) {
-        fprintf(stderr, "usage: %s CORE_DIR LOCAL_DIR [RANK]\n", argv[0]);
+    if (argc < 3 || rank < 0 || rank >= 12 ||
+        (strcmp(kind, "core") && strcmp(kind, "model"))) {
+        fprintf(stderr, "usage: %s SOURCE_DIR LOCAL_DIR [RANK] [core|model]\n", argv[0]);
         return 2;
     }
+    middle = !strcmp(kind, "core") ? ".core" : "";
     if (mkdir(argv[2], 0755) && errno != EEXIST) { perror("mkdir"); return 2; }
-    snprintf(src_blob, sizeof(src_blob), "%s/rank%02d.core.blob", argv[1], rank);
-    snprintf(src_manifest, sizeof(src_manifest), "%s/rank%02d.core.manifest", argv[1], rank);
-    snprintf(dst_blob, sizeof(dst_blob), "%s/rank%02d.core.blob", argv[2], rank);
-    snprintf(dst_manifest, sizeof(dst_manifest), "%s/rank%02d.core.manifest", argv[2], rank);
-    snprintf(tmp_blob, sizeof(tmp_blob), "%s/.rank%02d.core.blob.tmp.%ld", argv[2], rank, (long)getpid());
-    snprintf(tmp_manifest, sizeof(tmp_manifest), "%s/.rank%02d.core.manifest.tmp.%ld", argv[2], rank, (long)getpid());
+    snprintf(src_blob, sizeof(src_blob), "%s/rank%02d%s.blob", argv[1], rank, middle);
+    snprintf(src_manifest, sizeof(src_manifest), "%s/rank%02d%s.manifest", argv[1], rank, middle);
+    snprintf(dst_blob, sizeof(dst_blob), "%s/rank%02d%s.blob", argv[2], rank, middle);
+    snprintf(dst_manifest, sizeof(dst_manifest), "%s/rank%02d%s.manifest", argv[2], rank, middle);
+    snprintf(tmp_blob, sizeof(tmp_blob), "%s/.rank%02d%s.blob.tmp.%ld", argv[2], rank, middle, (long)getpid());
+    snprintf(tmp_manifest, sizeof(tmp_manifest), "%s/.rank%02d%s.manifest.tmp.%ld", argv[2], rank, middle, (long)getpid());
     if (stat(src_blob, &sb) || stat(src_manifest, &sm) || sb.st_size <= 0 || sm.st_size <= 0) {
         fprintf(stderr, "rank=%d incomplete source core stage\n", rank); return 2;
     }
     if (!stat(dst_blob, &sb) && !stat(dst_manifest, &sm) && sb.st_size > 0 && sm.st_size > 0) {
-        printf("SENTINEL glm53f_core_stage=REUSE rank=%d bytes=%lld\n", rank, (long long)sb.st_size);
+        printf("SENTINEL glm53f_rank_stage=REUSE kind=%s rank=%d bytes=%lld\n", kind, rank, (long long)sb.st_size);
         return 0;
     }
     unlink(tmp_blob); unlink(tmp_manifest);
@@ -76,6 +80,6 @@ int main(int argc, char **argv) {
         rename(tmp_blob, dst_blob) || rename(tmp_manifest, dst_manifest)) {
         perror("stage"); unlink(tmp_blob); unlink(tmp_manifest); return 1;
     }
-    printf("SENTINEL glm53f_core_stage=OK rank=%d bytes=%lld\n", rank, (long long)sb.st_size);
+    printf("SENTINEL glm53f_rank_stage=OK kind=%s rank=%d bytes=%lld\n", kind, rank, (long long)sb.st_size);
     return 0;
 }
