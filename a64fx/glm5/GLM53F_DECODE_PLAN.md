@@ -485,3 +485,8 @@ binary remained greedy-exact and measured **15.705 tok/s** for 16 tokens
 above its strict 32-token control (15.694 tok/s).  Keep the stack-scratch path
 as the new default; longer-run confirmation is still warranted against the
 18 tok/s historical peak because node-to-node variance remains substantial.
+
+A second independent 32-token repeat measured **16.587 tok/s**
+(`final_token=25 PASS`), matching the first run's 16.591 tok/s within 0.03%.
+The allocation removal is stable across the longer decode workload; attention
+and FFN remain the next bottlenecks.
