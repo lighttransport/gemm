@@ -73,6 +73,19 @@ int main(int argc, char **argv) {
                compare_cp ? "replicated-vs-cp" : "replicated",
                layer, warm, TOKENS, rel,rollback_rel,sm * 1e3, bm * 1e3, sm / bm,
                ok ? "PASS" : "FAIL");
+    if (!rank) {
+        const char *report = getenv("GLM53F_SPARSE_REPORT");
+        if (report && *report) {
+            FILE *rf = fopen(report, "w");
+            if (rf) {
+                fprintf(rf, "GLM53F_SPARSE_BATCH mode=%s layer=%d warm=%d tokens=%d rel_l2=%.9g rollback_rel_l2=%.9g seq_ms=%.3f batch_ms=%.3f speedup=%.3f %s\n",
+                        compare_cp ? "replicated-vs-cp" : "replicated", layer,
+                        warm, TOKENS, rel, rollback_rel, sm * 1e3, bm * 1e3,
+                        sm / bm, ok ? "PASS" : "FAIL");
+                fclose(rf);
+            }
+        }
+    }
     glm53f_sparse_free_12n(cb);
     glm53f_sparse_free_12n(ca);
     free(b); free(a); free(x);
