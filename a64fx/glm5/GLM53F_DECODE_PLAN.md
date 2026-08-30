@@ -399,6 +399,19 @@ FP32 flat ToFu (15.637 tok/s). The layer-44 output statistics differ at the
 fourth decimal place, so BF16 reduction is rejected for deployment despite its
 lower payload size.
 
+An opt-in in-place MPI reduction (`GLM53F_MPI_INPLACE=1`) is bit-exact and
+reduces scalar layer-44 all-reduce from 1.163 to 0.971 ms. Its integrated
+16-token target run reaches **15.888 tok/s** (`final_token=432 PASS`) versus
+15.581 tok/s for the out-of-place MPI control. The five-token callback path is
+slower (0.304 ms reduction), so retain the switch for scalar decode only until
+longer mixed scalar/batch validation is complete.
+
+The longer 32-token in-place run remained greedy-exact (`final_token=25 PASS`)
+but measured **15.273 tok/s**. This does not beat the established strict
+baseline (17.443--18.140 tok/s), so the in-place reduction remains an opt-in
+diagnostic rather than a deployment default despite its isolated scalar-layer
+benefit.
+
 An MLA head-dimension parallelization experiment (commit `58dee7e5`) preserved
 the exact token stream but regressed the 12-node target to **17.624 tok/s**
 (56.742 ms/token); attention rose to 25.084 ms/token. The additional OpenMP
@@ -417,3 +430,9 @@ greedy-exact (`final_token=25`, PASS) but measured **17.752 tok/s** (56.330
 ms/token), versus 18.191 tok/s on the first run. The spread matches the
 observed A64FX run variance, so the flag is not claimed as a reliable gain and
 is left disabled by default.
+
+The KDA output-projection row-batching experiment (8-row SVE kernel replacing
+4,096 one-row OpenMP iterations) is bit-exact and improves the isolated scalar
+callback to 1.003 ms, but the integrated 16-token target measures **15.391
+tok/s** (`final_token=432 PASS`). It therefore does not beat the current
+baseline and remains experimental.
