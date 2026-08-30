@@ -505,6 +505,14 @@ repeat at **16.610 tok/s** (`final_token=25 PASS` in both), versus the
 A64FX variance, so the prefetch hint is rejected and the original scan is
 restored.
 
+On the renewed 12-node allocation 51098702, the required layer-45 MTP block
+was staged successfully (routed and shared rank shards).  The stable
+stack-scratch integrated verifier then completed 16 cycles greedy-exact:
+`accepted=10/16`, `alpha=0.625`, `delivered=42` tokens at **12.936 tok/s**,
+`final_token=40591 PASS`.  This confirms MTP quality/stability after the
+staging retry; it is below the earlier 12.7--12.9 tok/s range only within
+normal run variance, so no speculative kernel change is justified yet.
+
 An opt-in SVE FEXPA softmax for MLA scores was also compiled and tested.  It
 preserved greedy output (`final_token=432 PASS`) but measured **15.655 tok/s**
 for 16 tokens versus **15.705 tok/s** for the exact `expf` stack-scratch
