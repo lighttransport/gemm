@@ -61,6 +61,38 @@ int glm53f_st_read_columns(const glm53f_st_context *ctx, const char *name,
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * A target rank reads a small, deterministic subset of the 62-file checkpoint
+ * during graph construction.  Recording that subset lets the offline A64FX
+ * repacker produce a compact rank-local core blob instead of mirroring the
+ * 306 GiB source checkpoint.  TRACE_ONLY is intentionally for construction
+ * tracing only: callers must not use its zero-filled weights for inference.
+ */
+static void glm53f_st_trace(const char *kind, const char *name,
+                            size_t a, size_t b, size_t c) {
+    const char *dir = getenv("GLM53F_REPACK_TRACE_DIR");
+    static FILE *trace;
+    static int opened;
+    char path[4096];
+    const char *rank_s;
+    int rank = 0;
+    if (!dir || !*dir) return;
+    if (!opened) {
+        rank_s = getenv("PMIX_RANK");
+        if (!rank_s || !*rank_s) rank_s = getenv("PJM_MPI_RANK");
+        if (!rank_s || !*rank_s) rank_s = getenv("OMPI_COMM_WORLD_RANK");
+        if (rank_s && *rank_s) rank = atoi(rank_s);
+        if (snprintf(path, sizeof(path), "%s/rank%02d.trace", dir, rank) >=
+            (int)sizeof(path)) return;
+        trace = fopen(path, "a");
+        opened = 1;
+    }
+    if (trace) {
+        fprintf(trace, "%s %s %zu %zu %zu\n", kind, name, a, b, c);
+        fflush(trace);
+    }
+}
+
 static char *glm53f_st_dup(const char *s) {
     size_t n = strlen(s) + 1;
     char *p = (char *)malloc(n);
@@ -187,6 +219,11 @@ int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
     int i, fd, rc = -1;
     char path[4096];
     if (!t || !owner || offset > t->nbytes || nbytes > t->nbytes - offset || !dst) return -1;
+    glm53f_st_trace("R", name, offset, nbytes, 0);
+    if (getenv("GLM53F_REPACK_TRACE_ONLY")) {
+        memset(dst, 0, nbytes);
+        return 0;
+    }
     for (i = 0; i < ctx->n_shards; ++i) if (ctx->shards[i].st == owner) break;
     if (i == ctx->n_shards || snprintf(path, sizeof(path), "%s/%s", ctx->model_dir,
                                         ctx->shards[i].name) >= (int)sizeof(path)) return -1;
@@ -218,6 +255,11 @@ int glm53f_st_read_columns(const glm53f_st_context *ctx, const char *name,
         column_offset > row_bytes || column_bytes > row_bytes - column_offset ||
         t->nbytes % row_bytes || !dst) return -1;
     rows = t->nbytes / row_bytes;
+    glm53f_st_trace("C", name, row_bytes, column_offset, column_bytes);
+    if (getenv("GLM53F_REPACK_TRACE_ONLY")) {
+        memset(dst, 0, rows * column_bytes);
+        return 0;
+    }
     for (i = 0; i < ctx->n_shards; ++i) if (ctx->shards[i].st == owner) break;
     if (i == ctx->n_shards || snprintf(path, sizeof(path), "%s/%s", ctx->model_dir,
                                         ctx->shards[i].name) >= (int)sizeof(path)) return -1;
