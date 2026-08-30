@@ -345,6 +345,17 @@ PASS`) and trims the nominal reduction portion from 0.934 to 0.928 ms, but
 two-collective overhead raises total layer time from 1.266 to 1.288 ms. It is
 therefore rejected for deployment and left disabled by default.
 
+The allocation-specific 12-rank ToFu topology was regenerated before testing
+the existing uTofu collective path.  With `GLM53F_UTOFU=1`, the real-weight
+layer-44 callback is exact (`rel_l2=0`, `state=BIT_EXACT`, `PASS`); five-token
+batch latency is 1.861 ms and the measured all-reduce portion is 0.252 ms,
+versus 0.934 ms through MPI on the same layer.  The standalone ToFu diagnostic
+measures a 35.18 us warm 16 KiB reduction floor (12 ranks), confirming that the
+earlier initialization failures were caused by stale/incomplete topology files,
+not by the collective implementation.  An integrated target decode using this
+path is running on job 51094320; its greedy-exact and end-to-end timing result
+must be recorded before enabling ToFu by default.
+
 An MLA head-dimension parallelization experiment (commit `58dee7e5`) preserved
 the exact token stream but regressed the 12-node target to **17.624 tok/s**
 (56.742 ms/token); attention rose to 25.084 ms/token. The additional OpenMP

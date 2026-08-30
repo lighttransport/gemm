@@ -50,26 +50,49 @@ int glm53f_collective_init_12n(const char *path, int max_count) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (!path || ranks != 12 || max_count < 1 ||
-            (topo_count = glm53f_read_topology(path, topology)) != ranks)
+            (topo_count = glm53f_read_topology(path, topology)) != ranks) {
+        if (getenv("GLM53F_UTOFU_DEBUG"))
+            fprintf(stderr, "GLM53F_UTOFU init preflight path=%s ranks=%d max=%d topo=%d\n",
+                    path ? path : "(null)", ranks, max_count,
+                    path ? topo_count : -1);
         return -1;
-    if (utofu_query_my_coords(mine) != UTOFU_SUCCESS) return -1;
+    }
+    if (utofu_query_my_coords(mine) != UTOFU_SUCCESS) {
+        if (getenv("GLM53F_UTOFU_DEBUG")) fprintf(stderr, "GLM53F_UTOFU query coords failed rank=%d\n", rank);
+        return -1;
+    }
     for (int r = 0; r < ranks; r++)
         if (!memcmp(mine, topology[r], TOFU_NCOORDS)) physical_rank = r;
-    if (physical_rank != rank) return -1;
+    if (physical_rank != rank) {
+        if (getenv("GLM53F_UTOFU_DEBUG")) fprintf(stderr, "GLM53F_UTOFU rank map failed rank=%d physical=%d\n", rank, physical_rank);
+        return -1;
+    }
     rc = utofu_get_onesided_tnis(&tnis, &ntni);
-    if (rc != UTOFU_SUCCESS || ntni < 1) { free(tnis); return -1; }
+    if (rc != UTOFU_SUCCESS || ntni < 1) {
+        if (getenv("GLM53F_UTOFU_DEBUG")) fprintf(stderr, "GLM53F_UTOFU get tni failed rank=%d rc=%d ntni=%zu\n", rank, rc, ntni);
+        free(tnis); return -1;
+    }
     tni = tnis[0];
     rc = utofu_create_vcq_with_cmp_id(tni, DEMO_CMP_ID, 0, &glm53f_vcq);
     free(tnis);
-    if (rc != UTOFU_SUCCESS) return -1;
+    if (rc != UTOFU_SUCCESS) {
+        if (getenv("GLM53F_UTOFU_DEBUG")) fprintf(stderr, "GLM53F_UTOFU create vcq failed rank=%d rc=%d\n", rank, rc);
+        return -1;
+    }
     for (int r = 0; r < ranks; r++) {
         rc = utofu_construct_vcq_id(topology[r], tni, DEMO_CQ_ID, DEMO_CMP_ID,
                                     &peers[r]);
-        if (rc != UTOFU_SUCCESS) return -1;
+        if (rc != UTOFU_SUCCESS) {
+            if (getenv("GLM53F_UTOFU_DEBUG")) fprintf(stderr, "GLM53F_UTOFU construct peer failed rank=%d peer=%d rc=%d\n", rank, r, rc);
+            return -1;
+        }
         utofu_set_vcq_id_path(&peers[r], NULL);
     }
     if (tp_comm_init(&glm53f_comm, glm53f_vcq, peers, rank, ranks,
-                     max_count, glm53f_mpi_barrier)) return -1;
+                     max_count, glm53f_mpi_barrier)) {
+        if (getenv("GLM53F_UTOFU_DEBUG")) fprintf(stderr, "GLM53F_UTOFU tp_comm_init failed rank=%d\n", rank);
+        return -1;
+    }
     glm53f_utofu_active = 1;
     if (!rank) fprintf(stderr, "GLM53F_COLLECTIVE mode=utofu max_count=%d\n", max_count);
     return 0;
