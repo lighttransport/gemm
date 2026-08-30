@@ -393,6 +393,12 @@ measured only **14.369 tok/s** for 16 tokens, slower than robust flat ToFu
 (15.637 tok/s) and MPI (15.581 tok/s). It is rejected for deployment; the
 MRQ-drain behavior remains enabled whenever ToFu is selected.
 
+BF16-compressed ToFu reduction (`TP_AR_BF16=1`) also preserved the 16-token
+greedy result (`final_token=432 PASS`) but measured **15.122 tok/s**, slower than
+FP32 flat ToFu (15.637 tok/s). The layer-44 output statistics differ at the
+fourth decimal place, so BF16 reduction is rejected for deployment despite its
+lower payload size.
+
 An MLA head-dimension parallelization experiment (commit `58dee7e5`) preserved
 the exact token stream but regressed the 12-node target to **17.624 tok/s**
 (56.742 ms/token); attention rose to 25.084 ms/token. The additional OpenMP
