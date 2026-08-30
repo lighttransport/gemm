@@ -513,12 +513,12 @@ stack-scratch integrated verifier then completed 16 cycles greedy-exact:
 staging retry; it is below the earlier 12.7--12.9 tok/s range only within
 normal run variance, so no speculative kernel change is justified yet.
 
-The sparse batch verifier was then changed to keep cache updates sequential
-but pack each token's local output projection into one `tokens*H` all-reduce,
-instead of issuing one 4096-float collective per token.  The rebuilt
-`glm53f_sparse_batch_check` returned exit 0 on the real layer-43 weights
-(replicated mode, warm=8, tokens=4), confirming the packed path's correctness;
-the bridge did not expose rank-0 timing output, so no speedup is claimed yet.
+The sparse batch verifier was then changed experimentally to keep cache updates
+sequential but pack each token's local output projection into one `tokens*H`
+all-reduce.  It remained exact (`rel_l2=9.19e-8`, rollback exact), but measured
+**5.015 ms** versus **3.310 ms** for four scalar positions (0.660x), because
+the larger collective outweighed the call reduction.  The packed path is
+rejected and the original per-token reduction is restored.
 
 An opt-in SVE FEXPA softmax for MLA scores was also compiled and tested.  It
 preserved greedy output (`final_token=432 PASS`) but measured **15.655 tok/s**
