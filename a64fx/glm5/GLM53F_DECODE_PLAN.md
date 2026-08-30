@@ -474,3 +474,14 @@ run. Both remain exact; the 0.4% spread confirms that the apparent post-float
 gain over the same-allocation strict control is within normal A64FX variance.
 Keep `GLM53F_MHC_POST_FLOAT=1` opt-in/diagnostic rather than changing the
 default build.
+
+The MLA decode scratch allocator was then removed from `mla_one`: each head
+now uses fixed worker-stack buffers (query latent, value accumulator, and
+TOPK score list) instead of three `a256`/`free` pairs.  The rebuilt integrated
+binary remained greedy-exact and measured **15.705 tok/s** for 16 tokens
+(`final_token=432 PASS`) and **16.591 tok/s** for a 32-token control
+(`final_token=25 PASS`) on allocation 51098702.  These are respectively about
+8.1% above the same-allocation strict 16-token control (14.529 tok/s) and 5.7%
+above its strict 32-token control (15.694 tok/s).  Keep the stack-scratch path
+as the new default; longer-run confirmation is still warranted against the
+18 tok/s historical peak because node-to-node variance remains substantial.

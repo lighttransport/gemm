@@ -33,11 +33,16 @@ static inline float fp8dot(const uint8_t*w,const float*sc,const float*x,int n){
 static inline float f32dot(const float*a,const float*b,int n){svfloat32_t s=svdup_f32(0);int vl=(int)svcntw();for(int i=0;i<n;i+=vl){svbool_t p=svwhilelt_b32(i,n);s=svmla_x(p,s,svld1(p,a+i),svld1(p,b+i));}return svaddv_f32(svptrue_b32(),s);}
 static inline float bf16dot(const uint16_t*w,const float*x,int n){svfloat32_t s=svdup_f32(0);int vl=(int)svcntw();for(int i=0;i<n;i+=vl){svbool_t p=svwhilelt_b32(i,n);svuint32_t z=svlsl_n_u32_x(p,svld1uh_u32(p,w+i),16);s=svmla_x(p,s,svreinterpret_f32_u32(z),svld1(p,x+i));}return svaddv_f32(svptrue_b32(),s);}
 static int mla_one(float*out,const float*q,const float*cache,const uint16_t*w,
-                   const int*sel,int nt){float *ql=a256(LAT*4),*va=a256(LAT*4),*log=a256((size_t)nt*4);const uint16_t*wv=w+(size_t)KD*LAT;int vl=(int)svcntw();memset(ql,0,LAT*4);
+                   const int*sel,int nt){
+    /* One head is owned by one OpenMP worker.  These scratch arrays are small
+     * (about 16 KiB at TOPK=2048); keeping them on that worker's stack avoids
+     * three allocator/lock round-trips for every head of every decode layer. */
+    float ql[LAT], va[LAT], log[2052]; /* TOPK(2048) + one KPOOL(4) tail */
+    const uint16_t*wv=w+(size_t)KD*LAT;int vl=(int)svcntw();memset(ql,0,LAT*4);
     for(int j=0;j<KD;j++){float x=q[j]/sqrtf((float)KD);for(int d=0;d<LAT;d+=vl){svbool_t p=svwhilelt_b32(d,LAT);svuint32_t z=svlsl_n_u32_x(p,svld1uh_u32(p,w+(size_t)j*LAT+d),16);svst1(p,ql+d,svmla_n_f32_x(p,svld1(p,ql+d),svreinterpret_f32_u32(z),x));}}
     float mx=-INFINITY,sum=0;for(int t=0;t<nt;t++){log[t]=f32dot(ql,cache+(size_t)sel[t]*LAT,LAT);if(log[t]>mx)mx=log[t];}for(int t=0;t<nt;t++){log[t]=expf(log[t]-mx);sum+=log[t];}memset(va,0,LAT*4);
     for(int t=0;t<nt;t++){float x=log[t]/sum;const float*z=cache+(size_t)sel[t]*LAT;for(int d=0;d<LAT;d+=vl){svbool_t p=svwhilelt_b32(d,LAT);svst1(p,va+d,svmla_n_f32_x(p,svld1(p,va+d),svld1(p,z+d),x));}}
-    for(int j=0;j<VD;j++)out[j]=bf16dot(wv+(size_t)j*LAT,va,LAT);free(log);free(va);free(ql);return 0;}
+    for(int j=0;j<VD;j++)out[j]=bf16dot(wv+(size_t)j*LAT,va,LAT);return 0;}
 static int mla_heads(float*out,const float*q,const float*z,const uint16_t*w,
                      const int*sel,int nt,int nh){int fail=0;
 #pragma omp parallel for schedule(static) reduction(|:fail)
