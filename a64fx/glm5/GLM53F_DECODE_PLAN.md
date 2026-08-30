@@ -370,6 +370,29 @@ the integrated 16-token target is slower at **15.374 tok/s** (final token 432).
 The extra row/column synchronization outweighs the microbenchmark win, so the
 2-D mode remains disabled and the flat MPI path remains the deployment default.
 
+The existing direct all-to-all ToFu option (`TP_AR_A2A=1`) was also checked.
+It is exact (`PASS`) and reduces the isolated scalar KDA reduction to 0.151 ms,
+but five-token verification remains 0.255 ms (flat ToFu 0.248 ms).  Because
+the full target run is dominated by verification-sized and non-KDA collectives,
+this option is retained for scalar experiments only and is not enabled by
+default without a paired end-to-end win.
+
+The paired integrated all-to-all target run is exact (`final_token=432`) but
+slower at **13.609 tok/s** for 16 tokens, versus 15.637 tok/s for flat ToFu and
+15.581 tok/s for MPI. The additional peer puts and cache traffic dominate in
+the full graph; `TP_AR_A2A` is therefore rejected for deployment.
+
+ToFu's robustness overhead was isolated with `TP_AR_ROBUST=0`: scalar KDA
+all-reduce falls to 0.171 ms (exact), but five-token verification remains
+0.269 ms versus 0.248 ms for flat robust-ToFu. A guarded integrated run is in
+progress; this mode is only suitable when the allocation is dedicated and
+long-run MRQ-overflow stability is demonstrated.
+
+The guarded integrated non-robust run remained exact (`final_token=432`) but
+measured only **14.369 tok/s** for 16 tokens, slower than robust flat ToFu
+(15.637 tok/s) and MPI (15.581 tok/s). It is rejected for deployment; the
+MRQ-drain behavior remains enabled whenever ToFu is selected.
+
 An MLA head-dimension parallelization experiment (commit `58dee7e5`) preserved
 the exact token stream but regressed the 12-node target to **17.624 tok/s**
 (56.742 ms/token); attention rose to 25.084 ms/token. The additional OpenMP
