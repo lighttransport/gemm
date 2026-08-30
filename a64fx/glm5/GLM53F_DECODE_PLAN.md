@@ -505,6 +505,12 @@ repeat at **16.610 tok/s** (`final_token=25 PASS` in both), versus the
 A64FX variance, so the prefetch hint is rejected and the original scan is
 restored.
 
+The lightweight real-weight KDA callback check on allocation 51098702 also
+completed cleanly for layer 44 (`tokens=5`): batch output and saved state are
+bit-exact (`rel_l2=6.94e-8`, PASS) and batch latency is **3.874 ms** versus
+**4.997 ms** for five sequential positions (1.29x).  This confirms the KDA
+batch kernel is not the source of the full-graph launch stalls.
+
 On the renewed 12-node allocation 51098702, the required layer-45 MTP block
 was staged successfully (routed and shared rank shards).  The stable
 stack-scratch integrated verifier then completed 16 cycles greedy-exact:
