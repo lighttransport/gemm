@@ -61,6 +61,66 @@ int glm53f_st_read_columns(const glm53f_st_context *ctx, const char *name,
 #include <stdlib.h>
 #include <string.h>
 
+static char *glm53f_st_dup(const char *s);
+
+typedef struct {
+    char kind;
+    char *name;
+    size_t a, b, c;
+    uint64_t blob_offset;
+} glm53f_st_repack_entry;
+
+/* Cached per-process view of a rank-local compact core blob. */
+static int glm53f_st_repack_read(const char *kind, const char *name,
+                                 size_t a, size_t b, size_t c,
+                                 void *dst, size_t nbytes) {
+    static int initialized, fd = -1, strict;
+    static glm53f_st_repack_entry *entries;
+    static int nentries;
+    const char *dir = getenv("GLM53F_REPACK_DIR");
+    if (!dir || !*dir) return 1;
+    if (!initialized) {
+        char manifest[4096], blob[4096], line[8192], parsed_name[512];
+        const char *rank_s = getenv("PMIX_RANK");
+        int rank = 0;
+        FILE *f;
+        if (!rank_s || !*rank_s) rank_s = getenv("PJM_MPI_RANK");
+        if (!rank_s || !*rank_s) rank_s = getenv("OMPI_COMM_WORLD_RANK");
+        if (rank_s && *rank_s) rank = atoi(rank_s);
+        strict = getenv("GLM53F_REPACK_REQUIRE") != NULL;
+        if (snprintf(manifest, sizeof(manifest), "%s/rank%02d.core.manifest", dir, rank) >= (int)sizeof(manifest) ||
+            snprintf(blob, sizeof(blob), "%s/rank%02d.core.blob", dir, rank) >= (int)sizeof(blob) ||
+            !(f = fopen(manifest, "r"))) { initialized = 1; return strict ? -1 : 1; }
+        while (fgets(line, sizeof(line), f)) {
+            glm53f_st_repack_entry e = {0};
+            unsigned long long off;
+            int got;
+            if (line[0] == '#') continue;
+            got = sscanf(line, "%c %511s %zu %zu %zu %llu", &e.kind, parsed_name,
+                         &e.a, &e.b, &e.c, &off);
+            if ((e.kind == 'R' && got == 5) || (e.kind == 'C' && got == 6)) {
+                if (e.kind == 'R') { e.blob_offset = e.c; e.c = 0; }
+                else e.blob_offset = off;
+                e.name = glm53f_st_dup(parsed_name);
+                if (!e.name) break;
+                glm53f_st_repack_entry *p = realloc(entries, (size_t)(nentries + 1) * sizeof(*entries));
+                if (!p) { free(e.name); break; }
+                entries = p; entries[nentries++] = e;
+            }
+        }
+        fclose(f);
+        fd = open(blob, O_RDONLY);
+        initialized = 1;
+        if (fd < 0) return strict ? -1 : 1;
+    }
+    for (int i = 0; i < nentries; ++i) {
+        glm53f_st_repack_entry *e = &entries[i];
+        if (e->kind == kind[0] && e->a == a && e->b == b && e->c == c && !strcmp(e->name, name))
+            return pread(fd, dst, nbytes, (off_t)e->blob_offset) == (ssize_t)nbytes ? 0 : -1;
+    }
+    return strict ? -1 : 1;
+}
+
 /*
  * A target rank reads a small, deterministic subset of the 62-file checkpoint
  * during graph construction.  Recording that subset lets the offline A64FX
@@ -220,6 +280,8 @@ int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
     char path[4096];
     if (!t || !owner || offset > t->nbytes || nbytes > t->nbytes - offset || !dst) return -1;
     glm53f_st_trace("R", name, offset, nbytes, 0);
+    { int repacked = glm53f_st_repack_read("R", name, offset, nbytes, 0, dst, nbytes);
+      if (repacked <= 0) return repacked; }
     if (getenv("GLM53F_REPACK_TRACE_ONLY")) {
         memset(dst, 0, nbytes);
         return 0;
@@ -256,6 +318,9 @@ int glm53f_st_read_columns(const glm53f_st_context *ctx, const char *name,
         t->nbytes % row_bytes || !dst) return -1;
     rows = t->nbytes / row_bytes;
     glm53f_st_trace("C", name, row_bytes, column_offset, column_bytes);
+    { int repacked = glm53f_st_repack_read("C", name, row_bytes, column_offset,
+                                            column_bytes, dst, rows * column_bytes);
+      if (repacked <= 0) return repacked; }
     if (getenv("GLM53F_REPACK_TRACE_ONLY")) {
         memset(dst, 0, rows * column_bytes);
         return 0;
