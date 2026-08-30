@@ -78,6 +78,11 @@ int main(int argc, char **argv) {
     MPI_Reduce(&seq_elapsed, &seq_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&batch_elapsed, &batch_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!rank) {
+        double out_ss = 0.0, out_sum = 0.0;
+        for (int i = 0; i < HIDDEN; ++i) {
+            out_ss += (double)a[0][i] * a[0][i];
+            out_sum += a[0][i];
+        }
         printf("GLM53F_KDA_CALLBACK layer=%d tokens=%d batch=%s state=%s "
                "rel_l2=%.9g seq_ms=%.3f batch_ms=%.3f speedup=%.3f "
                "front_ms=%.3f oproj_ms=%.3f allreduce_ms=%.3f %s\n", layer, tokens,
@@ -89,9 +94,10 @@ int main(int argc, char **argv) {
         if (report && *report) {
             FILE *rf = fopen(report, "w");
             if (rf) {
-                fprintf(rf, "GLM53F_KDA_CALLBACK layer=%d tokens=%d batch=%s state=%s rel_l2=%.9g seq_ms=%.3f batch_ms=%.3f speedup=%.3f front_ms=%.3f oproj_ms=%.3f allreduce_ms=%.3f %s\n",
+                fprintf(rf, "GLM53F_KDA_CALLBACK layer=%d tokens=%d batch=%s state=%s rel_l2=%.9g out_rms=%.9g out_sum=%.9g seq_ms=%.3f batch_ms=%.3f speedup=%.3f front_ms=%.3f oproj_ms=%.3f allreduce_ms=%.3f %s\n",
                         layer, tokens, ok ? "REL_L2_OK" : "FAIL",
                         all_state_ok ? "BIT_EXACT" : "FAIL", rel_l2,
+                        sqrt(out_ss / HIDDEN), out_sum,
                         seq_max * 1e3, batch_max * 1e3, seq_max / batch_max,
                         max_phase[0] * 1e3, max_phase[1] * 1e3,
                         max_phase[2] * 1e3, ok ? "PASS" : "FAIL");
