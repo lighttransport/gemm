@@ -158,6 +158,12 @@ int glm53f_sum_allreduce_12n(const float *input, float *output, int count) {
                 return -1;
             return 0;
         }
+        if (getenv("GLM53F_MPI_INPLACE")) {
+            if (input != output)
+                memcpy(output, input, (size_t)count * sizeof(float));
+            return MPI_Allreduce(MPI_IN_PLACE, output, count, MPI_FLOAT,
+                                 MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS ? 0 : -1;
+        }
         return MPI_Allreduce(input, output, count, MPI_FLOAT, MPI_SUM,
                              MPI_COMM_WORLD) == MPI_SUCCESS ? 0 : -1;
     }
