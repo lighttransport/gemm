@@ -505,6 +505,12 @@ repeat at **16.610 tok/s** (`final_token=25 PASS` in both), versus the
 A64FX variance, so the prefetch hint is rejected and the original scan is
 restored.
 
+An opt-in SVE FEXPA softmax for MLA scores was also compiled and tested.  It
+preserved greedy output (`final_token=432 PASS`) but measured **15.655 tok/s**
+for 16 tokens versus **15.705 tok/s** for the exact `expf` stack-scratch
+control.  The approximation is therefore rejected; exact `expf` remains the
+default.
+
 The MLA value reconstruction loop was also changed experimentally to keep one
 SVE accumulator per latent-dimension chunk instead of reloading/storing the
 accumulator for every selected cache entry.  It remained exact and measured
