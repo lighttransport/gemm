@@ -353,6 +353,57 @@ HTTP 409. Idle sessions are reaped after 30 minutes by default. A request
 timeout or output limit interrupts only the active command; the session remains
 usable.
 
+## GLM-5.3F 12-node MPI/uTofu launch
+
+Generate a topology file inside every new allocation; topology from a previous
+job must not be reused.  Build the helper and integrated runner through the
+site MPI compiler wrapper so that `mpi.h` and `libmpi` come from the same MPI
+installation.  On the current OSS-CN LLVM environment, `mpiclang` is the
+working wrapper; `mpiFCC` may be present but can be invalid when `OPAL_PREFIX`
+selects another MPI tree.
+
+```bash
+cd ~/work/gemm/glm53f/a64fx/glm5
+make -C ../utofu-tests tofu_topo_helper MPICC=mpiclang
+rm -f tofu_topo.txt
+mpiexec -np 12 ../utofu-tests/tofu_topo_helper
+test "$(grep -vc '^#' tofu_topo.txt)" -eq 12
+
+GLM53F_MPICC=mpiclang ./build_glm53f_integrated_12n.sh
+```
+
+`build_glm53f_integrated_12n.sh` selects `mpiclang` automatically when it is
+available and deliberately does not inject a separate MPI include or library
+path.  It links `libtofucom` explicitly for `GLM53F_UTOFU=1` collectives.
+
+Before a full-graph decode, verify that each rank has both first-stage blobs on
+its own `/local` filesystem.  The routed and shared directories are per-node,
+so testing only rank 0 is insufficient:
+
+```bash
+mpiexec -np 12 sh -c '
+  r=${PMIX_RANK:-${PJM_MPI_RANK:-${OMPI_COMM_WORLD_RANK:-0}}}
+  test -s "/local/glm53f-target-routed-$PJM_JOBID/rank$(printf %02d "$r").blob"
+  test -s "/local/glm53f-target-shared-$PJM_JOBID/rank$(printf %02d "$r").blob"
+'
+```
+
+Then use the fresh topology for the target path:
+
+```bash
+GLM53F_UTOFU=1 TOFU_TOPO_PATH="$PWD/tofu_topo.txt" \
+  OMP_NUM_THREADS=47 OMP_DYNAMIC=false OMP_WAIT_POLICY=active \
+  OMP_PROC_BIND=close OMP_PLACES=cores \
+  mpiexec -np 12 ./glm53f_target_decode_12n "$HOME/models/glm53f" \
+  "/local/glm53f-target-routed-$PJM_JOBID" \
+  "/local/glm53f-target-shared-$PJM_JOBID" 1 1
+```
+
+The first-stage blobs avoid repeated expert/shared reads from the model
+filesystem.  If the full graph still stops responding during initial loading,
+record it as model I/O and inspect it through a separate control session; do
+not infer a uTofu collective fault from that symptom.
+
 ## Stop the service
 
 Cancel the PJM allocation when it is no longer needed:

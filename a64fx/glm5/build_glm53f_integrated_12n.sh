@@ -13,11 +13,26 @@ else
 fi
 mkdir -p "$build_dir"
 
-mpi_include=${FJMPI_INCLUDE:-/opt/FJSVxtclanga/tcsds-1.2.43/include/mpi/fujitsu}
-mpi_lib=${FJMPI_LIB:-/opt/FJSVxtclanga/tcsds-1.2.43/lib64}
-cc=${FJCC:-fcc}
-cflags=(-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp
-        -Wall -Wextra -I"$mpi_include" -I. -I../../common)
+# The Fugaku login and compute environments can expose different MPI trees.
+# Do not mix mpi.h from one tree with libmpi from another: use its compiler
+# wrapper for both.  On the current OSS-CN LLVM environment mpiFCC is broken
+# by OPAL_PREFIX, while mpiclang is the supported MPI C wrapper.  A caller may
+# select another site wrapper explicitly through GLM53F_MPICC.
+if [ -n "${GLM53F_MPICC:-}" ]; then
+    cc=$GLM53F_MPICC
+elif command -v mpiclang >/dev/null 2>&1; then
+    cc=mpiclang
+elif command -v mpiFCC >/dev/null 2>&1 && mpiFCC --showme:compile >/dev/null 2>&1; then
+    cc=mpiFCC
+elif command -v mpicc >/dev/null 2>&1; then
+    cc=mpicc
+else
+    echo "error: no working MPI compiler wrapper (set GLM53F_MPICC)" >&2
+    exit 2
+fi
+
+cflags=(-O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp
+        -Wall -Wextra -I. -I../../common)
 if [ "${GLM53F_FAST_MATH:-0}" = 1 ]; then
     cflags+=(-ffast-math)
 fi
@@ -30,7 +45,10 @@ fi
 if [ "${GLM53F_MHC_POST_FLOAT:-0}" = 1 ]; then
     cflags+=(-DGLM53F_MHC_POST_FLOAT=1)
 fi
-ldflags=(-L"$mpi_lib" -lmpi -lm -ltofucom)
+# The MPI wrapper supplies its matching MPI include and link flags.  uTofu is
+# deliberately explicit because the model's collective implementation uses it
+# directly when GLM53F_UTOFU=1.
+ldflags=(-lm -ltofucom)
 external=(-DGLM53F_EXTERNAL_ST_IMPLEMENTATION)
 
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
@@ -70,4 +88,4 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
     glm53f_sparse_layer_12n.c "$build_dir/collective.o" \
     "${ldflags[@]}" -o glm53f_sparse_batch_check
 
-echo "SENTINEL glm53f_integrated_build_12n=OK build_dir=$build_dir"
+echo "SENTINEL glm53f_integrated_build_12n=OK cc=$cc build_dir=$build_dir"
