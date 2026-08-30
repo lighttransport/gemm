@@ -15,6 +15,9 @@
 #ifndef GLM53F_MHC_FUSED
 #define GLM53F_MHC_FUSED 0
 #endif
+#ifndef GLM53F_MHC_POST_FLOAT
+#define GLM53F_MHC_POST_FLOAT 0
+#endif
 
 enum {
     GLM53F_MHC_STREAMS = 4,
@@ -152,12 +155,19 @@ static inline void glm53f_mhc_pre_batch_sve(
 static inline void glm53f_mhc_post_sve(
         float *streams, const float *sublayer, const glm53f_mhc_scratch *scratch) {
 #pragma omp parallel for collapse(2) schedule(static)
-    for (int k = 0; k < GLM53F_MHC_STREAMS; ++k)
+        for (int k = 0; k < GLM53F_MHC_STREAMS; ++k)
         for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {
+#if GLM53F_MHC_POST_FLOAT
+            float v = scratch->post[k] * sublayer[d];
+            for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)
+                v += scratch->combine[(size_t)j * GLM53F_MHC_STREAMS + k] *
+                     scratch->residual[(size_t)j * GLM53F_MHC_WIDTH + d];
+#else
             double v = (double)scratch->post[k] * sublayer[d];
             for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)
                 v += (double)scratch->combine[(size_t)j * GLM53F_MHC_STREAMS + k] *
                      scratch->residual[(size_t)j * GLM53F_MHC_WIDTH + d];
+#endif
             streams[(size_t)k * GLM53F_MHC_WIDTH + d] = (float)v;
         }
 }
@@ -179,10 +189,17 @@ static inline void glm53f_mhc_post_batch_sve(
             const glm53f_mhc_scratch *s = (const glm53f_mhc_scratch *)
                               ((const unsigned char *)scratch + (size_t)t * stride);
             for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {
+#if GLM53F_MHC_POST_FLOAT
+                float v = s->post[k] * sublayer[(size_t)t * GLM53F_MHC_WIDTH + d];
+                for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)
+                    v += s->combine[(size_t)j * GLM53F_MHC_STREAMS + k] *
+                         res[(size_t)j * GLM53F_MHC_WIDTH + d];
+#else
                 double v = (double)s->post[k] * sublayer[(size_t)t * GLM53F_MHC_WIDTH + d];
                 for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)
                     v += (double)s->combine[(size_t)j * GLM53F_MHC_STREAMS + k] *
                          res[(size_t)j * GLM53F_MHC_WIDTH + d];
+#endif
                 dst[d] = (float)v;
             }
         }
