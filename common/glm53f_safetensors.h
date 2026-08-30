@@ -87,7 +87,8 @@ static int glm53f_st_repack_read(const char *kind, const char *name,
         if (!rank_s || !*rank_s) rank_s = getenv("PJM_MPI_RANK");
         if (!rank_s || !*rank_s) rank_s = getenv("OMPI_COMM_WORLD_RANK");
         if (rank_s && *rank_s) rank = atoi(rank_s);
-        strict = getenv("GLM53F_REPACK_REQUIRE") != NULL;
+        const char *require = getenv("GLM53F_REPACK_REQUIRE");
+        strict = require && atoi(require) != 0;
         if (snprintf(manifest, sizeof(manifest), "%s/rank%02d.core.manifest", dir, rank) >= (int)sizeof(manifest) ||
             snprintf(blob, sizeof(blob), "%s/rank%02d.core.blob", dir, rank) >= (int)sizeof(blob) ||
             !(f = fopen(manifest, "r"))) {
