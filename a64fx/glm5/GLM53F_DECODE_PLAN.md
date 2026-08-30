@@ -544,3 +544,31 @@ accumulator for every selected cache entry.  It remained exact and measured
 16.591 tok/s for the stack-scratch control.  The longer result is effectively
 flat (+0.04%), so this rewrite is rejected; the original token-major loop is
 restored.
+
+### Persistent EP12 rank images and HBM2 residency
+
+The decode deployment invariant is that every rank's complete weight shard is
+resident in anonymous HBM2 before token generation.  mmap and decode-time
+streaming from `/local` are not supported performance modes.  The storage path
+is deliberately three phase:
+
+1. One-time offline conversion of the 305.8 GiB, 62-file checkpoint into
+   `~/models/glm53f/a64fx_ep12_v1/{routed,shared,core}`.  Each directory has one
+   contiguous blob and manifest per rank.  The core blob contains only the
+   rank-owned attention/KDA, dense, router, embedding, norm, and vocabulary
+   slices recorded during target construction.
+2. At allocation startup, each rank copies only its own three files from shared
+   storage to `/local` with bounded 32 MiB I/O, `fsync`, and
+   `POSIX_FADV_DONTNEED`.  A completed offline image is identified by all rank
+   status files plus the root `COMPLETE` marker.
+3. The target performs sequential reads from `/local` into anonymous aligned
+   allocations and drops source cache pages.  All token-time kernels then read
+   HBM2 only.  uTofu may redistribute rank-owned pieces after upload when a
+   different tensor layout reduces compute communication, but it is never a
+   substitute for disk reads during decode.
+
+The canonical commands are `run_glm53f_offline_repack_12n.sh` once and
+`run_glm53f_stage_rank_image_12n.sh` for every allocation.  This format trades
+the slow one-time source reshuffle for sequential per-node startup traffic:
+shared storage (about 300 MB/s/node) to `/local`, followed by `/local` (about
+1 GB/s/node) to HBM2.
