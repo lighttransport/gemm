@@ -404,6 +404,32 @@ filesystem.  If the full graph still stops responding during initial loading,
 record it as model I/O and inspect it through a separate control session; do
 not infer a uTofu collective fault from that symptom.
 
+### Resident rank-image workflow
+
+Decode must not mmap or stream weights from either shared storage or
+`/local`.  Create the rank-contiguous image once in shared storage, copy each
+rank's routed, shared, and core blobs to that node's `/local` in bounded
+chunks at allocation startup, and then read them sequentially into anonymous
+HBM2.  Disk I/O ends before the first decode token.  A post-load uTofu shuffle
+is allowed, but steady-state weights remain resident and rank-sharded.
+
+```bash
+# One-time, 12-node offline conversion (resumable through status files).
+GLM53F_CORE_TRACE_DIR="$HOME/models/glm53f/a64fx_ep12_core_trace_51098702" \
+  ./run_glm53f_offline_repack_12n.sh
+
+# Every allocation: shared image -> per-node /local, 32 MiB chunks.
+./run_glm53f_stage_rank_image_12n.sh
+```
+
+The stable image root defaults to
+`$HOME/models/glm53f/a64fx_ep12_v1`; staging refuses an image without its
+`COMPLETE` marker.  Set `GLM53F_REPACK_REQUIRE=1` for full-graph measurements
+so a missing core slice fails rather than silently returning to fragmented
+source reads.  For performance A/B tests, `GLM53F_MOE_FUSED_WEIGHTED=0`
+builds the legacy expert aggregation; the default fuses route weighting into
+the down projection.
+
 ## Stop the service
 
 Cancel the PJM allocation when it is no longer needed:
