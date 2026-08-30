@@ -33,11 +33,14 @@ int glm53f_target_head_argmax_12n(glm53f_target_head_context_12n*c,const float*s
     for(int i=0;i<H;i++)c->x[i]=c->hidden[i]*inv*glm53f_bf16_to_f32(c->norm[i]);double t1=MPI_Wtime();
 #pragma omp parallel for schedule(static)
     for(int r=0;r<c->rn;r++)c->logits[r]=dot(c->head+(size_t)r*H,c->x,H);in.value=-INFINITY;in.index=-1;for(int r=0;r<c->rn;r++){int id=c->r0+r;if(c->logits[r]>in.value||(c->logits[r]==in.value&&id<in.index)){in.value=c->logits[r];in.index=id;}}double t2=MPI_Wtime();int rc=MPI_Allreduce(&in,&best,1,MPI_FLOAT_INT,MPI_MAXLOC,MPI_COMM_WORLD);double t3=MPI_Wtime();c->phase[0]=t1-t0;c->phase[1]=t2-t1;c->phase[2]=t3-t2;*token=best.index;*value=best.value;return rc==MPI_SUCCESS?0:-1;}
-int glm53f_target_head_argmax_batch_12n(glm53f_target_head_context_12n*c,const float*streams,int tokens,int*token,float*value){if(!c||!streams||!token||!value||tokens<1||tokens>5)return-1;struct pair{float value;int index;}in[5],best[5];double t0=MPI_Wtime();for(int t=0;t<tokens;t++){double ss=0;float*h=c->hidden+(size_t)t*H,*z=c->x+(size_t)t*H;const float*s=streams+(size_t)t*HC*H;
+int glm53f_target_head_argmax_batch_12n(glm53f_target_head_context_12n*c,const float*streams,int tokens,int*token,float*value){if(!c||!streams||!token||!value||tokens<1||tokens>5)return-1;struct pair{float value;int index;}in[5],best[5];double t0=MPI_Wtime();float invs[5];for(int t=0;t<tokens;t++){double ss=0;float*h=c->hidden+(size_t)t*H,*z=c->x+(size_t)t*H;const float*s=streams+(size_t)t*HC*H;
 #pragma omp parallel for reduction(+:ss)
-        for(int i=0;i<H;i++){float v=0;for(int q=0;q<HC;q++)v+=s[(size_t)q*H+i];h[i]=v/HC;ss+=(double)h[i]*h[i];}float inv=1/sqrtf((float)(ss/H)+1e-5f);
+        for(int i=0;i<H;i++){float v=0;for(int q=0;q<HC;q++)v+=s[(size_t)q*H+i];h[i]=v/HC;ss+=(double)h[i]*h[i];}invs[t]=1/sqrtf((float)(ss/H)+1e-5f);}
+    /* Projection is independent across verification positions; flatten it
+     * into one team to avoid a second fork/join per token. */
 #pragma omp parallel for schedule(static)
-        for(int i=0;i<H;i++)z[i]=h[i]*inv*glm53f_bf16_to_f32(c->norm[i]);}double t1=MPI_Wtime();int n=tokens<5?tokens:4;glm53f_mv_bf16_batch(c->logits,c->head,c->x,n,c->rn,H);if(tokens==5){float*z=c->x+(size_t)4*H,*l=c->logits+(size_t)4*c->rn;
+    for(int k=0;k<tokens*H;k++){int t=k/H,i=k%H;float*h=c->hidden+(size_t)t*H,*z=c->x+(size_t)t*H;z[i]=h[i]*invs[t]*glm53f_bf16_to_f32(c->norm[i]);}
+    double t1=MPI_Wtime();int n=tokens<5?tokens:4;glm53f_mv_bf16_batch(c->logits,c->head,c->x,n,c->rn,H);if(tokens==5){float*z=c->x+(size_t)4*H,*l=c->logits+(size_t)4*c->rn;
 #pragma omp parallel for schedule(static)
         for(int r=0;r<c->rn;r++)l[r]=dot(c->head+(size_t)r*H,z,H);}for(int t=0;t<tokens;t++){float*l=c->logits+(size_t)t*c->rn;in[t].value=-INFINITY;in[t].index=-1;for(int r=0;r<c->rn;r++){int id=c->r0+r;if(l[r]>in[t].value||(l[r]==in[t].value&&id<in[t].index)){in[t].value=l[r];in[t].index=id;}}}double t2=MPI_Wtime();int rc=MPI_Allreduce(in,best,tokens,MPI_FLOAT_INT,MPI_MAXLOC,MPI_COMM_WORLD);double t3=MPI_Wtime();for(int t=0;t<tokens;t++){token[t]=best[t].index;value[t]=best[t].value;}c->phase[0]=t1-t0;c->phase[1]=t2-t1;c->phase[2]=t3-t2;return rc==MPI_SUCCESS?0:-1;}
 void glm53f_target_head_last_phase_12n(const glm53f_target_head_context_12n*c,double p[3]){memcpy(p,c->phase,sizeof(c->phase));}
