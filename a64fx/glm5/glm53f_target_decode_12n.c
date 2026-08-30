@@ -412,7 +412,11 @@ int main(int argc, char **argv) {
         if(!rank)printf("GLM53F_TARGET_TOKEN step=%d token=%d logit=%.9g\n",step,token,value);
     }
     double elapsed=MPI_Wtime()-begin,max_elapsed;MPI_Reduce(&elapsed,&max_elapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
-    if(!rank)printf("GLM53F_TARGET_DECODE_12N steps=%d capacity=%d ms_tok=%.3f tok_s=%.3f final_token=%d PASS\n",steps,capacity,max_elapsed*1e3/steps,steps/max_elapsed,token);
+    if(!rank){
+        printf("GLM53F_TARGET_DECODE_12N steps=%d capacity=%d ms_tok=%.3f tok_s=%.3f final_token=%d PASS\n",steps,capacity,max_elapsed*1e3/steps,steps/max_elapsed,token);
+        const char *report=getenv("GLM53F_TARGET_REPORT");
+        if(report&&*report){FILE *rf=fopen(report,"w");if(rf){fprintf(rf,"GLM53F_TARGET_DECODE_12N steps=%d capacity=%d ms_tok=%.3f tok_s=%.3f final_token=%d PASS\n",steps,capacity,max_elapsed*1e3/steps,steps/max_elapsed,token);fclose(rf);}}
+    }
     glm53f_target_profile_report_12n(model,"decode");
     glm53f_target_model_free_12n(model);glm53f_collective_free_12n();
     MPI_Finalize();return 0;
