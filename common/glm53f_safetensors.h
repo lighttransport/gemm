@@ -90,7 +90,10 @@ static int glm53f_st_repack_read(const char *kind, const char *name,
         strict = getenv("GLM53F_REPACK_REQUIRE") != NULL;
         if (snprintf(manifest, sizeof(manifest), "%s/rank%02d.core.manifest", dir, rank) >= (int)sizeof(manifest) ||
             snprintf(blob, sizeof(blob), "%s/rank%02d.core.blob", dir, rank) >= (int)sizeof(blob) ||
-            !(f = fopen(manifest, "r"))) { initialized = 1; return strict ? -1 : 1; }
+            !(f = fopen(manifest, "r"))) {
+            if (strict) fprintf(stderr, "GLM53F_REPACK_OPEN_FAIL rank=%d dir=%s\n", rank, dir);
+            initialized = 1; return strict ? -1 : 1;
+        }
         while (fgets(line, sizeof(line), f)) {
             glm53f_st_repack_entry e = {0};
             unsigned long long off;
@@ -111,13 +114,18 @@ static int glm53f_st_repack_read(const char *kind, const char *name,
         fclose(f);
         fd = open(blob, O_RDONLY);
         initialized = 1;
-        if (fd < 0) return strict ? -1 : 1;
+        if (fd < 0) {
+            if (strict) fprintf(stderr, "GLM53F_REPACK_BLOB_FAIL rank=%d path=%s\n", rank, blob);
+            return strict ? -1 : 1;
+        }
     }
     for (int i = 0; i < nentries; ++i) {
         glm53f_st_repack_entry *e = &entries[i];
         if (e->kind == kind[0] && e->a == a && e->b == b && e->c == c && !strcmp(e->name, name))
             return pread(fd, dst, nbytes, (off_t)e->blob_offset) == (ssize_t)nbytes ? 0 : -1;
     }
+    if (strict) fprintf(stderr, "GLM53F_REPACK_MISS kind=%s name=%s a=%zu b=%zu c=%zu\n",
+                        kind, name, a, b, c);
     return strict ? -1 : 1;
 }
 
