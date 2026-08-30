@@ -20,6 +20,7 @@
 typedef struct {
     char *name;
     st_context *st;
+    int fd;
 } glm53f_st_shard;
 
 typedef struct {
@@ -40,6 +41,7 @@ glm53f_st_context *glm53f_st_open(const char *model_dir);
 void glm53f_st_close(glm53f_st_context *ctx);
 const st_tensor_info *glm53f_st_find(const glm53f_st_context *ctx, const char *name,
                                      const st_context **owner);
+int glm53f_st_physical_shard(const glm53f_st_context *ctx, const char *name);
 int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose);
 
 /* Validate one role before binding it to a graph buffer.  Shapes are in
@@ -52,9 +54,12 @@ int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
 
 #ifdef GLM53F_SAFETENSORS_IMPLEMENTATION
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static char *glm53f_st_dup(const char *s) {
     size_t n = strlen(s) + 1;
@@ -88,6 +93,7 @@ static int glm53f_st_shard_id(glm53f_st_context *ctx, const char *name) {
 
 static int glm53f_st_add_shard(glm53f_st_context *ctx, const char *dir, const char *name) {
     char path[4096];
+    const char *payload_dir;
     int id = glm53f_st_shard_id(ctx, name);
     if (id >= 0) return id;
     id = ctx->n_shards++;
@@ -95,6 +101,8 @@ static int glm53f_st_add_shard(glm53f_st_context *ctx, const char *dir, const ch
                                              (size_t)ctx->n_shards * sizeof(*ctx->shards));
     if (!ctx->shards) return -1;
     ctx->shards[id].name = glm53f_st_dup(name);
+    ctx->shards[id].st = NULL;
+    ctx->shards[id].fd = -1;
     if (!ctx->shards[id].name) return -1;
     if (snprintf(path, sizeof(path), "%s/%s", dir, name) >= (int)sizeof(path)) return -1;
     /* Metadata-only open is essential here: the 62 payloads are far larger
@@ -102,6 +110,11 @@ static int glm53f_st_add_shard(glm53f_st_context *ctx, const char *dir, const ch
      * loader can reopen an owned shard with safetensors_open when needed. */
     ctx->shards[id].st = safetensors_open_header(path);
     if (!ctx->shards[id].st) return -1;
+    payload_dir = getenv("GLM53F_ST_PAYLOAD_DIR");
+    if (!payload_dir || !*payload_dir) payload_dir = dir;
+    if (snprintf(path, sizeof(path), "%s/%s", payload_dir, name) >= (int)sizeof(path)) return -1;
+    ctx->shards[id].fd = open(path, O_RDONLY);
+    if (ctx->shards[id].fd < 0) return -1;
     return id;
 }
 
@@ -147,6 +160,7 @@ void glm53f_st_close(glm53f_st_context *ctx) {
     if (!ctx) return;
     for (i = 0; i < ctx->n_entries; ++i) free(ctx->entries[i].name);
     for (i = 0; i < ctx->n_shards; ++i) {
+        if (ctx->shards[i].fd >= 0) close(ctx->shards[i].fd);
         free(ctx->shards[i].name);
         safetensors_close(ctx->shards[i].st);
     }
@@ -166,6 +180,8 @@ const st_tensor_info *glm53f_st_find(const glm53f_st_context *ctx, const char *n
     return NULL;
 }
 
+int glm53f_st_physical_shard(const glm53f_st_context *ctx,const char*name){if(!ctx||!name)return -1;for(int i=0;i<ctx->n_entries;++i)if(!strcmp(ctx->entries[i].name,name))return ctx->entries[i].shard;return -1;}
+
 int glm53f_st_expect(const glm53f_st_context *ctx, const char *name,
                      const char *dtype, int n_dims, const uint64_t *shape) {
     const st_tensor_info *t = glm53f_st_find(ctx, name, NULL);
@@ -180,16 +196,23 @@ int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
     const st_context *owner = NULL;
     const st_tensor_info *t = glm53f_st_find(ctx, name, &owner);
     int i, fd, rc = -1;
-    char path[4096];
     if (!t || !owner || offset > t->nbytes || nbytes > t->nbytes - offset || !dst) return -1;
     for (i = 0; i < ctx->n_shards; ++i) if (ctx->shards[i].st == owner) break;
-    if (i == ctx->n_shards || snprintf(path, sizeof(path), "%s/%s", ctx->model_dir,
-                                        ctx->shards[i].name) >= (int)sizeof(path)) return -1;
-    fd = open(path, O_RDONLY);
+    if (i == ctx->n_shards) return -1;
+    fd = ctx->shards[i].fd;
     if (fd < 0) return -1;
-    if (pread(fd, dst, nbytes, (off_t)(owner->data_offset + t->offset + offset)) == (ssize_t)nbytes)
-        rc = 0;
-    close(fd);
+    off_t file_offset=(off_t)(owner->data_offset+t->offset+offset);
+    size_t done=0;
+    while(done<nbytes){
+        const size_t max_chunk=64U*1024U*1024U;
+        size_t chunk=nbytes-done<max_chunk?nbytes-done:max_chunk;
+        ssize_t got=pread(fd,(unsigned char*)dst+done,chunk,file_offset+(off_t)done);
+        if(got<0&&errno==EINTR)continue;
+        if(got<=0)break;
+        (void)posix_fadvise(fd,file_offset+(off_t)done,(off_t)got,POSIX_FADV_DONTNEED);
+        done+=(size_t)got;
+    }
+    if(done==nbytes)rc=0;
     return rc;
 }
 

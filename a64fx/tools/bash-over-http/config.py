@@ -116,7 +116,7 @@ def environment(config):
     for name in ("PROJECT_ID", "RSCGRP", "NODES", "ELAPSE", "A64FX_MODE",
                  "GFSCACHE", "LOCALTMP_SIZE", "MAX_RETRY",
                  "MONITOR_INTERVAL", "HEALTH_EVERY", "KEEPALIVE_SECONDS",
-                 "WAIT_TIME"):
+                 "WAIT_TIME", "PORT_OFFSET"):
         put(name, "job", name.lower())
     return values
 

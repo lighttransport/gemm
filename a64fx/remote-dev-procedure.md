@@ -45,7 +45,8 @@ select an explicit file. Environment variables such as `REMOTE` and
 `LOCAL_PORT` still override JSON settings.
 
 The JSON template covers the local checkout and port, SSH hostname, remote
-checkout and forwarded port, server bind/port, and PJM job settings. For
+checkout and forwarded port, server bind/port, optional model storage paths,
+and PJM job settings. For
 example, project-specific connection settings can be kept in:
 
 ```json
@@ -57,7 +58,12 @@ example, project-specific connection settings can be kept in:
     "port": 32386,
     "dir": "$HOME/work/gemm/glm53f"
   },
-  "server": { "host": "127.0.0.1", "port": 21264 }
+  "server": { "host": "127.0.0.1", "port": 21264 },
+  "storage": {
+    "model_dir": "$HOME/models/q38fn/bf16",
+    "local_dir": "/local/q38fn",
+    "staging": "cp"
+  }
 }
 ```
 
@@ -202,6 +208,11 @@ single hostname: commas in `pjsub -x` values are interpreted as separators.
 
 ## Run an interactive job (maximum six hours)
 
+Interactive allocations are limited by Fugaku's `int` resource group to at
+most **06:00:00**. A 12-hour allocation must use the batch launcher instead;
+`run_bash_http_interactive.sh` rejects any larger `ELAPSE` value before it
+contacts `pjsub`.
+
 Use the interactive launcher when the batch `small` queue is delayed. It asks
 the `int` resource group for an immediately usable allocation and waits at most
 600 seconds; it does not leave a queued batch job behind after that wait
@@ -252,6 +263,81 @@ tail -f "$state_dir/interactive.log"
 Only one bridge may own a given login-node port. Do not overlap interactive
 and batch bridges on port 32386. Wait for one to end, cancel it, or give the
 second bridge a different matching `REMOTE_PORT` and `FRONTEND_PORT`.
+
+### Concurrent bash-over-HTTP jobs
+
+Every bridge needs a unique port on the login node. Use `PORT_OFFSET` to
+increment both ends of the configured port pair together:
+
+```bash
+# Job 0: local 42386 -> login1:32386 (the configured default)
+# Job 1: local 42387 -> login1:32387
+PORT_OFFSET=1 LOCAL_PORT=42386 REMOTE_PORT=32386 \
+  a64fx/tools/bash-over-http/open_local_tunnel.sh
+PORT_OFFSET=1 NODES=4 ELAPSE=06:00:00 WAIT_TIME=600 \
+  a64fx/tools/bash-over-http/run_bash_http_interactive.sh
+```
+
+The launcher computes `local_port = configured_local_port + PORT_OFFSET` and
+`reverse_port = configured_remote_port + PORT_OFFSET`. Use the same offset for
+`open_local_tunnel.sh` and the job submitter, and use a separate
+`CONTROL_DIR` for each concurrent local tunnel. For example, use offsets 0,
+1, and 2 for three jobs. Do not reuse an offset until its job and tunnel have
+terminated.
+
+The interactive procedure is:
+
+1. Choose an unused port offset and a per-job control directory.
+2. Open the matching local forward with `open_local_tunnel.sh`.
+3. Submit the interactive job, for example:
+
+   ```bash
+   PORT_OFFSET=1 CONTROL_DIR=tmp/bash-http-4n \
+     NODES=4 ELAPSE=06:00:00 WAIT_TIME=600 \
+     a64fx/tools/bash-over-http/run_bash_http_interactive.sh
+   ```
+
+   Keep this command attached (or run it in `tmux`). It waits up to 600
+   seconds for the allocation and then keeps the reverse tunnel and server
+   alive for the job lifetime.
+4. Verify `http://127.0.0.1:$((42386 + PORT_OFFSET))/health` locally, then use
+   that port for the client.
+
+Interactive jobs are limited to six hours; a 12-hour job must use the batch
+launcher. Both launchers pass the selected reverse port to the compute-side
+supervisor.
+
+## Stage model data inside the A64FX allocation
+
+Fugaku shared storage is visible from the compute node, so model data does not
+need to pass through bash-over-HTTP or be copied from the local workstation.
+The `storage` configuration records the shared source and `/local` destination;
+it is workload metadata, not a bridge transfer mechanism. Stage data from
+inside the running allocation with `cp`:
+
+```bash
+MODEL_DIR="$HOME/models/q38fn/bf16"
+LOCAL_DIR=/local/q38fn
+mkdir -p "$LOCAL_DIR"
+cp "$MODEL_DIR/model-00005-of-00131.safetensors" "$LOCAL_DIR/"
+```
+
+Use one shard or other bounded subset appropriate for the experiment. Check
+`df -h /local` before copying; `/local` is allocation-local and is wiped when
+the job ends. For the Qwen3.8 Flash n-gram probe, the copied shard contains an
+800 MB n-gram tensor even though the complete safetensor shard is larger. The
+probe then reads that tensor from `$LOCAL_DIR` into resident A64FX memory for
+the HBM lookup benchmark. Do not use the local deployment `rsync` commands to
+transfer model weights.
+
+For the Q38FN tensor-parallel runner, stage logical tensor ranges directly
+with `q38fn_tp_stage_mpi` instead of copying whole safetensor files. A full
+12-rank shared-filesystem pass can exceed bash-over-HTTP's default five-minute
+request timeout. The stager records every completed tensor in
+`tp12-v*.manifest.partial`; rerunning the same command validates that prefix,
+truncates an interrupted tensor tail, and resumes without rereading committed
+tensors. Use a long request timeout for the initial run, while retaining the
+partial files if a retry is necessary.
 
 The interactive stdin path is protected by `ssh -n` on all nested
 compute-to-login SSH calls, so health probes cannot consume the remainder of

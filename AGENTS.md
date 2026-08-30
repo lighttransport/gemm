@@ -35,6 +35,11 @@ workflow. The canonical bridge scripts are in
 or user-global `${XDG_CONFIG_HOME:-$HOME/.config}/bash-over-http/setup.json`
 for connection defaults.
 
+For Qwen3.8-Flash-Next bring-up, use [q38fn/README.md](q38fn/README.md).
+Do not replicate its 51B BF16 PLE n-gram table: shard it across nodes and use
+the documented row-scaled INT8 HBM representation. Run the bounded validator
+and `q38fn/ngram_probe.c` before attempting multi-node inference.
+
 ## Coding Style & Naming Conventions
 - Languages: C, C++, and architecture-specific `.S` assembly.
 - Use 4-space indentation and keep brace/style conventions consistent with nearby files.

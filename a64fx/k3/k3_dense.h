@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include <math.h>
 #include <stdlib.h>
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
@@ -418,6 +421,59 @@ static inline void k3_matvec_q8(float *out, const k3_q8_matrix *m,
     k3_matvec_q8_bias(out,m,x,qx,NULL,threads);
 }
 
+/* Decode-oriented eight-row schedule. It trades some activation reuse for a
+ * spill-free accumulator set on A64FX, where the 16/24-row variants can put
+ * SVE accumulators on the stack. */
+static inline void k3_matvec_q8_8(float *out, const k3_q8_matrix *m,
+                                  const float *x, int8_t *qx, int threads) {
+    float xs = k3_q8_quantize_vector(qx, x, m->cols);
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#else
+    (void)threads;
+#endif
+    for (int row = 0; row < m->rows; row += 8) {
+        int32_t dot[8];
+        k3_q8_dot8(dot, m->weight + (size_t)row * m->cols, qx, m->cols);
+        int count = m->rows - row < 8 ? m->rows - row : 8;
+        for (int lane = 0; lane < count; ++lane)
+            out[row + lane] = (float)dot[lane] * m->scale[row + lane] * xs;
+    }
+}
+
+static inline void k3_q8_dot4(int32_t out[4], const int8_t *w,
+                               const int8_t *x, int n) {
+#if defined(__ARM_FEATURE_SVE)
+    svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0;
+    svbool_t pg=svptrue_b8(),pg32=svptrue_b32();int vl=(int)svcntb();
+    for(int i=0;i<n;i+=vl){svint8_t xv=svld1_s8(pg,x+i);
+        a0=svdot_s32(a0,svld1_s8(pg,w+(size_t)0*n+i),xv);
+        a1=svdot_s32(a1,svld1_s8(pg,w+(size_t)1*n+i),xv);
+        a2=svdot_s32(a2,svld1_s8(pg,w+(size_t)2*n+i),xv);
+        a3=svdot_s32(a3,svld1_s8(pg,w+(size_t)3*n+i),xv);}
+    out[0]=svaddv_s32(pg32,a0);out[1]=svaddv_s32(pg32,a1);
+    out[2]=svaddv_s32(pg32,a2);out[3]=svaddv_s32(pg32,a3);
+#else
+    for(int r=0;r<4;r++){int32_t s=0;for(int i=0;i<n;i++)s+=(int32_t)w[(size_t)r*n+i]*x[i];out[r]=s;}
+#endif
+}
+
+static inline void k3_matvec_q8_4(float *out, const k3_q8_matrix *m,
+                                  const float *x, int8_t *qx, int threads) {
+    float xs=k3_q8_quantize_vector(qx,x,m->cols);
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#else
+    (void)threads;
+#endif
+    for(int row=0;row<m->rows;row+=4){int32_t d[4];
+        k3_q8_dot4(d,m->weight+(size_t)row*m->cols,qx,m->cols);
+        int count=m->rows-row<4?m->rows-row:4;
+        for(int i=0;i<count;i++)out[row+i]=(float)d[i]*m->scale[row+i]*xs;}
+}
+
 static inline size_t k3_q8_matrix_bytes(int rows, int cols) {
     return (size_t)rows * cols + (size_t)rows * sizeof(float);
 }
@@ -463,6 +519,92 @@ static inline void k3_matvec_q8p16_bias(float*out,const int8_t*p,const float*sca
 static inline void k3_matvec_q8p16(float*out,const int8_t*p,const float*scale,
         int rows,int cols,const float*x,int8_t*qx,int threads){
     k3_matvec_q8p16_bias(out,p,scale,rows,cols,x,qx,NULL,threads);
+}
+
+/* Eight-row variant of the block-packed format.  Eight accumulators fit
+ * comfortably in registers while each 8x64 block remains one contiguous
+ * 512-byte weight stream. */
+static inline void k3_q8p8_quantize_bf16(int8_t *packed, float *scale,
+        const uint16_t *weight, int rows, int cols) {
+    int blocks = cols / 64;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int group = 0; group < rows / 8; ++group) {
+        for (int row_in_group = 0; row_in_group < 8; ++row_in_group) {
+            int row = group * 8 + row_in_group;
+            const uint16_t *source = weight + (size_t)row * cols;
+            float maximum = 0.0f;
+            for (int column = 0; column < cols; ++column)
+                maximum = fmaxf(maximum,
+                    fabsf(bf16_to_f32_scalar(source[column])));
+            float row_scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+            float inverse = 1.0f / row_scale;
+            scale[row] = row_scale;
+            for (int block = 0; block < blocks; ++block) {
+                int8_t *destination = packed +
+                    ((size_t)group * blocks + block) * 512 +
+                    row_in_group * 64;
+                for (int lane = 0; lane < 64; ++lane) {
+                    long value = lrintf(bf16_to_f32_scalar(
+                        source[block * 64 + lane]) * inverse);
+                    destination[lane] = (int8_t)(value < -127 ? -127 :
+                        value > 127 ? 127 : value);
+                }
+            }
+        }
+    }
+}
+
+static inline void k3_q8p8_dot8(int32_t out[8], const int8_t *packed,
+        const int8_t *x, int blocks) {
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b8(), p32 = svptrue_b32();
+    svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
+    for (int block = 0; block < blocks; ++block) {
+        const int8_t *weight = packed + (size_t)block * 512;
+        svint8_t activation = svld1_s8(pg, x + (size_t)block * 64);
+#define K3_Q8P8_ROW(R) a##R=svdot_s32(a##R,svld1_s8(pg,weight+(R)*64),activation)
+        K3_Q8P8_ROW(0); K3_Q8P8_ROW(1); K3_Q8P8_ROW(2); K3_Q8P8_ROW(3);
+        K3_Q8P8_ROW(4); K3_Q8P8_ROW(5); K3_Q8P8_ROW(6); K3_Q8P8_ROW(7);
+#undef K3_Q8P8_ROW
+    }
+#define K3_Q8P8_SUM(R) out[R]=svaddv_s32(p32,a##R)
+    K3_Q8P8_SUM(0); K3_Q8P8_SUM(1); K3_Q8P8_SUM(2); K3_Q8P8_SUM(3);
+    K3_Q8P8_SUM(4); K3_Q8P8_SUM(5); K3_Q8P8_SUM(6); K3_Q8P8_SUM(7);
+#undef K3_Q8P8_SUM
+#else
+    for (int row = 0; row < 8; ++row) {
+        int32_t sum = 0;
+        for (int block = 0; block < blocks; ++block)
+            for (int lane = 0; lane < 64; ++lane)
+                sum += packed[((size_t)block * 8 + row) * 64 + lane] *
+                    x[block * 64 + lane];
+        out[row] = sum;
+    }
+#endif
+}
+
+static inline void k3_matvec_q8p8(float *out, const int8_t *packed,
+        const float *scale, int rows, int cols, const float *x, int8_t *qx,
+        int threads) {
+    float activation_scale = k3_q8_quantize_vector(qx, x, cols);
+    int blocks = cols / 64;
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#else
+    (void)threads;
+#endif
+    for (int group = 0; group < rows / 8; ++group) {
+        int32_t dot[8];
+        k3_q8p8_dot8(dot, packed + (size_t)group * blocks * 512, qx,
+                     blocks);
+        for (int lane = 0; lane < 8; ++lane) {
+            int row = group * 8 + lane;
+            out[row] = (float)dot[lane] * scale[row] * activation_scale;
+        }
+    }
 }
 
 /* Decode KDA has five matrices with the same activation.  Quantize that

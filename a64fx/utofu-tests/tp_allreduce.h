@@ -421,7 +421,7 @@ static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
     int N = c->nprocs, me = c->my_rank;
     char *sb = c->region + tp_ar_slot_off(c, 0);            /* reuse the send slot */
     size_t pbytes = (size_t)count * sizeof(float);
-    size_t tr = (size_t)c->a2a_max * sizeof(float);         /* a2a slots' fixed trailer offset */
+    size_t tr = pbytes;                                    /* trailer follows this payload */
     memcpy(sb, buf, pbytes);
     *(volatile uint64_t *)(sb + tr) = tok;                  /* fits: a2a_max <= max_count */
     int gen = (int)(tok & 1);
@@ -430,8 +430,10 @@ static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
         int peer = (me + d) % N;
         utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
         utofu_stadd_t dst = c->peer_base[peer] + c->a2a_base + ((size_t)gen * N + me) * c->a2a_slot;
-        inflight += tp_ar_put_nb(c, peer, src, dst, pbytes);           /* payload */
-        inflight += tp_ar_put_nb(c, peer, src + tr, dst + tr, 8);      /* then trailer (in-order per pair) */
+        /* Payload and generation token share one Put.  uTofu completion of
+         * the trailing token therefore proves the payload is visible too,
+         * while halving decode-size injection and TCQ operations. */
+        inflight += tp_ar_put_nb(c, peer, src, dst, pbytes + 8);
     }
     while (inflight > 0) {                                   /* reap local completions */
         rc = utofu_poll_tcq(c->vcq, 0, &cb);

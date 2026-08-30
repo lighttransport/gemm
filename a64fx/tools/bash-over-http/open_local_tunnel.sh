@@ -12,6 +12,12 @@ case "$LOGIN_NODE" in [1-8]) ;; *) echo "LOGIN_NODE must be 1..8 (got '$LOGIN_NO
 REMOTE=${REMOTE:-${BASH_HTTP_REMOTE:-fugaku1}}
 LOCAL_PORT=${LOCAL_PORT:-${BASH_HTTP_LOCAL_PORT:-42386}}
 REMOTE_PORT=${REMOTE_PORT:-${BASH_HTTP_REMOTE_PORT:-32386}}
+PORT_OFFSET=${PORT_OFFSET:-${BASH_HTTP_PORT_OFFSET:-0}}
+case "$PORT_OFFSET" in
+    ''|*[!0-9]*) echo "PORT_OFFSET must be a non-negative integer" >&2; exit 2 ;;
+esac
+LOCAL_PORT=$((LOCAL_PORT + PORT_OFFSET))
+REMOTE_PORT=$((REMOTE_PORT + PORT_OFFSET))
 if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
     CONTROL_ROOT=$XDG_RUNTIME_DIR
 elif [[ -d /local ]]; then
@@ -19,7 +25,16 @@ elif [[ -d /local ]]; then
 else
     CONTROL_ROOT=tmp
 fi
-CONTROL_DIR=${CONTROL_DIR:-${BASH_HTTP_CONTROL_DIR:-$CONTROL_ROOT/clair-bash-http-${USER}}}
+if [[ -n "${CONTROL_DIR:-}" || -n "${BASH_HTTP_CONTROL_DIR:-}" ]]; then
+    CONTROL_DIR=${CONTROL_DIR:-$BASH_HTTP_CONTROL_DIR}
+else
+    CONTROL_DIR=$CONTROL_ROOT/clair-bash-http-${USER}
+    # Each offset needs its own ControlMaster: an existing master cannot
+    # acquire a new -L listener after it has been created.
+    if (( PORT_OFFSET > 0 )); then
+        CONTROL_DIR=${CONTROL_DIR}-port-$((LOCAL_PORT))
+    fi
+fi
 CONTROL_PATH=${CONTROL_PATH:-$CONTROL_DIR/cm-%r@%h:%p}
 STATE_FILE=${STATE_FILE:-$CONTROL_DIR/state.env}
 

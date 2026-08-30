@@ -16,8 +16,16 @@
 set -uo pipefail   # not -e: the supervisor loop relies on non-zero returns
 umask 077
 
-HERE=$(cd "$(dirname "$0")" && pwd)
-REPO_ROOT=$(cd "$HERE/../../.." && pwd)
+if [[ "$0" == -* || "$0" == "bash" || "$0" == "sh" ]]; then
+    # `pjsub --interact < script` supplies the script on stdin, so `$0` is
+    # not a filesystem path.  WORKDIR is passed by the submit wrapper and is
+    # the authoritative remote checkout in that mode.
+    REPO_ROOT=${WORKDIR:-${PJM_SUBMIT_DIR:-$HOME/work/gemm/glm53f}}
+    HERE=$REPO_ROOT/a64fx/tools/bash-over-http
+else
+    HERE=$(cd "$(dirname "$0")" && pwd)
+    REPO_ROOT=$(cd "$HERE/../../.." && pwd)
+fi
 eval "$(python3 "$HERE/config.py" --project-dir "$REPO_ROOT" --shell)"
 
 # Frontend to reverse-tunnel back to. LOGIN_NODE (1..8) -> loginN.fugaku.r-ccs.riken.jp;
