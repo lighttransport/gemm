@@ -94,10 +94,8 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     for(int h=0;h<hn;h++)glm53f_rmsnorm_gated_bf16(c->normed+(size_t)h*D,c->core+(size_t)h*D,c->gate+(size_t)h*D,w->on,1,D,1e-5f);
     if(c->detail_profile)c->detail[4]=MPI_Wtime()-td;
     double t1=MPI_Wtime();
-    /* Output projection has thousands of independent rows.  Reuse the
-     * eight-row SVE kernel so each worker performs eight reductions per loop
-     * assignment instead of paying one OpenMP iteration per row. */
-    mv(out,w->op,c->normed,H,qd);
+#pragma omp parallel for schedule(static)
+    for(int r=0;r<H;r++)out[r]=dot1(w->op+(size_t)r*qd,c->normed,qd);
     double t2=MPI_Wtime();c->phase[0]=t1-t0;c->phase[1]=t2-t1;c->phase[2]=0;return 0;
 }
 int glm53f_kda_sublayer_12n(void*context,float*out,const float*x){glm53f_kda_context_12n*c=context;if(!c||kda_local(c,c->partial,x))return-1;double t=MPI_Wtime();int rc=glm53f_sum_allreduce_12n(c->partial,out,H);c->phase[2]=MPI_Wtime()-t;return rc;}
