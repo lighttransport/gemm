@@ -226,7 +226,7 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
                                        float *logit, float *hidden,
                                        glm53f_target_snapshot_12n **after) {
     double begin = m && m->profile ? MPI_Wtime() : 0.0;
-    if (!m || !input || !next || !logit || tokens < 1 || tokens > 5)
+    if (!m || !input || (!next != !logit) || tokens < 1 || tokens > 5)
         return -1;
     for (int t = 0; t < tokens; t++)
         if (glm53f_embedding_streams_12n(m->embedding, input[t],
@@ -327,8 +327,8 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
             hidden[(size_t)t * HIDDEN + i] = z / STREAMS;
         }
     }
-    int rc = glm53f_target_head_argmax_batch_12n(
-        m->head, m->batch_streams, tokens, next, logit);
+    int rc = next ? glm53f_target_head_argmax_batch_12n(
+        m->head, m->batch_streams, tokens, next, logit) : 0;
     if (m->profile) {
         m->batch_phase[4] += MPI_Wtime() - begin;
         m->batch_calls++;
