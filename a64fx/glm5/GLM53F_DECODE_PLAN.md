@@ -356,6 +356,20 @@ not by the collective implementation.  An integrated target decode using this
 path is running on job 51094320; its greedy-exact and end-to-end timing result
 must be recorded before enabling ToFu by default.
 
+Scalar (4096-float) callback measurements further isolate the benefit: ToFu
+reduces the layer-44 all-reduce from 1.163 ms (MPI) to 0.271 ms while remaining
+bit-exact.  A paired 16-token integrated run is also greedy-exact (`final_token`
+432): ToFu measured 15.637 tok/s and MPI 15.581 tok/s.  This small 0.36% delta
+is within run variance, so ToFu remains an explicit opt-in pending repeated
+long-run measurements; the strict MPI path remains the deployment baseline.
+
+An opt-in 2-D ToFu hierarchy (`GLM53F_UTOFU_2D=1`, two groups of six ranks)
+was then tested. It is exact and lowers isolated scalar KDA reduction to
+0.180 ms, but the five-token callback reduction is unchanged at 0.248 ms and
+the integrated 16-token target is slower at **15.374 tok/s** (final token 432).
+The extra row/column synchronization outweighs the microbenchmark win, so the
+2-D mode remains disabled and the flat MPI path remains the deployment default.
+
 An MLA head-dimension parallelization experiment (commit `58dee7e5`) preserved
 the exact token stream but regressed the 12-node target to **17.624 tok/s**
 (56.742 ms/token); attention rose to 25.084 ms/token. The additional OpenMP

@@ -11,8 +11,10 @@
 
 enum { GLM53F_COLLECTIVE_MAX_NODES = 32 };
 static tp_comm glm53f_comm;
+static tp_comm glm53f_comm_row, glm53f_comm_col;
 static utofu_vcq_hdl_t glm53f_vcq;
 static int glm53f_utofu_active;
+static int glm53f_utofu_2d;
 
 static void glm53f_mpi_barrier(void) { MPI_Barrier(MPI_COMM_WORLD); }
 
@@ -88,8 +90,19 @@ int glm53f_collective_init_12n(const char *path, int max_count) {
         }
         utofu_set_vcq_id_path(&peers[r], NULL);
     }
-    if (tp_comm_init(&glm53f_comm, glm53f_vcq, peers, rank, ranks,
-                     max_count, glm53f_mpi_barrier)) {
+    if (getenv("GLM53F_UTOFU_2D")) {
+        /* A=2 maps rank groups onto the allocation's 2x3x2 shape: six
+         * contiguous ranks in each row group, then two group siblings. */
+        if (tp_comm_init_2d(&glm53f_comm_row, &glm53f_comm_col,
+                            glm53f_vcq, peers, rank, ranks, 2, max_count,
+                            glm53f_mpi_barrier)) {
+            if (getenv("GLM53F_UTOFU_DEBUG"))
+                fprintf(stderr, "GLM53F_UTOFU tp_comm_init_2d failed rank=%d\n", rank);
+            return -1;
+        }
+        glm53f_utofu_2d = 1;
+    } else if (tp_comm_init(&glm53f_comm, glm53f_vcq, peers, rank, ranks,
+                            max_count, glm53f_mpi_barrier)) {
         if (getenv("GLM53F_UTOFU_DEBUG")) fprintf(stderr, "GLM53F_UTOFU tp_comm_init failed rank=%d\n", rank);
         return -1;
     }
@@ -100,7 +113,13 @@ int glm53f_collective_init_12n(const char *path, int max_count) {
 
 void glm53f_collective_free_12n(void) {
     if (!glm53f_utofu_active) return;
-    tp_comm_free(&glm53f_comm);
+    if (glm53f_utofu_2d) {
+        tp_comm_free(&glm53f_comm_col);
+        tp_comm_free(&glm53f_comm_row);
+        glm53f_utofu_2d = 0;
+    } else {
+        tp_comm_free(&glm53f_comm);
+    }
     utofu_free_vcq(glm53f_vcq);
     glm53f_utofu_active = 0;
 }
@@ -143,6 +162,9 @@ int glm53f_sum_allreduce_12n(const float *input, float *output, int count) {
                              MPI_COMM_WORLD) == MPI_SUCCESS ? 0 : -1;
     }
     if (input != output) memcpy(output, input, (size_t)count * sizeof(float));
-    tp_allreduce_sum(&glm53f_comm, output, count);
+    if (glm53f_utofu_2d)
+        tp_allreduce_sum_2d(&glm53f_comm_row, &glm53f_comm_col, output, count);
+    else
+        tp_allreduce_sum(&glm53f_comm, output, count);
     return 0;
 }
