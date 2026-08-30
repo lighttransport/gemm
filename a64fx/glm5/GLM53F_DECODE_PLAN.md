@@ -497,3 +497,11 @@ tok/s** for 16 tokens and **16.460 tok/s** for 32 tokens, versus the
 stack-scratch control's 15.705 and 16.591 tok/s.  The short-run uplift did not
 hold at 32 tokens, so the multi-accumulator variant is rejected and the
 single-accumulator default is retained.
+
+The MLA value reconstruction loop was also changed experimentally to keep one
+SVE accumulator per latent-dimension chunk instead of reloading/storing the
+accumulator for every selected cache entry.  It remained exact and measured
+**15.843 tok/s** (16 tokens) and **16.597 tok/s** (32 tokens), versus 15.705 and
+16.591 tok/s for the stack-scratch control.  The longer result is effectively
+flat (+0.04%), so this rewrite is rejected; the original token-major loop is
+restored.
