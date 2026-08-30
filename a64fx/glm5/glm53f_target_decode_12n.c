@@ -286,17 +286,19 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
     if (after && state_off != after[0]->kda_bytes)
         return -1;
     begin = m->profile ? MPI_Wtime() : 0.0;
-    for (int t = 0; t < tokens; t++) {
-        float *stream = m->batch_streams + (size_t)t * FLAT;
-        if (hidden) {
-            float *h = hidden + (size_t)t * HIDDEN;
+    /* Reduce all returned hidden states in one OpenMP region.  The previous
+     * per-position parallel regions paid team wake-up/barrier overhead for
+     * every verified token (and made the cost grow discontinuously with the
+     * draft length); the flattened index preserves bit-exact scalar order. */
+    if (hidden) {
 #pragma omp parallel for schedule(static)
-            for (int i = 0; i < HIDDEN; i++) {
-                float z = 0;
-                for (int s = 0; s < STREAMS; s++)
-                    z += stream[(size_t)s * HIDDEN + i];
-                h[i] = z / STREAMS;
-            }
+        for (int k = 0; k < tokens * HIDDEN; k++) {
+            int t = k / HIDDEN, i = k % HIDDEN;
+            const float *stream = m->batch_streams + (size_t)t * FLAT;
+            float z = 0;
+            for (int s = 0; s < STREAMS; s++)
+                z += stream[(size_t)s * HIDDEN + i];
+            hidden[(size_t)t * HIDDEN + i] = z / STREAMS;
         }
     }
     int rc = glm53f_target_head_argmax_batch_12n(
