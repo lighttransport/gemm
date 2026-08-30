@@ -24,6 +24,9 @@ fi
 if [ "${GLM53F_NO_MATH_ERRNO:-0}" = 1 ]; then
     cflags+=(-fno-math-errno)
 fi
+if [ "${GLM53F_MHC_FUSED:-0}" = 1 ]; then
+    cflags+=(-DGLM53F_MHC_FUSED=1)
+fi
 ldflags=(-L"$mpi_lib" -lmpi -lm -ltofucom)
 external=(-DGLM53F_EXTERNAL_ST_IMPLEMENTATION)
 
