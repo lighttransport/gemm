@@ -467,3 +467,10 @@ A combined `GLM53F_MHC_FUSED=1 GLM53F_MHC_POST_FLOAT=1` build was also
 greedy-exact (`final_token=432 PASS`) but measured **14.612 tok/s** for 16
 tokens. This is below the post-float-only result (14.987 tok/s), so the fused
 pre-step is rejected in combination as well.
+
+A second independent 16-token post-float run on allocation 51098702 measured
+**14.930 tok/s** (`final_token=432 PASS`), versus **14.987 tok/s** on the first
+run. Both remain exact; the 0.4% spread confirms that the apparent post-float
+gain over the same-allocation strict control is within normal A64FX variance.
+Keep `GLM53F_MHC_POST_FLOAT=1` opt-in/diagnostic rather than changing the
+default build.
