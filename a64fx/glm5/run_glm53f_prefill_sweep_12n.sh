@@ -13,7 +13,12 @@ log=${GLM53F_PREFILL_LOG:-prefill_sweep_$job.log}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-47}
 export OMP_DYNAMIC=false OMP_WAIT_POLICY=active
 export OMP_PROC_BIND=close OMP_PLACES=cores
-export GLM53F_REPACK_DIR=$core GLM53F_REPACK_REQUIRE=1 GLM53F_PROFILE=1
+export GLM53F_REPACK_DIR=$core
+# Older trace-built core images can omit late-layer tensors.  Missing tensors
+# are read once during construction into their anonymous HBM allocations;
+# steady-state prefill never streams them from shared storage.
+export GLM53F_REPACK_REQUIRE=${GLM53F_REPACK_REQUIRE:-0}
+export GLM53F_PROFILE=1
 
 rm -f tofu_topo.txt
 mpiexec -np 12 ../utofu-tests/tofu_topo_helper
