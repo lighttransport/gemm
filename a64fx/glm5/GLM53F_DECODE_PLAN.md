@@ -436,3 +436,11 @@ The KDA output-projection row-batching experiment (8-row SVE kernel replacing
 callback to 1.003 ms, but the integrated 16-token target measures **15.391
 tok/s** (`final_token=432 PASS`). It therefore does not beat the current
 baseline and remains experimental.
+
+The opt-in `GLM53F_MHC_FUSED=1` implementation (commit `369d986c`) fuses the
+mHC RMS reduction and 24-row BF16 projection into one OpenMP team, removing a
+fork/join from each scalar mHC pre-step. The A64FX callback and full target
+binaries compile successfully; the callback remains bit-exact, but an
+end-to-end decode comparison is pending completion of the fresh allocation's
+node-local expert staging. The validated default (`GLM53F_MHC_FUSED=0`) is
+unchanged until that gate reports a wall-time improvement.
