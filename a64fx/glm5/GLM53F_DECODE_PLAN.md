@@ -498,6 +498,13 @@ stack-scratch control's 15.705 and 16.591 tok/s.  The short-run uplift did not
 hold at 32 tokens, so the multi-accumulator variant is rejected and the
 single-accumulator default is retained.
 
+An arithmetic-neutral latent-cache prefetch was tested next.  It remained
+greedy-exact and measured **16.674 tok/s** for 32 tokens, with an independent
+repeat at **16.610 tok/s** (`final_token=25 PASS` in both), versus the
+16.591 tok/s stack-scratch control.  The ~0.1--0.5% spread is within normal
+A64FX variance, so the prefetch hint is rejected and the original scan is
+restored.
+
 The MLA value reconstruction loop was also changed experimentally to keep one
 SVE accumulator per latent-dimension chunk instead of reloading/storing the
 accumulator for every selected cache entry.  It remained exact and measured
