@@ -39,15 +39,16 @@ static int seen(const request *v, size_t n, const request *r) {
 
 static int copy_out(int fd, uint64_t *offset, const void *src, size_t n) {
     uint64_t aligned = (*offset + 255u) & ~UINT64_C(255);
+    size_t remaining = n;
     if (aligned != *offset && lseek(fd, (off_t)aligned, SEEK_SET) < 0) return -1;
-    *offset = aligned;
     const unsigned char *p = src;
-    while (n) {
-        ssize_t w = write(fd, p, n);
+    while (remaining) {
+        ssize_t w = write(fd, p, remaining);
         if (w < 0) { if (errno == EINTR) continue; return -1; }
         p += w;
-        n -= (size_t)w;
+        remaining -= (size_t)w;
     }
+    *offset = aligned + n;
     return 0;
 }
 
