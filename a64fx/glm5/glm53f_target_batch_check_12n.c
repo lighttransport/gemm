@@ -69,6 +69,17 @@ int main(int argc, char **argv) {
         for (int t = 0; t < TOKENS; t++)
             printf(" token[%d]=%d/%d logit=%.9g/%.9g\n", t, seq[t], bat[t],
                    seq_logit[t], bat_logit[t]);
+        const char *report = getenv("GLM53F_TARGET_BATCH_REPORT");
+        if (report && *report) {
+            FILE *rf = fopen(report, "w");
+            if (rf) {
+                fprintf(rf, "GLM53F_TARGET_BATCH tokens=%d seq_ms=%.3f batch_ms=%.3f speedup=%.3f probe=%d/%d %s\n",
+                        TOKENS, seq_max * 1e3, bat_max * 1e3,
+                        seq_max / bat_max, probe_seq, probe_bat,
+                        ok ? "PASS" : "FAIL");
+                fclose(rf);
+            }
+        }
     }
     for (int t = 0; t < TOKENS; t++) glm53f_target_snapshot_free_12n(after[t]);
     glm53f_target_snapshot_free_12n(seq_final);
