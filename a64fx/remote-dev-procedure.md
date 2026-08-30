@@ -358,23 +358,28 @@ usable.
 Generate a topology file inside every new allocation; topology from a previous
 job must not be reused.  Build the helper and integrated runner through the
 site MPI compiler wrapper so that `mpi.h` and `libmpi` come from the same MPI
-installation.  On the current OSS-CN LLVM environment, `mpiclang` is the
-working wrapper; `mpiFCC` may be present but can be invalid when `OPAL_PREFIX`
-selects another MPI tree.
+installation.  For the Fujitsu compiler/runtime, unload the concurrently
+loaded LLVM module and clear its `OPAL_PREFIX`; otherwise `mpifcc`/`mpiFCC`
+search the LLVM MPI tree for incompatible wrapper-data files.  Use `mpifcc`
+for this C implementation (`mpiFCC` is the corresponding C++ wrapper).
 
 ```bash
 cd ~/work/gemm/glm53f/a64fx/glm5
-make -C ../utofu-tests tofu_topo_helper MPICC=mpiclang
+module unload LLVM/llvmorg-21.1.0
+unset OPAL_PREFIX
+make -C ../utofu-tests tofu_topo_helper MPICC=mpifcc
 rm -f tofu_topo.txt
 mpiexec -np 12 ../utofu-tests/tofu_topo_helper
 test "$(grep -vc '^#' tofu_topo.txt)" -eq 12
 
-GLM53F_MPICC=mpiclang ./build_glm53f_integrated_12n.sh
+GLM53F_MPICC=mpifcc ./build_glm53f_integrated_12n.sh
+ldd ./glm53f_prefill_12n | grep libmpi
 ```
 
-`build_glm53f_integrated_12n.sh` selects `mpiclang` automatically when it is
-available and deliberately does not inject a separate MPI include or library
-path.  It links `libtofucom` explicitly for `GLM53F_UTOFU=1` collectives.
+The final check must resolve `libmpi.so` under the active TCSDS installation,
+not the LLVM module directory.  The build deliberately does not inject a
+separate MPI include or library path and links `libtofucom` explicitly for
+`GLM53F_UTOFU=1` collectives.
 
 Before a full-graph decode, verify that each rank has both first-stage blobs on
 its own `/local` filesystem.  The routed and shared directories are per-node,
