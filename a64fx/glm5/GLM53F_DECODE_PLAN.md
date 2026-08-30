@@ -462,3 +462,8 @@ The same-allocation 32-token strict control then measured **15.694 tok/s**
 (`final_token=25 PASS`) versus **15.756 tok/s** (`final_token=25 PASS`) for
 the float post-mix build, a modest **0.4%** gain. Both streams are exact; the
 float path remains opt-in because this delta is close to observed run variance.
+
+A combined `GLM53F_MHC_FUSED=1 GLM53F_MHC_POST_FLOAT=1` build was also
+greedy-exact (`final_token=432 PASS`) but measured **14.612 tok/s** for 16
+tokens. This is below the post-float-only result (14.987 tok/s), so the fused
+pre-step is rejected in combination as well.
