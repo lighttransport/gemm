@@ -9,6 +9,13 @@
 #include <omp.h>
 #include "../../common/glm53f_ref.h"
 
+/* The default remains the validated implementation.  The fused variant keeps
+ * the mHC norm reduction and 24-row projection in one OpenMP team, avoiding a
+ * fork/join on every mHC invocation during scalar decode. */
+#ifndef GLM53F_MHC_FUSED
+#define GLM53F_MHC_FUSED 0
+#endif
+
 enum {
     GLM53F_MHC_STREAMS = 4,
     GLM53F_MHC_WIDTH = 4096,
@@ -77,6 +84,23 @@ static inline void glm53f_mhc_pre_sve(
         const glm53f_mhc_site *site, const uint16_t *norm) {
     double sumsq = 0.0;
     float logits[GLM53F_MHC_MIX];
+#if GLM53F_MHC_FUSED
+#pragma omp parallel shared(sumsq,logits)
+    {
+#pragma omp for reduction(+:sumsq) schedule(static)
+        for (int i = 0; i < GLM53F_MHC_FLAT; ++i)
+            sumsq += (double)streams[i] * streams[i];
+#pragma omp barrier
+#pragma omp single
+        { sumsq = (double)(1.0f / sqrtf((float)(sumsq / GLM53F_MHC_FLAT) + 1e-5f)); }
+#pragma omp barrier
+#pragma omp for schedule(static)
+        for (int m = 0; m < GLM53F_MHC_MIX; ++m)
+            logits[m] = glm53f_mhc_dot_bf16_sve(
+                site->fn + (size_t)m * GLM53F_MHC_FLAT, streams,
+                GLM53F_MHC_FLAT) * (float)sumsq;
+    }
+#else
 #pragma omp parallel for reduction(+:sumsq)
     for (int i = 0; i < GLM53F_MHC_FLAT; ++i)
         sumsq += (double)streams[i] * streams[i];
@@ -86,6 +110,7 @@ static inline void glm53f_mhc_pre_sve(
         logits[m] = glm53f_mhc_dot_bf16_sve(
             site->fn + (size_t)m * GLM53F_MHC_FLAT, streams,
             GLM53F_MHC_FLAT) * inv;
+#endif
     for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
         logits[k] = glm53f_sigmoid(logits[k] * site->scale[0] + site->base[k]) + 1e-6f;
         scratch->post[k] = 2.0f * glm53f_sigmoid(
