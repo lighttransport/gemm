@@ -490,3 +490,10 @@ A second independent 32-token repeat measured **16.587 tok/s**
 (`final_token=25 PASS`), matching the first run's 16.591 tok/s within 0.03%.
 The allocation removal is stable across the longer decode workload; attention
 and FFN remain the next bottlenecks.
+
+An opt-in four-accumulator SVE rewrite of the MLA score dot was also checked.
+It remained greedy-exact (`final_token=432/25 PASS`) but measured **16.017
+tok/s** for 16 tokens and **16.460 tok/s** for 32 tokens, versus the
+stack-scratch control's 15.705 and 16.591 tok/s.  The short-run uplift did not
+hold at 32 tokens, so the multi-accumulator variant is rejected and the
+single-accumulator default is retained.
