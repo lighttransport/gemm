@@ -450,3 +450,10 @@ The first full 12-node comparison is complete: baseline target decode measured
 tok/s** (`final_token=432 PASS`) for the same 16-token workload. The fused
 region is therefore ~0.65% slower in this run and remains opt-in/diagnostic;
 the strict default is retained.
+
+The opt-in `GLM53F_MHC_POST_FLOAT=1` post-mix path is bit-exact in both short
+and stability runs: 16 tokens measured **14.987 tok/s** (`final_token=432
+PASS`) and 32 tokens measured **15.756 tok/s** (`final_token=25 PASS`). The
+16-token result is 3.2% above the same-allocation strict 16-token baseline
+(14.529 tok/s). A same-allocation strict 32-token control is still pending;
+the float path remains opt-in until that control is recorded.
