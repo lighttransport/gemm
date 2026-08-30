@@ -444,3 +444,9 @@ binaries compile successfully; the callback remains bit-exact, but an
 end-to-end decode comparison is pending completion of the fresh allocation's
 node-local expert staging. The validated default (`GLM53F_MHC_FUSED=0`) is
 unchanged until that gate reports a wall-time improvement.
+
+The first full 12-node comparison is complete: baseline target decode measured
+**14.529 tok/s** (`final_token=432 PASS`) and the fused build measured **14.435
+tok/s** (`final_token=432 PASS`) for the same 16-token workload. The fused
+region is therefore ~0.65% slower in this run and remains opt-in/diagnostic;
+the strict default is retained.
