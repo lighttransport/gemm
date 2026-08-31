@@ -435,6 +435,14 @@ source reads.  For performance A/B tests, `GLM53F_MOE_FUSED_WEIGHTED=0`
 builds the legacy expert aggregation; the default fuses route weighting into
 the down projection.
 
+The first captured 12-node resident-image prefill sweep (job 51141027,
+`mpifcc` + uTofu) passed the scalar/batch gate (`92/92` probe agreement).  At
+64 prompt positions, throughput was 16.04, 16.33, 17.76, and 17.63 tok/s for
+chunks 1, 2, 4, and 5 respectively.  Chunk 4 is the best stable point in
+this short sweep; chunk 5 is effectively tied.  Rank 0 retained about 3.2 GiB
+`MemAvailable` after loading the 23.632-GiB routed image plus shared/core
+images.
+
 ## Stop the service
 
 Cancel the PJM allocation when it is no longer needed:
