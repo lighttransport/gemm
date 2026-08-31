@@ -2314,3 +2314,24 @@ runtime supports a correct state handoff.  The established twelve-node example
 is PP3 x TP4 for prefill.  This does not make pipeline parallelism preferable for
 single-token decode: prefill has enough token chunks to fill the stages, whereas
 one decode dependency chain does not.
+## 2026-08-31: Qwen3.8-27B TP4 mixed-Q4 bring-up
+
+The native TP stage now accepts the complete mixed `Qwen3.8-27B-UD-Q4_K_XL.gguf`
+layout rather than silently retaining only its F32 tensors.  The model contains
+866 tensors: F32 360, Q4_K 97, Q5_K 325, Q6_K 19, and IQ4_XS 65.  Column slices
+are required to start and end on each format's GGML block boundary.  Every file
+entry and the registered uTofu collective regions remain 256-byte aligned.
+
+TP4 stages 5.756 GB per rank.  A cold, one-token end-to-end check loaded all 866
+tensors on all four nodes and produced token 198 in lockstep.  Strict MPOL_BIND
+placed the barrier and all-reduce source/landing regions on persistent worker
+0's CMG (reported NUMA node 4 on this allocation), preventing inter-CMG access
+in the communication path.
+
+The first compact-Q4 correctness baseline is 315.58 ms/token (3.15 tok/s):
+295.08 ms compute and 20.50 ms communication across 129 reductions.  This is a
+bring-up baseline, not an optimized result.  Q5_K, Q6_K, and IQ4_XS currently
+fall through the generic full-row F32 dequantizer; native compact SVE/SDOT
+kernels are therefore the gating work for the 100 tok/s plain and 120 tok/s MTP
+targets.  The existing weight-byte estimator reports 14.31 GB/token for this
+mixed stage and must be corrected before using its derived 48 GB/s figure.
