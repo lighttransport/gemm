@@ -2335,3 +2335,13 @@ fall through the generic full-row F32 dequantizer; native compact SVE/SDOT
 kernels are therefore the gating work for the 100 tok/s plain and 120 tok/s MTP
 targets.  The existing weight-byte estimator reports 14.31 GB/token for this
 mixed stage and must be corrected before using its derived 48 GB/s figure.
+
+Direct compact SVE dots now cover Q5_K, Q6_K, and IQ4_XS in addition to the
+existing Q4_K kernel. They decode packed bitplanes and scales inside registers
+and never allocate or materialize an F32 row. A first-token TP4 check improved
+forward time from 315.58 to 171.76 ms (3.15 to 5.76 tok/s) while retaining token
+198. The opt-in `TF_COMPACT_K_CHECK=1` oracle compared the first row of each
+format against GGML dequantization plus a double-precision dot on every rank;
+the worst relative error was 9.22e-7. These are exact compact SVE/FMA kernels.
+An SDOT variant requires activation/weight requantization and remains behind
+the quantized quality gate rather than silently changing the exact Q4 path.
