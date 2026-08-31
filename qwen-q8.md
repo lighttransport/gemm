@@ -2252,3 +2252,65 @@ them in FP32 reaches only 49--108 GFLOP/s/core, below the 137 GFLOP/s/core BF16
 p-odd kernel, while retaining unstable error. It was rejected. The two-run 750
 tok/s gate remains open; reaching it requires a new mixed-precision kernel or a
 materially different parallel decomposition, not additional PP handoff tuning.
+
+## Two- and four-node decode topology recommendation (2026-08-31)
+
+For one autoregressive Qwen3.8-27B decode stream, use tensor parallelism on all
+available nodes: **TP2 on two nodes and TP4 on four nodes**.  Layer/pipeline
+parallelism reduces the number of collectives, but it executes each layer range
+serially for a single token.  The saved communication is smaller than the
+weight-streaming time saved by running each projection concurrently across the
+TP ranks.
+
+Qwen3.8-27B reduces a 5120-element FP32 residual buffer 129 times per generated
+token.  On the compact four-node topology, the earlier 16 KiB probe measured
+13.88 us warm and 25.40 us cold per collective, corresponding to a 1.8--3.3 ms
+transport floor.  Real TP4 decode spends approximately 4.5--8 ms/token in the
+collective phase once cache effects and rank-arrival skew are included.  This is
+only about 15--20% of a representative 34--40 ms BF16 token, so eliminating the
+collectives does not compensate for serializing the layer stages.
+
+The dedicated `a64fx/utofu-tests/qwen38_allreduce_bench` measures the exact
+20 KiB decode payload.  It runs TP2 as two concurrent pairs followed by TP4 on
+all four nodes, uses the production recursive-doubling collective, and reports
+the projection for 129 reductions/token.  Its payload, barrier, send, and receive
+regions are 256-byte aligned and strictly `MPOL_BIND`-bound to the CMG containing
+the pinned communication thread.  `wire_GB/s` and `link_peak_pct` count actual
+recursive-doubling wire bytes against one Tofu-D TNI's 6.8 GB/s peak.  The 20 KiB
+synchronous collective is latency- and reduction-bound and must not be expected
+to attain the large-message raw-Put peak.
+
+### Recommended configurations
+
+| workload | two nodes | four nodes |
+|---|---|---|
+| one decode stream, lowest latency | **PP1 x TP2** | **PP1 x TP4** |
+| latency-sensitive serving | **TP2** | **TP4** |
+| several continuously busy streams | TP2 or PP2 after measurement | evaluate **PP2 x TP2** or PP4 |
+| long-prompt prefill | TP2 | TP4 for four nodes; mixed PP x TP becomes useful with more nodes/chunks |
+
+The measured native-Q8 decode sweep confirms the single-stream choice: TP2
+reached 8.44 tok/s, while TP4 reached 14.09 tok/s.  Adding ranks reduced the
+per-node streamed weight set more than the extra collective round cost.  The
+four-node BF16 path similarly reaches roughly 25--31 tok/s plain decode, with
+representative profiles around 28--34 ms compute plus 4.5--8 ms communication.
+The accepted TP4 speculative path reaches 53.43 tok/s, which further favors
+retaining TP4 as the decode topology.
+
+A four-node **PP2 x TP2** layout is not preferred for a single stream.  Its two
+half-model stages are sequential, so their summed compute resembles a full TP2
+decode rather than TP4; the smaller TP2 collective cannot recover the lost
+parallel weight bandwidth.  Pure PP4 has the same issue across four serial
+stages.  Both layouts can become useful for aggregate serving throughput when
+independent requests keep every pipeline stage occupied.  In that case PP2 x
+TP2 is the balanced first configuration to measure: it retains two-way tensor
+parallelism within each stage and permits two requests to overlap.  PP4 is a
+throughput-oriented alternative when at least four independent sequences remain
+ready and per-request latency is secondary.
+
+For combined prefill and decode on larger allocations, use mixed parallelism
+for token-chunked prefill and switch to independent TP4 decode groups when the
+runtime supports a correct state handoff.  The established twelve-node example
+is PP3 x TP4 for prefill.  This does not make pipeline parallelism preferable for
+single-token decode: prefill has enough token chunks to fill the stages, whereas
+one decode dependency chain does not.
