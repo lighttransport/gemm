@@ -33,6 +33,7 @@ static inline void dot8(float*y,const uint16_t*w,const float*x,int n){
     }svbool_t p=svptrue_b32();y[0]=svaddv_f32(p,a0);y[1]=svaddv_f32(p,a1);y[2]=svaddv_f32(p,a2);y[3]=svaddv_f32(p,a3);y[4]=svaddv_f32(p,a4);y[5]=svaddv_f32(p,a5);y[6]=svaddv_f32(p,a6);y[7]=svaddv_f32(p,a7);
 }
 static inline float dot1(const uint16_t*w,const float*x,int n){svfloat32_t a=svdup_f32(0);int vl=(int)svcntw();for(int i=0;i<n;i+=vl){svbool_t p=svwhilelt_b32(i,n);svuint32_t z=svlsl_n_u32_x(p,svld1uh_u32(p,w+i),16);a=svmla_x(p,a,svreinterpret_f32_u32(z),svld1(p,x+i));}return svaddv_f32(svptrue_b32(),a);}
+#ifndef GLM53F_KDA_NO_MAIN
 static void mv(float*y,const uint16_t*w,const float*x,int rows,int cols){int nb=rows/8;
 #pragma omp parallel for schedule(static)
     for(int b=0;b<nb;b++)dot8(y+b*8,w+(size_t)b*8*cols,x,cols);
@@ -41,18 +42,26 @@ static void mv(float*y,const uint16_t*w,const float*x,int rows,int cols){int nb=
         for(int r=nb*8;r<rows;r++)y[r]=dot1(w+(size_t)r*cols,x,cols);
     }
 }
-static void mv3(float*y0,float*y1,float*y2,const uint16_t*w0,const uint16_t*w1,
-        const uint16_t*w2,const float*x,int rows,int cols){int nb=rows/8;
-#pragma omp parallel for schedule(static)
-    for(int b=0;b<nb;b++){size_t off=(size_t)b*8*cols;dot8(y0+b*8,w0+off,x,cols);dot8(y1+b*8,w1+off,x,cols);dot8(y2+b*8,w2+off,x,cols);}
-    if(rows&7){
-#pragma omp parallel for schedule(static)
-        for(int r=nb*8;r<rows;r++){size_t off=(size_t)r*cols;y0[r]=dot1(w0+off,x,cols);y1[r]=dot1(w1+off,x,cols);y2[r]=dot1(w2+off,x,cols);}
-    }
+#endif
+/* Orphaned work-sharing variants let one team execute the complete scalar
+ * decode graph.  Every loop has its implicit barrier because the following
+ * projection consumes the preceding loop's output. */
+static void mv_team(float*y,const uint16_t*w,const float*x,int rows,int cols){int nb=rows/8;
+#pragma omp for schedule(static)
+    for(int b=0;b<nb;b++)dot8(y+b*8,w+(size_t)b*8*cols,x,cols);
+#pragma omp for schedule(static)
+    for(int r=nb*8;r<rows;r++)y[r]=dot1(w+(size_t)r*cols,x,cols);
 }
-static void conv3(float*q,float*k,float*v,float*state,const uint16_t*qw,
+static void mv3_team(float*y0,float*y1,float*y2,const uint16_t*w0,
+        const uint16_t*w1,const uint16_t*w2,const float*x,int rows,int cols){int nb=rows/8;
+#pragma omp for schedule(static)
+    for(int b=0;b<nb;b++){size_t off=(size_t)b*8*cols;dot8(y0+b*8,w0+off,x,cols);dot8(y1+b*8,w1+off,x,cols);dot8(y2+b*8,w2+off,x,cols);}
+#pragma omp for schedule(static)
+    for(int r=nb*8;r<rows;r++){size_t off=(size_t)r*cols;y0[r]=dot1(w0+off,x,cols);y1[r]=dot1(w1+off,x,cols);y2[r]=dot1(w2+off,x,cols);}
+}
+static void conv3_team(float*q,float*k,float*v,float*state,const uint16_t*qw,
         const uint16_t*kw,const uint16_t*vw,int channels){
-#pragma omp parallel for schedule(static)
+#pragma omp for schedule(static)
     for(int j=0;j<3*channels;j++){int which=j/channels,c=j-which*channels;float*out=which==0?q:(which==1?k:v);const uint16_t*w=which==0?qw:(which==1?kw:vw);float*s=state+(size_t)j*KERNEL,y=0.0f;memmove(s,s+1,(KERNEL-1)*sizeof(*s));s[KERNEL-1]=out[c];for(int z=0;z<KERNEL;z++)y+=s[z]*glm53f_bf16_to_f32(w[(size_t)c*KERNEL+z]);out[c]=y/(1.0f+expf(-y));}
 }
 static void read_part(glm53f_st_context*st,const char*n,size_t off,void*p,size_t z,int rank){if(glm53f_st_read(st,n,off,p,z)){fprintf(stderr,"rank=%d read %s failed\n",rank,n);MPI_Abort(MPI_COMM_WORLD,2);}}
@@ -78,21 +87,32 @@ void glm53f_kda_reset_12n(glm53f_kda_context_12n*c){if(!c)return;memset(c->conv,
 static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     weights*w=&c->w;int qd=c->qd,hn=c->hn;double td=c->detail_profile?MPI_Wtime():0;
     double t0=MPI_Wtime();float*q=c->qkv,*k=q+qd,*v=k+qd;
-    mv3(q,k,v,w->q,w->k,w->v,x,qd,H);
-    if(c->detail_profile){double t=MPI_Wtime();c->detail[0]=t-td;td=t;}
-    conv3(q,k,v,c->conv,w->qc,w->kc,w->vc,qd);
-    if(c->detail_profile){double t=MPI_Wtime();c->detail[1]=t-td;td=t;}
-    mv(c->small,w->fa,x,D,H);mv(c->gate,w->fb,c->small,qd,D);mv(c->beta,w->b,x,hn,H);
-#pragma omp parallel for schedule(static)
-    for(int h=0;h<hn;h++){glm53f_l2norm(q+(size_t)h*D,D,1e-6f);glm53f_l2norm(k+(size_t)h*D,D,1e-6f);glm53f_kda_safe_log_decay(c->decay+(size_t)h*D,c->gate+(size_t)h*D,w->dt+(size_t)h*D,w->al[h],-5.0f,D);c->beta[h]=glm53f_sigmoid(c->beta[h]);}
-    if(c->detail_profile){double t=MPI_Wtime();c->detail[2]=t-td;td=t;}
-#pragma omp parallel for schedule(static)
-    for(int h=0;h<hn;h++)glm53f_kda_step_vec_streamed(c->state+(size_t)h*D*D,q+(size_t)h*D,k+(size_t)h*D,v+(size_t)h*D,c->decay+(size_t)h*D,c->beta[h],D,D,c->core+(size_t)h*D,c->work+(size_t)h*D);
-    if(c->detail_profile){double t=MPI_Wtime();c->detail[3]=t-td;td=t;}
-    mv(c->small,w->ga,x,D,H);mv(c->gate,w->gb,c->small,qd,D);
-#pragma omp parallel for schedule(static)
-    for(int h=0;h<hn;h++)glm53f_rmsnorm_gated_bf16(c->normed+(size_t)h*D,c->core+(size_t)h*D,c->gate+(size_t)h*D,w->on,1,D,1e-5f);
-    if(c->detail_profile)c->detail[4]=MPI_Wtime()-td;
+#pragma omp parallel shared(td)
+    {
+        mv3_team(q,k,v,w->q,w->k,w->v,x,qd,H);
+#pragma omp single
+        if(c->detail_profile){double t=MPI_Wtime();c->detail[0]=t-td;td=t;}
+        conv3_team(q,k,v,c->conv,w->qc,w->kc,w->vc,qd);
+#pragma omp single
+        if(c->detail_profile){double t=MPI_Wtime();c->detail[1]=t-td;td=t;}
+        mv_team(c->small,w->fa,x,D,H);
+        mv_team(c->gate,w->fb,c->small,qd,D);
+        mv_team(c->beta,w->b,x,hn,H);
+#pragma omp for schedule(static)
+        for(int h=0;h<hn;h++){glm53f_l2norm(q+(size_t)h*D,D,1e-6f);glm53f_l2norm(k+(size_t)h*D,D,1e-6f);glm53f_kda_safe_log_decay(c->decay+(size_t)h*D,c->gate+(size_t)h*D,w->dt+(size_t)h*D,w->al[h],-5.0f,D);c->beta[h]=glm53f_sigmoid(c->beta[h]);}
+#pragma omp single
+        if(c->detail_profile){double t=MPI_Wtime();c->detail[2]=t-td;td=t;}
+#pragma omp for schedule(static)
+        for(int h=0;h<hn;h++)glm53f_kda_step_vec_streamed(c->state+(size_t)h*D*D,q+(size_t)h*D,k+(size_t)h*D,v+(size_t)h*D,c->decay+(size_t)h*D,c->beta[h],D,D,c->core+(size_t)h*D,c->work+(size_t)h*D);
+#pragma omp single
+        if(c->detail_profile){double t=MPI_Wtime();c->detail[3]=t-td;td=t;}
+        mv_team(c->small,w->ga,x,D,H);
+        mv_team(c->gate,w->gb,c->small,qd,D);
+#pragma omp for schedule(static)
+        for(int h=0;h<hn;h++)glm53f_rmsnorm_gated_bf16(c->normed+(size_t)h*D,c->core+(size_t)h*D,c->gate+(size_t)h*D,w->on,1,D,1e-5f);
+#pragma omp single
+        if(c->detail_profile)c->detail[4]=MPI_Wtime()-td;
+    }
     double t1=MPI_Wtime();
 #pragma omp parallel for schedule(static)
     for(int r=0;r<H;r++)out[r]=dot1(w->op+(size_t)r*qd,c->normed,qd);
