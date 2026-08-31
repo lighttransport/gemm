@@ -26,6 +26,7 @@ export OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-active}
 export KMP_BLOCKTIME=${KMP_BLOCKTIME:-1} OMP_DYNAMIC=${OMP_DYNAMIC:-false}
 export TP_MTP_OMP_PARK=${TP_MTP_OMP_PARK:-1}
 export NUMA_DISTRIBUTE=${NUMA_DISTRIBUTE:-1} NUMA_N_CMGS=${NUMA_N_CMGS:-4}
+export TP_COMM_CMG_STRICT=${TP_COMM_CMG_STRICT:-1}
 export NUMA_CMG_BUDGET_GB=${NUMA_CMG_BUDGET_GB:-7} NUMA_ALIGNMENT=${NUMA_ALIGNMENT:-2097152}
 # TP_STAGE_DIR is a complete rank-local image.  The runner parses only GGUF
 # metadata and explicitly reads the stage into anonymous HBM-resident memory.

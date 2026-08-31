@@ -52,6 +52,8 @@
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <utofu.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -87,6 +89,51 @@ static void die(const char *what, int rc) { logmsg("FATAL: %s (rc=%d)\n", what, 
 static double now_sec(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+static int tp_numa_node_of_cpu(int cpu) {
+    char path[96];
+    for (int node = 0; node < 8; node++) {
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/node%d", cpu, node);
+        if (access(path, F_OK) == 0) return node;
+    }
+    return -1;
+}
+
+/* Persistent worker 0 executes the collectives. Bind registered source and
+ * landing pages to its CMG before first touch. mmap also guarantees alignment
+ * stricter than uTofu's 256-byte contract. */
+static void *tp_comm_cmg_alloc(size_t bytes, size_t *mapped_bytes, int *node_out) {
+    long page = sysconf(_SC_PAGESIZE);
+    if (page < 256) page = 256;
+    size_t n = (bytes + (size_t)page - 1) & ~((size_t)page - 1);
+    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    const char *offset_env = getenv("TF_POOL_CORE_OFFSET");
+    int offset = (offset_env && *offset_env ? atoi(offset_env) : 0) % 48;
+    if (offset < 0) offset += 48;
+    int node = tp_numa_node_of_cpu(12 + offset);
+    const char *strict_env = getenv("TP_COMM_CMG_STRICT");
+    int strict = strict_env && atoi(strict_env) != 0;
+#if defined(SYS_mbind)
+    if (node >= 0 && node < (int)(8 * sizeof(unsigned long))) {
+        unsigned long mask = 1UL << node;
+        if (syscall(SYS_mbind, p, n, 2L /* MPOL_BIND */, &mask,
+                    8UL * sizeof(mask), 0U) != 0 && strict) {
+            munmap(p, n);
+            return NULL;
+        }
+    } else if (strict) {
+        munmap(p, n);
+        return NULL;
+    }
+#else
+    if (strict) { munmap(p, n); return NULL; }
+#endif
+    if (((uintptr_t)p & 255u) != 0) { munmap(p, n); return NULL; }
+    *mapped_bytes = n;
+    if (node_out) *node_out = node;
+    return p;
 }
 /* Internal helper declarations from transformer.h (not part of public API, but
  * available in this TU because IMPLEMENTATION is enabled above). */
@@ -1310,7 +1357,10 @@ int main(int argc, char **argv) {
     SEND_OFF = 0;
     BAR_BASE = SlotSend;
     size_t region_sz = BAR_BASE + (size_t)(N + 1) * SlotB;
-    if (posix_memalign((void **)&Region, DEMO_CACHE_LINE, region_sz) != 0) die("posix_memalign", -1);
+    size_t region_map_sz = 0;
+    int comm_cmg_node = -1;
+    Region = tp_comm_cmg_alloc(region_sz, &region_map_sz, &comm_cmg_node);
+    if (!Region) die("CMG-local barrier allocation", errno ? errno : -1);
     memset(Region, 0, region_sz);
 
     /* ---- VCQ + region registration; reconstruct peers by convention ---- */
@@ -1374,10 +1424,18 @@ int main(int argc, char **argv) {
     long ar_max = (long)n_embd * ar_batch;
     if (ar_max > 2L * 1024 * 1024) ar_max = 2L * 1024 * 1024;  /* cap bf16 Put < 16MiB, region < ~75MB */
     if (ar_max < n_embd) ar_max = n_embd;
+    tp_comm_config ar_options = tp_comm_env_config();
+    size_t ar_region_bytes = tp_comm_region_size(N, (int)ar_max, &ar_options);
+    size_t ar_region_map_sz = 0;
+    void *ar_region = tp_comm_cmg_alloc(ar_region_bytes, &ar_region_map_sz, NULL);
+    if (!ar_region) die("CMG-local all-reduce allocation", errno ? errno : -1);
     tp_comm c;
-    if (tp_comm_init(&c, Vcq, PeerVcq, MyRank, N, (int)ar_max, barrier) != 0) die("tp_comm_init", -1);
-    if (is_first) logmsg("tp_ar region: max_count=%ld (TP_AR_BATCH=%d tokens, ~%.1f MB region)\n",
-                         ar_max, ar_batch, (double)(9L * ar_max * 4) / (1024*1024));
+    if (tp_comm_init_external(&c, Vcq, PeerVcq, MyRank, N, (int)ar_max,
+                              barrier, &ar_options, ar_region, ar_region_map_sz) != 0)
+        die("tp_comm_init_external", -1);
+    if (is_first) logmsg("tp_ar region: max_count=%ld (TP_AR_BATCH=%d tokens, %.1f MB, "
+                         "align=256 cmg_node=%d)\n", ar_max, ar_batch,
+                         (double)ar_region_bytes / (1024*1024), comm_cmg_node);
     transformer_set_tp(m, MyRank, N, tp_ar_callback, &c);
     barrier();
     tp_check_prompt_signature(&c, ptoks, P, MyRank);
@@ -1399,9 +1457,10 @@ int main(int argc, char **argv) {
                    null_stream_passes, (double)tp_stage_bytes / 1e9, bw);
         transformer_free(m);
         tp_comm_free(&c);
+        munmap(ar_region, ar_region_map_sz);
         utofu_dereg_mem(Vcq, Base, 0);
         utofu_free_vcq(Vcq);
-        free(ptoks); free(Region);
+        free(ptoks); munmap(Region, region_map_sz);
         if (g_log) fclose(g_log);
         if (g_curve) fclose(g_curve);
         if (g_tokdump) fclose(g_tokdump);
@@ -2174,9 +2233,10 @@ done:
      * matvec/barrier/serial/attn decode breakdown to stderr. */
     transformer_free(m);
     tp_comm_free(&c);
+    munmap(ar_region, ar_region_map_sz);
     utofu_dereg_mem(Vcq, Base, 0);
     utofu_free_vcq(Vcq);
-    free(ptoks); free(Region);
+    free(ptoks); munmap(Region, region_map_sz);
     free(prompt_repeat_text); free(prompt_file_text);
     if (g_log) fclose(g_log);
     if (g_curve) fclose(g_curve);
