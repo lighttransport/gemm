@@ -2391,3 +2391,29 @@ measured 33.78 ms/token at distance 8 and 34.75 ms/token at distance 12, so the
 launcher default is now 8.  A separate K=1536 specialization was rejected:
 although its isolated kernel reached 588.87 GB/s at distance 8, it was neutral
 end to end and added no useful model-level speedup.
+
+### BF16 K=5 MTP runtime fix (2026-09-01)
+
+The restarted sustained-MTP baseline exposed an OpenMP runtime failure rather
+than a math-kernel limit: K=5 verification took about 9.4 seconds per round and
+delivered only 0.23--0.29 tok/s.  The batch verifier opens many short OpenMP
+regions, while the launcher's `KMP_BLOCKTIME=1` repeatedly put the 48-worker
+team to sleep.  Holding the team warm globally fixed verification but slowed
+the ordinary prompt pass, so `tp_runner` now changes Fujitsu's exported
+`kmp_set_blocktime` dynamically: 200 ms during batched verification and zero
+before the pthread NextN draft.
+
+The K=5 BF16 dispatch also replaces the register-heavy 4-row x 5-token kernel
+with compact 4x3 plus exact 8x2 kernels.  On the 180-token sustained prompt,
+the accepted combination reduced verification to 89.34 ms/round and preserved
+the normal 17.79 tok/s prompt pass.  Six rounds generated 16 tokens at 17.21
+tok/s with nondegenerate greedy agreement (13/24, alpha 0.5417), versus 0.29
+tok/s before the runtime fix.  Draft generation is now the dominant cost at
+65.51 ms/round; verification is no longer catastrophically stalled.
+
+An independently staged TP4-sharded NextN block was also tested.  It reduced
+draft time to 56.25 ms but failed correctness (`teacher match=0/178`, alpha
+zero), so the production BF16 MTP path continues to use the replicated NextN
+block.  This result is still below the 80 tok/s target and identifies correct
+NextN tensor parallelism, followed by draft-step fusion, as the next required
+work rather than further trunk matvec tuning.

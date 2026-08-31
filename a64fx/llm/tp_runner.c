@@ -48,6 +48,13 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef _OPENMP
+/* Fujitsu's OpenMP runtime exports the Intel-compatible control.  Keeping the
+ * batch team warm is essential across its many short projection regions, but
+ * leaving it warm during the pthread NextN draft steals all 48 cores. */
+extern void kmp_set_blocktime(int milliseconds);
+#endif
 #include <strings.h>
 #include <errno.h>
 #include <limits.h>
@@ -1835,8 +1842,10 @@ int main(int argc, char **argv) {
         int measured = perf_warmup == 0;
         int mtp_detail = envb_opt("TP_MTP_PROFILE_DETAIL", 0);
         int mtp_omp_park = envb_opt("TP_MTP_OMP_PARK", 0);
+        int mtp_verify_blocktime = (int)envl_opt("TP_MTP_VERIFY_BLOCKTIME", 200);
 #ifndef _OPENMP
         mtp_omp_park = 0;
+        mtp_verify_blocktime = 0;
 #endif
         pthread_mutex_t mtp_park_mu = PTHREAD_MUTEX_INITIALIZER;
         pthread_cond_t mtp_park_cv = PTHREAD_COND_INITIALIZER;
@@ -1856,7 +1865,16 @@ int main(int argc, char **argv) {
             g_ar_secs = 0.0; g_ar_calls = 0;
             tf_batch_all_logits = all_logits;
             tf_batch_hidden_out = &batch_hidden;
+#ifdef _OPENMP
+            kmp_set_blocktime(mtp_verify_blocktime);
+#endif
             float *batch_ok = transformer_prefill_gemm(m, batch, spec_k, p);
+#ifdef _OPENMP
+            /* Draft generation uses the persistent pthread pool.  Park the
+             * OpenMP team immediately instead of waiting out the warm verify
+             * interval and oversubscribing every A64FX core. */
+            kmp_set_blocktime(0);
+#endif
             tf_batch_all_logits = NULL;
             tf_batch_hidden_out = NULL;
             if (!batch_ok || !batch_hidden) die("Qwen MTP batched verify", -1);
