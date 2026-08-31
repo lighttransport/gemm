@@ -26,12 +26,18 @@ test "$(grep -vc '^#' tofu_topo.txt)" -eq 12
 export GLM53F_UTOFU=1 TOFU_TOPO_PATH=$PWD/tofu_topo.txt
 
 echo "=== batch correctness $(date) ===" | tee -a "$log"
-mpiexec -np 12 ./glm53f_target_batch_check_12n \
-    "$model" "$routed" "$shared" 2>&1 | tee -a "$log"
+batch_prefix="prefill_batch_${job}"
+rm -f "$batch_prefix".*
+mpiexec -np 12 -of-proc "$batch_prefix" \
+    ./glm53f_target_batch_check_12n "$model" "$routed" "$shared"
+cat "$batch_prefix".*.0 | tee -a "$log"
 
 for chunk in 1 2 4 5; do
     echo "=== prefill positions=64 chunk=$chunk $(date) ===" | tee -a "$log"
-    mpiexec -np 12 ./glm53f_prefill_12n \
-        "$model" "$routed" "$shared" 64 "$chunk" 2>&1 | tee -a "$log"
+    prefix="prefill_c${chunk}_${job}"
+    rm -f "$prefix".*
+    mpiexec -np 12 -of-proc "$prefix" ./glm53f_prefill_12n \
+        "$model" "$routed" "$shared" 64 "$chunk"
+    cat "$prefix".*.0 | tee -a "$log"
 done
 echo "SENTINEL glm53f_prefill_sweep_12n=OK" | tee -a "$log"
