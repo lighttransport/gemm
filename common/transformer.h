@@ -9448,11 +9448,22 @@ size_t transformer_tp_load_stage(transformer_model *m, const char *stage_dir,
         int use_pv = !pv_env || atoi(pv_env) != 0;
         int nextn_pv = 0;
         const char *nextn_pv_env = getenv("TP_NEXTN_PV_MASK");
-        if (nextn_pv_env && !strncmp(e->name, "blk.64.", 7)) {
+        int is_nextn = !strncmp(e->name, "blk.64.", 7);
+        if (nextn_pv_env && is_nextn) {
             int mask = atoi(nextn_pv_env);
             if ((mask & 1) && strstr(e->name, "nextn.eh_proj.weight")) nextn_pv = 1;
+            if ((mask & 2) && strstr(e->name, "attn_q.weight")) nextn_pv = 1;
+            if ((mask & 4) && strstr(e->name, "attn_output.weight")) nextn_pv = 1;
+            if ((mask & 8) && strstr(e->name, "ffn_down.weight")) nextn_pv = 1;
         }
-        if (use_pv && (e->kind != Q38TP_REPLICATE || nextn_pv) &&
+        /* Sliced NextN K/V have only 256 rows.  The fused QKV scheduler splits
+         * those rows 5--6 at a time across 48 workers, which is incompatible
+         * with the PV kernel's 8-row task alignment.  Replicated NextN never
+         * hit this because replicated entries were already excluded.  Keep
+         * all NextN tensors row-major unless their dedicated mask explicitly
+         * opts in a scheduler-safe tensor (EH, Q, attention output, or FFN
+         * down).  K/V and fused gate/up deliberately have no mask bits. */
+        if (use_pv && ((!is_nextn && e->kind != Q38TP_REPLICATE) || nextn_pv) &&
             t->type == GGML_TYPE_BF16 && (t->n_rows % 8) == 0 &&
             (t->n_cols % 16) == 0 && t->n_rows >= 8) {
             if (nt > 1 && m->pool_alive) {

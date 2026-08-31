@@ -2411,9 +2411,37 @@ tok/s with nondegenerate greedy agreement (13/24, alpha 0.5417), versus 0.29
 tok/s before the runtime fix.  Draft generation is now the dominant cost at
 65.51 ms/round; verification is no longer catastrophically stalled.
 
-An independently staged TP4-sharded NextN block was also tested.  It reduced
-draft time to 56.25 ms but failed correctness (`teacher match=0/178`, alpha
-zero), so the production BF16 MTP path continues to use the replicated NextN
-block.  This result is still below the 80 tok/s target and identifies correct
-NextN tensor parallelism, followed by draft-step fusion, as the next required
-work rather than further trunk matvec tuning.
+An initial independently staged TP4-sharded NextN test reduced draft time to
+56.25 ms but failed correctness (`teacher match=0/178`, alpha zero).  The cause
+and corrected sharded result are documented below.
+
+### Correct BF16 NextN TP4 and K=2 selection
+
+The sharded-stage failure was a layout/scheduler mismatch.  The BF16 loader
+automatically PV-packed every sliced tensor, including NextN K/V.  Each local
+K/V matrix has 256 rows, and the fused QKV scheduler splits it across 48
+workers in 5--6-row ranges; the PV kernel requires 8-row-aligned ranges.  The
+loader now leaves NextN row-major unless `TP_NEXTN_PV_MASK` explicitly selects
+a scheduler-safe tensor.  This restored the replicated reference gate exactly:
+teacher match 55/178 and the same offset histogram.
+
+Individual quality sweeps selected mask 5 (EH fusion plus attention output).
+PV Q changed draft argmaxes, while attention output retained 55/178.  K/V and
+gate/up intentionally have no PV mask bit.  With direct small-buffer all-to-all
+enabled, the 64-token K sweep selected K=2:
+
+- K=4: 16.51 tok/s, 48/90 greedy matches;
+- K=3: 20.21 tok/s, 40/62 greedy matches;
+- K=2: **26.24 tok/s**, 26/39 greedy matches and alpha 0.6667.
+
+The accepted K=2 profile uses 39 rounds, 50.51 ms verification and 11.97 ms
+draft time per round.  It preserves teacher match 55/178, processes the
+180-token prompt at 19.40 tok/s, and reduces the effective generated-token
+forward time to 38.08 ms (33.02 ms compute plus 5.06 ms communication).  This
+is a large correction over the 0.29 tok/s stalled baseline, though it remains
+below plain BF16 decode and the requested 80 tok/s MTP target.
+
+Use `run_qwen38_bf16_tp4.sh stage-mtp` after each allocation restart to build
+the separate `/local/...-nextnshard` image, then run `mtp-sustained`.  The MTP
+mode now selects TP4 NextN sharding, mask 5, direct all-to-all, and K=2 by
+default; ordinary BF16 stage/decode settings are unchanged.

@@ -5,9 +5,16 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 MODEL=${MODEL:-/home/u14346/models/qwen38/27b/bf16/Qwen3.8-27B-BF16-00001-of-00002.gguf}
 TP_SIZE=${TP_SIZE:-4}
-case "$TP_SIZE" in 4|6|12) ;; *) echo "TP_SIZE must be 4, 6, or 12" >&2; exit 2 ;; esac
-STAGE=${TP_STAGE_DIR:-/local/u14346/qwen38-bf16-tp${TP_SIZE}}
 MODE=${1:-stage}
+# The accepted MTP profile uses a separately staged TP-sharded NextN block.
+if [ "$MODE" = mtp-sustained ] || [ "$MODE" = stage-mtp ]; then
+    [ "$TP_SIZE" = 4 ] || { echo "$MODE requires TP_SIZE=4" >&2; exit 2; }
+    export TP_NEXTN_SHARD=${TP_NEXTN_SHARD:-1}
+fi
+case "$TP_SIZE" in 4|6|12) ;; *) echo "TP_SIZE must be 4, 6, or 12" >&2; exit 2 ;; esac
+NEXTN_SUFFIX=
+if [ "${TP_NEXTN_SHARD:-0}" != 0 ]; then NEXTN_SUFFIX=-nextnshard; fi
+STAGE=${TP_STAGE_DIR:-/local/u14346/qwen38-bf16-tp${TP_SIZE}${NEXTN_SUFFIX}}
 
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:/usr/local/bin:/usr/bin:/bin"
 export TP_STAGE_DIR=$STAGE LLM_THREADS=${LLM_THREADS:-48} OMP_NUM_THREADS=${OMP_NUM_THREADS:-48}
@@ -40,7 +47,14 @@ export TF_SSM_FUSED_DOTS=${TF_SSM_FUSED_DOTS:-1}
 export TF_SILU_SVE=${TF_SILU_SVE:-1}
 # Packing only the replicated NextN embedding/hidden fusion projection retains
 # the long-context 53/56 agreement and saves about one percent end-to-end.
-export TP_NEXTN_PV_MASK=${TP_NEXTN_PV_MASK:-1}
+if [ "${TP_NEXTN_SHARD:-0}" != 0 ]; then
+    # EH + attention-output PV are exact under the sharded schedulers.  Q PV
+    # changes draft argmaxes; K/V and gate/up cannot satisfy 8-row task bounds.
+    export TP_NEXTN_PV_MASK=${TP_NEXTN_PV_MASK:-5}
+    export TP_AR_A2A=${TP_AR_A2A:-1} TP_AR_A2A_MAX=${TP_AR_A2A_MAX:-8192}
+else
+    export TP_NEXTN_PV_MASK=${TP_NEXTN_PV_MASK:-1}
+fi
 # The pair-interleaved layout uses the same low/high accumulation order as the
 # row-major kernel and now passes the long greedy-token gate.  Set PV=0 for the
 # original source-equivalent layout.
@@ -48,7 +62,7 @@ export TP_STAGE_BF16_PV=${TP_STAGE_BF16_PV:-1}
 
 cd "$HERE"
 case "$MODE" in
-    plan|stage)
+    plan|stage|stage-mtp)
         make qwen38_tp_stage CC=fcc OPENMP=1
         if [ "$MODE" = plan ]; then export Q38TP_PLAN=1; fi
         exec mpiexec -np "$TP_SIZE" ./build/qwen38_tp_stage "$MODEL" "$STAGE"
@@ -97,7 +111,7 @@ case "$MODE" in
                 export TP_RAW_PROMPT=1
                 export TP_PROMPT_FILE=${TP_PROMPT_FILE:-$HERE/qwen38_mtp_prompt.txt}
                 export TP_PROMPT_REPEAT=${TP_PROMPT_REPEAT:-2}
-                export TP_SPEC_K=${TP_SPEC_K:-5} TP_MTP_BATCH=${TP_MTP_BATCH:-1}
+                export TP_SPEC_K=${TP_SPEC_K:-2} TP_MTP_BATCH=${TP_MTP_BATCH:-1}
                 export TP_MAXSEQ=${TP_MAXSEQ:-768} TP_MAXGEN=${TP_MAXGEN:-256}
                 export TP_PERF_WARMUP=${TP_PERF_WARMUP:-0} TP_BUFFER_OUTPUT=${TP_BUFFER_OUTPUT:-1}
                 export TP_MTP_TRACE=${TP_MTP_TRACE:-0} TP_MTP_PROFILE_DETAIL=${TP_MTP_PROFILE_DETAIL:-1}
@@ -132,5 +146,5 @@ case "$MODE" in
               tp_tokens_rank00.txt tp_null_stream_rank*.txt
         exec mpiexec -np "$TP_SIZE" ./build/tp_runner "$MODEL"
         ;;
-    *) echo "usage: TP_SIZE={4|6|12} $0 {plan|stage|stream|null|check|source-check|bench|mtp-check|mtp-sustained|prefill|handoff|profile}" >&2; exit 2 ;;
+    *) echo "usage: TP_SIZE={4|6|12} $0 {plan|stage|stage-mtp|stream|null|check|source-check|bench|mtp-check|mtp-sustained|prefill|handoff|profile}" >&2; exit 2 ;;
 esac
