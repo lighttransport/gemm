@@ -1324,6 +1324,9 @@ int main(int argc, char **argv) {
         if (MyRank == 0) logmsg("TP_INT8_MODE=%s enabled for resident BF16 projections\n",
                                 getenv("TP_INT8_MODE"));
     }
+    if (MyRank == 0 && ((q8_mode_env && !strcmp(q8_mode_env, "row")) ||
+                        (getenv("TP_INT8_MODE") && *getenv("TP_INT8_MODE"))))
+        logmsg("TF_W8_DOT=%s\n", envs_opt("TF_W8_DOT", "int8"));
     if (!tp_stage_bytes && spec_k > 0 && m->nextn.loaded &&
         envb("TP_MATERIALIZE_NEXTN", 1)) {
         size_t nextn_bytes = transformer_materialize_nextn(m);

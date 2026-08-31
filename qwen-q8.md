@@ -2345,3 +2345,21 @@ format against GGML dequantization plus a double-precision dot on every rank;
 the worst relative error was 9.22e-7. These are exact compact SVE/FMA kernels.
 An SDOT variant requires activation/weight requantization and remains behind
 the quantized quality gate rather than silently changing the exact Q4 path.
+
+### TP4 BF16/Q8 SDOT comparison (2026-08-31)
+
+Short identical 16-token measured regions (`TP_AR_BATCH=1`, four warm-up
+tokens) gave the following directional results. Exact BF16 remained fastest at
+32.26 ms/token. Converting BF16 weights in place to row INT8 took 49.57
+ms/token; using INT16 activations with compact INT8 weights took 49.88 ms/token.
+The INT16 stream matched all 20 exact-BF16 token IDs, while INT8 first diverged
+at token 8. Thus H-to-D SDOT is retained as an accuracy experiment, not a speed
+profile: it is about 55% slower than the optimized BF16 path.
+
+For the native Q8 stage, row INT8 and INT16-activation SDOT measured 101.26 and
+98.20 ms/token respectively. Native block64 Q8 measured 107.82 ms/token. A new
+four-row row-INT8 kernel shares each activation load across four weight rows;
+it improved the Q8 row probe to 96.60 ms/token, but did not improve the BF16
+conversion path outside run-to-run noise. These short probes are not the final
+three-repeat 256-token acceptance gate, and neither Q8 token stream has yet
+passed the teacher-forced quality threshold.

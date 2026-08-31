@@ -1209,6 +1209,31 @@ static inline int32_t tf_int8_dot(const int8_t *w, const int8_t *x, int K) {
     for (; k < K; k++) s += (int32_t)w[k] * (int32_t)x[k];
     return s;
 }
+static inline void tf_int8_dot_4row(int32_t out[4], const int8_t *w,
+                                    const int8_t *x, int K) {
+    svint32_t a0 = svdup_s32(0), a1 = svdup_s32(0);
+    svint32_t a2 = svdup_s32(0), a3 = svdup_s32(0);
+    const svbool_t pg = svptrue_b8();
+    const int vl = (int)svcntb();
+    int k = 0;
+    for (; k + vl <= K; k += vl) {
+        svint8_t vx = svld1_s8(pg, x + k);
+        a0 = svdot_s32(a0, svld1_s8(pg, w + k), vx);
+        a1 = svdot_s32(a1, svld1_s8(pg, w + K + k), vx);
+        a2 = svdot_s32(a2, svld1_s8(pg, w + 2 * (size_t)K + k), vx);
+        a3 = svdot_s32(a3, svld1_s8(pg, w + 3 * (size_t)K + k), vx);
+    }
+    out[0] = svaddv_s32(svptrue_b32(), a0);
+    out[1] = svaddv_s32(svptrue_b32(), a1);
+    out[2] = svaddv_s32(svptrue_b32(), a2);
+    out[3] = svaddv_s32(svptrue_b32(), a3);
+    for (; k < K; k++) {
+        int v = x[k];
+        out[0] += w[k] * v; out[1] += w[K + k] * v;
+        out[2] += w[2 * (size_t)K + k] * v;
+        out[3] += w[3 * (size_t)K + k] * v;
+    }
+}
 /* quantize x[K] -> int8 (per-vector symmetric); returns scale s.t. x ~= xi8*scale. */
 static inline float tf_quant_x_i8(const float *x, int8_t *xi8, int K) {
     float mx = 0; for (int k = 0; k < K; k++) { float a = x[k] < 0 ? -x[k] : x[k]; if (a > mx) mx = a; }
@@ -1234,6 +1259,19 @@ static inline int64_t tf_int16_dot(const int16_t *a, const int16_t *b, int K) {
     for (int k = 0; k < K; k += vh) {
         svbool_t pg = svwhilelt_b16(k, K);
         acc = svdot_s64(acc, svld1_s16(pg, a + k), svld1_s16(pg, b + k));
+    }
+    return svaddv_s64(svptrue_b64(), acc);
+}
+
+/* Keep resident weights compact int8, sign-extend them while loading, and use
+ * H->D SDOT against an int16 activation. This isolates the precision/throughput
+ * tradeoff without doubling the weight footprint in HBM. */
+static inline int64_t tf_int8_int16_dot(const int8_t *w, const int16_t *x, int K) {
+    svint64_t acc = svdup_s64(0);
+    const int vh = (int)svcnth();
+    for (int k = 0; k < K; k += vh) {
+        svbool_t pg = svwhilelt_b16(k, K);
+        acc = svdot_s64(acc, svld1sb_s16(pg, w + k), svld1_s16(pg, x + k));
     }
     return svaddv_s64(svptrue_b64(), acc);
 }
@@ -7403,6 +7441,38 @@ static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
 
     if (mat->i8) {
 #if defined(__ARM_FEATURE_SVE)
+        static int w8_use_i16 = -1;
+        if (w8_use_i16 < 0) {
+            const char *mode = getenv("TF_W8_DOT");
+            w8_use_i16 = mode && !strcmp(mode, "int16");
+        }
+        if (w8_use_i16) {
+            static _Thread_local int16_t *tl_xi16;
+            static _Thread_local int tl_xi16_cap;
+            static _Thread_local const float *tl_x16_src;
+            static _Thread_local int tl_x16_n;
+            static _Thread_local float tl_x16_scale;
+            static _Thread_local float tl_x16_tag0, tl_x16_tag1, tl_x16_tag2, tl_x16_tag3;
+            if (tl_xi16_cap < n_cols) {
+                int16_t *p = (int16_t *)realloc(tl_xi16, (size_t)n_cols * sizeof(*p));
+                if (!p) return;
+                tl_xi16 = p; tl_xi16_cap = n_cols;
+            }
+            int same_x = tl_x16_src == x && tl_x16_n == n_cols &&
+                         tl_x16_tag0 == x[0] && tl_x16_tag1 == x[n_cols / 3] &&
+                         tl_x16_tag2 == x[(2 * n_cols) / 3] && tl_x16_tag3 == x[n_cols - 1];
+            float xs = same_x ? tl_x16_scale : tf_quant_x_i16(x, tl_xi16, n_cols);
+            if (!same_x) {
+                tl_x16_src = x; tl_x16_n = n_cols; tl_x16_scale = xs;
+                tl_x16_tag0 = x[0]; tl_x16_tag1 = x[n_cols / 3];
+                tl_x16_tag2 = x[(2 * n_cols) / 3]; tl_x16_tag3 = x[n_cols - 1];
+            }
+            const int8_t *w = mat->i8 + (size_t)rs * n_cols;
+            for (int i = 0; i < rc; i++)
+                dst[rs + i] = (float)tf_int8_int16_dot(
+                    w + (size_t)i * n_cols, tl_xi16, n_cols) * mat->i8s[rs + i] * xs;
+            return;
+        }
         static _Thread_local int8_t *tl_xi8;
         static _Thread_local int tl_xi8_cap;
         static _Thread_local const float *tl_x_src;
@@ -7434,7 +7504,16 @@ static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
             tl_x_tag2 = x[(2 * n_cols) / 3]; tl_x_tag3 = x[n_cols - 1];
         }
         const int8_t *w = mat->i8 + (size_t)rs * n_cols;
-        for (int i = 0; i < rc; i++)
+        int i = 0;
+        for (; i + 3 < rc; i += 4) {
+            int32_t dot[4];
+            tf_int8_dot_4row(dot, w + (size_t)i * n_cols, xi8, n_cols);
+            dst[rs + i] = (float)dot[0] * mat->i8s[rs + i] * xs;
+            dst[rs + i + 1] = (float)dot[1] * mat->i8s[rs + i + 1] * xs;
+            dst[rs + i + 2] = (float)dot[2] * mat->i8s[rs + i + 2] * xs;
+            dst[rs + i + 3] = (float)dot[3] * mat->i8s[rs + i + 3] * xs;
+        }
+        for (; i < rc; i++)
             dst[rs + i] = (float)tf_int8_dot(w + (size_t)i * n_cols, xi8, n_cols) *
                           mat->i8s[rs + i] * xs;
         return;
