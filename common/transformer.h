@@ -1082,6 +1082,125 @@ static inline float tf_q4_k_dot_sve(const block_q4_K *blocks, const float *x, in
     return svaddv_f32(pg, acc);
 }
 
+/* Direct compact K-quant dots. These consume the GGML byte layout in place;
+ * unlike the generic fallback they never allocate or materialize an F32 row. */
+static inline float tf_q5_k_dot_sve(const block_q5_K *blocks, const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const int vl = (int)svcntw();
+    svfloat32_t acc = svdup_f32(0.0f);
+    for (int ib = 0; ib < n / 256; ib++) {
+        const block_q5_K *b = &blocks[ib];
+        const float d = ggml_fp16_to_fp32(b->d);
+        const float dmin = ggml_fp16_to_fp32(b->dmin);
+        for (int g = 0, is = 0; g < 256; g += 64, is += 2) {
+            uint8_t sc, mv;
+            get_scale_min_k4(is, b->scales, &sc, &mv);
+            const svfloat32_t vd0 = svdup_f32(d * sc), vm0 = svdup_f32(dmin * mv);
+            get_scale_min_k4(is + 1, b->scales, &sc, &mv);
+            const svfloat32_t vd1 = svdup_f32(d * sc), vm1 = svdup_f32(dmin * mv);
+            const uint8_t *ql = b->qs + (g / 64) * 32;
+            const unsigned sh0 = (unsigned)(g / 64) * 2;
+            for (int k = 0; k < 32; k += vl) {
+                svbool_t pt = k + vl <= 32 ? pg : svwhilelt_b32((uint64_t)k, (uint64_t)32);
+                svuint32_t lo = svld1ub_u32(pt, ql + k);
+                svuint32_t hi = svld1ub_u32(pt, b->qh + k);
+                svuint32_t q0 = svorr_x(pt, svand_n_u32_x(pt, lo, 15),
+                                        svlsl_n_u32_x(pt, svand_n_u32_x(pt,
+                                            svlsr_n_u32_x(pt, hi, sh0), 1), 4));
+                svuint32_t q1 = svorr_x(pt, svlsr_n_u32_x(pt, lo, 4),
+                                        svlsl_n_u32_x(pt, svand_n_u32_x(pt,
+                                            svlsr_n_u32_x(pt, hi, sh0 + 1), 1), 4));
+                svfloat32_t w0 = svsub_x(pt, svmul_x(pt, svcvt_f32_u32_x(pt, q0), vd0), vm0);
+                svfloat32_t w1 = svsub_x(pt, svmul_x(pt, svcvt_f32_u32_x(pt, q1), vd1), vm1);
+                acc = svmla_m(pt, acc, w0, svld1(pt, x + ib * 256 + g + k));
+                acc = svmla_m(pt, acc, w1, svld1(pt, x + ib * 256 + g + 32 + k));
+            }
+        }
+    }
+    return svaddv_f32(pg, acc);
+}
+
+static inline float tf_q6_k_dot_sve(const block_q6_K *blocks, const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const int vl = (int)svcntw();
+    svfloat32_t acc = svdup_f32(0.0f);
+    for (int ib = 0; ib < n / 256; ib++) {
+        const block_q6_K *b = &blocks[ib];
+        const svfloat32_t vd = svdup_f32(ggml_fp16_to_fp32(b->d));
+        for (int half = 0; half < 2; half++) {
+            const uint8_t *ql = b->ql + half * 64;
+            const uint8_t *qh = b->qh + half * 32;
+            const int8_t *sc = b->scales + half * 8;
+            for (int part = 0; part < 4; part++) {
+                for (int k = 0; k < 32; k += vl) {
+                    svbool_t pt = k + vl <= 32 ? pg : svwhilelt_b32((uint64_t)k, (uint64_t)32);
+                    const int qlo_off = (part & 1) ? 32 : 0;
+                    const int lo_shift = part >= 2 ? 4 : 0;
+                    const int hi_shift = part * 2;
+                    svuint32_t lo = svand_n_u32_x(pt,
+                        svlsr_n_u32_x(pt, svld1ub_u32(pt, ql + qlo_off + k), lo_shift), 15);
+                    svuint32_t hi = svand_n_u32_x(pt,
+                        svlsr_n_u32_x(pt, svld1ub_u32(pt, qh + k), hi_shift), 3);
+                    svint32_t q = svsub_n_s32_x(pt,
+                        svreinterpret_s32_u32(svorr_x(pt, lo, svlsl_n_u32_x(pt, hi, 4))), 32);
+                    int si = part * 2 + k / 16;
+                    svfloat32_t w = svmul_x(pt, svcvt_f32_s32_x(pt, q),
+                                            svmul_n_f32_x(pt, vd, (float)sc[si]));
+                    acc = svmla_m(pt, acc, w,
+                        svld1(pt, x + ib * 256 + half * 128 + part * 32 + k));
+                }
+            }
+        }
+    }
+    return svaddv_f32(pg, acc);
+}
+
+static inline float tf_iq4_xs_dot_sve(const block_iq4_xs *blocks, const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    svfloat32_t acc = svdup_f32(0.0f);
+    for (int ib = 0; ib < n / 256; ib++) {
+        const block_iq4_xs *b = &blocks[ib];
+        const float d = ggml_fp16_to_fp32(b->d);
+        for (int g = 0; g < 8; g++) {
+            int ls = ((b->scales_l[g / 2] >> (4 * (g & 1))) & 15) |
+                     (((b->scales_h >> (2 * g)) & 3) << 4);
+            float w[32];
+            for (int k = 0; k < 16; k++) {
+                uint8_t q = b->qs[g * 16 + k];
+                w[k] = d * (ls - 32) * kvalues_iq4nl[q & 15];
+                w[k + 16] = d * (ls - 32) * kvalues_iq4nl[q >> 4];
+            }
+            acc = svmla_x(pg, acc, svld1(pg, w),
+                          svld1(pg, x + ib * 256 + g * 32));
+            acc = svmla_x(pg, acc, svld1(pg, w + 16),
+                          svld1(pg, x + ib * 256 + g * 32 + 16));
+        }
+    }
+    return svaddv_f32(pg, acc);
+}
+
+static inline void tf_compact_k_check(uint32_t type, const void *row,
+                                      const float *x, int n, float got) {
+    static volatile unsigned checked;
+    const char *enabled = getenv("TF_COMPACT_K_CHECK");
+    if (!enabled || atoi(enabled) == 0) return;
+    unsigned bit = type == GGML_TYPE_Q5_K ? 1u :
+                   type == GGML_TYPE_Q6_K ? 2u :
+                   type == GGML_TYPE_IQ4_XS ? 4u : 0u;
+    if (!bit || (__sync_fetch_and_or(&checked, bit) & bit)) return;
+    float *w = (float *)malloc((size_t)n * sizeof(float));
+    if (!w) { fprintf(stderr, "compact-k check: allocation failed\n"); abort(); }
+    dequant_row(type, row, w, n);
+    double ref = 0.0;
+    for (int i = 0; i < n; i++) ref += (double)w[i] * x[i];
+    free(w);
+    double err = fabs((double)got - ref);
+    double rel = err / (fabs(ref) + 1e-12);
+    fprintf(stderr, "compact-k check type=%s n=%d got=%.9g ref=%.9g abs=%.3g rel=%.3g\n",
+            ggml_type_name(type), n, got, ref, err, rel);
+    if (err > 1e-3 && rel > 2e-4) abort();
+}
+
 /* int8 SDOT row dot: sum(w[k]*x[k]) over K via svdot (4 int8 MAC / int32 lane). */
 static inline int32_t tf_int8_dot(const int8_t *w, const int8_t *x, int K) {
     svint32_t a = svdup_s32(0); svbool_t pb = svptrue_b8(); int vlb = (int)svcntb();
@@ -1267,6 +1386,20 @@ static void *tf_qmatvec_worker(void *arg) {
         const block_q4_K *base = (const block_q4_K *)t->mat->data;
         for (int i = t->row_start; i < t->row_end; i++)
             t->dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * row_bytes), t->x, n_cols);
+        return NULL;
+    }
+    if (t->mat->type == GGML_TYPE_Q5_K || t->mat->type == GGML_TYPE_Q6_K ||
+        t->mat->type == GGML_TYPE_IQ4_XS) {
+        size_t row_bytes = tf_row_bytes(t->mat->type, n_cols);
+        for (int i = t->row_start; i < t->row_end; i++) {
+            const uint8_t *row = (const uint8_t *)t->mat->data + (size_t)i * row_bytes;
+            if (t->mat->type == GGML_TYPE_Q5_K)
+                t->dst[i] = tf_q5_k_dot_sve((const block_q5_K *)row, t->x, n_cols);
+            else if (t->mat->type == GGML_TYPE_Q6_K)
+                t->dst[i] = tf_q6_k_dot_sve((const block_q6_K *)row, t->x, n_cols);
+            else
+                t->dst[i] = tf_iq4_xs_dot_sve((const block_iq4_xs *)row, t->x, n_cols);
+        }
         return NULL;
     }
 #endif
@@ -2749,6 +2882,27 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
         const block_q4_K *base = (const block_q4_K *)mat->data;
         for (int i = row_start; i < row_end; i++)
             dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * rb), x, n_cols);
+    } else if (mat->type == GGML_TYPE_Q5_K) {
+        size_t rb = (size_t)(n_cols / 256) * sizeof(block_q5_K);
+        for (int i = row_start; i < row_end; i++) {
+            const void *row = (const uint8_t *)mat->data + (size_t)i * rb;
+            dst[i] = tf_q5_k_dot_sve((const block_q5_K *)row, x, n_cols);
+            tf_compact_k_check(mat->type, row, x, n_cols, dst[i]);
+        }
+    } else if (mat->type == GGML_TYPE_Q6_K) {
+        size_t rb = (size_t)(n_cols / 256) * sizeof(block_q6_K);
+        for (int i = row_start; i < row_end; i++) {
+            const void *row = (const uint8_t *)mat->data + (size_t)i * rb;
+            dst[i] = tf_q6_k_dot_sve((const block_q6_K *)row, x, n_cols);
+            tf_compact_k_check(mat->type, row, x, n_cols, dst[i]);
+        }
+    } else if (mat->type == GGML_TYPE_IQ4_XS) {
+        size_t rb = (size_t)(n_cols / 256) * sizeof(block_iq4_xs);
+        for (int i = row_start; i < row_end; i++) {
+            const void *row = (const uint8_t *)mat->data + (size_t)i * rb;
+            dst[i] = tf_iq4_xs_dot_sve((const block_iq4_xs *)row, x, n_cols);
+            tf_compact_k_check(mat->type, row, x, n_cols, dst[i]);
+        }
 #endif
     } else {
         float *tmp = (float *)malloc(n_cols * sizeof(float));
@@ -2908,6 +3062,20 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         const block_q4_K *base = (const block_q4_K *)mat->data;
         for (int i = 0; i < n_rows; i++)
             dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * row_bytes), x, n_cols);
+        return;
+    }
+    if (mat->type == GGML_TYPE_Q5_K || mat->type == GGML_TYPE_Q6_K ||
+        mat->type == GGML_TYPE_IQ4_XS) {
+        size_t row_bytes = tf_row_bytes(mat->type, n_cols);
+        for (int i = 0; i < n_rows; i++) {
+            const uint8_t *row = (const uint8_t *)mat->data + (size_t)i * row_bytes;
+            if (mat->type == GGML_TYPE_Q5_K)
+                dst[i] = tf_q5_k_dot_sve((const block_q5_K *)row, x, n_cols);
+            else if (mat->type == GGML_TYPE_Q6_K)
+                dst[i] = tf_q6_k_dot_sve((const block_q6_K *)row, x, n_cols);
+            else
+                dst[i] = tf_iq4_xs_dot_sve((const block_iq4_xs *)row, x, n_cols);
+        }
         return;
     }
 #endif
