@@ -2380,3 +2380,14 @@ regressed to 103.42 ms/token; projection/communication overlap regressed to
 BF16 reduction tree was neutral once given equal prefetching and was removed.
 These results put the remaining 40 tok/s gap in projection scheduling and
 resident bandwidth, not scalar activation work or collective-buffer tuning.
+
+After the four-node allocation restarted, the rank-local BF16 shards were
+restaged and all 866 tensors loaded within the HBM guard.  A 32-token warmed
+profile reproduced the exact 48-token reference stream.  Production-kernel
+microbenchmarks then showed that distance 8 is the stronger general setting:
+at K=4352 it reached 766.56 GB/s versus 764.77 GB/s at distance 12, and at
+K=5120 it reached 815.94 versus 805.98 GB/s.  Same-session end-to-end A/B runs
+measured 33.78 ms/token at distance 8 and 34.75 ms/token at distance 12, so the
+launcher default is now 8.  A separate K=1536 specialization was rejected:
+although its isolated kernel reached 588.87 GB/s at distance 8, it was neutral
+end to end and added no useful model-level speedup.
