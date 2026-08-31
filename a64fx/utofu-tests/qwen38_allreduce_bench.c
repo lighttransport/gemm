@@ -14,15 +14,21 @@
  *   mpiexec -np 4 ./tofu_topo_helper
  *   mpiexec -np 4 ./qwen38_allreduce_bench
  *
- * Environment: Q38_AR_ITERS (2000), Q38_AR_WARMUP (200), Q38_AR_COUNT (5120).
+ * Environment: Q38_AR_ITERS (2000), Q38_AR_WARMUP (200), Q38_AR_COUNT (5120),
+ * Q38_AR_CORE (first core in the job cpuset).  All registered and CPU-touched
+ * memory is 256-byte aligned and MPOL_BIND-bound to that core's CMG.
  */
 #define _GNU_SOURCE
+#include <errno.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <utofu.h>
 
 #include "tofu_demo.h"
@@ -44,6 +50,8 @@ static utofu_stadd_t bar_base;
 static utofu_vcq_id_t peer_vcq[JOB_NODES];
 static utofu_stadd_t peer_bar_base[JOB_NODES];
 static uint64_t barrier_seq = 1;
+static int local_cpu;
+static int local_node;
 
 static double now_sec(void)
 {
@@ -63,6 +71,79 @@ static void fatal(const char *what, int rc)
     fprintf(stderr, "qwen38_allreduce rank=%d FATAL %s rc=%d\n",
             world_rank, what, rc);
     exit(1);
+}
+
+static int node_of_cpu(int cpu)
+{
+    for (int node = 0; node < 16; node++) {
+        char path[80], line[256];
+        snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        char *got = fgets(line, sizeof line, f);
+        fclose(f);
+        if (!got) continue;
+        char *p = line;
+        while (*p && *p != '\n') {
+            int lo = (int)strtol(p, &p, 10), hi = lo;
+            if (*p == '-') { p++; hi = (int)strtol(p, &p, 10); }
+            if (cpu >= lo && cpu <= hi) return node;
+            if (*p == ',') p++;
+        }
+    }
+    return -1;
+}
+
+static void bind_one_cmg(void)
+{
+    cpu_set_t allowed, one;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof allowed, &allowed) != 0)
+        fatal("sched_getaffinity", errno);
+    local_cpu = -1;
+    const char *requested = getenv("Q38_AR_CORE");
+    if (requested && *requested) {
+        int cpu = atoi(requested);
+        if (cpu < 0 || cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &allowed))
+            fatal("Q38_AR_CORE is outside the job cpuset", cpu);
+        local_cpu = cpu;
+    } else {
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+            if (CPU_ISSET(cpu, &allowed)) { local_cpu = cpu; break; }
+    }
+    if (local_cpu < 0) fatal("empty CPU affinity mask", -1);
+    CPU_ZERO(&one);
+    CPU_SET(local_cpu, &one);
+    if (sched_setaffinity(0, sizeof one, &one) != 0)
+        fatal("sched_setaffinity", errno);
+    local_node = node_of_cpu(local_cpu);
+    if (local_node < 0 || local_node >= (int)(8 * sizeof(unsigned long)))
+        fatal("cannot map selected core to a CMG NUMA node", local_node);
+}
+
+/* mmap is page aligned (and therefore 256-byte aligned).  Bind before first
+ * touch so CPU reduction, uTofu source, and uTofu landing pages stay in the
+ * same CMG as the pinned communication thread. */
+static void *cmg_alloc(size_t bytes, size_t *mapped_bytes)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    if (page < DEMO_CACHE_LINE) page = DEMO_CACHE_LINE;
+    size_t n = (bytes + (size_t)page - 1) & ~((size_t)page - 1);
+    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) fatal("mmap", errno);
+#if defined(SYS_mbind)
+    unsigned long mask = 1UL << local_node;
+    if (syscall(SYS_mbind, p, n, 2L /* MPOL_BIND */, &mask,
+                8UL * sizeof(mask), 0U) != 0)
+        fatal("mbind communication memory", errno);
+#else
+    fatal("mbind is unavailable", ENOSYS);
+#endif
+    if (((uintptr_t)p & (DEMO_CACHE_LINE - 1)) != 0)
+        fatal("communication memory is not 256-byte aligned", -1);
+    *mapped_bytes = n;
+    return p;
 }
 
 static int read_topology(uint8_t topo[][TOFU_NCOORDS])
@@ -145,15 +226,18 @@ static void run_case(int tp, long count, long warmup, long iters)
     utofu_vcq_id_t group_peers[JOB_NODES];
     for (int r = 0; r < tp; r++) group_peers[r] = peer_vcq[group_first + r];
 
+    tp_comm_config config = tp_comm_env_config();
+    size_t comm_need = tp_comm_region_size(tp, (int)count, &config);
+    size_t comm_mapped = 0;
+    void *comm_region = cmg_alloc(comm_need, &comm_mapped);
     tp_comm comm;
-    if (tp_comm_init(&comm, vcq, group_peers, local_rank, tp, (int)count,
-                     group_barrier) != 0)
+    if (tp_comm_init_external(&comm, vcq, group_peers, local_rank, tp,
+                              (int)count, group_barrier, &config,
+                              comm_region, comm_mapped) != 0)
         fatal("tp_comm_init", -1);
 
-    float *buf = NULL;
-    if (posix_memalign((void **)&buf, DEMO_CACHE_LINE,
-                       (size_t)count * sizeof(*buf)) != 0)
-        fatal("allocate payload", -1);
+    size_t buf_mapped = 0;
+    float *buf = cmg_alloc((size_t)count * sizeof(*buf), &buf_mapped);
 
     float input = (float)(local_rank + 1);
     float expected = (float)(tp * (tp + 1) / 2);
@@ -185,23 +269,30 @@ static void run_case(int tp, long count, long warmup, long iters)
     /* One line per group catches asymmetric pair placement in the TP2 case. */
     if (local_rank == 0) {
         double token_ms = usec * MODEL_REDUCES / 1000.0;
-        double gib_s = ((double)count * sizeof(float)) / (usec * 1e-6) /
-                       (1024.0 * 1024.0 * 1024.0);
+        int rounds = tp == 2 ? 1 : 2;
+        double wire_gb_s = (double)rounds * count * sizeof(float) /
+                           (usec * 1e-6) / 1e9;
+        double link_pct = wire_gb_s / 6.8 * 100.0;
         printf("qwen38_ar tp=%d group=%d-%d ranks=%d payload=fp32 "
-               "count=%ld bytes=%ld reduce_us=%.3f loop_us=%.3f effective_GiB/s=%.3f "
-               "reduces_per_token=%d comm_ms_per_token=%.3f models=Q8_0,BF16\n",
+               "count=%ld bytes=%ld rounds=%d reduce_us=%.3f loop_us=%.3f "
+               "wire_GB/s=%.3f link_peak_pct=%.1f "
+               "reduces_per_token=%d comm_ms_per_token=%.3f models=Q8_0,BF16 "
+               "cpu=%d cmg_node=%d align=256\n",
                tp, group_first, group_first + tp - 1, tp, count,
-               count * (long)sizeof(float), usec, total_usec, gib_s,
-               MODEL_REDUCES, token_ms);
+               count * (long)sizeof(float), rounds, usec, total_usec,
+               wire_gb_s, link_pct,
+               MODEL_REDUCES, token_ms, local_cpu, local_node);
         fflush(stdout);
     }
-    free(buf);
     tp_comm_free(&comm);
+    munmap(buf, buf_mapped);
+    munmap(comm_region, comm_mapped);
 }
 
 int main(void)
 {
     world_rank = -1;
+    bind_one_cmg();
     long count = env_long("Q38_AR_COUNT", 5120);
     long warmup = env_long("Q38_AR_WARMUP", 200);
     long iters = env_long("Q38_AR_ITERS", 2000);
@@ -232,8 +323,8 @@ int main(void)
 
     bar_slot = DEMO_CACHE_LINE;
     size_t bytes = bar_slot * (size_t)(world_size + 2);
-    if (posix_memalign((void **)&bar_region, DEMO_CACHE_LINE, bytes) != 0)
-        fatal("allocate barrier", -1);
+    size_t bar_mapped = 0;
+    bar_region = cmg_alloc(bytes, &bar_mapped);
     memset(bar_region, 0, bytes);
     if ((rc = utofu_reg_mem_with_stag(vcq, bar_region, bytes, BARRIER_STAG, 0,
                                       &bar_base)) != UTOFU_SUCCESS)
@@ -262,6 +353,6 @@ int main(void)
 
     utofu_dereg_mem(vcq, bar_base, 0);
     utofu_free_vcq(vcq);
-    free(bar_region);
+    munmap(bar_region, bar_mapped);
     return 0;
 }
