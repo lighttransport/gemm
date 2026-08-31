@@ -2445,3 +2445,27 @@ Use `run_qwen38_bf16_tp4.sh stage-mtp` after each allocation restart to build
 the separate `/local/...-nextnshard` image, then run `mtp-sustained`.  The MTP
 mode now selects TP4 NextN sharding, mask 5, direct all-to-all, and K=2 by
 default; ordinary BF16 stage/decode settings are unchanged.
+
+#### Post-restart BF16 sweep (2026-09-01)
+
+The `stage-mtp` workflow was restaged on a fresh four-node allocation and
+reproduced the accepted teacher gate (55/178).  The short K=2 profile measured
+52.56 ms verification, 13.25 ms draft, and 26.99 tok/s.  Raw target hidden
+states slightly increased the offline teacher score to 58/178 but left runtime
+acceptance at 26/39 and reduced the 64-token result to 25.42 tok/s; hidden-first
+fusion failed completely at 0/178.  Both remain disabled.
+
+Verifier blocktimes 100 and 400 ms, MTP2 prefetch distances 8 and 16, poll-spin
+32, a 16,384-float all-to-all cutoff, and adding FFN-down PV all regressed from
+the accepted defaults (200 ms, distance 12, poll-spin 8, cutoff 8192, mask 5).
+A PV-aware NextN fused gate/up implementation preserved 55/178 but raised draft
+time to 14.58 ms and was removed.
+
+Direct all-to-all was also tested for exact plain BF16 decode.  It improved the
+64-token measured region from 36.36 to 35.60 ms/token, but its 96-token SHA256
+was `737b132892e98a47c9f69f10779d0075d1c071579b94c4a16045d7d385239f94`,
+versus `66dbe8441659445c3b8dc6941d62814a0724824627fbede94eafe803db0a1235`
+for the standard collective.  The different FP32 summation order therefore
+eventually changes greedy output, so standard reduction remains the exact
+plain-decode default.  All-to-all stays confined to the separately quality-
+gated MTP profile.
