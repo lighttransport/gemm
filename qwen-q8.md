@@ -2461,11 +2461,17 @@ the accepted defaults (200 ms, distance 12, poll-spin 8, cutoff 8192, mask 5).
 A PV-aware NextN fused gate/up implementation preserved 55/178 but raised draft
 time to 14.58 ms and was removed.
 
-Direct all-to-all was also tested for exact plain BF16 decode.  It improved the
-64-token measured region from 36.36 to 35.60 ms/token, but its 96-token SHA256
-was `737b132892e98a47c9f69f10779d0075d1c071579b94c4a16045d7d385239f94`,
-versus `66dbe8441659445c3b8dc6941d62814a0724824627fbede94eafe803db0a1235`
-for the standard collective.  The different FP32 summation order therefore
-eventually changes greedy output, so standard reduction remains the exact
-plain-decode default.  All-to-all stays confined to the separately quality-
-gated MTP profile.
+Direct all-to-all was also retested for exact plain BF16 decode.  The initially
+recorded standard-collective token hash could not be reproduced: an adjacent
+control run with recursive doubling produced the same 96-token SHA256 as
+all-to-all, `737b132892e98a47c9f69f10779d0075d1c071579b94c4a16045d7d385239f94`.
+An explicit four-rank arithmetic-tree implementation produced that same hash
+as well, ruling out the A2A fold order as the cause of the earlier sequence.
+It was removed rather than retaining unnecessary code.
+
+In the final same-build A/B, recursive doubling measured 34.40 ms/token and
+the simple direct A2A path measured 33.49 ms/token over the 64-token measured
+region, a 0.91 ms/token (2.6%) reduction with identical token hashes.  TP4 now
+enables A2A for reductions up to 8192 floats in both ordinary decode and MTP;
+set `TP_AR_A2A=0` for a recursive-doubling control.  Larger reductions continue
+to use the tree collective.

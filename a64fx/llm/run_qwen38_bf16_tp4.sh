@@ -42,6 +42,12 @@ export TF_LOAD_KEEPCACHE=0
 export TF_HIER_BARRIER=${TF_HIER_BARRIER:-0} TF_BF16PV_PREFETCH=${TF_BF16PV_PREFETCH:-8}
 export TF_BF16PV_PREFETCH_MTP2=${TF_BF16PV_PREFETCH_MTP2:-12}
 export TF_SSM_FUSED_DOTS=${TF_SSM_FUSED_DOTS:-1}
+# Decode-size TP4 reductions are faster as direct peer puts than as two
+# recursive-doubling rounds.  Keep larger payloads on the tree and allow an
+# explicit TP_AR_A2A=0 for reproducibility/control runs.
+if [ "$TP_SIZE" = 4 ]; then
+    export TP_AR_A2A=${TP_AR_A2A:-1} TP_AR_A2A_MAX=${TP_AR_A2A_MAX:-8192}
+fi
 # Exact-token validated on both trunk and K=5 MTP.  Avoid scalar expf in the
 # verifier and replicated NextN FFN activation passes.
 export TF_SILU_SVE=${TF_SILU_SVE:-1}
@@ -51,7 +57,6 @@ if [ "${TP_NEXTN_SHARD:-0}" != 0 ]; then
     # EH + attention-output PV are exact under the sharded schedulers.  Q PV
     # changes draft argmaxes; K/V and gate/up cannot satisfy 8-row task bounds.
     export TP_NEXTN_PV_MASK=${TP_NEXTN_PV_MASK:-5}
-    export TP_AR_A2A=${TP_AR_A2A:-1} TP_AR_A2A_MAX=${TP_AR_A2A_MAX:-8192}
 else
     export TP_NEXTN_PV_MASK=${TP_NEXTN_PV_MASK:-1}
 fi
