@@ -2363,3 +2363,20 @@ it improved the Q8 row probe to 96.60 ms/token, but did not improve the BF16
 conversion path outside run-to-run noise. These short probes are not the final
 three-repeat 256-token acceptance gate, and neither Q8 token stream has yet
 passed the teacher-forced quality threshold.
+
+### Exact BF16 follow-up profile (2026-08-31)
+
+The current TP4 exact-PV path measures 32.36 ms/token with the validated
+default collective and retains the 20-token reference stream. Of that, 27.51
+ms is compute/rank-arrival time and 4.85 ms is 129 FP32 reductions. Profiling
+rank 0 attributes 8.27 ms to FFN gate/up, 5.74 ms to FFN down, 5.11 ms to SSM
+input, 4.09 ms to SSM output, 1.97 ms to attention projections, and 2.66 ms to
+SSM preparation/core.
+
+BF16-PV prefetch distances 4, 12, and 16 measured 32.51, 32.18, and 33.24
+ms/token in short A/B runs, so the launcher now uses 12. Hierarchical barriers
+regressed to 103.42 ms/token; projection/communication overlap regressed to
+52.79 ms/token and increased reductions from 129 to 641. A single-accumulator
+BF16 reduction tree was neutral once given equal prefetching and was removed.
+These results put the remaining 40 tok/s gap in projection scheduling and
+resident bandwidth, not scalar activation work or collective-buffer tuning.

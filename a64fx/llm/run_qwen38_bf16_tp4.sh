@@ -32,7 +32,7 @@ export NUMA_CMG_BUDGET_GB=${NUMA_CMG_BUDGET_GB:-7} NUMA_ALIGNMENT=${NUMA_ALIGNME
 # metadata and explicitly reads the stage into anonymous HBM-resident memory.
 unset GGUF_LAZY_MMAP TF_FORCE_MMAP
 export TF_LOAD_KEEPCACHE=0
-export TF_HIER_BARRIER=${TF_HIER_BARRIER:-0} TF_BF16PV_PREFETCH=${TF_BF16PV_PREFETCH:-8}
+export TF_HIER_BARRIER=${TF_HIER_BARRIER:-0} TF_BF16PV_PREFETCH=${TF_BF16PV_PREFETCH:-12}
 export TF_BF16PV_PREFETCH_MTP2=${TF_BF16PV_PREFETCH_MTP2:-12}
 export TF_SSM_FUSED_DOTS=${TF_SSM_FUSED_DOTS:-1}
 # Exact-token validated on both trunk and K=5 MTP.  Avoid scalar expf in the
