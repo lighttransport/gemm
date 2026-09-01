@@ -9718,6 +9718,9 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     int nkh = L->attn_k.n_rows / hd;
     int nff = L->ffn_gate.n_rows;
     int qd = nh * hd, kvd = nkh * hd, gqa = nh / nkh;
+    int profile = getenv("TF_NEXTN_PROFILE") != NULL;
+    double pt0 = profile ? tf_time_ms() : 0.0, pt_eh = 0.0, pt_qkv = 0.0;
+    double pt_attn = 0.0, pt_out = 0.0, pt_ffn = 0.0;
 
     /* The target pointer is commonly model->x; preserve it before using shared scratch. */
     memcpy(nn->hidden, target_hidden, (size_t)ne * sizeof(float));
@@ -9730,6 +9733,7 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     tf_rmsnorm(h_dst, nn->hidden, &nn->hnorm, ne,
                m->rms_norm_eps, m->matvec_tmp);
     tf_qmatvec_pool(m, m->x, &nn->eh_proj, nn->fusion, ne);
+    if (profile) pt_eh = tf_time_ms();
 
     tf_rmsnorm(m->xb, m->x, &L->attn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
     tf_qmatvec_fused_qkv_pool(m, m->xb2, &L->attn_q, 2 * qd,
@@ -9744,6 +9748,7 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     tf_apply_rope(m, m->q, m->k, nh, nkh, hd, position, position, position);
     memcpy(nn->key_cache + (size_t)position * kvd, m->k, (size_t)kvd * sizeof(float));
     memcpy(nn->value_cache + (size_t)position * kvd, m->v, (size_t)kvd * sizeof(float));
+    if (profile) pt_qkv = tf_time_ms();
 
     memset(m->xb2, 0, (size_t)qd * sizeof(float));
     if (m->pool_alive && m->n_threads > 1 && nh > 1) {
@@ -9766,11 +9771,13 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     }
     for (int i = 0; i < qd; i++)
         m->xb2[i] *= 1.0f / (1.0f + expf(-m->ffn_buf1[i]));
+    if (profile) pt_attn = tf_time_ms();
     tf_qmatvec_pool(m, m->xb, &L->attn_output, m->xb2, ne);
     int nextn_sharded = !getenv("TP_STAGE_DIR") ||
         (getenv("TP_NEXTN_SHARD") && atoi(getenv("TP_NEXTN_SHARD")));
     if (nextn_sharded && m->tp_attn_sharded && m->tp_allreduce_fn)
         m->tp_allreduce_fn(m->xb, ne, m->tp_allreduce_ctx);
+    if (profile) pt_out = tf_time_ms();
     tf_vadd(m->x, m->xb, ne);
     tf_rmsnorm(m->xb, m->x, &L->ffn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
     tf_qmatvec_fused2_pool(m, m->ffn_buf1, &L->ffn_gate,
@@ -9779,6 +9786,7 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     tf_qmatvec_pool(m, m->xb, &L->ffn_down, m->ffn_buf3, ne);
     if (nextn_sharded && m->tp_ffn_sharded && m->tp_allreduce_fn)
         m->tp_allreduce_fn(m->xb, ne, m->tp_allreduce_ctx);
+    if (profile) pt_ffn = tf_time_ms();
     tf_vadd(m->x, m->xb, ne);
     memcpy(nn->hidden, m->x, (size_t)ne * sizeof(float));
     /* Qwen3.5 NextN shares the trunk output norm/head when the optional
@@ -9791,6 +9799,12 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
      * Produce only local rows; the caller performs the global argmax reduce. */
     tf_qmatvec_pool(m, m->logits, head, m->xb,
                     head->n_rows > 0 ? head->n_rows : m->n_vocab);
+    if (profile && m->tp_rank == 0) {
+        double end = tf_time_ms();
+        fprintf(stderr, "nextn profile: eh=%.3f qkv=%.3f attn=%.3f out=%.3f ffn=%.3f head=%.3f total=%.3f ms\n",
+                pt_eh - pt0, pt_qkv - pt_eh, pt_attn - pt_qkv,
+                pt_out - pt_attn, pt_ffn - pt_out, end - pt_ffn, end - pt0);
+    }
     return m->logits;
 }
 

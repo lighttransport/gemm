@@ -2534,3 +2534,17 @@ ms and did not improve end-to-end throughput.  MTP4 prefetch distances 0, 4,
 and 12 did not beat distance 8 in the 64-token acceptance run.  Reaching 50+
 therefore requires a persistent/fused NextN implementation or a different
 near-zero-cost proposer, not another trunk-verifier prefetch adjustment.
+
+`TF_NEXTN_PROFILE=1` now reports per-call draft phases.  Stable mask-5 calls
+take roughly 8--10 ms each: EH 0.8--1.5 ms, QKV 0.8--1.4 ms, attention about
+0.8--1.3 ms, output 0.9--1.8 ms, FFN 1.9--3.0 ms, and the local vocabulary
+head 1.4--2.3 ms.  Thus three autoregressive calls have a measured 24--30 ms
+floor even after dispatch jitter is removed.  Shadow pools with 24 and 12
+threads measured 34.41 and 37.73 ms/round and did not help.
+
+A separately staged mask-37 experiment added BF16-PV packing for the NextN
+vocabulary head.  It retained 25/27 runtime matches but regressed the 32-token
+screen to 30.41 tok/s (76.69 ms verify, 40.17 ms draft); head time remained
+about 1.6--2.0 ms.  Mask 5 remains the accepted layout.  The result reinforces
+that 50+ needs speculative lookahead overlapped with verification (and a
+separate collective stream), rather than another per-call layout change.
