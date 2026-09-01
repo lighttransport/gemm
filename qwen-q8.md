@@ -2492,3 +2492,7 @@ two-chunk SVE unroll retained the token hash but regressed decode to 35.19
 ms/token through added register pressure.  Vectorizing the persistent worker's
 small per-thread SiLU slices also retained the long hash but regressed to 36.10
 ms/token and made rank 0 the straggler.  Both kernel experiments were removed.
+BF16 collective transport was also rejected: although its 96-token hash matched
+the current FP32 control, conversion overhead and disabling direct A2A raised
+decode to 36.86 ms/token, with roughly 10 ms/token charged to communication on
+the waiting ranks.  FP32 direct A2A remains the TP4 decode transport.
