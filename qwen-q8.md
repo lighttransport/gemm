@@ -2483,3 +2483,12 @@ acceptance run measured 32.65 ms/token (27.10 ms compute and 5.55 ms
 communication on rank 1) and retained the control SHA256 above.  The launcher
 therefore uses distance 6 for single-token BF16 kernels; the independently
 tuned two-token MTP kernel remains at distance 12.
+
+Production-shape microbenchmarks show the exact BF16-PV kernel is already close
+to the local streaming limit: 773.79 GB/s at K=4352 (84.3% of a 918.17 GB/s
+read ceiling) and 832.54 GB/s at K=5120 (91.0% of 915.02 GB/s).  The remaining
+model-level gap is therefore primarily scheduling, barriers, and rank skew.  A
+two-chunk SVE unroll retained the token hash but regressed decode to 35.19
+ms/token through added register pressure.  Vectorizing the persistent worker's
+small per-thread SiLU slices also retained the long hash but regressed to 36.10
+ms/token and made rank 0 the straggler.  Both kernel experiments were removed.
