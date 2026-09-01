@@ -2515,3 +2515,22 @@ still well behind BF16.  The allocating block64 FFN pack requested another
 safe for this 32 GB interactive configuration.  Decode P-at-V is not converted:
 it would require a scaled, transposed INT8 value cache, and its small current
 context cost cannot recover the projection/FFN regression.
+
+#### BF16 MTP 50 tok/s target
+
+On the repeated 359-token production prompt, runtime draft agreement is much
+higher than the earlier short-context sweep.  K=2 accepted 32/33 second drafts
+and measured 30.16 tok/s (52.01 ms verify plus 12.24 ms draft per round).  A
+same-session K sweep measured 32.35 tok/s at K=3, **34.90 tok/s at K=4**, and
+32.53 tok/s at K=5.  K=4 retained 49/51 draft matches (alpha 0.9608), so the
+sustained launcher now defaults to K=4.
+
+The 50 tok/s target is not yet met.  K=4 spends about 71 ms verifying and 37 ms
+building its three sequential NextN drafts.  A forced-accept diagnostic with
+draft generation removed reached **55.26 tok/s**, establishing that the batched
+verifier is fast enough but leaving only about 7 ms/round for a production
+draft path.  A private 48-thread shadow pool reduced draft time only to 34.94
+ms and did not improve end-to-end throughput.  MTP4 prefetch distances 0, 4,
+and 12 did not beat distance 8 in the 64-token acceptance run.  Reaching 50+
+therefore requires a persistent/fused NextN implementation or a different
+near-zero-cost proposer, not another trunk-verifier prefetch adjustment.
