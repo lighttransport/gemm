@@ -2475,3 +2475,11 @@ region, a 0.91 ms/token (2.6%) reduction with identical token hashes.  TP4 now
 enables A2A for reductions up to 8192 floats in both ordinary decode and MTP;
 set `TP_AR_A2A=0` for a recursive-doubling control.  Larger reductions continue
 to use the tree collective.
+
+A finer same-session BF16-PV prefetch sweep then found distance 6 preferable to
+the prior distance 8 default.  Distance 6 measured 32.59 ms/token over the
+32-token screen, while distance 4 measured 33.54 ms/token.  Its 64-token
+acceptance run measured 32.65 ms/token (27.10 ms compute and 5.55 ms
+communication on rank 1) and retained the control SHA256 above.  The launcher
+therefore uses distance 6 for single-token BF16 kernels; the independently
+tuned two-token MTP kernel remains at distance 12.
