@@ -2496,3 +2496,22 @@ BF16 collective transport was also rejected: although its 96-token hash matched
 the current FP32 control, conversion overhead and disabling direct A2A raised
 decode to 36.86 ms/token, with roughly 10 ms/token charged to communication on
 the waiting ranks.  FP32 direct A2A remains the TP4 decode transport.
+
+#### Resident INT8/INT16 SDOT follow-up
+
+The row-major BF16 stage was quantized in place to compact per-row INT8 weights
+and tested with both INT8 and INT16 activations.  Full-projection W8A8 measured
+51.28 ms/token (about 19.5 tok/s); H-to-D W8A16 measured 51.15 ms/token.  Both
+were slower than the 32.65 ms/token BF16-PV path and produced quantized token
+streams.  A four-row W8A16 kernel retained its stream but regressed to 56.30
+ms/token from SVE register pressure, so it was removed; the existing four-row
+W8A8 kernel remains active.
+
+`TP_INT8_MODE=row-ffn` now provides a memory-neutral diagnostic that quantizes
+only FFN gate/up/down in place while leaving attention, SSM, and the head BF16.
+One-token screens measured 50.56 ms for INT8 SDOT and 48.77 ms for INT16 SDOT,
+still well behind BF16.  The allocating block64 FFN pack requested another
+4.412 GB while retaining the 17.165 GB stage and was killed on rank 0; it is not
+safe for this 32 GB interactive configuration.  Decode P-at-V is not converted:
+it would require a scaled, transposed INT8 value cache, and its small current
+context cost cannot recover the projection/FFN regression.

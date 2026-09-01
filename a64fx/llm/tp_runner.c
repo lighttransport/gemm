@@ -1326,8 +1326,11 @@ int main(int argc, char **argv) {
             transformer_prepack_int8_block64_ffn(m);
         else if (!strcmp(getenv("TP_INT8_MODE"), "block64"))
             transformer_prepack_int8_block64(m);
-        else
+        else if (!strcmp(getenv("TP_INT8_MODE"), "row") ||
+                 !strcmp(getenv("TP_INT8_MODE"), "row-ffn"))
             transformer_prepack_int8(m);
+        else
+            die("TP_INT8_MODE must be row, row-ffn, block64, or block64-ffn", -1);
         if (MyRank == 0) logmsg("TP_INT8_MODE=%s enabled for resident BF16 projections\n",
                                 getenv("TP_INT8_MODE"));
     }

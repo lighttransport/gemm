@@ -10095,7 +10095,10 @@ void transformer_prepack_int8_block64_ffn(transformer_model *m) {
 void transformer_prepack_int8(transformer_model *m) {
     if (!m || !m->layers) return;
     int cnt = 0;
-    fprintf(stderr, "int8 prepack: start (%d layers, in-place)\n", m->n_layers);
+    const char *mode = getenv("TP_INT8_MODE");
+    int ffn_only = mode && !strcmp(mode, "row-ffn");
+    fprintf(stderr, "int8 prepack: start (%d layers, in-place%s)\n",
+            m->n_layers, ffn_only ? ", FFN only" : "");
     for (int li = 0; li < m->n_layers; li++) {
         transformer_layer *L = &m->layers[li];
         qtensor *ws[] = {
@@ -10104,7 +10107,8 @@ void transformer_prepack_int8(transformer_model *m) {
             &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta,
             &L->ssm_conv1d, &L->ssm_out
         };
-        for (size_t wi = 0; wi < sizeof(ws) / sizeof(ws[0]); wi++) {
+        size_t nw = ffn_only ? 3 : sizeof(ws) / sizeof(ws[0]);
+        for (size_t wi = 0; wi < nw; wi++) {
             qtensor *w = ws[wi];
             if (!w->data || w->type != GGML_TYPE_BF16 || w->i8) continue;
             int nr = w->n_rows, K = w->n_cols;
@@ -10129,7 +10133,7 @@ void transformer_prepack_int8(transformer_model *m) {
             w->i8 = i8; w->i8s = sc; cnt++;
         }
     }
-    if (m->output.data && m->output.type == GGML_TYPE_BF16 && !m->output.i8) {
+    if (!ffn_only && m->output.data && m->output.type == GGML_TYPE_BF16 && !m->output.i8) {
         qtensor *w = &m->output;
         int nr = w->n_rows, K = w->n_cols;
         float *sc = (float *)malloc((size_t)nr * sizeof(float));
