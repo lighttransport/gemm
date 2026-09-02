@@ -2595,3 +2595,26 @@ smaller proposer or reuse/fusion that avoids rereading the full NextN weights,
 plus the planned 25--30% verifier reduction.  Merely repartitioning the 48 cores
 or adding a second communication stream is insufficient on this memory-bound
 node.
+
+#### Post-async verifier and proposer probes
+
+K=3 cannot replace K=4/K=5 as the route to 50 tok/s.  A 128-token forced-full-
+accept run measured 68.99 ms/round; even three emitted tokens per round cap at
+43.5 tok/s before proposer cost.  A current exact K=5/256 run retained the
+established oracle SHA256
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`,
+but the present allocation delivered only 531--561 GB/s/node effective local
+bandwidth versus the earlier accepted 868--870 GB/s/node.  Its 93.09 ms verify,
+48.57 ms draft, and 32.84 tok/s result should therefore not replace the
+previous sustained 53.43 tok/s headline.
+
+Two further algorithmic probes were rejected.  A snapshot-free vector SSM
+ceiling reduced K=5 verification by about 8% (roughly 94 to 86.94 ms and 55.05
+tok/s with drafting removed), but exact lazy rollback/replay changed the
+128-token hash to
+`6b136ca08910eb2b47a820d1be2efc5eed1a38c7bf8f8a43de009c6b29f274c2`.
+The existing per-token recurrent snapshots remain required for the exact
+oracle.  Connecting the existing BF16-PV fused local-argmax helper to the
+NextN vocabulary head did preserve the complete 256-token oracle, but raised
+draft time from 48.57 to 57.50 ms and reduced throughput from 32.84 to 30.02
+tok/s.  Both code experiments were fully removed.
