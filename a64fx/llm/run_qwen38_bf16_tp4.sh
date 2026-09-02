@@ -25,6 +25,21 @@ export PJM_MPI_PROC=$TP_SIZE
 # compute outlier, charging the other ranks' wait as all-reduce time.  Keep it
 # overrideable for topology-specific experiments.
 export OMP_PROC_BIND=${OMP_PROC_BIND:-spread} OMP_PLACES=${OMP_PLACES:-cores}
+# Async K4 reserves local core slots 9..11 in every CMG for the 12-thread
+# NextN pool.  Order the remaining places by CMG so static verifier row ranges
+# retain the same row-quarter ownership as the staged weight first-touch.
+if [ "${TP_MTP_ASYNC:-0}" != 0 ]; then
+    export TP_MTP_VERIFY_THREADS=${TP_MTP_VERIFY_THREADS:-36}
+    export TP_MTP_SHADOW_THREADS=${TP_MTP_SHADOW_THREADS:-12}
+    export TP_MTP_SHADOW_STRIPED=${TP_MTP_SHADOW_STRIPED:-1}
+    export TP_MTP_SHADOW_CORE_OFFSET=${TP_MTP_SHADOW_CORE_OFFSET:-9}
+    # NextN executes on its private pthread pool.  Do not let its small SiLU
+    # pass recursively launch a verifier-sized OpenMP team from the background.
+    export TF_SILU_OMP=0
+    export OMP_PROC_BIND=close
+    export OMP_PLACES=${TP_MTP_VERIFY_PLACES:-\
+'{12},{13},{14},{15},{16},{17},{18},{19},{20},{24},{25},{26},{27},{28},{29},{30},{31},{32},{36},{37},{38},{39},{40},{41},{42},{43},{44},{48},{49},{50},{51},{52},{53},{54},{55},{56}'}
+fi
 # Keep the verifier's many small OpenMP regions hot, then explicitly park those
 # workers before the pthread-based native NextN pool runs.  Zero block time
 # repeatedly sleeps/wakes the matrix teams; active wait without parking

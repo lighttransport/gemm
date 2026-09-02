@@ -2548,3 +2548,50 @@ screen to 30.41 tok/s (76.69 ms verify, 40.17 ms draft); head time remained
 about 1.6--2.0 ms.  Mask 5 remains the accepted layout.  The result reinforces
 that 50+ needs speculative lookahead overlapped with verification (and a
 separate collective stream), rather than another per-call layout change.
+
+#### Asynchronous K=4 drafting experiment
+
+`TP_MTP_ASYNC=1` implements the proposed continuation pipeline.  At the start
+of a round, a background thread predicts the next four-token queue from the
+current bonus token while the trunk verifies `[input,draft0,draft1,draft2]`.
+The continuation is adopted only when all three drafts and the bonus token
+match.  A rejected chain is discarded and regenerated from the selected target
+hidden state, so speculative state never changes the committed trunk state.
+
+The draft uses an independent NextN scratch/KV context and pthread pool.  Its
+collectives use a second uTofu VCQ on TNI 1, a separate stag, and a 256-byte
+aligned 405 KiB communication region.  The default 36/12 split reserves three
+cores in every CMG for drafting; the striped affinity keeps each weight row on
+its owning CMG and avoids inter-CMG reads.  The verifier's batch helpers now
+consistently honor the reduced team size.  The SSM scan maps an arbitrary equal
+number of lanes to each of the 12 local recurrent heads, supporting both the
+48-thread control and reduced verifier teams without the snapshot-heavy scalar
+fallback.
+
+Two correctness/performance faults found during bring-up are now guarded in
+the implementation.  A completed worker waits for the consumer instead of
+executing the same request repeatedly, and blocked attention, SSM convolution,
+SSM preparation, projections, and FFN all use the same verifier thread count.
+Before those fixes, stale draft requests flooded the second TNI and mixed
+36/48-thread OpenMP regions took 10--22 seconds per verification round.  After
+the fixes, the 36-thread verifier returned to 73.52 ms/round.
+
+The experiment does not improve sustained throughput on A64FX.  With the
+359-token prompt, 36 verifier plus 12 draft cores measured 73.52 ms verification
+but 207.63 ms for the concurrent four-step continuation, including 150.01 ms
+of exposed wait; the 32-token screen reached 9.65 tok/s.  A 24/24 split measured
+91.14 ms verification, 227.97 ms continuation, and 154.69 ms exposed wait,
+reaching 10.00 tok/s over 64 tokens.  Giving the draft more cores did not help:
+the verifier and NextN projections contend for the same HBM bandwidth in every
+CMG.  A second TNI removes collective serialization, but cannot remove this
+weight-stream contention.
+
+Therefore asynchronous full-NextN drafting is retained as an opt-in diagnostic,
+not enabled by the production launcher.  The measured break-even requires the
+four-step continuation to finish within roughly the 72 ms verifier window and
+the verifier itself to fall toward 55 ms/round; current concurrent continuation
+is about three times that budget.  Reaching 50+ BF16 MTP needs a materially
+smaller proposer or reuse/fusion that avoids rereading the full NextN weights,
+plus the planned 25--30% verifier reduction.  Merely repartitioning the 48 cores
+or adding a second communication stream is insufficient on this memory-bound
+node.

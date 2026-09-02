@@ -269,6 +269,7 @@ typedef struct {
     int pool_alive;            /* 1 if pool is running */
     int pool_paused;           /* workers retained asleep while OMP batch owns cores */
     int pool_core_offset;      /* optional A64FX core offset for an isolated pool */
+    int pool_core_striped;     /* map a reduced pool evenly across all CMGs */
     pthread_mutex_t pool_mutex;/* protects pool_phase signaling */
     pthread_cond_t pool_cond;  /* workers sleep here between dispatches */
     volatile int bar_count;    /* barrier arrival counter */
@@ -3654,6 +3655,7 @@ static void *tf_attn_worker(void *arg) {
  * block shares each K/V cache row across all of its query tokens and the query
  * heads mapped to one KV head.  Each output still accumulates positions in
  * increasing order, matching the scalar task schedule's causal semantics. */
+extern int tf_batch_threads;
 static int tf_qwen_attention_blocked(transformer_model *m, int layer,
         const float *q, int q_stride, float *out, int qdim, int kvdim,
         int start_pos, int N) {
@@ -3672,7 +3674,7 @@ static int tf_qwen_attention_blocked(transformer_model *m, int layer,
     int nqb = (N + bq - 1) / bq, max_seq = start_pos + N;
     float scale = 1.0f / sqrtf((float)hd);
     #ifdef _OPENMP
-    #pragma omp parallel num_threads(m->n_threads)
+    #pragma omp parallel num_threads(tf_batch_threads > 0 ? tf_batch_threads : m->n_threads)
     #endif
     {
         size_t sn = (size_t)bq * nh * max_seq;
@@ -4710,12 +4712,20 @@ static void tf_bind_current_thread_for_numa(const transformer_model *model,
      * CMG0, 12..23 to CMG1, etc.  The old round-robin mapping (tid % 4)
      * scattered every tensor slice across all CMGs and made first-touch
      * placement remote for three quarters of each slice. */
-    int logical_tid = tid + (model ? model->pool_core_offset : 0);
-    logical_tid %= 48;
-    if (logical_tid < 0) logical_tid += 48;
     int per_cmg = 48 / n_cmgs;
-    int cmg = logical_tid / per_cmg;
-    int local = logical_tid % per_cmg;
+    int cmg, local;
+    if (model && model->pool_core_striped && model->n_threads >= n_cmgs &&
+        model->n_threads % n_cmgs == 0) {
+        int team_per_cmg = model->n_threads / n_cmgs;
+        cmg = tid / team_per_cmg;
+        local = model->pool_core_offset + tid % team_per_cmg;
+    } else {
+        int logical_tid = tid + (model ? model->pool_core_offset : 0);
+        logical_tid %= 48;
+        if (logical_tid < 0) logical_tid += 48;
+        cmg = logical_tid / per_cmg;
+        local = logical_tid % per_cmg;
+    }
     if (cmg >= n_cmgs) cmg = n_cmgs - 1;
     if (local >= 12) local %= 12;
     int core = 12 + cmg * 12 + local;
@@ -4997,6 +5007,8 @@ transformer_model *transformer_nextn_context_create(
     {
         const char *offset = getenv("TP_MTP_SHADOW_CORE_OFFSET");
         ctx->pool_core_offset = offset ? atoi(offset) : 0;
+        const char *striped = getenv("TP_MTP_SHADOW_STRIPED");
+        ctx->pool_core_striped = striped && atoi(striped) != 0;
     }
     ctx->nextn.key_cache = ctx->nextn.value_cache = NULL;
     ctx->nextn.hidden = ctx->nextn.target_hidden = ctx->nextn.fusion = NULL;
@@ -6379,9 +6391,15 @@ static void tf_ssm_scan4_batch(float *rec_state, float *Q, float *K,
         #ifdef _OPENMP
         tid = omp_get_thread_num(); team = omp_get_num_threads();
         #endif
-        if (team == nh * 4 && ds % 4 == 0) {
-            int h = tid / 4, lane = tid % 4;
-            int r0 = lane * ds / 4, r1 = (lane + 1) * ds / 4;
+        /* Give every recurrent head an equal number of workers.  TP4's
+         * full-core verifier uses four lanes/head (48 workers), while the
+         * async 36/12 split uses three.  Integer row boundaries cover the
+         * complete 128-row state without overlap even when lanes does not
+         * divide ds exactly. */
+        if (team >= nh && team % nh == 0) {
+            int lanes = team / nh;
+            int h = tid / lanes, lane = tid % lanes;
+            int r0 = lane * ds / lanes, r1 = (lane + 1) * ds / lanes;
             float *state_h = rec_state + (size_t)h * ds * ds;
             for (int t = 0; t < N; t++) {
                 float *q = Q + (size_t)t * q_stride + h * ds;
@@ -6801,7 +6819,7 @@ static void tf_ssm_conv_batch(transformer_model *m,int layer_idx,float*qkv_rows,
     float*st=m->conv_state[layer_idx];
     float*w=m->conv_w_trans_layers?m->conv_w_trans_layers[layer_idx]:m->conv_w_trans;
     if(!w||nh<=0)return;
-    int nt=m->n_threads>1?m->n_threads:1;
+    int nt=tf_batch_threads>0?tf_batch_threads:(m->n_threads>1?m->n_threads:1);
 #if defined(__ARM_FEATURE_SVE)
     /* Qwen uses kernel size four. Walk a vector of adjacent channels through
      * time so every long-stride token-row access consumes a full cache line;
@@ -6895,7 +6913,8 @@ static void tf_ssm_prepare_batch(transformer_model *m,int layer_idx,
         int N,int qstride,int qestride,int kestride,int vestride,int scalar_stride){
     transformer_layer*L=&m->layers[layer_idx];
     int ds=m->ssm_d_state,ng=m->ssm_n_group,nh=m->ssm_dt_rank;
-    int ld=m->ssm_d_inner,nt=m->n_threads>1?m->n_threads:1;
+    int ld=m->ssm_d_inner;
+    int nt=tf_batch_threads>0?tf_batch_threads:(m->n_threads>1?m->n_threads:1);
     static int fast_scalars=-1;
     if(fast_scalars<0){const char*e=getenv("TF_SSM_FAST_SCALARS");fast_scalars=e&&atoi(e)!=0;}
     static int preexp=-1;
@@ -12553,8 +12572,10 @@ static void tf_silu_mul_avx2(float *out, const float *gate, const float *up, int
     if(use_sve<0){const char*e=getenv("TF_SILU_SVE");use_sve=e&&atoi(e)!=0;}
     if(use_sve){
         int vl=(int)svcntw();
+        static int use_omp=-1;
+        if(use_omp<0){const char*e=getenv("TF_SILU_OMP");use_omp=e?atoi(e)!=0:1;}
         #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if(use_omp)
         #endif
         for(int i=0;i<n;i+=vl){
             svbool_t pg=svwhilelt_b32((uint64_t)i,(uint64_t)n);
@@ -13597,6 +13618,9 @@ float *tf_batch_all_logits = NULL;
  * sleep) and silence the per-call profile. */
 int tf_batch_keep_pool = 0;
 int tf_batch_quiet = 0;
+/* Spec verifier may reserve a disjoint core subset for an asynchronous draft
+ * pool. Zero keeps the model's normal thread count. */
+int tf_batch_threads = 0;
 /* TP verify: vocab-slice the all_logits lm_head to rows [v0,v1) of m->output (the lm_head
  * is token_embd, REPLICATED full -> recomputing the whole 262144 vocab on every rank is the
  * verify's biggest redundant read). Each rank fills all_logits[N x (v1-v0)]; the caller does
@@ -13918,6 +13942,7 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
     if ((flags & TF_PREFILL_EMBED) && !tokens) return NULL;
     if (!(flags & TF_PREFILL_EMBED) && !hidden_io) return NULL;
     int ne = m->n_embd;
+    int batch_nt = tf_batch_threads > 0 ? tf_batch_threads : m->n_threads;
     int qdim = m->n_heads * m->head_dim;
     int kvdim = m->n_kv_heads * m->head_dim;
     int max_proj = qdim * 2;
@@ -13982,10 +14007,10 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             L->attn_q.podd_packed && L->attn_k.podd_packed &&
             L->attn_v.podd_packed &&
             tf_rmsnorm_batch_pack_podd(NULL, cur, &L->attn_norm, ne, N,
-                m->rms_norm_eps, m->matvec_tmp, m->n_threads);
+                m->rms_norm_eps, m->matvec_tmp, batch_nt);
         if (!attn_norm_packed && (!fused_norm_pack ||
             !tf_rmsnorm_batch_pack_podd(norm, cur, &L->attn_norm, ne, N,
-                m->rms_norm_eps, m->matvec_tmp, m->n_threads)))
+                m->rms_norm_eps, m->matvec_tmp, batch_nt)))
             tf_rmsnorm_batch(norm, cur, &L->attn_norm, ne, N,
                              m->rms_norm_eps, m->matvec_tmp);
         pprof->norm_ms += tf_time_ms() - pt;
@@ -13995,17 +14020,17 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             int lq = m->ssm_qkv_dim;
             pt = tf_time_ms();
             tf_gemm_f16_mt_tokenmajor(proj, &L->ssm_qkv, norm, lq, N,
-                                      lq, ne, m->n_threads);
+                                      lq, ne, batch_nt);
             tf_gemm_f16_mt_tokenmajor(gate, &L->ssm_gate, norm, ld, N,
-                                      ld, ne, m->n_threads);
+                                      ld, ne, batch_nt);
             tf_gemm_f16_mt_tokenmajor(kv, &L->ssm_alpha, norm,
                                       m->ssm_dt_rank, N, m->ssm_dt_rank,
-                                      ne, m->n_threads);
+                                      ne, batch_nt);
             /* kv/vv are idle during SSM projection and provide separate scalar
              * storage; inner is overwritten by each token's recurrent output. */
             tf_gemm_f16_mt_tokenmajor(vv, &L->ssm_beta, norm,
                                       m->ssm_dt_rank, N, m->ssm_dt_rank,
-                                      ne, m->n_threads);
+                                      ne, batch_nt);
             pprof->proj_ms += tf_time_ms() - pt;
             /* Prepare convolution/QK/scalars in prompt order, but defer the
              * independent recurrent heads.  proj/attout/up are reused as
@@ -14026,16 +14051,17 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             }
 #if defined(__ARM_FEATURE_SVE)
             if (ssm_scan4 && !tf_batch_ssm_snapshots && m->ssm_dt_rank == 12 &&
-                m->ssm_d_state == 128 && m->n_threads == 48) {
+                m->ssm_d_state == 128 && batch_nt >= m->ssm_dt_rank &&
+                batch_nt % m->ssm_dt_rank == 0) {
                 tf_ssm_scan4_batch(m->recurrent_state[l], proj, attout, up,
                     inner, kv, vv, gate, ssm_norm_w, out, N, m->ssm_dt_rank,
                     m->ssm_d_state, lq, qdim, max_inner, ld, ld,
-                    rec_scale, m->rms_norm_eps, m->n_threads);
+                    rec_scale, m->rms_norm_eps, batch_nt);
             } else
 #endif
             {
             #ifdef _OPENMP
-            #pragma omp parallel for num_threads(m->n_threads) schedule(static)
+            #pragma omp parallel for num_threads(batch_nt) schedule(static)
             #endif
             for (int h = 0; h < m->ssm_dt_rank; h++) {
                 for (int t = 0; t < N; t++) {
@@ -14099,7 +14125,7 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             pprof->ssm_scan_ms += tf_time_ms() - pt;
             pt = tf_time_ms();
             tf_gemm_f16_mt_tokenmajor(out, &L->ssm_out, inner, ne, N,
-                                      ne, ld, m->n_threads);
+                                      ne, ld, batch_nt);
             pprof->out_proj_ms += tf_time_ms() - pt;
             pt = tf_time_ms();
             int reduced_added = 0;
@@ -14121,14 +14147,14 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                 tf_podd_compute_multi(proj,(const uint16_t *)L->attn_q.data,q2,q2,
                     kv,(const uint16_t *)L->attn_k.data,kvdim,kvdim,
                     vv,(const uint16_t *)L->attn_v.data,kvdim,kvdim,
-                    tf_podd_Xa,ne,N,m->n_threads);
+                    tf_podd_Xa,ne,N,batch_nt);
             if (!packed_qkv) {
                 tf_gemm_f16_mt_tokenmajor(proj, &L->attn_q, norm, q2, N,
-                                          q2, ne, m->n_threads);
+                                          q2, ne, batch_nt);
                 tf_gemm_f16_mt_tokenmajor(kv, &L->attn_k, norm, kvdim, N,
-                                          kvdim, ne, m->n_threads);
+                                          kvdim, ne, batch_nt);
                 tf_gemm_f16_mt_tokenmajor(vv, &L->attn_v, norm, kvdim, N,
-                                          kvdim, ne, m->n_threads);
+                                          kvdim, ne, batch_nt);
             }
             pprof->proj_ms += tf_time_ms() - pt;
             /* Prepare Q/K/V and cache rows in prompt order. Compact Q in the
@@ -14168,7 +14194,7 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                 attout, qdim, kvdim, start_pos, N);
             if (!blocked_attn) {
             #ifdef _OPENMP
-            #pragma omp parallel num_threads(m->n_threads)
+            #pragma omp parallel num_threads(batch_nt)
             #endif
             {
                 /* tf_attn_worker indexes scores by the global/local head ID,
@@ -14212,7 +14238,7 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             }
             } else {
                 #ifdef _OPENMP
-                #pragma omp parallel for collapse(2) num_threads(m->n_threads) schedule(static)
+                #pragma omp parallel for collapse(2) num_threads(batch_nt) schedule(static)
                 #endif
                 for (int t = 0; t < N; t++) for (int h = 0; h < m->n_heads; h++) {
                     float *gh = up + (size_t)t * max_inner + (size_t)h * m->head_dim;
@@ -14238,7 +14264,7 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             pprof->attn_kernel_ms += tf_time_ms() - pt;
             pt = tf_time_ms();
             tf_gemm_f16_mt_tokenmajor(out, &L->attn_output, attout, ne, N,
-                                      ne, qdim, m->n_threads);
+                                      ne, qdim, batch_nt);
             pprof->out_proj_ms += tf_time_ms() - pt;
             pt = tf_time_ms();
             int reduced_added = 0;
@@ -14257,10 +14283,10 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
         int ffn_norm_packed = packed_proj && L->ffn_gate.podd_packed &&
             L->ffn_up.podd_packed &&
             tf_rmsnorm_batch_pack_podd(NULL, cur, &L->ffn_norm, ne, N,
-                m->rms_norm_eps, m->matvec_tmp, m->n_threads);
+                m->rms_norm_eps, m->matvec_tmp, batch_nt);
         if (!ffn_norm_packed && (!fused_norm_pack ||
             !tf_rmsnorm_batch_pack_podd(norm, cur, &L->ffn_norm, ne, N,
-                m->rms_norm_eps, m->matvec_tmp, m->n_threads)))
+                m->rms_norm_eps, m->matvec_tmp, batch_nt)))
             tf_rmsnorm_batch(norm, cur, &L->ffn_norm, ne, N,
                              m->rms_norm_eps, m->matvec_tmp);
         pprof->norm_ms += tf_time_ms() - pt;
@@ -14277,37 +14303,37 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             L->ffn_gate.podd_packed && L->ffn_up.podd_packed &&
             tf_podd_compute_multi(gate,(const uint16_t *)L->ffn_gate.data,ld,ld,
                 up,(const uint16_t *)L->ffn_up.data,ld,ld,
-                NULL,NULL,0,0,tf_podd_Xa,ne,N,m->n_threads);
+                NULL,NULL,0,0,tf_podd_Xa,ne,N,batch_nt);
         packed_up = packed_gate;
         if (!packed_gate)
             packed_gate = ffn_norm_packed && L->ffn_gate.podd_packed &&
                 tf_podd_compute_packed(gate,(const uint16_t *)L->ffn_gate.data,
-                    tf_podd_Xa,ld,ne,N,ld,m->n_threads);
+                    tf_podd_Xa,ld,ne,N,ld,batch_nt);
         if (!packed_gate)
             tf_gemm_f16_mt_tokenmajor(gate, &L->ffn_gate, norm, ld, N,
-                                      ld, ne, m->n_threads);
+                                      ld, ne, batch_nt);
         pprof->ffn_proj_ms += tf_time_ms() - pt;
         if (podd_ffn_pipe) {
             pt = tf_time_ms();
             ffn_piped = tf_gemm_bf16_podd_ffn_up_down(out, gate,
                 (const uint16_t *)L->ffn_up.data,
-                (const uint16_t *)L->ffn_down.data, ld, ne, N, m->n_threads);
+                (const uint16_t *)L->ffn_down.data, ld, ne, N, batch_nt);
             pprof->ffn_down_ms += tf_time_ms() - pt;
         }
         if (!ffn_piped) {
             pt = tf_time_ms();
             if (!packed_up && !(ffn_norm_packed && L->ffn_up.podd_packed &&
                   tf_podd_compute_packed(up, (const uint16_t *)L->ffn_up.data,
-                    tf_podd_Xa, ld, ne, N, ld, m->n_threads)))
+                    tf_podd_Xa, ld, ne, N, ld, batch_nt)))
                 tf_gemm_f16_mt_tokenmajor(up, &L->ffn_up, norm, ld, N,
-                                          ld, ne, m->n_threads);
+                                          ld, ne, batch_nt);
             pprof->ffn_proj_ms += tf_time_ms() - pt;
             pt = tf_time_ms();
             tf_silu_mul_avx2(inner, gate, up, N * ld);
             pprof->ffn_act_ms += tf_time_ms() - pt;
             pt = tf_time_ms();
             tf_gemm_f16_mt_tokenmajor(out, &L->ffn_down, inner, ne, N,
-                                      ne, ld, m->n_threads);
+                                      ne, ld, batch_nt);
             pprof->ffn_down_ms += tf_time_ms() - pt;
         }
         pt = tf_time_ms();
@@ -14353,11 +14379,11 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             osl.n_rows = lv1 - lv0;
             tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &osl, norm,
                                       lv1 - lv0, N, lv1 - lv0, ne,
-                                      m->n_threads);
+                                      batch_nt);
         } else {
             tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &m->output, norm,
                                       m->output.n_rows, N, m->output.n_rows,
-                                      ne, m->n_threads);
+                                      ne, batch_nt);
         }
         result = tf_batch_all_logits + (size_t)(N - 1) *
             ((lv0 >= 0 && lv1 > lv0) ? (lv1 - lv0) : m->output.n_rows);
