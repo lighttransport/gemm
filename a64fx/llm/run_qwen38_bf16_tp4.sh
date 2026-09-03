@@ -6,12 +6,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 MODEL=${MODEL:-/home/u14346/models/qwen38/27b/bf16/Qwen3.8-27B-BF16-00001-of-00002.gguf}
 TP_SIZE=${TP_SIZE:-4}
 MODE=${1:-stage}
-# The accepted clean-node MTP profile replicates the small NextN block.  A
-# sharded stage remains available explicitly, but its extra collectives did not
-# reduce round time in adjacent exact runs.
+# The persistent-QKV proposer makes TP-sharding the NextN block profitable:
+# reduced projection traffic now outweighs its two extra reductions per draft.
+# Keep replicated NextN available explicitly for the historical control.
 if [ "$MODE" = mtp-sustained ] || [ "$MODE" = stage-mtp ]; then
     [ "$TP_SIZE" = 4 ] || { echo "$MODE requires TP_SIZE=4" >&2; exit 2; }
-    export TP_NEXTN_SHARD=${TP_NEXTN_SHARD:-0}
+    export TP_NEXTN_SHARD=${TP_NEXTN_SHARD:-1}
 fi
 case "$TP_SIZE" in 4|6|12) ;; *) echo "TP_SIZE must be 4, 6, or 12" >&2; exit 2 ;; esac
 NEXTN_SUFFIX=

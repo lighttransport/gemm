@@ -3164,3 +3164,22 @@ generic verifier grew to 101.64 ms and drafting to 24.80 ms, yielding only
 43.99 tok/s. K=5 remains the production point; reaching 60 tok/s still requires
 removing about 19 ms from its 96.4 ms round or hiding most proposer work without
 concurrent full-weight HBM contention.
+
+With persistent QKV enabled, TP-sharding the NextN layer is profitable again.
+The new `/local/u14346/qwen38-bf16-tp4-nextnshard` image is 17.165 GB/rank and
+keeps the same CMG-local row placement. The exact 128-token run reduced draft
+time from the replicated 20.18 ms to **15.37 ms/round** and reached 51.20 tok/s
+at 863--905 GB/s. Its 256-token acceptance run reproduced canonical
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`
+at **49.96 tok/s**, with 77.58 ms verification, 15.51 ms drafting, and
+851--896 GB/s on every rank. The launcher now defaults `stage-mtp` and
+`mtp-sustained` to `TP_NEXTN_SHARD=1`; set it to zero for the replicated
+historical control.
+
+The safe remote-completion one-Put protocol was neutral on this newly sharded
+path. Its exact clean 128-token result was 51.10 tok/s with 77.17/15.55 ms
+verify/draft versus 51.20 tok/s and 77.16/15.37 ms for the adjacent two-Put
+default. MTP therefore continues to use the separate payload/trailer protocol.
+At the measured 4.65 emitted tokens per round, 60 tok/s requires approximately
+77.5 ms total; the current 93.1 ms round still needs about 15.6 ms removed,
+primarily from verification.
