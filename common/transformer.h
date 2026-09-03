@@ -9782,6 +9782,12 @@ static void *tf_nextn_ffn_worker(void *arg) {
     tf_nextn_ffn_task *t = (tf_nextn_ffn_task *)arg;
     transformer_model *m = t->m;
     transformer_layer *L = t->layer;
+    static _Thread_local int nextn_prefetch_initialized;
+    if (!nextn_prefetch_initialized) {
+        const char *e = getenv("TF_BF16PV_PREFETCH_NEXTN");
+        if (e && *e) tf_bf16pv_decode_prefetch_override = atoi(e);
+        nextn_prefetch_initialized = 1;
+    }
     tf_barrier_tid = t->tid;
     if (t->include_attention) {
         int hp = t->nh / t->nt, hx = t->nh % t->nt;

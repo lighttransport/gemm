@@ -2814,6 +2814,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
   TF_NEXTN_BLOCK_PERSIST=1 \
   TF_NEXTN_FULL_PERSIST=1 \
   TF_NEXTN_ATTN_BLOCK_PERSIST=1 \
+  TF_BF16PV_PREFETCH_NEXTN=8 \
   TP_AR_DETERMINISTIC=1 TP_AR_A2A_TREE=1 TP_AR_FUSED_ADD=1 \
   TF_BF16PV_MTP5_FUSED=1 \
   bash run_qwen38_bf16_tp4.sh mtp-sustained
@@ -2833,6 +2834,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | persistent NextN output+FFN block | no | 128/256 yes | 40.90 short; 30.14 sustained | 81.96 / degraded allocation | 33.89 / degraded allocation | 697--752 / 522--730 | promote; short draft -26.3% vs FFN-only, long run rank-0 limited |
 | 2026-09-03 | persistent NextN full block through vocab head | no | 128/256 yes | 42.55 short; 35.76 sustained | 83.46 / 84.66 | 27.90 / 45.45 | 744--803 / 611--764 | promote; removes final pool wake, clean gate pending |
 | 2026-09-03 | persistent NextN attention-to-vocab tail | near/no | 128/256 yes | 44.52 short; 40.48 sustained | 83.10 / 83.59 | 23.33 / 31.32 | 767--821 / 711--811 | promote; exact original head ownership, clean gate pending |
+| 2026-09-03 | NextN-private BF16 prefetch 0/6/8/12 | no | 128 all yes; 256@8 yes | 32.43 / 35.85 / 36.55 / 31.94 | allocation varied | 50.91 / 46.05 / 39.73 / 56.73 | rank0 548 / 606 / 620 / 534 | promote 8 from adjacent 6/8; clean A/B pending |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2871,6 +2873,16 @@ weight rows between their CMG owners. The canonical 128-token run reached
 767--821 GB/s. The canonical 256-token run reached **40.48 tok/s**, with 83.59
 ms verification and 31.32 ms drafting at 711--811 GB/s. Both had under 0.2%
 rank wall-time skew; neither passes the all-ranks 800 GB/s clean gate.
+
+The shadow pool now has a thread-local single-token BF16 prefetch override, so
+proposer tuning no longer changes the verifier or trunk workers in the same
+process. Distances 0, 6, 8, and 12 were all canonical at 128 tokens. The most
+comparable 6/8 pair ran at 606/620 GB/s on limiting rank 0: distance 8 reduced
+draft time from 46.05 to 39.73 ms and improved throughput from 35.85 to 36.55
+tok/s. Distance 12 regressed to 56.73 ms. The 256-token distance-8 validation
+was canonical at 35.95 tok/s, 91.20 ms verification, and 38.19 ms drafting,
+with rank 0 limited to 622 GB/s. `TF_BF16PV_PREFETCH_NEXTN=8` is promoted,
+subject to the same clean-node A/B gate.
 
 An additional SSM scheduling probe normalized Q/K directly into each expanded
 head, replacing the normalize/expand pair with one worker phase and removing

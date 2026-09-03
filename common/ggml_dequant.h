@@ -1933,7 +1933,14 @@ static inline uint16_t ggml_fp32_to_fp16(float f) {
  * A single global prefetch distance makes the first width a worker sees choose
  * the setting for all later matrices.  Keep the global setting as the exact
  * compatibility default, but allow measured per-width overrides. */
+/* A private runtime (for example the Qwen NextN shadow pool) may select a
+ * different distance without perturbing trunk workers that use this header in
+ * the same process. Negative keeps the environment/shape defaults below. */
+static _Thread_local int tf_bf16pv_decode_prefetch_override = -1;
+
 static inline int tf_bf16pv_decode_prefetch_dist(int n) {
+    if (__builtin_expect(tf_bf16pv_decode_prefetch_override >= 0, 0))
+        return tf_bf16pv_decode_prefetch_override;
     static _Thread_local int initialized, generic, k4352, k5120, k6144;
     if (__builtin_expect(!initialized, 0)) {
         const char *e = getenv("TF_BF16PV_PREFETCH");
