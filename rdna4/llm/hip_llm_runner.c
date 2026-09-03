@@ -696,11 +696,11 @@ static const char *hip_kernel_source =
 "        for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
 "}\n"
-"/* Qwen4 HC up projection + four-stream sigmoid mix.  Two embedding outputs\n"
-" * per block, four warps per output (one warp per HC stream). */\n"
+"/* Qwen4 HC up projection + four-stream sigmoid mix.  Eight lanes own one\n"
+" * HC row; 32 row-groups/block keeps all 256 lanes useful for 256 columns. */\n"
 "__global__ void qwen4_hc_up_mix_q8(float *mixed,float *gate,const float *xn,\n"
 "        const unsigned char *mat,int n_embd,int n_stream,int n_cols){\n"
-"    int warp=threadIdx.x/32,lane=threadIdx.x&31;int i=blockIdx.x*2+warp/4,s=warp&3;\n"
+"    int group=threadIdx.x/8,lane=threadIdx.x&7;int i=blockIdx.x*8+group/4,s=group&3;\n"
 "    if(i>=n_embd||s>=n_stream)return;int row=s*n_embd+i,nb=n_cols/32,rb=nb*36;\n"
 "    const unsigned char *rp=mat+(size_t)row*rb;const float *x=xn;float sum=0.0f;\n"
 "    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;\n"
@@ -708,9 +708,9 @@ static const char *hip_kernel_source =
 "        #pragma unroll\n"
 "        for(int j=0;j<32;j++)z+=(float)q[j]*xb[j];\n"
 "        sum+=z*half_to_float(*(const half_raw *)bp);}\n"
-"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);\n"
+"    for(int o=4;o>0;o>>=1)sum+=__shfl_down(sum,o,8);\n"
 "    if(lane==0)gate[row]=sum;__syncthreads();\n"
-"    if(lane==0&&warp%4==0){float v=0.0f;for(int q=0;q<4;q++){int j=q*n_embd+i;\n"
+"    if(lane==0&&s==0){float v=0.0f;for(int q=0;q<4;q++){int j=q*n_embd+i;\n"
 "        v+=xn[j]/(1.0f+expf(-gate[j]));}mixed[i]=v/(float)n_stream;}\n"
 "}\n"
 "/* HC down Q8 matvec with the fixed 1/n_stream scale and SiLU folded in. */\n"
@@ -12499,13 +12499,30 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     unsigned char cpu_selected[512] = {0};
     int cpu_ids[512], cpu_pos[512], cpu_jobs = 0;
     if (cpu_singletons) {
+        int candidates[512], n_candidates = 0;
         for (int e = 0; e < ne; ++e) {
             int cnt = offs[e + 1] - offs[e];
-            if (cnt == 0 || cnt > cpu_max_count || cpu_jobs + cnt > cpu_max_jobs) continue;
+            if (cnt == 0 || cnt > cpu_max_count) continue;
             int resident = 0;
             for (int s = 0; s < cl->moe_cache_slots; ++s)
                 if (cl->moe_cache_ids[s] == e) { resident = 1; break; }
             if (resident) continue;
+            /* Sort the small candidate set by descending assignment count so
+             * the assignment budget removes the most GPU expert launches. */
+            int p = n_candidates++;
+            while (p > 0) {
+                int prev = candidates[p - 1];
+                int prev_cnt = offs[prev + 1] - offs[prev];
+                if (prev_cnt > cnt || (prev_cnt == cnt && prev < e)) break;
+                candidates[p] = prev;
+                --p;
+            }
+            candidates[p] = e;
+        }
+        for (int ci = 0; ci < n_candidates; ++ci) {
+            int e = candidates[ci];
+            int cnt = offs[e + 1] - offs[e];
+            if (cpu_jobs + cnt > cpu_max_jobs) continue;
             cpu_selected[e] = 1;
             for (int j = 0; j < cnt; ++j) {
                 int pos = offs[e] + j;
