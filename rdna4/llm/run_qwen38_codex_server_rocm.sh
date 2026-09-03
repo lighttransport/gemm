@@ -5,7 +5,9 @@ set -euo pipefail
 # endpoint for Codex and other coding-agent clients.
 runner_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 model="${QWEN38_MODEL:-/mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf}"
-cache_mb="${QWEN38_MOE_CACHE_MB:-8192}"
+# 64K KV plus server scratch needs more headroom than the short-context bench.
+# Override to 8192 on a larger card when maximizing MoE hit rate.
+cache_mb="${QWEN38_MOE_CACHE_MB:-4096}"
 context="${QWEN38_CONTEXT:-65536}"
 port="${QWEN38_API_PORT:-8080}"
 host="${QWEN38_API_HOST:-127.0.0.1}"
@@ -30,6 +32,7 @@ exec env \
     LLM_MOE_CPU_LIB="${cpu_lib}" \
     LLM_MOE_CPU_PREFILL_MAX_COUNT="${LLM_MOE_CPU_PREFILL_MAX_COUNT:-2}" \
     LLM_MOE_CPU_PREFILL_MAX_JOBS="${LLM_MOE_CPU_PREFILL_MAX_JOBS:-160}" \
+    LLM_BMAX="${LLM_BMAX:-128}" \
     python3 "${runner_dir}/codex_server.py" "${model}" \
     --runner "${runner_dir}/test_hip_llm" \
     --context "${context}" \
