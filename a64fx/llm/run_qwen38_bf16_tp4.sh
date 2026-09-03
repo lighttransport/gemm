@@ -133,11 +133,13 @@ case "$MODE" in
                 export TP_RAW_PROMPT=1
                 export TP_PROMPT_FILE=${TP_PROMPT_FILE:-$HERE/qwen38_mtp_prompt.txt}
                 export TP_PROMPT_REPEAT=${TP_PROMPT_REPEAT:-2}
-                export TP_SPEC_K=${TP_SPEC_K:-4} TP_MTP_BATCH=${TP_MTP_BATCH:-1}
+                # K=5 is the validated 53.43 tok/s clean-node profile.  Keep
+                # the explicit override for acceptance/prompt sweeps.
+                export TP_SPEC_K=${TP_SPEC_K:-5} TP_MTP_BATCH=${TP_MTP_BATCH:-1}
                 export TP_MAXSEQ=${TP_MAXSEQ:-768} TP_MAXGEN=${TP_MAXGEN:-256}
                 export TP_PERF_WARMUP=${TP_PERF_WARMUP:-0} TP_BUFFER_OUTPUT=${TP_BUFFER_OUTPUT:-1}
                 export TP_MTP_TRACE=${TP_MTP_TRACE:-0} TP_MTP_PROFILE_DETAIL=${TP_MTP_PROFILE_DETAIL:-1}
-                export TP_AR_DETERMINISTIC=${TP_AR_DETERMINISTIC:-0}
+                export TP_AR_DETERMINISTIC=${TP_AR_DETERMINISTIC:-1}
                 # A one-round peer all-gather folded as (r0+r1)+(r2+r3)
                 # exactly reproduces the deterministic TP4 tree for the
                 # 25,600-float K=5 residual batches.

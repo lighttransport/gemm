@@ -2646,3 +2646,13 @@ ms/round** (-5.1%); observed throughput was 28.71 versus 33.80 tok/s, although
 the draft portion of that delta included shared-node jitter.  A 256-token gate
 also reproduced `7b86e983...`, with 88.37 ms verifier rounds and 32.04 tok/s on
 the currently degraded interactive rank-0 node.
+
+The sustained launcher now selects that complete validated profile by default:
+K=5 plus deterministic TP4 reduction, which activates the exact one-round fold
+and fused residual add.  This replaces the older K=4/nondeterministic defaults
+that silently bypassed the later communication work.  `TP_SPEC_K=4` and
+`TP_AR_DETERMINISTIC=0` remain available for controlled sweeps.  The clean-node
+headline remains the exact K=5 **53.43 tok/s** result; on the interactive node,
+pinning the Codex process to one core improved the same exact 128-token run to
+35.03 tok/s and balanced ranks at 602--611 GB/s, still well below the clean
+868--870 GB/s/node weight-stream rate.
