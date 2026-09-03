@@ -59,6 +59,46 @@ static float rel_l2_error(const float *a, const float *b, int n) {
     return sqrtf(diff_sq / ref_sq);
 }
 
+/* Qwen3.8-Next non-thinking/Instruct defaults from the model card.  Keeping
+ * only top-k candidates makes sampling O(vocab*k), with no full-vocab sort. */
+static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
+                          float temperature, float presence_penalty,
+                          const unsigned char *seen, unsigned *rng) {
+    if (top_k < 1) top_k = 1;
+    if (top_k > 64) top_k = 64;
+    int ids[64];
+    float vals[64];
+    for (int j = 0; j < top_k; ++j) { ids[j] = -1; vals[j] = -INFINITY; }
+    for (int i = 0; i < n; ++i) {
+        float v = logits[i] - ((seen && seen[i]) ? presence_penalty : 0.0f);
+        if (!isfinite(v)) continue;
+        if (v <= vals[top_k - 1]) continue;
+        int j = top_k - 1;
+        while (j > 0 && v > vals[j - 1]) {
+            vals[j] = vals[j - 1]; ids[j] = ids[j - 1]; --j;
+        }
+        vals[j] = v; ids[j] = i;
+    }
+    if (ids[0] < 0) return 0;
+    while (top_k > 1 && ids[top_k - 1] < 0) --top_k;
+    if (temperature <= 0.0f || top_k == 1) return ids[0];
+    float sum = 0.0f;
+    for (int j = 0; j < top_k; ++j) {
+        vals[j] = expf((vals[j] - vals[0]) / temperature);
+        sum += vals[j];
+    }
+    float keep = 0.0f;
+    int nkeep = 0;
+    do { keep += vals[nkeep++]; } while (nkeep < top_k && keep < top_p * sum);
+    *rng ^= *rng << 13; *rng ^= *rng >> 17; *rng ^= *rng << 5;
+    float pick = ((float)(*rng & 0x00ffffffu) / 16777216.0f) * keep;
+    for (int j = 0; j < nkeep; ++j) {
+        pick -= vals[j];
+        if (pick <= 0.0f) return ids[j];
+    }
+    return ids[nkeep - 1];
+}
+
 static void print_first_n(const char *label, const float *v, int n, int show) {
     if (show > n) show = n;
     fprintf(stderr, "  %s [", label);
@@ -240,6 +280,7 @@ int main(int argc, char **argv) {
     int decode_n = 0;         /* --decode N: greedy-sample N tokens after prefill */
     int prefill_pad = 0;      /* --prefill-len M: pad prompt up to M tokens with last token (for bench) */
     int compare_paths = 0;    /* --compare-paths: report rel-L2 between batched and per-token logits */
+    int coding_mode = 0;      /* Qwen3.8 non-thinking coding sampling profile */
     int moe_cache_mb = 0;
     int moe_cpu_only = 0;
     int max_layers = 0;
@@ -307,6 +348,8 @@ int main(int argc, char **argv) {
             prefill_pad = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--compare-paths") == 0) {
             compare_paths = 1;
+        } else if (strcmp(argv[i], "--coding") == 0) {
+            coding_mode = 1;
         } else if (strcmp(argv[i], "--moe-cache-mb") == 0 && i + 1 < argc) {
             moe_cache_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--moe-cpu") == 0) {
@@ -319,7 +362,7 @@ int main(int argc, char **argv) {
             model_path = argv[i];
         } else {
             fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
-            fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M]\n");
+            fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M] [--coding]\n");
             fprintf(stderr, "       [--moe-cache-mb MiB] [--moe-cpu]\n");
             fprintf(stderr, "       [--verify-quant-kernels] [--bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]]\n");
             return 1;
@@ -465,6 +508,7 @@ int main(int argc, char **argv) {
     int pass = 1;
 
     if (bench_mode) {
+        unsigned char *seen = NULL;
         /* ---- Bench mode: split prefill and decode tokens/sec ---- */
         int n_prefill = max_tokens;
         if (n_prefill < 1) n_prefill = 1;
@@ -529,13 +573,20 @@ int main(int argc, char **argv) {
         double t_pf0 = get_time_ms();
         float *last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
         if (!last_logits) { fprintf(stderr, "GPU forward_batch_logits failed\n"); pass = 0; goto bench_done; }
-        int next_tok = argmax_logits(last_logits, n_vocab);
+        seen = coding_mode ? (unsigned char *)calloc((size_t)n_vocab, 1) : NULL;
+        unsigned sample_rng = 0x51f15e5du;
+        if (seen) for (int i = 0; i < n_prefill; ++i)
+            if (tokens[i] >= 0 && tokens[i] < n_vocab) seen[tokens[i]] = 1;
+        int next_tok = coding_mode ? sample_top_k_p(last_logits, n_vocab, 20, 0.80f,
+                                                    0.70f, 1.50f, seen, &sample_rng)
+                                   : argmax_logits(last_logits, n_vocab);
         double t_pf1 = get_time_ms();
         double prefill_ms = t_pf1 - t_pf0;
         double prefill_tps = (prefill_ms > 0.0) ? (1000.0 * n_prefill / prefill_ms) : 0.0;
 
         /* Decode: greedy-sample decode_n tokens. */
         double decode_ms = 0.0, decode_tps = 0.0;
+        int decoded = 0;
         int first_decode_tok = next_tok;
         if (decode_n > 0) {
             hip_llm_reset_moe_stats(gpu);
@@ -546,13 +597,17 @@ int main(int argc, char **argv) {
                 int pos = n_prefill + k;
                 float *lg = hip_llm_forward_logits(gpu, next_tok, pos);
                 if (!lg) { fprintf(stderr, "GPU forward_logits failed at decode k=%d\n", k); pass = 0; break; }
-                next_tok = argmax_logits(lg, n_vocab);
+                if (seen && next_tok >= 0 && next_tok < n_vocab) seen[next_tok] = 1;
+                next_tok = coding_mode ? sample_top_k_p(lg, n_vocab, 20, 0.80f,
+                                                        0.70f, 1.50f, seen, &sample_rng)
+                                       : argmax_logits(lg, n_vocab);
+                decoded++;
                 if (gen_text) { const char *s = bpe_token_to_str(vocab, next_tok); if (s) fprintf(stderr, "%s", s); }
             }
             if (gen_text) fprintf(stderr, "\n=== end ===\n");
             double t_dec1 = get_time_ms();
             decode_ms = t_dec1 - t_dec0;
-            decode_tps = (decode_ms > 0.0) ? (1000.0 * decode_n / decode_ms) : 0.0;
+            decode_tps = (decode_ms > 0.0) ? (1000.0 * decoded / decode_ms) : 0.0;
         }
 
         fprintf(stderr, "\n=== Bench results ===\n");
@@ -561,8 +616,8 @@ int main(int argc, char **argv) {
                 n_prefill > 0 ? prefill_ms / n_prefill : 0.0);
         if (decode_n > 0) {
             fprintf(stderr, "Decode:  %d tokens in %.2f ms  -> %.2f tok/s  (%.3f ms/tok)\n",
-                    decode_n, decode_ms, decode_tps,
-                    decode_ms / decode_n);
+                    decoded, decode_ms, decode_tps,
+                    decoded > 0 ? decode_ms / decoded : 0.0);
             fprintf(stderr, "First decoded token id=%d, last id=%d\n", first_decode_tok, next_tok);
         }
         {
@@ -578,7 +633,8 @@ int main(int argc, char **argv) {
             }
         }
         fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
-bench_done: ;
+bench_done:
+        free(seen);
     } else {
         /* ---- Correctness mode: per-token CPU vs GPU compare (legacy) ---- */
         fprintf(stderr, "\n=== Running %d tokens (n_embd=%d)%s ===\n",
