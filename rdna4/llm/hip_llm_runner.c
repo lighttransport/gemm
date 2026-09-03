@@ -7446,6 +7446,11 @@ struct hip_llm_runner {
     hipDevice_t device;
     hipCtx_t context;
     hipStream_t stream;
+    hipStream_t moe_copy_stream;
+    hipEvent_t moe_copy_ready[64];
+    hipEvent_t moe_compute_done[64];
+    unsigned char moe_pipeline_valid[64];
+    int moe_copy_pipeline;
     int verbose;
 
     /* Compiled module + kernels */
@@ -8190,6 +8195,15 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     CHECK_HIP_NULL(hipSetDevice(device_id));
     r->context = NULL;  /* use default context (no hipCtxCreate) */
     CHECK_HIP_NULL(hipStreamCreateWithFlags(&r->stream, hipStreamNonBlocking));
+    const char *pipeline_env = getenv("LLM_MOE_COPY_PIPELINE");
+    if (pipeline_env && atoi(pipeline_env) != 0) {
+        CHECK_HIP_NULL(hipStreamCreateWithFlags(&r->moe_copy_stream, hipStreamNonBlocking));
+        for (int s = 0; s < 64; s++) {
+            CHECK_HIP_NULL(hipEventCreateWithFlags(&r->moe_copy_ready[s], hipEventDisableTiming));
+            CHECK_HIP_NULL(hipEventCreateWithFlags(&r->moe_compute_done[s], hipEventDisableTiming));
+        }
+        r->moe_copy_pipeline=1;
+    }
 
     if (verbose >= 1) {
         hipDeviceProp_t props;
@@ -12033,6 +12047,7 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         void *gate_w;
         void *up_w;
         void *down_w;
+        int cache_slot=-1;
         if (r->is_qwen4exp) {
             if (cl->moe_cache_slots <= 0) {
                 fprintf(stderr, "hip_llm: batched Qwen4 MoE requires a cache slot\n");
@@ -12047,21 +12062,36 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
                 const unsigned char *gh = (const unsigned char *)cl->moe_gate_exps_host + (size_t)e * cl->moe_exp_stride_gu;
                 const unsigned char *uh = (const unsigned char *)cl->moe_up_exps_host + (size_t)e * cl->moe_exp_stride_gu;
                 const unsigned char *dh = (const unsigned char *)cl->moe_down_exps_host + (size_t)e * cl->moe_exp_stride_d;
-                hllm_cache_copy(r, (unsigned char *)cl->moe_cache_gate + (size_t)slot*cl->moe_cache_stride_gate,
-                                gh, cl->moe_gate_exps_type, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
-                                cl->moe_exp_stride_gu, cl->moe_cache_stride_gate);
-                hllm_cache_copy(r, (unsigned char *)cl->moe_cache_up + (size_t)slot*cl->moe_cache_stride_up,
-                                uh, cl->moe_up_exps_type, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
-                                cl->moe_exp_stride_gu, cl->moe_cache_stride_up);
-                hllm_cache_copy(r, (unsigned char *)cl->moe_cache_down + (size_t)slot*cl->moe_cache_stride_down,
-                                dh, cl->moe_down_exps_type, cl->moe_exp_rows_d, cl->moe_exp_cols_d,
-                                cl->moe_exp_stride_d, cl->moe_cache_stride_down);
+                if(r->moe_copy_pipeline && cl->moe_gate_exps_type!=GGML_TYPE_Q8_0 &&
+                   cl->moe_up_exps_type!=GGML_TYPE_Q8_0 && cl->moe_down_exps_type!=GGML_TYPE_Q8_0) {
+                    if(r->moe_pipeline_valid[slot])hipStreamWaitEvent(r->moe_copy_stream,r->moe_compute_done[slot],0);
+                    hipMemcpyAsync((unsigned char*)cl->moe_cache_gate+(size_t)slot*cl->moe_cache_stride_gate,
+                                   gh,cl->moe_exp_stride_gu,hipMemcpyHostToDevice,r->moe_copy_stream);
+                    hipMemcpyAsync((unsigned char*)cl->moe_cache_up+(size_t)slot*cl->moe_cache_stride_up,
+                                   uh,cl->moe_exp_stride_gu,hipMemcpyHostToDevice,r->moe_copy_stream);
+                    hipMemcpyAsync((unsigned char*)cl->moe_cache_down+(size_t)slot*cl->moe_cache_stride_down,
+                                   dh,cl->moe_exp_stride_d,hipMemcpyHostToDevice,r->moe_copy_stream);
+                    hipEventRecord(r->moe_copy_ready[slot],r->moe_copy_stream);
+                    hipStreamWaitEvent(r->stream,r->moe_copy_ready[slot],0);
+                    r->moe_stats.h2d_bytes+=2*cl->moe_exp_stride_gu+cl->moe_exp_stride_d;
+                } else {
+                    hllm_cache_copy(r, (unsigned char *)cl->moe_cache_gate + (size_t)slot*cl->moe_cache_stride_gate,
+                                    gh, cl->moe_gate_exps_type, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                    cl->moe_exp_stride_gu, cl->moe_cache_stride_gate);
+                    hllm_cache_copy(r, (unsigned char *)cl->moe_cache_up + (size_t)slot*cl->moe_cache_stride_up,
+                                    uh, cl->moe_up_exps_type, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                    cl->moe_exp_stride_gu, cl->moe_cache_stride_up);
+                    hllm_cache_copy(r, (unsigned char *)cl->moe_cache_down + (size_t)slot*cl->moe_cache_stride_down,
+                                    dh, cl->moe_down_exps_type, cl->moe_exp_rows_d, cl->moe_exp_cols_d,
+                                    cl->moe_exp_stride_d, cl->moe_cache_stride_down);
+                }
                 cl->moe_cache_ids[slot] = e;
                 r->moe_stats.cache_misses++;
             } else r->moe_stats.cache_hits++;
             gate_w = (unsigned char *)cl->moe_cache_gate + (size_t)slot*cl->moe_cache_stride_gate;
             up_w = (unsigned char *)cl->moe_cache_up + (size_t)slot*cl->moe_cache_stride_up;
             down_w = (unsigned char *)cl->moe_cache_down + (size_t)slot*cl->moe_cache_stride_down;
+            cache_slot=slot;
         } else {
             gate_w = (char *)cl->moe_gate_exps_w + (size_t)e * cl->moe_exp_stride_gu;
             up_w = (char *)cl->moe_up_exps_w + (size_t)e * cl->moe_exp_stride_gu;
@@ -12088,6 +12118,10 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             if (gemm_run_bf16_w(r, (float *)r->d_moe_eout + off * n_embd, dw,
                                 (char *)r->d_moe_esilu_bf16 + off * eff * 2,
                                 cnt, n_embd, eff, r->stream) != 0) return -1;
+            if(r->moe_copy_pipeline && cache_slot>=0) {
+                hipEventRecord(r->moe_compute_done[cache_slot],r->stream);
+                r->moe_pipeline_valid[cache_slot]=1;
+            }
             continue;
         }
         launch_mmq(r, (float *)r->d_moe_eg + off * eff, gate_w, xin, cnt, eff, n_embd, cl->moe_gate_exps_type);
@@ -13976,6 +14010,14 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->h_output_pinned) hipHostFree(r->h_output);
     else                    free(r->h_output);
 
+    if(r->moe_copy_stream) {
+        hipStreamSynchronize(r->moe_copy_stream);
+        for(int s=0;s<64;s++) {
+            if(r->moe_copy_ready[s])hipEventDestroy(r->moe_copy_ready[s]);
+            if(r->moe_compute_done[s])hipEventDestroy(r->moe_compute_done[s]);
+        }
+        hipStreamDestroy(r->moe_copy_stream);
+    }
     if (r->stream) hipStreamDestroy(r->stream);
 
     free(r);
