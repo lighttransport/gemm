@@ -12733,7 +12733,7 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     }
     const char *grouped_env = getenv("LLM_MOE_GROUPED_PREFILL");
     int grouped_qwen = grouped_env && atoi(grouped_env) != 0 &&
-        r->is_qwen4exp && cpu_jobs == 0 && cl->d_moe_cache_map &&
+        r->is_qwen4exp && cl->d_moe_cache_map &&
         ((cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
           cl->moe_up_exps_type == GGML_TYPE_Q4_K) ||
          (cl->moe_gate_exps_type == GGML_TYPE_Q5_K &&
@@ -12741,24 +12741,27 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
          (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
           cl->moe_down_exps_type == GGML_TYPE_Q8_0);
     int grouped_tasks = 0;
+    unsigned char grouped_expert[512] = {0};
     if (grouped_qwen) {
         for (int e = 0; e < ne; ++e) {
             int cnt = offs[e + 1] - offs[e];
-            if (cnt > 0) {
+            if (cnt > 0 && !cpu_selected[e]) {
                 int resident = 0;
                 for (int s = 0; s < cl->moe_cache_slots; ++s)
                     if (cl->moe_cache_ids[s] == e) { resident = 1; break; }
-                if (!resident) { grouped_qwen = 0; break; }
+                if (resident) grouped_expert[e] = 1;
             }
         }
-        if (grouped_qwen) {
+        for (int e = 0; e < ne; ++e) {
+            if (!grouped_expert[e]) continue;
+            for (int p = offs[e]; p < offs[e + 1]; ++p) {
+                r->h_moe_tok_idx[grouped_tasks] = e;
+                ((int *)r->h_router_batch)[grouped_tasks++] = p;
+            }
+        }
+        if (grouped_tasks) {
             int *task_e = r->h_moe_tok_idx;
             int *task_p = (int *)r->h_router_batch;
-            for (int e = 0; e < ne; ++e)
-                for (int p = offs[e]; p < offs[e + 1]; ++p) {
-                    task_e[grouped_tasks] = e;
-                    task_p[grouped_tasks++] = p;
-                }
             int *d_task_e = (int *)r->d_router_logits_batch;
             int *d_task_p = d_task_e + grouped_tasks;
             hipMemcpyAsync(d_task_e, task_e,
@@ -12767,13 +12770,13 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             hipMemcpyAsync(d_task_p, task_p,
                            (size_t)grouped_tasks * sizeof(int),
                            hipMemcpyHostToDevice, r->stream);
-        }
+        } else grouped_qwen = 0;
     }
     if (grouped_qwen)
         launch_qwen4_experts_grouped(r, cl, ne, eff, n_embd, grouped_tasks);
     if (grouped_qwen && r->moe_copy_pipeline) {
         for (int e = 0; e < ne; ++e) {
-            if (offs[e + 1] == offs[e]) continue;
+            if (!grouped_expert[e]) continue;
             for (int s = 0; s < cl->moe_cache_slots; ++s) {
                 if (cl->moe_cache_ids[s] == e) {
                     hipEventRecord(r->moe_compute_done[s], r->stream);
@@ -12786,7 +12789,7 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     for (int e = 0; e < ne; e++) {
         int cnt = offs[e + 1] - offs[e];
         if (cnt == 0) continue;
-        if (grouped_qwen) continue;
+        if (grouped_qwen && grouped_expert[e]) continue;
         size_t off = (size_t)offs[e];
         if (cpu_selected[e]) continue;
         float *xin = (float *)r->d_moe_gather_in + off * n_embd;
