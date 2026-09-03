@@ -829,6 +829,21 @@ static const char *hip_kernel_source =
 "    for(int o=16;o>0;o>>=1){g+=__shfl_down(g,o);u+=__shfl_down(u,o);}\n"
 "    if(lane==0)dst[(size_t)sel*rows+row]=(g/(1.0f+expf(-g)))*u;\n"
 "}\n"
+"__global__ void qwen4_gateup_silu_q4k_selected_2w(float *dst,const unsigned char *gate,\n"
+"        const unsigned char *up,const int *slots,const float *x,int K,int rows,int cols,\n"
+"        long long gs,long long us){\n"
+"    int ri=threadIdx.x/64,wi=(threadIdx.x&63)/32,lane=threadIdx.x&31;\n"
+"    int row=blockIdx.x*4+ri,sel=blockIdx.y;if(row>=rows||sel>=K)return;\n"
+"    int nb=cols/256,rb=nb*144,slot=slots[sel],G=nb*4;\n"
+"    const unsigned char *gr=gate+(long long)slot*gs+(size_t)row*rb;\n"
+"    const unsigned char *ur=up +(long long)slot*us+(size_t)row*rb;float g=0.0f,u=0.0f;\n"
+"    for(int z=lane+wi*32;z<G;z+=64){int b=z>>2,c=z&3;const float *xp=x+b*256+c*64;\n"
+"        g+=qwen4_q4k_group(gr+b*144,xp,c);u+=qwen4_q4k_group(ur+b*144,xp,c);}\n"
+"    for(int o=16;o>0;o>>=1){g+=__shfl_down(g,o);u+=__shfl_down(u,o);}\n"
+"    __shared__ float sg[8],su[8];if(lane==0){sg[ri*2+wi]=g;su[ri*2+wi]=u;}__syncthreads();\n"
+"    if(wi==0&&lane==0){g=sg[ri*2]+sg[ri*2+1];u=su[ri*2]+su[ri*2+1];\n"
+"        dst[(size_t)sel*rows+row]=(g/(1.0f+expf(-g)))*u;}\n"
+"}\n"
 "__global__ void qwen4_down_accum_q5_1_selected(float *acc,const unsigned char *down,\n"
 "        const float *act,const float *weights,const int *slots,int K,int rows,int cols,long long ds){\n"
 "    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp;if(row>=rows)return;\n"
@@ -7748,6 +7763,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_gateup_silu_q8_selected;
     hipFunction_t fn_qwen4_down_accum_q8_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_selected;
+    hipFunction_t fn_qwen4_gateup_silu_q4k_selected_2w;
     hipFunction_t fn_qwen4_gateup_silu_q4k_map;
     hipFunction_t fn_qwen4_gateup_silu_q5k_selected;
     hipFunction_t fn_qwen4_gateup_silu_q5k_map;
@@ -8288,6 +8304,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_gateup_silu_q8_selected);
     GET_FUNC(qwen4_down_accum_q8_selected);
     GET_FUNC(qwen4_gateup_silu_q4k_selected);
+    GET_FUNC(qwen4_gateup_silu_q4k_selected_2w);
     GET_FUNC(qwen4_gateup_silu_q4k_map);
     GET_FUNC(qwen4_gateup_silu_q5k_selected);
     GET_FUNC(qwen4_gateup_silu_q5k_map);
@@ -10684,8 +10701,14 @@ static inline void launch_qwen4_experts_q4k_selected(hip_llm_runner *r,
     long long us=(long long)cl->moe_cache_stride_up;
     void *ga[]={&r->d_moe_act8,&cl->moe_cache_gate,&cl->moe_cache_up,
                 &r->d_moe_idx,&r->d_xb,&K,&expert_ff,&n_embd,&gs,&us};
-    LAUNCH(r->fn_qwen4_gateup_silu_q4k_selected, (expert_ff+7)/8, K, 1,
-           256, 1, 1, 0, r->stream, ga);
+    hipFunction_t gate_fn = r->fn_qwen4_gateup_silu_q4k_selected;
+    int gate_blocks = (expert_ff + 7) / 8;
+    const char *q4_2w = getenv("LLM_Q4_2W");
+    if (q4_2w && atoi(q4_2w) != 0) {
+        gate_fn = r->fn_qwen4_gateup_silu_q4k_selected_2w;
+        gate_blocks = (expert_ff + 3) / 4;
+    }
+    LAUNCH(gate_fn, gate_blocks, K, 1, 256, 1, 1, 0, r->stream, ga);
     long long ds=(long long)cl->moe_cache_stride_down;
     void *da[]={&r->d_moe_accum,&cl->moe_cache_down,&r->d_moe_act8,
                 &r->d_moe_w,&r->d_moe_idx,&K,&n_embd,&expert_ff,&ds};
@@ -10834,8 +10857,14 @@ static inline void launch_qwen4_experts_q4k_gateup_selected(hip_llm_runner *r,
     long long us=(long long)cl->moe_cache_stride_up;
     void *ga[]={&r->d_moe_act8,&cl->moe_cache_gate,&cl->moe_cache_up,
                 &r->d_moe_idx,&r->d_xb,&K,&expert_ff,&n_embd,&gs,&us};
-    LAUNCH(r->fn_qwen4_gateup_silu_q4k_selected, (expert_ff+7)/8, K, 1,
-           256, 1, 1, 0, r->stream, ga);
+    hipFunction_t gate_fn = r->fn_qwen4_gateup_silu_q4k_selected;
+    int gate_blocks = (expert_ff + 7) / 8;
+    const char *q4_2w = getenv("LLM_Q4_2W");
+    if (q4_2w && atoi(q4_2w) != 0) {
+        gate_fn = r->fn_qwen4_gateup_silu_q4k_selected_2w;
+        gate_blocks = (expert_ff + 3) / 4;
+    }
+    LAUNCH(gate_fn, gate_blocks, K, 1, 256, 1, 1, 0, r->stream, ga);
     for (int sel = 0; sel < K; ++sel) {
         void *dw = (unsigned char *)cl->moe_cache_down +
                    (size_t)slots[sel]*cl->moe_cache_stride_down;
