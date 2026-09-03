@@ -17,6 +17,6 @@ exec env \
     LLM_MOE_STREAM_SLOTS="${LLM_MOE_STREAM_SLOTS:-4}" \
     LLM_MOE_CPU_LIB="${cpu_lib}" \
     LLM_MOE_CPU_PREFILL_MAX_COUNT="${LLM_MOE_CPU_PREFILL_MAX_COUNT:-2}" \
-    LLM_MOE_CPU_PREFILL_MAX_JOBS="${LLM_MOE_CPU_PREFILL_MAX_JOBS:-80}" \
+    LLM_MOE_CPU_PREFILL_MAX_JOBS="${LLM_MOE_CPU_PREFILL_MAX_JOBS:-160}" \
     "${runner_dir}/test_hip_llm" "${model}" \
     --gpu-only-bench --coding --moe-cache-mb "${cache_mb}" "$@"

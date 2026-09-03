@@ -177,6 +177,9 @@ int hip_llm_bench_quant_matvec(
         int warmup, int iters,
         float *out_ms);
 
+/* Verify batched MoE top-k routing, including expert ids above 255. */
+int hip_llm_verify_moe_routing(hip_llm_runner *r, int n_experts, int n_used);
+
 /* Query model dimensions (valid after load_weights). */
 int hip_llm_n_embd(const hip_llm_runner *r);
 int hip_llm_n_layers(const hip_llm_runner *r);

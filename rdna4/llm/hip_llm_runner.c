@@ -696,6 +696,36 @@ static const char *hip_kernel_source =
 "        for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
 "}\n"
+"/* Qwen4 HC up projection + four-stream sigmoid mix.  Two embedding outputs\n"
+" * per block, four warps per output (one warp per HC stream). */\n"
+"__global__ void qwen4_hc_up_mix_q8(float *mixed,float *gate,const float *xn,\n"
+"        const unsigned char *mat,int n_embd,int n_stream,int n_cols){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31;int i=blockIdx.x*2+warp/4,s=warp&3;\n"
+"    if(i>=n_embd||s>=n_stream)return;int row=s*n_embd+i,nb=n_cols/32,rb=nb*36;\n"
+"    const unsigned char *rp=mat+(size_t)row*rb;const float *x=xn;float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;\n"
+"        const signed char *q=(const signed char *)(bp+4);const float *xb=x+b*32;float z=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++)z+=(float)q[j]*xb[j];\n"
+"        sum+=z*half_to_float(*(const half_raw *)bp);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);\n"
+"    if(lane==0)gate[row]=sum;__syncthreads();\n"
+"    if(lane==0&&warp%4==0){float v=0.0f;for(int q=0;q<4;q++){int j=q*n_embd+i;\n"
+"        v+=xn[j]/(1.0f+expf(-gate[j]));}mixed[i]=v/(float)n_stream;}\n"
+"}\n"
+"/* HC down Q8 matvec with the fixed 1/n_stream scale and SiLU folded in. */\n"
+"__global__ void qwen4_hc_down_silu_q8(float *dst,const unsigned char *mat,\n"
+"        const float *x,int n_rows,int n_cols,float scale){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp;\n"
+"    if(row>=n_rows)return;int nb=n_cols/32,rb=nb*36;const unsigned char *rp=mat+(size_t)row*rb;float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;const signed char *q=(const signed char *)(bp+4);\n"
+"        const float *xb=x+b*32;float z=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++)z+=(float)q[j]*xb[j];\n"
+"        sum+=z*half_to_float(*(const half_raw *)bp);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);\n"
+"    if(lane==0){float v=sum*scale;dst[row]=v/(1.0f+expf(-v));}\n"
+"}\n"
 "\n"
 "/* Qwen4 cached-expert decode: fuse gate/up matvecs and SiLU product. */\n"
 "__global__ void qwen4_gateup_silu_q8(float *dst, const unsigned char *gate,\n"
@@ -788,7 +818,9 @@ static const char *hip_kernel_source =
 "    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp;if(row>=rows)return;\n"
 "    int nb=cols/32,rb=nb*24;float total=0.0f;\n"
 "    for(int sel=0;sel<K;sel++){const unsigned char *rp=down+(long long)slots[sel]*ds+(size_t)row*rb;\n"
-"        const float *x=act+(size_t)sel*cols;float sum=0.0f;for(int b=lane;b<nb;b+=32){\n"
+"        const float *x=act+(size_t)sel*cols;float sum=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int b=lane;b<nb;b+=32){\n"
 "            const unsigned char *bp=rp+b*24;float d=half_to_float(*(const half_raw *)bp),m=half_to_float(*(const half_raw *)(bp+2));\n"
 "            unsigned qh=(unsigned)bp[4]|((unsigned)bp[5]<<8)|((unsigned)bp[6]<<16)|((unsigned)bp[7]<<24);\n"
 "            const unsigned char *q=bp+8;float s=0.0f;\n"
@@ -798,12 +830,29 @@ static const char *hip_kernel_source =
 "        for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)total+=sum*weights[sel];}\n"
 "    if(lane==0)acc[row]=total;\n"
 "}\n"
+"__global__ void qwen4_down_accum_q5_1_map(float *acc,const unsigned char *down,\n"
+"        const float *act,const float *weights,const int *experts,const int *slot_map,\n"
+"        int K,int rows,int cols,long long ds){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp;if(row>=rows)return;\n"
+"    int nb=cols/32,rb=nb*24;float total=0.0f;\n"
+"    #pragma unroll\n"
+"    for(int sel=0;sel<K;sel++){int slot=slot_map[experts[sel]];const unsigned char *rp=down+(long long)slot*ds+(size_t)row*rb;\n"
+"        const float *x=act+(size_t)sel*cols;float sum=0.0f;for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*24;\n"
+"            float d=half_to_float(*(const half_raw *)bp),m=half_to_float(*(const half_raw *)(bp+2));\n"
+"            unsigned qh=(unsigned)bp[4]|((unsigned)bp[5]<<8)|((unsigned)bp[6]<<16)|((unsigned)bp[7]<<24);const unsigned char *q=bp+8;float s=0.0f;\n"
+"            #pragma unroll\n"
+"            for(int j=0;j<16;j++){int a=(q[j]&15)|(((qh>>j)&1)<<4);int v=(q[j]>>4)|(((qh>>(j+16))&1)<<4);s+=(d*a+m)*x[b*32+j]+(d*v+m)*x[b*32+j+16];}sum+=s;}\n"
+"        for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)total+=sum*weights[sel];}\n"
+"    if(lane==0)acc[row]=total;\n"
+"}\n"
 "__global__ void qwen4_down_accum_q8_0_selected(float *acc,const unsigned char *down,\n"
 "        const float *act,const float *weights,const int *slots,int K,int rows,int cols,long long ds){\n"
 "    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp;if(row>=rows)return;\n"
 "    int nb=cols/32,rb=nb*36;float total=0.0f;\n"
 "    for(int sel=0;sel<K;sel++){const unsigned char *rp=down+(long long)slots[sel]*ds+(size_t)row*rb;\n"
-"        const float *x=act+(size_t)sel*cols;float sum=0.0f;for(int b=lane;b<nb;b+=32){\n"
+"        const float *x=act+(size_t)sel*cols;float sum=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int b=lane;b<nb;b+=32){\n"
 "            const unsigned char *bp=rp+b*36;float d=half_to_float(*(const half_raw *)bp);\n"
 "            const signed char *q=(const signed char *)(bp+4);float s=0.0f;\n"
 "            #pragma unroll\n"
@@ -848,6 +897,30 @@ static const char *hip_kernel_source =
 "    for(int o=16;o>0;o>>=1){g+=__shfl_down(g,o);u+=__shfl_down(u,o);}\n"
 "    if(lane==0)dst[(size_t)m*rows+row]=(g/(1.0f+expf(-g)))*u;\n"
 "}\n"
+"__global__ void qwen4_gateup_silu_q5k_map(float *dst,const unsigned char *gate,\n"
+"        const unsigned char *up,const int *experts,const int *slot_map,const float *x,int K,int rows,int cols,\n"
+"        long long gs,long long us){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp,sel=blockIdx.y;\n"
+"    if(row>=rows||sel>=K)return;int nb=cols/256,rb=nb*176,slot=slot_map[experts[sel]],G=nb*4;\n"
+"    const unsigned char *gr=gate+(long long)slot*gs+(size_t)row*rb;\n"
+"    const unsigned char *ur=up +(long long)slot*us+(size_t)row*rb;float g=0.0f,u=0.0f;\n"
+"    for(int z=lane;z<G;z+=32){int b=z>>2,c=z&3;const float *xp=x+b*256+c*64;\n"
+"        g+=qwen4_q5k_group(gr+b*176,xp,c);u+=qwen4_q5k_group(ur+b*176,xp,c);}\n"
+"    for(int o=16;o>0;o>>=1){g+=__shfl_down(g,o);u+=__shfl_down(u,o);}\n"
+"    if(lane==0)dst[(size_t)sel*rows+row]=(g/(1.0f+expf(-g)))*u;\n"
+"}\n"
+"__global__ void qwen4_gateup_silu_q5k_selected(float *dst,const unsigned char *gate,\n"
+"        const unsigned char *up,const int *slots,const float *x,int K,int rows,int cols,\n"
+"        long long gs,long long us){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp,sel=blockIdx.y;\n"
+"    if(row>=rows||sel>=K)return;int nb=cols/256,rb=nb*176,slot=slots[sel],G=nb*4;\n"
+"    const unsigned char *gr=gate+(long long)slot*gs+(size_t)row*rb;\n"
+"    const unsigned char *ur=up +(long long)slot*us+(size_t)row*rb;float g=0.0f,u=0.0f;\n"
+"    for(int z=lane;z<G;z+=32){int b=z>>2,c=z&3;const float *xp=x+b*256+c*64;\n"
+"        g+=qwen4_q5k_group(gr+b*176,xp,c);u+=qwen4_q5k_group(ur+b*176,xp,c);}\n"
+"    for(int o=16;o>0;o>>=1){g+=__shfl_down(g,o);u+=__shfl_down(u,o);}\n"
+"    if(lane==0)dst[(size_t)sel*rows+row]=(g/(1.0f+expf(-g)))*u;\n"
+"}\n"
 "__global__ void qwen4_down_q5_1_batch(float *dst,const unsigned char *down,\n"
 "        const float *act,int M,int rows,int cols){\n"
 "    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*(blockDim.x/32)+warp,m=blockIdx.y;\n"
@@ -873,6 +946,69 @@ static const char *hip_kernel_source =
 "        #pragma unroll\n"
 "        for(int j=0;j<32;j++)s+=d*(float)q[j]*x[b*32+j];sum+=s;}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[(size_t)m*rows+row]=sum;\n"
+"}\n"
+"/* Grouped Qwen4 prefill kernels. blockIdx.y selects the expert and the\n"
+" * assignment offset table supplies the variable token count for that expert. */\n"
+"__global__ void qwen4_gateup_silu_q4k_grouped(float *dst,const unsigned char *gate,\n"
+"        const unsigned char *up,const float *x,const int *offs,const int *slot_map,\n"
+"        int ne,int rows,int cols,long long gs,long long us){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int e=blockIdx.y;\n"
+"    int row=blockIdx.x*(blockDim.x/32)+warp;int local=blockIdx.z;int cnt=offs[e+1]-offs[e];\n"
+"    if(e>=ne||row>=rows||local>=cnt)return;int a=offs[e]+local,nb=cols/256,rb=nb*144,G=nb*4;\n"
+"    int slot=slot_map[e];const unsigned char *gr=gate+(long long)slot*gs+(size_t)row*rb;\n"
+"    const unsigned char *ur=up +(long long)slot*us+(size_t)row*rb;\n"
+"    float g=0.0f,u=0.0f;const float *xp=x+(size_t)a*cols;\n"
+"    for(int z=lane;z<G;z+=32){int b=z>>2,c=z&3;\n"
+"        g+=qwen4_q4k_group(gr+b*144,xp+b*256+c*64,c);\n"
+"        u+=qwen4_q4k_group(ur+b*144,xp+b*256+c*64,c);}\n"
+"    for(int o=16;o>0;o>>=1){g+=__shfl_down(g,o);u+=__shfl_down(u,o);}\n"
+"    if(lane==0)dst[(size_t)a*rows+row]=(g/(1.0f+expf(-g)))*u;\n"
+"}\n"
+"__global__ void qwen4_gateup_silu_q5k_grouped(float *dst,const unsigned char *gate,\n"
+"        const unsigned char *up,const float *x,const int *offs,const int *slot_map,\n"
+"        int ne,int rows,int cols,long long gs,long long us){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int e=blockIdx.y;\n"
+"    int row=blockIdx.x*(blockDim.x/32)+warp;int local=blockIdx.z;int cnt=offs[e+1]-offs[e];\n"
+"    if(e>=ne||row>=rows||local>=cnt)return;int a=offs[e]+local,nb=cols/256,rb=nb*176,G=nb*4;\n"
+"    int slot=slot_map[e];const unsigned char *gr=gate+(long long)slot*gs+(size_t)row*rb;\n"
+"    const unsigned char *ur=up +(long long)slot*us+(size_t)row*rb;\n"
+"    float g=0.0f,u=0.0f;const float *xp=x+(size_t)a*cols;\n"
+"    for(int z=lane;z<G;z+=32){int b=z>>2,c=z&3;\n"
+"        g+=qwen4_q5k_group(gr+b*176,xp+b*256+c*64,c);\n"
+"        u+=qwen4_q5k_group(ur+b*176,xp+b*256+c*64,c);}\n"
+"    for(int o=16;o>0;o>>=1){g+=__shfl_down(g,o);u+=__shfl_down(u,o);}\n"
+"    if(lane==0)dst[(size_t)a*rows+row]=(g/(1.0f+expf(-g)))*u;\n"
+"}\n"
+"__global__ void qwen4_down_q5_1_grouped(float *dst,const unsigned char *down,\n"
+"        const float *act,const int *offs,const int *slot_map,int ne,int rows,int cols,\n"
+"        long long ds){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int e=blockIdx.y;\n"
+"    int row=blockIdx.x*(blockDim.x/32)+warp;int local=blockIdx.z;int cnt=offs[e+1]-offs[e];\n"
+"    if(e>=ne||row>=rows||local>=cnt)return;int a=offs[e]+local,nb=cols/32,rb=nb*24,slot=slot_map[e];\n"
+"    const unsigned char *rp=down+(long long)slot*ds+(size_t)row*rb;\n"
+"    const float *xp=act+(size_t)a*cols;float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*24;\n"
+"        float d=half_to_float(*(const half_raw *)bp),mn=half_to_float(*(const half_raw *)(bp+2));\n"
+"        unsigned qh=(unsigned)bp[4]|((unsigned)bp[5]<<8)|((unsigned)bp[6]<<16)|((unsigned)bp[7]<<24);\n"
+"        const unsigned char *q=bp+8;float s=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<16;j++){int v0=(q[j]&15)|(((qh>>j)&1)<<4);int v1=(q[j]>>4)|(((qh>>(j+16))&1)<<4);\n"
+"            s+=(d*v0+mn)*xp[b*32+j]+(d*v1+mn)*xp[b*32+j+16];}sum+=s;}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[(size_t)a*rows+row]=sum;\n"
+"}\n"
+"__global__ void qwen4_down_q8_0_grouped(float *dst,const unsigned char *down,\n"
+"        const float *act,const int *offs,const int *slot_map,int ne,int rows,int cols,\n"
+"        long long ds){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int e=blockIdx.y;\n"
+"    int row=blockIdx.x*(blockDim.x/32)+warp;int local=blockIdx.z;int cnt=offs[e+1]-offs[e];\n"
+"    if(e>=ne||row>=rows||local>=cnt)return;int a=offs[e]+local,nb=cols/32,rb=nb*36,slot=slot_map[e];\n"
+"    const unsigned char *rp=down+(long long)slot*ds+(size_t)row*rb;\n"
+"    const float *xp=act+(size_t)a*cols;float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;float d=half_to_float(*(const half_raw *)bp);\n"
+"        const signed char *q=(const signed char *)(bp+4);float s=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++)s+=d*(float)q[j]*xp[b*32+j];sum+=s;}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[(size_t)a*rows+row]=sum;\n"
 "}\n"
 "\n"
 "/* ---- 13. embed_q8_0: Padded Q8_0 embedding lookup -> F32 ---- */\n"
@@ -4751,6 +4887,12 @@ static const char *hip_kernel_source =
 "        counter[0] = 0;  /* reset for next layer */\n"
 "    }\n"
 "}\n"
+"__global__ void moe_cache_slots_valid(const int *experts,const int *slot_map,\n"
+"        int K,int *valid){\n"
+"    if(blockIdx.x == 0 && threadIdx.x == 0){\n"
+"        int ok=1; for(int i=0;i<K;i++) if(slot_map[experts[i]] < 0) ok=0; *valid=ok;\n"
+"    }\n"
+"}\n"
 "/* ---- deltanet_step_warp_f32: warp-per-state-row decode recurrence.        */\n"
 "/* 8 warps/block; warp owns S[h,r,0..127] in regs (4 f32/lane). 512 blocks   */\n"
 "/* (32 heads x 16 row-warps) vs old 32 blocks; single S read+write.          */\n"
@@ -6065,12 +6207,18 @@ static const char *hip_kernel_source =
 "    __shared__ float sval[256];\n"
 "    __shared__ int   sidx[256];\n"
 "    __shared__ int   chosen[64];\n"
-"    float my = (tid < ne) ? lg[tid] : -1e30f;\n"
+"    /* Two candidates per lane keeps routing correct for 512 experts. */\n"
+"    float my0 = (tid < ne) ? lg[tid] : -1e30f;\n"
+"    float my1 = (tid + 256 < ne) ? lg[tid + 256] : -1e30f;\n"
 "    int *oi = tok_idx + (size_t)m * K; float *ow = tok_w + (size_t)m * K;\n"
 "    for (int ki = 0; ki < K; ki++) {\n"
-"        float v = my;\n"
-"        for (int j = 0; j < ki; j++) if (chosen[j] == tid) v = -1e30f;\n"
-"        sval[tid] = v; sidx[tid] = tid; __syncthreads();\n"
+"        float v = my0; int vi = tid;\n"
+"        for (int j = 0; j < ki; j++) if (chosen[j] == vi) v = -1e30f;\n"
+"        if (my1 > v || (my1 == v && tid + 256 < vi)) {\n"
+"            v = my1; vi = tid + 256;\n"
+"            for (int j = 0; j < ki; j++) if (chosen[j] == vi) v = -1e30f;\n"
+"        }\n"
+"        sval[tid] = v; sidx[tid] = vi; __syncthreads();\n"
 "        for (int s = 128; s > 0; s >>= 1) {\n"
 "            if (tid < s && tid + s < 256) {\n"
 "                if (sval[tid+s] > sval[tid]) { sval[tid]=sval[tid+s]; sidx[tid]=sidx[tid+s]; }\n"
@@ -7450,6 +7598,7 @@ typedef struct {
     void *moe_cache_up;
     void *moe_cache_down;
     int *moe_cache_ids;
+    int *d_moe_cache_map;       /* device expert id -> resident cache slot */
     int moe_cache_slots;
     int moe_cache_next;
     size_t moe_cache_stride_gate;
@@ -7496,7 +7645,9 @@ typedef struct {
 
     /* Qwen4 hyperconnection weights. */
     void *hc_attn_norm_w, *hc_attn_down_w, *hc_attn_up_w, *hc_attn_inject_w;
+    void *hc_attn_down_w_bf16, *hc_attn_up_w_bf16;
     void *hc_ffn_norm_w,  *hc_ffn_down_w,  *hc_ffn_up_w,  *hc_ffn_inject_w;
+    void *hc_ffn_down_w_bf16, *hc_ffn_up_w_bf16;
     int hc_attn_down_type, hc_attn_up_type, hc_attn_inject_type;
     int hc_ffn_down_type, hc_ffn_up_type, hc_ffn_inject_type;
 
@@ -7562,17 +7713,26 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q8_0_dp4a;
     hipFunction_t fn_matvec_q8_0_f32;
     hipFunction_t fn_matvec_q8_0_mw_f32;
+    hipFunction_t fn_qwen4_hc_up_mix_q8;
+    hipFunction_t fn_qwen4_hc_down_silu_q8;
     hipFunction_t fn_qwen4_gateup_silu_q8;
     hipFunction_t fn_qwen4_down_accum_q8;
     hipFunction_t fn_qwen4_gateup_silu_q8_selected;
     hipFunction_t fn_qwen4_down_accum_q8_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_selected;
+    hipFunction_t fn_qwen4_gateup_silu_q5k_selected;
+    hipFunction_t fn_qwen4_gateup_silu_q5k_map;
     hipFunction_t fn_qwen4_down_accum_q5_1_selected;
+    hipFunction_t fn_qwen4_down_accum_q5_1_map;
     hipFunction_t fn_qwen4_down_accum_q8_0_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_batch;
     hipFunction_t fn_qwen4_gateup_silu_q5k_batch;
     hipFunction_t fn_qwen4_down_q5_1_batch;
     hipFunction_t fn_qwen4_down_q8_0_batch;
+    hipFunction_t fn_qwen4_gateup_silu_q4k_grouped;
+    hipFunction_t fn_qwen4_gateup_silu_q5k_grouped;
+    hipFunction_t fn_qwen4_down_q5_1_grouped;
+    hipFunction_t fn_qwen4_down_q8_0_grouped;
     hipFunction_t fn_embed_q8_0;
     hipFunction_t fn_embed_q4_0;
     hipFunction_t fn_matvec_q2_K_f32;
@@ -7647,6 +7807,7 @@ struct hip_llm_runner {
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
     hipFunction_t fn_moe_router_fused;      /* decode: router+topk+sgate, 1 launch */
+    hipFunction_t fn_moe_cache_slots_valid;
     hipFunction_t fn_deltanet_step_warp_f32; /* decode: warp-per-row deltanet */
     int moe_add_pending;                    /* decode: pending x += d_moe_accum fold */
     hipFunction_t fn_deltanet_step_batch_warp_f32; /* prefill: warp-per-row M-step */
@@ -7798,6 +7959,7 @@ struct hip_llm_runner {
     int ple_conv_kernel;
     int ple_eos_token;
     void *hc_head_norm_w, *hc_head_down_w, *hc_head_up_w;
+    void *hc_head_down_w_bf16, *hc_head_up_w_bf16;
     int hc_head_down_type, hc_head_up_type;
     void *d_hc;
     void *d_hc_norm;
@@ -8089,17 +8251,26 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(quantize_f32_act_to_int8);
     GET_FUNC(matvec_q8_0_f32);
     GET_FUNC(matvec_q8_0_mw_f32);
+    GET_FUNC(qwen4_hc_up_mix_q8);
+    GET_FUNC(qwen4_hc_down_silu_q8);
     GET_FUNC(qwen4_gateup_silu_q8);
     GET_FUNC(qwen4_down_accum_q8);
     GET_FUNC(qwen4_gateup_silu_q8_selected);
     GET_FUNC(qwen4_down_accum_q8_selected);
     GET_FUNC(qwen4_gateup_silu_q4k_selected);
+    GET_FUNC(qwen4_gateup_silu_q5k_selected);
+    GET_FUNC(qwen4_gateup_silu_q5k_map);
     GET_FUNC(qwen4_down_accum_q5_1_selected);
+    GET_FUNC(qwen4_down_accum_q5_1_map);
     GET_FUNC(qwen4_down_accum_q8_0_selected);
     GET_FUNC(qwen4_gateup_silu_q4k_batch);
     GET_FUNC(qwen4_gateup_silu_q5k_batch);
     GET_FUNC(qwen4_down_q5_1_batch);
     GET_FUNC(qwen4_down_q8_0_batch);
+    GET_FUNC(qwen4_gateup_silu_q4k_grouped);
+    GET_FUNC(qwen4_gateup_silu_q5k_grouped);
+    GET_FUNC(qwen4_down_q5_1_grouped);
+    GET_FUNC(qwen4_down_q8_0_grouped);
     GET_FUNC(embed_q8_0);
     GET_FUNC(embed_q4_0);
     GET_FUNC(matvec_q2_K_f32);
@@ -8169,6 +8340,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(moe_route_decode);
     GET_FUNC(res_rmsnorm_f32);
     GET_FUNC(moe_router_fused);
+    GET_FUNC(moe_cache_slots_valid);
     GET_FUNC(deltanet_step_warp_f32);
     GET_FUNC(deltanet_step_batch_warp_f32);
     GET_FUNC(gemm_bf16_own);
@@ -8399,6 +8571,20 @@ static int upload_norm_bf16(void **d_ptr, const qtensor *t, int n) {
     free(h);
     if (err != hipSuccess) { hipFree(*d_ptr); *d_ptr = NULL; return -1; }
     return 0;
+}
+
+/* Large HC Q8 matrices are used repeatedly by batched prefill.  Keep a BF16
+ * copy only when explicitly requested: on a 16-GiB card the extra ~1.2 GiB
+ * competes with the routed-expert cache and can reduce overall throughput.
+ * Callers fall back to on-the-fly dequantization when disabled or unavailable. */
+static void upload_optional_bf16(void **d_ptr, const qtensor *t) {
+    *d_ptr = NULL;
+    const char *enabled = getenv("LLM_HC_BF16_CACHE");
+    if (!t->data || t->type != GGML_TYPE_Q8_0 || !enabled || !atoi(enabled)) return;
+    if (upload_norm_bf16(d_ptr, t, t->n_rows * t->n_cols) != 0) {
+        fprintf(stderr, "hip_llm: HC BF16 cache unavailable; using on-the-fly dequant\n");
+        *d_ptr = NULL;
+    }
 }
 
 static int upload_norm_f32(void **d_ptr, const qtensor *t, int n) {
@@ -9108,9 +9294,11 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
         t = hllm_load_tensor(gguf, "output_hc_down.weight", 1);
         if (!t.data || upload_weight_matrix(&r->hc_head_down_w, &t,
                                              &r->hc_head_down_type) != 0) return -1;
+        upload_optional_bf16(&r->hc_head_down_w_bf16, &t);
         t = hllm_load_tensor(gguf, "output_hc_up.weight", 1);
         if (!t.data || upload_weight_matrix(&r->hc_head_up_w, &t,
                                              &r->hc_head_up_type) != 0) return -1;
+        upload_optional_bf16(&r->hc_head_up_w_bf16, &t);
         t = hllm_load_tensor(gguf, "per_layer_token_embd.weight", 1);
         if (!t.data) return -1;
         r->per_layer_token_embd_host = t.data;
@@ -9159,16 +9347,23 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                 t = hllm_load_tensor(gguf, name, 1); \
                 if (!t.data || upload_weight_matrix(&cl->field, &t, &cl->typefield) != 0) return -1; \
             } while (0)
+            #define LOAD_HC_Q8_MAT(field, bf16field, suffix, typefield) do { \
+                snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
+                t = hllm_load_tensor(gguf, name, 1); \
+                if (!t.data || upload_weight_matrix(&cl->field, &t, &cl->typefield) != 0) return -1; \
+                upload_optional_bf16(&cl->bf16field, &t); \
+            } while (0)
             LOAD_HC_NORM(hc_attn_norm_w, "hc_attn_norm");
-            LOAD_HC_MAT(hc_attn_down_w, "hc_attn_down", hc_attn_down_type);
-            LOAD_HC_MAT(hc_attn_up_w, "hc_attn_up", hc_attn_up_type);
+            LOAD_HC_Q8_MAT(hc_attn_down_w, hc_attn_down_w_bf16, "hc_attn_down", hc_attn_down_type);
+            LOAD_HC_Q8_MAT(hc_attn_up_w, hc_attn_up_w_bf16, "hc_attn_up", hc_attn_up_type);
             LOAD_HC_MAT(hc_attn_inject_w, "hc_attn_inject", hc_attn_inject_type);
             LOAD_HC_NORM(hc_ffn_norm_w, "hc_ffn_norm");
-            LOAD_HC_MAT(hc_ffn_down_w, "hc_ffn_down", hc_ffn_down_type);
-            LOAD_HC_MAT(hc_ffn_up_w, "hc_ffn_up", hc_ffn_up_type);
+            LOAD_HC_Q8_MAT(hc_ffn_down_w, hc_ffn_down_w_bf16, "hc_ffn_down", hc_ffn_down_type);
+            LOAD_HC_Q8_MAT(hc_ffn_up_w, hc_ffn_up_w_bf16, "hc_ffn_up", hc_ffn_up_type);
             LOAD_HC_MAT(hc_ffn_inject_w, "hc_ffn_inject", hc_ffn_inject_type);
             #undef LOAD_HC_NORM
             #undef LOAD_HC_MAT
+            #undef LOAD_HC_Q8_MAT
         } else {
             snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
@@ -9692,6 +9887,13 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 CHECK_HIP(hipMalloc(&cl->moe_cache_gate, (size_t)slots * cl->moe_cache_stride_gate));
                 CHECK_HIP(hipMalloc(&cl->moe_cache_up,   (size_t)slots * cl->moe_cache_stride_up));
                 CHECK_HIP(hipMalloc(&cl->moe_cache_down, (size_t)slots * cl->moe_cache_stride_down));
+                CHECK_HIP(hipMalloc(&cl->d_moe_cache_map, (size_t)r->n_experts * sizeof(int)));
+                int *map = (int *)malloc((size_t)r->n_experts * sizeof(int));
+                if (!map) return -1;
+                for (int e = 0; e < r->n_experts; ++e) map[e] = -1;
+                CHECK_HIP(hipMemcpy(cl->d_moe_cache_map, map,
+                                    (size_t)r->n_experts * sizeof(int), hipMemcpyHostToDevice));
+                free(map);
             }
             fprintf(stderr, "hip_llm: Qwen4 expert cache: %d slots/layer, %.2f GiB budget\n",
                     slots, per_slot_all * (double)slots / (double)(1ULL << 30));
@@ -10462,6 +10664,45 @@ static inline void launch_qwen4_experts_q4k_selected(hip_llm_runner *r,
            256, 1, 1, 0, r->stream, da);
 }
 
+static inline void launch_qwen4_experts_q5k_selected(hip_llm_runner *r,
+        hip_layer *cl, const int *slots, const float *weights, int K,
+        int expert_ff, int n_embd) {
+    hipMemcpyAsync(r->d_moe_idx, slots, (size_t)K*sizeof(int),
+                   hipMemcpyHostToDevice, r->stream);
+    hipMemcpyAsync(r->d_moe_w, weights, (size_t)K*sizeof(float),
+                   hipMemcpyHostToDevice, r->stream);
+    long long gs=(long long)cl->moe_cache_stride_gate;
+    long long us=(long long)cl->moe_cache_stride_up;
+    void *ga[]={&r->d_moe_act8,&cl->moe_cache_gate,&cl->moe_cache_up,
+                &r->d_moe_idx,&r->d_xb,&K,&expert_ff,&n_embd,&gs,&us};
+    LAUNCH(r->fn_qwen4_gateup_silu_q5k_selected, (expert_ff+7)/8, K, 1,
+           256, 1, 1, 0, r->stream, ga);
+    long long ds=(long long)cl->moe_cache_stride_down;
+    void *da[]={&r->d_moe_accum,&cl->moe_cache_down,&r->d_moe_act8,
+                &r->d_moe_w,&r->d_moe_idx,&K,&n_embd,&expert_ff,&ds};
+    hipFunction_t down = cl->moe_down_exps_type == GGML_TYPE_Q8_0 ?
+                         r->fn_qwen4_down_accum_q8_0_selected :
+                         r->fn_qwen4_down_accum_q5_1_selected;
+    LAUNCH(down, (n_embd+7)/8, 1, 1, 256, 1, 1, 0, r->stream, da);
+}
+
+static inline void launch_qwen4_experts_q5k_map(hip_llm_runner *r,
+        hip_layer *cl, int K, int expert_ff, int n_embd) {
+    long long gs = (long long)cl->moe_cache_stride_gate;
+    long long us = (long long)cl->moe_cache_stride_up;
+    void *ga[] = { &r->d_moe_act8, &cl->moe_cache_gate, &cl->moe_cache_up,
+                   &r->d_moe_idx, &cl->d_moe_cache_map, &r->d_xb,
+                   &K, &expert_ff, &n_embd, &gs, &us };
+    LAUNCH(r->fn_qwen4_gateup_silu_q5k_map, (expert_ff + 7) / 8, K, 1,
+           256, 1, 1, 0, r->stream, ga);
+    long long ds = (long long)cl->moe_cache_stride_down;
+    void *da[] = { &r->d_moe_accum, &cl->moe_cache_down, &r->d_moe_act8,
+                   &r->d_moe_w, &r->d_moe_idx, &cl->d_moe_cache_map,
+                   &K, &n_embd, &expert_ff, &ds };
+    LAUNCH(r->fn_qwen4_down_accum_q5_1_map, (n_embd + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, da);
+}
+
 static inline void launch_qwen4_expert_q4k_batch(hip_llm_runner *r,
         float *out, float *act, void *gate, void *up, void *down, float *x,
         int M, int expert_ff, int n_embd, int down_type) {
@@ -10485,6 +10726,33 @@ static inline void launch_qwen4_expert_q5k_q80_batch(hip_llm_runner *r,
     void *da[] = { &out, &down, &act, &M, &n_embd, &expert_ff };
     LAUNCH(r->fn_qwen4_down_q8_0_batch, (n_embd + 3) / 4, M, 1,
            128, 1, 1, 0, r->stream, da);
+}
+
+static inline void launch_qwen4_experts_grouped(hip_llm_runner *r, hip_layer *cl,
+        int ne, int expert_ff, int n_embd, int max_count) {
+    void *ga[] = { &r->d_moe_eg, &cl->moe_cache_gate, &cl->moe_cache_up,
+                   &r->d_moe_gather_in, &r->d_moe_offs, &cl->d_moe_cache_map,
+                   &ne, &expert_ff, &n_embd, &cl->moe_cache_stride_gate,
+                   &cl->moe_cache_stride_up };
+    hipFunction_t gateup = cl->moe_gate_exps_type == GGML_TYPE_Q5_K ?
+                            r->fn_qwen4_gateup_silu_q5k_grouped :
+                            r->fn_qwen4_gateup_silu_q4k_grouped;
+    long long gs = (long long)cl->moe_cache_stride_gate;
+    long long us = (long long)cl->moe_cache_stride_up;
+    ga[9] = &gs;
+    ga[10] = &us;
+    LAUNCH(gateup, (unsigned)((expert_ff + 7) / 8), ne, (unsigned)max_count,
+           256, 1, 1, 0, r->stream, ga);
+    void *da[] = { &r->d_moe_eout, &cl->moe_cache_down, &r->d_moe_eg,
+                   &r->d_moe_offs, &cl->d_moe_cache_map, &ne, &n_embd, &expert_ff,
+                   &cl->moe_cache_stride_down };
+    hipFunction_t down = cl->moe_down_exps_type == GGML_TYPE_Q8_0 ?
+                         r->fn_qwen4_down_q8_0_grouped :
+                         r->fn_qwen4_down_q5_1_grouped;
+    long long ds = (long long)cl->moe_cache_stride_down;
+    da[8] = &ds;
+    LAUNCH(down, (unsigned)((n_embd + 7) / 8), ne, (unsigned)max_count,
+           256, 1, 1, 0, r->stream, da);
 }
 
 static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
@@ -11610,6 +11878,13 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
     float *top_w = r->h_router_logits + n_experts + 64;
     const char *gpu_topk_env = getenv("LLM_QWEN4_GPU_TOPK");
     int use_gpu_topk = !gpu_topk_env || atoi(gpu_topk_env) != 0;
+    int device_cache_path = 0;
+    const char *device_cache_env = getenv("LLM_QWEN4_DEVICE_CACHE");
+    int use_device_cache = device_cache_env && atoi(device_cache_env) != 0 &&
+        cl->d_moe_cache_map &&
+        cl->moe_gate_exps_type == GGML_TYPE_Q5_K &&
+        cl->moe_up_exps_type == GGML_TYPE_Q5_K &&
+        cl->moe_down_exps_type == GGML_TYPE_Q5_1;
     if (use_gpu_topk) {
         int ne = n_experts, k = n_experts_used, nc = n_embd;
         void *ra[] = { &cl->moe_gate_w_bf16, &cl->moe_shared_gate_w_bf16,
@@ -11618,11 +11893,27 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                        &r->d_router_counter };
         LAUNCH(r->fn_moe_router_fused, ne + 1, 1, 1, 256, 1, 1,
                0, r->stream, ra);
-        hipMemcpyAsync(top_idx, r->d_moe_idx, (size_t)n_experts_used*sizeof(int),
-                       hipMemcpyDeviceToHost, r->stream);
-        hipMemcpyAsync(top_w, r->d_moe_w, (size_t)n_experts_used*sizeof(float),
-                       hipMemcpyDeviceToHost, r->stream);
-        hipStreamSynchronize(r->stream);
+        if (use_device_cache) {
+            int valid = 0;
+            void *va[] = { &r->d_moe_idx, &cl->d_moe_cache_map,
+                           &k, &r->d_router_counter };
+            LAUNCH(r->fn_moe_cache_slots_valid, 1, 1, 1, 64, 1, 1, 0, r->stream, va);
+            hipMemcpyAsync(&valid, r->d_router_counter, sizeof(valid),
+                           hipMemcpyDeviceToHost, r->stream);
+            hipStreamSynchronize(r->stream);
+            if (valid) {
+                hipMemsetAsync(r->d_moe_accum, 0, (size_t)n_embd * sizeof(float), r->stream);
+                launch_qwen4_experts_q5k_map(r, cl, n_experts_used, expert_ff, n_embd);
+                device_cache_path = 1;
+            }
+        }
+        if (!device_cache_path) {
+            hipMemcpyAsync(top_idx, r->d_moe_idx, (size_t)n_experts_used*sizeof(int),
+                           hipMemcpyDeviceToHost, r->stream);
+            hipMemcpyAsync(top_w, r->d_moe_w, (size_t)n_experts_used*sizeof(float),
+                           hipMemcpyDeviceToHost, r->stream);
+            hipStreamSynchronize(r->stream);
+        }
     } else {
         launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
                           cl->moe_gate_rows, cl->moe_gate_cols);
@@ -11632,7 +11923,9 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
         moe_topk_softmax(r->h_router_logits, n_experts, n_experts_used,
                          top_idx, top_w);
     }
-    if (cl->moe_cache_slots > 0) {
+    if (device_cache_path) {
+        r->moe_stats.gpu_assignments += (uint64_t)n_experts_used;
+    } else if (cl->moe_cache_slots > 0) {
         int *top_slots = (int *)(r->h_router_logits + n_experts + 128);
         const char *fused_env = getenv("LLM_QWEN4_FUSED_EXPERTS");
         int use_fused = !fused_env || atoi(fused_env) != 0;
@@ -11643,6 +11936,10 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                        cl->moe_up_exps_type == GGML_TYPE_Q4_K &&
                        (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
                         cl->moe_down_exps_type == GGML_TYPE_Q8_0);
+        int fused_q5k = use_fused && cl->moe_gate_exps_type == GGML_TYPE_Q5_K &&
+                        cl->moe_up_exps_type == GGML_TYPE_Q5_K &&
+                        (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
+                         cl->moe_down_exps_type == GGML_TYPE_Q8_0);
         hipMemsetAsync(r->d_moe_accum, 0, (size_t)n_embd * sizeof(float), r->stream);
         for (int sel = 0; sel < n_experts_used; ++sel) {
             int e = top_idx[sel], slot = -1;
@@ -11673,7 +11970,15 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                                 cl->moe_down_exps_type, cl->moe_exp_rows_d,
                                 cl->moe_exp_cols_d, cl->moe_exp_stride_d,
                                 cl->moe_cache_stride_down);
+                int old_e = cl->moe_cache_ids[slot];
+                if (old_e >= 0 && old_e != e) {
+                    int invalid_slot = -1;
+                    hipMemcpyAsync(cl->d_moe_cache_map + old_e, &invalid_slot,
+                                   sizeof(invalid_slot), hipMemcpyHostToDevice, r->stream);
+                }
                 cl->moe_cache_ids[slot] = e;
+                hipMemcpyAsync(cl->d_moe_cache_map + e, &slot, sizeof(slot),
+                               hipMemcpyHostToDevice, r->stream);
                 r->moe_stats.cache_misses++;
             } else {
                 r->moe_stats.cache_hits++;
@@ -11682,7 +11987,7 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
             void *gw = (unsigned char *)cl->moe_cache_gate + (size_t)slot*cl->moe_cache_stride_gate;
             void *uw = (unsigned char *)cl->moe_cache_up   + (size_t)slot*cl->moe_cache_stride_up;
             void *dw = (unsigned char *)cl->moe_cache_down + (size_t)slot*cl->moe_cache_stride_down;
-            if (!fused_q8 && !fused_xl) {
+            if (!fused_q8 && !fused_xl && !fused_q5k) {
                 launch_matvec_auto(r, r->d_gate, gw, r->d_xb, expert_ff, n_embd,
                                    cl->moe_gate_exps_type);
                 launch_matvec_auto(r, r->d_up, uw, r->d_xb, expert_ff, n_embd,
@@ -11698,6 +12003,9 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                                              n_experts_used, expert_ff, n_embd);
         else if (fused_xl)
             launch_qwen4_experts_q4k_selected(r, cl, top_slots, top_w,
+                                              n_experts_used, expert_ff, n_embd);
+        else if (fused_q5k)
+            launch_qwen4_experts_q5k_selected(r, cl, top_slots, top_w,
                                               n_experts_used, expert_ff, n_embd);
         r->moe_stats.gpu_assignments += (uint64_t)n_experts_used;
     } else {
@@ -11920,16 +12228,31 @@ static void forward_hc_mix(hip_llm_runner *r, void *norm_w, void *down_w,
     void *na[] = { &r->d_hc_norm, &r->d_hc, &norm_w, &ne, &ns, &eps };
     LAUNCH(r->fn_hc_norm_f32, ns, 1, 1, 256, 1, 1,
            256*sizeof(float), r->stream, na);
-    launch_matvec_auto(r, r->d_hc_low, down_w, r->d_hc_norm,
-                       r->hc_low_rank, hcd, down_type);
-    {
+    if (down_type == GGML_TYPE_Q8_0 && ne == 2560 && ns == 4 &&
+        r->hc_low_rank == 256) {
+        int nr = r->hc_low_rank, nc = hcd;
+        float scale = 1.0f/(float)ns;
+        void *a[] = { &r->d_hc_low, &down_w, &r->d_hc_norm,
+                      &nr, &nc, &scale };
+        LAUNCH(r->fn_qwen4_hc_down_silu_q8, (nr + 7) / 8, 1, 1,
+               256, 1, 1, 0, r->stream, a);
+    } else {
+        launch_matvec_auto(r, r->d_hc_low, down_w, r->d_hc_norm,
+                           r->hc_low_rank, hcd, down_type);
         int n = r->hc_low_rank; float scale = 1.0f/(float)ns;
         void *a[] = { &r->d_hc_low, &n, &scale };
         LAUNCH(r->fn_hc_silu_scale_f32, (n+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a);
     }
-    launch_matvec_auto(r, r->d_hc_gate, up_w, r->d_hc_low, hcd,
-                       r->hc_low_rank, up_type);
-    {
+    if (up_type == GGML_TYPE_Q8_0 && ne == 2560 && ns == 4 &&
+        r->hc_low_rank == 256) {
+        int nc = r->hc_low_rank;
+        void *a[] = { &mixed, &r->d_hc_gate, &r->d_hc_norm, &up_w,
+                      &ne, &ns, &nc };
+        LAUNCH(r->fn_qwen4_hc_up_mix_q8, (ne + 1) / 2, 1, 1,
+               256, 1, 1, 0, r->stream, a);
+    } else {
+        launch_matvec_auto(r, r->d_hc_gate, up_w, r->d_hc_low,
+                           hcd, r->hc_low_rank, up_type);
         void *a[] = { &mixed, &r->d_hc_norm, &r->d_hc_gate, &ne, &ns };
         LAUNCH(r->fn_hc_mix_f32, (ne+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a);
     }
@@ -11946,21 +12269,22 @@ static void forward_hc_combine(hip_llm_runner *r, void *block) {
 }
 
 static int forward_hc_mix_batched(hip_llm_runner *r, int M, void *norm_w,
-                                  void *down_w, int down_type, void *up_w,
-                                  int up_type, void *inject_w, int inject_type,
+                                  void *down_w, void *down_bf16, int down_type,
+                                  void *up_w, void *up_bf16, int up_type,
+                                  void *inject_w, int inject_type,
                                   void *mixed) {
     int ne=r->n_embd, ns=r->hc_count, hcd=ne*ns, lr=r->hc_low_rank;
     float eps=r->rms_norm_eps;
     void *na[]={&r->d_hc_norm_batch,&r->d_hc_batch,&norm_w,&ne,&ns,&M,&eps};
     LAUNCH(r->fn_hc_norm_batch_f32, M*ns,1,1,256,1,1,256*sizeof(float),r->stream,na);
     launch_pack_bf16_from_f32(r,r->d_hc_norm_batch_bf16,r->d_hc_norm_batch,M*hcd);
-    void *dw=get_bf16_weight(r,down_w,NULL,down_type,lr,hcd);
+    void *dw=get_bf16_weight(r,down_w,down_bf16,down_type,lr,hcd);
     if(!dw || gemm_run_bf16_w(r,r->d_hc_low_batch,dw,r->d_hc_norm_batch_bf16,
                               M,lr,hcd,r->stream)!=0)return -1;
     { int n=M*lr; float z=1.0f/(float)ns; void *a[]={&r->d_hc_low_batch,&n,&z};
       LAUNCH(r->fn_hc_silu_scale_f32,(n+255)/256,1,1,256,1,1,0,r->stream,a); }
     launch_pack_bf16_from_f32(r,r->d_hc_low_batch_bf16,r->d_hc_low_batch,M*lr);
-    void *uw=get_bf16_weight(r,up_w,NULL,up_type,hcd,lr);
+    void *uw=get_bf16_weight(r,up_w,up_bf16,up_type,hcd,lr);
     if(!uw || gemm_run_bf16_w(r,r->d_hc_gate_batch,uw,r->d_hc_low_batch_bf16,
                               M,hcd,lr,r->stream)!=0)return -1;
     { int n=M*hcd; launch_pack_bf16_from_f32(r,r->d_hc_gate_batch_bf16,
@@ -12007,7 +12331,8 @@ int hip_llm_verify_hc_batch(hip_llm_runner *r,int M,double *rel,double *mx){
     hipMemcpy(r->d_hc_batch,in,(size_t)M*hcd*sizeof(float),hipMemcpyHostToDevice);
     void *bout=r->d_hc_gate_batch_bf16;
     if(forward_hc_mix_batched(r,M,cl->hc_attn_norm_w,cl->hc_attn_down_w,
-       cl->hc_attn_down_type,cl->hc_attn_up_w,cl->hc_attn_up_type,
+       cl->hc_attn_down_w_bf16,cl->hc_attn_down_type,cl->hc_attn_up_w,
+       cl->hc_attn_up_w_bf16,cl->hc_attn_up_type,
        cl->hc_attn_inject_w,cl->hc_attn_inject_type,bout)!=0){free(in);free(a);free(b);return -1;}
     hipStreamSynchronize(r->stream);
     hipMemcpy(b,bout,(size_t)M*ne*sizeof(float),hipMemcpyDeviceToHost);
@@ -12086,8 +12411,7 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     if (ne > 1024) return -1;  /* cursor[] cap */
     /* 1. Router GEMM: [M,ne] = xnorm[M,n_embd] x Wg[ne,n_embd] (Wg is F32 -> bf16). */
     launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16_moe, r->d_xnorm_batch, M * n_embd);
-    launch_pack_bf16_from_f32(r, r->d_router_w_bf16, cl->moe_gate_w, ne * n_embd);
-    if (gemm_run_bf16_w(r, r->d_router_logits_batch, r->d_router_w_bf16,
+    if (gemm_run_bf16_w(r, r->d_router_logits_batch, cl->moe_gate_w_bf16,
                            r->d_xnorm_batch_bf16_moe, M, ne, n_embd, r->stream) != 0) return -1;
 
     /* 2. Top-K + softmax per token, group assignments by expert.
@@ -12323,9 +12647,46 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             cache_keep[best] = 1;
         }
     }
+    const char *grouped_env = getenv("LLM_MOE_GROUPED_PREFILL");
+    int grouped_qwen = grouped_env && atoi(grouped_env) != 0 &&
+        r->is_qwen4exp && cpu_jobs == 0 && cl->d_moe_cache_map &&
+        ((cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
+          cl->moe_up_exps_type == GGML_TYPE_Q4_K) ||
+         (cl->moe_gate_exps_type == GGML_TYPE_Q5_K &&
+          cl->moe_up_exps_type == GGML_TYPE_Q5_K)) &&
+        (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
+         cl->moe_down_exps_type == GGML_TYPE_Q8_0);
+    int max_count = 0;
+    if (grouped_qwen) {
+        for (int e = 0; e < ne; ++e) {
+            int cnt = offs[e + 1] - offs[e];
+            if (cnt > max_count) max_count = cnt;
+            if (cnt > 0) {
+                int resident = 0;
+                for (int s = 0; s < cl->moe_cache_slots; ++s)
+                    if (cl->moe_cache_ids[s] == e) { resident = 1; break; }
+                if (!resident) { grouped_qwen = 0; break; }
+            }
+        }
+    }
+    if (grouped_qwen)
+        launch_qwen4_experts_grouped(r, cl, ne, eff, n_embd, max_count);
+    if (grouped_qwen && r->moe_copy_pipeline) {
+        for (int e = 0; e < ne; ++e) {
+            if (offs[e + 1] == offs[e]) continue;
+            for (int s = 0; s < cl->moe_cache_slots; ++s) {
+                if (cl->moe_cache_ids[s] == e) {
+                    hipEventRecord(r->moe_compute_done[s], r->stream);
+                    r->moe_pipeline_valid[s] = 1;
+                    break;
+                }
+            }
+        }
+    }
     for (int e = 0; e < ne; e++) {
         int cnt = offs[e + 1] - offs[e];
         if (cnt == 0) continue;
+        if (grouped_qwen) continue;
         size_t off = (size_t)offs[e];
         if (cpu_selected[e]) continue;
         float *xin = (float *)r->d_moe_gather_in + off * n_embd;
@@ -12380,7 +12741,15 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
                                     dh, cl->moe_down_exps_type, cl->moe_exp_rows_d, cl->moe_exp_cols_d,
                                     cl->moe_exp_stride_d, cl->moe_cache_stride_down);
                 }
+                int old_e = cl->moe_cache_ids[slot];
+                if (old_e >= 0 && old_e != e) {
+                    int invalid_slot = -1;
+                    hipMemcpyAsync(cl->d_moe_cache_map + old_e, &invalid_slot,
+                                   sizeof(invalid_slot), hipMemcpyHostToDevice, r->stream);
+                }
                 cl->moe_cache_ids[slot] = e;
+                hipMemcpyAsync(cl->d_moe_cache_map + e, &slot, sizeof(slot),
+                               hipMemcpyHostToDevice, r->stream);
                 r->moe_stats.cache_misses++;
             } else r->moe_stats.cache_hits++;
             gate_w = (unsigned char *)cl->moe_cache_gate + (size_t)slot*cl->moe_cache_stride_gate;
@@ -12479,8 +12848,7 @@ experts_done:
                              r->d_moe_gather_w, total, n_embd);
 
     /* 6. Shared expert (dense over all M): gate logit -> sigmoid -> gate/up/silu/down -> row-scale add. */
-    launch_pack_bf16_from_f32(r, r->d_router_w_bf16, cl->moe_shared_gate_w, n_embd);
-    if (gemm_run_bf16_w(r, r->d_shared_scale_batch, r->d_router_w_bf16,
+    if (gemm_run_bf16_w(r, r->d_shared_scale_batch, cl->moe_shared_gate_w_bf16,
                            r->d_xnorm_batch_bf16_moe, M, 1, n_embd, r->stream) != 0) return -1;
     launch_sigmoid_inplace(r, r->d_shared_scale_batch, M);
     {
@@ -13251,8 +13619,8 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
 
         if (r->is_qwen4exp) {
             if (forward_hc_mix_batched(r, M, cl->hc_attn_norm_w,
-                    cl->hc_attn_down_w, cl->hc_attn_down_type,
-                    cl->hc_attn_up_w, cl->hc_attn_up_type,
+                    cl->hc_attn_down_w, cl->hc_attn_down_w_bf16, cl->hc_attn_down_type,
+                    cl->hc_attn_up_w, cl->hc_attn_up_w_bf16, cl->hc_attn_up_type,
                     cl->hc_attn_inject_w, cl->hc_attn_inject_type,
                     r->d_x_batch) != 0) return -1;
             hipMemcpyAsync(r->d_xnorm_batch, r->d_x_batch, (size_t)M*n_embd*sizeof(float),
@@ -13590,8 +13958,8 @@ ffn_section:
         /* ---- Pre-FFN RMSNorm: one batched launch over M rows ---- */
         if (r->is_qwen4exp) {
             if (forward_hc_mix_batched(r, M, cl->hc_ffn_norm_w,
-                    cl->hc_ffn_down_w, cl->hc_ffn_down_type,
-                    cl->hc_ffn_up_w, cl->hc_ffn_up_type,
+                    cl->hc_ffn_down_w, cl->hc_ffn_down_w_bf16, cl->hc_ffn_down_type,
+                    cl->hc_ffn_up_w, cl->hc_ffn_up_w_bf16, cl->hc_ffn_up_type,
                     cl->hc_ffn_inject_w, cl->hc_ffn_inject_type,
                     r->d_x_batch) != 0) return -1;
             hipMemcpyAsync(r->d_xnorm_batch, r->d_x_batch, (size_t)M*n_embd*sizeof(float),
@@ -13699,8 +14067,8 @@ ffn_section:
     /* ---- Final RMSNorm: one batched launch over M rows ---- */
     if (r->is_qwen4exp) {
         if (forward_hc_mix_batched(r, M, r->hc_head_norm_w,
-                r->hc_head_down_w, r->hc_head_down_type,
-                r->hc_head_up_w, r->hc_head_up_type, NULL, 0,
+                r->hc_head_down_w, r->hc_head_down_w_bf16, r->hc_head_down_type,
+                r->hc_head_up_w, r->hc_head_up_w_bf16, r->hc_head_up_type, NULL, 0,
                 r->d_x_batch) != 0) return -1;
     } else {
         launch_rmsnorm_batch(r, r->d_x_batch, r->d_x_batch,
@@ -14282,6 +14650,7 @@ void hip_llm_free(hip_llm_runner *r) {
             if (cl->moe_cache_gate) hipFree(cl->moe_cache_gate);
             if (cl->moe_cache_up)   hipFree(cl->moe_cache_up);
             if (cl->moe_cache_down) hipFree(cl->moe_cache_down);
+            if (cl->d_moe_cache_map) hipFree(cl->d_moe_cache_map);
             if (cl->moe_gate_host_registered) hipHostUnregister((void*)cl->moe_gate_exps_host);
             if (cl->moe_up_host_registered) hipHostUnregister((void*)cl->moe_up_exps_host);
             if (cl->moe_down_host_registered) hipHostUnregister((void*)cl->moe_down_exps_host);
@@ -14289,10 +14658,14 @@ void hip_llm_free(hip_llm_runner *r) {
             if (cl->hc_attn_norm_w)   hipFree(cl->hc_attn_norm_w);
             if (cl->hc_attn_down_w)   hipFree(cl->hc_attn_down_w);
             if (cl->hc_attn_up_w)     hipFree(cl->hc_attn_up_w);
+            if (cl->hc_attn_down_w_bf16) hipFree(cl->hc_attn_down_w_bf16);
+            if (cl->hc_attn_up_w_bf16)   hipFree(cl->hc_attn_up_w_bf16);
             if (cl->hc_attn_inject_w) hipFree(cl->hc_attn_inject_w);
             if (cl->hc_ffn_norm_w)    hipFree(cl->hc_ffn_norm_w);
             if (cl->hc_ffn_down_w)    hipFree(cl->hc_ffn_down_w);
             if (cl->hc_ffn_up_w)      hipFree(cl->hc_ffn_up_w);
+            if (cl->hc_ffn_down_w_bf16) hipFree(cl->hc_ffn_down_w_bf16);
+            if (cl->hc_ffn_up_w_bf16)   hipFree(cl->hc_ffn_up_w_bf16);
             if (cl->hc_ffn_inject_w)  hipFree(cl->hc_ffn_inject_w);
             if (cl->index_q_w)        hipFree(cl->index_q_w);
             if (cl->index_k_w)        hipFree(cl->index_k_w);
@@ -14321,6 +14694,8 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->hc_head_norm_w) hipFree(r->hc_head_norm_w);
     if (r->hc_head_down_w) hipFree(r->hc_head_down_w);
     if (r->hc_head_up_w)   hipFree(r->hc_head_up_w);
+    if (r->hc_head_down_w_bf16) hipFree(r->hc_head_down_w_bf16);
+    if (r->hc_head_up_w_bf16)   hipFree(r->hc_head_up_w_bf16);
     if (r->d_hc)           hipFree(r->d_hc);
     if (r->d_hc_norm)      hipFree(r->d_hc_norm);
     if (r->d_hc_gate)      hipFree(r->d_hc_gate);
@@ -14413,6 +14788,69 @@ static void fill_quant_matvec_inputs(unsigned char *h_mat, size_t mat_bytes,
         s ^= s << 13; s ^= s >> 17; s ^= s << 5;
         h_x[i] = (((float)((s >> 8) & 0xFFFFFF) / 16777216.0f) - 0.5f) * 0.1f;
     }
+}
+
+int hip_llm_verify_moe_routing(hip_llm_runner *r, int n_experts, int n_used) {
+    if (!r || n_experts <= 256 || n_experts > 512 || n_used <= 0 || n_used > 64)
+        return -1;
+
+    const int M = 3;
+    size_t logits_bytes = (size_t)M * n_experts * sizeof(float);
+    size_t route_bytes = (size_t)M * n_used * sizeof(int);
+    size_t weight_bytes = (size_t)M * n_used * sizeof(float);
+    float *h_logits = (float *)malloc(logits_bytes);
+    int *h_idx = (int *)malloc(route_bytes);
+    float *h_w = (float *)malloc(weight_bytes);
+    int *h_ref_idx = (int *)malloc(route_bytes);
+    float *h_ref_w = (float *)malloc(weight_bytes);
+    if (!h_logits || !h_idx || !h_w || !h_ref_idx || !h_ref_w) {
+        free(h_logits); free(h_idx); free(h_w); free(h_ref_idx); free(h_ref_w);
+        return -2;
+    }
+    for (int m = 0; m < M; m++) {
+        for (int e = 0; e < n_experts; e++)
+            h_logits[(size_t)m * n_experts + e] = (float)e * 0.001f - (float)m * 0.00001f;
+        /* Make the upper half unambiguously part of the selected set. */
+        h_logits[(size_t)m * n_experts + 511] = 10.0f - (float)m;
+        h_logits[(size_t)m * n_experts + 400] = 9.0f - (float)m;
+    }
+    for (int m = 0; m < M; m++)
+        moe_topk_softmax(h_logits + (size_t)m * n_experts, n_experts, n_used,
+                         h_ref_idx + (size_t)m * n_used,
+                         h_ref_w + (size_t)m * n_used);
+
+    float *d_logits = NULL, *d_w = NULL;
+    int *d_idx = NULL;
+    int rc = 0;
+    if (hipMalloc((void **)&d_logits, logits_bytes) != hipSuccess ||
+        hipMalloc((void **)&d_idx, route_bytes) != hipSuccess ||
+        hipMalloc((void **)&d_w, weight_bytes) != hipSuccess) {
+        rc = -2;
+        goto done;
+    }
+    if (hipMemcpyAsync(d_logits, h_logits, logits_bytes, hipMemcpyHostToDevice, r->stream) != hipSuccess) {
+        rc = -2; goto done;
+    }
+    int ne = n_experts, K = n_used;
+    void *args[] = { &d_logits, &ne, &K, &d_idx, &d_w };
+    LAUNCH(r->fn_moe_topk_batch, M, 1, 1, 256, 1, 1, 0, r->stream, args);
+    if (hipMemcpyAsync(h_idx, d_idx, route_bytes, hipMemcpyDeviceToHost, r->stream) != hipSuccess ||
+        hipMemcpyAsync(h_w, d_w, weight_bytes, hipMemcpyDeviceToHost, r->stream) != hipSuccess ||
+        hipStreamSynchronize(r->stream) != hipSuccess) {
+        rc = -2; goto done;
+    }
+    for (int i = 0; i < M * n_used; i++) {
+        if (h_idx[i] != h_ref_idx[i] || fabsf(h_w[i] - h_ref_w[i]) > 2e-5f) {
+            rc = 1; break;
+        }
+    }
+
+done:
+    if (d_logits) hipFree(d_logits);
+    if (d_idx) hipFree(d_idx);
+    if (d_w) hipFree(d_w);
+    free(h_logits); free(h_idx); free(h_w); free(h_ref_idx); free(h_ref_w);
+    return rc;
 }
 
 /* A/B verify: GPU matvec_<type> vs caller-provided CPU dequant + scalar matvec

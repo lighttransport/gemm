@@ -212,6 +212,16 @@ static int run_verify_quant_kernels(void) {
     return n_fail == 0 ? 0 : 2;
 }
 
+static int run_verify_moe_routing(void) {
+    fprintf(stderr, "=== --verify-moe-routing: batched 512-expert top-k ===\n");
+    hip_llm_runner *r = hip_llm_init(0, 0);
+    if (!r) { fprintf(stderr, "hip_llm_init failed\n"); return 1; }
+    int rc = hip_llm_verify_moe_routing(r, 512, 10);
+    hip_llm_free(r);
+    fprintf(stderr, "routing: %s\n", rc == 0 ? "PASS" : "FAIL");
+    return rc == 0 ? 0 : 2;
+}
+
 static int cmp_float_asc(const void *a, const void *b) {
     float fa = *(const float *)a;
     float fb = *(const float *)b;
@@ -286,6 +296,7 @@ int main(int argc, char **argv) {
     int max_layers = 0;
     int verify_hc_batch = 0;
     int verify_quant_kernels = 0; /* --verify-quant-kernels: A/B HIP vs CPU per quant type, then exit */
+    int verify_moe_routing = 0;
     const char *bench_qmv_type = NULL; /* --bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS] */
     int bench_qmv_rows = 0, bench_qmv_cols = 0, bench_qmv_iters = 0, bench_qmv_repeats = 1;
 
@@ -323,6 +334,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--verify-quant-kernels") == 0) {
             verify_quant_kernels = 1;
+        } else if (strcmp(argv[i], "--verify-moe-routing") == 0) {
+            verify_moe_routing = 1;
         } else if (strcmp(argv[i], "--bench-quant-matvec") == 0 && i + 4 < argc) {
             bench_qmv_type = argv[++i];
             bench_qmv_rows = atoi(argv[++i]);
@@ -365,6 +378,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M] [--coding]\n");
             fprintf(stderr, "       [--moe-cache-mb MiB] [--moe-cpu]\n");
             fprintf(stderr, "       [--verify-quant-kernels] [--bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]]\n");
+            fprintf(stderr, "       [--verify-moe-routing]\n");
             return 1;
         }
     }
@@ -372,6 +386,9 @@ int main(int argc, char **argv) {
     /* --verify-quant-kernels has no model dependency; run it and exit. */
     if (verify_quant_kernels) {
         return run_verify_quant_kernels();
+    }
+    if (verify_moe_routing) {
+        return run_verify_moe_routing();
     }
     if (bench_qmv_type) {
         return run_bench_quant_matvec(bench_qmv_type, bench_qmv_rows, bench_qmv_cols,
@@ -382,6 +399,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Usage: %s <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
         fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M]\n");
         fprintf(stderr, "       [--verify-quant-kernels]   (standalone; no model needed)\n");
+        fprintf(stderr, "       [--verify-moe-routing]     (standalone; no model needed)\n");
         fprintf(stderr, "       [--bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]]   (standalone)\n");
         return 1;
     }
