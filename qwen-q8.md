@@ -2830,3 +2830,12 @@ the three heads mapped to each source group redundantly recomputed its norm.
 SSM preparation rose from 1.46 to 2.15 ms/token and total decode regressed from
 31.10 to 32.70 ms/token in the adjacent run. The direct-normalization code was
 removed; the two-phase shared normalization remains production.
+
+A follow-on group-owner version avoided redundant norm sums and reduced the
+short-profile SSM preparation counter from 1.46 to 1.29 ms/token. It still
+failed the 128-token stream comparison. The legacy expand call also executes
+the normalization loop, so its workers may copy groups while their owners are
+performing that second normalization; replacing it with a single owner phase
+changes the historical floating-point state. The owner version was removed as
+well. Removing this barrier now requires an explicitly approved oracle change,
+not a decode-performance-only substitution.
