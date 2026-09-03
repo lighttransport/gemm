@@ -12769,7 +12769,16 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
      * own-GEMM path: dequant the expert weight to bf16 once and run the WMMA
      * GEMM — far faster than scalar mmq, which re-reads x per output row
      * (mmq measured 65% of prefill). mmq remains the blaslt-build fallback. */
-    int use_wmma_exp = r->gemm_own || r->is_qwen4exp;
+    int qwen_direct_experts = r->is_qwen4exp &&
+        ((cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
+          cl->moe_up_exps_type == GGML_TYPE_Q4_K) ||
+         (cl->moe_gate_exps_type == GGML_TYPE_Q5_K &&
+          cl->moe_up_exps_type == GGML_TYPE_Q5_K)) &&
+        (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
+         cl->moe_down_exps_type == GGML_TYPE_Q8_0);
+    /* Direct Qwen kernels consume F32 gathered activations. Do not pay for a
+     * full assignment-matrix BF16 pack that only the generic WMMA fallback uses. */
+    int use_wmma_exp = !qwen_direct_experts && (r->gemm_own || r->is_qwen4exp);
     /* Grouped path (own GEMM): per weight type, ONE all-expert dequant + ONE grouped
      * GEMM (blockIdx.z=expert). ~8 launches/layer vs ~1500 in the per-expert loop. */
     if (use_wmma_exp && r->d_expw_bf16 &&
