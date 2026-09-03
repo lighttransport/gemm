@@ -240,6 +240,8 @@ int main(int argc, char **argv) {
     int decode_n = 0;         /* --decode N: greedy-sample N tokens after prefill */
     int prefill_pad = 0;      /* --prefill-len M: pad prompt up to M tokens with last token (for bench) */
     int compare_paths = 0;    /* --compare-paths: report rel-L2 between batched and per-token logits */
+    int moe_cache_mb = 0;
+    int moe_cpu_only = 0;
     int verify_quant_kernels = 0; /* --verify-quant-kernels: A/B HIP vs CPU per quant type, then exit */
     const char *bench_qmv_type = NULL; /* --bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS] */
     int bench_qmv_rows = 0, bench_qmv_cols = 0, bench_qmv_iters = 0, bench_qmv_repeats = 1;
@@ -303,11 +305,16 @@ int main(int argc, char **argv) {
             prefill_pad = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--compare-paths") == 0) {
             compare_paths = 1;
+        } else if (strcmp(argv[i], "--moe-cache-mb") == 0 && i + 1 < argc) {
+            moe_cache_mb = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--moe-cpu") == 0) {
+            moe_cpu_only = 1;
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         } else {
             fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
             fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M]\n");
+            fprintf(stderr, "       [--moe-cache-mb MiB] [--moe-cpu]\n");
             fprintf(stderr, "       [--verify-quant-kernels] [--bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]]\n");
             return 1;
         }
@@ -423,6 +430,8 @@ int main(int argc, char **argv) {
     hip_llm_load_options load_options;
     hip_llm_load_options_default(&load_options);
     load_options.max_seq_len = max_seq_len;
+    if (moe_cache_mb > 0) load_options.moe_cache_bytes = (uint64_t)moe_cache_mb << 20;
+    if (moe_cpu_only) load_options.moe_mode = HIP_LLM_MOE_CPU;
     if (hip_llm_load_weights_sharded(gpu, gguf_model, &load_options) != 0) {
         fprintf(stderr, "Failed to load weights to GPU\n");
         hip_llm_free(gpu);
