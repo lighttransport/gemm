@@ -14333,9 +14333,7 @@ ffn_section:
                     cl->hc_ffn_down_w, cl->hc_ffn_down_w_bf16, cl->hc_ffn_down_type,
                     cl->hc_ffn_up_w, cl->hc_ffn_up_w_bf16, cl->hc_ffn_up_type,
                     cl->hc_ffn_inject_w, cl->hc_ffn_inject_type,
-                    r->d_x_batch) != 0) return -1;
-            hipMemcpyAsync(r->d_xnorm_batch, r->d_x_batch, (size_t)M*n_embd*sizeof(float),
-                           hipMemcpyDeviceToDevice, r->stream);
+                    r->d_xnorm_batch) != 0) return -1;
         } else {
             launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
                                  cl->ffn_norm_w, n_embd, M, n_embd, eps);
