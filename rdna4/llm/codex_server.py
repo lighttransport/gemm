@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 
 def content_text(content):
@@ -112,24 +113,34 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
     def do_GET(self):
-        if self.path == "/v1/models":
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        if path in ("/v1/models", "/models"):
             now = int(time.time())
             self.send_json(200, {"object": "list", "data": [{"id": self.model, "object": "model", "created": now, "owned_by": "local"}]})
         else:
+            self.log_message("404 GET %s", self.path)
             self.send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def do_POST(self):
-        if self.path not in ("/v1/chat/completions", "/v1/completions", "/v1/responses"):
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        if path.startswith("/v1/"):
+            api_path = path
+        elif path in ("/chat/completions", "/completions", "/responses"):
+            api_path = "/v1" + path
+        else:
+            api_path = path
+        if api_path not in ("/v1/chat/completions", "/v1/completions", "/v1/responses"):
+            self.log_message("404 POST %s", self.path)
             self.send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
             return
         try:
             n = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(n))
-            if self.path == "/v1/completions":
+            if api_path == "/v1/completions":
                 prompt = req.get("prompt", "")
                 if isinstance(prompt, list): prompt = "".join(map(str, prompt))
                 messages = [{"role": "user", "content": prompt}]
-            elif self.path == "/v1/responses":
+            elif api_path == "/v1/responses":
                 messages = []
                 if req.get("instructions"): messages.append({"role": "system", "content": req["instructions"]})
                 inp = req.get("input", "")
@@ -154,7 +165,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
-                if self.path == "/v1/responses":
+                if api_path == "/v1/responses":
                     response_id = "resp-" + uuid.uuid4().hex
                     created_obj = {"type": "response.created", "response": {"id": response_id, "object": "response", "status": "in_progress", "model": self.model}}
                     delta_obj = {"type": "response.output_text.delta", "item_id": response_id + "-item", "output_index": 0, "content_index": 0, "delta": text}
@@ -169,7 +180,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(("data: " + json.dumps(obj) + "\n\ndata: [DONE]\n\n").encode())
                 self.wfile.flush()
                 return
-            if self.path == "/v1/responses":
+            if api_path == "/v1/responses":
                 self.send_json(200, {"id": "resp-" + uuid.uuid4().hex, "object": "response", "model": self.model, "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "status": "completed", "usage": usage})
             elif self.path == "/v1/completions":
                 self.send_json(200, {"id": ident, "object": "text_completion", "created": created, "model": self.model, "choices": [{"index": 0, "text": text, "finish_reason": finish}], "usage": usage})
