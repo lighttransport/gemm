@@ -12405,6 +12405,13 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
     }
 
+    if (r->is_qwen4exp) {
+        int ns = r->hc_count, n = n_embd * ns;
+        void *a[] = { &r->d_hc, &r->d_x, &n_embd, &ns };
+        LAUNCH(r->fn_hc_repeat_f32, (n + 255) / 256, 1, 1,
+               256, 1, 1, 0, r->stream, a);
+    }
+
     /* Gemma4: scale token embeddings by sqrt(n_embd) */
     if (r->is_gemma4) {
         int n = n_embd;

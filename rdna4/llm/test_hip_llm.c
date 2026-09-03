@@ -492,19 +492,26 @@ int main(int argc, char **argv) {
             float *log_b = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
             if (!log_b) { fprintf(stderr, "compare: batched path failed\n"); free(buf_p); pass = 0; goto bench_done; }
 
-            float diff_sq = 0.0f, ref_sq = 0.0f, max_abs = 0.0f;
+            double diff_sq = 0.0, ref_sq = 0.0, batch_sq = 0.0;
+            float max_abs = 0.0f;
+            int finite_p = 0, finite_b = 0;
             for (int i = 0; i < n_vocab; i++) {
                 float d = log_b[i] - buf_p[i];
                 diff_sq += d * d;
                 ref_sq += buf_p[i] * buf_p[i];
+                batch_sq += log_b[i] * log_b[i];
+                finite_p += isfinite(buf_p[i]) != 0;
+                finite_b += isfinite(log_b[i]) != 0;
                 if (fabsf(d) > max_abs) max_abs = fabsf(d);
             }
-            float rl2 = (ref_sq > 1e-12f) ? sqrtf(diff_sq / ref_sq) : sqrtf(diff_sq);
+            double rl2 = (ref_sq > 1e-12) ? sqrt(diff_sq / ref_sq) : sqrt(diff_sq);
             int top_p = argmax_logits(buf_p, n_vocab);
             int top_b = argmax_logits(log_b, n_vocab);
             fprintf(stderr,
-                "[--compare-paths] rel_l2=%.4e  max_abs=%.4e  argmax: per-token=%d batched=%d %s\n",
-                rl2, max_abs, top_p, top_b, (top_p == top_b) ? "(match)" : "(DIFFER)");
+                "[--compare-paths] rel_l2=%.4e max_abs=%.4e l2=(%.4e,%.4e) "
+                "finite=(%d,%d) argmax: per-token=%d batched=%d %s\n",
+                rl2, max_abs, sqrt(ref_sq), sqrt(batch_sq), finite_p, finite_b,
+                top_p, top_b, (top_p == top_b) ? "(match)" : "(DIFFER)");
             free(buf_p);
         }
 
