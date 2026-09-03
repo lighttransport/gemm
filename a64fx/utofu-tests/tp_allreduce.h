@@ -428,19 +428,12 @@ static void tp_ar_sum_a2a_add(tp_comm *c, float *buf, float *residual,
     *(volatile uint64_t *)(sb + tr) = tok;                  /* fits: a2a_max <= max_count */
     int gen = (int)(tok & 1);
     int inflight = 0; void *cb; int rc;
-    int contiguous = count == c->a2a_max;
     for (int d = 1; d < N; d++) {
         int peer = (me + d) % N;
         utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
         utofu_stadd_t dst = c->peer_base[peer] + c->a2a_base + ((size_t)gen * N + me) * c->a2a_slot;
-        /* An exactly full slot has its fixed trailer immediately after the
-         * payload, so publish both with one ordered Put. This halves injection
-         * and TCQ work for the dominant decode residual size without moving
-         * the trailer or weakening the variable-count safety rule. */
-        inflight += tp_ar_put_nb(c, peer, src, dst,
-                                 contiguous ? pbytes + 8 : pbytes);
-        if (!contiguous)
-            inflight += tp_ar_put_nb(c, peer, src + tr, dst + tr, 8);
+        inflight += tp_ar_put_nb(c, peer, src, dst, pbytes);           /* payload */
+        inflight += tp_ar_put_nb(c, peer, src + tr, dst + tr, 8);      /* then trailer (in-order per pair) */
     }
     while (inflight > 0) {                                   /* reap local completions */
         rc = utofu_poll_tcq(c->vcq, 0, &cb);

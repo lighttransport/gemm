@@ -2842,7 +2842,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | paired verifier SSM alpha/beta team | near | 128 twice yes | 46.39 / 46.36 vs 44.59 control | 79.09 / 79.12 vs 82.73 | 23.03 / 23.07 vs 23.51 | 781--835 / 782--835 vs 775--826 | promote; exact, repeatable +4.0%, clean gate narrowly missed |
 | 2026-09-03 | paired verifier SSM QKV/gate team | near | 128 yes | 45.55 vs 46.09 control | 81.23 vs 79.60 | 22.79 vs 23.20 | 771--844 vs 785--833 | reject and remove; large HBM phases regress inside retained team |
 | 2026-09-03 | 24-thread SSM alpha/beta pair | no | 128 yes | 4.37 | 1027.23 | 57.72 | 68--89 | reject and remove; alternating 24/48-thread regions defeats Fujitsu hot-team reuse |
-| 2026-09-03 | exact-slot contiguous uTofu Put, non-MTP | no | 128 yes | 31.04 vs 26.99 | n/a | n/a | 535--555 vs 531--548 peers | promote 5120-float slot; comm 5.45--6.43 vs 10.09--10.92 ms/token |
+| 2026-09-03 | exact-slot contiguous uTofu Put, non-MTP | no | 128 repeated only | 31.04 vs 26.99 | n/a | n/a | 535--555 vs 531--548 peers | reject and revert; trailer visibility does not guarantee payload completion |
 | 2026-09-03 | exact-slot contiguous uTofu Put, MTP | near | 128 yes | 44.01 vs 46.36 | 79.84 vs 79.12 | 27.81 vs 23.07 | 785--825 vs 782--835 | reject 25600 slot; retain 32768 for MTP |
 | 2026-09-03 | late TCQ polling after peer arrival | no | 128 twice yes | 30.65 / 30.93 vs 31.04 reference | n/a | n/a | 527--554 / 536--544 | reject and remove; collective time neutral |
 
@@ -2971,15 +2971,15 @@ collapsed to 4.37 tok/s and accumulated verifier projection time increased to
 48-worker team as the surrounding projections even though half its workers
 have no row assigned.
 
-The small-buffer uTofu all-to-all now combines payload and its fixed trailer in
-one Put whenever `count == TP_AR_A2A_MAX`. This is safe because the trailer is
-already immediately adjacent to a full slot; variable-sized messages retain
-the original separate trailer Put and stale-payload protection. With the
-single-token slot changed from 8,192 to exactly 5,120 floats, the same 128-token
-stream improved from **26.99 to 31.04 tok/s**. Peer collective time fell from
-10.09--10.92 to 5.45--6.43 ms/token, while peer compute bandwidth remained
-comparable. The rank-0 service interference still prevents this from being a
-clean acceptance run, but the adjacent exact result is a 15.0% wall-time win.
+An exact-slot all-to-all experiment combined payload and its fixed trailer in
+one Put when `count == TP_AR_A2A_MAX`. The repeated short streams happened to
+match and performance improved from 26.99 to 31.04 tok/s, but this cannot be
+retained as an exact protocol: observing the last eight bytes of a multi-packet
+Put does not prove that all preceding payload cache lines are visible. The
+earlier `TP_AR_BATCH=1` experiment had already demonstrated divergence with
+the same publication assumption. The combined Put and 5,120-float launcher
+default were therefore reverted; production again uses distinct payload and
+trailer Puts with the 8,192-float slot.
 
 The corresponding MTP slot experiment was not promoted. A 25,600-float slot
 made the K=5 batched residual contiguous, but verifier collective time remained
