@@ -13238,10 +13238,23 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                               &r->d_xb, &qkv_rows, &z_rows, &dt_rank, &n_cols };
                 LAUNCH(r->fn_ssm_matvec4_iq3xxs, qkv_rows + z_rows + 2 * dt_rank, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
-            launch_matvec_auto(r, r->d_ssm_qkv,   cl->ssm_qkv_w,   r->d_xb, cl->ssm_qkv_rows,   cl->ssm_qkv_cols,   cl->ssm_qkv_type);
-            launch_matvec_auto(r, r->d_ssm_z,      cl->ssm_gate_w,  r->d_xb, cl->ssm_gate_rows,  cl->ssm_gate_cols,  cl->ssm_gate_type);
-            launch_matvec_auto(r, r->d_ssm_alpha,  cl->ssm_alpha_w, r->d_xb, cl->ssm_alpha_rows, cl->ssm_alpha_cols, cl->ssm_alpha_type);
-            launch_matvec_auto(r, r->d_ssm_beta,   cl->ssm_beta_w,  r->d_xb, cl->ssm_beta_rows,  cl->ssm_beta_cols,  cl->ssm_beta_type);
+            if (cl->ssm_qkv_type == GGML_TYPE_Q8_0 &&
+                cl->ssm_gate_type == GGML_TYPE_Q8_0 &&
+                cl->ssm_qkv_cols == cl->ssm_gate_cols) {
+                launch_matvec_qkv_q8(r, r->d_ssm_qkv, r->d_ssm_z, NULL,
+                                     cl->ssm_qkv_w, cl->ssm_gate_w, NULL,
+                                     r->d_xb, cl->ssm_qkv_rows, cl->ssm_gate_rows,
+                                     0, cl->ssm_qkv_cols);
+            } else {
+                launch_matvec_auto(r, r->d_ssm_qkv, cl->ssm_qkv_w, r->d_xb,
+                                   cl->ssm_qkv_rows, cl->ssm_qkv_cols, cl->ssm_qkv_type);
+                launch_matvec_auto(r, r->d_ssm_z, cl->ssm_gate_w, r->d_xb,
+                                   cl->ssm_gate_rows, cl->ssm_gate_cols, cl->ssm_gate_type);
+            }
+            launch_matvec_auto(r, r->d_ssm_alpha, cl->ssm_alpha_w, r->d_xb,
+                               cl->ssm_alpha_rows, cl->ssm_alpha_cols, cl->ssm_alpha_type);
+            launch_matvec_auto(r, r->d_ssm_beta, cl->ssm_beta_w, r->d_xb,
+                               cl->ssm_beta_rows, cl->ssm_beta_cols, cl->ssm_beta_type);
             }
 
             if (r->ssm_fused_decode &&
