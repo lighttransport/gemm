@@ -22,7 +22,7 @@ HIPBLASLT ?= 1
 # Target
 TARGET = test_hip_llm
 
-.PHONY: all clean run help
+.PHONY: all clean run cpu-expert-bench help
 
 all: $(TARGET)
 
@@ -43,8 +43,13 @@ $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h ../rocew.h $(
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]"
 
+cpu-expert-bench: bench_cpu_qwen_expert
+
+bench_cpu_qwen_expert: bench_cpu_qwen_expert.c
+	$(CC) -O3 -Wall -Wextra -march=native -fopenmp -o $@ $< -ldl -lm
+
 clean:
-	rm -f $(TARGET) mm_blaslt_bridge.o
+	rm -f $(TARGET) bench_cpu_qwen_expert mm_blaslt_bridge.o
 
 help:
 	@echo "HIP LLM Runner (HIPRTC-based, no hipcc needed)"
