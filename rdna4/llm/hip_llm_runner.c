@@ -715,6 +715,22 @@ static const char *hip_kernel_source =
 "        for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[local]=sum;\n"
 "}\n"
+"/* Fused dense Q8_0 gate/up projection and SiLU product. */\n"
+"__global__ void ffn_gate_up_silu_q8_0_mw(float *dst,const unsigned char *gate,\n"
+"        const unsigned char *up,const float *x,int rows,int cols){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp;\n"
+"    if(row>=rows)return;int nb=cols/32,rb=nb*36;\n"
+"    const unsigned char *gr=gate+(size_t)row*rb,*ur=up+(size_t)row*rb;\n"
+"    float g=0.0f,u=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *gb=gr+b*36,*ub=ur+b*36;\n"
+"        const signed char *gq=(const signed char *)(gb+4),*uq=(const signed char *)(ub+4);\n"
+"        const float *xb=x+b*32;float ag=0.0f,au=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++){ag+=(float)gq[j]*xb[j];au+=(float)uq[j]*xb[j];}\n"
+"        g+=ag*half_to_float(*(const half_raw *)gb);u+=au*half_to_float(*(const half_raw *)ub);}\n"
+"    for(int o=16;o>0;o>>=1){g+=__shfl_down(g,o);u+=__shfl_down(u,o);}\n"
+"    if(lane==0)dst[row]=(g/(1.0f+expf(-g)))*u;\n"
+"}\n"
 "/* Qwen4 HC up projection + four-stream sigmoid mix.  Eight lanes own one\n"
 " * HC row; 32 row-groups/block keeps all 256 lanes useful for 256 columns. */\n"
 "__global__ void qwen4_hc_up_mix_q8(float *mixed,float *gate,const float *xn,\n"
@@ -7776,6 +7792,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q8_0_f32;
     hipFunction_t fn_matvec_q8_0_mw_f32;
     hipFunction_t fn_matvec_qkv_q8_0_mw;
+    hipFunction_t fn_ffn_gate_up_silu_q8_0_mw;
     hipFunction_t fn_qwen4_hc_up_mix_q8;
     hipFunction_t fn_qwen4_hc_down_silu_q8;
     hipFunction_t fn_qwen4_gateup_silu_q8;
@@ -8318,6 +8335,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q8_0_f32);
     GET_FUNC(matvec_q8_0_mw_f32);
     GET_FUNC(matvec_qkv_q8_0_mw);
+    GET_FUNC(ffn_gate_up_silu_q8_0_mw);
     GET_FUNC(qwen4_hc_up_mix_q8);
     GET_FUNC(qwen4_hc_down_silu_q8);
     GET_FUNC(qwen4_gateup_silu_q8);
@@ -10688,6 +10706,14 @@ static inline void launch_matvec_qkv_q8(hip_llm_runner *r,
     void *args[] = { &q, &k, &v, &qw, &kw, &vw, &x,
                      &qr, &kr, &vr, &n_cols };
     LAUNCH(r->fn_matvec_qkv_q8_0_mw, (qr + kr + vr + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_ffn_gate_up_silu_q8(hip_llm_runner *r,
+                                               void *dst, void *gate, void *up,
+                                               void *x, int rows, int cols) {
+    void *args[] = { &dst, &gate, &up, &x, &rows, &cols };
+    LAUNCH(r->fn_ffn_gate_up_silu_q8_0_mw, (rows + 7) / 8, 1, 1,
            256, 1, 1, 0, r->stream, args);
 }
 
@@ -13432,7 +13458,14 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             goto ffn_done;
         } else {
             /* Dense FFN */
-            if (r->ssm_fused_decode &&
+            if (cl->ffn_gate_type == GGML_TYPE_Q8_0 &&
+                cl->ffn_up_type == GGML_TYPE_Q8_0 &&
+                cl->ffn_gate_rows == cl->ffn_up_rows &&
+                cl->ffn_gate_cols == cl->ffn_up_cols) {
+                launch_ffn_gate_up_silu_q8(r, r->d_gate, cl->ffn_gate_w,
+                                           cl->ffn_up_w, r->d_xb,
+                                           cl->ffn_gate_rows, cl->ffn_gate_cols);
+            } else if (r->ssm_fused_decode &&
                 cl->ffn_gate_type == GGML_TYPE_Q6_K && cl->ffn_up_type == GGML_TYPE_Q6_K) {
                 int n_ff = cl->ffn_gate_rows;
                 int nc = cl->ffn_gate_cols;
