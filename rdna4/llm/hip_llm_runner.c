@@ -12096,7 +12096,7 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
     int use_gpu_topk = !gpu_topk_env || atoi(gpu_topk_env) != 0;
     int device_cache_path = 0;
     const char *device_cache_env = getenv("LLM_QWEN4_DEVICE_CACHE");
-    int use_device_cache = device_cache_env && atoi(device_cache_env) != 0 &&
+    int use_device_cache = (!device_cache_env || atoi(device_cache_env) != 0) &&
         cl->d_moe_cache_map &&
         ((cl->moe_gate_exps_type == GGML_TYPE_Q5_K &&
           cl->moe_up_exps_type == GGML_TYPE_Q5_K) ||
