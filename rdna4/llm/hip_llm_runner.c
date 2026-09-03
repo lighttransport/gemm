@@ -10832,7 +10832,7 @@ static inline void launch_qwen4_experts_q4k_selected(hip_llm_runner *r,
     hipFunction_t gate_fn = r->fn_qwen4_gateup_silu_q4k_selected;
     int gate_blocks = (expert_ff + 7) / 8;
     const char *q4_2w = getenv("LLM_Q4_2W");
-    if (q4_2w && atoi(q4_2w) != 0) {
+    if (!q4_2w || atoi(q4_2w) != 0) {
         gate_fn = r->fn_qwen4_gateup_silu_q4k_selected_2w;
         gate_blocks = (expert_ff + 3) / 4;
     }
