@@ -60,6 +60,7 @@ if [ "$MODE" = mtp-sustained ]; then
     # activation region per draft step while preserving the exact BF16 rows.
     export TF_NEXTN_FFN_PERSIST=${TF_NEXTN_FFN_PERSIST:-1}
     export TF_NEXTN_BLOCK_PERSIST=${TF_NEXTN_BLOCK_PERSIST:-1}
+    export TF_NEXTN_FULL_PERSIST=${TF_NEXTN_FULL_PERSIST:-1}
 fi
 export NUMA_DISTRIBUTE=${NUMA_DISTRIBUTE:-1} NUMA_N_CMGS=${NUMA_N_CMGS:-4}
 export TP_COMM_CMG_STRICT=${TP_COMM_CMG_STRICT:-1}

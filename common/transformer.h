@@ -9739,8 +9739,9 @@ const float *transformer_nextn_target_hidden(const transformer_model *model) {
 typedef struct {
     transformer_model *m;
     transformer_layer *layer;
+    const qtensor *head, *head_norm;
     int tid, nt, nff, ne;
-    int include_output, nextn_sharded;
+    int head_rows, include_output, include_head, nextn_sharded;
     int barrier_sense;
 } tf_nextn_ffn_task;
 
@@ -9802,6 +9803,20 @@ static void *tf_nextn_ffn_worker(void *arg) {
     r0 = t->ne * t->tid / t->nt;
     r1 = t->ne * (t->tid + 1) / t->nt;
     tf_matvec_qtensor_rows(m->xb, &L->ffn_down, m->ffn_buf3, r0, r1);
+    if (t->include_head) {
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+        if (t->tid == 0) {
+            if (t->nextn_sharded && m->tp_ffn_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, t->ne, m->tp_allreduce_ctx);
+            tf_vadd(m->x, m->xb, t->ne);
+            memcpy(m->nextn.hidden, m->x, (size_t)t->ne * sizeof(float));
+            tf_rmsnorm(m->xb, m->x, t->head_norm, t->ne,
+                       m->rms_norm_eps, m->matvec_tmp);
+        }
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+        tf_thread_matvec(m->logits, t->head, m->xb, t->head_rows,
+                         t->tid, t->nt);
+    }
     return NULL;
 }
 
@@ -9814,13 +9829,18 @@ static int tf_nextn_ffn_persistent_pool(transformer_model *m,
                                         transformer_layer *L,
                                         int nff, int ne,
                                         int include_output,
-                                        int nextn_sharded) {
-    static int ffn_enabled = -1, block_enabled = -1;
+                                        int nextn_sharded,
+                                        const qtensor *head,
+                                        const qtensor *head_norm,
+                                        int head_rows) {
+    static int ffn_enabled = -1, block_enabled = -1, full_enabled = -1;
     if (ffn_enabled < 0) {
         const char *e = getenv("TF_NEXTN_FFN_PERSIST");
         ffn_enabled = e && atoi(e) != 0;
         e = getenv("TF_NEXTN_BLOCK_PERSIST");
         block_enabled = e && atoi(e) != 0;
+        e = getenv("TF_NEXTN_FULL_PERSIST");
+        full_enabled = e && atoi(e) != 0;
     }
     int enabled = include_output ? block_enabled : ffn_enabled;
     if (!enabled || !m->pool_alive || m->n_threads <= 1 ||
@@ -9836,10 +9856,12 @@ static int tf_nextn_ffn_persistent_pool(transformer_model *m,
     tf_nextn_ffn_task *tasks = (tf_nextn_ffn_task *)alloca(
         (size_t)nt * sizeof(*tasks));
     for (int tid = 0; tid < nt; tid++)
-        tasks[tid] = (tf_nextn_ffn_task){m, L, tid, nt, nff, ne,
-                                         include_output, nextn_sharded, 0};
+        tasks[tid] = (tf_nextn_ffn_task){m, L, head, head_norm, tid, nt,
+                                         nff, ne, head_rows, include_output,
+                                         include_output && full_enabled,
+                                         nextn_sharded, 0};
     tf_pool_dispatch(m, tf_nextn_ffn_worker, tasks, sizeof(*tasks));
-    return 1;
+    return include_output && full_enabled ? 2 : 1;
 }
 
 float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
@@ -9915,8 +9937,11 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     if (profile) pt_attn = tf_time_ms();
     int nextn_sharded = !getenv("TP_STAGE_DIR") ||
         (getenv("TP_NEXTN_SHARD") && atoi(getenv("TP_NEXTN_SHARD")));
+    const qtensor *head_norm = nn->shared_head_norm.data
+        ? &nn->shared_head_norm : &m->output_norm;
+    int head_rows = head->n_rows > 0 ? head->n_rows : m->n_vocab;
     int block_persistent = tf_nextn_ffn_persistent_pool(
-        m, L, nff, ne, 1, nextn_sharded);
+        m, L, nff, ne, 1, nextn_sharded, head, head_norm, head_rows);
     if (!block_persistent) {
         tf_qmatvec_pool(m, m->xb, &L->attn_output, m->xb2, ne);
         if (nextn_sharded && m->tp_attn_sharded && m->tp_allreduce_fn)
@@ -9926,27 +9951,29 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
         tf_rmsnorm(m->xb, m->x, &L->ffn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
     }
     if (!block_persistent &&
-        !tf_nextn_ffn_persistent_pool(m, L, nff, ne, 0, nextn_sharded)) {
+        !tf_nextn_ffn_persistent_pool(m, L, nff, ne, 0, nextn_sharded,
+                                      NULL, NULL, 0)) {
         tf_qmatvec_fused2_pool(m, m->ffn_buf1, &L->ffn_gate,
                                m->ffn_buf2, &L->ffn_up, m->xb, nff);
         tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, nff);
         tf_qmatvec_pool(m, m->xb, &L->ffn_down, m->ffn_buf3, ne);
     }
-    if (nextn_sharded && m->tp_ffn_sharded && m->tp_allreduce_fn)
-        m->tp_allreduce_fn(m->xb, ne, m->tp_allreduce_ctx);
-    if (profile) pt_ffn = tf_time_ms();
-    tf_vadd(m->x, m->xb, ne);
-    memcpy(nn->hidden, m->x, (size_t)ne * sizeof(float));
+    if (block_persistent != 2) {
+        if (nextn_sharded && m->tp_ffn_sharded && m->tp_allreduce_fn)
+            m->tp_allreduce_fn(m->xb, ne, m->tp_allreduce_ctx);
+        if (profile) pt_ffn = tf_time_ms();
+        tf_vadd(m->x, m->xb, ne);
+        memcpy(nn->hidden, m->x, (size_t)ne * sizeof(float));
+    }
     /* Qwen3.5 NextN shares the trunk output norm/head when the optional
      * nextn-specific tensors are absent.  Skipping the fallback RMSNorm makes
      * the vocabulary head collapse to tiny token IDs and yields alpha=0. */
-    const qtensor *head_norm = nn->shared_head_norm.data
-        ? &nn->shared_head_norm : &m->output_norm;
-    tf_rmsnorm(m->xb, m->x, head_norm, ne, m->rms_norm_eps, m->matvec_tmp);
-    /* In TP mode the shared head aliases the rank-local vocabulary shard.
-     * Produce only local rows; the caller performs the global argmax reduce. */
-    tf_qmatvec_pool(m, m->logits, head, m->xb,
-                    head->n_rows > 0 ? head->n_rows : m->n_vocab);
+    if (block_persistent != 2) {
+        tf_rmsnorm(m->xb, m->x, head_norm, ne, m->rms_norm_eps, m->matvec_tmp);
+        /* In TP mode the shared head aliases the rank-local vocabulary shard.
+         * Produce only local rows; the caller performs the global argmax reduce. */
+        tf_qmatvec_pool(m, m->logits, head, m->xb, head_rows);
+    }
     if (profile && m->tp_rank == 0) {
         double end = tf_time_ms();
         fprintf(stderr, "nextn profile: eh=%.3f qkv=%.3f attn=%.3f out=%.3f ffn=%.3f head=%.3f total=%.3f ms\n",

@@ -2812,6 +2812,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
   TP_MTP_SHADOW_THREADS=48 \
   TF_NEXTN_FFN_PERSIST=1 \
   TF_NEXTN_BLOCK_PERSIST=1 \
+  TF_NEXTN_FULL_PERSIST=1 \
   TP_AR_DETERMINISTIC=1 TP_AR_A2A_TREE=1 TP_AR_FUSED_ADD=1 \
   TF_BF16PV_MTP5_FUSED=1 \
   bash run_qwen38_bf16_tp4.sh mtp-sustained
@@ -2829,6 +2830,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | replicated NextN + shadow48 | no | 128 yes | 29.77 vs 26.73 | 90.37 | 68.86 | 528--658 | +11.4%; promote launcher default, clean gate pending |
 | 2026-09-03 | persistent NextN FFN | no | 128/256 yes | 36.65 short; 27.63 sustained | 83.37 / 98.85 | 45.96 / 69.62 | 647--701 / 471--677 | promote; 256 draft -9.5% at lower rank-0 BW |
 | 2026-09-03 | persistent NextN output+FFN block | no | 128/256 yes | 40.90 short; 30.14 sustained | 81.96 / degraded allocation | 33.89 / degraded allocation | 697--752 / 522--730 | promote; short draft -26.3% vs FFN-only, long run rank-0 limited |
+| 2026-09-03 | persistent NextN full block through vocab head | no | 128/256 yes | 42.55 short; 35.76 sustained | 83.46 / 84.66 | 27.90 / 45.45 | 744--803 / 611--764 | promote; removes final pool wake, clean gate pending |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2846,6 +2848,16 @@ held 687--730 GB/s.  The ranks nevertheless finished within 0.11%, identifying
 the loss as rank-0 compute bandwidth/interference rather than synchronization
 skew.  Clean-node acceptance still requires three exact 256-token runs and the
 60 tok/s median/minimum gate above.
+
+The next extension retains those same workers through FFN completion, the
+final residual and RMSNorm, and the rank-local 62,080-row vocabulary head.
+`TF_NEXTN_FULL_PERSIST=1` therefore removes the last pool wake in each NextN
+call without changing the BF16 projection kernel or the global argmax. Its
+128-token run was canonical at **42.55 tok/s**, 83.46 ms verification, and
+27.90 ms drafting. The 256-token run was also canonical at **35.76 tok/s**,
+84.66 ms verification, and 45.45 ms drafting, despite rank 0 reaching only
+611 GB/s while its peers reached 723--764 GB/s. This is promoted as the
+default MTP path, but neither measurement qualifies as a clean-node result.
 
 An additional SSM scheduling probe normalized Q/K directly into each expanded
 head, replacing the normalize/expand pair with one worker phase and removing
