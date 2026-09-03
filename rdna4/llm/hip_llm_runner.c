@@ -798,6 +798,19 @@ static const char *hip_kernel_source =
 "        for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)total+=sum*weights[sel];}\n"
 "    if(lane==0)acc[row]=total;\n"
 "}\n"
+"__global__ void qwen4_down_accum_q8_0_selected(float *acc,const unsigned char *down,\n"
+"        const float *act,const float *weights,const int *slots,int K,int rows,int cols,long long ds){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp;if(row>=rows)return;\n"
+"    int nb=cols/32,rb=nb*36;float total=0.0f;\n"
+"    for(int sel=0;sel<K;sel++){const unsigned char *rp=down+(long long)slots[sel]*ds+(size_t)row*rb;\n"
+"        const float *x=act+(size_t)sel*cols;float sum=0.0f;for(int b=lane;b<nb;b+=32){\n"
+"            const unsigned char *bp=rp+b*36;float d=half_to_float(*(const half_raw *)bp);\n"
+"            const signed char *q=(const signed char *)(bp+4);float s=0.0f;\n"
+"            #pragma unroll\n"
+"            for(int j=0;j<32;j++)s+=d*(float)q[j]*x[b*32+j];sum+=s;}\n"
+"        for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)total+=sum*weights[sel];}\n"
+"    if(lane==0)acc[row]=total;\n"
+"}\n"
 "__global__ void qwen4_gateup_silu_q4k_batch(float *dst,const unsigned char *gate,\n"
 "        const unsigned char *up,const float *x,int M,int rows,int cols){\n"
 "    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp,m=blockIdx.y;\n"
@@ -7529,6 +7542,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_down_accum_q8_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_selected;
     hipFunction_t fn_qwen4_down_accum_q5_1_selected;
+    hipFunction_t fn_qwen4_down_accum_q8_0_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_batch;
     hipFunction_t fn_qwen4_down_q5_1_batch;
     hipFunction_t fn_qwen4_down_q8_0_batch;
@@ -8054,6 +8068,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_down_accum_q8_selected);
     GET_FUNC(qwen4_gateup_silu_q4k_selected);
     GET_FUNC(qwen4_down_accum_q5_1_selected);
+    GET_FUNC(qwen4_down_accum_q8_0_selected);
     GET_FUNC(qwen4_gateup_silu_q4k_batch);
     GET_FUNC(qwen4_down_q5_1_batch);
     GET_FUNC(qwen4_down_q8_0_batch);
@@ -10396,7 +10411,7 @@ static inline void launch_qwen4_experts_q8_selected(hip_llm_runner *r,
            256, 1, 1, 0, r->stream, da);
 }
 
-static inline void launch_qwen4_experts_q4k_q51_selected(hip_llm_runner *r,
+static inline void launch_qwen4_experts_q4k_selected(hip_llm_runner *r,
         hip_layer *cl, const int *slots, const float *weights, int K,
         int expert_ff, int n_embd) {
     hipMemcpyAsync(r->d_moe_idx, slots, (size_t)K*sizeof(int),
@@ -10412,9 +10427,10 @@ static inline void launch_qwen4_experts_q4k_q51_selected(hip_llm_runner *r,
     long long ds=(long long)cl->moe_cache_stride_down;
     void *da[]={&r->d_moe_accum,&cl->moe_cache_down,&r->d_moe_act8,
                 &r->d_moe_w,&r->d_moe_idx,&K,&n_embd,&expert_ff,&ds};
-    /* expert_ff=640 has 20 Q5_1 blocks per row. One wave covers one row;
-     * pack several rows per workgroup to reduce scheduling overhead. */
-    LAUNCH(r->fn_qwen4_down_accum_q5_1_selected, (n_embd+7)/8, 1, 1,
+    hipFunction_t down_fn = cl->moe_down_exps_type == GGML_TYPE_Q8_0 ?
+                            r->fn_qwen4_down_accum_q8_0_selected :
+                            r->fn_qwen4_down_accum_q5_1_selected;
+    LAUNCH(down_fn, (n_embd+7)/8, 1, 1,
            256, 1, 1, 0, r->stream, da);
 }
 
@@ -11586,7 +11602,8 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                        cl->moe_down_exps_type == GGML_TYPE_Q8_0;
         int fused_xl = use_fused && cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
                        cl->moe_up_exps_type == GGML_TYPE_Q4_K &&
-                       cl->moe_down_exps_type == GGML_TYPE_Q5_1;
+                       (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
+                        cl->moe_down_exps_type == GGML_TYPE_Q8_0);
         hipMemsetAsync(r->d_moe_accum, 0, (size_t)n_embd * sizeof(float), r->stream);
         for (int sel = 0; sel < n_experts_used; ++sel) {
             int e = top_idx[sel], slot = -1;
@@ -11641,8 +11658,8 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
             launch_qwen4_experts_q8_selected(r, cl, top_slots, top_w,
                                              n_experts_used, expert_ff, n_embd);
         else if (fused_xl)
-            launch_qwen4_experts_q4k_q51_selected(r, cl, top_slots, top_w,
-                                                  n_experts_used, expert_ff, n_embd);
+            launch_qwen4_experts_q4k_selected(r, cl, top_slots, top_w,
+                                              n_experts_used, expert_ff, n_embd);
         r->moe_stats.gpu_assignments += (uint64_t)n_experts_used;
     } else {
       hipMemcpyAsync(r->h_moe_input, r->d_xb,
