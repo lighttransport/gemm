@@ -12064,11 +12064,29 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     int cpu_max_count = 1;
     const char *cpu_count_env = getenv("LLM_MOE_CPU_PREFILL_MAX_COUNT");
     if (cpu_count_env) cpu_max_count = atoi(cpu_count_env);
+    unsigned char cpu_selected[512] = {0};
+    int cpu_ids[512], cpu_pos[512], cpu_jobs = 0;
     if (cpu_singletons) {
-        hipMemcpyAsync(r->h_moe_gather_in_cpu, r->d_moe_gather_in,
-                       (size_t)total * n_embd * sizeof(float),
-                       hipMemcpyDeviceToHost, r->stream);
-        hipStreamSynchronize(r->stream);
+        for (int e = 0; e < ne; ++e) {
+            int cnt = offs[e + 1] - offs[e];
+            if (cnt == 0 || cnt > cpu_max_count || cpu_jobs + cnt > 512) continue;
+            int resident = 0;
+            for (int s = 0; s < cl->moe_cache_slots; ++s)
+                if (cl->moe_cache_ids[s] == e) { resident = 1; break; }
+            if (resident) continue;
+            cpu_selected[e] = 1;
+            for (int j = 0; j < cnt; ++j) {
+                int pos = offs[e] + j;
+                cpu_ids[cpu_jobs] = e;
+                cpu_pos[cpu_jobs++] = pos;
+                hipMemcpyAsync(r->h_moe_gather_in_cpu + (size_t)pos * n_embd,
+                               (float *)r->d_moe_gather_in + (size_t)pos * n_embd,
+                               (size_t)n_embd * sizeof(float),
+                               hipMemcpyDeviceToHost, r->stream);
+            }
+            r->moe_stats.cache_misses++;
+        }
+        if (cpu_jobs) hipStreamSynchronize(r->stream);
     }
 
     /* 4. Per-expert GEMMs.
@@ -12204,24 +12222,11 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             cache_keep[best] = 1;
         }
     }
-    int cpu_ids[512], cpu_pos[512], cpu_jobs = 0;
     for (int e = 0; e < ne; e++) {
         int cnt = offs[e + 1] - offs[e];
         if (cnt == 0) continue;
         size_t off = (size_t)offs[e];
-        if (cpu_singletons && cnt <= cpu_max_count) {
-            int resident = 0;
-            for (int s = 0; s < cl->moe_cache_slots; ++s)
-                if (cl->moe_cache_ids[s] == e) { resident = 1; break; }
-            if (!resident && cpu_jobs + cnt <= 512) {
-                for (int j = 0; j < cnt; ++j) {
-                    cpu_ids[cpu_jobs] = e;
-                    cpu_pos[cpu_jobs++] = (int)off + j;
-                }
-                r->moe_stats.cache_misses++;
-                continue;
-            }
-        }
+        if (cpu_selected[e]) continue;
         float *xin = (float *)r->d_moe_gather_in + off * n_embd;
         void *gate_w;
         void *up_w;
