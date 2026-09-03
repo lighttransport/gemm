@@ -56,6 +56,7 @@ unset GGUF_LAZY_MMAP TF_FORCE_MMAP
 export TF_LOAD_KEEPCACHE=0
 export TF_HIER_BARRIER=${TF_HIER_BARRIER:-0} TF_BF16PV_PREFETCH=${TF_BF16PV_PREFETCH:-6}
 export TF_BF16PV_PREFETCH_MTP2=${TF_BF16PV_PREFETCH_MTP2:-12}
+export TF_BF16PV_MTP5_FUSED=${TF_BF16PV_MTP5_FUSED:-1}
 export TF_SSM_FUSED_DOTS=${TF_SSM_FUSED_DOTS:-1}
 # Decode-size TP4 reductions are faster as direct peer puts than as two
 # recursive-doubling rounds.  Keep larger payloads on the tree and allow an

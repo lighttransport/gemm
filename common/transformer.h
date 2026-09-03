@@ -12059,10 +12059,21 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
                 const float *x2=X+2*(size_t)X_stride;
                 const float *x3=X+3*(size_t)X_stride;
                 const float *x4=X+4*(size_t)X_stride;
-                /* A 4-row x 5-token kernel needs 20 accumulators plus five X
-                 * vectors and weight/predicate temporaries, spilling on
-                 * A64FX.  Keep both pieces register-resident: 4x3 for the
-                 * first three tokens, then the exact 8x2 kernel for the tail. */
+                static int mtp5_fused = -1;
+                if (mtp5_fused < 0) {
+                    const char *e = getenv("TF_BF16PV_MTP5_FUSED");
+                    mtp5_fused = e && atoi(e) != 0;
+                }
+                /* The compiler keeps all twenty 4x5 accumulators in SVE
+                 * registers.  This path reads each weight vector once; retain
+                 * the established 4x3+8x2 schedule as an A/B control. */
+                if (mtp5_fused) {
+                    matvec_bf16_4x5_pv(y0,y1,y2,y3,y4,p,p+2*K,
+                                        x0,x1,x2,x3,x4,K);
+                    matvec_bf16_4x5_pv(y0+4,y1+4,y2+4,y3+4,y4+4,
+                                        p+4*K,p+6*K,x0,x1,x2,x3,x4,K);
+                    continue;
+                }
                 matvec_bf16_4x3_pv(y0,y1,y2,p,p+2*K,x0,x1,x2,K);
                 matvec_bf16_4x3_pv(y0+4,y1+4,y2+4,p+4*K,p+6*K,x0,x1,x2,K);
                 matvec_bf16_8x2_pv(y3,y4,p,p+2*K,p+4*K,p+6*K,x3,x4,K);

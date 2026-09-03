@@ -2656,3 +2656,18 @@ headline remains the exact K=5 **53.43 tok/s** result; on the interactive node,
 pinning the Codex process to one core improved the same exact 128-token run to
 35.03 tok/s and balanced ranks at 602--611 GB/s, still well below the clean
 868--870 GB/s/node weight-stream rate.
+
+The K=5 BF16-PV verifier now uses its existing compact 4-row by 5-token SVE
+kernel instead of replaying every weight tile through separate 4x3 and 8x2
+passes.  Compiler inspection had already shown that all twenty accumulators stay
+in registers; the old source comment claiming spills was stale.  The direct
+128-token A/B gate preserved `6b136ca0...` and reduced verifier time from
+**88.96 to 84.48 ms/round** (-5.0%).  The 256-token gate preserved
+`7b86e983...`, measured 80.09 ms/round, and reached 34.65 tok/s at only 602
+GB/s/node on the interactive rank-0 node.  `TF_BF16PV_MTP5_FUSED=1` is now the
+launcher default; zero restores the two-pass control.
+
+Prefetch distances 0, 8, 16, and 24 all remained exact and measured 85.64,
+83.89, 84.48, and 84.83 ms/round respectively in short runs.  That spread is
+comparable to live-node jitter, so the established distance 16 remains the
+default rather than overfitting the current allocation.
