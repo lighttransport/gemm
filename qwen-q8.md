@@ -2836,6 +2836,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | persistent NextN attention-to-vocab tail | near/no | 128/256 yes | 44.52 short; 40.48 sustained | 83.10 / 83.59 | 23.33 / 31.32 | 767--821 / 711--811 | promote; exact original head ownership, clean gate pending |
 | 2026-09-03 | NextN-private BF16 prefetch 0/6/8/12 | no | 128 all yes; 256@8 yes | 32.43 / 35.85 / 36.55 / 31.94 | allocation varied | 50.91 / 46.05 / 39.73 / 56.73 | rank0 548 / 606 / 620 / 534 | promote 8 from adjacent 6/8; clean A/B pending |
 | 2026-09-03 | extend persistent tail through NextN QKV | near | 128 yes | 44.32 vs 46.11 control | 80.53 vs 79.55 | 26.38 vs 23.19 | 786--852 vs 780--831 | reject and remove; serial QK/RoPE phase strands workers |
+| 2026-09-03 | verifier OpenMP blocktime 1 ms | no | run aborted | <1 | >300,000 | n/a | n/a | reject; only ~7 cores active, restore 200 ms |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2893,6 +2894,13 @@ QKV-unfused control reached **46.11 tok/s** with 23.19 ms drafting at
 the exact Q/K normalization, RoPE, and cache copies cost more than the saved
 pool wake. The QKV experiment was removed completely; the production
 persistent region continues to start at per-head attention.
+
+Reducing `TP_MTP_VERIFY_BLOCKTIME` from 200 to 1 ms was rejected without a
+completed timing sample. The confirmed live 128-token process was still in
+decode after five minutes and used only about seven cores' worth of CPU,
+instead of completing load plus decode in roughly 30 seconds on the same
+allocation. Repeated sleep/wake between the verifier's many OpenMP regions is
+catastrophic; the run was terminated and the 200 ms default is retained.
 
 An additional SSM scheduling probe normalized Q/K directly into each expanded
 head, replacing the normalize/expand pair with one worker phase and removing
