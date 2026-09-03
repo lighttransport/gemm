@@ -243,6 +243,7 @@ int main(int argc, char **argv) {
     int moe_cache_mb = 0;
     int moe_cpu_only = 0;
     int max_layers = 0;
+    int verify_hc_batch = 0;
     int verify_quant_kernels = 0; /* --verify-quant-kernels: A/B HIP vs CPU per quant type, then exit */
     const char *bench_qmv_type = NULL; /* --bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS] */
     int bench_qmv_rows = 0, bench_qmv_cols = 0, bench_qmv_iters = 0, bench_qmv_repeats = 1;
@@ -312,6 +313,8 @@ int main(int argc, char **argv) {
             moe_cpu_only = 1;
         } else if (strcmp(argv[i], "--max-layers") == 0 && i + 1 < argc) {
             max_layers = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--verify-hc-batch") == 0) {
+            verify_hc_batch = 1;
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         } else {
@@ -443,6 +446,17 @@ int main(int argc, char **argv) {
         bpe_vocab_free(vocab);
         gguf_close_shards(gguf_model);
         return 1;
+    }
+    if (verify_hc_batch) {
+        double rel = 0.0, max_abs = 0.0;
+        int rc = hip_llm_verify_hc_batch(gpu, 8, &rel, &max_abs);
+        fprintf(stderr, "HC batch verify: rel_l2=%.6e max_abs=%.6e %s\n",
+                rel, max_abs, rc == 0 && rel < 2e-2 ? "PASS" : "FAIL");
+        hip_llm_free(gpu);
+        if (cpu_model) transformer_free(cpu_model);
+        bpe_vocab_free(vocab);
+        gguf_close_shards(gguf_model);
+        return rc == 0 && rel < 2e-2 ? 0 : 1;
     }
 
     int n_embd = hip_llm_n_embd(gpu);

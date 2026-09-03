@@ -5472,7 +5472,7 @@ static const char *hip_kernel_source =
 "    float8 z = {0,0,0,0,0,0,0,0};\n"
 "    float8 cv00=z,cv01=z,cv10=z,cv11=z,cv20=z,cv21=z,cv30=z,cv31=z;\n"
 "    int interior = (cta_m0 + 128 <= M) && (cta_n0 + 128 <= N) && ((K & 31) == 0);\n"
-"    for (int k = 0; k < K; k += 32) {\n"
+"    for (int k = 0; k < K; k += 64) {\n"
 "        if (interior) {\n"
 "            int er = tid >> 1, ek = (tid & 1) * 16;\n"
 "            bf16x8 *da = (bf16x8 *)&smA[er * 32 + ek];\n"
@@ -5565,7 +5565,7 @@ static const char *hip_kernel_source =
 "            smB[0][e] = (col<N && kp<K) ? W[(size_t)col*K+kp] : 0; }\n"
 "    }\n"
 "    __syncthreads();\n"
-"    for (int k = 0; k < K; k += 64) {\n"
+"    for (int k = 0; k < K; k += 32) {\n"
 "        int nbuf = buf ^ 1;\n"
 "        int a_base = wM*64, b_base = wN*32;\n"
 "        for (int kk0 = 0; kk0 < 32; kk0 += 16) {\n"
@@ -9444,6 +9444,31 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         if (batch_max > 8192) batch_max = 8192;
         r->batch_max = batch_max;
 
+        if (r->is_qwen4exp) {
+            const char *qg = getenv("LLM_GEMM");
+            if (!qg || strcmp(qg, "own") != 0) r->gemm_own = 0;
+            size_t bm = (size_t)batch_max;
+            size_t hcd = (size_t)r->hc_count * r->n_embd;
+            size_t lr = (size_t)r->hc_low_rank;
+            CHECK_HIP(hipMalloc(&r->d_hc_batch,           bm*hcd*sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_hc_norm_batch,      bm*hcd*sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_hc_norm_batch_bf16, bm*hcd*2));
+            CHECK_HIP(hipMalloc(&r->d_hc_gate_batch,      bm*hcd*sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_hc_gate_batch_bf16, bm*hcd*2));
+            CHECK_HIP(hipMalloc(&r->d_hc_low_batch,       bm*lr*sizeof(float)));
+            CHECK_HIP(hipMalloc(&r->d_hc_low_batch_bf16,  bm*lr*2));
+            CHECK_HIP(hipMalloc(&r->d_hc_inject_batch,    bm*r->hc_count*sizeof(float)));
+            size_t hc_w_elems = hcd*lr;
+            if (!r->d_wbuf_bf16) {
+                r->d_wbuf_bf16_bytes = hc_w_elems*2;
+                CHECK_HIP(hipMalloc(&r->d_wbuf_bf16, r->d_wbuf_bf16_bytes));
+            }
+            if (!r->gemm_own && mm_blaslt_init() != 0) {
+                fprintf(stderr, "hip_llm: hipBLASLt unavailable for Qwen4 prefill\n");
+                return -1;
+            }
+        }
+
         int gemm_thresh = 8;
         const char *env_th = getenv("LLM_GEMM_M_THRESHOLD");
         if (env_th) gemm_thresh = atoi(env_th);
@@ -9837,7 +9862,7 @@ static inline int gemm_run_bf16_w(hip_llm_runner *r, void *Y, const void *W,
     if (!r->gemm_own)
         return mm_blaslt_run_bf16(Y, W, X, M, N, K, stream);
     void *args[] = { &Y, &W, &X, &N, &K, &M };
-    hipFunction_t fn = (K >= 128 && r->fn_gemm_bf16_own_db) ? r->fn_gemm_bf16_own_db
+    hipFunction_t fn = (M >= 128 && K >= 128 && r->fn_gemm_bf16_own_db) ? r->fn_gemm_bf16_own_db
                                                             : r->fn_gemm_bf16_own;
     hipError_t err = LAUNCH(fn, (unsigned)((N + 127) / 128),
                             (unsigned)((M + 127) / 128), 1, 256, 1, 1, 0,
@@ -11365,6 +11390,86 @@ static void forward_hc_combine(hip_llm_runner *r, void *block) {
     int ne=r->n_embd, ns=r->hc_count, n=ne*ns;
     void *a[] = { &r->d_hc, &block, &r->d_hc_inject, &ne, &ns };
     LAUNCH(r->fn_hc_combine_f32, (n+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a);
+}
+
+static int forward_hc_mix_batched(hip_llm_runner *r, int M, void *norm_w,
+                                  void *down_w, int down_type, void *up_w,
+                                  int up_type, void *inject_w, int inject_type,
+                                  void *mixed) {
+    int ne=r->n_embd, ns=r->hc_count, hcd=ne*ns, lr=r->hc_low_rank;
+    float eps=r->rms_norm_eps;
+    void *na[]={&r->d_hc_norm_batch,&r->d_hc_batch,&norm_w,&ne,&ns,&M,&eps};
+    LAUNCH(r->fn_hc_norm_batch_f32, M*ns,1,1,256,1,1,256*sizeof(float),r->stream,na);
+    launch_pack_bf16_from_f32(r,r->d_hc_norm_batch_bf16,r->d_hc_norm_batch,M*hcd);
+    void *dw=get_bf16_weight(r,down_w,NULL,down_type,lr,hcd);
+    if(!dw || gemm_run_bf16_w(r,r->d_hc_low_batch,dw,r->d_hc_norm_batch_bf16,
+                              M,lr,hcd,r->stream)!=0)return -1;
+    { int n=M*lr; float z=1.0f/(float)ns; void *a[]={&r->d_hc_low_batch,&n,&z};
+      LAUNCH(r->fn_hc_silu_scale_f32,(n+255)/256,1,1,256,1,1,0,r->stream,a); }
+    launch_pack_bf16_from_f32(r,r->d_hc_low_batch_bf16,r->d_hc_low_batch,M*lr);
+    void *uw=get_bf16_weight(r,up_w,NULL,up_type,hcd,lr);
+    if(!uw || gemm_run_bf16_w(r,r->d_hc_gate_batch,uw,r->d_hc_low_batch_bf16,
+                              M,hcd,lr,r->stream)!=0)return -1;
+    { int n=M*hcd; launch_pack_bf16_from_f32(r,r->d_hc_gate_batch_bf16,
+                                              r->d_hc_gate_batch,n); }
+    { void *a[]={&mixed,&r->d_hc_norm_batch,&r->d_hc_gate_batch,&ne,&ns,&M};
+      LAUNCH(r->fn_hc_mix_batch_f32,(M*ne+255)/256,1,1,256,1,1,0,r->stream,a); }
+    if(inject_w){
+        void *iw=get_bf16_weight(r,inject_w,NULL,inject_type,ns,hcd);
+        if(!iw || gemm_run_bf16_w(r,r->d_hc_inject_batch,iw,
+                                  r->d_hc_norm_batch_bf16,M,ns,hcd,r->stream)!=0)return -1;
+    }
+    return 0;
+}
+
+static void forward_hc_combine_batched(hip_llm_runner *r,int M,void *block){
+    int ne=r->n_embd,ns=r->hc_count,n=M*ne*ns;
+    void *a[]={&r->d_hc_batch,&block,&r->d_hc_inject_batch,&ne,&ns,&M};
+    LAUNCH(r->fn_hc_combine_batch_f32,(n+255)/256,1,1,256,1,1,0,r->stream,a);
+}
+
+int hip_llm_verify_hc_batch(hip_llm_runner *r,int M,double *rel,double *mx){
+    if(!r||!r->is_qwen4exp||M<1||M>r->batch_max)return -1;
+    int hcd=r->n_embd*r->hc_count,ne=r->n_embd;
+    float *in=(float*)malloc((size_t)M*hcd*sizeof(float));
+    float *a=(float*)malloc((size_t)M*ne*sizeof(float));
+    float *b=(float*)malloc((size_t)M*ne*sizeof(float));
+    float *sn=(float*)malloc((size_t)hcd*sizeof(float));
+    float *sl=(float*)malloc((size_t)r->hc_low_rank*sizeof(float));
+    float *sg=(float*)malloc((size_t)hcd*sizeof(float));
+    if(!in||!a||!b||!sn||!sl||!sg){free(in);free(a);free(b);free(sn);free(sl);free(sg);return -1;}
+    uint32_t z=1;for(int i=0;i<M*hcd;i++){z=z*1664525u+1013904223u;in[i]=((z>>8)*(1.0f/16777216.0f)-0.5f)*0.1f;}
+    hip_layer *cl=&r->layers[0];
+    for(int m=0;m<M;m++){
+        hipMemcpy(r->d_hc,in+(size_t)m*hcd,(size_t)hcd*sizeof(float),hipMemcpyHostToDevice);
+        forward_hc_mix(r,cl->hc_attn_norm_w,cl->hc_attn_down_w,cl->hc_attn_down_type,
+                       cl->hc_attn_up_w,cl->hc_attn_up_type,cl->hc_attn_inject_w,
+                       cl->hc_attn_inject_type,r->d_xb);
+        hipStreamSynchronize(r->stream);
+        hipMemcpy(a+(size_t)m*ne,r->d_xb,(size_t)ne*sizeof(float),hipMemcpyDeviceToHost);
+    }
+    hipMemcpy(sn,r->d_hc_norm,(size_t)hcd*sizeof(float),hipMemcpyDeviceToHost);
+    hipMemcpy(sl,r->d_hc_low,(size_t)r->hc_low_rank*sizeof(float),hipMemcpyDeviceToHost);
+    hipMemcpy(sg,r->d_hc_gate,(size_t)hcd*sizeof(float),hipMemcpyDeviceToHost);
+    hipMemcpy(r->d_hc_batch,in,(size_t)M*hcd*sizeof(float),hipMemcpyHostToDevice);
+    void *bout=r->d_hc_gate_batch_bf16;
+    if(forward_hc_mix_batched(r,M,cl->hc_attn_norm_w,cl->hc_attn_down_w,
+       cl->hc_attn_down_type,cl->hc_attn_up_w,cl->hc_attn_up_type,
+       cl->hc_attn_inject_w,cl->hc_attn_inject_type,bout)!=0){free(in);free(a);free(b);return -1;}
+    hipStreamSynchronize(r->stream);
+    hipMemcpy(b,bout,(size_t)M*ne*sizeof(float),hipMemcpyDeviceToHost);
+    if (r->verbose) { double sa=0,sb=0,nd=0,nn=0; for(int i=0;i<M*ne;i++){sa+=fabs(a[i]);sb+=fabs(b[i]);}
+        float *bn=(float*)malloc((size_t)hcd*sizeof(float)); float *bl=(float*)malloc((size_t)r->hc_low_rank*sizeof(float)); float *bg=(float*)malloc((size_t)hcd*sizeof(float));
+        hipMemcpy(bn,(float*)r->d_hc_norm_batch+(size_t)(M-1)*hcd,(size_t)hcd*sizeof(float),hipMemcpyDeviceToHost);
+        hipMemcpy(bl,(float*)r->d_hc_low_batch+(size_t)(M-1)*r->hc_low_rank,(size_t)r->hc_low_rank*sizeof(float),hipMemcpyDeviceToHost);
+        hipMemcpy(bg,(float*)r->d_hc_gate_batch+(size_t)(M-1)*hcd,(size_t)hcd*sizeof(float),hipMemcpyDeviceToHost);
+        for(int i=0;i<hcd;i++){double d=sn[i]-bn[i];nd+=d*d;nn+=(double)sn[i]*sn[i];} free(bn);
+        double ld=0,ln=0;for(int i=0;i<r->hc_low_rank;i++){double d=sl[i]-bl[i];ld+=d*d;ln+=(double)sl[i]*sl[i];}free(bl);
+        double gd=0,gn=0;for(int i=0;i<hcd;i++){double d=sg[i]-bg[i];gd+=d*d;gn+=(double)sg[i]*sg[i];}free(bg);
+        fprintf(stderr,"hip_llm: HC verify sample scalar=%g batch=%g l1=(%g,%g) norm_rel=%g low_rel=%g gate_rel=%g\n",a[0],b[0],sa,sb,sqrt(nd/nn),sqrt(ld/ln),sqrt(gd/gn)); }
+    double num=0,den=0,ma=0;for(int i=0;i<M*ne;i++){double d=(double)a[i]-b[i],ad=fabs(d);num+=d*d;den+=(double)a[i]*a[i];if(ad>ma)ma=ad;}
+    if(rel)*rel=den>0?sqrt(num/den):sqrt(num);if(mx)*mx=ma;
+    free(in);free(a);free(b);free(sn);free(sl);free(sg);return 0;
 }
 
 /* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch
@@ -13389,6 +13494,14 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_hc_gate)      hipFree(r->d_hc_gate);
     if (r->d_hc_low)       hipFree(r->d_hc_low);
     if (r->d_hc_inject)    hipFree(r->d_hc_inject);
+    if (r->d_hc_batch)             hipFree(r->d_hc_batch);
+    if (r->d_hc_norm_batch)        hipFree(r->d_hc_norm_batch);
+    if (r->d_hc_norm_batch_bf16)   hipFree(r->d_hc_norm_batch_bf16);
+    if (r->d_hc_gate_batch)        hipFree(r->d_hc_gate_batch);
+    if (r->d_hc_gate_batch_bf16)   hipFree(r->d_hc_gate_batch_bf16);
+    if (r->d_hc_low_batch)         hipFree(r->d_hc_low_batch);
+    if (r->d_hc_low_batch_bf16)    hipFree(r->d_hc_low_batch_bf16);
+    if (r->d_hc_inject_batch)      hipFree(r->d_hc_inject_batch);
 
     /* === Phase 5: graph + device-int cleanup === */
     if (r->graph_exec_logits) hipGraphExecDestroy(r->graph_exec_logits);
