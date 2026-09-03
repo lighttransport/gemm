@@ -3097,3 +3097,20 @@ accepted result. The same configuration with local Codex processes competing
 on rank 0 reached only 29.36 tok/s (rank 0 460 GB/s), quantifying why interactive
 results must not replace clean-node acceptance. A historical-control attempt
 landed on a lower 711--745 GB/s interval and is not a valid adjacent comparison.
+
+The persistent DeltaNet convolution now publishes state and output by channel
+inside each owning worker (`TF_SSM_CONV_INLINE_COPY=1`). Depthwise convolution
+has no cross-channel dependency, so after producing `[j0,j1)` the worker copies
+the original QKV slice to the same ring-state slice and replaces that QKV slice
+with its convolution result. The floating-point operations and their order are
+unchanged, and every read/write remains in the worker's existing CMG-owned
+channel range. This removes thread 0's two serial 10,240-float copies and one
+global barrier from each of the 48 SSM layers per token.
+
+The adjacent 64-token A/B reproduced the same
+`1ccdd24cc33593fcf2aa8058357848fdbf995526930e98cf2782169d23f71799`
+hash. Forward time improved from 31.84 to **31.61 ms/token** (0.7%), and overall
+throughput improved from 31.34 to **31.51 tok/s**. A controller-free MTP gate
+also reproduced canonical `6b136ca0...` and reached 47.41 tok/s with 76.32 ms
+verification and 23.61 ms drafting. `TF_SSM_CONV_INLINE_COPY=0` retains the
+legacy serial-copy/barrier path for exact comparisons.

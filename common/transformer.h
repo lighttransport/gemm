@@ -6499,7 +6499,7 @@ static void tf_ssm_finish_heads(transformer_model *m, int layer_idx,
 /* Cooperative SSM preparation helpers.  They operate on the persistent pool
  * directly; no nested pool dispatch is allowed while the token worker owns it. */
 static void tf_ssm_prepare_conv_worker(transformer_model *m, int layer_idx,
-                                       int tid, int nt) {
+                                       int tid, int nt, int inline_copy) {
     transformer_layer *layer = &m->layers[layer_idx];
     int qkv_dim = m->ssm_qkv_dim;
     int conv_k = m->ssm_conv_kernel;
@@ -6532,6 +6532,19 @@ static void tf_ssm_prepare_conv_worker(transformer_model *m, int layer_idx,
     }
 #endif
     for (int j = j0; j < j1; j++) out[j] /= 1.0f + expf(-out[j]);
+
+    /* Channels are independent throughout the depthwise convolution.  Publish
+     * this worker's original input to its ring-state slice, then replace only
+     * the same QKV slice with the completed convolution output.  Doing this
+     * here preserves the historical arithmetic while removing the serial
+     * whole-vector copies and their extra global barrier. */
+    if (inline_copy) {
+        memcpy(state + (size_t)wr * qkv_dim + j0, qkv + j0,
+               (size_t)(j1 - j0) * sizeof(float));
+        memcpy(qkv + j0, out + j0, (size_t)(j1 - j0) * sizeof(float));
+        if (tid == 0)
+            m->conv_state_pos[layer_idx] = (wr + 1) % n_hist;
+    }
 }
 
 static void tf_ssm_prepare_qk_worker(transformer_model *m, int tid, int nt, int expand) {
@@ -7690,8 +7703,13 @@ static void *tf_persistent_worker(void *arg) {
     int pos_t = ctx->pos_t, pos_h = ctx->pos_h, pos_w = ctx->pos_w;
     int local_sense = 0;
     static _Thread_local int trace_layers = -1;
+    static _Thread_local int ssm_conv_inline_copy = -1;
     if (trace_layers < 0)
         trace_layers = getenv("TF_TRACE_LAYERS") ? 1 : 0;
+    if (ssm_conv_inline_copy < 0) {
+        const char *e = getenv("TF_SSM_CONV_INLINE_COPY");
+        ssm_conv_inline_copy = !e || atoi(e) != 0;
+    }
     if (tid == 0 && tf_dprof < 0)
         tf_dprof = getenv("TF_DPROF") ? 1 : 0;
 
@@ -7744,15 +7762,20 @@ static void *tf_persistent_worker(void *arg) {
                 ssm_t0 = tf_time_ms();
             }
             double ssm_prepare_t0 = (tid == 0 && tf_dprof > 0) ? tf_time_ms() : 0.0;
-            tf_ssm_prepare_conv_worker(m, l, tid, nt);
+            tf_ssm_prepare_conv_worker(m, l, tid, nt, ssm_conv_inline_copy);
             tf_spin_barrier(m, &local_sense, nt);
-            if (tid == 0) {
-                memcpy(m->conv_state[l] + m->conv_state_pos[l] * m->ssm_qkv_dim,
-                       m->xb2, (size_t)m->ssm_qkv_dim * sizeof(float));
-                m->conv_state_pos[l] = (m->conv_state_pos[l] + 1) % (m->ssm_conv_kernel - 1);
-                memcpy(m->xb2, m->ffn_buf2, (size_t)m->ssm_qkv_dim * sizeof(float));
+            if (!ssm_conv_inline_copy) {
+                if (tid == 0) {
+                    memcpy(m->conv_state[l] +
+                               m->conv_state_pos[l] * m->ssm_qkv_dim,
+                           m->xb2, (size_t)m->ssm_qkv_dim * sizeof(float));
+                    m->conv_state_pos[l] =
+                        (m->conv_state_pos[l] + 1) % (m->ssm_conv_kernel - 1);
+                    memcpy(m->xb2, m->ffn_buf2,
+                           (size_t)m->ssm_qkv_dim * sizeof(float));
+                }
+                tf_spin_barrier(m, &local_sense, nt);
             }
-            tf_spin_barrier(m, &local_sense, nt);
             tf_ssm_prepare_qk_worker(m, tid, nt, 0);
             tf_spin_barrier(m, &local_sense, nt);
             tf_ssm_prepare_qk_worker(m, tid, nt, 1);
