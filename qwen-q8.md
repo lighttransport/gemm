@@ -2837,6 +2837,8 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | NextN-private BF16 prefetch 0/6/8/12 | no | 128 all yes; 256@8 yes | 32.43 / 35.85 / 36.55 / 31.94 | allocation varied | 50.91 / 46.05 / 39.73 / 56.73 | rank0 548 / 606 / 620 / 534 | promote 8 from adjacent 6/8; clean A/B pending |
 | 2026-09-03 | extend persistent tail through NextN QKV | near | 128 yes | 44.32 vs 46.11 control | 80.53 vs 79.55 | 26.38 vs 23.19 | 786--852 vs 780--831 | reject and remove; serial QK/RoPE phase strands workers |
 | 2026-09-03 | verifier OpenMP blocktime 1 ms | no | run aborted | <1 | >300,000 | n/a | n/a | reject; only ~7 cores active, restore 200 ms |
+| 2026-09-03 | uTofu poll cadence 4/8/16 | near | 128 all yes | 45.15 / 46.11 / 45.39 | 81.08 / 79.55 / 80.56 | 23.85 / 23.19 / 23.82 | 772--829 / 780--831 / 772--829 | retain 8 |
+| 2026-09-03 | persistent-trunk per-worker SVE SiLU | no | short stream changed | 23.39 vs 24.15 control | n/a | n/a | peers 526--539 | reject and remove; slices too small to amortize vector setup |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2901,6 +2903,17 @@ decode after five minutes and used only about seven cores' worth of CPU,
 instead of completing load plus decode in roughly 30 seconds on the same
 allocation. Repeated sleep/wake between the verifier's many OpenMP regions is
 catastrophic; the run was terminated and the 200 ms default is retained.
+
+The exact TP4 uTofu all-gather/tree path was also swept at trailer-invalidation
+cadences 4, 8, and 16 on comparable near-clean MTP runs. All three retained the
+128-token canonical hash. Cadence 8 remained best at 46.11 tok/s, versus 45.15
+and 45.39 tok/s; no polling default changed.
+
+Finally, applying the bulk SVE SiLU approximation inside each persistent trunk
+worker regressed non-MTP throughput from 24.15 to 23.39 tok/s while peer-rank
+weight bandwidth remained 526--539 GB/s. Each worker owns only about 91 FFN
+elements, so vector exponential/reciprocal setup does not amortize as it does
+in the batched activation path. The experiment was removed completely.
 
 An additional SSM scheduling probe normalized Q/K directly into each expanded
 head, replacing the normalize/expand pair with one worker phase and removing
