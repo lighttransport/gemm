@@ -2841,6 +2841,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | persistent-trunk per-worker SVE SiLU | no | short stream changed | 23.39 vs 24.15 control | n/a | n/a | peers 526--539 | reject and remove; slices too small to amortize vector setup |
 | 2026-09-03 | paired verifier SSM alpha/beta team | near | 128 twice yes | 46.39 / 46.36 vs 44.59 control | 79.09 / 79.12 vs 82.73 | 23.03 / 23.07 vs 23.51 | 781--835 / 782--835 vs 775--826 | promote; exact, repeatable +4.0%, clean gate narrowly missed |
 | 2026-09-03 | paired verifier SSM QKV/gate team | near | 128 yes | 45.55 vs 46.09 control | 81.23 vs 79.60 | 22.79 vs 23.20 | 771--844 vs 785--833 | reject and remove; large HBM phases regress inside retained team |
+| 2026-09-03 | 24-thread SSM alpha/beta pair | no | 128 yes | 4.37 | 1027.23 | 57.72 | 68--89 | reject and remove; alternating 24/48-thread regions defeats Fujitsu hot-team reuse |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2957,3 +2958,12 @@ tok/s with 81.23 ms verification. The immediately adjacent disabled control
 reached 46.09 tok/s with 79.60 ms verification. Projection time increased from
 447.5 to 461.4 ms over 27 rounds, so these long HBM-streaming phases benefit
 from ending the first region instead of holding its team through the barrier.
+
+Capping the paired alpha/beta region at its 24 actual row tasks was also
+rejected and removed. Although it retained the canonical token hash, repeatedly
+alternating between 48-worker projection teams and a 24-worker scalar team
+prevented the Fujitsu OpenMP runtime from reusing its hot team. Throughput
+collapsed to 4.37 tok/s and accumulated verifier projection time increased to
+18.5 seconds over 27 rounds. The pair therefore intentionally wakes the same
+48-worker team as the surrounding projections even though half its workers
+have no row assigned.
