@@ -206,9 +206,11 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             common = 0;
         }
         if (n_tokens > max_seq_len) n_tokens = max_seq_len;
+        double t_prefill0 = get_time_ms();
         float *logits = NULL;
         if (n_tokens > common)
             logits = hip_llm_forward_batch_logits(gpu, tokens + common, n_tokens - common, common);
+        double t_prefill1 = get_time_ms();
         if (!logits && n_tokens == common) {
             free(tokens); puts("ERR empty continuation"); fflush(stdout); continue;
         }
@@ -225,6 +227,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         char *text = (char *)calloc(text_cap ? text_cap : 1, 1);
         int generated = 0, finish_eos = 0;
         int eos = bpe_eos_id(vocab), eot = bpe_eot_id(vocab);
+        double t_decode0 = get_time_ms();
         for (int k = 0; logits && k < max_tokens; k++) {
             int next = (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
                 sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence, seen, &rng);
@@ -247,6 +250,21 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             if (next == eos || next == eot) { finish_eos = 1; break; }
             logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
         }
+        double t_decode1 = get_time_ms();
+        int prompt_added = n_tokens - common;
+        int batch_size = 128;
+        const char *batch_env = getenv("LLM_BMAX");
+        if (batch_env) batch_size = atoi(batch_env);
+        if (batch_size < 1) batch_size = 1;
+        int batches = prompt_added > 0 ? (prompt_added + batch_size - 1) / batch_size : 0;
+        double prefill_ms = t_prefill1 - t_prefill0;
+        double decode_ms = t_decode1 - t_decode0;
+        fprintf(stderr,
+                "llm_server: prompt=%d cached=%d added=%d batches=%d batch=%d "
+                "prefill=%.2f ms (%.2f tok/s) decode=%d in %.2f ms (%.2f tok/s)\n",
+                n_tokens, common, prompt_added, batches, batch_size,
+                prefill_ms, prefill_ms > 0.0 ? 1000.0 * prompt_added / prefill_ms : 0.0,
+                generated, decode_ms, decode_ms > 0.0 ? 1000.0 * generated / decode_ms : 0.0);
         size_t enc_n = 0; char *enc = b64_encode((const unsigned char *)(text ? text : ""), text_n, &enc_n);
         printf("OK %d %d %d %s %s\n", common, n_tokens, generated,
                finish_eos ? "stop" : "length", enc ? enc : "");
