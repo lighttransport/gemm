@@ -101,11 +101,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, status, obj):
         raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            return False
 
     def do_GET(self):
         if self.path == "/v1/models":
@@ -171,6 +175,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"id": ident, "object": "text_completion", "created": created, "model": self.model, "choices": [{"index": 0, "text": text, "finish_reason": finish}], "usage": usage})
             else:
                 self.send_json(200, {"id": ident, "object": "chat.completion", "created": created, "model": self.model, "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish}], "usage": usage})
+        except (BrokenPipeError, ConnectionResetError):
+            # Clients commonly cancel a request after their own timeout. The
+            # backend may finish its serialized inference, but there is no
+            # socket left to report an error on.
+            return
         except Exception as exc:
             self.send_json(500, {"error": {"message": str(exc), "type": "server_error"}})
 
