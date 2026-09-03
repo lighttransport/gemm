@@ -4961,7 +4961,7 @@ static const char *hip_kernel_source =
 "__global__ void moe_router_fused(const unsigned short *gate_w, const unsigned short *sgate_w,\n"
 "        const float *x, int ne, int K, int n_cols,\n"
 "        float *logits, int *out_idx, float *out_w, float *shared_scale,\n"
-"        unsigned int *counter) {\n"
+"        unsigned int *counter, const int *slot_map, float *cache_valid) {\n"
 "    int e = blockIdx.x; int tid = threadIdx.x;\n"
 "    const unsigned short *wr = (e < ne) ? gate_w + (size_t)e * n_cols : sgate_w;\n"
 "    float p = 0.0f;\n"
@@ -5004,6 +5004,8 @@ static const char *hip_kernel_source =
 "        float mx = out_w[0]; for (int i=1;i<K;i++) if (out_w[i]>mx) mx=out_w[i];\n"
 "        float sum=0; for (int i=0;i<K;i++){ out_w[i]=expf(out_w[i]-mx); sum+=out_w[i]; }\n"
 "        float inv=1.0f/sum; for (int i=0;i<K;i++) out_w[i]*=inv;\n"
+"        if (cache_valid) { int ok=1; for (int i=0;i<K;i++)\n"
+"            if (slot_map[out_idx[i]] < 0) ok=0; cache_valid[0]=(float)ok; }\n"
 "        counter[0] = 0;  /* reset for next layer */\n"
 "    }\n"
 "}\n"
@@ -12079,9 +12081,11 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
       cl->moe_shared_up_type   == GGML_TYPE_Q6_K &&
       cl->moe_shared_down_type == GGML_TYPE_Q6_K) {
       int ne_ = n_experts, K_ = n_experts_used, nc_ = n_embd;
+      const int *cache_map_ = NULL; float *cache_valid_ = NULL;
       void *a[] = { &cl->moe_gate_w_bf16, &cl->moe_shared_gate_w_bf16, &r->d_xb,
                     &ne_, &K_, &nc_, &r->d_router_logits, &r->d_moe_idx, &r->d_moe_w,
-                    &r->d_shared_scale, &r->d_router_counter };
+                    &r->d_shared_scale, &r->d_router_counter,
+                    &cache_map_, &cache_valid_ };
       LAUNCH(r->fn_moe_router_fused, ne_ + 1, 1, 1, 256, 1, 1, 0, r->stream, a);
       launch_moe_gateup_silu(r, cl, n_experts_used + 1,
                              cl->moe_shared_ffn_gate_w, cl->moe_shared_ffn_up_w);
@@ -12106,21 +12110,20 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
          cl->moe_down_exps_type == GGML_TYPE_Q8_0);
     if (use_gpu_topk) {
         int ne = n_experts, k = n_experts_used, nc = n_embd;
+        const int *cache_map = use_device_cache ? cl->d_moe_cache_map : NULL;
+        float *cache_valid = use_device_cache ? (float *)r->d_router_logits : NULL;
         void *ra[] = { &cl->moe_gate_w_bf16, &cl->moe_shared_gate_w_bf16,
                        &r->d_xb, &ne, &k, &nc, &r->d_router_logits,
                        &r->d_moe_idx, &r->d_moe_w, &r->d_shared_scale,
-                       &r->d_router_counter };
+                       &r->d_router_counter, &cache_map, &cache_valid };
         LAUNCH(r->fn_moe_router_fused, ne + 1, 1, 1, 256, 1, 1,
                0, r->stream, ra);
         if (use_device_cache) {
-            int valid = 0;
-            void *va[] = { &r->d_moe_idx, &cl->d_moe_cache_map,
-                           &k, &r->d_router_counter };
-            LAUNCH(r->fn_moe_cache_slots_valid, 1, 1, 1, 64, 1, 1, 0, r->stream, va);
-            hipMemcpyAsync(&valid, r->d_router_counter, sizeof(valid),
+            float valid = 0.0f;
+            hipMemcpyAsync(&valid, r->d_router_logits, sizeof(valid),
                            hipMemcpyDeviceToHost, r->stream);
             hipStreamSynchronize(r->stream);
-            if (valid) {
+            if (valid != 0.0f) {
                 hipMemsetAsync(r->d_moe_accum, 0, (size_t)n_embd * sizeof(float), r->stream);
                 if (cl->moe_gate_exps_type == GGML_TYPE_Q5_K)
                     launch_qwen4_experts_q5k_map(r, cl, n_experts_used, expert_ff, n_embd);
