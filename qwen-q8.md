@@ -2845,6 +2845,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | exact-slot contiguous uTofu Put, non-MTP | no | 128 repeated only | 31.04 vs 26.99 | n/a | n/a | 535--555 vs 531--548 peers | reject and revert; trailer visibility does not guarantee payload completion |
 | 2026-09-03 | exact-slot contiguous uTofu Put, MTP | near | 128 yes | 44.01 vs 46.36 | 79.84 vs 79.12 | 27.81 vs 23.07 | 785--825 vs 782--835 | reject 25600 slot; retain 32768 for MTP |
 | 2026-09-03 | late TCQ polling after peer arrival | no | 128 twice yes | 30.65 / 30.93 vs 31.04 reference | n/a | n/a | 527--554 / 536--544 | reject and remove; collective time neutral |
+| 2026-09-03 | strong-order trailer-only TCQ notice | no | 128 yes | 26.89 vs 26.99 control | n/a | n/a | 536--552 peers | reject and remove; comm 10.49--11.26 ms/token, no polling win |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2980,6 +2981,14 @@ earlier `TP_AR_BATCH=1` experiment had already demonstrated divergence with
 the same publication assumption. The combined Put and 5,120-float launcher
 default were therefore reverted; production again uses distinct payload and
 trailer Puts with the 8,192-float slot.
+
+A safe attempt to reduce only local completion work kept payload and trailer as
+separate remote Puts, applied `UTOFU_ONESIDED_FLAG_STRONG_ORDER`, and requested
+a TCQ notice only for the trailing descriptor. It retained the 128-token hash
+but reached 26.89 tok/s versus the comparable ordinary path at 26.99 tok/s;
+peer communication was 10.49--11.26 ms/token rather than 10.09--10.92. The
+branch was removed: TCQ polling is not the dominant cost, and production keeps
+an explicit completion notice for every Put.
 
 The corresponding MTP slot experiment was not promoted. A 25,600-float slot
 made the K=5 batched residual contiguous, but verifier collective time remained
