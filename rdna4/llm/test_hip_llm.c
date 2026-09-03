@@ -14,6 +14,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <ctype.h>
 
 /* GGUF loader */
 #define GGUF_LOADER_IMPLEMENTATION
@@ -97,6 +98,163 @@ static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
         if (pick <= 0.0f) return ids[j];
     }
     return ids[nkeep - 1];
+}
+
+static int argmax_logits(const float *logits, int n);
+
+/* Small line protocol used by codex_server.py.  Keeping HTTP/JSON out of the
+ * GPU process makes the runner easy to embed and, more importantly, keeps one
+ * HIP context alive for the lifetime of the API server. */
+static const char b64_chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static char *b64_encode(const unsigned char *src, size_t n, size_t *out_n) {
+    size_t cap = ((n + 2) / 3) * 4 + 1;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    size_t p = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned v = (unsigned)src[i] << 16;
+        if (i + 1 < n) v |= (unsigned)src[i + 1] << 8;
+        if (i + 2 < n) v |= src[i + 2];
+        out[p++] = b64_chars[(v >> 18) & 63];
+        out[p++] = b64_chars[(v >> 12) & 63];
+        out[p++] = i + 1 < n ? b64_chars[(v >> 6) & 63] : '=';
+        out[p++] = i + 2 < n ? b64_chars[v & 63] : '=';
+    }
+    out[p] = '\0';
+    if (out_n) *out_n = p;
+    return out;
+}
+
+static int b64_value(int c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static unsigned char *b64_decode(const char *src, size_t *out_n) {
+    size_t n = strlen(src), cap = (n / 4) * 3 + 3, p = 0;
+    unsigned char *out = (unsigned char *)malloc(cap);
+    if (!out) return NULL;
+    for (size_t i = 0; i + 1 < n; i += 4) {
+        int a = b64_value((unsigned char)src[i]);
+        int b = b64_value((unsigned char)src[i + 1]);
+        int c = src[i + 2] == '=' ? 0 : b64_value((unsigned char)src[i + 2]);
+        int d = src[i + 3] == '=' ? 0 : b64_value((unsigned char)src[i + 3]);
+        if (a < 0 || b < 0 || c < 0 || d < 0) { free(out); return NULL; }
+        unsigned v = ((unsigned)a << 18) | ((unsigned)b << 12) |
+                     ((unsigned)c << 6) | (unsigned)d;
+        out[p++] = (unsigned char)(v >> 16);
+        if (i + 2 < n && src[i + 2] != '=') out[p++] = (unsigned char)(v >> 8);
+        if (i + 3 < n && src[i + 3] != '=') out[p++] = (unsigned char)v;
+    }
+    out[p] = 0;
+    if (out_n) *out_n = p;
+    return out;
+}
+
+static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
+                            int n_vocab, int max_seq_len, int bos_id) {
+    char line[4 * 1024 * 1024];
+    int32_t *cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
+    int cache_n = 0;
+    unsigned rng = 0x51f15e5du;
+    if (!cache) return 1;
+    fprintf(stderr, "JSONL backend ready (max_seq_len=%d)\n", max_seq_len);
+    fflush(stderr);
+    while (fgets(line, sizeof(line), stdin)) {
+        int max_tokens = 16, top_k = 20;
+        float temperature = 0.2f, top_p = 0.95f, presence = 0.0f;
+        char *b64 = NULL;
+        static char b64buf[sizeof(line)];
+        if (strncmp(line, "REQ ", 4) != 0 ||
+            sscanf(line + 4, "%d %f %f %d %f ", &max_tokens, &temperature,
+                   &top_p, &top_k, &presence) != 5) {
+            puts("ERR invalid request"); fflush(stdout); continue;
+        }
+        if (sscanf(line + 4, "%d %f %f %d %f %4194303s", &max_tokens,
+                   &temperature, &top_p, &top_k, &presence, b64buf) != 6) {
+            puts("ERR missing prompt"); fflush(stdout); continue;
+        }
+        b64 = b64buf;
+        size_t prompt_n = 0;
+        unsigned char *prompt = b64_decode(b64, &prompt_n);
+        if (!prompt) { puts("ERR bad base64"); fflush(stdout); continue; }
+
+        int cap = max_seq_len > 0 ? max_seq_len : 512;
+        int32_t *tokens = (int32_t *)malloc((size_t)cap * sizeof(int32_t));
+        int n_tokens = tokens ? bpe_tokenize(vocab, (const char *)prompt,
+                                              (int)prompt_n, tokens, cap) : -1;
+        free(prompt);
+        if (!tokens || n_tokens <= 0) {
+            free(tokens); puts("ERR tokenization"); fflush(stdout); continue;
+        }
+        if (bos_id > 0 && n_tokens < cap && (n_tokens == 0 || tokens[0] != bos_id)) {
+            memmove(tokens + 1, tokens, (size_t)n_tokens * sizeof(int32_t));
+            tokens[0] = bos_id;
+            n_tokens++;
+        }
+        int common = 0;
+        while (common < cache_n && common < n_tokens && cache[common] == tokens[common]) common++;
+        if (common != cache_n) {
+            hip_llm_reset_state(gpu);
+            cache_n = 0;
+            common = 0;
+        }
+        if (n_tokens > max_seq_len) n_tokens = max_seq_len;
+        float *logits = NULL;
+        if (n_tokens > common)
+            logits = hip_llm_forward_batch_logits(gpu, tokens + common, n_tokens - common, common);
+        if (!logits && n_tokens == common) {
+            free(tokens); puts("ERR empty continuation"); fflush(stdout); continue;
+        }
+        unsigned char *seen = (unsigned char *)calloc((size_t)n_vocab, 1);
+        for (int i = 0; i < n_tokens; i++) {
+            cache[i] = tokens[i];
+            if (seen && tokens[i] >= 0 && tokens[i] < n_vocab) seen[tokens[i]] = 1;
+        }
+        cache_n = n_tokens;
+        free(tokens);
+        if (max_tokens < 0) max_tokens = 0;
+        if (max_tokens > max_seq_len - cache_n) max_tokens = max_seq_len - cache_n;
+        size_t text_cap = (size_t)max_tokens * 16 + 1, text_n = 0;
+        char *text = (char *)calloc(text_cap ? text_cap : 1, 1);
+        int generated = 0, finish_eos = 0;
+        int eos = bpe_eos_id(vocab), eot = bpe_eot_id(vocab);
+        for (int k = 0; logits && k < max_tokens; k++) {
+            int next = (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
+                sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence, seen, &rng);
+            const char *piece = bpe_token_to_str(vocab, next);
+            if (piece && text) {
+                int raw_n = (int)strlen(piece), dec_n = 0;
+                char *decoded = bpe_byte_decode(piece, raw_n, &dec_n);
+                if (decoded) {
+                    if (text_n + (size_t)dec_n + 1 > text_cap) {
+                        text_cap = (text_n + (size_t)dec_n + 1) * 2;
+                        text = (char *)realloc(text, text_cap);
+                    }
+                    if (text) { memcpy(text + text_n, decoded, (size_t)dec_n); text_n += (size_t)dec_n; text[text_n] = 0; }
+                    free(decoded);
+                }
+            }
+            if (cache_n < max_seq_len) cache[cache_n++] = next;
+            if (seen && next >= 0 && next < n_vocab) seen[next] = 1;
+            generated++;
+            if (next == eos || next == eot) { finish_eos = 1; break; }
+            logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
+        }
+        size_t enc_n = 0; char *enc = b64_encode((const unsigned char *)(text ? text : ""), text_n, &enc_n);
+        printf("OK %d %d %d %s %s\n", common, n_tokens, generated,
+               finish_eos ? "stop" : "length", enc ? enc : "");
+        fflush(stdout);
+        free(enc); free(text); free(seen);
+    }
+    free(cache);
+    return 0;
 }
 
 static void print_first_n(const char *label, const float *v, int n, int show) {
@@ -297,6 +455,7 @@ int main(int argc, char **argv) {
     int verify_hc_batch = 0;
     int verify_quant_kernels = 0; /* --verify-quant-kernels: A/B HIP vs CPU per quant type, then exit */
     int verify_moe_routing = 0;
+    int stdio_server = 0;
     const char *bench_qmv_type = NULL; /* --bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS] */
     int bench_qmv_rows = 0, bench_qmv_cols = 0, bench_qmv_iters = 0, bench_qmv_repeats = 1;
 
@@ -336,6 +495,8 @@ int main(int argc, char **argv) {
             verify_quant_kernels = 1;
         } else if (strcmp(argv[i], "--verify-moe-routing") == 0) {
             verify_moe_routing = 1;
+        } else if (strcmp(argv[i], "--stdio-server") == 0) {
+            stdio_server = 1;
         } else if (strcmp(argv[i], "--bench-quant-matvec") == 0 && i + 4 < argc) {
             bench_qmv_type = argv[++i];
             bench_qmv_rows = atoi(argv[++i]);
@@ -524,6 +685,22 @@ int main(int argc, char **argv) {
     int n_vocab = hip_llm_n_vocab(gpu);
     int n_max_seq = hip_llm_max_seq_len(gpu);
     int pass = 1;
+
+    if (stdio_server) {
+        int bos = -1;
+        const char *bos_env = getenv("LLM_ADD_BOS");
+        if (bos_env) bos = atoi(bos_env);
+        else {
+            int bi = gguf_find_key(gguf, "tokenizer.ggml.bos_token_id");
+            if (bi >= 0) bos = (int)gguf->kv[bi].value.u32;
+        }
+        pass = run_stdio_server(gpu, vocab, n_vocab, n_max_seq, bos) == 0;
+        hip_llm_free(gpu);
+        if (cpu_model) transformer_free(cpu_model);
+        bpe_vocab_free(vocab);
+        gguf_close_shards(gguf_model);
+        return pass ? 0 : 1;
+    }
 
     if (bench_mode) {
         unsigned char *seen = NULL;

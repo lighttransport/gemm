@@ -22,7 +22,7 @@ HIPBLASLT ?= 1
 # Target
 TARGET = test_hip_llm
 
-.PHONY: all clean run cpu-expert-bench help
+.PHONY: all clean run api cpu-expert-bench help
 
 all: $(TARGET)
 
@@ -42,6 +42,9 @@ $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h ../rocew.h $(
 
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]"
+
+api: $(TARGET)
+	@echo "Usage: python3 codex_server.py <model.gguf> [--port 8080] [--context 4096]"
 
 cpu-expert-bench: bench_cpu_qwen_expert
 
@@ -64,6 +67,7 @@ help:
 	@echo ""
 	@echo "Example:"
 	@echo "  ./test_hip_llm Qwen3-Embedding-0.6B-f16.gguf -t \"Hello world\" -n 4"
+	@echo "  python3 codex_server.py model.gguf --context 4096 --port 8080"
 	@echo ""
 	@echo "Requirements:"
 	@echo "  - libamdhip64.so (HIP runtime)"
