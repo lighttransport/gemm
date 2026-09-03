@@ -10735,6 +10735,16 @@ static void moe_topk_softmax(const float *logits, int n, int k, int *out_idx, fl
  * existing AVX2 dot product; K/legacy formats dequantize one row at a time.
  * The latter is replaced by paired quantized dot kernels in the optimized
  * scheduler, but keeping this common fallback makes every supported type safe. */
+static inline void hllm_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 15) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
 static void hllm_cpu_qmatvec(float *dst, const void *base, int type,
                              int rows, int cols, const float *x, float *tmp) {
     size_t rb = dequant_row_size(type, cols);
@@ -10744,6 +10754,96 @@ static void hllm_cpu_qmatvec(float *dst, const void *base, int type,
             dst[row] = vec_dot_q8_0_f32(rp, x, cols);
             continue;
         }
+#if defined(__AVX2__) && defined(__FMA__)
+        if (type == GGML_TYPE_Q4_K) {
+            const block_q4_K *blocks = (const block_q4_K *)rp;
+            __m256 total = _mm256_setzero_ps();
+            const __m256i mask = _mm256_set1_epi32(15);
+            for (int b = 0; b < cols / 256; ++b) {
+                float d = ggml_fp16_to_fp32(blocks[b].d);
+                float dm = ggml_fp16_to_fp32(blocks[b].dmin);
+                const uint8_t *q = blocks[b].qs;
+                const float *xp = x + b * 256;
+                for (int g = 0; g < 4; ++g) {
+                    uint8_t sc0, mn0, sc1, mn1;
+                    hllm_scale_min_k4(2*g, blocks[b].scales, &sc0, &mn0);
+                    hllm_scale_min_k4(2*g + 1, blocks[b].scales, &sc1, &mn1);
+                    __m256 vd0 = _mm256_set1_ps(d * sc0);
+                    __m256 vm0 = _mm256_set1_ps(dm * mn0);
+                    __m256 vd1 = _mm256_set1_ps(d * sc1);
+                    __m256 vm1 = _mm256_set1_ps(dm * mn1);
+                    for (int j = 0; j < 32; j += 8) {
+                        __m128i qb = _mm_loadl_epi64((const __m128i *)(q + j));
+                        __m256i qi = _mm256_cvtepu8_epi32(qb);
+                        __m256 qlo = _mm256_cvtepi32_ps(_mm256_and_si256(qi, mask));
+                        __m256 qhi = _mm256_cvtepi32_ps(_mm256_srli_epi32(qi, 4));
+                        __m256 w0 = _mm256_fmsub_ps(qlo, vd0, vm0);
+                        __m256 w1 = _mm256_fmsub_ps(qhi, vd1, vm1);
+                        total = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xp + j), total);
+                        total = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xp + 32 + j), total);
+                    }
+                    q += 32;
+                    xp += 64;
+                }
+            }
+            __m128 s = _mm_add_ps(_mm256_castps256_ps128(total),
+                                  _mm256_extractf128_ps(total, 1));
+            s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+            s = _mm_add_ss(s, _mm_movehdup_ps(s));
+            dst[row] = _mm_cvtss_f32(s);
+            continue;
+        }
+        if (type == GGML_TYPE_Q5_K) {
+            const block_q5_K *blocks = (const block_q5_K *)rp;
+            __m256 total = _mm256_setzero_ps();
+            const __m256i low4 = _mm256_set1_epi32(15);
+            const __m256i bit16 = _mm256_set1_epi32(16);
+            const __m256i zero = _mm256_setzero_si256();
+            for (int b = 0; b < cols / 256; ++b) {
+                float d = ggml_fp16_to_fp32(blocks[b].d);
+                float dm = ggml_fp16_to_fp32(blocks[b].dmin);
+                const uint8_t *q = blocks[b].qs;
+                const uint8_t *qh = blocks[b].qh;
+                const float *xp = x + b * 256;
+                int u0 = 1, u1 = 2;
+                for (int g = 0; g < 4; ++g, u0 <<= 2, u1 <<= 2) {
+                    uint8_t sc0, mn0, sc1, mn1;
+                    hllm_scale_min_k4(2*g, blocks[b].scales, &sc0, &mn0);
+                    hllm_scale_min_k4(2*g + 1, blocks[b].scales, &sc1, &mn1);
+                    __m256 vd0 = _mm256_set1_ps(d * sc0);
+                    __m256 vm0 = _mm256_set1_ps(dm * mn0);
+                    __m256 vd1 = _mm256_set1_ps(d * sc1);
+                    __m256 vm1 = _mm256_set1_ps(dm * mn1);
+                    __m256i vu0 = _mm256_set1_epi32(u0);
+                    __m256i vu1 = _mm256_set1_epi32(u1);
+                    for (int j = 0; j < 32; j += 8) {
+                        __m256i qi = _mm256_cvtepu8_epi32(
+                                _mm_loadl_epi64((const __m128i *)(q + j)));
+                        __m256i hi = _mm256_cvtepu8_epi32(
+                                _mm_loadl_epi64((const __m128i *)(qh + j)));
+                        __m256i h0z = _mm256_cmpeq_epi32(_mm256_and_si256(hi, vu0), zero);
+                        __m256i h1z = _mm256_cmpeq_epi32(_mm256_and_si256(hi, vu1), zero);
+                        __m256i i0 = _mm256_add_epi32(_mm256_and_si256(qi, low4),
+                                                     _mm256_andnot_si256(h0z, bit16));
+                        __m256i i1 = _mm256_add_epi32(_mm256_srli_epi32(qi, 4),
+                                                     _mm256_andnot_si256(h1z, bit16));
+                        __m256 w0 = _mm256_fmsub_ps(_mm256_cvtepi32_ps(i0), vd0, vm0);
+                        __m256 w1 = _mm256_fmsub_ps(_mm256_cvtepi32_ps(i1), vd1, vm1);
+                        total = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xp + j), total);
+                        total = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xp + 32 + j), total);
+                    }
+                    q += 32;
+                    xp += 64;
+                }
+            }
+            __m128 s = _mm_add_ps(_mm256_castps256_ps128(total),
+                                  _mm256_extractf128_ps(total, 1));
+            s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+            s = _mm_add_ss(s, _mm_movehdup_ps(s));
+            dst[row] = _mm_cvtss_f32(s);
+            continue;
+        }
+#endif
         float *work = tmp;
         dequant_row(type, rp, work, cols);
         float sum = 0.0f;
