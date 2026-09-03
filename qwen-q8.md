@@ -2610,11 +2610,17 @@ previous sustained 53.43 tok/s headline.
 
 Two further algorithmic probes were rejected.  A snapshot-free vector SSM
 ceiling reduced K=5 verification by about 8% (roughly 94 to 86.94 ms and 55.05
-tok/s with drafting removed), but exact lazy rollback/replay changed the
-128-token hash to
-`6b136ca08910eb2b47a820d1be2efc5eed1a38c7bf8f8a43de009c6b29f274c2`.
-The existing per-token recurrent snapshots remain required for the exact
-oracle.  Connecting the existing BF16-PV fused local-argmax helper to the
+tok/s with drafting removed).  Full lazy rollback/replay was exact at both 128
+and 256 tokens, including the established `7b86e983...` oracle, but eight
+rejected-round replays raised batch calls from 55 to 63, cost 79.37 ms/round,
+and reduced throughput to 24.17 tok/s.  Direct per-token recurrent snapshots
+remain substantially faster.  Connecting the existing BF16-PV fused local-argmax helper to the
 NextN vocabulary head did preserve the complete 256-token oracle, but raised
 draft time from 48.57 to 57.50 ms and reduced throughput from 32.84 to 30.02
 tok/s.  Both code experiments were fully removed.
+
+Extending the direct TP4 all-to-all cutoff from 8192 to 32768 floats was also
+rejected.  It moved the 25,600-float K=5 verifier reductions off the two-round
+tree, but the 128-token SHA256 changed from the established `6b136ca0...` to
+`9b71fe7c...`.  The direct peer-put fold is therefore retained only for the
+validated small-buffer range; K5 residual reductions remain on the exact tree.
