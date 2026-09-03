@@ -3139,3 +3139,28 @@ matched the serial preparation control. The 128-token MTP gate also retained
 canonical `6b136ca0...`; its 45.22 tok/s sample was bandwidth-degraded at
 761--812 GB/s and is correctness evidence only. Set `TF_ATTN_PREP_HEADS=0` for
 the legacy serial attention preparation.
+
+The replicated NextN proposer now extends its persistent worker region backward
+through QKV (`TF_NEXTN_QKV_PERSIST=1`). Each worker computes its unchanged
+static Q/K/V row ranges, then independent Q-head owners perform the established
+de-interleave, RMSNorm, and RoPE sequence. K-head owners normalize/rotate and
+publish disjoint key/value-cache slices. Two explicit dependency barriers
+separate projection, head preparation, and attention. This fixes the earlier
+QKV-extension experiment's serial-thread-0 preparation bottleneck without
+changing a dot product or moving a weight row between CMGs.
+
+The adjacent exact 128-token A/B reduced proposer time from 22.91 to **20.18
+ms/round** (-11.9%) and improved throughput from 47.47 to 48.19 tok/s despite
+1.2 ms of verifier jitter. The enabled sample passed the clean bandwidth gate
+at 806--854 GB/s. The required 256-token run also passed: canonical
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`,
+809--847 GB/s on all ranks, 76.37 ms verification, 20.00 ms drafting, and
+**48.27 tok/s**. This is promoted for MTP; setting the option to zero restores
+the separate QKV pool and serial head preparation.
+
+K=6 was rechecked after this proposer improvement and rejected again. It kept
+the canonical 128-token stream and normally accepted five drafts, but the
+generic verifier grew to 101.64 ms and drafting to 24.80 ms, yielding only
+43.99 tok/s. K=5 remains the production point; reaching 60 tok/s still requires
+removing about 19 ms from its 96.4 ms round or hiding most proposer work without
+concurrent full-weight HBM contention.

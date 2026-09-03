@@ -9858,7 +9858,8 @@ typedef struct {
     transformer_nextn *nextn;
     const qtensor *head, *head_norm;
     int tid, nt, nff, ne;
-    int head_rows, include_attention, include_output, include_head, nextn_sharded;
+    int head_rows, include_qkv, include_attention, include_output, include_head;
+    int nextn_sharded;
     int position, nh, hd, kvd, gqa, qd;
     int barrier_sense;
 } tf_nextn_ffn_task;
@@ -9905,10 +9906,63 @@ static void *tf_nextn_ffn_worker(void *arg) {
         nextn_prefetch_initialized = 1;
     }
     tf_barrier_tid = t->tid;
+    if (t->include_qkv) {
+        tf_thread_matvec(m->xb2, &L->attn_q, m->xb,
+                         2 * t->qd, t->tid, t->nt);
+        tf_thread_matvec(m->k, &L->attn_k, m->xb,
+                         t->kvd, t->tid, t->nt);
+        tf_thread_matvec(m->v, &L->attn_v, m->xb,
+                         t->kvd, t->tid, t->nt);
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+
+        /* Preserve the established operation order within every head while
+         * distributing independent Q and KV heads over the live workers. */
+        if (t->tid < t->nh) {
+            float *qh = m->q + (size_t)t->tid * t->hd;
+            memcpy(qh, m->xb2 + (size_t)t->tid * 2 * t->hd,
+                   (size_t)t->hd * sizeof(float));
+            memcpy(m->ffn_buf1 + (size_t)t->tid * t->hd,
+                   m->xb2 + (size_t)t->tid * 2 * t->hd + t->hd,
+                   (size_t)t->hd * sizeof(float));
+            tf_qk_norm(qh, 1, t->hd, &L->attn_q_norm,
+                       m->rms_norm_eps, m->thread_tmp[t->tid]);
+            if (m->use_mrope)
+                tf_rope_mrope(qh, 1, t->hd, t->position, t->position,
+                              t->position, m->rope_freq_base,
+                              m->mrope_sections, m->rope_mrope_inv_freq);
+            else
+                tf_rope(qh, 1, t->hd, t->position, m->rope_freq_base,
+                        m->rope_inv_freq);
+        }
+        int nkh = t->kvd / t->hd;
+        if (t->tid < nkh) {
+            float *kh = m->k + (size_t)t->tid * t->hd;
+            tf_qk_norm(kh, 1, t->hd, &L->attn_k_norm,
+                       m->rms_norm_eps, m->thread_tmp[t->tid]);
+            if (m->use_mrope)
+                tf_rope_mrope(kh, 1, t->hd, t->position, t->position,
+                              t->position, m->rope_freq_base,
+                              m->mrope_sections, m->rope_mrope_inv_freq);
+            else
+                tf_rope(kh, 1, t->hd, t->position, m->rope_freq_base,
+                        m->rope_inv_freq);
+            memcpy(t->nextn->key_cache +
+                       ((size_t)t->position * nkh + t->tid) * t->hd,
+                   kh, (size_t)t->hd * sizeof(float));
+            memcpy(t->nextn->value_cache +
+                       ((size_t)t->position * nkh + t->tid) * t->hd,
+                   m->v + (size_t)t->tid * t->hd,
+                   (size_t)t->hd * sizeof(float));
+        }
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+    }
     if (t->include_attention) {
         int hp = t->nh / t->nt, hx = t->nh % t->nt;
         int h0 = t->tid * hp + (t->tid < hx ? t->tid : hx);
         int h1 = h0 + hp + (t->tid < hx ? 1 : 0);
+        if (t->include_qkv && h1 > h0)
+            memset(m->xb2 + (size_t)h0 * t->hd, 0,
+                   (size_t)(h1 - h0) * t->hd * sizeof(float));
         tf_attn_task at = {m->q, m->att, m->xb2, t->nextn->key_cache,
                            t->nextn->value_cache, h0, h1, t->hd, t->kvd,
                            t->gqa, t->position + 1, m->max_seq_len,
@@ -9961,7 +10015,7 @@ static void *tf_nextn_ffn_worker(void *arg) {
 }
 
 /* Keep workers awake across gate/up, SiLU, and down.  Block modes can start at
- * attention or attention-output and continue through the local vocabulary
+ * QKV, attention, or attention-output and continue through the local vocabulary
  * head. Worker zero performs intervening collectives, residuals, and norms
  * while peers wait at dependency barriers. This removes pool broadcasts and
  * the nested OpenMP activation region; weight-row ownership is unchanged. */
@@ -9969,7 +10023,7 @@ static int tf_nextn_ffn_persistent_pool(transformer_model *m,
                                         transformer_layer *L,
                                         transformer_nextn *nn,
                                         int nff, int ne,
-                                        int include_attention,
+                                        int include_qkv, int include_attention,
                                         int include_output,
                                         int nextn_sharded,
                                         const qtensor *head,
@@ -10005,13 +10059,27 @@ static int tf_nextn_ffn_persistent_pool(transformer_model *m,
         (size_t)nt * sizeof(*tasks));
     for (int tid = 0; tid < nt; tid++)
         tasks[tid] = (tf_nextn_ffn_task){m, L, nn, head, head_norm, tid, nt,
-                                         nff, ne, head_rows, include_attention,
+                                         nff, ne, head_rows, include_qkv,
+                                         include_attention,
                                          include_output,
                                          include_output && full_enabled,
                                          nextn_sharded, position, nh, hd, kvd,
                                          gqa, qd, 0};
     tf_pool_dispatch(m, tf_nextn_ffn_worker, tasks, sizeof(*tasks));
     return include_attention ? 3 : (include_output && full_enabled ? 2 : 1);
+}
+
+static int tf_nextn_qkv_persistent_wanted(transformer_model *m,
+                                           transformer_layer *L) {
+    static int enabled = -1, attn_enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("TF_NEXTN_QKV_PERSIST");
+        enabled = e && atoi(e) != 0;
+        e = getenv("TF_NEXTN_ATTN_BLOCK_PERSIST");
+        attn_enabled = e && atoi(e) != 0;
+    }
+    return enabled && attn_enabled && m->pool_alive && m->n_threads > 1 &&
+           !L->attn_q.i8 && !L->attn_k.i8 && !L->attn_v.i8;
 }
 
 float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
@@ -10049,28 +10117,38 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     if (profile) pt_eh = tf_time_ms();
 
     tf_rmsnorm(m->xb, m->x, &L->attn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
-    tf_qmatvec_fused_qkv_pool(m, m->xb2, &L->attn_q, 2 * qd,
-                              m->k, &L->attn_k, m->v, &L->attn_v, kvd);
-    for (int h = 0; h < nh; h++) {
-        memcpy(m->q + h * hd, m->xb2 + h * 2 * hd, (size_t)hd * sizeof(float));
-        memcpy(m->ffn_buf1 + h * hd, m->xb2 + h * 2 * hd + hd,
-               (size_t)hd * sizeof(float));
+    int qkv_persistent = tf_nextn_qkv_persistent_wanted(m, L);
+    if (!qkv_persistent) {
+        tf_qmatvec_fused_qkv_pool(m, m->xb2, &L->attn_q, 2 * qd,
+                                  m->k, &L->attn_k, m->v, &L->attn_v, kvd);
+        for (int h = 0; h < nh; h++) {
+            memcpy(m->q + h * hd, m->xb2 + h * 2 * hd,
+                   (size_t)hd * sizeof(float));
+            memcpy(m->ffn_buf1 + h * hd, m->xb2 + h * 2 * hd + hd,
+                   (size_t)hd * sizeof(float));
+        }
+        tf_qk_norm(m->q, nh, hd, &L->attn_q_norm,
+                   m->rms_norm_eps, m->matvec_tmp);
+        tf_qk_norm(m->k, nkh, hd, &L->attn_k_norm,
+                   m->rms_norm_eps, m->matvec_tmp);
+        tf_apply_rope(m, m->q, m->k, nh, nkh, hd,
+                      position, position, position);
+        memcpy(nn->key_cache + (size_t)position * kvd, m->k,
+               (size_t)kvd * sizeof(float));
+        memcpy(nn->value_cache + (size_t)position * kvd, m->v,
+               (size_t)kvd * sizeof(float));
     }
-    tf_qk_norm(m->q, nh, hd, &L->attn_q_norm, m->rms_norm_eps, m->matvec_tmp);
-    tf_qk_norm(m->k, nkh, hd, &L->attn_k_norm, m->rms_norm_eps, m->matvec_tmp);
-    tf_apply_rope(m, m->q, m->k, nh, nkh, hd, position, position, position);
-    memcpy(nn->key_cache + (size_t)position * kvd, m->k, (size_t)kvd * sizeof(float));
-    memcpy(nn->value_cache + (size_t)position * kvd, m->v, (size_t)kvd * sizeof(float));
     if (profile) pt_qkv = tf_time_ms();
 
-    memset(m->xb2, 0, (size_t)qd * sizeof(float));
+    if (!qkv_persistent)
+        memset(m->xb2, 0, (size_t)qd * sizeof(float));
     int nextn_sharded = !getenv("TP_STAGE_DIR") ||
         (getenv("TP_NEXTN_SHARD") && atoi(getenv("TP_NEXTN_SHARD")));
     const qtensor *head_norm = nn->shared_head_norm.data
         ? &nn->shared_head_norm : &m->output_norm;
     int head_rows = head->n_rows > 0 ? head->n_rows : m->n_vocab;
     int block_persistent = tf_nextn_ffn_persistent_pool(
-        m, L, nn, nff, ne, 1, 1, nextn_sharded, head, head_norm,
+        m, L, nn, nff, ne, qkv_persistent, 1, 1, nextn_sharded, head, head_norm,
         head_rows, position, nh, hd, kvd, gqa, qd);
     if (!block_persistent && m->pool_alive && m->n_threads > 1 && nh > 1) {
         int nt=m->n_threads,hoff=0;
@@ -10093,10 +10171,13 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     if (!block_persistent)
         for (int i = 0; i < qd; i++)
             m->xb2[i] *= 1.0f / (1.0f + expf(-m->ffn_buf1[i]));
-    if (profile) pt_attn = tf_time_ms();
+    if (profile) {
+        pt_attn = tf_time_ms();
+        if (block_persistent) pt_out = pt_ffn = pt_attn;
+    }
     if (!block_persistent)
         block_persistent = tf_nextn_ffn_persistent_pool(
-            m, L, nn, nff, ne, 0, 1, nextn_sharded, head, head_norm,
+            m, L, nn, nff, ne, 0, 0, 1, nextn_sharded, head, head_norm,
             head_rows, position, nh, hd, kvd, gqa, qd);
     if (!block_persistent) {
         tf_qmatvec_pool(m, m->xb, &L->attn_output, m->xb2, ne);
@@ -10108,7 +10189,7 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     }
     if (!block_persistent &&
         !tf_nextn_ffn_persistent_pool(m, L, nn, nff, ne, 0, 0,
-                                      nextn_sharded, NULL, NULL, 0,
+                                      0, nextn_sharded, NULL, NULL, 0,
                                       position, nh, hd, kvd, gqa, qd)) {
         tf_qmatvec_fused2_pool(m, m->ffn_buf1, &L->ffn_gate,
                                m->ffn_buf2, &L->ffn_up, m->xb, nff);

@@ -62,6 +62,9 @@ if [ "$MODE" = mtp-sustained ]; then
     export TF_NEXTN_BLOCK_PERSIST=${TF_NEXTN_BLOCK_PERSIST:-1}
     export TF_NEXTN_FULL_PERSIST=${TF_NEXTN_FULL_PERSIST:-1}
     export TF_NEXTN_ATTN_BLOCK_PERSIST=${TF_NEXTN_ATTN_BLOCK_PERSIST:-1}
+    # Keep the same workers alive through QKV and distribute exact Q/K norm +
+    # RoPE by head, avoiding the formerly serial preparation between pools.
+    export TF_NEXTN_QKV_PERSIST=${TF_NEXTN_QKV_PERSIST:-1}
     export TF_BF16PV_PREFETCH_NEXTN=${TF_BF16PV_PREFETCH_NEXTN:-8}
 fi
 export NUMA_DISTRIBUTE=${NUMA_DISTRIBUTE:-1} NUMA_N_CMGS=${NUMA_N_CMGS:-4}
