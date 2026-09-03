@@ -206,13 +206,33 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             common = 0;
         }
         if (n_tokens > max_seq_len) n_tokens = max_seq_len;
+        int batch_size = 128;
+        const char *batch_env = getenv("LLM_BMAX");
+        if (batch_env) batch_size = atoi(batch_env);
+        if (batch_size < 1) batch_size = 1;
+        int prompt_added = n_tokens - common;
+        int batches = prompt_added > 0 ? (prompt_added + batch_size - 1) / batch_size : 0;
         double t_prefill0 = get_time_ms();
         float *logits = NULL;
-        if (n_tokens > common)
-            logits = hip_llm_forward_batch_logits(gpu, tokens + common, n_tokens - common, common);
+        for (int off = 0; off < prompt_added; off += batch_size) {
+            int cc = prompt_added - off;
+            if (cc > batch_size) cc = batch_size;
+            logits = hip_llm_forward_batch_logits(gpu, tokens + common + off, cc,
+                                                   common + off);
+            double batch_now = get_time_ms();
+            double batch_ms = batch_now - t_prefill0;
+            fprintf(stderr,
+                    "llm_server: prefill batch=%d/%d tokens=%d..%d count=%d "
+                    "elapsed=%.2f ms (%.2f tok/s)\n",
+                    off / batch_size + 1, batches, common + off,
+                    common + off + cc - 1, cc, batch_ms,
+                    batch_ms > 0.0 ? 1000.0 * (off + cc) / batch_ms : 0.0);
+            fflush(stderr);
+            if (!logits) break;
+        }
         double t_prefill1 = get_time_ms();
-        if (!logits && n_tokens == common) {
-            free(tokens); puts("ERR empty continuation"); fflush(stdout); continue;
+        if (!logits && prompt_added > 0) {
+            free(tokens); puts("ERR prefill"); fflush(stdout); continue;
         }
         unsigned char *seen = (unsigned char *)calloc((size_t)n_vocab, 1);
         for (int i = 0; i < n_tokens; i++) {
@@ -249,14 +269,16 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             generated++;
             if (next == eos || next == eot) { finish_eos = 1; break; }
             logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
+            double token_now = get_time_ms();
+            double token_ms = token_now - t_decode0;
+            fprintf(stderr,
+                    "llm_server: decode token=%d id=%d elapsed=%.2f ms "
+                    "(%.2f tok/s)\n",
+                    generated, next, token_ms,
+                    token_ms > 0.0 ? 1000.0 * generated / token_ms : 0.0);
+            fflush(stderr);
         }
         double t_decode1 = get_time_ms();
-        int prompt_added = n_tokens - common;
-        int batch_size = 128;
-        const char *batch_env = getenv("LLM_BMAX");
-        if (batch_env) batch_size = atoi(batch_env);
-        if (batch_size < 1) batch_size = 1;
-        int batches = prompt_added > 0 ? (prompt_added + batch_size - 1) / batch_size : 0;
         double prefill_ms = t_prefill1 - t_prefill0;
         double decode_ms = t_decode1 - t_decode0;
         fprintf(stderr,
