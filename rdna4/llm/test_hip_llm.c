@@ -242,6 +242,7 @@ int main(int argc, char **argv) {
     int compare_paths = 0;    /* --compare-paths: report rel-L2 between batched and per-token logits */
     int moe_cache_mb = 0;
     int moe_cpu_only = 0;
+    int max_layers = 0;
     int verify_quant_kernels = 0; /* --verify-quant-kernels: A/B HIP vs CPU per quant type, then exit */
     const char *bench_qmv_type = NULL; /* --bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS] */
     int bench_qmv_rows = 0, bench_qmv_cols = 0, bench_qmv_iters = 0, bench_qmv_repeats = 1;
@@ -309,6 +310,8 @@ int main(int argc, char **argv) {
             moe_cache_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--moe-cpu") == 0) {
             moe_cpu_only = 1;
+        } else if (strcmp(argv[i], "--max-layers") == 0 && i + 1 < argc) {
+            max_layers = atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         } else {
@@ -424,6 +427,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (getenv("LLM_DEBUG_LAYERS")) hip_llm_set_debug(gpu, 1);
+    if (max_layers > 0) hip_llm_set_max_layers(gpu, max_layers);
 
     /* Load weights to GPU */
     fprintf(stderr, "\n=== Loading weights to GPU ===\n");

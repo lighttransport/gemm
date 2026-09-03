@@ -133,6 +133,28 @@ static const char *hip_kernel_source =
 "__global__ void hc_repeat_f32(float *dst, const float *src, int n_embd, int n_stream) {\n"
 "    int j=blockIdx.x*blockDim.x+threadIdx.x; int n=n_embd*n_stream; if(j<n)dst[j]=src[j%n_embd];\n"
 "}\n"
+"__global__ void hc_norm_batch_f32(float *dst, const float *x, const float *w,\n"
+"    int n_embd, int n_stream, int M, float eps) {\n"
+"    int g=blockIdx.x; if(g>=M*n_stream)return; int s=g%n_stream,tid=threadIdx.x;\n"
+"    extern __shared__ float red[]; size_t off=(size_t)g*n_embd; float sum=0.0f;\n"
+"    for(int i=tid;i<n_embd;i+=blockDim.x){float v=x[off+i];sum+=v*v;} red[tid]=sum;__syncthreads();\n"
+"    for(int k=blockDim.x/2;k;k>>=1){if(tid<k)red[tid]+=red[tid+k];__syncthreads();}\n"
+"    float z=rsqrtf(red[0]/(float)n_embd+eps);\n"
+"    for(int i=tid;i<n_embd;i+=blockDim.x)dst[off+i]=x[off+i]*z*w[(size_t)s*n_embd+i];\n"
+"}\n"
+"__global__ void hc_mix_batch_f32(float *mixed,const float *xn,const float *gate,\n"
+"    int n_embd,int n_stream,int M){int j=blockIdx.x*blockDim.x+threadIdx.x;\n"
+"    int n=M*n_embd;if(j>=n)return;int m=j/n_embd,i=j-m*n_embd;float sum=0.0f;\n"
+"    size_t base=(size_t)m*n_stream*n_embd;for(int s=0;s<n_stream;s++){size_t k=base+(size_t)s*n_embd+i;\n"
+"    sum+=xn[k]/(1.0f+expf(-gate[k]));}mixed[j]=sum/(float)n_stream;}\n"
+"__global__ void hc_combine_batch_f32(float *hc,const float *block,const float *inject,\n"
+"    int n_embd,int n_stream,int M){int j=blockIdx.x*blockDim.x+threadIdx.x;\n"
+"    int n=M*n_stream*n_embd;if(j>=n)return;int g=j/n_embd,s=g%n_stream,m=g/n_stream;\n"
+"    float z=2.0f/(1.0f+expf(-inject[(size_t)m*n_stream+s]/(float)n_stream));\n"
+"    hc[j]+=block[(size_t)m*n_embd+(j%n_embd)]*z;}\n"
+"__global__ void hc_repeat_batch_f32(float *dst,const float *src,int n_embd,int n_stream,int M){\n"
+"    int j=blockIdx.x*blockDim.x+threadIdx.x,n=M*n_stream*n_embd;if(j>=n)return;\n"
+"    int g=j/n_embd,m=g/n_stream;dst[j]=src[(size_t)m*n_embd+(j%n_embd)];}\n"
 "\n"
 "/* ---- 3. matvec_f16_f32: F16 matrix x F32 vector -> F32 ---- */\n"
 "/* Each block computes one output row. 256 threads stride over K cols. */\n"
@@ -7283,6 +7305,10 @@ struct hip_llm_runner {
     hipFunction_t fn_hc_mix_f32;
     hipFunction_t fn_hc_combine_f32;
     hipFunction_t fn_hc_repeat_f32;
+    hipFunction_t fn_hc_norm_batch_f32;
+    hipFunction_t fn_hc_mix_batch_f32;
+    hipFunction_t fn_hc_combine_batch_f32;
+    hipFunction_t fn_hc_repeat_batch_f32;
     hipFunction_t fn_rmsnorm_batch_f32;
     hipFunction_t fn_matvec_f16_f32;
     hipFunction_t fn_qknorm_f32;
@@ -7525,6 +7551,14 @@ struct hip_llm_runner {
     void *d_hc_gate;
     void *d_hc_low;
     void *d_hc_inject;
+    void *d_hc_batch;
+    void *d_hc_norm_batch;
+    void *d_hc_norm_batch_bf16;
+    void *d_hc_gate_batch;
+    void *d_hc_gate_batch_bf16;
+    void *d_hc_low_batch;
+    void *d_hc_low_batch_bf16;
+    void *d_hc_inject_batch;
     const void *per_layer_token_embd_host;
     int per_layer_token_embd_type;
     int64_t per_layer_token_rows;
@@ -7768,6 +7802,10 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(hc_mix_f32);
     GET_FUNC(hc_combine_f32);
     GET_FUNC(hc_repeat_f32);
+    GET_FUNC(hc_norm_batch_f32);
+    GET_FUNC(hc_mix_batch_f32);
+    GET_FUNC(hc_combine_batch_f32);
+    GET_FUNC(hc_repeat_batch_f32);
     GET_FUNC(rmsnorm_batch_f32);
     GET_FUNC(matvec_f16_f32);
     GET_FUNC(qknorm_f32);
