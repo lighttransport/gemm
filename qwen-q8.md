@@ -2811,6 +2811,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_MAXGEN=256 \
 TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
   TP_MTP_SHADOW_THREADS=48 \
   TF_NEXTN_FFN_PERSIST=1 \
+  TF_NEXTN_BLOCK_PERSIST=1 \
   TP_AR_DETERMINISTIC=1 TP_AR_A2A_TREE=1 TP_AR_FUSED_ADD=1 \
   TF_BF16PV_MTP5_FUSED=1 \
   bash run_qwen38_bf16_tp4.sh mtp-sustained
@@ -2827,6 +2828,24 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | decode prefetch K4352=12 K5120=6 K6144=8 | no | short stream yes | 31.93 ms/tok vs 31.45 control | n/a | n/a | 540 / 537 | reject values; retain global 6 |
 | 2026-09-03 | replicated NextN + shadow48 | no | 128 yes | 29.77 vs 26.73 | 90.37 | 68.86 | 528--658 | +11.4%; promote launcher default, clean gate pending |
 | 2026-09-03 | persistent NextN FFN | no | 128/256 yes | 36.65 short; 27.63 sustained | 83.37 / 98.85 | 45.96 / 69.62 | 647--701 / 471--677 | promote; 256 draft -9.5% at lower rank-0 BW |
+| 2026-09-03 | persistent NextN output+FFN block | no | 128/256 yes | 40.90 short; 30.14 sustained | 81.96 / degraded allocation | 33.89 / degraded allocation | 697--752 / 522--730 | promote; short draft -26.3% vs FFN-only, long run rank-0 limited |
+
+The promoted NextN block dispatch extends the persistent proposer workers
+backward across attention output, its optional all-reduce, residual add, and
+FFN norm.  The exact 128-token run produced the canonical
+`6b136ca08910eb2b47a820d1be2efc5eed1a38c7bf8f8a43de009c6b29f274c2`
+hash at **40.90 tok/s**, with 81.96 ms verification and 33.89 ms drafting per
+round.  All ranks were balanced at 697--752 GB/s.  This reduced draft time by
+26.3% relative to the nearby persistent-FFN result (45.96 ms), although the
+runs were not on an acceptance-quality clean allocation.
+
+The 256-token validation produced the canonical
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`
+hash.  It reached 30.14 tok/s while rank 0 fell to 522 GB/s and the other ranks
+held 687--730 GB/s.  The ranks nevertheless finished within 0.11%, identifying
+the loss as rank-0 compute bandwidth/interference rather than synchronization
+skew.  Clean-node acceptance still requires three exact 256-token runs and the
+60 tok/s median/minimum gate above.
 
 An additional SSM scheduling probe normalized Q/K directly into each expanded
 head, replacing the normalize/expand pair with one worker phase and removing

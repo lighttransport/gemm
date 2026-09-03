@@ -9740,6 +9740,7 @@ typedef struct {
     transformer_model *m;
     transformer_layer *layer;
     int tid, nt, nff, ne;
+    int include_output, nextn_sharded;
     int barrier_sense;
 } tf_nextn_ffn_task;
 
@@ -9779,6 +9780,19 @@ static void *tf_nextn_ffn_worker(void *arg) {
     transformer_model *m = t->m;
     transformer_layer *L = t->layer;
     tf_barrier_tid = t->tid;
+    if (t->include_output) {
+        tf_thread_matvec(m->xb, &L->attn_output, m->xb2,
+                         t->ne, t->tid, t->nt);
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+        if (t->tid == 0) {
+            if (t->nextn_sharded && m->tp_attn_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, t->ne, m->tp_allreduce_ctx);
+            tf_vadd(m->x, m->xb, t->ne);
+            tf_rmsnorm(m->xb, m->x, &L->ffn_norm, t->ne,
+                       m->rms_norm_eps, m->matvec_tmp);
+        }
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+    }
     int r0 = t->nff * t->tid / t->nt;
     int r1 = t->nff * (t->tid + 1) / t->nt;
     tf_matvec_qtensor_rows(m->ffn_buf1, &L->ffn_gate, m->xb, r0, r1);
@@ -9791,17 +9805,24 @@ static void *tf_nextn_ffn_worker(void *arg) {
     return NULL;
 }
 
-/* Keep workers awake across gate/up, SiLU, and down.  This replaces two pool
- * broadcasts plus a nested OpenMP activation region with one dispatch and one
- * dependency barrier; row ownership and all arithmetic kernels are unchanged. */
+/* Keep workers awake across gate/up, SiLU, and down.  In block mode, start at
+ * attention-output and have worker zero perform the intervening all-reduce,
+ * residual, and norm while its peers wait at the dependency barrier.  This
+ * removes pool broadcasts and the nested OpenMP activation region; row
+ * ownership and all arithmetic kernels are unchanged. */
 static int tf_nextn_ffn_persistent_pool(transformer_model *m,
                                         transformer_layer *L,
-                                        int nff, int ne) {
-    static int enabled = -1;
-    if (enabled < 0) {
+                                        int nff, int ne,
+                                        int include_output,
+                                        int nextn_sharded) {
+    static int ffn_enabled = -1, block_enabled = -1;
+    if (ffn_enabled < 0) {
         const char *e = getenv("TF_NEXTN_FFN_PERSIST");
-        enabled = e && atoi(e) != 0;
+        ffn_enabled = e && atoi(e) != 0;
+        e = getenv("TF_NEXTN_BLOCK_PERSIST");
+        block_enabled = e && atoi(e) != 0;
     }
+    int enabled = include_output ? block_enabled : ffn_enabled;
     if (!enabled || !m->pool_alive || m->n_threads <= 1 ||
         L->ffn_gate.i8 || L->ffn_up.i8 || L->ffn_down.i8)
         return 0;
@@ -9815,7 +9836,8 @@ static int tf_nextn_ffn_persistent_pool(transformer_model *m,
     tf_nextn_ffn_task *tasks = (tf_nextn_ffn_task *)alloca(
         (size_t)nt * sizeof(*tasks));
     for (int tid = 0; tid < nt; tid++)
-        tasks[tid] = (tf_nextn_ffn_task){m, L, tid, nt, nff, ne, 0};
+        tasks[tid] = (tf_nextn_ffn_task){m, L, tid, nt, nff, ne,
+                                         include_output, nextn_sharded, 0};
     tf_pool_dispatch(m, tf_nextn_ffn_worker, tasks, sizeof(*tasks));
     return 1;
 }
@@ -9891,15 +9913,20 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     for (int i = 0; i < qd; i++)
         m->xb2[i] *= 1.0f / (1.0f + expf(-m->ffn_buf1[i]));
     if (profile) pt_attn = tf_time_ms();
-    tf_qmatvec_pool(m, m->xb, &L->attn_output, m->xb2, ne);
     int nextn_sharded = !getenv("TP_STAGE_DIR") ||
         (getenv("TP_NEXTN_SHARD") && atoi(getenv("TP_NEXTN_SHARD")));
-    if (nextn_sharded && m->tp_attn_sharded && m->tp_allreduce_fn)
-        m->tp_allreduce_fn(m->xb, ne, m->tp_allreduce_ctx);
-    if (profile) pt_out = tf_time_ms();
-    tf_vadd(m->x, m->xb, ne);
-    tf_rmsnorm(m->xb, m->x, &L->ffn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
-    if (!tf_nextn_ffn_persistent_pool(m, L, nff, ne)) {
+    int block_persistent = tf_nextn_ffn_persistent_pool(
+        m, L, nff, ne, 1, nextn_sharded);
+    if (!block_persistent) {
+        tf_qmatvec_pool(m, m->xb, &L->attn_output, m->xb2, ne);
+        if (nextn_sharded && m->tp_attn_sharded && m->tp_allreduce_fn)
+            m->tp_allreduce_fn(m->xb, ne, m->tp_allreduce_ctx);
+        if (profile) pt_out = tf_time_ms();
+        tf_vadd(m->x, m->xb, ne);
+        tf_rmsnorm(m->xb, m->x, &L->ffn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
+    }
+    if (!block_persistent &&
+        !tf_nextn_ffn_persistent_pool(m, L, nff, ne, 0, nextn_sharded)) {
         tf_qmatvec_fused2_pool(m, m->ffn_buf1, &L->ffn_gate,
                                m->ffn_buf2, &L->ffn_up, m->xb, nff);
         tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, nff);

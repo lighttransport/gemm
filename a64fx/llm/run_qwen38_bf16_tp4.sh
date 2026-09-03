@@ -55,10 +55,11 @@ export TP_MTP_OMP_PARK=${TP_MTP_OMP_PARK:-1}
 # improved the adjacent exact K=5 run by 11%.
 if [ "$MODE" = mtp-sustained ]; then
     export TP_MTP_SHADOW_THREADS=${TP_MTP_SHADOW_THREADS:-48}
-    # Keep the shadow workers active across gate/up, SiLU, and down.  This
-    # removes one pool wake and the nested OpenMP activation region per draft
-    # step while preserving the exact BF16 row kernels.
+    # Keep the shadow workers active from attention output through gate/up,
+    # SiLU, and down.  This removes two pool wakes and the nested OpenMP
+    # activation region per draft step while preserving the exact BF16 rows.
     export TF_NEXTN_FFN_PERSIST=${TF_NEXTN_FFN_PERSIST:-1}
+    export TF_NEXTN_BLOCK_PERSIST=${TF_NEXTN_BLOCK_PERSIST:-1}
 fi
 export NUMA_DISTRIBUTE=${NUMA_DISTRIBUTE:-1} NUMA_N_CMGS=${NUMA_N_CMGS:-4}
 export TP_COMM_CMG_STRICT=${TP_COMM_CMG_STRICT:-1}
