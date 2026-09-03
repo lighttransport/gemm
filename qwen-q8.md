@@ -2846,6 +2846,8 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | exact-slot contiguous uTofu Put, MTP | near | 128 yes | 44.01 vs 46.36 | 79.84 vs 79.12 | 27.81 vs 23.07 | 785--825 vs 782--835 | reject 25600 slot; retain 32768 for MTP |
 | 2026-09-03 | late TCQ polling after peer arrival | no | 128 twice yes | 30.65 / 30.93 vs 31.04 reference | n/a | n/a | 527--554 / 536--544 | reject and remove; collective time neutral |
 | 2026-09-03 | strong-order trailer-only TCQ notice | no | 128 yes | 26.89 vs 26.99 control | n/a | n/a | 536--552 peers | reject and remove; comm 10.49--11.26 ms/token, no polling win |
+| 2026-09-04 | MRQ-completed one-Put A2A, non-MTP | no | 128 twice + 256 yes | 30.07 / 29.83 / 30.29 vs 29.37 control | n/a | n/a | 545--563 peers | promote for non-MTP; remote completion replaces unsafe memory trailer |
+| 2026-09-04 | MRQ-completed one-Put A2A, MTP | near | 128 yes | 47.00 vs 46.83 control | 77.32 vs 77.45 | 23.49 vs 23.72 | 785--837 | neutral; retain two-Put MTP default pending sustained A/B |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2989,6 +2991,28 @@ but reached 26.89 tok/s versus the comparable ordinary path at 26.99 tok/s;
 peer communication was 10.49--11.26 ms/token rather than 10.09--10.92. The
 branch was removed: TCQ polling is not the dominant cost, and production keeps
 an explicit completion notice for every Put.
+
+The safe one-Put replacement uses uTofu remote-completion notices rather than
+inferring completion from bytes inside the payload Put. Each peer receives one
+payload with `UTOFU_ONESIDED_FLAG_REMOTE_MRQ_NOTICE`; the fold begins only after
+all three matching `RMT_PUT` notices and all three local TCQ completions arrive.
+This platform preserves only one byte of `edata`, so notices are matched by the
+reported destination end address to the containing double-buffered
+generation/sender slot. A small communicator mailbox preserves notices from a
+faster peer if generic MRQ cleanup encounters the next collective early.
+
+Non-MTP produced the same 128-token hash in repeated runs at 30.07, 29.83, and
+30.29 tok/s versus an adjacent 29.37 tok/s two-Put control. Peer collective
+wait fell by about 0.5 ms/token. A 256-token run completed 33,024 reductions
+without timeout or overflow, reproduced
+`382c37645708049d46069500a771f46c70769ba59311f3e37b313e14168d2624`,
+and reached 30.11 tok/s. The launcher therefore enables
+`TP_AR_A2A_MRQ_ONEPUT=1` for ordinary decode.
+
+The exact K=5 MTP A/B was neutral: one-Put reached 47.00 tok/s with 77.32 ms
+verification and 23.49 ms drafting, while the adjacent two-Put control reached
+46.83 tok/s, 77.45 ms, and 23.72 ms. MTP keeps the two-Put default until a
+256-token repeated comparison establishes a sustained gain.
 
 The corresponding MTP slot experiment was not promoted. A 25,600-float slot
 made the K=5 batched residual contiguous, but verifier collective time remained

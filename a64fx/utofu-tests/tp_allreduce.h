@@ -83,6 +83,10 @@ typedef struct {
     size_t          ack_base;                /* byte offset of ack region (nprocs 8B slots + 1 scratch) */
     unsigned long   drop_n, put_ctr;         /* TP_AR_DROP=N: drop 1-in-N payload Puts (loss injection) */
     int             send_inflight;           /* fast contiguous Put awaiting local completion */
+    /* Tagged notice mailbox for the optional one-Put A2A protocol. Generic
+     * MRQ cleanup can run while a faster peer starts the next collective, so
+     * preserve those future remote completions instead of discarding them. */
+    unsigned char   mrq_a2a_seen[2 * TP_AR_MAXN];
     /* one outstanding send awaiting confirmation. send() is NON-blocking (Put + stash here); it is
      * retransmitted from BOTH the recv-wait spin AND tp_ar_confirm() until the peer acks -- retransmit
      * during recv is essential: if both directions of a doubling pair drop, both ranks block in recv,
@@ -172,11 +176,40 @@ static inline size_t tp_ar_trailer_off(const tp_comm *c) { return (size_t)c->max
  * across a long decode (~10^4+ all-reduces) the MRQ OVERFLOWS, faults the TNI,
  * and subsequent Puts silently stop landing → the receiver spins on its trailer
  * forever (seen as `tp_ar wait timeout want=N+1 got=N` after ~86 tokens). We
- * don't use the notices (completion is the in-memory seq trailer), so drain-all
- * and discard. Cheap: NOT_FOUND returns immediately when the MRQ is empty. */
+ * Most paths don't use notices (completion is the in-memory seq trailer), but
+ * the optional one-Put A2A path does. Preserve a tagged future notice by its
+ * generation/sender slot; discard ordinary notices. */
+static inline int tp_ar_a2a_notice_slot(const tp_comm *c,
+                                        const struct utofu_mrq_notice *nt) {
+    if (nt->notice_type != UTOFU_MRQ_TYPE_RMT_PUT || nt->edata != 0xa5u ||
+        !c->a2a || nt->rmt_stadd < c->base + c->a2a_base) return -1;
+    size_t off = (size_t)(nt->rmt_stadd - (c->base + c->a2a_base));
+    /* RMT_PUT reports the end of the transferred range, so identify the
+     * containing fixed-size A2A slot rather than requiring its start. */
+    if (c->a2a_slot == 0 || off % c->a2a_slot >= c->a2a_slot - 8) return -1;
+    size_t slot = off / c->a2a_slot;
+    return slot < (size_t)(2 * c->nprocs) ? (int)slot : -1;
+}
+static inline void tp_ar_stash_mrq(tp_comm *c,
+                                    const struct utofu_mrq_notice *nt) {
+    int slot = tp_ar_a2a_notice_slot(c, nt);
+    if (slot >= 0) c->mrq_a2a_seen[slot] = 1;
+}
+static inline int tp_ar_take_a2a_mrq(tp_comm *c, int gen, int me) {
+    int n = 0;
+    for (int r = 0; r < c->nprocs; r++) if (r != me) {
+        int slot = gen * c->nprocs + r;
+        if (c->mrq_a2a_seen[slot]) {
+            c->mrq_a2a_seen[slot] = 0;
+            n++;
+        }
+    }
+    return n;
+}
 static inline void tp_ar_drain_mrq(tp_comm *c) {
     struct utofu_mrq_notice nt;
-    while (utofu_poll_mrq(c->vcq, 0, &nt) == UTOFU_SUCCESS) { /* discard */ }
+    while (utofu_poll_mrq(c->vcq, 0, &nt) == UTOFU_SUCCESS)
+        tp_ar_stash_mrq(c, &nt);
 }
 
 static void tp_ar_send_puts(tp_comm *c, int peer, int sid, size_t pbytes, int contiguous);  /* fwd decl */
@@ -411,6 +444,21 @@ static int tp_ar_put_nb(tp_comm *c, int peer, utofu_stadd_t src, utofu_stadd_t d
     if(rc!=UTOFU_SUCCESS)tp_ar_fail(c,EIO,"utofu_put(nb) rc=%d",rc);
     return 1;
 }
+static int tp_ar_put_nb_remote(tp_comm *c, int peer, utofu_stadd_t src,
+                               utofu_stadd_t dst, size_t len, uint64_t edata) {
+    const unsigned long flags = UTOFU_ONESIDED_FLAG_TCQ_NOTICE |
+                                UTOFU_ONESIDED_FLAG_REMOTE_MRQ_NOTICE;
+    int rc; void *cb;
+    for (;;) {
+        rc = utofu_put(c->vcq, c->peer_vcq[peer], src, dst, len,
+                       edata, flags, NULL);
+        if (rc != UTOFU_ERR_BUSY) break;
+        utofu_poll_tcq(c->vcq, 0, &cb);
+    }
+    if (rc != UTOFU_SUCCESS)
+        tp_ar_fail(c, EIO, "utofu_put(remote) rc=%d", rc);
+    return 1;
+}
 /* TP_AR_A2A sum: Put my payload to EVERY peer's a2a slot[gen][my_rank] (pipelined),
  * wait all N-1 trailers ONCE, then fold all N payloads in RANK ORDER. One detection
  * latency instead of ~ceil(log2 N)+2 sequential exchanges; every rank folds the same
@@ -428,27 +476,64 @@ static void tp_ar_sum_a2a_add(tp_comm *c, float *buf, float *residual,
     *(volatile uint64_t *)(sb + tr) = tok;                  /* fits: a2a_max <= max_count */
     int gen = (int)(tok & 1);
     int inflight = 0; void *cb; int rc;
+    static int mrq_oneput = -1;
+    if (mrq_oneput < 0) {
+        const char *e = getenv("TP_AR_A2A_MRQ_ONEPUT");
+        mrq_oneput = e && atoi(e) != 0;
+    }
     for (int d = 1; d < N; d++) {
         int peer = (me + d) % N;
         utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
         utofu_stadd_t dst = c->peer_base[peer] + c->a2a_base + ((size_t)gen * N + me) * c->a2a_slot;
-        inflight += tp_ar_put_nb(c, peer, src, dst, pbytes);           /* payload */
-        inflight += tp_ar_put_nb(c, peer, src + tr, dst + tr, 8);      /* then trailer (in-order per pair) */
+        if (mrq_oneput)
+            inflight += tp_ar_put_nb_remote(c, peer, src, dst, pbytes, 0xa5u);
+        else {
+            inflight += tp_ar_put_nb(c, peer, src, dst, pbytes);       /* payload */
+            inflight += tp_ar_put_nb(c, peer, src + tr, dst + tr, 8);  /* trailer */
+        }
     }
-    while (inflight > 0) {                                   /* reap local completions */
-        rc = utofu_poll_tcq(c->vcq, 0, &cb);
-        if (rc == UTOFU_SUCCESS) inflight--;
-        else if(rc!=UTOFU_ERR_NOT_FOUND)tp_ar_fail(c,EIO,"a2a poll_tcq rc=%d",rc);
+    int remote = mrq_oneput ? N - 1 - tp_ar_take_a2a_mrq(c, gen, me) : 0;
+    if (remote < 0) remote = 0;
+    double notice_t0 = tp_ar_now();
+    unsigned long notice_spins = 0;
+    while (inflight > 0 || remote > 0) {
+        if (inflight > 0) {
+            rc = utofu_poll_tcq(c->vcq, 0, &cb);
+            if (rc == UTOFU_SUCCESS) inflight--;
+            else if(rc!=UTOFU_ERR_NOT_FOUND)
+                tp_ar_fail(c,EIO,"a2a poll_tcq rc=%d",rc);
+        }
+        if (remote > 0) {
+            struct utofu_mrq_notice nt;
+            rc = utofu_poll_mrq(c->vcq, 0, &nt);
+            if (rc == UTOFU_SUCCESS) {
+                int slot = tp_ar_a2a_notice_slot(c, &nt);
+                int slot_gen = slot >= 0 ? slot / N : -1;
+                int sender = slot >= 0 ? slot % N : -1;
+                if (slot_gen == gen && sender != me) remote--;
+                else tp_ar_stash_mrq(c, &nt);
+            } else if (rc != UTOFU_ERR_NOT_FOUND) {
+                tp_ar_fail(c,EIO,"a2a poll_mrq rc=%d",rc);
+            }
+        }
+        if (((++notice_spins & 0xffffful) == 0) &&
+            tp_ar_now() - notice_t0 > c->timeout)
+            tp_ar_fail(c,ETIMEDOUT,"rank %d a2a completion timeout tok=%lu remote=%d local=%d",
+                       me,(unsigned long)tok,remote,inflight);
     }
-    tp_ar_drain_mrq(c);
+    /* Do not drain after a notice-driven call: a faster peer may already have
+     * published the next sequence, and its notice must remain queued. */
+    if (!mrq_oneput) tp_ar_drain_mrq(c);
     const float *fold_src[TP_AR_MAXN];
     for (int r = 0; r < N; r++) {
         const float *pr;
         if (r == me) pr = (const float *)sb;
         else {
             char *rb = c->region + c->a2a_base + ((size_t)gen * N + r) * c->a2a_slot;
-            volatile uint64_t *trl = (volatile uint64_t *)(rb + tr);
-            tp_ar_wait(c, trl, tok, r, "a2a");
+            if (!mrq_oneput) {
+                volatile uint64_t *trl = (volatile uint64_t *)(rb + tr);
+                tp_ar_wait(c, trl, tok, r, "a2a");
+            }
             pr = (const float *)rb;
         }
         fold_src[r] = pr;
