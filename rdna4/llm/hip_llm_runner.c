@@ -7364,6 +7364,7 @@ typedef struct {
     const void *moe_gate_exps_host;
     const void *moe_up_exps_host;
     const void *moe_down_exps_host;
+    int moe_gate_host_registered, moe_up_host_registered, moe_down_host_registered;
     void *moe_cache_gate;
     void *moe_cache_up;
     void *moe_cache_down;
@@ -9313,6 +9314,17 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                 cl->moe_down_exps_host = t.data;
                 cl->moe_exp_stride_d = dequant_row_size(t.type, t.n_cols) * (size_t)cl->moe_exp_rows_d;
             } else if (upload_3d_kquant_raw_bm(&cl->moe_down_exps_w, &t, &cl->moe_exp_stride_d, r->moe_iq2_bm) != 0) return -1;
+            const char *register_env=getenv("LLM_MOE_REGISTER_HOST");
+            if (r->is_qwen4exp && register_env && atoi(register_env)!=0) {
+                size_t gu_bytes=cl->moe_exp_stride_gu*(size_t)r->n_experts;
+                size_t dn_bytes=cl->moe_exp_stride_d*(size_t)r->n_experts;
+                cl->moe_gate_host_registered=hipHostRegister((void*)cl->moe_gate_exps_host,gu_bytes,0)==hipSuccess;
+                cl->moe_up_host_registered=hipHostRegister((void*)cl->moe_up_exps_host,gu_bytes,0)==hipSuccess;
+                cl->moe_down_host_registered=hipHostRegister((void*)cl->moe_down_exps_host,dn_bytes,0)==hipSuccess;
+                if(r->verbose>=1 && (!cl->moe_gate_host_registered||!cl->moe_up_host_registered||!cl->moe_down_host_registered))
+                    fprintf(stderr,"hip_llm: layer %d expert host registration partial (%d/%d/%d)\n",l,
+                            cl->moe_gate_host_registered,cl->moe_up_host_registered,cl->moe_down_host_registered);
+            }
             if (r->verbose >= 1 && r->is_qwen4exp && l == 0)
                 fprintf(stderr, "hip_llm: Qwen4 routed expert types: gate=%d up=%d down=%d\n",
                         cl->moe_gate_exps_type, cl->moe_up_exps_type,
@@ -13895,6 +13907,9 @@ void hip_llm_free(hip_llm_runner *r) {
             if (cl->moe_cache_gate) hipFree(cl->moe_cache_gate);
             if (cl->moe_cache_up)   hipFree(cl->moe_cache_up);
             if (cl->moe_cache_down) hipFree(cl->moe_cache_down);
+            if (cl->moe_gate_host_registered) hipHostUnregister((void*)cl->moe_gate_exps_host);
+            if (cl->moe_up_host_registered) hipHostUnregister((void*)cl->moe_up_exps_host);
+            if (cl->moe_down_host_registered) hipHostUnregister((void*)cl->moe_down_exps_host);
             free(cl->moe_cache_ids);
             if (cl->hc_attn_norm_w)   hipFree(cl->hc_attn_norm_w);
             if (cl->hc_attn_down_w)   hipFree(cl->hc_attn_down_w);
