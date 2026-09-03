@@ -11,7 +11,9 @@ cache_mb="${QWEN38_MOE_CACHE_MB:-4096}"
 context="${QWEN38_CONTEXT:-65536}"
 port="${QWEN38_API_PORT:-8080}"
 host="${QWEN38_API_HOST:-127.0.0.1}"
-max_output="${QWEN38_MAX_OUTPUT:-4096}"
+# The HTTP shim emits the first SSE event after generation completes. Keep the
+# interactive default bounded; raise QWEN38_MAX_OUTPUT for long code patches.
+max_output="${QWEN38_MAX_OUTPUT:-512}"
 cpu_lib="${LLM_MOE_CPU_LIB:-/mnt/nvme02/work/llama.cpp/build-codex-hetero-dev2/bin/libggml-cpu.so.0.22.0}"
 if [[ ! -r "${cpu_lib}" ]]; then
     cpu_lib=""
