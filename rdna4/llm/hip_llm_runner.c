@@ -678,6 +678,105 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Qwen4 cached-expert decode: fuse gate/up matvecs and SiLU product. */\n"
+"__global__ void qwen4_gateup_silu_q8(float *dst, const unsigned char *gate,\n"
+"        const unsigned char *up, const float *x, int rows, int cols) {\n"
+"    int row=blockIdx.x, tid=threadIdx.x; if(row>=rows)return;\n"
+"    int nb=cols/32, rb=nb*36; const unsigned char *gr=gate+(size_t)row*rb;\n"
+"    const unsigned char *ur=up+(size_t)row*rb; float sg=0.0f,su=0.0f;\n"
+"    for(int b=tid;b<nb;b+=blockDim.x){\n"
+"        const unsigned char *gb=gr+b*36,*ub=ur+b*36; const float *xb=x+b*32;\n"
+"        float ag=0.0f,au=0.0f; const signed char *gq=(const signed char *)(gb+4);\n"
+"        const signed char *uq=(const signed char *)(ub+4);\n"
+"        for(int k=0;k<32;k++){ag+=(float)gq[k]*xb[k];au+=(float)uq[k]*xb[k];}\n"
+"        sg+=ag*half_to_float(*(const half_raw *)gb);\n"
+"        su+=au*half_to_float(*(const half_raw *)ub);\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1){sg+=__shfl_down(sg,o);su+=__shfl_down(su,o);}\n"
+"    __shared__ float wg[8],wu[8]; int warp=tid/32,lane=tid%32;\n"
+"    if(lane==0){wg[warp]=sg;wu[warp]=su;} __syncthreads();\n"
+"    if(tid==0){float g=0.0f,u=0.0f;for(int w=0;w<(blockDim.x+31)/32;w++){g+=wg[w];u+=wu[w];}\n"
+"        dst[row]=(g/(1.0f+expf(-g)))*u;}\n"
+"}\n"
+"/* Fuse cached Q8 down projection with the weighted MoE accumulation. */\n"
+"__global__ void qwen4_down_accum_q8(float *acc, const unsigned char *down,\n"
+"        const float *x, float scale, int rows, int cols) {\n"
+"    int row=blockIdx.x,tid=threadIdx.x;if(row>=rows)return;int nb=cols/32,rb=nb*36;\n"
+"    const unsigned char *rp=down+(size_t)row*rb;float sum=0.0f;\n"
+"    for(int b=tid;b<nb;b+=blockDim.x){const unsigned char *bp=rp+b*36;\n"
+"        const signed char *q=(const signed char *)(bp+4);const float *xb=x+b*32;float s=0.0f;\n"
+"        for(int k=0;k<32;k++)s+=(float)q[k]*xb[k];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);__shared__ float ws[8];\n"
+"    int warp=tid/32,lane=tid%32;if(lane==0)ws[warp]=sum;__syncthreads();\n"
+"    if(tid==0){float v=0.0f;for(int w=0;w<(blockDim.x+31)/32;w++)v+=ws[w];acc[row]+=scale*v;}\n"
+"}\n"
+"/* All selected cached experts in one 2-D launch. slots[] indexes cache rows. */\n"
+"__global__ void qwen4_gateup_silu_q8_selected(float *dst,\n"
+"        const unsigned char *gate, const unsigned char *up, const int *slots,\n"
+"        const float *x, int K, int rows, int cols, long long gs, long long us) {\n"
+"    int row=blockIdx.x,sel=blockIdx.y,tid=threadIdx.x;if(row>=rows||sel>=K)return;\n"
+"    int nb=cols/32,rb=nb*36,slot=slots[sel];\n"
+"    const unsigned char *gr=gate+(long long)slot*gs+(size_t)row*rb;\n"
+"    const unsigned char *ur=up +(long long)slot*us+(size_t)row*rb;float sg=0.0f,su=0.0f;\n"
+"    for(int b=tid;b<nb;b+=blockDim.x){const unsigned char *gb=gr+b*36,*ub=ur+b*36;\n"
+"        const signed char *gq=(const signed char *)(gb+4),*uq=(const signed char *)(ub+4);\n"
+"        const float *xb=x+b*32;float ag=0.0f,au=0.0f;for(int k=0;k<32;k++){ag+=(float)gq[k]*xb[k];au+=(float)uq[k]*xb[k];}\n"
+"        sg+=ag*half_to_float(*(const half_raw *)gb);su+=au*half_to_float(*(const half_raw *)ub);}\n"
+"    for(int o=16;o>0;o>>=1){sg+=__shfl_down(sg,o);su+=__shfl_down(su,o);}\n"
+"    __shared__ float wg[8],wu[8];int warp=tid/32,lane=tid%32;if(lane==0){wg[warp]=sg;wu[warp]=su;}__syncthreads();\n"
+"    if(tid==0){float g=0.0f,u=0.0f;for(int w=0;w<(blockDim.x+31)/32;w++){g+=wg[w];u+=wu[w];}\n"
+"        dst[(size_t)sel*rows+row]=(g/(1.0f+expf(-g)))*u;}\n"
+"}\n"
+"__global__ void qwen4_down_accum_q8_selected(float *acc, const unsigned char *down,\n"
+"        const float *act, const float *weights, const int *slots, int K,\n"
+"        int rows, int cols, long long ds) {\n"
+"    int row=blockIdx.x,tid=threadIdx.x;if(row>=rows)return;float total=0.0f;int nb=cols/32,rb=nb*36;\n"
+"    for(int sel=0;sel<K;sel++){const unsigned char *rp=down+(long long)slots[sel]*ds+(size_t)row*rb;\n"
+"        const float *x=act+(size_t)sel*cols;float sum=0.0f;for(int b=tid;b<nb;b+=blockDim.x){\n"
+"            const unsigned char *bp=rp+b*36;const signed char *q=(const signed char *)(bp+4);\n"
+"            float s=0.0f;for(int k=0;k<32;k++)s+=(float)q[k]*x[b*32+k];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
+"        for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);__shared__ float ws[8];int warp=tid/32,lane=tid%32;\n"
+"        if(lane==0)ws[warp]=sum;__syncthreads();if(tid==0){float v=0.0f;for(int w=0;w<(blockDim.x+31)/32;w++)v+=ws[w];ws[0]=v*weights[sel];}\n"
+"        __syncthreads();total+=ws[0];__syncthreads();}\n"
+"    if(tid==0)acc[row]=total;\n"
+"}\n"
+"/* Actual Q4_K_XL expert formats: Q4_K gate/up, Q5_1 down. */\n"
+"__device__ __forceinline__ float qwen4_q4k_group(const unsigned char *bp,\n"
+"        const float *x, int c) {\n"
+"    float d=half_to_float(*(const half_raw *)bp),dm=half_to_float(*(const half_raw *)(bp+2));\n"
+"    const unsigned char *sc=bp+4;int is=2*c;unsigned char s0,m0,s1,m1;\n"
+"    if(is<4){s0=sc[is]&63;m0=sc[is+4]&63;}else{s0=(sc[is+4]&15)|((sc[is-4]>>6)<<4);m0=(sc[is+4]>>4)|((sc[is]>>6)<<4);}\n"
+"    if(is+1<4){s1=sc[is+1]&63;m1=sc[is+5]&63;}else{s1=(sc[is+5]&15)|((sc[is-3]>>6)<<4);m1=(sc[is+5]>>4)|((sc[is+1]>>6)<<4);}\n"
+"    const unsigned char *q=bp+16+c*32;float a=0.0f;for(int l=0;l<32;l++)\n"
+"        a+=(d*s0*(q[l]&15)-dm*m0)*x[l]+(d*s1*(q[l]>>4)-dm*m1)*x[l+32];return a;\n"
+"}\n"
+"__global__ void qwen4_gateup_silu_q4k_selected(float *dst,const unsigned char *gate,\n"
+"        const unsigned char *up,const int *slots,const float *x,int K,int rows,int cols,\n"
+"        long long gs,long long us){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp,sel=blockIdx.y;\n"
+"    if(row>=rows||sel>=K)return;int nb=cols/256,rb=nb*144,slot=slots[sel],G=nb*4;\n"
+"    const unsigned char *gr=gate+(long long)slot*gs+(size_t)row*rb;\n"
+"    const unsigned char *ur=up +(long long)slot*us+(size_t)row*rb;float g=0.0f,u=0.0f;\n"
+"    for(int z=lane;z<G;z+=32){int b=z>>2,c=z&3;const float *xp=x+b*256+c*64;\n"
+"        g+=qwen4_q4k_group(gr+b*144,xp,c);u+=qwen4_q4k_group(ur+b*144,xp,c);}\n"
+"    for(int o=16;o>0;o>>=1){g+=__shfl_down(g,o);u+=__shfl_down(u,o);}\n"
+"    if(lane==0)dst[(size_t)sel*rows+row]=(g/(1.0f+expf(-g)))*u;\n"
+"}\n"
+"__global__ void qwen4_down_accum_q5_1_selected(float *acc,const unsigned char *down,\n"
+"        const float *act,const float *weights,const int *slots,int K,int rows,int cols,long long ds){\n"
+"    int row=blockIdx.x,tid=threadIdx.x;if(row>=rows)return;int nb=cols/32,rb=nb*24;float total=0.0f;\n"
+"    for(int sel=0;sel<K;sel++){const unsigned char *rp=down+(long long)slots[sel]*ds+(size_t)row*rb;\n"
+"        const float *x=act+(size_t)sel*cols;float sum=0.0f;for(int b=tid;b<nb;b+=blockDim.x){\n"
+"            const unsigned char *bp=rp+b*24;float d=half_to_float(*(const half_raw *)bp),m=half_to_float(*(const half_raw *)(bp+2));\n"
+"            unsigned qh=(unsigned)bp[4]|((unsigned)bp[5]<<8)|((unsigned)bp[6]<<16)|((unsigned)bp[7]<<24);\n"
+"            const unsigned char *q=bp+8;float s=0.0f;for(int j=0;j<16;j++){int a=(q[j]&15)|(((qh>>j)&1)<<4);\n"
+"                int v=(q[j]>>4)|(((qh>>(j+16))&1)<<4);s+=(d*a+m)*x[b*32+j]+(d*v+m)*x[b*32+j+16];}sum+=s;}\n"
+"        for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);__shared__ float ws[8];int warp=tid/32,lane=tid%32;\n"
+"        if(lane==0)ws[warp]=sum;__syncthreads();if(tid==0){float v=0.0f;for(int w=0;w<8;w++)v+=ws[w];ws[0]=v*weights[sel];}\n"
+"        __syncthreads();total+=ws[0];__syncthreads();}\n"
+"    if(tid==0)acc[row]=total;\n"
+"}\n"
+"\n"
 "/* ---- 13. embed_q8_0: Padded Q8_0 embedding lookup -> F32 ---- */\n"
 "/* Block layout: 36 bytes = [uint16 d_half][2B pad][int8 qs[32]] */\n"
 "__global__ void embed_q8_0(float *dst, const unsigned char *embd_table,\n"
@@ -3170,8 +3269,8 @@ static const char *hip_kernel_source =
 "/* (ties broken by lowest index, matching the host '>' comparison).             */\n"
 "__global__ void moe_topk_softmax_gpu(const float *logits, int n, int k,\n"
 "                                       int *out_idx, float *out_w) {\n"
-"    __shared__ float sval[256];\n"
-"    __shared__ int   sidx[256];\n"
+"    __shared__ float sval[512];\n"
+"    __shared__ int   sidx[512];\n"
 "    __shared__ int   chosen[64];\n"
 "    int tid = threadIdx.x;\n"
 "    float my = (tid < n) ? logits[tid] : -1e30f;\n"
@@ -3181,8 +3280,8 @@ static const char *hip_kernel_source =
 "        for (int j = 0; j < ki; j++) if (chosen[j] == tid) v = -1e30f;\n"
 "        sval[tid] = v; sidx[tid] = tid;\n"
 "        __syncthreads();\n"
-"        for (int s = 128; s > 0; s >>= 1) {\n"
-"            if (tid < s && tid + s < 256) {\n"
+"        for (int s = 256; s > 0; s >>= 1) {\n"
+"            if (tid < s && tid + s < n) {\n"
 "                /* '>' so ties keep the lower index (smaller of the two) */\n"
 "                if (sval[tid + s] > sval[tid]) { sval[tid] = sval[tid + s]; sidx[tid] = sidx[tid + s]; }\n"
 "                else if (sval[tid + s] == sval[tid] && sidx[tid + s] < sidx[tid]) { sidx[tid] = sidx[tid + s]; }\n"
@@ -7337,6 +7436,12 @@ struct hip_llm_runner {
     hipFunction_t fn_quantize_f32_act_to_int8;
     hipFunction_t fn_matvec_q8_0_dp4a;
     hipFunction_t fn_matvec_q8_0_f32;
+    hipFunction_t fn_qwen4_gateup_silu_q8;
+    hipFunction_t fn_qwen4_down_accum_q8;
+    hipFunction_t fn_qwen4_gateup_silu_q8_selected;
+    hipFunction_t fn_qwen4_down_accum_q8_selected;
+    hipFunction_t fn_qwen4_gateup_silu_q4k_selected;
+    hipFunction_t fn_qwen4_down_accum_q5_1_selected;
     hipFunction_t fn_embed_q8_0;
     hipFunction_t fn_embed_q4_0;
     hipFunction_t fn_matvec_q2_K_f32;
@@ -7591,6 +7696,8 @@ struct hip_llm_runner {
     void *d_moe_accum;
     float *h_router_logits;
     float *h_moe_input;
+    int h_router_logits_pinned;
+    int h_moe_input_pinned;
     float *h_moe_output;
     float *h_moe_gate;
     float *h_moe_up;
@@ -7838,6 +7945,12 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(quantize_f32_to_int8);
     GET_FUNC(quantize_f32_act_to_int8);
     GET_FUNC(matvec_q8_0_f32);
+    GET_FUNC(qwen4_gateup_silu_q8);
+    GET_FUNC(qwen4_down_accum_q8);
+    GET_FUNC(qwen4_gateup_silu_q8_selected);
+    GET_FUNC(qwen4_down_accum_q8_selected);
+    GET_FUNC(qwen4_gateup_silu_q4k_selected);
+    GET_FUNC(qwen4_down_accum_q5_1_selected);
     GET_FUNC(embed_q8_0);
     GET_FUNC(embed_q4_0);
     GET_FUNC(matvec_q2_K_f32);
@@ -9156,6 +9269,10 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                 cl->moe_down_exps_host = t.data;
                 cl->moe_exp_stride_d = dequant_row_size(t.type, t.n_cols) * (size_t)cl->moe_exp_rows_d;
             } else if (upload_3d_kquant_raw_bm(&cl->moe_down_exps_w, &t, &cl->moe_exp_stride_d, r->moe_iq2_bm) != 0) return -1;
+            if (r->verbose >= 1 && r->is_qwen4exp && l == 0)
+                fprintf(stderr, "hip_llm: Qwen4 routed expert types: gate=%d up=%d down=%d\n",
+                        cl->moe_gate_exps_type, cl->moe_up_exps_type,
+                        cl->moe_down_exps_type);
 
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
@@ -9311,10 +9428,22 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
     if (r->is_moe) {
         CHECK_HIP(hipMalloc(&r->d_router_logits, r->n_experts * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_moe_accum, r->n_embd * sizeof(float)));
-        r->h_router_logits = (float *)malloc(r->n_experts * sizeof(float));
+        /* Extra pinned space holds top-k indices/weights and cache slots.  These
+         * buffers are sources for asynchronous copies and therefore must outlive
+         * the forwarding function's stack frame. */
+        size_t router_host_floats = (size_t)r->n_experts + 192;
+        if (hipHostMalloc((void **)&r->h_router_logits,
+                          router_host_floats*sizeof(float), hipHostMallocDefault) == hipSuccess)
+            r->h_router_logits_pinned = 1;
+        else
+            r->h_router_logits = (float *)malloc(router_host_floats*sizeof(float));
         if (!r->h_router_logits) return -1;
         if (r->is_qwen4exp) {
-            r->h_moe_input = (float *)malloc((size_t)r->n_embd * sizeof(float));
+            if (hipHostMalloc((void **)&r->h_moe_input,
+                              (size_t)r->n_embd*sizeof(float), hipHostMallocDefault) == hipSuccess)
+                r->h_moe_input_pinned = 1;
+            else
+                r->h_moe_input = (float *)malloc((size_t)r->n_embd*sizeof(float));
             r->h_moe_output = (float *)malloc((size_t)r->n_embd * sizeof(float));
             size_t jobs = (size_t)r->n_experts_used;
             r->h_moe_gate = (float *)malloc(jobs * r->expert_ff * sizeof(float));
@@ -10067,6 +10196,87 @@ static inline void launch_matvec_q8_f32(hip_llm_runner *r, void *dst, void *mat,
     LAUNCH(r->fn_matvec_q8_0_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
+static inline void launch_qwen4_expert_q8(hip_llm_runner *r, void *acc,
+        void *gate, void *up, void *down, void *x, float weight,
+        int expert_ff, int n_embd) {
+    void *ga[] = { &r->d_gate, &gate, &up, &x, &expert_ff, &n_embd };
+    LAUNCH(r->fn_qwen4_gateup_silu_q8, expert_ff, 1, 1, 256, 1, 1, 0,
+           r->stream, ga);
+    void *da[] = { &acc, &down, &r->d_gate, &weight, &n_embd, &expert_ff };
+    LAUNCH(r->fn_qwen4_down_accum_q8, n_embd, 1, 1, 256, 1, 1, 0,
+           r->stream, da);
+}
+
+static inline void launch_qwen4_experts_q8_selected(hip_llm_runner *r,
+        hip_layer *cl, const int *slots, const float *weights, int K,
+        int expert_ff, int n_embd) {
+    hipMemcpyAsync(r->d_moe_idx, slots, (size_t)K*sizeof(int),
+                   hipMemcpyHostToDevice, r->stream);
+    hipMemcpyAsync(r->d_moe_w, weights, (size_t)K*sizeof(float),
+                   hipMemcpyHostToDevice, r->stream);
+    long long gs=(long long)cl->moe_cache_stride_gate;
+    long long us=(long long)cl->moe_cache_stride_up;
+    void *ga[]={&r->d_moe_act8,&cl->moe_cache_gate,&cl->moe_cache_up,
+                &r->d_moe_idx,&r->d_xb,&K,&expert_ff,&n_embd,&gs,&us};
+    LAUNCH(r->fn_qwen4_gateup_silu_q8_selected, expert_ff, K, 1,
+           256, 1, 1, 0, r->stream, ga);
+    long long ds=(long long)cl->moe_cache_stride_down;
+    void *da[]={&r->d_moe_accum,&cl->moe_cache_down,&r->d_moe_act8,
+                &r->d_moe_w,&r->d_moe_idx,&K,&n_embd,&expert_ff,&ds};
+    LAUNCH(r->fn_qwen4_down_accum_q8_selected, n_embd, 1, 1,
+           256, 1, 1, 0, r->stream, da);
+}
+
+static inline void launch_qwen4_experts_q4k_q51_selected(hip_llm_runner *r,
+        hip_layer *cl, const int *slots, const float *weights, int K,
+        int expert_ff, int n_embd) {
+    hipMemcpyAsync(r->d_moe_idx, slots, (size_t)K*sizeof(int),
+                   hipMemcpyHostToDevice, r->stream);
+    hipMemcpyAsync(r->d_moe_w, weights, (size_t)K*sizeof(float),
+                   hipMemcpyHostToDevice, r->stream);
+    long long gs=(long long)cl->moe_cache_stride_gate;
+    long long us=(long long)cl->moe_cache_stride_up;
+    void *ga[]={&r->d_moe_act8,&cl->moe_cache_gate,&cl->moe_cache_up,
+                &r->d_moe_idx,&r->d_xb,&K,&expert_ff,&n_embd,&gs,&us};
+    LAUNCH(r->fn_qwen4_gateup_silu_q4k_selected, (expert_ff+7)/8, K, 1,
+           256, 1, 1, 0, r->stream, ga);
+    long long ds=(long long)cl->moe_cache_stride_down;
+    void *da[]={&r->d_moe_accum,&cl->moe_cache_down,&r->d_moe_act8,
+                &r->d_moe_w,&r->d_moe_idx,&K,&n_embd,&expert_ff,&ds};
+    LAUNCH(r->fn_qwen4_down_accum_q5_1_selected, n_embd, 1, 1,
+           256, 1, 1, 0, r->stream, da);
+}
+
+static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
+                                      void *x, int n_rows, int n_cols,
+                                      int weight_type);
+static inline void launch_scale_add(hip_llm_runner *r, void *dst, void *src,
+                                    float scale, int n);
+
+/* Keep the large gate/up projections fused, but use the established Q5_1
+ * matvec for each selected down projection.  Besides being a useful fallback,
+ * this preserves the exact per-expert accumulation order of the old path. */
+static inline void launch_qwen4_experts_q4k_gateup_selected(hip_llm_runner *r,
+        hip_layer *cl, const int *slots, const float *weights, int K,
+        int expert_ff, int n_embd) {
+    hipMemcpyAsync(r->d_moe_idx, slots, (size_t)K*sizeof(int),
+                   hipMemcpyHostToDevice, r->stream);
+    long long gs=(long long)cl->moe_cache_stride_gate;
+    long long us=(long long)cl->moe_cache_stride_up;
+    void *ga[]={&r->d_moe_act8,&cl->moe_cache_gate,&cl->moe_cache_up,
+                &r->d_moe_idx,&r->d_xb,&K,&expert_ff,&n_embd,&gs,&us};
+    LAUNCH(r->fn_qwen4_gateup_silu_q4k_selected, (expert_ff+7)/8, K, 1,
+           256, 1, 1, 0, r->stream, ga);
+    for (int sel = 0; sel < K; ++sel) {
+        void *dw = (unsigned char *)cl->moe_cache_down +
+                   (size_t)slots[sel]*cl->moe_cache_stride_down;
+        void *act = r->d_moe_act8 + (size_t)sel*expert_ff;
+        launch_matvec_auto(r, r->d_xb2, dw, act, n_embd, expert_ff,
+                           cl->moe_down_exps_type);
+        launch_scale_add(r, r->d_moe_accum, r->d_xb2, weights[sel], n_embd);
+    }
+}
+
 #define DEFINE_LAUNCH_MATVEC(name, fn_field) \
 static inline void launch_matvec_##name(hip_llm_runner *r, void *dst, void *mat, \
                                         void *x, int n_rows, int n_cols) { \
@@ -10759,7 +10969,8 @@ static inline void launch_matvec_f32(hip_llm_runner *r, void *dst, void *mat,
 static inline void launch_moe_topk(hip_llm_runner *r) {
     int n = r->n_experts, k = r->n_experts_used;
     void *args[] = { &r->d_router_logits, &n, &k, &r->d_moe_idx, &r->d_moe_w };
-    LAUNCH(r->fn_moe_topk_softmax_gpu, 1, 1, 1, 256, 1, 1, 0, r->stream, args);
+    unsigned threads = n > 256 ? 512 : 256;
+    LAUNCH(r->fn_moe_topk_softmax_gpu, 1, 1, 1, threads, 1, 1, 0, r->stream, args);
 }
 static inline void launch_sigmoid_scalar(hip_llm_runner *r, void *out, void *in) {
     void *args[] = { &out, &in };
@@ -11158,14 +11369,34 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                    cl->moe_gate_rows, cl->moe_gate_cols);
 
   if (r->is_qwen4exp && cl->moe_gate_exps_host) {
-    hipMemcpyAsync(r->h_router_logits, r->d_router_logits,
-                   (size_t)n_experts * sizeof(float), hipMemcpyDeviceToHost, r->stream);
-    hipMemcpyAsync(r->h_moe_input, r->d_xb,
-                   (size_t)n_embd * sizeof(float), hipMemcpyDeviceToHost, r->stream);
-    hipStreamSynchronize(r->stream);
-    int top_idx[64]; float top_w[64];
-    moe_topk_softmax(r->h_router_logits, n_experts, n_experts_used, top_idx, top_w);
+    int *top_idx = (int *)(r->h_router_logits + n_experts);
+    float *top_w = r->h_router_logits + n_experts + 64;
+    const char *gpu_topk_env = getenv("LLM_QWEN4_GPU_TOPK");
+    int use_gpu_topk = !gpu_topk_env || atoi(gpu_topk_env) != 0;
+    if (use_gpu_topk) {
+        launch_moe_topk(r);
+        hipMemcpyAsync(top_idx, r->d_moe_idx, (size_t)n_experts_used*sizeof(int),
+                       hipMemcpyDeviceToHost, r->stream);
+        hipMemcpyAsync(top_w, r->d_moe_w, (size_t)n_experts_used*sizeof(float),
+                       hipMemcpyDeviceToHost, r->stream);
+        hipStreamSynchronize(r->stream);
+    } else {
+        hipMemcpyAsync(r->h_router_logits, r->d_router_logits,
+                       (size_t)n_experts*sizeof(float), hipMemcpyDeviceToHost, r->stream);
+        hipStreamSynchronize(r->stream);
+        moe_topk_softmax(r->h_router_logits, n_experts, n_experts_used,
+                         top_idx, top_w);
+    }
     if (cl->moe_cache_slots > 0) {
+        int *top_slots = (int *)(r->h_router_logits + n_experts + 128);
+        const char *fused_env = getenv("LLM_QWEN4_FUSED_EXPERTS");
+        int use_fused = !fused_env || atoi(fused_env) != 0;
+        int fused_q8 = use_fused && cl->moe_gate_exps_type == GGML_TYPE_Q8_0 &&
+                       cl->moe_up_exps_type == GGML_TYPE_Q8_0 &&
+                       cl->moe_down_exps_type == GGML_TYPE_Q8_0;
+        int fused_xl = use_fused && cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
+                       cl->moe_up_exps_type == GGML_TYPE_Q4_K &&
+                       cl->moe_down_exps_type == GGML_TYPE_Q5_1;
         hipMemsetAsync(r->d_moe_accum, 0, (size_t)n_embd * sizeof(float), r->stream);
         for (int sel = 0; sel < n_experts_used; ++sel) {
             int e = top_idx[sel], slot = -1;
@@ -11201,20 +11432,32 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
             } else {
                 r->moe_stats.cache_hits++;
             }
+            top_slots[sel] = slot;
             void *gw = (unsigned char *)cl->moe_cache_gate + (size_t)slot*cl->moe_cache_stride_gate;
             void *uw = (unsigned char *)cl->moe_cache_up   + (size_t)slot*cl->moe_cache_stride_up;
             void *dw = (unsigned char *)cl->moe_cache_down + (size_t)slot*cl->moe_cache_stride_down;
-            launch_matvec_auto(r, r->d_gate, gw, r->d_xb, expert_ff, n_embd,
-                               cl->moe_gate_exps_type);
-            launch_matvec_auto(r, r->d_up, uw, r->d_xb, expert_ff, n_embd,
-                               cl->moe_up_exps_type);
-            launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
-            launch_matvec_auto(r, r->d_xb2, dw, r->d_gate, n_embd, expert_ff,
-                               cl->moe_down_exps_type);
-            launch_scale_add(r, r->d_moe_accum, r->d_xb2, top_w[sel], n_embd);
+            if (!fused_q8 && !fused_xl) {
+                launch_matvec_auto(r, r->d_gate, gw, r->d_xb, expert_ff, n_embd,
+                                   cl->moe_gate_exps_type);
+                launch_matvec_auto(r, r->d_up, uw, r->d_xb, expert_ff, n_embd,
+                                   cl->moe_up_exps_type);
+                launch_silu_mul(r, r->d_gate, r->d_up, expert_ff);
+                launch_matvec_auto(r, r->d_xb2, dw, r->d_gate, n_embd, expert_ff,
+                                   cl->moe_down_exps_type);
+                launch_scale_add(r, r->d_moe_accum, r->d_xb2, top_w[sel], n_embd);
+            }
         }
+        if (fused_q8)
+            launch_qwen4_experts_q8_selected(r, cl, top_slots, top_w,
+                                             n_experts_used, expert_ff, n_embd);
+        else if (fused_xl)
+            launch_qwen4_experts_q4k_q51_selected(r, cl, top_slots, top_w,
+                                                  n_experts_used, expert_ff, n_embd);
         r->moe_stats.gpu_assignments += (uint64_t)n_experts_used;
     } else {
+      hipMemcpyAsync(r->h_moe_input, r->d_xb,
+                     (size_t)n_embd*sizeof(float), hipMemcpyDeviceToHost, r->stream);
+      hipStreamSynchronize(r->stream);
       memset(r->h_moe_output, 0, (size_t)n_embd * sizeof(float));
       int work_stride = n_embd + (n_embd > expert_ff ? n_embd : expert_ff);
 #if defined(_OPENMP)
@@ -13029,7 +13272,10 @@ static int batched_path_eligible(const hip_llm_runner *r, int M) {
 static int prefill_chunk_size(const hip_llm_runner *r, int n_tokens) {
     int chunk;
     if (r->is_gemma4)            chunk = r->gemma_prefill_chunk;
-    else if (r->moe_prefill_batched) chunk = r->gemm_own ? r->batch_max : 256;
+    else if (r->moe_prefill_batched) {
+        if (r->is_qwen4exp && !r->gemm_own) chunk = r->batch_max < 512 ? r->batch_max : 512;
+        else chunk = r->gemm_own ? r->batch_max : 256;
+    }
     else                         chunk = n_tokens;
     { const char *e = getenv("LLM_MOE_CHUNK"); if (e) { int c = atoi(e); if (c >= 1) chunk = c; } }
     { const char *e = getenv("LLM_PREFILL_CHUNK"); if (e) { int c = atoi(e); if (c >= 1) chunk = c; } }
@@ -13432,8 +13678,10 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_shared_scale) hipFree(r->d_shared_scale);
     if (r->d_moe_act8)     hipFree(r->d_moe_act8);
     if (r->d_router_counter) hipFree(r->d_router_counter);
-    free(r->h_router_logits);
-    free(r->h_moe_input);
+    if (r->h_router_logits_pinned) hipHostFree(r->h_router_logits);
+    else free(r->h_router_logits);
+    if (r->h_moe_input_pinned) hipHostFree(r->h_moe_input);
+    else free(r->h_moe_input);
     free(r->h_moe_output);
     free(r->h_moe_gate);
     free(r->h_moe_up);
