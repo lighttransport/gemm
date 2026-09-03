@@ -2836,6 +2836,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | K=5 async 36-verifier/12-draft split | no | 128 yes | 43.21 | 72.04 | 17.67 exposed | 695--749 | reject and remove; reuse fell to 17/33 and verifier lost HBM bandwidth |
 | 2026-09-04 | sequential 12-thread K=5 bonus control | no | 128 yes | 40.14 | 74.51 | 43.51 | 650--695 | preserves 26/27 full acceptance and 24/27 boundary hits; async quality loss is predicted-hidden seeding, not thread-count numerics |
 | 2026-09-04 | verifier `TF_SSM_PREEXP=1` | yes | no | 54.17 | 75.14 | 15.68 | 915--992 | reject; output hash changed to `a0f96c3b...` |
+| 2026-09-04 | one hot OpenMP team for complete K=5 FFN gate/up streams | yes | 128 yes | 52.40 | 74.86 | 15.55 | 893--951 | reject and remove; FFN projection saved only 0.20 ms/round and wall time regressed |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
