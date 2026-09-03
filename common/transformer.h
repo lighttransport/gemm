@@ -9736,6 +9736,90 @@ const float *transformer_nextn_target_hidden(const transformer_model *model) {
     return model && model->nextn.loaded ? model->nextn.target_hidden : NULL;
 }
 
+typedef struct {
+    transformer_model *m;
+    transformer_layer *layer;
+    int tid, nt, nff, ne;
+    int barrier_sense;
+} tf_nextn_ffn_task;
+
+static inline void tf_nextn_silu_range(float *out, const float *gate,
+                                       const float *up, int start, int end) {
+#if defined(__ARM_FEATURE_SVE)
+    static _Thread_local int use_sve = -1;
+    if (use_sve < 0) {
+        const char *e = getenv("TF_SILU_SVE");
+        use_sve = e && atoi(e) != 0;
+    }
+    if (use_sve) {
+        int vl = (int)svcntw();
+        for (int i = start; i < end; i += vl) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)end);
+            svfloat32_t g = svld1(pg, gate + i), u = svld1(pg, up + i);
+            svfloat32_t x = svmul_n_f32_x(pg, g, -1.4426950408889634f);
+            x = svmax_n_f32_x(pg, svmin_n_f32_x(pg, x, 80.0f), -80.0f);
+            svfloat32_t den = svadd_n_f32_x(pg,
+                tf_exp2_fexpa_approx_sve(pg, x), 1.0f);
+            svfloat32_t inv = svrecpe_f32(den);
+            inv = svmul_f32_x(pg, inv, svrecps_f32(den, inv));
+            svst1(pg, out + i, svmul_f32_x(pg,
+                svmul_f32_x(pg, g, inv), u));
+        }
+        return;
+    }
+#endif
+    for (int i = start; i < end; i++) {
+        float g = gate[i];
+        out[i] = g / (1.0f + expf(-g)) * up[i];
+    }
+}
+
+static void *tf_nextn_ffn_worker(void *arg) {
+    tf_nextn_ffn_task *t = (tf_nextn_ffn_task *)arg;
+    transformer_model *m = t->m;
+    transformer_layer *L = t->layer;
+    tf_barrier_tid = t->tid;
+    int r0 = t->nff * t->tid / t->nt;
+    int r1 = t->nff * (t->tid + 1) / t->nt;
+    tf_matvec_qtensor_rows(m->ffn_buf1, &L->ffn_gate, m->xb, r0, r1);
+    tf_matvec_qtensor_rows(m->ffn_buf2, &L->ffn_up, m->xb, r0, r1);
+    tf_nextn_silu_range(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, r0, r1);
+    tf_spin_barrier(m, &t->barrier_sense, t->nt);
+    r0 = t->ne * t->tid / t->nt;
+    r1 = t->ne * (t->tid + 1) / t->nt;
+    tf_matvec_qtensor_rows(m->xb, &L->ffn_down, m->ffn_buf3, r0, r1);
+    return NULL;
+}
+
+/* Keep workers awake across gate/up, SiLU, and down.  This replaces two pool
+ * broadcasts plus a nested OpenMP activation region with one dispatch and one
+ * dependency barrier; row ownership and all arithmetic kernels are unchanged. */
+static int tf_nextn_ffn_persistent_pool(transformer_model *m,
+                                        transformer_layer *L,
+                                        int nff, int ne) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("TF_NEXTN_FFN_PERSIST");
+        enabled = e && atoi(e) != 0;
+    }
+    if (!enabled || !m->pool_alive || m->n_threads <= 1 ||
+        L->ffn_gate.i8 || L->ffn_up.i8 || L->ffn_down.i8)
+        return 0;
+    int nt = m->n_threads;
+    m->bar_count = 0;
+    m->bar_sense = 0;
+    memset(m->cmg_bar, 0, sizeof(m->cmg_bar));
+    m->cmg_leader_count = 0;
+    m->cmg_leader_sense = 0;
+    __sync_synchronize();
+    tf_nextn_ffn_task *tasks = (tf_nextn_ffn_task *)alloca(
+        (size_t)nt * sizeof(*tasks));
+    for (int tid = 0; tid < nt; tid++)
+        tasks[tid] = (tf_nextn_ffn_task){m, L, tid, nt, nff, ne, 0};
+    tf_pool_dispatch(m, tf_nextn_ffn_worker, tasks, sizeof(*tasks));
+    return 1;
+}
+
 float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
                                 const float *target_hidden, int position) {
     const char *pos_off_env = getenv("TP_MTP_POS_OFFSET");
@@ -9815,10 +9899,12 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     if (profile) pt_out = tf_time_ms();
     tf_vadd(m->x, m->xb, ne);
     tf_rmsnorm(m->xb, m->x, &L->ffn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
-    tf_qmatvec_fused2_pool(m, m->ffn_buf1, &L->ffn_gate,
-                           m->ffn_buf2, &L->ffn_up, m->xb, nff);
-    tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, nff);
-    tf_qmatvec_pool(m, m->xb, &L->ffn_down, m->ffn_buf3, ne);
+    if (!tf_nextn_ffn_persistent_pool(m, L, nff, ne)) {
+        tf_qmatvec_fused2_pool(m, m->ffn_buf1, &L->ffn_gate,
+                               m->ffn_buf2, &L->ffn_up, m->xb, nff);
+        tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, nff);
+        tf_qmatvec_pool(m, m->xb, &L->ffn_down, m->ffn_buf3, ne);
+    }
     if (nextn_sharded && m->tp_ffn_sharded && m->tp_allreduce_fn)
         m->tp_allreduce_fn(m->xb, ne, m->tp_allreduce_ctx);
     if (profile) pt_ffn = tf_time_ms();

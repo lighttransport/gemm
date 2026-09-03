@@ -2810,6 +2810,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_MAXGEN=256 \
 
 TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
   TP_MTP_SHADOW_THREADS=48 \
+  TF_NEXTN_FFN_PERSIST=1 \
   TP_AR_DETERMINISTIC=1 TP_AR_A2A_TREE=1 TP_AR_FUSED_ADD=1 \
   TF_BF16PV_MTP5_FUSED=1 \
   bash run_qwen38_bf16_tp4.sh mtp-sustained
@@ -2825,6 +2826,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
 | 2026-09-03 | decode prefetch K4352=12 K5120=6 K6144=8 | no | short stream yes | 31.93 ms/tok vs 31.45 control | n/a | n/a | 540 / 537 | reject values; retain global 6 |
 | 2026-09-03 | replicated NextN + shadow48 | no | 128 yes | 29.77 vs 26.73 | 90.37 | 68.86 | 528--658 | +11.4%; promote launcher default, clean gate pending |
+| 2026-09-03 | persistent NextN FFN | no | 128/256 yes | 36.65 short; 27.63 sustained | 83.37 / 98.85 | 45.96 / 69.62 | 647--701 / 471--677 | promote; 256 draft -9.5% at lower rank-0 BW |
 
 An additional SSM scheduling probe normalized Q/K directly into each expanded
 head, replacing the normalize/expand pair with one worker phase and removing
