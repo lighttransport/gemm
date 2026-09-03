@@ -2830,6 +2830,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | SVE snapshot convolution, sharded NextN K=5 | yes | 128/256 yes | 52.98 / 51.99 | 73.87 / 73.96 | 15.54 / 15.51 | 882--946 (256) | promote; preparation 127.5 to 51.7 ms/27 calls in adjacent 128 A/B |
 | 2026-09-04 | current non-MTP TP4 baseline, 64 warm + 256 measured | yes | 320 yes | 31.53 | n/a | n/a | 523--564 | 40 tok/s still open; 31.74 ms limiting rank, 129 reductions/token |
 | 2026-09-04 | MRQ one-Put recheck after SVE snapshot convolution | yes | 128 yes | 53.13 vs 52.98 | 73.68 vs 73.87 | 15.49 vs 15.54 | 906--935 | neutral; collective 362.1 vs 357.4 ms/27 calls, retain two-Put default |
+| 2026-09-04 | KMP blocktime 200 ms / remove verifier K scratch copy | yes | 128 yes | 52.74 / 52.91 | 74.03 / 73.97 | 15.79 / 15.58 | 894--933 / rank0 899 | reject both; neither beats the adjacent 52.98 default |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
