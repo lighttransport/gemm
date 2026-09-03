@@ -103,6 +103,37 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Qwen4 hyperconnection helpers.  Layout is [stream][embedding]. */\n"
+"__global__ void hc_norm_f32(float *dst, const float *x, const float *w,\n"
+"                            int n_embd, int n_stream, float eps) {\n"
+"    int s = blockIdx.x; if (s >= n_stream) return;\n"
+"    int tid = threadIdx.x; extern __shared__ float red[];\n"
+"    const float *xs = x + (size_t)s*n_embd; float *ds = dst + (size_t)s*n_embd;\n"
+"    float sum = 0.0f; for (int i=tid;i<n_embd;i+=blockDim.x) sum += xs[i]*xs[i];\n"
+"    red[tid]=sum; __syncthreads();\n"
+"    for (int k=blockDim.x/2;k;k>>=1) { if (tid<k) red[tid]+=red[tid+k]; __syncthreads(); }\n"
+"    float scale=rsqrtf(red[0]/(float)n_embd+eps);\n"
+"    for (int i=tid;i<n_embd;i+=blockDim.x) { int j=s*n_embd+i; ds[i]=xs[i]*scale*w[j]; }\n"
+"}\n"
+"__global__ void hc_silu_scale_f32(float *x, int n, float scale) {\n"
+"    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n){ float v=x[i]*scale; x[i]=v/(1.0f+expf(-v)); }\n"
+"}\n"
+"__global__ void hc_mix_f32(float *mixed, const float *xn, const float *gate,\n"
+"                           int n_embd, int n_stream) {\n"
+"    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n_embd)return; float sum=0.0f;\n"
+"    for(int s=0;s<n_stream;s++){ int j=s*n_embd+i; sum += xn[j]/(1.0f+expf(-gate[j])); }\n"
+"    mixed[i]=sum/(float)n_stream;\n"
+"}\n"
+"__global__ void hc_combine_f32(float *residual, const float *block, const float *inject,\n"
+"                               int n_embd, int n_stream) {\n"
+"    int j=blockIdx.x*blockDim.x+threadIdx.x; int n=n_embd*n_stream; if(j>=n)return;\n"
+"    int s=j/n_embd; float w=2.0f/(1.0f+expf(-inject[s]/(float)n_stream));\n"
+"    residual[j] += block[j-(size_t)s*n_embd]*w;\n"
+"}\n"
+"__global__ void hc_repeat_f32(float *dst, const float *src, int n_embd, int n_stream) {\n"
+"    int j=blockIdx.x*blockDim.x+threadIdx.x; int n=n_embd*n_stream; if(j<n)dst[j]=src[j%n_embd];\n"
+"}\n"
+"\n"
 "/* ---- 3. matvec_f16_f32: F16 matrix x F32 vector -> F32 ---- */\n"
 "/* Each block computes one output row. 256 threads stride over K cols. */\n"
 "__global__ void matvec_f16_f32(float *dst, const half_raw *mat, const float *x,\n"
@@ -7020,6 +7051,32 @@ static const char *hip_kernel_source =
 "    for (int d = tid; d < head_dim; d += NT) out_h[d] = acc_sh[d] * inv;\n"
 "}\n"
 "\n"
+"__global__ void kv_cache_store_f16_devp(half_raw *kc, half_raw *vc,\n"
+"    const float *k, const float *v, int kv_dim, const int *pos_p) {\n"
+"    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=kv_dim)return; size_t o=(size_t)(*pos_p)*kv_dim+i;\n"
+"    kc[o]=f32_to_f16_bits(k[i]); vc[o]=f32_to_f16_bits(v[i]);\n"
+"}\n"
+"__global__ void attn_decode_flash_f16_devp(float *out, const float *q,\n"
+"    const half_raw *key_cache, const half_raw *value_cache,\n"
+"    int n_heads, int n_kv_heads, int head_dim, int kv_dim,\n"
+"    const int *pos_p, float scale) {\n"
+"    extern __shared__ float smem[]; int h=blockIdx.x; if(h>=n_heads)return;\n"
+"    int kv_h=h/(n_heads/n_kv_heads), pos=*pos_p, tid=threadIdx.x, NT=blockDim.x;\n"
+"    float *q_sh=smem,*acc=q_sh+head_dim,*prob=acc+head_dim,*red=prob+NT;\n"
+"    const float *qh=q+h*head_dim; for(int d=tid;d<head_dim;d+=NT){q_sh[d]=qh[d]*scale;acc[d]=0.0f;}\n"
+"    __syncthreads(); float mi=-1e30f,li=0.0f;\n"
+"    for(int ts=0;ts<=pos;ts+=NT){ int kp=ts+tid, tn=pos-ts+1; if(tn>NT)tn=NT; float sc=-1e30f;\n"
+"      if(kp<=pos){const half_raw *kr=key_cache+(size_t)kp*kv_dim+kv_h*head_dim;sc=0.0f;\n"
+"        for(int d=0;d<head_dim;d++)sc+=q_sh[d]*half_to_float(kr[d]);}\n"
+"      red[tid]=sc;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}\n"
+"      float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm),pv=kp<=pos?__expf(sc-nm):0.0f;\n"
+"      prob[tid]=pv;red[tid]=pv;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]+=red[tid+z];__syncthreads();}\n"
+"      li=li*corr+red[0];for(int d=tid;d<head_dim;d+=NT){float a=acc[d]*corr;for(int t=0;t<tn;t++)\n"
+"        a+=prob[t]*half_to_float(value_cache[(size_t)(ts+t)*kv_dim+kv_h*head_dim+d]);acc[d]=a;}\n"
+"      mi=nm;__syncthreads();}\n"
+"    float inv=li>0.0f?1.0f/li:0.0f;for(int d=tid;d<head_dim;d+=NT)out[h*head_dim+d]=acc[d]*inv;\n"
+"}\n"
+"\n"
 "/* Repack batch buffer from compact per-layer stride to padded max stride.\n"
 " * dst [M * dst_stride] = src [M * src_stride], copying n_per_row elements per row. */\n"
 "__global__ void repack_batch_f32(float *dst, const float *src,\n"
@@ -7131,6 +7188,9 @@ typedef struct {
     int moe_exp_rows_d, moe_exp_cols_d;
     size_t moe_exp_stride_gu;
     size_t moe_exp_stride_d;
+    const void *moe_gate_exps_host;
+    const void *moe_up_exps_host;
+    const void *moe_down_exps_host;
     void *moe_shared_gate_w;
     void *moe_shared_ffn_gate_w;
     void *moe_shared_ffn_up_w;
@@ -7170,6 +7230,21 @@ typedef struct {
     void *d_conv_state;
     void *d_recurrent_state;
 
+    /* Qwen4 hyperconnection weights. */
+    void *hc_attn_norm_w, *hc_attn_down_w, *hc_attn_up_w, *hc_attn_inject_w;
+    void *hc_ffn_norm_w,  *hc_ffn_down_w,  *hc_ffn_up_w,  *hc_ffn_inject_w;
+    int hc_attn_down_type, hc_attn_up_type, hc_attn_inject_type;
+    int hc_ffn_down_type, hc_ffn_up_type, hc_ffn_inject_type;
+
+    /* Qwen4 QSA indexer. */
+    void *index_q_w, *index_k_w, *index_q_norm_w, *index_k_norm_w;
+    int index_q_type, index_k_type;
+
+    /* Qwen4 PLE (present only on metadata-selected layers). */
+    void *ple_key_w, *ple_value_w, *ple_norm_key_w, *ple_norm_query_w;
+    void *ple_norm_conv_w, *ple_conv1d_w;
+    int ple_key_type, ple_value_type;
+
     /* Gemma4 fields */
     int is_swa;                 /* 1 = sliding window attention layer */
     int shared_kv_source;       /* -1 = own KV, else layer index to share from */
@@ -7194,6 +7269,11 @@ struct hip_llm_runner {
     hipModule_t module;
     hipFunction_t fn_embed_f16;
     hipFunction_t fn_rmsnorm_f32;
+    hipFunction_t fn_hc_norm_f32;
+    hipFunction_t fn_hc_silu_scale_f32;
+    hipFunction_t fn_hc_mix_f32;
+    hipFunction_t fn_hc_combine_f32;
+    hipFunction_t fn_hc_repeat_f32;
     hipFunction_t fn_rmsnorm_batch_f32;
     hipFunction_t fn_matvec_f16_f32;
     hipFunction_t fn_qknorm_f32;
@@ -7414,17 +7494,46 @@ struct hip_llm_runner {
     int ssm_d_inner;
     int ssm_qkv_dim;
 
+    /* Qwen4 experimental architecture. */
+    int is_qwen4exp;
+    int hc_count;
+    int hc_low_rank;
+    int indexer_heads;
+    int indexer_dim;
+    int indexer_top_k;
+    int ple_dim;
+    int ple_ngram;
+    int ple_heads_per_ngram;
+    int ple_conv_kernel;
+    int ple_eos_token;
+    void *hc_head_norm_w, *hc_head_down_w, *hc_head_up_w;
+    int hc_head_down_type, hc_head_up_type;
+    void *d_hc;
+    void *d_hc_norm;
+    void *d_hc_gate;
+    void *d_hc_low;
+    void *d_hc_inject;
+    const void *per_layer_token_embd_host;
+    int per_layer_token_embd_type;
+    int64_t per_layer_token_rows;
+
     /* MoE params */
     int is_moe;
     int n_experts;
     int n_experts_used;
     int expert_ff;
     int shared_expert_ff;
+    hip_llm_moe_stats moe_stats;
 
     /* MoE scratch buffers */
     void *d_router_logits;
     void *d_moe_accum;
     float *h_router_logits;
+    float *h_moe_input;
+    float *h_moe_output;
+    float *h_moe_gate;
+    float *h_moe_up;
+    float *h_moe_tmp;
     /* MoE device-side dispatch buffers */
     int  *d_moe_idx;       /* [n_experts_used] selected expert indices */
     float *d_moe_w;        /* [n_experts_used] softmax weights */
@@ -7609,6 +7718,8 @@ struct hip_llm_runner {
     hipFunction_t fn_raw_rmsnorm_heads_batch_f32;
     hipFunction_t fn_attn_prefill_flash_f32;    /* bounded online-softmax prefill */
     hipFunction_t fn_attn_decode_flash_f32_devp;/* bounded online-softmax decode  */
+    hipFunction_t fn_kv_cache_store_f16_devp;
+    hipFunction_t fn_attn_decode_flash_f16_devp;
     hipFunction_t fn_flash_attn_wmma_hd512_causal; /* WMMA full-attn (head_dim 512) */
     int           gemma_fa_wmma;                /* use WMMA kernel for full-attn layers */
     int         swa_cache_len;      /* circular SWA cache size = window + chunk */
@@ -7640,6 +7751,11 @@ static int compile_kernels(hip_llm_runner *r) {
 
     GET_FUNC(embed_f16);
     GET_FUNC(rmsnorm_f32);
+    GET_FUNC(hc_norm_f32);
+    GET_FUNC(hc_silu_scale_f32);
+    GET_FUNC(hc_mix_f32);
+    GET_FUNC(hc_combine_f32);
+    GET_FUNC(hc_repeat_f32);
     GET_FUNC(rmsnorm_batch_f32);
     GET_FUNC(matvec_f16_f32);
     GET_FUNC(qknorm_f32);
@@ -7774,6 +7890,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(raw_rmsnorm_heads_batch_f32);
     GET_FUNC(attn_prefill_flash_f32);
     GET_FUNC(attn_decode_flash_f32_devp);
+    GET_FUNC(kv_cache_store_f16_devp);
+    GET_FUNC(attn_decode_flash_f16_devp);
     GET_FUNC(flash_attn_wmma_hd512_causal);
 
     GET_FUNC(pack_bf16_from_f32);
@@ -8157,9 +8275,22 @@ static int hllm_find_tensor(const gguf_context *gguf, const char *name) {
     return -1;
 }
 
+/* Model loading itself is synchronous, but using thread-local state keeps
+ * independent runner loads in different application threads from interfering. */
+static _Thread_local const gguf_shards *hllm_active_shards;
+
 static qtensor hllm_load_tensor(const gguf_context *gguf, const char *name, int required) {
     qtensor t = {0};
-    int idx = hllm_find_tensor(gguf, name);
+    int idx = -1;
+    if (hllm_active_shards) {
+        const gguf_context *owner = NULL;
+        if (gguf_shards_find_tensor(hllm_active_shards, name, &owner, &idx) == 0)
+            gguf = owner;
+        else
+            idx = -1;
+    } else {
+        idx = hllm_find_tensor(gguf, name);
+    }
     if (idx < 0) {
         if (required) fprintf(stderr, "hip_llm: missing tensor '%s'\n", name);
         return t;
@@ -8331,11 +8462,12 @@ int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_
     return hip_llm_finalize_load(r, max_seq_len);
 }
 
-int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
+static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
 
     const char *arch = "qwen2";
     if (gguf_find_key(gguf, "gemma4.block_count") >= 0) arch = "gemma4";
+    else if (gguf_find_key(gguf, "qwen4exp.block_count") >= 0) arch = "qwen4exp";
     else if (gguf_find_key(gguf, "qwen35moe.block_count") >= 0) arch = "qwen35moe";
     else if (gguf_find_key(gguf, "qwen35.block_count") >= 0) arch = "qwen35";
     else if (gguf_find_key(gguf, "qwen3.block_count") >= 0) arch = "qwen3";
@@ -8392,23 +8524,27 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
 
     /* Hybrid SSM (Qwen3.5) */
     r->is_hybrid = 0;
+    r->is_qwen4exp = 0;
     r->is_moe = 0;
     r->full_attn_interval = 0;
-    if (strcmp(arch, "qwen35") == 0 || strcmp(arch, "qwen35moe") == 0) {
+    if (strcmp(arch, "qwen35") == 0 || strcmp(arch, "qwen35moe") == 0 ||
+        strcmp(arch, "qwen4exp") == 0) {
         r->is_hybrid = 1;
         r->ssm_conv_kernel = hllm_get_int(gguf, ARCH_KEY("ssm.conv_kernel"), 4);
         r->ssm_d_state     = hllm_get_int(gguf, ARCH_KEY("ssm.state_size"), 128);
         r->ssm_n_group     = hllm_get_int(gguf, ARCH_KEY("ssm.group_count"), 16);
         r->ssm_dt_rank     = hllm_get_int(gguf, ARCH_KEY("ssm.time_step_rank"), 48);
         r->ssm_d_inner     = hllm_get_int(gguf, ARCH_KEY("ssm.inner_size"), 6144);
-        r->full_attn_interval = hllm_get_int(gguf, ARCH_KEY("attention.full_attention_interval"), 4);
+        r->full_attn_interval = hllm_get_int(gguf,
+            strcmp(arch, "qwen4exp") == 0 ? ARCH_KEY("full_attention_interval") :
+                                             ARCH_KEY("attention.full_attention_interval"), 4);
         r->ssm_qkv_dim = r->ssm_d_state * r->ssm_n_group * 2 + r->ssm_d_inner;
         if (r->verbose >= 1) {
             fprintf(stderr, "hip_llm: hybrid SSM: conv_k=%d d_state=%d n_group=%d dt_rank=%d d_inner=%d interval=%d qkv_dim=%d\n",
                     r->ssm_conv_kernel, r->ssm_d_state, r->ssm_n_group, r->ssm_dt_rank,
                     r->ssm_d_inner, r->full_attn_interval, r->ssm_qkv_dim);
         }
-        if (strcmp(arch, "qwen35moe") == 0) {
+        if (strcmp(arch, "qwen35moe") == 0 || strcmp(arch, "qwen4exp") == 0) {
             r->is_moe = 1;
             r->n_experts       = hllm_get_int(gguf, ARCH_KEY("expert_count"), 256);
             r->n_experts_used  = hllm_get_int(gguf, ARCH_KEY("expert_used_count"), 8);
@@ -8418,6 +8554,23 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             if (r->verbose >= 1) {
                 fprintf(stderr, "hip_llm: MoE: n_experts=%d n_experts_used=%d expert_ff=%d shared_expert_ff=%d\n",
                         r->n_experts, r->n_experts_used, r->expert_ff, r->shared_expert_ff);
+            }
+        }
+        if (strcmp(arch, "qwen4exp") == 0) {
+            r->is_qwen4exp = 1;
+            r->hc_count = hllm_get_int(gguf, ARCH_KEY("hyper_connection.count"), 4);
+            r->hc_low_rank = hllm_get_int(gguf, ARCH_KEY("hyper_connection.low_rank"), 320);
+            r->indexer_heads = hllm_get_int(gguf, ARCH_KEY("attention.indexer.head_count"), 4);
+            r->indexer_dim = hllm_get_int(gguf, ARCH_KEY("attention.indexer.key_length"), 128);
+            r->indexer_top_k = hllm_get_int(gguf, ARCH_KEY("attention.indexer.top_k"), 2048);
+            r->ple_dim = hllm_get_int(gguf, ARCH_KEY("embedding_length_per_layer_input"), 160);
+            r->ple_ngram = hllm_get_int(gguf, ARCH_KEY("ple.ngram_size"), 3);
+            r->ple_heads_per_ngram = hllm_get_int(gguf, ARCH_KEY("ple.heads_per_ngram"), 8);
+            r->ple_conv_kernel = hllm_get_int(gguf, ARCH_KEY("ple.conv_kernel"), 4);
+            r->ple_eos_token = hllm_get_int(gguf, ARCH_KEY("ple.eos_token_id"), -1);
+            if (r->hc_count != 4 || r->hc_low_rank <= 0) {
+                fprintf(stderr, "hip_llm: unsupported qwen4exp hyperconnection geometry\n");
+                return -1;
             }
         }
     }
@@ -8608,10 +8761,27 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
         if (upload_f16_matrix(&r->d_token_embd, &embd) != 0) return -1;
     }
 
-    /* Output norm */
-    qtensor onorm = hllm_load_tensor(gguf, "output_norm.weight", 1);
-    if (!onorm.data) return -1;
-    if (upload_norm_f32(&r->d_output_norm, &onorm, r->n_embd) != 0) return -1;
+    /* Qwen4 replaces the final RMSNorm with a hyperconnection mixer. */
+    if (r->is_qwen4exp) {
+        qtensor t = hllm_load_tensor(gguf, "output_hc_norm.weight", 1);
+        if (!t.data || upload_norm_f32(&r->hc_head_norm_w, &t,
+                                       r->n_embd * r->hc_count) != 0) return -1;
+        t = hllm_load_tensor(gguf, "output_hc_down.weight", 1);
+        if (!t.data || upload_weight_matrix(&r->hc_head_down_w, &t,
+                                             &r->hc_head_down_type) != 0) return -1;
+        t = hllm_load_tensor(gguf, "output_hc_up.weight", 1);
+        if (!t.data || upload_weight_matrix(&r->hc_head_up_w, &t,
+                                             &r->hc_head_up_type) != 0) return -1;
+        t = hllm_load_tensor(gguf, "per_layer_token_embd.weight", 1);
+        if (!t.data) return -1;
+        r->per_layer_token_embd_host = t.data;
+        r->per_layer_token_embd_type = t.type;
+        r->per_layer_token_rows = t.n_rows;
+    } else {
+        qtensor onorm = hllm_load_tensor(gguf, "output_norm.weight", 1);
+        if (!onorm.data) return -1;
+        if (upload_norm_f32(&r->d_output_norm, &onorm, r->n_embd) != 0) return -1;
+    }
 
     /* Output projection (lm_head) */
     {
@@ -8638,9 +8808,33 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
                       (l + 1) % r->full_attn_interval != 0);
         cl->is_ssm = is_ssm;
 
-        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", l);
-        qtensor t = hllm_load_tensor(gguf, name, 1);
-        if (upload_norm_f32(&cl->attn_norm_w, &t, r->n_embd) != 0) return -1;
+        qtensor t;
+        if (r->is_qwen4exp) {
+            #define LOAD_HC_NORM(field, suffix) do { \
+                snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
+                t = hllm_load_tensor(gguf, name, 1); \
+                if (!t.data || upload_norm_f32(&cl->field, &t, r->n_embd*r->hc_count) != 0) return -1; \
+            } while (0)
+            #define LOAD_HC_MAT(field, suffix, typefield) do { \
+                snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
+                t = hllm_load_tensor(gguf, name, 1); \
+                if (!t.data || upload_weight_matrix(&cl->field, &t, &cl->typefield) != 0) return -1; \
+            } while (0)
+            LOAD_HC_NORM(hc_attn_norm_w, "hc_attn_norm");
+            LOAD_HC_MAT(hc_attn_down_w, "hc_attn_down", hc_attn_down_type);
+            LOAD_HC_MAT(hc_attn_up_w, "hc_attn_up", hc_attn_up_type);
+            LOAD_HC_MAT(hc_attn_inject_w, "hc_attn_inject", hc_attn_inject_type);
+            LOAD_HC_NORM(hc_ffn_norm_w, "hc_ffn_norm");
+            LOAD_HC_MAT(hc_ffn_down_w, "hc_ffn_down", hc_ffn_down_type);
+            LOAD_HC_MAT(hc_ffn_up_w, "hc_ffn_up", hc_ffn_up_type);
+            LOAD_HC_MAT(hc_ffn_inject_w, "hc_ffn_inject", hc_ffn_inject_type);
+            #undef LOAD_HC_NORM
+            #undef LOAD_HC_MAT
+        } else {
+            snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (upload_norm_f32(&cl->attn_norm_w, &t, r->n_embd) != 0) return -1;
+        }
 
         if (r->is_gemma4) {
             /* === Gemma4 per-layer setup === */
@@ -8803,8 +8997,49 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             if (t.data) { if (upload_norm_f32(&cl->attn_k_norm_w, &t, r->head_dim) != 0) return -1; }
         }
 
+        if (r->is_qwen4exp && !is_ssm) {
+            snprintf(name, sizeof(name), "blk.%d.indexer.q_proj.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (!t.data || upload_weight_matrix(&cl->index_q_w, &t, &cl->index_q_type) != 0) return -1;
+            snprintf(name, sizeof(name), "blk.%d.indexer.k_proj.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (!t.data || upload_weight_matrix(&cl->index_k_w, &t, &cl->index_k_type) != 0) return -1;
+            snprintf(name, sizeof(name), "blk.%d.indexer.q_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (!t.data || upload_norm_f32(&cl->index_q_norm_w, &t, r->indexer_dim) != 0) return -1;
+            snprintf(name, sizeof(name), "blk.%d.indexer.k_norm.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (!t.data || upload_norm_f32(&cl->index_k_norm_w, &t, r->indexer_dim) != 0) return -1;
+        }
+        if (r->is_qwen4exp && l == 1) {
+            #define LOAD_PLE_MAT(field, suffix, typefield) do { \
+                snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
+                t = hllm_load_tensor(gguf, name, 1); \
+                if (!t.data || upload_weight_matrix(&cl->field, &t, &cl->typefield) != 0) return -1; \
+            } while (0)
+            #define LOAD_PLE_NORM(field, suffix, count) do { \
+                snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
+                t = hllm_load_tensor(gguf, name, 1); \
+                if (!t.data || upload_norm_f32(&cl->field, &t, (count)) != 0) return -1; \
+            } while (0)
+            LOAD_PLE_MAT(ple_key_w, "ple_key", ple_key_type);
+            LOAD_PLE_MAT(ple_value_w, "ple_value", ple_value_type);
+            LOAD_PLE_NORM(ple_norm_key_w, "ple_norm_key", r->n_embd*r->hc_count);
+            LOAD_PLE_NORM(ple_norm_query_w, "ple_norm_query", r->n_embd*r->hc_count);
+            LOAD_PLE_NORM(ple_norm_conv_w, "ple_norm_conv", r->n_embd*r->hc_count);
+            snprintf(name, sizeof(name), "blk.%d.ple_conv1d.weight", l);
+            t = hllm_load_tensor(gguf, name, 1);
+            if (!t.data || upload_norm_f32(&cl->ple_conv1d_w, &t,
+                    r->ple_conv_kernel*r->n_embd*r->hc_count) != 0) return -1;
+            #undef LOAD_PLE_MAT
+            #undef LOAD_PLE_NORM
+        }
+
         /* FFN norm */
-        if (r->is_gemma4) {
+        if (r->is_qwen4exp) {
+            /* The FFN hyperconnection contains its own grouped normalization. */
+            cl->ffn_norm_w = NULL;
+        } else if (r->is_gemma4) {
             snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
             if (upload_norm_f32(&cl->ffn_norm_w, &t, r->n_embd) != 0) return -1;
@@ -8835,19 +9070,26 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
             cl->moe_gate_exps_type = t.type;
             cl->moe_exp_cols_gu = t.n_cols;
             cl->moe_exp_rows_gu = (t.n_dims >= 3) ? (int)t.dims[1] : t.n_rows;
-            if (upload_3d_kquant_raw_bm(&cl->moe_gate_exps_w, &t, &cl->moe_exp_stride_gu, r->moe_iq2_bm) != 0) return -1;
+            if (r->is_qwen4exp) {
+                cl->moe_gate_exps_host = t.data;
+                cl->moe_exp_stride_gu = dequant_row_size(t.type, t.n_cols) * (size_t)cl->moe_exp_rows_gu;
+            } else if (upload_3d_kquant_raw_bm(&cl->moe_gate_exps_w, &t, &cl->moe_exp_stride_gu, r->moe_iq2_bm) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_up_exps.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
             cl->moe_up_exps_type = t.type;
-            if (upload_3d_kquant_raw_bm(&cl->moe_up_exps_w, &t, &cl->moe_exp_stride_gu, r->moe_iq2_bm) != 0) return -1;
+            if (r->is_qwen4exp) cl->moe_up_exps_host = t.data;
+            else if (upload_3d_kquant_raw_bm(&cl->moe_up_exps_w, &t, &cl->moe_exp_stride_gu, r->moe_iq2_bm) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
             cl->moe_down_exps_type = t.type;
             cl->moe_exp_cols_d = t.n_cols;
             cl->moe_exp_rows_d = (t.n_dims >= 3) ? (int)t.dims[1] : t.n_rows;
-            if (upload_3d_kquant_raw_bm(&cl->moe_down_exps_w, &t, &cl->moe_exp_stride_d, r->moe_iq2_bm) != 0) return -1;
+            if (r->is_qwen4exp) {
+                cl->moe_down_exps_host = t.data;
+                cl->moe_exp_stride_d = dequant_row_size(t.type, t.n_cols) * (size_t)cl->moe_exp_rows_d;
+            } else if (upload_3d_kquant_raw_bm(&cl->moe_down_exps_w, &t, &cl->moe_exp_stride_d, r->moe_iq2_bm) != 0) return -1;
 
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
@@ -8889,6 +9131,37 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
     return hip_llm_finalize_load(r, max_seq_len);
 }
 
+void hip_llm_load_options_default(hip_llm_load_options *options) {
+    if (!options) return;
+    memset(options, 0, sizeof(*options));
+    options->struct_size = sizeof(*options);
+    options->moe_mode = HIP_LLM_MOE_AUTO;
+    options->gpu_reserve_bytes = 1ull << 30;
+}
+
+int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
+    hllm_active_shards = NULL;
+    return hip_llm_load_weights_impl(r, gguf, max_seq_len);
+}
+
+int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
+                                 const hip_llm_load_options *options) {
+    if (!r || !model || !model->metadata) return -1;
+    hip_llm_load_options defaults;
+    hip_llm_load_options_default(&defaults);
+    if (!options) options = &defaults;
+    if (options->struct_size != 0 &&
+        options->struct_size < offsetof(hip_llm_load_options, gpu_reserve_bytes) +
+                               sizeof(options->gpu_reserve_bytes)) {
+        fprintf(stderr, "hip_llm: load options struct is too small\n");
+        return -1;
+    }
+    hllm_active_shards = model;
+    int rc = hip_llm_load_weights_impl(r, model->metadata, options->max_seq_len);
+    hllm_active_shards = NULL;
+    return rc;
+}
+
 static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
     /* For Gemma4, use the maximum head_dim for buffer sizing */
     int kv_dim = r->n_kv_heads * r->head_dim;
@@ -8926,7 +9199,8 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 kv_cache_size = (size_t)max_seq_len * layer_kv;
             }
         } else {
-            kv_cache_size = (size_t)max_seq_len * kv_dim * sizeof(float);
+            kv_cache_size = (size_t)max_seq_len * kv_dim *
+                            (r->is_qwen4exp ? sizeof(uint16_t) : sizeof(float));
         }
         CHECK_HIP(hipMalloc(&r->d_key_cache[l], kv_cache_size));
         CHECK_HIP(hipMemset(r->d_key_cache[l], 0, kv_cache_size));
@@ -8950,6 +9224,14 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
     CHECK_HIP(hipMalloc(&r->d_q,   q_dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_k,   kv_dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_v,   kv_dim * sizeof(float)));
+    if (r->is_qwen4exp) {
+        size_t hc_elems = (size_t)r->hc_count * r->n_embd;
+        CHECK_HIP(hipMalloc(&r->d_hc, hc_elems * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_hc_norm, hc_elems * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_hc_gate, hc_elems * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_hc_low, (size_t)r->hc_low_rank * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_hc_inject, (size_t)r->hc_count * sizeof(float)));
+    }
     {
         int ff_dim = r->n_ff;
         if (r->is_moe && r->shared_expert_ff > ff_dim) ff_dim = r->shared_expert_ff;
@@ -8962,6 +9244,16 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         CHECK_HIP(hipMalloc(&r->d_moe_accum, r->n_embd * sizeof(float)));
         r->h_router_logits = (float *)malloc(r->n_experts * sizeof(float));
         if (!r->h_router_logits) return -1;
+        if (r->is_qwen4exp) {
+            r->h_moe_input = (float *)malloc((size_t)r->n_embd * sizeof(float));
+            r->h_moe_output = (float *)malloc((size_t)r->n_embd * sizeof(float));
+            r->h_moe_gate = (float *)malloc((size_t)r->expert_ff * sizeof(float));
+            r->h_moe_up = (float *)malloc((size_t)r->expert_ff * sizeof(float));
+            int tmp_n = r->n_embd > r->expert_ff ? r->n_embd : r->expert_ff;
+            r->h_moe_tmp = (float *)malloc((size_t)tmp_n * sizeof(float));
+            if (!r->h_moe_input || !r->h_moe_output || !r->h_moe_gate ||
+                !r->h_moe_up || !r->h_moe_tmp) return -1;
+        }
         /* Device-side dispatch buffers (sync-free MoE routing) */
         CHECK_HIP(hipMalloc(&r->d_moe_idx, r->n_experts_used * sizeof(int)));
         CHECK_HIP(hipMalloc(&r->d_moe_w,   r->n_experts_used * sizeof(float)));
@@ -9076,6 +9368,11 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
          * the batch (forward_moe_ffn). Requires the sync-free device MoE dispatch so
          * the per-row loop has no host round-trips. Gate: LLM_MOE_PREFILL (default 1). */
         int eligible = !disabled;
+        /* Qwen4Next has four hyperconnection streams and host-resident routed
+         * experts.  The legacy batched path assumes one hidden stream and
+         * device-resident expert tensors, so using it would both produce wrong
+         * results and size staging buffers for the full 72 GiB expert set. */
+        if (r->is_qwen4exp) eligible = 0;
         if (r->is_moe) {
          /* Batched MoE prefill (LLM_MOE_PREFILL, default ON): SSM/attn projections
               * batch via hipBLASLt; experts are grouped by token and run through the
@@ -10114,6 +10411,25 @@ static inline void launch_attn_decode_flash(hip_llm_runner *r,
            smem, r->stream, args);
 }
 
+static inline void launch_kv_store_f16_devp(hip_llm_runner *r, void *kc, void *vc,
+                                             void *k, void *v, int kv_dim) {
+    int *pos_p = r->d_position;
+    void *args[] = { &kc, &vc, &k, &v, &kv_dim, &pos_p };
+    LAUNCH(r->fn_kv_cache_store_f16_devp, (kv_dim + 255) / 256, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_attn_decode_flash_f16(hip_llm_runner *r,
+    void *out, void *q, void *key_cache, void *value_cache,
+    int n_heads, int n_kv_heads, int head_dim, int kv_dim, float scale) {
+    int *pos_p = r->d_position;
+    void *args[] = { &out, &q, &key_cache, &value_cache, &n_heads, &n_kv_heads,
+                     &head_dim, &kv_dim, &pos_p, &scale };
+    size_t smem = ((size_t)(2 * head_dim + 2 * 256)) * sizeof(float);
+    LAUNCH(r->fn_attn_decode_flash_f16_devp, n_heads, 1, 1, 256, 1, 1,
+           smem, r->stream, args);
+}
+
 /* WMMA flash attention for Gemma4 full-attention layers (head_dim 512). Reads the
  * F32 KV cache directly. Grid (n_heads, ceil(M/16)), 1 wave/block, O in LDS. */
 static inline void launch_flash_attn_wmma_hd512(hip_llm_runner *r,
@@ -10414,6 +10730,54 @@ static void moe_topk_softmax(const float *logits, int n, int k, int *out_idx, fl
     }
 }
 
+/* Correctness-first host expert path for raw GGML blocks.  Q8_0 uses the
+ * existing AVX2 dot product; K/legacy formats dequantize one row at a time.
+ * The latter is replaced by paired quantized dot kernels in the optimized
+ * scheduler, but keeping this common fallback makes every supported type safe. */
+static void hllm_cpu_qmatvec(float *dst, const void *base, int type,
+                             int rows, int cols, const float *x, float *tmp) {
+    size_t rb = dequant_row_size(type, cols);
+#if defined(_OPENMP)
+#pragma omp parallel
+    {
+    float *row_tmp = (float *)malloc((size_t)cols * sizeof(float));
+#pragma omp for schedule(static)
+#endif
+    for (int row = 0; row < rows; ++row) {
+        const void *rp = (const unsigned char *)base + (size_t)row * rb;
+        if (type == GGML_TYPE_Q8_0) {
+            dst[row] = vec_dot_q8_0_f32(rp, x, cols);
+            continue;
+        }
+        float *work = tmp;
+#if defined(_OPENMP)
+        work = row_tmp;
+#endif
+        dequant_row(type, rp, work, cols);
+        float sum = 0.0f;
+#if defined(__AVX2__) && defined(__FMA__)
+        __m256 acc = _mm256_setzero_ps();
+        int j = 0;
+        for (; j + 7 < cols; j += 8)
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(work + j), _mm256_loadu_ps(x + j), acc);
+        __m128 lo = _mm256_castps256_ps128(acc);
+        __m128 hi = _mm256_extractf128_ps(acc, 1);
+        __m128 s = _mm_add_ps(lo, hi);
+        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        s = _mm_add_ss(s, _mm_movehdup_ps(s));
+        sum = _mm_cvtss_f32(s);
+        for (; j < cols; ++j) sum += work[j] * x[j];
+#else
+        for (int j = 0; j < cols; ++j) sum += work[j] * x[j];
+#endif
+        dst[row] = sum;
+    }
+#if defined(_OPENMP)
+    free(row_tmp);
+    }
+#endif
+}
+
 /* ======================================================================== */
 /* Public API: forward                                                      */
 /* ======================================================================== */
@@ -10438,6 +10802,12 @@ float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position) {
         launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else {
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    }
+
+    if (r->is_qwen4exp) {
+        int ns = r->hc_count, n = n_embd * ns;
+        void *a[] = { &r->d_hc, &r->d_x, &n_embd, &ns };
+        LAUNCH(r->fn_hc_repeat_f32, (n+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a);
     }
 
     /* Gemma4 scales token embeddings by sqrt(n_embd). This must run for EVERY token
@@ -10520,6 +10890,53 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
 
   launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
                    cl->moe_gate_rows, cl->moe_gate_cols);
+
+  if (r->is_qwen4exp && cl->moe_gate_exps_host) {
+    hipMemcpyAsync(r->h_router_logits, r->d_router_logits,
+                   (size_t)n_experts * sizeof(float), hipMemcpyDeviceToHost, r->stream);
+    hipMemcpyAsync(r->h_moe_input, r->d_xb,
+                   (size_t)n_embd * sizeof(float), hipMemcpyDeviceToHost, r->stream);
+    hipStreamSynchronize(r->stream);
+    int top_idx[64]; float top_w[64];
+    moe_topk_softmax(r->h_router_logits, n_experts, n_experts_used, top_idx, top_w);
+    memset(r->h_moe_output, 0, (size_t)n_embd * sizeof(float));
+    for (int slot = 0; slot < n_experts_used; ++slot) {
+        int e = top_idx[slot];
+        const void *gw = (const unsigned char *)cl->moe_gate_exps_host + (size_t)e*cl->moe_exp_stride_gu;
+        const void *uw = (const unsigned char *)cl->moe_up_exps_host   + (size_t)e*cl->moe_exp_stride_gu;
+        const void *dw = (const unsigned char *)cl->moe_down_exps_host + (size_t)e*cl->moe_exp_stride_d;
+        hllm_cpu_qmatvec(r->h_moe_gate, gw, cl->moe_gate_exps_type,
+                         expert_ff, n_embd, r->h_moe_input, r->h_moe_tmp);
+        hllm_cpu_qmatvec(r->h_moe_up, uw, cl->moe_up_exps_type,
+                         expert_ff, n_embd, r->h_moe_input, r->h_moe_tmp);
+        for (int i = 0; i < expert_ff; ++i) {
+            float v = r->h_moe_gate[i];
+            r->h_moe_gate[i] = (v / (1.0f + expf(-v))) * r->h_moe_up[i];
+        }
+        hllm_cpu_qmatvec(r->h_moe_tmp, dw, cl->moe_down_exps_type,
+                         n_embd, expert_ff, r->h_moe_gate, r->h_moe_up);
+        for (int i = 0; i < n_embd; ++i)
+            r->h_moe_output[i] += top_w[slot] * r->h_moe_tmp[i];
+    }
+    hipMemcpyAsync(r->d_moe_accum, r->h_moe_output,
+                   (size_t)n_embd * sizeof(float), hipMemcpyHostToDevice, r->stream);
+
+    /* The shared expert is small and remains resident on the GPU. */
+    launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
+    launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
+    launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
+                       cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
+    launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
+                       cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
+    launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
+    launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
+                       cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
+    launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_shared_scale, 0, n_embd);
+    r->moe_stats.tokens++;
+    r->moe_stats.assignments += (uint64_t)n_experts_used;
+    r->moe_stats.cpu_assignments += (uint64_t)n_experts_used;
+    return;
+  }
 
   if (r->moe_dev_dispatch_ok) {
     launch_moe_topk(r);
@@ -10650,6 +11067,39 @@ shared_expert:
         launch_scale_add(r, r->d_moe_accum, r->d_xb2, shared_scale, n_embd);
     }
   }
+}
+
+static void forward_hc_mix(hip_llm_runner *r, void *norm_w, void *down_w,
+                           int down_type, void *up_w, int up_type,
+                           void *inject_w, int inject_type, void *mixed) {
+    int ne = r->n_embd, ns = r->hc_count, hcd = ne * ns;
+    float eps = r->rms_norm_eps;
+    void *na[] = { &r->d_hc_norm, &r->d_hc, &norm_w, &ne, &ns, &eps };
+    LAUNCH(r->fn_hc_norm_f32, ns, 1, 1, 256, 1, 1,
+           256*sizeof(float), r->stream, na);
+    launch_matvec_auto(r, r->d_hc_low, down_w, r->d_hc_norm,
+                       r->hc_low_rank, hcd, down_type);
+    {
+        int n = r->hc_low_rank; float scale = 1.0f/(float)ns;
+        void *a[] = { &r->d_hc_low, &n, &scale };
+        LAUNCH(r->fn_hc_silu_scale_f32, (n+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a);
+    }
+    launch_matvec_auto(r, r->d_hc_gate, up_w, r->d_hc_low, hcd,
+                       r->hc_low_rank, up_type);
+    {
+        void *a[] = { &mixed, &r->d_hc_norm, &r->d_hc_gate, &ne, &ns };
+        LAUNCH(r->fn_hc_mix_f32, (ne+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a);
+    }
+    if (inject_w) {
+        launch_matvec_auto(r, r->d_hc_inject, inject_w, r->d_hc_norm,
+                           ns, hcd, inject_type);
+    }
+}
+
+static void forward_hc_combine(hip_llm_runner *r, void *block) {
+    int ne=r->n_embd, ns=r->hc_count, n=ne*ns;
+    void *a[] = { &r->d_hc, &block, &r->d_hc_inject, &ne, &ns };
+    LAUNCH(r->fn_hc_combine_f32, (n+255)/256, 1, 1, 256, 1, 1, 0, r->stream, a);
 }
 
 /* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch
@@ -10923,8 +11373,13 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
     float eps      = r->rms_norm_eps;
     hip_layer *cl  = &r->layers[l];
 
+    /* Qwen4 mixes and normalizes its four residual streams here. */
+    if (r->is_qwen4exp) {
+        forward_hc_mix(r, cl->hc_attn_norm_w, cl->hc_attn_down_w,
+                       cl->hc_attn_down_type, cl->hc_attn_up_w, cl->hc_attn_up_type,
+                       cl->hc_attn_inject_w, cl->hc_attn_inject_type, r->d_xb);
     /* Pre-attention RMSNorm; fused with pending MoE residual from previous layer. */
-    if (r->moe_add_pending) {
+    } else if (r->moe_add_pending) {
         void *a[] = { &r->d_x, &r->d_moe_accum, &r->d_xb, &cl->attn_norm_w, &n_embd, &eps };
         LAUNCH(r->fn_res_rmsnorm_f32, 1, 1, 1, 256, 1, 1, 256 * sizeof(float), r->stream, a);
         r->moe_add_pending = 0;
@@ -11181,14 +11636,22 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             launch_rope_devp(r, r->d_q, n_heads, head_dim, r->rope_freq_base);
             launch_rope_devp(r, r->d_k, n_kv_heads, head_dim, r->rope_freq_base);
 
-            launch_kv_store_devp(r, r->d_key_cache[l], r->d_value_cache[l],
-                                 r->d_k, r->d_v, kv_dim, r->max_seq_len);
-
             float scale = 1.0f / sqrtf((float)head_dim);
-            size_t smem_attn = (size_t)r->max_seq_len * sizeof(float);
-            launch_attention_devp(r, r->d_xb2, r->d_q,
-                                   r->d_key_cache[l], r->d_value_cache[l],
-                                   n_heads, n_kv_heads, head_dim, kv_dim, scale, smem_attn);
+            if (r->is_qwen4exp) {
+                launch_kv_store_f16_devp(r, r->d_key_cache[l], r->d_value_cache[l],
+                                         r->d_k, r->d_v, kv_dim);
+                /* QSA is exactly dense through indexer_top_k+ratio-1 tokens. */
+                launch_attn_decode_flash_f16(r, r->d_xb2, r->d_q,
+                                             r->d_key_cache[l], r->d_value_cache[l],
+                                             n_heads, n_kv_heads, head_dim, kv_dim, scale);
+            } else {
+                launch_kv_store_devp(r, r->d_key_cache[l], r->d_value_cache[l],
+                                     r->d_k, r->d_v, kv_dim, r->max_seq_len);
+                size_t smem_attn = (size_t)r->max_seq_len * sizeof(float);
+                launch_attention_devp(r, r->d_xb2, r->d_q,
+                                       r->d_key_cache[l], r->d_value_cache[l],
+                                       n_heads, n_kv_heads, head_dim, kv_dim, scale, smem_attn);
+            }
 
             int q_dim_local = n_heads * head_dim;
             if (r->ssm_fused_decode && cl->attn_output_type == GGML_TYPE_Q6_K) {
@@ -11255,6 +11718,16 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
 
             launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
                               cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+        }
+
+        if (r->is_qwen4exp) {
+            forward_hc_combine(r, r->d_xb);
+            forward_hc_mix(r, cl->hc_ffn_norm_w, cl->hc_ffn_down_w,
+                           cl->hc_ffn_down_type, cl->hc_ffn_up_w, cl->hc_ffn_up_type,
+                           cl->hc_ffn_inject_w, cl->hc_ffn_inject_type, r->d_xb);
+            forward_moe_ffn(r, cl);
+            forward_hc_combine(r, r->d_moe_accum);
+            return;
         }
 
         /* Residual + FFN RMSNorm fused: x += xb; xb = rmsnorm(x)*w */
@@ -11355,9 +11828,15 @@ static void forward_blocks_body(hip_llm_runner *r) {
             }
         }
     }
-    /* Final RMSNorm */
-    if (r->moe_add_pending) { launch_add(r, r->d_x, r->d_moe_accum, r->n_embd); r->moe_add_pending = 0; }
-    launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, r->n_embd, r->rms_norm_eps);
+    if (r->is_qwen4exp) {
+        forward_hc_mix(r, r->hc_head_norm_w, r->hc_head_down_w,
+                       r->hc_head_down_type, r->hc_head_up_w,
+                       r->hc_head_up_type, NULL, 0, r->d_x);
+    } else {
+        /* Final RMSNorm */
+        if (r->moe_add_pending) { launch_add(r, r->d_x, r->d_moe_accum, r->n_embd); r->moe_add_pending = 0; }
+        launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, r->n_embd, r->rms_norm_eps);
+    }
 }
 
 /* === Phase 5 graph capture =============================================== */
@@ -12463,7 +12942,17 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_ds_tmp)   hipFree(r->d_ds_tmp);
     if (r->d_router_logits) hipFree(r->d_router_logits);
     if (r->d_moe_accum)    hipFree(r->d_moe_accum);
+    if (r->d_moe_idx)      hipFree(r->d_moe_idx);
+    if (r->d_moe_w)        hipFree(r->d_moe_w);
+    if (r->d_shared_scale) hipFree(r->d_shared_scale);
+    if (r->d_moe_act8)     hipFree(r->d_moe_act8);
+    if (r->d_router_counter) hipFree(r->d_router_counter);
     free(r->h_router_logits);
+    free(r->h_moe_input);
+    free(r->h_moe_output);
+    free(r->h_moe_gate);
+    free(r->h_moe_up);
+    free(r->h_moe_tmp);
     if (r->d_xb_q)    hipFree(r->d_xb_q);
     if (r->d_xb_scale) hipFree(r->d_xb_scale);
 
@@ -12591,6 +13080,24 @@ void hip_llm_free(hip_llm_runner *r) {
             if (cl->moe_shared_ffn_gate_w)  hipFree(cl->moe_shared_ffn_gate_w);
             if (cl->moe_shared_ffn_up_w)    hipFree(cl->moe_shared_ffn_up_w);
             if (cl->moe_shared_ffn_down_w)  hipFree(cl->moe_shared_ffn_down_w);
+            if (cl->hc_attn_norm_w)   hipFree(cl->hc_attn_norm_w);
+            if (cl->hc_attn_down_w)   hipFree(cl->hc_attn_down_w);
+            if (cl->hc_attn_up_w)     hipFree(cl->hc_attn_up_w);
+            if (cl->hc_attn_inject_w) hipFree(cl->hc_attn_inject_w);
+            if (cl->hc_ffn_norm_w)    hipFree(cl->hc_ffn_norm_w);
+            if (cl->hc_ffn_down_w)    hipFree(cl->hc_ffn_down_w);
+            if (cl->hc_ffn_up_w)      hipFree(cl->hc_ffn_up_w);
+            if (cl->hc_ffn_inject_w)  hipFree(cl->hc_ffn_inject_w);
+            if (cl->index_q_w)        hipFree(cl->index_q_w);
+            if (cl->index_k_w)        hipFree(cl->index_k_w);
+            if (cl->index_q_norm_w)   hipFree(cl->index_q_norm_w);
+            if (cl->index_k_norm_w)   hipFree(cl->index_k_norm_w);
+            if (cl->ple_key_w)        hipFree(cl->ple_key_w);
+            if (cl->ple_value_w)      hipFree(cl->ple_value_w);
+            if (cl->ple_norm_key_w)   hipFree(cl->ple_norm_key_w);
+            if (cl->ple_norm_query_w) hipFree(cl->ple_norm_query_w);
+            if (cl->ple_norm_conv_w)  hipFree(cl->ple_norm_conv_w);
+            if (cl->ple_conv1d_w)     hipFree(cl->ple_conv1d_w);
             /* Gemma4 per-layer weights */
             if (cl->post_attn_norm_w)  hipFree(cl->post_attn_norm_w);
             if (cl->post_ffw_norm_w)   hipFree(cl->post_ffw_norm_w);
@@ -12605,6 +13112,14 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_output_norm) hipFree(r->d_output_norm);
     if (r->d_output_w && r->d_output_w != r->d_token_embd) hipFree(r->d_output_w);
     if (r->d_logits) hipFree(r->d_logits);
+    if (r->hc_head_norm_w) hipFree(r->hc_head_norm_w);
+    if (r->hc_head_down_w) hipFree(r->hc_head_down_w);
+    if (r->hc_head_up_w)   hipFree(r->hc_head_up_w);
+    if (r->d_hc)           hipFree(r->d_hc);
+    if (r->d_hc_norm)      hipFree(r->d_hc_norm);
+    if (r->d_hc_gate)      hipFree(r->d_hc_gate);
+    if (r->d_hc_low)       hipFree(r->d_hc_low);
+    if (r->d_hc_inject)    hipFree(r->d_hc_inject);
 
     /* === Phase 5: graph + device-int cleanup === */
     if (r->graph_exec_logits) hipGraphExecDestroy(r->graph_exec_logits);
@@ -12869,3 +13384,13 @@ int hip_llm_n_embd(const hip_llm_runner *r) { return r ? r->n_embd : 0; }
 int hip_llm_n_layers(const hip_llm_runner *r) { return r ? r->n_layers : 0; }
 int hip_llm_n_vocab(const hip_llm_runner *r) { return r ? r->n_vocab : 0; }
 int hip_llm_max_seq_len(const hip_llm_runner *r) { return r ? r->max_seq_len : 0; }
+
+int hip_llm_get_moe_stats(const hip_llm_runner *r, hip_llm_moe_stats *stats) {
+    if (!r || !stats) return -1;
+    *stats = r->moe_stats;
+    return 0;
+}
+
+void hip_llm_reset_moe_stats(hip_llm_runner *r) {
+    if (r) memset(&r->moe_stats, 0, sizeof(r->moe_stats));
+}

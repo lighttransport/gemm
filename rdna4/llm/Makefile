@@ -6,8 +6,9 @@
 CC = gcc
 HIPCC ?= hipcc
 ROCM_PATH ?= /opt/rocm
-CFLAGS = -O3 -Wall -Wextra -I.. -march=native
-LDFLAGS = -ldl -lm -lpthread
+ROCM_LIB ?= $(dir $(firstword $(wildcard $(ROCM_PATH)/lib/libhipblaslt.so $(ROCM_PATH)/core-*/lib/libhipblaslt.so)))
+CFLAGS = -O3 -Wall -Wextra -I.. -march=native -fopenmp
+LDFLAGS = -ldl -lm -lpthread -fopenmp
 
 # Sources
 ROCEW_SRC = ../rocew.c
@@ -27,7 +28,7 @@ all: $(TARGET)
 
 ifeq ($(HIPBLASLT),1)
 CFLAGS += -DLLM_HIPBLASLT_ENABLED
-LDFLAGS += -L$(ROCM_PATH)/lib -lhipblaslt -lstdc++
+LDFLAGS += -L$(ROCM_LIB) -Wl,-rpath,$(ROCM_LIB) -lhipblaslt -lstdc++
 BLASLT_OBJ = mm_blaslt_bridge.o
 else
 BLASLT_OBJ =

@@ -22,6 +22,39 @@ extern "C" {
 
 typedef struct hip_llm_runner hip_llm_runner;
 
+typedef enum {
+    HIP_LLM_MOE_AUTO = 0,
+    HIP_LLM_MOE_HYBRID,
+    HIP_LLM_MOE_CPU,
+    HIP_LLM_MOE_GPU_STREAM,
+} hip_llm_moe_mode;
+
+typedef struct {
+    uint32_t struct_size;
+    int max_seq_len;              /* <= 0: model default */
+    hip_llm_moe_mode moe_mode;
+    uint64_t moe_cache_bytes;     /* 0: consume safe remaining VRAM */
+    int moe_cpu_threads;          /* <= 0: physical cores */
+    uint64_t host_register_bytes; /* 0: automatic */
+    uint64_t gpu_reserve_bytes;   /* 0: default 1 GiB */
+} hip_llm_load_options;
+
+typedef struct {
+    uint64_t tokens;
+    uint64_t assignments;
+    uint64_t gpu_assignments;
+    uint64_t cpu_assignments;
+    uint64_t cache_hits;
+    uint64_t cache_misses;
+    uint64_t cache_evictions;
+    uint64_t h2d_bytes;
+    double cpu_ms;
+    double copy_ms;
+    double gpu_moe_ms;
+} hip_llm_moe_stats;
+
+void hip_llm_load_options_default(hip_llm_load_options *options);
+
 /* Initialize HIP context + compile kernels via HIPRTC for the given device.
  * Returns NULL on failure. verbose: 0=quiet, 1=info, 2=debug */
 hip_llm_runner *hip_llm_init(int device_id, int verbose);
@@ -29,6 +62,14 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose);
 /* Load model weights from GGUF onto GPU. max_seq_len <= 0 uses model default.
  * Returns 0 on success, -1 on error. */
 int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len);
+
+/* Load a logical model spanning one or more GGUF shards.  The caller owns the
+ * shard mappings and must keep them alive until hip_llm_offload/free. */
+int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
+                                 const hip_llm_load_options *options);
+
+int hip_llm_get_moe_stats(const hip_llm_runner *r, hip_llm_moe_stats *stats);
+void hip_llm_reset_moe_stats(hip_llm_runner *r);
 
 /* Load Qwen3 dense weights from a safetensors file (text-encoder path). */
 int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_path, int max_seq_len);

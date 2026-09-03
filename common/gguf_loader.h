@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -143,8 +144,21 @@ typedef struct {
 #endif
 } gguf_context;
 
+/* A logical GGUF model may be split across several physical files.  The
+ * metadata is normally repeated in every shard, while tensors live in exactly
+ * one shard (the first shard is allowed to contain no tensors). */
+typedef struct {
+    int n_shards;
+    gguf_context **shards;
+    gguf_context *metadata;
+} gguf_shards;
+
 gguf_context *gguf_open(const char *path, int use_mmap);
 void gguf_close(gguf_context *ctx);
+gguf_shards *gguf_open_shards(const char *path, int use_mmap);
+void gguf_close_shards(gguf_shards *model);
+int gguf_shards_find_tensor(const gguf_shards *model, const char *name,
+                            const gguf_context **out_ctx, int *out_index);
 const char *gguf_tensor_name(const gguf_context *ctx, int i);
 void *gguf_tensor_data(const gguf_context *ctx, int i);
 size_t gguf_tensor_size(const gguf_context *ctx, int i);
@@ -507,6 +521,130 @@ void gguf_close(gguf_context *ctx) {
         free(ctx->data);
     }
     free(ctx);
+}
+
+static int gguf_kv_as_int(const gguf_context *ctx, const char *key, int def) {
+    int i = gguf_find_key(ctx, key);
+    if (i < 0) return def;
+    switch (ctx->kv[i].type) {
+        case GGUF_TYPE_UINT8:  return (int)ctx->kv[i].value.u8;
+        case GGUF_TYPE_INT8:   return (int)ctx->kv[i].value.i8;
+        case GGUF_TYPE_UINT16: return (int)ctx->kv[i].value.u16;
+        case GGUF_TYPE_INT16:  return (int)ctx->kv[i].value.i16;
+        case GGUF_TYPE_UINT32: return (int)ctx->kv[i].value.u32;
+        case GGUF_TYPE_INT32:  return ctx->kv[i].value.i32;
+        case GGUF_TYPE_UINT64: return (int)ctx->kv[i].value.u64;
+        case GGUF_TYPE_INT64:  return (int)ctx->kv[i].value.i64;
+        default: return def;
+    }
+}
+
+static char *gguf_shard_path(const char *path, int shard, int count) {
+    const size_t tag_len = strlen("-00001-of-00001");
+    const char *marker = NULL;
+    const char *p = path;
+    while ((p = strstr(p, "-00001-of-")) != NULL) { marker = p; p++; }
+    if (!marker || strlen(marker) < strlen("-00001-of-00001.gguf")) return NULL;
+
+    size_t prefix = (size_t)(marker - path);
+    size_t suffix_off = prefix + tag_len;
+    size_t suffix = strlen(path + suffix_off);
+    char *result = (char *)malloc(prefix + tag_len + suffix + 2);
+    if (!result) return NULL;
+    memcpy(result, path, prefix);
+    int nw = snprintf(result + prefix, tag_len + 2, "-%05d-of-%05d", shard + 1, count);
+    if (nw != (int)tag_len) { free(result); return NULL; }
+    memcpy(result + prefix + tag_len, path + suffix_off, suffix + 1);
+    return result;
+}
+
+gguf_shards *gguf_open_shards(const char *path, int use_mmap) {
+    if (!path) return NULL;
+    gguf_context *first = gguf_open(path, use_mmap);
+    if (!first) return NULL;
+
+    int count = gguf_kv_as_int(first, "split.count", 1);
+    if (count < 1 || count > 99999) {
+        fprintf(stderr, "gguf: invalid split.count=%d\n", count);
+        gguf_close(first);
+        return NULL;
+    }
+
+    gguf_shards *model = (gguf_shards *)calloc(1, sizeof(*model));
+    if (!model) { gguf_close(first); return NULL; }
+    model->n_shards = count;
+    model->shards = (gguf_context **)calloc((size_t)count, sizeof(*model->shards));
+    if (!model->shards) { free(model); gguf_close(first); return NULL; }
+    model->shards[0] = first;
+    model->metadata = first;
+
+    for (int s = 1; s < count; ++s) {
+        char *shard_path = gguf_shard_path(path, s, count);
+        if (!shard_path) {
+            fprintf(stderr, "gguf: cannot derive shard %d path from %s\n", s + 1, path);
+            gguf_close_shards(model);
+            return NULL;
+        }
+        model->shards[s] = gguf_open(shard_path, use_mmap);
+        free(shard_path);
+        if (!model->shards[s]) {
+            fprintf(stderr, "gguf: failed to open shard %d of %d\n", s + 1, count);
+            gguf_close_shards(model);
+            return NULL;
+        }
+        int shard_no = gguf_kv_as_int(model->shards[s], "split.no", s);
+        int shard_count = gguf_kv_as_int(model->shards[s], "split.count", count);
+        if (shard_no != s || shard_count != count) {
+            fprintf(stderr, "gguf: inconsistent split metadata in shard %d\n", s + 1);
+            gguf_close_shards(model);
+            return NULL;
+        }
+    }
+
+    /* Duplicate tensor names make lookup ambiguous and usually indicate that
+     * mismatched shard sets were combined.  This is deliberately checked once
+     * at load rather than on every tensor lookup. */
+    for (int a = 0; a < count; ++a) {
+        for (uint64_t i = 0; i < model->shards[a]->n_tensors; ++i) {
+            const char *name = model->shards[a]->tensors[i].name.str;
+            for (int b = a + 1; b < count; ++b) {
+                for (uint64_t j = 0; j < model->shards[b]->n_tensors; ++j) {
+                    if (strcmp(name, model->shards[b]->tensors[j].name.str) == 0) {
+                        fprintf(stderr, "gguf: duplicate tensor '%s' in shards %d and %d\n",
+                                name, a + 1, b + 1);
+                        gguf_close_shards(model);
+                        return NULL;
+                    }
+                }
+            }
+        }
+    }
+    return model;
+}
+
+void gguf_close_shards(gguf_shards *model) {
+    if (!model) return;
+    if (model->shards) {
+        for (int i = 0; i < model->n_shards; ++i) gguf_close(model->shards[i]);
+        free(model->shards);
+    }
+    free(model);
+}
+
+int gguf_shards_find_tensor(const gguf_shards *model, const char *name,
+                            const gguf_context **out_ctx, int *out_index) {
+    if (!model || !name) return -1;
+    for (int s = 0; s < model->n_shards; ++s) {
+        const gguf_context *ctx = model->shards[s];
+        for (uint64_t i = 0; i < ctx->n_tensors; ++i) {
+            if (strcmp(ctx->tensors[i].name.str, name) == 0) {
+                if (out_ctx) *out_ctx = ctx;
+                if (out_index) *out_index = (int)i;
+                return 0;
+            }
+        }
+    }
+    return -1;
 }
 
 const char *gguf_tensor_name(const gguf_context *ctx, int i) {

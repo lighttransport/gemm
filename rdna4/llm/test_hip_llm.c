@@ -332,17 +332,18 @@ int main(int argc, char **argv) {
 
     /* Load GGUF */
     fprintf(stderr, "Loading GGUF: %s\n", model_path);
-    gguf_context *gguf = gguf_open(model_path, 1);
-    if (!gguf) {
+    gguf_shards *gguf_model = gguf_open_shards(model_path, 1);
+    if (!gguf_model) {
         fprintf(stderr, "Failed to open GGUF file\n");
         return 1;
     }
+    gguf_context *gguf = gguf_model->metadata;
 
     /* Load tokenizer */
     bpe_vocab *vocab = bpe_vocab_load(gguf);
     if (!vocab) {
         fprintf(stderr, "Failed to load vocab\n");
-        gguf_close(gguf);
+        gguf_close_shards(gguf_model);
         return 1;
     }
     fprintf(stderr, "Vocab: %d tokens\n", vocab->n_tokens);
@@ -355,7 +356,7 @@ int main(int argc, char **argv) {
     if (n_tokens <= 0) {
         fprintf(stderr, "Tokenization failed\n");
         bpe_vocab_free(vocab);
-        gguf_close(gguf);
+        gguf_close_shards(gguf_model);
         return 1;
     }
     /* Prepend BOS (Gemma expects it; bpe_tokenize here does not add it). Default to
@@ -412,19 +413,22 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to init HIP runner\n");
         if (cpu_model) transformer_free(cpu_model);
         bpe_vocab_free(vocab);
-        gguf_close(gguf);
+        gguf_close_shards(gguf_model);
         return 1;
     }
     if (getenv("LLM_DEBUG_LAYERS")) hip_llm_set_debug(gpu, 1);
 
     /* Load weights to GPU */
     fprintf(stderr, "\n=== Loading weights to GPU ===\n");
-    if (hip_llm_load_weights(gpu, gguf, max_seq_len) != 0) {
+    hip_llm_load_options load_options;
+    hip_llm_load_options_default(&load_options);
+    load_options.max_seq_len = max_seq_len;
+    if (hip_llm_load_weights_sharded(gpu, gguf_model, &load_options) != 0) {
         fprintf(stderr, "Failed to load weights to GPU\n");
         hip_llm_free(gpu);
         if (cpu_model) transformer_free(cpu_model);
         bpe_vocab_free(vocab);
-        gguf_close(gguf);
+        gguf_close_shards(gguf_model);
         return 1;
     }
 
@@ -595,7 +599,7 @@ bench_done: ;
     hip_llm_free(gpu);
     if (cpu_model) transformer_free(cpu_model);
     bpe_vocab_free(vocab);
-    gguf_close(gguf);
+    gguf_close_shards(gguf_model);
 
     return pass ? 0 : 1;
 }
