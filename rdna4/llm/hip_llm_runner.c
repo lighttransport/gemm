@@ -747,7 +747,9 @@ static const char *hip_kernel_source =
 "    const unsigned char *sc=bp+4;int is=2*c;unsigned char s0,m0,s1,m1;\n"
 "    if(is<4){s0=sc[is]&63;m0=sc[is+4]&63;}else{s0=(sc[is+4]&15)|((sc[is-4]>>6)<<4);m0=(sc[is+4]>>4)|((sc[is]>>6)<<4);}\n"
 "    if(is+1<4){s1=sc[is+1]&63;m1=sc[is+5]&63;}else{s1=(sc[is+5]&15)|((sc[is-3]>>6)<<4);m1=(sc[is+5]>>4)|((sc[is+1]>>6)<<4);}\n"
-"    const unsigned char *q=bp+16+c*32;float a=0.0f;for(int l=0;l<32;l++)\n"
+"    const unsigned char *q=bp+16+c*32;float a=0.0f;\n"
+"    #pragma unroll\n"
+"    for(int l=0;l<32;l++)\n"
 "        a+=(d*s0*(q[l]&15)-dm*m0)*x[l]+(d*s1*(q[l]>>4)-dm*m1)*x[l+32];return a;\n"
 "}\n"
 "__global__ void qwen4_gateup_silu_q4k_selected(float *dst,const unsigned char *gate,\n"
@@ -764,13 +766,15 @@ static const char *hip_kernel_source =
 "}\n"
 "__global__ void qwen4_down_accum_q5_1_selected(float *acc,const unsigned char *down,\n"
 "        const float *act,const float *weights,const int *slots,int K,int rows,int cols,long long ds){\n"
-"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp;if(row>=rows)return;\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*4+warp;if(row>=rows)return;\n"
 "    int nb=cols/32,rb=nb*24;float total=0.0f;\n"
 "    for(int sel=0;sel<K;sel++){const unsigned char *rp=down+(long long)slots[sel]*ds+(size_t)row*rb;\n"
 "        const float *x=act+(size_t)sel*cols;float sum=0.0f;for(int b=lane;b<nb;b+=32){\n"
 "            const unsigned char *bp=rp+b*24;float d=half_to_float(*(const half_raw *)bp),m=half_to_float(*(const half_raw *)(bp+2));\n"
 "            unsigned qh=(unsigned)bp[4]|((unsigned)bp[5]<<8)|((unsigned)bp[6]<<16)|((unsigned)bp[7]<<24);\n"
-"            const unsigned char *q=bp+8;float s=0.0f;for(int j=0;j<16;j++){int a=(q[j]&15)|(((qh>>j)&1)<<4);\n"
+"            const unsigned char *q=bp+8;float s=0.0f;\n"
+"            #pragma unroll\n"
+"            for(int j=0;j<16;j++){int a=(q[j]&15)|(((qh>>j)&1)<<4);\n"
 "                int v=(q[j]>>4)|(((qh>>(j+16))&1)<<4);s+=(d*a+m)*x[b*32+j]+(d*v+m)*x[b*32+j+16];}sum+=s;}\n"
 "        for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)total+=sum*weights[sel];}\n"
 "    if(lane==0)acc[row]=total;\n"
@@ -4630,11 +4634,12 @@ static const char *hip_kernel_source =
 "    if (rank != (unsigned)ne) return;   /* only the last-finished block continues */\n"
 "    /* topK + softmax over logits[0..ne) */\n"
 "    __shared__ float sval[256]; __shared__ int sidx[256]; __shared__ int chosen[64];\n"
-"    float my = (tid < ne) ? logits[tid] : -1e30f;\n"
+"    float a = (tid < ne) ? logits[tid] : -1e30f; int ai = tid;\n"
+"    float b = (tid + 256 < ne) ? logits[tid + 256] : -1e30f; int bi = tid + 256;\n"
 "    for (int ki = 0; ki < K; ki++) {\n"
-"        float v = my;\n"
-"        for (int j = 0; j < ki; j++) if (chosen[j] == tid) v = -1e30f;\n"
-"        sval[tid] = v; sidx[tid] = tid; __syncthreads();\n"
+"        for (int j = 0; j < ki; j++) { if (chosen[j] == ai) a = -1e30f; if (chosen[j] == bi) b = -1e30f; }\n"
+"        float v = a; int vi = ai; if (b > v || (b == v && bi < vi)) { v = b; vi = bi; }\n"
+"        sval[tid] = v; sidx[tid] = vi; __syncthreads();\n"
 "        for (int st = 128; st > 0; st >>= 1) {\n"
 "            if (tid < st && tid + st < 256) {\n"
 "                if (sval[tid+st] > sval[tid]) { sval[tid]=sval[tid+st]; sidx[tid]=sidx[tid+st]; }\n"
@@ -4846,6 +4851,26 @@ static const char *hip_kernel_source =
 "    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
 "    if (lane == 0) accum[row] += scale_ptr[0] * sum;\n"
 "}\n"
+"/* Fused shared expert for Q8_0 weights used by Qwen4 Q4_K_XL. */\n"
+"__global__ void shexp_gateup_silu_q8(float *out,const unsigned char *gw,const unsigned char *uw,\n"
+"        const float *x,int eff,int n_cols){int warp=threadIdx.x/32,lane=threadIdx.x%32;\n"
+"    int row=blockIdx.x*4+warp;if(row>=eff)return;int nb=n_cols/32,rb=nb*36;float sg=0,su=0;\n"
+"    const unsigned char *gr=gw+(size_t)row*rb,*ur=uw+(size_t)row*rb;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *gb=gr+b*36,*ub=ur+b*36;const float *xb=x+b*32;\n"
+"        const signed char *gq=(const signed char *)(gb+4),*uq=(const signed char *)(ub+4);float ag=0,au=0;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++){ag+=(float)gq[j]*xb[j];au+=(float)uq[j]*xb[j];}\n"
+"        sg+=ag*half_to_float(*(const half_raw *)gb);su+=au*half_to_float(*(const half_raw *)ub);}\n"
+"    for(int o=16;o>0;o>>=1){sg+=__shfl_down(sg,o);su+=__shfl_down(su,o);}\n"
+"    if(lane==0)out[row]=(sg/(1.0f+expf(-sg)))*su;}\n"
+"__global__ void shexp_down_accum_q8(float *accum,const unsigned char *dw,const float *x,\n"
+"        int n_embd,int eff,const float *scale_ptr){int warp=threadIdx.x/32,lane=threadIdx.x%32;\n"
+"    int row=blockIdx.x*4+warp;if(row>=n_embd)return;int nb=eff/32,rb=nb*36;float sum=0;\n"
+"    const unsigned char *rp=dw+(size_t)row*rb;for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;\n"
+"        const signed char *q=(const signed char *)(bp+4);const float *xb=x+b*32;float s=0;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)accum[row]+=scale_ptr[0]*sum;}\n"
 "/* ---- matvec_iq1_s_f32: IQ1_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq1_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -7489,6 +7514,8 @@ struct hip_llm_runner {
     hipFunction_t fn_moe_down_accum_iq3s;   /* decode: all-K experts down+w-accum */
     hipFunction_t fn_shexp_gateup_silu_q6k; /* decode: shared expert gate+up+silu */
     hipFunction_t fn_shexp_down_accum_q6k;  /* decode: shared expert down+scale-add */
+    hipFunction_t fn_shexp_gateup_silu_q8;
+    hipFunction_t fn_shexp_down_accum_q8;
     hipFunction_t fn_ssm_prep_f32;          /* decode: fused SSM aux chain */
     hipFunction_t fn_ssm_matvec4_q6k;       /* decode: fused 4 SSM input matvecs */
     hipFunction_t fn_matvec_qkv_q6k;        /* decode: fused attn q/k/v matvecs */
@@ -7996,6 +8023,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(moe_down_accum_iq3s);
     GET_FUNC(shexp_gateup_silu_q6k);
     GET_FUNC(shexp_down_accum_q6k);
+    GET_FUNC(shexp_gateup_silu_q8);
+    GET_FUNC(shexp_down_accum_q8);
     GET_FUNC(ssm_prep_f32);
     GET_FUNC(ssm_matvec4_q6k);
     GET_FUNC(matvec_qkv_q6k);
@@ -10243,9 +10272,9 @@ static inline void launch_qwen4_experts_q4k_q51_selected(hip_llm_runner *r,
     void *da[]={&r->d_moe_accum,&cl->moe_cache_down,&r->d_moe_act8,
                 &r->d_moe_w,&r->d_moe_idx,&K,&n_embd,&expert_ff,&ds};
     /* expert_ff=640 has 20 Q5_1 blocks per row. One wave covers one row;
-     * packing eight rows per workgroup minimizes scheduling overhead. */
-    LAUNCH(r->fn_qwen4_down_accum_q5_1_selected, (n_embd+7)/8, 1, 1,
-           256, 1, 1, 0, r->stream, da);
+     * pack several rows per workgroup to reduce scheduling overhead. */
+    LAUNCH(r->fn_qwen4_down_accum_q5_1_selected, (n_embd+3)/4, 1, 1,
+           128, 1, 1, 0, r->stream, da);
 }
 
 static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
@@ -11366,22 +11395,27 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
       return;
   }
 
-  launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
-                   cl->moe_gate_rows, cl->moe_gate_cols);
-
   if (r->is_qwen4exp && cl->moe_gate_exps_host) {
     int *top_idx = (int *)(r->h_router_logits + n_experts);
     float *top_w = r->h_router_logits + n_experts + 64;
     const char *gpu_topk_env = getenv("LLM_QWEN4_GPU_TOPK");
     int use_gpu_topk = !gpu_topk_env || atoi(gpu_topk_env) != 0;
     if (use_gpu_topk) {
-        launch_moe_topk(r);
+        int ne = n_experts, k = n_experts_used, nc = n_embd;
+        void *ra[] = { &cl->moe_gate_w_bf16, &cl->moe_shared_gate_w_bf16,
+                       &r->d_xb, &ne, &k, &nc, &r->d_router_logits,
+                       &r->d_moe_idx, &r->d_moe_w, &r->d_shared_scale,
+                       &r->d_router_counter };
+        LAUNCH(r->fn_moe_router_fused, ne + 1, 1, 1, 256, 1, 1,
+               0, r->stream, ra);
         hipMemcpyAsync(top_idx, r->d_moe_idx, (size_t)n_experts_used*sizeof(int),
                        hipMemcpyDeviceToHost, r->stream);
         hipMemcpyAsync(top_w, r->d_moe_w, (size_t)n_experts_used*sizeof(float),
                        hipMemcpyDeviceToHost, r->stream);
         hipStreamSynchronize(r->stream);
     } else {
+        launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
+                          cl->moe_gate_rows, cl->moe_gate_cols);
         hipMemcpyAsync(r->h_router_logits, r->d_router_logits,
                        (size_t)n_experts*sizeof(float), hipMemcpyDeviceToHost, r->stream);
         hipStreamSynchronize(r->stream);
@@ -11494,20 +11528,47 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
     }
 
     /* The shared expert is small and remains resident on the GPU. */
-    launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
-    launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
-    launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
-                       cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
-    launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
-                       cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
-    launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
-    launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
-                       cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
-    launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_shared_scale, 0, n_embd);
+    if (!use_gpu_topk) {
+        launch_matvec_f32(r, r->d_shared_scale, cl->moe_shared_gate_w, r->d_xb, 1, n_embd);
+        launch_sigmoid_scalar(r, r->d_shared_scale, r->d_shared_scale);
+    }
+    int shared_q6 = cl->moe_shared_gate_type == GGML_TYPE_Q6_K &&
+                    cl->moe_shared_up_type   == GGML_TYPE_Q6_K &&
+                    cl->moe_shared_down_type == GGML_TYPE_Q6_K;
+    int shared_q8 = cl->moe_shared_gate_type == GGML_TYPE_Q8_0 &&
+                    cl->moe_shared_up_type   == GGML_TYPE_Q8_0 &&
+                    cl->moe_shared_down_type == GGML_TYPE_Q8_0;
+    if (r->moe_fused_decode && (shared_q6 || shared_q8)) {
+        int eff = shared_expert_ff;
+        void *a1[] = { &r->d_gate, &cl->moe_shared_ffn_gate_w,
+                       &cl->moe_shared_ffn_up_w, &r->d_xb, &eff, &n_embd };
+        hipFunction_t gateup_fn = shared_q6 ? r->fn_shexp_gateup_silu_q6k : r->fn_shexp_gateup_silu_q8;
+        hipFunction_t down_fn = shared_q6 ? r->fn_shexp_down_accum_q6k : r->fn_shexp_down_accum_q8;
+        unsigned shared_threads = shared_q6 ? 256 : 128;
+        int shared_rows = shared_q6 ? 8 : 4;
+        LAUNCH(gateup_fn, (eff + shared_rows - 1) / shared_rows, 1, 1,
+               shared_threads, 1, 1, 0, r->stream, a1);
+        void *a2[] = { &r->d_moe_accum, &cl->moe_shared_ffn_down_w,
+                       &r->d_gate, &n_embd, &eff, &r->d_shared_scale };
+        LAUNCH(down_fn, (n_embd + shared_rows - 1) / shared_rows, 1, 1,
+               shared_threads, 1, 1, 0, r->stream, a2);
+    } else {
+        launch_matvec_auto(r, r->d_gate, cl->moe_shared_ffn_gate_w, r->d_xb,
+                           cl->moe_shared_gate_rows, cl->moe_shared_gate_cols, cl->moe_shared_gate_type);
+        launch_matvec_auto(r, r->d_up, cl->moe_shared_ffn_up_w, r->d_xb,
+                           cl->moe_shared_up_rows, cl->moe_shared_up_cols, cl->moe_shared_up_type);
+        launch_silu_mul(r, r->d_gate, r->d_up, shared_expert_ff);
+        launch_matvec_auto(r, r->d_xb2, cl->moe_shared_ffn_down_w, r->d_gate,
+                           cl->moe_shared_down_rows, cl->moe_shared_down_cols, cl->moe_shared_down_type);
+        launch_scale_add_dev(r, r->d_moe_accum, r->d_xb2, r->d_shared_scale, 0, n_embd);
+    }
     r->moe_stats.tokens++;
     r->moe_stats.assignments += (uint64_t)n_experts_used;
     return;
   }
+
+  launch_matvec_f32(r, r->d_router_logits, cl->moe_gate_w, r->d_xb,
+                    cl->moe_gate_rows, cl->moe_gate_cols);
 
   if (r->moe_dev_dispatch_ok) {
     launch_moe_topk(r);
