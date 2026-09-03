@@ -780,7 +780,7 @@ static const char *hip_kernel_source =
 "}\n"
 "__global__ void qwen4_down_accum_q5_1_selected(float *acc,const unsigned char *down,\n"
 "        const float *act,const float *weights,const int *slots,int K,int rows,int cols,long long ds){\n"
-"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*4+warp;if(row>=rows)return;\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp;if(row>=rows)return;\n"
 "    int nb=cols/32,rb=nb*24;float total=0.0f;\n"
 "    for(int sel=0;sel<K;sel++){const unsigned char *rp=down+(long long)slots[sel]*ds+(size_t)row*rb;\n"
 "        const float *x=act+(size_t)sel*cols;float sum=0.0f;for(int b=lane;b<nb;b+=32){\n"
@@ -10316,8 +10316,8 @@ static inline void launch_qwen4_experts_q4k_q51_selected(hip_llm_runner *r,
                 &r->d_moe_w,&r->d_moe_idx,&K,&n_embd,&expert_ff,&ds};
     /* expert_ff=640 has 20 Q5_1 blocks per row. One wave covers one row;
      * pack several rows per workgroup to reduce scheduling overhead. */
-    LAUNCH(r->fn_qwen4_down_accum_q5_1_selected, (n_embd+3)/4, 1, 1,
-           128, 1, 1, 0, r->stream, da);
+    LAUNCH(r->fn_qwen4_down_accum_q5_1_selected, (n_embd+7)/8, 1, 1,
+           256, 1, 1, 0, r->stream, da);
 }
 
 static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
