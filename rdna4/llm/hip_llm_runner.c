@@ -678,6 +678,20 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Warp-per-row Q8_0 matvec: eight rows per workgroup. Decode matrices have\n"
+" * only 20--320 blocks/row, so the block-per-row kernel wastes most lanes. */\n"
+"__global__ void matvec_q8_0_mw_f32(float *dst,const unsigned char *mat,\n"
+"        const float *x,int n_rows,int n_cols){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp;\n"
+"    if(row>=n_rows)return;int nb=n_cols/32,rb=nb*36;\n"
+"    const unsigned char *rp=mat+(size_t)row*rb;float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;\n"
+"        const signed char *q=(const signed char *)(bp+4);const float *xb=x+b*32;float s=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
+"}\n"
+"\n"
 "/* Qwen4 cached-expert decode: fuse gate/up matvecs and SiLU product. */\n"
 "__global__ void qwen4_gateup_silu_q8(float *dst, const unsigned char *gate,\n"
 "        const unsigned char *up, const float *x, int rows, int cols) {\n"
@@ -7460,6 +7474,7 @@ struct hip_llm_runner {
     hipFunction_t fn_quantize_f32_act_to_int8;
     hipFunction_t fn_matvec_q8_0_dp4a;
     hipFunction_t fn_matvec_q8_0_f32;
+    hipFunction_t fn_matvec_q8_0_mw_f32;
     hipFunction_t fn_qwen4_gateup_silu_q8;
     hipFunction_t fn_qwen4_down_accum_q8;
     hipFunction_t fn_qwen4_gateup_silu_q8_selected;
@@ -7971,6 +7986,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(quantize_f32_to_int8);
     GET_FUNC(quantize_f32_act_to_int8);
     GET_FUNC(matvec_q8_0_f32);
+    GET_FUNC(matvec_q8_0_mw_f32);
     GET_FUNC(qwen4_gateup_silu_q8);
     GET_FUNC(qwen4_down_accum_q8);
     GET_FUNC(qwen4_gateup_silu_q8_selected);
@@ -10221,7 +10237,8 @@ static inline void launch_embed_q4_0(hip_llm_runner *r, void *dst, void *embd_ta
 static inline void launch_matvec_q8_f32(hip_llm_runner *r, void *dst, void *mat,
                                          void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
-    LAUNCH(r->fn_matvec_q8_0_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
+    LAUNCH(r->fn_matvec_q8_0_mw_f32, (n_rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
 }
 
 static inline void launch_qwen4_expert_q8(hip_llm_runner *r, void *acc,
