@@ -793,6 +793,31 @@ static const char *hip_kernel_source =
 "        for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)total+=sum*weights[sel];}\n"
 "    if(lane==0)acc[row]=total;\n"
 "}\n"
+"__global__ void qwen4_gateup_silu_q4k_batch(float *dst,const unsigned char *gate,\n"
+"        const unsigned char *up,const float *x,int M,int rows,int cols){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp,m=blockIdx.y;\n"
+"    if(row>=rows||m>=M)return;int nb=cols/256,rb=nb*144,G=nb*4;\n"
+"    const unsigned char *gr=gate+(size_t)row*rb,*ur=up+(size_t)row*rb;\n"
+"    const float *xp0=x+(size_t)m*cols;float g=0.0f,u=0.0f;\n"
+"    for(int z=lane;z<G;z+=32){int b=z>>2,c=z&3;const float *xp=xp0+b*256+c*64;\n"
+"        g+=qwen4_q4k_group(gr+b*144,xp,c);u+=qwen4_q4k_group(ur+b*144,xp,c);}\n"
+"    for(int o=16;o>0;o>>=1){g+=__shfl_down(g,o);u+=__shfl_down(u,o);}\n"
+"    if(lane==0)dst[(size_t)m*rows+row]=(g/(1.0f+expf(-g)))*u;\n"
+"}\n"
+"__global__ void qwen4_down_q5_1_batch(float *dst,const unsigned char *down,\n"
+"        const float *act,int M,int rows,int cols){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp,m=blockIdx.y;\n"
+"    if(row>=rows||m>=M)return;int nb=cols/32,rb=nb*24;\n"
+"    const unsigned char *rp=down+(size_t)row*rb;const float *x=act+(size_t)m*cols;float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*24;\n"
+"        float d=half_to_float(*(const half_raw *)bp),mn=half_to_float(*(const half_raw *)(bp+2));\n"
+"        unsigned qh=(unsigned)bp[4]|((unsigned)bp[5]<<8)|((unsigned)bp[6]<<16)|((unsigned)bp[7]<<24);\n"
+"        const unsigned char *q=bp+8;float s=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<16;j++){int a=(q[j]&15)|(((qh>>j)&1)<<4);\n"
+"            int v=(q[j]>>4)|(((qh>>(j+16))&1)<<4);s+=(d*a+mn)*x[b*32+j]+(d*v+mn)*x[b*32+j+16];}sum+=s;}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[(size_t)m*rows+row]=sum;\n"
+"}\n"
 "\n"
 "/* ---- 13. embed_q8_0: Padded Q8_0 embedding lookup -> F32 ---- */\n"
 "/* Block layout: 36 bytes = [uint16 d_half][2B pad][int8 qs[32]] */\n"
@@ -7487,6 +7512,8 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_down_accum_q8_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_selected;
     hipFunction_t fn_qwen4_down_accum_q5_1_selected;
+    hipFunction_t fn_qwen4_gateup_silu_q4k_batch;
+    hipFunction_t fn_qwen4_down_q5_1_batch;
     hipFunction_t fn_embed_q8_0;
     hipFunction_t fn_embed_q4_0;
     hipFunction_t fn_matvec_q2_K_f32;
@@ -7999,6 +8026,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_down_accum_q8_selected);
     GET_FUNC(qwen4_gateup_silu_q4k_selected);
     GET_FUNC(qwen4_down_accum_q5_1_selected);
+    GET_FUNC(qwen4_gateup_silu_q4k_batch);
+    GET_FUNC(qwen4_down_q5_1_batch);
     GET_FUNC(embed_q8_0);
     GET_FUNC(embed_q4_0);
     GET_FUNC(matvec_q2_K_f32);
@@ -10320,6 +10349,17 @@ static inline void launch_qwen4_experts_q4k_q51_selected(hip_llm_runner *r,
            256, 1, 1, 0, r->stream, da);
 }
 
+static inline void launch_qwen4_expert_q4k_q51_batch(hip_llm_runner *r,
+        float *out, float *act, void *gate, void *up, void *down, float *x,
+        int M, int expert_ff, int n_embd) {
+    void *ga[] = { &act, &gate, &up, &x, &M, &expert_ff, &n_embd };
+    LAUNCH(r->fn_qwen4_gateup_silu_q4k_batch, (expert_ff + 7) / 8, M, 1,
+           256, 1, 1, 0, r->stream, ga);
+    void *da[] = { &out, &down, &act, &M, &n_embd, &expert_ff };
+    LAUNCH(r->fn_qwen4_down_q5_1_batch, (n_embd + 7) / 8, M, 1,
+           256, 1, 1, 0, r->stream, da);
+}
+
 static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols,
                                       int weight_type);
@@ -12129,6 +12169,19 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             gate_w = (char *)cl->moe_gate_exps_w + (size_t)e * cl->moe_exp_stride_gu;
             up_w = (char *)cl->moe_up_exps_w + (size_t)e * cl->moe_exp_stride_gu;
             down_w = (char *)cl->moe_down_exps_w + (size_t)e * cl->moe_exp_stride_d;
+        }
+        if (cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
+            cl->moe_up_exps_type == GGML_TYPE_Q4_K &&
+            cl->moe_down_exps_type == GGML_TYPE_Q5_1) {
+            launch_qwen4_expert_q4k_q51_batch(r,
+                (float *)r->d_moe_eout + off * n_embd,
+                (float *)r->d_moe_eg + off * eff,
+                gate_w, up_w, down_w, xin, cnt, eff, n_embd);
+            if (r->moe_copy_pipeline && cache_slot >= 0) {
+                hipEventRecord(r->moe_compute_done[cache_slot], r->stream);
+                r->moe_pipeline_valid[cache_slot] = 1;
+            }
+            continue;
         }
         if (use_wmma_exp) {
             void *xin_bf16 = (char *)r->d_moe_gather_in_bf16 + off * n_embd * 2;
