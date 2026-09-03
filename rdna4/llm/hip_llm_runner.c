@@ -696,6 +696,25 @@ static const char *hip_kernel_source =
 "        for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
 "}\n"
+"/* Fused Q/K/V Q8_0 matvecs. The three projections share the input vector;\n"
+" * selecting the output matrix per warp removes two launch boundaries. */\n"
+"__global__ void matvec_qkv_q8_0_mw(float *qout,float *kout,float *vout,\n"
+"        const unsigned char *qmat,const unsigned char *kmat,const unsigned char *vmat,\n"
+"        const float *x,int qr,int kr,int vr,int n_cols){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp;\n"
+"    int total=qr+kr+vr;if(row>=total)return;\n"
+"    float *dst;const unsigned char *mat;int local;\n"
+"    if(row<qr){dst=qout;mat=qmat;local=row;}\n"
+"    else if(row<qr+kr){dst=kout;mat=kmat;local=row-qr;}\n"
+"    else{dst=vout;mat=vmat;local=row-qr-kr;}\n"
+"    int nb=n_cols/32,rb=nb*36;const unsigned char *rp=mat+(size_t)local*rb;\n"
+"    float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;\n"
+"        const signed char *q=(const signed char *)(bp+4);const float *xb=x+b*32;float s=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[local]=sum;\n"
+"}\n"
 "/* Qwen4 HC up projection + four-stream sigmoid mix.  Eight lanes own one\n"
 " * HC row; 32 row-groups/block keeps all 256 lanes useful for 256 columns. */\n"
 "__global__ void qwen4_hc_up_mix_q8(float *mixed,float *gate,const float *xn,\n"
@@ -7756,6 +7775,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q8_0_dp4a;
     hipFunction_t fn_matvec_q8_0_f32;
     hipFunction_t fn_matvec_q8_0_mw_f32;
+    hipFunction_t fn_matvec_qkv_q8_0_mw;
     hipFunction_t fn_qwen4_hc_up_mix_q8;
     hipFunction_t fn_qwen4_hc_down_silu_q8;
     hipFunction_t fn_qwen4_gateup_silu_q8;
@@ -8297,6 +8317,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(quantize_f32_act_to_int8);
     GET_FUNC(matvec_q8_0_f32);
     GET_FUNC(matvec_q8_0_mw_f32);
+    GET_FUNC(matvec_qkv_q8_0_mw);
     GET_FUNC(qwen4_hc_up_mix_q8);
     GET_FUNC(qwen4_hc_down_silu_q8);
     GET_FUNC(qwen4_gateup_silu_q8);
@@ -10656,6 +10677,17 @@ static inline void launch_matvec_q8_f32(hip_llm_runner *r, void *dst, void *mat,
                                          void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     LAUNCH(r->fn_matvec_q8_0_mw_f32, (n_rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_matvec_qkv_q8(hip_llm_runner *r,
+                                         void *q, void *k, void *v,
+                                         void *qw, void *kw, void *vw,
+                                         void *x, int qr, int kr, int vr,
+                                         int n_cols) {
+    void *args[] = { &q, &k, &v, &qw, &kw, &vw, &x,
+                     &qr, &kr, &vr, &n_cols };
+    LAUNCH(r->fn_matvec_qkv_q8_0_mw, (qr + kr + vr + 7) / 8, 1, 1,
            256, 1, 1, 0, r->stream, args);
 }
 
@@ -13248,7 +13280,14 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
 
         } else if (r->is_hybrid) {
             /* === Gated attention layer (Qwen3.5) === */
-            if (r->ssm_fused_decode &&
+            if (cl->attn_q_type == GGML_TYPE_Q8_0 &&
+                cl->attn_k_type == GGML_TYPE_Q8_0 && cl->attn_v_type == GGML_TYPE_Q8_0 &&
+                cl->attn_q_cols == cl->attn_k_cols && cl->attn_q_cols == cl->attn_v_cols) {
+                launch_matvec_qkv_q8(r, r->d_xb2, r->d_k, r->d_v,
+                                     cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                                     r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                                     cl->attn_v_rows, cl->attn_q_cols);
+            } else if (r->ssm_fused_decode &&
                 cl->attn_q_type == GGML_TYPE_Q6_K && cl->attn_k_type == GGML_TYPE_Q6_K &&
                 cl->attn_v_type == GGML_TYPE_Q6_K) {
                 int qr = cl->attn_q_rows, kr = cl->attn_k_rows, vr = cl->attn_v_rows;
@@ -13316,7 +13355,14 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
 
         } else {
             /* === Standard attention === */
-            if (r->ssm_fused_decode &&
+            if (cl->attn_q_type == GGML_TYPE_Q8_0 &&
+                cl->attn_k_type == GGML_TYPE_Q8_0 && cl->attn_v_type == GGML_TYPE_Q8_0 &&
+                cl->attn_q_cols == cl->attn_k_cols && cl->attn_q_cols == cl->attn_v_cols) {
+                launch_matvec_qkv_q8(r, r->d_q, r->d_k, r->d_v,
+                                     cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                                     r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                                     cl->attn_v_rows, cl->attn_q_cols);
+            } else if (r->ssm_fused_decode &&
                 cl->attn_q_type == GGML_TYPE_Q6_K && cl->attn_k_type == GGML_TYPE_Q6_K &&
                 cl->attn_v_type == GGML_TYPE_Q6_K) {
                 int qr = cl->attn_q_rows, kr = cl->attn_k_rows, vr = cl->attn_v_rows;
