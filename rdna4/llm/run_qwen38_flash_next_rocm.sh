@@ -15,6 +15,7 @@ exec env \
     LLM_MOE_COPY_PIPELINE="${LLM_MOE_COPY_PIPELINE:-1}" \
     LLM_MOE_LFU_CACHE="${LLM_MOE_LFU_CACHE:-1}" \
     LLM_MOE_CPU_LIB="${cpu_lib}" \
-    LLM_MOE_CPU_PREFILL_MAX_COUNT="${LLM_MOE_CPU_PREFILL_MAX_COUNT:-1}" \
+    LLM_MOE_CPU_PREFILL_MAX_COUNT="${LLM_MOE_CPU_PREFILL_MAX_COUNT:-2}" \
+    LLM_MOE_CPU_PREFILL_MAX_JOBS="${LLM_MOE_CPU_PREFILL_MAX_JOBS:-80}" \
     "${runner_dir}/test_hip_llm" "${model}" \
     --gpu-only-bench --coding --moe-cache-mb "${cache_mb}" "$@"

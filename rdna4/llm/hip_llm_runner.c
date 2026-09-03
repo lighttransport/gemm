@@ -12064,12 +12064,17 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     int cpu_max_count = 1;
     const char *cpu_count_env = getenv("LLM_MOE_CPU_PREFILL_MAX_COUNT");
     if (cpu_count_env) cpu_max_count = atoi(cpu_count_env);
+    int cpu_max_jobs = 512;
+    const char *cpu_jobs_env = getenv("LLM_MOE_CPU_PREFILL_MAX_JOBS");
+    if (cpu_jobs_env) cpu_max_jobs = atoi(cpu_jobs_env);
+    if (cpu_max_jobs < 0) cpu_max_jobs = 0;
+    if (cpu_max_jobs > 512) cpu_max_jobs = 512;
     unsigned char cpu_selected[512] = {0};
     int cpu_ids[512], cpu_pos[512], cpu_jobs = 0;
     if (cpu_singletons) {
         for (int e = 0; e < ne; ++e) {
             int cnt = offs[e + 1] - offs[e];
-            if (cnt == 0 || cnt > cpu_max_count || cpu_jobs + cnt > 512) continue;
+            if (cnt == 0 || cnt > cpu_max_count || cpu_jobs + cnt > cpu_max_jobs) continue;
             int resident = 0;
             for (int s = 0; s < cl->moe_cache_slots; ++s)
                 if (cl->moe_cache_ids[s] == e) { resident = 1; break; }
