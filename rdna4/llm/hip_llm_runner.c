@@ -735,7 +735,7 @@ static const char *hip_kernel_source =
 "/* Full Qwen SSM input fusion: Q8 qkv/gate plus F32 alpha/beta. */\n"
 "__global__ void ssm_matvec4_q8_f32(float *qkv,float *z,float *alpha,float *beta,\n"
 "        const unsigned char *wq,const unsigned char *wz,const float *wa,const float *wb,\n"
-"        const float *x,int qrows,int zrows,int dt_rank,int qcols,int fcols){\n"
+"        const float *x,int qrows,int zrows,int dt_rank,int qcols,int fcols,int aux_f16){\n"
 "    int row=blockIdx.x,tid=threadIdx.x;if(row>=qrows+zrows+2*dt_rank)return;\n"
 "    float sum=0.0f;\n"
 "    if(row<qrows+zrows){\n"
@@ -746,9 +746,12 @@ static const char *hip_kernel_source =
 "            #pragma unroll\n"
 "            for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
 "    } else {\n"
-"        int r=row-qrows-zrows;const float *mat=r<dt_rank?wa:wb;\n"
-"        int rr=r<dt_rank?r:r-dt_rank;const float *rp=mat+(size_t)rr*fcols;\n"
-"        for(int j=tid;j<fcols;j+=blockDim.x)sum+=rp[j]*x[j];\n"
+"        int r=row-qrows-zrows;const unsigned char *mat=(const unsigned char *)(r<dt_rank?wa:wb);\n"
+"        int rr=r<dt_rank?r:r-dt_rank;size_t stride=(size_t)fcols*(aux_f16?2:4);\n"
+"        const float *rp=(const float *)(mat+(size_t)rr*stride);\n"
+"        if(aux_f16){const half_raw *hp=(const half_raw *)(mat+(size_t)rr*stride);\n"
+"            for(int j=tid;j<fcols;j+=blockDim.x)sum+=half_to_float(hp[j])*x[j];}\n"
+"        else for(int j=tid;j<fcols;j+=blockDim.x)sum+=rp[j]*x[j];\n"
 "    }\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);__shared__ float ws[8];\n"
 "    int warp=tid/32,lane=tid&31;if(lane==0)ws[warp]=sum;__syncthreads();\n"
@@ -10780,9 +10783,9 @@ static inline void launch_ssm_matvec4_q8_f32(hip_llm_runner *r,
                                               void *qmat, void *zmat,
                                               void *amat, void *bmat, void *x,
                                               int qrows, int zrows, int dt_rank,
-                                              int qcols, int fcols) {
+                                              int qcols, int fcols, int aux_f16) {
     void *args[] = { &qkv, &z, &alpha, &beta, &qmat, &zmat, &amat, &bmat,
-                     &x, &qrows, &zrows, &dt_rank, &qcols, &fcols };
+                     &x, &qrows, &zrows, &dt_rank, &qcols, &fcols, &aux_f16 };
     LAUNCH(r->fn_ssm_matvec4_q8_f32, qrows + zrows + 2 * dt_rank, 1, 1,
            256, 1, 1, 0, r->stream, args);
 }
@@ -13386,7 +13389,18 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
                                           cl->ssm_alpha_w, cl->ssm_beta_w,
                                           r->d_xb, cl->ssm_qkv_rows,
                                           cl->ssm_gate_rows, r->ssm_dt_rank,
-                                          cl->ssm_qkv_cols, cl->ssm_alpha_cols);
+                                          cl->ssm_qkv_cols, cl->ssm_alpha_cols, 0);
+            } else if (cl->ssm_qkv_type == GGML_TYPE_Q8_0 &&
+                       cl->ssm_gate_type == GGML_TYPE_Q8_0 &&
+                       cl->ssm_alpha_type == GGML_TYPE_F16 &&
+                       cl->ssm_beta_type == GGML_TYPE_F16) {
+                launch_ssm_matvec4_q8_f32(r, r->d_ssm_qkv, r->d_ssm_z,
+                                          r->d_ssm_alpha, r->d_ssm_beta,
+                                          cl->ssm_qkv_w, cl->ssm_gate_w,
+                                          cl->ssm_alpha_w, cl->ssm_beta_w,
+                                          r->d_xb, cl->ssm_qkv_rows,
+                                          cl->ssm_gate_rows, r->ssm_dt_rank,
+                                          cl->ssm_qkv_cols, cl->ssm_alpha_cols, 1);
             } else if (cl->ssm_qkv_type == GGML_TYPE_Q8_0 &&
                        cl->ssm_gate_type == GGML_TYPE_Q8_0) {
                 launch_matvec_qz_q8(r, r->d_ssm_qkv, r->d_ssm_z,
