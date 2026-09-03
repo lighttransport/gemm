@@ -10707,25 +10707,32 @@ static inline void launch_qwen4_expert_q4k_batch(hip_llm_runner *r,
         float *out, float *act, void *gate, void *up, void *down, float *x,
         int M, int expert_ff, int n_embd, int down_type) {
     void *ga[] = { &act, &gate, &up, &x, &M, &expert_ff, &n_embd };
-    LAUNCH(r->fn_qwen4_gateup_silu_q4k_batch, (expert_ff + 3) / 4, M, 1,
-           128, 1, 1, 0, r->stream, ga);
+    unsigned threads = M == 1 ? 256 : 128;
+    unsigned rows_per_block = threads / 32;
+    LAUNCH(r->fn_qwen4_gateup_silu_q4k_batch,
+           (expert_ff + (int)rows_per_block - 1) / (int)rows_per_block, M, 1,
+           threads, 1, 1, 0, r->stream, ga);
     void *da[] = { &out, &down, &act, &M, &n_embd, &expert_ff };
     hipFunction_t down_fn = down_type == GGML_TYPE_Q8_0 ?
                             r->fn_qwen4_down_q8_0_batch :
                             r->fn_qwen4_down_q5_1_batch;
-    LAUNCH(down_fn, (n_embd + 3) / 4, M, 1,
-           128, 1, 1, 0, r->stream, da);
+    LAUNCH(down_fn, (n_embd + (int)rows_per_block - 1) / (int)rows_per_block, M, 1,
+           threads, 1, 1, 0, r->stream, da);
 }
 
 static inline void launch_qwen4_expert_q5k_q80_batch(hip_llm_runner *r,
         float *out, float *act, void *gate, void *up, void *down, float *x,
         int M, int expert_ff, int n_embd) {
     void *ga[] = { &act, &gate, &up, &x, &M, &expert_ff, &n_embd };
-    LAUNCH(r->fn_qwen4_gateup_silu_q5k_batch, (expert_ff + 3) / 4, M, 1,
-           128, 1, 1, 0, r->stream, ga);
+    unsigned threads = M == 1 ? 256 : 128;
+    unsigned rows_per_block = threads / 32;
+    LAUNCH(r->fn_qwen4_gateup_silu_q5k_batch,
+           (expert_ff + (int)rows_per_block - 1) / (int)rows_per_block, M, 1,
+           threads, 1, 1, 0, r->stream, ga);
     void *da[] = { &out, &down, &act, &M, &n_embd, &expert_ff };
-    LAUNCH(r->fn_qwen4_down_q8_0_batch, (n_embd + 3) / 4, M, 1,
-           128, 1, 1, 0, r->stream, da);
+    LAUNCH(r->fn_qwen4_down_q8_0_batch,
+           (n_embd + (int)rows_per_block - 1) / (int)rows_per_block, M, 1,
+           threads, 1, 1, 0, r->stream, da);
 }
 
 static inline void launch_qwen4_experts_grouped(hip_llm_runner *r, hip_layer *cl,
