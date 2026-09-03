@@ -7679,6 +7679,9 @@ static void *tf_persistent_worker(void *arg) {
     int position = ctx->position;
     int pos_t = ctx->pos_t, pos_h = ctx->pos_h, pos_w = ctx->pos_w;
     int local_sense = 0;
+    static _Thread_local int trace_layers = -1;
+    if (trace_layers < 0)
+        trace_layers = getenv("TF_TRACE_LAYERS") ? 1 : 0;
     if (tid == 0 && tf_dprof < 0)
         tf_dprof = getenv("TF_DPROF") ? 1 : 0;
 
@@ -7697,7 +7700,7 @@ static void *tf_persistent_worker(void *arg) {
 
     for (int l = 0; l < m->n_layers; l++) {
         transformer_layer *layer = &m->layers[l];
-        if (tid == 0 && getenv("TF_TRACE_LAYERS"))
+        if (tid == 0 && trace_layers)
             fprintf(stderr, "trace: layer %d begin type=%s\n", l,
                     (m->is_hybrid && layer->is_ssm) ? "ssm" : "attn");
 
@@ -7791,7 +7794,7 @@ static void *tf_persistent_worker(void *arg) {
                 tf_spin_barrier(m, &local_sense, nt);
             if (tid == 0 && tf_dprof > 0)
                 tf_decode_ssm_out_ms += tf_time_ms() - ssm_t0;
-            if (tid == 0 && getenv("TF_TRACE_LAYERS"))
+            if (tid == 0 && trace_layers)
                 fprintf(stderr, "trace: layer %d ssm done\n", l);
         } else {
             /* --- Attention layer --- */
@@ -7933,7 +7936,7 @@ static void *tf_persistent_worker(void *arg) {
                 tf_spin_barrier(m, &local_sense, nt);
             if (tid == 0 && tf_dprof > 0)
                 tf_decode_attn_out_ms += tf_time_ms() - attn_t0;
-            if (tid == 0 && getenv("TF_TRACE_LAYERS"))
+            if (tid == 0 && trace_layers)
                 fprintf(stderr, "trace: layer %d attn done\n", l);
         }
 

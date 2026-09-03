@@ -3033,3 +3033,30 @@ MRQ overflow, producing 28.44 tok/s. Its per-token curve held communication
 near 5 ms on rank 0, but rank-0 compute stalls between tokens 177 and 226 made
 peers report 8.19--8.97 ms average wait and reduced aggregate throughput. It is
 therefore stability evidence only, not a clean sustained performance result.
+
+An exact BF16 gate/up panel-interleaving probe was rejected and removed. It
+kept each persistent worker's original eight-row range and called the unchanged
+PV8 kernel first for one gate panel and then the matching up panel. Thus it
+preserved CMG ownership and reproduced the 64-token hash, but profiled gate/up
+time remained 7.8--8.0 ms/token, indistinguishable from the sequential-stream
+control. Alternating two large weight streams does not improve reuse: the
+shared 5,120-float activation already fits in L2 and the weights are consumed
+once. The production scheduler continues to finish its local gate range before
+starting up.
+
+The existing greedy-only vocabulary-head path was also tested explicitly with
+`TP_LMHEAD_ARGMAX=1`. It invokes the same BF16 PV8 dot kernel while retaining
+only the per-worker winning logit, then leaves the other logits at negative
+infinity for the unchanged TP argmax. The token hash remained exact, but the
+adjacent runs were both 43.8 ms/token on the limiting rank, so eliminating the
+roughly 1 MB logit write/read is immaterial next to the 1.27 GB local head
+weight stream. It remains opt-in.
+
+These probes sharpen the current non-MTP bottleneck. On the same impaired
+allocation, ranks 1--3 sustained 538--547 GB/s and about 26.2 ms compute, while
+rank 0 sustained only 364 GB/s and took 39.3 ms compute; peers charged the
+resulting 17.3--17.7 ms wait to collectives. The next 40 tok/s work should
+therefore target rank-0 placement/interference and the unclassified serial
+persistent-worker path, rather than logit stores or gate/up scheduling. A
+minor hot-loop cleanup now caches `TF_TRACE_LAYERS` once per worker invocation
+instead of calling `getenv` three times per layer.
