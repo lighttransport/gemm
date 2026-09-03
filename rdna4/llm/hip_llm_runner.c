@@ -12897,6 +12897,7 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
           cl->moe_down_exps_type == GGML_TYPE_Q8_0);
     int grouped_tasks = 0;
     unsigned char grouped_expert[512] = {0};
+    unsigned char grouped_deferred[512] = {0};
     if (grouped_qwen) {
         for (int e = 0; e < ne; ++e) {
             int cnt = offs[e + 1] - offs[e];
@@ -12925,9 +12926,9 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             hipMemcpyAsync(d_task_p, task_p,
                            (size_t)grouped_tasks * sizeof(int),
                            hipMemcpyHostToDevice, r->stream);
-        } else grouped_qwen = 0;
+        }
     }
-    if (grouped_qwen)
+    if (grouped_qwen && grouped_tasks)
         launch_qwen4_experts_grouped(r, cl, ne, eff, n_embd, grouped_tasks);
     if (grouped_qwen && r->moe_copy_pipeline) {
         for (int e = 0; e < ne; ++e) {
@@ -12940,6 +12941,17 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
                 }
             }
         }
+    }
+    int grouped_cold_count = 0;
+    int grouped_cold_start = 0;
+    int grouped_cold_seen = 0;
+    if (grouped_qwen) {
+        for (int e = 0; e < ne; ++e) {
+            if (!grouped_expert[e] && !cpu_selected[e] && offs[e + 1] > offs[e])
+                grouped_cold_count++;
+        }
+        if (grouped_cold_count > cl->moe_cache_slots)
+            grouped_cold_start = grouped_cold_count - cl->moe_cache_slots;
     }
     for (int e = 0; e < ne; e++) {
         int cnt = offs[e + 1] - offs[e];
@@ -13019,6 +13031,14 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             up_w = (char *)cl->moe_up_exps_w + (size_t)e * cl->moe_exp_stride_gu;
             down_w = (char *)cl->moe_down_exps_w + (size_t)e * cl->moe_exp_stride_d;
         }
+        if (grouped_qwen && !grouped_expert[e]) {
+            int defer = grouped_cold_seen++ >= grouped_cold_start;
+            if (defer) {
+                grouped_expert[e] = 1;
+                grouped_deferred[e] = 1;
+                continue;
+            }
+        }
         if (cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
             cl->moe_up_exps_type == GGML_TYPE_Q4_K &&
             (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
@@ -13086,6 +13106,41 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             if (!dw) return -1;
             if (gemm_run_bf16_w(r, (float *)r->d_moe_eout + off * n_embd, dw,
                                    (char *)r->d_moe_esilu_bf16 + off * eff * 2, cnt, n_embd, eff, r->stream) != 0) return -1;
+        }
+    }
+    if (grouped_qwen) {
+        int deferred_tasks = 0;
+        for (int e = 0; e < ne; ++e) {
+            if (!grouped_deferred[e]) continue;
+            for (int p = offs[e]; p < offs[e + 1]; ++p) {
+                r->h_moe_tok_idx[deferred_tasks] = e;
+                ((int *)r->h_router_batch)[deferred_tasks++] = p;
+            }
+        }
+        if (deferred_tasks) {
+            int *task_e = r->h_moe_tok_idx;
+            int *task_p = (int *)r->h_router_batch;
+            int *d_task_e = (int *)r->d_router_logits_batch;
+            int *d_task_p = d_task_e + deferred_tasks;
+            hipMemcpyAsync(d_task_e, task_e,
+                           (size_t)deferred_tasks * sizeof(int),
+                           hipMemcpyHostToDevice, r->stream);
+            hipMemcpyAsync(d_task_p, task_p,
+                           (size_t)deferred_tasks * sizeof(int),
+                           hipMemcpyHostToDevice, r->stream);
+            launch_qwen4_experts_grouped(r, cl, ne, eff, n_embd, deferred_tasks);
+            if (r->moe_copy_pipeline) {
+                for (int e = 0; e < ne; ++e) {
+                    if (!grouped_deferred[e]) continue;
+                    for (int s = 0; s < cl->moe_cache_slots; ++s) {
+                        if (cl->moe_cache_ids[s] == e) {
+                            hipEventRecord(r->moe_compute_done[s], r->stream);
+                            r->moe_pipeline_valid[s] = 1;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
     if (cpu_jobs) {
