@@ -2619,8 +2619,18 @@ NextN vocabulary head did preserve the complete 256-token oracle, but raised
 draft time from 48.57 to 57.50 ms and reduced throughput from 32.84 to 30.02
 tok/s.  Both code experiments were fully removed.
 
-Extending the direct TP4 all-to-all cutoff from 8192 to 32768 floats was also
-rejected.  It moved the 25,600-float K=5 verifier reductions off the two-round
-tree, but the 128-token SHA256 changed from the established `6b136ca0...` to
-`9b71fe7c...`.  The direct peer-put fold is therefore retained only for the
-validated small-buffer range; K5 residual reductions remain on the exact tree.
+The original attempt to extend the direct TP4 all-to-all cutoff from 8192 to
+32768 floats changed the K=5 token stream because its rank-order fold did not
+match the deterministic reduction tree.  The replacement sends the same
+one-round peer puts but folds the gathered TP4 inputs as
+`(rank0 + rank1) + (rank2 + rank3)`, exactly matching the fixed-root tree's FP32
+expression.  Both 128- and 256-token gates now reproduce the established
+`6b136ca0...` and `7b86e983...` SHA256 oracles.
+
+In an adjacent 128-token direct run on the currently bandwidth-degraded
+allocation, the exact one-round path improved **31.16 to 33.37 tok/s** (+7.1%),
+reduced K=5 verifier time **96.12 to 89.93 ms/round** (-6.4%), and reduced
+reported collective cost **6.35 to 5.81 ms/token** (-8.5%).  The sustained TP4
+launcher enables it for deterministic MTP runs and raises the cutoff to 32768;
+`TP_AR_A2A_TREE=0 TP_AR_A2A=0` retains the two-round control.  The communication
+region and every generation/rank slot remain 256-byte aligned and CMG-local.

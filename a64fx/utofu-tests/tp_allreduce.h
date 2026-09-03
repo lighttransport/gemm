@@ -45,7 +45,7 @@
 typedef struct {
     int use_bf16, deterministic, robust;
     int poll_spins;
-    int a2a, a2a_max;
+    int a2a, a2a_max, a2a_tree;
     int ack, ack_retx;
     double ack_rtt, timeout;
     unsigned long drop_n;
@@ -73,6 +73,7 @@ typedef struct {
     /* --- TP_AR_A2A: direct all-to-all sum for small (decode-size) payloads --- */
     int             a2a;                     /* TP_AR_A2A=1: enable */
     int             a2a_max;                 /* max elems for the a2a path (TP_AR_A2A_MAX, clamped to max_count) */
+    int             a2a_tree;                /* TP4 all-gather with exact deterministic-tree fold */
     size_t          a2a_base, a2a_slot;      /* dedicated recv region: 2 generations x nprocs slots */
     /* --- TP_AR_ACK: ack/retransmit reliability prototype (default off) --- */
     int             ack;                     /* 1 = reliable send (bounded retransmit + ack) */
@@ -439,7 +440,8 @@ static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
         else if(rc!=UTOFU_ERR_NOT_FOUND)tp_ar_fail(c,EIO,"a2a poll_tcq rc=%d",rc);
     }
     tp_ar_drain_mrq(c);
-    for (int r = 0; r < N; r++) {                            /* fold in rank order */
+    const float *fold_src[TP_AR_MAXN];
+    for (int r = 0; r < N; r++) {
         const float *pr;
         if (r == me) pr = (const float *)sb;
         else {
@@ -448,8 +450,22 @@ static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
             tp_ar_wait(c, trl, tok, r, "a2a");
             pr = (const float *)rb;
         }
-        if (r == 0) memcpy(buf, pr, pbytes);
-        else        for (int i = 0; i < count; i++) buf[i] += pr[i];
+        fold_src[r] = pr;
+    }
+    /* The fixed-root deterministic TP4 tree evaluates (r0+r1)+(r2+r3).
+     * Reproduce that exact FP32 expression after the one-round all-gather so
+     * transport latency can change without changing model arithmetic. */
+    int tree_fold = N == 4 && c->a2a_tree;
+    if (tree_fold) {
+        for (int i = 0; i < count; i++) {
+            float p01 = fold_src[0][i] + fold_src[1][i];
+            float p23 = fold_src[2][i] + fold_src[3][i];
+            buf[i] = p01 + p23;
+        }
+    } else {
+        memcpy(buf, fold_src[0], pbytes);
+        for (int r = 1; r < N; r++)
+            for (int i = 0; i < count; i++) buf[i] += fold_src[r][i];
     }
 }
 
@@ -492,6 +508,11 @@ static void tp_allreduce_sum_deterministic(tp_comm *c, float *buf, int count, ui
 static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
     if (c->nprocs == 1) return;
     uint64_t tok = ++c->seq;
+    if (c->deterministic && c->a2a && !c->ack && !c->use_bf16 &&
+        count <= c->a2a_max && c->nprocs == 4 && c->a2a_tree) {
+        tp_ar_sum_a2a(c, buf, count, tok);
+        return;
+    }
     if (c->deterministic){
         tp_allreduce_sum_deterministic(c,buf,count,tok);
         return;
@@ -743,6 +764,7 @@ static tp_comm_config tp_comm_env_config(void) {
     o.poll_spins = getenv("TP_AR_POLL_SPINS") ? atoi(getenv("TP_AR_POLL_SPINS")) : 8;
     o.a2a = getenv("TP_AR_A2A") ? atoi(getenv("TP_AR_A2A")) : 0;
     o.a2a_max = getenv("TP_AR_A2A_MAX") ? atoi(getenv("TP_AR_A2A_MAX")) : 8192;
+    o.a2a_tree = getenv("TP_AR_A2A_TREE") ? atoi(getenv("TP_AR_A2A_TREE")) : 0;
     o.ack = getenv("TP_AR_ACK") ? atoi(getenv("TP_AR_ACK")) : 0;
     o.ack_retx = getenv("TP_AR_ACK_RETX") ? atoi(getenv("TP_AR_ACK_RETX")) : 64;
     o.ack_rtt = getenv("TP_AR_ACK_RTT") ? atof(getenv("TP_AR_ACK_RTT")) : 0.001;
@@ -790,6 +812,7 @@ static int tp_comm_init_region_ex(tp_comm *c, utofu_vcq_hdl_t vcq,
      * seq&1) keeps a rank one reduce ahead from overwriting a slot its slow peer hasn't read. */
     c->a2a_max = options->a2a_max>0?options->a2a_max:8192;
     if (c->a2a_max > max_count) c->a2a_max = max_count;
+    c->a2a_tree = options->a2a_tree;
     c->a2a_slot = ((size_t)c->a2a_max * sizeof(float) + 8 + (TP_AR_LINE - 1)) & ~(size_t)(TP_AR_LINE - 1);
     c->a2a_base = region_sz;
     if (c->a2a) region_sz += (size_t)2 * nprocs * c->a2a_slot;

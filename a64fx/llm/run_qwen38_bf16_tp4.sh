@@ -61,6 +61,8 @@ export TF_SSM_FUSED_DOTS=${TF_SSM_FUSED_DOTS:-1}
 # recursive-doubling rounds.  Keep larger payloads on the tree and allow an
 # explicit TP_AR_A2A=0 for reproducibility/control runs.
 if [ "$TP_SIZE" = 4 ]; then
+    ar_a2a_max_defaulted=0
+    if [ -z "${TP_AR_A2A_MAX+x}" ]; then ar_a2a_max_defaulted=1; fi
     export TP_AR_A2A=${TP_AR_A2A:-1} TP_AR_A2A_MAX=${TP_AR_A2A_MAX:-8192}
 fi
 # Exact-token validated on both trunk and K=5 MTP.  Avoid scalar expf in the
@@ -136,6 +138,13 @@ case "$MODE" in
                 export TP_PERF_WARMUP=${TP_PERF_WARMUP:-0} TP_BUFFER_OUTPUT=${TP_BUFFER_OUTPUT:-1}
                 export TP_MTP_TRACE=${TP_MTP_TRACE:-0} TP_MTP_PROFILE_DETAIL=${TP_MTP_PROFILE_DETAIL:-1}
                 export TP_AR_DETERMINISTIC=${TP_AR_DETERMINISTIC:-0}
+                # A one-round peer all-gather folded as (r0+r1)+(r2+r3)
+                # exactly reproduces the deterministic TP4 tree for the
+                # 25,600-float K=5 residual batches.
+                if [ "$TP_SIZE" = 4 ] && [ "$TP_AR_DETERMINISTIC" != 0 ]; then
+                    export TP_AR_A2A_TREE=${TP_AR_A2A_TREE:-1}
+                    if [ "$ar_a2a_max_defaulted" = 1 ]; then export TP_AR_A2A_MAX=32768; fi
+                fi
                 export TP_IGNORE_EOS=1 TP_DUMP_TOKENS=1
                 ;;
             prefill)
