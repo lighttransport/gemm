@@ -9338,6 +9338,13 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             size_t reserve = r->requested_gpu_reserve_bytes ?
                              (size_t)r->requested_gpu_reserve_bytes : (size_t)1536 << 20;
             size_t budget = free_b > reserve ? free_b - reserve : 0;
+            /* On 16 GiB RDNA4, letting the cache consume all otherwise-free VRAM
+             * reduces hipBLASLt prefill throughput substantially.  The 14-slot
+             * working set provided by 2 GiB retained a 99.5% decode hit rate while
+             * improving pp512 from 106 to 132 tok/s. Explicit controls below still
+             * override this balanced automatic default. */
+            size_t auto_cap = (size_t)2048 << 20;
+            if (!r->requested_moe_cache_bytes && budget > auto_cap) budget = auto_cap;
             if (r->requested_moe_cache_bytes) budget = (size_t)r->requested_moe_cache_bytes;
             if (r->requested_moe_mode == HIP_LLM_MOE_CPU) budget = 0;
             const char *env_mb = getenv("LLM_MOE_CACHE_MB");
