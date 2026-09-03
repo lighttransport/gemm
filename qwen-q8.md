@@ -2827,6 +2827,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | Date | Change/config | Clean? | Exact? | tok/s | Verify ms | Draft ms | GB/s/rank | Decision |
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | historical | replicated NextN K=5 | yes | yes | 53.43 | 68.79 | 18.26 | ~868 | reference |
+| 2026-09-04 | SVE snapshot convolution, sharded NextN K=5 | yes | 128/256 yes | 52.98 / 51.99 | 73.87 / 73.96 | 15.54 / 15.51 | 882--946 (256) | promote; preparation 127.5 to 51.7 ms/27 calls in adjacent 128 A/B |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |

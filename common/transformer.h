@@ -6842,10 +6842,12 @@ static void tf_ssm_conv_batch(transformer_model *m,int layer_idx,float*qkv_rows,
     if(!w||nh<=0)return;
     int nt=tf_batch_threads>0?tf_batch_threads:(m->n_threads>1?m->n_threads:1);
 #if defined(__ARM_FEATURE_SVE)
+    static int batch_sve=-1;
+    if(batch_sve<0){const char*e=getenv("TF_SSM_CONV_BATCH_SVE");batch_sve=!e||atoi(e)!=0;}
     /* Qwen uses kernel size four. Walk a vector of adjacent channels through
      * time so every long-stride token-row access consumes a full cache line;
      * the scalar channel loop below consumed only one float from each line. */
-    if(nh==3&&!tf_batch_ssm_snapshots){
+    if(batch_sve&&nh==3){
         int vl=(int)svcntw();
         #ifdef _OPENMP
         #pragma omp parallel for num_threads(nt) schedule(static)
@@ -6867,6 +6869,17 @@ static void tf_ssm_conv_batch(transformer_model *m,int layer_idx,float*qkv_rows,
                 s=svmla_f32_x(pg,s,w2,h2);
                 s=svmla_f32_x(pg,s,w3,x);
                 svst1(pg,xp,s);h0=h1;h1=h2;h2=x;
+                if(tf_batch_ssm_snapshots){
+                    float*slot=tf_batch_ssm_snapshot_slots?tf_batch_ssm_snapshot_slots[t]:
+                        tf_batch_ssm_snapshots+(size_t)t*tf_batch_ssm_slot_stride;
+                    if(slot){
+                        int nwr=(wr+t+1)%3;
+                        float*sn=slot+(size_t)layer_idx*tf_batch_ssm_layer_stride;
+                        svst1(pg,sn+(size_t)((nwr+0)%3)*qd+j,h0);
+                        svst1(pg,sn+(size_t)((nwr+1)%3)*qd+j,h1);
+                        svst1(pg,sn+(size_t)((nwr+2)%3)*qd+j,h2);
+                    }
+                }
             }
             int nwr=(wr+N)%3;
             svst1(pg,st+(size_t)((nwr+0)%3)*qd+j,h0);
