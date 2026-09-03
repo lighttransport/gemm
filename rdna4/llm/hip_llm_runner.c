@@ -12743,14 +12743,20 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
                 int pos = offs[e] + j;
                 cpu_ids[cpu_jobs] = e;
                 cpu_pos[cpu_jobs++] = pos;
-                hipMemcpyAsync(r->h_moe_gather_in_cpu + (size_t)pos * n_embd,
-                               (float *)r->d_moe_gather_in + (size_t)pos * n_embd,
-                               (size_t)n_embd * sizeof(float),
-                               hipMemcpyDeviceToHost, r->stream);
             }
             r->moe_stats.cache_misses++;
         }
-        if (cpu_jobs) hipStreamSynchronize(r->stream);
+        if (cpu_jobs) {
+            for (int e = 0; e < ne; ++e) {
+                if (!cpu_selected[e]) continue;
+                int first = offs[e], count = offs[e + 1] - first;
+                hipMemcpyAsync(r->h_moe_gather_in_cpu + (size_t)first * n_embd,
+                               (float *)r->d_moe_gather_in + (size_t)first * n_embd,
+                               (size_t)count * n_embd * sizeof(float),
+                               hipMemcpyDeviceToHost, r->stream);
+            }
+            hipStreamSynchronize(r->stream);
+        }
     }
 
     /* 4. Per-expert GEMMs.
