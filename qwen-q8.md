@@ -2683,3 +2683,44 @@ rose from 364.8 to 392.8 ms over 27 calls.  Both implementations were fully
 removed.  Disassembly also confirms that the exact TP4 fold is already SVE
 vectorized, so an intrinsic transcription would not eliminate another scalar
 pass.
+
+### Canonical clean-node BF16 MTP result: 53.43 tok/s
+
+The accepted clean-node result used four A64FX nodes, one TP rank per node and
+48 pinned threads per rank. NextN was replicated: each rank read the same
+17.724 GB staged image from `/local/u14346/qwen38-bf16-tp4`. The 359-token raw
+tracked prompt was repeated twice, followed by 256 generated tokens in 55 K=5
+rounds. Runtime was 4.790 s, or **53.43 tok/s**. Verification averaged 68.79
+ms/round, drafting 18.26 ms/round, acceptance was 205/220 = 0.9318, and each
+node sustained about 868 GB/s of effective weight traffic. The exact 256-token
+SHA256 was `7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`;
+the 128-token gate was
+`6b136ca08910eb2b47a820d1be2efc5eed1a38c7bf8f8a43de009c6b29f274c2`.
+
+The historical-equivalent launcher configuration is deliberately distinct
+from the newer optimized defaults (sharded NextN, one-round exact reduction,
+fused residual add, and the compact 4x5 verifier kernel):
+
+```sh
+cd a64fx/llm
+TP_SIZE=4 TP_NEXTN_SHARD=0 \
+  TP_STAGE_DIR=/local/u14346/qwen38-bf16-tp4 \
+  bash run_qwen38_bf16_tp4.sh stage
+
+TP_SIZE=4 TP_NEXTN_SHARD=0 \
+  TP_STAGE_DIR=/local/u14346/qwen38-bf16-tp4 \
+  TP_SPEC_K=5 TP_AR_DETERMINISTIC=1 \
+  TP_AR_A2A=0 TP_AR_A2A_TREE=0 TP_AR_FUSED_ADD=0 \
+  TF_BF16PV_MTP5_FUSED=0 TF_BF16PV_PREFETCH=8 \
+  TP_NEXTN_PV_MASK=1 TP_MAXGEN=256 \
+  bash run_qwen38_bf16_tp4.sh mtp-sustained
+```
+
+All production measurements run the uTofu-enabled binary directly through
+`mpiexec`; no `pjsub` wrapper is involved. Communication buffers, rank slots,
+and generation slots are 256-byte aligned. Each rank allocates and first-
+touches its own communication and model storage locally, and the 48-thread
+layout keeps weight rows within their owning 12-core CMG so kernels do not read
+another CMG's HBM partition. A result is clean only when every rank reaches at
+least 800 GB/s effective weight bandwidth, rank wall-time skew is at most 3%,
+memory remains below 32 GB/node, and the token hash is exact.

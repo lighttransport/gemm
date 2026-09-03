@@ -7782,7 +7782,10 @@ static void *tf_persistent_worker(void *arg) {
                                             m->tp_ssm_sharded, &local_sense);
             tf_spin_barrier(m, &local_sense, nt);  /* B2: SSM done */
             if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ssm_sharded) &&
-                m->tp_ssm_sharded && m->tp_allreduce_fn)
+                m->tp_ssm_sharded && m->tp_reduce_add_fn)
+                m->tp_reduce_add_fn(m->xb, m->x, n_embd, m->tp_allreduce_ctx);
+            else if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ssm_sharded) &&
+                     m->tp_ssm_sharded && m->tp_allreduce_fn)
                 m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
             if (m->tp_ssm_sharded && m->tp_allreduce_fn)
                 tf_spin_barrier(m, &local_sense, nt);
@@ -7921,7 +7924,10 @@ static void *tf_persistent_worker(void *arg) {
                                             m->tp_attn_sharded, &local_sense);
             tf_spin_barrier(m, &local_sense, nt);  /* B5: xb ready */
             if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_attn_sharded) &&
-                m->tp_attn_sharded && m->tp_allreduce_fn)
+                m->tp_attn_sharded && m->tp_reduce_add_fn)
+                m->tp_reduce_add_fn(m->xb, m->x, n_embd, m->tp_allreduce_ctx);
+            else if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_attn_sharded) &&
+                     m->tp_attn_sharded && m->tp_allreduce_fn)
                 m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
             if (m->tp_attn_sharded && m->tp_allreduce_fn)
                 tf_spin_barrier(m, &local_sense, nt);
@@ -7933,7 +7939,12 @@ static void *tf_persistent_worker(void *arg) {
 
         /* Thread 0: residual + FFN norm (merged B5+B6: saves 1 barrier) */
         if (tid == 0) {
-            tf_vadd(m->x, m->xb, n_embd);
+            int active_sharded = m->is_hybrid && layer->is_ssm ?
+                                 m->tp_ssm_sharded : m->tp_attn_sharded;
+            int fused_residual = active_sharded && m->tp_reduce_add_fn &&
+                                 !tf_tp_overlap_wanted(m, n_embd, nt, active_sharded);
+            if (!fused_residual)
+                tf_vadd(m->x, m->xb, n_embd);
             tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         }
         tf_spin_barrier(m, &local_sense, nt);  /* B6: xb ready for FFN (merged) */
@@ -7970,7 +7981,10 @@ static void *tf_persistent_worker(void *arg) {
                                             m->tp_ffn_sharded, &local_sense);
             tf_spin_barrier(m, &local_sense, nt);  /* B8: xb ready */
             if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ffn_sharded) &&
-                m->tp_ffn_sharded && m->tp_allreduce_fn)
+                m->tp_ffn_sharded && m->tp_reduce_add_fn)
+                m->tp_reduce_add_fn(m->xb, m->x, n_embd, m->tp_allreduce_ctx);
+            else if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ffn_sharded) &&
+                     m->tp_ffn_sharded && m->tp_allreduce_fn)
                 m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
             if (m->tp_ffn_sharded && m->tp_allreduce_fn)
                 tf_spin_barrier(m, &local_sense, nt);
@@ -7978,7 +7992,9 @@ static void *tf_persistent_worker(void *arg) {
                 tf_decode_ffn_down_ms += tf_time_ms() - ffn_t0;
 
             /* Thread 0: residual */
-            if (tid == 0) tf_vadd(m->x, m->xb, n_embd);
+            if (tid == 0 && !(m->tp_ffn_sharded && m->tp_reduce_add_fn &&
+                              !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ffn_sharded)))
+                tf_vadd(m->x, m->xb, n_embd);
         } else {
             /* MoE: thread 0 only (complex routing) */
             if (tid == 0) {
