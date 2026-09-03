@@ -823,6 +823,18 @@ static const char *hip_kernel_source =
 "            int v=(q[j]>>4)|(((qh>>(j+16))&1)<<4);s+=(d*a+mn)*x[b*32+j]+(d*v+mn)*x[b*32+j+16];}sum+=s;}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[(size_t)m*rows+row]=sum;\n"
 "}\n"
+"__global__ void qwen4_down_q8_0_batch(float *dst,const unsigned char *down,\n"
+"        const float *act,int M,int rows,int cols){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*8+warp,m=blockIdx.y;\n"
+"    if(row>=rows||m>=M)return;int nb=cols/32,rb=nb*36;\n"
+"    const unsigned char *rp=down+(size_t)row*rb;const float *x=act+(size_t)m*cols;float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;\n"
+"        float d=half_to_float(*(const half_raw *)bp);const signed char *q=(const signed char *)(bp+4);\n"
+"        float s=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++)s+=d*(float)q[j]*x[b*32+j];sum+=s;}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[(size_t)m*rows+row]=sum;\n"
+"}\n"
 "\n"
 "/* ---- 13. embed_q8_0: Padded Q8_0 embedding lookup -> F32 ---- */\n"
 "/* Block layout: 36 bytes = [uint16 d_half][2B pad][int8 qs[32]] */\n"
@@ -7519,6 +7531,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_down_accum_q5_1_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_batch;
     hipFunction_t fn_qwen4_down_q5_1_batch;
+    hipFunction_t fn_qwen4_down_q8_0_batch;
     hipFunction_t fn_embed_q8_0;
     hipFunction_t fn_embed_q4_0;
     hipFunction_t fn_matvec_q2_K_f32;
@@ -7782,8 +7795,8 @@ struct hip_llm_runner {
     float *h_moe_up;
     float *h_moe_tmp;
     void *moe_cpu_lib;
-    hllm_quant_fn moe_quant_q8k, moe_quant_q81;
-    hllm_dot_fn moe_dot_q4k, moe_dot_q51;
+    hllm_quant_fn moe_quant_q8k, moe_quant_q81, moe_quant_q80;
+    hllm_dot_fn moe_dot_q4k, moe_dot_q5k, moe_dot_q51, moe_dot_q80;
     float *h_moe_gather_in_cpu;
     float *h_moe_eout_cpu;
     unsigned char *h_moe_xq_cpu;
@@ -8043,6 +8056,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_down_accum_q5_1_selected);
     GET_FUNC(qwen4_gateup_silu_q4k_batch);
     GET_FUNC(qwen4_down_q5_1_batch);
+    GET_FUNC(qwen4_down_q8_0_batch);
     GET_FUNC(embed_q8_0);
     GET_FUNC(embed_q4_0);
     GET_FUNC(matvec_q2_K_f32);
@@ -9572,10 +9586,14 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 if (r->moe_cpu_lib) {
                     r->moe_quant_q8k = (hllm_quant_fn)dlsym(r->moe_cpu_lib, "quantize_row_q8_K");
                     r->moe_quant_q81 = (hllm_quant_fn)dlsym(r->moe_cpu_lib, "quantize_row_q8_1");
+                    r->moe_quant_q80 = (hllm_quant_fn)dlsym(r->moe_cpu_lib, "quantize_row_q8_0");
                     r->moe_dot_q4k = (hllm_dot_fn)dlsym(r->moe_cpu_lib, "ggml_vec_dot_q4_K_q8_K");
+                    r->moe_dot_q5k = (hllm_dot_fn)dlsym(r->moe_cpu_lib, "ggml_vec_dot_q5_K_q8_K");
                     r->moe_dot_q51 = (hllm_dot_fn)dlsym(r->moe_cpu_lib, "ggml_vec_dot_q5_1_q8_1");
-                    r->moe_cpu_prefill = r->moe_quant_q8k && r->moe_quant_q81 &&
-                                         r->moe_dot_q4k && r->moe_dot_q51;
+                    r->moe_dot_q80 = (hllm_dot_fn)dlsym(r->moe_cpu_lib, "ggml_vec_dot_q8_0_q8_0");
+                    r->moe_cpu_prefill = r->moe_quant_q8k && r->moe_quant_q81 && r->moe_quant_q80 &&
+                                         r->moe_dot_q4k && r->moe_dot_q5k &&
+                                         r->moe_dot_q51 && r->moe_dot_q80;
                 }
                 if (r->verbose >= 1)
                     fprintf(stderr, "hip_llm: CPU cold-prefill experts %s (%s)\n",
@@ -10400,14 +10418,17 @@ static inline void launch_qwen4_experts_q4k_q51_selected(hip_llm_runner *r,
            256, 1, 1, 0, r->stream, da);
 }
 
-static inline void launch_qwen4_expert_q4k_q51_batch(hip_llm_runner *r,
+static inline void launch_qwen4_expert_q4k_batch(hip_llm_runner *r,
         float *out, float *act, void *gate, void *up, void *down, float *x,
-        int M, int expert_ff, int n_embd) {
+        int M, int expert_ff, int n_embd, int down_type) {
     void *ga[] = { &act, &gate, &up, &x, &M, &expert_ff, &n_embd };
     LAUNCH(r->fn_qwen4_gateup_silu_q4k_batch, (expert_ff + 7) / 8, M, 1,
            256, 1, 1, 0, r->stream, ga);
     void *da[] = { &out, &down, &act, &M, &n_embd, &expert_ff };
-    LAUNCH(r->fn_qwen4_down_q5_1_batch, (n_embd + 7) / 8, M, 1,
+    hipFunction_t down_fn = down_type == GGML_TYPE_Q8_0 ?
+                            r->fn_qwen4_down_q8_0_batch :
+                            r->fn_qwen4_down_q5_1_batch;
+    LAUNCH(down_fn, (n_embd + 7) / 8, M, 1,
            256, 1, 1, 0, r->stream, da);
 }
 
@@ -11957,9 +11978,14 @@ static void hllm_cpu_prefill_jobs(hip_llm_runner *r, hip_layer *cl,
         const int *ids, const int *positions, int jobs) {
     const int ne = r->n_embd, ff = r->expert_ff;
     const size_t xqs = (size_t)(ne / 256) * 292;
-    const size_t gqs = (size_t)(ff / 32) * 40;
-    const size_t q4r = (size_t)(ne / 256) * 144;
-    const size_t q51r = (size_t)(ff / 32) * 24;
+    const int down_q8 = cl->moe_down_exps_type == GGML_TYPE_Q8_0;
+    const size_t gqs = (size_t)(ff / 32) * (down_q8 ? 34 : 40);
+    const size_t gur = (size_t)(ne / 256) *
+                       (cl->moe_gate_exps_type == GGML_TYPE_Q5_K ? 176 : 144);
+    const size_t dnr = (size_t)(ff / 32) * (down_q8 ? 34 : 24);
+    hllm_dot_fn gu_dot = cl->moe_gate_exps_type == GGML_TYPE_Q5_K ?
+                         r->moe_dot_q5k : r->moe_dot_q4k;
+    hllm_dot_fn dn_dot = down_q8 ? r->moe_dot_q80 : r->moe_dot_q51;
     float *gate = r->h_moe_eout_cpu;
     float *up = gate + (size_t)jobs * ff;
     for (int j = 0; j < jobs; ++j)
@@ -11971,18 +11997,19 @@ static void hllm_cpu_prefill_jobs(hip_llm_runner *r, hip_layer *cl,
     for (int task = 0; task < jobs * ff; ++task) {
         int row = task / jobs, j = task % jobs, e = ids[j];
         const unsigned char *gw = (const unsigned char *)cl->moe_gate_exps_host +
-                                  (size_t)e * cl->moe_exp_stride_gu + (size_t)row * q4r;
+                                  (size_t)e * cl->moe_exp_stride_gu + (size_t)row * gur;
         const unsigned char *uw = (const unsigned char *)cl->moe_up_exps_host +
-                                  (size_t)e * cl->moe_exp_stride_gu + (size_t)row * q4r;
+                                  (size_t)e * cl->moe_exp_stride_gu + (size_t)row * gur;
         const void *xq = r->h_moe_xq_cpu + (size_t)j * xqs;
-        r->moe_dot_q4k(ne, &gate[(size_t)j * ff + row], 0, gw, 0, xq, 0, 1);
-        r->moe_dot_q4k(ne, &up[(size_t)j * ff + row], 0, uw, 0, xq, 0, 1);
+        gu_dot(ne, &gate[(size_t)j * ff + row], 0, gw, 0, xq, 0, 1);
+        gu_dot(ne, &up[(size_t)j * ff + row], 0, uw, 0, xq, 0, 1);
     }
     for (int j = 0; j < jobs; ++j) {
         float *g = gate + (size_t)j * ff;
         float *u = up + (size_t)j * ff;
         for (int i = 0; i < ff; ++i) g[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
-        r->moe_quant_q81(g, r->h_moe_gate_q_cpu + (size_t)j * gqs, ff);
+        if (down_q8) r->moe_quant_q80(g, r->h_moe_gate_q_cpu + (size_t)j * gqs, ff);
+        else r->moe_quant_q81(g, r->h_moe_gate_q_cpu + (size_t)j * gqs, ff);
     }
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static)
@@ -11990,10 +12017,10 @@ static void hllm_cpu_prefill_jobs(hip_llm_runner *r, hip_layer *cl,
     for (int task = 0; task < jobs * ne; ++task) {
         int row = task / jobs, j = task % jobs, e = ids[j];
         const unsigned char *dw = (const unsigned char *)cl->moe_down_exps_host +
-                                  (size_t)e * cl->moe_exp_stride_d + (size_t)row * q51r;
+                                  (size_t)e * cl->moe_exp_stride_d + (size_t)row * dnr;
         float *out = r->h_moe_eout_cpu + (size_t)positions[j] * ne;
-        r->moe_dot_q51(ff, &out[row], 0, dw, 0,
-                       r->h_moe_gate_q_cpu + (size_t)j * gqs, 0, 1);
+        dn_dot(ff, &out[row], 0, dw, 0,
+               r->h_moe_gate_q_cpu + (size_t)j * gqs, 0, 1);
     }
 }
 
@@ -12064,9 +12091,12 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     launch_moe_gather(r, r->d_moe_gather_in, r->d_xnorm_batch, r->d_moe_gather_src, total, n_embd);
     hipMemsetAsync(r->d_moe_out_batch, 0, (size_t)M * n_embd * sizeof(float), r->stream);
     int cpu_singletons = r->moe_cpu_prefill &&
-        cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
-        cl->moe_up_exps_type == GGML_TYPE_Q4_K &&
-        cl->moe_down_exps_type == GGML_TYPE_Q5_1;
+        ((cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
+          cl->moe_up_exps_type == GGML_TYPE_Q4_K) ||
+         (cl->moe_gate_exps_type == GGML_TYPE_Q5_K &&
+          cl->moe_up_exps_type == GGML_TYPE_Q5_K)) &&
+        (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
+         cl->moe_down_exps_type == GGML_TYPE_Q8_0);
     int cpu_max_count = 1;
     const char *cpu_count_env = getenv("LLM_MOE_CPU_PREFILL_MAX_COUNT");
     if (cpu_count_env) cpu_max_count = atoi(cpu_count_env);
@@ -12304,11 +12334,13 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         }
         if (cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
             cl->moe_up_exps_type == GGML_TYPE_Q4_K &&
-            cl->moe_down_exps_type == GGML_TYPE_Q5_1) {
-            launch_qwen4_expert_q4k_q51_batch(r,
+            (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
+             cl->moe_down_exps_type == GGML_TYPE_Q8_0)) {
+            launch_qwen4_expert_q4k_batch(r,
                 (float *)r->d_moe_eout + off * n_embd,
                 (float *)r->d_moe_eg + off * eff,
-                gate_w, up_w, down_w, xin, cnt, eff, n_embd);
+                gate_w, up_w, down_w, xin, cnt, eff, n_embd,
+                cl->moe_down_exps_type);
             if (r->moe_copy_pipeline && cache_slot >= 0) {
                 hipEventRecord(r->moe_compute_done[cache_slot], r->stream);
                 r->moe_pipeline_valid[cache_slot] = 1;
