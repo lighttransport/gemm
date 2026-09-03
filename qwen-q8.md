@@ -2671,3 +2671,15 @@ Prefetch distances 0, 8, 16, and 24 all remained exact and measured 85.64,
 83.89, 84.48, and 84.83 ms/round respectively in short runs.  That spread is
 comparable to live-node jitter, so the established distance 16 remains the
 default rather than overfitting the current allocation.
+
+Two follow-on fusion probes were exact but rejected.  Routing the two sharded
+NextN reductions through the fused residual callback saved only 160 KiB of
+local traffic per K=5 round and measured 71.68 ms draft time versus 62.11 ms
+for the adjacent unfused control.  Combining verifier FFN gate and up into one
+OpenMP region preserved `6b136ca0...`, but processing both matrices per row
+group disrupted the favorable whole-matrix/CMG streaming order: it reached
+27.51 tok/s versus 35.68 tok/s adjacent, and its FFN projection phase itself
+rose from 364.8 to 392.8 ms over 27 calls.  Both implementations were fully
+removed.  Disassembly also confirms that the exact TP4 fold is already SVE
+vectorized, so an intrinsic transcription would not eliminate another scalar
+pass.
