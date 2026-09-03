@@ -2835,6 +2835,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | persistent NextN full block through vocab head | no | 128/256 yes | 42.55 short; 35.76 sustained | 83.46 / 84.66 | 27.90 / 45.45 | 744--803 / 611--764 | promote; removes final pool wake, clean gate pending |
 | 2026-09-03 | persistent NextN attention-to-vocab tail | near/no | 128/256 yes | 44.52 short; 40.48 sustained | 83.10 / 83.59 | 23.33 / 31.32 | 767--821 / 711--811 | promote; exact original head ownership, clean gate pending |
 | 2026-09-03 | NextN-private BF16 prefetch 0/6/8/12 | no | 128 all yes; 256@8 yes | 32.43 / 35.85 / 36.55 / 31.94 | allocation varied | 50.91 / 46.05 / 39.73 / 56.73 | rank0 548 / 606 / 620 / 534 | promote 8 from adjacent 6/8; clean A/B pending |
+| 2026-09-03 | extend persistent tail through NextN QKV | near | 128 yes | 44.32 vs 46.11 control | 80.53 vs 79.55 | 26.38 vs 23.19 | 786--852 vs 780--831 | reject and remove; serial QK/RoPE phase strands workers |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2883,6 +2884,15 @@ tok/s. Distance 12 regressed to 56.73 ms. The 256-token distance-8 validation
 was canonical at 35.95 tok/s, 91.20 ms verification, and 38.19 ms drafting,
 with rank 0 limited to 622 GB/s. `TF_BF16PV_PREFETCH_NEXTN=8` is promoted,
 subject to the same clean-node A/B gate.
+
+Extending the persistent tail one boundary farther, through the NextN QKV
+projection, was exact but counterproductive. The fused run reached 44.32
+tok/s with 26.38 ms drafting at 786--852 GB/s. Its immediately adjacent
+QKV-unfused control reached **46.11 tok/s** with 23.19 ms drafting at
+780--831 GB/s. Keeping all workers inside the dispatch while worker zero did
+the exact Q/K normalization, RoPE, and cache copies cost more than the saved
+pool wake. The QKV experiment was removed completely; the production
+persistent region continues to start at per-head attention.
 
 An additional SSM scheduling probe normalized Q/K directly into each expanded
 head, replacing the normalize/expand pair with one worker phase and removing
