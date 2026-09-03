@@ -6,10 +6,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 MODEL=${MODEL:-/home/u14346/models/qwen38/27b/bf16/Qwen3.8-27B-BF16-00001-of-00002.gguf}
 TP_SIZE=${TP_SIZE:-4}
 MODE=${1:-stage}
-# The accepted MTP profile uses a separately staged TP-sharded NextN block.
+# The accepted clean-node MTP profile replicates the small NextN block.  A
+# sharded stage remains available explicitly, but its extra collectives did not
+# reduce round time in adjacent exact runs.
 if [ "$MODE" = mtp-sustained ] || [ "$MODE" = stage-mtp ]; then
     [ "$TP_SIZE" = 4 ] || { echo "$MODE requires TP_SIZE=4" >&2; exit 2; }
-    export TP_NEXTN_SHARD=${TP_NEXTN_SHARD:-1}
+    export TP_NEXTN_SHARD=${TP_NEXTN_SHARD:-0}
 fi
 case "$TP_SIZE" in 4|6|12) ;; *) echo "TP_SIZE must be 4, 6, or 12" >&2; exit 2 ;; esac
 NEXTN_SUFFIX=
@@ -47,6 +49,13 @@ fi
 export OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-active}
 export KMP_BLOCKTIME=${KMP_BLOCKTIME:-1} OMP_DYNAMIC=${OMP_DYNAMIC:-false}
 export TP_MTP_OMP_PARK=${TP_MTP_OMP_PARK:-1}
+# Sequential drafting uses a private runtime context and persistent pthread
+# pool while sharing immutable staged weights.  This avoids reusing the trunk
+# context from inside the OpenMP parking region; it added no weight copy and
+# improved the adjacent exact K=5 run by 11%.
+if [ "$MODE" = mtp-sustained ]; then
+    export TP_MTP_SHADOW_THREADS=${TP_MTP_SHADOW_THREADS:-48}
+fi
 export NUMA_DISTRIBUTE=${NUMA_DISTRIBUTE:-1} NUMA_N_CMGS=${NUMA_N_CMGS:-4}
 export TP_COMM_CMG_STRICT=${TP_COMM_CMG_STRICT:-1}
 export NUMA_CMG_BUDGET_GB=${NUMA_CMG_BUDGET_GB:-7} NUMA_ALIGNMENT=${NUMA_ALIGNMENT:-2097152}

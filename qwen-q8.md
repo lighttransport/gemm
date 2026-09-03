@@ -2777,7 +2777,8 @@ beat an adjacent control.
 #### Phase 2: MTP to 60+ tok/s
 
 - [ ] Rebaseline the combined exact one-round TP4 fold, fused batch residual,
-  compact single-pass BF16 4x5 verifier, K=5, and sharded NextN. At clean-node
+  compact single-pass BF16 4x5 verifier, K=5, and replicated NextN with a
+  48-thread shadow runtime. At clean-node
   bandwidth the combined changes may already cross 60 tok/s.
 - [ ] Measure verifier and proposer separately. At observed acceptance, the
   60 tok/s budget is roughly 75--80 ms total per accepted K=5 round.
@@ -2800,14 +2801,15 @@ The canonical direct commands for the current profile are:
 ```sh
 cd a64fx/llm
 
-TP_SIZE=4 TP_NEXTN_SHARD=1 \
-  TP_STAGE_DIR=/local/u14346/qwen38-bf16-tp4-nextnshard \
+TP_SIZE=4 TP_NEXTN_SHARD=0 \
+  TP_STAGE_DIR=/local/u14346/qwen38-bf16-tp4 \
   bash run_qwen38_bf16_tp4.sh stage-mtp
 
 TP_SIZE=4 TP_NEXTN_SHARD=0 TP_MAXGEN=256 \
   bash run_qwen38_bf16_tp4.sh bench
 
-TP_SIZE=4 TP_NEXTN_SHARD=1 TP_SPEC_K=5 TP_MAXGEN=256 \
+TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
+  TP_MTP_SHADOW_THREADS=48 \
   TP_AR_DETERMINISTIC=1 TP_AR_A2A_TREE=1 TP_AR_FUSED_ADD=1 \
   TF_BF16PV_MTP5_FUSED=1 \
   bash run_qwen38_bf16_tp4.sh mtp-sustained
@@ -2822,6 +2824,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=1 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
 | 2026-09-03 | decode prefetch K4352=12 K5120=6 K6144=8 | no | short stream yes | 31.93 ms/tok vs 31.45 control | n/a | n/a | 540 / 537 | reject values; retain global 6 |
+| 2026-09-03 | replicated NextN + shadow48 | no | 128 yes | 29.77 vs 26.73 | 90.37 | 68.86 | 528--658 | +11.4%; promote launcher default, clean gate pending |
 
 An additional SSM scheduling probe normalized Q/K directly into each expanded
 head, replacing the normalize/expand pair with one worker phase and removing
