@@ -84,7 +84,9 @@ export TF_SSM_AB_PAIR=${TF_SSM_AB_PAIR:-1}
 if [ "$TP_SIZE" = 4 ]; then
     ar_a2a_max_defaulted=0
     if [ -z "${TP_AR_A2A_MAX+x}" ]; then ar_a2a_max_defaulted=1; fi
-    export TP_AR_A2A=${TP_AR_A2A:-1} TP_AR_A2A_MAX=${TP_AR_A2A_MAX:-8192}
+    # Single-token residuals are exactly 5,120 floats. Matching the slot size
+    # lets uTofu publish payload+trailer in one Put instead of two per peer.
+    export TP_AR_A2A=${TP_AR_A2A:-1} TP_AR_A2A_MAX=${TP_AR_A2A_MAX:-5120}
 fi
 # Exact-token validated on both trunk and K=5 MTP.  Avoid scalar expf in the
 # verifier and replicated NextN FFN activation passes.
