@@ -490,6 +490,7 @@ int main(int argc, char **argv) {
 
         /* Prefill: a single forward_batch_logits call. Phase 1 implementation is a
          * per-token loop; Phase 2 will swap in a true batched WMMA path. */
+        hip_llm_reset_moe_stats(gpu);
         double t_pf0 = get_time_ms();
         float *last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
         if (!last_logits) { fprintf(stderr, "GPU forward_batch_logits failed\n"); pass = 0; goto bench_done; }
@@ -502,6 +503,7 @@ int main(int argc, char **argv) {
         double decode_ms = 0.0, decode_tps = 0.0;
         int first_decode_tok = next_tok;
         if (decode_n > 0) {
+            hip_llm_reset_moe_stats(gpu);
             int gen_text = (getenv("LLM_GEN_TEXT") != NULL);
             if (gen_text) fprintf(stderr, "\n=== Generated text ===\n%s", bpe_token_to_str(vocab, next_tok));
             double t_dec0 = get_time_ms();
@@ -527,6 +529,18 @@ int main(int argc, char **argv) {
                     decode_n, decode_ms, decode_tps,
                     decode_ms / decode_n);
             fprintf(stderr, "First decoded token id=%d, last id=%d\n", first_decode_tok, next_tok);
+        }
+        {
+            hip_llm_moe_stats ms;
+            if (hip_llm_get_moe_stats(gpu, &ms) == 0 &&
+                ms.cache_hits + ms.cache_misses > 0) {
+                double hit = 100.0 * (double)ms.cache_hits /
+                             (double)(ms.cache_hits + ms.cache_misses);
+                fprintf(stderr, "MoE cache: %.1f%% hit (%llu/%llu), H2D %.2f GiB\n", hit,
+                        (unsigned long long)ms.cache_hits,
+                        (unsigned long long)(ms.cache_hits + ms.cache_misses),
+                        ms.h2d_bytes / (double)(1ULL << 30));
+            }
         }
         fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
 bench_done: ;
