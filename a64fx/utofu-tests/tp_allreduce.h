@@ -418,7 +418,8 @@ static int tp_ar_put_nb(tp_comm *c, int peer, utofu_stadd_t src, utofu_stadd_t d
  * fold order differs from recursive doubling -> reassoc vs the doubling path (coherent-
  * class; integer payloads, e.g. tp_ar_ack_test's, sum exactly -> bitwise-equal there).
  * BW cost x(N-1)/log2(N) -- enabled only for count <= a2a_max (decode-size payloads). */
-static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
+static void tp_ar_sum_a2a_add(tp_comm *c, float *buf, float *residual,
+                              int count, uint64_t tok) {
     int N = c->nprocs, me = c->my_rank;
     char *sb = c->region + tp_ar_slot_off(c, 0);            /* reuse the send slot */
     size_t pbytes = (size_t)count * sizeof(float);
@@ -460,13 +461,21 @@ static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
         for (int i = 0; i < count; i++) {
             float p01 = fold_src[0][i] + fold_src[1][i];
             float p23 = fold_src[2][i] + fold_src[3][i];
-            buf[i] = p01 + p23;
+            float sum = p01 + p23;
+            if (residual) residual[i] += sum;
+            else          buf[i] = sum;
         }
     } else {
         memcpy(buf, fold_src[0], pbytes);
         for (int r = 1; r < N; r++)
             for (int i = 0; i < count; i++) buf[i] += fold_src[r][i];
+        if (residual)
+            for (int i = 0; i < count; i++) residual[i] += buf[i];
     }
+}
+
+static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
+    tp_ar_sum_a2a_add(c, buf, NULL, count, tok);
 }
 
 /* Deterministic fixed-root sum. Recursive doubling is faster, but each survivor folds
@@ -547,6 +556,26 @@ static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
         if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, mr + 1, buf, count, tok);   /* even: recv only (prefold already confirmed) */
         else { tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok); tp_ar_confirm(c); } /* odd: confirm the bcast send */
     }
+}
+
+/* Reduce a TP projection and add its replicated residual without a second
+ * read/write pass over the tile.  The optimized TP4 path evaluates
+ * residual + ((r0+r1)+(r2+r3)), exactly the same expression as the existing
+ * deterministic reduction followed by the caller's residual add. */
+static void tp_allreduce_sum_add(tp_comm *c, float *buf, float *residual,
+                                 int count) {
+    if (c->nprocs == 1) {
+        for (int i = 0; i < count; i++) residual[i] += buf[i];
+        return;
+    }
+    if (c->deterministic && c->a2a && !c->ack && !c->use_bf16 &&
+        count <= c->a2a_max && c->nprocs == 4 && c->a2a_tree) {
+        uint64_t tok = ++c->seq;
+        tp_ar_sum_a2a_add(c, buf, residual, count, tok);
+        return;
+    }
+    tp_allreduce_sum(c, buf, count);
+    for (int i = 0; i < count; i++) residual[i] += buf[i];
 }
 
 /* Fixed-root MAX companion.  The mathematical max is associative, but the BF16

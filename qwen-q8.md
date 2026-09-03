@@ -2634,3 +2634,15 @@ reported collective cost **6.35 to 5.81 ms/token** (-8.5%).  The sustained TP4
 launcher enables it for deterministic MTP runs and raises the cutoff to 32768;
 `TP_AR_A2A_TREE=0 TP_AR_A2A=0` retains the two-round control.  The communication
 region and every generation/rank slot remain 256-byte aligned and CMG-local.
+
+The verifier previously followed every sharded SSM/attention/FFN reduction
+with a separate pass over the complete `[K,5120]` residual tile.  The TP4
+one-round fold now optionally writes the exact result directly into that
+residual as `residual + ((rank0+rank1)+(rank2+rank3))`; other collective modes
+retain the reduce-then-add fallback.  `TP_AR_FUSED_ADD=0` is the control, while
+the runner enables fusion by default.  An adjacent 128-token comparison kept
+the `6b136ca0...` oracle and reduced verifier time from **93.19 to 88.40
+ms/round** (-5.1%); observed throughput was 28.71 versus 33.80 tok/s, although
+the draft portion of that delta included shared-node jitter.  A 256-token gate
+also reproduced `7b86e983...`, with 88.37 ms verifier rounds and 32.04 tok/s on
+the currently degraded interactive rank-0 node.

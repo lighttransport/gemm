@@ -1180,6 +1180,21 @@ static void tp_ar_callback(float *buf, int count, void *ctx) {
     g_ar_calls++;
 }
 
+static void tp_ar_reduce_add_callback(float *buf, float *residual, int count,
+                                      void *ctx) {
+    tp_comm *c = (tp_comm *)ctx;
+    int mc = c->max_count > 0 ? c->max_count : count;
+    double t0 = now_sec();
+    for (int off = 0; off < count; ) {
+        int n = count - off;
+        if (n > mc) n = mc;
+        tp_allreduce_sum_add(c, buf + off, residual + off, n);
+        off += n;
+    }
+    g_ar_secs += now_sec() - t0;
+    g_ar_calls++;
+}
+
 /* Independent draft callback: its worker records argmax communication in the
  * async job and must not race the verifier's legacy timing counters here. */
 static void tp_ar_callback_quiet(float *buf, int count, void *ctx) {
@@ -1594,6 +1609,8 @@ int main(int argc, char **argv) {
                          "align=256 cmg_node=%d)\n", ar_max, ar_batch,
                          (double)ar_region_bytes / (1024*1024), comm_cmg_node);
     transformer_set_tp(m, MyRank, N, tp_ar_callback, &c);
+    if (envb_opt("TP_AR_FUSED_ADD", 1))
+        transformer_set_tp_reduce_add(m, tp_ar_reduce_add_callback);
 
     /* Async NextN owns a second TNI/VCQ and collective sequence.  Keeping its
      * registered landing region separate is required for real overlap: sharing
