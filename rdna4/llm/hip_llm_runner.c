@@ -12039,6 +12039,29 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     }
     if (use_wmma_exp)
         launch_pack_bf16_from_f32(r, r->d_moe_gather_in_bf16, r->d_moe_gather_in, total * n_embd);
+    unsigned char cache_keep[512] = {0};
+    const char *lfu_env = getenv("LLM_MOE_LFU_CACHE");
+    int use_lfu = r->is_qwen4exp && lfu_env && atoi(lfu_env) != 0 && ne <= 512;
+    if (use_lfu) {
+        int stream_slots = 1;
+        const char *stream_env = getenv("LLM_MOE_STREAM_SLOTS");
+        if (stream_env) stream_slots = atoi(stream_env);
+        if (stream_slots < 1) stream_slots = 1;
+        if (stream_slots > cl->moe_cache_slots) stream_slots = cl->moe_cache_slots;
+        int nkeep = cl->moe_cache_slots - stream_slots;
+        for (int k = 0; k < nkeep; k++) {
+            int best = -1, best_count = 0;
+            for (int x = 0; x < ne; x++) {
+                int count = offs[x + 1] - offs[x];
+                if (!cache_keep[x] && count > best_count) {
+                    best = x;
+                    best_count = count;
+                }
+            }
+            if (best < 0) break;
+            cache_keep[best] = 1;
+        }
+    }
     for (int e = 0; e < ne; e++) {
         int cnt = offs[e + 1] - offs[e];
         if (cnt == 0) continue;
@@ -12057,7 +12080,17 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             for (int s = 0; s < cl->moe_cache_slots; ++s)
                 if (cl->moe_cache_ids[s] == e) { slot = s; break; }
             if (slot < 0) {
-                slot = cl->moe_cache_next++ % cl->moe_cache_slots;
+                if (use_lfu) {
+                    for (int tries = 0; tries < cl->moe_cache_slots; tries++) {
+                        int s = cl->moe_cache_next++ % cl->moe_cache_slots;
+                        int old = cl->moe_cache_ids[s];
+                        if (old < 0 || old >= ne || !cache_keep[old]) {
+                            slot = s;
+                            break;
+                        }
+                    }
+                }
+                if (slot < 0) slot = cl->moe_cache_next++ % cl->moe_cache_slots;
                 if (cl->moe_cache_ids[slot] >= 0) r->moe_stats.cache_evictions++;
                 const unsigned char *gh = (const unsigned char *)cl->moe_gate_exps_host + (size_t)e * cl->moe_exp_stride_gu;
                 const unsigned char *uh = (const unsigned char *)cl->moe_up_exps_host + (size_t)e * cl->moe_exp_stride_gu;
