@@ -6542,8 +6542,6 @@ static void tf_ssm_prepare_conv_worker(transformer_model *m, int layer_idx,
         memcpy(state + (size_t)wr * qkv_dim + j0, qkv + j0,
                (size_t)(j1 - j0) * sizeof(float));
         memcpy(qkv + j0, out + j0, (size_t)(j1 - j0) * sizeof(float));
-        if (tid == 0)
-            m->conv_state_pos[layer_idx] = (wr + 1) % n_hist;
     }
 }
 
@@ -7704,11 +7702,16 @@ static void *tf_persistent_worker(void *arg) {
     int local_sense = 0;
     static _Thread_local int trace_layers = -1;
     static _Thread_local int ssm_conv_inline_copy = -1;
+    static _Thread_local int attn_prep_heads = -1;
     if (trace_layers < 0)
         trace_layers = getenv("TF_TRACE_LAYERS") ? 1 : 0;
     if (ssm_conv_inline_copy < 0) {
         const char *e = getenv("TF_SSM_CONV_INLINE_COPY");
         ssm_conv_inline_copy = !e || atoi(e) != 0;
+    }
+    if (attn_prep_heads < 0) {
+        const char *e = getenv("TF_ATTN_PREP_HEADS");
+        attn_prep_heads = e && atoi(e) != 0;
     }
     if (tid == 0 && tf_dprof < 0)
         tf_dprof = getenv("TF_DPROF") ? 1 : 0;
@@ -7764,7 +7767,11 @@ static void *tf_persistent_worker(void *arg) {
             double ssm_prepare_t0 = (tid == 0 && tf_dprof > 0) ? tf_time_ms() : 0.0;
             tf_ssm_prepare_conv_worker(m, l, tid, nt, ssm_conv_inline_copy);
             tf_spin_barrier(m, &local_sense, nt);
-            if (!ssm_conv_inline_copy) {
+            if (ssm_conv_inline_copy) {
+                if (tid == 0)
+                    m->conv_state_pos[l] =
+                        (m->conv_state_pos[l] + 1) % (m->ssm_conv_kernel - 1);
+            } else {
                 if (tid == 0) {
                     memcpy(m->conv_state[l] +
                                m->conv_state_pos[l] * m->ssm_qkv_dim,
@@ -7853,8 +7860,81 @@ static void *tf_persistent_worker(void *arg) {
             if (tid == 0 && tf_dprof > 0)
                 tf_decode_attn_qkv_ms += tf_time_ms() - attn_t0;
 
-            /* Thread 0: de-interleave (gated), QK-norm, RoPE, KV cache */
-            if (tid == 0) {
+            /* Q heads are independent through de-interleave, normalization,
+             * bias, and RoPE.  The optional head-owned path leaves K/V and
+             * cache publication on thread 0, while one worker prepares each
+             * local Q head with the unchanged scalar/SVE routines. */
+            if (attn_prep_heads && m->is_hybrid) {
+                if (tid < n_heads) {
+                    float *qh = m->q + (size_t)tid * head_dim;
+                    memcpy(qh, m->xb2 + (size_t)tid * 2 * head_dim,
+                           (size_t)head_dim * sizeof(float));
+                    memcpy(m->ffn_buf1 + (size_t)tid * head_dim,
+                           m->xb2 + (size_t)tid * 2 * head_dim + head_dim,
+                           (size_t)head_dim * sizeof(float));
+                    if (layer->attn_q_norm.data)
+                        tf_qk_norm(qh, 1, head_dim, &layer->attn_q_norm,
+                                   m->rms_norm_eps, m->thread_tmp[tid]);
+                    if (layer->attn_q_bias.data) {
+                        const float *qb;
+                        if (layer->attn_q_bias.type == GGML_TYPE_F32)
+                            qb = (const float *)layer->attn_q_bias.data;
+                        else {
+                            tf_dequant_row(&layer->attn_q_bias, 0,
+                                           m->thread_tmp[tid]);
+                            qb = m->thread_tmp[tid];
+                        }
+                        for (int i = 0; i < head_dim; i++)
+                            qh[i] += qb[(size_t)tid * head_dim + i];
+                    }
+                    if (m->use_mrope)
+                        tf_rope_mrope(qh, 1, head_dim, pos_t, pos_h, pos_w,
+                                      m->rope_freq_base, m->mrope_sections,
+                                      m->rope_mrope_inv_freq);
+                    else
+                        tf_rope(qh, 1, head_dim, pos_t, m->rope_freq_base,
+                                m->rope_inv_freq);
+                }
+                if (tid == 0) {
+                    if (layer->attn_k_norm.data)
+                        tf_qk_norm(m->k, n_kv_heads, head_dim,
+                                   &layer->attn_k_norm, m->rms_norm_eps,
+                                   m->matvec_tmp);
+                    if (layer->attn_k_bias.data) {
+                        const float *kb;
+                        if (layer->attn_k_bias.type == GGML_TYPE_F32)
+                            kb = (const float *)layer->attn_k_bias.data;
+                        else {
+                            tf_dequant_row(&layer->attn_k_bias, 0,
+                                           m->matvec_tmp);
+                            kb = m->matvec_tmp;
+                        }
+                        for (int i = 0; i < kv_dim; i++) m->k[i] += kb[i];
+                    }
+                    if (layer->attn_v_bias.data) {
+                        const float *vb;
+                        if (layer->attn_v_bias.type == GGML_TYPE_F32)
+                            vb = (const float *)layer->attn_v_bias.data;
+                        else {
+                            tf_dequant_row(&layer->attn_v_bias, 0,
+                                           m->matvec_tmp);
+                            vb = m->matvec_tmp;
+                        }
+                        for (int i = 0; i < kv_dim; i++) m->v[i] += vb[i];
+                    }
+                    if (m->use_mrope)
+                        tf_rope_mrope(m->k, n_kv_heads, head_dim,
+                                      pos_t, pos_h, pos_w, m->rope_freq_base,
+                                      m->mrope_sections, m->rope_mrope_inv_freq);
+                    else
+                        tf_rope(m->k, n_kv_heads, head_dim, pos_t,
+                                m->rope_freq_base, m->rope_inv_freq);
+                    memcpy(m->key_cache[l] + (size_t)position * kv_dim,
+                           m->k, (size_t)kv_dim * sizeof(float));
+                    memcpy(m->value_cache[l] + (size_t)position * kv_dim,
+                           m->v, (size_t)kv_dim * sizeof(float));
+                }
+            } else if (tid == 0) {
                 if (m->is_hybrid) {
                     for (int h = 0; h < n_heads; h++) {
                         memcpy(m->q + h * head_dim, m->xb2 + h * 2 * head_dim, head_dim * sizeof(float));

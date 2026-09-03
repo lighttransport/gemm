@@ -79,6 +79,9 @@ export TF_SSM_FUSED_DOTS=${TF_SSM_FUSED_DOTS:-1}
 # QKV buffer in the owning worker. This removes one global barrier per SSM
 # layer without changing arithmetic; set 0 for the exact legacy A/B control.
 export TF_SSM_CONV_INLINE_COPY=${TF_SSM_CONV_INLINE_COPY:-1}
+# Prepare the six TP4-local Q heads concurrently after QKV projection. Each
+# worker retains the exact per-head norm/bias/RoPE order; K/V stay on thread 0.
+export TF_ATTN_PREP_HEADS=${TF_ATTN_PREP_HEADS:-1}
 # The verifier's BF16 alpha/beta matrices have only 12 rows each. Compute both
 # under one OpenMP team while retaining the exact established SVE row reduction.
 export TF_SSM_AB_PAIR=${TF_SSM_AB_PAIR:-1}

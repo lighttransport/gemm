@@ -3114,3 +3114,28 @@ throughput improved from 31.34 to **31.51 tok/s**. A controller-free MTP gate
 also reproduced canonical `6b136ca0...` and reached 47.41 tok/s with 76.32 ms
 verification and 23.61 ms drafting. `TF_SSM_CONV_INLINE_COPY=0` retains the
 legacy serial-copy/barrier path for exact comparisons.
+
+The first inline-copy implementation advanced the convolution ring index from
+thread 0 inside its channel worker. A 64-token gate happened to pass, but the
+256-token gate exposed that a delayed peer could read the new index before
+entering its worker. That uncommitted runtime was discarded. The corrected
+path advances the index on thread 0 only after the existing all-worker
+convolution barrier. With both inline copy enabled and disabled, the corrected
+320-token stream produced the same
+`031bdd2014e6b8614b9b92b86aa0ef06857a4df4c0b1564f97ec659ffa74540b`
+hash.
+
+Attention preparation is now head-owned under `TF_ATTN_PREP_HEADS=1`. TP4 has
+six local Q heads; workers 0--5 independently de-interleave one complete head,
+then execute its unchanged RMSNorm, bias addition, and RoPE sequence. Thread 0
+continues to prepare the single local K/V head and publish its cache. The
+dependency barrier remains, and no head or weight range crosses a CMG.
+
+The no-weight 256-token serial-floor A/B fell from **15.82 to 12.88 ms/token**,
+with rank-0 compute falling from 10.82 to 7.65 ms. The 64-token weight-stream
+A/B was exact and improved 31.33 to 31.24 ms/token; the longer 256-token pair
+improved 32.07 to **31.73 ms/token** on the limiting rank. Its 320-token hash
+matched the serial preparation control. The 128-token MTP gate also retained
+canonical `6b136ca0...`; its 45.22 tok/s sample was bandwidth-degraded at
+761--812 GB/s and is correctness evidence only. Set `TF_ATTN_PREP_HEADS=0` for
+the legacy serial attention preparation.
