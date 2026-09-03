@@ -12887,7 +12887,7 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         }
     }
     const char *grouped_env = getenv("LLM_MOE_GROUPED_PREFILL");
-    int grouped_qwen = grouped_env && atoi(grouped_env) != 0 &&
+    int grouped_qwen = (!grouped_env || atoi(grouped_env) != 0) &&
         r->is_qwen4exp && cl->d_moe_cache_map &&
         ((cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
           cl->moe_up_exps_type == GGML_TYPE_Q4_K) ||
