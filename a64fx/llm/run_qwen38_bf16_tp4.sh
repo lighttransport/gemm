@@ -75,6 +75,9 @@ export TF_HIER_BARRIER=${TF_HIER_BARRIER:-0} TF_BF16PV_PREFETCH=${TF_BF16PV_PREF
 export TF_BF16PV_PREFETCH_MTP2=${TF_BF16PV_PREFETCH_MTP2:-12}
 export TF_BF16PV_MTP5_FUSED=${TF_BF16PV_MTP5_FUSED:-1}
 export TF_SSM_FUSED_DOTS=${TF_SSM_FUSED_DOTS:-1}
+# The verifier's BF16 alpha/beta matrices have only 12 rows each. Compute both
+# under one OpenMP team while retaining the exact established SVE row reduction.
+export TF_SSM_AB_PAIR=${TF_SSM_AB_PAIR:-1}
 # Decode-size TP4 reductions are faster as direct peer puts than as two
 # recursive-doubling rounds.  Keep larger payloads on the tree and allow an
 # explicit TP_AR_A2A=0 for reproducibility/control runs.

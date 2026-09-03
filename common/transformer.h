@@ -12008,6 +12008,77 @@ static int tf_gemm_q8v2_pair_gelu_tokenmajor(float *Y, const qtensor *gate,
 }
 #endif /* TF_HAVE_Q8V2 */
 
+/* Exact row-major BF16 small-N row. Keep this shared by the ordinary and
+ * paired dispatchers so fusing OpenMP teams cannot change reduction order. */
+#if defined(__ARM_FEATURE_SVE)
+static inline void tf_gemm_bf16_smalln_row(float *Y_out, const uint16_t *w,
+                                            const float *X, int K, int N,
+                                            int out_stride, int X_stride,
+                                            int row) {
+    svbool_t pt = svptrue_b32(), pth = svptrue_b16();
+    svuint16_t zero = svdup_u16(0);
+    int vlh = (int)svcnth(), vl = (int)svcntw();
+    svfloat32_t a0 = svdup_f32(0), a1 = svdup_f32(0);
+    svfloat32_t a2 = svdup_f32(0), a3 = svdup_f32(0);
+    svfloat32_t a4 = svdup_f32(0), a5 = svdup_f32(0);
+    svfloat32_t a6 = svdup_f32(0), a7 = svdup_f32(0);
+    int k = 0;
+    for (; k + vlh <= K; k += vlh) {
+        svuint16_t raw = svld1_u16(pth, w + k);
+        svfloat32_t wlo = svreinterpret_f32_u16(svzip1_u16(zero, raw));
+        svfloat32_t whi = svreinterpret_f32_u16(svzip2_u16(zero, raw));
+        #define TF_DOT_SMALLN(ai,t) if (N > (t)) { \
+            const float *x = X + (size_t)(t) * X_stride + k; \
+            ai = svmla_f32_x(pt, ai, wlo, svld1_f32(pt, x)); \
+            ai = svmla_f32_x(pt, ai, whi, svld1_f32(pt, x + vl)); }
+        TF_DOT_SMALLN(a0,0) TF_DOT_SMALLN(a1,1)
+        TF_DOT_SMALLN(a2,2) TF_DOT_SMALLN(a3,3)
+        TF_DOT_SMALLN(a4,4) TF_DOT_SMALLN(a5,5)
+        TF_DOT_SMALLN(a6,6) TF_DOT_SMALLN(a7,7)
+        #undef TF_DOT_SMALLN
+    }
+    float s[8];
+    s[0]=svaddv_f32(pt,a0); s[1]=svaddv_f32(pt,a1);
+    s[2]=svaddv_f32(pt,a2); s[3]=svaddv_f32(pt,a3);
+    s[4]=svaddv_f32(pt,a4); s[5]=svaddv_f32(pt,a5);
+    s[6]=svaddv_f32(pt,a6); s[7]=svaddv_f32(pt,a7);
+    for (; k < K; k++) {
+        float wv = bf16_to_f32_scalar(w[k]);
+        for (int t = 0; t < N; t++)
+            s[t] += wv * X[(size_t)t * X_stride + k];
+    }
+    for (int t = 0; t < N; t++)
+        Y_out[(size_t)t * out_stride + row] = s[t];
+}
+
+static int tf_gemm_bf16_smalln_pair(float *Y0, const qtensor *m0,
+                                     float *Y1, const qtensor *m1,
+                                     const float *X, int rows, int N,
+                                     int out_stride, int X_stride,
+                                     int n_threads) {
+    if (!m0 || !m1 || m0->type != GGML_TYPE_BF16 ||
+        m1->type != GGML_TYPE_BF16 || m0->podd_packed || m1->podd_packed ||
+        m0->bf16_pv || m1->bf16_pv || m0->i8 || m1->i8 ||
+        m0->n_cols != m1->n_cols || N <= 0 || N > 8)
+        return 0;
+    int K = m0->n_cols, nt = n_threads > 1 ? n_threads : 1;
+    const uint16_t *W0 = (const uint16_t *)m0->data;
+    const uint16_t *W1 = (const uint16_t *)m1->data;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int mr = 0; mr < 2 * rows; mr++) {
+        int which = mr >= rows;
+        int r = mr - which * rows;
+        const uint16_t *W = which ? W1 : W0;
+        float *Y = which ? Y1 : Y0;
+        tf_gemm_bf16_smalln_row(Y, W + (size_t)r * K, X, K, N,
+                                out_stride, X_stride, r);
+    }
+    return 1;
+}
+#endif
+
 /* Token-major GEMM: Y[tok * out_stride + row] = dot(W[row,:], X[tok,:])
  * Direct output without transpose. */
 static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const float *X,
@@ -12368,24 +12439,8 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
             #endif
             for (int r = 0; r < n_rows; r++) {
                 const uint16_t *w = Wd + (size_t)r * K;
-                svbool_t pt = svptrue_b32(), pth = svptrue_b16(); svuint16_t zero = svdup_u16(0);
-                int vlh = (int)svcnth(), vl = (int)svcntw();
-                svfloat32_t a0 = svdup_f32(0), a1 = svdup_f32(0), a2 = svdup_f32(0), a3 = svdup_f32(0);
-                svfloat32_t a4 = svdup_f32(0), a5 = svdup_f32(0), a6 = svdup_f32(0), a7 = svdup_f32(0);
-                int k = 0;
-                for (; k + vlh <= K; k += vlh) {
-                    svuint16_t raw = svld1_u16(pth, w + k);
-                    svfloat32_t wlo = svreinterpret_f32_u16(svzip1_u16(zero, raw));
-                    svfloat32_t whi = svreinterpret_f32_u16(svzip2_u16(zero, raw));
-                    #define DOT_T(ai,t) if (N > (t)) { const float *x = X + (size_t)(t)*X_stride + k; \
-                        ai = svmla_f32_x(pt, ai, wlo, svld1_f32(pt, x)); ai = svmla_f32_x(pt, ai, whi, svld1_f32(pt, x + vl)); }
-                    DOT_T(a0,0) DOT_T(a1,1) DOT_T(a2,2) DOT_T(a3,3) DOT_T(a4,4) DOT_T(a5,5) DOT_T(a6,6) DOT_T(a7,7)
-                    #undef DOT_T
-                }
-                float s[8]; s[0]=svaddv_f32(pt,a0); s[1]=svaddv_f32(pt,a1); s[2]=svaddv_f32(pt,a2); s[3]=svaddv_f32(pt,a3);
-                s[4]=svaddv_f32(pt,a4); s[5]=svaddv_f32(pt,a5); s[6]=svaddv_f32(pt,a6); s[7]=svaddv_f32(pt,a7);
-                for (; k < K; k++) { float wv = bf16_to_f32_scalar(w[k]); for (int t = 0; t < N; t++) s[t] += wv * X[(size_t)t*X_stride + k]; }
-                for (int t = 0; t < N; t++) Y_out[(size_t)t * out_stride + r] = s[t];
+                tf_gemm_bf16_smalln_row(Y_out, w, X, K, N,
+                                         out_stride, X_stride, r);
             }
             return;
         }
@@ -14231,14 +14286,29 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                                       lq, ne, batch_nt);
             tf_gemm_f16_mt_tokenmajor(gate, &L->ssm_gate, norm, ld, N,
                                       ld, ne, batch_nt);
-            tf_gemm_f16_mt_tokenmajor(kv, &L->ssm_alpha, norm,
-                                      m->ssm_dt_rank, N, m->ssm_dt_rank,
-                                      ne, batch_nt);
-            /* kv/vv are idle during SSM projection and provide separate scalar
-             * storage; inner is overwritten by each token's recurrent output. */
-            tf_gemm_f16_mt_tokenmajor(vv, &L->ssm_beta, norm,
-                                      m->ssm_dt_rank, N, m->ssm_dt_rank,
-                                      ne, batch_nt);
+            /* Alpha/beta are just 12 rows each. A shared small-N team avoids
+             * 96 tiny team launches per verifier round (two in every SSM
+             * layer), while the common row primitive preserves exact sums. */
+            static int pair_ab = -1;
+            if (pair_ab < 0) {
+                const char *e = getenv("TF_SSM_AB_PAIR");
+                pair_ab = e ? atoi(e) != 0 : 1;
+            }
+#if defined(__ARM_FEATURE_SVE)
+            int paired_ab = pair_ab && tf_gemm_bf16_smalln_pair(
+                kv, &L->ssm_alpha, vv, &L->ssm_beta, norm,
+                m->ssm_dt_rank, N, m->ssm_dt_rank, ne, batch_nt);
+#else
+            int paired_ab = 0;
+#endif
+            if (!paired_ab) {
+                tf_gemm_f16_mt_tokenmajor(kv, &L->ssm_alpha, norm,
+                                          m->ssm_dt_rank, N, m->ssm_dt_rank,
+                                          ne, batch_nt);
+                tf_gemm_f16_mt_tokenmajor(vv, &L->ssm_beta, norm,
+                                          m->ssm_dt_rank, N, m->ssm_dt_rank,
+                                          ne, batch_nt);
+            }
             pprof->proj_ms += tf_time_ms() - pt;
             /* Prepare convolution/QK/scalars in prompt order, but defer the
              * independent recurrent heads.  proj/attout/up are reused as

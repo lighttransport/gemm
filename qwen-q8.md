@@ -2839,6 +2839,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | verifier OpenMP blocktime 1 ms | no | run aborted | <1 | >300,000 | n/a | n/a | reject; only ~7 cores active, restore 200 ms |
 | 2026-09-03 | uTofu poll cadence 4/8/16 | near | 128 all yes | 45.15 / 46.11 / 45.39 | 81.08 / 79.55 / 80.56 | 23.85 / 23.19 / 23.82 | 772--829 / 780--831 / 772--829 | retain 8 |
 | 2026-09-03 | persistent-trunk per-worker SVE SiLU | no | short stream changed | 23.39 vs 24.15 control | n/a | n/a | peers 526--539 | reject and remove; slices too small to amortize vector setup |
+| 2026-09-03 | paired verifier SSM alpha/beta team | near | 128 twice yes | 46.39 / 46.36 vs 44.59 control | 79.09 / 79.12 vs 82.73 | 23.03 / 23.07 vs 23.51 | 781--835 / 782--835 vs 775--826 | promote; exact, repeatable +4.0%, clean gate narrowly missed |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2931,3 +2932,19 @@ performing that second normalization; replacing it with a single owner phase
 changes the historical floating-point state. The owner version was removed as
 well. Removing this barrier now requires an explicitly approved oracle change,
 not a decode-performance-only substitution.
+
+The verifier now evaluates each SSM layer's 12-row alpha and beta projections
+under one OpenMP team (`TF_SSM_AB_PAIR=1`). Those tensors cannot use the PV8
+layout because their row count is not divisible by eight; the old path created
+two 48-thread teams per layer, or 96 tiny team launches per verifier round.
+Both the ordinary and paired dispatchers call the same factored SVE row
+primitive, preserving the exact accumulation and reduction order. Two adjacent
+paired 128-token runs reproduced the canonical
+`6b136ca08910eb2b47a820d1be2efc5eed1a38c7bf8f8a43de009c6b29f274c2`
+hash at **46.39 and 46.36 tok/s**, with 79.09/79.12 ms verification and
+23.03/23.07 ms drafting per round. The intervening disabled control was also
+exact but reached 44.59 tok/s and 82.73 ms verification. Accumulated verifier
+projection time fell from 480.5 to 444.8/450.4 ms over 27 rounds. This is a
+repeatable 4.0% end-to-end short-run improvement and is promoted as the
+launcher default. The samples remain classified near-clean because one rank
+measured 781--782 GB/s, just below the 800 GB/s acceptance threshold.
