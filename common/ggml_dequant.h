@@ -1928,6 +1928,34 @@ static inline uint16_t ggml_fp32_to_fp16(float f) {
  *
  * Constraints: n_cols % vl (= 16 on A64FX) == 0, n_rows % 8 == 0.
  * Caller must have packed weights via pack_bf16_rows_to_pv first. */
+/* Decode matrices have three dominant K widths in Qwen3.8 (4352 for the TP
+ * FFN shard, 5120 for residual projections, and 6144 for SSM inner work).
+ * A single global prefetch distance makes the first width a worker sees choose
+ * the setting for all later matrices.  Keep the global setting as the exact
+ * compatibility default, but allow measured per-width overrides. */
+static inline int tf_bf16pv_decode_prefetch_dist(int n) {
+    static _Thread_local int initialized, generic, k4352, k5120, k6144;
+    if (__builtin_expect(!initialized, 0)) {
+        const char *e = getenv("TF_BF16PV_PREFETCH");
+        generic = (e && *e && *e != '0') ? atoi(e) : 0;
+        if (generic == 1) generic = 8;
+        k4352 = generic;
+        k5120 = generic;
+        k6144 = generic;
+        e = getenv("TF_BF16PV_PREFETCH_K4352");
+        if (e && *e) k4352 = atoi(e);
+        e = getenv("TF_BF16PV_PREFETCH_K5120");
+        if (e && *e) k5120 = atoi(e);
+        e = getenv("TF_BF16PV_PREFETCH_K6144");
+        if (e && *e) k6144 = atoi(e);
+        initialized = 1;
+    }
+    if (n == 4352) return k4352;
+    if (n == 5120) return k5120;
+    if (n == 6144) return k6144;
+    return generic;
+}
+
 static inline void matvec_bf16_8row_pv(float *dst,
                                         const uint16_t *pAB, const uint16_t *pCD,
                                         const uint16_t *pEF, const uint16_t *pGH,
@@ -1952,15 +1980,7 @@ static inline void matvec_bf16_8row_pv(float *dst,
      * pair stream, to L2 (locality=2). With ~12 threads/CMG × 4 pair streams
      * the HW prefetcher's ~16 slots/CMG are oversubscribed; an L2-only hint
      * provides headroom without blowing the L1. Guarded by TF_BF16PV_PREFETCH=1. */
-    static _Thread_local int pf_env_done = 0, pf_dist = 0;
-    if (__builtin_expect(!pf_env_done, 0)) {
-        const char *e = getenv("TF_BF16PV_PREFETCH");
-        if (e && *e && *e != '0') pf_dist = atoi(e);
-        /* Preserve the original boolean interface while allowing measured
-         * distances to be selected directly (2, 4, 8, 12, ... chunks). */
-        if (pf_dist == 1) pf_dist = 8;
-        pf_env_done = 1;
-    }
+    int pf_dist = tf_bf16pv_decode_prefetch_dist(n);
     const int pfd_hw = pf_dist * 2 * vl;
     for (; i + vl - 1 < n; i += vl) {
         /* pair[hw_base = 2*i] points at chunk c = i/vl */

@@ -2762,7 +2762,8 @@ applicable throughput target.
   hashes pass; the adjacent bandwidth-degraded 128-token run improved 26.19 to
   26.83 tok/s (+2.4%).
 - [ ] Sweep BF16-PV prefetch by shape: K=4352 at 8/12/16, and K=5120/6144 at
-  4/6/8/12. Promote only a repeatable whole-model gain.
+  4/6/8/12. `TF_BF16PV_PREFETCH_K4352`, `_K5120`, and `_K6144` now override
+  the global default independently; promote only a repeatable whole-model gain.
 - [ ] Reduce persistent DeltaNet dispatch/barrier cost by grouping independent
   QKV/gate/alpha/beta work while preserving CMG-owned row ranges.
 - [ ] Profile the vocabulary head and test local per-rank argmax plus a small
@@ -2819,3 +2820,13 @@ TP_SIZE=4 TP_NEXTN_SHARD=1 TP_SPEC_K=5 TP_MAXGEN=256 \
 | historical | replicated NextN K=5 | yes | yes | 53.43 | 68.79 | 18.26 | ~868 | reference |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
+| 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
+| 2026-09-03 | decode prefetch K4352=12 K5120=6 K6144=8 | no | short stream yes | 31.93 ms/tok vs 31.45 control | n/a | n/a | 540 / 537 | reject values; retain global 6 |
+
+An additional SSM scheduling probe normalized Q/K directly into each expanded
+head, replacing the normalize/expand pair with one worker phase and removing
+48 global barriers per token. It retained the short token stream exactly, but
+the three heads mapped to each source group redundantly recomputed its norm.
+SSM preparation rose from 1.46 to 2.15 ms/token and total decode regressed from
+31.10 to 32.70 ms/token in the adjacent run. The direct-normalization code was
+removed; the two-phase shared normalization remains production.
