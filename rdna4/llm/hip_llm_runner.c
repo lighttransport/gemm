@@ -15,6 +15,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <dlfcn.h>
+
+typedef void (*hllm_quant_fn)(const float *, void *, int64_t);
+typedef void (*hllm_dot_fn)(int, float *, size_t, const void *, size_t,
+                             const void *, size_t, int);
 
 /* transformer.h header-only: gives us qtensor type + dequant declarations */
 #include "../../common/ggml_dequant.h"
@@ -7776,6 +7781,15 @@ struct hip_llm_runner {
     float *h_moe_gate;
     float *h_moe_up;
     float *h_moe_tmp;
+    void *moe_cpu_lib;
+    hllm_quant_fn moe_quant_q8k, moe_quant_q81;
+    hllm_dot_fn moe_dot_q4k, moe_dot_q51;
+    float *h_moe_gather_in_cpu;
+    float *h_moe_eout_cpu;
+    unsigned char *h_moe_xq_cpu;
+    unsigned char *h_moe_gate_q_cpu;
+    int h_moe_gather_in_cpu_pinned;
+    int moe_cpu_prefill;
     /* MoE device-side dispatch buffers */
     int  *d_moe_idx;       /* [n_experts_used] selected expert indices */
     float *d_moe_w;        /* [n_experts_used] softmax weights */
@@ -9551,6 +9565,21 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             r->h_moe_tmp = (float *)malloc(jobs * (size_t)(r->n_embd + tmp_n) * sizeof(float));
             if (!r->h_moe_input || !r->h_moe_output || !r->h_moe_gate ||
                 !r->h_moe_up || !r->h_moe_tmp) return -1;
+            const char *cpu_lib = getenv("LLM_MOE_CPU_LIB");
+            if (cpu_lib && *cpu_lib) {
+                r->moe_cpu_lib = dlopen(cpu_lib, RTLD_NOW | RTLD_LOCAL);
+                if (r->moe_cpu_lib) {
+                    r->moe_quant_q8k = (hllm_quant_fn)dlsym(r->moe_cpu_lib, "quantize_row_q8_K");
+                    r->moe_quant_q81 = (hllm_quant_fn)dlsym(r->moe_cpu_lib, "quantize_row_q8_1");
+                    r->moe_dot_q4k = (hllm_dot_fn)dlsym(r->moe_cpu_lib, "ggml_vec_dot_q4_K_q8_K");
+                    r->moe_dot_q51 = (hllm_dot_fn)dlsym(r->moe_cpu_lib, "ggml_vec_dot_q5_1_q8_1");
+                    r->moe_cpu_prefill = r->moe_quant_q8k && r->moe_quant_q81 &&
+                                         r->moe_dot_q4k && r->moe_dot_q51;
+                }
+                if (r->verbose >= 1)
+                    fprintf(stderr, "hip_llm: CPU cold-prefill experts %s (%s)\n",
+                            r->moe_cpu_prefill ? "enabled" : "disabled", cpu_lib);
+            }
         }
         /* Device-side dispatch buffers (sync-free MoE routing) */
         CHECK_HIP(hipMalloc(&r->d_moe_idx, r->n_experts_used * sizeof(int)));
@@ -9954,6 +9983,22 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 CHECK_HIP(hipMalloc(&r->d_shared_scale_batch,  (size_t)bm * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_moe_gather_src,      TA * sizeof(int)));
                 CHECK_HIP(hipMalloc(&r->d_moe_gather_w,        TA * sizeof(float)));
+                if (r->moe_cpu_prefill) {
+                    size_t in_bytes = TA * r->n_embd * sizeof(float);
+                    if (hipHostMalloc((void **)&r->h_moe_gather_in_cpu, in_bytes,
+                                      hipHostMallocDefault) == hipSuccess)
+                        r->h_moe_gather_in_cpu_pinned = 1;
+                    else
+                        r->h_moe_gather_in_cpu = (float *)malloc(in_bytes);
+                    r->h_moe_eout_cpu = (float *)aligned_alloc(64, (in_bytes + 63) & ~(size_t)63);
+                    r->h_moe_xq_cpu = (unsigned char *)aligned_alloc(64,
+                        ((TA * (size_t)(r->n_embd / 256) * 292) + 63) & ~(size_t)63);
+                    r->h_moe_gate_q_cpu = (unsigned char *)aligned_alloc(64,
+                        ((TA * (size_t)(eff / 32) * 40) + 63) & ~(size_t)63);
+                    if (!r->h_moe_gather_in_cpu || !r->h_moe_eout_cpu ||
+                        !r->h_moe_xq_cpu || !r->h_moe_gate_q_cpu)
+                        r->moe_cpu_prefill = 0;
+                }
                 /* All-expert bf16 staging. Qwen4 stages only active host experts. */
                 {
                     size_t gu = (size_t)ne * r->expert_ff * r->n_embd * 2;
@@ -11902,6 +11947,50 @@ int hip_llm_verify_hc_batch(hip_llm_runner *r,int M,double *rel,double *mx){
  * Experts are grouped by token: router GEMM -> host top-K -> gather by expert ->
  * per-expert dequant+GEMM (gate/up/silu/down) -> scatter-accumulate; shared
  * expert is dense over all M. Returns 0 on success. */
+static void hllm_cpu_prefill_jobs(hip_llm_runner *r, hip_layer *cl,
+        const int *ids, const int *positions, int jobs) {
+    const int ne = r->n_embd, ff = r->expert_ff;
+    const size_t xqs = (size_t)(ne / 256) * 292;
+    const size_t gqs = (size_t)(ff / 32) * 40;
+    const size_t q4r = (size_t)(ne / 256) * 144;
+    const size_t q51r = (size_t)(ff / 32) * 24;
+    float *gate = r->h_moe_eout_cpu;
+    float *up = gate + (size_t)jobs * ff;
+    for (int j = 0; j < jobs; ++j)
+        r->moe_quant_q8k(r->h_moe_gather_in_cpu + (size_t)positions[j] * ne,
+                         r->h_moe_xq_cpu + (size_t)j * xqs, ne);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int task = 0; task < jobs * ff; ++task) {
+        int row = task / jobs, j = task % jobs, e = ids[j];
+        const unsigned char *gw = (const unsigned char *)cl->moe_gate_exps_host +
+                                  (size_t)e * cl->moe_exp_stride_gu + (size_t)row * q4r;
+        const unsigned char *uw = (const unsigned char *)cl->moe_up_exps_host +
+                                  (size_t)e * cl->moe_exp_stride_gu + (size_t)row * q4r;
+        const void *xq = r->h_moe_xq_cpu + (size_t)j * xqs;
+        r->moe_dot_q4k(ne, &gate[(size_t)j * ff + row], 0, gw, 0, xq, 0, 1);
+        r->moe_dot_q4k(ne, &up[(size_t)j * ff + row], 0, uw, 0, xq, 0, 1);
+    }
+    for (int j = 0; j < jobs; ++j) {
+        float *g = gate + (size_t)j * ff;
+        float *u = up + (size_t)j * ff;
+        for (int i = 0; i < ff; ++i) g[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
+        r->moe_quant_q81(g, r->h_moe_gate_q_cpu + (size_t)j * gqs, ff);
+    }
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int task = 0; task < jobs * ne; ++task) {
+        int row = task / jobs, j = task % jobs, e = ids[j];
+        const unsigned char *dw = (const unsigned char *)cl->moe_down_exps_host +
+                                  (size_t)e * cl->moe_exp_stride_d + (size_t)row * q51r;
+        float *out = r->h_moe_eout_cpu + (size_t)positions[j] * ne;
+        r->moe_dot_q51(ff, &out[row], 0, dw, 0,
+                       r->h_moe_gate_q_cpu + (size_t)j * gqs, 0, 1);
+    }
+}
+
 static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     int n_embd = r->n_embd, ne = r->n_experts, K = r->n_experts_used;
     int eff = r->expert_ff, sff = r->shared_expert_ff;
@@ -11968,6 +12057,19 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     /* 3. Gather activations grouped by expert (f32, fed straight to mmq). */
     launch_moe_gather(r, r->d_moe_gather_in, r->d_xnorm_batch, r->d_moe_gather_src, total, n_embd);
     hipMemsetAsync(r->d_moe_out_batch, 0, (size_t)M * n_embd * sizeof(float), r->stream);
+    int cpu_singletons = r->moe_cpu_prefill &&
+        cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
+        cl->moe_up_exps_type == GGML_TYPE_Q4_K &&
+        cl->moe_down_exps_type == GGML_TYPE_Q5_1;
+    int cpu_max_count = 1;
+    const char *cpu_count_env = getenv("LLM_MOE_CPU_PREFILL_MAX_COUNT");
+    if (cpu_count_env) cpu_max_count = atoi(cpu_count_env);
+    if (cpu_singletons) {
+        hipMemcpyAsync(r->h_moe_gather_in_cpu, r->d_moe_gather_in,
+                       (size_t)total * n_embd * sizeof(float),
+                       hipMemcpyDeviceToHost, r->stream);
+        hipStreamSynchronize(r->stream);
+    }
 
     /* 4. Per-expert GEMMs.
      * own-GEMM path: dequant the expert weight to bf16 once and run the WMMA
@@ -12102,10 +12204,24 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             cache_keep[best] = 1;
         }
     }
+    int cpu_ids[512], cpu_pos[512], cpu_jobs = 0;
     for (int e = 0; e < ne; e++) {
         int cnt = offs[e + 1] - offs[e];
         if (cnt == 0) continue;
         size_t off = (size_t)offs[e];
+        if (cpu_singletons && cnt <= cpu_max_count) {
+            int resident = 0;
+            for (int s = 0; s < cl->moe_cache_slots; ++s)
+                if (cl->moe_cache_ids[s] == e) { resident = 1; break; }
+            if (!resident && cpu_jobs + cnt <= 512) {
+                for (int j = 0; j < cnt; ++j) {
+                    cpu_ids[cpu_jobs] = e;
+                    cpu_pos[cpu_jobs++] = (int)off + j;
+                }
+                r->moe_stats.cache_misses++;
+                continue;
+            }
+        }
         float *xin = (float *)r->d_moe_gather_in + off * n_embd;
         void *gate_w;
         void *up_w;
@@ -12223,6 +12339,17 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             if (gemm_run_bf16_w(r, (float *)r->d_moe_eout + off * n_embd, dw,
                                    (char *)r->d_moe_esilu_bf16 + off * eff * 2, cnt, n_embd, eff, r->stream) != 0) return -1;
         }
+    }
+    if (cpu_jobs) {
+        hllm_cpu_prefill_jobs(r, cl, cpu_ids, cpu_pos, cpu_jobs);
+        for (int j = 0; j < cpu_jobs; ++j) {
+            size_t off = (size_t)cpu_pos[j];
+            hipMemcpyAsync((float *)r->d_moe_eout + off * n_embd,
+                           r->h_moe_eout_cpu + off * n_embd,
+                           (size_t)n_embd * sizeof(float), hipMemcpyHostToDevice,
+                           r->stream);
+        }
+        r->moe_stats.cpu_assignments += (uint64_t)cpu_jobs;
     }
 
 experts_done:
@@ -13897,6 +14024,12 @@ void hip_llm_free(hip_llm_runner *r) {
     free(r->h_moe_gate);
     free(r->h_moe_up);
     free(r->h_moe_tmp);
+    if (r->h_moe_gather_in_cpu_pinned) hipHostFree(r->h_moe_gather_in_cpu);
+    else free(r->h_moe_gather_in_cpu);
+    free(r->h_moe_eout_cpu);
+    free(r->h_moe_xq_cpu);
+    free(r->h_moe_gate_q_cpu);
+    if (r->moe_cpu_lib) dlclose(r->moe_cpu_lib);
     if (r->d_xb_q)    hipFree(r->d_xb_q);
     if (r->d_xb_scale) hipFree(r->d_xb_scale);
 
