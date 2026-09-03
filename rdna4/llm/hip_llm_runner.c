@@ -716,15 +716,19 @@ static const char *hip_kernel_source =
 "/* HC down Q8 matvec with the fixed 1/n_stream scale and SiLU folded in. */\n"
 "__global__ void qwen4_hc_down_silu_q8(float *dst,const unsigned char *mat,\n"
 "        const float *x,int n_rows,int n_cols,float scale){\n"
-"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp;\n"
+"    int row_in_block=threadIdx.x/64,warp_in_row=(threadIdx.x&63)/32,lane=threadIdx.x&31;\n"
+"    int row=blockIdx.x*4+row_in_block;\n"
 "    if(row>=n_rows)return;int nb=n_cols/32,rb=nb*36;const unsigned char *rp=mat+(size_t)row*rb;float sum=0.0f;\n"
-"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;const signed char *q=(const signed char *)(bp+4);\n"
+"    for(int b=(threadIdx.x&63);b<nb;b+=64){const unsigned char *bp=rp+b*36;const signed char *q=(const signed char *)(bp+4);\n"
 "        const float *xb=x+b*32;float z=0.0f;\n"
 "        #pragma unroll\n"
 "        for(int j=0;j<32;j++)z+=(float)q[j]*xb[j];\n"
 "        sum+=z*half_to_float(*(const half_raw *)bp);}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);\n"
-"    if(lane==0){float v=sum*scale;dst[row]=v/(1.0f+expf(-v));}\n"
+"    __shared__ float ws[8];\n"
+"    if(lane==0)ws[row_in_block*2+warp_in_row]=sum;__syncthreads();\n"
+"    if((threadIdx.x&63)==0){float v=(ws[row_in_block*2]+ws[row_in_block*2+1])*scale;\n"
+"        dst[row]=v/(1.0f+expf(-v));}\n"
 "}\n"
 "\n"
 "/* Qwen4 cached-expert decode: fuse gate/up matvecs and SiLU product. */\n"
@@ -12241,7 +12245,7 @@ static void forward_hc_mix(hip_llm_runner *r, void *norm_w, void *down_w,
         float scale = 1.0f/(float)ns;
         void *a[] = { &r->d_hc_low, &down_w, &r->d_hc_norm,
                       &nr, &nc, &scale };
-        LAUNCH(r->fn_qwen4_hc_down_silu_q8, (nr + 7) / 8, 1, 1,
+        LAUNCH(r->fn_qwen4_hc_down_silu_q8, (nr + 3) / 4, 1, 1,
                256, 1, 1, 0, r->stream, a);
     } else {
         launch_matvec_auto(r, r->d_hc_low, down_w, r->d_hc_norm,
