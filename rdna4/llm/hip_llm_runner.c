@@ -9247,10 +9247,11 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         if (r->is_qwen4exp) {
             r->h_moe_input = (float *)malloc((size_t)r->n_embd * sizeof(float));
             r->h_moe_output = (float *)malloc((size_t)r->n_embd * sizeof(float));
-            r->h_moe_gate = (float *)malloc((size_t)r->expert_ff * sizeof(float));
-            r->h_moe_up = (float *)malloc((size_t)r->expert_ff * sizeof(float));
+            size_t jobs = (size_t)r->n_experts_used;
+            r->h_moe_gate = (float *)malloc(jobs * r->expert_ff * sizeof(float));
+            r->h_moe_up = (float *)malloc(jobs * r->expert_ff * sizeof(float));
             int tmp_n = r->n_embd > r->expert_ff ? r->n_embd : r->expert_ff;
-            r->h_moe_tmp = (float *)malloc((size_t)tmp_n * sizeof(float));
+            r->h_moe_tmp = (float *)malloc(jobs * (size_t)(r->n_embd + tmp_n) * sizeof(float));
             if (!r->h_moe_input || !r->h_moe_output || !r->h_moe_gate ||
                 !r->h_moe_up || !r->h_moe_tmp) return -1;
         }
@@ -10737,12 +10738,6 @@ static void moe_topk_softmax(const float *logits, int n, int k, int *out_idx, fl
 static void hllm_cpu_qmatvec(float *dst, const void *base, int type,
                              int rows, int cols, const float *x, float *tmp) {
     size_t rb = dequant_row_size(type, cols);
-#if defined(_OPENMP)
-#pragma omp parallel
-    {
-    float *row_tmp = (float *)malloc((size_t)cols * sizeof(float));
-#pragma omp for schedule(static)
-#endif
     for (int row = 0; row < rows; ++row) {
         const void *rp = (const unsigned char *)base + (size_t)row * rb;
         if (type == GGML_TYPE_Q8_0) {
@@ -10750,9 +10745,6 @@ static void hllm_cpu_qmatvec(float *dst, const void *base, int type,
             continue;
         }
         float *work = tmp;
-#if defined(_OPENMP)
-        work = row_tmp;
-#endif
         dequant_row(type, rp, work, cols);
         float sum = 0.0f;
 #if defined(__AVX2__) && defined(__FMA__)
@@ -10772,10 +10764,6 @@ static void hllm_cpu_qmatvec(float *dst, const void *base, int type,
 #endif
         dst[row] = sum;
     }
-#if defined(_OPENMP)
-    free(row_tmp);
-    }
-#endif
 }
 
 /* ======================================================================== */
@@ -10900,23 +10888,33 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
     int top_idx[64]; float top_w[64];
     moe_topk_softmax(r->h_router_logits, n_experts, n_experts_used, top_idx, top_w);
     memset(r->h_moe_output, 0, (size_t)n_embd * sizeof(float));
+    int work_stride = n_embd + (n_embd > expert_ff ? n_embd : expert_ff);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
     for (int slot = 0; slot < n_experts_used; ++slot) {
         int e = top_idx[slot];
+        float *gate = r->h_moe_gate + (size_t)slot * expert_ff;
+        float *up = r->h_moe_up + (size_t)slot * expert_ff;
+        float *out = r->h_moe_tmp + (size_t)slot * work_stride;
+        float *work = out + n_embd;
         const void *gw = (const unsigned char *)cl->moe_gate_exps_host + (size_t)e*cl->moe_exp_stride_gu;
         const void *uw = (const unsigned char *)cl->moe_up_exps_host   + (size_t)e*cl->moe_exp_stride_gu;
         const void *dw = (const unsigned char *)cl->moe_down_exps_host + (size_t)e*cl->moe_exp_stride_d;
-        hllm_cpu_qmatvec(r->h_moe_gate, gw, cl->moe_gate_exps_type,
-                         expert_ff, n_embd, r->h_moe_input, r->h_moe_tmp);
-        hllm_cpu_qmatvec(r->h_moe_up, uw, cl->moe_up_exps_type,
-                         expert_ff, n_embd, r->h_moe_input, r->h_moe_tmp);
+        hllm_cpu_qmatvec(gate, gw, cl->moe_gate_exps_type,
+                         expert_ff, n_embd, r->h_moe_input, work);
+        hllm_cpu_qmatvec(up, uw, cl->moe_up_exps_type,
+                         expert_ff, n_embd, r->h_moe_input, work);
         for (int i = 0; i < expert_ff; ++i) {
-            float v = r->h_moe_gate[i];
-            r->h_moe_gate[i] = (v / (1.0f + expf(-v))) * r->h_moe_up[i];
+            float v = gate[i];
+            gate[i] = (v / (1.0f + expf(-v))) * up[i];
         }
-        hllm_cpu_qmatvec(r->h_moe_tmp, dw, cl->moe_down_exps_type,
-                         n_embd, expert_ff, r->h_moe_gate, r->h_moe_up);
-        for (int i = 0; i < n_embd; ++i)
-            r->h_moe_output[i] += top_w[slot] * r->h_moe_tmp[i];
+        hllm_cpu_qmatvec(out, dw, cl->moe_down_exps_type,
+                         n_embd, expert_ff, gate, work);
+    }
+    for (int slot = 0; slot < n_experts_used; ++slot) {
+        const float *out = r->h_moe_tmp + (size_t)slot * work_stride;
+        for (int i = 0; i < n_embd; ++i) r->h_moe_output[i] += top_w[slot] * out[i];
     }
     hipMemcpyAsync(r->d_moe_accum, r->h_moe_output,
                    (size_t)n_embd * sizeof(float), hipMemcpyHostToDevice, r->stream);
