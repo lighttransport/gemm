@@ -80,10 +80,12 @@ class Backend:
             result = self.proc.stdout.readline().strip()
         if not result.startswith("OK "):
             raise RuntimeError(result)
-        fields = result.split(" ", 4)
-        if len(fields) != 5:
+        fields = result.split(" ", 5)
+        if len(fields) != 6:
             raise RuntimeError("malformed runner response")
-        cached, prompt_tokens, completion_tokens, finish, encoded = fields
+        if fields[0] != "OK":
+            raise RuntimeError("malformed runner response")
+        cached, prompt_tokens, completion_tokens, finish, encoded = fields[1:]
         text = base64.b64decode(encoded).decode("utf-8", "replace")
         return text, int(cached), int(prompt_tokens), int(completion_tokens), finish
 

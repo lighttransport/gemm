@@ -33,6 +33,7 @@ exec env \
     LLM_MOE_CPU_PREFILL_MAX_COUNT="${LLM_MOE_CPU_PREFILL_MAX_COUNT:-2}" \
     LLM_MOE_CPU_PREFILL_MAX_JOBS="${LLM_MOE_CPU_PREFILL_MAX_JOBS:-160}" \
     LLM_BMAX="${LLM_BMAX:-128}" \
+    LLM_MOE_GROUPED_PREFILL="${LLM_MOE_GROUPED_PREFILL:-0}" \
     python3 "${runner_dir}/codex_server.py" "${model}" \
     --runner "${runner_dir}/test_hip_llm" \
     --context "${context}" \
