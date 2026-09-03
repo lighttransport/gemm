@@ -2728,11 +2728,20 @@ double tf_decode_ffn_down_ms = 0.0;
 double tf_decode_lm_head_ms = 0.0;
 static int tf_dprof = -1;
 static int tf_null_gemm = -1;
+static int tf_null_scan_weights = -1;
 
 static inline int tf_null_gemm_enabled(void) {
     if (tf_null_gemm < 0)
         tf_null_gemm = getenv("TF_NULL_GEMM") ? 1 : 0;
     return tf_null_gemm;
+}
+
+static inline int tf_null_scan_enabled(void) {
+    if (tf_null_scan_weights < 0) {
+        const char *e = getenv("TF_NULL_SCAN");
+        tf_null_scan_weights = !e || atoi(e) != 0;
+    }
+    return tf_null_scan_weights;
 }
 
 /* Read-only bandwidth probe for decode: touch every cache line, but skip all
@@ -2800,9 +2809,10 @@ static inline void tf_null_matvec(float *dst, const qtensor *mat, int n_rows,
     size_t total = tf_null_tensor_bytes(mat, n_rows);
     size_t off = total * (size_t)tid / (size_t)nt;
     size_t end = total * (size_t)(tid + 1) / (size_t)nt;
-    tf_null_scan((const uint8_t *)mat->data + off, end - off);
+    if (tf_null_scan_enabled())
+        tf_null_scan((const uint8_t *)mat->data + off, end - off);
     for (int i = r0; i < r1; i++) dst[i] = 0.0f;
-    if (tid == 0) tf_decode_null_bytes += (double)total;
+    if (tid == 0 && tf_null_scan_enabled()) tf_decode_null_bytes += (double)total;
 }
 
 static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qtensor *mat1,

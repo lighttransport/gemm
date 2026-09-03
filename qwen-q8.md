@@ -2766,8 +2766,10 @@ applicable throughput target.
   the global default independently; promote only a repeatable whole-model gain.
 - [ ] Reduce persistent DeltaNet dispatch/barrier cost by grouping independent
   QKV/gate/alpha/beta work while preserving CMG-owned row ranges.
-- [ ] Profile the vocabulary head and test local per-rank argmax plus a small
-  winner exchange; keep the full-logit route as exact control.
+- [x] Profile the vocabulary head and test local per-rank argmax plus a small
+  winner exchange; keep the full-logit route as exact control. The exact
+  greedy-only BF16 PV path was neutral because logit traffic is negligible
+  beside the local weight shard, so it remains opt-in.
 - [ ] Revisit projection/collective overlap only with CMG-local buffers and no
   lost weight-stream worker or reordered exact fold.
 
@@ -3060,3 +3062,38 @@ therefore target rank-0 placement/interference and the unclassified serial
 persistent-worker path, rather than logit stores or gate/up scheduling. A
 minor hot-loop cleanup now caches `TF_TRACE_LAYERS` once per worker invocation
 instead of calling `getenv` three times per layer.
+
+The null-GEMM diagnostic now supports `TF_NULL_SCAN=0`, which preserves every
+persistent-worker phase, output zeroing, barrier, SSM state update, and TP
+collective while omitting weight reads. The launcher also preserves an
+explicit caller value of `TF_NULL_GEMM` in `null` mode instead of forcing it to
+one. A 256-token flat-barrier run measured **15.12 ms/token** across the four
+ranks (rank-0 compute 8.07 ms plus 6.96 ms collective). This is a 66 tok/s
+schedule/communication ceiling and proves the 40 tok/s plain-decode target is
+not blocked by irreducible scalar work.
+
+The corresponding decode-shaped weight scan measured 37.80 ms/token and only
+577--585 GB/s on the peer ranks. In contrast, five batched passes over the same
+17.724 GB stage measured **810.2--831.4 GB/s** on all ranks, including 826.8
+GB/s on rank 0. HBM placement and CMG ownership are therefore healthy; frequent
+short projections, barriers, and collectives prevent the production stream
+from reaching its steady-state bandwidth. `TF_HIER_BARRIER=1` is not a remedy:
+the no-scan A/B regressed catastrophically to 109.2 ms/token, so the launcher
+continues to default to the flat barrier.
+
+For an uninstrumented serial-floor measurement use:
+
+```sh
+cd a64fx/llm
+TP_MAXGEN=256 TP_PERF_WARMUP=64 TF_NULL_SCAN=0 \
+  bash run_qwen38_bf16_tp4.sh null
+```
+
+A controller-free 128-token MTP rebaseline of the current combined defaults
+was exact (`6b136ca0...`) and reached **46.95 tok/s**, with 77.78 ms verifier
+and 23.12 ms draft time. Rank bandwidth was 789--828 GB/s; because two ranks
+were just below the 800 GB/s gate, it is near-clean evidence rather than an
+accepted result. The same configuration with local Codex processes competing
+on rank 0 reached only 29.36 tok/s (rank 0 460 GB/s), quantifying why interactive
+results must not replace clean-node acceptance. A historical-control attempt
+landed on a lower 711--745 GB/s interval and is not a valid adjacent comparison.

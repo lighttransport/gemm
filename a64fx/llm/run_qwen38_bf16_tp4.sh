@@ -130,7 +130,7 @@ case "$MODE" in
                 unset TF_NULL_GEMM
                 export TP_NULL_STREAM_PASSES=${TP_NULL_STREAM_PASSES:-10} TP_MAXGEN=1
                 ;;
-            null) export TF_NULL_GEMM=1 TP_MAXGEN=${TP_MAXGEN:-32} ;;
+            null) export TF_NULL_GEMM=${TF_NULL_GEMM:-1} TP_MAXGEN=${TP_MAXGEN:-32} ;;
             check)
                 unset TF_NULL_GEMM
                 export TP_AR_DETERMINISTIC=${TP_AR_DETERMINISTIC:-1}
