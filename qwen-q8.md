@@ -3183,3 +3183,8 @@ default. MTP therefore continues to use the separate payload/trailer protocol.
 At the measured 4.65 emitted tokens per round, 60 tok/s requires approximately
 77.5 ms total; the current 93.1 ms round still needs about 15.6 ms removed,
 primarily from verification.
+
+The clean sharded path also rechecked verifier-kernel prefetch distance 8
+against the established MTP5 distance 16. Distance 8 reproduced the 128-token
+oracle at 51.19 tok/s with 77.07/15.49 ms verify/draft, indistinguishable from
+51.20 tok/s at distance 16. The MTP5 default remains 16.
