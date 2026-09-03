@@ -12259,7 +12259,7 @@ static void forward_hc_mix(hip_llm_runner *r, void *norm_w, void *down_w,
         int nc = r->hc_low_rank;
         void *a[] = { &mixed, &r->d_hc_gate, &r->d_hc_norm, &up_w,
                       &ne, &ns, &nc };
-        LAUNCH(r->fn_qwen4_hc_up_mix_q8, (ne + 1) / 2, 1, 1,
+        LAUNCH(r->fn_qwen4_hc_up_mix_q8, (ne + 7) / 8, 1, 1,
                256, 1, 1, 0, r->stream, a);
     } else {
         launch_matvec_auto(r, r->d_hc_gate, up_w, r->d_hc_low,
