@@ -2840,6 +2840,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | uTofu poll cadence 4/8/16 | near | 128 all yes | 45.15 / 46.11 / 45.39 | 81.08 / 79.55 / 80.56 | 23.85 / 23.19 / 23.82 | 772--829 / 780--831 / 772--829 | retain 8 |
 | 2026-09-03 | persistent-trunk per-worker SVE SiLU | no | short stream changed | 23.39 vs 24.15 control | n/a | n/a | peers 526--539 | reject and remove; slices too small to amortize vector setup |
 | 2026-09-03 | paired verifier SSM alpha/beta team | near | 128 twice yes | 46.39 / 46.36 vs 44.59 control | 79.09 / 79.12 vs 82.73 | 23.03 / 23.07 vs 23.51 | 781--835 / 782--835 vs 775--826 | promote; exact, repeatable +4.0%, clean gate narrowly missed |
+| 2026-09-03 | paired verifier SSM QKV/gate team | near | 128 yes | 45.55 vs 46.09 control | 81.23 vs 79.60 | 22.79 vs 23.20 | 771--844 vs 785--833 | reject and remove; large HBM phases regress inside retained team |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2948,3 +2949,11 @@ projection time fell from 480.5 to 444.8/450.4 ms over 27 rounds. This is a
 repeatable 4.0% end-to-end short-run improvement and is promoted as the
 launcher default. The samples remain classified near-clean because one rank
 measured 781--782 GB/s, just below the 800 GB/s acceptance threshold.
+
+The analogous shared-team experiment for the much larger SSM QKV and gate
+projections was rejected and removed. It retained the canonical hash, the same
+static row ownership, and an explicit phase barrier, but reached only 45.55
+tok/s with 81.23 ms verification. The immediately adjacent disabled control
+reached 46.09 tok/s with 79.60 ms verification. Projection time increased from
+447.5 to 461.4 ms over 27 rounds, so these long HBM-streaming phases benefit
+from ending the first region instead of holding its team through the barrier.
