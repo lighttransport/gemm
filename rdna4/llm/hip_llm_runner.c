@@ -978,11 +978,11 @@ static const char *hip_kernel_source =
 "/* Grouped Qwen4 prefill kernels. blockIdx.y selects the expert and the\n"
 " * assignment offset table supplies the variable token count for that expert. */\n"
 "__global__ void qwen4_gateup_silu_q4k_grouped(float *dst,const unsigned char *gate,\n"
-"        const unsigned char *up,const float *x,const int *offs,const int *slot_map,const int *active,int na,\n"
-"        int ne,int rows,int cols,long long gs,long long us){\n"
-"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int e=blockIdx.y<na?active[blockIdx.y]:ne;\n"
-"    int row=blockIdx.x*(blockDim.x/32)+warp;int local=blockIdx.z;int cnt=offs[e+1]-offs[e];\n"
-"    if(e>=ne||row>=rows||local>=cnt)return;int a=offs[e]+local,nb=cols/256,rb=nb*144,G=nb*4;\n"
+"        const unsigned char *up,const float *x,const int *task_e,const int *task_p,const int *slot_map,\n"
+"        int rows,int cols,long long gs,long long us){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int task=blockIdx.y;\n"
+"    int row=blockIdx.x*(blockDim.x/32)+warp;int e=task_e[task],a=task_p[task];\n"
+"    if(row>=rows)return;int nb=cols/256,rb=nb*144,G=nb*4;\n"
 "    int slot=slot_map[e];const unsigned char *gr=gate+(long long)slot*gs+(size_t)row*rb;\n"
 "    const unsigned char *ur=up +(long long)slot*us+(size_t)row*rb;\n"
 "    float g=0.0f,u=0.0f;const float *xp=x+(size_t)a*cols;\n"
@@ -993,11 +993,11 @@ static const char *hip_kernel_source =
 "    if(lane==0)dst[(size_t)a*rows+row]=(g/(1.0f+expf(-g)))*u;\n"
 "}\n"
 "__global__ void qwen4_gateup_silu_q5k_grouped(float *dst,const unsigned char *gate,\n"
-"        const unsigned char *up,const float *x,const int *offs,const int *slot_map,const int *active,int na,\n"
-"        int ne,int rows,int cols,long long gs,long long us){\n"
-"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int e=blockIdx.y<na?active[blockIdx.y]:ne;\n"
-"    int row=blockIdx.x*(blockDim.x/32)+warp;int local=blockIdx.z;int cnt=offs[e+1]-offs[e];\n"
-"    if(e>=ne||row>=rows||local>=cnt)return;int a=offs[e]+local,nb=cols/256,rb=nb*176,G=nb*4;\n"
+"        const unsigned char *up,const float *x,const int *task_e,const int *task_p,const int *slot_map,\n"
+"        int rows,int cols,long long gs,long long us){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int task=blockIdx.y;\n"
+"    int row=blockIdx.x*(blockDim.x/32)+warp;int e=task_e[task],a=task_p[task];\n"
+"    if(row>=rows)return;int nb=cols/256,rb=nb*176,G=nb*4;\n"
 "    int slot=slot_map[e];const unsigned char *gr=gate+(long long)slot*gs+(size_t)row*rb;\n"
 "    const unsigned char *ur=up +(long long)slot*us+(size_t)row*rb;\n"
 "    float g=0.0f,u=0.0f;const float *xp=x+(size_t)a*cols;\n"
@@ -1008,11 +1008,11 @@ static const char *hip_kernel_source =
 "    if(lane==0)dst[(size_t)a*rows+row]=(g/(1.0f+expf(-g)))*u;\n"
 "}\n"
 "__global__ void qwen4_down_q5_1_grouped(float *dst,const unsigned char *down,\n"
-"        const float *act,const int *offs,const int *slot_map,const int *active,int na,int ne,int rows,int cols,\n"
+"        const float *act,const int *task_e,const int *task_p,const int *slot_map,int rows,int cols,\n"
 "        long long ds){\n"
-"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int e=blockIdx.y<na?active[blockIdx.y]:ne;\n"
-"    int row=blockIdx.x*(blockDim.x/32)+warp;int local=blockIdx.z;int cnt=offs[e+1]-offs[e];\n"
-"    if(e>=ne||row>=rows||local>=cnt)return;int a=offs[e]+local,nb=cols/32,rb=nb*24,slot=slot_map[e];\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int task=blockIdx.y;\n"
+"    int row=blockIdx.x*(blockDim.x/32)+warp;int e=task_e[task],a=task_p[task];\n"
+"    if(row>=rows)return;int nb=cols/32,rb=nb*24,slot=slot_map[e];\n"
 "    const unsigned char *rp=down+(long long)slot*ds+(size_t)row*rb;\n"
 "    const float *xp=act+(size_t)a*cols;float sum=0.0f;\n"
 "    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*24;\n"
@@ -1025,11 +1025,11 @@ static const char *hip_kernel_source =
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[(size_t)a*rows+row]=sum;\n"
 "}\n"
 "__global__ void qwen4_down_q8_0_grouped(float *dst,const unsigned char *down,\n"
-"        const float *act,const int *offs,const int *slot_map,const int *active,int na,int ne,int rows,int cols,\n"
+"        const float *act,const int *task_e,const int *task_p,const int *slot_map,int rows,int cols,\n"
 "        long long ds){\n"
-"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int e=blockIdx.y<na?active[blockIdx.y]:ne;\n"
-"    int row=blockIdx.x*(blockDim.x/32)+warp;int local=blockIdx.z;int cnt=offs[e+1]-offs[e];\n"
-"    if(e>=ne||row>=rows||local>=cnt)return;int a=offs[e]+local,nb=cols/32,rb=nb*36,slot=slot_map[e];\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x%32;int task=blockIdx.y;\n"
+"    int row=blockIdx.x*(blockDim.x/32)+warp;int e=task_e[task],a=task_p[task];\n"
+"    if(row>=rows)return;int nb=cols/32,rb=nb*36,slot=slot_map[e];\n"
 "    const unsigned char *rp=down+(long long)slot*ds+(size_t)row*rb;\n"
 "    const float *xp=act+(size_t)a*cols;float sum=0.0f;\n"
 "    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;float d=half_to_float(*(const half_raw *)bp);\n"
@@ -10787,29 +10787,32 @@ static inline void launch_qwen4_expert_q5k_q80_batch(hip_llm_runner *r,
 }
 
 static inline void launch_qwen4_experts_grouped(hip_llm_runner *r, hip_layer *cl,
-        int ne, int expert_ff, int n_embd, int max_count, int active_count) {
+        int ne, int expert_ff, int n_embd, int total) {
+    (void)ne;
+    int *task_e = (int *)r->d_router_logits_batch;
+    int *task_p = task_e + total;
     void *ga[] = { &r->d_moe_eg, &cl->moe_cache_gate, &cl->moe_cache_up,
-                   &r->d_moe_gather_in, &r->d_moe_offs, &cl->d_moe_cache_map,
-                   &r->d_cursor, &active_count, &ne, &expert_ff, &n_embd, &cl->moe_cache_stride_gate,
+                   &r->d_moe_gather_in, &task_e, &task_p, &cl->d_moe_cache_map,
+                   &expert_ff, &n_embd, &cl->moe_cache_stride_gate,
                    &cl->moe_cache_stride_up };
     hipFunction_t gateup = cl->moe_gate_exps_type == GGML_TYPE_Q5_K ?
                             r->fn_qwen4_gateup_silu_q5k_grouped :
                             r->fn_qwen4_gateup_silu_q4k_grouped;
     long long gs = (long long)cl->moe_cache_stride_gate;
     long long us = (long long)cl->moe_cache_stride_up;
-    ga[11] = &gs;
-    ga[12] = &us;
-    LAUNCH(gateup, (unsigned)((expert_ff + 7) / 8), active_count, (unsigned)max_count,
+    ga[9] = &gs;
+    ga[10] = &us;
+    LAUNCH(gateup, (unsigned)((expert_ff + 7) / 8), total, 1,
            256, 1, 1, 0, r->stream, ga);
     void *da[] = { &r->d_moe_eout, &cl->moe_cache_down, &r->d_moe_eg,
-                   &r->d_moe_offs, &cl->d_moe_cache_map, &r->d_cursor,
-                   &active_count, &ne, &n_embd, &expert_ff, &cl->moe_cache_stride_down };
+                   &task_e, &task_p, &cl->d_moe_cache_map,
+                   &n_embd, &expert_ff, &cl->moe_cache_stride_down };
     hipFunction_t down = cl->moe_down_exps_type == GGML_TYPE_Q8_0 ?
                          r->fn_qwen4_down_q8_0_grouped :
                          r->fn_qwen4_down_q5_1_grouped;
     long long ds = (long long)cl->moe_cache_stride_down;
-    da[10] = &ds;
-    LAUNCH(down, (unsigned)((n_embd + 7) / 8), active_count, (unsigned)max_count,
+    da[8] = &ds;
+    LAUNCH(down, (unsigned)((n_embd + 7) / 8), total, 1,
            256, 1, 1, 0, r->stream, da);
 }
 
@@ -12737,12 +12740,10 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
           cl->moe_up_exps_type == GGML_TYPE_Q5_K)) &&
          (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
           cl->moe_down_exps_type == GGML_TYPE_Q8_0);
-    int max_count = 0;
-    int active_experts[512], active_count = 0;
+    int grouped_tasks = 0;
     if (grouped_qwen) {
         for (int e = 0; e < ne; ++e) {
             int cnt = offs[e + 1] - offs[e];
-            if (cnt > max_count) max_count = cnt;
             if (cnt > 0) {
                 int resident = 0;
                 for (int s = 0; s < cl->moe_cache_slots; ++s)
@@ -12751,15 +12752,25 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             }
         }
         if (grouped_qwen) {
+            int *task_e = r->h_moe_tok_idx;
+            int *task_p = (int *)r->h_router_batch;
             for (int e = 0; e < ne; ++e)
-                if (offs[e + 1] > offs[e]) active_experts[active_count++] = e;
-            hipMemcpyAsync(r->d_cursor, active_experts,
-                           (size_t)active_count * sizeof(int),
+                for (int p = offs[e]; p < offs[e + 1]; ++p) {
+                    task_e[grouped_tasks] = e;
+                    task_p[grouped_tasks++] = p;
+                }
+            int *d_task_e = (int *)r->d_router_logits_batch;
+            int *d_task_p = d_task_e + grouped_tasks;
+            hipMemcpyAsync(d_task_e, task_e,
+                           (size_t)grouped_tasks * sizeof(int),
+                           hipMemcpyHostToDevice, r->stream);
+            hipMemcpyAsync(d_task_p, task_p,
+                           (size_t)grouped_tasks * sizeof(int),
                            hipMemcpyHostToDevice, r->stream);
         }
     }
     if (grouped_qwen)
-        launch_qwen4_experts_grouped(r, cl, ne, eff, n_embd, max_count, active_count);
+        launch_qwen4_experts_grouped(r, cl, ne, eff, n_embd, grouped_tasks);
     if (grouped_qwen && r->moe_copy_pipeline) {
         for (int e = 0; e < ne; ++e) {
             if (offs[e + 1] == offs[e]) continue;
