@@ -13151,12 +13151,13 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     }
     if (cpu_jobs) {
         hllm_cpu_prefill_jobs(r, cl, cpu_ids, cpu_pos, cpu_jobs);
-        for (int j = 0; j < cpu_jobs; ++j) {
-            size_t off = (size_t)cpu_pos[j];
-            hipMemcpyAsync((float *)r->d_moe_eout + off * n_embd,
-                           r->h_moe_eout_cpu + off * n_embd,
-                           (size_t)n_embd * sizeof(float), hipMemcpyHostToDevice,
-                           r->stream);
+        for (int e = 0; e < ne; ++e) {
+            if (!cpu_selected[e]) continue;
+            int first = offs[e], count = offs[e + 1] - first;
+            hipMemcpyAsync((float *)r->d_moe_eout + (size_t)first * n_embd,
+                           r->h_moe_eout_cpu + (size_t)first * n_embd,
+                           (size_t)count * n_embd * sizeof(float),
+                           hipMemcpyHostToDevice, r->stream);
         }
         r->moe_stats.cpu_assignments += (uint64_t)cpu_jobs;
     }
