@@ -10803,11 +10803,12 @@ static inline void launch_qwen4_expert_q8(hip_llm_runner *r, void *acc,
 
 static inline void launch_qwen4_experts_q8_selected(hip_llm_runner *r,
         hip_layer *cl, const int *slots, const float *weights, int K,
-        int expert_ff, int n_embd) {
+        int expert_ff, int n_embd, int weights_device) {
     hipMemcpyAsync(r->d_moe_idx, slots, (size_t)K*sizeof(int),
                    hipMemcpyHostToDevice, r->stream);
-    hipMemcpyAsync(r->d_moe_w, weights, (size_t)K*sizeof(float),
-                   hipMemcpyHostToDevice, r->stream);
+    if (!weights_device)
+        hipMemcpyAsync(r->d_moe_w, weights, (size_t)K*sizeof(float),
+                       hipMemcpyHostToDevice, r->stream);
     long long gs=(long long)cl->moe_cache_stride_gate;
     long long us=(long long)cl->moe_cache_stride_up;
     void *ga[]={&r->d_moe_act8,&cl->moe_cache_gate,&cl->moe_cache_up,
@@ -10823,11 +10824,12 @@ static inline void launch_qwen4_experts_q8_selected(hip_llm_runner *r,
 
 static inline void launch_qwen4_experts_q4k_selected(hip_llm_runner *r,
         hip_layer *cl, const int *slots, const float *weights, int K,
-        int expert_ff, int n_embd) {
+        int expert_ff, int n_embd, int weights_device) {
     hipMemcpyAsync(r->d_moe_idx, slots, (size_t)K*sizeof(int),
                    hipMemcpyHostToDevice, r->stream);
-    hipMemcpyAsync(r->d_moe_w, weights, (size_t)K*sizeof(float),
-                   hipMemcpyHostToDevice, r->stream);
+    if (!weights_device)
+        hipMemcpyAsync(r->d_moe_w, weights, (size_t)K*sizeof(float),
+                       hipMemcpyHostToDevice, r->stream);
     long long gs=(long long)cl->moe_cache_stride_gate;
     long long us=(long long)cl->moe_cache_stride_up;
     void *ga[]={&r->d_moe_act8,&cl->moe_cache_gate,&cl->moe_cache_up,
@@ -10852,11 +10854,12 @@ static inline void launch_qwen4_experts_q4k_selected(hip_llm_runner *r,
 
 static inline void launch_qwen4_experts_q5k_selected(hip_llm_runner *r,
         hip_layer *cl, const int *slots, const float *weights, int K,
-        int expert_ff, int n_embd) {
+        int expert_ff, int n_embd, int weights_device) {
     hipMemcpyAsync(r->d_moe_idx, slots, (size_t)K*sizeof(int),
                    hipMemcpyHostToDevice, r->stream);
-    hipMemcpyAsync(r->d_moe_w, weights, (size_t)K*sizeof(float),
-                   hipMemcpyHostToDevice, r->stream);
+    if (!weights_device)
+        hipMemcpyAsync(r->d_moe_w, weights, (size_t)K*sizeof(float),
+                       hipMemcpyHostToDevice, r->stream);
     long long gs=(long long)cl->moe_cache_stride_gate;
     long long us=(long long)cl->moe_cache_stride_up;
     void *ga[]={&r->d_moe_act8,&cl->moe_cache_gate,&cl->moe_cache_up,
@@ -12125,8 +12128,9 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
             float valid = 0.0f;
             hipMemcpyAsync(top_idx, r->d_moe_idx, (size_t)n_experts_used*sizeof(int),
                            hipMemcpyDeviceToHost, r->stream);
-            hipMemcpyAsync(top_w, r->d_moe_w, (size_t)n_experts_used*sizeof(float),
-                           hipMemcpyDeviceToHost, r->stream);
+            if (!use_gpu_topk)
+                hipMemcpyAsync(top_w, r->d_moe_w, (size_t)n_experts_used*sizeof(float),
+                               hipMemcpyDeviceToHost, r->stream);
             hipMemcpyAsync(&valid, r->d_router_logits, sizeof(valid),
                            hipMemcpyDeviceToHost, r->stream);
             hipStreamSynchronize(r->stream);
@@ -12231,13 +12235,13 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
         }
         if (fused_q8)
             launch_qwen4_experts_q8_selected(r, cl, top_slots, top_w,
-                                             n_experts_used, expert_ff, n_embd);
+                                             n_experts_used, expert_ff, n_embd, use_gpu_topk);
         else if (fused_xl)
             launch_qwen4_experts_q4k_selected(r, cl, top_slots, top_w,
-                                              n_experts_used, expert_ff, n_embd);
+                                              n_experts_used, expert_ff, n_embd, use_gpu_topk);
         else if (fused_q5k)
             launch_qwen4_experts_q5k_selected(r, cl, top_slots, top_w,
-                                              n_experts_used, expert_ff, n_embd);
+                                              n_experts_used, expert_ff, n_embd, use_gpu_topk);
         r->moe_stats.gpu_assignments += (uint64_t)n_experts_used;
     } else {
       hipMemcpyAsync(r->h_moe_input, r->d_xb,
