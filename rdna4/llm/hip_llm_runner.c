@@ -7789,6 +7789,7 @@ struct hip_llm_runner {
     unsigned char *h_moe_xq_cpu;
     unsigned char *h_moe_gate_q_cpu;
     int h_moe_gather_in_cpu_pinned;
+    int h_moe_eout_cpu_pinned;
     int moe_cpu_prefill;
     /* MoE device-side dispatch buffers */
     int  *d_moe_idx;       /* [n_experts_used] selected expert indices */
@@ -9990,7 +9991,12 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                         r->h_moe_gather_in_cpu_pinned = 1;
                     else
                         r->h_moe_gather_in_cpu = (float *)malloc(in_bytes);
-                    r->h_moe_eout_cpu = (float *)aligned_alloc(64, (in_bytes + 63) & ~(size_t)63);
+                    if (hipHostMalloc((void **)&r->h_moe_eout_cpu, in_bytes,
+                                      hipHostMallocDefault) == hipSuccess)
+                        r->h_moe_eout_cpu_pinned = 1;
+                    else
+                        r->h_moe_eout_cpu = (float *)aligned_alloc(64,
+                            (in_bytes + 63) & ~(size_t)63);
                     r->h_moe_xq_cpu = (unsigned char *)aligned_alloc(64,
                         ((TA * (size_t)(r->n_embd / 256) * 292) + 63) & ~(size_t)63);
                     r->h_moe_gate_q_cpu = (unsigned char *)aligned_alloc(64,
@@ -14036,7 +14042,8 @@ void hip_llm_free(hip_llm_runner *r) {
     free(r->h_moe_tmp);
     if (r->h_moe_gather_in_cpu_pinned) hipHostFree(r->h_moe_gather_in_cpu);
     else free(r->h_moe_gather_in_cpu);
-    free(r->h_moe_eout_cpu);
+    if (r->h_moe_eout_cpu_pinned) hipHostFree(r->h_moe_eout_cpu);
+    else free(r->h_moe_eout_cpu);
     free(r->h_moe_xq_cpu);
     free(r->h_moe_gate_q_cpu);
     if (r->moe_cpu_lib) dlclose(r->moe_cpu_lib);
