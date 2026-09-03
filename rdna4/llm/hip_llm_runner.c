@@ -12120,6 +12120,10 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                0, r->stream, ra);
         if (use_device_cache) {
             float valid = 0.0f;
+            hipMemcpyAsync(top_idx, r->d_moe_idx, (size_t)n_experts_used*sizeof(int),
+                           hipMemcpyDeviceToHost, r->stream);
+            hipMemcpyAsync(top_w, r->d_moe_w, (size_t)n_experts_used*sizeof(float),
+                           hipMemcpyDeviceToHost, r->stream);
             hipMemcpyAsync(&valid, r->d_router_logits, sizeof(valid),
                            hipMemcpyDeviceToHost, r->stream);
             hipStreamSynchronize(r->stream);
@@ -12131,8 +12135,7 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                     launch_qwen4_experts_q4k_map(r, cl, n_experts_used, expert_ff, n_embd);
                 device_cache_path = 1;
             }
-        }
-        if (!device_cache_path) {
+        } else {
             hipMemcpyAsync(top_idx, r->d_moe_idx, (size_t)n_experts_used*sizeof(int),
                            hipMemcpyDeviceToHost, r->stream);
             hipMemcpyAsync(top_w, r->d_moe_w, (size_t)n_experts_used*sizeof(float),
