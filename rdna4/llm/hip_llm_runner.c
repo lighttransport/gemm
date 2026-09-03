@@ -772,7 +772,7 @@ static const char *hip_kernel_source =
 "            const unsigned char *q=bp+8;float s=0.0f;for(int j=0;j<16;j++){int a=(q[j]&15)|(((qh>>j)&1)<<4);\n"
 "                int v=(q[j]>>4)|(((qh>>(j+16))&1)<<4);s+=(d*a+m)*x[b*32+j]+(d*v+m)*x[b*32+j+16];}sum+=s;}\n"
 "        for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);__shared__ float ws[8];int warp=tid/32,lane=tid%32;\n"
-"        if(lane==0)ws[warp]=sum;__syncthreads();if(tid==0){float v=0.0f;for(int w=0;w<8;w++)v+=ws[w];ws[0]=v*weights[sel];}\n"
+"        if(lane==0)ws[warp]=sum;__syncthreads();if(tid==0){float v=0.0f;for(int w=0;w<blockDim.x/32;w++)v+=ws[w];ws[0]=v*weights[sel];}\n"
 "        __syncthreads();total+=ws[0];__syncthreads();}\n"
 "    if(tid==0)acc[row]=total;\n"
 "}\n"
@@ -10243,8 +10243,10 @@ static inline void launch_qwen4_experts_q4k_q51_selected(hip_llm_runner *r,
     long long ds=(long long)cl->moe_cache_stride_down;
     void *da[]={&r->d_moe_accum,&cl->moe_cache_down,&r->d_moe_act8,
                 &r->d_moe_w,&r->d_moe_idx,&K,&n_embd,&expert_ff,&ds};
+    /* expert_ff=640 has just 20 Q5_1 blocks per row: one wave covers all
+     * blocks and avoids scheduling seven waves that only contribute zero. */
     LAUNCH(r->fn_qwen4_down_accum_q5_1_selected, n_embd, 1, 1,
-           256, 1, 1, 0, r->stream, da);
+           32, 1, 1, 0, r->stream, da);
 }
 
 static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
