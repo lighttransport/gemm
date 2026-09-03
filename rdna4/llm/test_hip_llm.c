@@ -487,6 +487,7 @@ int main(int argc, char **argv) {
             memcpy(buf_p, log_p, (size_t)n_vocab * sizeof(float));
 
             /* Run prefill via batched path */
+            hip_llm_reset_state(gpu);
             hip_llm_set_batched_path(gpu, 1);
             float *log_b = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
             if (!log_b) { fprintf(stderr, "compare: batched path failed\n"); free(buf_p); pass = 0; goto bench_done; }

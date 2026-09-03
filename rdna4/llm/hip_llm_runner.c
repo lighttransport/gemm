@@ -5287,6 +5287,20 @@ static const char *hip_kernel_source =
 "    size_t out_idx = (size_t)row * n_cols + c;\n"
 "    dst[out_idx] = f32_to_bf16(val);\n"
 "}\n"
+"__global__ void dequant_q5_1_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row=blockIdx.x, c=blockIdx.y*256+threadIdx.x; if(c>=n_cols)return;\n"
+"    int nb=n_cols/32, blk=c>>5, w=c&31;\n"
+"    const unsigned char *bp=mat+(size_t)row*nb*24+(size_t)blk*24;\n"
+"    float d=half_to_float(*(const half_raw *)bp);\n"
+"    float m=half_to_float(*(const half_raw *)(bp+2));\n"
+"    unsigned int qh=(unsigned int)bp[4]|((unsigned int)bp[5]<<8)|\n"
+"                    ((unsigned int)bp[6]<<16)|((unsigned int)bp[7]<<24);\n"
+"    const unsigned char *qs=bp+8; int q;\n"
+"    if(w<16) q=(qs[w]&15)|(((qh>>w)&1)<<4);\n"
+"    else { int j=w-16; q=(qs[j]>>4)|(((qh>>(j+16))&1)<<4); }\n"
+"    dst[(size_t)row*n_cols+c]=f32_to_bf16(d*(float)q+m);\n"
+"}\n"
 "\n"
 "/* Per-call dequant of IQ3_XXS (98 B/block, 256 elems) to BF16. Uses the\n"
 " * iq3xxs_grid_dev codebook + ksigns_iq2xs_dev sign table that were emitted\n"
@@ -7468,6 +7482,7 @@ struct hip_llm_runner {
     /* K-quant batched-prefill dequant kernels (write BF16 to a staging buffer) */
     hipFunction_t fn_dequant_q8_0_to_bf16;
     hipFunction_t fn_dequant_q4_0_to_bf16;
+    hipFunction_t fn_dequant_q5_1_to_bf16;
     hipFunction_t fn_dequant_q2_K_to_bf16;
     hipFunction_t fn_dequant_q3_K_to_bf16;
     hipFunction_t fn_dequant_q4_K_to_bf16;
@@ -7948,6 +7963,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(convert_f16_to_bf16);
     GET_FUNC(dequant_q8_0_to_bf16);
     GET_FUNC(dequant_q4_0_to_bf16);
+    GET_FUNC(dequant_q5_1_to_bf16);
     GET_FUNC(dequant_q2_K_to_bf16);
     GET_FUNC(dequant_q3_K_to_bf16);
     GET_FUNC(dequant_q4_K_to_bf16);
@@ -9485,11 +9501,6 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
          * the batch (forward_moe_ffn). Requires the sync-free device MoE dispatch so
          * the per-row loop has no host round-trips. Gate: LLM_MOE_PREFILL (default 1). */
         int eligible = !disabled;
-        /* Qwen4Next has four hyperconnection streams and host-resident routed
-         * experts.  The legacy batched path assumes one hidden stream and
-         * device-resident expert tensors, so using it would both produce wrong
-         * results and size staging buffers for the full 72 GiB expert set. */
-        if (r->is_qwen4exp) eligible = 0;
         if (r->is_moe) {
          /* Batched MoE prefill (LLM_MOE_PREFILL, default ON): SSM/attn projections
               * batch via hipBLASLt; experts are grouped by token and run through the
@@ -9602,8 +9613,13 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             hipDeviceSynchronize();
 
             /* Per-call dequant staging buffer (sized to the largest weight). */
-            r->d_wbuf_bf16_bytes = max_w_elems * 2;
-            CHECK_HIP(hipMalloc(&r->d_wbuf_bf16, r->d_wbuf_bf16_bytes));
+            size_t need_wbuf = max_w_elems * 2;
+            if (r->d_wbuf_bf16_bytes < need_wbuf) {
+                if (r->d_wbuf_bf16) hipFree(r->d_wbuf_bf16);
+                r->d_wbuf_bf16 = NULL;
+                r->d_wbuf_bf16_bytes = need_wbuf;
+                CHECK_HIP(hipMalloc(&r->d_wbuf_bf16, r->d_wbuf_bf16_bytes));
+            }
             if (r->verbose >= 1) {
                 fprintf(stderr, "hip_llm: K-quant dequant staging buffer = %.1f MB\n",
                         (double)r->d_wbuf_bf16_bytes / (1024.0 * 1024.0));
@@ -9703,20 +9719,22 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 CHECK_HIP(hipMalloc(&r->d_shared_scale_batch,  (size_t)bm * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_moe_gather_src,      TA * sizeof(int)));
                 CHECK_HIP(hipMalloc(&r->d_moe_gather_w,        TA * sizeof(float)));
-                /* All-expert bf16 staging (one weight type at a time) + device offsets */
+                /* All-expert bf16 staging. Qwen4 stages only active host experts. */
                 {
                     size_t gu = (size_t)ne * r->expert_ff * r->n_embd * 2;
                     size_t dn = (size_t)ne * r->n_embd * r->expert_ff * 2;
                     size_t sz = gu > dn ? gu : dn;
-                    CHECK_HIP(hipMalloc(&r->d_expw_bf16, sz));
-                    CHECK_HIP(hipMalloc(&r->d_expw_int8, sz / 2));  /* INT8: 1 byte vs BF16's 2 */
-                    { size_t _act_sz = (size_t)TA * (r->n_embd > eff ? r->n_embd : eff);
-                      CHECK_HIP(hipMalloc(&r->d_act_int8, _act_sz)); }
+                    if (!r->is_qwen4exp) {
+                        CHECK_HIP(hipMalloc(&r->d_expw_bf16, sz));
+                        CHECK_HIP(hipMalloc(&r->d_expw_int8, sz / 2));
+                        { size_t _act_sz = (size_t)TA * (r->n_embd > eff ? r->n_embd : eff);
+                          CHECK_HIP(hipMalloc(&r->d_act_int8, _act_sz)); }
+                    }
                     CHECK_HIP(hipMalloc(&r->d_moe_offs, (size_t)(ne + 1) * sizeof(int)));
                     CHECK_HIP(hipMalloc(&r->d_tok_idx, TA * sizeof(int)));
                     CHECK_HIP(hipMalloc(&r->d_tok_w,   TA * sizeof(float)));
                     CHECK_HIP(hipMalloc(&r->d_cursor,  (size_t)ne * sizeof(int)));
-                    if (r->verbose >= 1)
+                    if (r->verbose >= 1 && !r->is_qwen4exp)
                         fprintf(stderr, "hip_llm: grouped-expert staging %.0f MB\n", sz / 1048576.0);
                 }
                 r->h_router_batch    = (float *)malloc((size_t)bm * ne * sizeof(float));
@@ -10257,6 +10275,15 @@ static inline int launch_dequant_q4_0_to_bf16(hip_llm_runner *r,
     return 0;
 }
 
+static inline int launch_dequant_q5_1_to_bf16(hip_llm_runner *r, void *dst,
+                                               void *mat, int n_rows, int n_cols) {
+    if ((n_cols % 32) != 0) return -1;
+    void *args[] = { &dst, &mat, &n_rows, &n_cols };
+    hipError_t e = LAUNCH(r->fn_dequant_q5_1_to_bf16, n_rows, (n_cols+255)/256, 1,
+                          256, 1, 1, 0, r->stream, args);
+    return e == hipSuccess ? 0 : -1;
+}
+
 /* Return a BF16 weight pointer suitable for mm_blaslt_run_bf16, doing per-call
  * dequant into r->d_wbuf_bf16 if the weight is not F16-pre-converted.
  * NOTE: returns r->d_wbuf_bf16 for non-F16 paths; the caller must consume the
@@ -10270,7 +10297,7 @@ static inline void launch_convert_f16_to_bf16(hip_llm_runner *r, void *dst,
 /* True if `type` has a per-call dequant kernel suitable for the batched path. */
 static inline int batch_qtype_ok(int type) {
     return type == GGML_TYPE_F32     || type == GGML_TYPE_F16 ||
-           type == GGML_TYPE_Q8_0    ||
+           type == GGML_TYPE_Q8_0    || type == GGML_TYPE_Q5_1 ||
            type == GGML_TYPE_Q2_K    || type == GGML_TYPE_Q3_K ||
            type == GGML_TYPE_Q4_K    || type == GGML_TYPE_Q5_K ||
            type == GGML_TYPE_Q6_K    || type == GGML_TYPE_IQ3_XXS ||
@@ -10330,6 +10357,9 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
             return r->d_wbuf_bf16;
         case GGML_TYPE_Q4_0:
             if (launch_dequant_q4_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_Q5_1:
+            if (launch_dequant_q5_1_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
             return r->d_wbuf_bf16;
         case GGML_TYPE_Q2_K:
             launch_dequant_q2_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
@@ -11548,7 +11578,7 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
      * own-GEMM path: dequant the expert weight to bf16 once and run the WMMA
      * GEMM — far faster than scalar mmq, which re-reads x per output row
      * (mmq measured 65% of prefill). mmq remains the blaslt-build fallback. */
-    int use_wmma_exp = r->gemm_own;
+    int use_wmma_exp = r->gemm_own || r->is_qwen4exp;
     /* Grouped path (own GEMM): per weight type, ONE all-expert dequant + ONE grouped
      * GEMM (blockIdx.z=expert). ~8 launches/layer vs ~1500 in the per-expert loop. */
     if (use_wmma_exp && r->d_expw_bf16 &&
@@ -11659,9 +11689,43 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         if (cnt == 0) continue;
         size_t off = (size_t)offs[e];
         float *xin = (float *)r->d_moe_gather_in + off * n_embd;
-        void *gate_w = (char *)cl->moe_gate_exps_w + (size_t)e * cl->moe_exp_stride_gu;
-        void *up_w   = (char *)cl->moe_up_exps_w   + (size_t)e * cl->moe_exp_stride_gu;
-        void *down_w = (char *)cl->moe_down_exps_w  + (size_t)e * cl->moe_exp_stride_d;
+        void *gate_w;
+        void *up_w;
+        void *down_w;
+        if (r->is_qwen4exp) {
+            if (cl->moe_cache_slots <= 0) {
+                fprintf(stderr, "hip_llm: batched Qwen4 MoE requires a cache slot\n");
+                return -1;
+            }
+            int slot = -1;
+            for (int s = 0; s < cl->moe_cache_slots; ++s)
+                if (cl->moe_cache_ids[s] == e) { slot = s; break; }
+            if (slot < 0) {
+                slot = cl->moe_cache_next++ % cl->moe_cache_slots;
+                if (cl->moe_cache_ids[slot] >= 0) r->moe_stats.cache_evictions++;
+                const unsigned char *gh = (const unsigned char *)cl->moe_gate_exps_host + (size_t)e * cl->moe_exp_stride_gu;
+                const unsigned char *uh = (const unsigned char *)cl->moe_up_exps_host + (size_t)e * cl->moe_exp_stride_gu;
+                const unsigned char *dh = (const unsigned char *)cl->moe_down_exps_host + (size_t)e * cl->moe_exp_stride_d;
+                hllm_cache_copy(r, (unsigned char *)cl->moe_cache_gate + (size_t)slot*cl->moe_cache_stride_gate,
+                                gh, cl->moe_gate_exps_type, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                cl->moe_exp_stride_gu, cl->moe_cache_stride_gate);
+                hllm_cache_copy(r, (unsigned char *)cl->moe_cache_up + (size_t)slot*cl->moe_cache_stride_up,
+                                uh, cl->moe_up_exps_type, cl->moe_exp_rows_gu, cl->moe_exp_cols_gu,
+                                cl->moe_exp_stride_gu, cl->moe_cache_stride_up);
+                hllm_cache_copy(r, (unsigned char *)cl->moe_cache_down + (size_t)slot*cl->moe_cache_stride_down,
+                                dh, cl->moe_down_exps_type, cl->moe_exp_rows_d, cl->moe_exp_cols_d,
+                                cl->moe_exp_stride_d, cl->moe_cache_stride_down);
+                cl->moe_cache_ids[slot] = e;
+                r->moe_stats.cache_misses++;
+            } else r->moe_stats.cache_hits++;
+            gate_w = (unsigned char *)cl->moe_cache_gate + (size_t)slot*cl->moe_cache_stride_gate;
+            up_w = (unsigned char *)cl->moe_cache_up + (size_t)slot*cl->moe_cache_stride_up;
+            down_w = (unsigned char *)cl->moe_cache_down + (size_t)slot*cl->moe_cache_stride_down;
+        } else {
+            gate_w = (char *)cl->moe_gate_exps_w + (size_t)e * cl->moe_exp_stride_gu;
+            up_w = (char *)cl->moe_up_exps_w + (size_t)e * cl->moe_exp_stride_gu;
+            down_w = (char *)cl->moe_down_exps_w + (size_t)e * cl->moe_exp_stride_d;
+        }
         if (use_wmma_exp) {
             void *xin_bf16 = (char *)r->d_moe_gather_in_bf16 + off * n_embd * 2;
             void *gw = get_bf16_weight(r, gate_w, NULL, cl->moe_gate_exps_type,
@@ -11729,7 +11793,8 @@ experts_done:
     }
 
     /* 7. Residual: x_batch += moe_out. */
-    launch_add(r, r->d_x_batch, r->d_moe_out_batch, M * n_embd);
+    if (!r->is_qwen4exp)
+        launch_add(r, r->d_x_batch, r->d_moe_out_batch, M * n_embd);
     return 0;
 }
 
@@ -12468,9 +12533,18 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
          * deinterleave_qgate_batch after Q proj and sigmoid_mul before output proj. */
         int is_gated_attn = (cl->attn_q_rows == 2 * q_dim);
 
-        /* ---- Pre-attention RMSNorm: one batched launch over M rows ---- */
-        launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
-                             cl->attn_norm_w, n_embd, M, n_embd, eps);
+        if (r->is_qwen4exp) {
+            if (forward_hc_mix_batched(r, M, cl->hc_attn_norm_w,
+                    cl->hc_attn_down_w, cl->hc_attn_down_type,
+                    cl->hc_attn_up_w, cl->hc_attn_up_type,
+                    cl->hc_attn_inject_w, cl->hc_attn_inject_type,
+                    r->d_x_batch) != 0) return -1;
+            hipMemcpyAsync(r->d_xnorm_batch, r->d_x_batch, (size_t)M*n_embd*sizeof(float),
+                           hipMemcpyDeviceToDevice, r->stream);
+        } else {
+            launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
+                                 cl->attn_norm_w, n_embd, M, n_embd, eps);
+        }
 
         /* Pack BF16 input (single launch over M*n_embd) */
         launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16,
@@ -12585,7 +12659,8 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             }
 
             /* Residual: x_batch += ssm_proj */
-            launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
+            if (r->is_qwen4exp) forward_hc_combine_batched(r, M, r->d_attn_proj_batch);
+            else launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
 
             /* Jump past the attn block to the FFN section. */
             goto ffn_section;
@@ -12785,7 +12860,9 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         /* Residual with Gemma4 post-attention norm. llama.cpp applies the norm to the
          * attention output (Wo·attn) and THEN adds the residual: x += post_attn_norm(attn_proj).
          * (Earlier this normed the post-residual x, which is structurally wrong.) */
-        if (r->is_gemma4 && cl->post_attn_norm_w) {
+        if (r->is_qwen4exp) {
+            forward_hc_combine_batched(r, M, r->d_attn_proj_batch);
+        } else if (r->is_gemma4 && cl->post_attn_norm_w) {
             launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_attn_proj_batch,
                                  cl->post_attn_norm_w, n_embd, M, n_embd, eps);
             launch_add(r, r->d_x_batch, r->d_xnorm_batch, M * n_embd);
@@ -12795,8 +12872,18 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
 
 ffn_section:
         /* ---- Pre-FFN RMSNorm: one batched launch over M rows ---- */
-        launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
-                             cl->ffn_norm_w, n_embd, M, n_embd, eps);
+        if (r->is_qwen4exp) {
+            if (forward_hc_mix_batched(r, M, cl->hc_ffn_norm_w,
+                    cl->hc_ffn_down_w, cl->hc_ffn_down_type,
+                    cl->hc_ffn_up_w, cl->hc_ffn_up_type,
+                    cl->hc_ffn_inject_w, cl->hc_ffn_inject_type,
+                    r->d_x_batch) != 0) return -1;
+            hipMemcpyAsync(r->d_xnorm_batch, r->d_x_batch, (size_t)M*n_embd*sizeof(float),
+                           hipMemcpyDeviceToDevice, r->stream);
+        } else {
+            launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
+                                 cl->ffn_norm_w, n_embd, M, n_embd, eps);
+        }
 
         /* ---- MoE FFN: per-row over the batch (Phase 2 increment 1). The router
          * top-K + sparse experts are applied to each of the M normed rows; the
@@ -12805,6 +12892,7 @@ ffn_section:
         if (cl->is_moe) {
             if (r->moe_prefill_batched) {
                 if (forward_moe_ffn_batched(r, cl, M) != 0) return -1;
+                if (r->is_qwen4exp) forward_hc_combine_batched(r, M, r->d_moe_out_batch);
             } else {
                 void *saved_xb = r->d_xb;
                 for (int m = 0; m < M; m++) {
@@ -12893,8 +12981,15 @@ ffn_section:
     }
 
     /* ---- Final RMSNorm: one batched launch over M rows ---- */
-    launch_rmsnorm_batch(r, r->d_x_batch, r->d_x_batch,
-                         r->d_output_norm, n_embd, M, n_embd, eps);
+    if (r->is_qwen4exp) {
+        if (forward_hc_mix_batched(r, M, r->hc_head_norm_w,
+                r->hc_head_down_w, r->hc_head_down_type,
+                r->hc_head_up_w, r->hc_head_up_type, NULL, 0,
+                r->d_x_batch) != 0) return -1;
+    } else {
+        launch_rmsnorm_batch(r, r->d_x_batch, r->d_x_batch,
+                             r->d_output_norm, n_embd, M, n_embd, eps);
+    }
 
     /* Copy last row into r->d_x so callers (and lm_head path) see the result. */
     float *last_row = (float *)r->d_x_batch + (size_t)(M - 1) * n_embd;
@@ -12958,6 +13053,12 @@ static int embed_tokens_batch(hip_llm_runner *r,
         float scale = r->embd_scale;
         void *a[] = { &r->d_x_batch, &scale, &n };
         LAUNCH(r->fn_scale_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+    }
+    if (r->is_qwen4exp) {
+        int ns = r->hc_count, n = M * n_embd * ns;
+        void *a[] = { &r->d_hc_batch, &r->d_x_batch, &n_embd, &ns, &M };
+        LAUNCH(r->fn_hc_repeat_batch_f32, (n + 255) / 256, 1, 1,
+               256, 1, 1, 0, r->stream, a);
     }
     return 0;
 }
