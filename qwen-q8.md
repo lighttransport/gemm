@@ -2844,6 +2844,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | 24-thread SSM alpha/beta pair | no | 128 yes | 4.37 | 1027.23 | 57.72 | 68--89 | reject and remove; alternating 24/48-thread regions defeats Fujitsu hot-team reuse |
 | 2026-09-03 | exact-slot contiguous uTofu Put, non-MTP | no | 128 yes | 31.04 vs 26.99 | n/a | n/a | 535--555 vs 531--548 peers | promote 5120-float slot; comm 5.45--6.43 vs 10.09--10.92 ms/token |
 | 2026-09-03 | exact-slot contiguous uTofu Put, MTP | near | 128 yes | 44.01 vs 46.36 | 79.84 vs 79.12 | 27.81 vs 23.07 | 785--825 vs 782--835 | reject 25600 slot; retain 32768 for MTP |
+| 2026-09-03 | late TCQ polling after peer arrival | no | 128 twice yes | 30.65 / 30.93 vs 31.04 reference | n/a | n/a | 527--554 / 536--544 | reject and remove; collective time neutral |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2986,3 +2987,16 @@ flat and the smaller sequential draft reductions became slower. The canonical
 run reached 44.01 tok/s, 79.84 ms verification, and 27.81 ms drafting versus
 46.36 tok/s, 79.12 ms, and 23.07 ms with the 32,768-float default. MTP therefore
 continues to override the single-token default with 32,768 floats.
+
+Deferring local TCQ completion polling until after remote trailer arrival was
+also exact but neutral. Two 128-token runs reached 30.65 and 30.93 tok/s with
+balanced peer collective times of 5.36--6.77 and 5.64--6.03 ms/token. The
+original completion-first exact-slot run reached 31.04 tok/s and
+5.45--6.43 ms/token. The late-poll branch was removed to keep the simpler
+ordering and avoid accumulating unobserved completions during peer waits.
+
+A 256-token exact-slot stability run completed without a protocol timeout or
+MRQ overflow, producing 28.44 tok/s. Its per-token curve held communication
+near 5 ms on rank 0, but rank-0 compute stalls between tokens 177 and 226 made
+peers report 8.19--8.97 ms average wait and reduced aggregate throughput. It is
+therefore stability evidence only, not a clean sustained performance result.
