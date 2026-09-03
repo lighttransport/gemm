@@ -12,6 +12,8 @@ extern "C" int mm_blaslt_init(void) { return -1; }
 
 extern "C" int mm_blaslt_run_bf16(void *, const void *, const void *,
                                   int, int, int, void *) { return -1; }
+extern "C" int mm_blaslt_run_bf16_strided_batch(
+    void *, const void *, const void *, int, int, int, int, void *) { return -1; }
 
 extern "C" int mm_blaslt_run_bf16_bias(void *, const void *, const void *,
                                        const void *, int, int, int, void *) {
@@ -82,10 +84,10 @@ struct Plan {
 };
 
 struct ShapeKey {
-  int M, N, K;
+  int M, N, K, batch;
   int flags;  /* bit0: bias, bit1: gelu+bf16-D variant */
   bool operator==(const ShapeKey &o) const noexcept {
-    return M == o.M && N == o.N && K == o.K && flags == o.flags;
+    return M == o.M && N == o.N && K == o.K && batch == o.batch && flags == o.flags;
   }
 };
 
@@ -94,6 +96,7 @@ struct ShapeKeyHash {
     size_t h = static_cast<size_t>(k.M) * 0x9E3779B185EBCA87ull;
     h ^= static_cast<size_t>(k.N) * 0xC2B2AE3D27D4EB4Full;
     h ^= static_cast<size_t>(k.K) * 0x165667B19E3779F9ull;
+    h ^= static_cast<size_t>(k.batch) * 0x27D4EB2F165667C5ull;
     h ^= static_cast<size_t>(k.flags) * 0x94D049BB133111EBull;
     return h;
   }
@@ -169,7 +172,7 @@ void destroy_plan(Plan &p) {
   p = Plan{};
 }
 
-int build_plan(int M, int N, int K, int flags, Plan &p) {
+int build_plan(int M, int N, int K, int batch, int flags, Plan &p) {
   bool with_bias = (flags & 1) != 0;
   bool gelu_bf16d = (flags & 2) != 0;
   bool bias_bf16d = (flags & 4) != 0;
@@ -200,6 +203,18 @@ int build_plan(int M, int N, int K, int flags, Plan &p) {
   /* Y [M,N] D-type row-major == [N,M] col-major */
   HBLT_RET(hipblasLtMatrixLayoutCreate(&p.c, d_dt, N, M, N));
   HBLT_RET(hipblasLtMatrixLayoutCreate(&p.d, d_dt, N, M, N));
+  if (batch > 1) {
+    int32_t bc = batch;
+    int64_t sa = (int64_t)N * K, sb = (int64_t)M * K, sy = (int64_t)M * N;
+    HBLT_RET(hipblasLtMatrixLayoutSetAttribute(p.a, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &bc, sizeof(bc)));
+    HBLT_RET(hipblasLtMatrixLayoutSetAttribute(p.b, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &bc, sizeof(bc)));
+    HBLT_RET(hipblasLtMatrixLayoutSetAttribute(p.c, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &bc, sizeof(bc)));
+    HBLT_RET(hipblasLtMatrixLayoutSetAttribute(p.d, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &bc, sizeof(bc)));
+    HBLT_RET(hipblasLtMatrixLayoutSetAttribute(p.a, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &sa, sizeof(sa)));
+    HBLT_RET(hipblasLtMatrixLayoutSetAttribute(p.b, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &sb, sizeof(sb)));
+    HBLT_RET(hipblasLtMatrixLayoutSetAttribute(p.c, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &sy, sizeof(sy)));
+    HBLT_RET(hipblasLtMatrixLayoutSetAttribute(p.d, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &sy, sizeof(sy)));
+  }
 
   std::vector<hipblasLtMatmulHeuristicResult_t> results(64);
   int returned = 0;
@@ -319,6 +334,33 @@ extern "C" int mm_blaslt_run_bf16(void *d_y_f32, const void *d_w_bf16,
                                  M, N, K, stream);
 }
 
+extern "C" int mm_blaslt_run_bf16_strided_batch(
+    void *d_y_f32, const void *d_w_bf16, const void *d_x_bf16,
+    int M, int N, int K, int batch_count, void *stream) {
+  if (batch_count <= 1)
+    return mm_blaslt_run_bf16(d_y_f32, d_w_bf16, d_x_bf16, M, N, K, stream);
+  if (!g_state.initialized && mm_blaslt_init() != 0) return -1;
+  ShapeKey key{M, N, K, batch_count, 0};
+  auto it = g_state.plans.find(key);
+  if (it == g_state.plans.end()) {
+    Plan p;
+    if (build_plan(M, N, K, batch_count, 0, p) != 0) {
+      destroy_plan(p);
+      return -1;
+    }
+    it = g_state.plans.emplace(key, p).first;
+  }
+  Plan &p = it->second;
+  if (!p.valid) return -1;
+  const float alpha = 1.0f, beta = 0.0f;
+  HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha,
+                           d_w_bf16, p.a, d_x_bf16, p.b, &beta,
+                           d_y_f32, p.c, d_y_f32, p.d, &p.algo,
+                           p.workspace, p.workspace_size,
+                           static_cast<hipStream_t>(stream)));
+  return 0;
+}
+
 extern "C" int mm_blaslt_run_bf16_bias(void *d_y_f32, const void *d_w_bf16,
                                        const void *d_x_bf16,
                                        const void *d_bias_f32,
@@ -336,11 +378,11 @@ extern "C" int mm_blaslt_run_bf16_bias_residual(
   }
   bool with_bias = (d_bias_f32 != nullptr);
   int flags = with_bias ? 1 : 0;
-  ShapeKey key{M, N, K, flags};
+  ShapeKey key{M, N, K, 1, flags};
   auto it = g_state.plans.find(key);
   if (it == g_state.plans.end()) {
     Plan p;
-    if (build_plan(M, N, K, flags, p) != 0) {
+    if (build_plan(M, N, K, 1, flags, p) != 0) {
       destroy_plan(p);
       return -1;
     }
@@ -376,11 +418,11 @@ extern "C" int mm_blaslt_run_bf16_bias_bf16d(
     return -1;
   }
   int flags = 1 | 4; /* bias + bf16-D */
-  ShapeKey key{M, N, K, flags};
+  ShapeKey key{M, N, K, 1, flags};
   auto it = g_state.plans.find(key);
   if (it == g_state.plans.end()) {
     Plan p;
-    if (build_plan(M, N, K, flags, p) != 0) {
+    if (build_plan(M, N, K, 1, flags, p) != 0) {
       destroy_plan(p);
       return -1;
     }
@@ -413,11 +455,11 @@ extern "C" int mm_blaslt_run_bf16_bias_gelu_bf16d(
     return -1;
   }
   int flags = 1 | 2; /* bias + gelu+bf16-D */
-  ShapeKey key{M, N, K, flags};
+  ShapeKey key{M, N, K, 1, flags};
   auto it = g_state.plans.find(key);
   if (it == g_state.plans.end()) {
     Plan p;
-    if (build_plan(M, N, K, flags, p) != 0) {
+    if (build_plan(M, N, K, 1, flags, p) != 0) {
       destroy_plan(p);
       return -1;
     }
