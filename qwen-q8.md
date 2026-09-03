@@ -2813,6 +2813,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
   TF_NEXTN_FFN_PERSIST=1 \
   TF_NEXTN_BLOCK_PERSIST=1 \
   TF_NEXTN_FULL_PERSIST=1 \
+  TF_NEXTN_ATTN_BLOCK_PERSIST=1 \
   TP_AR_DETERMINISTIC=1 TP_AR_A2A_TREE=1 TP_AR_FUSED_ADD=1 \
   TF_BF16PV_MTP5_FUSED=1 \
   bash run_qwen38_bf16_tp4.sh mtp-sustained
@@ -2831,6 +2832,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-03 | persistent NextN FFN | no | 128/256 yes | 36.65 short; 27.63 sustained | 83.37 / 98.85 | 45.96 / 69.62 | 647--701 / 471--677 | promote; 256 draft -9.5% at lower rank-0 BW |
 | 2026-09-03 | persistent NextN output+FFN block | no | 128/256 yes | 40.90 short; 30.14 sustained | 81.96 / degraded allocation | 33.89 / degraded allocation | 697--752 / 522--730 | promote; short draft -26.3% vs FFN-only, long run rank-0 limited |
 | 2026-09-03 | persistent NextN full block through vocab head | no | 128/256 yes | 42.55 short; 35.76 sustained | 83.46 / 84.66 | 27.90 / 45.45 | 744--803 / 611--764 | promote; removes final pool wake, clean gate pending |
+| 2026-09-03 | persistent NextN attention-to-vocab tail | near/no | 128/256 yes | 44.52 short; 40.48 sustained | 83.10 / 83.59 | 23.33 / 31.32 | 767--821 / 711--811 | promote; exact original head ownership, clean gate pending |
 
 The promoted NextN block dispatch extends the persistent proposer workers
 backward across attention output, its optional all-reduce, residual add, and
@@ -2858,6 +2860,17 @@ call without changing the BF16 projection kernel or the global argmax. Its
 84.66 ms verification, and 45.45 ms drafting, despite rank 0 reaching only
 611 GB/s while its peers reached 723--764 GB/s. This is promoted as the
 default MTP path, but neither measurement qualifies as a clean-node result.
+
+`TF_NEXTN_ATTN_BLOCK_PERSIST=1` extends the same dispatch backward through the
+per-head attention calculation and gated-attention activation. It preserves
+the original head assignment (including idle workers when there are fewer
+heads than threads), then crosses explicit dependency barriers before the
+attention-output projection. This avoids one more pool wake without moving
+weight rows between their CMG owners. The canonical 128-token run reached
+**44.52 tok/s**, with 83.10 ms verification and 23.33 ms drafting at
+767--821 GB/s. The canonical 256-token run reached **40.48 tok/s**, with 83.59
+ms verification and 31.32 ms drafting at 711--811 GB/s. Both had under 0.2%
+rank wall-time skew; neither passes the all-ranks 800 GB/s clean gate.
 
 An additional SSM scheduling probe normalized Q/K directly into each expanded
 head, replacing the normalize/expand pair with one worker phase and removing
