@@ -715,6 +715,48 @@ static const char *hip_kernel_source =
 "        for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[local]=sum;\n"
 "}\n"
+"/* Qwen SSM qkv and gate projections have different input widths. */\n"
+"__global__ void matvec_qz_q8_0_mw(float *qout,float *zout,\n"
+"        const unsigned char *qmat,const unsigned char *zmat,const float *x,\n"
+"        int qr,int zr,int qcols,int zcols){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp;\n"
+"    int total=qr+zr;if(row>=total)return;\n"
+"    float *dst;const unsigned char *mat;int local,n_cols;\n"
+"    if(row<qr){dst=qout;mat=qmat;local=row;n_cols=qcols;}\n"
+"    else{dst=zout;mat=zmat;local=row-qr;n_cols=zcols;}\n"
+"    int nb=n_cols/32,rb=nb*36;const unsigned char *rp=mat+(size_t)local*rb;\n"
+"    float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;\n"
+"        const signed char *q=(const signed char *)(bp+4);const float *xb=x+b*32;float s=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[local]=sum;\n"
+"}\n"
+"/* Full Qwen SSM input fusion: Q8 qkv/gate plus F32 alpha/beta. */\n"
+"__global__ void ssm_matvec4_q8_f32(float *qkv,float *z,float *alpha,float *beta,\n"
+"        const unsigned char *wq,const unsigned char *wz,const float *wa,const float *wb,\n"
+"        const float *x,int qrows,int zrows,int dt_rank,int qcols,int fcols){\n"
+"    int row=blockIdx.x,tid=threadIdx.x;if(row>=qrows+zrows+2*dt_rank)return;\n"
+"    float sum=0.0f;\n"
+"    if(row<qrows+zrows){\n"
+"        int r=row<qrows?row:row-qrows;const unsigned char *mat=row<qrows?wq:wz;\n"
+"        const unsigned char *rp=mat+(size_t)r*(qcols/32)*36;\n"
+"        for(int b=tid;b<qcols/32;b+=blockDim.x){const unsigned char *bp=rp+b*36;\n"
+"            const signed char *q=(const signed char *)(bp+4);const float *xb=x+b*32;float s=0.0f;\n"
+"            #pragma unroll\n"
+"            for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
+"    } else {\n"
+"        int r=row-qrows-zrows;const float *mat=r<dt_rank?wa:wb;\n"
+"        int rr=r<dt_rank?r:r-dt_rank;const float *rp=mat+(size_t)rr*fcols;\n"
+"        for(int j=tid;j<fcols;j+=blockDim.x)sum+=rp[j]*x[j];\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);__shared__ float ws[8];\n"
+"    int warp=tid/32,lane=tid&31;if(lane==0)ws[warp]=sum;__syncthreads();\n"
+"    if(tid==0){float total=0.0f;for(int w=0;w<blockDim.x/32;w++)total+=ws[w];\n"
+"        if(row<qrows)qkv[row]=total;else if(row<qrows+zrows)z[row-qrows]=total;\n"
+"        else if(row-qrows-zrows<dt_rank)alpha[row-qrows-zrows]=total;\n"
+"        else beta[row-qrows-zrows-dt_rank]=total;}\n"
+"}\n"
 "/* Fused dense Q8_0 gate/up projection and SiLU product. */\n"
 "__global__ void ffn_gate_up_silu_q8_0_mw(float *dst,const unsigned char *gate,\n"
 "        const unsigned char *up,const float *x,int rows,int cols){\n"
@@ -7792,6 +7834,8 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q8_0_f32;
     hipFunction_t fn_matvec_q8_0_mw_f32;
     hipFunction_t fn_matvec_qkv_q8_0_mw;
+    hipFunction_t fn_matvec_qz_q8_0_mw;
+    hipFunction_t fn_ssm_matvec4_q8_f32;
     hipFunction_t fn_ffn_gate_up_silu_q8_0_mw;
     hipFunction_t fn_qwen4_hc_up_mix_q8;
     hipFunction_t fn_qwen4_hc_down_silu_q8;
@@ -8335,6 +8379,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q8_0_f32);
     GET_FUNC(matvec_q8_0_mw_f32);
     GET_FUNC(matvec_qkv_q8_0_mw);
+    GET_FUNC(matvec_qz_q8_0_mw);
+    GET_FUNC(ssm_matvec4_q8_f32);
     GET_FUNC(ffn_gate_up_silu_q8_0_mw);
     GET_FUNC(qwen4_hc_up_mix_q8);
     GET_FUNC(qwen4_hc_down_silu_q8);
@@ -10714,6 +10760,28 @@ static inline void launch_ffn_gate_up_silu_q8(hip_llm_runner *r,
                                                void *x, int rows, int cols) {
     void *args[] = { &dst, &gate, &up, &x, &rows, &cols };
     LAUNCH(r->fn_ffn_gate_up_silu_q8_0_mw, (rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_matvec_qz_q8(hip_llm_runner *r,
+                                        void *q, void *z, void *qw, void *zw,
+                                        void *x, int qr, int zr,
+                                        int qcols, int zcols) {
+    void *args[] = { &q, &z, &qw, &zw, &x, &qr, &zr, &qcols, &zcols };
+    LAUNCH(r->fn_matvec_qz_q8_0_mw, (qr + zr + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_ssm_matvec4_q8_f32(hip_llm_runner *r,
+                                              void *qkv, void *z,
+                                              void *alpha, void *beta,
+                                              void *qmat, void *zmat,
+                                              void *amat, void *bmat, void *x,
+                                              int qrows, int zrows, int dt_rank,
+                                              int qcols, int fcols) {
+    void *args[] = { &qkv, &z, &alpha, &beta, &qmat, &zmat, &amat, &bmat,
+                     &x, &qrows, &zrows, &dt_rank, &qcols, &fcols };
+    LAUNCH(r->fn_ssm_matvec4_q8_f32, qrows + zrows + 2 * dt_rank, 1, 1,
            256, 1, 1, 0, r->stream, args);
 }
 
@@ -13240,11 +13308,23 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
             } else {
             if (cl->ssm_qkv_type == GGML_TYPE_Q8_0 &&
                 cl->ssm_gate_type == GGML_TYPE_Q8_0 &&
-                cl->ssm_qkv_cols == cl->ssm_gate_cols) {
-                launch_matvec_qkv_q8(r, r->d_ssm_qkv, r->d_ssm_z, NULL,
-                                     cl->ssm_qkv_w, cl->ssm_gate_w, NULL,
-                                     r->d_xb, cl->ssm_qkv_rows, cl->ssm_gate_rows,
-                                     0, cl->ssm_qkv_cols);
+                cl->ssm_alpha_type == GGML_TYPE_F32 &&
+                cl->ssm_beta_type == GGML_TYPE_F32 &&
+                cl->ssm_qkv_cols == cl->ssm_alpha_cols &&
+                cl->ssm_qkv_cols == cl->ssm_beta_cols) {
+                launch_ssm_matvec4_q8_f32(r, r->d_ssm_qkv, r->d_ssm_z,
+                                          r->d_ssm_alpha, r->d_ssm_beta,
+                                          cl->ssm_qkv_w, cl->ssm_gate_w,
+                                          cl->ssm_alpha_w, cl->ssm_beta_w,
+                                          r->d_xb, cl->ssm_qkv_rows,
+                                          cl->ssm_gate_rows, r->ssm_dt_rank,
+                                          cl->ssm_qkv_cols, cl->ssm_alpha_cols);
+            } else if (cl->ssm_qkv_type == GGML_TYPE_Q8_0 &&
+                       cl->ssm_gate_type == GGML_TYPE_Q8_0) {
+                launch_matvec_qz_q8(r, r->d_ssm_qkv, r->d_ssm_z,
+                                    cl->ssm_qkv_w, cl->ssm_gate_w, r->d_xb,
+                                    cl->ssm_qkv_rows, cl->ssm_gate_rows,
+                                    cl->ssm_qkv_cols, cl->ssm_gate_cols);
             } else {
                 launch_matvec_auto(r, r->d_ssm_qkv, cl->ssm_qkv_w, r->d_xb,
                                    cl->ssm_qkv_rows, cl->ssm_qkv_cols, cl->ssm_qkv_type);
