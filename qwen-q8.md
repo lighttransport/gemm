@@ -2829,8 +2829,13 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | historical | replicated NextN K=5 | yes | yes | 53.43 | 68.79 | 18.26 | ~868 | reference |
 | 2026-09-04 | SVE snapshot convolution, sharded NextN K=5 | yes | 128/256 yes | 52.98 / 51.99 | 73.87 / 73.96 | 15.54 / 15.51 | 882--946 (256) | promote; preparation 127.5 to 51.7 ms/27 calls in adjacent 128 A/B |
 | 2026-09-04 | current non-MTP TP4 baseline, 64 warm + 256 measured | yes | 320 yes | 31.53 | n/a | n/a | 523--564 | 40 tok/s still open; 31.74 ms limiting rank, 129 reductions/token |
+| 2026-09-04 | prefetch next CMG-local projection during TP reduction | yes | first 80 canonical | 32.52 vs 32.59 adjacent | n/a | n/a | 548--572 vs 544--566 | reject and remove; 30.81 vs 30.68 ms/token |
 | 2026-09-04 | MRQ one-Put recheck after SVE snapshot convolution | yes | 128 yes | 53.13 vs 52.98 | 73.68 vs 73.87 | 15.49 vs 15.54 | 906--935 | neutral; collective 362.1 vs 357.4 ms/27 calls, retain two-Put default |
 | 2026-09-04 | KMP blocktime 200 ms / remove verifier K scratch copy | yes | 128 yes | 52.74 / 52.91 | 74.03 / 73.97 | 15.79 / 15.58 | 894--933 / rank0 899 | reject both; neither beats the adjacent 52.98 default |
+| 2026-09-04 | K=5 bonus proposal probe | yes | 128 yes | 50.54 | 74.65 | 19.09 | rank0 857 | boundary token 24/27 (88.9%); optimistic overlap is viable only if 48-thread numerics/bandwidth are preserved |
+| 2026-09-04 | K=5 async 36-verifier/12-draft split | no | 128 yes | 43.21 | 72.04 | 17.67 exposed | 695--749 | reject and remove; reuse fell to 17/33 and verifier lost HBM bandwidth |
+| 2026-09-04 | sequential 12-thread K=5 bonus control | no | 128 yes | 40.14 | 74.51 | 43.51 | 650--695 | preserves 26/27 full acceptance and 24/27 boundary hits; async quality loss is predicted-hidden seeding, not thread-count numerics |
+| 2026-09-04 | verifier `TF_SSM_PREEXP=1` | yes | no | 54.17 | 75.14 | 15.68 | 915--992 | reject; output hash changed to `a0f96c3b...` |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
