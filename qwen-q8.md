@@ -2839,6 +2839,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | one hot OpenMP team for complete K=5 FFN gate/up streams | yes | 128 yes | 52.40 | 74.86 | 15.55 | 893--951 | reject and remove; FFN projection saved only 0.20 ms/round and wall time regressed |
 | 2026-09-04 | defer K=5 SSM output norm/gate to 60-task pass | yes | 128 yes | 52.99 | 73.96 | 15.43 | 884--951 | reject and remove; scan rose 121.1 to 128.3 ms/27 calls, wall gain was collective variance |
 | 2026-09-04 | worker-private verifier attention-score arena | yes | 128/256 yes | 56.57 / 55.53 | 68.41 / 68.41 | 15.33 / 15.35 | 927--945 (256) | promote; 256-byte-aligned per-worker slices remove 768 contended allocator pairs per K=5 round |
+| 2026-09-04 | 30-thread verifier attention team | no | 128 yes | 13.69 | 330.85 | 15.36 | 220--251 | reject and remove; changing team size stalls Fujitsu OpenMP reuse and poisons later phases |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
