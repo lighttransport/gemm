@@ -2847,6 +2847,8 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | compact BF16 PV 2-row x 6-token verifier | yes | 128 yes | 53.09 | 85.97 | 18.79 | 876--892 | retain as K=6 improvement; 4x6 spilled (47.30), 1x6 lacked MLP (36.80), and K=5 remains faster at 56.80 |
 | 2026-09-04 | compact BF16 PV 2-row x 8-token verifier | yes | 128 yes | 44.34 / 48.31 | 118.67 / 106.70 | 25.58 / 25.72 | 831--844 / 798--847 | reject and remove; second result raises exact one-round cutoff 32768 to 65536, but kernel/runtime phases still lose to K=5 |
 | 2026-09-04 | prefetch upcoming FFN during non-MTP collective | yes | short bench only | 32.30 / 32.37 (8 / 2 lines) vs 32.70 | n/a | n/a | 546--552 | reject and remove; cache warming is neutral-to-negative |
+| 2026-09-04 | static verifier attention task schedule / SVE attention gate | yes | 128 yes | 56.36 / 56.27 | 68.90 / 68.83 | 15.15 / 15.36 | 941--964 | reject static schedule; leave SVE gate opt-in, both are wall-neutral |
+| 2026-09-04 | futex park / pre-park OpenMP barrier | yes | 128 yes | 55.88 / 56.00 | 68.72 / 68.52 | 16.06 / 16.06 | 931--969 | reject and remove; neither beats pthread-cond parking without an added barrier |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
@@ -3227,3 +3229,13 @@ launcher enables the arena for `mtp-sustained`; setting the variable to zero
 restores the allocator-heavy exact control. At the observed 4.65 emitted
 tokens per round, the current 83.76 ms verify-plus-draft budget still needs
 roughly 6.3 ms removed to sustain 60 tok/s.
+
+A fresh `TF_NEXTN_PROFILE=1` run on the sharded persistent proposer attributes
+about 0.7--1.2 ms of each call to hidden/embedding fusion and 1.8--2.9 ms to the
+single persistent QKV-through-head worker region. Four calls therefore account
+for roughly 12.5 ms of the 15.5 ms draft round; parking and four sequential
+argmax handoffs account for the remaining roughly 3 ms. Replacing the pthread
+condition wait with a direct futex, or adding a 48-worker barrier before sleep,
+raised draft time to 16.06 ms. The current condition-variable parking path is
+retained. Meaningful proposer progress must reduce a weight stream or an argmax
+handoff, not substitute another worker-sleep primitive.
