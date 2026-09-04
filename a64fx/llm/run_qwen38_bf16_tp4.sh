@@ -83,6 +83,13 @@ fi
 export NUMA_DISTRIBUTE=${NUMA_DISTRIBUTE:-1} NUMA_N_CMGS=${NUMA_N_CMGS:-4}
 export TP_COMM_CMG_STRICT=${TP_COMM_CMG_STRICT:-1}
 export NUMA_CMG_BUDGET_GB=${NUMA_CMG_BUDGET_GB:-7} NUMA_ALIGNMENT=${NUMA_ALIGNMENT:-2097152}
+# The one-Put decode collective benefits from less frequent trailer-line
+# invalidation.  MTP retains its independently validated cadence of eight.
+if [ "$MODE" = mtp-sustained ]; then
+    export TP_AR_POLL_SPINS=${TP_AR_POLL_SPINS:-8}
+else
+    export TP_AR_POLL_SPINS=${TP_AR_POLL_SPINS:-16}
+fi
 # TP_STAGE_DIR is a complete rank-local image.  The runner parses only GGUF
 # metadata and explicitly reads the stage into anonymous HBM-resident memory.
 unset GGUF_LAZY_MMAP TF_FORCE_MMAP

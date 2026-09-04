@@ -2854,6 +2854,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | inline BF16-PV NextN head winner | yes | 128/256 yes | 56.97 vs 56.75; 55.98 long | 68.79 vs 68.83; 68.72 long | 14.36 vs 14.64; 14.36 long | 944--961 (256) | promote; avoids full logits store/reread |
 | 2026-09-04 | snapshot-aware four-lane SSM verifier scan | yes | 128 yes | 56.68 | 68.97 | 14.59 | 952--982 | reject and remove; scan remained 122.4 ms/27 calls, so recurrent snapshot traffic is bandwidth-bound |
 | 2026-09-04 | balanced non-MTP profile / K5120 prefetch 8 | yes | 96 same hash | 32.47 / 32.36 | n/a | n/a | 549--557 / 546--555 | retain global distance 6; K5120=8 regressed limiting-rank time from 30.79 to 30.93 ms |
+| 2026-09-04 | non-MTP uTofu poll cadence 4/8/16/32 | yes | 96 yes; 320@8/16 yes | 32.30 / 32.47 / 32.58 / 32.34 short; 32.21 / 32.31 long at 8/16 | n/a | n/a | 542--550 (long) | promote 16 for ordinary decode; MTP retains independently proven 8 |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
