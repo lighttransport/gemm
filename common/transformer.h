@@ -12638,6 +12638,20 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
                 const float *x3=X+3*(size_t)X_stride;
                 const float *x4=X+4*(size_t)X_stride;
                 const float *x5=X+5*(size_t)X_stride;
+                static int mtp6_3row = -1;
+                if (mtp6_3row < 0) {
+                    const char *e = getenv("TF_BF16PV_MTP6_3ROW");
+                    mtp6_3row = e && atoi(e) != 0;
+                }
+                if (mtp6_3row) {
+                    matvec_bf16_3x6_pv(y0,y1,y2,y3,y4,y5,
+                        p-1,p,p+2*K-1,x0,x1,x2,x3,x4,x5,K);
+                    matvec_bf16_3x6_pv(y0+3,y1+3,y2+3,y3+3,y4+3,y5+3,
+                        p+2*K,p+4*K-1,p+4*K,x0,x1,x2,x3,x4,x5,K);
+                    matvec_bf16_2x6_pv(y0+6,y1+6,y2+6,y3+6,y4+6,y5+6,
+                        p+6*K,x0,x1,x2,x3,x4,x5,K);
+                    continue;
+                }
                 matvec_bf16_2x6_pv(y0,y1,y2,y3,y4,y5,p,
                                     x0,x1,x2,x3,x4,x5,K);
                 matvec_bf16_2x6_pv(y0+2,y1+2,y2+2,y3+2,y4+2,y5+2,p+2*K,

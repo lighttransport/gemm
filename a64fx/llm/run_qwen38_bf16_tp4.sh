@@ -82,6 +82,10 @@ if [ "$MODE" = mtp-sustained ]; then
     # K=6 remains a fallback, but its compact 2x6 kernel benefits from a
     # shorter distance than the historical 16 when explicitly selected.
     export TF_BF16PV_PREFETCH_MTP6=${TF_BF16PV_PREFETCH_MTP6:-8}
+    # Fit three rows by six verifier tokens in the A64FX SVE register file.
+    # Two 3x6 calls plus a 2x6 tail retain the exact PV row reductions while
+    # reducing K=6 verifier time relative to four separate 2x6 calls.
+    export TF_BF16PV_MTP6_3ROW=${TF_BF16PV_MTP6_3ROW:-1}
     # Each persistent head worker scans only the rows it just produced, then
     # the caller folds the 48 cached winners before the unchanged TP argmax.
     # This preserves CMG ownership and avoids a second serial vocabulary scan.
