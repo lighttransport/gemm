@@ -2254,6 +2254,53 @@ static inline void matvec_bf16_4x5_pv(float *d0, float *d1, float *d2,
     d4[0]=svaddv(pg,a04);d4[1]=svaddv(pg,a14);d4[2]=svaddv(pg,a24);d4[3]=svaddv(pg,a34);
 }
 
+/* Two rows by six verifier tokens.  Twelve accumulators plus six activation
+ * vectors leave register headroom while still reading every weight once. */
+static inline void matvec_bf16_2x6_pv(float *d0, float *d1, float *d2,
+                                      float *d3, float *d4, float *d5,
+                                      const uint16_t *pAB,
+                                      const float *x0, const float *x1,
+                                      const float *x2, const float *x3,
+                                      const float *x4, const float *x5, int n) {
+    svbool_t pg=svptrue_b32(),ph=svptrue_b16();
+    svuint16_t ix=svindex_u16(0,1);
+    svbool_t po=svcmpne_n_u16(ph,svand_n_u16_x(ph,ix,1),0);
+    svfloat32_t a00=svdup_f32(0),a10=svdup_f32(0);
+    svfloat32_t a01=svdup_f32(0),a11=svdup_f32(0);
+    svfloat32_t a02=svdup_f32(0),a12=svdup_f32(0);
+    svfloat32_t a03=svdup_f32(0),a13=svdup_f32(0);
+    svfloat32_t a04=svdup_f32(0),a14=svdup_f32(0);
+    svfloat32_t a05=svdup_f32(0),a15=svdup_f32(0);
+    static _Thread_local int pf_done=0,pf_dist=16;
+    if(__builtin_expect(!pf_done,0)){
+        const char*e=getenv("TF_BF16PV_PREFETCH_MTP6");
+        if(e&&*e)pf_dist=atoi(e);
+        pf_done=1;
+    }
+    int vl=(int)svcntw(),pfd=pf_dist*2*vl;
+    for(int i=0;i<n;i+=vl){
+        const uint16_t*ab=pAB+2*i;
+        if(pf_dist)__builtin_prefetch(ab+pfd,0,2);
+        svfloat32_t v0=svld1(pg,x0+i),v1=svld1(pg,x1+i),v2=svld1(pg,x2+i);
+        svfloat32_t v3=svld1(pg,x3+i),v4=svld1(pg,x4+i),v5=svld1(pg,x5+i),w;
+        #define TF_BF16PV_MTP6_ROW(A, W) do { \
+            (A##0)=svmla_x(pg,(A##0),(W),v0); (A##1)=svmla_x(pg,(A##1),(W),v1); \
+            (A##2)=svmla_x(pg,(A##2),(W),v2); (A##3)=svmla_x(pg,(A##3),(W),v3); \
+            (A##4)=svmla_x(pg,(A##4),(W),v4); (A##5)=svmla_x(pg,(A##5),(W),v5); \
+        } while (0)
+        w=svreinterpret_f32(svld1_u16(po,ab-1));TF_BF16PV_MTP6_ROW(a0,w);
+        w=svreinterpret_f32(svld1_u16(po,ab));  TF_BF16PV_MTP6_ROW(a1,w);
+        #undef TF_BF16PV_MTP6_ROW
+    }
+    #define TF_BF16PV_MTP6_STORE(D, J) do { \
+        (D)[0]=svaddv(pg,a0##J); (D)[1]=svaddv(pg,a1##J); \
+    } while (0)
+    TF_BF16PV_MTP6_STORE(d0,0); TF_BF16PV_MTP6_STORE(d1,1);
+    TF_BF16PV_MTP6_STORE(d2,2); TF_BF16PV_MTP6_STORE(d3,3);
+    TF_BF16PV_MTP6_STORE(d4,4); TF_BF16PV_MTP6_STORE(d5,5);
+    #undef TF_BF16PV_MTP6_STORE
+}
+
 /* Register-blocked 8-row x 3-token accumulating pv GEMM microkernel.
  *
  * matvec_bf16_8row_pv_acc replayed per token loads the 8 weight-row vectors from

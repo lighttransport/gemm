@@ -12557,6 +12557,27 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
                 matvec_bf16_8x2_pv(y3,y4,p,p+2*K,p+4*K,p+6*K,x3,x4,K);
                 continue;
             }
+            if (N == 6) {
+                float *y0=Y_out+g*8,*y1=Y_out+out_stride+g*8;
+                float *y2=Y_out+2*(size_t)out_stride+g*8;
+                float *y3=Y_out+3*(size_t)out_stride+g*8;
+                float *y4=Y_out+4*(size_t)out_stride+g*8;
+                float *y5=Y_out+5*(size_t)out_stride+g*8;
+                const float *x0=X,*x1=X+X_stride;
+                const float *x2=X+2*(size_t)X_stride;
+                const float *x3=X+3*(size_t)X_stride;
+                const float *x4=X+4*(size_t)X_stride;
+                const float *x5=X+5*(size_t)X_stride;
+                matvec_bf16_2x6_pv(y0,y1,y2,y3,y4,y5,p,
+                                    x0,x1,x2,x3,x4,x5,K);
+                matvec_bf16_2x6_pv(y0+2,y1+2,y2+2,y3+2,y4+2,y5+2,p+2*K,
+                                    x0,x1,x2,x3,x4,x5,K);
+                matvec_bf16_2x6_pv(y0+4,y1+4,y2+4,y3+4,y4+4,y5+4,p+4*K,
+                                    x0,x1,x2,x3,x4,x5,K);
+                matvec_bf16_2x6_pv(y0+6,y1+6,y2+6,y3+6,y4+6,y5+6,p+6*K,
+                                    x0,x1,x2,x3,x4,x5,K);
+                continue;
+            }
             for (; t + 2 < N; t += 3) {
                 float *y0=Y_out+(size_t)t*out_stride+g*8;
                 float *y1=Y_out+(size_t)(t+1)*out_stride+g*8;
