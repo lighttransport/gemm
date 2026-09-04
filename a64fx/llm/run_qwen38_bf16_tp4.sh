@@ -60,6 +60,10 @@ if [ "$MODE" = mtp-sustained ]; then
     # 768 contended malloc/free pairs per speculative round while preserving
     # first-touch CMG ownership of every worker-private slice.
     export TF_BATCH_ATTN_SCORE_ARENA=${TF_BATCH_ATTN_SCORE_ARENA:-1}
+    # Reuse one 256-byte-partitioned verifier scratch arena across rounds.
+    # Stable addresses preserve first-touch ownership and avoid eleven aligned
+    # allocation/free pairs per K=5 verification call.
+    export TF_BATCH_SCRATCH_REUSE=${TF_BATCH_SCRATCH_REUSE:-1}
     # Keep the shadow workers active from attention output through gate/up,
     # SiLU, and down.  This removes two pool wakes and the nested OpenMP
     # activation region per draft step while preserving the exact BF16 rows.

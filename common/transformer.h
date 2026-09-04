@@ -14521,25 +14521,52 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
         return NULL;
 
     size_t nf = (size_t)N;
-    float *cur = (float *)tf_aligned_alloc_notouch(256, nf * ne * sizeof(float));
-    float *norm = (float *)tf_aligned_alloc_notouch(256, nf * ne * sizeof(float));
-    float *proj = (float *)tf_aligned_alloc_notouch(256, nf * (size_t)max_proj * sizeof(float));
-    float *kv = (float *)tf_aligned_alloc_notouch(256, nf * (size_t)kvdim * sizeof(float));
-    float *vv = (float *)tf_aligned_alloc_notouch(256, nf * (size_t)kvdim * sizeof(float));
-    float *attout = (float *)tf_aligned_alloc_notouch(256, nf * (size_t)qdim * sizeof(float));
-    float *inner = (float *)tf_aligned_alloc_notouch(256, nf * (size_t)max_inner * sizeof(float));
-    float *gate = (float *)tf_aligned_alloc_notouch(256, nf * (size_t)max_inner * sizeof(float));
-    float *up = (float *)tf_aligned_alloc_notouch(256, nf * (size_t)max_inner * sizeof(float));
-    float *out = (float *)tf_aligned_alloc_notouch(256, nf * ne * sizeof(float));
     static int reuse_attn_scores = -1;
     if (reuse_attn_scores < 0) {
         const char *e = getenv("TF_BATCH_ATTN_SCORE_ARENA");
         reuse_attn_scores = e && atoi(e) != 0;
     }
     size_t attn_score_stride = (size_t)m->n_heads * m->max_seq_len;
-    float *attn_scores = reuse_attn_scores
-        ? (float *)tf_aligned_alloc_notouch(256,
-            (size_t)batch_nt * attn_score_stride * sizeof(float)) : NULL;
+    static int reuse_scratch = -1;
+    static unsigned char *scratch_arena;
+    static size_t scratch_arena_cap;
+    if (reuse_scratch < 0) {
+        const char *e = getenv("TF_BATCH_SCRATCH_REUSE");
+        reuse_scratch = e && atoi(e) != 0;
+    }
+    size_t sizes[11] = {
+        nf*(size_t)ne*4, nf*(size_t)ne*4,
+        nf*(size_t)max_proj*4, nf*(size_t)kvdim*4,
+        nf*(size_t)kvdim*4, nf*(size_t)qdim*4,
+        nf*(size_t)max_inner*4, nf*(size_t)max_inner*4,
+        nf*(size_t)max_inner*4, nf*(size_t)ne*4,
+        reuse_attn_scores ? (size_t)batch_nt*attn_score_stride*4 : 0
+    };
+    float *bufs[11] = {0};
+    if (reuse_scratch) {
+        size_t total = 0;
+        for (int i = 0; i < 11; i++) total += (sizes[i] + 255) & ~(size_t)255;
+        if (total > scratch_arena_cap) {
+            unsigned char *grown = (unsigned char *)
+                tf_aligned_alloc_notouch(256, total);
+            if (!grown) goto fail_early;
+            free(scratch_arena);
+            scratch_arena = grown;
+            scratch_arena_cap = total;
+        }
+        size_t off = 0;
+        for (int i = 0; i < 11; i++) {
+            if (sizes[i]) bufs[i] = (float *)(scratch_arena + off);
+            off += (sizes[i] + 255) & ~(size_t)255;
+        }
+    } else {
+        for (int i = 0; i < 11; i++) if (sizes[i])
+            bufs[i] = (float *)tf_aligned_alloc_notouch(256, sizes[i]);
+    }
+    float *cur=bufs[0], *norm=bufs[1], *proj=bufs[2];
+    float *kv=bufs[3], *vv=bufs[4], *attout=bufs[5];
+    float *inner=bufs[6], *gate=bufs[7], *up=bufs[8], *out=bufs[9];
+    float *attn_scores=bufs[10];
     if (!cur || !norm || !proj || !kv || !vv || !attout || !inner || !gate || !up || !out)
         goto fail;
     if (reuse_attn_scores && !attn_scores) goto fail;
@@ -14998,13 +15025,19 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
     static int keep_pool_off=-1;
     if(keep_pool_off<0){const char*e=getenv("TF_PREFILL_KEEP_POOL_OFF");keep_pool_off=e&&atoi(e)!=0;}
     if (pool_was_alive && !pool_retained && !keep_pool_off) tf_pool_start(m);
-    free(cur); free(norm); free(proj); free(kv); free(vv); free(attout);
-    free(inner); free(gate); free(up); free(out); free(attn_scores);
+    if (!reuse_scratch) {
+        free(cur); free(norm); free(proj); free(kv); free(vv); free(attout);
+        free(inner); free(gate); free(up); free(out); free(attn_scores);
+    }
     return result;
 
 fail:
-    free(cur); free(norm); free(proj); free(kv); free(vv); free(attout);
-    free(inner); free(gate); free(up); free(out); free(attn_scores);
+    if (!reuse_scratch) {
+        free(cur); free(norm); free(proj); free(kv); free(vv); free(attout);
+        free(inner); free(gate); free(up); free(out); free(attn_scores);
+    }
+    return NULL;
+fail_early:
     return NULL;
 }
 
