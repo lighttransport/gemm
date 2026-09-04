@@ -75,6 +75,9 @@ if [ "$MODE" = mtp-sustained ]; then
     # twenty accumulators. Distance 12 keeps its two weight streams ahead on
     # A64FX without the cache pressure measured at the old distance 16.
     export TF_BF16PV_PREFETCH_MTP5=${TF_BF16PV_PREFETCH_MTP5:-12}
+    # K=6 remains a fallback, but its compact 2x6 kernel benefits from a
+    # shorter distance than the historical 16 when explicitly selected.
+    export TF_BF16PV_PREFETCH_MTP6=${TF_BF16PV_PREFETCH_MTP6:-8}
     # Each persistent head worker scans only the rows it just produced, then
     # the caller folds the 48 cached winners before the unchanged TP argmax.
     # This preserves CMG ownership and avoids a second serial vocabulary scan.

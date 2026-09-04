@@ -2860,6 +2860,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | MTP one-Put remote-notice transport | yes | 128/256 yes | 57.08 vs 56.85 short; 56.25 long | 68.59 vs 68.79; 68.31 long | 14.40 vs 14.53; 14.37 long | 942--966 (256) | promote; verifier collective 10.66 vs 10.91 ms/round in adjacent A/B |
 | 2026-09-04 | compact 4x5 verifier prefetch 10/12/16 | yes | 128 all; 256@12 yes | 57.73 / 57.81 / 57.10 short; 56.86 long | 67.59 / 67.69 / 68.67; 67.47 long | 14.47 / 14.24 / 14.29; 14.32 long | 956--972 (256) | promote 12; long gain +0.61 tok/s over prior distance-16 best |
 | 2026-09-04 | shape-specific MTP5 prefetch 4352/5120/6144=10/12/10 | yes | 128 yes | 56.82 | 69.01 | 14.36 | 964--992 | reject and remove; down saved ~0.19 ms/round but combined verifier did not improve over global 12 |
+| 2026-09-04 | current K=6 compact-kernel prefetch 12/10/8 | yes | 128 all yes | 54.30 / 54.74 / 54.91 | 84.49 / 84.02 / 83.78 | 17.93 / 17.57 / 17.50 | 913--931 (8) | retain 8 as K=6 fallback; K=5 remains faster at 57.81 short / 56.86 long |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
