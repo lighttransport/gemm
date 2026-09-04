@@ -25,7 +25,13 @@ def content_text(content):
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") in ("text", None))
+        # Responses API messages use input_text/output_text, while Chat
+        # Completions uses text.  Dropping input_text silently turns a real
+        # user request into an empty message and makes the model answer the
+        # surrounding Codex system prompt instead.
+        return "".join(x.get("text", "") for x in content
+                       if isinstance(x, dict) and
+                       x.get("type") in ("text", "input_text", "output_text", None))
     return ""
 
 
@@ -36,17 +42,10 @@ def chat_prompt(messages):
     for m in messages:
         role = m.get("role", "user")
         text = content_text(m.get("content", ""))
-        # The generation prefix below has already supplied a closed, empty
-        # thinking block for each assistant answer.  Preserve that exact
-        # token sequence when the client sends the answer back as conversation
-        # history; otherwise the second turn diverges at the assistant header
-        # and no KV prefix can be reused.
-        if role == "assistant" and not text.startswith("<think>"):
-            text = "<think>\n\n</think>\n\n" + text
         out.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
-    # Codex needs useful answer tokens promptly.  Use the template's explicit
-    # non-thinking generation form; the coding sampling defaults below are
-    # important for this checkpoint in that mode.
+    # This checkpoint's non-thinking form closes the optional reasoning block
+    # before answer tokens.  Leaving it open exposes the model's work plan as
+    # assistant output even for a simple user message.
     out.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
     return "".join(out)
 
@@ -143,7 +142,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
-        if path in ("/v1/models", "/models"):
+        if path in ("/health", "/v1/health"):
+            self.send_json(200, {"status": "ok"})
+        elif path in ("/v1/models", "/models"):
             now = int(time.time())
             self.send_json(200, {"object": "list", "data": [{"id": self.model, "object": "model", "created": now, "owned_by": "local"}]})
         else:
@@ -244,7 +245,8 @@ class Handler(BaseHTTPRequestHandler):
                     item_id = response_id + "-item"
                     part = {"type": "output_text", "text": text, "annotations": []}
                     item = {"type": "message", "id": item_id, "role": "assistant", "status": "completed", "content": [part]}
-                    response_base = {"id": response_id, "object": "response", "status": "in_progress", "model": self.model, "output": []}
+                    response_base = {"id": response_id, "object": "response", "created_at": created,
+                                     "status": "in_progress", "model": self.model, "output": []}
                     created_obj = {"type": "response.created", "response": response_base}
                     in_progress_obj = {"type": "response.in_progress", "response": response_base}
                     added_obj = {"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": item_id, "role": "assistant", "status": "in_progress", "content": []}}
@@ -272,7 +274,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if api_path == "/v1/responses":
                 response_id = "resp-" + uuid.uuid4().hex
-                self.send_json(200, {"id": response_id, "object": "response", "model": self.model, "output": [{"type": "message", "id": response_id + "-item", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}], "status": "completed", "usage": {"input_tokens": ptok, "output_tokens": ctok, "total_tokens": ptok + ctok, "input_tokens_details": {"cached_tokens": cached}}})
+                item = {"type": "message", "id": response_id + "-item", "role": "assistant",
+                        "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}
+                self.send_json(200, {"id": response_id, "object": "response", "created_at": created,
+                                     "model": self.model, "output": [item], "output_text": text,
+                                     "status": "completed", "usage": {"input_tokens": ptok,
+                                     "output_tokens": ctok, "total_tokens": ptok + ctok,
+                                     "input_tokens_details": {"cached_tokens": cached}}})
             elif self.path == "/v1/completions":
                 self.send_json(200, {"id": ident, "object": "text_completion", "created": created, "model": self.model, "choices": [{"index": 0, "text": text, "finish_reason": finish}], "usage": usage})
             else:

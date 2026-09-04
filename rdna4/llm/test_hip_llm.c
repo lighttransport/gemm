@@ -66,6 +66,7 @@ static float rel_l2_error(const float *a, const float *b, int n) {
 static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
                           float temperature, float presence_penalty,
                           const unsigned char *seen, const unsigned short *counts,
+                          const int32_t *history, int history_n, int history_start,
                           unsigned *rng) {
     if (top_k < 1) top_k = 1;
     if (top_k > 64) top_k = 64;
@@ -73,6 +74,20 @@ static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
     float vals[64];
     for (int j = 0; j < top_k; ++j) { ids[j] = -1; vals[j] = -INFINITY; }
     for (int i = 0; i < n; ++i) {
+        /* Prevent a repeated 4-gram within generated output.  Do not include
+         * prompt tokens: system text must not constrain normal completions. */
+        if (history && history_n - history_start >= 3) {
+            int h = history_n - 3;
+            int repeated = 0;
+            for (int j = history_start; j < h; ++j) {
+                if (history[j] == history[h] && history[j + 1] == history[h + 1] &&
+                    history[j + 2] == history[h + 2] && history[j + 3] == i) {
+                    repeated = 1;
+                    break;
+                }
+            }
+            if (repeated) continue;
+        }
         /* Presence applies to prompt/history tokens; frequency is completion
          * only and prevents a winning phrase from becoming an infinite loop. */
         float freq = (counts && counts[i]) ? 0.35f * (float)counts[i] : 0.0f;
@@ -286,7 +301,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         for (int k = 0; logits && k < max_tokens; k++) {
             if (g_stdio_cancel) { cancelled = 1; break; }
             int next = (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
-                sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence, seen, counts, &rng);
+                sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence,
+                               seen, counts, cache, cache_n, n_tokens, &rng);
             int is_stop = next == eos || next == eot || next == im_end;
             const char *piece = bpe_token_to_str(vocab, next);
             if (!is_stop && piece && text) {
@@ -878,7 +894,8 @@ int main(int argc, char **argv) {
         if (seen) for (int i = 0; i < n_prefill; ++i)
             if (tokens[i] >= 0 && tokens[i] < n_vocab) seen[tokens[i]] = 1;
         int next_tok = coding_mode ? sample_top_k_p(last_logits, n_vocab, 20, 0.80f,
-                                                    0.70f, 1.50f, seen, counts, &sample_rng)
+                                                    0.70f, 1.50f, seen, counts,
+                                                    NULL, 0, 0, &sample_rng)
                                    : argmax_logits(last_logits, n_vocab);
         double t_pf1 = get_time_ms();
         double prefill_ms = t_pf1 - t_pf0;
@@ -904,7 +921,8 @@ int main(int argc, char **argv) {
                 if (seen && next_tok >= 0 && next_tok < n_vocab) seen[next_tok] = 1;
                 if (counts && next_tok >= 0 && next_tok < n_vocab && counts[next_tok] != 0xffffu) counts[next_tok]++;
                 next_tok = coding_mode ? sample_top_k_p(lg, n_vocab, 20, 0.80f,
-                                                        0.70f, 1.50f, seen, counts, &sample_rng)
+                                                        0.70f, 1.50f, seen, counts,
+                                                        NULL, 0, 0, &sample_rng)
                                        : argmax_logits(lg, n_vocab);
                 decoded++;
                 if (gen_text) { const char *s = bpe_token_to_str(vocab, next_tok); if (s) fprintf(stderr, "%s", s); }
