@@ -115,14 +115,10 @@ if [ "$TP_SIZE" = 4 ]; then
     ar_a2a_max_defaulted=0
     if [ -z "${TP_AR_A2A_MAX+x}" ]; then ar_a2a_max_defaulted=1; fi
     export TP_AR_A2A=${TP_AR_A2A:-1} TP_AR_A2A_MAX=${TP_AR_A2A_MAX:-8192}
-    # For single-token decode, use the remote-completion notice as publication
-    # evidence and send one payload Put per peer. K=5 MTP remains on its proven
-    # two-Put trailer protocol: the adjacent 128-token A/B was neutral.
-    if [ "$MODE" = mtp-sustained ]; then
-        export TP_AR_A2A_MRQ_ONEPUT=${TP_AR_A2A_MRQ_ONEPUT:-0}
-    else
-        export TP_AR_A2A_MRQ_ONEPUT=${TP_AR_A2A_MRQ_ONEPUT:-1}
-    fi
+    # Use the remote-completion notice as publication evidence and send one
+    # payload Put per peer. This is exact for both decode and the K=5 verifier;
+    # it avoids each peer's separate eight-byte trailer Put.
+    export TP_AR_A2A_MRQ_ONEPUT=${TP_AR_A2A_MRQ_ONEPUT:-1}
 fi
 # Exact-token validated on both trunk and K=5 MTP.  Avoid scalar expf in the
 # verifier and replicated NextN FFN activation passes.

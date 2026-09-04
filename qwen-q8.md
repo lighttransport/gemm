@@ -2856,6 +2856,8 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | balanced non-MTP profile / K5120 prefetch 8 | yes | 96 same hash | 32.47 / 32.36 | n/a | n/a | 549--557 / 546--555 | retain global distance 6; K5120=8 regressed limiting-rank time from 30.79 to 30.93 ms |
 | 2026-09-04 | non-MTP uTofu poll cadence 4/8/16/32 | yes | 96 yes; 320@8/16 yes | 32.30 / 32.47 / 32.58 / 32.34 short; 32.21 / 32.31 long at 8/16 | n/a | n/a | 542--550 (long) | promote 16 for ordinary decode; MTP retains independently proven 8 |
 | 2026-09-04 | fused TP reduce-plus-residual long A/B | yes | 320 both yes | 32.31 vs 31.55 enabled/disabled | n/a | n/a | 544--550 / 525--544 | retain default; exact sustained +2.4% at poll cadence 16 |
+| 2026-09-04 | lean robustness under one-Put/cadence-16 decode | yes | 96 yes | 31.86 | n/a | n/a | 543--555 | reject; current robust=1 path remains faster |
+| 2026-09-04 | MTP one-Put remote-notice transport | yes | 128/256 yes | 57.08 vs 56.85 short; 56.25 long | 68.59 vs 68.79; 68.31 long | 14.40 vs 14.53; 14.37 long | 942--966 (256) | promote; verifier collective 10.66 vs 10.91 ms/round in adjacent A/B |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
