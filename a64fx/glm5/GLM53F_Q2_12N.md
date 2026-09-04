@@ -55,3 +55,22 @@ The fast 47-thread profile measured 6.61 ms/token MHC, 25.52 attention, 15.16
 FFN, and 1.47 head.  Further repeatable gains should target attention rather
 than the mixed-IQ routed kernel; the isolated Q2 routed layer measured
 0.254--0.269 ms/token including its collective.
+
+## 30 tok/s investigation
+
+The following full 128-step experiments were rejected on the same job:
+
+| Variant | tok/s | Finding |
+| --- | ---: | --- |
+| KDA output projection, 8 rows/dot | 20.089 | Attention regressed to 26.23 ms/token. |
+| KDA output projection, 4 rows/dot | 20.353 | Attention regressed to 26.09 ms/token. |
+| `-mcpu=a64fx` | 20.886 | Accepted and exact trajectory, but within allocation variance. |
+
+Speculative MTP using the staged safetensors layer 45 against the Q2 target
+accepted 31/32 drafts (96.875%), but did not raise throughput: M=2 target
+verification took 103.78 ms/cycle, or 51.91 ms per position, yielding only
+17.623 delivered tok/s.  The current Q2 batch MoE falls back to one
+single-token IQ evaluation per position because independently routed experts
+rarely overlap.  Reaching 30 tok/s requires a structural attention reduction
+(for example channel-level KDA partitioning) or a genuine multi-token IQ MoE
+verifier; compiler flags and output-row batching have been exhausted.
