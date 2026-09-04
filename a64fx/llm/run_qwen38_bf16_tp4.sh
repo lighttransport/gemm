@@ -71,6 +71,10 @@ if [ "$MODE" = mtp-sustained ]; then
     # RoPE by head, avoiding the formerly serial preparation between pools.
     export TF_NEXTN_QKV_PERSIST=${TF_NEXTN_QKV_PERSIST:-1}
     export TF_BF16PV_PREFETCH_NEXTN=${TF_BF16PV_PREFETCH_NEXTN:-8}
+    # The compact 4x5 verifier has five activation vectors competing with its
+    # twenty accumulators. Distance 12 keeps its two weight streams ahead on
+    # A64FX without the cache pressure measured at the old distance 16.
+    export TF_BF16PV_PREFETCH_MTP5=${TF_BF16PV_PREFETCH_MTP5:-12}
     # Each persistent head worker scans only the rows it just produced, then
     # the caller folds the 48 cached winners before the unchanged TP argmax.
     # This preserves CMG ownership and avoids a second serial vocabulary scan.
