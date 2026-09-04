@@ -33,7 +33,10 @@ def chat_prompt(messages):
         role = m.get("role", "user")
         text = content_text(m.get("content", ""))
         out.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
-    out.append("<|im_start|>assistant\n")
+    # Qwen3.8's template uses an explicit empty reasoning block when
+    # enable_thinking=false. Without this marker the model continues in an
+    # invalid assistant state and commonly degenerates into repeated tokens.
+    out.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
     return "".join(out)
 
 
