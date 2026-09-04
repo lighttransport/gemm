@@ -14440,8 +14440,18 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
     float *gate = (float *)tf_aligned_alloc_notouch(256, nf * (size_t)max_inner * sizeof(float));
     float *up = (float *)tf_aligned_alloc_notouch(256, nf * (size_t)max_inner * sizeof(float));
     float *out = (float *)tf_aligned_alloc_notouch(256, nf * ne * sizeof(float));
+    static int reuse_attn_scores = -1;
+    if (reuse_attn_scores < 0) {
+        const char *e = getenv("TF_BATCH_ATTN_SCORE_ARENA");
+        reuse_attn_scores = e && atoi(e) != 0;
+    }
+    size_t attn_score_stride = (size_t)m->n_heads * m->max_seq_len;
+    float *attn_scores = reuse_attn_scores
+        ? (float *)tf_aligned_alloc_notouch(256,
+            (size_t)batch_nt * attn_score_stride * sizeof(float)) : NULL;
     if (!cur || !norm || !proj || !kv || !vv || !attout || !inner || !gate || !up || !out)
         goto fail;
+    if (reuse_attn_scores && !attn_scores) goto fail;
 
     if (flags & TF_PREFILL_EMBED) {
         for (int t = 0; t < N; t++) {
@@ -14688,7 +14698,13 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                 /* tf_attn_worker indexes scores by the global/local head ID,
                  * even when a task owns one head, so retain a full head stride
                  * in each worker-private buffer. */
-                float *scores = (float *)malloc((size_t)m->n_heads * m->max_seq_len * sizeof(float));
+                int score_tid = 0;
+                #ifdef _OPENMP
+                score_tid = omp_get_thread_num();
+                #endif
+                float *scores = attn_scores
+                    ? attn_scores + (size_t)score_tid * attn_score_stride
+                    : (float *)malloc(attn_score_stride * sizeof(float));
                 #ifdef _OPENMP
                 #pragma omp for collapse(2) schedule(dynamic)
                 #endif
@@ -14722,7 +14738,7 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                     for (int i = 0; i < m->head_dim; i++)
                         oh[i] *= 1.0f / (1.0f + expf(-gh[i]));
                 }
-                free(scores);
+                if (!attn_scores) free(scores);
             }
             } else {
                 #ifdef _OPENMP
@@ -14892,12 +14908,12 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
     if(keep_pool_off<0){const char*e=getenv("TF_PREFILL_KEEP_POOL_OFF");keep_pool_off=e&&atoi(e)!=0;}
     if (pool_was_alive && !pool_retained && !keep_pool_off) tf_pool_start(m);
     free(cur); free(norm); free(proj); free(kv); free(vv); free(attout);
-    free(inner); free(gate); free(up); free(out);
+    free(inner); free(gate); free(up); free(out); free(attn_scores);
     return result;
 
 fail:
     free(cur); free(norm); free(proj); free(kv); free(vv); free(attout);
-    free(inner); free(gate); free(up); free(out);
+    free(inner); free(gate); free(up); free(out); free(attn_scores);
     return NULL;
 }
 

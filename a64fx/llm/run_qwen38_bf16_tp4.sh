@@ -55,6 +55,11 @@ export TP_MTP_OMP_PARK=${TP_MTP_OMP_PARK:-1}
 # improved the adjacent exact K=5 run by 11%.
 if [ "$MODE" = mtp-sustained ]; then
     export TP_MTP_SHADOW_THREADS=${TP_MTP_SHADOW_THREADS:-48}
+    # Give every verifier worker one 256-byte-aligned attention-score slice
+    # and reuse it across all attention layers in the K=5 batch.  This avoids
+    # 768 contended malloc/free pairs per speculative round while preserving
+    # first-touch CMG ownership of every worker-private slice.
+    export TF_BATCH_ATTN_SCORE_ARENA=${TF_BATCH_ATTN_SCORE_ARENA:-1}
     # Keep the shadow workers active from attention output through gate/up,
     # SiLU, and down.  This removes two pool wakes and the nested OpenMP
     # activation region per draft step while preserving the exact BF16 rows.

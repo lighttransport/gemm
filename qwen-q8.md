@@ -2837,6 +2837,8 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | sequential 12-thread K=5 bonus control | no | 128 yes | 40.14 | 74.51 | 43.51 | 650--695 | preserves 26/27 full acceptance and 24/27 boundary hits; async quality loss is predicted-hidden seeding, not thread-count numerics |
 | 2026-09-04 | verifier `TF_SSM_PREEXP=1` | yes | no | 54.17 | 75.14 | 15.68 | 915--992 | reject; output hash changed to `a0f96c3b...` |
 | 2026-09-04 | one hot OpenMP team for complete K=5 FFN gate/up streams | yes | 128 yes | 52.40 | 74.86 | 15.55 | 893--951 | reject and remove; FFN projection saved only 0.20 ms/round and wall time regressed |
+| 2026-09-04 | defer K=5 SSM output norm/gate to 60-task pass | yes | 128 yes | 52.99 | 73.96 | 15.43 | 884--951 | reject and remove; scan rose 121.1 to 128.3 ms/27 calls, wall gain was collective variance |
+| 2026-09-04 | worker-private verifier attention-score arena | yes | 128/256 yes | 56.57 / 55.53 | 68.41 / 68.41 | 15.33 / 15.35 | 927--945 (256) | promote; 256-byte-aligned per-worker slices remove 768 contended allocator pairs per K=5 round |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
@@ -3198,3 +3200,22 @@ The clean sharded path also rechecked verifier-kernel prefetch distance 8
 against the established MTP5 distance 16. Distance 8 reproduced the 128-token
 oracle at 51.19 tok/s with 77.07/15.49 ms verify/draft, indistinguishable from
 51.20 tok/s at distance 16. The MTP5 default remains 16.
+
+The batched verifier now allocates one attention-score arena for the complete
+K=5 call instead of issuing a `malloc` and `free` from every one of 48 workers
+in each of 16 attention layers. `TF_BATCH_ATTN_SCORE_ARENA=1` divides the arena
+into 256-byte-aligned, worker-private slices; first touch therefore stays with
+the worker and its CMG, and no slice is shared across CMGs. The adjacent
+128-token control was exact at 52.58 tok/s, 74.39 ms verification, and 15.70 ms
+drafting. Enabling the arena retained canonical `6b136ca0...`, reduced total
+attention time over 27 verifier calls from 130.6 to 36.0 ms, and reached
+**56.57 tok/s** with 68.41/15.33 ms verify/draft.
+
+The required long gate also retained canonical
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`.
+It generated 256 tokens at **55.53 tok/s**, with 68.41 ms verification, 15.35 ms
+drafting, and 927--945 GB/s weight bandwidth across the four nodes. The
+launcher enables the arena for `mtp-sustained`; setting the variable to zero
+restores the allocator-heavy exact control. At the observed 4.65 emitted
+tokens per round, the current 83.76 ms verify-plus-draft budget still needs
+roughly 6.3 ms removed to sustain 60 tok/s.
