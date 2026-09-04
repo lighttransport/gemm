@@ -167,10 +167,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 if api_path == "/v1/responses":
                     response_id = "resp-" + uuid.uuid4().hex
-                    created_obj = {"type": "response.created", "response": {"id": response_id, "object": "response", "status": "in_progress", "model": self.model}}
-                    delta_obj = {"type": "response.output_text.delta", "item_id": response_id + "-item", "output_index": 0, "content_index": 0, "delta": text}
-                    done_obj = {"type": "response.completed", "response": {"id": response_id, "object": "response", "status": "completed", "model": self.model, "usage": usage}}
-                    for event, obj in (("response.created", created_obj), ("response.output_text.delta", delta_obj), ("response.completed", done_obj)):
+                    item_id = response_id + "-item"
+                    part = {"type": "output_text", "text": text, "annotations": []}
+                    item = {"type": "message", "id": item_id, "role": "assistant", "status": "completed", "content": [part]}
+                    response_base = {"id": response_id, "object": "response", "status": "in_progress", "model": self.model, "output": []}
+                    created_obj = {"type": "response.created", "response": response_base}
+                    in_progress_obj = {"type": "response.in_progress", "response": response_base}
+                    added_obj = {"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": item_id, "role": "assistant", "status": "in_progress", "content": []}}
+                    part_added_obj = {"type": "response.content_part.added", "item_id": item_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}
+                    delta_obj = {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": text}
+                    text_done_obj = {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": text}
+                    part_done_obj = {"type": "response.content_part.done", "item_id": item_id, "output_index": 0, "content_index": 0, "part": part}
+                    item_done_obj = {"type": "response.output_item.done", "output_index": 0, "item": item}
+                    response_done = {**response_base, "status": "completed", "output": [item], "usage": {"input_tokens": ptok, "output_tokens": ctok, "total_tokens": ptok + ctok, "input_tokens_details": {"cached_tokens": cached}}}
+                    done_obj = {"type": "response.completed", "response": response_done}
+                    events = (("response.created", created_obj), ("response.in_progress", in_progress_obj),
+                              ("response.output_item.added", added_obj), ("response.content_part.added", part_added_obj),
+                              ("response.output_text.delta", delta_obj), ("response.output_text.done", text_done_obj),
+                              ("response.content_part.done", part_done_obj), ("response.output_item.done", item_done_obj),
+                              ("response.completed", done_obj))
+                    for event, obj in events:
                         self.wfile.write(("event: " + event + "\ndata: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
                 else:
                     if text:
@@ -181,7 +197,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             if api_path == "/v1/responses":
-                self.send_json(200, {"id": "resp-" + uuid.uuid4().hex, "object": "response", "model": self.model, "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "status": "completed", "usage": usage})
+                response_id = "resp-" + uuid.uuid4().hex
+                self.send_json(200, {"id": response_id, "object": "response", "model": self.model, "output": [{"type": "message", "id": response_id + "-item", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}], "status": "completed", "usage": {"input_tokens": ptok, "output_tokens": ctok, "total_tokens": ptok + ctok, "input_tokens_details": {"cached_tokens": cached}}})
             elif self.path == "/v1/completions":
                 self.send_json(200, {"id": ident, "object": "text_completion", "created": created, "model": self.model, "choices": [{"index": 0, "text": text, "finish_reason": finish}], "usage": usage})
             else:
