@@ -2854,6 +2854,8 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | inline BF16-PV NextN head winner | yes | 128/256 yes | 56.97 vs 56.75; 55.98 long | 68.79 vs 68.83; 68.72 long | 14.36 vs 14.64; 14.36 long | 944--961 (256) | promote; avoids full logits store/reread |
 | 2026-09-04 | snapshot-aware four-lane SSM verifier scan | yes | 128 yes | 56.68 | 68.97 | 14.59 | 952--982 | reject and remove; scan remained 122.4 ms/27 calls, so recurrent snapshot traffic is bandwidth-bound |
 | 2026-09-04 | balanced non-MTP profile / K5120 prefetch 8 | yes | 96 same hash | 32.47 / 32.36 | n/a | n/a | 549--557 / 546--555 | retain global distance 6; K5120=8 regressed limiting-rank time from 30.79 to 30.93 ms |
+| 2026-09-04 | K4352 decode prefetch distance 8 | yes | short stream only | 31.48 vs 31.59 | n/a | n/a | 529--552 vs 535--557 | reject; retain global distance 6 |
+| 2026-09-04 | L1-locality exact BF16-PV prefetch | yes | short stream only | 26.36 vs 31.59 | n/a | n/a | 429--431 vs 535--557 | reject and remove; L1 pollution raises compute from 25.7--26.7 to 33.2--33.4 ms/token |
 | 2026-09-04 | non-MTP uTofu poll cadence 4/8/16/32 | yes | 96 yes; 320@8/16 yes | 32.30 / 32.47 / 32.58 / 32.34 short; 32.21 / 32.31 long at 8/16 | n/a | n/a | 542--550 (long) | promote 16 for ordinary decode; MTP retains independently proven 8 |
 | 2026-09-04 | fused TP reduce-plus-residual long A/B | yes | 320 both yes | 32.31 vs 31.55 enabled/disabled | n/a | n/a | 544--550 / 525--544 | retain default; exact sustained +2.4% at poll cadence 16 |
 | 2026-09-04 | lean robustness under one-Put/cadence-16 decode | yes | 96 yes | 31.86 | n/a | n/a | 543--555 | reject; current robust=1 path remains faster |
