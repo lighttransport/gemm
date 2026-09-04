@@ -2845,6 +2845,8 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | `TF_PODD_FFN_PIPE=1` on BF16-PV stage | yes | 128 yes | 56.44 | 68.63 | 15.29 | 936--958 | no-op; staged verifier matrices lack the p-odd pipeline precondition |
 | 2026-09-04 | explicit SVE TP4 exact-tree fold | yes | 128 yes | 56.18 vs 56.80 | 68.89 vs 68.15 | 15.43 vs 15.25 | 937--960 vs 951--964 | reject and remove; fold saved ~0.24 ms/round internally but did not improve wall time |
 | 2026-09-04 | compact BF16 PV 2-row x 6-token verifier | yes | 128 yes | 53.09 | 85.97 | 18.79 | 876--892 | retain as K=6 improvement; 4x6 spilled (47.30), 1x6 lacked MLP (36.80), and K=5 remains faster at 56.80 |
+| 2026-09-04 | compact BF16 PV 2-row x 8-token verifier | yes | 128 yes | 44.34 / 48.31 | 118.67 / 106.70 | 25.58 / 25.72 | 831--844 / 798--847 | reject and remove; second result raises exact one-round cutoff 32768 to 65536, but kernel/runtime phases still lose to K=5 |
+| 2026-09-04 | prefetch upcoming FFN during non-MTP collective | yes | short bench only | 32.30 / 32.37 (8 / 2 lines) vs 32.70 | n/a | n/a | 546--552 | reject and remove; cache warming is neutral-to-negative |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
