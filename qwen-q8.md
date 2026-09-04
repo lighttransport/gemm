@@ -2866,6 +2866,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | shape-specific MTP5 prefetch 4352/5120/6144=10/12/10 | yes | 128 yes | 56.82 | 69.01 | 14.36 | 964--992 | reject and remove; down saved ~0.19 ms/round but combined verifier did not improve over global 12 |
 | 2026-09-04 | current K=6 compact-kernel prefetch 12/10/8 | yes | 128 all yes | 54.30 / 54.74 / 54.91 | 84.49 / 84.02 / 83.78 | 17.93 / 17.57 / 17.50 | 913--931 (8) | retain 8 as K=6 fallback; K=5 remains faster at 57.81 short / 56.86 long |
 | 2026-09-04 | inline K=5 verifier-head local argmax | yes | 128 both yes | 57.91 vs 57.89 | 67.43 vs 67.41 | 14.37 vs 14.42 | 970--998 | reject and remove; skipping 1.24 MB logits traffic is neutral beside the 1.27 GB local head stream |
+| 2026-09-04 | fused paired BF16-PV projections (`TF_BF16PV_FUSED_PAIR=1`) | no | 128 yes | 48.28 vs 56.18 disabled | 74.50 vs 69.43 | 23.57 vs 14.90 | allocation-contended | reject; the paired stream preserves the 104/108 draft match but stalls the persistent NextN path badly |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
