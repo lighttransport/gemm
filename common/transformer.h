@@ -7584,6 +7584,44 @@ static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
     }
 }
 
+/* NextN greedy head specialization. Keep each eight-row BF16-PV result in a
+ * worker-private stack slot and update its winner immediately, avoiding the
+ * store and later reload of the complete local vocabulary slice. */
+static int tf_thread_bf16_pv_argmax(transformer_model *m, const qtensor *mat,
+                                    const float *x, int n_rows,
+                                    int tid, int nt) {
+#if defined(__ARM_FEATURE_SVE)
+    if (!m || !mat || mat->type != GGML_TYPE_BF16 || !mat->bf16_pv ||
+        (n_rows & 7) || !m->lm_head_best_idx || !m->lm_head_best_val)
+        return 0;
+    int groups = n_rows / 8;
+    int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+    size_t group_hw = (size_t)8 * mat->n_cols;
+    const uint16_t *base = (const uint16_t *)mat->data;
+    float best = -INFINITY;
+    int best_row = g0 * 8;
+    for (int g = g0; g < g1; g++) {
+        const uint16_t *p = base + (size_t)g * group_hw;
+        float out[8];
+        matvec_bf16_8row_pv(out, p, p + 2 * mat->n_cols,
+                            p + 4 * mat->n_cols, p + 6 * mat->n_cols,
+                            x, mat->n_cols);
+        for (int r = 0; r < 8; r++) {
+            if (out[r] > best) {
+                best = out[r];
+                best_row = g * 8 + r;
+            }
+        }
+    }
+    m->lm_head_best_idx[tid] = best_row;
+    m->lm_head_best_val[tid] = best;
+    return 1;
+#else
+    (void)m; (void)mat; (void)x; (void)n_rows; (void)tid; (void)nt;
+    return 0;
+#endif
+}
+
 /* Defined with the pool helpers below; used by the persistent TP pipeline. */
 static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *x,
                                     int row_start, int row_end);
@@ -9873,6 +9911,7 @@ typedef struct {
     const qtensor *head, *head_norm;
     int tid, nt, nff, ne;
     int head_rows, include_qkv, include_attention, include_output, include_head;
+    int inline_argmax;
     int nextn_sharded;
     int position, nh, hd, kvd, gqa, qd;
     int barrier_sense;
@@ -10022,9 +10061,12 @@ static void *tf_nextn_ffn_worker(void *arg) {
                        m->rms_norm_eps, m->matvec_tmp);
         }
         tf_spin_barrier(m, &t->barrier_sense, t->nt);
-        tf_thread_matvec(m->logits, t->head, m->xb, t->head_rows,
-                         t->tid, t->nt);
-        if (m->lm_head_best_idx && m->lm_head_best_val) {
+        int fused = t->inline_argmax && tf_thread_bf16_pv_argmax(
+            m, t->head, m->xb, t->head_rows, t->tid, t->nt);
+        if (!fused)
+            tf_thread_matvec(m->logits, t->head, m->xb, t->head_rows,
+                             t->tid, t->nt);
+        if (!fused && m->lm_head_best_idx && m->lm_head_best_val) {
             int groups = t->head_rows / 8;
             int r0 = (groups * t->tid / t->nt) * 8;
             int r1 = (groups * (t->tid + 1) / t->nt) * 8;
@@ -10056,7 +10098,7 @@ static int tf_nextn_ffn_persistent_pool(transformer_model *m,
                                         int nh, int hd, int kvd, int gqa,
                                         int qd) {
     static int ffn_enabled = -1, block_enabled = -1, full_enabled = -1;
-    static int attn_enabled = -1;
+    static int attn_enabled = -1, inline_argmax = -1;
     if (ffn_enabled < 0) {
         const char *e = getenv("TF_NEXTN_FFN_PERSIST");
         ffn_enabled = e && atoi(e) != 0;
@@ -10066,6 +10108,8 @@ static int tf_nextn_ffn_persistent_pool(transformer_model *m,
         full_enabled = e && atoi(e) != 0;
         e = getenv("TF_NEXTN_ATTN_BLOCK_PERSIST");
         attn_enabled = e && atoi(e) != 0;
+        e = getenv("TF_NEXTN_INLINE_ARGMAX");
+        inline_argmax = e && atoi(e) != 0;
     }
     int enabled = include_attention ? attn_enabled
         : (include_output ? block_enabled : ffn_enabled);
@@ -10087,7 +10131,8 @@ static int tf_nextn_ffn_persistent_pool(transformer_model *m,
                                          include_attention,
                                          include_output,
                                          include_output && full_enabled,
-                                         nextn_sharded, position, nh, hd, kvd,
+                                         inline_argmax, nextn_sharded,
+                                         position, nh, hd, kvd,
                                          gqa, qd, 0};
     tf_pool_dispatch(m, tf_nextn_ffn_worker, tasks, sizeof(*tasks));
     return include_attention ? 3 : (include_output && full_enabled ? 2 : 1);

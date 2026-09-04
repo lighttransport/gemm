@@ -75,6 +75,10 @@ if [ "$MODE" = mtp-sustained ]; then
     # the caller folds the 48 cached winners before the unchanged TP argmax.
     # This preserves CMG ownership and avoids a second serial vocabulary scan.
     export TF_NEXTN_LOCAL_ARGMAX=${TF_NEXTN_LOCAL_ARGMAX:-1}
+    # Consume each eight-row BF16-PV head result while it is still on the
+    # owning worker's stack. Only the worker winner is published; the full
+    # local vocabulary slice is no longer stored and reread for greedy draft.
+    export TF_NEXTN_INLINE_ARGMAX=${TF_NEXTN_INLINE_ARGMAX:-1}
 fi
 export NUMA_DISTRIBUTE=${NUMA_DISTRIBUTE:-1} NUMA_N_CMGS=${NUMA_N_CMGS:-4}
 export TP_COMM_CMG_STRICT=${TP_COMM_CMG_STRICT:-1}
