@@ -16647,6 +16647,99 @@ void hip_llm_reset_state(hip_llm_runner *r) {
     }
 }
 
+struct hip_llm_state_snapshot {
+    int n_layers;
+    void **conv_host;
+    void **rec_host;
+    size_t *conv_bytes;
+    size_t *rec_bytes;
+    void *ple_host;
+    size_t ple_bytes;
+    int32_t ple_history[2];
+};
+
+void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
+    if (!s) return;
+    for (int l = 0; l < s->n_layers; ++l) {
+        free(s->conv_host ? s->conv_host[l] : NULL);
+        free(s->rec_host ? s->rec_host[l] : NULL);
+    }
+    free(s->conv_host);
+    free(s->rec_host);
+    free(s->conv_bytes);
+    free(s->rec_bytes);
+    free(s->ple_host);
+    free(s);
+}
+
+hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
+    if (!r) return NULL;
+    hip_llm_state_snapshot *s = (hip_llm_state_snapshot *)calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    s->n_layers = r->n_layers;
+    s->conv_host = (void **)calloc((size_t)s->n_layers, sizeof(void *));
+    s->rec_host = (void **)calloc((size_t)s->n_layers, sizeof(void *));
+    s->conv_bytes = (size_t *)calloc((size_t)s->n_layers, sizeof(size_t));
+    s->rec_bytes = (size_t *)calloc((size_t)s->n_layers, sizeof(size_t));
+    if (!s->conv_host || !s->rec_host || !s->conv_bytes || !s->rec_bytes)
+        goto fail;
+    if (hipDeviceSynchronize() != hipSuccess) goto fail;
+    for (int l = 0; l < r->n_layers; ++l) {
+        hip_layer *cl = &r->layers[l];
+        if (!cl->is_ssm) continue;
+        if (cl->d_conv_state) {
+            s->conv_bytes[l] = (size_t)(r->ssm_conv_kernel - 1) *
+                               r->ssm_qkv_dim * sizeof(float);
+            s->conv_host[l] = malloc(s->conv_bytes[l]);
+            if (!s->conv_host[l] || hipMemcpy(s->conv_host[l], cl->d_conv_state,
+                                              s->conv_bytes[l], hipMemcpyDeviceToHost) != hipSuccess)
+                goto fail;
+        }
+        if (cl->d_recurrent_state) {
+            s->rec_bytes[l] = (size_t)r->ssm_dt_rank * r->ssm_d_state *
+                              r->ssm_d_state * sizeof(float);
+            s->rec_host[l] = malloc(s->rec_bytes[l]);
+            if (!s->rec_host[l] || hipMemcpy(s->rec_host[l], cl->d_recurrent_state,
+                                             s->rec_bytes[l], hipMemcpyDeviceToHost) != hipSuccess)
+                goto fail;
+        }
+    }
+    if (r->d_ple_conv_state && r->ple_n_heads > 0) {
+        size_t hist = (size_t)(r->ple_conv_kernel - 1) * r->ple_ngram;
+        s->ple_bytes = hist * (size_t)r->hc_count * r->n_embd * sizeof(float);
+        s->ple_host = malloc(s->ple_bytes);
+        if (!s->ple_host || hipMemcpy(s->ple_host, r->d_ple_conv_state,
+                                      s->ple_bytes, hipMemcpyDeviceToHost) != hipSuccess)
+            goto fail;
+        s->ple_history[0] = r->ple_history[0];
+        s->ple_history[1] = r->ple_history[1];
+    }
+    return s;
+fail:
+    hip_llm_free_state_snapshot(s);
+    return NULL;
+}
+
+int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *s) {
+    if (!r || !s || s->n_layers != r->n_layers) return -1;
+    r->decode_mode = 0;
+    for (int l = 0; l < r->n_layers; ++l) {
+        hip_layer *cl = &r->layers[l];
+        if (s->conv_host[l] && cl->d_conv_state &&
+            hipMemcpy(cl->d_conv_state, s->conv_host[l], s->conv_bytes[l], hipMemcpyHostToDevice) != hipSuccess)
+            return -1;
+        if (s->rec_host[l] && cl->d_recurrent_state &&
+            hipMemcpy(cl->d_recurrent_state, s->rec_host[l], s->rec_bytes[l], hipMemcpyHostToDevice) != hipSuccess)
+            return -1;
+    }
+    if (s->ple_host && r->d_ple_conv_state &&
+        hipMemcpy(r->d_ple_conv_state, s->ple_host, s->ple_bytes, hipMemcpyHostToDevice) != hipSuccess)
+        return -1;
+    r->ple_history[0] = s->ple_history[0];
+    r->ple_history[1] = s->ple_history[1];
+    return hipDeviceSynchronize() == hipSuccess ? 0 : -1;
+}
+
 void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled) {
     if (r) r->decode_mode = enabled != 0;
 }

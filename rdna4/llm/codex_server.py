@@ -50,6 +50,17 @@ def chat_prompt(messages):
     return "".join(out)
 
 
+def chat_prefix(messages):
+    """Return the stable leading system/developer frames for prefix KV reuse."""
+    out = []
+    for m in messages:
+        if m.get("role") not in ("system", "developer"):
+            break
+        role = m.get("role", "system")
+        out.append(f"<|im_start|>{role}\n{content_text(m.get('content', ''))}<|im_end|>\n")
+    return "".join(out)
+
+
 def fit_context(messages, context_tokens, output_tokens):
     """Keep system/developer instructions and the newest turns.
 
@@ -92,9 +103,10 @@ class Backend:
             except ProcessLookupError:
                 pass
 
-    def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence):
+    def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, prefix=""):
+        prefix_payload = base64.b64encode(prefix.encode("utf-8")).decode("ascii") if prefix else "-"
         payload = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
-        line = f"REQ {max_tokens} {temperature} {top_p} {top_k} {presence} {payload}\n"
+        line = f"REQ {max_tokens} {temperature} {top_p} {top_k} {presence} {prefix_payload} {payload}\n"
         with self.lock:
             if self.proc.poll() is not None:
                 raise RuntimeError("runner exited")
@@ -204,6 +216,7 @@ class Handler(BaseHTTPRequestHandler):
             limit = min(int(req.get("max_tokens", req.get("max_output_tokens", self.max_tokens))), self.max_tokens)
             messages = fit_context(messages, self.context, limit)
             prompt = chat_prompt(messages)
+            prefix = chat_prefix(messages)
             # Match test_hip_llm's validated Qwen3.8 coding profile unless a
             # client explicitly supplies sampling controls.  Previously
             # --coding was passed only to the child binary, where it has no
@@ -224,7 +237,7 @@ class Handler(BaseHTTPRequestHandler):
                                        args=(stop_watcher, cancelled), daemon=True)
             watcher.start()
             try:
-                text, cached, ptok, ctok, finish = self.backend.generate(prompt, limit, temp, top_p, top_k, presence)
+                text, cached, ptok, ctok, finish = self.backend.generate(prompt, limit, temp, top_p, top_k, presence, prefix)
             finally:
                 stop_watcher.set()
                 watcher.join(timeout=0.2)

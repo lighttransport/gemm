@@ -21,6 +21,7 @@ extern "C" {
 #endif
 
 typedef struct hip_llm_runner hip_llm_runner;
+typedef struct hip_llm_state_snapshot hip_llm_state_snapshot;
 
 typedef enum {
     HIP_LLM_MOE_AUTO = 0,
@@ -121,6 +122,13 @@ void hip_llm_offload(hip_llm_runner *r);
 /* Reset all SSM state (conv + recurrent). Call between conversations for hybrid models. */
 void hip_llm_reset_state(hip_llm_runner *r);
 void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled);
+
+/* Save/restore recurrent state at a prompt boundary. KV entries remain in
+ * their positional device cache, so this snapshots only hybrid SSM/PLE state.
+ * The opaque snapshot is owned by the caller and may be reused across turns. */
+hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r);
+int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *snapshot);
+void hip_llm_free_state_snapshot(hip_llm_state_snapshot *snapshot);
 
 /* Read last hidden state (d_x) from GPU into dst. n = n_embd. */
 int hip_llm_read_hidden(const hip_llm_runner *r, float *dst, int n);
