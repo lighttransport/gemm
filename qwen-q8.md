@@ -2758,9 +2758,9 @@ applicable throughput target.
 - [x] Route persistent Qwen SSM/attention output and FFN-down collectives
   through the exact reduce-plus-residual callback. The old path remains active
   when projection/collective overlap is requested.
-- [ ] Complete the clean-node A/B against `TP_AR_FUSED_ADD=0`. Both token
-  hashes pass; the adjacent bandwidth-degraded 128-token run improved 26.19 to
-  26.83 tok/s (+2.4%).
+- [x] Complete the clean-node A/B against `TP_AR_FUSED_ADD=0`. Both canonical
+  320-token runs passed; the adjacent sustained run improved 31.55 to
+  32.31 tok/s (+2.4%), confirming the earlier short result.
 - [ ] Sweep BF16-PV prefetch by shape: K=4352 at 8/12/16, and K=5120/6144 at
   4/6/8/12. `TF_BF16PV_PREFETCH_K4352`, `_K5120`, and `_K6144` now override
   the global default independently; promote only a repeatable whole-model gain.
@@ -2855,6 +2855,7 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | snapshot-aware four-lane SSM verifier scan | yes | 128 yes | 56.68 | 68.97 | 14.59 | 952--982 | reject and remove; scan remained 122.4 ms/27 calls, so recurrent snapshot traffic is bandwidth-bound |
 | 2026-09-04 | balanced non-MTP profile / K5120 prefetch 8 | yes | 96 same hash | 32.47 / 32.36 | n/a | n/a | 549--557 / 546--555 | retain global distance 6; K5120=8 regressed limiting-rank time from 30.79 to 30.93 ms |
 | 2026-09-04 | non-MTP uTofu poll cadence 4/8/16/32 | yes | 96 yes; 320@8/16 yes | 32.30 / 32.47 / 32.58 / 32.34 short; 32.21 / 32.31 long at 8/16 | n/a | n/a | 542--550 (long) | promote 16 for ordinary decode; MTP retains independently proven 8 |
+| 2026-09-04 | fused TP reduce-plus-residual long A/B | yes | 320 both yes | 32.31 vs 31.55 enabled/disabled | n/a | n/a | 544--550 / 525--544 | retain default; exact sustained +2.4% at poll cadence 16 |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
