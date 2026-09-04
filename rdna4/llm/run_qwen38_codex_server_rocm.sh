@@ -5,9 +5,11 @@ set -euo pipefail
 # endpoint for Codex and other coding-agent clients.
 runner_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 model="${QWEN38_MODEL:-/mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf}"
-# 64K KV plus server scratch needs more headroom than the short-context bench.
-# Override to 8192 on a larger card when maximizing MoE hit rate.
-cache_mb="${QWEN38_MOE_CACHE_MB:-4096}"
+# 8.0 GiB is the largest verified cache on a 16 GiB RX 9070 XT with 64K KV
+# when the server's 128-token batch scratch is used. It keeps up to 89
+# experts/layer resident; the old 4 GiB default kept only 28 and
+# reduced decode from ~28 to ~18 tok/s through repeated PCIe uploads.
+cache_mb="${QWEN38_MOE_CACHE_MB:-8000}"
 context="${QWEN38_CONTEXT:-65536}"
 port="${QWEN38_API_PORT:-8080}"
 host="${QWEN38_API_HOST:-127.0.0.1}"
@@ -27,9 +29,18 @@ fi
 
 exec env \
     OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}" \
+    OMP_PROC_BIND="${OMP_PROC_BIND:-close}" \
+    OMP_PLACES="${OMP_PLACES:-cores}" \
     LLM_MOE_REGISTER_HOST="${LLM_MOE_REGISTER_HOST:-1}" \
     LLM_MOE_COPY_PIPELINE="${LLM_MOE_COPY_PIPELINE:-1}" \
-    LLM_MOE_LFU_CACHE="${LLM_MOE_LFU_CACHE:-1}" \
+    LLM_MOE_LFU_CACHE="${LLM_MOE_LFU_CACHE:-0}" \
+    LLM_MOE_CPU_DECODE_MISSES="${LLM_MOE_CPU_DECODE_MISSES:-1}" \
+    LLM_MOE_CPU_REFILLS_PER_LAYER="${LLM_MOE_CPU_REFILLS_PER_LAYER:-1}" \
+    LLM_MOE_CPU_MIN_WEIGHT="${LLM_MOE_CPU_MIN_WEIGHT:-1}" \
+    LLM_QWEN4_DELAYED_CACHE="${LLM_QWEN4_DELAYED_CACHE:-1}" \
+    LLM_QWEN4_DELAYED_REFILL_INTERVAL="${LLM_QWEN4_DELAYED_REFILL_INTERVAL:-2}" \
+    LLM_HC_GRAPHS="${LLM_HC_GRAPHS:-1}" \
+    LLM_QWEN_PRE_GRAPHS="${LLM_QWEN_PRE_GRAPHS:-1}" \
     LLM_MOE_STREAM_SLOTS="${LLM_MOE_STREAM_SLOTS:-4}" \
     LLM_MOE_CPU_LIB="${cpu_lib}" \
     LLM_MOE_CPU_PREFILL_MAX_COUNT="${LLM_MOE_CPU_PREFILL_MAX_COUNT:-2}" \

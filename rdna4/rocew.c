@@ -98,6 +98,7 @@ thipFree hipFree = NULL;
 thipMallocHost hipMallocHost = NULL;
 thipHostMalloc hipHostMalloc = NULL;
 thipHostRegister hipHostRegister = NULL;
+thipHostGetDevicePointer hipHostGetDevicePointer = NULL;
 thipHostUnregister hipHostUnregister = NULL;
 thipFreeHost hipFreeHost = NULL;
 thipHostFree hipHostFree = NULL;
@@ -289,6 +290,7 @@ static int loadHIP(void)
     HIP_LIBRARY_FIND(hipMallocHost);
     HIP_LIBRARY_FIND(hipHostMalloc);
     HIP_LIBRARY_FIND(hipHostRegister);
+    HIP_LIBRARY_FIND(hipHostGetDevicePointer);
     HIP_LIBRARY_FIND(hipHostUnregister);
     HIP_LIBRARY_FIND(hipFreeHost);
     HIP_LIBRARY_FIND(hipHostFree);

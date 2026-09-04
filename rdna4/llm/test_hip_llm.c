@@ -213,6 +213,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         int prompt_added = n_tokens - common;
         int batches = prompt_added > 0 ? (prompt_added + batch_size - 1) / batch_size : 0;
         double t_prefill0 = get_time_ms();
+        hip_llm_set_decode_mode(gpu, 0);
         float *logits = NULL;
         for (int off = 0; off < prompt_added; off += batch_size) {
             int cc = prompt_added - off;
@@ -246,13 +247,22 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         size_t text_cap = (size_t)max_tokens * 16 + 1, text_n = 0;
         char *text = (char *)calloc(text_cap ? text_cap : 1, 1);
         int generated = 0, finish_eos = 0;
-        int eos = bpe_eos_id(vocab), eot = bpe_eot_id(vocab);
+        int eos = bpe_eos_id(vocab), eot = bpe_eot_id(vocab), im_end = -1;
+        /* Qwen ChatML terminates an assistant turn with this control token;
+         * GGUF's eot_token_id is a different token for this checkpoint. */
+        for (int i = 0; i < n_vocab; ++i) {
+            const char *s = bpe_token_to_str(vocab, i);
+            if (s && strcmp(s, "<|im_end|>") == 0) { im_end = i; break; }
+        }
         double t_decode0 = get_time_ms();
+        hip_llm_reset_moe_stats(gpu);
+        hip_llm_set_decode_mode(gpu, 1);
         for (int k = 0; logits && k < max_tokens; k++) {
             int next = (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
                 sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence, seen, &rng);
+            int is_stop = next == eos || next == eot || next == im_end;
             const char *piece = bpe_token_to_str(vocab, next);
-            if (piece && text) {
+            if (!is_stop && piece && text) {
                 int raw_n = (int)strlen(piece), dec_n = 0;
                 char *decoded = bpe_byte_decode(piece, raw_n, &dec_n);
                 if (decoded) {
@@ -267,7 +277,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             if (cache_n < max_seq_len) cache[cache_n++] = next;
             if (seen && next >= 0 && next < n_vocab) seen[next] = 1;
             generated++;
-            if (next == eos || next == eot) { finish_eos = 1; break; }
+            if (is_stop) { finish_eos = 1; break; }
             logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
             double token_now = get_time_ms();
             double token_ms = token_now - t_decode0;
@@ -279,6 +289,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             fflush(stderr);
         }
         double t_decode1 = get_time_ms();
+        hip_llm_set_decode_mode(gpu, 0);
         double prefill_ms = t_prefill1 - t_prefill0;
         double decode_ms = t_decode1 - t_decode0;
         fprintf(stderr,
@@ -287,6 +298,22 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 n_tokens, common, prompt_added, batches, batch_size,
                 prefill_ms, prefill_ms > 0.0 ? 1000.0 * prompt_added / prefill_ms : 0.0,
                 generated, decode_ms, decode_ms > 0.0 ? 1000.0 * generated / decode_ms : 0.0);
+        {
+            hip_llm_moe_stats ms;
+            if (hip_llm_get_moe_stats(gpu, &ms) == 0 &&
+                ms.cache_hits + ms.cache_misses > 0) {
+                double hit = 100.0 * (double)ms.cache_hits /
+                             (double)(ms.cache_hits + ms.cache_misses);
+                fprintf(stderr,
+                        "llm_server: MoE cache=%.1f%% (%llu/%llu) H2D=%.2f GiB CPU=%llu GPU=%llu skipped=%llu CPU-time=%.2f ms\n",
+                        hit, (unsigned long long)ms.cache_hits,
+                        (unsigned long long)(ms.cache_hits + ms.cache_misses),
+                        ms.h2d_bytes / (double)(1ULL << 30),
+                        (unsigned long long)ms.cpu_assignments,
+                        (unsigned long long)ms.gpu_assignments,
+                        (unsigned long long)ms.skipped_assignments, ms.cpu_ms);
+            }
+        }
         size_t enc_n = 0; char *enc = b64_encode((const unsigned char *)(text ? text : ""), text_n, &enc_n);
         printf("OK %d %d %d %s %s\n", common, n_tokens, generated,
                finish_eos ? "stop" : "length", enc ? enc : "");
@@ -805,6 +832,7 @@ int main(int argc, char **argv) {
         /* Prefill: a single forward_batch_logits call. Phase 1 implementation is a
          * per-token loop; Phase 2 will swap in a true batched WMMA path. */
         hip_llm_reset_moe_stats(gpu);
+        hip_llm_set_decode_mode(gpu, 0);
         double t_pf0 = get_time_ms();
         float *last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
         if (!last_logits) { fprintf(stderr, "GPU forward_batch_logits failed\n"); pass = 0; goto bench_done; }
@@ -823,12 +851,16 @@ int main(int argc, char **argv) {
         double decode_ms = 0.0, decode_tps = 0.0;
         int decoded = 0;
         int first_decode_tok = next_tok;
+        uint64_t decode_hash = 1469598103934665603ULL;
         if (decode_n > 0) {
             hip_llm_reset_moe_stats(gpu);
+            hip_llm_set_decode_mode(gpu, 1);
             int gen_text = (getenv("LLM_GEN_TEXT") != NULL);
             if (gen_text) fprintf(stderr, "\n=== Generated text ===\n%s", bpe_token_to_str(vocab, next_tok));
             double t_dec0 = get_time_ms();
             for (int k = 0; k < decode_n; k++) {
+                decode_hash ^= (uint32_t)next_tok;
+                decode_hash *= 1099511628211ULL;
                 int pos = n_prefill + k;
                 float *lg = hip_llm_forward_logits(gpu, next_tok, pos);
                 if (!lg) { fprintf(stderr, "GPU forward_logits failed at decode k=%d\n", k); pass = 0; break; }
@@ -841,6 +873,7 @@ int main(int argc, char **argv) {
             }
             if (gen_text) fprintf(stderr, "\n=== end ===\n");
             double t_dec1 = get_time_ms();
+            hip_llm_set_decode_mode(gpu, 0);
             decode_ms = t_dec1 - t_dec0;
             decode_tps = (decode_ms > 0.0) ? (1000.0 * decoded / decode_ms) : 0.0;
         }
@@ -853,7 +886,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Decode:  %d tokens in %.2f ms  -> %.2f tok/s  (%.3f ms/tok)\n",
                     decoded, decode_ms, decode_tps,
                     decoded > 0 ? decode_ms / decoded : 0.0);
-            fprintf(stderr, "First decoded token id=%d, last id=%d\n", first_decode_tok, next_tok);
+            fprintf(stderr, "First decoded token id=%d, last id=%d, sequence hash=%016llx\n",
+                    first_decode_tok, next_tok, (unsigned long long)decode_hash);
         }
         {
             hip_llm_moe_stats ms;
@@ -861,10 +895,10 @@ int main(int argc, char **argv) {
                 ms.cache_hits + ms.cache_misses > 0) {
                 double hit = 100.0 * (double)ms.cache_hits /
                              (double)(ms.cache_hits + ms.cache_misses);
-                fprintf(stderr, "MoE cache: %.1f%% hit (%llu/%llu), H2D %.2f GiB\n", hit,
+                fprintf(stderr, "MoE cache: %.1f%% hit (%llu/%llu), H2D %.2f GiB, CPU-time %.2f ms\n", hit,
                         (unsigned long long)ms.cache_hits,
                         (unsigned long long)(ms.cache_hits + ms.cache_misses),
-                        ms.h2d_bytes / (double)(1ULL << 30));
+                        ms.h2d_bytes / (double)(1ULL << 30), ms.cpu_ms);
             }
         }
         fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");

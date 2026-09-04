@@ -32,10 +32,17 @@ def chat_prompt(messages):
     for m in messages:
         role = m.get("role", "user")
         text = content_text(m.get("content", ""))
+        # The generation prefix below has already supplied a closed, empty
+        # thinking block for each assistant answer.  Preserve that exact
+        # token sequence when the client sends the answer back as conversation
+        # history; otherwise the second turn diverges at the assistant header
+        # and no KV prefix can be reused.
+        if role == "assistant" and not text.startswith("<think>"):
+            text = "<think>\n\n</think>\n\n" + text
         out.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
-    # Qwen3.8's template uses an explicit empty reasoning block when
-    # enable_thinking=false. Without this marker the model continues in an
-    # invalid assistant state and commonly degenerates into repeated tokens.
+    # Codex needs useful answer tokens promptly.  Use the template's explicit
+    # non-thinking generation form; the coding sampling defaults below are
+    # important for this checkpoint in that mode.
     out.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
     return "".join(out)
 
@@ -68,6 +75,7 @@ class Backend:
             cmd += ["--moe-cache-mb", str(args.moe_cache_mb)]
         if args.coding:
             cmd += ["--coding"]
+        self.coding = args.coding
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=None, text=True, bufsize=1)
         self.lock = threading.Lock()
@@ -99,6 +107,7 @@ class Handler(BaseHTTPRequestHandler):
     model = "local"
     max_tokens = 256
     context = 4096
+    coding = False
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[api] " + (fmt % args) + "\n")
@@ -154,10 +163,15 @@ class Handler(BaseHTTPRequestHandler):
             limit = min(int(req.get("max_tokens", req.get("max_output_tokens", self.max_tokens))), self.max_tokens)
             messages = fit_context(messages, self.context, limit)
             prompt = chat_prompt(messages)
-            temp = float(req.get("temperature", 0.2))
-            top_p = float(req.get("top_p", 0.95))
+            # Match test_hip_llm's validated Qwen3.8 coding profile unless a
+            # client explicitly supplies sampling controls.  Previously
+            # --coding was passed only to the child binary, where it has no
+            # effect on protocol requests; API calls therefore used a very
+            # low-temperature generic profile that produces meta-commentary.
+            temp = float(req.get("temperature", 0.7 if self.coding else 0.2))
+            top_p = float(req.get("top_p", 0.80 if self.coding else 0.95))
             top_k = int(req.get("top_k", 20))
-            presence = float(req.get("presence_penalty", 0.0))
+            presence = float(req.get("presence_penalty", 1.5 if self.coding else 0.0))
             text, cached, ptok, ctok, finish = self.backend.generate(prompt, limit, temp, top_p, top_k, presence)
             ident = "chatcmpl-" + uuid.uuid4().hex
             created = int(time.time())
@@ -230,6 +244,7 @@ def main():
     Handler.model = Handler.backend.model
     Handler.max_tokens = args.max_output
     Handler.context = args.context
+    Handler.coding = args.coding
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"OpenAI-compatible API: http://{args.host}:{args.port}/v1", flush=True)
     try: server.serve_forever()

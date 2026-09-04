@@ -44,6 +44,7 @@ typedef struct {
     uint64_t assignments;
     uint64_t gpu_assignments;
     uint64_t cpu_assignments;
+    uint64_t skipped_assignments;
     uint64_t cache_hits;
     uint64_t cache_misses;
     uint64_t cache_evictions;
@@ -119,6 +120,7 @@ void hip_llm_offload(hip_llm_runner *r);
 
 /* Reset all SSM state (conv + recurrent). Call between conversations for hybrid models. */
 void hip_llm_reset_state(hip_llm_runner *r);
+void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled);
 
 /* Read last hidden state (d_x) from GPU into dst. n = n_embd. */
 int hip_llm_read_hidden(const hip_llm_runner *r, float *dst, int n);

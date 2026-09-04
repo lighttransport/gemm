@@ -365,6 +365,7 @@ typedef hipError_t (HIPAPI *thipHostMalloc)(void** ptr, size_t size, unsigned in
 typedef hipError_t (HIPAPI *thipFreeHost)(void* ptr);
 typedef hipError_t (HIPAPI *thipHostFree)(void* ptr);
 typedef hipError_t (HIPAPI *thipHostRegister)(void* ptr, size_t size, unsigned int flags);
+typedef hipError_t (HIPAPI *thipHostGetDevicePointer)(void** devPtr, void* hstPtr, unsigned int flags);
 typedef hipError_t (HIPAPI *thipHostUnregister)(void* ptr);
 typedef hipError_t (HIPAPI *thipMallocManaged)(void** ptr, size_t size, unsigned int flags);
 typedef hipError_t (HIPAPI *thipMemcpy)(void* dst, const void* src, size_t size, hipMemcpyKind kind);
@@ -529,6 +530,7 @@ extern thipFree hipFree;
 extern thipMallocHost hipMallocHost;
 extern thipHostMalloc hipHostMalloc;
 extern thipHostRegister hipHostRegister;
+extern thipHostGetDevicePointer hipHostGetDevicePointer;
 extern thipHostUnregister hipHostUnregister;
 extern thipFreeHost hipFreeHost;
 extern thipHostFree hipHostFree;
