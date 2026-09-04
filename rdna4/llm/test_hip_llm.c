@@ -15,6 +15,7 @@
 #include <math.h>
 #include <time.h>
 #include <ctype.h>
+#include <signal.h>
 
 /* GGUF loader */
 #define GGUF_LOADER_IMPLEMENTATION
@@ -64,14 +65,18 @@ static float rel_l2_error(const float *a, const float *b, int n) {
  * only top-k candidates makes sampling O(vocab*k), with no full-vocab sort. */
 static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
                           float temperature, float presence_penalty,
-                          const unsigned char *seen, unsigned *rng) {
+                          const unsigned char *seen, const unsigned short *counts,
+                          unsigned *rng) {
     if (top_k < 1) top_k = 1;
     if (top_k > 64) top_k = 64;
     int ids[64];
     float vals[64];
     for (int j = 0; j < top_k; ++j) { ids[j] = -1; vals[j] = -INFINITY; }
     for (int i = 0; i < n; ++i) {
-        float v = logits[i] - ((seen && seen[i]) ? presence_penalty : 0.0f);
+        /* Presence applies to prompt/history tokens; frequency is completion
+         * only and prevents a winning phrase from becoming an infinite loop. */
+        float freq = (counts && counts[i]) ? 0.35f * (float)counts[i] : 0.0f;
+        float v = logits[i] - ((seen && seen[i]) ? presence_penalty : 0.0f) - freq;
         if (!isfinite(v)) continue;
         if (v <= vals[top_k - 1]) continue;
         int j = top_k - 1;
@@ -101,6 +106,13 @@ static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
 }
 
 static int argmax_logits(const float *logits, int n);
+
+static volatile sig_atomic_t g_stdio_cancel;
+
+static void stdio_cancel_handler(int signo) {
+    (void)signo;
+    g_stdio_cancel = 1;
+}
 
 /* Small line protocol used by codex_server.py.  Keeping HTTP/JSON out of the
  * GPU process makes the runner easy to embed and, more importantly, keeps one
@@ -164,9 +176,11 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
     int cache_n = 0;
     unsigned rng = 0x51f15e5du;
     if (!cache) return 1;
+    signal(SIGUSR1, stdio_cancel_handler);
     fprintf(stderr, "JSONL backend ready (max_seq_len=%d)\n", max_seq_len);
     fflush(stderr);
     while (fgets(line, sizeof(line), stdin)) {
+        g_stdio_cancel = 0;
         int max_tokens = 16, top_k = 20;
         float temperature = 0.2f, top_p = 0.95f, presence = 0.0f;
         char *b64 = NULL;
@@ -215,7 +229,9 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         double t_prefill0 = get_time_ms();
         hip_llm_set_decode_mode(gpu, 0);
         float *logits = NULL;
+        int cancelled = 0;
         for (int off = 0; off < prompt_added; off += batch_size) {
+            if (g_stdio_cancel) { cancelled = 1; break; }
             int cc = prompt_added - off;
             if (cc > batch_size) cc = batch_size;
             logits = hip_llm_forward_batch_logits(gpu, tokens + common + off, cc,
@@ -232,10 +248,20 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             if (!logits) break;
         }
         double t_prefill1 = get_time_ms();
+        if (g_stdio_cancel) cancelled = 1;
+        if (cancelled) {
+            hip_llm_reset_state(gpu);
+            cache_n = 0;
+            free(tokens);
+            puts("OK 0 0 0 cancelled");
+            fflush(stdout);
+            continue;
+        }
         if (!logits && prompt_added > 0) {
             free(tokens); puts("ERR prefill"); fflush(stdout); continue;
         }
         unsigned char *seen = (unsigned char *)calloc((size_t)n_vocab, 1);
+        unsigned short *counts = (unsigned short *)calloc((size_t)n_vocab, sizeof(*counts));
         for (int i = 0; i < n_tokens; i++) {
             cache[i] = tokens[i];
             if (seen && tokens[i] >= 0 && tokens[i] < n_vocab) seen[tokens[i]] = 1;
@@ -258,8 +284,9 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         hip_llm_reset_moe_stats(gpu);
         hip_llm_set_decode_mode(gpu, 1);
         for (int k = 0; logits && k < max_tokens; k++) {
+            if (g_stdio_cancel) { cancelled = 1; break; }
             int next = (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
-                sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence, seen, &rng);
+                sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence, seen, counts, &rng);
             int is_stop = next == eos || next == eot || next == im_end;
             const char *piece = bpe_token_to_str(vocab, next);
             if (!is_stop && piece && text) {
@@ -276,6 +303,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             }
             if (cache_n < max_seq_len) cache[cache_n++] = next;
             if (seen && next >= 0 && next < n_vocab) seen[next] = 1;
+            if (counts && next >= 0 && next < n_vocab && counts[next] != 0xffffu) counts[next]++;
             generated++;
             if (is_stop) { finish_eos = 1; break; }
             logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
@@ -288,6 +316,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                     token_ms > 0.0 ? 1000.0 * generated / token_ms : 0.0);
             fflush(stderr);
         }
+        if (g_stdio_cancel) cancelled = 1;
         double t_decode1 = get_time_ms();
         hip_llm_set_decode_mode(gpu, 0);
         double prefill_ms = t_prefill1 - t_prefill0;
@@ -315,10 +344,16 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             }
         }
         size_t enc_n = 0; char *enc = b64_encode((const unsigned char *)(text ? text : ""), text_n, &enc_n);
-        printf("OK %d %d %d %s %s\n", common, n_tokens, generated,
-               finish_eos ? "stop" : "length", enc ? enc : "");
+        if (cancelled) {
+            hip_llm_reset_state(gpu);
+            cache_n = 0;
+        }
+        printf("OK %d %d %d %s %s\n", cancelled ? 0 : common,
+               cancelled ? 0 : n_tokens, generated,
+               cancelled ? "cancelled" : (finish_eos ? "stop" : "length"),
+               enc ? enc : "");
         fflush(stdout);
-        free(enc); free(text); free(seen);
+        free(enc); free(text); free(seen); free(counts);
     }
     free(cache);
     return 0;
@@ -771,6 +806,7 @@ int main(int argc, char **argv) {
 
     if (bench_mode) {
         unsigned char *seen = NULL;
+        unsigned short *counts = NULL;
         /* ---- Bench mode: split prefill and decode tokens/sec ---- */
         int n_prefill = max_tokens;
         if (n_prefill < 1) n_prefill = 1;
@@ -837,11 +873,12 @@ int main(int argc, char **argv) {
         float *last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
         if (!last_logits) { fprintf(stderr, "GPU forward_batch_logits failed\n"); pass = 0; goto bench_done; }
         seen = coding_mode ? (unsigned char *)calloc((size_t)n_vocab, 1) : NULL;
+        counts = coding_mode ? (unsigned short *)calloc((size_t)n_vocab, sizeof(*counts)) : NULL;
         unsigned sample_rng = 0x51f15e5du;
         if (seen) for (int i = 0; i < n_prefill; ++i)
             if (tokens[i] >= 0 && tokens[i] < n_vocab) seen[tokens[i]] = 1;
         int next_tok = coding_mode ? sample_top_k_p(last_logits, n_vocab, 20, 0.80f,
-                                                    0.70f, 1.50f, seen, &sample_rng)
+                                                    0.70f, 1.50f, seen, counts, &sample_rng)
                                    : argmax_logits(last_logits, n_vocab);
         double t_pf1 = get_time_ms();
         double prefill_ms = t_pf1 - t_pf0;
@@ -865,8 +902,9 @@ int main(int argc, char **argv) {
                 float *lg = hip_llm_forward_logits(gpu, next_tok, pos);
                 if (!lg) { fprintf(stderr, "GPU forward_logits failed at decode k=%d\n", k); pass = 0; break; }
                 if (seen && next_tok >= 0 && next_tok < n_vocab) seen[next_tok] = 1;
+                if (counts && next_tok >= 0 && next_tok < n_vocab && counts[next_tok] != 0xffffu) counts[next_tok]++;
                 next_tok = coding_mode ? sample_top_k_p(lg, n_vocab, 20, 0.80f,
-                                                        0.70f, 1.50f, seen, &sample_rng)
+                                                        0.70f, 1.50f, seen, counts, &sample_rng)
                                        : argmax_logits(lg, n_vocab);
                 decoded++;
                 if (gen_text) { const char *s = bpe_token_to_str(vocab, next_tok); if (s) fprintf(stderr, "%s", s); }
@@ -903,7 +941,7 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
 bench_done:
-        free(seen);
+        free(seen); free(counts);
     } else {
         /* ---- Correctness mode: per-token CPU vs GPU compare (legacy) ---- */
         fprintf(stderr, "\n=== Running %d tokens (n_embd=%d)%s ===\n",

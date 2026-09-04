@@ -8,6 +8,10 @@ limits, while the child keeps the model and KV/SSM state resident.
 import argparse
 import base64
 import json
+import os
+import select
+import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -81,6 +85,14 @@ class Backend:
         self.lock = threading.Lock()
         self.model = args.model.rsplit("/", 1)[-1]
 
+    def cancel(self):
+        """Request cooperative cancellation in the resident runner."""
+        if self.proc.poll() is None:
+            try:
+                os.kill(self.proc.pid, signal.SIGUSR1)
+            except ProcessLookupError:
+                pass
+
     def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence):
         payload = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
         line = f"REQ {max_tokens} {temperature} {top_p} {top_k} {presence} {payload}\n"
@@ -89,10 +101,15 @@ class Backend:
                 raise RuntimeError("runner exited")
             self.proc.stdin.write(line)
             self.proc.stdin.flush()
-            result = self.proc.stdout.readline().strip()
+            # Preserve the final empty field: an immediate EOS is a valid
+            # completion and the runner's OK line intentionally ends with an
+            # empty base64 payload in that case.
+            result = self.proc.stdout.readline().rstrip("\r\n")
         if not result.startswith("OK "):
             raise RuntimeError(result)
         fields = result.split(" ", 5)
+        if len(fields) == 5 and fields[4] in ("stop", "length", "cancelled"):
+            fields.append("")
         if len(fields) != 6:
             raise RuntimeError("malformed runner response")
         if fields[0] != "OK":
@@ -133,6 +150,25 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("404 GET %s", self.path)
             self.send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
+    def _watch_disconnect(self, stop, cancelled):
+        """Cancel inference when the client closes its request socket."""
+        while not stop.wait(0.05):
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                if not readable:
+                    continue
+                data = self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                if not data:
+                    self.backend.cancel()
+                    cancelled.set()
+                    return
+            except (BlockingIOError, InterruptedError):
+                continue
+            except (OSError, ValueError):
+                self.backend.cancel()
+                cancelled.set()
+                return
+
     def do_POST(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if path.startswith("/v1/"):
@@ -141,6 +177,10 @@ class Handler(BaseHTTPRequestHandler):
             api_path = "/v1" + path
         else:
             api_path = path
+        if api_path == "/v1/cancel":
+            self.backend.cancel()
+            self.send_json(202, {"status": "cancellation_requested"})
+            return
         if api_path not in ("/v1/chat/completions", "/v1/completions", "/v1/responses"):
             self.log_message("404 POST %s", self.path)
             self.send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
@@ -168,11 +208,28 @@ class Handler(BaseHTTPRequestHandler):
             # --coding was passed only to the child binary, where it has no
             # effect on protocol requests; API calls therefore used a very
             # low-temperature generic profile that produces meta-commentary.
-            temp = float(req.get("temperature", 0.7 if self.coding else 0.2))
-            top_p = float(req.get("top_p", 0.80 if self.coding else 0.95))
-            top_k = int(req.get("top_k", 20))
-            presence = float(req.get("presence_penalty", 1.5 if self.coding else 0.0))
-            text, cached, ptok, ctok, finish = self.backend.generate(prompt, limit, temp, top_p, top_k, presence)
+            # The local Qwen checkpoint is substantially more reliable for
+            # Codex's terse control prompts with low-entropy sampling.  The
+            # old coding defaults (T=0.7, presence=1.5) could turn a simple
+            # confirmation into repeated fragments even though the request
+            # and transport completed successfully.
+            temp = float(req.get("temperature", 0.05 if self.coding else 0.2))
+            top_p = float(req.get("top_p", 1.0 if self.coding else 0.95))
+            top_k = int(req.get("top_k", 1 if self.coding else 20))
+            presence = float(req.get("presence_penalty", 0.0))
+            stop_watcher = threading.Event()
+            cancelled = threading.Event()
+            watcher = threading.Thread(target=self._watch_disconnect,
+                                       args=(stop_watcher, cancelled), daemon=True)
+            watcher.start()
+            try:
+                text, cached, ptok, ctok, finish = self.backend.generate(prompt, limit, temp, top_p, top_k, presence)
+            finally:
+                stop_watcher.set()
+                watcher.join(timeout=0.2)
+            if cancelled.is_set() or finish == "cancelled":
+                self.log_message("request cancelled: %s", self.path)
+                return
             ident = "chatcmpl-" + uuid.uuid4().hex
             created = int(time.time())
             usage = {"prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ptok + ctok, "cached_tokens": cached}
@@ -226,6 +283,7 @@ class Handler(BaseHTTPRequestHandler):
             # socket left to report an error on.
             return
         except Exception as exc:
+            self.log_message("500 POST %s: %s", self.path, exc)
             self.send_json(500, {"error": {"message": str(exc), "type": "server_error"}})
 
 
