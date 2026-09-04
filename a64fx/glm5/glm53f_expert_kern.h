@@ -13,6 +13,8 @@ typedef struct {
     const uint8_t *down;
     const float *down_scale;
     int inter;
+    int gate_type; /* 0: staged FP8_E4M3; otherwise GGML type id */
+    int down_type; /* 0: staged FP8_E4M3; otherwise GGML type id */
 } glm53f_expert_part;
 
 static inline float glm53f_fp8_e4m3_scalar(uint8_t q) {

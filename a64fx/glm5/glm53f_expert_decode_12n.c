@@ -35,7 +35,7 @@ enum { FIRST_LAYER = 3, LAST_LAYER = 46, NLAYERS = 43, NEXPERTS = 288 };
 
 typedef struct {
     uint64_t gate_up, gate_up_scale, down, down_scale;
-    int inter;
+    int inter, gate_type, down_type;
 } expert_offset;
 typedef expert_offset shared_offset;
 
@@ -66,6 +66,7 @@ static int load_manifest(const char *path, expert_offset *table) {
     for (int i = 0; i < NLAYERS * NEXPERTS; ++i) {
         table[i].gate_up = table[i].gate_up_scale = UINT64_MAX;
         table[i].down = table[i].down_scale = UINT64_MAX;
+        table[i].gate_type = table[i].down_type = 0;
     }
     while (fgets(line, sizeof(line), f)) {
         char *last;
@@ -79,9 +80,13 @@ static int load_manifest(const char *path, expert_offset *table) {
                    &layer, &expert, suffix) != 3) continue;
         if (layer < FIRST_LAYER || layer >= LAST_LAYER || expert < 0 || expert >= NEXPERTS) continue;
         expert_offset *p = &table[(layer - FIRST_LAYER) * NEXPERTS + expert];
-        if (!strcmp(suffix, "gate_up_fused.weight")) p->gate_up = off;
+        int qtype = 0;
+        if (!strcmp(dtype, "IQ2_XS")) qtype = GLM53F_GGML_IQ2_XS;
+        else if (!strcmp(dtype, "IQ3_XXS")) qtype = GLM53F_GGML_IQ3_XXS;
+        else if (!strcmp(dtype, "IQ4_XS")) qtype = GLM53F_GGML_IQ4_XS;
+        if (!strcmp(suffix, "gate_up_fused.weight")) { p->gate_up = off; p->gate_type = qtype; }
         else if (!strcmp(suffix, "gate_up_fused.weight_scale_inv")) p->gate_up_scale = off;
-        else if (!strcmp(suffix, "down_proj.weight")) { p->down = off; p->inter = cols; }
+        else if (!strcmp(suffix, "down_proj.weight")) { p->down = off; p->inter = cols; p->down_type = qtype; }
         else if (!strcmp(suffix, "down_proj.weight_scale_inv")) p->down_scale = off;
         else continue;
         found++;
@@ -180,7 +185,7 @@ glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
 void glm53f_moe_stage_set_layer_12n(glm53f_moe_stage_context_12n*c,int layer){if(c)c->active_layer=layer;}
 int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_moe_stage_context_12n*c=context;int li=c->active_layer-c->first_layer,selected[8],npart=0;float route_weight[8],part_weight[9];glm53f_expert_part part[9];if(li<0||li>=c->layer_count)return-1;
 #pragma omp parallel for schedule(static)
-    for(int e=0;e<NEXPERTS;e++)c->router_logits[e]=glm53f_dot_bf16_sve(c->router_w+((size_t)li*NEXPERTS+e)*4096,x,4096);glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);int table_layer=c->active_layer-FIRST_LAYER;for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,(const float*)(c->blob+p->down_scale),p->inter};part_weight[npart++]=route_weight[k];}if(c->shared_blob){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter};part_weight[npart++]=1.0f;}glm53f_moe_local_12n(c->scratch->local_output,part,part_weight,npart,x,c->scratch);return glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);}
+    for(int e=0;e<NEXPERTS;e++)c->router_logits[e]=glm53f_dot_bf16_sve(c->router_w+((size_t)li*NEXPERTS+e)*4096,x,4096);glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);int table_layer=c->active_layer-FIRST_LAYER;for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};part_weight[npart++]=route_weight[k];}if(c->shared_blob){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter,0,0};part_weight[npart++]=1.0f;}glm53f_moe_local_12n(c->scratch->local_output,part,part_weight,npart,x,c->scratch);return glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);}
 int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out,const float*x,int tokens){
     int li=c?c->active_layer-c->first_layer:-1,table_layer=c?c->active_layer-FIRST_LAYER:-1;
     if(!c||!out||!x||tokens<1||tokens>4||li<0||li>=c->layer_count||!c->shared_blob)return-1;
@@ -190,8 +195,26 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
 #pragma omp parallel for schedule(static)
         for(int e=0;e<NEXPERTS;e++)c->router_logits[e]=glm53f_dot_bf16_sve(c->router_w+((size_t)li*NEXPERTS+e)*H,xt,H);
         glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);
-        for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;parts[t*MAXP+npart]=(glm53f_expert_part){c->blob+p->gate_up,(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,(const float*)(c->blob+p->down_scale),p->inter};weights[t*MAXP+npart++]=route_weight[k];}
+        for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;parts[t*MAXP+npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};weights[t*MAXP+npart++]=route_weight[k];}
         counts[t]=npart;
+    }
+    int has_iq=0;
+    for(int t=0;t<tokens&&!has_iq;t++)
+        for(int k=0;k<counts[t];k++)
+            has_iq|=parts[t*MAXP+k].gate_type||parts[t*MAXP+k].down_type;
+    if(has_iq){
+        shared_offset*sp=&c->shared[table_layer];
+        for(int t=0;t<tokens;t++){
+            int n=counts[t];
+            parts[t*MAXP+n]=(glm53f_expert_part){c->shared_blob+sp->gate_up,
+                (const float*)(c->shared_blob+sp->gate_up_scale),
+                c->shared_blob+sp->down,(const float*)(c->shared_blob+sp->down_scale),
+                sp->inter,0,0};
+            weights[t*MAXP+n]=1.0f;
+            glm53f_moe_local_12n(c->batch_local+(size_t)t*H,
+                parts+t*MAXP,weights+t*MAXP,n+1,x+(size_t)t*H,c->scratch);
+        }
+        return glm53f_sum_allreduce_12n(c->batch_local,out,tokens*H);
     }
     if(!c->task_up){if(posix_memalign((void**)&c->task_up,256,4*9*1024*4)||posix_memalign((void**)&c->task_activation,256,4*9*512*4)||posix_memalign((void**)&c->task_output,256,4*9*H*4))return-1;}
     float*up=c->task_up; float*act=c->task_activation; float*y=c->task_output;
@@ -202,7 +225,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
                                  up+(size_t)t*MAXP*1024,
                                  act+(size_t)t*MAXP*512,
                                  y+(size_t)t*MAXP*H);
-    shared_offset*sp=&c->shared[table_layer];glm53f_expert_part shared={c->shared_blob+sp->gate_up,(const float*)(c->shared_blob+sp->gate_up_scale),c->shared_blob+sp->down,(const float*)(c->shared_blob+sp->down_scale),sp->inter};
+    shared_offset*sp=&c->shared[table_layer];glm53f_expert_part shared={c->shared_blob+sp->gate_up,(const float*)(c->shared_blob+sp->gate_up_scale),c->shared_blob+sp->down,(const float*)(c->shared_blob+sp->down_scale),sp->inter,0,0};
     glm53f_expert_tokens_bits(&shared,tokens,x,c->batch_up,c->batch_activation,c->batch_shared);
 #pragma omp parallel for schedule(static)
     for(int q=0;q<tokens*H;q++){int t=q/H,i=q-t*H;float v=0.0f;for(int k=0;k<counts[t];k++)v+=weights[t*MAXP+k]*y[((size_t)t*MAXP+k)*H+i];c->batch_local[q]=v+c->batch_shared[q];}
@@ -351,10 +374,12 @@ int main(int argc, char **argv) {
                 expert_offset *p = &table[layer_index * NEXPERTS + selected[k]];
                 if (p->gate_up == UINT64_MAX) continue;
                 part[n].gate_up = blob + p->gate_up;
-                part[n].gate_up_scale = (const float *)(blob + p->gate_up_scale);
+                part[n].gate_up_scale = p->gate_up_scale==UINT64_MAX?NULL:(const float *)(blob + p->gate_up_scale);
                 part[n].down = blob + p->down;
-                part[n].down_scale = (const float *)(blob + p->down_scale);
+                part[n].down_scale = p->down_scale==UINT64_MAX?NULL:(const float *)(blob + p->down_scale);
                 part[n].inter = p->inter;
+                part[n].gate_type = p->gate_type;
+                part[n].down_type = p->down_type;
                 part_weight[n] = route_weight[k];
                 n++;
             }
@@ -365,6 +390,8 @@ int main(int argc, char **argv) {
                 part[n].down = shared_blob + p->down;
                 part[n].down_scale = (const float *)(shared_blob + p->down_scale);
                 part[n].inter = p->inter;
+                part[n].gate_type = 0;
+                part[n].down_type = 0;
                 part_weight[n] = 1.0f;
                 n++;
             }

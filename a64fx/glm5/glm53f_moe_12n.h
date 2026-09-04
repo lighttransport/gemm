@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <string.h>
 #include "glm53f_expert_kern.h"
+#include "glm53f_iq_bridge.h"
 
 #ifndef GLM53F_MOE_FUSED_WEIGHTED
 #define GLM53F_MOE_FUSED_WEIGHTED 1
@@ -43,9 +44,36 @@ static inline void glm53f_moe_local_12n(
         return;
     }
 #if GLM53F_MOE_FUSED_WEIGHTED
-        glm53f_expert_batch_weighted_bits(part, part_weight, count, x,
-                                           scratch->up, scratch->activation,
-                                           output);
+    int niq = 0, nfp = 0;
+    glm53f_iq_part iq[GLM53F_MOE_MAX_PARTS];
+    glm53f_expert_part fp[GLM53F_MOE_MAX_PARTS];
+    float iq_weight[GLM53F_MOE_MAX_PARTS], fp_weight[GLM53F_MOE_MAX_PARTS];
+    for (int k = 0; k < count; ++k) {
+        if (part[k].gate_type || part[k].down_type) {
+            iq[niq] = (glm53f_iq_part){ part[k].gate_up, part[k].down,
+                part[k].gate_type, part[k].down_type, part[k].inter };
+            iq_weight[niq++] = part_weight[k];
+        } else {
+            fp[nfp] = part[k]; fp_weight[nfp++] = part_weight[k];
+        }
+    }
+    if (!niq) {
+        glm53f_expert_batch_weighted_bits(fp, fp_weight, nfp, x,
+                                           scratch->up, scratch->activation, output);
+    } else {
+        float *iq_output = scratch->local_output;
+        float *fp_output = scratch->part_output;
+        if (glm53f_iq_expert_weighted(iq_output, iq, iq_weight, niq, x,
+                                      scratch->up, scratch->activation)) {
+            memset(iq_output, 0, GLM53F_MOE_HIDDEN * sizeof(*iq_output));
+        }
+        if (nfp)
+            glm53f_expert_batch_weighted_bits(fp, fp_weight, nfp, x,
+                scratch->up, scratch->activation, fp_output);
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < GLM53F_MOE_HIDDEN; ++i)
+            output[i] = iq_output[i] + (nfp ? fp_output[i] : 0.0f);
+    }
 #else
     glm53f_expert_batch_bits(part, count, x, scratch->up,
                              scratch->activation, scratch->part_output);

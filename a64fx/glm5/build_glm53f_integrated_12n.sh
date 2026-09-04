@@ -33,6 +33,9 @@ fi
 
 cflags=(-O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp
         -Wall -Wextra -I. -I../../common)
+case "$(basename "$cc")" in
+    mpifcc|mpiFCC) cflags=(-Nclang "${cflags[@]}") ;;
+esac
 if [ "${GLM53F_FAST_MATH:-0}" = 1 ]; then
     cflags+=(-ffast-math)
 fi
@@ -65,6 +68,8 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" "${external[@]}" \
     -DGLM53F_DENSE_NO_MAIN -c glm53f_dense_ffn_12n.c -o "$build_dir/dense.o"
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" "${external[@]}" \
     -DGLM53F_EXPERT_NO_MAIN -c glm53f_expert_decode_12n.c -o "$build_dir/moe.o"
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
+    -c glm53f_iq_bridge.c -o "$build_dir/iq_bridge.o"
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" "${external[@]}" \
     -DGLM53F_TARGET_HEAD_NO_MAIN -c glm53f_target_head_12n.c -o "$build_dir/head.o"
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" "${external[@]}" \
@@ -75,7 +80,7 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" "${external[@]}" \
     -c glm53f_mtp_12n.c -o "$build_dir/mtp.o"
 
 objects=("$build_dir/collective.o" "$build_dir/kda.o" "$build_dir/sparse.o" "$build_dir/dense.o"
-         "$build_dir/moe.o" "$build_dir/head.o" "$build_dir/embedding.o")
+         "$build_dir/moe.o" "$build_dir/iq_bridge.o" "$build_dir/head.o" "$build_dir/embedding.o")
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_target_decode_12n.c \
     "${objects[@]}" "${ldflags[@]}" -o glm53f_target_decode_12n
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_spec_decode_12n.c \
@@ -93,5 +98,14 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
     -DGLM53F_SPARSE_NO_MAIN glm53f_sparse_batch_check.c \
     glm53f_sparse_layer_12n.c "$build_dir/collective.o" \
     "${ldflags[@]}" -o glm53f_sparse_batch_check
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_stage.c \
+    -o glm53f_q2_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_core_stage.c \
+    -o glm53f_core_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_expert_decode_12n.c \
+    "$build_dir/iq_bridge.o" "$build_dir/collective.o" \
+    "${ldflags[@]}" -o glm53f_expert_decode_12n
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" ../utofu-tests/tofu_topo_helper.c \
+    -ltofucom -o ../utofu-tests/tofu_topo_helper
 
 echo "SENTINEL glm53f_integrated_build_12n=OK cc=$cc build_dir=$build_dir"
