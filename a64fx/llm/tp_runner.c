@@ -2093,6 +2093,7 @@ int main(int argc, char **argv) {
         int measured = perf_warmup == 0;
         int mtp_detail = envb_opt("TP_MTP_PROFILE_DETAIL", 0);
         int mtp_omp_park = envb_opt("TP_MTP_OMP_PARK", 0);
+        int mtp_local_argmax = envb_opt("TF_NEXTN_LOCAL_ARGMAX", 0);
         int mtp_verify_blocktime = (int)envl_opt("TP_MTP_VERIFY_BLOCKTIME", 200);
 #ifndef _OPENMP
         mtp_omp_park = 0;
@@ -2269,8 +2270,20 @@ int main(int argc, char **argv) {
                             float *dlg = transformer_nextn_logits(
                                 mtp_draft_model, prev, draft_h, p - 1 + k);
                             double da = 0.0; long dc = 0;
-                            mtp_pending[k] = sample_argmax(
-                                mtp_draft_model, dlg, &c, &da, &dc);
+                            if (mtp_local_argmax) {
+                                float best;
+                                int local = transformer_nextn_local_argmax(
+                                    mtp_draft_model, &best);
+                                if (local < 0) die("NextN local argmax", -1);
+                                int32_t global = local + mtp_draft_model->tp_vocab_lo;
+                                double ar0 = now_sec();
+                                tp_allreduce_argmax(&c, &best, &global);
+                                da = now_sec() - ar0; dc = 1;
+                                mtp_pending[k] = global;
+                            } else {
+                                mtp_pending[k] = sample_argmax(
+                                    mtp_draft_model, dlg, &c, &da, &dc);
+                            }
                             argmax_ar += da; argmax_calls += dc;
                             prev = mtp_pending[k];
                             draft_h = transformer_nextn_hidden(mtp_draft_model);

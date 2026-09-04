@@ -2849,6 +2849,8 @@ TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
 | 2026-09-04 | prefetch upcoming FFN during non-MTP collective | yes | short bench only | 32.30 / 32.37 (8 / 2 lines) vs 32.70 | n/a | n/a | 546--552 | reject and remove; cache warming is neutral-to-negative |
 | 2026-09-04 | static verifier attention task schedule / SVE attention gate | yes | 128 yes | 56.36 / 56.27 | 68.90 / 68.83 | 15.15 / 15.36 | 941--964 | reject static schedule; leave SVE gate opt-in, both are wall-neutral |
 | 2026-09-04 | futex park / pre-park OpenMP barrier | yes | 128 yes | 55.88 / 56.00 | 68.72 / 68.52 | 16.06 / 16.06 | 931--969 | reject and remove; neither beats pthread-cond parking without an added barrier |
+| 2026-09-04 | direct all-peer draft argmax transport | yes | 128 yes | 55.84 | 69.63 | 15.19 | 930--970 | reject and remove; exact but wall-neutral versus the established TP argmax |
+| 2026-09-04 | worker-owned NextN local argmax | yes | 128/256 yes | 56.36 vs 56.21; 55.87 long | 69.33 vs 68.65; 68.55 long | 14.72 vs 15.63; 14.70 long | 943--964 (256) | promote; adjacent enabled/disabled A/B saves 0.91 ms of drafting |
 | pending | combined optimized MTP | - | - | - | - | - | - | clean rebaseline |
 | 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
 | 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
@@ -3239,3 +3241,23 @@ condition wait with a direct futex, or adding a 48-worker barrier before sleep,
 raised draft time to 16.06 ms. The current condition-variable parking path is
 retained. Meaningful proposer progress must reduce a weight stream or an argmax
 handoff, not substitute another worker-sleep primitive.
+
+The persistent NextN head now also computes one local argmax per worker over
+the exact eight-row groups already owned by that worker. The caller folds the
+48 cached winners, with the same lower-index tie break, before invoking the
+unchanged TP argmax. The logits and reduction arithmetic are unchanged; every
+scan stays within its worker's first-touched row range, so it adds neither
+cross-CMG access nor weaker alignment. An adjacent 128-token enabled/disabled
+A/B retained canonical `6b136ca0...` in both runs. Enabling the path reached
+56.36 versus 56.21 tok/s and reduced draft time from 15.63 to 14.72 ms despite
+verification jitter from 68.65 to 69.33 ms. `mtp-sustained` therefore enables
+`TF_NEXTN_LOCAL_ARGMAX=1`; set it to zero for the serial-scan control.
+The promoted 256-token gate retained canonical
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`
+at **55.87 tok/s**, 68.55/14.70 ms verify/draft, alpha 0.9364, and
+943--964 GB/s across the four ranks.
+
+A direct all-peer transport for the tiny argmax record was also exact, but
+only reached 55.84 tok/s with 69.63/15.19 ms verify/draft and 930--970 GB/s.
+It was removed: changing the collective does not beat removing the redundant
+serial vocabulary scan.

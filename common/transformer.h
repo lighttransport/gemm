@@ -456,6 +456,7 @@ float *transformer_nextn_logits(transformer_model *model, int32_t prev_token,
                                 const float *target_hidden, int position);
 const float *transformer_nextn_hidden(const transformer_model *model);
 const float *transformer_nextn_target_hidden(const transformer_model *model);
+int transformer_nextn_local_argmax(const transformer_model *model, float *value);
 /* Create a weights-sharing NextN-only runtime.  It owns independent scratch,
  * KV state, logits, and worker threads, but never owns the trunk/staged weights.
  * This is the isolation boundary needed to overlap a speculative NextN chain
@@ -10023,6 +10024,16 @@ static void *tf_nextn_ffn_worker(void *arg) {
         tf_spin_barrier(m, &t->barrier_sense, t->nt);
         tf_thread_matvec(m->logits, t->head, m->xb, t->head_rows,
                          t->tid, t->nt);
+        if (m->lm_head_best_idx && m->lm_head_best_val) {
+            int groups = t->head_rows / 8;
+            int r0 = (groups * t->tid / t->nt) * 8;
+            int r1 = (groups * (t->tid + 1) / t->nt) * 8;
+            int best = r0;
+            for (int r = r0 + 1; r < r1; r++)
+                if (m->logits[r] > m->logits[best]) best = r;
+            m->lm_head_best_idx[t->tid] = best;
+            m->lm_head_best_val[t->tid] = r1 > r0 ? m->logits[best] : -INFINITY;
+        }
     }
     return NULL;
 }
@@ -10232,6 +10243,20 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
                 pt_out - pt_attn, pt_ffn - pt_out, end - pt_ffn, end - pt0);
     }
     return m->logits;
+}
+
+int transformer_nextn_local_argmax(const transformer_model *m, float *value) {
+    if (!m || !m->lm_head_best_idx || !m->lm_head_best_val || m->n_threads < 1)
+        return -1;
+    int best = m->lm_head_best_idx[0];
+    float bv = m->lm_head_best_val[0];
+    for (int t = 1; t < m->n_threads; t++) {
+        float v = m->lm_head_best_val[t];
+        int i = m->lm_head_best_idx[t];
+        if (v > bv || (v == bv && i < best)) { bv = v; best = i; }
+    }
+    if (value) *value = bv;
+    return best;
 }
 
 float *transformer_forward_partial(transformer_model *m, int cache_pos,

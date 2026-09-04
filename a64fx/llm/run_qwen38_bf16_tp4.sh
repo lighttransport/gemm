@@ -71,6 +71,10 @@ if [ "$MODE" = mtp-sustained ]; then
     # RoPE by head, avoiding the formerly serial preparation between pools.
     export TF_NEXTN_QKV_PERSIST=${TF_NEXTN_QKV_PERSIST:-1}
     export TF_BF16PV_PREFETCH_NEXTN=${TF_BF16PV_PREFETCH_NEXTN:-8}
+    # Each persistent head worker scans only the rows it just produced, then
+    # the caller folds the 48 cached winners before the unchanged TP argmax.
+    # This preserves CMG ownership and avoids a second serial vocabulary scan.
+    export TF_NEXTN_LOCAL_ARGMAX=${TF_NEXTN_LOCAL_ARGMAX:-1}
 fi
 export NUMA_DISTRIBUTE=${NUMA_DISTRIBUTE:-1} NUMA_N_CMGS=${NUMA_N_CMGS:-4}
 export TP_COMM_CMG_STRICT=${TP_COMM_CMG_STRICT:-1}
