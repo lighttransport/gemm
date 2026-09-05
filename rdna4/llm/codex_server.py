@@ -35,6 +35,32 @@ def content_text(content):
     return ""
 
 
+def responses_input_messages(value):
+    """Normalize Responses input message objects and direct content items."""
+    if isinstance(value, str):
+        return [{"role": "user", "content": value}]
+    if isinstance(value, dict):
+        return [{"role": value.get("role", "user"),
+                 "content": value.get("content", value.get("text", ""))}]
+    if not isinstance(value, list):
+        return []
+    messages = []
+    direct = []
+    for item in value:
+        if isinstance(item, dict) and item.get("role"):
+            messages.append(item)
+        elif isinstance(item, dict) and "content" in item:
+            # Be liberal with message-shaped Responses items that omit role;
+            # treating them as user content is safer than silently dropping
+            # the actual request and answering only the system prompt.
+            messages.append({"role": "user", "content": item["content"]})
+        elif isinstance(item, dict) and item.get("type") in ("input_text", "output_text", "text"):
+            direct.append(item)
+    if direct:
+        messages.append({"role": "user", "content": direct})
+    return messages
+
+
 def chat_prompt(messages):
     # Stable ChatML-like framing gives the backend an exact token prefix to
     # reuse when an agent resends its prior conversation plus one new turn.
@@ -209,8 +235,7 @@ class Handler(BaseHTTPRequestHandler):
                 messages = []
                 if req.get("instructions"): messages.append({"role": "system", "content": req["instructions"]})
                 inp = req.get("input", "")
-                if isinstance(inp, str): messages.append({"role": "user", "content": inp})
-                else: messages.extend(inp)
+                messages.extend(responses_input_messages(inp))
             else:
                 messages = req.get("messages", [])
             limit = min(int(req.get("max_tokens", req.get("max_output_tokens", self.max_tokens))), self.max_tokens)
@@ -251,8 +276,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
+                # This shim buffers one complete inference before emitting the
+                # event sequence.  Explicitly terminate the SSE response so
+                # clients that use EOF as the stream boundary (including
+                # Codex) do not wait forever after response.completed.
+                self.send_header("Connection", "close")
                 self.end_headers()
+                self.close_connection = True
                 if api_path == "/v1/responses":
                     response_id = "resp-" + uuid.uuid4().hex
                     item_id = response_id + "-item"
@@ -275,7 +305,11 @@ class Handler(BaseHTTPRequestHandler):
                               ("response.output_text.delta", delta_obj), ("response.output_text.done", text_done_obj),
                               ("response.content_part.done", part_done_obj), ("response.output_item.done", item_done_obj),
                               ("response.completed", done_obj))
-                    for event, obj in events:
+                    for sequence_number, (event, obj) in enumerate(events):
+                        # Responses stream consumers use this to order and
+                        # validate events.  In particular, Codex silently
+                        # discards otherwise well-formed events without it.
+                        obj = {**obj, "sequence_number": sequence_number}
                         self.wfile.write(("event: " + event + "\ndata: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
                 else:
                     if text:
