@@ -72,3 +72,23 @@ BF16 dot-product, and context-partition smoke checks. This demonstrates a
 coherent compilable output with a formatting violation; it is not exhaustive
 verification of all generated numerical primitives or requested bug fixes.
 Raw output, extracted header and harness are in the same shared log directory.
+
+## SVE unpacking follow-up (job 51370956)
+
+Replace two TBL lookups and OR with SPLICE to concatenate low/high nibble
+vectors. This preserves byte values and arithmetic ordering. The 300-case
+reference test passes; two full 128-token runs reproduce every baseline token
+ID and printed logit exactly.
+
+An optional kernel benchmark is enabled with `GLM53F_KQUANT_BENCH=1` on the
+test executable. It streams 8,192 rows of 4,096 weights with 47 OpenMP threads.
+In baseline/candidate/candidate/baseline order, Q4 throughput was
+196.054 / 210.449 / 206.617 / 196.163 Gweights/s. Q5 was essentially unchanged:
+173.322 / 170.715 / 174.040 / 174.040 Gweights/s.
+
+Full decode: baseline 23.011 tok/s, candidate 20.447 and 22.663 tok/s.
+The repeat profile has FFN 15.771 ms versus baseline 15.811 ms; attention
+21.321 versus 20.549 ms. Thus the isolated Q4 gain is 6–7%, but these runs
+do not establish an end-to-end speedup. Long-context performance has not been
+remeasured for SPLICE. Logs use `before-splice`, `after-splice`, and
+`after-splice-repeat` in the job's shared log directory.

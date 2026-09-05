@@ -51,5 +51,40 @@ int main(void) {
         }
     }
     printf("PASS K-quants cases=300 worst_normalized_error=%g\n", worst);
+    if (getenv("GLM53F_KQUANT_BENCH")) {
+        enum { ROWS = 8192, COLS = 4096, REPS = 20 };
+        float *out = malloc(ROWS * sizeof(float));
+        if (!out) return 2;
+        for (int type = GLM53F_GGML_Q4_K; type <= GLM53F_GGML_Q5_K; ++type) {
+            size_t rb = dequant_row_size(type, COLS);
+            unsigned char *matrix = malloc(ROWS * rb);
+            if (!matrix) return 2;
+            /* A repeated finite block exercises the real row stride and HBM
+             * footprint without allowing the compiler to fold the dot. */
+            memset(weights, 0x55, sizeof(weights));
+            for (int b = 0; b < COLS / 256; ++b) {
+                if (type == GLM53F_GGML_Q4_K) {
+                    ((block_q4_K *)weights)[b].d = ggml_fp32_to_fp16(0.01f);
+                    ((block_q4_K *)weights)[b].dmin = ggml_fp32_to_fp16(0.005f);
+                } else {
+                    ((block_q5_K *)weights)[b].d = ggml_fp32_to_fp16(0.01f);
+                    ((block_q5_K *)weights)[b].dmin = ggml_fp32_to_fp16(0.005f);
+                }
+            }
+#pragma omp parallel for schedule(static)
+            for (int r = 0; r < ROWS; ++r) memcpy(matrix + r * rb, weights, rb);
+            double start = omp_get_wtime();
+            for (int rep = 0; rep < REPS; ++rep) {
+#pragma omp parallel for schedule(static)
+                for (int r = 0; r < ROWS; ++r)
+                    out[r] = iq_row(type, matrix + r * rb, xq, COLS / 256);
+            }
+            double seconds = omp_get_wtime() - start;
+            printf("BENCH type=%d Gweights_s=%.3f check=%.9g\n", type,
+                   (double)ROWS * COLS * REPS / seconds / 1e9, out[ROWS-1]);
+            free(matrix);
+        }
+        free(out);
+    }
     return 0;
 }

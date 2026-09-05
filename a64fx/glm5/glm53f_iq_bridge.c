@@ -52,13 +52,6 @@ static float q5_k_q8_row(const block_q5_K *w,
     const svbool_t p32 = svptrue_b32();
     const svbool_t p32bytes = svwhilelt_b8(0, 32);
     const svbool_t lo8 = svwhilelt_b32(0, 8);
-    static const uint8_t idx0[64] = {
-        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
-        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255};
-    static const uint8_t idx1[64] = {
-        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
-    const svuint8_t vi0=svld1_u8(p8,idx0), vi1=svld1_u8(p8,idx1);
     const svint8_t ones = svdup_s8(1);
     svfloat32_t acc = svdup_f32(0.0f);
     for (int b = 0; b < blocks; ++b) {
@@ -79,8 +72,7 @@ static float q5_k_q8_row(const block_q5_K *w,
                 svand_n_u8_x(p8, high, bit0), 0), svdup_u8(16), svdup_u8(0)));
             uq1 = svadd_u8_x(p8, uq1, svsel_u8(svcmpne_n_u8(p32bytes,
                 svand_n_u8_x(p8, high, bit1), 0), svdup_u8(16), svdup_u8(0)));
-            const svint8_t qv = svreinterpret_s8_u8(svorr_u8_x(p8,
-                svtbl_u8(uq0,vi0), svtbl_u8(uq1,vi1)));
+            const svint8_t qv = svreinterpret_s8_u8(svsplice_u8(p32bytes, uq0, uq1));
             const svint8_t xv = svld1_s8(p8, x[b].q + g);
             const svint32_t dot = svdot_s32(svdup_s32(0),qv,xv);
             const svint32_t sx = svdot_s32(svdup_s32(0),ones,xv);
@@ -105,13 +97,6 @@ static float q4_k_q8_row(const block_q4_K *w,
     const svint8_t ones = svdup_s8(1);
     const svbool_t p32bytes = svwhilelt_b8(0, 32);
     const svbool_t lo8 = svwhilelt_b32(0, 8);
-    static const uint8_t idx0[64] = {
-        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
-        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255};
-    static const uint8_t idx1[64] = {
-        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
-    const svuint8_t vi0=svld1_u8(p8,idx0), vi1=svld1_u8(p8,idx1);
     svfloat32_t acc = svdup_f32(0.0f);
     for (int b = 0; b < blocks; ++b) {
         const float d = ggml_fp16_to_fp32(w[b].d);
@@ -128,7 +113,7 @@ static float q4_k_q8_row(const block_q4_K *w,
                 svand_n_u8_x(p8, packed, 15));
             const svint8_t q1 = svreinterpret_s8_u8(
                 svlsr_n_u8_x(p8, packed, 4));
-            const svint8_t qv=svorr_s8_x(p8,svtbl_s8(q0,vi0),svtbl_s8(q1,vi1));
+            const svint8_t qv = svsplice_s8(p32bytes, q0, q1);
             const svint8_t xv=svld1_s8(p8,x[b].q+g);
             const svint32_t dot=svdot_s32(svdup_s32(0),qv,xv);
             const svint32_t sx=svdot_s32(svdup_s32(0),ones,xv);
