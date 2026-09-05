@@ -74,3 +74,33 @@ single-token IQ evaluation per position because independently routed experts
 rarely overlap.  Reaching 30 tok/s requires a structural attention reduction
 (for example channel-level KDA partitioning) or a genuine multi-token IQ MoE
 verifier; compiler flags and output-row batching have been exhausted.
+
+## Long-context sparse decode (job 51351748, 2026-09-05)
+
+The sparse MLA path now follows the incremental pooling strategy from
+llama.cpp PR 27754: each completed four-token index key is compressed once,
+instead of recompressing the complete prefix on every decode step. Above the
+2,048-token selection budget, pool scoring is divided across 12 ranks and
+exchanged with the FP32 uTofu all-reduce. An exact bounded heap retains the top
+512 pools, and selected latent rows are packed contiguously before MLA.
+
+Each rank owns only five or six MLA heads. The long-context kernel now uses
+eight contiguous token shards per local head inside one OpenMP team, then
+reduces the partial value vectors in a fixed order. A 128-token greedy run
+after an 8,378-token prompt produced stable windows of **20.199** and
+**20.251 tok/s**, **20.226 tok/s** overall decode, and the same 128 token IDs
+as the full-sort control. Decode-only phase averages were 6.020 ms MHC,
+28.199 ms attention, 14.670 ms FFN, and 1.210 ms head.
+
+Generation IDs are buffered and written once after timing; rank 0 previously
+reopened the shared-filesystem output for every token. Profiling now resets at
+the prompt/decode boundary. A longer run consumed the same 8,378-token prompt,
+generated 7,272 tokens to EOS, and averaged 19.256 tok/s while total context
+grew to 15,650 tokens.
+
+The semantic gate used `prompts/glm53f_cpp_codegen_task.md`. A coherent raw
+C++17 generation reached EOS but strict compilation found one unused helper.
+Deleting only that helper made it compile with
+`mpiFCC -Nclang -std=c++17 -O2 -Wall -Wextra -Werror -pedantic`; the ARM binary
+then passed FIFO, duplicate, cancellation, empty-payload, integer-range,
+malformed-command, and quit tests with an exact output diff.

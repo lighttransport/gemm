@@ -415,38 +415,96 @@ void glm53f_target_model_free_12n(glm53f_target_model_12n *m) {
 }
 
 #ifndef GLM53F_TARGET_MODEL_NO_MAIN
+static int read_token_ids(const char *path, int **ids_out, int *count_out) {
+    FILE *f = fopen(path, "r");
+    int *ids = NULL, cap = 0, n = 0, id;
+    if (!f) return -1;
+    while (fscanf(f, "%d", &id) == 1) {
+        if (id < 0 || id >= 154880) { free(ids); fclose(f); return -1; }
+        if (n == cap) {
+            int next_cap = cap ? cap * 2 : 4096;
+            int *next = (int *)realloc(ids, (size_t)next_cap * sizeof(*ids));
+            if (!next) { free(ids); fclose(f); return -1; }
+            ids = next;
+            cap = next_cap;
+        }
+        ids[n++] = id;
+    }
+    if (!feof(f)) { free(ids); fclose(f); return -1; }
+    fclose(f);
+    if (!n) { free(ids); return -1; }
+    *ids_out = ids;
+    *count_out = n;
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    int rank, ranks, token, steps;
+    int rank, ranks, token, steps, generate = 0;
+    int *prompt_ids = NULL, *generated_ids = NULL, prompt_count = 0, generated = 0;
+    const char *output_ids = NULL;
     glm53f_target_model_12n *model;
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 4 || ranks != 12) {
-        if (!rank) fprintf(stderr,"usage: %s MODEL ROUTED_STAGE SHARED_STAGE [token=1] [steps=1]\n",argv[0]);
+        if (!rank) fprintf(stderr,"usage: %s MODEL ROUTED_STAGE SHARED_STAGE [token=1] [steps=1]\n       %s MODEL ROUTED_STAGE SHARED_STAGE --generate PROMPT_IDS OUTPUT_IDS MAX_NEW\n",argv[0],argv[0]);
         MPI_Abort(MPI_COMM_WORLD,2);
     }
-    token=argc>4?atoi(argv[4]):1;steps=argc>5?atoi(argv[5]):1;
-    if(token<0||token>=154880||steps<1||steps>128)MPI_Abort(MPI_COMM_WORLD,2);
+    generate = argc == 8 && !strcmp(argv[4], "--generate");
+    if (generate) {
+        if (read_token_ids(argv[5], &prompt_ids, &prompt_count)) {
+            if (!rank) { fprintf(stderr, "cannot read prompt token IDs: %s\n", argv[5]); fflush(stderr); }
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        }
+        output_ids = argv[6];
+        steps = atoi(argv[7]);
+        if (steps < 1 || steps > 8192) MPI_Abort(MPI_COMM_WORLD, 2);
+        if (!rank && !(generated_ids = malloc((size_t)steps * sizeof(*generated_ids))))
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        token = prompt_ids[0];
+    } else {
+        token=argc>4?atoi(argv[4]):1;steps=argc>5?atoi(argv[5]):1;
+        if(token<0||token>=154880||steps<1||steps>128)MPI_Abort(MPI_COMM_WORLD,2);
+    }
     int capacity=getenv("GLM53F_CAPACITY")?atoi(getenv("GLM53F_CAPACITY")):steps;
+    if (generate && capacity < prompt_count + steps) capacity = prompt_count + steps;
     if(capacity<steps)MPI_Abort(MPI_COMM_WORLD,2);
     if(getenv("GLM53F_UTOFU")){const char*topo=getenv("TOFU_TOPO_PATH");if(!topo)topo="../utofu-tests/tofu_topo.txt";if(glm53f_collective_init_12n(topo,5*HIDDEN))MPI_Abort(MPI_COMM_WORLD,2);}
     model=glm53f_target_model_create_12n(argv[1],argv[2],argv[3],capacity);
     if(!model)MPI_Abort(MPI_COMM_WORLD,2);
     glm53f_target_profile_reset_12n(model);
-    MPI_Barrier(MPI_COMM_WORLD);double begin=MPI_Wtime();
-    for(int step=0;step<steps;step++){
+    MPI_Barrier(MPI_COMM_WORLD);double begin=MPI_Wtime(),prompt_elapsed=0.0,decode_elapsed=0.0,window_begin=begin;
+    int total_steps = generate ? prompt_count + steps - 1 : steps;
+    int completed_steps = 0;
+    for(int step=0;step<total_steps;step++){
+        double step_begin=MPI_Wtime();
+        if(generate&&step==prompt_count-1){window_begin=step_begin;glm53f_target_profile_reset_12n(model);}
         float value;
         if(glm53f_target_model_step_12n(model,token,&token,&value,NULL))MPI_Abort(MPI_COMM_WORLD,2);
-        if(!rank)printf("GLM53F_TARGET_TOKEN step=%d token=%d logit=%.9g\n",step,token,value);
+        double step_elapsed=MPI_Wtime()-step_begin;
+        if(generate&&step<prompt_count-1)prompt_elapsed+=step_elapsed;else decode_elapsed+=step_elapsed;
+        completed_steps++;
+        if (generate && step >= prompt_count - 1) {
+            if (!rank) {
+                generated_ids[generated] = token;
+            }
+            generated++;
+            if(!rank&&generated%64==0){double now=MPI_Wtime();printf("GLM53F_TARGET_DECODE_WINDOW end=%d tok_s=%.3f\n",generated,64.0/(now-window_begin));fflush(stdout);window_begin=now;}
+        }
+        if (!generate && !rank) printf("GLM53F_TARGET_TOKEN step=%d token=%d logit=%.9g\n",step,token,value);
+        if(generate&&step>=prompt_count-1&&(token==154820||token==154827||token==154829))break;
+        if (generate && step + 1 < prompt_count) token = prompt_ids[step + 1];
     }
     double elapsed=MPI_Wtime()-begin,max_elapsed;MPI_Reduce(&elapsed,&max_elapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     if(!rank){
-        printf("GLM53F_TARGET_DECODE_12N steps=%d capacity=%d ms_tok=%.3f tok_s=%.3f final_token=%d PASS\n",steps,capacity,max_elapsed*1e3/steps,steps/max_elapsed,token);
+        if(generate){FILE*f=fopen(output_ids,"w");if(!f)MPI_Abort(MPI_COMM_WORLD,2);for(int i=0;i<generated;i++)fprintf(f,"%d%c",generated_ids[i],i+1==generated?'\n':' ');fclose(f);}
+        printf("GLM53F_TARGET_%s_12N steps=%d generated=%d capacity=%d ms_tok=%.3f tok_s=%.3f final_token=%d PASS\n",generate ? "GENERATE" : "DECODE",completed_steps,generate?generated:steps,capacity,max_elapsed*1e3/completed_steps,completed_steps/max_elapsed,token);
+        if(generate){printf("GLM53F_TARGET_TIMING prompt_tokens=%d prompt_tok_s=%.3f decode_tokens=%d decode_tok_s=%.3f\n",prompt_count-1,(prompt_count-1)/(prompt_elapsed?prompt_elapsed:1.0),generated,generated/(decode_elapsed?decode_elapsed:1.0));}
         const char *report=getenv("GLM53F_TARGET_REPORT");
         if(report&&*report){FILE *rf=fopen(report,"w");if(rf){fprintf(rf,"GLM53F_TARGET_DECODE_12N steps=%d capacity=%d ms_tok=%.3f tok_s=%.3f final_token=%d PASS\n",steps,capacity,max_elapsed*1e3/steps,steps/max_elapsed,token);fclose(rf);}}
     }
     glm53f_target_profile_report_12n(model,"decode");
-    glm53f_target_model_free_12n(model);glm53f_collective_free_12n();
+    glm53f_target_model_free_12n(model);glm53f_collective_free_12n();free(generated_ids);free(prompt_ids);
     MPI_Finalize();return 0;
 }
 #endif
