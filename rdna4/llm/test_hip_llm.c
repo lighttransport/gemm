@@ -64,7 +64,7 @@ static float rel_l2_error(const float *a, const float *b, int n) {
 /* Qwen3.8-Next non-thinking/Instruct defaults from the model card.  Keeping
  * only top-k candidates makes sampling O(vocab*k), with no full-vocab sort. */
 static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
-                          float temperature, float presence_penalty,
+                          float temperature, float presence_penalty, float min_p,
                           const unsigned char *seen, const unsigned short *counts,
                           const int32_t *history, int history_n, int history_start,
                           unsigned *rng) {
@@ -103,6 +103,10 @@ static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
     if (ids[0] < 0) return 0;
     while (top_k > 1 && ids[top_k - 1] < 0) --top_k;
     if (temperature <= 0.0f || top_k == 1) return ids[0];
+    if (min_p > 0.0f) {
+        float cutoff = vals[0] + logf(min_p);
+        while (top_k > 1 && vals[top_k - 1] < cutoff) --top_k;
+    }
     float sum = 0.0f;
     for (int j = 0; j < top_k; ++j) {
         vals[j] = expf((vals[j] - vals[0]) / temperature);
@@ -200,7 +204,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
     while (fgets(line, sizeof(line), stdin)) {
         g_stdio_cancel = 0;
         int max_tokens = 16, top_k = 20;
-        float temperature = 0.2f, top_p = 0.95f, presence = 0.0f;
+        float temperature = 0.2f, top_p = 0.95f, presence = 0.0f, min_p = 0.0f;
         char *b64 = NULL, *prefix_b64 = NULL;
         static char b64buf[sizeof(line)];
         static char prefix_b64buf[sizeof(line)];
@@ -209,17 +213,23 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                    &top_p, &top_k, &presence) != 5) {
             puts("ERR invalid request"); fflush(stdout); continue;
         }
-        int fields = sscanf(line + 4, "%d %f %f %d %f %4194303s %4194303s", &max_tokens,
+        int fields = sscanf(line + 4, "%d %f %f %d %f %f %4194303s %4194303s", &max_tokens,
+                            &temperature, &top_p, &top_k, &presence,
+                            &min_p, prefix_b64buf, b64buf);
+        if (fields != 8) {
+            min_p = 0.0f;
+            fields = sscanf(line + 4, "%d %f %f %d %f %4194303s %4194303s", &max_tokens,
                             &temperature, &top_p, &top_k, &presence,
                             prefix_b64buf, b64buf);
-        if (fields != 7) {
+        }
+        if (fields != 8 && fields != 7) {
             fields = sscanf(line + 4, "%d %f %f %d %f %4194303s", &max_tokens,
                             &temperature, &top_p, &top_k, &presence, b64buf);
         }
-        if (fields != 7 && fields != 6) {
+        if (fields != 8 && fields != 7 && fields != 6) {
             puts("ERR missing prompt"); fflush(stdout); continue;
         }
-        prefix_b64 = fields == 7 ? prefix_b64buf : NULL;
+        prefix_b64 = fields >= 7 ? prefix_b64buf : NULL;
         b64 = b64buf;
         size_t prompt_n = 0;
         unsigned char *prompt = b64_decode(b64, &prompt_n);
@@ -365,7 +375,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         for (int k = 0; logits && k < max_tokens; k++) {
             if (g_stdio_cancel) { cancelled = 1; break; }
             int next = (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
-                sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence,
+                sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence, min_p,
                                seen, counts, cache, cache_n, n_tokens, &rng);
             int is_stop = next == eos || next == eot || next == im_end;
             const char *piece = bpe_token_to_str(vocab, next);
@@ -960,7 +970,7 @@ int main(int argc, char **argv) {
         if (seen) for (int i = 0; i < n_prefill; ++i)
             if (tokens[i] >= 0 && tokens[i] < n_vocab) seen[tokens[i]] = 1;
         int next_tok = coding_mode ? sample_top_k_p(last_logits, n_vocab, 20, 0.80f,
-                                                    0.70f, 1.50f, seen, counts,
+                                                    0.70f, 1.50f, 0.0f, seen, counts,
                                                     NULL, 0, 0, &sample_rng)
                                    : argmax_logits(last_logits, n_vocab);
         double t_pf1 = get_time_ms();
@@ -987,7 +997,7 @@ int main(int argc, char **argv) {
                 if (seen && next_tok >= 0 && next_tok < n_vocab) seen[next_tok] = 1;
                 if (counts && next_tok >= 0 && next_tok < n_vocab && counts[next_tok] != 0xffffu) counts[next_tok]++;
                 next_tok = coding_mode ? sample_top_k_p(lg, n_vocab, 20, 0.80f,
-                                                        0.70f, 1.50f, seen, counts,
+                                                        0.70f, 1.50f, 0.0f, seen, counts,
                                                         NULL, 0, 0, &sample_rng)
                                        : argmax_logits(lg, n_vocab);
                 decoded++;

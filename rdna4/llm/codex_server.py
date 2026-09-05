@@ -69,9 +69,9 @@ def chat_prompt(messages):
         role = m.get("role", "user")
         text = content_text(m.get("content", ""))
         out.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
-    # This checkpoint's non-thinking form closes the optional reasoning block
-    # before answer tokens.  Leaving it open exposes the model's work plan as
-    # assistant output even for a simple user message.
+    # Qwen3.8 Flash Next thinks by default.  Match llama.cpp's explicit
+    # non-thinking mode by placing an empty reasoning block before the final
+    # answer; otherwise <think> content leaks into the Responses text.
     out.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
     return "".join(out)
 
@@ -129,10 +129,10 @@ class Backend:
             except ProcessLookupError:
                 pass
 
-    def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, prefix=""):
+    def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, min_p, prefix=""):
         prefix_payload = base64.b64encode(prefix.encode("utf-8")).decode("ascii") if prefix else "-"
         payload = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
-        line = f"REQ {max_tokens} {temperature} {top_p} {top_k} {presence} {prefix_payload} {payload}\n"
+        line = f"REQ {max_tokens} {temperature} {top_p} {top_k} {presence} {min_p} {prefix_payload} {payload}\n"
         with self.lock:
             if self.proc.poll() is not None:
                 raise RuntimeError("runner exited")
@@ -252,17 +252,22 @@ class Handler(BaseHTTPRequestHandler):
             # old coding defaults (T=0.7, presence=1.5) could turn a simple
             # confirmation into repeated fragments even though the request
             # and transport completed successfully.
-            temp = float(req.get("temperature", 0.05 if self.coding else 0.2))
-            top_p = float(req.get("top_p", 1.0 if self.coding else 0.95))
-            top_k = int(req.get("top_k", 1 if self.coding else 20))
-            presence = float(req.get("presence_penalty", 0.0))
+            # Match the Qwen3.8/Coder-Next llama.cpp profile. Greedy decoding
+            # falls into long repeated planning text on Codex's agent prompt.
+            default_temp, default_top_p, default_top_k, default_presence = (
+                (1.0, 0.95, 40, 0.0) if self.coding else (0.2, 0.95, 20, 0.0))
+            temp = float(req.get("temperature", default_temp))
+            top_p = float(req.get("top_p", default_top_p))
+            top_k = int(req.get("top_k", default_top_k))
+            presence = float(req.get("presence_penalty", default_presence))
+            min_p = float(req.get("min_p", 0.01 if self.coding else 0.0))
             stop_watcher = threading.Event()
             cancelled = threading.Event()
             watcher = threading.Thread(target=self._watch_disconnect,
                                        args=(stop_watcher, cancelled), daemon=True)
             watcher.start()
             try:
-                text, cached, ptok, ctok, finish = self.backend.generate(prompt, limit, temp, top_p, top_k, presence, prefix)
+                text, cached, ptok, ctok, finish = self.backend.generate(prompt, limit, temp, top_p, top_k, presence, min_p, prefix)
             finally:
                 stop_watcher.set()
                 watcher.join(timeout=0.2)
