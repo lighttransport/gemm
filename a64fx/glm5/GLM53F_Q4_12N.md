@@ -92,3 +92,22 @@ The repeat profile has FFN 15.771 ms versus baseline 15.811 ms; attention
 do not establish an end-to-end speedup. Long-context performance has not been
 remeasured for SPLICE. Logs use `before-splice`, `after-splice`, and
 `after-splice-repeat` in the job's shared log directory.
+
+## Remove idle KDA team barriers (job 51370956)
+
+Detailed-profiling singles previously imposed five barriers per KDA layer
+even with profiling disabled. The uniform profiling condition now surrounds
+each single construct. Eight-row matvec helpers also skip remainder
+worksharing when no remainder exists, retaining the producer-loop barrier.
+Arithmetic and dependent-loop synchronization are unchanged.
+
+Short-context 128-token decode measured 23.407 tok/s, attention 19.910 ms,
+and reproduced all baseline token IDs and printed logits exactly.
+
+After the same 8,378-token prompt, the two 64-token decode windows measured
+**20.069 and 20.123 tok/s**, **20.096 tok/s** overall for 128 output tokens.
+All 128 IDs match the prefix of `candidate8k.ids` exactly. Phase averages:
+MHC 6.502 ms, attention 27.312 ms, FFN 15.601 ms, head 1.226 ms.
+This clears 20 tok/s for the measured 128-token sample; sustained multi-thousand
+token throughput has not been remeasured. Logs: `kda-barriers.*` and
+`kda-barriers8k.*`; output: `kda-barriers8k.ids` in the shared job directory.
