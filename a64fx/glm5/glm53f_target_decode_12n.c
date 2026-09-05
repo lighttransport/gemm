@@ -484,6 +484,11 @@ int main(int argc, char **argv) {
         double step_elapsed=MPI_Wtime()-step_begin;
         if(generate&&step<prompt_count-1)prompt_elapsed+=step_elapsed;else decode_elapsed+=step_elapsed;
         completed_steps++;
+        if (generate && !rank && step < prompt_count - 1 && (step + 1) % 512 == 0) {
+            printf("GLM53F_TARGET_PROMPT completed=%d total=%d tok_s=%.3f\n",
+                   step + 1, prompt_count - 1, (step + 1) / prompt_elapsed);
+            fflush(stdout);
+        }
         if (generate && step >= prompt_count - 1) {
             if (!rank) {
                 generated_ids[generated] = token;

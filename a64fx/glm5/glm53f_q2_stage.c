@@ -68,7 +68,8 @@ static tensor_ref find_tensor(gguf_context *g, const char *name) {
 }
 
 static int supported_iq(uint32_t t) {
-    return t == GGML_TYPE_IQ2_XS || t == GGML_TYPE_IQ3_XXS ||
+    return t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K ||
+           t == GGML_TYPE_IQ2_XS || t == GGML_TYPE_IQ3_XXS ||
            t == GGML_TYPE_IQ4_XS;
 }
 
@@ -222,6 +223,23 @@ int main(int argc, char **argv) {
         tensor_ref up = find_tensor(g, name);
         snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", layer);
         tensor_ref down = find_tensor(g, name);
+        if (rank == 0) {
+            fprintf(stderr, "GLM53F_STAGE_TYPES gate=%s/%u[%" PRIu64 ",%" PRIu64 ",%" PRIu64
+                    "] up=%s/%u[%" PRIu64 ",%" PRIu64 ",%" PRIu64 "] down=%s/%u[%" PRIu64
+                    ",%" PRIu64 ",%" PRIu64 "]\n",
+                    gate.ti ? ggml_type_name(gate.ti->type) : "missing",
+                    gate.ti ? gate.ti->n_dims : 0,
+                    gate.ti ? gate.ti->dims[0] : 0, gate.ti ? gate.ti->dims[1] : 0,
+                    gate.ti ? gate.ti->dims[2] : 0,
+                    up.ti ? ggml_type_name(up.ti->type) : "missing",
+                    up.ti ? up.ti->n_dims : 0,
+                    up.ti ? up.ti->dims[0] : 0, up.ti ? up.ti->dims[1] : 0,
+                    up.ti ? up.ti->dims[2] : 0,
+                    down.ti ? ggml_type_name(down.ti->type) : "missing",
+                    down.ti ? down.ti->n_dims : 0,
+                    down.ti ? down.ti->dims[0] : 0, down.ti ? down.ti->dims[1] : 0,
+                    down.ti ? down.ti->dims[2] : 0);
+        }
         if (!gate.ti || !up.ti || !down.ti || !supported_iq(gate.ti->type) ||
             !supported_iq(up.ti->type) || !supported_iq(down.ti->type) ||
             gate.ti->n_dims != 3 || down.ti->n_dims != 3 ||
