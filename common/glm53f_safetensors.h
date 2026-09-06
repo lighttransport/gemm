@@ -51,6 +51,11 @@ int glm53f_st_expect(const glm53f_st_context *ctx, const char *name,
 /* Read a bounded tensor slice without mapping the shard payload. */
 int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
                    size_t offset, void *dst, size_t nbytes);
+/* Pack the same contiguous column interval from every row of a 2-D tensor.
+ * The shard is opened once, avoiding thousands of open/close pairs. */
+int glm53f_st_read_columns(const glm53f_st_context *ctx, const char *name,
+                           size_t row_bytes, size_t column_offset,
+                           size_t column_bytes, void *dst);
 
 #ifdef GLM53F_SAFETENSORS_IMPLEMENTATION
 
@@ -60,6 +65,107 @@ int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static char *glm53f_st_dup(const char *s);
+
+typedef struct {
+    char kind;
+    char *name;
+    size_t a, b, c;
+    uint64_t blob_offset;
+} glm53f_st_repack_entry;
+
+/* Cached per-process view of a rank-local compact core blob. */
+static int glm53f_st_repack_read(const char *kind, const char *name,
+                                 size_t a, size_t b, size_t c,
+                                 void *dst, size_t nbytes) {
+    static int initialized, fd = -1, strict;
+    static glm53f_st_repack_entry *entries;
+    static int nentries;
+    const char *dir = getenv("GLM53F_REPACK_DIR");
+    if (!dir || !*dir) return 1;
+    if (!initialized) {
+        char manifest[4096], blob[4096], line[8192], parsed_name[512];
+        const char *rank_s = getenv("PMIX_RANK");
+        int rank = 0;
+        FILE *f;
+        if (!rank_s || !*rank_s) rank_s = getenv("PJM_MPI_RANK");
+        if (!rank_s || !*rank_s) rank_s = getenv("OMPI_COMM_WORLD_RANK");
+        if (rank_s && *rank_s) rank = atoi(rank_s);
+        const char *require = getenv("GLM53F_REPACK_REQUIRE");
+        strict = require && atoi(require) != 0;
+        if (snprintf(manifest, sizeof(manifest), "%s/rank%02d.core.manifest", dir, rank) >= (int)sizeof(manifest) ||
+            snprintf(blob, sizeof(blob), "%s/rank%02d.core.blob", dir, rank) >= (int)sizeof(blob) ||
+            !(f = fopen(manifest, "r"))) {
+            if (strict) fprintf(stderr, "GLM53F_REPACK_OPEN_FAIL rank=%d dir=%s\n", rank, dir);
+            initialized = 1; return strict ? -1 : 1;
+        }
+        while (fgets(line, sizeof(line), f)) {
+            glm53f_st_repack_entry e = {0};
+            unsigned long long off;
+            int got;
+            if (line[0] == '#') continue;
+            got = sscanf(line, "%c %511s %zu %zu %zu %llu", &e.kind, parsed_name,
+                         &e.a, &e.b, &e.c, &off);
+            if ((e.kind == 'R' && got == 5) || (e.kind == 'C' && got == 6)) {
+                if (e.kind == 'R') { e.blob_offset = e.c; e.c = 0; }
+                else e.blob_offset = off;
+                e.name = glm53f_st_dup(parsed_name);
+                if (!e.name) break;
+                glm53f_st_repack_entry *p = realloc(entries, (size_t)(nentries + 1) * sizeof(*entries));
+                if (!p) { free(e.name); break; }
+                entries = p; entries[nentries++] = e;
+            }
+        }
+        fclose(f);
+        fd = open(blob, O_RDONLY);
+        initialized = 1;
+        if (fd < 0) {
+            if (strict) fprintf(stderr, "GLM53F_REPACK_BLOB_FAIL rank=%d path=%s\n", rank, blob);
+            return strict ? -1 : 1;
+        }
+    }
+    for (int i = 0; i < nentries; ++i) {
+        glm53f_st_repack_entry *e = &entries[i];
+        if (e->kind == kind[0] && e->a == a && e->b == b && e->c == c && !strcmp(e->name, name))
+            return pread(fd, dst, nbytes, (off_t)e->blob_offset) == (ssize_t)nbytes ? 0 : -1;
+    }
+    if (strict) fprintf(stderr, "GLM53F_REPACK_MISS kind=%s name=%s a=%zu b=%zu c=%zu\n",
+                        kind, name, a, b, c);
+    return strict ? -1 : 1;
+}
+
+/*
+ * A target rank reads a small, deterministic subset of the 62-file checkpoint
+ * during graph construction.  Recording that subset lets the offline A64FX
+ * repacker produce a compact rank-local core blob instead of mirroring the
+ * 306 GiB source checkpoint.  TRACE_ONLY is intentionally for construction
+ * tracing only: callers must not use its zero-filled weights for inference.
+ */
+static void glm53f_st_trace(const char *kind, const char *name,
+                            size_t a, size_t b, size_t c) {
+    const char *dir = getenv("GLM53F_REPACK_TRACE_DIR");
+    static FILE *trace;
+    static int opened;
+    char path[4096];
+    const char *rank_s;
+    int rank = 0;
+    if (!dir || !*dir) return;
+    if (!opened) {
+        rank_s = getenv("PMIX_RANK");
+        if (!rank_s || !*rank_s) rank_s = getenv("PJM_MPI_RANK");
+        if (!rank_s || !*rank_s) rank_s = getenv("OMPI_COMM_WORLD_RANK");
+        if (rank_s && *rank_s) rank = atoi(rank_s);
+        if (snprintf(path, sizeof(path), "%s/rank%02d.trace", dir, rank) >=
+            (int)sizeof(path)) return;
+        trace = fopen(path, "a");
+        opened = 1;
+    }
+    if (trace) {
+        fprintf(trace, "%s %s %zu %zu %zu\n", kind, name, a, b, c);
+        fflush(trace);
+    }
+}
 
 static char *glm53f_st_dup(const char *s) {
     size_t n = strlen(s) + 1;
@@ -197,6 +303,13 @@ int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
     const st_tensor_info *t = glm53f_st_find(ctx, name, &owner);
     int i, fd, rc = -1;
     if (!t || !owner || offset > t->nbytes || nbytes > t->nbytes - offset || !dst) return -1;
+    glm53f_st_trace("R", name, offset, nbytes, 0);
+    { int repacked = glm53f_st_repack_read("R", name, offset, nbytes, 0, dst, nbytes);
+      if (repacked <= 0) return repacked; }
+    if (getenv("GLM53F_REPACK_TRACE_ONLY")) {
+        memset(dst, 0, nbytes);
+        return 0;
+    }
     for (i = 0; i < ctx->n_shards; ++i) if (ctx->shards[i].st == owner) break;
     if (i == ctx->n_shards) return -1;
     fd = ctx->shards[i].fd;
@@ -216,6 +329,48 @@ int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
     return rc;
 }
 
+int glm53f_st_read_columns(const glm53f_st_context *ctx, const char *name,
+                           size_t row_bytes, size_t column_offset,
+                           size_t column_bytes, void *dst) {
+    const st_context *owner = NULL;
+    const st_tensor_info *t = glm53f_st_find(ctx, name, &owner);
+    char path[4096];
+    size_t rows;
+    int i, fd, rc = -1;
+    if (!t || !owner || t->n_dims != 2 || !row_bytes || !column_bytes ||
+        column_offset > row_bytes || column_bytes > row_bytes - column_offset ||
+        t->nbytes % row_bytes || !dst) return -1;
+    rows = t->nbytes / row_bytes;
+    glm53f_st_trace("C", name, row_bytes, column_offset, column_bytes);
+    { int repacked = glm53f_st_repack_read("C", name, row_bytes, column_offset,
+                                            column_bytes, dst, rows * column_bytes);
+      if (repacked <= 0) return repacked; }
+    if (getenv("GLM53F_REPACK_TRACE_ONLY")) {
+        memset(dst, 0, rows * column_bytes);
+        return 0;
+    }
+    for (i = 0; i < ctx->n_shards; ++i) if (ctx->shards[i].st == owner) break;
+    if (i == ctx->n_shards || snprintf(path, sizeof(path), "%s/%s", ctx->model_dir,
+                                        ctx->shards[i].name) >= (int)sizeof(path)) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    for (size_t row = 0; row < rows; ++row) {
+        off_t offset = (off_t)(owner->data_offset + t->offset + row * row_bytes +
+                               column_offset);
+        if (pread(fd, (unsigned char *)dst + row * column_bytes,
+                  column_bytes, offset) != (ssize_t)column_bytes) goto done;
+    }
+    rc = 0;
+#if defined(POSIX_FADV_DONTNEED)
+    if (!getenv("GLM53F_STAGE_KEEPCACHE"))
+        posix_fadvise(fd, (off_t)(owner->data_offset + t->offset),
+                      (off_t)t->nbytes, POSIX_FADV_DONTNEED);
+#endif
+done:
+    close(fd);
+    return rc;
+}
+
 int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose) {
     const char *required[] = {
         "model.language_model.embed_tokens.weight",
@@ -223,7 +378,9 @@ int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose) {
         "lm_head.weight",
         "model.language_model.layers.0.input_layernorm.weight",
         "model.language_model.layers.3.self_attn.indexer.k_norm.weight",
-        "model.language_model.layers.3.mlp.gate.weight"
+        "model.language_model.layers.3.mlp.gate.weight",
+        "model.language_model.layers.44.hc_attn_fn",
+        "model.language_model.layers.44.hc_ffn_fn"
     };
     int i, missing = 0, layers = 0, experts = 0, shape_errors = 0;
     char name[128];
@@ -266,6 +423,14 @@ int glm53f_st_validate_contract(const glm53f_st_context *ctx, int verbose) {
     }
     if (verbose) fprintf(stderr, "glm53f_st: entries=%d shards=%d layers=%d moe_layers=%d\n",
                          ctx ? ctx->n_entries : 0, ctx ? ctx->n_shards : 0, layers, experts);
+    /* Layer 45 is the single-stream MTP block. Unlike target layers 0..44 it
+     * deliberately has no learned mHC sites; treating it as four-stream would
+     * silently change draft logits and acceptance. */
+    if (ctx && (glm53f_st_find(ctx, "model.language_model.layers.45.hc_attn_fn", NULL) ||
+                glm53f_st_find(ctx, "model.language_model.layers.45.hc_ffn_fn", NULL))) {
+        shape_errors++;
+        if (verbose) fprintf(stderr, "unexpected mHC tensors on MTP layer 45\n");
+    }
     return ctx && missing == 0 && shape_errors == 0 && layers == 46 && experts == 43 ? 0 : -1;
 }
 

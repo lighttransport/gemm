@@ -344,6 +344,24 @@ compute-to-login SSH calls, so health probes cannot consume the remainder of
 the supervisor script. This path was validated end to end on 2026-08-23 with
 interactive job 50790829.
 
+The 12-node GLM-5.3F continuation allocation was relaunched on 2026-08-30 as
+interactive job **51086028**, with the maximum six-hour elapsed limit. It uses
+the next port pair after the prior GLM session:
+
+```text
+local HTTP port    42396
+login reverse port 32396
+compute HTTP port  21264
+nodes              12
+elapsed limit      06:00:00
+compute host       d27-7002c
+```
+
+The persistent shell session is `ed377c9e2d1e4f0e8bad648f6d15b114`. The local
+launcher is kept in the `codex-a64fx-12n` tmux session, with log
+`tmp/codex-remote-dev-42396/interactive-tmux.log`; open the matching tunnel
+with `LOCAL_PORT=42396 REMOTE_PORT=32396`.
+
 ## Wait for readiness
 
 Inspect the saved job ID and PJM state:
@@ -420,6 +438,96 @@ Each session is serial: overlapping `/run` calls for the same session receive
 HTTP 409. Idle sessions are reaped after 30 minutes by default. A request
 timeout or output limit interrupts only the active command; the session remains
 usable.
+
+## GLM-5.3F 12-node MPI/uTofu launch
+
+Generate a topology file inside every new allocation; topology from a previous
+job must not be reused.  Build the helper and integrated runner through the
+site MPI compiler wrapper so that `mpi.h` and `libmpi` come from the same MPI
+installation.  For the Fujitsu compiler/runtime, unload the concurrently
+loaded LLVM module and clear its `OPAL_PREFIX`; otherwise `mpifcc`/`mpiFCC`
+search the LLVM MPI tree for incompatible wrapper-data files.  Use `mpifcc`
+for this C implementation (`mpiFCC` is the corresponding C++ wrapper).
+
+```bash
+cd ~/work/gemm/glm53f/a64fx/glm5
+module unload LLVM/llvmorg-21.1.0
+unset OPAL_PREFIX
+make -C ../utofu-tests tofu_topo_helper MPICC=mpifcc
+rm -f tofu_topo.txt
+mpiexec -np 12 ../utofu-tests/tofu_topo_helper
+test "$(grep -vc '^#' tofu_topo.txt)" -eq 12
+
+GLM53F_MPICC=mpifcc ./build_glm53f_integrated_12n.sh
+ldd ./glm53f_prefill_12n | grep libmpi
+```
+
+The final check must resolve `libmpi.so` under the active TCSDS installation,
+not the LLVM module directory.  The build deliberately does not inject a
+separate MPI include or library path and links `libtofucom` explicitly for
+`GLM53F_UTOFU=1` collectives.
+
+Before a full-graph decode, verify that each rank has both first-stage blobs on
+its own `/local` filesystem.  The routed and shared directories are per-node,
+so testing only rank 0 is insufficient:
+
+```bash
+mpiexec -np 12 sh -c '
+  r=${PMIX_RANK:-${PJM_MPI_RANK:-${OMPI_COMM_WORLD_RANK:-0}}}
+  test -s "/local/glm53f-target-routed-$PJM_JOBID/rank$(printf %02d "$r").blob"
+  test -s "/local/glm53f-target-shared-$PJM_JOBID/rank$(printf %02d "$r").blob"
+'
+```
+
+Then use the fresh topology for the target path:
+
+```bash
+GLM53F_UTOFU=1 TOFU_TOPO_PATH="$PWD/tofu_topo.txt" \
+  OMP_NUM_THREADS=47 OMP_DYNAMIC=false OMP_WAIT_POLICY=active \
+  OMP_PROC_BIND=close OMP_PLACES=cores \
+  mpiexec -np 12 ./glm53f_target_decode_12n "$HOME/models/glm53f" \
+  "/local/glm53f-target-routed-$PJM_JOBID" \
+  "/local/glm53f-target-shared-$PJM_JOBID" 1 1
+```
+
+The first-stage blobs avoid repeated expert/shared reads from the model
+filesystem.  If the full graph still stops responding during initial loading,
+record it as model I/O and inspect it through a separate control session; do
+not infer a uTofu collective fault from that symptom.
+
+### Resident rank-image workflow
+
+Decode must not mmap or stream weights from either shared storage or
+`/local`.  Create the rank-contiguous image once in shared storage, copy each
+rank's routed, shared, and core blobs to that node's `/local` in bounded
+chunks at allocation startup, and then read them sequentially into anonymous
+HBM2.  Disk I/O ends before the first decode token.  A post-load uTofu shuffle
+is allowed, but steady-state weights remain resident and rank-sharded.
+
+```bash
+# One-time, 12-node offline conversion (resumable through status files).
+GLM53F_CORE_TRACE_DIR="$HOME/models/glm53f/a64fx_ep12_core_trace_51098702" \
+  ./run_glm53f_offline_repack_12n.sh
+
+# Every allocation: shared image -> per-node /local, 32 MiB chunks.
+./run_glm53f_stage_rank_image_12n.sh
+```
+
+The stable image root defaults to
+`$HOME/models/glm53f/a64fx_ep12_v1`; staging refuses an image without its
+`COMPLETE` marker.  Set `GLM53F_REPACK_REQUIRE=1` for full-graph measurements
+so a missing core slice fails rather than silently returning to fragmented
+source reads.  For performance A/B tests, `GLM53F_MOE_FUSED_WEIGHTED=0`
+builds the legacy expert aggregation; the default fuses route weighting into
+the down projection.
+
+The first captured 12-node resident-image prefill sweep (job 51141027,
+`mpifcc` + uTofu) passed the scalar/batch gate (`92/92` probe agreement).  At
+64 prompt positions, throughput was 16.04, 16.33, 17.76, and 17.63 tok/s for
+chunks 1, 2, 4, and 5 respectively.  Chunk 4 is the best stable point in
+this short sweep; chunk 5 is effectively tied.  Rank 0 retained about 3.2 GiB
+`MemAvailable` after loading the 23.632-GiB routed image plus shared/core
+images.
 
 ## Stop the service
 

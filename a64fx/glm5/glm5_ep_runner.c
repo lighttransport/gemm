@@ -78,6 +78,12 @@ static void prof_file_delta(FILE*f,const char*label,const double a[GLM5_NPHASE],
 }
 static int envi(const char*k,int d){ const char*v=getenv(k); return (v&&*v)?atoi(v):d; }
 static size_t rss_bytes(void){ FILE*f=fopen("/proc/self/statm","r"); if(!f)return 0; long tot=0,res=0; if(fscanf(f,"%ld %ld",&tot,&res)!=2)res=0; fclose(f); return (size_t)res*(size_t)sysconf(_SC_PAGESIZE); }
+static void *glm5_arealloc(void *old,size_t old_bytes,size_t new_bytes){
+    void *p=glm5_amalloc(new_bytes);
+    if(!p) return NULL;
+    if(old){ memcpy(p,old,old_bytes<new_bytes?old_bytes:new_bytes); glm5_afree(old); }
+    return p;
+}
 
 /* deterministic synthetic activations, identical on every rank */
 static uint64_t sm_state;

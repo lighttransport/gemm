@@ -52,7 +52,7 @@ int main(void){
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
-    for(int r=0;r<rows;r++) ys[r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,x,cols);
+    for(int r=0;r<rows;r++) ys[r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,0,x,cols);
     double ts=wall_sec()-t0;
 
     t0=wall_sec();
@@ -68,9 +68,9 @@ int main(void){
             w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
             s,s+sb,s+2*(size_t)sb,s+3*(size_t)sb,
             s+4*(size_t)sb,s+5*(size_t)sb,s+6*(size_t)sb,s+7*(size_t)sb,
-            gs,x,cols);
+            gs,0,x,cols);
     }
-    for(int r=nb*8;r<rows;r++) yo[r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,x,cols);
+    for(int r=nb*8;r<rows;r++) yo[r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,0,x,cols);
 #else
     memcpy(yo,ys,(size_t)rows*4);
 #endif
@@ -87,7 +87,7 @@ int main(void){
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
-        for(int r=0;r<rows;r++) ys[r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,x,cols);
+        for(int r=0;r<rows;r++) ys[r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,0,x,cols);
         ts=wall_sec()-t0; if(ts<best_s)best_s=ts;
         t0=wall_sec();
 #if defined(__ARM_FEATURE_SVE)
@@ -102,9 +102,9 @@ int main(void){
                 w+4*(size_t)cols,w+5*(size_t)cols,w+6*(size_t)cols,w+7*(size_t)cols,
                 s,s+sb,s+2*(size_t)sb,s+3*(size_t)sb,
                 s+4*(size_t)sb,s+5*(size_t)sb,s+6*(size_t)sb,s+7*(size_t)sb,
-                gs,x,cols);
+                gs,0,x,cols);
         }
-        for(int r=nb2*8;r<rows;r++) yo[r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,x,cols);
+        for(int r=nb2*8;r<rows;r++) yo[r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,0,x,cols);
 #endif
         to=wall_sec()-t0; if(to<best_o)best_o=to;
     }
@@ -125,8 +125,8 @@ int main(void){
     glm5_model gm; memset(&gm,0,sizeof gm);
     int check_n=gemm_n<4?gemm_n:4, check_rows=gemm_rows<64?gemm_rows:64;
     for(int t=0;t<check_n;t++) for(int r=0;r<check_rows;r++)
-        Yr[(size_t)t*gemm_rows+r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,Xg+(size_t)t*cols,cols);
-    glm5_gemm_int8(&gm,Yg,W,S,gs,Xg,check_n,check_rows,cols);
+        Yr[(size_t)t*gemm_rows+r]=glm5_dot_int8_row(W+(size_t)r*cols,S+(size_t)r*sb,gs,0,Xg+(size_t)t*cols,cols);
+    glm5_gemm_int8(&gm,Yg,W,S,gs,0,Xg,check_n,check_rows,cols);
     double gemm_abs=0.0,gemm_rel=0.0;
     for(int t=0;t<check_n;t++) for(int r=0;r<check_rows;r++){
         double d=fabs((double)Yr[(size_t)t*gemm_rows+r]-(double)Yg[(size_t)t*check_rows+r]);
@@ -136,7 +136,7 @@ int main(void){
     double tg_best=1e30;
     for(int it=0;it<reps;it++){
         t0=wall_sec();
-        glm5_gemm_int8(&gm,Yg,W,S,gs,Xg,gemm_n,gemm_rows,cols);
+        glm5_gemm_int8(&gm,Yg,W,S,gs,0,Xg,gemm_n,gemm_rows,cols);
         double tg=wall_sec()-t0; if(tg<tg_best)tg_best=tg;
     }
     double gops=2.0*(double)gemm_n*(double)gemm_rows*(double)cols;
@@ -146,7 +146,7 @@ int main(void){
     /* w8a8 SDOT GEMM: speed + accuracy vs the w8a16 reference Yr (activation int8-quant error) */
     float *Ys=(float*)glm5_amalloc((size_t)gemm_n*gemm_rows*4);
     if(!Ys) return 2;
-    glm5_gemm_int8_sdot(&gm,Ys,W,S,gs,Xg,check_n,check_rows,cols);
+    glm5_gemm_int8_sdot(&gm,Ys,W,S,gs,0,Xg,check_n,check_rows,cols);
     double sd_abs=0.0,sd_rel=0.0; double refn=0.0;
     for(int t=0;t<check_n;t++) for(int r=0;r<check_rows;r++){
         double ref=Yr[(size_t)t*gemm_rows+r];
@@ -161,7 +161,7 @@ int main(void){
     }
     double tsd=1e30;
     for(int it=0;it<reps;it++){
-        t0=wall_sec(); glm5_gemm_int8_sdot(&gm,Ys,W,S,gs,Xg,gemm_n,gemm_rows,cols);
+        t0=wall_sec(); glm5_gemm_int8_sdot(&gm,Ys,W,S,gs,0,Xg,gemm_n,gemm_rows,cols);
         double tt=wall_sec()-t0; if(tt<tsd)tsd=tt;
     }
     printf("INT8_SDOT N=%d rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g best=%.6f s %.2f Gop/s (vs w8a16 GEMM %.2f Gop/s)\n",
@@ -170,7 +170,7 @@ int main(void){
     /* int16 w8a16-mimic SDOT GEMM: the prefill lever — accuracy (rms vs w8a16 Yr) + speed vs w8a16. */
     float *Y16=(float*)glm5_amalloc((size_t)gemm_n*gemm_rows*4);
     if(!Y16) return 2;
-    glm5_gemm_int16sdot(&gm,Y16,W,S,gs,Xg,check_n,check_rows,cols);
+    glm5_gemm_int16sdot(&gm,Y16,W,S,gs,0,Xg,check_n,check_rows,cols);
     double s16_sse=0,s16_sref=0,s16_maxrel=0;
     for(int t=0;t<check_n;t++) for(int r=0;r<check_rows;r++){
         double ref=Yr[(size_t)t*gemm_rows+r], dd=ref-(double)Y16[(size_t)t*check_rows+r];
@@ -178,7 +178,7 @@ int main(void){
     }
     double t16=1e30;
     for(int it=0;it<reps;it++){
-        t0=wall_sec(); glm5_gemm_int16sdot(&gm,Y16,W,S,gs,Xg,gemm_n,gemm_rows,cols);
+        t0=wall_sec(); glm5_gemm_int16sdot(&gm,Y16,W,S,gs,0,Xg,gemm_n,gemm_rows,cols);
         double tt=wall_sec()-t0; if(tt<t16)t16=tt;
     }
     printf("INT16_GEMM N=%d rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g best=%.6f s %.2f Gop/s (vs w8a16 %.2f Gop/s, speedup=%.2fx)\n",
@@ -187,14 +187,14 @@ int main(void){
     /* register-blocked int8 w8a8 GEMM (glm5_gemm_int8sdot_rb): fastest but lossy vs w8a16 Yr. */
     float *Y8r=(float*)glm5_amalloc((size_t)gemm_n*gemm_rows*4);
     if(!Y8r) return 2;
-    glm5_gemm_int8sdot_rb(&gm,Y8r,W,S,gs,Xg,check_n,check_rows,cols);
+    glm5_gemm_int8sdot_rb(&gm,Y8r,W,S,gs,0,Xg,check_n,check_rows,cols);
     double s8_sse=0,s8_sref=0;
     for(int t=0;t<check_n;t++) for(int r=0;r<check_rows;r++){
         double ref=Yr[(size_t)t*gemm_rows+r], dd=ref-(double)Y8r[(size_t)t*check_rows+r]; s8_sse+=dd*dd; s8_sref+=ref*ref;
     }
     double t8r=1e30;
     for(int it=0;it<reps;it++){
-        t0=wall_sec(); glm5_gemm_int8sdot_rb(&gm,Y8r,W,S,gs,Xg,gemm_n,gemm_rows,cols);
+        t0=wall_sec(); glm5_gemm_int8sdot_rb(&gm,Y8r,W,S,gs,0,Xg,gemm_n,gemm_rows,cols);
         double tt=wall_sec()-t0; if(tt<t8r)t8r=tt;
     }
     printf("INT8_RB_GEMM N=%d rows=%d cols=%d gs=%d rms_rel=%.4g best=%.6f s %.2f Gop/s (vs w8a16 %.2f Gop/s, speedup=%.2fx)\n",
@@ -203,7 +203,7 @@ int main(void){
     /* M=1 w8a8 SDOT MATVEC (the decode lever): glm5_mv_int8_sdot vs the w8a16 8row matvec (yo). */
     float *ymv=(float*)glm5_amalloc((size_t)rows*4);
     if(!ymv) return 2;
-    glm5_mv_int8_sdot(&gm,ymv,W,S,gs,x,rows,cols);   /* yo already holds the w8a16 reference */
+    glm5_mv_int8_sdot(&gm,ymv,W,S,gs,0,x,rows,cols);   /* yo already holds the w8a16 reference */
     double mv_sse=0,mv_sref=0,mv_maxrel=0;
     for(int r=0;r<rows;r++){
         double ref=yo[r], dd=ref-(double)ymv[r]; mv_sse+=dd*dd; mv_sref+=ref*ref;
@@ -211,7 +211,7 @@ int main(void){
     }
     double tmv=1e30;
     for(int it=0;it<reps;it++){
-        t0=wall_sec(); glm5_mv_int8_sdot(&gm,ymv,W,S,gs,x,rows,cols);
+        t0=wall_sec(); glm5_mv_int8_sdot(&gm,ymv,W,S,gs,0,x,rows,cols);
         double tt=wall_sec()-t0; if(tt<tmv)tmv=tt;
     }
     printf("INT8_MV_SDOT rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g w8a16=%.6f s %.2f Gop/s  sdot=%.6f s %.2f Gop/s  speedup=%.2fx\n",
@@ -220,7 +220,7 @@ int main(void){
     /* M=1 w8a16-MIMIC int16 SDOT matvec: glm5_mv_int16_sdot vs w8a16 (yo). Accuracy should be ~1e-4. */
     float *ymv16=(float*)glm5_amalloc((size_t)rows*4);
     if(!ymv16) return 2;
-    glm5_mv_int16_sdot(&gm,ymv16,W,S,gs,x,rows,cols);
+    glm5_mv_int16_sdot(&gm,ymv16,W,S,gs,0,x,rows,cols);
     double m16_sse=0,m16_sref=0,m16_maxrel=0;
     for(int r=0;r<rows;r++){
         double ref=yo[r], dd=ref-(double)ymv16[r]; m16_sse+=dd*dd; m16_sref+=ref*ref;
@@ -228,7 +228,7 @@ int main(void){
     }
     double tmv16=1e30;
     for(int it=0;it<reps;it++){
-        t0=wall_sec(); glm5_mv_int16_sdot(&gm,ymv16,W,S,gs,x,rows,cols);
+        t0=wall_sec(); glm5_mv_int16_sdot(&gm,ymv16,W,S,gs,0,x,rows,cols);
         double tt=wall_sec()-t0; if(tt<tmv16)tmv16=tt;
     }
     printf("INT16_MV_SDOT rows=%d cols=%d gs=%d max_rel=%.4g rms_rel=%.4g w8a16=%.6f s %.2f Gop/s  i16sdot=%.6f s %.2f Gop/s  speedup=%.2fx\n",

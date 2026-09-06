@@ -37,6 +37,7 @@ typedef struct {
     int hc_mult;                 /* 4 */
     int hc_sinkhorn_iters;       /* 20 */
     int short_conv_kernel_size;  /* 4 */
+    float linear_lower_bound;    /* -5.0 safe KDA forget-gate bound */
     float routed_scaling_factor; /* 2.5 */
 } glm53f_arch;
 
@@ -51,6 +52,7 @@ static inline glm53f_arch glm53f_arch_default(void) {
     a.moe_intermediate_size=2048; a.first_k_dense_replace=3;
     a.mtp_layers=1; a.mhc_enabled=1; a.hc_mult=4; a.hc_sinkhorn_iters=20;
     a.short_conv_kernel_size=4;
+    a.linear_lower_bound=-5.0f;
     a.routed_scaling_factor=2.5f;
     return a;
 }
@@ -68,5 +70,32 @@ static inline int glm53f_is_moe(size_t layer) {
 }
 
 static inline int glm53f_is_mtp(size_t layer) { return layer == 45; }
+
+/* Split each routed expert's intermediate dimension across `parts` ranks.
+ * parts=4 on 12 A64FX nodes gives the best measured decode critical path.
+ * The offsets keep every part on a distinct rank and balance 288 experts. */
+static inline int glm53f_expert_part_owner(int expert, int part, int parts, int ranks) {
+    if (expert < 0 || part < 0 || part >= parts || parts < 1 || ranks < parts || ranks % parts)
+        return -1;
+    return (expert % ranks + part * (ranks / parts)) % ranks;
+}
+
+static inline void glm53f_balanced_slice(int n, int part, int parts, int *begin, int *count) {
+    int a = n * part / parts, b = n * (part + 1) / parts;
+    if (begin) *begin = a;
+    if (count) *count = b - a;
+}
+
+static inline int glm53f_block_aligned_slice(
+        int n, int block, int part, int parts, int *begin, int *count) {
+    if (n < 1 || block < 1 || n % block || parts < 1 || part < 0 || part >= parts)
+        return -1;
+    int blocks = n / block;
+    int a = blocks * part / parts, b = blocks * (part + 1) / parts;
+    if (a == b) return -1;
+    if (begin) *begin = a * block;
+    if (count) *count = (b - a) * block;
+    return 0;
+}
 
 #endif
