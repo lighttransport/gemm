@@ -5560,6 +5560,43 @@ static const char *hip_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
+"/* Fused IQ1_S gate/up projection and SiLU product for one expert. */\n"
+"__global__ void ffn_gate_up_silu_iq1_s_mw(float *dst,const unsigned char *gate,\n"
+"        const unsigned char *up,const float *x,int rows,int cols){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp;\n"
+"    if(row>=rows)return;int nb=cols/256,rb=nb*50;float g=0.0f,u=0.0f;\n"
+"    for(int b=lane>>1;b<nb;b+=16){\n"
+"        const unsigned char *gb=gate+(size_t)row*rb+b*50,*ub=up+(size_t)row*rb+b*50;\n"
+"        float dg=half_to_float(*(const half_raw *)gb),du=half_to_float(*(const half_raw *)ub);\n"
+"        const unsigned char *gqs=gb+2,*uqs=ub+2;\n"
+"        const unsigned short *gqh=(const unsigned short *)(gb+34),*uqh=(const unsigned short *)(ub+34);\n"
+"        const float *xb=x+b*256;int ib0=(lane&1)*4;\n"
+"        for(int ib=ib0;ib<ib0+4;ib++){\n"
+"            float dgl=dg*(float)(2*((gqh[ib]>>12)&7)+1),dul=du*(float)(2*((uqh[ib]>>12)&7)+1);\n"
+"            float dsg=(gqh[ib]&0x8000)?-0.125f:0.125f,dsu=(uqh[ib]&0x8000)?-0.125f:0.125f;\n"
+"            for(int l=0;l<4;l++){int gi=gqs[ib*4+l]|(((gqh[ib]>>(3*l))&7)<<8),ui=uqs[ib*4+l]|(((uqh[ib]>>(3*l))&7)<<8);\n"
+"                const signed char *gc=(const signed char *)&iq1s_grid_dev[gi],*uc=(const signed char *)&iq1s_grid_dev[ui];int base=ib*32+l*8;\n"
+"                for(int j=0;j<8;j++){g+=dgl*((float)gc[j]+dsg)*xb[base+j];u+=dul*((float)uc[j]+dsu)*xb[base+j];}}}\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1){g+=__shfl_down(g,o);u+=__shfl_down(u,o);}\n"
+"    if(lane==0)dst[row]=(g/(1.0f+expf(-g)))*u;\n"
+"}\n"
+"__global__ void iq1_s_down_accum_f32(float *dst,const unsigned char *mat,\n"
+"        const float *x,float scale,int rows,int cols){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp;\n"
+"    if(row>=rows)return;int nb=cols/256,rb=nb*50;float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*rb;\n"
+"    for(int b=lane>>1;b<nb;b+=16){const unsigned char *bp=rp+b*50;\n"
+"        float d=half_to_float(*(const half_raw *)bp);const unsigned char *qs0=bp+2;\n"
+"        const unsigned short *qh=(const unsigned short *)(bp+34);const float *xb=x+b*256;int ib0=(lane&1)*4;\n"
+"        for(int ib=ib0;ib<ib0+4;ib++){float dl=d*(float)(2*((qh[ib]>>12)&7)+1);float delta=(qh[ib]&0x8000)?-0.125f:0.125f;\n"
+"            const unsigned char *qs=qs0+ib*4;for(int l=0;l<4;l++){int gi=qs[l]|(((qh[ib]>>(3*l))&7)<<8);\n"
+"                const signed char *grid=(const signed char *)&iq1s_grid_dev[gi];int base=ib*32+l*8;\n"
+"                for(int j=0;j<8;j++)sum+=dl*((float)grid[j]+delta)*xb[base+j];}}\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)atomicAdd(dst+row,scale*sum);\n"
+"}\n"
+
 "/* ---- matvec_iq1_m_f32: IQ1_M matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq1_m_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -8307,6 +8344,8 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_qz_q8_0_mw;
     hipFunction_t fn_ssm_matvec4_q8_f32;
     hipFunction_t fn_ffn_gate_up_silu_q8_0_mw;
+    hipFunction_t fn_ffn_gate_up_silu_iq1_s_mw;
+    hipFunction_t fn_iq1_s_down_accum_f32;
     hipFunction_t fn_qwen4_hc_up_mix_q8;
     hipFunction_t fn_qwen4_hc_down_silu_q8;
     hipFunction_t fn_qwen4_gateup_silu_q8;
@@ -8930,6 +8969,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_qz_q8_0_mw);
     GET_FUNC(ssm_matvec4_q8_f32);
     GET_FUNC(ffn_gate_up_silu_q8_0_mw);
+    GET_FUNC(ffn_gate_up_silu_iq1_s_mw);
+    GET_FUNC(iq1_s_down_accum_f32);
     GET_FUNC(qwen4_hc_up_mix_q8);
     GET_FUNC(qwen4_hc_down_silu_q8);
     GET_FUNC(qwen4_gateup_silu_q8);
@@ -12196,6 +12237,22 @@ static inline void launch_ffn_gate_up_silu_q8(hip_llm_runner *r,
                                                void *x, int rows, int cols) {
     void *args[] = { &dst, &gate, &up, &x, &rows, &cols };
     LAUNCH(r->fn_ffn_gate_up_silu_q8_0_mw, (rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_ffn_gate_up_silu_iq1_s(hip_llm_runner *r,
+                                                  void *dst, void *gate, void *up,
+                                                  void *x, int rows, int cols) {
+    void *args[] = { &dst, &gate, &up, &x, &rows, &cols };
+    LAUNCH(r->fn_ffn_gate_up_silu_iq1_s_mw, (rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_iq1_s_down_accum(hip_llm_runner *r, void *dst,
+                                            void *mat, void *x, float scale,
+                                            int rows, int cols) {
+    void *args[] = { &dst, &mat, &x, &scale, &rows, &cols };
+    LAUNCH(r->fn_iq1_s_down_accum_f32, (rows + 7) / 8, 1, 1,
            256, 1, 1, 0, r->stream, args);
 }
 
@@ -15681,18 +15738,29 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
         }
     }
     for (int j = 0; j < slots; ++j) {
-        launch_matvec_auto(r, dg, dgw[j], dx, c->expert_ff_length,
-                           c->hidden_size, gtype[j]);
-        launch_matvec_auto(r, du, duw[j], dx, c->expert_ff_length,
-                           c->hidden_size, utype[j]);
-        launch_swiglu_limit(r, dg, du, c->expert_ff_length,
-                            c->swiglu_clamp_exp ? c->swiglu_clamp_exp[layer] : 0.0f);
-        launch_silu_mul(r, dg, du, c->expert_ff_length);
-        launch_matvec_auto(r, do_, ddw[j], dg, c->hidden_size,
-                           c->expert_ff_length, dtype[j]);
+        float clamp = c->swiglu_clamp_exp ? c->swiglu_clamp_exp[layer] : 0.0f;
+        if (gtype[j] == GGML_TYPE_IQ1_S && utype[j] == GGML_TYPE_IQ1_S &&
+            clamp <= 1e-6f) {
+            launch_ffn_gate_up_silu_iq1_s(r, dg, dgw[j], duw[j], dx,
+                                          c->expert_ff_length, c->hidden_size);
+        } else {
+            launch_matvec_auto(r, dg, dgw[j], dx, c->expert_ff_length,
+                               c->hidden_size, gtype[j]);
+            launch_matvec_auto(r, du, duw[j], dx, c->expert_ff_length,
+                               c->hidden_size, utype[j]);
+            launch_swiglu_limit(r, dg, du, c->expert_ff_length, clamp);
+            launch_silu_mul(r, dg, du, c->expert_ff_length);
+        }
         float w = c->routed_scaling_factor * weights[j] /
                   (sum > 0.0f ? sum : 1.0f);
-        launch_scale_add(r, daccum, do_, w, c->hidden_size);
+        if (dtype[j] == GGML_TYPE_IQ1_S) {
+            launch_iq1_s_down_accum(r, daccum, ddw[j], dg, w,
+                                    c->hidden_size, c->expert_ff_length);
+        } else {
+            launch_matvec_auto(r, do_, ddw[j], dg, c->hidden_size,
+                               c->expert_ff_length, dtype[j]);
+            launch_scale_add(r, daccum, do_, w, c->hidden_size);
+        }
     }
 
     { qtensor sg = glm5next_as_qtensor(&shared_gate_v);
@@ -15709,16 +15777,26 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
               upload_weight_matrix(&dso, &sd, &std) != 0) goto done;
           shared_own = 1;
       }
-      launch_matvec_auto(r, dg, dsg, dx, c->shared_expert_ff_length,
-                         c->hidden_size, stg);
-      launch_matvec_auto(r, du, dsu, dx, c->shared_expert_ff_length,
-                         c->hidden_size, stu);
-      launch_swiglu_limit(r, dg, du, c->shared_expert_ff_length,
-                          c->swiglu_clamp_shexp ? c->swiglu_clamp_shexp[layer] : 0.0f);
-      launch_silu_mul(r, dg, du, c->shared_expert_ff_length);
-      launch_matvec_auto(r, do_, dso, dg, c->hidden_size,
-                         c->shared_expert_ff_length, std);
-      launch_scale_add(r, daccum, do_, 1.0f, c->hidden_size);
+      float shared_clamp = c->swiglu_clamp_shexp ? c->swiglu_clamp_shexp[layer] : 0.0f;
+      if (stg == GGML_TYPE_IQ1_S && stu == GGML_TYPE_IQ1_S && shared_clamp <= 1e-6f) {
+          launch_ffn_gate_up_silu_iq1_s(r, dg, dsg, dsu, dx,
+                                        c->shared_expert_ff_length, c->hidden_size);
+      } else {
+          launch_matvec_auto(r, dg, dsg, dx, c->shared_expert_ff_length,
+                             c->hidden_size, stg);
+          launch_matvec_auto(r, du, dsu, dx, c->shared_expert_ff_length,
+                             c->hidden_size, stu);
+          launch_swiglu_limit(r, dg, du, c->shared_expert_ff_length, shared_clamp);
+          launch_silu_mul(r, dg, du, c->shared_expert_ff_length);
+      }
+      if (std == GGML_TYPE_IQ1_S) {
+          launch_iq1_s_down_accum(r, daccum, dso, dg, 1.0f,
+                                  c->hidden_size, c->shared_expert_ff_length);
+      } else {
+          launch_matvec_auto(r, do_, dso, dg, c->hidden_size,
+                             c->shared_expert_ff_length, std);
+          launch_scale_add(r, daccum, do_, 1.0f, c->hidden_size);
+      }
     }
     if (hipStreamSynchronize(r->stream) != hipSuccess ||
         hipMemcpy(out, daccum, (size_t)c->hidden_size * sizeof(float),
