@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "glm5next_cpu_kda.h"
 
@@ -168,6 +169,9 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
         position < 0 || position >= r->max_seq_len ||
         (position != 0 && position != r->position)) return -1;
     int h = r->config.hidden_size, hc = r->config.hc_count, d = r->config.linear_head_dim;
+    const int profile = getenv("GLM5NEXT_PROFILE") && atoi(getenv("GLM5NEXT_PROFILE")) != 0;
+    double profile_layers_ms = 0.0;
+    struct timespec profile_t0, profile_t1;
     glm5next_tensor_view t;
     if (position == 0) glm5next_cpu_runtime_reset(r);
     if (glm5next_tensor_view_get(r->model, "token_embd.weight", 1, &t) != 0 ||
@@ -181,6 +185,7 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
     for (int s = 0; s < hc; ++s)
         memcpy(r->streams + (size_t)s * h, r->hidden, (size_t)h * sizeof(float));
     for (int l = 0; l < r->config.n_layers; ++l) {
+        if (profile) clock_gettime(CLOCK_MONOTONIC, &profile_t0);
         float *rs = r->recurrent + (size_t)l * r->config.attention_heads * d * d;
         float *cs = r->conv + (size_t)l * 3 * r->config.attention_heads * d *
                     (r->config.short_conv_kernel - 1);
@@ -208,6 +213,14 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
                     position);
             return -1;
         }
+        if (profile) {
+            clock_gettime(CLOCK_MONOTONIC, &profile_t1);
+            double ms = (double)(profile_t1.tv_sec - profile_t0.tv_sec) * 1000.0 +
+                        (double)(profile_t1.tv_nsec - profile_t0.tv_nsec) / 1000000.0;
+            profile_layers_ms += ms;
+            fprintf(stderr, "glm5next profile: pos=%d layer=%d kind=%s %.3f ms\n", position, l,
+                    glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA ? "KDA" : "DSA", ms);
+        }
     }
     for (int i = 0; i < h; ++i) {
         double sum = 0.0; for (int s = 0; s < hc; ++s) sum += r->streams[(size_t)s * h + i];
@@ -216,8 +229,16 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
     memcpy(r->target_hidden, r->hidden, (size_t)h * sizeof(float));
     r->target_position = position;
     if (r->output_callback) {
+        if (profile) clock_gettime(CLOCK_MONOTONIC, &profile_t0);
         if (r->output_callback(r->model, &r->config, r->hidden, r->logits,
                                r->output_callback_opaque) != 0) return -1;
+        if (profile) {
+            clock_gettime(CLOCK_MONOTONIC, &profile_t1);
+            double ms = (double)(profile_t1.tv_sec - profile_t0.tv_sec) * 1000.0 +
+                        (double)(profile_t1.tv_nsec - profile_t0.tv_nsec) / 1000000.0;
+            fprintf(stderr, "glm5next profile: pos=%d output %.3f ms layers %.3f ms total %.3f ms\n",
+                    position, ms, profile_layers_ms, profile_layers_ms + ms);
+        }
     } else {
         if (glm5next_tensor_view_get(r->model, "output_norm.weight", 1, &t) != 0 ||
             glm5next_cpu_vector(&t, r->normed, h) != 0) return -1;

@@ -8449,6 +8449,11 @@ struct hip_llm_runner {
     gguf_context *glm5next_single_shard;
     glm5next_dsa_gpu_cache *glm5next_dsa_gpu;
     glm5next_kda_gpu_cache *glm5next_kda_gpu;
+    /* The LM head is reused for every token.  Keep its quantized matrix
+     * resident when it fits; streaming it once per token dominates decode. */
+    void *glm5next_output_gpu;
+    int glm5next_output_type;
+    int glm5next_output_cache_attempted;
     hip_llm_moe_mode requested_moe_mode;
     uint64_t requested_moe_cache_bytes;
     uint64_t requested_gpu_reserve_bytes;
@@ -16805,6 +16810,40 @@ static int glm5next_hip_output_logits_norm(hip_llm_runner *r,
                     qv.n_rows, qv.n_cols, qv.type);
             goto done;
         }
+        /* Upload the vocabulary matrix once.  This is intentionally lazy:
+         * cards with insufficient free VRAM retain the old streaming path. */
+        if (!r->glm5next_output_gpu && !r->glm5next_output_cache_attempted) {
+            void *cached = NULL;
+            int cached_type = 0;
+            r->glm5next_output_cache_attempted = 1;
+            if (upload_weight_matrix(&cached, &qv, &cached_type) == 0) {
+                r->glm5next_output_gpu = cached;
+                r->glm5next_output_type = cached_type;
+                if (r->verbose >= 1)
+                    fprintf(stderr, "hip_llm: GLM5Next output.weight cached (%zu MiB)\n",
+                            (row_bytes * (size_t)qv.n_rows) / (1024 * 1024));
+            } else if (r->verbose >= 1) {
+                fprintf(stderr, "hip_llm: GLM5Next output.weight cache unavailable; using streaming chunks\n");
+            }
+        }
+        if (r->glm5next_output_gpu) {
+            launch_matvec_auto(r, dy, r->glm5next_output_gpu, dx,
+                               qv.n_rows, qv.n_cols, r->glm5next_output_type);
+            hipError_t err = hipStreamSynchronize(r->stream);
+            if (err == hipSuccess)
+                err = hipMemcpy(logits, dy, (size_t)qv.n_rows * sizeof(float),
+                                hipMemcpyDeviceToHost);
+            if (err != hipSuccess) {
+                /* A device-side failure should not leave a poisoned cache;
+                 * fall back to the bounded streaming implementation. */
+                hipFree(r->glm5next_output_gpu);
+                r->glm5next_output_gpu = NULL;
+                r->glm5next_output_type = 0;
+            } else {
+                rc = 0;
+                goto done;
+            }
+        }
         for (int first = 0; first < qv.n_rows; first += chunk_rows) {
             int rows = qv.n_rows - first;
             if (rows > chunk_rows) rows = chunk_rows;
@@ -18285,6 +18324,10 @@ void hip_llm_free(hip_llm_runner *r) {
         if (r->glm5next_kda_gpu->norm) hipFree(r->glm5next_kda_gpu->norm);
         free(r->glm5next_kda_gpu);
         r->glm5next_kda_gpu = NULL;
+    }
+    if (r->glm5next_output_gpu) {
+        hipFree(r->glm5next_output_gpu);
+        r->glm5next_output_gpu = NULL;
     }
     if (r->glm5next_cpu) {
         glm5next_cpu_runtime_free(r->glm5next_cpu);
