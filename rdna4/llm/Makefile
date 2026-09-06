@@ -102,6 +102,7 @@ help:
 	@echo "  GLM5NEXT_HIP_INDEXER=1 moves DSA indexer projections to HIP"
 	@echo "  GLM5NEXT_HIP_MHC=1 moves mHC projection matvecs to HIP"
 	@echo "  GLM5NEXT_HIP_OUTPUT=1 moves the final vocabulary projection to HIP"
+	@echo "  GLM5NEXT_CPU_OMP=1 enables OpenMP rows for large CPU projections"
 	@echo ""
 	@echo "Requirements:"
 	@echo "  - libamdhip64.so (HIP runtime)"

@@ -1,6 +1,6 @@
-/* Reusable single-token GLM5Next CPU runtime.  DSA currently has a one-cell
- * attention implementation; KDA recurrent and convolution state is retained
- * across calls.  This is also the correctness oracle for the HIP runner. */
+/* Reusable single-token GLM5Next CPU runtime.  DSA retains latent and pooled
+ * indexer state, while KDA retains recurrent and convolution state across
+ * calls.  This is also the correctness oracle for the HIP runner. */
 #ifndef GLM5NEXT_CPU_RUNTIME_H
 #define GLM5NEXT_CPU_RUNTIME_H
 
