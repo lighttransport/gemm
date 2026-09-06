@@ -242,8 +242,13 @@ static inline int glm5next_cpu_dsa_forward(const gguf_shards *model, int layer,
     return glm5next_cpu_dsa_forward_cached(model, layer, c, hidden, out, NULL, 1, 0);
 }
 
-static inline int glm5next_cpu_moe_ffn(const gguf_shards *model, int layer,
-        const glm5next_config *c, const float *hidden, float *out) {
+typedef int (*glm5next_moe_callback)(const gguf_shards *model, int layer,
+        const glm5next_config *config, const float *hidden, float *out, void *opaque);
+
+static inline int glm5next_cpu_moe_ffn_cb(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out,
+        glm5next_moe_callback callback, void *opaque) {
+    if (callback) return callback(model, layer, c, hidden, out, opaque);
     char name[128]; glm5next_tensor_view t;
     int h = c->hidden_size, ff = c->expert_ff_length, ne = c->expert_count;
     float *router = (float *)malloc((size_t)ne * sizeof(float));
@@ -296,6 +301,11 @@ fail:
 #undef MOE_GET
 }
 
+static inline int glm5next_cpu_moe_ffn(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out) {
+    return glm5next_cpu_moe_ffn_cb(model, layer, c, hidden, out, NULL, NULL);
+}
+
 typedef int (*glm5next_dsa_callback)(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         float *latent_cache, int max_seq_len, int position, void *opaque);
@@ -306,7 +316,8 @@ typedef int (*glm5next_kda_callback)(const gguf_shards *model, int layer,
 static inline int glm5next_cpu_dsa_moe_block_cached_cb(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
         float *latent_cache, int max_seq_len, int position,
-        glm5next_dsa_callback callback, void *opaque) {
+        glm5next_dsa_callback callback, glm5next_moe_callback moe_callback,
+        void *opaque, void *moe_opaque) {
     int h = c->hidden_size, hc = c->hc_count;
     char name[128]; glm5next_tensor_view fn, base, scale;
     float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
@@ -333,7 +344,8 @@ static inline int glm5next_cpu_dsa_moe_block_cached_cb(const gguf_shards *model,
     if (glm5next_cpu_mhc_pre(c, &fn, &base, &scale, residual, collapsed, post, comb) != 0) goto fail;
     BLOCK_VIEW("ffn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
     glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
-    if (glm5next_cpu_moe_ffn(model, layer, c, collapsed, sublayer) != 0) goto fail;
+    if (glm5next_cpu_moe_ffn_cb(model, layer, c, collapsed, sublayer,
+                                moe_callback, moe_opaque) != 0) goto fail;
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
     free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return 0;
 fail:
@@ -345,7 +357,7 @@ static inline int glm5next_cpu_dsa_moe_block_cached(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
         float *latent_cache, int max_seq_len, int position) {
     return glm5next_cpu_dsa_moe_block_cached_cb(model, layer, c, streams,
-        latent_cache, max_seq_len, position, NULL, NULL);
+        latent_cache, max_seq_len, position, NULL, NULL, NULL, NULL);
 }
 
 static inline int glm5next_cpu_dsa_moe_block(const gguf_shards *model,
@@ -360,7 +372,7 @@ static inline int glm5next_cpu_kda_forward(const gguf_shards *model,
 static inline int glm5next_cpu_kda_moe_block_cb(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
         float *recurrent, float *conv_state, glm5next_kda_callback callback,
-        void *opaque) {
+        glm5next_moe_callback moe_callback, void *opaque, void *moe_opaque) {
     int h = c->hidden_size, hc = c->hc_count;
     char name[128]; glm5next_tensor_view fn, base, scale;
     float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
@@ -387,7 +399,8 @@ static inline int glm5next_cpu_kda_moe_block_cb(const gguf_shards *model,
     if (glm5next_cpu_mhc_pre(c, &fn, &base, &scale, residual, collapsed, post, comb) != 0) goto fail;
     KM_VIEW("ffn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
     glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
-    if (glm5next_cpu_moe_ffn(model, layer, c, collapsed, sublayer) != 0) goto fail;
+    if (glm5next_cpu_moe_ffn_cb(model, layer, c, collapsed, sublayer,
+                                moe_callback, moe_opaque) != 0) goto fail;
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
     free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return 0;
 fail:
@@ -399,7 +412,7 @@ static inline int glm5next_cpu_kda_moe_block(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
         float *recurrent, float *conv_state) {
     return glm5next_cpu_kda_moe_block_cb(model, layer, c, streams, recurrent,
-        conv_state, NULL, NULL);
+        conv_state, NULL, NULL, NULL, NULL);
 }
 
 /* Execute one recurrent KDA layer from the real GGUF views.  State layouts
@@ -555,7 +568,9 @@ done:
 static inline int glm5next_cpu_kda_dense_block_cb(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
         float *recurrent, float *conv_state, glm5next_kda_callback callback,
-        void *opaque) {
+        glm5next_moe_callback moe_callback, void *opaque, void *moe_opaque) {
+    (void)moe_callback;
+    (void)moe_opaque;
     int h = c->hidden_size, hc = c->hc_count;
     char name[128]; glm5next_tensor_view fn, base, scale;
     float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
@@ -599,7 +614,7 @@ static inline int glm5next_cpu_kda_dense_block(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
         float *recurrent, float *conv_state) {
     return glm5next_cpu_kda_dense_block_cb(model, layer, c, streams, recurrent,
-        conv_state, NULL, NULL);
+        conv_state, NULL, NULL, NULL, NULL);
 }
 
 #endif /* GLM5NEXT_CPU_KDA_H */
