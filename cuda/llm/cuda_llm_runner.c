@@ -9847,6 +9847,7 @@ lookup_funcs:
                          * is more accurate but slower). Enabled per user request; disable the
                          * whole vendored path with CUDA_LLM_NO_MMQ_VENDOR. */
                         { "q6k", GGML_TYPE_Q6_K, 256, 0, 57856 },
+                        { "mxfp4", GGML_TYPE_MXFP4, 32, 0, 57856 },
                     };
                     char nm[64];
                     for (int i = 0; i < (int)(sizeof(reg)/sizeof(reg[0])); i++) {

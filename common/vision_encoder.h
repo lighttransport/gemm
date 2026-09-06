@@ -43,7 +43,7 @@ typedef struct {
     qtensor norm_w, norm_b;
 } vision_deepstack;
 
-typedef struct {
+typedef struct vision_model {
     /* Hyperparameters */
     int n_blocks;
     int dim;          /* embedding_length (1024 for 2B) */

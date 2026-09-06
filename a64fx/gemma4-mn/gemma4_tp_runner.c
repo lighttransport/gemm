@@ -1,0 +1,326 @@
+/* gemma4_tp_runner.c - tensor-parallel (TP) multinode runner for Gemma-4 12B BF16.
+ *
+ * Every rank/node holds a ROW/COL slice of EVERY weight (Megatron sharding, see
+ * gemma4_stage.c "tp" + TP_DESIGN.md) and runs the FULL forward in lockstep; the sharded
+ * matvecs combine via uTofu recursive-doubling all-reduce (tp_allreduce.h). MPI only places
+ * ranks (no MPI_Init). Per token (identical on every rank): embed -> forward (all layers,
+ * 2 all-reduce-SUM/layer) -> vocab-parallel lm_head slice -> local argmax -> all-reduce
+ * argmax -> global token. No pipeline handoff; the token stream is identical on all ranks.
+ *
+ * Run: (after tofu_topo_helper writes tofu_topo.txt) mpiexec -np N -vcoordfile vc \
+ *        ./gemma4_tp_runner <gguf> <blob_dir> [prompt_ids_file] [maxgen]
+ * Build: fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -D_GNU_SOURCE \
+ *        -I../../common gemma4_tp_runner.c -lm -lpthread -lhwb -ltofucom -o gemma4_tp_runner
+ */
+#define _GNU_SOURCE
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <utofu.h>
+#define TRANSFORMER_IMPLEMENTATION
+#define GGML_DEQUANT_IMPLEMENTATION
+#define GGUF_LOADER_IMPLEMENTATION
+#include "transformer.h"
+#include "gemma4_tp_load.h"
+#include "gemma4_mtp.h"
+#include "../utofu-tests/tofu_demo.h"
+#include "../utofu-tests/tp_allreduce.h"
+
+/* batched-prefill hooks exported by transformer.h (the verify path) */
+extern float *tf_batch_all_logits; extern float **tf_batch_hidden_out;
+extern int tf_batch_keep_pool, tf_batch_quiet;
+extern int tf_batch_logit_v0, tf_batch_logit_v1;   /* TP verify lm_head vocab-slice */
+
+#define MAX_NODES 128
+#define RUN_STAG  DEMO_STAG
+#define WAIT_TIMEOUT_SEC 300.0
+static void die(const char *what, int rc){ fprintf(stderr,"FATAL: %s (rc=%d)\n",what,rc); exit(1); }
+static double now_sec(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
+
+static int read_topo(uint8_t coords[][TOFU_NCOORDS]){
+    const char *tp = getenv("TOFU_TOPO_PATH"); if(!tp||!*tp) tp = TOPO_PATH;
+    FILE *f = fopen(tp,"r"); if(!f){ fprintf(stderr,"cannot open %s (run tofu_topo_helper first)\n",tp); exit(1); }
+    int n=0; char line[256];
+    while(fgets(line,sizeof line,f)){
+        if(line[0]=='#'||line[0]=='\n') continue;
+        unsigned r,c[TOFU_NCOORDS];
+        if(sscanf(line,"%u %u %u %u %u %u %u",&r,&c[0],&c[1],&c[2],&c[3],&c[4],&c[5])!=7){ fprintf(stderr,"malformed: %s",line); exit(1); }
+        if((int)r!=n){ fprintf(stderr,"ranks out of order\n"); exit(1); }
+        for(int k=0;k<TOFU_NCOORDS;k++) coords[n][k]=(uint8_t)c[k];
+        n++;
+    }
+    fclose(f); if(n<1){ fprintf(stderr,"empty topo\n"); exit(1); } return n;
+}
+
+/* ---- uTofu state (barrier region only; tp_allreduce.h owns its own region) ---- */
+static int N, MyRank;
+static char *Region;
+static utofu_vcq_hdl_t Vcq;
+static utofu_stadd_t Base;
+static utofu_vcq_id_t PeerVcq[MAX_NODES];
+static utofu_stadd_t PeerBase[MAX_NODES];
+static const unsigned long FLAGS = UTOFU_ONESIDED_FLAG_TCQ_NOTICE;
+static size_t SEND_OFF, BAR_BASE, REGION_SZ;
+static uint64_t Bt = 1;
+static inline size_t bar_recv_off(int s){ return BAR_BASE + (size_t)s*DEMO_CACHE_LINE; }
+static inline size_t bar_go_off(void){ return BAR_BASE + (size_t)N*DEMO_CACHE_LINE; }
+
+static void put_issue(utofu_vcq_id_t pv, utofu_stadd_t s, utofu_stadd_t d, size_t len, int drain){
+    int rc; void *cb;
+    for(;;){ rc=utofu_put(Vcq,pv,s,d,len,0,FLAGS,NULL); if(rc!=UTOFU_ERR_BUSY) break; utofu_poll_tcq(Vcq,0,&cb); }
+    if(rc!=UTOFU_SUCCESS) die("utofu_put",rc);
+    if(drain){ do{ rc=utofu_poll_tcq(Vcq,0,&cb); }while(rc==UTOFU_ERR_NOT_FOUND); if(rc!=UTOFU_SUCCESS) die("poll_tcq",rc); }
+}
+static void wait_ge(volatile uint64_t *q, uint64_t v, const char *what){
+    double ts=now_sec(); while(*q<v) if(now_sec()-ts>WAIT_TIMEOUT_SEC) die(what,-1);
+}
+static void barrier_robust(void){
+    uint64_t t=++Bt; char *sb=Region+SEND_OFF;
+    if(MyRank==0){
+        for(int s=1;s<N;s++) wait_ge((volatile uint64_t*)(Region+bar_recv_off(s)),t,"barrier fan-in");
+        for(int s=1;s<N;s++){ *(volatile uint64_t*)sb=t; put_issue(PeerVcq[s],Base+SEND_OFF,PeerBase[s]+bar_go_off(),8,1); }
+    } else {
+        volatile uint64_t *go=(volatile uint64_t*)(Region+bar_go_off()); double ts=now_sec();
+        do{ *(volatile uint64_t*)sb=t; put_issue(PeerVcq[0],Base+SEND_OFF,PeerBase[0]+bar_recv_off(MyRank),8,1);
+            for(int a=0;a<50 && *go<t;a++) usleep(2000);
+            if(now_sec()-ts>WAIT_TIMEOUT_SEC) die("barrier timeout",-1);
+        }while(*go<t);
+    }
+}
+
+/* transformer_set_tp callback: SUM-reduce a partial across all TP ranks (o-proj/down).
+ * TP_SKIP_AR=1 makes it a no-op -> WRONG output, but isolates compute-only time so we can
+ * measure the comm fraction (== the ceiling that batched/amortized decode could reach). */
+static int g_skip_ar = -1;
+static void ar_sum_cb(float *buf, int count, void *ctx){
+    if(g_skip_ar<0){ const char*e=getenv("TP_SKIP_AR"); g_skip_ar = (e&&atoi(e))?1:0; }
+    if(g_skip_ar) return;
+    tp_allreduce_sum((tp_comm*)ctx, buf, count);
+}
+/* MTP head-shard: all-reduce-argmax the per-rank vocab-slice (val,idx) -> global draft token. */
+static void mtp_arx_cb(float *val, int32_t *idx, void *ctx){ tp_allreduce_argmax((tp_comm*)ctx, val, idx); }
+/* MTP FFN block-shard: all-reduce-SUM the per-rank down-proj partial -> full. */
+static void mtp_sum_cb(float *buf, int count, void *ctx){ tp_allreduce_sum((tp_comm*)ctx, buf, count); }
+
+int main(int argc,char**argv){
+    if(argc<3){ fprintf(stderr,"usage: %s <gguf> <blob_dir> [prompt_ids_file] [maxgen]\n",argv[0]); return 1; }
+    const char *gguf=argv[1], *blob_dir=argv[2];
+    const char *prompt_file = argc>3 ? argv[3] : NULL;
+    int maxgen = argc>4 ? atoi(argv[4]) : 32;
+    int nthr = getenv("LLM_THREADS")?atoi(getenv("LLM_THREADS")):48;
+    int max_seq = getenv("MAX_SEQ")?atoi(getenv("MAX_SEQ")):2048;
+    int rc;
+
+    /* ---- uTofu bootstrap ---- */
+    utofu_tni_id_t *tni_ids=NULL; size_t num_tnis=0;
+    rc=utofu_get_onesided_tnis(&tni_ids,&num_tnis); if(rc!=UTOFU_SUCCESS) die("get_onesided_tnis",rc);
+    if(num_tnis<1) die("no onesided TNIs",-1);
+    uint8_t my_coords[TOFU_NCOORDS]={0};
+    rc=utofu_query_my_coords(my_coords); if(rc!=UTOFU_SUCCESS) die("query_my_coords",rc);
+    static uint8_t topo[MAX_NODES][TOFU_NCOORDS];
+    N=read_topo(topo);
+    MyRank=-1; for(int r=0;r<N;r++) if(memcmp(topo[r],my_coords,TOFU_NCOORDS)==0) MyRank=r;
+    if(MyRank<0) die("my coords not in topo",-1);
+
+    /* ---- load this rank's TP shard ---- */
+    char blob[1100],mani[1100];
+    snprintf(blob,sizeof blob,"%s/rank%02d.blob",blob_dir,MyRank);
+    snprintf(mani,sizeof mani,"%s/rank%02d.manifest",blob_dir,MyRank);
+    transformer_model *m=gemma4_tp_load(gguf,blob,mani,MyRank,N,max_seq);
+    if(!m) die("tp load failed",-1);
+    transformer_set_threads(m,nthr);
+    int n_embd_g=m->n_embd, V=m->n_vocab;
+
+    /* ---- barrier region ---- */
+    SEND_OFF=0; BAR_BASE=DEMO_CACHE_LINE; REGION_SZ=BAR_BASE+(size_t)(N+1)*DEMO_CACHE_LINE;
+    if(posix_memalign((void**)&Region,DEMO_CACHE_LINE,REGION_SZ)!=0) die("posix_memalign",-1);
+    memset(Region,0,REGION_SZ);
+    utofu_tni_id_t tni=tni_ids[0];
+    rc=utofu_create_vcq_with_cmp_id(tni,DEMO_CMP_ID,0,&Vcq); if(rc!=UTOFU_SUCCESS) die("create_vcq",rc);
+    utofu_vcq_id_t my_real; rc=utofu_query_vcq_id(Vcq,&my_real); if(rc!=UTOFU_SUCCESS) die("query_vcq_id",rc);
+    rc=utofu_reg_mem_with_stag(Vcq,Region,REGION_SZ,RUN_STAG,0,&Base); if(rc!=UTOFU_SUCCESS) die("reg_mem",rc);
+    for(int r=0;r<N;r++){
+        if(r==MyRank){ PeerVcq[r]=my_real; PeerBase[r]=Base; continue; }
+        rc=utofu_construct_vcq_id(topo[r],tni,DEMO_CQ_ID,DEMO_CMP_ID,&PeerVcq[r]); if(rc!=UTOFU_SUCCESS) die("construct_vcq_id",rc);
+        utofu_set_vcq_id_path(&PeerVcq[r],NULL);
+        rc=utofu_query_stadd(PeerVcq[r],RUN_STAG,&PeerBase[r]); if(rc!=UTOFU_SUCCESS) die("query_stadd",rc);
+    }
+    free(tni_ids);
+    barrier_robust();
+
+    /* ---- TP all-reduce comm (its own registered region) ---- */
+    /* batched/verify forward reduces [M,n_embd] at once -> size for the largest batch. */
+    int batch_M = getenv("GEMMA4_TP_BATCH") ? atoi(getenv("GEMMA4_TP_BATCH")) : 0;
+    const char *mtp_path = getenv("GEMMA4_TP_MTP");
+    int spec_K = getenv("GEMMA4_TP_SPEC_K") ? atoi(getenv("GEMMA4_TP_SPEC_K")) : 4;
+    if(spec_K > MTP_NL) spec_K = MTP_NL; if(spec_K < 1) spec_K = 1;
+    int ar_batch = batch_M > 1 ? (batch_M < 64 ? batch_M : 64) : 1;
+    if(mtp_path && ar_batch < 128) ar_batch = 128;   /* spec: prompt-prefill chunk + verify */
+    int ar_max = n_embd_g * ar_batch;
+    static tp_comm comm;
+    if(tp_comm_init(&comm, Vcq, PeerVcq, MyRank, N, ar_max, barrier_robust)!=0) die("tp_comm_init",-1);
+    transformer_set_tp(m, MyRank, N, ar_sum_cb, &comm);
+    barrier_robust();
+    if(MyRank==0) fprintf(stderr,"[tp] %d ranks up; sharded forward; starting\n",N);
+
+    /* ---- prompt ---- */
+    int prompt[2048]; int P=0;
+    if(prompt_file){ FILE*pf=fopen(prompt_file,"r"); if(pf){ int v; while(P<2048 && fscanf(pf,"%d",&v)==1) prompt[P++]=v; fclose(pf); } }
+    if(P==0){ int dflt[]={2,651,6037,576,6081,603,476,6892,576}; P=sizeof dflt/sizeof dflt[0]; for(int i=0;i<P;i++) prompt[i]=dflt[i]; }
+    int total=P+maxgen;
+    int *gen=(int*)calloc(maxgen,sizeof(int)); int ngen=0;
+    long v0=(long)MyRank*V/N, v1=(long)(MyRank+1)*V/N;
+
+    /* ---- speculative decode: MTP draft + batched-TP verify ----
+     * Every rank replicates the MTP weights and reads its replicated target KV, so the
+     * draft is identical on all ranks (NO comm). The verify is the batched TP forward
+     * (sharded + internal allreduce); its all_logits are full (token_embd replicated) so
+     * argmax/accept are identical on all ranks -> seq[] stays lockstep without extra comm. */
+    if(mtp_path){
+        static mtp_model MM;
+        if(!mtp_load(&MM, mtp_path, m->n_layers, n_embd_g)){
+            if(MyRank==0) fprintf(stderr,"[tp] MTP load failed: %s\n", mtp_path);
+            barrier_robust(); return 1;
+        }
+        float embd_scale = sqrtf((float)n_embd_g);
+        tf_batch_keep_pool=1; tf_batch_quiet=1;
+        int Kd=spec_K;
+        /* head-shard the MTP draft: each rank computes its vocab slice [v0,v1) + reduce-argmax
+         * (the head is ~65% of the replicated draft cost). GEMMA4_MTP_NOSHARD=1 = A/B off. */
+        int mtp_shard = (N>1) && !(getenv("GEMMA4_MTP_NOSHARD")&&atoi(getenv("GEMMA4_MTP_NOSHARD")));
+        int hsh_v0 = mtp_shard ? (int)v0 : -1, hsh_v1 = (int)v1;
+        int ffn_f0 = mtp_shard ? (int)((long)MyRank*MM.FF/N) : -1, ffn_f1 = (int)((long)(MyRank+1)*MM.FF/N);
+        if(MyRank==0) fprintf(stderr,"[tp] spec: MTP head-shard=%d (v0=%ld v1=%ld)\n",mtp_shard,v0,v1);
+        float *all=(float*)malloc((size_t)(Kd+1)*V*sizeof(float));
+        int *seq=(int*)malloc(sizeof(int)*(P+maxgen+Kd+8));
+        for(int i=0;i<P;i++) seq[i]=prompt[i];
+        /* prefill prompt (chunked <=128 so the verify-sized allreduce covers it) */
+        float *hid=NULL; tf_batch_hidden_out=&hid;
+        for(int s=0;s<P;s+=128){ int c=P-s; if(c>128) c=128;
+            int32_t cb[128]; for(int i=0;i<c;i++) cb[i]=prompt[s+i];
+            if(!transformer_prefill_gemm(m, cb, c, s)){
+                if(MyRank==0) fprintf(stderr,"[tp] spec: prefill_gemm NULL (PLE?)\n");
+                barrier_robust(); return 1; } }
+        int pos=P; { float mx=m->logits[0]; int a=0; for(int i=1;i<V;i++) if(m->logits[i]>mx){mx=m->logits[i];a=i;} seq[pos]=a; }
+        float thid[3840];
+        tf_rmsnorm(thid, hid+(size_t)(P-1)*n_embd_g, &m->output_norm, n_embd_g, m->rms_norm_eps, m->matvec_tmp);
+        /* The MTP draft + the verify GEMMs are OpenMP; the transformer pthread pool
+         * busy-SPINS when idle and would starve those OMP threads -> shut it for the
+         * whole spec phase (keep_pool=1 + all_logits => verify stays OMP, no pool need). */
+        tf_pool_shutdown(m);
+
+        int gen=0, rounds=0, fwd=0, accepted=0, mtp_tries=0, mtp_hit=0;
+        barrier_robust(); double t0=now_sec(); double t_draft=0, t_verify=0;
+        while(gen<maxgen){
+            int draft[8]; float hh[3840]; memcpy(hh,thid,sizeof hh);
+            int prev=seq[pos];
+            double td0=now_sec();
+            for(int j=0;j<Kd;j++){ float hn[3840];
+                int dt=mtp_step(m,&MM,hh,prev,pos+j,pos,embd_scale,hn, hsh_v0,hsh_v1,mtp_arx_cb,&comm, ffn_f0,ffn_f1,mtp_sum_cb);
+                draft[j]=dt; prev=dt; memcpy(hh,hn,sizeof hh); }
+            t_draft+=now_sec()-td0;
+            int32_t batch[16]; int NB=Kd+1; batch[0]=seq[pos];
+            for(int j=0;j<Kd;j++) batch[1+j]=draft[j];
+            double tv0=now_sec();
+            tf_batch_all_logits=all; tf_batch_hidden_out=&hid;
+            if(mtp_shard){ tf_batch_logit_v0=(int)v0; tf_batch_logit_v1=(int)v1; }
+            transformer_prefill_gemm(m, batch, NB, pos);
+            tf_batch_all_logits=NULL; tf_batch_logit_v0=-1; fwd++;
+            t_verify+=now_sec()-tv0;
+            int gg[16];
+            if(mtp_shard){   /* verify lm_head vocab-sliced: per-position local argmax + reduce */
+                int sl=(int)(v1-v0);
+                for(int j=0;j<NB;j++){ float*lp=all+(size_t)j*sl; float mx=lp[0]; int32_t a=(int32_t)v0;
+                    for(int i=1;i<sl;i++) if(lp[i]>mx){mx=lp[i];a=(int32_t)(v0+i);}
+                    tp_allreduce_argmax(&comm,&mx,&a); gg[j]=(int)a; }
+            } else {
+                for(int j=0;j<NB;j++){ float*lp=all+(size_t)j*V; float mx=lp[0]; int a=0;
+                    for(int i=1;i<V;i++) if(lp[i]>mx){mx=lp[i];a=i;} gg[j]=a; }
+            }
+            int a=0; while(a<Kd && draft[a]==gg[a]) a++;
+            for(int j=0;j<Kd;j++){ mtp_tries++; if(j<a) mtp_hit++; }
+            for(int j=0;j<a;j++) seq[pos+1+j]=draft[j];
+            seq[pos+1+a]=gg[a];
+            tf_rmsnorm(thid, hid+(size_t)a*n_embd_g, &m->output_norm, n_embd_g, m->rms_norm_eps, m->matvec_tmp);
+            gen+=1+a; accepted+=a; rounds++; pos+=1+a;
+        }
+        double dt=now_sec()-t0;
+        if(MyRank==0){
+            double tps=dt>0?gen/dt:0, alpha=mtp_tries?(double)mtp_hit/mtp_tries:0, tpf=fwd?(double)gen/fwd:0;
+            fprintf(stderr,"[tp] N=%d SPEC K=%d: %d tok in %.3fs = %.2f tok/s; alpha=%.1f%% (%d/%d) tok/fwd=%.2f (%d fwd, %d rounds)\n",
+                    N,Kd,gen,dt,tps,100*alpha,mtp_hit,mtp_tries,tpf,fwd,rounds);
+            fprintf(stderr,"[tp]   draft %.3fs (%.1f%%, %.2f ms/round)  verify %.3fs (%.1f%%, %.2f ms/round)\n",
+                    t_draft,100*t_draft/dt,1000*t_draft/rounds, t_verify,100*t_verify/dt,1000*t_verify/rounds);
+            printf("TPSPEC N=%d K=%d tok_s=%.3f alpha=%.4f tok_fwd=%.3f gen=%d first=%d\n",
+                   N,Kd,tps,alpha,tpf,gen,seq[P]);
+            const char*rf=getenv("GEMMA4_RESULT_FILE"); if(!rf||!*rf) rf="gemma4_tp_result.txt";
+            FILE*f=fopen(rf,"w");
+            if(f){ fprintf(f,"TPSPEC N=%d K=%d tok_s=%.4f alpha=%.4f tok_fwd=%.4f gen=%d tokens:",N,Kd,tps,alpha,tpf,gen);
+                   for(int i=0;i<gen && i<64;i++) fprintf(f," %d",seq[P+i]); fprintf(f,"\n"); fclose(f); }
+        }
+        free(all); free(seq); barrier_robust(); return 0;
+    }
+
+    /* ---- batched-throughput mode (comm amortized over M tokens/forward) ---- */
+    if(batch_M > 1){
+        int M = batch_M;
+        int *btok=(int*)malloc((size_t)M*sizeof(int));
+        for(int i=0;i<M;i++) btok[i]=prompt[i%P];
+        /* correctness: batched prefill of the real prompt -> argmax(last) == M=1 first gen */
+        if(!transformer_prefill_gemm(m, prompt, P, 0)){
+            if(MyRank==0) fprintf(stderr,"[tp] BATCH unavailable (prefill_gemm NULL: PLE model?)\n");
+            free(btok); barrier_robust(); return 0;
+        }
+        int chk=0; { float mx=m->logits[0]; for(int i=1;i<V;i++) if(m->logits[i]>mx){mx=m->logits[i];chk=i;} }
+        transformer_prefill_gemm(m, btok, M, 0);      /* warm */
+        barrier_robust();
+        int reps=8; double tb=now_sec();
+        for(int r=0;r<reps;r++) transformer_prefill_gemm(m, btok, M, 0);
+        double el=now_sec()-tb; double tps=el>0?(double)reps*M/el:0;
+        if(MyRank==0){
+            fprintf(stderr,"[tp] N=%d BATCH M=%d: %.2f tok/s (%d forwards x %d tok in %.3fs)  prompt-next-argmax=%d\n",
+                    N,M,tps,reps,M,el,chk);
+            const char*rf=getenv("GEMMA4_RESULT_FILE"); if(!rf||!*rf) rf="gemma4_tp_result.txt";
+            FILE*f=fopen(rf,"w");
+            if(f){ fprintf(f,"TPBATCH N=%d M=%d batched_tps=%.4f prompt_next_argmax=%d\n",N,M,tps,chk); fclose(f); }
+            printf("TPBATCH N=%d M=%d batched_tps=%.3f prompt_next_argmax=%d\n",N,M,tps,chk);
+        }
+        free(btok); barrier_robust(); return 0;
+    }
+
+    double t0=now_sec(), t_pf=now_sec();
+    int next=prompt[0];
+    for(int p=0; p<total; p++){
+        int t = (p<P)? prompt[p] : next;
+        transformer_embed_token(m,t);
+        transformer_forward_partial(m,p,0,m->n_layers);          /* full TP forward */
+        transformer_compute_logits_slice(m,(int)v0,(int)v1);     /* local vocab slice */
+        float mx=m->logits[0]; int32_t gi=(int32_t)v0;
+        for(long i=1;i<v1-v0;i++) if(m->logits[i]>mx){ mx=m->logits[i]; gi=(int32_t)(v0+i); }
+        tp_allreduce_argmax(&comm,&mx,&gi);                      /* global argmax token */
+        next=(int)gi;
+        if(p>=P-1 && ngen<maxgen) gen[ngen++]=next;
+        if(p==P-1) t_pf=now_sec();
+    }
+    double tend=now_sec(), dt=tend-t0;
+    if(MyRank==0){
+        double pf_t=t_pf-t0, dec_t=tend-t_pf;
+        double pf_tps=pf_t>0?P/pf_t:0, dec_tps=dec_t>0?maxgen/dec_t:0;
+        fprintf(stderr,"[tp] N=%d prefill %.2f tok/s (%d tok, %.3fs)  decode %.2f tok/s (%d tok, %.3fs)\n",
+                N,pf_tps,P,pf_t,dec_tps,maxgen,dec_t);
+        printf("TPGEN N=%d prefill_tps=%.3f decode_tps=%.3f n=%d tokens:",N,pf_tps,dec_tps,ngen);
+        for(int i=0;i<ngen;i++) printf(" %d",gen[i]);
+        printf("\n");
+        const char *rf=getenv("GEMMA4_RESULT_FILE"); if(!rf||!*rf) rf="gemma4_tp_result.txt";
+        FILE*f=fopen(rf,"w");
+        if(f){ fprintf(f,"TPGEN N=%d prefill_tps=%.4f decode_tps=%.4f P=%d maxgen=%d n=%d tokens:",
+                       N,pf_tps,dec_tps,P,maxgen,ngen);
+               for(int i=0;i<ngen;i++) fprintf(f," %d",gen[i]); fprintf(f,"\n"); fclose(f); }
+    }
+    (void)dt; (void)n_embd_g;
+    barrier_robust();
+    return 0;
+}

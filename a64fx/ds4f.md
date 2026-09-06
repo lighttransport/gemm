@@ -870,3 +870,98 @@ breakdown that ranks them is item 1.
 > **If a job restart wipes /local / moves the alloc:** re-stage (Step 1 of this doc) + regenerate
 > topo (never `SKIP_TOPO=1` across jobs). The single-node pinned bench (`ds4f_decode_bw_bench.c`,
 > cores 12–59) is the alloc-free vehicle to roofline a new KV/attn kernel before wiring it.
+
+## Decode roofline revisit (2026-06-10): theoretical @800 GB/s vs actual, gap decomposition (non-MTP)
+
+Clean re-profile on current HEAD (`DS4F_MTP=0 DS4F_PROF=1`, 11n real weights, fresh alloc).
+**Two gotchas found while measuring** (both invalidate naive baselines):
+- **`run_ds4f_gen_11n.sh` / `run_ds4f_longctx_11n.sh` default `DS4F_Q8_DENSE=1`** (champion
+  config baked in at Step 2l): every "`DS4F_FP8_BF16=1`" run through these wrappers is actually
+  **int8 W8A8 dense** (`repacked 344 dense tensors` in stderr confirms). The bf16 rows below are
+  computed + historical (Step 2c/2l), not re-measured; set `DS4F_Q8_DENSE=0` explicitly for a
+  true bf16 run.
+- **`DS4F_MTP=1` alone contaminates decode** (the alpha path drafts every step). Now opt-in via
+  `DS4F_MTP_ALPHA=1`; `DS4F_MTP=1` only loads the block.
+
+### Theoretical floor — exact bytes/token/node (11n EP, dense replicated no-TP)
+
+Per-layer dense: wq_a 4.19M + wq_b 33.55M + wkv 2.10M + wo_a 33.55M + wo_b 33.55M + sh_w1/w3/w2
+25.17M + gate 1.05M = 133.2M elem × 43 = 5.73G elem. Experts (MXFP4, 6 active /11) ≈ 0.33 GB/tok.
+Head bf16 1.06 GB/tok. Indexer projections (idx_wq_b ×21 CSA, bf16) ≈ 0.71 GB/tok. Context reads
+@ctx10240 ≈ 15 MB/tok (negligible; @12M the idx scan dominates instead — different regime).
+
+| config | total GB/tok | floor @800 GB/s eff. | floor tok/s | @720 (measured R) |
+|---|---|---|---|---|
+| bf16-pv dense       | 13.5 | 16.9 ms | **59**  | 53 |
+| int8 Q8_DENSE       | ~8.0 (counted 7.30–7.49) | 10.0 ms | **100** | 90 |
+| FP8 on-demand       | 7.9  | 9.9 ms  | 101 (unreachable: dequant-issue-bound 8–20% of R) | 91 |
+
+### Actual (measured this revisit, Q8 dense, tierb2)
+
+| run | tok/s | ms/tok | note |
+|---|---|---|---|
+| ctx10240 synthetic decode (no mHC) | **12.84** | 77.9 | == documented 13.03/76.7 ± alloc |
+| short-ctx ~109 REAL GEN (mHC)      | **9.45**  | 105.8 | the path that produces actual text |
+
+### Gap decomposition @ctx10240 (77.9 ms vs 10.0 ms floor = **7.8×**)
+
+| phase | ms | achieved GB/s | bound by |
+|---|---|---|---|
+| matvecs (qkv 7.41 + o_proj 9.33 + shared 6.11 + router 0.51 + experts 4.23 + head 1.98) | **29.6** | 7.3 GB/29.6 ms = **247 GB/s = 31% of 800** | issue/dispatch (µbench proves 85% per-matvec) |
+| attn (window+selected) | 15.0 | n/a (28 MB) | per-position SVE compute (already 6.6×-opt) |
+| tb2prep (lcmp 4.6 + topk 4.2 + scan 3.6 + qproj 3.2 + icmp 1.3 + rest) | 17.4 | n/a | per-position compute (already 19×-opt) |
+| other ≈ comm (43 EP all-reduces) | 13.5 | — | LATENCY: ~300 µs/reduce vs utofu tree bench 23.5 µs |
+| **total** | **77.9** | | |
+
+**The real-gen (mHC) path pays +36.7 ms/tok more** ("other" 50.2 vs 13.5): the hc_pre/hc_post
+hyper-connection wrap (86 calls/tok of f32 fn-matvec + sinkhorn + collapse/expand + 64 KB
+memcpys) — measured here for the first time as a top-level cost: **35% of the real-gen wall**,
+the same serial-scalar-between-dispatches pattern as the 2j/2k wins (15×/19× there).
+
+### Ranked non-MTP levers (expected effect on the REAL-GEN 105.8 ms wall)
+
+1. **Parallelize/vectorize mHC hc_pre/hc_post** (~37 → ~5 ms): pool-split the per-stream fn
+   matvecs + collapse loops (disjoint outputs ⇒ bit-exact, like 2j/2k). **+40% gen decode.**
+2. **Tree/pipelined EP all-reduce** (12.7 → ~2 ms): utofu tree = 23.5 µs measured vs ~300 µs
+   current. +12%. (bf16-payload variant REFUTED earlier — argmax flip; f32 tree is exact.)
+3. **Dense matvec issue efficiency** (29.6 → ~15 ms): 31% → ~55% of 800 (fuse per-layer matvec
+   chain into fewer pool dispatches, software prefetch, CMG-local Q8 blocks). +15–18%.
+4. **TP_HEAD** (−1.0 ms, bit-exact, already validated): vocab-shard the 1.06 GB head.
+5. Combined realistic: 105.8 → ~55 ms ⇒ **~18 tok/s real-gen** (synthetic ~45 ms ⇒ ~22 tok/s).
+   **Structural ceiling stays ~32 tok/s** (attn+tb2 per-position floor) — beyond that only
+   batched/spec decode (MTP) amortizes.
+
+> Profile hygiene: `ds4f_prof_names` top-level = indices 0..8 (`tb2*`/`qkv_*` entries are
+> sub-timers inside tb2prep/qkv, don't double-count); `o_proj` has the underscore (grep gotcha).
+
+### Prefill roofline estimate (same dims; compute-bound, unlike decode)
+
+Per-token mac counts/node (M≥8 batched GEMM, weights amortized): dense REPLICATED 5.73 Gmac
+(133.2M/layer × 43, every node) + routed experts 0.59 Gmac (6 × 25.2M × 43 /11) + head 0.53 +
+indexer proj 0.35 + attn ~0.7 @seq256 ≈ **~7.9 Gmac/tok/node**. A64FX fp32-FMA peak = 48 cores ×
+2 pipes × 16 lanes × 2 × 2.0 GHz = **3.07 Tmac/s/node**.
+
+| ceiling | value | note |
+|---|---|---|
+| BW @batch M (Q8 8.0 GB/M per tok) | crosses compute at **M≈5** | M≥8 ⇒ BW irrelevant (e.g. M=32: 0.25 GB/tok = 0.3 ms @800) |
+| FMA, dense replicated (today) | **~390–450 tok/s** | 3.07 T / 7.9–6.8 G; the 84%-redundant dense caps it |
+| FMA, TP-sharded dense (/11) | **~1900 tok/s** | dense 5.73→0.52 G ⇒ ~1.6 G/tok/node |
+
+**Actual**: batched prefill (synthetic-act path; force-OFF under mHC/tierb2) **56.3 tok/s
+@batch32** (Step 2o sweep; 39.5 @TILE=16 real-weight A/B) = **~13% of the 450 ceiling ⇒ ~8×
+gap**, dominated by GEMM kernel util (8x3-pv ≈ 7–13% of FMA peak; the FP16_GEMM_CEILING study
+proves 89% reachable with a tuned 12×2 kernel). Real-gen prefill (mHC+tierb2 forces M=1
+token-at-a-time) measured today: **10.4 tok/s** short-ctx gen / 18.1 synthetic — that path is
+governed by the DECODE roofline above (same per-token phases incl. the ~37 ms mHC tax), not by
+GEMM.
+
+Prefill levers (unchanged in priority from the earlier prefill plan, now tied to these numbers):
+(1) TP-compose batched prefill (ceiling 450→1900; ~140–170 tok/s at today's kernel util);
+(2) GEMM kernel port toward the 89%-proven 12×2 (3–4×); (3) batched tier-B2/mHC prefill — the
+M2b `ds4f_forward_verify` is exactly this machinery (batched dense + per-position tb2 under
+mHC), so the real-gen prefill could batch via verify(K≤8) chunks once generalized past K=8.
+
+> **Workstream split-out:** each lever above is packaged as an independent 1–4-node R&D
+> workstream (repro commands + per-agent resume prompts + validation ladder) in
+> **`a64fx/ds4f-opt.md`** — WS1 mHC-parallel, WS2 matvec issue, WS3 GEMM 12×2, WS4 tree
+> all-reduce. Only final integration A/Bs need the 11/12-node alloc.

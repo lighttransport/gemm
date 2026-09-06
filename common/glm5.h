@@ -53,7 +53,19 @@
 #include <time.h>
 #include <arm_sve.h>
 
-#include "ggml_dequant.h"   /* matvec_bf16_8row_pv + e8m0/fp8 helpers (shared with ds4f) */
+/* GLM5_IMPL translation units also need the scalar GGML dequantizers for the
+ * mixed-IQ GLM-5.2 GGUF path.  Each GLM executable is a single translation
+ * unit, so emitting the header implementation here does not create duplicate
+ * linker definitions. */
+#if defined(GLM5_IMPL) && !defined(GGML_DEQUANT_IMPLEMENTATION)
+#define GGML_DEQUANT_IMPLEMENTATION
+#define GLM5_OWNS_GGML_DEQUANT_IMPLEMENTATION
+#endif
+#include "ggml_dequant.h"   /* matvec_bf16_8row_pv + GGML IQ dequantizers */
+#ifdef GLM5_OWNS_GGML_DEQUANT_IMPLEMENTATION
+#undef GGML_DEQUANT_IMPLEMENTATION
+#undef GLM5_OWNS_GGML_DEQUANT_IMPLEMENTATION
+#endif
 #include "glm5_mem.h"         /* glm5_amalloc/glm5_acalloc/glm5_afree: 256-aligned NUMA-interleaved */
 
 /* ===================== config ===================== */
@@ -144,13 +156,35 @@ static inline int glm5_idx_q_dim(const glm5_config *c) { return c->index_n_heads
  * flat layout for norms/embed/index-norm read directly. GLM5_F32 for the router
  * gate + e_score bias (argmax-critical, kept high precision). MXFP4/Q8 reserved
  * for the later perf phase (same enum values as ds4f for kernel sharing). */
-typedef enum { GLM5_BF16 = 0, GLM5_FP8 = 1, GLM5_MXFP4 = 2, GLM5_F32 = 3, GLM5_BF16_PV = 4, GLM5_Q8_PV = 5, GLM5_MXFP8 = 6 } glm5_qtype;
+typedef enum {
+    GLM5_BF16 = 0, GLM5_FP8 = 1, GLM5_MXFP4 = 2, GLM5_F32 = 3,
+    GLM5_BF16_PV = 4, GLM5_Q8_PV = 5, GLM5_MXFP8 = 6, GLM5_INT8 = 7,
+    /* Values intentionally match enum ggml_dtype: the mixed-IQ dispatch can
+     * pass them directly to dequant_row/dequant_row_size. */
+    GLM5_Q8_0 = 8, GLM5_Q2_K = 10, GLM5_Q3_K = 11, GLM5_Q4_K = 12,
+    GLM5_Q5_K = 13, GLM5_Q6_K = 14, GLM5_IQ2_XS = 17,
+    GLM5_IQ3_XXS = 18, GLM5_IQ4_XS = 23
+} glm5_qtype;
+
+static inline int glm5_is_ggml_q(glm5_qtype t) {
+    return t == GLM5_Q8_0 || t == GLM5_Q2_K || t == GLM5_Q3_K ||
+           t == GLM5_Q4_K || t == GLM5_Q5_K || t == GLM5_Q6_K ||
+           t == GLM5_IQ2_XS || t == GLM5_IQ3_XXS || t == GLM5_IQ4_XS;
+}
+/* types the fast q8/a16 mixed-IQ row kernels implement; every other ggml type
+ * (e.g. the nextn block's Q2_K/Q3_K experts) must take the source-faithful
+ * dequant fallback — feeding them to the IQ kernels produces garbage. */
+static inline int glm5_iq_q8_ok(glm5_qtype t) {
+    return t == GLM5_IQ2_XS || t == GLM5_IQ3_XXS || t == GLM5_IQ4_XS;
+}
 
 typedef struct {
     void    *w;       /* weight bytes */
-    uint8_t *scale;   /* FP8 scale bytes (GLM5.2: F32 scale_inv blocks; NULL for BF16/F32) */
+    uint8_t *scale;   /* FP8: F32 scale_inv blocks; INT8: F32 per-row scale groups; NULL for BF16/F32 */
     glm5_qtype type;
     int rows, cols;   /* logical [rows, cols] */
+    int qg;           /* INT8 scale group size in cols (128 group / =cols per-channel); 0 otherwise */
+    int qg0;          /* INT8 original-column offset into the first copied scale group */
 } glm5_tensor;
 
 static inline size_t glm5_wbytes(glm5_qtype t, int rows, int cols) {
@@ -160,9 +194,19 @@ static inline size_t glm5_wbytes(glm5_qtype t, int rows, int cols) {
         case GLM5_BF16_PV: return n * 2;
         case GLM5_FP8:     return n;
         case GLM5_MXFP8:   return n;          /* 1 byte/elem (FP8 E4GLM5) */
+        case GLM5_INT8:    return n;          /* 1 byte/elem (int8 packed) */
         case GLM5_MXFP4:   return n / 2;
         case GLM5_F32:     return n * 4;
         case GLM5_Q8_PV:   return (size_t)(rows / 8) * (cols / 64) * 528;
+        case GLM5_Q8_0:
+        case GLM5_Q2_K:
+        case GLM5_Q3_K:
+        case GLM5_Q4_K:
+        case GLM5_Q5_K:
+        case GLM5_Q6_K:
+        case GLM5_IQ2_XS:
+        case GLM5_IQ3_XXS:
+        case GLM5_IQ4_XS:  return (size_t)rows * dequant_row_size((uint32_t)t, cols);
     }
     return 0;
 }
@@ -170,6 +214,7 @@ static inline size_t glm5_sbytes(glm5_qtype t, int rows, int cols) {
     switch (t) {
         case GLM5_FP8:   return (size_t)((rows + 127) / 128) * ((cols + 127) / 128) * 4;
         case GLM5_MXFP8: return (size_t)((rows + 127) / 128) * ((cols + 127) / 128) * 4;
+        case GLM5_INT8:  return (size_t)rows * ((cols + 127) / 128) * 4;  /* per-row f32 group scale */
         case GLM5_MXFP4: return (size_t)rows * (cols / 32);
         default:       return 0;
     }
@@ -207,7 +252,7 @@ static inline int glm5_n_owned(int n_experts, int ep_rank, int ep_size) {
 }
 
 /* ===================== layer / model ===================== */
-typedef struct {
+typedef struct glm5_layer_s {
     /* norms (BF16 [hidden], Gemma: applied as x*(1+w)) */
     uint16_t *input_norm;     /* input_layernorm */
     uint16_t *post_norm;      /* post_attention_layernorm */
@@ -232,6 +277,7 @@ typedef struct {
     glm5_tensor *ex_w1, *ex_w3, *ex_w2; /* owned routed experts, 0..n_owned-1 */
     int      *owned_eid;      /* global expert id of each owned slot */
     int       n_owned;
+    int       ex_iqok;   /* all owned expert tensors use the fast-IQ-kernel types */
     /* TP_SHARED: shared-expert intermediate shard [sh_r0, sh_r0+sh_rows) for w1/w3
      * (w2 input-sharded correspondingly, output EP-summed). */
     int sh_r0, sh_rows;
@@ -262,6 +308,9 @@ typedef struct glm5_pool glm5_pool;
 typedef struct {
     glm5_config cfg;
     int ep_rank, ep_size;
+    int ex_shard2, ex_no0;   /* 2-way expert shard (manifest "# expert_shard 2"); no0 = h0 slot count */
+    int bd_fused;            /* fused-batch decode layers (GLM5_BD_FUSED; runtime-togglable for A/B) */
+    int prefill_ntok;   /* tokens in the current prefill chunk; gates expert sdot (auto >= 1024) */
     glm5_layer *layers;
     /* embeddings / head (BF16; TP vocab-sharded) */
     uint16_t *embed;          /* [emb_rows, hidden] this rank's vocab shard */
@@ -288,19 +337,50 @@ typedef struct {
      * per-rank partial attention ( kv_combine_cb) + a cross-rank top-k block merge for MSA. */
     int int4_kv, cp_on, cp_nslot, cp_block;
     int kv_fp16;   /* uint16 KV path stores IEEE fp16 (GLM5_KV_FP16) instead of bf16 (quality ref) */
+    /* context-tiered prefill: a single job runs Tier A (cp_on=0 bf16, KV replicated, no per-token
+     * CP combine -- fast) while pos < T_cp, then re-shards the KV in place and flips to Tier B
+     * (cp_on=1 int4, CP-sharded) for the long tail. T_cp is derived from the per-rank memory
+     * budget (positions whose un-sharded KV fits). T_cp==0 disables tiering (static config). */
+    int T_cp;
+    /* T_dense: max positions attended DENSELY / the Tier-A window (= T_cp when tiered, else max_pos).
+     * The 256K+ buffer-layout invariant (a64fx/glm5/CTX_BUFFER_LAYOUT.md): every class-D
+     * (O(ctx), replicated) scratch/score buffer is bounded by T_dense, never by max_pos=T_ctx; the
+     * logical context grows only through the CP-sharded Tier-B KV (class E) and the maxsel/nblkmax-
+     * bounded MSA scratch (class B/C). */
+    int T_dense;
+    long kv_avail;   /* MemAvailable seen at kv_init; re-used to recompute T_cp after a Phase-2 merge
+                      * (bigger group -> fewer experts/rank -> more Tier-A KV budget -> higher T_cp). */
+    /* effective MSA on/off, decided by the tier (auto mode): OFF for a single un-sharded Tier A
+     * (dense attention is faster AND exact while the KV fits -- MSA's per-token index overhead
+     * dominates its sparse-attention savings at short/mid context), ON for tiered jobs (Tier B
+     * needs sparse + the index keys, so Tier A stores them). Static mode (GLM5_CP_THRESHOLD<0)
+     * keeps the GLM5_MSA env value. Read in the forward instead of the env. */
+    int msa_on;
     /* flash-combine of [n_heads*head_dim] partial out + per-head (max,sumexp) across EP ranks.
      * The runner provides a uTofu all-reduce specialized for the online-softmax merge. */
     void  (*kv_combine_cb)(float *out, float *mx, float *sumexp, int n_heads, int head_dim, void *ctx);
     void   *kv_combine_ctx;
+    /* batched flash-combine for a whole prefill chunk: merges all S tokens' partials in TWO
+     * collectives (one MAX over [S*nh], one SUM over the packed [S*(nh+nh*hd)] payload) instead
+     * of 2*S per-token collectives. out/mx/se are the contiguous per-token buffers with the given
+     * strides; bit-identical to calling kv_combine_cb per token. NULL => fall back to per-token. */
+    void  (*kv_combine_batch_cb)(float *out, float *mx, float *se, int S, int nh, int hd,
+                                 int out_stride, int mxse_stride, void *ctx);
+    void   *kv_combine_batch_ctx;
     /* all-reduce-MAX of the per-block index scores across EP ranks (each block owned by one
      * rank; non-owned entries are -inf) so every rank derives the same global top-k selection. */
     void  (*blk_reduce_cb)(float *scores, int nblk, void *ctx);
     void   *blk_reduce_ctx;
     /* scratch (per-forward, single token) */
     float *s_norm, *s_q, *s_k, *s_v, *s_kvb, *s_qabs, *s_ctx, *s_attn, *s_o;
+    float *s_q_lat;                    /* MLA q_a latent; separate from index-query output */
     float *s_idx_q, *s_idx_k;          /* MSA index projections */
     float *s_blk_score; int *s_blk_sel; int s_blk_nsel;  /* per-block scores + selected block ids */
     float *s_attn_score;               /* [local_heads, max_pos] decode attention scores */
+    float *s_pctx,*s_pmx,*s_pse,*s_qfull; /* parallel absorbed-attention tile partials */
+    void  *s_iqx,*s_iqx2;              /* fused-decode pre-quantized q8 activations (h2 / expert gate) */
+    int16_t *s_axq,*s_axq2; int64_t *s_axg,*s_axg2; /* fused-decode hoisted a16 activations (int8 dense) */
+    int16_t *s_bxq,*s_bxq2; float *s_bxsc,*s_bxsc2; int64_t *s_bxg,*s_bxg2; /* fused-batch (M<=4) preq activations */
     float *s_router, *s_shg, *s_shu, *s_sh, *s_exg, *s_exu, *s_moe;
     float *s_route;                    /* routed-expert partial (owned-only); EP-summed via ar_cb */
     float *s_ff_g, *s_ff_u, *s_ff;     /* dense FFN scratch */
@@ -310,6 +390,10 @@ typedef struct {
     void  (*ar_cb)(float *buf, int count, void *ctx);
     void   *ar_ctx;
     void  (*ar_argmax_cb)(float *val, int32_t *idx, void *ctx);  /* TP_HEAD argmax merge */
+    /* batched TP_HEAD merge: n (val, idx-as-float-bits) pairs in ONE collective. Used by the
+     * batched-decode head (M streams -> 1 AR instead of M). NULL => per-stream ar_argmax_cb. */
+    void  (*ar_argmax_n_cb)(float *vi, int n, void *ctx);
+    void   *ar_argmax_n_ctx;
     void   *ar_argmax_ctx;
     /* comm-overlap (optional): ar_async_start issues the all-reduce on a comm-driver thread
      * (returns immediately); ar_wait blocks for it. NULL => no overlap (use ar_cb). The
@@ -317,6 +401,23 @@ typedef struct {
     void  (*ar_async_start)(float *buf, int count, void *ctx);
     void  (*ar_wait)(void *ctx);
     void   *ar_async_ctx;
+    /* decode sampling (lockstep: identical s_logits + shared rng on every rank -> same token).
+     * samp_temp<=0 => greedy argmax (default, backward-compatible). Only active when the lm_head
+     * is REPLICATED (head.rows==vocab) so s_logits holds the full distribution on each rank. */
+    float    samp_temp;       /* temperature; <=0 disables sampling */
+    float    samp_topp;       /* nucleus top-p in (0,1]; >=1 disables the cutoff */
+    float    samp_rep_pen;    /* repetition penalty (>1 penalizes); <=1 disables */
+    uint64_t samp_rng;        /* xorshift64 state; SAME initial seed on all ranks */
+    const int *samp_hist;     /* generated-token history for the repetition penalty (runner-owned) */
+    int      samp_hist_n;
+    int     *samp_idx;        /* scratch [vocab] for top-p index sort (alloc'd lazily) */
+    /* MTP (multi-token prediction, checkpoint layer 78 "next-N"): draft head that predicts
+     * token t+2 from (hidden state at t, embedding of token t+1). NULL/unset => no MTP.
+     * mtp_layer is a FULL transformer block (own KV cache) run via a 1-layer model view. */
+    struct glm5_layer_s *mtp_layer;
+    uint16_t *mtp_enorm, *mtp_hnorm;   /* [hidden] RMSNorm weights for the two halves */
+    uint16_t *mtp_out_norm;            /* MTP shared_head.norm [hidden] (used in the view, not model.norm) */
+    glm5_tensor mtp_eh;                /* eh_proj [hidden, 2*hidden] */
     /* perf accounting */
     size_t bytes_read;
     double prof[16];
@@ -325,11 +426,11 @@ typedef struct {
 /* phase ids for glm5_model.prof[] */
 enum { GLM5_P_QKV=0, GLM5_P_QKNORM=1, GLM5_P_ROPE=2, GLM5_P_MSA_INDEX=3, GLM5_P_ATTN=4,
        GLM5_P_OPROJ=5, GLM5_P_ROUTER=6, GLM5_P_EXPERTS=7, GLM5_P_SHARED=8, GLM5_P_DENSE_FFN=9,
-       GLM5_P_HEAD=10, GLM5_P_OTHER=11 };
+       GLM5_P_HEAD=10, GLM5_P_OTHER=11, GLM5_P_ROUTE_AR=12 };
 #define GLM5_NPHASE 16
 static const char *glm5_prof_names[GLM5_NPHASE] = {
     "qkv_proj","qk_norm","rope","msa_index","attn","o_proj","router","experts",
-    "shared","dense_ffn","head","other","-","-","-","-" };
+    "shared","dense_ffn","head","other","route_ar","-","-","-" };
 
 /* CP slot mapping: block b=pos/cp_block owned by rank b%ep_size; owner stores it at a local
  * slot packed over its owned blocks. When cp_on==0 every rank stores all positions (slot==pos). */

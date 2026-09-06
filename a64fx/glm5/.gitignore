@@ -1,0 +1,19 @@
+# Transient run outputs from the GLM-5.2 runner/probes (not source).
+logs/
+*_run_*/
+*_run_*_*n/
+codegen_run_*/
+ar_probe_run_*/
+bestof_run_*/
+bestof1h_run_*/
+bisect_run_*/
+batch_run_*/
+cbatch_*_run_*/
+output.*/
+*.ids
+*_result*.txt
+tofu_topo.txt
+# staged/compiled artifacts that occasionally land here
+glm5_ep_runner
+gemma4_stage
+gemma4_pp_runner

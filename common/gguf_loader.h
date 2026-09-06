@@ -119,9 +119,10 @@ typedef struct {
     uint64_t dims[4];
     uint32_t type; /* ggml_dtype */
     uint64_t offset; /* offset from start of data section */
+    uint32_t file_index; /* zero for a single file; set by gguf_open_multi */
 } gguf_tensor_info;
 
-typedef struct {
+typedef struct gguf_context_s {
     uint32_t version;
     uint64_t n_kv;
     uint64_t n_tensors;
@@ -132,6 +133,14 @@ typedef struct {
     uint8_t *data;      /* pointer to tensor data (mmap'd or malloc'd) */
     size_t data_size;
     int use_mmap;
+    /* Split-GGUF support.  A merged context owns the metadata/tensor catalogue,
+     * while each tensor remains backed by the mmap belonging to its source
+     * shard.  Single-file contexts leave these fields NULL/zero. */
+    void **tensor_data;
+    int *tensor_fds;
+    uint64_t *tensor_file_offsets;
+    struct gguf_context_s **shards;
+    int n_shards;
 #ifdef _WIN32
     void *map_handle;
     void *file_handle;
@@ -142,6 +151,11 @@ typedef struct {
     size_t map_size;
     int fd;
 #endif
+    /* A multi-file context owns one ordinary context per GGUF shard.  The
+     * aggregate tensor table below keeps the public API unchanged while
+     * gguf_tensor_data() selects the owning shard. */
+    struct gguf_context **parts;
+    uint32_t n_parts;
 } gguf_context;
 
 /* A logical GGUF model may be split across several physical files.  The
@@ -154,6 +168,7 @@ typedef struct {
 } gguf_shards;
 
 gguf_context *gguf_open(const char *path, int use_mmap);
+gguf_context *gguf_open_multi(const char *path, int use_mmap);
 void gguf_close(gguf_context *ctx);
 gguf_shards *gguf_open_shards(const char *path, int use_mmap);
 void gguf_close_shards(gguf_shards *model);
@@ -193,6 +208,7 @@ static int gguf_find_key_internal(const gguf_context *ctx, const char *key) {
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #endif
 
 /* block_size, type_size pairs for ggml types */
@@ -355,6 +371,21 @@ static void gguf_free_kv(gguf_kv *kv) {
 }
 
 gguf_context *gguf_open(const char *path, int use_mmap) {
+#if defined(__linux__) && defined(SYS_set_mempolicy)
+    /* NUMA_INTERLEAVE=1: set the process default mempolicy to MPOL_INTERLEAVE before
+     * any weight allocation/first-touch (replicates `numactl --interleave=all` in-code,
+     * inherited by the pool/numa worker threads created later). M=1 decode matvec is
+     * BW-bound and reads each weight once with a 48-thread row-split; with a per-CMG
+     * (concentrated) placement it caps at one controller's BW (~60 GB/s). Interleaving
+     * across all 4 CMG controllers ~2x's the matvec BW (12B decode 2.2 -> 3.8 tok/s).
+     * Costs the compute-bound prefill GEMM ~6% (it prefers CMG-local) -> opt-in. */
+    if (getenv("NUMA_INTERLEAVE") && atoi(getenv("NUMA_INTERLEAVE"))) {
+        unsigned long nodemask = 0xFFUL;   /* nodes 0..7 (A64FX = 4 CMGs) */
+        long r = syscall(SYS_set_mempolicy, 3 /*MPOL_INTERLEAVE*/, &nodemask, 8UL);
+        fprintf(stderr, "gguf: MPOL_INTERLEAVE process mempolicy (decode BW)%s\n",
+                r == 0 ? "" : " [set_mempolicy failed]");
+    }
+#endif
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "gguf: cannot open %s\n", path); return NULL; }
 
@@ -433,6 +464,43 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         ctx->data_size = max_end;
     }
 
+    /* Metadata-only mode keeps the source fd for explicit chunked pread but
+     * neither maps nor allocates the tensor payload.  Rank-local stage builders
+     * use this to create HBM-resident shards without transiently mapping the
+     * full shared model. */
+    if (use_mmap == 3) {
+#ifdef _WIN32
+        goto fail;
+#else
+        ctx->fd = dup(fileno(f));
+        fclose(f); f = NULL;
+        if (ctx->fd < 0) goto fail;
+        /* Preserve tensor-presence semantics for metadata consumers.  The
+         * pointer is never dereferenced by a metadata-only caller; a complete
+         * resident stage must replace every tensor before inference. */
+        ctx->data = (uint8_t *)(uintptr_t)1;
+        fprintf(stderr, "gguf: metadata-only source (no tensor mmap/load)\n");
+        return ctx;
+#endif
+    }
+
+    /* Default to anonymous RAM load when the model fits comfortably in RAM:
+     * file-backed mmap pages are NUMA-mis-placed for the GEMM threads (reads stay
+     * ~storage-slow even when resident), while anonymous memory is first-touched
+     * distributed across CMGs by the NUMA parallel pread -> ~16x faster prefill GEMMs
+     * (measured: Gemma-4 12B BF16 2.8 -> 33 tok/s). Keep mmap for huge models that
+     * don't fit one node's RAM (sharded multi-node). Override with TF_FORCE_MMAP=1. */
+    if (use_mmap && getenv("NUMA_DISTRIBUTE") &&
+        !(getenv("TF_FORCE_MMAP") && atoi(getenv("TF_FORCE_MMAP")))) {
+        long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGE_SIZE);
+        size_t ram = (pages > 0 && psz > 0) ? (size_t)pages * (size_t)psz : 0;
+        if (ram && ctx->data_size < (size_t)((double)ram * 0.80)) {
+            use_mmap = 0;
+            fprintf(stderr, "gguf: model %.1fGB fits RAM %.1fGB -> anonymous load "
+                    "(NUMA-local, eviction-safe; TF_FORCE_MMAP=1 to keep mmap)\n",
+                    (double)ctx->data_size / 1e9, (double)ram / 1e9);
+        }
+    }
     /* load data */
     if (use_mmap) {
 #ifdef _WIN32
@@ -457,7 +525,9 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         ctx->map_size = (size_t)st.st_size;
         {
             int flags = MAP_PRIVATE;
-            if (!getenv("NUMA_DISTRIBUTE")) flags |= MAP_POPULATE;
+            if (use_mmap == 1 && !getenv("NUMA_DISTRIBUTE") &&
+                !(getenv("GGUF_LAZY_MMAP") && atoi(getenv("GGUF_LAZY_MMAP"))))
+                flags |= MAP_POPULATE;
             ctx->map_base = mmap(NULL, ctx->map_size, PROT_READ, flags, ctx->fd, 0);
         }
         if (ctx->map_base == MAP_FAILED) { ctx->map_base = NULL; goto fail; }
@@ -476,15 +546,54 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         }
         if (getenv("NUMA_DISTRIBUTE")) {
             /* NUMA mode: keep fd open for parallel pread later.
-             * Don't fread here — let transformer_numa_distribute() do
-             * parallel pread so first-touch places pages on correct CMG. */
+             * Large tensors are loaded later by transformer_numa_setup()
+             * so first-touch places pages on the consuming CMG. Small tensors
+             * may be copied during transformer_load(), so load them eagerly. */
             ctx->fd = fileno(f);
             /* Duplicate fd since fclose will close it */
             ctx->fd = dup(ctx->fd);
+            {
+                size_t eager_limit = 16 * 1024 * 1024;
+                const char *env = getenv("NUMA_EAGER_TENSOR_BYTES");
+                if (env) eager_limit = (size_t)atoll(env);
+                for (uint64_t i = 0; i < ctx->n_tensors; i++) {
+                    size_t sz = gguf_tensor_size(ctx, (int)i);
+                    if (sz == 0) continue;
+                    if (ctx->tensors[i].n_dims <= 1 || sz <= eager_limit) {
+                        uint8_t *dst = ctx->data + ctx->tensors[i].offset;
+                        size_t off = 0;
+                        while (off < sz) {
+                            size_t chunk = sz - off;
+                            if (chunk > 1024 * 1024) chunk = 1024 * 1024;
+                            ssize_t n = pread(ctx->fd, dst + off, chunk,
+                                              (off_t)(ctx->data_offset + ctx->tensors[i].offset + off));
+                            if (n <= 0) goto fail;
+                            off += (size_t)n;
+                        }
+                    }
+                }
+            }
             fclose(f); f = NULL;
         } else {
-            fseek(f, (long)ctx->data_offset, SEEK_SET);
-            if (fread(ctx->data, 1, ctx->data_size, f) != ctx->data_size) goto fail;
+            /* Chunked pread + drop the SOURCE file's page-cache per chunk. A single
+             * fread of the whole 24 GB would cache 24 GB of source pages ON TOP of the
+             * 24 GB anon dest -> page cache balloons -> kswapd thrash / interactive HANG.
+             * Reading in 64 MB chunks and posix_fadvise(DONTNEED) keeps the source-cache
+             * window tiny -> clean explicit anon (HBM2) upload. TF_LOAD_KEEPCACHE=1 disables. */
+            int dfd = fileno(f);
+            int keep = (getenv("TF_LOAD_KEEPCACHE") && atoi(getenv("TF_LOAD_KEEPCACHE")));
+            size_t off = 0, total = ctx->data_size;
+            while (off < total) {
+                size_t chunk = total - off;
+                if (chunk > 64u * 1024 * 1024) chunk = 64u * 1024 * 1024;
+                ssize_t n = pread(dfd, (uint8_t *)ctx->data + off, chunk,
+                                  (off_t)(ctx->data_offset + off));
+                if (n <= 0) goto fail;
+#if defined(POSIX_FADV_DONTNEED)
+                if (!keep) posix_fadvise(dfd, (off_t)(ctx->data_offset + off), (size_t)n, POSIX_FADV_DONTNEED);
+#endif
+                off += (size_t)n;
+            }
             fclose(f); f = NULL;
         }
     }
@@ -498,8 +607,112 @@ fail:
     return NULL;
 }
 
+gguf_context *gguf_open_multi(const char *path, int use_mmap) {
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    size_t blen = strlen(base);
+    if (blen < 16 || strcmp(base + blen - 5, ".gguf") != 0)
+        return gguf_open(path, use_mmap);
+
+    /* Recognize ...-00001-of-00002.gguf (width is not assumed). */
+    const char *of = NULL;
+    for (const char *p = base; (p = strstr(p, "-of-")) != NULL; p += 4) of = p;
+    if (!of) return gguf_open(path, use_mmap);
+    const char *idx_dash = of;
+    while (idx_dash > base && idx_dash[-1] != '-') idx_dash--;
+    if (idx_dash <= base || idx_dash[-1] != '-') return gguf_open(path, use_mmap);
+    const char *tot_begin = of + 4;
+    char *endp = NULL;
+    long total = strtol(tot_begin, &endp, 10);
+    if (total < 1 || !endp || strcmp(endp, ".gguf") != 0)
+        return gguf_open(path, use_mmap);
+    int idx_width = (int)(of - idx_dash);
+    int total_width = (int)(endp - tot_begin);
+    if (idx_width < 1 || total_width < 1 || total > 10000)
+        return gguf_open(path, use_mmap);
+
+    size_t dir_len = (size_t)(base - path);
+    size_t prefix_len = (size_t)(idx_dash - base - 1);
+    gguf_context **parts = (gguf_context **)calloc((size_t)total, sizeof(*parts));
+    if (!parts) return NULL;
+    uint64_t tensor_total = 0;
+    for (long s = 0; s < total; s++) {
+        size_t cap = strlen(path) + 64;
+        char *sp = (char *)malloc(cap);
+        if (!sp) goto multi_fail;
+        snprintf(sp, cap, "%.*s%.*s-%0*ld-of-%0*ld.gguf",
+                 (int)dir_len, path, (int)prefix_len, base,
+                 idx_width, s + 1, total_width, total);
+        /* mode 2 means lazy mmap; mode 3 is metadata + source fd only. */
+        parts[s] = gguf_open(sp, use_mmap == 3 ? 3 : (use_mmap ? 2 : 0));
+        free(sp);
+        if (!parts[s]) goto multi_fail;
+        tensor_total += parts[s]->n_tensors;
+    }
+
+    gguf_context *ctx = (gguf_context *)calloc(1, sizeof(*ctx));
+    if (!ctx) goto multi_fail;
+    ctx->version = parts[0]->version;
+    ctx->use_mmap = use_mmap;
+    ctx->alignment = parts[0]->alignment;
+    ctx->n_kv = parts[0]->n_kv;
+    ctx->kv = parts[0]->kv;          /* transfer metadata ownership */
+    parts[0]->n_kv = 0;
+    parts[0]->kv = NULL;
+    ctx->n_tensors = tensor_total;
+    ctx->tensors = (gguf_tensor_info *)calloc((size_t)tensor_total, sizeof(*ctx->tensors));
+    ctx->tensor_data = (void **)calloc((size_t)tensor_total, sizeof(*ctx->tensor_data));
+    ctx->tensor_fds = (int *)calloc((size_t)tensor_total, sizeof(*ctx->tensor_fds));
+    ctx->tensor_file_offsets = (uint64_t *)calloc((size_t)tensor_total, sizeof(*ctx->tensor_file_offsets));
+    if (!ctx->tensors || !ctx->tensor_data || !ctx->tensor_fds || !ctx->tensor_file_offsets) {
+        gguf_close(ctx);
+        goto multi_fail;
+    }
+    uint64_t out = 0;
+    for (long s = 0; s < total; s++) {
+        gguf_context *sctx = parts[s];
+        for (uint64_t j = 0; j < sctx->n_tensors; j++, out++) {
+            ctx->tensors[out] = sctx->tensors[j];
+            ctx->tensors[out].file_index = (uint32_t)s;
+            ctx->tensors[out].name.str = strdup(sctx->tensors[j].name.str);
+            if (!ctx->tensors[out].name.str) {
+                ctx->n_tensors = out;
+                gguf_close(ctx);
+                goto multi_fail;
+            }
+            ctx->tensor_data[out] = gguf_tensor_data(sctx, (int)j);
+#ifdef _WIN32
+            ctx->tensor_fds[out] = -1;
+#else
+            ctx->tensor_fds[out] = sctx->fd;
+#endif
+            ctx->tensor_file_offsets[out] =
+                (uint64_t)sctx->data_offset + sctx->tensors[j].offset;
+            ctx->data_size += gguf_tensor_size(sctx, (int)j);
+        }
+    }
+    ctx->shards = parts;
+    ctx->n_shards = (int)total;
+    ctx->n_parts = (uint32_t)total;
+    fprintf(stderr, "gguf: merged %ld shards, %llu tensors (lazy=%d)\n",
+            total, (unsigned long long)tensor_total, use_mmap != 0);
+    return ctx;
+
+multi_fail:
+    for (long s = 0; s < total; s++) if (parts[s]) gguf_close(parts[s]);
+    free(parts);
+    return NULL;
+}
+
 void gguf_close(gguf_context *ctx) {
     if (!ctx) return;
+    if (ctx->shards) {
+        for (int i = 0; i < ctx->n_shards; i++) gguf_close(ctx->shards[i]);
+        free(ctx->shards);
+    }
+    free(ctx->tensor_data);
+    free(ctx->tensor_fds);
+    free(ctx->tensor_file_offsets);
     if (ctx->kv) {
         for (uint64_t i = 0; i < ctx->n_kv; i++) gguf_free_kv(&ctx->kv[i]);
         free(ctx->kv);
@@ -518,6 +731,9 @@ void gguf_close(gguf_context *ctx) {
         if (ctx->fd > 0) close(ctx->fd);
 #endif
     } else {
+#ifndef _WIN32
+        if (ctx->fd > 0) close(ctx->fd);
+#endif
         free(ctx->data);
     }
     free(ctx);
@@ -654,7 +870,9 @@ const char *gguf_tensor_name(const gguf_context *ctx, int i) {
 
 void *gguf_tensor_data(const gguf_context *ctx, int i) {
     if (i < 0 || (uint64_t)i >= ctx->n_tensors) return NULL;
-    return ctx->data + ctx->tensors[i].offset;
+    if (ctx->tensor_data) return ctx->tensor_data[i];
+    if (ctx->use_mmap == 3) return (void *)(uintptr_t)(16u * (unsigned)(i + 1));
+    return ctx->data ? ctx->data + ctx->tensors[i].offset : NULL;
 }
 
 size_t gguf_tensor_size(const gguf_context *ctx, int i) {

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Generic GGUF split-shard staging helper.
-# Given one shard path (or single-file GGUF), copy all shards to shared local dir.
+# Given one shard path (or single-file GGUF), copy all shards to node-local storage.
 # Usage:
 #   stage_gguf_shards.sh /home/.../Model-00001-of-00002.gguf /local/models
 
@@ -55,7 +55,27 @@ for src in "${shards[@]}"; do
         continue
     fi
     t0=$(date +%s)
-    cp "$src" "$dst"
+    tmp="$dst.partial.$$"
+    rm -f "$tmp"
+
+    # Model files are commonly tens of GiB while an A64FX node has 32 GiB HBM.
+    # A plain cp lets clean source and dirty destination pages accumulate in the
+    # page cache.  Copy aligned whole-MiB blocks with direct I/O, then handle the
+    # (sub-MiB) tail normally before the atomic publish.
+    mib=$((1024 * 1024))
+    whole=$((want / mib))
+    tail=$((want % mib))
+    if [ "$whole" -gt 0 ]; then
+        dd if="$src" of="$tmp" bs="$mib" count="$whole" \
+            iflag=direct,fullblock oflag=direct status=none
+    fi
+    if [ "$tail" -gt 0 ]; then
+        dd if="$src" of="$tmp" bs="$mib" skip="$whole" seek="$whole" \
+            count=1 iflag=fullblock conv=notrunc,fsync status=none
+    else
+        sync -f "$tmp"
+    fi
+    mv -f "$tmp" "$dst"
     got=$(stat -c '%s' "$dst" 2>/dev/null)
     t1=$(date +%s)
     if [ "$got" != "$want" ]; then

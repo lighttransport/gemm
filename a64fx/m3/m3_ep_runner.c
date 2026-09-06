@@ -24,6 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <math.h>
+#include <sched.h>
 #include <utofu.h>
 
 #define M3_IMPL
@@ -151,6 +152,12 @@ static _Atomic int g_comm_go=0, g_comm_done=1, g_comm_stop=0;
 static float *g_comm_buf=NULL; static int g_comm_count=0;
 static pthread_t g_comm_th;
 static void* comm_driver(void *a){ (void)a;
+    /* M3_COMM_CORE=<cpu>: pin this comm-driver thread to a reserved core (run compute with
+     * OMP_NUM_THREADS = cores-1 so the spin-wait AR driver never shares a core with a compute
+     * thread — the Lever-2 de-risk for cross-layer comm overlap). Unset = float (legacy). */
+    { const char*cc=getenv("M3_COMM_CORE");
+      if(cc&&*cc){ int core=atoi(cc); cpu_set_t s; CPU_ZERO(&s); CPU_SET(core,&s);
+                   if(sched_setaffinity(0,sizeof s,&s)==0 && MyRank==0) logmsg("comm-driver pinned to core %d\n",core); } }
     for(;;){
         while(!atomic_load_explicit(&g_comm_go,memory_order_acquire) && !atomic_load_explicit(&g_comm_stop,memory_order_acquire))
             __asm__ __volatile__("yield":::"memory");

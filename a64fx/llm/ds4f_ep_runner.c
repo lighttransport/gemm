@@ -8,31 +8,39 @@
  * redundantly. The per-layer MoE combine is a single tp_allreduce_sum over the
  * routed-expert partial [hidden] (Stage 2). Shared expert stays local.
  *
- * Weights are SYNTHETIC (filled in HBM, no disk). Logits are MEANINGLESS; the
- * validation targets are: per-node memory fit (~20-26 GB), cross-rank lockstep
- * (identical step count + identical synthetic argmax, since activations are
- * seeded identically on every rank and the all-reduce makes s_route identical),
- * and decode/prefill throughput split into compute vs all-reduce comm.
+ * Weights are synthetic by default, or staged real weights when DS4F_REAL=1.
+ * Synthetic logits are MEANINGLESS; real generation additionally validates
+ * greedy token lockstep and completion quality. The shared validation targets
+ * are per-node memory fit, cross-rank lockstep, and decode/prefill throughput
+ * split into compute vs all-reduce communication.
  *
  * Build (native A64FX):
  *   make -C a64fx/llm ds4f_ep_runner CC=fcc OPENMP=1
  * Run (after tofu_topo_helper writes tofu_topo.txt, 1 proc/node):
- *   mpiexec -n 11 [-vcoordfile vcoord] build/ds4f_ep_runner
+ *   mpiexec -n 12 -vcoordfile vcoord build/ds4f_ep_runner
  *
- * Env (in addition to ds4f.h's DS4F_*):
- *   LLM_THREADS    compute threads (default 48)
- *   DS4F_PREFILL   synthetic prefill tokens (default 8)
- *   DS4F_MAXGEN    synthetic decode tokens (default 16)
- *   DS4F_MAXPOS    KV cache capacity / max position (default 4096)
- *   DS4F_LAYERS    override n_layers (default 43)
+ * CLI (the launcher passes these explicitly):
+ *   --threads N, --prefill N, --decode N, --max-pos N, --layers N,
+ *   --ctx-warm N, --prefill-batch N, --prefill-verify N,
+ *   --comm-poll-spins N, --comm-robust 0|1
+ * Environment (model/debug/compatibility settings only):
  *   DS4F_FP8_BF16  predequant dense FP8->BF16 (default 0 = on-demand FP8)
+ *   DS4F_REQUIRE_NODES  fail fast unless topology has this many ranks
+ *   DS4F_STATUS_DIR     durable per-rank state files (default current dir)
+ *   DS4F_COMM_ROBUST    use retrying phase barriers (default 1)
+ *   DS4F_COMM_POLL_SPINS bounded TCQ polling while a Put is busy (default 1;
+ *                        higher values are an opt-in performance experiment)
+ *   DS4F_COMM_MODE      flat (default) or 2d hierarchical all-reduce
+ *   DS4F_COMM_2D_A      first 2D factor; N must be divisible by A
  */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <utofu.h>
@@ -41,22 +49,124 @@
 #include "../utofu-tests/tofu_demo.h"
 #include "../utofu-tests/tp_allreduce.h"
 
-#define MAX_NODES 128  /* DS4P 96-node 1M run (96=8x12=6x16); 108 for co-serving. Was 96; 32 for 11-node DS4F */
+#define MAX_NODES 32
 #define RUN_STAG  DEMO_STAG
 #define WAIT_TIMEOUT_SEC 300.0   /* tolerate cold first-touch skew across ranks */
 
 static FILE *g_log = NULL;
+static int N = -1, MyRank = -1;
+static int g_comm_poll_spins = 4;
+static int g_comm_robust = 1;
+
+/* K3-style durable per-rank state. mpiexec commonly drops rank stdout and
+ * stderr, so an atomic status file makes load/bootstrap failures diagnosable. */
+static void write_status(const char *state, const char *detail) {
+    const char *dir = getenv("DS4F_STATUS_DIR");
+    if (!dir || !*dir) dir = ".";
+    const char *re = getenv("DS4F_EP_RANK");
+    int rank = MyRank >= 0 ? MyRank : (re && *re ? atoi(re) : 0);
+    char path[1024], tmp[1080];
+    snprintf(path, sizeof path, "%s/ds4f_status_rank%02d.txt", dir, rank);
+    snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "state=%s\nrank=%d\nnodes=%d\npid=%ld\nrun_tag=%s\n",
+            state ? state : "unknown", rank, N, (long)getpid(),
+            getenv("DS4F_RUN_TAG") ? getenv("DS4F_RUN_TAG") : "-");
+    if (detail && *detail) fprintf(f, "detail=%s\n", detail);
+    fflush(f);
+    fclose(f);
+    rename(tmp, path);
+}
+
 static void logmsg(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     if (g_log) { va_list ap2; va_copy(ap2, ap); vfprintf(g_log, fmt, ap2); va_end(ap2); fflush(g_log); }
     vfprintf(stderr, fmt, ap); va_end(ap);
 }
-static void die(const char *what, int rc) { logmsg("FATAL: %s (rc=%d)\n", what, rc); exit(1); }
+static void die(const char *what, int rc) {
+    logmsg("FATAL: %s (rc=%d)\n", what, rc);
+    write_status("failed", what);
+    exit(1);
+}
 static double now_sec(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 static int envi(const char *k, int d) { const char *v = getenv(k); return (v && *v) ? atoi(v) : d; }
+
+typedef struct {
+    int threads, cmgs, prefill, maxgen, maxpos, layers, ctx_warm;
+    int prefill_batch, prefill_verify, comm_poll_spins, comm_robust;
+} runner_opts;
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "usage: %s [options]\n"
+        "  --threads N             compute threads (default 48)\n"
+        "  --cmgs N                CMG count (default 4)\n"
+        "  --prefill N             synthetic prefill tokens (default 8)\n"
+        "  --decode N              synthetic decode tokens (default 16)\n"
+        "  --max-pos N             KV capacity (default 4096)\n"
+        "  --layers N              layer override (default model)\n"
+        "  --ctx-warm N            warm synthetic context (default 0)\n"
+        "  --prefill-batch N       batched prefill size (default 0)\n"
+        "  --prefill-verify N      verify prefill size (default 0)\n"
+        "  --comm-poll-spins N     bounded TCQ polling (default 1)\n"
+        "  --comm-robust 0|1       retrying barriers (default 1)\n"
+        "  --help                  show this text\n"
+        "Execution controls are intentionally CLI-only; environment is reserved for model/debug settings.\n", prog);
+}
+
+static void parse_cli(int argc, char **argv, runner_opts *o) {
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--help")) { usage(argv[0]); exit(0); }
+        int *dst = NULL;
+        if (!strcmp(a, "--threads") || !strcmp(a, "--cmgs") || !strcmp(a, "--prefill") ||
+            !strcmp(a, "--decode") || !strcmp(a, "--max-pos") || !strcmp(a, "--layers") ||
+            !strcmp(a, "--ctx-warm") || !strcmp(a, "--prefill-batch") ||
+            !strcmp(a, "--prefill-verify") || !strcmp(a, "--comm-poll-spins") ||
+            !strcmp(a, "--comm-robust")) {
+            if (i + 1 >= argc) { fprintf(stderr, "%s needs an integer\n", a); exit(2); }
+            if (!strcmp(a, "--threads")) dst=&o->threads; else if (!strcmp(a, "--cmgs")) dst=&o->cmgs;
+            else if (!strcmp(a, "--prefill")) dst=&o->prefill; else if (!strcmp(a, "--decode")) dst=&o->maxgen;
+            else if (!strcmp(a, "--max-pos")) dst=&o->maxpos; else if (!strcmp(a, "--layers")) dst=&o->layers;
+            else if (!strcmp(a, "--ctx-warm")) dst=&o->ctx_warm; else if (!strcmp(a, "--prefill-batch")) dst=&o->prefill_batch;
+            else if (!strcmp(a, "--prefill-verify")) dst=&o->prefill_verify; else if (!strcmp(a, "--comm-poll-spins")) dst=&o->comm_poll_spins;
+            else dst=&o->comm_robust;
+            char *end = NULL; long v = strtol(argv[++i], &end, 10);
+            if (!end || *end || v < -2147483647L || v > 2147483647L) { fprintf(stderr, "invalid integer for %s\n", a); exit(2); }
+            *dst = (int)v;
+        } else {
+            fprintf(stderr, "unknown option: %s\n", a); usage(argv[0]); exit(2);
+        }
+    }
+}
+
+static int file_exists(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
+}
+
+static void preflight_stage(const char *blob_dir, int rank, int ep_size) {
+    if (!envi("DS4F_REAL", 0)) return;
+    if (!blob_dir || !*blob_dir) die("DS4F_REAL=1 requires DS4F_STAGE_DIR", -1);
+    char blob[1200], manifest[1200];
+    snprintf(blob, sizeof blob, "%s/rank%02d.blob", blob_dir, rank);
+    snprintf(manifest, sizeof manifest, "%s/rank%02d.manifest", blob_dir, rank);
+    if (!file_exists(blob) || !file_exists(manifest)) {
+        char msg[1400];
+        snprintf(msg, sizeof msg, "missing staged rank files for rank %d/%d in %s", rank, ep_size, blob_dir);
+        die(msg, -1);
+    }
+    int required = envi("DS4F_REQUIRE_NODES", 0);
+    if (required > 0 && ep_size != required) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "requires %d ranks but topology has %d", required, ep_size);
+        die(msg, -1);
+    }
+}
 
 /* splitmix64 -> deterministic synthetic activations (IDENTICAL on every rank) */
 static uint64_t sm_state;
@@ -100,18 +210,10 @@ static void embed_lookup(const ds4f_model *m, int tok, float *x) {
     }
 }
 
-/* ---- topology (tofu_topo.txt; written once by tofu_topo_helper) ----
- * TOPO_PATH (default tofu_topo.txt) may be overridden per process via TOFU_TOPO_PATH
- * so co-resident EP groups (e.g. ds4p on 96 nodes + ds4f on 12) can keep SEPARATE
- * topo files in one allocation. tofu_topo_helper honors the same env. */
-static const char *topo_path(void) {
-    const char *t = getenv("TOFU_TOPO_PATH");
-    return (t && *t) ? t : TOPO_PATH;
-}
+/* ---- topology (tofu_topo.txt; written once by tofu_topo_helper) ---- */
 static int read_topo(uint8_t coords[][TOFU_NCOORDS]) {
-    const char *tp = topo_path();
-    FILE *f = fopen(tp, "r");
-    if (!f) { fprintf(stderr, "cannot open %s (run tofu_topo_helper first)\n", tp); exit(1); }
+    FILE *f = fopen(TOPO_PATH, "r");
+    if (!f) { perror("cannot open " TOPO_PATH); fprintf(stderr, "  (run tofu_topo_helper first)\n"); exit(1); }
     int n = 0; char line[256];
     while (fgets(line, sizeof line, f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
@@ -119,17 +221,16 @@ static int read_topo(uint8_t coords[][TOFU_NCOORDS]) {
         unsigned r, c[TOFU_NCOORDS];
         if (sscanf(line, "%u %u %u %u %u %u %u", &r, &c[0], &c[1], &c[2], &c[3], &c[4], &c[5]) != 7)
             { fprintf(stderr, "malformed line: %s", line); exit(1); }
-        if ((int)r != n) { fprintf(stderr, "%s ranks out of order\n", tp); exit(1); }
+        if ((int)r != n) { fprintf(stderr, "%s ranks out of order\n", TOPO_PATH); exit(1); }
         for (int k = 0; k < TOFU_NCOORDS; k++) coords[n][k] = (uint8_t)c[k];
         n++;
     }
     fclose(f);
-    if (n < 1) { fprintf(stderr, "%s lists %d node(s)\n", tp, n); exit(1); }
+    if (n < 1) { fprintf(stderr, "%s lists %d node(s)\n", TOPO_PATH, n); exit(1); }
     return n;
 }
 
 /* ---- uTofu state (barrier region; the all-reduce keeps its own region) ---- */
-static int             N, MyRank;
 static char           *Region;
 static size_t          SEND_OFF, BAR_BASE, SlotSend, SlotB;
 static utofu_vcq_hdl_t Vcq;
@@ -145,7 +246,12 @@ static inline size_t bar_go_off(void)    { return BAR_BASE + (size_t)N * SlotB; 
 static void put_issue(utofu_vcq_id_t pv, utofu_stadd_t s, utofu_stadd_t d, size_t len, int drain) {
     int rc; void *cb;
     for (;;) { rc = utofu_put(Vcq, pv, s, d, len, 0, FLAGS, NULL);
-               if (rc != UTOFU_ERR_BUSY) break; utofu_poll_tcq(Vcq, 0, &cb); }
+               if (rc != UTOFU_ERR_BUSY) break;
+               for (int i = 0; i < g_comm_poll_spins; i++) {
+                   int prc = utofu_poll_tcq(Vcq, 0, &cb);
+                   if (prc != UTOFU_ERR_NOT_FOUND) break;
+               }
+             }
     if (rc != UTOFU_SUCCESS) die("utofu_put", rc);
     if (drain) { do { rc = utofu_poll_tcq(Vcq, 0, &cb); } while (rc == UTOFU_ERR_NOT_FOUND);
                  if (rc != UTOFU_SUCCESS) die("utofu_poll_tcq", rc); }
@@ -177,49 +283,88 @@ static void barrier_robust(int robust) {
         } while (*go < t);
     }
 }
-static void barrier(void) { barrier_robust(0); }   /* tp_comm_init's barrier_fn */
+static void barrier(void) { barrier_robust(g_comm_robust); }   /* tp_comm_init's barrier_fn */
 
 /* ---- EP combine all-reduce callback (model -> tp_allreduce.h) ---- */
 static double g_ar_secs = 0.0; static long g_ar_calls = 0;
+typedef struct {
+    tp_comm flat;
+    tp_comm row, col;
+    int mode_2d;
+    int factor_a;
+} ds4f_comm;
+
 static void ep_ar_callback(float *buf, int count, void *ctx) {
-    tp_comm *c = (tp_comm *)ctx;
+    ds4f_comm *dc = (ds4f_comm *)ctx;
+    tp_comm *c = dc->mode_2d ? &dc->row : &dc->flat;
     int mc = c->max_count > 0 ? c->max_count : count;
     double t0 = now_sec();
     for (int off = 0; off < count; ) {
         int n = count - off; if (n > mc) n = mc;
-        tp_allreduce_sum(c, buf + off, n);
+        if (dc->mode_2d) tp_allreduce_sum_2d(&dc->row, &dc->col, buf + off, n);
+        else            tp_allreduce_sum(c, buf + off, n);
         off += n;
     }
     g_ar_secs += now_sec() - t0; g_ar_calls++;
 }
 /* (val, global-idx) argmax all-reduce callback (TP_HEAD batched-prefill head merge). */
 static void ep_argmax_callback(float *val, int32_t *idx, void *ctx) {
-    tp_allreduce_argmax((tp_comm *)ctx, val, idx);
+    ds4f_comm *dc = (ds4f_comm *)ctx;
+    if (dc->mode_2d) tp_allreduce_argmax_2d(&dc->row, &dc->col, val, idx);
+    else            tp_allreduce_argmax(&dc->flat, val, idx);
 }
 /* MAX all-reduce callback (Phase-2 CP online-softmax combine: global per-head max). */
 static void ep_armax_callback(float *buf, int count, void *ctx) {
-    tp_comm *c = (tp_comm *)ctx;
+    ds4f_comm *dc = (ds4f_comm *)ctx;
+    tp_comm *c = dc->mode_2d ? &dc->row : &dc->flat;
     int mc = c->max_count > 0 ? c->max_count : count;
     double t0 = now_sec();
     for (int off = 0; off < count; ) {
         int n = count - off; if (n > mc) n = mc;
-        tp_allreduce_max(c, buf + off, n);
+        if (dc->mode_2d) tp_allreduce_max_2d(&dc->row, &dc->col, buf + off, n);
+        else            tp_allreduce_max(c, buf + off, n);
         off += n;
     }
     g_ar_secs += now_sec() - t0; g_ar_calls++;
 }
 
-int main(void) {
+static int ds4f_comm_init(ds4f_comm *dc, utofu_vcq_hdl_t vcq,
+                          const utofu_vcq_id_t *peer_vcq, int rank, int nprocs,
+                          int max_count) {
+    memset(dc, 0, sizeof *dc);
+    const char *mode = getenv("DS4F_COMM_MODE");
+    int want_2d = mode && (!strcmp(mode, "2d") || !strcmp(mode, "hier") || !strcmp(mode, "hierarchical"));
+    if (want_2d) {
+        int a = envi("DS4F_COMM_2D_A", 0);
+        if (a <= 0) a = (nprocs % 4 == 0) ? 4 : ((nprocs % 3 == 0) ? 3 : 0);
+        if (a > 0 && nprocs % a == 0 &&
+            tp_comm_init_2d(&dc->row, &dc->col, vcq, peer_vcq, rank, nprocs, a, max_count, barrier) == 0) {
+            dc->mode_2d = 1;
+            dc->factor_a = a;
+            if (MyRank == 0) logmsg("DS4F_COMM_MODE=2d A=%d B=%d\n", a, nprocs / a);
+            return 0;
+        }
+        if (MyRank == 0) logmsg("DS4F_COMM_MODE=2d unavailable; falling back to flat\n");
+    }
+    if (tp_comm_init(&dc->flat, vcq, peer_vcq, rank, nprocs, max_count, barrier) != 0) return -1;
+    if (MyRank == 0) logmsg("DS4F_COMM_MODE=flat\n");
+    return 0;
+}
+
+int main(int argc, char **argv) {
     int rc;
-    int n_threads = envi("LLM_THREADS", 48);
-    int n_cmgs    = envi("DS4F_CMGS", 4);
-    int prefill   = envi("DS4F_PREFILL", 8);
-    int maxgen    = envi("DS4F_MAXGEN", 16);
-    int maxpos    = envi("DS4F_MAXPOS", 4096);
-    int layers    = envi("DS4F_LAYERS", 0);
-    int ctx_warm  = envi("DS4F_CTX_WARM", 0);   /* fill synthetic KV+compressed to this ctx, decode from there */
-    int prefill_batch = envi("DS4F_PREFILL_BATCH", 0);   /* >0: batched M-token GEMM prefill (needs exact + dense bf16) */
+    runner_opts opt = { 48, 4, 8, 16, 4096, 0, 0, 0, 0, 1, 1 };
+    parse_cli(argc, argv, &opt);
+    int n_threads = opt.threads, n_cmgs = opt.cmgs, prefill = opt.prefill, maxgen = opt.maxgen;
+    int maxpos = opt.maxpos, layers = opt.layers, ctx_warm = opt.ctx_warm;
+    int prefill_batch = opt.prefill_batch, prefill_verify = opt.prefill_verify;
+    g_comm_poll_spins = opt.comm_poll_spins;
+    if (g_comm_poll_spins < 1) g_comm_poll_spins = 1;
+    if (g_comm_poll_spins > 64) g_comm_poll_spins = 64;
+    g_comm_robust = opt.comm_robust != 0;
     if (prefill_batch > DS4F_MAX_MTILE) prefill_batch = DS4F_MAX_MTILE;
+    if (prefill_verify > DS4F_MAX_MTILE) prefill_verify = DS4F_MAX_MTILE;
+    if (prefill_verify < 0) prefill_verify = 0;
 
     /* ---- real greedy generation mode (coding-task quality test) ----
      * DS4F_PROMPT_IDS=<file of whitespace-separated token ids> turns on real
@@ -229,6 +374,7 @@ int main(void) {
      * cross-rank lockstep preserved with no extra broadcast. */
     const char *prompt_ids_file = getenv("DS4F_PROMPT_IDS");
     const char *gen_out_file    = getenv("DS4F_GEN_OUT");
+    const char *prefill_out_file = getenv("DS4F_PREFILL_OUT");
     int gen_mode = (prompt_ids_file && *prompt_ids_file);
     int max_new  = envi("DS4F_MAX_NEW", 256);
     int *prompt_ids = NULL, n_prompt = 0;
@@ -243,6 +389,11 @@ int main(void) {
         }
         fclose(pfh);
         if (n_prompt < 1) die("DS4F_PROMPT_IDS file has no ids", -1);
+        /* Benchmark harness: allow a long fixed corpus to be measured at a
+         * shorter exact-causal length without generating another tracked
+         * artifact.  The default remains the complete prompt. */
+        int prompt_limit = envi("DS4F_PROMPT_LIMIT", 0);
+        if (prompt_limit > 0 && n_prompt > prompt_limit) n_prompt = prompt_limit;
         prefill = n_prompt;     /* prefill the whole prompt token-at-a-time */
         maxgen  = max_new;      /* decode up to max_new new tokens */
         prefill_batch = 0;      /* greedy feedback needs the per-token embedding */
@@ -263,7 +414,7 @@ int main(void) {
     N = read_topo(topo);
     MyRank = -1;
     for (int r = 0; r < N; r++) if (memcmp(topo[r], my_coords, TOFU_NCOORDS) == 0) MyRank = r;
-    if (MyRank == -1) { fprintf(stderr, "my coords not in %s\n", topo_path()); exit(1); }
+    if (MyRank == -1) { fprintf(stderr, "my coords not in %s\n", TOPO_PATH); exit(1); }
 
     /* FJ mpiexec drops per-rank stderr -> capture to a file so diagnostics survive */
     {   char en[64]; snprintf(en, sizeof en, "ds4f_ep_stderr_rank%02d.txt", MyRank);
@@ -271,9 +422,18 @@ int main(void) {
         setvbuf(stderr, NULL, _IOLBF, 0);
     }
     if (MyRank == 0) g_log = fopen("ds4f_ep_rank00.txt", "w");
+    write_status("topology", "rank mapped to tofu_topo.txt");
+    {
+        int required = envi("DS4F_REQUIRE_NODES", 0);
+        if (required > 0 && N != required) {
+            char msg[256];
+            snprintf(msg, sizeof msg, "requires %d ranks but topology has %d", required, N);
+            die(msg, -1);
+        }
+    }
 
     int ep_rank = MyRank, ep_size = N;
-    ds4f_config cfg = ds4f_config_from_env();
+    ds4f_config cfg = ds4f_default_config();
     cfg.max_pos = maxpos;
     if (layers > 0) cfg.n_layers = layers;
     if (prefill + maxgen > cfg.max_pos) die("prefill+maxgen exceeds max_pos", -1);
@@ -324,6 +484,8 @@ int main(void) {
      * Else synthetic fill. Loader forces dense=FP8 (ignores the synth dense knobs). */
     int real_weights = envi("DS4F_REAL", 0);
     const char *blob_dir = getenv("DS4F_STAGE_DIR");
+    preflight_stage(blob_dir, ep_rank, ep_size);
+    write_status("loading", real_weights ? "staged real weights" : "synthetic weights");
     double ta0 = now_sec();
     ds4f_model *m = real_weights
         ? ds4f_load_real(cfg, ep_rank, ep_size, blob_dir, n_threads, n_cmgs)
@@ -345,6 +507,7 @@ int main(void) {
         if (tf) { fprintf(tf, "rank %d: alloc+first-touch=%.2fs arena_used=%.2f GB RSS=%.2f GB owned=%d/layer\n",
                           MyRank, ta1-ta0, m->arena_used/1e9, rss_bytes()/1e9, no); fclose(tf); }
     }
+    write_status("loaded", "model allocation and first touch complete");
 
     /* ---- barrier region (own cache line per remote-written slot) ---- */
     SlotSend = DEMO_CACHE_LINE; SlotB = DEMO_CACHE_LINE; SEND_OFF = 0; BAR_BASE = SlotSend;
@@ -412,20 +575,23 @@ int main(void) {
         m->mxfp4_gemm_tile = 16;
         if (MyRank == 0) logmsg("batched prefill: MXFP4 GEMM tile-dequant default ON (DS4F_MXFP4_GEMM_TILE=16)\n");
     }
-    int ar_mtile = (prefill_batch > 0 && prefill > 0)
-                 ? (prefill_batch < prefill ? prefill_batch : prefill) : 1;
+    int requested_mtile = prefill_batch > prefill_verify ? prefill_batch : prefill_verify;
+    int ar_mtile = (requested_mtile > 0 && prefill > 0)
+                 ? (requested_mtile < prefill ? requested_mtile : prefill) : 1;
 
     /* ---- all-reduce comm region (hidden*ar_mtile floats) + wire model hook ---- */
-    static tp_comm comm;
-    if (tp_comm_init(&comm, Vcq, PeerVcq, MyRank, N, cfg.hidden * ar_mtile, barrier) != 0)
-        die("tp_comm_init", -1);
+    static ds4f_comm comm;
+    if (ds4f_comm_init(&comm, Vcq, PeerVcq, MyRank, N, cfg.hidden * ar_mtile) != 0)
+        die("ds4f_comm_init", -1);
     m->ar_cb = ep_ar_callback; m->ar_ctx = &comm;
     m->ar_max_cb = ep_armax_callback; m->ar_max_ctx = &comm;
     m->ar_argmax_cb = ep_argmax_callback; m->ar_argmax_ctx = &comm;
 
     barrier_robust(1);   /* everyone past load + comm init (robust: tolerate skew) */
-    if (MyRank == 0) logmsg("all %d ranks past bootstrap barrier; starting prefill%s\n",
-                            N, prefill_batch > 0 ? " [batched M-token GEMM]" : "");
+    write_status("ready", "all ranks past uTofu bootstrap and collective init");
+        if (MyRank == 0) logmsg("all %d ranks past bootstrap barrier; starting prefill%s\n",
+                            N, prefill_batch > 0 ? " [batched M-token GEMM]" :
+                            (prefill_verify > 1 ? " [chunked mHC/Tier-B2 verify]" : ""));
 
     /* Stage-A self-test (post-barrier so every rank's comm is live): verify
      * tp_allreduce_max == serial max + lockstep (every rank computes the same expected
@@ -455,11 +621,21 @@ int main(void) {
      * bit-identical on every rank -> replicated dense + lockstep argmax preserved. ---- */
     double t_pf0 = now_sec(); size_t pf_bytes = 0; g_ar_secs = 0; g_ar_calls = 0;
     int nan_count = 0; double xnorm = 0.0; int pf_last_tok = -1;
+    int *prefill_out = (gen_mode && prefill_out_file && *prefill_out_file)
+                     ? (int *)malloc((size_t)prefill * sizeof(int)) : NULL;
     int mtp_on = gen_mode && m->has_mtp;   /* DS4F_MTP self-spec: maintain MTP KV (prefill+decode) + measure accept rate */
     int spec_on = mtp_on && envi("DS4F_SPEC", 0);   /* DS4F_SPEC: gamma=1 speculative decode loop */
+    int mtp_alpha = mtp_on && !spec_on && envi("DS4F_MTP_ALPHA", 0);  /* alpha measurement costs a draft/step --
+                                          * opt-in so DS4F_MTP=1 alone doesn't contaminate decode baselines */
+    /* batched verify (ds4f_gemm) under Q8_PV NaNs in the small-M remainder kernel (WS in ds4f-opt.md);
+     * spec decode is a bf16-dense lever anyway (Q8 batched is dequant-bound) -> require Q8 off. */
+    if (m->q8_dense && (spec_on || envi("DS4F_GEMM_DECODE", 0)))
+        die("DS4F_SPEC / DS4F_GEMM_DECODE need DS4F_Q8_DENSE=0", -1);
     float *xe = mtp_on ? (float *)aligned_alloc(64, (size_t)C * 4) : NULL;
     int mtp_prev_draft = -1, mtp_hits = 0, mtp_total = 0;
     sm_state = 0xD5F00D;   /* SAME seed on every rank -> replicated dense + valid all-reduce */
+    if (prefill_batch > 0 && prefill_verify > 0)
+        die("DS4F_PREFILL_BATCH and DS4F_PREFILL_VERIFY are mutually exclusive", -1);
     if (prefill_batch > 0 && prefill > 0) {
         ds4f_alloc_prefill_batch(m, ar_mtile);
         float *X  = (float *)aligned_alloc(256, (size_t)ar_mtile * C * 4);
@@ -477,6 +653,38 @@ int main(void) {
         const float *xl = m->p_x + (size_t)(Mlast-1)*C;
         for (int i = 0; i < C; i++) { if (!(xl[i] == xl[i])) nan_count++; xnorm += (double)xl[i]*xl[i]; }
         free(X); free(bt);
+    } else if (gen_mode && prefill_verify > 1 && prefill > 0) {
+        /* Real prompt prefill: run causal mHC/Tier-B2 verification in chunks.
+         * forward_verify updates the per-layer caches in position order while
+         * batching dense projections, routed GEMMs, and the [K,C] EP reduce. */
+        int Kmax = prefill_verify;
+        ds4f_alloc_prefill_batch(m, Kmax);
+        float *Xv = (float *)aligned_alloc(256, (size_t)Kmax * C * 4);
+        float *Hv = (float *)aligned_alloc(256, (size_t)Kmax * m->cfg.hc_mult * C * 4);
+        int *ot = (int *)malloc((size_t)Kmax * sizeof(int));
+        int tf_check = envi("DS4F_TF_CHECK", 0), tf_correct = 0, tf_total = 0;
+        for (int base = 0; base < prefill; base += Kmax) {
+            int K = prefill - base < Kmax ? prefill - base : Kmax;
+            for (int k = 0; k < K; k++) embed_lookup(m, prompt_ids[base + k], Xv + (size_t)k * C);
+            m->bytes_read = 0;
+            ds4f_forward_verify(m, Xv, K, base, ot, Hv, NULL);
+            if (prefill_out) memcpy(prefill_out + base, ot, (size_t)K * sizeof(int));
+            pf_bytes += m->bytes_read;
+            pf_last_tok = ot[K - 1];
+            for (int k = 0; k < K; k++) if (tf_check && base + k + 1 < prefill) {
+                int hit = ot[k] == prompt_ids[base + k + 1];
+                tf_correct += hit; tf_total++;
+            }
+        }
+        if (tf_check && MyRank == 0)
+            logmsg("TF_ACCURACY %d/%d = %.1f%% (chunked verify)\n",
+                   tf_correct, tf_total, tf_total ? 100.0 * tf_correct / tf_total : 0.0);
+        const float *hl = Hv + (size_t)((prefill - 1) % Kmax) * m->cfg.hc_mult * C;
+        for (int i = 0; i < m->cfg.hc_mult * C; i++) {
+            if (!(hl[i] == hl[i])) nan_count++;
+            xnorm += (double)hl[i] * hl[i];
+        }
+        free(Xv); free(Hv); free(ot);
     } else {
         int tf_check = gen_mode && envi("DS4F_TF_CHECK", 0);
         int tf_correct = 0, tf_total = 0;
@@ -485,11 +693,12 @@ int main(void) {
             else for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
             m->bytes_read = 0;
             pf_last_tok = ds4f_forward_token(m, x, p);
+            if (prefill_out) prefill_out[p] = pf_last_tok;
             pf_bytes += m->bytes_read;
-            if (mtp_on) {   /* maintain MTP KV over the prompt: process token@(p+1) at position p+1 */
+            if (mtp_alpha || spec_on) {   /* maintain MTP KV over the prompt: process token@(p+1) at position p+1 */
                 int nt = (p + 1 < prefill) ? prompt_ids[p+1] : pf_last_tok;
                 embed_lookup(m, nt, xe);
-                mtp_prev_draft = ds4f_mtp_predict(m, m->s_x4, xe, p + 1, NULL);
+                mtp_prev_draft = ds4f_mtp_predict(m, m->s_x4, xe, p + 1, NULL, 0);
             }
             /* teacher-forcing sanity: does argmax(pos p) predict prompt_ids[p+1]?
              * A correct LM hits ~50-80% on its own code text; ~0% == broken forward. */
@@ -507,6 +716,8 @@ int main(void) {
     }
     double t_pf = now_sec() - t_pf0;
     double pf_ar = g_ar_secs; long pf_calls = g_ar_calls;
+    double pf_prof[DS4F_NPHASE];
+    memcpy(pf_prof, m->prof, sizeof pf_prof);
 
     barrier();   /* lockstep check between phases */
 
@@ -535,32 +746,53 @@ int main(void) {
          * with the MTP, verify pos+1 (commit) + pos+2 (speculative, input the draft). On accept emit 2
          * tokens; on reject restore the compressor state + the saved hidden, redo pos+2 next step. */
         size_t hcf = (size_t)m->cfg.hc_mult * C, hcb = hcf * 4;
-        int spec_batch = envi("DS4F_SPEC_BATCH", 0);   /* 1: BATCHED verify (M2b, COHERENT, the speedup) */
-        gen_ids = (int *)malloc((size_t)(max_new + 2) * sizeof(int));
-        char *snap = (char *)malloc(ds4f_tb2_snap_bytes(m));
+        int spec_batch = envi("DS4F_SPEC_BATCH", 0);   /* 1: BATCHED verify (M2b/M4, COHERENT, the speedup) */
+        int G = envi("DS4F_SPEC_GAMMA", 1);            /* M4: draft chain depth (verify K=G+1, K<=8) */
+        if (G < 1) G = 1; if (G > 7) G = 7;
+        int backfill = envi("DS4F_MTP_BACKFILL", 1);   /* M4: fill the MTP-KV hole on full accept (KV-only fwd) */
+        int Kv = G + 1;
+        size_t snapb = ds4f_tb2_snap_bytes(m);
+        gen_ids = (int *)malloc((size_t)(max_new + Kv) * sizeof(int));
+        char *snap = (char *)malloc((size_t)(spec_batch ? G : 1) * snapb);   /* batched: G mid-verify slots */
         float *hc_save = (float *)aligned_alloc(64, hcb), *Xin = NULL, *vhc = NULL;
-        if (spec_batch) { ds4f_alloc_prefill_batch(m, 2); Xin = (float *)aligned_alloc(64,(size_t)2*C*4); vhc = (float *)aligned_alloc(64, 2*hcb); }
+        if (spec_batch) { ds4f_alloc_prefill_batch(m, Kv); Xin = (float *)aligned_alloc(64,(size_t)Kv*C*4); vhc = (float *)aligned_alloc(64, (size_t)Kv*hcb); }
         int pos = dec_base - 1, t_next = pf_last_tok, dec_steps = 0, accepts = 0, rejects = 0;
         while (n_gen < max_new) {
             gen_ids[n_gen++] = t_next;
             if (t_next == DS4F_EOS_ID) break;
-            embed_lookup(m, t_next, xe);                              /* draft token@(pos+2) */
-            int d = ds4f_mtp_predict(m, m->s_x4, xe, pos + 1, NULL);
-            if (spec_batch) {                                        /* M2b: ONE batched verify of pos+1,pos+2 */
-                embed_lookup(m, t_next, Xin); embed_lookup(m, d, Xin + C);
-                ds4f_tb2_snap(m, snap, 0);
-                int ot[2]; ds4f_forward_verify(m, Xin, 2, pos + 1, ot, vhc); dec_steps++;
-                int m1 = ot[0], m2 = ot[1];
-                if (n_gen >= max_new) { t_next = m1; break; }
-                if (d == m1) {                                       /* ACCEPT: both committed */
-                    gen_ids[n_gen++] = m1; t_next = m2; memcpy(m->s_x4, vhc + hcf, hcb); pos += 2; accepts++;
-                    if (m1 == DS4F_EOS_ID) break;
-                } else {                                             /* REJECT: undo pos+2, redo pos+1 (GEMM-consistent) */
-                    ds4f_tb2_snap(m, snap, 1); embed_lookup(m, t_next, Xin);
-                    ds4f_forward_verify(m, Xin, 1, pos + 1, ot, vhc); dec_steps++;
-                    t_next = ot[0]; memcpy(m->s_x4, vhc, hcb); pos += 1; rejects++;
+            if (spec_batch) {
+                /* M4: gamma-chained drafts. First call fuses the MAIN hidden (s_x4 loop invariant);
+                 * mtp_predict leaves the MTP layer's own hidden in s_x4, so g>=1 chains on it
+                 * (standard MTP autoregression). MTP KV written contiguously at pos+1..pos+G. */
+                int dr[8], tok = t_next;
+                for (int g = 0; g < G; g++) {
+                    embed_lookup(m, tok, xe);
+                    dr[g] = ds4f_mtp_predict(m, m->s_x4, xe, pos + 1 + g, NULL, 0);
+                    tok = dr[g];
                 }
+                /* ONE batched verify of pos+1..pos+Kv: position 0 = t_next (always commits),
+                 * positions 1..G = the drafts. snaps[k] = compressor state after position k. */
+                embed_lookup(m, t_next, Xin);
+                for (int g = 0; g < G; g++) embed_lookup(m, dr[g], Xin + (size_t)(g+1)*C);
+                int ot[8]; ds4f_forward_verify(m, Xin, Kv, pos + 1, ot, vhc, snap); dec_steps++;
+                int j = 0; while (j < G && dr[j] == ot[j]) j++;       /* accepted draft prefix */
+                int hit_eos = 0;
+                for (int e = 0; e < j && n_gen < max_new; e++) {     /* emit the j verified drafts */
+                    gen_ids[n_gen++] = ot[e];
+                    if (ot[e] == DS4F_EOS_ID) { hit_eos = 1; break; }
+                }
+                accepts += j; rejects += (j < G);
+                if (hit_eos) { t_next = DS4F_EOS_ID; break; }
+                if (j < G) ds4f_tb2_snap(m, snap + (size_t)j*snapb, 1);  /* roll back to after pos+1+j (NO redo) */
+                else if (backfill) {                                 /* full accept: MTP-KV hole at pos+1+G */
+                    embed_lookup(m, dr[G-1], xe);
+                    ds4f_mtp_predict(m, vhc + (size_t)(G-1)*hcf, xe, pos + 1 + G, NULL, 1);
+                }
+                memcpy(m->s_x4, vhc + (size_t)j*hcf, hcb);           /* main hidden @ last committed */
+                t_next = ot[j]; pos += j + 1;
             } else {                                                /* M2 step 1: LOOPED verify (byte-identical) */
+                embed_lookup(m, t_next, xe);                          /* draft token@(pos+2) */
+                int d = ds4f_mtp_predict(m, m->s_x4, xe, pos + 1, NULL, 0);
                 embed_lookup(m, t_next, x); m->bytes_read = 0;
                 int m1 = ds4f_forward_token(m, x, pos + 1);
                 dec_bytes += m->bytes_read; dec_steps++;
@@ -591,19 +823,22 @@ int main(void) {
             int pos = dec_base + g;
             embed_lookup(m, cur, x);
             m->bytes_read = 0;
-            if (gemm_decode) { int ot; ds4f_forward_verify(m, x, 1, pos, &ot, m->s_x4); cur = ot; }
+            if (gemm_decode) { int ot; ds4f_forward_verify(m, x, 1, pos, &ot, m->s_x4, NULL); cur = ot; }
             else cur = ds4f_forward_token(m, x, pos);
             dec_bytes += m->bytes_read;
             dec_steps++;
-            if (mtp_on) {   /* check last step's draft vs the real next token (alpha), then draft for the next */
+            if (mtp_alpha) {   /* check last step's draft vs the real next token (alpha), then draft for the next */
                 if (mtp_prev_draft >= 0) { mtp_total++; if (mtp_prev_draft == cur) mtp_hits++; }
+                if (envi("DS4F_MTP_DBG", 0) && MyRank == 0)
+                    logmsg("  MTPDBG pos=%-5d cur=%-6d prev_draft=%-6d %s\n", pos, cur, mtp_prev_draft,
+                           mtp_prev_draft < 0 ? "-" : (mtp_prev_draft == cur ? "HIT" : "miss"));
                 if (cur != DS4F_EOS_ID) { embed_lookup(m, cur, xe);
-                    mtp_prev_draft = ds4f_mtp_predict(m, m->s_x4, xe, pos + 1, NULL); }
+                    mtp_prev_draft = ds4f_mtp_predict(m, m->s_x4, xe, pos + 1, NULL, 0); }
             }
         }
         last_tok = cur;
         maxgen = dec_steps;     /* report tok/s over actual decode forward calls */
-        if (mtp_on && MyRank == 0)
+        if (mtp_alpha && MyRank == 0)
             logmsg("MTP_ALPHA %d/%d = %.1f%% (MTP draft == main next-tok; alpha -- the spec-decode gain predictor)\n",
                    mtp_hits, mtp_total, mtp_total ? 100.0*mtp_hits/mtp_total : 0.0);
     } else {
@@ -628,7 +863,8 @@ int main(void) {
             if (prefill > 0)
                 fprintf(rf, "prefill: %d tok  %.1f ms/tok  %.2f tok/s  comm %.1f%%  ar_calls=%ld  argmax=%d%s\n",
                         prefill, t_pf/prefill*1e3, prefill/t_pf, 100.0*pf_ar/t_pf, pf_calls,
-                        pf_last_tok, prefill_batch > 0 ? "  [batched]" : "");
+                        pf_last_tok, prefill_batch > 0 ? "  [batched]" :
+                        (prefill_verify > 1 ? "  [chunked-verify]" : ""));
             if (maxgen > 0)
                 fprintf(rf, "decode:  %d tok  %.1f ms/tok  %.2f tok/s  comm %.1f%%  %.1f GB/s-weights\n",
                         maxgen, t_dec/maxgen*1e3, maxgen/t_dec, 100.0*dec_ar/t_dec,
@@ -643,7 +879,16 @@ int main(void) {
         if (prefill > 0)
             logmsg("prefill: %d tok  %.1f ms/tok  %.2f tok/s   comm %.1f%% (ar_calls=%ld argmax=%d)%s\n",
                    prefill, t_pf/prefill*1e3, prefill/t_pf, 100.0*pf_ar/t_pf, pf_calls, pf_last_tok,
-                   prefill_batch > 0 ? "  [batched]" : "");
+                   prefill_batch > 0 ? "  [batched]" :
+                   (prefill_verify > 1 ? "  [chunked-verify]" : ""));
+        double pfsum = 0; for (int i = 0; i <= DS4F_P_TB2PREP; i++) pfsum += pf_prof[i];
+        if (pfsum > 0 && prefill > 0) {
+            logmsg("per-phase prefill (ms/tok):\n");
+            for (int i = 0; i < DS4F_NPHASE; i++) {
+                double ms = pf_prof[i]/prefill*1e3; if (ms <= 0) continue;
+                logmsg("  %-9s %7.3f ms  %5.1f%%\n", ds4f_prof_names[i], ms, 100.0*pf_prof[i]/pfsum);
+            }
+        }
         if (maxgen > 0) {
             logmsg("decode:  %d tok  %.1f ms/tok  %.2f tok/s   comm %.1f%% (%.0f us/tok)\n",
                    maxgen, t_dec/maxgen*1e3, maxgen/t_dec, 100.0*dec_ar/t_dec, dec_ar/maxgen*1e6);
@@ -672,11 +917,24 @@ int main(void) {
                 logmsg("gen: WARNING could not open DS4F_GEN_OUT=%s for write\n", gen_out_file);
             }
         }
+        if (gen_mode && prefill_out && prefill_out_file && *prefill_out_file) {
+            FILE *pf = fopen(prefill_out_file, "w");
+            if (pf) {
+                for (int i = 0; i < prefill; i++)
+                    fprintf(pf, "%d%s", prefill_out[i], i + 1 < prefill ? " " : "\n");
+                fclose(pf);
+                logmsg("prefill: wrote %d teacher argmax ids to %s\n", prefill, prefill_out_file);
+            } else {
+                logmsg("prefill: WARNING could not open DS4F_PREFILL_OUT=%s for write\n", prefill_out_file);
+            }
+        }
     }
 
     free(prompt_ids);
+    free(prefill_out);
     free(gen_ids);
     free(x);
     ds4f_free(m);
+    write_status("done", "prefill/decode completed");
     return 0;
 }

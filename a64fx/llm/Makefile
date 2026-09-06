@@ -6,12 +6,14 @@
 # Usage:
 #   make CC=fcc                     # Fujitsu fcc, sequential
 #   make CC=fcc OPENMP=1            # Fujitsu fcc + OpenMP (recommended)
+#   make CC=mpifcc OPENMP=1         # Fujitsu MPI wrapper + OpenMP
 #   make CC=gcc OPENMP=1            # gcc + OpenMP
 #
 # Outputs:
 #   build/llm_runner   - end-to-end runner (text or text+image)
 
 CC      ?= fcc
+HOSTCC  ?= cc
 OPENMP  ?=
 DEBUG   ?=
 EXTRA_CFLAGS ?=
@@ -25,9 +27,23 @@ VLM_KERNELS := $(VLM_DIR)/kernels
 VLM_SRC     := $(VLM_DIR)/src
 VLM_BUILD   := $(VLM_DIR)/build
 BUILD       := $(LLM_DIR)build
+Q8V2_KERNEL := $(ROOT)/gemma4-kernels/kernel_q8v2_3x4.S
+Q8B6_KERNEL := $(ROOT)/int8-cmg/micro_kernel_6x4_no_sector.S
+BF16_PODD_KERNEL := $(ROOT)/gemma4-kernels/sgemm_bf16_2x12.S
 
 # ── Compiler-specific flags ────────────────────────────────────────────
 ifeq ($(CC),fcc)
+    BASE_CFLAGS  := -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast
+    BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
+    # -g -rdynamic: symbol names for the SIGSEGV backtrace handler (on by default). These do NOT
+    # change codegen at -O3 -- they only keep the symbol table, so a crash reports
+    # "ds4f_pf_qnr_worker -> ds4f_rope_apply" instead of a bare hex address. On a multi-node run with
+    # no core dump and no debugger, that is the difference between a 10-minute fix and a lost day.
+    BASE_CFLAGS  += -g -rdynamic
+    OMP_FLAG     := -fopenmp
+    ASMC         := fcc
+    HWBLIB       := -lhwb
+else ifeq ($(CC),mpifcc)
     BASE_CFLAGS  := -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast
     BASE_CFLAGS  += -Wno-unused-function -Wno-unused-variable
     OMP_FLAG     := -fopenmp
@@ -62,9 +78,23 @@ CFLAGS  := $(BASE_CFLAGS) -std=c11 -D_GNU_SOURCE \
            -I$(VLM_INC) -I$(VLM_KERNELS) -I$(VLM_SRC) -I$(COMMON)
 LDFLAGS := -lm -lpthread $(HWBLIB)
 
+# Qwen's exact Q8 decode path benefits from Fujitsu's fast scalar/SVE
+# scheduling while retaining the same generated greedy output in the 128-token
+# comparison. Keep this target-specific so unrelated runners retain their
+# existing floating-point flags.
+ifeq ($(CC),fcc)
+QWEN_CFLAGS := -Kfast
+else
+QWEN_CFLAGS :=
+endif
+
 ifdef OPENMP
     CFLAGS  += $(OMP_FLAG) -DUSE_OPENMP=1
     LDFLAGS += $(OMP_FLAG)
+endif
+
+ifdef FAPP
+    CFLAGS  += -DGLM5_USE_FAPP=1
 endif
 
 ifdef DEBUG
@@ -107,13 +137,40 @@ DS4F_HDRS := $(LLM_DIR)../../common/ds4f.h $(LLM_DIR)../../common/ds4f_impl.h $(
 M3_EP_SRC := $(LLM_DIR)../m3/m3_ep_runner.c
 M3_HDRS   := $(COMMON)/m3.h $(COMMON)/m3_impl.h $(COMMON)/ggml_dequant.h
 GLM5_EP_SRC := $(LLM_DIR)../glm5/glm5_ep_runner.c
-GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COMMON)/glm5_mxfp8.h $(COMMON)/ggml_dequant.h \
+GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COMMON)/glm5_mxfp8.h $(COMMON)/glm5_int8.h $(COMMON)/ggml_dequant.h \
                $(LLM_DIR)../utofu-tests/tp_allreduce.h $(LLM_DIR)../utofu-tests/tofu_demo.h
 
 # ── Targets ────────────────────────────────────────────────────────────
-.PHONY: all clean vlm_objs pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw m3_ep_runner glm5_ep_runner glm5_stage glm5_real_test glm5_fp8_kernel_test
+# ds4f_bake MUST be here: the alias target name matches ds4f_bake.c, so without .PHONY make's
+# built-in "%: %.c" rule fires and re-links the finished binary as if it were an object.
+.PHONY: all clean vlm_objs qwen38_runner qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
 
 all: $(BUILD)/llm_runner
+
+qwen38_runner: $(BUILD)/qwen38_runner
+$(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h | $(BUILD)
+	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -o $@ $(LLM_DIR)qwen38_runner.c $(LDFLAGS)
+
+qwen38_pp_runner: $(BUILD)/qwen38_pp_runner
+$(BUILD)/qwen38_pp_runner: $(LLM_DIR)qwen38_pp_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h | $(BUILD)
+	OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43 /opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifcc \
+		$(CFLAGS) -o $@ $(LLM_DIR)qwen38_pp_runner.c $(LDFLAGS)
+
+qwen38_prefill_runner: $(BUILD)/qwen38_prefill_runner
+$(BUILD)/qwen38_prefill_runner: $(LLM_DIR)qwen38_prefill_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h $(ROOT)/utofu-tests/tp_allreduce.h $(ROOT)/utofu-tests/tp_rsag4.h $(VLM_KERNELS)/micro_kernel_bf16B_8x3_pv.S $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) | $(BUILD)
+	OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43 /opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifcc \
+		$(filter-out -g -rdynamic,$(CFLAGS)) -DTF_LINK_BF16PV48 -DTF_LINK_PODD -DTF_HAVE_Q8V2 $(QWEN_CFLAGS) -o $@ \
+		$(LLM_DIR)qwen38_prefill_runner.c $(VLM_KERNELS)/micro_kernel_bf16B_8x3_pv.S $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(LDFLAGS) -ltofucom
+
+qwen38_mixed_runner: $(BUILD)/qwen38_mixed_runner
+$(BUILD)/qwen38_mixed_runner: $(LLM_DIR)qwen38_mixed_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h $(VLM_KERNELS)/micro_kernel_bf16B_8x3_pv.S $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) | $(BUILD)
+	OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43 /opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifcc \
+		$(filter-out -g -rdynamic,$(CFLAGS)) -DTF_LINK_BF16PV48 -DTF_LINK_PODD -DTF_HAVE_Q8V2 $(QWEN_CFLAGS) -o $@ \
+		$(LLM_DIR)qwen38_mixed_runner.c $(VLM_KERNELS)/micro_kernel_bf16B_8x3_pv.S $(BF16_PODD_KERNEL) $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(LDFLAGS) -ltofucom
+
+qwen38_tp_stage: $(BUILD)/qwen38_tp_stage
+$(BUILD)/qwen38_tp_stage: $(LLM_DIR)qwen38_tp_stage.c $(LLM_DIR)qwen38_tp_stage.h $(COMMON)/gguf_loader.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)qwen38_tp_stage.c -lm
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -133,8 +190,9 @@ $(BUILD)/pp_runner: $(PP_SRC) vlm_objs | $(BUILD)
 
 # Multi-node tensor-parallel decode runner (pure uTofu, no MPI in the binary).
 tp_runner: $(BUILD)/tp_runner
-$(BUILD)/tp_runner: $(TP_SRC) vlm_objs | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $(TP_SRC) $(VLM_OBJS) $(LDFLAGS) -ltofucom
+$(BUILD)/tp_runner: $(TP_SRC) $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h ../utofu-tests/tp_allreduce.h $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(BF16_PODD_KERNEL) | $(BUILD)
+	$(CC) $(filter-out -g -rdynamic,$(CFLAGS)) -DTF_HAVE_Q8V2 -DTF_LINK_PODD $(QWEN_CFLAGS) -o $@ \
+		$(TP_SRC) $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(BF16_PODD_KERNEL) $(LDFLAGS) -ltofucom
 
 # Same as tp_runner but with -DTF_POOL_PROFILE: dumps the per-dispatch work-vs-wait
 # and per-tid matvec/barrier/attn decode breakdown at pool shutdown. Separate binary
@@ -179,9 +237,15 @@ $(BUILD)/m3_real_test: $(LLM_DIR)../m3/m3_real_test.c $(M3_HDRS) | $(BUILD)
 glm5_ep_runner: $(BUILD)/glm5_ep_runner
 $(BUILD)/glm5_ep_runner: $(GLM5_EP_SRC) $(GLM5_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(GLM5_EP_SRC) $(LDFLAGS) -ltofucom
+glm5_ep_runner_fapp: $(BUILD)/glm5_ep_runner_fapp
+$(BUILD)/glm5_ep_runner_fapp: $(GLM5_EP_SRC) $(GLM5_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -DGLM5_USE_FAPP=1 -o $@ $(GLM5_EP_SRC) $(LDFLAGS) -ltofucom
 glm5_stage: $(BUILD)/glm5_stage
 $(BUILD)/glm5_stage: $(COMMON)/glm5_stage.c $(COMMON)/safetensors.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(COMMON)/glm5_stage.c $(LDFLAGS)
+glm52_gguf_convert: $(BUILD)/glm52_gguf_convert
+$(BUILD)/glm52_gguf_convert: $(LLM_DIR)../glm5/glm52_gguf_convert.c $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h | $(BUILD)
+	$(HOSTCC) -O2 -std=c11 -D_GNU_SOURCE -I$(COMMON) -o $@ $(LLM_DIR)../glm5/glm52_gguf_convert.c -lm
 glm5_real_test: $(BUILD)/glm5_real_test
 $(BUILD)/glm5_real_test: $(LLM_DIR)../glm5/glm5_real_test.c $(GLM5_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)../glm5/glm5_real_test.c $(LDFLAGS)
@@ -195,6 +259,15 @@ $(LLM_DIR)../glm5/glm5_fp8_kernel_test: $(LLM_DIR)../glm5/glm5_fp8_kernel_test.c
 ds4f_decode_bw: $(BUILD)/ds4f_decode_bw
 $(BUILD)/ds4f_decode_bw: $(DS4F_DECBW_SRC) $(DS4F_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(DS4F_DECBW_SRC) $(LDFLAGS)
+
+# OFFLINE dense bake: safetensors FP8 -> the kernel-ready BF16_PV / Q8_PV layouts, written
+# permanently under ~/models/<model>-fast/. Removes the runtime bf16 promotion peak (which is
+# what makes the ds4f 8-node decode floor "load-peak-tight" and blocks Q8 dense on ds4fbase
+# entirely). Single node, no allocation, no MPI. Calls the SAME promote/repack workers the
+# runtime uses, so the bytes are identical by construction. See the header of ds4f_bake.c.
+ds4f_bake: $(BUILD)/ds4f_bake
+$(BUILD)/ds4f_bake: $(LLM_DIR)ds4f_bake.c $(DS4F_HDRS) $(COMMON)/safetensors.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)ds4f_bake.c $(LDFLAGS)
 
 clean:
 	rm -rf $(BUILD)

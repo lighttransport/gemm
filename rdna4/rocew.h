@@ -286,6 +286,7 @@ typedef enum hipFuncAttribute_t {
 #define hipHostMallocWriteCombined 0x04
 #define hipHostMallocCoherent 0x40000000
 #define hipHostMallocNonCoherent 0x80000000
+#define hipHostRegisterDefault 0x00
 
 /* ============================================================================
  * HIPRTC Types

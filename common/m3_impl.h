@@ -742,6 +742,8 @@ static int m3_forward_token(m3_model*m,float*x,int pos){
 typedef struct {
     int n;
     uint16_t *kc, *vc;        /* [n][n_layers][max_pos][kv_dim] bf16 per-stream KV caches */
+    uint8_t  *k_q4, *v_q4;    /* int4 KV (M3_INT4_KV): [n][n_layers][max_pos][kv_dim/2] packed nibbles */
+    uint16_t *k_qs, *v_qs;    /* int4 KV per-head scales (bf16): [n][n_layers][max_pos][n_kv_heads] */
     float *xn,*q,*k,*v,*attn,*o,*h2,*router,*route,*shg,*shu,*ffg,*ffu,*tmp2;  /* token-major batched scratch */
     float *exg,*exu,*emoe;    /* per-token expert scratch (M=1) */
     int *bk; float *bw; int *bcnt;   /* expert grouping: per-owned-slot token buckets [n_experts*N]/[n_experts] */
@@ -831,7 +833,8 @@ static void m3_gemm(m3_model*m, float*restrict Y, const m3_tensor*t, const float
 
 static void m3_free_mstream(m3_model*m){
     m3_mstream*ms=(m3_mstream*)m->ms; if(!ms) return;
-    m3_afree(ms->kc);m3_afree(ms->vc);m3_afree(ms->xn);m3_afree(ms->q);m3_afree(ms->k);m3_afree(ms->v);m3_afree(ms->attn);m3_afree(ms->o);
+    m3_afree(ms->kc);m3_afree(ms->vc);m3_afree(ms->k_q4);m3_afree(ms->v_q4);m3_afree(ms->k_qs);m3_afree(ms->v_qs);
+    m3_afree(ms->xn);m3_afree(ms->q);m3_afree(ms->k);m3_afree(ms->v);m3_afree(ms->attn);m3_afree(ms->o);
     m3_afree(ms->h2);m3_afree(ms->router);m3_afree(ms->route);m3_afree(ms->shg);m3_afree(ms->shu);m3_afree(ms->ffg);m3_afree(ms->ffu);
     m3_afree(ms->tmp2);m3_afree(ms->exg);m3_afree(ms->exu);m3_afree(ms->emoe);m3_afree(ms->bk);m3_afree(ms->bw);m3_afree(ms->bcnt);m3_afree(ms->logits);m3_afree(ms->sc);
     m3_afree(ms->psel);m3_afree(ms->pnsel);m3_afree(ms->gsel);m3_afree(ms->gselw);
@@ -844,7 +847,13 @@ static int m3_alloc_mstream_ex(m3_model*m,int N,int per_stream_kv){
     const m3_config*c=&m->cfg; int H=c->hidden,QD=m3_q_dim(c),KVD=m3_kv_dim(c),hrows=m->head.rows;
     m3_mstream*ms=m3_acalloc(1,sizeof *ms); if(!ms) return -1; ms->n=N;
     size_t per=(size_t)c->n_layers*c->max_pos*KVD;
-    if(per_stream_kv){ ms->kc=m3_acalloc((size_t)N*per,2); ms->vc=m3_acalloc((size_t)N*per,2); }
+    if(per_stream_kv){
+        if(m->int4_kv){   /* int4 KV: ~3.9x smaller -> more streams fit at long ctx (batched-serving enabler) */
+            size_t perq=(size_t)c->n_layers*c->max_pos*(KVD/2), pers=(size_t)c->n_layers*c->max_pos*c->n_kv_heads;
+            ms->k_q4=m3_acalloc((size_t)N*perq,1); ms->v_q4=m3_acalloc((size_t)N*perq,1);
+            ms->k_qs=m3_acalloc((size_t)N*pers,2); ms->v_qs=m3_acalloc((size_t)N*pers,2);
+        } else { ms->kc=m3_acalloc((size_t)N*per,2); ms->vc=m3_acalloc((size_t)N*per,2); }
+    }
     else { ms->maxsel=(c->msa_topk_blocks+c->msa_local_block+c->msa_init_block+1)*c->msa_block_size;
            ms->psel=m3_amalloc((size_t)N*ms->maxsel*sizeof(int)); ms->pnsel=m3_amalloc((size_t)N*sizeof(int));
            ms->gsel=m3_amalloc((size_t)N*8*sizeof(int)); ms->gselw=m3_amalloc((size_t)N*8*sizeof(float));
@@ -860,7 +869,8 @@ static int m3_alloc_mstream_ex(m3_model*m,int N,int per_stream_kv){
     ms->exg=m3_amalloc((size_t)c->moe_inter*4); ms->exu=m3_amalloc((size_t)c->moe_inter*4); ms->emoe=m3_amalloc((size_t)H*4);
     ms->bk=m3_amalloc((size_t)c->n_experts*N*sizeof(int)); ms->bw=m3_amalloc((size_t)c->n_experts*N*4); ms->bcnt=m3_amalloc((size_t)c->n_experts*sizeof(int));
     ms->logits=m3_amalloc((size_t)N*hrows*4); ms->sc=m3_amalloc((size_t)N*c->max_pos*4);
-    int kvok = per_stream_kv ? (ms->kc&&ms->vc) : (ms->psel&&ms->pnsel);
+    int kvok = per_stream_kv ? (m->int4_kv ? (ms->k_q4&&ms->v_q4&&ms->k_qs&&ms->v_qs) : (ms->kc&&ms->vc))
+                             : (ms->psel&&ms->pnsel);
     if(!kvok||!ms->logits){ m->ms=ms; m3_free_mstream(m); return -1; }
     m->ms=ms; return 0;
 }
@@ -871,6 +881,8 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
     const m3_config*c=&m->cfg; const int H=c->hidden,HD=c->head_dim,QH=c->n_heads,KVH=c->n_kv_heads;
     const int KVD=m3_kv_dim(c),grp=QH/KVH,half=c->rotary_dim/2; const float ascale=1.0f/sqrtf((float)HD);
     m3_mstream*ms=(m3_mstream*)m->ms; size_t per=(size_t)c->n_layers*c->max_pos*KVD;
+    const int i4=m->int4_kv, HD2=HD/2, KVD2=KVD/2;   /* int4-KV batched path (M3_INT4_KV) */
+    const size_t perq=(size_t)c->n_layers*c->max_pos*KVD2, pers=(size_t)c->n_layers*c->max_pos*KVH;
     for(int l=0;l<c->n_layers;l++){
         m3_layer*L=&m->layers[l]; int is_moe=m3_is_moe(c,l);
         const int qh0=L->qh0,qh1=L->qh1,nown=qh1-qh0,qrows=nown*HD; const int tp_attn=(qrows<QH*HD);
@@ -888,19 +900,29 @@ static void m3_forward_batch_decode(m3_model*m, float*X, int N, const int*pos, i
             float*qb=ms->q+(size_t)t*qrows,*kb=ms->k+(size_t)t*KVD,*vb=ms->v+(size_t)t*KVD;
             for(int hh=0;hh<nown;hh++){ float*qh=qb+hh*HD; if(c->use_qk_norm) m3_rmsnorm_head(qh,L->q_norm,HD,c->norm_eps); m3_rope_head(qh,cosp,sinp,c->rotary_dim); }
             for(int kh=0;kh<KVH;kh++){ float*kk=kb+kh*HD; if(c->use_qk_norm) m3_rmsnorm_head(kk,L->k_norm,HD,c->norm_eps); m3_rope_head(kk,cosp,sinp,c->rotary_dim); }
-            uint16_t*kc=ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVD+(size_t)p*KVD;
-            uint16_t*vc=ms->vc+(size_t)t*per+(size_t)l*c->max_pos*KVD+(size_t)p*KVD;
-            for(int i=0;i<KVD;i++){ kc[i]=m3_f2bf(kb[i]); vc[i]=m3_f2bf(vb[i]); } }
+            if(i4){ size_t qo=(size_t)t*perq+(size_t)l*c->max_pos*KVD2+(size_t)p*KVD2, so=(size_t)t*pers+(size_t)l*c->max_pos*KVH+(size_t)p*KVH;
+                for(int kh=0;kh<KVH;kh++){ ms->k_qs[so+kh]=m3_q4_pack(ms->k_q4+qo+(size_t)kh*HD2,kb+kh*HD,HD);
+                                           ms->v_qs[so+kh]=m3_q4_pack(ms->v_q4+qo+(size_t)kh*HD2,vb+kh*HD,HD); }
+            } else {
+                uint16_t*kc=ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVD+(size_t)p*KVD;
+                uint16_t*vc=ms->vc+(size_t)t*per+(size_t)l*c->max_pos*KVD+(size_t)p*KVD;
+                for(int i=0;i<KVD;i++){ kc[i]=m3_f2bf(kb[i]); vc[i]=m3_f2bf(vb[i]); } } }
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
         for(int t=0;t<N;t++){ int p=pos[t]; float*qb=ms->q+(size_t)t*qrows,*ab=ms->attn+(size_t)t*qrows,*sc=ms->sc+(size_t)t*c->max_pos;
-            uint16_t*kcl=ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVD,*vcl=ms->vc+(size_t)t*per+(size_t)l*c->max_pos*KVD;
+            uint16_t*kcl=i4?NULL:ms->kc+(size_t)t*per+(size_t)l*c->max_pos*KVD,*vcl=i4?NULL:ms->vc+(size_t)t*per+(size_t)l*c->max_pos*KVD;
+            size_t kqb=(size_t)t*perq+(size_t)l*c->max_pos*KVD2, sqb=(size_t)t*pers+(size_t)l*c->max_pos*KVH;
             for(int hh=0;hh<nown;hh++){ int hgl=qh0+hh; float*qh=qb+hh*HD; int kvh=hgl/grp; float mx=-1e30f;
-                for(int tt=0;tt<=p;tt++){ const uint16_t*kt=kcl+(size_t)tt*KVD+kvh*HD; double d=0; for(int i=0;i<HD;i++) d+=(double)qh[i]*m3_bf2f(kt[i]); float s=(float)d*ascale; sc[tt]=s; if(s>mx)mx=s; }
+                for(int tt=0;tt<=p;tt++){ float s;
+                    if(i4) s=m3_q4_dot(ms->k_q4+kqb+(size_t)tt*KVD2+(size_t)kvh*HD2, ms->k_qs[sqb+(size_t)tt*KVH+kvh], qh, HD)*ascale;
+                    else { const uint16_t*kt=kcl+(size_t)tt*KVD+kvh*HD; double d=0; for(int i=0;i<HD;i++) d+=(double)qh[i]*m3_bf2f(kt[i]); s=(float)d*ascale; }
+                    sc[tt]=s; if(s>mx)mx=s; }
                 double sum=0; for(int tt=0;tt<=p;tt++){ float e=expf(sc[tt]-mx); sc[tt]=e; sum+=e; }
                 float inv=(float)(1.0/(sum>0?sum:1)); float*oh=ab+hh*HD; for(int i=0;i<HD;i++) oh[i]=0;
-                for(int tt=0;tt<=p;tt++){ float w=sc[tt]*inv; const uint16_t*vt=vcl+(size_t)tt*KVD+kvh*HD; for(int i=0;i<HD;i++) oh[i]+=w*m3_bf2f(vt[i]); } } }
+                for(int tt=0;tt<=p;tt++){ float w=sc[tt]*inv;
+                    if(i4) m3_q4_axpy(oh, ms->v_q4+kqb+(size_t)tt*KVD2+(size_t)kvh*HD2, ms->v_qs[sqb+(size_t)tt*KVH+kvh], w, HD);
+                    else { const uint16_t*vt=vcl+(size_t)tt*KVD+kvh*HD; for(int i=0;i<HD;i++) oh[i]+=w*m3_bf2f(vt[i]); } } } }
         m3_gemm(m,ms->o,&L->wo,ms->attn,N,H,qrows);
         if(tp_attn && m->ar_cb) m->ar_cb(ms->o,N*H,m->ar_ctx);
         for(size_t i=0;i<(size_t)N*H;i++) X[i]+=ms->o[i];

@@ -48,11 +48,23 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef _OPENMP
+/* Fujitsu's OpenMP runtime exports the Intel-compatible control.  Keeping the
+ * batch team warm is essential across its many short projection regions, but
+ * leaving it warm during the pthread NextN draft steals all 48 cores. */
+extern void kmp_set_blocktime(int milliseconds);
+#endif
 #include <strings.h>
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <utofu.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define GGUF_LOADER_IMPLEMENTATION
 #include "../../common/gguf_loader.h"
@@ -74,6 +86,9 @@
 static FILE *g_log = NULL;
 static FILE *g_curve = NULL;   /* rank0 per-token decode-cost-vs-context curve */
 static FILE *g_tokdump = NULL; /* rank0 generated-token-id log (TP_DUMP_TOKENS=1) for A/B parity */
+/* Optional clean detokenized output for long-form quality gates.  Keeping this
+ * separate from g_log matters: g_log deliberately includes runner telemetry. */
+static FILE *g_generated_text = NULL;
 static void logmsg(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     if (g_log) { va_list ap2; va_copy(ap2, ap); vfprintf(g_log, fmt, ap2); fflush(g_log); va_end(ap2); }
@@ -84,6 +99,51 @@ static void die(const char *what, int rc) { logmsg("FATAL: %s (rc=%d)\n", what, 
 static double now_sec(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+static int tp_numa_node_of_cpu(int cpu) {
+    char path[96];
+    for (int node = 0; node < 8; node++) {
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/node%d", cpu, node);
+        if (access(path, F_OK) == 0) return node;
+    }
+    return -1;
+}
+
+/* Persistent worker 0 executes the collectives. Bind registered source and
+ * landing pages to its CMG before first touch. mmap also guarantees alignment
+ * stricter than uTofu's 256-byte contract. */
+static void *tp_comm_cmg_alloc(size_t bytes, size_t *mapped_bytes, int *node_out) {
+    long page = sysconf(_SC_PAGESIZE);
+    if (page < 256) page = 256;
+    size_t n = (bytes + (size_t)page - 1) & ~((size_t)page - 1);
+    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    const char *offset_env = getenv("TF_POOL_CORE_OFFSET");
+    int offset = (offset_env && *offset_env ? atoi(offset_env) : 0) % 48;
+    if (offset < 0) offset += 48;
+    int node = tp_numa_node_of_cpu(12 + offset);
+    const char *strict_env = getenv("TP_COMM_CMG_STRICT");
+    int strict = strict_env && atoi(strict_env) != 0;
+#if defined(SYS_mbind)
+    if (node >= 0 && node < (int)(8 * sizeof(unsigned long))) {
+        unsigned long mask = 1UL << node;
+        if (syscall(SYS_mbind, p, n, 2L /* MPOL_BIND */, &mask,
+                    8UL * sizeof(mask), 0U) != 0 && strict) {
+            munmap(p, n);
+            return NULL;
+        }
+    } else if (strict) {
+        munmap(p, n);
+        return NULL;
+    }
+#else
+    if (strict) { munmap(p, n); return NULL; }
+#endif
+    if (((uintptr_t)p & 255u) != 0) { munmap(p, n); return NULL; }
+    *mapped_bytes = n;
+    if (node_out) *node_out = node;
+    return p;
 }
 /* Internal helper declarations from transformer.h (not part of public API, but
  * available in this TU because IMPLEMENTATION is enabled above). */
@@ -331,19 +391,19 @@ static int tf_cache_kv_dim_for_layer(const transformer_model *m, int l) {
 static tp_layer_cache tp_layer_cache_bytes(const transformer_model *m, int l) {
     tp_layer_cache x = {0,0,0,0,0,0};
     if (!m || l < 0 || l >= m->n_layers) return x;
-    if (!m->key_cache || !m->value_cache) return x;
-    if (!m->key_cache[l] || !m->value_cache[l]) return x;
-    if (m->is_hybrid && m->layers && m->layers[l].is_ssm) return x;
-    if (m->is_gemma4 && m->layers && m->layers[l].shared_kv_source >= 0) return x;
-
-    size_t seq = tf_cache_seq_len_for_layer(m, l);
-    int kv_dim = tf_cache_kv_dim_for_layer(m, l);
-    x.key_bytes = (int64_t)seq * kv_dim * (int64_t)m->kv_elem_bytes;
-    x.value_bytes = x.key_bytes;
-    if (m->key_scales && m->key_scales[l])
-        x.key_scale_bytes = (int64_t)seq * (int64_t)m->n_kv_heads * (int64_t)sizeof(float);
-    if (m->value_scales && m->value_scales[l])
-        x.value_scale_bytes = x.key_scale_bytes;
+    int is_ssm = m->is_hybrid && m->layers && m->layers[l].is_ssm;
+    if (!is_ssm && m->key_cache && m->value_cache &&
+        m->key_cache[l] && m->value_cache[l] &&
+        !(m->is_gemma4 && m->layers && m->layers[l].shared_kv_source >= 0)) {
+        size_t seq = tf_cache_seq_len_for_layer(m, l);
+        int kv_dim = tf_cache_kv_dim_for_layer(m, l);
+        x.key_bytes = (int64_t)seq * kv_dim * (int64_t)m->kv_elem_bytes;
+        x.value_bytes = x.key_bytes;
+        if (m->key_scales && m->key_scales[l])
+            x.key_scale_bytes = (int64_t)seq * (int64_t)m->n_kv_heads * (int64_t)sizeof(float);
+        if (m->value_scales && m->value_scales[l])
+            x.value_scale_bytes = x.key_scale_bytes;
+    }
     if (m->conv_state && m->conv_state[l] && m->ssm_conv_kernel > 1 && m->ssm_qkv_dim > 0) {
         x.conv_state_bytes = (int64_t)(m->ssm_conv_kernel - 1) * (int64_t)m->ssm_qkv_dim * (int64_t)sizeof(float);
     }
@@ -351,6 +411,71 @@ static tp_layer_cache tp_layer_cache_bytes(const transformer_model *m, int l) {
         x.recurrent_state_bytes = (int64_t)m->ssm_dt_rank * (int64_t)m->ssm_d_state * (int64_t)m->ssm_d_state * (int64_t)sizeof(float);
     }
     return x;
+}
+
+/* In-memory checkpoint for speculative Qwen hybrid verification.  Attention
+ * KV at rejected future positions is overwritten on replay, but the SSM
+ * convolution ring and recurrent matrices are destructive and must be
+ * restored exactly.  This buffer is rank-local anonymous memory in HBM2. */
+typedef struct {
+    unsigned char *data;
+    size_t *conv_off;
+    size_t *rec_off;
+    int *conv_pos;
+    size_t bytes;
+    int n_layers;
+} tp_spec_state;
+
+static int tp_spec_state_init(tp_spec_state *s, const transformer_model *m) {
+    memset(s, 0, sizeof(*s));
+    if (!m || !m->is_hybrid || m->n_layers <= 0) return -1;
+    s->n_layers = m->n_layers;
+    s->conv_off = (size_t *)malloc((size_t)m->n_layers * sizeof(size_t));
+    s->rec_off = (size_t *)malloc((size_t)m->n_layers * sizeof(size_t));
+    s->conv_pos = (int *)malloc((size_t)m->n_layers * sizeof(int));
+    if (!s->conv_off || !s->rec_off || !s->conv_pos) return -1;
+    for (int l = 0; l < m->n_layers; l++) {
+        tp_layer_cache lc = tp_layer_cache_bytes(m, l);
+        s->conv_off[l] = s->bytes;
+        s->bytes += (size_t)lc.conv_state_bytes;
+        s->rec_off[l] = s->bytes;
+        s->bytes += (size_t)lc.recurrent_state_bytes;
+    }
+    if (posix_memalign((void **)&s->data, 256, s->bytes ? s->bytes : 256) != 0)
+        return -1;
+    return 0;
+}
+
+static void tp_spec_state_save(tp_spec_state *s, const transformer_model *m) {
+    for (int l = 0; l < s->n_layers; l++) {
+        tp_layer_cache lc = tp_layer_cache_bytes(m, l);
+        if (lc.conv_state_bytes)
+            memcpy(s->data + s->conv_off[l], m->conv_state[l],
+                   (size_t)lc.conv_state_bytes);
+        if (lc.recurrent_state_bytes)
+            memcpy(s->data + s->rec_off[l], m->recurrent_state[l],
+                   (size_t)lc.recurrent_state_bytes);
+        s->conv_pos[l] = m->conv_state_pos ? m->conv_state_pos[l] : 0;
+    }
+}
+
+static void tp_spec_state_restore(const tp_spec_state *s, transformer_model *m) {
+    for (int l = 0; l < s->n_layers; l++) {
+        tp_layer_cache lc = tp_layer_cache_bytes(m, l);
+        if (lc.conv_state_bytes)
+            memcpy(m->conv_state[l], s->data + s->conv_off[l],
+                   (size_t)lc.conv_state_bytes);
+        if (lc.recurrent_state_bytes)
+            memcpy(m->recurrent_state[l], s->data + s->rec_off[l],
+                   (size_t)lc.recurrent_state_bytes);
+        if (m->conv_state_pos) m->conv_state_pos[l] = s->conv_pos[l];
+    }
+}
+
+static void tp_spec_state_free(tp_spec_state *s) {
+    if (!s) return;
+    free(s->data); free(s->conv_off); free(s->rec_off); free(s->conv_pos);
+    memset(s, 0, sizeof(*s));
 }
 
 static int tp_cache_matches_model(const tp_cache_header *h, const transformer_model *m,
@@ -542,6 +667,169 @@ static int tp_checkpoint_load(transformer_model *m, const char *path,
     return 0;
 }
 
+/* Load a TP12 prefill checkpoint into a TP4 decode rank.  TP12 keeps full KV
+ * for the four attention heads and owns four SSM V heads; TP4 owns one KV head
+ * and twelve SSM V heads.  The checkpoint files are intentionally per-source
+ * rank so the repartitioner can combine them without an MPI dependency. */
+static int tp_checkpoint_load_repartition(transformer_model *m,
+                                          const char *root,
+                                          const char *model_path,
+                                          const char *tag,
+                                          int src_size, int target_rank,
+                                          int64_t *cache_pos,
+                                          int32_t *next_token) {
+    if (!m || !root || !*root || src_size != 12 || m->tp_size != 4) return -1;
+    FILE *fs[12] = {0};
+    tp_cache_header hs[12];
+    for (int r = 0; r < src_size; r++) {
+        char p[PATH_MAX];
+        if (tp_build_cache_path(p, sizeof(p), m, model_path, NULL, root, tag, r, 0) != 0)
+            goto fail;
+        fs[r] = fopen(p, "rb");
+        if (!fs[r] || read_full(fs[r], &hs[r], sizeof(hs[r])) != 0) {
+            fprintf(stderr, "tp repartition open/read failed rank=%d path=%s errno=%d\n", r, p, errno);
+            goto fail;
+        }
+        if (hs[r].magic != TP_CACHE_MAGIC || hs[r].version != TP_CACHE_VERSION ||
+            hs[r].tp_size != src_size || hs[r].n_layers != m->n_layers ||
+            hs[r].n_embd != m->n_embd || hs[r].n_heads != m->n_heads * m->tp_size ||
+            hs[r].n_kv_heads != m->n_kv_heads * m->tp_size || hs[r].n_head_dim != m->head_dim ||
+            !hs[r].is_hybrid || hs[r].cache_pos < 0 || hs[r].cache_pos > m->max_seq_len) {
+            fprintf(stderr, "tp repartition header mismatch rank=%d magic=%x ver=%u tp=%d layers=%d hybrid=%d pos=%d\n",
+                    r, hs[r].magic, hs[r].version, hs[r].tp_size, hs[r].n_layers,
+                    hs[r].is_hybrid, hs[r].cache_pos);
+            goto fail;
+        }
+        if (r > 0 && (hs[r].cache_pos != hs[0].cache_pos || hs[r].next_token != hs[0].next_token))
+            goto fail;
+    }
+    if (cache_pos) *cache_pos = hs[0].cache_pos;
+    if (next_token) *next_token = hs[0].next_token;
+
+    int src_dt = 48 / src_size;
+    int dst_dt = m->ssm_dt_rank;
+    int ds = m->ssm_d_state;
+    int qk = 2 * m->ssm_n_group * ds;
+    int src_qkv = qk + src_dt * ds;
+    int dst_qkv = qk + dst_dt * ds;
+    int dst_kv_heads = m->tp_kv_head_count;
+    int dst_kv_dim = dst_kv_heads * m->head_dim;
+    size_t src_seq = (size_t)hs[0].max_seq_len;
+    for (int l = 0; l < m->n_layers; l++) {
+        tp_layer_cache lc[12];
+        for (int r = 0; r < src_size; r++) {
+            if (read_i64(fs[r], &lc[r].key_bytes) != 0 ||
+                read_i64(fs[r], &lc[r].value_bytes) != 0 ||
+                read_i64(fs[r], &lc[r].key_scale_bytes) != 0 ||
+                read_i64(fs[r], &lc[r].value_scale_bytes) != 0 ||
+                read_i64(fs[r], &lc[r].conv_state_bytes) != 0 ||
+                read_i64(fs[r], &lc[r].recurrent_state_bytes) != 0) goto fail;
+        }
+        int is_attn = !(m->layers[l].is_ssm);
+        if (is_attn && m->key_cache && m->key_cache[l] && lc[0].key_bytes > 0) {
+            size_t src_row = (size_t)m->n_kv_heads * m->head_dim * m->kv_elem_bytes;
+            size_t dst_row = (size_t)dst_kv_dim * m->kv_elem_bytes;
+            uint8_t *all = (uint8_t *)malloc((size_t)lc[0].key_bytes);
+            if (!all || read_full(fs[0], all, (size_t)lc[0].key_bytes) != 0) { free(all); goto fail; }
+            int head = m->tp_kv_head_base;
+            size_t rows = (size_t)lc[0].key_bytes / src_row;
+            if (rows > src_seq) rows = src_seq;
+            for (size_t t = 0; t < rows; t++) {
+                memcpy((uint8_t *)m->key_cache[l] + t * dst_row,
+                       all + t * src_row + (size_t)head * m->head_dim * m->kv_elem_bytes, dst_row);
+            }
+            free(all);
+            for (int r = 1; r < src_size; r++)
+                if (lc[r].key_bytes && fseek(fs[r], (long)lc[r].key_bytes, SEEK_CUR) != 0) goto fail;
+        } else {
+            for (int r = 0; r < src_size; r++)
+                if (lc[r].key_bytes && fseek(fs[r], (long)lc[r].key_bytes, SEEK_CUR) != 0) goto fail;
+        }
+        for (int r = 0; r < src_size; r++) {
+            if (lc[r].value_bytes && (is_attn && r == 0 && m->value_cache && m->value_cache[l])) {
+                size_t src_row = (size_t)m->n_kv_heads * m->head_dim * m->kv_elem_bytes;
+                size_t dst_row = (size_t)dst_kv_dim * m->kv_elem_bytes;
+                uint8_t *all = (uint8_t *)malloc((size_t)lc[r].value_bytes);
+                if (!all || read_full(fs[r], all, (size_t)lc[r].value_bytes) != 0) { free(all); goto fail; }
+                int head = m->tp_kv_head_base;
+                size_t rows = (size_t)lc[r].value_bytes / src_row;
+                if (rows > src_seq) rows = src_seq;
+                for (size_t t = 0; t < rows; t++) {
+                    memcpy((uint8_t *)m->value_cache[l] + t * dst_row,
+                           all + t * src_row + (size_t)head * m->head_dim * m->kv_elem_bytes, dst_row);
+                }
+                free(all);
+            } else if (lc[r].value_bytes && fseek(fs[r], (long)lc[r].value_bytes, SEEK_CUR) != 0) goto fail;
+            if (lc[r].key_scale_bytes && fseek(fs[r], (long)lc[r].key_scale_bytes, SEEK_CUR) != 0) goto fail;
+            if (lc[r].value_scale_bytes && fseek(fs[r], (long)lc[r].value_scale_bytes, SEEK_CUR) != 0) goto fail;
+        }
+        if (!is_attn) {
+            float *conv[12] = {0}, *rec[12] = {0};
+            for (int r = 0; r < src_size; r++) {
+                if (lc[r].conv_state_bytes != (int64_t)(m->ssm_conv_kernel - 1) * src_qkv * sizeof(float) ||
+                    lc[r].recurrent_state_bytes != (int64_t)src_dt * ds * ds * sizeof(float)) {
+                    for (int j = 0; j < src_size; j++) { free(conv[j]); free(rec[j]); }
+                    goto fail;
+                }
+                conv[r] = (float *)malloc((size_t)lc[r].conv_state_bytes);
+                rec[r] = (float *)malloc((size_t)lc[r].recurrent_state_bytes);
+                if (!conv[r] || !rec[r] ||
+                    read_full(fs[r], conv[r], (size_t)lc[r].conv_state_bytes) != 0 ||
+                    read_full(fs[r], rec[r], (size_t)lc[r].recurrent_state_bytes) != 0) {
+                    for (int j = 0; j < src_size; j++) { free(conv[j]); free(rec[j]); }
+                    goto fail;
+                }
+            }
+            if (m->conv_state && m->conv_state[l]) {
+                int nh = m->ssm_conv_kernel - 1;
+                for (int h = 0; h < nh; h++) {
+                    memcpy(m->conv_state[l] + (size_t)h * dst_qkv,
+                           conv[0] + (size_t)h * src_qkv, (size_t)qk * sizeof(float));
+                    float *d = m->conv_state[l] + (size_t)h * dst_qkv + qk;
+                    for (int j = 0; j < 3; j++) {
+                        int sr = target_rank * 3 + j;
+                        memcpy(d + (size_t)j * src_dt * ds,
+                               conv[sr] + (size_t)h * src_qkv + qk,
+                               (size_t)src_dt * ds * sizeof(float));
+                    }
+                }
+            }
+            if (m->recurrent_state && m->recurrent_state[l]) {
+                for (int j = 0; j < 3; j++) {
+                    int sr = target_rank * 3 + j;
+                    memcpy(m->recurrent_state[l] + (size_t)j * src_dt * ds * ds,
+                           rec[sr], (size_t)src_dt * ds * ds * sizeof(float));
+                }
+            }
+            for (int r = 0; r < src_size; r++) { free(conv[r]); free(rec[r]); }
+        } else {
+            for (int r = 0; r < src_size; r++) {
+                if (lc[r].conv_state_bytes && fseek(fs[r], (long)lc[r].conv_state_bytes, SEEK_CUR) != 0) goto fail;
+                if (lc[r].recurrent_state_bytes && fseek(fs[r], (long)lc[r].recurrent_state_bytes, SEEK_CUR) != 0) goto fail;
+            }
+        }
+    }
+    if (m->conv_state_pos) {
+        for (int r = 0; r < src_size; r++) {
+            for (int l = 0; l < m->n_layers; l++) {
+                int32_t p;
+                if (read_i32(fs[r], &p) != 0) goto fail;
+                if (r == 0) m->conv_state_pos[l] = p;
+            }
+        }
+    }
+    for (int r = 0; r < src_size; r++) fclose(fs[r]);
+    if (target_rank == 0)
+        fprintf(stderr, "tp cache repartition complete: source TP%d -> target TP%d pos=%d\n",
+                src_size, m->tp_size, hs[0].cache_pos);
+    return 0;
+
+fail:
+    fprintf(stderr, "tp repartition failed rank=%d\n", target_rank);
+    for (int r = 0; r < src_size; r++) if (fs[r]) fclose(fs[r]);
+    return -1;
+}
+
 static int tp_checkpoint_probe(const transformer_model *m, const char *path,
                               int64_t *cache_pos, int32_t *next_token,
                               int tp_size, int rank, int n, int shared_mode) {
@@ -595,6 +883,187 @@ static int32_t sample_argmax(transformer_model *m, float *lg, tp_comm *c,
     return nt;
 }
 
+/* All TP ranks must tokenize the same prompt.  This is easy to violate with a
+ * node-local TP_PROMPT_FILE under /local: one rank can read it while peers fall
+ * back to TP_PROMPT.  Detect that before prefill instead of desynchronizing the
+ * collective sequence and hanging.  Values are masked to 23 bits so their
+ * float representation remains exact. */
+static void tp_check_prompt_signature(tp_comm *c, const int32_t *tokens, int n,
+                                      int rank) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < n; i++) {
+        uint32_t x = (uint32_t)tokens[i];
+        for (int b = 0; b < 4; b++) {
+            h ^= (x >> (8 * b)) & 0xffu;
+            h *= 16777619u;
+        }
+    }
+    float max_n = (float)n, neg_min_n = -(float)n;
+    float max_h = (float)(h & 0x7fffffu), neg_min_h = -max_h;
+    int32_t owner = rank;
+    tp_allreduce_argmax(c, &max_n, &owner);
+    owner = rank; tp_allreduce_argmax(c, &neg_min_n, &owner);
+    owner = rank; tp_allreduce_argmax(c, &max_h, &owner);
+    owner = rank; tp_allreduce_argmax(c, &neg_min_h, &owner);
+    if (max_n != -neg_min_n || max_h != -neg_min_h)
+        die("prompt tokens differ across TP ranks; use a shared path or stage TP_PROMPT_FILE on every node", -1);
+}
+
+static void sample_argmax_n(transformer_model *m, float *logits, int stride,
+                            int n, int32_t *tokens, tp_comm *c,
+                            double *ar_secs_out, long *ar_calls_out) {
+    float vi[16];
+    int nloc = m->tp_vocab_sharded ? m->tp_vocab_loc : m->n_vocab;
+    for (int k = 0; k < n; k++) {
+        float best = -1e30f;
+        int32_t nt = 0;
+        float *lg = logits + (size_t)k * stride;
+        for (int v = 0; v < nloc; v++) {
+            if (lg[v] > best) { best = lg[v]; nt = v; }
+        }
+        nt += m->tp_vocab_lo;
+        vi[2*k] = best;
+        memcpy(&vi[2*k+1], &nt, sizeof(nt));
+    }
+    if (m->tp_vocab_sharded) {
+        double t0 = now_sec();
+        tp_allreduce_argmax_n(c, vi, n);
+        if (ar_secs_out) *ar_secs_out += now_sec() - t0;
+        if (ar_calls_out) (*ar_calls_out)++;
+    }
+    for (int k = 0; k < n; k++)
+        memcpy(&tokens[k], &vi[2*k+1], sizeof(tokens[k]));
+}
+
+typedef enum {
+    MTP_ASYNC_IDLE = 0,
+    MTP_ASYNC_RUNNING,
+    MTP_ASYNC_DONE,
+    MTP_ASYNC_FAILED,
+    MTP_ASYNC_STOP
+} mtp_async_status;
+
+typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    mtp_async_status status;
+    transformer_model *model;
+    tp_comm *comm;
+    float *seed_hidden;
+    int32_t seed_token;
+    int32_t tokens[16];
+    int position, count;
+    int cpu;
+    double elapsed, ar_secs;
+    long ar_calls;
+} mtp_async_state;
+
+static void *mtp_async_worker(void *opaque) {
+    mtp_async_state *s = (mtp_async_state *)opaque;
+#if defined(__linux__)
+    if (s->cpu >= 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set); CPU_SET(s->cpu, &set);
+        (void)sched_setaffinity(0, sizeof(set), &set);
+    }
+#endif
+    pthread_mutex_lock(&s->mu);
+    for (;;) {
+        /* DONE remains owned by the consumer until mtp_async_wait() copies
+         * the result and returns the slot to IDLE.  In particular, do not
+         * treat DONE as another work request: that would repeatedly advance
+         * the private KV cache and flood the second TNI while verification is
+         * still running. */
+        while (s->status != MTP_ASYNC_RUNNING &&
+               s->status != MTP_ASYNC_STOP)
+            pthread_cond_wait(&s->cv, &s->mu);
+        if (s->status == MTP_ASYNC_STOP) break;
+        int32_t prev = s->seed_token;
+        int pos = s->position, count = s->count;
+        pthread_mutex_unlock(&s->mu);
+
+        const float *hidden = s->seed_hidden;
+        double begin = now_sec(), ar = 0.0;
+        long calls = 0;
+        int failed = 0;
+        for (int k = 0; k < count; k++) {
+            if (getenv("TP_MTP_ASYNC_TRACE") && s->model->tp_rank == 0)
+                fprintf(stderr, "async draft begin k=%d pos=%d\n", k, pos + k);
+            float *logits = transformer_nextn_logits(s->model, prev, hidden, pos + k);
+            if (!logits) { failed = 1; break; }
+            s->tokens[k] = sample_argmax(s->model, logits, s->comm, &ar, &calls);
+            if (getenv("TP_MTP_ASYNC_TRACE") && s->model->tp_rank == 0)
+                fprintf(stderr, "async draft end k=%d token=%d\n", k, s->tokens[k]);
+            prev = s->tokens[k];
+            hidden = transformer_nextn_hidden(s->model);
+        }
+
+        pthread_mutex_lock(&s->mu);
+        s->elapsed = now_sec() - begin;
+        s->ar_secs = ar;
+        s->ar_calls = calls;
+        s->status = failed ? MTP_ASYNC_FAILED : MTP_ASYNC_DONE;
+        pthread_cond_broadcast(&s->cv);
+    }
+    pthread_mutex_unlock(&s->mu);
+    return NULL;
+}
+
+static int mtp_async_start(mtp_async_state *s, transformer_model *model,
+                           tp_comm *comm, int n_embd, int cpu) {
+    memset(s, 0, sizeof(*s));
+    s->model = model; s->comm = comm; s->cpu = cpu;
+    s->status = MTP_ASYNC_IDLE;
+    if (posix_memalign((void **)&s->seed_hidden, 256,
+                       (size_t)n_embd * sizeof(float)) != 0) return -1;
+    if (pthread_mutex_init(&s->mu, NULL) || pthread_cond_init(&s->cv, NULL) ||
+        pthread_create(&s->thread, NULL, mtp_async_worker, s)) {
+        free(s->seed_hidden); s->seed_hidden = NULL; return -1;
+    }
+    return 0;
+}
+
+static void mtp_async_submit(mtp_async_state *s, int32_t seed_token,
+                             const float *seed_hidden, int n_embd,
+                             int position, int count) {
+    pthread_mutex_lock(&s->mu);
+    if (s->status != MTP_ASYNC_IDLE) die("MTP async submit while busy", -1);
+    memcpy(s->seed_hidden, seed_hidden, (size_t)n_embd * sizeof(float));
+    s->seed_token = seed_token; s->position = position; s->count = count;
+    s->status = MTP_ASYNC_RUNNING;
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+}
+
+static int mtp_async_wait(mtp_async_state *s, int32_t *tokens,
+                          double *elapsed, double *ar_secs, long *ar_calls) {
+    pthread_mutex_lock(&s->mu);
+    while (s->status == MTP_ASYNC_RUNNING)
+        pthread_cond_wait(&s->cv, &s->mu);
+    int ok = s->status == MTP_ASYNC_DONE;
+    if (ok) memcpy(tokens, s->tokens, (size_t)s->count * sizeof(*tokens));
+    if (elapsed) *elapsed = s->elapsed;
+    if (ar_secs) *ar_secs = s->ar_secs;
+    if (ar_calls) *ar_calls = s->ar_calls;
+    s->status = MTP_ASYNC_IDLE;
+    pthread_mutex_unlock(&s->mu);
+    return ok ? 0 : -1;
+}
+
+static void mtp_async_stop(mtp_async_state *s) {
+    if (!s->seed_hidden) return;
+    pthread_mutex_lock(&s->mu);
+    while (s->status == MTP_ASYNC_RUNNING)
+        pthread_cond_wait(&s->cv, &s->mu);
+    s->status = MTP_ASYNC_STOP;
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+    pthread_join(s->thread, NULL);
+    pthread_cond_destroy(&s->cv); pthread_mutex_destroy(&s->mu);
+    free(s->seed_hidden); s->seed_hidden = NULL;
+}
+
 static void print_token(const bpe_vocab *vocab, int32_t nt) {
     const char *s = bpe_token_to_str(vocab, nt);
     if (!s) return;
@@ -602,8 +1071,13 @@ static void print_token(const bpe_vocab *vocab, int32_t nt) {
     char *dec = bpe_byte_decode(s, (int)strlen(s), &dec_len);
     const char *out = dec ? dec : s;
     int len = dec ? dec_len : (int)strlen(s);
-    if (g_log) { fwrite(out, 1, len, g_log); fflush(g_log); }
-    fwrite(out, 1, len, stdout); fflush(stdout);
+    int buffered = getenv("TP_BUFFER_OUTPUT") != NULL;
+    if (g_log) { fwrite(out, 1, len, g_log); if (!buffered) fflush(g_log); }
+    if (g_generated_text) {
+        fwrite(out, 1, len, g_generated_text);
+        if (!buffered) fflush(g_generated_text);
+    }
+    fwrite(out, 1, len, stdout); if (!buffered) fflush(stdout);
     free(dec);
 }
 
@@ -713,6 +1187,34 @@ static void tp_ar_callback(float *buf, int count, void *ctx) {
     g_ar_calls++;
 }
 
+static void tp_ar_reduce_add_callback(float *buf, float *residual, int count,
+                                      void *ctx) {
+    tp_comm *c = (tp_comm *)ctx;
+    int mc = c->max_count > 0 ? c->max_count : count;
+    double t0 = now_sec();
+    for (int off = 0; off < count; ) {
+        int n = count - off;
+        if (n > mc) n = mc;
+        tp_allreduce_sum_add(c, buf + off, residual + off, n);
+        off += n;
+    }
+    g_ar_secs += now_sec() - t0;
+    g_ar_calls++;
+}
+
+/* Independent draft callback: its worker records argmax communication in the
+ * async job and must not race the verifier's legacy timing counters here. */
+static void tp_ar_callback_quiet(float *buf, int count, void *ctx) {
+    tp_comm *c = (tp_comm *)ctx;
+    int mc = c->max_count > 0 ? c->max_count : count;
+    for (int off = 0; off < count; ) {
+        int n = count - off;
+        if (n > mc) n = mc;
+        tp_allreduce_sum(c, buf + off, n);
+        off += n;
+    }
+}
+
 static void tp_dry_token_walk(transformer_model *m, tp_comm *c, int32_t tok,
                              int work_reps, int ar_reps) {
     if (!m || !m->x || m->n_embd <= 0) return;
@@ -768,9 +1270,20 @@ int main(int argc, char **argv) {
     const char *prompt_env = envs("TP_PROMPT", "Hello, who are you?");
     const char *prompt_file = envs("TP_PROMPT_FILE", "");
     char *prompt_file_text = NULL;
+    char *prompt_repeat_text = NULL;
     const char *prompt = prompt_env;
     int  max_gen           = (int)envl("TP_MAXGEN", 64);
+    int  perf_warmup       = (int)envl("TP_PERF_WARMUP", 0);
+    int  spec_k            = (int)envl("TP_SPEC_K", 0);
+    /* Opt in until the batched-vs-token greedy gate is exact for long runs. */
+    int  mtp_batch         = envb("TP_MTP_BATCH", 0);
+    int  mtp_async         = mtp_batch && envb_opt("TP_MTP_ASYNC", 0);
+    int  mtp_bonus_probe   = mtp_batch &&
+        (mtp_async || envb_opt("TP_MTP_BONUS_PROBE", 0));
     int  llm_threads       = (int)envl("LLM_THREADS", 48);
+    int fused_decode_head = envb_opt("TP_DECODE_FUSED_HEAD", 0);
+    if (spec_k < 0 || spec_k > 16) die("TP_SPEC_K must be in [0,16]", -1);
+    if (mtp_async && spec_k != 4) die("TP_MTP_ASYNC currently requires TP_SPEC_K=4", -1);
     int  ignore_eos        = (int)envl("TP_IGNORE_EOS", 0);  /* long-ctx perf sweep: don't stop at EOS */
     int  prefill_only      = envb("TP_PREFILL_ONLY", 0);
     int  do_prefill_gemm   = envb("TP_PREFILL_GEMM", 1);      /* 1=batched prefill, fallback to token loop */
@@ -782,11 +1295,19 @@ int main(int argc, char **argv) {
     int  dry_work_reps    = (int)envl_opt("TP_DRY_WORK_REPS", 0);
     int  dry_ar_steps     = (int)envl_opt("TP_DRY_AR_STEPS", 0);
     int  dry_token_step   = (int)envl_opt("TP_DRY_TOKEN_STEP", 1);
-    int  cache_load         = envb_opt("TP_CACHE_LOAD", 0);
-    int  cache_save         = envb_opt("TP_CACHE_SAVE", 0);
+    /* A system cache is an ordinary TP checkpoint taken at a known prompt
+     * prefix.  It can be reused by requests which append user text, avoiding
+     * a second pass over the fixed system instructions. */
+    const char *system_cache_path = envs_opt("TP_SYSTEM_CACHE_PATH", "");
+    const char *system_cache_dir = envs_opt("TP_SYSTEM_CACHE_DIR", "");
+    int system_cache_tokens = (int)envl_opt("TP_SYSTEM_CACHE_TOKENS", 0);
+    int  cache_load         = envb_opt("TP_CACHE_LOAD", system_cache_path[0] != 0 || system_cache_dir[0] != 0);
+    int  cache_save         = envb_opt("TP_CACHE_SAVE", system_cache_path[0] != 0 || system_cache_dir[0] != 0);
+    int  cache_autosave     = envb_opt("TP_CACHE_AUTOSAVE", 1);
+    int  cache_repartition_from = (int)envl_opt("TP_CACHE_REPARTITION_FROM", 0);
     const char *cache_shared_s = envs_opt("TP_CACHE_SHARED", "auto");
-    const char *cache_dir = envs_opt("TP_CACHE_DIR", "");
-    const char *cache_path_env = envs_opt("TP_CACHE_PATH", "");
+    const char *cache_dir = envs_opt("TP_CACHE_DIR", system_cache_dir);
+    const char *cache_path_env = envs_opt("TP_CACHE_PATH", system_cache_path);
     const char *cache_tag = envs_opt("TP_CACHE_TAG", "tp");
     int cache_shared = -1;
 
@@ -825,6 +1346,11 @@ int main(int argc, char **argv) {
         g_curve = fopen("tp_curve_rank00.txt", "w");
         if (g_curve) fprintf(g_curve, "# pos ctx_len fwd_ms comm_ms\n");
         if (envb_opt("TP_DUMP_TOKENS", 0)) g_tokdump = fopen("tp_tokens_rank00.txt", "w");
+        const char *generated_path = envs_opt("TP_GENERATED_TEXT_FILE", "");
+        if (generated_path[0]) {
+            g_generated_text = fopen(generated_path, "w");
+            if (!g_generated_text) die("open TP_GENERATED_TEXT_FILE", errno);
+        }
     }
 
     /* ---- prompt + tokenize (every rank: deterministic, no comm) ---- */
@@ -837,8 +1363,31 @@ int main(int argc, char **argv) {
             prompt = prompt_file_text;
         }
     }
-
-    gguf_context *gguf = gguf_open_multi(model_path, 1);   /* lazy mmap */
+    int prompt_repeat = (int)envl_opt("TP_PROMPT_REPEAT", 1);
+    /* Long-context validation deliberately repeats a deterministic brief.
+     * Keep an upper bound for allocation safety, but allow 8k-token prompts. */
+    if (prompt_repeat < 1 || prompt_repeat > 64)
+        die("TP_PROMPT_REPEAT must be in [1,64]", -1);
+    if (prompt_repeat > 1) {
+        size_t one = strlen(prompt);
+        if (one > (SIZE_MAX - (size_t)prompt_repeat) / (size_t)prompt_repeat)
+            die("TP_PROMPT_REPEAT overflow", -1);
+        size_t bytes = one * (size_t)prompt_repeat + (size_t)prompt_repeat;
+        prompt_repeat_text = (char *)malloc(bytes);
+        if (!prompt_repeat_text) die("malloc(repeated prompt)", -1);
+        char *d = prompt_repeat_text;
+        for (int i = 0; i < prompt_repeat; i++) {
+            if (i) *d++ = ' ';
+            memcpy(d, prompt, one);
+            d += one;
+        }
+        *d = 0;
+        prompt = prompt_repeat_text;
+    }
+    /* A complete TP stage owns every tensor used by decode.  Parse only
+     * source metadata in that mode; never mmap or allocate the 54 GB GGUF. */
+    gguf_context *gguf = gguf_open_multi(model_path,
+                                         envs_opt("TP_STAGE_DIR", "")[0] ? 3 : 0);
     if (!gguf) die("gguf_open_multi", -1);
     bpe_vocab *vocab = bpe_vocab_load(gguf);
     if (!vocab) die("bpe_vocab_load", -1);
@@ -856,7 +1405,8 @@ int main(int argc, char **argv) {
         if (synth_token_id <= 0) synth_token_id = 1;
         for (int i = 0; i < P; i++) ptoks[i] = (int32_t)synth_token_id;
     } else {
-        char *text = build_chat_text(prompt, NULL);
+        char *text = envb_opt("TP_RAW_PROMPT", 0) ? strdup(prompt)
+                                                   : build_chat_text(prompt, NULL);
         if (!text) die("build chat text", -1);
 
         P = bpe_tokenize(vocab, text, -1, NULL, 0);
@@ -870,6 +1420,12 @@ int main(int argc, char **argv) {
         if (P > tok_cap) die("tokenization budget overflow", -1);
         free(text);
     }
+    int prompt_token_limit = (int)envl_opt("TP_PROMPT_TOKEN_LIMIT", 0);
+    if (prompt_token_limit > 0 && P > prompt_token_limit) P = prompt_token_limit;
+    if (system_cache_tokens < 0 || system_cache_tokens > P)
+        die("TP_SYSTEM_CACHE_TOKENS must be in [0, prompt token count]", -1);
+    if ((system_cache_path[0] || system_cache_dir[0]) && system_cache_tokens == 0)
+        die("TP_SYSTEM_CACHE_PATH/DIR requires TP_SYSTEM_CACHE_TOKENS", -1);
 
     int cfg_max_seq = (int)envl("TP_MAXSEQ", 0);
     int need_seq = P + max_gen + 16;
@@ -888,14 +1444,101 @@ int main(int argc, char **argv) {
     int n_layers = m->n_layers;
     int n_embd   = m->n_embd;
 
+    /* Optional reduced decode teams must still cover all four CMGs. */
+    m->pool_core_striped = envb_opt("TP_POOL_CORE_STRIPED", 0);
     if (llm_threads > 1) transformer_set_threads(m, llm_threads);
     /* Hybrid models (Qwen3.5/3.6) need Stage-B SSM V-head sharding to fit; pure
      * transformer 9B only has attn+FFN to shard. TP_NO_SSM_SHARD forces Stage A. */
     int ssm_shard = m->is_hybrid && !getenv("TP_NO_SSM_SHARD");
     if (transformer_tp_slice_weights(m, MyRank, N, ssm_shard) != 0)
         die("transformer_tp_slice_weights (check n_heads/n_kv/n_ff/ssm_dt % N)", -1);
+    /* P-odd is a prefill-only layout: ordinary decode matvec reads row-major
+     * weights, so never enable it for a run that will generate tokens. */
+    if (prefill_only && do_prefill_gemm && envb_opt("TP_PREFILL_PREPACK_PODD", 0)) {
+        transformer_prepack_podd(m);
+        if (MyRank == 0) logmsg("prefill: p-odd BF16 weights prepacked\n");
+    }
+    const char *tp_stage_dir = envs_opt("TP_STAGE_DIR", "");
+    if ((spec_k > 0 || envs_opt("TP_STAGE_DIR", "")[0]) && m->nextn.loaded &&
+        transformer_tp_slice_nextn(m, MyRank, N) != 0)
+        die("transformer_tp_slice_nextn", -1);
+    size_t tp_stage_bytes = 0;
+    if (tp_stage_dir[0]) {
+        tp_stage_bytes = transformer_tp_load_stage(m, tp_stage_dir, MyRank, N);
+        if (!tp_stage_bytes) die("transformer_tp_load_stage", -1);
+    }
+    /* Q8 TP shards can be converted once to row-major W8A8.  This selects the
+     * native SVE SDOT matvec path; keep it opt-in because it is lossy and only
+     * applies to Q8_0 models. */
+    const char *q8_mode_env = getenv("TP_Q8_MODE");
+    int is_q8_model = m->layers &&
+        (m->layers[0].attn_q.type == GGML_TYPE_Q8_0 ||
+         m->layers[0].ssm_qkv.type == GGML_TYPE_Q8_0 ||
+         m->layers[0].ffn_gate.type == GGML_TYPE_Q8_0);
+    if (q8_mode_env && *q8_mode_env && is_q8_model) {
+        int q8_mode = !strcmp(q8_mode_env, "row") ? 1 :
+                      !strcmp(q8_mode_env, "block64") ? 2 :
+                      !strcmp(q8_mode_env, "block64-ffn") ? 3 :
+                      !strcmp(q8_mode_env, "block64-exact") ? 4 : 0;
+        size_t q8_bytes = transformer_materialize_q8_decode(m, gguf, q8_mode);
+        if (!q8_bytes) die("transformer_materialize_q8_decode", -1);
+        if (MyRank == 0) logmsg("TP_Q8_MODE=%s resident=%.3fGB\n", q8_mode_env,
+                                (double)q8_bytes / 1e9);
+    }
+    const char *q8_expand = getenv("TP_Q8_EXPAND_BF16");
+    if (q8_expand && *q8_expand && atoi(q8_expand) != 0 && is_q8_model) {
+        if (q8_mode_env && *q8_mode_env)
+            die("TP_Q8_EXPAND_BF16 conflicts with TP_Q8_MODE", -1);
+        if (getenv("TP_Q8_VERIFY") && *getenv("TP_Q8_VERIFY"))
+            die("TP_Q8_EXPAND_BF16 conflicts with TP_Q8_VERIFY", -1);
+        int nextn_mask = spec_k > 0 ? (int)envl("TP_Q8_EXPAND_NEXTN_MASK", 0) : 0;
+        if (nextn_mask & ~0x1ff)
+            die("TP_Q8_EXPAND_NEXTN_MASK contains unsupported bits", -1);
+        if (!tp_stage_bytes)
+            die("TP_Q8_EXPAND_BF16 requires a complete anonymous TP stage", -1);
+        size_t expanded = transformer_expand_q8_bf16_pv_range(
+            m, 0, m->n_layers, 1, nextn_mask);
+        if (!expanded) die("Q8 to BF16 PV expansion", -1);
+        if (MyRank == 0) logmsg("TP_Q8_EXPAND_BF16=1 expanded=%.3fGB\n",
+                                (double)expanded / 1e9);
+    }
+    const char *q8_verify = getenv("TP_Q8_VERIFY");
+    if (q8_verify && *q8_verify && is_q8_model) {
+        size_t verify_bytes = 0;
+        if (!strcmp(q8_verify, "q8v2"))
+            verify_bytes = transformer_prepack_q8v2_range(m, 0, m->n_layers);
+        else
+            die("TP_Q8_VERIFY must be q8v2", -1);
+        if (!verify_bytes) die("Q8 verifier prepack", -1);
+        if (MyRank == 0) logmsg("TP_Q8_VERIFY=%s packed=%.3fGB\n",
+                                q8_verify, (double)verify_bytes / 1e9);
+    }
+    if (getenv("TP_INT8_MODE") && *getenv("TP_INT8_MODE")) {
+        if (m->layers[0].ffn_gate.type != GGML_TYPE_BF16)
+            die("TP_INT8_MODE requires BF16 TP shards", -1);
+        if (!strcmp(getenv("TP_INT8_MODE"), "block64-ffn"))
+            transformer_prepack_int8_block64_ffn(m);
+        else if (!strcmp(getenv("TP_INT8_MODE"), "block64"))
+            transformer_prepack_int8_block64(m);
+        else if (!strcmp(getenv("TP_INT8_MODE"), "row") ||
+                 !strcmp(getenv("TP_INT8_MODE"), "row-ffn"))
+            transformer_prepack_int8(m);
+        else
+            die("TP_INT8_MODE must be row, row-ffn, block64, or block64-ffn", -1);
+        if (MyRank == 0) logmsg("TP_INT8_MODE=%s enabled for resident BF16 projections\n",
+                                getenv("TP_INT8_MODE"));
+    }
+    if (MyRank == 0 && ((q8_mode_env && !strcmp(q8_mode_env, "row")) ||
+                        (getenv("TP_INT8_MODE") && *getenv("TP_INT8_MODE"))))
+        logmsg("TF_W8_DOT=%s\n", envs_opt("TF_W8_DOT", "int8"));
+    if (!tp_stage_bytes && spec_k > 0 && m->nextn.loaded &&
+        envb("TP_MATERIALIZE_NEXTN", 1)) {
+        size_t nextn_bytes = transformer_materialize_nextn(m);
+        if (!nextn_bytes) die("transformer_materialize_nextn", -1);
+    }
     double tp0 = now_sec();
-    transformer_build_panels(m);                  /* repack the local shard */
+    if (!envb("TF_NO_PANEL", 0))
+        transformer_build_panels(m);              /* repack the local shard */
     double tp1 = now_sec();
     if (dry_mode) {
         if (dry_ar_steps <= 0) dry_ar_steps = 2;
@@ -904,11 +1547,12 @@ int main(int argc, char **argv) {
     }
     {   char tname[64]; snprintf(tname, sizeof tname, "tp_load_rank%02d.txt", MyRank);
         FILE *tf = fopen(tname, "w");
-        if (tf) { fprintf(tf, "rank %d: transformer_load=%.1fs build_panels=%.1fs "
+        if (tf) { fprintf(tf, "rank %d: transformer_load=%.1fs build_panels=%.1fs stage=%.3fGB "
                           "(n_heads=%d n_kv=%d n_ff=%d hybrid=%d ssm_shard=%d "
                           "ssm_dt=%d ssm_qkv=%d ssm_d_inner=%d head_off=%d "
                           "vocab_shard=%d vocab_loc=%d vocab_lo=%d)\n",
-                          MyRank, tl1 - tl0, tp1 - tp0, m->n_heads, m->n_kv_heads, m->n_ff,
+                          MyRank, tl1 - tl0, tp1 - tp0, (double)tp_stage_bytes/1e9,
+                          m->n_heads, m->n_kv_heads, m->n_ff,
                           m->is_hybrid, m->tp_ssm_sharded, m->ssm_dt_rank, m->ssm_qkv_dim,
                           m->ssm_d_inner, m->ssm_head_offset,
                           m->tp_vocab_sharded, m->tp_vocab_loc, m->tp_vocab_lo); fclose(tf); }
@@ -920,7 +1564,10 @@ int main(int argc, char **argv) {
     SEND_OFF = 0;
     BAR_BASE = SlotSend;
     size_t region_sz = BAR_BASE + (size_t)(N + 1) * SlotB;
-    if (posix_memalign((void **)&Region, DEMO_CACHE_LINE, region_sz) != 0) die("posix_memalign", -1);
+    size_t region_map_sz = 0;
+    int comm_cmg_node = -1;
+    Region = tp_comm_cmg_alloc(region_sz, &region_map_sz, &comm_cmg_node);
+    if (!Region) die("CMG-local barrier allocation", errno ? errno : -1);
     memset(Region, 0, region_sz);
 
     /* ---- VCQ + region registration; reconstruct peers by convention ---- */
@@ -947,8 +1594,6 @@ int main(int argc, char **argv) {
         rc = utofu_query_stadd(PeerVcq[r], RUN_STAG, &PeerBase[r]);
         if (rc != UTOFU_SUCCESS) die("utofu_query_stadd(peer)", rc);
     }
-    free(tni_ids);
-
     int is_first = (MyRank == 0);
 
     if (is_first)
@@ -963,10 +1608,14 @@ int main(int argc, char **argv) {
            MyRank, m->n_heads, m->n_kv_heads, m->n_ff, m->tp_kv_head_count, m->tp_kv_head_base, region_sz / 1024.0);
 
     if (m->tp_attn_sharded && m->tp_kv_head_count > 0 && m->tp_kv_head_count < m->n_kv_heads) {
+        if (is_first) logmsg("tp startup: resize KV begin\n");
         transformer_resize_kv_for_tp(m, 0, n_layers, m->tp_kv_head_count * m->head_dim);
+        if (is_first) logmsg("tp startup: resize KV complete\n");
     }
 
+    if (is_first) logmsg("tp startup: barrier begin\n");
     barrier_robust(1);   /* robust startup bootstrap (all ranks registered + running) */
+    if (is_first) logmsg("tp startup: barrier complete\n");
 
     /* ---- init all-reduce comm + wire into the model ----
      * Region holds max_count floats. Decode reduces exactly n_embd, but BATCHED
@@ -984,12 +1633,99 @@ int main(int argc, char **argv) {
     long ar_max = (long)n_embd * ar_batch;
     if (ar_max > 2L * 1024 * 1024) ar_max = 2L * 1024 * 1024;  /* cap bf16 Put < 16MiB, region < ~75MB */
     if (ar_max < n_embd) ar_max = n_embd;
+    tp_comm_config ar_options = tp_comm_env_config();
+    size_t ar_region_bytes = tp_comm_region_size(N, (int)ar_max, &ar_options);
+    size_t ar_region_map_sz = 0;
+    void *ar_region = tp_comm_cmg_alloc(ar_region_bytes, &ar_region_map_sz, NULL);
+    if (!ar_region) die("CMG-local all-reduce allocation", errno ? errno : -1);
     tp_comm c;
-    if (tp_comm_init(&c, Vcq, PeerVcq, MyRank, N, (int)ar_max, barrier) != 0) die("tp_comm_init", -1);
-    if (is_first) logmsg("tp_ar region: max_count=%ld (TP_AR_BATCH=%d tokens, ~%.1f MB region)\n",
-                         ar_max, ar_batch, (double)(9L * ar_max * 4) / (1024*1024));
+    if (tp_comm_init_external(&c, Vcq, PeerVcq, MyRank, N, (int)ar_max,
+                              barrier, &ar_options, ar_region, ar_region_map_sz) != 0)
+        die("tp_comm_init_external", -1);
+    if (is_first) logmsg("tp_ar region: max_count=%ld (TP_AR_BATCH=%d tokens, %.1f MB, "
+                         "align=256 cmg_node=%d)\n", ar_max, ar_batch,
+                         (double)ar_region_bytes / (1024*1024), comm_cmg_node);
     transformer_set_tp(m, MyRank, N, tp_ar_callback, &c);
+    if (envb_opt("TP_AR_FUSED_ADD", 1))
+        transformer_set_tp_reduce_add(m, tp_ar_reduce_add_callback);
+
+    /* Async NextN owns a second TNI/VCQ and collective sequence.  Keeping its
+     * registered landing region separate is required for real overlap: sharing
+     * the verifier VCQ would race TCQ/MRQ polling and sequence trailers. */
+    utofu_vcq_hdl_t draft_vcq = 0;
+    utofu_vcq_id_t draft_peer_vcq[MAX_NODES] = {0};
+    tp_comm draft_comm;
+    memset(&draft_comm, 0, sizeof(draft_comm));
+    void *draft_ar_region = NULL;
+    size_t draft_ar_map_sz = 0;
+    int draft_comm_ready = 0;
+    if (mtp_async) {
+        if (num_tnis < 2) die("TP_MTP_ASYNC requires a second one-sided TNI", -1);
+        utofu_tni_id_t dtni = tni_ids[1];
+        rc = utofu_create_vcq_with_cmp_id(dtni, DEMO_CMP_ID, 0, &draft_vcq);
+        if (rc != UTOFU_SUCCESS) die("create async draft VCQ", rc);
+        utofu_vcq_id_t dself;
+        rc = utofu_query_vcq_id(draft_vcq, &dself);
+        if (rc != UTOFU_SUCCESS) die("query async draft VCQ", rc);
+        for (int r = 0; r < N; r++) {
+            if (r == MyRank) draft_peer_vcq[r] = dself;
+            else {
+                rc = utofu_construct_vcq_id(topo[r], dtni, DEMO_CQ_ID,
+                                             DEMO_CMP_ID, &draft_peer_vcq[r]);
+                if (rc != UTOFU_SUCCESS) die("construct async draft peer VCQ", rc);
+                utofu_set_vcq_id_path(&draft_peer_vcq[r], NULL);
+            }
+        }
+        tp_comm_config dc = ar_options;
+        dc.a2a_max = n_embd;
+        size_t bytes = tp_comm_region_size(N, n_embd, &dc);
+        draft_ar_region = tp_comm_cmg_alloc(bytes, &draft_ar_map_sz, NULL);
+        if (!draft_ar_region) die("CMG-local async draft all-reduce allocation", errno);
+        if (tp_comm_init_region_ex(&draft_comm, draft_vcq, draft_peer_vcq,
+                                   MyRank, N, n_embd, barrier, 9, &dc,
+                                   draft_ar_region, draft_ar_map_sz) != 0)
+            die("async draft tp_comm init", -1);
+        draft_comm_ready = 1;
+        if (is_first)
+            logmsg("MTP async transport: TNI=1 stag=9 region=%.1fKB align=256\n",
+                   (double)bytes / 1024.0);
+    }
+    free(tni_ids); tni_ids = NULL;
     barrier();
+    tp_check_prompt_signature(&c, ptoks, P, MyRank);
+
+    int null_stream_passes = (int)envl("TP_NULL_STREAM_PASSES", 0);
+    if (null_stream_passes > 0) {
+        double bw = transformer_null_stream_bench(m, null_stream_passes);
+        barrier();
+        char pn[64];
+        snprintf(pn, sizeof pn, "tp_null_stream_rank%02d.txt", MyRank);
+        FILE *pf = fopen(pn, "w");
+        if (pf) {
+            fprintf(pf, "rank %d: passes=%d stage=%.3fGB bandwidth=%.1fGB/s\n",
+                    MyRank, null_stream_passes, (double)tp_stage_bytes / 1e9, bw);
+            fclose(pf);
+        }
+        if (is_first)
+            logmsg("TP null-batched: passes=%d local_stage=%.3f GB bandwidth=%.1f GB/s/rank\n",
+                   null_stream_passes, (double)tp_stage_bytes / 1e9, bw);
+        transformer_free(m);
+        if (draft_comm_ready) {
+            tp_comm_free(&draft_comm);
+            munmap(draft_ar_region, draft_ar_map_sz);
+            utofu_free_vcq(draft_vcq);
+        }
+        tp_comm_free(&c);
+        munmap(ar_region, ar_region_map_sz);
+        utofu_dereg_mem(Vcq, Base, 0);
+        utofu_free_vcq(Vcq);
+        free(ptoks); munmap(Region, region_map_sz);
+        if (g_log) fclose(g_log);
+        if (g_generated_text) fclose(g_generated_text);
+        if (g_curve) fclose(g_curve);
+        if (g_tokdump) fclose(g_tokdump);
+        return 0;
+    }
 
     int cache_loaded = 0;
     int cache_prefill_used = 0;
@@ -1028,7 +1764,7 @@ int main(int argc, char **argv) {
             have_cache_path = 1;
     }
 
-    if (cache_path_env[0] || cache_dir[0]) {
+    if (cache_autosave && (cache_path_env[0] || cache_dir[0])) {
         if (!cache_load)  cache_load = 1;
         if (!cache_save)  cache_save = 1;
     }
@@ -1036,14 +1772,28 @@ int main(int argc, char **argv) {
     if (cache_load && have_cache_path) {
         int64_t probe_pos = -1; int32_t probe_next = -1;
         int cache_rank = cache_shared ? -1 : MyRank;
-        int probe_ok = (tp_checkpoint_probe(m, cache_path, &probe_pos, &probe_next,
-                                          N, cache_rank, max_seq, cache_shared) == 0);
+        int probe_ok;
+        if (cache_repartition_from > 0) {
+            if (is_first) fprintf(stderr, "tp cache repartition source=%d dir=%s target=%d\n",
+                                  cache_repartition_from, cache_dir, N);
+            probe_ok = cache_dir[0] && cache_repartition_from != N &&
+                tp_checkpoint_load_repartition(m, cache_dir, model_path, cache_tag,
+                                               cache_repartition_from, MyRank,
+                                               &probe_pos, &probe_next) == 0;
+        } else {
+            probe_ok = (tp_checkpoint_probe(m, cache_path, &probe_pos, &probe_next,
+                                             N, cache_rank, max_seq, cache_shared) == 0);
+        }
         float all_probe = probe_ok ? 1.0f : 0.0f;
         tp_allreduce_sum(&c, &all_probe, 1);
         int all_ranks_probe = ((int)(all_probe + 0.5f) == N);
         if (all_ranks_probe) {
-            cache_loaded = (tp_checkpoint_load(m, cache_path, &ck_pos, &ck_next,
-                                             cache_rank, N, cache_shared) == 0);
+            if (cache_repartition_from > 0) {
+                ck_pos = probe_pos; ck_next = probe_next; cache_loaded = 1;
+            } else {
+                cache_loaded = (tp_checkpoint_load(m, cache_path, &ck_pos, &ck_next,
+                                                 cache_rank, N, cache_shared) == 0);
+            }
             if (cache_loaded) cache_prefill_used = 1;
             if (!cache_loaded && is_first)
                 logmsg("TP cache load failed on rank0 after pre-check: %s\n", cache_path);
@@ -1059,12 +1809,28 @@ int main(int argc, char **argv) {
     int n_gen = 0;
     double t_prefill = 0.0;
     double t_fwd = 0.0;
+    long mtp_match = 0, mtp_total = 0;
+    long mtp_bonus_match = 0, mtp_bonus_total = 0;
+    long mtp_bonus_chain_match = 0, mtp_full_accept = 0;
+    long mtp_accept_hist[17] = {0};
+    long mtp_horizon_match[16] = {0}, mtp_horizon_total[16] = {0};
+    long mtp_teacher_match = 0, mtp_teacher_total = 0;
+    long mtp_teacher_offset_match[7] = {0};  /* expected token index p + [-1..5] */
+    int32_t *mtp_token_counts = spec_k > 0
+        ? (int32_t *)calloc((size_t)m->n_vocab, sizeof(int32_t)) : NULL;
+    int mtp_unique_targets = 0, mtp_max_target_count = 0;
+    int32_t mtp_pending[16] = {0};
+    int mtp_pending_n = 0;
+    float *mtp_seed_hidden = spec_k > 0
+        ? (float *)malloc((size_t)n_embd * sizeof(float)) : NULL;
+    if (spec_k > 0 && !mtp_seed_hidden) die("MTP hidden allocation", -1);
     double t_comm = 0.0;
     long pcnt = 0, ar_calls = 0;
     int32_t in_tok = (P > 0) ? ptoks[0] : 0;
     int prefill_gemm_used = 0;
     int prefill_tokens = 0;
     int prefill_from = 0;
+    int system_cache_saved = 0;
 
     if (P <= 0) die("prompt token count must be positive", -1);
 
@@ -1118,13 +1884,70 @@ int main(int argc, char **argv) {
             in_tok = (P > 0) ? tp_next_token_synth(in_tok, 1, m->n_vocab) : in_tok;
         } else if (do_prefill_gemm) {
             double pf0 = now_sec();
-            float *lg = transformer_prefill_gemm(m, ptoks + prefill_from, prefill_tokens, prefill_from);
+            /* A full 8k hybrid batch gives attention an impractically large
+             * working set on TP4.  Each call writes its KV and recurrent state
+             * at start_pos, so contiguous chunks are mathematically the same
+             * causal prefill as one call while bounding scratch and task size. */
+            int prefill_chunk = (int)envl_opt("TP_PREFILL_CHUNK", 0);
+            if (prefill_chunk < 1)
+                prefill_chunk = prefill_tokens > 1024 ? 512 : prefill_tokens;
+            if (prefill_chunk > prefill_tokens) prefill_chunk = prefill_tokens;
+            float *lg = NULL;
+            int pf_done = 0;
+            while (pf_done < prefill_tokens) {
+                int n = prefill_tokens - pf_done;
+                if (n > prefill_chunk) n = prefill_chunk;
+                int system_rel = system_cache_tokens - prefill_from;
+                if (!system_cache_saved && (system_cache_path[0] || system_cache_dir[0]) &&
+                    system_rel > pf_done && system_rel < pf_done + n)
+                    n = system_rel - pf_done;
+                lg = transformer_prefill_gemm(m, ptoks + prefill_from + pf_done,
+                                               n, prefill_from + pf_done);
+                if (!lg) break;
+                pf_done += n;
+                if (!system_cache_saved && (system_cache_path[0] || system_cache_dir[0]) &&
+                    prefill_from + pf_done == system_cache_tokens && have_cache_path) {
+                    double cache_ar = 0.0; long cache_calls = 0;
+                    int32_t cache_next = sample_argmax(m, lg, &c, &cache_ar, &cache_calls);
+                    if (tp_checkpoint_write(m, cache_path, system_cache_tokens,
+                                            cache_next, cache_shared) != 0)
+                        die("write TP system cache", errno ? errno : -1);
+                    system_cache_saved = 1;
+                    t_comm += cache_ar; ar_calls += cache_calls;
+                    if (is_first)
+                        logmsg("TP system cache saved: %s pos=%d\n",
+                               cache_path, system_cache_tokens);
+                }
+            }
             if (lg) {
                 double ar_step = 0.0; long ar_calls_step = 0;
                 in_tok = sample_argmax(m, lg, &c, &ar_step, &ar_calls_step);
                 t_prefill = now_sec() - pf0;
                 t_comm += ar_step; ar_calls += ar_calls_step;
                 prefill_gemm_used = 1;
+                if (spec_k && m->nextn.loaded && prefill_from == 0) {
+                    const float *raw = envb_opt("TP_MTP_RAW_HIDDEN", 0)
+                        ? transformer_nextn_target_hidden(m) : transformer_get_hidden(m);
+                    if (envb_opt("TP_MTP_RAW_HIDDEN", 0))
+                        memcpy(mtp_seed_hidden, raw, (size_t)n_embd * sizeof(float));
+                    else
+                        tf_rmsnorm(mtp_seed_hidden, raw, &m->output_norm, n_embd,
+                                   m->rms_norm_eps, m->matvec_tmp);
+                    /* Chunking intentionally omits prompt teacher statistics:
+                     * retaining every chunk's hidden rows would restore the
+                     * large working set this path avoids. */
+                    int seed_drafts = mtp_batch
+                        ? spec_k - 1 + mtp_bonus_probe : spec_k;
+                    int prev = in_tok;
+                    const float *dh = mtp_seed_hidden;
+                    for (int k = 0; k < seed_drafts; k++) {
+                        float *dlg = transformer_nextn_logits(m, prev, dh, P - 1 + k);
+                        mtp_pending[k] = sample_argmax(m, dlg, &c, &ar_step, &ar_calls_step);
+                        prev = mtp_pending[k]; dh = transformer_nextn_hidden(m);
+                    }
+                    mtp_pending_n = seed_drafts;
+                    t_comm += ar_step; ar_calls += ar_calls_step;
+                }
             } else if (is_first) {
                 fprintf(stderr, "warning: prefill_gemm unavailable; fallback to per-token prefill\n");
             }
@@ -1135,6 +1958,35 @@ int main(int argc, char **argv) {
                 transformer_embed_token(m, ptoks[p]);
                 double _ta = now_sec();
                 transformer_forward_partial(m, p, 0, n_layers);
+                if (spec_k && m->nextn.loaded) {
+                    float *target_h = (float *)alloca((size_t)n_embd * sizeof(float));
+                    memcpy(target_h, transformer_get_hidden(m), (size_t)n_embd * sizeof(float));
+                    const float *mtp_target = envb_opt("TP_MTP_RAW_HIDDEN", 0)
+                        ? transformer_nextn_target_hidden(m) : transformer_get_hidden(m);
+                    memcpy(mtp_seed_hidden, mtp_target, (size_t)n_embd * sizeof(float));
+                    /* Teacher-force the known next prompt token.  The draft
+                     * head consumes (h[p], token[p+1]) and predicts token[p+2]. */
+                    if (p + 1 < P) {
+                        float *catchup_logits = transformer_nextn_logits(
+                            m, ptoks[p + 1], mtp_seed_hidden, p);
+                        if (p + 2 < P) {
+                            double catchup_ar = 0.0; long catchup_calls = 0;
+                            int32_t catchup = sample_argmax(
+                                m, catchup_logits, &c, &catchup_ar, &catchup_calls);
+                            mtp_teacher_match += catchup == ptoks[p + 2];
+                            mtp_teacher_total++;
+                            for (int oi = 0; oi < 7; oi++) {
+                                int expected_pos = p + oi - 1;
+                                if (expected_pos >= 0 && expected_pos < P)
+                                    mtp_teacher_offset_match[oi] += catchup == ptoks[expected_pos];
+                            }
+                            if (is_first && envb_opt("TP_MTP_TRACE", 0))
+                                logmsg("MTP catchup pos=%d input=%d draft=%d expected=%d\n",
+                                       p, ptoks[p + 1], catchup, ptoks[p + 2]);
+                        }
+                    }
+                    transformer_set_hidden(m, target_h);
+                }
                 t_fwd += now_sec() - _ta;
             }
             float *lg = transformer_compute_logits(m);  /* only final prompt token matters */
@@ -1143,6 +1995,25 @@ int main(int argc, char **argv) {
             in_tok = sample_argmax(m, lg, &c, &ar_step, &ar_calls_step);
             t_prefill = now_sec() - pf0;
             t_comm += ar_step; ar_calls += ar_calls_step;
+
+            /* Seed predictions beyond the first target token.  The trunk
+             * logits above already provide in_tok; NextN predicts the token
+             * after it, so agreement is checked on the following trunk step. */
+            if (spec_k && m->nextn.loaded && mtp_seed_hidden) {
+                int seed_drafts = mtp_batch
+                    ? spec_k - 1 + mtp_bonus_probe : spec_k;
+                const float *dh = mtp_seed_hidden;
+                int32_t prev = in_tok;
+                for (int k = 0; k < seed_drafts; k++) {
+                    float *dlg = transformer_nextn_logits(m, prev, dh, P - 1 + k);
+                    double da = 0.0; long dc = 0;
+                    mtp_pending[k] = sample_argmax(m, dlg, &c, &da, &dc);
+                    t_comm += da; ar_calls += dc;
+                    prev = mtp_pending[k];
+                    dh = transformer_nextn_hidden(m);
+                }
+                mtp_pending_n = seed_drafts;
+            }
         }
     } else {
         if (cache_loaded && token_in_vocab(vocab, ck_next)) {
@@ -1188,6 +2059,390 @@ int main(int argc, char **argv) {
     int decode_started = 0;
     transformer_pool_profile_reset();
     final_cache_pos = decode_start;
+    double t_decode_wall = 0.0;
+
+    if (!dry_decode && mtp_batch && spec_k > 0 && m->nextn.loaded) {
+        tp_spec_state ss;
+        tf_batch_keep_pool = 1;
+        tf_batch_quiet = 1;
+        tf_batch_threads = (int)envl_opt("TP_MTP_VERIFY_THREADS",
+                                         mtp_async ? 36 : 0);
+#ifdef _OPENMP
+        if (tf_batch_threads > 0) omp_set_num_threads(tf_batch_threads);
+#endif
+        if (mtp_async && is_first)
+            logmsg("MTP async core split: verifier=%d draft=%ld (%ld/CMG reserved)\n",
+                   tf_batch_threads, envl_opt("TP_MTP_SHADOW_THREADS", 12),
+                   envl_opt("TP_MTP_SHADOW_THREADS", 12) / 4);
+        transformer_prefill_profile_reset();
+        if (tp_spec_state_init(&ss, m) != 0) die("MTP recurrent snapshot alloc", -1);
+        int vlogits = m->output.n_rows;
+        float *all_logits = (float *)malloc((size_t)spec_k * vlogits * sizeof(float));
+        float *batch_hidden = NULL;
+        size_t snap_conv = (size_t)(m->ssm_conv_kernel - 1) * m->ssm_qkv_dim;
+        size_t snap_rec = (size_t)m->ssm_dt_rank * m->ssm_d_state * m->ssm_d_state;
+        size_t snap_layer = snap_conv + snap_rec;
+        size_t snap_slot = (size_t)n_layers * snap_layer;
+        float *batch_ssm = NULL;
+        float **batch_ssm_slots = (float **)alloca((size_t)spec_k * sizeof(*batch_ssm_slots));
+        float **orig_conv = (float **)alloca((size_t)n_layers * sizeof(*orig_conv));
+        float **orig_rec = (float **)alloca((size_t)n_layers * sizeof(*orig_rec));
+        int verify_drafts = spec_k - 1;
+        int queue_drafts = verify_drafts + mtp_bonus_probe;
+        if (posix_memalign((void **)&batch_ssm, 256,
+                           (size_t)spec_k * snap_slot * sizeof(float)) != 0)
+            batch_ssm = NULL;
+        if (!all_logits || !batch_ssm) die("MTP batch scratch alloc", -1);
+        for (int k = 0; k < spec_k; k++)
+            batch_ssm_slots[k] = k < verify_drafts
+                ? batch_ssm + (size_t)k * snap_slot : NULL;
+        float *batch_ssm_current = batch_ssm + (size_t)verify_drafts * snap_slot;
+        for (int l = 0; l < n_layers; l++) {
+            orig_conv[l] = m->conv_state ? m->conv_state[l] : NULL;
+            orig_rec[l] = m->recurrent_state ? m->recurrent_state[l] : NULL;
+            if (!m->layers[l].is_ssm) continue;
+            float *ls = batch_ssm_current + (size_t)l * snap_layer;
+            memcpy(ls, orig_conv[l], snap_conv * sizeof(float));
+            memcpy(ls + snap_conv, orig_rec[l], snap_rec * sizeof(float));
+            m->conv_state[l] = ls;
+            m->recurrent_state[l] = ls + snap_conv;
+        }
+        /* The old pre-round copy is no longer needed; retain its byte count for
+         * reporting and its conv_pos array for the round boundary. */
+        free(ss.data); ss.data = NULL;
+        tf_batch_ssm_snapshots = batch_ssm;
+        tf_batch_ssm_snapshot_slots = batch_ssm_slots;
+        tf_batch_ssm_layer_stride = snap_layer;
+        tf_batch_ssm_slot_stride = snap_slot;
+        int mtp_shadow_threads = (int)envl_opt("TP_MTP_SHADOW_THREADS",
+                                               mtp_async ? 12 : 0);
+        if (mtp_async) {
+            if (mtp_shadow_threads < 4 || mtp_shadow_threads % 4)
+                die("async draft threads must be a multiple of four", -1);
+            setenv("TP_MTP_SHADOW_STRIPED", "1", 0);
+            setenv("TP_MTP_SHADOW_CORE_OFFSET", "9", 0);
+        }
+        transformer_model *mtp_draft_model = m;
+        if (mtp_shadow_threads > 0) {
+            mtp_draft_model = transformer_nextn_context_create(m, mtp_shadow_threads);
+            if (!mtp_draft_model) die("MTP shadow context alloc", -1);
+            transformer_nextn_context_copy_state(mtp_draft_model, m);
+            /* Tensor-parallel fields and callback are copied from m; only the
+             * mutable NextN runtime and worker pool are private. */
+            if (is_first)
+                logmsg("MTP shadow context: threads=%d independent scratch/KV/pool\n",
+                       mtp_shadow_threads);
+        }
+        if (mtp_async)
+            transformer_set_tp(mtp_draft_model, MyRank, N, tp_ar_callback_quiet,
+                               &draft_comm);
+        mtp_async_state async_state;
+        memset(&async_state, 0, sizeof(async_state));
+        if (mtp_async) {
+            /* Draft thread zero occupies local slot 9 of CMG0.  Its workers
+             * use slots 9..11 in every CMG via the striped context mapping. */
+            int draft_cpu = 12 +
+                (int)envl_opt("TP_MTP_SHADOW_CORE_OFFSET", 9);
+            if (mtp_async_start(&async_state, mtp_draft_model, &draft_comm,
+                                n_embd, draft_cpu) != 0)
+                die("MTP async worker start", -1);
+        }
+        if (is_first)
+            logmsg("MTP batched verify: K=%d vocab/rank=%d recurrent_snapshot=%.1fMB\n",
+                   spec_k, vlogits, (double)ss.bytes / (1024.0 * 1024.0));
+        if (is_first && mtp_bonus_probe)
+            logmsg("MTP bonus-token probe enabled: queue=%d verify_drafts=%d\n",
+                   queue_drafts, verify_drafts);
+
+        int p = (int)decode_start;
+        int measured = perf_warmup == 0;
+        int mtp_detail = envb_opt("TP_MTP_PROFILE_DETAIL", 0);
+        int mtp_omp_park = envb_opt("TP_MTP_OMP_PARK", 0);
+        int mtp_local_argmax = envb_opt("TF_NEXTN_LOCAL_ARGMAX", 0);
+        int mtp_verify_blocktime = (int)envl_opt("TP_MTP_VERIFY_BLOCKTIME", 200);
+#ifndef _OPENMP
+        mtp_omp_park = 0;
+        mtp_verify_blocktime = 0;
+#endif
+        pthread_mutex_t mtp_park_mu = PTHREAD_MUTEX_INITIALIZER;
+        pthread_cond_t mtp_park_cv = PTHREAD_COND_INITIALIZER;
+        int mtp_park_done = 0;
+        double mtp_verify_sec = 0.0, mtp_restore_sec = 0.0, mtp_draft_sec = 0.0;
+        double mtp_async_wait_sec = 0.0, mtp_async_cont_sec = 0.0;
+        double mtp_async_recovery_sec = 0.0;
+        long mtp_async_hits = 0, mtp_async_recoveries = 0;
+        long mtp_detail_rounds = 0;
+        double decode_wall_start = now_sec();
+        while (n_gen < max_gen + perf_warmup) {
+            if (mtp_pending_n < queue_drafts) die("MTP draft queue not full", -1);
+            if (mtp_async) {
+                const float *ahead_h = transformer_nextn_hidden(mtp_draft_model);
+                mtp_async_submit(&async_state, mtp_pending[verify_drafts], ahead_h,
+                                 n_embd, p - 1 + queue_drafts, queue_drafts);
+            }
+            int32_t batch[16], target[16];
+            batch[0] = in_tok;
+            for (int j = 1; j < spec_k; j++) batch[j] = mtp_pending[j - 1];
+
+            double ta = now_sec();
+            for (int l = 0; l < n_layers; l++)
+                ss.conv_pos[l] = m->conv_state_pos ? m->conv_state_pos[l] : 0;
+            g_ar_secs = 0.0; g_ar_calls = 0;
+            tf_batch_all_logits = all_logits;
+            tf_batch_hidden_out = &batch_hidden;
+#ifdef _OPENMP
+            kmp_set_blocktime(mtp_verify_blocktime);
+#endif
+            float *batch_ok = transformer_prefill_gemm(m, batch, spec_k, p);
+            if (mtp_async && getenv("TP_MTP_ASYNC_TRACE") && is_first)
+                fprintf(stderr, "async verify returned pos=%d\n", p);
+#ifdef _OPENMP
+            /* Draft generation uses the persistent pthread pool.  Park the
+             * OpenMP team immediately instead of waiting out the warm verify
+             * interval and oversubscribing every A64FX core. */
+            kmp_set_blocktime(0);
+#endif
+            tf_batch_all_logits = NULL;
+            tf_batch_hidden_out = NULL;
+            if (!batch_ok || !batch_hidden) die("Qwen MTP batched verify", -1);
+
+            double argmax_ar = 0.0; long argmax_calls = 0;
+            sample_argmax_n(m, all_logits, vlogits, spec_k, target, &c,
+                            &argmax_ar, &argmax_calls);
+            if (mtp_bonus_probe) {
+                mtp_bonus_match += mtp_pending[verify_drafts] == target[spec_k - 1];
+                mtp_bonus_total++;
+            }
+            int accepted = 0;
+            while (accepted < verify_drafts && mtp_pending[accepted] == target[accepted])
+                accepted++;
+            int async_chain_ok = mtp_async && accepted == verify_drafts &&
+                mtp_pending[verify_drafts] == target[spec_k - 1];
+            mtp_accept_hist[accepted]++;
+            if (accepted == verify_drafts) {
+                mtp_full_accept++;
+                if (mtp_bonus_probe && mtp_pending[verify_drafts] == target[spec_k - 1])
+                    mtp_bonus_chain_match++;
+            }
+            double td_verify = mtp_detail ? now_sec() : 0.0;
+            if (envb_opt("TP_MTP_FORCE_ACCEPT", 0)) accepted = verify_drafts;
+            for (int j = 0; j < verify_drafts; j++) {
+                int hit = mtp_pending[j] == target[j];
+                mtp_match += hit; mtp_total++;
+                mtp_horizon_match[j] += hit; mtp_horizon_total[j]++;
+                if (mtp_token_counts && target[j] >= 0 && target[j] < m->n_vocab) {
+                    int count = ++mtp_token_counts[target[j]];
+                    if (count == 1) mtp_unique_targets++;
+                    if (count > mtp_max_target_count) mtp_max_target_count = count;
+                }
+            }
+
+            int emitted = accepted + 1;
+            const float *draft_h = NULL;
+            if (accepted < verify_drafts) {
+                /* Select the state captured immediately after the last
+                 * committed input. No trunk replay is needed. */
+                int selected = emitted - 1;
+                float *old_current = batch_ssm_current;
+                batch_ssm_current = batch_ssm_slots[selected];
+                batch_ssm_slots[selected] = old_current;
+                for (int l = 0; l < n_layers; l++) {
+                    if (!m->layers[l].is_ssm) continue;
+                    float *ls = batch_ssm_current + (size_t)l * snap_layer;
+                    m->conv_state[l] = ls;
+                    m->recurrent_state[l] = ls + snap_conv;
+                    m->conv_state_pos[l] =
+                        (ss.conv_pos[l] + emitted) % (m->ssm_conv_kernel - 1);
+                }
+                const float *last_hidden = batch_hidden + (size_t)(emitted - 1) * n_embd;
+                if (envb_opt("TP_MTP_RAW_HIDDEN", 0)) draft_h = last_hidden;
+                else {
+                    tf_rmsnorm(mtp_seed_hidden, last_hidden, &m->output_norm,
+                               n_embd, m->rms_norm_eps, m->matvec_tmp);
+                    draft_h = mtp_seed_hidden;
+                }
+            } else {
+                const float *last_hidden = batch_hidden + (size_t)(spec_k - 1) * n_embd;
+                if (envb_opt("TP_MTP_RAW_HIDDEN", 0)) {
+                    draft_h = last_hidden;
+                } else {
+                    tf_rmsnorm(mtp_seed_hidden, last_hidden, &m->output_norm,
+                               n_embd, m->rms_norm_eps, m->matvec_tmp);
+                    draft_h = mtp_seed_hidden;
+                }
+            }
+            double td_restore = mtp_detail ? now_sec() : 0.0;
+
+            int stop = 0, committed = 0;
+            for (int j = 0; j < emitted && n_gen < max_gen + perf_warmup; j++) {
+                int32_t out_tok = target[j];
+                int eos = out_tok == bpe_eos_id(vocab) || out_tok == bpe_eot_id(vocab);
+                if (g_tokdump) fprintf(g_tokdump, "%d\n", (int)out_tok);
+                if (!eos && is_first) print_token(vocab, out_tok);
+                n_gen++; committed++;
+                if (eos && !ignore_eos) { stop = 1; break; }
+            }
+            if (g_tokdump) fflush(g_tokdump);
+            if (committed == 0) break;
+            in_tok = target[committed - 1];
+            p += committed;
+            final_cache_pos = p;
+
+            /* Build a fresh K-token queue from the target hidden at the last
+             * committed input.  The auxiliary head is TP-sharded and its
+             * argmax reduction is included in the communication ledger. */
+            int prev = in_tok;
+            mtp_park_done = 0;
+            if (mtp_async) {
+                int32_t ahead[16];
+                double wait0 = now_sec(), elapsed = 0.0, dar = 0.0;
+                long dcalls = 0;
+                if (mtp_async_wait(&async_state, ahead, &elapsed, &dar, &dcalls) != 0)
+                    die("MTP async continuation failed", -1);
+                mtp_async_wait_sec += now_sec() - wait0;
+                mtp_async_cont_sec += elapsed;
+                argmax_ar += dar; argmax_calls += dcalls;
+                if (async_chain_ok) {
+                    memcpy(mtp_pending, ahead,
+                           (size_t)queue_drafts * sizeof(mtp_pending[0]));
+                    mtp_async_hits++;
+                } else {
+                    double recovery0 = now_sec();
+                    mtp_async_submit(&async_state, in_tok, draft_h, n_embd,
+                                     p - 1, queue_drafts);
+                    if (mtp_async_wait(&async_state, mtp_pending, &elapsed,
+                                       &dar, &dcalls) != 0)
+                        die("MTP async recovery failed", -1);
+                    mtp_async_recovery_sec += now_sec() - recovery0;
+                    argmax_ar += dar; argmax_calls += dcalls;
+                    mtp_async_recoveries++;
+                }
+            } else
+            #ifdef _OPENMP
+            #pragma omp parallel num_threads(48) if(mtp_omp_park) \
+                shared(mtp_park_done, prev, draft_h, argmax_ar, argmax_calls)
+            #endif
+            {
+                int park_tid = 0;
+                #ifdef _OPENMP
+                park_tid = omp_get_thread_num();
+                #endif
+                if (park_tid == 0) {
+                    if (envb_opt("TP_MTP_SKIP_DRAFT", 0)) {
+                        for (int k = 0; k < queue_drafts; k++) mtp_pending[k] = prev;
+                    } else {
+                        for (int k = 0; k < queue_drafts; k++) {
+                            float *dlg = transformer_nextn_logits(
+                                mtp_draft_model, prev, draft_h, p - 1 + k);
+                            double da = 0.0; long dc = 0;
+                            if (mtp_local_argmax) {
+                                float best;
+                                int local = transformer_nextn_local_argmax(
+                                    mtp_draft_model, &best);
+                                if (local < 0) die("NextN local argmax", -1);
+                                int32_t global = local + mtp_draft_model->tp_vocab_lo;
+                                double ar0 = now_sec();
+                                tp_allreduce_argmax(&c, &best, &global);
+                                da = now_sec() - ar0; dc = 1;
+                                mtp_pending[k] = global;
+                            } else {
+                                mtp_pending[k] = sample_argmax(
+                                    mtp_draft_model, dlg, &c, &da, &dc);
+                            }
+                            argmax_ar += da; argmax_calls += dc;
+                            prev = mtp_pending[k];
+                            draft_h = transformer_nextn_hidden(mtp_draft_model);
+                        }
+                    }
+                    if (mtp_omp_park) {
+                        pthread_mutex_lock(&mtp_park_mu);
+                        mtp_park_done = 1;
+                        pthread_cond_broadcast(&mtp_park_cv);
+                        pthread_mutex_unlock(&mtp_park_mu);
+                    }
+                } else {
+                    pthread_mutex_lock(&mtp_park_mu);
+                    while (!mtp_park_done)
+                        pthread_cond_wait(&mtp_park_cv, &mtp_park_mu);
+                    pthread_mutex_unlock(&mtp_park_mu);
+                }
+            }
+            mtp_pending_n = queue_drafts;
+            double td_draft = mtp_detail ? now_sec() : 0.0;
+
+            double tb = now_sec();
+            if (measured) {
+                t_fwd += tb - ta;
+                t_comm += g_ar_secs + argmax_ar;
+                ar_calls += g_ar_calls + argmax_calls;
+                pcnt += committed;
+                if (mtp_detail) {
+                    mtp_verify_sec += td_verify - ta;
+                    mtp_restore_sec += td_restore - td_verify;
+                    mtp_draft_sec += td_draft - td_restore;
+                    mtp_detail_rounds++;
+                }
+            } else if (n_gen >= perf_warmup) {
+                measured = 1;
+                t_fwd = t_comm = 0.0; ar_calls = 0; pcnt = 0;
+                transformer_pool_profile_reset();
+            }
+            if (g_curve) {
+                fprintf(g_curve, "%d %d %.3f %.3f\n", p - committed, p,
+                        1000.0 * (tb - ta), 1000.0 * (g_ar_secs + argmax_ar));
+                fflush(g_curve);
+            }
+            if (is_first && envb_opt("TP_MTP_TRACE", 0))
+                logmsg("MTP batch pos=%d accepted=%d/%d committed=%d next=%d\n",
+                       p - committed, accepted, spec_k, committed, in_tok);
+            if (stop) break;
+        }
+        t_decode_wall = now_sec() - decode_wall_start;
+        if (is_first) {
+            transformer_prefill_profile bp;
+            transformer_prefill_profile_get(&bp);
+            logmsg("MTP batch profile: calls=%d norm=%.1f proj=%.1f ssm_prep=%.1f "
+                   "ssm_scan=%.1f attn_prep=%.1f attn=%.1f out=%.1f "
+                   "ffn_proj=%.1f act=%.1f down=%.1f collective=%.1f ms\n",
+                   bp.calls, bp.norm_ms, bp.proj_ms, bp.ssm_prepare_ms,
+                   bp.ssm_scan_ms, bp.attn_prepare_ms, bp.attn_kernel_ms,
+                   bp.out_proj_ms, bp.ffn_proj_ms, bp.ffn_act_ms,
+                   bp.ffn_down_ms, bp.collective_ms);
+            if (mtp_detail && mtp_detail_rounds)
+                logmsg("MTP round profile: rounds=%ld verify=%.2f restore=%.2f draft=%.2f ms/round\n",
+                       mtp_detail_rounds, 1000.0 * mtp_verify_sec / mtp_detail_rounds,
+                       1000.0 * mtp_restore_sec / mtp_detail_rounds,
+                       1000.0 * mtp_draft_sec / mtp_detail_rounds);
+            if (mtp_async && mtp_detail_rounds)
+                logmsg("MTP async profile: hits=%ld recoveries=%ld continuation=%.2f "
+                       "wait=%.2f recovery=%.2f ms/round\n", mtp_async_hits,
+                       mtp_async_recoveries, 1000.0 * mtp_async_cont_sec / mtp_detail_rounds,
+                       1000.0 * mtp_async_wait_sec / mtp_detail_rounds,
+                       1000.0 * mtp_async_recovery_sec / mtp_detail_rounds);
+        }
+        tf_batch_ssm_snapshots = NULL;
+        tf_batch_ssm_snapshot_slots = NULL;
+        tf_batch_ssm_layer_stride = tf_batch_ssm_slot_stride = 0;
+        pthread_cond_destroy(&mtp_park_cv);
+        pthread_mutex_destroy(&mtp_park_mu);
+        for (int l = 0; l < n_layers; l++) {
+            if (!m->layers[l].is_ssm) continue;
+            float *ls = batch_ssm_current + (size_t)l * snap_layer;
+            memcpy(orig_conv[l], ls, snap_conv * sizeof(float));
+            memcpy(orig_rec[l], ls + snap_conv, snap_rec * sizeof(float));
+            m->conv_state[l] = orig_conv[l];
+            m->recurrent_state[l] = orig_rec[l];
+        }
+        free(batch_ssm);
+        free(all_logits);
+        if (mtp_async) mtp_async_stop(&async_state);
+        if (mtp_draft_model != m)
+            transformer_nextn_context_free(mtp_draft_model);
+        tp_spec_state_free(&ss);
+        goto done;
+    }
+
+    double decode_wall_start = now_sec();
     for (int p = (int)decode_start; ; p++) {
         double _ta = now_sec();
         double ar_step = 0.0; long ar_calls_step = 0;
@@ -1202,9 +2457,59 @@ int main(int argc, char **argv) {
         } else {
             transformer_embed_token(m, in_tok);
             g_ar_secs = 0.0; g_ar_calls = 0;
+            tf_g4p_did_logits = 0;
+            tf_g4p_want_logits = fused_decode_head;
             transformer_forward_partial(m, p, 0, n_layers);
-            float *lg = transformer_compute_logits(m);
+            tf_g4p_want_logits = 0;
+            float *lg = tf_g4p_did_logits ? m->logits : transformer_compute_logits(m);
             nt = sample_argmax(m, lg, &c, &ar_step, &ar_calls_step);
+            if (spec_k && m->nextn.loaded) {
+                int regenerate_drafts = 1;
+                if (is_first && envb_opt("TP_MTP_TRACE", 0))
+                    logmsg("MTP trunk pos=%d input=%d target=%d\n", p, in_tok, nt);
+                if (mtp_pending_n > 0) {
+                    if (is_first && envb_opt("TP_MTP_TRACE", 0))
+                        logmsg("MTP compare pos=%d draft=%d target=%d\n",
+                               p, mtp_pending[0], nt);
+                    int accepted = mtp_pending[0] == nt;
+                    int horizon = spec_k - mtp_pending_n;
+                    mtp_match += accepted;
+                    mtp_total++;
+                    if (horizon >= 0 && horizon < 4) {
+                        mtp_horizon_match[horizon] += accepted;
+                        mtp_horizon_total[horizon]++;
+                    }
+                    if (mtp_token_counts && nt >= 0 && nt < m->n_vocab) {
+                        int count = ++mtp_token_counts[nt];
+                        if (count == 1) mtp_unique_targets++;
+                        if (count > mtp_max_target_count) mtp_max_target_count = count;
+                    }
+                    if (accepted && mtp_pending_n > 1) {
+                        memmove(mtp_pending, mtp_pending + 1,
+                                (size_t)(mtp_pending_n - 1) * sizeof(mtp_pending[0]));
+                        mtp_pending_n--;
+                        regenerate_drafts = 0;
+                    } else {
+                        mtp_pending_n = 0;
+                    }
+                }
+                if (regenerate_drafts) {
+                    const float *draft_h = envb_opt("TP_MTP_RAW_HIDDEN", 0)
+                        ? transformer_nextn_target_hidden(m) : transformer_get_hidden(m);
+                    int prev = nt;
+                    for (int k = 0; k < spec_k; k++) {
+                        float *dlg = transformer_nextn_logits(m, prev, draft_h, p + k);
+                        double draft_ar = 0.0; long draft_calls = 0;
+                        int32_t draft = sample_argmax(m, dlg, &c, &draft_ar, &draft_calls);
+                        ar_step += draft_ar;
+                        ar_calls_step += draft_calls;
+                        mtp_pending[k] = draft;
+                        prev = draft;
+                        draft_h = transformer_nextn_hidden(m);
+                    }
+                    mtp_pending_n = spec_k;
+                }
+            }
         }
 
         double _tb = now_sec();
@@ -1225,12 +2530,54 @@ int main(int argc, char **argv) {
         if (g_curve) { fprintf(g_curve, "%d %d %.3f %.3f\n",
                                p, p + 1, 1000.0 * (_tb - _ta), 1000.0 * (g_ar_secs + ar_step));
                          fflush(g_curve); }
-        if (stop_eos || n_gen >= max_gen) break;
+        if (perf_warmup > 0 && n_gen == perf_warmup) {
+            t_fwd = 0.0; t_comm = 0.0; ar_calls = 0; pcnt = 0;
+            transformer_pool_profile_reset();
+        }
+        if (stop_eos || n_gen >= max_gen + perf_warmup) break;
         in_tok = nt;
     }
+    t_decode_wall = now_sec() - decode_wall_start;
 
 done:
+    free(mtp_seed_hidden);
+    free(mtp_token_counts);
+    if (getenv("TP_BUFFER_OUTPUT")) {
+        if (g_log) fflush(g_log);
+        fflush(stdout);
+    }
     barrier();
+    if (is_first && mtp_total)
+        logmsg("MTP greedy match=%ld/%ld alpha=%.4f K=%d diversity=%d max_share=%.4f gate=%s\n",
+               mtp_match, mtp_total, (double)mtp_match / mtp_total, spec_k,
+               mtp_unique_targets, (double)mtp_max_target_count / mtp_total,
+               mtp_unique_targets >= 8 && mtp_max_target_count * 10 < mtp_total * 9
+                   ? "nondegenerate" : "REJECT-DEGENERATE");
+    if (is_first && mtp_total) {
+        logmsg("MTP horizons:");
+        for (int k = 0; k < spec_k; k++)
+            logmsg(" h%d=%ld/%ld", k + 1, mtp_horizon_match[k], mtp_horizon_total[k]);
+        logmsg("\n");
+    }
+    if (is_first && mtp_bonus_total)
+        logmsg("MTP bonus-token match=%ld/%ld alpha=%.4f full-chain=%ld/%ld "
+               "full_accept=%ld/%ld\n", mtp_bonus_match, mtp_bonus_total,
+               (double)mtp_bonus_match / mtp_bonus_total, mtp_bonus_chain_match,
+               mtp_bonus_total, mtp_full_accept, mtp_bonus_total);
+    if (is_first && mtp_total) {
+        logmsg("MTP accepted-prefix histogram:");
+        for (int k = 0; k <= spec_k - 1; k++)
+            logmsg(" a%d=%ld", k, mtp_accept_hist[k]);
+        logmsg("\n");
+    }
+    if (is_first && mtp_teacher_total)
+        logmsg("MTP teacher match=%ld/%ld alpha=%.4f offsets[p-1..p+5]="
+               "%ld,%ld,%ld,%ld,%ld,%ld,%ld\n", mtp_teacher_match,
+               mtp_teacher_total, (double)mtp_teacher_match / mtp_teacher_total,
+               mtp_teacher_offset_match[0], mtp_teacher_offset_match[1],
+               mtp_teacher_offset_match[2], mtp_teacher_offset_match[3],
+               mtp_teacher_offset_match[4], mtp_teacher_offset_match[5],
+               mtp_teacher_offset_match[6]);
     {   char pn[64]; snprintf(pn, sizeof pn, "tp_perf_rank%02d.txt", MyRank);
         FILE *pf2 = fopen(pn, "w");
         if (pf2) {
@@ -1252,7 +2599,7 @@ done:
     }
     double t_total = now_sec() - t0_all;
     if (is_first) {
-        double t_dec = t_total - t_prefill;
+        double t_dec = t_decode_wall > 0.0 ? t_decode_wall : t_total - t_prefill;
         logmsg("\n\n=== done: %d tokens generated ===\n", n_gen);
         logmsg("prefill(%d tok)=%.3f s (%.2f tok/s)%s\n", prefill_tokens, t_prefill,
                prefill_tokens > 0 ? (double)prefill_tokens / t_prefill : 0.0,
@@ -1260,6 +2607,20 @@ done:
         if (cache_prefill_used && cache_prefill_skipped > 0)
             logmsg("cache-skipped=%d prompt toks, ck_pos=%lld\n", cache_prefill_skipped, (long long)ck_pos);
         logmsg("decode(%d tok)=%.3f s = %.2f tok/s\n", n_gen, t_dec, n_gen > 0 ? n_gen / t_dec : 0.0);
+    }
+    if (getenv("TF_DPROF") && pcnt > 0) {
+        double mat_bw = tf_decode_matvec_ms > 0.0
+                      ? tf_decode_matvec_bytes / (tf_decode_matvec_ms * 1e6) : 0.0;
+        fprintf(stderr, "rank %d dprof: matvec=%.2fms/tok BW=%.1fGB/s dispatches=%.1f/tok "
+                        "attn_qkv=%.2f attn_out=%.2f ssm_in=%.2f ssm_prepare=%.2f "
+                        "ssm_core=%.2f ssm_out=%.2f ffn_gateup=%.2f ffn_down=%.2f lm_head=%.2f\n",
+                MyRank, tf_decode_matvec_ms / pcnt, mat_bw,
+                (double)tf_decode_matvec_cnt / pcnt,
+                tf_decode_attn_qkv_ms / pcnt, tf_decode_attn_out_ms / pcnt,
+                tf_decode_ssm_in_ms / pcnt, tf_decode_ssm_prepare_ms / pcnt,
+                tf_decode_ssm_core_ms / pcnt, tf_decode_ssm_out_ms / pcnt,
+                tf_decode_ffn_gateup_ms / pcnt, tf_decode_ffn_down_ms / pcnt,
+                tf_decode_lm_head_ms / pcnt);
     }
 
     if (cache_save && have_cache_path) {
@@ -1289,12 +2650,20 @@ done:
      * -DTF_POOL_PROFILE emits the per-dispatch work/wait + per-tid
      * matvec/barrier/serial/attn decode breakdown to stderr. */
     transformer_free(m);
+    if (draft_comm_ready) {
+        tp_comm_free(&draft_comm);
+        munmap(draft_ar_region, draft_ar_map_sz);
+        utofu_free_vcq(draft_vcq);
+    }
     tp_comm_free(&c);
+    munmap(ar_region, ar_region_map_sz);
     utofu_dereg_mem(Vcq, Base, 0);
     utofu_free_vcq(Vcq);
-    free(ptoks); free(Region);
+    free(ptoks); munmap(Region, region_map_sz);
+    free(prompt_repeat_text); free(prompt_file_text);
     if (g_log) fclose(g_log);
     if (g_curve) fclose(g_curve);
     if (g_tokdump) fclose(g_tokdump);
+    if (g_generated_text) fclose(g_generated_text);
     return 0;
 }

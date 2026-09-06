@@ -16,7 +16,7 @@ MPICC     = mpiclang
 MPICFLAGS = -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall
 TOFU      = -ltofucom
 
-all: tofu_topo_helper tofu_put_demo utofu_init_probe ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench ep_prefill_synth
+all: tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench ep_prefill_synth qwen38_allreduce_bench
 
 # helper uses MPI + uTofu
 tofu_topo_helper: tofu_topo_helper.c tofu_demo.h
@@ -24,10 +24,6 @@ tofu_topo_helper: tofu_topo_helper.c tofu_demo.h
 
 # pure uTofu app: NO MPI
 tofu_put_demo: tofu_put_demo.c tofu_demo.h
-	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
-
-# pure uTofu init probe: NO MPI, logs each rank to UTOFU_PROBE_DIR
-utofu_init_probe: utofu_init_probe.c tofu_demo.h
 	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
 
 # pure uTofu ring-attention decode cost benchmark: NO MPI, OpenMP for mem stream
@@ -66,6 +62,14 @@ p2p_latbw_bench: p2p_latbw_bench.c tofu_demo.h
 tp_allreduce_test: tp_allreduce_test.c tofu_demo.h tp_allreduce.h
 	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
 
+# all-reduce in-loop cost decomposition (floor/cold/robust/skew): NO MPI
+tp_ar_diag_bench: tp_ar_diag_bench.c tofu_demo.h tp_allreduce.h
+	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
+
+# Qwen3.8-27B decode all-reduce: TP2 pairs and TP4 on one four-node job, NO MPI
+qwen38_allreduce_bench: qwen38_allreduce_bench.c tofu_demo.h tp_allreduce.h
+	$(CC) $(CFLAGS) -o $@ $< $(TOFU)
+
 # communication-only EP prefill roofline: allreduce and synthetic token dispatch, NO MPI
 ep_prefill_synth: ep_prefill_synth.c tofu_demo.h tp_allreduce.h
 	$(CC) $(CFLAGS) -o $@ $< $(TOFU) -lm
@@ -84,6 +88,6 @@ ring_attn_async: ring_attn_async.c tofu_demo.h
 	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(TOFU) -lhwb
 
 clean:
-	rm -f tofu_topo_helper tofu_put_demo utofu_init_probe ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench ep_prefill_synth tofu_topo.txt
+	rm -f tofu_topo_helper tofu_put_demo ring_attn_bench tni_stripe_bench ring_attn_overlap ring_attn_async moe_dispatch_bench moe_async_bench allgather_bench reducescatter_bench pp_handoff_bench p2p_latbw_bench ep_prefill_synth qwen38_allreduce_bench tofu_topo.txt
 
 .PHONY: all clean

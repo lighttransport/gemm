@@ -14,12 +14,9 @@
  * (multi-TNI reduce-scatter) + (multi-TNI all-gather) beat the fused
  * recursive-doubling tree all-reduce that the estimator assumes?
  *
- * Scope: comm-pattern + roofline only. No reduction arithmetic is performed
- * (like ring_attn_bench / moe_dispatch_bench / allgather_bench). We move
- * realistically sized shards and time the schedules; the per-receive "add" is
- * elided -- this measures the COMMUNICATION term, so reduce-scatter and
- * all-gather come out equal-cost (their wire patterns are exact time-reverses),
- * and the headline is how the decomposed pair compares to the fused tree.
+ * The transport-only variants remain for roofline comparison. For BF16 payloads,
+ * REAL RSAG also performs an SVE receiver sum, uses ordered completion flags and
+ * disjoint scatter/gather landing areas, and verifies the gathered numerical result.
  *
  * Transports over the same scatter (every rank ends owning shard[myrank]):
  *   (a) NAIVE  : single TNI direct scatter -- Put my contribution-to-shard-d to
@@ -72,6 +69,7 @@
  */
 #define _GNU_SOURCE
 #include <stdarg.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,6 +77,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <utofu.h>
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 
 #include "tofu_demo.h"
 
@@ -128,7 +129,7 @@ static int read_topo(uint8_t coords[][TOFU_NCOORDS])
 
 /* ----- file-scope state (single-threaded bench; globals keep loops readable) ----- */
 static int            N, NTNI, MyRank;
-static char          *Region;                 /* local[N] + recv[N] + tree slots   */
+static char          *Region;                 /* local[N] + scatter[N] + gather[N] + reduced + tree */
 static size_t         SlotG, SlotT, GBASE;    /* shard slot, tree slot, tree base  */
 static size_t         Shard, PlenTree;        /* per-rank shard bytes, full vector */
 static utofu_vcq_hdl_t Vcq[MAX_TNI];
@@ -145,6 +146,8 @@ static int Pof2, Rem, NRounds, BcastSid, NewRank;
  *   tree recv/send for the fused all-reduce baseline.  Each slot its own cache line. */
 static inline size_t local_off(int d)    { return (size_t)d * SlotG; }
 static inline size_t recv_off(int s)      { return (size_t)(N + s) * SlotG; }
+static inline size_t gather_off(int s)    { return (size_t)(2 * N + s) * SlotG; }
+static inline size_t reduced_off(void)    { return (size_t)(3 * N) * SlotG; }
 static inline size_t tree_recv_off(int s) { return GBASE + (size_t)s * SlotT; }
 static inline size_t tree_send_off(void)  { return GBASE + (size_t)TREE_NSTEP * SlotT; }
 
@@ -178,30 +181,116 @@ static void rs_scatter(int multi, uint64_t tok)
         *(volatile uint64_t *)(sb + Shard) = tok;                          /* trailing seq */
         int k = multi ? (idx % NTNI) : 0;
         put_issue(Vcq[k], PeerVcq[k][dst], Base[k] + local_off(dst),
-                  PeerBase[k][dst] + recv_off(MyRank), Shard + 8, multi ? 0 : 1);
+                  PeerBase[k][dst] + recv_off(MyRank), Shard, multi ? 0 : 1);
         if (multi) issued[k]++;
         idx++;
+    }
+    if (multi) for (int k = 0; k < NTNI; k++) drain_n(k, issued[k]);
+    memset(issued, 0, sizeof issued); idx = 0;
+    for (int s = 1; s < N; s++) {
+        int dst = (MyRank + s) % N, k = multi ? (idx % NTNI) : 0;
+        put_issue(Vcq[k], PeerVcq[k][dst], Base[k] + local_off(dst) + Shard,
+                  PeerBase[k][dst] + recv_off(MyRank) + Shard, 8, multi ? 0 : 1);
+        if (multi) issued[k]++; idx++;
     }
     if (multi) for (int k = 0; k < NTNI; k++) drain_n(k, issued[k]);
 }
 
 /* (G) multi-TNI / single-TNI all-gather broadcast over the reduced shard: Put my
  * shard (local[myrank]) to every peer's recv[myrank]. The AG half of all-reduce. */
-static void ag_bcast(int multi, uint64_t tok)
+static void ag_bcast_from(int multi, uint64_t tok, size_t source_off)
 {
-    char *sb = Region + local_off(MyRank);
+    char *sb = Region + source_off;
     *(volatile uint64_t *)(sb)         = RS_MAGIC | (uint64_t)MyRank;
     *(volatile uint64_t *)(sb + Shard) = tok;
     int issued[MAX_TNI] = {0}, idx = 0;
     for (int s = 1; s < N; s++) {
         int dst = (MyRank + s) % N;
         int k = multi ? (idx % NTNI) : 0;
-        put_issue(Vcq[k], PeerVcq[k][dst], Base[k] + local_off(MyRank),
-                  PeerBase[k][dst] + recv_off(MyRank), Shard + 8, multi ? 0 : 1);
+        put_issue(Vcq[k], PeerVcq[k][dst], Base[k] + source_off,
+                  PeerBase[k][dst] + gather_off(MyRank), Shard, multi ? 0 : 1);
         if (multi) issued[k]++;
         idx++;
     }
     if (multi) for (int k = 0; k < NTNI; k++) drain_n(k, issued[k]);
+    memset(issued, 0, sizeof issued); idx = 0;
+    for (int s = 1; s < N; s++) {
+        int dst = (MyRank + s) % N, k = multi ? (idx % NTNI) : 0;
+        put_issue(Vcq[k], PeerVcq[k][dst], Base[k] + source_off + Shard,
+                  PeerBase[k][dst] + gather_off(MyRank) + Shard, 8, multi ? 0 : 1);
+        if (multi) issued[k]++; idx++;
+    }
+    if (multi) for (int k = 0; k < NTNI; k++) drain_n(k, issued[k]);
+}
+static void ag_bcast(int multi, uint64_t tok)
+{
+    ag_bcast_from(multi, tok, local_off(MyRank));
+}
+
+static inline float bf16_f32(uint16_t v)
+{
+    uint32_t u = (uint32_t)v << 16; float f; memcpy(&f, &u, sizeof f); return f;
+}
+static inline uint16_t f32_bf16(float f)
+{
+    uint32_t u; memcpy(&u, &f, sizeof u); return (uint16_t)(u >> 16);
+}
+
+/* Real BF16 receiver reduction for the K3 RSAG path. Control occupies the
+ * first eight bytes and the sequence word follows Shard, as in the wire probe. */
+static void rs_reduce_bf16(uint64_t tok)
+{
+    uint16_t *dst = (uint16_t *)(Region + reduced_off() + 8);
+    const uint16_t *own = (const uint16_t *)(Region + local_off(MyRank) + 8);
+    size_t n = (Shard - 8) / sizeof(uint16_t);
+#if defined(__ARM_FEATURE_SVE)
+    int vl = (int)svcntw();
+    for (size_t i = 0; i < n; i += vl) {
+        svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+        svuint32_t u = svlsl_n_u32_x(pg, svld1uh_u32(pg, own + i), 16);
+        svfloat32_t sum = svreinterpret_f32_u32(u);
+        for (int s = 0; s < N; s++) if (s != MyRank) {
+            const uint16_t *p = (const uint16_t *)(Region + recv_off(s) + 8) + i;
+            u = svlsl_n_u32_x(pg, svld1uh_u32(pg, p), 16);
+            sum = svadd_f32_x(pg, sum, svreinterpret_f32_u32(u));
+        }
+        u = svlsr_n_u32_x(pg, svreinterpret_u32_f32(sum), 16);
+        svst1h_u32(pg, dst + i, u);
+    }
+#else
+    int reported = 0;
+    for (size_t i = 0; i < n; i++) {
+        float sum = bf16_f32(own[i]);
+        for (int s = 0; s < N; s++) if (s != MyRank)
+            sum += bf16_f32(((const uint16_t *)(Region + recv_off(s) + 8))[i]);
+        if (!reported && fabsf(sum - (float)(N * (N + 1) / 2)) > .01f) {
+            logmsg("reduce mismatch elem=%zu own=%.1f", i, bf16_f32(own[i]));
+            for (int s = 0; s < N; s++) if (s != MyRank)
+                logmsg(" s%d=%.1f", s, bf16_f32(((const uint16_t *)(Region + recv_off(s) + 8))[i]));
+            logmsg(" sum=%.1f\n", sum); reported = 1;
+        }
+        dst[i] = f32_bf16(sum);
+    }
+#endif
+    *(volatile uint64_t *)(Region + reduced_off()) = RS_MAGIC | (uint64_t)MyRank;
+    *(volatile uint64_t *)(Region + reduced_off() + Shard) = tok;
+}
+
+static int rsag_verify_bf16(void)
+{
+    size_t n = (Shard - 8) / sizeof(uint16_t);
+    for (int s = 0; s < N; s++) {
+        const uint16_t *p = (const uint16_t *)(Region +
+            (s == MyRank ? reduced_off() : gather_off(s)) + 8);
+        float want = (float)(N * (N + 1) / 2);
+        for (size_t i = 0; i < n; i++)
+            if (fabsf(bf16_f32(p[i]) - want) > .51f) {
+                logmsg("real RSAG mismatch shard=%d elem=%zu got=%.3f want=%.3f\n",
+                       s, i, bf16_f32(p[i]), want);
+                return 0;
+            }
+    }
+    return 1;
 }
 
 /* (c) ring reduce-scatter: forward the chunk I hold to my successor, receive the
@@ -234,11 +323,21 @@ static void rs_wait(uint64_t tok)
         while (*sq < tok) if (now_sec() - ts > WAIT_TIMEOUT_SEC) die("rs_wait timeout", -1);
     }
 }
-static int rs_verify(void)
+static void ag_wait(uint64_t tok)
+{
+    double ts = now_sec();
+    for (int s = 0; s < N; s++) {
+        if (s == MyRank) continue;
+        volatile uint64_t *sq = (volatile uint64_t *)(Region + gather_off(s) + Shard);
+        while (*sq < tok) if (now_sec() - ts > WAIT_TIMEOUT_SEC) die("ag_wait timeout", -1);
+    }
+}
+static int rs_verify(int gather)
 {
     for (int s = 0; s < N; s++) {
         if (s == MyRank) continue;
-        uint64_t h = *(volatile uint64_t *)(Region + recv_off(s));
+        uint64_t h = *(volatile uint64_t *)(Region +
+            (gather ? gather_off(s) : recv_off(s)));
         if (h != (RS_MAGIC | (uint64_t)s)) {
             logmsg("verify FAIL src=%d got=0x%lx want=0x%lx\n",
                    s, (unsigned long)h, (unsigned long)(RS_MAGIC | (uint64_t)s));
@@ -321,10 +420,18 @@ int main(void)
 
     SlotG = (Shard    + 8 + (DEMO_CACHE_LINE - 1)) & ~(size_t)(DEMO_CACHE_LINE - 1);
     SlotT = (PlenTree + 8 + (DEMO_CACHE_LINE - 1)) & ~(size_t)(DEMO_CACHE_LINE - 1);
-    GBASE = (size_t)(2 * N) * SlotG;
+    GBASE = (size_t)(3 * N + 1) * SlotG;
     size_t region_sz = GBASE + (size_t)(TREE_NSTEP + 1) * SlotT;
     if (posix_memalign((void **)&Region, DEMO_CACHE_LINE, region_sz) != 0) die("posix_memalign", -1);
     memset(Region, 0, region_sz);
+    if (ABYTES == 2) {
+        size_t n = (Shard - 8) / sizeof(uint16_t);
+        for (int d = 0; d < N; d++) {
+            uint16_t *p = (uint16_t *)(Region + local_off(d) + 8);
+            uint16_t v = f32_bf16((float)(MyRank + 1));
+            for (size_t i = 0; i < n; i++) p[i] = v;
+        }
+    }
 
     /* tree all-reduce shape (Rabenseifner non-power-of-2) */
     Pof2 = 1; while (Pof2 * 2 <= N) Pof2 *= 2;
@@ -368,7 +475,7 @@ int main(void)
     free(tni_ids);
 
     if (MyRank == 0) {
-        logmsg("=== reduce-scatter (no reduction compute) ===\n");
+        logmsg("=== reduce-scatter / real BF16 RSAG ===\n");
         logmsg("nodes=%d  HID=%ld abytes=%ld B=%ld  full=%zu B  shard=%zu B\n",
                N, HID, ABYTES, B, full, Shard);
         logmsg("SlotG=%zu SlotT=%zu region=%.1f MiB  NTNI=%d\n",
@@ -397,15 +504,21 @@ int main(void)
     uint64_t tok = 2;
 
     /* one-time correctness pass for each variant (heads carry source/chunk ids) */
-    { rs_scatter(0, tok); rs_wait(tok); if (!rs_verify()) die("naive verify failed", -1); tok++; }
-    { rs_ring(tok);       rs_wait(tok); if (!rs_verify()) die("ring verify failed", -1);  tok++; }
-    { ag_bcast(0, tok);   rs_wait(tok); if (!rs_verify()) die("ag verify failed", -1);    tok++; }
+    { rs_scatter(0, tok); rs_wait(tok); if (!rs_verify(0)) die("naive verify failed", -1); tok++; }
+    { rs_ring(tok);       rs_wait(tok); if (!rs_verify(0)) die("ring verify failed", -1);  tok++; }
+    { ag_bcast(0, tok);   ag_wait(tok); if (!rs_verify(1)) die("ag verify failed", -1);    tok++; }
+    if (ABYTES == 2) {
+        rs_scatter(1, tok); rs_wait(tok); rs_reduce_bf16(tok); tok++;
+        ag_bcast_from(1, tok, reduced_off()); ag_wait(tok);
+        if (!rsag_verify_bf16()) die("real bf16 RSAG verify failed", -1);
+        tok++;
+    }
 
     /* ---- timed phases: WARMUP untimed, then ITERS timed. ---- */
-#define TIME_SCATTER(fn, multi, out_us)                                          \
-    do { for (long i = 0; i < WARMUP; i++) { fn((multi), tok); rs_wait(tok); tok++; } \
+#define TIME_SCATTER(fn, waitfn, multi, out_us)                                  \
+    do { for (long i = 0; i < WARMUP; i++) { fn((multi), tok); waitfn(tok); tok++; } \
          double _t0 = now_sec();                                                 \
-         for (long i = 0; i < ITERS;  i++) { fn((multi), tok); rs_wait(tok); tok++; } \
+         for (long i = 0; i < ITERS;  i++) { fn((multi), tok); waitfn(tok); tok++; } \
          (out_us) = (now_sec() - _t0) / (double)ITERS * 1e6; } while (0)
 #define TIME_FN(fn, out_us)                                                      \
     do { for (long i = 0; i < WARMUP; i++) { fn(tok); tok++; }                   \
@@ -414,11 +527,27 @@ int main(void)
          (out_us) = (now_sec() - _t0) / (double)ITERS * 1e6; } while (0)
 
     double rs_naive = 0, rs_multi = 0, rs_ring_us = 0, ag_multi = 0, tree_us = 0;
-    TIME_SCATTER(rs_scatter, 0, rs_naive);
-    TIME_SCATTER(rs_scatter, 1, rs_multi);
+    TIME_SCATTER(rs_scatter, rs_wait, 0, rs_naive);
+    TIME_SCATTER(rs_scatter, rs_wait, 1, rs_multi);
     TIME_FN(rs_ring, rs_ring_us);
-    TIME_SCATTER(ag_bcast, 1, ag_multi);
+    TIME_SCATTER(ag_bcast, ag_wait, 1, ag_multi);
     TIME_FN(tree_allreduce, tree_us);
+
+    double real_rsag_us = 0.0, reduce_local_us = 0.0;
+    if (ABYTES == 2) {
+        for (long i = 0; i < WARMUP; i++) {
+            rs_scatter(1, tok); rs_wait(tok); rs_reduce_bf16(tok); tok++;
+            ag_bcast_from(1, tok, reduced_off()); ag_wait(tok); tok++;
+        }
+        double t0 = now_sec();
+        for (long i = 0; i < ITERS; i++) {
+            rs_scatter(1, tok); rs_wait(tok); double tr = now_sec();
+            rs_reduce_bf16(tok); reduce_local_us += now_sec() - tr; tok++;
+            ag_bcast_from(1, tok, reduced_off()); ag_wait(tok); tok++;
+        }
+        real_rsag_us = (now_sec() - t0) / (double)ITERS * 1e6;
+        reduce_local_us = reduce_local_us / (double)ITERS * 1e6;
+    }
 
     if (MyRank == 0) {
         double recv_bytes = (double)(N - 1) * (double)Shard;       /* reduced into my shard */
@@ -439,6 +568,12 @@ int main(void)
         logmsg("DECOMPOSED all-reduce (best_RS + multiTNI_AG) =%.2f  RATIO vs fused tree x%.2f  "
                "[<1 => decomposing beats the fused tree]\n",
                decomposed, decomposed / tree_us);
+        if (ABYTES == 2)
+            logmsg("REAL BF16 RSAG (scatter + sum + gather)=%.2f  RATIO vs wire-only tree x%.2f  correctness=PASS\n",
+                   real_rsag_us, real_rsag_us / tree_us);
+        if (ABYTES == 2)
+            logmsg("local BF16 receiver sum=%.2f us (remaining RSAG excess is phase skew/control)\n",
+                   reduce_local_us);
         logmsg("ingest BW (per rank, %.0f KiB reduced): naive=%.1f multiTNI=%.1f ring=%.1f GB/s\n",
                recv_bytes / 1024.0,
                recv_bytes / (rs_naive   * 1e-6) / 1e9, recv_bytes / (rs_multi  * 1e-6) / 1e9,

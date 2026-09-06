@@ -54,6 +54,12 @@ fi
 # ---- forward harness knobs to the ranks (mpiexec forwards EXPORTED env only) ----
 export LLM_THREADS=${LLM_THREADS:-48}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$LLM_THREADS}
+# NUMA lever (~1.40x bit-identical decode): the runner interleaves its arena across all CMGs in-process
+# (ds4f_apply_numa, default DS4F_NUMA=1); OMP thread affinity is read at runtime init so it MUST be set
+# at launch here. DS4F_NUMA=0 disables the interleave half for an A/B.
+export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
+export OMP_PLACES=${OMP_PLACES:-cores}
+export DS4F_NUMA=${DS4F_NUMA:-1}
 export DS4F_CMGS=${DS4F_CMGS:-4}
 export DS4F_PREFILL=${DS4F_PREFILL:-8}
 # DS4F_PREFILL_BATCH=M_TILE>0 runs prefill as M-token GEMM tiles (needs EXACT+FP8_BF16).
@@ -62,6 +68,20 @@ export DS4F_PREFILL=${DS4F_PREFILL:-8}
 # (Attention is now GEMM-ified per-head-block so its 32MB q/attn buffers no longer
 #  bound L2 — that is why the old M>=128 cliff softened and 64 now wins.)
 export DS4F_PREFILL_BATCH=${DS4F_PREFILL_BATCH:-0}
+
+# ---- PREFILL: batch it through the verify path. ON by default as of 2026-07-14 ---------------
+# Gated on Flash before flipping (gate_prefill_flash.sh): VERIFY_GATE 16/16 PASS, and the completion
+# is CHARACTER-IDENTICAL to the control with the same prefill argmax (361).
+#
+#   PREFILL_GEMM=0   prefill 15.45 tok/s   ar_calls 3010
+#   PREFILL_GEMM=1   prefill 24.86 (+61%)  ar_calls  129     decode unchanged (15.47 -> 15.51)
+#
+# Decode is untouched by design -- this only changes how the prompt is consumed. Flash's TP stack is
+# OFF (below), so the forward_verify x TP_WOB bug that broke every batched path on base (f9daca59)
+# never applied here; that is a reason to EXPECT a pass, not a substitute for gating one.
+export DS4F_PREFILL_GEMM=${DS4F_PREFILL_GEMM:-1}
+export DS4F_PREFILL_K=${DS4F_PREFILL_K:-32}
+
 export DS4F_MAXGEN=${DS4F_MAXGEN:-16}
 export DS4F_MAXPOS=${DS4F_MAXPOS:-4096}
 # DS4F_CTX_WARM>0 fills synthetic KV+compressed caches to this ctx, then decodes
@@ -158,6 +178,12 @@ export DS4F_QNR_PAR=${DS4F_QNR_PAR:-1}
 # Default 1 = split the index_heads across the pool (BIT-EXACT, disjoint per-head slices).
 # Was 4.68ms/tok = 5.0% of decode @ctx10240 (scalar, serial on tid0 inside ds4f_index_step).
 export DS4F_TB2ROPE_PAR=${DS4F_TB2ROPE_PAR:-1}
+# DS4F_FLAGBAR=0 forces the OLD shared-counter pool barrier (all 47 workers atomic_fetch_add one
+# _Atomic done -> cache-line ping-pong). Default 1 = per-worker completion flag on its own cache
+# line (main polls each). BIT-IDENTICAL (same worker fn + splits, only the done-signal differs).
+# M=1 decode does ~900 tiny pool dispatches/tok, so the 47-way contention was pure overhead:
+# measured 11n ctx1759 decode 12.26 -> 13.24 tok/s (+8%), prefill 12.32 -> 13.28, byte-identical gen.
+export DS4F_FLAGBAR=${DS4F_FLAGBAR:-1}
 # DS4F_INT8_KV=1 stores the window KV latent as int8 (per-channel STATIC scale calibrated
 # on the first DS4F_INT8KV_CAL positions; S5 scheme), halving the KV footprint (the long-ctx
 # memory dominator). LOSSY (~1% rel) -> argmax NOT bit-exact; coherence is the gate. Forces
@@ -205,7 +231,7 @@ echo "threads=$LLM_THREADS prefill=$DS4F_PREFILL maxgen=$DS4F_MAXGEN max_pos=$DS
 
 # ---- build (native fcc + OpenMP) ----
 make -C "$UTOFU_DIR" tofu_topo_helper >/dev/null
-make -C "$LLM_DIR" ds4f_ep_runner CC=fcc OPENMP=1 >/dev/null
+[ "${DS4F_NOBUILD:-0}" = 1 ] || make -C "$LLM_DIR" ds4f_ep_runner CC=fcc OPENMP=1 >/dev/null
 BIN="$LLM_DIR/build/ds4f_ep_runner"
 
 # ---- clean per-rank artifacts from any prior run ----

@@ -84,12 +84,13 @@ GLM5_STAGE_LAYERS=$STAGE_LAYERS mpiexec -np "$NP" "$LLM/build/glm5_stage" || { e
 echo "staged ranks: $(ls "$WORK"/glm5_stage_rank*.txt 2>/dev/null | wc -l)/$NP ($(date))"
 cat "$WORK"/glm5_stage_rank*.txt 2>/dev/null | sort | tail -12
 
+NUMA_WRAP=""; [ "${GLM5_NUMACTL:-0}" = "1" ] && NUMA_WRAP="numactl --interleave=all"
 for th in $THREADS; do
     for pc in $PCHUNKS; do
-        echo "--- prefill FP8 run threads=$th pchunk=$pc ($(date)) ---"
+        echo "--- prefill FP8 run threads=$th pchunk=$pc numactl=${GLM5_NUMACTL:-0} bind=${OMP_PROC_BIND:-unset} ($(date)) ---"
         rm -f glm5_ep_*.txt glm5_ep_rank00.txt
         LLM_THREADS=$th OMP_NUM_THREADS=$th GLM5_PCHUNK=$pc GLM5_REAL=1 GLM5_LAYERS=$RUN_LAYERS \
-          mpiexec -np "$NP" "$LLM/build/glm5_ep_runner" || { echo "FATAL: prefill threads=$th pchunk=$pc"; exit 5; }
+          mpiexec -np "$NP" $NUMA_WRAP "$LLM/build/glm5_ep_runner" || { echo "FATAL: prefill threads=$th pchunk=$pc"; exit 5; }
         cp glm5_ep_rank00.txt "prefill_rank00_t${th}_pc${pc}.txt" 2>/dev/null || true
         grep -E "prefill_synth:|prefill_progress:|PROFILE prefill_synth|SENTINEL" "prefill_rank00_t${th}_pc${pc}.txt" 2>/dev/null || true
     done

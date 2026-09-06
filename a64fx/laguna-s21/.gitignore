@@ -1,0 +1,18 @@
+build/
+logs/
+smoke/
+gen_*/
+long_context_tests/
+probe/
+*.ids
+bf16smoke/
+fp8run/
+# in-tree test/bench binaries (sources are tracked)
+sampler_test
+slide_attn_test
+run_prim_test
+attn_bench*
+fp8_dq_bench
+fp8_mm_bench
+i8_mm_bench
+!*.c

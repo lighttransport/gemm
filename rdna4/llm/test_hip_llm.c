@@ -810,6 +810,17 @@ int main(int argc, char **argv) {
     }
     gguf_context *gguf = gguf_model->metadata;
 
+    int arch_idx = gguf_find_key(gguf, "general.architecture");
+    if (arch_idx >= 0 && gguf->kv[arch_idx].type == GGUF_TYPE_STRING &&
+        strcmp(gguf->kv[arch_idx].value.str.str, "deepseek4") == 0) {
+        fprintf(stderr, "deepseek4 GGUF detected (%u split shards, %llu tensors), "
+                "but the generic Qwen/Gemma HIP runner does not implement the "
+                "DeepSeek4 graph; use the DS4F backend or add its tensor adapter.\n",
+                gguf_model->n_shards, (unsigned long long)gguf->n_tensors);
+        gguf_close_shards(gguf_model);
+        return 2;
+    }
+
     /* Load tokenizer */
     bpe_vocab *vocab = bpe_vocab_load(gguf);
     if (!vocab) {

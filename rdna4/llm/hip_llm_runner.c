@@ -7801,6 +7801,11 @@ static const char *hip_kernel_source =
     } \
 } while(0)
 
+/* hipMalloc takes void **; keep typed device pointers warning-clean without
+ * relying on permissive C conversion rules. */
+#define CHECK_HIP_MALLOC(ptr, bytes) \
+    CHECK_HIP(hipMalloc((void **)(void *)(ptr), (bytes)))
+
 #define CHECK_HIP_NULL(call) do { \
     hipError_t err = (call); \
     if (err != hipSuccess) { \
@@ -14387,8 +14392,6 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
         int hd = cl->local_head_dim;
         int local_kv_heads = cl->local_kv_heads;
         int local_kv_dim = local_kv_heads * hd;
-        int local_q_dim = n_heads * hd;
-        int local_gqa = n_heads / local_kv_heads;
         int kv_src = (cl->shared_kv_source >= 0) ? cl->shared_kv_source : l;
         /* Value-less (global/full-attn) layers: V = K (config attention_k_eq_v). */
         int v_eq_k = (cl->shared_kv_source < 0) && (cl->attn_v_rows <= 0);

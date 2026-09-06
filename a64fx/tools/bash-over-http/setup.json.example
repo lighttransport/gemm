@@ -1,0 +1,31 @@
+{
+  "local": {
+    "dir": ".",
+    "port": 42386
+  },
+  "remote": {
+    "ssh_host": "fugaku1",
+    "hostname": "login1.fugaku.r-ccs.riken.jp",
+    "port": 32386,
+    "dir": "$HOME/work/gemm/glm53f"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 21264
+  },
+  "storage": {
+    "model_dir": "$HOME/models/q38fn/bf16",
+    "local_dir": "/local/q38fn",
+    "staging": "cp"
+  },
+  "job": {
+    "project_id": "hp250467",
+    "rscgrp": "small",
+    "nodes": 1,
+    "elapse": "08:00:00",
+    "port_offset": 0,
+    "a64fx_mode": "normal",
+    "gfscache": "/vol0004",
+    "localtmp_size": "87Gi"
+  }
+}

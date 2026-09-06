@@ -40,7 +40,25 @@ typedef struct {
     uint64_t dims[4];
     float    scale;      /* optional external scale for safetensors FP8 weights */
     int      has_scale;
+    int      podd_packed; /* 1 = data is k-major-interleaved for the p_odd BF16 GEMM */
+    uint16_t *prefill_pv48; /* optional Kx48 packed BF16 prefill weights */
+    int8_t   *prefill_q8v2_q; /* optional [panel64][block32][8][4][64] */
+    float    *prefill_q8v2_d; /* optional [panel64][block32][64] scales */
+    int8_t   *prefill_q8b6_q; /* optional [panel64][block64][16][4][64] */
+    float    *prefill_q8b6_d; /* optional [panel64][block64][64] scales */
+    int      bf16_pv;     /* 1 = 8-row pair-interleaved decode layout */
+    int8_t  *i8;          /* optional int8 W8A8 weights [n_rows*n_cols], row-major */
+    float   *i8s;         /* per-row int8 scale [n_rows] (w ~= i8 * i8s[row]) */
+    int      q8_block64;  /* 1/2=Q8 original layout, 3=compact W8A8 groups */
+    void    *tp_owned_data; /* owned contiguous TP column repack, if any */
 } qtensor;
+
+typedef struct {
+    double norm_ms, proj_ms, ssm_prepare_ms, ssm_scan_ms;
+    double attn_prepare_ms, attn_kernel_ms, out_proj_ms;
+    double ffn_proj_ms, ffn_act_ms, ffn_down_ms, collective_ms;
+    int layers, calls;
+} transformer_prefill_profile;
 
 typedef struct {
     qtensor attn_norm;   /* [n_embd] */
@@ -93,9 +111,39 @@ typedef struct {
                             * derived from attn_k rows / head_dim. 0 = use model default */
 } transformer_layer;
 
+/* Qwen3.5/3.6/3.8 native NextN block.  GGUF counts this after the trunk in
+ * block_count, but it is not part of the ordinary autoregressive layer loop. */
+typedef struct {
+    transformer_layer layer;
+    qtensor eh_proj;             /* [2*n_embd, n_embd] */
+    qtensor enorm;               /* embedding RMS norm */
+    qtensor hnorm;               /* target-hidden RMS norm */
+    qtensor shared_head_norm;    /* draft-head RMS norm */
+    qtensor embed_tokens;        /* optional private embedding */
+    qtensor shared_head_head;    /* optional private LM head */
+    int layer_index;
+    int loaded;
+    float *key_cache;          /* private draft KV [max_seq_len, kv_dim] */
+    float *value_cache;
+    float *hidden;             /* recurrent draft hidden [n_embd] */
+    float *target_hidden;      /* raw trunk final-layer hidden [n_embd] */
+    float *fusion;             /* [2*n_embd] normalized embedding + hidden */
+} transformer_nextn;
+
+/* Cache-line-separated state for the optional hierarchical persistent-worker
+ * barrier.  The default barrier remains the original sense barrier until the
+ * hierarchical path has passed an A/B benchmark and output check. */
+typedef struct {
+    volatile int count;
+    volatile int sense;
+    char pad[56];
+} tf_cmg_barrier_state;
+
 typedef struct {
     /* Hyperparameters */
     int n_layers;
+    int n_layers_all;
+    int n_nextn_layers;
     int n_embd;
     int n_heads;
     int n_kv_heads;
@@ -127,7 +175,8 @@ typedef struct {
     float **conv_state;      /* [n_layers] -> [conv_kernel-1, qkv_dim] per SSM layer */
     int *conv_state_pos;     /* [n_layers] circular buffer write position per SSM layer */
     float **recurrent_state; /* [n_layers] -> [n_v_heads, d_state, d_state] per SSM layer */
-    float *conv_w_trans;     /* pre-allocated [conv_k * qkv_dim] for batch-dequant conv weights */
+    float *conv_w_trans;     /* compatibility scratch for non-hybrid callers */
+    float **conv_w_trans_layers; /* cached [layer][conv_k * qkv_dim] SSM weights */
     int n_deepstack;       /* number of deepstack layers (Qwen3-VL) */
     const float *ds_embd;  /* pointer to current full embedding (incl deepstack slices) */
     int ds_embd_stride;    /* total embedding dim = proj_dim * (1 + n_deepstack) */
@@ -143,6 +192,9 @@ typedef struct {
     float rope_freq_base_swa;       /* RoPE freq base for SWA layers (10000) */
     float embd_scale;               /* sqrt(n_embd) for token embedding scaling */
     int ffn_activation;             /* 0 = SiLU (default), 1 = GELU (Gemma4) */
+    int ffn_gelu_fast;              /* 1 = A64FX fast GELU approximation */
+    int ffn_fused_q4;               /* 1 = fused Q4 gate/up + GELU for Gemma4 prefill */
+    int ffn_check;                  /* 1 = print one fused-vs-exact FFN tile check */
     int *swa_pattern;               /* [n_layers] 1=SWA, 0=full attention */
     /* Per-layer embedding global tensors */
     qtensor per_layer_token_embd;   /* [n_embd_per_layer*n_layer, n_vocab] */
@@ -163,10 +215,14 @@ typedef struct {
 
     /* Per-layer weights */
     transformer_layer *layers;
+    transformer_nextn nextn;
 
     /* KV cache: [n_layers][max_seq_len * n_kv_heads * head_dim] */
     float **key_cache;
     float **value_cache;
+    void **key_cache_raw;
+    void **value_cache_raw;
+    int kv_cache_type;  /* 0 = F32, 1 = F16 */
 
     /* Scratch buffers */
     float *x;        /* [n_embd] current hidden state */
@@ -180,7 +236,17 @@ typedef struct {
     float *ffn_buf2; /* [n_ff] */
     float *ffn_buf3; /* [n_ff] */
     float *logits;     /* [n_vocab] output logits (only if has_lm_head) */
+    int *lm_head_best_idx; /* per-worker fused greedy argmax */
+    float *lm_head_best_val;
+    int last_argmax;
+    void *tp_stage_data;  /* anonymous rank-local staged-weight arena */
+    size_t tp_stage_bytes;
+    int tp_stage_is_mmap;
+    void *q8_bf16_arena; /* anonymous System-V expansion arena, if enabled */
+    size_t q8_bf16_arena_bytes;
     float *matvec_tmp; /* max(n_embd, n_ff) for row dequant (thread 0) */
+    float ssm_alpha_tmp[64]; /* shared persistent-worker SSM scalars */
+    float ssm_beta_tmp[64];
     int trace_hidden_norms; /* print per-layer hidden norms during forward */
 
     /* Multi-threading */
@@ -201,16 +267,31 @@ typedef struct {
     volatile int pool_phase;   /* incremented to signal work */
     volatile int pool_done;    /* number of workers done */
     int pool_alive;            /* 1 if pool is running */
+    int pool_paused;           /* workers retained asleep while OMP batch owns cores */
+    int pool_core_offset;      /* optional A64FX core offset for an isolated pool */
+    int pool_core_striped;     /* map a reduced pool evenly across all CMGs */
     pthread_mutex_t pool_mutex;/* protects pool_phase signaling */
     pthread_cond_t pool_cond;  /* workers sleep here between dispatches */
     volatile int bar_count;    /* barrier arrival counter */
     volatile int bar_sense;    /* barrier sense flag (alternates 0/1) */
+    tf_cmg_barrier_state cmg_bar[4];
+    volatile int cmg_leader_count;
+    volatile int cmg_leader_sense;
 
     /* Tensor parallelism */
     int tp_rank;               /* this rank's position in the TP group (0 if no TP) */
     int tp_size;               /* size of the TP group (1 if no TP) */
     void (*tp_allreduce_fn)(float *buf, int count, void *ctx);  /* allreduce callback */
+    void (*tp_reduce_add_fn)(float *buf, float *residual, int count,
+                             void *ctx); /* optional fused allreduce + residual add */
     void *tp_allreduce_ctx;    /* opaque context passed to allreduce (e.g. parallel_config*) */
+    int tp_attn_sharded, tp_ffn_sharded, tp_ssm_sharded;
+    int tp_qhead_offset, tp_kv_head_base, tp_kv_head_count;
+    int ssm_head_offset;
+    int tp_vocab_sharded, tp_vocab_lo, tp_vocab_loc;
+    int gqa_group;
+    int kv_dtype, kv_elem_bytes, kv_k_transposed, kv_k_dp;
+    float **key_scales, **value_scales;
 
     /* NUMA allocator state */
     struct {
@@ -220,6 +301,19 @@ typedef struct {
         size_t alignment;             /* minimum alignment (default: 2MB) */
         int enabled;                  /* 0=fallback, 1=active */
     } numa;
+
+    /* Persistent NUMA-distributed 256-aligned bump pool for prefill scratch.
+     * Reused across prefill calls (reset, not freed) to avoid per-call malloc/free
+     * churn that fragments THP and mis-places pages (progressive prefill slowdown). */
+    struct {
+        void  *base;   /* mmap arena (NULL until first use) */
+        size_t cap;    /* capacity bytes */
+        size_t off;    /* bump offset */
+    } mpool;
+    /* Decode-only materializations (for example selective Q8 residency). */
+    void **decode_owned;
+    int decode_owned_count;
+    int decode_owned_cap;
 } transformer_model;
 
 transformer_model *transformer_load(gguf_context *gguf, int max_seq_len);
@@ -227,16 +321,95 @@ void transformer_free(transformer_model *model);
 
 /* Set number of threads for parallel matmul/attention (default: 1) */
 void transformer_set_threads(transformer_model *model, int n_threads);
+void transformer_build_panels(transformer_model *model);
+void transformer_pool_profile_reset(void);
+void transformer_reset_runtime_state(transformer_model *model);
+/* Serialize only mutable inference state for [layer_start,layer_end).  The
+ * resulting blob is position-bounded (attention KV rows [0,cache_pos)) and
+ * contains no weights or scratch buffers, so it can be moved directly when a
+ * PP prefill rank is regrouped into a TP decode replica. */
+size_t transformer_runtime_state_size(const transformer_model *model,
+                                      int layer_start, int layer_end,
+                                      int cache_pos);
+int transformer_runtime_state_pack(const transformer_model *model,
+                                   int layer_start, int layer_end,
+                                   int cache_pos, void *blob, size_t blob_size);
+int transformer_runtime_state_unpack(transformer_model *model,
+                                     const void *blob, size_t blob_size,
+                                     int *cache_pos);
 void transformer_set_trace_hidden_norms(transformer_model *model, int enable);
 /* Enable double-precision accumulation in matvec/rmsnorm for a higher-fidelity
  * (closer to F64) CPU reference. Slower; intended for oracle/verification use. */
 void transformer_set_f64_accum(transformer_model *model, int enable);
+/* Lossy resident W8A8 conversion for BF16 decode projections.  The int8
+ * payload is written into the first half of each staged BF16 row; the BF16
+ * source remains addressable for diagnostics but matvec dispatch uses i8. */
+void transformer_prepack_int8(transformer_model *model);
+size_t transformer_prepack_int8_range(transformer_model *model,
+                                      int layer_start, int layer_end,
+                                      int include_output);
+size_t transformer_prepack_q8_w8a8_range(transformer_model *model,
+                                         int layer_start, int layer_end,
+                                         int include_output);
+size_t transformer_prepack_q8v2_range(transformer_model *model,
+                                      int layer_start, int layer_end);
+/* Release transient Q8v2 batched-prefill panels while retaining the native
+ * resident TP stage.  Used before expanding that same stage for decode. */
+size_t transformer_release_q8v2_range(transformer_model *model,
+                                      int layer_start, int layer_end);
+size_t transformer_prepack_q8b6_range(transformer_model *model,
+                                      int layer_start, int layer_end);
+/* Expand resident Q8_0 trunk weights into the pair-interleaved BF16 layout
+ * used by the exact A64FX decode/verifier kernels.  The Q8 rank stage remains
+ * the source of truth; expansion is anonymous memory and is guarded by
+ * MemAvailable so a rank cannot consume the node's final HBM headroom. */
+size_t transformer_expand_q8_bf16_pv_range(transformer_model *model,
+                                            int layer_start, int layer_end,
+                                            int include_output,
+                                            int nextn_mask);
+/* Pack BF16 projections owned by [layer_start,layer_end) for the exact
+ * FP32-activation 8x48 A64FX prefill kernel. */
+size_t transformer_prepack_prefill_pv48_range(transformer_model *model,
+                                               int layer_start, int layer_end);
+/* Reclaim exact-BF16 prefill panels before switching a resident model to
+ * single-token decode. */
+size_t transformer_release_prefill_pv48_range(transformer_model *model,
+                                               int layer_start, int layer_end);
+/* Convert resident row-major BF16 projections to the exact eight-row
+ * pair-interleaved decode layout without allocating a second weight arena. */
+size_t transformer_pack_bf16_pv_range_inplace(transformer_model *model,
+                                               int layer_start, int layer_end,
+                                               int include_output);
+void transformer_prefill_profile_reset(void);
+void transformer_prefill_profile_get(transformer_prefill_profile *out);
+/* Diagnostic only: scan all resident Q8 decode tensors as one batched stream,
+ * removing per-projection scheduling from the bandwidth measurement. */
+double transformer_null_stream_bench(transformer_model *model, int passes);
 
 /* Configure NUMA-aware weight/buffer distribution across CMGs.
  * Must be called after transformer_set_threads, before inference.
  * Env vars: NUMA_DISTRIBUTE=1 (enable), NUMA_N_CMGS (default 4),
- *           NUMA_CMG_BUDGET_GB (default 6), NUMA_ALIGNMENT (default 2MB). */
+ *           NUMA_CMG_BUDGET_GB (default 7), NUMA_ALIGNMENT (default 2MB). */
 void transformer_numa_setup(transformer_model *m, const gguf_context *gguf);
+/* Copy Q8 decode weights out of a lazy mmap without materializing embeddings or
+ * the optional NextN block. Returns resident bytes, or 0 on failure. */
+size_t transformer_materialize_q8_decode(transformer_model *m,
+                                          const gguf_context *gguf,
+                                          int q8_mode);
+/* Lossy BF16 -> compact 8-row x 64-column W8A8 SDOT layout. */
+void transformer_prepack_int8_block64(transformer_model *model);
+/* Selective form: convert only FFN gate/up/down projections. */
+void transformer_prepack_int8_block64_ffn(transformer_model *model);
+/* Copy the native NextN block out of a lazy GGUF mapping.  TP decode uses this
+ * when speculative drafts are enabled so the auxiliary block is not reread
+ * from the filesystem for every generated token. */
+size_t transformer_materialize_nextn(transformer_model *m);
+/* Copy only the PP-owned native weights out of the file mapping.  This is
+ * useful for BF16 PP on node-local storage: each stage has enough HBM for its
+ * layer range, but repeatedly faulting a 13GB stage from mmap is too slow. */
+size_t transformer_materialize_pp(transformer_model *m, int layer_start, int layer_end);
+/* Apply the main TP partition to the native NextN attention/FFN block. */
+int transformer_tp_slice_nextn(transformer_model *m, int rank, int size);
 
 /* Run one token through the transformer. Returns pointer to hidden state [n_embd].
  * For embedding models (no output projection), this is the final hidden state. */
@@ -270,6 +443,29 @@ float *transformer_forward_partial(transformer_model *model, int cache_pos,
 /* Compute logits from the current hidden state in model->x.
  * Call after transformer_forward_partial with layer_end == n_layers. */
 float *transformer_compute_logits(transformer_model *model);
+/* TP vocab-parallel: logits for rows [v0,v1) into model->logits[0..v1-v0). */
+float *transformer_compute_logits_slice(transformer_model *model, int v0, int v1);
+/* Argmax produced during the most recent persistent LM-head sweep. */
+int transformer_last_argmax(const transformer_model *model);
+
+/* Run the native Qwen NextN head for one draft position. target_hidden is the
+ * trunk hidden associated with prev_token. Returns draft logits [n_vocab] and
+ * stores the recurrent auxiliary hidden internally for callers that generate
+ * K>1 drafts (pass transformer_nextn_hidden() as target_hidden on later steps). */
+float *transformer_nextn_logits(transformer_model *model, int32_t prev_token,
+                                const float *target_hidden, int position);
+const float *transformer_nextn_hidden(const transformer_model *model);
+const float *transformer_nextn_target_hidden(const transformer_model *model);
+int transformer_nextn_local_argmax(const transformer_model *model, float *value);
+/* Create a weights-sharing NextN-only runtime.  It owns independent scratch,
+ * KV state, logits, and worker threads, but never owns the trunk/staged weights.
+ * This is the isolation boundary needed to overlap a speculative NextN chain
+ * with target-model verification without racing transformer_model scratch. */
+transformer_model *transformer_nextn_context_create(
+    const transformer_model *source, int n_threads);
+void transformer_nextn_context_copy_state(transformer_model *dst,
+                                          const transformer_model *source);
+void transformer_nextn_context_free(transformer_model *context);
 
 /* Copy hidden state into/out of model->x for MPI communication */
 float *transformer_get_hidden(transformer_model *model);
@@ -290,6 +486,13 @@ void transformer_embed_token(transformer_model *model, int32_t token_id);
 void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
                          void (*allreduce_fn)(float *buf, int count, void *ctx),
                          void *allreduce_ctx);
+void transformer_set_tp_reduce_add(transformer_model *model,
+                         void (*reduce_add_fn)(float *buf, float *residual,
+                                               int count, void *ctx));
+int transformer_tp_slice_weights(transformer_model *model, int tp_rank, int tp_size,
+                                  int ssm_shard);
+size_t transformer_tp_load_stage(transformer_model *model, const char *stage_dir,
+                                 int tp_rank, int tp_size);
 
 /* --- Distributed memory management --- */
 
@@ -321,6 +524,18 @@ typedef struct {
 /* Run batched prefill and return logits for the last token. Returns NULL if no LM head.
  * All N tokens are processed through GEMM instead of individual matvecs. */
 float *transformer_forward_batch_logits(transformer_model *m, const transformer_batch *b);
+float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens, int n_tokens, int start_pos);
+enum {
+    TF_PREFILL_EMBED  = 1u << 0,
+    TF_PREFILL_LOGITS = 1u << 1,
+};
+/* Batched Qwen hybrid prefill over a contiguous layer range.  hidden_io is
+ * token-major [n_tokens,n_embd].  Stage zero supplies TF_PREFILL_EMBED and may
+ * leave hidden_io uninitialized; later pipeline stages consume the incoming
+ * hidden block.  The final stage supplies TF_PREFILL_LOGITS. */
+float *transformer_prefill_range(transformer_model *m, const int32_t *tokens,
+                                 float *hidden_io, int n_tokens, int start_pos,
+                                 int layer_start, int layer_end, unsigned flags);
 
 /* Sample next token from logits using temperature and top-k. */
 int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperature, int top_k);
@@ -341,6 +556,23 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#include <fcntl.h>      /* posix_fadvise (drop source page-cache during anon weight load) */
+#include <errno.h>
+#include <limits.h>
+#include <sys/mman.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include "../a64fx/llm/qwen38_tp_stage.h"
+#if defined(TF_LINK_BF16PV48) && defined(__ARM_FEATURE_SVE)
+#include "../a64fx/k3/k3_prefill.h"
+#endif
+
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+extern void gemm_fp16_BT(int M, int K, int N,
+                         const float *A, int lda,
+                         const uint16_t *BT_fp16, int ldb,
+                         float *C, int ldc) __attribute__((weak));
+#endif
 
 /* Profiling macros: active only if profiler.h was included before this file */
 #ifdef PROFILER_H
@@ -415,6 +647,65 @@ static void *tf_aligned_alloc_notouch(size_t alignment, size_t size) {
     void *p = NULL;
     if (posix_memalign(&p, alignment, size) != 0) return NULL;
     return p;
+}
+
+static uint16_t tf_f32_to_f16(float f) {
+    uint32_t x;
+    __builtin_memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((x >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = x & 0x7fffffu;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        uint32_t t = mant >> (uint32_t)(1 - exp);
+        if (t & 0x1000u) t += 0x2000u;
+        return (uint16_t)(sign | (t >> 13));
+    }
+    if (exp >= 31) {
+        return (uint16_t)(sign | 0x7c00u | (mant ? 0x0200u : 0));
+    }
+    if (mant & 0x1000u) {
+        mant += 0x2000u;
+        if (mant & 0x800000u) {
+            mant = 0;
+            exp++;
+            if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+        }
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
+static void tf_kv_store(transformer_model *m, int layer, size_t offset,
+                        const float *src, int n) {
+    if (m->kv_cache_type == 1) {
+        uint16_t *dst = (uint16_t *)m->key_cache_raw[layer] + offset;
+        for (int i = 0; i < n; i++) dst[i] = tf_f32_to_f16(src[i]);
+    } else {
+        memcpy(m->key_cache[layer] + offset, src, (size_t)n * sizeof(float));
+    }
+}
+
+static void tf_kv_store_value(transformer_model *m, int layer, size_t offset,
+                              const float *src, int n) {
+    if (m->kv_cache_type == 1) {
+        uint16_t *dst = (uint16_t *)m->value_cache_raw[layer] + offset;
+        for (int i = 0; i < n; i++) dst[i] = tf_f32_to_f16(src[i]);
+    } else {
+        memcpy(m->value_cache[layer] + offset, src, (size_t)n * sizeof(float));
+    }
+}
+
+static inline float tf_kv_load_key(const transformer_model *m, int layer, size_t idx) {
+    if (m->kv_cache_type == 1)
+        return ggml_fp16_to_fp32(((const uint16_t *)m->key_cache_raw[layer])[idx]);
+    return m->key_cache[layer][idx];
+}
+
+static inline float tf_kv_load_value(const transformer_model *m, int layer, size_t idx) {
+    if (m->kv_cache_type == 1)
+        return ggml_fp16_to_fp32(((const uint16_t *)m->value_cache_raw[layer])[idx]);
+    return m->value_cache[layer][idx];
 }
 
 /* ---- Compute helpers ---- */
@@ -591,14 +882,14 @@ static float tf_sum_squares(const float *v, int n) {
 static int tf_g_f64_accum = 0;
 
 static void tf_rmsnorm(float *dst, const float *x, const qtensor *w, int n, float eps, float *w_buf) {
-    /* Dequant weight */
-    tf_dequant_row(w, 0, w_buf);
+    const float *wv = w->type == GGML_TYPE_F32 ? (const float *)w->data : w_buf;
+    if (wv == w_buf) tf_dequant_row(w, 0, w_buf);
 
     if (tf_g_f64_accum) {
         double ss = 0.0;
         for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
         float inv = (float)(1.0 / sqrt(ss / n + (double)eps));
-        for (int i = 0; i < n; i++) dst[i] = x[i] * inv * w_buf[i];
+        for (int i = 0; i < n; i++) dst[i] = x[i] * inv * wv[i];
         return;
     }
 
@@ -624,15 +915,24 @@ static void tf_rmsnorm(float *dst, const float *x, const qtensor *w, int n, floa
     i = 0;
     for (; i + 7 < n; i += 8) {
         __m256 vx = _mm256_loadu_ps(x + i);
-        __m256 vw = _mm256_loadu_ps(w_buf + i);
+        __m256 vw = _mm256_loadu_ps(wv + i);
         _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_mul_ps(vx, vscale), vw));
     }
-    for (; i < n; i++) dst[i] = x[i] * ss * w_buf[i];
+    for (; i < n; i++) dst[i] = x[i] * ss * wv[i];
+#elif defined(__ARM_FEATURE_SVE)
+    svbool_t pt = svptrue_b32(); int vl = (int)svcntw();
+    svfloat32_t vss = svdup_f32(0);
+    for (int i = 0; i < n; i += vl) { svbool_t pg = svwhilelt_b32(i, n);
+        svfloat32_t vx = svld1(pg, x + i); vss = svmla_m(pg, vss, vx, vx); }
+    float ss = 1.0f / sqrtf(svaddv(pt, vss) / n + eps);
+    svfloat32_t vsc = svdup_f32(ss);
+    for (int i = 0; i < n; i += vl) { svbool_t pg = svwhilelt_b32(i, n);
+        svst1(pg, dst + i, svmul_x(pg, svmul_x(pg, svld1(pg, x + i), vsc), svld1(pg, wv + i))); }
 #else
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
     ss = 1.0f / sqrtf(ss / n + eps);
-    for (int i = 0; i < n; i++) dst[i] = x[i] * ss * w_buf[i];
+    for (int i = 0; i < n; i++) dst[i] = x[i] * ss * wv[i];
 #endif
 }
 
@@ -644,6 +944,341 @@ typedef struct {
     int row_start, row_end;
     float *tmp; /* per-thread scratch */
 } tf_matvec_task;
+
+static inline float tf_vec_dot_q4_0_f32(const block_q4_0 *row, const float *x, int n_cols);
+static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
+                                           const float *x0, const float *x1,
+                                           const float *x2, const float *x3,
+                                           int n_cols, float *s0, float *s1,
+                                           float *s2, float *s3);
+static inline void tf_vec_dot_q4_0_f32_4row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const float *x, int n_cols);
+static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const block_q4_0 *r4, const block_q4_0 *r5,
+    const block_q4_0 *r6, const block_q4_0 *r7,
+    const float *x, int n_cols);
+static inline void tf_vec_dot_q4_0_int8_full_8row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const block_q4_0 *r4, const block_q4_0 *r5,
+    const block_q4_0 *r6, const block_q4_0 *r7,
+    const float *x, int n_cols);
+static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols, float scale_w);
+static inline void tf_dequant_q4_0_8row_strided_to_int8(const uint8_t *base, size_t row_bytes, int8_t *dst, int n_cols, float scale_w);
+static inline void tf_vec_dot_q4_0_int8_8row(int32_t *dst, const int8_t *wi8,
+                                                const int8_t *xi8, int n_cols);
+static inline void tf_quantize_f32_to_int8(const float *x, int8_t *xi8, int n_cols, float *out_inv);
+static inline void tf_vec_dot_q4_0_pair_f32(const block_q4_0 *gate,
+                                             const block_q4_0 *up,
+                                             const float *x, int n_cols,
+                                             float *sg, float *su);
+static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_bytes,
+                                  const float *x, int n_cols, int row_start, int row_end);
+
+#if defined(__ARM_FEATURE_SVE)
+/* Q4_K and the other K-quants use the generic dequantizer below.  Keep that
+ * conversion intact, but reduce the resulting F32 row with SVE rather than
+ * scalar C. */
+static inline float tf_f32_dot_sve(const float *a, const float *b, int n) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t acc = svdup_f32(0.0f);
+    int i = 0;
+    int vl = (int)svcntw();
+    for (; i + vl <= n; i += vl)
+        acc = svmla_x(pg, acc, svld1(pg, a + i), svld1(pg, b + i));
+    float sum = svaddv_f32(pg, acc);
+    if (i < n) {
+        svbool_t tail = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+        sum += svaddv_f32(tail, svmul_x(tail, svld1(tail, a + i), svld1(tail, b + i)));
+    }
+    return sum;
+}
+
+/* Two-row dot product for the SSM state matvecs.  Each row retains the same
+ * left-to-right vector accumulation and horizontal reduction as
+ * tf_f32_dot_sve; only the shared input-vector load is hoisted between rows. */
+static inline void tf_f32_dot_sve_2row(float *out0, float *out1,
+                                       const float *a0, const float *a1,
+                                       const float *b, int n) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t acc0 = svdup_f32(0.0f), acc1 = svdup_f32(0.0f);
+    int i = 0, vl = (int)svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t vb = svld1(pg, b + i);
+        acc0 = svmla_x(pg, acc0, svld1(pg, a0 + i), vb);
+        acc1 = svmla_x(pg, acc1, svld1(pg, a1 + i), vb);
+    }
+    *out0 = svaddv_f32(pg, acc0);
+    *out1 = svaddv_f32(pg, acc1);
+    if (i < n) {
+        svbool_t tail = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+        svfloat32_t vb = svld1(tail, b + i);
+        *out0 += svaddv_f32(tail, svmul_x(tail, svld1(tail, a0 + i), vb));
+        *out1 += svaddv_f32(tail, svmul_x(tail, svld1(tail, a1 + i), vb));
+    }
+}
+
+/* Dot one state row with two vectors.  DeltaNet needs state*K and state*Q
+ * from the same 128-float row; sharing the state load avoids rereading the
+ * complete recurrent matrix after its rank-one update. */
+static inline void tf_f32_dot_sve_2vec(float *out0, float *out1,
+                                      const float *a, const float *b0,
+                                      const float *b1, int n) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t acc0 = svdup_f32(0.0f), acc1 = svdup_f32(0.0f);
+    int i = 0, vl = (int)svcntw();
+    for (; i + vl <= n; i += vl) {
+        svfloat32_t va = svld1(pg, a + i);
+        acc0 = svmla_x(pg, acc0, va, svld1(pg, b0 + i));
+        acc1 = svmla_x(pg, acc1, va, svld1(pg, b1 + i));
+    }
+    *out0 = svaddv_f32(pg, acc0);
+    *out1 = svaddv_f32(pg, acc1);
+    if (i < n) {
+        svbool_t tail = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+        svfloat32_t va = svld1(tail, a + i);
+        *out0 += svaddv_f32(tail, svmul_x(tail, va, svld1(tail, b0 + i)));
+        *out1 += svaddv_f32(tail, svmul_x(tail, va, svld1(tail, b1 + i)));
+    }
+}
+
+/* Fused Q4_K dequantization and dot product.  A Q4_K super-block contains
+ * eight 32-value sub-blocks: each pair shares one byte slice, with low and
+ * high nibbles forming the two sub-blocks. */
+static inline float tf_q4_k_dot_sve(const block_q4_K *blocks, const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const int vl = (int)svcntw();
+    svfloat32_t acc = svdup_f32(0.0f);
+    const int nb = n / 256;
+    for (int ib = 0; ib < nb; ib++) {
+        const block_q4_K *b = &blocks[ib];
+        const float d = ggml_fp16_to_fp32(b->d);
+        const float dmin = ggml_fp16_to_fp32(b->dmin);
+        int is = 0;
+        for (int g = 0; g < 256; g += 64, is += 2) {
+            uint8_t sc, mv;
+            get_scale_min_k4(is, b->scales, &sc, &mv);
+            const float d0 = d * sc, m0 = dmin * mv;
+            get_scale_min_k4(is + 1, b->scales, &sc, &mv);
+            const float d1 = d * sc, m1 = dmin * mv;
+            const svfloat32_t vd0 = svdup_f32(d0), vm0 = svdup_f32(m0);
+            const svfloat32_t vd1 = svdup_f32(d1), vm1 = svdup_f32(m1);
+            const uint8_t *q = b->qs + (g / 64) * 32;
+            for (int k = 0; k < 32; k += vl) {
+                svbool_t pt = (k + vl <= 32) ? pg : svwhilelt_b32((uint64_t)k, (uint64_t)32);
+                svuint32_t qv = svld1ub_u32(pt, q + k);
+                svfloat32_t xv = svld1(pt, x + ib * 256 + g + k);
+                svfloat32_t wv = svsub_x(pt, svmul_x(pt, svcvt_f32_u32_x(pt, svand_n_u32_x(pt, qv, 0x0f)), vd0), vm0);
+                acc = svmla_m(pt, acc, wv, xv);
+                qv = svld1ub_u32(pt, q + k);
+                xv = svld1(pt, x + ib * 256 + g + 32 + k);
+                wv = svsub_x(pt, svmul_x(pt, svcvt_f32_u32_x(pt, svlsr_n_u32_x(pt, qv, 4)), vd1), vm1);
+                acc = svmla_m(pt, acc, wv, xv);
+            }
+        }
+    }
+    return svaddv_f32(pg, acc);
+}
+
+/* Direct compact K-quant dots. These consume the GGML byte layout in place;
+ * unlike the generic fallback they never allocate or materialize an F32 row. */
+static inline float tf_q5_k_dot_sve(const block_q5_K *blocks, const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const int vl = (int)svcntw();
+    svfloat32_t acc = svdup_f32(0.0f);
+    for (int ib = 0; ib < n / 256; ib++) {
+        const block_q5_K *b = &blocks[ib];
+        const float d = ggml_fp16_to_fp32(b->d);
+        const float dmin = ggml_fp16_to_fp32(b->dmin);
+        for (int g = 0, is = 0; g < 256; g += 64, is += 2) {
+            uint8_t sc, mv;
+            get_scale_min_k4(is, b->scales, &sc, &mv);
+            const svfloat32_t vd0 = svdup_f32(d * sc), vm0 = svdup_f32(dmin * mv);
+            get_scale_min_k4(is + 1, b->scales, &sc, &mv);
+            const svfloat32_t vd1 = svdup_f32(d * sc), vm1 = svdup_f32(dmin * mv);
+            const uint8_t *ql = b->qs + (g / 64) * 32;
+            const unsigned sh0 = (unsigned)(g / 64) * 2;
+            for (int k = 0; k < 32; k += vl) {
+                svbool_t pt = k + vl <= 32 ? pg : svwhilelt_b32((uint64_t)k, (uint64_t)32);
+                svuint32_t lo = svld1ub_u32(pt, ql + k);
+                svuint32_t hi = svld1ub_u32(pt, b->qh + k);
+                svuint32_t q0 = svorr_x(pt, svand_n_u32_x(pt, lo, 15),
+                                        svlsl_n_u32_x(pt, svand_n_u32_x(pt,
+                                            svlsr_n_u32_x(pt, hi, sh0), 1), 4));
+                svuint32_t q1 = svorr_x(pt, svlsr_n_u32_x(pt, lo, 4),
+                                        svlsl_n_u32_x(pt, svand_n_u32_x(pt,
+                                            svlsr_n_u32_x(pt, hi, sh0 + 1), 1), 4));
+                svfloat32_t w0 = svsub_x(pt, svmul_x(pt, svcvt_f32_u32_x(pt, q0), vd0), vm0);
+                svfloat32_t w1 = svsub_x(pt, svmul_x(pt, svcvt_f32_u32_x(pt, q1), vd1), vm1);
+                acc = svmla_m(pt, acc, w0, svld1(pt, x + ib * 256 + g + k));
+                acc = svmla_m(pt, acc, w1, svld1(pt, x + ib * 256 + g + 32 + k));
+            }
+        }
+    }
+    return svaddv_f32(pg, acc);
+}
+
+static inline float tf_q6_k_dot_sve(const block_q6_K *blocks, const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const int vl = (int)svcntw();
+    svfloat32_t acc = svdup_f32(0.0f);
+    for (int ib = 0; ib < n / 256; ib++) {
+        const block_q6_K *b = &blocks[ib];
+        const svfloat32_t vd = svdup_f32(ggml_fp16_to_fp32(b->d));
+        for (int half = 0; half < 2; half++) {
+            const uint8_t *ql = b->ql + half * 64;
+            const uint8_t *qh = b->qh + half * 32;
+            const int8_t *sc = b->scales + half * 8;
+            for (int part = 0; part < 4; part++) {
+                for (int k = 0; k < 32; k += vl) {
+                    svbool_t pt = k + vl <= 32 ? pg : svwhilelt_b32((uint64_t)k, (uint64_t)32);
+                    const int qlo_off = (part & 1) ? 32 : 0;
+                    const int lo_shift = part >= 2 ? 4 : 0;
+                    const int hi_shift = part * 2;
+                    svuint32_t lo = svand_n_u32_x(pt,
+                        svlsr_n_u32_x(pt, svld1ub_u32(pt, ql + qlo_off + k), lo_shift), 15);
+                    svuint32_t hi = svand_n_u32_x(pt,
+                        svlsr_n_u32_x(pt, svld1ub_u32(pt, qh + k), hi_shift), 3);
+                    svint32_t q = svsub_n_s32_x(pt,
+                        svreinterpret_s32_u32(svorr_x(pt, lo, svlsl_n_u32_x(pt, hi, 4))), 32);
+                    int si = part * 2 + k / 16;
+                    svfloat32_t w = svmul_x(pt, svcvt_f32_s32_x(pt, q),
+                                            svmul_n_f32_x(pt, vd, (float)sc[si]));
+                    acc = svmla_m(pt, acc, w,
+                        svld1(pt, x + ib * 256 + half * 128 + part * 32 + k));
+                }
+            }
+        }
+    }
+    return svaddv_f32(pg, acc);
+}
+
+static inline float tf_iq4_xs_dot_sve(const block_iq4_xs *blocks, const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    svfloat32_t acc = svdup_f32(0.0f);
+    for (int ib = 0; ib < n / 256; ib++) {
+        const block_iq4_xs *b = &blocks[ib];
+        const float d = ggml_fp16_to_fp32(b->d);
+        for (int g = 0; g < 8; g++) {
+            int ls = ((b->scales_l[g / 2] >> (4 * (g & 1))) & 15) |
+                     (((b->scales_h >> (2 * g)) & 3) << 4);
+            float w[32];
+            for (int k = 0; k < 16; k++) {
+                uint8_t q = b->qs[g * 16 + k];
+                w[k] = d * (ls - 32) * kvalues_iq4nl[q & 15];
+                w[k + 16] = d * (ls - 32) * kvalues_iq4nl[q >> 4];
+            }
+            acc = svmla_x(pg, acc, svld1(pg, w),
+                          svld1(pg, x + ib * 256 + g * 32));
+            acc = svmla_x(pg, acc, svld1(pg, w + 16),
+                          svld1(pg, x + ib * 256 + g * 32 + 16));
+        }
+    }
+    return svaddv_f32(pg, acc);
+}
+
+static inline void tf_compact_k_check(uint32_t type, const void *row,
+                                      const float *x, int n, float got) {
+    static volatile unsigned checked;
+    const char *enabled = getenv("TF_COMPACT_K_CHECK");
+    if (!enabled || atoi(enabled) == 0) return;
+    unsigned bit = type == GGML_TYPE_Q5_K ? 1u :
+                   type == GGML_TYPE_Q6_K ? 2u :
+                   type == GGML_TYPE_IQ4_XS ? 4u : 0u;
+    if (!bit || (__sync_fetch_and_or(&checked, bit) & bit)) return;
+    float *w = (float *)malloc((size_t)n * sizeof(float));
+    if (!w) { fprintf(stderr, "compact-k check: allocation failed\n"); abort(); }
+    dequant_row(type, row, w, n);
+    double ref = 0.0;
+    for (int i = 0; i < n; i++) ref += (double)w[i] * x[i];
+    free(w);
+    double err = fabs((double)got - ref);
+    double rel = err / (fabs(ref) + 1e-12);
+    fprintf(stderr, "compact-k check type=%s n=%d got=%.9g ref=%.9g abs=%.3g rel=%.3g\n",
+            ggml_type_name(type), n, got, ref, err, rel);
+    if (err > 1e-3 && rel > 2e-4) abort();
+}
+
+/* int8 SDOT row dot: sum(w[k]*x[k]) over K via svdot (4 int8 MAC / int32 lane). */
+static inline int32_t tf_int8_dot(const int8_t *w, const int8_t *x, int K) {
+    svint32_t a = svdup_s32(0); svbool_t pb = svptrue_b8(); int vlb = (int)svcntb();
+    int k = 0; for (; k + vlb <= K; k += vlb) a = svdot_s32(a, svld1_s8(pb, w + k), svld1_s8(pb, x + k));
+    int32_t s = svaddv_s32(svptrue_b32(), a);
+    for (; k < K; k++) s += (int32_t)w[k] * (int32_t)x[k];
+    return s;
+}
+static inline void tf_int8_dot_4row(int32_t out[4], const int8_t *w,
+                                    const int8_t *x, int K) {
+    svint32_t a0 = svdup_s32(0), a1 = svdup_s32(0);
+    svint32_t a2 = svdup_s32(0), a3 = svdup_s32(0);
+    const svbool_t pg = svptrue_b8();
+    const int vl = (int)svcntb();
+    int k = 0;
+    for (; k + vl <= K; k += vl) {
+        svint8_t vx = svld1_s8(pg, x + k);
+        a0 = svdot_s32(a0, svld1_s8(pg, w + k), vx);
+        a1 = svdot_s32(a1, svld1_s8(pg, w + K + k), vx);
+        a2 = svdot_s32(a2, svld1_s8(pg, w + 2 * (size_t)K + k), vx);
+        a3 = svdot_s32(a3, svld1_s8(pg, w + 3 * (size_t)K + k), vx);
+    }
+    out[0] = svaddv_s32(svptrue_b32(), a0);
+    out[1] = svaddv_s32(svptrue_b32(), a1);
+    out[2] = svaddv_s32(svptrue_b32(), a2);
+    out[3] = svaddv_s32(svptrue_b32(), a3);
+    for (; k < K; k++) {
+        int v = x[k];
+        out[0] += w[k] * v; out[1] += w[K + k] * v;
+        out[2] += w[2 * (size_t)K + k] * v;
+        out[3] += w[3 * (size_t)K + k] * v;
+    }
+}
+/* quantize x[K] -> int8 (per-vector symmetric); returns scale s.t. x ~= xi8*scale. */
+static inline float tf_quant_x_i8(const float *x, int8_t *xi8, int K) {
+    float mx = 0; for (int k = 0; k < K; k++) { float a = x[k] < 0 ? -x[k] : x[k]; if (a > mx) mx = a; }
+    float sc = mx / 127.0f, inv = sc > 0 ? 1.0f / sc : 0;
+    for (int k = 0; k < K; k++) { int q = (int)lrintf(x[k] * inv); xi8[k] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q); }
+    return sc;
+}
+
+static inline float tf_quant_x_i16(const float *x, int16_t *q, int K) {
+    float mx = 0.0f;
+    for (int k = 0; k < K; k++) { float a = fabsf(x[k]); if (a > mx) mx = a; }
+    float sc = mx / 32767.0f, inv = sc > 0.0f ? 1.0f / sc : 0.0f;
+    for (int k = 0; k < K; k++) {
+        long v = lrintf(x[k] * inv);
+        q[k] = (int16_t)(v < -32767 ? -32767 : v > 32767 ? 32767 : v);
+    }
+    return sc;
+}
+
+static inline int64_t tf_int16_dot(const int16_t *a, const int16_t *b, int K) {
+    svint64_t acc = svdup_s64(0);
+    int vh = (int)svcnth();
+    for (int k = 0; k < K; k += vh) {
+        svbool_t pg = svwhilelt_b16(k, K);
+        acc = svdot_s64(acc, svld1_s16(pg, a + k), svld1_s16(pg, b + k));
+    }
+    return svaddv_s64(svptrue_b64(), acc);
+}
+
+/* Keep resident weights compact int8, sign-extend them while loading, and use
+ * H->D SDOT against an int16 activation. This isolates the precision/throughput
+ * tradeoff without doubling the weight footprint in HBM. */
+static inline int64_t tf_int8_int16_dot(const int8_t *w, const int16_t *x, int K) {
+    svint64_t acc = svdup_s64(0);
+    const int vh = (int)svcnth();
+    for (int k = 0; k < K; k += vh) {
+        svbool_t pg = svwhilelt_b16(k, K);
+        acc = svdot_s64(acc, svld1sb_s16(pg, w + k), svld1_s16(pg, x + k));
+    }
+    return svaddv_s64(svptrue_b64(), acc);
+}
+
+#endif
 
 static void *tf_qmatvec_worker(void *arg) {
     tf_matvec_task *t = (tf_matvec_task *)arg;
@@ -679,7 +1314,79 @@ static void *tf_qmatvec_worker(void *arg) {
         }
         return NULL;
     }
+#if defined(__ARM_FEATURE_SVE)
+    if (t->mat->q8_block64) {
+        int nb = n_cols / 64;
+        int8_t *xq = (int8_t *)t->tmp;
+        float *xs = (float *)((uint8_t *)t->tmp + (size_t)n_cols);
+        for (int b = 0; b < nb; b++) {
+            float mx = 0.0f;
+            for (int j = 0; j < 64; j++) {
+                float a = fabsf(t->x[b * 64 + j]);
+                if (a > mx) mx = a;
+            }
+            xs[b] = mx / 127.0f;
+            float inv = xs[b] > 0.0f ? 1.0f / xs[b] : 0.0f;
+            for (int j = 0; j < 64; j++) {
+                int q = (int)lrintf(t->x[b * 64 + j] * inv);
+                xq[b * 64 + j] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q);
+            }
+        }
+        int groups = t->mat->n_rows / 8;
+        int g0 = groups * t->row_start / t->mat->n_rows;
+        int g1 = (groups * t->row_end + t->mat->n_rows - 1) / t->mat->n_rows;
+        size_t gb = (size_t)nb * (t->mat->q8_block64 == 3 ? 528 : 544);
+        for (int g = g0; g < g1; g++) {
+            float out[8];
+            const uint8_t *group = (const uint8_t *)t->mat->data + (size_t)g * gb;
+            if (t->mat->q8_block64 == 3)
+                matvec_sdot_8row(out, group, xq, xs, n_cols);
+            else
+                matvec_sdot_8row_q8orig(out, group, xq, xs, n_cols);
+            int r0 = g * 8, r1 = r0 + 8;
+            if (r0 < t->row_start) r0 = t->row_start;
+            if (r1 > t->row_end) r1 = t->row_end;
+            for (int r = r0; r < r1; r++) t->dst[r] = out[r - g * 8];
+        }
+        return NULL;
+    }
+    if (t->mat->i8) {   /* W8A8 int8 SDOT (per-row w scale, per-call x scale) */
+        int8_t *xi8 = (int8_t *)t->tmp;   /* per-thread scratch (max_dim floats >= n_cols bytes) */
+        static _Thread_local const float *tl_x_src;
+        static _Thread_local int tl_x_n;
+        static _Thread_local float tl_x_scale;
+        static _Thread_local float tl_x_tag0, tl_x_tag1, tl_x_tag2, tl_x_tag3;
+        float xs;
+        int same_x = tl_x_src == t->x && tl_x_n == n_cols &&
+                     tl_x_tag0 == t->x[0] && tl_x_tag1 == t->x[n_cols / 3] &&
+                     tl_x_tag2 == t->x[(2 * n_cols) / 3] && tl_x_tag3 == t->x[n_cols - 1];
+        if (same_x) xs = tl_x_scale;
+        else {
+            xs = tf_quant_x_i8(t->x, xi8, n_cols);
+            tl_x_src = t->x; tl_x_n = n_cols; tl_x_scale = xs;
+            tl_x_tag0 = t->x[0]; tl_x_tag1 = t->x[n_cols / 3];
+            tl_x_tag2 = t->x[(2 * n_cols) / 3]; tl_x_tag3 = t->x[n_cols - 1];
+        }
+        const int8_t *W = t->mat->i8; const float *ws = t->mat->i8s;
+        for (int i = t->row_start; i < t->row_end; i++)
+            t->dst[i] = (float)tf_int8_dot(W + (size_t)i * n_cols, xi8, n_cols) * ws[i] * xs;
+        return NULL;
+    }
+#endif
     if (t->mat->type == GGML_TYPE_BF16) {
+#if defined(__ARM_FEATURE_SVE)
+        if (t->mat->bf16_pv) {
+            const uint16_t *base = (const uint16_t *)t->mat->data;
+            size_t group_hw = (size_t)8 * n_cols;
+            for (int i = t->row_start; i < t->row_end; i += 8) {
+                const uint16_t *p = base + (size_t)(i / 8) * group_hw;
+                matvec_bf16_8row_pv(t->dst + i, p, p + 2 * n_cols,
+                                    p + 4 * n_cols, p + 6 * n_cols,
+                                    t->x, n_cols);
+            }
+            return NULL;
+        }
+#endif
         const uint8_t *base = (const uint8_t *)t->mat->data;
         size_t row_bytes = (size_t)n_cols * 2;
         int i = t->row_start;
@@ -706,6 +1413,36 @@ static void *tf_qmatvec_worker(void *arg) {
         }
         return NULL;
     }
+    if (t->mat->type == GGML_TYPE_Q4_0) {
+        int nb = n_cols / 32;
+        size_t row_bytes = (size_t)nb * sizeof(block_q4_0);
+        tf_matvec_q4_0_rows(t->dst, (const uint8_t *)t->mat->data, row_bytes,
+                              t->x, n_cols, t->row_start, t->row_end);
+        return NULL;
+    }
+#if defined(__ARM_FEATURE_SVE)
+    if (t->mat->type == GGML_TYPE_Q4_K) {
+        size_t row_bytes = (size_t)(n_cols / 256) * sizeof(block_q4_K);
+        const block_q4_K *base = (const block_q4_K *)t->mat->data;
+        for (int i = t->row_start; i < t->row_end; i++)
+            t->dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * row_bytes), t->x, n_cols);
+        return NULL;
+    }
+    if (t->mat->type == GGML_TYPE_Q5_K || t->mat->type == GGML_TYPE_Q6_K ||
+        t->mat->type == GGML_TYPE_IQ4_XS) {
+        size_t row_bytes = tf_row_bytes(t->mat->type, n_cols);
+        for (int i = t->row_start; i < t->row_end; i++) {
+            const uint8_t *row = (const uint8_t *)t->mat->data + (size_t)i * row_bytes;
+            if (t->mat->type == GGML_TYPE_Q5_K)
+                t->dst[i] = tf_q5_k_dot_sve((const block_q5_K *)row, t->x, n_cols);
+            else if (t->mat->type == GGML_TYPE_Q6_K)
+                t->dst[i] = tf_q6_k_dot_sve((const block_q6_K *)row, t->x, n_cols);
+            else
+                t->dst[i] = tf_iq4_xs_dot_sve((const block_iq4_xs *)row, t->x, n_cols);
+        }
+        return NULL;
+    }
+#endif
     for (int i = t->row_start; i < t->row_end; i++) {
         tf_dequant_row(t->mat, i, t->tmp);
 #if defined(__AVX2__) && defined(__FMA__)
@@ -729,8 +1466,12 @@ static void *tf_qmatvec_worker(void *arg) {
         float sum = _mm_cvtss_f32(s4);
         for (; j < n_cols; j++) sum += t->tmp[j] * t->x[j];
 #else
+#if defined(__ARM_FEATURE_SVE)
+        float sum = tf_f32_dot_sve(t->tmp, t->x, n_cols);
+#else
         float sum = 0.0f;
         for (int j = 0; j < n_cols; j++) sum += t->tmp[j] * t->x[j];
+#endif
 #endif
         t->dst[i] = sum;
     }
@@ -739,6 +1480,7 @@ static void *tf_qmatvec_worker(void *arg) {
 
 /* Forward declarations for fused matvec and thread pool */
 static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_rows, float *tmp);
+static void tf_qmatvec_pool(transformer_model *m, float *dst, const qtensor *mat, const float *x, int n_rows);
 static void tf_pool_dispatch(transformer_model *model, void *(*fn)(void *),
                               void *args, size_t arg_stride);
 static void tf_pool_shutdown(transformer_model *model);
@@ -759,12 +1501,1114 @@ static void tf_matvec_q8_rows(float *dst, const uint8_t *base, size_t row_bytes,
     }
 }
 
-static void tf_matvec_bf16_rows(float *dst, const uint8_t *base, size_t row_bytes,
+static inline float tf_vec_dot_q4_0_f32(const block_q4_0 *row, const float *x, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t acc = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    if (nb > 0) __builtin_prefetch(row->qs, 0, 0);
+    for (int b = 0; b < nb; b++) {
+        const float d = ggml_fp16_to_fp32(row[b].d);
+        const int base = b * 32;
+        svuint32_t q = svld1ub_u32(pg, row[b].qs);
+        svint32_t qlo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, q, 0x0f)), 8);
+        svint32_t qhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, q, 4)), 8);
+        svfloat32_t wlo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qlo), d);
+        svfloat32_t whi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qhi), d);
+        acc = svmla_x(pg, acc, wlo, svld1(pg, x + base));
+        acc = svmla_x(pg, acc, whi, svld1(pg, x + base + 16));
+        if (b + 1 < nb) __builtin_prefetch(row[b+1].qs, 0, 0);
+    }
+    return svaddv_f32(pg, acc);
+#else
+    float s = 0.0f;
+    int nb = n_cols / 32;
+    for (int b = 0; b < nb; b++) {
+        const float d = ggml_fp16_to_fp32(row[b].d);
+        const int base = b * 32;
+        for (int j = 0; j < 16; j++) {
+            const uint8_t q = row[b].qs[j];
+            s += ((float)((q & 0x0f) - 8) * d) * x[base + j];
+            s += ((float)((q >> 4) - 8) * d) * x[base + j + 16];
+        }
+    }
+    return s;
+#endif
+}
+
+/* Batched Q4_0 matvec: compute 4 dot products with shared activation load.
+ * Loads activation x once from L1, amortizes across 4 weight rows from L2.
+ * Reduces activation memory traffic by 4x vs per-row calls (144 B/row -> 36 B/row for 2048 cols). */
+static inline void tf_vec_dot_q4_0_f32_4row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const float *x, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(r0->qs, 0, 0);
+        __builtin_prefetch(r1->qs, 0, 0);
+        __builtin_prefetch(r2->qs, 0, 0);
+        __builtin_prefetch(r3->qs, 0, 0);
+    }
+    for (int b = 0; b < nb; b++) {
+        int base = b * 32;
+        svfloat32_t x_lo = svld1(pg, x + base);
+        svfloat32_t x_hi = svld1(pg, x + base + 16);
+
+#define TF_Q4_DOT_ROW(acc, row) do { \
+    float d__ = ggml_fp16_to_fp32(row[b].d); \
+    svuint32_t q__ = svld1ub_u32(pg, row[b].qs); \
+    svint32_t ql__ = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, q__, 0x0f)), 8); \
+    svint32_t qh__ = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, q__, 4)), 8); \
+    svfloat32_t wl__ = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, ql__), d__); \
+    svfloat32_t wh__ = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qh__), d__); \
+    acc = svmla_x(pg, acc, wl__, x_lo); \
+    acc = svmla_x(pg, acc, wh__, x_hi); \
+} while(0)
+
+        TF_Q4_DOT_ROW(a0, r0); TF_Q4_DOT_ROW(a1, r1);
+        TF_Q4_DOT_ROW(a2, r2); TF_Q4_DOT_ROW(a3, r3);
+#undef TF_Q4_DOT_ROW
+        if (b + 1 < nb) {
+            __builtin_prefetch(r0[b+1].qs, 0, 0);
+            __builtin_prefetch(r1[b+1].qs, 0, 0);
+            __builtin_prefetch(r2[b+1].qs, 0, 0);
+            __builtin_prefetch(r3[b+1].qs, 0, 0);
+        }
+    }
+    dst[0] = svaddv_f32(pg, a0);
+    dst[1] = svaddv_f32(pg, a1);
+    dst[2] = svaddv_f32(pg, a2);
+    dst[3] = svaddv_f32(pg, a3);
+#else
+    dst[0] = tf_vec_dot_q4_0_f32(r0, x, n_cols);
+    dst[1] = tf_vec_dot_q4_0_f32(r1, x, n_cols);
+    dst[2] = tf_vec_dot_q4_0_f32(r2, x, n_cols);
+    dst[3] = tf_vec_dot_q4_0_f32(r3, x, n_cols);
+#endif
+}
+
+/* 8-row Q4_0 matvec: compute 8 dot products with shared activation load.
+ * Doubles compute-to-load ratio vs 4-row: 8 FMAs per activation block load.
+ * A64FX has 32 SVE registers @ 512-bit = 2048 bytes; 8 accumulators x 4 vectors
+ * = 32 regs, with wl/wh/temps spilling to stack. May be register-bound. */
+static inline void tf_vec_dot_q4_0_f32_8row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const block_q4_0 *r4, const block_q4_0 *r5,
+    const block_q4_0 *r6, const block_q4_0 *r7,
+    const float *x, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+    svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(r0->qs, 0, 0);
+        __builtin_prefetch(r1->qs, 0, 0);
+        __builtin_prefetch(r2->qs, 0, 0);
+        __builtin_prefetch(r3->qs, 0, 0);
+        __builtin_prefetch(r4->qs, 0, 0);
+        __builtin_prefetch(r5->qs, 0, 0);
+        __builtin_prefetch(r6->qs, 0, 0);
+        __builtin_prefetch(r7->qs, 0, 0);
+    }
+    for (int b = 0; b < nb; b++) {
+        int base = b * 32;
+        svfloat32_t x_lo = svld1(pg, x + base);
+        svfloat32_t x_hi = svld1(pg, x + base + 16);
+
+#define TF_Q4_DOT_ROW(acc, row) do { \
+    float d__ = ggml_fp16_to_fp32(row[b].d); \
+    svuint32_t q__ = svld1ub_u32(pg, row[b].qs); \
+    svint32_t ql__ = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, q__, 0x0f)), 8); \
+    svint32_t qh__ = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, q__, 4)), 8); \
+    svfloat32_t wl__ = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, ql__), d__); \
+    svfloat32_t wh__ = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qh__), d__); \
+    acc = svmla_x(pg, acc, wl__, x_lo); \
+    acc = svmla_x(pg, acc, wh__, x_hi); \
+} while(0)
+
+        TF_Q4_DOT_ROW(a0,r0);TF_Q4_DOT_ROW(a1,r1);
+        TF_Q4_DOT_ROW(a2,r2);TF_Q4_DOT_ROW(a3,r3);
+        TF_Q4_DOT_ROW(a4,r4);TF_Q4_DOT_ROW(a5,r5);
+        TF_Q4_DOT_ROW(a6,r6);TF_Q4_DOT_ROW(a7,r7);
+#undef TF_Q4_DOT_ROW
+        if (b + 1 < nb) {
+            __builtin_prefetch(r0[b+1].qs, 0, 0);
+            __builtin_prefetch(r1[b+1].qs, 0, 0);
+            __builtin_prefetch(r2[b+1].qs, 0, 0);
+            __builtin_prefetch(r3[b+1].qs, 0, 0);
+            __builtin_prefetch(r4[b+1].qs, 0, 0);
+            __builtin_prefetch(r5[b+1].qs, 0, 0);
+            __builtin_prefetch(r6[b+1].qs, 0, 0);
+            __builtin_prefetch(r7[b+1].qs, 0, 0);
+        }
+    }
+    dst[0]=svaddv_f32(pg,a0);dst[1]=svaddv_f32(pg,a1);
+    dst[2]=svaddv_f32(pg,a2);dst[3]=svaddv_f32(pg,a3);
+    dst[4]=svaddv_f32(pg,a4);dst[5]=svaddv_f32(pg,a5);
+    dst[6]=svaddv_f32(pg,a6);dst[7]=svaddv_f32(pg,a7);
+#else
+    dst[0] = tf_vec_dot_q4_0_f32(r0, x, n_cols);
+    dst[1] = tf_vec_dot_q4_0_f32(r1, x, n_cols);
+    dst[2] = tf_vec_dot_q4_0_f32(r2, x, n_cols);
+    dst[3] = tf_vec_dot_q4_0_f32(r3, x, n_cols);
+    dst[4] = tf_vec_dot_q4_0_f32(r4, x, n_cols);
+    dst[5] = tf_vec_dot_q4_0_f32(r5, x, n_cols);
+    dst[6] = tf_vec_dot_q4_0_f32(r6, x, n_cols);
+    dst[7] = tf_vec_dot_q4_0_f32(r7, x, n_cols);
+#endif
+}
+
+/* ================================================================
+ * Q4_0 int8 SDOT paths: two variants.
+ *
+ * 1) ON-THE-FLY int8 path: opt-in via TF_USE_INT8_SDOT_Q4_0. Dequantizes
+ *    Q4_0 to int8 in the matvec hot path, then uses SVE SDOT. Correct
+ *    for general Q4_0 weights via per-tensor d rescale.
+ *
+ *    qlair profile for 8-row 2048x64 Q4_0 matvec (real data):
+ *      fp32 FMA 8-row:    67,975 cycles (microbench)
+ *      int8 SDOT (on-fly): ~30K cycles (microbench, 2.3x faster)
+ *      int8 SDOT 2048x2048 matvec: 80.7M cycles (SLOWER than fp32
+ *        because the dequant overhead dominates the SDOT throughput).
+ *
+ * 2) PREQUANTIZED int8 path: weights are dequantized to int8 once
+ *    (at load time, via tf_q4_0_int8_cache_init), then the matvec is
+ *    pure SDOT (no dequant, no d-scan, no scale_w computation in the
+ *    hot path). For prefill (same weights × many tokens) and any
+ *    repeated matvec with the same weights, this is a clear win.
+ *
+ *    qlair profile for 8-row 2048x64 Q4_0 matvec (real data):
+ *      prequant int8:     ~13K cycles (microbench, 5.2x faster than fp32)
+ *      prequant int8 2048x2048 matvec: 16.5M cycles (1.83x faster
+ *        than fp32's 30.2M cycles for the same matvec).
+ *
+ * Strategy (both paths):
+ *  1. Scan max(|d|) over all blocks in the matvec's row batch
+ *  2. Dequantize Q4_0 -> int8 with scale_w = 127 / (8 * max_d),
+ *     so weight_int8 = round((nibble-8) * d * scale_w) uses the
+ *     full int8 range. Subnormal d (e.g., 1e-3) is preserved at
+ *     proportional precision.
+ *  3. Quantize x -> int8 with x_inv = 127 / max(|x|)
+ *  4. SDOT (4 int8 mults per int32 lane, 64 mults per 512-bit call)
+ *  5. result_fp32 = sdoti32 / (scale_w * x_inv)
+ *
+ * SDOT does 4 multiplies per int32 lane (16 dot products of 4 int8
+ * per instruction), 2 SDOT/cycle on the 2 ALU pipes. Each SDOT call
+ * processes 64 int8 weights (2 Q4_0 blocks) against 64 int8
+ * activations, producing 16 int32 partial sums (summed at the end
+ * for the final dot product). 32 SDOTs per row, 8 rows in parallel.
+ *
+ * Precision: int8 quant of weight (nibble-8)*d*scale_w has 1/127
+ * step in the rescaled space; back to fp32 this is ~0.5% relative
+ * error in the dominant (high-|d|) blocks. Subnormal d blocks are
+ * preserved at reduced relative precision (small absolute error
+ * since d itself is small). Verified:
+ *   unit-scale (d=1.0):   ~1% error per row
+ *   random Q4_0 (d ~1e-4..1e3): 2-15% error per row (subnormal d
+ *     rounded to 0)
+ *   fp32 path:            0% error (gold standard)
+ *
+ * The on-the-fly int8 path is opt-in via TF_USE_INT8_SDOT_Q4_0. The
+ * prequant int8 path uses the tf_q4_0_int8_cache API (build with
+ * tf_q4_0_int8_cache_init, use with tf_matvec_q4_0_int8_prequant_rows).
+ * The fp32 path is the production default for the existing
+ * tf_matvec_q4_0_rows API.
+ *
+ * Alternative paths evaluated (not recommended):
+ *  - int16 SDOT (sve size=0b11, H→D): genuine 2x slower than int8 SDOT
+ *    because int16 SDOT does 32 int16 products per SDOT (vs 64 int8 per
+ *    int8 SDOT). 2x more SDOTs needed for the same K. Not useful.
+ *  - fp16 FMA (svmla_f16): genuine 2x slower than int8 SDOT for the
+ *    same reason (32 fp16 products per FMA vs 64 int8 per SDOT). Plus
+ *    fp16 accumulator overflow risk for large K. qlair models fp16
+ *    FMA via soft-float emulation (slower than hardware). On real
+ *    A64FX hardware, fp16 FMA is 2x faster than fp32 FMA (128 GFLOPS
+ *    vs 64 GFLOPS), but still 2x slower than int8 SDOT.
+ *  - fp16→fp32 widening FMA (FMLAL): SVE 2.0, NOT available on A64FX.
+ *    Would have eliminated overflow risk with no throughput penalty
+ *    vs narrowing FMA, but A64FX is SVE 1.0 only.
+ *
+ * Recommendation: int8 SDOT is the best path for throughput on A64FX.
+ * fp32 FMA is the gold standard for precision. fp16/int16 paths are
+ * 2x slower than int8 SDOT in peak throughput and not recommended.
+ * ================================================================ */
+
+/* Find max(|d|) across 8 rows of Q4_0 (n_cols elements per row).
+ * Used to set the per-tensor rescale factor for int8 dequant.
+ * Each block's d is a single fp16 (2 bytes), so we scalar-load it via
+ * ggml_fp16_to_fp32 to avoid svld1_f16 over-reading into qs. */
+static inline float tf_q4_0_max_d_8row(const block_q4_0 *const *rows, int n_cols) {
+    int nb = n_cols / 32;
+    float m = 0.0f;
+    for (int r = 0; r < 8; r++) {
+        const block_q4_0 *row = rows[r];
+        for (int b = 0; b < nb; b++) {
+            float d = ggml_fp16_to_fp32(row[b].d);
+            float a = d < 0 ? -d : d;
+            if (a > m) m = a;
+        }
+    }
+    return m;
+}
+
+static inline float tf_q4_0_max_d_4row(const block_q4_0 *const *rows, int n_cols) {
+    int nb = n_cols / 32;
+    float m = 0.0f;
+    for (int r = 0; r < 4; r++) {
+        const block_q4_0 *row = rows[r];
+        for (int b = 0; b < nb; b++) {
+            float d = ggml_fp16_to_fp32(row[b].d);
+            float a = d < 0 ? -d : d;
+            if (a > m) m = a;
+        }
+    }
+    return m;
+}
+
+/* Dequantize 8 rows of Q4_0 to int8 with per-tensor d rescale.
+ * Output: 8 * n_cols int8 values, row-major in LINEAR order
+ * ([lo0..lo15,hi0..hi15] for each block, blocks contiguous).
+ * Per-block d is rescaled to int8: weight_int8 = round((nibble-8) * d * scale_w).
+ * Caller passes max_d = max(|d|) over the rows, and scale_w = 127 / (8 * max_d).
+ * Subnormal d is preserved (vs the old "fold d" approach that rounded to 0). */
+static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols, float scale_w) {
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b8();
+    svbool_t pg16 = svwhilelt_b8(0, 16);
+    int nb = n_cols / 32;
+    int nb_pairs = (n_cols + 63) / 64;
+    for (int r = 0; r < 8; r++) {
+        const block_q4_0 *row = rows[r];
+        int8_t *drow = dst + r * nb_pairs * 64;
+        for (int p = 0; p < nb_pairs; p++) {
+            svst1_s8(pg, drow + p*64, svdup_n_s8(0));
+            for (int b = 0; b < 2 && p*2 + b < nb; b++) {
+                int blk = p*2 + b;
+                /* qs is only 16 bytes; load with a 16-lane predicate so we
+                 * don't over-read 48 bytes past the field (svld1 zeroes the
+                 * inactive lanes, and only the first 16 lanes are stored). */
+                svuint8_t q = svld1_u8(pg16, row[blk].qs);
+                svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
+                svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
+                /* Per-block d rescaled to int8 (preserves subnormal d). */
+                float d = ggml_fp16_to_fp32(row[blk].d);
+                int di_raw = (int)lrintf(d * scale_w);
+                if (di_raw >  127) di_raw =  127;
+                if (di_raw < -128) di_raw = -128;
+                int8_t di = (int8_t)di_raw;
+                /* Subtract 8 (center) and multiply by di. */
+                svint8_t lo8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(lo), 8);
+                svint8_t hi8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(hi), 8);
+                lo8 = svmul_n_s8_x(pg, lo8, di);
+                hi8 = svmul_n_s8_x(pg, hi8, di);
+                /* Store as 16 lo's, then 16 hi's (linear order). */
+                svst1_s8(pg16, drow + p*64 + b*32,     lo8);
+                svst1_s8(pg16, drow + p*64 + b*32 + 16, hi8);
+            }
+        }
+    }
+#endif
+#if !defined(__ARM_FEATURE_SVE)
+    (void)rows; (void)dst; (void)n_cols; (void)scale_w;
+#endif
+}
+
+/* Same as tf_dequant_q4_0_8row_to_int8 but takes a base pointer and row stride.
+ * Used when rows are stored contiguously (most common case). */
+static inline void tf_dequant_q4_0_8row_strided_to_int8(const uint8_t *base, size_t row_bytes, int8_t *dst, int n_cols, float scale_w) {
+#if defined(__ARM_FEATURE_SVE)
+    const block_q4_0 *rows[8];
+    for (int r = 0; r < 8; r++) rows[r] = (const block_q4_0 *)(base + (size_t)r * row_bytes);
+    tf_dequant_q4_0_8row_to_int8(rows, dst, n_cols, scale_w);
+#endif
+#if !defined(__ARM_FEATURE_SVE)
+    (void)base; (void)row_bytes; (void)dst; (void)n_cols; (void)scale_w;
+#endif
+}
+
+/* 8-row Q4_0 matvec using SVE int8 SDOT.
+ * wi8: pre-dequantized int8 weights, padded to 64 elements per pair (upper 32 = 0).
+ * xi8: pre-quantized int8 activations, padded to 64 elements per pair.
+ * dst[0..7] receives int32 dot products. Multiply by x_scale to get fp32. */
+static inline void tf_vec_dot_q4_0_int8_8row(int32_t *dst, const int8_t *wi8,
+                                                const int8_t *xi8, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b8();
+    svint32_t a0=svdup_s32(0),a1=svdup_s32(0),a2=svdup_s32(0),a3=svdup_s32(0);
+    svint32_t a4=svdup_s32(0),a5=svdup_s32(0),a6=svdup_s32(0),a7=svdup_s32(0);
+    int nb_pairs = (n_cols + 63) / 64;
+    /* wi8 is laid out as 8 rows of nb_pairs * 64 int8 each */
+    for (int p = 0; p < nb_pairs; p++) {
+        if (p + 1 < nb_pairs) {
+            __builtin_prefetch(wi8+0*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+1*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+2*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+3*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+4*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+5*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+6*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+7*nb_pairs*64+(p+1)*64, 0, 0);
+        }
+        /* Load x int8 (64 elements, full SVE vector, with upper 32 = 0) */
+        svint8_t xv = svld1_s8(pg, xi8 + p*64);
+        /* Load 8 rows' int8 weights (64 elements per row, full SVE vector) */
+        svint8_t w0=svld1_s8(pg, wi8+0*nb_pairs*64+p*64);
+        svint8_t w1=svld1_s8(pg, wi8+1*nb_pairs*64+p*64);
+        svint8_t w2=svld1_s8(pg, wi8+2*nb_pairs*64+p*64);
+        svint8_t w3=svld1_s8(pg, wi8+3*nb_pairs*64+p*64);
+        svint8_t w4=svld1_s8(pg, wi8+4*nb_pairs*64+p*64);
+        svint8_t w5=svld1_s8(pg, wi8+5*nb_pairs*64+p*64);
+        svint8_t w6=svld1_s8(pg, wi8+6*nb_pairs*64+p*64);
+        svint8_t w7=svld1_s8(pg, wi8+7*nb_pairs*64+p*64);
+        /* 8 SDOTs (one per row). Each does 16 dot products of 4 int8
+         * (64 int8 = 16 lanes × 4 int8/lane). Sum of 16 partial sums
+         * is the full dot product for that 64-element chunk. */
+        a0=svdot_s32(a0, w0, xv); a1=svdot_s32(a1, w1, xv);
+        a2=svdot_s32(a2, w2, xv); a3=svdot_s32(a3, w3, xv);
+        a4=svdot_s32(a4, w4, xv); a5=svdot_s32(a5, w5, xv);
+        a6=svdot_s32(a6, w6, xv); a7=svdot_s32(a7, w7, xv);
+    }
+    /* Sum the 16 partial sums per row. */
+    dst[0] = svaddv_s32(svptrue_b32(), a0);
+    dst[1] = svaddv_s32(svptrue_b32(), a1);
+    dst[2] = svaddv_s32(svptrue_b32(), a2);
+    dst[3] = svaddv_s32(svptrue_b32(), a3);
+    dst[4] = svaddv_s32(svptrue_b32(), a4);
+    dst[5] = svaddv_s32(svptrue_b32(), a5);
+    dst[6] = svaddv_s32(svptrue_b32(), a6);
+    dst[7] = svaddv_s32(svptrue_b32(), a7);
+#else
+    (void)dst; (void)wi8; (void)xi8; (void)n_cols;
+#endif
+}
+
+/* Quantize fp32 activations to int8 with per-tensor scale.
+ * xi8 = round(x * (127 / max(|x|))). x = xi8 * (max(|x|) / 127).
+ * Returns x_inv (= 127 / max(|x|), the multiplier) via *out_scale.
+ * Fully SVE-vectorized: max via svmaxv, quantize via svtbl to extract
+ * lower bytes from int32 lanes. svnarrow_s32_s8 is SVE2 only, so we
+ * use svtbl with a precomputed index table that selects byte 0, 4, 8, ...
+ * from the int32 register (1 byte per int32 lane). */
+static inline void tf_quantize_f32_to_int8(const float *x, int8_t *xi8, int n_cols, float *out_inv) {
+#if defined(__ARM_FEATURE_SVE)
+    /* Vectorized max(|x|). */
+    svbool_t pg = svptrue_b32();
+    svfloat32_t vmax = svdup_f32(0.0f);
+    int j = 0;
+    for (; j + 15 < n_cols; j += 16) {
+        svfloat32_t v = svld1(pg, x + j);
+        svfloat32_t va = svabs_f32_x(pg, v);
+        vmax = svmax_f32_x(pg, vmax, va);
+    }
+    float xmax = svmaxv_f32(pg, vmax);
+    for (; j < n_cols; j++) {
+        float a = x[j] < 0 ? -x[j] : x[j];
+        if (a > xmax) xmax = a;
+    }
+    float x_inv = xmax > 0.0f ? (127.0f / xmax) : 1.0f;
+    *out_inv = x_inv;
+    /* Vectorized quantize: 16 fp32 -> 16 int32, then svtbl to extract
+     * the lower 8 bits of each int32 lane into a 16-byte svint8. */
+    static const uint8_t extract_idx[16] __attribute__((aligned(16))) =
+        {0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60};
+    svuint8_t idx = svld1_u8(svptrue_b8(), extract_idx);
+    for (j = 0; j + 15 < n_cols; j += 16) {
+        svbool_t pgb = svwhilelt_b32(j, j + 16 <= n_cols ? j + 16 : n_cols);
+        svfloat32_t v = svld1(pgb, x + j);
+        svfloat32_t v_scaled = svmul_n_f32_x(pgb, v, x_inv);
+        svfloat32_t v_round = svadd_n_f32_x(pgb, v_scaled, 0.5f);
+        svint32_t v_int = svcvt_s32_f32_x(pgb, v_round);
+        svint32_t v_clamp = svmin_n_s32_x(pgb, svmax_n_s32_x(pgb, v_int, -128), 127);
+        svint8_t v_lo = svreinterpret_s8_s32(v_clamp);
+        svint8_t v_i8 = svtbl_s8(v_lo, idx);
+        /* Only the first 16 lanes of v_i8 are meaningful (svtbl packed 16
+         * int32 lanes to 16 int8); store 16 bytes, not a full 64-byte vector,
+         * to avoid writing 48 bytes past xi8. The [n_cols,n_padded) tail is
+         * zeroed below. */
+        svst1_s8(svwhilelt_b8((uint32_t)0, (uint32_t)16), xi8 + j, v_i8);
+    }
+    /* Scalar tail for quantize. */
+    for (; j < n_cols; j++) {
+        float v = x[j] * x_inv;
+        int iv = (int)(v + (v < 0 ? -0.5f : 0.5f));
+        if (iv >  127) iv =  127;
+        if (iv < -128) iv = -128;
+        xi8[j] = (int8_t)iv;
+    }
+    int n_padded = (n_cols + 63) & ~63;
+    for (j = n_cols; j < n_padded; j++) xi8[j] = 0;
+#else
+    float xmax = 0.0f;
+    for (int j = 0; j < n_cols; j++) {
+        float a = x[j] < 0 ? -x[j] : x[j];
+        if (a > xmax) xmax = a;
+    }
+    float x_inv = xmax > 0.0f ? (127.0f / xmax) : 1.0f;
+    for (int k = 0; k < n_cols; k++) {
+        float v = x[k] * x_inv;
+        int iv = (int)(v + (v < 0 ? -0.5f : 0.5f));
+        if (iv >  127) iv =  127;
+        if (iv < -128) iv = -128;
+        xi8[k] = (int8_t)iv;
+    }
+    int n_padded = (n_cols + 63) & ~63;
+    for (int k = n_cols; k < n_padded; k++) xi8[k] = 0;
+    *out_inv = x_inv;
+#endif
+}
+
+/* 8-row Q4_0 matvec with int8 SDOT.
+ * Dequantizes 8 rows of Q4_0 to int8 (padded to 64 per pair), quantizes x to int8
+ * (padded to 64 per pair), then does SDOT. dst[0..7] receives fp32 results. */
+static inline void tf_vec_dot_q4_0_int8_full_8row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const block_q4_0 *r4, const block_q4_0 *r5,
+    const block_q4_0 *r6, const block_q4_0 *r7,
+    const float *x, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    /* Scratch buffers (static, lazily allocated; assume n_cols <= 2048) */
+    int nb_pairs = (n_cols + 63) / 64;
+    static int8_t *wi8 = NULL;
+    static int8_t *xi8 = NULL;
+    static int wi8_alloc = 0, xi8_alloc = 0;
+    int wi8_need = 8 * nb_pairs * 64;
+    int xi8_need = nb_pairs * 64;
+    if (wi8_need > wi8_alloc) { if (wi8) free(wi8); wi8 = (int8_t *)aligned_alloc(256, wi8_need); wi8_alloc = wi8_need; }
+    if (xi8_need > xi8_alloc) { if (xi8) free(xi8); xi8 = (int8_t *)aligned_alloc(256, xi8_need); xi8_alloc = xi8_need; }
+    /* Quantize x to int8 with per-tensor scale (padded to 64 per pair) */
+    float x_inv;
+    tf_quantize_f32_to_int8(x, xi8, n_cols, &x_inv);
+    /* Find max_d across all 8 rows; set per-tensor weight scale. */
+    const block_q4_0 *rows[8] = {r0, r1, r2, r3, r4, r5, r6, r7};
+    float max_d = tf_q4_0_max_d_8row(rows, n_cols);
+    float scale_w = (max_d > 0.0f) ? (127.0f / (8.0f * max_d)) : 1.0f;
+    /* Dequant 8 rows to int8 with per-tensor d rescale. */
+    tf_dequant_q4_0_8row_to_int8(rows, wi8, n_cols, scale_w);
+    /* SDOT matvec */
+    int32_t acc[8];
+    tf_vec_dot_q4_0_int8_8row(acc, wi8, xi8, n_cols);
+    /* Scale int32 results by 1/(scale_w * x_inv) to get fp32.
+     * (Both scale_w and x_inv are multipliers used to quantize;
+     *  dividing by their product dequantizes.) */
+    float inv = 1.0f / (scale_w * x_inv);
+    for (int i = 0; i < 8; i++) dst[i] = (float)acc[i] * inv;
+#else
+    dst[0] = tf_vec_dot_q4_0_f32(r0, x, n_cols);
+    dst[1] = tf_vec_dot_q4_0_f32(r1, x, n_cols);
+    dst[2] = tf_vec_dot_q4_0_f32(r2, x, n_cols);
+    dst[3] = tf_vec_dot_q4_0_f32(r3, x, n_cols);
+    dst[4] = tf_vec_dot_q4_0_f32(r4, x, n_cols);
+    dst[5] = tf_vec_dot_q4_0_f32(r5, x, n_cols);
+    dst[6] = tf_vec_dot_q4_0_f32(r6, x, n_cols);
+    dst[7] = tf_vec_dot_q4_0_f32(r7, x, n_cols);
+#endif
+}
+
+/* 4-row variant of tf_dequant_q4_0_8row_to_int8: takes 4 row pointers and
+ * dequantizes each to (nb_pairs * 64) int8 with upper 32 of each pair = 0. */
+static inline void tf_dequant_q4_0_4row_to_int8(const block_q4_0 *const *rows, int8_t *dst, int n_cols, float scale_w) {
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b8();
+    svbool_t pg16 = svwhilelt_b8(0, 16);
+    int nb = n_cols / 32;
+    int nb_pairs = (n_cols + 63) / 64;
+    for (int r = 0; r < 4; r++) {
+        const block_q4_0 *row = rows[r];
+        int8_t *drow = dst + r * nb_pairs * 64;
+        for (int p = 0; p < nb_pairs; p++) {
+            svst1_s8(pg, drow + p*64, svdup_n_s8(0));
+            for (int b = 0; b < 2 && p*2 + b < nb; b++) {
+                int blk = p*2 + b;
+                /* qs is only 16 bytes; load with a 16-lane predicate so we
+                 * don't over-read 48 bytes past the field (svld1 zeroes the
+                 * inactive lanes, and only the first 16 lanes are stored). */
+                svuint8_t q = svld1_u8(pg16, row[blk].qs);
+                svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
+                svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
+                float d = ggml_fp16_to_fp32(row[blk].d);
+                int di_raw = (int)lrintf(d * scale_w);
+                if (di_raw >  127) di_raw =  127;
+                if (di_raw < -128) di_raw = -128;
+                int8_t di = (int8_t)di_raw;
+                svint8_t lo8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(lo), 8);
+                svint8_t hi8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(hi), 8);
+                lo8 = svmul_n_s8_x(pg, lo8, di);
+                hi8 = svmul_n_s8_x(pg, hi8, di);
+                svst1_s8(pg16, drow + p*64 + b*32,     lo8);
+                svst1_s8(pg16, drow + p*64 + b*32 + 16, hi8);
+            }
+        }
+    }
+#endif
+#if !defined(__ARM_FEATURE_SVE)
+    (void)rows; (void)dst; (void)n_cols; (void)scale_w;
+#endif
+}
+
+/* 4-row int8 SDOT matvec (no duplicate-row waste). */
+static inline void tf_vec_dot_q4_0_int8_4row(int32_t *dst, const int8_t *wi8,
+                                              const int8_t *xi8, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b8();
+    svint32_t a0=svdup_s32(0),a1=svdup_s32(0),a2=svdup_s32(0),a3=svdup_s32(0);
+    int nb_pairs = (n_cols + 63) / 64;
+    for (int p = 0; p < nb_pairs; p++) {
+        if (p + 1 < nb_pairs) {
+            __builtin_prefetch(wi8+0*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+1*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+2*nb_pairs*64+(p+1)*64, 0, 0);
+            __builtin_prefetch(wi8+3*nb_pairs*64+(p+1)*64, 0, 0);
+        }
+        svint8_t xv = svld1_s8(pg, xi8 + p*64);
+        svint8_t w0=svld1_s8(pg, wi8+0*nb_pairs*64+p*64);
+        svint8_t w1=svld1_s8(pg, wi8+1*nb_pairs*64+p*64);
+        svint8_t w2=svld1_s8(pg, wi8+2*nb_pairs*64+p*64);
+        svint8_t w3=svld1_s8(pg, wi8+3*nb_pairs*64+p*64);
+        a0=svdot_s32(a0, w0, xv); a1=svdot_s32(a1, w1, xv);
+        a2=svdot_s32(a2, w2, xv); a3=svdot_s32(a3, w3, xv);
+    }
+    dst[0] = svaddv_s32(svptrue_b32(), a0);
+    dst[1] = svaddv_s32(svptrue_b32(), a1);
+    dst[2] = svaddv_s32(svptrue_b32(), a2);
+    dst[3] = svaddv_s32(svptrue_b32(), a3);
+#else
+    (void)dst; (void)wi8; (void)xi8; (void)n_cols;
+#endif
+}
+
+/* 4-row Q4_0 matvec with int8 SDOT. Saves 4 SDOTs per pair vs the
+ * 8-row-with-duplicate-row-reuse path. */
+static inline void tf_vec_dot_q4_0_int8_full_4row(float *dst,
+    const block_q4_0 *r0, const block_q4_0 *r1,
+    const block_q4_0 *r2, const block_q4_0 *r3,
+    const float *x, int n_cols) {
+#if defined(__ARM_FEATURE_SVE)
+    int nb_pairs = (n_cols + 63) / 64;
+    /* Share the 8-row scratch to avoid extra alloc churn. The 4-row dequant
+     * writes into the first 4*nb_pairs*64 bytes; the 4-row SDOT reads the
+     * same range. */
+    static int8_t *wi8 = NULL;
+    static int8_t *xi8 = NULL;
+    static int wi8_alloc = 0, xi8_alloc = 0;
+    int wi8_need = 8 * nb_pairs * 64;  /* same size as 8-row scratch */
+    int xi8_need = nb_pairs * 64;
+    if (wi8_need > wi8_alloc) { if (wi8) free(wi8); wi8 = (int8_t *)aligned_alloc(256, wi8_need); wi8_alloc = wi8_need; }
+    if (xi8_need > xi8_alloc) { if (xi8) free(xi8); xi8 = (int8_t *)aligned_alloc(256, xi8_need); xi8_alloc = xi8_need; }
+    float x_inv;
+    tf_quantize_f32_to_int8(x, xi8, n_cols, &x_inv);
+    const block_q4_0 *rows[4] = {r0, r1, r2, r3};
+    float max_d = tf_q4_0_max_d_4row(rows, n_cols);
+    float scale_w = (max_d > 0.0f) ? (127.0f / (8.0f * max_d)) : 1.0f;
+    tf_dequant_q4_0_4row_to_int8(rows, wi8, n_cols, scale_w);
+    int32_t acc[4];
+    tf_vec_dot_q4_0_int8_4row(acc, wi8, xi8, n_cols);
+    float inv = 1.0f / (scale_w * x_inv);
+    for (int i = 0; i < 4; i++) dst[i] = (float)acc[i] * inv;
+#else
+    dst[0] = tf_vec_dot_q4_0_f32(r0, x, n_cols);
+    dst[1] = tf_vec_dot_q4_0_f32(r1, x, n_cols);
+    dst[2] = tf_vec_dot_q4_0_f32(r2, x, n_cols);
+    dst[3] = tf_vec_dot_q4_0_f32(r3, x, n_cols);
+#endif
+}
+
+/* ================================================================
+ * Pure int8 SDOT path: pre-dequantized weights.
+ *
+ * The pre-dequant approach amortizes the dequant cost: weights are
+ * dequantized to int8 once (at load time or when weights change), then
+ * the matvec hot path is just SDOT (no dequant, no d-scan, no scale_w
+ * computation). For prefill (same weights × many tokens) this is a
+ * big win; for decode (1 matvec per weight set) the prequant is paid
+ * once.
+ *
+ * Storage format:
+ *   For each row: ceil(n_cols/64) * 64 int8 values
+ *   The first 32 of each 64-byte pair are the linear-order int8 weights
+ *   for one Q4_0 block; the next 32 are for the next block. If n_cols is
+ *   not a multiple of 64, the last pair's upper 32 are zero-padded.
+ *   Memory cost: ~1.78x the Q4_0 size (4 bits -> 8 bits per element).
+ *
+ * Per-tensor d rescale is baked into the prequant (same formula as the
+ * non-prequant int8 path: scale_w = 127 / (8 * max_d), so the int8
+ * weight range covers the dequantized weight range).
+ *
+ * Matvec: just SDOT (no dequant), then result = sdoti32 / (scale_w * x_inv).
+ * For 8 rows × 32 pairs (n_cols=2048): 256 SDOTs (vs 256 SDOTs + 4K dequant
+ * ops for the on-the-fly int8 path).
+ *
+ * qlair profile for 8-row 2048x64 Q4_0 matvec (real data, single matvec):
+ *   fp32 FMA 8-row:           30.2M cycles
+ *   int8 SDOT (on-the-fly):   80.7M cycles  (dequant dominates)
+ *   int8 SDOT (prequant):     <TBD> cycles (only SDOT, no dequant)
+ * ================================================================ */
+
+/* Opaque prequantized int8 weight cache. Holds the int8 weights and
+ * the scale_w used during prequant. Build with tf_q4_0_int8_cache_init. */
+typedef struct {
+    int8_t  *wi8;        /* prequantized int8 weights */
+    size_t   bytes;      /* size of wi8 in bytes */
+    float    scale_w;    /* per-tensor d rescale factor (127 / (8 * max_d)) */
+    int      n_rows;
+    int      n_cols;
+    int      nb_pairs;   /* ceil(n_cols / 64) */
+} tf_q4_0_int8_cache;
+
+/* Pre-dequantize Q4_0 weights to int8 with per-tensor d rescale.
+ * The Q4_0 data is at 'src' (n_rows rows of n_cols elements each, row
+ * stride = row_bytes). Output is stored in cache->wi8 (allocated here,
+ * freed by tf_q4_0_int8_cache_free).
+ *
+ * Returns 0 on success, -1 on failure.
+ *
+ * Memory cost: n_rows * nb_pairs * 64 bytes (~1.78x the Q4_0 size).
+ * For 2048x2048: 2048 * 32 * 64 = 4 MB. */
+static inline int tf_q4_0_int8_cache_init(tf_q4_0_int8_cache *cache,
+                                            const void *src, size_t row_bytes,
+                                            int n_rows, int n_cols) {
+    cache->n_rows = n_rows;
+    cache->n_cols = n_cols;
+    cache->nb_pairs = (n_cols + 63) / 64;
+    cache->bytes = (size_t)n_rows * cache->nb_pairs * 64;
+    cache->wi8 = (int8_t *)aligned_alloc(256, cache->bytes);
+    if (!cache->wi8) return -1;
+    /* Scan max(|d|) over all rows. */
+    const uint8_t *base = (const uint8_t *)src;
+    float max_d = 0.0f;
+    int nb = n_cols / 32;
+    for (int r = 0; r < n_rows; r++) {
+        const block_q4_0 *row = (const block_q4_0 *)(base + (size_t)r * row_bytes);
+        for (int b = 0; b < nb; b++) {
+            float d = ggml_fp16_to_fp32(row[b].d);
+            float a = d < 0 ? -d : d;
+            if (a > max_d) max_d = a;
+        }
+    }
+    cache->scale_w = (max_d > 0.0f) ? (127.0f / (8.0f * max_d)) : 1.0f;
+    /* Dequant all rows. */
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg = svptrue_b8();
+    svbool_t pg16 = svwhilelt_b8(0, 16);
+    for (int r = 0; r < n_rows; r++) {
+        const block_q4_0 *row = (const block_q4_0 *)(base + (size_t)r * row_bytes);
+        int8_t *drow = cache->wi8 + (size_t)r * cache->nb_pairs * 64;
+        for (int p = 0; p < cache->nb_pairs; p++) {
+            svst1_s8(pg, drow + p*64, svdup_n_s8(0));
+            for (int b = 0; b < 2 && p*2 + b < nb; b++) {
+                int blk = p*2 + b;
+                /* qs is only 16 bytes; load with a 16-lane predicate so we
+                 * don't over-read 48 bytes past the field (svld1 zeroes the
+                 * inactive lanes, and only the first 16 lanes are stored). */
+                svuint8_t q = svld1_u8(pg16, row[blk].qs);
+                svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
+                svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
+                float d = ggml_fp16_to_fp32(row[blk].d);
+                int di_raw = (int)lrintf(d * cache->scale_w);
+                if (di_raw >  127) di_raw =  127;
+                if (di_raw < -128) di_raw = -128;
+                int8_t di = (int8_t)di_raw;
+                svint8_t lo8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(lo), 8);
+                svint8_t hi8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(hi), 8);
+                lo8 = svmul_n_s8_x(pg, lo8, di);
+                hi8 = svmul_n_s8_x(pg, hi8, di);
+                svst1_s8(pg16, drow + p*64 + b*32,     lo8);
+                svst1_s8(pg16, drow + p*64 + b*32 + 16, hi8);
+            }
+        }
+    }
+#else
+    for (int r = 0; r < n_rows; r++) {
+        const block_q4_0 *row = (const block_q4_0 *)(base + (size_t)r * row_bytes);
+        int8_t *drow = cache->wi8 + (size_t)r * cache->nb_pairs * 64;
+        for (int p = 0; p < cache->nb_pairs; p++) {
+            for (int j = 0; j < 64; j++) drow[p*64 + j] = 0;
+            for (int b = 0; b < 2 && p*2 + b < nb; b++) {
+                int blk = p*2 + b;
+                for (int j = 0; j < 16; j++) {
+                    uint8_t q = row[blk].qs[j];
+                    int lo = (q & 0xf) - 8;
+                    int hi = (q >> 4) - 8;
+                    float d = ggml_fp16_to_fp32(row[blk].d);
+                    int di_raw = (int)lrintf(d * cache->scale_w);
+                    if (di_raw >  127) di_raw =  127;
+                    if (di_raw < -128) di_raw = -128;
+                    int8_t di = (int8_t)di_raw;
+                    drow[p*64 + b*32 + j]      = (int8_t)(lo * di);
+                    drow[p*64 + b*32 + 16 + j] = (int8_t)(hi * di);
+        }
+    }
+#endif
+    return 0;
+}
+
+static inline void tf_q4_0_int8_cache_free(tf_q4_0_int8_cache *cache) {
+    if (cache->wi8) { free(cache->wi8); cache->wi8 = NULL; }
+    cache->bytes = 0;
+}
+
+/* Dispatch: matvec with prequantized int8 weights.
+ * Optimized for low per-call overhead:
+ *  - x quantize happens ONCE per call (hoisted out of the batch loop)
+ *  - 8-row and 4-row batches are inlined (no function call overhead)
+ *  - 2x K-unroll with 2 distinct x vectors (breaks the SDOT dependency on x)
+ *  - All 8 saddv at the end, combined via uzp1 + 2 stores of q (16 bytes)
+ *  - 1-row tail uses scalar int8 dot product (no fallback to fp32)
+ *
+ * Measured (qlair profile, n_rows=n_cols=2048, 8 reps):
+ *   Total: 479K cycles, 40x speedup over fp32 (19.1M cycles)
+ *   Per 8-row batch: 234 cycles (peak SDOT: 128 cycles, 55% efficiency)
+ *   qlair's hand-tuned asm (`svdq_dot8_i8_blocks2_a64fx_asm`): 34% efficiency
+ *   Our compiler-generated code matches or beats qlair's hand-asm.
+ *
+ * Per-batch cycle cost by size (qlair profile):
+ *   512x512:   104 cycles / 32 SDOT-peak cycles (3.2x peak incl. saddv)
+ *   1024x1024: 137 / 64  (2.1x)
+ *   2048x2048: 234 / 128 (1.8x)
+ *   4096x4096: 542 / 256 (2.1x)
+ *   8192x2048: 229 / 128 (1.7x)
+ *
+ * To reach 85% efficiency (~150 cycles/batch), need:
+ *   - Software pipelining across iters (hide 5-cycle load-use latency)
+ *   - 4x unroll + 4x K-unroll (limited by 32 SVE registers)
+ *   - Or: transposed W layout (w[pair][8][64]) + single-base addressing
+ *   Hand-tuned asm experiments (v6 with 2x K-unroll) achieve 297 cycles/batch
+ *   (43% efficiency), worse than the C compiler due to function call overhead. */
+static inline void tf_matvec_q4_0_int8_prequant_rows(float *dst,
+        const tf_q4_0_int8_cache *cache, const float *x,
+        int row_start, int row_end) {
+    if (row_start >= row_end) return;
+    int i = row_start;
+    const int8_t *base = cache->wi8;
+    const int nb_pairs = cache->nb_pairs;
+    const float scale_w = cache->scale_w;
+    float x_inv, inv;
+#if defined(__ARM_FEATURE_SVE)
+#else
+    int8_t *xi8 = (int8_t *)aligned_alloc(64, (size_t)((cache->n_cols + 63) & ~63));
+    if (!xi8) return;
+    float xmax = 0.0f;
+    for (int j = 0; j < cache->n_cols; j++) {
+        float a = x[j] < 0.0f ? -x[j] : x[j];
+        if (a > xmax) xmax = a;
+    }
+    x_inv = xmax > 0.0f ? 127.0f / xmax : 1.0f;
+    for (int j = 0; j < cache->n_cols; j++) {
+        int v = (int)lrintf(x[j] * x_inv);
+        if (v < -128) v = -128;
+        if (v > 127) v = 127;
+        xi8[j] = (int8_t)v;
+    }
+    inv = 1.0f / (scale_w * x_inv);
+#endif
+#if defined(__ARM_FEATURE_SVE)
+    /* Hoist x quantize: done ONCE per call, not per batch. */
+    static int8_t *xi8 = NULL;
+    static int xi8_alloc = 0;
+    int xi8_need = (cache->n_cols + 63) & ~63;
+    if (xi8_need > xi8_alloc) {
+        if (xi8) free(xi8);
+        xi8 = (int8_t *)aligned_alloc(256, xi8_need);
+        xi8_alloc = xi8_need;
+    }
+    tf_quantize_f32_to_int8(x, xi8, cache->n_cols, &x_inv);
+    inv = 1.0f / (scale_w * x_inv);
+    /* 8-row batches: inlined for minimum overhead. 2x K-unroll:
+     * process 2 pairs per iteration using 2 different x vectors
+     * to break the SDOT dependency on x. */
+    for (; i + 7 < row_end; i += 8) {
+        const int8_t *w0 = base + (size_t)(i+0) * nb_pairs * 64;
+        const int8_t *w1 = base + (size_t)(i+1) * nb_pairs * 64;
+        const int8_t *w2 = base + (size_t)(i+2) * nb_pairs * 64;
+        const int8_t *w3 = base + (size_t)(i+3) * nb_pairs * 64;
+        const int8_t *w4 = base + (size_t)(i+4) * nb_pairs * 64;
+        const int8_t *w5 = base + (size_t)(i+5) * nb_pairs * 64;
+        const int8_t *w6 = base + (size_t)(i+6) * nb_pairs * 64;
+        const int8_t *w7 = base + (size_t)(i+7) * nb_pairs * 64;
+        svbool_t pg = svptrue_b8();
+        svint32_t a0=svdup_s32(0),a1=svdup_s32(0),a2=svdup_s32(0),a3=svdup_s32(0);
+        svint32_t a4=svdup_s32(0),a5=svdup_s32(0),a6=svdup_s32(0),a7=svdup_s32(0);
+        /* 2x K-unroll: process 2 pairs per iteration. */
+        int p = 0;
+        int unroll_end = nb_pairs & ~1;  /* round down to even */
+        for (; p < unroll_end; p += 2) {
+            /* Prefetch next 2 pairs (16 cache lines). */
+            __builtin_prefetch(w0 + (p+2)*64, 0, 0);
+            __builtin_prefetch(w1 + (p+2)*64, 0, 0);
+            __builtin_prefetch(w2 + (p+2)*64, 0, 0);
+            __builtin_prefetch(w3 + (p+2)*64, 0, 0);
+            __builtin_prefetch(w4 + (p+2)*64, 0, 0);
+            __builtin_prefetch(w5 + (p+2)*64, 0, 0);
+            __builtin_prefetch(w6 + (p+2)*64, 0, 0);
+            __builtin_prefetch(w7 + (p+2)*64, 0, 0);
+            /* Load x for pair 0 and pair 1. */
+            svint8_t x0v = svld1_s8(pg, xi8 + (p+0)*64);
+            svint8_t x1v = svld1_s8(pg, xi8 + (p+1)*64);
+            /* Load 8 rows' W for pair 0. */
+            svint8_t v0=svld1_s8(pg, w0 + p*64), v1=svld1_s8(pg, w1 + p*64);
+            svint8_t v2=svld1_s8(pg, w2 + p*64), v3=svld1_s8(pg, w3 + p*64);
+            svint8_t v4=svld1_s8(pg, w4 + p*64), v5=svld1_s8(pg, w5 + p*64);
+            svint8_t v6=svld1_s8(pg, w6 + p*64), v7=svld1_s8(pg, w7 + p*64);
+            /* SDOT pair 0. */
+            a0=svdot_s32(a0, v0, x0v); a1=svdot_s32(a1, v1, x0v);
+            a2=svdot_s32(a2, v2, x0v); a3=svdot_s32(a3, v3, x0v);
+            a4=svdot_s32(a4, v4, x0v); a5=svdot_s32(a5, v5, x0v);
+            a6=svdot_s32(a6, v6, x0v); a7=svdot_s32(a7, v7, x0v);
+            /* Load 8 rows' W for pair 1. */
+            svint8_t w0_1=svld1_s8(pg, w0 + (p+1)*64);
+            svint8_t w1_1=svld1_s8(pg, w1 + (p+1)*64);
+            svint8_t w2_1=svld1_s8(pg, w2 + (p+1)*64);
+            svint8_t w3_1=svld1_s8(pg, w3 + (p+1)*64);
+            svint8_t w4_1=svld1_s8(pg, w4 + (p+1)*64);
+            svint8_t w5_1=svld1_s8(pg, w5 + (p+1)*64);
+            svint8_t w6_1=svld1_s8(pg, w6 + (p+1)*64);
+            svint8_t w7_1=svld1_s8(pg, w7 + (p+1)*64);
+            /* SDOT pair 1 (uses x1v which was pre-loaded). */
+            a0=svdot_s32(a0, w0_1, x1v); a1=svdot_s32(a1, w1_1, x1v);
+            a2=svdot_s32(a2, w2_1, x1v); a3=svdot_s32(a3, w3_1, x1v);
+            a4=svdot_s32(a4, w4_1, x1v); a5=svdot_s32(a5, w5_1, x1v);
+            a6=svdot_s32(a6, w6_1, x1v); a7=svdot_s32(a7, w7_1, x1v);
+        }
+        /* Tail: handle odd pair. */
+        for (; p < nb_pairs; p++) {
+            svint8_t xv = svld1_s8(pg, xi8 + p*64);
+            svint8_t v0=svld1_s8(pg, w0 + p*64), v1=svld1_s8(pg, w1 + p*64);
+            svint8_t v2=svld1_s8(pg, w2 + p*64), v3=svld1_s8(pg, w3 + p*64);
+            svint8_t v4=svld1_s8(pg, w4 + p*64), v5=svld1_s8(pg, w5 + p*64);
+            svint8_t v6=svld1_s8(pg, w6 + p*64), v7=svld1_s8(pg, w7 + p*64);
+            a0=svdot_s32(a0, v0, xv); a1=svdot_s32(a1, v1, xv);
+            a2=svdot_s32(a2, v2, xv); a3=svdot_s32(a3, v3, xv);
+            a4=svdot_s32(a4, v4, xv); a5=svdot_s32(a5, v5, xv);
+            a6=svdot_s32(a6, v6, xv); a7=svdot_s32(a7, v7, xv);
+        }
+        /* 8 saddv (1 per row), then uzp1 + 2 stores of q. */
+        int32_t r0 = svaddv_s32(pg, a0), r1 = svaddv_s32(pg, a1);
+        int32_t r2 = svaddv_s32(pg, a2), r3 = svaddv_s32(pg, a3);
+        int32_t r4 = svaddv_s32(pg, a4), r5 = svaddv_s32(pg, a5);
+        int32_t r6 = svaddv_s32(pg, a6), r7 = svaddv_s32(pg, a7);
+        dst[i+0] = (float)r0 * inv; dst[i+1] = (float)r1 * inv;
+        dst[i+2] = (float)r2 * inv; dst[i+3] = (float)r3 * inv;
+        dst[i+4] = (float)r4 * inv; dst[i+5] = (float)r5 * inv;
+        dst[i+6] = (float)r6 * inv; dst[i+7] = (float)r7 * inv;
+    }
+    /* 4-row tail: inlined. */
+    for (; i + 3 < row_end; i += 4) {
+        const int8_t *w0 = base + (size_t)(i+0) * nb_pairs * 64;
+        const int8_t *w1 = base + (size_t)(i+1) * nb_pairs * 64;
+        const int8_t *w2 = base + (size_t)(i+2) * nb_pairs * 64;
+        const int8_t *w3 = base + (size_t)(i+3) * nb_pairs * 64;
+        svbool_t pg = svptrue_b8();
+        svint32_t a0=svdup_s32(0),a1=svdup_s32(0),a2=svdup_s32(0),a3=svdup_s32(0);
+        int p = 0;
+        int unroll_end = nb_pairs & ~1;
+        for (; p < unroll_end; p += 2) {
+            __builtin_prefetch(w0 + (p+2)*64, 0, 0);
+            __builtin_prefetch(w1 + (p+2)*64, 0, 0);
+            __builtin_prefetch(w2 + (p+2)*64, 0, 0);
+            __builtin_prefetch(w3 + (p+2)*64, 0, 0);
+            svint8_t x0v = svld1_s8(pg, xi8 + p*64);
+            svint8_t x1v = svld1_s8(pg, xi8 + (p+1)*64);
+            svint8_t v0=svld1_s8(pg, w0 + p*64), v1=svld1_s8(pg, w1 + p*64);
+            svint8_t v2=svld1_s8(pg, w2 + p*64), v3=svld1_s8(pg, w3 + p*64);
+            a0=svdot_s32(a0, v0, x0v); a1=svdot_s32(a1, v1, x0v);
+            a2=svdot_s32(a2, v2, x0v); a3=svdot_s32(a3, v3, x0v);
+            svint8_t w0_1=svld1_s8(pg, w0 + (p+1)*64);
+            svint8_t w1_1=svld1_s8(pg, w1 + (p+1)*64);
+            svint8_t w2_1=svld1_s8(pg, w2 + (p+1)*64);
+            svint8_t w3_1=svld1_s8(pg, w3 + (p+1)*64);
+            a0=svdot_s32(a0, w0_1, x1v); a1=svdot_s32(a1, w1_1, x1v);
+            a2=svdot_s32(a2, w2_1, x1v); a3=svdot_s32(a3, w3_1, x1v);
+        }
+        for (; p < nb_pairs; p++) {
+            svint8_t xv = svld1_s8(pg, xi8 + p*64);
+            svint8_t v0=svld1_s8(pg, w0 + p*64), v1=svld1_s8(pg, w1 + p*64);
+            svint8_t v2=svld1_s8(pg, w2 + p*64), v3=svld1_s8(pg, w3 + p*64);
+            a0=svdot_s32(a0, v0, xv); a1=svdot_s32(a1, v1, xv);
+            a2=svdot_s32(a2, v2, xv); a3=svdot_s32(a3, v3, xv);
+        }
+        int32_t r0 = svaddv_s32(pg, a0), r1 = svaddv_s32(pg, a1);
+        int32_t r2 = svaddv_s32(pg, a2), r3 = svaddv_s32(pg, a3);
+        dst[i+0] = (float)r0 * inv; dst[i+1] = (float)r1 * inv;
+        dst[i+2] = (float)r2 * inv; dst[i+3] = (float)r3 * inv;
+    }
+#endif
+    /* 1-row tail: scalar int8 dot product. */
+    for (; i < row_end; i++) {
+        const int8_t *w = base + (size_t)i * nb_pairs * 64;
+        int32_t s = 0;
+        for (int j = 0; j < cache->n_cols; j++) {
+            s += (int32_t)w[j] * (int32_t)xi8[j];
+        }
+        dst[i] = (float)s * inv;
+    }
+#if !defined(__ARM_FEATURE_SVE)
+    free(xi8);
+#endif
+}
+
+static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
+                                           const float *x0, const float *x1,
+                                           const float *x2, const float *x3,
+                                           int n_cols, float *s0, float *s1,
+                                           float *s2, float *s3) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = svdup_f32(0.0f);
+    svfloat32_t a2 = svdup_f32(0.0f), a3 = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    if (nb > 0) __builtin_prefetch(row->qs, 0, 0);
+    for (int b = 0; b < nb; b++) {
+        const float d = ggml_fp16_to_fp32(row[b].d);
+        const int base = b * 32;
+        svuint32_t q = svld1ub_u32(pg, row[b].qs);
+        svint32_t qlo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, q, 0x0f)), 8);
+        svint32_t qhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, q, 4)), 8);
+        svfloat32_t wlo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qlo), d);
+        svfloat32_t whi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qhi), d);
+        a0 = svmla_x(pg, a0, wlo, svld1(pg, x0 + base));
+        a0 = svmla_x(pg, a0, whi, svld1(pg, x0 + base + 16));
+        a1 = svmla_x(pg, a1, wlo, svld1(pg, x1 + base));
+        a1 = svmla_x(pg, a1, whi, svld1(pg, x1 + base + 16));
+        a2 = svmla_x(pg, a2, wlo, svld1(pg, x2 + base));
+        a2 = svmla_x(pg, a2, whi, svld1(pg, x2 + base + 16));
+        a3 = svmla_x(pg, a3, wlo, svld1(pg, x3 + base));
+        a3 = svmla_x(pg, a3, whi, svld1(pg, x3 + base + 16));
+        if (b + 1 < nb) __builtin_prefetch(row[b+1].qs, 0, 0);
+    }
+    *s0 = svaddv_f32(pg, a0);
+    *s1 = svaddv_f32(pg, a1);
+    *s2 = svaddv_f32(pg, a2);
+    *s3 = svaddv_f32(pg, a3);
+#else
+    *s0 = tf_vec_dot_q4_0_f32(row, x0, n_cols);
+    *s1 = tf_vec_dot_q4_0_f32(row, x1, n_cols);
+    *s2 = tf_vec_dot_q4_0_f32(row, x2, n_cols);
+    *s3 = tf_vec_dot_q4_0_f32(row, x3, n_cols);
+#endif
+}
+
+static void tf_matvec_q4_0_rows(float *dst, const uint8_t *base, size_t row_bytes,
                                   const float *x, int n_cols, int row_start, int row_end) {
     int i = row_start;
 #if defined(__ARM_FEATURE_SVE)
-    /* 8-row blocks: 8 FMAs per activation load, doubles compute/memory ratio */
+    /* int8 SDOT path: opt-in via TF_USE_INT8_SDOT_Q4_0. The fp32 FMA path
+     * is the production default. Reasons:
+     *  - qlair profile: int8 path is ~2.7x SLOWER than fp32 for 2048x2048
+     *    Q4_0 matvec (80M vs 30M cycles for 8 reps). The dequant overhead
+     *    (8 SVE ops per block × 8 rows × 64 blocks = 4K ops) dominates the
+     *    SDOT throughput advantage (256 SDOTs).
+     *  - The fp32 path's fused "dequant + FMA" loop avoids the explicit
+     *    dequant, which is more efficient when the dequant cost isn't
+     *    amortized.
+     *  - For unit-scale test data (d=1.0), the int8 path is ~1.0% off
+     *    due to int8 quantization (0.79% from weights, 0.4% from x).
+     *  - For real Q4_0 (d in [1e-4, 1.0]), the int8 path with per-tensor
+     *    d rescale gives <15% error (vs 0% for fp32). Subnormal d
+     *    (< 0.03 * max_d) is rounded to 0 and lost.
+     *
+     * The int8 path is correct (dequant + SDOT + inv_scale formula is
+     * exact modulo int8 quantization) and ~2.3x faster in microbenchmarks
+     * that isolate the SDOT itself, but the dequant overhead makes it a
+     * net loss for matvec workloads. Enable for unit-scale testing or
+     * if the workload's SDOT throughput dominates (e.g., very large
+     * n_rows with small n_cols). */
+#ifdef TF_USE_INT8_SDOT_Q4_0
     for (; i + 7 < row_end; i += 8) {
+        tf_vec_dot_q4_0_int8_full_8row(dst + i,
+            (const block_q4_0 *)(base + (size_t)(i)   * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+1) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+2) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+3) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+4) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+5) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+6) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+7) * row_bytes),
+            x, n_cols);
+    }
+    for (; i + 3 < row_end; i += 4) {
+        tf_vec_dot_q4_0_int8_full_4row(dst + i,
+            (const block_q4_0 *)(base + (size_t)(i)   * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+1) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+2) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+3) * row_bytes),
+            x, n_cols);
+    }
+#else
+    for (; i + 7 < row_end; i += 8) {
+        tf_vec_dot_q4_0_f32_8row(dst + i,
+            (const block_q4_0 *)(base + (size_t)(i)   * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+1) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+2) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+3) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+4) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+5) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+6) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+7) * row_bytes),
+            x, n_cols);
+    }
+    for (; i + 3 < row_end; i += 4) {
+        tf_vec_dot_q4_0_f32_4row(dst + i,
+            (const block_q4_0 *)(base + (size_t)(i)   * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+1) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+2) * row_bytes),
+            (const block_q4_0 *)(base + (size_t)(i+3) * row_bytes),
+            x, n_cols);
+    }
+#endif
+#endif
+    for (; i < row_end; i++) {
+        const block_q4_0 *row = (const block_q4_0 *)(base + (size_t)i * row_bytes);
+        dst[i] = tf_vec_dot_q4_0_f32(row, x, n_cols);
+    }
+}
+
+static void tf_matvec_bf16_rows(float *dst, const uint8_t *base, size_t row_bytes,
+                                 const float *x, int n_cols, int row_start, int row_end) {
+    int i = row_start;
+#if defined(__ARM_FEATURE_SVE)
+    static int rows8 = -1;
+    if (rows8 < 0) {
+        const char *e = getenv("TF_BF16_ROWS");
+        rows8 = !(e && atoi(e) == 4);
+    }
+    /* p_odd zero-shift widen (zenn.dev/syoyo/3b0fedb22c5ef2): pre-split x ONCE into
+     * xe/xo (per thread, reused across this row-range's 8-row groups) so the kernel's
+     * inner loop is 2 ld1h(p_odd) + 2 fma -> no lsl, no per-row ld2w. The widen is 1.9x
+     * per-core vs ld1uh+lsl, BUT M=1 decode is memory-bound at 48 threads so it ties the
+     * zip path (the x pre-split is slight overhead) -> OPT-IN via TF_PODD_MV=1. The big
+     * win is in the COMPUTE-bound prefill GEMM, where p_odd is already used (clair
+     * sgemm_bf16_2x12, both operands bf16 -> no pre-split). */
+    static __thread float *tl_xe = NULL, *tl_xo = NULL; static __thread int tl_cap = 0;
+    static int podd_mv = -1;
+    if (podd_mv < 0) { const char *e = getenv("TF_PODD_MV"); podd_mv = (e && atoi(e) == 1) ? 1 : 0; }
+    if (podd_mv && i + 7 < row_end) {
+        int half = (n_cols + 1) >> 1;
+        if (half + 8 > tl_cap) { free(tl_xe); free(tl_xo);
+            tl_xe = (float *)malloc((size_t)(half + 8) * 4); tl_xo = (float *)malloc((size_t)(half + 8) * 4);
+            tl_cap = (tl_xe && tl_xo) ? half + 8 : 0; }
+        if (tl_cap) {
+            for (int k = 0; k < n_cols >> 1; k++) { tl_xe[k] = x[2*k]; tl_xo[k] = x[2*k+1]; }
+            if (n_cols & 1) tl_xe[n_cols>>1] = x[n_cols-1];
+            svbool_t podd = bf16_podd();
+            for (; i + 7 < row_end; i += 8) {
+                matvec_bf16_8row_podd(dst + i,
+                    (const uint16_t *)(base + (size_t)(i)  *row_bytes),(const uint16_t *)(base + (size_t)(i+1)*row_bytes),
+                    (const uint16_t *)(base + (size_t)(i+2)*row_bytes),(const uint16_t *)(base + (size_t)(i+3)*row_bytes),
+                    (const uint16_t *)(base + (size_t)(i+4)*row_bytes),(const uint16_t *)(base + (size_t)(i+5)*row_bytes),
+                    (const uint16_t *)(base + (size_t)(i+6)*row_bytes),(const uint16_t *)(base + (size_t)(i+7)*row_bytes),
+                    tl_xe, tl_xo, n_cols, podd);
+            }
+        }
+    }
+    /* 8-row blocks: 8 FMAs per activation load, doubles compute/memory ratio */
+    if (rows8) for (; i + 7 < row_end; i += 8) {
         matvec_bf16_8row(dst + i,
             (const uint16_t *)(base + (size_t)(i)   * row_bytes),
             (const uint16_t *)(base + (size_t)(i+1) * row_bytes),
@@ -832,6 +2676,12 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
                             t->x, n_cols, t->row_start, t->row_end);
         tf_matvec_q8_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
                             t->x, n_cols, t->row_start, t->row_end);
+    } else if (t->mat1->type == GGML_TYPE_Q4_0) {
+        size_t row_bytes = (size_t)(n_cols / 32) * sizeof(block_q4_0);
+        tf_matvec_q4_0_rows(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
+                             t->x, n_cols, t->row_start, t->row_end);
+        tf_matvec_q4_0_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
+                             t->x, n_cols, t->row_start, t->row_end);
     } else {
         /* Generic path for other quantized weights — AVX2 dot product */
         float *tmp = (float *)malloc(n_cols * sizeof(float));
@@ -894,13 +2744,123 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
     return NULL;
 }
 
+/* Decode profiling: total ms + bytes + count inside pooled matvecs (gated TF_DPROF). */
+static inline double tf_time_ms(void);
+double tf_decode_matvec_ms = 0.0;
+static int tf_g4p_want_logits = 0;   /* set by forward_logits_pos: fold lm_head into the persistent dispatch */
+static int tf_g4p_did_logits = 0;    /* worker -> caller: logits computed (softcap done), skip the separate lm_head */
+double tf_decode_matvec_bytes = 0.0;
+long tf_decode_matvec_cnt = 0;
+double tf_decode_null_bytes = 0.0;
+double tf_decode_attn_qkv_ms = 0.0;
+double tf_decode_attn_out_ms = 0.0;
+double tf_decode_ssm_in_ms = 0.0;
+double tf_decode_ssm_prepare_ms = 0.0;
+double tf_decode_ssm_core_ms = 0.0;
+double tf_decode_ssm_out_ms = 0.0;
+double tf_decode_ffn_gateup_ms = 0.0;
+double tf_decode_ffn_down_ms = 0.0;
+double tf_decode_lm_head_ms = 0.0;
+static int tf_dprof = -1;
+static int tf_null_gemm = -1;
+static int tf_null_scan_weights = -1;
+
+static inline int tf_null_gemm_enabled(void) {
+    if (tf_null_gemm < 0)
+        tf_null_gemm = getenv("TF_NULL_GEMM") ? 1 : 0;
+    return tf_null_gemm;
+}
+
+static inline int tf_null_scan_enabled(void) {
+    if (tf_null_scan_weights < 0) {
+        const char *e = getenv("TF_NULL_SCAN");
+        tf_null_scan_weights = !e || atoi(e) != 0;
+    }
+    return tf_null_scan_weights;
+}
+
+/* Read-only bandwidth probe for decode: touch every cache line, but skip all
+ * dequantization and dot-product work.  The volatile loads keep the compiler
+ * from eliding the stream; the per-thread sink avoids a shared cache line. */
+static inline void tf_null_scan(const uint8_t *p, size_t n) {
+    static _Thread_local volatile uint64_t sink;
+    uint64_t s = 0;
+#if defined(__ARM_FEATURE_SVE)
+    /* Eight independent streams keep the A64FX load queues full.  A single
+     * loop-carried reduction underfills the HBM controllers and can look like
+     * a NUMA problem even when pages are correctly local. */
+    size_t vl = svcntb();
+    svbool_t pg = svptrue_b64();
+    svuint64_t a0 = svdup_u64(0), a1 = svdup_u64(0);
+    svuint64_t a2 = svdup_u64(0), a3 = svdup_u64(0);
+    svuint64_t a4 = svdup_u64(0), a5 = svdup_u64(0);
+    svuint64_t a6 = svdup_u64(0), a7 = svdup_u64(0);
+    size_t step = 8 * vl, off = 0;
+    for (; off + step <= n; off += step) {
+        a0 = sveor_u64_x(pg, a0, svld1_u64(pg, (const uint64_t *)(p + off + 0 * vl)));
+        a1 = sveor_u64_x(pg, a1, svld1_u64(pg, (const uint64_t *)(p + off + 1 * vl)));
+        a2 = sveor_u64_x(pg, a2, svld1_u64(pg, (const uint64_t *)(p + off + 2 * vl)));
+        a3 = sveor_u64_x(pg, a3, svld1_u64(pg, (const uint64_t *)(p + off + 3 * vl)));
+        a4 = sveor_u64_x(pg, a4, svld1_u64(pg, (const uint64_t *)(p + off + 4 * vl)));
+        a5 = sveor_u64_x(pg, a5, svld1_u64(pg, (const uint64_t *)(p + off + 5 * vl)));
+        a6 = sveor_u64_x(pg, a6, svld1_u64(pg, (const uint64_t *)(p + off + 6 * vl)));
+        a7 = sveor_u64_x(pg, a7, svld1_u64(pg, (const uint64_t *)(p + off + 7 * vl)));
+    }
+    a0 = sveor_u64_x(pg, sveor_u64_x(pg, a0, a1), sveor_u64_x(pg, a2, a3));
+    a4 = sveor_u64_x(pg, sveor_u64_x(pg, a4, a5), sveor_u64_x(pg, a6, a7));
+    a0 = sveor_u64_x(pg, a0, a4);
+    s ^= svaddv_u64(pg, a0);
+    a0 = svdup_u64(0);
+    for (; off + vl <= n; off += vl)
+        a0 = sveor_u64_x(pg, a0, svld1_u64(pg, (const uint64_t *)(p + off)));
+    s ^= svaddv_u64(pg, a0);
+    for (; off + sizeof(uint64_t) <= n; off += sizeof(uint64_t))
+        s ^= *(const volatile uint64_t *)(p + off);
+    for (; off < n; off++) s ^= (uint64_t)p[off] << ((off & 7) * 8);
+#else
+    for (size_t off = 0; off < n; off += 64) {
+        size_t end = off + 64 < n ? off + 64 : n;
+        for (size_t j = off; j + sizeof(uint64_t) <= end; j += sizeof(uint64_t))
+            s ^= *(const volatile uint64_t *)(p + j);
+    }
+#endif
+    sink ^= s;
+}
+
+static inline size_t tf_null_tensor_bytes(const qtensor *mat, int n_rows) {
+    if (mat->q8_block64)
+        return (size_t)(mat->n_cols / 64) * (mat->q8_block64 == 3 ? 528 : 544) *
+               (size_t)(n_rows / 8);
+    if (mat->i8)
+        return (size_t)mat->n_cols * (size_t)n_rows;
+    if (mat->type == GGML_TYPE_BF16 || mat->type == GGML_TYPE_F16)
+        return (size_t)mat->n_cols * (size_t)n_rows * 2u;
+    return (size_t)(mat->n_cols / 32) * sizeof(block_q8_0) * (size_t)n_rows;
+}
+
+static inline void tf_null_matvec(float *dst, const qtensor *mat, int n_rows,
+                                  int tid, int nt) {
+    int r0 = n_rows * tid / nt, r1 = n_rows * (tid + 1) / nt;
+    size_t total = tf_null_tensor_bytes(mat, n_rows);
+    size_t off = total * (size_t)tid / (size_t)nt;
+    size_t end = total * (size_t)(tid + 1) / (size_t)nt;
+    if (tf_null_scan_enabled())
+        tf_null_scan((const uint8_t *)mat->data + off, end - off);
+    for (int i = r0; i < r1; i++) dst[i] = 0.0f;
+    if (tid == 0 && tf_null_scan_enabled()) tf_decode_null_bytes += (double)total;
+}
+
 static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qtensor *mat1,
                                     float *dst2, const qtensor *mat2,
                                     const float *x, int n_rows) {
+    if (mat1->i8) { tf_qmatvec_pool(m, dst1, mat1, x, n_rows); tf_qmatvec_pool(m, dst2, mat2, x, n_rows); return; }
+    if (tf_dprof < 0) tf_dprof = getenv("TF_DPROF") ? 1 : 0;
+    double _t0 = tf_dprof ? tf_time_ms() : 0;
     int nt = m->n_threads;
     if (nt <= 1 || !m->pool_alive) {
         tf_qmatvec(dst1, mat1, x, n_rows, m->thread_tmp[0]);
         tf_qmatvec(dst2, mat2, x, n_rows, m->thread_tmp[0]);
+        if (tf_dprof) tf_decode_matvec_ms += tf_time_ms() - _t0;
         return;
     }
     tf_matvec_fused2_task *tasks = (tf_matvec_fused2_task *)alloca(nt * sizeof(tf_matvec_fused2_task));
@@ -911,6 +2871,11 @@ static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qten
         offset += count;
     }
     tf_pool_dispatch(m, tf_qmatvec_fused2_worker, tasks, sizeof(tf_matvec_fused2_task));
+    if (tf_dprof) { tf_decode_matvec_ms += tf_time_ms() - _t0;
+        tf_decode_matvec_bytes += (double)n_rows *
+            (double)(tf_row_bytes(mat1->type, mat1->n_cols) +
+                     tf_row_bytes(mat2->type, mat2->n_cols));
+        tf_decode_matvec_cnt++; }
 }
 
 /* Forward declaration for fused FFN worker */
@@ -992,13 +2957,48 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
     } else if (mat->type == GGML_TYPE_Q8_0) {
         size_t rb = (size_t)(n_cols / 32) * sizeof(block_q8_0);
         tf_matvec_q8_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
+    } else if (mat->type == GGML_TYPE_Q4_0) {
+        size_t rb = (size_t)(n_cols / 32) * sizeof(block_q4_0);
+        tf_matvec_q4_0_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
+#if defined(__ARM_FEATURE_SVE)
+    } else if (mat->type == GGML_TYPE_Q4_K) {
+        size_t rb = (size_t)(n_cols / 256) * sizeof(block_q4_K);
+        const block_q4_K *base = (const block_q4_K *)mat->data;
+        for (int i = row_start; i < row_end; i++)
+            dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * rb), x, n_cols);
+    } else if (mat->type == GGML_TYPE_Q5_K) {
+        size_t rb = (size_t)(n_cols / 256) * sizeof(block_q5_K);
+        for (int i = row_start; i < row_end; i++) {
+            const void *row = (const uint8_t *)mat->data + (size_t)i * rb;
+            dst[i] = tf_q5_k_dot_sve((const block_q5_K *)row, x, n_cols);
+            tf_compact_k_check(mat->type, row, x, n_cols, dst[i]);
+        }
+    } else if (mat->type == GGML_TYPE_Q6_K) {
+        size_t rb = (size_t)(n_cols / 256) * sizeof(block_q6_K);
+        for (int i = row_start; i < row_end; i++) {
+            const void *row = (const uint8_t *)mat->data + (size_t)i * rb;
+            dst[i] = tf_q6_k_dot_sve((const block_q6_K *)row, x, n_cols);
+            tf_compact_k_check(mat->type, row, x, n_cols, dst[i]);
+        }
+    } else if (mat->type == GGML_TYPE_IQ4_XS) {
+        size_t rb = (size_t)(n_cols / 256) * sizeof(block_iq4_xs);
+        for (int i = row_start; i < row_end; i++) {
+            const void *row = (const uint8_t *)mat->data + (size_t)i * rb;
+            dst[i] = tf_iq4_xs_dot_sve((const block_iq4_xs *)row, x, n_cols);
+            tf_compact_k_check(mat->type, row, x, n_cols, dst[i]);
+        }
+#endif
     } else {
         float *tmp = (float *)malloc(n_cols * sizeof(float));
         if (!tmp) return;
         for (int i = row_start; i < row_end; i++) {
             tf_dequant_row(mat, i, tmp);
+#if defined(__ARM_FEATURE_SVE)
+            float sum = tf_f32_dot_sve(tmp, x, n_cols);
+#else
             float sum = 0.0f;
             for (int j = 0; j < n_cols; j++) sum += tmp[j] * x[j];
+#endif
             dst[i] = sum;
         }
         free(tmp);
@@ -1022,6 +3022,8 @@ static void tf_qmatvec_fused_qkv_pool(transformer_model *m,
                                         float *q, const qtensor *mat_q, int n_q,
                                         float *k, const qtensor *mat_k,
                                         float *v, const qtensor *mat_v, int n_kv) {
+    if (mat_q->i8) { tf_qmatvec_pool(m, q, mat_q, m->xb, n_q);
+        tf_qmatvec_pool(m, k, mat_k, m->xb, n_kv); tf_qmatvec_pool(m, v, mat_v, m->xb, n_kv); return; }
     int nt = m->n_threads;
     if (nt <= 1 || !m->pool_alive) {
         tf_qmatvec(q, mat_q, m->xb, n_q, m->thread_tmp[0]);
@@ -1048,6 +3050,55 @@ static void tf_qmatvec_fused_qkv_pool(transformer_model *m,
 
 static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_rows, float *tmp) {
     int n_cols = mat->n_cols;
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->type == GGML_TYPE_BF16 && mat->bf16_pv) {
+        int groups = n_rows / 8;
+        size_t group_hw = (size_t)8 * mat->n_cols;
+        const uint16_t *base = (const uint16_t *)mat->data;
+        for (int g = 0; g < groups; g++) {
+            const uint16_t *p = base + (size_t)g * group_hw;
+            matvec_bf16_8row_pv(dst + g * 8,
+                                p, p + 2 * mat->n_cols,
+                                p + 4 * mat->n_cols, p + 6 * mat->n_cols,
+                                x, mat->n_cols);
+        }
+        return;
+    }
+    if (mat->q8_block64) {
+        int nb = n_cols / 64;
+        int8_t *xq = (int8_t *)tmp;
+        float *xs = (float *)((uint8_t *)tmp + (size_t)n_cols);
+        for (int b = 0; b < nb; b++) {
+            float mx = 0.0f;
+            for (int j = 0; j < 64; j++) {
+                float a = fabsf(x[b * 64 + j]);
+                if (a > mx) mx = a;
+            }
+            xs[b] = mx / 127.0f;
+            float inv = xs[b] > 0.0f ? 1.0f / xs[b] : 0.0f;
+            for (int j = 0; j < 64; j++) {
+                int q = (int)lrintf(x[b * 64 + j] * inv);
+                xq[b * 64 + j] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q);
+            }
+        }
+        size_t gb = (size_t)nb * (mat->q8_block64 == 3 ? 528 : 544);
+        for (int g = 0; g < n_rows / 8; g++) {
+            const uint8_t *group = (const uint8_t *)mat->data + (size_t)g * gb;
+            if (mat->q8_block64 == 3)
+                matvec_sdot_8row(dst + g * 8, group, xq, xs, n_cols);
+            else
+                matvec_sdot_8row_q8orig(dst + g * 8, group, xq, xs, n_cols);
+        }
+        return;
+    }
+    if (mat->i8) {   /* W8A8 int8 SDOT */
+        int8_t *xi8 = (int8_t *)tmp;
+        float xs = tf_quant_x_i8(x, xi8, n_cols);
+        const int8_t *W = mat->i8; const float *ws = mat->i8s;
+        for (int r = 0; r < n_rows; r++) dst[r] = (float)tf_int8_dot(W + (size_t)r * n_cols, xi8, n_cols) * ws[r] * xs;
+        return;
+    }
+#endif
     if (mat->type == GGML_TYPE_F16) {
         const uint8_t *base = (const uint8_t *)mat->data;
         size_t row_bytes = (size_t)n_cols * 2;
@@ -1083,6 +3134,35 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         }
         return;
     }
+    if (mat->type == GGML_TYPE_Q4_0) {
+        int nb = n_cols / 32;
+        size_t row_bytes = (size_t)nb * sizeof(block_q4_0);
+        tf_matvec_q4_0_rows(dst, (const uint8_t *)mat->data, row_bytes, x, n_cols, 0, n_rows);
+        return;
+    }
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->type == GGML_TYPE_Q4_K) {
+        size_t row_bytes = (size_t)(n_cols / 256) * sizeof(block_q4_K);
+        const block_q4_K *base = (const block_q4_K *)mat->data;
+        for (int i = 0; i < n_rows; i++)
+            dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * row_bytes), x, n_cols);
+        return;
+    }
+    if (mat->type == GGML_TYPE_Q5_K || mat->type == GGML_TYPE_Q6_K ||
+        mat->type == GGML_TYPE_IQ4_XS) {
+        size_t row_bytes = tf_row_bytes(mat->type, n_cols);
+        for (int i = 0; i < n_rows; i++) {
+            const uint8_t *row = (const uint8_t *)mat->data + (size_t)i * row_bytes;
+            if (mat->type == GGML_TYPE_Q5_K)
+                dst[i] = tf_q5_k_dot_sve((const block_q5_K *)row, x, n_cols);
+            else if (mat->type == GGML_TYPE_Q6_K)
+                dst[i] = tf_q6_k_dot_sve((const block_q6_K *)row, x, n_cols);
+            else
+                dst[i] = tf_iq4_xs_dot_sve((const block_iq4_xs *)row, x, n_cols);
+        }
+        return;
+    }
+#endif
     for (int i = 0; i < n_rows; i++) {
         tf_dequant_row(mat, i, tmp);
 #if defined(__AVX2__) && defined(__FMA__)
@@ -1106,8 +3186,12 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         float sum = _mm_cvtss_f32(s4);
         for (; j < n_cols; j++) sum += tmp[j] * x[j];
 #else
+#if defined(__ARM_FEATURE_SVE)
+        float sum = tf_f32_dot_sve(tmp, x, n_cols);
+#else
         float sum = 0.0f;
         for (int j = 0; j < n_cols; j++) sum += tmp[j] * x[j];
+#endif
 #endif
         dst[i] = sum;
     }
@@ -1115,21 +3199,85 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
 
 /* Pool-based multi-threaded matvec (avoids pthread_create per call) */
 static void tf_qmatvec_pool(transformer_model *m, float *dst, const qtensor *mat, const float *x, int n_rows) {
+    if (tf_dprof < 0) tf_dprof = getenv("TF_DPROF") ? 1 : 0;
+    double _t0 = tf_dprof ? tf_time_ms() : 0;
     int n_threads = m->n_threads;
     if (n_threads <= 1 || n_rows < n_threads * 4 || !m->pool_alive) {
         tf_qmatvec(dst, mat, x, n_rows, m->thread_tmp[0]);
+        if (tf_dprof) tf_decode_matvec_ms += tf_time_ms() - _t0;
         return;
     }
     tf_matvec_task *tasks = (tf_matvec_task *)alloca(n_threads * sizeof(tf_matvec_task));
-    int rows_per = n_rows / n_threads;
-    int extra = n_rows % n_threads;
+    int unit = (mat->type == GGML_TYPE_BF16 && mat->bf16_pv) ? 8 : 1;
+    int work = n_rows / unit;
+    int rows_per = work / n_threads;
+    int extra = work % n_threads;
     int offset = 0;
     for (int t = 0; t < n_threads; t++) {
-        int count = rows_per + (t < extra ? 1 : 0);
+        int count = (rows_per + (t < extra ? 1 : 0)) * unit;
         tasks[t] = (tf_matvec_task){dst, mat, x, offset, offset + count, m->thread_tmp[t]};
         offset += count;
     }
     tf_pool_dispatch(m, tf_qmatvec_worker, tasks, sizeof(tf_matvec_task));
+    if (tf_dprof) { tf_decode_matvec_ms += tf_time_ms() - _t0;
+        tf_decode_matvec_bytes += (double)n_rows *
+                                  (double)tf_row_bytes(mat->type, mat->n_cols);
+        tf_decode_matvec_cnt++; }
+}
+
+/* Greedy-only vocabulary projection: compute the local maximum while the
+ * BF16 PV head is streamed, avoiding the write of every local logit.  The
+ * caller initializes logits to -Inf and this worker leaves only its winning
+ * row populated, so existing TP argmax code remains unchanged. */
+typedef struct {
+    transformer_model *m;
+    const qtensor *mat;
+    const float *x;
+    int row_start, row_end, tid;
+} tf_argmax_task;
+
+static void *tf_bf16_pv_argmax_worker(void *arg) {
+    tf_argmax_task *t = (tf_argmax_task *)arg;
+    int groups = t->mat->n_rows / 8;
+    int g0 = groups * t->tid / t->m->n_threads;
+    int g1 = groups * (t->tid + 1) / t->m->n_threads;
+    float best = -INFINITY;
+    int best_row = t->row_start;
+    size_t group_hw = (size_t)8 * t->mat->n_cols;
+    const uint16_t *base = (const uint16_t *)t->mat->data;
+    for (int g = g0; g < g1; g++) {
+        const uint16_t *p = base + (size_t)g * group_hw;
+        float out[8];
+        matvec_bf16_8row_pv(out, p, p + 2 * t->mat->n_cols,
+                            p + 4 * t->mat->n_cols, p + 6 * t->mat->n_cols,
+                            t->x, t->mat->n_cols);
+        for (int r = 0; r < 8; r++) {
+            if (out[r] > best) {
+                best = out[r];
+                best_row = g * 8 + r;
+            }
+        }
+    }
+    t->m->lm_head_best_idx[t->tid] = best_row;
+    t->m->lm_head_best_val[t->tid] = best;
+    t->m->logits[best_row] = best;
+    return NULL;
+}
+
+static int tf_bf16_pv_argmax_pool(transformer_model *m, const qtensor *mat,
+                                  const float *x, int n_rows) {
+    if (!m || !mat || mat->type != GGML_TYPE_BF16 || !mat->bf16_pv ||
+        (n_rows & 7) || m->n_threads <= 1 || !m->pool_alive) return 0;
+    for (int i = 0; i < n_rows; i++) m->logits[i] = -INFINITY;
+    int nt = m->n_threads;
+    tf_argmax_task *tasks = (tf_argmax_task *)alloca((size_t)nt * sizeof(*tasks));
+    for (int tid = 0; tid < nt; tid++) {
+        int rs = n_rows * tid / nt;
+        int re = n_rows * (tid + 1) / nt;
+        tasks[tid] = (tf_argmax_task){m, mat, x, rs, re, tid};
+    }
+    tf_pool_dispatch(m, tf_bf16_pv_argmax_worker, tasks, sizeof(*tasks));
+    return 1;
 }
 
 /* Pool-based multi-threaded expert matvec: splits rows across threads */
@@ -1305,6 +3453,15 @@ static void tf_qk_norm(float *vec, int n_heads, int head_dim, const qtensor *nor
             _mm256_storeu_ps(v + i, _mm256_mul_ps(_mm256_mul_ps(vi, vscale), vw));
         }
         for (; i < head_dim; i++) v[i] = v[i] * ss * w_buf[i];
+#elif defined(__ARM_FEATURE_SVE)
+        svbool_t pt = svptrue_b32(); int vl = (int)svcntw();
+        svfloat32_t vss = svdup_f32(0);
+        for (int i = 0; i < head_dim; i += vl) { svbool_t pg = svwhilelt_b32(i, head_dim);
+            svfloat32_t vi = svld1(pg, v + i); vss = svmla_m(pg, vss, vi, vi); }
+        float ss = 1.0f / sqrtf(svaddv(pt, vss) / head_dim + eps);
+        svfloat32_t vsc = svdup_f32(ss);
+        for (int i = 0; i < head_dim; i += vl) { svbool_t pg = svwhilelt_b32(i, head_dim);
+            svst1(pg, v + i, svmul_x(pg, svmul_x(pg, svld1(pg, v + i), vsc), svld1(pg, w_buf + i))); }
 #else
         float ss = 0.0f;
         for (int i = 0; i < head_dim; i++) ss += v[i] * v[i];
@@ -1317,6 +3474,10 @@ static void tf_qk_norm(float *vec, int n_heads, int head_dim, const qtensor *nor
 /* Forward declarations — defined after fast_exp_avx2 */
 static void tf_softmax(float *x, int n);
 static void tf_silu_mul_avx2(float *out, const float *gate, const float *up, int n);
+#if defined(__ARM_FEATURE_SVE)
+static inline svfloat32_t tf_exp2_fexpa_approx_sve(svbool_t pg,
+                                                   svfloat32_t x);
+#endif
 
 /* Multi-head attention worker for threading */
 typedef struct {
@@ -1328,13 +3489,41 @@ typedef struct {
     int head_start, head_end;
     int head_dim, kv_dim, gqa_ratio, seq_len, max_seq_len;
     float scale;
+    int q_head_offset;
+    int phase;              /* 0=full, 1=QK score slice, 2=softmax+PV */
+    int seq_start, seq_end; /* score interval for phase 1 */
 } tf_attn_task;
+
+#if defined(__ARM_FEATURE_SVE)
+/* Independent output dimensions can be assigned to different workers without
+ * changing the sequence-order reduction of any individual component. */
+static void tf_attn_pv_slice_sve(float *out, const float *scores,
+                                 const float *values, int seq_len,
+                                 int kv_dim, int begin, int end) {
+    int vl = (int)svcntw();
+    for (int d = begin; d < end; d += 2 * vl) {
+        svbool_t p0 = svwhilelt_b32(d, end);
+        svbool_t p1 = svwhilelt_b32(d + vl, end);
+        svfloat32_t o0 = svdup_f32(0), o1 = svdup_f32(0);
+        for (int p = 0; p < seq_len; p++) {
+            const float *v = values + (size_t)p * kv_dim + d;
+            svfloat32_t a = svdup_f32(scores[p]);
+            o0 = svmla_m(p0, o0, a, svld1(p0, v));
+            if (d + vl < end)
+                o1 = svmla_m(p1, o1, a, svld1(p1, v + vl));
+        }
+        svst1(p0, out + d, o0);
+        if (d + vl < end) svst1(p1, out + d + vl, o1);
+    }
+}
+
+#endif
 
 static void *tf_attn_worker(void *arg) {
     tf_attn_task *t = (tf_attn_task *)arg;
     int hd = t->head_dim;
     for (int h = t->head_start; h < t->head_end; h++) {
-        int kv_h = h / t->gqa_ratio;
+        int kv_h = (t->q_head_offset + h) / t->gqa_ratio;
         const float *q_h = t->q + h * hd;
         float *att_h = t->att + h * t->max_seq_len;
         int seq_len = t->seq_len;
@@ -1472,7 +3661,10 @@ static void *tf_attn_worker(void *arg) {
         {
             /* SVE attention with prefetch */
             svbool_t pg = svptrue_b32();
-            for (int p = 0; p < seq_len; p++) {
+            int score_start = t->phase == 1 ? t->seq_start : 0;
+            int score_end = t->phase == 1 ? t->seq_end :
+                            t->phase == 2 ? 0 : seq_len;
+            for (int p = score_start; p < score_end; p++) {
                 const float *k_p = t->key_cache + (size_t)p * t->kv_dim + kv_h * hd;
                 if (p + 2 < seq_len)
                     __builtin_prefetch(t->key_cache + (size_t)(p+2) * t->kv_dim + kv_h * hd, 0, 1);
@@ -1486,6 +3678,7 @@ static void *tf_attn_worker(void *arg) {
                 }
                 att_h[p] = svaddv(pg, acc) * t->scale;
             }
+            if (t->phase == 1) continue;
             tf_softmax(att_h, seq_len);
             float *out_h = t->xb2 + h * hd;
             /* Zero output with SVE */
@@ -1526,6 +3719,87 @@ static void *tf_attn_worker(void *arg) {
 #endif
     }
     return NULL;
+}
+
+/* Qwen prefill attention specialized for the TP-local GQA shape.  A query
+ * block shares each K/V cache row across all of its query tokens and the query
+ * heads mapped to one KV head.  Each output still accumulates positions in
+ * increasing order, matching the scalar task schedule's causal semantics. */
+extern int tf_batch_threads;
+static int tf_qwen_attention_blocked(transformer_model *m, int layer,
+        const float *q, int q_stride, float *out, int qdim, int kvdim,
+        int start_pos, int N) {
+#if defined(__ARM_FEATURE_SVE)
+    static int enabled = -1, bq = 0;
+    if (enabled < 0) {
+        const char *e = getenv("TF_QWEN_ATTN_BLOCK");
+        enabled = e && atoi(e) != 0;
+        const char *b = getenv("TF_QWEN_ATTN_BQ");
+        bq = b ? atoi(b) : 4;
+    }
+    if (!enabled || bq < 1 || bq > 8 || m->head_dim != 128 ||
+        m->n_heads < 1 || m->n_kv_heads < 1 || m->gqa_group < 1)
+        return 0;
+    int nh = m->n_heads, nkh = m->n_kv_heads, hd = m->head_dim;
+    int nqb = (N + bq - 1) / bq, max_seq = start_pos + N;
+    float scale = 1.0f / sqrtf((float)hd);
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(tf_batch_threads > 0 ? tf_batch_threads : m->n_threads)
+    #endif
+    {
+        size_t sn = (size_t)bq * nh * max_seq;
+        float *scores = (float *)malloc(sn * sizeof(float));
+        #ifdef _OPENMP
+        #pragma omp for schedule(static)
+        #endif
+        for (int task = 0; task < nqb * nkh; task++) {
+            int qb = task / nkh, kvh = task % nkh;
+            int t0 = qb * bq, tn = N - t0; if (tn > bq) tn = bq;
+            int h0 = 0, h1 = 0;
+            while (h0 < nh && (m->tp_qhead_offset + h0) / m->gqa_group < kvh) h0++;
+            h1 = h0;
+            while (h1 < nh && (m->tp_qhead_offset + h1) / m->gqa_group == kvh) h1++;
+            if (h0 == h1) continue;
+            svbool_t pg = svptrue_b32();
+            for (int ti = 0; ti < tn; ti++) for (int h = h0; h < h1; h++) {
+                const float *qh = q + (size_t)(t0 + ti) * q_stride + h * hd;
+                float *sc = scores + ((size_t)ti * nh + h) * max_seq;
+                int sl = start_pos + t0 + ti + 1;
+                for (int p = 0; p < sl; p++) {
+                    const float *kp = m->key_cache[layer] + (size_t)p * kvdim + kvh * hd;
+                    svfloat32_t acc = svdup_f32(0.0f);
+                    for (int d = 0; d < hd; d += (int)svcntw())
+                        acc = svmla_f32_x(pg, acc, svld1(pg, qh + d), svld1(pg, kp + d));
+                    sc[p] = svaddv_f32(pg, acc) * scale;
+                }
+                tf_softmax(sc, sl);
+                float *oh = out + (size_t)(t0 + ti) * qdim + h * hd;
+                for (int d = 0; d < hd; d += (int)svcntw())
+                    svst1(pg, oh + d, svdup_f32(0.0f));
+            }
+            int slmax = start_pos + t0 + tn;
+            for (int p = 0; p < slmax; p++) {
+                const float *vp = m->value_cache[layer] + (size_t)p * kvdim + kvh * hd;
+                for (int ti = 0; ti < tn; ti++) {
+                    if (p >= start_pos + t0 + ti + 1) continue;
+                    for (int h = h0; h < h1; h++) {
+                        float *sc = scores + ((size_t)ti * nh + h) * max_seq;
+                        float *oh = out + (size_t)(t0 + ti) * qdim + h * hd;
+                        svfloat32_t w = svdup_f32(sc[p]);
+                        for (int d = 0; d < hd; d += (int)svcntw())
+                            svst1(pg, oh + d, svmla_f32_x(pg, svld1(pg, oh + d),
+                                                         w, svld1(pg, vp + d)));
+                    }
+                }
+            }
+        }
+        free(scores);
+    }
+    return 1;
+#else
+    (void)m; (void)layer; (void)q; (void)q_stride; (void)out;
+    (void)qdim; (void)kvdim; (void)start_pos; (void)N; return 0;
+#endif
 }
 
 #if defined(__AVX2__) && defined(__FMA__)
@@ -1576,6 +3850,43 @@ static void tf_softmax(float *x, int n) {
         _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vinv));
     float inv_sum = 1.0f / sum;
     for (; i < n; i++) x[i] *= inv_sum;
+#elif defined(__ARM_FEATURE_SVE)
+    static int softmax_sve = -1;
+    if (softmax_sve < 0) {
+        const char *e = getenv("TF_SOFTMAX_SVE");
+        softmax_sve = e && atoi(e) != 0;
+    }
+    if (softmax_sve) {
+        svbool_t all = svptrue_b32();
+        svfloat32_t vmax = svdup_f32(-INFINITY);
+        for (int i = 0; i < n; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+            vmax = svmax_f32_m(pg, vmax, svld1(pg, x + i));
+        }
+        float max_val = svmaxv_f32(all, vmax);
+        svfloat32_t vsum = svdup_f32(0.0f);
+        for (int i = 0; i < n; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+            svfloat32_t z = svmul_n_f32_x(pg,
+                svsub_n_f32_x(pg, svld1(pg, x + i), max_val),
+                1.4426950408889634f);
+            z = svmax_n_f32_x(pg, z, -126.0f);
+            svfloat32_t e = tf_exp2_fexpa_approx_sve(pg, z);
+            svst1(pg, x + i, e);
+            vsum = svadd_f32_m(pg, vsum, e);
+        }
+        float inv = 1.0f / svaddv_f32(all, vsum);
+        for (int i = 0; i < n; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+            svst1(pg, x + i, svmul_n_f32_x(pg, svld1(pg, x + i), inv));
+        }
+        return;
+    }
+    float max_val = x[0];
+    for (int i = 1; i < n; i++) if (x[i] > max_val) max_val = x[i];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - max_val); sum += x[i]; }
+    for (int i = 0; i < n; i++) x[i] /= sum;
 #else
     float max_val = x[0];
     for (int i = 1; i < n; i++) if (x[i] > max_val) max_val = x[i];
@@ -1626,7 +3937,15 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->n_embd      = tf_get_int(gguf, ARCH_KEY("embedding_length"), 4096);
     m->n_heads     = tf_get_int(gguf, ARCH_KEY("attention.head_count"), 32);
     m->n_kv_heads  = tf_get_int(gguf, ARCH_KEY("attention.head_count_kv"), 8);
-    m->n_layers    = tf_get_int(gguf, ARCH_KEY("block_count"), 36);
+    m->n_layers_all = tf_get_int(gguf, ARCH_KEY("block_count"), 36);
+    m->n_nextn_layers = tf_get_int(gguf, ARCH_KEY("nextn_predict_layers"), 0);
+    if (m->n_nextn_layers < 0 || m->n_nextn_layers >= m->n_layers_all) {
+        fprintf(stderr, "transformer: invalid nextn layer count %d for block_count=%d\n",
+                m->n_nextn_layers, m->n_layers_all);
+        free(m);
+        return NULL;
+    }
+    m->n_layers = m->n_layers_all - m->n_nextn_layers;
     m->n_ff        = tf_get_int(gguf, ARCH_KEY("feed_forward_length"), 12288);
     m->n_vocab     = tf_get_int(gguf, ARCH_KEY("vocab_size"), 0);
     m->rms_norm_eps = tf_get_float(gguf, ARCH_KEY("attention.layer_norm_rms_epsilon"), 1e-6f);
@@ -1716,6 +4035,9 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->rope_inv_freq_swa = NULL;
     m->ple_buf = NULL;
     m->ple_proj_buf = NULL;
+    m->ffn_gelu_fast = 0;
+    m->ffn_fused_q4 = 0;
+    m->ffn_check = 0;
     if (strcmp(arch, "gemma4") == 0) {
         m->is_gemma4 = 1;
         m->head_dim_full = tf_get_int(gguf, ARCH_KEY("attention.key_length"), 512);
@@ -1729,6 +4051,23 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         m->rope_freq_base_swa = tf_get_float(gguf, ARCH_KEY("rope.freq_base_swa"), 10000.0f);
         m->embd_scale = sqrtf((float)m->n_embd);
         m->ffn_activation = 1; /* GELU */
+#if defined(__ARM_FEATURE_SVE)
+        m->ffn_gelu_fast = 1;
+        m->ffn_fused_q4 = 1;
+#endif
+        const char *gelu_mode = getenv("TF_GELU_MODE");
+        if (gelu_mode) {
+            if (strcmp(gelu_mode, "exact") == 0 || strcmp(gelu_mode, "0") == 0)
+                m->ffn_gelu_fast = 0;
+            else if (strcmp(gelu_mode, "fast") == 0 || strcmp(gelu_mode, "1") == 0)
+                m->ffn_gelu_fast = 1;
+            else
+                fprintf(stderr, "transformer: ignoring unknown TF_GELU_MODE=%s (use fast|exact)\n", gelu_mode);
+        }
+        const char *fused_q4 = getenv("TF_FFN_FUSED_Q4");
+        if (fused_q4) m->ffn_fused_q4 = atoi(fused_q4) != 0;
+        const char *ffn_check = getenv("TF_FFN_CHECK");
+        if (ffn_check) m->ffn_check = atoi(ffn_check) != 0;
 
         /* Parse SWA layer pattern from GGUF bool array */
         m->swa_pattern = (int *)calloc(m->n_layers, sizeof(int));
@@ -1756,6 +4095,8 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
                 m->n_embd_per_layer, m->n_layer_kv_from_start);
         fprintf(stderr, "transformer: Gemma4: softcap=%.1f rope_base_swa=%.0f\n",
                 m->final_logit_softcapping, m->rope_freq_base_swa);
+        fprintf(stderr, "transformer: Gemma4 FFN: GELU=%s fused_q4=%d check=%d\n",
+                m->ffn_gelu_fast ? "fast_sve" : "exact_erf", m->ffn_fused_q4, m->ffn_check);
     }
 
     #undef ARCH_KEY
@@ -1764,6 +4105,9 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
     fprintf(stderr, "transformer: n_embd=%d n_heads=%d n_kv_heads=%d n_layers=%d n_ff=%d head_dim=%d\n",
             m->n_embd, m->n_heads, m->n_kv_heads, m->n_layers, m->n_ff, m->head_dim);
+    if (m->n_nextn_layers)
+        fprintf(stderr, "transformer: NextN trunk=%d auxiliary=%d total=%d\n",
+                m->n_layers, m->n_nextn_layers, m->n_layers_all);
     fprintf(stderr, "transformer: rope_freq_base=%.0f rms_norm_eps=%.1e max_seq_len=%d\n",
             m->rope_freq_base, m->rms_norm_eps, max_seq_len);
     if (m->use_moe) {
@@ -1771,9 +4115,17 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
                 m->n_expert, m->n_expert_used, m->n_ff_expert);
     }
 
+    /* PP (pipeline-parallel) load: TF_PP_L0/L1 = this stage's layer range. The first
+     * stage owns token_embd (input embedding), the last owns token_embd (tied lm_head)
+     * + output_norm; middle stages own neither -> relax the global requirements and the
+     * layer/KV loops below load only [TF_PP_L0, TF_PP_L1). Default = full model. */
+    int tf_pp_l0 = getenv("TF_PP_L0") ? atoi(getenv("TF_PP_L0")) : 0;
+    int tf_pp_l1 = getenv("TF_PP_L1") ? atoi(getenv("TF_PP_L1")) : m->n_layers;
+    int tf_pp = (tf_pp_l0 > 0 || tf_pp_l1 < m->n_layers);
+
     /* Global tensors */
-    m->token_embd = tf_load_tensor(gguf, "token_embd.weight", 1);
-    m->output_norm = tf_load_tensor(gguf, "output_norm.weight", 1);
+    m->token_embd = tf_load_tensor(gguf, "token_embd.weight", tf_pp ? 0 : 1);
+    m->output_norm = tf_load_tensor(gguf, "output_norm.weight", tf_pp ? 0 : 1);
     m->output = tf_load_tensor(gguf, "output.weight", 0);
     if (!m->output.data && m->token_embd.data) {
         /* Weight tying: use token_embd as output projection */
@@ -1785,12 +4137,12 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     if (m->n_vocab == 0 && m->token_embd.data) {
         m->n_vocab = m->token_embd.n_rows;
     }
-    if (!m->token_embd.data || !m->output_norm.data) {
+    if (!tf_pp && (!m->token_embd.data || !m->output_norm.data)) {
         fprintf(stderr, "transformer: missing required global tensor(s)\n");
         transformer_free(m);
         return NULL;
     }
-    if (m->n_vocab <= 0) {
+    if (!tf_pp && m->n_vocab <= 0) {
         fprintf(stderr, "transformer: invalid vocabulary size %d\n", m->n_vocab);
         transformer_free(m);
         return NULL;
@@ -1842,6 +4194,15 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
                     missing_required = 1; \
                 } \
             } while (0)
+
+        if (tf_pp && (l < tf_pp_l0 || l >= tf_pp_l1)) {
+            /* PP: skip non-owned layers. Force shared_kv_source=-1 so the KV-cache
+             * setup does NOT alias them to layer 0 (the calloc default 0 means "share
+             * from layer 0" -> free_unused_kv would double-free layer 0's KV on the
+             * stage that owns layer 0). */
+            m->layers[l].shared_kv_source = -1;
+            continue;
+        }
 
         LOAD(attn_norm,    "attn_norm",   1)
 
@@ -2028,6 +4389,44 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         #undef LOAD
         #undef REQUIRE_SUPPORTED
     }
+    if (m->n_nextn_layers) {
+        if (m->n_nextn_layers != 1 || !m->is_hybrid) {
+            fprintf(stderr, "transformer: only one Qwen35 NextN block is supported\n");
+            missing_required = 1;
+        } else {
+            transformer_nextn *nn = &m->nextn;
+            transformer_layer *L = &nn->layer;
+            int l = m->n_layers;
+            char name[128];
+            nn->layer_index = l;
+#define NN_LOAD(field, suffix, req) do { \
+                snprintf(name, sizeof(name), "blk.%d." suffix ".weight", l); \
+                (field) = tf_load_tensor(gguf, name, req); \
+                if ((req) && !(field).data) missing_required = 1; \
+            } while (0)
+            NN_LOAD(L->attn_norm, "attn_norm", 1);
+            NN_LOAD(L->attn_q, "attn_q", 1);
+            NN_LOAD(L->attn_k, "attn_k", 1);
+            NN_LOAD(L->attn_v, "attn_v", 1);
+            NN_LOAD(L->attn_q_norm, "attn_q_norm", 1);
+            NN_LOAD(L->attn_k_norm, "attn_k_norm", 1);
+            NN_LOAD(L->attn_output, "attn_output", 1);
+            NN_LOAD(L->ffn_norm, "post_attention_norm", 1);
+            NN_LOAD(L->ffn_gate, "ffn_gate", 1);
+            NN_LOAD(L->ffn_up, "ffn_up", 1);
+            NN_LOAD(L->ffn_down, "ffn_down", 1);
+            NN_LOAD(nn->eh_proj, "nextn.eh_proj", 1);
+            NN_LOAD(nn->enorm, "nextn.enorm", 1);
+            NN_LOAD(nn->hnorm, "nextn.hnorm", 1);
+            NN_LOAD(nn->shared_head_norm, "nextn.shared_head_norm", 0);
+            NN_LOAD(nn->embed_tokens, "nextn.embed_tokens", 0);
+            NN_LOAD(nn->shared_head_head, "nextn.shared_head_head", 0);
+#undef NN_LOAD
+            nn->loaded = !missing_required;
+            if (nn->loaded)
+                fprintf(stderr, "transformer: loaded Qwen NextN block %d\n", l);
+        }
+    }
     if (missing_required) {
         fprintf(stderr, "transformer: aborting due to missing required per-layer tensors\n");
         transformer_free(m);
@@ -2038,20 +4437,36 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     int kv_dim = m->n_kv_heads * m->head_dim;
     m->key_cache   = (float **)calloc(m->n_layers, sizeof(float *));
     m->value_cache = (float **)calloc(m->n_layers, sizeof(float *));
+    m->key_cache_raw   = (void **)calloc(m->n_layers, sizeof(void *));
+    m->value_cache_raw = (void **)calloc(m->n_layers, sizeof(void *));
+    m->kv_cache_type = 0;
+    {
+        const char *kv = getenv("TF_KV_DTYPE");
+        if (m->is_gemma4 && kv && (!strcmp(kv, "f16") || !strcmp(kv, "fp16"))) {
+            m->kv_cache_type = 1;
+        } else if (m->is_gemma4 && kv && strcmp(kv, "f32") && strcmp(kv, "fp32")) {
+            fprintf(stderr, "transformer: Gemma4 unsupported TF_KV_DTYPE=%s, using f32\n", kv);
+        }
+    }
     if (m->is_gemma4) {
         int n_own = 0, n_shared = 0;
+        size_t kv_elem_size = (m->kv_cache_type == 1) ? sizeof(uint16_t) : sizeof(float);
         for (int l = 0; l < m->n_layers; l++) {
             if (m->layers[l].shared_kv_source >= 0) { n_shared++; continue; }
             /* Per-layer KV dim (SWA & full-attn may have different KV head counts) */
             int lhd = m->layers[l].is_swa ? m->head_dim_swa : m->head_dim_full;
             int l_kv_dim = m->layers[l].n_kv_heads * lhd;
-            if (m->layers[l].is_swa) {
-                int cache_len = m->swa_window_size;
-                m->key_cache[l]   = (float *)tf_aligned_calloc(256, cache_len * l_kv_dim, sizeof(float));
-                m->value_cache[l] = (float *)tf_aligned_calloc(256, cache_len * l_kv_dim, sizeof(float));
-            } else {
-                m->key_cache[l]   = (float *)tf_aligned_calloc(256, max_seq_len * l_kv_dim, sizeof(float));
-                m->value_cache[l] = (float *)tf_aligned_calloc(256, max_seq_len * l_kv_dim, sizeof(float));
+            int cache_len = m->layers[l].is_swa ? m->swa_window_size : max_seq_len;
+            m->key_cache_raw[l]   = tf_aligned_calloc(256, (size_t)cache_len * l_kv_dim, kv_elem_size);
+            m->value_cache_raw[l] = tf_aligned_calloc(256, (size_t)cache_len * l_kv_dim, kv_elem_size);
+            if (m->kv_cache_type == 0) {
+                m->key_cache[l]   = (float *)m->key_cache_raw[l];
+                m->value_cache[l] = (float *)m->value_cache_raw[l];
+            }
+            if (!m->key_cache_raw[l] || !m->value_cache_raw[l]) {
+                fprintf(stderr, "transformer: Gemma4 KV cache alloc failed at layer %d\n", l);
+                transformer_free(m);
+                return NULL;
             }
             n_own++;
         }
@@ -2061,9 +4476,12 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             if (src >= 0) {
                 m->key_cache[l]   = m->key_cache[src];
                 m->value_cache[l] = m->value_cache[src];
+                m->key_cache_raw[l]   = m->key_cache_raw[src];
+                m->value_cache_raw[l] = m->value_cache_raw[src];
             }
         }
-        fprintf(stderr, "transformer: Gemma4 KV cache: %d own layers, %d shared layers\n", n_own, n_shared);
+        fprintf(stderr, "transformer: Gemma4 KV cache: %d own layers, %d shared layers, dtype=%s\n",
+                n_own, n_shared, m->kv_cache_type == 1 ? "f16" : "f32");
         /* Scratch sizing: max per-layer KV dim across all layers (SWA & full-attn differ). */
         for (int l = 0; l < m->n_layers; l++) {
             int lhd = m->layers[l].is_swa ? m->head_dim_swa : m->head_dim_full;
@@ -2075,6 +4493,8 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             if (m->is_hybrid && m->layers[l].is_ssm) continue;
             m->key_cache[l]   = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim, sizeof(float));
             m->value_cache[l] = (float *)tf_aligned_calloc(256, max_seq_len * kv_dim, sizeof(float));
+            m->key_cache_raw[l]   = m->key_cache[l];
+            m->value_cache_raw[l] = m->value_cache[l];
         }
     }
 
@@ -2099,10 +4519,48 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
         fprintf(stderr, "transformer: SSM state: %d layers, conv=[%d×%d], recurrent=[%d×%d×%d]\n",
                 n_ssm, m->ssm_conv_kernel - 1, m->ssm_qkv_dim,
                 m->ssm_dt_rank, m->ssm_d_state, m->ssm_d_state);
-        m->conv_w_trans = (float *)malloc((size_t)m->ssm_conv_kernel * m->ssm_qkv_dim * sizeof(float));
+        size_t conv_w_count = (size_t)m->ssm_conv_kernel * m->ssm_qkv_dim;
+        m->conv_w_trans = (float *)malloc(conv_w_count * sizeof(float));
+        m->conv_w_trans_layers = (float **)calloc(nl, sizeof(float *));
+        if (m->conv_w_trans_layers && gguf->use_mmap != 3) {
+            for (int l = 0; l < m->n_layers; l++) {
+                if (!m->layers[l].is_ssm || !m->layers[l].ssm_conv1d.data) continue;
+                float *w = (float *)malloc(conv_w_count * sizeof(float));
+                if (!w) continue;
+                size_t crb = tf_row_bytes(m->layers[l].ssm_conv1d.type,
+                                          m->layers[l].ssm_conv1d.n_cols);
+                const uint8_t *base = (const uint8_t *)m->layers[l].ssm_conv1d.data;
+                for (int j = 0; j < m->ssm_qkv_dim; j++) {
+                    float wb[8];
+                    dequant_row(m->layers[l].ssm_conv1d.type, base + (size_t)j * crb,
+                                wb, m->ssm_conv_kernel);
+                    for (int f = 0; f < m->ssm_conv_kernel; f++)
+                        w[(size_t)f * m->ssm_qkv_dim + j] = wb[f];
+                }
+                m->conv_w_trans_layers[l] = w;
+            }
+        }
     } else {
         m->conv_w_trans = NULL;
+        m->conv_w_trans_layers = NULL;
     }
+    if (getenv("TP_LOAD_TRACE")) fprintf(stderr, "transformer: load trace conv-ready\n");
+
+    if (m->nextn.loaded) {
+        size_t nkv = (size_t)max_seq_len * m->n_kv_heads * m->head_dim;
+        m->nextn.key_cache = (float *)tf_aligned_calloc(256, nkv, sizeof(float));
+        m->nextn.value_cache = (float *)tf_aligned_calloc(256, nkv, sizeof(float));
+        m->nextn.hidden = (float *)tf_aligned_calloc(256, m->n_embd, sizeof(float));
+        m->nextn.target_hidden = (float *)tf_aligned_calloc(256, m->n_embd, sizeof(float));
+        m->nextn.fusion = (float *)tf_aligned_calloc(256, 2 * m->n_embd, sizeof(float));
+        if (!m->nextn.key_cache || !m->nextn.value_cache ||
+            !m->nextn.hidden || !m->nextn.target_hidden || !m->nextn.fusion) {
+            fprintf(stderr, "transformer: cannot allocate NextN runtime buffers\n");
+            transformer_free(m);
+            return NULL;
+        }
+    }
+    if (getenv("TP_LOAD_TRACE")) fprintf(stderr, "transformer: load trace nextn-buffers-ready\n");
 
     /* Allocate scratch buffers */
     int max_ff = tf_compute_max_ff(m);
@@ -2129,8 +4587,12 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->ffn_buf2  = (float *)tf_aligned_calloc(256, max_ff, sizeof(float));
     m->ffn_buf3  = (float *)tf_aligned_calloc(256, max_ff, sizeof(float));
     m->logits     = m->has_lm_head ? (float *)tf_aligned_calloc(256, m->n_vocab, sizeof(float)) : NULL;
+    m->lm_head_best_idx = (int *)calloc(1, sizeof(int));
+    m->lm_head_best_val = (float *)calloc(1, sizeof(float));
+    m->last_argmax = 0;
     m->matvec_tmp = (float *)tf_aligned_calloc(256, max_dim, sizeof(float));
     m->trace_hidden_norms = 1;
+    if (getenv("TP_LOAD_TRACE")) fprintf(stderr, "transformer: load trace scratch-ready\n");
 
     /* Default: single-threaded, no tensor parallelism */
     m->n_threads = 1;
@@ -2138,6 +4600,11 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     m->tp_size = 1;
     m->tp_allreduce_fn = NULL;
     m->tp_allreduce_ctx = NULL;
+    m->tp_kv_head_count = m->n_kv_heads;
+    m->tp_vocab_loc = m->n_vocab;
+    m->gqa_group = m->n_heads / m->n_kv_heads;
+    m->kv_dtype = 0;
+    m->kv_elem_bytes = (int)sizeof(float);
     m->thread_tmp = (float **)calloc(1, sizeof(float *));
     m->thread_tmp[0] = m->matvec_tmp;
 
@@ -2161,6 +4628,8 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
             m->rope_mrope_inv_freq = NULL;
         }
     }
+
+    if (getenv("TP_LOAD_TRACE")) fprintf(stderr, "transformer: load trace rope-ready\n");
 
     /* Gemma4: precompute SWA RoPE table and per-layer embedding buffers */
     if (m->is_gemma4) {
@@ -2190,18 +4659,38 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
 
 void transformer_free(transformer_model *model) {
     if (!model) return;
-    free(model->layers);
-    if (model->key_cache) {
+    if (model->mpool.base) { munmap(model->mpool.base, model->mpool.cap); model->mpool.base = NULL; }
+    if (model->key_cache || model->key_cache_raw) {
         for (int l = 0; l < model->n_layers; l++) {
             /* Skip shared KV caches (freed by their source layer) */
             if (model->is_gemma4 && l < model->n_layers &&
                 model->layers && model->layers[l].shared_kv_source >= 0) continue;
-            free(model->key_cache[l]);
-            free(model->value_cache[l]);
+            void *kptr = model->key_cache_raw ? model->key_cache_raw[l] : (void *)model->key_cache[l];
+            void *vptr = model->value_cache_raw ? model->value_cache_raw[l] : (void *)model->value_cache[l];
+            free(kptr);
+            free(vptr);
         }
+        free(model->key_cache_raw);
+        free(model->value_cache_raw);
         free(model->key_cache);
         free(model->value_cache);
     }
+    if (model->layers) {
+        for (int l = 0; l < model->n_layers; l++) {
+            free(model->layers[l].attn_output.tp_owned_data);
+            free(model->layers[l].ffn_down.tp_owned_data);
+            free(model->layers[l].ssm_qkv.tp_owned_data);
+            free(model->layers[l].ssm_conv1d.tp_owned_data);
+            free(model->layers[l].ssm_out.tp_owned_data);
+        }
+    }
+    free(model->output.tp_owned_data);
+    free(model->layers);
+    free(model->nextn.key_cache);
+    free(model->nextn.value_cache);
+    free(model->nextn.hidden);
+    free(model->nextn.target_hidden);
+    free(model->nextn.fusion);
     /* Gemma4 resources */
     free(model->swa_pattern);
     free(model->rope_freq_factors);
@@ -2214,6 +4703,10 @@ void transformer_free(transformer_model *model) {
     }
     free(model->conv_state_pos);
     free(model->conv_w_trans);
+    if (model->conv_w_trans_layers) {
+        for (int l = 0; l < model->n_layers; l++) free(model->conv_w_trans_layers[l]);
+        free(model->conv_w_trans_layers);
+    }
     if (model->recurrent_state) {
         for (int l = 0; l < model->n_layers; l++) free(model->recurrent_state[l]);
         free(model->recurrent_state);
@@ -2229,9 +4722,25 @@ void transformer_free(transformer_model *model) {
     free(model->ffn_buf2);
     free(model->ffn_buf3);
     free(model->logits);
+    free(model->lm_head_best_idx);
+    free(model->lm_head_best_val);
+    if (model->tp_stage_data) {
+#if defined(__linux__)
+        if (model->tp_stage_is_mmap == 2) shmdt(model->tp_stage_data);
+        else if (model->tp_stage_is_mmap) munmap(model->tp_stage_data, model->tp_stage_bytes);
+        else
+#endif
+            free(model->tp_stage_data);
+    }
+#if defined(__linux__)
+    if (model->q8_bf16_arena) shmdt(model->q8_bf16_arena);
+#endif
     free(model->matvec_tmp);
     free(model->rope_inv_freq);
     free(model->rope_mrope_inv_freq);
+    for (int i = 0; i < model->decode_owned_count; i++)
+        free(model->decode_owned[i]);
+    free(model->decode_owned);
     /* Free extra per-thread scratch (thread_tmp[0] == matvec_tmp, already freed) */
     tf_pool_shutdown(model);
     if (model->thread_tmp) {
@@ -2256,23 +4765,104 @@ typedef struct {
     int tid;
 } tf_pool_worker_ctx;
 
+static void tf_bind_current_thread_for_numa(const transformer_model *model,
+                                            int tid) {
+    const char *enabled = getenv("NUMA_DISTRIBUTE");
+    if (!enabled || atoi(enabled) == 0) {
+        (void)tid;
+        return;
+    }
+#if defined(__linux__)
+    int n_cmgs = 4;
+    const char *env = getenv("NUMA_N_CMGS");
+    if (env) n_cmgs = atoi(env);
+    if (n_cmgs < 1) n_cmgs = 1;
+    if (n_cmgs > 4) n_cmgs = 4;
+    /* Keep the pool's contiguous row slices local: workers 0..11 belong to
+     * CMG0, 12..23 to CMG1, etc.  The old round-robin mapping (tid % 4)
+     * scattered every tensor slice across all CMGs and made first-touch
+     * placement remote for three quarters of each slice. */
+    int per_cmg = 48 / n_cmgs;
+    int cmg, local;
+    if (model && model->pool_core_striped && model->n_threads >= n_cmgs &&
+        model->n_threads % n_cmgs == 0) {
+        int team_per_cmg = model->n_threads / n_cmgs;
+        cmg = tid / team_per_cmg;
+        local = model->pool_core_offset + tid % team_per_cmg;
+    } else {
+        int logical_tid = tid + (model ? model->pool_core_offset : 0);
+        logical_tid %= 48;
+        if (logical_tid < 0) logical_tid += 48;
+        cmg = logical_tid / per_cmg;
+        local = logical_tid % per_cmg;
+    }
+    if (cmg >= n_cmgs) cmg = n_cmgs - 1;
+    if (local >= 12) local %= 12;
+    int core = 12 + cmg * 12 + local;
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) != 0 && tid == 0) {
+        fprintf(stderr, "numa: warning: sched_setaffinity(core=%d) failed\n", core);
+    }
+#else
+    (void)tid;
+#endif
+}
+
+static int tf_bind_current_thread_for_numa_saved(const transformer_model *model,
+                                                 int tid, cpu_set_t *old_set) {
+    const char *enabled = getenv("NUMA_DISTRIBUTE");
+    if (!enabled || atoi(enabled) == 0) {
+        (void)tid;
+        (void)old_set;
+        return 0;
+    }
+#if defined(__linux__)
+    if (sched_getaffinity(0, sizeof(*old_set), old_set) != 0) return 0;
+    tf_bind_current_thread_for_numa(model, tid);
+    return 1;
+#else
+    (void)tid;
+    (void)old_set;
+    return 0;
+#endif
+}
+
+static void tf_restore_current_thread_affinity(int restore, const cpu_set_t *old_set) {
+#if defined(__linux__)
+    if (restore) sched_setaffinity(0, sizeof(*old_set), old_set);
+#else
+    (void)restore;
+    (void)old_set;
+#endif
+}
+
 static void *tf_pool_worker_main(void *arg) {
     tf_pool_worker_ctx *ctx = (tf_pool_worker_ctx *)arg;
     transformer_model *m = ctx->model;
     int tid = ctx->tid;
     free(ctx);
+    tf_bind_current_thread_for_numa(m, tid);
 
+    /* NOTE: a spin-then-sleep on pool_phase was tried to cut the cond_broadcast
+     * wake-from-sleep latency (~0.4ms/dispatch x 169/tok) but it only ever HURT
+     * (any spin budget throttles the chip / contends); pure cond_wait is best. The
+     * per-matvec barrier overhead is structural -> the real lever is batched decode. */
     int last_phase = 0;
     while (1) {
-        /* Sleep until dispatcher signals new work via cond_broadcast.
-         * Workers consume ZERO bandwidth while sleeping (futex-based). */
+        /* Sleep until dispatcher signals new work via cond_broadcast. */
         pthread_mutex_lock(&m->pool_mutex);
-        while (m->pool_phase == last_phase && m->pool_alive)
+        while (m->pool_phase == last_phase && (m->pool_alive || m->pool_paused))
             pthread_cond_wait(&m->pool_cond, &m->pool_mutex);
         pthread_mutex_unlock(&m->pool_mutex);
 
         last_phase = m->pool_phase;
-        if (!m->pool_alive) return NULL;
+        if (!m->pool_alive) {
+            if (m->pool_paused) continue;
+            return NULL;
+        }
 
         /* Execute work */
         void *task = (char *)m->pool_args + (size_t)tid * m->pool_arg_stride;
@@ -2306,6 +4896,7 @@ static void tf_pool_start(transformer_model *model) {
     model->pool_phase = 0;
     model->pool_done = 0;
     model->pool_alive = 1;
+    model->pool_paused = 0;
     pthread_mutex_init(&model->pool_mutex, NULL);
     pthread_cond_init(&model->pool_cond, NULL);
     __sync_synchronize();
@@ -2334,13 +4925,78 @@ static void tf_pool_dispatch(transformer_model *model, void *(*fn)(void *),
     pthread_cond_broadcast(&model->pool_cond);
     pthread_mutex_unlock(&model->pool_mutex);
 
-    /* Main thread executes worker 0's task directly */
+    /* Main thread executes worker 0's task directly. Pin only for this task so
+     * later ad-hoc pthread kernels inherit the broad numactl CPU mask. */
     void *task0 = (char *)args;
+#if defined(__linux__)
+    cpu_set_t old_set;
+    int restore_affinity = tf_bind_current_thread_for_numa_saved(model, 0, &old_set);
+#endif
     fn(task0);
+#if defined(__linux__)
+    tf_restore_current_thread_affinity(restore_affinity, &old_set);
+#endif
 
     /* Wait for remaining workers (brief spin — workers are doing useful work) */
     while (model->pool_done < nt - 1)
         tf_cpu_pause();
+}
+
+typedef struct {
+    qtensor **weights;
+    int count;
+    int tid;
+    int nt;
+} tf_null_stream_task;
+
+static void *tf_null_stream_worker(void *arg) {
+    tf_null_stream_task *t = (tf_null_stream_task *)arg;
+    for (int i = 0; i < t->count; i++) {
+        qtensor *mat = t->weights[i];
+        size_t total = tf_null_tensor_bytes(mat, mat->n_rows);
+        size_t off = total * (size_t)t->tid / (size_t)t->nt;
+        size_t end = total * (size_t)(t->tid + 1) / (size_t)t->nt;
+        tf_null_scan((const uint8_t *)mat->data + off, end - off);
+    }
+    return NULL;
+}
+
+double transformer_null_stream_bench(transformer_model *m, int passes) {
+    if (!m || !m->pool_alive || passes < 1) return 0.0;
+    int cap = m->n_layers * 13 + 1;
+    qtensor **weights = (qtensor **)alloca((size_t)cap * sizeof(*weights));
+    int count = 0;
+    for (int l = 0; l < m->n_layers; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *v[] = {
+            &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+            &L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta,
+            &L->ssm_conv1d, &L->ssm_out
+        };
+        for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++)
+            if (v[i]->data && (v[i]->type == GGML_TYPE_Q8_0 ||
+                               v[i]->type == GGML_TYPE_BF16 ||
+                               v[i]->type == GGML_TYPE_F16 || v[i]->i8))
+                weights[count++] = v[i];
+    }
+    if (m->output.data && (m->output.type == GGML_TYPE_Q8_0 ||
+                          m->output.type == GGML_TYPE_BF16 ||
+                          m->output.type == GGML_TYPE_F16 || m->output.i8))
+        weights[count++] = &m->output;
+    double bytes = 0.0;
+    for (int i = 0; i < count; i++) bytes += (double)tf_null_tensor_bytes(weights[i], weights[i]->n_rows);
+    int nt = m->n_threads;
+    tf_null_stream_task *tasks = (tf_null_stream_task *)alloca((size_t)nt * sizeof(*tasks));
+    for (int t = 0; t < nt; t++) tasks[t] = (tf_null_stream_task){weights, count, t, nt};
+    double t0 = tf_time_ms();
+    for (int p = 0; p < passes; p++)
+        tf_pool_dispatch(m, tf_null_stream_worker, tasks, sizeof(*tasks));
+    double ms = tf_time_ms() - t0;
+    double total_bytes = bytes * passes;
+    fprintf(stderr, "transformer: null-batched tensors=%d %.3f GB/pass %.1f GB/s (%d passes)\n",
+            count, bytes / 1e9, ms > 0.0 ? total_bytes / (ms * 1e6) : 0.0, passes);
+    return ms > 0.0 ? total_bytes / (ms * 1e6) : 0.0;
 }
 
 void transformer_set_threads(transformer_model *model, int n_threads) {
@@ -2357,6 +5013,10 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     int max_ff = tf_compute_max_ff(model);
     int max_dim = model->n_embd > max_ff ? model->n_embd : max_ff;
     model->n_threads = n_threads;
+    free(model->lm_head_best_idx);
+    free(model->lm_head_best_val);
+    model->lm_head_best_idx = (int *)calloc((size_t)n_threads, sizeof(int));
+    model->lm_head_best_val = (float *)calloc((size_t)n_threads, sizeof(float));
     model->thread_tmp = (float **)calloc(n_threads, sizeof(float *));
     model->thread_tmp[0] = model->matvec_tmp;
     for (int t = 1; t < n_threads; t++) {
@@ -2370,6 +5030,326 @@ void transformer_set_threads(transformer_model *model, int n_threads) {
     /* Start new pool */
     if (n_threads > 1) tf_pool_start(model);
     fprintf(stderr, "transformer: using %d threads (thread pool)\n", n_threads);
+#if defined(__ARM_FEATURE_SVE)
+    fprintf(stderr, "transformer: A64FX SVE kernels enabled (BF16/F16/Q4_0)\n");
+#endif
+}
+
+transformer_model *transformer_nextn_context_create(
+        const transformer_model *source, int n_threads) {
+    if (!source || !source->nextn.loaded) return NULL;
+
+    transformer_model *ctx = (transformer_model *)calloc(1, sizeof(*ctx));
+    if (!ctx) return NULL;
+    /* Tensor descriptors, RoPE tables, and all staged tensor payloads are
+     * immutable after staging, so a shallow copy is intentional.  Every
+     * mutable/owned pointer used by NextN is replaced below. */
+    *ctx = *source;
+    ctx->tp_stage_data = NULL;
+    ctx->tp_stage_bytes = 0;
+    ctx->tp_stage_is_mmap = 0;
+    ctx->q8_bf16_arena = NULL;
+    ctx->q8_bf16_arena_bytes = 0;
+    ctx->decode_owned = NULL;
+    ctx->decode_owned_count = ctx->decode_owned_cap = 0;
+    memset(&ctx->mpool, 0, sizeof(ctx->mpool));
+    ctx->key_cache = ctx->value_cache = NULL;
+    ctx->key_cache_raw = ctx->value_cache_raw = NULL;
+    ctx->conv_state = NULL;
+    ctx->conv_state_pos = NULL;
+    ctx->recurrent_state = NULL;
+    ctx->conv_w_trans = NULL;
+    ctx->conv_w_trans_layers = NULL;
+    ctx->ple_buf = ctx->ple_proj_buf = NULL;
+
+    ctx->x = ctx->xb = ctx->xb2 = NULL;
+    ctx->q = ctx->k = ctx->v = ctx->att = NULL;
+    ctx->ffn_buf1 = ctx->ffn_buf2 = ctx->ffn_buf3 = NULL;
+    ctx->logits = ctx->matvec_tmp = NULL;
+    ctx->lm_head_best_idx = NULL;
+    ctx->lm_head_best_val = NULL;
+    ctx->thread_tmp = NULL;
+    ctx->pool_threads = NULL;
+    ctx->pool_fn = NULL;
+    ctx->pool_args = NULL;
+    ctx->pool_alive = ctx->pool_paused = 0;
+    ctx->n_threads = 1;
+    {
+        const char *offset = getenv("TP_MTP_SHADOW_CORE_OFFSET");
+        ctx->pool_core_offset = offset ? atoi(offset) : 0;
+        const char *striped = getenv("TP_MTP_SHADOW_STRIPED");
+        ctx->pool_core_striped = striped && atoi(striped) != 0;
+    }
+    ctx->nextn.key_cache = ctx->nextn.value_cache = NULL;
+    ctx->nextn.hidden = ctx->nextn.target_hidden = ctx->nextn.fusion = NULL;
+
+    transformer_layer *L = &ctx->nextn.layer;
+    int ne = ctx->n_embd, hd = ctx->head_dim;
+    int nh = L->attn_q.n_rows / (2 * hd);
+    int nkh = L->attn_k.n_rows / hd;
+    int qd = nh * hd, kvd = nkh * hd;
+    int nff = L->ffn_gate.n_rows;
+    int work = nff > qd ? nff : qd;
+    int tmp = ne > ctx->ssm_qkv_dim ? ne : ctx->ssm_qkv_dim;
+    if (tmp < work) tmp = work;
+    size_t nkv = (size_t)ctx->max_seq_len * kvd;
+    int nlogits = ctx->output.n_rows > 0 ? ctx->output.n_rows : ctx->n_vocab;
+
+#define TF_NN_CTX_ALLOC(field, count) do { \
+        ctx->field = (float *)tf_aligned_calloc(256, (size_t)(count), sizeof(float)); \
+        if (!ctx->field) goto fail; \
+    } while (0)
+    TF_NN_CTX_ALLOC(x, ne);
+    TF_NN_CTX_ALLOC(xb, ne);
+    TF_NN_CTX_ALLOC(xb2, qd > ne ? 2 * qd : 2 * ne);
+    TF_NN_CTX_ALLOC(q, qd);
+    TF_NN_CTX_ALLOC(k, kvd);
+    TF_NN_CTX_ALLOC(v, kvd);
+    TF_NN_CTX_ALLOC(att, (size_t)nh * ctx->max_seq_len);
+    TF_NN_CTX_ALLOC(ffn_buf1, work);
+    TF_NN_CTX_ALLOC(ffn_buf2, work);
+    TF_NN_CTX_ALLOC(ffn_buf3, work);
+    TF_NN_CTX_ALLOC(logits, nlogits);
+    TF_NN_CTX_ALLOC(matvec_tmp, tmp);
+    TF_NN_CTX_ALLOC(nextn.key_cache, nkv);
+    TF_NN_CTX_ALLOC(nextn.value_cache, nkv);
+    TF_NN_CTX_ALLOC(nextn.hidden, ne);
+    TF_NN_CTX_ALLOC(nextn.target_hidden, ne);
+    TF_NN_CTX_ALLOC(nextn.fusion, 2 * ne);
+#undef TF_NN_CTX_ALLOC
+
+    ctx->lm_head_best_idx = (int *)calloc(1, sizeof(int));
+    ctx->lm_head_best_val = (float *)calloc(1, sizeof(float));
+    ctx->thread_tmp = (float **)calloc(1, sizeof(float *));
+    if (!ctx->lm_head_best_idx || !ctx->lm_head_best_val || !ctx->thread_tmp)
+        goto fail;
+    ctx->thread_tmp[0] = ctx->matvec_tmp;
+    if (n_threads < 1) n_threads = 1;
+    if (n_threads > 1) transformer_set_threads(ctx, n_threads);
+    return ctx;
+
+fail:
+    transformer_nextn_context_free(ctx);
+    return NULL;
+}
+
+void transformer_nextn_context_copy_state(transformer_model *dst,
+                                           const transformer_model *source) {
+    if (!dst || !source || !dst->nextn.loaded || !source->nextn.loaded) return;
+    int kvd = dst->nextn.layer.attn_k.n_rows;
+    size_t nkv = (size_t)dst->max_seq_len * kvd;
+    memcpy(dst->nextn.key_cache, source->nextn.key_cache, nkv * sizeof(float));
+    memcpy(dst->nextn.value_cache, source->nextn.value_cache, nkv * sizeof(float));
+    memcpy(dst->nextn.hidden, source->nextn.hidden,
+           (size_t)dst->n_embd * sizeof(float));
+    memcpy(dst->nextn.target_hidden, source->nextn.target_hidden,
+           (size_t)dst->n_embd * sizeof(float));
+    memcpy(dst->nextn.fusion, source->nextn.fusion,
+           (size_t)2 * dst->n_embd * sizeof(float));
+}
+
+void transformer_nextn_context_free(transformer_model *ctx) {
+    if (!ctx) return;
+    tf_pool_shutdown(ctx);
+    if (ctx->thread_tmp) {
+        for (int t = 1; t < ctx->n_threads; t++) free(ctx->thread_tmp[t]);
+        free(ctx->thread_tmp);
+    }
+    free(ctx->x); free(ctx->xb); free(ctx->xb2);
+    free(ctx->q); free(ctx->k); free(ctx->v); free(ctx->att);
+    free(ctx->ffn_buf1); free(ctx->ffn_buf2); free(ctx->ffn_buf3);
+    free(ctx->logits); free(ctx->matvec_tmp);
+    free(ctx->lm_head_best_idx); free(ctx->lm_head_best_val);
+    free(ctx->nextn.key_cache); free(ctx->nextn.value_cache);
+    free(ctx->nextn.hidden); free(ctx->nextn.target_hidden);
+    free(ctx->nextn.fusion);
+    free(ctx);
+}
+
+void transformer_build_panels(transformer_model *model) {
+    (void)model;
+}
+
+void transformer_pool_profile_reset(void) {
+    tf_decode_matvec_ms = 0.0;
+    tf_decode_matvec_bytes = 0.0;
+    tf_decode_matvec_cnt = 0;
+    tf_decode_null_bytes = 0.0;
+    tf_decode_attn_qkv_ms = 0.0;
+    tf_decode_attn_out_ms = 0.0;
+    tf_decode_ssm_in_ms = 0.0;
+    tf_decode_ssm_prepare_ms = 0.0;
+    tf_decode_ssm_core_ms = 0.0;
+    tf_decode_ssm_out_ms = 0.0;
+    tf_decode_ffn_gateup_ms = 0.0;
+    tf_decode_ffn_down_ms = 0.0;
+    tf_decode_lm_head_ms = 0.0;
+}
+
+void transformer_reset_runtime_state(transformer_model *model) {
+    if (!model) return;
+    model->ds_embd = NULL;
+    model->ds_embd_stride = 0;
+    if (model->conv_state_pos) {
+        memset(model->conv_state_pos, 0, (size_t)model->n_layers * sizeof(int));
+    }
+    if (model->conv_state) {
+        for (int l = 0; l < model->n_layers; l++) {
+            if (model->conv_state[l]) {
+                int n = (model->ssm_conv_kernel - 1) * model->ssm_qkv_dim;
+                if (n > 0) memset(model->conv_state[l], 0, (size_t)n * sizeof(float));
+            }
+        }
+    }
+    if (model->recurrent_state) {
+        for (int l = 0; l < model->n_layers; l++) {
+            if (model->recurrent_state[l]) {
+                int n = model->ssm_dt_rank * model->ssm_d_state * model->ssm_d_state;
+                if (n > 0) memset(model->recurrent_state[l], 0, (size_t)n * sizeof(float));
+            }
+        }
+    }
+}
+
+#define TF_RUNTIME_STATE_MAGIC 0x54535254u /* "TRST" */
+#define TF_RUNTIME_STATE_VERSION 1u
+typedef struct {
+    uint32_t magic, version;
+    int32_t n_layers, layer_start, layer_end, cache_pos;
+    int32_t max_seq_len, tp_size, tp_rank, kv_elem_bytes;
+    int32_t tp_kv_head_count, head_dim, ssm_dt_rank, ssm_d_state;
+    int32_t ssm_qkv_dim, ssm_conv_kernel;
+    uint64_t payload_bytes;
+} tf_runtime_state_header;
+typedef struct {
+    uint64_t key_bytes, value_bytes, conv_bytes, recurrent_bytes;
+    int32_t conv_pos;
+    int32_t reserved;
+} tf_runtime_state_layer;
+
+static int tf_runtime_state_layout(const transformer_model *m, int l0, int l1,
+                                   int pos, size_t *total) {
+    if (!m || !total || l0 < 0 || l1 > m->n_layers || l0 >= l1 ||
+        pos < 0 || pos > m->max_seq_len || m->kv_elem_bytes <= 0) return -1;
+    size_t n = sizeof(tf_runtime_state_header) +
+               (size_t)(l1 - l0) * sizeof(tf_runtime_state_layer);
+    int kv_heads = m->tp_kv_head_count > 0 ? m->tp_kv_head_count : m->n_kv_heads;
+    for (int l = l0; l < l1; l++) {
+        size_t add = 0;
+        if (m->key_cache_raw && m->value_cache_raw &&
+            m->key_cache_raw[l] && m->value_cache_raw[l]) {
+            size_t row = (size_t)kv_heads * m->head_dim * m->kv_elem_bytes;
+            if ((size_t)pos > SIZE_MAX / row) return -1;
+            add = 2 * (size_t)pos * row;
+        }
+        if (m->conv_state && m->conv_state[l]) {
+            size_t x = (size_t)(m->ssm_conv_kernel - 1) * m->ssm_qkv_dim * sizeof(float);
+            if (add > SIZE_MAX - x) return -1;
+            add += x;
+        }
+        if (m->recurrent_state && m->recurrent_state[l]) {
+            size_t x = (size_t)m->ssm_dt_rank * m->ssm_d_state *
+                       m->ssm_d_state * sizeof(float);
+            if (add > SIZE_MAX - x) return -1;
+            add += x;
+        }
+        if (n > SIZE_MAX - add) return -1;
+        n += add;
+    }
+    *total = n;
+    return 0;
+}
+
+size_t transformer_runtime_state_size(const transformer_model *m,
+                                      int l0, int l1, int pos) {
+    size_t n = 0;
+    return tf_runtime_state_layout(m, l0, l1, pos, &n) == 0 ? n : 0;
+}
+
+int transformer_runtime_state_pack(const transformer_model *m, int l0, int l1,
+                                   int pos, void *blob, size_t blob_size) {
+    size_t need = 0;
+    if (!blob || tf_runtime_state_layout(m, l0, l1, pos, &need) || blob_size < need)
+        return -1;
+    tf_runtime_state_header *h = (tf_runtime_state_header *)blob;
+    *h = (tf_runtime_state_header){
+        TF_RUNTIME_STATE_MAGIC, TF_RUNTIME_STATE_VERSION, m->n_layers, l0, l1, pos,
+        m->max_seq_len, m->tp_size, m->tp_rank, m->kv_elem_bytes,
+        m->tp_kv_head_count, m->head_dim, m->ssm_dt_rank, m->ssm_d_state,
+        m->ssm_qkv_dim, m->ssm_conv_kernel,
+        need - sizeof(*h) - (uint64_t)(l1 - l0) * sizeof(tf_runtime_state_layer)
+    };
+    tf_runtime_state_layer *rec = (tf_runtime_state_layer *)(h + 1);
+    uint8_t *p = (uint8_t *)(rec + (l1 - l0));
+    int kv_heads = m->tp_kv_head_count > 0 ? m->tp_kv_head_count : m->n_kv_heads;
+    size_t kv_bytes = (size_t)pos * kv_heads * m->head_dim * m->kv_elem_bytes;
+    for (int l = l0; l < l1; l++, rec++) {
+        memset(rec, 0, sizeof(*rec));
+        if (m->key_cache_raw && m->value_cache_raw &&
+            m->key_cache_raw[l] && m->value_cache_raw[l]) {
+            rec->key_bytes = rec->value_bytes = kv_bytes;
+            memcpy(p, m->key_cache_raw[l], kv_bytes); p += kv_bytes;
+            memcpy(p, m->value_cache_raw[l], kv_bytes); p += kv_bytes;
+        }
+        if (m->conv_state && m->conv_state[l]) {
+            rec->conv_bytes = (uint64_t)(m->ssm_conv_kernel - 1) *
+                              m->ssm_qkv_dim * sizeof(float);
+            rec->conv_pos = m->conv_state_pos ? m->conv_state_pos[l] : 0;
+            memcpy(p, m->conv_state[l], (size_t)rec->conv_bytes); p += rec->conv_bytes;
+        }
+        if (m->recurrent_state && m->recurrent_state[l]) {
+            rec->recurrent_bytes = (uint64_t)m->ssm_dt_rank * m->ssm_d_state *
+                                   m->ssm_d_state * sizeof(float);
+            memcpy(p, m->recurrent_state[l], (size_t)rec->recurrent_bytes);
+            p += rec->recurrent_bytes;
+        }
+    }
+    return (size_t)(p - (uint8_t *)blob) == need ? 0 : -1;
+}
+
+int transformer_runtime_state_unpack(transformer_model *m, const void *blob,
+                                     size_t blob_size, int *cache_pos) {
+    if (!m || !blob || blob_size < sizeof(tf_runtime_state_header)) return -1;
+    const tf_runtime_state_header *h = (const tf_runtime_state_header *)blob;
+    if (h->magic != TF_RUNTIME_STATE_MAGIC || h->version != TF_RUNTIME_STATE_VERSION ||
+        h->n_layers != m->n_layers || h->layer_start < 0 || h->layer_end > m->n_layers ||
+        h->layer_start >= h->layer_end || h->cache_pos < 0 ||
+        h->cache_pos > m->max_seq_len || h->tp_size != m->tp_size ||
+        h->tp_rank != m->tp_rank || h->kv_elem_bytes != m->kv_elem_bytes ||
+        h->tp_kv_head_count != m->tp_kv_head_count || h->head_dim != m->head_dim ||
+        h->ssm_dt_rank != m->ssm_dt_rank || h->ssm_d_state != m->ssm_d_state ||
+        h->ssm_qkv_dim != m->ssm_qkv_dim || h->ssm_conv_kernel != m->ssm_conv_kernel)
+        return -1;
+    int nr = h->layer_end - h->layer_start;
+    size_t meta = sizeof(*h) + (size_t)nr * sizeof(tf_runtime_state_layer);
+    if (meta > blob_size || h->payload_bytes != blob_size - meta) return -1;
+    const tf_runtime_state_layer *rec = (const tf_runtime_state_layer *)(h + 1);
+    const uint8_t *p = (const uint8_t *)(rec + nr), *end = (const uint8_t *)blob + blob_size;
+    int kv_heads = m->tp_kv_head_count > 0 ? m->tp_kv_head_count : m->n_kv_heads;
+    size_t kv_bytes = (size_t)h->cache_pos * kv_heads * m->head_dim * m->kv_elem_bytes;
+    for (int l = h->layer_start; l < h->layer_end; l++, rec++) {
+        size_t cb = (m->conv_state && m->conv_state[l]) ?
+            (size_t)(m->ssm_conv_kernel - 1) * m->ssm_qkv_dim * sizeof(float) : 0;
+        size_t rb = (m->recurrent_state && m->recurrent_state[l]) ?
+            (size_t)m->ssm_dt_rank * m->ssm_d_state * m->ssm_d_state * sizeof(float) : 0;
+        int have_kv = m->key_cache_raw && m->value_cache_raw &&
+                      m->key_cache_raw[l] && m->value_cache_raw[l];
+        if (rec->key_bytes != (have_kv ? kv_bytes : 0) ||
+            rec->value_bytes != (have_kv ? kv_bytes : 0) ||
+            rec->conv_bytes != cb || rec->recurrent_bytes != rb ||
+            rec->key_bytes + rec->value_bytes + rec->conv_bytes + rec->recurrent_bytes >
+                (uint64_t)(end - p)) return -1;
+        if (rec->key_bytes) { memcpy(m->key_cache_raw[l], p, kv_bytes); p += kv_bytes; }
+        if (rec->value_bytes) { memcpy(m->value_cache_raw[l], p, kv_bytes); p += kv_bytes; }
+        if (rec->conv_bytes) {
+            memcpy(m->conv_state[l], p, cb); p += cb;
+            if (m->conv_state_pos) m->conv_state_pos[l] = rec->conv_pos;
+        }
+        if (rec->recurrent_bytes) { memcpy(m->recurrent_state[l], p, rb); p += rb; }
+    }
+    if (p != end) return -1;
+    if (cache_pos) *cache_pos = h->cache_pos;
+    return 0;
 }
 
 void transformer_set_trace_hidden_norms(transformer_model *model, int enable) {
@@ -2410,6 +5390,18 @@ static void *tf_numa_pread_worker(void *arg) {
         ssize_t n = pread(t->fd, base + start + off, chunk,
                           (off_t)(t->file_off + start + off));
         if (n <= 0) break;
+#if defined(POSIX_FADV_DONTNEED)
+        /* Explicit HBM2 upload: drop the SOURCE file's page-cache for the range we
+         * just copied into the anon buffer. Without this, preading 24 GB of weights
+         * balloons the page cache to ~24 GB ON TOP of the 24 GB anon dest -> kswapd
+         * must reclaim it -> swap thrash / interactive-session HANG. Default on;
+         * set TF_LOAD_KEEPCACHE=1 to keep pages cached. */
+        {
+            static int keep = -1;
+            if (keep < 0) { const char *e = getenv("TF_LOAD_KEEPCACHE"); keep = (e && atoi(e)) ? 1 : 0; }
+            if (!keep) posix_fadvise(t->fd, (off_t)(t->file_off + start + off), (size_t)n, POSIX_FADV_DONTNEED);
+        }
+#endif
         off += (size_t)n;
     }
     return NULL;
@@ -2427,7 +5419,7 @@ static void *tf_numa_memset_worker(void *arg) {
 static void tf_numa_init(transformer_model *m) {
     memset(&m->numa, 0, sizeof(m->numa));
     m->numa.n_cmgs = 4;
-    m->numa.per_cmg_budget = 6ULL * 1024 * 1024 * 1024;
+    m->numa.per_cmg_budget = 7ULL * 1024 * 1024 * 1024;
     m->numa.alignment = 2 * 1024 * 1024;
     m->numa.enabled = 0;
 
@@ -2435,7 +5427,10 @@ static void tf_numa_init(transformer_model *m) {
     if ((env = getenv("NUMA_N_CMGS")))       m->numa.n_cmgs = atoi(env);
     if ((env = getenv("NUMA_CMG_BUDGET_GB"))) m->numa.per_cmg_budget = (size_t)(atof(env) * 1024.0 * 1024.0 * 1024.0);
     if ((env = getenv("NUMA_ALIGNMENT")))     m->numa.alignment = (size_t)atol(env);
-    if (getenv("NUMA_DISTRIBUTE"))            m->numa.enabled = 1;
+    /* NUMA_INTERLEAVE is sufficient for anonymous weights, but when the
+     * loader has a file descriptor available we can do better: parallel
+     * first-touch places each tensor row range on the CMG that consumes it. */
+    if (getenv("NUMA_DISTRIBUTE") || getenv("NUMA_INTERLEAVE")) m->numa.enabled = 1;
 }
 
 /* Distribute a buffer across threads via parallel memset (first-touch placement) */
@@ -2454,6 +5449,35 @@ static void tf_numa_distribute_buffer(transformer_model *m, void *buf, size_t to
     tf_pool_dispatch(m, tf_numa_memset_worker, tasks, sizeof(tf_numa_task));
 }
 
+/* ── Persistent NUMA-distributed 256-aligned bump pool ──
+ * Replaces per-prefill posix_memalign/free (glibc mmap/munmap churn -> THP
+ * fragmentation + page mis-placement -> progressive prefill slowdown). The arena
+ * is mmap'd once and first-touched spread across CMGs (tf_numa_distribute_buffer,
+ * which needs the thread pool ALIVE -> call ensure before tf_pool_shutdown).
+ * Subsequent prefills reuse the placed pages (reset, no re-mmap, no re-touch). */
+#define TF_MPOOL_ALIGN 256u
+static void tf_mpool_reset(transformer_model *m) { m->mpool.off = 0; }
+static int tf_mpool_ensure(transformer_model *m, size_t need) {
+    if (m->mpool.base && m->mpool.cap >= need) return 1;
+    size_t cap = need + (need >> 2);                 /* +25% headroom */
+    cap = (cap + (2u<<20) - 1) & ~((size_t)(2u<<20) - 1);  /* round to 2MB (THP) */
+    void *p = mmap(NULL, cap, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 0;
+    if (m->mpool.base) munmap(m->mpool.base, m->mpool.cap);
+    m->mpool.base = p; m->mpool.cap = cap; m->mpool.off = 0;
+    if (m->numa.enabled) tf_numa_distribute_buffer(m, p, cap);  /* NUMA-spread first-touch */
+    else memset(p, 0, cap);                                     /* still pre-fault once */
+    return 1;
+}
+static void *tf_mpool_alloc(transformer_model *m, size_t bytes) {
+    size_t a = (bytes + (TF_MPOOL_ALIGN - 1)) & ~(size_t)(TF_MPOOL_ALIGN - 1);
+    if (m->mpool.off + a > m->mpool.cap) return NULL;
+    void *r = (uint8_t *)m->mpool.base + m->mpool.off;
+    m->mpool.off += a;
+    return r;
+}
+
 /* Print per-CMG usage */
 static void tf_numa_print_usage(transformer_model *m) {
     int nc = m->numa.n_cmgs < m->n_threads ? m->numa.n_cmgs : m->n_threads;
@@ -2461,6 +5485,55 @@ static void tf_numa_print_usage(transformer_model *m) {
     for (int c = 0; c < nc; c++)
         fprintf(stderr, " CMG%d=%.1fMB", c, (double)m->numa.per_cmg_used[c] / (1024.0 * 1024.0));
     fprintf(stderr, " (budget=%.1fGB)\n", (double)m->numa.per_cmg_budget / (1024.0 * 1024.0 * 1024.0));
+}
+
+static int tf_numa_verify_tensor_sample(int fd, const char *name, const void *data,
+                                        size_t file_off, size_t size, int full) {
+    if (fd < 0 || !data || size == 0) return 0;
+    uint8_t ref[64];
+    const uint8_t *mem = (const uint8_t *)data;
+    if (full) {
+        uint8_t *buf = (uint8_t *)malloc(1024 * 1024);
+        if (!buf) return 1;
+        size_t off = 0;
+        while (off < size) {
+            size_t n = size - off;
+            if (n > 1024 * 1024) n = 1024 * 1024;
+            if (pread(fd, buf, n, (off_t)(file_off + off)) != (ssize_t)n) {
+                fprintf(stderr, "numa: verify read failed tensor=%s off=%zu\n", name, off);
+                free(buf);
+                return 1;
+            }
+            if (memcmp(mem + off, buf, n) != 0) {
+                fprintf(stderr, "numa: verify mismatch tensor=%s off=%zu size=%zu\n",
+                        name, off, size);
+                free(buf);
+                return 1;
+            }
+            off += n;
+        }
+        free(buf);
+        return 0;
+    }
+    size_t points[3];
+    points[0] = 0;
+    points[1] = size > sizeof(ref) ? size / 2 : 0;
+    points[2] = size > sizeof(ref) ? size - sizeof(ref) : 0;
+    for (int i = 0; i < 3; i++) {
+        size_t off = points[i];
+        size_t n = size - off;
+        if (n > sizeof(ref)) n = sizeof(ref);
+        if (pread(fd, ref, n, (off_t)(file_off + off)) != (ssize_t)n) {
+            fprintf(stderr, "numa: verify read failed tensor=%s off=%zu\n", name, off);
+            return 1;
+        }
+        if (memcmp(mem + off, ref, n) != 0) {
+            fprintf(stderr, "numa: verify mismatch tensor=%s off=%zu size=%zu\n",
+                    name, off, size);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void transformer_numa_setup(transformer_model *m, const gguf_context *gguf) {
@@ -2482,13 +5555,15 @@ void transformer_numa_setup(transformer_model *m, const gguf_context *gguf) {
         fprintf(stderr, "numa: phase 1 - loading weights (fd=%d, %zu tensors)...\n",
                 fd, (size_t)gguf->n_tensors);
         size_t weight_bytes = 0;
+        int verify = getenv("TF_NUMA_VERIFY") ? atoi(getenv("TF_NUMA_VERIFY")) : 0;
+        int verify_errors = 0;
 
         for (uint64_t ti = 0; ti < gguf->n_tensors; ti++) {
             void *tdata = gguf_tensor_data(gguf, (int)ti);
             size_t tsz = gguf_tensor_size(gguf, (int)ti);
             if (!tdata || tsz == 0) continue;
 
-            size_t toff = gguf->data_offset + ((uint8_t *)tdata - gguf->data);
+            size_t toff = gguf->data_offset + gguf->tensors[ti].offset;
             int n_dims = (int)gguf->tensors[ti].n_dims;
             int n_rows = 1;
             for (int d = 1; d < n_dims; d++)
@@ -2505,7 +5580,7 @@ void transformer_numa_setup(transformer_model *m, const gguf_context *gguf) {
                 for (int t = 0; t < nt; t++) {
                     int rc = rp + (t < re ? 1 : 0);
                     size_t s = (size_t)ro * row_bytes;
-                    size_t e = (size_t)(ro + rc) * row_bytes;
+                    size_t e = (t == nt - 1) ? tsz : (size_t)(ro + rc) * row_bytes;
                     if (e > tsz) e = tsz;
                     tasks[t] = (tf_numa_task){tdata, fd, toff, s, e};
                     int cmg = t < m->numa.n_cmgs ? t : t % m->numa.n_cmgs;
@@ -2514,8 +5589,16 @@ void transformer_numa_setup(transformer_model *m, const gguf_context *gguf) {
                 }
                 tf_pool_dispatch(m, tf_numa_pread_worker, tasks, sizeof(tf_numa_task));
             }
+            if (verify && verify_errors < 8) {
+                const char *name = gguf_tensor_name(gguf, (int)ti);
+                verify_errors += tf_numa_verify_tensor_sample(fd, name ? name : "?",
+                                                              tdata, toff, tsz, verify >= 2);
+            }
             weight_bytes += tsz;
         }
+        if (verify)
+            fprintf(stderr, "numa: verify %s (%d sample mismatches)\n",
+                    verify_errors ? "FAILED" : "ok", verify_errors);
         fprintf(stderr, "numa: phase 1 done (%.1fGB weights loaded)\n",
                 (double)weight_bytes / (1024.0 * 1024.0 * 1024.0));
     }
@@ -2576,6 +5659,399 @@ void transformer_numa_setup(transformer_model *m, const gguf_context *gguf) {
     fprintf(stderr, "numa: setup complete\n");
 }
 
+typedef struct {
+    uint8_t *dst;
+    const uint8_t *src;
+    size_t start, end;
+} tf_copy_task;
+
+static void *tf_copy_worker(void *arg) {
+    tf_copy_task *t = (tf_copy_task *)arg;
+    if (t->end > t->start)
+        memcpy(t->dst + t->start, t->src + t->start, t->end - t->start);
+    return NULL;
+}
+
+static long tf_mem_available_kb(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char key[64], unit[16];
+    long value = -1;
+    while (fscanf(f, "%63s %ld %15s", key, &value, unit) == 3) {
+        if (strcmp(key, "MemAvailable:") == 0) break;
+        value = -1;
+    }
+    fclose(f);
+    return value;
+}
+
+static int tf_decode_owned_add(transformer_model *m, void *p) {
+    if (m->decode_owned_count == m->decode_owned_cap) {
+        int cap = m->decode_owned_cap ? 2 * m->decode_owned_cap : 128;
+        void **v = (void **)realloc(m->decode_owned, (size_t)cap * sizeof(void *));
+        if (!v) return -1;
+        m->decode_owned = v;
+        m->decode_owned_cap = cap;
+    }
+    m->decode_owned[m->decode_owned_count++] = p;
+    return 0;
+}
+
+static size_t tf_qtensor_bytes(const qtensor *t) {
+    if (!t || !t->data || t->n_rows <= 0 || t->n_cols <= 0) return 0;
+    size_t rb = tf_row_bytes(t->type, t->n_cols);
+    return rb ? (size_t)t->n_rows * rb : 0;
+}
+
+static size_t tf_materialize_nextn_tensor(transformer_model *m, qtensor *t,
+                                          const void *alias0, const void *alias1) {
+    size_t bytes = tf_qtensor_bytes(t);
+    if (!bytes || t->data == alias0 || t->data == alias1 || t->tp_owned_data) return 0;
+    uint8_t *dst = (uint8_t *)tf_aligned_alloc_notouch(256, bytes);
+    if (!dst || tf_decode_owned_add(m, dst) != 0) { free(dst); return (size_t)-1; }
+    int nt = m->n_threads > 0 ? m->n_threads : 1;
+    tf_copy_task *tasks = (tf_copy_task *)alloca((size_t)nt * sizeof(*tasks));
+    for (int i = 0; i < nt; i++) {
+        size_t a = bytes * (size_t)i / (size_t)nt;
+        size_t b = bytes * (size_t)(i + 1) / (size_t)nt;
+        tasks[i] = (tf_copy_task){dst, (const uint8_t *)t->data, a, b};
+    }
+    if (nt > 1 && m->pool_alive) tf_pool_dispatch(m, tf_copy_worker, tasks, sizeof(*tasks));
+    else tf_copy_worker(&tasks[0]);
+#if defined(MADV_DONTNEED)
+    {
+        long ps = sysconf(_SC_PAGESIZE);
+        if (ps > 0) {
+            uintptr_t lo = (uintptr_t)t->data & ~((uintptr_t)ps - 1);
+            uintptr_t hi = ((uintptr_t)t->data + bytes + (uintptr_t)ps - 1) & ~((uintptr_t)ps - 1);
+            madvise((void *)lo, hi - lo, MADV_DONTNEED);
+        }
+    }
+#endif
+    t->data = dst;
+    return bytes;
+}
+
+size_t transformer_materialize_nextn(transformer_model *m) {
+    if (!m || !m->nextn.loaded) return 0;
+    transformer_nextn *nn = &m->nextn;
+    transformer_layer *L = &nn->layer;
+    const void *out = m->output.data;
+    const void *emb = m->token_embd.data;
+    size_t total = 0;
+#define TF_NEXTN_COPY(x) do { \
+        size_t _n = tf_materialize_nextn_tensor(m, &(x), out, emb); \
+        if (_n == (size_t)-1) return 0; total += _n; \
+    } while (0)
+    TF_NEXTN_COPY(L->attn_norm); TF_NEXTN_COPY(L->attn_q); TF_NEXTN_COPY(L->attn_k);
+    TF_NEXTN_COPY(L->attn_v); TF_NEXTN_COPY(L->attn_q_norm); TF_NEXTN_COPY(L->attn_k_norm);
+    TF_NEXTN_COPY(L->attn_output); TF_NEXTN_COPY(L->ffn_norm);
+    TF_NEXTN_COPY(L->ffn_gate); TF_NEXTN_COPY(L->ffn_up); TF_NEXTN_COPY(L->ffn_down);
+    TF_NEXTN_COPY(nn->eh_proj); TF_NEXTN_COPY(nn->enorm); TF_NEXTN_COPY(nn->hnorm);
+    TF_NEXTN_COPY(nn->shared_head_norm); TF_NEXTN_COPY(nn->embed_tokens);
+    TF_NEXTN_COPY(nn->shared_head_head);
+#undef TF_NEXTN_COPY
+    fprintf(stderr, "transformer: NextN materialized %.3fGB MemAvailable=%.2fGB\n",
+            (double)total / 1e9, (double)tf_mem_available_kb() / (1024.0 * 1024.0));
+    return total;
+}
+
+size_t transformer_materialize_pp(transformer_model *m, int layer_start, int layer_end) {
+    if (!m || !m->layers) return 0;
+    if (layer_start < 0) layer_start = 0;
+    if (layer_end > m->n_layers) layer_end = m->n_layers;
+    size_t total = 0;
+#define TF_PP_COPY(x) do { \
+        size_t _n = tf_materialize_nextn_tensor(m, &(x), NULL, NULL); \
+        if (_n == (size_t)-1) return 0; total += _n; \
+    } while (0)
+    /* Every rank participates in the vocab-sharded head; keep its output
+     * projection resident.  The embedding is intentionally left mapped since
+     * only the first stage reads one row per token. */
+    TF_PP_COPY(m->output_norm);
+    TF_PP_COPY(m->output);
+    for (int l = layer_start; l < layer_end; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *w[] = {
+            &L->attn_norm, &L->attn_q, &L->attn_k, &L->attn_v,
+            &L->attn_q_norm, &L->attn_k_norm, &L->attn_q_bias,
+            &L->attn_k_bias, &L->attn_v_bias, &L->attn_output,
+            &L->ffn_norm, &L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->ffn_gate_inp, &L->ffn_up_exps, &L->ffn_gate_exps,
+            &L->ffn_down_exps, &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha,
+            &L->ssm_beta, &L->ssm_a, &L->ssm_dt_bias, &L->ssm_conv1d,
+            &L->ssm_norm, &L->ssm_out, &L->attn_v_norm,
+            &L->post_attention_norm, &L->post_ffw_norm,
+            &L->layer_output_scale, &L->ple_inp_gate, &L->ple_proj,
+            &L->ple_post_norm
+        };
+        for (size_t i = 0; i < sizeof(w) / sizeof(w[0]); i++) TF_PP_COPY(*w[i]);
+    }
+#undef TF_PP_COPY
+    fprintf(stderr, "transformer: PP resident %.3fGB layers=[%d,%d) MemAvailable=%.2fGB\n",
+            (double)total / 1e9, layer_start, layer_end,
+            (double)tf_mem_available_kb() / (1024.0 * 1024.0));
+    return total;
+}
+
+/* Opt-in physical placement check.  Reading procfs does not migrate or fault
+ * pages, and works with the A64FX large-page mappings used by libmpg. */
+static void tf_numa_report_mapping(const char *name, const void *ptr) {
+    if (!getenv("NUMA_REPORT") || !ptr) return;
+    FILE *f = fopen("/proc/self/numa_maps", "r");
+    if (!f) return;
+    uintptr_t p = (uintptr_t)ptr;
+    char line[1024];
+    char best[1024] = {0};
+    uintptr_t best_lo = 0;
+    while (fgets(line, sizeof(line), f)) {
+        /* numa_maps has only the mapping start (unlike /proc/self/maps); the
+         * last start not greater than ptr identifies the containing entry. */
+        unsigned long long lo;
+        if (sscanf(line, "%llx", &lo) == 1 && (uintptr_t)lo <= p) {
+            best_lo = (uintptr_t)lo;
+            strncpy(best, line, sizeof(best) - 1);
+            best[sizeof(best) - 1] = 0;
+        }
+    }
+    if (best_lo) fprintf(stderr, "numa: %s %p %s", name, ptr, best);
+    fclose(f);
+}
+
+static size_t tf_materialize_q8_tensor(transformer_model *m, qtensor *t) {
+    if (!t || !t->data || t->type != GGML_TYPE_Q8_0 || t->n_rows <= 0) return 0;
+    size_t row_bytes = tf_row_bytes(t->type, t->n_cols);
+    size_t bytes = (size_t)t->n_rows * row_bytes;
+    long avail = tf_mem_available_kb();
+    const long reserve_kb = 2L * 1024L * 1024L;
+    if (avail >= 0 && avail < (long)((bytes + 1023) / 1024) + reserve_kb) {
+        fprintf(stderr, "q8 resident: refusing %.1fMB tensor with MemAvailable=%.1fMB\n",
+                (double)bytes / 1048576.0, (double)avail / 1024.0);
+        return (size_t)-1;
+    }
+    uint8_t *dst = (uint8_t *)tf_aligned_alloc_notouch(256, bytes);
+    if (!dst) {
+        free(dst);
+        return (size_t)-1;
+    }
+    if (tf_decode_owned_add(m, dst) != 0) {
+        free(dst); return (size_t)-1;
+    }
+    int nt = m->n_threads > 0 ? m->n_threads : 1;
+    tf_copy_task *tasks = (tf_copy_task *)alloca((size_t)nt * sizeof(*tasks));
+    for (int i = 0; i < nt; i++) {
+        size_t r0 = (size_t)t->n_rows * (size_t)i / (size_t)nt;
+        size_t r1 = (size_t)t->n_rows * (size_t)(i + 1) / (size_t)nt;
+        tasks[i] = (tf_copy_task){dst, (const uint8_t *)t->data,
+                                  r0 * row_bytes, r1 * row_bytes};
+    }
+    if (nt > 1 && m->pool_alive)
+        tf_pool_dispatch(m, tf_copy_worker, tasks, sizeof(*tasks));
+    else
+        tf_copy_worker(&tasks[0]);
+#if defined(MADV_DONTNEED)
+    {
+        long ps = sysconf(_SC_PAGE_SIZE);
+        uintptr_t lo = (uintptr_t)t->data & ~((uintptr_t)ps - 1);
+        uintptr_t hi = ((uintptr_t)t->data + bytes + (uintptr_t)ps - 1) &
+                       ~((uintptr_t)ps - 1);
+        madvise((void *)lo, hi - lo, MADV_DONTNEED);
+    }
+#endif
+    t->data = dst;
+    return bytes;
+}
+
+typedef struct {
+    const block_q8_0 *src;
+    int8_t *dst;
+    float *scales;
+    int n_cols;
+    int row_start, row_end;
+} tf_q8_row_pack_task;
+
+static void *tf_q8_row_pack_worker(void *arg) {
+    tf_q8_row_pack_task *t = (tf_q8_row_pack_task *)arg;
+    const int nb = t->n_cols / 32;
+    for (int r = t->row_start; r < t->row_end; r++) {
+        const block_q8_0 *src = t->src + (size_t)r * nb;
+        int8_t *dst = t->dst + (size_t)r * t->n_cols;
+        float mx = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            float d = ggml_fp16_to_fp32(src[b].d);
+            for (int j = 0; j < 32; j++) {
+                float a = fabsf(d * (float)src[b].qs[j]);
+                if (a > mx) mx = a;
+            }
+        }
+        float ws = mx / 127.0f;
+        float inv = ws > 0.0f ? 1.0f / ws : 0.0f;
+        t->scales[r] = ws;
+        for (int b = 0; b < nb; b++) {
+            float f = ggml_fp16_to_fp32(src[b].d) * inv;
+            for (int j = 0; j < 32; j++) {
+                int q = (int)lrintf(f * (float)src[b].qs[j]);
+                dst[b * 32 + j] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q);
+            }
+        }
+    }
+    return NULL;
+}
+
+static size_t tf_materialize_q8_row_tensor(transformer_model *m, qtensor *t) {
+    if (!t || !t->data || t->type != GGML_TYPE_Q8_0 || t->n_rows <= 0) return 0;
+    size_t bytes = (size_t)t->n_rows * (size_t)t->n_cols;
+    size_t scale_bytes = (size_t)t->n_rows * sizeof(float);
+    long avail = tf_mem_available_kb();
+    const long reserve_kb = 2L * 1024L * 1024L;
+    if (avail >= 0 && avail < (long)((bytes + scale_bytes + 1023) / 1024) + reserve_kb)
+        return (size_t)-1;
+    int8_t *dst = (int8_t *)tf_aligned_alloc_notouch(256, bytes);
+    float *scales = (float *)tf_aligned_alloc_notouch(256, scale_bytes);
+    if (!dst || !scales) { free(dst); free(scales); return (size_t)-1; }
+    if (tf_decode_owned_add(m, dst) != 0) { free(dst); free(scales); return (size_t)-1; }
+    if (tf_decode_owned_add(m, scales) != 0) {
+        m->decode_owned_count--;
+        free(dst); free(scales);
+        return (size_t)-1;
+    }
+    int nt = m->n_threads > 0 ? m->n_threads : 1;
+    tf_q8_row_pack_task *tasks = (tf_q8_row_pack_task *)alloca((size_t)nt * sizeof(*tasks));
+    for (int i = 0; i < nt; i++) {
+        int r0 = t->n_rows * i / nt, r1 = t->n_rows * (i + 1) / nt;
+        tasks[i] = (tf_q8_row_pack_task){(const block_q8_0 *)t->data, dst, scales,
+                                         t->n_cols, r0, r1};
+    }
+    if (nt > 1 && m->pool_alive)
+        tf_pool_dispatch(m, tf_q8_row_pack_worker, tasks, sizeof(*tasks));
+    else
+        tf_q8_row_pack_worker(&tasks[0]);
+#if defined(MADV_DONTNEED)
+    {
+        size_t source_bytes = (size_t)t->n_rows * tf_row_bytes(t->type, t->n_cols);
+        long ps = sysconf(_SC_PAGE_SIZE);
+        uintptr_t lo = (uintptr_t)t->data & ~((uintptr_t)ps - 1);
+        uintptr_t hi = ((uintptr_t)t->data + source_bytes + (uintptr_t)ps - 1) &
+                       ~((uintptr_t)ps - 1);
+        madvise((void *)lo, hi - lo, MADV_DONTNEED);
+    }
+#endif
+    t->data = dst;
+    t->i8 = dst;
+    t->i8s = scales;
+    return bytes + scale_bytes;
+}
+
+typedef struct {
+    const block_q8_0 *src;
+    uint8_t *dst;
+    int n_rows, n_cols, group_start, group_end;
+} tf_q8_block64_pack_task;
+
+static void *tf_q8_block64_pack_worker(void *arg) {
+    tf_q8_block64_pack_task *t = (tf_q8_block64_pack_task *)arg;
+    int src_nb = t->n_cols / 32, nb = t->n_cols / 64;
+    size_t group_bytes = (size_t)nb * 544;
+    for (int g = t->group_start; g < t->group_end; g++) {
+        uint8_t *group = t->dst + (size_t)g * group_bytes;
+        for (int b = 0; b < nb; b++) {
+            uint8_t *blk = group + (size_t)b * 544;
+            uint16_t *scl = (uint16_t *)blk;
+            int8_t *qs = (int8_t *)(blk + 32);
+            for (int r = 0; r < 8; r++) {
+                const block_q8_0 *s = t->src + (size_t)(g * 8 + r) * src_nb + 2 * b;
+                scl[r * 2 + 0] = s[0].d;
+                scl[r * 2 + 1] = s[1].d;
+                memcpy(qs + (size_t)r * 64, s[0].qs, 32);
+                memcpy(qs + (size_t)r * 64 + 32, s[1].qs, 32);
+            }
+        }
+    }
+    return NULL;
+}
+
+static size_t tf_materialize_q8_block64_tensor(transformer_model *m, qtensor *t,
+                                               int exact_f32) {
+    if (!t || !t->data || t->type != GGML_TYPE_Q8_0 || t->n_rows <= 0) return 0;
+    if ((t->n_rows & 7) || (t->n_cols & 63))
+        return tf_materialize_q8_tensor(m, t);
+    int groups = t->n_rows / 8, nb = t->n_cols / 64;
+    size_t bytes = (size_t)groups * (size_t)nb * 544;
+    long avail = tf_mem_available_kb();
+    if (avail >= 0 && avail < (long)((bytes + 1023) / 1024) + 2L * 1024L * 1024L)
+        return (size_t)-1;
+    uint8_t *dst = (uint8_t *)tf_aligned_alloc_notouch(256, bytes);
+    if (!dst || tf_decode_owned_add(m, dst) != 0) { free(dst); return (size_t)-1; }
+    int nt = m->n_threads > 0 ? m->n_threads : 1;
+    tf_q8_block64_pack_task *tasks = (tf_q8_block64_pack_task *)alloca((size_t)nt * sizeof(*tasks));
+    for (int i = 0; i < nt; i++)
+        tasks[i] = (tf_q8_block64_pack_task){(const block_q8_0 *)t->data, dst,
+                                             t->n_rows, t->n_cols,
+                                             groups * i / nt, groups * (i + 1) / nt};
+    if (nt > 1 && m->pool_alive)
+        tf_pool_dispatch(m, tf_q8_block64_pack_worker, tasks, sizeof(*tasks));
+    else
+        tf_q8_block64_pack_worker(&tasks[0]);
+#if defined(MADV_DONTNEED)
+    {
+        size_t source_bytes = (size_t)t->n_rows * tf_row_bytes(t->type, t->n_cols);
+        long ps = sysconf(_SC_PAGE_SIZE);
+        uintptr_t lo = (uintptr_t)t->data & ~((uintptr_t)ps - 1);
+        uintptr_t hi = ((uintptr_t)t->data + source_bytes + (uintptr_t)ps - 1) & ~((uintptr_t)ps - 1);
+        madvise((void *)lo, hi - lo, MADV_DONTNEED);
+    }
+#endif
+    t->data = dst;
+    t->q8_block64 = exact_f32 ? 2 : 1;
+    return bytes;
+}
+
+size_t transformer_materialize_q8_decode(transformer_model *m,
+                                          const gguf_context *gguf,
+                                          int q8_mode) {
+    (void)gguf;
+    if (!m || !m->layers || !m->pool_alive) return 0;
+    size_t total = 0;
+#define TF_Q8_RESIDENT_MODE(t_, mode_) do { \
+        size_t _n = (mode_) == 1 ? tf_materialize_q8_row_tensor(m, (t_)) : \
+                    ((mode_) == 2 || (mode_) == 4) ? \
+                        tf_materialize_q8_block64_tensor(m, (t_), (mode_) == 4) : \
+                                   tf_materialize_q8_tensor(m, (t_)); \
+        if (_n == (size_t)-1) return 0; \
+        total += _n; \
+    } while (0)
+    for (int l = 0; l < m->n_layers; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *weights[] = {
+            &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+            &L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta,
+            &L->ssm_conv1d, &L->ssm_out
+        };
+        for (size_t i = 0; i < sizeof(weights) / sizeof(weights[0]); i++) {
+            int mode = q8_mode == 3 ? ((i >= 4 && i <= 6) ? 2 : 0) : q8_mode;
+            TF_Q8_RESIDENT_MODE(weights[i], mode);
+        }
+    }
+    TF_Q8_RESIDENT_MODE(&m->output, q8_mode == 3 ? 0 : q8_mode);
+#undef TF_Q8_RESIDENT_MODE
+    fprintf(stderr, "q8 resident: %.3fGB decode weights (%s), embedding/NextN mmap-backed, "
+                    "MemAvailable=%.1fMB\n",
+            (double)total / 1e9, q8_mode == 1 ? "row-int8" :
+                                  q8_mode == 2 ? "block64-int8" :
+                                  q8_mode == 3 ? "block64-ffn" :
+                                  q8_mode == 4 ? "block64-exact" : "reference-q8",
+            (double)tf_mem_available_kb() / 1024.0);
+    if (getenv("NUMA_REPORT")) {
+        int mid = m->n_layers / 2;
+        tf_numa_report_mapping("L0.ssm_qkv", m->layers[0].ssm_qkv.data);
+        tf_numa_report_mapping("L0.ffn_gate", m->layers[0].ffn_gate.data);
+        tf_numa_report_mapping("L0.ffn_down", m->layers[0].ffn_down.data);
+        tf_numa_report_mapping("Lmid.ffn_gate", m->layers[mid].ffn_gate.data);
+    }
+    return total;
+}
+
 /* ---- SSM Delta-Net forward (single token, autoregressive) ---- */
 
 /* L2-normalize a vector in-place: v[i] /= sqrt(sum(v[i]^2) + eps) */
@@ -2601,6 +6077,14 @@ static void tf_l2_norm(float *v, int n, float eps) {
     for (; i + 7 < n; i += 8)
         _mm256_storeu_ps(v + i, _mm256_mul_ps(_mm256_loadu_ps(v + i), vinv));
     for (; i < n; i++) v[i] *= inv;
+#elif defined(__ARM_FEATURE_SVE)
+    float ss = tf_f32_dot_sve(v, v, n);
+    float inv = 1.0f / sqrtf(ss + eps);
+    svfloat32_t vi = svdup_f32(inv);
+    for (int i = 0; i < n; i += (int)svcntw()) {
+        svbool_t pt = svwhilelt_b32((uint64_t)i, (uint64_t)n);
+        svst1(pt, v + i, svmul_x(pt, svld1(pt, v + i), vi));
+    }
 #else
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += v[i] * v[i];
@@ -2621,15 +6105,20 @@ typedef struct {
     int head_start, head_end;
     int d_state;
     float scale;
+    float *rec_state_out;   /* optional out-of-place next state */
 } tf_ssm_recurrence_task;
 
 static void *tf_ssm_recurrence_worker(void *arg) {
     tf_ssm_recurrence_task *t = (tf_ssm_recurrence_task *)arg;
     int ds = t->d_state;
     int d2 = ds * ds;
+    static int preexp_done=0,preexp=0;
+    if(!preexp_done){const char*e=getenv("TF_SSM_PREEXP");preexp=e&&atoi(e)!=0;preexp_done=1;}
 
     for (int h = t->head_start; h < t->head_end; h++) {
-        float *state = t->rec_state + (size_t)h * d2;
+        const float *state_in = t->rec_state + (size_t)h * d2;
+        float *state = (t->rec_state_out ? t->rec_state_out : t->rec_state) +
+                       (size_t)h * d2;
         float *q_h = t->Q_exp + h * ds;
         float *k_h = t->K_exp + h * ds;
         float *v_h = t->V_raw + h * ds;
@@ -2647,12 +6136,12 @@ static void *tf_ssm_recurrence_worker(void *arg) {
 
         /* Decay: state *= exp(alpha_h) */
         {
-            float decay = expf(t->alpha[h]);
+            float decay = preexp ? t->alpha[h] : expf(t->alpha[h]);
             __m256 vdecay = _mm256_set1_ps(decay);
             int i = 0;
             for (; i + 7 < d2; i += 8)
-                _mm256_storeu_ps(state + i, _mm256_mul_ps(_mm256_loadu_ps(state + i), vdecay));
-            for (; i < d2; i++) state[i] *= decay;
+                _mm256_storeu_ps(state + i, _mm256_mul_ps(_mm256_loadu_ps(state_in + i), vdecay));
+            for (; i < d2; i++) state[i] = state_in[i] * decay;
         }
 
         /* Read: sk = state @ k (2-row to share k loads) */
@@ -2825,11 +6314,84 @@ static void *tf_ssm_recurrence_worker(void *arg) {
                 o_h[r] = _mm_cvtss_f32(s4);
             }
         }
+#elif defined(__ARM_FEATURE_SVE)
+        /* A64FX path: the old fallback was scalar C for the three 128x128
+         * state matvecs.  Keep the same update order, but use SVE dot/FMA. */
+        {
+            svfloat32_t vs = svdup_f32(t->scale);
+            for (int i = 0; i < ds; i += (int)svcntw()) {
+                svbool_t pt = svwhilelt_b32((uint64_t)i, (uint64_t)ds);
+                svst1(pt, q_h + i, svmul_x(pt, svld1(pt, q_h + i), vs));
+            }
+            float decay = preexp ? t->alpha[h] : expf(t->alpha[h]);
+            svfloat32_t vd = svdup_f32(decay);
+            for (int i = 0; i < d2; i += (int)svcntw()) {
+                svbool_t pt = svwhilelt_b32((uint64_t)i, (uint64_t)d2);
+                svst1(pt, state + i, svmul_x(pt, svld1(pt, state_in + i), vd));
+            }
+            float sk[128], old_o[128], delta[128];
+            static int ssm_pair_done = 0, ssm_pair = 0, ssm_fused = 0;
+            if (!ssm_pair_done) {
+                const char *e = getenv("TF_SSM_SVE2");
+                ssm_pair = e && atoi(e) != 0;
+                e = getenv("TF_SSM_FUSED_DOTS");
+                ssm_fused = e && atoi(e) != 0;
+                ssm_pair_done = 1;
+            }
+            if (ssm_fused) {
+                for (int r = 0; r < ds; r++)
+                    tf_f32_dot_sve_2vec(&sk[r], &old_o[r],
+                                        state + (size_t)r * ds, k_h, q_h, ds);
+            } else if (ssm_pair) {
+                int r = 0;
+                for (; r + 1 < ds; r += 2)
+                    tf_f32_dot_sve_2row(&sk[r], &sk[r + 1],
+                                        state + (size_t)r * ds,
+                                        state + (size_t)(r + 1) * ds,
+                                        k_h, ds);
+                for (; r < ds; r++)
+                    sk[r] = tf_f32_dot_sve(state + (size_t)r * ds, k_h, ds);
+            } else {
+                for (int r = 0; r < ds; r++)
+                    sk[r] = tf_f32_dot_sve(state + (size_t)r * ds, k_h, ds);
+            }
+            svfloat32_t vb = svdup_f32(t->beta_arr[h]);
+            for (int i = 0; i < ds; i += (int)svcntw()) {
+                svbool_t pt = svwhilelt_b32((uint64_t)i, (uint64_t)ds);
+                svst1(pt, delta + i, svmul_x(pt,
+                    svsub_x(pt, svld1(pt, v_h + i), svld1(pt, sk + i)), vb));
+            }
+            for (int r = 0; r < ds; r++) {
+                svfloat32_t vr = svdup_f32(delta[r]);
+                float *row = state + (size_t)r * ds;
+                for (int c = 0; c < ds; c += (int)svcntw()) {
+                    svbool_t pt = svwhilelt_b32((uint64_t)c, (uint64_t)ds);
+                    svst1(pt, row + c, svmla_x(pt, svld1(pt, row + c), vr, svld1(pt, k_h + c)));
+                }
+            }
+            if (ssm_fused) {
+                float kq = tf_f32_dot_sve(k_h, q_h, ds);
+                for (int r = 0; r < ds; r++)
+                    o_h[r] = old_o[r] + delta[r] * kq;
+            } else if (ssm_pair) {
+                int r = 0;
+                for (; r + 1 < ds; r += 2)
+                    tf_f32_dot_sve_2row(&o_h[r], &o_h[r + 1],
+                                        state + (size_t)r * ds,
+                                        state + (size_t)(r + 1) * ds,
+                                        q_h, ds);
+                for (; r < ds; r++)
+                    o_h[r] = tf_f32_dot_sve(state + (size_t)r * ds, q_h, ds);
+            } else {
+                for (int r = 0; r < ds; r++)
+                    o_h[r] = tf_f32_dot_sve(state + (size_t)r * ds, q_h, ds);
+            }
+        }
 #else
         /* Scalar fallback */
         for (int i = 0; i < ds; i++) q_h[i] *= t->scale;
-        float decay = expf(t->alpha[h]);
-        for (int i = 0; i < d2; i++) state[i] *= decay;
+        float decay = preexp ? t->alpha[h] : expf(t->alpha[h]);
+        for (int i = 0; i < d2; i++) state[i] = state_in[i] * decay;
 
         float sk[128];
         for (int r = 0; r < ds; r++) {
@@ -2853,12 +6415,232 @@ static void *tf_ssm_recurrence_worker(void *arg) {
     return NULL;
 }
 
+#if defined(__ARM_FEATURE_SVE)
+static inline svfloat32_t tf_exp2_fexpa_approx_sve(svbool_t pg,
+                                                   svfloat32_t x);
+/* TP4 batched DeltaNet scan: Qwen3.8 has 48 global V heads, hence only 12
+ * local heads after TP4. The old head-parallel loop used 12/48 cores. Split
+ * each 128-row recurrent state into four disjoint 32-row slices. Every worker
+ * retains its rows for the complete token sequence, preserving recurrence
+ * order. Output normalization is deferred until the scan completes: it does
+ * not feed the recurrent state, and this avoids two four-way barriers/token. */
+static void tf_ssm_scan4_batch(float *rec_state, float *Q, float *K,
+        float *V, float *out, const float *alpha, const float *beta,
+        const float *gate, const float *norm_w, float *scratch,
+        int N, int nh, int ds, int q_stride, int k_stride, int v_stride,
+        int out_stride, int gate_stride, float scale, float eps, int nt) {
+    float *kq = scratch;
+    float *decay = scratch + (size_t)N * nh;
+    static int preexp = -1;
+    if (preexp < 0) {
+        const char *e = getenv("TF_SSM_PREEXP");
+        preexp = e && atoi(e) != 0;
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int z = 0; z < N * nh; z++) {
+        int t = z / nh, h = z % nh;
+        float *q = Q + (size_t)t * q_stride + h * ds;
+        const float *k = K + (size_t)t * k_stride + h * ds;
+        svfloat32_t vs = svdup_f32(scale);
+        for (int i = 0; i < ds; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)ds);
+            svst1(pg, q + i, svmul_f32_x(pg, svld1(pg, q + i), vs));
+        }
+        kq[z] = tf_f32_dot_sve(k, q, ds);
+        decay[z] = preexp ? alpha[(size_t)t * nh + h]
+                          : expf(alpha[(size_t)t * nh + h]);
+    }
+
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    {
+        int tid = 0, team = 1;
+        #ifdef _OPENMP
+        tid = omp_get_thread_num(); team = omp_get_num_threads();
+        #endif
+        /* Give every recurrent head an equal number of workers.  TP4's
+         * full-core verifier uses four lanes/head (48 workers), while the
+         * async 36/12 split uses three.  Integer row boundaries cover the
+         * complete 128-row state without overlap even when lanes does not
+         * divide ds exactly. */
+        if (team >= nh && team % nh == 0) {
+            int lanes = team / nh;
+            int h = tid / lanes, lane = tid % lanes;
+            int r0 = lane * ds / lanes, r1 = (lane + 1) * ds / lanes;
+            float *state_h = rec_state + (size_t)h * ds * ds;
+            for (int t = 0; t < N; t++) {
+                float *q = Q + (size_t)t * q_stride + h * ds;
+                const float *k = K + (size_t)t * k_stride + h * ds;
+                const float *v = V + (size_t)t * v_stride + h * ds;
+                float *o = out + (size_t)t * out_stride + h * ds;
+                float vd = decay[(size_t)t * nh + h];
+                float vb = beta[(size_t)t * nh + h];
+                float hkq = kq[(size_t)t * nh + h];
+                for (int r = r0; r < r1; r++) {
+                    float *row = state_h + (size_t)r * ds;
+                    svfloat32_t vdecay = svdup_f32(vd);
+                    for (int c = 0; c < ds; c += (int)svcntw()) {
+                        svbool_t pg = svwhilelt_b32((uint64_t)c, (uint64_t)ds);
+                        svst1(pg, row + c,
+                              svmul_f32_x(pg, svld1(pg, row + c), vdecay));
+                    }
+                    float sk, old_o;
+                    tf_f32_dot_sve_2vec(&sk, &old_o, row, k, q, ds);
+                    float delta = (v[r] - sk) * vb;
+                    svfloat32_t vdelta = svdup_f32(delta);
+                    for (int c = 0; c < ds; c += (int)svcntw()) {
+                        svbool_t pg = svwhilelt_b32((uint64_t)c, (uint64_t)ds);
+                        svst1(pg, row + c, svmla_f32_x(pg, svld1(pg, row + c),
+                                                       vdelta, svld1(pg, k + c)));
+                    }
+                    o[r] = old_o + delta * hkq;
+                }
+            }
+        }
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int z = 0; z < N * nh; z++) {
+        int t = z / nh, h = z % nh;
+        float *o = out + (size_t)t * out_stride + h * ds;
+        const float *g = gate + (size_t)t * gate_stride + h * ds;
+        float ns = 1.0f / sqrtf(tf_f32_dot_sve(o, o, ds) / ds + eps);
+        for (int i = 0; i < ds; i += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)ds);
+            svfloat32_t zv = svld1(pg, g + i);
+            svfloat32_t et = svmul_n_f32_x(pg, zv, -1.4426950408889634f);
+            et = svmax_n_f32_x(pg, svmin_n_f32_x(pg, et, 80.0f), -80.0f);
+            svfloat32_t den = svadd_n_f32_x(pg,
+                tf_exp2_fexpa_approx_sve(pg, et), 1.0f);
+            svfloat32_t inv = svrecpe_f32(den);
+            inv = svmul_f32_x(pg, inv, svrecps_f32(den, inv));
+            svfloat32_t y = svmul_n_f32_x(pg, svld1(pg, o + i), ns);
+            y = svmul_f32_x(pg, y, svld1(pg, norm_w + i));
+            y = svmul_f32_x(pg, y, svmul_f32_x(pg, zv, inv));
+            svst1(pg, o + i, y);
+        }
+    }
+}
+#endif
+
 /* SSM Delta-Net forward for one layer.
  * Input:  m->xb (post-norm hidden state [n_embd])
  * Output: m->xb (residual-ready output [n_embd])
  * Scratch: m->xb2 (qkv), m->q (Q_expanded), m->ffn_buf1 (z/gate),
  *          m->ffn_buf2 (K_expanded), m->ffn_buf3 (delta-net output) */
-static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
+static void tf_ssm_finish_heads(transformer_model *m, int layer_idx,
+                                int head_start, int head_end) {
+    transformer_layer *layer = &m->layers[layer_idx];
+    int ds = m->ssm_d_state;
+    float norm_w[128];
+    tf_dequant_row(&layer->ssm_norm, 0, norm_w);
+    for (int h = head_start; h < head_end; h++) {
+        float *o = m->ffn_buf3 + (size_t)h * ds;
+        float *z = m->ffn_buf1 + (size_t)h * ds;
+#if defined(__ARM_FEATURE_SVE)
+        float ss = tf_f32_dot_sve(o, o, ds);
+#else
+        float ss = 0.0f;
+        for (int i = 0; i < ds; i++) ss += o[i] * o[i];
+#endif
+        float scale = 1.0f / sqrtf(ss / ds + m->rms_norm_eps);
+        for (int i = 0; i < ds; i++) {
+            float zi = z[i];
+            o[i] = o[i] * scale * norm_w[i] *
+                   (zi / (1.0f + expf(-zi)));
+        }
+    }
+}
+
+/* Cooperative SSM preparation helpers.  They operate on the persistent pool
+ * directly; no nested pool dispatch is allowed while the token worker owns it. */
+static void tf_ssm_prepare_conv_worker(transformer_model *m, int layer_idx,
+                                       int tid, int nt, int inline_copy) {
+    transformer_layer *layer = &m->layers[layer_idx];
+    int qkv_dim = m->ssm_qkv_dim;
+    int conv_k = m->ssm_conv_kernel;
+    int n_hist = conv_k - 1;
+    int wr = m->conv_state_pos[layer_idx];
+    float *qkv = m->xb2;
+    float *out = m->ffn_buf2;
+    float *state = m->conv_state[layer_idx];
+    float *w = m->conv_w_trans_layers ? m->conv_w_trans_layers[layer_idx] : NULL;
+    if (!w) w = m->conv_w_trans;
+    int row_off[8];
+    for (int f = 0; f < n_hist; f++) row_off[f] = ((wr + f) % n_hist) * qkv_dim;
+    int j0 = qkv_dim * tid / nt;
+    int j1 = qkv_dim * (tid + 1) / nt;
+#if defined(__ARM_FEATURE_SVE)
+    for (int j = j0; j < j1; j += (int)svcntw()) {
+        svbool_t pg = svwhilelt_b32((uint64_t)j, (uint64_t)j1);
+        svfloat32_t sum = svmul_x(pg,
+            svld1(pg, w + (size_t)n_hist * qkv_dim + j), svld1(pg, qkv + j));
+        for (int f = 0; f < n_hist; f++)
+            sum = svmla_x(pg, sum, svld1(pg, w + (size_t)f * qkv_dim + j),
+                          svld1(pg, state + row_off[f] + j));
+        svst1(pg, out + j, sum);
+    }
+#else
+    for (int j = j0; j < j1; j++) {
+        float sum = w[n_hist * qkv_dim + j] * qkv[j];
+        for (int f = 0; f < n_hist; f++) sum += w[f * qkv_dim + j] * state[row_off[f] + j];
+        out[j] = sum;
+    }
+#endif
+    for (int j = j0; j < j1; j++) out[j] /= 1.0f + expf(-out[j]);
+
+    /* Channels are independent throughout the depthwise convolution.  Publish
+     * this worker's original input to its ring-state slice, then replace only
+     * the same QKV slice with the completed convolution output.  Doing this
+     * here preserves the historical arithmetic while removing the serial
+     * whole-vector copies and their extra global barrier. */
+    if (inline_copy) {
+        memcpy(state + (size_t)wr * qkv_dim + j0, qkv + j0,
+               (size_t)(j1 - j0) * sizeof(float));
+        memcpy(qkv + j0, out + j0, (size_t)(j1 - j0) * sizeof(float));
+    }
+}
+
+static void tf_ssm_prepare_qk_worker(transformer_model *m, int tid, int nt, int expand) {
+    int d_state = m->ssm_d_state;
+    int n_group = m->ssm_n_group;
+    int dt_rank = m->ssm_dt_rank;
+    int g0 = n_group * tid / nt;
+    int g1 = n_group * (tid + 1) / nt;
+    float *qkv = m->xb2;
+    for (int g = g0; g < g1; g++) {
+        tf_l2_norm(qkv + g * d_state, d_state, m->rms_norm_eps);
+        tf_l2_norm(qkv + n_group * d_state + g * d_state, d_state, m->rms_norm_eps);
+    }
+    if (!expand) return;
+    int h0 = dt_rank * tid / nt;
+    int h1 = dt_rank * (tid + 1) / nt;
+    float *q_exp = m->q;
+    float *k_exp = m->ffn_buf2;
+    for (int h = h0; h < h1; h++) {
+        int g = (m->ssm_head_offset + h) % n_group;
+        memcpy(q_exp + (size_t)h * d_state, qkv + (size_t)g * d_state,
+               (size_t)d_state * sizeof(float));
+        memcpy(k_exp + (size_t)h * d_state,
+               qkv + (size_t)(n_group + g) * d_state,
+               (size_t)d_state * sizeof(float));
+    }
+}
+
+#if defined(__ARM_FEATURE_SVE)
+static inline svfloat32_t tf_exp2_fexpa_approx_sve(svbool_t pg, svfloat32_t x);
+#endif
+
+static void tf_ssm_deltanet_forward_parts(transformer_model *m, int layer_idx,
+                                           int do_input_projection,
+                                           int do_output_projection,
+                                           int prepare_only,
+                                           int scalar_projections_ready,
+                                           int conv_ready, int qk_ready) {
     transformer_layer *layer = &m->layers[layer_idx];
     int n_embd  = m->n_embd;
     int qkv_dim = m->ssm_qkv_dim;
@@ -2876,12 +6658,17 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     float *Q_exp   = m->q;         /* [dt_rank * d_state] */
 
     /* 1. Linear projections from xb (pool-based for large projections) */
-    tf_qmatvec_pool(m, qkv_buf, &layer->ssm_qkv, m->xb, qkv_dim);
-    tf_qmatvec_pool(m, z_buf, &layer->ssm_gate, m->xb, d_inner);
+    if (do_input_projection) {
+        tf_qmatvec_pool(m, qkv_buf, &layer->ssm_qkv, m->xb, qkv_dim);
+        tf_qmatvec_pool(m, z_buf, &layer->ssm_gate, m->xb, d_inner);
+    }
 
-    float alpha[64], beta_arr[64]; /* dt_rank <= 64 (48 for Qwen3.5-27B) */
-    tf_qmatvec(alpha, &layer->ssm_alpha, m->xb, dt_rank, m->matvec_tmp);
-    tf_qmatvec(beta_arr, &layer->ssm_beta, m->xb, dt_rank, m->matvec_tmp);
+    float *alpha = m->ssm_alpha_tmp;
+    float *beta_arr = m->ssm_beta_tmp; /* dt_rank <= 64 */
+    if (!scalar_projections_ready) {
+        tf_qmatvec(alpha, &layer->ssm_alpha, m->xb, dt_rank, m->matvec_tmp);
+        tf_qmatvec(beta_arr, &layer->ssm_beta, m->xb, dt_rank, m->matvec_tmp);
+    }
 
     /* 2. alpha = softplus(alpha + dt_bias) * ssm_a */
     {
@@ -2889,9 +6676,10 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
         tf_dequant_row(&layer->ssm_a, 0, a_buf);
         tf_dequant_row(&layer->ssm_dt_bias, 0, dt_bias_buf);
         for (int i = 0; i < dt_rank; i++) {
-            float val = alpha[i] + dt_bias_buf[i];
+            int gh = m->ssm_head_offset + i;
+            float val = alpha[i] + dt_bias_buf[gh];
             float sp = (val > 20.0f) ? val : logf(1.0f + expf(val));
-            alpha[i] = sp * a_buf[i]; /* negative since ssm_a < 0 */
+            alpha[i] = sp * a_buf[gh]; /* negative since ssm_a < 0 */
         }
     }
 
@@ -2916,6 +6704,7 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
 #endif
 
     /* 4. Conv1d: depthwise causal conv + SiLU (circular buffer) */
+    if (!conv_ready) {
     {
         float *conv_st = m->conv_state[layer_idx]; /* [(conv_k-1) * qkv_dim] */
         int wr = m->conv_state_pos[layer_idx]; /* circular buffer write position */
@@ -2923,9 +6712,10 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
         /* Use K_exp temporarily for conv output (17408 >= 10240) */
         float *conv_out = K_exp;
 
-        /* Batch-dequant all conv weights into transposed layout [conv_k][qkv_dim] */
-        float *w_trans = m->conv_w_trans;
-        {
+        /* Conv weights are transposed and dequantized once at load time. */
+        float *w_trans = m->conv_w_trans_layers ? m->conv_w_trans_layers[layer_idx] : NULL;
+        if (!w_trans) w_trans = m->conv_w_trans;
+        if (!w_trans) {
             size_t crb = tf_row_bytes(layer->ssm_conv1d.type, layer->ssm_conv1d.n_cols);
             const uint8_t *cbase = (const uint8_t *)layer->ssm_conv1d.data;
             for (int j = 0; j < qkv_dim; j++) {
@@ -2966,6 +6756,16 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
                 conv_out[j] = s + w_trans[n_hist * qkv_dim + j] * qkv_buf[j];
             }
         }
+#elif defined(__ARM_FEATURE_SVE)
+        for (int j = 0; j < qkv_dim; j += (int)svcntw()) {
+            svbool_t pt = svwhilelt_b32((uint64_t)j, (uint64_t)qkv_dim);
+            svfloat32_t sum = svmul_x(pt, svld1(pt, w_trans + n_hist * qkv_dim + j),
+                                      svld1(pt, qkv_buf + j));
+            for (int f = 0; f < n_hist; f++)
+                sum = svmla_x(pt, sum, svld1(pt, w_trans + f * qkv_dim + j),
+                              svld1(pt, conv_st + row_off[f] + j));
+            svst1(pt, conv_out + j, sum);
+        }
 #else
         for (int j = 0; j < qkv_dim; j++) {
             float sum = 0.0f;
@@ -2988,6 +6788,17 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
             for (; j < qkv_dim; j++)
                 conv_out[j] = conv_out[j] / (1.0f + expf(-conv_out[j]));
         }
+#elif defined(__ARM_FEATURE_SVE)
+        for (int j = 0; j < qkv_dim; j += (int)svcntw()) {
+            svbool_t pg = svwhilelt_b32((uint64_t)j, (uint64_t)qkv_dim);
+            svfloat32_t s = svld1(pg, conv_out + j);
+            svfloat32_t t = svmul_n_f32_x(pg, s, -1.4426950408889634f);
+            t = svmax_n_f32_x(pg, svmin_n_f32_x(pg, t, 80.0f), -80.0f);
+            svfloat32_t den = svadd_n_f32_x(pg, tf_exp2_fexpa_approx_sve(pg, t), 1.0f);
+            svfloat32_t inv = svrecpe_f32(den);
+            inv = svmul_f32_x(pg, inv, svrecps_f32(den, inv));
+            svst1(pg, conv_out + j, svmul_f32_x(pg, s, inv));
+        }
 #else
         for (int j = 0; j < qkv_dim; j++)
             conv_out[j] = conv_out[j] / (1.0f + expf(-conv_out[j]));
@@ -3000,6 +6811,7 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
         /* Copy conv output to qkv_buf */
         memcpy(qkv_buf, conv_out, qkv_dim * sizeof(float));
     }
+    }
 
     /* 5. Split: Q[n_group*d_state], K[n_group*d_state], V[dt_rank*d_state]
      *    Order in qkv_buf: Q, K, V (following llama.cpp convention) */
@@ -3008,21 +6820,26 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     float *V_raw = qkv_buf + 2 * n_group * d_state;          /* [dt_rank * d_state = d_inner] */
 
     /* L2-normalize Q and K per head (n_group heads, d_state elements each) */
-    for (int g = 0; g < n_group; g++) {
+    if (!qk_ready) for (int g = 0; g < n_group; g++) {
         tf_l2_norm(Q_raw + g * d_state, d_state, eps);
         tf_l2_norm(K_raw + g * d_state, d_state, eps);
     }
 
     /* Repeat Q and K from n_group to dt_rank heads (tiling, matching ggml_repeat) */
     /* dt_rank=48, n_group=16: 3 bulk copies of n_group*d_state instead of 96 memcpys */
-    {
+    if (!qk_ready) {
         size_t tile_bytes = (size_t)n_group * d_state * sizeof(float);
-        int n_repeat = dt_rank / n_group;
-        for (int r = n_repeat - 1; r >= 0; r--) {
-            memcpy(Q_exp + r * n_group * d_state, Q_raw, tile_bytes);
-            memcpy(K_exp + r * n_group * d_state, K_raw, tile_bytes);
+        (void)tile_bytes;
+        for (int h = 0; h < dt_rank; h++) {
+            int g = (m->ssm_head_offset + h) % n_group;
+            memcpy(Q_exp + (size_t)h * d_state, Q_raw + (size_t)g * d_state,
+                   (size_t)d_state * sizeof(float));
+            memcpy(K_exp + (size_t)h * d_state, K_raw + (size_t)g * d_state,
+                   (size_t)d_state * sizeof(float));
         }
     }
+
+    if (prepare_only) return;
 
     /* 6. Delta-Net recurrence per head (AVX2 + multi-threaded) */
     float scale = 1.0f / sqrtf((float)d_state);
@@ -3051,75 +6868,314 @@ static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
     }
 
     /* 7. Fused: out = rmsnorm(out, ssm_norm) * silu(z) */
-    {
-        /* ssm_norm has [d_state] weights, applied per-head (48 groups of 128) */
-        float norm_w[128];
-        tf_dequant_row(&layer->ssm_norm, 0, norm_w);
-        for (int h = 0; h < dt_rank; h++) {
-            float *o_h = out_buf + h * d_state;
-            float *z_h = z_buf + h * d_state;
-#if defined(__AVX2__) && defined(__FMA__)
-            /* RMSNorm: sum of squares (AVX2) */
-            __m256 vss = _mm256_setzero_ps();
-            int i = 0;
-            for (; i + 7 < d_state; i += 8) {
-                __m256 oi = _mm256_loadu_ps(o_h + i);
-                vss = _mm256_fmadd_ps(oi, oi, vss);
-            }
-            __m128 hi128 = _mm256_extractf128_ps(vss, 1);
-            __m128 lo128 = _mm256_castps256_ps128(vss);
-            __m128 s4 = _mm_add_ps(lo128, hi128);
-            s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
-            s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
-            float ss = _mm_cvtss_f32(s4);
-            for (; i < d_state; i++) ss += o_h[i] * o_h[i];
-            __m256 vscale = _mm256_set1_ps(1.0f / sqrtf(ss / d_state + eps));
-            const __m256 one = _mm256_set1_ps(1.0f);
-            /* Apply norm * weight * silu(z) */
-            i = 0;
-            for (; i + 7 < d_state; i += 8) {
-                __m256 oi = _mm256_loadu_ps(o_h + i);
-                __m256 wi = _mm256_loadu_ps(norm_w + i);
-                __m256 normed = _mm256_mul_ps(_mm256_mul_ps(oi, vscale), wi);
-                __m256 zi = _mm256_loadu_ps(z_h + i);
-                __m256 neg_z = _mm256_sub_ps(_mm256_setzero_ps(), zi);
-                __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, fast_exp_avx2(neg_z)));
-                _mm256_storeu_ps(o_h + i, _mm256_mul_ps(normed, _mm256_mul_ps(zi, sig)));
-            }
-            float ss_scalar = 1.0f / sqrtf(ss / d_state + eps);
-            for (; i < d_state; i++) {
-                float normed = o_h[i] * ss_scalar * norm_w[i];
-                float z_val = z_h[i];
-                o_h[i] = normed * (z_val / (1.0f + expf(-z_val)));
-            }
-#else
-            /* RMSNorm per head */
-            float ss = 0.0f;
-            for (int i = 0; i < d_state; i++) ss += o_h[i] * o_h[i];
-            ss = 1.0f / sqrtf(ss / d_state + eps);
-            /* Apply norm * weight * silu(z) */
-            for (int i = 0; i < d_state; i++) {
-                float normed = o_h[i] * ss * norm_w[i];
-                float z_val = z_h[i];
-                float silu_z = z_val / (1.0f + expf(-z_val));
-                o_h[i] = normed * silu_z;
-            }
-#endif
-        }
-    }
+    tf_ssm_finish_heads(m, layer_idx, 0, dt_rank);
 
     /* 8. Output projection: xb = ssm_out @ out_buf */
-    tf_qmatvec_pool(m, m->xb, &layer->ssm_out, out_buf, n_embd);
+    if (do_output_projection) {
+        tf_qmatvec_pool(m, m->xb, &layer->ssm_out, out_buf, n_embd);
+        if (m->tp_ssm_sharded && m->tp_allreduce_fn)
+            m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
+    }
 }
 
-/* Vectorized GELU(gate) × up: out[i] = gelu(gate[i]) * up[i]
- * Uses exact GELU: x * 0.5 * (1 + erf(x / sqrt(2))) */
-static void tf_gelu_mul(float *out, const float *gate, const float *up, int n) {
+static void tf_ssm_deltanet_forward(transformer_model *m, int layer_idx) {
+    tf_ssm_deltanet_forward_parts(m, layer_idx, 1, 1, 0, 0, 0, 0);
+}
+
+/* Optional speculative-verify state capture. Layout is
+ * [token][layer][conv_state,recurrent_state], in floats.  The runner owns the
+ * anonymous buffer and publishes strides before a batched Qwen forward. */
+float *tf_batch_ssm_snapshots = NULL;
+float **tf_batch_ssm_snapshot_slots = NULL;
+size_t tf_batch_ssm_layer_stride = 0;
+size_t tf_batch_ssm_slot_stride = 0;
+
+/* Batched causal depthwise convolution for Qwen hybrid prefill.  Time remains
+ * strictly ordered within each channel, while channels are independent and
+ * distributed across cores. qkv_rows is overwritten with conv+SiLU output. */
+static void tf_ssm_conv_batch(transformer_model *m,int layer_idx,float*qkv_rows,
+                              int N,int stride){
+    transformer_layer*L=&m->layers[layer_idx];int qd=m->ssm_qkv_dim;
+    int ck=m->ssm_conv_kernel,nh=ck-1,wr=m->conv_state_pos[layer_idx];
+    float*st=m->conv_state[layer_idx];
+    float*w=m->conv_w_trans_layers?m->conv_w_trans_layers[layer_idx]:m->conv_w_trans;
+    if(!w||nh<=0)return;
+    int nt=tf_batch_threads>0?tf_batch_threads:(m->n_threads>1?m->n_threads:1);
+#if defined(__ARM_FEATURE_SVE)
+    static int batch_sve=-1;
+    if(batch_sve<0){const char*e=getenv("TF_SSM_CONV_BATCH_SVE");batch_sve=!e||atoi(e)!=0;}
+    /* Qwen uses kernel size four. Walk a vector of adjacent channels through
+     * time so every long-stride token-row access consumes a full cache line;
+     * the scalar channel loop below consumed only one float from each line. */
+    if(batch_sve&&nh==3){
+        int vl=(int)svcntw();
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(nt) schedule(static)
+        #endif
+        for(int j=0;j<qd;j+=vl){
+            svbool_t pg=svwhilelt_b32((uint64_t)j,(uint64_t)qd);
+            svfloat32_t h0=svld1(pg,st+(size_t)((wr+0)%3)*qd+j);
+            svfloat32_t h1=svld1(pg,st+(size_t)((wr+1)%3)*qd+j);
+            svfloat32_t h2=svld1(pg,st+(size_t)((wr+2)%3)*qd+j);
+            svfloat32_t w0=svld1(pg,w+(size_t)0*qd+j);
+            svfloat32_t w1=svld1(pg,w+(size_t)1*qd+j);
+            svfloat32_t w2=svld1(pg,w+(size_t)2*qd+j);
+            svfloat32_t w3=svld1(pg,w+(size_t)3*qd+j);
+            for(int t=0;t<N;t++){
+                float*xp=qkv_rows+(size_t)t*stride+j;
+                svfloat32_t x=svld1(pg,xp);
+                svfloat32_t s=svmul_f32_x(pg,w0,h0);
+                s=svmla_f32_x(pg,s,w1,h1);
+                s=svmla_f32_x(pg,s,w2,h2);
+                s=svmla_f32_x(pg,s,w3,x);
+                svst1(pg,xp,s);h0=h1;h1=h2;h2=x;
+                if(tf_batch_ssm_snapshots){
+                    float*slot=tf_batch_ssm_snapshot_slots?tf_batch_ssm_snapshot_slots[t]:
+                        tf_batch_ssm_snapshots+(size_t)t*tf_batch_ssm_slot_stride;
+                    if(slot){
+                        int nwr=(wr+t+1)%3;
+                        float*sn=slot+(size_t)layer_idx*tf_batch_ssm_layer_stride;
+                        svst1(pg,sn+(size_t)((nwr+0)%3)*qd+j,h0);
+                        svst1(pg,sn+(size_t)((nwr+1)%3)*qd+j,h1);
+                        svst1(pg,sn+(size_t)((nwr+2)%3)*qd+j,h2);
+                    }
+                }
+            }
+            int nwr=(wr+N)%3;
+            svst1(pg,st+(size_t)((nwr+0)%3)*qd+j,h0);
+            svst1(pg,st+(size_t)((nwr+1)%3)*qd+j,h1);
+            svst1(pg,st+(size_t)((nwr+2)%3)*qd+j,h2);
+        }
+        m->conv_state_pos[layer_idx]=(wr+N)%nh;
+    }else
+#endif
+    {
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for(int j=0;j<qd;j++){
+        float hist[8];
+        for(int f=0;f<nh;f++)hist[f]=st[((wr+f)%nh)*(size_t)qd+j];
+        for(int t=0;t<N;t++){
+            float*xp=qkv_rows+(size_t)t*stride+j,x=*xp,s=0;
+            for(int f=0;f<nh;f++)s+=w[(size_t)f*qd+j]*hist[f];
+            s+=w[(size_t)nh*qd+j]*x;
+            for(int f=0;f+1<nh;f++)hist[f]=hist[f+1];hist[nh-1]=x;
+            *xp=s;
+            if(tf_batch_ssm_snapshots){
+                float*slot=tf_batch_ssm_snapshot_slots?tf_batch_ssm_snapshot_slots[t]:
+                    tf_batch_ssm_snapshots+(size_t)t*tf_batch_ssm_slot_stride;
+                if(slot){
+                    int nwr=(wr+t+1)%nh;
+                    float*sn=slot+(size_t)layer_idx*tf_batch_ssm_layer_stride;
+                    for(int f=0;f<nh;f++)sn[(size_t)((nwr+f)%nh)*qd+j]=hist[f];
+                }
+            }
+        }
+        int nwr=(wr+N)%nh;
+        for(int f=0;f<nh;f++)st[((nwr+f)%nh)*(size_t)qd+j]=hist[f];
+    }
+    m->conv_state_pos[layer_idx]=(wr+N)%nh;
+    }
+    #if defined(__ARM_FEATURE_SVE)
+    size_t total=(size_t)N*stride;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for(size_t j=0;j<total;j+=(size_t)svcntw()){
+        svbool_t pg=svwhilelt_b32((uint64_t)j,(uint64_t)total);
+        svfloat32_t s=svld1(pg,qkv_rows+j);
+        svfloat32_t t=svmul_n_f32_x(pg,s,-1.4426950408889634f);
+        t=svmax_n_f32_x(pg,svmin_n_f32_x(pg,t,80.0f),-80.0f);
+        svfloat32_t den=svadd_n_f32_x(pg,tf_exp2_fexpa_approx_sve(pg,t),1.0f);
+        svfloat32_t inv=svrecpe_f32(den);inv=svmul_f32_x(pg,inv,svrecps_f32(den,inv));
+        svst1(pg,qkv_rows+j,svmul_f32_x(pg,s,inv));
+    }
+    #else
+    for(int t=0;t<N;t++)for(int j=0;j<qd;j++){
+        float*x=qkv_rows+(size_t)t*stride+j;*x=*x/(1.0f+expf(-*x));
+    }
+    #endif
+}
+
+/* Prepare all post-convolution DeltaNet rows without round-tripping through the
+ * model's single-token scratch buffers. Rows are independent here, so token
+ * parallelism hides scalar softplus latency while the recurrent scan remains
+ * strictly ordered within each head. */
+static void tf_ssm_prepare_batch(transformer_model *m,int layer_idx,
+        float*qkv,float*qexp,float*kexp,float*vexp,float*alpha,float*beta,
+        int N,int qstride,int qestride,int kestride,int vestride,int scalar_stride){
+    transformer_layer*L=&m->layers[layer_idx];
+    int ds=m->ssm_d_state,ng=m->ssm_n_group,nh=m->ssm_dt_rank;
+    int ld=m->ssm_d_inner;
+    int nt=tf_batch_threads>0?tf_batch_threads:(m->n_threads>1?m->n_threads:1);
+    static int fast_scalars=-1;
+    if(fast_scalars<0){const char*e=getenv("TF_SSM_FAST_SCALARS");fast_scalars=e&&atoi(e)!=0;}
+    static int preexp=-1;
+    if(preexp<0){const char*e=getenv("TF_SSM_PREEXP");preexp=e&&atoi(e)!=0;}
+    float av[64],db[64];
+    tf_dequant_row(&L->ssm_a,0,av);
+    tf_dequant_row(&L->ssm_dt_bias,0,db);
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for(int t=0;t<N;t++){
+        float*row=qkv+(size_t)t*qstride;
+        float qtmp[ng*ds],ktmp[ng*ds];
+        float*ar=alpha+(size_t)t*scalar_stride;
+        float*br=beta +(size_t)t*scalar_stride;
+#if defined(__ARM_FEATURE_SVE)
+        if(fast_scalars){
+            float ex[64];
+            for(int h=0;h<nh;h+=(int)svcntw()){
+                svbool_t pg=svwhilelt_b32(h,nh);
+                svfloat32_t x=svadd_f32_x(pg,svld1(pg,ar+h),
+                    svld1(pg,db+m->ssm_head_offset+h));
+                svfloat32_t xc=svmax_n_f32_x(pg,svmin_n_f32_x(pg,x,80.0f),-80.0f);
+                svst1(pg,ex+h,tf_exp2_fexpa_approx_sve(pg,
+                    svmul_n_f32_x(pg,xc,1.4426950408889634f)));
+                svfloat32_t b=svld1(pg,br+h);
+                svfloat32_t bt=svmax_n_f32_x(pg,svmin_n_f32_x(pg,
+                    svmul_n_f32_x(pg,b,-1.4426950408889634f),80.0f),-80.0f);
+                svfloat32_t den=svadd_n_f32_x(pg,tf_exp2_fexpa_approx_sve(pg,bt),1.0f);
+                svfloat32_t inv=svrecpe_f32(den);
+                inv=svmul_f32_x(pg,inv,svrecps_f32(den,inv));
+                svst1(pg,br+h,inv);
+            }
+            for(int h=0;h<nh;h++){
+                int gh=m->ssm_head_offset+h;float x=ar[h]+db[gh];
+                ar[h]=(x>20.0f?x:log1pf(ex[h]))*av[gh];
+            }
+        } else
+#endif
+        for(int h=0;h<nh;h++){
+            int gh=m->ssm_head_offset+h;float x=ar[h]+db[gh];
+            ar[h]=(x>20.0f?x:logf(1.0f+expf(x)))*av[gh];
+            br[h]=1.0f/(1.0f+expf(-br[h]));
+        }
+        if(preexp)for(int h=0;h<nh;h++)ar[h]=expf(ar[h]);
+        for(int g=0;g<ng;g++){
+            tf_l2_norm(row+(size_t)g*ds,ds,m->rms_norm_eps);
+            tf_l2_norm(row+(size_t)(ng+g)*ds,ds,m->rms_norm_eps);
+        }
+        memcpy(qtmp,row,(size_t)ng*ds*sizeof(float));
+        memcpy(ktmp,row+(size_t)ng*ds,(size_t)ng*ds*sizeof(float));
+        memcpy(vexp+(size_t)t*vestride,row+(size_t)2*ng*ds,
+               (size_t)ld*sizeof(float));
+        for(int h=0;h<nh;h++){
+            int g=(m->ssm_head_offset+h)%ng;
+            memcpy(qexp+(size_t)t*qestride+(size_t)h*ds,
+                   qtmp+(size_t)g*ds,(size_t)ds*sizeof(float));
+            memcpy(kexp+(size_t)t*kestride+(size_t)h*ds,
+                   ktmp+(size_t)g*ds,(size_t)ds*sizeof(float));
+        }
+    }
+}
+
+static inline float tf_gelu_exact_scalar(float g) {
+    return g * 0.5f * (1.0f + erff(g * 0.7071067811865476f));
+}
+
+static inline float tf_gelu_fast_scalar(float g) {
+    float a = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+    float a2 = a * a;
+    float t = a * (27.0f + a2) / (27.0f + 9.0f * a2);
+    if (t > 1.0f) t = 1.0f;
+    if (t < -1.0f) t = -1.0f;
+    return 0.5f * g * (1.0f + t);
+}
+
+static void tf_gelu_mul_exact(float *out, const float *gate, const float *up, int n) {
     for (int i = 0; i < n; i++) {
         float g = gate[i];
-        float gelu_g = g * 0.5f * (1.0f + erff(g * 0.7071067811865476f)); /* 1/sqrt(2) */
-        out[i] = gelu_g * up[i];
+        out[i] = tf_gelu_exact_scalar(g) * up[i];
     }
+}
+
+static inline float tf_gelu_mul_exact_scalar(float gate, float up) {
+    return tf_gelu_exact_scalar(gate) * up;
+}
+
+static inline float tf_gelu_mul_fast_scalar(float gate, float up) {
+    return tf_gelu_fast_scalar(gate) * up;
+}
+
+#if defined(__ARM_FEATURE_SVE)
+static inline svfloat32_t tf_exp2_fexpa_approx_sve(svbool_t pg, svfloat32_t x) {
+    const float shift_f = 204927.0f; /* 0x48481fc0: FEXPA-compatible rounding shift */
+    svfloat32_t shift = svdup_f32(shift_f);
+    svfloat32_t z = svadd_f32_x(pg, x, shift);
+    svfloat32_t n = svsub_f32_x(pg, z, shift);
+    svfloat32_t r = svsub_f32_x(pg, x, n);
+    svfloat32_t scale = svexpa_f32(svreinterpret_u32_f32(z));
+    svfloat32_t corr = svmla_n_f32_x(pg, svdup_f32(1.0f), r, 0.6931471805599453f);
+    return svmul_f32_x(pg, scale, corr);
+}
+
+static inline svfloat32_t tf_gelu_fast_sve(svbool_t pg, svfloat32_t g) {
+    svfloat32_t g2 = svmul_f32_x(pg, g, g);
+    svfloat32_t g3 = svmul_f32_x(pg, g2, g);
+    svfloat32_t a = svmla_n_f32_x(pg, g, g3, 0.044715f);
+    a = svmul_n_f32_x(pg, a, 0.7978845608028654f);
+    svfloat32_t t = svmul_n_f32_x(pg, a, -2.8853900817779268f); /* -2 * log2(e) */
+    t = svmax_n_f32_x(pg, svmin_n_f32_x(pg, t, 80.0f), -80.0f);
+    svfloat32_t exp_neg = tf_exp2_fexpa_approx_sve(pg, t);
+    svfloat32_t denom = svadd_f32_x(pg, svdup_f32(1.0f), exp_neg);
+    svfloat32_t inv = svrecpe_f32(denom);
+    inv = svmul_f32_x(pg, inv, svrecps_f32(denom, inv));
+    return svmul_f32_x(pg, g, inv);
+}
+
+static void tf_gelu_mul_fast_sve(float *out, const float *gate, const float *up, int n) {
+    int i = 0;
+    while (i < n) {
+        svbool_t pg = svwhilelt_b32(i, n);
+        svfloat32_t g = svld1(pg, gate + i);
+        svfloat32_t u = svld1(pg, up + i);
+        svfloat32_t y = svmul_f32_x(pg, tf_gelu_fast_sve(pg, g), u);
+        svst1(pg, out + i, y);
+        i += (int)svcntw();
+    }
+}
+
+static inline void tf_gelu_mul_fast4_sve(float *out, size_t stride, int row,
+                                         int tok, float g0, float g1,
+                                         float g2, float g3, float u0,
+                                         float u1, float u2, float u3) {
+    float y[4];
+    svbool_t pg = svwhilelt_b32(0, 4);
+    svfloat32_t gv = svdupq_n_f32(g0, g1, g2, g3);
+    svfloat32_t uv = svdupq_n_f32(u0, u1, u2, u3);
+    svst1(pg, y, svmul_f32_x(pg, tf_gelu_fast_sve(pg, gv), uv));
+    out[(size_t)(tok + 0) * stride + row] = y[0];
+    out[(size_t)(tok + 1) * stride + row] = y[1];
+    out[(size_t)(tok + 2) * stride + row] = y[2];
+    out[(size_t)(tok + 3) * stride + row] = y[3];
+}
+
+#endif
+
+static void tf_gelu_mul_fast(float *out, const float *gate, const float *up, int n) {
+#if defined(__ARM_FEATURE_SVE)
+    /* parallelize the (serial) SVE GELU over chunks — was the prefill's GELU cost */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < n; c += 8192) {
+        int len = (n - c < 8192) ? (n - c) : 8192;
+        tf_gelu_mul_fast_sve(out + c, gate + c, up + c, len);
+    }
+    #else
+    tf_gelu_mul_fast_sve(out, gate, up, n);
+    #endif
+#else
+    for (int i = 0; i < n; i++) out[i] = tf_gelu_mul_fast_scalar(gate[i], up[i]);
+#endif
+}
+
+/* GELU(gate) × up dispatcher. Exact mode keeps the previous erf GELU. */
+static void tf_gelu_mul(float *out, const float *gate, const float *up, int n, int fast) {
+    if (fast) tf_gelu_mul_fast(out, gate, up, n);
+    else tf_gelu_mul_exact(out, gate, up, n);
 }
 
 /* Logit soft-capping: logits[i] = cap * tanh(logits[i] / cap) */
@@ -3152,6 +7208,7 @@ typedef struct {
     transformer_model *m;
     int tid;
     int position, pos_t, pos_h, pos_w;
+    int l0, l1;   /* layer range for the gemma4 persistent worker (PP); default 0..n_layers */
 } tf_persistent_ctx;
 
 /* ---- Barrier implementations ---- */
@@ -3177,8 +7234,71 @@ static inline void tf_hw_barrier_w0(void) {
 
 /* Barrier: sense-reversing with SEV/WFE on aarch64 for low-power wait.
  * WFE puts the core in low-power state until an event (SEV from the last
- * arriving thread). No bandwidth consumption while waiting. */
+ * arriving thread). No bandwidth consumption while waiting. The default
+ * A64FX multi-CMG path is hierarchical; TF_HIER_BARRIER=0 restores the
+ * original 48-way barrier for an A/B check. */
+static _Thread_local int tf_barrier_tid;
 static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int nt) {
+    static _Thread_local int use_hier = -1;
+    static _Thread_local int busy_wait;
+    if (use_hier < 0) {
+        const char *e = getenv("TF_HIER_BARRIER");
+        use_hier = e ? (atoi(e) != 0) : 1;
+        e = getenv("TF_BARRIER_BUSY_WAIT");
+        busy_wait = e && atoi(e) != 0;
+    }
+    if (use_hier && m->numa.enabled && m->numa.n_cmgs == 4 &&
+        nt >= 4 && (nt % 4) == 0) {
+        const int per_cmg = nt / 4;
+        const int tid = tf_barrier_tid;
+        const int cmg = tid / per_cmg;
+        const int local_tid = tid % per_cmg;
+        const int my_sense = !(*local_sense);
+        tf_cmg_barrier_state *cs = &m->cmg_bar[cmg];
+
+        if (__sync_add_and_fetch(&cs->count, 1) == per_cmg) {
+            cs->count = 0;
+            __sync_synchronize();
+            cs->sense = my_sense;
+#if defined(__aarch64__)
+            __asm__ __volatile__("sev");
+#endif
+        } else {
+#if defined(__aarch64__)
+            __asm__ __volatile__("sevl");
+            do { __asm__ __volatile__("wfe"); } while (cs->sense != my_sense);
+#else
+            while (cs->sense != my_sense) tf_cpu_pause();
+#endif
+        }
+
+        if (local_tid == 0) {
+            if (__sync_add_and_fetch(&m->cmg_leader_count, 1) == 4) {
+                m->cmg_leader_count = 0;
+                __sync_synchronize();
+                m->cmg_leader_sense = my_sense;
+#if defined(__aarch64__)
+                __asm__ __volatile__("sev");
+#endif
+            } else {
+#if defined(__aarch64__)
+                __asm__ __volatile__("sevl");
+                do { __asm__ __volatile__("wfe"); } while (m->cmg_leader_sense != my_sense);
+#else
+                while (m->cmg_leader_sense != my_sense) tf_cpu_pause();
+#endif
+            }
+        } else {
+#if defined(__aarch64__)
+            __asm__ __volatile__("sevl");
+            do { __asm__ __volatile__("wfe"); } while (m->cmg_leader_sense != my_sense);
+#else
+            while (m->cmg_leader_sense != my_sense) tf_cpu_pause();
+#endif
+        }
+        *local_sense = my_sense;
+        return;
+    }
     int my_sense = !(*local_sense);
     if (__sync_add_and_fetch(&m->bar_count, 1) == nt) {
         m->bar_count = 0;
@@ -3189,12 +7309,16 @@ static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int n
 #endif
     } else {
 #if defined(__aarch64__)
-        /* SEV/WFE spin: core sleeps until event, then rechecks.
-         * SEVL ensures first WFE doesn't stall if event pending. */
-        __asm__ __volatile__("sevl");
-        do {
-            __asm__ __volatile__("wfe");
-        } while (m->bar_sense != my_sense);
+        if (busy_wait) {
+            while (m->bar_sense != my_sense)
+                __asm__ __volatile__("yield" ::: "memory");
+        } else {
+            /* SEVL makes the first WFE return before rechecking the sense. */
+            __asm__ __volatile__("sevl");
+            do {
+                __asm__ __volatile__("wfe");
+            } while (m->bar_sense != my_sense);
+        }
 #else
         while (m->bar_sense != my_sense)
             tf_cpu_pause();
@@ -3251,12 +7375,270 @@ static inline void tf_barrier(transformer_model *m, int tid, int *local_sense, i
 /* Per-thread matvec: thread tid computes its static row partition */
 static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
                               int n_rows, int tid, int nt) {
+    (void)x;
+    if (tf_null_gemm_enabled() &&
+        (mat->type == GGML_TYPE_Q8_0 || mat->type == GGML_TYPE_BF16 || mat->i8)) {
+        tf_null_matvec(dst, mat, n_rows, tid, nt);
+        return;
+    }
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->type == GGML_TYPE_BF16 && mat->bf16_pv) {
+        int groups = n_rows / 8;
+        int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+        size_t group_hw = (size_t)8 * mat->n_cols;
+        const uint16_t *base = (const uint16_t *)mat->data;
+        for (int g = g0; g < g1; g++) {
+            const uint16_t *p = base + (size_t)g * group_hw;
+            matvec_bf16_8row_pv(dst + g * 8,
+                                p, p + 2 * mat->n_cols,
+                                p + 4 * mat->n_cols, p + 6 * mat->n_cols,
+                                x, mat->n_cols);
+        }
+        return;
+    }
+    if (mat->q8_block64) {
+        if (mat->q8_block64 == 3) {
+            static _Thread_local int8_t *tl_w8_x;
+            static _Thread_local float *tl_w8_s;
+            static _Thread_local int tl_w8_cap;
+            static _Thread_local const float *tl_w8_src;
+            static _Thread_local int tl_w8_n;
+            static _Thread_local float tl_w8_tag0, tl_w8_tag1, tl_w8_tag2, tl_w8_tag3;
+            static int w8_cache_done = 0, w8_cache = 1;
+            if (!w8_cache_done) {
+                const char *e = getenv("TF_W8_ACT_CACHE");
+                if (e) w8_cache = atoi(e) != 0;
+                w8_cache_done = 1;
+            }
+            int n_cols = mat->n_cols, nb = n_cols / 64;
+            if (tl_w8_cap < n_cols) {
+                int8_t *qx = (int8_t *)realloc(tl_w8_x, (size_t)n_cols);
+                float *qs = (float *)realloc(tl_w8_s, (size_t)nb * sizeof(float));
+                if (!qx || !qs) { free(qx); free(qs); return; }
+                tl_w8_x = qx; tl_w8_s = qs; tl_w8_cap = n_cols;
+            }
+            int same_x = w8_cache && tl_w8_src == x && tl_w8_n == n_cols &&
+                         tl_w8_tag0 == x[0] && tl_w8_tag1 == x[n_cols / 3] &&
+                         tl_w8_tag2 == x[(2 * n_cols) / 3] &&
+                         tl_w8_tag3 == x[n_cols - 1];
+            if (!same_x) {
+                for (int b = 0; b < nb; b++) {
+                    float mx = 0.0f;
+                    for (int j = 0; j < 64; j++) {
+                        float a = fabsf(x[b * 64 + j]);
+                        if (a > mx) mx = a;
+                    }
+                    tl_w8_s[b] = mx / 127.0f;
+                    float inv = tl_w8_s[b] > 0 ? 1.0f / tl_w8_s[b] : 0.0f;
+                    for (int j = 0; j < 64; j++) {
+                        int q = (int)lrintf(x[b * 64 + j] * inv);
+                        tl_w8_x[b * 64 + j] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q);
+                    }
+                }
+                tl_w8_src = x; tl_w8_n = n_cols;
+                tl_w8_tag0 = x[0]; tl_w8_tag1 = x[n_cols / 3];
+                tl_w8_tag2 = x[(2 * n_cols) / 3]; tl_w8_tag3 = x[n_cols - 1];
+            }
+            int groups = n_rows / 8;
+            int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+            size_t group_bytes = (size_t)nb * 528;
+            for (int g = g0; g < g1; g++)
+                matvec_sdot_8row(dst + g * 8,
+                    (const uint8_t *)mat->data + (size_t)g * group_bytes,
+                    tl_w8_x, tl_w8_s, n_cols);
+            return;
+        }
+        if (mat->q8_block64 == 2) {
+            int groups = n_rows / 8;
+            int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+            size_t group_bytes = (size_t)(mat->n_cols / 64) * 544;
+            for (int g = g0; g < g1; g++)
+                matvec_q8orig_8row_f32(dst + g * 8,
+                    (const uint8_t *)mat->data + (size_t)g * group_bytes,
+                    x, mat->n_cols);
+            return;
+        }
+        static _Thread_local int8_t *tl_q8b_x;
+        static _Thread_local float *tl_q8b_s;
+        static _Thread_local int tl_q8b_cap;
+        int n_cols = mat->n_cols, nb = n_cols / 64;
+        if (tl_q8b_cap < n_cols) {
+            int8_t *qx = (int8_t *)realloc(tl_q8b_x, (size_t)n_cols);
+            float *qs = (float *)realloc(tl_q8b_s, (size_t)nb * sizeof(float));
+            if (!qx || !qs) { free(qx); free(qs); return; }
+            tl_q8b_x = qx; tl_q8b_s = qs; tl_q8b_cap = n_cols;
+        }
+        for (int b = 0; b < nb; b++) {
+            float mx = 0.0f;
+            for (int j = 0; j < 64; j++) {
+                float a = fabsf(x[b * 64 + j]);
+                if (a > mx) mx = a;
+            }
+            float sc = mx / 127.0f;
+            float inv = sc > 0.0f ? 1.0f / sc : 0.0f;
+            tl_q8b_s[b] = sc;
+            for (int j = 0; j < 64; j++) {
+                int q = (int)lrintf(x[b * 64 + j] * inv);
+                tl_q8b_x[b * 64 + j] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q);
+                }
+            }
+        int groups = n_rows / 8;
+        int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+        size_t group_bytes = (size_t)nb * 544;
+        for (int g = g0; g < g1; g++) {
+            const uint8_t *group = (const uint8_t *)mat->data + (size_t)g * group_bytes;
+            matvec_sdot_8row_q8orig(dst + g * 8, group,
+                                    tl_q8b_x, tl_q8b_s, n_cols);
+        }
+        return;
+    }
+#endif
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->type == GGML_TYPE_Q8_0 && !mat->i8 && n_rows >= 8) {
+        static int tf_q8_rows = -1;
+        if (tf_q8_rows < 0) {
+            const char *e = getenv("TF_Q8_ROWS");
+            /* Four rows reduce SVE register pressure on A64FX; 2 is retained
+             * as an experimental lower-register-pressure A/B mode. */
+            tf_q8_rows = (e && (atoi(e) == 2 || atoi(e) == 8)) ? atoi(e) : 4;
+        }
+        if (tf_q8_rows == 2) {
+            int groups = n_rows / 2;
+            int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+            size_t group_bytes = (size_t)(mat->n_cols / 32) * sizeof(block_q8_0) * 2;
+            for (int g = g0; g < g1; g++)
+                matvec_q8_0_2row_f32(dst + g * 2,
+                    (const uint8_t *)mat->data + (size_t)g * group_bytes,
+                    x, mat->n_cols);
+            int tail0 = groups * 2;
+            if (tid == 0) {
+                size_t row_bytes = (size_t)(mat->n_cols / 32) * sizeof(block_q8_0);
+                const uint8_t *base = (const uint8_t *)mat->data;
+                for (int i = tail0; i < n_rows; i++)
+                    dst[i] = vec_dot_q8_0_f32(base + (size_t)i * row_bytes, x, mat->n_cols);
+            }
+            return;
+        }
+        if (tf_q8_rows == 4) {
+            int groups = n_rows / 4;
+            int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+            size_t group_bytes = (size_t)(mat->n_cols / 32) * sizeof(block_q8_0) * 4;
+            for (int g = g0; g < g1; g++)
+                matvec_q8_0_4row_f32(dst + g * 4,
+                    (const uint8_t *)mat->data + (size_t)g * group_bytes,
+                    x, mat->n_cols);
+            int tail0 = groups * 4;
+            if (tid == 0) {
+                size_t row_bytes = (size_t)(mat->n_cols / 32) * sizeof(block_q8_0);
+                const uint8_t *base = (const uint8_t *)mat->data;
+                for (int i = tail0; i < n_rows; i++)
+                    dst[i] = vec_dot_q8_0_f32(base + (size_t)i * row_bytes, x, mat->n_cols);
+            }
+            return;
+        }
+        int groups = n_rows / 8;
+        int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+        size_t group_bytes = (size_t)(mat->n_cols / 32) * sizeof(block_q8_0) * 8;
+        for (int g = g0; g < g1; g++)
+            matvec_q8_0_8row_f32(dst + g * 8,
+                (const uint8_t *)mat->data + (size_t)g * group_bytes,
+                x, mat->n_cols);
+        int tail0 = groups * 8;
+        if (tid == 0) {
+            size_t row_bytes = (size_t)(mat->n_cols / 32) * sizeof(block_q8_0);
+            const uint8_t *base = (const uint8_t *)mat->data;
+            for (int i = tail0; i < n_rows; i++)
+                dst[i] = vec_dot_q8_0_f32(base + (size_t)i * row_bytes, x, mat->n_cols);
+        }
+        return;
+    }
+#endif
     int rp = n_rows / nt, re = n_rows % nt;
     int rs = tid * rp + (tid < re ? tid : re);
     int rc = rp + (tid < re ? 1 : 0);
     if (rc <= 0) return;
     int n_cols = mat->n_cols;
 
+    if (mat->i8) {
+#if defined(__ARM_FEATURE_SVE)
+        static int w8_use_i16 = -1;
+        if (w8_use_i16 < 0) {
+            const char *mode = getenv("TF_W8_DOT");
+            w8_use_i16 = mode && !strcmp(mode, "int16");
+        }
+        if (w8_use_i16) {
+            static _Thread_local int16_t *tl_xi16;
+            static _Thread_local int tl_xi16_cap;
+            static _Thread_local const float *tl_x16_src;
+            static _Thread_local int tl_x16_n;
+            static _Thread_local float tl_x16_scale;
+            static _Thread_local float tl_x16_tag0, tl_x16_tag1, tl_x16_tag2, tl_x16_tag3;
+            if (tl_xi16_cap < n_cols) {
+                int16_t *p = (int16_t *)realloc(tl_xi16, (size_t)n_cols * sizeof(*p));
+                if (!p) return;
+                tl_xi16 = p; tl_xi16_cap = n_cols;
+            }
+            int same_x = tl_x16_src == x && tl_x16_n == n_cols &&
+                         tl_x16_tag0 == x[0] && tl_x16_tag1 == x[n_cols / 3] &&
+                         tl_x16_tag2 == x[(2 * n_cols) / 3] && tl_x16_tag3 == x[n_cols - 1];
+            float xs = same_x ? tl_x16_scale : tf_quant_x_i16(x, tl_xi16, n_cols);
+            if (!same_x) {
+                tl_x16_src = x; tl_x16_n = n_cols; tl_x16_scale = xs;
+                tl_x16_tag0 = x[0]; tl_x16_tag1 = x[n_cols / 3];
+                tl_x16_tag2 = x[(2 * n_cols) / 3]; tl_x16_tag3 = x[n_cols - 1];
+            }
+            const int8_t *w = mat->i8 + (size_t)rs * n_cols;
+            for (int i = 0; i < rc; i++)
+                dst[rs + i] = (float)tf_int8_int16_dot(
+                    w + (size_t)i * n_cols, tl_xi16, n_cols) * mat->i8s[rs + i] * xs;
+            return;
+        }
+        static _Thread_local int8_t *tl_xi8;
+        static _Thread_local int tl_xi8_cap;
+        static _Thread_local const float *tl_x_src;
+        static _Thread_local int tl_x_n;
+        static _Thread_local float tl_x_scale;
+        static _Thread_local float tl_x_tag0, tl_x_tag1, tl_x_tag2, tl_x_tag3;
+        if (tl_xi8_cap < n_cols) {
+            int8_t *p = (int8_t *)realloc(tl_xi8, (size_t)n_cols);
+            if (!p) return;
+            tl_xi8 = p;
+            tl_xi8_cap = n_cols;
+        }
+        int8_t *xi8 = tl_xi8;
+        float xs;
+        /* All persistent workers quantize the same activation vector.  Cache
+         * the per-thread result across Q/K/V and gate/up projections; a new
+         * pointer or width invalidates it. */
+        int same_x = tl_x_src == x && tl_x_n == n_cols &&
+                     tl_x_tag0 == x[0] && tl_x_tag1 == x[n_cols / 3] &&
+                     tl_x_tag2 == x[(2 * n_cols) / 3] && tl_x_tag3 == x[n_cols - 1];
+        if (same_x) {
+            xs = tl_x_scale;
+        } else {
+            xs = tf_quant_x_i8(x, xi8, n_cols);
+            tl_x_src = x;
+            tl_x_n = n_cols;
+            tl_x_scale = xs;
+            tl_x_tag0 = x[0]; tl_x_tag1 = x[n_cols / 3];
+            tl_x_tag2 = x[(2 * n_cols) / 3]; tl_x_tag3 = x[n_cols - 1];
+        }
+        const int8_t *w = mat->i8 + (size_t)rs * n_cols;
+        int i = 0;
+        for (; i + 3 < rc; i += 4) {
+            int32_t dot[4];
+            tf_int8_dot_4row(dot, w + (size_t)i * n_cols, xi8, n_cols);
+            dst[rs + i] = (float)dot[0] * mat->i8s[rs + i] * xs;
+            dst[rs + i + 1] = (float)dot[1] * mat->i8s[rs + i + 1] * xs;
+            dst[rs + i + 2] = (float)dot[2] * mat->i8s[rs + i + 2] * xs;
+            dst[rs + i + 3] = (float)dot[3] * mat->i8s[rs + i + 3] * xs;
+        }
+        for (; i < rc; i++)
+            dst[rs + i] = (float)tf_int8_dot(w + (size_t)i * n_cols, xi8, n_cols) *
+                          mat->i8s[rs + i] * xs;
+        return;
+#endif
+    }
     if (mat->type == GGML_TYPE_BF16) {
         tf_matvec_bf16_rows(dst, (const uint8_t *)mat->data,
                              (size_t)n_cols * 2, x, n_cols, rs, rs + rc);
@@ -3268,14 +7650,202 @@ static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
     }
 }
 
+/* NextN greedy head specialization. Keep each eight-row BF16-PV result in a
+ * worker-private stack slot and update its winner immediately, avoiding the
+ * store and later reload of the complete local vocabulary slice. */
+static int tf_thread_bf16_pv_argmax(transformer_model *m, const qtensor *mat,
+                                    const float *x, int n_rows,
+                                    int tid, int nt) {
+#if defined(__ARM_FEATURE_SVE)
+    if (!m || !mat || mat->type != GGML_TYPE_BF16 || !mat->bf16_pv ||
+        (n_rows & 7) || !m->lm_head_best_idx || !m->lm_head_best_val)
+        return 0;
+    int groups = n_rows / 8;
+    int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+    size_t group_hw = (size_t)8 * mat->n_cols;
+    const uint16_t *base = (const uint16_t *)mat->data;
+    float best = -INFINITY;
+    int best_row = g0 * 8;
+    for (int g = g0; g < g1; g++) {
+        const uint16_t *p = base + (size_t)g * group_hw;
+        float out[8];
+        matvec_bf16_8row_pv(out, p, p + 2 * mat->n_cols,
+                            p + 4 * mat->n_cols, p + 6 * mat->n_cols,
+                            x, mat->n_cols);
+        for (int r = 0; r < 8; r++) {
+            if (out[r] > best) {
+                best = out[r];
+                best_row = g * 8 + r;
+            }
+        }
+    }
+    m->lm_head_best_idx[tid] = best_row;
+    m->lm_head_best_val[tid] = best;
+    return 1;
+#else
+    (void)m; (void)mat; (void)x; (void)n_rows; (void)tid; (void)nt;
+    return 0;
+#endif
+}
+
+/* Defined with the pool helpers below; used by the persistent TP pipeline. */
+static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *x,
+                                    int row_start, int row_end);
+
+/* Persistent TP projection pipeline.  Thread 0 reduces the completed output
+ * tile while threads 1..nt-1 compute the next tile.  Tiles occupy disjoint
+ * output ranges, so the two live ranges are the compute/communication
+ * double-buffer.  This is intentionally opt-in: it adds barriers and removes
+ * one compute worker, and is useful only when the projection's result is
+ * immediately all-reduced by the caller. */
+static int tf_tp_overlap_wanted(transformer_model *m, int n_rows, int nt,
+                                int do_reduce) {
+    static int enabled = -1;
+    static int tile_rows = 1024;
+    if (enabled < 0) {
+        const char *e = getenv("TP_OVERLAP");
+        enabled = e && *e && *e != '0';
+        const char *t = getenv("TP_OVERLAP_TILE");
+        if (t && *t) {
+            int v = atoi(t);
+            if (v >= 64 && v <= 8192) tile_rows = (v + 7) & ~7;
+        }
+    }
+    return enabled && do_reduce && nt >= 3 && m && m->tp_allreduce_fn &&
+           n_rows >= tile_rows * 2;
+}
+
+static void tf_thread_matvec_overlap_reduce(transformer_model *m, float *dst,
+                                            const qtensor *mat, const float *x,
+                                            int n_rows, int tid, int nt,
+                                            int do_reduce, int *local_sense) {
+    if (!tf_tp_overlap_wanted(m, n_rows, nt, do_reduce)) {
+        tf_thread_matvec(dst, mat, x, n_rows, tid, nt);
+        return;
+    }
+
+    static int tile_rows = 1024;
+    const char *t = getenv("TP_OVERLAP_TILE");
+    if (t && *t) {
+        int v = atoi(t);
+        if (v >= 64 && v <= 8192) tile_rows = (v + 7) & ~7;
+    }
+
+    const int workers = nt - 1;
+    for (int base = 0; base < n_rows; base += tile_rows) {
+        int end = base + tile_rows;
+        if (end > n_rows) end = n_rows;
+        if (tid != 0) {
+            int span = end - base;
+            int rs = base + span * (tid - 1) / workers;
+            int re = base + span * tid / workers;
+            if (re > rs)
+                tf_matvec_qtensor_rows(dst, mat, x, rs, re);
+        }
+        /* After this barrier, workers advance to the next tile while rank
+         * thread 0 reduces this tile.  The next barrier provides reuse safety. */
+        tf_spin_barrier(m, local_sense, nt);
+        if (tid == 0)
+            m->tp_allreduce_fn(dst + base, end - base, m->tp_allreduce_ctx);
+    }
+}
+
+static int tf_thread_matvec_fused_q8_pair(float *dst1, const qtensor *mat1,
+                                          float *dst2, const qtensor *mat2,
+                                          const float *x, int n_rows, int tid, int nt) {
+#if defined(__ARM_FEATURE_SVE)
+    static int tf_q8_fused_2row = -1;
+    if (tf_q8_fused_2row < 0) {
+        const char *e = getenv("TF_Q8_FUSED_2ROW");
+        tf_q8_fused_2row = e ? (atoi(e) != 0) : 1;
+    }
+    if (tf_null_gemm_enabled() &&
+        (mat1->type == GGML_TYPE_Q8_0 || mat1->type == GGML_TYPE_BF16 || mat1->i8) &&
+        (mat2->type == GGML_TYPE_Q8_0 || mat2->type == GGML_TYPE_BF16 || mat2->i8)) {
+        tf_null_matvec(dst1, mat1, n_rows, tid, nt);
+        tf_null_matvec(dst2, mat2, n_rows, tid, nt);
+        return 1;
+    }
+    if (mat1->type == GGML_TYPE_Q8_0 && mat2->type == GGML_TYPE_Q8_0 &&
+        !mat1->q8_block64 && !mat2->q8_block64 && mat1->n_cols == mat2->n_cols &&
+        n_rows >= 4) {
+        if (tf_q8_fused_2row) {
+            int groups = n_rows / 2;
+            int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+            size_t group_bytes = (size_t)(mat1->n_cols / 32) * sizeof(block_q8_0) * 2;
+            for (int g = g0; g < g1; g++)
+                matvec_q8_0_2row_fused2_f32(
+                    dst1 + g * 2, dst2 + g * 2,
+                    (const uint8_t *)mat1->data + (size_t)g * group_bytes,
+                    (const uint8_t *)mat2->data + (size_t)g * group_bytes,
+                    x, mat1->n_cols);
+            return 1;
+        }
+        int groups = n_rows / 4;
+        int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+        size_t group_bytes = (size_t)(mat1->n_cols / 32) * sizeof(block_q8_0) * 4;
+        for (int g = g0; g < g1; g++)
+            matvec_q8_0_4row_fused2_f32(
+                dst1 + g * 4, dst2 + g * 4,
+                (const uint8_t *)mat1->data + (size_t)g * group_bytes,
+                (const uint8_t *)mat2->data + (size_t)g * group_bytes,
+                x, mat1->n_cols);
+        int tail0 = groups * 4;
+        if (tid == 0) {
+            size_t row_bytes = (size_t)(mat1->n_cols / 32) * sizeof(block_q8_0);
+            const uint8_t *b1 = (const uint8_t *)mat1->data;
+            const uint8_t *b2 = (const uint8_t *)mat2->data;
+            for (int i = tail0; i < n_rows; i++) {
+                dst1[i] = vec_dot_q8_0_f32(b1 + (size_t)i * row_bytes, x, mat1->n_cols);
+                dst2[i] = vec_dot_q8_0_f32(b2 + (size_t)i * row_bytes, x, mat2->n_cols);
+            }
+        }
+        return 1;
+    }
+#else
+    (void)dst1; (void)mat1; (void)dst2; (void)mat2; (void)x;
+    (void)n_rows; (void)tid; (void)nt;
+#endif
+    return 0;
+}
+
+/* Consume precisely the groups produced by tf_thread_matvec's BF16-PV path.
+ * Keeping producer and consumer ownership identical avoids an FFN barrier. */
+static void tf_swiglu_pv_worker(float *dst, const float *gate, const float *up,
+                                int n_rows, int tid, int nt) {
+    int groups = n_rows / 8;
+    int begin = (groups * tid / nt) * 8;
+    int end = (groups * (tid + 1) / nt) * 8;
+    for (int i = begin; i < end; i++) {
+        float g = gate[i];
+        dst[i] = g / (1.0f + expf(-g)) * up[i];
+    }
+}
+
 static void *tf_persistent_worker(void *arg) {
     tf_persistent_ctx *ctx = (tf_persistent_ctx *)arg;
     transformer_model *m = ctx->m;
     int tid = ctx->tid;
+    tf_barrier_tid = tid;
     int nt = m->n_threads;
     int position = ctx->position;
     int pos_t = ctx->pos_t, pos_h = ctx->pos_h, pos_w = ctx->pos_w;
     int local_sense = 0;
+    static _Thread_local int trace_layers = -1;
+    static _Thread_local int ssm_conv_inline_copy = -1;
+    static _Thread_local int attn_prep_heads = -1;
+    if (trace_layers < 0)
+        trace_layers = getenv("TF_TRACE_LAYERS") ? 1 : 0;
+    if (ssm_conv_inline_copy < 0) {
+        const char *e = getenv("TF_SSM_CONV_INLINE_COPY");
+        ssm_conv_inline_copy = !e || atoi(e) != 0;
+    }
+    if (attn_prep_heads < 0) {
+        const char *e = getenv("TF_ATTN_PREP_HEADS");
+        attn_prep_heads = e && atoi(e) != 0;
+    }
+    if (tid == 0 && tf_dprof < 0)
+        tf_dprof = getenv("TF_DPROF") ? 1 : 0;
 
     int n_embd = m->n_embd;
     int n_heads = m->n_heads;
@@ -3283,7 +7853,7 @@ static void *tf_persistent_worker(void *arg) {
     int head_dim = m->head_dim;
     int kv_dim = n_kv_heads * head_dim;
     int q_dim = n_heads * head_dim;
-    int gqa_ratio = n_heads / n_kv_heads;
+    int gqa_ratio = m->tp_attn_sharded ? m->gqa_group : n_heads / n_kv_heads;
     int n_ff = m->n_ff;
     /* Head partition for attention */
     int h_per = n_heads / nt, h_extra = n_heads % nt;
@@ -3292,6 +7862,9 @@ static void *tf_persistent_worker(void *arg) {
 
     for (int l = 0; l < m->n_layers; l++) {
         transformer_layer *layer = &m->layers[l];
+        if (tid == 0 && trace_layers)
+            fprintf(stderr, "trace: layer %d begin type=%s\n", l,
+                    (m->is_hybrid && layer->is_ssm) ? "ssm" : "attn");
 
         /* Thread 0: RMSNorm (sequential, cheap) */
         if (tid == 0)
@@ -3299,18 +7872,106 @@ static void *tf_persistent_worker(void *arg) {
         tf_spin_barrier(m, &local_sense, nt);  /* B1: xb ready */
 
         if (m->is_hybrid && layer->is_ssm) {
-            /* SSM: thread 0 runs with pool disabled. Other threads wait. */
+            /* The persistent workers already occupy the pool, so nested pool
+             * dispatch would deadlock.  Cooperatively split both projections
+             * and the independent Delta-Net heads across these workers. */
+            double ssm_t0 = (tid == 0 && tf_dprof > 0) ? tf_time_ms() : 0.0;
+            tf_thread_matvec(m->xb2, &layer->ssm_qkv, m->xb,
+                             m->ssm_qkv_dim, tid, nt);
+            tf_thread_matvec(m->ffn_buf1, &layer->ssm_gate, m->xb,
+                             m->ssm_d_inner, tid, nt);
+            /* Alpha/beta are small, but were previously computed entirely by
+             * thread 0 during SSM preparation.  Keep them in the persistent
+             * pool so their Q8 row partitions overlap across all workers.  They
+             * are independent of QKV/gate and write disjoint buffers, so do
+             * not serialize them with an intermediate barrier; the barrier
+             * below still covers all four projections before preparation. */
+            tf_thread_matvec(m->ssm_alpha_tmp, &layer->ssm_alpha, m->xb,
+                             m->ssm_dt_rank, tid, nt);
+            tf_thread_matvec(m->ssm_beta_tmp, &layer->ssm_beta, m->xb,
+                             m->ssm_dt_rank, tid, nt);
+            tf_spin_barrier(m, &local_sense, nt);
+            if (tid == 0 && tf_dprof > 0) {
+                tf_decode_ssm_in_ms += tf_time_ms() - ssm_t0;
+                ssm_t0 = tf_time_ms();
+            }
+            double ssm_prepare_t0 = (tid == 0 && tf_dprof > 0) ? tf_time_ms() : 0.0;
+            tf_ssm_prepare_conv_worker(m, l, tid, nt, ssm_conv_inline_copy);
+            tf_spin_barrier(m, &local_sense, nt);
+            if (ssm_conv_inline_copy) {
+                if (tid == 0)
+                    m->conv_state_pos[l] =
+                        (m->conv_state_pos[l] + 1) % (m->ssm_conv_kernel - 1);
+            } else {
+                if (tid == 0) {
+                    memcpy(m->conv_state[l] +
+                               m->conv_state_pos[l] * m->ssm_qkv_dim,
+                           m->xb2, (size_t)m->ssm_qkv_dim * sizeof(float));
+                    m->conv_state_pos[l] =
+                        (m->conv_state_pos[l] + 1) % (m->ssm_conv_kernel - 1);
+                    memcpy(m->xb2, m->ffn_buf2,
+                           (size_t)m->ssm_qkv_dim * sizeof(float));
+                }
+                tf_spin_barrier(m, &local_sense, nt);
+            }
+            tf_ssm_prepare_qk_worker(m, tid, nt, 0);
+            tf_spin_barrier(m, &local_sense, nt);
+            tf_ssm_prepare_qk_worker(m, tid, nt, 1);
+            tf_spin_barrier(m, &local_sense, nt);
             if (tid == 0) {
                 int saved_alive = m->pool_alive;
                 m->pool_alive = 0;
-                tf_ssm_deltanet_forward(m, l);
+                tf_ssm_deltanet_forward_parts(m, l, 0, 0, 1, 1, 1, 1);
                 m->pool_alive = saved_alive;
             }
+            tf_spin_barrier(m, &local_sense, nt);
+            if (tid == 0 && tf_dprof > 0) {
+                tf_decode_ssm_prepare_ms += tf_time_ms() - ssm_prepare_t0;
+                ssm_t0 = tf_time_ms();
+            }
+
+            {
+                int dt_rank = m->ssm_dt_rank;
+                int hp = dt_rank / nt, hx = dt_rank % nt;
+                int hs = tid * hp + (tid < hx ? tid : hx);
+                int hc = hp + (tid < hx ? 1 : 0);
+                tf_ssm_recurrence_task task = {
+                    m->recurrent_state[l], m->q, m->ffn_buf2,
+                    m->xb2 + 2 * m->ssm_n_group * m->ssm_d_state,
+                    m->ffn_buf3, m->ssm_alpha_tmp, m->ssm_beta_tmp,
+                    hs, hs + hc, m->ssm_d_state,
+                    1.0f / sqrtf((float)m->ssm_d_state)
+                };
+                if (hc > 0)
+                    tf_ssm_recurrence_worker(&task);
+                tf_ssm_finish_heads(m, l, hs, hs + hc);
+            }
+            tf_spin_barrier(m, &local_sense, nt);
+            if (tid == 0 && tf_dprof > 0) {
+                tf_decode_ssm_core_ms += tf_time_ms() - ssm_t0;
+                ssm_t0 = tf_time_ms();
+            }
+            tf_thread_matvec_overlap_reduce(m, m->xb, &layer->ssm_out,
+                                            m->ffn_buf3, n_embd, tid, nt,
+                                            m->tp_ssm_sharded, &local_sense);
             tf_spin_barrier(m, &local_sense, nt);  /* B2: SSM done */
+            if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ssm_sharded) &&
+                m->tp_ssm_sharded && m->tp_reduce_add_fn)
+                m->tp_reduce_add_fn(m->xb, m->x, n_embd, m->tp_allreduce_ctx);
+            else if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ssm_sharded) &&
+                     m->tp_ssm_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
+            if (m->tp_ssm_sharded && m->tp_allreduce_fn)
+                tf_spin_barrier(m, &local_sense, nt);
+            if (tid == 0 && tf_dprof > 0)
+                tf_decode_ssm_out_ms += tf_time_ms() - ssm_t0;
+            if (tid == 0 && trace_layers)
+                fprintf(stderr, "trace: layer %d ssm done\n", l);
         } else {
             /* --- Attention layer --- */
 
             /* QKV projection: all threads compute their row partition */
+            double attn_t0 = (tid == 0 && tf_dprof > 0) ? tf_time_ms() : 0.0;
             if (m->is_hybrid) {
                 /* Gated attention: Q+gate combined [2*q_dim] */
                 int q2_dim = 2 * q_dim;
@@ -3327,9 +7988,84 @@ static void *tf_persistent_worker(void *arg) {
                 }
             }
             tf_spin_barrier(m, &local_sense, nt);  /* B2: Q/K/V ready */
+            if (tid == 0 && tf_dprof > 0)
+                tf_decode_attn_qkv_ms += tf_time_ms() - attn_t0;
 
-            /* Thread 0: de-interleave (gated), QK-norm, RoPE, KV cache */
-            if (tid == 0) {
+            /* Q heads are independent through de-interleave, normalization,
+             * bias, and RoPE.  The optional head-owned path leaves K/V and
+             * cache publication on thread 0, while one worker prepares each
+             * local Q head with the unchanged scalar/SVE routines. */
+            if (attn_prep_heads && m->is_hybrid) {
+                if (tid < n_heads) {
+                    float *qh = m->q + (size_t)tid * head_dim;
+                    memcpy(qh, m->xb2 + (size_t)tid * 2 * head_dim,
+                           (size_t)head_dim * sizeof(float));
+                    memcpy(m->ffn_buf1 + (size_t)tid * head_dim,
+                           m->xb2 + (size_t)tid * 2 * head_dim + head_dim,
+                           (size_t)head_dim * sizeof(float));
+                    if (layer->attn_q_norm.data)
+                        tf_qk_norm(qh, 1, head_dim, &layer->attn_q_norm,
+                                   m->rms_norm_eps, m->thread_tmp[tid]);
+                    if (layer->attn_q_bias.data) {
+                        const float *qb;
+                        if (layer->attn_q_bias.type == GGML_TYPE_F32)
+                            qb = (const float *)layer->attn_q_bias.data;
+                        else {
+                            tf_dequant_row(&layer->attn_q_bias, 0,
+                                           m->thread_tmp[tid]);
+                            qb = m->thread_tmp[tid];
+                        }
+                        for (int i = 0; i < head_dim; i++)
+                            qh[i] += qb[(size_t)tid * head_dim + i];
+                    }
+                    if (m->use_mrope)
+                        tf_rope_mrope(qh, 1, head_dim, pos_t, pos_h, pos_w,
+                                      m->rope_freq_base, m->mrope_sections,
+                                      m->rope_mrope_inv_freq);
+                    else
+                        tf_rope(qh, 1, head_dim, pos_t, m->rope_freq_base,
+                                m->rope_inv_freq);
+                }
+                if (tid == 0) {
+                    if (layer->attn_k_norm.data)
+                        tf_qk_norm(m->k, n_kv_heads, head_dim,
+                                   &layer->attn_k_norm, m->rms_norm_eps,
+                                   m->matvec_tmp);
+                    if (layer->attn_k_bias.data) {
+                        const float *kb;
+                        if (layer->attn_k_bias.type == GGML_TYPE_F32)
+                            kb = (const float *)layer->attn_k_bias.data;
+                        else {
+                            tf_dequant_row(&layer->attn_k_bias, 0,
+                                           m->matvec_tmp);
+                            kb = m->matvec_tmp;
+                        }
+                        for (int i = 0; i < kv_dim; i++) m->k[i] += kb[i];
+                    }
+                    if (layer->attn_v_bias.data) {
+                        const float *vb;
+                        if (layer->attn_v_bias.type == GGML_TYPE_F32)
+                            vb = (const float *)layer->attn_v_bias.data;
+                        else {
+                            tf_dequant_row(&layer->attn_v_bias, 0,
+                                           m->matvec_tmp);
+                            vb = m->matvec_tmp;
+                        }
+                        for (int i = 0; i < kv_dim; i++) m->v[i] += vb[i];
+                    }
+                    if (m->use_mrope)
+                        tf_rope_mrope(m->k, n_kv_heads, head_dim,
+                                      pos_t, pos_h, pos_w, m->rope_freq_base,
+                                      m->mrope_sections, m->rope_mrope_inv_freq);
+                    else
+                        tf_rope(m->k, n_kv_heads, head_dim, pos_t,
+                                m->rope_freq_base, m->rope_inv_freq);
+                    memcpy(m->key_cache[l] + (size_t)position * kv_dim,
+                           m->k, (size_t)kv_dim * sizeof(float));
+                    memcpy(m->value_cache[l] + (size_t)position * kv_dim,
+                           m->v, (size_t)kv_dim * sizeof(float));
+                }
+            } else if (tid == 0) {
                 if (m->is_hybrid) {
                     for (int h = 0; h < n_heads; h++) {
                         memcpy(m->q + h * head_dim, m->xb2 + h * 2 * head_dim, head_dim * sizeof(float));
@@ -3374,14 +8110,68 @@ static void *tf_persistent_worker(void *arg) {
             }
             tf_spin_barrier(m, &local_sense, nt);  /* B3: Q/K ready for attention */
 
-            /* Attention: each thread handles its head partition */
+            /* Attention.  TP4 leaves only six local query heads, so at long
+             * context split independent QK positions eight ways per head.  A
+             * head owner still performs softmax and PV in original sequence
+             * order, preserving the exact accumulation result. */
             {
                 int seq_len = position + 1;
                 float scale = 1.0f / sqrtf((float)head_dim);
-                if (h_count > 0) {
+                static _Thread_local int seq_split = -1;
+                static _Thread_local int seq_split_min = -1;
+                static _Thread_local int pv_split = -1;
+                if (seq_split < 0) {
+                    const char *e = getenv("TF_ATTN_SEQ_SPLIT");
+                    seq_split = e && atoi(e) != 0;
+                    e = getenv("TF_ATTN_SEQ_SPLIT_MIN");
+                    seq_split_min = e ? atoi(e) : 512;
+                    if (seq_split_min < 1) seq_split_min = 1;
+                    e = getenv("TF_ATTN_PV_SPLIT");
+                    pv_split = e && atoi(e) != 0;
+                }
+                int split = seq_split && seq_len >= seq_split_min && n_heads < nt &&
+                            (nt % n_heads) == 0;
+                if (split) {
+                    int lanes = nt / n_heads;
+                    int sh = tid % n_heads;
+                    int lane = tid / n_heads;
+                    int p0 = seq_len * lane / lanes;
+                    int p1 = seq_len * (lane + 1) / lanes;
+                    tf_attn_task scores = {m->q, m->att, m->xb2,
+                        m->key_cache[l], m->value_cache[l], sh, sh + 1,
+                        head_dim, kv_dim, gqa_ratio, seq_len, m->max_seq_len,
+                        scale, m->tp_qhead_offset, 1, p0, p1};
+                    tf_attn_worker(&scores);
+                    tf_spin_barrier(m, &local_sense, nt);
+#if defined(__ARM_FEATURE_SVE)
+                    if (pv_split) {
+                        if (tid < n_heads)
+                            tf_softmax(m->att + tid * m->max_seq_len, seq_len);
+                        tf_spin_barrier(m, &local_sense, nt);
+                        int kv_h = (m->tp_qhead_offset + sh) / gqa_ratio;
+                        tf_attn_pv_slice_sve(m->xb2 + sh * head_dim,
+                            m->att + sh * m->max_seq_len,
+                            m->value_cache[l] + kv_h * head_dim, seq_len, kv_dim,
+                            head_dim * lane / lanes, head_dim * (lane + 1) / lanes);
+                        /* The head owner's following sigmoid gate consumes
+                         * dimensions produced by every lane, not just itself. */
+                        tf_spin_barrier(m, &local_sense, nt);
+                    } else
+#endif
+                    if (tid < n_heads) {
+                        memset(m->xb2 + tid * head_dim, 0,
+                               (size_t)head_dim * sizeof(float));
+                        tf_attn_task finish = {m->q, m->att, m->xb2,
+                            m->key_cache[l], m->value_cache[l], tid, tid + 1,
+                            head_dim, kv_dim, gqa_ratio, seq_len, m->max_seq_len,
+                            scale, m->tp_qhead_offset, 2, 0, 0};
+                        tf_attn_worker(&finish);
+                    }
+                } else if (h_count > 0) {
                     tf_attn_task at = {m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
                                        h_start, h_start + h_count, head_dim, kv_dim, gqa_ratio,
-                                       seq_len, m->max_seq_len, scale};
+                                       seq_len, m->max_seq_len, scale,
+                                       m->tp_qhead_offset, 0, 0, 0};
                     memset(m->xb2 + h_start * head_dim, 0, (size_t)h_count * head_dim * sizeof(float));
                     tf_attn_worker(&at);
                 }
@@ -3397,40 +8187,94 @@ static void *tf_persistent_worker(void *arg) {
             tf_spin_barrier(m, &local_sense, nt);  /* B4: xb2 ready */
 
             /* Output projection: all threads compute their row partition */
-            tf_thread_matvec(m->xb, &layer->attn_output, m->xb2, n_embd, tid, nt);
+            attn_t0 = (tid == 0 && tf_dprof > 0) ? tf_time_ms() : 0.0;
+            tf_thread_matvec_overlap_reduce(m, m->xb, &layer->attn_output,
+                                            m->xb2, n_embd, tid, nt,
+                                            m->tp_attn_sharded, &local_sense);
             tf_spin_barrier(m, &local_sense, nt);  /* B5: xb ready */
+            if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_attn_sharded) &&
+                m->tp_attn_sharded && m->tp_reduce_add_fn)
+                m->tp_reduce_add_fn(m->xb, m->x, n_embd, m->tp_allreduce_ctx);
+            else if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_attn_sharded) &&
+                     m->tp_attn_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
+            if (m->tp_attn_sharded && m->tp_allreduce_fn)
+                tf_spin_barrier(m, &local_sense, nt);
+            if (tid == 0 && tf_dprof > 0)
+                tf_decode_attn_out_ms += tf_time_ms() - attn_t0;
+            if (tid == 0 && trace_layers)
+                fprintf(stderr, "trace: layer %d attn done\n", l);
         }
 
         /* Thread 0: residual + FFN norm (merged B5+B6: saves 1 barrier) */
         if (tid == 0) {
-            tf_vadd(m->x, m->xb, n_embd);
+            int active_sharded = m->is_hybrid && layer->is_ssm ?
+                                 m->tp_ssm_sharded : m->tp_attn_sharded;
+            int fused_residual = active_sharded && m->tp_reduce_add_fn &&
+                                 !tf_tp_overlap_wanted(m, n_embd, nt, active_sharded);
+            if (!fused_residual)
+                tf_vadd(m->x, m->xb, n_embd);
             tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         }
         tf_spin_barrier(m, &local_sense, nt);  /* B6: xb ready for FFN (merged) */
 
         if (!m->use_moe || !layer->ffn_gate_inp.data) {
             /* Dense SwiGLU FFN: gate+up matvec (parallel) */
-            tf_thread_matvec(m->ffn_buf1, &layer->ffn_gate, m->xb, n_ff, tid, nt);
-            tf_thread_matvec(m->ffn_buf2, &layer->ffn_up, m->xb, n_ff, tid, nt);
+            double ffn_t0 = (tid == 0 && tf_dprof > 0) ? tf_time_ms() : 0.0;
+            if (!tf_thread_matvec_fused_q8_pair(
+                    m->ffn_buf1, &layer->ffn_gate, m->ffn_buf2, &layer->ffn_up,
+                    m->xb, n_ff, tid, nt)) {
+                tf_thread_matvec(m->ffn_buf1, &layer->ffn_gate, m->xb, n_ff, tid, nt);
+                tf_thread_matvec(m->ffn_buf2, &layer->ffn_up, m->xb, n_ff, tid, nt);
+            }
 
             /* SiLU×mul on this thread's row partition (no barrier needed) */
             {
                 int rp = n_ff / nt, re = n_ff % nt;
                 int rs = tid * rp + (tid < re ? tid : re);
                 int rc = rp + (tid < re ? 1 : 0);
+                /* PV producers partition eight-row groups, not individual
+                 * rows. Consume the same groups here: there is deliberately
+                 * no barrier between the projections and this activation. */
+#if defined(__ARM_FEATURE_SVE)
+                if (layer->ffn_gate.type == GGML_TYPE_BF16 && layer->ffn_gate.bf16_pv &&
+                    layer->ffn_up.type == GGML_TYPE_BF16 && layer->ffn_up.bf16_pv) {
+                    tf_swiglu_pv_worker(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2,
+                                         n_ff, tid, nt);
+                    rc = 0;
+                }
+#endif
                 for (int i = rs; i < rs + rc; i++) {
                     float g = m->ffn_buf1[i];
                     m->ffn_buf3[i] = g / (1.0f + expf(-g)) * m->ffn_buf2[i];
                 }
             }
             tf_spin_barrier(m, &local_sense, nt);  /* B7: ffn_buf3 ready for down */
+            if (tid == 0 && tf_dprof > 0) {
+                tf_decode_ffn_gateup_ms += tf_time_ms() - ffn_t0;
+                ffn_t0 = tf_time_ms();
+            }
 
             /* Down projection */
-            tf_thread_matvec(m->xb, &layer->ffn_down, m->ffn_buf3, n_embd, tid, nt);
+            tf_thread_matvec_overlap_reduce(m, m->xb, &layer->ffn_down,
+                                            m->ffn_buf3, n_embd, tid, nt,
+                                            m->tp_ffn_sharded, &local_sense);
             tf_spin_barrier(m, &local_sense, nt);  /* B8: xb ready */
+            if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ffn_sharded) &&
+                m->tp_ffn_sharded && m->tp_reduce_add_fn)
+                m->tp_reduce_add_fn(m->xb, m->x, n_embd, m->tp_allreduce_ctx);
+            else if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ffn_sharded) &&
+                     m->tp_ffn_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
+            if (m->tp_ffn_sharded && m->tp_allreduce_fn)
+                tf_spin_barrier(m, &local_sense, nt);
+            if (tid == 0 && tf_dprof > 0)
+                tf_decode_ffn_down_ms += tf_time_ms() - ffn_t0;
 
             /* Thread 0: residual */
-            if (tid == 0) tf_vadd(m->x, m->xb, n_embd);
+            if (tid == 0 && !(m->tp_ffn_sharded && m->tp_reduce_add_fn &&
+                              !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ffn_sharded)))
+                tf_vadd(m->x, m->xb, n_embd);
         } else {
             /* MoE: thread 0 only (complex routing) */
             if (tid == 0) {
@@ -3461,9 +8305,301 @@ static void *tf_persistent_worker(void *arg) {
 
     /* Final norm: thread 0 only */
     if (tid == 0) {
+        if (m->nextn.target_hidden)
+            memcpy(m->nextn.target_hidden, m->x, (size_t)n_embd * sizeof(float));
         tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
     }
+    if (tf_g4p_want_logits && m->has_lm_head) {
+        double lm_t0 = (tid == 0 && tf_dprof > 0) ? tf_time_ms() : 0.0;
+        tf_spin_barrier(m, &local_sense, nt);
+        int rows = m->output.n_rows; /* TP owns only its local vocabulary. */
+        tf_thread_matvec(m->logits, &m->output, m->x, rows, tid, nt);
+        int start = tid * rows / nt;
+        int end = (tid + 1) * rows / nt;
+        if (m->output.type == GGML_TYPE_BF16 && m->output.bf16_pv) {
+            start = (rows / 8 * tid / nt) * 8;
+            end = (rows / 8 * (tid + 1) / nt) * 8;
+        } else {
+            /* Non-PV kernels may partition rows differently from this scan. */
+            tf_spin_barrier(m, &local_sense, nt);
+        }
+        int best = start;
+        for (int i = start + 1; i < end; i++)
+            if (m->logits[i] > m->logits[best]) best = i;
+        if (m->lm_head_best_idx) {
+            m->lm_head_best_idx[tid] = best;
+            m->lm_head_best_val[tid] = end > start ? m->logits[best] : -INFINITY;
+        }
+        tf_spin_barrier(m, &local_sense, nt);
+        if (tid == 0 && m->lm_head_best_idx) {
+            int global = m->lm_head_best_idx[0];
+            float value = m->lm_head_best_val[0];
+            for (int t = 1; t < nt; t++) {
+                if (m->lm_head_best_val[t] > value) {
+                    value = m->lm_head_best_val[t];
+                    global = m->lm_head_best_idx[t];
+                }
+            }
+            m->last_argmax = global;
+        }
+        if (tid == 0 && tf_dprof > 0)
+            tf_decode_lm_head_ms += tf_time_ms() - lm_t0;
+        if (tid == 0) tf_g4p_did_logits = 1;
+    }
     return NULL;
+}
+
+/* Gemma4-aware persistent worker: the whole token forward in ONE pool dispatch,
+ * threads sync via the WFE/SEV spin barrier instead of 169 cond_broadcast dispatches
+ * (decode is dispatch-bound: ~0.4 ms/cond_broadcast, ~77 GB/s matvec). Mirrors the
+ * gemma4 block in tf_forward_blocks_range EXACTLY (SWA window / per-layer hd,kvh /
+ * qk+v norm / proportional RoPE / circular KV) but: matvecs row-split (tf_thread_matvec),
+ * attention head-split, GELU element-split. Serial-but-cheap parts (norms, rope, kv
+ * store) run on tid0 while others WFE-wait. 12B BF16 path: no PLE, no MoE, no softcap. */
+static void *tf_gemma4_persistent_worker(void *arg) {
+    tf_persistent_ctx *ctx = (tf_persistent_ctx *)arg;
+    transformer_model *m = ctx->m;
+    int tid = ctx->tid;
+    tf_barrier_tid = tid;
+    int nt = m->n_threads;
+    int position = ctx->position;
+    int local_sense = 0;
+
+    int n_embd = m->n_embd;
+    int n_heads = m->n_heads;
+    int n_kv_heads = m->n_kv_heads;
+    float eps = m->rms_norm_eps;
+    /* head partition for attention (head count is constant across layers) */
+    int h_per = n_heads / nt, h_extra = n_heads % nt;
+    int h_start = tid * h_per + (tid < h_extra ? tid : h_extra);
+    int h_count = h_per + (tid < h_extra ? 1 : 0);
+    int pp_l0 = ctx->l0, pp_l1 = ctx->l1;   /* PP layer range (full = 0..n_layers) */
+
+    for (int l = pp_l0; l < pp_l1; l++) {
+        transformer_layer *layer = &m->layers[l];
+        int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
+        int l_kvh = layer->n_kv_heads > 0 ? layer->n_kv_heads : n_kv_heads;
+        int local_kv_dim = l_kvh * hd;
+        int local_q_dim  = n_heads * hd;
+        int local_gqa    = n_heads / l_kvh;
+        int kv_src = (layer->shared_kv_source >= 0) ? layer->shared_kv_source : l;
+
+        /* attn_norm (tid0) */
+        if (tid == 0) tf_rmsnorm(m->xb, m->x, &layer->attn_norm, n_embd, eps, m->matvec_tmp);
+        tf_spin_barrier(m, &local_sense, nt);  /* B1 */
+
+        /* Q/K/V projections (row-split) */
+        if (layer->shared_kv_source < 0 && layer->has_v_proj) {
+            tf_thread_matvec(m->q, &layer->attn_q, m->xb, local_q_dim, tid, nt);
+            tf_thread_matvec(m->k, &layer->attn_k, m->xb, local_kv_dim, tid, nt);
+            tf_thread_matvec(m->v, &layer->attn_v, m->xb, local_kv_dim, tid, nt);
+        } else {
+            tf_thread_matvec(m->q, &layer->attn_q, m->xb, local_q_dim, tid, nt);
+            if (layer->shared_kv_source < 0) {
+                tf_thread_matvec(m->k, &layer->attn_k, m->xb, local_kv_dim, tid, nt);
+                if (layer->has_v_proj)
+                    tf_thread_matvec(m->v, &layer->attn_v, m->xb, local_kv_dim, tid, nt);
+            }
+        }
+        tf_spin_barrier(m, &local_sense, nt);  /* B2 */
+
+        /* QK/V norm + RoPE + KV store (tid0) */
+        if (tid == 0) {
+            tf_qk_norm(m->q, n_heads, hd, &layer->attn_q_norm, eps, m->matvec_tmp);
+            if (layer->shared_kv_source < 0) {
+                tf_qk_norm(m->k, l_kvh, hd, &layer->attn_k_norm, eps, m->matvec_tmp);
+                if (!layer->has_v_proj) memcpy(m->v, m->k, local_kv_dim * sizeof(float));
+                if (layer->attn_v_norm.data) {
+                    tf_qk_norm(m->v, l_kvh, hd, &layer->attn_v_norm, eps, m->matvec_tmp);
+                } else {
+                    for (int h = 0; h < l_kvh; h++) {
+                        float *vh = m->v + h * hd; float ss = 0.0f;
+                        for (int i = 0; i < hd; i++) ss += vh[i] * vh[i];
+                        ss = 1.0f / sqrtf(ss / hd + eps);
+                        for (int i = 0; i < hd; i++) vh[i] *= ss;
+                    }
+                }
+            }
+            /* RoPE: hoist cos/sin, SVE half-split rotate */
+            {
+                float *inv_freq = layer->is_swa ? m->rope_inv_freq_swa : m->rope_inv_freq;
+                int half = hd / 2;
+                float cs[256], sn[256];
+                for (int j = 0; j < half; j++) { float f = (float)position * inv_freq[j]; cs[j] = cosf(f); sn[j] = sinf(f); }
+                int nrot = n_heads + (layer->shared_kv_source < 0 ? l_kvh : 0);
+                for (int hh = 0; hh < nrot; hh++) {
+                    float *vh = (hh < n_heads) ? (m->q + hh * hd) : (m->k + (hh - n_heads) * hd);
+#if defined(__ARM_FEATURE_SVE)
+                    for (int j = 0; j < half; j += (int)svcntw()) { svbool_t pg = svwhilelt_b32(j, half);
+                        svfloat32_t r0 = svld1(pg, vh + j), r1 = svld1(pg, vh + j + half);
+                        svfloat32_t c = svld1(pg, cs + j), s = svld1(pg, sn + j);
+                        svst1(pg, vh + j,        svmls_x(pg, svmul_x(pg, r0, c), r1, s));
+                        svst1(pg, vh + j + half, svmla_x(pg, svmul_x(pg, r0, s), r1, c)); }
+#else
+                    for (int j = 0; j < half; j++) { float r0 = vh[j], r1 = vh[j + half];
+                        vh[j] = r0 * cs[j] - r1 * sn[j]; vh[j + half] = r0 * sn[j] + r1 * cs[j]; }
+#endif
+                }
+            }
+            if (layer->shared_kv_source < 0) {
+                if (layer->is_swa) {
+                    int slot = position % m->swa_window_size;
+                    tf_kv_store(m, l, (size_t)slot * local_kv_dim, m->k, local_kv_dim);
+                    tf_kv_store_value(m, l, (size_t)slot * local_kv_dim, m->v, local_kv_dim);
+                } else {
+                    tf_kv_store(m, l, (size_t)position * local_kv_dim, m->k, local_kv_dim);
+                    tf_kv_store_value(m, l, (size_t)position * local_kv_dim, m->v, local_kv_dim);
+                }
+            }
+        }
+        tf_spin_barrier(m, &local_sense, nt);  /* B3 */
+
+        /* Attention (head-split) */
+        if (h_count > 0) {
+            float attn_scale = 1.0f;
+            int win = m->swa_window_size;
+            int start = (layer->is_swa && position >= win) ? (position - win + 1) : 0;
+            int seq_len = position - start + 1;
+            memset(m->xb2 + h_start * hd, 0, (size_t)h_count * hd * sizeof(float));
+            for (int h = h_start; h < h_start + h_count; h++) {
+                float *qh = m->q + h * hd;
+                float *att_h = m->att + (size_t)h * seq_len;
+                int kv_h = h / local_gqa;
+                for (int p = 0; p < seq_len; p++) {
+                    int abs_pos = start + p;
+                    int slot = layer->is_swa ? (abs_pos % win) : abs_pos;
+                    float score = 0.0f;
+                    size_t kbase = (size_t)slot * local_kv_dim + (size_t)kv_h * hd;
+                    for (int d = 0; d < hd; d++) score += qh[d] * tf_kv_load_key(m, kv_src, kbase + d);
+                    att_h[p] = score * attn_scale;
+                }
+                float max_s = att_h[0];
+                for (int p = 1; p < seq_len; p++) if (att_h[p] > max_s) max_s = att_h[p];
+                float sum_e = 0.0f;
+                for (int p = 0; p < seq_len; p++) { att_h[p] = expf(att_h[p] - max_s); sum_e += att_h[p]; }
+                float inv_sum = 1.0f / sum_e;
+                for (int p = 0; p < seq_len; p++) att_h[p] *= inv_sum;
+                float *out_h = m->xb2 + h * hd;
+                for (int p = 0; p < seq_len; p++) {
+                    int abs_pos = start + p;
+                    int slot = layer->is_swa ? (abs_pos % win) : abs_pos;
+                    float w = att_h[p];
+                    size_t vbase = (size_t)slot * local_kv_dim + (size_t)kv_h * hd;
+                    for (int d = 0; d < hd; d++) out_h[d] += w * tf_kv_load_value(m, kv_src, vbase + d);
+                }
+            }
+        }
+        tf_spin_barrier(m, &local_sense, nt);  /* B4 */
+
+        /* Output projection (row-split) */
+        tf_thread_matvec(m->xb, &layer->attn_output, m->xb2, n_embd, tid, nt);
+        tf_spin_barrier(m, &local_sense, nt);  /* B5 */
+
+        /* post-attn norm + residual + ffn norm (tid0) */
+        if (tid == 0) {
+            tf_rmsnorm(m->xb, m->xb, &layer->post_attention_norm, n_embd, eps, m->matvec_tmp);
+            tf_vadd(m->x, m->xb, n_embd);
+            tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, eps, m->matvec_tmp);
+        }
+        tf_spin_barrier(m, &local_sense, nt);  /* B6 */
+
+        /* FFN gate+up (row-split) + GELU (element-split) */
+        tf_thread_matvec(m->ffn_buf1, &layer->ffn_gate, m->xb, m->n_ff, tid, nt);
+        tf_thread_matvec(m->ffn_buf2, &layer->ffn_up,   m->xb, m->n_ff, tid, nt);
+        {
+            int rp = m->n_ff / nt, re = m->n_ff % nt;
+            int rs = tid * rp + (tid < re ? tid : re);
+            int rc = rp + (tid < re ? 1 : 0);
+            if (rc > 0) {
+#if defined(__ARM_FEATURE_SVE)
+                if (m->ffn_gelu_fast) tf_gelu_mul_fast_sve(m->ffn_buf3 + rs, m->ffn_buf1 + rs, m->ffn_buf2 + rs, rc);
+                else tf_gelu_mul_exact(m->ffn_buf3 + rs, m->ffn_buf1 + rs, m->ffn_buf2 + rs, rc);
+#else
+                tf_gelu_mul_exact(m->ffn_buf3 + rs, m->ffn_buf1 + rs, m->ffn_buf2 + rs, rc);
+#endif
+            }
+        }
+        tf_spin_barrier(m, &local_sense, nt);  /* B7 */
+
+        /* FFN down (row-split) + post_ffw norm + residual + layer-output scale */
+        tf_thread_matvec(m->xb, &layer->ffn_down, m->ffn_buf3, n_embd, tid, nt);
+        tf_spin_barrier(m, &local_sense, nt);  /* B8 */
+        if (tid == 0) {
+            tf_rmsnorm(m->xb, m->xb, &layer->post_ffw_norm, n_embd, eps, m->matvec_tmp);
+            tf_vadd(m->x, m->xb, n_embd);
+            if (layer->layer_output_scale.data) {
+                float scale_val;
+                dequant_row(layer->layer_output_scale.type, layer->layer_output_scale.data, &scale_val, 1);
+                for (int i = 0; i < n_embd; i++) m->x[i] *= scale_val;
+            }
+        }
+        /* next layer's B1 covers the m->x write (only tid0 writes/reads it) */
+    }
+
+    /* Final RMSNorm only on the LAST stage (pp_l1 == n_layers); PP middle/first stages
+     * hand off the raw post-block residual to the next stage. */
+    if (tid == 0 && pp_l1 == m->n_layers && m->output_norm.data) {
+        if (m->nextn.target_hidden)
+            memcpy(m->nextn.target_hidden, m->x, (size_t)n_embd * sizeof(float));
+        tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, eps, m->matvec_tmp);
+    }
+
+    /* Lever 2: fold lm_head into the same dispatch (no separate cond_broadcast,
+     * threads stay engaged). Row-split the [n_vocab, n_embd] output matvec, then
+     * tid0 applies gemma final-logit softcap. */
+    if (tf_g4p_want_logits && m->has_lm_head) {
+        tf_spin_barrier(m, &local_sense, nt);  /* final norm visible to all */
+        tf_thread_matvec(m->logits, &m->output, m->x, m->n_vocab, tid, nt);
+        int start = tid * m->n_vocab / nt;
+        int end = (tid + 1) * m->n_vocab / nt;
+        int best = start;
+        for (int i = start + 1; i < end; i++)
+            if (m->logits[i] > m->logits[best]) best = i;
+        if (m->lm_head_best_idx) {
+            m->lm_head_best_idx[tid] = best;
+            m->lm_head_best_val[tid] = end > start ? m->logits[best] : -INFINITY;
+        }
+        tf_spin_barrier(m, &local_sense, nt);
+        if (tid == 0 && m->lm_head_best_idx) {
+            int global = m->lm_head_best_idx[0];
+            float value = m->lm_head_best_val[0];
+            for (int t = 1; t < nt; t++) {
+                if (m->lm_head_best_val[t] > value) {
+                    value = m->lm_head_best_val[t];
+                    global = m->lm_head_best_idx[t];
+                }
+            }
+            m->last_argmax = global;
+        }
+        if (m->is_gemma4 && m->final_logit_softcapping > 0.0f) {
+            tf_spin_barrier(m, &local_sense, nt);  /* all logit rows written before softcap reads them */
+            if (tid == 0) tf_logit_softcap(m->logits, m->n_vocab, m->final_logit_softcapping);
+        }
+        if (tid == 0) tf_g4p_did_logits = 1;
+    }
+    return NULL;
+}
+
+static float *tf_forward_gemma4_persistent_range(transformer_model *m, int position,
+                                                 int pos_t, int pos_h, int pos_w, int l0, int l1) {
+    int nt = m->n_threads;
+    m->bar_count = 0; m->bar_sense = 0; __sync_synchronize();
+    memset(m->cmg_bar, 0, sizeof(m->cmg_bar));
+    m->cmg_leader_count = 0; m->cmg_leader_sense = 0;
+    tf_persistent_ctx *ctxs = (tf_persistent_ctx *)alloca(nt * sizeof(tf_persistent_ctx));
+    for (int t = 0; t < nt; t++) ctxs[t] = (tf_persistent_ctx){m, t, position, pos_t, pos_h, pos_w, l0, l1};
+    tf_pool_dispatch(m, tf_gemma4_persistent_worker, ctxs, sizeof(tf_persistent_ctx));
+    return m->x;
+}
+static float *tf_forward_gemma4_persistent(transformer_model *m, int position, int pos_t, int pos_h, int pos_w) {
+    return tf_forward_gemma4_persistent_range(m, position, pos_t, pos_h, pos_w, 0, m->n_layers);
+}
+/* PP: run layers [l0,l1) of a single token through the persistent worker (spin-barrier,
+ * ~2.6x the block path). Caller sets m->x (embedding on stage 0, recv hidden elsewhere);
+ * the final RMSNorm fires only when l1==n_layers. Returns m->x. */
+float *transformer_forward_partial_persistent(transformer_model *m, int cache_pos, int l0, int l1) {
+    if (!m || !m->is_gemma4) return NULL;
+    return tf_forward_gemma4_persistent_range(m, cache_pos, cache_pos, cache_pos, cache_pos, l0, l1);
 }
 
 /* Persistent forward: dispatch tf_persistent_worker to ALL threads via pool,
@@ -3474,11 +8610,14 @@ static float *tf_forward_persistent(transformer_model *m, int position, int pos_
 
     m->bar_count = 0;
     m->bar_sense = 0;
+    memset(m->cmg_bar, 0, sizeof(m->cmg_bar));
+    m->cmg_leader_count = 0;
+    m->cmg_leader_sense = 0;
     __sync_synchronize();
 
     tf_persistent_ctx *ctxs = (tf_persistent_ctx *)alloca(nt * sizeof(tf_persistent_ctx));
     for (int t = 0; t < nt; t++)
-        ctxs[t] = (tf_persistent_ctx){m, t, position, pos_t, pos_h, pos_w};
+        ctxs[t] = (tf_persistent_ctx){m, t, position, pos_t, pos_h, pos_w, 0, 0};
 
     /* Use the existing pool to dispatch the persistent worker to threads 1..nt-1.
      * Main thread (worker 0) runs inline. */
@@ -3521,8 +8660,11 @@ float *transformer_forward(transformer_model *model, int32_t token_id, int posit
 }
 
 float *transformer_forward_logits_pos(transformer_model *model, int32_t token_id, int cache_pos, int pos_t, int pos_h, int pos_w) {
+    tf_g4p_did_logits = 0; tf_g4p_want_logits = 1;   /* ask the gemma4 persistent path to fold lm_head */
     float *hidden = transformer_forward_pos(model, token_id, cache_pos, pos_t, pos_h, pos_w);
+    tf_g4p_want_logits = 0;
     if (!model->has_lm_head || !hidden) return NULL;
+    if (tf_g4p_did_logits) return model->logits;   /* lm_head + softcap already done in the persistent dispatch */
     TF_PROF_BEGIN("lm_head", -1, "matvec", "FP32");
     tf_qmatvec_pool(model, model->logits, &model->output, hidden, model->n_vocab);
     TF_PROF_END("lm_head", 2.0 * model->n_vocab * model->n_embd, 0);
@@ -3544,6 +8686,15 @@ static float *tf_forward_blocks(transformer_model *m, int position, int pos_t, i
      * gemma4-aware block path; its matvecs still parallelize via tf_qmatvec_pool. */
     if (m->n_threads > 1 && m->pool_alive && !m->is_gemma4)
         return tf_forward_persistent(m, position, pos_t, pos_h, pos_w);
+    /* Gemma4 single-token decode: collapse the 169 per-matvec cond_broadcast dispatches
+     * into one persistent dispatch (WFE/SEV spin barriers). Opt-in TF_G4_PERSIST; only
+     * for the 12B-style dense path (no PLE, no MoE). */
+    if (m->is_gemma4 && m->n_threads > 1 && m->pool_alive &&
+        !(m->per_layer_token_embd.data && m->current_token_id >= 0) && !m->use_moe) {
+        static int g4p = -1;
+        if (g4p < 0) { const char *e = getenv("TF_G4_PERSIST"); g4p = (e && atoi(e)) ? 1 : 0; }
+        if (g4p) return tf_forward_gemma4_persistent(m, position, pos_t, pos_h, pos_w);
+    }
     return tf_forward_blocks_range(m, position, pos_t, pos_h, pos_w, 0, m->n_layers);
 }
 
@@ -3625,23 +8776,35 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             /* --- Gemma4 layer --- */
             int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
             int l_kvh = layer->n_kv_heads > 0 ? layer->n_kv_heads : n_kv_heads;
-            int local_kv_dim = l_kvh * hd;
-            int local_q_dim  = n_heads * hd;
-            int local_gqa    = n_heads / l_kvh;
+            int local_kv_dim = l_kvh * hd;          /* KV REPLICATED full on every TP rank */
+            int local_gqa    = n_heads / l_kvh;     /* global GQA ratio (heads per KV group) */
+            /* TP: this rank owns Q heads [tp_h0, tp_h0+local_qh); attn_q is ROW-sliced so
+             * m->q/xb2 hold ONLY these heads packed from 0, but kv_h uses the GLOBAL head
+             * index (tp_h0+h) since KV is replicated full. h0=0/local_qh=n_heads when off. */
+            int tp_h0 = 0, local_qh = n_heads;
+            if (m->tp_size > 1) {
+                tp_h0    = m->tp_rank * n_heads / m->tp_size;
+                local_qh = (m->tp_rank + 1) * n_heads / m->tp_size - tp_h0;
+            }
+            int local_q_dim  = local_qh * hd;       /* == layer->attn_q.n_rows when TP-loaded */
             float eps = m->rms_norm_eps;
 
-            /* Q projection (always present) */
-            tf_qmatvec_pool(m, m->q, &layer->attn_q, m->xb, local_q_dim);
-
-            /* K/V projections (skip if sharing KV) */
+            /* Q/K/V projections: fuse q,k,v into ONE pool dispatch (decode is
+             * dispatch-overhead-bound: ~0.4 ms/dispatch x 289/tok). */
             int kv_src = (layer->shared_kv_source >= 0) ? layer->shared_kv_source : l;
-            if (layer->shared_kv_source < 0) {
-                tf_qmatvec_pool(m, m->k, &layer->attn_k, m->xb, local_kv_dim);
-                tf_qmatvec_pool(m, m->v, &layer->attn_v, m->xb, local_kv_dim);
+            if (layer->shared_kv_source < 0 && layer->has_v_proj) {
+                tf_qmatvec_fused_qkv_pool(m, m->q, &layer->attn_q, local_q_dim,
+                                          m->k, &layer->attn_k, m->v, &layer->attn_v, local_kv_dim);
+            } else {
+                tf_qmatvec_pool(m, m->q, &layer->attn_q, m->xb, local_q_dim);
+                if (layer->shared_kv_source < 0) {
+                    tf_qmatvec_pool(m, m->k, &layer->attn_k, m->xb, local_kv_dim);
+                    tf_qmatvec_pool(m, m->v, &layer->attn_v, m->xb, local_kv_dim);
+                }
             }
 
-            /* Q norm (always) */
-            tf_qk_norm(m->q, n_heads, hd, &layer->attn_q_norm, eps, m->matvec_tmp);
+            /* Q norm (always) — over this rank's local Q heads */
+            tf_qk_norm(m->q, local_qh, hd, &layer->attn_q_norm, eps, m->matvec_tmp);
 
             /* K/V norm (only if we projected them) */
             if (layer->shared_kv_source < 0) {
@@ -3665,33 +8828,26 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                 }
             }
 
-            /* RoPE: use SWA or full-attention inv_freq table */
+            /* RoPE: hoist cos/sin out of the head loop (was recomputed per head -> ~32x
+             * redundant trig) and SVE the half-split rotate (decode is M=1). */
             {
                 float *inv_freq = layer->is_swa ? m->rope_inv_freq_swa : m->rope_inv_freq;
                 int half = hd / 2;
-                /* Apply RoPE to Q */
-                for (int h = 0; h < n_heads; h++) {
-                    float *qh = m->q + h * hd;
-                    for (int j = 0; j < half; j++) {
-                        float freq = (float)position * inv_freq[j];
-                        float cos_v = cosf(freq), sin_v = sinf(freq);
-                        float r0 = qh[j], r1 = qh[j + half];
-                        qh[j]        = r0 * cos_v - r1 * sin_v;
-                        qh[j + half] = r0 * sin_v + r1 * cos_v;
-                    }
-                }
-                /* Apply RoPE to K (only if we projected K) */
-                if (layer->shared_kv_source < 0) {
-                    for (int h = 0; h < l_kvh; h++) {
-                        float *kh = m->k + h * hd;
-                        for (int j = 0; j < half; j++) {
-                            float freq = (float)position * inv_freq[j];
-                            float cos_v = cosf(freq), sin_v = sinf(freq);
-                            float r0 = kh[j], r1 = kh[j + half];
-                            kh[j]        = r0 * cos_v - r1 * sin_v;
-                            kh[j + half] = r0 * sin_v + r1 * cos_v;
-                        }
-                    }
+                float cs[256], sn[256];   /* half = hd/2 <= 256 */
+                for (int j = 0; j < half; j++) { float f = (float)position * inv_freq[j]; cs[j] = cosf(f); sn[j] = sinf(f); }
+                int nrot = local_qh + (layer->shared_kv_source < 0 ? l_kvh : 0);
+                for (int hh = 0; hh < nrot; hh++) {
+                    float *vh = (hh < local_qh) ? (m->q + hh * hd) : (m->k + (hh - local_qh) * hd);
+#if defined(__ARM_FEATURE_SVE)
+                    for (int j = 0; j < half; j += (int)svcntw()) { svbool_t pg = svwhilelt_b32(j, half);
+                        svfloat32_t r0 = svld1(pg, vh + j), r1 = svld1(pg, vh + j + half);
+                        svfloat32_t c = svld1(pg, cs + j), s = svld1(pg, sn + j);
+                        svst1(pg, vh + j,        svmls_x(pg, svmul_x(pg, r0, c), r1, s));
+                        svst1(pg, vh + j + half, svmla_x(pg, svmul_x(pg, r0, s), r1, c)); }
+#else
+                    for (int j = 0; j < half; j++) { float r0 = vh[j], r1 = vh[j + half];
+                        vh[j] = r0 * cs[j] - r1 * sn[j]; vh[j + half] = r0 * sn[j] + r1 * cs[j]; }
+#endif
                 }
             }
 
@@ -3699,11 +8855,11 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             if (layer->shared_kv_source < 0) {
                 if (layer->is_swa) {
                     int slot = position % m->swa_window_size;
-                    memcpy(m->key_cache[l]   + slot * local_kv_dim, m->k, local_kv_dim * sizeof(float));
-                    memcpy(m->value_cache[l] + slot * local_kv_dim, m->v, local_kv_dim * sizeof(float));
+                    tf_kv_store(m, l, (size_t)slot * local_kv_dim, m->k, local_kv_dim);
+                    tf_kv_store_value(m, l, (size_t)slot * local_kv_dim, m->v, local_kv_dim);
                 } else {
-                    memcpy(m->key_cache[l]   + position * local_kv_dim, m->k, local_kv_dim * sizeof(float));
-                    memcpy(m->value_cache[l] + position * local_kv_dim, m->v, local_kv_dim * sizeof(float));
+                    tf_kv_store(m, l, (size_t)position * local_kv_dim, m->k, local_kv_dim);
+                    tf_kv_store_value(m, l, (size_t)position * local_kv_dim, m->v, local_kv_dim);
                 }
             }
 
@@ -3711,8 +8867,6 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             {
                 float attn_scale = 1.0f;
                 int seq_len;
-                float *kc = m->key_cache[kv_src];
-                float *vc = m->value_cache[kv_src];
 
                 if (layer->is_swa) {
                     /* SWA: attend to window [max(0, pos-window+1), pos] via circular buffer */
@@ -3722,18 +8876,18 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
 
                     /* Compute attention scores over the window */
                     memset(m->xb2, 0, local_q_dim * sizeof(float));
-                    for (int h = 0; h < n_heads; h++) {
+                    for (int h = 0; h < local_qh; h++) {
                         float *qh = m->q + h * hd;
                         float *att_h = m->att + h * seq_len;
-                        int kv_h = h / local_gqa;
+                        int kv_h = (tp_h0 + h) / local_gqa;
 
                         /* Compute QK scores */
                         for (int p = 0; p < seq_len; p++) {
                             int abs_pos = start + p;
                             int slot = abs_pos % win;
-                            float *kp = kc + slot * local_kv_dim + kv_h * hd;
                             float score = 0.0f;
-                            for (int d = 0; d < hd; d++) score += qh[d] * kp[d];
+                            size_t kbase = (size_t)slot * local_kv_dim + (size_t)kv_h * hd;
+                            for (int d = 0; d < hd; d++) score += qh[d] * tf_kv_load_key(m, kv_src, kbase + d);
                             att_h[p] = score * attn_scale;
                         }
 
@@ -3750,24 +8904,24 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                         for (int p = 0; p < seq_len; p++) {
                             int abs_pos = start + p;
                             int slot = abs_pos % win;
-                            float *vp = vc + slot * local_kv_dim + kv_h * hd;
                             float w = att_h[p];
-                            for (int d = 0; d < hd; d++) out_h[d] += w * vp[d];
+                            size_t vbase = (size_t)slot * local_kv_dim + (size_t)kv_h * hd;
+                            for (int d = 0; d < hd; d++) out_h[d] += w * tf_kv_load_value(m, kv_src, vbase + d);
                         }
                     }
                 } else {
                     /* Full attention */
                     seq_len = position + 1;
                     memset(m->xb2, 0, local_q_dim * sizeof(float));
-                    for (int h = 0; h < n_heads; h++) {
+                    for (int h = 0; h < local_qh; h++) {
                         float *qh = m->q + h * hd;
                         float *att_h = m->att + h * seq_len;
-                        int kv_h = h / local_gqa;
+                        int kv_h = (tp_h0 + h) / local_gqa;
 
                         for (int p = 0; p < seq_len; p++) {
-                            float *kp = kc + p * local_kv_dim + kv_h * hd;
                             float score = 0.0f;
-                            for (int d = 0; d < hd; d++) score += qh[d] * kp[d];
+                            size_t kbase = (size_t)p * local_kv_dim + (size_t)kv_h * hd;
+                            for (int d = 0; d < hd; d++) score += qh[d] * tf_kv_load_key(m, kv_src, kbase + d);
                             att_h[p] = score * attn_scale;
                         }
 
@@ -3780,16 +8934,20 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
 
                         float *out_h = m->xb2 + h * hd;
                         for (int p = 0; p < seq_len; p++) {
-                            float *vp = vc + p * local_kv_dim + kv_h * hd;
                             float w = att_h[p];
-                            for (int d = 0; d < hd; d++) out_h[d] += w * vp[d];
+                            size_t vbase = (size_t)p * local_kv_dim + (size_t)kv_h * hd;
+                            for (int d = 0; d < hd; d++) out_h[d] += w * tf_kv_load_value(m, kv_src, vbase + d);
                         }
                     }
                 }
             }
 
-            /* Output projection */
+            /* Output projection — TP: attn_output is COL-sliced over this rank's Q heads,
+             * so xb2 holds only local-head outputs and the matvec yields a PARTIAL sum;
+             * allreduce-SUM BEFORE post_attention_norm. */
             tf_qmatvec_pool(m, m->xb, &layer->attn_output, m->xb2, n_embd);
+            if (m->tp_size > 1 && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
 
             /* Post-attention norm (before residual) */
             tf_rmsnorm(m->xb, m->xb, &layer->post_attention_norm, n_embd, eps, m->matvec_tmp);
@@ -3800,11 +8958,18 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             /* --- FFN with GELU --- */
             tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, eps, m->matvec_tmp);
 
+            /* TP: gate/up are ROW-sliced (each rank owns ffn rows [r*nff/N,(r+1)*nff/N));
+             * ffn_gate.n_rows is the LOCAL ff width (== n_ff when not TP-loaded). down is
+             * COL-sliced over the SAME ff block -> matvec gives a PARTIAL sum that must be
+             * allreduce-SUM'd BEFORE post_ffw_norm (norm-of-partial != norm-of-sum). */
+            int local_ff = layer->ffn_gate.n_rows;
             tf_qmatvec_fused2_pool(m, m->ffn_buf1, &layer->ffn_gate,
-                                    m->ffn_buf2, &layer->ffn_up, m->xb, m->n_ff);
-            tf_gelu_mul(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, m->n_ff);
+                                    m->ffn_buf2, &layer->ffn_up, m->xb, local_ff);
+            tf_gelu_mul(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, local_ff, m->ffn_gelu_fast);
 
             tf_qmatvec_pool(m, m->xb, &layer->ffn_down, m->ffn_buf3, n_embd);
+            if (m->tp_size > 1 && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);   /* partial -> full */
 
             /* Post-FFN norm (before residual) */
             tf_rmsnorm(m->xb, m->xb, &layer->post_ffw_norm, n_embd, eps, m->matvec_tmp);
@@ -3899,7 +9064,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                     int hcount = heads_per + (t < heads_extra ? 1 : 0);
                     atasks[t] = (tf_attn_task){m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
                                                hoff, hoff + hcount, head_dim, kv_dim, gqa_ratio, seq_len,
-                                               m->max_seq_len, scale};
+                                               m->max_seq_len, scale, m->tp_qhead_offset};
                     hoff += hcount;
                 }
                 tf_pool_dispatch(m, tf_attn_worker, atasks, sizeof(tf_attn_task));
@@ -3907,7 +9072,7 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
                 /* Single-threaded fallback — dispatch through tf_attn_worker for AVX2 */
                 tf_attn_task st = {m->q, m->att, m->xb2, m->key_cache[l], m->value_cache[l],
                                    0, n_heads, head_dim, kv_dim, gqa_ratio, seq_len,
-                                   m->max_seq_len, scale};
+                                   m->max_seq_len, scale, m->tp_qhead_offset};
                 memset(m->xb2, 0, q_dim * sizeof(float));
                 tf_attn_worker(&st);
             }
@@ -3937,6 +9102,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             /* Output projection */
             TF_PROF_BEGIN("out_proj", l, "matvec", "FP32");
             tf_qmatvec_pool(m, m->xb, &layer->attn_output, m->xb2, n_embd);
+            if (m->tp_attn_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
             TF_PROF_END("out_proj", 2.0 * n_embd * q_dim, 0);
         } else {
             /* --- Standard attention (non-hybrid) --- */
@@ -4141,6 +9308,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
 
             TF_PROF_BEGIN("ffn_down", l, "matvec", "FP32");
             tf_qmatvec_pool(m, m->xb, &layer->ffn_down, m->ffn_buf3, n_embd);
+            if (m->tp_ffn_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, n_embd, m->tp_allreduce_ctx);
             TF_PROF_END("ffn_down", 2.0 * n_embd * m->n_ff, 0);
 
             tf_vadd(m->x, m->xb, n_embd);
@@ -4165,6 +9334,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
     /* Final RMSNorm (only if we processed through the last layer) */
     if (layer_end >= m->n_layers) {
         TF_PROF_BEGIN("final_norm", -1, "rmsnorm", "FP32");
+        if (m->nextn.target_hidden)
+            memcpy(m->nextn.target_hidden, m->x, (size_t)n_embd * sizeof(float));
         tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
         TF_PROF_END("final_norm", 5.0 * n_embd, 0);
     }
@@ -4185,14 +9356,523 @@ void transformer_set_tp(transformer_model *model, int tp_rank, int tp_size,
     model->tp_allreduce_ctx = allreduce_ctx;
 }
 
+void transformer_set_tp_reduce_add(transformer_model *model,
+        void (*reduce_add_fn)(float *buf, float *residual, int count, void *ctx)) {
+    if (model) model->tp_reduce_add_fn = reduce_add_fn;
+}
+
+static void tf_tp_slice_rows(qtensor *t, int r0, int r1) {
+    if (!t->data || r1 <= r0) return;
+    size_t rb = tf_row_bytes(t->type, t->n_cols);
+    t->data = (uint8_t *)t->data + (size_t)r0 * rb;
+    t->n_rows = r1 - r0;
+}
+
+static int tf_tp_repack_cols(qtensor *t, int c0, int c1) {
+    if (!t->data || c1 <= c0) return 0;
+    int bs = ggml_type_info[t->type].block_size;
+    if (bs <= 0 || c0 % bs || c1 % bs) {
+        fprintf(stderr, "tp_slice: columns [%d,%d) not aligned to type %u block %d\n",
+                c0, c1, t->type, bs);
+        return -1;
+    }
+    size_t src_rb = tf_row_bytes(t->type, t->n_cols);
+    size_t dst_rb = tf_row_bytes(t->type, c1 - c0);
+    size_t byte0 = tf_row_bytes(t->type, c0);
+    void *dst = tf_aligned_calloc(256, (size_t)t->n_rows, dst_rb);
+    if (!dst) return -1;
+    for (int r = 0; r < t->n_rows; r++)
+        memcpy((uint8_t *)dst + (size_t)r * dst_rb,
+               (const uint8_t *)t->data + (size_t)r * src_rb + byte0, dst_rb);
+    t->data = dst;
+    t->tp_owned_data = dst;
+    t->n_cols = c1 - c0;
+    return 0;
+}
+
+static int tf_tp_repack_ssm_rows(qtensor *t, int qk_rows, int v0, int v1) {
+    if (!t->data || v1 <= v0) return -1;
+    size_t rb = tf_row_bytes(t->type, t->n_cols);
+    int nr = qk_rows + v1 - v0;
+    void *dst = tf_aligned_calloc(256, (size_t)nr, rb);
+    if (!dst) return -1;
+    memcpy(dst, t->data, (size_t)qk_rows * rb);
+    memcpy((uint8_t *)dst + (size_t)qk_rows * rb,
+           (const uint8_t *)t->data + (size_t)v0 * rb,
+           (size_t)(v1 - v0) * rb);
+    t->data = dst;
+    t->tp_owned_data = dst;
+    t->n_rows = nr;
+    return 0;
+}
+
+/* A rank stage already stores column/SSM slices in their final dense layout.
+ * During metadata setup only adjust shapes; transformer_tp_load_stage replaces
+ * the source pointers immediately afterwards. */
+static void tf_tp_slice_cols_metadata(qtensor *t, int c0, int c1) {
+    (void)c0;
+    if (t->data && c1 > c0) t->n_cols = c1 - c0;
+}
+static void tf_tp_slice_ssm_metadata(qtensor *t, int qk_rows, int v0, int v1) {
+    if (t->data && v1 > v0) t->n_rows = qk_rows + v1 - v0;
+}
+
+static void tf_tp_range(int n, int parts, int rank, int *lo, int *hi) {
+    int base = n / parts, rem = n % parts;
+    *lo = rank * base + (rank < rem ? rank : rem);
+    *hi = *lo + base + (rank < rem);
+}
+
+static size_t tf_runtime_kv_len_for_layer(const transformer_model *m, int layer) {
+    (void)layer;
+    return (size_t)m->max_seq_len;
+}
+
+static int tf_runtime_kv_dim_for_layer(const transformer_model *m, int layer) {
+    if (m->is_gemma4 && layer >= 0 && layer < m->n_layers) {
+        int hd = m->layers[layer].is_swa ? m->head_dim_swa : m->head_dim_full;
+        return m->layers[layer].n_kv_heads * hd;
+    }
+    return m->n_kv_heads * m->head_dim;
+}
+
+int transformer_tp_slice_weights(transformer_model *m, int rank, int size,
+                                  int ssm_shard) {
+    if (!m || size <= 1) return 0;
+    if (rank < 0 || rank >= size || m->use_moe) return -1;
+    int oh = m->n_heads, okv = m->n_kv_heads, off = m->n_ff, hd = m->head_dim;
+    int q0, q1, k0, k1;
+    tf_tp_range(oh, size, rank, &q0, &q1);
+    int kv_rep = okv % size != 0;
+    if (kv_rep) { k0 = 0; k1 = okv; }
+    else tf_tp_range(okv, size, rank, &k0, &k1);
+    int chunk = ((off + size - 1) / size + 255) & ~255;
+    int f0 = rank * chunk, f1 = f0 + chunk;
+    if (f0 > off) f0 = off;
+    if (f1 > off) f1 = off;
+    if (q1 <= q0 || f1 <= f0) return -1;
+    int qstride = m->is_hybrid ? 2 * hd : hd;
+    /* Query heads and output-projection columns can remain sharded when the
+     * smaller KV head set must be replicated. q_head_offset selects the proper
+     * global GQA mapping in the attention worker. */
+    int do_attn = getenv("TP_SKIP_ATTN") == NULL;
+    int do_ffn = getenv("TP_SKIP_FFN") == NULL;
+    int sh0 = 0, sh1 = m->ssm_dt_rank;
+    if (ssm_shard) tf_tp_range(m->ssm_dt_rank, size, rank, &sh0, &sh1);
+
+    int staged = getenv("TP_STAGE_DIR") && *getenv("TP_STAGE_DIR");
+    for (int l = 0; l < m->n_layers; l++) {
+        transformer_layer *L = &m->layers[l];
+        if (do_attn && !(m->is_hybrid && L->is_ssm)) {
+            tf_tp_slice_rows(&L->attn_q, q0 * qstride, q1 * qstride);
+            if (!kv_rep) {
+                tf_tp_slice_rows(&L->attn_k, k0 * hd, k1 * hd);
+                tf_tp_slice_rows(&L->attn_v, k0 * hd, k1 * hd);
+            }
+            if (staged) tf_tp_slice_cols_metadata(&L->attn_output, q0 * hd, q1 * hd);
+            else if (tf_tp_repack_cols(&L->attn_output, q0 * hd, q1 * hd)) return -1;
+        } else if (m->is_hybrid && L->is_ssm && ssm_shard) {
+            int ds = m->ssm_d_state;
+            int qk = 2 * m->ssm_n_group * ds;
+            int v0s = qk + sh0 * ds, v1s = qk + sh1 * ds;
+            if (staged) {
+                tf_tp_slice_ssm_metadata(&L->ssm_qkv, qk, v0s, v1s);
+                tf_tp_slice_ssm_metadata(&L->ssm_conv1d, qk, v0s, v1s);
+            } else {
+                if (tf_tp_repack_ssm_rows(&L->ssm_qkv, qk, v0s, v1s)) return -1;
+                if (tf_tp_repack_ssm_rows(&L->ssm_conv1d, qk, v0s, v1s)) return -1;
+            }
+            tf_tp_slice_rows(&L->ssm_gate, sh0 * ds, sh1 * ds);
+            tf_tp_slice_rows(&L->ssm_alpha, sh0, sh1);
+            tf_tp_slice_rows(&L->ssm_beta, sh0, sh1);
+            if (staged) tf_tp_slice_cols_metadata(&L->ssm_out, sh0 * ds, sh1 * ds);
+            else if (tf_tp_repack_cols(&L->ssm_out, sh0 * ds, sh1 * ds)) return -1;
+        }
+        if (do_ffn) {
+            tf_tp_slice_rows(&L->ffn_gate, f0, f1);
+            tf_tp_slice_rows(&L->ffn_up, f0, f1);
+            if (staged) tf_tp_slice_cols_metadata(&L->ffn_down, f0, f1);
+            else if (tf_tp_repack_cols(&L->ffn_down, f0, f1)) return -1;
+        }
+    }
+
+    if (m->nextn.loaded && !m->nextn.shared_head_head.data)
+        m->nextn.shared_head_head = m->output; /* retain the full native MTP head */
+    int vchunk = ((m->n_vocab + size - 1) / size + 31) & ~31;
+    int v0 = rank * vchunk, v1 = v0 + vchunk;
+    if (v0 > m->n_vocab) v0 = m->n_vocab;
+    if (v1 > m->n_vocab) v1 = m->n_vocab;
+    if (!getenv("TP_NO_VOCAB_SHARD") && m->output.data &&
+        m->output.data != m->token_embd.data && v1 > v0) {
+        tf_tp_slice_rows(&m->output, v0, v1);
+        m->tp_vocab_sharded = 1;
+        m->tp_vocab_lo = v0;
+        m->tp_vocab_loc = v1 - v0;
+    } else {
+        m->tp_vocab_lo = 0;
+        m->tp_vocab_loc = m->n_vocab;
+    }
+    if (do_attn) {
+        m->n_heads = q1 - q0;
+        if (!kv_rep) m->n_kv_heads = k1 - k0;
+    }
+    if (do_ffn) m->n_ff = f1 - f0;
+    m->tp_qhead_offset = do_attn && kv_rep ? q0 : 0;
+    m->tp_kv_head_base = do_attn && !kv_rep ? k0 : 0;
+    m->tp_kv_head_count = m->n_kv_heads;
+    m->gqa_group = oh / okv;
+    m->tp_attn_sharded = do_attn;
+    m->tp_ffn_sharded = do_ffn;
+    if (ssm_shard) {
+        m->ssm_head_offset = sh0;
+        m->ssm_dt_rank = sh1 - sh0;
+        m->ssm_d_inner = m->ssm_dt_rank * m->ssm_d_state;
+        m->ssm_qkv_dim = 2 * m->ssm_n_group * m->ssm_d_state + m->ssm_d_inner;
+        m->tp_ssm_sharded = 1;
+    }
+    m->tp_rank = rank;
+    m->tp_size = size;
+    fprintf(stderr, "tp_slice: rank %d/%d heads=%d kv=%d ff=%d vocab=%d@%d SSM=%s dt=%d@%d\n",
+            rank, size, m->n_heads, m->n_kv_heads, m->n_ff,
+            m->tp_vocab_loc, m->tp_vocab_lo, ssm_shard ? "sharded" : "replicated",
+            m->ssm_dt_rank, m->ssm_head_offset);
+    if (kv_rep)
+        fprintf(stderr, "tp_slice: attention replicated (%d KV heads not divisible by %d ranks)\n",
+                okv, size);
+    return 0;
+}
+
+int transformer_tp_slice_nextn(transformer_model *m, int rank, int size) {
+    if (!m || !m->nextn.loaded || size <= 1) return 0;
+    transformer_layer *L = &m->nextn.layer;
+    const int hd = m->head_dim;
+    int nh = L->attn_q.n_rows / (2 * hd);
+    int nkh = L->attn_k.n_rows / hd;
+    int q0, q1, k0, k1;
+    int staged = getenv("TP_STAGE_DIR") && *getenv("TP_STAGE_DIR");
+    int shard_block = !staged || (getenv("TP_NEXTN_SHARD") && atoi(getenv("TP_NEXTN_SHARD")));
+    tf_tp_range(nh, size, rank, &q0, &q1);
+    tf_tp_range(nkh, size, rank, &k0, &k1);
+    /* A complete rank stage keeps the small NextN transformer block
+     * replicated unless TP_NEXTN_SHARD is explicitly requested.  In that
+     * mode only the vocabulary head is sliced, so odd TP sizes do not need to
+     * divide the NextN KV-head count. */
+    if (shard_block && (q1 <= q0 || k1 <= k0 || nh % size || nkh % size))
+        return -1;
+    if (!shard_block) goto slice_head;
+
+    tf_tp_slice_rows(&L->attn_q, q0 * 2 * hd, q1 * 2 * hd);
+    tf_tp_slice_rows(&L->attn_k, k0 * hd, k1 * hd);
+    tf_tp_slice_rows(&L->attn_v, k0 * hd, k1 * hd);
+    if (staged) tf_tp_slice_cols_metadata(&L->attn_output, q0 * hd, q1 * hd);
+    else if (tf_tp_repack_cols(&L->attn_output, q0 * hd, q1 * hd)) return -1;
+
+    int ff = L->ffn_gate.n_rows;
+    int f0, f1;
+    tf_tp_range(ff, size, rank, &f0, &f1);
+    if (f1 <= f0 || ff % size) return -1;
+    tf_tp_slice_rows(&L->ffn_gate, f0, f1);
+    tf_tp_slice_rows(&L->ffn_up, f0, f1);
+    if (staged) tf_tp_slice_cols_metadata(&L->ffn_down, f0, f1);
+    else if (tf_tp_repack_cols(&L->ffn_down, f0, f1)) return -1;
+
+slice_head:
+    /* The optional NextN head (or the full-head alias installed by the trunk
+     * slicer) must follow the trunk vocabulary partition.  Leaving it full
+     * made every rank score rows 0..tp_vocab_loc and then apply a different
+     * global offset, so rank 0 consistently won with tiny token IDs. */
+    if (m->nextn.shared_head_head.data && m->tp_vocab_sharded) {
+        int v0 = m->tp_vocab_lo;
+        int v1 = v0 + m->tp_vocab_loc;
+        tf_tp_slice_rows(&m->nextn.shared_head_head, v0, v1);
+    }
+
+    if (shard_block) L->n_kv_heads = k1 - k0;
+    fprintf(stderr, "tp_slice_nextn: rank %d/%d q=%d@%d kv=%d@%d ff=%d@%d\n",
+            rank, size, shard_block ? q1-q0 : nh, shard_block ? q0 : 0,
+            shard_block ? k1-k0 : nkh, shard_block ? k0 : 0,
+            shard_block ? f1-f0 : L->ffn_gate.n_rows, shard_block ? f0 : 0);
+    return 0;
+}
+
+static qtensor *tf_tp_stage_tensor(transformer_model *m, const char *name) {
+    if (!strcmp(name, "token_embd.weight")) return &m->token_embd;
+    if (!strcmp(name, "output_norm.weight")) return &m->output_norm;
+    if (!strcmp(name, "output.weight")) return &m->output;
+    int l = -1, n = 0;
+    if (sscanf(name, "blk.%d.%n", &l, &n) != 1 || n <= 0 || l < 0 || l > m->n_layers)
+        return NULL;
+    const char *s = name + n;
+    transformer_layer *L = l == m->n_layers ? &m->nextn.layer : &m->layers[l];
+    if (l == m->n_layers) {
+        if (!strcmp(s, "nextn.eh_proj.weight")) return &m->nextn.eh_proj;
+        if (!strcmp(s, "nextn.enorm.weight")) return &m->nextn.enorm;
+        if (!strcmp(s, "nextn.hnorm.weight")) return &m->nextn.hnorm;
+        if (!strcmp(s, "nextn.shared_head_norm.weight")) return &m->nextn.shared_head_norm;
+        if (!strcmp(s, "nextn.embed_tokens.weight")) return &m->nextn.embed_tokens;
+        if (!strcmp(s, "nextn.shared_head_head.weight")) return &m->nextn.shared_head_head;
+    }
+    if (!strcmp(s, "attn_norm.weight")) return &L->attn_norm;
+    if (!strcmp(s, "ffn_gate.weight")) return &L->ffn_gate;
+    if (!strcmp(s, "ffn_up.weight")) return &L->ffn_up;
+    if (!strcmp(s, "ffn_down.weight")) return &L->ffn_down;
+    if (!strcmp(s, "attn_q.weight")) return &L->attn_q;
+    if (!strcmp(s, "attn_k.weight")) return &L->attn_k;
+    if (!strcmp(s, "attn_v.weight")) return &L->attn_v;
+    if (!strcmp(s, "attn_output.weight")) return &L->attn_output;
+    if (!strcmp(s, "attn_q_norm.weight")) return &L->attn_q_norm;
+    if (!strcmp(s, "attn_k_norm.weight")) return &L->attn_k_norm;
+    if (!strcmp(s, "attn_qkv.weight")) return &L->ssm_qkv;
+    if (!strcmp(s, "attn_gate.weight")) return &L->ssm_gate;
+    if (!strcmp(s, "ssm_alpha.weight")) return &L->ssm_alpha;
+    if (!strcmp(s, "ssm_beta.weight")) return &L->ssm_beta;
+    if (!strcmp(s, "ssm_conv1d.weight")) return &L->ssm_conv1d;
+    if (!strcmp(s, "ssm_norm.weight")) return &L->ssm_norm;
+    if (!strcmp(s, "ssm_a")) return &L->ssm_a;
+    if (!strcmp(s, "ssm_dt.bias")) return &L->ssm_dt_bias;
+    if (!strcmp(s, "ssm_out.weight")) return &L->ssm_out;
+    if (!strcmp(s, "post_attention_norm.weight")) return &L->ffn_norm;
+    return NULL;
+}
+
+typedef struct {
+    const uint16_t *src;
+    uint16_t *dst;
+    int rows, cols, tid, nt;
+} tf_bf16_pv_pack_task;
+
+static void *tf_bf16_pv_pack_worker(void *arg) {
+    tf_bf16_pv_pack_task *t = (tf_bf16_pv_pack_task *)arg;
+    size_t group_bytes = (size_t)8 * t->cols * sizeof(uint16_t);
+    uint16_t *scratch = (uint16_t *)malloc(group_bytes);
+    if (!scratch) return (void *)(uintptr_t)1;
+    int groups = t->rows / 8;
+    int g0 = groups * t->tid / t->nt;
+    int g1 = groups * (t->tid + 1) / t->nt;
+    for (int g = g0; g < g1; g++) {
+        const uint16_t *s = t->src + (size_t)g * 8 * t->cols;
+        uint16_t *d = t->dst + (size_t)g * 8 * t->cols;
+        if (s == d) {
+            memcpy(scratch, s, group_bytes);
+            s = scratch;
+        }
+        for (int pair = 0; pair < 4; pair++) {
+            const uint16_t *a = s + (size_t)(2 * pair) * t->cols;
+            const uint16_t *b = a + t->cols;
+            uint16_t *p = d + (size_t)pair * 2 * t->cols;
+            for (int k = 0; k < t->cols; k++) {
+                p[2 * k] = a[k];
+                p[2 * k + 1] = b[k];
+            }
+        }
+    }
+    free(scratch);
+    return NULL;
+}
+
+static double tf_mem_available_gb(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1.0;
+    char key[64], unit[16]; unsigned long long kb = 0, value = 0;
+    while (fscanf(f, "%63s %llu %15s", key, &value, unit) == 3) {
+        if (!strcmp(key, "MemAvailable:")) { kb = value; break; }
+    }
+    fclose(f); return kb ? (double)kb / (1024.0 * 1024.0) : -1.0;
+}
+
+size_t transformer_tp_load_stage(transformer_model *m, const char *stage_dir,
+                                 int rank, int size) {
+    if (!m || !stage_dir || !*stage_dir || rank < 0 || size <= 1) return 0;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/rank%02d.blob", stage_dir, rank);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "tp_stage: cannot open %s: %s\n", path, strerror(errno)); return 0; }
+    q38tp_header *h = (q38tp_header *)malloc(sizeof(*h));
+    if (!h || pread(fd, h, sizeof(*h), 0) != (ssize_t)sizeof(*h)) {
+        fprintf(stderr, "tp_stage: cannot read header %s\n", path); free(h); close(fd); return 0;
+    }
+    uint64_t eh = q38tp_hash_update(0, h->entries, (size_t)h->n_entries * sizeof(h->entries[0]));
+    if (memcmp(h->magic, Q38TP_MAGIC, 8) || h->version != Q38TP_VERSION ||
+        h->header_bytes != Q38TP_HEADER_BYTES || h->tp_rank != (uint32_t)rank ||
+        h->tp_size != (uint32_t)size || h->n_entries > Q38TP_MAX_ENTRIES ||
+        h->n_layers != (uint32_t)m->n_layers || h->n_embd != (uint32_t)m->n_embd ||
+        h->n_vocab != (uint32_t)m->n_vocab || eh != h->entries_checksum) {
+        fprintf(stderr, "tp_stage: incompatible/corrupt header %s\n", path); free(h); close(fd); return 0;
+    }
+    size_t alloc = (size_t)((h->data_bytes + (2u<<20) - 1) & ~((uint64_t)(2u<<20) - 1));
+    void *arena = NULL;
+    /* Anonymous System-V memory avoids both file mapping and Fujitsu's eager
+     * large-page malloc placement. Parallel pread first-touches its pages on
+     * the CMGs that consume them. The segment survives only while attached. */
+    int stage_shmid = shmget(IPC_PRIVATE, alloc, IPC_CREAT | 0600);
+    if (stage_shmid >= 0) {
+        arena = shmat(stage_shmid, NULL, 0);
+        if (arena == (void *)-1) arena = NULL;
+        shmctl(stage_shmid, IPC_RMID, NULL);
+    }
+    if (!arena) { fprintf(stderr, "tp_stage: allocation failed %.3f GB\n", (double)alloc/1e9); free(h); close(fd); return 0; }
+    m->tp_stage_data = arena; m->tp_stage_bytes = alloc;
+    m->tp_stage_is_mmap = 2;
+    tf_numa_init(m);
+    int nt = m->n_threads > 1 ? m->n_threads : 1;
+    int verify = getenv("TP_STAGE_VERIFY") && atoi(getenv("TP_STAGE_VERIFY"));
+    int staged_private_nextn_head = 0;
+    for (uint32_t i = 0; i < h->n_entries; i++) {
+        q38tp_entry *e = &h->entries[i];
+        if (!strcmp(e->name, "blk.64.nextn.shared_head_head.weight"))
+            staged_private_nextn_head = 1;
+        qtensor *t = tf_tp_stage_tensor(m, e->name);
+        int full_conv = strstr(e->name, ".ssm_conv1d.weight") != NULL;
+        if (!t || t->type != e->type ||
+            (!full_conv && t->n_rows != (int)e->local_rows) ||
+            t->n_cols != (int)e->local_cols || e->file_offset < h->header_bytes ||
+            e->file_offset + e->byte_length > h->header_bytes + h->data_bytes) {
+            fprintf(stderr, "tp_stage: tensor mismatch %s local=%dx%d stage=%ux%u\n",
+                    e->name, t ? t->n_rows : -1, t ? t->n_cols : -1,
+                    e->local_rows, e->local_cols);
+            free(h); close(fd); return 0;
+        }
+        size_t expected_src_rb = tf_row_bytes(t->type, (int)e->source_cols);
+        size_t expected_local_rb = tf_row_bytes(t->type, t->n_cols);
+        if (!expected_src_rb || e->source_row_bytes != expected_src_rb ||
+            e->local_row_bytes != expected_local_rb ||
+            (size_t)e->byte_length != (size_t)e->local_rows * expected_local_rb) {
+            fprintf(stderr, "tp_stage: row-byte mismatch %s src=%llu local=%llu expected=%zu\n",
+                    e->name, (unsigned long long)e->source_row_bytes,
+                    (unsigned long long)e->local_row_bytes, expected_local_rb);
+            free(h); close(fd); return 0;
+        }
+        uint8_t *dst = (uint8_t *)arena + (size_t)(e->file_offset - h->header_bytes);
+        size_t rb = e->local_rows ? (size_t)(e->byte_length / e->local_rows) : 0;
+        if (nt > 1 && m->pool_alive && rb) {
+            tf_numa_task *tasks = (tf_numa_task *)alloca((size_t)nt * sizeof(*tasks));
+            for (int k = 0; k < nt; k++) {
+                size_t r0 = (size_t)e->local_rows * (size_t)k / (size_t)nt;
+                size_t r1 = (size_t)e->local_rows * (size_t)(k + 1) / (size_t)nt;
+                tasks[k] = (tf_numa_task){dst, fd, (size_t)e->file_offset, r0 * rb, r1 * rb};
+            }
+            tf_pool_dispatch(m, tf_numa_pread_worker, tasks, sizeof(*tasks));
+        } else {
+            tf_numa_task task = {dst, fd, (size_t)e->file_offset, 0, (size_t)e->byte_length};
+            tf_numa_pread_worker(&task);
+        }
+        if (verify) {
+            uint64_t got = q38tp_hash_update(0, dst, (size_t)e->byte_length);
+            if (got != e->checksum) {
+                fprintf(stderr, "tp_stage: checksum mismatch %s got=%016llx want=%016llx\n",
+                        e->name, (unsigned long long)got, (unsigned long long)e->checksum);
+                free(h); close(fd); return 0;
+            }
+        }
+        /* Pack the resident decode copy after verifying the simple row-major
+         * stage file.  Eight rows then share one activation stream without the
+         * 16-accumulator register pressure of the row-major widening kernel. */
+        const char *pv_env = getenv("TP_STAGE_BF16_PV");
+        int use_pv = !pv_env || atoi(pv_env) != 0;
+        int nextn_pv = 0;
+        const char *nextn_pv_env = getenv("TP_NEXTN_PV_MASK");
+        int is_nextn = !strncmp(e->name, "blk.64.", 7);
+        if (nextn_pv_env && is_nextn) {
+            int mask = atoi(nextn_pv_env);
+            if ((mask & 1) && strstr(e->name, "nextn.eh_proj.weight")) nextn_pv = 1;
+            if ((mask & 2) && strstr(e->name, "attn_q.weight")) nextn_pv = 1;
+            if ((mask & 4) && strstr(e->name, "attn_output.weight")) nextn_pv = 1;
+            if ((mask & 8) && strstr(e->name, "ffn_down.weight")) nextn_pv = 1;
+        }
+        /* Sliced NextN K/V have only 256 rows.  The fused QKV scheduler splits
+         * those rows 5--6 at a time across 48 workers, which is incompatible
+         * with the PV kernel's 8-row task alignment.  Replicated NextN never
+         * hit this because replicated entries were already excluded.  Keep
+         * all NextN tensors row-major unless their dedicated mask explicitly
+         * opts in a scheduler-safe tensor (EH, Q, attention output, or FFN
+         * down).  K/V and fused gate/up deliberately have no mask bits. */
+        if (use_pv && ((!is_nextn && e->kind != Q38TP_REPLICATE) || nextn_pv) &&
+            t->type == GGML_TYPE_BF16 && (t->n_rows % 8) == 0 &&
+            (t->n_cols % 16) == 0 && t->n_rows >= 8) {
+            if (nt > 1 && m->pool_alive) {
+                tf_bf16_pv_pack_task *tasks = (tf_bf16_pv_pack_task *)alloca((size_t)nt * sizeof(*tasks));
+                for (int k = 0; k < nt; k++)
+                    tasks[k] = (tf_bf16_pv_pack_task){(const uint16_t *)dst,
+                                                       (uint16_t *)dst,
+                                                       t->n_rows, t->n_cols, k, nt};
+                tf_pool_dispatch(m, tf_bf16_pv_pack_worker, tasks, sizeof(*tasks));
+            } else {
+                tf_bf16_pv_pack_task task = {(const uint16_t *)dst, (uint16_t *)dst,
+                                              t->n_rows, t->n_cols, 0, 1};
+                tf_bf16_pv_pack_worker(&task);
+            }
+            t->bf16_pv = 1;
+        }
+        t->data = dst;
+        if ((i & 15u) == 15u) {
+            double avail = tf_mem_available_gb();
+            if (avail >= 0.0 && avail < 2.0) {
+                fprintf(stderr, "tp_stage: MemAvailable %.2f GB below 2 GB guard\n", avail);
+                free(h); close(fd); return 0;
+            }
+        }
+    }
+    if (m->nextn.loaded && !staged_private_nextn_head)
+        m->nextn.shared_head_head = m->output;
+    /* Metadata-only construction deliberately deferred this source-reading
+     * transpose.  Build it now from the complete HBM-resident stage. */
+    if (m->is_hybrid && m->conv_w_trans_layers) {
+        for (int l = 0; l < m->n_layers; l++) {
+            transformer_layer *L = &m->layers[l];
+            if (!L->is_ssm || !L->ssm_conv1d.data || m->conv_w_trans_layers[l]) continue;
+            char conv_name[96];
+            snprintf(conv_name, sizeof(conv_name), "blk.%d.ssm_conv1d.weight", l);
+            int source_conv_dim = m->ssm_qkv_dim;
+            for (uint32_t i = 0; i < h->n_entries; i++)
+                if (!strcmp(h->entries[i].name, conv_name)) {
+                    source_conv_dim = (int)h->entries[i].source_rows;
+                    break;
+                }
+            int local_conv_dim = m->ssm_qkv_dim;
+            int qk_dim = 2 * m->ssm_n_group * m->ssm_d_state;
+            int v_source0 = qk_dim + m->ssm_head_offset * m->ssm_d_state;
+            if (source_conv_dim < qk_dim ||
+                v_source0 + local_conv_dim - qk_dim > source_conv_dim) {
+                fprintf(stderr, "tp_stage: invalid SSM conv slice layer=%d source=%d local=%d v0=%d\n",
+                        l, source_conv_dim, local_conv_dim, v_source0);
+                free(h); close(fd); return 0;
+            }
+            size_t conv_count = (size_t)m->ssm_conv_kernel * local_conv_dim;
+            float *w = (float *)malloc(conv_count * sizeof(float));
+            if (!w) { free(h); close(fd); return 0; }
+            size_t crb = tf_row_bytes(L->ssm_conv1d.type, L->ssm_conv1d.n_cols);
+            const uint8_t *base = (const uint8_t *)L->ssm_conv1d.data;
+            for (int j = 0; j < local_conv_dim; j++) {
+                int source_j = j < qk_dim ? j : v_source0 + j - qk_dim;
+                float wb[8];
+                dequant_row(L->ssm_conv1d.type, base + (size_t)source_j * crb,
+                            wb, m->ssm_conv_kernel);
+                for (int f = 0; f < m->ssm_conv_kernel; f++)
+                    w[(size_t)f * local_conv_dim + j] = wb[f];
+            }
+            m->conv_w_trans_layers[l] = w;
+        }
+    }
+    fprintf(stderr, "tp_stage: rank %d loaded %u tensors %.3f GB from %s verify=%d MemAvailable=%.2fGB\n",
+            rank, h->n_entries, (double)h->data_bytes/1e9, path, verify, tf_mem_available_gb());
+    size_t result = (size_t)h->data_bytes;
+    free(h); close(fd); return result;
+}
+
 /* ---- Distributed memory management ---- */
 
 void transformer_free_unused_kv(transformer_model *model, int layer_start, int layer_end) {
-    if (!model || !model->key_cache) return;
+    if (!model || (!model->key_cache && !model->key_cache_raw)) return;
     for (int l = 0; l < model->n_layers; l++) {
         if (l < layer_start || l >= layer_end) {
-            free(model->key_cache[l]);   model->key_cache[l] = NULL;
-            free(model->value_cache[l]); model->value_cache[l] = NULL;
+            void *kptr = model->key_cache_raw ? model->key_cache_raw[l] : (void *)model->key_cache[l];
+            void *vptr = model->value_cache_raw ? model->value_cache_raw[l] : (void *)model->value_cache[l];
+            free(kptr);
+            free(vptr);
+            if (model->key_cache) model->key_cache[l] = NULL;
+            if (model->value_cache) model->value_cache[l] = NULL;
+            if (model->key_cache_raw) model->key_cache_raw[l] = NULL;
+            if (model->value_cache_raw) model->value_cache_raw[l] = NULL;
         }
     }
     /* Also free SSM state for unused layers */
@@ -4210,11 +9890,16 @@ void transformer_resize_kv_for_tp(transformer_model *model,
                                     int layer_start, int layer_end, int tp_kv_dim) {
     if (!model || !model->key_cache) return;
     for (int l = layer_start; l < layer_end && l < model->n_layers; l++) {
-        if (!model->key_cache[l]) continue;  /* SSM layer, no KV cache */
-        free(model->key_cache[l]);
-        free(model->value_cache[l]);
+        void *old_k = model->key_cache_raw ? model->key_cache_raw[l] : (void *)model->key_cache[l];
+        void *old_v = model->value_cache_raw ? model->value_cache_raw[l] : (void *)model->value_cache[l];
+        if (!old_k) continue;  /* SSM layer, no KV cache */
+        free(old_k);
+        free(old_v);
         model->key_cache[l]   = (float *)calloc(model->max_seq_len * tp_kv_dim, sizeof(float));
         model->value_cache[l] = (float *)calloc(model->max_seq_len * tp_kv_dim, sizeof(float));
+        if (model->key_cache_raw) model->key_cache_raw[l] = model->key_cache[l];
+        if (model->value_cache_raw) model->value_cache_raw[l] = model->value_cache[l];
+        model->kv_cache_type = 0;
     }
 }
 
@@ -4302,14 +9987,449 @@ void transformer_set_hidden(transformer_model *model, const float *hidden) {
 float *transformer_compute_logits(transformer_model *model) {
     if (!model || !model->has_lm_head) return NULL;
     TF_PROF_BEGIN("lm_head", -1, "matvec", "FP32");
-    tf_qmatvec_pool(model, model->logits, &model->output, model->x, model->n_vocab);
+    const char *fused = getenv("TP_LMHEAD_ARGMAX");
+    if (fused && atoi(fused) != 0 &&
+        tf_bf16_pv_argmax_pool(model, &model->output, model->x,
+                               model->output.n_rows))
+        return model->logits;
+    tf_qmatvec_pool(model, model->logits, &model->output, model->x, model->output.n_rows);
     TF_PROF_END("lm_head", 2.0 * model->n_vocab * model->n_embd, 0);
     return model->logits;
+}
+
+int transformer_last_argmax(const transformer_model *model) {
+    return model ? model->last_argmax : 0;
+}
+
+/* TP vocab-parallel lm_head: compute logit rows [v0,v1) into model->logits[0..v1-v0).
+ * lm_head is TIED to token_embd (replicated full on every TP rank) and the final hidden
+ * model->x is identical across ranks (post final-norm), so each rank computes only its
+ * vocab slice; the caller takes the local argmax (offset by v0) then tp_allreduce_argmax
+ * for the global token. Argmax is invariant to final_logit_softcapping (monotonic), so
+ * the slice need not apply it. Returns model->logits (holds v1-v0 valid entries). */
+float *transformer_compute_logits_slice(transformer_model *model, int v0, int v1) {
+    if (!model || !model->has_lm_head) return NULL;
+    if (v0 < 0) v0 = 0;
+    if (v1 > model->n_vocab) v1 = model->n_vocab;
+    if (v1 <= v0) return NULL;
+    tf_qmatvec_row_slice(model, model->logits, &model->output, model->x, v0, v1);
+    return model->logits;
+}
+
+const float *transformer_nextn_hidden(const transformer_model *model) {
+    return model && model->nextn.loaded ? model->nextn.hidden : NULL;
+}
+
+const float *transformer_nextn_target_hidden(const transformer_model *model) {
+    return model && model->nextn.loaded ? model->nextn.target_hidden : NULL;
+}
+
+typedef struct {
+    transformer_model *m;
+    transformer_layer *layer;
+    transformer_nextn *nextn;
+    const qtensor *head, *head_norm;
+    int tid, nt, nff, ne;
+    int head_rows, include_qkv, include_attention, include_output, include_head;
+    int inline_argmax;
+    int nextn_sharded;
+    int position, nh, hd, kvd, gqa, qd;
+    int barrier_sense;
+} tf_nextn_ffn_task;
+
+static inline void tf_nextn_silu_range(float *out, const float *gate,
+                                       const float *up, int start, int end) {
+#if defined(__ARM_FEATURE_SVE)
+    static _Thread_local int use_sve = -1;
+    if (use_sve < 0) {
+        const char *e = getenv("TF_SILU_SVE");
+        use_sve = e && atoi(e) != 0;
+    }
+    if (use_sve) {
+        int vl = (int)svcntw();
+        for (int i = start; i < end; i += vl) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)end);
+            svfloat32_t g = svld1(pg, gate + i), u = svld1(pg, up + i);
+            svfloat32_t x = svmul_n_f32_x(pg, g, -1.4426950408889634f);
+            x = svmax_n_f32_x(pg, svmin_n_f32_x(pg, x, 80.0f), -80.0f);
+            svfloat32_t den = svadd_n_f32_x(pg,
+                tf_exp2_fexpa_approx_sve(pg, x), 1.0f);
+            svfloat32_t inv = svrecpe_f32(den);
+            inv = svmul_f32_x(pg, inv, svrecps_f32(den, inv));
+            svst1(pg, out + i, svmul_f32_x(pg,
+                svmul_f32_x(pg, g, inv), u));
+        }
+        return;
+    }
+#endif
+    for (int i = start; i < end; i++) {
+        float g = gate[i];
+        out[i] = g / (1.0f + expf(-g)) * up[i];
+    }
+}
+
+static void *tf_nextn_ffn_worker(void *arg) {
+    tf_nextn_ffn_task *t = (tf_nextn_ffn_task *)arg;
+    transformer_model *m = t->m;
+    transformer_layer *L = t->layer;
+    static _Thread_local int nextn_prefetch_initialized;
+    if (!nextn_prefetch_initialized) {
+        const char *e = getenv("TF_BF16PV_PREFETCH_NEXTN");
+        if (e && *e) tf_bf16pv_decode_prefetch_override = atoi(e);
+        nextn_prefetch_initialized = 1;
+    }
+    tf_barrier_tid = t->tid;
+    if (t->include_qkv) {
+        tf_thread_matvec(m->xb2, &L->attn_q, m->xb,
+                         2 * t->qd, t->tid, t->nt);
+        tf_thread_matvec(m->k, &L->attn_k, m->xb,
+                         t->kvd, t->tid, t->nt);
+        tf_thread_matvec(m->v, &L->attn_v, m->xb,
+                         t->kvd, t->tid, t->nt);
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+
+        /* Preserve the established operation order within every head while
+         * distributing independent Q and KV heads over the live workers. */
+        if (t->tid < t->nh) {
+            float *qh = m->q + (size_t)t->tid * t->hd;
+            memcpy(qh, m->xb2 + (size_t)t->tid * 2 * t->hd,
+                   (size_t)t->hd * sizeof(float));
+            memcpy(m->ffn_buf1 + (size_t)t->tid * t->hd,
+                   m->xb2 + (size_t)t->tid * 2 * t->hd + t->hd,
+                   (size_t)t->hd * sizeof(float));
+            tf_qk_norm(qh, 1, t->hd, &L->attn_q_norm,
+                       m->rms_norm_eps, m->thread_tmp[t->tid]);
+            if (m->use_mrope)
+                tf_rope_mrope(qh, 1, t->hd, t->position, t->position,
+                              t->position, m->rope_freq_base,
+                              m->mrope_sections, m->rope_mrope_inv_freq);
+            else
+                tf_rope(qh, 1, t->hd, t->position, m->rope_freq_base,
+                        m->rope_inv_freq);
+        }
+        int nkh = t->kvd / t->hd;
+        if (t->tid < nkh) {
+            float *kh = m->k + (size_t)t->tid * t->hd;
+            tf_qk_norm(kh, 1, t->hd, &L->attn_k_norm,
+                       m->rms_norm_eps, m->thread_tmp[t->tid]);
+            if (m->use_mrope)
+                tf_rope_mrope(kh, 1, t->hd, t->position, t->position,
+                              t->position, m->rope_freq_base,
+                              m->mrope_sections, m->rope_mrope_inv_freq);
+            else
+                tf_rope(kh, 1, t->hd, t->position, m->rope_freq_base,
+                        m->rope_inv_freq);
+            memcpy(t->nextn->key_cache +
+                       ((size_t)t->position * nkh + t->tid) * t->hd,
+                   kh, (size_t)t->hd * sizeof(float));
+            memcpy(t->nextn->value_cache +
+                       ((size_t)t->position * nkh + t->tid) * t->hd,
+                   m->v + (size_t)t->tid * t->hd,
+                   (size_t)t->hd * sizeof(float));
+        }
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+    }
+    if (t->include_attention) {
+        int hp = t->nh / t->nt, hx = t->nh % t->nt;
+        int h0 = t->tid * hp + (t->tid < hx ? t->tid : hx);
+        int h1 = h0 + hp + (t->tid < hx ? 1 : 0);
+        if (t->include_qkv && h1 > h0)
+            memset(m->xb2 + (size_t)h0 * t->hd, 0,
+                   (size_t)(h1 - h0) * t->hd * sizeof(float));
+        tf_attn_task at = {m->q, m->att, m->xb2, t->nextn->key_cache,
+                           t->nextn->value_cache, h0, h1, t->hd, t->kvd,
+                           t->gqa, t->position + 1, m->max_seq_len,
+                           1.0f / sqrtf((float)t->hd), 0};
+        tf_attn_worker(&at);
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+        int a0 = t->qd * t->tid / t->nt;
+        int a1 = t->qd * (t->tid + 1) / t->nt;
+        for (int i = a0; i < a1; i++)
+            m->xb2[i] *= 1.0f / (1.0f + expf(-m->ffn_buf1[i]));
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+    }
+    if (t->include_output) {
+        tf_thread_matvec(m->xb, &L->attn_output, m->xb2,
+                         t->ne, t->tid, t->nt);
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+        if (t->tid == 0) {
+            if (t->nextn_sharded && m->tp_attn_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, t->ne, m->tp_allreduce_ctx);
+            tf_vadd(m->x, m->xb, t->ne);
+            tf_rmsnorm(m->xb, m->x, &L->ffn_norm, t->ne,
+                       m->rms_norm_eps, m->matvec_tmp);
+        }
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+    }
+    int r0 = t->nff * t->tid / t->nt;
+    int r1 = t->nff * (t->tid + 1) / t->nt;
+    tf_matvec_qtensor_rows(m->ffn_buf1, &L->ffn_gate, m->xb, r0, r1);
+    tf_matvec_qtensor_rows(m->ffn_buf2, &L->ffn_up, m->xb, r0, r1);
+    tf_nextn_silu_range(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, r0, r1);
+    tf_spin_barrier(m, &t->barrier_sense, t->nt);
+    r0 = t->ne * t->tid / t->nt;
+    r1 = t->ne * (t->tid + 1) / t->nt;
+    tf_matvec_qtensor_rows(m->xb, &L->ffn_down, m->ffn_buf3, r0, r1);
+    if (t->include_head) {
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+        if (t->tid == 0) {
+            if (t->nextn_sharded && m->tp_ffn_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(m->xb, t->ne, m->tp_allreduce_ctx);
+            tf_vadd(m->x, m->xb, t->ne);
+            memcpy(m->nextn.hidden, m->x, (size_t)t->ne * sizeof(float));
+            tf_rmsnorm(m->xb, m->x, t->head_norm, t->ne,
+                       m->rms_norm_eps, m->matvec_tmp);
+        }
+        tf_spin_barrier(m, &t->barrier_sense, t->nt);
+        int fused = t->inline_argmax && tf_thread_bf16_pv_argmax(
+            m, t->head, m->xb, t->head_rows, t->tid, t->nt);
+        if (!fused)
+            tf_thread_matvec(m->logits, t->head, m->xb, t->head_rows,
+                             t->tid, t->nt);
+        if (!fused && m->lm_head_best_idx && m->lm_head_best_val) {
+            int groups = t->head_rows / 8;
+            int r0 = (groups * t->tid / t->nt) * 8;
+            int r1 = (groups * (t->tid + 1) / t->nt) * 8;
+            int best = r0;
+            for (int r = r0 + 1; r < r1; r++)
+                if (m->logits[r] > m->logits[best]) best = r;
+            m->lm_head_best_idx[t->tid] = best;
+            m->lm_head_best_val[t->tid] = r1 > r0 ? m->logits[best] : -INFINITY;
+        }
+    }
+    return NULL;
+}
+
+/* Keep workers awake across gate/up, SiLU, and down.  Block modes can start at
+ * QKV, attention, or attention-output and continue through the local vocabulary
+ * head. Worker zero performs intervening collectives, residuals, and norms
+ * while peers wait at dependency barriers. This removes pool broadcasts and
+ * the nested OpenMP activation region; weight-row ownership is unchanged. */
+static int tf_nextn_ffn_persistent_pool(transformer_model *m,
+                                        transformer_layer *L,
+                                        transformer_nextn *nn,
+                                        int nff, int ne,
+                                        int include_qkv, int include_attention,
+                                        int include_output,
+                                        int nextn_sharded,
+                                        const qtensor *head,
+                                        const qtensor *head_norm,
+                                        int head_rows, int position,
+                                        int nh, int hd, int kvd, int gqa,
+                                        int qd) {
+    static int ffn_enabled = -1, block_enabled = -1, full_enabled = -1;
+    static int attn_enabled = -1, inline_argmax = -1;
+    if (ffn_enabled < 0) {
+        const char *e = getenv("TF_NEXTN_FFN_PERSIST");
+        ffn_enabled = e && atoi(e) != 0;
+        e = getenv("TF_NEXTN_BLOCK_PERSIST");
+        block_enabled = e && atoi(e) != 0;
+        e = getenv("TF_NEXTN_FULL_PERSIST");
+        full_enabled = e && atoi(e) != 0;
+        e = getenv("TF_NEXTN_ATTN_BLOCK_PERSIST");
+        attn_enabled = e && atoi(e) != 0;
+        e = getenv("TF_NEXTN_INLINE_ARGMAX");
+        inline_argmax = e && atoi(e) != 0;
+    }
+    int enabled = include_attention ? attn_enabled
+        : (include_output ? block_enabled : ffn_enabled);
+    if (!enabled || !m->pool_alive || m->n_threads <= 1 ||
+        L->ffn_gate.i8 || L->ffn_up.i8 || L->ffn_down.i8)
+        return 0;
+    int nt = m->n_threads;
+    m->bar_count = 0;
+    m->bar_sense = 0;
+    memset(m->cmg_bar, 0, sizeof(m->cmg_bar));
+    m->cmg_leader_count = 0;
+    m->cmg_leader_sense = 0;
+    __sync_synchronize();
+    tf_nextn_ffn_task *tasks = (tf_nextn_ffn_task *)alloca(
+        (size_t)nt * sizeof(*tasks));
+    for (int tid = 0; tid < nt; tid++)
+        tasks[tid] = (tf_nextn_ffn_task){m, L, nn, head, head_norm, tid, nt,
+                                         nff, ne, head_rows, include_qkv,
+                                         include_attention,
+                                         include_output,
+                                         include_output && full_enabled,
+                                         inline_argmax, nextn_sharded,
+                                         position, nh, hd, kvd,
+                                         gqa, qd, 0};
+    tf_pool_dispatch(m, tf_nextn_ffn_worker, tasks, sizeof(*tasks));
+    return include_attention ? 3 : (include_output && full_enabled ? 2 : 1);
+}
+
+static int tf_nextn_qkv_persistent_wanted(transformer_model *m,
+                                           transformer_layer *L) {
+    static int enabled = -1, attn_enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("TF_NEXTN_QKV_PERSIST");
+        enabled = e && atoi(e) != 0;
+        e = getenv("TF_NEXTN_ATTN_BLOCK_PERSIST");
+        attn_enabled = e && atoi(e) != 0;
+    }
+    return enabled && attn_enabled && m->pool_alive && m->n_threads > 1 &&
+           !L->attn_q.i8 && !L->attn_k.i8 && !L->attn_v.i8;
+}
+
+float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
+                                const float *target_hidden, int position) {
+    const char *pos_off_env = getenv("TP_MTP_POS_OFFSET");
+    if (pos_off_env) position += atoi(pos_off_env);
+    if (!m || !m->nextn.loaded || !target_hidden || prev_token < 0 ||
+        prev_token >= m->n_vocab || position < 0 || position >= m->max_seq_len)
+        return NULL;
+
+    transformer_nextn *nn = &m->nextn;
+    transformer_layer *L = &nn->layer;
+    const qtensor *emb = nn->embed_tokens.data ? &nn->embed_tokens : &m->token_embd;
+    const qtensor *head = nn->shared_head_head.data ? &nn->shared_head_head : &m->output;
+    int ne = m->n_embd, hd = m->head_dim;
+    int nh = L->attn_q.n_rows / (2 * hd);
+    int nkh = L->attn_k.n_rows / hd;
+    int nff = L->ffn_gate.n_rows;
+    int qd = nh * hd, kvd = nkh * hd, gqa = nh / nkh;
+    int profile = getenv("TF_NEXTN_PROFILE") != NULL;
+    double pt0 = profile ? tf_time_ms() : 0.0, pt_eh = 0.0, pt_qkv = 0.0;
+    double pt_attn = 0.0, pt_out = 0.0, pt_ffn = 0.0;
+
+    /* The target pointer is commonly model->x; preserve it before using shared scratch. */
+    memcpy(nn->hidden, target_hidden, (size_t)ne * sizeof(float));
+    tf_dequant_row(emb, prev_token, m->xb);
+    int hidden_first = getenv("TP_MTP_HIDDEN_FIRST") &&
+                       atoi(getenv("TP_MTP_HIDDEN_FIRST"));
+    float *e_dst = nn->fusion + (hidden_first ? ne : 0);
+    float *h_dst = nn->fusion + (hidden_first ? 0 : ne);
+    tf_rmsnorm(e_dst, m->xb, &nn->enorm, ne, m->rms_norm_eps, m->matvec_tmp);
+    tf_rmsnorm(h_dst, nn->hidden, &nn->hnorm, ne,
+               m->rms_norm_eps, m->matvec_tmp);
+    tf_qmatvec_pool(m, m->x, &nn->eh_proj, nn->fusion, ne);
+    if (profile) pt_eh = tf_time_ms();
+
+    tf_rmsnorm(m->xb, m->x, &L->attn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
+    int qkv_persistent = tf_nextn_qkv_persistent_wanted(m, L);
+    if (!qkv_persistent) {
+        tf_qmatvec_fused_qkv_pool(m, m->xb2, &L->attn_q, 2 * qd,
+                                  m->k, &L->attn_k, m->v, &L->attn_v, kvd);
+        for (int h = 0; h < nh; h++) {
+            memcpy(m->q + h * hd, m->xb2 + h * 2 * hd,
+                   (size_t)hd * sizeof(float));
+            memcpy(m->ffn_buf1 + h * hd, m->xb2 + h * 2 * hd + hd,
+                   (size_t)hd * sizeof(float));
+        }
+        tf_qk_norm(m->q, nh, hd, &L->attn_q_norm,
+                   m->rms_norm_eps, m->matvec_tmp);
+        tf_qk_norm(m->k, nkh, hd, &L->attn_k_norm,
+                   m->rms_norm_eps, m->matvec_tmp);
+        tf_apply_rope(m, m->q, m->k, nh, nkh, hd,
+                      position, position, position);
+        memcpy(nn->key_cache + (size_t)position * kvd, m->k,
+               (size_t)kvd * sizeof(float));
+        memcpy(nn->value_cache + (size_t)position * kvd, m->v,
+               (size_t)kvd * sizeof(float));
+    }
+    if (profile) pt_qkv = tf_time_ms();
+
+    if (!qkv_persistent)
+        memset(m->xb2, 0, (size_t)qd * sizeof(float));
+    int nextn_sharded = !getenv("TP_STAGE_DIR") ||
+        (getenv("TP_NEXTN_SHARD") && atoi(getenv("TP_NEXTN_SHARD")));
+    const qtensor *head_norm = nn->shared_head_norm.data
+        ? &nn->shared_head_norm : &m->output_norm;
+    int head_rows = head->n_rows > 0 ? head->n_rows : m->n_vocab;
+    int block_persistent = tf_nextn_ffn_persistent_pool(
+        m, L, nn, nff, ne, qkv_persistent, 1, 1, nextn_sharded, head, head_norm,
+        head_rows, position, nh, hd, kvd, gqa, qd);
+    if (!block_persistent && m->pool_alive && m->n_threads > 1 && nh > 1) {
+        int nt=m->n_threads,hoff=0;
+        tf_attn_task *tasks=(tf_attn_task*)alloca((size_t)nt*sizeof(*tasks));
+        int hp=nh/nt,hx=nh%nt;
+        for(int t=0;t<nt;t++){
+            int hc=hp+(t<hx?1:0);
+            tasks[t]=(tf_attn_task){m->q,m->att,m->xb2,nn->key_cache,
+                nn->value_cache,hoff,hoff+hc,hd,kvd,gqa,position+1,
+                m->max_seq_len,1.0f/sqrtf((float)hd),0};
+            hoff+=hc;
+        }
+        tf_pool_dispatch(m,tf_attn_worker,tasks,sizeof(*tasks));
+    } else if (!block_persistent) {
+        tf_attn_task task = {m->q, m->att, m->xb2, nn->key_cache, nn->value_cache,
+                             0, nh, hd, kvd, gqa, position + 1, m->max_seq_len,
+                             1.0f / sqrtf((float)hd)};
+        tf_attn_worker(&task);
+    }
+    if (!block_persistent)
+        for (int i = 0; i < qd; i++)
+            m->xb2[i] *= 1.0f / (1.0f + expf(-m->ffn_buf1[i]));
+    if (profile) {
+        pt_attn = tf_time_ms();
+        if (block_persistent) pt_out = pt_ffn = pt_attn;
+    }
+    if (!block_persistent)
+        block_persistent = tf_nextn_ffn_persistent_pool(
+            m, L, nn, nff, ne, 0, 0, 1, nextn_sharded, head, head_norm,
+            head_rows, position, nh, hd, kvd, gqa, qd);
+    if (!block_persistent) {
+        tf_qmatvec_pool(m, m->xb, &L->attn_output, m->xb2, ne);
+        if (nextn_sharded && m->tp_attn_sharded && m->tp_allreduce_fn)
+            m->tp_allreduce_fn(m->xb, ne, m->tp_allreduce_ctx);
+        if (profile) pt_out = tf_time_ms();
+        tf_vadd(m->x, m->xb, ne);
+        tf_rmsnorm(m->xb, m->x, &L->ffn_norm, ne, m->rms_norm_eps, m->matvec_tmp);
+    }
+    if (!block_persistent &&
+        !tf_nextn_ffn_persistent_pool(m, L, nn, nff, ne, 0, 0,
+                                      0, nextn_sharded, NULL, NULL, 0,
+                                      position, nh, hd, kvd, gqa, qd)) {
+        tf_qmatvec_fused2_pool(m, m->ffn_buf1, &L->ffn_gate,
+                               m->ffn_buf2, &L->ffn_up, m->xb, nff);
+        tf_silu_mul_avx2(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2, nff);
+        tf_qmatvec_pool(m, m->xb, &L->ffn_down, m->ffn_buf3, ne);
+    }
+    if (block_persistent < 2) {
+        if (nextn_sharded && m->tp_ffn_sharded && m->tp_allreduce_fn)
+            m->tp_allreduce_fn(m->xb, ne, m->tp_allreduce_ctx);
+        if (profile) pt_ffn = tf_time_ms();
+        tf_vadd(m->x, m->xb, ne);
+        memcpy(nn->hidden, m->x, (size_t)ne * sizeof(float));
+    }
+    /* Qwen3.5 NextN shares the trunk output norm/head when the optional
+     * nextn-specific tensors are absent.  Skipping the fallback RMSNorm makes
+     * the vocabulary head collapse to tiny token IDs and yields alpha=0. */
+    if (block_persistent < 2) {
+        tf_rmsnorm(m->xb, m->x, head_norm, ne, m->rms_norm_eps, m->matvec_tmp);
+        /* In TP mode the shared head aliases the rank-local vocabulary shard.
+         * Produce only local rows; the caller performs the global argmax reduce. */
+        tf_qmatvec_pool(m, m->logits, head, m->xb, head_rows);
+    }
+    if (profile && m->tp_rank == 0) {
+        double end = tf_time_ms();
+        fprintf(stderr, "nextn profile: eh=%.3f qkv=%.3f attn=%.3f out=%.3f ffn=%.3f head=%.3f total=%.3f ms\n",
+                pt_eh - pt0, pt_qkv - pt_eh, pt_attn - pt_qkv,
+                pt_out - pt_attn, pt_ffn - pt_out, end - pt_ffn, end - pt0);
+    }
+    return m->logits;
+}
+
+int transformer_nextn_local_argmax(const transformer_model *m, float *value) {
+    if (!m || !m->lm_head_best_idx || !m->lm_head_best_val || m->n_threads < 1)
+        return -1;
+    int best = m->lm_head_best_idx[0];
+    float bv = m->lm_head_best_val[0];
+    for (int t = 1; t < m->n_threads; t++) {
+        float v = m->lm_head_best_val[t];
+        int i = m->lm_head_best_idx[t];
+        if (v > bv || (v == bv && i < best)) { bv = v; best = i; }
+    }
+    if (value) *value = bv;
+    return best;
 }
 
 float *transformer_forward_partial(transformer_model *m, int cache_pos,
                                     int layer_start, int layer_end) {
     if (!m) return NULL;
+    if (!m->is_gemma4 && m->n_threads > 1 && m->pool_alive &&
+        layer_start == 0 && layer_end == m->n_layers)
+        return tf_forward_persistent(m, cache_pos, cache_pos, cache_pos, cache_pos);
     return tf_forward_blocks_range(m, cache_pos, cache_pos, cache_pos, cache_pos,
                                     layer_start, layer_end);
 }
@@ -4453,6 +10573,1139 @@ static void *tf_gemm_tm_worker(void *arg) {
     return NULL;
 }
 
+#if defined(__ARM_FEATURE_SVE)
+/* Register-blocked token-major BF16xfp32 GEMM (MR=4 tokens x NR=6 weight-rows).
+ * ~60x the matvec-based gemm_bf16_f32_tokmajor: shared k-vector loads feed 24 FMAs/
+ * k-step, BF16 widened in-register (ld1uh->lsl#16, zero conversion FLOPs). No OMP —
+ * the caller's pthread row-split parallelizes. Same signature as gemm_bf16_f32_tokmajor.
+ * For N=1 (decode) the caller keeps the matvec path (this wastes 3/4 token slots). */
+static inline svfloat32_t tf_bf16w(svbool_t pg, const uint16_t *p) {
+    return svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, p), 16));
+}
+static void tf_gemm_bf16_blocked(float *Y, const uint16_t *W, const float *X,
+        int n_rows, int K, int N, int Ys, int Xs, int nt) {
+    const int MR = 4, NR = 6; int vl = (int)svcntw();
+    int MTn = (N + MR - 1) / MR, NTn = n_rows / NR;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int n0 = 0; n0 < NTn; n0++) {
+        const uint16_t *w0=W+(size_t)(n0*NR+0)*K,*w1=W+(size_t)(n0*NR+1)*K,*w2=W+(size_t)(n0*NR+2)*K;
+        const uint16_t *w3=W+(size_t)(n0*NR+3)*K,*w4=W+(size_t)(n0*NR+4)*K,*w5=W+(size_t)(n0*NR+5)*K;
+        for (int m0 = 0; m0 < MTn; m0++) {
+            int t0=m0*MR,t1=t0+1,t2=t0+2,t3=t0+3;
+            const float *x0=X+(size_t)(t0<N?t0:0)*Xs,*x1=X+(size_t)(t1<N?t1:0)*Xs;
+            const float *x2=X+(size_t)(t2<N?t2:0)*Xs,*x3=X+(size_t)(t3<N?t3:0)*Xs;
+            svfloat32_t a00=svdup_f32(0),a01=svdup_f32(0),a02=svdup_f32(0),a03=svdup_f32(0),a04=svdup_f32(0),a05=svdup_f32(0);
+            svfloat32_t a10=svdup_f32(0),a11=svdup_f32(0),a12=svdup_f32(0),a13=svdup_f32(0),a14=svdup_f32(0),a15=svdup_f32(0);
+            svfloat32_t a20=svdup_f32(0),a21=svdup_f32(0),a22=svdup_f32(0),a23=svdup_f32(0),a24=svdup_f32(0),a25=svdup_f32(0);
+            svfloat32_t a30=svdup_f32(0),a31=svdup_f32(0),a32=svdup_f32(0),a33=svdup_f32(0),a34=svdup_f32(0),a35=svdup_f32(0);
+            for (int k=0;k<K;k+=vl){ svbool_t pg=svwhilelt_b32(k,K);
+                svfloat32_t v0=tf_bf16w(pg,w0+k),v1=tf_bf16w(pg,w1+k),v2=tf_bf16w(pg,w2+k),v3=tf_bf16w(pg,w3+k),v4=tf_bf16w(pg,w4+k),v5=tf_bf16w(pg,w5+k);
+                svfloat32_t x=svld1_f32(pg,x0+k);
+                a00=svmla_f32_m(pg,a00,x,v0);a01=svmla_f32_m(pg,a01,x,v1);a02=svmla_f32_m(pg,a02,x,v2);a03=svmla_f32_m(pg,a03,x,v3);a04=svmla_f32_m(pg,a04,x,v4);a05=svmla_f32_m(pg,a05,x,v5);
+                x=svld1_f32(pg,x1+k);
+                a10=svmla_f32_m(pg,a10,x,v0);a11=svmla_f32_m(pg,a11,x,v1);a12=svmla_f32_m(pg,a12,x,v2);a13=svmla_f32_m(pg,a13,x,v3);a14=svmla_f32_m(pg,a14,x,v4);a15=svmla_f32_m(pg,a15,x,v5);
+                x=svld1_f32(pg,x2+k);
+                a20=svmla_f32_m(pg,a20,x,v0);a21=svmla_f32_m(pg,a21,x,v1);a22=svmla_f32_m(pg,a22,x,v2);a23=svmla_f32_m(pg,a23,x,v3);a24=svmla_f32_m(pg,a24,x,v4);a25=svmla_f32_m(pg,a25,x,v5);
+                x=svld1_f32(pg,x3+k);
+                a30=svmla_f32_m(pg,a30,x,v0);a31=svmla_f32_m(pg,a31,x,v1);a32=svmla_f32_m(pg,a32,x,v2);a33=svmla_f32_m(pg,a33,x,v3);a34=svmla_f32_m(pg,a34,x,v4);a35=svmla_f32_m(pg,a35,x,v5);
+            }
+            svbool_t pt=svptrue_b32(); float *Yb=Y+(size_t)n0*NR;
+            #define TF_BST(tok,A0,A1,A2,A3,A4,A5) if((tok)<N){ float*y=Yb+(size_t)(tok)*Ys; \
+                y[0]=svaddv_f32(pt,A0);y[1]=svaddv_f32(pt,A1);y[2]=svaddv_f32(pt,A2);y[3]=svaddv_f32(pt,A3);y[4]=svaddv_f32(pt,A4);y[5]=svaddv_f32(pt,A5); }
+            TF_BST(t0,a00,a01,a02,a03,a04,a05) TF_BST(t1,a10,a11,a12,a13,a14,a15)
+            TF_BST(t2,a20,a21,a22,a23,a24,a25) TF_BST(t3,a30,a31,a32,a33,a34,a35)
+            #undef TF_BST
+        }
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int row=NTn*NR; row<n_rows; row++){ const uint16_t *w=W+(size_t)row*K;
+        for (int t=0;t<N;t++){ const float *x=X+(size_t)t*Xs; svfloat32_t a=svdup_f32(0);
+            for (int k=0;k<K;k+=vl){ svbool_t pg=svwhilelt_b32(k,K); a=svmla_f32_m(pg,a,svld1_f32(pg,x+k),tf_bf16w(pg,w+k)); }
+            Y[(size_t)t*Ys+row]=svaddv_f32(svptrue_b32(),a); } }
+}
+#define TF_HAVE_BF16_BLOCKED 1
+
+/* W8A8 int8 prepack: quantize the 7 BF16 dense weights/layer to int8 (per-row symmetric
+ * scale) IN-PLACE -- the 1-byte int8 row [r*K..] overwrites the first half of the 2-byte
+ * BF16 row [r*2K..] AFTER it's read (the int8 write frontier r*K+k stays strictly below
+ * the BF16 read frontier r*2K+2k for r>=1, and within row 0 below the read), so no extra
+ * memory and no madvise (madvise(DONTNEED) HANGS on the interleaved buffer). The weights
+ * are first-touch-distributed by an OMP loop over WEIGHTS (each weight quantized
+ * single-threaded internally -- the in-place hazard is intra-weight; weights are
+ * independent). Sets w->i8 (= w->data) + w->i8s. BREAKS the BF16 path (dispatch checks
+ * mat->i8). The dead second half stays mapped (no saving, but memory-neutral). */
+static size_t tf_prepack_int8_block64_tensor(transformer_model *m, qtensor *w) {
+    if (!w || !w->data || w->type != GGML_TYPE_BF16 || w->i8 || w->q8_block64)
+        return 0;
+    if ((w->n_rows & 7) || (w->n_cols & 63)) return 0;
+    int groups = w->n_rows / 8, nb = w->n_cols / 64;
+    size_t group_bytes = (size_t)nb * 528;
+    size_t bytes = (size_t)groups * group_bytes;
+    int8_t *dst = (int8_t *)tf_aligned_alloc_notouch(256, bytes);
+    if (!dst || tf_decode_owned_add(m, dst) != 0) {
+        free(dst);
+        return 0;
+    }
+    const uint16_t *src = (const uint16_t *)w->data;
+    for (int g = 0; g < groups; g++) {
+        uint8_t *group = (uint8_t *)dst + (size_t)g * group_bytes;
+        for (int b = 0; b < nb; b++) {
+            uint16_t *scales = (uint16_t *)(group + (size_t)b * 528);
+            int8_t *qs = (int8_t *)(scales + 8);
+            for (int r = 0; r < 8; r++) {
+                const uint16_t *row = src + (size_t)(g * 8 + r) * w->n_cols + b * 64;
+                float mx = 0.0f;
+                for (int j = 0; j < 64; j++) {
+                    float v = bf16_to_f32_scalar(row[j]);
+                    float a = v < 0 ? -v : v;
+                    if (a > mx) mx = a;
+                }
+                float scale = mx / 127.0f;
+                scales[r] = ggml_fp32_to_fp16(scale);
+                float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+                for (int j = 0; j < 64; j++) {
+                    int q = (int)lrintf(bf16_to_f32_scalar(row[j]) * inv);
+                    qs[(size_t)r * 64 + j] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q);
+                }
+            }
+        }
+    }
+    w->data = dst;
+    w->q8_block64 = 3;
+    return bytes;
+}
+
+void transformer_prepack_int8_block64(transformer_model *m) {
+    if (!m || !m->layers) return;
+    size_t total = 0;
+    int cnt = 0;
+    for (int li = 0; li < m->n_layers; li++) {
+        transformer_layer *L = &m->layers[li];
+        qtensor *ws[] = {
+            &L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+            &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta,
+            &L->ssm_conv1d, &L->ssm_out
+        };
+        for (size_t wi = 0; wi < sizeof(ws) / sizeof(ws[0]); wi++) {
+            size_t n = tf_prepack_int8_block64_tensor(m, ws[wi]);
+            if (n) { total += n; cnt++; }
+        }
+    }
+    size_t n = tf_prepack_int8_block64_tensor(m, &m->output);
+    if (n) { total += n; cnt++; }
+    fprintf(stderr, "int8 block64 prepack: %d BF16 weights %.3fGB -> compact W8A8 SDOT\n",
+            cnt, (double)total / 1e9);
+}
+
+/* Selective W8A8 mode for experiments that keep SSM/attention BF16 while
+ * converting only the dominant dense FFN projections.  The caller must use
+ * the row-major BF16 stage (TP_STAGE_BF16_PV=0), since this packer consumes
+ * ordinary BF16 rows. */
+void transformer_prepack_int8_block64_ffn(transformer_model *m) {
+    if (!m || !m->layers) return;
+    size_t total = 0;
+    int cnt = 0;
+    for (int li = 0; li < m->n_layers; li++) {
+        transformer_layer *L = &m->layers[li];
+        qtensor *ws[] = { &L->ffn_gate, &L->ffn_up, &L->ffn_down };
+        for (size_t wi = 0; wi < sizeof(ws) / sizeof(ws[0]); wi++) {
+            size_t n = tf_prepack_int8_block64_tensor(m, ws[wi]);
+            if (n) { total += n; cnt++; }
+        }
+    }
+    fprintf(stderr, "int8 block64-ffn prepack: %d BF16 FFN weights %.3fGB -> compact W8A8 SDOT\n",
+            cnt, (double)total / 1e9);
+}
+
+void transformer_prepack_int8(transformer_model *m) {
+    if (!m || !m->layers) return;
+    int cnt = 0;
+    const char *mode = getenv("TP_INT8_MODE");
+    int ffn_only = mode && !strcmp(mode, "row-ffn");
+    fprintf(stderr, "int8 prepack: start (%d layers, in-place%s)\n",
+            m->n_layers, ffn_only ? ", FFN only" : "");
+    for (int li = 0; li < m->n_layers; li++) {
+        transformer_layer *L = &m->layers[li];
+        qtensor *ws[] = {
+            &L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+            &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta,
+            &L->ssm_conv1d, &L->ssm_out
+        };
+        size_t nw = ffn_only ? 3 : sizeof(ws) / sizeof(ws[0]);
+        for (size_t wi = 0; wi < nw; wi++) {
+            qtensor *w = ws[wi];
+            if (!w->data || w->type != GGML_TYPE_BF16 || w->i8) continue;
+            int nr = w->n_rows, K = w->n_cols;
+            float *sc = (float *)malloc((size_t)nr * sizeof(float));
+            if (!sc) { fprintf(stderr, "int8 prepack: scale alloc failed\n"); return; }
+            int8_t *i8 = (int8_t *)w->data;
+            for (int r = 0; r < nr; r++) {
+                const uint16_t *row = (const uint16_t *)w->data + (size_t)r * K;
+                float mx = 0;
+                for (int k = 0; k < K; k++) {
+                    float v = bf16_to_f32_scalar(row[k]);
+                    float a = v < 0 ? -v : v;
+                    if (a > mx) mx = a;
+                }
+                float s = mx / 127.0f, inv = s > 0 ? 1.0f / s : 0;
+                sc[r] = s;
+                for (int k = 0; k < K; k++) {
+                    int q = (int)lrintf(bf16_to_f32_scalar(row[k]) * inv);
+                    i8[(size_t)r * K + k] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q);
+                }
+            }
+            w->i8 = i8; w->i8s = sc; cnt++;
+        }
+    }
+    if (!ffn_only && m->output.data && m->output.type == GGML_TYPE_BF16 && !m->output.i8) {
+        qtensor *w = &m->output;
+        int nr = w->n_rows, K = w->n_cols;
+        float *sc = (float *)malloc((size_t)nr * sizeof(float));
+        if (!sc) { fprintf(stderr, "int8 prepack: output scale alloc failed\n"); return; }
+        int8_t *i8 = (int8_t *)w->data;
+        for (int r = 0; r < nr; r++) {
+            const uint16_t *row = (const uint16_t *)w->data + (size_t)r * K;
+            float mx = 0;
+            for (int k = 0; k < K; k++) {
+                float v = bf16_to_f32_scalar(row[k]);
+                float a = v < 0 ? -v : v;
+                if (a > mx) mx = a;
+            }
+            float s = mx / 127.0f, inv = s > 0 ? 1.0f / s : 0;
+            sc[r] = s;
+            for (int k = 0; k < K; k++) {
+                int q = (int)lrintf(bf16_to_f32_scalar(row[k]) * inv);
+                i8[(size_t)r * K + k] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q);
+            }
+        }
+        w->i8 = i8; w->i8s = sc; cnt++;
+    }
+    fprintf(stderr, "int8 prepack: %d BF16 weights -> int8 W8A8 (in-place)\n", cnt);
+}
+
+static size_t tf_prepack_int8_row_tensor(qtensor *w) {
+    if (!w || !w->data || w->type != GGML_TYPE_BF16 || w->i8 ||
+        w->n_rows <= 0 || w->n_cols <= 0) return 0;
+    int nr = w->n_rows, K = w->n_cols;
+    float *sc = (float *)malloc((size_t)nr * sizeof(*sc));
+    if (!sc) return 0;
+    int8_t *dst = (int8_t *)w->data;
+    for (int r = 0; r < nr; r++) {
+        const uint16_t *row = (const uint16_t *)w->data + (size_t)r * K;
+        float mx = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float a = fabsf(bf16_to_f32_scalar(row[k]));
+            if (a > mx) mx = a;
+        }
+        float s = mx / 127.0f, inv = s > 0.0f ? 1.0f / s : 0.0f;
+        sc[r] = s;
+        for (int k = 0; k < K; k++) {
+            int q = (int)lrintf(bf16_to_f32_scalar(row[k]) * inv);
+            dst[(size_t)r * K + k] = (int8_t)(q < -127 ? -127 : q > 127 ? 127 : q);
+        }
+    }
+    w->i8 = dst;
+    w->i8s = sc;
+    return (size_t)nr * K;
+}
+
+size_t transformer_prepack_int8_range(transformer_model *m, int l0, int l1,
+                                      int include_output) {
+    if (!m || !m->layers) return 0;
+    if (l0 < 0) l0 = 0;
+    if (l1 > m->n_layers) l1 = m->n_layers;
+    if (l0 >= l1) return 0;
+    size_t total = 0;
+    int count = 0;
+    for (int l = l0; l < l1; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {
+            &L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+            &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta,
+            &L->ssm_out
+        };
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            size_t n = tf_prepack_int8_row_tensor(ws[i]);
+            if (n) { total += n; count++; }
+        }
+    }
+    if (include_output) {
+        size_t n = tf_prepack_int8_row_tensor(&m->output);
+        if (n) { total += n; count++; }
+    }
+    fprintf(stderr, "int8 range prepack: layers=[%d,%d) tensors=%d payload=%.3fGB%s\n",
+            l0, l1, count, (double)total / 1e9,
+            include_output ? " +lm_head" : "");
+    return total;
+}
+
+static size_t tf_prepack_q8_w8a8_tensor(transformer_model *m, qtensor *w) {
+    if (!w || !w->data || w->type != GGML_TYPE_Q8_0 || w->q8_block64 ||
+        (w->n_rows & 7) || (w->n_cols & 63)) return 0;
+    int groups = w->n_rows / 8, nb = w->n_cols / 64, src_nb = w->n_cols / 32;
+    size_t group_bytes = (size_t)nb * 528;
+    size_t bytes = (size_t)groups * group_bytes;
+    uint8_t *dst = (uint8_t *)tf_aligned_alloc_notouch(256, bytes);
+    if (!dst || tf_decode_owned_add(m, dst) != 0) { free(dst); return 0; }
+    const block_q8_0 *src = (const block_q8_0 *)w->data;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(m->n_threads) schedule(static)
+    #endif
+    for (int g = 0; g < groups; g++) {
+        uint8_t *gp = dst + (size_t)g * group_bytes;
+        for (int b = 0; b < nb; b++) {
+            uint8_t *bp = gp + (size_t)b * 528;
+            uint16_t *sc = (uint16_t *)bp;
+            int8_t *qs = (int8_t *)(bp + 16);
+            for (int r = 0; r < 8; r++) {
+                const block_q8_0 *s = src + (size_t)(g * 8 + r) * src_nb + 2 * b;
+                float d0 = ggml_fp16_to_fp32(s[0].d), d1 = ggml_fp16_to_fp32(s[1].d);
+                float mx = 0.0f;
+                for (int j = 0; j < 32; j++) {
+                    float a0 = fabsf(d0 * s[0].qs[j]); if (a0 > mx) mx = a0;
+                    float a1 = fabsf(d1 * s[1].qs[j]); if (a1 > mx) mx = a1;
+                }
+                float ws = mx / 127.0f, inv = ws > 0.0f ? 1.0f / ws : 0.0f;
+                sc[r] = ggml_fp32_to_fp16(ws);
+                for (int j = 0; j < 32; j++) {
+                    int q0 = (int)lrintf(d0 * s[0].qs[j] * inv);
+                    int q1 = (int)lrintf(d1 * s[1].qs[j] * inv);
+                    qs[(size_t)r * 64 + j] = (int8_t)(q0 < -127 ? -127 : q0 > 127 ? 127 : q0);
+                    qs[(size_t)r * 64 + 32 + j] = (int8_t)(q1 < -127 ? -127 : q1 > 127 ? 127 : q1);
+                }
+            }
+        }
+    }
+    w->data = dst;
+    w->q8_block64 = 3;
+    return bytes;
+}
+
+size_t transformer_prepack_q8_w8a8_range(transformer_model *m, int l0, int l1,
+                                         int include_output) {
+    if (!m || !m->layers) return 0;
+    if (l0 < 0) l0 = 0; if (l1 > m->n_layers) l1 = m->n_layers;
+    size_t total = 0; int count = 0;
+    for (int l = l0; l < l1; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ssm_qkv,&L->ssm_gate,&L->ssm_alpha,&L->ssm_beta,&L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws)/sizeof(ws[0]); i++) {
+            size_t n = tf_prepack_q8_w8a8_tensor(m, ws[i]);
+            if (n) { total += n; count++; }
+        }
+    }
+    if (include_output) {
+        size_t n = tf_prepack_q8_w8a8_tensor(m, &m->output);
+        if (n) { total += n; count++; }
+    }
+    fprintf(stderr, "q8 W8A8 range pack: layers=[%d,%d) tensors=%d %.3fGB%s\n",
+            l0,l1,count,(double)total/1e9,include_output?" +lm_head":"");
+    return total;
+}
+
+static size_t tf_prepack_q8v2_tensor(transformer_model *m, qtensor *w) {
+    if (!w || !w->data || w->type != GGML_TYPE_Q8_0 || w->prefill_q8v2_q ||
+        (w->n_rows & 63) || (w->n_cols & 31)) return 0;
+    int panels=w->n_rows/64, nb=w->n_cols/32;
+    size_t qpt=(size_t)nb*64*32, dpt=(size_t)nb*64;
+    size_t qbytes=(size_t)panels*qpt, dbytes=(size_t)panels*dpt*sizeof(float);
+    int8_t *q=(int8_t *)tf_aligned_alloc_notouch(256,qbytes);
+    float *d=(float *)tf_aligned_alloc_notouch(256,dbytes);
+    if(!q||!d){free(q);free(d);return 0;}
+    if(tf_decode_owned_add(m,q)!=0){free(q);free(d);return 0;}
+    if(tf_decode_owned_add(m,d)!=0){m->decode_owned_count--;free(q);free(d);return 0;}
+    const block_q8_0 *src=(const block_q8_0 *)w->data;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(m->n_threads) schedule(static)
+    #endif
+    for(int p=0;p<panels;p++){
+        int8_t *pq=q+(size_t)p*qpt; float *pd=d+(size_t)p*dpt;
+        for(int b=0;b<nb;b++){
+            for(int c=0;c<64;c++)
+                pd[(size_t)b*64+c]=ggml_fp16_to_fp32(src[(size_t)(p*64+c)*nb+b].d);
+            for(int g3=0;g3<8;g3++) for(int vec=0;vec<4;vec++) for(int col=0;col<16;col++){
+                int c=vec*16+col;
+                const block_q8_0 *sb=src+(size_t)(p*64+c)*nb+b;
+                for(int kk=0;kk<4;kk++)
+                    pq[((size_t)b*8*4+(size_t)g3*4+vec)*64+(size_t)col*4+kk]=sb->qs[g3*4+kk];
+            }
+        }
+    }
+    w->prefill_q8v2_q=q; w->prefill_q8v2_d=d;
+    return qbytes+dbytes;
+}
+
+size_t transformer_prepack_q8v2_range(transformer_model *m,int l0,int l1){
+    if(!m||!m->layers)return 0;
+    if(l0<0)l0=0;if(l1>m->n_layers)l1=m->n_layers;
+    size_t total=0;int count=0;
+    for(int l=l0;l<l1;l++){
+        transformer_layer *L=&m->layers[l];
+        qtensor *ws[]={&L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ssm_qkv,&L->ssm_gate,&L->ssm_alpha,&L->ssm_beta,&L->ssm_out};
+        for(size_t i=0;i<sizeof(ws)/sizeof(ws[0]);i++){
+            size_t n=tf_prepack_q8v2_tensor(m,ws[i]);if(n){total+=n;count++;}
+        }
+    }
+    fprintf(stderr,"q8v2 range pack: layers=[%d,%d) tensors=%d %.3fGB\n",
+            l0,l1,count,(double)total/1e9);
+    return total;
+}
+
+static size_t tf_release_q8v2_tensor(transformer_model *m, qtensor *w) {
+    if (!m || !w || (!w->prefill_q8v2_q && !w->prefill_q8v2_d)) return 0;
+    size_t bytes = 0;
+    if (w->n_rows > 0 && w->n_cols > 0) {
+        int panels = w->n_rows / 64, nb = w->n_cols / 32;
+        bytes = (size_t)panels * ((size_t)nb * 64 * 32 +
+                                 (size_t)nb * 64 * sizeof(float));
+    }
+    void *ptrs[2] = {w->prefill_q8v2_q, w->prefill_q8v2_d};
+    for (int j = 0; j < 2; j++) if (ptrs[j]) {
+        for (int i = 0; i < m->decode_owned_count; i++)
+            if (m->decode_owned[i] == ptrs[j]) { m->decode_owned[i] = NULL; break; }
+        free(ptrs[j]);
+    }
+    w->prefill_q8v2_q = NULL;
+    w->prefill_q8v2_d = NULL;
+    return bytes;
+}
+
+size_t transformer_release_q8v2_range(transformer_model *m, int l0, int l1) {
+    if (!m || !m->layers) return 0;
+    if (l0 < 0) l0 = 0;
+    if (l1 > m->n_layers) l1 = m->n_layers;
+    size_t total = 0;
+    for (int l = l0; l < l1; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ssm_qkv,&L->ssm_gate,&L->ssm_alpha,&L->ssm_beta,&L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws)/sizeof(ws[0]); i++)
+            total += tf_release_q8v2_tensor(m, ws[i]);
+    }
+    return total;
+}
+
+static uint16_t tf_q8_bf16_rne(float v) {
+    uint32_t u;
+    __builtin_memcpy(&u, &v, sizeof(u));
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
+
+static size_t tf_q8_bf16_pv_bytes(const qtensor *w) {
+    if (!w || !w->data || w->type != GGML_TYPE_Q8_0 ||
+        w->n_rows <= 0 || w->n_cols <= 0 || (w->n_rows & 7) ||
+        (w->n_cols & 31)) return 0;
+    return (size_t)w->n_rows * (size_t)w->n_cols * sizeof(uint16_t);
+}
+
+typedef struct {
+    const block_q8_0 *src;
+    uint16_t *dst;
+    int rows, cols, tid, nt;
+} tf_q8_bf16_pv_task;
+
+static void *tf_q8_bf16_pv_worker(void *arg) {
+    tf_q8_bf16_pv_task *t = (tf_q8_bf16_pv_task *)arg;
+    int groups = t->rows / 8, nb = t->cols / 32;
+    int g0 = groups * t->tid / t->nt;
+    int g1 = groups * (t->tid + 1) / t->nt;
+    for (int g = g0; g < g1; g++) {
+        uint16_t *gd = t->dst + (size_t)g * 8 * t->cols;
+        for (int pair = 0; pair < 4; pair++) {
+            int r0 = g * 8 + 2 * pair, r1 = r0 + 1;
+            uint16_t *pd = gd + (size_t)pair * 2 * t->cols;
+            for (int b = 0; b < nb; b++) {
+                const block_q8_0 *s0 = t->src + (size_t)r0 * nb + b;
+                const block_q8_0 *s1 = t->src + (size_t)r1 * nb + b;
+                float d0 = ggml_fp16_to_fp32(s0->d);
+                float d1 = ggml_fp16_to_fp32(s1->d);
+                for (int j = 0; j < 32; j++) {
+                    size_t k = (size_t)b * 32 + j;
+                    pd[2 * k] = tf_q8_bf16_rne(d0 * s0->qs[j]);
+                    pd[2 * k + 1] = tf_q8_bf16_rne(d1 * s1->qs[j]);
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static int tf_expand_q8_bf16_pv_tensor(transformer_model *m, qtensor *w,
+                                        uint16_t *dst) {
+    size_t bytes = tf_q8_bf16_pv_bytes(w);
+    if (!bytes) return 0;
+    const block_q8_0 *src = (const block_q8_0 *)w->data;
+    int nt = m->n_threads > 1 ? m->n_threads : 1;
+    tf_q8_bf16_pv_task *tasks =
+        (tf_q8_bf16_pv_task *)alloca((size_t)nt * sizeof(*tasks));
+    for (int tid = 0; tid < nt; tid++) {
+        tasks[tid] = (tf_q8_bf16_pv_task){src, dst, w->n_rows,
+                                          w->n_cols, tid, nt};
+    }
+    if (nt > 1 && m->pool_alive)
+        tf_pool_dispatch(m, tf_q8_bf16_pv_worker, tasks, sizeof(*tasks));
+    else
+        tf_q8_bf16_pv_worker(&tasks[0]);
+    w->data = dst;
+    w->type = GGML_TYPE_BF16;
+    w->bf16_pv = 1;
+    return 1;
+}
+
+size_t transformer_expand_q8_bf16_pv_range(transformer_model *m,
+                                             int l0, int l1,
+                                             int include_output,
+                                             int nextn_mask) {
+    if (!m || !m->layers) return 0;
+    if (l0 < 0) l0 = 0;
+    if (l1 > m->n_layers) l1 = m->n_layers;
+    if (l0 >= l1) return 0;
+    size_t planned = 0;
+    int planned_count = 0;
+    for (int l = l0; l < l1; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ssm_qkv,&L->ssm_gate,&L->ssm_alpha,&L->ssm_beta,&L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            size_t n = tf_q8_bf16_pv_bytes(ws[i]);
+            if (n) { planned += n; planned_count++; }
+        }
+    }
+    if (include_output) {
+        size_t n = tf_q8_bf16_pv_bytes(&m->output);
+        if (n) { planned += n; planned_count++; }
+    }
+    if (nextn_mask && m->nextn.loaded) {
+        transformer_layer *L = &m->nextn.layer;
+        qtensor *ws[] = {&m->nextn.eh_proj,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &m->nextn.shared_head_head};
+        const int bits[] = {1,2,128,256,4,8,64,16,32};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            if (!(nextn_mask & bits[i])) continue;
+            size_t n = tf_q8_bf16_pv_bytes(ws[i]);
+            if (n) { planned += n; planned_count++; }
+        }
+    }
+    const char *reserve_env = getenv("TP_Q8_BF16_RESERVE_GB");
+    double reserve_gb = reserve_env && *reserve_env ? atof(reserve_env) : 3.0;
+    if (reserve_gb < 2.0) reserve_gb = 2.0;
+    long avail_kb = tf_mem_available_kb();
+    double avail_gb = avail_kb > 0 ? (double)avail_kb / (1024.0 * 1024.0) : -1.0;
+    fprintf(stderr, "q8->bf16 PV plan: tensors=%d %.3fGB MemAvailable=%.2fGB reserve=%.2fGB\n",
+            planned_count, (double)planned / 1e9, avail_gb, reserve_gb);
+    if (!planned || (avail_kb > 0 &&
+        (double)planned / (1024.0 * 1024.0 * 1024.0) + reserve_gb > avail_gb)) {
+        fprintf(stderr, "q8->bf16 PV: rejected by HBM headroom guard\n");
+        return 0;
+    }
+    size_t arena_bytes = (planned + (2u << 20) - 1) & ~((size_t)(2u << 20) - 1);
+    int shmid = shmget(IPC_PRIVATE, arena_bytes, IPC_CREAT | 0600);
+    void *arena = shmid >= 0 ? shmat(shmid, NULL, 0) : (void *)-1;
+    if (shmid >= 0) shmctl(shmid, IPC_RMID, NULL);
+    if (arena == (void *)-1) {
+        fprintf(stderr, "q8->bf16 PV: anonymous System-V arena allocation failed\n");
+        return 0;
+    }
+    m->q8_bf16_arena = arena;
+    m->q8_bf16_arena_bytes = arena_bytes;
+    size_t total = 0;
+    int count = 0;
+    for (int l = l0; l < l1; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ssm_qkv,&L->ssm_gate,&L->ssm_alpha,&L->ssm_beta,&L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            size_t n = tf_q8_bf16_pv_bytes(ws[i]);
+            if (!n) continue;
+            if (tf_expand_q8_bf16_pv_tensor(m, ws[i],
+                    (uint16_t *)((uint8_t *)arena + total)) < 0) return 0;
+            total += n;
+            count++;
+        }
+    }
+    if (include_output) {
+        size_t n = tf_q8_bf16_pv_bytes(&m->output);
+        if (n) {
+            if (tf_expand_q8_bf16_pv_tensor(m, &m->output,
+                    (uint16_t *)((uint8_t *)arena + total)) < 0) return 0;
+            total += n;
+            count++;
+        }
+    }
+    if (nextn_mask && m->nextn.loaded) {
+        transformer_layer *L = &m->nextn.layer;
+        qtensor *ws[] = {&m->nextn.eh_proj,
+            &L->attn_q,&L->attn_k,&L->attn_v,&L->attn_output,
+            &L->ffn_gate,&L->ffn_up,&L->ffn_down,
+            &m->nextn.shared_head_head};
+        const int bits[] = {1,2,128,256,4,8,64,16,32};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            if (!(nextn_mask & bits[i])) continue;
+            size_t n = tf_q8_bf16_pv_bytes(ws[i]);
+            if (!n) continue;
+            if (tf_expand_q8_bf16_pv_tensor(m, ws[i],
+                    (uint16_t *)((uint8_t *)arena + total)) < 0) return 0;
+            total += n;
+            count++;
+        }
+    }
+    fprintf(stderr, "q8->bf16 PV: tensors=%d expanded=%.3fGB MemAvailable=%.2fGB%s\n",
+            count, (double)total / 1e9,
+            (double)tf_mem_available_kb() / (1024.0 * 1024.0),
+            nextn_mask ? " +lm_head+selected-NextN" :
+            (include_output ? " +lm_head" : ""));
+    return total;
+}
+
+static size_t tf_prepack_q8b6_tensor(transformer_model *m,qtensor *w){
+    if(!w||!w->data||w->type!=GGML_TYPE_Q8_0||w->prefill_q8b6_q||
+       (w->n_rows&63)||(w->n_cols&63))return 0;
+    int panels=w->n_rows/64,nb=w->n_cols/64,snb=w->n_cols/32;
+    size_t qpt=(size_t)nb*4096,dpt=(size_t)nb*64;
+    size_t qbytes=(size_t)panels*qpt,dbytes=(size_t)panels*dpt*sizeof(float);
+    int8_t*q=(int8_t*)tf_aligned_alloc_notouch(256,qbytes);
+    float*d=(float*)tf_aligned_alloc_notouch(256,dbytes);
+    if(!q||!d){free(q);free(d);return 0;}
+    if(tf_decode_owned_add(m,q)!=0){free(q);free(d);return 0;}
+    if(tf_decode_owned_add(m,d)!=0){m->decode_owned_count--;free(q);free(d);return 0;}
+    const block_q8_0*src=(const block_q8_0*)w->data;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(m->n_threads) schedule(static)
+    #endif
+    for(int p=0;p<panels;p++)for(int b=0;b<nb;b++)for(int c=0;c<64;c++){
+        const block_q8_0*s=src+(size_t)(p*64+c)*snb+2*b;
+        float d0=ggml_fp16_to_fp32(s[0].d),d1=ggml_fp16_to_fp32(s[1].d),mx=0;
+        for(int k=0;k<32;k++){float a=fabsf(d0*s[0].qs[k]);if(a>mx)mx=a;
+                              a=fabsf(d1*s[1].qs[k]);if(a>mx)mx=a;}
+        float sc=mx/127.0f,inv=sc>0?1.0f/sc:0;
+        d[(size_t)p*dpt+(size_t)b*64+c]=sc;
+        int vec=c/16,col=c%16;
+        for(int k=0;k<64;k++){
+            float v=(k<32?d0*s[0].qs[k]:d1*s[1].qs[k-32])*inv;
+            int z=(int)lrintf(v);if(z>127)z=127;if(z<-127)z=-127;
+            int g=k/4,kk=k%4;
+            q[(size_t)p*qpt+(size_t)b*4096+((size_t)g*4+vec)*64+col*4+kk]=(int8_t)z;
+        }
+    }
+    w->prefill_q8b6_q=q;w->prefill_q8b6_d=d;return qbytes+dbytes;
+}
+
+size_t transformer_prepack_q8b6_range(transformer_model*m,int l0,int l1){
+    if(!m||!m->layers)return 0;if(l0<0)l0=0;if(l1>m->n_layers)l1=m->n_layers;
+    size_t total=0;int count=0;
+    for(int l=l0;l<l1;l++){
+        transformer_layer*L=&m->layers[l];
+        qtensor*ws[]={&L->ffn_gate,&L->ffn_up,&L->ffn_down,&L->attn_q,&L->attn_k,
+            &L->attn_v,&L->attn_output,&L->ssm_qkv,&L->ssm_gate,&L->ssm_alpha,
+            &L->ssm_beta,&L->ssm_out};
+        for(size_t i=0;i<sizeof(ws)/sizeof(ws[0]);i++){
+            size_t n=tf_prepack_q8b6_tensor(m,ws[i]);if(n){total+=n;count++;}
+        }
+    }
+    fprintf(stderr,"q8 block6 range pack: layers=[%d,%d) tensors=%d %.3fGB\n",
+            l0,l1,count,(double)total/1e9);return total;
+}
+
+#ifdef TF_LINK_PODD   /* consumer opts in (-DTF_LINK_PODD) AND links sgemm_bf16_2x12.S */
+/* On-the-fly p_odd BF16 GEMM (clair sgemm_bf16_2x12, 137 GF/core). A=features(MR=32),
+ * B=tokens(NR=12): W packed k-major-interleaved + X packed k-major BF16 per call, C
+ * col-major -> transposed to token-major Y. ~1.8x the blocked kernel for prefill at
+ * N>=128 (the W-pack is a fixed cost that amortizes with N). BF16 activations
+ * (model-native precision; relL2 ~2.7e-3 vs blocked's 2e-7). Enable: TF_PODD=1.
+ * Needs n_rows%32==0 (all gemma-4 12B dims are); token remainder handled by padding. */
+extern void sgemm_bf16_2x12(int64_t K, const void *A, const void *B, float *C, int64_t ldc);
+static uint16_t *tf_podd_Wp = NULL, *tf_podd_Xa = NULL;
+static size_t tf_podd_Wcap = 0, tf_podd_Xcap = 0;
+static uint16_t *tf_podd_Xnext = NULL;
+static size_t tf_podd_Xnext_cap = 0;
+static const float *tf_podd_cache_x = NULL;
+static int tf_podd_cache_n = 0, tf_podd_cache_k = 0, tf_podd_cache_xs = 0;
+static float tf_podd_cache_tag[8];
+/* pack one [n_rows][K] BF16 weight -> k-major interleaved (the p_odd A layout). */
+static void tf_podd_pack_w(const uint16_t *W, uint16_t *Wp, int n_rows, int K, int nt) {
+    const int PMR = 32; int FT = n_rows / PMR;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int ft = 0; ft < FT; ft++) { uint16_t *dst = Wp + (size_t)ft * K * PMR;
+        for (int k = 0; k < K; k++) for (int i = 0; i < 16; i++) {
+            dst[k*PMR + 2*i]   = W[(size_t)(ft*PMR + i)     * K + k];
+            dst[k*PMR + 2*i+1] = W[(size_t)(ft*PMR + 16 + i) * K + k]; } }
+}
+static int tf_gemm_bf16_podd(float *Y, const uint16_t *W, const float *X,
+        int n_rows, int K, int N, int Ys, int Xs, int nt, int prepacked) {
+    const int PMR = 32, PNR = 12;
+    if (n_rows % PMR) return 0;
+    int FT = n_rows / PMR, TT = (N + PNR - 1) / PNR;
+    size_t xn = (size_t)TT * K * PNR * 2;
+    static int cmg_local = -1;
+    if (cmg_local < 0) {
+        const char *e = getenv("TF_PODD_CMG");
+        cmg_local = e && atoi(e) != 0;
+    }
+    int ncmg = cmg_local && nt >= 4 ? 4 : 1;
+    const uint16_t *Wp;
+    if (prepacked) {
+        Wp = W;   /* data already k-major interleaved (packed at load) */
+    } else {
+        size_t wn = (size_t)FT * K * PMR * 2;
+        if (wn > tf_podd_Wcap) { free(tf_podd_Wp); tf_podd_Wp = (uint16_t *)malloc(wn); tf_podd_Wcap = tf_podd_Wp ? wn : 0; }
+        if (!tf_podd_Wp) return 0;
+        tf_podd_pack_w(W, tf_podd_Wp, n_rows, K, nt);
+        Wp = tf_podd_Wp;
+    }
+    size_t xalloc = xn * (size_t)ncmg;
+    if (xalloc > tf_podd_Xcap) {
+        free(tf_podd_Xa);
+        tf_podd_Xa = (uint16_t *)tf_aligned_alloc_notouch(256, xalloc);
+        tf_podd_Xcap = tf_podd_Xa ? xalloc : 0;
+        tf_podd_cache_x = NULL;
+    }
+    if (!tf_podd_Xa) return 0;
+    uint16_t *Xa = tf_podd_Xa;
+    static int reuse_x = -1;
+    if (reuse_x < 0) {
+        const char *e = getenv("TF_PODD_REUSE_X");
+        reuse_x = !e || atoi(e) != 0;
+    }
+    float xtag[8]; size_t xcount = (size_t)N * Xs;
+    for (int i = 0; i < 8; i++) xtag[i] = X[xcount * (size_t)i / 8];
+    int xhit = reuse_x && tf_podd_cache_x == X && tf_podd_cache_n == N &&
+               tf_podd_cache_k == K && tf_podd_cache_xs == Xs;
+    for (int i = 0; i < 8 && xhit; i++) xhit = tf_podd_cache_tag[i] == xtag[i];
+    /* pack X -> k-major BF16 (transpose + fp32->BF16). SVE: per token, load contiguous
+     * fp32, BF16 = top 16 bits (lsr#16 + halfword scatter to Xb[k*12+n], stride 12). */
+    /* collapse(tt,n): TT*PNR work units so ALL nt threads pack (was TT-only -> for
+     * ffn_down TT=10 starved 38 threads while K=15360 made each unit 4x heavier). */
+    if (!xhit) {
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    {
+        int tid = 0, team = 1;
+    #ifdef _OPENMP
+        tid = omp_get_thread_num(); team = omp_get_num_threads();
+    #endif
+        int cmg = ncmg == 4 ? 4 * tid / team : 0;
+        int t0 = ncmg == 4 ? team * cmg / 4 : 0;
+        int t1 = ncmg == 4 ? team * (cmg + 1) / 4 : team;
+        int ltid = tid - t0, lteam = t1 - t0;
+        uint16_t *Xc = Xa + (size_t)cmg * xn / 2;
+        for (int z = ltid; z < TT * PNR; z += lteam) {
+            int tt = z / PNR, n = z % PNR;
+            uint16_t *Xb = Xc + (size_t)tt * K * PNR;
+            int tok = tt * PNR + n;
+            if (tok >= N) {
+                for (int k = 0; k < K; k++) Xb[k * PNR + n] = 0;
+                continue;
+            }
+            const float *xr = X + (size_t)tok * Xs;
+            svuint32_t lanes = svindex_u32(0, (uint32_t)PNR);
+            for (int k = 0; k < K; k += (int)svcntw()) {
+                svbool_t pg = svwhilelt_b32(k, K);
+                svuint32_t hu = svlsr_n_u32_x(pg,
+                    svreinterpret_u32_f32(svld1_f32(pg, xr + k)), 16);
+                svuint32_t idx = svadd_n_u32_x(pg, lanes,
+                                               (uint32_t)(k * PNR + n));
+                svst1h_scatter_u32index_u32(pg, Xb, idx, hu);
+            }
+        }
+    }
+    }
+    if (!xhit) {
+        tf_podd_cache_x = X; tf_podd_cache_n = N;
+        tf_podd_cache_k = K; tf_podd_cache_xs = Xs;
+        for (int i = 0; i < 8; i++) tf_podd_cache_tag[i] = xtag[i];
+    }
+    /* kernel per (feat-tile, tok-tile); transpose col-major C -> token-major Y.
+     * For large K (e.g. ffn_down K=15360) the 32xK W strip (983 KB) x12 cores
+     * overflows the 8 MB CMG L2 -> thrashes, re-streaming W across tok-tiles
+     * (~22% peak vs ~63% at K=3840). Fix: K-PANEL OUTERMOST so a 32xKc W
+     * sub-strip (256 KB; 12 cores = 3 MB, L2-resident) is reused across ALL
+     * tok-tiles, accumulating C across panels. Barrier between panels (the omp
+     * for) + static schedule => each (ft,tt) handled by the same thread each
+     * panel => disjoint Y writes, no races. */
+    if (K > 6144) {
+        const int Kc = 4096; int NP = (K + Kc - 1) / Kc;
+        #ifdef _OPENMP
+        #pragma omp parallel num_threads(nt)
+        #endif
+        {
+          float Ct[32 * 12]; int tid = 0, team = 1;
+          #ifdef _OPENMP
+          tid = omp_get_thread_num(); team = omp_get_num_threads();
+          #endif
+          int cmg = ncmg == 4 ? 4 * tid / team : 0;
+          int t0 = ncmg == 4 ? team * cmg / 4 : 0;
+          int t1 = ncmg == 4 ? team * (cmg + 1) / 4 : team;
+          int ltid = tid - t0, lteam = t1 - t0;
+          int ft0 = ncmg == 4 ? FT * cmg / 4 : 0;
+          int ft1 = ncmg == 4 ? FT * (cmg + 1) / 4 : FT;
+          const uint16_t *Xc = Xa + (size_t)cmg * xn / 2;
+          for (int ft = ft0 + ltid; ft < ft1; ft += lteam) {
+            for (int kp = 0; kp < NP; kp++) {
+              int k0 = kp * Kc, kk = (K - k0 < Kc) ? (K - k0) : Kc;
+              for (int tt = 0; tt < TT; tt++) {
+                  sgemm_bf16_2x12(kk, Wp + (size_t)ft*K*PMR + (size_t)k0*PMR,
+                                  Xc + (size_t)tt*K*PNR + (size_t)k0*PNR, Ct, PMR);
+                  for (int n = 0; n < PNR; n++) { int tok = tt*PNR + n; if (tok >= N) continue;
+                      float *yp = Y + (size_t)tok * Ys + ft*PMR;
+                      if (kp == 0) for (int mm = 0; mm < PMR; mm++) yp[mm]  = Ct[mm + n*PMR];
+                      else         for (int mm = 0; mm < PMR; mm++) yp[mm] += Ct[mm + n*PMR];
+                  }
+              }
+            }
+          }
+        }
+        return 1;
+    }
+    static int direct_out = -1;
+    if (direct_out < 0) {
+        const char *e = getenv("TF_PODD_DIRECT_OUT");
+        direct_out = !e || atoi(e) != 0;
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    {
+      float Ct[32 * 12]; int tid = 0, team = 1;
+      #ifdef _OPENMP
+      tid = omp_get_thread_num(); team = omp_get_num_threads();
+      #endif
+      int cmg = ncmg == 4 ? 4 * tid / team : 0;
+      int t0 = ncmg == 4 ? team * cmg / 4 : 0;
+      int t1 = ncmg == 4 ? team * (cmg + 1) / 4 : team;
+      int ltid = tid - t0, lteam = t1 - t0;
+      int ft0 = ncmg == 4 ? FT * cmg / 4 : 0;
+      int ft1 = ncmg == 4 ? FT * (cmg + 1) / 4 : FT;
+      const uint16_t *Xc = Xa + (size_t)cmg * xn / 2;
+      for (int ft = ft0 + ltid; ft < ft1; ft += lteam) for (int tt = 0; tt < TT; tt++) {
+          int tok0 = tt * PNR;
+          if (direct_out && tok0 + PNR <= N) {
+              sgemm_bf16_2x12(K, Wp + (size_t)ft*K*PMR,
+                              Xc + (size_t)tt*K*PNR,
+                              Y + (size_t)tok0*Ys + ft*PMR, Ys);
+          } else {
+              sgemm_bf16_2x12(K, Wp + (size_t)ft*K*PMR,
+                              Xc + (size_t)tt*K*PNR, Ct, PMR);
+              for (int n = 0; n < PNR; n++) {
+                  int tok = tok0 + n; if (tok >= N) continue;
+                  float *yp = Y + (size_t)tok * Ys + ft*PMR;
+#if defined(__ARM_FEATURE_SVE)
+                  svbool_t pg = svptrue_b32();
+                  svst1(pg, yp, svld1(pg, Ct + n*PMR));
+                  svst1(pg, yp + 16, svld1(pg, Ct + n*PMR + 16));
+#else
+                  memcpy(yp, Ct + n*PMR, PMR * sizeof(float));
+#endif
+              }
+          }
+      } }
+    return 1;
+}
+/* Combined QKV podd GEMM: q/k/v share the SAME input X and K, so pack X ONCE and run
+ * the 3 prepacked weights' tiles in ONE OMP region (nowait between them). Saves 2
+ * X-packs + 2 fork/joins vs 3 separate calls, and combines the small 2048-row k/v
+ * GEMMs (which parallelize poorly alone) with q into one balanced sweep. Prepacked
+ * weights only, K<=6144 (no K-blocking needed at K=n_embd). */
+static int tf_gemm_bf16_podd_qkv(float *Yq, float *Yk, float *Yv,
+        const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv, const float *X,
+        int rq, int rk, int rv, int K, int N, int Ysq, int Ysk, int Ysv, int Xs, int nt) {
+    const int PMR = 32, PNR = 12;
+    if (rq % PMR || rk % PMR || rv % PMR || K > 6144) return 0;
+    int TT = (N + PNR - 1) / PNR;
+    size_t xn = (size_t)TT * K * PNR * 2;
+    if (xn > tf_podd_Xcap) { free(tf_podd_Xa); tf_podd_Xa = (uint16_t *)malloc(xn); tf_podd_Xcap = tf_podd_Xa ? xn : 0; }
+    if (!tf_podd_Xa) return 0;
+    tf_podd_cache_x = NULL;
+    uint16_t *Xa = tf_podd_Xa;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static) collapse(2)
+    #endif
+    for (int tt = 0; tt < TT; tt++) for (int n = 0; n < PNR; n++) {
+            uint16_t *Xb = Xa + (size_t)tt * K * PNR;
+            int tok = tt*PNR + n;
+            if (tok >= N) { for (int k = 0; k < K; k++) Xb[k*PNR + n] = 0; continue; }
+            const float *xs = X + (size_t)tok * Xs;
+            svuint32_t lanes = svindex_u32(0, (uint32_t)PNR);
+            for (int k = 0; k < K; k += (int)svcntw()) { svbool_t pg = svwhilelt_b32(k, K);
+                svuint32_t hu = svlsr_n_u32_x(pg, svreinterpret_u32_f32(svld1_f32(pg, xs + k)), 16);
+                svuint32_t idx = svadd_n_u32_x(pg, lanes, (uint32_t)(k*PNR + n));
+                svst1h_scatter_u32index_u32(pg, (uint16_t *)Xb, idx, hu); } }
+    static int direct_out = -1;
+    if (direct_out < 0) {
+        const char *e = getenv("TF_PODD_DIRECT_OUT");
+        direct_out = !e || atoi(e) != 0;
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    { float Ct[32 * 12];
+      #define TF_QKV_TILE(FT, W, Y, Ys) \
+        for (int ft = 0; ft < (FT); ft++) for (int tt = 0; tt < TT; tt++) { \
+            int tok0 = tt * PNR; \
+            if (direct_out && tok0 + PNR <= N) { \
+                sgemm_bf16_2x12(K, (W) + (size_t)ft*K*PMR, Xa + (size_t)tt*K*PNR, \
+                    (Y) + (size_t)tok0*(Ys) + ft*PMR, (Ys)); \
+            } else { \
+                sgemm_bf16_2x12(K, (W) + (size_t)ft*K*PMR, Xa + (size_t)tt*K*PNR, Ct, PMR); \
+                for (int n = 0; n < PNR; n++) { int tok = tok0+n; if (tok >= N) continue; \
+                    memcpy((Y)+(size_t)tok*(Ys)+ft*PMR, Ct+n*PMR, PMR*sizeof(float)); } } }
+      #ifdef _OPENMP
+      #pragma omp for schedule(static) collapse(2)
+      #endif
+      TF_QKV_TILE(rq / PMR, Wq, Yq, Ysq)
+      #ifdef _OPENMP
+      #pragma omp for schedule(static) collapse(2)
+      #endif
+      TF_QKV_TILE(rk / PMR, Wk, Yk, Ysk)
+      #ifdef _OPENMP
+      #pragma omp for schedule(static) collapse(2)
+      #endif
+      TF_QKV_TILE(rv / PMR, Wv, Yv, Ysv)
+      #undef TF_QKV_TILE
+    }
+    return 1;
+}
+
+/* Consume an already p_odd-packed activation without inspecting/repacking a
+ * token-major FP32 source. Used by the fused FFN up->SiLU->down path. */
+static int tf_podd_compute_packed(float *Y, const uint16_t *Wp,
+        const uint16_t *Xa, int n_rows, int K, int N, int Ys, int nt) {
+    const int PMR = 32, PNR = 12;
+    if (!Wp || !Xa || n_rows % PMR) return 0;
+    int FT = n_rows / PMR, TT = (N + PNR - 1) / PNR;
+    if (K > 6144) {
+        const int Kc = 4096; int NP = (K + Kc - 1) / Kc;
+        #ifdef _OPENMP
+        #pragma omp parallel num_threads(nt)
+        #endif
+        {
+            int tid = 0, team = 1; float Ct[PMR * PNR];
+            #ifdef _OPENMP
+            tid = omp_get_thread_num(); team = omp_get_num_threads();
+            #endif
+            for (int ft = tid; ft < FT; ft += team) for (int kp = 0; kp < NP; kp++) {
+                int k0 = kp * Kc, kk = K - k0 < Kc ? K - k0 : Kc;
+                for (int tt = 0; tt < TT; tt++) {
+                    sgemm_bf16_2x12(kk, Wp + (size_t)ft * K * PMR + (size_t)k0 * PMR,
+                        Xa + (size_t)tt * K * PNR + (size_t)k0 * PNR, Ct, PMR);
+                    for (int n = 0; n < PNR; n++) {
+                        int tok = tt * PNR + n; if (tok >= N) continue;
+                        float *yp = Y + (size_t)tok * Ys + ft * PMR;
+                        for (int m = 0; m < PMR; m++) {
+                            float v = Ct[m + n * PMR];
+                            if (kp == 0) yp[m] = v; else yp[m] += v;
+                        }
+                    }
+                }
+            }
+        }
+        return 1;
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    {
+        int tid = 0, team = 1; float Ct[PMR * PNR];
+        #ifdef _OPENMP
+        tid = omp_get_thread_num(); team = omp_get_num_threads();
+        #endif
+        for (int ft = tid; ft < FT; ft += team) for (int tt = 0; tt < TT; tt++) {
+            int tok0 = tt * PNR;
+            if (tok0 + PNR <= N)
+                sgemm_bf16_2x12(K, Wp + (size_t)ft * K * PMR,
+                    Xa + (size_t)tt * K * PNR,
+                    Y + (size_t)tok0 * Ys + ft * PMR, Ys);
+            else {
+                sgemm_bf16_2x12(K, Wp + (size_t)ft * K * PMR,
+                    Xa + (size_t)tt * K * PNR, Ct, PMR);
+                for (int n = 0; n < PNR; n++) {
+                    int tok = tok0 + n; if (tok >= N) continue;
+                    memcpy(Y + (size_t)tok * Ys + ft * PMR,
+                           Ct + n * PMR, PMR * sizeof(float));
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+/* Run 2-3 same-input, prepacked p-odd projections in one barrier-free tile
+ * queue. All Qwen input projections have K=5120, so no large-K accumulation
+ * is required here. */
+static int tf_podd_compute_multi(float *Y0, const uint16_t *W0, int R0, int Ys0,
+        float *Y1, const uint16_t *W1, int R1, int Ys1,
+        float *Y2, const uint16_t *W2, int R2, int Ys2,
+        const uint16_t *Xa, int K, int N, int nt) {
+    const int PMR=32,PNR=12;
+    if(!Y0||!W0||!Y1||!W1||!Xa||K>6144||R0%PMR||R1%PMR||
+       (Y2&&(!W2||R2%PMR)))return 0;
+    int TT=(N+PNR-1)/PNR;
+    int n0=(R0/PMR)*TT,n1=(R1/PMR)*TT,n2=Y2?(R2/PMR)*TT:0;
+    int total=n0+n1+n2;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for(int z=0;z<total;z++){
+        float *Y;const uint16_t*W;int Ys,u;
+        if(z<n0){Y=Y0;W=W0;Ys=Ys0;u=z;}
+        else if(z<n0+n1){Y=Y1;W=W1;Ys=Ys1;u=z-n0;}
+        else{Y=Y2;W=W2;Ys=Ys2;u=z-n0-n1;}
+        int ft=u/TT,tt=u%TT,tok0=tt*PNR;
+        if(tok0+PNR<=N){
+            sgemm_bf16_2x12(K,W+(size_t)ft*K*PMR,
+                Xa+(size_t)tt*K*PNR,Y+(size_t)tok0*Ys+ft*PMR,Ys);
+        }else{
+            float Ct[PMR*PNR];
+            sgemm_bf16_2x12(K,W+(size_t)ft*K*PMR,
+                Xa+(size_t)tt*K*PNR,Ct,PMR);
+            for(int n=0;n<PNR;n++){
+                int tok=tok0+n;if(tok>=N)continue;
+                memcpy(Y+(size_t)tok*Ys+ft*PMR,Ct+n*PMR,PMR*sizeof(float));
+            }
+        }
+    }
+    return 1;
+}
+
+/* Gate has already populated Ygate and left its normalized input in tf_podd_Xa.
+ * Evaluate up, apply the production SVE SiLU, truncate directly into the p_odd
+ * activation layout required by down, then run down without FP32 up/inner
+ * buffers or a separate activation pack. */
+static int tf_gemm_bf16_podd_ffn_up_down(float *Y, float *Ygate,
+        const uint16_t *Wup, const uint16_t *Wdown, int local_ff,
+        int ne, int N, int nt) {
+    const int PMR = 32, PNR = 12;
+    if (!Wup || !Wdown || !tf_podd_Xa || local_ff % PMR || ne % PMR) return 0;
+    int FT = local_ff / PMR, TT = (N + PNR - 1) / PNR;
+    size_t elems = (size_t)TT * local_ff * PNR;
+    size_t bytes = elems * sizeof(uint16_t);
+    if (bytes > tf_podd_Xnext_cap) {
+        free(tf_podd_Xnext);
+        tf_podd_Xnext = (uint16_t *)tf_aligned_alloc_notouch(256, bytes);
+        tf_podd_Xnext_cap = tf_podd_Xnext ? bytes : 0;
+    }
+    if (!tf_podd_Xnext) return 0;
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    {
+        int tid = 0, team = 1; float Ct[PMR * PNR];
+        #ifdef _OPENMP
+        tid = omp_get_thread_num(); team = omp_get_num_threads();
+        #endif
+        for (int ft = tid; ft < FT; ft += team) for (int tt = 0; tt < TT; tt++) {
+            sgemm_bf16_2x12(ne, Wup + (size_t)ft * ne * PMR,
+                tf_podd_Xa + (size_t)tt * ne * PNR, Ct, PMR);
+            uint16_t *Xd = tf_podd_Xnext + (size_t)tt * local_ff * PNR;
+            for (int n = 0; n < PNR; n++) {
+                int tok = tt * PNR + n;
+#if defined(__ARM_FEATURE_SVE)
+                for (int m = 0; m < PMR; m += (int)svcntw()) {
+                    svbool_t pg = svwhilelt_b32((uint64_t)m, (uint64_t)PMR);
+                    svfloat32_t y = svdup_f32(0.0f);
+                    if (tok < N) {
+                        svfloat32_t g = svld1(pg,
+                            Ygate + (size_t)tok * local_ff + ft * PMR + m);
+                        svfloat32_t z = svmul_n_f32_x(pg, g, -1.4426950408889634f);
+                        z = svmax_n_f32_x(pg, svmin_n_f32_x(pg, z, 80.0f), -80.0f);
+                        svfloat32_t den = svadd_n_f32_x(pg,
+                            tf_exp2_fexpa_approx_sve(pg, z), 1.0f);
+                        svfloat32_t inv = svrecpe_f32(den);
+                        inv = svmul_f32_x(pg, inv, svrecps_f32(den, inv));
+                        y = svmul_f32_x(pg, svmul_f32_x(pg, g, inv),
+                                       svld1(pg, Ct + n * PMR + m));
+                    }
+                    svuint32_t u = svlsr_n_u32_x(pg, svreinterpret_u32_f32(y), 16);
+                    svuint32_t idx = svindex_u32((uint32_t)((ft * PMR + m) * PNR + n),
+                                                 (uint32_t)PNR);
+                    svst1h_scatter_u32index_u32(pg, Xd, idx, u);
+                }
+#else
+                for (int m = 0; m < PMR; m++) {
+                    float y = 0.0f;
+                    if (tok < N) {
+                        float g = Ygate[(size_t)tok * local_ff + ft * PMR + m];
+                        y = g / (1.0f + expf(-g)) * Ct[m + n * PMR];
+                    }
+                    uint32_t u; memcpy(&u, &y, sizeof(u));
+                    Xd[((size_t)ft * PMR + m) * PNR + n] = (uint16_t)(u >> 16);
+                }
+#endif
+            }
+        }
+    }
+    return tf_podd_compute_packed(Y, Wdown, tf_podd_Xnext,
+                                  ne, local_ff, N, ne, nt);
+}
+/* Pre-pack small-K BF16 weights (gate/up/q/k/v) IN-PLACE to k-major-interleaved so
+ * the p_odd GEMM skips the per-call W-pack (~2.5x the on-the-fly podd: 1767->4499 GF
+ * standalone). In-place via one temp (no extra steady memory). This changes the row-
+ * major layout -> BREAKS the decode matvec for these weights => PREFILL-ONLY; the
+ * harness calls this only when it will prefill with TF_PODD. */
+int transformer_prepack_podd_range(transformer_model *m,int l0,int l1) {
+    if (!m || !m->layers) return 0;
+    if(l0<0)l0=0;if(l1>m->n_layers)l1=m->n_layers;
+    size_t maxsz = 0;
+    for (int l = l0; l < l1; l++) {
+        qtensor *ws[] = {&m->layers[l].ffn_gate, &m->layers[l].ffn_up, &m->layers[l].ffn_down,
+                         &m->layers[l].attn_q, &m->layers[l].attn_k, &m->layers[l].attn_v,
+                         &m->layers[l].attn_output,&m->layers[l].ssm_qkv,
+                         &m->layers[l].ssm_gate,&m->layers[l].ssm_alpha,
+                         &m->layers[l].ssm_beta,&m->layers[l].ssm_out};
+        for (int i = 0; i < 12; i++) if (ws[i]->data && ws[i]->type == GGML_TYPE_BF16) {
+            size_t s = (size_t)ws[i]->n_rows * ws[i]->n_cols * 2;
+            if (s > maxsz) maxsz = s;
+        }
+    }
+    if (!maxsz) return 0;
+    uint16_t *tmp = (uint16_t *)malloc(maxsz);
+    if (!tmp) { fprintf(stderr, "podd prepack: tmp alloc failed (%zu)\n", maxsz); return 0; }
+    int nt = m->n_threads > 1 ? m->n_threads : 1, cnt = 0;
+    for (int l = l0; l < l1; l++) {
+        qtensor *ws[] = {&m->layers[l].ffn_gate, &m->layers[l].ffn_up, &m->layers[l].ffn_down,
+                         &m->layers[l].attn_q, &m->layers[l].attn_k, &m->layers[l].attn_v,
+                         &m->layers[l].attn_output,&m->layers[l].ssm_qkv,
+                         &m->layers[l].ssm_gate,&m->layers[l].ssm_alpha,
+                         &m->layers[l].ssm_beta,&m->layers[l].ssm_out};
+        for (int i = 0; i < 12; i++) { qtensor *w = ws[i];
+            if (!w->data || w->type != GGML_TYPE_BF16 || w->podd_packed) continue;
+            int n_rows = w->n_rows, K = w->n_cols;
+            if (n_rows % 32) continue;          /* kernel needs MR=32 row tiles */
+            tf_podd_pack_w((const uint16_t *)w->data, tmp, n_rows, K, nt);
+            memcpy(w->data, tmp, (size_t)n_rows * K * 2);
+            w->podd_packed = 1; cnt++;
+        }
+    }
+    free(tmp);
+    fprintf(stderr, "podd prepack: layers=[%d,%d) %d BF16 weights packed (prefill-only)\n",l0,l1,cnt);
+    return cnt;
+}
+void transformer_prepack_podd(transformer_model *m) {
+    if(m) (void)transformer_prepack_podd_range(m,0,m->n_layers);
+}
+#define TF_HAVE_BF16_PODD 1
+#endif /* TF_LINK_PODD */
+#endif /* __ARM_FEATURE_SVE */
+
 static void *tf_gemm_bf16_tm_worker(void *arg) {
     tf_gemm_tm_task *t = (tf_gemm_tm_task *)arg;
     int nrows = t->row_end - t->row_start;
@@ -4471,6 +11724,14 @@ typedef struct {
     int K, N, Y_stride, X_stride;
 } tf_gemm_q8_tm_task;
 
+typedef struct {
+    float *Y;
+    const qtensor *mat;
+    const float *X;
+    int row_start, row_end;
+    int K, N, Y_stride, X_stride;
+} tf_gemm_qtensor_tm_task;
+
 static void *tf_gemm_q8_tm_worker(void *arg) {
     tf_gemm_q8_tm_task *t = (tf_gemm_q8_tm_task *)arg;
     int nrows = t->row_end - t->row_start;
@@ -4482,11 +11743,1144 @@ static void *tf_gemm_q8_tm_worker(void *arg) {
     return NULL;
 }
 
+static void *tf_gemm_qtensor_tm_worker(void *arg) {
+    tf_gemm_qtensor_tm_task *t = (tf_gemm_qtensor_tm_task *)arg;
+    float *row_buf = (float *)malloc((size_t)t->K * sizeof(float));
+    if (!row_buf) return NULL;
+    size_t rb = tf_row_bytes(t->mat->type, t->K);
+    for (int r = t->row_start; r < t->row_end; r++) {
+        const void *row_data = (const uint8_t *)t->mat->data + (size_t)r * rb;
+        dequant_row(t->mat->type, row_data, row_buf, t->K);
+        for (int tok = 0; tok < t->N; tok++) {
+            const float *xt = t->X + (size_t)tok * t->X_stride;
+            float sum = 0.0f;
+            for (int k = 0; k < t->K; k++) sum += row_buf[k] * xt[k];
+            t->Y[(size_t)tok * t->Y_stride + r] = sum;
+        }
+    }
+    free(row_buf);
+    return NULL;
+}
+
+static void *tf_gemm_q4_0_tm_worker(void *arg) {
+    tf_gemm_qtensor_tm_task *t = (tf_gemm_qtensor_tm_task *)arg;
+    const int nb = t->K / 32;
+    const block_q4_0 *rows = (const block_q4_0 *)t->mat->data;
+    for (int r = t->row_start; r < t->row_end; r++) {
+        const block_q4_0 *row = rows + (size_t)r * nb;
+        int tok = 0;
+        for (; tok + 3 < t->N; tok += 4) {
+            const float *x0 = t->X + (size_t)(tok + 0) * t->X_stride;
+            const float *x1 = t->X + (size_t)(tok + 1) * t->X_stride;
+            const float *x2 = t->X + (size_t)(tok + 2) * t->X_stride;
+            const float *x3 = t->X + (size_t)(tok + 3) * t->X_stride;
+            float s0, s1, s2, s3;
+            tf_vec_dot_q4_0_f32_4x(row, x0, x1, x2, x3, t->K, &s0, &s1, &s2, &s3);
+            t->Y[(size_t)(tok + 0) * t->Y_stride + r] = s0;
+            t->Y[(size_t)(tok + 1) * t->Y_stride + r] = s1;
+            t->Y[(size_t)(tok + 2) * t->Y_stride + r] = s2;
+            t->Y[(size_t)(tok + 3) * t->Y_stride + r] = s3;
+        }
+        for (; tok < t->N; tok++) {
+            const float *x = t->X + (size_t)tok * t->X_stride;
+            float s = tf_vec_dot_q4_0_f32(row, x, t->K);
+            t->Y[(size_t)tok * t->Y_stride + r] = s;
+        }
+    }
+    return NULL;
+}
+
+typedef struct {
+    float *Y;
+    const qtensor *gate;
+    const qtensor *up;
+    const float *X;
+    int row_start, row_end;
+    int K, N, Y_stride, X_stride;
+} tf_gemm_q4_pair_gelu_task;
+
+static inline void tf_vec_dot_q4_0_pair_f32(const block_q4_0 *gate,
+                                             const block_q4_0 *up,
+                                             const float *x, int n_cols,
+                                             float *sg, float *su) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t ag = svdup_f32(0.0f), au = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(gate->qs, 0, 0);
+        __builtin_prefetch(up->qs, 0, 0);
+    }
+    for (int b = 0; b < nb; b++) {
+        const int base = b * 32;
+        svfloat32_t xlo = svld1(pg, x + base);
+        svfloat32_t xhi = svld1(pg, x + base + 16);
+
+        svuint32_t qg = svld1ub_u32(pg, gate[b].qs);
+        svint32_t qglo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qg, 0x0f)), 8);
+        svint32_t qghi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qg, 4)), 8);
+        float dg = ggml_fp16_to_fp32(gate[b].d);
+        ag = svmla_x(pg, ag, svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qglo), dg), xlo);
+        ag = svmla_x(pg, ag, svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qghi), dg), xhi);
+
+        svuint32_t qu = svld1ub_u32(pg, up[b].qs);
+        svint32_t qulo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qu, 0x0f)), 8);
+        svint32_t quhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qu, 4)), 8);
+        float du = ggml_fp16_to_fp32(up[b].d);
+        au = svmla_x(pg, au, svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qulo), du), xlo);
+        au = svmla_x(pg, au, svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, quhi), du), xhi);
+        if (b + 1 < nb) {
+            __builtin_prefetch(gate[b+1].qs, 0, 0);
+            __builtin_prefetch(up[b+1].qs, 0, 0);
+        }
+    }
+    *sg = svaddv_f32(pg, ag);
+    *su = svaddv_f32(pg, au);
+#else
+    float gsum = 0.0f, usum = 0.0f;
+    int nb = n_cols / 32;
+    for (int b = 0; b < nb; b++) {
+        float dg = ggml_fp16_to_fp32(gate[b].d);
+        float du = ggml_fp16_to_fp32(up[b].d);
+        const int base = b * 32;
+        for (int j = 0; j < 16; j++) {
+            uint8_t qg = gate[b].qs[j];
+            uint8_t qu = up[b].qs[j];
+            gsum += ((float)((int)(qg & 0x0f) - 8) * dg) * x[base + j];
+            gsum += ((float)((int)(qg >> 4) - 8) * dg) * x[base + j + 16];
+            usum += ((float)((int)(qu & 0x0f) - 8) * du) * x[base + j];
+            usum += ((float)((int)(qu >> 4) - 8) * du) * x[base + j + 16];
+        }
+    }
+    *sg = gsum;
+    *su = usum;
+#endif
+}
+
+static inline void tf_vec_dot_q4_0_pair_f32_4x(const block_q4_0 *gate,
+                                                const block_q4_0 *up,
+                                                const float *x0, const float *x1,
+                                                const float *x2, const float *x3,
+                                                int n_cols,
+                                                float *g0, float *g1,
+                                                float *g2, float *g3,
+                                                float *u0, float *u1,
+                                                float *u2, float *u3) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t ag0 = svdup_f32(0.0f), ag1 = svdup_f32(0.0f);
+    svfloat32_t ag2 = svdup_f32(0.0f), ag3 = svdup_f32(0.0f);
+    svfloat32_t au0 = svdup_f32(0.0f), au1 = svdup_f32(0.0f);
+    svfloat32_t au2 = svdup_f32(0.0f), au3 = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(gate->qs, 0, 0);
+        __builtin_prefetch(up->qs, 0, 0);
+    }
+    for (int b = 0; b < nb; b++) {
+        const int base = b * 32;
+        svfloat32_t x0lo = svld1(pg, x0 + base);
+        svfloat32_t x0hi = svld1(pg, x0 + base + 16);
+        svfloat32_t x1lo = svld1(pg, x1 + base);
+        svfloat32_t x1hi = svld1(pg, x1 + base + 16);
+        svfloat32_t x2lo = svld1(pg, x2 + base);
+        svfloat32_t x2hi = svld1(pg, x2 + base + 16);
+        svfloat32_t x3lo = svld1(pg, x3 + base);
+        svfloat32_t x3hi = svld1(pg, x3 + base + 16);
+
+        svuint32_t qg = svld1ub_u32(pg, gate[b].qs);
+        svint32_t qglo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qg, 0x0f)), 8);
+        svint32_t qghi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qg, 4)), 8);
+        float dg = ggml_fp16_to_fp32(gate[b].d);
+        svfloat32_t wglo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qglo), dg);
+        svfloat32_t wghi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qghi), dg);
+        ag0 = svmla_x(pg, ag0, wglo, x0lo); ag0 = svmla_x(pg, ag0, wghi, x0hi);
+        ag1 = svmla_x(pg, ag1, wglo, x1lo); ag1 = svmla_x(pg, ag1, wghi, x1hi);
+        ag2 = svmla_x(pg, ag2, wglo, x2lo); ag2 = svmla_x(pg, ag2, wghi, x2hi);
+        ag3 = svmla_x(pg, ag3, wglo, x3lo); ag3 = svmla_x(pg, ag3, wghi, x3hi);
+
+        svuint32_t qu = svld1ub_u32(pg, up[b].qs);
+        svint32_t qulo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qu, 0x0f)), 8);
+        svint32_t quhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qu, 4)), 8);
+        float du = ggml_fp16_to_fp32(up[b].d);
+        svfloat32_t wulo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qulo), du);
+        svfloat32_t wuhi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, quhi), du);
+        au0 = svmla_x(pg, au0, wulo, x0lo); au0 = svmla_x(pg, au0, wuhi, x0hi);
+        au1 = svmla_x(pg, au1, wulo, x1lo); au1 = svmla_x(pg, au1, wuhi, x1hi);
+        au2 = svmla_x(pg, au2, wulo, x2lo); au2 = svmla_x(pg, au2, wuhi, x2hi);
+        au3 = svmla_x(pg, au3, wulo, x3lo); au3 = svmla_x(pg, au3, wuhi, x3hi);
+        if (b + 1 < nb) {
+            __builtin_prefetch(gate[b+1].qs, 0, 0);
+            __builtin_prefetch(up[b+1].qs, 0, 0);
+        }
+    }
+    *g0 = svaddv_f32(pg, ag0); *g1 = svaddv_f32(pg, ag1);
+    *g2 = svaddv_f32(pg, ag2); *g3 = svaddv_f32(pg, ag3);
+    *u0 = svaddv_f32(pg, au0); *u1 = svaddv_f32(pg, au1);
+    *u2 = svaddv_f32(pg, au2); *u3 = svaddv_f32(pg, au3);
+#else
+    tf_vec_dot_q4_0_pair_f32(gate, up, x0, n_cols, g0, u0);
+    tf_vec_dot_q4_0_pair_f32(gate, up, x1, n_cols, g1, u1);
+    tf_vec_dot_q4_0_pair_f32(gate, up, x2, n_cols, g2, u2);
+    tf_vec_dot_q4_0_pair_f32(gate, up, x3, n_cols, g3, u3);
+#endif
+}
+
+static inline void tf_vec_dot_q4_0_pair_f32_2r4x(const block_q4_0 *gate0,
+                                                  const block_q4_0 *up0,
+                                                  const block_q4_0 *gate1,
+                                                  const block_q4_0 *up1,
+                                                  const float *x0, const float *x1,
+                                                  const float *x2, const float *x3,
+                                                  int n_cols,
+                                                  float *g00, float *g01,
+                                                  float *g02, float *g03,
+                                                  float *u00, float *u01,
+                                                  float *u02, float *u03,
+                                                  float *g10, float *g11,
+                                                  float *g12, float *g13,
+                                                  float *u10, float *u11,
+                                                  float *u12, float *u13) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t ag00 = svdup_f32(0.0f), ag01 = svdup_f32(0.0f);
+    svfloat32_t ag02 = svdup_f32(0.0f), ag03 = svdup_f32(0.0f);
+    svfloat32_t au00 = svdup_f32(0.0f), au01 = svdup_f32(0.0f);
+    svfloat32_t au02 = svdup_f32(0.0f), au03 = svdup_f32(0.0f);
+    svfloat32_t ag10 = svdup_f32(0.0f), ag11 = svdup_f32(0.0f);
+    svfloat32_t ag12 = svdup_f32(0.0f), ag13 = svdup_f32(0.0f);
+    svfloat32_t au10 = svdup_f32(0.0f), au11 = svdup_f32(0.0f);
+    svfloat32_t au12 = svdup_f32(0.0f), au13 = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(gate0->qs, 0, 0);
+        __builtin_prefetch(up0->qs, 0, 0);
+        __builtin_prefetch(gate1->qs, 0, 0);
+        __builtin_prefetch(up1->qs, 0, 0);
+    }
+    for (int b = 0; b < nb; b++) {
+        const int base = b * 32;
+        svfloat32_t x0lo = svld1(pg, x0 + base), x0hi = svld1(pg, x0 + base + 16);
+        svfloat32_t x1lo = svld1(pg, x1 + base), x1hi = svld1(pg, x1 + base + 16);
+        svfloat32_t x2lo = svld1(pg, x2 + base), x2hi = svld1(pg, x2 + base + 16);
+        svfloat32_t x3lo = svld1(pg, x3 + base), x3hi = svld1(pg, x3 + base + 16);
+
+#define TF_Q4_ACC_ROW(GROW, UROW, AG0, AG1, AG2, AG3, AU0, AU1, AU2, AU3) do { \
+        svuint32_t qg = svld1ub_u32(pg, (GROW)[b].qs); \
+        svint32_t qglo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qg, 0x0f)), 8); \
+        svint32_t qghi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qg, 4)), 8); \
+        float dg = ggml_fp16_to_fp32((GROW)[b].d); \
+        svfloat32_t wglo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qglo), dg); \
+        svfloat32_t wghi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qghi), dg); \
+        AG0 = svmla_x(pg, AG0, wglo, x0lo); AG0 = svmla_x(pg, AG0, wghi, x0hi); \
+        AG1 = svmla_x(pg, AG1, wglo, x1lo); AG1 = svmla_x(pg, AG1, wghi, x1hi); \
+        AG2 = svmla_x(pg, AG2, wglo, x2lo); AG2 = svmla_x(pg, AG2, wghi, x2hi); \
+        AG3 = svmla_x(pg, AG3, wglo, x3lo); AG3 = svmla_x(pg, AG3, wghi, x3hi); \
+        svuint32_t qu = svld1ub_u32(pg, (UROW)[b].qs); \
+        svint32_t qulo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qu, 0x0f)), 8); \
+        svint32_t quhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qu, 4)), 8); \
+        float du = ggml_fp16_to_fp32((UROW)[b].d); \
+        svfloat32_t wulo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qulo), du); \
+        svfloat32_t wuhi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, quhi), du); \
+        AU0 = svmla_x(pg, AU0, wulo, x0lo); AU0 = svmla_x(pg, AU0, wuhi, x0hi); \
+        AU1 = svmla_x(pg, AU1, wulo, x1lo); AU1 = svmla_x(pg, AU1, wuhi, x1hi); \
+        AU2 = svmla_x(pg, AU2, wulo, x2lo); AU2 = svmla_x(pg, AU2, wuhi, x2hi); \
+        AU3 = svmla_x(pg, AU3, wulo, x3lo); AU3 = svmla_x(pg, AU3, wuhi, x3hi); \
+    } while (0)
+        TF_Q4_ACC_ROW(gate0, up0, ag00, ag01, ag02, ag03, au00, au01, au02, au03);
+        TF_Q4_ACC_ROW(gate1, up1, ag10, ag11, ag12, ag13, au10, au11, au12, au13);
+#undef TF_Q4_ACC_ROW
+        if (b + 1 < nb) {
+            __builtin_prefetch(gate0[b+1].qs, 0, 0);
+            __builtin_prefetch(up0[b+1].qs, 0, 0);
+            __builtin_prefetch(gate1[b+1].qs, 0, 0);
+            __builtin_prefetch(up1[b+1].qs, 0, 0);
+        }
+    }
+    *g00 = svaddv_f32(pg, ag00); *g01 = svaddv_f32(pg, ag01);
+    *g02 = svaddv_f32(pg, ag02); *g03 = svaddv_f32(pg, ag03);
+    *u00 = svaddv_f32(pg, au00); *u01 = svaddv_f32(pg, au01);
+    *u02 = svaddv_f32(pg, au02); *u03 = svaddv_f32(pg, au03);
+    *g10 = svaddv_f32(pg, ag10); *g11 = svaddv_f32(pg, ag11);
+    *g12 = svaddv_f32(pg, ag12); *g13 = svaddv_f32(pg, ag13);
+    *u10 = svaddv_f32(pg, au10); *u11 = svaddv_f32(pg, au11);
+    *u12 = svaddv_f32(pg, au12); *u13 = svaddv_f32(pg, au13);
+#else
+    tf_vec_dot_q4_0_pair_f32_4x(gate0, up0, x0, x1, x2, x3, n_cols,
+                                g00, g01, g02, g03, u00, u01, u02, u03);
+    tf_vec_dot_q4_0_pair_f32_4x(gate1, up1, x0, x1, x2, x3, n_cols,
+                                g10, g11, g12, g13, u10, u11, u12, u13);
+#endif
+}
+
+static inline void tf_vec_dot_q4_0_pair_f32_8x(const block_q4_0 *gate,
+                                                const block_q4_0 *up,
+                                                const float *x0, const float *x1,
+                                                const float *x2, const float *x3,
+                                                const float *x4, const float *x5,
+                                                const float *x6, const float *x7,
+                                                int n_cols,
+                                                float *g0, float *g1,
+                                                float *g2, float *g3,
+                                                float *g4, float *g5,
+                                                float *g6, float *g7,
+                                                float *u0, float *u1,
+                                                float *u2, float *u3,
+                                                float *u4, float *u5,
+                                                float *u6, float *u7) {
+#if defined(__ARM_FEATURE_SVE)
+    svfloat32_t ag0 = svdup_f32(0.0f), ag1 = svdup_f32(0.0f);
+    svfloat32_t ag2 = svdup_f32(0.0f), ag3 = svdup_f32(0.0f);
+    svfloat32_t ag4 = svdup_f32(0.0f), ag5 = svdup_f32(0.0f);
+    svfloat32_t ag6 = svdup_f32(0.0f), ag7 = svdup_f32(0.0f);
+    svfloat32_t au0 = svdup_f32(0.0f), au1 = svdup_f32(0.0f);
+    svfloat32_t au2 = svdup_f32(0.0f), au3 = svdup_f32(0.0f);
+    svfloat32_t au4 = svdup_f32(0.0f), au5 = svdup_f32(0.0f);
+    svfloat32_t au6 = svdup_f32(0.0f), au7 = svdup_f32(0.0f);
+    svbool_t pg = svptrue_b32();
+    int nb = n_cols / 32;
+    if (nb > 0) {
+        __builtin_prefetch(gate->qs, 0, 0);
+        __builtin_prefetch(up->qs, 0, 0);
+    }
+    for (int b = 0; b < nb; b++) {
+        const int base = b * 32;
+        svuint32_t qg = svld1ub_u32(pg, gate[b].qs);
+        svint32_t qglo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qg, 0x0f)), 8);
+        svint32_t qghi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qg, 4)), 8);
+        float dg = ggml_fp16_to_fp32(gate[b].d);
+        svfloat32_t wglo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qglo), dg);
+        svfloat32_t wghi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qghi), dg);
+        svuint32_t qu = svld1ub_u32(pg, up[b].qs);
+        svint32_t qulo = svsub_n_s32_x(pg, svreinterpret_s32_u32(svand_n_u32_x(pg, qu, 0x0f)), 8);
+        svint32_t quhi = svsub_n_s32_x(pg, svreinterpret_s32_u32(svlsr_n_u32_x(pg, qu, 4)), 8);
+        float du = ggml_fp16_to_fp32(up[b].d);
+        svfloat32_t wulo = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, qulo), du);
+        svfloat32_t wuhi = svmul_n_f32_x(pg, svcvt_f32_s32_x(pg, quhi), du);
+
+#define TF_Q4_ACC_TOKEN(IDX, XPTR, AG, AU) do { \
+        svfloat32_t xlo = svld1(pg, (XPTR) + base); \
+        svfloat32_t xhi = svld1(pg, (XPTR) + base + 16); \
+        AG = svmla_x(pg, AG, wglo, xlo); \
+        AG = svmla_x(pg, AG, wghi, xhi); \
+        AU = svmla_x(pg, AU, wulo, xlo); \
+        AU = svmla_x(pg, AU, wuhi, xhi); \
+    } while (0)
+        TF_Q4_ACC_TOKEN(0, x0, ag0, au0);
+        TF_Q4_ACC_TOKEN(1, x1, ag1, au1);
+        TF_Q4_ACC_TOKEN(2, x2, ag2, au2);
+        TF_Q4_ACC_TOKEN(3, x3, ag3, au3);
+        TF_Q4_ACC_TOKEN(4, x4, ag4, au4);
+        TF_Q4_ACC_TOKEN(5, x5, ag5, au5);
+        TF_Q4_ACC_TOKEN(6, x6, ag6, au6);
+        TF_Q4_ACC_TOKEN(7, x7, ag7, au7);
+#undef TF_Q4_ACC_TOKEN
+        if (b + 1 < nb) {
+            __builtin_prefetch(gate[b+1].qs, 0, 0);
+            __builtin_prefetch(up[b+1].qs, 0, 0);
+        }
+    }
+    *g0 = svaddv_f32(pg, ag0); *g1 = svaddv_f32(pg, ag1);
+    *g2 = svaddv_f32(pg, ag2); *g3 = svaddv_f32(pg, ag3);
+    *g4 = svaddv_f32(pg, ag4); *g5 = svaddv_f32(pg, ag5);
+    *g6 = svaddv_f32(pg, ag6); *g7 = svaddv_f32(pg, ag7);
+    *u0 = svaddv_f32(pg, au0); *u1 = svaddv_f32(pg, au1);
+    *u2 = svaddv_f32(pg, au2); *u3 = svaddv_f32(pg, au3);
+    *u4 = svaddv_f32(pg, au4); *u5 = svaddv_f32(pg, au5);
+    *u6 = svaddv_f32(pg, au6); *u7 = svaddv_f32(pg, au7);
+#else
+    tf_vec_dot_q4_0_pair_f32_4x(gate, up, x0, x1, x2, x3, n_cols,
+                                g0, g1, g2, g3, u0, u1, u2, u3);
+    tf_vec_dot_q4_0_pair_f32_4x(gate, up, x4, x5, x6, x7, n_cols,
+                                g4, g5, g6, g7, u4, u5, u6, u7);
+#endif
+}
+
+static void *tf_gemm_q4_0_pair_gelu_worker(void *arg) {
+    tf_gemm_q4_pair_gelu_task *t = (tf_gemm_q4_pair_gelu_task *)arg;
+    const int nb = t->K / 32;
+    const block_q4_0 *gate_rows = (const block_q4_0 *)t->gate->data;
+    const block_q4_0 *up_rows = (const block_q4_0 *)t->up->data;
+    const char *use_2r_env = getenv("TF_FFN_2R4X");
+    int use_2r4x = use_2r_env && atoi(use_2r_env) != 0;
+    const char *use_8x_env = getenv("TF_FFN_8X");
+    int use_8x = !use_8x_env || atoi(use_8x_env) != 0;
+    int r = t->row_start;
+    for (; use_2r4x && r + 1 < t->row_end; r += 2) {
+        const block_q4_0 *g0row = gate_rows + (size_t)r * nb;
+        const block_q4_0 *u0row = up_rows + (size_t)r * nb;
+        const block_q4_0 *g1row = g0row + nb;
+        const block_q4_0 *u1row = u0row + nb;
+        int tok = 0;
+        for (; tok + 3 < t->N; tok += 4) {
+            const float *x0 = t->X + (size_t)(tok + 0) * t->X_stride;
+            const float *x1 = t->X + (size_t)(tok + 1) * t->X_stride;
+            const float *x2 = t->X + (size_t)(tok + 2) * t->X_stride;
+            const float *x3 = t->X + (size_t)(tok + 3) * t->X_stride;
+            float g00, g01, g02, g03, u00, u01, u02, u03;
+            float g10, g11, g12, g13, u10, u11, u12, u13;
+            tf_vec_dot_q4_0_pair_f32_2r4x(g0row, u0row, g1row, u1row,
+                                          x0, x1, x2, x3, t->K,
+                                          &g00, &g01, &g02, &g03, &u00, &u01, &u02, &u03,
+                                          &g10, &g11, &g12, &g13, &u10, &u11, &u12, &u13);
+#if defined(__ARM_FEATURE_SVE)
+            tf_gelu_mul_fast4_sve(t->Y, (size_t)t->Y_stride, r, tok,
+                                  g00, g01, g02, g03, u00, u01, u02, u03);
+            tf_gelu_mul_fast4_sve(t->Y, (size_t)t->Y_stride, r + 1, tok,
+                                  g10, g11, g12, g13, u10, u11, u12, u13);
+#else
+            t->Y[(size_t)(tok + 0) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g00, u00);
+            t->Y[(size_t)(tok + 1) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g01, u01);
+            t->Y[(size_t)(tok + 2) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g02, u02);
+            t->Y[(size_t)(tok + 3) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g03, u03);
+            t->Y[(size_t)(tok + 0) * t->Y_stride + r + 1] = tf_gelu_mul_fast_scalar(g10, u10);
+            t->Y[(size_t)(tok + 1) * t->Y_stride + r + 1] = tf_gelu_mul_fast_scalar(g11, u11);
+            t->Y[(size_t)(tok + 2) * t->Y_stride + r + 1] = tf_gelu_mul_fast_scalar(g12, u12);
+            t->Y[(size_t)(tok + 3) * t->Y_stride + r + 1] = tf_gelu_mul_fast_scalar(g13, u13);
+#endif
+        }
+        for (; tok < t->N; tok++) {
+            const float *x = t->X + (size_t)tok * t->X_stride;
+            float gate, up;
+            tf_vec_dot_q4_0_pair_f32(g0row, u0row, x, t->K, &gate, &up);
+            t->Y[(size_t)tok * t->Y_stride + r] = tf_gelu_mul_fast_scalar(gate, up);
+            tf_vec_dot_q4_0_pair_f32(g1row, u1row, x, t->K, &gate, &up);
+            t->Y[(size_t)tok * t->Y_stride + r + 1] = tf_gelu_mul_fast_scalar(gate, up);
+        }
+    }
+    for (; r < t->row_end; r++) {
+        const block_q4_0 *grow = gate_rows + (size_t)r * nb;
+        const block_q4_0 *urow = up_rows + (size_t)r * nb;
+        int tok = 0;
+        if (use_8x) {
+            for (; tok + 7 < t->N; tok += 8) {
+                const float *x0 = t->X + (size_t)(tok + 0) * t->X_stride;
+                const float *x1 = t->X + (size_t)(tok + 1) * t->X_stride;
+                const float *x2 = t->X + (size_t)(tok + 2) * t->X_stride;
+                const float *x3 = t->X + (size_t)(tok + 3) * t->X_stride;
+                const float *x4 = t->X + (size_t)(tok + 4) * t->X_stride;
+                const float *x5 = t->X + (size_t)(tok + 5) * t->X_stride;
+                const float *x6 = t->X + (size_t)(tok + 6) * t->X_stride;
+                const float *x7 = t->X + (size_t)(tok + 7) * t->X_stride;
+                float g0, g1, g2, g3, g4, g5, g6, g7;
+                float u0, u1, u2, u3, u4, u5, u6, u7;
+                tf_vec_dot_q4_0_pair_f32_8x(grow, urow, x0, x1, x2, x3,
+                                            x4, x5, x6, x7, t->K,
+                                            &g0, &g1, &g2, &g3, &g4, &g5, &g6, &g7,
+                                            &u0, &u1, &u2, &u3, &u4, &u5, &u6, &u7);
+#if defined(__ARM_FEATURE_SVE)
+                tf_gelu_mul_fast4_sve(t->Y, (size_t)t->Y_stride, r, tok,
+                                      g0, g1, g2, g3, u0, u1, u2, u3);
+                tf_gelu_mul_fast4_sve(t->Y, (size_t)t->Y_stride, r, tok + 4,
+                                      g4, g5, g6, g7, u4, u5, u6, u7);
+#else
+                t->Y[(size_t)(tok + 0) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g0, u0);
+                t->Y[(size_t)(tok + 1) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g1, u1);
+                t->Y[(size_t)(tok + 2) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g2, u2);
+                t->Y[(size_t)(tok + 3) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g3, u3);
+                t->Y[(size_t)(tok + 4) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g4, u4);
+                t->Y[(size_t)(tok + 5) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g5, u5);
+                t->Y[(size_t)(tok + 6) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g6, u6);
+                t->Y[(size_t)(tok + 7) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g7, u7);
+#endif
+            }
+        }
+        for (; tok + 3 < t->N; tok += 4) {
+            const float *x0 = t->X + (size_t)(tok + 0) * t->X_stride;
+            const float *x1 = t->X + (size_t)(tok + 1) * t->X_stride;
+            const float *x2 = t->X + (size_t)(tok + 2) * t->X_stride;
+            const float *x3 = t->X + (size_t)(tok + 3) * t->X_stride;
+            float g0, g1, g2, g3, u0, u1, u2, u3;
+            tf_vec_dot_q4_0_pair_f32_4x(grow, urow, x0, x1, x2, x3, t->K,
+                                        &g0, &g1, &g2, &g3, &u0, &u1, &u2, &u3);
+#if defined(__ARM_FEATURE_SVE)
+            tf_gelu_mul_fast4_sve(t->Y, (size_t)t->Y_stride, r, tok,
+                                  g0, g1, g2, g3, u0, u1, u2, u3);
+#else
+            t->Y[(size_t)(tok + 0) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g0, u0);
+            t->Y[(size_t)(tok + 1) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g1, u1);
+            t->Y[(size_t)(tok + 2) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g2, u2);
+            t->Y[(size_t)(tok + 3) * t->Y_stride + r] = tf_gelu_mul_fast_scalar(g3, u3);
+#endif
+        }
+        for (; tok < t->N; tok++) {
+            const float *x = t->X + (size_t)tok * t->X_stride;
+            float gate, up;
+            tf_vec_dot_q4_0_pair_f32(grow, urow, x, t->K, &gate, &up);
+            t->Y[(size_t)tok * t->Y_stride + r] = tf_gelu_mul_fast_scalar(gate, up);
+        }
+    }
+    return NULL;
+}
+
+static void tf_dequant_q4_0_rows_to_fp16_bt(uint16_t *bt, const qtensor *mat,
+                                             int row0, int n_rows, int K) {
+    const int nb = K / 32;
+    const block_q4_0 *rows = (const block_q4_0 *)mat->data + (size_t)row0 * nb;
+    for (int rr = 0; rr < n_rows; rr++) {
+        const block_q4_0 *row = rows + (size_t)rr * nb;
+        for (int b = 0; b < nb; b++) {
+            float d = ggml_fp16_to_fp32(row[b].d);
+            int base = b * 32;
+            for (int j = 0; j < 16; j++) {
+                uint8_t q = row[b].qs[j];
+                bt[(size_t)(base + j) * n_rows + rr] =
+                    tf_f32_to_f16(((float)((int)(q & 0x0f) - 8)) * d);
+                bt[(size_t)(base + j + 16) * n_rows + rr] =
+                    tf_f32_to_f16(((float)((int)(q >> 4) - 8)) * d);
+            }
+        }
+    }
+}
+
+static int tf_gemm_q4_0_pair_gelu_block_fp16(float *Y_out, const qtensor *gate,
+                                             const qtensor *up, const float *X,
+                                             int n_rows, int N, int out_stride,
+                                             int X_stride) {
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+    if (!gemm_fp16_BT) return 0;
+    if (!gate || !up || gate->type != GGML_TYPE_Q4_0 || up->type != GGML_TYPE_Q4_0)
+        return 0;
+    if (gate->n_cols != up->n_cols || gate->n_rows != up->n_rows ||
+        gate->n_cols != X_stride || n_rows != gate->n_rows)
+        return 0;
+    int K = gate->n_cols;
+    if ((K % 32) != 0) return 0;
+
+    const int rb_target = 1024;
+    for (int row0 = 0; row0 < n_rows; row0 += rb_target) {
+        int rb = n_rows - row0;
+        if (rb > rb_target) rb = rb_target;
+        size_t w_elems = (size_t)K * rb;
+        size_t y_elems = (size_t)N * rb;
+        uint16_t *gate_bt = (uint16_t *)malloc(w_elems * sizeof(uint16_t));
+        uint16_t *up_bt = (uint16_t *)malloc(w_elems * sizeof(uint16_t));
+        float *gate_y = (float *)malloc(y_elems * sizeof(float));
+        float *up_y = (float *)malloc(y_elems * sizeof(float));
+        if (!gate_bt || !up_bt || !gate_y || !up_y) {
+            free(gate_bt); free(up_bt); free(gate_y); free(up_y);
+            return 0;
+        }
+        tf_dequant_q4_0_rows_to_fp16_bt(gate_bt, gate, row0, rb, K);
+        tf_dequant_q4_0_rows_to_fp16_bt(up_bt, up, row0, rb, K);
+        gemm_fp16_BT(N, K, rb, X, X_stride, gate_bt, rb, gate_y, rb);
+        gemm_fp16_BT(N, K, rb, X, X_stride, up_bt, rb, up_y, rb);
+        tf_gelu_mul_fast(gate_y, gate_y, up_y, (int)y_elems);
+        for (int t = 0; t < N; t++) {
+            memcpy(Y_out + (size_t)t * out_stride + row0,
+                   gate_y + (size_t)t * rb, (size_t)rb * sizeof(float));
+        }
+
+        free(gate_bt); free(up_bt); free(gate_y); free(up_y);
+    }
+    return 1;
+#else
+    (void)Y_out; (void)gate; (void)up; (void)X; (void)n_rows;
+    (void)N; (void)out_stride; (void)X_stride;
+    return 0;
+#endif
+}
+
+static int tf_gemm_q4_0_pair_gelu_tokenmajor(float *Y_out, const qtensor *gate,
+                                             const qtensor *up, const float *X,
+                                             int n_rows, int N, int out_stride,
+                                             int X_stride, int n_threads,
+                                             int check) {
+    if (!gate || !up || gate->type != GGML_TYPE_Q4_0 || up->type != GGML_TYPE_Q4_0)
+        return 0;
+    if (gate->n_cols != up->n_cols || gate->n_rows != up->n_rows ||
+        gate->n_cols != X_stride || n_rows != gate->n_rows)
+        return 0;
+    int K = gate->n_cols;
+    if ((K % 32) != 0) return 0;
+    const char *block_q4 = getenv("TF_FFN_BLOCK_Q4");
+    if (block_q4 && atoi(block_q4) != 0 && N >= 64 &&
+        tf_gemm_q4_0_pair_gelu_block_fp16(Y_out, gate, up, X,
+                                          n_rows, N, out_stride, X_stride))
+        return 1;
+
+    int nt = n_threads;
+    if (nt < 1) nt = 1;
+    if (nt > n_rows) nt = n_rows;
+    if (nt <= 1 || n_rows < 8) {
+        tf_gemm_q4_pair_gelu_task task = {Y_out, gate, up, X, 0, n_rows, K, N, out_stride, X_stride};
+        (void)tf_gemm_q4_0_pair_gelu_worker(&task);
+    } else {
+        pthread_t *threads = (pthread_t *)alloca((size_t)nt * sizeof(pthread_t));
+        tf_gemm_q4_pair_gelu_task *tasks = (tf_gemm_q4_pair_gelu_task *)alloca((size_t)nt * sizeof(tf_gemm_q4_pair_gelu_task));
+        int rows_per = n_rows / nt, extra = n_rows % nt, offset = 0;
+        for (int i = 0; i < nt; i++) {
+            int count = rows_per + (i < extra ? 1 : 0);
+            tasks[i] = (tf_gemm_q4_pair_gelu_task){Y_out, gate, up, X, offset, offset + count,
+                                                   K, N, out_stride, X_stride};
+            offset += count;
+            pthread_create(&threads[i], NULL, tf_gemm_q4_0_pair_gelu_worker, &tasks[i]);
+        }
+        for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
+    }
+
+    if (check && N > 0 && n_rows > 0) {
+        const int nb = K / 32;
+        const block_q4_0 *grow = (const block_q4_0 *)gate->data;
+        const block_q4_0 *urow = (const block_q4_0 *)up->data;
+        float g, u;
+        tf_vec_dot_q4_0_pair_f32(grow, urow, X, K, &g, &u);
+        float exact = tf_gelu_mul_exact_scalar(g, u);
+        float fast = Y_out[0];
+        float abs_err = fabsf(fast - exact);
+        float rel_err = abs_err / (fabsf(exact) + 1e-9f);
+        fprintf(stderr, "transformer: TF_FFN_CHECK q4 fused row0 tok0 gate=%.6g up=%.6g fast=%.6g exact=%.6g abs=%.3g rel=%.3g nb=%d\n",
+                g, u, fast, exact, abs_err, rel_err, nb);
+    }
+    return 1;
+}
+
+#ifdef TF_HAVE_Q8V2
+/* Q8v2 per-block int8 FFN gate/up GEMM with fused fast-GELU. Drop-in for
+ * tf_gemm_q4_0_pair_gelu_tokenmajor (~12x faster, argmax-identical, ~0.6% relL2).
+ * Q4_0 weights packed ON-THE-FLY per n-tile to centered-nibble int8 (pack_B layout,
+ * per-thread scratch — never globally cached, avoids the 30GB OOM); activations
+ * quantized per-32-block per-row to int8. Kernel: gemma4-kernels/kernel_q8v2_3x4.S.
+ * Enable at runtime with env TF_Q8V2=1. Requires K%256==0 and n_rows%64==0. */
+extern void kernel_q8v2_3x4(const int8_t*,const float*,const int8_t*,const float*,long,float*,long);
+int tf_q8v2_enable = -1;  /* <0=init from env TF_Q8V2; 0/1 settable by caller for A/B */
+static int tf_gemm_q8v2_pair_gelu_tokenmajor(float *Y, const qtensor *gate,
+        const qtensor *up, const float *X, int n_rows, int N,
+        int out_stride, int X_stride, int n_threads) {
+    if (!gate || !up || gate->type!=GGML_TYPE_Q4_0 || up->type!=GGML_TYPE_Q4_0) return 0;
+    if (gate->n_cols!=up->n_cols || gate->n_rows!=up->n_rows ||
+        gate->n_cols!=X_stride || n_rows!=gate->n_rows) return 0;
+    int K = gate->n_cols;
+    if (K%256 || n_rows%64) return 0;
+    const int MR=3, NR=64, BLK=32;
+    int nb=K/BLK, NTn=n_rows/NR, MTn=(N+MR-1)/MR;
+    int nt=n_threads<1?1:n_threads;
+    size_t aqt=(size_t)nb*MR*BLK, adt=(size_t)nb*MR;
+    int8_t*Aq=(int8_t*)malloc((size_t)MTn*aqt);
+    float *Ad=(float*)malloc((size_t)MTn*adt*sizeof(float));
+    if(!Aq||!Ad){ free(Aq); free(Ad); return 0; }
+    /* 1. quantize activations per-block per-row -> int8 */
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    for(int m0=0;m0<MTn;m0++){ int8_t*aq=Aq+(size_t)m0*aqt; float*ad=Ad+(size_t)m0*adt;
+        for(int b=0;b<nb;b++) for(int r=0;r<MR;r++){ int tok=m0*MR+r;
+            float amax=0; if(tok<N) for(int k=0;k<BLK;k++){ float a=fabsf(X[(size_t)tok*X_stride+b*BLK+k]); if(a>amax)amax=a; }
+            float d=amax>0?amax/127.0f:0.0f, inv=d>0?1.0f/d:0.0f;
+            ad[b*MR+r]=d;
+            for(int k=0;k<BLK;k++){ int q=0; if(tok<N){ q=(int)lrintf(X[(size_t)tok*X_stride+b*BLK+k]*inv); if(q>127)q=127; if(q<-127)q=-127; } aq[(size_t)(b*MR+r)*BLK+k]=(int8_t)q; }
+        }
+    }
+    /* 2. per n-tile: dequant gate/up Q4_0 -> centered-nibble int8 scratch, kernel x2, GELU */
+    const block_q4_0*G=(const block_q4_0*)gate->data;
+    const block_q4_0*U=(const block_q4_0*)up->data;
+    #pragma omp parallel num_threads(nt)
+    {
+        size_t bqt=(size_t)nb*8*4*64;
+        int8_t*bqg=(int8_t*)malloc(bqt), *bqu=(int8_t*)malloc(bqt);
+        float *bdg=(float*)malloc((size_t)nb*NR*sizeof(float)), *bdu=(float*)malloc((size_t)nb*NR*sizeof(float));
+        float Cg[MR*NR], Cu[MR*NR];
+        #pragma omp for schedule(static)
+        for(int n0=0;n0<NTn;n0++){
+            for(int b=0;b<nb;b++) for(int vec=0;vec<4;vec++) for(int col=0;col<16;col++){
+                int n=n0*NR+vec*16+col;
+                const block_q4_0*gr=G+(size_t)n*nb, *ur=U+(size_t)n*nb;
+                bdg[b*NR+vec*16+col]=ggml_fp16_to_fp32(gr[b].d);
+                bdu[b*NR+vec*16+col]=ggml_fp16_to_fp32(ur[b].d);
+                for(int g3=0;g3<8;g3++) for(int kk=0;kk<4;kk++){ int k=g3*4+kk;
+                    int qg=(k<16)?(gr[b].qs[k]&0xf):(gr[b].qs[k-16]>>4);
+                    int qu=(k<16)?(ur[b].qs[k]&0xf):(ur[b].qs[k-16]>>4);
+                    size_t off=((size_t)b*8*4+(size_t)g3*4+vec)*64 + (size_t)col*4 + kk;
+                    bqg[off]=(int8_t)(qg-8); bqu[off]=(int8_t)(qu-8);
+                }
+            }
+            for(int m0=0;m0<MTn;m0++){
+                const int8_t*aq=Aq+(size_t)m0*aqt; const float*ad=Ad+(size_t)m0*adt;
+                kernel_q8v2_3x4(aq,ad,bqg,bdg,nb,Cg,(long)NR*4);
+                kernel_q8v2_3x4(aq,ad,bqu,bdu,nb,Cu,(long)NR*4);
+                for(int r=0;r<MR;r++){ int tok=m0*MR+r; if(tok>=N) continue;
+                    for(int c=0;c<NR;c++) Y[(size_t)tok*out_stride + n0*NR + c]=tf_gelu_fast_scalar(Cg[r*NR+c])*Cu[r*NR+c];
+                }
+            }
+        }
+        free(bqg); free(bqu); free(bdg); free(bdu);
+    }
+    free(Aq); free(Ad);
+    return 1;
+}
+#endif /* TF_HAVE_Q8V2 */
+
+/* Exact row-major BF16 small-N row. Keep this shared by the ordinary and
+ * paired dispatchers so fusing OpenMP teams cannot change reduction order. */
+#if defined(__ARM_FEATURE_SVE)
+static inline void tf_gemm_bf16_smalln_row(float *Y_out, const uint16_t *w,
+                                            const float *X, int K, int N,
+                                            int out_stride, int X_stride,
+                                            int row) {
+    svbool_t pt = svptrue_b32(), pth = svptrue_b16();
+    svuint16_t zero = svdup_u16(0);
+    int vlh = (int)svcnth(), vl = (int)svcntw();
+    svfloat32_t a0 = svdup_f32(0), a1 = svdup_f32(0);
+    svfloat32_t a2 = svdup_f32(0), a3 = svdup_f32(0);
+    svfloat32_t a4 = svdup_f32(0), a5 = svdup_f32(0);
+    svfloat32_t a6 = svdup_f32(0), a7 = svdup_f32(0);
+    int k = 0;
+    for (; k + vlh <= K; k += vlh) {
+        svuint16_t raw = svld1_u16(pth, w + k);
+        svfloat32_t wlo = svreinterpret_f32_u16(svzip1_u16(zero, raw));
+        svfloat32_t whi = svreinterpret_f32_u16(svzip2_u16(zero, raw));
+        #define TF_DOT_SMALLN(ai,t) if (N > (t)) { \
+            const float *x = X + (size_t)(t) * X_stride + k; \
+            ai = svmla_f32_x(pt, ai, wlo, svld1_f32(pt, x)); \
+            ai = svmla_f32_x(pt, ai, whi, svld1_f32(pt, x + vl)); }
+        TF_DOT_SMALLN(a0,0) TF_DOT_SMALLN(a1,1)
+        TF_DOT_SMALLN(a2,2) TF_DOT_SMALLN(a3,3)
+        TF_DOT_SMALLN(a4,4) TF_DOT_SMALLN(a5,5)
+        TF_DOT_SMALLN(a6,6) TF_DOT_SMALLN(a7,7)
+        #undef TF_DOT_SMALLN
+    }
+    float s[8];
+    s[0]=svaddv_f32(pt,a0); s[1]=svaddv_f32(pt,a1);
+    s[2]=svaddv_f32(pt,a2); s[3]=svaddv_f32(pt,a3);
+    s[4]=svaddv_f32(pt,a4); s[5]=svaddv_f32(pt,a5);
+    s[6]=svaddv_f32(pt,a6); s[7]=svaddv_f32(pt,a7);
+    for (; k < K; k++) {
+        float wv = bf16_to_f32_scalar(w[k]);
+        for (int t = 0; t < N; t++)
+            s[t] += wv * X[(size_t)t * X_stride + k];
+    }
+    for (int t = 0; t < N; t++)
+        Y_out[(size_t)t * out_stride + row] = s[t];
+}
+
+static int tf_gemm_bf16_smalln_pair(float *Y0, const qtensor *m0,
+                                     float *Y1, const qtensor *m1,
+                                     const float *X, int rows, int N,
+                                     int out_stride, int X_stride,
+                                     int n_threads) {
+    if (!m0 || !m1 || m0->type != GGML_TYPE_BF16 ||
+        m1->type != GGML_TYPE_BF16 || m0->podd_packed || m1->podd_packed ||
+        m0->bf16_pv || m1->bf16_pv || m0->i8 || m1->i8 ||
+        m0->n_cols != m1->n_cols || N <= 0 || N > 8)
+        return 0;
+    int K = m0->n_cols, nt = n_threads > 1 ? n_threads : 1;
+    const uint16_t *W0 = (const uint16_t *)m0->data;
+    const uint16_t *W1 = (const uint16_t *)m1->data;
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int mr = 0; mr < 2 * rows; mr++) {
+        int which = mr >= rows;
+        int r = mr - which * rows;
+        const uint16_t *W = which ? W1 : W0;
+        float *Y = which ? Y1 : Y0;
+        tf_gemm_bf16_smalln_row(Y, W + (size_t)r * K, X, K, N,
+                                out_stride, X_stride, r);
+    }
+    return 1;
+}
+#endif
+
 /* Token-major GEMM: Y[tok * out_stride + row] = dot(W[row,:], X[tok,:])
  * Direct output without transpose. */
 static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const float *X,
                                        int n_rows, int N, int out_stride, int X_stride,
                                        int n_threads) {
+#if defined(TF_HAVE_Q8V2) && defined(__ARM_FEATURE_SVE)
+    if(mat->prefill_q8b6_q&&mat->prefill_q8b6_d&&N>=6){
+        extern void micro_kernel_6x4_no_sector(const int8_t*,const int8_t*,int32_t*,long,long,long);
+        int K=mat->n_cols,nb=K/64,MT=N/6,NP=n_rows/64,nt=n_threads>1?n_threads:1;
+        size_t aqt=(size_t)nb*16*6*4;
+        static int8_t*cache_aq;static float*cache_ad;static size_t qcap,dcap;
+        static const float*cache_x;static int cache_N,cache_K,cache_stride;
+        static float cache_tag[8];float tag[8];size_t xn=(size_t)N*X_stride;
+        for(int i=0;i<8;i++)tag[i]=X[xn*(size_t)i/8];
+        int hit=cache_x==X&&cache_N==N&&cache_K==K&&cache_stride==X_stride;
+        for(int i=0;i<8&&hit;i++)hit=cache_tag[i]==tag[i];
+        size_t qneed=(size_t)MT*aqt,dneed=(size_t)MT*nb*6;
+        if(qcap<qneed){int8_t*p=(int8_t*)realloc(cache_aq,qneed);if(p){cache_aq=p;qcap=qneed;}else hit=0;}
+        if(dcap<dneed){float*p=(float*)realloc(cache_ad,dneed*sizeof(float));if(p){cache_ad=p;dcap=dneed;}else hit=0;}
+        int8_t*aq=qcap>=qneed?cache_aq:NULL;float*ad=dcap>=dneed?cache_ad:NULL;
+        if(aq&&ad){
+            if(!hit){
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nt) schedule(static)
+            #endif
+            for(int mt=0;mt<MT;mt++)for(int b=0;b<nb;b++)for(int r=0;r<6;r++){
+                const float*xp=X+(size_t)(mt*6+r)*X_stride+b*64;float mx=0;
+                for(int k=0;k<64;k++){float v=fabsf(xp[k]);if(v>mx)mx=v;}
+                float sc=mx/127.0f,inv=sc>0?1.0f/sc:0;
+                ad[((size_t)mt*nb+b)*6+r]=sc;
+                for(int k=0;k<64;k++){int v=(int)lrintf(xp[k]*inv);if(v>127)v=127;if(v<-127)v=-127;
+                    int g=k/4,kk=k%4;
+                    aq[(size_t)mt*aqt+((size_t)b*16+g)*24+r*4+kk]=(int8_t)v;}
+            }
+            cache_x=X;cache_N=N;cache_K=K;cache_stride=X_stride;
+            for(int i=0;i<8;i++)cache_tag[i]=tag[i];
+            }
+            size_t qpt=(size_t)nb*4096,dpt=(size_t)nb*64;
+            #ifdef _OPENMP
+            #pragma omp parallel for collapse(2) num_threads(nt) schedule(static)
+            #endif
+            for(int p=0;p<NP;p++)for(int mt=0;mt<MT;mt++){
+                int32_t tmp[6*64];float*out=Y_out+(size_t)(mt*6)*out_stride+p*64;
+                for(int r=0;r<6;r++)for(int c=0;c<64;c++)out[(size_t)r*out_stride+c]=0;
+                for(int b=0;b<nb;b++){
+                    micro_kernel_6x4_no_sector(aq+(size_t)mt*aqt+(size_t)b*384,
+                        mat->prefill_q8b6_q+(size_t)p*qpt+(size_t)b*4096,tmp,64,0,64*4L);
+                    const float*as=ad+((size_t)mt*nb+b)*6;
+                    const float*ws=mat->prefill_q8b6_d+(size_t)p*dpt+(size_t)b*64;
+                    for(int r=0;r<6;r++)for(int c=0;c<64;c++)
+                        out[(size_t)r*out_stride+c]+=(float)tmp[r*64+c]*as[r]*ws[c];
+                }
+            }
+            int tail=N-MT*6;if(tail)gemm_q8_0_f32_tokmajor(Y_out+(size_t)(MT*6)*out_stride,
+                mat->data,X+(size_t)(MT*6)*X_stride,n_rows,K,tail,out_stride,X_stride);
+            return;
+        }
+    }
+#endif
+#if defined(TF_HAVE_Q8V2) && defined(__ARM_FEATURE_SVE)
+    if(mat->prefill_q8v2_q && mat->prefill_q8v2_d && N>=3){
+        extern void kernel_q8v2_3x4(const int8_t*,const float*,const int8_t*,const float*,long,float*,long);
+        extern void kernel_q8v2_3x4_arow(const int8_t*,const float*,const int8_t*,const float*,long,float*,long);
+        static int use_arow=-1;
+        if(use_arow<0){const char *e=getenv("TF_Q8V2_AROW");use_arow=e&&atoi(e)!=0;}
+        int K=mat->n_cols,nb=K/32,MT=(N+2)/3,NP=n_rows/64;
+        size_t aqt=(size_t)nb*3*32,adt=use_arow?3:(size_t)nb*3;
+        /* Consecutive Q/K/V and gate/up projections consume the same activation
+         * matrix.  Retain its per-32 Q8 pack across calls; the sampled values
+         * distinguish the reused norm scratch after the next layer rewrites it. */
+        static int8_t *cache_aq;
+        static float *cache_ad;
+        static size_t cache_qcap,cache_dcap;
+        static const float *cache_x;
+        static int cache_N,cache_K,cache_stride;
+        static float cache_tag[8];
+        float tag[8];
+        size_t xn=(size_t)N*X_stride;
+        for(int i=0;i<8;i++) tag[i]=X[xn*(size_t)i/8];
+        int hit=cache_x==X&&cache_N==N&&cache_K==K&&cache_stride==X_stride;
+        for(int i=0;i<8&&hit;i++) hit=cache_tag[i]==tag[i];
+        size_t qneed=(size_t)MT*aqt,dneed=(size_t)MT*adt;
+        if(cache_qcap<qneed){int8_t *p=(int8_t *)realloc(cache_aq,qneed);if(p){cache_aq=p;cache_qcap=qneed;}else hit=0;}
+        if(cache_dcap<dneed){float *p=(float *)realloc(cache_ad,dneed*sizeof(float));if(p){cache_ad=p;cache_dcap=dneed;}else hit=0;}
+        int8_t *aq=cache_qcap>=qneed?cache_aq:NULL;
+        float *ad=cache_dcap>=dneed?cache_ad:NULL;
+        int nt=n_threads>1?n_threads:1;
+        if(aq&&ad){
+            if(!hit){
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nt) schedule(static)
+            #endif
+            for(int mt=0;mt<MT;mt++){
+                int8_t *qa=aq+(size_t)mt*aqt;float *da=ad+(size_t)mt*adt;
+                if(use_arow) for(int r=0;r<3;r++){
+                    int t=mt*3+r;const float *xp=t<N?X+(size_t)t*X_stride:NULL;
+                    float mx=0;if(xp)for(int k=0;k<K;k++){float v=fabsf(xp[k]);if(v>mx)mx=v;}
+                    float sc=mx/127.0f,inv=sc>0?1.0f/sc:0;da[r]=sc;
+                    for(int b=0;b<nb;b++)for(int k=0;k<32;k++){
+                        int v=xp?(int)lrintf(xp[b*32+k]*inv):0;
+                        qa[((size_t)b*3+r)*32+k]=(int8_t)(v < -127 ? -127 : v > 127 ? 127 : v);
+                    }
+                } else for(int b=0;b<nb;b++)for(int r=0;r<3;r++){
+                    int t=mt*3+r;const float *xp=t<N?X+(size_t)t*X_stride+b*32:NULL;
+                    float mx=0; if(xp)for(int k=0;k<32;k++){float v=fabsf(xp[k]);if(v>mx)mx=v;}
+                    float sc=mx/127.0f,inv=sc>0?1.0f/sc:0;da[(size_t)b*3+r]=sc;
+                    for(int k=0;k<32;k++){int v=xp?(int)lrintf(xp[k]*inv):0;
+                        qa[((size_t)b*3+r)*32+k]=(int8_t)(v < -127 ? -127 : v > 127 ? 127 : v);}
+                }
+            }
+            cache_x=X;cache_N=N;cache_K=K;cache_stride=X_stride;
+            for(int i=0;i<8;i++)cache_tag[i]=tag[i];
+            }
+            size_t qpt=(size_t)nb*64*32,dpt=(size_t)nb*64;
+            #ifdef _OPENMP
+            #pragma omp parallel for collapse(2) num_threads(nt) schedule(static)
+            #endif
+            for(int p=0;p<NP;p++)for(int mt=0;mt<MT;mt++){
+                int valid=N-mt*3;if(valid>3)valid=3;
+                if(valid==3)(use_arow?kernel_q8v2_3x4_arow:kernel_q8v2_3x4)(
+                    aq+(size_t)mt*aqt,ad+(size_t)mt*adt,
+                    mat->prefill_q8v2_q+(size_t)p*qpt,mat->prefill_q8v2_d+(size_t)p*dpt,
+                    nb,Y_out+(size_t)(mt*3)*out_stride+p*64,(long)out_stride*4);
+                else{
+                    float tmp[3*64];
+                    (use_arow?kernel_q8v2_3x4_arow:kernel_q8v2_3x4)(
+                        aq+(size_t)mt*aqt,ad+(size_t)mt*adt,
+                        mat->prefill_q8v2_q+(size_t)p*qpt,mat->prefill_q8v2_d+(size_t)p*dpt,
+                        nb,tmp,64*4L);
+                    for(int r=0;r<valid;r++)memcpy(Y_out+(size_t)(mt*3+r)*out_stride+p*64,
+                                                   tmp+r*64,64*sizeof(float));
+                }
+            }
+            return;
+        }
+    }
+#endif
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->q8_block64 == 3 && N > 0) {
+        int K = mat->n_cols, nb = K / 64, nt = n_threads > 1 ? n_threads : 1;
+        int8_t *xq = (int8_t *)malloc((size_t)N * K);
+        float *xs = (float *)malloc((size_t)N * nb * sizeof(*xs));
+        if (xq && xs) {
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nt) schedule(static)
+            #endif
+            for (int t = 0; t < N; t++) for (int b = 0; b < nb; b++) {
+                const float *xp = X + (size_t)t * X_stride + b * 64;
+                int8_t *qp = xq + (size_t)t * K + b * 64;
+                float mx = 0.0f;
+                for (int j = 0; j < 64; j++) { float a=fabsf(xp[j]); if(a>mx)mx=a; }
+                float sc=mx/127.0f, inv=sc>0.0f?1.0f/sc:0.0f;
+                xs[(size_t)t*nb+b]=sc;
+                for (int j = 0; j < 64; j++) { int q=(int)lrintf(xp[j]*inv);
+                    qp[j]=(int8_t)(q < -127 ? -127 : q > 127 ? 127 : q); }
+            }
+            int groups = n_rows / 8;
+            size_t gb = (size_t)nb * 528;
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nt) schedule(static)
+            #endif
+            for (int g = 0; g < groups; g++) {
+                const uint8_t *wp=(const uint8_t *)mat->data+(size_t)g*gb;
+                int t=0;
+                for (; t+2<N; t+=3)
+                    matvec_sdot_8row_3x(Y_out+(size_t)(t+0)*out_stride+g*8,
+                        Y_out+(size_t)(t+1)*out_stride+g*8,
+                        Y_out+(size_t)(t+2)*out_stride+g*8,wp,
+                        xq+(size_t)(t+0)*K,xs+(size_t)(t+0)*nb,
+                        xq+(size_t)(t+1)*K,xs+(size_t)(t+1)*nb,
+                        xq+(size_t)(t+2)*K,xs+(size_t)(t+2)*nb,K);
+                for (; t<N; t++)
+                    matvec_sdot_8row(Y_out+(size_t)t*out_stride+g*8,wp,
+                        xq+(size_t)t*K,xs+(size_t)t*nb,K);
+            }
+            free(xq); free(xs); return;
+        }
+        free(xq); free(xs);
+    }
+#endif
+#if defined(TF_LINK_BF16PV48) && defined(__ARM_FEATURE_SVE)
+    if (mat->type == GGML_TYPE_BF16 && mat->prefill_pv48 && !mat->i8) {
+        static float *scratch;
+        static size_t scratch_cap;
+        static const float *cache_x;
+        static int cache_n,cache_k,cache_stride;
+        static float cache_tag[8];
+        size_t need = k3_prefill_bf16_scratch_bytes(N, mat->n_cols);
+        if (need > scratch_cap) {
+            free(scratch); scratch = NULL; scratch_cap = 0;
+            if (posix_memalign((void **)&scratch, 256, need) == 0) scratch_cap = need;
+        }
+        k3_bf16_matrix km = {(const uint16_t *)mat->data, n_rows, mat->n_cols};
+        float tag[8];size_t xn=(size_t)N*X_stride;
+        for(int i=0;i<8;i++)tag[i]=X[xn*(size_t)i/8];
+        int hit=N<=256&&cache_x==X&&cache_n==N&&cache_k==mat->n_cols&&cache_stride==X_stride;
+        for(int i=0;i<8&&hit;i++)hit=cache_tag[i]==tag[i];
+        if (scratch && k3_prefill_gemm_bf16_pv_ex(Y_out, X, N, &km,
+                mat->prefill_pv48, scratch, scratch_cap,
+                n_threads > 1 ? n_threads : 1,!hit) == 0) {
+            cache_x=X;cache_n=N;cache_k=mat->n_cols;cache_stride=X_stride;
+            for(int i=0;i<8;i++)cache_tag[i]=tag[i];
+            return;
+        }
+    }
+#endif
+#if defined(__ARM_FEATURE_SVE)
+    if (mat->type == GGML_TYPE_BF16 && mat->bf16_pv && !mat->i8) {
+        /* Resident TP decode shards use the 8-row pair-interleaved layout.
+         * Verify K candidates directly from that layout: the 8x3 kernel loads
+         * each weight vector once for three token columns, while the tail uses
+         * the exact single-token PV reduction. */
+        int K = mat->n_cols, nt = n_threads > 1 ? n_threads : 1;
+        int groups = n_rows / 8;
+        const uint16_t *base = (const uint16_t *)mat->data;
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(nt) schedule(static)
+        #endif
+        for (int g = 0; g < groups; g++) {
+            const uint16_t *p = base + (size_t)g * 8 * K;
+            int t = 0;
+            if (N == 2) {
+                matvec_bf16_8x2_pv(Y_out + g*8, Y_out + out_stride + g*8,
+                                    p, p + 2*K, p + 4*K, p + 6*K,
+                                    X, X + X_stride, K);
+                continue;
+            }
+            if (N == 4) {
+                float *y0=Y_out+g*8,*y1=Y_out+out_stride+g*8;
+                float *y2=Y_out+2*(size_t)out_stride+g*8;
+                float *y3=Y_out+3*(size_t)out_stride+g*8;
+                const float *x0=X,*x1=X+X_stride;
+                const float *x2=X+2*(size_t)X_stride;
+                const float *x3=X+3*(size_t)X_stride;
+                matvec_bf16_4x4_pv(y0,y1,y2,y3,p,p+2*K,x0,x1,x2,x3,K);
+                matvec_bf16_4x4_pv(y0+4,y1+4,y2+4,y3+4,p+4*K,p+6*K,
+                                    x0,x1,x2,x3,K);
+                continue;
+            }
+            if (N == 5) {
+                float *y0=Y_out+g*8,*y1=Y_out+out_stride+g*8;
+                float *y2=Y_out+2*(size_t)out_stride+g*8;
+                float *y3=Y_out+3*(size_t)out_stride+g*8;
+                float *y4=Y_out+4*(size_t)out_stride+g*8;
+                const float *x0=X,*x1=X+X_stride;
+                const float *x2=X+2*(size_t)X_stride;
+                const float *x3=X+3*(size_t)X_stride;
+                const float *x4=X+4*(size_t)X_stride;
+                static int mtp5_fused = -1;
+                if (mtp5_fused < 0) {
+                    const char *e = getenv("TF_BF16PV_MTP5_FUSED");
+                    mtp5_fused = e && atoi(e) != 0;
+                }
+                /* The compiler keeps all twenty 4x5 accumulators in SVE
+                 * registers.  This path reads each weight vector once; retain
+                 * the established 4x3+8x2 schedule as an A/B control. */
+                if (mtp5_fused) {
+                    matvec_bf16_4x5_pv(y0,y1,y2,y3,y4,p,p+2*K,
+                                        x0,x1,x2,x3,x4,K);
+                    matvec_bf16_4x5_pv(y0+4,y1+4,y2+4,y3+4,y4+4,
+                                        p+4*K,p+6*K,x0,x1,x2,x3,x4,K);
+                    continue;
+                }
+                matvec_bf16_4x3_pv(y0,y1,y2,p,p+2*K,x0,x1,x2,K);
+                matvec_bf16_4x3_pv(y0+4,y1+4,y2+4,p+4*K,p+6*K,x0,x1,x2,K);
+                matvec_bf16_8x2_pv(y3,y4,p,p+2*K,p+4*K,p+6*K,x3,x4,K);
+                continue;
+            }
+            if (N == 6) {
+                float *y0=Y_out+g*8,*y1=Y_out+out_stride+g*8;
+                float *y2=Y_out+2*(size_t)out_stride+g*8;
+                float *y3=Y_out+3*(size_t)out_stride+g*8;
+                float *y4=Y_out+4*(size_t)out_stride+g*8;
+                float *y5=Y_out+5*(size_t)out_stride+g*8;
+                const float *x0=X,*x1=X+X_stride;
+                const float *x2=X+2*(size_t)X_stride;
+                const float *x3=X+3*(size_t)X_stride;
+                const float *x4=X+4*(size_t)X_stride;
+                const float *x5=X+5*(size_t)X_stride;
+                static int mtp6_3row = -1;
+                if (mtp6_3row < 0) {
+                    const char *e = getenv("TF_BF16PV_MTP6_3ROW");
+                    mtp6_3row = e && atoi(e) != 0;
+                }
+                if (mtp6_3row) {
+                    matvec_bf16_3x6_pv(y0,y1,y2,y3,y4,y5,
+                        p-1,p,p+2*K-1,x0,x1,x2,x3,x4,x5,K);
+                    matvec_bf16_3x6_pv(y0+3,y1+3,y2+3,y3+3,y4+3,y5+3,
+                        p+2*K,p+4*K-1,p+4*K,x0,x1,x2,x3,x4,x5,K);
+                    matvec_bf16_2x6_pv(y0+6,y1+6,y2+6,y3+6,y4+6,y5+6,
+                        p+6*K,x0,x1,x2,x3,x4,x5,K);
+                    continue;
+                }
+                matvec_bf16_2x6_pv(y0,y1,y2,y3,y4,y5,p,
+                                    x0,x1,x2,x3,x4,x5,K);
+                matvec_bf16_2x6_pv(y0+2,y1+2,y2+2,y3+2,y4+2,y5+2,p+2*K,
+                                    x0,x1,x2,x3,x4,x5,K);
+                matvec_bf16_2x6_pv(y0+4,y1+4,y2+4,y3+4,y4+4,y5+4,p+4*K,
+                                    x0,x1,x2,x3,x4,x5,K);
+                matvec_bf16_2x6_pv(y0+6,y1+6,y2+6,y3+6,y4+6,y5+6,p+6*K,
+                                    x0,x1,x2,x3,x4,x5,K);
+                continue;
+            }
+            for (; t + 2 < N; t += 3) {
+                float *y0=Y_out+(size_t)t*out_stride+g*8;
+                float *y1=Y_out+(size_t)(t+1)*out_stride+g*8;
+                float *y2=Y_out+(size_t)(t+2)*out_stride+g*8;
+                const float *x0=X+(size_t)t*X_stride;
+                const float *x1=X+(size_t)(t+1)*X_stride;
+                const float *x2=X+(size_t)(t+2)*X_stride;
+                matvec_bf16_4x3_pv(y0,y1,y2,p,p+2*K,x0,x1,x2,K);
+                matvec_bf16_4x3_pv(y0+4,y1+4,y2+4,p+4*K,p+6*K,x0,x1,x2,K);
+            }
+            for (; t < N; t++)
+                matvec_bf16_8row_pv(Y_out + (size_t)t * out_stride + g*8,
+                                    p, p + 2*K, p + 4*K, p + 6*K,
+                                    X + (size_t)t * X_stride, K);
+        }
+        return;
+    }
+    if (mat->i8) {   /* W8A8 int8 SDOT GEMM: quantize X per-token, row-outer/token-inner
+                      * (weight row read once from HBM, reused across N tokens from L1). */
+        int K = mat->n_cols, nt = n_threads > 1 ? n_threads : 1;
+        static int8_t *xi8 = NULL; static float *xsc = NULL; static size_t xcap = 0; static int scap = 0;
+        size_t need = (size_t)N * K;
+        const char *qmode = getenv("Q38_PREFILL_QUANT");
+        int use_i16 = qmode && !strcmp(qmode, "int16");
+        if (use_i16) {
+            int16_t *x16 = (int16_t *)malloc((size_t)N * K * sizeof(*x16));
+            float *xs16 = (float *)malloc((size_t)N * sizeof(*xs16));
+            if (x16 && xs16) {
+                #ifdef _OPENMP
+                #pragma omp parallel for num_threads(nt) schedule(static)
+                #endif
+                for (int t = 0; t < N; t++)
+                    xs16[t] = tf_quant_x_i16(X + (size_t)t * X_stride,
+                                             x16 + (size_t)t * K, K);
+                const int8_t *W = mat->i8; const float *Ws = mat->i8s;
+                #ifdef _OPENMP
+                #pragma omp parallel num_threads(nt)
+                #endif
+                {
+                    int16_t *w16 = (int16_t *)malloc((size_t)K * sizeof(*w16));
+                    #ifdef _OPENMP
+                    #pragma omp for schedule(static)
+                    #endif
+                    for (int r = 0; r < n_rows; r++) {
+                        const int8_t *wr = W + (size_t)r * K;
+                        for (int k = 0; k < K; k++) w16[k] = wr[k];
+                        for (int t = 0; t < N; t++)
+                            Y_out[(size_t)t * out_stride + r] =
+                                (float)tf_int16_dot(w16, x16 + (size_t)t * K, K) *
+                                Ws[r] * xs16[t];
+                    }
+                    free(w16);
+                }
+                free(x16); free(xs16);
+                return;
+            }
+            free(x16); free(xs16);
+        }
+        if (need > xcap) { free(xi8); xi8 = (int8_t *)malloc(need); xcap = xi8 ? need : 0; }
+        if (N > scap) { free(xsc); xsc = (float *)malloc((size_t)N * 4); scap = xsc ? N : 0; }
+        if (xi8 && xsc) {
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nt) schedule(static)
+            #endif
+            for (int t = 0; t < N; t++) xsc[t] = tf_quant_x_i8(X + (size_t)t * X_stride, xi8 + (size_t)t * K, K);
+            const int8_t *W = mat->i8; const float *Ws = mat->i8s;
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nt) schedule(static)
+            #endif
+            for (int r = 0; r < n_rows; r++) {
+                const int8_t *w = W + (size_t)r * K; float wsc = Ws[r];
+                for (int t = 0; t < N; t++)
+                    Y_out[(size_t)t * out_stride + r] = (float)tf_int8_dot(w, xi8 + (size_t)t * K, K) * wsc * xsc[t];
+            }
+            return;
+        }
+    }
+    /* Small-N BF16 GEMM (verify/spec): row-split, token-inner zip-widen dot. The podd
+     * GEMM is X-pack/C-transpose/12-col-pad bound at small N (~2.6 GB/s @N=5); this is
+     * weight-read-bound (row read once, reused across N tokens). Needs NORMAL bf16
+     * layout (NOT podd_packed). Gated TF_GEMM_SMALLN (default 8, 0=off). */
+    if (mat->type == GGML_TYPE_BF16 && !mat->podd_packed) {
+        static int smalln = -1;
+        if (smalln < 0) { const char *e = getenv("TF_GEMM_SMALLN"); smalln = e ? atoi(e) : 8; }
+        if (smalln > 0 && N <= smalln) {
+            int K = mat->n_cols, nt = n_threads > 1 ? n_threads : 1;
+            const uint16_t *Wd = (const uint16_t *)mat->data;
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(nt) schedule(static)
+            #endif
+            for (int r = 0; r < n_rows; r++) {
+                const uint16_t *w = Wd + (size_t)r * K;
+                tf_gemm_bf16_smalln_row(Y_out, w, X, K, N,
+                                         out_stride, X_stride, r);
+            }
+            return;
+        }
+    }
+#endif
     if (mat->type == GGML_TYPE_Q8_0) {
         /* Q8_0 SIMD GEMM path */
         int K = mat->n_cols;
@@ -4494,6 +12888,27 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
             gemm_q8_0_f32_tokmajor(Y_out, mat->data, X, n_rows, K, N, out_stride, X_stride);
             return;
         }
+#ifdef _OPENMP
+        /* Small-N speculative verification calls this path for every trunk
+         * projection.  Creating and joining 48 raw pthreads per matrix costs
+         * tens of milliseconds on A64FX and previously dominated Q8 MTP.
+         * Reuse the hot, pinned OpenMP team just as the BF16 small-N path does.
+         * Each row retains the same Q8 block traversal and reduction order. */
+        int nt = n_threads > 1 ? n_threads : 1;
+        size_t row_bytes = (size_t)(K / 32) * sizeof(block_q8_0);
+        #pragma omp parallel num_threads(nt)
+        {
+            int tid = omp_get_thread_num();
+            int team = omp_get_num_threads();
+            int row0 = n_rows * tid / team;
+            int row1 = n_rows * (tid + 1) / team;
+            if (row1 > row0)
+                gemm_q8_0_f32_tokmajor(Y_out + row0,
+                    (const uint8_t *)mat->data + (size_t)row0 * row_bytes,
+                    X, row1 - row0, K, N, out_stride, X_stride);
+        }
+        return;
+#else
         pthread_t *threads = (pthread_t *)alloca(n_threads * sizeof(pthread_t));
         tf_gemm_q8_tm_task *tasks = (tf_gemm_q8_tm_task *)alloca(n_threads * sizeof(tf_gemm_q8_tm_task));
         int rows_per = n_rows / n_threads, extra = n_rows % n_threads, offset = 0;
@@ -4509,10 +12924,35 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
         }
         for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
         return;
+#endif
     }
     if (mat->type == GGML_TYPE_BF16) {
         /* BF16 GEMM path */
         int K = mat->n_cols;
+#ifdef TF_HAVE_BF16_PODD
+        {   static int podd = -1;
+            if (podd < 0) podd = getenv("TF_PODD") && atoi(getenv("TF_PODD"));
+            /* podd_packed weights (pre-packed at load) -> ALWAYS use podd at ANY N (the
+             * kernel pads tokens to NR=12; the blocked path below would MISREAD the
+             * k-major-packed layout as row-major -> corruption). Needed for spec/batched
+             * decode (N=d+1 < 12). On-the-fly podd only at small K + N>=12 (pack amortizes). */
+            if (podd && (mat->podd_packed ? (N >= 1) : (N >= 12 && K < 4096)) &&
+                tf_gemm_bf16_podd(Y_out, (const uint16_t *)mat->data, X,
+                                  n_rows, K, N, out_stride, X_stride,
+                                  n_threads > 1 ? n_threads : 1, mat->podd_packed))
+                return;
+        }
+#endif
+#ifdef TF_HAVE_BF16_BLOCKED
+        /* prefill (N>=4): register-blocked, PINNED OpenMP (raw pthreads below float
+         * across CMGs -> cross-CMG weight reads). N=1 decode keeps the matvec path. */
+        if (N >= 4) {
+            tf_gemm_bf16_blocked(Y_out, (const uint16_t *)mat->data, X,
+                                 n_rows, K, N, out_stride, X_stride,
+                                 n_threads > 1 ? n_threads : 1);
+            return;
+        }
+#endif
         if (n_threads <= 1 || n_rows < n_threads * 4) {
             gemm_bf16_f32_tokmajor(Y_out, (const uint16_t *)mat->data, X,
                                     n_rows, K, N, out_stride, X_stride);
@@ -4532,43 +12972,50 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
         for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
         return;
     }
-    if (mat->type != GGML_TYPE_F16) {
-        /* Fallback for other non-F16/BF16: per-token matvec */
-        int n_cols = mat->n_cols;
-        float *row_buf = (float *)malloc(n_cols * sizeof(float));
-        size_t rb = tf_row_bytes(mat->type, n_cols);
-        for (int t = 0; t < N; t++) {
-            const float *xt = X + (size_t)t * X_stride;
-            for (int r = 0; r < n_rows; r++) {
-                const void *row_data = (const uint8_t *)mat->data + (size_t)r * rb;
-                dequant_row(mat->type, row_data, row_buf, n_cols);
-#if defined(__AVX2__) && defined(__FMA__)
-                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-                __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
-                int j = 0;
-                for (; j + 31 < n_cols; j += 32) {
-                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j),    _mm256_loadu_ps(xt+j),    a0);
-                    a1 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+8),  _mm256_loadu_ps(xt+j+8),  a1);
-                    a2 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+16), _mm256_loadu_ps(xt+j+16), a2);
-                    a3 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j+24), _mm256_loadu_ps(xt+j+24), a3);
-                }
-                for (; j + 7 < n_cols; j += 8)
-                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row_buf+j), _mm256_loadu_ps(xt+j), a0);
-                a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
-                __m128 hi = _mm256_extractf128_ps(a0, 1), lo = _mm256_castps256_ps128(a0);
-                __m128 s4 = _mm_add_ps(lo, hi);
-                s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
-                s4 = _mm_add_ss(s4, _mm_movehdup_ps(s4));
-                float sum = _mm_cvtss_f32(s4);
-                for (; j < n_cols; j++) sum += row_buf[j] * xt[j];
-#else
-                float sum = 0.0f;
-                for (int j = 0; j < n_cols; j++) sum += row_buf[j] * xt[j];
-#endif
-                Y_out[(size_t)t * out_stride + r] = sum;
-            }
+    if (mat->type == GGML_TYPE_Q4_0) {
+        int K = mat->n_cols;
+        int nt = n_threads;
+        if (nt < 1) nt = 1;
+        if (nt > n_rows) nt = n_rows;
+        if (nt <= 1 || n_rows < 8) {
+            tf_gemm_qtensor_tm_task task = {Y_out, mat, X, 0, n_rows, K, N, out_stride, X_stride};
+            (void)tf_gemm_q4_0_tm_worker(&task);
+            return;
         }
-        free(row_buf);
+        pthread_t *threads = (pthread_t *)alloca((size_t)nt * sizeof(pthread_t));
+        tf_gemm_qtensor_tm_task *tasks = (tf_gemm_qtensor_tm_task *)alloca((size_t)nt * sizeof(tf_gemm_qtensor_tm_task));
+        int rows_per = n_rows / nt, extra = n_rows % nt, offset = 0;
+        for (int i = 0; i < nt; i++) {
+            int count = rows_per + (i < extra ? 1 : 0);
+            tasks[i] = (tf_gemm_qtensor_tm_task){Y_out, mat, X, offset, offset + count,
+                                                 K, N, out_stride, X_stride};
+            offset += count;
+            pthread_create(&threads[i], NULL, tf_gemm_q4_0_tm_worker, &tasks[i]);
+        }
+        for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
+        return;
+    }
+    if (mat->type != GGML_TYPE_F16) {
+        int K = mat->n_cols;
+        int nt = n_threads;
+        if (nt < 1) nt = 1;
+        if (nt > n_rows) nt = n_rows;
+        if (nt <= 1 || n_rows < 8) {
+            tf_gemm_qtensor_tm_task task = {Y_out, mat, X, 0, n_rows, K, N, out_stride, X_stride};
+            (void)tf_gemm_qtensor_tm_worker(&task);
+            return;
+        }
+        pthread_t *threads = (pthread_t *)alloca((size_t)nt * sizeof(pthread_t));
+        tf_gemm_qtensor_tm_task *tasks = (tf_gemm_qtensor_tm_task *)alloca((size_t)nt * sizeof(tf_gemm_qtensor_tm_task));
+        int rows_per = n_rows / nt, extra = n_rows % nt, offset = 0;
+        for (int i = 0; i < nt; i++) {
+            int count = rows_per + (i < extra ? 1 : 0);
+            tasks[i] = (tf_gemm_qtensor_tm_task){Y_out, mat, X, offset, offset + count,
+                                                 K, N, out_stride, X_stride};
+            offset += count;
+            pthread_create(&threads[i], NULL, tf_gemm_qtensor_tm_worker, &tasks[i]);
+        }
+        for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
         return;
     }
 
@@ -4592,6 +13039,131 @@ static void tf_gemm_f16_mt_tokenmajor(float *Y_out, const qtensor *mat, const fl
         pthread_create(&threads[i], NULL, tf_gemm_tm_worker, &tasks[i]);
     }
     for (int i = 0; i < n_threads; i++) pthread_join(threads[i], NULL);
+}
+
+size_t transformer_prepack_prefill_pv48_range(transformer_model *m,
+                                               int layer_start, int layer_end) {
+#if defined(TF_LINK_BF16PV48) && defined(__ARM_FEATURE_SVE)
+    if (!m || !m->layers || layer_start < 0 || layer_end > m->n_layers ||
+        layer_start >= layer_end) return 0;
+    size_t total = 0; int count = 0;
+    for (int l = layer_start; l < layer_end; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+            &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta, &L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws)/sizeof(ws[0]); i++) {
+            qtensor *w = ws[i];
+            if (!w->data || w->type != GGML_TYPE_BF16 || w->prefill_pv48 ||
+                w->n_cols % 4) continue;
+            k3_bf16_matrix km = {(const uint16_t *)w->data, w->n_rows, w->n_cols};
+            size_t bytes = k3_prefill_bf16_packed_bytes(w->n_rows, w->n_cols);
+            uint16_t *p = (uint16_t *)tf_aligned_alloc_notouch(256, bytes);
+            if (!p || k3_prefill_pack_bf16_pv(p, bytes, &km, m->n_threads) != 0 ||
+                tf_decode_owned_add(m, p) != 0) {
+                if (p) free(p);
+                fprintf(stderr, "prefill pv48: pack failed layer=%d tensor=%zu\n", l, i);
+                return total;
+            }
+            w->prefill_pv48 = p; total += bytes; count++;
+        }
+    }
+    fprintf(stderr, "prefill pv48: layers=[%d,%d) tensors=%d packed=%.3fGB\n",
+            layer_start, layer_end, count, (double)total/1e9);
+    return total;
+#else
+    (void)m; (void)layer_start; (void)layer_end; return 0;
+#endif
+}
+
+static size_t tf_release_prefill_pv48_tensor(transformer_model *m, qtensor *w) {
+    if (!m || !w || !w->prefill_pv48) return 0;
+    size_t bytes = 0;
+#if defined(TF_LINK_BF16PV48) && defined(__ARM_FEATURE_SVE)
+    if (w->n_rows > 0 && w->n_cols > 0)
+        bytes = k3_prefill_bf16_packed_bytes(w->n_rows, w->n_cols);
+#endif
+    void *p = w->prefill_pv48;
+    for (int i = 0; i < m->decode_owned_count; i++) {
+        if (m->decode_owned[i] == p) {
+            m->decode_owned[i] = NULL;
+            break;
+        }
+    }
+    free(p);
+    w->prefill_pv48 = NULL;
+    return bytes;
+}
+
+size_t transformer_release_prefill_pv48_range(transformer_model *m,
+                                               int layer_start, int layer_end) {
+    if (!m || !m->layers) return 0;
+    if (layer_start < 0) layer_start = 0;
+    if (layer_end > m->n_layers) layer_end = m->n_layers;
+    size_t total = 0;
+    int count = 0;
+    for (int l = layer_start; l < layer_end; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+            &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta, &L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            size_t n = tf_release_prefill_pv48_tensor(m, ws[i]);
+            if (n) { total += n; count++; }
+        }
+    }
+    fprintf(stderr, "prefill pv48: released layers=[%d,%d) tensors=%d %.3fGB\n",
+            layer_start, layer_end, count, (double)total / 1e9);
+    return total;
+}
+
+static size_t tf_pack_bf16_pv_tensor_inplace(transformer_model *m, qtensor *w) {
+    if (!m || !w || !w->data || w->type != GGML_TYPE_BF16 || w->bf16_pv ||
+        w->i8 || (w->n_rows & 7) || (w->n_cols & 15) || w->n_rows < 8)
+        return 0;
+    int nt = m->n_threads > 1 && m->pool_alive ? m->n_threads : 1;
+    if (nt > 1) {
+        tf_bf16_pv_pack_task *tasks =
+            (tf_bf16_pv_pack_task *)alloca((size_t)nt * sizeof(*tasks));
+        for (int t = 0; t < nt; t++)
+            tasks[t] = (tf_bf16_pv_pack_task){(const uint16_t *)w->data,
+                (uint16_t *)w->data, w->n_rows, w->n_cols, t, nt};
+        tf_pool_dispatch(m, tf_bf16_pv_pack_worker, tasks, sizeof(*tasks));
+    } else {
+        tf_bf16_pv_pack_task task = {(const uint16_t *)w->data,
+            (uint16_t *)w->data, w->n_rows, w->n_cols, 0, 1};
+        tf_bf16_pv_pack_worker(&task);
+    }
+    w->bf16_pv = 1;
+    return (size_t)w->n_rows * (size_t)w->n_cols * sizeof(uint16_t);
+}
+
+size_t transformer_pack_bf16_pv_range_inplace(transformer_model *m,
+                                               int layer_start, int layer_end,
+                                               int include_output) {
+    if (!m || !m->layers) return 0;
+    if (layer_start < 0) layer_start = 0;
+    if (layer_end > m->n_layers) layer_end = m->n_layers;
+    size_t total = 0;
+    int count = 0;
+    for (int l = layer_start; l < layer_end; l++) {
+        transformer_layer *L = &m->layers[l];
+        qtensor *ws[] = {&L->ffn_gate, &L->ffn_up, &L->ffn_down,
+            &L->attn_q, &L->attn_k, &L->attn_v, &L->attn_output,
+            &L->ssm_qkv, &L->ssm_gate, &L->ssm_alpha, &L->ssm_beta, &L->ssm_out};
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) {
+            size_t n = tf_pack_bf16_pv_tensor_inplace(m, ws[i]);
+            if (n) { total += n; count++; }
+        }
+    }
+    if (include_output) {
+        size_t n = tf_pack_bf16_pv_tensor_inplace(m, &m->output);
+        if (n) { total += n; count++; }
+    }
+    fprintf(stderr, "bf16 pv8 inplace: layers=[%d,%d) tensors=%d %.3fGB%s\n",
+            layer_start, layer_end, count, (double)total / 1e9,
+            include_output ? " +lm_head" : "");
+    return total;
 }
 
 /* Fused dual-matrix threaded GEMM: compute gate and up simultaneously, reading X once */
@@ -4688,6 +13260,34 @@ static void tf_silu_mul_avx2(float *out, const float *gate, const float *up, int
         _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_mul_ps(g, sig), u));
     }
     for (; i < n; i++) {
+        float g = gate[i];
+        out[i] = g / (1.0f + expf(-g)) * up[i];
+    }
+}
+#elif defined(__ARM_FEATURE_SVE)
+static void tf_silu_mul_avx2(float *out, const float *gate, const float *up, int n) {
+    static int use_sve=-1;
+    if(use_sve<0){const char*e=getenv("TF_SILU_SVE");use_sve=e&&atoi(e)!=0;}
+    if(use_sve){
+        int vl=(int)svcntw();
+        static int use_omp=-1;
+        if(use_omp<0){const char*e=getenv("TF_SILU_OMP");use_omp=e?atoi(e)!=0:1;}
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if(use_omp)
+        #endif
+        for(int i=0;i<n;i+=vl){
+            svbool_t pg=svwhilelt_b32((uint64_t)i,(uint64_t)n);
+            svfloat32_t g=svld1(pg,gate+i),u=svld1(pg,up+i);
+            svfloat32_t x=svmul_n_f32_x(pg,g,-1.4426950408889634f);
+            x=svmax_n_f32_x(pg,svmin_n_f32_x(pg,x,80.0f),-80.0f);
+            svfloat32_t den=svadd_n_f32_x(pg,tf_exp2_fexpa_approx_sve(pg,x),1.0f);
+            svfloat32_t inv=svrecpe_f32(den);
+            inv=svmul_f32_x(pg,inv,svrecps_f32(den,inv));
+            svst1(pg,out+i,svmul_f32_x(pg,svmul_f32_x(pg,g,inv),u));
+        }
+        return;
+    }
+    for (int i = 0; i < n; i++) {
         float g = gate[i];
         out[i] = g / (1.0f + expf(-g)) * up[i];
     }
@@ -4807,7 +13407,12 @@ static void tf_rope_mrope_batch(float *bq, float *bk, int N, int n_heads, int n_
 /* Batched RMSNorm: apply to N tokens. bx[i] = rmsnorm(bx_in[i], w) */
 static void tf_rmsnorm_batch(float *dst, const float *src, const qtensor *w,
                               int n_embd, int N, float eps, float *w_buf) {
-    tf_dequant_row(w, 0, w_buf);
+    const float *wv = w->type == GGML_TYPE_F32 ? (const float *)w->data : w_buf;
+    if (wv == w_buf) tf_dequant_row(w, 0, w_buf);
+    /* per-token independent (w_buf shared read-only) -> parallelize over tokens */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(N >= 8)
+    #endif
     for (int t = 0; t < N; t++) {
         const float *xi = src + (size_t)t * n_embd;
         float *yi = dst + (size_t)t * n_embd;
@@ -4830,15 +13435,97 @@ static void tf_rmsnorm_batch(float *dst, const float *src, const qtensor *w,
         i = 0;
         for (; i + 7 < n_embd; i += 8)
             _mm256_storeu_ps(yi + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xi + i), vscale),
-                                                     _mm256_loadu_ps(w_buf + i)));
-        for (; i < n_embd; i++) yi[i] = xi[i] * ss * w_buf[i];
+                                                     _mm256_loadu_ps(wv + i)));
+        for (; i < n_embd; i++) yi[i] = xi[i] * ss * wv[i];
+#elif defined(__ARM_FEATURE_SVE)
+        svbool_t pt = svptrue_b32(); int vl = (int)svcntw();
+        svfloat32_t vss = svdup_f32(0);
+        for (int i = 0; i < n_embd; i += vl) { svbool_t pg = svwhilelt_b32(i, n_embd);
+            svfloat32_t vx = svld1(pg, xi + i); vss = svmla_m(pg, vss, vx, vx); }
+        float ss = 1.0f / sqrtf(svaddv(pt, vss) / n_embd + eps);
+        svfloat32_t vsc = svdup_f32(ss);
+        for (int i = 0; i < n_embd; i += vl) { svbool_t pg = svwhilelt_b32(i, n_embd);
+            svst1(pg, yi + i, svmul_x(pg, svmul_x(pg, svld1(pg, xi + i), vsc), svld1(pg, wv + i))); }
 #else
         float ss = 0.0f;
         for (int i = 0; i < n_embd; i++) ss += xi[i] * xi[i];
         ss = 1.0f / sqrtf(ss / n_embd + eps);
-        for (int i = 0; i < n_embd; i++) yi[i] = xi[i] * ss * w_buf[i];
+        for (int i = 0; i < n_embd; i++) yi[i] = xi[i] * ss * wv[i];
 #endif
     }
+}
+
+/* RMSNorm plus the p-odd token pack consumed by the following BF16
+ * projections. The FP32 dst is retained for fallback/small projections, while
+ * the first p-odd GEMM observes a cache hit and skips its separate pack pass. */
+static int tf_rmsnorm_batch_pack_podd(float *dst, const float *src,
+        const qtensor *w, int K, int N, float eps, float *w_buf, int nt) {
+#if defined(TF_HAVE_BF16_PODD) && defined(__ARM_FEATURE_SVE)
+    const int PNR = 12;
+    const char *cmg = getenv("TF_PODD_CMG");
+    if (cmg && atoi(cmg) != 0) return 0;
+    int TT = (N + PNR - 1) / PNR;
+    size_t xn = (size_t)TT * K * PNR * sizeof(uint16_t);
+    if (xn > tf_podd_Xcap) {
+        free(tf_podd_Xa);
+        tf_podd_Xa = (uint16_t *)tf_aligned_alloc_notouch(256, xn);
+        tf_podd_Xcap = tf_podd_Xa ? xn : 0;
+    }
+    if (!tf_podd_Xa) return 0;
+    const float *wv = w->type == GGML_TYPE_F32 ? (const float *)w->data : w_buf;
+    if (wv == w_buf) tf_dequant_row(w, 0, w_buf);
+    int vl = (int)svcntw();
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int tok = 0; tok < TT * PNR; tok++) {
+        int tt = tok / PNR, n = tok % PNR;
+        uint16_t *xb = tf_podd_Xa + (size_t)tt * K * PNR;
+        svuint32_t lanes = svindex_u32((uint32_t)n, (uint32_t)PNR);
+        if (tok >= N) {
+            for (int i = 0; i < K; i += vl) {
+                svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)K);
+                svst1h_scatter_u32index_u32(pg, xb,
+                    svadd_n_u32_x(pg, lanes, (uint32_t)(i * PNR)),
+                    svdup_u32(0));
+            }
+            continue;
+        }
+        const float *xi = src + (size_t)tok * K;
+        float *yi = dst ? dst + (size_t)tok * K : NULL;
+        svbool_t pt = svptrue_b32();
+        svfloat32_t ss = svdup_f32(0);
+        for (int i = 0; i < K; i += vl) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)K);
+            svfloat32_t x = svld1(pg, xi + i);
+            ss = svmla_f32_m(pg, ss, x, x);
+        }
+        svfloat32_t sc = svdup_f32(1.0f /
+            sqrtf(svaddv_f32(pt, ss) / K + eps));
+        for (int i = 0; i < K; i += vl) {
+            svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)K);
+            svfloat32_t y = svmul_f32_x(pg,
+                svmul_f32_x(pg, svld1(pg, xi + i), sc), svld1(pg, wv + i));
+            if (yi) svst1(pg, yi + i, y);
+            svuint32_t hi = svlsr_n_u32_x(pg, svreinterpret_u32_f32(y), 16);
+            svst1h_scatter_u32index_u32(pg, xb,
+                svadd_n_u32_x(pg, lanes, (uint32_t)(i * PNR)), hi);
+        }
+    }
+    if (dst) {
+        tf_podd_cache_x = dst; tf_podd_cache_n = N;
+        tf_podd_cache_k = K; tf_podd_cache_xs = K;
+        size_t count = (size_t)N * K;
+        for (int i = 0; i < 8; i++)
+            tf_podd_cache_tag[i] = dst[count * (size_t)i / 8];
+    } else {
+        tf_podd_cache_x = NULL;
+    }
+    return 1;
+#else
+    (void)dst; (void)src; (void)w; (void)K; (void)N;
+    (void)eps; (void)w_buf; (void)nt; return 0;
+#endif
 }
 
 /* Batched QK-norm: per-head RMSNorm for N tokens */
@@ -4846,6 +13533,11 @@ static void tf_qk_norm_batch(float *vec, int n_heads, int head_dim, int N,
                                const qtensor *norm_w, float eps, float *w_buf) {
     tf_dequant_row(norm_w, 0, w_buf);
     int vec_dim = n_heads * head_dim;
+    /* parallel over (token,head): N*n_heads work items (was N-only -> for k/v with
+     * few tokens/heads it starved threads). Each (t,h) writes a disjoint slice. */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) collapse(2)
+    #endif
     for (int t = 0; t < N; t++) {
         for (int h = 0; h < n_heads; h++) {
             float *v = vec + (size_t)t * vec_dim + h * head_dim;
@@ -4870,6 +13562,15 @@ static void tf_qk_norm_batch(float *vec, int n_heads, int head_dim, int N,
                 _mm256_storeu_ps(v + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(v + i), vscale),
                                                        _mm256_loadu_ps(w_buf + i)));
             for (; i < head_dim; i++) v[i] = v[i] * ss * w_buf[i];
+#elif defined(__ARM_FEATURE_SVE)
+            svbool_t pt = svptrue_b32(); int vl = (int)svcntw();
+            svfloat32_t vss = svdup_f32(0);
+            for (int i = 0; i < head_dim; i += vl) { svbool_t pg = svwhilelt_b32(i, head_dim);
+                svfloat32_t vx = svld1(pg, v + i); vss = svmla_m(pg, vss, vx, vx); }
+            float ss = 1.0f / sqrtf(svaddv(pt, vss) / head_dim + eps);
+            svfloat32_t vsc = svdup_f32(ss);
+            for (int i = 0; i < head_dim; i += vl) { svbool_t pg = svwhilelt_b32(i, head_dim);
+                svst1(pg, v + i, svmul_x(pg, svmul_x(pg, svld1(pg, v + i), vsc), svld1(pg, w_buf + i))); }
 #else
             float ss = 0.0f;
             for (int i = 0; i < head_dim; i++) ss += v[i] * v[i];
@@ -5191,9 +13892,19 @@ static void *tf_attn_gemm_worker(void *arg) {
 
 /* Timing helper */
 static inline double tf_time_ms(void) {
+#if defined(__aarch64__)
+    /* cntvct_el0 is substantially cheaper than clock_gettime on A64FX and is
+     * stable across the cores used by the persistent pool. */
+    static uint64_t freq;
+    if (!freq) __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+    uint64_t ticks;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(ticks));
+    return (double)ticks * 1000.0 / (double)freq;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+#endif
 }
 
 float *transformer_forward_batch_logits(transformer_model *m, const transformer_batch *b) {
@@ -5222,18 +13933,19 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
     double t0p;
 
     /* Allocate batch scratch buffers */
-    float *bx     = (float *)malloc((size_t)N * n_embd * sizeof(float));
-    float *bxb    = (float *)malloc((size_t)N * n_embd * sizeof(float));
-    float *bq     = (float *)malloc((size_t)N * q_dim * sizeof(float));
-    float *bk     = (float *)malloc((size_t)N * kv_dim * sizeof(float));
-    float *bv     = (float *)malloc((size_t)N * kv_dim * sizeof(float));
-    float *bxb2   = (float *)malloc((size_t)N * q_dim * sizeof(float));
-    float *bffn1  = (float *)malloc((size_t)N * n_ff * sizeof(float));
-    float *bffn2  = (float *)malloc((size_t)N * n_ff * sizeof(float));
-    float *bffn3  = (float *)malloc((size_t)N * n_ff * sizeof(float));
+    float *bx     = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_embd * sizeof(float));
+    float *bxb    = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_embd * sizeof(float));
+    float *bq     = (float *)tf_aligned_alloc_notouch(256, (size_t)N * q_dim * sizeof(float));
+    float *bk     = (float *)tf_aligned_alloc_notouch(256, (size_t)N * kv_dim * sizeof(float));
+    float *bv     = (float *)tf_aligned_alloc_notouch(256, (size_t)N * kv_dim * sizeof(float));
+    float *bxb2   = (float *)tf_aligned_alloc_notouch(256, (size_t)N * q_dim * sizeof(float));
+    float *bffn1  = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_ff * sizeof(float));
+    float *bffn2  = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_ff * sizeof(float));
+    float *bffn3  = (float *)tf_aligned_alloc_notouch(256, (size_t)N * n_ff * sizeof(float));
 
     /* Per-thread attention score scratch: each thread needs [max_seq_len] */
-    float *batch_att_scratch = (float *)malloc((size_t)m->n_threads * m->max_seq_len * sizeof(float));
+    float *batch_att_scratch = (float *)tf_aligned_alloc_notouch(256,
+        (size_t)m->n_threads * m->max_seq_len * sizeof(float));
 
     /* Copy input embeddings to bx (extract n_embd from embd_stride) */
     for (int t = 0; t < N; t++) {
@@ -5409,6 +14121,1085 @@ float *transformer_forward_batch_logits(transformer_model *m, const transformer_
     if (pool_was_alive) tf_pool_start(m);
 
     return m->logits;
+}
+
+static void tf_gemma4_rope_batch(transformer_model *m, transformer_layer *layer,
+                                  float *bq, float *bk, const int *pos,
+                                  int N, int n_heads, int n_kv_heads,
+                                  int hd, int q_dim, int kv_dim) {
+    float *inv_freq = layer->is_swa ? m->rope_inv_freq_swa : m->rope_inv_freq;
+    int half = hd / 2;
+    int nt = m->n_threads > 1 ? m->n_threads : 1;
+#if !defined(_OPENMP)
+    (void)nt;
+#endif
+    /* parallel over tokens; cos/sin depend only on (token,j) so hoist out of the
+     * head loop (was recomputed per head -> ~n_heads x redundant trig). */
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    #endif
+    for (int t = 0; t < N; t++) {
+        int p = pos[t];
+        float cs[256], sn[256];   /* half = hd/2 <= 256 */
+        for (int j = 0; j < half; j++) { float f = (float)p * inv_freq[j]; cs[j] = cosf(f); sn[j] = sinf(f); }
+        for (int h = 0; h < n_heads; h++) {
+            float *qh = bq + (size_t)t * q_dim + h * hd;
+#if defined(__ARM_FEATURE_SVE)
+            for (int j = 0; j < half; j += (int)svcntw()) { svbool_t pg = svwhilelt_b32(j, half);
+                svfloat32_t r0 = svld1(pg, qh + j), r1 = svld1(pg, qh + j + half);
+                svfloat32_t c = svld1(pg, cs + j), s = svld1(pg, sn + j);
+                svst1(pg, qh + j,        svmls_x(pg, svmul_x(pg, r0, c), r1, s));   /* r0*c - r1*s */
+                svst1(pg, qh + j + half, svmla_x(pg, svmul_x(pg, r0, s), r1, c)); } /* r0*s + r1*c */
+#else
+            for (int j = 0; j < half; j++) {
+                float r0 = qh[j], r1 = qh[j + half];
+                qh[j] = r0 * cs[j] - r1 * sn[j];
+                qh[j + half] = r0 * sn[j] + r1 * cs[j];
+            }
+#endif
+        }
+        if (layer->shared_kv_source < 0) {
+            for (int h = 0; h < n_kv_heads; h++) {
+                float *kh = bk + (size_t)t * kv_dim + h * hd;
+#if defined(__ARM_FEATURE_SVE)
+                for (int j = 0; j < half; j += (int)svcntw()) { svbool_t pg = svwhilelt_b32(j, half);
+                    svfloat32_t r0 = svld1(pg, kh + j), r1 = svld1(pg, kh + j + half);
+                    svfloat32_t c = svld1(pg, cs + j), s = svld1(pg, sn + j);
+                    svst1(pg, kh + j,        svmls_x(pg, svmul_x(pg, r0, c), r1, s));
+                    svst1(pg, kh + j + half, svmla_x(pg, svmul_x(pg, r0, s), r1, c)); }
+#else
+                for (int j = 0; j < half; j++) {
+                    float r0 = kh[j], r1 = kh[j + half];
+                    kh[j] = r0 * cs[j] - r1 * sn[j];
+                    kh[j + half] = r0 * sn[j] + r1 * cs[j];
+                }
+#endif
+            }
+        }
+    }
+}
+
+static void tf_gemma4_raw_v_norm_batch(float *bv, int N, int n_kv_heads,
+                                        int hd, int kv_dim, float eps) {
+    for (int t = 0; t < N; t++) {
+        for (int h = 0; h < n_kv_heads; h++) {
+            float *v = bv + (size_t)t * kv_dim + h * hd;
+            float ss = 0.0f;
+            for (int i = 0; i < hd; i++) ss += v[i] * v[i];
+            ss = 1.0f / sqrtf(ss / hd + eps);
+            for (int i = 0; i < hd; i++) v[i] *= ss;
+        }
+    }
+}
+
+#if defined(__ARM_FEATURE_SVE)
+/* Vectorized FEXPA expf (from a64fx/gemma4-kernels/attn_profile.c): exp(v)=2^(v*log2e);
+ * the fexpa core gives 2^round_{1/64}(u), then *(1+r*ln2) recovers the residual ->
+ * ~1e-3, libm-class for softmax. SH=204927.0f is the magic shift. */
+#define TF_FEXPA_SH 204927.0f
+static inline svfloat32_t tf_sve_expf(svbool_t pg, svfloat32_t v) {
+    const float L2E = 1.4426950408889634f, LN2 = 0.6931471805599453f;
+    svfloat32_t u  = svmul_x(pg, v, svdup_f32(L2E));
+    svfloat32_t z  = svadd_x(pg, u, svdup_f32(TF_FEXPA_SH));
+    svfloat32_t sc; __asm__("fexpa %0.s, %1.s" : "=w"(sc) : "w"(z));
+    svfloat32_t lg = svsub_x(pg, z, svdup_f32(TF_FEXPA_SH));
+    svfloat32_t r  = svsub_x(pg, u, lg);
+    return svmul_x(pg, sc, svmla_x(pg, svdup_f32(1.0f), r, svdup_f32(LN2)));
+}
+#endif
+
+static void tf_gemma4_attention_batch(transformer_model *m, transformer_layer *layer,
+                                       float *bq, float *bxb2, const int *pos,
+                                       int N, int kv_src, int n_heads,
+                                       int n_kv_heads, int hd, int q_dim,
+                                       int kv_dim, int gqa, int kv_head_offset) {
+    memset(bxb2, 0, (size_t)N * q_dim * sizeof(float));
+    /* Parallel over (token,head): each (t,h) writes a disjoint bxb2[t*q_dim+h*hd]
+     * region and uses a thread-local score buffer -> race-free. */
+    int nt = m->n_threads > 1 ? m->n_threads : 1;
+#if !defined(_OPENMP)
+    (void)nt;
+#endif
+#if defined(__ARM_FEATURE_SVE)
+    /* SVE fp32 path (TF_ATTN_SVE=1 default): vectorize QK^T dot, FEXPA softmax, PV
+     * accumulate. Only for the F32 KV cache (the default); F16 KV falls back to scalar. */
+    static int attn_sve = -1;
+    if (attn_sve < 0) { const char *e = getenv("TF_ATTN_SVE"); attn_sve = (e && atoi(e) == 0) ? 0 : 1; }
+    int use_sve = attn_sve && m->kv_cache_type == 0;
+#else
+    int use_sve = 0;
+#if !defined(__ARM_FEATURE_SVE)
+    (void)use_sve;
+    (void)n_kv_heads;
+#endif
+#endif
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+    #endif
+    {
+        float *att = (float *)malloc((size_t)m->max_seq_len * sizeof(float));
+        #ifdef _OPENMP
+        #pragma omp for collapse(2) schedule(dynamic)
+        #endif
+        for (int t = 0; t < N; t++) {
+            for (int h = 0; h < n_heads; h++) {
+                int cur_pos = pos[t];
+                int start = 0, seq_len = cur_pos + 1;
+                if (layer->is_swa && seq_len > m->swa_window_size) {
+                    start = cur_pos - m->swa_window_size + 1;
+                    seq_len = m->swa_window_size;
+                }
+                float *qh = bq + (size_t)t * q_dim + h * hd;
+                int kv_h = (kv_head_offset + h) / gqa;   /* TP: GLOBAL head index (KV replicated) */
+                float *out_h = bxb2 + (size_t)t * q_dim + h * hd;
+#if defined(__ARM_FEATURE_SVE)
+                if (use_sve) {
+                    const float *Kc = m->key_cache[kv_src];
+                    const float *Vc = m->value_cache[kv_src];
+                    svbool_t pt = svptrue_b32();
+                    /* QK^T: dot(qh, K_slot) over hd (multiple of VL) */
+                    for (int p = 0; p < seq_len; p++) {
+                        int abs_pos = start + p;
+                        int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
+                        const float *kp = Kc + (size_t)slot * kv_dim + (size_t)kv_h * hd;
+                        svfloat32_t acc = svdup_f32(0);
+                        for (int d = 0; d < hd; d += (int)svcntw())
+                            acc = svmla_x(pt, acc, svld1(pt, qh + d), svld1(pt, kp + d));
+                        att[p] = svaddv(pt, acc);
+                    }
+                    /* softmax: max, then FEXPA exp + sum (vectorized over p) */
+                    float max_s = att[0];
+                    for (int p = 1; p < seq_len; p++) if (att[p] > max_s) max_s = att[p];
+                    svfloat32_t vmax = svdup_f32(max_s), vsum = svdup_f32(0);
+                    int p = 0;
+                    for (; p + (int)svcntw() <= seq_len; p += (int)svcntw()) {
+                        svfloat32_t e = tf_sve_expf(pt, svsub_x(pt, svld1(pt, att + p), vmax));
+                        svst1(pt, att + p, e); vsum = svadd_x(pt, vsum, e);
+                    }
+                    float sum_e = svaddv(pt, vsum);
+                    for (; p < seq_len; p++) { float e = expf(att[p] - max_s); att[p] = e; sum_e += e; }
+                    float inv_sum = 1.0f / sum_e;
+                    /* PV: out_h[d] += (att[p]*inv_sum) * V_slot[d], accumulate over p */
+                    for (int q = 0; q < seq_len; q++) {
+                        int abs_pos = start + q;
+                        int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
+                        const float *vp = Vc + (size_t)slot * kv_dim + (size_t)kv_h * hd;
+                        svfloat32_t w = svdup_f32(att[q] * inv_sum);
+                        for (int d = 0; d < hd; d += (int)svcntw())
+                            svst1(pt, out_h + d, svmla_x(pt, svld1(pt, out_h + d), w, svld1(pt, vp + d)));
+                    }
+                    continue;
+                }
+#endif
+                for (int p = 0; p < seq_len; p++) {
+                    int abs_pos = start + p;
+                    int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
+                    size_t kbase = (size_t)slot * kv_dim + (size_t)kv_h * hd;
+                    float score = 0.0f;
+                    for (int d = 0; d < hd; d++) score += qh[d] * tf_kv_load_key(m, kv_src, kbase + d);
+                    att[p] = score;
+                }
+                float max_s = att[0];
+                for (int p = 1; p < seq_len; p++) if (att[p] > max_s) max_s = att[p];
+                float sum_e = 0.0f;
+                for (int p = 0; p < seq_len; p++) { att[p] = expf(att[p] - max_s); sum_e += att[p]; }
+                float inv_sum = 1.0f / sum_e;
+                for (int p = 0; p < seq_len; p++) {
+                    int abs_pos = start + p;
+                    int slot = layer->is_swa ? (abs_pos % m->swa_window_size) : abs_pos;
+                    size_t vbase = (size_t)slot * kv_dim + (size_t)kv_h * hd;
+                    float w = att[p] * inv_sum;
+                    for (int d = 0; d < hd; d++) out_h[d] += w * tf_kv_load_value(m, kv_src, vbase + d);
+                }
+            }
+        }
+        free(att);
+    }
+}
+
+/* Batched-decode verify hook: if set (size N*n_vocab), prefill_batch fills it with
+ * lm_head logits for ALL N tokens (not just the last) via a single batched GEMM ->
+ * the foundation for speculative/batched decode. NULL = current last-token behavior. */
+float *tf_batch_all_logits = NULL;
+/* Spec-decode: keep the thread pool ALIVE across prefill_batch calls (skip the
+ * shutdown/restart churn ~0.4s/call -- the prefill body is all OMP; pool threads just
+ * sleep) and silence the per-call profile. */
+int tf_batch_keep_pool = 0;
+int tf_batch_quiet = 0;
+/* Spec verifier may reserve a disjoint core subset for an asynchronous draft
+ * pool. Zero keeps the model's normal thread count. */
+int tf_batch_threads = 0;
+/* TP verify: vocab-slice the all_logits lm_head to rows [v0,v1) of m->output (the lm_head
+ * is token_embd, REPLICATED full -> recomputing the whole 262144 vocab on every rank is the
+ * verify's biggest redundant read). Each rank fills all_logits[N x (v1-v0)]; the caller does
+ * per-position local argmax (offset v0) + all-reduce-argmax. v0<0 = full vocab (default). */
+int tf_batch_logit_v0 = -1, tf_batch_logit_v1 = -1;
+/* If set, prefill_batch points this at the [N x n_embd] post-block hidden states (the
+ * pre-output-norm residual stream) so an MTP/draft head can fuse them. */
+float **tf_batch_hidden_out = NULL;
+/* Qwen's hybrid prefill uses transient malloc scratch (unlike Gemma's model
+ * pool), so retain a small reusable copy when the speculative caller requests
+ * all per-position hidden rows.  K is normally <=4: this is kilobytes, not a
+ * second weight/state allocation. */
+static float *tf_qwen_batch_hidden = NULL;
+static size_t tf_qwen_batch_hidden_cap = 0;
+
+static float *tf_gemma4_prefill_batch(transformer_model *m, const int32_t *tokens,
+                                      int n_tokens, int start_pos) {
+    if (!m || !tokens || n_tokens <= 0 || !m->is_gemma4) return NULL;
+    if (m->n_embd_per_layer > 0 || m->per_layer_token_embd.data) {
+        fprintf(stderr, "transformer: Gemma4 batch prefill: PLE models not supported, using token loop\n");
+        return NULL;
+    }
+
+    int N = n_tokens;
+    int n_embd = m->n_embd;
+    int n_heads = m->n_heads;
+    int max_q_dim = n_heads * m->head_dim;
+    int max_kv_dim = 0;
+    for (int l = 0; l < m->n_layers; l++) {
+        transformer_layer *layer = &m->layers[l];
+        int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
+        int l_kvh = layer->n_kv_heads > 0 ? layer->n_kv_heads : m->n_kv_heads;
+        int local_kv_dim = l_kvh * hd;
+        if (local_kv_dim > max_kv_dim) max_kv_dim = local_kv_dim;
+    }
+    if (max_q_dim <= 0 || max_kv_dim <= 0) return NULL;
+
+    int fused_q4_prefill = m->ffn_fused_q4 && m->ffn_gelu_fast;
+    if (fused_q4_prefill) {
+        for (int l = 0; l < m->n_layers; l++) {
+            transformer_layer *layer = &m->layers[l];
+            if (layer->ffn_gate.type != GGML_TYPE_Q4_0 || layer->ffn_up.type != GGML_TYPE_Q4_0 ||
+                layer->ffn_gate.n_rows != m->n_ff || layer->ffn_up.n_rows != m->n_ff ||
+                layer->ffn_gate.n_cols != n_embd || layer->ffn_up.n_cols != n_embd ||
+                (layer->ffn_gate.n_cols % 32) != 0) {
+                fused_q4_prefill = 0;
+                break;
+            }
+        }
+    }
+    if (m->ffn_fused_q4 && !fused_q4_prefill) {
+        fprintf(stderr, "transformer: Gemma4 FFN fused_q4 prefill fallback (requires fast GELU and Q4_0 gate/up)\n");
+    } else if (fused_q4_prefill) {
+        fprintf(stderr, "transformer: Gemma4 FFN fused_q4 prefill active (no bff1/bff2 scratch)\n");
+    }
+
+    /* Allocate scratch from the persistent NUMA bump pool (no per-call malloc/free
+     * churn; pages first-touched NUMA-spread once). Pool ensure runs BEFORE the
+     * thread-pool shutdown below so tf_numa_distribute_buffer can place pages. */
+    #define TF_RND256(x) (((size_t)(x) + 255u) & ~(size_t)255u)
+    size_t ff_bytes = (size_t)N * m->n_ff * sizeof(float);
+    size_t need = TF_RND256((size_t)N * sizeof(int))
+        + 2 * TF_RND256((size_t)N * n_embd * sizeof(float))      /* bx, bxb */
+        + 2 * TF_RND256((size_t)N * max_q_dim * sizeof(float))   /* bq, bxb2 */
+        + 2 * TF_RND256((size_t)N * max_kv_dim * sizeof(float))  /* bk, bv */
+        + (fused_q4_prefill ? 0 : 2 * TF_RND256(ff_bytes))       /* bff1, bff2 */
+        + TF_RND256(ff_bytes);                                   /* bff3 */
+    if (!tf_mpool_ensure(m, need)) {
+        fprintf(stderr, "transformer: Gemma4 batch prefill pool alloc failed (N=%d, need=%zu)\n", N, need);
+        return NULL;
+    }
+    tf_mpool_reset(m);
+    int *pos = (int *)tf_mpool_alloc(m, (size_t)N * sizeof(int));
+    float *bx    = (float *)tf_mpool_alloc(m, (size_t)N * n_embd * sizeof(float));
+    float *bxb   = (float *)tf_mpool_alloc(m, (size_t)N * n_embd * sizeof(float));
+    float *bq    = (float *)tf_mpool_alloc(m, (size_t)N * max_q_dim * sizeof(float));
+    float *bk    = (float *)tf_mpool_alloc(m, (size_t)N * max_kv_dim * sizeof(float));
+    float *bv    = (float *)tf_mpool_alloc(m, (size_t)N * max_kv_dim * sizeof(float));
+    float *bxb2  = (float *)tf_mpool_alloc(m, (size_t)N * max_q_dim * sizeof(float));
+    float *bff1  = fused_q4_prefill ? NULL : (float *)tf_mpool_alloc(m, ff_bytes);
+    float *bff2  = fused_q4_prefill ? NULL : (float *)tf_mpool_alloc(m, ff_bytes);
+    float *bff3  = (float *)tf_mpool_alloc(m, ff_bytes);
+    #undef TF_RND256
+    if (!pos || !bx || !bxb || !bq || !bk || !bv || !bxb2 ||
+        (!fused_q4_prefill && (!bff1 || !bff2)) || !bff3) {
+        fprintf(stderr, "transformer: Gemma4 batch prefill pool sub-alloc failed (N=%d)\n", N);
+        return NULL;
+    }
+
+    for (int t = 0; t < N; t++) {
+        pos[t] = start_pos + t;
+        tf_dequant_row(&m->token_embd, tokens[t], bx + (size_t)t * n_embd);
+        float scale = m->embd_scale;
+        for (int i = 0; i < n_embd; i++) bx[(size_t)t * n_embd + i] *= scale;
+    }
+
+    double t_attn_norm = 0, t_qkv = 0, t_qk_norm = 0, t_rope = 0, t_kv = 0;
+    double t_attn = 0, t_out = 0, t_post = 0, t_ffn_gateup = 0, t_gelu = 0, t_ffn_down = 0;
+    double t0p;
+
+    int pool_was_alive = m->pool_alive;
+    if (pool_was_alive && !tf_batch_keep_pool) tf_pool_shutdown(m);
+
+    for (int l = 0; l < m->n_layers; l++) {
+        transformer_layer *layer = &m->layers[l];
+        int hd = layer->is_swa ? m->head_dim_swa : m->head_dim_full;
+        int l_kvh = layer->n_kv_heads > 0 ? layer->n_kv_heads : m->n_kv_heads;
+        int local_kv_dim = l_kvh * hd;          /* KV REPLICATED full on every TP rank */
+        int local_gqa = n_heads / l_kvh;
+        /* TP: this rank owns Q heads [tp_h0, tp_h0+local_qh); KV replicated -> kv_h uses
+         * GLOBAL idx. local_ff = ffn rows this rank owns. All == full when tp_size<=1. */
+        int tp_h0 = 0, local_qh = n_heads;
+        if (m->tp_size > 1) {
+            tp_h0    = m->tp_rank * n_heads / m->tp_size;
+            local_qh = (m->tp_rank + 1) * n_heads / m->tp_size - tp_h0;
+        }
+        int local_q_dim = local_qh * hd;        /* == layer->attn_q.n_rows when TP-loaded */
+        int local_ff    = layer->ffn_gate.n_rows;
+        float eps = m->rms_norm_eps;
+
+        t0p = tf_time_ms();
+        tf_rmsnorm_batch(bxb, bx, &layer->attn_norm, n_embd, N, eps, m->matvec_tmp);
+        t_attn_norm += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        int kv_src = (layer->shared_kv_source >= 0) ? layer->shared_kv_source : l;
+#ifdef TF_HAVE_BF16_PODD
+        /* Combined QKV podd: one X-pack + one fork/join over q,k,v (vs 3 calls). */
+        if (m->tp_size <= 1 && layer->shared_kv_source < 0 && layer->has_v_proj && N >= 12 &&
+            layer->attn_q.podd_packed && layer->attn_k.podd_packed && layer->attn_v.podd_packed &&
+            tf_gemm_bf16_podd_qkv(bq, bk, bv,
+                (const uint16_t *)layer->attn_q.data, (const uint16_t *)layer->attn_k.data,
+                (const uint16_t *)layer->attn_v.data, bxb,
+                local_q_dim, local_kv_dim, local_kv_dim, n_embd, N,
+                local_q_dim, local_kv_dim, local_kv_dim, n_embd, m->n_threads)) {
+            /* done */
+        } else
+#endif
+        {
+            tf_gemm_f16_mt_tokenmajor(bq, &layer->attn_q, bxb, local_q_dim, N, local_q_dim, n_embd, m->n_threads);
+            if (layer->shared_kv_source < 0) {
+                tf_gemm_f16_mt_tokenmajor(bk, &layer->attn_k, bxb, local_kv_dim, N, local_kv_dim, n_embd, m->n_threads);
+                if (layer->has_v_proj) {
+                    tf_gemm_f16_mt_tokenmajor(bv, &layer->attn_v, bxb, local_kv_dim, N, local_kv_dim, n_embd, m->n_threads);
+                } else {
+                    memcpy(bv, bk, (size_t)N * local_kv_dim * sizeof(float));
+                }
+            }
+        }
+        t_qkv += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        tf_qk_norm_batch(bq, local_qh, hd, N, &layer->attn_q_norm, eps, m->matvec_tmp);
+        if (layer->shared_kv_source < 0) {
+            tf_qk_norm_batch(bk, l_kvh, hd, N, &layer->attn_k_norm, eps, m->matvec_tmp);
+            if (layer->attn_v_norm.data)
+                tf_qk_norm_batch(bv, l_kvh, hd, N, &layer->attn_v_norm, eps, m->matvec_tmp);
+            else
+                tf_gemma4_raw_v_norm_batch(bv, N, l_kvh, hd, local_kv_dim, eps);
+        }
+        t_qk_norm += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        tf_gemma4_rope_batch(m, layer, bq, bk, pos, N, local_qh, l_kvh, hd, local_q_dim, local_kv_dim);
+        t_rope += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        if (layer->shared_kv_source < 0) {
+            for (int t = 0; t < N; t++) {
+                int slot = layer->is_swa ? (pos[t] % m->swa_window_size) : pos[t];
+                tf_kv_store(m, l, (size_t)slot * local_kv_dim,
+                            bk + (size_t)t * local_kv_dim, local_kv_dim);
+                tf_kv_store_value(m, l, (size_t)slot * local_kv_dim,
+                                  bv + (size_t)t * local_kv_dim, local_kv_dim);
+            }
+        }
+        t_kv += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        tf_gemma4_attention_batch(m, layer, bq, bxb2, pos, N, kv_src, local_qh,
+                                  l_kvh, hd, local_q_dim, local_kv_dim, local_gqa, tp_h0);
+        t_attn += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        /* o-proj: COL-sliced over local heads -> partial [N,n_embd]; allreduce-SUM before post-norm */
+        tf_gemm_f16_mt_tokenmajor(bxb, &layer->attn_output, bxb2, n_embd, N, n_embd, local_q_dim, m->n_threads);
+        if (m->tp_size > 1 && m->tp_allreduce_fn)
+            m->tp_allreduce_fn(bxb, N * n_embd, m->tp_allreduce_ctx);
+        t_out += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        tf_rmsnorm_batch(bxb, bxb, &layer->post_attention_norm, n_embd, N, eps, m->matvec_tmp);
+        for (int t = 0; t < N; t++) tf_vadd(bx + (size_t)t * n_embd, bxb + (size_t)t * n_embd, n_embd);
+        tf_rmsnorm_batch(bxb, bx, &layer->ffn_norm, n_embd, N, eps, m->matvec_tmp);
+        t_post += tf_time_ms() - t0p;
+
+        t0p = tf_time_ms();
+        /* TP: gate/up ROW-sliced (local_ff rows); down COL-sliced (local_ff cols) ->
+         * partial [N,n_embd] allreduce-SUM before post_ffw_norm. Fused q4/q8v2 paths
+         * are full-width -> disabled under TP (TP is BF16-only anyway). */
+#ifdef TF_HAVE_Q8V2
+        if (tf_q8v2_enable < 0) tf_q8v2_enable = getenv("TF_Q8V2") && atoi(getenv("TF_Q8V2"));
+        if (m->tp_size <= 1 && tf_q8v2_enable &&
+            tf_gemm_q8v2_pair_gelu_tokenmajor(bff3, &layer->ffn_gate, &layer->ffn_up,
+                                               bxb, m->n_ff, N, m->n_ff, n_embd, m->n_threads)) {
+            t_ffn_gateup += tf_time_ms() - t0p;
+        } else
+#endif
+        if (m->tp_size <= 1 && fused_q4_prefill &&
+            tf_gemm_q4_0_pair_gelu_tokenmajor(bff3, &layer->ffn_gate, &layer->ffn_up,
+                                               bxb, m->n_ff, N, m->n_ff, n_embd,
+                                               m->n_threads, m->ffn_check && l == 0)) {
+            t_ffn_gateup += tf_time_ms() - t0p;
+        } else {
+            tf_gemm_f16_mt_tokenmajor(bff1, &layer->ffn_gate, bxb, local_ff, N, local_ff, n_embd, m->n_threads);
+            tf_gemm_f16_mt_tokenmajor(bff2, &layer->ffn_up, bxb, local_ff, N, local_ff, n_embd, m->n_threads);
+            t_ffn_gateup += tf_time_ms() - t0p;
+
+            t0p = tf_time_ms();
+            tf_gelu_mul(bff3, bff1, bff2, N * local_ff, m->ffn_gelu_fast);
+            t_gelu += tf_time_ms() - t0p;
+        }
+
+        t0p = tf_time_ms();
+        tf_gemm_f16_mt_tokenmajor(bxb, &layer->ffn_down, bff3, n_embd, N, n_embd, local_ff, m->n_threads);
+        if (m->tp_size > 1 && m->tp_allreduce_fn)
+            m->tp_allreduce_fn(bxb, N * n_embd, m->tp_allreduce_ctx);
+        tf_rmsnorm_batch(bxb, bxb, &layer->post_ffw_norm, n_embd, N, eps, m->matvec_tmp);
+        for (int t = 0; t < N; t++) tf_vadd(bx + (size_t)t * n_embd, bxb + (size_t)t * n_embd, n_embd);
+        if (layer->layer_output_scale.data) {
+            float scale_val;
+            dequant_row(layer->layer_output_scale.type, layer->layer_output_scale.data, &scale_val, 1);
+            for (int t = 0; t < N; t++) {
+                float *xt = bx + (size_t)t * n_embd;
+                for (int i = 0; i < n_embd; i++) xt[i] *= scale_val;
+            }
+        }
+        t_ffn_down += tf_time_ms() - t0p;
+    }
+
+    if (tf_batch_hidden_out) *tf_batch_hidden_out = bx;   /* [N x n_embd] residual stream */
+    if (tf_batch_all_logits) {
+        /* All-N logits for batched-decode verify: rmsnorm all N hidden states then one
+         * batched lm_head GEMM (output weight read ONCE for N tokens). TP: optionally
+         * vocab-slice [v0,v1) of m->output (each rank computes V/N rows -> the caller
+         * reduce-argmaxes; argmax is softcap-invariant so the slice skips softcap). */
+        tf_rmsnorm_batch(bxb, bx, &m->output_norm, n_embd, N, m->rms_norm_eps, m->matvec_tmp);
+        int lv0 = tf_batch_logit_v0, lv1 = tf_batch_logit_v1;
+        if (lv0 >= 0 && lv1 > lv0 && lv1 <= m->n_vocab) {
+            qtensor osl = m->output;
+            osl.data = (void *)((uint8_t *)m->output.data + (size_t)lv0 * tf_row_bytes(m->output.type, m->output.n_cols));
+            osl.n_rows = lv1 - lv0;
+            tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &osl, bxb, lv1 - lv0, N,
+                                      lv1 - lv0, n_embd, m->n_threads);
+        } else {
+            tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &m->output, bxb, m->n_vocab, N,
+                                      m->n_vocab, n_embd, m->n_threads);
+            if (m->final_logit_softcapping > 0.0f)
+                for (int t = 0; t < N; t++)
+                    tf_logit_softcap(tf_batch_all_logits + (size_t)t * m->n_vocab, m->n_vocab, m->final_logit_softcapping);
+        }
+    }
+    if (tf_batch_all_logits) {
+        /* last-token logits already in all_logits[(N-1)*vocab]; copy into m->logits and
+         * skip the redundant (single-threaded, with the pool shut) lm_head matvec. */
+        memcpy(m->logits, tf_batch_all_logits + (size_t)(N - 1) * m->n_vocab, (size_t)m->n_vocab * sizeof(float));
+    } else {
+        float *last = bx + (size_t)(N - 1) * n_embd;
+        tf_rmsnorm(m->x, last, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+        tf_qmatvec_pool(m, m->logits, &m->output, m->x, m->n_vocab);
+        if (m->final_logit_softcapping > 0.0f)
+            tf_logit_softcap(m->logits, m->n_vocab, m->final_logit_softcapping);
+    }
+
+    double total = t_attn_norm + t_qkv + t_qk_norm + t_rope + t_kv + t_attn + t_out + t_post + t_ffn_gateup + t_gelu + t_ffn_down;
+    if (!tf_batch_quiet) {
+    fprintf(stderr, "\n  === Gemma4 Batch Prefill Profile (%d tokens x %d layers) ===\n", N, m->n_layers);
+    fprintf(stderr, "  attn_norm: %8.1f ms\n", t_attn_norm);
+    fprintf(stderr, "  QKV GEMM:  %8.1f ms\n", t_qkv);
+    fprintf(stderr, "  QK/V norm: %8.1f ms\n", t_qk_norm);
+    fprintf(stderr, "  RoPE:      %8.1f ms\n", t_rope);
+    fprintf(stderr, "  KV store:  %8.1f ms\n", t_kv);
+    fprintf(stderr, "  attention: %8.1f ms\n", t_attn);
+    fprintf(stderr, "  out proj:  %8.1f ms\n", t_out);
+    fprintf(stderr, "  post/norm: %8.1f ms\n", t_post);
+    fprintf(stderr, "  FFN gate/up:%7.1f ms%s\n", t_ffn_gateup, fused_q4_prefill ? " (fused q4+gelu)" : "");
+    fprintf(stderr, "  GELU/mul:  %8.1f ms (%s)\n", t_gelu, m->ffn_gelu_fast ? "fast" : "exact");
+    fprintf(stderr, "  FFN down:  %8.1f ms\n", t_ffn_down);
+    fprintf(stderr, "  TOTAL:     %8.1f ms (%.2f tok/s)\n\n", total, total > 0 ? (1000.0 * N / total) : 0.0);
+    }
+
+    if (pool_was_alive && !tf_batch_keep_pool) tf_pool_start(m);
+    /* scratch lives in m->mpool (persistent, reused next call) — do not free */
+    (void)pos; (void)bx; (void)bxb; (void)bq; (void)bk; (void)bv; (void)bxb2;
+    (void)bff1; (void)bff2; (void)bff3;
+    return m->logits;
+}
+
+static transformer_prefill_profile tf_qwen_prefill_profile;
+void transformer_prefill_profile_reset(void) {
+    memset(&tf_qwen_prefill_profile, 0, sizeof(tf_qwen_prefill_profile));
+}
+void transformer_prefill_profile_get(transformer_prefill_profile *out) {
+    if (out) *out = tf_qwen_prefill_profile;
+}
+
+/* Qwen3.8 hybrid prefill.  The large projections are evaluated as token-major
+ * GEMMs; SSM state updates and causal attention consume those projected rows in
+ * prompt order so the result remains equivalent to the token loop. */
+static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
+                                           const int32_t *tokens,
+                                           float *hidden_io, int N, int start_pos,
+                                           int layer_start, int layer_end,
+                                           unsigned flags) {
+    transformer_prefill_profile *pprof = &tf_qwen_prefill_profile;
+    if (!m || N <= 0 || !m->is_hybrid || m->is_gemma4 ||
+        layer_start < 0 || layer_end > m->n_layers || layer_start >= layer_end)
+        return NULL;
+    if ((flags & TF_PREFILL_EMBED) && !tokens) return NULL;
+    if (!(flags & TF_PREFILL_EMBED) && !hidden_io) return NULL;
+    int ne = m->n_embd;
+    int batch_nt = tf_batch_threads > 0 ? tf_batch_threads : m->n_threads;
+    int qdim = m->n_heads * m->head_dim;
+    int kvdim = m->n_kv_heads * m->head_dim;
+    int max_proj = qdim * 2;
+    int max_inner = m->n_ff;
+    if (m->ssm_qkv_dim > max_proj) max_proj = m->ssm_qkv_dim;
+    if (m->ssm_d_inner > max_inner) max_inner = m->ssm_d_inner;
+    /* Attention temporarily stores its sigmoid gate in `up`.  With replicated
+     * attention and TP-sharded FFN (for example TP12 with four KV heads), qdim
+     * can exceed the rank-local FFN/SSM width. */
+    if (qdim > max_inner) max_inner = qdim;
+    if (ne <= 0 || qdim <= 0 || kvdim <= 0 || max_proj <= 0 || max_inner <= 0)
+        return NULL;
+
+    size_t nf = (size_t)N;
+    static int reuse_attn_scores = -1;
+    if (reuse_attn_scores < 0) {
+        const char *e = getenv("TF_BATCH_ATTN_SCORE_ARENA");
+        reuse_attn_scores = e && atoi(e) != 0;
+    }
+    size_t attn_score_stride = (size_t)m->n_heads * m->max_seq_len;
+    static int reuse_scratch = -1;
+    static unsigned char *scratch_arena;
+    static size_t scratch_arena_cap;
+    if (reuse_scratch < 0) {
+        const char *e = getenv("TF_BATCH_SCRATCH_REUSE");
+        reuse_scratch = e && atoi(e) != 0;
+    }
+    size_t sizes[11] = {
+        nf*(size_t)ne*4, nf*(size_t)ne*4,
+        nf*(size_t)max_proj*4, nf*(size_t)kvdim*4,
+        nf*(size_t)kvdim*4, nf*(size_t)qdim*4,
+        nf*(size_t)max_inner*4, nf*(size_t)max_inner*4,
+        nf*(size_t)max_inner*4, nf*(size_t)ne*4,
+        reuse_attn_scores ? (size_t)batch_nt*attn_score_stride*4 : 0
+    };
+    float *bufs[11] = {0};
+    if (reuse_scratch) {
+        size_t total = 0;
+        for (int i = 0; i < 11; i++) total += (sizes[i] + 255) & ~(size_t)255;
+        if (total > scratch_arena_cap) {
+            unsigned char *grown = (unsigned char *)
+                tf_aligned_alloc_notouch(256, total);
+            if (!grown) goto fail_early;
+            free(scratch_arena);
+            scratch_arena = grown;
+            scratch_arena_cap = total;
+        }
+        size_t off = 0;
+        for (int i = 0; i < 11; i++) {
+            if (sizes[i]) bufs[i] = (float *)(scratch_arena + off);
+            off += (sizes[i] + 255) & ~(size_t)255;
+        }
+    } else {
+        for (int i = 0; i < 11; i++) if (sizes[i])
+            bufs[i] = (float *)tf_aligned_alloc_notouch(256, sizes[i]);
+    }
+    float *cur=bufs[0], *norm=bufs[1], *proj=bufs[2];
+    float *kv=bufs[3], *vv=bufs[4], *attout=bufs[5];
+    float *inner=bufs[6], *gate=bufs[7], *up=bufs[8], *out=bufs[9];
+    float *attn_scores=bufs[10];
+    if (!cur || !norm || !proj || !kv || !vv || !attout || !inner || !gate || !up || !out)
+        goto fail;
+    if (reuse_attn_scores && !attn_scores) goto fail;
+
+    if (flags & TF_PREFILL_EMBED) {
+        for (int t = 0; t < N; t++) {
+            transformer_embed_token(m, tokens[t]);
+            memcpy(cur + (size_t)t * ne, m->x, (size_t)ne * sizeof(float));
+        }
+    } else {
+        memcpy(cur, hidden_io, nf * (size_t)ne * sizeof(float));
+    }
+
+    int pool_was_alive = m->pool_alive;
+    int pool_retained = pool_was_alive && tf_batch_keep_pool;
+    if (pool_was_alive && !pool_retained) tf_pool_shutdown(m);
+    int saved_pool_alive = m->pool_alive;
+    if (pool_retained) m->pool_paused = 1;
+    m->pool_alive = 0; /* Batch helpers must not dispatch into the decode pool. */
+
+    pprof->calls++;
+    static int fused_norm_pack = -1;
+    if (fused_norm_pack < 0) {
+        const char *e = getenv("TF_TP_FUSED_NORM_PACK");
+        const char *p = getenv("TF_PODD");
+        fused_norm_pack = e ? atoi(e) != 0 : (p && atoi(p) != 0);
+    }
+    static int packed_proj = -1;
+    if (packed_proj < 0) {
+        const char *e = getenv("TF_TP_PACKED_PROJ");
+        const char *p = getenv("TF_PODD");
+        packed_proj = e ? atoi(e) != 0 : (p && atoi(p) != 0);
+    }
+    for (int l = layer_start; l < layer_end; l++) {
+        pprof->layers++;
+        transformer_layer *L = &m->layers[l];
+        double pt = tf_time_ms();
+        int attn_norm_packed = packed_proj && !L->is_ssm &&
+            L->attn_q.podd_packed && L->attn_k.podd_packed &&
+            L->attn_v.podd_packed &&
+            tf_rmsnorm_batch_pack_podd(NULL, cur, &L->attn_norm, ne, N,
+                m->rms_norm_eps, m->matvec_tmp, batch_nt);
+        if (!attn_norm_packed && (!fused_norm_pack ||
+            !tf_rmsnorm_batch_pack_podd(norm, cur, &L->attn_norm, ne, N,
+                m->rms_norm_eps, m->matvec_tmp, batch_nt)))
+            tf_rmsnorm_batch(norm, cur, &L->attn_norm, ne, N,
+                             m->rms_norm_eps, m->matvec_tmp);
+        pprof->norm_ms += tf_time_ms() - pt;
+
+        if (L->is_ssm) {
+            int ld = m->ssm_d_inner;
+            int lq = m->ssm_qkv_dim;
+            pt = tf_time_ms();
+            tf_gemm_f16_mt_tokenmajor(proj, &L->ssm_qkv, norm, lq, N,
+                                      lq, ne, batch_nt);
+            tf_gemm_f16_mt_tokenmajor(gate, &L->ssm_gate, norm, ld, N,
+                                      ld, ne, batch_nt);
+            /* Alpha/beta are just 12 rows each. A shared small-N team avoids
+             * 96 tiny team launches per verifier round (two in every SSM
+             * layer), while the common row primitive preserves exact sums. */
+            static int pair_ab = -1;
+            if (pair_ab < 0) {
+                const char *e = getenv("TF_SSM_AB_PAIR");
+                pair_ab = e ? atoi(e) != 0 : 1;
+            }
+#if defined(__ARM_FEATURE_SVE)
+            int paired_ab = pair_ab && tf_gemm_bf16_smalln_pair(
+                kv, &L->ssm_alpha, vv, &L->ssm_beta, norm,
+                m->ssm_dt_rank, N, m->ssm_dt_rank, ne, batch_nt);
+#else
+            int paired_ab = 0;
+#endif
+            if (!paired_ab) {
+                tf_gemm_f16_mt_tokenmajor(kv, &L->ssm_alpha, norm,
+                                          m->ssm_dt_rank, N, m->ssm_dt_rank,
+                                          ne, batch_nt);
+                tf_gemm_f16_mt_tokenmajor(vv, &L->ssm_beta, norm,
+                                          m->ssm_dt_rank, N, m->ssm_dt_rank,
+                                          ne, batch_nt);
+            }
+            pprof->proj_ms += tf_time_ms() - pt;
+            /* Prepare convolution/QK/scalars in prompt order, but defer the
+             * independent recurrent heads.  proj/attout/up are reused as
+             * token-major Q/K/V stores after their projection rows are read. */
+            pt = tf_time_ms();
+            tf_ssm_conv_batch(m,l,proj,N,lq);
+            tf_ssm_prepare_batch(m,l,proj,proj,attout,up,kv,vv,N,
+                                 lq,lq,qdim,max_inner,m->ssm_dt_rank);
+            pprof->ssm_prepare_ms += tf_time_ms() - pt;
+            float ssm_norm_w[128];
+            tf_dequant_row(&L->ssm_norm, 0, ssm_norm_w);
+            float rec_scale = 1.0f / sqrtf((float)m->ssm_d_state);
+            pt = tf_time_ms();
+            static int ssm_scan4 = -1;
+            if (ssm_scan4 < 0) {
+                const char *e = getenv("TF_SSM_SCAN4");
+                ssm_scan4 = e && atoi(e) != 0;
+            }
+#if defined(__ARM_FEATURE_SVE)
+            if (ssm_scan4 && !tf_batch_ssm_snapshots && m->ssm_dt_rank == 12 &&
+                m->ssm_d_state == 128 && batch_nt >= m->ssm_dt_rank &&
+                batch_nt % m->ssm_dt_rank == 0) {
+                tf_ssm_scan4_batch(m->recurrent_state[l], proj, attout, up,
+                    inner, kv, vv, gate, ssm_norm_w, out, N, m->ssm_dt_rank,
+                    m->ssm_d_state, lq, qdim, max_inner, ld, ld,
+                    rec_scale, m->rms_norm_eps, batch_nt);
+            } else
+#endif
+            {
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(batch_nt) schedule(static)
+            #endif
+            for (int h = 0; h < m->ssm_dt_rank; h++) {
+                for (int t = 0; t < N; t++) {
+                    size_t conv_count = (size_t)(m->ssm_conv_kernel - 1) * lq;
+                    float *src_slot = NULL, *dst_slot = NULL;
+                    if (tf_batch_ssm_snapshots) {
+                        if (t > 0) src_slot = tf_batch_ssm_snapshot_slots
+                            ? tf_batch_ssm_snapshot_slots[t - 1]
+                            : tf_batch_ssm_snapshots + (size_t)(t - 1) *
+                              tf_batch_ssm_slot_stride;
+                        dst_slot = tf_batch_ssm_snapshot_slots
+                            ? tf_batch_ssm_snapshot_slots[t]
+                            : tf_batch_ssm_snapshots + (size_t)t *
+                              tf_batch_ssm_slot_stride;
+                    }
+                    float *rec_in = src_slot
+                        ? src_slot + (size_t)l * tf_batch_ssm_layer_stride + conv_count
+                        : m->recurrent_state[l];
+                    float *rec_out = dst_slot
+                        ? dst_slot + (size_t)l * tf_batch_ssm_layer_stride + conv_count
+                        : m->recurrent_state[l];
+                    tf_ssm_recurrence_task rt = {
+                        rec_in, proj + (size_t)t * lq,
+                        attout + (size_t)t * qdim, up + (size_t)t * max_inner,
+                        inner + (size_t)t * ld, kv + (size_t)t * m->ssm_dt_rank,
+                        vv + (size_t)t * m->ssm_dt_rank, h, h + 1,
+                        m->ssm_d_state, rec_scale, rec_out
+                    };
+                    tf_ssm_recurrence_worker(&rt);
+                    float *o = inner + (size_t)t * ld + (size_t)h * m->ssm_d_state;
+                    float *z = gate + (size_t)t * ld + (size_t)h * m->ssm_d_state;
+                    float ss = 0.0f;
+#if defined(__ARM_FEATURE_SVE)
+                    ss = tf_f32_dot_sve(o, o, m->ssm_d_state);
+#else
+                    for (int i = 0; i < m->ssm_d_state; i++) ss += o[i] * o[i];
+#endif
+                    float ns = 1.0f / sqrtf(ss / m->ssm_d_state + m->rms_norm_eps);
+#if defined(__ARM_FEATURE_SVE)
+                    for(int i=0;i<m->ssm_d_state;i+=(int)svcntw()){
+                        svbool_t pg=svwhilelt_b32(i,m->ssm_d_state);
+                        svfloat32_t zv=svld1(pg,z+i);
+                        svfloat32_t et=svmul_n_f32_x(pg,zv,-1.4426950408889634f);
+                        et=svmax_n_f32_x(pg,svmin_n_f32_x(pg,et,80.0f),-80.0f);
+                        svfloat32_t den=svadd_n_f32_x(pg,tf_exp2_fexpa_approx_sve(pg,et),1.0f);
+                        svfloat32_t inv=svrecpe_f32(den);
+                        inv=svmul_f32_x(pg,inv,svrecps_f32(den,inv));
+                        svfloat32_t y=svmul_n_f32_x(pg,svld1(pg,o+i),ns);
+                        y=svmul_f32_x(pg,y,svld1(pg,ssm_norm_w+i));
+                        y=svmul_f32_x(pg,y,svmul_f32_x(pg,zv,inv));
+                        svst1(pg,o+i,y);
+                    }
+#else
+                    for (int i = 0; i < m->ssm_d_state; i++)
+                        o[i] = o[i] * ns * ssm_norm_w[i] *
+                               (z[i] / (1.0f + expf(-z[i])));
+#endif
+                }
+            }
+            }
+            pprof->ssm_scan_ms += tf_time_ms() - pt;
+            pt = tf_time_ms();
+            tf_gemm_f16_mt_tokenmajor(out, &L->ssm_out, inner, ne, N,
+                                      ne, ld, batch_nt);
+            pprof->out_proj_ms += tf_time_ms() - pt;
+            pt = tf_time_ms();
+            int reduced_added = 0;
+            if (m->tp_ssm_sharded && m->tp_reduce_add_fn) {
+                m->tp_reduce_add_fn(out, cur, N * ne, m->tp_allreduce_ctx);
+                reduced_added = 1;
+            } else if (m->tp_ssm_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(out, N * ne, m->tp_allreduce_ctx);
+            pprof->collective_ms += tf_time_ms() - pt;
+            if (!reduced_added)
+                for (int t = 0; t < N; t++)
+                    tf_vadd(cur + (size_t)t * ne, out + (size_t)t * ne, ne);
+        } else {
+            int q2 = 2 * qdim;
+            int ld = m->n_ff;
+            pt = tf_time_ms();
+            int packed_qkv = attn_norm_packed && L->attn_q.podd_packed &&
+                L->attn_k.podd_packed && L->attn_v.podd_packed &&
+                tf_podd_compute_multi(proj,(const uint16_t *)L->attn_q.data,q2,q2,
+                    kv,(const uint16_t *)L->attn_k.data,kvdim,kvdim,
+                    vv,(const uint16_t *)L->attn_v.data,kvdim,kvdim,
+                    tf_podd_Xa,ne,N,batch_nt);
+            if (!packed_qkv) {
+                tf_gemm_f16_mt_tokenmajor(proj, &L->attn_q, norm, q2, N,
+                                          q2, ne, batch_nt);
+                tf_gemm_f16_mt_tokenmajor(kv, &L->attn_k, norm, kvdim, N,
+                                          kvdim, ne, batch_nt);
+                tf_gemm_f16_mt_tokenmajor(vv, &L->attn_v, norm, kvdim, N,
+                                          kvdim, ne, batch_nt);
+            }
+            pprof->proj_ms += tf_time_ms() - pt;
+            /* Prepare Q/K/V and cache rows in prompt order. Compact Q in the
+             * first qdim values of its projected row; keep the sigmoid gate in
+             * otherwise-idle up scratch. */
+            pt = tf_time_ms();
+            for (int t = 0; t < N; t++) {
+                float *qt = proj + (size_t)t * q2;
+                float *gt = up + (size_t)t * max_inner;
+                for (int h = 0; h < m->n_heads; h++) {
+                    memmove(qt + (size_t)h * m->head_dim,
+                           qt + (size_t)h * 2 * m->head_dim,
+                           (size_t)m->head_dim * sizeof(float));
+                    memcpy(gt + (size_t)h * m->head_dim,
+                           qt + (size_t)h * 2 * m->head_dim + m->head_dim,
+                           (size_t)m->head_dim * sizeof(float));
+                }
+                if (L->attn_q_norm.data)
+                    tf_qk_norm(qt, m->n_heads, m->head_dim,
+                               &L->attn_q_norm, m->rms_norm_eps, m->matvec_tmp);
+                if (L->attn_k_norm.data)
+                    tf_qk_norm(kv + (size_t)t * kvdim, m->n_kv_heads, m->head_dim,
+                               &L->attn_k_norm, m->rms_norm_eps, m->matvec_tmp);
+                tf_apply_rope(m, qt, kv + (size_t)t * kvdim,
+                              m->n_heads, m->n_kv_heads,
+                              m->head_dim, start_pos + t, start_pos + t,
+                              start_pos + t);
+                memcpy(m->key_cache[l] + (size_t)(start_pos + t) * kvdim,
+                       kv + (size_t)t * kvdim, (size_t)kvdim * sizeof(float));
+                memcpy(m->value_cache[l] + (size_t)(start_pos + t) * kvdim,
+                       vv + (size_t)t * kvdim, (size_t)kvdim * sizeof(float));
+            }
+            pprof->attn_prepare_ms += tf_time_ms() - pt;
+            memset(attout, 0, nf * (size_t)qdim * sizeof(float));
+            pt = tf_time_ms();
+            int blocked_attn = tf_qwen_attention_blocked(m, l, proj, q2,
+                attout, qdim, kvdim, start_pos, N);
+            if (!blocked_attn) {
+            #ifdef _OPENMP
+            #pragma omp parallel num_threads(batch_nt)
+            #endif
+            {
+                /* tf_attn_worker indexes scores by the global/local head ID,
+                 * even when a task owns one head, so retain a full head stride
+                 * in each worker-private buffer. */
+                int score_tid = 0;
+                #ifdef _OPENMP
+                score_tid = omp_get_thread_num();
+                #endif
+                float *scores = attn_scores
+                    ? attn_scores + (size_t)score_tid * attn_score_stride
+                    : (float *)malloc(attn_score_stride * sizeof(float));
+                #ifdef _OPENMP
+                #pragma omp for collapse(2) schedule(dynamic)
+                #endif
+                for (int t = 0; t < N; t++) for (int h = 0; h < m->n_heads; h++) {
+                    float *qb = proj + (size_t)t * q2;
+                    float *ab = attout + (size_t)t * qdim;
+                    tf_attn_task at = {qb, scores, ab, m->key_cache[l],
+                        m->value_cache[l], h, h + 1, m->head_dim, kvdim,
+                        m->tp_attn_sharded ? m->gqa_group : m->n_heads / m->n_kv_heads,
+                        start_pos + t + 1, m->max_seq_len,
+                        1.0f / sqrtf((float)m->head_dim),m->tp_qhead_offset};
+                    tf_attn_worker(&at);
+                    float *gh = up + (size_t)t * max_inner + (size_t)h * m->head_dim;
+                    float *oh = ab + (size_t)h * m->head_dim;
+                    static int attn_gate_sve=-1;
+                    if(attn_gate_sve<0){const char*e=getenv("TF_ATTN_GATE_SVE");attn_gate_sve=e&&atoi(e)!=0;}
+#if defined(__ARM_FEATURE_SVE)
+                    if(attn_gate_sve){
+                        for(int i=0;i<m->head_dim;i+=(int)svcntw()){
+                            svbool_t pg=svwhilelt_b32((uint64_t)i,(uint64_t)m->head_dim);
+                            svfloat32_t g=svld1(pg,gh+i);
+                            svfloat32_t x=svmul_n_f32_x(pg,g,-1.4426950408889634f);
+                            x=svmax_n_f32_x(pg,svmin_n_f32_x(pg,x,80.0f),-80.0f);
+                            svfloat32_t den=svadd_n_f32_x(pg,tf_exp2_fexpa_approx_sve(pg,x),1.0f);
+                            svfloat32_t inv=svrecpe_f32(den);
+                            inv=svmul_f32_x(pg,inv,svrecps_f32(den,inv));
+                            svst1(pg,oh+i,svmul_f32_x(pg,svld1(pg,oh+i),inv));
+                        }
+                    } else
+#endif
+                    for (int i = 0; i < m->head_dim; i++)
+                        oh[i] *= 1.0f / (1.0f + expf(-gh[i]));
+                }
+                if (!attn_scores) free(scores);
+            }
+            } else {
+                #ifdef _OPENMP
+                #pragma omp parallel for collapse(2) num_threads(batch_nt) schedule(static)
+                #endif
+                for (int t = 0; t < N; t++) for (int h = 0; h < m->n_heads; h++) {
+                    float *gh = up + (size_t)t * max_inner + (size_t)h * m->head_dim;
+                    float *oh = attout + (size_t)t * qdim + (size_t)h * m->head_dim;
+#if defined(__ARM_FEATURE_SVE)
+                    for (int i = 0; i < m->head_dim; i += (int)svcntw()) {
+                        svbool_t pg = svwhilelt_b32((uint64_t)i,(uint64_t)m->head_dim);
+                        svfloat32_t g = svld1(pg, gh + i);
+                        svfloat32_t x = svmul_n_f32_x(pg,g,-1.4426950408889634f);
+                        x = svmax_n_f32_x(pg,svmin_n_f32_x(pg,x,80.0f),-80.0f);
+                        svfloat32_t den = svadd_n_f32_x(pg,
+                            tf_exp2_fexpa_approx_sve(pg,x),1.0f);
+                        svfloat32_t inv = svrecpe_f32(den);
+                        inv = svmul_f32_x(pg,inv,svrecps_f32(den,inv));
+                        svst1(pg,oh+i,svmul_f32_x(pg,svld1(pg,oh+i),inv));
+                    }
+#else
+                    for (int i = 0; i < m->head_dim; i++)
+                        oh[i] *= 1.0f / (1.0f + expf(-gh[i]));
+#endif
+                }
+            }
+            pprof->attn_kernel_ms += tf_time_ms() - pt;
+            pt = tf_time_ms();
+            tf_gemm_f16_mt_tokenmajor(out, &L->attn_output, attout, ne, N,
+                                      ne, qdim, batch_nt);
+            pprof->out_proj_ms += tf_time_ms() - pt;
+            pt = tf_time_ms();
+            int reduced_added = 0;
+            if (m->tp_attn_sharded && m->tp_reduce_add_fn) {
+                m->tp_reduce_add_fn(out, cur, N * ne, m->tp_allreduce_ctx);
+                reduced_added = 1;
+            } else if (m->tp_attn_sharded && m->tp_allreduce_fn)
+                m->tp_allreduce_fn(out, N * ne, m->tp_allreduce_ctx);
+            pprof->collective_ms += tf_time_ms() - pt;
+            if (!reduced_added)
+                for (int t = 0; t < N; t++)
+                    tf_vadd(cur + (size_t)t * ne, out + (size_t)t * ne, ne);
+        }
+
+        pt = tf_time_ms();
+        int ffn_norm_packed = packed_proj && L->ffn_gate.podd_packed &&
+            L->ffn_up.podd_packed &&
+            tf_rmsnorm_batch_pack_podd(NULL, cur, &L->ffn_norm, ne, N,
+                m->rms_norm_eps, m->matvec_tmp, batch_nt);
+        if (!ffn_norm_packed && (!fused_norm_pack ||
+            !tf_rmsnorm_batch_pack_podd(norm, cur, &L->ffn_norm, ne, N,
+                m->rms_norm_eps, m->matvec_tmp, batch_nt)))
+            tf_rmsnorm_batch(norm, cur, &L->ffn_norm, ne, N,
+                             m->rms_norm_eps, m->matvec_tmp);
+        pprof->norm_ms += tf_time_ms() - pt;
+        int ld = L->ffn_gate.n_rows;
+        static int podd_ffn_pipe = -1;
+        if (podd_ffn_pipe < 0) {
+            const char *e = getenv("TF_PODD_FFN_PIPE");
+            podd_ffn_pipe = e && atoi(e) != 0;
+        }
+        int ffn_piped = 0;
+        pt = tf_time_ms();
+        int packed_up = 0;
+        int packed_gate = ffn_norm_packed && !podd_ffn_pipe &&
+            L->ffn_gate.podd_packed && L->ffn_up.podd_packed &&
+            tf_podd_compute_multi(gate,(const uint16_t *)L->ffn_gate.data,ld,ld,
+                up,(const uint16_t *)L->ffn_up.data,ld,ld,
+                NULL,NULL,0,0,tf_podd_Xa,ne,N,batch_nt);
+        packed_up = packed_gate;
+        if (!packed_gate)
+            packed_gate = ffn_norm_packed && L->ffn_gate.podd_packed &&
+                tf_podd_compute_packed(gate,(const uint16_t *)L->ffn_gate.data,
+                    tf_podd_Xa,ld,ne,N,ld,batch_nt);
+        if (!packed_gate)
+            tf_gemm_f16_mt_tokenmajor(gate, &L->ffn_gate, norm, ld, N,
+                                      ld, ne, batch_nt);
+        pprof->ffn_proj_ms += tf_time_ms() - pt;
+        if (podd_ffn_pipe) {
+            pt = tf_time_ms();
+            ffn_piped = tf_gemm_bf16_podd_ffn_up_down(out, gate,
+                (const uint16_t *)L->ffn_up.data,
+                (const uint16_t *)L->ffn_down.data, ld, ne, N, batch_nt);
+            pprof->ffn_down_ms += tf_time_ms() - pt;
+        }
+        if (!ffn_piped) {
+            pt = tf_time_ms();
+            if (!packed_up && !(ffn_norm_packed && L->ffn_up.podd_packed &&
+                  tf_podd_compute_packed(up, (const uint16_t *)L->ffn_up.data,
+                    tf_podd_Xa, ld, ne, N, ld, batch_nt)))
+                tf_gemm_f16_mt_tokenmajor(up, &L->ffn_up, norm, ld, N,
+                                          ld, ne, batch_nt);
+            pprof->ffn_proj_ms += tf_time_ms() - pt;
+            pt = tf_time_ms();
+            tf_silu_mul_avx2(inner, gate, up, N * ld);
+            pprof->ffn_act_ms += tf_time_ms() - pt;
+            pt = tf_time_ms();
+            tf_gemm_f16_mt_tokenmajor(out, &L->ffn_down, inner, ne, N,
+                                      ne, ld, batch_nt);
+            pprof->ffn_down_ms += tf_time_ms() - pt;
+        }
+        pt = tf_time_ms();
+        int reduced_added = 0;
+        if (m->tp_ffn_sharded && m->tp_reduce_add_fn) {
+            m->tp_reduce_add_fn(out, cur, N * ne, m->tp_allreduce_ctx);
+            reduced_added = 1;
+        } else if (m->tp_ffn_sharded && m->tp_allreduce_fn)
+            m->tp_allreduce_fn(out, N * ne, m->tp_allreduce_ctx);
+        pprof->collective_ms += tf_time_ms() - pt;
+        if (!reduced_added)
+            for (int t = 0; t < N; t++)
+                tf_vadd(cur + (size_t)t * ne, out + (size_t)t * ne, ne);
+    }
+
+    if (hidden_io) memcpy(hidden_io, cur, nf * (size_t)ne * sizeof(float));
+    if (tf_batch_hidden_out) {
+        size_t hidden_count = nf * (size_t)ne;
+        if (hidden_count > tf_qwen_batch_hidden_cap) {
+            float *grown = (float *)realloc(tf_qwen_batch_hidden,
+                                            hidden_count * sizeof(float));
+            if (!grown) goto fail;
+            tf_qwen_batch_hidden = grown;
+            tf_qwen_batch_hidden_cap = hidden_count;
+        }
+        memcpy(tf_qwen_batch_hidden, cur, hidden_count * sizeof(float));
+        *tf_batch_hidden_out = tf_qwen_batch_hidden;
+    }
+    memcpy(m->x, cur + (size_t)(N - 1) * ne, (size_t)ne * sizeof(float));
+    float *result = m->x;
+    if ((flags & TF_PREFILL_LOGITS) && tf_batch_all_logits) {
+        /* Speculative verification needs every position's target logits.  Keep
+         * the whole operation token-major so the (large) shared output matrix
+         * is streamed once for all K candidates.  A TP caller may assign each
+         * rank a disjoint vocabulary interval and reduce only K argmax pairs. */
+        tf_rmsnorm_batch(norm, cur, &m->output_norm, ne, N,
+                         m->rms_norm_eps, m->matvec_tmp);
+        int lv0 = tf_batch_logit_v0, lv1 = tf_batch_logit_v1;
+        if (lv0 >= 0 && lv1 > lv0 && lv1 <= m->output.n_rows) {
+            qtensor osl = m->output;
+            osl.data = (void *)((uint8_t *)m->output.data +
+                (size_t)lv0 * tf_row_bytes(m->output.type, m->output.n_cols));
+            osl.n_rows = lv1 - lv0;
+            tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &osl, norm,
+                                      lv1 - lv0, N, lv1 - lv0, ne,
+                                      batch_nt);
+        } else {
+            tf_gemm_f16_mt_tokenmajor(tf_batch_all_logits, &m->output, norm,
+                                      m->output.n_rows, N, m->output.n_rows,
+                                      ne, batch_nt);
+        }
+        result = tf_batch_all_logits + (size_t)(N - 1) *
+            ((lv0 >= 0 && lv1 > lv0) ? (lv1 - lv0) : m->output.n_rows);
+        if (m->logits && m->output.n_rows == m->n_vocab &&
+            !(lv0 >= 0 && lv1 > lv0))
+            memcpy(m->logits, result, (size_t)m->n_vocab * sizeof(float));
+    } else if (flags & TF_PREFILL_LOGITS) {
+        tf_rmsnorm(m->x, m->x, &m->output_norm, ne, m->rms_norm_eps, m->matvec_tmp);
+        result = transformer_compute_logits(m);
+    }
+    m->pool_alive = pool_retained ? 1 : saved_pool_alive;
+    if (pool_retained) m->pool_paused = 0;
+    /* Pipeline-prefill runners do not return to token decode between chunks.
+     * Keep the decode pthread pool stopped after the first range call instead
+     * of paying shutdown/start for every chunk; transformer_free handles an
+     * already-stopped pool. */
+    static int keep_pool_off=-1;
+    if(keep_pool_off<0){const char*e=getenv("TF_PREFILL_KEEP_POOL_OFF");keep_pool_off=e&&atoi(e)!=0;}
+    if (pool_was_alive && !pool_retained && !keep_pool_off) tf_pool_start(m);
+    if (!reuse_scratch) {
+        free(cur); free(norm); free(proj); free(kv); free(vv); free(attout);
+        free(inner); free(gate); free(up); free(out); free(attn_scores);
+    }
+    return result;
+
+fail:
+    if (!reuse_scratch) {
+        free(cur); free(norm); free(proj); free(kv); free(vv); free(attout);
+        free(inner); free(gate); free(up); free(out); free(attn_scores);
+    }
+    return NULL;
+fail_early:
+    return NULL;
+}
+
+float *transformer_prefill_gemm(transformer_model *m, const int32_t *tokens,
+                                int n_tokens, int start_pos) {
+    if (!m || !tokens || n_tokens <= 0) return NULL;
+    if (m->is_gemma4) return tf_gemma4_prefill_batch(m, tokens, n_tokens, start_pos);
+    if (m->is_hybrid) return tf_qwen_hybrid_prefill_batch(m, tokens, NULL,
+        n_tokens, start_pos, 0, m->n_layers, TF_PREFILL_EMBED | TF_PREFILL_LOGITS);
+    return NULL;
+}
+
+float *transformer_prefill_range(transformer_model *m, const int32_t *tokens,
+                                 float *hidden_io, int n_tokens, int start_pos,
+                                 int layer_start, int layer_end, unsigned flags) {
+    if (!m || !m->is_hybrid || m->is_gemma4) return NULL;
+    return tf_qwen_hybrid_prefill_batch(m, tokens, hidden_io, n_tokens,
+        start_pos, layer_start, layer_end, flags);
 }
 
 /* Top-k sampling with temperature */

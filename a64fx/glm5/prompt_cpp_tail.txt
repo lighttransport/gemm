@@ -1,0 +1,13 @@
+<<<END OF BACKGROUND CONTEXT>>>
+
+// Task: Implement in C++17:
+//
+//     std::map<std::string, std::string>
+//     parse_json_object(const std::string& s);
+//
+// Parse exactly one flat JSON object whose keys and values are JSON strings.
+// Support all JSON string escapes, including UTF-16 \uXXXX surrogate pairs encoded as UTF-8.
+// Reject malformed input, duplicate keys, trailing data, invalid escapes, unpaired surrogates,
+// and unescaped control characters by throwing std::invalid_argument.
+// Return a complete, self-contained, compilable implementation with a small main() containing
+// representative assertions. Output only C++ code.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal byte-level BPE for GLM-5.2 (reads tokenizer.json; no deps, py3.6 ok).
+"""Minimal byte-level BPE for GLM-5.3 Flash (reads tokenizer.json; no deps, py3.6 ok).
 
 Handles the GPT-4-style byte-level BPE: ByteLevel pre-tokenizer + decoder, BPE merges.
 The pretokenize regex uses \\p{L}/\\p{N} which stdlib `re` lacks, so we approximate it
@@ -9,18 +9,14 @@ Usage:
   python3 glm5_tokenizer.py encode "The capital of France is" [--bos]   # -> ids
   python3 glm5_tokenizer.py decode "12 34 56"                            # -> text
   python3 glm5_tokenizer.py decode-file gen_ids.txt
-Env: GLM5_TOKENIZER (default ~/models/glm5.2/tokenizer.json)
+Env: GLM5_TOKENIZER (default ~/models/glm53f/tokenizer.json)
 """
 import sys, os, json, re
 
-TOKJSON = os.environ.get("GLM5_TOKENIZER", os.path.expanduser("~/models/glm5.2/tokenizer.json"))
+TOKJSON = os.environ.get("GLM5_TOKENIZER", os.path.expanduser("~/models/glm53f/tokenizer.json"))
 
 GLM5_GMASK = 154822
 GLM5_SOP = 154824
-GLM5_USER = 154827
-GLM5_ASSISTANT = 154828
-GLM5_OBSERVATION = 154829
-GLM5_NO_THINK = 154842
 
 def bytes_to_unicode():
     bs = list(range(ord("!"),ord("~")+1))+list(range(ord("\xa1"),ord("\xac")+1))+list(range(ord("\xae"),ord("\xff")+1))
@@ -46,6 +42,12 @@ class Tok:
         for a in j.get("added_tokens",[]):
             self.added[a["id"]] = a["content"]; self.added_ids.add(a["id"])
             self.vocab.setdefault(a["content"], a["id"]); self.id2tok[a["id"]]=a["content"]
+        self.special_ids = {s: self.vocab[s] for s in
+                            ("[gMASK]", "<sop>", "<|user|>", "<|assistant|>",
+                             "<|system|>", "<|observation|>", "<think>", "</think>")
+                            if s in self.vocab}
+        self.special_re = re.compile("|".join(re.escape(s) for s in
+                                               sorted(self.special_ids, key=len, reverse=True))) if self.special_ids else None
         # ASCII-approx GPT-4 pretok pattern
         self.pat = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+(?!\S)|\s+""")
     def _bpe(self, tokens):
@@ -62,19 +64,35 @@ class Tok:
         if add_bos:
             b=self.vocab.get("[gMASK]") or self.vocab.get("<|begin_of_sentence|>") or GLM5_SOP
             ids.append(b)
-        for piece in self.pat.findall(text):
-            s="".join(B2U[b] for b in piece.encode("utf-8"))
-            for t in self._bpe(list(s)):
-                if t in self.vocab: ids.append(self.vocab[t])
-                else:
-                    for ch in t: ids.append(self.vocab.get(ch, 0))
+        chunks = self.special_re.split(text) if self.special_re else [text]
+        specials = self.special_re.findall(text) if self.special_re else []
+        for ci, piece in enumerate(chunks):
+            if ci and specials[ci - 1] in self.special_ids:
+                ids.append(self.special_ids[specials[ci - 1]])
+            if not piece: continue
+            for piece in self.pat.findall(piece):
+                s="".join(B2U[b] for b in piece.encode("utf-8"))
+                for t in self._bpe(list(s)):
+                    if t in self.vocab: ids.append(self.vocab[t])
+                    else:
+                        for ch in t: ids.append(self.vocab.get(ch, 0))
         return ids
+    def render_chat(self, messages, reasoning_effort="max", add_generation_prompt=True):
+        """Render the text-only GLM5.3 template subset before BPE encoding."""
+        effort = reasoning_effort.capitalize() if reasoning_effort else "Max"
+        out = "[gMASK]<sop><|system|>Reasoning Effort: %s" % effort
+        for message in messages:
+            role = message["role"]
+            out += "<|%s|>" % ("observation" if role == "tool" else role)
+            out += message.get("content", "")
+            if role == "assistant" and message.get("reasoning_content"):
+                out += "<think>" + message["reasoning_content"] + "</think>"
+        if add_generation_prompt: out += "<|assistant|><think>"
+        return out
+
     def chat(self, user_text, think=False):
-        """GLM-5.2 chat prefix: [gMASK, sop, <|user|>, text, <|assistant|>, </think>] by default."""
-        ids=[GLM5_GMASK, GLM5_SOP, GLM5_USER]+self.encode(user_text)+[GLM5_ASSISTANT]
-        if not think:
-            ids.append(GLM5_NO_THINK)
-        return ids
+        messages = [{"role": "user", "content": user_text}]
+        return self.encode(self.render_chat(messages, add_generation_prompt=True))
     def decode(self, ids):
         out=[]
         for i in ids:
@@ -98,6 +116,9 @@ def main():
     elif cmd=="chat-file":
         text=open(sys.argv[2]).read()
         print(" ".join(str(i) for i in t.chat(text)))
+    elif cmd=="encode-file":
+        text=open(sys.argv[2]).read()
+        print(" ".join(str(i) for i in t.encode(text)))
     elif cmd=="decode":
         ids=[int(x) for x in sys.argv[2].split()]
         print(t.decode(ids))

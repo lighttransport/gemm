@@ -1,0 +1,4 @@
+The capital of France is
+def factorial(n):
+Water boils at a temperature of
+The three primary colors are red, yellow, and

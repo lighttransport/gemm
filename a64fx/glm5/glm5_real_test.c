@@ -30,13 +30,37 @@ int main(void){
     int L=envi("GLM5_LAYERS",4); if(L>0) c.n_layers=L;
     c.max_pos=envi("GLM5_MAXPOS",256);
     int prefill=envi("GLM5_PREFILL",8), decode=envi("GLM5_DECODE",8);
+    int ep_rank=envi("GLM5_EP_RANK",0), ep_size=envi("GLM5_EP_SIZE",1);
     const char*dir=getenv("GLM5_STAGE_DIR");
-    printf("=== GLM5 real-weight test: layers=%d experts=%d max_pos=%d dir=%s ===\n",
-           c.n_layers,c.n_experts,c.max_pos,dir?dir:"/local/glm5");
+    printf("=== GLM5 real-weight test: layers=%d experts=%d ep=%d/%d max_pos=%d dir=%s ===\n",
+           c.n_layers,c.n_experts,ep_rank,ep_size,c.max_pos,dir?dir:"/local/glm5");
     double t0=now_sec();
-    glm5_model*m=glm5_load_real(c,0,1,dir,1,1);
+    glm5_model*m=glm5_load_real(c,ep_rank,ep_size,dir,1,1);
     if(!m){ printf("FAIL: glm5_load_real returned NULL (missing/short tensors)\n"); return 1; }
     printf("load OK: %.1fs  arena_used=%.2f GB\n", now_sec()-t0, m->arena_used/1e9);
+
+    if(envi("GLM5_IQ_SELFTEST",0)){
+        if(c.n_layers<=3||!m->layers[3].ex_w1||m->layers[3].n_owned<1){
+            printf("FAIL: IQ self-test needs layer 3 and one owned expert\n");
+            glm5_free(m); return 1;
+        }
+        glm5_tensor*t=&m->layers[3].ex_w1[0];
+        int rows=t->rows,cols=t->cols;
+        float*ix=glm5_amalloc((size_t)cols*4),*fast=glm5_amalloc((size_t)rows*4),*ref=glm5_amalloc((size_t)rows*4);
+        if(!ix||!fast||!ref){ printf("FAIL: IQ self-test allocation\n"); return 1; }
+        glm5_sm=0x52A16;
+        for(int i=0;i<cols;i++) ix[i]=(float)(glm5_sm_next()*4.0-2.0);
+        double tf=now_sec(); int bad=glm5_mv_iq_a16(fast,t,ix,rows,cols); tf=now_sec()-tf;
+        double tr=now_sec(); glm5_mv_ggml(ref,t,ix,rows,cols); tr=now_sec()-tr;
+        double e2=0,r2=0,mx=0;
+        for(int i=0;i<rows;i++){ double e=(double)fast[i]-ref[i],a=fabs(e); e2+=e*e; r2+=(double)ref[i]*ref[i]; if(a>mx)mx=a; }
+        double rel=sqrt(e2/(r2+1e-30));
+        printf("IQ self-test type=%d [%d,%d] rel_l2=%.3e max_abs=%.3e fast=%.3fs ref=%.3fs %s\n",
+               t->type,rows,cols,rel,mx,tf,tr,(!bad&&isfinite(rel)&&rel<5e-4)?"OK":"FAIL");
+        glm5_afree(ix); glm5_afree(fast); glm5_afree(ref);
+        if(bad||!isfinite(rel)||rel>=5e-4){ glm5_free(m); return 1; }
+        if(envi("GLM5_IQ_SELFTEST_ONLY",1)){ glm5_free(m); return 0; }
+    }
 
     float*x=glm5_amalloc((size_t)c.hidden*4); int nan=0, argmax=0; double xn=0;
     int pchunk=envi("GLM5_PCHUNK",0);   /* Lever 1: chunked batched prefill (M=pchunk) */

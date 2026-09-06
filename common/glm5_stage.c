@@ -61,10 +61,44 @@ static long layer_id(const char*name){
     if(*p<'0'||*p>'9') return -1; return strtol(p,NULL,10);
 }
 
+/* Mixed-precision: layers listed in GLM5_BF16_LAYERS ("0,1,2,77" or "0-2,77") are staged
+ * from the bf16 model (GLM5_BF16_DIR) WITHOUT a _scale_inv companion, so the loader uses
+ * the bf16 path for them; all other layers stay FP8 from GLM5_MODEL_DIR. Targets the
+ * sensitive first/last layers to recover instruction-following lost to E4M3 quantization. */
+static int g_nbf16=0; static int g_bf16[256];
+static int is_bf16_layer(long L){ for(int i=0;i<g_nbf16;i++) if(g_bf16[i]==L) return 1; return 0; }
+static void parse_bf16_layers(void){
+    const char*e=getenv("GLM5_BF16_LAYERS"); if(!e||!*e) return;
+    char*p=(char*)e;            /* accepts ',' ':' or ' ' separators ("0-2,77" or "0:1:2:77") */
+    while(*p){
+        while(*p==','||*p==' '||*p==':')p++; if(!*p)break;
+        long a=strtol(p,&p,10), b=a;
+        if(*p=='-'){ p++; b=strtol(p,&p,10); }
+        for(long L=a;L<=b && g_nbf16<256;L++) g_bf16[g_nbf16++]=(int)L;
+    }
+}
+/* GLM5_BF16_EXTRA: exact tensor names (':'/','/space-sep) to source from GLM5_BF16_DIR — for
+ * un-quantized globals (e.g. model.norm.weight) absent from a partially-downloaded primary
+ * checkpoint but identical in the bf16 sibling. Staged in the bf16 pass like bf16 layers. */
+static int g_nextra=0; static char g_extra[16][256];
+static int is_extra(const char*name){ for(int i=0;i<g_nextra;i++) if(!strcmp(g_extra[i],name)) return 1; return 0; }
+static void parse_bf16_extra(void){
+    const char*e=getenv("GLM5_BF16_EXTRA"); if(!e||!*e) return;
+    char buf[4096]; snprintf(buf,sizeof buf,"%s",e);
+    for(char*t=strtok(buf,":, ");t&&g_nextra<16;t=strtok(NULL,":, ")) snprintf(g_extra[g_nextra++],256,"%s",t);
+}
+
 enum { CLS_SKIP, CLS_DENSE, CLS_EXPERT };
-static int classify(const char*name,int rank,int ep_size){
+/* bf16_pass=0: FP8 source pass (skip bf16-designated layers); 1: bf16 source pass (keep only them). */
+static int classify(const char*name,int rank,int ep_size,int bf16_pass){
     static int slay=-2; if(slay==-2) slay=envi("GLM5_STAGE_LAYERS",78);
-    if(slay>0){ long L=layer_id(name); if(L>=0 && L>=slay) return CLS_SKIP; }
+    long L=layer_id(name);
+    if(slay>0){ if(L>=0 && L>=slay) return CLS_SKIP; }
+    if(g_nbf16>0 || g_nextra>0){
+        int isb=(L>=0 && is_bf16_layer(L)) || is_extra(name);
+        if(bf16_pass){ if(!isb) return CLS_SKIP; }   /* bf16 pass keeps only designated layers/extras */
+        else { if(isb) return CLS_SKIP; }            /* primary pass skips them */
+    } else if(bf16_pass) return CLS_SKIP;            /* none designated -> bf16 pass empty */
     long e=expert_id(name);
     if(e>=0) return (e%ep_size==rank)?CLS_EXPERT:CLS_SKIP;
     return CLS_DENSE;
@@ -83,9 +117,18 @@ int main(void){
              else snprintf(stage_dir,sizeof stage_dir,"%s/tmp/glm5",home); } }
     int rank=detect_rank();
     int ep_size=envi("GLM5_EP_SIZE",192);
+    /* data-parallel groups: ep_size is the GROUP size; ranks beyond it belong to sibling groups that
+     * stage the SAME group-local expert shard (e%ep_size==rank) to their own node's /local. Map the
+     * global MPI rank to its group-local index so each group is a complete, independently-staged model. */
+    if(ep_size>0) rank %= ep_size;
     int nshards=envi("GLM5_NSHARDS",282);
     int slimit=envi("GLM5_SHARD_LIMIT",0);
-    int last=(slimit>0&&slimit<nshards)?slimit:nshards;
+    int fp8_last=(slimit>0&&slimit<nshards)?slimit:nshards;
+    parse_bf16_layers(); parse_bf16_extra();
+    char bf16_dir[1024];
+    { const char*e=getenv("GLM5_BF16_DIR"); if(e&&*e) snprintf(bf16_dir,sizeof bf16_dir,"%s",e);
+      else snprintf(bf16_dir,sizeof bf16_dir,"%s/models/glm5.2",home); }
+    int bf16_nshards=envi("GLM5_BF16_NSHARDS",282);
     uint64_t flush_bytes=(uint64_t)(envi("GLM5_STAGE_FLUSH_GB",2)>0?envi("GLM5_STAGE_FLUSH_GB",2):2)<<30;
     if(rank<0||rank>=ep_size){ fprintf(stderr,"glm5_stage: bad rank %d for ep_size %d\n",rank,ep_size); return 2; }
     mkdir(stage_dir,0755);
@@ -103,13 +146,19 @@ int main(void){
     fprintf(mf,"# GLM5MANIFEST rank=%02d ep_size=%02d n_tensors=%-12d blob_bytes=%-18lld\n",rank,ep_size,0,0LL);
 
     uint64_t off=0,last_sync=0; long long n_dense=0,n_expert=0; uint64_t b_dense=0,b_expert=0; double t0=now_sec();
-    for(int s=1;s<=last;s++){
-        char shard[1200]; snprintf(shard,sizeof shard,"%s/model-%05d-of-%05d.safetensors",model_dir,s,nshards);
+    int npass=(g_nbf16>0||g_nextra>0)?2:1;
+    if(g_nbf16>0||g_nextra>0){ printf("glm5_stage: 2nd pass from %s (%d bf16 layers, %d extra tensors)\n",bf16_dir,g_nbf16,g_nextra); fflush(stdout); }
+    for(int pass=0;pass<npass;pass++){
+      const char*mdir = pass==0?model_dir:bf16_dir;
+      int nsh = pass==0?nshards:bf16_nshards;
+      int last = pass==0?fp8_last:bf16_nshards;
+      for(int s=1;s<=last;s++){
+        char shard[1200]; snprintf(shard,sizeof shard,"%s/model-%05d-of-%05d.safetensors",mdir,s,nsh);
         st_context*st=safetensors_open(shard);
         if(!st){ fprintf(stderr,"glm5_stage: skip unreadable shard %s\n",shard); continue; }
         int kept=0;
         for(int i=0;i<st->n_tensors;i++){
-            const char*name=st->tensors[i].name; int cls=classify(name,rank,ep_size);
+            const char*name=st->tensors[i].name; int cls=classify(name,rank,ep_size,pass);
             if(cls==CLS_SKIP) continue;
             size_t nb=st->tensors[i].nbytes;
             uint64_t aligned=(off+(ALIGN-1))&~(uint64_t)(ALIGN-1);
@@ -127,7 +176,41 @@ int main(void){
         madvise(st->map_base,st->map_size,MADV_DONTNEED);
         safetensors_close(st);
         double el=now_sec()-t0; double gb=(b_dense+b_expert)/1e9;
-        printf("  shard %2d/%d  kept %4d  cum %5.1f GB  %5.1f s  %5.2f GB/s\n",s,nshards,kept,gb,el,el>0?gb/el:0.0); fflush(stdout);
+        printf("  [p%d] shard %2d/%d  kept %4d  cum %5.1f GB  %5.1f s  %5.2f GB/s\n",pass,s,nsh,kept,gb,el,el>0?gb/el:0.0); fflush(stdout);
+      }
+      /* MTP block (checkpoint layer 78) lives in mtp-*.safetensors, NOT model-*.safetensors, so the
+       * shard loop above never sees it. Stage it (FP8/int8 source pass only) when GLM5_STAGE_LAYERS>78
+       * (=79). Tensor names are already "model.layers.78.*", so the same classify() applies: EP-shard
+       * the routed experts (e%ep_size==rank), keep the dense/fusion tensors (enorm/hnorm/eh_proj/
+       * input_layernorm/shared_head.norm/attn/shared) on every rank -> glm5_load_mtp_real finds them. */
+      if(pass==0 && envi("GLM5_STAGE_LAYERS",78)>78){
+        int mtp_nsh=envi("GLM5_MTP_NSHARDS",4);
+        for(int s=1;s<=mtp_nsh;s++){
+          char shard[1200]; snprintf(shard,sizeof shard,"%s/mtp-%05d-of-%05d.safetensors",mdir,s,mtp_nsh);
+          st_context*st=safetensors_open(shard);
+          if(!st){ fprintf(stderr,"glm5_stage: skip unreadable MTP shard %s\n",shard); continue; }
+          int kept=0;
+          for(int i=0;i<st->n_tensors;i++){
+              const char*name=st->tensors[i].name; int cls=classify(name,rank,ep_size,pass);
+              if(cls==CLS_SKIP) continue;
+              size_t nb=st->tensors[i].nbytes;
+              uint64_t aligned=(off+(ALIGN-1))&~(uint64_t)(ALIGN-1);
+              if(aligned!=off && lseek(bfd,(off_t)aligned,SEEK_SET)<0){ fprintf(stderr,"glm5_stage: lseek: %s\n",strerror(errno)); goto fail; }
+              if(write_all(bfd,safetensors_data(st,i),nb)!=0){ fprintf(stderr,"glm5_stage: write %s: %s\n",name,strerror(errno)); goto fail; }
+              st_tensor_info*t=&st->tensors[i];
+              fprintf(mf,"%llu %zu %s %d",(unsigned long long)aligned,nb,t->dtype_str,t->n_dims);
+              for(int d=0;d<t->n_dims;d++) fprintf(mf," %llu",(unsigned long long)t->shape[d]);
+              fprintf(mf," %s\n",name);
+              off=aligned+nb;
+              if(cls==CLS_EXPERT){ n_expert++; b_expert+=nb; } else { n_dense++; b_dense+=nb; }
+              kept++;
+              if(off-last_sync>=flush_bytes){ fdatasync(bfd); posix_fadvise(bfd,0,0,POSIX_FADV_DONTNEED); last_sync=off; }
+          }
+          madvise(st->map_base,st->map_size,MADV_DONTNEED);
+          safetensors_close(st);
+          printf("  [p%d] MTP shard %d/%d  kept %4d (layer 78)\n",pass,s,mtp_nsh,kept); fflush(stdout);
+        }
+      }
     }
     double tel=now_sec()-t0; long long n_total=n_dense+n_expert; uint64_t b_total=b_dense+b_expert;
     fseek(mf,hdr_pos,SEEK_SET);
