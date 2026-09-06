@@ -14402,6 +14402,94 @@ done:
 #undef G5VIEW
 }
 
+/* Real-model one-token DSA weight check.  q_a/kv_a/q_b are evaluated by the
+ * CPU oracle; HIP evaluates each 3-D Q8 k_b/v_b head and the output matrix.
+ * This specifically exercises the padded 3-D Q8 stride used by DSA. */
+int hip_llm_verify_glm5next_model_dsa_layer(hip_llm_runner *r, gguf_shards *model,
+                                            int layer, double *out_rel_l2,
+                                            double *out_max_abs, double *out_ms) {
+    const int h = 4096, heads = 64, kv = 512, qdim = 256, vdim = 256;
+    glm5next_config c; memset(&c, 0, sizeof(c));
+    glm5next_tensor_view tk, tv, to, emb, an;
+    qtensor qtk, qtv, qto;
+    void *dk = NULL, *dv = NULL, *do_w = NULL, *d_q = NULL, *d_kv = NULL;
+    void *d_qout = NULL, *d_vout = NULL, *d_value = NULL, *d_out = NULL;
+    float *hidden = NULL, *x = NULL, *q = NULL, *kvl = NULL, *qhead = NULL;
+    float *value = NULL, *ref = NULL, *got = NULL, *tmp = NULL, *norm = NULL;
+    size_t kstride = 0, vstride = 0; int ot = 0, rc = -1;
+    double start = 0.0, num = 0.0, den = 0.0, mx = 0.0;
+    if (!r || !model || layer < 0 || layer >= 45 ||
+        glm5next_config_load(model->metadata, &c, NULL, 0) != 0 ||
+        glm5next_layer_type(&c, layer) != GLM5NEXT_LAYER_DSA) goto done;
+#define DSA_VIEW(dst, suffix) do { char n[128]; snprintf(n, sizeof(n), "blk.%d.%s", layer, suffix); \
+    if (glm5next_tensor_view_get(model, n, 1, &(dst)) != 0) goto done; } while (0)
+    DSA_VIEW(tk, "attn_k_b.weight"); DSA_VIEW(tv, "attn_v_b.weight");
+    DSA_VIEW(to, "attn_output.weight"); DSA_VIEW(an, "attn_norm.weight");
+    if (tk.n_dims != 3 || tv.n_dims != 3 || tk.type != GGML_TYPE_Q8_0 ||
+        tv.type != GGML_TYPE_Q8_0 || tk.dims[0] != qdim || tk.dims[1] != kv ||
+        tk.dims[2] != heads || tv.dims[0] != kv || tv.dims[1] != vdim || tv.dims[2] != heads) goto done;
+    hidden = (float *)malloc((size_t)h * sizeof(float)); x = (float *)malloc((size_t)h * sizeof(float));
+    q = (float *)malloc((size_t)heads * qdim * sizeof(float)); kvl = (float *)malloc((size_t)kv * sizeof(float));
+    qhead = (float *)malloc((size_t)kv * sizeof(float)); value = (float *)malloc((size_t)heads * vdim * sizeof(float));
+    ref = (float *)malloc((size_t)h * sizeof(float)); got = (float *)malloc((size_t)h * sizeof(float));
+    tmp = (float *)malloc((size_t)h * sizeof(float)); norm = (float *)malloc((size_t)h * sizeof(float));
+    if (!hidden || !x || !q || !kvl || !qhead || !value || !ref || !got || !tmp || !norm) goto done;
+    if (glm5next_tensor_view_get(model, "token_embd.weight", 1, &emb) != 0 || emb.n_dims != 2) goto done;
+    { size_t rb = dequant_row_size(emb.type, h); if (dequant_row(emb.type, (const uint8_t *)emb.data + rb, hidden, h) != 0) goto done; }
+    if (glm5next_cpu_vector(&an, norm, h) != 0) goto done;
+    glm5next_cpu_rmsnorm(x, hidden, norm, h, c.norm_epsilon);
+    if (glm5next_cpu_dsa_forward_cached(model, layer, &c, x, ref, NULL, 1, 0) != 0) goto done;
+    DSA_VIEW(tk, "attn_k_b.weight"); DSA_VIEW(tv, "attn_v_b.weight");
+    /* Build the CPU query/latent inputs using the exact DSA projections. */
+    { glm5next_tensor_view t; char qname[128]; float *qr = (float *)malloc(1536*sizeof(float)); float *wn = (float *)malloc(1536*sizeof(float));
+      snprintf(qname, sizeof(qname), "blk.%d.attn_q_a.weight", layer);
+      if (!qr || !wn || glm5next_tensor_view_get(model, qname, 1, &t) != 0 ||
+          glm5next_cpu_matvec(qr, &t, x) != 0) { free(qr); free(wn); goto done; }
+      snprintf(qname, sizeof(qname), "blk.%d.attn_q_a_norm.weight", layer);
+      if (glm5next_tensor_view_get(model, qname, 1, &t) != 0 ||
+          glm5next_cpu_vector(&t, wn, 1536) != 0) { free(qr); free(wn); goto done; }
+      glm5next_cpu_rmsnorm(qr, qr, wn, 1536, c.norm_epsilon); free(wn);
+      snprintf(qname, sizeof(qname), "blk.%d.attn_q_b.weight", layer);
+      if (glm5next_tensor_view_get(model, qname, 1, &t) != 0 || glm5next_cpu_matvec(q, &t, qr) != 0) { free(qr); goto done; }
+      snprintf(qname, sizeof(qname), "blk.%d.attn_kv_a_mqa.weight", layer);
+      if (glm5next_tensor_view_get(model, qname, 1, &t) != 0 || glm5next_cpu_matvec(kvl, &t, x) != 0) { free(qr); goto done; }
+      free(qr);
+      snprintf(qname, sizeof(qname), "blk.%d.attn_kv_a_norm.weight", layer);
+      if (glm5next_tensor_view_get(model, qname, 1, &t) != 0 || glm5next_cpu_vector(&t, norm, kv) != 0) goto done;
+      glm5next_cpu_rmsnorm(kvl, kvl, norm, kv, c.norm_epsilon); }
+    qtk = glm5next_as_qtensor(&tk); qtk.n_rows = (int)(tk.dims[1] * tk.dims[2]);
+    qtv = glm5next_as_qtensor(&tv); qtv.n_rows = (int)(tv.dims[1] * tv.dims[2]);
+    qto = glm5next_as_qtensor(&to);
+    if (upload_3d_kquant_raw(&dk, &qtk, &kstride) != 0 || upload_3d_kquant_raw(&dv, &qtv, &vstride) != 0 ||
+        upload_weight_matrix(&do_w, &qto, &ot) != 0) goto done;
+    if (hipMalloc(&d_q, qdim*sizeof(float)) != hipSuccess || hipMalloc(&d_kv, kv*sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_qout, kv*sizeof(float)) != hipSuccess || hipMalloc(&d_vout, vdim*sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_value, (size_t)heads*vdim*sizeof(float)) != hipSuccess || hipMalloc(&d_out, h*sizeof(float)) != hipSuccess) goto done;
+    if (hipMemcpy(d_kv, kvl, kv*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    start = hllm_monotonic_ms();
+    for (int head = 0; head < heads; ++head) {
+        if (glm5next_cpu_matvec_head(qhead, &tk, head, q + (size_t)head*qdim) != 0) goto done;
+        if (hipMemcpy(d_q, q + (size_t)head*qdim, qdim*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+        launch_matvec_auto(r, d_qout, (uint8_t *)dk + (size_t)head*kstride, d_q, kv, qdim, GGML_TYPE_Q8_0);
+        launch_matvec_auto(r, d_vout, (uint8_t *)dv + (size_t)head*vstride, d_kv, vdim, kv, GGML_TYPE_Q8_0);
+        if (hipStreamSynchronize(r->stream) != hipSuccess || hipMemcpy(tmp, d_qout, kv*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
+            hipMemcpy(value + (size_t)head*vdim, d_vout, vdim*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+        for (int i=0;i<kv;++i) { double e=(double)tmp[i]-qhead[i]; num+=e*e; den+=(double)qhead[i]*qhead[i]; if(fabs(e)>mx)mx=fabs(e); }
+    }
+    if (hipMemcpy(d_value, value, (size_t)heads*vdim*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    launch_matvec_auto(r, d_out, do_w, d_value, h, heads*vdim, ot);
+    if (hipStreamSynchronize(r->stream) != hipSuccess || hipMemcpy(got, d_out, h*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+    for (int i=0;i<h;++i) { double e=(double)got[i]-ref[i]; num+=e*e; den+=(double)ref[i]*ref[i]; if(fabs(e)>mx)mx=fabs(e); }
+    if (out_rel_l2) *out_rel_l2 = den > 0.0 ? sqrt(num/den) : sqrt(num); if (out_max_abs) *out_max_abs = mx;
+    if (out_ms) *out_ms = hllm_monotonic_ms() - start; rc = 0;
+done:
+    if (dk) hipFree(dk); if (dv) hipFree(dv); if (do_w) hipFree(do_w); if (d_q) hipFree(d_q); if (d_kv) hipFree(d_kv);
+    if (d_qout) hipFree(d_qout); if (d_vout) hipFree(d_vout); if (d_value) hipFree(d_value); if (d_out) hipFree(d_out);
+    free(hidden); free(x); free(q); free(kvl); free(qhead); free(value); free(ref); free(got); free(tmp); free(norm);
+    glm5next_config_free(&c); return rc;
+#undef DSA_VIEW
+}
+
 /* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch
  * [M, n_embd] (pre-normed). Adds the MoE output into r->d_x_batch (residual).
  * Experts are grouped by token: router GEMM -> host top-K -> gather by expert ->

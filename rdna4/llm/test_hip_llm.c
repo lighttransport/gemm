@@ -719,6 +719,7 @@ int main(int argc, char **argv) {
     int verify_glm5next_model = 0;
     int verify_glm5next_projections = 0;
     int verify_glm5next_kda_layer = 0;
+    int verify_glm5next_dsa_layer = 0;
     int glm5next_verify_layer = 0;
     int verify_quant_kernels = 0; /* --verify-quant-kernels: A/B HIP vs CPU per quant type, then exit */
     int verify_moe_routing = 0;
@@ -812,6 +813,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--verify-glm5next-kda-layer") == 0) {
             verify_glm5next_kda_layer = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') glm5next_verify_layer = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--verify-glm5next-dsa-layer") == 0) {
+            verify_glm5next_dsa_layer = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') glm5next_verify_layer = atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         } else {
@@ -825,6 +829,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       [--verify-glm5next-model]\n");
             fprintf(stderr, "       [--verify-glm5next-projections [LAYER]]\n");
             fprintf(stderr, "       [--verify-glm5next-kda-layer [LAYER]]\n");
+            fprintf(stderr, "       [--verify-glm5next-dsa-layer [LAYER]]\n");
             return 1;
         }
     }
@@ -885,6 +890,23 @@ int main(int argc, char **argv) {
         int rc = model && r ? hip_llm_verify_glm5next_model_kda_layer(
             r, model, glm5next_verify_layer, &rel, &max_abs, &ms) : -1;
         fprintf(stderr, "GLM5Next KDA layer: layer=%d rel_l2=%.6e max_abs=%.6e "
+                        "launch_ms=%.3f %s\n", glm5next_verify_layer, rel, max_abs,
+                        ms, rc == 0 && rel < 1e-5 ? "PASS" : "FAIL");
+        if (r) hip_llm_free(r);
+        if (model) gguf_close_shards(model);
+        return rc == 0 && rel < 1e-5 ? 0 : 1;
+    }
+    if (verify_glm5next_dsa_layer) {
+        if (!model_path) {
+            fprintf(stderr, "--verify-glm5next-dsa-layer requires a model path\n");
+            return 2;
+        }
+        gguf_shards *model = gguf_open_shards(model_path, 2);
+        hip_llm_runner *r = hip_llm_init(0, 1);
+        double rel = 0.0, max_abs = 0.0, ms = 0.0;
+        int rc = model && r ? hip_llm_verify_glm5next_model_dsa_layer(
+            r, model, glm5next_verify_layer, &rel, &max_abs, &ms) : -1;
+        fprintf(stderr, "GLM5Next DSA layer: layer=%d rel_l2=%.6e max_abs=%.6e "
                         "launch_ms=%.3f %s\n", glm5next_verify_layer, rel, max_abs,
                         ms, rc == 0 && rel < 1e-5 ? "PASS" : "FAIL");
         if (r) hip_llm_free(r);

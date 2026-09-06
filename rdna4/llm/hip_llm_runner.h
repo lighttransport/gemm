@@ -99,6 +99,9 @@ int hip_llm_verify_glm5next_model_kda_projections(hip_llm_runner *r,
 int hip_llm_verify_glm5next_model_kda_layer(hip_llm_runner *r, gguf_shards *model,
                                             int layer, double *out_rel_l2,
                                             double *out_max_abs, double *out_ms);
+int hip_llm_verify_glm5next_model_dsa_layer(hip_llm_runner *r, gguf_shards *model,
+                                            int layer, double *out_rel_l2,
+                                            double *out_max_abs, double *out_ms);
 
 /* Load Qwen3 dense weights from a safetensors file (text-encoder path). */
 int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_path, int max_seq_len);
