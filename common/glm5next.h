@@ -342,9 +342,13 @@ static inline int glm5next_state_layout_compute(const glm5next_config *c, int ma
     if (!c || !out || max_seq_len <= 0) return -1;
     memset(out, 0, sizeof(*out));
     n = (size_t)c->n_layers;
+    /* KDA q/k/v and recurrent state are laid out per attention head.  The
+     * previous contract omitted this factor, under-reporting a 64-head model
+     * by 64x even though the CPU runtime correctly allocated the full state. */
     out->conv_bytes = n * (size_t)(c->short_conv_kernel - 1) *
-                      (size_t)(3 * c->linear_head_dim) * sizeof(float);
-    out->recurrent_bytes = n * (size_t)c->linear_head_dim * c->linear_head_dim * sizeof(float);
+                      (size_t)(3 * c->attention_heads * c->linear_head_dim) * sizeof(float);
+    out->recurrent_bytes = n * (size_t)c->attention_heads *
+                           c->linear_head_dim * c->linear_head_dim * sizeof(float);
     out->latent_kv_bytes = n * (size_t)max_seq_len * (size_t)c->kv_lora_rank * sizeof(float);
     out->indexer_bytes = n * (size_t)max_seq_len * (size_t)c->indexer_key_length * sizeof(float);
     out->mhc_bytes = (size_t)c->hc_count * c->hidden_size * sizeof(float);
