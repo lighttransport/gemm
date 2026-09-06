@@ -10,18 +10,26 @@ import uuid
 def tool_registry(tools, namespace=None):
     registry = {}
     for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
         if tool.get("type") == "namespace":
-            registry.update(tool_registry(tool.get("tools", []), tool["name"]))
+            child_namespace = tool.get("name")
+            if isinstance(child_namespace, str) and child_namespace:
+                registry.update(tool_registry(tool.get("tools", []), child_namespace))
             continue
         kind = tool.get("type")
         if kind not in ("function", "custom"):
             continue
         spec = tool.get("function", tool)
+        if not isinstance(spec, dict) or not isinstance(spec.get("name"), str) or not spec["name"]:
+            continue
         name = spec["name"]
         qualified = f"{namespace}.{name}" if namespace else name
         parameters = spec.get("parameters", {}) if kind == "function" else {
             "type": "object", "properties": {"input": {"type": "string"}},
             "required": ["input"]}
+        if not isinstance(parameters, dict):
+            parameters = {}
         registry[qualified] = {"name": name, "namespace": namespace, "type": kind,
                                "description": spec.get("description", ""),
                                "parameters": parameters}

@@ -62,6 +62,15 @@ class QwenToolsTest(unittest.TestCase):
         self.assertEqual(calls[0]["name"], "echo")
         self.assertEqual(calls[0]["arguments"], '{"text": "hello"}')
 
+    def test_malformed_tool_entries_are_ignored(self):
+        registry = tool_registry([
+            None,
+            "not an object",
+            {"type": "namespace", "tools": [{"type": "function"}]},
+            {"type": "function", "function": {"name": "valid"}},
+        ])
+        self.assertEqual(list(registry), ["valid"])
+
 
 if __name__ == "__main__":
     unittest.main()
