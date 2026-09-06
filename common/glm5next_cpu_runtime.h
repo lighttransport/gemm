@@ -21,6 +21,7 @@ typedef struct {
     float *nextn_latent_kv, *nextn_hidden, *nextn_fusion;
     int max_seq_len;
     int position;
+    int target_position;
     glm5next_dsa_callback dsa_callback;
     void *dsa_callback_opaque;
     glm5next_kda_callback kda_callback;
@@ -130,7 +131,7 @@ static inline int glm5next_cpu_runtime_init(glm5next_cpu_runtime *r,
         ? (float *)malloc((size_t)h * sizeof(float)) : NULL;
     r->nextn_fusion = r->config.n_nextn_layers > 0
         ? (float *)malloc((size_t)2 * h * sizeof(float)) : NULL;
-    r->model = model; r->max_seq_len = max_seq_len; r->position = 0;
+    r->model = model; r->max_seq_len = max_seq_len; r->position = 0; r->target_position = -1;
     if (!r->streams || !r->recurrent || !r->conv || !r->latent_kv ||
         !r->indexer_keys || !r->indexer_gates || !r->hidden || !r->target_hidden ||
         !r->normed || !r->logits || (r->config.n_nextn_layers > 0 &&
@@ -158,6 +159,7 @@ static inline void glm5next_cpu_runtime_reset(glm5next_cpu_runtime *r) {
         memset(r->nextn_latent_kv, 0, (size_t)r->config.n_nextn_layers * r->max_seq_len *
                r->config.kv_lora_rank * sizeof(float));
     r->position = 0;
+    r->target_position = -1;
 }
 
 static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
@@ -212,6 +214,7 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
         r->hidden[i] = (float)(sum / hc);
     }
     memcpy(r->target_hidden, r->hidden, (size_t)h * sizeof(float));
+    r->target_position = position;
     if (r->output_callback) {
         if (r->output_callback(r->model, &r->config, r->hidden, r->logits,
                                r->output_callback_opaque) != 0) return -1;
@@ -235,7 +238,8 @@ static inline float *glm5next_cpu_runtime_nextn_logits(glm5next_cpu_runtime *r,
     if (!r || !r->model || r->config.n_nextn_layers <= 0 || !r->target_hidden ||
         !r->nextn_latent_kv || !r->nextn_hidden || !r->nextn_fusion ||
         prev_token < 0 || prev_token >= r->config.vocab_size || position < 0 ||
-        position >= r->max_seq_len) return NULL;
+        position >= r->max_seq_len || r->target_position < 0 ||
+        position != r->target_position + 1) return NULL;
     int h = r->config.hidden_size, layer = r->config.n_layers;
     float *embedding = (float *)malloc((size_t)h * sizeof(float));
     float *enorm = (float *)malloc((size_t)h * sizeof(float));

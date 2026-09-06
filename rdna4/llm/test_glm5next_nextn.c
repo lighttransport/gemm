@@ -23,6 +23,10 @@ int main(int argc, char **argv) {
     options.max_seq_len = 2;
     if (hip_llm_load_weights_sharded(runner, model, &options) != 0) return 1;
     trunk = hip_llm_forward_logits(runner, 87, 0);
+    if (!trunk || hip_llm_forward_nextn_logits(runner, 88, 0) != NULL) {
+        fprintf(stderr, "GLM5Next NextN accepted an invalid draft position\n");
+        hip_llm_free(runner); gguf_close_shards(model); return 1;
+    }
     draft = hip_llm_forward_nextn_logits(runner, 88, 1);
     if (!trunk || !draft) {
         fprintf(stderr, "GLM5Next NextN forward failed\n");
