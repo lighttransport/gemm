@@ -368,6 +368,31 @@ static inline int glm5next_validate_tensors(const gguf_shards *model,
             }
         }
     }
+    /* NextN/MTP blocks are stored after the trunk.  The current single-token
+     * runtime does not execute speculative NextN yet, but validating its
+     * weights here prevents a split or damaged checkpoint from appearing
+     * usable merely because trunk generation succeeds.  GLM5Next's NextN
+     * block is a dense-attention MoE block (no KDA or mHC tensors). */
+    for (l = c->n_layers; l < c->n_layers_all; ++l) {
+        const char *base[] = { "attn_norm.weight", "attn_output.weight", "ffn_norm.weight",
+                               "ffn_gate_inp.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight",
+                               "ffn_down_exps.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                               "ffn_down_shexp.weight", "exp_probs_b.bias",
+                               "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
+                               "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight", "attn_k_b.weight",
+                               "attn_v_b.weight", "indexer.attn_k.weight", "indexer.attn_q_b.weight",
+                               "indexer.k_norm.weight", "indexer.k_norm.bias", "indexer.proj.weight",
+                               "indexer_compressor_ape.weight", "indexer_compressor_gate.weight",
+                               "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight",
+                               "nextn.shared_head_norm.weight" };
+        for (i = 0; i < (int)(sizeof(base) / sizeof(base[0])); ++i) {
+            snprintf(name, sizeof(name), "blk.%d.%s", l, base[i]);
+            if (!glm5next_tensor_present(model, name)) {
+                if (err && err_cap) snprintf(err, err_cap, "missing NextN tensor %s", name);
+                return -1;
+            }
+        }
+    }
     return 0;
 }
 

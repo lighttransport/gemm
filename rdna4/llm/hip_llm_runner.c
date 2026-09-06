@@ -9980,8 +9980,11 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                          r->glm5next_layout.indexer_bytes +
                          r->glm5next_layout.mhc_bytes) / (1024.0 * 1024.0));
         fprintf(stderr,
-                "hip_llm: GLM5Next HIP graph is pending; enabling CPU reference "
-                "execution with persistent KDA state\n");
+                "hip_llm: GLM5Next NextN weights validated (%d layer%s); "
+                "speculative NextN graph is unavailable, using trunk CPU reference "
+                "with persistent KDA state\n",
+                r->glm5next.n_nextn_layers,
+                r->glm5next.n_nextn_layers == 1 ? "" : "s");
         if (!hllm_active_shards) return -1;
         r->glm5next_model = hllm_active_shards;
         r->glm5next_cpu = (glm5next_cpu_runtime *)calloc(1, sizeof(*r->glm5next_cpu));
