@@ -18,6 +18,8 @@ typedef struct {
     int position;
     glm5next_dsa_callback dsa_callback;
     void *dsa_callback_opaque;
+    glm5next_kda_callback kda_callback;
+    void *kda_callback_opaque;
 } glm5next_cpu_runtime;
 
 static inline void glm5next_cpu_runtime_set_dsa_callback(glm5next_cpu_runtime *r,
@@ -25,6 +27,13 @@ static inline void glm5next_cpu_runtime_set_dsa_callback(glm5next_cpu_runtime *r
     if (!r) return;
     r->dsa_callback = callback;
     r->dsa_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_kda_callback(glm5next_cpu_runtime *r,
+        glm5next_kda_callback callback, void *opaque) {
+    if (!r) return;
+    r->kda_callback = callback;
+    r->kda_callback_opaque = opaque;
 }
 
 static inline void glm5next_cpu_runtime_free(glm5next_cpu_runtime *r) {
@@ -98,8 +107,10 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
         int rc;
         if (glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA) {
             rc = l < r->config.first_k_dense_replace
-                ? glm5next_cpu_kda_dense_block(r->model, l, &r->config, r->streams, rs, cs)
-                : glm5next_cpu_kda_moe_block(r->model, l, &r->config, r->streams, rs, cs);
+                ? glm5next_cpu_kda_dense_block_cb(r->model, l, &r->config, r->streams, rs, cs,
+                    r->kda_callback, r->kda_callback_opaque)
+                : glm5next_cpu_kda_moe_block_cb(r->model, l, &r->config, r->streams, rs, cs,
+                    r->kda_callback, r->kda_callback_opaque);
         } else {
             float *cache = r->latent_kv + (size_t)l * r->max_seq_len * r->config.kv_lora_rank;
             rc = glm5next_cpu_dsa_moe_block_cached_cb(r->model, l, &r->config, r->streams,

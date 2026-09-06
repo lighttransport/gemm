@@ -299,6 +299,9 @@ fail:
 typedef int (*glm5next_dsa_callback)(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         float *latent_cache, int max_seq_len, int position, void *opaque);
+typedef int (*glm5next_kda_callback)(const gguf_shards *model, int layer,
+        const glm5next_config *config, const float *hidden, float *out,
+        float *recurrent, float *conv_state, void *opaque);
 
 static inline int glm5next_cpu_dsa_moe_block_cached_cb(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
@@ -354,9 +357,10 @@ static inline int glm5next_cpu_kda_forward(const gguf_shards *model,
         int layer, const glm5next_config *c, const float *hidden, float *out,
         float *recurrent, float *conv_state);
 
-static inline int glm5next_cpu_kda_moe_block(const gguf_shards *model,
+static inline int glm5next_cpu_kda_moe_block_cb(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
-        float *recurrent, float *conv_state) {
+        float *recurrent, float *conv_state, glm5next_kda_callback callback,
+        void *opaque) {
     int h = c->hidden_size, hc = c->hc_count;
     char name[128]; glm5next_tensor_view fn, base, scale;
     float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
@@ -373,7 +377,10 @@ static inline int glm5next_cpu_kda_moe_block(const gguf_shards *model,
     if (glm5next_cpu_mhc_pre(c, &fn, &base, &scale, residual, collapsed, post, comb) != 0) goto fail;
     KM_VIEW("attn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
     glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
-    if (glm5next_cpu_kda_forward(model, layer, c, collapsed, sublayer, recurrent, conv_state) != 0) goto fail;
+    if ((callback ? callback(model, layer, c, collapsed, sublayer, recurrent,
+                             conv_state, opaque)
+                  : glm5next_cpu_kda_forward(model, layer, c, collapsed,
+                             sublayer, recurrent, conv_state)) != 0) goto fail;
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
     memcpy(residual, streams, (size_t)hc * h * sizeof(float));
     KM_VIEW("hc_ffn_fn.weight", fn); KM_VIEW("hc_ffn_base.weight", base); KM_VIEW("hc_ffn_scale.weight", scale);
@@ -386,6 +393,13 @@ static inline int glm5next_cpu_kda_moe_block(const gguf_shards *model,
 fail:
     free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return -1;
 #undef KM_VIEW
+}
+
+static inline int glm5next_cpu_kda_moe_block(const gguf_shards *model,
+        int layer, const glm5next_config *c, float *streams,
+        float *recurrent, float *conv_state) {
+    return glm5next_cpu_kda_moe_block_cb(model, layer, c, streams, recurrent,
+        conv_state, NULL, NULL);
 }
 
 /* Execute one recurrent KDA layer from the real GGUF views.  State layouts
@@ -538,9 +552,10 @@ done:
  * end-to-end block oracle: it includes both mHC sites, RMSNorm, recurrent KDA,
  * and the dense SwiGLU FFN.  DSA/MoE blocks use separate routines because
  * their cache and expert routing state are different. */
-static inline int glm5next_cpu_kda_dense_block(const gguf_shards *model,
+static inline int glm5next_cpu_kda_dense_block_cb(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
-        float *recurrent, float *conv_state) {
+        float *recurrent, float *conv_state, glm5next_kda_callback callback,
+        void *opaque) {
     int h = c->hidden_size, hc = c->hc_count;
     char name[128]; glm5next_tensor_view fn, base, scale;
     float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
@@ -558,7 +573,10 @@ static inline int glm5next_cpu_kda_dense_block(const gguf_shards *model,
     G5VIEW("attn_norm.weight", 1, fn);
     if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
     glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
-    if (glm5next_cpu_kda_forward(model, layer, c, collapsed, sublayer, recurrent, conv_state) != 0) goto fail;
+    if ((callback ? callback(model, layer, c, collapsed, sublayer, recurrent,
+                             conv_state, opaque)
+                  : glm5next_cpu_kda_forward(model, layer, c, collapsed,
+                             sublayer, recurrent, conv_state)) != 0) goto fail;
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
 
     memcpy(residual, streams, (size_t)hc * h * sizeof(float));
@@ -575,6 +593,13 @@ fail:
     free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm);
     return -1;
 #undef G5VIEW
+}
+
+static inline int glm5next_cpu_kda_dense_block(const gguf_shards *model,
+        int layer, const glm5next_config *c, float *streams,
+        float *recurrent, float *conv_state) {
+    return glm5next_cpu_kda_dense_block_cb(model, layer, c, streams, recurrent,
+        conv_state, NULL, NULL);
 }
 
 #endif /* GLM5NEXT_CPU_KDA_H */
