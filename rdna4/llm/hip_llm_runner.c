@@ -9213,6 +9213,39 @@ static int upload_weight_matrix(void **d_ptr, const qtensor *t, int *out_type) {
 
 static int upload_3d_kquant_raw(void **d_ptr, const qtensor *t, size_t *out_stride) {
     if (!t->data) { *d_ptr = NULL; return 0; }
+    /* GGUF Q8_0 uses 34-byte blocks, while the HIP Q8 matvec kernels use
+     * [f16 scale][2-byte pad][32 int8] = 36 bytes.  The ordinary 2-D path
+     * already performs this conversion; keep 3-D tensors consistent so a
+     * future per-head DSA upload cannot silently read every row after the
+     * first one at the wrong offset. */
+    if (t->type == GGML_TYPE_Q8_0) {
+        int n_elements = t->n_rows * t->n_cols;
+        if (n_elements <= 0 || (n_elements % 32) != 0) return -1;
+        int n_blocks = n_elements / 32;
+        size_t padded_row_bytes = (size_t)(t->n_cols / 32) * 36;
+        int rows_per_expert = (t->n_dims >= 3) ? (int)t->dims[1] : t->n_rows;
+        size_t total_bytes = padded_row_bytes * (size_t)t->n_rows;
+        uint8_t *padded = (uint8_t *)malloc(total_bytes);
+        if (!padded) return -1;
+        const uint8_t *src = (const uint8_t *)t->data;
+        for (int i = 0; i < n_blocks; ++i) {
+            uint8_t *dst = padded + (size_t)i * 36;
+            const uint8_t *s = src + (size_t)i * 34;
+            dst[0] = s[0]; dst[1] = s[1]; dst[2] = 0; dst[3] = 0;
+            memcpy(dst + 4, s + 2, 32);
+        }
+        *out_stride = padded_row_bytes * (size_t)rows_per_expert;
+        hipError_t err = hipMalloc(d_ptr, total_bytes);
+        if (err == hipSuccess)
+            err = hipMemcpy(*d_ptr, padded, total_bytes, hipMemcpyHostToDevice);
+        free(padded);
+        if (err != hipSuccess) {
+            if (*d_ptr) hipFree(*d_ptr);
+            *d_ptr = NULL;
+            return -1;
+        }
+        return 0;
+    }
     size_t row_bytes = dequant_row_size(t->type, t->n_cols);
     int rows_per_expert = (t->n_dims >= 3) ? (int)t->dims[1] : t->n_rows;
     *out_stride = row_bytes * (size_t)rows_per_expert;
