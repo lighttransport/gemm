@@ -252,6 +252,13 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         if (fields != 8 && fields != 7 && fields != 6) {
             puts("ERR missing prompt"); fflush(stdout); continue;
         }
+        if (max_tokens < 0 || top_k < 1 ||
+            !isfinite(temperature) || temperature < 0.0f ||
+            !isfinite(top_p) || top_p < 0.0f || top_p > 1.0f ||
+            !isfinite(presence) || !isfinite(min_p) ||
+            min_p < 0.0f || min_p > 1.0f) {
+            puts("ERR invalid sampling"); fflush(stdout); continue;
+        }
         prefix_b64 = fields >= 7 ? prefix_b64buf : NULL;
         b64 = b64buf;
         size_t prompt_n = 0;
