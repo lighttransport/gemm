@@ -821,8 +821,8 @@ int main(int argc, char **argv) {
         hip_llm_runner *r = hip_llm_init(0, 1);
         if (!r) return 1;
         double rel = 0.0, max_abs = 0.0;
-        int rc = hip_llm_verify_glm5next_kda(r, glm5next_kda_dim, &rel, &max_abs);
-        fprintf(stderr, "GLM5Next KDA verify: head_dim=%d rel_l2=%.6e max_abs=%.6e %s\n",
+        int rc = hip_llm_verify_glm5next_kda_heads(r, 4, glm5next_kda_dim, &rel, &max_abs);
+        fprintf(stderr, "GLM5Next KDA verify: heads=4 head_dim=%d rel_l2=%.6e max_abs=%.6e %s\n",
                 glm5next_kda_dim, rel, max_abs,
                 rc == 0 && rel < 1e-6 ? "PASS" : "FAIL");
         hip_llm_free(r);
