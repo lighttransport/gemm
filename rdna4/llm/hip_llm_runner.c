@@ -13703,7 +13703,8 @@ int hip_llm_verify_hc_batch(hip_llm_runner *r,int M,double *rel,double *mx){
         double gd=0,gn=0;for(int i=0;i<hcd;i++){double d=sg[i]-bg[i];gd+=d*d;gn+=(double)sg[i]*sg[i];}free(bg);
         fprintf(stderr,"hip_llm: HC verify sample scalar=%g batch=%g l1=(%g,%g) norm_rel=%g low_rel=%g gate_rel=%g\n",a[0],b[0],sa,sb,sqrt(nd/nn),sqrt(ld/ln),sqrt(gd/gn)); }
     double num=0,den=0,ma=0;for(int i=0;i<M*ne;i++){double d=(double)a[i]-b[i],ad=fabs(d);num+=d*d;den+=(double)a[i]*a[i];if(ad>ma)ma=ad;}
-    if(rel)*rel=den>0?sqrt(num/den):sqrt(num);if(mx)*mx=ma;
+    if (rel) *rel = den > 0 ? sqrt(num / den) : sqrt(num);
+    if (mx) *mx = ma;
     free(in);free(a);free(b);free(sn);free(sl);free(sg);return 0;
 }
 
