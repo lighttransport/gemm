@@ -169,20 +169,27 @@ static int b64_value(int c) {
 }
 
 static unsigned char *b64_decode(const char *src, size_t *out_n) {
-    size_t n = strlen(src), cap = (n / 4) * 3 + 3, p = 0;
+    size_t n = strlen(src), cap, p = 0;
+    if (n % 4 != 0) return NULL;
+    cap = (n / 4) * 3 + 1;
     unsigned char *out = (unsigned char *)malloc(cap);
     if (!out) return NULL;
-    for (size_t i = 0; i + 1 < n; i += 4) {
+    for (size_t i = 0; i < n; i += 4) {
         int a = b64_value((unsigned char)src[i]);
         int b = b64_value((unsigned char)src[i + 1]);
         int c = src[i + 2] == '=' ? 0 : b64_value((unsigned char)src[i + 2]);
         int d = src[i + 3] == '=' ? 0 : b64_value((unsigned char)src[i + 3]);
-        if (a < 0 || b < 0 || c < 0 || d < 0) { free(out); return NULL; }
+        int last = i + 4 == n;
+        if (a < 0 || b < 0 || c < 0 || d < 0 ||
+            (!last && (src[i + 2] == '=' || src[i + 3] == '=')) ||
+            (src[i + 2] == '=' && src[i + 3] != '=')) {
+            free(out); return NULL;
+        }
         unsigned v = ((unsigned)a << 18) | ((unsigned)b << 12) |
                      ((unsigned)c << 6) | (unsigned)d;
         out[p++] = (unsigned char)(v >> 16);
-        if (i + 2 < n && src[i + 2] != '=') out[p++] = (unsigned char)(v >> 8);
-        if (i + 3 < n && src[i + 3] != '=') out[p++] = (unsigned char)v;
+        if (src[i + 2] != '=') out[p++] = (unsigned char)(v >> 8);
+        if (src[i + 3] != '=') out[p++] = (unsigned char)v;
     }
     out[p] = 0;
     if (out_n) *out_n = p;
