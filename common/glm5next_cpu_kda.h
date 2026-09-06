@@ -169,6 +169,93 @@ fail:
 #undef DSA_GET
 }
 
+static inline int glm5next_cpu_moe_ffn(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out) {
+    char name[128]; glm5next_tensor_view t;
+    int h = c->hidden_size, ff = c->expert_ff_length, ne = c->expert_count;
+    float *router = (float *)malloc((size_t)ne * sizeof(float));
+    float *bias = (float *)malloc((size_t)ne * sizeof(float));
+    float *gate = (float *)malloc((size_t)ff * sizeof(float));
+    float *up = (float *)malloc((size_t)ff * sizeof(float));
+    float *expert_out = (float *)malloc((size_t)h * sizeof(float));
+    float *shared_gate = (float *)malloc((size_t)c->shared_expert_ff_length * sizeof(float));
+    float *shared_up = (float *)malloc((size_t)c->shared_expert_ff_length * sizeof(float));
+    float *shared_out = (float *)malloc((size_t)h * sizeof(float));
+    if (!router || !bias || !gate || !up || !expert_out || !shared_gate || !shared_up || !shared_out) goto fail;
+#define MOE_GET(s) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
+    if (glm5next_tensor_view_get(model, name, 1, &t) != 0) goto fail; } while (0)
+    MOE_GET("ffn_gate_inp.weight"); if (glm5next_cpu_matvec(router, &t, hidden) != 0) goto fail;
+    MOE_GET("exp_probs_b.bias"); if (glm5next_cpu_vector(&t, bias, ne) != 0) goto fail;
+    int ids[8]; float weights[8];
+    for (int j = 0; j < c->expert_used_count; ++j) { ids[j] = -1; weights[j] = -INFINITY; }
+    for (int e = 0; e < ne; ++e) {
+        float score = 1.0f / (1.0f + expf(-router[e])) + bias[e];
+        int j = c->expert_used_count - 1;
+        if (score <= weights[j]) continue;
+        while (j > 0 && score > weights[j - 1]) { weights[j] = weights[j - 1]; ids[j] = ids[j - 1]; --j; }
+        weights[j] = score; ids[j] = e;
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < c->expert_used_count; ++j) {
+        float w = 1.0f / (1.0f + expf(-router[ids[j]]));
+        weights[j] = w; sum += w;
+    }
+    memset(out, 0, (size_t)h * sizeof(float));
+    for (int j = 0; j < c->expert_used_count; ++j) {
+        int e = ids[j];
+        MOE_GET("ffn_gate_exps.weight"); if (glm5next_cpu_matvec_head(gate, &t, e, hidden) != 0) goto fail;
+        MOE_GET("ffn_up_exps.weight"); if (glm5next_cpu_matvec_head(up, &t, e, hidden) != 0) goto fail;
+        for (int i = 0; i < ff; ++i) gate[i] = gate[i] / (1.0f + expf(-gate[i])) * up[i];
+        MOE_GET("ffn_down_exps.weight"); if (glm5next_cpu_matvec_head(expert_out, &t, e, gate) != 0) goto fail;
+        float w = c->routed_scaling_factor * weights[j] / (sum > 0.0f ? sum : 1.0f);
+        for (int i = 0; i < h; ++i) out[i] += w * expert_out[i];
+    }
+    /* Shared expert is unscaled and runs in parallel with the routed path. */
+    int sff = c->shared_expert_ff_length;
+    MOE_GET("ffn_gate_shexp.weight"); if (glm5next_cpu_matvec(shared_gate, &t, hidden) != 0) goto fail;
+    MOE_GET("ffn_up_shexp.weight"); if (glm5next_cpu_matvec(shared_up, &t, hidden) != 0) goto fail;
+    for (int i = 0; i < sff; ++i) shared_gate[i] = shared_gate[i] / (1.0f + expf(-shared_gate[i])) * shared_up[i];
+    MOE_GET("ffn_down_shexp.weight"); if (glm5next_cpu_matvec(shared_out, &t, shared_gate) != 0) goto fail;
+    for (int i = 0; i < h; ++i) out[i] += shared_out[i];
+    free(router); free(bias); free(gate); free(up); free(expert_out); free(shared_gate); free(shared_up); free(shared_out); return 0;
+fail:
+    free(router); free(bias); free(gate); free(up); free(expert_out); free(shared_gate); free(shared_up); free(shared_out); return -1;
+#undef MOE_GET
+}
+
+static inline int glm5next_cpu_dsa_moe_block(const gguf_shards *model,
+        int layer, const glm5next_config *c, float *streams) {
+    int h = c->hidden_size, hc = c->hc_count;
+    char name[128]; glm5next_tensor_view fn, base, scale;
+    float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
+    float *collapsed = (float *)malloc((size_t)h * sizeof(float));
+    float *sublayer = (float *)malloc((size_t)h * sizeof(float));
+    float *post = (float *)malloc((size_t)hc * sizeof(float));
+    float *comb = (float *)malloc((size_t)hc * hc * sizeof(float));
+    float *norm = (float *)malloc((size_t)h * sizeof(float));
+    if (!residual || !collapsed || !sublayer || !post || !comb || !norm) goto fail;
+    memcpy(residual, streams, (size_t)hc * h * sizeof(float));
+#define BLOCK_VIEW(s, dst) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
+    if (glm5next_tensor_view_get(model, name, 1, &(dst)) != 0) goto fail; } while (0)
+    BLOCK_VIEW("hc_attn_fn.weight", fn); BLOCK_VIEW("hc_attn_base.weight", base); BLOCK_VIEW("hc_attn_scale.weight", scale);
+    if (glm5next_cpu_mhc_pre(c, &fn, &base, &scale, residual, collapsed, post, comb) != 0) goto fail;
+    BLOCK_VIEW("attn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
+    glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
+    if (glm5next_cpu_dsa_forward(model, layer, c, collapsed, sublayer) != 0) goto fail;
+    glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
+    memcpy(residual, streams, (size_t)hc * h * sizeof(float));
+    BLOCK_VIEW("hc_ffn_fn.weight", fn); BLOCK_VIEW("hc_ffn_base.weight", base); BLOCK_VIEW("hc_ffn_scale.weight", scale);
+    if (glm5next_cpu_mhc_pre(c, &fn, &base, &scale, residual, collapsed, post, comb) != 0) goto fail;
+    BLOCK_VIEW("ffn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
+    glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
+    if (glm5next_cpu_moe_ffn(model, layer, c, collapsed, sublayer) != 0) goto fail;
+    glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
+    free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return 0;
+fail:
+    free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return -1;
+#undef BLOCK_VIEW
+}
+
 /* Execute one recurrent KDA layer from the real GGUF views.  State layouts
  * are contiguous by layer and owned by the caller.  This is deliberately a
  * reference implementation: each quantized matrix row is dequantized before

@@ -58,6 +58,14 @@ int main(int argc, char **argv) {
     }
     for (i = 0; i < config.hidden_size; ++i)
         if (!isfinite(dsa_out[i])) { fprintf(stderr, "DSA produced non-finite output\n"); return 1; }
+    for (i = 0; i < config.hc_count; ++i)
+        memcpy(streams + (size_t)i * config.hidden_size, hidden,
+               (size_t)config.hidden_size * sizeof(float));
+    if (glm5next_cpu_dsa_moe_block(model, 3, &config, streams) != 0) {
+        fprintf(stderr, "complete DSA+MoE block execution failed\n"); return 1;
+    }
+    for (i = 0; i < config.hc_count * config.hidden_size; ++i)
+        if (!isfinite(streams[i])) { fprintf(stderr, "complete DSA block produced non-finite output\n"); return 1; }
     {
         double ss = 0.0;
         for (i = 0; i < config.hidden_size; ++i) ss += (double)out[i] * out[i];
