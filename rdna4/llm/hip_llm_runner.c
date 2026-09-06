@@ -7937,12 +7937,21 @@ typedef struct {
     void *kv_a_weight;
     void *q_a_norm;
     void *kv_a_norm;
+    void *indexer_k_weight;
+    void *indexer_gate_weight;
+    void *indexer_q_weight;
+    void *indexer_proj_weight;
     size_t k_stride;
     size_t v_stride;
     int q_a_type;
     int q_b_type;
     int kv_a_type;
+    int indexer_k_type;
+    int indexer_gate_type;
+    int indexer_q_type;
+    int indexer_proj_type;
     int q_ready;
+    int indexer_ready;
     int ready;
 } glm5next_dsa_gpu_cache;
 
@@ -9562,6 +9571,7 @@ static int glm5next_upload_f32_view(void **dst, const glm5next_tensor_view *v);
 static int glm5next_hip_dsa_cache_load(hip_llm_runner *r, const gguf_shards *model,
         int layer, glm5next_dsa_gpu_cache *cache) {
     glm5next_tensor_view tk, tv, tqa, tqb, tkva, tqan, tkvan;
+    glm5next_tensor_view tik, tig, tiq, tiw;
     char n[128];
     if (!r || !model || !cache) return -1;
     snprintf(n, sizeof(n), "blk.%d.attn_k_b.weight", layer);
@@ -9583,8 +9593,7 @@ static int glm5next_hip_dsa_cache_load(hip_llm_runner *r, const gguf_shards *mod
         const char *proj = getenv("GLM5NEXT_HIP_DSA_PROJ");
         const char *layer_env = getenv("GLM5NEXT_HIP_DSA_PROJ_LAYER");
         int proj_layer = layer_env ? atoi(layer_env) : -1;
-        if (!proj || atoi(proj) == 0 || (proj_layer >= 0 && proj_layer != layer))
-            goto dsa_cache_ready;
+        if (proj && atoi(proj) != 0 && (proj_layer < 0 || proj_layer == layer)) {
         snprintf(n, sizeof(n), "blk.%d.attn_q_a.weight", layer);
         if (glm5next_tensor_view_get(model, n, 1, &tqa) != 0) return -1;
         snprintf(n, sizeof(n), "blk.%d.attn_q_b.weight", layer);
@@ -9612,8 +9621,35 @@ static int glm5next_hip_dsa_cache_load(hip_llm_runner *r, const gguf_shards *mod
           }
         }
         cache->q_ready = 1;
+        }
     }
-dsa_cache_ready:
+    if (getenv("GLM5NEXT_HIP_INDEXER_CACHE") &&
+        atoi(getenv("GLM5NEXT_HIP_INDEXER_CACHE")) != 0) {
+        qtensor qik, qig, qiq, qiw;
+        snprintf(n, sizeof(n), "blk.%d.indexer.attn_k.weight", layer);
+        if (glm5next_tensor_view_get(model, n, 1, &tik) != 0) return -1;
+        snprintf(n, sizeof(n), "blk.%d.indexer_compressor_gate.weight", layer);
+        if (glm5next_tensor_view_get(model, n, 1, &tig) != 0) return -1;
+        snprintf(n, sizeof(n), "blk.%d.indexer.attn_q_b.weight", layer);
+        if (glm5next_tensor_view_get(model, n, 1, &tiq) != 0) return -1;
+        snprintf(n, sizeof(n), "blk.%d.indexer.proj.weight", layer);
+        if (glm5next_tensor_view_get(model, n, 1, &tiw) != 0) return -1;
+        qik = glm5next_as_qtensor(&tik); qig = glm5next_as_qtensor(&tig);
+        qiq = glm5next_as_qtensor(&tiq); qiw = glm5next_as_qtensor(&tiw);
+        if (upload_weight_matrix(&cache->indexer_k_weight, &qik, &cache->indexer_k_type) != 0 ||
+            upload_weight_matrix(&cache->indexer_gate_weight, &qig, &cache->indexer_gate_type) != 0 ||
+            upload_weight_matrix(&cache->indexer_q_weight, &qiq, &cache->indexer_q_type) != 0 ||
+            upload_weight_matrix(&cache->indexer_proj_weight, &qiw, &cache->indexer_proj_type) != 0) {
+            if (cache->indexer_k_weight) hipFree(cache->indexer_k_weight);
+            if (cache->indexer_gate_weight) hipFree(cache->indexer_gate_weight);
+            if (cache->indexer_q_weight) hipFree(cache->indexer_q_weight);
+            if (cache->indexer_proj_weight) hipFree(cache->indexer_proj_weight);
+            cache->indexer_k_weight = cache->indexer_gate_weight = NULL;
+            cache->indexer_q_weight = cache->indexer_proj_weight = NULL;
+            return -1;
+        }
+        cache->indexer_ready = 1;
+    }
     cache->ready = 1;
     return 0;
 }
@@ -9630,7 +9666,7 @@ static int glm5next_hip_indexer_step(hip_llm_runner *r,
         const gguf_shards *model, int layer, const glm5next_config *c,
         const float *hidden, const float *qrank_norm,
         float *indexer_keys, float *indexer_gates, int max_seq_len, int position,
-        int *selected) {
+        int *selected, glm5next_dsa_gpu_cache *cache) {
     glm5next_tensor_view vk, vg, vq, vw, vkw, vkb, va;
     void *wk = NULL, *wg = NULL, *wq = NULL, *ww = NULL, *dx = NULL, *dq = NULL;
     void *dk = NULL, *dg = NULL, *diq = NULL, *diw = NULL;
@@ -9656,12 +9692,19 @@ static int glm5next_hip_indexer_step(hip_llm_runner *r,
     HIP_IDX_VIEW(vkw, "indexer.k_norm.weight");
     HIP_IDX_VIEW(vkb, "indexer.k_norm.bias");
     HIP_IDX_VIEW(va, "indexer_compressor_ape.weight");
-    { qtensor qtk = glm5next_as_qtensor(&vk), qtg = glm5next_as_qtensor(&vg);
-      qtensor qtq = glm5next_as_qtensor(&vq), qtw = glm5next_as_qtensor(&vw);
-      if (upload_weight_matrix(&wk, &qtk, &tk) != 0 ||
-          upload_weight_matrix(&wg, &qtg, &tg) != 0 ||
-          upload_weight_matrix(&wq, &qtq, &tq) != 0 ||
-          upload_weight_matrix(&ww, &qtw, &tw) != 0) goto done; }
+    if (cache && cache->indexer_ready) {
+        wk = cache->indexer_k_weight; tk = cache->indexer_k_type;
+        wg = cache->indexer_gate_weight; tg = cache->indexer_gate_type;
+        wq = cache->indexer_q_weight; tq = cache->indexer_q_type;
+        ww = cache->indexer_proj_weight; tw = cache->indexer_proj_type;
+    } else {
+        qtensor qtk = glm5next_as_qtensor(&vk), qtg = glm5next_as_qtensor(&vg);
+        qtensor qtq = glm5next_as_qtensor(&vq), qtw = glm5next_as_qtensor(&vw);
+        if (upload_weight_matrix(&wk, &qtk, &tk) != 0 ||
+            upload_weight_matrix(&wg, &qtg, &tg) != 0 ||
+            upload_weight_matrix(&wq, &qtq, &tq) != 0 ||
+            upload_weight_matrix(&ww, &qtw, &tw) != 0) goto done;
+    }
     key = (float *)malloc((size_t)dim * sizeof(float));
     gate = (float *)malloc((size_t)dim * sizeof(float));
     iq = (float *)malloc((size_t)qdim * sizeof(float));
@@ -9702,7 +9745,9 @@ static int glm5next_hip_indexer_step(hip_llm_runner *r,
     else for (int i = 0; i < count; ++i) selected[i] = i;
     rc = count;
 done:
-    if (wk) hipFree(wk); if (wg) hipFree(wg); if (wq) hipFree(wq); if (ww) hipFree(ww);
+    if (!cache || !cache->indexer_ready) {
+        if (wk) hipFree(wk); if (wg) hipFree(wg); if (wq) hipFree(wq); if (ww) hipFree(ww);
+    }
     if (dx) hipFree(dx); if (dq) hipFree(dq); if (dk) hipFree(dk); if (dg) hipFree(dg);
     if (diq) hipFree(diq); if (diw) hipFree(diw);
     free(key); free(gate); free(iq); free(iw); free(kw); free(kb); free(ape); free(pool);
@@ -14855,7 +14900,7 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
         if (getenv("GLM5NEXT_HIP_INDEXER") && atoi(getenv("GLM5NEXT_HIP_INDEXER")) != 0)
             attn_nt = glm5next_hip_indexer_step(r, model, layer, c, hidden, qr,
                                                 indexer_keys, indexer_gates,
-                                                max_seq_len, position, selected);
+                                                max_seq_len, position, selected, cache);
         else
             attn_nt = glm5next_cpu_indexer_step(model, layer, c, hidden, qr,
                                                 indexer_keys, indexer_gates,

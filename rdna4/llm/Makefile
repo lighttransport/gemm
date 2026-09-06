@@ -100,6 +100,7 @@ help:
 	@echo "  GLM5NEXT_HIP_DSA=1 GLM5NEXT_HIP_KDA=1 GLM5NEXT_HIP_MOE=1 ./test_hip_llm GLM5Next.gguf --gpu-only-bench --prefill-len 1 --decode 1"
 	@echo "  GLM5NEXT_HIP_MOE_LAYER=N limits streamed MoE bring-up to one layer"
 	@echo "  GLM5NEXT_HIP_INDEXER=1 moves DSA indexer projections to HIP"
+	@echo "  GLM5NEXT_HIP_INDEXER_CACHE=1 retains indexer weights on HIP (uses more VRAM)"
 	@echo "  GLM5NEXT_HIP_MHC=1 moves mHC projection matvecs to HIP"
 	@echo "  GLM5NEXT_HIP_OUTPUT=1 moves the final vocabulary projection to HIP"
 	@echo "  GLM5NEXT_HIP_DSA_PROJ=1 moves DSA q_a/q_b/kv_a projections to HIP"
