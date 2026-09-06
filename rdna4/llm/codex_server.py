@@ -62,12 +62,19 @@ def responses_input_messages(value):
 
 
 def chat_prompt(messages):
-    # Stable ChatML-like framing gives the backend an exact token prefix to
-    # reuse when an agent resends its prior conversation plus one new turn.
-    out = []
+    # Match the checkpoint's non-thinking ChatML template, including the
+    # reasoning frame on historical assistant turns. Omitting it changes the
+    # token prefix and discards reusable conversation KV on every follow-up.
+    out = [chat_prefix(messages)]
+    leading = True
     for m in messages:
         role = m.get("role", "user")
-        text = content_text(m.get("content", ""))
+        if leading and role in ("system", "developer"):
+            continue
+        leading = False
+        text = content_text(m.get("content", "")).strip()
+        if role == "assistant":
+            text = "<think>\n\n</think>\n\n" + text
         out.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
     # Qwen3.8 Flash Next thinks by default.  Match llama.cpp's explicit
     # non-thinking mode by placing an empty reasoning block before the final
@@ -82,9 +89,11 @@ def chat_prefix(messages):
     for m in messages:
         if m.get("role") not in ("system", "developer"):
             break
-        role = m.get("role", "system")
-        out.append(f"<|im_start|>{role}\n{content_text(m.get('content', ''))}<|im_end|>\n")
-    return "".join(out)
+        text = content_text(m.get("content", "")).strip()
+        if text:
+            out.append(text)
+    # Qwen3.8's GGUF template merges consecutive system/developer messages.
+    return "<|im_start|>system\n" + "\n".join(out) + "<|im_end|>\n" if out else ""
 
 
 def fit_context(messages, context_tokens, output_tokens):
@@ -119,29 +128,69 @@ class Backend:
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=None, text=True, bufsize=1)
         self.lock = threading.Lock()
+        self.cancel_lock = threading.Lock()
+        self.active_cancel = None
+        self.ready = False
         self.model = args.model.rsplit("/", 1)[-1]
 
-    def cancel(self):
+    def cancel(self, cancellation=None):
         """Request cooperative cancellation in the resident runner."""
-        if self.proc.poll() is None:
-            try:
-                os.kill(self.proc.pid, signal.SIGUSR1)
-            except ProcessLookupError:
-                pass
+        with self.cancel_lock:
+            if self.active_cancel is None:
+                return
+            if cancellation is not None and cancellation is not self.active_cancel:
+                return
+            self.active_cancel.set()
+            if self.proc.poll() is None:
+                try:
+                    os.kill(self.proc.pid, signal.SIGUSR1)
+                except ProcessLookupError:
+                    pass
 
-    def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, min_p, prefix=""):
+    def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, min_p,
+                 prefix="", cancellation=None):
+        cancellation = cancellation if cancellation is not None else threading.Event()
         prefix_payload = base64.b64encode(prefix.encode("utf-8")).decode("ascii") if prefix else "-"
         payload = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
         line = f"REQ {max_tokens} {temperature} {top_p} {top_k} {presence} {min_p} {prefix_payload} {payload}\n"
         with self.lock:
             if self.proc.poll() is not None:
                 raise RuntimeError("runner exited")
-            self.proc.stdin.write(line)
-            self.proc.stdin.flush()
+            # The child installs its signal handler before announcing READY.
+            # A client may disconnect while the model is still loading.
+            while not self.ready:
+                raw = self.proc.stdout.readline()
+                if not raw:
+                    raise RuntimeError("runner closed its response pipe before READY")
+                if raw.rstrip("\r\n") == "READY":
+                    self.ready = True
+                else:
+                    sys.stderr.write("[runner diagnostic] " + raw)
+            with self.cancel_lock:
+                if cancellation.is_set():
+                    return "", 0, 0, 0, "cancelled"
+                self.active_cancel = cancellation
             # Preserve the final empty field: an immediate EOS is a valid
             # completion and the runner's OK line intentionally ends with an
             # empty base64 payload in that case.
-            result = self.proc.stdout.readline().rstrip("\r\n")
+            # HIP libraries may print diagnostics on stdout. Consume those
+            # within the transaction: returning early leaves its OK queued
+            # and makes the next HTTP request receive the previous answer.
+            try:
+                self.proc.stdin.write(line)
+                self.proc.stdin.flush()
+                while True:
+                    raw = self.proc.stdout.readline()
+                    if not raw:
+                        raise RuntimeError("runner closed its response pipe")
+                    result = raw.rstrip("\r\n")
+                    if result.startswith(("OK ", "ERR ")):
+                        break
+                    sys.stderr.write("[runner diagnostic] " + result + "\n")
+            finally:
+                # Clear ownership before another request can take self.lock.
+                with self.cancel_lock:
+                    self.active_cancel = None
         if not result.startswith("OK "):
             raise RuntimeError(result)
         fields = result.split(" ", 5)
@@ -192,21 +241,24 @@ class Handler(BaseHTTPRequestHandler):
     def _watch_disconnect(self, stop, cancelled):
         """Cancel inference when the client closes its request socket."""
         while not stop.wait(0.05):
+            if cancelled.is_set():
+                # Repeat until the transaction completes: the first signal
+                # can arrive just before the runner reads its REQ line.
+                self.backend.cancel(cancelled)
+                continue
             try:
                 readable, _, _ = select.select([self.connection], [], [], 0)
                 if not readable:
                     continue
                 data = self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
                 if not data:
-                    self.backend.cancel()
                     cancelled.set()
-                    return
+                    self.backend.cancel(cancelled)
             except (BlockingIOError, InterruptedError):
                 continue
             except (OSError, ValueError):
-                self.backend.cancel()
                 cancelled.set()
-                return
+                self.backend.cancel(cancelled)
 
     def do_POST(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
@@ -242,18 +294,10 @@ class Handler(BaseHTTPRequestHandler):
             messages = fit_context(messages, self.context, limit)
             prompt = chat_prompt(messages)
             prefix = chat_prefix(messages)
-            # Match test_hip_llm's validated Qwen3.8 coding profile unless a
-            # client explicitly supplies sampling controls.  Previously
-            # --coding was passed only to the child binary, where it has no
-            # effect on protocol requests; API calls therefore used a very
-            # low-temperature generic profile that produces meta-commentary.
-            # The local Qwen checkpoint is substantially more reliable for
-            # Codex's terse control prompts with low-entropy sampling.  The
-            # old coding defaults (T=0.7, presence=1.5) could turn a simple
-            # confirmation into repeated fragments even though the request
-            # and transport completed successfully.
-            # Match the Qwen3.8/Coder-Next llama.cpp profile. Greedy decoding
-            # falls into long repeated planning text on Codex's agent prompt.
+            # Explicit API sampling controls override the requested coding
+            # profile (T=1, top_p=.95, top_k=40, min_p=.01, no penalties).
+            # The child receives these values through the request protocol;
+            # its standalone benchmark sampling defaults do not apply here.
             default_temp, default_top_p, default_top_k, default_presence = (
                 (1.0, 0.95, 40, 0.0) if self.coding else (0.2, 0.95, 20, 0.0))
             temp = float(req.get("temperature", default_temp))
@@ -267,7 +311,8 @@ class Handler(BaseHTTPRequestHandler):
                                        args=(stop_watcher, cancelled), daemon=True)
             watcher.start()
             try:
-                text, cached, ptok, ctok, finish = self.backend.generate(prompt, limit, temp, top_p, top_k, presence, min_p, prefix)
+                text, cached, ptok, ctok, finish = self.backend.generate(
+                    prompt, limit, temp, top_p, top_k, presence, min_p, prefix, cancelled)
             finally:
                 stop_watcher.set()
                 watcher.join(timeout=0.2)
@@ -333,7 +378,7 @@ class Handler(BaseHTTPRequestHandler):
                                      "status": "completed", "usage": {"input_tokens": ptok,
                                      "output_tokens": ctok, "total_tokens": ptok + ctok,
                                      "input_tokens_details": {"cached_tokens": cached}}})
-            elif self.path == "/v1/completions":
+            elif api_path == "/v1/completions":
                 self.send_json(200, {"id": ident, "object": "text_completion", "created": created, "model": self.model, "choices": [{"index": 0, "text": text, "finish_reason": finish}], "usage": usage})
             else:
                 self.send_json(200, {"id": ident, "object": "chat.completion", "created": created, "model": self.model, "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish}], "usage": usage})

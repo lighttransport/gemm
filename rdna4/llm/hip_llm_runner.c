@@ -22,6 +22,15 @@ typedef void (*hllm_quant_fn)(const float *, void *, int64_t);
 typedef void (*hllm_dot_fn)(int, float *, size_t, const void *, size_t,
                              const void *, size_t, int);
 
+static int hllm_init_cpu_library(void *lib) {
+    void (*cpu_init)(void) = (void (*)(void))dlsym(lib, "ggml_cpu_init");
+    if (!cpu_init) return -1;
+    /* Raw dot kernels use ggml's FP16 lookup tables. dlopen alone leaves
+     * these zero-initialized, silently zeroing expert contributions. */
+    cpu_init();
+    return 0;
+}
+
 static double hllm_monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -8832,13 +8841,20 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     r->context = NULL;  /* use default context (no hipCtxCreate) */
     CHECK_HIP_NULL(hipStreamCreateWithFlags(&r->stream, hipStreamNonBlocking));
     const char *pipeline_env = getenv("LLM_MOE_COPY_PIPELINE");
-    if (pipeline_env && atoi(pipeline_env) != 0) {
+    const char *cpu_decode_env = getenv("LLM_MOE_CPU_DECODE_MISSES");
+    const char *delayed_cache_env = getenv("LLM_QWEN4_DELAYED_CACHE");
+    r->moe_copy_pipeline = pipeline_env && atoi(pipeline_env) != 0;
+    /* CPU-miss/delayed refills need completion events even when the separate
+     * grouped-prefill copy pipeline is disabled. Without them slots remain
+     * permanently pending after their first refill. */
+    if (r->moe_copy_pipeline ||
+        (cpu_decode_env && atoi(cpu_decode_env) != 0) ||
+        (delayed_cache_env && atoi(delayed_cache_env) != 0)) {
         CHECK_HIP_NULL(hipStreamCreateWithFlags(&r->moe_copy_stream, hipStreamNonBlocking));
         for (int s = 0; s < 128; s++) {
             CHECK_HIP_NULL(hipEventCreateWithFlags(&r->moe_copy_ready[s], hipEventDisableTiming));
             CHECK_HIP_NULL(hipEventCreateWithFlags(&r->moe_compute_done[s], hipEventDisableTiming));
         }
-        r->moe_copy_pipeline=1;
     }
 
     if (verbose >= 1) {
@@ -10247,7 +10263,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             const char *cpu_lib = getenv("LLM_MOE_CPU_LIB");
             if (cpu_lib && *cpu_lib) {
                 r->moe_cpu_lib = dlopen(cpu_lib, RTLD_NOW | RTLD_LOCAL);
-                if (r->moe_cpu_lib) {
+                if (r->moe_cpu_lib && hllm_init_cpu_library(r->moe_cpu_lib) == 0) {
                     r->moe_quant_q8k = (hllm_quant_fn)dlsym(r->moe_cpu_lib, "quantize_row_q8_K");
                     r->moe_quant_q81 = (hllm_quant_fn)dlsym(r->moe_cpu_lib, "quantize_row_q8_1");
                     r->moe_quant_q80 = (hllm_quant_fn)dlsym(r->moe_cpu_lib, "quantize_row_q8_0");
@@ -12543,6 +12559,36 @@ static void hllm_cpu_qwen4_decode_jobs(hip_llm_runner *r, hip_layer *cl,
         const float *out = r->h_moe_tmp + (size_t)j * ne;
         for (int i = 0; i < ne; ++i) r->h_moe_output[i] += weights[j] * out[i];
     }
+    /* Opt-in diagnostic against unquantized-activation expert evaluation. */
+    const char *verify_env = getenv("LLM_MOE_CPU_VERIFY");
+    if (verify_env && atoi(verify_env) != 0) {
+        float *ref = (float *)calloc((size_t)ne, sizeof(float));
+        float *work = (float *)malloc((size_t)(2 * ff + 2 * ne) * sizeof(float));
+        if (ref && work) {
+            float *g = work, *u = g + ff, *out = u + ff, *tmp = out + ne;
+            for (int j = 0; j < jobs; ++j) {
+                int e = ids[j];
+                const char *gw = (const char *)cl->moe_gate_exps_host + (size_t)e * cl->moe_exp_stride_gu;
+                const char *uw = (const char *)cl->moe_up_exps_host + (size_t)e * cl->moe_exp_stride_gu;
+                const char *dw = (const char *)cl->moe_down_exps_host + (size_t)e * cl->moe_exp_stride_d;
+                hllm_cpu_qmatvec(g, gw, cl->moe_gate_exps_type, ff, ne, r->h_moe_input, tmp);
+                hllm_cpu_qmatvec(u, uw, cl->moe_up_exps_type, ff, ne, r->h_moe_input, tmp);
+                for (int i = 0; i < ff; ++i) g[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
+                hllm_cpu_qmatvec(out, dw, cl->moe_down_exps_type, ne, ff, g, tmp);
+                for (int i = 0; i < ne; ++i) ref[i] += weights[j] * out[i];
+            }
+            double err = 0.0, norm = 0.0;
+            for (int i = 0; i < ne; ++i) {
+                double delta = r->h_moe_output[i] - ref[i];
+                err += delta * delta;
+                norm += (double)ref[i] * ref[i];
+            }
+            fprintf(stderr, "hip_llm: CPU expert verify layer=%d jobs=%d rel_l2=%.6g norm=%.6g\n",
+                    (int)(cl - r->layers), jobs, sqrt(err / fmax(norm, 1e-30)), sqrt(norm));
+        }
+        free(ref);
+        free(work);
+    }
 }
 
 /* ======================================================================== */
@@ -12963,12 +13009,18 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                          cl->moe_down_exps_type == GGML_TYPE_Q8_0);
         int pipe_misses = r->decode_mode && r->moe_copy_pipeline &&
                           (fused_q8 || fused_xl || fused_q5k) &&
-                          !cpu_decode_misses;
+                          !cpu_decode_misses &&
+                          /* The grouped path needs one cache slot per
+                           * selected expert; otherwise protecting hits can
+                           * leave a miss with no legal replacement slot. */
+                          cl->moe_cache_slots >= n_experts_used;
         int miss_slots[16], pipe_hit_slots[16];
-        float miss_weights[16], pipe_hit_weights[16];
         int miss_count = 0, pipe_hit_count = 0;
         const char *refill_env = getenv("LLM_MOE_CPU_REFILLS_PER_LAYER");
         int cpu_refill_limit = refill_env ? atoi(refill_env) : 1;
+        /* There is one pending slot/event per layer. Multiple simultaneous
+         * refills would overwrite that slot's identity and H2D map source. */
+        if (cpu_refill_limit > 1) cpu_refill_limit = 1;
         if (cl->moe_pending_slot >= 0) cpu_refill_limit = 0;
         int cpu_refill_count = 0;
         if (r->debug_layers) {
@@ -13028,6 +13080,17 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                          cl->moe_cache_age[s] < cl->moe_cache_age[slot]) ||
                         (!use_lfu && cl->moe_cache_age[s] < cl->moe_cache_age[slot]))
                         slot = s;
+                }
+                /* In CPU-miss mode every resident slot can be protected by
+                 * this token's GPU hits.  There is no cache destination in
+                 * that case; keep the selected expert on the CPU and avoid
+                 * indexing the cache arrays with -1. */
+                if (slot < 0 && cpu_current_miss) {
+                    top_slots[sel] = -1;
+                    r->moe_stats.cache_misses++;
+                    if (layer_idx >= 0 && layer_idx < 128)
+                        r->moe_layer_misses[layer_idx]++;
+                    continue;
                 }
                 if (cl->moe_cache_ids[slot] >= 0) r->moe_stats.cache_evictions++;
                 const unsigned char *gh = (const unsigned char *)cl->moe_gate_exps_host +
@@ -13096,11 +13159,8 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
             if (pipe_misses) {
                 pipe_hit_slots[sel] = was_miss ? -1 : slot;
                 miss_slots[sel] = was_miss ? slot : -1;
-                if (was_miss) {
-                    miss_weights[miss_count++] = top_w[sel];
-                } else {
-                    pipe_hit_weights[pipe_hit_count++] = top_w[sel];
-                }
+                if (was_miss) ++miss_count;
+                else ++pipe_hit_count;
             }
             if (cpu_decode_misses) {
                 hit_slots[hit_count] = slot;
@@ -16050,6 +16110,9 @@ void hip_llm_offload(hip_llm_runner *r) {
 
 void hip_llm_free(hip_llm_runner *r) {
     if (!r) return;
+    /* Refills use host metadata and device slots freed below. */
+    if (r->stream) hipStreamSynchronize(r->stream);
+    if (r->moe_copy_stream) hipStreamSynchronize(r->moe_copy_stream);
 
     if (r->d_x)    hipFree(r->d_x);
     if (r->d_xb)   hipFree(r->d_xb);
@@ -16606,7 +16669,7 @@ done:
 
 void hip_llm_reset_state(hip_llm_runner *r) {
     if (!r) return;
-    r->decode_mode = 0;
+    hip_llm_set_decode_mode(r, 0);
     if (r->ple_n_heads > 0) {
         r->ple_history[0] = r->ple_history[1] = r->ple_eos_token;
         if (r->d_ple_conv_state) {
@@ -16741,7 +16804,21 @@ int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *s) {
 }
 
 void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled) {
-    if (r) r->decode_mode = enabled != 0;
+    if (!r) return;
+    if (!enabled && r->moe_copy_stream) {
+        /* Prefill may immediately reuse cache slots. Complete pending decode
+         * copies and publish their host identities before it does so. */
+        hipStreamSynchronize(r->moe_copy_stream);
+        for (int l = 0; r->layers && l < r->n_layers; ++l) {
+            hip_layer *cl = &r->layers[l];
+            if (cl->moe_cache_ids && cl->moe_pending_slot >= 0) {
+                cl->moe_cache_ids[cl->moe_pending_slot] = cl->moe_pending_expert;
+                cl->moe_pending_slot = -1;
+                cl->moe_pending_expert = -1;
+            }
+        }
+    }
+    r->decode_mode = enabled != 0;
 }
 
 int hip_llm_n_embd(const hip_llm_runner *r) { return r ? r->n_embd : 0; }

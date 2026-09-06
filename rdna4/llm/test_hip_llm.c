@@ -108,8 +108,9 @@ static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
         while (top_k > 1 && vals[top_k - 1] < cutoff) --top_k;
     }
     float sum = 0.0f;
+    const float max_logit = vals[0];
     for (int j = 0; j < top_k; ++j) {
-        vals[j] = expf((vals[j] - vals[0]) / temperature);
+        vals[j] = expf((vals[j] - max_logit) / temperature);
         sum += vals[j];
     }
     float keep = 0.0f;
@@ -188,6 +189,19 @@ static unsigned char *b64_decode(const char *src, size_t *out_n) {
     return out;
 }
 
+/* A BOS id alone does not mean it should be inserted (Qwen uses the same
+ * id for padding). Preserve the explicit diagnostic override. */
+static int prompt_bos_id(const gguf_context *gguf) {
+    const char *override = getenv("LLM_ADD_BOS");
+    if (override) return atoi(override);
+    int add = gguf_find_key(gguf, "tokenizer.ggml.add_bos_token");
+    if (add >= 0 && gguf->kv[add].type == GGUF_TYPE_BOOL && !gguf->kv[add].value.b)
+        return -1;
+    int id = gguf_find_key(gguf, "tokenizer.ggml.bos_token_id");
+    return id >= 0 && gguf->kv[id].type == GGUF_TYPE_UINT32 ?
+        (int)gguf->kv[id].value.u32 : -1;
+}
+
 static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                             int n_vocab, int max_seq_len, int bos_id) {
     char line[4 * 1024 * 1024];
@@ -201,6 +215,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
     signal(SIGUSR1, stdio_cancel_handler);
     fprintf(stderr, "JSONL backend ready (max_seq_len=%d)\n", max_seq_len);
     fflush(stderr);
+    puts("READY");
+    fflush(stdout);
     while (fgets(line, sizeof(line), stdin)) {
         g_stdio_cancel = 0;
         int max_tokens = 16, top_k = 20;
@@ -249,6 +265,10 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         if (!tokens || n_tokens <= 0) {
             free(prefix); free(tokens); puts("ERR tokenization"); fflush(stdout); continue;
         }
+        if (n_tokens > cap || (bos_id > 0 && tokens[0] != bos_id && n_tokens == cap)) {
+            free(prefix); free(tokens);
+            puts("ERR prompt exceeds context capacity"); fflush(stdout); continue;
+        }
         if (bos_id > 0 && n_tokens < cap && (n_tokens == 0 || tokens[0] != bos_id)) {
             memmove(tokens + 1, tokens, (size_t)n_tokens * sizeof(int32_t));
             tokens[0] = bos_id;
@@ -259,6 +279,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         if (prefix && prefix_n_bytes > 0 && prefix_tokens) {
             requested_prefix = bpe_tokenize(vocab, (const char *)prefix,
                                              (int)prefix_n_bytes, prefix_tokens, cap);
+            if (requested_prefix > cap || requested_prefix < 0)
+                requested_prefix = 0;
             if (requested_prefix > 0 && bos_id > 0 && requested_prefix < cap && prefix_tokens[0] != bos_id) {
                 memmove(prefix_tokens + 1, prefix_tokens, (size_t)requested_prefix * sizeof(int32_t));
                 prefix_tokens[0] = bos_id;
@@ -283,6 +305,11 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             restored_prefix = 1;
         }
         if (common != cache_n) {
+            /* Subsequent forwards overwrite positional KV storage. A host
+             * recurrent snapshot cannot restore those overwritten entries. */
+            hip_llm_free_state_snapshot(prefix_snapshot);
+            prefix_snapshot = NULL;
+            prefix_cache_n = 0;
             hip_llm_reset_state(gpu);
             cache_n = 0;
             common = 0;
@@ -339,6 +366,9 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         double t_prefill1 = get_time_ms();
         if (g_stdio_cancel) cancelled = 1;
         if (cancelled) {
+            hip_llm_free_state_snapshot(prefix_snapshot);
+            prefix_snapshot = NULL;
+            prefix_cache_n = 0;
             hip_llm_reset_state(gpu);
             cache_n = 0;
             free(tokens);
@@ -347,10 +377,14 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             continue;
         }
         if (!logits && prompt_added > 0) {
+            hip_llm_free_state_snapshot(prefix_snapshot);
+            prefix_snapshot = NULL;
+            prefix_cache_n = 0;
+            hip_llm_reset_state(gpu);
+            cache_n = 0;
             free(tokens); puts("ERR prefill"); fflush(stdout); continue;
         }
         unsigned char *seen = (unsigned char *)calloc((size_t)n_vocab, 1);
-        unsigned short *counts = (unsigned short *)calloc((size_t)n_vocab, sizeof(*counts));
         for (int i = 0; i < n_tokens; i++) {
             cache[i] = tokens[i];
             if (seen && tokens[i] >= 0 && tokens[i] < n_vocab) seen[tokens[i]] = 1;
@@ -376,7 +410,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             if (g_stdio_cancel) { cancelled = 1; break; }
             int next = (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
                 sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence, min_p,
-                               seen, counts, cache, cache_n, n_tokens, &rng);
+                               seen, NULL, NULL, 0, 0, &rng);
             int is_stop = next == eos || next == eot || next == im_end;
             const char *piece = bpe_token_to_str(vocab, next);
             if (!is_stop && piece && text) {
@@ -393,9 +427,14 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             }
             if (cache_n < max_seq_len) cache[cache_n++] = next;
             if (seen && next >= 0 && next < n_vocab) seen[next] = 1;
-            if (counts && next >= 0 && next < n_vocab && counts[next] != 0xffffu) counts[next]++;
             generated++;
-            if (is_stop) { finish_eos = 1; break; }
+            if (is_stop) {
+                /* Stop was sampled but never forwarded. Only processed
+                 * tokens belong in the reusable KV/recurrent prefix. */
+                cache_n--;
+                finish_eos = 1;
+                break;
+            }
             logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
             double token_now = get_time_ms();
             double token_ms = token_now - t_decode0;
@@ -435,6 +474,9 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         }
         size_t enc_n = 0; char *enc = b64_encode((const unsigned char *)(text ? text : ""), text_n, &enc_n);
         if (cancelled) {
+            hip_llm_free_state_snapshot(prefix_snapshot);
+            prefix_snapshot = NULL;
+            prefix_cache_n = 0;
             hip_llm_reset_state(gpu);
             cache_n = 0;
         }
@@ -443,7 +485,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                cancelled ? "cancelled" : (finish_eos ? "stop" : "length"),
                enc ? enc : "");
         fflush(stdout);
-        free(enc); free(text); free(seen); free(counts);
+        free(enc); free(text); free(seen);
     }
     free(cache);
     free(prefix_cache);
@@ -788,14 +830,9 @@ int main(int argc, char **argv) {
         gguf_close_shards(gguf_model);
         return 1;
     }
-    /* Prepend BOS (Gemma expects it; bpe_tokenize here does not add it). Default to
-     * the GGUF's tokenizer.ggml.bos_token_id; LLM_ADD_BOS overrides (0 disables). */
+    /* bpe_tokenize does not insert BOS; honor the model's insertion policy. */
     {
-        int bos = -1;
-        const char *e = getenv("LLM_ADD_BOS");
-        if (e) bos = atoi(e);
-        else { int bi = gguf_find_key(gguf, "tokenizer.ggml.bos_token_id");
-               if (bi >= 0) bos = (int)gguf->kv[bi].value.u32; }
+        int bos = prompt_bos_id(gguf);
         if (bos > 0 && (n_tokens == 0 || tokens[0] != bos)) {
             for (int i = n_tokens; i > 0; i--) tokens[i] = tokens[i-1];
             tokens[0] = bos; n_tokens++;
@@ -881,13 +918,7 @@ int main(int argc, char **argv) {
     int pass = 1;
 
     if (stdio_server) {
-        int bos = -1;
-        const char *bos_env = getenv("LLM_ADD_BOS");
-        if (bos_env) bos = atoi(bos_env);
-        else {
-            int bi = gguf_find_key(gguf, "tokenizer.ggml.bos_token_id");
-            if (bi >= 0) bos = (int)gguf->kv[bi].value.u32;
-        }
+        int bos = prompt_bos_id(gguf);
         pass = run_stdio_server(gpu, vocab, n_vocab, n_max_seq, bos) == 0;
         hip_llm_free(gpu);
         if (cpu_model) transformer_free(cpu_model);

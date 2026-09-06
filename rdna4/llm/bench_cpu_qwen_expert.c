@@ -35,6 +35,9 @@ int main(int argc, char **argv) {
     }
     void *lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!lib) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+    void (*cpu_init)(void) = (void (*)(void))dlsym(lib, "ggml_cpu_init");
+    if (!cpu_init) { fprintf(stderr, "missing ggml_cpu_init\n"); return 1; }
+    cpu_init();
     quant_fn quant_q8k = (quant_fn)dlsym(lib, "quantize_row_q8_K");
     quant_fn quant_q81 = (quant_fn)dlsym(lib, "quantize_row_q8_1");
     dot_fn dot_q4k = (dot_fn)dlsym(lib, "ggml_vec_dot_q4_K_q8_K");

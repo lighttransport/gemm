@@ -32,6 +32,9 @@ fi
 # cache-map reuse can fault under the grouped path.
 # The 640-wide Q4_K experts run faster with one warp per output row.
 # The matching Q5_1 down projection benefits from two warps per output row.
+# Keep CPU_MIN_WEIGHT at zero for exact routing: positive thresholds omit
+# selected experts on cache misses; 1 enables approximate cache-hit-only decode.
+# The runner initializes ggml's CPU lookup tables before using these kernels.
 exec env \
     OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}" \
     OMP_PROC_BIND="${OMP_PROC_BIND:-close}" \
@@ -41,7 +44,7 @@ exec env \
     LLM_MOE_LFU_CACHE="${LLM_MOE_LFU_CACHE:-0}" \
     LLM_MOE_CPU_DECODE_MISSES="${LLM_MOE_CPU_DECODE_MISSES:-1}" \
     LLM_MOE_CPU_REFILLS_PER_LAYER="${LLM_MOE_CPU_REFILLS_PER_LAYER:-1}" \
-    LLM_MOE_CPU_MIN_WEIGHT="${LLM_MOE_CPU_MIN_WEIGHT:-1}" \
+    LLM_MOE_CPU_MIN_WEIGHT="${LLM_MOE_CPU_MIN_WEIGHT:-0}" \
     LLM_QWEN4_DELAYED_CACHE="${LLM_QWEN4_DELAYED_CACHE:-1}" \
     LLM_QWEN4_DELAYED_REFILL_INTERVAL="${LLM_QWEN4_DELAYED_REFILL_INTERVAL:-2}" \
     LLM_QWEN4_BATCH="${LLM_QWEN4_BATCH:-1}" \
