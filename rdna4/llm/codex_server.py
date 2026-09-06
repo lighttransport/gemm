@@ -25,6 +25,12 @@ from urllib.parse import urlsplit
 from qwen_tools import call_events, parse_calls, tool_instructions, tool_registry
 
 
+def _handle_sigterm(signum, frame):
+    """Turn service-manager termination into the normal cleanup path."""
+    del signum, frame
+    raise KeyboardInterrupt
+
+
 def content_text(content):
     if isinstance(content, str):
         return content
@@ -585,6 +591,7 @@ def main():
         # process when the requested port is busy or the bind is invalid.
         Handler.backend.close()
         raise
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     print(f"OpenAI-compatible API: http://{args.host}:{args.port}/v1", flush=True)
     try: server.serve_forever()
     except KeyboardInterrupt: pass
