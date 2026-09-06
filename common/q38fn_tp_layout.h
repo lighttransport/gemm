@@ -102,7 +102,7 @@ static inline int q38fn_tp_make_plan(const char *name, const uint64_t *shape,
     /* The checkpoint is multimodal, but q38fn_runner is a text decoder.  The
      * vision tower sorts after all model.language_model tensors and must not
      * consume the last 1--2 GiB of a 32 GiB A64FX HBM node. */
-    if (!strncmp(name, "model.visual.", 13) || !strncmp(name, "mtp.", 4)) {
+    if (!strncmp(name, "model.visual.", 13)) {
         plan->kind = Q38FN_TP_SKIP;
         return 0;
     }

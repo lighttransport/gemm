@@ -87,6 +87,30 @@ TOFU_TOPO_PATH="$PWD/a64fx/utofu-tests/tofu_topo.txt" \
     "$HOME/models/q38fn/bf16" --local-base /local/$USER/q38fn-tp
 ```
 
+Run the helper and the application as separate, serialized `mpiexec` launches;
+never start two uTofu/MPI applications concurrently in one interactive job.
+For the current 12-node interactive allocation, `PJM_MPI_SHAPE_X=12` and the
+full allocation includes virtual coordinate `(0,0,0)`.  Consequently, use the
+plain 12-rank launch shown above: a vcoord file that excludes `(0,0,0)` has
+only 11 usable entries.  Use `-vcoordfile` only for a strict subset, and build
+it from the actual `PJM_MPI_SHAPE_*` values.  The helper's `tofu_topo.txt` is
+the placement/discovery contract consumed by the uTofu transport; keep it in
+the runner's working directory or set `TOFU_TOPO_PATH` explicitly.
+
+For a placement-independent uTofu smoke test after topology discovery:
+
+```bash
+mpiexec -n 12 a64fx/utofu-tests/tofu_topo_helper
+mpiexec -n 12 a64fx/utofu-tests/tp_ar_diag_bench
+```
+
+The second command is deliberately issued only after the first exits.  On
+Fugaku, `CODE=1907` means retry the helper once in the same allocation and
+then retry the application; do not leave overlapping MPI launchers running.
+When issuing these commands through the local bash-over-HTTP wrapper, use
+explicit remote paths such as `/home/u14346/models/q38fn/bf16` carefully: the
+local shell can expand an unquoted `$HOME` before the command reaches Fugaku.
+
 The helper must be run as the allocation's MPI-launched command, not from a
 shell already running as a bash-over-HTTP/PJM rank; nested `mpiexec` launches
 are rejected by Fugaku's `plexec`.  If uTofu initialization returns transient
@@ -105,13 +129,106 @@ instead of pinning the model to CMG0.  Decode matvecs process eight BF16 rows
 per SVE kernel call, including the selected routed experts and LM-head shard.
 Per-rank traces are written when `Q38FN_TP_TRACE_DIR` is set.
 
-TP layout v5 omits unused `model.visual.*` and `mtp.*` tensors and physically
+Scalar prefill keeps the recurrent PLE and decoder layers strictly
+autoregressive, but batches the independent token-embedding reductions and
+PLE key/value projections in eight-token windows. The projected PLE values are
+then consumed in token order, preserving the recurrent state while reducing
+prompt-side uTofu reductions, n-gram lookups, and repeated projection setup. This does not use
+the experimental layer-major path. Set `Q38FN_TP_DISABLE_EMBED_BATCH=1` for
+an A/B comparison or legacy behavior.
+BF16 window projections use one SVE/OpenMP traversal over the resident rows;
+the scalar fallback remains available on non-SVE hosts.
+
+TP layout v5 omits unused `model.visual.*` tensors and physically
 packs only the DeltaNet Q/K/V rows executed by each rank. Decoder and expert
 tensors are anonymous/resident. Owned n-gram tensors are staged directly as
 signed Q5 blocks (32 weights plus an FP16 scale in 22 bytes), loaded into
 anonymous HBM, and dequantized only for the 16 selected rows. This removes
 decode-time file faults. The loader also converts legacy BF16 n-gram entries
 in bounded chunks, dropping source pages as it advances.
+
+### Exact speculative decode
+
+Use `--spec-width 4` or `--spec-width 8` to enable exact greedy speculative
+decode. The first token in every block is the target model's carried greedy
+token; later candidates come from repeated-history matching and the staged
+native `mtp.*` layer. Native MTP is currently isolated behind
+`Q38FN_TP_ENABLE_MTP=1`: it changes target logits when interleaved with target
+prefill and has not passed the exactness gate. The safe default therefore uses
+history proposals only. The target verifies every candidate, commits only the
+longest matching prefix, and restores DeltaNet, PLE, attention, MTP, and
+hyper-connection state to that prefix. Consequently its committed token IDs
+must match `--spec-width 1` exactly.
+
+On TP12, the safe one-token fast path reproduced 16/16 baseline token IDs at
+16.49 tok/s (scalar baseline 16.98 tok/s). Transactional replay remains active
+only for blocks wider than one. An MPI-only MTP collective diagnostic produced
+the same divergence as uTofu, ruling out collective-channel ordering; inspect
+MTP tensor shapes and write bounds before enabling it.
+State-integrity probes found no changes to target DeltaNet, attention KV, PLE,
+saved/live hyper activations, or the target LM-head scratch when MTP uses its
+dedicated model view. The remaining interference is hidden process-global or
+kernel runtime state, so in-process MTP remains unsupported by default.
+
+### Experimental prefill windows
+
+`Q38FN_TP_PREFILL_WIDTH=8 Q38FN_TP_LAYER_MAJOR=1` processes prompt tokens in
+eight-token layer-major windows and batches embedding/n-gram communication.
+Prefill does not allocate or copy speculative rollback journals. On the
+83-token repeat-8 prompt this reduced prefill from 4.126 s to 3.745 s (9.2%)
+and reduced collective calls from 17,836 to 17,528 for the complete prefill +
+eight-token decode run. It remains opt-in: an earlier journaled run matched
+8/8 generated IDs, but the journal-free timing changed token IDs after token
+two, exposing the runner's unresolved numerical instability. Do not use this
+path for quality claims until a deterministic scalar baseline and per-layer
+checksum gate pass repeatedly.
+
+`Q38FN_TP_MPI_SUM=1` forces all tensor-parallel sums through MPI while keeping
+the same runner binary. Use it as the determinism oracle: compare two scalar
+per-layer checksum probes and then repeat with MTP prefill enabled. If MPI is
+stable while uTofu changes, the defect is in uTofu completion/slot reuse rather
+than model state or prefill scheduling.
+
+`--spec-adaptive` starts by probing the requested maximum width and width four,
+then chooses the better observed committed-token rate while periodically
+narrowing after poor acceptance. The runtime reports proposal, verification,
+commit time, source counts, and an acceptance histogram in `Q38FN_SPEC`.
+
+```bash
+mpiexec -n 12 q38fn/q38fn_tp_runner_utofu \
+  "$HOME/models/q38fn/bf16" --local-base /local/$USER/q38fn-tp \
+  --prompt 'Write a portable C11 merge sort. Return only code.' \
+  --max-gen 128 --max-seq 512 --spec-width 8 --spec-adaptive
+```
+
+The final hyper-connection mixer and LM head evaluate all candidate activations
+as Q8 block passes and use packed reductions plus one batched distributed
+argmax. PLE performs one packed reduction per block; its n-gram requests are
+sorted by resident shard/row, deduplicated, and prefetched.
+Sharded token embeddings are also gathered with one packed reduction per
+candidate block instead of one collective per token.
+Target verification is token-major by default: each candidate completes all
+layers before the next candidate starts, preserving the model's cross-layer
+recurrent state exactly. `Q38FN_TP_LAYER_MAJOR=1` enables the experimental
+layer-major scheduler for kernel development, but it currently fails the
+greedy-token exactness gate and must not be used for quality or throughput
+claims. Final-mixer and LM-head evaluation is also scalar by default;
+`Q38FN_TP_BATCHED_HEAD=1` enables its experimental packed implementation.
+Width-aware embedding, PLE, and n-gram kernels remain available on the exact
+path.
+
+The full-attention window path is experimental and disabled by default because
+the reordered layer path does not yet preserve target token IDs. Set
+`Q38FN_TP_ATTN_WINDOW=1` only for numerical A/B work. The default retains the
+layer-major scheduler while executing each full-attention layer through the
+original exact path. Compare committed token IDs—not decoded text alone—against
+`--spec-width 1` before accepting a new kernel result.
+
+The stager retains the checkpoint's `mtp.*` tensors for exact target-verified
+speculative decoding. MTP attention and MoE tensors use the same TP ownership
+rules as one full-attention decoder layer; small fusion and normalization
+tensors are replicated. Token embeddings and the LM head remain shared with
+the target model rather than duplicated.
 
 ### Four-node low-bit path (TP4)
 

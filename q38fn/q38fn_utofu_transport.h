@@ -14,5 +14,7 @@ void q38fn_utofu_transport_sum(q38fn_utofu_transport *transport,
                                float *values, int count);
 void q38fn_utofu_transport_argmax(q38fn_utofu_transport *transport,
                                   float *value, int32_t *index);
+void q38fn_utofu_transport_argmax_n(q38fn_utofu_transport *transport,
+                                    float *values, int32_t *indices, int count);
 
 #endif

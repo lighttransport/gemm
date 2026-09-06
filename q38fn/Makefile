@@ -144,6 +144,9 @@ test_q38fn_tp_blob: test_q38fn_tp_blob.c ../common/q38fn_tp_blob.h
 test_q38fn_tp_runtime: test_q38fn_tp_runtime.c ../common/q38fn_tp_runtime.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ -lm
 
+test_q38fn_spec: test_q38fn_spec.c ../common/q38fn_spec.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
 test_q38fn_tp_runtime_4: test_q38fn_tp_runtime.c ../common/q38fn_tp_runtime.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DQ38FN_TP_RANKS=4 $< -o $@ -lm
 
@@ -153,7 +156,7 @@ test_q38fn_tp_layout_4: test_q38fn_tp_layout.c ../common/q38fn_tp_layout.h
 test_q38fn_tp_layout_6: test_q38fn_tp_layout.c ../common/q38fn_tp_layout.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DQ38FN_TP_RANKS=6 $< -o $@
 
-test: test_ngram_pipeline test_q38fn_runtime test_q38fn_lowbit test_q38fn_tp_layout test_q38fn_tp_layout_4 test_q38fn_tp_blob test_q38fn_tp_runtime test_q38fn_tp_runtime_4
+test: test_ngram_pipeline test_q38fn_runtime test_q38fn_lowbit test_q38fn_tp_layout test_q38fn_tp_layout_4 test_q38fn_tp_blob test_q38fn_tp_runtime test_q38fn_tp_runtime_4 test_q38fn_spec
 	./test_ngram_pipeline
 	./test_q38fn_runtime
 	./test_q38fn_lowbit
@@ -162,6 +165,7 @@ test: test_ngram_pipeline test_q38fn_runtime test_q38fn_lowbit test_q38fn_tp_lay
 	./test_q38fn_tp_blob
 	./test_q38fn_tp_runtime
 	./test_q38fn_tp_runtime_4
+	./test_q38fn_spec
 
 test_target_code: test_target_fibonacci.c
 	$(CC) $(CFLAGS) $< -o test_target_fibonacci
@@ -243,7 +247,7 @@ owner_load_probe: ../a64fx/q38fn/ngram_owner_load_probe.c \
 clean:
 	rm -f q38fn_runner q38fn_pp_runner q38fn_stage_mpi q38fn_tp_stage_mpi q38fn_tp4_stage_mpi q38fn_tp_upgrade_mpi q38fn_tp_hc_repack_mpi q38fn_tp_reconstruct_mpi q38fn_tp_runner q38fn_tp4_runner q38fn_tp4_blob_probe q38fn_tp_runner_utofu q38fn_tp_runner_utofu_fapp q38fn_tp4_runner_utofu q38fn_tp4_runner_utofu_fapp q38fn_inspect ngram_pipeline_probe test_ngram_pipeline test_ngram_pipeline_asan test_q38fn_runtime test_q38fn_lowbit test_q38fn_tp_layout test_q38fn_tp_layout_4 test_q38fn_tp_blob test_q38fn_tp_runtime test_q38fn_tp_runtime_4 ngram_utofu_source.o ngram_utofu_probe ngram_utofu_probe_mpi ngram_utofu_real_probe ngram_utofu_pipeline_probe ngram_utofu_pipeline_probe_mpi ngram_stage ngram_stage_mpi owner_load_probe
 	rm -f compare_f32 decode_trace ngram_hbm_probe q38fn_lowbit_probe tsan_probe
-	rm -f q38fn_lowbit_plan
+	rm -f q38fn_lowbit_plan test_q38fn_spec
 	rm -f test_ngram_pipeline_dbg test_ngram_pipeline_san \
 		test_ngram_pipeline_san_check test_ngram_pipeline_san_run \
 		test_ngram_pipeline_tsan test_ngram_pipeline_tsan_check \

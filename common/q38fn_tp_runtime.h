@@ -8,10 +8,13 @@
 
 typedef void (*q38fn_tp_sum_fn)(float *values, int count, void *opaque);
 typedef void (*q38fn_tp_argmax_fn)(float *value, int *index, void *opaque);
+typedef void (*q38fn_tp_argmax_n_fn)(float *values, int32_t *indices,
+                                     int count, void *opaque);
 
 typedef struct { float *conv,*recurrent; } q38fn_tp_delta_state;
 typedef struct { float *keys,*values,*scores;size_t length,capacity; } q38fn_tp_attention_state;
 typedef struct { float *conv;uint64_t previous,previous2; } q38fn_tp_ple_state;
+typedef struct { q38fn_tp_attention_state attention; } q38fn_tp_mtp_state;
 typedef struct {
     q38fn_tp_blob blob;
     q38fn_tp_blob hc_blob;
@@ -23,25 +26,43 @@ typedef struct {
     int rank,ranks;
     q38fn_tp_sum_fn sum;
     q38fn_tp_argmax_fn argmax;
+    q38fn_tp_argmax_n_fn argmax_n;
     void *comm;
     float *head_logits;
     size_t head_logits_count;
 } q38fn_tp_model;
 
 int q38fn_tp_model_open(q38fn_tp_model*,const char*,int,int,q38fn_tp_sum_fn,q38fn_tp_argmax_fn,void*);
+void q38fn_tp_model_set_argmax_n(q38fn_tp_model*,q38fn_tp_argmax_n_fn);
 void q38fn_tp_model_close(q38fn_tp_model*);
 int q38fn_tp_delta_init(q38fn_tp_delta_state*);void q38fn_tp_delta_close(q38fn_tp_delta_state*);
+size_t q38fn_tp_delta_snapshot_bytes(void);
+int q38fn_tp_delta_save(const q38fn_tp_delta_state*,void*,size_t);
+int q38fn_tp_delta_restore(q38fn_tp_delta_state*,const void*,size_t);
 int q38fn_tp_attention_init(q38fn_tp_attention_state*,size_t);void q38fn_tp_attention_close(q38fn_tp_attention_state*);
 int q38fn_tp_ple_init(q38fn_tp_ple_state*);void q38fn_tp_ple_close(q38fn_tp_ple_state*);
+size_t q38fn_tp_ple_snapshot_bytes(void);
+int q38fn_tp_ple_save(const q38fn_tp_ple_state*,void*,size_t);
+int q38fn_tp_ple_restore(q38fn_tp_ple_state*,const void*,size_t);
+int q38fn_tp_ple_project_window(q38fn_tp_model*,int,const float*,uint32_t,float*,float*);
+int q38fn_tp_ple_apply(q38fn_tp_model*,int,q38fn_tp_ple_state*,uint64_t,const float*,const float*,const float*,float*);
+int q38fn_tp_mtp_init(q38fn_tp_mtp_state*,size_t);
+void q38fn_tp_mtp_close(q38fn_tp_mtp_state*);
+int q38fn_tp_mtp_draft(q38fn_tp_model*,q38fn_tp_mtp_state*,int32_t,
+                       const float*,float*,int32_t*,float*);
 int q38fn_tp_embedding(q38fn_tp_model*,int,float*);
+int q38fn_tp_embedding_window(q38fn_tp_model*,const int32_t*,uint32_t,float*);
 int q38fn_tp_ngram(q38fn_tp_model*,uint64_t,uint64_t,uint64_t,float*);
 int q38fn_tp_ngram_local(q38fn_tp_model*,uint64_t,uint64_t,uint64_t,float*);
+int q38fn_tp_ngram_window(q38fn_tp_model*,const int32_t*,uint32_t,
+                          uint64_t,uint64_t,float*);
 void q38fn_tp_ngram_reduce(q38fn_tp_model*,float*);
 int q38fn_tp_linear_layer(q38fn_tp_model*,int,q38fn_tp_delta_state*,float*);
 int q38fn_tp_attention_layer(q38fn_tp_model*,int,q38fn_tp_attention_state*,float*);
-int q38fn_tp_ple_apply(q38fn_tp_model*,int,q38fn_tp_ple_state*,uint64_t,const float*,float*);
 int q38fn_tp_final(q38fn_tp_model*,const float*,float*);
+int q38fn_tp_final_window(q38fn_tp_model*,const float*,uint32_t,float*);
 int q38fn_tp_head(q38fn_tp_model*,const float*,int*,float*);
+int q38fn_tp_head_window(q38fn_tp_model*,const float*,uint32_t,int32_t*,float*);
 void q38fn_tp_profile_report(FILE*);
 
 #ifdef Q38FN_TP_RUNTIME_IMPLEMENTATION
@@ -135,6 +156,21 @@ static int qtp_q8_mv(const q38fn_tp_blob_entry*e,const float*x,int rows,int cols
     if(getenv("Q38FN_TP_MOE_DEBUG"))for(int r=0;r<rows;r++)if(!e||!e->q8_scales||!isfinite(e->q8_scales[r])){fprintf(stderr,"q38fn q8: invalid scale row=%d\\n",r);break;}
     return qtp_q8_mv_quantized(e,x,qx,xs,rows,cols,y);
 }
+static int qtp_q8_mv_window(const q38fn_tp_blob_entry*e,const float*x,int width,int rows,int cols,float*y){
+ if(!e||!e->q8_data||!e->q8_scales||!x||!y||width<1||width>8)return-1;
+ if(getenv("Q38FN_TP_NO_Q8_WINDOW")){for(int p=0;p<width;p++)if(qtp_q8_mv(e,x+(size_t)p*cols,rows,cols,y+(size_t)p*rows))return-1;return 0;}
+#if defined(__ARM_FEATURE_SVE)
+ int8_t*qx=malloc((size_t)width*(size_t)cols);float xs[8];if(!qx)return-1;
+ for(int p=0;p<width;p++)xs[p]=qtp_q8_quantize(qx+(size_t)p*cols,x+(size_t)p*cols,cols);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+ for(int r=0;r<rows;r+=8){int count=rows-r<8?rows-r:8;if(count==8){int32_t dot[8*8];k3_q8_dot8_window(dot,e->q8_data+(size_t)r*cols,qx,width,cols);for(int p=0;p<width;p++)for(int j=0;j<8;j++)y[(size_t)p*rows+r+j]=(float)dot[p*8+j]*e->q8_scales[r+j]*xs[p];}else for(int p=0;p<width;p++)for(int j=0;j<count;j++)y[(size_t)p*rows+r+j]=(float)k3_q8_dot(e->q8_data+(size_t)(r+j)*cols,qx+(size_t)p*cols,cols)*e->q8_scales[r+j]*xs[p];}
+ free(qx);return 0;
+#else
+ for(int p=0;p<width;p++)if(qtp_q8_mv(e,x+(size_t)p*cols,rows,cols,y+(size_t)p*rows))return-1;return 0;
+#endif
+}
 static int qtp_q8_mv_blocks(const q38fn_tp_blob_entry*e,const size_t*ids,size_t blocks,
                             const int8_t*qx,float xs,int rows,int cols,float*y){
  if(!e||!e->q8_data||!e->q8_block_bytes||!ids||!qx||!blocks||rows<1||cols<1)return-1;
@@ -215,8 +251,30 @@ static inline svfloat32_t qtp_sig_sve(svbool_t pg,svfloat32_t x){
 #endif
 static float qtp_softplus(float x){return x>20.0f?x:log1pf(expf(x));}
 static int qtp_finite_n(const float*x,size_t n){for(size_t i=0;i<n;i++)if(!isfinite(x[i]))return 0;return 1;}
-static const q38fn_tp_blob_entry*qtp_find(q38fn_tp_model*m,const char*n){const q38fn_tp_blob_entry*e=m->has_q8_blob?q38fn_tp_blob_find(&m->q8_blob,n):NULL;if(!e&&m->has_aux_blob)e=q38fn_tp_blob_find(&m->aux_blob,n);if(!e&&m->has_hc_blob)e=q38fn_tp_blob_find(&m->hc_blob,n);return e?e:q38fn_tp_blob_find(&m->blob,n);}
+static _Thread_local int qtp_mtp_mode;
+static const q38fn_tp_blob_entry*qtp_find(q38fn_tp_model*m,const char*n){char mapped[256];if(qtp_mtp_mode){const char*layer="model.language_model.layers.0.";const char*mixer="model.language_model.hyper_connection_mixer.";if(!strncmp(n,layer,strlen(layer)))snprintf(mapped,sizeof(mapped),"mtp.layers.0.%s",n+strlen(layer));else if(!strncmp(n,mixer,strlen(mixer)))snprintf(mapped,sizeof(mapped),"mtp.hyper_connection_mixer.%s",n+strlen(mixer));else mapped[0]=0;if(mapped[0])n=mapped;}const q38fn_tp_blob_entry*e=m->has_q8_blob?q38fn_tp_blob_find(&m->q8_blob,n):NULL;if(!e&&m->has_aux_blob)e=q38fn_tp_blob_find(&m->aux_blob,n);if(!e&&m->has_hc_blob)e=q38fn_tp_blob_find(&m->hc_blob,n);return e?e:q38fn_tp_blob_find(&m->blob,n);}
 static int qtp_entry_mv(const q38fn_tp_blob_entry*e,const float*x,int rows,int cols,float*y){if(!e)return-1;if(e->q8_data)return qtp_q8_mv(e,x,rows,cols,y);if(e->q5_data)return q38fn_q5_matvec(y,e->q5_data,x,(size_t)rows,(size_t)cols);qtp_mv_rows(e->data,x,rows,cols,y);return 0;}
+static int qtp_bf16_mv_window(const uint16_t*w,const float*x,int width,int rows,int cols,float*y){
+#if defined(__ARM_FEATURE_SVE)
+ int groups=rows/8;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+ for(int g=0;g<groups;g++){
+  const uint16_t*base=w+(size_t)g*8*cols;
+  /* Keep the eight-row weight tile hot while consuming every prompt vector. */
+  for(int p=0;p<width;p++)
+   matvec_bf16_8row(y+(size_t)p*rows+(size_t)g*8,base,base+cols,base+2*cols,base+3*cols,
+                    base+4*cols,base+5*cols,base+6*cols,base+7*cols,x+(size_t)p*cols,cols);
+ }
+ for(int p=0;p<width;p++)for(int r=groups*8;r<rows;r++)
+  y[(size_t)p*rows+r]=qtp_dot(w+(size_t)r*cols,x+(size_t)p*cols,cols);
+ return 0;
+#else
+ (void)w;(void)x;(void)width;(void)rows;(void)cols;(void)y;return -1;
+#endif
+}
+static int qtp_entry_mv_window(const q38fn_tp_blob_entry*e,const float*x,int width,int rows,int cols,float*y){if(!e||!x||!y||width<1||width>8)return-1;if(e->q8_data)return qtp_q8_mv_window(e,x,width,rows,cols,y);if(e->q5_data){for(int p=0;p<width;p++)if(q38fn_q5_matvec(y+(size_t)p*rows,e->q5_data,x+(size_t)p*cols,(size_t)rows,(size_t)cols))return-1;return 0;}if(qtp_bf16_mv_window(e->data,x,width,rows,cols,y)==0)return 0;for(int p=0;p<width;p++)if(qtp_entry_mv(e,x+(size_t)p*cols,rows,cols,y+(size_t)p*rows))return-1;return 0;}
 static int qtp_entry_mv_q8_block(const q38fn_tp_blob_entry*e,size_t block,const float*x,int rows,int cols,float*y){if(!e||!e->q8_data||!e->q8_block_bytes)return-1;q38fn_tp_blob_entry part=*e;part.q8_data=e->q8_data+block*e->q8_block_bytes;part.q8_scales=(const float*)((const char*)part.q8_data+(size_t)rows*(size_t)cols);part.q8_block_rows=(size_t)rows;part.q8_block_bytes=e->q8_block_bytes;return qtp_q8_mv(&part,x,rows,cols,y);}
 static int qtp_entry_mv_offset(const q38fn_tp_blob_entry*e,size_t row,const float*x,int rows,int cols,float*y){if(!e)return-1;if(e->q8_data){q38fn_tp_blob_entry part=*e;part.q8_data=e->q8_data+row*(size_t)cols;part.q8_scales=e->q8_scales+row;return qtp_q8_mv(&part,x,rows,cols,y);}if(e->q5_data)return q38fn_q5_matvec(y,e->q5_data+row*(size_t)(cols/32),x,(size_t)rows,(size_t)cols);qtp_mv_rows(e->data+row*(size_t)cols,x,rows,cols,y);return 0;}
 static int qtp_bf16_mv_blocks(const q38fn_tp_blob_entry*e,const size_t*ids,
@@ -304,19 +362,55 @@ int q38fn_tp_model_open(q38fn_tp_model*m,const char*base,int rank,int ranks,q38f
  const char*q8=getenv("Q38FN_TP_Q8_BASE");if(q8&&*q8){if(snprintf(d,sizeof(d),"%s/rank-%02d",q8,rank)>=(int)sizeof(d)||q38fn_tp_blob_open(&m->q8_blob,d,getenv("Q38FN_TP_VERIFY")!=NULL)){if(m->has_hc_blob)q38fn_tp_blob_close(&m->hc_blob);q38fn_tp_blob_close(&m->blob);return-1;}m->has_q8_blob=1;}
  const char*aux=getenv("Q38FN_TP_AUX_BASE");if(aux&&*aux){if(snprintf(d,sizeof(d),"%s/rank-%02d",aux,rank)>=(int)sizeof(d)||q38fn_tp_blob_open(&m->aux_blob,d,getenv("Q38FN_TP_VERIFY")!=NULL)){if(m->has_q8_blob)q38fn_tp_blob_close(&m->q8_blob);if(m->has_hc_blob)q38fn_tp_blob_close(&m->hc_blob);q38fn_tp_blob_close(&m->blob);return-1;}m->has_aux_blob=1;}
  m->rank=rank;m->ranks=ranks;m->sum=sum;m->argmax=argmax;m->comm=comm;
- const q38fn_tp_blob_entry*head=q38fn_tp_blob_find(&m->blob,"lm_head.weight");if(head&&head->n_ranges>0){m->head_logits_count=(size_t)head->range[0].count;m->head_logits=malloc(m->head_logits_count*sizeof(*m->head_logits));if(!m->head_logits){q38fn_tp_blob_close(&m->blob);return-1;}}return 0;}
+ const q38fn_tp_blob_entry*head=q38fn_tp_blob_find(&m->blob,"lm_head.weight");if(head&&head->n_ranges>0){m->head_logits_count=(size_t)head->range[0].count*8;m->head_logits=malloc(m->head_logits_count*sizeof(*m->head_logits));if(!m->head_logits){q38fn_tp_blob_close(&m->blob);return-1;}}return 0;}
 void q38fn_tp_model_close(q38fn_tp_model*m){if(m){free(m->head_logits);m->head_logits=NULL;m->head_logits_count=0;if(m->has_aux_blob)q38fn_tp_blob_close(&m->aux_blob);if(m->has_q8_blob)q38fn_tp_blob_close(&m->q8_blob);if(m->has_hc_blob)q38fn_tp_blob_close(&m->hc_blob);q38fn_tp_blob_close(&m->blob);}}
-int q38fn_tp_delta_init(q38fn_tp_delta_state*s){if(!s)return-1;s->conv=calloc((size_t)Q38FN_LINEAR_CONV_DIM*4,4);s->recurrent=calloc((size_t)Q38FN_LINEAR_VALUE_HEADS*128*128,4);return s->conv&&s->recurrent?0:-1;}
+void q38fn_tp_model_set_argmax_n(q38fn_tp_model*m,q38fn_tp_argmax_n_fn fn){if(m)m->argmax_n=fn;}
+static size_t qtp_delta_conv_bytes(void){return (size_t)Q38FN_LINEAR_CONV_DIM*4*sizeof(float);}
+static size_t qtp_delta_recurrent_bytes(void){return (size_t)(Q38FN_LINEAR_VALUE_HEADS/Q38FN_TP_RANKS)*128*128*sizeof(float);}
+int q38fn_tp_delta_init(q38fn_tp_delta_state*s){if(!s)return-1;s->conv=calloc(1,qtp_delta_conv_bytes());s->recurrent=calloc(1,qtp_delta_recurrent_bytes());return s->conv&&s->recurrent?0:-1;}
 void q38fn_tp_delta_close(q38fn_tp_delta_state*s){if(s){free(s->conv);free(s->recurrent);memset(s,0,sizeof(*s));}}
+size_t q38fn_tp_delta_snapshot_bytes(void){return qtp_delta_conv_bytes()+qtp_delta_recurrent_bytes();}
+int q38fn_tp_delta_save(const q38fn_tp_delta_state*s,void*dst,size_t bytes){size_t cb=qtp_delta_conv_bytes(),rb=qtp_delta_recurrent_bytes();if(!s||!s->conv||!s->recurrent||!dst||bytes<cb+rb)return-1;memcpy(dst,s->conv,cb);memcpy((char*)dst+cb,s->recurrent,rb);return 0;}
+int q38fn_tp_delta_restore(q38fn_tp_delta_state*s,const void*src,size_t bytes){size_t cb=qtp_delta_conv_bytes(),rb=qtp_delta_recurrent_bytes();if(!s||!s->conv||!s->recurrent||!src||bytes<cb+rb)return-1;memcpy(s->conv,src,cb);memcpy(s->recurrent,(const char*)src+cb,rb);return 0;}
 int q38fn_tp_attention_init(q38fn_tp_attention_state*s,size_t cap){size_t w=Q38FN_KV_HEADS*Q38FN_HEAD_DIM;if(!s)return-1;memset(s,0,sizeof(*s));s->keys=calloc(cap*w,4);s->values=calloc(cap*w,4);s->scores=malloc(cap*4);s->capacity=cap;return s->keys&&s->values&&s->scores?0:-1;}
 void q38fn_tp_attention_close(q38fn_tp_attention_state*s){if(s){free(s->keys);free(s->values);free(s->scores);memset(s,0,sizeof(*s));}}
 int q38fn_tp_ple_init(q38fn_tp_ple_state*s){if(!s)return-1;memset(s,0,sizeof(*s));s->conv=calloc((size_t)QTP_HC*9,4);s->previous=s->previous2=Q38FN_EOS;return s->conv?0:-1;}
 void q38fn_tp_ple_close(q38fn_tp_ple_state*s){if(s){free(s->conv);memset(s,0,sizeof(*s));}}
+size_t q38fn_tp_ple_snapshot_bytes(void){return (size_t)QTP_HC*9*sizeof(float)+2*sizeof(uint64_t);}
+int q38fn_tp_ple_save(const q38fn_tp_ple_state*s,void*dst,size_t bytes){size_t cb=(size_t)QTP_HC*9*sizeof(float);if(!s||!s->conv||!dst||bytes<cb+2*sizeof(uint64_t))return-1;memcpy(dst,s->conv,cb);memcpy((char*)dst+cb,&s->previous,2*sizeof(uint64_t));return 0;}
+int q38fn_tp_ple_restore(q38fn_tp_ple_state*s,const void*src,size_t bytes){size_t cb=(size_t)QTP_HC*9*sizeof(float);if(!s||!s->conv||!src||bytes<cb+2*sizeof(uint64_t))return-1;memcpy(s->conv,src,cb);memcpy(&s->previous,(const char*)src+cb,2*sizeof(uint64_t));return 0;}
+int q38fn_tp_mtp_init(q38fn_tp_mtp_state*s,size_t capacity){if(!s)return-1;memset(s,0,sizeof(*s));return q38fn_tp_attention_init(&s->attention,capacity);}
+void q38fn_tp_mtp_close(q38fn_tp_mtp_state*s){if(s)q38fn_tp_attention_close(&s->attention);}
 
 int q38fn_tp_embedding(q38fn_tp_model*m,int token,float*out){const q38fn_tp_blob_entry*e=qtp_find(m,"model.language_model.embed_tokens.weight");if(!e||e->kind!=Q38FN_TP_AXIS0)return-1;memset(out,0,Q38FN_HIDDEN*4);uint64_t s=e->range[0].start,n=e->range[0].count;if(token>=(int)s&&token<(int)(s+n)){size_t row=(size_t)(token-(int)s);if(e->q5_data){if(q38fn_q5_dequantize_row(out,e->q5_data+row*(Q38FN_HIDDEN/32),Q38FN_HIDDEN))return-1;}else{const uint16_t*p=e->data+row*Q38FN_HIDDEN;for(int i=0;i<Q38FN_HIDDEN;i++)out[i]=qtp_bf(p[i]);}}m->sum(out,Q38FN_HIDDEN,m->comm);return 0;}
+int q38fn_tp_embedding_window(q38fn_tp_model*m,const int32_t*tokens,uint32_t width,float*out){const q38fn_tp_blob_entry*e=qtp_find(m,"model.language_model.embed_tokens.weight");if(!e||e->kind!=Q38FN_TP_AXIS0||!tokens||!out||width<1||width>8)return-1;memset(out,0,(size_t)width*Q38FN_HIDDEN*sizeof(float));uint64_t start=e->range[0].start,count=e->range[0].count;for(uint32_t pos=0;pos<width;pos++){int token=tokens[pos];float*dst=out+(size_t)pos*Q38FN_HIDDEN;if(token>=(int)start&&token<(int)(start+count)){size_t row=(size_t)(token-(int)start);if(e->q5_data){if(q38fn_q5_dequantize_row(dst,e->q5_data+row*(Q38FN_HIDDEN/32),Q38FN_HIDDEN))return-1;}else{const uint16_t*p=e->data+row*Q38FN_HIDDEN;for(int i=0;i<Q38FN_HIDDEN;i++)dst[i]=qtp_bf(p[i]);}}}m->sum(out,(int)((size_t)width*Q38FN_HIDDEN),m->comm);return 0;}
 int q38fn_tp_ngram_local(q38fn_tp_model*m,uint64_t token,uint64_t prev,uint64_t prev2,float*out){uint64_t rows[Q38FN_NGRAM_HEADS];q38fn_ngram_rows(token,prev,prev2,rows);memset(out,0,Q38FN_HIDDEN*4);for(int h=0;h<Q38FN_NGRAM_HEADS;h++){uint64_t sh=rows[h]/Q38FN_NGRAM_ROWS_PER_SHARD,row=rows[h]%Q38FN_NGRAM_ROWS_PER_SHARD;if(q38fn_ngram_owner_for_ranks((int)sh,m->ranks)==m->rank){char n[224];snprintf(n,sizeof(n),"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_%llu.weight",(unsigned long long)sh);const q38fn_tp_blob_entry*e=qtp_find(m,n);if(!e)return-1;if(e->q5_data){const q38fn_q5_block*p=e->q5_data+row*(Q38FN_NGRAM_HEAD_DIM/32);if(q38fn_q5_dequantize_row(out+h*Q38FN_NGRAM_HEAD_DIM,p,Q38FN_NGRAM_HEAD_DIM))return-1;}else{const uint16_t*p=e->data+row*Q38FN_NGRAM_HEAD_DIM;for(int i=0;i<Q38FN_NGRAM_HEAD_DIM;i++)out[h*Q38FN_NGRAM_HEAD_DIM+i]=qtp_bf(p[i]);}}}return 0;}
 void q38fn_tp_ngram_reduce(q38fn_tp_model*m,float*out){m->sum(out,Q38FN_HIDDEN,m->comm);}
 int q38fn_tp_ngram(q38fn_tp_model*m,uint64_t token,uint64_t prev,uint64_t prev2,float*out){if(q38fn_tp_ngram_local(m,token,prev,prev2,out))return-1;q38fn_tp_ngram_reduce(m,out);return 0;}
+int q38fn_tp_ngram_window(q38fn_tp_model*m,const int32_t*tokens,uint32_t width,
+                          uint64_t prev,uint64_t prev2,float*out){
+ if(!m||!tokens||!out||width<1||width>8)return-1;
+ typedef struct{uint64_t shard,row;uint16_t dst;}qtp_ng_req;
+ qtp_ng_req req[8*Q38FN_NGRAM_HEADS];int nr=0;memset(out,0,(size_t)width*Q38FN_HIDDEN*sizeof(float));
+ for(uint32_t i=0;i<width;i++){uint64_t rows[Q38FN_NGRAM_HEADS],token=(uint64_t)(uint32_t)tokens[i];q38fn_ngram_rows(token,prev,prev2,rows);
+  for(int h=0;h<Q38FN_NGRAM_HEADS;h++){uint64_t sh=rows[h]/Q38FN_NGRAM_ROWS_PER_SHARD;if(q38fn_ngram_owner_for_ranks((int)sh,m->ranks)==m->rank){req[nr].shard=sh;req[nr].row=rows[h]%Q38FN_NGRAM_ROWS_PER_SHARD;req[nr].dst=(uint16_t)(i*Q38FN_NGRAM_HEADS+h);nr++;}}
+  prev2=prev;prev=token;
+ }
+ /* Group random requests by resident shard and row.  Equal rows are decoded
+  * once, while sorted nearby rows give hardware prefetch a useful stream. */
+ for(int i=1;i<nr;i++){qtp_ng_req v=req[i];int j=i;while(j&&
+   (req[j-1].shard>v.shard||(req[j-1].shard==v.shard&&req[j-1].row>v.row))){req[j]=req[j-1];j--;}req[j]=v;}
+ for(int i=0;i<nr;){char name[224];uint64_t sh=req[i].shard,row=req[i].row;snprintf(name,sizeof(name),"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_%llu.weight",(unsigned long long)sh);const q38fn_tp_blob_entry*e=qtp_find(m,name);if(!e)return-1;
+  float decoded[Q38FN_NGRAM_HEAD_DIM];if(i+1<nr&&req[i+1].shard==sh){uint64_t ahead=req[i+1].row;
+#if defined(__GNUC__) || defined(__clang__)
+   if(e->q5_data)__builtin_prefetch(e->q5_data+ahead*(Q38FN_NGRAM_HEAD_DIM/32),0,1);else __builtin_prefetch(e->data+ahead*Q38FN_NGRAM_HEAD_DIM,0,1);
+#endif
+  }
+  if(e->q5_data){if(q38fn_q5_dequantize_row(decoded,e->q5_data+row*(Q38FN_NGRAM_HEAD_DIM/32),Q38FN_NGRAM_HEAD_DIM))return-1;}else{const uint16_t*p=e->data+row*Q38FN_NGRAM_HEAD_DIM;for(int k=0;k<Q38FN_NGRAM_HEAD_DIM;k++)decoded[k]=qtp_bf(p[k]);}
+  int j=i;while(j<nr&&req[j].shard==sh&&req[j].row==row){memcpy(out+(size_t)req[j].dst*Q38FN_NGRAM_HEAD_DIM,decoded,sizeof decoded);j++;}i=j;
+ }
+ m->sum(out,(int)((size_t)width*Q38FN_HIDDEN),m->comm);return 0;
+}
 
 static int qtp_hc(q38fn_tp_model*m,int L,const char*block,const float*h,float*x,float inj[4]){char n[224],p[180];float norm[QTP_HC],lo[QTP_LAYER_MIX],partial[QTP_HC];
  static int rep_init=0,replicated=0;if(!rep_init){const char*e=getenv("Q38FN_TP_REPLICATED_HC");replicated=e&&*e&&*e!='0';rep_init=1;}uint64_t hc_start=0;int prof=qtp_profile_enabled();double pt=prof?qtp_profile_now():0;
@@ -915,6 +1009,7 @@ static int qtp_moe(q38fn_tp_model*m,int L,const float*x,float*y){char n[224];flo
 static void qtp_delta_recurrent(float*state,int first_gh,int value_heads,
  const float*qq,const float*kk,const float*v,const float*dec,const float*beta,
  float*core){
+ (void)first_gh;
  float del[Q38FN_LINEAR_VALUE_HEADS][128];
 #if defined(__ARM_FEATURE_SVE)
  int lanes=(int)svcntw(),tiles=128/lanes;
@@ -931,14 +1026,14 @@ static void qtp_delta_recurrent(float*state,int first_gh,int value_heads,
    int per=nth/4,order=(nth==48)?(tid%per)*4+tid/per:tid;
    int tasks=value_heads*tiles;
    if(!getenv("Q38FN_TP_NO_FUSED_DELTA_RECURRENT")){for(int task=order;task<tasks;task+=nth){
-    int lh=task/tiles,tile=task%tiles,j=tile*lanes,gh=first_gh+lh;float*mat=state+(size_t)gh*128*128;svbool_t pg=svptrue_b32();svfloat32_t mv=svdup_f32(0),dv=svdup_f32(dec[lh]);
+    int lh=task/tiles,tile=task%tiles,j=tile*lanes,gh=lh;float*mat=state+(size_t)gh*128*128;svbool_t pg=svptrue_b32();svfloat32_t mv=svdup_f32(0),dv=svdup_f32(dec[lh]);
     for(int i=0;i<128;i++){float*row=mat+(size_t)i*128+j;svfloat32_t z=svmul_f32_x(pg,svld1_f32(pg,row),dv);svst1_f32(pg,row,z);mv=svmla_n_f32_x(pg,mv,z,kk[(size_t)lh*128+i]);}
     svfloat32_t d=svmul_n_f32_x(pg,svsub_f32_x(pg,svld1_f32(pg,v+(size_t)lh*128+j),mv),beta[lh]),ov=svdup_f32(0);
     for(int i=0;i<128;i++){float*row=mat+(size_t)i*128+j;svfloat32_t z=svmla_n_f32_x(pg,svld1_f32(pg,row),d,kk[(size_t)lh*128+i]);svst1_f32(pg,row,z);ov=svmla_n_f32_x(pg,ov,z,qq[(size_t)lh*128+i]);}
     svst1_f32(pg,core+(size_t)lh*128+j,ov);
    }}else{
    for(int task=order;task<tasks;task+=nth){
-    int lh=task/tiles,tile=task%tiles,j=tile*lanes,gh=first_gh+lh;
+    int lh=task/tiles,tile=task%tiles,j=tile*lanes,gh=lh;
     float*mat=state+(size_t)gh*128*128;svbool_t pg=svptrue_b32();
     svfloat32_t mv=svdup_f32(0),dv=svdup_f32(dec[lh]);
     for(int i=0;i<128;i++){float*row=mat+(size_t)i*128+j;svfloat32_t z=svmul_f32_x(pg,svld1_f32(pg,row),dv);svst1_f32(pg,row,z);mv=svmla_n_f32_x(pg,mv,z,kk[(size_t)lh*128+i]);}
@@ -946,7 +1041,7 @@ static void qtp_delta_recurrent(float*state,int first_gh,int value_heads,
    }
 #pragma omp barrier
    for(int task=order;task<tasks;task+=nth){
-    int lh=task/tiles,tile=task%tiles,j=tile*lanes,gh=first_gh+lh;
+    int lh=task/tiles,tile=task%tiles,j=tile*lanes,gh=lh;
     float*mat=state+(size_t)gh*128*128;svbool_t pg=svptrue_b32();
     svfloat32_t d=svld1_f32(pg,del[lh]+j),ov=svdup_f32(0);
     for(int i=0;i<128;i++){float*row=mat+(size_t)i*128+j;svfloat32_t z=svmla_n_f32_x(pg,svld1_f32(pg,row),d,kk[(size_t)lh*128+i]);svst1_f32(pg,row,z);ov=svmla_n_f32_x(pg,ov,z,qq[(size_t)lh*128+i]);}
@@ -963,7 +1058,7 @@ static void qtp_delta_recurrent(float*state,int first_gh,int value_heads,
 #pragma omp for collapse(2) schedule(static)
 #endif
  for(int lh=0;lh<value_heads;lh++)for(int tile=0;tile<tiles;tile++){
-  int j=tile*lanes,gh=first_gh+lh;float*mat=state+(size_t)gh*128*128;
+  int j=tile*lanes,gh=lh;float*mat=state+(size_t)gh*128*128;
   svbool_t pg=svptrue_b32();svfloat32_t mv=svdup_f32(0),dv=svdup_f32(dec[lh]);
   for(int i=0;i<128;i++){float*row=mat+(size_t)i*128+j;svfloat32_t z=svmul_f32_x(pg,svld1_f32(pg,row),dv);svst1_f32(pg,row,z);mv=svmla_n_f32_x(pg,mv,z,kk[(size_t)lh*128+i]);}
   svfloat32_t d=svmul_n_f32_x(pg,svsub_f32_x(pg,svld1_f32(pg,v+(size_t)lh*128+j),mv),beta[lh]);svst1_f32(pg,del[lh]+j,d);
@@ -972,7 +1067,7 @@ static void qtp_delta_recurrent(float*state,int first_gh,int value_heads,
 #pragma omp for collapse(2) schedule(static)
 #endif
  for(int lh=0;lh<value_heads;lh++)for(int tile=0;tile<tiles;tile++){
-  int j=tile*lanes,gh=first_gh+lh;float*mat=state+(size_t)gh*128*128;svbool_t pg=svptrue_b32();svfloat32_t d=svld1_f32(pg,del[lh]+j),ov=svdup_f32(0);
+  int j=tile*lanes,gh=lh;float*mat=state+(size_t)gh*128*128;svbool_t pg=svptrue_b32();svfloat32_t d=svld1_f32(pg,del[lh]+j),ov=svdup_f32(0);
   /* Update and consume each state row while it is resident.  This removes a
    * third 128x128 traversal and its OpenMP barrier. */
   for(int i=0;i<128;i++){float*row=mat+(size_t)i*128+j;svfloat32_t z=svmla_n_f32_x(pg,svld1_f32(pg,row),d,kk[(size_t)lh*128+i]);svst1_f32(pg,row,z);ov=svmla_n_f32_x(pg,ov,z,qq[(size_t)lh*128+i]);}svst1_f32(pg,core+(size_t)lh*128+j,ov);
@@ -988,7 +1083,7 @@ static void qtp_delta_recurrent(float*state,int first_gh,int value_heads,
 #pragma omp for collapse(2) schedule(static)
 #endif
  for(int lh=0;lh<value_heads;lh++)for(int j=0;j<128;j++){
-  int gh=first_gh+lh;float*mat=state+(size_t)gh*128*128;double mv=0;
+  int gh=lh;float*mat=state+(size_t)gh*128*128;double mv=0;
   for(int i=0;i<128;i++){float*cell=mat+(size_t)i*128+j;*cell*=dec[lh];mv+=(double)*cell*kk[(size_t)lh*128+i];}
   del[lh][j]=(v[(size_t)lh*128+j]-(float)mv)*beta[lh];
  }
@@ -996,7 +1091,7 @@ static void qtp_delta_recurrent(float*state,int first_gh,int value_heads,
 #pragma omp for collapse(2) schedule(static)
 #endif
  for(int lh=0;lh<value_heads;lh++)for(int j=0;j<128;j++){
-  int gh=first_gh+lh;float*mat=state+(size_t)gh*128*128;double ov=0;
+  int gh=lh;float*mat=state+(size_t)gh*128*128;double ov=0;
   for(int i=0;i<128;i++){float*z=mat+(size_t)i*128+j;*z+=kk[(size_t)lh*128+i]*del[lh][j];ov+=(double)*z*qq[(size_t)lh*128+i];}
   core[(size_t)lh*128+j]=(float)ov;
  }
@@ -1082,24 +1177,44 @@ static int qtp_attention(q38fn_tp_model*m,int L,q38fn_tp_attention_state*s,const
  for(int lh=0;lh<local_heads;lh++){int gh=m->rank*local_heads+lh,kv=gh/(Q38FN_HEADS/Q38FN_KV_HEADS);float mx=-FLT_MAX,sum=0;for(size_t p=0;p<s->length;p++){double d=0;const float*ck=s->keys+p*Q38FN_KV_HEADS*Q38FN_HEAD_DIM+kv*Q38FN_HEAD_DIM;for(int i=0;i<Q38FN_HEAD_DIM;i++)d+=(double)q[lh*Q38FN_HEAD_DIM+i]*ck[i];s->scores[p]=(float)(d/16.0);if(s->scores[p]>mx)mx=s->scores[p];}for(size_t p=0;p<s->length;p++){s->scores[p]=expf(s->scores[p]-mx);sum+=s->scores[p];}for(size_t p=0;p<s->length;p++){float z=s->scores[p]/sum;const float*cv=s->values+p*Q38FN_KV_HEADS*Q38FN_HEAD_DIM+kv*Q38FN_HEAD_DIM;for(int i=0;i<Q38FN_HEAD_DIM;i++)att[lh*Q38FN_HEAD_DIM+i]+=z*cv[i];}}
  for(int i=0;i<local_width;i++)att[i]*=qtp_sig(g[i]);
  qtp_name(n,sizeof(n),L,"self_attn.o_proj.weight");return qtp_axis1_mv(m,qtp_find(m,n),att,Q38FN_HIDDEN,y);}
+static int qtp_attention_window(q38fn_tp_model*m,int L,q38fn_tp_attention_state*s,const float*x,int width,float*y){char n[224];int local_heads=Q38FN_HEADS/m->ranks,local_width=local_heads*Q38FN_HEAD_DIM,kv_width=Q38FN_KV_HEADS*Q38FN_HEAD_DIM;float*qg=malloc((size_t)width*2*local_width*4),*q=malloc((size_t)width*local_width*4),*g=malloc((size_t)width*local_width*4),*k=malloc((size_t)width*kv_width*4),*v=malloc((size_t)width*kv_width*4),*att=calloc((size_t)width*local_width,4);if(!qg||!q||!g||!k||!v||!att){free(att);free(v);free(k);free(g);free(q);free(qg);return-1;}qtp_name(n,sizeof(n),L,"self_attn.q_proj.weight");const q38fn_tp_blob_entry*qw=qtp_find(m,n);qtp_name(n,sizeof(n),L,"self_attn.k_proj.weight");const q38fn_tp_blob_entry*kw=qtp_find(m,n);qtp_name(n,sizeof(n),L,"self_attn.v_proj.weight");const q38fn_tp_blob_entry*vw=qtp_find(m,n);int prc=0;if(getenv("Q38FN_TP_ATTN_SCALAR_QKV")){for(int p=0;p<width&&!prc;p++)prc=qtp_axis0_mv(qw,x+(size_t)p*Q38FN_HIDDEN,Q38FN_HIDDEN,qg+(size_t)p*2*local_width)!=2*local_width||qtp_full_mv(kw,x+(size_t)p*Q38FN_HIDDEN,kv_width,Q38FN_HIDDEN,k+(size_t)p*kv_width)||qtp_full_mv(vw,x+(size_t)p*Q38FN_HIDDEN,kv_width,Q38FN_HIDDEN,v+(size_t)p*kv_width);}else prc=!qw||!kw||!vw||qtp_entry_mv_window(qw,x,width,2*local_width,Q38FN_HIDDEN,qg)||qtp_entry_mv_window(kw,x,width,kv_width,Q38FN_HIDDEN,k)||qtp_entry_mv_window(vw,x,width,kv_width,Q38FN_HIDDEN,v);if(prc){free(att);free(v);free(k);free(g);free(q);free(qg);return-1;}qtp_name(n,sizeof(n),L,"self_attn.q_norm.weight");const q38fn_tp_blob_entry*qn=qtp_find(m,n);qtp_name(n,sizeof(n),L,"self_attn.k_norm.weight");const q38fn_tp_blob_entry*kn=qtp_find(m,n);for(int p=0;p<width;p++){float*qp=q+(size_t)p*local_width,*gp=g+(size_t)p*local_width,*qgp=qg+(size_t)p*2*local_width,*kp=k+(size_t)p*kv_width,*vp=v+(size_t)p*kv_width,*ap=att+(size_t)p*local_width;for(int h=0;h<local_heads;h++){memcpy(qp+h*Q38FN_HEAD_DIM,qgp+h*2*Q38FN_HEAD_DIM,Q38FN_HEAD_DIM*4);memcpy(gp+h*Q38FN_HEAD_DIM,qgp+h*2*Q38FN_HEAD_DIM+Q38FN_HEAD_DIM,Q38FN_HEAD_DIM*4);}if(qtp_norm_heads(qn,qp,local_heads)||qtp_norm_heads(kn,kp,Q38FN_KV_HEADS)){free(att);free(v);free(k);free(g);free(q);free(qg);return-1;}for(int h=0;h<local_heads;h++)qtp_rope(qp+h*Q38FN_HEAD_DIM,s->length);for(int h=0;h<Q38FN_KV_HEADS;h++)qtp_rope(kp+h*Q38FN_HEAD_DIM,s->length);memcpy(s->keys+s->length*kv_width,kp,(size_t)kv_width*4);memcpy(s->values+s->length*kv_width,vp,(size_t)kv_width*4);s->length++;for(int lh=0;lh<local_heads;lh++){int gh=m->rank*local_heads+lh,kh=gh/(Q38FN_HEADS/Q38FN_KV_HEADS);float mx=-FLT_MAX,sum=0;for(size_t at=0;at<s->length;at++){double d=0;const float*ck=s->keys+at*kv_width+kh*Q38FN_HEAD_DIM;for(int i=0;i<Q38FN_HEAD_DIM;i++)d+=(double)qp[lh*Q38FN_HEAD_DIM+i]*ck[i];s->scores[at]=(float)(d/16.0);if(s->scores[at]>mx)mx=s->scores[at];}for(size_t at=0;at<s->length;at++){s->scores[at]=expf(s->scores[at]-mx);sum+=s->scores[at];}for(size_t at=0;at<s->length;at++){float scale=s->scores[at]/sum;const float*cv=s->values+at*kv_width+kh*Q38FN_HEAD_DIM;for(int i=0;i<Q38FN_HEAD_DIM;i++)ap[lh*Q38FN_HEAD_DIM+i]+=scale*cv[i];}}for(int i=0;i<local_width;i++)ap[i]*=qtp_sig(gp[i]);}qtp_name(n,sizeof(n),L,"self_attn.o_proj.weight");const q38fn_tp_blob_entry*ow=qtp_find(m,n);int rc=0;if(getenv("Q38FN_TP_ATTN_SCALAR_OUT")){for(int p=0;p<width&&!rc;p++)rc=qtp_axis1_mv(m,ow,att+(size_t)p*local_width,Q38FN_HIDDEN,y+(size_t)p*Q38FN_HIDDEN);}else{rc=!ow||qtp_entry_mv_window(ow,att,width,Q38FN_HIDDEN,local_width,y);if(!rc)m->sum(y,width*Q38FN_HIDDEN,m->comm);}free(att);free(v);free(k);free(g);free(q);free(qg);return rc;}
+static int qtp_attention_layer_window(q38fn_tp_model*m,int L,q38fn_tp_attention_state*s,float*h,int width){float*x=malloc((size_t)width*Q38FN_HIDDEN*4),*y=malloc((size_t)width*Q38FN_HIDDEN*4);float(*inj)[4]=malloc((size_t)width*sizeof(*inj));if(!x||!y||!inj){free(inj);free(y);free(x);return-1;}for(int p=0;p<width;p++)if(qtp_hc(m,L,"attn",h+(size_t)p*QTP_HC,x+(size_t)p*Q38FN_HIDDEN,inj[p])){free(inj);free(y);free(x);return-1;}if(qtp_attention_window(m,L,s,x,width,y)){free(inj);free(y);free(x);return-1;}for(int p=0;p<width;p++){float*hp=h+(size_t)p*QTP_HC;qtp_residual(hp,y+(size_t)p*Q38FN_HIDDEN,inj[p]);if(qtp_hc(m,L,"mlp",hp,x+(size_t)p*Q38FN_HIDDEN,inj[p])||qtp_moe(m,L,x+(size_t)p*Q38FN_HIDDEN,y+(size_t)p*Q38FN_HIDDEN)){free(inj);free(y);free(x);return-1;}qtp_residual(hp,y+(size_t)p*Q38FN_HIDDEN,inj[p]);}free(inj);free(y);free(x);return 0;}
 int q38fn_tp_attention_layer(q38fn_tp_model*m,int L,q38fn_tp_attention_state*s,float*h){float x[Q38FN_HIDDEN],y[Q38FN_HIDDEN],inj[4];int p=qtp_profile_enabled();double t=p?qtp_profile_now():0;if(qtp_hc(m,L,"attn",h,x,inj))return-1;if(p){qtp_profile.hc+=qtp_profile_now()-t;qtp_profile.hc_n++;t=qtp_profile_now();}if(qtp_attention(m,L,s,x,y))return-1;if(p){qtp_profile.attention+=qtp_profile_now()-t;qtp_profile.attention_n++;}qtp_residual(h,y,inj);t=p?qtp_profile_now():0;if(qtp_hc(m,L,"mlp",h,x,inj))return-1;if(p){qtp_profile.hc+=qtp_profile_now()-t;qtp_profile.hc_n++;t=qtp_profile_now();}if(qtp_moe(m,L,x,y))return-1;if(p){qtp_profile.moe+=qtp_profile_now()-t;qtp_profile.moe_n++;}qtp_residual(h,y,inj);return 0;}
 
-int q38fn_tp_ple_apply(q38fn_tp_model*m,int L,q38fn_tp_ple_state*s,uint64_t tok,const float*emb,float*h){char n[224];float key[QTP_HC],value[Q38FN_HIDDEN],kn[QTP_HC],qn[QTP_HC],gated[QTP_HC];qtp_name(n,sizeof(n),L,"ple.key_proj.weight");if(qtp_full_mv(qtp_find(m,n),emb,QTP_HC,Q38FN_HIDDEN,key))return-1;qtp_name(n,sizeof(n),L,"ple.value_proj.weight");if(qtp_full_mv(qtp_find(m,n),emb,Q38FN_HIDDEN,Q38FN_HIDDEN,value))return-1;qtp_name(n,sizeof(n),L,"ple.norm_key.weight");const q38fn_tp_blob_entry*nk=qtp_find(m,n);qtp_name(n,sizeof(n),L,"ple.norm_query.weight");const q38fn_tp_blob_entry*nq=qtp_find(m,n);if(!nk||!nq)return-1;for(int st=0;st<4;st++){double a=0,b=0;for(int i=0;i<Q38FN_HIDDEN;i++){a+=(double)key[st*Q38FN_HIDDEN+i]*key[st*Q38FN_HIDDEN+i];b+=(double)h[st*Q38FN_HIDDEN+i]*h[st*Q38FN_HIDDEN+i];}float ka=1/sqrtf((float)(a/Q38FN_HIDDEN)+1e-6f),qb=1/sqrtf((float)(b/Q38FN_HIDDEN)+1e-6f);double d=0;for(int i=0;i<Q38FN_HIDDEN;i++){int j=st*Q38FN_HIDDEN+i;kn[j]=key[j]*ka*(1+qtp_bf(nk->data[j]));qn[j]=h[j]*qb*(1+qtp_bf(nq->data[j]));d+=(double)kn[j]*qn[j];}float z=(float)(d/sqrtf(Q38FN_HIDDEN));z=qtp_sig(copysignf(sqrtf(fmaxf(fabsf(z),1e-6f)),z));for(int i=0;i<Q38FN_HIDDEN;i++)gated[st*Q38FN_HIDDEN+i]=z*value[i];}
+int q38fn_tp_ple_project_window(q38fn_tp_model*m,int L,const float*emb,uint32_t width,float*key,float*value){char n[224];if(!m||!emb||!key||!value||width<1||width>8)return-1;qtp_name(n,sizeof(n),L,"ple.key_proj.weight");if(qtp_entry_mv_window(qtp_find(m,n),emb,width,QTP_HC,Q38FN_HIDDEN,key))return-1;qtp_name(n,sizeof(n),L,"ple.value_proj.weight");return qtp_entry_mv_window(qtp_find(m,n),emb,width,Q38FN_HIDDEN,Q38FN_HIDDEN,value);}
+int q38fn_tp_ple_apply(q38fn_tp_model*m,int L,q38fn_tp_ple_state*s,uint64_t tok,const float*emb,const float*pre_key,const float*pre_value,float*h){char n[224];float key[QTP_HC],value[Q38FN_HIDDEN],kn[QTP_HC],qn[QTP_HC],gated[QTP_HC];if((pre_key==NULL)!=(pre_value==NULL))return-1;if(!pre_key){qtp_name(n,sizeof(n),L,"ple.key_proj.weight");if(qtp_full_mv(qtp_find(m,n),emb,QTP_HC,Q38FN_HIDDEN,key))return-1;qtp_name(n,sizeof(n),L,"ple.value_proj.weight");if(qtp_full_mv(qtp_find(m,n),emb,Q38FN_HIDDEN,Q38FN_HIDDEN,value))return-1;pre_key=key;pre_value=value;}qtp_name(n,sizeof(n),L,"ple.norm_key.weight");const q38fn_tp_blob_entry*nk=qtp_find(m,n);qtp_name(n,sizeof(n),L,"ple.norm_query.weight");const q38fn_tp_blob_entry*nq=qtp_find(m,n);if(!nk||!nq)return-1;for(int st=0;st<4;st++){double a=0,b=0;for(int i=0;i<Q38FN_HIDDEN;i++){a+=(double)pre_key[st*Q38FN_HIDDEN+i]*pre_key[st*Q38FN_HIDDEN+i];b+=(double)h[st*Q38FN_HIDDEN+i]*h[st*Q38FN_HIDDEN+i];}float ka=1/sqrtf((float)(a/Q38FN_HIDDEN)+1e-6f),qb=1/sqrtf((float)(b/Q38FN_HIDDEN)+1e-6f);double d=0;for(int i=0;i<Q38FN_HIDDEN;i++){int j=st*Q38FN_HIDDEN+i;kn[j]=pre_key[j]*ka*(1+qtp_bf(nk->data[j]));qn[j]=h[j]*qb*(1+qtp_bf(nq->data[j]));d+=(double)kn[j]*qn[j];}float z=(float)(d/sqrtf(Q38FN_HIDDEN));z=qtp_sig(copysignf(sqrtf(fmaxf(fabsf(z),1e-6f)),z));for(int i=0;i<Q38FN_HIDDEN;i++)gated[st*Q38FN_HIDDEN+i]=z*pre_value[i];}
  qtp_name(n,sizeof(n),L,"ple.norm_conv.weight");const q38fn_tp_blob_entry*nc=qtp_find(m,n);qtp_name(n,sizeof(n),L,"ple.conv1d.weight");const q38fn_tp_blob_entry*cw=qtp_find(m,n);if(!nc||!cw)return-1;for(int st=0;st<4;st++){double q=0;for(int i=0;i<Q38FN_HIDDEN;i++)q+=(double)gated[st*Q38FN_HIDDEN+i]*gated[st*Q38FN_HIDDEN+i];float z=1/sqrtf((float)(q/Q38FN_HIDDEN)+1e-6f);for(int i=0;i<Q38FN_HIDDEN;i++){int c=st*Q38FN_HIDDEN+i;float norm=gated[c]*z*(1+qtp_bf(nc->data[c])),*hist=s->conv+(size_t)c*9;float v=hist[0]*qtp_bf(cw->data[c*4])+hist[3]*qtp_bf(cw->data[c*4+1])+hist[6]*qtp_bf(cw->data[c*4+2])+norm*qtp_bf(cw->data[c*4+3]);for(int j=0;j<8;j++)hist[j]=hist[j+1];hist[8]=norm;h[c]+=gated[c]+qtp_silu(v);}}s->previous2=s->previous;s->previous=tok;return 0;}
 
-int q38fn_tp_final(q38fn_tp_model*m,const float*h,float*out){int prof=qtp_profile_enabled();double pt=prof?qtp_profile_now():0;const char*p="model.language_model.hyper_connection_mixer";char n[180];float norm[QTP_HC],lo[QTP_LAYER_MIX],part[QTP_HC];snprintf(n,sizeof(n),"%s.hc_norm.weight",p);const q38fn_tp_blob_entry*nw=qtp_find(m,n);if(!nw)return-1;for(int st=0;st<4;st++){double q=0;for(int i=0;i<Q38FN_HIDDEN;i++)q+=(double)h[st*Q38FN_HIDDEN+i]*h[st*Q38FN_HIDDEN+i];float z=1/sqrtf((float)(q/Q38FN_HIDDEN)+1e-6f);for(int i=0;i<Q38FN_HIDDEN;i++){int j=st*Q38FN_HIDDEN+i;norm[j]=h[j]*z*(1+qtp_bf(nw->data[j]));}}snprintf(n,sizeof(n),"%s.input_mix_weight_down.weight",p);const q38fn_tp_blob_entry*wd=qtp_find(m,n);int d=qtp_axis0_mv(wd,norm,QTP_HC,lo);if(d<0||d>QTP_LAYER_MIX)return-1;for(int i=0;i<d;i++)lo[i]=qtp_silu(lo[i]/4);snprintf(n,sizeof(n),"%s.input_mix_weight_up.weight",p);const q38fn_tp_blob_entry*wu=qtp_find(m,n);for(int r=0;r<QTP_HC;r++)part[r]=qtp_entry_row_dot(wu,(size_t)r,lo,d);m->sum(part,QTP_HC,m->comm);for(int i=0;i<Q38FN_HIDDEN;i++){double z=0;for(int st=0;st<4;st++){int j=st*Q38FN_HIDDEN+i;z+=(double)qtp_sig(part[j])*norm[j];}out[i]=(float)(z/4);}if(prof){qtp_profile.final_mix+=qtp_profile_now()-pt;qtp_profile.final_n++;}return 0;}
-int q38fn_tp_head(q38fn_tp_model*m,const float*x,int*token,float*logit){int prof=qtp_profile_enabled();double pt=prof?qtp_profile_now():0;const q38fn_tp_blob_entry*e=qtp_find(m,"lm_head.weight");if(!e||e->kind!=Q38FN_TP_AXIS0)return-1;int rows=(int)e->range[0].count,best=-1;float bv=-FLT_MAX;
- float*logits=m->head_logits;if(!logits||m->head_logits_count<(size_t)rows||qtp_entry_mv(e,x,rows,Q38FN_HIDDEN,logits))return-1;
-#ifdef _OPENMP
-#pragma omp parallel
- {int lb=-1;float lv=-FLT_MAX;
-#pragma omp for schedule(static)
- for(int r=0;r<rows;r++)if(logits[r]>lv){lv=logits[r];lb=r;}
-#pragma omp critical
- if(lv>bv){bv=lv;best=lb;}}
-#else
- for(int r=0;r<rows;r++)if(logits[r]>bv){bv=logits[r];best=r;}
-#endif
- best+=(int)e->range[0].start;m->argmax(&bv,&best,m->comm);*token=best;if(logit)*logit=bv;if(prof){qtp_profile.head+=qtp_profile_now()-pt;qtp_profile.head_n++;}return 0;}
+int q38fn_tp_final_window(q38fn_tp_model*m,const float*h,uint32_t width,float*out){int prof=qtp_profile_enabled();double pt=prof?qtp_profile_now():0;if(!m||!h||!out||width<1||width>8)return-1;const char*p="model.language_model.hyper_connection_mixer";char n[180];float*norm=malloc((size_t)width*QTP_HC*sizeof(float)),*lo=malloc((size_t)width*QTP_LAYER_MIX*sizeof(float)),*part=malloc((size_t)width*QTP_HC*sizeof(float));if(!norm||!lo||!part){free(part);free(lo);free(norm);return-1;}snprintf(n,sizeof(n),"%s.hc_norm.weight",p);const q38fn_tp_blob_entry*nw=qtp_find(m,n);if(!nw){free(part);free(lo);free(norm);return-1;}for(uint32_t pos=0;pos<width;pos++)for(int st=0;st<4;st++){double q=0;const float*src=h+(size_t)pos*QTP_HC+(size_t)st*Q38FN_HIDDEN;float*dst=norm+(size_t)pos*QTP_HC+(size_t)st*Q38FN_HIDDEN;for(int i=0;i<Q38FN_HIDDEN;i++)q+=(double)src[i]*src[i];float z=1/sqrtf((float)(q/Q38FN_HIDDEN)+1e-6f);for(int i=0;i<Q38FN_HIDDEN;i++){int j=st*Q38FN_HIDDEN+i;dst[i]=src[i]*z*(1+qtp_bf(nw->data[j]));}}snprintf(n,sizeof(n),"%s.input_mix_weight_down.weight",p);const q38fn_tp_blob_entry*wd=qtp_find(m,n);if(!wd||wd->kind!=Q38FN_TP_AXIS0||wd->n_ranges!=1){free(part);free(lo);free(norm);return-1;}int d=(int)wd->range[0].count;if(d<1||d>QTP_LAYER_MIX||qtp_entry_mv_window(wd,norm,(int)width,d,QTP_HC,lo)){free(part);free(lo);free(norm);return-1;}for(uint32_t pos=0;pos<width;pos++)for(int i=0;i<d;i++)lo[(size_t)pos*d+i]=qtp_silu(lo[(size_t)pos*d+i]/4);snprintf(n,sizeof(n),"%s.input_mix_weight_up.weight",p);const q38fn_tp_blob_entry*wu=qtp_find(m,n);if(!wu||qtp_entry_mv_window(wu,lo,(int)width,QTP_HC,d,part)){free(part);free(lo);free(norm);return-1;}m->sum(part,(int)((size_t)width*QTP_HC),m->comm);for(uint32_t pos=0;pos<width;pos++)for(int i=0;i<Q38FN_HIDDEN;i++){double z=0;for(int st=0;st<4;st++){int j=st*Q38FN_HIDDEN+i;z+=(double)qtp_sig(part[(size_t)pos*QTP_HC+j])*norm[(size_t)pos*QTP_HC+j];}out[(size_t)pos*Q38FN_HIDDEN+i]=(float)(z/4);}free(part);free(lo);free(norm);if(prof){qtp_profile.final_mix+=qtp_profile_now()-pt;qtp_profile.final_n+=width;}return 0;}
+#define q38fn_tp_ple_apply(m,L,s,t,e,h) q38fn_tp_ple_apply((m),(L),(s),(t),(e),NULL,NULL,(h))
+int q38fn_tp_final(q38fn_tp_model*m,const float*h,float*out){return q38fn_tp_final_window(m,h,1,out);}
+int q38fn_tp_mtp_draft(q38fn_tp_model*m,q38fn_tp_mtp_state*s,int32_t token,
+                       const float*previous_hyper,float*output_hyper,
+                       int32_t*next,float*logit){
+ if(!m||!s||!previous_hyper||!output_hyper||!next)return-1;
+ const q38fn_tp_blob_entry*nh=qtp_find(m,"mtp.pre_fc_norm_hidden.weight");
+ const q38fn_tp_blob_entry*ne=qtp_find(m,"mtp.pre_fc_norm_embedding.weight");
+ const q38fn_tp_blob_entry*fh=qtp_find(m,"mtp.fc_hidden.weight");
+ const q38fn_tp_blob_entry*fe=qtp_find(m,"mtp.fc_embedding.weight");
+ if(!nh||!ne||!fh||!fe||!nh->data||!ne->data)return-1;
+ float embedding[Q38FN_HIDDEN],enorm[Q38FN_HIDDEN],eproj[Q38FN_HIDDEN];
+ if(q38fn_tp_embedding(m,token,embedding))return-1;
+ double es=0;for(int i=0;i<Q38FN_HIDDEN;i++)es+=(double)embedding[i]*embedding[i];
+ float ez=1/sqrtf((float)(es/Q38FN_HIDDEN)+1e-6f);
+ for(int i=0;i<Q38FN_HIDDEN;i++)enorm[i]=embedding[i]*ez*(1+qtp_bf(ne->data[i]));
+ if(qtp_full_mv(fe,enorm,Q38FN_HIDDEN,Q38FN_HIDDEN,eproj))return-1;
+ for(int stream=0;stream<Q38FN_HC_COUNT;stream++){
+  float hnorm[Q38FN_HIDDEN],hproj[Q38FN_HIDDEN];const float*input=previous_hyper+(size_t)stream*Q38FN_HIDDEN;double hs=0;
+  for(int i=0;i<Q38FN_HIDDEN;i++)hs+=(double)input[i]*input[i];float hz=1/sqrtf((float)(hs/Q38FN_HIDDEN)+1e-6f);
+  for(int i=0;i<Q38FN_HIDDEN;i++){int j=stream*Q38FN_HIDDEN+i;hnorm[i]=input[i]*hz*(1+qtp_bf(nh->data[j]));}
+  if(qtp_full_mv(fh,hnorm,Q38FN_HIDDEN,Q38FN_HIDDEN,hproj))return-1;
+  for(int i=0;i<Q38FN_HIDDEN;i++)output_hyper[(size_t)stream*Q38FN_HIDDEN+i]=hproj[i]+eproj[i];
+ }
+ qtp_mtp_mode=1;int rc=q38fn_tp_attention_layer(m,0,&s->attention,output_hyper);float hidden[Q38FN_HIDDEN];if(!rc)rc=q38fn_tp_final(m,output_hyper,hidden);qtp_mtp_mode=0;
+ if(rc||!qtp_finite_n(output_hyper,QTP_HC)||!qtp_finite_n(hidden,Q38FN_HIDDEN))return-1;
+ int id;if(q38fn_tp_head(m,hidden,&id,logit))return-1;*next=(int32_t)id;return 0;
+}
+int q38fn_tp_head_window(q38fn_tp_model*m,const float*x,uint32_t width,int32_t*token,float*logit){int prof=qtp_profile_enabled();double pt=prof?qtp_profile_now():0;const q38fn_tp_blob_entry*e=qtp_find(m,"lm_head.weight");if(!e||e->kind!=Q38FN_TP_AXIS0||!x||!token||width<1||width>8)return-1;int rows=(int)e->range[0].count;size_t needed=(size_t)width*(size_t)rows;if(!m->head_logits||m->head_logits_count<needed||qtp_entry_mv_window(e,x,(int)width,rows,Q38FN_HIDDEN,m->head_logits))return-1;float values[8];for(uint32_t p=0;p<width;p++){const float*row=m->head_logits+(size_t)p*rows;float best=-FLT_MAX;int32_t id=-1;for(int r=0;r<rows;r++)if(row[r]>best){best=row[r];id=r;}values[p]=best;token[p]=id+(int32_t)e->range[0].start;}if(m->argmax_n)m->argmax_n(values,token,(int)width,m->comm);else for(uint32_t i=0;i<width;i++){int id=token[i];m->argmax(values+i,&id,m->comm);token[i]=id;}if(logit)memcpy(logit,values,(size_t)width*sizeof(*logit));if(prof){qtp_profile.head+=qtp_profile_now()-pt;qtp_profile.head_n+=width;}return 0;}
+int q38fn_tp_head(q38fn_tp_model*m,const float*x,int*token,float*logit){int32_t id;if(q38fn_tp_head_window(m,x,1,&id,logit))return-1;*token=(int)id;return 0;}
 #endif
 #endif

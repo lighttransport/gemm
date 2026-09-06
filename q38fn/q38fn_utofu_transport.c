@@ -1,7 +1,9 @@
 #include "q38fn_utofu_transport.h"
 #include "../a64fx/utofu-tests/tp_allreduce.h"
+#include "../common/q38fn_spec.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 struct q38fn_utofu_transport { tp_comm comm; };
 
@@ -32,4 +34,20 @@ void q38fn_utofu_transport_argmax(q38fn_utofu_transport *t,
                                   float *value, int32_t *index)
 {
     tp_allreduce_argmax(&t->comm, value, index);
+}
+
+void q38fn_utofu_transport_argmax_n(q38fn_utofu_transport *t,
+                                    float *values, int32_t *indices, int count)
+{
+    float packed[2 * Q38FN_SPEC_MAX_WIDTH];
+    if (count < 1 || count > Q38FN_SPEC_MAX_WIDTH) return;
+    for (int i = 0; i < count; ++i) {
+        packed[2 * i] = values[i];
+        memcpy(packed + 2 * i + 1, indices + i, sizeof(indices[i]));
+    }
+    tp_allreduce_argmax_n(&t->comm, packed, count);
+    for (int i = 0; i < count; ++i) {
+        values[i] = packed[2 * i];
+        memcpy(indices + i, packed + 2 * i + 1, sizeof(indices[i]));
+    }
 }

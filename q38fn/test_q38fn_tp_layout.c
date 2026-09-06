@@ -71,7 +71,14 @@ int main(void)
     {
         uint64_t visual[2]={1024,1024};q38fn_tp_plan p;
         if(q38fn_tp_make_plan("model.visual.blocks.0.attn.qkv.weight",visual,2,0,Q38FN_TP_RANKS,&p)||p.kind!=Q38FN_TP_SKIP)return 1;
-        if(q38fn_tp_make_plan("mtp.fc.weight",visual,2,0,Q38FN_TP_RANKS,&p)||p.kind!=Q38FN_TP_SKIP)return 1;
+        uint64_t fc[2]={Q38FN_HIDDEN,Q38FN_HIDDEN};
+        if(q38fn_tp_make_plan("mtp.fc_hidden.weight",fc,2,0,Q38FN_TP_RANKS,&p)||p.kind!=Q38FN_TP_FULL)return 1;
+        if(check_cover("mtp.layers.0.self_attn.q_proj.weight",q,2,
+                       Q38FN_TP_AXIS0,q[0]) ||
+           check_cover("mtp.layers.0.self_attn.o_proj.weight",o,2,
+                       Q38FN_TP_AXIS1,o[1]) ||
+           check_cover("mtp.layers.0.mlp.experts.down_proj",down,3,
+                       Q38FN_TP_AXIS1,Q38FN_EXPERT_INTERMEDIATE)) return 1;
     }
     for (int shard = 0; shard < Q38FN_NGRAM_SHARDS; ++shard) {
         char name[160]; int owners = 0;

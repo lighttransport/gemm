@@ -340,6 +340,33 @@ static inline void k3_q8_dot8(int32_t out[8], const int8_t *w,
 #endif
 }
 
+/* Evaluate up to eight independent activation rows while each eight-row
+ * weight tile is hot.  A two-position tile uses 16 accumulators, fitting the
+ * A64FX SVE register file without spilling.  Output is position-major. */
+static inline void k3_q8_dot8_window(int32_t *out, const int8_t *w,
+                                     const int8_t *x, int width, int n) {
+    if (width < 1 || width > 8) return;
+#if defined(__ARM_FEATURE_SVE)
+    svbool_t pg=svptrue_b8(),pg32=svptrue_b32();int vl=(int)svcntb();
+    for(int p=0;p<width;p+=2){int pair=p+1<width;
+        svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
+        svint32_t b0=a0,b1=a0,b2=a0,b3=a0,b4=a0,b5=a0,b6=a0,b7=a0;
+        for(int i=0;i<n;i+=vl){svint8_t xa=svld1_s8(pg,x+(size_t)p*n+i);svint8_t xb=pair?svld1_s8(pg,x+(size_t)(p+1)*n+i):xa;
+#define K3_Q8_WINDOW_ROW(R) do{svint8_t wt=svld1_s8(pg,w+(size_t)(R)*n+i);a##R=svdot_s32(a##R,wt,xa);if(pair)b##R=svdot_s32(b##R,wt,xb);}while(0)
+            K3_Q8_WINDOW_ROW(0);K3_Q8_WINDOW_ROW(1);K3_Q8_WINDOW_ROW(2);K3_Q8_WINDOW_ROW(3);
+            K3_Q8_WINDOW_ROW(4);K3_Q8_WINDOW_ROW(5);K3_Q8_WINDOW_ROW(6);K3_Q8_WINDOW_ROW(7);
+#undef K3_Q8_WINDOW_ROW
+        }
+#define K3_Q8_WINDOW_STORE(R) do{out[(size_t)p*8+(R)]=svaddv_s32(pg32,a##R);if(pair)out[(size_t)(p+1)*8+(R)]=svaddv_s32(pg32,b##R);}while(0)
+        K3_Q8_WINDOW_STORE(0);K3_Q8_WINDOW_STORE(1);K3_Q8_WINDOW_STORE(2);K3_Q8_WINDOW_STORE(3);
+        K3_Q8_WINDOW_STORE(4);K3_Q8_WINDOW_STORE(5);K3_Q8_WINDOW_STORE(6);K3_Q8_WINDOW_STORE(7);
+#undef K3_Q8_WINDOW_STORE
+    }
+#else
+    for(int p=0;p<width;p++)k3_q8_dot8(out+(size_t)p*8,w,x+(size_t)p*n,n);
+#endif
+}
+
 static inline void k3_q8_dot16(int32_t out[16], const int8_t *w,
                                 const int8_t *x, int n) {
 #if defined(__ARM_FEATURE_SVE)
