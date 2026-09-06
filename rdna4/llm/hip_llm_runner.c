@@ -9565,6 +9565,9 @@ static int glm5next_hip_dsa_cache_load(hip_llm_runner *r, const gguf_shards *mod
 static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         float *latent_cache, int max_seq_len, int position, void *opaque);
+static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
+        const glm5next_config *config, const float *hidden, float *out,
+        float *recurrent, float *conv_state, void *opaque);
 static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
 
@@ -9642,6 +9645,12 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                 glm5next_hip_dsa_callback, r);
             fprintf(stderr, "hip_llm: GLM5Next HIP DSA callback enabled "
                             "(persistent per-layer weight cache)\n");
+        }
+        if (getenv("GLM5NEXT_HIP_KDA") && atoi(getenv("GLM5NEXT_HIP_KDA")) != 0) {
+            glm5next_cpu_runtime_set_kda_callback(r->glm5next_cpu,
+                glm5next_hip_kda_callback, r);
+            fprintf(stderr, "hip_llm: GLM5Next HIP KDA callback enabled "
+                            "(select layer with GLM5NEXT_HIP_KDA_LAYER)\n");
         }
         r->has_lm_head = 1;
         r->weights_loaded = 1;
@@ -14606,6 +14615,81 @@ done:
     free(qr); free(q); free(kvl); free(norm); free(qhead);
     return rc;
 #undef CB_VIEW
+}
+
+/* HIP KDA callback.  This mirrors the verified model-weighted KDA chain and
+ * exchanges only the persistent recurrent/conv state with the CPU mHC block.
+ * A layer selector is supported while bringing the path up; without one all
+ * KDA layers use this path when GLM5NEXT_HIP_KDA=1. */
+static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out,
+        float *recurrent, float *conv_state, void *opaque) {
+    hip_llm_runner *r = (hip_llm_runner *)opaque;
+    const int h = c->hidden_size, heads = c->attention_heads, d = c->linear_head_dim;
+    const int qdim = heads * d, dt_rank = 128, ck = c->short_conv_kernel;
+    const char *select = getenv("GLM5NEXT_HIP_KDA_LAYER");
+    glm5next_tensor_view mv[9], cv[3], dtv, av, nv;
+    qtensor mq[9]; void *mw[9] = { 0 }, *cw[3] = { 0 };
+    void *d_dt = NULL, *d_a = NULL, *d_norm = NULL, *dx = NULL, *dq = NULL, *dk = NULL, *dv = NULL;
+    void *dfa = NULL, *df = NULL, *dbeta = NULL, *dga = NULL, *dgg = NULL, *ddecay = NULL;
+    void *dstate = NULL, *dcore = NULL, *dout = NULL, *dcs[3] = { 0 };
+    int types[9] = { 0 }, rc = -1;
+    if (!r || !model || !hidden || !out || !recurrent || !conv_state ||
+        glm5next_layer_type(c, layer) != GLM5NEXT_LAYER_KDA) return -1;
+    if (select && atoi(select) != layer)
+        return glm5next_cpu_kda_forward(model, layer, c, hidden, out, recurrent, conv_state);
+#define KCB_VIEW(dst, suffix) do { char n[128]; snprintf(n, sizeof(n), "blk.%d.%s", layer, suffix); \
+    if (glm5next_tensor_view_get(model, n, 1, &(dst)) != 0) goto done; } while (0)
+    { const char *names[9] = { "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "ssm_f_a.weight", "ssm_f_b.weight", "ssm_beta.weight", "ssm_g_a.weight",
+        "ssm_g_b.weight", "attn_output.weight" };
+      const char *cn[3] = { "ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight" };
+      for (int i=0;i<9;++i) { KCB_VIEW(mv[i], names[i]); mq[i]=glm5next_as_qtensor(&mv[i]);
+          if (upload_weight_matrix(&mw[i], &mq[i], &types[i]) != 0) goto done; }
+      for (int i=0;i<3;++i) { KCB_VIEW(cv[i], cn[i]); if (glm5next_upload_f32_view(&cw[i], &cv[i]) != 0) goto done; } }
+    KCB_VIEW(dtv, "ssm_dt.bias"); KCB_VIEW(av, "ssm_a"); KCB_VIEW(nv, "ssm_norm.weight");
+    if (glm5next_upload_f32_view(&d_dt, &dtv) != 0 || glm5next_upload_f32_view(&d_a, &av) != 0 ||
+        glm5next_upload_f32_view(&d_norm, &nv) != 0) goto done;
+#define KCB_ALLOC(p,n) do { if (hipMalloc(&(p), (size_t)(n)*sizeof(float)) != hipSuccess) goto done; } while (0)
+    KCB_ALLOC(dx,h); KCB_ALLOC(dq,qdim); KCB_ALLOC(dk,qdim); KCB_ALLOC(dv,qdim); KCB_ALLOC(dfa,dt_rank);
+    KCB_ALLOC(df,qdim); KCB_ALLOC(dbeta,heads); KCB_ALLOC(dga,dt_rank); KCB_ALLOC(dgg,qdim); KCB_ALLOC(ddecay,qdim);
+    KCB_ALLOC(dstate,(size_t)heads*d*d); KCB_ALLOC(dcore,qdim); KCB_ALLOC(dout,h);
+    for (int i=0;i<3;++i) KCB_ALLOC(dcs[i], (size_t)qdim*(ck-1));
+    if (hipMemcpy(dx, hidden, (size_t)h*sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(dstate, recurrent, (size_t)heads*d*d*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    for (int i=0;i<3;++i) if (hipMemcpy(dcs[i], conv_state + (size_t)i*qdim*(ck-1),
+        (size_t)qdim*(ck-1)*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    launch_matvec_auto(r, dq, mw[0], dx, qdim, h, types[0]);
+    launch_matvec_auto(r, dk, mw[1], dx, qdim, h, types[1]);
+    launch_matvec_auto(r, dv, mw[2], dx, qdim, h, types[2]);
+    launch_conv1d(r, dq, dcs[0], dq, cw[0], qdim, ck);
+    launch_conv1d(r, dk, dcs[1], dk, cw[1], qdim, ck);
+    launch_conv1d(r, dv, dcs[2], dv, cw[2], qdim, ck);
+    launch_l2_norm_heads(r, dq, heads, d, 1e-6f); launch_l2_norm_heads(r, dk, heads, d, 1e-6f);
+    launch_matvec_auto(r, dfa, mw[3], dx, dt_rank, h, types[3]);
+    launch_matvec_auto(r, df, mw[4], dfa, qdim, dt_rank, types[4]);
+    launch_matvec_auto(r, dbeta, mw[5], dx, heads, h, types[5]);
+    launch_matvec_auto(r, dga, mw[6], dx, dt_rank, h, types[6]);
+    launch_matvec_auto(r, dgg, mw[7], dga, qdim, dt_rank, types[7]);
+    launch_glm5next_kda_decay(r, ddecay, df, d_dt, d_a, heads, d, c->kda_gate_lower_bound);
+    launch_sigmoid_inplace(r, dbeta, heads);
+    launch_glm5next_kda_heads_step(r, dstate, dcore, dq, dk, dv, ddecay, dbeta, heads, d);
+    launch_glm5next_kda_gated_norm(r, dcore, dgg, d_norm, heads, d, 1e-6f);
+    launch_matvec_auto(r, dout, mw[8], dcore, h, qdim, types[8]);
+    if (hipStreamSynchronize(r->stream) != hipSuccess ||
+        hipMemcpy(out, dout, (size_t)h*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
+        hipMemcpy(recurrent, dstate, (size_t)heads*d*d*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+    for (int i=0;i<3;++i) if (hipMemcpy(conv_state + (size_t)i*qdim*(ck-1), dcs[i],
+        (size_t)qdim*(ck-1)*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+    rc = 0;
+done:
+    for (int i=0;i<9;++i) if (mw[i]) hipFree(mw[i]);
+    for (int i=0;i<3;++i) { if (cw[i]) hipFree(cw[i]); if (dcs[i]) hipFree(dcs[i]); }
+    void *all[] = { d_dt,d_a,d_norm,dx,dq,dk,dv,dfa,df,dbeta,dga,dgg,ddecay,dstate,dcore,dout };
+    for (size_t i=0;i<sizeof(all)/sizeof(all[0]);++i) if (all[i]) hipFree(all[i]);
+    return rc;
+#undef KCB_ALLOC
+#undef KCB_VIEW
 }
 
 /* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch
