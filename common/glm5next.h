@@ -71,6 +71,16 @@ typedef struct {
     size_t mhc_bytes;
 } glm5next_state_layout;
 
+typedef struct {
+    const gguf_context *owner;
+    int index;
+    uint32_t type;
+    uint32_t n_dims;
+    uint64_t dims[4];
+    void *data;
+    size_t bytes;
+} glm5next_tensor_view;
+
 static inline void glm5next_config_free(glm5next_config *c) {
     if (!c) return;
     free(c->layer_kv_heads);
@@ -213,6 +223,28 @@ static inline glm5next_layer_kind glm5next_layer_type(const glm5next_config *c, 
 
 static inline int glm5next_tensor_present(const gguf_shards *model, const char *name) {
     return model && name && gguf_shards_find_tensor(model, name, NULL, NULL) == 0;
+}
+
+/* Resolve a tensor without copying it.  In mmap mode data points into the
+ * owning shard; in metadata-only mode it is NULL and only the shape/type are
+ * available. */
+static inline int glm5next_tensor_view_get(const gguf_shards *model, const char *name,
+                                           int required, glm5next_tensor_view *out) {
+    const gguf_context *owner = NULL;
+    int index = -1;
+    if (out) memset(out, 0, sizeof(*out));
+    if (!model || !name || !out || gguf_shards_find_tensor(model, name, &owner, &index) != 0) {
+        if (required) return -1;
+        return 1;
+    }
+    out->owner = owner;
+    out->index = index;
+    out->type = owner->tensors[index].type;
+    out->n_dims = owner->tensors[index].n_dims > 4 ? 4 : owner->tensors[index].n_dims;
+    for (uint32_t i = 0; i < out->n_dims; ++i) out->dims[i] = owner->tensors[index].dims[i];
+    out->data = gguf_tensor_data(owner, index);
+    out->bytes = gguf_tensor_size(owner, index);
+    return 0;
 }
 
 /* Validate the tensor-name contract without touching tensor payloads.  This is

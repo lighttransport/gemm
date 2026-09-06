@@ -15,6 +15,7 @@ int main(int argc, char **argv) {
     int max_seq = 4096;
     int kda = 0, dsa = 0, i;
     uint64_t tensor_count = 0;
+    glm5next_tensor_view view;
 
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL.gguf [max_seq_len]\n", argv[0]);
@@ -34,6 +35,22 @@ int main(int argc, char **argv) {
     }
     if (glm5next_validate_tensors(model, &config, error, sizeof(error)) != 0) {
         fprintf(stderr, "GLM5Next tensors: FAIL: %s\n", error);
+        glm5next_config_free(&config);
+        gguf_close_shards(model);
+        return 1;
+    }
+    if (glm5next_tensor_view_get(model, "blk.0.attn_q.weight", 1, &view) != 0 ||
+        view.n_dims != 2 || view.dims[0] != 4096 || view.dims[1] != 8192 ||
+        view.data == NULL) {
+        fprintf(stderr, "GLM5Next tensor view: FAIL for blk.0.attn_q.weight\n");
+        glm5next_config_free(&config);
+        gguf_close_shards(model);
+        return 1;
+    }
+    if (glm5next_tensor_view_get(model, "blk.3.attn_k_b.weight", 1, &view) != 0 ||
+        view.n_dims != 3 || view.dims[0] != 256 || view.dims[1] != 512 ||
+        view.dims[2] != 64 || view.data == NULL) {
+        fprintf(stderr, "GLM5Next tensor view: FAIL for blk.3.attn_k_b.weight\n");
         glm5next_config_free(&config);
         gguf_close_shards(model);
         return 1;
