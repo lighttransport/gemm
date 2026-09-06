@@ -76,7 +76,10 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
         t.n_dims != 2 || t.dims[0] != (uint64_t)h ||
         dequant_row(t.type, (const unsigned char *)t.data +
                     dequant_row_size(t.type, h) * (size_t)token, r->hidden, h) != 0)
+    {
+        fprintf(stderr, "glm5next: embedding lookup failed for token %d\n", token);
         return -1;
+    }
     for (int s = 0; s < hc; ++s)
         memcpy(r->streams + (size_t)s * h, r->hidden, (size_t)h * sizeof(float));
     for (int l = 0; l < r->config.n_layers; ++l) {
@@ -90,7 +93,12 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
             : glm5next_cpu_dsa_moe_block_cached(r->model, l, &r->config, r->streams,
                 r->latent_kv + (size_t)l * r->max_seq_len * r->config.kv_lora_rank,
                 r->max_seq_len, position);
-        if (rc != 0) return -1;
+        if (rc != 0) {
+            fprintf(stderr, "glm5next: layer %d (%s) failed at position %d\n", l,
+                    glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA ? "KDA" : "DSA",
+                    position);
+            return -1;
+        }
     }
     for (int i = 0; i < h; ++i) {
         double sum = 0.0; for (int s = 0; s < hc; ++s) sum += r->streams[(size_t)s * h + i];

@@ -12,17 +12,60 @@
 #include "glm5next_ref.h"
 #include "ggml_dequant.h"
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 static inline int glm5next_cpu_matvec(float *out, const glm5next_tensor_view *w,
                                       const float *x) {
     int rows, cols;
     size_t row_bytes;
+    float *tmp;
     if (!out || !w || !x || w->n_dims < 2 || !w->data) return -1;
     cols = (int)w->dims[0];
     rows = (int)w->dims[1];
     row_bytes = dequant_row_size(w->type, cols);
+    if (rows <= 0 || cols <= 0 || row_bytes == 0) return -1;
+    /* Reuse one row buffer.  GLM5Next invokes matvec thousands of times per
+     * token; allocating a temporary for every row made the CPU oracle spend a
+     * significant fraction of its time in malloc/free rather than dequant or
+     * dot products.  Calls are sequential, so one scratch row is sufficient. */
+    tmp = (float *)malloc((size_t)cols * sizeof(float));
+    if (!tmp) return -1;
+/* Quantized rows are independent.  Use one dequant scratch row per worker for
+ * large projections, while retaining the compact serial path for vectors and
+ * small control projections. */
+#if defined(_OPENMP)
+    if (rows >= 1024) {
+        int failed = 0;
+#pragma omp parallel
+        {
+            float *local = (float *)malloc((size_t)cols * sizeof(float));
+            if (!local) {
+#pragma omp atomic write
+                failed = 1;
+            } else {
+#pragma omp for schedule(static)
+                for (int r = 0; r < rows; ++r) {
+                    const uint8_t *row = (const uint8_t *)w->data + (size_t)r * row_bytes;
+                    double sum = 0.0;
+                    if (dequant_row(w->type, row, local, cols) != 0) {
+#pragma omp atomic write
+                        failed = 1;
+                        continue;
+                    }
+                    for (int j = 0; j < cols; ++j) sum += (double)local[j] * x[j];
+                    out[r] = (float)sum;
+                }
+                free(local);
+            }
+        }
+        free(tmp);
+        return failed ? -1 : 0;
+    }
+#endif
     for (int r = 0; r < rows; ++r) {
         const uint8_t *row = (const uint8_t *)w->data + (size_t)r * row_bytes;
-        float *tmp = (float *)malloc((size_t)cols * sizeof(float));
         double sum = 0.0;
         if (!tmp || dequant_row(w->type, row, tmp, cols) != 0) {
             free(tmp);
@@ -30,8 +73,8 @@ static inline int glm5next_cpu_matvec(float *out, const glm5next_tensor_view *w,
         }
         for (int j = 0; j < cols; ++j) sum += (double)tmp[j] * x[j];
         out[r] = (float)sum;
-        free(tmp);
     }
+    free(tmp);
     return 0;
 }
 
