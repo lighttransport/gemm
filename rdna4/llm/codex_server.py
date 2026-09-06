@@ -52,6 +52,17 @@ def responses_input_messages(value):
     for item in value:
         if isinstance(item, dict) and item.get("role"):
             messages.append(item)
+        elif isinstance(item, dict) and item.get("type") == "function_call_output":
+            # Responses sends tool results as input items rather than chat
+            # messages. Preserve them as a tool turn; dropping them makes a
+            # follow-up generation repeat the same call without its result.
+            output = item.get("output", "")
+            if not isinstance(output, str):
+                output = json.dumps(output, ensure_ascii=False)
+            call_id = item.get("call_id", "")
+            label = f" call_id={call_id}" if call_id else ""
+            messages.append({"role": "tool",
+                             "content": f"<tool_response{label}>\n{output}\n</tool_response>"})
         elif isinstance(item, dict) and "content" in item:
             # Be liberal with message-shaped Responses items that omit role;
             # treating them as user content is safer than silently dropping

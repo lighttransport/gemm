@@ -8,10 +8,20 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from codex_server import Backend
+from codex_server import Backend, responses_input_messages
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_responses_tool_output_is_preserved(self):
+        messages = responses_input_messages([
+            {"role": "user", "content": "Call echo."},
+            {"type": "function_call_output", "call_id": "call_1",
+             "output": {"value": 21}},
+        ])
+        self.assertEqual(messages[-1]["role"], "tool")
+        self.assertIn("call_id=call_1", messages[-1]["content"])
+        self.assertIn('"value": 21', messages[-1]["content"])
+
     def test_startup_waits_for_runner_ready(self):
         backend = Backend.__new__(Backend)
         backend.ready = False
