@@ -11,6 +11,7 @@ import io
 import json
 import math
 import os
+from pathlib import Path
 import select
 import signal
 import socket
@@ -23,6 +24,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from qwen_tools import call_events, parse_calls, tool_instructions, tool_registry
+
+
+WEB_DIR = Path(__file__).with_name("web")
 
 
 def _handle_sigterm(signum, frame):
@@ -321,11 +325,36 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return False
 
+    def send_file(self, path, content_type):
+        try:
+            raw = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return True
+        except FileNotFoundError:
+            self.send_json(404, {"error": {"message": "UI asset not found", "type": "server_error"}})
+            return False
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
-        if path in ("/health", "/v1/health"):
+        if path in ("/", "/ui"):
+            self.send_file(WEB_DIR / "index.html", "text/html; charset=utf-8")
+        elif path in ("/health", "/v1/health"):
             health = self.backend.health()
             self.send_json(200 if health["status"] == "ready" else 503, health)
+        elif path == "/v1/ui/capabilities":
+            self.send_json(200, {
+                "model": self.model,
+                "coding": self.coding,
+                "research": True,
+                "vision": False,
+                "vision_note": "This Qwen endpoint is text-only; image upload is preview-only until a vision backend is connected.",
+            })
         elif path in ("/v1/models", "/models"):
             now = int(time.time())
             self.send_json(200, {"object": "list", "data": [{"id": self.model, "object": "model", "created": now, "owned_by": "local"}]})

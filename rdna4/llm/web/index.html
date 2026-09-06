@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Qwen Chat</title>
+  <style>
+    :root { color-scheme: dark; --bg:#111318; --panel:#1a1d24; --line:#303642; --text:#e9edf4; --muted:#9ba5b5; --accent:#72a7ff; }
+    * { box-sizing:border-box } body { margin:0; background:var(--bg); color:var(--text); font:15px system-ui,sans-serif; }
+    main { width:min(1000px,100%); min-height:100vh; margin:auto; display:flex; flex-direction:column; padding:20px 16px; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px; }
+    h1 { font-size:20px; margin:0 } .status { color:var(--muted); font-size:12px; }
+    #chat { flex:1; min-height:55vh; border:1px solid var(--line); border-radius:12px; padding:18px; background:var(--panel); overflow:auto; }
+    .empty { color:var(--muted); text-align:center; padding:12vh 20px; } .msg { margin:0 0 18px; white-space:pre-wrap; line-height:1.5; }
+    .label { color:var(--accent); font-size:12px; font-weight:700; margin-bottom:4px; text-transform:uppercase; letter-spacing:.06em; }
+    .bubble { background:#222733; border-radius:9px; padding:10px 12px; overflow:auto; } .user .bubble { background:#263853; }
+    textarea, select, button { font:inherit; color:var(--text); border:1px solid var(--line); border-radius:8px; background:#171a20; }
+    textarea { width:100%; resize:vertical; min-height:80px; padding:12px; margin-top:12px; }
+    .toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:10px; } select, button { padding:8px 11px; }
+    button { cursor:pointer; background:#275da9; border-color:#3975cf; } button.secondary { background:#20252e; border-color:var(--line); }
+    button:disabled { opacity:.55; cursor:wait; } .drop { flex:1; min-width:220px; color:var(--muted); border:1px dashed #536078; border-radius:8px; padding:8px 10px; cursor:pointer; }
+    .drop.drag { border-color:var(--accent); background:#202b40; } .preview { display:none; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
+    .preview img { width:48px; height:48px; object-fit:cover; border-radius:6px; } .notice { color:#e4bd72; font-size:12px; margin-top:8px; }
+    code, pre { font-family:ui-monospace,SFMono-Regular,monospace; } pre { white-space:pre-wrap; margin:0; }
+  </style>
+</head>
+<body>
+<main>
+  <header><h1>Local Qwen Chat</h1><span id="status" class="status">connecting…</span></header>
+  <section id="chat"><div class="empty">Ask about code, debugging, design, or research.</div></section>
+  <textarea id="prompt" placeholder="Message the local model… (Ctrl/⌘ + Enter to send)"></textarea>
+  <div class="toolbar">
+    <select id="mode" aria-label="Conversation mode"><option value="coding">Coding</option><option value="research">Research</option><option value="general">General</option></select>
+    <label id="drop" class="drop">Drop an image here or choose one<input id="file" type="file" accept="image/*" hidden></label>
+    <button id="send">Send</button><button id="stop" class="secondary" disabled>Stop</button>
+  </div>
+  <div id="preview" class="preview"><img id="thumb" alt="Selected image"><span id="filename"></span><button id="remove" class="secondary">Remove</button></div>
+  <div id="notice" class="notice">Image upload is preview-only: this server currently uses a text-only model.</div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const chat = $('chat'), prompt = $('prompt'), send = $('send'), stop = $('stop'), drop = $('drop');
+let history = [], controller = null, image = null;
+function add(role, text) { const empty = chat.querySelector('.empty'); if (empty) empty.remove(); const el = document.createElement('div'); el.className = 'msg ' + role; const label = document.createElement('div'); label.className='label'; label.textContent=role==='user'?'You':'Qwen'; const bubble=document.createElement('div'); bubble.className='bubble'; const pre=document.createElement('pre'); pre.textContent=text; bubble.append(pre); el.append(label,bubble); chat.append(el); chat.scrollTop=chat.scrollHeight; return pre; }
+async function capabilities() { try { const r=await fetch('/v1/ui/capabilities'); const c=await r.json(); $('status').textContent=(c.model||'local')+' · '+(c.vision?'vision ready':'text-only'); } catch (_) { $('status').textContent='server unavailable'; } }
+async function submit() {
+  const text=prompt.value.trim(); if (!text || controller) return;
+  const mode=$('mode').value; const instructions={coding:'Act as a careful coding assistant. Give concrete, testable solutions and call out assumptions.',research:'Act as a research assistant. Separate facts from inference and provide useful source/search suggestions when citations are not available.',general:''}[mode];
+  add('user', text); history.push({role:'user',content:text}); prompt.value=''; send.disabled=true; stop.disabled=false; controller=new AbortController(); const out=add('assistant','Thinking…');
+  try { const r=await fetch('/v1/responses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'local',instructions,input:history,max_output_tokens:512}),signal:controller.signal}); const data=await r.json(); if(!r.ok) throw Error(data.error?.message||r.statusText); const answer=data.output_text||data.output?.[0]?.content?.[0]?.text||'(no text returned)'; out.textContent=answer; history.push({role:'assistant',content:answer}); }
+  catch(e) { out.textContent=e.name==='AbortError'?'Stopped.':'Error: '+e.message; }
+  finally { controller=null; send.disabled=false; stop.disabled=true; chat.scrollTop=chat.scrollHeight; }
+}
+function choose(file) { if(!file || !file.type.startsWith('image/')) return; if(file.size>10*1024*1024){ $('notice').textContent='Image is too large (10 MB maximum).'; return; } image=file; $('thumb').src=URL.createObjectURL(file); $('filename').textContent=file.name+' · '+Math.ceil(file.size/1024)+' KB'; $('preview').style.display='flex'; $('notice').textContent='Preview only: the current text-only endpoint will not analyze image pixels.'; }
+send.onclick=submit; stop.onclick=()=>{ if(controller){ controller.abort(); fetch('/v1/cancel',{method:'POST'}).catch(()=>{}); } }; prompt.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter')submit();}); $('file').onchange=e=>choose(e.target.files[0]); drop.ondragover=e=>{e.preventDefault();drop.classList.add('drag')}; drop.ondragleave=()=>drop.classList.remove('drag'); drop.ondrop=e=>{e.preventDefault();drop.classList.remove('drag');choose(e.dataTransfer.files[0]);}; $('remove').onclick=()=>{image=null;$('preview').style.display='none';$('file').value='';}; capabilities();
+</script>
+</body>
+</html>
