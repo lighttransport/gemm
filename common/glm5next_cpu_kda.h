@@ -382,13 +382,16 @@ static inline int glm5next_cpu_dsa_forward_cached_indexed(const gguf_shards *mod
             if (scores[p] > max_score) max_score = scores[p];
         }
         double denom = 0.0;
-        for (int p = 0; p <= position; ++p) denom += exp((double)scores[p] - max_score);
+        for (int si = 0; si < selected_count; ++si) {
+            int p = selected ? selected[si] : si;
+            denom += exp((double)scores[p] - max_score);
+        }
         for (int si = 0; si < selected_count; ++si) {
             int p = selected ? selected[si] : si;
             const float *kp = latent_cache ? latent_cache + (size_t)p * kv : kv_latent;
             float *vv = (float *)malloc((size_t)vdim * sizeof(float));
             if (!vv || glm5next_cpu_matvec_head(vv, &t, head, kp) != 0) { free(vv); free(scores); free(qh); goto fail; }
-            float w = (float)(exp((double)scores[si] - max_score) / denom);
+            float w = (float)(exp((double)scores[p] - max_score) / denom);
             for (int i = 0; i < vdim; ++i) vh[i] += w * vv[i];
             free(vv);
         }
