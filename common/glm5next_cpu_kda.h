@@ -520,6 +520,8 @@ typedef int (*glm5next_dsa_callback)(const gguf_shards *model, int layer,
 typedef int (*glm5next_kda_callback)(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         float *recurrent, float *conv_state, void *opaque);
+typedef int (*glm5next_output_callback)(const gguf_shards *model,
+        const glm5next_config *config, float *hidden, float *logits, void *opaque);
 
 static inline int glm5next_cpu_dsa_moe_block_cached_cb(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,

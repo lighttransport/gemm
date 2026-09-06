@@ -24,6 +24,8 @@ typedef struct {
     void *moe_callback_opaque;
     glm5next_mhc_callback mhc_callback;
     void *mhc_callback_opaque;
+    glm5next_output_callback output_callback;
+    void *output_callback_opaque;
     float *indexer_keys;
     float *indexer_gates;
 } glm5next_cpu_runtime;
@@ -54,6 +56,13 @@ static inline void glm5next_cpu_runtime_set_mhc_callback(glm5next_cpu_runtime *r
     if (!r) return;
     r->mhc_callback = callback;
     r->mhc_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_output_callback(glm5next_cpu_runtime *r,
+        glm5next_output_callback callback, void *opaque) {
+    if (!r) return;
+    r->output_callback = callback;
+    r->output_callback_opaque = opaque;
 }
 
 static inline void glm5next_cpu_runtime_free(glm5next_cpu_runtime *r) {
@@ -165,11 +174,16 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
         double sum = 0.0; for (int s = 0; s < hc; ++s) sum += r->streams[(size_t)s * h + i];
         r->hidden[i] = (float)(sum / hc);
     }
-    if (glm5next_tensor_view_get(r->model, "output_norm.weight", 1, &t) != 0 ||
-        glm5next_cpu_vector(&t, r->normed, h) != 0) return -1;
-    glm5next_cpu_rmsnorm(r->hidden, r->hidden, r->normed, h, r->config.norm_epsilon);
-    if (glm5next_tensor_view_get(r->model, "output.weight", 1, &t) != 0 ||
-        glm5next_cpu_matvec(r->logits, &t, r->hidden) != 0) return -1;
+    if (r->output_callback) {
+        if (r->output_callback(r->model, &r->config, r->hidden, r->logits,
+                               r->output_callback_opaque) != 0) return -1;
+    } else {
+        if (glm5next_tensor_view_get(r->model, "output_norm.weight", 1, &t) != 0 ||
+            glm5next_cpu_vector(&t, r->normed, h) != 0) return -1;
+        glm5next_cpu_rmsnorm(r->hidden, r->hidden, r->normed, h, r->config.norm_epsilon);
+        if (glm5next_tensor_view_get(r->model, "output.weight", 1, &t) != 0 ||
+            glm5next_cpu_matvec(r->logits, &t, r->hidden) != 0) return -1;
+    }
     r->position = position + 1; return 0;
 }
 

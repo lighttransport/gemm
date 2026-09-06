@@ -8386,6 +8386,9 @@ struct hip_llm_runner {
     glm5next_state_layout glm5next_layout;
     glm5next_cpu_runtime *glm5next_cpu;
     const gguf_shards *glm5next_model;
+    /* Non-owning adapter for the legacy single-context load API. */
+    gguf_shards glm5next_single_shards;
+    gguf_context *glm5next_single_shard;
     glm5next_dsa_gpu_cache *glm5next_dsa_gpu;
     hip_llm_moe_mode requested_moe_mode;
     uint64_t requested_moe_cache_bytes;
@@ -9806,6 +9809,8 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
 static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, int site, const float *streams,
         float *collapsed, float *post, float *comb, void *opaque);
+static int glm5next_hip_output_callback(const gguf_shards *model,
+        const glm5next_config *config, float *hidden, float *logits, void *opaque);
 static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
 
@@ -9908,6 +9913,11 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
             glm5next_cpu_runtime_set_mhc_callback(r->glm5next_cpu,
                 glm5next_hip_mhc_callback, r);
             fprintf(stderr, "hip_llm: GLM5Next HIP mHC projection callback enabled\n");
+        }
+        if (getenv("GLM5NEXT_HIP_OUTPUT") && atoi(getenv("GLM5NEXT_HIP_OUTPUT")) != 0) {
+            glm5next_cpu_runtime_set_output_callback(r->glm5next_cpu,
+                glm5next_hip_output_callback, r);
+            fprintf(stderr, "hip_llm: GLM5Next HIP output norm/projection callback enabled\n");
         }
         r->has_lm_head = 1;
         r->weights_loaded = 1;
@@ -10674,12 +10684,11 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
      * still work through the legacy public API: wrap the caller-owned
      * context, without transferring ownership, for the duration of load. */
     if (glm5next_is_arch(gguf)) {
-        gguf_shards one = {
-            .n_shards = 1,
-            .shards = &gguf,
-            .metadata = gguf,
-        };
-        hllm_active_shards = &one;
+        r->glm5next_single_shard = gguf;
+        r->glm5next_single_shards.n_shards = 1;
+        r->glm5next_single_shards.shards = &r->glm5next_single_shard;
+        r->glm5next_single_shards.metadata = gguf;
+        hllm_active_shards = &r->glm5next_single_shards;
         int rc = hip_llm_load_weights_impl(r, gguf, max_seq_len);
         hllm_active_shards = NULL;
         return rc;
@@ -16534,24 +16543,40 @@ static void hip_llm_phase5_capture(hip_llm_runner *r) {
     }
 }
 
-static int glm5next_hip_output_logits(hip_llm_runner *r) {
+static int glm5next_hip_output_logits(hip_llm_runner *r,
+        const glm5next_config *config, float *hidden, float *logits) {
     glm5next_tensor_view v;
-    void *dx = NULL, *dy = NULL;
+    glm5next_tensor_view normv;
+    void *dx = NULL, *dnormed = NULL, *dweight = NULL, *dy = NULL;
     int rc = -1;
-    if (!r || !r->glm5next_cpu || !r->glm5next_cpu->hidden) return -1;
+    if (!r || !config || !hidden || !logits) return -1;
     if (hipMalloc(&dx, (size_t)r->n_embd * sizeof(float)) != hipSuccess) {
         fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: activation allocation failed\n");
+        goto done;
+    }
+    if (hipMalloc(&dnormed, (size_t)r->n_embd * sizeof(float)) != hipSuccess) {
+        fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: normalized activation allocation failed\n");
         goto done;
     }
     if (hipMalloc(&dy, (size_t)r->n_vocab * sizeof(float)) != hipSuccess) {
         fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: logits allocation failed\n");
         goto done;
     }
-    if (hipMemcpy(dx, r->glm5next_cpu->hidden, (size_t)r->n_embd * sizeof(float),
+    if (glm5next_tensor_view_get(r->glm5next_model, "output_norm.weight", 1, &normv) != 0 ||
+        glm5next_upload_f32_view(&dweight, &normv) != 0) {
+        fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: output norm upload failed\n");
+        goto done;
+    }
+    if (hipMemcpy(dx, hidden, (size_t)r->n_embd * sizeof(float),
                   hipMemcpyHostToDevice) != hipSuccess) {
         fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: activation upload failed\n");
         goto done;
     }
+    launch_rmsnorm(r, dnormed, dx, dweight, r->n_embd, config->norm_epsilon);
+    if (hipStreamSynchronize(r->stream) != hipSuccess ||
+        hipMemcpy(hidden, dnormed, (size_t)r->n_embd * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+        goto done;
     if (glm5next_tensor_view_get(r->glm5next_model, "output.weight", 1, &v) != 0) {
         fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: output.weight not found\n");
         goto done;
@@ -16584,7 +16609,7 @@ static int glm5next_hip_output_logits(hip_llm_runner *r) {
             launch_matvec_auto(r, dy, weight, dx, rows, r->n_embd, type);
             hipError_t err = hipStreamSynchronize(r->stream);
             if (err == hipSuccess)
-                err = hipMemcpy(r->glm5next_cpu->logits + first, dy,
+                err = hipMemcpy(logits + first, dy,
                                 (size_t)rows * sizeof(float), hipMemcpyDeviceToHost);
             hipFree(weight);
             if (err != hipSuccess) {
@@ -16598,8 +16623,16 @@ static int glm5next_hip_output_logits(hip_llm_runner *r) {
     }
     rc = 0;
 done:
-    if (dx) hipFree(dx); if (dy) hipFree(dy);
+    if (dx) hipFree(dx); if (dnormed) hipFree(dnormed);
+    if (dweight) hipFree(dweight); if (dy) hipFree(dy);
     return rc;
+}
+
+static int glm5next_hip_output_callback(const gguf_shards *model,
+        const glm5next_config *config, float *hidden, float *logits, void *opaque) {
+    hip_llm_runner *r = (hip_llm_runner *)opaque;
+    if (!r || model != r->glm5next_model) return -1;
+    return glm5next_hip_output_logits(r, config, hidden, logits);
 }
 
 float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position) {
@@ -16610,8 +16643,6 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
     if (r->is_glm5next) {
         if (!r->glm5next_cpu || glm5next_cpu_runtime_step(r->glm5next_cpu, token_id, position) != 0)
             return NULL;
-        if (getenv("GLM5NEXT_HIP_OUTPUT") && atoi(getenv("GLM5NEXT_HIP_OUTPUT")) != 0 &&
-            glm5next_hip_output_logits(r) != 0) return NULL;
         return r->glm5next_cpu->logits;
     }
 
