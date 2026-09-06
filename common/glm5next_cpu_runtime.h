@@ -16,7 +16,16 @@ typedef struct {
     float *streams, *recurrent, *conv, *latent_kv, *hidden, *normed, *logits;
     int max_seq_len;
     int position;
+    glm5next_dsa_callback dsa_callback;
+    void *dsa_callback_opaque;
 } glm5next_cpu_runtime;
+
+static inline void glm5next_cpu_runtime_set_dsa_callback(glm5next_cpu_runtime *r,
+        glm5next_dsa_callback callback, void *opaque) {
+    if (!r) return;
+    r->dsa_callback = callback;
+    r->dsa_callback_opaque = opaque;
+}
 
 static inline void glm5next_cpu_runtime_free(glm5next_cpu_runtime *r) {
     if (!r) return;
@@ -86,13 +95,17 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
         float *rs = r->recurrent + (size_t)l * r->config.attention_heads * d * d;
         float *cs = r->conv + (size_t)l * 3 * r->config.attention_heads * d *
                     (r->config.short_conv_kernel - 1);
-        int rc = glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA
-            ? (l < r->config.first_k_dense_replace
+        int rc;
+        if (glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA) {
+            rc = l < r->config.first_k_dense_replace
                 ? glm5next_cpu_kda_dense_block(r->model, l, &r->config, r->streams, rs, cs)
-                : glm5next_cpu_kda_moe_block(r->model, l, &r->config, r->streams, rs, cs))
-            : glm5next_cpu_dsa_moe_block_cached(r->model, l, &r->config, r->streams,
-                r->latent_kv + (size_t)l * r->max_seq_len * r->config.kv_lora_rank,
-                r->max_seq_len, position);
+                : glm5next_cpu_kda_moe_block(r->model, l, &r->config, r->streams, rs, cs);
+        } else {
+            float *cache = r->latent_kv + (size_t)l * r->max_seq_len * r->config.kv_lora_rank;
+            rc = glm5next_cpu_dsa_moe_block_cached_cb(r->model, l, &r->config, r->streams,
+                cache, r->max_seq_len, position, r->dsa_callback,
+                r->dsa_callback_opaque);
+        }
         if (rc != 0) {
             fprintf(stderr, "glm5next: layer %d (%s) failed at position %d\n", l,
                     glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA ? "KDA" : "DSA",

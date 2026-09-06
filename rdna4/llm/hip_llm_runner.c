@@ -7921,6 +7921,14 @@ static const char *hip_kernel_source =
 /* Runner state                                                             */
 /* ======================================================================== */
 
+typedef struct {
+    void *k_weight;
+    void *v_weight;
+    size_t k_stride;
+    size_t v_stride;
+    int ready;
+} glm5next_dsa_gpu_cache;
+
 /* Per-layer GPU weight pointers */
 typedef struct {
     void *attn_norm_w;    /* F32 [n_embd] */
@@ -8350,6 +8358,7 @@ struct hip_llm_runner {
     glm5next_config glm5next;
     glm5next_state_layout glm5next_layout;
     glm5next_cpu_runtime *glm5next_cpu;
+    glm5next_dsa_gpu_cache *glm5next_dsa_gpu;
     hip_llm_moe_mode requested_moe_mode;
     uint64_t requested_moe_cache_bytes;
     uint64_t requested_gpu_reserve_bytes;
@@ -9527,6 +9536,35 @@ int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_
     return hip_llm_finalize_load(r, max_seq_len);
 }
 
+static qtensor glm5next_as_qtensor(const glm5next_tensor_view *v);
+
+static int glm5next_hip_dsa_cache_load(hip_llm_runner *r, const gguf_shards *model,
+        int layer, glm5next_dsa_gpu_cache *cache) {
+    glm5next_tensor_view tk, tv;
+    char n[128];
+    if (!r || !model || !cache) return -1;
+    snprintf(n, sizeof(n), "blk.%d.attn_k_b.weight", layer);
+    if (glm5next_tensor_view_get(model, n, 1, &tk) != 0) return -1;
+    snprintf(n, sizeof(n), "blk.%d.attn_v_b.weight", layer);
+    if (glm5next_tensor_view_get(model, n, 1, &tv) != 0) return -1;
+    if (tk.n_dims != 3 || tv.n_dims != 3 || tk.type != GGML_TYPE_Q8_0 || tv.type != GGML_TYPE_Q8_0) return -1;
+    { qtensor qtk = glm5next_as_qtensor(&tk), qtv = glm5next_as_qtensor(&tv);
+      qtk.n_rows = (int)(tk.dims[1] * tk.dims[2]); qtv.n_rows = (int)(tv.dims[1] * tv.dims[2]);
+      if (upload_3d_kquant_raw(&cache->k_weight, &qtk, &cache->k_stride) != 0 ||
+          upload_3d_kquant_raw(&cache->v_weight, &qtv, &cache->v_stride) != 0) {
+          if (cache->k_weight) hipFree(cache->k_weight);
+          if (cache->v_weight) hipFree(cache->v_weight);
+          memset(cache, 0, sizeof(*cache));
+          return -1;
+      }
+    }
+    cache->ready = 1;
+    return 0;
+}
+
+static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
+        const glm5next_config *config, const float *hidden, float *out,
+        float *latent_cache, int max_seq_len, int position, void *opaque);
 static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
 
@@ -9590,6 +9628,20 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
             fprintf(stderr, "hip_llm: GLM5Next CPU runtime init failed: %s\n", error);
             free(r->glm5next_cpu); r->glm5next_cpu = NULL;
             return -1;
+        }
+        if (getenv("GLM5NEXT_HIP_DSA") && atoi(getenv("GLM5NEXT_HIP_DSA")) != 0) {
+            r->glm5next_dsa_gpu = (glm5next_dsa_gpu_cache *)calloc(
+                (size_t)r->glm5next.n_layers, sizeof(*r->glm5next_dsa_gpu));
+            if (!r->glm5next_dsa_gpu) {
+                fprintf(stderr, "hip_llm: GLM5Next DSA cache allocation failed\n");
+                glm5next_cpu_runtime_free(r->glm5next_cpu);
+                free(r->glm5next_cpu); r->glm5next_cpu = NULL;
+                return -1;
+            }
+            glm5next_cpu_runtime_set_dsa_callback(r->glm5next_cpu,
+                glm5next_hip_dsa_callback, r);
+            fprintf(stderr, "hip_llm: GLM5Next HIP DSA callback enabled "
+                            "(persistent per-layer weight cache)\n");
         }
         r->has_lm_head = 1;
         r->weights_loaded = 1;
@@ -12866,7 +12918,6 @@ static float *hip_llm_forward_blocks(hip_llm_runner *r, int position);
 static void debug_hc_state(hip_llm_runner *r, int layer, const char *stage);
 static void debug_f32_state(hip_llm_runner *r, int layer, const char *stage,
                             const void *src, int n);
-
 float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position) {
     if (!r || !r->weights_loaded) return NULL;
     if (token_id < 0 || token_id >= r->n_vocab) return NULL;
@@ -14488,6 +14539,73 @@ done:
     free(hidden); free(x); free(q); free(kvl); free(qhead); free(value); free(ref); free(got); free(tmp); free(norm);
     glm5next_config_free(&c); return rc;
 #undef DSA_VIEW
+}
+
+static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out,
+        float *latent_cache, int max_seq_len, int position, void *opaque) {
+    hip_llm_runner *r = (hip_llm_runner *)opaque;
+    const int heads = c->attention_heads, qrank = c->q_lora_rank;
+    const int kv = c->kv_lora_rank, qdim = c->qk_nope_head_dim, vdim = c->value_head_dim;
+    const int h = c->hidden_size, nt = position + 1;
+    glm5next_tensor_view t, normv, tk, tv, to;
+    void *dq = NULL, *dkv = NULL, *do_w = NULL;
+    void *dqcache = NULL, *dkcache = NULL, *dvcache = NULL, *dattn = NULL, *dout = NULL, *dvout = NULL;
+    float *qr = NULL, *q = NULL, *kvl = NULL, *norm = NULL, *qhead = NULL;
+    glm5next_dsa_gpu_cache *cache = NULL; int otype = 0, rc = -1;
+    if (!r || !model || !hidden || !out || !latent_cache || position < 0 || position >= max_seq_len) return -1;
+    if (!r->glm5next_dsa_gpu || layer < 0 || layer >= c->n_layers) return -1;
+    cache = &r->glm5next_dsa_gpu[layer];
+    if (!cache->ready && glm5next_hip_dsa_cache_load(r, model, layer, cache) != 0) return -1;
+#define CB_VIEW(dst, suffix) do { char n[128]; snprintf(n, sizeof(n), "blk.%d.%s", layer, suffix); \
+    if (glm5next_tensor_view_get(model, n, 1, &(dst)) != 0) goto done; } while (0)
+    qr = (float *)malloc((size_t)qrank*sizeof(float)); q = (float *)malloc((size_t)heads*qdim*sizeof(float));
+    kvl = (float *)malloc((size_t)kv*sizeof(float)); norm = (float *)malloc((size_t)((qrank > kv) ? qrank : kv)*sizeof(float));
+    qhead = (float *)malloc((size_t)kv*sizeof(float));
+    if (!qr || !q || !kvl || !norm || !qhead) goto done;
+    CB_VIEW(t, "attn_q_a.weight"); if (glm5next_cpu_matvec(qr, &t, hidden) != 0) goto done;
+    CB_VIEW(normv, "attn_q_a_norm.weight"); if (glm5next_cpu_vector(&normv, norm, qrank) != 0) goto done;
+    glm5next_cpu_rmsnorm(qr, qr, norm, qrank, c->norm_epsilon);
+    CB_VIEW(t, "attn_q_b.weight"); if (glm5next_cpu_matvec(q, &t, qr) != 0) goto done;
+    CB_VIEW(t, "attn_kv_a_mqa.weight"); if (glm5next_cpu_matvec(kvl, &t, hidden) != 0) goto done;
+    CB_VIEW(normv, "attn_kv_a_norm.weight"); if (glm5next_cpu_vector(&normv, norm, kv) != 0) goto done;
+    glm5next_cpu_rmsnorm(kvl, kvl, norm, kv, c->norm_epsilon);
+    memcpy(latent_cache + (size_t)position*kv, kvl, (size_t)kv*sizeof(float));
+    CB_VIEW(tk, "attn_k_b.weight"); CB_VIEW(to, "attn_output.weight");
+    { qtensor qto = glm5next_as_qtensor(&to);
+      if (upload_weight_matrix(&do_w, &qto, &otype) != 0) goto done; }
+    if (hipMalloc(&dq, (size_t)qdim*sizeof(float)) != hipSuccess || hipMalloc(&dkv, (size_t)kv*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dqcache, (size_t)heads*kv*sizeof(float)) != hipSuccess || hipMalloc(&dkcache, (size_t)nt*kv*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dvcache, (size_t)nt*heads*vdim*sizeof(float)) != hipSuccess || hipMalloc(&dattn, (size_t)heads*vdim*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dout, (size_t)h*sizeof(float)) != hipSuccess || hipMalloc(&dvout, (size_t)vdim*sizeof(float)) != hipSuccess) goto done;
+    if (hipMemcpy(dkcache, latent_cache, (size_t)nt*kv*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    if (hipMemcpy(dkv, latent_cache + (size_t)position*kv, (size_t)kv*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    for (int head = 0; head < heads; ++head) {
+        if (glm5next_cpu_matvec_head(qhead, &tk, head, q + (size_t)head*qdim) != 0) goto done;
+        if (hipMemcpy(dq, q + (size_t)head*qdim, (size_t)qdim*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+        launch_matvec_q8_f32(r, (uint8_t *)dqcache + (size_t)head*kv*sizeof(float),
+                             (uint8_t *)cache->k_weight + (size_t)head*cache->k_stride, dq, kv, qdim);
+        for (int p = 0; p < nt; ++p) {
+            if (hipMemcpy(dkv, latent_cache + (size_t)p*kv, (size_t)kv*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+            launch_matvec_q8_f32(r, dvout, (uint8_t *)cache->v_weight + (size_t)head*cache->v_stride, dkv, vdim, kv);
+            if (hipMemcpy((uint8_t *)dvcache + ((size_t)p*heads + head)*vdim*sizeof(float), dvout,
+                          (size_t)vdim*sizeof(float), hipMemcpyDeviceToDevice) != hipSuccess) goto done;
+        }
+    }
+    if (hipStreamSynchronize(r->stream) != hipSuccess) goto done;
+    { void *args[] = { &dattn, &dqcache, &dkcache, &dvcache, (void *)&heads, (void *)&kv,
+                       (void *)&vdim, (void *)&nt };
+      if (LAUNCH(r->fn_glm5next_dsa_attend_f32, heads, 1, 1, 256, 1, 1, 0, r->stream, args) != hipSuccess) goto done; }
+    launch_matvec_auto(r, dout, do_w, dattn, h, heads*vdim, otype);
+    if (hipStreamSynchronize(r->stream) != hipSuccess || hipMemcpy(out, dout, (size_t)h*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+    rc = 0;
+done:
+    if (do_w) hipFree(do_w); if (dq) hipFree(dq); if (dkv) hipFree(dkv);
+    if (dqcache) hipFree(dqcache); if (dkcache) hipFree(dkcache); if (dvcache) hipFree(dvcache); if (dattn) hipFree(dattn);
+    if (dout) hipFree(dout); if (dvout) hipFree(dvout);
+    free(qr); free(q); free(kvl); free(norm); free(qhead);
+    return rc;
+#undef CB_VIEW
 }
 
 /* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch
@@ -17188,6 +17306,14 @@ void hip_llm_free(hip_llm_runner *r) {
     }
     if (r->stream) hipStreamDestroy(r->stream);
 
+    if (r->glm5next_dsa_gpu) {
+        for (int l = 0; l < r->glm5next.n_layers; ++l) {
+            if (r->glm5next_dsa_gpu[l].k_weight) hipFree(r->glm5next_dsa_gpu[l].k_weight);
+            if (r->glm5next_dsa_gpu[l].v_weight) hipFree(r->glm5next_dsa_gpu[l].v_weight);
+        }
+        free(r->glm5next_dsa_gpu);
+        r->glm5next_dsa_gpu = NULL;
+    }
     if (r->glm5next_cpu) {
         glm5next_cpu_runtime_free(r->glm5next_cpu);
         free(r->glm5next_cpu);

@@ -296,9 +296,14 @@ fail:
 #undef MOE_GET
 }
 
-static inline int glm5next_cpu_dsa_moe_block_cached(const gguf_shards *model,
+typedef int (*glm5next_dsa_callback)(const gguf_shards *model, int layer,
+        const glm5next_config *config, const float *hidden, float *out,
+        float *latent_cache, int max_seq_len, int position, void *opaque);
+
+static inline int glm5next_cpu_dsa_moe_block_cached_cb(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
-        float *latent_cache, int max_seq_len, int position) {
+        float *latent_cache, int max_seq_len, int position,
+        glm5next_dsa_callback callback, void *opaque) {
     int h = c->hidden_size, hc = c->hc_count;
     char name[128]; glm5next_tensor_view fn, base, scale;
     float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
@@ -315,8 +320,10 @@ static inline int glm5next_cpu_dsa_moe_block_cached(const gguf_shards *model,
     if (glm5next_cpu_mhc_pre(c, &fn, &base, &scale, residual, collapsed, post, comb) != 0) goto fail;
     BLOCK_VIEW("attn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
     glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
-    if (glm5next_cpu_dsa_forward_cached(model, layer, c, collapsed, sublayer,
-                                         latent_cache, max_seq_len, position) != 0) goto fail;
+    if ((callback ? callback(model, layer, c, collapsed, sublayer, latent_cache,
+                             max_seq_len, position, opaque)
+                  : glm5next_cpu_dsa_forward_cached(model, layer, c, collapsed,
+                             sublayer, latent_cache, max_seq_len, position)) != 0) goto fail;
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
     memcpy(residual, streams, (size_t)hc * h * sizeof(float));
     BLOCK_VIEW("hc_ffn_fn.weight", fn); BLOCK_VIEW("hc_ffn_base.weight", base); BLOCK_VIEW("hc_ffn_scale.weight", scale);
@@ -329,6 +336,13 @@ static inline int glm5next_cpu_dsa_moe_block_cached(const gguf_shards *model,
 fail:
     free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return -1;
 #undef BLOCK_VIEW
+}
+
+static inline int glm5next_cpu_dsa_moe_block_cached(const gguf_shards *model,
+        int layer, const glm5next_config *c, float *streams,
+        float *latent_cache, int max_seq_len, int position) {
+    return glm5next_cpu_dsa_moe_block_cached_cb(model, layer, c, streams,
+        latent_cache, max_seq_len, position, NULL, NULL);
 }
 
 static inline int glm5next_cpu_dsa_moe_block(const gguf_shards *model,
