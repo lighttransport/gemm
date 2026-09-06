@@ -2123,6 +2123,37 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* ---- 25c. GLM5Next mHC affine/gates/collapse ---- */\n"
+"__global__ void glm5next_mhc_finish_f32(float *collapsed, float *post,\n"
+"    float *comb, float *logits, const float *streams, const float *base,\n"
+"    const float *scale, int hc, int width, float norm_eps, float sink_eps) {\n"
+"    extern __shared__ double mhc_sdata[];\n"
+"    int tid = threadIdx.x;\n"
+"    int mix = (2 + hc) * hc;\n"
+"    double ss = 0.0;\n"
+"    for (int i = tid; i < hc * width; i += blockDim.x) {\n"
+"        double v = (double)streams[i]; ss += v * v;\n"
+"    }\n"
+"    mhc_sdata[tid] = ss; __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) mhc_sdata[tid] += mhc_sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float inv = 1.0f / sqrtf((float)(mhc_sdata[0] / (double)(hc * width)) + norm_eps);\n"
+"    for (int i = tid; i < mix; i += blockDim.x) logits[i] *= inv;\n"
+"    __syncthreads();\n"
+"    for (int i = tid; i < hc; i += blockDim.x) {\n"
+"        logits[i] = 1.0f / (1.0f + expf(-(logits[i] * scale[0] + base[i]))) + sink_eps;\n"
+"        post[i] = 2.0f / (1.0f + expf(-(logits[hc + i] * scale[1] + base[hc + i])));\n"
+"    }\n"
+"    for (int i = tid; i < hc * hc; i += blockDim.x)\n"
+"        comb[i] = logits[2 * hc + i] * scale[2] + base[2 * hc + i];\n"
+"    for (int d = tid; d < width; d += blockDim.x) {\n"
+"        double v = 0.0;\n"
+"        for (int i = 0; i < hc; ++i) v += (double)logits[i] * streams[i * width + d];\n"
+"        collapsed[d] = (float)v;\n"
+"    }\n"
+"}\n"
 "/* ===== Batched SSM aux ops (one launch over M rows) ===== */\n"
 "\n"
 "/* ---- 22b. l2_norm_heads_batch_f32: per-(m,h) RMSNorm over head_dim ----\n"
@@ -8205,6 +8236,7 @@ struct hip_llm_runner {
     hipFunction_t fn_glm5next_kda_heads_step_f32;
     hipFunction_t fn_glm5next_kda_decay_f32;
     hipFunction_t fn_glm5next_dsa_attend_f32;
+    hipFunction_t fn_glm5next_mhc_finish_f32;
     hipFunction_t fn_deltanet_step_batch_f32;
     hipFunction_t fn_l2_norm_heads_batch_f32;
     hipFunction_t fn_repeat_tile_batch_f32;
@@ -8808,6 +8840,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(glm5next_kda_heads_step_f32);
     GET_FUNC(glm5next_kda_decay_f32);
     GET_FUNC(glm5next_dsa_attend_f32);
+    GET_FUNC(glm5next_mhc_finish_f32);
     GET_FUNC(deltanet_step_batch_f32);
     GET_FUNC(l2_norm_heads_batch_f32);
     GET_FUNC(repeat_tile_batch_f32);
@@ -9759,12 +9792,18 @@ done:
 #undef HIP_IDX_VIEW
 }
 
+static inline void launch_glm5next_mhc_finish(hip_llm_runner *r,
+        void *collapsed, void *post, void *comb, void *logits, void *streams,
+        void *base, void *scale, int hc, int width, float norm_eps,
+        float sink_eps);
+
 static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
         const glm5next_config *c, int site, const float *streams,
         float *collapsed, float *post, float *comb, void *opaque) {
     hip_llm_runner *r = (hip_llm_runner *)opaque;
     glm5next_tensor_view fn, base, scale;
-    void *dw = NULL, *dx = NULL, *dy = NULL;
+    void *dw = NULL, *dx = NULL, *dy = NULL, *dbase = NULL, *dscale = NULL;
+    void *dcollapsed = NULL, *dpost = NULL, *dcomb = NULL;
     float *logits = NULL, *base_f = NULL, *scale_f = NULL;
     int wt = 0, rc = -1;
     char n[128];
@@ -9783,20 +9822,41 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
     logits = (float *)malloc((size_t)mix * sizeof(float));
     base_f = (float *)malloc((size_t)mix * sizeof(float));
     scale_f = (float *)malloc(3 * sizeof(float));
-    if (!logits || !base_f || !scale_f || glm5next_cpu_vector(&base, base_f, mix) != 0 ||
+    if (!logits || !base_f || !scale_f ||
+        glm5next_cpu_vector(&base, base_f, mix) != 0 ||
         glm5next_cpu_vector(&scale, scale_f, 3) != 0) goto done;
     if (hipMalloc(&dx, (size_t)hc * width * sizeof(float)) != hipSuccess ||
         hipMalloc(&dy, (size_t)mix * sizeof(float)) != hipSuccess) goto done;
     if (hipMemcpy(dx, streams, (size_t)hc * width * sizeof(float),
                   hipMemcpyHostToDevice) != hipSuccess) goto done;
     launch_matvec_auto(r, dy, dw, dx, mix, hc * width, wt);
-    if (hipStreamSynchronize(r->stream) != hipSuccess ||
-        hipMemcpy(logits, dy, (size_t)mix * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
-    if (glm5next_cpu_mhc_finish(c, streams, logits, base_f, scale_f,
-                                collapsed, post, comb) != 0) goto done;
+    if (getenv("GLM5NEXT_HIP_MHC_FINISH") &&
+        atoi(getenv("GLM5NEXT_HIP_MHC_FINISH")) != 0) {
+        if (glm5next_upload_f32_view(&dbase, &base) != 0 ||
+            glm5next_upload_f32_view(&dscale, &scale) != 0 ||
+            hipMalloc(&dcollapsed, (size_t)width * sizeof(float)) != hipSuccess ||
+            hipMalloc(&dpost, (size_t)hc * sizeof(float)) != hipSuccess ||
+            hipMalloc(&dcomb, (size_t)hc * hc * sizeof(float)) != hipSuccess) goto done;
+        launch_glm5next_mhc_finish(r, dcollapsed, dpost, dcomb, dy, dx,
+                                   dbase, dscale, hc, width, c->norm_epsilon,
+                                   c->hc_sinkhorn_epsilon);
+        if (hipStreamSynchronize(r->stream) != hipSuccess ||
+            hipMemcpy(collapsed, dcollapsed, (size_t)width * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
+            hipMemcpy(post, dpost, (size_t)hc * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
+            hipMemcpy(comb, dcomb, (size_t)hc * hc * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+        glm5next_mhc_sinkhorn(comb, hc, c->hc_sinkhorn_iterations,
+                              c->hc_sinkhorn_epsilon);
+    } else {
+        if (hipStreamSynchronize(r->stream) != hipSuccess ||
+            hipMemcpy(logits, dy, (size_t)mix * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
+            glm5next_cpu_mhc_finish(c, streams, logits, base_f, scale_f,
+                                    collapsed, post, comb) != 0) goto done;
+    }
     rc = 0;
 done:
     if (dw) hipFree(dw); if (dx) hipFree(dx); if (dy) hipFree(dy);
+    if (dbase) hipFree(dbase); if (dscale) hipFree(dscale);
+    if (dcollapsed) hipFree(dcollapsed); if (dpost) hipFree(dpost); if (dcomb) hipFree(dcomb);
     free(logits); free(base_f); free(scale_f);
     return rc;
 }
@@ -11583,6 +11643,16 @@ static inline void launch_rmsnorm(hip_llm_runner *r, void *dst, void *x,
                                    void *w, int n, float eps) {
     void *args[] = { &dst, &x, &w, &n, &eps };
     LAUNCH(r->fn_rmsnorm_f32, 1, 1, 1, 256, 1, 1, 256 * sizeof(float), r->stream, args);
+}
+
+static inline void launch_glm5next_mhc_finish(hip_llm_runner *r,
+        void *collapsed, void *post, void *comb, void *logits, void *streams,
+        void *base, void *scale, int hc, int width, float norm_eps,
+        float sink_eps) {
+    void *args[] = { &collapsed, &post, &comb, &logits, &streams, &base,
+                     &scale, &hc, &width, &norm_eps, &sink_eps };
+    LAUNCH(r->fn_glm5next_mhc_finish_f32, 1, 1, 1, 256, 1, 1,
+           256 * sizeof(double), r->stream, args);
 }
 
 /* Batched RMSNorm: one block per row, n_rows blocks. row_stride = n unless padded. */
