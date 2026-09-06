@@ -10577,6 +10577,24 @@ void hip_llm_load_options_default(hip_llm_load_options *options) {
 }
 
 int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
+    if (!r || !gguf) return -1;
+
+    /* GLM5Next uses the shard-aware tensor lookup because its large MoE
+     * checkpoints are normally split.  A complete single-file GGUF should
+     * still work through the legacy public API: wrap the caller-owned
+     * context, without transferring ownership, for the duration of load. */
+    if (glm5next_is_arch(gguf)) {
+        gguf_shards one = {
+            .n_shards = 1,
+            .shards = &gguf,
+            .metadata = gguf,
+        };
+        hllm_active_shards = &one;
+        int rc = hip_llm_load_weights_impl(r, gguf, max_seq_len);
+        hllm_active_shards = NULL;
+        return rc;
+    }
+
     hllm_active_shards = NULL;
     return hip_llm_load_weights_impl(r, gguf, max_seq_len);
 }
