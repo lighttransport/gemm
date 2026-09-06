@@ -9986,8 +9986,8 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                          r->glm5next_layout.mhc_bytes) / (1024.0 * 1024.0));
         fprintf(stderr,
                 "hip_llm: GLM5Next NextN weights validated (%d layer%s); "
-                "speculative NextN graph is unavailable, using trunk CPU reference "
-                "with persistent KDA state\n",
+                "NextN API is available; using trunk CPU reference with persistent "
+                "KDA state\n",
                 r->glm5next.n_nextn_layers,
                 r->glm5next.n_nextn_layers == 1 ? "" : "s");
         if (!hllm_active_shards) return -1;
