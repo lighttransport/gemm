@@ -22,7 +22,7 @@ HIPBLASLT ?= 1
 # Target
 TARGET = test_hip_llm
 
-.PHONY: all clean run api cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-hip-kda help
+.PHONY: all clean run api cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-hip-kda help
 
 all: $(TARGET)
 
@@ -54,6 +54,11 @@ glm5next-ref: test_glm5next_ref
 
 glm5next-cpu-kda: test_glm5next_cpu_kda
 
+glm5next-cpu-full: test_glm5next_cpu_full
+
+test_glm5next_cpu_full: test_glm5next_cpu_full.c ../../common/glm5next_cpu_kda.h
+	$(CC) -O2 -Wall -Wextra -Wpedantic -I.. -o $@ $< -lm
+
 glm5next-hip-kda: $(TARGET)
 	./$(TARGET) --verify-glm5next-kda 128
 
@@ -70,7 +75,7 @@ bench_cpu_qwen_expert: bench_cpu_qwen_expert.c
 	$(CC) -O3 -Wall -Wextra -march=native -fopenmp -o $@ $< -ldl -lm
 
 clean:
-	rm -f $(TARGET) bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda mm_blaslt_bridge.o
+	rm -f $(TARGET) bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full mm_blaslt_bridge.o
 
 help:
 	@echo "HIP LLM Runner (HIPRTC-based, no hipcc needed)"

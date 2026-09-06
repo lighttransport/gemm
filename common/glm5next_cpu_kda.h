@@ -256,6 +256,44 @@ fail:
 #undef BLOCK_VIEW
 }
 
+static inline int glm5next_cpu_kda_forward(const gguf_shards *model,
+        int layer, const glm5next_config *c, const float *hidden, float *out,
+        float *recurrent, float *conv_state);
+
+static inline int glm5next_cpu_kda_moe_block(const gguf_shards *model,
+        int layer, const glm5next_config *c, float *streams,
+        float *recurrent, float *conv_state) {
+    int h = c->hidden_size, hc = c->hc_count;
+    char name[128]; glm5next_tensor_view fn, base, scale;
+    float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
+    float *collapsed = (float *)malloc((size_t)h * sizeof(float));
+    float *sublayer = (float *)malloc((size_t)h * sizeof(float));
+    float *post = (float *)malloc((size_t)hc * sizeof(float));
+    float *comb = (float *)malloc((size_t)hc * hc * sizeof(float));
+    float *norm = (float *)malloc((size_t)h * sizeof(float));
+    if (!residual || !collapsed || !sublayer || !post || !comb || !norm) goto fail;
+    memcpy(residual, streams, (size_t)hc * h * sizeof(float));
+#define KM_VIEW(s, dst) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
+    if (glm5next_tensor_view_get(model, name, 1, &(dst)) != 0) goto fail; } while (0)
+    KM_VIEW("hc_attn_fn.weight", fn); KM_VIEW("hc_attn_base.weight", base); KM_VIEW("hc_attn_scale.weight", scale);
+    if (glm5next_cpu_mhc_pre(c, &fn, &base, &scale, residual, collapsed, post, comb) != 0) goto fail;
+    KM_VIEW("attn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
+    glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
+    if (glm5next_cpu_kda_forward(model, layer, c, collapsed, sublayer, recurrent, conv_state) != 0) goto fail;
+    glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
+    memcpy(residual, streams, (size_t)hc * h * sizeof(float));
+    KM_VIEW("hc_ffn_fn.weight", fn); KM_VIEW("hc_ffn_base.weight", base); KM_VIEW("hc_ffn_scale.weight", scale);
+    if (glm5next_cpu_mhc_pre(c, &fn, &base, &scale, residual, collapsed, post, comb) != 0) goto fail;
+    KM_VIEW("ffn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
+    glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
+    if (glm5next_cpu_moe_ffn(model, layer, c, collapsed, sublayer) != 0) goto fail;
+    glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
+    free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return 0;
+fail:
+    free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return -1;
+#undef KM_VIEW
+}
+
 /* Execute one recurrent KDA layer from the real GGUF views.  State layouts
  * are contiguous by layer and owned by the caller.  This is deliberately a
  * reference implementation: each quantized matrix row is dequantized before
