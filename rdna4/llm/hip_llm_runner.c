@@ -1951,6 +1951,33 @@ static const char *hip_kernel_source =
 "    out[(size_t)h * head_dim + j] = y * rsqrtf((float)head_dim);\n"
 "}\n"
 "\n"
+"/* Causal absorbed-DSA attention over shared latent keys and per-head values. */\n"
+"__global__ void glm5next_dsa_attend_f32(\n"
+"    float *out, const float *q, const float *kcache, const float *vcache,\n"
+"    int n_heads, int kv_dim, int value_dim, int n_tokens) {\n"
+"    int h = blockIdx.x, j = threadIdx.x;\n"
+"    if (h >= n_heads || j >= value_dim) return;\n"
+"    const float *qh = q + (size_t)h * kv_dim;\n"
+"    float max_score = -3.402823466e+38f;\n"
+"    for (int p = 0; p < n_tokens; ++p) {\n"
+"        const float *kp = kcache + (size_t)p * kv_dim;\n"
+"        float score = 0.0f;\n"
+"        for (int d = 0; d < kv_dim; ++d) score += qh[d] * kp[d];\n"
+"        score *= rsqrtf(256.0f);\n"
+"        if (score > max_score) max_score = score;\n"
+"    }\n"
+"    float denom = 0.0f, value = 0.0f;\n"
+"    for (int p = 0; p < n_tokens; ++p) {\n"
+"        const float *kp = kcache + (size_t)p * kv_dim;\n"
+"        float score = 0.0f;\n"
+"        for (int d = 0; d < kv_dim; ++d) score += qh[d] * kp[d];\n"
+"        float w = expf(score * rsqrtf(256.0f) - max_score);\n"
+"        denom += w;\n"
+"        value += w * vcache[((size_t)p * n_heads + h) * value_dim + j];\n"
+"    }\n"
+"    out[(size_t)h * value_dim + j] = value / denom;\n"
+"}\n"
+"\n"
 "/* ---- 24b. deltanet_step_batch_f32: M sequential steps fused in one kernel ----\n"
 " * Each thread r owns row r of the state matrix; the row is loaded into\n"
 " * registers ONCE at the start, mutated through M token steps, written back\n"
@@ -8130,6 +8157,7 @@ struct hip_llm_runner {
     hipFunction_t fn_deltanet_step_f32;
     hipFunction_t fn_glm5next_kda_step_f32;
     hipFunction_t fn_glm5next_kda_heads_step_f32;
+    hipFunction_t fn_glm5next_dsa_attend_f32;
     hipFunction_t fn_deltanet_step_batch_f32;
     hipFunction_t fn_l2_norm_heads_batch_f32;
     hipFunction_t fn_repeat_tile_batch_f32;
@@ -8725,6 +8753,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(deltanet_step_f32);
     GET_FUNC(glm5next_kda_step_f32);
     GET_FUNC(glm5next_kda_heads_step_f32);
+    GET_FUNC(glm5next_dsa_attend_f32);
     GET_FUNC(deltanet_step_batch_f32);
     GET_FUNC(l2_norm_heads_batch_f32);
     GET_FUNC(repeat_tile_batch_f32);
@@ -14022,6 +14051,60 @@ done:
     if (dv) hipFree(dv); if (dd) hipFree(dd); if (db) hipFree(db);
     free(state); free(ref_state); free(q); free(k); free(v); free(decay); free(beta);
     free(out); free(ref_out); free(work); return rc;
+}
+
+int hip_llm_verify_glm5next_dsa_attention(hip_llm_runner *r, int n_heads,
+                                          int kv_dim, int value_dim, int n_tokens,
+                                          double *out_rel_l2, double *out_max_abs) {
+    if (!r || !r->fn_glm5next_dsa_attend_f32 || n_heads < 1 || n_heads > 64 ||
+        kv_dim < 1 || kv_dim > 1024 || value_dim < 1 || value_dim > 256 ||
+        n_tokens < 1 || n_tokens > 4096) return -1;
+    size_t qn = (size_t)n_heads * kv_dim;
+    size_t kn = (size_t)n_tokens * kv_dim;
+    size_t vn = (size_t)n_tokens * n_heads * value_dim;
+    size_t on = (size_t)n_heads * value_dim;
+    float *q = (float *)malloc(qn * sizeof(float));
+    float *kc = (float *)malloc(kn * sizeof(float));
+    float *vc = (float *)malloc(vn * sizeof(float));
+    float *out = (float *)malloc(on * sizeof(float));
+    float *ref = (float *)malloc(on * sizeof(float));
+    if (!q || !kc || !vc || !out || !ref) { free(q); free(kc); free(vc); free(out); free(ref); return -2; }
+    uint32_t seed = 0x51a7e3d1u;
+    for (size_t i = 0; i < qn + kn + vn; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        float x = ((float)(seed >> 8) * (1.0f / 16777216.0f) - 0.5f) * 0.3f;
+        if (i < qn) q[i] = x; else if (i < qn + kn) kc[i - qn] = x; else vc[i - qn - kn] = x;
+    }
+    for (int h = 0; h < n_heads; ++h) {
+        float max_s = -INFINITY; float *scores = (float *)malloc((size_t)n_tokens * sizeof(float));
+        if (!scores) { free(q); free(kc); free(vc); free(out); free(ref); return -2; }
+        for (int p = 0; p < n_tokens; ++p) {
+            double s = 0.0; for (int d = 0; d < kv_dim; ++d) s += (double)q[(size_t)h * kv_dim + d] * kc[(size_t)p * kv_dim + d];
+            scores[p] = (float)(s / sqrt(256.0)); if (scores[p] > max_s) max_s = scores[p];
+        }
+        double denom = 0.0; for (int p = 0; p < n_tokens; ++p) denom += exp((double)scores[p] - max_s);
+        for (int j = 0; j < value_dim; ++j) {
+            double y = 0.0;
+            for (int p = 0; p < n_tokens; ++p) y += exp((double)scores[p] - max_s) / denom * vc[((size_t)p * n_heads + h) * value_dim + j];
+            ref[(size_t)h * value_dim + j] = (float)y;
+        }
+        free(scores);
+    }
+    void *dq = NULL, *dk = NULL, *dv = NULL, *do_ = NULL; int rc = -2;
+    if (hipMalloc(&dq, qn * sizeof(float)) != hipSuccess || hipMalloc(&dk, kn * sizeof(float)) != hipSuccess ||
+        hipMalloc(&dv, vn * sizeof(float)) != hipSuccess || hipMalloc(&do_, on * sizeof(float)) != hipSuccess) goto done;
+    if (hipMemcpy(dq, q, qn*sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(dk, kc, kn*sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(dv, vc, vn*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    { void *args[] = { &do_, &dq, &dk, &dv, &n_heads, &kv_dim, &value_dim, &n_tokens };
+      if (LAUNCH(r->fn_glm5next_dsa_attend_f32, n_heads, 1, 1, 256, 1, 1, 0, r->stream, args) != hipSuccess) goto done; }
+    if (hipStreamSynchronize(r->stream) != hipSuccess || hipMemcpy(out, do_, on*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+    { double num=0.0, den=0.0, mx=0.0; for (size_t i=0;i<on;++i) { double d=(double)out[i]-ref[i]; num+=d*d; den+=(double)ref[i]*ref[i]; if(fabs(d)>mx)mx=fabs(d); }
+      if(out_rel_l2)*out_rel_l2=den>0.0?sqrt(num/den):sqrt(num); if(out_max_abs)*out_max_abs=mx; }
+    rc = 0;
+done:
+    if (dq) hipFree(dq); if (dk) hipFree(dk); if (dv) hipFree(dv); if (do_) hipFree(do_);
+    free(q); free(kc); free(vc); free(out); free(ref); return rc;
 }
 
 /* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch
