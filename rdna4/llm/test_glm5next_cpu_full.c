@@ -11,6 +11,7 @@
 #define GGML_DEQUANT_IMPLEMENTATION
 #include "../../common/ggml_dequant.h"
 #include "../../common/glm5next_cpu_kda.h"
+#include "../../common/glm5next_cpu_runtime.h"
 
 int main(int argc, char **argv) {
     if (argc != 2) { fprintf(stderr, "usage: %s MODEL.gguf\n", argv[0]); return 2; }

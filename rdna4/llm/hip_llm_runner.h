@@ -85,6 +85,9 @@ int hip_llm_verify_glm5next_kda_heads(hip_llm_runner *r, int n_heads, int head_d
 int hip_llm_verify_glm5next_dsa_attention(hip_llm_runner *r, int n_heads,
                                           int kv_dim, int value_dim, int n_tokens,
                                           double *out_rel_l2, double *out_max_abs);
+int hip_llm_verify_glm5next_model_matvec(hip_llm_runner *r, gguf_shards *model,
+                                         int layer, double *out_rel_l2,
+                                         double *out_max_abs);
 
 /* Load Qwen3 dense weights from a safetensors file (text-encoder path). */
 int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_path, int max_seq_len);

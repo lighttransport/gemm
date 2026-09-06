@@ -14107,6 +14107,55 @@ done:
     free(q); free(kc); free(vc); free(out); free(ref); return rc;
 }
 
+static qtensor glm5next_as_qtensor(const glm5next_tensor_view *v) {
+    qtensor t; memset(&t, 0, sizeof(t));
+    t.data = v->data; t.type = v->type; t.n_dims = v->n_dims;
+    for (uint32_t i = 0; i < v->n_dims && i < 4; ++i) t.dims[i] = v->dims[i];
+    t.n_cols = v->n_dims > 0 ? (int)v->dims[0] : 0;
+    t.n_rows = v->n_dims > 1 ? (int)v->dims[1] : 1;
+    return t;
+}
+
+int hip_llm_verify_glm5next_model_matvec(hip_llm_runner *r, gguf_shards *model,
+                                         int layer, double *out_rel_l2,
+                                         double *out_max_abs) {
+    if (!r || !model || layer < 0 || layer >= 45) return -1;
+    const char *names[] = { "attn_q.weight", "attn_k.weight", "attn_v.weight" };
+    double total_num = 0.0, total_den = 0.0, global_max = 0.0;
+    uint32_t seed = 0x9e3779b9u;
+    float *x = (float *)malloc(4096 * sizeof(float));
+    if (!x) return -2;
+    for (int i = 0; i < 4096; ++i) { seed = seed * 1664525u + 1013904223u; x[i] = ((float)(seed >> 8) * (1.0f / 16777216.0f) - 0.5f) * 0.2f; }
+    int rc = 0;
+    for (int n = 0; n < 3; ++n) {
+        char name[128]; snprintf(name, sizeof(name), "blk.%d.%s", layer, names[n]);
+        glm5next_tensor_view v;
+        if (glm5next_tensor_view_get(model, name, 1, &v) != 0 || v.n_dims != 2) { rc = -1; break; }
+        qtensor qt = glm5next_as_qtensor(&v);
+        float *ref = (float *)malloc((size_t)qt.n_rows * sizeof(float));
+        float *got = (float *)malloc((size_t)qt.n_rows * sizeof(float));
+        void *dw = NULL, *dx = NULL, *dy = NULL; int type = 0;
+        if (!ref || !got || upload_weight_matrix(&dw, &qt, &type) != 0 ||
+            hipMalloc(&dx, 4096 * sizeof(float)) != hipSuccess ||
+            hipMalloc(&dy, (size_t)qt.n_rows * sizeof(float)) != hipSuccess) {
+            free(ref); free(got); if (dw) hipFree(dw); if (dx) hipFree(dx); if (dy) hipFree(dy); rc = -2; break;
+        }
+        if (hipMemcpy(dx, x, 4096 * sizeof(float), hipMemcpyHostToDevice) != hipSuccess) rc = -2;
+        if (!rc) {
+            launch_matvec_auto(r, dy, dw, dx, qt.n_rows, qt.n_cols, type);
+            if (hipStreamSynchronize(r->stream) != hipSuccess || hipMemcpy(got, dy, (size_t)qt.n_rows*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) rc = -2;
+        }
+        if (!rc && glm5next_cpu_matvec(ref, &v, x) != 0) rc = -1;
+        if (!rc) for (int i = 0; i < qt.n_rows; ++i) { double d = (double)got[i] - ref[i]; total_num += d*d; total_den += (double)ref[i]*ref[i]; if (fabs(d) > global_max) global_max = fabs(d); }
+        free(ref); free(got); if (dw) hipFree(dw); if (dx) hipFree(dx); if (dy) hipFree(dy);
+        if (rc) break;
+    }
+    free(x);
+    if (out_rel_l2) *out_rel_l2 = total_den > 0.0 ? sqrt(total_num / total_den) : sqrt(total_num);
+    if (out_max_abs) *out_max_abs = global_max;
+    return rc;
+}
+
 /* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch
  * [M, n_embd] (pre-normed). Adds the MoE output into r->d_x_batch (residual).
  * Experts are grouped by token: router GEMM -> host top-K -> gather by expert ->
