@@ -71,8 +71,11 @@ Resume the returned thread id with `codex exec resume --skip-git-repo-check
 --json THREAD_ID PROMPT`. The second prompt changes the upper bound to 20;
 the third requests the sum of squares from 1 through 20. Generated programs
 were compiled with `cc -Wall -Wextra -Werror` and checked for results 55,
-210, and 2870. These are conversational code-generation tests, not autonomous
-tool-execution tests. The HTTP shim does not yet implement tool-call transport.
+210, and 2870. The HTTP shim also translates Qwen XML tool calls into native
+Responses/Chat Completions tool-call items. With the live server,
+`codex exec` successfully emitted a namespaced shell call, executed
+`find . -maxdepth 1 -mindepth 1 -type d | wc -l` in read-only mode, and
+received `21`.
 
 Representative single first-turn measurements (not a statistical benchmark):
 
@@ -90,5 +93,5 @@ Short/suffix-prefill throughput should not be compared directly with the
 long initial prompt. Fast runs that omitted experts or returned malformed
 code are not valid decode-performance baselines.
 
-Remaining work includes autonomous tool-call support, request-owned concurrent
-cancellation, longer-context validation, and further decode optimization.
+Remaining work includes request-owned concurrent cancellation, longer-context
+validation, and further decode optimization.
