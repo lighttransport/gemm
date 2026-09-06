@@ -211,6 +211,97 @@ static inline glm5next_layer_kind glm5next_layer_type(const glm5next_config *c, 
         ? GLM5NEXT_LAYER_KDA : GLM5NEXT_LAYER_DSA;
 }
 
+static inline int glm5next_tensor_present(const gguf_shards *model, const char *name) {
+    return model && name && gguf_shards_find_tensor(model, name, NULL, NULL) == 0;
+}
+
+/* Validate the tensor-name contract without touching tensor payloads.  This is
+ * intentionally separate from config_load so CPU/HIP loaders can fail before
+ * allocating large activation or expert buffers. */
+static inline int glm5next_validate_tensors(const gguf_shards *model,
+                                            const glm5next_config *c,
+                                            char *err, size_t err_cap) {
+    char name[128];
+    const char *common[] = { "token_embd.weight", "output_norm.weight", "output.weight" };
+    int i, l;
+    if (err && err_cap) err[0] = '\0';
+    if (!model || !c) return -1;
+    for (i = 0; i < (int)(sizeof(common) / sizeof(common[0])); ++i) {
+        if (!glm5next_tensor_present(model, common[i])) {
+            if (err && err_cap) snprintf(err, err_cap, "missing tensor %s", common[i]);
+            return -1;
+        }
+    }
+    for (l = 0; l < c->n_layers; ++l) {
+        const char *attn[] = {
+            "attn_norm.weight", "attn_output.weight", "ffn_norm.weight",
+            "hc_attn_fn.weight", "hc_attn_base.weight", "hc_attn_scale.weight",
+            "hc_ffn_fn.weight", "hc_ffn_base.weight", "hc_ffn_scale.weight"
+        };
+        for (i = 0; i < (int)(sizeof(attn) / sizeof(attn[0])); ++i) {
+            snprintf(name, sizeof(name), "blk.%d.%s", l, attn[i]);
+            if (!glm5next_tensor_present(model, name)) {
+                if (err && err_cap) snprintf(err, err_cap, "missing tensor %s", name);
+                return -1;
+            }
+        }
+        if (l < c->first_k_dense_replace) {
+            const char *dense[] = { "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight" };
+            for (i = 0; i < (int)(sizeof(dense) / sizeof(dense[0])); ++i) {
+                snprintf(name, sizeof(name), "blk.%d.%s", l, dense[i]);
+                if (!glm5next_tensor_present(model, name)) {
+                    if (err && err_cap) snprintf(err, err_cap, "missing tensor %s", name);
+                    return -1;
+                }
+            }
+        } else {
+            const char *moe[] = {
+                "ffn_gate_inp.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight",
+                "ffn_down_exps.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                "ffn_down_shexp.weight", "exp_probs_b.bias"
+            };
+            for (i = 0; i < (int)(sizeof(moe) / sizeof(moe[0])); ++i) {
+                snprintf(name, sizeof(name), "blk.%d.%s", l, moe[i]);
+                if (!glm5next_tensor_present(model, name)) {
+                    if (err && err_cap) snprintf(err, err_cap, "missing tensor %s", name);
+                    return -1;
+                }
+            }
+        }
+        if (glm5next_layer_type(c, l) == GLM5NEXT_LAYER_KDA) {
+            const char *kda[] = {
+                "ssm_a", "ssm_beta.weight", "ssm_conv1d_q.weight",
+                "ssm_conv1d_k.weight", "ssm_conv1d_v.weight", "ssm_dt.bias",
+                "ssm_f_a.weight", "ssm_f_b.weight", "ssm_g_a.weight",
+                "ssm_g_b.weight", "ssm_norm.weight"
+            };
+            for (i = 0; i < (int)(sizeof(kda) / sizeof(kda[0])); ++i) {
+                snprintf(name, sizeof(name), "blk.%d.%s", l, kda[i]);
+                if (!glm5next_tensor_present(model, name)) {
+                    if (err && err_cap) snprintf(err, err_cap, "missing tensor %s", name);
+                    return -1;
+                }
+            }
+        } else {
+            const char *dsa[] = {
+                "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
+                "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight", "attn_k_b.weight",
+                "attn_v_b.weight", "indexer.attn_k.weight", "indexer.attn_q_b.weight",
+                "indexer.k_norm.weight", "indexer.k_norm.bias", "indexer.proj.weight",
+                "indexer_compressor_ape.weight", "indexer_compressor_gate.weight"
+            };
+            for (i = 0; i < (int)(sizeof(dsa) / sizeof(dsa[0])); ++i) {
+                snprintf(name, sizeof(name), "blk.%d.%s", l, dsa[i]);
+                if (!glm5next_tensor_present(model, name)) {
+                    if (err && err_cap) snprintf(err, err_cap, "missing tensor %s", name);
+                    return -1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static inline int glm5next_state_layout_compute(const glm5next_config *c, int max_seq_len,
                                                 glm5next_state_layout *out) {
     size_t n;

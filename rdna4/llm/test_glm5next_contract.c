@@ -8,33 +8,42 @@
 #include "../../common/glm5next.h"
 
 int main(int argc, char **argv) {
-    gguf_context *model;
+    gguf_shards *model;
     glm5next_config config;
     glm5next_state_layout layout;
     char error[160];
     int max_seq = 4096;
     int kda = 0, dsa = 0, i;
+    uint64_t tensor_count = 0;
 
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL.gguf [max_seq_len]\n", argv[0]);
         return 2;
     }
     if (argc > 2) max_seq = atoi(argv[2]);
-    model = gguf_open_multi(argv[1], 3);
+    model = gguf_open_shards(argv[1], 2);
     if (!model) {
         fprintf(stderr, "failed to open GGUF shards: %s\n", argv[1]);
         return 1;
     }
     memset(&config, 0, sizeof(config));
-    if (glm5next_config_load(model, &config, error, sizeof(error)) != 0) {
+    if (glm5next_config_load(model->metadata, &config, error, sizeof(error)) != 0) {
         fprintf(stderr, "GLM5Next contract: FAIL: %s\n", error);
-        gguf_close(model);
+        gguf_close_shards(model);
         return 1;
     }
+    if (glm5next_validate_tensors(model, &config, error, sizeof(error)) != 0) {
+        fprintf(stderr, "GLM5Next tensors: FAIL: %s\n", error);
+        glm5next_config_free(&config);
+        gguf_close_shards(model);
+        return 1;
+    }
+    for (i = 0; i < model->n_shards; ++i)
+        tensor_count += model->shards[i]->n_tensors;
     if (glm5next_state_layout_compute(&config, max_seq, &layout) != 0) {
         fprintf(stderr, "GLM5Next state layout: FAIL\n");
         glm5next_config_free(&config);
-        gguf_close(model);
+        gguf_close_shards(model);
         return 1;
     }
     for (i = 0; i < config.n_layers; ++i) {
@@ -43,7 +52,7 @@ int main(int argc, char **argv) {
     }
     printf("GLM5NEXT_CONTRACT PASS\n");
     printf("  shards=%u tensors=%llu layers=%d nextn=%d hidden=%d vocab=%d context=%d\n",
-           model->n_shards, (unsigned long long)model->n_tensors,
+           model->n_shards, (unsigned long long)tensor_count,
            config.n_layers, config.n_nextn_layers, config.hidden_size,
            config.vocab_size, config.context_length);
     printf("  schedule kda=%d dsa=%d heads=%d q_lora=%d kv_lora=%d nope=%d value=%d\n",
@@ -61,6 +70,6 @@ int main(int argc, char **argv) {
            (double)layout.latent_kv_bytes / (1024.0 * 1024.0),
            (double)layout.indexer_bytes / (1024.0 * 1024.0));
     glm5next_config_free(&config);
-    gguf_close(model);
+    gguf_close_shards(model);
     return 0;
 }

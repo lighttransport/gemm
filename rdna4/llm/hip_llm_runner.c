@@ -9412,6 +9412,13 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
             fprintf(stderr, "hip_llm: invalid GLM5Next model: %s\n", error);
             return -1;
         }
+        if (hllm_active_shards &&
+            glm5next_validate_tensors(hllm_active_shards, &r->glm5next,
+                                      error, sizeof(error)) != 0) {
+            fprintf(stderr, "hip_llm: invalid GLM5Next tensor set: %s\n", error);
+            glm5next_config_free(&r->glm5next);
+            return -1;
+        }
         if (max_seq_len > r->glm5next.context_length && r->glm5next.context_length > 0)
             max_seq_len = r->glm5next.context_length;
         if (glm5next_state_layout_compute(&r->glm5next, max_seq_len,
@@ -10177,6 +10184,10 @@ int hip_llm_glm5next_inspect(gguf_shards *model, glm5next_config *config,
     }
     if (glm5next_config_load(model->metadata, config, error, error_cap) != 0)
         return -1;
+    if (glm5next_validate_tensors(model, config, error, error_cap) != 0) {
+        glm5next_config_free(config);
+        return -1;
+    }
     ctx = config->context_length;
     if (max_seq_len <= 0) max_seq_len = ctx > 0 ? ctx : 1024;
     if (ctx > 0 && max_seq_len > ctx) max_seq_len = ctx;
