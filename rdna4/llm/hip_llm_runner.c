@@ -9654,12 +9654,57 @@ done:
 #undef HIP_IDX_ALLOC
 #undef HIP_IDX_VIEW
 }
+
+static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
+        const glm5next_config *c, int site, const float *streams,
+        float *collapsed, float *post, float *comb, void *opaque) {
+    hip_llm_runner *r = (hip_llm_runner *)opaque;
+    glm5next_tensor_view fn, base, scale;
+    void *dw = NULL, *dx = NULL, *dy = NULL;
+    float *logits = NULL, *base_f = NULL, *scale_f = NULL;
+    int wt = 0, rc = -1;
+    char n[128];
+    const char *suffix = site == 0 ? "hc_attn" : "hc_ffn";
+    if (!r || !model || !c || !streams || !collapsed || !post || !comb ||
+        (site != 0 && site != 1)) return -1;
+    snprintf(n, sizeof(n), "blk.%d.%s_fn.weight", layer, suffix);
+    if (glm5next_tensor_view_get(model, n, 1, &fn) != 0) goto done;
+    snprintf(n, sizeof(n), "blk.%d.%s_base.weight", layer, suffix);
+    if (glm5next_tensor_view_get(model, n, 1, &base) != 0) goto done;
+    snprintf(n, sizeof(n), "blk.%d.%s_scale.weight", layer, suffix);
+    if (glm5next_tensor_view_get(model, n, 1, &scale) != 0) goto done;
+    { qtensor qfn = glm5next_as_qtensor(&fn);
+      if (upload_weight_matrix(&dw, &qfn, &wt) != 0) goto done; }
+    int hc = c->hc_count, width = c->hidden_size, mix = (2 + hc) * hc;
+    logits = (float *)malloc((size_t)mix * sizeof(float));
+    base_f = (float *)malloc((size_t)mix * sizeof(float));
+    scale_f = (float *)malloc(3 * sizeof(float));
+    if (!logits || !base_f || !scale_f || glm5next_cpu_vector(&base, base_f, mix) != 0 ||
+        glm5next_cpu_vector(&scale, scale_f, 3) != 0) goto done;
+    if (hipMalloc(&dx, (size_t)hc * width * sizeof(float)) != hipSuccess ||
+        hipMalloc(&dy, (size_t)mix * sizeof(float)) != hipSuccess) goto done;
+    if (hipMemcpy(dx, streams, (size_t)hc * width * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess) goto done;
+    launch_matvec_auto(r, dy, dw, dx, mix, hc * width, wt);
+    if (hipStreamSynchronize(r->stream) != hipSuccess ||
+        hipMemcpy(logits, dy, (size_t)mix * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+    if (glm5next_cpu_mhc_finish(c, streams, logits, base_f, scale_f,
+                                collapsed, post, comb) != 0) goto done;
+    rc = 0;
+done:
+    if (dw) hipFree(dw); if (dx) hipFree(dx); if (dy) hipFree(dy);
+    free(logits); free(base_f); free(scale_f);
+    return rc;
+}
 static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         float *recurrent, float *conv_state, void *opaque);
 static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         void *opaque);
+static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
+        const glm5next_config *config, int site, const float *streams,
+        float *collapsed, float *post, float *comb, void *opaque);
 static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
 
@@ -9756,6 +9801,11 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                 glm5next_hip_moe_callback, r);
             fprintf(stderr, "hip_llm: GLM5Next HIP MoE callback enabled "
                             "(streams selected experts per token)\n");
+        }
+        if (getenv("GLM5NEXT_HIP_MHC") && atoi(getenv("GLM5NEXT_HIP_MHC")) != 0) {
+            glm5next_cpu_runtime_set_mhc_callback(r->glm5next_cpu,
+                glm5next_hip_mhc_callback, r);
+            fprintf(stderr, "hip_llm: GLM5Next HIP mHC projection callback enabled\n");
         }
         r->has_lm_head = 1;
         r->weights_loaded = 1;

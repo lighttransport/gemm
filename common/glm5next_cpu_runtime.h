@@ -22,6 +22,8 @@ typedef struct {
     void *kda_callback_opaque;
     glm5next_moe_callback moe_callback;
     void *moe_callback_opaque;
+    glm5next_mhc_callback mhc_callback;
+    void *mhc_callback_opaque;
     float *indexer_keys;
     float *indexer_gates;
 } glm5next_cpu_runtime;
@@ -45,6 +47,13 @@ static inline void glm5next_cpu_runtime_set_moe_callback(glm5next_cpu_runtime *r
     if (!r) return;
     r->moe_callback = callback;
     r->moe_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_mhc_callback(glm5next_cpu_runtime *r,
+        glm5next_mhc_callback callback, void *opaque) {
+    if (!r) return;
+    r->mhc_callback = callback;
+    r->mhc_callback_opaque = opaque;
 }
 
 static inline void glm5next_cpu_runtime_free(glm5next_cpu_runtime *r) {
@@ -130,17 +139,18 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
             rc = l < r->config.first_k_dense_replace
                 ? glm5next_cpu_kda_dense_block_cb(r->model, l, &r->config, r->streams, rs, cs,
                     r->kda_callback, r->moe_callback, r->kda_callback_opaque,
-                    r->moe_callback_opaque)
+                    r->moe_callback_opaque, r->mhc_callback, r->mhc_callback_opaque)
                 : glm5next_cpu_kda_moe_block_cb(r->model, l, &r->config, r->streams, rs, cs,
                     r->kda_callback, r->moe_callback, r->kda_callback_opaque,
-                    r->moe_callback_opaque);
+                    r->moe_callback_opaque, r->mhc_callback, r->mhc_callback_opaque);
         } else {
             float *cache = r->latent_kv + (size_t)l * r->max_seq_len * r->config.kv_lora_rank;
             rc = glm5next_cpu_dsa_moe_block_cached_cb(r->model, l, &r->config, r->streams,
                 cache, r->max_seq_len, position, r->dsa_callback,
                 r->moe_callback, r->dsa_callback_opaque, r->moe_callback_opaque,
                 r->indexer_keys + (size_t)l * r->max_seq_len * r->config.indexer_key_length,
-                r->indexer_gates + (size_t)l * r->max_seq_len * r->config.indexer_key_length);
+                r->indexer_gates + (size_t)l * r->max_seq_len * r->config.indexer_key_length,
+                r->mhc_callback, r->mhc_callback_opaque);
         }
         if (rc != 0) {
             fprintf(stderr, "glm5next: layer %d (%s) failed at position %d\n", l,
