@@ -1,0 +1,51 @@
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define GGUF_LOADER_IMPLEMENTATION
+#include "../../common/gguf_loader.h"
+#define GGML_DEQUANT_IMPLEMENTATION
+#include "../../common/ggml_dequant.h"
+#include "../../common/glm5next_cpu_kda.h"
+
+int main(int argc, char **argv) {
+    gguf_shards *model;
+    glm5next_config config;
+    char error[160];
+    float *hidden, *out, *state, *conv;
+    int i;
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s MODEL.gguf\n", argv[0]);
+        return 2;
+    }
+    model = gguf_open_shards(argv[1], 2);
+    if (!model) return 1;
+    if (glm5next_config_load(model->metadata, &config, error, sizeof(error)) != 0 ||
+        glm5next_validate_tensors(model, &config, error, sizeof(error)) != 0) {
+        fprintf(stderr, "contract failure: %s\n", error);
+        glm5next_config_free(&config); gguf_close_shards(model); return 1;
+    }
+    hidden = (float *)malloc((size_t)config.hidden_size * sizeof(float));
+    out = (float *)malloc((size_t)config.hidden_size * sizeof(float));
+    state = (float *)calloc((size_t)config.attention_heads * config.linear_head_dim *
+                            config.linear_head_dim, sizeof(float));
+    conv = (float *)calloc((size_t)3 * config.attention_heads * config.linear_head_dim *
+                           (config.short_conv_kernel - 1), sizeof(float));
+    if (!hidden || !out || !state || !conv) return 1;
+    for (i = 0; i < config.hidden_size; ++i)
+        hidden[i] = 0.01f * sinf((float)(i + 1));
+    if (glm5next_cpu_kda_forward(model, 0, &config, hidden, out, state, conv) != 0) {
+        fprintf(stderr, "KDA layer execution failed\n"); return 1;
+    }
+    for (i = 0; i < config.hidden_size; ++i)
+        if (!isfinite(out[i])) { fprintf(stderr, "KDA produced non-finite output\n"); return 1; }
+    {
+        double ss = 0.0;
+        for (i = 0; i < config.hidden_size; ++i) ss += (double)out[i] * out[i];
+        printf("GLM5NEXT_CPU_KDA PASS out_rms=%.7g state0=%.7g\n",
+               sqrt(ss / config.hidden_size), state[0]);
+    }
+    free(hidden); free(out); free(state); free(conv);
+    glm5next_config_free(&config); gguf_close_shards(model);
+    return 0;
+}
