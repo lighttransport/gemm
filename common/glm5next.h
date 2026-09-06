@@ -368,11 +368,11 @@ static inline int glm5next_validate_tensors(const gguf_shards *model,
             }
         }
     }
-    /* NextN/MTP blocks are stored after the trunk.  The current single-token
-     * runtime does not execute speculative NextN yet, but validating its
-     * weights here prevents a split or damaged checkpoint from appearing
-     * usable merely because trunk generation succeeds.  GLM5Next's NextN
-     * block is a dense-attention MoE block (no KDA or mHC tensors). */
+    /* NextN/MTP blocks are stored after the trunk.  Validate their weights
+     * separately from the ordinary autoregressive loop so a split or damaged
+     * checkpoint cannot appear usable merely because trunk generation
+     * succeeds.  GLM5Next's NextN block is a dense-attention MoE block (no KDA
+     * or mHC tensors). */
     for (l = c->n_layers; l < c->n_layers_all; ++l) {
         const char *base[] = { "attn_norm.weight", "attn_output.weight", "ffn_norm.weight",
                                "ffn_gate_inp.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight",
