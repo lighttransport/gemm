@@ -171,6 +171,69 @@ fail:
 #undef G5GET
 }
 
+/* Build one DSA indexer row and return the causal positions selected for the
+ * latent attention.  The helper is shared by the CPU oracle and HIP callback
+ * so sparse selection cannot silently diverge between backends. */
+static inline int glm5next_cpu_indexer_step(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, const float *qrank_norm,
+        float *indexer_keys, float *indexer_gates, int max_seq_len, int position,
+        int *selected) {
+    glm5next_tensor_view t, kwv, kbv, apev;
+    float *iq = NULL, *iw = NULL, *key = NULL, *gate = NULL, *ape = NULL, *pool = NULL;
+    int count = position + 1, rc = -1;
+    char name[128];
+    if (!model || !c || !hidden || !qrank_norm || !indexer_keys || !indexer_gates ||
+        !selected || position < 0 || position >= max_seq_len) return -1;
+    int dim = c->indexer_key_length, heads = c->indexer_heads;
+    iq = (float *)malloc((size_t)heads * dim * sizeof(float));
+    iw = (float *)malloc((size_t)heads * sizeof(float));
+    key = (float *)malloc((size_t)dim * sizeof(float));
+    gate = (float *)malloc((size_t)dim * sizeof(float));
+    ape = (float *)malloc((size_t)c->indexer_kpool * dim * sizeof(float));
+    pool = (float *)malloc((size_t)((max_seq_len / c->indexer_kpool) + 1) * dim * sizeof(float));
+    if (!iq || !iw || !key || !gate || !ape || !pool) goto done;
+#define IDX_GET(s, dst) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
+    if (glm5next_tensor_view_get(model, name, 1, &(dst)) != 0) goto done; } while (0)
+    IDX_GET("indexer.attn_k.weight", t);
+    if (glm5next_cpu_matvec(key, &t, hidden) != 0) goto done;
+    IDX_GET("indexer.k_norm.weight", kwv); IDX_GET("indexer.k_norm.bias", kbv);
+    { float *kw = (float *)malloc((size_t)dim * sizeof(float));
+      float *kb = (float *)malloc((size_t)dim * sizeof(float));
+      if (!kw || !kb || glm5next_cpu_vector(&kwv, kw, dim) != 0 ||
+          glm5next_cpu_vector(&kbv, kb, dim) != 0) { free(kw); free(kb); goto done; }
+      double mean = 0.0, ss = 0.0;
+      for (int i = 0; i < dim; ++i) mean += key[i];
+      mean /= dim;
+      for (int i = 0; i < dim; ++i) { double d = key[i] - mean; ss += d * d; }
+      float inv = 1.0f / sqrtf((float)(ss / dim) + c->norm_epsilon);
+      for (int i = 0; i < dim; ++i) key[i] = (key[i] - (float)mean) * inv * kw[i] + kb[i];
+      free(kw); free(kb);
+    }
+    memcpy(indexer_keys + (size_t)position * dim, key, (size_t)dim * sizeof(float));
+    IDX_GET("indexer_compressor_gate.weight", t);
+    if (glm5next_cpu_matvec(gate, &t, hidden) != 0) goto done;
+    memcpy(indexer_gates + (size_t)position * dim, gate, (size_t)dim * sizeof(float));
+    IDX_GET("indexer.attn_q_b.weight", t);
+    if (glm5next_cpu_matvec(iq, &t, qrank_norm) != 0) goto done;
+    IDX_GET("indexer.proj.weight", t);
+    if (glm5next_cpu_matvec(iw, &t, hidden) != 0) goto done;
+    IDX_GET("indexer_compressor_ape.weight", apev);
+    if (apev.type != GGML_TYPE_F32 || apev.n_dims != 2 || apev.dims[0] != (uint64_t)dim ||
+        apev.dims[1] != (uint64_t)c->indexer_kpool) goto done;
+    memcpy(ape, apev.data, (size_t)c->indexer_kpool * dim * sizeof(float));
+    if (position + 1 > c->indexer_top_k)
+        count = glm5next_index_select(pool, selected, iq, iw, indexer_keys, indexer_gates,
+                                       ape, position + 1, c->indexer_kpool,
+                                       c->indexer_top_k, heads, dim);
+    else for (int i = 0; i < count; ++i) selected[i] = i;
+    if (count < 0) goto done;
+    rc = count;
+done:
+    free(iq); free(iw); free(key); free(gate); free(ape); free(pool);
+    return rc;
+#undef IDX_GET
+}
+
 /* One-token absorbed DSA attention.  With no prior KV cells this is already
  * the exact causal attention result (the sole score softmaxes to one); the
  * latent cache/indexer is added in the history-aware routine below. */

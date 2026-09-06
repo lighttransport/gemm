@@ -14574,14 +14574,15 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     hip_llm_runner *r = (hip_llm_runner *)opaque;
     const int heads = c->attention_heads, qrank = c->q_lora_rank;
     const int kv = c->kv_lora_rank, qdim = c->qk_nope_head_dim, vdim = c->value_head_dim;
-    const int h = c->hidden_size, nt = position + 1;
+    const int h = c->hidden_size;
+    int nt = position + 1, attn_nt = nt;
     glm5next_tensor_view t, normv, tk, tv, to;
     void *dq = NULL, *dkv = NULL, *do_w = NULL;
     void *dqcache = NULL, *dkcache = NULL, *dvcache = NULL, *dattn = NULL, *dout = NULL, *dvout = NULL;
     float *qr = NULL, *q = NULL, *kvl = NULL, *norm = NULL, *qhead = NULL;
     glm5next_dsa_gpu_cache local_cache; glm5next_dsa_gpu_cache *cache = NULL;
     int persistent_cache = r && r->glm5next_dsa_gpu != NULL;
-    (void)indexer_keys; (void)indexer_gates;
+    int *selected = NULL;
     int otype = 0, rc = -1;
     if (!r || !model || !hidden || !out || !latent_cache || position < 0 || position >= max_seq_len) return -1;
     if (layer < 0 || layer >= c->n_layers) return -1;
@@ -14602,31 +14603,45 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     CB_VIEW(normv, "attn_kv_a_norm.weight"); if (glm5next_cpu_vector(&normv, norm, kv) != 0) goto done;
     glm5next_cpu_rmsnorm(kvl, kvl, norm, kv, c->norm_epsilon);
     memcpy(latent_cache + (size_t)position*kv, kvl, (size_t)kv*sizeof(float));
+    if (indexer_keys && indexer_gates) {
+        selected = (int *)malloc((size_t)(c->indexer_top_k + c->indexer_kpool) * sizeof(int));
+        if (!selected) goto done;
+        attn_nt = glm5next_cpu_indexer_step(model, layer, c, hidden, qr,
+                                            indexer_keys, indexer_gates,
+                                            max_seq_len, position, selected);
+        if (attn_nt < 0) goto done;
+    }
     CB_VIEW(tk, "attn_k_b.weight"); CB_VIEW(to, "attn_output.weight");
     { qtensor qto = glm5next_as_qtensor(&to);
       if (upload_weight_matrix(&do_w, &qto, &otype) != 0) goto done; }
     if (hipMalloc(&dq, (size_t)qdim*sizeof(float)) != hipSuccess || hipMalloc(&dkv, (size_t)kv*sizeof(float)) != hipSuccess ||
-        hipMalloc(&dqcache, (size_t)heads*kv*sizeof(float)) != hipSuccess || hipMalloc(&dkcache, (size_t)nt*kv*sizeof(float)) != hipSuccess ||
-        hipMalloc(&dvcache, (size_t)nt*heads*vdim*sizeof(float)) != hipSuccess || hipMalloc(&dattn, (size_t)heads*vdim*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dqcache, (size_t)heads*kv*sizeof(float)) != hipSuccess || hipMalloc(&dkcache, (size_t)attn_nt*kv*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dvcache, (size_t)attn_nt*heads*vdim*sizeof(float)) != hipSuccess || hipMalloc(&dattn, (size_t)heads*vdim*sizeof(float)) != hipSuccess ||
         hipMalloc(&dout, (size_t)h*sizeof(float)) != hipSuccess || hipMalloc(&dvout, (size_t)vdim*sizeof(float)) != hipSuccess) goto done;
-    if (hipMemcpy(dkcache, latent_cache, (size_t)nt*kv*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
     if (hipMemcpy(dkv, latent_cache + (size_t)position*kv, (size_t)kv*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    for (int si = 0; si < attn_nt; ++si) {
+        int p = selected ? selected[si] : si;
+        if (hipMemcpy((uint8_t *)dkcache + (size_t)si*kv*sizeof(float),
+                      latent_cache + (size_t)p*kv, (size_t)kv*sizeof(float),
+                      hipMemcpyHostToDevice) != hipSuccess) goto done;
+    }
     for (int head = 0; head < heads; ++head) {
         if (glm5next_cpu_matvec_head(qhead, &tk, head, q + (size_t)head*qdim) != 0) goto done;
         if (hipMemcpy(dq, q + (size_t)head*qdim, (size_t)qdim*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
         launch_matvec_q8_f32(r, (uint8_t *)dqcache + (size_t)head*kv*sizeof(float),
                              (uint8_t *)cache->k_weight + (size_t)head*cache->k_stride, dq, kv, qdim);
-        for (int p = 0; p < nt; ++p) {
+        for (int si = 0; si < attn_nt; ++si) {
+            int p = selected ? selected[si] : si;
             if (hipMemcpy(dkv, latent_cache + (size_t)p*kv, (size_t)kv*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
             launch_matvec_q8_f32(r, dvout, (uint8_t *)cache->v_weight + (size_t)head*cache->v_stride, dkv, vdim, kv);
-            if (hipMemcpyAsync((uint8_t *)dvcache + ((size_t)p*heads + head)*vdim*sizeof(float), dvout,
+            if (hipMemcpyAsync((uint8_t *)dvcache + ((size_t)si*heads + head)*vdim*sizeof(float), dvout,
                                (size_t)vdim*sizeof(float), hipMemcpyDeviceToDevice,
                                r->stream) != hipSuccess) goto done;
         }
     }
     if (hipStreamSynchronize(r->stream) != hipSuccess) goto done;
     { void *args[] = { &dattn, &dqcache, &dkcache, &dvcache, (void *)&heads, (void *)&kv,
-                       (void *)&vdim, (void *)&nt };
+                       (void *)&vdim, (void *)&attn_nt };
       if (LAUNCH(r->fn_glm5next_dsa_attend_f32, heads, 1, 1, 256, 1, 1, 0, r->stream, args) != hipSuccess) goto done; }
     launch_matvec_auto(r, dout, do_w, dattn, h, heads*vdim, otype);
     if (hipStreamSynchronize(r->stream) != hipSuccess || hipMemcpy(out, dout, (size_t)h*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
@@ -14636,6 +14651,7 @@ done:
     if (dqcache) hipFree(dqcache); if (dkcache) hipFree(dkcache); if (dvcache) hipFree(dvcache); if (dattn) hipFree(dattn);
     if (dout) hipFree(dout); if (dvout) hipFree(dvout);
     free(qr); free(q); free(kvl); free(norm); free(qhead);
+    free(selected);
     if (!persistent_cache) {
         if (local_cache.k_weight) hipFree(local_cache.k_weight);
         if (local_cache.v_weight) hipFree(local_cache.v_weight);
