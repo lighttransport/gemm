@@ -9566,6 +9566,94 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         float *latent_cache, float *indexer_keys, float *indexer_gates,
         int max_seq_len, int position, void *opaque);
+static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
+                                      void *x, int n_rows, int n_cols,
+                                      int weight_type);
+
+static int glm5next_hip_indexer_step(hip_llm_runner *r,
+        const gguf_shards *model, int layer, const glm5next_config *c,
+        const float *hidden, const float *qrank_norm,
+        float *indexer_keys, float *indexer_gates, int max_seq_len, int position,
+        int *selected) {
+    glm5next_tensor_view vk, vg, vq, vw, vkw, vkb, va;
+    void *wk = NULL, *wg = NULL, *wq = NULL, *ww = NULL, *dx = NULL, *dq = NULL;
+    void *dk = NULL, *dg = NULL, *diq = NULL, *diw = NULL;
+    float *key = NULL, *gate = NULL, *iq = NULL, *iw = NULL;
+    float *ape = NULL, *pool = NULL, *kw = NULL, *kb = NULL;
+    int tk = 0, tg = 0, tq = 0, tw = 0, count = position + 1, rc = -1;
+    char name[128];
+    if (!r || !model || !c || !hidden || !qrank_norm || !indexer_keys ||
+        !indexer_gates || !selected || position < 0 || position >= max_seq_len) return -1;
+    const int dim = c->indexer_key_length, heads = c->indexer_heads, h = c->hidden_size;
+    const int qdim = heads * dim;
+#define HIP_IDX_VIEW(dst, suffix) do { \
+        snprintf(name, sizeof(name), "blk.%d.%s", layer, (suffix)); \
+        if (glm5next_tensor_view_get(model, name, 1, &(dst)) != 0) goto done; \
+    } while (0)
+#define HIP_IDX_ALLOC(ptr, n) do { \
+        if (hipMalloc(&(ptr), (size_t)(n) * sizeof(float)) != hipSuccess) goto done; \
+    } while (0)
+    HIP_IDX_VIEW(vk, "indexer.attn_k.weight");
+    HIP_IDX_VIEW(vg, "indexer_compressor_gate.weight");
+    HIP_IDX_VIEW(vq, "indexer.attn_q_b.weight");
+    HIP_IDX_VIEW(vw, "indexer.proj.weight");
+    HIP_IDX_VIEW(vkw, "indexer.k_norm.weight");
+    HIP_IDX_VIEW(vkb, "indexer.k_norm.bias");
+    HIP_IDX_VIEW(va, "indexer_compressor_ape.weight");
+    { qtensor qtk = glm5next_as_qtensor(&vk), qtg = glm5next_as_qtensor(&vg);
+      qtensor qtq = glm5next_as_qtensor(&vq), qtw = glm5next_as_qtensor(&vw);
+      if (upload_weight_matrix(&wk, &qtk, &tk) != 0 ||
+          upload_weight_matrix(&wg, &qtg, &tg) != 0 ||
+          upload_weight_matrix(&wq, &qtq, &tq) != 0 ||
+          upload_weight_matrix(&ww, &qtw, &tw) != 0) goto done; }
+    key = (float *)malloc((size_t)dim * sizeof(float));
+    gate = (float *)malloc((size_t)dim * sizeof(float));
+    iq = (float *)malloc((size_t)qdim * sizeof(float));
+    iw = (float *)malloc((size_t)heads * sizeof(float));
+    kw = (float *)malloc((size_t)dim * sizeof(float));
+    kb = (float *)malloc((size_t)dim * sizeof(float));
+    ape = (float *)malloc((size_t)c->indexer_kpool * dim * sizeof(float));
+    pool = (float *)malloc((size_t)((max_seq_len / c->indexer_kpool) + 1) * dim * sizeof(float));
+    if (!key || !gate || !iq || !iw || !kw || !kb || !ape || !pool) goto done;
+    if (glm5next_cpu_vector(&vkw, kw, dim) != 0 || glm5next_cpu_vector(&vkb, kb, dim) != 0 ||
+        va.type != GGML_TYPE_F32 || va.n_dims != 2 || va.dims[0] != (uint64_t)dim ||
+        va.dims[1] != (uint64_t)c->indexer_kpool) goto done;
+    memcpy(ape, va.data, (size_t)c->indexer_kpool * dim * sizeof(float));
+    HIP_IDX_ALLOC(dx, h); HIP_IDX_ALLOC(dq, c->q_lora_rank);
+    HIP_IDX_ALLOC(dk, dim); HIP_IDX_ALLOC(dg, dim); HIP_IDX_ALLOC(diq, qdim); HIP_IDX_ALLOC(diw, heads);
+    if (hipMemcpy(dx, hidden, (size_t)h * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(dq, qrank_norm, (size_t)c->q_lora_rank * sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    launch_matvec_auto(r, dk, wk, dx, dim, h, tk);
+    launch_matvec_auto(r, dg, wg, dx, dim, h, tg);
+    launch_matvec_auto(r, diq, wq, dq, qdim, c->q_lora_rank, tq);
+    launch_matvec_auto(r, diw, ww, dx, heads, h, tw);
+    if (hipStreamSynchronize(r->stream) != hipSuccess ||
+        hipMemcpy(key, dk, (size_t)dim * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
+        hipMemcpy(gate, dg, (size_t)dim * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
+        hipMemcpy(iq, diq, (size_t)qdim * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
+        hipMemcpy(iw, diw, (size_t)heads * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+    { double mean = 0.0, ss = 0.0;
+      for (int i = 0; i < dim; ++i) mean += key[i]; mean /= dim;
+      for (int i = 0; i < dim; ++i) { double d = key[i] - mean; ss += d * d; }
+      float inv = 1.0f / sqrtf((float)(ss / dim) + c->norm_epsilon);
+      for (int i = 0; i < dim; ++i) key[i] = (key[i] - (float)mean) * inv * kw[i] + kb[i]; }
+    memcpy(indexer_keys + (size_t)position * dim, key, (size_t)dim * sizeof(float));
+    memcpy(indexer_gates + (size_t)position * dim, gate, (size_t)dim * sizeof(float));
+    if (position + 1 > c->indexer_top_k)
+        count = glm5next_index_select(pool, selected, iq, iw, indexer_keys, indexer_gates,
+                                      ape, position + 1, c->indexer_kpool,
+                                      c->indexer_top_k, heads, dim);
+    else for (int i = 0; i < count; ++i) selected[i] = i;
+    rc = count;
+done:
+    if (wk) hipFree(wk); if (wg) hipFree(wg); if (wq) hipFree(wq); if (ww) hipFree(ww);
+    if (dx) hipFree(dx); if (dq) hipFree(dq); if (dk) hipFree(dk); if (dg) hipFree(dg);
+    if (diq) hipFree(diq); if (diw) hipFree(diw);
+    free(key); free(gate); free(iq); free(iw); free(kw); free(kb); free(ape); free(pool);
+    return rc;
+#undef HIP_IDX_ALLOC
+#undef HIP_IDX_VIEW
+}
 static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         float *recurrent, float *conv_state, void *opaque);
@@ -14606,9 +14694,14 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     if (indexer_keys && indexer_gates) {
         selected = (int *)malloc((size_t)(c->indexer_top_k + c->indexer_kpool) * sizeof(int));
         if (!selected) goto done;
-        attn_nt = glm5next_cpu_indexer_step(model, layer, c, hidden, qr,
-                                            indexer_keys, indexer_gates,
-                                            max_seq_len, position, selected);
+        if (getenv("GLM5NEXT_HIP_INDEXER") && atoi(getenv("GLM5NEXT_HIP_INDEXER")) != 0)
+            attn_nt = glm5next_hip_indexer_step(r, model, layer, c, hidden, qr,
+                                                indexer_keys, indexer_gates,
+                                                max_seq_len, position, selected);
+        else
+            attn_nt = glm5next_cpu_indexer_step(model, layer, c, hidden, qr,
+                                                indexer_keys, indexer_gates,
+                                                max_seq_len, position, selected);
         if (attn_nt < 0) goto done;
     }
     CB_VIEW(tk, "attn_k_b.weight"); CB_VIEW(to, "attn_output.weight");
