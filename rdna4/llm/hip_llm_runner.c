@@ -7050,6 +7050,11 @@ static const char *hip_kernel_source =
     } \
 } while(0)
 
+/* hipMalloc takes void **; keep typed device pointers warning-clean without
+ * relying on permissive C conversion rules. */
+#define CHECK_HIP_MALLOC(ptr, bytes) \
+    CHECK_HIP(hipMalloc((void **)(void *)(ptr), (bytes)))
+
 #define CHECK_HIP_NULL(call) do { \
     hipError_t err = (call); \
     if (err != hipSuccess) { \
@@ -8963,13 +8968,13 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         r->h_router_logits = (float *)malloc(r->n_experts * sizeof(float));
         if (!r->h_router_logits) return -1;
         /* Device-side dispatch buffers (sync-free MoE routing) */
-        CHECK_HIP(hipMalloc(&r->d_moe_idx, r->n_experts_used * sizeof(int)));
-        CHECK_HIP(hipMalloc(&r->d_moe_w,   r->n_experts_used * sizeof(float)));
-        CHECK_HIP(hipMalloc(&r->d_shared_scale, sizeof(float)));
-        CHECK_HIP(hipMalloc(&r->d_router_counter, sizeof(unsigned int)));
+        CHECK_HIP_MALLOC(&r->d_moe_idx, r->n_experts_used * sizeof(int));
+        CHECK_HIP_MALLOC(&r->d_moe_w,   r->n_experts_used * sizeof(float));
+        CHECK_HIP_MALLOC(&r->d_shared_scale, sizeof(float));
+        CHECK_HIP_MALLOC(&r->d_router_counter, sizeof(unsigned int));
         CHECK_HIP(hipMemset(r->d_router_counter, 0, sizeof(unsigned int)));
-        CHECK_HIP(hipMalloc(&r->d_moe_act8,
-                            (size_t)(r->n_experts_used + 1) * r->expert_ff * sizeof(float)));
+        CHECK_HIP_MALLOC(&r->d_moe_act8,
+                         (size_t)(r->n_experts_used + 1) * r->expert_ff * sizeof(float));
         /* Device-side expert dispatch is supported only when every routed-expert
          * weight type has an expert-indexed kernel (IQ2_S / IQ3_S / IQ4_XS). */
         r->moe_dev_dispatch_ok = 1;
@@ -9287,8 +9292,8 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 CHECK_HIP(hipMalloc(&r->d_moe_out_batch,       (size_t)bm * r->n_embd * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_xnorm_batch_bf16_moe,(size_t)bm * r->n_embd * 2));
                 CHECK_HIP(hipMalloc(&r->d_shared_scale_batch,  (size_t)bm * sizeof(float)));
-                CHECK_HIP(hipMalloc(&r->d_moe_gather_src,      TA * sizeof(int)));
-                CHECK_HIP(hipMalloc(&r->d_moe_gather_w,        TA * sizeof(float)));
+                CHECK_HIP_MALLOC(&r->d_moe_gather_src,      TA * sizeof(int));
+                CHECK_HIP_MALLOC(&r->d_moe_gather_w,        TA * sizeof(float));
                 /* All-expert bf16 staging (one weight type at a time) + device offsets */
                 {
                     size_t gu = (size_t)ne * r->expert_ff * r->n_embd * 2;
@@ -9298,10 +9303,10 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                     CHECK_HIP(hipMalloc(&r->d_expw_int8, sz / 2));  /* INT8: 1 byte vs BF16's 2 */
                     { size_t _act_sz = (size_t)TA * (r->n_embd > eff ? r->n_embd : eff);
                       CHECK_HIP(hipMalloc(&r->d_act_int8, _act_sz)); }
-                    CHECK_HIP(hipMalloc(&r->d_moe_offs, (size_t)(ne + 1) * sizeof(int)));
-                    CHECK_HIP(hipMalloc(&r->d_tok_idx, TA * sizeof(int)));
-                    CHECK_HIP(hipMalloc(&r->d_tok_w,   TA * sizeof(float)));
-                    CHECK_HIP(hipMalloc(&r->d_cursor,  (size_t)ne * sizeof(int)));
+                    CHECK_HIP_MALLOC(&r->d_moe_offs, (size_t)(ne + 1) * sizeof(int));
+                    CHECK_HIP_MALLOC(&r->d_tok_idx, TA * sizeof(int));
+                    CHECK_HIP_MALLOC(&r->d_tok_w,   TA * sizeof(float));
+                    CHECK_HIP_MALLOC(&r->d_cursor,  (size_t)ne * sizeof(int));
                     if (r->verbose >= 1)
                         fprintf(stderr, "hip_llm: grouped-expert staging %.0f MB\n", sz / 1048576.0);
                 }
@@ -10937,8 +10942,6 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
         int hd = cl->local_head_dim;
         int local_kv_heads = cl->local_kv_heads;
         int local_kv_dim = local_kv_heads * hd;
-        int local_q_dim = n_heads * hd;
-        int local_gqa = n_heads / local_kv_heads;
         int kv_src = (cl->shared_kv_source >= 0) ? cl->shared_kv_source : l;
         /* Value-less (global/full-attn) layers: V = K (config attention_k_eq_v). */
         int v_eq_k = (cl->shared_kv_source < 0) && (cl->attn_v_rows <= 0);

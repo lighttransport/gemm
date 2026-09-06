@@ -119,6 +119,7 @@ typedef struct {
     uint64_t dims[4];
     uint32_t type; /* ggml_dtype */
     uint64_t offset; /* offset from start of data section */
+    uint32_t file_index; /* zero for a single file; set by gguf_open_multi */
 } gguf_tensor_info;
 
 typedef struct gguf_context_s {
@@ -150,6 +151,11 @@ typedef struct gguf_context_s {
     size_t map_size;
     int fd;
 #endif
+    /* A multi-file context owns one ordinary context per GGUF shard.  The
+     * aggregate tensor table below keeps the public API unchanged while
+     * gguf_tensor_data() selects the owning shard. */
+    struct gguf_context **parts;
+    uint32_t n_parts;
 } gguf_context;
 
 gguf_context *gguf_open(const char *path, int use_mmap);
@@ -654,6 +660,7 @@ gguf_context *gguf_open_multi(const char *path, int use_mmap) {
         gguf_context *sctx = parts[s];
         for (uint64_t j = 0; j < sctx->n_tensors; j++, out++) {
             ctx->tensors[out] = sctx->tensors[j];
+            ctx->tensors[out].file_index = (uint32_t)s;
             ctx->tensors[out].name.str = strdup(sctx->tensors[j].name.str);
             if (!ctx->tensors[out].name.str) {
                 ctx->n_tensors = out;
@@ -673,6 +680,7 @@ gguf_context *gguf_open_multi(const char *path, int use_mmap) {
     }
     ctx->shards = parts;
     ctx->n_shards = (int)total;
+    ctx->n_parts = (uint32_t)total;
     fprintf(stderr, "gguf: merged %ld shards, %llu tensors (lazy=%d)\n",
             total, (unsigned long long)tensor_total, use_mmap != 0);
     return ctx;

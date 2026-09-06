@@ -1799,9 +1799,10 @@ static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, i
                 svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
                 /* Per-block d rescaled to int8 (preserves subnormal d). */
                 float d = ggml_fp16_to_fp32(row[blk].d);
-                int8_t di = (int8_t)lrintf(d * scale_w);
-                if (di >  127) di =  127;
-                if (di < -128) di = -128;
+                int di_raw = (int)lrintf(d * scale_w);
+                if (di_raw >  127) di_raw =  127;
+                if (di_raw < -128) di_raw = -128;
+                int8_t di = (int8_t)di_raw;
                 /* Subtract 8 (center) and multiply by di. */
                 svint8_t lo8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(lo), 8);
                 svint8_t hi8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(hi), 8);
@@ -1814,6 +1815,9 @@ static inline void tf_dequant_q4_0_8row_to_int8(const block_q4_0 *const *rows, i
         }
     }
 #endif
+#if !defined(__ARM_FEATURE_SVE)
+    (void)rows; (void)dst; (void)n_cols; (void)scale_w;
+#endif
 }
 
 /* Same as tf_dequant_q4_0_8row_to_int8 but takes a base pointer and row stride.
@@ -1823,6 +1827,9 @@ static inline void tf_dequant_q4_0_8row_strided_to_int8(const uint8_t *base, siz
     const block_q4_0 *rows[8];
     for (int r = 0; r < 8; r++) rows[r] = (const block_q4_0 *)(base + (size_t)r * row_bytes);
     tf_dequant_q4_0_8row_to_int8(rows, dst, n_cols, scale_w);
+#endif
+#if !defined(__ARM_FEATURE_SVE)
+    (void)base; (void)row_bytes; (void)dst; (void)n_cols; (void)scale_w;
 #endif
 }
 
@@ -2027,9 +2034,10 @@ static inline void tf_dequant_q4_0_4row_to_int8(const block_q4_0 *const *rows, i
                 svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
                 svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
                 float d = ggml_fp16_to_fp32(row[blk].d);
-                int8_t di = (int8_t)lrintf(d * scale_w);
-                if (di >  127) di =  127;
-                if (di < -128) di = -128;
+                int di_raw = (int)lrintf(d * scale_w);
+                if (di_raw >  127) di_raw =  127;
+                if (di_raw < -128) di_raw = -128;
+                int8_t di = (int8_t)di_raw;
                 svint8_t lo8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(lo), 8);
                 svint8_t hi8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(hi), 8);
                 lo8 = svmul_n_s8_x(pg, lo8, di);
@@ -2039,6 +2047,9 @@ static inline void tf_dequant_q4_0_4row_to_int8(const block_q4_0 *const *rows, i
             }
         }
     }
+#endif
+#if !defined(__ARM_FEATURE_SVE)
+    (void)rows; (void)dst; (void)n_cols; (void)scale_w;
 #endif
 }
 
@@ -2200,9 +2211,10 @@ static inline int tf_q4_0_int8_cache_init(tf_q4_0_int8_cache *cache,
                 svuint8_t lo = svand_n_u8_x(pg, q, 0x0f);
                 svuint8_t hi = svlsr_n_u8_x(pg, q, 4);
                 float d = ggml_fp16_to_fp32(row[blk].d);
-                int8_t di = (int8_t)lrintf(d * cache->scale_w);
-                if (di >  127) di =  127;
-                if (di < -128) di = -128;
+                int di_raw = (int)lrintf(d * cache->scale_w);
+                if (di_raw >  127) di_raw =  127;
+                if (di_raw < -128) di_raw = -128;
+                int8_t di = (int8_t)di_raw;
                 svint8_t lo8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(lo), 8);
                 svint8_t hi8 = svsub_n_s8_x(pg, svreinterpret_s8_u8(hi), 8);
                 lo8 = svmul_n_s8_x(pg, lo8, di);
@@ -2225,9 +2237,10 @@ static inline int tf_q4_0_int8_cache_init(tf_q4_0_int8_cache *cache,
                     int lo = (q & 0xf) - 8;
                     int hi = (q >> 4) - 8;
                     float d = ggml_fp16_to_fp32(row[blk].d);
-                    int8_t di = (int8_t)lrintf(d * cache->scale_w);
-                    if (di >  127) di =  127;
-                    if (di < -128) di = -128;
+                    int di_raw = (int)lrintf(d * cache->scale_w);
+                    if (di_raw >  127) di_raw =  127;
+                    if (di_raw < -128) di_raw = -128;
+                    int8_t di = (int8_t)di_raw;
                     drow[p*64 + b*32 + j]      = (int8_t)(lo * di);
                     drow[p*64 + b*32 + 16 + j] = (int8_t)(hi * di);
         }
@@ -2276,6 +2289,25 @@ static inline void tf_matvec_q4_0_int8_prequant_rows(float *dst,
     const int8_t *base = cache->wi8;
     const int nb_pairs = cache->nb_pairs;
     const float scale_w = cache->scale_w;
+    float x_inv, inv;
+#if defined(__ARM_FEATURE_SVE)
+#else
+    int8_t *xi8 = (int8_t *)aligned_alloc(64, (size_t)((cache->n_cols + 63) & ~63));
+    if (!xi8) return;
+    float xmax = 0.0f;
+    for (int j = 0; j < cache->n_cols; j++) {
+        float a = x[j] < 0.0f ? -x[j] : x[j];
+        if (a > xmax) xmax = a;
+    }
+    x_inv = xmax > 0.0f ? 127.0f / xmax : 1.0f;
+    for (int j = 0; j < cache->n_cols; j++) {
+        int v = (int)lrintf(x[j] * x_inv);
+        if (v < -128) v = -128;
+        if (v > 127) v = 127;
+        xi8[j] = (int8_t)v;
+    }
+    inv = 1.0f / (scale_w * x_inv);
+#endif
 #if defined(__ARM_FEATURE_SVE)
     /* Hoist x quantize: done ONCE per call, not per batch. */
     static int8_t *xi8 = NULL;
@@ -2286,9 +2318,8 @@ static inline void tf_matvec_q4_0_int8_prequant_rows(float *dst,
         xi8 = (int8_t *)aligned_alloc(256, xi8_need);
         xi8_alloc = xi8_need;
     }
-    float x_inv;
     tf_quantize_f32_to_int8(x, xi8, cache->n_cols, &x_inv);
-    const float inv = 1.0f / (scale_w * x_inv);
+    inv = 1.0f / (scale_w * x_inv);
     /* 8-row batches: inlined for minimum overhead. 2x K-unroll:
      * process 2 pairs per iteration using 2 different x vectors
      * to break the SDOT dependency on x. */
@@ -2417,6 +2448,9 @@ static inline void tf_matvec_q4_0_int8_prequant_rows(float *dst,
         }
         dst[i] = (float)s * inv;
     }
+#if !defined(__ARM_FEATURE_SVE)
+    free(xi8);
+#endif
 }
 
 static inline void tf_vec_dot_q4_0_f32_4x(const block_q4_0 *row,
@@ -8583,7 +8617,7 @@ static float *tf_forward_persistent(transformer_model *m, int position, int pos_
 
     tf_persistent_ctx *ctxs = (tf_persistent_ctx *)alloca(nt * sizeof(tf_persistent_ctx));
     for (int t = 0; t < nt; t++)
-        ctxs[t] = (tf_persistent_ctx){m, t, position, pos_t, pos_h, pos_w};
+        ctxs[t] = (tf_persistent_ctx){m, t, position, pos_t, pos_h, pos_w, 0, 0};
 
     /* Use the existing pool to dispatch the persistent worker to threads 1..nt-1.
      * Main thread (worker 0) runs inline. */
@@ -14096,6 +14130,9 @@ static void tf_gemma4_rope_batch(transformer_model *m, transformer_layer *layer,
     float *inv_freq = layer->is_swa ? m->rope_inv_freq_swa : m->rope_inv_freq;
     int half = hd / 2;
     int nt = m->n_threads > 1 ? m->n_threads : 1;
+#if !defined(_OPENMP)
+    (void)nt;
+#endif
     /* parallel over tokens; cos/sin depend only on (token,j) so hoist out of the
      * head loop (was recomputed per head -> ~n_heads x redundant trig). */
     #ifdef _OPENMP
@@ -14180,6 +14217,9 @@ static void tf_gemma4_attention_batch(transformer_model *m, transformer_layer *l
     /* Parallel over (token,head): each (t,h) writes a disjoint bxb2[t*q_dim+h*hd]
      * region and uses a thread-local score buffer -> race-free. */
     int nt = m->n_threads > 1 ? m->n_threads : 1;
+#if !defined(_OPENMP)
+    (void)nt;
+#endif
 #if defined(__ARM_FEATURE_SVE)
     /* SVE fp32 path (TF_ATTN_SVE=1 default): vectorize QK^T dot, FEXPA softmax, PV
      * accumulate. Only for the F32 KV cache (the default); F16 KV falls back to scalar. */
@@ -14188,6 +14228,10 @@ static void tf_gemma4_attention_batch(transformer_model *m, transformer_layer *l
     int use_sve = attn_sve && m->kv_cache_type == 0;
 #else
     int use_sve = 0;
+#if !defined(__ARM_FEATURE_SVE)
+    (void)use_sve;
+    (void)n_kv_heads;
+#endif
 #endif
     #ifdef _OPENMP
     #pragma omp parallel num_threads(nt)

@@ -2844,6 +2844,13 @@ static inline void matvec_mxfp4_8row_2x(float *dst0, float *dst1,
 }
 #endif /* __ARM_FEATURE_SVE */
 
+/* x86 counterparts of the DS4F 8-row decode matvec kernels above. Same
+ * signatures and weight layouts, so ds4f_impl.h's call sites are common. */
+#if !defined(__ARM_FEATURE_SVE)
+#include "ds4f_matvec_avx2.h"
+#endif
+
+
 /* ======================================================================== */
 #ifdef GGML_DEQUANT_IMPLEMENTATION
 

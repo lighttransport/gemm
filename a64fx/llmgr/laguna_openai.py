@@ -64,8 +64,18 @@ def normalize_messages(messages):
     return out
 
 
-def native_request(body, tokenizer=None, chat=True):
-    tok = tokenizer or laguna_tok.Tok(laguna_tok.TOKJSON)
+def load_tokenizer(path):
+    """Load a tokenizer from an explicit model configuration path."""
+    if not path:
+        raise ValueError("tokenizer path is required; set tokenizer or LLMGR_TOKENIZER")
+    path = os.path.abspath(os.path.expanduser(os.fspath(path)))
+    if not os.path.isfile(path):
+        raise FileNotFoundError("tokenizer file not found: %s" % path)
+    return laguna_tok.Tok(path)
+
+
+def native_request(body, tokenizer=None, tokenizer_path=None, chat=True):
+    tok = tokenizer or load_tokenizer(tokenizer_path or body.get("tokenizer"))
     if chat:
         messages = normalize_messages(body.get("messages"))
         if not messages:
@@ -73,9 +83,13 @@ def native_request(body, tokenizer=None, chat=True):
         thinking = body.get("enable_thinking", True)
         if body.get("reasoning_effort") == "none":
             thinking = False
-        prompt = laguna_tok.render_chat(
-            messages, add_generation_prompt=True, enable_thinking=thinking,
-            tools=body.get("tools"))
+        try:
+            prompt = laguna_tok.render_chat(
+                messages, add_generation_prompt=True, enable_thinking=thinking,
+                tools=body.get("tools"))
+        except (ImportError, SystemExit):
+            prompt = "\n".join("%s: %s" % (m["role"], m["content"])
+                               for m in messages) + "\nassistant:"
         ids = tok.encode(prompt)
     else:
         prompt = body.get("prompt", "")

@@ -53,9 +53,16 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <alloca.h>
+#if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
+#endif
 
 #include "ggml_dequant.h"
+#if !defined(__ARM_FEATURE_SVE)
+/* Portable stand-ins for the SVE-only small kernels in ds4f_impl.h. */
+#include "ds4f_kernels_x86.h"
+#endif
 
 /* Weight quant types. Declared up here because ds4f_config carries one (expert_qt);
  * the per-type layout notes live above the ds4f_tensor definition below. */
@@ -218,11 +225,14 @@ static inline ds4f_config ds4f_config_from_env(void) {
  * but NOT rel<1e-3 (int8 rounding ~1e-2); used ONLY for the big hidden-layer
  * dense GEMMs (qkv/o_proj/shared), never the argmax-critical router/lm-head. */
 
-typedef struct {
+typedef struct ds4f_tensor {
     void    *w;       /* weight bytes */
     uint8_t *scale;   /* E8M0 scale bytes (NULL for BF16/F32) */
     ds4f_qtype type;
     int rows, cols;   /* logical [rows, cols] */
+    /* Optional device-bank id.  -1 is CPU; -2 is the CUDA expert cache used
+     * by the dual-GPU decode adapter (it is not a HIP bank index). */
+    int gpu_id;
 } ds4f_tensor;
 
 /* bytes of the weight body for a logical [rows,cols] of the given type */
@@ -247,7 +257,7 @@ static inline size_t ds4f_sbytes(ds4f_qtype t, int rows, int cols) {
 }
 
 /* ===================== layer / model ===================== */
-typedef struct {
+typedef struct ds4f_layer {
     /* norms (BF16) */
     uint16_t *attn_norm, *ffn_norm, *q_norm, *kv_norm;
     /* MLA (FP8) */
@@ -256,6 +266,7 @@ typedef struct {
     /* MoE */
     ds4f_tensor gate;                 /* BF16 [n_experts, hidden] router */
     float *gate_bias;                 /* [n_experts] F32 selection bias (exact, layers>=n_hash); NULL=hash/synth */
+    int32_t *gate_tid2eid;             /* [vocab,n_active] token-id routes for hash layers */
     ds4f_tensor sh_w1, sh_w2, sh_w3;  /* shared expert (FP8) */
     ds4f_tensor *ex_w1, *ex_w2, *ex_w3; /* owned experts (cfg.expert_qt: MXFP4 | FP8), 0..n_owned-1 */
     int *owned_eid;                   /* global expert id of each owned slot */
@@ -308,7 +319,8 @@ typedef struct {
      * bytes, bit-identical to the prior f32-widened arena. ape stays f32, norm bf16.
      * All NULL unless m->tierb2 && compress_ratio!=0. */
     uint16_t *cmp_wkv, *cmp_wgate;   /* layer compressor (rotate=0): [coff*kv_lora, hidden] bf16 */
-    uint16_t *cmp_wkv_pv, *cmp_wgate_pv; /* optional pair-interleaved copies for batched prefill */
+    int       cmp_wkv_gpu_id, cmp_wgate_gpu_id; /* optional serving HIP bindings */
+    int       idx_wq_b_gpu_id;       /* ditto for the indexer q-projection (-1 = CPU) */
     float    *cmp_ape;               /* [compress_ratio, coff*kv_lora] */
     uint16_t *cmp_norm;              /* [kv_lora] bf16 */
     float    *cmp_kv_state, *cmp_score_state;  /* [coff*ratio, coff*kv_lora] ring state */
@@ -358,6 +370,27 @@ typedef struct {
     int      *sel_cache; int sel_cache_n, sel_cache_pos;
 } ds4f_layer;
 
+#define DS4F_DSPARK_STAGES 3
+#define DS4F_DSPARK_TARGET_LAYERS 3
+#define DS4F_DSPARK_TRAINED_BLOCK 5
+#define DS4F_DSPARK_DEFAULT_DRAFT DS4F_DSPARK_TRAINED_BLOCK
+
+/* DeepSeek-V4 DSpark is stored under the mtp.* namespace but is not the
+ * legacy autoregressive MTP block.  It is a three-block parallel drafter;
+ * stage 0 owns the target-hidden projection and stage 2 owns the output
+ * heads.  The transformer body is represented by ds4f_layer so it can reuse
+ * the exact MLA/mHC/MoE kernels. */
+typedef struct {
+    ds4f_layer layer;
+    ds4f_tensor main_proj;       /* stage 0: [hidden, 3*hidden] */
+    uint16_t *main_norm;         /* stage 0: [hidden] */
+    uint16_t *norm;              /* stage 2: [hidden] */
+    float *hc_head_fn, *hc_head_base, *hc_head_scale;
+    uint16_t *markov_w1;         /* stage 2: [vocab, markov_rank] */
+    ds4f_tensor markov_w2;       /* stage 2: [vocab, markov_rank] */
+    uint16_t *confidence_proj;   /* stage 2: [hidden+markov_rank] */
+} ds4f_dspark_stage;
+
 /* Batched concurrent decode (DS4F_DECODE_BATCH): the per-sequence DATA/STATE cache buffers for one
  * (sequence, layer). The batched forward swaps these into ds4f_layer per batch element so the tested
  * per-position attn/tb2/KV-append run unchanged. Weights (cmp_wkv, idx_wq_b, ...) are shared, never
@@ -377,26 +410,139 @@ typedef struct {
 } ds4f_lseq;
 
 typedef struct ds4f_pool ds4f_pool;
+typedef struct ds4f_mem_pool ds4f_mem_pool;
+
+/* Runtime configuration.  The command-line/JSON path fills this structure;
+ * the legacy ds4f_load_real()/ds4f_alloc_synth() wrappers below may still
+ * populate it from the environment for old experiments.  Environment values
+ * are therefore an explicit compatibility/debug path, not the production
+ * configuration interface. */
+typedef struct ds4f_runtime_options {
+    ds4f_config cfg;
+    char stage_dir[1024];
+    char tokenizer[1024];
+    char tokenizer_py[1024];
+    int ep_rank, ep_size;
+    int n_threads, n_cmgs;
+    int dense_bf16, bf16_pv, dense_mxfp4, q8_dense, mxfp4_w4a8;
+    int fp8_magic, mxfp4_gemm_tile;
+    int sparse, mhc, exact, tierb2;
+    int int8_kv, int8_cmp, int4_cmp, cp;
+    int tp_head, tp_shared, tp_shared_full, tp_attn, tp_oproj, tp_embed, tp_wob;
+    int mtp, expert_resident;
+    int logical_ep_lanes;               /* single-process exact routed-expert lane topology */
+    int int8kv_cal, int8cmp_cal;
+    int zero_copy_experts, load_drop_blob;
+    int use_hip, hip_device, hip_async, hip_verbose;
+    int hip_shared_bf16, hip_shared_bf16_layers;
+    int hip_shared_fp16, hip_shared_fp16_layers;
+    int hip_ordered_wkv_layers;          /* CPU-compatible FP8 WKV GEMM for prefill prefix */
+    int hip_ordered_fp8_layers;          /* CPU-compatible reduction for all FP8 GEMMs */
+    int hip_mxfp4_widen_layers;          /* GPU MXFP4 experts, widened to row-scale FP8 */
+    int hip_mxfp4_resident_layers;       /* keep this many widened expert layers on GPU */
+    int hip_mxfp4_resident_auto;         /* derive resident prefix from free VRAM */
+    int hip_vram_reserve_mb;             /* safety margin for streamed/work buffers */
+    int hip_mxfp4_stream_raw;            /* use compact raw MXFP4/LUT for streamed experts */
+    int hip_expert_cache_mb;              /* 0=off, -1=auto, >0 raw MXFP4 expert-cache budget */
+    int hip_expert_cache_stats;           /* report prompt-hot cache coverage and residency */
+    int hip_prefill_attn;                /* experimental opt-in GPU sliding-window attention; exact default is 0 */
+    int hip_tb2_batch;                   /* batch exact Tier-B2 window partials per prefill tile */
+    int hip_qkv_fuse, hip_qkv_device_chain;
+    int hip_attn_device_chain, hip_attn_no_d2h, hip_routed_ffn;
+    int hip_fp8_wmma, hip_bf16_wmma, hip_attn_wmma;
+    int hip_oproj_group_wmma, hip_mxfp4_wmma, hip_block_threads;
+    int hip_decode_routed_ffn, hip_decode_qkv_fuse, hip_decode_attn_oproj;
+    int hip_decode_kv_resident;
+    int hip_exact_prefill;              /* keep M>1 prompt GEMMs on CPU reference path */
+    int debug_env;
+} ds4f_runtime_options;
+
+/* Optional S3 dense-device hook.  The common forward path remains CPU-owned;
+ * a backend can attach a persistent FP8 bank and claim only tensors it has
+ * explicitly uploaded.  Returning zero means dst was produced; nonzero asks
+ * the caller to treat the backend invocation as a hard integration failure. */
+typedef int (*ds4f_gpu_dense_matvec_fn)(void *ctx, float *dst,
+                                        const ds4f_tensor *t, const float *x);
+typedef int (*ds4f_gpu_dense_async_multi_fn)(
+    void *ctx, float *const *dst, const ds4f_tensor *const *t,
+    const float *const *x, int n);
+typedef int (*ds4f_gpu_dense_wait_fn)(void *ctx);
+/* Fused shared expert: w1/w3 -> SwiGLU -> w2 with both [M, inter]
+ * intermediates kept on the device, so only x goes up and only [M, hidden]
+ * comes back.  Nonzero means the backend declined and the caller should run
+ * the unfused GEMM/SwiGLU/GEMM sequence. */
+typedef int (*ds4f_gpu_shared_ffn_fn)(
+    void *ctx, float *dst, const ds4f_tensor *w1, const ds4f_tensor *w3,
+    const ds4f_tensor *w2, const float *x, int M, int inter, int C, float lim);
+typedef int (*ds4f_gpu_shared_ffn_wait_fn)(void *ctx,float *dst,int M,int C);
+typedef int (*ds4f_gpu_routed_ffn_fn)(void *ctx, float *dst, const float *x,
+    const ds4f_tensor *const *w1, const ds4f_tensor *const *w3,
+    const ds4f_tensor *const *w2, const int *counts, const int *offsets,
+    int n_experts, int total, int C, int inter, float lim);
+typedef int (*ds4f_gpu_oproj_fn)(void *ctx,float *dst,const ds4f_tensor *wa,
+    const ds4f_tensor *wb,const float *x,int M,int groups,int gin,int lora,
+    int H,int C,int ointer);
+typedef int (*ds4f_gpu_head_argmax_fn)(void *ctx,int *token,
+    const ds4f_tensor *head,const float *x,int cols);
+typedef int (*ds4f_gpu_dense_blockdiag_fn)(
+    void *ctx, float *dst, const ds4f_tensor *t, const float *xbase,
+    int gin, int glora, int goff);
+/* Batched prefill GEMM: Y[M,Ystride] = W[rows,cols] * X[M,Xstride]^T,
+ * with token-major host buffers. The backend may use a device GEMM and must
+ * preserve the logical row strides supplied by the caller. */
+typedef int (*ds4f_gpu_dense_gemm_fn)(
+    void *ctx, float *dst, const ds4f_tensor *t, const float *x,
+    int M, int Ystride, int Xstride);
+typedef int (*ds4f_gpu_dense_gemm_multi_fn)(
+    void *ctx, float *const *dst, const ds4f_tensor *const *t,
+    const float *const *x, const int *M, const int *Ystride,
+    const int *Xstride, int n);
+typedef int (*ds4f_gpu_dense_layer_fn)(void *ctx, const ds4f_layer *layer);
+typedef int (*ds4f_gpu_dense_layer_prefetch_fn)(void *ctx, const ds4f_layer *layer);
+typedef int (*ds4f_gpu_prefill_attn_fn)(
+    void *ctx, float *dst, const float *q, const uint16_t *kv,
+    const float *sink, const float *rcos, const float *rsin,
+    int rope_offset, int rope_pairs, int M, int pos0, int n_heads,
+    int head_dim, int kv_dim, int kv_slots, int window, float scale);
+/* Same window-attention math as ds4f_gpu_prefill_attn_fn, but returns the
+ * UNNORMALIZED weighted-sum (dst) plus the per-(token,head) softmax max
+ * (dst_max) and sum (dst_sum), so a caller can merge this GPU-computed
+ * window term with a CPU-computed sparse/compressed term (tier-B2's
+ * compressed-KV) via the standard online-softmax identity before
+ * normalizing and de-rotating. Mathematically exact, not an approximation. */
+typedef int (*ds4f_gpu_prefill_attn_partial_fn)(
+    void *ctx, float *dst, float *dst_max, float *dst_sum,
+    const float *q, const uint16_t *kv, const float *sink,
+    int M, int pos0, int n_heads, int head_dim, int kv_dim,
+    int kv_slots, int window, float scale);
+typedef int (*ds4f_gpu_prefill_attn_oproj_fn)(void *ctx, float *dst, const float *q, const uint16_t *kv,
+    const float *sink, const float *rcos, const float *rsin, const ds4f_tensor *wa, const ds4f_tensor *wb,
+    int M, int pos0, int n_heads, int head_dim, int kv_dim, int kv_slots, int window, float scale,
+    int rope_offset, int rope_pairs, int groups, int gin, int lora, int H, int C, int ointer);
+typedef int (*ds4f_gpu_prefill_qkv_fn)(void *ctx, float *q, float *kv,
+    const float *x, const ds4f_tensor *wqa, const ds4f_tensor *wkv,
+    const ds4f_tensor *wqb, const uint16_t *qnorm, int M, int C,
+    int q_lora, int H, int kv_lora);
 
 typedef struct {
     ds4f_config cfg;
+    int route_n_active; /* checkpoint tid2eid row stride before fast-profile truncation */
     int ep_rank, ep_size;
+    ds4f_mem_pool *mem;                       /* owns all model-side allocations */
     ds4f_layer *layers;
-    /* DS4F_MTP: the multi-token-prediction module (config num_nextn_predict_layers=1, tensors mtp.0.*).
-     * A full transformer Block (reuses ds4f_layer: attn + MoE) + the MTP fusion:
-     *   x' = e_proj(enorm(embed(next_id))) + h_proj(hnorm(x));  block(x'); head -> logits.
-     * Scaffolded (load + forward stub); the draft/verify spec-decode loop is the follow-on. */
-    int       has_mtp;                         /* DS4F_MTP loaded */
+    /* Three-stage DSpark parallel drafter (checkpoint namespace mtp.0..2). */
+    int       has_mtp;                         /* complete DSpark bundle loaded */
+    int       dspark_n_stages, dspark_block_size, dspark_noise_token;
+    int       dspark_markov_rank;
+    int       dspark_target_layers[DS4F_DSPARK_TARGET_LAYERS];
+    ds4f_dspark_stage dspark[DS4F_DSPARK_STAGES];
     /* DS4F_DECODE_BATCH: when dec_batch_seq!=NULL, ds4f_forward_verify decodes dec_nseq INDEPENDENT
      * sequences (batch elem k at position dec_batch_pos[k], reading cache set dec_batch_seq[k*L+layer])
      * instead of K consecutive tokens of one sequence. Set 0 aliases the layers' own live buffers. */
     int        dec_nseq;
+    int        dec_batch_cap;
     int       *dec_batch_pos;                  /* [dec_nseq] per-sequence positions (NULL = consecutive) */
     ds4f_lseq *dec_batch_seq;                  /* [dec_nseq * n_layers] cache sets (NULL = single-stream) */
-    ds4f_layer mtp;                            /* the MTP block (attn + MoE), like a main layer */
-    uint16_t *mtp_enorm, *mtp_hnorm, *mtp_norm;/* BF16 [hidden] RMSNorm weights (embed/hidden/final) */
-    ds4f_tensor mtp_e_proj, mtp_h_proj;        /* [hidden,hidden] dense fusion projections */
-    float    *mtp_hc_fn, *mtp_hc_base, *mtp_hc_scale;  /* MTP head's HC params */
     uint16_t *embed;        /* BF16 [vocab, hidden] (unused in synth decode) */
     ds4f_tensor head;       /* BF16 [vocab, hidden] (TP: only this node's vocab-shard rows) */
     int head_r0;            /* DS4F_TP_HEAD: global vocab offset of this node's head shard
@@ -421,11 +567,50 @@ typedef struct {
      * through the BW-bound bf16 kernel ~400 GB/s instead of the gather-bound
      * fp8 kernel ~70 GB/s). Set via DS4F_FP8_BF16=1. Experts stay MXFP4. */
     ds4f_qtype dense_qt;
+    void *gpu_dense_ctx;
+    ds4f_gpu_dense_matvec_fn gpu_dense_matvec;
+    ds4f_gpu_dense_async_multi_fn gpu_dense_async_multi;
+    ds4f_gpu_dense_wait_fn gpu_dense_wait;
+    ds4f_gpu_shared_ffn_fn gpu_shared_ffn;
+    ds4f_gpu_routed_ffn_fn gpu_routed_ffn;
+    ds4f_gpu_shared_ffn_fn gpu_shared_ffn_begin;
+    ds4f_gpu_shared_ffn_wait_fn gpu_shared_ffn_wait;
+    ds4f_gpu_oproj_fn gpu_oproj;
+    ds4f_gpu_head_argmax_fn gpu_head_argmax;
+    ds4f_gpu_dense_blockdiag_fn gpu_dense_blockdiag;
+    ds4f_gpu_dense_gemm_fn gpu_dense_gemm;
+    ds4f_gpu_dense_gemm_multi_fn gpu_dense_gemm_multi;
+    ds4f_gpu_dense_layer_prefetch_fn gpu_dense_layer_prefetch;
+    ds4f_gpu_dense_layer_fn gpu_dense_layer_begin;
+    ds4f_gpu_prefill_attn_fn gpu_prefill_attn;
+    ds4f_gpu_prefill_attn_partial_fn gpu_prefill_attn_partial;
+    int gpu_tb2_batch_enabled;
+    ds4f_gpu_prefill_attn_oproj_fn gpu_prefill_attn_oproj;
+    ds4f_gpu_prefill_qkv_fn gpu_prefill_qkv;
+    int gpu_prefill_qkv_enabled, gpu_qkv_device_chain, gpu_attn_device_chain;
+    int gpu_attn_no_d2h, gpu_routed_ffn_enabled, gpu_decode_routed_ffn_enabled;
+    int gpu_decode_attn_enabled, gpu_decode_attn_oproj_enabled, gpu_decode_qkv_enabled;
+    int gpu_dense_stream_prefill_only;
+    int gpu_dense_mixed;       /* opt-in mixed GPU/CPU independent-GEMM dispatch */
+    int gpu_exact_prefill;     /* skip GPU M>1 GEMMs; retain GPU M=1 decode */
     /* FP8 dense decode kernel: 0 = gather (LUT, bit-exact), 1 = magic-multiply
      * (FTZ, ~6 ops/lane, no gather; +2..18% in the HBM-stream decode regime,
      * subnormals flush to 0 -> values ~5e-5 off, fine for the harness). The
      * magic path also enables FTZ on every pool worker. Set via DS4F_FP8_MAGIC=1. */
     int fp8_magic;
+    /* x86 MXFP4 expert activation mode.  Allocators initialize this from
+     * DS4F_MXFP4_W4A8; keeping it per model lets a correctness harness compare
+     * exact-f32 and W4A8 models in one process. */
+    int mxfp4_w4a8;
+    /* Zero-copy routed experts: the MXFP4 expert tensors point directly at the
+     * mmap'd safetensors shards instead of at repacked arena copies, so their
+     * ~147 GB stay clean, evictable, file-backed page cache. Requires kernels
+     * that consume the ON-DISK nibble order and undo the x0.5 scale in-kernel
+     * (see matvec_mxfp4_1row_*_raw). Set by ds4f_load_real from a
+     * DS4F_STAGE_NOCOPY manifest; 0 keeps the repack-into-arena behaviour. */
+    int mxfp4_raw;
+    void  *blob_map;      /* kept mapped for the model's lifetime when mxfp4_raw */
+    size_t blob_map_sz;
     /* MXFP4 GEMM (M>1 expert/dense): 0 = svtbl per-token-pair (matvec_mxfp4_8row_2x,
      * default; the M=1 decode + small-M path -- ~84 Gmac/s, dequant re-run per pair);
      * >0 = M threshold above which the GEMM tile-dequants each 8-row group's nibbles
@@ -519,18 +704,39 @@ typedef struct {
     /* scratch (per-forward, single token) */
     float *s_hn, *s_q, *s_qlat, *s_kvlat, *s_attn, *s_oin, *s_o1, *s_o;
     float *s_h2, *s_router, *s_shg, *s_shu, *s_exg, *s_exu, *s_moe, *s_logits;
+    /* S2 routed-expert decode scratch: active experts are evaluated in two
+     * dispatches (all gate/up matvecs, then all down matvecs).  The legacy
+     * serial path continues to use s_exg/s_exu/s_o. */
+    float *s_exb_g, *s_exb_u, *s_exb_o;
     float *s_route;         /* routed-expert partial (owned-only); EP-summed via ar_cb */
+    int logical_ep_lanes;
+    float *s_lane_route;    /* optional [logical_ep_lanes, hidden] lane partials */
     float *s_attn_sc;       /* DS4F_ATTN_GEMM: [n_heads*(window+index_topk)] scores->softmax weights (lazy) */
+    /* DS4F_ATTN_HYBRID_GPU scratch (lazy): GPU window-partial output/max/sum
+     * and CPU compressed-partial output/max/sum, each [n_heads*head_dim] or
+     * [n_heads], merged via the online-softmax identity into s_attn. */
+    float *s_attn_hy, *s_attn_hymax, *s_attn_hysum;
+    float *s_attn_hc, *s_attn_hcmax, *s_attn_hcsum;
+    /* Batched tier-B2 hybrid attention.  The compressor/indexer recurrence is
+     * still stepped in causal order, but its per-position selections and a
+     * chronological BF16 window+tile KV slab are retained so the GPU window
+     * partial is issued once for the whole tile instead of once per token. */
+    float *p_attn_hy, *p_attn_hymax, *p_attn_hysum;
+    uint16_t *p_tb2_kv;
+    int *p_tb2_sel, *p_tb2_nsel;
+    int p_tb2_sel_stride;
     float *s_attn_m;             /* DS4F_CP_COMBINE: per-head local max (lazy, [n_heads]) */
     float *s_attn_comb;          /* DS4F_CP_COMBINE: packed [acc: n_heads*q_head_dim | l: n_heads] reduced in
                                   * ONE ar_cb (min collective count on this latency-bound fabric) (lazy) */
     float *p_attn_comb, *p_attn_m;  /* DS4F_CP_COMBINE verify/prefill: the K positions' partials collected so the
                                   * cross-node combine is ONE reduce for the whole chunk (m_tile-sized, lazy) */
     float *s_idx_qpre;      /* batched-prefill: pre-projected indexer q for the current pos (NULL=compute in index_step) */
+    /* Decode-time GPU tb2 precompute targets.  ds4f_compress_step and
+     * ds4f_index_step already accept precomputed projections (kv_pre/score_pre
+     * and q_pre); these hold the device results so the CPU never reads the
+     * compressor / indexer weight banks during decode. */
+    float *s_tb2_kvpre, *s_tb2_scpre, *s_tb2_qpre;
     float *v_idxq;          /* [m_tile*index_n_heads*index_head_dim] batched qproj output (lazy, verify prefill) */
-    float *v_cmp_kv, *v_cmp_score; /* [m_tile*2*kv_lora] batched layer-compressor projections */
-    int *s_idx_batch_sel;           /* optional tile-level CSA selections [K,index_topk] */
-    int s_idx_batch_K, s_idx_batch_pos0;
     /* batched (M>1) prefill scratch (only allocated by ds4f_alloc_prefill_batch;
      * NULL unless DS4F_PREFILL_BATCH is wired). Token-major [m_tile, width].
      * p_x is the carried hidden state for all M tokens. */
@@ -541,8 +747,9 @@ typedef struct {
      * owned shard + ar_cb SUM). When the head is replicated it aliases p_logits. Lazily allocated. */
     float *p_logits_full;
     /* expert-grouping prefill scratch: per owned slot a bucket of routed tokens
-     * (ex_tok[slot*m_tile+p]=token idx, ex_wt=its routed weight); p_exX gathers
-     * those tokens' h2, p_exG/p_exU hold the w1/w3 GEMM out, p_exO the w2 out. */
+     * (ex_tok[slot*m_tile+p]=token idx, ex_wt=its routed weight). The p_ex*
+     * slabs hold all local assignments contiguously so independent experts can
+     * share one gate/up, activation, and down dispatch. */
     int *ex_cnt, *ex_tok; float *ex_wt; float *p_exX, *p_exG, *p_exU, *p_exO; int ex_no;
     /* mHC 4-stream state (only used when m->mhc): x4/resid = [hc_mult*hidden]
      * stream buffers, xc = [hidden] collapsed hc_pre/hc_head output. */
@@ -576,10 +783,26 @@ typedef struct {
     float  *s_cp_cand_slot; /* [ep_size*index_topk] CP idx-merge: gathered candidate slots (as float) */
     float  *s_cp_cand_score;/* [ep_size*index_topk] CP idx-merge: gathered candidate scores */
     float  *v_x4, *v_resid; /* [K*hc_mult*hidden] M2b batched verify: the K positions' mHC states + residual */
+    /* DSpark consumes the mean mHC state after main-model layers 40..42.
+     * The single-token buffer is always available when DSpark is loaded;
+     * the tiled buffer is allocated with the verifier scratch. */
+    float *dspark_main_hidden, *dspark_tile_hidden;
+    int dspark_forward;      /* suppress recursive main-hidden capture while drafting */
     /* perf accounting (weight HBM bytes touched, reset per token by the runner) */
     size_t bytes_read;
+    /* Optional routing telemetry, lazily allocated when DS4F_ROUTE_TELEMETRY=1.
+     * route_hits is [n_layers,n_experts]; route_tokens counts routed tokens per
+     * layer.  Keeping it model-local makes server and benchmark reports agree. */
+    uint64_t *route_hits, *route_tokens;
+    int route_telemetry;
+    /* Token ids corresponding to the current forward call.  Hash-routed
+     * layers 0..n_hash_layers-1 require the original id; the embedding alone
+     * cannot recover it.  Serving code sets this immediately before a
+     * token/batch forward. */
+    const int *forward_token_ids;
+    int forward_token_count;
     /* per-phase wall-time profiler (seconds, accumulated; printed by runner) */
-#define DS4F_NPHASE 24
+#define DS4F_NPHASE 26
     double prof[DS4F_NPHASE];
 } ds4f_model;
 
@@ -602,12 +825,16 @@ enum { DS4F_P_QKV=0, DS4F_P_ATTN=1, DS4F_P_OPROJ=2, DS4F_P_SHARED=3,
        /* QKV_A..QKV_ROPE are SUB-timers of QKV (like TB2SCAN.. are of TB2PREP) */
        DS4F_P_QKV_A=16, DS4F_P_QKV_B=17, DS4F_P_QKV_KV=18, DS4F_P_QKV_ROPE=19,
        /* mHC + comm decode sub-timers (mhc* are inside "other"/oproj/experts; comm = ar_cb) */
-       DS4F_P_MHCPRE=20, DS4F_P_MHCPOST=21, DS4F_P_MHCCPY=22, DS4F_P_COMM=23 };
-static const char *ds4f_prof_names[24] = {
+       DS4F_P_MHCPRE=20, DS4F_P_MHCPOST=21, DS4F_P_MHCCPY=22, DS4F_P_COMM=23,
+       /* Decode-time MoE sub-timers (inside "experts"): CPU fallback for
+        * cache-missed experts vs. GPU matvec/routed-ffn for cache hits. */
+       DS4F_P_EXPERTS_CPU=24, DS4F_P_EXPERTS_GPU=25 };
+static const char *ds4f_prof_names[26] = {
     "qkv_proj","attn","o_proj","shared","router","experts","head","other","tb2prep","tb2scan",
     "tb2qproj","tb2rope","tb2icmp","tb2wproj","tb2lcmp","tb2topk",
     "qkv_wqa","qkv_wqb","qkv_wkv","qkv_rope",
-    "mhc_pre","mhc_post","mhc_cpy","comm" };
+    "mhc_pre","mhc_post","mhc_cpy","comm",
+    "exp_cpu","exp_gpu" };
 
 /* ===================== thread pool (pinned, spin) ===================== */
 typedef void (*ds4f_fn)(void *arg, int tid, int nthr);

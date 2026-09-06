@@ -133,24 +133,31 @@ def main(argv=None):
     s.add_argument("--command-timeout", type=float, default=1800.0)
 
     b = sub.add_parser("build")
-    b.add_argument("--model", default="laguna")
+    b.add_argument("--model")
     b.add_argument("--variant")
     b.add_argument("--kv-fp16", action="store_true",
                    help="experimental Laguna FP16 KV (FP8 variant only)")
     b.add_argument("--clean", action="store_true")
 
     st = sub.add_parser("stage")
-    st.add_argument("--model", default="laguna")
+    st.add_argument("--model")
     st.add_argument("--variant")
     st.add_argument("--stage-dir")
     st.add_argument("--model-dir")
+    st.add_argument("--work-dir")
+    st.add_argument("--deployment", choices=("single", "ep"),
+                    help="DS4F deployment topology")
+    st.add_argument("--tokenizer")
     st.add_argument("--np", type=int)
     st.add_argument("--tp-np", type=int, help="K3 tensor-parallel ranks per context")
     st.add_argument("--layer", type=int)
     st.add_argument("--experts")
+    st.add_argument("--exclude")
+    st.add_argument("--vcoord")
+    st.add_argument("--nshards", type=int)
 
     ss = sub.add_parser("stage-status")
-    ss.add_argument("--model", default="laguna")
+    ss.add_argument("--model")
     ss.add_argument("--variant")
     ss.add_argument("--stage-dir")
     ss.add_argument("--model-dir")
@@ -159,7 +166,7 @@ def main(argv=None):
     ss.add_argument("--no-fanout", action="store_true")
 
     r = sub.add_parser("start", help="start a runner")
-    r.add_argument("--model", default="laguna")
+    r.add_argument("--model")
     r.add_argument("--variant")
     r.add_argument("--kv-fp16", action="store_true",
                    help="experimental Laguna FP16 KV (FP8 variant only)")
@@ -182,6 +189,19 @@ def main(argv=None):
     r.add_argument("--experts", help="K3 expert range, e.g. 0-15")
     r.add_argument("--stage-dir")
     r.add_argument("--model-dir")
+    r.add_argument("--work-dir")
+    r.add_argument("--deployment", choices=("single", "ep"),
+                    help="DS4F deployment topology")
+    r.add_argument("--tokenizer")
+    r.add_argument("--ctx", type=int)
+    r.add_argument("--q8-dense", type=int, choices=(0, 1))
+    r.add_argument("--fp8-bf16", type=int, choices=(0, 1))
+    r.add_argument("--prefill-gemm", type=int, choices=(0, 1))
+    r.add_argument("--mhc", type=int, choices=(0, 1))
+    r.add_argument("--hc-par", type=int, choices=(0, 1))
+    r.add_argument("--hc-rmspar", type=int, choices=(0, 1))
+    r.add_argument("--vcoord")
+    r.add_argument("--nshards", type=int)
     r.add_argument("--result-dir")
     r.add_argument("--heartbeat-tokens", type=int)
     r.add_argument("--min-available-mib", type=int)
@@ -223,7 +243,7 @@ def main(argv=None):
     ch = sub.add_parser("chat", help="OpenAI-compatible Laguna chat")
     ch.add_argument("prompt")
     ch.add_argument("--system")
-    ch.add_argument("--model", default="laguna-s21")
+    ch.add_argument("--model")
     ch.add_argument("--max-new", type=int, default=256)
     ch.add_argument("--temperature", type=float, default=0.0)
     ch.add_argument("--top-k", type=int)
@@ -240,7 +260,7 @@ def main(argv=None):
     ca.add_argument("id")
 
     pr = sub.add_parser("profile")
-    pr.add_argument("--model", default="laguna")
+    pr.add_argument("--model")
     pr.add_argument("--variant")
     pr.add_argument("--kv-fp16", action="store_true",
                     help="experimental Laguna FP16 KV (FP8 variant only)")
@@ -258,7 +278,7 @@ def main(argv=None):
     ar.add_argument("id")
 
     kv = sub.add_parser("kv")
-    kv.add_argument("--model", default="laguna")
+    kv.add_argument("--model")
     kv.add_argument("action", choices=("save", "load", "clear", "stats"))
     kv.add_argument("--id")
     kv.add_argument("--path")
@@ -275,7 +295,9 @@ def main(argv=None):
     def opt(*keys):
         """Only send flags the user actually set: llmgr fills the defaults."""
         return {k: getattr(args, k) for k in keys
-                if getattr(args, k, None) not in (None, False, [])}
+                if getattr(args, k, None) is not None and
+                getattr(args, k, None) is not False and
+                getattr(args, k, None) != []}
 
     c = args.cmd
     if c == "health":
@@ -295,8 +317,9 @@ def main(argv=None):
     elif c == "stage":
         emit(call(args, "POST", "/stage",
                   dict(model=args.model,
-                       **opt("variant", "stage_dir", "model_dir", "np", "tp_np",
-                             "layer", "experts"))))
+                       **opt("variant", "stage_dir", "model_dir", "work_dir",
+                             "tokenizer", "np", "tp_np", "layer", "experts",
+                             "exclude", "vcoord", "nshards"))))
     elif c == "stage-status":
         q = {"model": args.model}
         q.update(opt("variant", "stage_dir", "model_dir", "np", "tp_np"))
@@ -313,9 +336,12 @@ def main(argv=None):
                              "np", "tp_np", "max_new", "tokens", "layer", "experts",
                              "cache_load", "cache_save",
                              "stage_dir", "model_dir", "result_dir",
+                             "work_dir", "deployment", "tokenizer", "ctx", "q8_dense",
+                             "fp8_bf16", "prefill_gemm", "mhc", "hc_par",
+                             "hc_rmspar", "exclude", "vcoord", "nshards",
                              "heartbeat_tokens", "min_available_mib",
                              "prompt", "ids", "prompt_ids",
-                             "gguf", "mtp", "exclude", "threads", "spec_k",
+                             "gguf", "mtp", "threads", "spec_k",
                              "batch", "tp_skip_ar", "stage",
                              "extra"))))
     elif c == "stop":
