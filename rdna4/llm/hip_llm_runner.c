@@ -9633,18 +9633,25 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
             return -1;
         }
         if (getenv("GLM5NEXT_HIP_DSA") && atoi(getenv("GLM5NEXT_HIP_DSA")) != 0) {
-            r->glm5next_dsa_gpu = (glm5next_dsa_gpu_cache *)calloc(
-                (size_t)r->glm5next.n_layers, sizeof(*r->glm5next_dsa_gpu));
-            if (!r->glm5next_dsa_gpu) {
-                fprintf(stderr, "hip_llm: GLM5Next DSA cache allocation failed\n");
-                glm5next_cpu_runtime_free(r->glm5next_cpu);
-                free(r->glm5next_cpu); r->glm5next_cpu = NULL;
-                return -1;
+            /* KDA stages sizeable temporary matrices on the same device.  Do
+             * not retain all DSA heads in that combined mode unless the user
+             * explicitly opts in; this avoids exhausting a 16 GB card. */
+            int stream_dsa = getenv("GLM5NEXT_HIP_KDA") &&
+                !getenv("GLM5NEXT_HIP_DSA_CACHE");
+            if (!stream_dsa) {
+                r->glm5next_dsa_gpu = (glm5next_dsa_gpu_cache *)calloc(
+                    (size_t)r->glm5next.n_layers, sizeof(*r->glm5next_dsa_gpu));
+                if (!r->glm5next_dsa_gpu) {
+                    fprintf(stderr, "hip_llm: GLM5Next DSA cache allocation failed\n");
+                    glm5next_cpu_runtime_free(r->glm5next_cpu);
+                    free(r->glm5next_cpu); r->glm5next_cpu = NULL;
+                    return -1;
+                }
             }
             glm5next_cpu_runtime_set_dsa_callback(r->glm5next_cpu,
                 glm5next_hip_dsa_callback, r);
-            fprintf(stderr, "hip_llm: GLM5Next HIP DSA callback enabled "
-                            "(persistent per-layer weight cache)\n");
+            fprintf(stderr, "hip_llm: GLM5Next HIP DSA callback enabled (%s cache)\n",
+                    stream_dsa ? "streaming" : "persistent per-layer weight");
         }
         if (getenv("GLM5NEXT_HIP_KDA") && atoi(getenv("GLM5NEXT_HIP_KDA")) != 0) {
             glm5next_cpu_runtime_set_kda_callback(r->glm5next_cpu,
@@ -14561,10 +14568,13 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     void *dq = NULL, *dkv = NULL, *do_w = NULL;
     void *dqcache = NULL, *dkcache = NULL, *dvcache = NULL, *dattn = NULL, *dout = NULL, *dvout = NULL;
     float *qr = NULL, *q = NULL, *kvl = NULL, *norm = NULL, *qhead = NULL;
-    glm5next_dsa_gpu_cache *cache = NULL; int otype = 0, rc = -1;
+    glm5next_dsa_gpu_cache local_cache; glm5next_dsa_gpu_cache *cache = NULL;
+    int persistent_cache = r && r->glm5next_dsa_gpu != NULL;
+    int otype = 0, rc = -1;
     if (!r || !model || !hidden || !out || !latent_cache || position < 0 || position >= max_seq_len) return -1;
-    if (!r->glm5next_dsa_gpu || layer < 0 || layer >= c->n_layers) return -1;
-    cache = &r->glm5next_dsa_gpu[layer];
+    if (layer < 0 || layer >= c->n_layers) return -1;
+    memset(&local_cache, 0, sizeof(local_cache));
+    cache = persistent_cache ? &r->glm5next_dsa_gpu[layer] : &local_cache;
     if (!cache->ready && glm5next_hip_dsa_cache_load(r, model, layer, cache) != 0) return -1;
 #define CB_VIEW(dst, suffix) do { char n[128]; snprintf(n, sizeof(n), "blk.%d.%s", layer, suffix); \
     if (glm5next_tensor_view_get(model, n, 1, &(dst)) != 0) goto done; } while (0)
@@ -14597,8 +14607,9 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
         for (int p = 0; p < nt; ++p) {
             if (hipMemcpy(dkv, latent_cache + (size_t)p*kv, (size_t)kv*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
             launch_matvec_q8_f32(r, dvout, (uint8_t *)cache->v_weight + (size_t)head*cache->v_stride, dkv, vdim, kv);
-            if (hipMemcpy((uint8_t *)dvcache + ((size_t)p*heads + head)*vdim*sizeof(float), dvout,
-                          (size_t)vdim*sizeof(float), hipMemcpyDeviceToDevice) != hipSuccess) goto done;
+            if (hipMemcpyAsync((uint8_t *)dvcache + ((size_t)p*heads + head)*vdim*sizeof(float), dvout,
+                               (size_t)vdim*sizeof(float), hipMemcpyDeviceToDevice,
+                               r->stream) != hipSuccess) goto done;
         }
     }
     if (hipStreamSynchronize(r->stream) != hipSuccess) goto done;
@@ -14613,6 +14624,10 @@ done:
     if (dqcache) hipFree(dqcache); if (dkcache) hipFree(dkcache); if (dvcache) hipFree(dvcache); if (dattn) hipFree(dattn);
     if (dout) hipFree(dout); if (dvout) hipFree(dvout);
     free(qr); free(q); free(kvl); free(norm); free(qhead);
+    if (!persistent_cache) {
+        if (local_cache.k_weight) hipFree(local_cache.k_weight);
+        if (local_cache.v_weight) hipFree(local_cache.v_weight);
+    }
     return rc;
 #undef CB_VIEW
 }
