@@ -116,7 +116,9 @@ static inline void glm5next_cpu_runtime_reset(glm5next_cpu_runtime *r) {
 
 static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
                                              int position) {
-    if (!r || !r->model || token < 0 || token >= r->config.vocab_size) return -1;
+    if (!r || !r->model || token < 0 || token >= r->config.vocab_size ||
+        position < 0 || position >= r->max_seq_len ||
+        (position != 0 && position != r->position)) return -1;
     int h = r->config.hidden_size, hc = r->config.hc_count, d = r->config.linear_head_dim;
     glm5next_tensor_view t;
     if (position == 0) glm5next_cpu_runtime_reset(r);
