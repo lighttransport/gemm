@@ -52,6 +52,25 @@ def responses_input_messages(value):
     for item in value:
         if isinstance(item, dict) and item.get("role"):
             messages.append(item)
+        elif isinstance(item, dict) and item.get("type") == "function_call":
+            # Responses represents the assistant's tool invocation as an
+            # output item rather than a role-bearing message. Keep it when a
+            # client sends the full prior turn back for the tool-result turn;
+            # otherwise the tool output has no causal assistant context.
+            name = item.get("name", "")
+            arguments = item.get("arguments", "{}")
+            try:
+                parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+            except (TypeError, ValueError):
+                parsed = {"input": str(arguments)}
+            if not isinstance(parsed, dict):
+                parsed = {"input": json.dumps(parsed, ensure_ascii=False)}
+            call = ["<tool_call>", f"<function={name}>"]
+            for key, value in parsed.items():
+                rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                call.extend((f"<parameter={key}>", rendered, "</parameter>"))
+            call.extend(("</function>", "</tool_call>"))
+            messages.append({"role": "assistant", "content": "\n".join(call)})
         elif isinstance(item, dict) and item.get("type") == "function_call_output":
             # Responses sends tool results as input items rather than chat
             # messages. Preserve them as a tool turn; dropping them makes a

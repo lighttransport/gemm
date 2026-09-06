@@ -22,6 +22,18 @@ class ProtocolTest(unittest.TestCase):
         self.assertIn("call_id=call_1", messages[-1]["content"])
         self.assertIn('"value": 21', messages[-1]["content"])
 
+    def test_responses_function_call_is_preserved(self):
+        messages = responses_input_messages([
+            {"role": "user", "content": "Call echo."},
+            {"type": "function_call", "call_id": "call_1", "name": "echo",
+             "arguments": '{"text":"hello"}'},
+            {"type": "function_call_output", "call_id": "call_1", "output": "hello"},
+        ])
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertIn("<function=echo>", messages[1]["content"])
+        self.assertIn("<parameter=text>\nhello", messages[1]["content"])
+        self.assertEqual(messages[2]["role"], "tool")
+
     def test_startup_waits_for_runner_ready(self):
         backend = Backend.__new__(Backend)
         backend.ready = False
