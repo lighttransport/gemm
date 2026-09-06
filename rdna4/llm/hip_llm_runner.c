@@ -15108,8 +15108,10 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     shared_out = (float *)malloc((size_t)c->hidden_size * sizeof(float));
     if (!router || !bias || !gate || !up || !expert_out || !shared_gate ||
         !shared_up || !shared_out) goto done;
-    if (getenv("GLM5NEXT_HIP_MOE_ROUTER") &&
-        atoi(getenv("GLM5NEXT_HIP_MOE_ROUTER")) != 0) {
+    {
+        const char *router_env = getenv("GLM5NEXT_HIP_MOE_ROUTER");
+        int use_hip_router = !router_env || atoi(router_env) != 0;
+        if (use_hip_router) {
         qtensor qrouter = glm5next_as_qtensor(&router_v);
         int router_type = 0;
         if (upload_weight_matrix(&drw, &qrouter, &router_type) != 0 ||
@@ -15124,8 +15126,9 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
             hipMemcpy(router, dr, (size_t)c->expert_count * sizeof(float),
                       hipMemcpyDeviceToHost) != hipSuccess)
             goto done;
-    } else if (glm5next_cpu_matvec(router, &router_v, hidden) != 0) {
-        goto done;
+        } else if (glm5next_cpu_matvec(router, &router_v, hidden) != 0) {
+            goto done;
+        }
     }
     if (glm5next_cpu_vector(&bias_v, bias, c->expert_count) != 0) goto done;
 
