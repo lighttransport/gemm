@@ -67,6 +67,9 @@ def parse_calls(text, registry):
         if index and text[matches[index - 1].end():match.start()].strip():
             return text, []
         name, body = match.groups()
+        name = name.strip()
+        if not name:
+            return text, []
         spec = registry.get(name)
         if spec is None:
             # Qwen commonly emits the bare function name even when the API
@@ -87,6 +90,9 @@ def parse_calls(text, registry):
         properties = spec["parameters"].get("properties", {})
         for parameter in parameters:
             key, value = parameter.groups()
+            key = key.strip()
+            if not key:
+                return text, []
             if key in arguments or key not in properties:
                 return text, []
             if properties[key].get("type") != "string":

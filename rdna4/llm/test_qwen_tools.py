@@ -53,6 +53,15 @@ class QwenToolsTest(unittest.TestCase):
         self.assertEqual(calls[0]["name"], "echo")
         self.assertEqual(calls[0]["namespace"], "shell")
 
+    def test_whitespace_around_tool_names_is_accepted(self):
+        text, calls = parse_calls(
+            "<tool_call>\n<function= shell.echo >\n"
+            "<parameter= text >\nhello\n</parameter>\n"
+            "</function>\n</tool_call>", self.registry)
+        self.assertEqual(text, "")
+        self.assertEqual(calls[0]["name"], "echo")
+        self.assertEqual(calls[0]["arguments"], '{"text": "hello"}')
+
 
 if __name__ == "__main__":
     unittest.main()
