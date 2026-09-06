@@ -10,6 +10,7 @@
 
 #include "hip_llm_runner.h"
 #include "../../common/glm5next_ref.h"
+#include "../../common/glm5next_cpu_runtime.h"
 #include "../rocew.h"
 
 #include <stdio.h>
@@ -8282,6 +8283,7 @@ struct hip_llm_runner {
     int is_glm5next;
     glm5next_config glm5next;
     glm5next_state_layout glm5next_layout;
+    glm5next_cpu_runtime *glm5next_cpu;
     hip_llm_moe_mode requested_moe_mode;
     uint64_t requested_moe_cache_bytes;
     uint64_t requested_gpu_reserve_bytes;
@@ -9477,9 +9479,19 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                          r->glm5next_layout.indexer_bytes +
                          r->glm5next_layout.mhc_bytes) / (1024.0 * 1024.0));
         fprintf(stderr,
-                "hip_llm: GLM5Next graph is not wired into the HIP executor yet; "
-                "refusing legacy Qwen tensor dispatch\n");
-        return -2;
+                "hip_llm: GLM5Next HIP graph is pending; enabling CPU reference "
+                "execution with persistent KDA state\n");
+        if (!hllm_active_shards) return -1;
+        r->glm5next_cpu = (glm5next_cpu_runtime *)calloc(1, sizeof(*r->glm5next_cpu));
+        if (!r->glm5next_cpu || glm5next_cpu_runtime_init(r->glm5next_cpu,
+                    hllm_active_shards, error, sizeof(error)) != 0) {
+            fprintf(stderr, "hip_llm: GLM5Next CPU runtime init failed: %s\n", error);
+            free(r->glm5next_cpu); r->glm5next_cpu = NULL;
+            return -1;
+        }
+        r->has_lm_head = 1;
+        r->weights_loaded = 1;
+        return 0;
     }
 
     const char *arch = "qwen2";
@@ -12732,6 +12744,11 @@ float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position) {
     if (!r || !r->weights_loaded) return NULL;
     if (token_id < 0 || token_id >= r->n_vocab) return NULL;
     if (position < 0 || position >= r->max_seq_len) return NULL;
+    if (r->is_glm5next) {
+        if (!r->glm5next_cpu || glm5next_cpu_runtime_step(r->glm5next_cpu, token_id, position) != 0)
+            return NULL;
+        return r->glm5next_cpu->hidden;
+    }
 
     int n_embd = r->n_embd;
     if (r->is_qwen4exp) r->ple_token_id = token_id;
@@ -15254,6 +15271,11 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
     if (token_id < 0 || token_id >= r->n_vocab) return NULL;
     if (position < 0 || position >= r->max_seq_len) return NULL;
     if (!r->has_lm_head) return NULL;
+    if (r->is_glm5next) {
+        if (!r->glm5next_cpu || glm5next_cpu_runtime_step(r->glm5next_cpu, token_id, position) != 0)
+            return NULL;
+        return r->glm5next_cpu->logits;
+    }
 
     int n_embd = r->n_embd;
     if (r->is_qwen4exp) r->ple_token_id = token_id;
@@ -16601,6 +16623,11 @@ void hip_llm_free(hip_llm_runner *r) {
     }
     if (r->stream) hipStreamDestroy(r->stream);
 
+    if (r->glm5next_cpu) {
+        glm5next_cpu_runtime_free(r->glm5next_cpu);
+        free(r->glm5next_cpu);
+        r->glm5next_cpu = NULL;
+    }
     glm5next_config_free(&r->glm5next);
     free(r);
 }
@@ -16874,6 +16901,10 @@ done:
 
 void hip_llm_reset_state(hip_llm_runner *r) {
     if (!r) return;
+    if (r->is_glm5next) {
+        if (r->glm5next_cpu) glm5next_cpu_runtime_reset(r->glm5next_cpu);
+        return;
+    }
     hip_llm_set_decode_mode(r, 0);
     if (r->ple_n_heads > 0) {
         r->ple_history[0] = r->ple_history[1] = r->ple_eos_token;
