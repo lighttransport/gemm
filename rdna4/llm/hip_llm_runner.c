@@ -10000,11 +10000,11 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
             return -1;
         }
         if (getenv("GLM5NEXT_HIP_DSA") && atoi(getenv("GLM5NEXT_HIP_DSA")) != 0) {
-            /* KDA stages sizeable temporary matrices on the same device.  Do
-             * not retain all DSA heads in that combined mode unless the user
-             * explicitly opts in; this avoids exhausting a 16 GB card. */
-            int stream_dsa = getenv("GLM5NEXT_HIP_KDA") &&
-                !getenv("GLM5NEXT_HIP_DSA_CACHE");
+            /* DSA's per-layer K/V projections are large (and NextN adds one
+             * more layer).  Stream them by default; retaining the full cache
+             * is an explicit opt-in for cards with enough free VRAM. */
+            int stream_dsa = !getenv("GLM5NEXT_HIP_DSA_CACHE") ||
+                atoi(getenv("GLM5NEXT_HIP_DSA_CACHE")) == 0;
             if (!stream_dsa) {
                 r->glm5next_dsa_gpu = (glm5next_dsa_gpu_cache *)calloc(
                     (size_t)r->glm5next.n_layers_all, sizeof(*r->glm5next_dsa_gpu));
