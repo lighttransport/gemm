@@ -6,7 +6,14 @@
 CC = gcc
 HIPCC ?= hipcc
 ROCM_PATH ?= /opt/rocm
-CFLAGS = -O3 -Wall -Wextra -I.. -march=native
+COMMA := ,
+ROCM_LIBDIR ?= $(shell \
+	if [ -f "$(ROCM_PATH)/lib/libhipblaslt.so" ]; then \
+		echo "$(ROCM_PATH)/lib"; \
+	else \
+		find "$(ROCM_PATH)" -name libhipblaslt.so -print -quit 2>/dev/null | xargs -r dirname; \
+	fi)
+CFLAGS = -O3 -Wall -Wextra -D_GNU_SOURCE -I.. -march=native
 LDFLAGS = -ldl -lm -lpthread
 
 # Sources
@@ -27,7 +34,7 @@ all: $(TARGET)
 
 ifeq ($(HIPBLASLT),1)
 CFLAGS += -DLLM_HIPBLASLT_ENABLED
-LDFLAGS += -L$(ROCM_PATH)/lib -lhipblaslt -lstdc++
+LDFLAGS += $(if $(ROCM_LIBDIR),-L$(ROCM_LIBDIR) -Wl$(COMMA)-rpath$(COMMA)$(ROCM_LIBDIR)) -lhipblaslt -lstdc++
 BLASLT_OBJ = mm_blaslt_bridge.o
 else
 BLASLT_OBJ =

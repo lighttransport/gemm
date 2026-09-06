@@ -27,6 +27,16 @@
  *   out_dir/rank<rr>.manifest   header line + one line per tensor:
  *       <local_off> <nbytes> <dtype> <ndims> <d0..dn> <name>
  *
+ * DS4F_STAGE_NOCOPY=1 writes the manifest ONLY, with offsets pointing into a
+ * virtual concatenation of the ORIGINAL safetensors shards (recorded as
+ * "#shard <idx> <vbase> <size> <path>" header lines). The loader reserves one
+ * address range and MAP_FIXEDs each shard into it, so the rest of the load path
+ * still sees a single flat blob and needs no changes. This exists because the
+ * hetero/ds4f host has ~68 GB free disk and the ep_size=1 blob would be ~150 GB.
+ * It requires every kept tensor to be usable as-is: no bake overlay, and no
+ * F32->E8M0 scale fold (true for ds4f Flash, whose scales already ship F8_E8M0,
+ * but NOT for ds4fbase -- the stager refuses no-copy in that case).
+ *
  * Build (native A64FX):
  *   fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -std=c11 \
  *       -D_GNU_SOURCE -I../../common -o build/ds4f_stage ds4f_stage.c
@@ -255,6 +265,7 @@ int main(void) {
      * the 11-node stage). Force writeback + drop cache every DS4F_STAGE_FLUSH_GB
      * (default 2) GB written, and DONTNEED each source shard's clean mmap pages
      * after use -> peak staging HBM ~= flush_gb (dirty) + one shard (clean). */
+    int nocopy = envi("DS4F_STAGE_NOCOPY", 0);
     int flush_gb = envi("DS4F_STAGE_FLUSH_GB", 2);
     uint64_t flush_bytes = (uint64_t)(flush_gb > 0 ? flush_gb : 2) << 30;
 
@@ -281,8 +292,13 @@ int main(void) {
     snprintf(blob_path, sizeof blob_path, "%s/rank%02d.blob", stage_dir, rank);
     snprintf(mani_path, sizeof mani_path, "%s/rank%02d.manifest", stage_dir, rank);
 
-    int bfd = open(blob_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (bfd < 0) { fprintf(stderr, "ds4f_stage: cannot create %s: %s\n", blob_path, strerror(errno)); return 2; }
+    if (nocopy && g_bake_n) {
+        fprintf(stderr, "ds4f_stage: DS4F_STAGE_NOCOPY is incompatible with DS4F_DENSE bake overlay "
+                        "(baked tensors have no bytes in the original shards)\n");
+        return 2;
+    }
+    int bfd = nocopy ? -1 : open(blob_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (!nocopy && bfd < 0) { fprintf(stderr, "ds4f_stage: cannot create %s: %s\n", blob_path, strerror(errno)); return 2; }
     FILE *mf = fopen(mani_path, "w");
     if (!mf) { fprintf(stderr, "ds4f_stage: cannot create %s: %s\n", mani_path, strerror(errno)); close(bfd); return 2; }
 
@@ -295,6 +311,12 @@ int main(void) {
     long hdr_pos = ftell(mf);
     fprintf(mf, "# DS4FMANIFEST rank=%02d ep_size=%02d n_tensors=%-12d blob_bytes=%-18lld\n",
             rank, ep_size, 0, 0LL);
+
+    /* NOCOPY: each shard is mapped whole, page-aligned, into one virtual range;
+     * vbase is this shard's start in that range. Tensor offsets are then just
+     * vbase + (data section start + in-file tensor offset). */
+    const uint64_t PAGE = 4096;
+    uint64_t vbase = 0;
 
     uint64_t off = 0;                  /* current (aligned) blob offset */
     uint64_t last_sync = 0;            /* blob bytes already flushed + dropped */
@@ -310,6 +332,13 @@ int main(void) {
         snprintf(shard, sizeof shard, "%s/model-%05d-of-%05d.safetensors", model_dir, s, nshards);
         st_context *st = safetensors_open(shard);
         if (!st) { fprintf(stderr, "ds4f_stage: skip unreadable shard %s\n", shard); continue; }
+        uint64_t shard_vbase = vbase, shard_dofs = 0;
+        if (nocopy) {
+            shard_dofs = (uint64_t)((const uint8_t *)st->data - (const uint8_t *)st->map_base);
+            fprintf(mf, "#shard %d %llu %llu %s\n", s,
+                    (unsigned long long)shard_vbase, (unsigned long long)st->map_size, shard);
+            vbase += (st->map_size + PAGE - 1) & ~(PAGE - 1);
+        }
 
         int kept = 0;
         for (int i = 0; i < st->n_tensors; i++) {
@@ -334,6 +363,12 @@ int main(void) {
 
             /* ds4fbase ships *.scale as F32; fold it to the E8M0 byte the loader expects.
              * (ds4f's scales are already F8_E8M0 -> this never fires, plain byte copy.) */
+            if (nocopy && !be && strcmp(dtype, "F32") == 0 && is_scale_name(name)) {
+                fprintf(stderr, "ds4f_stage: DS4F_STAGE_NOCOPY cannot serve '%s': its F32 scale needs "
+                                "the E8M0 fold, so the bytes must be materialized (use ds4f Flash, "
+                                "whose scales already ship F8_E8M0)\n", name);
+                goto fail;
+            }
             if (!be && strcmp(dtype, "F32") == 0 && is_scale_name(name)) {
                 if (nb / 4 > sizeof e8m0_buf) {   /* scales are tiny (<=8 KB); guard anyway */
                     fprintf(stderr, "ds4f_stage: '%s' scale too large (%zu B) for the E8M0 buffer\n", name, nb);
@@ -343,17 +378,22 @@ int main(void) {
                 src = e8m0_buf; nb /= 4; dtype = "F8_E8M0"; n_e8m0++;
             }
 
-            /* align the destination offset to ALIGN (sparse seek over the gap) */
-            uint64_t aligned = (off + (ALIGN - 1)) & ~(uint64_t)(ALIGN - 1);
-            if (aligned != off) {
-                if (lseek(bfd, (off_t)aligned, SEEK_SET) < 0) {
-                    fprintf(stderr, "ds4f_stage: lseek failed: %s\n", strerror(errno));
+            uint64_t aligned;
+            if (nocopy) {
+                aligned = shard_vbase + shard_dofs + (uint64_t)t->offset;   /* into the mapped shard */
+            } else {
+                /* align the destination offset to ALIGN (sparse seek over the gap) */
+                aligned = (off + (ALIGN - 1)) & ~(uint64_t)(ALIGN - 1);
+                if (aligned != off) {
+                    if (lseek(bfd, (off_t)aligned, SEEK_SET) < 0) {
+                        fprintf(stderr, "ds4f_stage: lseek failed: %s\n", strerror(errno));
+                        goto fail;
+                    }
+                }
+                if (write_all(bfd, src, nb) != 0) {
+                    fprintf(stderr, "ds4f_stage: write failed on %s: %s\n", name, strerror(errno));
                     goto fail;
                 }
-            }
-            if (write_all(bfd, src, nb) != 0) {
-                fprintf(stderr, "ds4f_stage: write failed on %s: %s\n", name, strerror(errno));
-                goto fail;
             }
 
             /* manifest line: off nbytes dtype ndims shape... name
@@ -365,20 +405,20 @@ int main(void) {
             for (int d = 0; d < nd; d++) fprintf(mf, " %llu", (unsigned long long)shape[d]);
             fprintf(mf, " %s\n", name);
 
-            off = aligned + nb;
+            off = nocopy ? off + nb : aligned + nb;
             if (cls == CLS_EXPERT) { n_expert++; b_expert += nb; }
             else                   { n_dense++;  b_dense  += nb; }
             kept++;
 
             /* keep the blob's dirty page cache bounded in HBM */
-            if (off - last_sync >= flush_bytes) {
+            if (!nocopy && off - last_sync >= flush_bytes) {
                 fdatasync(bfd);
                 posix_fadvise(bfd, 0, 0, POSIX_FADV_DONTNEED);
                 last_sync = off;
             }
         }
         /* drop this shard's source pages (clean, read-only) before the next */
-        madvise(st->map_base, st->map_size, MADV_DONTNEED);
+        if (!nocopy) madvise(st->map_base, st->map_size, MADV_DONTNEED);
         safetensors_close(st);
         double el = now_sec() - t0;
         double gb = (b_dense + b_expert) / 1e9;
@@ -396,18 +436,25 @@ int main(void) {
     fprintf(mf, "# DS4FMANIFEST rank=%02d ep_size=%02d n_tensors=%-12lld blob_bytes=%-18llu\n",
             rank, ep_size, n_total, (unsigned long long)b_total);
     fclose(mf);
-    fdatasync(bfd);                                  /* flush the tail dirty pages */
-    posix_fadvise(bfd, 0, 0, POSIX_FADV_DONTNEED);   /* release the blob cache from HBM */
-    if (close(bfd) < 0) { fprintf(stderr, "ds4f_stage: close blob failed: %s\n", strerror(errno)); return 2; }
+    if (!nocopy) {
+        fdatasync(bfd);                                  /* flush the tail dirty pages */
+        posix_fadvise(bfd, 0, 0, POSIX_FADV_DONTNEED);   /* release the blob cache from HBM */
+        if (close(bfd) < 0) { fprintf(stderr, "ds4f_stage: close blob failed: %s\n", strerror(errno)); return 2; }
+    }
 
     printf("\nrank %d done: %lld tensors (%lld dense / %lld expert)\n", rank, n_total, n_dense, n_expert);
     printf("  F32->E8M0 scales folded: %lld  (0 = ds4f, already E8M0)\n", n_e8m0);
     printf("  dense from BAKE overlay:  %lld %s  (0 = DS4F_DENSE=fp8, no overlay)\n",
            n_baked, g_bake_dtype ? g_bake_dtype : "-");
-    printf("  staged %.2f GB (dense %.2f + expert %.2f)  blob_size=%.2f GB\n",
-           b_total / 1e9, b_dense / 1e9, b_expert / 1e9, off / 1e9);
+    if (nocopy)
+        printf("  NOCOPY: %.2f GB referenced in place (dense %.2f + expert %.2f); no blob written\n",
+               b_total / 1e9, b_dense / 1e9, b_expert / 1e9);
+    else
+        printf("  staged %.2f GB (dense %.2f + expert %.2f)  blob_size=%.2f GB\n",
+               b_total / 1e9, b_dense / 1e9, b_expert / 1e9, off / 1e9);
     printf("  %.1f s  %.2f GB/s effective\n", tel, tel > 0 ? b_total / 1e9 / tel : 0.0);
-    printf("  -> %s\n  -> %s\n", blob_path, mani_path);
+    if (nocopy) printf("  -> %s (references %s/model-*.safetensors)\n", mani_path, model_dir);
+    else        printf("  -> %s\n  -> %s\n", blob_path, mani_path);
 
     /* per-rank status line on the SHARED FS (mpiexec drops stdout and /local is
      * node-local) so a multinode launcher can confirm every rank finished. */

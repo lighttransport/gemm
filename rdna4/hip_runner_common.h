@@ -88,9 +88,10 @@ static void *hip_upload_raw(const void *data, size_t bytes) {
 
 /* ---- HIPRTC kernel compilation ---- */
 
-static int hip_compile_kernels(hipModule_t *module, int device_id,
-                                const char *source, const char *prog_name,
-                                int verbose, const char *prefix) {
+static int hip_compile_kernels_ex(hipModule_t *module, int device_id,
+                                   const char *source, const char *prog_name,
+                                   int verbose, const char *prefix,
+                                   int precise_override) {
     const char *arch = rocewGetRDNA4ArchString(device_id);
     if (!arch) {
         /* Fallback: get arch from device properties */
@@ -103,7 +104,8 @@ static int hip_compile_kernels(hipModule_t *module, int device_id,
     }
 
     const char *precise_env = getenv("HIP_RUNNER_PRECISE_MATH");
-    int precise_math = precise_env && precise_env[0] && strcmp(precise_env, "0") != 0;
+    int precise_math = precise_override >= 0 ? precise_override :
+        (precise_env && precise_env[0] && strcmp(precise_env, "0") != 0);
 
     if (verbose >= 1)
         fprintf(stderr, "%s: compiling kernels for %s (%s math) ...\n",
@@ -164,6 +166,13 @@ static int hip_compile_kernels(hipModule_t *module, int device_id,
 
     /* Return a positive value to indicate success (arch-dependent) */
     return 1;
+}
+
+static int hip_compile_kernels(hipModule_t *module, int device_id,
+                               const char *source, const char *prog_name,
+                               int verbose, const char *prefix) {
+    return hip_compile_kernels_ex(module, device_id, source, prog_name,
+                                  verbose, prefix, -1);
 }
 
 #endif /* HIP_RUNNER_COMMON_IMPLEMENTATION */

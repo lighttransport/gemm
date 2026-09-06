@@ -178,6 +178,17 @@ int cublasew_gemm_f16_f32_rowmajor_nt(cublasew_context *ctx,
                                       int n_out,
                                       int n_in);
 
+/* Native FP8 tensor-core GEMM with F32 block scales. A is row-major E4M3
+ * with one scale per row/128 K values; B is W[n_out,n_in] E4M3 with one
+ * scale per 128x128 weight block. Y is row-major F32. */
+int cublasew_gemm_fp8_scaled_rowmajor_nt(cublasew_context *ctx,
+                                         CUdeviceptr d_Y,
+                                         CUdeviceptr d_W_fp8,
+                                         CUdeviceptr d_W_scale,
+                                         CUdeviceptr d_X_fp8,
+                                         CUdeviceptr d_X_scale,
+                                         int n_tok, int n_out, int n_in);
+
 /* Row-major Y[m, n_out] = X[m, n_in] * W[n_out, n_in]^T
  * W and X are FP16, Y is FP32, compute is FP32.
  * Use when mixed F16×F32 is not supported (Blackwell).

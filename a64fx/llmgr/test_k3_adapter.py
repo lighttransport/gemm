@@ -19,6 +19,10 @@ class K3AdapterTest(unittest.TestCase):
         self.assertIn("generate", d["modes"])
         self.assertTrue(d["supports_cache"])
 
+    def test_semantic_api_is_not_available_for_partial_runner(self):
+        with self.assertRaises(models.ConfigError):
+            self.a.responses_request({"input": "hello"})
+
     def test_stage_is_stage_only_and_arg_driven(self):
         argv, env, cwd = self.a.stage({
             "np": 96, "layer": 2, "experts": "0-7",

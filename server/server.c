@@ -5,6 +5,7 @@
  * model code, stb_image_write for PNG encoding, and the safetensors JSON parser.
  */
 
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #define SAFETENSORS_IMPLEMENTATION
@@ -25,6 +26,7 @@
 #include "../common/gguf_loader.h"
 #include "../common/bpe_tokenizer.h"
 #include "../common/transformer.h"
+#include "../common/ds4f.h"
 #include "../common/qwen_image_scheduler.h"
 
 #if defined(DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_HIP)
@@ -96,6 +98,8 @@ typedef struct {
     const char *sam3_1_ref_url;   /* http://host:port forwarded via /v1/ref/sam3.1 */
     const char *qwen_ref_url;     /* http://host:port pytorch/comfyui fp8 reference bridge (backend=pytorch) */
     const char *llm_model;
+    const char *ds4f_model;
+    ds4f_runtime_options ds4f_options;
     const char *llm_mmproj;
     llm_state g_llm;
     int device;
@@ -168,12 +172,21 @@ typedef struct {
     char     phase[24];     /* idle|starting|encode|dit_load|dit|vae_load|vae|done */
     int      dit_step;
     int      dit_total;
+    int      prompt_tokens;
+    int      prompt_processed;
+    int      completion_tokens;
+    int      completion_total;
+    int      cache_hit;
+    double   prompt_tps;
+    double   decode_tps;
     char     gpu[128];
     double   started_ms;
 } progress_state;
 
 static progress_state g_prog = {
-    PTHREAD_MUTEX_INITIALIZER, 0, 0, "", "", "idle", 0, 0, "", 0.0
+    .mu = PTHREAD_MUTEX_INITIALIZER, .active = 0, .job_id = 0,
+    .model = "", .precision = "", .phase = "idle",
+    .dit_step = 0, .dit_total = 0, .gpu = "", .started_ms = 0.0
 };
 
 static void progress_begin(const char *model, const char *precision) {
@@ -184,6 +197,9 @@ static void progress_begin(const char *model, const char *precision) {
     snprintf(g_prog.precision, sizeof(g_prog.precision), "%s", precision ? precision : "");
     snprintf(g_prog.phase, sizeof(g_prog.phase), "%s", "starting");
     g_prog.dit_step = 0; g_prog.dit_total = 0;
+    g_prog.prompt_tokens = 0; g_prog.prompt_processed = 0;
+    g_prog.completion_tokens = 0; g_prog.completion_total = 0;
+    g_prog.cache_hit = 0; g_prog.prompt_tps = 0.0; g_prog.decode_tps = 0.0;
     g_prog.gpu[0] = 0;
     g_prog.started_ms = now_ms();
     pthread_mutex_unlock(&g_prog.mu);
@@ -202,6 +218,27 @@ static void progress_dit(int step, int total) {
     pthread_mutex_lock(&g_prog.mu);
     snprintf(g_prog.phase, sizeof(g_prog.phase), "%s", "dit");
     g_prog.dit_step = step; g_prog.dit_total = total;
+    pthread_mutex_unlock(&g_prog.mu);
+}
+
+/* DS4F/LLM progress hook.  Kept separate from the image progress fields so
+ * GET /v1/progress remains useful while a long prompt or decode is running. */
+void server_progress_llm(const char *phase, int processed, int total,
+                         int completion, int cache_hit) {
+    pthread_mutex_lock(&g_prog.mu);
+    snprintf(g_prog.phase, sizeof(g_prog.phase), "%s", phase ? phase : "llm");
+    if (completion) {
+        g_prog.completion_tokens = processed;
+        g_prog.completion_total = total;
+        double sec = (now_ms() - g_prog.started_ms) / 1000.0;
+        if (sec > 0.0) g_prog.decode_tps = processed / sec;
+    } else {
+        g_prog.prompt_processed = processed;
+        g_prog.prompt_tokens = total;
+        if (cache_hit) g_prog.cache_hit = 1;
+        double sec = (now_ms() - g_prog.started_ms) / 1000.0;
+        if (sec > 0.0) g_prog.prompt_tps = processed / sec;
+    }
     pthread_mutex_unlock(&g_prog.mu);
 }
 static void progress_end(void) {
@@ -1640,9 +1677,15 @@ static char *progress_json(void) {
     sbuf b; sbuf_init(&b);
     sbuf_printf(&b,
         "{\"ok\":true,\"active\":%s,\"job_id\":%llu,\"model\":\"%s\",\"precision\":\"%s\","
-        "\"phase\":\"%s\",\"dit_step\":%d,\"dit_total\":%d,\"gpu\":\"%s\",\"elapsed_ms\":%.0f}",
+        "\"phase\":\"%s\",\"dit_step\":%d,\"dit_total\":%d,"
+        "\"prompt_tokens\":%d,\"prompt_processed\":%d,\"prompt_tps\":%.2f,"
+        "\"completion_tokens\":%d,\"completion_total\":%d,\"decode_tps\":%.2f,"
+        "\"cache_hit\":%s,\"gpu\":\"%s\",\"elapsed_ms\":%.0f}",
         g_prog.active ? "true" : "false", (unsigned long long)g_prog.job_id,
-        md, pr, ph, g_prog.dit_step, g_prog.dit_total, gpu, elapsed);
+        md, pr, ph, g_prog.dit_step, g_prog.dit_total,
+        g_prog.prompt_tokens, g_prog.prompt_processed, g_prog.prompt_tps,
+        g_prog.completion_tokens, g_prog.completion_total, g_prog.decode_tps,
+        g_prog.cache_hit ? "true" : "false", gpu, elapsed);
     free(gpu); free(ph); free(pr); free(md);
     pthread_mutex_unlock(&g_prog.mu);
     return b.ptr;
@@ -1709,8 +1752,20 @@ static char *models_json(const server_config *cfg) {
     if (cfg && cfg->g_llm.loaded) {
         char *mp = json_escape_dup(cfg->g_llm.model_path);
         sbuf_printf(&out,
-            "{\"id\":\"%s\",\"tasks\":[\"chat\",\"completions\"],\"backends\":[\"cpu\"],\"is_vlm\":%s}",
-            mp, cfg->g_llm.is_vlm ? "true" : "false");
+            "{\"id\":\"%s\",\"tasks\":[\"chat\",\"completions\"],\"backends\":[\"%s\"],\"is_vlm\":%s}",
+            mp, cfg->g_llm.backend == LLM_BACKEND_DS4F ? "ds4f-x86" : "cpu",
+            cfg->g_llm.is_vlm ? "true" : "false");
+        if (cfg->g_llm.backend == LLM_BACKEND_DS4F) {
+            /* Expose stable logical aliases in addition to the staged path. */
+            if (strcmp(cfg->g_llm.model_path, "ds4f-q3") != 0)
+                sbuf_append(&out,
+                    ",{\"id\":\"ds4f-q3\",\"tasks\":[\"chat\",\"completions\"],"
+                    "\"backends\":[\"ds4f-x86\"],\"is_vlm\":false}");
+            if (strcmp(cfg->g_llm.model_path, "ds4f") != 0)
+                sbuf_append(&out,
+                    ",{\"id\":\"ds4f\",\"tasks\":[\"chat\",\"completions\"],"
+                    "\"backends\":[\"ds4f-x86\"],\"is_vlm\":false}");
+        }
         free(mp);
     } else {
         sbuf_append(&out,
@@ -1718,6 +1773,20 @@ static char *models_json(const server_config *cfg) {
     }
     sbuf_append(&out, "]}");
     return out.ptr;
+}
+
+static char *model_detail_json(const server_config *cfg, const char *requested) {
+    sbuf b; sbuf_init(&b);
+    const char *id = requested && *requested ? requested : "ds4f-q3";
+    const char *backend = cfg && cfg->g_llm.backend == LLM_BACKEND_DS4F
+                        ? "ds4f-x86" : "cpu";
+    char *eid = json_escape_dup(id);
+    sbuf_printf(&b,
+        "{\"id\":\"%s\",\"object\":\"model\",\"created\":0,"
+        "\"owned_by\":\"local\",\"tasks\":[\"chat\",\"completions\"],"
+        "\"backend\":\"%s\"}", eid ? eid : "ds4f-q3", backend);
+    free(eid);
+    return b.ptr;
 }
 
 static char *health_json(void) {
@@ -2090,13 +2159,19 @@ static void handle_client(int fd, server_config *cfg) {
         char *j = health_json();
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
+    } else if (strcmp(method, "GET") == 0 && strncmp(path, "/v1/models/", 11) == 0) {
+        char *j = model_detail_json(cfg, path + 11);
+        send_response(fd, 200, "application/json", j, strlen(j));
+        free(j);
     } else if (strcmp(method, "GET") == 0 &&
                (strcmp(path, "/models") == 0 || strcmp(path, "/v1/models") == 0)) {
         char *j = models_json(cfg);
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
     } else if (strcmp(method, "GET") == 0 &&
-               (strcmp(path, "/progress") == 0 || strcmp(path, "/v1/progress") == 0)) {
+               (strcmp(path, "/progress") == 0 || strcmp(path, "/v1/progress") == 0 ||
+                strcmp(path, "/status") == 0 || strcmp(path, "/v1/status") == 0 ||
+                strcmp(path, "/v1/metrics") == 0)) {
         char *j = progress_json();
         send_response(fd, 200, "application/json", j, strlen(j));
         free(j);
@@ -2135,6 +2210,8 @@ static void handle_client(int fd, server_config *cfg) {
                 free(e);
                 pthread_mutex_unlock(&g_infer_mu);
             } else {
+                progress_begin(cfg->g_llm.backend == LLM_BACKEND_DS4F ? "ds4f" : "llm",
+                               cfg->g_llm.backend == LLM_BACKEND_DS4F ? "exact" : "");
                 if (stream) {
                     char sse_hdr[256];
                     snprintf(sse_hdr, sizeof(sse_hdr),
@@ -2210,6 +2287,8 @@ static void handle_client(int fd, server_config *cfg) {
                 free(e);
                 pthread_mutex_unlock(&g_infer_mu);
             } else {
+                progress_begin(cfg->g_llm.backend == LLM_BACKEND_DS4F ? "ds4f" : "llm",
+                               cfg->g_llm.backend == LLM_BACKEND_DS4F ? "exact" : "");
                 if (stream) {
                     char sse_hdr[256];
                     snprintf(sse_hdr, sizeof(sse_hdr),
@@ -2521,6 +2600,27 @@ static void usage(const char *prog) {
         "  --sam3-1-ref-url <url>   proxy /v1/ref/sam3.1/* to URL (pytorch ref, sam3.1)\n"
         "  --qwen-ref-url <url>     qwen-image backend=pytorch -> fp8 bridge URL (or env QWEN_IMAGE_REF_URL)\n"
         "  --model <path>           LLM/VLM GGUF model file for OpenAI-compatible endpoints\n"
+        "  --ds4f-model <stage>     native staged DS4F model (requires DS4F server option)\n"
+        "  --ds4f-config <json>     DS4F runtime JSON (CLI DS4F options override it)\n"
+        "  --ds4f-threads <n>       DS4F CPU worker threads\n"
+        "  --ds4f-ep-size <n>       DS4F expert-parallel size\n"
+        "  --ds4f-ep-rank <n>       DS4F expert-parallel rank\n"
+        "  --ds4f-max-pos <n>       DS4F KV capacity\n"
+        "  --ds4f-hip <0|1>         attach the AMD HIP dense bank\n"
+        "  --ds4f-hip-device <n>    AMD device ordinal\n"
+        "  --ds4f-hip-async <0|1>   use asynchronous HIP submissions\n"
+        "  --ds4f-hip-expert-cache-mb <0|-1|MB> prompt-hot MXFP4 decode cache (-1=auto)\n"
+        "  --ds4f-hip-expert-cache-stats <0|1> report cache coverage/residency\n"
+        "  --ds4f-hip-prefill-attn <0|1> GPU attention for batched/prompt paths\n"
+        "  --ds4f-hip-verbose <0|1> HIP diagnostics\n"
+        "  --ds4f-hip-shared-bf16 <0|1>  approximate hot-shared BF16 mode\n"
+        "  --ds4f-hip-shared-bf16-layers <n>  limit approximate mode layers\n"
+        "  --ds4f-hip-shared-fp16 <0|1>  exact-weight FP8->FP16 hot-shared mode\n"
+        "  --ds4f-hip-shared-fp16-layers <n>  limit exact mode layers\n"
+        "  --ds4f-hip-exact-prefill <0|1>  CPU-reference prompt GEMMs; keep GPU decode\n"
+        "  --ds4f-tp-head/shared/attn/oproj/embed <0|1>  tensor-parallel shards\n"
+        "  --ds4f-mtp <0|1>        enable MTP checkpoint loading\n"
+        "  --ds4f-debug-env         enable legacy DS4F_* environment overrides\n"
         "  --mmproj <path>          (optional) multimodal projector GGUF for VLM (vision)\n"
         "  --device <n>             default 0\n"
         "  --stdio                  line-delimited JSON transport for local debugging\n"
@@ -2535,6 +2635,15 @@ int main(int argc, char **argv) {
     cfg.port = 8080;
     cfg.web_root = "../web";
     cfg.device = 0;
+    ds4f_runtime_options_init(&cfg.ds4f_options);
+    char ds4f_config_path[1024] = {0};
+    for (int i = 1; i + 1 < argc; i++)
+        if (strcmp(argv[i], "--ds4f-config") == 0)
+            snprintf(ds4f_config_path, sizeof(ds4f_config_path), "%s", argv[i + 1]);
+    if (ds4f_config_path[0] &&
+        ds4f_runtime_options_load_json(&cfg.ds4f_options, ds4f_config_path) != 0) {
+        fprintf(stderr, "cannot load DS4F config JSON\n"); return 1;
+    }
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) cfg.host = argv[++i];
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) cfg.port = atoi(argv[++i]);
@@ -2552,6 +2661,47 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--sam3-1-ref-url") == 0 && i + 1 < argc) cfg.sam3_1_ref_url = argv[++i];
         else if (strcmp(argv[i], "--qwen-ref-url") == 0 && i + 1 < argc) cfg.qwen_ref_url = argv[++i];
         else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) cfg.llm_model = argv[++i];
+        else if (strcmp(argv[i], "--ds4f-model") == 0 && i + 1 < argc) cfg.ds4f_model = argv[++i];
+        else if (strcmp(argv[i], "--ds4f-config") == 0 && i + 1 < argc) {
+            i++;
+        }
+        else if (strcmp(argv[i], "--ds4f-threads") == 0 && i + 1 < argc) cfg.ds4f_options.n_threads = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-ep-size") == 0 && i + 1 < argc) cfg.ds4f_options.ep_size = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-ep-rank") == 0 && i + 1 < argc) cfg.ds4f_options.ep_rank = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-max-pos") == 0 && i + 1 < argc) cfg.ds4f_options.cfg.max_pos = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip") == 0 && i + 1 < argc) cfg.ds4f_options.use_hip = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-device") == 0 && i + 1 < argc) cfg.ds4f_options.hip_device = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-async") == 0 && i + 1 < argc) cfg.ds4f_options.hip_async = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-expert-cache-mb") == 0 && i + 1 < argc) cfg.ds4f_options.hip_expert_cache_mb = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-expert-cache-stats") == 0 && i + 1 < argc) cfg.ds4f_options.hip_expert_cache_stats = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-prefill-attn") == 0 && i + 1 < argc) cfg.ds4f_options.hip_prefill_attn = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-verbose") == 0 && i + 1 < argc) cfg.ds4f_options.hip_verbose = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-shared-bf16") == 0 && i + 1 < argc) cfg.ds4f_options.hip_shared_bf16 = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-shared-bf16-layers") == 0 && i + 1 < argc) cfg.ds4f_options.hip_shared_bf16_layers = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-shared-fp16") == 0 && i + 1 < argc) cfg.ds4f_options.hip_shared_fp16 = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-shared-fp16-layers") == 0 && i + 1 < argc) cfg.ds4f_options.hip_shared_fp16_layers = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-ordered-wkv-layers") == 0 && i + 1 < argc) cfg.ds4f_options.hip_ordered_wkv_layers = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-ordered-fp8-layers") == 0 && i + 1 < argc) cfg.ds4f_options.hip_ordered_fp8_layers = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-mxfp4-widen-layers") == 0 && i + 1 < argc) cfg.ds4f_options.hip_mxfp4_widen_layers = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-mxfp4-resident-layers") == 0 && i + 1 < argc) cfg.ds4f_options.hip_mxfp4_resident_layers = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-mxfp4-stream-raw") == 0 && i + 1 < argc) cfg.ds4f_options.hip_mxfp4_stream_raw = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-prefill-attn") == 0 && i + 1 < argc) cfg.ds4f_options.hip_prefill_attn = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-hip-exact-prefill") == 0 && i + 1 < argc) cfg.ds4f_options.hip_exact_prefill = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-exact") == 0 && i + 1 < argc) cfg.ds4f_options.exact = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-bf16") == 0 && i + 1 < argc) cfg.ds4f_options.dense_bf16 = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-bf16-pv") == 0 && i + 1 < argc) cfg.ds4f_options.bf16_pv = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-mhc") == 0 && i + 1 < argc) cfg.ds4f_options.mhc = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-tierb2") == 0 && i + 1 < argc) cfg.ds4f_options.tierb2 = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-tp-head") == 0 && i + 1 < argc) cfg.ds4f_options.tp_head = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-tp-shared") == 0 && i + 1 < argc) cfg.ds4f_options.tp_shared = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-tp-shared-full") == 0 && i + 1 < argc) cfg.ds4f_options.tp_shared_full = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-tp-attn") == 0 && i + 1 < argc) cfg.ds4f_options.tp_attn = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-tp-oproj") == 0 && i + 1 < argc) cfg.ds4f_options.tp_oproj = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-tp-embed") == 0 && i + 1 < argc) cfg.ds4f_options.tp_embed = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-tp-wob") == 0 && i + 1 < argc) cfg.ds4f_options.tp_wob = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-mtp") == 0 && i + 1 < argc) cfg.ds4f_options.mtp = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-expert-resident") == 0 && i + 1 < argc) cfg.ds4f_options.expert_resident = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ds4f-debug-env") == 0) cfg.ds4f_options.debug_env = 1;
         else if (strcmp(argv[i], "--mmproj") == 0 && i + 1 < argc) cfg.llm_mmproj = argv[++i];
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) cfg.device = atoi(argv[++i]);
         else if (strcmp(argv[i], "--stdio") == 0) cfg.stdio_mode = 1;
@@ -2570,12 +2720,36 @@ int main(int argc, char **argv) {
     }
     qwen_variants_parse(&cfg, cfg.qwen_variants_spec);
 
-    /* Initialize LLM/VLM model if --model was provided */
-    if (cfg.llm_model) {
+    if (cfg.ds4f_options.debug_env) {
+        ds4f_runtime_options envopt = ds4f_runtime_options_debug_env(cfg.ds4f_options.cfg,
+            cfg.ds4f_model, cfg.ds4f_options.ep_rank, cfg.ds4f_options.ep_size,
+            cfg.ds4f_options.n_threads, cfg.ds4f_options.n_cmgs);
+        envopt.use_hip = cfg.ds4f_options.use_hip;
+        envopt.hip_device = cfg.ds4f_options.hip_device;
+        envopt.hip_async = cfg.ds4f_options.hip_async;
+        envopt.hip_verbose = cfg.ds4f_options.hip_verbose;
+        if (cfg.ds4f_options.hip_expert_cache_mb)
+            envopt.hip_expert_cache_mb = cfg.ds4f_options.hip_expert_cache_mb;
+        if (cfg.ds4f_options.hip_expert_cache_stats)
+            envopt.hip_expert_cache_stats = cfg.ds4f_options.hip_expert_cache_stats;
+        cfg.ds4f_options = envopt;
+    }
+    if (cfg.ds4f_model)
+        snprintf(cfg.ds4f_options.stage_dir, sizeof(cfg.ds4f_options.stage_dir), "%s", cfg.ds4f_model);
+
+    /* Initialize LLM/VLM model if --model or native DS4F was provided. */
+    if (cfg.ds4f_model) {
+        char ds4f_uri[1024];
+        snprintf(ds4f_uri, sizeof(ds4f_uri), "ds4f://%s", cfg.ds4f_model);
+        fprintf(stderr, "Loading native DS4F model: %s\n", cfg.ds4f_model);
+        if (llm_init(&cfg.g_llm, ds4f_uri, NULL, &cfg.ds4f_options) != 0) {
+            fprintf(stderr, "Failed to load DS4F model, continuing without LLM/VLM support\n");
+        }
+    } else if (cfg.llm_model) {
         fprintf(stderr, "Loading LLM/VLM model: %s\n", cfg.llm_model);
         if (cfg.llm_mmproj)
             fprintf(stderr, "  mmproj: %s\n", cfg.llm_mmproj);
-        if (llm_init(&cfg.g_llm, cfg.llm_model, cfg.llm_mmproj) != 0) {
+        if (llm_init(&cfg.g_llm, cfg.llm_model, cfg.llm_mmproj, NULL) != 0) {
             fprintf(stderr, "Failed to load model, continuing without LLM/VLM support\n");
         }
     }

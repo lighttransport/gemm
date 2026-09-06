@@ -45,7 +45,7 @@
 typedef struct {
     int use_bf16, deterministic, robust;
     int poll_spins;
-    int a2a, a2a_max;
+    int a2a, a2a_max, a2a_tree;
     int ack, ack_retx;
     double ack_rtt, timeout;
     unsigned long drop_n;
@@ -73,6 +73,7 @@ typedef struct {
     /* --- TP_AR_A2A: direct all-to-all sum for small (decode-size) payloads --- */
     int             a2a;                     /* TP_AR_A2A=1: enable */
     int             a2a_max;                 /* max elems for the a2a path (TP_AR_A2A_MAX, clamped to max_count) */
+    int             a2a_tree;                /* TP4 all-gather with exact deterministic-tree fold */
     size_t          a2a_base, a2a_slot;      /* dedicated recv region: 2 generations x nprocs slots */
     /* --- TP_AR_ACK: ack/retransmit reliability prototype (default off) --- */
     int             ack;                     /* 1 = reliable send (bounded retransmit + ack) */
@@ -82,6 +83,10 @@ typedef struct {
     size_t          ack_base;                /* byte offset of ack region (nprocs 8B slots + 1 scratch) */
     unsigned long   drop_n, put_ctr;         /* TP_AR_DROP=N: drop 1-in-N payload Puts (loss injection) */
     int             send_inflight;           /* fast contiguous Put awaiting local completion */
+    /* Tagged notice mailbox for the optional one-Put A2A protocol. Generic
+     * MRQ cleanup can run while a faster peer starts the next collective, so
+     * preserve those future remote completions instead of discarding them. */
+    unsigned char   mrq_a2a_seen[2 * TP_AR_MAXN];
     /* one outstanding send awaiting confirmation. send() is NON-blocking (Put + stash here); it is
      * retransmitted from BOTH the recv-wait spin AND tp_ar_confirm() until the peer acks -- retransmit
      * during recv is essential: if both directions of a doubling pair drop, both ranks block in recv,
@@ -171,11 +176,40 @@ static inline size_t tp_ar_trailer_off(const tp_comm *c) { return (size_t)c->max
  * across a long decode (~10^4+ all-reduces) the MRQ OVERFLOWS, faults the TNI,
  * and subsequent Puts silently stop landing → the receiver spins on its trailer
  * forever (seen as `tp_ar wait timeout want=N+1 got=N` after ~86 tokens). We
- * don't use the notices (completion is the in-memory seq trailer), so drain-all
- * and discard. Cheap: NOT_FOUND returns immediately when the MRQ is empty. */
+ * Most paths don't use notices (completion is the in-memory seq trailer), but
+ * the optional one-Put A2A path does. Preserve a tagged future notice by its
+ * generation/sender slot; discard ordinary notices. */
+static inline int tp_ar_a2a_notice_slot(const tp_comm *c,
+                                        const struct utofu_mrq_notice *nt) {
+    if (nt->notice_type != UTOFU_MRQ_TYPE_RMT_PUT || nt->edata != 0xa5u ||
+        !c->a2a || nt->rmt_stadd < c->base + c->a2a_base) return -1;
+    size_t off = (size_t)(nt->rmt_stadd - (c->base + c->a2a_base));
+    /* RMT_PUT reports the end of the transferred range, so identify the
+     * containing fixed-size A2A slot rather than requiring its start. */
+    if (c->a2a_slot == 0 || off % c->a2a_slot >= c->a2a_slot - 8) return -1;
+    size_t slot = off / c->a2a_slot;
+    return slot < (size_t)(2 * c->nprocs) ? (int)slot : -1;
+}
+static inline void tp_ar_stash_mrq(tp_comm *c,
+                                    const struct utofu_mrq_notice *nt) {
+    int slot = tp_ar_a2a_notice_slot(c, nt);
+    if (slot >= 0) c->mrq_a2a_seen[slot] = 1;
+}
+static inline int tp_ar_take_a2a_mrq(tp_comm *c, int gen, int me) {
+    int n = 0;
+    for (int r = 0; r < c->nprocs; r++) if (r != me) {
+        int slot = gen * c->nprocs + r;
+        if (c->mrq_a2a_seen[slot]) {
+            c->mrq_a2a_seen[slot] = 0;
+            n++;
+        }
+    }
+    return n;
+}
 static inline void tp_ar_drain_mrq(tp_comm *c) {
     struct utofu_mrq_notice nt;
-    while (utofu_poll_mrq(c->vcq, 0, &nt) == UTOFU_SUCCESS) { /* discard */ }
+    while (utofu_poll_mrq(c->vcq, 0, &nt) == UTOFU_SUCCESS)
+        tp_ar_stash_mrq(c, &nt);
 }
 
 static void tp_ar_send_puts(tp_comm *c, int peer, int sid, size_t pbytes, int contiguous);  /* fwd decl */
@@ -410,6 +444,21 @@ static int tp_ar_put_nb(tp_comm *c, int peer, utofu_stadd_t src, utofu_stadd_t d
     if(rc!=UTOFU_SUCCESS)tp_ar_fail(c,EIO,"utofu_put(nb) rc=%d",rc);
     return 1;
 }
+static int tp_ar_put_nb_remote(tp_comm *c, int peer, utofu_stadd_t src,
+                               utofu_stadd_t dst, size_t len, uint64_t edata) {
+    const unsigned long flags = UTOFU_ONESIDED_FLAG_TCQ_NOTICE |
+                                UTOFU_ONESIDED_FLAG_REMOTE_MRQ_NOTICE;
+    int rc; void *cb;
+    for (;;) {
+        rc = utofu_put(c->vcq, c->peer_vcq[peer], src, dst, len,
+                       edata, flags, NULL);
+        if (rc != UTOFU_ERR_BUSY) break;
+        utofu_poll_tcq(c->vcq, 0, &cb);
+    }
+    if (rc != UTOFU_SUCCESS)
+        tp_ar_fail(c, EIO, "utofu_put(remote) rc=%d", rc);
+    return 1;
+}
 /* TP_AR_A2A sum: Put my payload to EVERY peer's a2a slot[gen][my_rank] (pipelined),
  * wait all N-1 trailers ONCE, then fold all N payloads in RANK ORDER. One detection
  * latency instead of ~ceil(log2 N)+2 sequential exchanges; every rank folds the same
@@ -417,42 +466,101 @@ static int tp_ar_put_nb(tp_comm *c, int peer, utofu_stadd_t src, utofu_stadd_t d
  * fold order differs from recursive doubling -> reassoc vs the doubling path (coherent-
  * class; integer payloads, e.g. tp_ar_ack_test's, sum exactly -> bitwise-equal there).
  * BW cost x(N-1)/log2(N) -- enabled only for count <= a2a_max (decode-size payloads). */
-static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
+static void tp_ar_sum_a2a_add(tp_comm *c, float *buf, float *residual,
+                              int count, uint64_t tok) {
     int N = c->nprocs, me = c->my_rank;
     char *sb = c->region + tp_ar_slot_off(c, 0);            /* reuse the send slot */
     size_t pbytes = (size_t)count * sizeof(float);
-    size_t tr = pbytes;                                    /* trailer follows this payload */
+    size_t tr = (size_t)c->a2a_max * sizeof(float);         /* a2a slots' fixed trailer offset */
     memcpy(sb, buf, pbytes);
     *(volatile uint64_t *)(sb + tr) = tok;                  /* fits: a2a_max <= max_count */
     int gen = (int)(tok & 1);
     int inflight = 0; void *cb; int rc;
+    static int mrq_oneput = -1;
+    if (mrq_oneput < 0) {
+        const char *e = getenv("TP_AR_A2A_MRQ_ONEPUT");
+        mrq_oneput = e && atoi(e) != 0;
+    }
     for (int d = 1; d < N; d++) {
         int peer = (me + d) % N;
         utofu_stadd_t src = c->base + tp_ar_slot_off(c, 0);
         utofu_stadd_t dst = c->peer_base[peer] + c->a2a_base + ((size_t)gen * N + me) * c->a2a_slot;
-        /* Payload and generation token share one Put.  uTofu completion of
-         * the trailing token therefore proves the payload is visible too,
-         * while halving decode-size injection and TCQ operations. */
-        inflight += tp_ar_put_nb(c, peer, src, dst, pbytes + 8);
+        if (mrq_oneput)
+            inflight += tp_ar_put_nb_remote(c, peer, src, dst, pbytes, 0xa5u);
+        else {
+            inflight += tp_ar_put_nb(c, peer, src, dst, pbytes);       /* payload */
+            inflight += tp_ar_put_nb(c, peer, src + tr, dst + tr, 8);  /* trailer */
+        }
     }
-    while (inflight > 0) {                                   /* reap local completions */
-        rc = utofu_poll_tcq(c->vcq, 0, &cb);
-        if (rc == UTOFU_SUCCESS) inflight--;
-        else if(rc!=UTOFU_ERR_NOT_FOUND)tp_ar_fail(c,EIO,"a2a poll_tcq rc=%d",rc);
+    int remote = mrq_oneput ? N - 1 - tp_ar_take_a2a_mrq(c, gen, me) : 0;
+    if (remote < 0) remote = 0;
+    double notice_t0 = tp_ar_now();
+    unsigned long notice_spins = 0;
+    while (inflight > 0 || remote > 0) {
+        if (inflight > 0) {
+            rc = utofu_poll_tcq(c->vcq, 0, &cb);
+            if (rc == UTOFU_SUCCESS) inflight--;
+            else if(rc!=UTOFU_ERR_NOT_FOUND)
+                tp_ar_fail(c,EIO,"a2a poll_tcq rc=%d",rc);
+        }
+        if (remote > 0) {
+            struct utofu_mrq_notice nt;
+            rc = utofu_poll_mrq(c->vcq, 0, &nt);
+            if (rc == UTOFU_SUCCESS) {
+                int slot = tp_ar_a2a_notice_slot(c, &nt);
+                int slot_gen = slot >= 0 ? slot / N : -1;
+                int sender = slot >= 0 ? slot % N : -1;
+                if (slot_gen == gen && sender != me) remote--;
+                else tp_ar_stash_mrq(c, &nt);
+            } else if (rc != UTOFU_ERR_NOT_FOUND) {
+                tp_ar_fail(c,EIO,"a2a poll_mrq rc=%d",rc);
+            }
+        }
+        if (((++notice_spins & 0xffffful) == 0) &&
+            tp_ar_now() - notice_t0 > c->timeout)
+            tp_ar_fail(c,ETIMEDOUT,"rank %d a2a completion timeout tok=%lu remote=%d local=%d",
+                       me,(unsigned long)tok,remote,inflight);
     }
-    tp_ar_drain_mrq(c);
-    for (int r = 0; r < N; r++) {                            /* fold in rank order */
+    /* Do not drain after a notice-driven call: a faster peer may already have
+     * published the next sequence, and its notice must remain queued. */
+    if (!mrq_oneput) tp_ar_drain_mrq(c);
+    const float *fold_src[TP_AR_MAXN];
+    for (int r = 0; r < N; r++) {
         const float *pr;
         if (r == me) pr = (const float *)sb;
         else {
             char *rb = c->region + c->a2a_base + ((size_t)gen * N + r) * c->a2a_slot;
-            volatile uint64_t *trl = (volatile uint64_t *)(rb + tr);
-            tp_ar_wait(c, trl, tok, r, "a2a");
+            if (!mrq_oneput) {
+                volatile uint64_t *trl = (volatile uint64_t *)(rb + tr);
+                tp_ar_wait(c, trl, tok, r, "a2a");
+            }
             pr = (const float *)rb;
         }
-        if (r == 0) memcpy(buf, pr, pbytes);
-        else        for (int i = 0; i < count; i++) buf[i] += pr[i];
+        fold_src[r] = pr;
     }
+    /* The fixed-root deterministic TP4 tree evaluates (r0+r1)+(r2+r3).
+     * Reproduce that exact FP32 expression after the one-round all-gather so
+     * transport latency can change without changing model arithmetic. */
+    int tree_fold = N == 4 && c->a2a_tree;
+    if (tree_fold) {
+        for (int i = 0; i < count; i++) {
+            float p01 = fold_src[0][i] + fold_src[1][i];
+            float p23 = fold_src[2][i] + fold_src[3][i];
+            float sum = p01 + p23;
+            if (residual) residual[i] += sum;
+            else          buf[i] = sum;
+        }
+    } else {
+        memcpy(buf, fold_src[0], pbytes);
+        for (int r = 1; r < N; r++)
+            for (int i = 0; i < count; i++) buf[i] += fold_src[r][i];
+        if (residual)
+            for (int i = 0; i < count; i++) residual[i] += buf[i];
+    }
+}
+
+static void tp_ar_sum_a2a(tp_comm *c, float *buf, int count, uint64_t tok) {
+    tp_ar_sum_a2a_add(c, buf, NULL, count, tok);
 }
 
 /* Deterministic fixed-root sum. Recursive doubling is faster, but each survivor folds
@@ -494,6 +602,11 @@ static void tp_allreduce_sum_deterministic(tp_comm *c, float *buf, int count, ui
 static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
     if (c->nprocs == 1) return;
     uint64_t tok = ++c->seq;
+    if (c->deterministic && c->a2a && !c->ack && !c->use_bf16 &&
+        count <= c->a2a_max && c->nprocs == 4 && c->a2a_tree) {
+        tp_ar_sum_a2a(c, buf, count, tok);
+        return;
+    }
     if (c->deterministic){
         tp_allreduce_sum_deterministic(c,buf,count,tok);
         return;
@@ -528,6 +641,26 @@ static void tp_allreduce_sum(tp_comm *c, float *buf, int count) {
         if (mr % 2 == 0) tp_ar_recv_copy(c, c->bcast_sid, mr + 1, buf, count, tok);   /* even: recv only (prefold already confirmed) */
         else { tp_ar_send(c, mr - 1, c->bcast_sid, buf, count, tok); tp_ar_confirm(c); } /* odd: confirm the bcast send */
     }
+}
+
+/* Reduce a TP projection and add its replicated residual without a second
+ * read/write pass over the tile.  The optimized TP4 path evaluates
+ * residual + ((r0+r1)+(r2+r3)), exactly the same expression as the existing
+ * deterministic reduction followed by the caller's residual add. */
+static void tp_allreduce_sum_add(tp_comm *c, float *buf, float *residual,
+                                 int count) {
+    if (c->nprocs == 1) {
+        for (int i = 0; i < count; i++) residual[i] += buf[i];
+        return;
+    }
+    if (c->deterministic && c->a2a && !c->ack && !c->use_bf16 &&
+        count <= c->a2a_max && c->nprocs == 4 && c->a2a_tree) {
+        uint64_t tok = ++c->seq;
+        tp_ar_sum_a2a_add(c, buf, residual, count, tok);
+        return;
+    }
+    tp_allreduce_sum(c, buf, count);
+    for (int i = 0; i < count; i++) residual[i] += buf[i];
 }
 
 /* Fixed-root MAX companion.  The mathematical max is associative, but the BF16
@@ -745,6 +878,7 @@ static tp_comm_config tp_comm_env_config(void) {
     o.poll_spins = getenv("TP_AR_POLL_SPINS") ? atoi(getenv("TP_AR_POLL_SPINS")) : 8;
     o.a2a = getenv("TP_AR_A2A") ? atoi(getenv("TP_AR_A2A")) : 0;
     o.a2a_max = getenv("TP_AR_A2A_MAX") ? atoi(getenv("TP_AR_A2A_MAX")) : 8192;
+    o.a2a_tree = getenv("TP_AR_A2A_TREE") ? atoi(getenv("TP_AR_A2A_TREE")) : 0;
     o.ack = getenv("TP_AR_ACK") ? atoi(getenv("TP_AR_ACK")) : 0;
     o.ack_retx = getenv("TP_AR_ACK_RETX") ? atoi(getenv("TP_AR_ACK_RETX")) : 64;
     o.ack_rtt = getenv("TP_AR_ACK_RTT") ? atof(getenv("TP_AR_ACK_RTT")) : 0.001;
@@ -792,6 +926,7 @@ static int tp_comm_init_region_ex(tp_comm *c, utofu_vcq_hdl_t vcq,
      * seq&1) keeps a rank one reduce ahead from overwriting a slot its slow peer hasn't read. */
     c->a2a_max = options->a2a_max>0?options->a2a_max:8192;
     if (c->a2a_max > max_count) c->a2a_max = max_count;
+    c->a2a_tree = options->a2a_tree;
     c->a2a_slot = ((size_t)c->a2a_max * sizeof(float) + 8 + (TP_AR_LINE - 1)) & ~(size_t)(TP_AR_LINE - 1);
     c->a2a_base = region_sz;
     if (c->a2a) region_sz += (size_t)2 * nprocs * c->a2a_slot;

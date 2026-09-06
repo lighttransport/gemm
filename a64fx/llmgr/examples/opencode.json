@@ -1,0 +1,15 @@
+{
+  "provider": {
+    "ds4f": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "DS4F local",
+      "options": {
+        "baseURL": "http://127.0.0.1:21274/v1",
+        "apiKey": "none"
+      },
+      "models": {
+        "ds4f": {"name": "ds4f", "tool_call": true}
+      }
+    }
+  }
+}

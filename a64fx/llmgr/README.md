@@ -31,6 +31,142 @@ survive between calls).
 
 Python 3 standard library only — Fugaku's system `python3` is 3.6.
 
+## Model configuration
+
+The supervisor resolves the default model from `LLMGR_DEFAULT_MODEL` (otherwise
+the first serving-capable adapter), and never assumes a home directory for
+weights. Set `LLMGR_MODEL_ROOT`, `LLMGR_STAGE_ROOT`, and `LLMGR_TOKENIZER`, or
+pass `model_dir`, `stage_dir`, and `tokenizer` in the request. The legacy
+`LAGUNA_TOKENIZER` variable is accepted as an alias. An adapter owns semantic
+request translation, tokenizer loading, runner selection, and response
+formatting; adding a serving model does not require a new branch in the HTTP
+supervisor.
+
+### DS4F + Codex on RX 9070 XT
+
+On the ROCm host with the full, unquantized DS4F weights available, the default
+topology is the single-node HIP runner. It keeps the routed weight set in host
+memory and uses the 9070 XT for the dense path; `--q8-dense 0` keeps this run
+unquantized:
+
+Run the preflight before staging; it verifies every shard, tokenizer, library,
+and ROCm device without copying the model:
+
+```sh
+DS4F_MODEL_DIR=/shared/models/ds4f-full \
+DS4F_STAGE_DIR=/local/ds4f \
+DS4F_TOKENIZER=/shared/models/ds4f-full/tokenizer.json \
+  sh a64fx/llm/check_ds4f_env.sh
+```
+
+```sh
+DS4F_MODEL_DIR=/shared/models/ds4f-full \
+DS4F_STAGE_DIR=/local/ds4f \
+DS4F_WORK_DIR=$PWD/a64fx/llm \
+DS4F_NP=1 ./a64fx/llmgr/run_llmgr_ds4f.sh --daemon --verbose
+
+python3 a64fx/llmgr/llmgr_cli.py stage --model ds4f --deployment single --np 1
+python3 a64fx/llmgr/llmgr_cli.py start --model ds4f --mode serve --port 8080 \
+  --deployment single --np 1 --ctx 16384 --q8-dense 0 --fp8-bf16 0
+```
+
+For the existing 11-node MPI deployment, set `DS4F_DEPLOYMENT=ep`, use
+`DS4F_NP=11`, and pass `--deployment ep` to both commands.
+
+Point Codex at `http://127.0.0.1:21274/v1` with model `ds4f` and Responses
+wire format. The llmgr port proxies the request to the DS4F frontend; it does
+not tokenize or duplicate the 160 GB model in the controller process.
+Ready-to-copy client examples are in `a64fx/llmgr/examples/`.
+
+Measure a warm single-stream run with:
+
+```sh
+python3 a64fx/llm/bench_ds4f_http.py \
+  --url http://127.0.0.1:21274/v1/responses \
+  --model ds4f --max-tokens 128 --warmup 1 --repeat 3
+```
+
+Use `--max-tokens 1` for a prefill/TTFT sample and a larger value for decode.
+The harness reports cached and uncached prompt tokens; use `--warmup 0` for a
+cold-prefix measurement and a warmup request to verify the system-prompt cache.
+Its prefill rate is based on uncached prompt tokens and includes the first
+decode step, so compare runs with the same prompt and context.
+
+### Qwen3.6/Qwen3.5 GGUF on the 9070 XT + 5060 Ti
+
+The `qwen36` adapter delegates to a local llama.cpp server and keeps the model
+path, server path, device list, split, context, and KV types configurable:
+
+```sh
+export QWEN36_MODEL=/path/to/Qwen3.6-27B-Q5_K_M.gguf
+export LLMGR_LLAMA_SERVER=/path/to/llama-server
+export LLMGR_LLAMA_DEVICES=Vulkan1,Vulkan0  # AMD primary, NVIDIA secondary
+export LLMGR_QWEN36_CACHE_DIR=$PWD/qwen36-cache
+mkdir -p "$LLMGR_QWEN36_CACHE_DIR"
+./a64fx/llmgr/run_llmgr_qwen36.sh --daemon --verbose
+python3 a64fx/llmgr/llmgr_cli.py start --model qwen36 --mode serve \
+  --port 8081 --ctx 524288
+```
+
+The adapter defaults to layer splitting, tensor split `1.4,1` (AMD primary), flash attention,
+and Q4 KV. Override `cache_type_k`, `cache_type_v`, `tensor_split`, or other
+runner fields in the `/runner/start` JSON when needed. A 512K context
+allocation succeeded with the fit allocator; short benchmark results were 628
+tok/s prefill at 4096 tokens and 18 tok/s decode.
+
+To persist an exact Codex or Claude Code system message after starting the
+server with `slot_save_path`/`LLMGR_QWEN36_CACHE_DIR`, run:
+
+```sh
+python3 a64fx/llmgr/qwen36_prompt_cache.py --agent codex \
+  --prompt-file /path/to/codex-system.txt --server http://127.0.0.1:8081
+python3 a64fx/llmgr/qwen36_prompt_cache.py --agent claude-code \
+  --prompt-file /path/to/claude-system.txt --server http://127.0.0.1:8081
+```
+
+Alternatively pass the exact captured wire request with `--request-file`; the
+utility extracts OpenAI/Responses `instructions`/system/developer messages or
+Anthropic `system` content automatically:
+
+```sh
+python3 a64fx/llmgr/qwen36_prompt_cache.py --agent codex \
+  --request-file codex-request.json --server http://127.0.0.1:8081
+```
+
+Each cache is model- and prompt-digest bound. Do not reuse a cache after
+changing the GGUF, tokenizer/chat template, or agent system message.
+The utility sends a `hello` user turn during warmup because Qwen3.6's chat
+template requires one; the cache digest remains based on the system prompt.
+
+For several agents or for a new model, use the batch wrapper. Agent labels are
+arbitrary, so adding a new client does not require changing the cache code:
+
+```sh
+./a64fx/llmgr/cache_agent_prompts.sh \
+  --model /path/to/model.gguf --server http://127.0.0.1:8081 \
+  --output-dir "$HOME/.cache/llmgr/emerging-model" \
+  codex=/tmp/codex-request.json \
+  claude-code=/tmp/claude-request.json \
+  opencode=/tmp/opencode-request.json
+```
+
+Use `--reuse` after a server restart to restore all matching slots instead of
+warming them again.
+On a later server launch, restore the matching slot before sending the first
+agent request:
+
+```sh
+python3 a64fx/llmgr/qwen36_prompt_cache.py --agent codex --reuse \
+  --prompt-file /path/to/codex-system.txt --server http://127.0.0.1:8081
+```
+
+On the validation host (48 shards, 155.4 GiB, `gfx1201`), the full-weight
+single-node run with `--q8-dense 0 --fp8-bf16 0` loaded in 107.7 s, used 7.2 GiB
+VRAM, and measured 1.18 tok/s decode / 2.48 uncached prompt tok/s in one
+128-token sample. This is below the 17/50+ target because routed MXFP4 expert
+work remains CPU-bound. `--fp8-bf16 1` promotes dense tensors to the CPU
+BF16-PV path in this serving adapter and is not the GPU benchmark setting.
+
 ## Quick start (inside an existing interactive allocation)
 
 ```sh
@@ -132,6 +268,7 @@ immediately; follow them with `/runner/<id>/log`. Requests need no auth unless
 | `laguna` | `int4` (default), `bf16`, `fp8` | yes | no | `a64fx/laguna-s21/run_laguna_s21_12n.sh` |
 | `gemma4` | `tp` (default), `pp` | no — one-shot only | no | `a64fx/gemma4-mn/run_gemma4_tp.sh` / `run_gemma4_pp.sh` |
 | `k3` | `partial` | no — one-shot only | yes | `a64fx/k3/run_k3_ep.sh` |
+| `ds4f` | `full` | yes — single HIP or 11-node EP | no | `a64fx/llm/run_ds4f_single_serve.sh` / `run_ds4f_serve_11n.sh` |
 
 Exactly one serving child per model may be starting or ready. All semantic and native
 requests share one bounded FIFO (capacity 8 by default, configurable with

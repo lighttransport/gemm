@@ -16,6 +16,8 @@
 #include "../../common/safetensors.h"
 #include "../../common/ggml_dequant.h"
 
+#include <stdio.h>
+
 #include "hip_qimg_runner.h"
 #include "../rocew.h"
 #include "../hip_kernels_common.h"
@@ -23,7 +25,6 @@
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>

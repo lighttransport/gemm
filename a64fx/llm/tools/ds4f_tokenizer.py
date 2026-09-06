@@ -17,7 +17,7 @@ CLI (file handoff for the C EP runner):
   decode --ids-file gen_ids.txt   (or --ids "12 34 56")
   selftest                        (round-trip + invariants)
 """
-import sys, os, json, argparse, unicodedata
+import sys, os, json, argparse, re, unicodedata
 
 DEFAULT_TOK = os.path.join(os.environ.get("DS4F_MODEL_DIR",
                            os.path.join(os.environ["HOME"], "models", "ds4f")),
@@ -181,6 +181,11 @@ class DS4FTokenizer(object):
         for t in d.get("added_tokens", []):
             self.added[t["content"]] = t["id"]
             self.id_to_tok.setdefault(t["id"], t["content"])
+        # Match model control tokens before byte-level pretokenization. Without
+        # this, the DSV4 role markers are encoded as ordinary punctuation and
+        # the chat model never sees its User/Assistant transition IDs.
+        special = sorted(self.added, key=len, reverse=True)
+        self.special_re = re.compile("|".join(map(re.escape, special))) if special else None
         # BPE ranks
         self.ranks = {}
         for r, pair in enumerate(m["merges"]):
@@ -238,11 +243,25 @@ class DS4FTokenizer(object):
         self._cache[token] = word
         return word
 
-    def encode(self, text, add_bos=True):
-        ids = [BOS_ID] if add_bos else []
+    def _encode_plain(self, text, ids):
         for tok in self._pretokenize(text):
             for sym in self._bpe(tok):
                 ids.append(self.vocab[sym])
+
+    def encode(self, text, add_bos=True):
+        # A rendered DSV4 prompt already begins with the literal BOS token.
+        # Do not prepend a second ID; the special-token scan emits it exactly.
+        has_literal_bos = text.startswith(self.id_to_tok.get(BOS_ID, "\0"))
+        ids = [BOS_ID] if add_bos and not has_literal_bos else []
+        if not self.special_re:
+            self._encode_plain(text, ids)
+            return ids
+        off = 0
+        for match in self.special_re.finditer(text):
+            self._encode_plain(text[off:match.start()], ids)
+            ids.append(self.added[match.group(0)])
+            off = match.end()
+        self._encode_plain(text[off:], ids)
         return ids
 
     def decode(self, ids, skip_special=True, stop_at_eos=True):
@@ -276,6 +295,14 @@ def _selftest(tok):
         "for i in range(10):\n\tprint(i**2)\n",
     ]
     ok = True
+    control = "<｜begin▁of▁sentence｜><｜User｜>x<｜Assistant｜></think>"
+    control_ids = tok.encode(control)
+    expected = [tok.added["<｜begin▁of▁sentence｜>"],
+                tok.added["<｜User｜>"]]
+    special_ok = control_ids[:2] == expected and \
+        tok.added["<｜Assistant｜>"] in control_ids
+    print("[%s] DSV4 special-token encoding" % ("OK" if special_ok else "XX"))
+    ok = ok and special_ok
     for s in samples:
         ids = tok.encode(s, add_bos=False)
         back = tok.decode(ids, skip_special=True, stop_at_eos=False)
