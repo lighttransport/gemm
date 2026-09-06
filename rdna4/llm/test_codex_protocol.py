@@ -1,6 +1,7 @@
 """GPU-independent regression for runner stdout transaction alignment."""
 import base64
 import io
+import os
 import queue
 import threading
 import unittest
@@ -50,6 +51,19 @@ class ProtocolTest(unittest.TestCase):
                                        poll=lambda: 1)
         with self.assertRaisesRegex(RuntimeError, "runner exited before READY"):
             backend._wait_ready()
+
+    def test_startup_readiness_has_a_deadline(self):
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, "r")
+        backend = Backend.__new__(Backend)
+        backend.ready = False
+        backend.proc = SimpleNamespace(stdout=stream, poll=lambda: None)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "ready before timeout"):
+                backend._wait_ready(0.01)
+        finally:
+            stream.close()
+            os.close(write_fd)
 
     def test_health_reports_dead_runner(self):
         backend = Backend.__new__(Backend)
