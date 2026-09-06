@@ -15058,6 +15058,7 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     glm5next_tensor_view router_v, bias_v, gate_v, up_v, down_v;
     glm5next_tensor_view shared_gate_v, shared_up_v, shared_down_v;
     void *dx = NULL, *dg = NULL, *du = NULL, *do_ = NULL;
+    void *drw = NULL, *drx = NULL, *dr = NULL;
     void *dsg = NULL, *dsu = NULL, *dso = NULL;
     float *router = NULL, *bias = NULL, *gate = NULL, *up = NULL;
     float *expert_out = NULL, *shared_gate = NULL, *shared_up = NULL;
@@ -15107,8 +15108,26 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     shared_out = (float *)malloc((size_t)c->hidden_size * sizeof(float));
     if (!router || !bias || !gate || !up || !expert_out || !shared_gate ||
         !shared_up || !shared_out) goto done;
-    if (glm5next_cpu_matvec(router, &router_v, hidden) != 0 ||
-        glm5next_cpu_vector(&bias_v, bias, c->expert_count) != 0) goto done;
+    if (getenv("GLM5NEXT_HIP_MOE_ROUTER") &&
+        atoi(getenv("GLM5NEXT_HIP_MOE_ROUTER")) != 0) {
+        qtensor qrouter = glm5next_as_qtensor(&router_v);
+        int router_type = 0;
+        if (upload_weight_matrix(&drw, &qrouter, &router_type) != 0 ||
+            hipMalloc(&drx, (size_t)c->hidden_size * sizeof(float)) != hipSuccess ||
+            hipMalloc(&dr, (size_t)c->expert_count * sizeof(float)) != hipSuccess ||
+            hipMemcpy(drx, hidden, (size_t)c->hidden_size * sizeof(float),
+                      hipMemcpyHostToDevice) != hipSuccess)
+            goto done;
+        launch_matvec_auto(r, dr, drw, drx, c->expert_count,
+                           c->hidden_size, router_type);
+        if (hipStreamSynchronize(r->stream) != hipSuccess ||
+            hipMemcpy(router, dr, (size_t)c->expert_count * sizeof(float),
+                      hipMemcpyDeviceToHost) != hipSuccess)
+            goto done;
+    } else if (glm5next_cpu_matvec(router, &router_v, hidden) != 0) {
+        goto done;
+    }
+    if (glm5next_cpu_vector(&bias_v, bias, c->expert_count) != 0) goto done;
 
     for (int j = 0; j < slots; ++j) { ids[j] = -1; weights[j] = -INFINITY; }
     for (int e = 0; e < c->expert_count; ++e) {
@@ -15199,6 +15218,7 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
 done:
     if (dsg) hipFree(dsg); if (dsu) hipFree(dsu); if (dso) hipFree(dso);
     if (dx) hipFree(dx); if (dg) hipFree(dg); if (du) hipFree(du); if (do_) hipFree(do_);
+    if (drw) hipFree(drw); if (drx) hipFree(drx); if (dr) hipFree(dr);
     free(router); free(bias); free(gate); free(up); free(expert_out);
     free(shared_gate); free(shared_up); free(shared_out);
     return rc;
