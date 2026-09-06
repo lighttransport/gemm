@@ -62,6 +62,8 @@ typedef struct {
     float kda_gate_lower_bound;
     float routed_scaling_factor;
     int32_t *layer_kv_heads;       /* [n_layers], owned by this structure */
+    float *swiglu_clamp_exp;       /* [n_layers_all], optional */
+    float *swiglu_clamp_shexp;     /* [n_layers_all], optional */
 } glm5next_config;
 
 typedef struct {
@@ -85,6 +87,8 @@ typedef struct {
 static inline void glm5next_config_free(glm5next_config *c) {
     if (!c) return;
     free(c->layer_kv_heads);
+    free(c->swiglu_clamp_exp);
+    free(c->swiglu_clamp_shexp);
     memset(c, 0, sizeof(*c));
 }
 
@@ -130,6 +134,25 @@ static inline int glm5next_get_layer_heads(const gguf_context *gguf,
     if (gguf->kv[i].value.arr.type == GGUF_TYPE_UINT32) {
         const uint32_t *v = (const uint32_t *)gguf->kv[i].value.arr.data;
         for (j = 0; j < n; ++j) out[j] = (int32_t)v[j];
+        return 0;
+    }
+    return -1;
+}
+
+static inline int glm5next_get_layer_floats(const gguf_context *gguf,
+                                            const char *key, float *out, int n) {
+    int i = gguf_find_key(gguf, key);
+    if (i < 0) return 0; /* optional */
+    if (gguf->kv[i].type != GGUF_TYPE_ARRAY || (int)gguf->kv[i].value.arr.n < n)
+        return -1;
+    if (gguf->kv[i].value.arr.type == GGUF_TYPE_FLOAT32) {
+        const float *v = (const float *)gguf->kv[i].value.arr.data;
+        for (int j = 0; j < n; ++j) out[j] = v[j];
+        return 0;
+    }
+    if (gguf->kv[i].value.arr.type == GGUF_TYPE_FLOAT64) {
+        const double *v = (const double *)gguf->kv[i].value.arr.data;
+        for (int j = 0; j < n; ++j) out[j] = (float)v[j];
         return 0;
     }
     return -1;
@@ -197,9 +220,16 @@ static inline int glm5next_config_load(const gguf_context *gguf,
         goto bad_values;
 
     c->layer_kv_heads = (int32_t *)calloc((size_t)c->n_layers, sizeof(int32_t));
-    if (!c->layer_kv_heads) goto bad_values;
+    c->swiglu_clamp_exp = (float *)calloc((size_t)c->n_layers_all, sizeof(float));
+    c->swiglu_clamp_shexp = (float *)calloc((size_t)c->n_layers_all, sizeof(float));
+    if (!c->layer_kv_heads || !c->swiglu_clamp_exp || !c->swiglu_clamp_shexp) goto bad_values;
     if (glm5next_get_layer_heads(gguf, "glm5next.attention.head_count_kv",
                                  c->layer_kv_heads, c->n_layers) != 0)
+        goto bad_values;
+    if (glm5next_get_layer_floats(gguf, "glm5next.swiglu_clamp_exp",
+                                  c->swiglu_clamp_exp, c->n_layers_all) != 0 ||
+        glm5next_get_layer_floats(gguf, "glm5next.swiglu_clamp_shexp",
+                                  c->swiglu_clamp_shexp, c->n_layers_all) != 0)
         goto bad_values;
     for (i = 0; i < c->n_layers; ++i) {
         if (c->layer_kv_heads[i] == 0) ++kda;

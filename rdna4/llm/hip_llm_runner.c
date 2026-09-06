@@ -468,6 +468,14 @@ static const char *hip_kernel_source =
 "\n"
 "/* Repack compact GGUF Q8_0 blocks (34 B) into the runner's aligned 36 B\n"
 " * cache representation directly on-device. One warp owns one block. */\n"
+"__global__ void swiglu_limit_f32(float *gate, float *up, int n, float limit) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n && limit > 1e-6f) {\n"
+"        gate[i] = fminf(gate[i], limit);\n"
+"        up[i] = fminf(fmaxf(up[i], -limit), limit);\n"
+"    }\n"
+"}\n"
+"\n"
 "__global__ void q8_0_compact_to_padded(unsigned char *dst,\n"
 "        const unsigned char *src, int n_blocks) {\n"
 "    int b = blockIdx.x; int lane = threadIdx.x;\n"
@@ -8109,6 +8117,7 @@ struct hip_llm_runner {
     hipFunction_t fn_kv_cache_store;
     hipFunction_t fn_attn_decode_f32;
     hipFunction_t fn_silu_mul_f32;
+    hipFunction_t fn_swiglu_limit_f32;
     hipFunction_t fn_q8_0_compact_to_padded;
     hipFunction_t fn_qwen4_stage_misses;
     hipFunction_t fn_qwen4_stage_q8_misses;
@@ -8711,6 +8720,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(kv_cache_store_devp);
     GET_FUNC(attn_decode_f32_devp);
     GET_FUNC(silu_mul_f32);
+    GET_FUNC(swiglu_limit_f32);
     GET_FUNC(q8_0_compact_to_padded);
     GET_FUNC(qwen4_stage_misses);
     GET_FUNC(qwen4_stage_q8_misses);
@@ -11590,6 +11600,14 @@ static inline void launch_attention_devp(hip_llm_runner *r, void *out, void *q,
 static inline void launch_silu_mul(hip_llm_runner *r, void *gate, void *up, int n) {
     void *args[] = { &gate, &up, &n };
     LAUNCH(r->fn_silu_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_swiglu_limit(hip_llm_runner *r, void *gate, void *up,
+                                       int n, float limit) {
+    if (limit <= 1e-6f) return;
+    void *args[] = { &gate, &up, &n, &limit };
+    LAUNCH(r->fn_swiglu_limit_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
 }
 
 static inline void launch_add(hip_llm_runner *r, void *dst, void *src, int n) {
@@ -14992,6 +15010,8 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
                            c->hidden_size, gtype);
         launch_matvec_auto(r, du, duw, dx, c->expert_ff_length,
                            c->hidden_size, utype);
+        launch_swiglu_limit(r, dg, du, c->expert_ff_length,
+                            c->swiglu_clamp_exp ? c->swiglu_clamp_exp[layer] : 0.0f);
         launch_silu_mul(r, dg, du, c->expert_ff_length);
         launch_matvec_auto(r, do_, ddw, dg, c->hidden_size,
                            c->expert_ff_length, dtype);
@@ -15017,6 +15037,8 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
                          c->hidden_size, stg);
       launch_matvec_auto(r, du, dsu, dx, c->shared_expert_ff_length,
                          c->hidden_size, stu);
+      launch_swiglu_limit(r, dg, du, c->shared_expert_ff_length,
+                          c->swiglu_clamp_shexp ? c->swiglu_clamp_shexp[layer] : 0.0f);
       launch_silu_mul(r, dg, du, c->shared_expert_ff_length);
       launch_matvec_auto(r, do_, dso, dg, c->hidden_size,
                          c->shared_expert_ff_length, std);

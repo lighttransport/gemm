@@ -204,7 +204,17 @@ static inline int glm5next_cpu_dense_ffn(const gguf_shards *model, int layer,
     if (glm5next_tensor_view_get(model, name, 1, &t) != 0) { free(gate); free(up); return -1; } } while (0)
     G5GET("ffn_gate.weight"); if (glm5next_cpu_matvec(gate, &t, hidden) != 0) goto fail;
     G5GET("ffn_up.weight"); if (glm5next_cpu_matvec(up, &t, hidden) != 0) goto fail;
-    for (int i = 0; i < ff; ++i) gate[i] = gate[i] / (1.0f + expf(-gate[i])) * up[i];
+    {
+        float limit = c->swiglu_clamp_shexp ? c->swiglu_clamp_shexp[layer] : 0.0f;
+        for (int i = 0; i < ff; ++i) {
+            if (limit > 1e-6f) {
+                if (gate[i] > limit) gate[i] = limit;
+                if (up[i] > limit) up[i] = limit;
+                if (up[i] < -limit) up[i] = -limit;
+            }
+            gate[i] = gate[i] / (1.0f + expf(-gate[i])) * up[i];
+        }
+    }
     G5GET("ffn_down.weight"); if (glm5next_cpu_matvec(out, &t, gate) != 0) goto fail;
     free(gate); free(up); return 0;
 fail:
@@ -460,7 +470,17 @@ static inline int glm5next_cpu_moe_ffn_cb(const gguf_shards *model, int layer,
         int e = ids[j];
         MOE_GET("ffn_gate_exps.weight"); if (glm5next_cpu_matvec_head(gate, &t, e, hidden) != 0) goto fail;
         MOE_GET("ffn_up_exps.weight"); if (glm5next_cpu_matvec_head(up, &t, e, hidden) != 0) goto fail;
-        for (int i = 0; i < ff; ++i) gate[i] = gate[i] / (1.0f + expf(-gate[i])) * up[i];
+        {
+            float limit = c->swiglu_clamp_exp ? c->swiglu_clamp_exp[layer] : 0.0f;
+            for (int i = 0; i < ff; ++i) {
+                if (limit > 1e-6f) {
+                    if (gate[i] > limit) gate[i] = limit;
+                    if (up[i] > limit) up[i] = limit;
+                    if (up[i] < -limit) up[i] = -limit;
+                }
+                gate[i] = gate[i] / (1.0f + expf(-gate[i])) * up[i];
+            }
+        }
         MOE_GET("ffn_down_exps.weight"); if (glm5next_cpu_matvec_head(expert_out, &t, e, gate) != 0) goto fail;
         float w = c->routed_scaling_factor * weights[j] / (sum > 0.0f ? sum : 1.0f);
         for (int i = 0; i < h; ++i) out[i] += w * expert_out[i];
@@ -469,7 +489,17 @@ static inline int glm5next_cpu_moe_ffn_cb(const gguf_shards *model, int layer,
     int sff = c->shared_expert_ff_length;
     MOE_GET("ffn_gate_shexp.weight"); if (glm5next_cpu_matvec(shared_gate, &t, hidden) != 0) goto fail;
     MOE_GET("ffn_up_shexp.weight"); if (glm5next_cpu_matvec(shared_up, &t, hidden) != 0) goto fail;
-    for (int i = 0; i < sff; ++i) shared_gate[i] = shared_gate[i] / (1.0f + expf(-shared_gate[i])) * shared_up[i];
+    {
+        float limit = c->swiglu_clamp_shexp ? c->swiglu_clamp_shexp[layer] : 0.0f;
+        for (int i = 0; i < sff; ++i) {
+            if (limit > 1e-6f) {
+                if (shared_gate[i] > limit) shared_gate[i] = limit;
+                if (shared_up[i] > limit) shared_up[i] = limit;
+                if (shared_up[i] < -limit) shared_up[i] = -limit;
+            }
+            shared_gate[i] = shared_gate[i] / (1.0f + expf(-shared_gate[i])) * shared_up[i];
+        }
+    }
     MOE_GET("ffn_down_shexp.weight"); if (glm5next_cpu_matvec(shared_out, &t, shared_gate) != 0) goto fail;
     for (int i = 0; i < h; ++i) out[i] += shared_out[i];
     free(router); free(bias); free(gate); free(up); free(expert_out); free(shared_gate); free(shared_up); free(shared_out); return 0;
