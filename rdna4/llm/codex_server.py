@@ -253,7 +253,7 @@ class Backend:
                     pass
 
     def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, min_p,
-                 prefix="", cancellation=None):
+                 prefix="", cancellation=None, on_token=None):
         cancellation = cancellation if cancellation is not None else threading.Event()
         prefix_payload = base64.b64encode(prefix.encode("utf-8")).decode("ascii") if prefix else "-"
         payload = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
@@ -282,6 +282,13 @@ class Backend:
                     if not raw:
                         raise RuntimeError("runner closed its response pipe")
                     result = raw.rstrip("\r\n")
+                    if result.startswith("TOK "):
+                        if on_token is not None:
+                            try:
+                                on_token(base64.b64decode(result[4:]).decode("utf-8", "replace"))
+                            except (ValueError, UnicodeError):
+                                sys.stderr.write("[runner diagnostic] malformed token frame\n")
+                        continue
                     if result.startswith(("OK ", "ERR ")):
                         break
                     sys.stderr.write("[runner diagnostic] " + result + "\n")
@@ -291,14 +298,21 @@ class Backend:
                     self.active_cancel = None
         if not result.startswith("OK "):
             raise RuntimeError(result)
-        fields = result.split(" ", 5)
+        fields = result.split(" ", 7)
         if len(fields) == 5 and fields[4] in ("stop", "length", "cancelled"):
             fields.append("")
-        if len(fields) != 6:
+        if len(fields) == 6:
+            fields.extend(("0", "0"))
+        if len(fields) != 8:
             raise RuntimeError("malformed runner response")
         if fields[0] != "OK":
             raise RuntimeError("malformed runner response")
-        cached, prompt_tokens, completion_tokens, finish, encoded = fields[1:]
+        cached, prompt_tokens, completion_tokens, finish, encoded, prefill_ms, decode_ms = fields[1:]
+        self.last_metrics = {"prompt_ms": float(prefill_ms), "generation_ms": float(decode_ms)}
+        self.last_metrics["pp_tok_s"] = (1000.0 * (int(prompt_tokens) - int(cached)) / float(prefill_ms)
+                                          if float(prefill_ms) > 0 else 0.0)
+        self.last_metrics["tg_tok_s"] = (1000.0 * int(completion_tokens) / float(decode_ms)
+                                          if float(decode_ms) > 0 else 0.0)
         text = base64.b64decode(encoded).decode("utf-8", "replace")
         return text, int(cached), int(prompt_tokens), int(completion_tokens), finish
 
@@ -464,6 +478,7 @@ class Handler(BaseHTTPRequestHandler):
             cancelled = threading.Event()
             stream_keepalive_stop = threading.Event()
             stream_keepalive = None
+            stream_write_lock = threading.Lock()
             stream_response_id = "resp-" + uuid.uuid4().hex if req.get("stream") else None
             stream_created = int(time.time())
             if req.get("stream"):
@@ -488,8 +503,9 @@ class Handler(BaseHTTPRequestHandler):
                 def keepalive():
                     while not stream_keepalive_stop.wait(5.0):
                         try:
-                            self.wfile.write(b": keep-alive\n\n")
-                            self.wfile.flush()
+                            with stream_write_lock:
+                                self.wfile.write(b": keep-alive\n\n")
+                                self.wfile.flush()
                         except (BrokenPipeError, ConnectionResetError, OSError):
                             cancelled.set()
                             self.backend.cancel(cancelled)
@@ -497,12 +513,27 @@ class Handler(BaseHTTPRequestHandler):
 
                 stream_keepalive = threading.Thread(target=keepalive, daemon=True)
                 stream_keepalive.start()
+            def stream_token(token):
+                if not req.get("stream") or api_path != "/v1/chat/completions":
+                    return
+                obj = {"id": stream_response_id, "object": "chat.completion.chunk",
+                       "created": stream_created, "model": self.model,
+                       "choices": [{"index": 0, "delta": {"content": token},
+                                    "finish_reason": None}]}
+                try:
+                    with stream_write_lock:
+                        self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    cancelled.set()
+                    self.backend.cancel(cancelled)
             watcher = threading.Thread(target=self._watch_disconnect,
                                        args=(stop_watcher, cancelled), daemon=True)
             watcher.start()
             try:
                 text, cached, ptok, ctok, finish = self.backend.generate(
-                    prompt, limit, temp, top_p, top_k, presence, min_p, prefix, cancelled)
+                    prompt, limit, temp, top_p, top_k, presence, min_p, prefix, cancelled,
+                    stream_token)
             finally:
                 stop_watcher.set()
                 watcher.join(timeout=0.2)
@@ -518,6 +549,7 @@ class Handler(BaseHTTPRequestHandler):
             ident = "chatcmpl-" + uuid.uuid4().hex
             created = int(time.time())
             usage = {"prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ptok + ctok, "cached_tokens": cached}
+            performance = getattr(self.backend, "last_metrics", {})
             if req.get("stream"):
                 # The stream headers and keepalive comments were sent before
                 # inference; now append the buffered response event sequence.
@@ -583,10 +615,10 @@ class Handler(BaseHTTPRequestHandler):
                                              "finish_reason": None}]}
                         self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) +
                                           "\n\n").encode())
-                    elif text:
+                    elif text and api_path != "/v1/chat/completions":
                         obj = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": self.model, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
                         self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
-                    obj = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": self.model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
+                    obj = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": self.model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}], "performance": performance}
                     self.wfile.write(("data: " + json.dumps(obj) + "\n\ndata: [DONE]\n\n").encode())
                 self.wfile.flush()
                 return
@@ -618,7 +650,7 @@ class Handler(BaseHTTPRequestHandler):
                                                "function": {"name": item["name"],
                                                             "arguments": item.get("arguments", "")}}
                                               for item in calls]
-                self.send_json(200, {"id": ident, "object": "chat.completion", "created": created, "model": self.model, "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if calls else finish}], "usage": usage})
+                self.send_json(200, {"id": ident, "object": "chat.completion", "created": created, "model": self.model, "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if calls else finish}], "usage": usage, "performance": performance})
         except (BrokenPipeError, ConnectionResetError):
             # Clients commonly cancel a request after their own timeout. The
             # backend may finish its serialized inference, but there is no

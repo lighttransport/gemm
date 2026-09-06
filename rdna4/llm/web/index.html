@@ -47,7 +47,15 @@ async function submit() {
   const text=prompt.value.trim(); if (!text || controller) return;
   const mode=$('mode').value; const instructions={coding:'Act as a careful coding assistant. Give concrete, testable solutions and call out assumptions.',research:'Act as a research assistant. Separate facts from inference and provide useful source/search suggestions when citations are not available.',general:''}[mode];
   add('user', text); history.push({role:'user',content:text}); prompt.value=''; send.disabled=true; stop.disabled=false; controller=new AbortController(); const out=add('assistant','Thinking…');
-  try { const r=await fetch('/v1/responses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'local',instructions,input:history,max_output_tokens:512}),signal:controller.signal}); const data=await r.json(); if(!r.ok) throw Error(data.error?.message||r.statusText); const answer=data.output_text||data.output?.[0]?.content?.[0]?.text||'(no text returned)'; out.textContent=answer; history.push({role:'assistant',content:answer}); }
+  try {
+    const messages = instructions ? [{role:'system',content:instructions}, ...history] : history;
+    const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'local',messages,stream:true,max_tokens:512}),signal:controller.signal});
+    if(!r.ok) { const data=await r.json(); throw Error(data.error?.message||r.statusText); }
+    const reader=r.body.getReader(), decoder=new TextDecoder(); let buffer='', answer='', performance={};
+    while(true) { const part=await reader.read(); if(part.done) break; buffer+=decoder.decode(part.value,{stream:true}); const lines=buffer.split('\n'); buffer=lines.pop(); for(const line of lines) { if(!line.startsWith('data: ')) continue; const raw=line.slice(6); if(raw==='[DONE]') continue; const data=JSON.parse(raw); const delta=data.choices?.[0]?.delta?.content; if(delta){answer+=delta;out.textContent=answer;chat.scrollTop=chat.scrollHeight;} if(data.performance) performance=data.performance; } }
+    if(!answer) answer='(no text returned)'; out.textContent=answer; history.push({role:'assistant',content:answer});
+    const stats=document.createElement('div'); stats.className='status'; stats.textContent=`pp ${Number(performance.pp_tok_s||0).toFixed(1)} tok/s · tg ${Number(performance.tg_tok_s||0).toFixed(1)} tok/s`; out.parentElement.append(stats);
+  }
   catch(e) { out.textContent=e.name==='AbortError'?'Stopped.':'Error: '+e.message; }
   finally { controller=null; send.disabled=false; stop.disabled=true; chat.scrollTop=chat.scrollHeight; }
 }

@@ -436,6 +436,16 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                         text = (char *)realloc(text, text_cap);
                     }
                     if (text) { memcpy(text + text_n, decoded, (size_t)dec_n); text_n += (size_t)dec_n; text[text_n] = 0; }
+                    if (dec_n > 0) {
+                        size_t tok_enc_n = 0;
+                        char *tok_enc = b64_encode((const unsigned char *)decoded,
+                                                   (size_t)dec_n, &tok_enc_n);
+                        if (tok_enc) {
+                            printf("TOK %s\n", tok_enc);
+                            fflush(stdout);
+                            free(tok_enc);
+                        }
+                    }
                     free(decoded);
                 }
             }
@@ -494,10 +504,10 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             hip_llm_reset_state(gpu);
             cache_n = 0;
         }
-        printf("OK %d %d %d %s %s\n", cancelled ? 0 : common,
+        printf("OK %d %d %d %s %s %.3f %.3f\n", cancelled ? 0 : common,
                cancelled ? 0 : n_tokens, generated,
                cancelled ? "cancelled" : (finish_eos ? "stop" : "length"),
-               enc ? enc : "");
+               enc ? enc : "", prefill_ms, decode_ms);
         fflush(stdout);
         free(enc); free(text); free(seen);
     }
