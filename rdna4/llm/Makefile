@@ -97,6 +97,8 @@ help:
 	@echo "Example:"
 	@echo "  ./test_hip_llm Qwen3-Embedding-0.6B-f16.gguf -t \"Hello world\" -n 4"
 	@echo "  python3 codex_server.py model.gguf --context 4096 --port 8080"
+	@echo "  GLM5NEXT_HIP_DSA=1 GLM5NEXT_HIP_KDA=1 GLM5NEXT_HIP_MOE=1 ./test_hip_llm GLM5Next.gguf --gpu-only-bench --prefill-len 1 --decode 1"
+	@echo "  GLM5NEXT_HIP_MOE_LAYER=N limits streamed MoE bring-up to one layer"
 	@echo ""
 	@echo "Requirements:"
 	@echo "  - libamdhip64.so (HIP runtime)"
