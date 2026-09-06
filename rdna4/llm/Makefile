@@ -7,7 +7,7 @@ CC = gcc
 HIPCC ?= hipcc
 ROCM_PATH ?= /opt/rocm
 ROCM_LIB ?= $(dir $(firstword $(wildcard $(ROCM_PATH)/lib/libhipblaslt.so $(ROCM_PATH)/core-*/lib/libhipblaslt.so)))
-CFLAGS = -O3 -Wall -Wextra -I.. -march=native -fopenmp
+CFLAGS = -O3 -Wall -Wextra -D_GNU_SOURCE -I.. -march=native -fopenmp
 LDFLAGS = -ldl -lm -lpthread -fopenmp
 
 # Sources

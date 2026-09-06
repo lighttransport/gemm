@@ -8,6 +8,7 @@ limits, while the child keeps the model and KV/SSM state resident.
 import argparse
 import base64
 import json
+import math
 import os
 import select
 import signal
@@ -19,6 +20,8 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+
+from qwen_tools import call_events, parse_calls, tool_instructions, tool_registry
 
 
 def content_text(content):
@@ -132,6 +135,25 @@ class Backend:
         self.active_cancel = None
         self.ready = False
         self.model = args.model.rsplit("/", 1)[-1]
+        self._wait_ready()
+
+    def _wait_ready(self):
+        """Wait until the resident runner has loaded the model."""
+        while not self.ready:
+            raw = self.proc.stdout.readline()
+            if not raw:
+                status = self.proc.poll()
+                if status is not None:
+                    wait = getattr(self.proc, "wait", None)
+                    if wait is not None:
+                        wait()
+                raise RuntimeError(
+                    "runner exited before READY" +
+                    (f" (status {status})" if status is not None else ""))
+            if raw.rstrip("\r\n") == "READY":
+                self.ready = True
+            else:
+                sys.stderr.write("[runner diagnostic] " + raw)
 
     def cancel(self, cancellation=None):
         """Request cooperative cancellation in the resident runner."""
@@ -156,16 +178,9 @@ class Backend:
         with self.lock:
             if self.proc.poll() is not None:
                 raise RuntimeError("runner exited")
-            # The child installs its signal handler before announcing READY.
-            # A client may disconnect while the model is still loading.
-            while not self.ready:
-                raw = self.proc.stdout.readline()
-                if not raw:
-                    raise RuntimeError("runner closed its response pipe before READY")
-                if raw.rstrip("\r\n") == "READY":
-                    self.ready = True
-                else:
-                    sys.stderr.write("[runner diagnostic] " + raw)
+            # The constructor normally consumes READY; retain this check for
+            # tests and callers that construct Backend without __init__.
+            self._wait_ready()
             with self.cancel_lock:
                 if cancellation.is_set():
                     return "", 0, 0, 0, "cancelled"
@@ -278,7 +293,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             n = int(self.headers.get("Content-Length", "0"))
-            req = json.loads(self.rfile.read(n))
+            if n <= 0:
+                self.send_json(400, {"error": {"message": "request body is required", "type": "invalid_request_error"}})
+                return
+            try:
+                req = json.loads(self.rfile.read(n))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"error": {"message": f"invalid JSON: {exc}", "type": "invalid_request_error"}})
+                return
+            if not isinstance(req, dict):
+                self.send_json(400, {"error": {"message": "request body must be a JSON object", "type": "invalid_request_error"}})
+                return
             if api_path == "/v1/completions":
                 prompt = req.get("prompt", "")
                 if isinstance(prompt, list): prompt = "".join(map(str, prompt))
@@ -290,7 +315,18 @@ class Handler(BaseHTTPRequestHandler):
                 messages.extend(responses_input_messages(inp))
             else:
                 messages = req.get("messages", [])
-            limit = min(int(req.get("max_tokens", req.get("max_output_tokens", self.max_tokens))), self.max_tokens)
+            registry = tool_registry(req.get("tools", []))
+            if registry:
+                messages.insert(0, {"role": "system", "content": tool_instructions(registry)})
+            try:
+                requested_limit = int(req.get("max_tokens", req.get("max_output_tokens", self.max_tokens)))
+            except (TypeError, ValueError):
+                self.send_json(400, {"error": {"message": "max_tokens must be an integer", "type": "invalid_request_error"}})
+                return
+            if requested_limit < 0:
+                self.send_json(400, {"error": {"message": "max_tokens must be non-negative", "type": "invalid_request_error"}})
+                return
+            limit = min(requested_limit, self.max_tokens)
             messages = fit_context(messages, self.context, limit)
             prompt = chat_prompt(messages)
             prefix = chat_prefix(messages)
@@ -300,11 +336,21 @@ class Handler(BaseHTTPRequestHandler):
             # its standalone benchmark sampling defaults do not apply here.
             default_temp, default_top_p, default_top_k, default_presence = (
                 (1.0, 0.95, 40, 0.0) if self.coding else (0.2, 0.95, 20, 0.0))
-            temp = float(req.get("temperature", default_temp))
-            top_p = float(req.get("top_p", default_top_p))
-            top_k = int(req.get("top_k", default_top_k))
-            presence = float(req.get("presence_penalty", default_presence))
-            min_p = float(req.get("min_p", 0.01 if self.coding else 0.0))
+            try:
+                temp = float(req.get("temperature", default_temp))
+                top_p = float(req.get("top_p", default_top_p))
+                top_k = int(req.get("top_k", default_top_k))
+                presence = float(req.get("presence_penalty", default_presence))
+                min_p = float(req.get("min_p", 0.01 if self.coding else 0.0))
+            except (TypeError, ValueError):
+                self.send_json(400, {"error": {"message": "sampling parameters must be numeric", "type": "invalid_request_error"}})
+                return
+            if (not math.isfinite(temp) or temp < 0 or
+                    not math.isfinite(top_p) or not 0 <= top_p <= 1 or
+                    top_k < 1 or not math.isfinite(presence) or
+                    not math.isfinite(min_p) or not 0 <= min_p <= 1):
+                self.send_json(400, {"error": {"message": "invalid sampling parameters", "type": "invalid_request_error"}})
+                return
             stop_watcher = threading.Event()
             cancelled = threading.Event()
             watcher = threading.Thread(target=self._watch_disconnect,
@@ -319,6 +365,9 @@ class Handler(BaseHTTPRequestHandler):
             if cancelled.is_set() or finish == "cancelled":
                 self.log_message("request cancelled: %s", self.path)
                 return
+            tool_text, calls = parse_calls(text, registry)
+            if calls:
+                text = tool_text
             ident = "chatcmpl-" + uuid.uuid4().hex
             created = int(time.time())
             usage = {"prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ptok + ctok, "cached_tokens": cached}
@@ -335,6 +384,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 if api_path == "/v1/responses":
                     response_id = "resp-" + uuid.uuid4().hex
+                    if calls:
+                        response_base = {"id": response_id, "object": "response",
+                                         "created_at": created, "status": "in_progress",
+                                         "model": self.model, "output": []}
+                        events = list(call_events(response_id, calls))
+                        response_done = {**response_base, "status": "completed",
+                                         "output": calls,
+                                         "usage": {"input_tokens": ptok,
+                                                   "output_tokens": ctok,
+                                                   "total_tokens": ptok + ctok,
+                                                   "input_tokens_details": {"cached_tokens": cached}}}
+                        events.append({"type": "response.completed", "response": response_done})
+                        for sequence_number, obj in enumerate(events):
+                            event = obj["type"]
+                            obj = {**obj, "sequence_number": sequence_number}
+                            self.wfile.write(("event: " + event + "\ndata: " +
+                                              json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
+                        self.wfile.flush()
+                        return
                     item_id = response_id + "-item"
                     part = {"type": "output_text", "text": text, "annotations": []}
                     item = {"type": "message", "id": item_id, "role": "assistant", "status": "completed", "content": [part]}
@@ -362,7 +430,19 @@ class Handler(BaseHTTPRequestHandler):
                         obj = {**obj, "sequence_number": sequence_number}
                         self.wfile.write(("event: " + event + "\ndata: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
                 else:
-                    if text:
+                    if calls:
+                        delta = {"role": "assistant", "tool_calls": [
+                            {"index": i, "id": item["call_id"], "type": item["type"],
+                             "function": {"name": item["name"],
+                                          "arguments": item.get("arguments", "")}}
+                            for i, item in enumerate(calls)]}
+                        obj = {"id": ident, "object": "chat.completion.chunk",
+                               "created": created, "model": self.model,
+                               "choices": [{"index": 0, "delta": delta,
+                                             "finish_reason": None}]}
+                        self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) +
+                                          "\n\n").encode())
+                    elif text:
                         obj = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": self.model, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
                         self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
                     obj = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": self.model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
@@ -371,6 +451,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if api_path == "/v1/responses":
                 response_id = "resp-" + uuid.uuid4().hex
+                if calls:
+                    self.send_json(200, {"id": response_id, "object": "response",
+                                         "created_at": created, "model": self.model,
+                                         "output": calls, "status": "completed",
+                                         "usage": {"input_tokens": ptok,
+                                                   "output_tokens": ctok,
+                                                   "total_tokens": ptok + ctok,
+                                                   "input_tokens_details": {"cached_tokens": cached}}})
+                    return
                 item = {"type": "message", "id": response_id + "-item", "role": "assistant",
                         "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}
                 self.send_json(200, {"id": response_id, "object": "response", "created_at": created,
@@ -381,7 +470,14 @@ class Handler(BaseHTTPRequestHandler):
             elif api_path == "/v1/completions":
                 self.send_json(200, {"id": ident, "object": "text_completion", "created": created, "model": self.model, "choices": [{"index": 0, "text": text, "finish_reason": finish}], "usage": usage})
             else:
-                self.send_json(200, {"id": ident, "object": "chat.completion", "created": created, "model": self.model, "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish}], "usage": usage})
+                message = {"role": "assistant", "content": text}
+                if calls:
+                    message["content"] = None
+                    message["tool_calls"] = [{"id": item["call_id"], "type": item["type"],
+                                               "function": {"name": item["name"],
+                                                            "arguments": item.get("arguments", "")}}
+                                              for item in calls]
+                self.send_json(200, {"id": ident, "object": "chat.completion", "created": created, "model": self.model, "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if calls else finish}], "usage": usage})
         except (BrokenPipeError, ConnectionResetError):
             # Clients commonly cancel a request after their own timeout. The
             # backend may finish its serialized inference, but there is no

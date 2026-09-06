@@ -2243,6 +2243,8 @@ static inline int tf_q4_0_int8_cache_init(tf_q4_0_int8_cache *cache,
                     int8_t di = (int8_t)di_raw;
                     drow[p*64 + b*32 + j]      = (int8_t)(lo * di);
                     drow[p*64 + b*32 + 16 + j] = (int8_t)(hi * di);
+                }
+            }
         }
     }
 #endif
@@ -10074,8 +10076,6 @@ static void *tf_nextn_ffn_worker(void *arg) {
     transformer_layer *L = t->layer;
     static _Thread_local int nextn_prefetch_initialized;
     if (!nextn_prefetch_initialized) {
-        const char *e = getenv("TF_BF16PV_PREFETCH_NEXTN");
-        if (e && *e) tf_bf16pv_decode_prefetch_override = atoi(e);
         nextn_prefetch_initialized = 1;
     }
     tf_barrier_tid = t->tid;
@@ -11705,6 +11705,44 @@ void transformer_prepack_podd(transformer_model *m) {
 #define TF_HAVE_BF16_PODD 1
 #endif /* TF_LINK_PODD */
 #endif /* __ARM_FEATURE_SVE */
+
+/* The batched path is shared with x86 builds, while p_odd is an optional
+ * A64FX-only implementation.  Keep the call sites portable when that
+ * implementation is not compiled in. */
+#ifndef TF_HAVE_BF16_PODD
+static uint16_t *tf_podd_Xa = NULL;
+static int tf_gemm_bf16_podd_qkv(float *Yq, float *Yk, float *Yv,
+        const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,
+        const float *X, int rq, int rk, int rv, int K, int N,
+        int Ysq, int Ysk, int Ysv, int Xs, int nt) {
+    (void)Yq; (void)Yk; (void)Yv; (void)Wq; (void)Wk; (void)Wv;
+    (void)X; (void)rq; (void)rk; (void)rv; (void)K; (void)N;
+    (void)Ysq; (void)Ysk; (void)Ysv; (void)Xs; (void)nt;
+    return 0;
+}
+static int tf_podd_compute_multi(float *Y0, const uint16_t *W0, int R0, int Ys0,
+        float *Y1, const uint16_t *W1, int R1, int Ys1,
+        float *Y2, const uint16_t *W2, int R2, int Ys2,
+        const uint16_t *Xa, int K, int N, int nt) {
+    (void)Y0; (void)W0; (void)R0; (void)Ys0; (void)Y1; (void)W1;
+    (void)R1; (void)Ys1; (void)Y2; (void)W2; (void)R2; (void)Ys2;
+    (void)Xa; (void)K; (void)N; (void)nt;
+    return 0;
+}
+static int tf_podd_compute_packed(float *Y, const uint16_t *Wp,
+        const uint16_t *Xa, int n_rows, int K, int N, int Ys, int nt) {
+    (void)Y; (void)Wp; (void)Xa; (void)n_rows; (void)K;
+    (void)N; (void)Ys; (void)nt;
+    return 0;
+}
+static int tf_gemm_bf16_podd_ffn_up_down(float *Y, float *Ygate,
+        const uint16_t *Wup, const uint16_t *Wdown, int local_ff,
+        int ne, int N, int nt) {
+    (void)Y; (void)Ygate; (void)Wup; (void)Wdown; (void)local_ff;
+    (void)ne; (void)N; (void)nt;
+    return 0;
+}
+#endif
 
 static void *tf_gemm_bf16_tm_worker(void *arg) {
     tf_gemm_tm_task *t = (tf_gemm_tm_task *)arg;

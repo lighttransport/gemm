@@ -69,6 +69,15 @@ def parse_calls(text, registry):
         name, body = match.groups()
         spec = registry.get(name)
         if spec is None:
+            # Qwen commonly emits the bare function name even when the API
+            # presents a namespaced tool. Accept that spelling only when it
+            # maps to exactly one registered function; ambiguity remains
+            # plain text rather than risking a call to the wrong tool.
+            candidates = [item for qualified, item in registry.items()
+                          if item["name"] == name and "." in qualified]
+            if len(candidates) == 1:
+                spec = candidates[0]
+        if spec is None:
             return text, []
         arguments = {}
         parameter_pattern = r"<parameter=([^>]+)>\n?(.*?)\n?</parameter>"

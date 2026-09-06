@@ -12,6 +12,23 @@ from codex_server import Backend
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_startup_waits_for_runner_ready(self):
+        backend = Backend.__new__(Backend)
+        backend.ready = False
+        backend.proc = SimpleNamespace(stdout=io.StringIO("loading\nREADY\n"),
+                                       poll=lambda: None)
+        with patch("codex_server.sys.stderr"):
+            backend._wait_ready()
+        self.assertTrue(backend.ready)
+
+    def test_startup_reports_runner_failure(self):
+        backend = Backend.__new__(Backend)
+        backend.ready = False
+        backend.proc = SimpleNamespace(stdout=io.StringIO("loading\n"),
+                                       poll=lambda: 1)
+        with self.assertRaisesRegex(RuntimeError, "runner exited before READY"):
+            backend._wait_ready()
+
     def test_queued_disconnect_cannot_cancel_active_request(self):
         replies = queue.Queue()
         submitted = threading.Event()
