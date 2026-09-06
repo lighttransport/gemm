@@ -433,6 +433,30 @@ class Handler(BaseHTTPRequestHandler):
                 return
             stop_watcher = threading.Event()
             cancelled = threading.Event()
+            stream_keepalive_stop = threading.Event()
+            stream_keepalive = None
+            if req.get("stream"):
+                # Send headers before inference and periodically emit SSE
+                # comments.  Qwen3.8's long prompt prefill can otherwise
+                # leave Codex's streaming HTTP request silent for minutes.
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+
+                def keepalive():
+                    while not stream_keepalive_stop.wait(5.0):
+                        try:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            cancelled.set()
+                            self.backend.cancel(cancelled)
+                            return
+
+                stream_keepalive = threading.Thread(target=keepalive, daemon=True)
+                stream_keepalive.start()
             watcher = threading.Thread(target=self._watch_disconnect,
                                        args=(stop_watcher, cancelled), daemon=True)
             watcher.start()
@@ -442,6 +466,9 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 stop_watcher.set()
                 watcher.join(timeout=0.2)
+                stream_keepalive_stop.set()
+                if stream_keepalive is not None:
+                    stream_keepalive.join(timeout=0.2)
             if cancelled.is_set() or finish == "cancelled":
                 self.log_message("request cancelled: %s", self.path)
                 return
@@ -452,15 +479,10 @@ class Handler(BaseHTTPRequestHandler):
             created = int(time.time())
             usage = {"prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ptok + ctok, "cached_tokens": cached}
             if req.get("stream"):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                # This shim buffers one complete inference before emitting the
-                # event sequence.  Explicitly terminate the SSE response so
-                # clients that use EOF as the stream boundary (including
-                # Codex) do not wait forever after response.completed.
-                self.send_header("Connection", "close")
-                self.end_headers()
+                # The stream headers and keepalive comments were sent before
+                # inference; now append the buffered response event sequence.
+                # Explicitly terminate the SSE response so clients that use
+                # EOF as the stream boundary (including Codex) finish cleanly.
                 self.close_connection = True
                 if api_path == "/v1/responses":
                     response_id = "resp-" + uuid.uuid4().hex
