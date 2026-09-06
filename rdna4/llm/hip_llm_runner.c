@@ -748,6 +748,38 @@ static const char *hip_kernel_source =
 "        for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
 "}\n"
+"/* Batched DSA Q8 projections. One launch covers all heads, avoiding 64\n"
+" * tiny matvec launches for each token. Matrices are head-major. */\n"
+"__global__ void dsa_q8_heads_f32(float *dst,const unsigned char *mat,\n"
+"        const float *x,int rows,int cols,size_t mat_stride){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,g=blockIdx.x*8+warp;\n"
+"    int head=g/rows,row=g%rows;if(head>=64||row>=rows)return;\n"
+"    int nb=cols/32,rb=nb*36;const unsigned char *rp=mat+(size_t)head*mat_stride+(size_t)row*rb;\n"
+"    const float *xb=x+(size_t)head*cols;float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;\n"
+"        const signed char *q=(const signed char *)(bp+4);float s=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++)s+=(float)q[j]*xb[b*32+j];\n"
+"        sum+=s*half_to_float(*(const half_raw *)bp);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[(size_t)head*rows+row]=sum;\n"
+"}\n"
+"/* Batched DSA V projections. Inputs/outputs are sequence-major, while the\n"
+" * quantized matrices remain head-major. */\n"
+"__global__ void dsa_q8_values_f32(float *dst,const unsigned char *mat,\n"
+"        const float *x,int seq,int heads,int rows,int cols,size_t mat_stride){\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,g=blockIdx.x*8+warp;\n"
+"    int si=g/(heads*rows),rem=g%(heads*rows),head=rem/rows,row=rem%rows;\n"
+"    if(si>=seq||head>=heads||row>=rows)return;\n"
+"    int nb=cols/32,rb=nb*36;const unsigned char *rp=mat+(size_t)head*mat_stride+(size_t)row*rb;\n"
+"    const float *xb=x+(size_t)si*cols;float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*36;\n"
+"        const signed char *q=(const signed char *)(bp+4);float s=0.0f;\n"
+"        #pragma unroll\n"
+"        for(int j=0;j<32;j++)s+=(float)q[j]*xb[b*32+j];\n"
+"        sum+=s*half_to_float(*(const half_raw *)bp);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);\n"
+"    if(lane==0)dst[((size_t)si*heads+head)*rows+row]=sum;\n"
+"}\n"
 "/* Fused Q/K/V Q8_0 matvecs. The three projections share the input vector;\n"
 " * selecting the output matrix per warp removes two launch boundaries. */\n"
 "__global__ void matvec_qkv_q8_0_mw(float *qout,float *kout,float *vout,\n"
@@ -8262,6 +8294,8 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q8_0_dp4a;
     hipFunction_t fn_matvec_q8_0_f32;
     hipFunction_t fn_matvec_q8_0_mw_f32;
+    hipFunction_t fn_dsa_q8_heads_f32;
+    hipFunction_t fn_dsa_q8_values_f32;
     hipFunction_t fn_matvec_qkv_q8_0_mw;
     hipFunction_t fn_matvec_qz_q8_0_mw;
     hipFunction_t fn_ssm_matvec4_q8_f32;
@@ -8882,6 +8916,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(quantize_f32_act_to_int8);
     GET_FUNC(matvec_q8_0_f32);
     GET_FUNC(matvec_q8_0_mw_f32);
+    GET_FUNC(dsa_q8_heads_f32);
+    GET_FUNC(dsa_q8_values_f32);
     GET_FUNC(matvec_qkv_q8_0_mw);
     GET_FUNC(matvec_qz_q8_0_mw);
     GET_FUNC(ssm_matvec4_q8_f32);
@@ -12108,6 +12144,21 @@ static inline void launch_matvec_q8_f32(hip_llm_runner *r, void *dst, void *mat,
            256, 1, 1, 0, r->stream, args);
 }
 
+static inline void launch_dsa_q8_heads(hip_llm_runner *r, void *dst, void *mat,
+                                       void *x, int rows, int cols, size_t mat_stride) {
+    void *args[] = { &dst, &mat, &x, &rows, &cols, &mat_stride };
+    LAUNCH(r->fn_dsa_q8_heads_f32, (64 * rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_dsa_q8_values(hip_llm_runner *r, void *dst, void *mat,
+                                        void *x, int seq, int heads, int rows,
+                                        int cols, size_t mat_stride) {
+    void *args[] = { &dst, &mat, &x, &seq, &heads, &rows, &cols, &mat_stride };
+    LAUNCH(r->fn_dsa_q8_values_f32, (seq * heads * rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
 static inline void launch_matvec_qkv_q8(hip_llm_runner *r,
                                          void *q, void *k, void *v,
                                          void *qw, void *kw, void *vw,
@@ -15315,20 +15366,16 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
             if (hipMemcpy(dq, q + (size_t)head*qdim, (size_t)qdim*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
             q_input = dq;
         }
-        launch_matvec_q8_f32(r, (uint8_t *)dqcache + (size_t)head*kv*sizeof(float),
-                             (uint8_t *)cache->k_weight + (size_t)head*cache->k_stride, q_input, kv, qdim);
-        for (int si = 0; si < attn_nt; ++si) {
-            int p = selected ? selected[si] : si;
-            (void)p;
-            /* The selected latent rows were uploaded into dkcache above.
-             * Write each head's V result directly to the attention workspace;
-             * this removes a per-head H2D latent copy and a D2D staging copy. */
-            launch_matvec_q8_f32(r,
-                (uint8_t *)dvcache + ((size_t)si*heads + head)*vdim*sizeof(float),
-                (uint8_t *)cache->v_weight + (size_t)head*cache->v_stride,
-                (uint8_t *)dkcache + (size_t)si*kv*sizeof(float), vdim, kv);
-        }
+        if (!cache->q_ready)
+            launch_matvec_q8_f32(r, (uint8_t *)dqcache + (size_t)head*kv*sizeof(float),
+                                 (uint8_t *)cache->k_weight + (size_t)head*cache->k_stride,
+                                 q_input, kv, qdim);
     }
+    if (cache->q_ready)
+        launch_dsa_q8_heads(r, dqcache, cache->k_weight, dproj_q, kv, qdim, cache->k_stride);
+    /* All V heads and selected latent rows share one launch. */
+    launch_dsa_q8_values(r, dvcache, cache->v_weight, dkcache,
+                         attn_nt, heads, vdim, kv, cache->v_stride);
     if (hipStreamSynchronize(r->stream) != hipSuccess) goto done;
     { void *args[] = { &dattn, &dqcache, &dkcache, &dvcache, (void *)&heads, (void *)&kv,
                        (void *)&vdim, (void *)&attn_nt };
@@ -15379,10 +15426,15 @@ static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
          * uploaded from host RAM on every token. */
         persistent = &r->glm5next_kda_gpu[layer];
         own_weights = 0;
+        int was_ready = persistent->ready;
         if (glm5next_hip_kda_cache_load(model, layer, persistent) != 0) {
             /* Fall back to streaming if the complete cache cannot fit. */
+            if (!was_ready)
+                fprintf(stderr, "hip_llm: KDA layer %d resident cache unavailable; streaming\n", layer);
             persistent = NULL;
             own_weights = 1;
+        } else if (!was_ready) {
+            fprintf(stderr, "hip_llm: KDA layer %d resident cache ready\n", layer);
         }
     }
     if (!own_weights) {
