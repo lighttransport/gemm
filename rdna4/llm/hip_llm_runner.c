@@ -1926,6 +1926,31 @@ static const char *hip_kernel_source =
 "    out[j] = y * rsqrtf((float)head_dim);\n"
 "}\n"
 "\n"
+"/* Multi-head KDA form: one block per head, one thread per state column. */\n"
+"__global__ void glm5next_kda_heads_step_f32(\n"
+"    float *state, float *out, const float *q, const float *k, const float *v,\n"
+"    const float *log_decay, const float *beta, int n_heads, int head_dim) {\n"
+"    int h = blockIdx.x, j = threadIdx.x;\n"
+"    if (h >= n_heads || j >= head_dim) return;\n"
+"    size_t base = (size_t)h * head_dim * head_dim;\n"
+"    const float *qh = q + (size_t)h * head_dim;\n"
+"    const float *kh = k + (size_t)h * head_dim;\n"
+"    const float *vh = v + (size_t)h * head_dim;\n"
+"    const float *dh = log_decay + (size_t)h * head_dim;\n"
+"    float memory = 0.0f;\n"
+"    for (int d = 0; d < head_dim; ++d) {\n"
+"        size_t z = base + (size_t)d * head_dim + j;\n"
+"        state[z] *= expf(dh[d]); memory += state[z] * kh[d];\n"
+"    }\n"
+"    float delta = (vh[j] - memory) * beta[h];\n"
+"    float y = 0.0f;\n"
+"    for (int d = 0; d < head_dim; ++d) {\n"
+"        size_t z = base + (size_t)d * head_dim + j;\n"
+"        state[z] += kh[d] * delta; y += state[z] * qh[d];\n"
+"    }\n"
+"    out[(size_t)h * head_dim + j] = y * rsqrtf((float)head_dim);\n"
+"}\n"
+"\n"
 "/* ---- 24b. deltanet_step_batch_f32: M sequential steps fused in one kernel ----\n"
 " * Each thread r owns row r of the state matrix; the row is loaded into\n"
 " * registers ONCE at the start, mutated through M token steps, written back\n"
@@ -8104,6 +8129,7 @@ struct hip_llm_runner {
     hipFunction_t fn_repeat_tile_f32;
     hipFunction_t fn_deltanet_step_f32;
     hipFunction_t fn_glm5next_kda_step_f32;
+    hipFunction_t fn_glm5next_kda_heads_step_f32;
     hipFunction_t fn_deltanet_step_batch_f32;
     hipFunction_t fn_l2_norm_heads_batch_f32;
     hipFunction_t fn_repeat_tile_batch_f32;
@@ -8698,6 +8724,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(repeat_tile_f32);
     GET_FUNC(deltanet_step_f32);
     GET_FUNC(glm5next_kda_step_f32);
+    GET_FUNC(glm5next_kda_heads_step_f32);
     GET_FUNC(deltanet_step_batch_f32);
     GET_FUNC(l2_norm_heads_batch_f32);
     GET_FUNC(repeat_tile_batch_f32);
