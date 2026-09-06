@@ -35,6 +35,16 @@ static inline int glm5next_cpu_matvec(float *out, const glm5next_tensor_view *w,
     return 0;
 }
 
+static inline int glm5next_cpu_matvec_head(float *out,
+        const glm5next_tensor_view *w, int head, const float *x) {
+    if (!w || w->n_dims != 3 || head < 0 || (uint64_t)head >= w->dims[2]) return -1;
+    glm5next_tensor_view slice = *w;
+    size_t row_bytes = dequant_row_size(w->type, (int)w->dims[0]);
+    slice.n_dims = 2;
+    slice.data = (void *)((const uint8_t *)w->data + (size_t)head * w->dims[1] * row_bytes);
+    return glm5next_cpu_matvec(out, &slice, x);
+}
+
 static inline int glm5next_cpu_vector(const glm5next_tensor_view *w, float *out, int n) {
     if (!w || !out || !w->data || w->n_dims != 1 || (int)w->dims[0] != n) return -1;
     return dequant_row(w->type, w->data, out, n);
@@ -46,6 +56,117 @@ static inline void glm5next_cpu_rmsnorm(float *out, const float *x,
     for (int i = 0; i < n; ++i) ss += (double)x[i] * x[i];
     float inv = 1.0f / sqrtf((float)(ss / n) + eps);
     for (int i = 0; i < n; ++i) out[i] = x[i] * inv * weight[i];
+}
+
+/* CPU implementation of one mHC site.  The learned mixer is stored as a
+ * quantized [hc*hidden, (2+hc)*hc] matrix, so the generic row matvec also
+ * handles the model's Q8_0 representation without materializing it. */
+static inline int glm5next_cpu_mhc_pre(const glm5next_config *c,
+        const glm5next_tensor_view *fn, const glm5next_tensor_view *base,
+        const glm5next_tensor_view *scale, const float *streams,
+        float *collapsed, float *post, float *comb) {
+    int hc = c->hc_count, width = c->hidden_size;
+    int mix = (2 + hc) * hc;
+    float *logits = (float *)malloc((size_t)mix * sizeof(float));
+    float *base_f = (float *)malloc((size_t)mix * sizeof(float));
+    float *scale_f = (float *)malloc(3 * sizeof(float));
+    if (!logits || !base_f || !scale_f ||
+        glm5next_cpu_matvec(logits, fn, streams) != 0 ||
+        glm5next_cpu_vector(base, base_f, mix) != 0 ||
+        glm5next_cpu_vector(scale, scale_f, 3) != 0) {
+        free(logits); free(base_f); free(scale_f); return -1;
+    }
+    double ss = 0.0;
+    for (int i = 0; i < hc * width; ++i) ss += (double)streams[i] * streams[i];
+    float inv = 1.0f / sqrtf((float)(ss / (hc * width)) + c->norm_epsilon);
+    for (int i = 0; i < mix; ++i) logits[i] = logits[i] * inv;
+    for (int i = 0; i < hc; ++i) {
+        logits[i] = 1.0f / (1.0f + expf(-(logits[i] * scale_f[0] + base_f[i]))) + c->hc_sinkhorn_epsilon;
+        post[i] = 2.0f / (1.0f + expf(-(logits[hc + i] * scale_f[1] + base_f[hc + i])));
+    }
+    for (int i = 0; i < hc * hc; ++i) comb[i] = logits[2 * hc + i] * scale_f[2] + base_f[2 * hc + i];
+    glm5next_mhc_sinkhorn(comb, hc, c->hc_sinkhorn_iterations, c->hc_sinkhorn_epsilon);
+    for (int d = 0; d < width; ++d) {
+        double v = 0.0;
+        for (int i = 0; i < hc; ++i) v += (double)logits[i] * streams[(size_t)i * width + d];
+        collapsed[d] = (float)v;
+    }
+    free(logits); free(base_f); free(scale_f); return 0;
+}
+
+static inline void glm5next_cpu_mhc_post(const glm5next_config *c,
+        float *streams, const float *residual, const float *sublayer,
+        const float *post, const float *comb) {
+    int hc = c->hc_count, width = c->hidden_size;
+    for (int k = 0; k < hc; ++k) for (int d = 0; d < width; ++d) {
+        double v = (double)post[k] * sublayer[d];
+        for (int j = 0; j < hc; ++j) v += (double)comb[(size_t)j * hc + k] * residual[(size_t)j * width + d];
+        streams[(size_t)k * width + d] = (float)v;
+    }
+}
+
+static inline int glm5next_cpu_dense_ffn(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out) {
+    char name[128]; glm5next_tensor_view t;
+    int ff = c->dense_feed_forward_length;
+    float *gate = (float *)malloc((size_t)ff * sizeof(float));
+    float *up = (float *)malloc((size_t)ff * sizeof(float));
+    if (!gate || !up) { free(gate); free(up); return -1; }
+#define G5GET(s) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
+    if (glm5next_tensor_view_get(model, name, 1, &t) != 0) { free(gate); free(up); return -1; } } while (0)
+    G5GET("ffn_gate.weight"); if (glm5next_cpu_matvec(gate, &t, hidden) != 0) goto fail;
+    G5GET("ffn_up.weight"); if (glm5next_cpu_matvec(up, &t, hidden) != 0) goto fail;
+    for (int i = 0; i < ff; ++i) gate[i] = gate[i] / (1.0f + expf(-gate[i])) * up[i];
+    G5GET("ffn_down.weight"); if (glm5next_cpu_matvec(out, &t, gate) != 0) goto fail;
+    free(gate); free(up); return 0;
+fail:
+    free(gate); free(up); return -1;
+#undef G5GET
+}
+
+/* One-token absorbed DSA attention.  With no prior KV cells this is already
+ * the exact causal attention result (the sole score softmaxes to one); the
+ * latent cache/indexer is added in the history-aware routine below. */
+static inline int glm5next_cpu_dsa_forward(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out) {
+    char name[128]; glm5next_tensor_view t;
+    int h = c->hidden_size, heads = c->attention_heads;
+    int qrank = c->q_lora_rank, kv = c->kv_lora_rank;
+    int qdim = c->qk_nope_head_dim, vdim = c->value_head_dim;
+    float *qr = (float *)malloc((size_t)qrank * sizeof(float));
+    float *kv_latent = (float *)malloc((size_t)kv * sizeof(float));
+    float *q = (float *)malloc((size_t)heads * qdim * sizeof(float));
+    float *value = (float *)malloc((size_t)heads * vdim * sizeof(float));
+    float *tmp = (float *)malloc((size_t)h * sizeof(float));
+    float *norm = (float *)malloc((size_t)((qrank > kv) ? qrank : kv) * sizeof(float));
+    if (!qr || !kv_latent || !q || !value || !tmp || !norm) goto fail;
+#define DSA_GET(s) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
+    if (glm5next_tensor_view_get(model, name, 1, &t) != 0) goto fail; } while (0)
+    DSA_GET("attn_q_a.weight"); if (glm5next_cpu_matvec(qr, &t, hidden) != 0) goto fail;
+    DSA_GET("attn_q_a_norm.weight"); if (glm5next_cpu_vector(&t, norm, qrank) != 0) goto fail;
+    glm5next_cpu_rmsnorm(qr, qr, norm, qrank, c->norm_epsilon);
+    DSA_GET("attn_q_b.weight"); if (glm5next_cpu_matvec(q, &t, qr) != 0) goto fail;
+    DSA_GET("attn_kv_a_mqa.weight"); if (glm5next_cpu_matvec(kv_latent, &t, hidden) != 0) goto fail;
+    DSA_GET("attn_kv_a_norm.weight"); if (glm5next_cpu_vector(&t, norm, kv) != 0) goto fail;
+    glm5next_cpu_rmsnorm(kv_latent, kv_latent, norm, kv, c->norm_epsilon);
+    for (int head = 0; head < heads; ++head) {
+        float *qh = (float *)malloc((size_t)kv * sizeof(float));
+        if (!qh) goto fail;
+        DSA_GET("attn_k_b.weight");
+        if (glm5next_cpu_matvec_head(qh, &t, head, q + (size_t)head * qdim) != 0) { free(qh); goto fail; }
+        float score = 0.0f;
+        for (int i = 0; i < kv; ++i) score += qh[i] * kv_latent[i];
+        (void)score; /* one causal cell: softmax(score) = 1 */
+        DSA_GET("attn_v_b.weight");
+        if (glm5next_cpu_matvec_head(value + (size_t)head * vdim, &t, head, kv_latent) != 0) { free(qh); goto fail; }
+        free(qh);
+    }
+    DSA_GET("attn_output.weight"); if (glm5next_cpu_matvec(tmp, &t, value) != 0) goto fail;
+    memcpy(out, tmp, (size_t)h * sizeof(float));
+    free(qr); free(kv_latent); free(q); free(value); free(tmp); free(norm); return 0;
+fail:
+    free(qr); free(kv_latent); free(q); free(value); free(tmp); free(norm); return -1;
+#undef DSA_GET
 }
 
 /* Execute one recurrent KDA layer from the real GGUF views.  State layouts
@@ -95,11 +216,19 @@ static inline int glm5next_cpu_kda_forward(const gguf_shards *model,
     MAT(q, "attn_q.weight");
     MAT(k, "attn_k.weight");
     MAT(v, "attn_v.weight");
-    GET("ssm_conv1d_q.weight", 1);
-    if (t.type != GGML_TYPE_F32 || t.n_dims != 3) goto done;
+    glm5next_tensor_view conv[3];
+    const char *conv_names[3] = {
+        "ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight"
+    };
+    for (z = 0; z < 3; ++z) {
+        GET(conv_names[z], 1);
+        conv[z] = t;
+        if (conv[z].type != GGML_TYPE_F32 || conv[z].n_dims != 3) goto done;
+    }
     {
-        const float *w = (const float *)t.data;
+        const float *w;
         for (z = 0; z < 3; ++z) {
+            w = (const float *)conv[z].data;
             float *y = z == 0 ? q : (z == 1 ? k : v);
             float *s = conv_state + (size_t)z * qdim * (c->short_conv_kernel - 1);
             for (d = 0; d < qdim; ++d) {
@@ -135,8 +264,11 @@ static inline int glm5next_cpu_kda_forward(const gguf_shards *model,
     for (h = 0; h < c->attention_heads; ++h) {
         for (d = 0; d < c->linear_head_dim; ++d) {
             int j = h * c->linear_head_dim + d;
+            /* GLM5Next stores ssm_a as -exp(A_log), not A_log.  The
+             * reference graph computes sigmoid(-ssm_a * (f + dt)) and then
+             * scales the result by the negative lower bound. */
             decay[j] = c->kda_gate_lower_bound *
-                (1.0f / (1.0f + expf(-expf(a[h]) * (gate[j] + dt[j]))));
+                (1.0f / (1.0f + expf(a[h] * (gate[j] + dt[j]))));
         }
         beta[h] = 1.0f / (1.0f + expf(-beta[h]));
         glm5next_kda_step(recurrent + (size_t)h * c->linear_head_dim * c->linear_head_dim,
@@ -170,6 +302,49 @@ done:
     return rc;
 #undef MAT
 #undef GET
+}
+
+/* Complete CPU block for the KDA + leading-dense case.  This is the first
+ * end-to-end block oracle: it includes both mHC sites, RMSNorm, recurrent KDA,
+ * and the dense SwiGLU FFN.  DSA/MoE blocks use separate routines because
+ * their cache and expert routing state are different. */
+static inline int glm5next_cpu_kda_dense_block(const gguf_shards *model,
+        int layer, const glm5next_config *c, float *streams,
+        float *recurrent, float *conv_state) {
+    int h = c->hidden_size, hc = c->hc_count;
+    char name[128]; glm5next_tensor_view fn, base, scale;
+    float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
+    float *collapsed = (float *)malloc((size_t)h * sizeof(float));
+    float *sublayer = (float *)malloc((size_t)h * sizeof(float));
+    float *post = (float *)malloc((size_t)hc * sizeof(float));
+    float *comb = (float *)malloc((size_t)hc * hc * sizeof(float));
+    float *norm = (float *)malloc((size_t)h * sizeof(float));
+    if (!residual || !collapsed || !sublayer || !post || !comb || !norm) goto fail;
+    memcpy(residual, streams, (size_t)hc * h * sizeof(float));
+#define G5VIEW(s, req, dst) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
+    if (glm5next_tensor_view_get(model, name, (req), &(dst)) != 0) goto fail; } while (0)
+    G5VIEW("hc_attn_fn.weight", 1, fn); G5VIEW("hc_attn_base.weight", 1, base); G5VIEW("hc_attn_scale.weight", 1, scale);
+    if (glm5next_cpu_mhc_pre(c, &fn, &base, &scale, residual, collapsed, post, comb) != 0) goto fail;
+    G5VIEW("attn_norm.weight", 1, fn);
+    if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
+    glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
+    if (glm5next_cpu_kda_forward(model, layer, c, collapsed, sublayer, recurrent, conv_state) != 0) goto fail;
+    glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
+
+    memcpy(residual, streams, (size_t)hc * h * sizeof(float));
+    G5VIEW("hc_ffn_fn.weight", 1, fn); G5VIEW("hc_ffn_base.weight", 1, base); G5VIEW("hc_ffn_scale.weight", 1, scale);
+    if (glm5next_cpu_mhc_pre(c, &fn, &base, &scale, residual, collapsed, post, comb) != 0) goto fail;
+    G5VIEW("ffn_norm.weight", 1, fn);
+    if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
+    glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
+    if (glm5next_cpu_dense_ffn(model, layer, c, collapsed, sublayer) != 0) goto fail;
+    glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
+    free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm);
+    return 0;
+fail:
+    free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm);
+    return -1;
+#undef G5VIEW
 }
 
 #endif /* GLM5NEXT_CPU_KDA_H */

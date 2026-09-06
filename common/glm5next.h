@@ -32,6 +32,7 @@ typedef struct {
     int n_nextn_layers;
     int hidden_size;
     int vocab_size;
+    int dense_feed_forward_length;
     int context_length;
     int attention_heads;
     int kv_heads_default;
@@ -151,6 +152,7 @@ static inline int glm5next_config_load(const gguf_context *gguf,
     c->n_layers           = c->n_layers_all - c->n_nextn_layers;
     c->hidden_size        = G5I("embedding_length", 0);
     c->vocab_size         = G5I("vocab_size", 0);
+    c->dense_feed_forward_length = G5I("feed_forward_length", 0);
     c->context_length     = G5I("context_length", 0);
     c->attention_heads    = G5I("attention.head_count", 0);
     c->kv_heads_default   = G5I("attention.head_count_kv", 0);
@@ -183,7 +185,7 @@ static inline int glm5next_config_load(const gguf_context *gguf,
 #undef G5F
 
     if (c->n_layers <= 0 || c->n_layers > c->n_layers_all || c->hidden_size <= 0 ||
-        c->vocab_size <= 0 || c->attention_heads <= 0 || c->q_lora_rank <= 0 ||
+        c->vocab_size <= 0 || c->dense_feed_forward_length <= 0 || c->attention_heads <= 0 || c->q_lora_rank <= 0 ||
         c->kv_lora_rank <= 0 || c->qk_nope_head_dim <= 0 || c->value_head_dim <= 0 ||
         c->linear_head_dim <= 0 || c->indexer_heads <= 0 || c->indexer_key_length <= 0 ||
         c->indexer_top_k <= 0 || c->indexer_kpool <= 0 ||
