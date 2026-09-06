@@ -36,7 +36,11 @@ static inline int glm5next_cpu_matvec(float *out, const glm5next_tensor_view *w,
  * large projections, while retaining the compact serial path for vectors and
  * small control projections. */
 #if defined(_OPENMP)
-    if (rows >= 1024) {
+    /* Some GGML IQ dequant helpers lazily initialize shared lookup tables.
+     * Keep this path opt-in until those helpers are made thread-safe; the
+     * reference oracle must never produce NaNs while validating HIP kernels. */
+    if (rows >= 1024 && getenv("GLM5NEXT_CPU_OMP") &&
+        atoi(getenv("GLM5NEXT_CPU_OMP")) != 0) {
         int failed = 0;
 #pragma omp parallel
         {
@@ -448,8 +452,15 @@ static inline int glm5next_cpu_kda_forward(const gguf_shards *model,
             }
         }
     }
-    glm53f_l2norm(q, qdim, 1e-6f);
-    glm53f_l2norm(k, qdim, 1e-6f);
+    /* Q/K are normalized independently for each KDA head.  A single
+     * qdim-wide normalization changes the relative scale between heads and
+     * does not match the HIP per-head kernel or the GLM5Next graph. */
+    for (h = 0; h < c->attention_heads; ++h) {
+        glm53f_l2norm(q + (size_t)h * c->linear_head_dim,
+                      c->linear_head_dim, 1e-6f);
+        glm53f_l2norm(k + (size_t)h * c->linear_head_dim,
+                      c->linear_head_dim, 1e-6f);
+    }
     MAT(fa, "ssm_f_a.weight");
     GET("ssm_f_b.weight", 1);
     if (glm5next_cpu_matvec(gate, &t, fa) != 0) goto done;
@@ -494,7 +505,11 @@ static inline int glm5next_cpu_kda_forward(const gguf_shards *model,
             core[j] *= inv * norm[d] * sig;
         }
     }
-    MAT(out, "attn_output.weight");
+    /* The output projection consumes the gated recurrent state, not the
+     * normalized model input.  Using MAT here reused x (hidden-sized) and
+     * read past its end because this projection has qdim=8192 columns. */
+    GET("attn_output.weight", 1);
+    if (glm5next_cpu_matvec(out, &t, core) != 0) goto done;
     free(dt);
     rc = 0;
 done:

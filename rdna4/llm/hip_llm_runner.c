@@ -1951,6 +1951,17 @@ static const char *hip_kernel_source =
 "    out[(size_t)h * head_dim + j] = y * rsqrtf((float)head_dim);\n"
 "}\n"
 "\n"
+"/* GLM5Next stores a[h] = -exp(A_log).  Produce the per-channel decay\n"
+" * directly from the f projection and dt bias. */\n"
+"__global__ void glm5next_kda_decay_f32(float *out, const float *f,\n"
+"    const float *dt, const float *a, int n_heads, int head_dim, float lower) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int n = n_heads * head_dim;\n"
+"    if (i >= n) return;\n"
+"    int h = i / head_dim;\n"
+"    out[i] = lower / (1.0f + expf(a[h] * (f[i] + dt[i])));\n"
+"}\n"
+"\n"
 "/* Causal absorbed-DSA attention over shared latent keys and per-head values. */\n"
 "__global__ void glm5next_dsa_attend_f32(\n"
 "    float *out, const float *q, const float *kcache, const float *vcache,\n"
@@ -8157,6 +8168,7 @@ struct hip_llm_runner {
     hipFunction_t fn_deltanet_step_f32;
     hipFunction_t fn_glm5next_kda_step_f32;
     hipFunction_t fn_glm5next_kda_heads_step_f32;
+    hipFunction_t fn_glm5next_kda_decay_f32;
     hipFunction_t fn_glm5next_dsa_attend_f32;
     hipFunction_t fn_deltanet_step_batch_f32;
     hipFunction_t fn_l2_norm_heads_batch_f32;
@@ -8753,6 +8765,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(deltanet_step_f32);
     GET_FUNC(glm5next_kda_step_f32);
     GET_FUNC(glm5next_kda_heads_step_f32);
+    GET_FUNC(glm5next_kda_decay_f32);
     GET_FUNC(glm5next_dsa_attend_f32);
     GET_FUNC(deltanet_step_batch_f32);
     GET_FUNC(l2_norm_heads_batch_f32);
@@ -12324,6 +12337,31 @@ static inline void launch_deltanet_step(hip_llm_runner *r, void *state,
     }
 }
 
+static inline void launch_glm5next_kda_decay(hip_llm_runner *r, void *out,
+        void *f, void *dt, void *a, int n_heads, int head_dim, float lower) {
+    int n = n_heads * head_dim;
+    void *args[] = { &out, &f, &dt, &a, &n_heads, &head_dim, &lower };
+    LAUNCH(r->fn_glm5next_kda_decay_f32, (n + 255) / 256, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_glm5next_kda_heads_step(hip_llm_runner *r, void *state,
+        void *out, void *q, void *k, void *v, void *decay, void *beta,
+        int n_heads, int head_dim) {
+    void *args[] = { &state, &out, &q, &k, &v, &decay, &beta, &n_heads, &head_dim };
+    LAUNCH(r->fn_glm5next_kda_heads_step_f32, n_heads, 1, 1, head_dim,
+           1, 1, 0, r->stream, args);
+}
+
+static inline void launch_glm5next_kda_gated_norm(hip_llm_runner *r, void *out,
+        void *gate, void *norm_w, int n_heads, int head_dim, float eps) {
+    int gate_silu = 0; /* GLM5Next uses sigmoid(g), not SiLU(g). */
+    int threads = head_dim <= 128 ? 128 : 256;
+    void *args[] = { &out, &gate, &norm_w, &n_heads, &head_dim, &eps, &gate_silu };
+    LAUNCH(r->fn_gated_rmsnorm_silu_f32, n_heads, 1, 1, threads, 1, 1,
+           threads * sizeof(float), r->stream, args);
+}
+
 /* Fused multi-token DeltaNet step: M sequential token steps in one launch.
  * Each thread keeps its row of the state matrix in registers across the M
  * iterations, eliminating the M × (state_row R + W) global traffic of the
@@ -14154,6 +14192,181 @@ int hip_llm_verify_glm5next_model_matvec(hip_llm_runner *r, gguf_shards *model,
     if (out_rel_l2) *out_rel_l2 = total_den > 0.0 ? sqrt(total_num / total_den) : sqrt(total_num);
     if (out_max_abs) *out_max_abs = global_max;
     return rc;
+}
+
+int hip_llm_verify_glm5next_model_kda_projections(hip_llm_runner *r,
+                                                   gguf_shards *model, int layer,
+                                                   double *out_rel_l2,
+                                                   double *out_max_abs,
+                                                   double *out_ms) {
+    const char *names[3] = { "attn_q.weight", "attn_k.weight", "attn_v.weight" };
+    glm5next_tensor_view view[3];
+    qtensor qt[3];
+    void *dw[3] = { NULL, NULL, NULL }, *dx = NULL, *dy[3] = { NULL, NULL, NULL };
+    float *x = NULL, *ref[3] = { NULL, NULL, NULL }, *got[3] = { NULL, NULL, NULL };
+    int types[3] = { 0, 0, 0 }, rc = -1;
+    double num = 0.0, den = 0.0, mx = 0.0, start = 0.0;
+    uint32_t seed = 0x517cc1b7u;
+    if (!r || !model || layer < 0 || layer >= 45) return -1;
+    for (int i = 0; i < 3; ++i) {
+        char name[128];
+        snprintf(name, sizeof(name), "blk.%d.%s", layer, names[i]);
+        if (glm5next_tensor_view_get(model, name, 1, &view[i]) != 0 ||
+            view[i].n_dims != 2 || view[i].dims[0] != 4096 || view[i].dims[1] == 0)
+            goto done;
+        qt[i] = glm5next_as_qtensor(&view[i]);
+    }
+    x = (float *)malloc(4096 * sizeof(float));
+    if (!x) goto done;
+    for (int i = 0; i < 4096; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        x[i] = ((float)(seed >> 8) * (1.0f / 16777216.0f) - 0.5f) * 0.2f;
+    }
+    for (int i = 0; i < 3; ++i) {
+        size_t n = (size_t)qt[i].n_rows;
+        ref[i] = (float *)malloc(n * sizeof(float));
+        got[i] = (float *)malloc(n * sizeof(float));
+        if (!ref[i] || !got[i] || upload_weight_matrix(&dw[i], &qt[i], &types[i]) != 0 ||
+            hipMalloc(&dy[i], n * sizeof(float)) != hipSuccess) goto done;
+    }
+    if (hipMalloc(&dx, 4096 * sizeof(float)) != hipSuccess ||
+        hipMemcpy(dx, x, 4096 * sizeof(float), hipMemcpyHostToDevice) != hipSuccess)
+        goto done;
+    start = hllm_monotonic_ms();
+    for (int i = 0; i < 3; ++i)
+        launch_matvec_auto(r, dy[i], dw[i], dx, qt[i].n_rows, qt[i].n_cols, types[i]);
+    if (hipStreamSynchronize(r->stream) != hipSuccess) goto done;
+    if (out_ms) *out_ms = hllm_monotonic_ms() - start;
+    for (int i = 0; i < 3; ++i) {
+        size_t n = (size_t)qt[i].n_rows;
+        if (hipMemcpy(got[i], dy[i], n * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
+            glm5next_cpu_matvec(ref[i], &view[i], x) != 0) goto done;
+        for (size_t j = 0; j < n; ++j) {
+            double d = (double)got[i][j] - ref[i][j];
+            num += d * d; den += (double)ref[i][j] * ref[i][j];
+            if (fabs(d) > mx) mx = fabs(d);
+        }
+    }
+    if (out_rel_l2) *out_rel_l2 = den > 0.0 ? sqrt(num / den) : sqrt(num);
+    if (out_max_abs) *out_max_abs = mx;
+    rc = 0;
+done:
+    for (int i = 0; i < 3; ++i) {
+        if (dw[i]) hipFree(dw[i]);
+        if (dy[i]) hipFree(dy[i]);
+        free(ref[i]); free(got[i]);
+    }
+    if (dx) hipFree(dx);
+    free(x);
+    return rc;
+}
+
+static int glm5next_upload_f32_view(void **dst, const glm5next_tensor_view *v) {
+    if (!dst || !v || !v->data || v->type != GGML_TYPE_F32 || v->bytes == 0) return -1;
+    if (hipMalloc(dst, v->bytes) != hipSuccess ||
+        hipMemcpy(*dst, v->data, v->bytes, hipMemcpyHostToDevice) != hipSuccess) {
+        if (*dst) hipFree(*dst);
+        *dst = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+int hip_llm_verify_glm5next_model_kda_layer(hip_llm_runner *r, gguf_shards *model,
+                                            int layer, double *out_rel_l2,
+                                            double *out_max_abs, double *out_ms) {
+    const int h = 4096, heads = 64, d = 128, qdim = 8192, dt_rank = 128;
+    const char *matrix_names[] = { "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "ssm_f_a.weight", "ssm_f_b.weight", "ssm_beta.weight",
+        "ssm_g_a.weight", "ssm_g_b.weight", "attn_output.weight" };
+    const char *conv_names[] = { "ssm_conv1d_q.weight", "ssm_conv1d_k.weight",
+        "ssm_conv1d_v.weight" };
+    glm5next_tensor_view mv[9], cv[3], dtv, av, nv;
+    qtensor mq[9];
+    void *mw[9] = { NULL }, *cw[3] = { NULL }, *d_dt = NULL, *d_a = NULL, *d_norm = NULL;
+    void *dx = NULL, *dq = NULL, *dk = NULL, *dv = NULL, *dfa = NULL, *df = NULL;
+    void *dbeta = NULL, *dga = NULL, *dgg = NULL, *ddecay = NULL;
+    void *dcore = NULL, *dstate = NULL, *dout = NULL, *dconv_state[3] = { NULL };
+    float *hidden = NULL, *x = NULL, *ref = NULL, *got = NULL, *state = NULL, *conv_state = NULL;
+    int types[9] = { 0 }, rc = -1;
+    glm5next_config config;
+    memset(&config, 0, sizeof(config));
+    double start = 0.0;
+    uint32_t seed = 0x7f4a7c15u;
+    if (!r || !model || layer < 0 || layer >= 45 ||
+        glm5next_config_load(model->metadata, &config, NULL, 0) != 0 ||
+        glm5next_layer_type(&config, layer) != GLM5NEXT_LAYER_KDA)
+        return -1;
+#define G5VIEW(dst, suffix) do { char g5n[128]; snprintf(g5n, sizeof(g5n), "blk.%d.%s", layer, suffix); \
+    if (glm5next_tensor_view_get(model, g5n, 1, &(dst)) != 0) goto done; } while (0)
+    for (int i = 0; i < 9; ++i) { G5VIEW(mv[i], matrix_names[i]); mq[i] = glm5next_as_qtensor(&mv[i]); }
+    for (int i = 0; i < 3; ++i) G5VIEW(cv[i], conv_names[i]);
+    G5VIEW(dtv, "ssm_dt.bias"); G5VIEW(av, "ssm_a"); G5VIEW(nv, "ssm_norm.weight");
+    hidden = (float *)malloc((size_t)h * sizeof(float));
+    x = (float *)malloc((size_t)h * sizeof(float)); ref = (float *)malloc((size_t)h * sizeof(float));
+    got = (float *)malloc((size_t)h * sizeof(float)); state = (float *)calloc((size_t)heads*d*d, sizeof(float));
+    conv_state = (float *)calloc((size_t)3*qdim*3, sizeof(float));
+    if (!hidden || !x || !ref || !got || !state || !conv_state) goto done;
+    /* Use a real embedding row: arbitrary synthetic inputs can drive the
+     * recurrent gate far outside the model's calibrated activation range and
+     * are not a meaningful end-to-end oracle for this layer. */
+    { glm5next_tensor_view emb; size_t rb;
+      if (glm5next_tensor_view_get(model, "token_embd.weight", 1, &emb) != 0 ||
+          emb.n_dims != 2 || emb.dims[0] != (uint64_t)h) goto done;
+      rb = dequant_row_size(emb.type, h);
+      if (dequant_row(emb.type, (const unsigned char *)emb.data + rb, hidden, h) != 0) goto done;
+    }
+    /* The CPU KDA oracle performs the input RMSNorm itself. */
+    if (glm5next_cpu_kda_forward(model, layer, &config, hidden, ref, state, conv_state) != 0) goto done;
+    /* Reconstruct the same normalized input for the GPU chain. */
+    { glm5next_tensor_view normv; float *norm = (float *)malloc((size_t)h*sizeof(float));
+      G5VIEW(normv, "attn_norm.weight"); if (!norm || glm5next_cpu_vector(&normv, norm, h) != 0) { free(norm); goto done; }
+      glm5next_cpu_rmsnorm(x, hidden, norm, h, 1e-6f); free(norm); }
+    for (int i = 0; i < 9; ++i) if (upload_weight_matrix(&mw[i], &mq[i], &types[i]) != 0) goto done;
+    for (int i = 0; i < 3; ++i) if (glm5next_upload_f32_view(&cw[i], &cv[i]) != 0) goto done;
+    if (glm5next_upload_f32_view(&d_dt, &dtv) != 0 || glm5next_upload_f32_view(&d_a, &av) != 0 ||
+        glm5next_upload_f32_view(&d_norm, &nv) != 0) goto done;
+#define G5ALLOC(p,n) if (hipMalloc(&(p), (size_t)(n)*sizeof(float)) != hipSuccess) goto done
+    G5ALLOC(dx,h); G5ALLOC(dq,qdim); G5ALLOC(dk,qdim); G5ALLOC(dv,qdim); G5ALLOC(dfa,dt_rank);
+    G5ALLOC(df,qdim); G5ALLOC(dbeta,heads); G5ALLOC(dga,dt_rank);
+    G5ALLOC(dgg,qdim); G5ALLOC(ddecay,qdim); G5ALLOC(dcore,qdim); G5ALLOC(dstate,(size_t)heads*d*d); G5ALLOC(dout,h);
+    for (int i = 0; i < 3; ++i) { G5ALLOC(dconv_state[i], (size_t)qdim*3); }
+    if (hipMemset(dstate, 0, (size_t)heads*d*d*sizeof(float)) != hipSuccess) goto done;
+    for (int i = 0; i < 3; ++i)
+        if (hipMemset(dconv_state[i], 0, (size_t)qdim*3*sizeof(float)) != hipSuccess) goto done;
+    if (hipMemcpy(dx, x, (size_t)h*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    start = hllm_monotonic_ms();
+    launch_matvec_auto(r, dq, mw[0], dx, qdim, h, types[0]);
+    launch_matvec_auto(r, dk, mw[1], dx, qdim, h, types[1]);
+    launch_matvec_auto(r, dv, mw[2], dx, qdim, h, types[2]);
+    for (int i = 0; i < 3; ++i) launch_conv1d(r, i == 0 ? dq : (i == 1 ? dk : dv), dconv_state[i],
+                                                i == 0 ? dq : (i == 1 ? dk : dv), cw[i], qdim, 4);
+    launch_l2_norm_heads(r, dq, heads, d, 1e-6f); launch_l2_norm_heads(r, dk, heads, d, 1e-6f);
+    launch_matvec_auto(r, dfa, mw[3], dx, dt_rank, h, types[3]);
+    launch_matvec_auto(r, df, mw[4], dfa, qdim, dt_rank, types[4]);
+    launch_matvec_auto(r, dbeta, mw[5], dx, heads, h, types[5]);
+    launch_matvec_auto(r, dga, mw[6], dx, dt_rank, h, types[6]);
+    launch_matvec_auto(r, dgg, mw[7], dga, qdim, dt_rank, types[7]);
+    launch_glm5next_kda_decay(r, ddecay, df, d_dt, d_a, heads, d, -5.0f);
+    launch_sigmoid_inplace(r, dbeta, heads);
+    launch_glm5next_kda_heads_step(r, dstate, dcore, dq, dk, dv, ddecay, dbeta, heads, d);
+    launch_glm5next_kda_gated_norm(r, dcore, dgg, d_norm, heads, d, 1e-6f);
+    launch_matvec_auto(r, dout, mw[8], dcore, h, qdim, types[8]);
+    if (hipStreamSynchronize(r->stream) != hipSuccess || hipMemcpy(got, dout, (size_t)h*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+    if (out_ms) *out_ms = hllm_monotonic_ms() - start;
+    { double num=0.0, den=0.0, maxv=0.0; for (int i=0;i<h;++i) { double e=(double)got[i]-ref[i]; num+=e*e; den+=(double)ref[i]*ref[i]; if(fabs(e)>maxv)maxv=fabs(e); }
+      if(out_rel_l2)*out_rel_l2=den>0?sqrt(num/den):sqrt(num); if(out_max_abs)*out_max_abs=maxv; }
+    rc=0;
+done:
+    for (int i=0;i<9;++i) { if(mw[i])hipFree(mw[i]); }
+    for (int i=0;i<3;++i) { if(cw[i])hipFree(cw[i]); if(dconv_state[i])hipFree(dconv_state[i]); }
+    void *all[] = {d_dt,d_a,d_norm,dx,dq,dk,dv,dfa,df,dbeta,dga,dgg,ddecay,dcore,dstate,dout};
+    for (size_t i=0;i<sizeof(all)/sizeof(all[0]);++i) if(all[i])hipFree(all[i]);
+    free(hidden);free(x);free(ref);free(got);free(state);free(conv_state);
+    glm5next_config_free(&config);
+    return rc;
+#undef G5ALLOC
+#undef G5VIEW
 }
 
 /* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch

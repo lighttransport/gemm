@@ -88,6 +88,17 @@ int hip_llm_verify_glm5next_dsa_attention(hip_llm_runner *r, int n_heads,
 int hip_llm_verify_glm5next_model_matvec(hip_llm_runner *r, gguf_shards *model,
                                          int layer, double *out_rel_l2,
                                          double *out_max_abs);
+/* Stage all three real KDA input projections together and execute them in one
+ * stream.  This is the first model-weighted GPU graph boundary; it is kept as
+ * a public verifier until the complete staged layer is wired into forward(). */
+int hip_llm_verify_glm5next_model_kda_projections(hip_llm_runner *r,
+                                                   gguf_shards *model, int layer,
+                                                   double *out_rel_l2,
+                                                   double *out_max_abs,
+                                                   double *out_ms);
+int hip_llm_verify_glm5next_model_kda_layer(hip_llm_runner *r, gguf_shards *model,
+                                            int layer, double *out_rel_l2,
+                                            double *out_max_abs, double *out_ms);
 
 /* Load Qwen3 dense weights from a safetensors file (text-encoder path). */
 int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_path, int max_seq_len);
