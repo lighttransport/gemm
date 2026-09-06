@@ -102,6 +102,8 @@ help:
 	@echo "  GLM5NEXT_HIP_INDEXER=1 moves DSA indexer projections to HIP"
 	@echo "  GLM5NEXT_HIP_MHC=1 moves mHC projection matvecs to HIP"
 	@echo "  GLM5NEXT_HIP_OUTPUT=1 moves the final vocabulary projection to HIP"
+	@echo "  GLM5NEXT_HIP_DSA_PROJ=1 moves DSA q_a/q_b/kv_a projections to HIP"
+	@echo "  GLM5NEXT_HIP_DSA_PROJ_LAYER=N limits DSA projection offload to one layer"
 	@echo "  GLM5NEXT_CPU_OMP=1 enables OpenMP rows for large CPU projections"
 	@echo ""
 	@echo "Requirements:"
