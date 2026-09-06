@@ -9926,6 +9926,11 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
         float *collapsed, float *post, float *comb, void *opaque);
 static int glm5next_hip_output_callback(const gguf_shards *model,
         const glm5next_config *config, float *hidden, float *logits, void *opaque);
+static int glm5next_hip_nextn_output_callback(const gguf_shards *model,
+        const glm5next_config *config, float *hidden, float *logits, void *opaque);
+static int glm5next_hip_nextn_fusion_callback(const gguf_shards *model,
+        const glm5next_config *config, const float *embedding_norm,
+        const float *hidden_norm, float *out, void *opaque);
 static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
 
@@ -10045,7 +10050,14 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
         if (getenv("GLM5NEXT_HIP_OUTPUT") && atoi(getenv("GLM5NEXT_HIP_OUTPUT")) != 0) {
             glm5next_cpu_runtime_set_output_callback(r->glm5next_cpu,
                 glm5next_hip_output_callback, r);
+            glm5next_cpu_runtime_set_nextn_output_callback(r->glm5next_cpu,
+                glm5next_hip_nextn_output_callback, r);
             fprintf(stderr, "hip_llm: GLM5Next HIP output norm/projection callback enabled\n");
+        }
+        if (getenv("GLM5NEXT_HIP_NEXTN") && atoi(getenv("GLM5NEXT_HIP_NEXTN")) != 0) {
+            glm5next_cpu_runtime_set_nextn_fusion_callback(r->glm5next_cpu,
+                glm5next_hip_nextn_fusion_callback, r);
+            fprintf(stderr, "hip_llm: GLM5Next HIP NextN fusion projection enabled\n");
         }
         r->has_lm_head = 1;
         r->weights_loaded = 1;
@@ -16722,8 +16734,9 @@ static void hip_llm_phase5_capture(hip_llm_runner *r) {
     }
 }
 
-static int glm5next_hip_output_logits(hip_llm_runner *r,
-        const glm5next_config *config, float *hidden, float *logits) {
+static int glm5next_hip_output_logits_norm(hip_llm_runner *r,
+        const glm5next_config *config, float *hidden, float *logits,
+        const char *norm_name) {
     glm5next_tensor_view v;
     glm5next_tensor_view normv;
     void *dx = NULL, *dnormed = NULL, *dweight = NULL, *dy = NULL;
@@ -16741,7 +16754,8 @@ static int glm5next_hip_output_logits(hip_llm_runner *r,
         fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: logits allocation failed\n");
         goto done;
     }
-    if (glm5next_tensor_view_get(r->glm5next_model, "output_norm.weight", 1, &normv) != 0 ||
+    if (glm5next_tensor_view_get(r->glm5next_model,
+            norm_name ? norm_name : "output_norm.weight", 1, &normv) != 0 ||
         glm5next_upload_f32_view(&dweight, &normv) != 0) {
         fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: output norm upload failed\n");
         goto done;
@@ -16807,11 +16821,64 @@ done:
     return rc;
 }
 
+static int glm5next_hip_output_logits(hip_llm_runner *r,
+        const glm5next_config *config, float *hidden, float *logits) {
+    return glm5next_hip_output_logits_norm(r, config, hidden, logits, NULL);
+}
+
 static int glm5next_hip_output_callback(const gguf_shards *model,
         const glm5next_config *config, float *hidden, float *logits, void *opaque) {
     hip_llm_runner *r = (hip_llm_runner *)opaque;
     if (!r || model != r->glm5next_model) return -1;
     return glm5next_hip_output_logits(r, config, hidden, logits);
+}
+
+static int glm5next_hip_nextn_output_callback(const gguf_shards *model,
+        const glm5next_config *config, float *hidden, float *logits, void *opaque) {
+    hip_llm_runner *r = (hip_llm_runner *)opaque;
+    char norm_name[96];
+    if (!r || model != r->glm5next_model) return -1;
+    snprintf(norm_name, sizeof(norm_name), "blk.%d.nextn.shared_head_norm.weight",
+             config->n_layers);
+    return glm5next_hip_output_logits_norm(r, config, hidden, logits, norm_name);
+}
+
+static int glm5next_hip_nextn_fusion_callback(const gguf_shards *model,
+        const glm5next_config *config, const float *embedding_norm,
+        const float *hidden_norm, float *out, void *opaque) {
+    hip_llm_runner *r = (hip_llm_runner *)opaque;
+    glm5next_tensor_view view;
+    void *weight = NULL, *input = NULL, *output = NULL;
+    int type = 0, rc = -1;
+    char name[96];
+    if (!r || !model || model != r->glm5next_model || !config ||
+        !embedding_norm || !hidden_norm || !out) return -1;
+    snprintf(name, sizeof(name), "blk.%d.nextn.eh_proj.weight", config->n_layers);
+    if (glm5next_tensor_view_get(model, name, 1, &view) != 0) goto done;
+    {
+        qtensor q = glm5next_as_qtensor(&view);
+        if (q.n_rows != config->hidden_size || q.n_cols != 2 * config->hidden_size ||
+            upload_weight_matrix(&weight, &q, &type) != 0) goto done;
+    }
+    if (hipMalloc(&input, (size_t)2 * config->hidden_size * sizeof(float)) != hipSuccess ||
+        hipMalloc(&output, (size_t)config->hidden_size * sizeof(float)) != hipSuccess)
+        goto done;
+    if (hipMemcpy(input, embedding_norm,
+                  (size_t)config->hidden_size * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy((uint8_t *)input + (size_t)config->hidden_size * sizeof(float), hidden_norm,
+                  (size_t)config->hidden_size * sizeof(float), hipMemcpyHostToDevice) != hipSuccess)
+        goto done;
+    launch_matvec_auto(r, output, weight, input, config->hidden_size,
+                       2 * config->hidden_size, type);
+    if (hipStreamSynchronize(r->stream) != hipSuccess ||
+        hipMemcpy(out, output, (size_t)config->hidden_size * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess) goto done;
+    rc = 0;
+done:
+    if (weight) hipFree(weight);
+    if (input) hipFree(input);
+    if (output) hipFree(output);
+    return rc;
 }
 
 float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position) {

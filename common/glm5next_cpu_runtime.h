@@ -10,6 +10,10 @@
 
 #include "glm5next_cpu_kda.h"
 
+typedef int (*glm5next_nextn_fusion_callback)(const gguf_shards *model,
+        const glm5next_config *config, const float *embedding_norm,
+        const float *hidden_norm, float *out, void *opaque);
+
 typedef struct {
     const gguf_shards *model;
     glm5next_config config;
@@ -27,6 +31,10 @@ typedef struct {
     void *mhc_callback_opaque;
     glm5next_output_callback output_callback;
     void *output_callback_opaque;
+    glm5next_output_callback nextn_output_callback;
+    void *nextn_output_callback_opaque;
+    glm5next_nextn_fusion_callback nextn_fusion_callback;
+    void *nextn_fusion_callback_opaque;
     float *indexer_keys;
     float *indexer_gates;
 } glm5next_cpu_runtime;
@@ -64,6 +72,20 @@ static inline void glm5next_cpu_runtime_set_output_callback(glm5next_cpu_runtime
     if (!r) return;
     r->output_callback = callback;
     r->output_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_nextn_output_callback(glm5next_cpu_runtime *r,
+        glm5next_output_callback callback, void *opaque) {
+    if (!r) return;
+    r->nextn_output_callback = callback;
+    r->nextn_output_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_nextn_fusion_callback(glm5next_cpu_runtime *r,
+        glm5next_nextn_fusion_callback callback, void *opaque) {
+    if (!r) return;
+    r->nextn_fusion_callback = callback;
+    r->nextn_fusion_callback_opaque = opaque;
 }
 
 static inline void glm5next_cpu_runtime_free(glm5next_cpu_runtime *r) {
@@ -244,8 +266,13 @@ static inline float *glm5next_cpu_runtime_nextn_logits(glm5next_cpu_runtime *r,
     glm5next_cpu_rmsnorm(hnorm, r->target_hidden, norm, h, r->config.norm_epsilon);
     memcpy(r->nextn_fusion, enorm, (size_t)h * sizeof(float));
     memcpy(r->nextn_fusion + h, hnorm, (size_t)h * sizeof(float));
-    NEXTN_GET("nextn.eh_proj.weight");
-    if (glm5next_cpu_matvec(x, &t, r->nextn_fusion) != 0) goto done;
+    if (r->nextn_fusion_callback) {
+        if (r->nextn_fusion_callback(r->model, &r->config, enorm, hnorm, x,
+                                     r->nextn_fusion_callback_opaque) != 0) goto done;
+    } else {
+        NEXTN_GET("nextn.eh_proj.weight");
+        if (glm5next_cpu_matvec(x, &t, r->nextn_fusion) != 0) goto done;
+    }
     NEXTN_GET("attn_norm.weight");
     if (glm5next_cpu_vector(&t, norm, h) != 0) goto done;
     glm5next_cpu_rmsnorm(ffn_norm, x, norm, h, r->config.norm_epsilon);
@@ -268,8 +295,13 @@ static inline float *glm5next_cpu_runtime_nextn_logits(glm5next_cpu_runtime *r,
     NEXTN_GET("nextn.shared_head_norm.weight");
     if (glm5next_cpu_vector(&t, norm, h) != 0) goto done;
     glm5next_cpu_rmsnorm(head_norm, x, norm, h, r->config.norm_epsilon);
-    if (glm5next_tensor_view_get(r->model, "output.weight", 1, &t) != 0 ||
-        glm5next_cpu_matvec(r->logits, &t, head_norm) != 0) goto done;
+    if (r->nextn_output_callback) {
+        memcpy(r->nextn_hidden, x, (size_t)h * sizeof(float));
+        if (r->nextn_output_callback(r->model, &r->config, r->nextn_hidden,
+                                     r->logits, r->nextn_output_callback_opaque) != 0)
+            goto done;
+    } else if (glm5next_tensor_view_get(r->model, "output.weight", 1, &t) != 0 ||
+               glm5next_cpu_matvec(r->logits, &t, head_norm) != 0) goto done;
     rc = 0;
 done:
     free(embedding); free(enorm); free(hnorm); free(x); free(norm); free(attn);
