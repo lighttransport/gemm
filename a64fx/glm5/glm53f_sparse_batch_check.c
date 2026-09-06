@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "glm53f_sparse_12n.h"
+#include "glm53f_collective_12n.h"
 
 enum { HIDDEN = 4096, TOKENS = 4 };
 
@@ -19,6 +20,8 @@ int main(int argc, char **argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 2 || ranks != 12 || warm < 0 || !x || !a || !b)
         MPI_Abort(MPI_COMM_WORLD, 2);
+    if (getenv("GLM53F_UTOFU") && glm53f_collective_init_12n(
+            getenv("TOFU_TOPO_PATH"), 5 * HIDDEN)) MPI_Abort(MPI_COMM_WORLD, 2);
     int compare_cp = getenv("GLM53F_SPARSE_COMPARE_CP") != NULL;
     if (compare_cp) setenv("GLM53F_SPARSE_CP", "0", 1);
     glm53f_sparse_context_12n *ca = glm53f_sparse_create_12n(
@@ -88,6 +91,7 @@ int main(int argc, char **argv) {
     }
     glm53f_sparse_free_12n(cb);
     glm53f_sparse_free_12n(ca);
+    glm53f_collective_free_12n();
     free(b); free(a); free(x);
     MPI_Finalize();
     return ok ? 0 : 1;

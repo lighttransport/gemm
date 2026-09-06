@@ -12,6 +12,10 @@ int glm53f_mtp_forward_12n(
     const float *target_hidden, int *draft_token, float *draft_logit,
     float *draft_hidden);
 int glm53f_mtp_length_12n(const glm53f_mtp_context_12n *context);
+/* Rebuild exact cache state without computing an unused draft/hidden output. */
+int glm53f_mtp_cache_append_12n(
+    glm53f_mtp_context_12n *context, int input_token,
+    const float *target_hidden);
 int glm53f_mtp_restore_length_12n(
     glm53f_mtp_context_12n *context, int length);
 

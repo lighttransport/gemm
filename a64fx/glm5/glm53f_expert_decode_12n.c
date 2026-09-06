@@ -207,6 +207,39 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
             has_iq|=parts[t*MAXP+k].gate_type||parts[t*MAXP+k].down_type;
     if(has_iq){
         shared_offset*sp=&c->shared[table_layer];
+        int batch_shared = getenv("GLM53F_Q4_BATCH_SHARED") &&
+                           atoi(getenv("GLM53F_Q4_BATCH_SHARED"));
+        for (int t = 0; t < tokens && batch_shared; t++)
+            for (int k = 0; k < counts[t]; k++)
+                if (!glm53f_iq_type_supported(parts[t*MAXP+k].gate_type) ||
+                    !glm53f_iq_type_supported(parts[t*MAXP+k].down_type))
+                    batch_shared = 0;
+        if (batch_shared) {
+            /* Routed experts keep their validated SDOT accumulation order.
+             * The FP8 shared expert is common to all positions: amortize its
+             * weight reads and dequantization across the verification batch. */
+            for (int t = 0; t < tokens; t++) {
+                glm53f_iq_part iq[MAXP];
+                for (int k = 0; k < counts[t]; k++) {
+                    const glm53f_expert_part *p = &parts[t*MAXP+k];
+                    iq[k] = (glm53f_iq_part){p->gate_up, p->down,
+                        p->gate_type, p->down_type, p->inter};
+                }
+                if (!counts[t]) memset(c->batch_local + (size_t)t*H, 0, H*sizeof(float));
+                else if (glm53f_iq_expert_weighted(c->batch_local + (size_t)t*H,
+                    iq, weights + t*MAXP, counts[t], x + (size_t)t*H,
+                    c->scratch->up, c->scratch->activation)) return -1;
+            }
+            glm53f_expert_part shared = {c->shared_blob + sp->gate_up,
+                (const float *)(c->shared_blob + sp->gate_up_scale),
+                c->shared_blob + sp->down,
+                (const float *)(c->shared_blob + sp->down_scale), sp->inter, 0, 0};
+            glm53f_expert_tokens_bits(&shared, tokens, x, c->batch_up,
+                                      c->batch_activation, c->batch_shared);
+#pragma omp parallel for schedule(static)
+            for (int q = 0; q < tokens*H; q++) c->batch_local[q] += c->batch_shared[q];
+            return glm53f_sum_allreduce_12n(c->batch_local, out, tokens*H);
+        }
         for(int t=0;t<tokens;t++){
             int n=counts[t];
             parts[t*MAXP+n]=(glm53f_expert_part){c->shared_blob+sp->gate_up,

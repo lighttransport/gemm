@@ -111,3 +111,78 @@ MHC 6.502 ms, attention 27.312 ms, FFN 15.601 ms, head 1.226 ms.
 This clears 20 tok/s for the measured 128-token sample; sustained multi-thousand
 token throughput has not been remeasured. Logs: `kda-barriers.*` and
 `kda-barriers8k.*`; output: `kda-barriers8k.ids` in the shared job directory.
+
+## Q4 TP12 MTP verifier work (job 51370956)
+
+The draft uses the safetensors layer-45 weights (0.563 GiB routed per rank),
+not a Q4 conversion of that layer. Stage it separately after each restart:
+
+```sh
+bash a64fx/glm5/run_glm53f_mtp_stage_12n.sh
+# Q4 target/core/shared images must already have been staged for this job.
+bash a64fx/glm5/run_glm53f_q4_mtp_12n.sh PROMPT_IDS OUTPUT_IDS 128 1
+```
+
+The launcher builds with `mpifcc -Nclang` and executes the ARM binary directly
+on the existing allocation. It uses `/local` for build/staging and shared
+`tmp/` for logs. `GLM53F_BUILD=0` reuses an existing binary. Input/output IDs
+are whitespace-separated integers, with the same prompt contract as the
+target generator. Prompt replay is excluded from the decode timing.
+
+Optimizations and controls:
+
+- Cache-only MTP warmup/replay computes embedding fusion, KV/indexer
+  projections, and completed compression pools. Query/attention output,
+  MoE, and vocabulary head are skipped because they do not affect persistent
+  cache state. Context-parallel caches retain the existing attention path.
+  `GLM53F_SPEC_FULL_REPLAY=1` selects the full replay reference.
+- `GLM53F_KDA_BATCH_TEAM=1` keeps one team across batched projections,
+  causal convolution, per-head recurrent updates, normalization, and parallel
+  snapshot copies. Every committed position retains its own recurrent state.
+- `GLM53F_Q4_BATCH_SHARED=1` batches the common FP8 shared expert while retaining
+  the existing routed Q4/Q5/Q6 SDOT kernels and accumulation order.
+- `GLM53F_SPARSE_BATCH_OP=1` batches sparse output projection and its collective;
+  KV updates and attention selection remain causal. This is experimental and
+  disabled in the launcher pending end-to-end measurement.
+- Remove the speculative pre-verification snapshot, which was never restored.
+
+Validation/measurement controls on the speculative binary:
+
+- `GLM53F_SPEC_REFERENCE_IDS=FILE` checks delivered tokens against a saved
+  reference prefix and reports how many tokens were checked. A mismatch fails
+  the run. A plain `PASS` without this check is only a runner/gate status.
+- `GLM53F_SPEC_SELF_REFERENCE=1` first generates a scalar reference from the
+  identical warmed target state, restores that state, and checks speculation.
+  It also saves `OUTPUT_IDS.greedy`. Its separately reported scalar timing is
+  not included in speculative timing. Do not combine with an external reference.
+- `GLM53F_SPEC_DRAFT_SWEEP=1` tests draft counts 1 through the positional maximum
+  from the same warmed state; output files gain `.d1`, `.d2`, etc.
+- `GLM53F_SPEC_COMPARE_BATCH=1` compares full replay/legacy verifier against
+  cache replay/all three batching switches from the same warmed state. Outputs
+  gain `.baseline`/`.optimized`. Do not combine with the draft sweep.
+- Coding-prompt generation stops at EOS. Work speculated beyond EOS is timed
+  but not counted as delivered output.
+
+The real-weight cache test, `test_glm53f_mtp_cache_12n MODEL MTP_ROUTED
+MTP_SHARED 2051`, passes a rollback crossing completed pools: next draft,
+logit, and all 4096 hidden values are bit-exact. Full replay costs 3.480 ms
+per position versus 0.426 ms for cache-only replay (8.17x faster replay).
+KDA tests for 2, 3, 4, and 5 positions have zero output difference and bit-exact
+recurrent snapshots. Four-position layer-44 verification falls from 1.372 ms
+to 0.670 ms. These are component measurements, not whole-model speedups.
+
+The full-model five-position batch/rollback check passes with all batching
+switches enabled. The sparse-only 8190-position test also passes
+(`rel_l2=7.33e-8`, rollback difference zero), but its single MPI-only timing
+sample regresses from 6.028 to 7.373 ms; do not infer a sparse speedup from it.
+
+An initial one-draft run after the 8378-token coding prompt delivers 383 tokens
+at 21.420 tok/s, accepting 127/128 drafts (99.22%). Phase cost per cycle is
+50.200 ms scalar target, 3.345 ms draft, 85.534 ms verification, and 0.898 ms
+replay. KDA/shared batching is enabled; sparse projection batching is disabled.
+The output differs from the older saved non-MTP response from its first token,
+so this measurement alone does **not** establish greedy equivalence. The
+same-state scalar/speculative validation is required before a quality claim.
+At this near-perfect acceptance, the measured cycle costs permit only about
+21.43 tok/s even at 100% acceptance. The 60 tok/s target remains unmet; target
+verification throughput, not first-draft acceptance, is the limiting factor.

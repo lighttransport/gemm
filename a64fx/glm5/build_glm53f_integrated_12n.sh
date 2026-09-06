@@ -86,6 +86,9 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_target_decode_12n.c \
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_spec_decode_12n.c \
     "${objects[@]}" "$build_dir/target.o" "$build_dir/mtp.o" \
     "${ldflags[@]}" -o glm53f_spec_decode_12n
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_mtp_cache_12n.c \
+    "${objects[@]}" "$build_dir/mtp.o" \
+    "${ldflags[@]}" -o test_glm53f_mtp_cache_12n
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_target_batch_check_12n.c \
     "${objects[@]}" "$build_dir/target.o" \
     "${ldflags[@]}" -o glm53f_target_batch_check_12n
