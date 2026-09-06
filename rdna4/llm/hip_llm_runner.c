@@ -14852,7 +14852,7 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     const int h = c->hidden_size;
     int nt = position + 1, attn_nt = nt;
     glm5next_tensor_view t, normv, tk, tv, to;
-    void *dq = NULL, *dkv = NULL, *do_w = NULL;
+    void *dq = NULL, *q_input = NULL, *dkv = NULL, *do_w = NULL;
     void *dproj_x = NULL, *dproj_qr = NULL, *dproj_q = NULL;
     void *dproj_kv_raw = NULL, *dproj_kv = NULL;
     void *dqcache = NULL, *dkcache = NULL, *dvcache = NULL, *dattn = NULL, *dout = NULL, *dvout = NULL;
@@ -14890,7 +14890,6 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
         launch_rmsnorm(r, dproj_kv, dproj_kv_raw, cache->kv_a_norm, kv, c->norm_epsilon);
         if (hipStreamSynchronize(r->stream) != hipSuccess ||
             hipMemcpy(qr, dproj_qr, (size_t)qrank * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
-            hipMemcpy(q, dproj_q, (size_t)heads * qdim * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
             hipMemcpy(kvl, dproj_kv, (size_t)kv * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess)
             goto done;
     } else {
@@ -14931,10 +14930,15 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
                       hipMemcpyHostToDevice) != hipSuccess) goto done;
     }
     for (int head = 0; head < heads; ++head) {
-        if (glm5next_cpu_matvec_head(qhead, &tk, head, q + (size_t)head*qdim) != 0) goto done;
-        if (hipMemcpy(dq, q + (size_t)head*qdim, (size_t)qdim*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+        if (cache->q_ready) {
+            q_input = (uint8_t *)dproj_q + (size_t)head * qdim * sizeof(float);
+        } else {
+            if (glm5next_cpu_matvec_head(qhead, &tk, head, q + (size_t)head*qdim) != 0) goto done;
+            if (hipMemcpy(dq, q + (size_t)head*qdim, (size_t)qdim*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+            q_input = dq;
+        }
         launch_matvec_q8_f32(r, (uint8_t *)dqcache + (size_t)head*kv*sizeof(float),
-                             (uint8_t *)cache->k_weight + (size_t)head*cache->k_stride, dq, kv, qdim);
+                             (uint8_t *)cache->k_weight + (size_t)head*cache->k_stride, q_input, kv, qdim);
         for (int si = 0; si < attn_nt; ++si) {
             int p = selected ? selected[si] : si;
             if (hipMemcpy(dkv, latent_cache + (size_t)p*kv, (size_t)kv*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
