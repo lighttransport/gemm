@@ -53,6 +53,8 @@ typedef struct {
     int expert_ff_length;
     int shared_expert_count;
     int shared_expert_ff_length;
+    int expert_weights_norm;
+    int expert_gating_func;
     int first_k_dense_replace;
     int hc_count;
     int hc_sinkhorn_iterations;
@@ -196,6 +198,8 @@ static inline int glm5next_config_load(const gguf_context *gguf,
     c->expert_ff_length   = G5I("expert_feed_forward_length", 0);
     c->shared_expert_count = G5I("expert_shared_count", 0);
     c->shared_expert_ff_length = G5I("expert_shared_feed_forward_length", 0);
+    c->expert_weights_norm = G5I("expert_weights_norm", 1);
+    c->expert_gating_func = G5I("expert_gating_func", 2);
     c->first_k_dense_replace = G5I("leading_dense_block_count", 0);
     c->hc_count            = G5I("hyper_connection.count", 0);
     c->hc_sinkhorn_iterations = G5I("hyper_connection.sinkhorn_iterations", 0);
@@ -214,7 +218,8 @@ static inline int glm5next_config_load(const gguf_context *gguf,
         c->indexer_top_k <= 0 || c->indexer_kpool <= 0 ||
         c->indexer_top_k % c->indexer_kpool != 0 || c->expert_count <= 0 ||
         c->expert_used_count <= 0 || c->expert_used_count > c->expert_count ||
-        c->expert_ff_length <= 0 || c->hc_count != 4 ||
+        c->expert_ff_length <= 0 || c->expert_weights_norm != 1 ||
+        c->expert_gating_func != 2 || c->hc_count != 4 ||
         c->hc_sinkhorn_iterations <= 0 || c->short_conv_kernel <= 1 ||
         c->norm_epsilon <= 0.0f || c->kda_gate_lower_bound >= 0.0f)
         goto bad_values;
