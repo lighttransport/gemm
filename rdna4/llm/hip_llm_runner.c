@@ -7986,6 +7986,16 @@ typedef struct {
     int ready;
 } glm5next_dsa_gpu_cache;
 
+typedef struct {
+    void *matrix[9];
+    void *conv[3];
+    void *dt_bias;
+    void *a;
+    void *norm;
+    int types[9];
+    int ready;
+} glm5next_kda_gpu_cache;
+
 /* Per-layer GPU weight pointers */
 typedef struct {
     void *attn_norm_w;    /* F32 [n_embd] */
@@ -8422,6 +8432,7 @@ struct hip_llm_runner {
     gguf_shards glm5next_single_shards;
     gguf_context *glm5next_single_shard;
     glm5next_dsa_gpu_cache *glm5next_dsa_gpu;
+    glm5next_kda_gpu_cache *glm5next_kda_gpu;
     hip_llm_moe_mode requested_moe_mode;
     uint64_t requested_moe_cache_bytes;
     uint64_t requested_gpu_reserve_bytes;
@@ -9694,6 +9705,50 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         float *latent_cache, float *indexer_keys, float *indexer_gates,
         int max_seq_len, int position, void *opaque);
+static int glm5next_hip_kda_cache_load(const gguf_shards *model, int layer,
+        glm5next_kda_gpu_cache *cache) {
+    const char *names[9] = { "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "ssm_f_a.weight", "ssm_f_b.weight", "ssm_beta.weight", "ssm_g_a.weight",
+        "ssm_g_b.weight", "attn_output.weight" };
+    const char *conv_names[3] = { "ssm_conv1d_q.weight", "ssm_conv1d_k.weight",
+        "ssm_conv1d_v.weight" };
+    glm5next_tensor_view v;
+    char name[128];
+    if (!model || !cache || cache->ready) return 0;
+    for (int i = 0; i < 9; ++i) {
+        qtensor q;
+        snprintf(name, sizeof(name), "blk.%d.%s", layer, names[i]);
+        if (glm5next_tensor_view_get(model, name, 1, &v) != 0) goto fail;
+        q = glm5next_as_qtensor(&v);
+        if (upload_weight_matrix(&cache->matrix[i], &q, &cache->types[i]) != 0)
+            goto fail;
+    }
+    for (int i = 0; i < 3; ++i) {
+        snprintf(name, sizeof(name), "blk.%d.%s", layer, conv_names[i]);
+        if (glm5next_tensor_view_get(model, name, 1, &v) != 0 ||
+            glm5next_upload_f32_view(&cache->conv[i], &v) != 0)
+            goto fail;
+    }
+    snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", layer);
+    if (glm5next_tensor_view_get(model, name, 1, &v) != 0 ||
+        glm5next_upload_f32_view(&cache->dt_bias, &v) != 0) goto fail;
+    snprintf(name, sizeof(name), "blk.%d.ssm_a", layer);
+    if (glm5next_tensor_view_get(model, name, 1, &v) != 0 ||
+        glm5next_upload_f32_view(&cache->a, &v) != 0) goto fail;
+    snprintf(name, sizeof(name), "blk.%d.ssm_norm.weight", layer);
+    if (glm5next_tensor_view_get(model, name, 1, &v) != 0 ||
+        glm5next_upload_f32_view(&cache->norm, &v) != 0) goto fail;
+    cache->ready = 1;
+    return 0;
+fail:
+    for (int i = 0; i < 9; ++i) if (cache->matrix[i]) hipFree(cache->matrix[i]);
+    for (int i = 0; i < 3; ++i) if (cache->conv[i]) hipFree(cache->conv[i]);
+    if (cache->dt_bias) hipFree(cache->dt_bias);
+    if (cache->a) hipFree(cache->a);
+    if (cache->norm) hipFree(cache->norm);
+    memset(cache, 0, sizeof(*cache));
+    return -1;
+}
 static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols,
                                       int weight_type);
@@ -9958,6 +10013,16 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                     stream_dsa ? "streaming" : "persistent per-layer weight");
         }
         if (getenv("GLM5NEXT_HIP_KDA") && atoi(getenv("GLM5NEXT_HIP_KDA")) != 0) {
+            const char *kda_layer = getenv("GLM5NEXT_HIP_KDA_LAYER");
+            const char *kda_cache = getenv("GLM5NEXT_HIP_KDA_CACHE");
+            if (kda_layer && atoi(kda_layer) >= 0 && atoi(kda_layer) < r->glm5next.n_layers &&
+                (!kda_cache || atoi(kda_cache) != 0)) {
+                r->glm5next_kda_gpu = (glm5next_kda_gpu_cache *)calloc(1, sizeof(*r->glm5next_kda_gpu));
+                if (!r->glm5next_kda_gpu) {
+                    fprintf(stderr, "hip_llm: GLM5Next KDA cache allocation failed\n");
+                    return -1;
+                }
+            }
             glm5next_cpu_runtime_set_kda_callback(r->glm5next_cpu,
                 glm5next_hip_kda_callback, r);
             fprintf(stderr, "hip_llm: GLM5Next HIP KDA callback enabled "
@@ -15058,22 +15123,34 @@ static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
     void *dfa = NULL, *df = NULL, *dbeta = NULL, *dga = NULL, *dgg = NULL, *ddecay = NULL;
     void *dstate = NULL, *dcore = NULL, *dout = NULL, *dcs[3] = { 0 };
     int types[9] = { 0 }, rc = -1;
+    glm5next_kda_gpu_cache *persistent = NULL;
+    int own_weights = 1;
     if (!r || !model || !hidden || !out || !recurrent || !conv_state ||
         glm5next_layer_type(c, layer) != GLM5NEXT_LAYER_KDA) return -1;
     if (select && atoi(select) != layer)
         return glm5next_cpu_kda_forward(model, layer, c, hidden, out, recurrent, conv_state);
+    if (select && r->glm5next_kda_gpu) {
+        persistent = r->glm5next_kda_gpu;
+        own_weights = 0;
+        if (glm5next_hip_kda_cache_load(model, layer, persistent) != 0) goto done;
+        for (int i = 0; i < 9; ++i) { mw[i] = persistent->matrix[i]; types[i] = persistent->types[i]; }
+        for (int i = 0; i < 3; ++i) cw[i] = persistent->conv[i];
+        d_dt = persistent->dt_bias; d_a = persistent->a; d_norm = persistent->norm;
+    }
 #define KCB_VIEW(dst, suffix) do { char n[128]; snprintf(n, sizeof(n), "blk.%d.%s", layer, suffix); \
     if (glm5next_tensor_view_get(model, n, 1, &(dst)) != 0) goto done; } while (0)
-    { const char *names[9] = { "attn_q.weight", "attn_k.weight", "attn_v.weight",
+    if (own_weights) { const char *names[9] = { "attn_q.weight", "attn_k.weight", "attn_v.weight",
         "ssm_f_a.weight", "ssm_f_b.weight", "ssm_beta.weight", "ssm_g_a.weight",
         "ssm_g_b.weight", "attn_output.weight" };
       const char *cn[3] = { "ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight" };
       for (int i=0;i<9;++i) { KCB_VIEW(mv[i], names[i]); mq[i]=glm5next_as_qtensor(&mv[i]);
           if (upload_weight_matrix(&mw[i], &mq[i], &types[i]) != 0) goto done; }
       for (int i=0;i<3;++i) { KCB_VIEW(cv[i], cn[i]); if (glm5next_upload_f32_view(&cw[i], &cv[i]) != 0) goto done; } }
-    KCB_VIEW(dtv, "ssm_dt.bias"); KCB_VIEW(av, "ssm_a"); KCB_VIEW(nv, "ssm_norm.weight");
-    if (glm5next_upload_f32_view(&d_dt, &dtv) != 0 || glm5next_upload_f32_view(&d_a, &av) != 0 ||
-        glm5next_upload_f32_view(&d_norm, &nv) != 0) goto done;
+    if (own_weights) {
+        KCB_VIEW(dtv, "ssm_dt.bias"); KCB_VIEW(av, "ssm_a"); KCB_VIEW(nv, "ssm_norm.weight");
+        if (glm5next_upload_f32_view(&d_dt, &dtv) != 0 || glm5next_upload_f32_view(&d_a, &av) != 0 ||
+            glm5next_upload_f32_view(&d_norm, &nv) != 0) goto done;
+    }
 #define KCB_ALLOC(p,n) do { if (hipMalloc(&(p), (size_t)(n)*sizeof(float)) != hipSuccess) goto done; } while (0)
     KCB_ALLOC(dx,h); KCB_ALLOC(dq,qdim); KCB_ALLOC(dk,qdim); KCB_ALLOC(dv,qdim); KCB_ALLOC(dfa,dt_rank);
     KCB_ALLOC(df,qdim); KCB_ALLOC(dbeta,heads); KCB_ALLOC(dga,dt_rank); KCB_ALLOC(dgg,qdim); KCB_ALLOC(ddecay,qdim);
@@ -15107,10 +15184,12 @@ static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
         (size_t)qdim*(ck-1)*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
     rc = 0;
 done:
-    for (int i=0;i<9;++i) if (mw[i]) hipFree(mw[i]);
-    for (int i=0;i<3;++i) { if (cw[i]) hipFree(cw[i]); if (dcs[i]) hipFree(dcs[i]); }
+    if (own_weights) for (int i=0;i<9;++i) if (mw[i]) hipFree(mw[i]);
+    if (own_weights) for (int i=0;i<3;++i) if (cw[i]) hipFree(cw[i]);
+    for (int i=0;i<3;++i) if (dcs[i]) hipFree(dcs[i]);
     void *all[] = { d_dt,d_a,d_norm,dx,dq,dk,dv,dfa,df,dbeta,dga,dgg,ddecay,dstate,dcore,dout };
-    for (size_t i=0;i<sizeof(all)/sizeof(all[0]);++i) if (all[i]) hipFree(all[i]);
+    if (own_weights) for (size_t i=0;i<3;++i) if (all[i]) hipFree(all[i]);
+    for (size_t i=3;i<sizeof(all)/sizeof(all[0]);++i) if (all[i]) hipFree(all[i]);
     return rc;
 #undef KCB_ALLOC
 #undef KCB_VIEW
@@ -18101,6 +18180,17 @@ void hip_llm_free(hip_llm_runner *r) {
         }
         free(r->glm5next_dsa_gpu);
         r->glm5next_dsa_gpu = NULL;
+    }
+    if (r->glm5next_kda_gpu) {
+        for (int i = 0; i < 9; ++i)
+            if (r->glm5next_kda_gpu->matrix[i]) hipFree(r->glm5next_kda_gpu->matrix[i]);
+        for (int i = 0; i < 3; ++i)
+            if (r->glm5next_kda_gpu->conv[i]) hipFree(r->glm5next_kda_gpu->conv[i]);
+        if (r->glm5next_kda_gpu->dt_bias) hipFree(r->glm5next_kda_gpu->dt_bias);
+        if (r->glm5next_kda_gpu->a) hipFree(r->glm5next_kda_gpu->a);
+        if (r->glm5next_kda_gpu->norm) hipFree(r->glm5next_kda_gpu->norm);
+        free(r->glm5next_kda_gpu);
+        r->glm5next_kda_gpu = NULL;
     }
     if (r->glm5next_cpu) {
         glm5next_cpu_runtime_free(r->glm5next_cpu);

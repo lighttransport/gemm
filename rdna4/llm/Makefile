@@ -99,6 +99,8 @@ help:
 	@echo "  python3 codex_server.py model.gguf --context 4096 --port 8080"
 	@echo "  GLM5NEXT_HIP_DSA=1 GLM5NEXT_HIP_KDA=1 GLM5NEXT_HIP_MOE=1 ./test_hip_llm GLM5Next.gguf --gpu-only-bench --prefill-len 1 --decode 1"
 	@echo "  GLM5NEXT_HIP_MOE_LAYER=N limits streamed MoE bring-up to one layer"
+	@echo "  GLM5NEXT_HIP_KDA_LAYER=N limits KDA bring-up to one layer"
+	@echo "  GLM5NEXT_HIP_KDA_CACHE=0 disables selected-layer persistent KDA weights"
 	@echo "  GLM5NEXT_HIP_MOE_ROUTER=0 keeps the MoE router matvec on CPU (HIP is default)"
 	@echo "  GLM5NEXT_HIP_INDEXER=1 moves DSA indexer projections to HIP"
 	@echo "  GLM5NEXT_HIP_INDEXER_CACHE=1 retains indexer weights on HIP (uses more VRAM)"
