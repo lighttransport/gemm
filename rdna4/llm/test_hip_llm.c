@@ -202,7 +202,9 @@ static int prompt_bos_id(const gguf_context *gguf) {
     const char *override = getenv("LLM_ADD_BOS");
     if (override) return atoi(override);
     int add = gguf_find_key(gguf, "tokenizer.ggml.add_bos_token");
-    if (add >= 0 && gguf->kv[add].type == GGUF_TYPE_BOOL && !gguf->kv[add].value.b)
+    /* Match llama.cpp: absent add_bos_token defaults to false.  A BOS ID by
+     * itself is metadata, not an instruction to prepend it. */
+    if (add < 0 || gguf->kv[add].type != GGUF_TYPE_BOOL || !gguf->kv[add].value.b)
         return -1;
     int id = gguf_find_key(gguf, "tokenizer.ggml.bos_token_id");
     return id >= 0 && gguf->kv[id].type == GGUF_TYPE_UINT32 ?
