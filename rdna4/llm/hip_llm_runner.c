@@ -9,6 +9,7 @@
  */
 
 #include "hip_llm_runner.h"
+#include "../../common/glm5next_ref.h"
 #include "../rocew.h"
 
 #include <stdio.h>
@@ -1898,6 +1899,30 @@ static const char *hip_kernel_source =
 "    float o = 0.0f;\n"
 "    for (int c = 0; c < d_state; c++) o += S[c] * q[c];\n"
 "    out[h * d_state + r] = o * scale;\n"
+"}\n"
+"\n"
+"/* ---- 24a. glm5next_kda_step_f32: one head, one recurrent token ---- */\n"
+"/* State is [head_dim, head_dim], with each thread owning one output\n"
+" * column. This layout matches the scalar CPU oracle exactly. */\n"
+"__global__ void glm5next_kda_step_f32(\n"
+"    float *state, float *out, const float *q, const float *k,\n"
+"    const float *v, const float *log_decay, float beta, int head_dim) {\n"
+"    int j = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (j >= head_dim) return;\n"
+"    float memory = 0.0f;\n"
+"    for (int d = 0; d < head_dim; ++d) {\n"
+"        size_t z = (size_t)d * head_dim + j;\n"
+"        state[z] *= expf(log_decay[d]);\n"
+"        memory += state[z] * k[d];\n"
+"    }\n"
+"    float delta = (v[j] - memory) * beta;\n"
+"    float y = 0.0f;\n"
+"    for (int d = 0; d < head_dim; ++d) {\n"
+"        size_t z = (size_t)d * head_dim + j;\n"
+"        state[z] += k[d] * delta;\n"
+"        y += state[z] * q[d];\n"
+"    }\n"
+"    out[j] = y * rsqrtf((float)head_dim);\n"
 "}\n"
 "\n"
 "/* ---- 24b. deltanet_step_batch_f32: M sequential steps fused in one kernel ----\n"
@@ -8077,6 +8102,7 @@ struct hip_llm_runner {
     hipFunction_t fn_l2_norm_heads_f32;
     hipFunction_t fn_repeat_tile_f32;
     hipFunction_t fn_deltanet_step_f32;
+    hipFunction_t fn_glm5next_kda_step_f32;
     hipFunction_t fn_deltanet_step_batch_f32;
     hipFunction_t fn_l2_norm_heads_batch_f32;
     hipFunction_t fn_repeat_tile_batch_f32;
@@ -8669,6 +8695,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(l2_norm_heads_f32);
     GET_FUNC(repeat_tile_f32);
     GET_FUNC(deltanet_step_f32);
+    GET_FUNC(glm5next_kda_step_f32);
     GET_FUNC(deltanet_step_batch_f32);
     GET_FUNC(l2_norm_heads_batch_f32);
     GET_FUNC(repeat_tile_batch_f32);
@@ -13800,6 +13827,85 @@ int hip_llm_verify_hc_batch(hip_llm_runner *r,int M,double *rel,double *mx){
     if (rel) *rel = den > 0 ? sqrt(num / den) : sqrt(num);
     if (mx) *mx = ma;
     free(in);free(a);free(b);free(sn);free(sl);free(sg);return 0;
+}
+
+int hip_llm_verify_glm5next_kda(hip_llm_runner *r, int head_dim,
+                                double *out_rel_l2, double *out_max_abs) {
+    if (!r || !r->fn_glm5next_kda_step_f32 || head_dim < 1 || head_dim > 256)
+        return -1;
+    size_t nn = (size_t)head_dim * head_dim;
+    float *state = (float *)malloc(nn * sizeof(float));
+    float *state_ref = (float *)malloc(nn * sizeof(float));
+    float *q = (float *)malloc((size_t)head_dim * sizeof(float));
+    float *k = (float *)malloc((size_t)head_dim * sizeof(float));
+    float *v = (float *)malloc((size_t)head_dim * sizeof(float));
+    float *decay = (float *)malloc((size_t)head_dim * sizeof(float));
+    float *out = (float *)malloc((size_t)head_dim * sizeof(float));
+    float *out_ref = (float *)malloc((size_t)head_dim * sizeof(float));
+    float *work = (float *)malloc((size_t)head_dim * sizeof(float));
+    if (!state || !state_ref || !q || !k || !v || !decay || !out || !out_ref || !work) {
+        free(state); free(state_ref); free(q); free(k); free(v); free(decay);
+        free(out); free(out_ref); free(work);
+        return -2;
+    }
+    uint32_t seed = 0x13579bdfu;
+    for (size_t i = 0; i < nn; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        state[i] = ((float)(seed >> 8) * (1.0f / 16777216.0f) - 0.5f) * 0.2f;
+    }
+    for (int i = 0; i < head_dim; ++i) {
+        seed = seed * 1664525u + 1013904223u; q[i] = ((float)(seed >> 8) * (1.0f / 16777216.0f) - 0.5f) * 0.4f;
+        seed = seed * 1664525u + 1013904223u; k[i] = ((float)(seed >> 8) * (1.0f / 16777216.0f) - 0.5f) * 0.4f;
+        seed = seed * 1664525u + 1013904223u; v[i] = ((float)(seed >> 8) * (1.0f / 16777216.0f) - 0.5f) * 0.4f;
+        decay[i] = -0.01f - 0.0001f * (float)i;
+    }
+    memcpy(state_ref, state, nn * sizeof(float));
+    glm53f_kda_step_vec_streamed(state_ref, q, k, v, decay, 0.37f,
+                                 head_dim, head_dim, out_ref, work);
+
+    void *d_state = NULL, *d_out = NULL, *d_q = NULL, *d_k = NULL, *d_v = NULL, *d_decay = NULL;
+    int rc = -2;
+    if (hipMalloc(&d_state, nn * sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_out, (size_t)head_dim * sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_q, (size_t)head_dim * sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_k, (size_t)head_dim * sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_v, (size_t)head_dim * sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_decay, (size_t)head_dim * sizeof(float)) != hipSuccess) goto done;
+    if (hipMemcpy(d_state, state, nn * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(d_q, q, (size_t)head_dim * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(d_k, k, (size_t)head_dim * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(d_v, v, (size_t)head_dim * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(d_decay, decay, (size_t)head_dim * sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    {
+        float beta = 0.37f;
+        void *args[] = { &d_state, &d_out, &d_q, &d_k, &d_v, &d_decay, &beta, &head_dim };
+        if (LAUNCH(r->fn_glm5next_kda_step_f32, (head_dim + 255) / 256, 1, 1,
+                   256, 1, 1, 0, r->stream, args) != hipSuccess) goto done;
+    }
+    if (hipStreamSynchronize(r->stream) != hipSuccess ||
+        hipMemcpy(out, d_out, (size_t)head_dim * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
+        hipMemcpy(state, d_state, nn * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+    {
+        double num = 0.0, den = 0.0, max_abs = 0.0;
+        for (int i = 0; i < head_dim; ++i) {
+            double d = (double)out[i] - out_ref[i], ad = fabs(d);
+            num += d * d; den += (double)out_ref[i] * out_ref[i]; if (ad > max_abs) max_abs = ad;
+        }
+        for (size_t i = 0; i < nn; ++i) {
+            double d = (double)state[i] - state_ref[i];
+            num += d * d; den += (double)state_ref[i] * state_ref[i];
+            if (fabs(d) > max_abs) max_abs = fabs(d);
+        }
+        if (out_rel_l2) *out_rel_l2 = den > 0.0 ? sqrt(num / den) : sqrt(num);
+        if (out_max_abs) *out_max_abs = max_abs;
+    }
+    rc = 0;
+done:
+    if (d_state) hipFree(d_state); if (d_out) hipFree(d_out); if (d_q) hipFree(d_q);
+    if (d_k) hipFree(d_k); if (d_v) hipFree(d_v); if (d_decay) hipFree(d_decay);
+    free(state); free(state_ref); free(q); free(k); free(v); free(decay);
+    free(out); free(out_ref); free(work);
+    return rc;
 }
 
 /* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch

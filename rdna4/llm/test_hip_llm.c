@@ -713,6 +713,8 @@ int main(int argc, char **argv) {
     int moe_cpu_only = 0;
     int max_layers = 0;
     int verify_hc_batch = 0;
+    int verify_glm5next_kda = 0;
+    int glm5next_kda_dim = 128;
     int verify_quant_kernels = 0; /* --verify-quant-kernels: A/B HIP vs CPU per quant type, then exit */
     int verify_moe_routing = 0;
     int stdio_server = 0;
@@ -792,6 +794,9 @@ int main(int argc, char **argv) {
             max_layers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--verify-hc-batch") == 0) {
             verify_hc_batch = 1;
+        } else if (strcmp(argv[i], "--verify-glm5next-kda") == 0) {
+            verify_glm5next_kda = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') glm5next_kda_dim = atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         } else {
@@ -800,6 +805,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       [--moe-cache-mb MiB] [--moe-cpu]\n");
             fprintf(stderr, "       [--verify-quant-kernels] [--bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]]\n");
             fprintf(stderr, "       [--verify-moe-routing]\n");
+            fprintf(stderr, "       [--verify-glm5next-kda [HEAD_DIM]]\n");
             return 1;
         }
     }
@@ -811,6 +817,17 @@ int main(int argc, char **argv) {
     if (verify_moe_routing) {
         return run_verify_moe_routing();
     }
+    if (verify_glm5next_kda) {
+        hip_llm_runner *r = hip_llm_init(0, 1);
+        if (!r) return 1;
+        double rel = 0.0, max_abs = 0.0;
+        int rc = hip_llm_verify_glm5next_kda(r, glm5next_kda_dim, &rel, &max_abs);
+        fprintf(stderr, "GLM5Next KDA verify: head_dim=%d rel_l2=%.6e max_abs=%.6e %s\n",
+                glm5next_kda_dim, rel, max_abs,
+                rc == 0 && rel < 1e-6 ? "PASS" : "FAIL");
+        hip_llm_free(r);
+        return rc == 0 && rel < 1e-6 ? 0 : 1;
+    }
     if (bench_qmv_type) {
         return run_bench_quant_matvec(bench_qmv_type, bench_qmv_rows, bench_qmv_cols,
                                       bench_qmv_iters, bench_qmv_repeats);
@@ -821,6 +838,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M]\n");
         fprintf(stderr, "       [--verify-quant-kernels]   (standalone; no model needed)\n");
         fprintf(stderr, "       [--verify-moe-routing]     (standalone; no model needed)\n");
+        fprintf(stderr, "       [--verify-glm5next-kda [HEAD_DIM]] (standalone)\n");
         fprintf(stderr, "       [--bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]]   (standalone)\n");
         return 1;
     }

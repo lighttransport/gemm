@@ -22,7 +22,7 @@ HIPBLASLT ?= 1
 # Target
 TARGET = test_hip_llm
 
-.PHONY: all clean run api cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda help
+.PHONY: all clean run api cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-hip-kda help
 
 all: $(TARGET)
 
@@ -53,6 +53,9 @@ glm5next-contract: test_glm5next_contract
 glm5next-ref: test_glm5next_ref
 
 glm5next-cpu-kda: test_glm5next_cpu_kda
+
+glm5next-hip-kda: $(TARGET)
+	./$(TARGET) --verify-glm5next-kda 128
 
 test_glm5next_cpu_kda: test_glm5next_cpu_kda.c ../../common/glm5next_cpu_kda.h ../../common/glm5next_ref.h
 	$(CC) -O2 -Wall -Wextra -Wpedantic -I.. -o $@ $< -lm

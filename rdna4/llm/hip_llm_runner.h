@@ -76,6 +76,11 @@ void hip_llm_reset_moe_stats(hip_llm_runner *r);
 int hip_llm_verify_hc_batch(hip_llm_runner *r, int batch,
                             double *out_rel_l2, double *out_max_abs);
 
+/* Verify the standalone GLM5Next KDA recurrent step against its scalar CPU
+ * oracle. This does not require model weights to be loaded. */
+int hip_llm_verify_glm5next_kda(hip_llm_runner *r, int head_dim,
+                                double *out_rel_l2, double *out_max_abs);
+
 /* Load Qwen3 dense weights from a safetensors file (text-encoder path). */
 int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_path, int max_seq_len);
 
