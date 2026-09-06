@@ -174,9 +174,10 @@ fail:
 /* One-token absorbed DSA attention.  With no prior KV cells this is already
  * the exact causal attention result (the sole score softmaxes to one); the
  * latent cache/indexer is added in the history-aware routine below. */
-static inline int glm5next_cpu_dsa_forward_cached(const gguf_shards *model, int layer,
+static inline int glm5next_cpu_dsa_forward_cached_indexed(const gguf_shards *model, int layer,
         const glm5next_config *c, const float *hidden, float *out,
-        float *latent_cache, int max_seq_len, int position) {
+        float *latent_cache, float *indexer_keys, float *indexer_gates,
+        int max_seq_len, int position) {
     char name[128]; glm5next_tensor_view t;
     int h = c->hidden_size, heads = c->attention_heads;
     int qrank = c->q_lora_rank, kv = c->kv_lora_rank;
@@ -187,8 +188,24 @@ static inline int glm5next_cpu_dsa_forward_cached(const gguf_shards *model, int 
     float *value = (float *)malloc((size_t)heads * vdim * sizeof(float));
     float *tmp = (float *)malloc((size_t)h * sizeof(float));
     float *norm = (float *)malloc((size_t)((qrank > kv) ? qrank : kv) * sizeof(float));
+    float *index_query = NULL, *head_weight = NULL, *index_key = NULL;
+    float *index_gate = NULL, *ape = NULL;
+    float *pool_keys = NULL;
+    int *selected = NULL, selected_count = position + 1;
+    if (indexer_keys && indexer_gates) {
+        index_query = (float *)malloc((size_t)c->indexer_heads * c->indexer_key_length * sizeof(float));
+        head_weight = (float *)malloc((size_t)c->indexer_heads * sizeof(float));
+        index_key = (float *)malloc((size_t)c->indexer_key_length * sizeof(float));
+        index_gate = (float *)malloc((size_t)c->indexer_key_length * sizeof(float));
+        ape = (float *)malloc((size_t)c->indexer_kpool * c->indexer_key_length * sizeof(float));
+        selected = (int *)malloc((size_t)(c->indexer_top_k + c->indexer_kpool) * sizeof(int));
+        pool_keys = (float *)malloc((size_t)((max_seq_len / c->indexer_kpool) + 1) *
+                                    c->indexer_key_length * sizeof(float));
+    }
     if (!qr || !kv_latent || !q || !value || !tmp || !norm || position < 0 ||
-        (latent_cache && position >= max_seq_len)) goto fail;
+        (latent_cache && position >= max_seq_len) ||
+        (indexer_keys && indexer_gates && (!index_query || !head_weight ||
+         !index_key || !index_gate || !ape || !selected || !pool_keys))) goto fail;
 #define DSA_GET(s) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
     if (glm5next_tensor_view_get(model, name, 1, &t) != 0) goto fail; } while (0)
     DSA_GET("attn_q_a.weight"); if (glm5next_cpu_matvec(qr, &t, hidden) != 0) goto fail;
@@ -200,6 +217,48 @@ static inline int glm5next_cpu_dsa_forward_cached(const gguf_shards *model, int 
     glm5next_cpu_rmsnorm(kv_latent, kv_latent, norm, kv, c->norm_epsilon);
     if (latent_cache) memcpy(latent_cache + (size_t)position * kv, kv_latent,
                              (size_t)kv * sizeof(float));
+    if (indexer_keys && indexer_gates) {
+        glm5next_tensor_view ik, iq, iw, ikw, ikb, ig, ia;
+        DSA_GET("indexer.attn_k.weight"); ik = t;
+        if (glm5next_cpu_matvec(index_key, &ik, hidden) != 0) goto fail;
+        DSA_GET("indexer.k_norm.weight"); ikw = t;
+        DSA_GET("indexer.k_norm.bias"); ikb = t;
+        { float *kw = (float *)malloc((size_t)c->indexer_key_length * sizeof(float));
+          float *kb = (float *)malloc((size_t)c->indexer_key_length * sizeof(float));
+          if (!kw || !kb || glm5next_cpu_vector(&ikw, kw, c->indexer_key_length) != 0 ||
+              glm5next_cpu_vector(&ikb, kb, c->indexer_key_length) != 0) {
+              free(kw); free(kb); goto fail;
+          }
+          double mean = 0.0, ss = 0.0;
+          for (int i = 0; i < c->indexer_key_length; ++i) mean += index_key[i];
+          mean /= c->indexer_key_length;
+          for (int i = 0; i < c->indexer_key_length; ++i) { double d = index_key[i] - mean; ss += d*d; }
+          float inv = 1.0f / sqrtf((float)(ss / c->indexer_key_length) + c->norm_epsilon);
+          for (int i = 0; i < c->indexer_key_length; ++i) index_key[i] = (index_key[i] - (float)mean) * inv * kw[i] + kb[i];
+          free(kw); free(kb);
+        }
+        memcpy(indexer_keys + (size_t)position * c->indexer_key_length, index_key,
+               (size_t)c->indexer_key_length * sizeof(float));
+        DSA_GET("indexer_compressor_gate.weight"); ig = t;
+        if (glm5next_cpu_matvec(index_gate, &ig, hidden) != 0) goto fail;
+        memcpy(indexer_gates + (size_t)position * c->indexer_key_length, index_gate,
+               (size_t)c->indexer_key_length * sizeof(float));
+        DSA_GET("indexer.attn_q_b.weight"); iq = t;
+        if (glm5next_cpu_matvec(index_query, &iq, qr) != 0) goto fail;
+        DSA_GET("indexer.proj.weight"); iw = t;
+        if (glm5next_cpu_matvec(head_weight, &iw, hidden) != 0) goto fail;
+        DSA_GET("indexer_compressor_ape.weight"); ia = t;
+        if (ia.type != GGML_TYPE_F32 || ia.n_dims != 2 ||
+            ia.dims[0] != (uint64_t)c->indexer_key_length ||
+            ia.dims[1] != (uint64_t)c->indexer_kpool) goto fail;
+        memcpy(ape, ia.data, (size_t)c->indexer_kpool * c->indexer_key_length * sizeof(float));
+        if (position + 1 > c->indexer_top_k)
+            selected_count = glm5next_index_select(pool_keys, selected, index_query, head_weight,
+                indexer_keys, indexer_gates, ape, position + 1, c->indexer_kpool,
+                c->indexer_top_k, c->indexer_heads, c->indexer_key_length);
+        else for (int i = 0; i < selected_count; ++i) selected[i] = i;
+        if (selected_count < 0) goto fail;
+    }
     for (int head = 0; head < heads; ++head) {
         float *qh = (float *)malloc((size_t)kv * sizeof(float));
         float *scores = (float *)malloc((size_t)(position + 1) * sizeof(float));
@@ -210,7 +269,8 @@ static inline int glm5next_cpu_dsa_forward_cached(const gguf_shards *model, int 
         float *vh = value + (size_t)head * vdim;
         memset(vh, 0, (size_t)vdim * sizeof(float));
         float max_score = -INFINITY;
-        for (int p = 0; p <= position; ++p) {
+        for (int si = 0; si < selected_count; ++si) {
+            int p = selected ? selected[si] : si;
             const float *kp = latent_cache ? latent_cache + (size_t)p * kv : kv_latent;
             double score = 0.0;
             for (int i = 0; i < kv; ++i) score += (double)qh[i] * kp[i];
@@ -219,11 +279,12 @@ static inline int glm5next_cpu_dsa_forward_cached(const gguf_shards *model, int 
         }
         double denom = 0.0;
         for (int p = 0; p <= position; ++p) denom += exp((double)scores[p] - max_score);
-        for (int p = 0; p <= position; ++p) {
+        for (int si = 0; si < selected_count; ++si) {
+            int p = selected ? selected[si] : si;
             const float *kp = latent_cache ? latent_cache + (size_t)p * kv : kv_latent;
             float *vv = (float *)malloc((size_t)vdim * sizeof(float));
             if (!vv || glm5next_cpu_matvec_head(vv, &t, head, kp) != 0) { free(vv); free(scores); free(qh); goto fail; }
-            float w = (float)(exp((double)scores[p] - max_score) / denom);
+            float w = (float)(exp((double)scores[si] - max_score) / denom);
             for (int i = 0; i < vdim; ++i) vh[i] += w * vv[i];
             free(vv);
         }
@@ -231,10 +292,19 @@ static inline int glm5next_cpu_dsa_forward_cached(const gguf_shards *model, int 
     }
     DSA_GET("attn_output.weight"); if (glm5next_cpu_matvec(tmp, &t, value) != 0) goto fail;
     memcpy(out, tmp, (size_t)h * sizeof(float));
-    free(qr); free(kv_latent); free(q); free(value); free(tmp); free(norm); return 0;
+    free(qr); free(kv_latent); free(q); free(value); free(tmp); free(norm);
+    free(index_query); free(head_weight); free(index_key); free(index_gate); free(ape); free(selected); free(pool_keys); return 0;
 fail:
-    free(qr); free(kv_latent); free(q); free(value); free(tmp); free(norm); return -1;
+    free(qr); free(kv_latent); free(q); free(value); free(tmp); free(norm);
+    free(index_query); free(head_weight); free(index_key); free(index_gate); free(ape); free(selected); free(pool_keys); return -1;
 #undef DSA_GET
+}
+
+static inline int glm5next_cpu_dsa_forward_cached(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out,
+        float *latent_cache, int max_seq_len, int position) {
+    return glm5next_cpu_dsa_forward_cached_indexed(model, layer, c, hidden, out,
+        latent_cache, NULL, NULL, max_seq_len, position);
 }
 
 static inline int glm5next_cpu_dsa_forward(const gguf_shards *model, int layer,
@@ -308,7 +378,8 @@ static inline int glm5next_cpu_moe_ffn(const gguf_shards *model, int layer,
 
 typedef int (*glm5next_dsa_callback)(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
-        float *latent_cache, int max_seq_len, int position, void *opaque);
+        float *latent_cache, float *indexer_keys, float *indexer_gates,
+        int max_seq_len, int position, void *opaque);
 typedef int (*glm5next_kda_callback)(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         float *recurrent, float *conv_state, void *opaque);
@@ -317,7 +388,7 @@ static inline int glm5next_cpu_dsa_moe_block_cached_cb(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
         float *latent_cache, int max_seq_len, int position,
         glm5next_dsa_callback callback, glm5next_moe_callback moe_callback,
-        void *opaque, void *moe_opaque) {
+        void *opaque, void *moe_opaque, float *indexer_keys, float *indexer_gates) {
     int h = c->hidden_size, hc = c->hc_count;
     char name[128]; glm5next_tensor_view fn, base, scale;
     float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
@@ -335,9 +406,10 @@ static inline int glm5next_cpu_dsa_moe_block_cached_cb(const gguf_shards *model,
     BLOCK_VIEW("attn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
     glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
     if ((callback ? callback(model, layer, c, collapsed, sublayer, latent_cache,
-                             max_seq_len, position, opaque)
-                  : glm5next_cpu_dsa_forward_cached(model, layer, c, collapsed,
-                             sublayer, latent_cache, max_seq_len, position)) != 0) goto fail;
+                             indexer_keys, indexer_gates, max_seq_len, position, opaque)
+                  : glm5next_cpu_dsa_forward_cached_indexed(model, layer, c, collapsed,
+                             sublayer, latent_cache, indexer_keys, indexer_gates,
+                             max_seq_len, position)) != 0) goto fail;
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
     memcpy(residual, streams, (size_t)hc * h * sizeof(float));
     BLOCK_VIEW("hc_ffn_fn.weight", fn); BLOCK_VIEW("hc_ffn_base.weight", base); BLOCK_VIEW("hc_ffn_scale.weight", scale);
@@ -357,7 +429,7 @@ static inline int glm5next_cpu_dsa_moe_block_cached(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
         float *latent_cache, int max_seq_len, int position) {
     return glm5next_cpu_dsa_moe_block_cached_cb(model, layer, c, streams,
-        latent_cache, max_seq_len, position, NULL, NULL, NULL, NULL);
+        latent_cache, max_seq_len, position, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
 static inline int glm5next_cpu_dsa_moe_block(const gguf_shards *model,

@@ -9564,7 +9564,8 @@ static int glm5next_hip_dsa_cache_load(hip_llm_runner *r, const gguf_shards *mod
 
 static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
-        float *latent_cache, int max_seq_len, int position, void *opaque);
+        float *latent_cache, float *indexer_keys, float *indexer_gates,
+        int max_seq_len, int position, void *opaque);
 static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         float *recurrent, float *conv_state, void *opaque);
@@ -14568,7 +14569,8 @@ done:
 
 static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
         const glm5next_config *c, const float *hidden, float *out,
-        float *latent_cache, int max_seq_len, int position, void *opaque) {
+        float *latent_cache, float *indexer_keys, float *indexer_gates,
+        int max_seq_len, int position, void *opaque) {
     hip_llm_runner *r = (hip_llm_runner *)opaque;
     const int heads = c->attention_heads, qrank = c->q_lora_rank;
     const int kv = c->kv_lora_rank, qdim = c->qk_nope_head_dim, vdim = c->value_head_dim;
@@ -14579,6 +14581,7 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     float *qr = NULL, *q = NULL, *kvl = NULL, *norm = NULL, *qhead = NULL;
     glm5next_dsa_gpu_cache local_cache; glm5next_dsa_gpu_cache *cache = NULL;
     int persistent_cache = r && r->glm5next_dsa_gpu != NULL;
+    (void)indexer_keys; (void)indexer_gates;
     int otype = 0, rc = -1;
     if (!r || !model || !hidden || !out || !latent_cache || position < 0 || position >= max_seq_len) return -1;
     if (layer < 0 || layer >= c->n_layers) return -1;
