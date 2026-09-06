@@ -10002,7 +10002,7 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                 !getenv("GLM5NEXT_HIP_DSA_CACHE");
             if (!stream_dsa) {
                 r->glm5next_dsa_gpu = (glm5next_dsa_gpu_cache *)calloc(
-                    (size_t)r->glm5next.n_layers, sizeof(*r->glm5next_dsa_gpu));
+                    (size_t)r->glm5next.n_layers_all, sizeof(*r->glm5next_dsa_gpu));
                 if (!r->glm5next_dsa_gpu) {
                     fprintf(stderr, "hip_llm: GLM5Next DSA cache allocation failed\n");
                     glm5next_cpu_runtime_free(r->glm5next_cpu);
@@ -15000,7 +15000,7 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     int *selected = NULL;
     int otype = 0, rc = -1;
     if (!r || !model || !hidden || !out || !latent_cache || position < 0 || position >= max_seq_len) return -1;
-    if (layer < 0 || layer >= c->n_layers) return -1;
+    if (layer < 0 || layer >= c->n_layers_all) return -1;
     memset(&local_cache, 0, sizeof(local_cache));
     cache = persistent_cache ? &r->glm5next_dsa_gpu[layer] : &local_cache;
     if (!cache->ready && glm5next_hip_dsa_cache_load(r, model, layer, cache) != 0) return -1;
@@ -15220,7 +15220,7 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     int rc = -1;
     char name[128];
     if (!r || !model || !c || !hidden || !out || layer < 0 ||
-        layer >= c->n_layers || slots <= 0 || slots > 64) return -1;
+        layer >= c->n_layers_all || slots <= 0 || slots > 64) return -1;
     {
         const char *select = getenv("GLM5NEXT_HIP_MOE_LAYER");
         if (select && atoi(select) != layer)
@@ -16884,6 +16884,14 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
     return r->h_output;
 }
 
+float *hip_llm_forward_nextn_logits(hip_llm_runner *r, int32_t prev_token, int position) {
+    if (!r || !r->weights_loaded || !r->is_glm5next || !r->glm5next_cpu ||
+        prev_token < 0 || prev_token >= r->n_vocab || position < 0 ||
+        position >= r->max_seq_len)
+        return NULL;
+    return glm5next_cpu_runtime_nextn_logits(r->glm5next_cpu, prev_token, position);
+}
+
 /* ---- Batched forward (Phase 2: hipBLASLt-routed dense path) ---- */
 
 #ifdef LLM_HIPBLASLT_ENABLED
@@ -18172,7 +18180,7 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->stream) hipStreamDestroy(r->stream);
 
     if (r->glm5next_dsa_gpu) {
-        for (int l = 0; l < r->glm5next.n_layers; ++l) {
+        for (int l = 0; l < r->glm5next.n_layers_all; ++l) {
             if (r->glm5next_dsa_gpu[l].k_weight) hipFree(r->glm5next_dsa_gpu[l].k_weight);
             if (r->glm5next_dsa_gpu[l].v_weight) hipFree(r->glm5next_dsa_gpu[l].v_weight);
             if (r->glm5next_dsa_gpu[l].q_a_weight) hipFree(r->glm5next_dsa_gpu[l].q_a_weight);

@@ -114,6 +114,11 @@ float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position);
  * The returned pointer is valid until the next call (host-side buffer). */
 float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position);
 
+/* Run the optional GLM5Next speculative/NextN block using the latest trunk
+ * hidden state and the token that should be embedded by the draft head.  The
+ * returned logits are valid until the next call. */
+float *hip_llm_forward_nextn_logits(hip_llm_runner *r, int32_t prev_token, int position);
+
 /* Run forward pass with a pre-computed F32 embedding [n_embd] instead of token lookup.
  * Used to inject vision embeddings. embd_stride is the stride between embeddings
  * (>= n_embd; extra data used for deepstack injection). */
