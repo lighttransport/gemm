@@ -9480,21 +9480,18 @@ static int upload_weight_matrix(void **d_ptr, const qtensor *t, int *out_type) {
 
 /* Leading GLM5Next dense FFN matrices are Q5_K/Q6_K.  Their legacy
  * warp-per-row kernels are not safe for the 12K-row decode shape, so keep a
- * resident F16 copy for this small three-layer prefix. */
-static int upload_dequant_f16_matrix(void **d_ptr, const qtensor *t, int *out_type) {
+ * resident F32 copy for this small three-layer prefix. */
+static int upload_dequant_f32_matrix(void **d_ptr, const qtensor *t, int *out_type) {
     int n = t->n_rows * t->n_cols;
     float *f32 = n > 0 ? (float *)malloc((size_t)n * sizeof(float)) : NULL;
-    uint16_t *f16 = n > 0 ? (uint16_t *)malloc((size_t)n * sizeof(uint16_t)) : NULL;
-    if (!f32 || !f16 || dequant_row(t->type, t->data, f32, n) != 0) {
-        free(f32); free(f16); return -1;
+    if (!f32 || dequant_row(t->type, t->data, f32, n) != 0) {
+        free(f32); return -1;
     }
-    for (int i = 0; i < n; ++i) f16[i] = hllm_f32_to_f16(f32[i]);
-    free(f32);
-    if (hipMalloc(d_ptr, (size_t)n * sizeof(uint16_t)) != hipSuccess ||
-        hipMemcpy(*d_ptr, f16, (size_t)n * sizeof(uint16_t), hipMemcpyHostToDevice) != hipSuccess) {
-        if (*d_ptr) hipFree(*d_ptr); *d_ptr = NULL; free(f16); return -1;
+    if (hipMalloc(d_ptr, (size_t)n * sizeof(float)) != hipSuccess ||
+        hipMemcpy(*d_ptr, f32, (size_t)n * sizeof(float), hipMemcpyHostToDevice) != hipSuccess) {
+        if (*d_ptr) hipFree(*d_ptr); *d_ptr = NULL; free(f32); return -1;
     }
-    free(f16); *out_type = GGML_TYPE_F16; return 0;
+    free(f32); *out_type = GGML_TYPE_F32; return 0;
 }
 
 static int upload_3d_kquant_raw(void **d_ptr, const qtensor *t, size_t *out_stride) {
@@ -9923,7 +9920,9 @@ static inline void launch_swiglu_limit(hip_llm_runner *r, void *gate, void *up,
 static inline void launch_ffn_gate_up_silu_iq1_s(hip_llm_runner *r,
                                                   void *dst, void *gate, void *up,
                                                   void *x, int rows, int cols);
-static int upload_dequant_f16_matrix(void **dst, const qtensor *t, int *out_type);
+static int upload_dequant_f32_matrix(void **dst, const qtensor *t, int *out_type);
+static inline void launch_matvec_f32(hip_llm_runner *r, void *dst, void *mat,
+                                      void *x, int n_rows, int n_cols);
 static inline void launch_dense_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
                                              void *x, int n_rows, int n_cols, int type);
 
@@ -9953,9 +9952,15 @@ static int glm5next_hip_dense_callback(const gguf_shards *model, int layer,
         if (cache) {
             qtensor qg = glm5next_as_qtensor(&gv), qu = glm5next_as_qtensor(&uv),
                     qd = glm5next_as_qtensor(&dv);
-            int eg = upload_weight_matrix(&cache->gate, &qg, &cache->gate_type);
-            int eu = upload_weight_matrix(&cache->up, &qu, &cache->up_type);
-            int ed = upload_weight_matrix(&cache->down, &qd, &cache->down_type);
+            int eg = (qg.type == GGML_TYPE_Q5_K || qg.type == GGML_TYPE_Q6_K) ?
+                upload_dequant_f32_matrix(&cache->gate, &qg, &cache->gate_type) :
+                upload_weight_matrix(&cache->gate, &qg, &cache->gate_type);
+            int eu = (qu.type == GGML_TYPE_Q5_K || qu.type == GGML_TYPE_Q6_K) ?
+                upload_dequant_f32_matrix(&cache->up, &qu, &cache->up_type) :
+                upload_weight_matrix(&cache->up, &qu, &cache->up_type);
+            int ed = (qd.type == GGML_TYPE_Q5_K || qd.type == GGML_TYPE_Q6_K) ?
+                upload_dequant_f32_matrix(&cache->down, &qd, &cache->down_type) :
+                upload_weight_matrix(&cache->down, &qd, &cache->down_type);
             if (eg != 0 || eu != 0 || ed != 0) {
                 if (cache->gate) hipFree(cache->gate); if (cache->up) hipFree(cache->up);
                 if (cache->down) hipFree(cache->down); memset(cache, 0, sizeof(*cache));
@@ -9969,9 +9974,15 @@ static int glm5next_hip_dense_callback(const gguf_shards *model, int layer,
         } else {
             qtensor qg = glm5next_as_qtensor(&gv), qu = glm5next_as_qtensor(&uv),
                     qd = glm5next_as_qtensor(&dv);
-            if (upload_weight_matrix(&dx, &qg, &gt) != 0 ||
-                upload_weight_matrix(&dg, &qu, &ut) != 0 ||
-                upload_weight_matrix(&dd, &qd, &dt) != 0) goto done;
+            if (((qg.type == GGML_TYPE_Q5_K || qg.type == GGML_TYPE_Q6_K) ?
+                    upload_dequant_f32_matrix(&dx, &qg, &gt) :
+                    upload_weight_matrix(&dx, &qg, &gt)) != 0 ||
+                ((qu.type == GGML_TYPE_Q5_K || qu.type == GGML_TYPE_Q6_K) ?
+                    upload_dequant_f32_matrix(&dg, &qu, &ut) :
+                    upload_weight_matrix(&dg, &qu, &ut)) != 0 ||
+                ((qd.type == GGML_TYPE_Q5_K || qd.type == GGML_TYPE_Q6_K) ?
+                    upload_dequant_f32_matrix(&dd, &qd, &dt) :
+                    upload_weight_matrix(&dd, &qd, &dt)) != 0) goto done;
             own = 1;
         }
     }
@@ -9981,10 +9992,21 @@ static int glm5next_hip_dense_callback(const gguf_shards *model, int layer,
     if (hipMalloc(&du, (size_t)c->dense_feed_forward_length * sizeof(float)) != hipSuccess) goto done;
     {
         void *dinput = NULL, *doutput = NULL;
+        int dense_debug = getenv("GLM5NEXT_DENSE_DEBUG") != NULL;
         if (hipMalloc(&dinput, (size_t)c->hidden_size * sizeof(float)) != hipSuccess ||
-            hipMalloc(&doutput, (size_t)c->hidden_size * sizeof(float)) != hipSuccess ||
+            /* The up projection uses doutput as its FFN-width temporary;
+             * the down projection reuses it for the hidden-width result. */
+            hipMalloc(&doutput, (size_t)c->dense_feed_forward_length * sizeof(float)) != hipSuccess ||
             hipMemcpy(dinput, hidden, (size_t)c->hidden_size * sizeof(float), hipMemcpyHostToDevice) != hipSuccess) {
             if (dinput) hipFree(dinput); if (doutput) hipFree(doutput); goto done;
+        }
+        if (dense_debug) {
+            size_t free_b = 0, total_b = 0;
+            hipMemGetInfo(&free_b, &total_b);
+            fprintf(stderr, "hip_llm: dense[%d] ptr gate=%p up=%p down=%p in=%p out=%p ff=%d h=%d types=%d/%d/%d free=%.0f MiB\n",
+                    layer, dx, dg, dd, dinput, doutput,
+                    c->dense_feed_forward_length, c->hidden_size, gt, ut, dt,
+                    (double)free_b / (1024.0 * 1024.0));
         }
         if (gt == GGML_TYPE_IQ1_S && ut == GGML_TYPE_IQ1_S &&
             (!c->swiglu_clamp_shexp || c->swiglu_clamp_shexp[layer] <= 1e-6f))
@@ -9992,13 +10014,31 @@ static int glm5next_hip_dense_callback(const gguf_shards *model, int layer,
                                           c->dense_feed_forward_length, c->hidden_size);
         else {
             launch_dense_matvec_auto(r, du, dx, dinput, c->dense_feed_forward_length, c->hidden_size, gt);
+            if (dense_debug && hipStreamSynchronize(r->stream) != hipSuccess) {
+                const char *err_text = "unknown"; hipError_t err = hipGetLastError();
+                if (hipGetErrorString) hipGetErrorString(err, &err_text);
+                fprintf(stderr, "hip_llm: dense[%d] gate launch failed: %s\n", layer, err_text);
+                hipFree(dinput); hipFree(doutput); goto done;
+            }
             launch_dense_matvec_auto(r, doutput, dg, dinput, c->dense_feed_forward_length, c->hidden_size, ut);
+            if (dense_debug && hipStreamSynchronize(r->stream) != hipSuccess) {
+                const char *err_text = "unknown"; hipError_t err = hipGetLastError();
+                if (hipGetErrorString) hipGetErrorString(err, &err_text);
+                fprintf(stderr, "hip_llm: dense[%d] up launch failed: %s\n", layer, err_text);
+                hipFree(dinput); hipFree(doutput); goto done;
+            }
             launch_swiglu_limit(r, du, doutput, c->dense_feed_forward_length,
                                 c->swiglu_clamp_shexp ? c->swiglu_clamp_shexp[layer] : 0.0f);
             launch_silu_mul(r, du, doutput, c->dense_feed_forward_length);
         }
         launch_dense_matvec_auto(r, doutput, dd, du, c->hidden_size,
                                  c->dense_feed_forward_length, dt);
+        if (dense_debug && hipStreamSynchronize(r->stream) != hipSuccess) {
+            const char *err_text = "unknown"; hipError_t err = hipGetLastError();
+            if (hipGetErrorString) hipGetErrorString(err, &err_text);
+            fprintf(stderr, "hip_llm: dense[%d] down launch failed: %s\n", layer, err_text);
+            hipFree(dinput); hipFree(doutput); goto done;
+        }
         if (hipStreamSynchronize(r->stream) != hipSuccess ||
             hipMemcpy(out, doutput, (size_t)c->hidden_size * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) {
             hipFree(dinput); hipFree(doutput); goto done;
@@ -12889,10 +12929,8 @@ static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
 
 static inline void launch_dense_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
                                              void *x, int n_rows, int n_cols, int type) {
-    if (type == GGML_TYPE_Q5_K) {
-        void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
-        LAUNCH(r->fn_matvec_q5_K_f32, n_rows, 1, 1, 256, 1, 1, 0,
-               r->stream, args);
+    if (type == GGML_TYPE_F32) {
+        launch_matvec_f32(r, dst, mat, x, n_rows, n_cols);
     } else {
         launch_matvec_auto(r, dst, mat, x, n_rows, n_cols, type);
     }
