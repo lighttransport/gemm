@@ -535,7 +535,13 @@ def main():
     Handler.max_tokens = args.max_output
     Handler.context = args.context
     Handler.coding = args.coding
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+    except Exception:
+        # The runner is already resident at this point.  Do not leak a model
+        # process when the requested port is busy or the bind is invalid.
+        Handler.backend.close()
+        raise
     print(f"OpenAI-compatible API: http://{args.host}:{args.port}/v1", flush=True)
     try: server.serve_forever()
     except KeyboardInterrupt: pass
