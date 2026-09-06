@@ -525,7 +525,13 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         ctx->map_size = (size_t)st.st_size;
         {
             int flags = MAP_PRIVATE;
-            if (use_mmap == 1 && !getenv("NUMA_DISTRIBUTE") &&
+            /* MAP_POPULATE is useful for small dense models but turns a large
+             * MoE load into a synchronous read of every weight before the
+             * caller can inspect metadata or stage the first layer.  Keep
+             * huge models demand-paged by default; GGUF_LAZY_MMAP remains an
+             * explicit override for smaller files. */
+            if (use_mmap == 1 && ctx->data_size < (size_t)8 * 1024 * 1024 * 1024 &&
+                !getenv("NUMA_DISTRIBUTE") &&
                 !(getenv("GGUF_LAZY_MMAP") && atoi(getenv("GGUF_LAZY_MMAP"))))
                 flags |= MAP_POPULATE;
             ctx->map_base = mmap(NULL, ctx->map_size, PROT_READ, flags, ctx->fd, 0);
@@ -774,6 +780,12 @@ static char *gguf_shard_path(const char *path, int shard, int count) {
     return result;
 }
 
+static int gguf_compare_name_ptr(const void *a, const void *b) {
+    const char *const *pa = (const char *const *)a;
+    const char *const *pb = (const char *const *)b;
+    return strcmp(*pa, *pb);
+}
+
 gguf_shards *gguf_open_shards(const char *path, int use_mmap) {
     if (!path) return NULL;
     gguf_context *first = gguf_open(path, use_mmap);
@@ -818,22 +830,28 @@ gguf_shards *gguf_open_shards(const char *path, int use_mmap) {
     }
 
     /* Duplicate tensor names make lookup ambiguous and usually indicate that
-     * mismatched shard sets were combined.  This is deliberately checked once
-     * at load rather than on every tensor lookup. */
-    for (int a = 0; a < count; ++a) {
-        for (uint64_t i = 0; i < model->shards[a]->n_tensors; ++i) {
-            const char *name = model->shards[a]->tensors[i].name.str;
-            for (int b = a + 1; b < count; ++b) {
-                for (uint64_t j = 0; j < model->shards[b]->n_tensors; ++j) {
-                    if (strcmp(name, model->shards[b]->tensors[j].name.str) == 0) {
-                        fprintf(stderr, "gguf: duplicate tensor '%s' in shards %d and %d\n",
-                                name, a + 1, b + 1);
-                        gguf_close_shards(model);
-                        return NULL;
-                    }
-                }
+     * mismatched shard sets were combined.  Sort pointers once: the previous
+     * pairwise shard scan was quadratic and made large MoE models spend most
+     * of startup validating names. */
+    {
+        uint64_t total = 0, n = 0;
+        const char **names;
+        for (int s = 0; s < count; ++s) total += model->shards[s]->n_tensors;
+        names = (const char **)malloc((size_t)total * sizeof(*names));
+        if (!names) { gguf_close_shards(model); return NULL; }
+        for (int s = 0; s < count; ++s)
+            for (uint64_t i = 0; i < model->shards[s]->n_tensors; ++i)
+                names[n++] = model->shards[s]->tensors[i].name.str;
+        qsort(names, (size_t)n, sizeof(*names), gguf_compare_name_ptr);
+        for (uint64_t i = 1; i < n; ++i) {
+            if (strcmp(names[i - 1], names[i]) == 0) {
+                fprintf(stderr, "gguf: duplicate tensor '%s' in shard set\n", names[i]);
+                free(names);
+                gguf_close_shards(model);
+                return NULL;
             }
         }
+        free(names);
     }
     return model;
 }

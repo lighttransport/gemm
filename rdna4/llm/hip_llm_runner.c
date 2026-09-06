@@ -8253,6 +8253,9 @@ struct hip_llm_runner {
     int debug_layers;
     int max_layers;
     int n_deepstack;
+    int is_glm5next;
+    glm5next_config glm5next;
+    glm5next_state_layout glm5next_layout;
     hip_llm_moe_mode requested_moe_mode;
     uint64_t requested_moe_cache_bytes;
     uint64_t requested_gpu_reserve_bytes;
@@ -9396,6 +9399,55 @@ int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_
 static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
 
+    /* GLM5Next has a different graph and cache contract from every model
+     * implemented by this file.  Validate it before the legacy loader can
+     * accidentally interpret its MLA/KDA tensors as Qwen attention. */
+    if (glm5next_is_arch(gguf)) {
+        char error[160];
+        int n_kda = 0, n_dsa = 0;
+        int ctx = glm5next_get_int(gguf, "glm5next.context_length", 0);
+        if (max_seq_len <= 0) max_seq_len = ctx > 0 ? ctx : 1024;
+        glm5next_config_free(&r->glm5next);
+        if (glm5next_config_load(gguf, &r->glm5next, error, sizeof(error)) != 0) {
+            fprintf(stderr, "hip_llm: invalid GLM5Next model: %s\n", error);
+            return -1;
+        }
+        if (max_seq_len > r->glm5next.context_length && r->glm5next.context_length > 0)
+            max_seq_len = r->glm5next.context_length;
+        if (glm5next_state_layout_compute(&r->glm5next, max_seq_len,
+                                          &r->glm5next_layout) != 0) {
+            fprintf(stderr, "hip_llm: invalid GLM5Next state layout\n");
+            glm5next_config_free(&r->glm5next);
+            return -1;
+        }
+        r->is_glm5next = 1;
+        r->n_layers = r->glm5next.n_layers;
+        r->n_embd = r->glm5next.hidden_size;
+        r->n_vocab = r->glm5next.vocab_size;
+        r->max_seq_len = max_seq_len;
+        for (int l = 0; l < r->glm5next.n_layers; ++l) {
+            if (glm5next_layer_type(&r->glm5next, l) == GLM5NEXT_LAYER_KDA) ++n_kda;
+            else ++n_dsa;
+        }
+        fprintf(stderr,
+                "hip_llm: GLM5Next contract validated: layers=%d hidden=%d "
+                "KDA=%d DSA=%d experts=%d/%d index_top_k=%d kpool=%d "
+                "state=%.1f MiB\n",
+                r->glm5next.n_layers, r->glm5next.hidden_size,
+                n_kda, n_dsa,
+                r->glm5next.expert_count, r->glm5next.expert_used_count,
+                r->glm5next.indexer_top_k, r->glm5next.indexer_kpool,
+                (double)(r->glm5next_layout.conv_bytes +
+                         r->glm5next_layout.recurrent_bytes +
+                         r->glm5next_layout.latent_kv_bytes +
+                         r->glm5next_layout.indexer_bytes +
+                         r->glm5next_layout.mhc_bytes) / (1024.0 * 1024.0));
+        fprintf(stderr,
+                "hip_llm: GLM5Next graph is not wired into the HIP executor yet; "
+                "refusing legacy Qwen tensor dispatch\n");
+        return -2;
+    }
+
     const char *arch = "qwen2";
     if (gguf_find_key(gguf, "gemma4.block_count") >= 0) arch = "gemma4";
     else if (gguf_find_key(gguf, "qwen4exp.block_count") >= 0) arch = "qwen4exp";
@@ -10112,6 +10164,28 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
     }
 
     return hip_llm_finalize_load(r, max_seq_len);
+}
+
+int hip_llm_glm5next_inspect(gguf_shards *model, glm5next_config *config,
+                             glm5next_state_layout *layout, int max_seq_len,
+                             char *error, size_t error_cap) {
+    int ctx;
+    if (error && error_cap) error[0] = '\0';
+    if (!model || !model->metadata || !config || !layout) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid inspect arguments");
+        return -1;
+    }
+    if (glm5next_config_load(model->metadata, config, error, error_cap) != 0)
+        return -1;
+    ctx = config->context_length;
+    if (max_seq_len <= 0) max_seq_len = ctx > 0 ? ctx : 1024;
+    if (ctx > 0 && max_seq_len > ctx) max_seq_len = ctx;
+    if (glm5next_state_layout_compute(config, max_seq_len, layout) != 0) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid state layout");
+        glm5next_config_free(config);
+        return -1;
+    }
+    return 0;
 }
 
 void hip_llm_load_options_default(hip_llm_load_options *options) {
@@ -16410,6 +16484,7 @@ void hip_llm_free(hip_llm_runner *r) {
     }
     if (r->stream) hipStreamDestroy(r->stream);
 
+    glm5next_config_free(&r->glm5next);
     free(r);
 }
 

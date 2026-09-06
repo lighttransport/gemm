@@ -836,6 +836,45 @@ int main(int argc, char **argv) {
 
     int arch_idx = gguf_find_key(gguf, "general.architecture");
     if (arch_idx >= 0 && gguf->kv[arch_idx].type == GGUF_TYPE_STRING &&
+        strcmp(gguf->kv[arch_idx].value.str.str, "glm5next") == 0) {
+        glm5next_config config;
+        glm5next_state_layout layout;
+        char error[160];
+        int kda = 0, dsa = 0;
+        memset(&config, 0, sizeof(config));
+        if (glm5next_config_load(gguf, &config, error, sizeof(error)) != 0) {
+            fprintf(stderr, "GLM5Next GGUF rejected: %s\n", error);
+            gguf_close_shards(gguf_model);
+            return 2;
+        }
+        if (glm5next_state_layout_compute(&config, max_seq_len, &layout) != 0) {
+            fprintf(stderr, "GLM5Next state layout rejected\n");
+            glm5next_config_free(&config);
+            gguf_close_shards(gguf_model);
+            return 2;
+        }
+        for (int l = 0; l < config.n_layers; ++l) {
+            if (glm5next_layer_type(&config, l) == GLM5NEXT_LAYER_KDA) ++kda;
+            else ++dsa;
+        }
+        fprintf(stderr,
+                "GLM5Next detected: layers=%d (+%d NextN), hidden=%d, "
+                "KDA=%d, DSA=%d, experts=%d/%d, indexer=%d/kpool%d, "
+                "state@%d=%.1f MiB\n",
+                config.n_layers, config.n_nextn_layers, config.hidden_size,
+                kda, dsa, config.expert_count, config.expert_used_count,
+                config.indexer_top_k, config.indexer_kpool, max_seq_len,
+                (double)(layout.conv_bytes + layout.recurrent_bytes +
+                         layout.latent_kv_bytes + layout.indexer_bytes +
+                         layout.mhc_bytes) / (1024.0 * 1024.0));
+        fprintf(stderr,
+                "GLM5Next execution is not yet connected to test_hip_llm; "
+                "the legacy Qwen/Gemma graph was not attempted.\n");
+        glm5next_config_free(&config);
+        gguf_close_shards(gguf_model);
+        return 2;
+    }
+    if (arch_idx >= 0 && gguf->kv[arch_idx].type == GGUF_TYPE_STRING &&
         strcmp(gguf->kv[arch_idx].value.str.str, "deepseek4") == 0) {
         fprintf(stderr, "deepseek4 GGUF detected (%u split shards, %llu tensors), "
                 "but the generic Qwen/Gemma HIP runner does not implement the "

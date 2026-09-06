@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include "../../common/gguf_loader.h"
+#include "../../common/glm5next.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -195,6 +196,12 @@ int hip_llm_n_embd(const hip_llm_runner *r);
 int hip_llm_n_layers(const hip_llm_runner *r);
 int hip_llm_n_vocab(const hip_llm_runner *r);
 int hip_llm_max_seq_len(const hip_llm_runner *r);
+
+/* Inspect the GLM5Next GGUF contract without initializing HIP.  This is used
+ * by CPU bring-up and by launchers to reject an incomplete model cleanly. */
+int hip_llm_glm5next_inspect(gguf_shards *model, glm5next_config *config,
+                             glm5next_state_layout *layout, int max_seq_len,
+                             char *error, size_t error_cap);
 
 #ifdef __cplusplus
 }

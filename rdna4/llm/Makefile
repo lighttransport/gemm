@@ -22,7 +22,7 @@ HIPBLASLT ?= 1
 # Target
 TARGET = test_hip_llm
 
-.PHONY: all clean run api cpu-expert-bench help
+.PHONY: all clean run api cpu-expert-bench glm5next-contract help
 
 all: $(TARGET)
 
@@ -48,11 +48,16 @@ api: $(TARGET)
 
 cpu-expert-bench: bench_cpu_qwen_expert
 
+glm5next-contract: test_glm5next_contract
+
+test_glm5next_contract: test_glm5next_contract.c ../../common/glm5next.h ../../common/gguf_loader.h
+	$(CC) -O2 -Wall -Wextra -Wpedantic -I.. -o $@ $< -lm
+
 bench_cpu_qwen_expert: bench_cpu_qwen_expert.c
 	$(CC) -O3 -Wall -Wextra -march=native -fopenmp -o $@ $< -ldl -lm
 
 clean:
-	rm -f $(TARGET) bench_cpu_qwen_expert mm_blaslt_bridge.o
+	rm -f $(TARGET) bench_cpu_qwen_expert test_glm5next_contract mm_blaslt_bridge.o
 
 help:
 	@echo "HIP LLM Runner (HIPRTC-based, no hipcc needed)"
@@ -61,6 +66,7 @@ help:
 	@echo "Build:"
 	@echo "  make              - Build test_hip_llm"
 	@echo "  make clean        - Remove built files"
+	@echo "  make glm5next-contract MODEL=/path/to/GLM5Next.gguf"
 	@echo ""
 	@echo "Run:"
 	@echo "  ./test_hip_llm <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]"
