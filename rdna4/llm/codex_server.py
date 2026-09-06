@@ -435,6 +435,8 @@ class Handler(BaseHTTPRequestHandler):
             cancelled = threading.Event()
             stream_keepalive_stop = threading.Event()
             stream_keepalive = None
+            stream_response_id = "resp-" + uuid.uuid4().hex if req.get("stream") else None
+            stream_created = int(time.time())
             if req.get("stream"):
                 # Send headers before inference and periodically emit SSE
                 # comments.  Qwen3.8's long prompt prefill can otherwise
@@ -444,6 +446,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
+                stream_base = {"id": stream_response_id, "object": "response",
+                               "created_at": stream_created, "status": "in_progress",
+                               "model": self.model, "output": []}
+                for sequence_number, event in enumerate(("response.created", "response.in_progress")):
+                    payload = {"type": event, "response": stream_base,
+                               "sequence_number": sequence_number}
+                    self.wfile.write(("event: " + event + "\ndata: " +
+                                     json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
+                self.wfile.flush()
 
                 def keepalive():
                     while not stream_keepalive_stop.wait(5.0):
@@ -485,12 +496,12 @@ class Handler(BaseHTTPRequestHandler):
                 # EOF as the stream boundary (including Codex) finish cleanly.
                 self.close_connection = True
                 if api_path == "/v1/responses":
-                    response_id = "resp-" + uuid.uuid4().hex
+                    response_id = stream_response_id
                     if calls:
                         response_base = {"id": response_id, "object": "response",
                                          "created_at": created, "status": "in_progress",
                                          "model": self.model, "output": []}
-                        events = list(call_events(response_id, calls))
+                        events = list(call_events(response_id, calls))[2:]
                         response_done = {**response_base, "status": "completed",
                                          "output": calls,
                                          "usage": {"input_tokens": ptok,
@@ -498,7 +509,7 @@ class Handler(BaseHTTPRequestHandler):
                                                    "total_tokens": ptok + ctok,
                                                    "input_tokens_details": {"cached_tokens": cached}}}
                         events.append({"type": "response.completed", "response": response_done})
-                        for sequence_number, obj in enumerate(events):
+                        for sequence_number, obj in enumerate(events, 2):
                             event = obj["type"]
                             obj = {**obj, "sequence_number": sequence_number}
                             self.wfile.write(("event: " + event + "\ndata: " +
@@ -520,12 +531,11 @@ class Handler(BaseHTTPRequestHandler):
                     item_done_obj = {"type": "response.output_item.done", "output_index": 0, "item": item}
                     response_done = {**response_base, "status": "completed", "output": [item], "usage": {"input_tokens": ptok, "output_tokens": ctok, "total_tokens": ptok + ctok, "input_tokens_details": {"cached_tokens": cached}}}
                     done_obj = {"type": "response.completed", "response": response_done}
-                    events = (("response.created", created_obj), ("response.in_progress", in_progress_obj),
-                              ("response.output_item.added", added_obj), ("response.content_part.added", part_added_obj),
+                    events = (("response.output_item.added", added_obj), ("response.content_part.added", part_added_obj),
                               ("response.output_text.delta", delta_obj), ("response.output_text.done", text_done_obj),
                               ("response.content_part.done", part_done_obj), ("response.output_item.done", item_done_obj),
                               ("response.completed", done_obj))
-                    for sequence_number, (event, obj) in enumerate(events):
+                    for sequence_number, (event, obj) in enumerate(events, 2):
                         # Responses stream consumers use this to order and
                         # validate events.  In particular, Codex silently
                         # discards otherwise well-formed events without it.
