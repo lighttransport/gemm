@@ -8082,6 +8082,13 @@ typedef struct {
     int ready;
 } glm5next_kda_gpu_cache;
 
+typedef struct {
+    void *weight;
+    float *bias;
+    int type;
+    int ready;
+} glm5next_moe_router_cache;
+
 /* GLM5Next's routed experts are selected independently at every layer.  Keep
  * a bounded global set of complete (gate, up, down) expert matrices on the
  * device and evict the least-recently-used entry when the budget is full.
@@ -8540,6 +8547,7 @@ struct hip_llm_runner {
     gguf_context *glm5next_single_shard;
     glm5next_dsa_gpu_cache *glm5next_dsa_gpu;
     glm5next_kda_gpu_cache *glm5next_kda_gpu;
+    glm5next_moe_router_cache *glm5next_moe_router;
     glm5next_moe_resident_slot *glm5next_moe_cache;
     int glm5next_moe_cache_slots;
     size_t glm5next_moe_cache_budget;
@@ -9936,7 +9944,9 @@ static int glm5next_moe_cache_get(hip_llm_runner *r, const qtensor *gate,
         victim = -1;
         for (int i = 0; i < r->glm5next_moe_cache_slots; ++i) {
             glm5next_moe_resident_slot *s = &r->glm5next_moe_cache[i];
-            if (s->gate && s->age < oldest) { oldest = s->age; victim = i; }
+            if (s->gate && s->expert >= 0 && s->age < oldest) {
+                oldest = s->age; victim = i;
+            }
         }
         if (victim < 0) break;
         glm5next_moe_slot_release(r, &r->glm5next_moe_cache[victim]);
@@ -9949,7 +9959,8 @@ static int glm5next_moe_cache_get(hip_llm_runner *r, const qtensor *gate,
     if (victim < 0) {
         uint64_t oldest = UINT64_MAX;
         for (int i = 0; i < r->glm5next_moe_cache_slots; ++i)
-            if (r->glm5next_moe_cache[i].age < oldest) {
+            if (r->glm5next_moe_cache[i].expert >= 0 &&
+                r->glm5next_moe_cache[i].age < oldest) {
                 oldest = r->glm5next_moe_cache[i].age; victim = i;
             }
         glm5next_moe_slot_release(r, &r->glm5next_moe_cache[victim]);
@@ -10288,6 +10299,8 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                     r->glm5next_kda_gpu ? "persistent per-layer" : "streaming");
         }
         if (getenv("GLM5NEXT_HIP_MOE") && atoi(getenv("GLM5NEXT_HIP_MOE")) != 0) {
+            r->glm5next_moe_router = (glm5next_moe_router_cache *)calloc(
+                (size_t)r->glm5next.n_layers_all, sizeof(*r->glm5next_moe_router));
             glm5next_cpu_runtime_set_moe_callback(r->glm5next_cpu,
                 glm5next_hip_moe_callback, r);
             fprintf(stderr, "hip_llm: GLM5Next HIP MoE callback enabled "
@@ -15523,6 +15536,8 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     void *dgw[64] = { 0 }, *duw[64] = { 0 }, *ddw[64] = { 0 };
     unsigned char own_w[64] = { 0 };
     glm5next_moe_resident_slot *resident[64] = { 0 };
+    glm5next_moe_resident_slot *shared_resident = NULL;
+    int shared_own = 0;
     int gtype[64] = { 0 }, utype[64] = { 0 }, dtype[64] = { 0 };
     void *drw = NULL, *drx = NULL, *dr = NULL;
     void *dsg = NULL, *dsu = NULL, *dso = NULL;
@@ -15531,10 +15546,12 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     float *shared_out = NULL;
     int ids[64], slots = c ? c->expert_used_count : 0;
     float weights[64];
+    glm5next_moe_router_cache *router_cache = NULL;
     int rc = -1;
     char name[128];
     if (!r || !model || !c || !hidden || !out || layer < 0 ||
         layer >= c->n_layers_all || slots <= 0 || slots > 64) return -1;
+    router_cache = r->glm5next_moe_router ? &r->glm5next_moe_router[layer] : NULL;
     {
         const char *select = getenv("GLM5NEXT_HIP_MOE_LAYER");
         if (select && atoi(select) != layer)
@@ -15580,12 +15597,28 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
         if (use_hip_router) {
         qtensor qrouter = glm5next_as_qtensor(&router_v);
         int router_type = 0;
-        if (upload_weight_matrix(&drw, &qrouter, &router_type) != 0 ||
-            hipMalloc(&drx, (size_t)c->hidden_size * sizeof(float)) != hipSuccess ||
+        if (hipMalloc(&drx, (size_t)c->hidden_size * sizeof(float)) != hipSuccess ||
             hipMalloc(&dr, (size_t)c->expert_count * sizeof(float)) != hipSuccess ||
             hipMemcpy(drx, hidden, (size_t)c->hidden_size * sizeof(float),
-                      hipMemcpyHostToDevice) != hipSuccess)
-            goto done;
+                      hipMemcpyHostToDevice) != hipSuccess) goto done;
+        if (router_cache && router_cache->ready) {
+            drw = router_cache->weight;
+            router_type = router_cache->type;
+            memcpy(bias, router_cache->bias, (size_t)c->expert_count * sizeof(float));
+        } else {
+            if (router_cache) {
+                if (upload_weight_matrix(&router_cache->weight, &qrouter,
+                                         &router_cache->type) != 0) goto done;
+                router_cache->bias = (float *)malloc((size_t)c->expert_count * sizeof(float));
+                if (!router_cache->bias || glm5next_cpu_vector(&bias_v, router_cache->bias,
+                                                                c->expert_count) != 0) goto done;
+                router_cache->ready = 1;
+                drw = router_cache->weight;
+                router_type = router_cache->type;
+                memcpy(bias, router_cache->bias, (size_t)c->expert_count * sizeof(float));
+            } else if (upload_weight_matrix(&drw, &qrouter, &router_type) != 0 ||
+                       glm5next_cpu_vector(&bias_v, bias, c->expert_count) != 0) goto done;
+        }
         launch_matvec_auto(r, dr, drw, drx, c->expert_count,
                            c->hidden_size, router_type);
         if (hipStreamSynchronize(r->stream) != hipSuccess ||
@@ -15596,8 +15629,6 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
             goto done;
         }
     }
-    if (glm5next_cpu_vector(&bias_v, bias, c->expert_count) != 0) goto done;
-
     for (int j = 0; j < slots; ++j) { ids[j] = -1; weights[j] = -INFINITY; }
     for (int e = 0; e < c->expert_count; ++e) {
         float score = 1.0f / (1.0f + expf(-router[e])) + bias[e];
@@ -15668,9 +15699,16 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
       qtensor su = glm5next_as_qtensor(&shared_up_v);
       qtensor sd = glm5next_as_qtensor(&shared_down_v);
       int stg = 0, stu = 0, std = 0;
-      if (upload_weight_matrix(&dsg, &sg, &stg) != 0 ||
-          upload_weight_matrix(&dsu, &su, &stu) != 0 ||
-          upload_weight_matrix(&dso, &sd, &std) != 0) goto done;
+      if (glm5next_moe_cache_get(r, &sg, &su, &sd, layer, -1, &shared_resident) == 0) {
+          dsg = shared_resident->gate; dsu = shared_resident->up; dso = shared_resident->down;
+          stg = shared_resident->gate_type; stu = shared_resident->up_type;
+          std = shared_resident->down_type;
+      } else {
+          if (upload_weight_matrix(&dsg, &sg, &stg) != 0 ||
+              upload_weight_matrix(&dsu, &su, &stu) != 0 ||
+              upload_weight_matrix(&dso, &sd, &std) != 0) goto done;
+          shared_own = 1;
+      }
       launch_matvec_auto(r, dg, dsg, dx, c->shared_expert_ff_length,
                          c->hidden_size, stg);
       launch_matvec_auto(r, du, dsu, dx, c->shared_expert_ff_length,
@@ -15690,9 +15728,12 @@ done:
     for (int j = 0; j < slots; ++j) if (own_w[j]) {
         if (dgw[j]) hipFree(dgw[j]); if (duw[j]) hipFree(duw[j]); if (ddw[j]) hipFree(ddw[j]);
     }
-    if (dsg) hipFree(dsg); if (dsu) hipFree(dsu); if (dso) hipFree(dso);
+    if (shared_own) {
+        if (dsg) hipFree(dsg); if (dsu) hipFree(dsu); if (dso) hipFree(dso);
+    }
     if (dx) hipFree(dx); if (dg) hipFree(dg); if (du) hipFree(du); if (do_) hipFree(do_); if (daccum) hipFree(daccum);
-    if (drw) hipFree(drw); if (drx) hipFree(drx); if (dr) hipFree(dr);
+    if (drw && (!router_cache || drw != router_cache->weight)) hipFree(drw);
+    if (drx) hipFree(drx); if (dr) hipFree(dr);
     free(router); free(bias); free(gate); free(up); free(expert_out);
     free(shared_gate); free(shared_up); free(shared_out);
     return rc;
@@ -18615,6 +18656,15 @@ void hip_llm_free(hip_llm_runner *r) {
             glm5next_moe_slot_release(r, &r->glm5next_moe_cache[i]);
         free(r->glm5next_moe_cache);
         r->glm5next_moe_cache = NULL;
+    }
+    if (r->glm5next_moe_router) {
+        for (int l = 0; l < r->glm5next.n_layers_all; ++l) {
+            if (r->glm5next_moe_router[l].weight)
+                hipFree(r->glm5next_moe_router[l].weight);
+            free(r->glm5next_moe_router[l].bias);
+        }
+        free(r->glm5next_moe_router);
+        r->glm5next_moe_router = NULL;
     }
     if (r->glm5next_cpu) {
         glm5next_cpu_runtime_free(r->glm5next_cpu);
