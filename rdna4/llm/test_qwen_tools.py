@@ -71,6 +71,15 @@ class QwenToolsTest(unittest.TestCase):
         ])
         self.assertEqual(list(registry), ["valid"])
 
+    def test_custom_tool_accepts_native_command_parameter_name(self):
+        text, calls = parse_calls(
+            "<tool_call>\n<function=apply_patch>\n"
+            "<parameter=cmd>printf GPU_CODEX_OK</parameter>\n"
+            "</function>\n</tool_call>", self.registry)
+        self.assertEqual(text, "")
+        self.assertEqual(calls[0]["type"], "custom_tool_call")
+        self.assertEqual(calls[0]["input"], "printf GPU_CODEX_OK")
+
 
 if __name__ == "__main__":
     unittest.main()

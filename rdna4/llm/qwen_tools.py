@@ -96,11 +96,21 @@ def parse_calls(text, registry):
         if re.sub(parameter_pattern, "", body, flags=re.S).strip():
             return text, []
         properties = spec["parameters"].get("properties", {})
+        custom_input = None
         for parameter in parameters:
             key, value = parameter.groups()
             key = key.strip()
             if not key:
                 return text, []
+            if spec["type"] == "custom":
+                # Some agent prompts describe a custom tool using its native
+                # command field (for example `cmd`) even though the Responses
+                # transport calls the payload `input`. Preserve one raw
+                # parameter regardless of that spelling.
+                if custom_input is not None:
+                    return text, []
+                custom_input = value
+                continue
             if key in arguments or key not in properties:
                 return text, []
             if properties[key].get("type") != "string":
@@ -109,14 +119,17 @@ def parse_calls(text, registry):
                 except ValueError:
                     return text, []
             arguments[key] = value
-        if any(key not in arguments for key in spec["parameters"].get("required", [])):
+        if spec["type"] == "custom" and custom_input is None:
+            return text, []
+        if spec["type"] != "custom" and any(
+                key not in arguments for key in spec["parameters"].get("required", [])):
             return text, []
         item = {"id": "fc_" + uuid.uuid4().hex, "call_id": "call_" + uuid.uuid4().hex,
                 "name": spec["name"], "status": "completed"}
         if spec["namespace"]:
             item["namespace"] = spec["namespace"]
         if spec["type"] == "custom":
-            item.update(type="custom_tool_call", input=arguments["input"])
+            item.update(type="custom_tool_call", input=custom_input)
         else:
             item.update(type="function_call", arguments=json.dumps(arguments, ensure_ascii=False))
         calls.append(item)
