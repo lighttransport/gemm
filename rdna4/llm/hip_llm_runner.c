@@ -8358,6 +8358,7 @@ struct hip_llm_runner {
     glm5next_config glm5next;
     glm5next_state_layout glm5next_layout;
     glm5next_cpu_runtime *glm5next_cpu;
+    const gguf_shards *glm5next_model;
     glm5next_dsa_gpu_cache *glm5next_dsa_gpu;
     hip_llm_moe_mode requested_moe_mode;
     uint64_t requested_moe_cache_bytes;
@@ -9762,6 +9763,7 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                 "hip_llm: GLM5Next HIP graph is pending; enabling CPU reference "
                 "execution with persistent KDA state\n");
         if (!hllm_active_shards) return -1;
+        r->glm5next_model = hllm_active_shards;
         r->glm5next_cpu = (glm5next_cpu_runtime *)calloc(1, sizeof(*r->glm5next_cpu));
         if (!r->glm5next_cpu || glm5next_cpu_runtime_init(r->glm5next_cpu,
                     hllm_active_shards, max_seq_len, error, sizeof(error)) != 0) {
@@ -16375,6 +16377,74 @@ static void hip_llm_phase5_capture(hip_llm_runner *r) {
     }
 }
 
+static int glm5next_hip_output_logits(hip_llm_runner *r) {
+    glm5next_tensor_view v;
+    void *dx = NULL, *dy = NULL;
+    int rc = -1;
+    if (!r || !r->glm5next_cpu || !r->glm5next_cpu->hidden) return -1;
+    if (hipMalloc(&dx, (size_t)r->n_embd * sizeof(float)) != hipSuccess) {
+        fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: activation allocation failed\n");
+        goto done;
+    }
+    if (hipMalloc(&dy, (size_t)r->n_vocab * sizeof(float)) != hipSuccess) {
+        fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: logits allocation failed\n");
+        goto done;
+    }
+    if (hipMemcpy(dx, r->glm5next_cpu->hidden, (size_t)r->n_embd * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess) {
+        fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: activation upload failed\n");
+        goto done;
+    }
+    if (glm5next_tensor_view_get(r->glm5next_model, "output.weight", 1, &v) != 0) {
+        fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: output.weight not found\n");
+        goto done;
+    }
+    {
+        qtensor qv = glm5next_as_qtensor(&v);
+        size_t row_bytes = dequant_row_size(qv.type, qv.n_cols);
+        const int chunk_rows = 4096;
+        if (row_bytes == 0 || qv.n_rows != r->n_vocab || qv.n_cols != r->n_embd) {
+            fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: invalid output shape [%d,%d] type=%d\n",
+                    qv.n_rows, qv.n_cols, qv.type);
+            goto done;
+        }
+        for (int first = 0; first < qv.n_rows; first += chunk_rows) {
+            int rows = qv.n_rows - first;
+            if (rows > chunk_rows) rows = chunk_rows;
+            qtensor part = qv;
+            part.data = (const unsigned char *)qv.data + row_bytes * (size_t)first;
+            part.n_rows = rows;
+            part.dims[1] = rows;
+            void *weight = NULL;
+            int type = 0;
+            if (upload_weight_matrix(&weight, &part, &type) != 0) {
+                size_t free_b = 0, total_b = 0;
+                hipMemGetInfo(&free_b, &total_b);
+                fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: chunk upload failed first=%d rows=%d free=%zu MiB total=%zu MiB\n",
+                        first, rows, free_b/(1024*1024), total_b/(1024*1024));
+                goto done;
+            }
+            launch_matvec_auto(r, dy, weight, dx, rows, r->n_embd, type);
+            hipError_t err = hipStreamSynchronize(r->stream);
+            if (err == hipSuccess)
+                err = hipMemcpy(r->glm5next_cpu->logits + first, dy,
+                                (size_t)rows * sizeof(float), hipMemcpyDeviceToHost);
+            hipFree(weight);
+            if (err != hipSuccess) {
+                const char *err_text = "unknown";
+                if (hipGetErrorString) hipGetErrorString(err, &err_text);
+                fprintf(stderr, "hip_llm: GLM5NEXT_HIP_OUTPUT: chunk failed first=%d rows=%d: %s\n",
+                        first, rows, err_text);
+                goto done;
+            }
+        }
+    }
+    rc = 0;
+done:
+    if (dx) hipFree(dx); if (dy) hipFree(dy);
+    return rc;
+}
+
 float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position) {
     if (!r || !r->weights_loaded) return NULL;
     if (token_id < 0 || token_id >= r->n_vocab) return NULL;
@@ -16383,6 +16453,8 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
     if (r->is_glm5next) {
         if (!r->glm5next_cpu || glm5next_cpu_runtime_step(r->glm5next_cpu, token_id, position) != 0)
             return NULL;
+        if (getenv("GLM5NEXT_HIP_OUTPUT") && atoi(getenv("GLM5NEXT_HIP_OUTPUT")) != 0 &&
+            glm5next_hip_output_logits(r) != 0) return NULL;
         return r->glm5next_cpu->logits;
     }
 
