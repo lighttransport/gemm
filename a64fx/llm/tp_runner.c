@@ -86,6 +86,9 @@ extern void kmp_set_blocktime(int milliseconds);
 static FILE *g_log = NULL;
 static FILE *g_curve = NULL;   /* rank0 per-token decode-cost-vs-context curve */
 static FILE *g_tokdump = NULL; /* rank0 generated-token-id log (TP_DUMP_TOKENS=1) for A/B parity */
+/* Optional clean detokenized output for long-form quality gates.  Keeping this
+ * separate from g_log matters: g_log deliberately includes runner telemetry. */
+static FILE *g_generated_text = NULL;
 static void logmsg(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     if (g_log) { va_list ap2; va_copy(ap2, ap); vfprintf(g_log, fmt, ap2); fflush(g_log); va_end(ap2); }
@@ -1070,6 +1073,10 @@ static void print_token(const bpe_vocab *vocab, int32_t nt) {
     int len = dec ? dec_len : (int)strlen(s);
     int buffered = getenv("TP_BUFFER_OUTPUT") != NULL;
     if (g_log) { fwrite(out, 1, len, g_log); if (!buffered) fflush(g_log); }
+    if (g_generated_text) {
+        fwrite(out, 1, len, g_generated_text);
+        if (!buffered) fflush(g_generated_text);
+    }
     fwrite(out, 1, len, stdout); if (!buffered) fflush(stdout);
     free(dec);
 }
@@ -1274,6 +1281,7 @@ int main(int argc, char **argv) {
     int  mtp_bonus_probe   = mtp_batch &&
         (mtp_async || envb_opt("TP_MTP_BONUS_PROBE", 0));
     int  llm_threads       = (int)envl("LLM_THREADS", 48);
+    int fused_decode_head = envb_opt("TP_DECODE_FUSED_HEAD", 0);
     if (spec_k < 0 || spec_k > 16) die("TP_SPEC_K must be in [0,16]", -1);
     if (mtp_async && spec_k != 4) die("TP_MTP_ASYNC currently requires TP_SPEC_K=4", -1);
     int  ignore_eos        = (int)envl("TP_IGNORE_EOS", 0);  /* long-ctx perf sweep: don't stop at EOS */
@@ -1287,13 +1295,19 @@ int main(int argc, char **argv) {
     int  dry_work_reps    = (int)envl_opt("TP_DRY_WORK_REPS", 0);
     int  dry_ar_steps     = (int)envl_opt("TP_DRY_AR_STEPS", 0);
     int  dry_token_step   = (int)envl_opt("TP_DRY_TOKEN_STEP", 1);
-    int  cache_load         = envb_opt("TP_CACHE_LOAD", 0);
-    int  cache_save         = envb_opt("TP_CACHE_SAVE", 0);
+    /* A system cache is an ordinary TP checkpoint taken at a known prompt
+     * prefix.  It can be reused by requests which append user text, avoiding
+     * a second pass over the fixed system instructions. */
+    const char *system_cache_path = envs_opt("TP_SYSTEM_CACHE_PATH", "");
+    const char *system_cache_dir = envs_opt("TP_SYSTEM_CACHE_DIR", "");
+    int system_cache_tokens = (int)envl_opt("TP_SYSTEM_CACHE_TOKENS", 0);
+    int  cache_load         = envb_opt("TP_CACHE_LOAD", system_cache_path[0] != 0 || system_cache_dir[0] != 0);
+    int  cache_save         = envb_opt("TP_CACHE_SAVE", system_cache_path[0] != 0 || system_cache_dir[0] != 0);
     int  cache_autosave     = envb_opt("TP_CACHE_AUTOSAVE", 1);
     int  cache_repartition_from = (int)envl_opt("TP_CACHE_REPARTITION_FROM", 0);
     const char *cache_shared_s = envs_opt("TP_CACHE_SHARED", "auto");
-    const char *cache_dir = envs_opt("TP_CACHE_DIR", "");
-    const char *cache_path_env = envs_opt("TP_CACHE_PATH", "");
+    const char *cache_dir = envs_opt("TP_CACHE_DIR", system_cache_dir);
+    const char *cache_path_env = envs_opt("TP_CACHE_PATH", system_cache_path);
     const char *cache_tag = envs_opt("TP_CACHE_TAG", "tp");
     int cache_shared = -1;
 
@@ -1332,6 +1346,11 @@ int main(int argc, char **argv) {
         g_curve = fopen("tp_curve_rank00.txt", "w");
         if (g_curve) fprintf(g_curve, "# pos ctx_len fwd_ms comm_ms\n");
         if (envb_opt("TP_DUMP_TOKENS", 0)) g_tokdump = fopen("tp_tokens_rank00.txt", "w");
+        const char *generated_path = envs_opt("TP_GENERATED_TEXT_FILE", "");
+        if (generated_path[0]) {
+            g_generated_text = fopen(generated_path, "w");
+            if (!g_generated_text) die("open TP_GENERATED_TEXT_FILE", errno);
+        }
     }
 
     /* ---- prompt + tokenize (every rank: deterministic, no comm) ---- */
@@ -1345,8 +1364,10 @@ int main(int argc, char **argv) {
         }
     }
     int prompt_repeat = (int)envl_opt("TP_PROMPT_REPEAT", 1);
-    if (prompt_repeat < 1 || prompt_repeat > 16)
-        die("TP_PROMPT_REPEAT must be in [1,16]", -1);
+    /* Long-context validation deliberately repeats a deterministic brief.
+     * Keep an upper bound for allocation safety, but allow 8k-token prompts. */
+    if (prompt_repeat < 1 || prompt_repeat > 64)
+        die("TP_PROMPT_REPEAT must be in [1,64]", -1);
     if (prompt_repeat > 1) {
         size_t one = strlen(prompt);
         if (one > (SIZE_MAX - (size_t)prompt_repeat) / (size_t)prompt_repeat)
@@ -1401,6 +1422,10 @@ int main(int argc, char **argv) {
     }
     int prompt_token_limit = (int)envl_opt("TP_PROMPT_TOKEN_LIMIT", 0);
     if (prompt_token_limit > 0 && P > prompt_token_limit) P = prompt_token_limit;
+    if (system_cache_tokens < 0 || system_cache_tokens > P)
+        die("TP_SYSTEM_CACHE_TOKENS must be in [0, prompt token count]", -1);
+    if ((system_cache_path[0] || system_cache_dir[0]) && system_cache_tokens == 0)
+        die("TP_SYSTEM_CACHE_PATH/DIR requires TP_SYSTEM_CACHE_TOKENS", -1);
 
     int cfg_max_seq = (int)envl("TP_MAXSEQ", 0);
     int need_seq = P + max_gen + 16;
@@ -1419,12 +1444,20 @@ int main(int argc, char **argv) {
     int n_layers = m->n_layers;
     int n_embd   = m->n_embd;
 
+    /* Optional reduced decode teams must still cover all four CMGs. */
+    m->pool_core_striped = envb_opt("TP_POOL_CORE_STRIPED", 0);
     if (llm_threads > 1) transformer_set_threads(m, llm_threads);
     /* Hybrid models (Qwen3.5/3.6) need Stage-B SSM V-head sharding to fit; pure
      * transformer 9B only has attn+FFN to shard. TP_NO_SSM_SHARD forces Stage A. */
     int ssm_shard = m->is_hybrid && !getenv("TP_NO_SSM_SHARD");
     if (transformer_tp_slice_weights(m, MyRank, N, ssm_shard) != 0)
         die("transformer_tp_slice_weights (check n_heads/n_kv/n_ff/ssm_dt % N)", -1);
+    /* P-odd is a prefill-only layout: ordinary decode matvec reads row-major
+     * weights, so never enable it for a run that will generate tokens. */
+    if (prefill_only && do_prefill_gemm && envb_opt("TP_PREFILL_PREPACK_PODD", 0)) {
+        transformer_prepack_podd(m);
+        if (MyRank == 0) logmsg("prefill: p-odd BF16 weights prepacked\n");
+    }
     const char *tp_stage_dir = envs_opt("TP_STAGE_DIR", "");
     if ((spec_k > 0 || envs_opt("TP_STAGE_DIR", "")[0]) && m->nextn.loaded &&
         transformer_tp_slice_nextn(m, MyRank, N) != 0)
@@ -1575,10 +1608,14 @@ int main(int argc, char **argv) {
            MyRank, m->n_heads, m->n_kv_heads, m->n_ff, m->tp_kv_head_count, m->tp_kv_head_base, region_sz / 1024.0);
 
     if (m->tp_attn_sharded && m->tp_kv_head_count > 0 && m->tp_kv_head_count < m->n_kv_heads) {
+        if (is_first) logmsg("tp startup: resize KV begin\n");
         transformer_resize_kv_for_tp(m, 0, n_layers, m->tp_kv_head_count * m->head_dim);
+        if (is_first) logmsg("tp startup: resize KV complete\n");
     }
 
+    if (is_first) logmsg("tp startup: barrier begin\n");
     barrier_robust(1);   /* robust startup bootstrap (all ranks registered + running) */
+    if (is_first) logmsg("tp startup: barrier complete\n");
 
     /* ---- init all-reduce comm + wire into the model ----
      * Region holds max_count floats. Decode reduces exactly n_embd, but BATCHED
@@ -1684,6 +1721,7 @@ int main(int argc, char **argv) {
         utofu_free_vcq(Vcq);
         free(ptoks); munmap(Region, region_map_sz);
         if (g_log) fclose(g_log);
+        if (g_generated_text) fclose(g_generated_text);
         if (g_curve) fclose(g_curve);
         if (g_tokdump) fclose(g_tokdump);
         return 0;
@@ -1792,6 +1830,7 @@ int main(int argc, char **argv) {
     int prefill_gemm_used = 0;
     int prefill_tokens = 0;
     int prefill_from = 0;
+    int system_cache_saved = 0;
 
     if (P <= 0) die("prompt token count must be positive", -1);
 
@@ -1845,32 +1884,58 @@ int main(int argc, char **argv) {
             in_tok = (P > 0) ? tp_next_token_synth(in_tok, 1, m->n_vocab) : in_tok;
         } else if (do_prefill_gemm) {
             double pf0 = now_sec();
-            float *pf_hidden = NULL;
-            if (spec_k && m->nextn.loaded) tf_batch_hidden_out = &pf_hidden;
-            float *lg = transformer_prefill_gemm(m, ptoks + prefill_from, prefill_tokens, prefill_from);
-            tf_batch_hidden_out = NULL;
+            /* A full 8k hybrid batch gives attention an impractically large
+             * working set on TP4.  Each call writes its KV and recurrent state
+             * at start_pos, so contiguous chunks are mathematically the same
+             * causal prefill as one call while bounding scratch and task size. */
+            int prefill_chunk = (int)envl_opt("TP_PREFILL_CHUNK", 0);
+            if (prefill_chunk < 1)
+                prefill_chunk = prefill_tokens > 1024 ? 512 : prefill_tokens;
+            if (prefill_chunk > prefill_tokens) prefill_chunk = prefill_tokens;
+            float *lg = NULL;
+            int pf_done = 0;
+            while (pf_done < prefill_tokens) {
+                int n = prefill_tokens - pf_done;
+                if (n > prefill_chunk) n = prefill_chunk;
+                int system_rel = system_cache_tokens - prefill_from;
+                if (!system_cache_saved && (system_cache_path[0] || system_cache_dir[0]) &&
+                    system_rel > pf_done && system_rel < pf_done + n)
+                    n = system_rel - pf_done;
+                lg = transformer_prefill_gemm(m, ptoks + prefill_from + pf_done,
+                                               n, prefill_from + pf_done);
+                if (!lg) break;
+                pf_done += n;
+                if (!system_cache_saved && (system_cache_path[0] || system_cache_dir[0]) &&
+                    prefill_from + pf_done == system_cache_tokens && have_cache_path) {
+                    double cache_ar = 0.0; long cache_calls = 0;
+                    int32_t cache_next = sample_argmax(m, lg, &c, &cache_ar, &cache_calls);
+                    if (tp_checkpoint_write(m, cache_path, system_cache_tokens,
+                                            cache_next, cache_shared) != 0)
+                        die("write TP system cache", errno ? errno : -1);
+                    system_cache_saved = 1;
+                    t_comm += cache_ar; ar_calls += cache_calls;
+                    if (is_first)
+                        logmsg("TP system cache saved: %s pos=%d\n",
+                               cache_path, system_cache_tokens);
+                }
+            }
             if (lg) {
                 double ar_step = 0.0; long ar_calls_step = 0;
                 in_tok = sample_argmax(m, lg, &c, &ar_step, &ar_calls_step);
                 t_prefill = now_sec() - pf0;
                 t_comm += ar_step; ar_calls += ar_calls_step;
                 prefill_gemm_used = 1;
-                if (spec_k && m->nextn.loaded && pf_hidden && prefill_from == 0) {
-                    float *th = (float *)alloca((size_t)n_embd * sizeof(float));
-                    for (int p = 0; p < P; p++) {
-                        const float *raw = pf_hidden + (size_t)p * n_embd;
-                        if (envb_opt("TP_MTP_RAW_HIDDEN", 0)) memcpy(th, raw, (size_t)n_embd*sizeof(float));
-                        else tf_rmsnorm(th, raw, &m->output_norm, n_embd,
-                                        m->rms_norm_eps, m->matvec_tmp);
-                        memcpy(mtp_seed_hidden, th, (size_t)n_embd * sizeof(float));
-                        if (p + 1 < P) {
-                            float *dlg = transformer_nextn_logits(m, ptoks[p + 1], th, p);
-                            if (p + 2 < P) {
-                                int32_t d = sample_argmax(m, dlg, &c, &ar_step, &ar_calls_step);
-                                mtp_teacher_match += d == ptoks[p + 2]; mtp_teacher_total++;
-                            }
-                        }
-                    }
+                if (spec_k && m->nextn.loaded && prefill_from == 0) {
+                    const float *raw = envb_opt("TP_MTP_RAW_HIDDEN", 0)
+                        ? transformer_nextn_target_hidden(m) : transformer_get_hidden(m);
+                    if (envb_opt("TP_MTP_RAW_HIDDEN", 0))
+                        memcpy(mtp_seed_hidden, raw, (size_t)n_embd * sizeof(float));
+                    else
+                        tf_rmsnorm(mtp_seed_hidden, raw, &m->output_norm, n_embd,
+                                   m->rms_norm_eps, m->matvec_tmp);
+                    /* Chunking intentionally omits prompt teacher statistics:
+                     * retaining every chunk's hidden rows would restore the
+                     * large working set this path avoids. */
                     int seed_drafts = mtp_batch
                         ? spec_k - 1 + mtp_bonus_probe : spec_k;
                     int prev = in_tok;
@@ -2392,8 +2457,11 @@ int main(int argc, char **argv) {
         } else {
             transformer_embed_token(m, in_tok);
             g_ar_secs = 0.0; g_ar_calls = 0;
+            tf_g4p_did_logits = 0;
+            tf_g4p_want_logits = fused_decode_head;
             transformer_forward_partial(m, p, 0, n_layers);
-            float *lg = transformer_compute_logits(m);
+            tf_g4p_want_logits = 0;
+            float *lg = tf_g4p_did_logits ? m->logits : transformer_compute_logits(m);
             nt = sample_argmax(m, lg, &c, &ar_step, &ar_calls_step);
             if (spec_k && m->nextn.loaded) {
                 int regenerate_drafts = 1;
@@ -2596,5 +2664,6 @@ done:
     if (g_log) fclose(g_log);
     if (g_curve) fclose(g_curve);
     if (g_tokdump) fclose(g_tokdump);
+    if (g_generated_text) fclose(g_generated_text);
     return 0;
 }

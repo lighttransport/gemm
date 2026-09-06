@@ -3460,6 +3460,31 @@ typedef struct {
     int seq_start, seq_end; /* score interval for phase 1 */
 } tf_attn_task;
 
+#if defined(__ARM_FEATURE_SVE)
+/* Independent output dimensions can be assigned to different workers without
+ * changing the sequence-order reduction of any individual component. */
+static void tf_attn_pv_slice_sve(float *out, const float *scores,
+                                 const float *values, int seq_len,
+                                 int kv_dim, int begin, int end) {
+    int vl = (int)svcntw();
+    for (int d = begin; d < end; d += 2 * vl) {
+        svbool_t p0 = svwhilelt_b32(d, end);
+        svbool_t p1 = svwhilelt_b32(d + vl, end);
+        svfloat32_t o0 = svdup_f32(0), o1 = svdup_f32(0);
+        for (int p = 0; p < seq_len; p++) {
+            const float *v = values + (size_t)p * kv_dim + d;
+            svfloat32_t a = svdup_f32(scores[p]);
+            o0 = svmla_m(p0, o0, a, svld1(p0, v));
+            if (d + vl < end)
+                o1 = svmla_m(p1, o1, a, svld1(p1, v + vl));
+        }
+        svst1(p0, out + d, o0);
+        if (d + vl < end) svst1(p1, out + d + vl, o1);
+    }
+}
+
+#endif
+
 static void *tf_attn_worker(void *arg) {
     tf_attn_task *t = (tf_attn_task *)arg;
     int hd = t->head_dim;
@@ -7180,10 +7205,13 @@ static inline void tf_hw_barrier_w0(void) {
  * original 48-way barrier for an A/B check. */
 static _Thread_local int tf_barrier_tid;
 static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int nt) {
-    static int use_hier = -1;
+    static _Thread_local int use_hier = -1;
+    static _Thread_local int busy_wait;
     if (use_hier < 0) {
         const char *e = getenv("TF_HIER_BARRIER");
         use_hier = e ? (atoi(e) != 0) : 1;
+        e = getenv("TF_BARRIER_BUSY_WAIT");
+        busy_wait = e && atoi(e) != 0;
     }
     if (use_hier && m->numa.enabled && m->numa.n_cmgs == 4 &&
         nt >= 4 && (nt % 4) == 0) {
@@ -7247,12 +7275,16 @@ static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int n
 #endif
     } else {
 #if defined(__aarch64__)
-        /* SEV/WFE spin: core sleeps until event, then rechecks.
-         * SEVL ensures first WFE doesn't stall if event pending. */
-        __asm__ __volatile__("sevl");
-        do {
-            __asm__ __volatile__("wfe");
-        } while (m->bar_sense != my_sense);
+        if (busy_wait) {
+            while (m->bar_sense != my_sense)
+                __asm__ __volatile__("yield" ::: "memory");
+        } else {
+            /* SEVL makes the first WFE return before rechecking the sense. */
+            __asm__ __volatile__("sevl");
+            do {
+                __asm__ __volatile__("wfe");
+            } while (m->bar_sense != my_sense);
+        }
 #else
         while (m->bar_sense != my_sense)
             tf_cpu_pause();
@@ -7743,6 +7775,19 @@ static int tf_thread_matvec_fused_q8_pair(float *dst1, const qtensor *mat1,
     return 0;
 }
 
+/* Consume precisely the groups produced by tf_thread_matvec's BF16-PV path.
+ * Keeping producer and consumer ownership identical avoids an FFN barrier. */
+static void tf_swiglu_pv_worker(float *dst, const float *gate, const float *up,
+                                int n_rows, int tid, int nt) {
+    int groups = n_rows / 8;
+    int begin = (groups * tid / nt) * 8;
+    int end = (groups * (tid + 1) / nt) * 8;
+    for (int i = begin; i < end; i++) {
+        float g = gate[i];
+        dst[i] = g / (1.0f + expf(-g)) * up[i];
+    }
+}
+
 static void *tf_persistent_worker(void *arg) {
     tf_persistent_ctx *ctx = (tf_persistent_ctx *)arg;
     transformer_model *m = ctx->m;
@@ -8038,12 +8083,19 @@ static void *tf_persistent_worker(void *arg) {
             {
                 int seq_len = position + 1;
                 float scale = 1.0f / sqrtf((float)head_dim);
-                static int seq_split = -1;
+                static _Thread_local int seq_split = -1;
+                static _Thread_local int seq_split_min = -1;
+                static _Thread_local int pv_split = -1;
                 if (seq_split < 0) {
                     const char *e = getenv("TF_ATTN_SEQ_SPLIT");
                     seq_split = e && atoi(e) != 0;
+                    e = getenv("TF_ATTN_SEQ_SPLIT_MIN");
+                    seq_split_min = e ? atoi(e) : 512;
+                    if (seq_split_min < 1) seq_split_min = 1;
+                    e = getenv("TF_ATTN_PV_SPLIT");
+                    pv_split = e && atoi(e) != 0;
                 }
-                int split = seq_split && seq_len >= 512 && n_heads < nt &&
+                int split = seq_split && seq_len >= seq_split_min && n_heads < nt &&
                             (nt % n_heads) == 0;
                 if (split) {
                     int lanes = nt / n_heads;
@@ -8057,6 +8109,21 @@ static void *tf_persistent_worker(void *arg) {
                         scale, m->tp_qhead_offset, 1, p0, p1};
                     tf_attn_worker(&scores);
                     tf_spin_barrier(m, &local_sense, nt);
+#if defined(__ARM_FEATURE_SVE)
+                    if (pv_split) {
+                        if (tid < n_heads)
+                            tf_softmax(m->att + tid * m->max_seq_len, seq_len);
+                        tf_spin_barrier(m, &local_sense, nt);
+                        int kv_h = (m->tp_qhead_offset + sh) / gqa_ratio;
+                        tf_attn_pv_slice_sve(m->xb2 + sh * head_dim,
+                            m->att + sh * m->max_seq_len,
+                            m->value_cache[l] + kv_h * head_dim, seq_len, kv_dim,
+                            head_dim * lane / lanes, head_dim * (lane + 1) / lanes);
+                        /* The head owner's following sigmoid gate consumes
+                         * dimensions produced by every lane, not just itself. */
+                        tf_spin_barrier(m, &local_sense, nt);
+                    } else
+#endif
                     if (tid < n_heads) {
                         memset(m->xb2 + tid * head_dim, 0,
                                (size_t)head_dim * sizeof(float));
@@ -8132,6 +8199,17 @@ static void *tf_persistent_worker(void *arg) {
                 int rp = n_ff / nt, re = n_ff % nt;
                 int rs = tid * rp + (tid < re ? tid : re);
                 int rc = rp + (tid < re ? 1 : 0);
+                /* PV producers partition eight-row groups, not individual
+                 * rows. Consume the same groups here: there is deliberately
+                 * no barrier between the projections and this activation. */
+#if defined(__ARM_FEATURE_SVE)
+                if (layer->ffn_gate.type == GGML_TYPE_BF16 && layer->ffn_gate.bf16_pv &&
+                    layer->ffn_up.type == GGML_TYPE_BF16 && layer->ffn_up.bf16_pv) {
+                    tf_swiglu_pv_worker(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2,
+                                         n_ff, tid, nt);
+                    rc = 0;
+                }
+#endif
                 for (int i = rs; i < rs + rc; i++) {
                     float g = m->ffn_buf1[i];
                     m->ffn_buf3[i] = g / (1.0f + expf(-g)) * m->ffn_buf2[i];
@@ -8200,9 +8278,17 @@ static void *tf_persistent_worker(void *arg) {
     if (tf_g4p_want_logits && m->has_lm_head) {
         double lm_t0 = (tid == 0 && tf_dprof > 0) ? tf_time_ms() : 0.0;
         tf_spin_barrier(m, &local_sense, nt);
-        tf_thread_matvec(m->logits, &m->output, m->x, m->n_vocab, tid, nt);
-        int start = tid * m->n_vocab / nt;
-        int end = (tid + 1) * m->n_vocab / nt;
+        int rows = m->output.n_rows; /* TP owns only its local vocabulary. */
+        tf_thread_matvec(m->logits, &m->output, m->x, rows, tid, nt);
+        int start = tid * rows / nt;
+        int end = (tid + 1) * rows / nt;
+        if (m->output.type == GGML_TYPE_BF16 && m->output.bf16_pv) {
+            start = (rows / 8 * tid / nt) * 8;
+            end = (rows / 8 * (tid + 1) / nt) * 8;
+        } else {
+            /* Non-PV kernels may partition rows differently from this scan. */
+            tf_spin_barrier(m, &local_sense, nt);
+        }
         int best = start;
         for (int i = start + 1; i < end; i++)
             if (m->logits[i] > m->logits[best]) best = i;

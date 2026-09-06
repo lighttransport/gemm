@@ -120,6 +120,15 @@ export TF_SSM_CONV_INLINE_COPY=${TF_SSM_CONV_INLINE_COPY:-1}
 # Prepare the six TP4-local Q heads concurrently after QKV projection. Each
 # worker retains the exact per-head norm/bias/RoPE order; K/V stay on thread 0.
 export TF_ATTN_PREP_HEADS=${TF_ATTN_PREP_HEADS:-1}
+# At TP4 each rank owns only six query heads.  From a moderate context onward,
+# split each head's independent QK positions over the otherwise idle workers;
+# the head owner still performs the softmax and PV reduction in sequence order.
+# This is an exact decode scheduling change and avoids leaving 42 cores idle.
+export TF_ATTN_SEQ_SPLIT=${TF_ATTN_SEQ_SPLIT:-1}
+# At shallow contexts the extra two barriers outweigh the unused-core benefit.
+# Retain the historical 512-token default in transformer.h for other runners,
+# but switch TP4 only once its six local heads become a real bottleneck.
+export TF_ATTN_SEQ_SPLIT_MIN=${TF_ATTN_SEQ_SPLIT_MIN:-4096}
 # The verifier's BF16 alpha/beta matrices have only 12 rows each. Compute both
 # under one OpenMP team while retaining the exact established SVE row reduction.
 export TF_SSM_AB_PAIR=${TF_SSM_AB_PAIR:-1}
@@ -160,7 +169,9 @@ case "$MODE" in
         exec mpiexec -np "$TP_SIZE" ./build/qwen38_tp_stage "$MODEL" "$STAGE"
         ;;
     stream|null|check|source-check|bench|mtp-check|mtp-sustained|prefill|handoff|profile)
-        make tp_runner CC=fcc OPENMP=1
+        if [ -z "${TP_RUNNER_BIN:-}" ]; then
+            make tp_runner CC=fcc OPENMP=1
+        fi
         make -C ../utofu-tests tofu_topo_helper >/dev/null
         mpiexec -np "$TP_SIZE" ../utofu-tests/tofu_topo_helper
         export TP_SYNTH_TOKEN_ID=1
@@ -221,7 +232,14 @@ case "$MODE" in
                 ;;
             prefill)
                 unset TF_NULL_GEMM
-                export TP_SYNTH_TOKENS=${TP_SYNTH_TOKENS:-128}
+                # The synthetic stream is useful for reproducible kernel
+                # sweeps.  Long-context quality jobs must instead prefill the
+                # actual tokenizer output while retaining this same runner.
+                if [ "${TP_PREFILL_REAL_PROMPT:-0}" != 0 ]; then
+                    unset TP_SYNTH_TOKENS
+                else
+                    export TP_SYNTH_TOKENS=${TP_SYNTH_TOKENS:-128}
+                fi
                 # Batched GEMM consumes row-major BF16; PV is decode-only.
                 export TP_STAGE_BF16_PV=0
                 export TP_PREFILL_GEMM=1 TP_PREFILL_ONLY=1 TP_MAXGEN=0 TP_DUMP_TOKENS=0
@@ -245,7 +263,7 @@ case "$MODE" in
         export TP_MAXSEQ=${TP_MAXSEQ:-128}
         rm -f tp_run_*.txt tp_load_rank*.txt tp_perf_rank*.txt tp_stderr_rank*.txt \
               tp_tokens_rank00.txt tp_null_stream_rank*.txt
-        exec mpiexec -np "$TP_SIZE" ./build/tp_runner "$MODEL"
+        exec mpiexec -np "$TP_SIZE" "${TP_RUNNER_BIN:-./build/tp_runner}" "$MODEL"
         ;;
     *) echo "usage: TP_SIZE={4|6|12} $0 {plan|stage|stage-mtp|stream|null|check|source-check|bench|mtp-check|mtp-sustained|prefill|handoff|profile}" >&2; exit 2 ;;
 esac
