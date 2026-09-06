@@ -13,19 +13,20 @@
 typedef struct {
     const gguf_shards *model;
     glm5next_config config;
-    float *streams, *recurrent, *conv, *hidden, *normed, *logits;
+    float *streams, *recurrent, *conv, *latent_kv, *hidden, *normed, *logits;
+    int max_seq_len;
     int position;
 } glm5next_cpu_runtime;
 
 static inline void glm5next_cpu_runtime_free(glm5next_cpu_runtime *r) {
     if (!r) return;
-    free(r->streams); free(r->recurrent); free(r->conv);
+    free(r->streams); free(r->recurrent); free(r->conv); free(r->latent_kv);
     free(r->hidden); free(r->normed); free(r->logits);
     glm5next_config_free(&r->config); memset(r, 0, sizeof(*r));
 }
 
 static inline int glm5next_cpu_runtime_init(glm5next_cpu_runtime *r,
-        const gguf_shards *model, char *error, size_t error_cap) {
+        const gguf_shards *model, int max_seq_len, char *error, size_t error_cap) {
     if (!r || !model) return -1;
     memset(r, 0, sizeof(*r));
     if (glm5next_config_load(model->metadata, &r->config, error, error_cap) != 0 ||
@@ -33,17 +34,20 @@ static inline int glm5next_cpu_runtime_init(glm5next_cpu_runtime *r,
         glm5next_cpu_runtime_free(r); return -1;
     }
     int h = r->config.hidden_size, hc = r->config.hc_count, d = r->config.linear_head_dim;
+    if (max_seq_len < 1 || max_seq_len > r->config.context_length) max_seq_len = 256;
     size_t rn = (size_t)r->config.n_layers * r->config.attention_heads * d * d;
     size_t cn = (size_t)r->config.n_layers * 3 * r->config.attention_heads * d *
                 (r->config.short_conv_kernel - 1);
     r->streams = (float *)malloc((size_t)hc * h * sizeof(float));
     r->recurrent = (float *)calloc(rn, sizeof(float));
     r->conv = (float *)calloc(cn, sizeof(float));
+    r->latent_kv = (float *)calloc((size_t)r->config.n_layers * max_seq_len *
+                                   r->config.kv_lora_rank, sizeof(float));
     r->hidden = (float *)malloc((size_t)h * sizeof(float));
     r->normed = (float *)malloc((size_t)h * sizeof(float));
     r->logits = (float *)malloc((size_t)r->config.vocab_size * sizeof(float));
-    r->model = model; r->position = 0;
-    if (!r->streams || !r->recurrent || !r->conv || !r->hidden || !r->normed || !r->logits) {
+    r->model = model; r->max_seq_len = max_seq_len; r->position = 0;
+    if (!r->streams || !r->recurrent || !r->conv || !r->latent_kv || !r->hidden || !r->normed || !r->logits) {
         glm5next_cpu_runtime_free(r); return -1;
     }
     return 0;
@@ -57,6 +61,8 @@ static inline void glm5next_cpu_runtime_reset(glm5next_cpu_runtime *r) {
                 (r->config.short_conv_kernel - 1);
     memset(r->streams, 0, (size_t)hc * h * sizeof(float));
     memset(r->recurrent, 0, rn * sizeof(float)); memset(r->conv, 0, cn * sizeof(float));
+    memset(r->latent_kv, 0, (size_t)r->config.n_layers * r->max_seq_len *
+           r->config.kv_lora_rank * sizeof(float));
     r->position = 0;
 }
 
@@ -81,7 +87,9 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
             ? (l < r->config.first_k_dense_replace
                 ? glm5next_cpu_kda_dense_block(r->model, l, &r->config, r->streams, rs, cs)
                 : glm5next_cpu_kda_moe_block(r->model, l, &r->config, r->streams, rs, cs))
-            : glm5next_cpu_dsa_moe_block(r->model, l, &r->config, r->streams);
+            : glm5next_cpu_dsa_moe_block_cached(r->model, l, &r->config, r->streams,
+                r->latent_kv + (size_t)l * r->max_seq_len * r->config.kv_lora_rank,
+                r->max_seq_len, position);
         if (rc != 0) return -1;
     }
     for (int i = 0; i < h; ++i) {

@@ -127,8 +127,9 @@ fail:
 /* One-token absorbed DSA attention.  With no prior KV cells this is already
  * the exact causal attention result (the sole score softmaxes to one); the
  * latent cache/indexer is added in the history-aware routine below. */
-static inline int glm5next_cpu_dsa_forward(const gguf_shards *model, int layer,
-        const glm5next_config *c, const float *hidden, float *out) {
+static inline int glm5next_cpu_dsa_forward_cached(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out,
+        float *latent_cache, int max_seq_len, int position) {
     char name[128]; glm5next_tensor_view t;
     int h = c->hidden_size, heads = c->attention_heads;
     int qrank = c->q_lora_rank, kv = c->kv_lora_rank;
@@ -139,7 +140,8 @@ static inline int glm5next_cpu_dsa_forward(const gguf_shards *model, int layer,
     float *value = (float *)malloc((size_t)heads * vdim * sizeof(float));
     float *tmp = (float *)malloc((size_t)h * sizeof(float));
     float *norm = (float *)malloc((size_t)((qrank > kv) ? qrank : kv) * sizeof(float));
-    if (!qr || !kv_latent || !q || !value || !tmp || !norm) goto fail;
+    if (!qr || !kv_latent || !q || !value || !tmp || !norm || position < 0 ||
+        (latent_cache && position >= max_seq_len)) goto fail;
 #define DSA_GET(s) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
     if (glm5next_tensor_view_get(model, name, 1, &t) != 0) goto fail; } while (0)
     DSA_GET("attn_q_a.weight"); if (glm5next_cpu_matvec(qr, &t, hidden) != 0) goto fail;
@@ -149,17 +151,36 @@ static inline int glm5next_cpu_dsa_forward(const gguf_shards *model, int layer,
     DSA_GET("attn_kv_a_mqa.weight"); if (glm5next_cpu_matvec(kv_latent, &t, hidden) != 0) goto fail;
     DSA_GET("attn_kv_a_norm.weight"); if (glm5next_cpu_vector(&t, norm, kv) != 0) goto fail;
     glm5next_cpu_rmsnorm(kv_latent, kv_latent, norm, kv, c->norm_epsilon);
+    if (latent_cache) memcpy(latent_cache + (size_t)position * kv, kv_latent,
+                             (size_t)kv * sizeof(float));
     for (int head = 0; head < heads; ++head) {
         float *qh = (float *)malloc((size_t)kv * sizeof(float));
-        if (!qh) goto fail;
+        float *scores = (float *)malloc((size_t)(position + 1) * sizeof(float));
+        if (!qh || !scores) { free(qh); free(scores); goto fail; }
         DSA_GET("attn_k_b.weight");
         if (glm5next_cpu_matvec_head(qh, &t, head, q + (size_t)head * qdim) != 0) { free(qh); goto fail; }
-        float score = 0.0f;
-        for (int i = 0; i < kv; ++i) score += qh[i] * kv_latent[i];
-        (void)score; /* one causal cell: softmax(score) = 1 */
         DSA_GET("attn_v_b.weight");
-        if (glm5next_cpu_matvec_head(value + (size_t)head * vdim, &t, head, kv_latent) != 0) { free(qh); goto fail; }
-        free(qh);
+        float *vh = value + (size_t)head * vdim;
+        memset(vh, 0, (size_t)vdim * sizeof(float));
+        float max_score = -INFINITY;
+        for (int p = 0; p <= position; ++p) {
+            const float *kp = latent_cache ? latent_cache + (size_t)p * kv : kv_latent;
+            double score = 0.0;
+            for (int i = 0; i < kv; ++i) score += (double)qh[i] * kp[i];
+            scores[p] = (float)(score / sqrtf((float)qdim));
+            if (scores[p] > max_score) max_score = scores[p];
+        }
+        double denom = 0.0;
+        for (int p = 0; p <= position; ++p) denom += exp((double)scores[p] - max_score);
+        for (int p = 0; p <= position; ++p) {
+            const float *kp = latent_cache ? latent_cache + (size_t)p * kv : kv_latent;
+            float *vv = (float *)malloc((size_t)vdim * sizeof(float));
+            if (!vv || glm5next_cpu_matvec_head(vv, &t, head, kp) != 0) { free(vv); free(scores); free(qh); goto fail; }
+            float w = (float)(exp((double)scores[p] - max_score) / denom);
+            for (int i = 0; i < vdim; ++i) vh[i] += w * vv[i];
+            free(vv);
+        }
+        free(scores); free(qh);
     }
     DSA_GET("attn_output.weight"); if (glm5next_cpu_matvec(tmp, &t, value) != 0) goto fail;
     memcpy(out, tmp, (size_t)h * sizeof(float));
@@ -167,6 +188,11 @@ static inline int glm5next_cpu_dsa_forward(const gguf_shards *model, int layer,
 fail:
     free(qr); free(kv_latent); free(q); free(value); free(tmp); free(norm); return -1;
 #undef DSA_GET
+}
+
+static inline int glm5next_cpu_dsa_forward(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out) {
+    return glm5next_cpu_dsa_forward_cached(model, layer, c, hidden, out, NULL, 1, 0);
 }
 
 static inline int glm5next_cpu_moe_ffn(const gguf_shards *model, int layer,
@@ -223,8 +249,9 @@ fail:
 #undef MOE_GET
 }
 
-static inline int glm5next_cpu_dsa_moe_block(const gguf_shards *model,
-        int layer, const glm5next_config *c, float *streams) {
+static inline int glm5next_cpu_dsa_moe_block_cached(const gguf_shards *model,
+        int layer, const glm5next_config *c, float *streams,
+        float *latent_cache, int max_seq_len, int position) {
     int h = c->hidden_size, hc = c->hc_count;
     char name[128]; glm5next_tensor_view fn, base, scale;
     float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
@@ -241,7 +268,8 @@ static inline int glm5next_cpu_dsa_moe_block(const gguf_shards *model,
     if (glm5next_cpu_mhc_pre(c, &fn, &base, &scale, residual, collapsed, post, comb) != 0) goto fail;
     BLOCK_VIEW("attn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
     glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
-    if (glm5next_cpu_dsa_forward(model, layer, c, collapsed, sublayer) != 0) goto fail;
+    if (glm5next_cpu_dsa_forward_cached(model, layer, c, collapsed, sublayer,
+                                         latent_cache, max_seq_len, position) != 0) goto fail;
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
     memcpy(residual, streams, (size_t)hc * h * sizeof(float));
     BLOCK_VIEW("hc_ffn_fn.weight", fn); BLOCK_VIEW("hc_ffn_base.weight", base); BLOCK_VIEW("hc_ffn_scale.weight", scale);
@@ -254,6 +282,11 @@ static inline int glm5next_cpu_dsa_moe_block(const gguf_shards *model,
 fail:
     free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return -1;
 #undef BLOCK_VIEW
+}
+
+static inline int glm5next_cpu_dsa_moe_block(const gguf_shards *model,
+        int layer, const glm5next_config *c, float *streams) {
+    return glm5next_cpu_dsa_moe_block_cached(model, layer, c, streams, NULL, 1, 0);
 }
 
 static inline int glm5next_cpu_kda_forward(const gguf_shards *model,

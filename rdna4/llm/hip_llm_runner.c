@@ -9484,7 +9484,7 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
         if (!hllm_active_shards) return -1;
         r->glm5next_cpu = (glm5next_cpu_runtime *)calloc(1, sizeof(*r->glm5next_cpu));
         if (!r->glm5next_cpu || glm5next_cpu_runtime_init(r->glm5next_cpu,
-                    hllm_active_shards, error, sizeof(error)) != 0) {
+                    hllm_active_shards, max_seq_len, error, sizeof(error)) != 0) {
             fprintf(stderr, "hip_llm: GLM5Next CPU runtime init failed: %s\n", error);
             free(r->glm5next_cpu); r->glm5next_cpu = NULL;
             return -1;
