@@ -49,6 +49,30 @@ class ProtocolTest(unittest.TestCase):
             "runner_exit_status": 1,
         })
 
+    def test_close_reaps_running_runner(self):
+        class FakeProc:
+            def __init__(self):
+                self.exit_status = None
+                self.terminated = False
+                self.wait_calls = 0
+
+            def poll(self):
+                return self.exit_status
+
+            def terminate(self):
+                self.terminated = True
+                self.exit_status = 0
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                return self.exit_status
+
+        backend = Backend.__new__(Backend)
+        backend.proc = FakeProc()
+        backend.close()
+        self.assertTrue(backend.proc.terminated)
+        self.assertEqual(backend.proc.wait_calls, 1)
+
     def test_queued_disconnect_cannot_cancel_active_request(self):
         replies = queue.Queue()
         submitted = threading.Event()

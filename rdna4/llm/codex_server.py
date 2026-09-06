@@ -157,6 +157,16 @@ class Backend:
             "runner_exit_status": exit_status,
         }
 
+    def close(self):
+        """Stop and reap the resident runner during server shutdown."""
+        if self.proc.poll() is None:
+            self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+
     def _wait_ready(self):
         """Wait until the resident runner has loaded the model."""
         while not self.ready:
@@ -531,7 +541,7 @@ def main():
     except KeyboardInterrupt: pass
     finally:
         server.server_close()
-        Handler.backend.proc.terminate()
+        Handler.backend.close()
 
 
 if __name__ == "__main__":
