@@ -7986,6 +7986,22 @@ typedef struct {
     int ready;
 } glm5next_dsa_gpu_cache;
 
+static void glm5next_hip_dsa_cache_free(glm5next_dsa_gpu_cache *cache) {
+    if (!cache) return;
+    if (cache->k_weight) hipFree(cache->k_weight);
+    if (cache->v_weight) hipFree(cache->v_weight);
+    if (cache->q_a_weight) hipFree(cache->q_a_weight);
+    if (cache->q_b_weight) hipFree(cache->q_b_weight);
+    if (cache->kv_a_weight) hipFree(cache->kv_a_weight);
+    if (cache->q_a_norm) hipFree(cache->q_a_norm);
+    if (cache->kv_a_norm) hipFree(cache->kv_a_norm);
+    if (cache->indexer_k_weight) hipFree(cache->indexer_k_weight);
+    if (cache->indexer_gate_weight) hipFree(cache->indexer_gate_weight);
+    if (cache->indexer_q_weight) hipFree(cache->indexer_q_weight);
+    if (cache->indexer_proj_weight) hipFree(cache->indexer_proj_weight);
+    memset(cache, 0, sizeof(*cache));
+}
+
 typedef struct {
     void *matrix[9];
     void *conv[3];
@@ -15015,7 +15031,14 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     if (layer < 0 || layer >= c->n_layers_all) return -1;
     memset(&local_cache, 0, sizeof(local_cache));
     cache = persistent_cache ? &r->glm5next_dsa_gpu[layer] : &local_cache;
-    if (!cache->ready && glm5next_hip_dsa_cache_load(r, model, layer, cache) != 0) return -1;
+    if (!cache->ready && glm5next_hip_dsa_cache_load(r, model, layer, cache) != 0) {
+        /* Cache loading can fail after only some projections were uploaded.
+         * Release those partial allocations before returning; this path is
+         * frequent in streaming mode and otherwise exhausts VRAM across
+         * successive prompt tokens. */
+        glm5next_hip_dsa_cache_free(cache);
+        return -1;
+    }
 #define CB_VIEW(dst, suffix) do { char n[128]; snprintf(n, sizeof(n), "blk.%d.%s", layer, suffix); \
     if (glm5next_tensor_view_get(model, n, 1, &(dst)) != 0) goto done; } while (0)
     qr = (float *)malloc((size_t)qrank*sizeof(float)); q = (float *)malloc((size_t)heads*qdim*sizeof(float));
@@ -15114,8 +15137,7 @@ done:
     free(qr); free(q); free(kvl); free(norm); free(qhead);
     free(selected);
     if (!persistent_cache) {
-        if (local_cache.k_weight) hipFree(local_cache.k_weight);
-        if (local_cache.v_weight) hipFree(local_cache.v_weight);
+        glm5next_hip_dsa_cache_free(&local_cache);
     }
     return rc;
 #undef CB_VIEW
@@ -18248,13 +18270,7 @@ void hip_llm_free(hip_llm_runner *r) {
 
     if (r->glm5next_dsa_gpu) {
         for (int l = 0; l < r->glm5next.n_layers_all; ++l) {
-            if (r->glm5next_dsa_gpu[l].k_weight) hipFree(r->glm5next_dsa_gpu[l].k_weight);
-            if (r->glm5next_dsa_gpu[l].v_weight) hipFree(r->glm5next_dsa_gpu[l].v_weight);
-            if (r->glm5next_dsa_gpu[l].q_a_weight) hipFree(r->glm5next_dsa_gpu[l].q_a_weight);
-            if (r->glm5next_dsa_gpu[l].q_b_weight) hipFree(r->glm5next_dsa_gpu[l].q_b_weight);
-            if (r->glm5next_dsa_gpu[l].kv_a_weight) hipFree(r->glm5next_dsa_gpu[l].kv_a_weight);
-            if (r->glm5next_dsa_gpu[l].q_a_norm) hipFree(r->glm5next_dsa_gpu[l].q_a_norm);
-            if (r->glm5next_dsa_gpu[l].kv_a_norm) hipFree(r->glm5next_dsa_gpu[l].kv_a_norm);
+            glm5next_hip_dsa_cache_free(&r->glm5next_dsa_gpu[l]);
         }
         free(r->glm5next_dsa_gpu);
         r->glm5next_dsa_gpu = NULL;
