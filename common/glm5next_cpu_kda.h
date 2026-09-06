@@ -431,6 +431,8 @@ static inline int glm5next_cpu_dsa_forward(const gguf_shards *model, int layer,
 
 typedef int (*glm5next_moe_callback)(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out, void *opaque);
+typedef int (*glm5next_dense_callback)(const gguf_shards *model, int layer,
+        const glm5next_config *config, const float *hidden, float *out, void *opaque);
 
 static inline int glm5next_cpu_moe_ffn_cb(const gguf_shards *model, int layer,
         const glm5next_config *c, const float *hidden, float *out,
@@ -506,6 +508,13 @@ static inline int glm5next_cpu_moe_ffn_cb(const gguf_shards *model, int layer,
 fail:
     free(router); free(bias); free(gate); free(up); free(expert_out); free(shared_gate); free(shared_up); free(shared_out); return -1;
 #undef MOE_GET
+}
+
+static inline int glm5next_cpu_dense_ffn_cb(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out,
+        glm5next_dense_callback callback, void *opaque) {
+    return callback ? callback(model, layer, c, hidden, out, opaque) :
+        glm5next_cpu_dense_ffn(model, layer, c, hidden, out);
 }
 
 static inline int glm5next_cpu_moe_ffn(const gguf_shards *model, int layer,
@@ -791,6 +800,7 @@ static inline int glm5next_cpu_kda_dense_block_cb(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
         float *recurrent, float *conv_state, glm5next_kda_callback callback,
         glm5next_moe_callback moe_callback, void *opaque, void *moe_opaque,
+        glm5next_dense_callback dense_callback, void *dense_opaque,
         glm5next_mhc_callback mhc_callback, void *mhc_opaque) {
     (void)moe_callback;
     (void)moe_opaque;
@@ -827,7 +837,8 @@ static inline int glm5next_cpu_kda_dense_block_cb(const gguf_shards *model,
     G5VIEW("ffn_norm.weight", 1, fn);
     if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
     glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
-    if (glm5next_cpu_dense_ffn(model, layer, c, collapsed, sublayer) != 0) goto fail;
+    if (glm5next_cpu_dense_ffn_cb(model, layer, c, collapsed, sublayer,
+                                  dense_callback, dense_opaque) != 0) goto fail;
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
     free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm);
     return 0;
@@ -841,7 +852,7 @@ static inline int glm5next_cpu_kda_dense_block(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
         float *recurrent, float *conv_state) {
     return glm5next_cpu_kda_dense_block_cb(model, layer, c, streams, recurrent,
-        conv_state, NULL, NULL, NULL, NULL, NULL, NULL);
+        conv_state, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
 #endif /* GLM5NEXT_CPU_KDA_H */

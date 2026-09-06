@@ -8126,6 +8126,16 @@ typedef struct {
     int ready;
 } glm5next_moe_router_cache;
 
+typedef struct {
+    void *gate;
+    void *up;
+    void *down;
+    int gate_type;
+    int up_type;
+    int down_type;
+    int ready;
+} glm5next_dense_gpu_cache;
+
 /* GLM5Next's routed experts are selected independently at every layer.  Keep
  * a bounded global set of complete (gate, up, down) expert matrices on the
  * device and evict the least-recently-used entry when the budget is full.
@@ -8587,6 +8597,7 @@ struct hip_llm_runner {
     glm5next_dsa_gpu_cache *glm5next_dsa_gpu;
     glm5next_kda_gpu_cache *glm5next_kda_gpu;
     glm5next_moe_router_cache *glm5next_moe_router;
+    glm5next_dense_gpu_cache *glm5next_dense_gpu;
     glm5next_moe_resident_slot *glm5next_moe_cache;
     int glm5next_moe_cache_slots;
     size_t glm5next_moe_cache_budget;
@@ -9467,6 +9478,25 @@ static int upload_weight_matrix(void **d_ptr, const qtensor *t, int *out_type) {
     }
 }
 
+/* Leading GLM5Next dense FFN matrices are Q5_K/Q6_K.  Their legacy
+ * warp-per-row kernels are not safe for the 12K-row decode shape, so keep a
+ * resident F16 copy for this small three-layer prefix. */
+static int upload_dequant_f16_matrix(void **d_ptr, const qtensor *t, int *out_type) {
+    int n = t->n_rows * t->n_cols;
+    float *f32 = n > 0 ? (float *)malloc((size_t)n * sizeof(float)) : NULL;
+    uint16_t *f16 = n > 0 ? (uint16_t *)malloc((size_t)n * sizeof(uint16_t)) : NULL;
+    if (!f32 || !f16 || dequant_row(t->type, t->data, f32, n) != 0) {
+        free(f32); free(f16); return -1;
+    }
+    for (int i = 0; i < n; ++i) f16[i] = hllm_f32_to_f16(f32[i]);
+    free(f32);
+    if (hipMalloc(d_ptr, (size_t)n * sizeof(uint16_t)) != hipSuccess ||
+        hipMemcpy(*d_ptr, f16, (size_t)n * sizeof(uint16_t), hipMemcpyHostToDevice) != hipSuccess) {
+        if (*d_ptr) hipFree(*d_ptr); *d_ptr = NULL; free(f16); return -1;
+    }
+    free(f16); *out_type = GGML_TYPE_F16; return 0;
+}
+
 static int upload_3d_kquant_raw(void **d_ptr, const qtensor *t, size_t *out_stride) {
     if (!t->data) { *d_ptr = NULL; return 0; }
     /* GGUF Q8_0 uses 34-byte blocks, while the HIP Q8 matvec kernels use
@@ -9883,6 +9913,104 @@ static int glm5next_hip_dsa_cache_load(hip_llm_runner *r, const gguf_shards *mod
     }
     cache->ready = 1;
     return 0;
+}
+
+static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
+                                      void *x, int n_rows, int n_cols, int weight_type);
+static inline void launch_silu_mul(hip_llm_runner *r, void *gate, void *up, int n);
+static inline void launch_swiglu_limit(hip_llm_runner *r, void *gate, void *up,
+                                       int n, float limit);
+static inline void launch_ffn_gate_up_silu_iq1_s(hip_llm_runner *r,
+                                                  void *dst, void *gate, void *up,
+                                                  void *x, int rows, int cols);
+static int upload_dequant_f16_matrix(void **dst, const qtensor *t, int *out_type);
+static inline void launch_dense_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
+                                             void *x, int n_rows, int n_cols, int type);
+
+static int glm5next_hip_dense_callback(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out, void *opaque) {
+    hip_llm_runner *r = (hip_llm_runner *)opaque;
+    glm5next_tensor_view gv, uv, dv;
+    void *dx = NULL, *dg = NULL, *du = NULL, *dd = NULL;
+    int gt = 0, ut = 0, dt = 0, own = 0, rc = -1;
+    glm5next_dense_gpu_cache *cache = NULL;
+    char name[128];
+    if (!r || !model || !c || !hidden || !out || layer < 0 ||
+        layer >= c->first_k_dense_replace) return -1;
+    cache = r->glm5next_dense_gpu ? &r->glm5next_dense_gpu[layer] : NULL;
+#define DENSE_VIEW(dst, suffix) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, suffix); \
+    if (glm5next_tensor_view_get(model, name, 1, &(dst)) != 0) goto done; } while (0)
+    if (cache && cache->ready) {
+        gt = cache->gate_type; ut = cache->up_type; dt = cache->down_type;
+    } else {
+        DENSE_VIEW(gv, "ffn_gate.weight"); DENSE_VIEW(uv, "ffn_up.weight");
+        DENSE_VIEW(dv, "ffn_down.weight");
+        if (getenv("GLM5NEXT_PROFILE"))
+            fprintf(stderr, "hip_llm: dense layer %d gate=%d[%llu,%llu] up=%d[%llu,%llu] down=%d[%llu,%llu]\n",
+                    layer, gv.type, (unsigned long long)gv.dims[0], (unsigned long long)gv.dims[1],
+                    uv.type, (unsigned long long)uv.dims[0], (unsigned long long)uv.dims[1],
+                    dv.type, (unsigned long long)dv.dims[0], (unsigned long long)dv.dims[1]);
+        if (cache) {
+            qtensor qg = glm5next_as_qtensor(&gv), qu = glm5next_as_qtensor(&uv),
+                    qd = glm5next_as_qtensor(&dv);
+            int eg = upload_weight_matrix(&cache->gate, &qg, &cache->gate_type);
+            int eu = upload_weight_matrix(&cache->up, &qu, &cache->up_type);
+            int ed = upload_weight_matrix(&cache->down, &qd, &cache->down_type);
+            if (eg != 0 || eu != 0 || ed != 0) {
+                if (cache->gate) hipFree(cache->gate); if (cache->up) hipFree(cache->up);
+                if (cache->down) hipFree(cache->down); memset(cache, 0, sizeof(*cache));
+                cache = NULL;
+            } else {
+                cache->ready = 1;
+            }
+        }
+        if (cache) {
+            gt = cache->gate_type; ut = cache->up_type; dt = cache->down_type;
+        } else {
+            qtensor qg = glm5next_as_qtensor(&gv), qu = glm5next_as_qtensor(&uv),
+                    qd = glm5next_as_qtensor(&dv);
+            if (upload_weight_matrix(&dx, &qg, &gt) != 0 ||
+                upload_weight_matrix(&dg, &qu, &ut) != 0 ||
+                upload_weight_matrix(&dd, &qd, &dt) != 0) goto done;
+            own = 1;
+        }
+    }
+    if (cache) {
+        dx = cache->gate; dg = cache->up; dd = cache->down;
+    }
+    if (hipMalloc(&du, (size_t)c->dense_feed_forward_length * sizeof(float)) != hipSuccess) goto done;
+    {
+        void *dinput = NULL, *doutput = NULL;
+        if (hipMalloc(&dinput, (size_t)c->hidden_size * sizeof(float)) != hipSuccess ||
+            hipMalloc(&doutput, (size_t)c->hidden_size * sizeof(float)) != hipSuccess ||
+            hipMemcpy(dinput, hidden, (size_t)c->hidden_size * sizeof(float), hipMemcpyHostToDevice) != hipSuccess) {
+            if (dinput) hipFree(dinput); if (doutput) hipFree(doutput); goto done;
+        }
+        if (gt == GGML_TYPE_IQ1_S && ut == GGML_TYPE_IQ1_S &&
+            (!c->swiglu_clamp_shexp || c->swiglu_clamp_shexp[layer] <= 1e-6f))
+            launch_ffn_gate_up_silu_iq1_s(r, du, dx, dg, dinput,
+                                          c->dense_feed_forward_length, c->hidden_size);
+        else {
+            launch_dense_matvec_auto(r, du, dx, dinput, c->dense_feed_forward_length, c->hidden_size, gt);
+            launch_dense_matvec_auto(r, doutput, dg, dinput, c->dense_feed_forward_length, c->hidden_size, ut);
+            launch_swiglu_limit(r, du, doutput, c->dense_feed_forward_length,
+                                c->swiglu_clamp_shexp ? c->swiglu_clamp_shexp[layer] : 0.0f);
+            launch_silu_mul(r, du, doutput, c->dense_feed_forward_length);
+        }
+        launch_dense_matvec_auto(r, doutput, dd, du, c->hidden_size,
+                                 c->dense_feed_forward_length, dt);
+        if (hipStreamSynchronize(r->stream) != hipSuccess ||
+            hipMemcpy(out, doutput, (size_t)c->hidden_size * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) {
+            hipFree(dinput); hipFree(doutput); goto done;
+        }
+        hipFree(dinput); hipFree(doutput);
+    }
+    rc = 0;
+done:
+    if (own) { if (dx) hipFree(dx); if (dg) hipFree(dg); if (dd) hipFree(dd); }
+    if (du) hipFree(du);
+    return rc;
+#undef DENSE_VIEW
 }
 
 static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
@@ -10326,6 +10454,10 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
         }
         if (getenv("GLM5NEXT_HIP_KDA") && atoi(getenv("GLM5NEXT_HIP_KDA")) != 0) {
             const char *kda_cache = getenv("GLM5NEXT_HIP_KDA_CACHE");
+            if (getenv("GLM5NEXT_HIP_DENSE") && atoi(getenv("GLM5NEXT_HIP_DENSE")) != 0 &&
+                (!getenv("GLM5NEXT_HIP_DENSE_CACHE") || atoi(getenv("GLM5NEXT_HIP_DENSE_CACHE")) != 0))
+                r->glm5next_dense_gpu = (glm5next_dense_gpu_cache *)calloc(
+                    (size_t)r->glm5next.first_k_dense_replace, sizeof(*r->glm5next_dense_gpu));
             if (kda_cache && atoi(kda_cache) != 0) {
                 r->glm5next_kda_gpu = (glm5next_kda_gpu_cache *)calloc(
                     (size_t)r->glm5next.n_layers_all, sizeof(*r->glm5next_kda_gpu));
@@ -10336,6 +10468,9 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
             }
             glm5next_cpu_runtime_set_kda_callback(r->glm5next_cpu,
                 glm5next_hip_kda_callback, r);
+            if (getenv("GLM5NEXT_HIP_DENSE") && atoi(getenv("GLM5NEXT_HIP_DENSE")) != 0)
+                glm5next_cpu_runtime_set_dense_callback(r->glm5next_cpu,
+                    glm5next_hip_dense_callback, r);
             fprintf(stderr, "hip_llm: GLM5Next HIP KDA callback enabled (%s cache)\n",
                     r->glm5next_kda_gpu ? "persistent per-layer" : "streaming");
         }
@@ -12749,6 +12884,17 @@ static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
         case GGML_TYPE_TQ1_0:   launch_matvec_tq1_0(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_TQ2_0:   launch_matvec_tq2_0(r, dst, mat, x, n_rows, n_cols); break;
         default:             launch_matvec(r, dst, mat, x, n_rows, n_cols); break;
+    }
+}
+
+static inline void launch_dense_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
+                                             void *x, int n_rows, int n_cols, int type) {
+    if (type == GGML_TYPE_Q5_K) {
+        void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_q5_K_f32, n_rows, 1, 1, 256, 1, 1, 0,
+               r->stream, args);
+    } else {
+        launch_matvec_auto(r, dst, mat, x, n_rows, n_cols, type);
     }
 }
 
@@ -18724,6 +18870,15 @@ void hip_llm_free(hip_llm_runner *r) {
         }
         free(r->glm5next_kda_gpu);
         r->glm5next_kda_gpu = NULL;
+    }
+    if (r->glm5next_dense_gpu) {
+        for (int l = 0; l < r->glm5next.first_k_dense_replace; ++l) {
+            if (r->glm5next_dense_gpu[l].gate) hipFree(r->glm5next_dense_gpu[l].gate);
+            if (r->glm5next_dense_gpu[l].up) hipFree(r->glm5next_dense_gpu[l].up);
+            if (r->glm5next_dense_gpu[l].down) hipFree(r->glm5next_dense_gpu[l].down);
+        }
+        free(r->glm5next_dense_gpu);
+        r->glm5next_dense_gpu = NULL;
     }
     if (r->glm5next_output_gpu) {
         hipFree(r->glm5next_output_gpu);

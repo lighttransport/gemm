@@ -29,6 +29,8 @@ typedef struct {
     void *kda_callback_opaque;
     glm5next_moe_callback moe_callback;
     void *moe_callback_opaque;
+    glm5next_dense_callback dense_callback;
+    void *dense_callback_opaque;
     glm5next_mhc_callback mhc_callback;
     void *mhc_callback_opaque;
     glm5next_output_callback output_callback;
@@ -60,6 +62,13 @@ static inline void glm5next_cpu_runtime_set_moe_callback(glm5next_cpu_runtime *r
     if (!r) return;
     r->moe_callback = callback;
     r->moe_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_dense_callback(glm5next_cpu_runtime *r,
+        glm5next_dense_callback callback, void *opaque) {
+    if (!r) return;
+    r->dense_callback = callback;
+    r->dense_callback_opaque = opaque;
 }
 
 static inline void glm5next_cpu_runtime_set_mhc_callback(glm5next_cpu_runtime *r,
@@ -194,7 +203,8 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
             rc = l < r->config.first_k_dense_replace
                 ? glm5next_cpu_kda_dense_block_cb(r->model, l, &r->config, r->streams, rs, cs,
                     r->kda_callback, r->moe_callback, r->kda_callback_opaque,
-                    r->moe_callback_opaque, r->mhc_callback, r->mhc_callback_opaque)
+                    r->moe_callback_opaque, r->dense_callback,
+                    r->dense_callback_opaque, r->mhc_callback, r->mhc_callback_opaque)
                 : glm5next_cpu_kda_moe_block_cb(r->model, l, &r->config, r->streams, rs, cs,
                     r->kda_callback, r->moe_callback, r->kda_callback_opaque,
                     r->moe_callback_opaque, r->mhc_callback, r->mhc_callback_opaque);
