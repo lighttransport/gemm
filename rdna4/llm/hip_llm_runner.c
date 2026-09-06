@@ -9568,6 +9568,9 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
 static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         float *recurrent, float *conv_state, void *opaque);
+static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
+        const glm5next_config *config, const float *hidden, float *out,
+        void *opaque);
 static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
     if (!r || !gguf) return -1;
 
@@ -9658,6 +9661,12 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                 glm5next_hip_kda_callback, r);
             fprintf(stderr, "hip_llm: GLM5Next HIP KDA callback enabled "
                             "(select layer with GLM5NEXT_HIP_KDA_LAYER)\n");
+        }
+        if (getenv("GLM5NEXT_HIP_MOE") && atoi(getenv("GLM5NEXT_HIP_MOE")) != 0) {
+            glm5next_cpu_runtime_set_moe_callback(r->glm5next_cpu,
+                glm5next_hip_moe_callback, r);
+            fprintf(stderr, "hip_llm: GLM5Next HIP MoE callback enabled "
+                            "(streams selected experts per token)\n");
         }
         r->has_lm_head = 1;
         r->weights_loaded = 1;
@@ -14705,6 +14714,162 @@ done:
     return rc;
 #undef KCB_ALLOC
 #undef KCB_VIEW
+}
+
+/* Correctness-first GLM5Next MoE path.  The CPU runtime performs the mHC
+ * plumbing and calls this once per token.  Keep the router and accumulation
+ * in F32 on the host, while each selected expert's quantized gate/up/down
+ * matrices are streamed through the normal HIP matvec kernels.  This avoids
+ * retaining 45 * 288 experts on a 16 GiB card and gives us a direct bridge to
+ * the eventual resident/cache implementation. */
+static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out, void *opaque) {
+    hip_llm_runner *r = (hip_llm_runner *)opaque;
+    glm5next_tensor_view router_v, bias_v, gate_v, up_v, down_v;
+    glm5next_tensor_view shared_gate_v, shared_up_v, shared_down_v;
+    void *dx = NULL, *dg = NULL, *du = NULL, *do_ = NULL;
+    void *dsg = NULL, *dsu = NULL, *dso = NULL;
+    float *router = NULL, *bias = NULL, *gate = NULL, *up = NULL;
+    float *expert_out = NULL, *shared_gate = NULL, *shared_up = NULL;
+    float *shared_out = NULL;
+    int ids[64], slots = c ? c->expert_used_count : 0;
+    float weights[64];
+    int rc = -1;
+    char name[128];
+    if (!r || !model || !c || !hidden || !out || layer < 0 ||
+        layer >= c->n_layers || slots <= 0 || slots > 64) return -1;
+    {
+        const char *select = getenv("GLM5NEXT_HIP_MOE_LAYER");
+        if (select && atoi(select) != layer)
+            return glm5next_cpu_moe_ffn(model, layer, c, hidden, out);
+    }
+
+#define G5MOE_VIEW(dst, suffix, required) do { \
+        snprintf(name, sizeof(name), "blk.%d.%s", layer, (suffix)); \
+        if (glm5next_tensor_view_get(model, name, (required), &(dst)) != 0) goto done; \
+    } while (0)
+#define G5MOE_ALLOC(ptr, count) do { \
+        if (hipMalloc(&(ptr), (size_t)(count) * sizeof(float)) != hipSuccess) goto done; \
+    } while (0)
+
+    G5MOE_VIEW(router_v, "ffn_gate_inp.weight", 1);
+    G5MOE_VIEW(bias_v, "exp_probs_b.bias", 1);
+    G5MOE_VIEW(gate_v, "ffn_gate_exps.weight", 1);
+    G5MOE_VIEW(up_v, "ffn_up_exps.weight", 1);
+    G5MOE_VIEW(down_v, "ffn_down_exps.weight", 1);
+    G5MOE_VIEW(shared_gate_v, "ffn_gate_shexp.weight", 1);
+    G5MOE_VIEW(shared_up_v, "ffn_up_shexp.weight", 1);
+    G5MOE_VIEW(shared_down_v, "ffn_down_shexp.weight", 1);
+    if (router_v.n_dims != 2 || bias_v.n_dims != 1 || gate_v.n_dims != 3 ||
+        up_v.n_dims != 3 || down_v.n_dims != 3 || shared_gate_v.n_dims != 2 ||
+        shared_up_v.n_dims != 2 || shared_down_v.n_dims != 2 ||
+        gate_v.dims[2] != (uint64_t)c->expert_count ||
+        up_v.dims[2] != (uint64_t)c->expert_count ||
+        down_v.dims[2] != (uint64_t)c->expert_count) goto done;
+
+    router = (float *)malloc((size_t)c->expert_count * sizeof(float));
+    bias = (float *)malloc((size_t)c->expert_count * sizeof(float));
+    gate = (float *)malloc((size_t)c->expert_ff_length * sizeof(float));
+    up = (float *)malloc((size_t)c->expert_ff_length * sizeof(float));
+    expert_out = (float *)malloc((size_t)c->hidden_size * sizeof(float));
+    shared_gate = (float *)malloc((size_t)c->shared_expert_ff_length * sizeof(float));
+    shared_up = (float *)malloc((size_t)c->shared_expert_ff_length * sizeof(float));
+    shared_out = (float *)malloc((size_t)c->hidden_size * sizeof(float));
+    if (!router || !bias || !gate || !up || !expert_out || !shared_gate ||
+        !shared_up || !shared_out) goto done;
+    if (glm5next_cpu_matvec(router, &router_v, hidden) != 0 ||
+        glm5next_cpu_vector(&bias_v, bias, c->expert_count) != 0) goto done;
+
+    for (int j = 0; j < slots; ++j) { ids[j] = -1; weights[j] = -INFINITY; }
+    for (int e = 0; e < c->expert_count; ++e) {
+        float score = 1.0f / (1.0f + expf(-router[e])) + bias[e];
+        int j = slots - 1;
+        if (score <= weights[j]) continue;
+        while (j > 0 && score > weights[j - 1]) {
+            weights[j] = weights[j - 1]; ids[j] = ids[j - 1]; --j;
+        }
+        weights[j] = score; ids[j] = e;
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < slots; ++j) {
+        float w = 1.0f / (1.0f + expf(-router[ids[j]]));
+        weights[j] = w; sum += w;
+    }
+    memset(out, 0, (size_t)c->hidden_size * sizeof(float));
+    G5MOE_ALLOC(dx, c->hidden_size);
+    G5MOE_ALLOC(dg, c->expert_ff_length);
+    G5MOE_ALLOC(du, c->expert_ff_length);
+    G5MOE_ALLOC(do_, c->hidden_size);
+    if (hipMemcpy(dx, hidden, (size_t)c->hidden_size * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess) goto done;
+
+    size_t gu_stride = dequant_row_size(gate_v.type, (int)gate_v.dims[0]) *
+                       (size_t)gate_v.dims[1];
+    size_t dn_stride = dequant_row_size(down_v.type, (int)down_v.dims[0]) *
+                       (size_t)down_v.dims[1];
+    for (int j = 0; j < slots; ++j) {
+        qtensor gw = glm5next_as_qtensor(&gate_v);
+        qtensor uw = glm5next_as_qtensor(&up_v);
+        qtensor dw = glm5next_as_qtensor(&down_v);
+        void *dgw = NULL, *duw = NULL, *ddw = NULL;
+        int gtype = 0, utype = 0, dtype = 0;
+        size_t e = (size_t)ids[j];
+        gw.n_dims = uw.n_dims = dw.n_dims = 2;
+        gw.data = (const unsigned char *)gate_v.data + e * gu_stride;
+        uw.data = (const unsigned char *)up_v.data + e * gu_stride;
+        dw.data = (const unsigned char *)down_v.data + e * dn_stride;
+        if (upload_weight_matrix(&dgw, &gw, &gtype) != 0 ||
+            upload_weight_matrix(&duw, &uw, &utype) != 0 ||
+            upload_weight_matrix(&ddw, &dw, &dtype) != 0) {
+            if (dgw) hipFree(dgw); if (duw) hipFree(duw); if (ddw) hipFree(ddw);
+            goto done;
+        }
+        launch_matvec_auto(r, dg, dgw, dx, c->expert_ff_length,
+                           c->hidden_size, gtype);
+        launch_matvec_auto(r, du, duw, dx, c->expert_ff_length,
+                           c->hidden_size, utype);
+        launch_silu_mul(r, dg, du, c->expert_ff_length);
+        launch_matvec_auto(r, do_, ddw, dg, c->hidden_size,
+                           c->expert_ff_length, dtype);
+        if (hipStreamSynchronize(r->stream) != hipSuccess ||
+            hipMemcpy(expert_out, do_, (size_t)c->hidden_size * sizeof(float),
+                      hipMemcpyDeviceToHost) != hipSuccess) {
+            hipFree(dgw); hipFree(duw); hipFree(ddw); goto done;
+        }
+        float w = c->routed_scaling_factor * weights[j] /
+                  (sum > 0.0f ? sum : 1.0f);
+        for (int i = 0; i < c->hidden_size; ++i) out[i] += w * expert_out[i];
+        hipFree(dgw); hipFree(duw); hipFree(ddw);
+    }
+
+    { qtensor sg = glm5next_as_qtensor(&shared_gate_v);
+      qtensor su = glm5next_as_qtensor(&shared_up_v);
+      qtensor sd = glm5next_as_qtensor(&shared_down_v);
+      int stg = 0, stu = 0, std = 0;
+      if (upload_weight_matrix(&dsg, &sg, &stg) != 0 ||
+          upload_weight_matrix(&dsu, &su, &stu) != 0 ||
+          upload_weight_matrix(&dso, &sd, &std) != 0) goto done;
+      launch_matvec_auto(r, dg, dsg, dx, c->shared_expert_ff_length,
+                         c->hidden_size, stg);
+      launch_matvec_auto(r, du, dsu, dx, c->shared_expert_ff_length,
+                         c->hidden_size, stu);
+      launch_silu_mul(r, dg, du, c->shared_expert_ff_length);
+      launch_matvec_auto(r, do_, dso, dg, c->hidden_size,
+                         c->shared_expert_ff_length, std);
+      if (hipStreamSynchronize(r->stream) != hipSuccess ||
+          hipMemcpy(shared_out, do_, (size_t)c->hidden_size * sizeof(float),
+                    hipMemcpyDeviceToHost) != hipSuccess) goto done;
+      for (int i = 0; i < c->hidden_size; ++i) out[i] += shared_out[i];
+    }
+    rc = 0;
+done:
+    if (dsg) hipFree(dsg); if (dsu) hipFree(dsu); if (dso) hipFree(dso);
+    if (dx) hipFree(dx); if (dg) hipFree(dg); if (du) hipFree(du); if (do_) hipFree(do_);
+    free(router); free(bias); free(gate); free(up); free(expert_out);
+    free(shared_gate); free(shared_up); free(shared_out);
+    return rc;
+#undef G5MOE_ALLOC
+#undef G5MOE_VIEW
 }
 
 /* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch
