@@ -7,6 +7,7 @@ limits, while the child keeps the model and KV/SSM state resident.
 """
 import argparse
 import base64
+import io
 import json
 import math
 import os
@@ -165,7 +166,17 @@ class Backend:
         self.active_cancel = None
         self.ready = False
         self.model = args.model.rsplit("/", 1)[-1]
-        self._wait_ready()
+        try:
+            ready_timeout = float(os.environ.get("QWEN38_READY_TIMEOUT", "300"))
+            if not math.isfinite(ready_timeout) or ready_timeout <= 0:
+                raise ValueError
+            self._wait_ready(ready_timeout)
+        except Exception:
+            # A failed startup must not leave a model-sized child process
+            # behind, especially when readiness times out or the port setup
+            # fails immediately afterwards.
+            self.close()
+            raise
 
     def health(self):
         """Return readiness state without sending a request to the runner."""
@@ -186,9 +197,22 @@ class Backend:
             self.proc.kill()
             self.proc.wait()
 
-    def _wait_ready(self):
+    def _wait_ready(self, timeout=None):
         """Wait until the resident runner has loaded the model."""
+        deadline = time.monotonic() + timeout if timeout is not None else None
         while not self.ready:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("runner did not become ready before timeout")
+                try:
+                    fd = self.proc.stdout.fileno()
+                    if not select.select([fd], [], [], remaining)[0]:
+                        raise RuntimeError("runner did not become ready before timeout")
+                except (AttributeError, io.UnsupportedOperation, ValueError):
+                    # In-memory streams used by the protocol tests do not
+                    # expose a selectable file descriptor.
+                    pass
             raw = self.proc.stdout.readline()
             if not raw:
                 status = self.proc.poll()
