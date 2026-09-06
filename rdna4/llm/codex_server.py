@@ -148,6 +148,15 @@ class Backend:
         self.model = args.model.rsplit("/", 1)[-1]
         self._wait_ready()
 
+    def health(self):
+        """Return readiness state without sending a request to the runner."""
+        exit_status = self.proc.poll()
+        return {
+            "status": "ready" if self.ready and exit_status is None else "unavailable",
+            "runner_alive": exit_status is None,
+            "runner_exit_status": exit_status,
+        }
+
     def _wait_ready(self):
         """Wait until the resident runner has loaded the model."""
         while not self.ready:
@@ -256,7 +265,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if path in ("/health", "/v1/health"):
-            self.send_json(200, {"status": "ok"})
+            health = self.backend.health()
+            self.send_json(200 if health["status"] == "ready" else 503, health)
         elif path in ("/v1/models", "/models"):
             now = int(time.time())
             self.send_json(200, {"object": "list", "data": [{"id": self.model, "object": "model", "created": now, "owned_by": "local"}]})

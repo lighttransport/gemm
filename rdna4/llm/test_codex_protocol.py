@@ -39,6 +39,16 @@ class ProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "runner exited before READY"):
             backend._wait_ready()
 
+    def test_health_reports_dead_runner(self):
+        backend = Backend.__new__(Backend)
+        backend.ready = True
+        backend.proc = SimpleNamespace(poll=lambda: 1)
+        self.assertEqual(backend.health(), {
+            "status": "unavailable",
+            "runner_alive": False,
+            "runner_exit_status": 1,
+        })
+
     def test_queued_disconnect_cannot_cancel_active_request(self):
         replies = queue.Queue()
         submitted = threading.Event()
