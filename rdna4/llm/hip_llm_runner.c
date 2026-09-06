@@ -9767,7 +9767,11 @@ static int glm5next_hip_dsa_cache_load(hip_llm_runner *r, const gguf_shards *mod
         const char *proj = getenv("GLM5NEXT_HIP_DSA_PROJ");
         const char *layer_env = getenv("GLM5NEXT_HIP_DSA_PROJ_LAYER");
         int proj_layer = layer_env ? atoi(layer_env) : -1;
-        if (proj && atoi(proj) != 0 && (proj_layer < 0 || proj_layer == layer)) {
+        /* A persistent DSA cache should be fully device-resident by default;
+         * retain the environment variable as an opt-out/experimental layer
+         * selector for cards with tighter VRAM. */
+        int use_proj = proj ? atoi(proj) != 0 : r->glm5next_dsa_gpu != NULL;
+        if (use_proj && (proj_layer < 0 || proj_layer == layer)) {
         snprintf(n, sizeof(n), "blk.%d.attn_q_a.weight", layer);
         if (glm5next_tensor_view_get(model, n, 1, &tqa) != 0) return -1;
         snprintf(n, sizeof(n), "blk.%d.attn_q_b.weight", layer);
@@ -9797,8 +9801,11 @@ static int glm5next_hip_dsa_cache_load(hip_llm_runner *r, const gguf_shards *mod
         cache->q_ready = 1;
         }
     }
-    if (getenv("GLM5NEXT_HIP_INDEXER_CACHE") &&
-        atoi(getenv("GLM5NEXT_HIP_INDEXER_CACHE")) != 0) {
+    {
+        const char *indexer_cache = getenv("GLM5NEXT_HIP_INDEXER_CACHE");
+        int use_indexer_cache = indexer_cache ? atoi(indexer_cache) != 0 :
+                                 r->glm5next_dsa_gpu != NULL;
+    if (use_indexer_cache) {
         qtensor qik, qig, qiq, qiw;
         snprintf(n, sizeof(n), "blk.%d.indexer.attn_k.weight", layer);
         if (glm5next_tensor_view_get(model, n, 1, &tik) != 0) return -1;
@@ -9823,6 +9830,7 @@ static int glm5next_hip_dsa_cache_load(hip_llm_runner *r, const gguf_shards *mod
             return -1;
         }
         cache->indexer_ready = 1;
+    }
     }
     cache->ready = 1;
     return 0;
