@@ -26,6 +26,20 @@ if [[ ! -r "${model}" ]]; then
     exit 1
 fi
 
+# Fail early with an actionable message when this is launched from a container
+# or session that was not given the AMD device nodes. HIP otherwise reports a
+# terse initialization error after loading the model and wasting startup time.
+if [[ ! -e /dev/kfd ]]; then
+    echo "q38fn ROCm device unavailable: /dev/kfd is missing" >&2
+    echo "Expose the AMD KFD device (and grant the user video/render access) before starting the server." >&2
+    exit 1
+fi
+if ! compgen -G '/dev/dri/renderD*' > /dev/null; then
+    echo "q38fn ROCm device unavailable: no /dev/dri/renderD* node is visible" >&2
+    echo "Expose an AMD render node before starting the server." >&2
+    exit 1
+fi
+
 # LFU replacement currently races grouped Qwen prefill on gfx1201.
 # Grouped Qwen expert execution is enabled for Codex: it is needed to sustain
 # 100+ tok/s prefill. Disable the copy pipeline on gfx1201 because its mutable

@@ -8823,7 +8823,16 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
 
     hipError_t err = hipInit(0);
     if (err != hipSuccess) {
-        fprintf(stderr, "hip_llm: hipInit failed\n");
+        const char *name = "unknown";
+        const char *text = "unknown";
+        if (hipGetErrorName) hipGetErrorName(err, &name);
+        if (hipGetErrorString) hipGetErrorString(err, &text);
+        fprintf(stderr, "hip_llm: hipInit failed: %s (%s, %d)\n",
+                text ? text : "unknown", name ? name : "unknown", err);
+        if (err == hipErrorNoDevice || err == hipErrorOperatingSystem) {
+            fprintf(stderr, "hip_llm: no usable AMD GPU runtime is visible; "
+                    "check /dev/kfd, /dev/dri/renderD*, and ROCm permissions\n");
+        }
         return NULL;
     }
 
