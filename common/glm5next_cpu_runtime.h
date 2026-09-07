@@ -30,6 +30,8 @@ typedef struct {
     void *kda_callback_opaque;
     glm5next_moe_callback moe_callback;
     void *moe_callback_opaque;
+    glm5next_moe_batch_callback moe_batch_callback;
+    void *moe_batch_callback_opaque;
     glm5next_dense_callback dense_callback;
     void *dense_callback_opaque;
     glm5next_mhc_callback mhc_callback;
@@ -63,6 +65,13 @@ static inline void glm5next_cpu_runtime_set_moe_callback(glm5next_cpu_runtime *r
     if (!r) return;
     r->moe_callback = callback;
     r->moe_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_moe_batch_callback(glm5next_cpu_runtime *r,
+        glm5next_moe_batch_callback callback, void *opaque) {
+    if (!r) return;
+    r->moe_batch_callback = callback;
+    r->moe_batch_callback_opaque = opaque;
 }
 
 static inline void glm5next_cpu_runtime_set_dense_callback(glm5next_cpu_runtime *r,

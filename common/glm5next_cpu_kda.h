@@ -431,8 +431,34 @@ static inline int glm5next_cpu_dsa_forward(const gguf_shards *model, int layer,
 
 typedef int (*glm5next_moe_callback)(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out, void *opaque);
+/* Batch MoE contract used by verifier/prefill runtimes.  hidden and out are
+ * token-major [tokens][hidden]; the callback owns route selection and may
+ * reuse each selected expert's weight stream across all tokens. */
+typedef int (*glm5next_moe_batch_callback)(const gguf_shards *model, int layer,
+        const glm5next_config *config, const float *hidden, float *out,
+        int tokens, void *opaque);
 typedef int (*glm5next_dense_callback)(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out, void *opaque);
+
+static inline int glm5next_cpu_moe_ffn_cb(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out,
+        glm5next_moe_callback callback, void *opaque);
+
+static inline int glm5next_cpu_moe_ffn_batch_cb(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out, int tokens,
+        glm5next_moe_batch_callback batch_callback, glm5next_moe_callback callback,
+        void *opaque) {
+    if (!model || !c || !hidden || !out || tokens <= 0) return -1;
+    if (batch_callback)
+        return batch_callback(model, layer, c, hidden, out, tokens, opaque);
+    for (int t = 0; t < tokens; ++t) {
+        if (glm5next_cpu_moe_ffn_cb(model, layer, c,
+                hidden + (size_t)t * c->hidden_size,
+                out + (size_t)t * c->hidden_size, callback, opaque) != 0)
+            return -1;
+    }
+    return 0;
+}
 
 static inline int glm5next_cpu_moe_ffn_cb(const gguf_shards *model, int layer,
         const glm5next_config *c, const float *hidden, float *out,
