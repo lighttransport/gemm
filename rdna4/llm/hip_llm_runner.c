@@ -16945,22 +16945,6 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
             duw[j] = (unsigned char *)mapped_up + e * mapped_up_stride;
             ddw[j] = (unsigned char *)mapped_down + e * mapped_down_stride;
             gtype[j] = gate_v.type; utype[j] = up_v.type; dtype[j] = down_v.type;
-            /* Mapped mode is the safe fallback for the full expert table, but
-             * it used to make the resident cache completely ineffective.  An
-             * adaptive opt-in promotes selected experts on a cache miss and
-             * uses the mapped pointers until promotion succeeds.  This keeps
-             * cold-route behavior unchanged while allowing hot routes to stop
-             * rereading their three matrices over PCIe on later tokens. */
-            const char *promote_env = getenv("GLM5NEXT_HIP_MOE_MAPPED_CACHE");
-            if (promote_env && atoi(promote_env) != 0 && r->glm5next_moe_cache &&
-                glm5next_moe_cache_get(r, &gw, &uw, &dw, layer, ids[j], &resident[j]) == 0) {
-                dgw[j] = resident[j]->gate;
-                duw[j] = resident[j]->up;
-                ddw[j] = resident[j]->down;
-                gtype[j] = resident[j]->gate_type;
-                utype[j] = resident[j]->up_type;
-                dtype[j] = resident[j]->down_type;
-            }
             if (r->glm5next_moe_down_pool &&
                 glm5next_moe_down_pool_get(r, &dw, layer, ids[j], &resident[j]) == 0) {
                 ddw[j] = resident[j]->down;
@@ -17135,16 +17119,6 @@ moe_scalar_experts:
             duw[j] = (unsigned char *)mapped_up + e * mapped_up_stride;
             ddw[j] = (unsigned char *)mapped_down + e * mapped_down_stride;
             gtype[j] = gate_v.type; utype[j] = up_v.type; dtype[j] = down_v.type;
-            const char *promote_env = getenv("GLM5NEXT_HIP_MOE_MAPPED_CACHE");
-            if (promote_env && atoi(promote_env) != 0 && r->glm5next_moe_cache &&
-                glm5next_moe_cache_get(r, &gw, &uw, &dw, layer, ids[j], &resident[j]) == 0) {
-                dgw[j] = resident[j]->gate;
-                duw[j] = resident[j]->up;
-                ddw[j] = resident[j]->down;
-                gtype[j] = resident[j]->gate_type;
-                utype[j] = resident[j]->up_type;
-                dtype[j] = resident[j]->down_type;
-            }
             if (r->glm5next_moe_down_pool &&
                 glm5next_moe_down_pool_get(r, &dw, layer, ids[j], &resident[j]) == 0) {
                 ddw[j] = resident[j]->down;
