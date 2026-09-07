@@ -16153,11 +16153,11 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     qhead = (float *)malloc((size_t)kv*sizeof(float));
     if (!qr || !q || !kvl || !norm || !qhead) goto done;
     if (cache->q_ready) {
-        if (hipMalloc(&dproj_x, (size_t)h * sizeof(float)) != hipSuccess ||
-            hipMalloc(&dproj_qr, (size_t)qrank * sizeof(float)) != hipSuccess ||
-            hipMalloc(&dproj_q, (size_t)heads * qdim * sizeof(float)) != hipSuccess ||
-            hipMalloc(&dproj_kv_raw, (size_t)kv * sizeof(float)) != hipSuccess ||
-            hipMalloc(&dproj_kv, (size_t)kv * sizeof(float)) != hipSuccess ||
+        if ((!persistent_scratch && hipMalloc(&dproj_x, (size_t)h * sizeof(float)) != hipSuccess) ||
+            (!persistent_scratch && hipMalloc(&dproj_qr, (size_t)qrank * sizeof(float)) != hipSuccess) ||
+            (!persistent_scratch && hipMalloc(&dproj_q, (size_t)heads * qdim * sizeof(float)) != hipSuccess) ||
+            (!persistent_scratch && hipMalloc(&dproj_kv_raw, (size_t)kv * sizeof(float)) != hipSuccess) ||
+            (!persistent_scratch && hipMalloc(&dproj_kv, (size_t)kv * sizeof(float)) != hipSuccess) ||
             hipMemcpy(dproj_x, hidden, (size_t)h * sizeof(float), hipMemcpyHostToDevice) != hipSuccess)
             goto done;
         const char *dsa_fused_env = getenv("GLM5NEXT_HIP_DSA_QKV_FUSED");
