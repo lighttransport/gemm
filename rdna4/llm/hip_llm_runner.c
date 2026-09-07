@@ -1887,6 +1887,39 @@ static const char *hip_kernel_source =
 "    if (lane == 0) { qout[row] = qs; kout[row] = ks; vout[row] = vs; }\n"
 "}\n"
 "\n"
+"__global__ void glm5next_kda_qkv_q5k_batch_f32(float *qout, float *kout, float *vout,\n"
+"        const unsigned char *qw, const unsigned char *kw, const unsigned char *vw,\n"
+"        const float *x, int n_rows, int n_cols, int tokens) {\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int row = blockIdx.x * 8 + warp, t = blockIdx.z;\n"
+"    if (row >= n_rows || t >= tokens) return;\n"
+"    int nb = n_cols / 256; size_t row_bytes = (size_t)nb * 176;\n"
+"    const unsigned char *qr = qw + (size_t)row * row_bytes;\n"
+"    const unsigned char *kr = kw + (size_t)row * row_bytes;\n"
+"    const unsigned char *vr = vw + (size_t)row * row_bytes;\n"
+"    const float *xt = x + (size_t)t * n_cols;\n"
+"    float qs = 0.0f, ks = 0.0f, vs = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *qb = qr + (size_t)b * 176;\n"
+"        const unsigned char *kb = kr + (size_t)b * 176;\n"
+"        const unsigned char *vb = vr + (size_t)b * 176;\n"
+"        const float *xb = xt + (size_t)b * 256;\n"
+"        for (int c = 0; c < 4; ++c) {\n"
+"            qs += qwen4_q5k_group(qb, xb + c * 64, c);\n"
+"            ks += qwen4_q5k_group(kb, xb + c * 64, c);\n"
+"            vs += qwen4_q5k_group(vb, xb + c * 64, c);\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) {\n"
+"        qs += __shfl_down(qs, o); ks += __shfl_down(ks, o); vs += __shfl_down(vs, o);\n"
+"    }\n"
+"    if (lane == 0) {\n"
+"        qout[(size_t)t * n_rows + row] = qs;\n"
+"        kout[(size_t)t * n_rows + row] = ks;\n"
+"        vout[(size_t)t * n_rows + row] = vs;\n"
+"    }\n"
+"}\n"
+"\n"
 "__global__ void glm5next_dsa_qkv_a_q5k_f32(float *qout, float *kvout,\n"
 "        const unsigned char *qw, const unsigned char *kvw, const float *x,\n"
 "        int qrows, int kvrows, int n_cols) {\n"
@@ -2098,6 +2131,31 @@ static const char *hip_kernel_source =
 "        state[z] += kh[d] * delta; y += state[z] * qh[d];\n"
 "    }\n"
 "    out[(size_t)h * head_dim + j] = y * rsqrtf((float)head_dim);\n"
+"}\n"
+"\n"
+"/* Batch KDA recurrence: keep one state column in registers while advancing\n"
+" * verifier tokens in order. */\n"
+"#define GLM5NEXT_KDA_BATCH_MAX_D 256\n"
+"__global__ void glm5next_kda_heads_step_batch_f32(float *state, float *out,\n"
+"        const float *q, const float *k, const float *v, const float *log_decay,\n"
+"        const float *beta, int tokens, int n_heads, int head_dim) {\n"
+"    int h = blockIdx.x, j = threadIdx.x;\n"
+"    if (h >= n_heads || j >= head_dim || head_dim > GLM5NEXT_KDA_BATCH_MAX_D) return;\n"
+"    size_t base = (size_t)h * head_dim * head_dim;\n"
+"    float s[GLM5NEXT_KDA_BATCH_MAX_D];\n"
+"    for (int d = 0; d < head_dim; ++d) s[d] = state[base + (size_t)d * head_dim + j];\n"
+"    for (int t = 0; t < tokens; ++t) {\n"
+"        size_t vb = ((size_t)t * n_heads + h) * head_dim;\n"
+"        const float *qh = q + vb, *kh = k + vb, *vh = v + vb;\n"
+"        const float *dh = log_decay + vb;\n"
+"        float memory = 0.0f;\n"
+"        for (int d = 0; d < head_dim; ++d) { s[d] *= expf(dh[d]); memory += s[d] * kh[d]; }\n"
+"        float delta = (vh[j] - memory) * beta[(size_t)t * n_heads + h];\n"
+"        float y = 0.0f;\n"
+"        for (int d = 0; d < head_dim; ++d) { s[d] += kh[d] * delta; y += s[d] * qh[d]; }\n"
+"        out[vb + j] = y * rsqrtf((float)head_dim);\n"
+"    }\n"
+"    for (int d = 0; d < head_dim; ++d) state[base + (size_t)d * head_dim + j] = s[d];\n"
 "}\n"
 "\n"
 "/* GLM5Next stores a[h] = -exp(A_log).  Produce the per-channel decay\n"
@@ -8763,6 +8821,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q5_K_mw_f32;
     hipFunction_t fn_matvec_q5_K_mw16_f32;
     hipFunction_t fn_glm5next_kda_qkv_q5k_f32;
+    hipFunction_t fn_glm5next_kda_qkv_q5k_batch_f32;
     hipFunction_t fn_glm5next_dsa_qkv_a_q5k_f32;
     hipFunction_t fn_matvec_q6_K_f32;
     hipFunction_t fn_embed_q2_K;
@@ -8776,6 +8835,7 @@ struct hip_llm_runner {
     hipFunction_t fn_deltanet_step_f32;
     hipFunction_t fn_glm5next_kda_step_f32;
     hipFunction_t fn_glm5next_kda_heads_step_f32;
+    hipFunction_t fn_glm5next_kda_heads_step_batch_f32;
     hipFunction_t fn_glm5next_kda_decay_f32;
     hipFunction_t fn_glm5next_dsa_attend_f32;
     hipFunction_t fn_glm5next_mhc_finish_f32;
@@ -9519,6 +9579,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q5_K_mw_f32);
     GET_FUNC(matvec_q5_K_mw16_f32);
     GET_FUNC(glm5next_kda_qkv_q5k_f32);
+    GET_FUNC(glm5next_kda_qkv_q5k_batch_f32);
     GET_FUNC(glm5next_dsa_qkv_a_q5k_f32);
     GET_FUNC(matvec_q6_K_f32);
     GET_FUNC(embed_q2_K);
@@ -9532,6 +9593,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(deltanet_step_f32);
     GET_FUNC(glm5next_kda_step_f32);
     GET_FUNC(glm5next_kda_heads_step_f32);
+    GET_FUNC(glm5next_kda_heads_step_batch_f32);
     GET_FUNC(glm5next_kda_decay_f32);
     GET_FUNC(glm5next_dsa_attend_f32);
     GET_FUNC(glm5next_mhc_finish_f32);
@@ -13699,6 +13761,14 @@ static inline void launch_glm5next_kda_qkv_q5k(hip_llm_runner *r,
     LAUNCH(r->fn_glm5next_kda_qkv_q5k_f32, (n_rows + 7) / 8, 1, 1,
            256, 1, 1, 0, r->stream, args);
 }
+static inline void launch_glm5next_kda_qkv_q5k_batch(hip_llm_runner *r,
+        void *qout, void *kout, void *vout, void *qw, void *kw, void *vw,
+        void *x, int n_rows, int n_cols, int tokens) {
+    void *args[] = { &qout, &kout, &vout, &qw, &kw, &vw, &x,
+                     &n_rows, &n_cols, &tokens };
+    LAUNCH(r->fn_glm5next_kda_qkv_q5k_batch_f32, (n_rows + 7) / 8,
+           1, tokens, 256, 1, 1, 0, r->stream, args);
+}
 static inline void launch_glm5next_dsa_qkv_a_q5k(hip_llm_runner *r,
         void *qout, void *kvout, void *qw, void *kvw, void *x,
         int qrows, int kvrows, int n_cols) {
@@ -14336,6 +14406,15 @@ static inline void launch_glm5next_kda_heads_step(hip_llm_runner *r, void *state
     void *args[] = { &state, &out, &q, &k, &v, &decay, &beta, &n_heads, &head_dim };
     LAUNCH(r->fn_glm5next_kda_heads_step_f32, n_heads, 1, 1, head_dim,
            1, 1, 0, r->stream, args);
+}
+
+static inline void launch_glm5next_kda_heads_step_batch(hip_llm_runner *r,
+        void *state, void *out, void *q, void *k, void *v, void *decay,
+        void *beta, int tokens, int n_heads, int head_dim) {
+    void *args[] = { &state, &out, &q, &k, &v, &decay, &beta,
+                     &tokens, &n_heads, &head_dim };
+    LAUNCH(r->fn_glm5next_kda_heads_step_batch_f32, n_heads, 1, 1,
+           head_dim, 1, 1, 0, r->stream, args);
 }
 
 static inline void launch_glm5next_kda_gated_norm(hip_llm_runner *r, void *out,
