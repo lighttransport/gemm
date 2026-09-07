@@ -175,7 +175,10 @@ static inline int glm5next_cpu_mhc_finish(const glm5next_config *c,
     if (!c || !streams || !logits || !base_f || !scale_f || !collapsed || !post || !comb) return -1;
     for (int i = 0; i < hc * width; ++i) ss += (double)streams[i] * streams[i];
     float inv = 1.0f / sqrtf((float)(ss / (hc * width)) + c->norm_epsilon);
-    float *z = (float *)malloc((size_t)mix * sizeof(float));
+    float z_stack[64];
+    float *z = mix <= (int)(sizeof(z_stack) / sizeof(z_stack[0]))
+        ? z_stack : (float *)malloc((size_t)mix * sizeof(float));
+    int z_heap = z != z_stack;
     if (!z) return -1;
     for (int i = 0; i < mix; ++i) z[i] = logits[i] * inv;
     for (int i = 0; i < hc; ++i) {
@@ -189,7 +192,7 @@ static inline int glm5next_cpu_mhc_finish(const glm5next_config *c,
         for (int i = 0; i < hc; ++i) v += (double)z[i] * streams[(size_t)i * width + d];
         collapsed[d] = (float)v;
     }
-    free(z);
+    if (z_heap) free(z);
     return 0;
 }
 

@@ -18,6 +18,7 @@ TEST_SRC = test_hip_llm.c
 # hipBLASLt bridge (optional). Build with `make HIPBLASLT=1` to enable WMMA-class
 # prefill GEMMs via hipBLASLt. Without it, the runner falls back to per-token GEMV.
 HIPBLASLT ?= 1
+CUDA_MOE ?= 0
 
 # Target
 TARGET = test_hip_llm
@@ -34,11 +35,22 @@ else
 BLASLT_OBJ =
 endif
 
+ifeq ($(CUDA_MOE),1)
+CFLAGS += -DCUDA_MOE_BRIDGE
+LDFLAGS += -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lstdc++
+CUDA_MOE_OBJ = cuda_moe_bridge.o
+else
+CUDA_MOE_OBJ =
+endif
+
+cuda_moe_bridge.o: cuda_moe_bridge.cu cuda_moe_bridge.h glm5next_iq1s_grid.h glm5next_iq2_iq3_grid.h
+	nvcc -O3 -arch=sm_120 -Xcompiler -fPIC -c -o $@ $<
+
 mm_blaslt_bridge.o: mm_blaslt_bridge.cpp mm_blaslt_bridge.h
 	$(HIPCC) -O3 -fPIE --offload-arch=gfx1201 -c -o $@ $<
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h ../rocew.h $(BLASLT_OBJ)
-	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h ../rocew.h $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
+	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ) $(LDFLAGS)
 
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]"
@@ -60,8 +72,8 @@ glm5next-cpu-runtime: test_glm5next_cpu_runtime
 
 glm5next-nextn: test_glm5next_nextn
 
-test_glm5next_nextn: test_glm5next_nextn.c $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h ../rocew.h
-	$(CC) $(CFLAGS) -o $@ $< $(RUNNER_SRC) $(ROCEW_SRC) $(LDFLAGS)
+test_glm5next_nextn: test_glm5next_nextn.c $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h ../rocew.h $(BLASLT_OBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
 
 test_glm5next_cpu_runtime: test_glm5next_cpu_runtime.c ../../common/glm5next_cpu_runtime.h
 	$(CC) -O2 -Wall -Wextra -Wpedantic -I.. -o $@ $< -lm
@@ -85,7 +97,7 @@ bench_cpu_qwen_expert: bench_cpu_qwen_expert.c
 	$(CC) -O3 -Wall -Wextra -march=native -fopenmp -o $@ $< -ldl -lm
 
 clean:
-	rm -f $(TARGET) bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full test_glm5next_cpu_runtime test_glm5next_nextn mm_blaslt_bridge.o
+	rm -f $(TARGET) bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full test_glm5next_cpu_runtime test_glm5next_nextn mm_blaslt_bridge.o cuda_moe_bridge.o
 
 help:
 	@echo "HIP LLM Runner (HIPRTC-based, no hipcc needed)"
