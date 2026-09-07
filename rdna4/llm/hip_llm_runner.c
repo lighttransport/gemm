@@ -549,6 +549,20 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"__global__ void matvec_f32_mw_f32(float *dst, const float *mat, const float *x,\n"
+"                                   int n_rows, int n_cols) {\n"
+"    int lane = threadIdx.x & 31;\n"
+"    int warp = threadIdx.x >> 5;\n"
+"    int row = blockIdx.x * 8 + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    const float *rp = mat + (size_t)row * n_cols;\n"
+"    float sum = 0.0f;\n"
+"    for (int j = lane; j < n_cols; j += 32) sum += rp[j] * x[j];\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
 "/* ---- dp4a: INT8 dot product (software fallback for RDNA4) ---- */\n"
 "__device__ __forceinline__ int dp4a_s8(int a, int b, int c) {\n"
 "    signed char *av = (signed char*)&a;\n"
@@ -8120,6 +8134,12 @@ typedef struct {
 } glm5next_kda_gpu_cache;
 
 typedef struct {
+    void *state;
+    void *conv[3];
+    int ready;
+} glm5next_kda_state_gpu;
+
+typedef struct {
     void *weight;
     float *bias;
     int type;
@@ -8421,6 +8441,7 @@ struct hip_llm_runner {
     /* MoE kernels */
     hipFunction_t fn_scale_add_f32;
     hipFunction_t fn_matvec_f32_f32;
+    hipFunction_t fn_matvec_f32_mw_f32;
     /* MoE device-side dispatch (sync-free, graph-capturable) */
     hipFunction_t fn_moe_topk_softmax_gpu;
     hipFunction_t fn_sigmoid_scalar_f32;
@@ -8596,15 +8617,11 @@ struct hip_llm_runner {
     gguf_context *glm5next_single_shard;
     glm5next_dsa_gpu_cache *glm5next_dsa_gpu;
     glm5next_kda_gpu_cache *glm5next_kda_gpu;
+    glm5next_kda_state_gpu *glm5next_kda_state_cache;
     /* Reused decode scratch for the serialized GLM5Next KDA callback.
      * Indices 0..12 are the named vectors below; 13..15 are conv buffers. */
     void *glm5next_kda_scratch[16];
     int glm5next_kda_scratch_ready;
-    /* DSA projection/attention scratch; cache buffers grow with the current
-     * selected-token count and are reused across serialized callbacks. */
-    void *glm5next_dsa_scratch[11];
-    int glm5next_dsa_scratch_ready;
-    int glm5next_dsa_scratch_nt;
     glm5next_moe_router_cache *glm5next_moe_router;
     glm5next_dense_gpu_cache *glm5next_dense_gpu;
     glm5next_moe_resident_slot *glm5next_moe_cache;
@@ -9054,6 +9071,7 @@ static int compile_kernels(hip_llm_runner *r) {
     /* MoE kernels */
     GET_FUNC(scale_add_f32);
     GET_FUNC(matvec_f32_f32);
+    GET_FUNC(matvec_f32_mw_f32);
     /* MoE device-side dispatch */
     GET_FUNC(moe_topk_softmax_gpu);
     GET_FUNC(sigmoid_scalar_f32);
@@ -10072,52 +10090,6 @@ done:
     if (du) hipFree(du);
     return rc;
 #undef DENSE_VIEW
-}
-
-static int glm5next_dsa_scratch_get(hip_llm_runner *r, const glm5next_config *c, int nt) {
-    if (!r || !c || nt < 1) return -1;
-    const int h = c->hidden_size, heads = c->attention_heads;
-    const int qrank = c->q_lora_rank, kv = c->kv_lora_rank;
-    const int qdim = c->qk_nope_head_dim, vdim = c->value_head_dim;
-    int old_nt = r->glm5next_dsa_scratch_nt;
-    if (r->glm5next_dsa_scratch_ready && old_nt >= nt) return 0;
-    if (!r->glm5next_dsa_scratch_ready) {
-        size_t n[7] = { (size_t)h, (size_t)qrank, (size_t)heads * qdim,
-                        (size_t)kv, (size_t)kv, (size_t)qdim,
-                        (size_t)heads * kv };
-        for (int i = 0; i < 7; ++i) {
-            if (hipMalloc(&r->glm5next_dsa_scratch[i], n[i] * sizeof(float)) != hipSuccess)
-                goto fail;
-        }
-        r->glm5next_dsa_scratch_ready = 1;
-    }
-    if (old_nt < nt) {
-        void *new_k = NULL, *new_v = NULL;
-        if (hipMalloc(&new_k, (size_t)nt * kv * sizeof(float)) != hipSuccess ||
-            hipMalloc(&new_v, (size_t)nt * heads * vdim * sizeof(float)) != hipSuccess) {
-            if (new_k) hipFree(new_k);
-            if (new_v) hipFree(new_v);
-            goto fail;
-        }
-        if (r->glm5next_dsa_scratch[7]) hipFree(r->glm5next_dsa_scratch[7]);
-        if (r->glm5next_dsa_scratch[8]) hipFree(r->glm5next_dsa_scratch[8]);
-        r->glm5next_dsa_scratch[7] = new_k;
-        r->glm5next_dsa_scratch[8] = new_v;
-        r->glm5next_dsa_scratch_nt = nt;
-    }
-    if (!r->glm5next_dsa_scratch[9] &&
-        hipMalloc(&r->glm5next_dsa_scratch[9], (size_t)heads * vdim * sizeof(float)) != hipSuccess)
-        goto fail;
-    if (!r->glm5next_dsa_scratch[10] &&
-        hipMalloc(&r->glm5next_dsa_scratch[10], (size_t)h * sizeof(float)) != hipSuccess)
-        goto fail;
-    return 0;
-fail:
-    for (int i = 0; i < 11; ++i) if (r->glm5next_dsa_scratch[i]) hipFree(r->glm5next_dsa_scratch[i]);
-    memset(r->glm5next_dsa_scratch, 0, sizeof(r->glm5next_dsa_scratch));
-    r->glm5next_dsa_scratch_ready = 0;
-    r->glm5next_dsa_scratch_nt = 0;
-    return -1;
 }
 
 static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
@@ -13614,7 +13586,8 @@ static inline void launch_scale_add(hip_llm_runner *r, void *dst, void *src,
 static inline void launch_matvec_f32(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
-    LAUNCH(r->fn_matvec_f32_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
+    LAUNCH(r->fn_matvec_f32_mw_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
 }
 
 /* === MoE device-side dispatch launchers (sync-free, graph-capturable) === */
@@ -15643,14 +15616,13 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     kvl = (float *)malloc((size_t)kv*sizeof(float)); norm = (float *)malloc((size_t)((qrank > kv) ? qrank : kv)*sizeof(float));
     qhead = (float *)malloc((size_t)kv*sizeof(float));
     if (!qr || !q || !kvl || !norm || !qhead) goto done;
-    if (glm5next_dsa_scratch_get(r, c, attn_nt) != 0) goto done;
-    dproj_x = r->glm5next_dsa_scratch[0];
-    dproj_qr = r->glm5next_dsa_scratch[1];
-    dproj_q = r->glm5next_dsa_scratch[2];
-    dproj_kv_raw = r->glm5next_dsa_scratch[3];
-    dproj_kv = r->glm5next_dsa_scratch[4];
     if (cache->q_ready) {
-        if (hipMemcpy(dproj_x, hidden, (size_t)h * sizeof(float), hipMemcpyHostToDevice) != hipSuccess)
+        if (hipMalloc(&dproj_x, (size_t)h * sizeof(float)) != hipSuccess ||
+            hipMalloc(&dproj_qr, (size_t)qrank * sizeof(float)) != hipSuccess ||
+            hipMalloc(&dproj_q, (size_t)heads * qdim * sizeof(float)) != hipSuccess ||
+            hipMalloc(&dproj_kv_raw, (size_t)kv * sizeof(float)) != hipSuccess ||
+            hipMalloc(&dproj_kv, (size_t)kv * sizeof(float)) != hipSuccess ||
+            hipMemcpy(dproj_x, hidden, (size_t)h * sizeof(float), hipMemcpyHostToDevice) != hipSuccess)
             goto done;
         launch_matvec_auto(r, dproj_qr, cache->q_a_weight, dproj_x,
                            qrank, h, cache->q_a_type);
@@ -15687,7 +15659,6 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
                                                 max_seq_len, position, selected);
         if (attn_nt < 0) goto done;
     }
-    if (glm5next_dsa_scratch_get(r, c, attn_nt) != 0) goto done;
     CB_VIEW(tk, "attn_k_b.weight");
     if (persistent_cache && cache->out_weight) {
         do_w = cache->out_weight;
@@ -15697,13 +15668,10 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
         { qtensor qto = glm5next_as_qtensor(&to);
           if (upload_weight_matrix(&do_w, &qto, &otype) != 0) goto done; }
     }
-    dq = r->glm5next_dsa_scratch[5];
-    dqcache = r->glm5next_dsa_scratch[6];
-    dkcache = r->glm5next_dsa_scratch[7];
-    dvcache = r->glm5next_dsa_scratch[8];
-    dattn = r->glm5next_dsa_scratch[9];
-    dout = r->glm5next_dsa_scratch[10];
-    if (!dq || !dqcache || !dkcache || !dvcache || !dattn || !dout) goto done;
+    if (hipMalloc(&dq, (size_t)qdim*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dqcache, (size_t)heads*kv*sizeof(float)) != hipSuccess || hipMalloc(&dkcache, (size_t)attn_nt*kv*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dvcache, (size_t)attn_nt*heads*vdim*sizeof(float)) != hipSuccess || hipMalloc(&dattn, (size_t)heads*vdim*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dout, (size_t)h*sizeof(float)) != hipSuccess) goto done;
     for (int si = 0; si < attn_nt; ++si) {
         int p = selected ? selected[si] : si;
         if (hipMemcpy((uint8_t *)dkcache + (size_t)si*kv*sizeof(float),
@@ -15737,6 +15705,10 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     rc = 0;
 done:
     if (do_w && (!persistent_cache || do_w != cache->out_weight)) hipFree(do_w); if (dq) hipFree(dq);
+    if (dproj_x) hipFree(dproj_x); if (dproj_qr) hipFree(dproj_qr); if (dproj_q) hipFree(dproj_q);
+    if (dproj_kv_raw) hipFree(dproj_kv_raw); if (dproj_kv) hipFree(dproj_kv);
+    if (dqcache) hipFree(dqcache); if (dkcache) hipFree(dkcache); if (dvcache) hipFree(dvcache); if (dattn) hipFree(dattn);
+    if (dout) hipFree(dout);
     free(qr); free(q); free(kvl); free(norm); free(qhead);
     free(selected);
     if (!persistent_cache) {
@@ -15772,6 +15744,47 @@ static int glm5next_kda_scratch_get(hip_llm_runner *r, const glm5next_config *c)
                      heads * d * d + h + 3 * (size_t)qdim * (ck - 1)) * sizeof(float) /
             (1024.0 * 1024.0));
     return 0;
+}
+
+static int glm5next_kda_state_get(hip_llm_runner *r, const glm5next_config *c,
+        int layer, const float *host_state, const float *host_conv,
+        void **state_out, void *conv_out[3]) {
+    if (!r || !c || !host_state || !host_conv || layer < 0 ||
+        layer >= c->n_layers_all || !state_out || !conv_out) return -1;
+    if (!r->glm5next_kda_state_cache) {
+        r->glm5next_kda_state_cache = (glm5next_kda_state_gpu *)calloc(
+            (size_t)c->n_layers_all, sizeof(*r->glm5next_kda_state_cache));
+        if (!r->glm5next_kda_state_cache) return -1;
+    }
+    glm5next_kda_state_gpu *s = &r->glm5next_kda_state_cache[layer];
+    size_t state_n = (size_t)c->attention_heads * c->linear_head_dim * c->linear_head_dim;
+    size_t conv_n = (size_t)c->attention_heads * c->linear_head_dim * (c->short_conv_kernel - 1);
+    if (!s->ready) {
+        if (hipMalloc(&s->state, state_n * sizeof(float)) != hipSuccess) return -1;
+        for (int i = 0; i < 3; ++i) {
+            if (hipMalloc(&s->conv[i], conv_n * sizeof(float)) != hipSuccess) {
+                if (s->state) hipFree(s->state);
+                for (int j = 0; j < i; ++j) hipFree(s->conv[j]);
+                memset(s, 0, sizeof(*s));
+                return -1;
+            }
+        }
+        if (hipMemcpy(s->state, host_state, state_n * sizeof(float), hipMemcpyHostToDevice) != hipSuccess)
+            goto fail;
+        for (int i = 0; i < 3; ++i)
+            if (hipMemcpy(s->conv[i], host_conv + (size_t)i * conv_n,
+                          conv_n * sizeof(float), hipMemcpyHostToDevice) != hipSuccess)
+                goto fail;
+        s->ready = 1;
+    }
+    *state_out = s->state;
+    for (int i = 0; i < 3; ++i) conv_out[i] = s->conv[i];
+    return 0;
+fail:
+    if (s->state) hipFree(s->state);
+    for (int i = 0; i < 3; ++i) if (s->conv[i]) hipFree(s->conv[i]);
+    memset(s, 0, sizeof(*s));
+    return -1;
 }
 
 /* HIP KDA callback.  This mirrors the verified model-weighted KDA chain and
@@ -15841,10 +15854,14 @@ static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
     dstate = r->glm5next_kda_scratch[10]; dcore = r->glm5next_kda_scratch[11];
     dout = r->glm5next_kda_scratch[12];
     for (int i = 0; i < 3; ++i) dcs[i] = r->glm5next_kda_scratch[13 + i];
-    if (hipMemcpy(dx, hidden, (size_t)h*sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
-        hipMemcpy(dstate, recurrent, (size_t)heads*d*d*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
-    for (int i=0;i<3;++i) if (hipMemcpy(dcs[i], conv_state + (size_t)i*qdim*(ck-1),
-        (size_t)qdim*(ck-1)*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
+    {
+        void *state_gpu = NULL, *conv_gpu[3] = { NULL };
+        if (glm5next_kda_state_get(r, c, layer, recurrent, conv_state,
+                                   &state_gpu, conv_gpu) != 0) goto done;
+        dstate = state_gpu;
+        for (int i = 0; i < 3; ++i) dcs[i] = conv_gpu[i];
+    }
+    if (hipMemcpy(dx, hidden, (size_t)h*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
     launch_matvec_auto(r, dq, mw[0], dx, qdim, h, types[0]);
     launch_matvec_auto(r, dk, mw[1], dx, qdim, h, types[1]);
     launch_matvec_auto(r, dv, mw[2], dx, qdim, h, types[2]);
@@ -15863,10 +15880,7 @@ static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
     launch_glm5next_kda_gated_norm(r, dcore, dgg, d_norm, heads, d, 1e-6f);
     launch_matvec_auto(r, dout, mw[8], dcore, h, qdim, types[8]);
     if (hipStreamSynchronize(r->stream) != hipSuccess ||
-        hipMemcpy(out, dout, (size_t)h*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
-        hipMemcpy(recurrent, dstate, (size_t)heads*d*d*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
-    for (int i=0;i<3;++i) if (hipMemcpy(conv_state + (size_t)i*qdim*(ck-1), dcs[i],
-        (size_t)qdim*(ck-1)*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
+        hipMemcpy(out, dout, (size_t)h*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
     rc = 0;
 done:
     if (own_weights) for (int i=0;i<9;++i) if (mw[i]) hipFree(mw[i]);
@@ -19027,12 +19041,17 @@ void hip_llm_free(hip_llm_runner *r) {
         r->glm5next_kda_scratch[i] = NULL;
     }
     r->glm5next_kda_scratch_ready = 0;
-    for (int i = 0; i < 11; ++i) {
-        if (r->glm5next_dsa_scratch[i]) hipFree(r->glm5next_dsa_scratch[i]);
-        r->glm5next_dsa_scratch[i] = NULL;
+    if (r->glm5next_kda_state_cache) {
+        for (int l = 0; l < r->glm5next.n_layers_all; ++l) {
+            if (r->glm5next_kda_state_cache[l].state)
+                hipFree(r->glm5next_kda_state_cache[l].state);
+            for (int i = 0; i < 3; ++i)
+                if (r->glm5next_kda_state_cache[l].conv[i])
+                    hipFree(r->glm5next_kda_state_cache[l].conv[i]);
+        }
+        free(r->glm5next_kda_state_cache);
+        r->glm5next_kda_state_cache = NULL;
     }
-    r->glm5next_dsa_scratch_ready = 0;
-    r->glm5next_dsa_scratch_nt = 0;
     if (r->glm5next_dense_gpu) {
         for (int l = 0; l < r->glm5next.first_k_dense_replace; ++l) {
             if (r->glm5next_dense_gpu[l].gate) hipFree(r->glm5next_dense_gpu[l].gate);
@@ -19341,6 +19360,10 @@ void hip_llm_reset_state(hip_llm_runner *r) {
     if (!r) return;
     if (r->is_glm5next) {
         if (r->glm5next_cpu) glm5next_cpu_runtime_reset(r->glm5next_cpu);
+        if (r->glm5next_kda_state_cache) {
+            for (int l = 0; l < r->glm5next.n_layers_all; ++l)
+                r->glm5next_kda_state_cache[l].ready = 0;
+        }
         return;
     }
     hip_llm_set_decode_mode(r, 0);
