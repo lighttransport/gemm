@@ -1821,6 +1821,35 @@ static const char *hip_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
+"__global__ void glm5next_kda_qkv_q5k_f32(float *qout, float *kout, float *vout,\n"
+"        const unsigned char *qw, const unsigned char *kw, const unsigned char *vw,\n"
+"        const float *x, int n_rows, int n_cols) {\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int row = blockIdx.x * 8 + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    size_t row_bytes = (size_t)nb * 176;\n"
+"    const unsigned char *qr = qw + (size_t)row * row_bytes;\n"
+"    const unsigned char *kr = kw + (size_t)row * row_bytes;\n"
+"    const unsigned char *vr = vw + (size_t)row * row_bytes;\n"
+"    float qs = 0.0f, ks = 0.0f, vs = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *qb = qr + (size_t)b * 176;\n"
+"        const unsigned char *kb = kr + (size_t)b * 176;\n"
+"        const unsigned char *vb = vr + (size_t)b * 176;\n"
+"        const float *xb = x + (size_t)b * 256;\n"
+"        for (int c = 0; c < 4; ++c) {\n"
+"            qs += qwen4_q5k_group(qb, xb + c * 64, c);\n"
+"            ks += qwen4_q5k_group(kb, xb + c * 64, c);\n"
+"            vs += qwen4_q5k_group(vb, xb + c * 64, c);\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) {\n"
+"        qs += __shfl_down(qs, o); ks += __shfl_down(ks, o); vs += __shfl_down(vs, o);\n"
+"    }\n"
+"    if (lane == 0) { qout[row] = qs; kout[row] = ks; vout[row] = vs; }\n"
+"}\n"
+"\n"
 "/* ---- 18. embed_q2_K: Q2_K embedding lookup -> F32 ---- */\n"
 "__global__ void embed_q2_K(float *dst, const unsigned char *embd_table,\n"
 "                             int token_id, int n_embd) {\n"
@@ -8414,6 +8443,7 @@ struct hip_llm_runner {
     int q4k_g4;                             /* LLM_Q4K_G4: warp-per-row G=nb*4 Q4_K */
     hipFunction_t fn_matvec_q5_K_f32;
     hipFunction_t fn_matvec_q5_K_mw_f32;
+    hipFunction_t fn_glm5next_kda_qkv_q5k_f32;
     hipFunction_t fn_matvec_q6_K_f32;
     hipFunction_t fn_embed_q2_K;
     /* SSM kernels */
@@ -9044,6 +9074,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q4_K_g4_f32);
     GET_FUNC(matvec_q5_K_f32);
     GET_FUNC(matvec_q5_K_mw_f32);
+    GET_FUNC(glm5next_kda_qkv_q5k_f32);
     GET_FUNC(matvec_q6_K_f32);
     GET_FUNC(embed_q2_K);
     /* SSM kernels */
@@ -12882,6 +12913,13 @@ static inline void launch_matvec_q5_K(hip_llm_runner *r, void *dst, void *mat,
         LAUNCH(r->fn_matvec_q5_K_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
     }
 }
+static inline void launch_glm5next_kda_qkv_q5k(hip_llm_runner *r,
+        void *qout, void *kout, void *vout, void *qw, void *kw, void *vw,
+        void *x, int n_rows, int n_cols) {
+    void *args[] = { &qout, &kout, &vout, &qw, &kw, &vw, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_glm5next_kda_qkv_q5k_f32, (n_rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
 static inline void launch_matvec_q6_K(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -15458,9 +15496,16 @@ int hip_llm_verify_glm5next_model_kda_layer(hip_llm_runner *r, gguf_shards *mode
         if (hipMemset(dconv_state[i], 0, (size_t)qdim*3*sizeof(float)) != hipSuccess) goto done;
     if (hipMemcpy(dx, x, (size_t)h*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
     start = hllm_monotonic_ms();
-    launch_matvec_auto(r, dq, mw[0], dx, qdim, h, types[0]);
-    launch_matvec_auto(r, dk, mw[1], dx, qdim, h, types[1]);
-    launch_matvec_auto(r, dv, mw[2], dx, qdim, h, types[2]);
+    const char *kda_qkv_env = getenv("GLM5NEXT_HIP_KDA_QKV_FUSED");
+    int use_kda_qkv = !kda_qkv_env || atoi(kda_qkv_env) != 0;
+    if (use_kda_qkv && types[0] == GGML_TYPE_Q5_K && types[1] == GGML_TYPE_Q5_K &&
+        types[2] == GGML_TYPE_Q5_K && qdim % 8 == 0 && h % 256 == 0)
+        launch_glm5next_kda_qkv_q5k(r, dq, dk, dv, mw[0], mw[1], mw[2], dx, qdim, h);
+    else {
+        launch_matvec_auto(r, dq, mw[0], dx, qdim, h, types[0]);
+        launch_matvec_auto(r, dk, mw[1], dx, qdim, h, types[1]);
+        launch_matvec_auto(r, dv, mw[2], dx, qdim, h, types[2]);
+    }
     for (int i = 0; i < 3; ++i) launch_conv1d(r, i == 0 ? dq : (i == 1 ? dk : dv), dconv_state[i],
                                                 i == 0 ? dq : (i == 1 ? dk : dv), cw[i], qdim, 4);
     launch_l2_norm_heads(r, dq, heads, d, 1e-6f); launch_l2_norm_heads(r, dk, heads, d, 1e-6f);
