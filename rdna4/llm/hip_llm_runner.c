@@ -10673,18 +10673,45 @@ static int glm5next_moe_cache_get(hip_llm_runner *r, const qtensor *gate,
     glm5next_moe_resident_slot *s = &r->glm5next_moe_cache[victim];
     void *g = NULL, *u = NULL, *d = NULL;
     int gt = 0, ut = 0, dt = 0;
-    int raw_iq1 = gate->type == GGML_TYPE_IQ1_S && up->type == GGML_TYPE_IQ1_S &&
-                  down->type == GGML_TYPE_IQ1_S && !getenv("HIP_LLM_LEGACY_CPU_DEQUANT");
+    int raw_quant = !getenv("HIP_LLM_LEGACY_CPU_DEQUANT");
+    int raw_types[] = { GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS };
+    int raw_ok = 1;
+    for (int ri = 0; ri < 3; ++ri) {
+        if (gate->type == raw_types[ri]) break;
+        if (ri == 2) raw_ok = 0;
+    }
+    int up_ok = 0, down_ok = 0;
+    for (int ri = 0; ri < 3; ++ri) {
+        if (up->type == raw_types[ri]) up_ok = 1;
+        if (down->type == raw_types[ri]) down_ok = 1;
+    }
+    raw_ok = raw_ok && up_ok && down_ok;
+    raw_quant = raw_quant && raw_ok;
     size_t gb = glm5next_qtensor_bytes(gate), ub = glm5next_qtensor_bytes(up);
     size_t db = glm5next_qtensor_bytes(down);
-    if (raw_iq1 && s->gate && s->up && s->down &&
+    if (raw_quant && s->gate && s->up && s->down &&
         s->gate_capacity >= gb && s->up_capacity >= ub && s->down_capacity >= db) {
         if (hipMemcpy(s->gate, gate->data, gb, hipMemcpyHostToDevice) != hipSuccess ||
             hipMemcpy(s->up, up->data, ub, hipMemcpyHostToDevice) != hipSuccess ||
             hipMemcpy(s->down, down->data, db, hipMemcpyHostToDevice) != hipSuccess)
             return -1;
         g = s->gate; u = s->up; d = s->down;
-        gt = ut = dt = GGML_TYPE_IQ1_S;
+        gt = gate->type; ut = up->type; dt = down->type;
+    } else if (raw_quant) {
+        if (s->gate) hipFree(s->gate);
+        if (s->up) hipFree(s->up);
+        if (s->down) hipFree(s->down);
+        s->gate = s->up = s->down = NULL;
+        s->gate_capacity = s->up_capacity = s->down_capacity = 0;
+        if (hipMalloc(&g, gb) != hipSuccess || hipMalloc(&u, ub) != hipSuccess ||
+            hipMalloc(&d, db) != hipSuccess ||
+            hipMemcpy(g, gate->data, gb, hipMemcpyHostToDevice) != hipSuccess ||
+            hipMemcpy(u, up->data, ub, hipMemcpyHostToDevice) != hipSuccess ||
+            hipMemcpy(d, down->data, db, hipMemcpyHostToDevice) != hipSuccess) {
+            if (g) hipFree(g); if (u) hipFree(u); if (d) hipFree(d);
+            return -1;
+        }
+        gt = gate->type; ut = up->type; dt = down->type;
     } else {
         if (s->gate) hipFree(s->gate);
         if (s->up) hipFree(s->up);
