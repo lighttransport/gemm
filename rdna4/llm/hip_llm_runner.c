@@ -5835,6 +5835,42 @@ static const char *hip_kernel_source =
 "        sum+=dl*sc[b]*(dot+delta*(float)sumq);}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)out[(size_t)e*rows+row]=sum*weights[e];\n"
 "}\n"
+"/* Token-batched IQ1_S routed experts.  The z dimension is [token][expert];\n"
+" * keeping the expert pointer table flattened lets verifier tokens share the\n"
+" * same route materialization and keeps each weight stream coalesced. */\n"
+"__global__ void glm5next_moe_gateup_iq1s_batch(float *dst,const unsigned char * const *gates,\n"
+"        const unsigned char * const *ups,const float *x,int rows,int cols,int experts,int tokens){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,group=blockIdx.z,e=group%experts,t=group/experts,row=blockIdx.x*8+warp;\n"
+"    if(e>=experts||t>=tokens||row>=rows)return; int nb=cols/256; float sg=0.0f,su=0.0f;\n"
+"    const unsigned char *gw=gates[group]+(size_t)row*nb*50,*uw=ups[group]+(size_t)row*nb*50;\n"
+"    const float *xt=x+(size_t)t*cols;\n"
+"    for(int b=lane>>1;b<nb;b+=16){const unsigned char *gb=gw+b*50,*ub=uw+b*50;\n"
+"        float gd=half_to_float(*(const half_raw*)gb),ud=half_to_float(*(const half_raw*)ub);\n"
+"        const unsigned char *gqs=gb+2,*uqs=ub+2; const unsigned short *gqh=(const unsigned short*)(gb+34),*uqh=(const unsigned short*)(ub+34); int ib0=(lane&1)*4;\n"
+"        for(int ib=ib0;ib<ib0+4;++ib){float gl=gd*(float)(2*((gqh[ib]>>12)&7)+1),ul=ud*(float)(2*((uqh[ib]>>12)&7)+1);\n"
+"            float gs=(gqh[ib]&0x8000)?-0.125f:0.125f,us=(uqh[ib]&0x8000)?-0.125f:0.125f;\n"
+"            for(int l=0;l<4;++l){int gi=gqs[ib*4+l]|(((gqh[ib]>>(3*l))&7)<<8),ui=uqs[ib*4+l]|(((uqh[ib]>>(3*l))&7)<<8);\n"
+"                const signed char *gc=(const signed char*)&iq1s_grid_dev[gi],*uc=(const signed char*)&iq1s_grid_dev[ui]; int base=ib*32+l*8;\n"
+"                for(int j=0;j<8;++j){float xv=xt[b*256+base+j];sg+=gl*((float)gc[j]+gs)*xv;su+=ul*((float)uc[j]+us)*xv;}}}}\n"
+"    for(int o=16;o>0;o>>=1){sg+=__shfl_down(sg,o);su+=__shfl_down(su,o);}\n"
+"    if(lane==0)dst[(size_t)group*rows+row]=(sg/(1.0f+expf(-sg)))*su;\n"
+"}\n"
+"__global__ void glm5next_moe_down_iq1s_batch(float *out,const unsigned char * const *downs,\n"
+"        const float *gate,const float *weights,int rows,int cols,int experts,int tokens){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,group=blockIdx.z,e=group%experts,t=group/experts,row=blockIdx.x*8+warp;\n"
+"    if(e>=experts||t>=tokens||row>=rows)return; int nb=cols/256; float sum=0.0f;\n"
+"    const unsigned char *dw=downs[group]+(size_t)row*nb*50; const float *gx=gate+(size_t)group*cols;\n"
+"    for(int b=lane>>1;b<nb;b+=16){const unsigned char *bp=dw+b*50;float d0=half_to_float(*(const half_raw*)bp);\n"
+"        const unsigned char *qs=bp+2;const unsigned short *qh=(const unsigned short*)(bp+34);int ib0=(lane&1)*4;\n"
+"        for(int ib=ib0;ib<ib0+4;++ib){float dl=d0*(float)(2*((qh[ib]>>12)&7)+1),ds=(qh[ib]&0x8000)?-0.125f:0.125f;\n"
+"            for(int l=0;l<4;++l){int qi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);const signed char *grid=(const signed char*)&iq1s_grid_dev[qi];int base=ib*32+l*8;\n"
+"                for(int j=0;j<8;++j)sum+=dl*((float)grid[j]+ds)*gx[b*256+base+j];}}}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)out[(size_t)group*rows+row]=sum*weights[e];\n"
+"}\n"
+"__global__ void glm5next_moe_reduce_iq1s_batch(float *accum,const float *parts,int rows,int experts,int tokens){\n"
+"    int i=blockIdx.x*blockDim.x+threadIdx.x,t=i/rows,row=i%rows;if(t>=tokens)return;float s=0.0f;\n"
+"    for(int e=0;e<experts;++e)s+=parts[((size_t)t*experts+e)*rows+row];accum[(size_t)t*rows+row]+=s;\n"
+"}\n"
 "__global__ void glm5next_moe_reduce_iq1s(float *accum, const float *parts, int rows, int experts) {\n"
 "    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=rows)return; float s=0.0f;\n"
 "    for(int e=0;e<experts;++e)s+=parts[(size_t)e*rows+i]; accum[i]+=s;\n"
@@ -8683,6 +8719,9 @@ struct hip_llm_runner {
     hipFunction_t fn_glm5next_moe_down_iq1s_selected;
     hipFunction_t fn_glm5next_moe_down_iq1s_selected_dp4a;
     hipFunction_t fn_glm5next_moe_reduce_iq1s;
+    hipFunction_t fn_glm5next_moe_gateup_iq1s_batch;
+    hipFunction_t fn_glm5next_moe_down_iq1s_batch;
+    hipFunction_t fn_glm5next_moe_reduce_iq1s_batch;
     hipFunction_t fn_iq1_s_down_accum_f32;
     hipFunction_t fn_qwen4_hc_up_mix_q8;
     hipFunction_t fn_qwen4_hc_down_silu_q8;
@@ -9438,6 +9477,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(glm5next_moe_down_iq1s_selected);
     GET_FUNC(glm5next_moe_down_iq1s_selected_dp4a);
     GET_FUNC(glm5next_moe_reduce_iq1s);
+    GET_FUNC(glm5next_moe_gateup_iq1s_batch);
+    GET_FUNC(glm5next_moe_down_iq1s_batch);
+    GET_FUNC(glm5next_moe_reduce_iq1s_batch);
     GET_FUNC(iq1_s_down_accum_f32);
     GET_FUNC(qwen4_hc_up_mix_q8);
     GET_FUNC(qwen4_hc_down_silu_q8);
@@ -13223,6 +13265,26 @@ static inline void launch_glm5next_moe_reduce_iq1s(hip_llm_runner *r,
     void *args[] = { &accum, &parts, &rows, &experts };
     LAUNCH(r->fn_glm5next_moe_reduce_iq1s, (rows + 255) / 256, 1, 1,
            256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_glm5next_moe_gateup_iq1s_batch(hip_llm_runner *r,
+        void *dst, void *gates, void *ups, void *x, int rows, int cols,
+        int experts, int tokens) {
+    void *args[] = { &dst, &gates, &ups, &x, &rows, &cols, &experts, &tokens };
+    LAUNCH(r->fn_glm5next_moe_gateup_iq1s_batch, (rows + 7) / 8,
+           1, experts * tokens, 256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_glm5next_moe_down_iq1s_batch(hip_llm_runner *r,
+        void *out, void *downs, void *gate, void *weights, int rows,
+        int cols, int experts, int tokens) {
+    void *args[] = { &out, &downs, &gate, &weights, &rows, &cols, &experts, &tokens };
+    LAUNCH(r->fn_glm5next_moe_down_iq1s_batch, (rows + 7) / 8,
+           1, experts * tokens, 256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_glm5next_moe_reduce_iq1s_batch(hip_llm_runner *r,
+        void *accum, void *parts, int rows, int experts, int tokens) {
+    void *args[] = { &accum, &parts, &rows, &experts, &tokens };
+    LAUNCH(r->fn_glm5next_moe_reduce_iq1s_batch,
+           (rows * tokens + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
 static inline void launch_matvec_qz_q8(hip_llm_runner *r,
