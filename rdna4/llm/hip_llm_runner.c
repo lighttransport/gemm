@@ -16974,11 +16974,24 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     int rc = -1;
     int scratch = 0;
     int mapped_host = 0;
+    const int moe_phase_profile = getenv("GLM5NEXT_MOE_PHASE_PROFILE") &&
+        atoi(getenv("GLM5NEXT_MOE_PHASE_PROFILE")) != 0;
+    double moe_phase_t0 = 0.0;
     void *mapped_gate = NULL, *mapped_up = NULL, *mapped_down = NULL;
     size_t mapped_gate_stride = 0, mapped_up_stride = 0, mapped_down_stride = 0;
     char name[128];
     if (!r || !model || !c || !hidden || !out || layer < 0 ||
         layer >= c->n_layers_all || slots <= 0 || slots > 64) return -1;
+#define MOE_PHASE(label) do { \
+    if (moe_phase_profile) { \
+        if (hipStreamSynchronize(r->stream) != hipSuccess) goto done; \
+        double moe_phase_t1 = hllm_monotonic_ms(); \
+        fprintf(stderr, "glm5next moe phase: layer=%d %s %.3f ms\n", \
+                layer, (label), moe_phase_t1 - moe_phase_t0); \
+        moe_phase_t0 = moe_phase_t1; \
+    } \
+} while (0)
+    if (moe_phase_profile) moe_phase_t0 = hllm_monotonic_ms();
     r->iq1_q8_valid = 0;
     router_cache = r->glm5next_moe_router ? &r->glm5next_moe_router[layer] : NULL;
     {
@@ -17069,6 +17082,7 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
             goto done;
         }
     }
+    MOE_PHASE("route");
     for (int j = 0; j < slots; ++j) { ids[j] = -1; weights[j] = -INFINITY; }
     for (int e = 0; e < c->expert_count; ++e) {
         float score = 1.0f / (1.0f + expf(-router[e])) + bias[e];
@@ -17136,6 +17150,7 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
             own_w[j] = 1;
         }
     }
+    MOE_PHASE("materialize");
     grouped_iq1 = 1;
     for (int j = 0; j < slots; ++j)
         if (gtype[j] != GGML_TYPE_IQ1_S || utype[j] != GGML_TYPE_IQ1_S ||
@@ -17200,6 +17215,7 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
                                           c->expert_ff_length, slots);
         }
         launch_glm5next_moe_reduce_iq1s(r, daccum, do_, c->hidden_size, slots);
+        MOE_PHASE("routed-grouped");
     } else if (grouped_gateup_iq1) {
         /* Gate/up are IQ1_S on several GLM5 quantizations while down is
          * IQ3_XXS. Fuse the expensive gate/up stage even when the down
@@ -17220,17 +17236,40 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
                                             r->glm5next_moe_ptrs[1], dx,
                                             c->expert_ff_length, c->hidden_size, slots);
         }
-        for (int j = 0; j < slots; ++j) {
-            float w = c->routed_scaling_factor * weights[j] /
-                      (sum > 0.0f ? sum : 1.0f);
-            float *gj = (float *)dg + (size_t)j * c->expert_ff_length;
-            if (dtype[j] == GGML_TYPE_IQ1_S) {
-                launch_iq1_s_down_accum(r, daccum, ddw[j], gj, w,
-                                        c->hidden_size, c->expert_ff_length);
-            } else {
-                launch_matvec_auto(r, do_, ddw[j], gj, c->hidden_size,
-                                   c->expert_ff_length, dtype[j]);
-                launch_scale_add(r, daccum, do_, w, c->hidden_size);
+        int all_down_iq3 = 1;
+        for (int j = 0; j < slots; ++j)
+            if (dtype[j] != GGML_TYPE_IQ3_XXS) all_down_iq3 = 0;
+        if (all_down_iq3) {
+            /* The IQ1 gate/up route is commonly paired with IQ3_XXS down
+             * matrices.  Use the pointer-table kernel here too; the previous
+             * loop issued one full hidden-width launch per expert. */
+            if (hipMemcpyAsync(r->glm5next_moe_ptrs[2], ddw,
+                               (size_t)slots * sizeof(void *),
+                               hipMemcpyHostToDevice, r->stream) != hipSuccess)
+                goto done;
+            launch_matvec_iq3_xxs_ptrs(r, do_, r->glm5next_moe_ptrs[2], dg,
+                                       c->hidden_size, c->expert_ff_length,
+                                       c->expert_ff_length, slots);
+            for (int j = 0; j < slots; ++j) {
+                float w = c->routed_scaling_factor * weights[j] /
+                          (sum > 0.0f ? sum : 1.0f);
+                launch_scale_add(r, daccum,
+                                 (float *)do_ + (size_t)j * c->hidden_size,
+                                 w, c->hidden_size);
+            }
+        } else {
+            for (int j = 0; j < slots; ++j) {
+                float w = c->routed_scaling_factor * weights[j] /
+                          (sum > 0.0f ? sum : 1.0f);
+                float *gj = (float *)dg + (size_t)j * c->expert_ff_length;
+                if (dtype[j] == GGML_TYPE_IQ1_S) {
+                    launch_iq1_s_down_accum(r, daccum, ddw[j], gj, w,
+                                            c->hidden_size, c->expert_ff_length);
+                } else {
+                    launch_matvec_auto(r, do_, ddw[j], gj, c->hidden_size,
+                                       c->expert_ff_length, dtype[j]);
+                    launch_scale_add(r, daccum, do_, w, c->hidden_size);
+                }
             }
         }
     } else if (!getenv("GLM5NEXT_HIP_IQ2_XXS_GROUPED") ||
@@ -17375,6 +17414,7 @@ moe_scalar_experts:
     if (hipStreamSynchronize(r->stream) != hipSuccess ||
         hipMemcpy(out, daccum, (size_t)c->hidden_size * sizeof(float),
                   hipMemcpyDeviceToHost) != hipSuccess) goto done;
+    MOE_PHASE("shared-and-copy");
     rc = 0;
 done:
     for (int j = 0; j < slots; ++j) if (own_w[j]) {
@@ -17392,6 +17432,7 @@ done:
     free(router); free(bias); free(gate); free(up); free(expert_out);
     free(shared_gate); free(shared_up); free(shared_out);
     return rc;
+#undef MOE_PHASE
 #undef G5MOE_ALLOC
 #undef G5MOE_VIEW
 }
