@@ -10953,7 +10953,12 @@ static int glm5next_moe_down_pool_get(hip_llm_runner *r, const qtensor *down,
     s->down = (unsigned char *)r->glm5next_moe_down_pool +
               (size_t)victim * r->glm5next_moe_down_pool_stride;
     s->pooled_down = 1;
-    if (hipMemcpy(s->down, down->data, bytes, hipMemcpyHostToDevice) != hipSuccess)
+    /* The mapped-host tensor was page-locked by glm5next_moe_map_layer().
+     * Keep pool fills on the runner stream: the grouped MoE launch is ordered
+     * after these copies, while the CPU can materialize the remaining route
+     * slots without paying one blocking H2D round trip per expert. */
+    if (hipMemcpyAsync(s->down, down->data, bytes,
+                       hipMemcpyHostToDevice, r->stream) != hipSuccess)
         return -1;
     s->layer = layer; s->expert = expert; s->age = ++r->glm5next_moe_cache_clock;
     s->bytes = bytes; s->down_capacity = r->glm5next_moe_down_pool_stride;
@@ -11289,7 +11294,11 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                 else if (budget > free_b - reserve) budget = free_b - reserve;
             }
             if (slots < 0) slots = 0;
-            if (slots > 128) slots = 128;
+            /* A mapped-host model can benefit from one routed set per layer:
+             * GLM5 uses 34 MoE layers with up to 8 selected experts, so the
+             * old 128-slot ceiling forced avoidable down-weight thrashing even
+             * when the caller supplied a larger VRAM budget. */
+            if (slots > 512) slots = 512;
             if (slots > 0 && budget > 0) {
                 r->glm5next_moe_cache = (glm5next_moe_resident_slot *)calloc(
                     (size_t)slots, sizeof(*r->glm5next_moe_cache));
@@ -16782,8 +16791,21 @@ static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
     int types[9] = { 0 }, rc = -1;
     glm5next_kda_gpu_cache *persistent = NULL;
     int own_weights = 1;
+    const int phase_profile = getenv("GLM5NEXT_KDA_PHASE_PROFILE") &&
+        atoi(getenv("GLM5NEXT_KDA_PHASE_PROFILE")) != 0;
+    double phase_t0 = 0.0;
     if (!r || !model || !hidden || !out || !recurrent || !conv_state ||
         glm5next_layer_type(c, layer) != GLM5NEXT_LAYER_KDA) return -1;
+#define KDA_PHASE(label) do { \
+    if (phase_profile) { \
+        if (hipStreamSynchronize(r->stream) != hipSuccess) goto done; \
+        double phase_t1 = hllm_monotonic_ms(); \
+        fprintf(stderr, "glm5next kda phase: layer=%d %s %.3f ms\n", \
+                layer, (label), phase_t1 - phase_t0); \
+        phase_t0 = phase_t1; \
+    } \
+} while (0)
+    if (phase_profile) phase_t0 = hllm_monotonic_ms();
     r->iq1_q8_valid = 0;
     if (select && atoi(select) != layer)
         return glm5next_cpu_kda_forward(model, layer, c, hidden, out, recurrent, conv_state);
@@ -16857,6 +16879,7 @@ static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
     launch_conv1d(r, dk, dcs[1], dk, cw[1], qdim, ck);
     launch_conv1d(r, dv, dcs[2], dv, cw[2], qdim, ck);
     launch_l2_norm_heads(r, dq, heads, d, 1e-6f); launch_l2_norm_heads(r, dk, heads, d, 1e-6f);
+    KDA_PHASE("qkv-conv-norm");
     launch_matvec_auto(r, dfa, mw[3], dx, dt_rank, h, types[3]);
     launch_matvec_auto(r, df, mw[4], dfa, qdim, dt_rank, types[4]);
     launch_matvec_auto(r, dbeta, mw[5], dx, heads, h, types[5]);
@@ -16864,15 +16887,19 @@ static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
     launch_matvec_auto(r, dgg, mw[7], dga, qdim, dt_rank, types[7]);
     launch_glm5next_kda_decay(r, ddecay, df, d_dt, d_a, heads, d, c->kda_gate_lower_bound);
     launch_sigmoid_inplace(r, dbeta, heads);
+    KDA_PHASE("aux-projections");
     launch_glm5next_kda_heads_step(r, dstate, dcore, dq, dk, dv, ddecay, dbeta, heads, d);
     launch_glm5next_kda_gated_norm(r, dcore, dgg, d_norm, heads, d, 1e-6f);
+    KDA_PHASE("recurrent-norm");
     launch_matvec_auto(r, dout, mw[8], dcore, h, qdim, types[8]);
+    KDA_PHASE("output-projection");
     if (hipStreamSynchronize(r->stream) != hipSuccess ||
         hipMemcpy(out, dout, (size_t)h*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
     rc = 0;
 done:
     if (own_weights) for (int i=0;i<9;++i) if (mw[i]) hipFree(mw[i]);
     if (own_weights) for (int i=0;i<3;++i) if (cw[i]) hipFree(cw[i]);
+#undef KDA_PHASE
     return rc;
 #undef KCB_VIEW
 }

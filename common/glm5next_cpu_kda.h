@@ -668,6 +668,19 @@ static inline int glm5next_cpu_kda_moe_block_cb(const gguf_shards *model,
     char name[128]; glm5next_tensor_view fn, base, scale;
     glm5next_cpu_mhc_workspace *w = glm5next_cpu_mhc_workspace_get(c);
     if (!w) goto fail;
+    const int profile = getenv("GLM5NEXT_BLOCK_PHASE_PROFILE") &&
+                        atoi(getenv("GLM5NEXT_BLOCK_PHASE_PROFILE")) != 0;
+    struct timespec profile_t0, profile_t1;
+    if (profile) clock_gettime(CLOCK_MONOTONIC, &profile_t0);
+#define BLOCK_PHASE(label) do { \
+    if (profile) { \
+        clock_gettime(CLOCK_MONOTONIC, &profile_t1); \
+        fprintf(stderr, "glm5next block phase: layer=%d %s %.3f ms\n", layer, \
+                (label), (double)(profile_t1.tv_sec - profile_t0.tv_sec) * 1000.0 + \
+                (double)(profile_t1.tv_nsec - profile_t0.tv_nsec) / 1000000.0); \
+        profile_t0 = profile_t1; \
+    } \
+} while (0)
     float *residual = w->residual, *collapsed = w->collapsed;
     float *sublayer = w->sublayer, *post = w->post, *comb = w->comb, *norm = w->norm;
     memcpy(residual, streams, (size_t)hc * h * sizeof(float));
@@ -677,26 +690,35 @@ static inline int glm5next_cpu_kda_moe_block_cb(const gguf_shards *model,
     if (glm5next_cpu_mhc_pre_cb(model, layer, c, 0, &fn, &base, &scale,
                                 residual, collapsed, post, comb,
                                 mhc_callback, mhc_opaque) != 0) goto fail;
+    BLOCK_PHASE("attn-mhc-pre");
     KM_VIEW("attn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
     glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
+    BLOCK_PHASE("attn-norm");
     if ((callback ? callback(model, layer, c, collapsed, sublayer, recurrent,
                              conv_state, opaque)
                   : glm5next_cpu_kda_forward(model, layer, c, collapsed,
                              sublayer, recurrent, conv_state)) != 0) goto fail;
+    BLOCK_PHASE("kda");
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
+    BLOCK_PHASE("attn-mhc-post");
     memcpy(residual, streams, (size_t)hc * h * sizeof(float));
     KM_VIEW("hc_ffn_fn.weight", fn); KM_VIEW("hc_ffn_base.weight", base); KM_VIEW("hc_ffn_scale.weight", scale);
     if (glm5next_cpu_mhc_pre_cb(model, layer, c, 1, &fn, &base, &scale,
                                 residual, collapsed, post, comb,
                                 mhc_callback, mhc_opaque) != 0) goto fail;
+    BLOCK_PHASE("ffn-mhc-pre");
     KM_VIEW("ffn_norm.weight", fn); if (glm5next_cpu_vector(&fn, norm, h) != 0) goto fail;
     glm5next_cpu_rmsnorm(collapsed, collapsed, norm, h, c->norm_epsilon);
+    BLOCK_PHASE("ffn-norm");
     if (glm5next_cpu_moe_ffn_cb(model, layer, c, collapsed, sublayer,
                                 moe_callback, moe_opaque) != 0) goto fail;
+    BLOCK_PHASE("moe");
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
+    BLOCK_PHASE("ffn-mhc-post");
     return 0;
 fail:
     return -1;
+#undef BLOCK_PHASE
 #undef KM_VIEW
 }
 
