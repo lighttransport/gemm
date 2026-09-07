@@ -8692,6 +8692,8 @@ struct hip_llm_runner {
     glm5next_mhc_gpu_cache *glm5next_mhc_gpu;
     void *glm5next_mhc_scratch[5]; /* dx, dy, collapsed, post, comb */
     int glm5next_mhc_scratch_ready;
+    void *glm5next_moe_scratch[5]; /* dx, gate, up, down, accumulator */
+    int glm5next_moe_scratch_ready;
     /* Reused decode scratch for the serialized GLM5Next KDA callback.
      * Indices 0..12 are the named vectors below; 13..15 are conv buffers. */
     void *glm5next_kda_scratch[16];
@@ -16072,6 +16074,23 @@ done:
  * matrices are streamed through the normal HIP matvec kernels.  This avoids
  * retaining 45 * 288 experts on a 16 GiB card and gives us a direct bridge to
  * the eventual resident/cache implementation. */
+static int glm5next_moe_scratch_get(hip_llm_runner *r, const glm5next_config *c) {
+    if (!r || !c) return -1;
+    if (r->glm5next_moe_scratch_ready) return 0;
+    size_t n[5] = { (size_t)c->hidden_size, (size_t)c->expert_ff_length,
+                    (size_t)c->expert_ff_length, (size_t)c->hidden_size,
+                    (size_t)c->hidden_size };
+    for (int i = 0; i < 5; ++i) {
+        if (hipMalloc(&r->glm5next_moe_scratch[i], n[i] * sizeof(float)) != hipSuccess) {
+            for (int j = 0; j < i; ++j) hipFree(r->glm5next_moe_scratch[j]);
+            memset(r->glm5next_moe_scratch, 0, sizeof(r->glm5next_moe_scratch));
+            return -1;
+        }
+    }
+    r->glm5next_moe_scratch_ready = 1;
+    return 0;
+}
+
 static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
         const glm5next_config *c, const float *hidden, float *out, void *opaque) {
     hip_llm_runner *r = (hip_llm_runner *)opaque;
@@ -16093,6 +16112,7 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     float weights[64];
     glm5next_moe_router_cache *router_cache = NULL;
     int rc = -1;
+    int scratch = 0;
     char name[128];
     if (!r || !model || !c || !hidden || !out || layer < 0 ||
         layer >= c->n_layers_all || slots <= 0 || slots > 64) return -1;
@@ -16190,11 +16210,13 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
         weights[j] = w; sum += w;
     }
     memset(out, 0, (size_t)c->hidden_size * sizeof(float));
-    G5MOE_ALLOC(dx, c->hidden_size);
-    G5MOE_ALLOC(dg, c->expert_ff_length);
-    G5MOE_ALLOC(du, c->expert_ff_length);
-    G5MOE_ALLOC(do_, c->hidden_size);
-    G5MOE_ALLOC(daccum, c->hidden_size);
+    if (glm5next_moe_scratch_get(r, c) != 0) goto done;
+    scratch = 1;
+    dx = r->glm5next_moe_scratch[0];
+    dg = r->glm5next_moe_scratch[1];
+    du = r->glm5next_moe_scratch[2];
+    do_ = r->glm5next_moe_scratch[3];
+    daccum = r->glm5next_moe_scratch[4];
     if (hipMemcpy(dx, hidden, (size_t)c->hidden_size * sizeof(float),
                   hipMemcpyHostToDevice) != hipSuccess) goto done;
     if (hipMemset(daccum, 0, (size_t)c->hidden_size * sizeof(float)) != hipSuccess) goto done;
@@ -16297,7 +16319,10 @@ done:
     if (shared_own) {
         if (dsg) hipFree(dsg); if (dsu) hipFree(dsu); if (dso) hipFree(dso);
     }
-    if (dx) hipFree(dx); if (dg) hipFree(dg); if (du) hipFree(du); if (do_) hipFree(do_); if (daccum) hipFree(daccum);
+    if (!scratch) {
+        if (dx) hipFree(dx); if (dg) hipFree(dg); if (du) hipFree(du);
+        if (do_) hipFree(do_); if (daccum) hipFree(daccum);
+    }
     if (drw && (!router_cache || drw != router_cache->weight)) hipFree(drw);
     if (drx) hipFree(drx); if (dr) hipFree(dr);
     free(router); free(bias); free(gate); free(up); free(expert_out);
@@ -19230,6 +19255,11 @@ void hip_llm_free(hip_llm_runner *r) {
         r->glm5next_mhc_scratch[i] = NULL;
     }
     r->glm5next_mhc_scratch_ready = 0;
+    for (int i = 0; i < 5; ++i) {
+        if (r->glm5next_moe_scratch[i]) hipFree(r->glm5next_moe_scratch[i]);
+        r->glm5next_moe_scratch[i] = NULL;
+    }
+    r->glm5next_moe_scratch_ready = 0;
     for (int i = 0; i < 16; ++i) {
         if (r->glm5next_kda_scratch[i]) hipFree(r->glm5next_kda_scratch[i]);
         r->glm5next_kda_scratch[i] = NULL;
