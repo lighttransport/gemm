@@ -532,6 +532,44 @@ typedef int (*glm5next_kda_callback)(const gguf_shards *model, int layer,
 typedef int (*glm5next_output_callback)(const gguf_shards *model,
         const glm5next_config *config, float *hidden, float *logits, void *opaque);
 
+/* The single-token runtime visits layers serially.  Keep the mHC temporaries
+ * in a thread-local arena so the hot path does not malloc/free six buffers at
+ * every attention and FFN site.  The arena is resized only when a caller
+ * changes model dimensions on the same worker thread. */
+typedef struct {
+    float *residual, *collapsed, *sublayer, *post, *comb, *norm;
+    int h, hc;
+} glm5next_cpu_mhc_workspace;
+
+static _Thread_local glm5next_cpu_mhc_workspace glm5next_cpu_mhc_tls;
+
+static inline glm5next_cpu_mhc_workspace *glm5next_cpu_mhc_workspace_get(
+        const glm5next_config *c) {
+    if (!c) return NULL;
+    int h = c->hidden_size, hc = c->hc_count;
+    glm5next_cpu_mhc_workspace *w = &glm5next_cpu_mhc_tls;
+    if (w->h == h && w->hc == hc && w->residual && w->collapsed &&
+        w->sublayer && w->post && w->comb && w->norm) return w;
+    free(w->residual); free(w->collapsed); free(w->sublayer);
+    free(w->post); free(w->comb); free(w->norm);
+    memset(w, 0, sizeof(*w));
+    w->residual = (float *)malloc((size_t)hc * h * sizeof(float));
+    w->collapsed = (float *)malloc((size_t)h * sizeof(float));
+    w->sublayer = (float *)malloc((size_t)h * sizeof(float));
+    w->post = (float *)malloc((size_t)hc * sizeof(float));
+    w->comb = (float *)malloc((size_t)hc * hc * sizeof(float));
+    w->norm = (float *)malloc((size_t)h * sizeof(float));
+    if (!w->residual || !w->collapsed || !w->sublayer || !w->post ||
+        !w->comb || !w->norm) {
+        free(w->residual); free(w->collapsed); free(w->sublayer);
+        free(w->post); free(w->comb); free(w->norm);
+        memset(w, 0, sizeof(*w));
+        return NULL;
+    }
+    w->h = h; w->hc = hc;
+    return w;
+}
+
 static inline int glm5next_cpu_dsa_moe_block_cached_cb(const gguf_shards *model,
         int layer, const glm5next_config *c, float *streams,
         float *latent_cache, int max_seq_len, int position,
@@ -540,13 +578,10 @@ static inline int glm5next_cpu_dsa_moe_block_cached_cb(const gguf_shards *model,
         glm5next_mhc_callback mhc_callback, void *mhc_opaque) {
     int h = c->hidden_size, hc = c->hc_count;
     char name[128]; glm5next_tensor_view fn, base, scale;
-    float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
-    float *collapsed = (float *)malloc((size_t)h * sizeof(float));
-    float *sublayer = (float *)malloc((size_t)h * sizeof(float));
-    float *post = (float *)malloc((size_t)hc * sizeof(float));
-    float *comb = (float *)malloc((size_t)hc * hc * sizeof(float));
-    float *norm = (float *)malloc((size_t)h * sizeof(float));
-    if (!residual || !collapsed || !sublayer || !post || !comb || !norm) goto fail;
+    glm5next_cpu_mhc_workspace *w = glm5next_cpu_mhc_workspace_get(c);
+    if (!w) goto fail;
+    float *residual = w->residual, *collapsed = w->collapsed;
+    float *sublayer = w->sublayer, *post = w->post, *comb = w->comb, *norm = w->norm;
     memcpy(residual, streams, (size_t)hc * h * sizeof(float));
 #define BLOCK_VIEW(s, dst) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
     if (glm5next_tensor_view_get(model, name, 1, &(dst)) != 0) goto fail; } while (0)
@@ -572,9 +607,9 @@ static inline int glm5next_cpu_dsa_moe_block_cached_cb(const gguf_shards *model,
     if (glm5next_cpu_moe_ffn_cb(model, layer, c, collapsed, sublayer,
                                 moe_callback, moe_opaque) != 0) goto fail;
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
-    free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return 0;
+    return 0;
 fail:
-    free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return -1;
+    return -1;
 #undef BLOCK_VIEW
 }
 
@@ -602,13 +637,10 @@ static inline int glm5next_cpu_kda_moe_block_cb(const gguf_shards *model,
         glm5next_mhc_callback mhc_callback, void *mhc_opaque) {
     int h = c->hidden_size, hc = c->hc_count;
     char name[128]; glm5next_tensor_view fn, base, scale;
-    float *residual = (float *)malloc((size_t)hc * h * sizeof(float));
-    float *collapsed = (float *)malloc((size_t)h * sizeof(float));
-    float *sublayer = (float *)malloc((size_t)h * sizeof(float));
-    float *post = (float *)malloc((size_t)hc * sizeof(float));
-    float *comb = (float *)malloc((size_t)hc * hc * sizeof(float));
-    float *norm = (float *)malloc((size_t)h * sizeof(float));
-    if (!residual || !collapsed || !sublayer || !post || !comb || !norm) goto fail;
+    glm5next_cpu_mhc_workspace *w = glm5next_cpu_mhc_workspace_get(c);
+    if (!w) goto fail;
+    float *residual = w->residual, *collapsed = w->collapsed;
+    float *sublayer = w->sublayer, *post = w->post, *comb = w->comb, *norm = w->norm;
     memcpy(residual, streams, (size_t)hc * h * sizeof(float));
 #define KM_VIEW(s, dst) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
     if (glm5next_tensor_view_get(model, name, 1, &(dst)) != 0) goto fail; } while (0)
@@ -633,9 +665,9 @@ static inline int glm5next_cpu_kda_moe_block_cb(const gguf_shards *model,
     if (glm5next_cpu_moe_ffn_cb(model, layer, c, collapsed, sublayer,
                                 moe_callback, moe_opaque) != 0) goto fail;
     glm5next_cpu_mhc_post(c, streams, residual, sublayer, post, comb);
-    free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return 0;
+    return 0;
 fail:
-    free(residual); free(collapsed); free(sublayer); free(post); free(comb); free(norm); return -1;
+    return -1;
 #undef KM_VIEW
 }
 
