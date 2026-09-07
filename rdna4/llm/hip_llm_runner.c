@@ -3952,6 +3952,73 @@ static const char *hip_kernel_source =
 "    if (lane == 0) dst[(size_t)slot * n_rows + row] = sum;\n"
 "}\n"
 "\n"
+"/* Token-batched IQ2_XXS projection.  blockIdx.z indexes a flattened\n"
+" * [token][slot] table; x_stride is the activation stride between tokens. */\n"
+"__global__ void matvec_iq2_xxs_batch_ptrs_f32(float *dst, const unsigned char *const *mats,\n"
+"        const float *x, int n_rows, int n_cols, int slots, int x_stride) {\n"
+"    int warp_id = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int group = blockIdx.z;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 66;\n"
+"    const unsigned char *row_ptr = mats[group] + (size_t)row * row_bytes;\n"
+"    const float *xt = x + (size_t)(group / slots) * x_stride;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 66;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        float partial = 0.0f; int yi = 0;\n"
+"        for (int ib32 = 0; ib32 < 8; ++ib32) {\n"
+"            unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
+"            unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
+"            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"            const unsigned char *aux8 = (const unsigned char *)&aux0;\n"
+"            for (int l = 0; l < 4; ++l) {\n"
+"                const unsigned char *grid = (const unsigned char *)&iq2xxs_grid_dev[aux8[l]];\n"
+"                unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
+"                const float *xb = xt + b * 256;\n"
+"                for (int j = 0; j < 8; ++j)\n"
+"                    partial += db * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f) * xb[yi++];\n"
+"            }\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[(size_t)group * n_rows + row] = sum;\n"
+"}\n"
+
+"/* Token-batched IQ3_XXS projection.  x is [token][slot][n_cols]. */\n"
+"__global__ void matvec_iq3_xxs_batch_ptrs_f32(float *dst, const unsigned char *const *mats,\n"
+"        const float *x, int n_rows, int n_cols, int slots, int x_stride) {\n"
+"    int warp_id = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int group = blockIdx.z, slot = group % slots;\n"
+"    int row = blockIdx.x * 8 + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 98, G = nb * 32;\n"
+"    const unsigned char *row_ptr = mats[group] + (size_t)row * row_bytes;\n"
+"    const float *xt = x + (size_t)(group / slots) * x_stride + (size_t)slot * n_cols;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5, rem = g & 31, sb = rem >> 2, l = rem & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = *(const unsigned int *)(bp + 66 + 4*sb);\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        const float *xb = xt + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; ++j) {\n"
+"            sum += db * (float)g1[j] * ((sgn & (1 << j)) ? -1.0f : 1.0f) * xb[j];\n"
+"            sum += db * (float)g2[j] * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f) * xb[j+4];\n"
+"        }\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[(size_t)group * n_rows + row] = sum;\n"
+"}\n"
+
 "/* ---- matvec_iq2_s_f32: IQ2_S matrix x F32 vector -> F32 ---- */\n"
 "/* Full 32-lane utilization: each lane processes 8-element groups (one (ib32,l)  */\n"
 "/* pair = a single grid entry) striding by 32 over the row's nb*32 groups. Avoids */\n"
@@ -8782,6 +8849,7 @@ struct hip_llm_runner {
     int   decode_dp4a;   /* LLM_DECODE_DP4A (default on) */
     hipFunction_t fn_matvec_iq2_xxs_f32;
     hipFunction_t fn_matvec_iq2_xxs_ptrs_f32;
+    hipFunction_t fn_matvec_iq2_xxs_batch_ptrs_f32;
     hipFunction_t fn_matvec_q4_0_f32;
     hipFunction_t fn_matvec_q4_1_f32;
     hipFunction_t fn_matvec_q5_0_f32;
@@ -8791,6 +8859,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq2_xs_f32;
     hipFunction_t fn_matvec_iq3_xxs_f32;
     hipFunction_t fn_matvec_iq3_xxs_ptrs_f32;
+    hipFunction_t fn_matvec_iq3_xxs_batch_ptrs_f32;
     hipFunction_t fn_matvec_iq2_s_f32;
     hipFunction_t fn_matvec_iq3_s_f32;
     hipFunction_t fn_matvec_iq1_s_f32;
@@ -9492,6 +9561,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq2_s_expert_f32);
     GET_FUNC(matvec_iq3_s_expert_f32);
     GET_FUNC(matvec_iq4_xs_expert_f32);
+    GET_FUNC(matvec_iq2_xxs_batch_ptrs_f32);
+    GET_FUNC(matvec_iq3_xxs_batch_ptrs_f32);
     /* DP4A decode path */
     GET_FUNC(quantize_q8_32);
     GET_FUNC(matvec_iq2_s_dp4a);
@@ -13579,6 +13650,13 @@ static inline void launch_matvec_iq2_xxs_ptrs(hip_llm_runner *r, void *dst,
     LAUNCH(r->fn_matvec_iq2_xxs_ptrs_f32, (n_rows + 7) / 8, 1, slots,
            256, 1, 1, 0, r->stream, args);
 }
+static inline void launch_matvec_iq2_xxs_batch_ptrs(hip_llm_runner *r,
+        void *dst, void *mats, void *x, int n_rows, int n_cols,
+        int slots, int x_stride, int tokens) {
+    void *args[] = { &dst, &mats, &x, &n_rows, &n_cols, &slots, &x_stride };
+    LAUNCH(r->fn_matvec_iq2_xxs_batch_ptrs_f32, (n_rows + 7) / 8,
+           1, slots * tokens, 256, 1, 1, 0, r->stream, args);
+}
 DEFINE_LAUNCH_MATVEC(q4_0, fn_matvec_q4_0_f32)
 DEFINE_LAUNCH_MATVEC(q4_1, fn_matvec_q4_1_f32)
 DEFINE_LAUNCH_MATVEC(q5_0, fn_matvec_q5_0_f32)
@@ -13592,6 +13670,13 @@ static inline void launch_matvec_iq3_xxs_ptrs(hip_llm_runner *r, void *dst,
     void *args[] = { &dst, &mats, &x, &n_rows, &n_cols, &x_stride };
     LAUNCH(r->fn_matvec_iq3_xxs_ptrs_f32, (n_rows + 7) / 8, 1, slots,
            256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq3_xxs_batch_ptrs(hip_llm_runner *r,
+        void *dst, void *mats, void *x, int n_rows, int n_cols,
+        int slots, int x_stride, int tokens) {
+    void *args[] = { &dst, &mats, &x, &n_rows, &n_cols, &slots, &x_stride };
+    LAUNCH(r->fn_matvec_iq3_xxs_batch_ptrs_f32, (n_rows + 7) / 8,
+           1, slots * tokens, 256, 1, 1, 0, r->stream, args);
 }
 /* Quantize a F32 activation vector x[n] -> int8 per-32-block (qs) + fp32 scale. */
 static inline void launch_quantize_q8(hip_llm_runner *r, void *x, int n,
@@ -16860,6 +16945,22 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
             duw[j] = (unsigned char *)mapped_up + e * mapped_up_stride;
             ddw[j] = (unsigned char *)mapped_down + e * mapped_down_stride;
             gtype[j] = gate_v.type; utype[j] = up_v.type; dtype[j] = down_v.type;
+            /* Mapped mode is the safe fallback for the full expert table, but
+             * it used to make the resident cache completely ineffective.  An
+             * adaptive opt-in promotes selected experts on a cache miss and
+             * uses the mapped pointers until promotion succeeds.  This keeps
+             * cold-route behavior unchanged while allowing hot routes to stop
+             * rereading their three matrices over PCIe on later tokens. */
+            const char *promote_env = getenv("GLM5NEXT_HIP_MOE_MAPPED_CACHE");
+            if (promote_env && atoi(promote_env) != 0 && r->glm5next_moe_cache &&
+                glm5next_moe_cache_get(r, &gw, &uw, &dw, layer, ids[j], &resident[j]) == 0) {
+                dgw[j] = resident[j]->gate;
+                duw[j] = resident[j]->up;
+                ddw[j] = resident[j]->down;
+                gtype[j] = resident[j]->gate_type;
+                utype[j] = resident[j]->up_type;
+                dtype[j] = resident[j]->down_type;
+            }
             if (r->glm5next_moe_down_pool &&
                 glm5next_moe_down_pool_get(r, &dw, layer, ids[j], &resident[j]) == 0) {
                 ddw[j] = resident[j]->down;
@@ -17034,6 +17135,16 @@ moe_scalar_experts:
             duw[j] = (unsigned char *)mapped_up + e * mapped_up_stride;
             ddw[j] = (unsigned char *)mapped_down + e * mapped_down_stride;
             gtype[j] = gate_v.type; utype[j] = up_v.type; dtype[j] = down_v.type;
+            const char *promote_env = getenv("GLM5NEXT_HIP_MOE_MAPPED_CACHE");
+            if (promote_env && atoi(promote_env) != 0 && r->glm5next_moe_cache &&
+                glm5next_moe_cache_get(r, &gw, &uw, &dw, layer, ids[j], &resident[j]) == 0) {
+                dgw[j] = resident[j]->gate;
+                duw[j] = resident[j]->up;
+                ddw[j] = resident[j]->down;
+                gtype[j] = resident[j]->gate_type;
+                utype[j] = resident[j]->up_type;
+                dtype[j] = resident[j]->down_type;
+            }
             if (r->glm5next_moe_down_pool &&
                 glm5next_moe_down_pool_get(r, &dw, layer, ids[j], &resident[j]) == 0) {
                 ddw[j] = resident[j]->down;
