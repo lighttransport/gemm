@@ -16569,6 +16569,7 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     if (hipMemset(daccum, 0, (size_t)c->hidden_size * sizeof(float)) != hipSuccess) goto done;
 
     int grouped_iq1 = 0;
+    int grouped_gateup_iq1 = 0;
 
     size_t gu_stride = dequant_row_size(gate_v.type, (int)gate_v.dims[0]) *
                        (size_t)gate_v.dims[1];
@@ -16601,10 +16602,19 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     for (int j = 0; j < slots; ++j)
         if (gtype[j] != GGML_TYPE_IQ1_S || utype[j] != GGML_TYPE_IQ1_S ||
             dtype[j] != GGML_TYPE_IQ1_S) grouped_iq1 = 0;
+    grouped_gateup_iq1 = 1;
+    for (int j = 0; j < slots; ++j)
+        if (gtype[j] != GGML_TYPE_IQ1_S || utype[j] != GGML_TYPE_IQ1_S)
+            grouped_gateup_iq1 = 0;
     const char *grouped_env = getenv("GLM5NEXT_HIP_MOE_GROUPED_IQ1");
     if (grouped_env && atoi(grouped_env) == 0) grouped_iq1 = 0;
+    if (grouped_env && atoi(grouped_env) == 0) grouped_gateup_iq1 = 0;
+    const char *gateup_env = getenv("GLM5NEXT_HIP_MOE_GROUPED_GATEUP_IQ1");
+    if (gateup_env && atoi(gateup_env) == 0) grouped_gateup_iq1 = 0;
+    if (c->swiglu_clamp_exp && c->swiglu_clamp_exp[layer] > 1e-6f)
+        grouped_gateup_iq1 = 0;
     const char *dp4a_env = getenv("GLM5NEXT_HIP_IQ1_DP4A");
-    int grouped_dp4a = grouped_iq1 && dp4a_env && atoi(dp4a_env) != 0 &&
+    int grouped_dp4a = grouped_gateup_iq1 && dp4a_env && atoi(dp4a_env) != 0 &&
                        c->hidden_size <= 8192 && (c->hidden_size % 256) == 0;
     /* First stage all selected matrices.  The following loop then contains
      * only GPU launches, allowing the device accumulator to stay resident. */
@@ -16652,6 +16662,39 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
                                           c->expert_ff_length, slots);
         }
         launch_glm5next_moe_reduce_iq1s(r, daccum, do_, c->hidden_size, slots);
+    } else if (grouped_gateup_iq1) {
+        /* Gate/up are IQ1_S on several GLM5 quantizations while down is
+         * IQ3_XXS. Fuse the expensive gate/up stage even when the down
+         * projection cannot use the all-IQ1 grouped kernel. */
+        if (hipMemcpyAsync(r->glm5next_moe_ptrs[0], dgw,
+                           (size_t)slots * sizeof(void *), hipMemcpyHostToDevice, r->stream) != hipSuccess ||
+            hipMemcpyAsync(r->glm5next_moe_ptrs[1], duw,
+                           (size_t)slots * sizeof(void *), hipMemcpyHostToDevice, r->stream) != hipSuccess)
+            goto done;
+        if (grouped_dp4a) {
+            launch_quantize_q8(r, dx, c->hidden_size, r->d_act_q8, r->d_act_scale);
+            launch_glm5next_moe_gateup_iq1s_dp4a(r, dg, r->glm5next_moe_ptrs[0],
+                                                 r->glm5next_moe_ptrs[1], r->d_act_q8,
+                                                 r->d_act_scale, c->expert_ff_length,
+                                                 c->hidden_size, slots);
+        } else {
+            launch_glm5next_moe_gateup_iq1s(r, dg, r->glm5next_moe_ptrs[0],
+                                            r->glm5next_moe_ptrs[1], dx,
+                                            c->expert_ff_length, c->hidden_size, slots);
+        }
+        for (int j = 0; j < slots; ++j) {
+            float w = c->routed_scaling_factor * weights[j] /
+                      (sum > 0.0f ? sum : 1.0f);
+            float *gj = (float *)dg + (size_t)j * c->expert_ff_length;
+            if (dtype[j] == GGML_TYPE_IQ1_S) {
+                launch_iq1_s_down_accum(r, daccum, ddw[j], gj, w,
+                                        c->hidden_size, c->expert_ff_length);
+            } else {
+                launch_matvec_auto(r, do_, ddw[j], gj, c->hidden_size,
+                                   c->expert_ff_length, dtype[j]);
+                launch_scale_add(r, daccum, do_, w, c->hidden_size);
+            }
+        }
     } else for (int j = 0; j < slots; ++j) {
         qtensor gw = glm5next_as_qtensor(&gate_v);
         qtensor uw = glm5next_as_qtensor(&up_v);
