@@ -8690,6 +8690,8 @@ struct hip_llm_runner {
     glm5next_kda_gpu_cache *glm5next_kda_gpu;
     glm5next_kda_state_gpu *glm5next_kda_state_cache;
     glm5next_mhc_gpu_cache *glm5next_mhc_gpu;
+    void *glm5next_mhc_scratch[5]; /* dx, dy, collapsed, post, comb */
+    int glm5next_mhc_scratch_ready;
     /* Reused decode scratch for the serialized GLM5Next KDA callback.
      * Indices 0..12 are the named vectors below; 13..15 are conv buffers. */
     void *glm5next_kda_scratch[16];
@@ -10462,6 +10464,23 @@ static int glm5next_mhc_cache_load(hip_llm_runner *r,
     return 0;
 }
 
+static int glm5next_mhc_scratch_get(hip_llm_runner *r, const glm5next_config *c) {
+    if (!r || !c) return -1;
+    if (r->glm5next_mhc_scratch_ready) return 0;
+    int hc = c->hc_count, width = c->hidden_size, mix = (2 + hc) * hc;
+    size_t n[5] = { (size_t)hc * width, (size_t)mix, (size_t)width,
+                    (size_t)hc, (size_t)hc * hc };
+    for (int i = 0; i < 5; ++i) {
+        if (hipMalloc(&r->glm5next_mhc_scratch[i], n[i] * sizeof(float)) != hipSuccess) {
+            for (int j = 0; j < i; ++j) hipFree(r->glm5next_mhc_scratch[j]);
+            memset(r->glm5next_mhc_scratch, 0, sizeof(r->glm5next_mhc_scratch));
+            return -1;
+        }
+    }
+    r->glm5next_mhc_scratch_ready = 1;
+    return 0;
+}
+
 static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
         const glm5next_config *c, int site, const float *streams,
         float *collapsed, float *post, float *comb, void *opaque) {
@@ -10471,6 +10490,7 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
     void *dcollapsed = NULL, *dpost = NULL, *dcomb = NULL;
     float *logits = NULL, *base_f = NULL, *scale_f = NULL;
     int wt = 0, rc = -1;
+    int scratch = 0;
     char n[128];
     const char *suffix = site == 0 ? "hc_attn" : "hc_ffn";
     glm5next_mhc_gpu_cache *mhc_cache = NULL;
@@ -10487,11 +10507,16 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
     mhc_cache = &r->glm5next_mhc_gpu[layer * 2 + site];
     dw = mhc_cache->fn;
     wt = mhc_cache->type;
+    if (glm5next_mhc_scratch_get(r, c) != 0) goto done;
+    scratch = 1;
+    dx = r->glm5next_mhc_scratch[0];
+    dy = r->glm5next_mhc_scratch[1];
+    dcollapsed = r->glm5next_mhc_scratch[2];
+    dpost = r->glm5next_mhc_scratch[3];
+    dcomb = r->glm5next_mhc_scratch[4];
     logits = mhc_cache->logits;
     base_f = mhc_cache->base_f;
     scale_f = mhc_cache->scale_f;
-    if (hipMalloc(&dx, (size_t)hc * width * sizeof(float)) != hipSuccess ||
-        hipMalloc(&dy, (size_t)mix * sizeof(float)) != hipSuccess) goto done;
     if (hipMemcpy(dx, streams, (size_t)hc * width * sizeof(float),
                   hipMemcpyHostToDevice) != hipSuccess) goto done;
     launch_matvec_auto(r, dy, dw, dx, mix, hc * width, wt);
@@ -10499,9 +10524,6 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
         atoi(getenv("GLM5NEXT_HIP_MHC_FINISH")) != 0) {
         dbase = mhc_cache->base;
         dscale = mhc_cache->scale;
-        if (hipMalloc(&dcollapsed, (size_t)width * sizeof(float)) != hipSuccess ||
-            hipMalloc(&dpost, (size_t)hc * sizeof(float)) != hipSuccess ||
-            hipMalloc(&dcomb, (size_t)hc * hc * sizeof(float)) != hipSuccess) goto done;
         launch_glm5next_mhc_finish(r, dcollapsed, dpost, dcomb, dy, dx,
                                    dbase, dscale, hc, width, c->norm_epsilon,
                                    c->hc_sinkhorn_epsilon);
@@ -10519,10 +10541,10 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
     }
     rc = 0;
 done:
-    if (dx) hipFree(dx); if (dy) hipFree(dy);
+    if (!scratch) { if (dx) hipFree(dx); if (dy) hipFree(dy); }
     if (dbase && (!mhc_cache || dbase != mhc_cache->base)) hipFree(dbase);
     if (dscale && (!mhc_cache || dscale != mhc_cache->scale)) hipFree(dscale);
-    if (dcollapsed) hipFree(dcollapsed); if (dpost) hipFree(dpost); if (dcomb) hipFree(dcomb);
+    if (!scratch) { if (dcollapsed) hipFree(dcollapsed); if (dpost) hipFree(dpost); if (dcomb) hipFree(dcomb); }
     return rc;
 }
 static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
@@ -19203,6 +19225,11 @@ void hip_llm_free(hip_llm_runner *r) {
         free(r->glm5next_mhc_gpu);
         r->glm5next_mhc_gpu = NULL;
     }
+    for (int i = 0; i < 5; ++i) {
+        if (r->glm5next_mhc_scratch[i]) hipFree(r->glm5next_mhc_scratch[i]);
+        r->glm5next_mhc_scratch[i] = NULL;
+    }
+    r->glm5next_mhc_scratch_ready = 0;
     for (int i = 0; i < 16; ++i) {
         if (r->glm5next_kda_scratch[i]) hipFree(r->glm5next_kda_scratch[i]);
         r->glm5next_kda_scratch[i] = NULL;
