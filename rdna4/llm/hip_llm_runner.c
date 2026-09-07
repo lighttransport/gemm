@@ -8193,6 +8193,11 @@ typedef struct {
 
 typedef struct {
     void *fn;
+    void *base;
+    void *scale;
+    float *base_f;
+    float *scale_f;
+    float *logits;
     int type;
     int ready;
 } glm5next_mhc_gpu_cache;
@@ -10420,8 +10425,10 @@ static inline void launch_glm5next_mhc_finish(hip_llm_runner *r,
 
 static int glm5next_mhc_cache_load(hip_llm_runner *r,
         const gguf_shards *model, int layer, int site,
-        const glm5next_tensor_view *fn) {
-    if (!r || !model || !fn || layer < 0 || layer >= r->glm5next.n_layers_all ||
+        const glm5next_tensor_view *fn, const glm5next_tensor_view *base,
+        const glm5next_tensor_view *scale, int mix) {
+    if (!r || !model || !fn || !base || !scale || mix <= 0 ||
+        layer < 0 || layer >= r->glm5next.n_layers_all ||
         site < 0 || site > 1) return -1;
     if (!r->glm5next_mhc_gpu) {
         r->glm5next_mhc_gpu = (glm5next_mhc_gpu_cache *)calloc(
@@ -10433,6 +10440,21 @@ static int glm5next_mhc_cache_load(hip_llm_runner *r,
     qtensor qfn = glm5next_as_qtensor(fn);
     if (upload_weight_matrix(&cache->fn, &qfn, &cache->type) != 0) {
         if (cache->fn) hipFree(cache->fn);
+        memset(cache, 0, sizeof(*cache));
+        return -1;
+    }
+    cache->base_f = (float *)malloc((size_t)mix * sizeof(float));
+    cache->scale_f = (float *)malloc(3 * sizeof(float));
+    cache->logits = (float *)malloc((size_t)mix * sizeof(float));
+    if (!cache->base_f || !cache->scale_f || !cache->logits ||
+        glm5next_cpu_vector(base, cache->base_f, mix) != 0 ||
+        glm5next_cpu_vector(scale, cache->scale_f, 3) != 0 ||
+        glm5next_upload_f32_view(&cache->base, base) != 0 ||
+        glm5next_upload_f32_view(&cache->scale, scale) != 0) {
+        if (cache->fn) hipFree(cache->fn);
+        if (cache->base) hipFree(cache->base);
+        if (cache->scale) hipFree(cache->scale);
+        free(cache->base_f); free(cache->scale_f); free(cache->logits);
         memset(cache, 0, sizeof(*cache));
         return -1;
     }
@@ -10460,17 +10482,14 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
     if (glm5next_tensor_view_get(model, n, 1, &base) != 0) goto done;
     snprintf(n, sizeof(n), "blk.%d.%s_scale.weight", layer, suffix);
     if (glm5next_tensor_view_get(model, n, 1, &scale) != 0) goto done;
-    if (glm5next_mhc_cache_load(r, model, layer, site, &fn) != 0) goto done;
+    int hc = c->hc_count, width = c->hidden_size, mix = (2 + hc) * hc;
+    if (glm5next_mhc_cache_load(r, model, layer, site, &fn, &base, &scale, mix) != 0) goto done;
     mhc_cache = &r->glm5next_mhc_gpu[layer * 2 + site];
     dw = mhc_cache->fn;
     wt = mhc_cache->type;
-    int hc = c->hc_count, width = c->hidden_size, mix = (2 + hc) * hc;
-    logits = (float *)malloc((size_t)mix * sizeof(float));
-    base_f = (float *)malloc((size_t)mix * sizeof(float));
-    scale_f = (float *)malloc(3 * sizeof(float));
-    if (!logits || !base_f || !scale_f ||
-        glm5next_cpu_vector(&base, base_f, mix) != 0 ||
-        glm5next_cpu_vector(&scale, scale_f, 3) != 0) goto done;
+    logits = mhc_cache->logits;
+    base_f = mhc_cache->base_f;
+    scale_f = mhc_cache->scale_f;
     if (hipMalloc(&dx, (size_t)hc * width * sizeof(float)) != hipSuccess ||
         hipMalloc(&dy, (size_t)mix * sizeof(float)) != hipSuccess) goto done;
     if (hipMemcpy(dx, streams, (size_t)hc * width * sizeof(float),
@@ -10478,9 +10497,9 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
     launch_matvec_auto(r, dy, dw, dx, mix, hc * width, wt);
     if (getenv("GLM5NEXT_HIP_MHC_FINISH") &&
         atoi(getenv("GLM5NEXT_HIP_MHC_FINISH")) != 0) {
-        if (glm5next_upload_f32_view(&dbase, &base) != 0 ||
-            glm5next_upload_f32_view(&dscale, &scale) != 0 ||
-            hipMalloc(&dcollapsed, (size_t)width * sizeof(float)) != hipSuccess ||
+        dbase = mhc_cache->base;
+        dscale = mhc_cache->scale;
+        if (hipMalloc(&dcollapsed, (size_t)width * sizeof(float)) != hipSuccess ||
             hipMalloc(&dpost, (size_t)hc * sizeof(float)) != hipSuccess ||
             hipMalloc(&dcomb, (size_t)hc * hc * sizeof(float)) != hipSuccess) goto done;
         launch_glm5next_mhc_finish(r, dcollapsed, dpost, dcomb, dy, dx,
@@ -10501,9 +10520,9 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
     rc = 0;
 done:
     if (dx) hipFree(dx); if (dy) hipFree(dy);
-    if (dbase) hipFree(dbase); if (dscale) hipFree(dscale);
+    if (dbase && (!mhc_cache || dbase != mhc_cache->base)) hipFree(dbase);
+    if (dscale && (!mhc_cache || dscale != mhc_cache->scale)) hipFree(dscale);
     if (dcollapsed) hipFree(dcollapsed); if (dpost) hipFree(dpost); if (dcomb) hipFree(dcomb);
-    free(logits); free(base_f); free(scale_f);
     return rc;
 }
 static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
@@ -19173,8 +19192,14 @@ void hip_llm_free(hip_llm_runner *r) {
         r->glm5next_kda_gpu = NULL;
     }
     if (r->glm5next_mhc_gpu) {
-        for (int i = 0; i < r->glm5next.n_layers_all * 2; ++i)
+        for (int i = 0; i < r->glm5next.n_layers_all * 2; ++i) {
             if (r->glm5next_mhc_gpu[i].fn) hipFree(r->glm5next_mhc_gpu[i].fn);
+            if (r->glm5next_mhc_gpu[i].base) hipFree(r->glm5next_mhc_gpu[i].base);
+            if (r->glm5next_mhc_gpu[i].scale) hipFree(r->glm5next_mhc_gpu[i].scale);
+            free(r->glm5next_mhc_gpu[i].base_f);
+            free(r->glm5next_mhc_gpu[i].scale_f);
+            free(r->glm5next_mhc_gpu[i].logits);
+        }
         free(r->glm5next_mhc_gpu);
         r->glm5next_mhc_gpu = NULL;
     }
