@@ -1850,6 +1850,35 @@ static const char *hip_kernel_source =
 "    if (lane == 0) { qout[row] = qs; kout[row] = ks; vout[row] = vs; }\n"
 "}\n"
 "\n"
+"__global__ void glm5next_dsa_qkv_a_q5k_f32(float *qout, float *kvout,\n"
+"        const unsigned char *qw, const unsigned char *kvw, const float *x,\n"
+"        int qrows, int kvrows, int n_cols) {\n"
+"    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"    int row = blockIdx.x * 8 + warp;\n"
+"    int nb = n_cols / 256; size_t row_bytes = (size_t)nb * 176;\n"
+"    float qs = 0.0f, ks = 0.0f;\n"
+"    if (row < qrows) {\n"
+"        const unsigned char *rp = qw + (size_t)row * row_bytes;\n"
+"        for (int b = lane; b < nb; b += 32) {\n"
+"            const unsigned char *bp = rp + (size_t)b * 176;\n"
+"            const float *xb = x + (size_t)b * 256;\n"
+"            for (int c = 0; c < 4; ++c) qs += qwen4_q5k_group(bp, xb + c * 64, c);\n"
+"        }\n"
+"    }\n"
+"    if (row < kvrows) {\n"
+"        const unsigned char *rp = kvw + (size_t)row * row_bytes;\n"
+"        for (int b = lane; b < nb; b += 32) {\n"
+"            const unsigned char *bp = rp + (size_t)b * 176;\n"
+"            const float *xb = x + (size_t)b * 256;\n"
+"            for (int c = 0; c < 4; ++c) ks += qwen4_q5k_group(bp, xb + c * 64, c);\n"
+"        }\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) {\n"
+"        qs += __shfl_down(qs, o); ks += __shfl_down(ks, o);\n"
+"    }\n"
+"    if (lane == 0) { if (row < qrows) qout[row] = qs; if (row < kvrows) kvout[row] = ks; }\n"
+"}\n"
+"\n"
 "/* ---- 18. embed_q2_K: Q2_K embedding lookup -> F32 ---- */\n"
 "__global__ void embed_q2_K(float *dst, const unsigned char *embd_table,\n"
 "                             int token_id, int n_embd) {\n"
@@ -8444,6 +8473,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q5_K_f32;
     hipFunction_t fn_matvec_q5_K_mw_f32;
     hipFunction_t fn_glm5next_kda_qkv_q5k_f32;
+    hipFunction_t fn_glm5next_dsa_qkv_a_q5k_f32;
     hipFunction_t fn_matvec_q6_K_f32;
     hipFunction_t fn_embed_q2_K;
     /* SSM kernels */
@@ -9075,6 +9105,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q5_K_f32);
     GET_FUNC(matvec_q5_K_mw_f32);
     GET_FUNC(glm5next_kda_qkv_q5k_f32);
+    GET_FUNC(glm5next_dsa_qkv_a_q5k_f32);
     GET_FUNC(matvec_q6_K_f32);
     GET_FUNC(embed_q2_K);
     /* SSM kernels */
@@ -12920,6 +12951,14 @@ static inline void launch_glm5next_kda_qkv_q5k(hip_llm_runner *r,
     LAUNCH(r->fn_glm5next_kda_qkv_q5k_f32, (n_rows + 7) / 8, 1, 1,
            256, 1, 1, 0, r->stream, args);
 }
+static inline void launch_glm5next_dsa_qkv_a_q5k(hip_llm_runner *r,
+        void *qout, void *kvout, void *qw, void *kvw, void *x,
+        int qrows, int kvrows, int n_cols) {
+    void *args[] = { &qout, &kvout, &qw, &kvw, &x, &qrows, &kvrows, &n_cols };
+    int rows = qrows > kvrows ? qrows : kvrows;
+    LAUNCH(r->fn_glm5next_dsa_qkv_a_q5k_f32, (rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
 static inline void launch_matvec_q6_K(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -15669,13 +15708,22 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
             hipMalloc(&dproj_kv, (size_t)kv * sizeof(float)) != hipSuccess ||
             hipMemcpy(dproj_x, hidden, (size_t)h * sizeof(float), hipMemcpyHostToDevice) != hipSuccess)
             goto done;
-        launch_matvec_auto(r, dproj_qr, cache->q_a_weight, dproj_x,
-                           qrank, h, cache->q_a_type);
+        const char *dsa_fused_env = getenv("GLM5NEXT_HIP_DSA_QKV_FUSED");
+        int use_dsa_fused = !dsa_fused_env || atoi(dsa_fused_env) != 0;
+        if (use_dsa_fused && cache->q_a_type == GGML_TYPE_Q5_K &&
+            cache->kv_a_type == GGML_TYPE_Q5_K && h % 256 == 0)
+            launch_glm5next_dsa_qkv_a_q5k(r, dproj_qr, dproj_kv_raw,
+                                          cache->q_a_weight, cache->kv_a_weight,
+                                          dproj_x, qrank, kv, h);
+        else {
+            launch_matvec_auto(r, dproj_qr, cache->q_a_weight, dproj_x,
+                               qrank, h, cache->q_a_type);
+            launch_matvec_auto(r, dproj_kv_raw, cache->kv_a_weight, dproj_x,
+                               kv, h, cache->kv_a_type);
+        }
         launch_rmsnorm(r, dproj_qr, dproj_qr, cache->q_a_norm, qrank, c->norm_epsilon);
         launch_matvec_auto(r, dproj_q, cache->q_b_weight, dproj_qr,
                            heads * qdim, qrank, cache->q_b_type);
-        launch_matvec_auto(r, dproj_kv_raw, cache->kv_a_weight, dproj_x,
-                           kv, h, cache->kv_a_type);
         launch_rmsnorm(r, dproj_kv, dproj_kv_raw, cache->kv_a_norm, kv, c->norm_epsilon);
         if (hipStreamSynchronize(r->stream) != hipSuccess ||
             hipMemcpy(qr, dproj_qr, (size_t)qrank * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess ||
