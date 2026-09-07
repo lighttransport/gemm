@@ -19616,6 +19616,18 @@ float *hip_llm_forward_batch_logits(hip_llm_runner *r,
     }
 #endif
 
+    /* GLM5Next has ordered KDA/DSA state but can still batch the FFN boundary
+     * for verifier tokens.  Keep this opt-in until the HIP batch-MoE callback
+     * is selected by the caller; without it the runtime uses an exact scalar
+     * MoE fallback and serves as a correctness bring-up path. */
+    if (r->glm5next_cpu && getenv("GLM5NEXT_HIP_BATCH_RUNTIME") &&
+        atoi(getenv("GLM5NEXT_HIP_BATCH_RUNTIME")) != 0) {
+        if (glm5next_cpu_runtime_step_batch(r->glm5next_cpu, tokens, n_tokens,
+                                            position_start, NULL) != 0)
+            return NULL;
+        return r->glm5next_cpu->logits;
+    }
+
     /* Fallback */
     for (int i = 0; i < n_tokens - 1; i++) {
         if (!hip_llm_forward(r, tokens[i], position_start + i)) return NULL;

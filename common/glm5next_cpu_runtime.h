@@ -275,6 +275,171 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
     r->position = position + 1; return 0;
 }
 
+/* Run a short contiguous target batch.  KDA/DSA attention remains ordered in
+ * token order so recurrent and indexer state are exact, but each layer stops
+ * at the normalized FFN input and calls the batch-MoE callback once.  This is
+ * the state layout required by speculative verification: the callback sees
+ * [tokens][hidden] activations while the layer's attention state advances
+ * normally.  With no batch callback this is an exact scalar-compatible
+ * implementation and is useful as a reference path. */
+static inline int glm5next_cpu_runtime_step_batch(glm5next_cpu_runtime *r,
+        const int *tokens, int count, int position, float *logits_out) {
+    if (!r || !r->model || !tokens || count < 1 || count > 8 ||
+        position < 0 || position + count > r->max_seq_len ||
+        (position != 0 && position != r->position)) return -1;
+    int h = r->config.hidden_size, hc = r->config.hc_count;
+    int d = r->config.linear_head_dim;
+    size_t stream_n = (size_t)hc * h;
+    size_t rn_layer = (size_t)r->config.attention_heads * d * d;
+    size_t cn_layer = (size_t)3 * r->config.attention_heads * d *
+                      (r->config.short_conv_kernel - 1);
+    float *emb = NULL, *streams = NULL, *residual = NULL, *ffn_norm = NULL;
+    float *ffn_out = NULL, *post = NULL, *comb = NULL, *hidden = NULL;
+    float *norm = NULL;
+    int rc = -1;
+    if (position == 0) glm5next_cpu_runtime_reset(r);
+    emb = (float *)malloc((size_t)count * h * sizeof(float));
+    streams = (float *)malloc((size_t)count * stream_n * sizeof(float));
+    residual = (float *)malloc((size_t)count * stream_n * sizeof(float));
+    ffn_norm = (float *)malloc((size_t)count * h * sizeof(float));
+    ffn_out = (float *)malloc((size_t)count * h * sizeof(float));
+    post = (float *)malloc((size_t)count * hc * sizeof(float));
+    comb = (float *)malloc((size_t)count * hc * hc * sizeof(float));
+    hidden = (float *)malloc((size_t)count * h * sizeof(float));
+    norm = (float *)malloc((size_t)h * sizeof(float));
+    if (!emb || !streams || !residual || !ffn_norm || !ffn_out || !post ||
+        !comb || !hidden || !norm) goto done;
+    glm5next_tensor_view t;
+    if (glm5next_tensor_view_get(r->model, "token_embd.weight", 1, &t) != 0 ||
+        t.n_dims != 2 || t.dims[0] != (uint64_t)h) goto done;
+    size_t erow = dequant_row_size(t.type, h);
+    for (int k = 0; k < count; ++k) {
+        if (tokens[k] < 0 || tokens[k] >= r->config.vocab_size ||
+            dequant_row(t.type, (const unsigned char *)t.data + erow *
+                        (size_t)tokens[k], emb + (size_t)k * h, h) != 0) goto done;
+        for (int s = 0; s < hc; ++s)
+            memcpy(streams + (size_t)k * stream_n + (size_t)s * h,
+                   emb + (size_t)k * h, (size_t)h * sizeof(float));
+    }
+    for (int l = 0; l < r->config.n_layers; ++l) {
+        glm5next_cpu_mhc_workspace *w = glm5next_cpu_mhc_workspace_get(&r->config);
+        if (!w) goto done;
+        char name[128]; glm5next_tensor_view fn, base, scale;
+#define BATCH_VIEW(s, dst) do { snprintf(name, sizeof(name), "blk.%d.%s", l, (s)); \
+            if (glm5next_tensor_view_get(r->model, name, 1, &(dst)) != 0) goto done; } while (0)
+        /* Attention is ordered, but its result is retained independently for
+         * every verifier token before the common FFN/MoE stage. */
+        for (int k = 0; k < count; ++k) {
+            float *sk = streams + (size_t)k * stream_n;
+            float *rs = r->recurrent + (size_t)l * rn_layer;
+            float *cs = r->conv + (size_t)l * cn_layer;
+            memcpy(w->residual, sk, stream_n * sizeof(float));
+            BATCH_VIEW("hc_attn_fn.weight", fn);
+            BATCH_VIEW("hc_attn_base.weight", base);
+            BATCH_VIEW("hc_attn_scale.weight", scale);
+            if (glm5next_cpu_mhc_pre_cb(r->model, l, &r->config, 0, &fn, &base,
+                    &scale, w->residual, w->collapsed, w->post, w->comb,
+                    r->mhc_callback, r->mhc_callback_opaque) != 0) goto done;
+            BATCH_VIEW("attn_norm.weight", fn);
+            if (glm5next_cpu_vector(&fn, norm, h) != 0) goto done;
+            glm5next_cpu_rmsnorm(w->collapsed, w->collapsed, norm, h,
+                                 r->config.norm_epsilon);
+            int ar;
+            if (glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA) {
+                ar = r->kda_callback
+                    ? r->kda_callback(r->model, l, &r->config, w->collapsed,
+                                      w->sublayer, rs, cs, r->kda_callback_opaque)
+                    : glm5next_cpu_kda_forward(r->model, l, &r->config,
+                                      w->collapsed, w->sublayer, rs, cs);
+            } else {
+                float *cache = r->latent_kv + (size_t)l * r->max_seq_len *
+                               r->config.kv_lora_rank;
+                ar = r->dsa_callback
+                    ? r->dsa_callback(r->model, l, &r->config, w->collapsed,
+                          w->sublayer, cache, r->indexer_keys + (size_t)l *
+                          r->max_seq_len * r->config.indexer_key_length,
+                          r->indexer_gates + (size_t)l * r->max_seq_len *
+                          r->config.indexer_key_length, r->max_seq_len,
+                          position + k, r->dsa_callback_opaque)
+                    : glm5next_cpu_dsa_forward_cached_indexed(r->model, l,
+                          &r->config, w->collapsed, w->sublayer, cache,
+                          r->indexer_keys + (size_t)l * r->max_seq_len *
+                          r->config.indexer_key_length, r->indexer_gates +
+                          (size_t)l * r->max_seq_len * r->config.indexer_key_length,
+                          r->max_seq_len, position + k);
+            if (ar != 0) goto done;
+            glm5next_cpu_mhc_post(&r->config, sk, w->residual, w->sublayer,
+                                  w->post, w->comb);
+        }
+        for (int k = 0; k < count; ++k) {
+            float *sk = streams + (size_t)k * stream_n;
+            memcpy(residual + (size_t)k * stream_n, sk,
+                   stream_n * sizeof(float));
+            BATCH_VIEW("hc_ffn_fn.weight", fn);
+            BATCH_VIEW("hc_ffn_base.weight", base);
+            BATCH_VIEW("hc_ffn_scale.weight", scale);
+            if (glm5next_cpu_mhc_pre_cb(r->model, l, &r->config, 1, &fn, &base,
+                    &scale, residual + (size_t)k * stream_n,
+                    ffn_norm + (size_t)k * h, post + (size_t)k * hc,
+                    comb + (size_t)k * hc * hc, r->mhc_callback,
+                    r->mhc_callback_opaque) != 0) goto done;
+            BATCH_VIEW("ffn_norm.weight", fn);
+            if (glm5next_cpu_vector(&fn, norm, h) != 0) goto done;
+            glm5next_cpu_rmsnorm(ffn_norm + (size_t)k * h,
+                                 ffn_norm + (size_t)k * h, norm, h,
+                                 r->config.norm_epsilon);
+        }
+        if (l < r->config.first_k_dense_replace) {
+            for (int k = 0; k < count; ++k) {
+                if (glm5next_cpu_dense_ffn_cb(r->model, l, &r->config,
+                        ffn_norm + (size_t)k * h, ffn_out + (size_t)k * h,
+                        r->dense_callback, r->dense_callback_opaque) != 0) goto done;
+            }
+        } else if (glm5next_cpu_moe_ffn_batch_cb(r->model, l, &r->config,
+                ffn_norm, ffn_out, count, r->moe_batch_callback,
+                r->moe_callback, r->moe_batch_callback
+                    ? r->moe_batch_callback_opaque : r->moe_callback_opaque) != 0) goto done;
+        for (int k = 0; k < count; ++k)
+            glm5next_cpu_mhc_post(&r->config, streams + (size_t)k * stream_n,
+                residual + (size_t)k * stream_n, ffn_out + (size_t)k * h,
+                post + (size_t)k * hc, comb + (size_t)k * hc * hc);
+#undef BATCH_VIEW
+    }
+    }
+    for (int k = 0; k < count; ++k) {
+        float *sk = streams + (size_t)k * stream_n;
+        float *hk = hidden + (size_t)k * h;
+        for (int i = 0; i < h; ++i) {
+            double sum = 0.0;
+            for (int s = 0; s < hc; ++s) sum += sk[(size_t)s * h + i];
+            hk[i] = (float)(sum / hc);
+        }
+        float *lo = logits_out ? logits_out + (size_t)k * r->config.vocab_size : r->logits;
+        if (r->output_callback) {
+            if (r->output_callback(r->model, &r->config, hk, lo,
+                                   r->output_callback_opaque) != 0) goto done;
+        } else {
+            if (glm5next_tensor_view_get(r->model, "output_norm.weight", 1, &t) != 0 ||
+                glm5next_cpu_vector(&t, norm, h) != 0) goto done;
+            glm5next_cpu_rmsnorm(hk, hk, norm, h, r->config.norm_epsilon);
+            if (glm5next_tensor_view_get(r->model, "output.weight", 1, &t) != 0 ||
+                glm5next_cpu_matvec(lo, &t, hk) != 0) goto done;
+        }
+    }
+    memcpy(r->streams, streams + (size_t)(count - 1) * stream_n,
+           stream_n * sizeof(float));
+    memcpy(r->hidden, hidden + (size_t)(count - 1) * h, (size_t)h * sizeof(float));
+    memcpy(r->target_hidden, r->hidden, (size_t)h * sizeof(float));
+    r->position = position + count;
+    r->target_position = position + count - 1;
+    r->nextn_chain_active = 0;
+    rc = 0;
+done:
+    free(emb); free(streams); free(residual); free(ffn_norm); free(ffn_out);
+    free(post); free(comb); free(hidden); free(norm);
+    return rc;
+}
+
 /* Execute one GLM5Next NextN/MTP block from the trunk's un-normalized final
  * hidden state.  NextN is a plain residual block: embedding/hidden fusion,
  * absorbed MLA attention (without the trunk indexer), MoE FFN, then the
