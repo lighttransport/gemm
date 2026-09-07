@@ -15797,11 +15797,11 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     if (hipStreamSynchronize(r->stream) != hipSuccess || hipMemcpy(out, dout, (size_t)h*sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto done;
     rc = 0;
 done:
-    if (do_w && (!persistent_cache || do_w != cache->out_weight)) hipFree(do_w); if (dq) hipFree(dq);
+    if (do_w && (!persistent_cache || do_w != cache->out_weight)) hipFree(do_w);
     if (dproj_x) hipFree(dproj_x); if (dproj_qr) hipFree(dproj_qr); if (dproj_q) hipFree(dproj_q);
     if (dproj_kv_raw) hipFree(dproj_kv_raw); if (dproj_kv) hipFree(dproj_kv);
-    if (dqcache) hipFree(dqcache); if (dkcache) hipFree(dkcache); if (dvcache) hipFree(dvcache); if (dattn) hipFree(dattn);
-    if (dout) hipFree(dout);
+    if (dq) hipFree(dq); if (dqcache) hipFree(dqcache); if (dkcache) hipFree(dkcache); if (dvcache) hipFree(dvcache);
+    if (dattn) hipFree(dattn); if (dout) hipFree(dout);
     free(qr); free(q); free(kvl); free(norm); free(qhead);
     free(selected);
     if (!persistent_cache) {
@@ -15955,9 +15955,20 @@ static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
         for (int i = 0; i < 3; ++i) dcs[i] = conv_gpu[i];
     }
     if (hipMemcpy(dx, hidden, (size_t)h*sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
-    launch_matvec_auto(r, dq, mw[0], dx, qdim, h, types[0]);
-    launch_matvec_auto(r, dk, mw[1], dx, qdim, h, types[1]);
-    launch_matvec_auto(r, dv, mw[2], dx, qdim, h, types[2]);
+    /* Q/K/V read the same activation and have the same Q5_K row layout on
+     * the IQ1 model.  Keep this fusion in the live callback as well as the
+     * standalone KDA benchmark; otherwise the benchmark measures a path the
+     * decoder never uses. */
+    const char *kda_qkv_env = getenv("GLM5NEXT_HIP_KDA_QKV_FUSED");
+    int use_kda_qkv = !kda_qkv_env || atoi(kda_qkv_env) != 0;
+    if (use_kda_qkv && types[0] == GGML_TYPE_Q5_K && types[1] == GGML_TYPE_Q5_K &&
+        types[2] == GGML_TYPE_Q5_K && qdim % 8 == 0 && h % 256 == 0)
+        launch_glm5next_kda_qkv_q5k(r, dq, dk, dv, mw[0], mw[1], mw[2], dx, qdim, h);
+    else {
+        launch_matvec_auto(r, dq, mw[0], dx, qdim, h, types[0]);
+        launch_matvec_auto(r, dk, mw[1], dx, qdim, h, types[1]);
+        launch_matvec_auto(r, dv, mw[2], dx, qdim, h, types[2]);
+    }
     launch_conv1d(r, dq, dcs[0], dq, cw[0], qdim, ck);
     launch_conv1d(r, dk, dcs[1], dk, cw[1], qdim, ck);
     launch_conv1d(r, dv, dcs[2], dv, cw[2], qdim, ck);
