@@ -8192,6 +8192,12 @@ typedef struct {
 } glm5next_kda_gpu_cache;
 
 typedef struct {
+    void *fn;
+    int type;
+    int ready;
+} glm5next_mhc_gpu_cache;
+
+typedef struct {
     void *state;
     void *conv[3];
     int ready;
@@ -8678,6 +8684,7 @@ struct hip_llm_runner {
     glm5next_dsa_gpu_cache *glm5next_dsa_gpu;
     glm5next_kda_gpu_cache *glm5next_kda_gpu;
     glm5next_kda_state_gpu *glm5next_kda_state_cache;
+    glm5next_mhc_gpu_cache *glm5next_mhc_gpu;
     /* Reused decode scratch for the serialized GLM5Next KDA callback.
      * Indices 0..12 are the named vectors below; 13..15 are conv buffers. */
     void *glm5next_kda_scratch[16];
@@ -10411,6 +10418,28 @@ static inline void launch_glm5next_mhc_finish(hip_llm_runner *r,
         void *base, void *scale, int hc, int width, float norm_eps,
         float sink_eps);
 
+static int glm5next_mhc_cache_load(hip_llm_runner *r,
+        const gguf_shards *model, int layer, int site,
+        const glm5next_tensor_view *fn) {
+    if (!r || !model || !fn || layer < 0 || layer >= r->glm5next.n_layers_all ||
+        site < 0 || site > 1) return -1;
+    if (!r->glm5next_mhc_gpu) {
+        r->glm5next_mhc_gpu = (glm5next_mhc_gpu_cache *)calloc(
+            (size_t)r->glm5next.n_layers_all * 2, sizeof(*r->glm5next_mhc_gpu));
+        if (!r->glm5next_mhc_gpu) return -1;
+    }
+    glm5next_mhc_gpu_cache *cache = &r->glm5next_mhc_gpu[layer * 2 + site];
+    if (cache->ready) return 0;
+    qtensor qfn = glm5next_as_qtensor(fn);
+    if (upload_weight_matrix(&cache->fn, &qfn, &cache->type) != 0) {
+        if (cache->fn) hipFree(cache->fn);
+        memset(cache, 0, sizeof(*cache));
+        return -1;
+    }
+    cache->ready = 1;
+    return 0;
+}
+
 static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
         const glm5next_config *c, int site, const float *streams,
         float *collapsed, float *post, float *comb, void *opaque) {
@@ -10422,6 +10451,7 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
     int wt = 0, rc = -1;
     char n[128];
     const char *suffix = site == 0 ? "hc_attn" : "hc_ffn";
+    glm5next_mhc_gpu_cache *mhc_cache = NULL;
     if (!r || !model || !c || !streams || !collapsed || !post || !comb ||
         (site != 0 && site != 1)) return -1;
     snprintf(n, sizeof(n), "blk.%d.%s_fn.weight", layer, suffix);
@@ -10430,8 +10460,10 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
     if (glm5next_tensor_view_get(model, n, 1, &base) != 0) goto done;
     snprintf(n, sizeof(n), "blk.%d.%s_scale.weight", layer, suffix);
     if (glm5next_tensor_view_get(model, n, 1, &scale) != 0) goto done;
-    { qtensor qfn = glm5next_as_qtensor(&fn);
-      if (upload_weight_matrix(&dw, &qfn, &wt) != 0) goto done; }
+    if (glm5next_mhc_cache_load(r, model, layer, site, &fn) != 0) goto done;
+    mhc_cache = &r->glm5next_mhc_gpu[layer * 2 + site];
+    dw = mhc_cache->fn;
+    wt = mhc_cache->type;
     int hc = c->hc_count, width = c->hidden_size, mix = (2 + hc) * hc;
     logits = (float *)malloc((size_t)mix * sizeof(float));
     base_f = (float *)malloc((size_t)mix * sizeof(float));
@@ -10468,7 +10500,7 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
     }
     rc = 0;
 done:
-    if (dw) hipFree(dw); if (dx) hipFree(dx); if (dy) hipFree(dy);
+    if (dx) hipFree(dx); if (dy) hipFree(dy);
     if (dbase) hipFree(dbase); if (dscale) hipFree(dscale);
     if (dcollapsed) hipFree(dcollapsed); if (dpost) hipFree(dpost); if (dcomb) hipFree(dcomb);
     free(logits); free(base_f); free(scale_f);
@@ -19139,6 +19171,12 @@ void hip_llm_free(hip_llm_runner *r) {
         }
         free(r->glm5next_kda_gpu);
         r->glm5next_kda_gpu = NULL;
+    }
+    if (r->glm5next_mhc_gpu) {
+        for (int i = 0; i < r->glm5next.n_layers_all * 2; ++i)
+            if (r->glm5next_mhc_gpu[i].fn) hipFree(r->glm5next_mhc_gpu[i].fn);
+        free(r->glm5next_mhc_gpu);
+        r->glm5next_mhc_gpu = NULL;
     }
     for (int i = 0; i < 16; ++i) {
         if (r->glm5next_kda_scratch[i]) hipFree(r->glm5next_kda_scratch[i]);
