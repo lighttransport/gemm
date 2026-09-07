@@ -8338,6 +8338,10 @@ typedef struct {
     int gate_type;
     int up_type;
     int down_type;
+    size_t gate_capacity;
+    size_t up_capacity;
+    size_t down_capacity;
+    int valid;
 } glm5next_moe_resident_slot;
 
 /* Per-layer GPU weight pointers */
@@ -10470,6 +10474,18 @@ static void glm5next_moe_slot_release(hip_llm_runner *r,
     s->expert = -1;
 }
 
+static void glm5next_moe_slot_evict(hip_llm_runner *r,
+                                    glm5next_moe_resident_slot *s) {
+    if (!r || !s) return;
+    if (r->glm5next_moe_cache_used >= s->bytes)
+        r->glm5next_moe_cache_used -= s->bytes;
+    s->layer = -1;
+    s->expert = -1;
+    s->age = 0;
+    s->bytes = 0;
+    s->valid = 0;
+}
+
 static int glm5next_moe_cache_get(hip_llm_runner *r, const qtensor *gate,
         const qtensor *up, const qtensor *down, int layer, int expert,
         glm5next_moe_resident_slot **out) {
@@ -10478,7 +10494,8 @@ static int glm5next_moe_cache_get(hip_llm_runner *r, const qtensor *gate,
         return -1;
     for (int i = 0; i < r->glm5next_moe_cache_slots; ++i) {
         glm5next_moe_resident_slot *s = &r->glm5next_moe_cache[i];
-        if (s->layer == layer && s->expert == expert && s->gate && s->up && s->down) {
+        if (s->valid && s->layer == layer && s->expert == expert &&
+            s->gate && s->up && s->down) {
             s->age = ++r->glm5next_moe_cache_clock;
             r->glm5next_moe_cache_hits++;
             *out = s;
@@ -10498,41 +10515,63 @@ static int glm5next_moe_cache_get(hip_llm_runner *r, const qtensor *gate,
             /* The callback may already hold pointers to other experts from
              * this layer. Never evict one while selection is materialized. */
             if (s->layer == layer) continue;
-            if (s->gate && s->expert >= 0 && s->age < oldest) {
+            if (s->valid && s->expert >= 0 && s->age < oldest) {
                 oldest = s->age; victim = i;
             }
         }
         if (victim < 0) break;
-        glm5next_moe_slot_release(r, &r->glm5next_moe_cache[victim]);
+        glm5next_moe_slot_evict(r, &r->glm5next_moe_cache[victim]);
     }
     if (r->glm5next_moe_cache_used + bytes > r->glm5next_moe_cache_budget) return -1;
     if (victim < 0) {
         for (int i = 0; i < r->glm5next_moe_cache_slots; ++i)
-            if (!r->glm5next_moe_cache[i].gate) { victim = i; break; }
+            if (!r->glm5next_moe_cache[i].valid) { victim = i; break; }
     }
     if (victim < 0) {
         uint64_t oldest = UINT64_MAX;
         for (int i = 0; i < r->glm5next_moe_cache_slots; ++i)
             if (r->glm5next_moe_cache[i].layer != layer &&
+                r->glm5next_moe_cache[i].valid &&
                 r->glm5next_moe_cache[i].expert >= 0 &&
                 r->glm5next_moe_cache[i].age < oldest) {
                 oldest = r->glm5next_moe_cache[i].age; victim = i;
             }
-        glm5next_moe_slot_release(r, &r->glm5next_moe_cache[victim]);
+        glm5next_moe_slot_evict(r, &r->glm5next_moe_cache[victim]);
     }
     if (victim < 0) return -1;
     glm5next_moe_resident_slot *s = &r->glm5next_moe_cache[victim];
     void *g = NULL, *u = NULL, *d = NULL;
     int gt = 0, ut = 0, dt = 0;
-    if (upload_weight_matrix(&g, gate, &gt) != 0 ||
-        upload_weight_matrix(&u, up, &ut) != 0 ||
-        upload_weight_matrix(&d, down, &dt) != 0) {
-        if (g) hipFree(g); if (u) hipFree(u); if (d) hipFree(d);
-        return -1;
+    int raw_iq1 = gate->type == GGML_TYPE_IQ1_S && up->type == GGML_TYPE_IQ1_S &&
+                  down->type == GGML_TYPE_IQ1_S && !getenv("HIP_LLM_LEGACY_CPU_DEQUANT");
+    size_t gb = glm5next_qtensor_bytes(gate), ub = glm5next_qtensor_bytes(up);
+    size_t db = glm5next_qtensor_bytes(down);
+    if (raw_iq1 && s->gate && s->up && s->down &&
+        s->gate_capacity >= gb && s->up_capacity >= ub && s->down_capacity >= db) {
+        if (hipMemcpy(s->gate, gate->data, gb, hipMemcpyHostToDevice) != hipSuccess ||
+            hipMemcpy(s->up, up->data, ub, hipMemcpyHostToDevice) != hipSuccess ||
+            hipMemcpy(s->down, down->data, db, hipMemcpyHostToDevice) != hipSuccess)
+            return -1;
+        g = s->gate; u = s->up; d = s->down;
+        gt = ut = dt = GGML_TYPE_IQ1_S;
+    } else {
+        if (s->gate) hipFree(s->gate);
+        if (s->up) hipFree(s->up);
+        if (s->down) hipFree(s->down);
+        s->gate = s->up = s->down = NULL;
+        s->gate_capacity = s->up_capacity = s->down_capacity = 0;
+        if (upload_weight_matrix(&g, gate, &gt) != 0 ||
+            upload_weight_matrix(&u, up, &ut) != 0 ||
+            upload_weight_matrix(&d, down, &dt) != 0) {
+            if (g) hipFree(g); if (u) hipFree(u); if (d) hipFree(d);
+            return -1;
+        }
     }
     s->layer = layer; s->expert = expert; s->age = ++r->glm5next_moe_cache_clock;
     s->bytes = bytes; s->gate = g; s->up = u; s->down = d;
+    s->gate_capacity = gb; s->up_capacity = ub; s->down_capacity = db;
     s->gate_type = gt; s->up_type = ut; s->down_type = dt;
+    s->valid = 1;
     r->glm5next_moe_cache_used += bytes;
     r->moe_stats.h2d_bytes += bytes;
     *out = s;
