@@ -8406,6 +8406,7 @@ typedef struct {
     size_t gate_capacity;
     size_t up_capacity;
     size_t down_capacity;
+    int pooled_down;
     int valid;
 } glm5next_moe_resident_slot;
 
@@ -8900,6 +8901,9 @@ struct hip_llm_runner {
     uint64_t glm5next_moe_cache_clock;
     uint64_t glm5next_moe_cache_hits;
     uint64_t glm5next_moe_cache_misses;
+    void *glm5next_moe_down_pool;
+    size_t glm5next_moe_down_pool_stride;
+    int glm5next_moe_down_pool_slots;
     /* The LM head is reused for every token.  Keep its quantized matrix
      * resident when it fits; streaming it once per token dominates decode. */
     void *glm5next_output_gpu;
@@ -10319,7 +10323,6 @@ static int glm5next_hip_dsa_cache_load(hip_llm_runner *r, const gguf_shards *mod
     cache->ready = 1;
     return 0;
 }
-
 static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols, int weight_type);
 static inline void launch_silu_mul(hip_llm_runner *r, void *gate, void *up, int n);
@@ -10597,12 +10600,14 @@ static void glm5next_moe_slot_release(hip_llm_runner *r,
     if (!r || !s) return;
     if (s->gate) hipFree(s->gate);
     if (s->up) hipFree(s->up);
-    if (s->down) hipFree(s->down);
+    if (s->down && !s->pooled_down) hipFree(s->down);
     if (r->glm5next_moe_cache_used >= s->bytes)
         r->glm5next_moe_cache_used -= s->bytes;
     memset(s, 0, sizeof(*s));
     s->layer = -1;
     s->expert = -1;
+    s->down = NULL;
+    s->pooled_down = 0;
 }
 
 static void glm5next_moe_slot_evict(hip_llm_runner *r,
@@ -10614,6 +10619,8 @@ static void glm5next_moe_slot_evict(hip_llm_runner *r,
     s->expert = -1;
     s->age = 0;
     s->bytes = 0;
+    s->down = NULL;
+    s->pooled_down = 0;
     s->valid = 0;
 }
 
@@ -10735,6 +10742,54 @@ static int glm5next_moe_cache_get(hip_llm_runner *r, const qtensor *gate,
     *out = s;
     return 0;
 }
+
+/* Fixed-slot down-only cache for the mapped-host hybrid path.  Every slot is
+ * carved from one allocation prepared at load time, so route churn cannot
+ * fragment VRAM or evict unrelated persistent layer weights. */
+static int glm5next_moe_down_pool_get(hip_llm_runner *r, const qtensor *down,
+        int layer, int expert, glm5next_moe_resident_slot **out) {
+    if (!r || !down || !out || !r->glm5next_moe_down_pool ||
+        r->glm5next_moe_down_pool_slots <= 0) return -1;
+    size_t bytes = glm5next_qtensor_bytes(down);
+    if (bytes == 0 || bytes > r->glm5next_moe_down_pool_stride) return -1;
+    int n = r->glm5next_moe_down_pool_slots;
+    for (int i = 0; i < n; ++i) {
+        glm5next_moe_resident_slot *s = &r->glm5next_moe_cache[i];
+        if (s->valid && s->layer == layer && s->expert == expert &&
+            s->down && s->pooled_down) {
+            s->age = ++r->glm5next_moe_cache_clock;
+            r->glm5next_moe_cache_hits++;
+            *out = s;
+            return 0;
+        }
+    }
+    r->glm5next_moe_cache_misses++;
+    int victim = -1;
+    uint64_t oldest = UINT64_MAX;
+    for (int i = 0; i < n; ++i) {
+        glm5next_moe_resident_slot *s = &r->glm5next_moe_cache[i];
+        if (s->layer == layer) continue;
+        if (!s->valid) { victim = i; break; }
+        if (s->age < oldest) { oldest = s->age; victim = i; }
+    }
+    if (victim < 0) return -1;
+    glm5next_moe_resident_slot *s = &r->glm5next_moe_cache[victim];
+    if (s->valid) glm5next_moe_slot_evict(r, s);
+    s->down = (unsigned char *)r->glm5next_moe_down_pool +
+              (size_t)victim * r->glm5next_moe_down_pool_stride;
+    s->pooled_down = 1;
+    if (hipMemcpy(s->down, down->data, bytes, hipMemcpyHostToDevice) != hipSuccess)
+        return -1;
+    s->layer = layer; s->expert = expert; s->age = ++r->glm5next_moe_cache_clock;
+    s->bytes = bytes; s->down_capacity = r->glm5next_moe_down_pool_stride;
+    s->down_type = down->type; s->pooled_down = 1; s->valid = 1;
+    r->glm5next_moe_cache_used += bytes;
+    r->moe_stats.h2d_bytes += bytes;
+    *out = s;
+    return 0;
+}
+
+
 static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols,
                                       int weight_type);
@@ -11069,6 +11124,35 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                     }
                     fprintf(stderr, "hip_llm: GLM5Next resident MoE cache: %d slots, %.0f MiB budget\n",
                             slots, (double)budget / (1024.0 * 1024.0));
+                }
+            }
+            if (r->glm5next_moe_cache &&
+                getenv("GLM5NEXT_HIP_MOE_MAPPED_DOWN_CACHE") &&
+                atoi(getenv("GLM5NEXT_HIP_MOE_MAPPED_DOWN_CACHE")) != 0) {
+                size_t max_down = 0;
+                char down_name[128];
+                for (int l = 0; l < r->glm5next.n_layers; ++l) {
+                    glm5next_tensor_view dv;
+                    snprintf(down_name, sizeof(down_name),
+                             "blk.%d.ffn_down_exps.weight", l);
+                    if (glm5next_tensor_view_get(hllm_active_shards, down_name, 1, &dv) != 0)
+                        continue;
+                    qtensor qd = glm5next_as_qtensor(&dv);
+                    qd.n_dims = 2; qd.n_rows = (int)dv.dims[0]; qd.n_cols = (int)dv.dims[1];
+                    size_t bytes = glm5next_qtensor_bytes(&qd);
+                    if (bytes > max_down) max_down = bytes;
+                }
+                if (max_down > 0) {
+                    int pool_slots = (int)(budget / max_down);
+                    if (pool_slots > slots) pool_slots = slots;
+                    if (pool_slots > 0 &&
+                        hipMalloc(&r->glm5next_moe_down_pool,
+                                  (size_t)pool_slots * max_down) == hipSuccess) {
+                        r->glm5next_moe_down_pool_stride = max_down;
+                        r->glm5next_moe_down_pool_slots = pool_slots;
+                        fprintf(stderr, "hip_llm: GLM5 mapped down pool: %d slots, %.1f MiB/slot\n",
+                                pool_slots, (double)max_down / (1024.0 * 1024.0));
+                    }
                 }
             }
         }
@@ -16776,6 +16860,11 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
             duw[j] = (unsigned char *)mapped_up + e * mapped_up_stride;
             ddw[j] = (unsigned char *)mapped_down + e * mapped_down_stride;
             gtype[j] = gate_v.type; utype[j] = up_v.type; dtype[j] = down_v.type;
+            if (r->glm5next_moe_down_pool &&
+                glm5next_moe_down_pool_get(r, &dw, layer, ids[j], &resident[j]) == 0) {
+                ddw[j] = resident[j]->down;
+                dtype[j] = resident[j]->down_type;
+            }
         } else if (glm5next_moe_cache_get(r, &gw, &uw, &dw, layer, ids[j], &resident[j]) == 0) {
             dgw[j] = resident[j]->gate; duw[j] = resident[j]->up; ddw[j] = resident[j]->down;
             gtype[j] = resident[j]->gate_type; utype[j] = resident[j]->up_type;
@@ -16945,6 +17034,11 @@ moe_scalar_experts:
             duw[j] = (unsigned char *)mapped_up + e * mapped_up_stride;
             ddw[j] = (unsigned char *)mapped_down + e * mapped_down_stride;
             gtype[j] = gate_v.type; utype[j] = up_v.type; dtype[j] = down_v.type;
+            if (r->glm5next_moe_down_pool &&
+                glm5next_moe_down_pool_get(r, &dw, layer, ids[j], &resident[j]) == 0) {
+                ddw[j] = resident[j]->down;
+                dtype[j] = resident[j]->down_type;
+            }
         } else if (glm5next_moe_cache_get(r, &gw, &uw, &dw, layer, ids[j], &resident[j]) == 0) {
             dgw[j] = resident[j]->gate; duw[j] = resident[j]->up; ddw[j] = resident[j]->down;
             gtype[j] = resident[j]->gate_type; utype[j] = resident[j]->up_type;
@@ -20022,6 +20116,10 @@ void hip_llm_free(hip_llm_runner *r) {
             glm5next_moe_slot_release(r, &r->glm5next_moe_cache[i]);
         free(r->glm5next_moe_cache);
         r->glm5next_moe_cache = NULL;
+    }
+    if (r->glm5next_moe_down_pool) {
+        hipFree(r->glm5next_moe_down_pool);
+        r->glm5next_moe_down_pool = NULL;
     }
     if (r->glm5next_moe_mapped_ready) {
         for (int l = 0; l < r->glm5next.n_layers; ++l) {
