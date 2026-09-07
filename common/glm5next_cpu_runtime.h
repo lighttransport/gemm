@@ -23,6 +23,7 @@ typedef struct {
     int max_seq_len;
     int position;
     int target_position;
+    int nextn_chain_active;
     glm5next_dsa_callback dsa_callback;
     void *dsa_callback_opaque;
     glm5next_kda_callback kda_callback;
@@ -142,6 +143,7 @@ static inline int glm5next_cpu_runtime_init(glm5next_cpu_runtime *r,
     r->nextn_fusion = r->config.n_nextn_layers > 0
         ? (float *)malloc((size_t)2 * h * sizeof(float)) : NULL;
     r->model = model; r->max_seq_len = max_seq_len; r->position = 0; r->target_position = -1;
+    r->nextn_chain_active = 0;
     if (!r->streams || !r->recurrent || !r->conv || !r->latent_kv ||
         !r->indexer_keys || !r->indexer_gates || !r->hidden || !r->target_hidden ||
         !r->normed || !r->logits || (r->config.n_nextn_layers > 0 &&
@@ -170,6 +172,7 @@ static inline void glm5next_cpu_runtime_reset(glm5next_cpu_runtime *r) {
                r->config.kv_lora_rank * sizeof(float));
     r->position = 0;
     r->target_position = -1;
+    r->nextn_chain_active = 0;
 }
 
 static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
@@ -238,6 +241,10 @@ static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
     }
     memcpy(r->target_hidden, r->hidden, (size_t)h * sizeof(float));
     r->target_position = position;
+    /* A trunk token establishes a new draft base.  Chained NextN calls are
+     * valid only until the next trunk step; never carry a prior draft hidden
+     * into a later target position. */
+    r->nextn_chain_active = 0;
     if (r->output_callback) {
         if (profile) clock_gettime(CLOCK_MONOTONIC, &profile_t0);
         if (r->output_callback(r->model, &r->config, r->hidden, r->logits,
@@ -298,7 +305,8 @@ static inline float *glm5next_cpu_runtime_nextn_logits(glm5next_cpu_runtime *r,
     glm5next_cpu_rmsnorm(enorm, embedding, norm, h, r->config.norm_epsilon);
     NEXTN_GET("nextn.hnorm.weight");
     if (glm5next_cpu_vector(&t, norm, h) != 0) goto done;
-    glm5next_cpu_rmsnorm(hnorm, r->target_hidden, norm, h, r->config.norm_epsilon);
+    const float *draft_base = r->nextn_chain_active ? r->nextn_hidden : r->target_hidden;
+    glm5next_cpu_rmsnorm(hnorm, draft_base, norm, h, r->config.norm_epsilon);
     memcpy(r->nextn_fusion, enorm, (size_t)h * sizeof(float));
     memcpy(r->nextn_fusion + h, hnorm, (size_t)h * sizeof(float));
     if (r->nextn_fusion_callback) {
@@ -341,6 +349,10 @@ static inline float *glm5next_cpu_runtime_nextn_logits(glm5next_cpu_runtime *r,
 done:
     free(embedding); free(enorm); free(hnorm); free(x); free(norm); free(attn);
     free(ffn_norm); free(ffn); free(head_norm);
+    if (rc == 0) {
+        r->target_position = position;
+        r->nextn_chain_active = 1;
+    }
     return rc == 0 ? r->logits : NULL;
 #undef NEXTN_GET
 }

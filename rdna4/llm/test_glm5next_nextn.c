@@ -20,7 +20,7 @@ int main(int argc, char **argv) {
     int best = -1;
     if (!model || !runner) return 1;
     hip_llm_load_options_default(&options);
-    options.max_seq_len = 2;
+    options.max_seq_len = 4;
     if (hip_llm_load_weights_sharded(runner, model, &options) != 0) return 1;
     trunk = hip_llm_forward_logits(runner, 87, 0);
     if (!trunk || hip_llm_forward_nextn_logits(runner, 88, 0) != NULL) {
@@ -31,6 +31,19 @@ int main(int argc, char **argv) {
     if (!trunk || !draft) {
         fprintf(stderr, "GLM5Next NextN forward failed\n");
         hip_llm_free(runner); gguf_close_shards(model); return 1;
+    }
+    {
+        float *draft2 = hip_llm_forward_nextn_logits(runner, 89, 2);
+        if (!draft2) {
+            fprintf(stderr, "GLM5Next chained NextN forward failed\n");
+            hip_llm_free(runner); gguf_close_shards(model); return 1;
+        }
+        for (int i = 0; i < hip_llm_n_vocab(runner); ++i) {
+            if (!isfinite(draft2[i])) {
+                fprintf(stderr, "non-finite chained NextN logit at %d\n", i);
+                hip_llm_free(runner); gguf_close_shards(model); return 1;
+            }
+        }
     }
     best = 0;
     for (int i = 0; i < hip_llm_n_vocab(runner); ++i) {
