@@ -5680,6 +5680,14 @@ static const char *hip_kernel_source =
 "    }\n"
 "    for(int o=16;o>0;o>>=1){sg+=__shfl_down(sg,o);su+=__shfl_down(su,o);} if(lane==0)dst[(size_t)e*rows+row]=(sg/(1.0f+expf(-sg)))*su;\n"
 "}\n"
+"/* Grouped IQ1_S gate/up using Q8 activations and RDNA4 DP4A. */\n"
+"__global__ void glm5next_moe_gateup_iq1s_selected_dp4a(float *dst, const unsigned char * const *gates, const unsigned char * const *ups, const signed char *xq, const float *xscale, int rows, int cols, int experts) {\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,e=blockIdx.y,row=blockIdx.x*8+warp; if(e>=experts||row>=rows)return; int qblocks=cols/32; float sg=0.0f,su=0.0f; const unsigned char *gw=gates[e]+(size_t)row*(cols/256)*50,*uw=ups[e]+(size_t)row*(cols/256)*50;\n"
+"    for(int b=lane;b<qblocks;b+=32){int block=b>>3,ib=b&7;const unsigned char *gb=gw+block*50,*ub=uw+block*50;const unsigned short *gqh=(const unsigned short*)(gb+34),*uqh=(const unsigned short*)(ub+34);const unsigned char *gqs=gb+2,*uqs=ub+2;float gd=half_to_float(*(const half_raw*)gb)*(float)(2*((gqh[ib]>>12)&7)+1),ud=half_to_float(*(const half_raw*)ub)*(float)(2*((uqh[ib]>>12)&7)+1);float gs=(gqh[ib]&0x8000)?-0.125f:0.125f,us=(uqh[ib]&0x8000)?-0.125f:0.125f;const signed char *xp=xq+b*32;float dg=0.0f,du=0.0f;int sumq=0;\n"
+"        for(int l=0;l<4;++l){int gi=gqs[ib*4+l]|(((gqh[ib]>>(3*l))&7)<<8),ui=uqs[ib*4+l]|(((uqh[ib]>>(3*l))&7)<<8);const signed char *gc=(const signed char*)&iq1s_grid_dev[gi],*uc=(const signed char*)&iq1s_grid_dev[ui];int gw0=((int)gc[0]&255)|(((int)gc[1]&255)<<8)|(((int)gc[2]&255)<<16)|(((int)gc[3]&255)<<24),gw1=((int)gc[4]&255)|(((int)gc[5]&255)<<8)|(((int)gc[6]&255)<<16)|(((int)gc[7]&255)<<24),uw0=((int)uc[0]&255)|(((int)uc[1]&255)<<8)|(((int)uc[2]&255)<<16)|(((int)uc[3]&255)<<24),uw1=((int)uc[4]&255)|(((int)uc[5]&255)<<8)|(((int)uc[6]&255)<<16)|(((int)uc[7]&255)<<24);const int *qi=(const int*)xp;dg+=(float)dp4a_hw(gw0,qi[l*2],0)+(float)dp4a_hw(gw1,qi[l*2+1],0);du+=(float)dp4a_hw(uw0,qi[l*2],0)+(float)dp4a_hw(uw1,qi[l*2+1],0);for(int j=0;j<8;++j)sumq+=(int)xp[l*8+j];}\n"
+"        sg+=gd*xscale[b]*(dg+gs*(float)sumq);su+=ud*xscale[b]*(du+us*(float)sumq);}\n"
+"    for(int o=16;o>0;o>>=1){sg+=__shfl_down(sg,o);su+=__shfl_down(su,o);}if(lane==0)dst[(size_t)e*rows+row]=(sg/(1.0f+expf(-sg)))*su;\n"
+"}\n"
 "/* Grouped IQ1_S routed-expert down projections. */\n"
 "__global__ void glm5next_moe_down_iq1s_selected(float *out,const unsigned char * const *downs,const float *gate,const float *weights,int rows,int cols,int experts){\n"
 "    int lane=threadIdx.x&31,warp=threadIdx.x>>5,e=blockIdx.y,row=blockIdx.x*8+warp;if(e>=experts||row>=rows)return; int nb=cols/256;float sum=0.0f;const unsigned char *dw=downs[e]+(size_t)row*nb*50;\n"
@@ -8513,6 +8521,7 @@ struct hip_llm_runner {
     hipFunction_t fn_ffn_gate_up_silu_q8_0_mw;
     hipFunction_t fn_ffn_gate_up_silu_iq1_s_mw;
     hipFunction_t fn_glm5next_moe_gateup_iq1s_selected;
+    hipFunction_t fn_glm5next_moe_gateup_iq1s_selected_dp4a;
     hipFunction_t fn_glm5next_moe_down_iq1s_selected;
     hipFunction_t fn_glm5next_moe_reduce_iq1s;
     hipFunction_t fn_iq1_s_down_accum_f32;
@@ -9162,6 +9171,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(ffn_gate_up_silu_q8_0_mw);
     GET_FUNC(ffn_gate_up_silu_iq1_s_mw);
     GET_FUNC(glm5next_moe_gateup_iq1s_selected);
+    GET_FUNC(glm5next_moe_gateup_iq1s_selected_dp4a);
     GET_FUNC(glm5next_moe_down_iq1s_selected);
     GET_FUNC(glm5next_moe_reduce_iq1s);
     GET_FUNC(iq1_s_down_accum_f32);
@@ -12724,6 +12734,14 @@ static inline void launch_glm5next_moe_gateup_iq1s(hip_llm_runner *r,
         void *dst, void *gates, void *ups, void *x, int rows, int cols, int experts) {
     void *args[] = { &dst, &gates, &ups, &x, &rows, &cols, &experts };
     LAUNCH(r->fn_glm5next_moe_gateup_iq1s_selected, (rows + 7) / 8, experts, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_glm5next_moe_gateup_iq1s_dp4a(hip_llm_runner *r,
+        void *dst, void *gates, void *ups, void *xq, void *xscale,
+        int rows, int cols, int experts) {
+    void *args[] = { &dst, &gates, &ups, &xq, &xscale, &rows, &cols, &experts };
+    LAUNCH(r->fn_glm5next_moe_gateup_iq1s_selected_dp4a, (rows + 7) / 8, experts, 1,
            256, 1, 1, 0, r->stream, args);
 }
 
@@ -16406,6 +16424,9 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
             dtype[j] != GGML_TYPE_IQ1_S) grouped_iq1 = 0;
     const char *grouped_env = getenv("GLM5NEXT_HIP_MOE_GROUPED_IQ1");
     if (grouped_env && atoi(grouped_env) == 0) grouped_iq1 = 0;
+    const char *dp4a_env = getenv("GLM5NEXT_HIP_IQ1_DP4A");
+    int grouped_dp4a = grouped_iq1 && dp4a_env && atoi(dp4a_env) != 0 &&
+                       c->hidden_size <= 8192 && (c->hidden_size % 256) == 0;
     /* First stage all selected matrices.  The following loop then contains
      * only GPU launches, allowing the device accumulator to stay resident. */
     if (grouped_iq1) {
@@ -16416,9 +16437,17 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
             hipMemcpyAsync(r->glm5next_moe_ptrs[2], ddw,
                            (size_t)slots * sizeof(void *), hipMemcpyHostToDevice, r->stream) != hipSuccess)
             goto done;
-        launch_glm5next_moe_gateup_iq1s(r, dg, r->glm5next_moe_ptrs[0],
-                                        r->glm5next_moe_ptrs[1], dx,
-                                        c->expert_ff_length, c->hidden_size, slots);
+        if (grouped_dp4a) {
+            launch_quantize_q8(r, dx, c->hidden_size, r->d_act_q8, r->d_act_scale);
+            launch_glm5next_moe_gateup_iq1s_dp4a(r, dg, r->glm5next_moe_ptrs[0],
+                                                 r->glm5next_moe_ptrs[1], r->d_act_q8,
+                                                 r->d_act_scale, c->expert_ff_length,
+                                                 c->hidden_size, slots);
+        } else {
+            launch_glm5next_moe_gateup_iq1s(r, dg, r->glm5next_moe_ptrs[0],
+                                            r->glm5next_moe_ptrs[1], dx,
+                                            c->expert_ff_length, c->hidden_size, slots);
+        }
         for (int j = 0; j < slots; ++j) {
             float w = c->routed_scaling_factor * weights[j] /
                       (sum > 0.0f ? sum : 1.0f);
