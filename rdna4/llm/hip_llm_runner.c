@@ -15753,6 +15753,7 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     void *dproj_kv_raw = NULL, *dproj_kv = NULL;
     void *dqcache = NULL, *dkcache = NULL, *dvcache = NULL, *dattn = NULL, *dout = NULL;
     float *qr = NULL, *q = NULL, *kvl = NULL, *norm = NULL, *qhead = NULL;
+    float *kcache_host = NULL;
     glm5next_dsa_gpu_cache local_cache; glm5next_dsa_gpu_cache *cache = NULL;
     int persistent_cache = r && r->glm5next_dsa_gpu != NULL;
     int *selected = NULL;
@@ -15840,12 +15841,15 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
         hipMalloc(&dqcache, (size_t)heads*kv*sizeof(float)) != hipSuccess || hipMalloc(&dkcache, (size_t)attn_nt*kv*sizeof(float)) != hipSuccess ||
         hipMalloc(&dvcache, (size_t)attn_nt*heads*vdim*sizeof(float)) != hipSuccess || hipMalloc(&dattn, (size_t)heads*vdim*sizeof(float)) != hipSuccess ||
         hipMalloc(&dout, (size_t)h*sizeof(float)) != hipSuccess) goto done;
+    kcache_host = (float *)malloc((size_t)attn_nt * kv * sizeof(float));
+    if (!kcache_host) goto done;
     for (int si = 0; si < attn_nt; ++si) {
         int p = selected ? selected[si] : si;
-        if (hipMemcpy((uint8_t *)dkcache + (size_t)si*kv*sizeof(float),
-                      latent_cache + (size_t)p*kv, (size_t)kv*sizeof(float),
-                      hipMemcpyHostToDevice) != hipSuccess) goto done;
+        memcpy(kcache_host + (size_t)si * kv,
+               latent_cache + (size_t)p * kv, (size_t)kv * sizeof(float));
     }
+    if (hipMemcpy(dkcache, kcache_host, (size_t)attn_nt * kv * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess) goto done;
     for (int head = 0; head < heads; ++head) {
         if (cache->q_ready) {
             q_input = (uint8_t *)dproj_q + (size_t)head * qdim * sizeof(float);
@@ -15877,7 +15881,7 @@ done:
     if (dproj_kv_raw) hipFree(dproj_kv_raw); if (dproj_kv) hipFree(dproj_kv);
     if (dq) hipFree(dq); if (dqcache) hipFree(dqcache); if (dkcache) hipFree(dkcache); if (dvcache) hipFree(dvcache);
     if (dattn) hipFree(dattn); if (dout) hipFree(dout);
-    free(qr); free(q); free(kvl); free(norm); free(qhead);
+    free(qr); free(q); free(kvl); free(norm); free(qhead); free(kcache_host);
     free(selected);
     if (!persistent_cache) {
         glm5next_hip_dsa_cache_free(&local_cache);
