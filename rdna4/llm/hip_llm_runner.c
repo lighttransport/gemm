@@ -5865,7 +5865,7 @@ static const char *hip_kernel_source =
 "        for(int ib=ib0;ib<ib0+4;++ib){float dl=d0*(float)(2*((qh[ib]>>12)&7)+1),ds=(qh[ib]&0x8000)?-0.125f:0.125f;\n"
 "            for(int l=0;l<4;++l){int qi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);const signed char *grid=(const signed char*)&iq1s_grid_dev[qi];int base=ib*32+l*8;\n"
 "                for(int j=0;j<8;++j)sum+=dl*((float)grid[j]+ds)*gx[b*256+base+j];}}}\n"
-"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)out[(size_t)group*rows+row]=sum*weights[e];\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)out[(size_t)group*rows+row]=sum*weights[(size_t)t*experts+e];\n"
 "}\n"
 "__global__ void glm5next_moe_reduce_iq1s_batch(float *accum,const float *parts,int rows,int experts,int tokens){\n"
 "    int i=blockIdx.x*blockDim.x+threadIdx.x,t=i/rows,row=i%rows;if(t>=tokens)return;float s=0.0f;\n"
@@ -11131,6 +11131,9 @@ static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
 static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, const float *hidden, float *out,
         void *opaque);
+static int glm5next_hip_moe_batch_callback(const gguf_shards *model, int layer,
+        const glm5next_config *config, const float *hidden, float *out,
+        int tokens, void *opaque);
 static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
         const glm5next_config *config, int site, const float *streams,
         float *collapsed, float *post, float *comb, void *opaque);
@@ -11317,6 +11320,10 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                 (size_t)r->glm5next.n_layers_all, sizeof(*r->glm5next_moe_router));
             glm5next_cpu_runtime_set_moe_callback(r->glm5next_cpu,
                 glm5next_hip_moe_callback, r);
+            if (getenv("GLM5NEXT_HIP_BATCH_MOE") &&
+                atoi(getenv("GLM5NEXT_HIP_BATCH_MOE")) != 0)
+                glm5next_cpu_runtime_set_moe_batch_callback(r->glm5next_cpu,
+                    glm5next_hip_moe_batch_callback, r);
             fprintf(stderr, "hip_llm: GLM5Next HIP MoE callback enabled "
                             "(streams selected experts per token)\n");
         }
@@ -17281,6 +17288,142 @@ done:
     return rc;
 #undef G5MOE_ALLOC
 #undef G5MOE_VIEW
+}
+
+/* Batched GLM5Next MoE for the mapped IQ1_S model.  Routing is still done on
+ * the host because each verifier token can select a different expert set;
+ * after routing, one gate/up and one down launch cover all tokens.  The
+ * shared expert is small and is intentionally issued per token until its
+ * batched kernel is added. */
+static int glm5next_hip_moe_batch_callback(const gguf_shards *model, int layer,
+        const glm5next_config *c, const float *hidden, float *out, int tokens,
+        void *opaque) {
+    hip_llm_runner *r = (hip_llm_runner *)opaque;
+    if (!r || !model || !c || !hidden || !out || tokens <= 0 || tokens > 8)
+        return -1;
+    int h = c->hidden_size;
+    const char *enable = getenv("GLM5NEXT_HIP_BATCH_MOE");
+    if (!enable || atoi(enable) == 0)
+        for (int t = 0; t < tokens; ++t)
+            if (glm5next_hip_moe_callback(model, layer, c,
+                    hidden + (size_t)t * c->hidden_size,
+                    out + (size_t)t * c->hidden_size, opaque) != 0) return -1;
+    if (!enable || atoi(enable) == 0) return 0;
+
+    glm5next_tensor_view router_v, bias_v, gate_v, up_v, down_v;
+    glm5next_tensor_view sg_v, su_v, sd_v;
+    char name[128];
+#define BM_VIEW(dst, suffix) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (suffix)); \
+        if (glm5next_tensor_view_get(model, name, 1, &(dst)) != 0) goto fail; } while (0)
+    BM_VIEW(router_v, "ffn_gate_inp.weight"); BM_VIEW(bias_v, "exp_probs_b.bias");
+    BM_VIEW(gate_v, "ffn_gate_exps.weight"); BM_VIEW(up_v, "ffn_up_exps.weight");
+    BM_VIEW(down_v, "ffn_down_exps.weight"); BM_VIEW(sg_v, "ffn_gate_shexp.weight");
+    BM_VIEW(su_v, "ffn_up_shexp.weight"); BM_VIEW(sd_v, "ffn_down_shexp.weight");
+    if (gate_v.type != GGML_TYPE_IQ1_S || up_v.type != GGML_TYPE_IQ1_S ||
+        down_v.type != GGML_TYPE_IQ1_S || sg_v.type != GGML_TYPE_IQ1_S ||
+        su_v.type != GGML_TYPE_IQ1_S || sd_v.type != GGML_TYPE_IQ1_S ||
+        (c->swiglu_clamp_exp && c->swiglu_clamp_exp[layer] > 1e-6f) ||
+        (c->swiglu_clamp_shexp && c->swiglu_clamp_shexp[layer] > 1e-6f)) goto fallback;
+    if (!glm5next_moe_map_layer(r, layer, c, &gate_v, &up_v, &down_v)) goto fallback;
+    int slots = c->expert_used_count, ne = c->expert_count;
+    size_t gu_stride = dequant_row_size(gate_v.type, (int)gate_v.dims[0]) * gate_v.dims[1];
+    size_t dn_stride = dequant_row_size(down_v.type, (int)down_v.dims[0]) * down_v.dims[1];
+    float *router = (float *)malloc((size_t)tokens * ne * sizeof(float));
+    float *bias = (float *)malloc((size_t)ne * sizeof(float));
+    int *ids = (int *)malloc((size_t)tokens * slots * sizeof(int));
+    float *weights = (float *)malloc((size_t)tokens * slots * sizeof(float));
+    void **hp[3] = { 0 }, *dp[3] = { 0 };
+    void *dx = NULL, *dg = NULL, *parts = NULL, *shared_buf = NULL, *accum = NULL;
+    void *dweights = NULL, *dsg = NULL, *dsu = NULL, *dso = NULL;
+    int own_shared = 0, rc = -1;
+    if (!router || !bias || !ids || !weights) goto batch_done;
+    if (glm5next_cpu_vector(&bias_v, bias, ne) != 0) goto batch_done;
+    for (int t = 0; t < tokens; ++t) {
+        if (glm5next_cpu_matvec(router + (size_t)t * ne, &router_v,
+                                hidden + (size_t)t * h) != 0) goto batch_done;
+        for (int j = 0; j < slots; ++j) {
+            ids[(size_t)t * slots + j] = -1;
+            weights[(size_t)t * slots + j] = -INFINITY;
+        }
+        for (int e = 0; e < ne; ++e) {
+            float score = 1.0f / (1.0f + expf(-router[(size_t)t * ne + e])) + bias[e];
+            int j = slots - 1;
+            if (score <= weights[(size_t)t * slots + j]) continue;
+            while (j > 0 && score > weights[(size_t)t * slots + j - 1]) {
+                weights[(size_t)t * slots + j] = weights[(size_t)t * slots + j - 1];
+                ids[(size_t)t * slots + j] = ids[(size_t)t * slots + j - 1]; --j;
+            }
+            weights[(size_t)t * slots + j] = score;
+            ids[(size_t)t * slots + j] = e;
+        }
+        float sum = 0.0f;
+        for (int j = 0; j < slots; ++j) {
+            float w = 1.0f / (1.0f + expf(-router[(size_t)t * ne + ids[(size_t)t * slots + j]]));
+            weights[(size_t)t * slots + j] = c->routed_scaling_factor * w;
+            sum += w;
+        }
+        if (sum > 0.0f) for (int j = 0; j < slots; ++j)
+            weights[(size_t)t * slots + j] /= sum;
+    }
+    for (int q = 0; q < 3; ++q) {
+        hp[q] = malloc((size_t)tokens * slots * sizeof(void *));
+        if (!hp[q]) goto batch_done;
+    }
+    for (int t = 0; t < tokens; ++t) for (int j = 0; j < slots; ++j) {
+        size_t e = (size_t)ids[(size_t)t * slots + j];
+        ((void **)hp[0])[(size_t)t * slots + j] = (unsigned char *)r->glm5next_moe_gate_mapped[layer] + e * gu_stride;
+        ((void **)hp[1])[(size_t)t * slots + j] = (unsigned char *)r->glm5next_moe_up_mapped[layer] + e * gu_stride;
+        ((void **)hp[2])[(size_t)t * slots + j] = (unsigned char *)r->glm5next_moe_down_mapped[layer] + e * dn_stride;
+    }
+    if (hipMalloc(&dx, (size_t)tokens * h * sizeof(float)) != hipSuccess ||
+        hipMalloc(&dg, (size_t)tokens * slots * c->expert_ff_length * sizeof(float)) != hipSuccess ||
+        hipMalloc(&parts, (size_t)tokens * slots * h * sizeof(float)) != hipSuccess ||
+        hipMalloc(&accum, (size_t)tokens * h * sizeof(float)) != hipSuccess ||
+        hipMalloc(&dweights, (size_t)tokens * slots * sizeof(float)) != hipSuccess) goto batch_done;
+    for (int q = 0; q < 3; ++q) {
+        if (hipMalloc(&dp[q], (size_t)tokens * slots * sizeof(void *)) != hipSuccess ||
+            hipMemcpy(dp[q], hp[q], (size_t)tokens * slots * sizeof(void *), hipMemcpyHostToDevice) != hipSuccess) goto batch_done;
+    }
+    if (hipMemcpy(dx, hidden, (size_t)tokens * h * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(dweights, weights, (size_t)tokens * slots * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemset(accum, 0, (size_t)tokens * h * sizeof(float)) != hipSuccess) goto batch_done;
+    launch_glm5next_moe_gateup_iq1s_batch(r, dg, dp[0], dp[1], dx,
+        c->expert_ff_length, h, slots, tokens);
+    launch_glm5next_moe_down_iq1s_batch(r, parts, dp[2], dg, dweights,
+        h, c->expert_ff_length, slots, tokens);
+    launch_glm5next_moe_reduce_iq1s_batch(r, accum, parts, h, slots, tokens);
+    { qtensor qg = glm5next_as_qtensor(&sg_v), qu = glm5next_as_qtensor(&su_v), qd = glm5next_as_qtensor(&sd_v);
+      int tg = 0, tu = 0, td = 0;
+      if (upload_weight_matrix(&dsg, &qg, &tg) != 0 || upload_weight_matrix(&dsu, &qu, &tu) != 0 ||
+          upload_weight_matrix(&dso, &qd, &td) != 0 || tg != GGML_TYPE_IQ1_S ||
+          tu != GGML_TYPE_IQ1_S || td != GGML_TYPE_IQ1_S) goto batch_done;
+      own_shared = 1;
+      if (hipMalloc(&shared_buf, (size_t)c->shared_expert_ff_length * sizeof(float)) != hipSuccess) goto batch_done;
+      for (int t = 0; t < tokens; ++t) {
+          launch_ffn_gate_up_silu_iq1_s(r, shared_buf, dsg, dsu, (unsigned char *)dx + (size_t)t * h * sizeof(float),
+                                        c->shared_expert_ff_length, h);
+          launch_iq1_s_down_accum(r, (unsigned char *)accum + (size_t)t * h * sizeof(float), dso,
+                                  shared_buf, 1.0f, h, c->shared_expert_ff_length);
+      }
+    }
+    if (hipStreamSynchronize(r->stream) != hipSuccess ||
+        hipMemcpy(out, accum, (size_t)tokens * h * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) goto batch_done;
+    rc = 0;
+batch_done:
+    for (int q = 0; q < 3; ++q) { free(hp[q]); if (dp[q]) hipFree(dp[q]); }
+    if (dsg && own_shared) hipFree(dsg); if (dsu && own_shared) hipFree(dsu); if (dso && own_shared) hipFree(dso);
+    if (dx) hipFree(dx); if (dg) hipFree(dg); if (parts) hipFree(parts); if (shared_buf) hipFree(shared_buf);
+    if (accum) hipFree(accum); if (dweights) hipFree(dweights);
+    free(router); free(bias); free(ids); free(weights);
+    if (rc == 0) return 0;
+fallback:
+    for (int t = 0; t < tokens; ++t)
+        if (glm5next_hip_moe_callback(model, layer, c, hidden + (size_t)t * h,
+                                      out + (size_t)t * h, opaque) != 0) return -1;
+    return 0;
+fail:
+    return -1;
+#undef BM_VIEW
 }
 
 /* Batched token-grouped MoE FFN for M tokens (prefill). Input: r->d_xnorm_batch
