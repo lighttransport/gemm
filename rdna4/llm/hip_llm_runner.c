@@ -8258,6 +8258,14 @@ static void glm5next_hip_dsa_cache_free(glm5next_dsa_gpu_cache *cache) {
 }
 
 typedef struct {
+    void *d[6];                 /* dx, dq, dk, dg, diq, diw */
+    float *key, *gate, *iq, *iw;
+    float *kw, *kb, *ape, *pool;
+    size_t pool_floats;
+    int ready;
+} glm5next_dsa_indexer_scratch;
+
+typedef struct {
     void *matrix[9];
     void *conv[3];
     void *dt_bias;
@@ -8772,6 +8780,7 @@ struct hip_llm_runner {
     gguf_shards glm5next_single_shards;
     gguf_context *glm5next_single_shard;
     glm5next_dsa_gpu_cache *glm5next_dsa_gpu;
+    glm5next_dsa_indexer_scratch *glm5next_dsa_indexer_scratch;
     glm5next_kda_gpu_cache *glm5next_kda_gpu;
     glm5next_kda_state_gpu *glm5next_kda_state_cache;
     glm5next_mhc_gpu_cache *glm5next_mhc_gpu;
@@ -9103,6 +9112,51 @@ struct hip_llm_runner {
     int         gemma_prefill_chunk;/* prefill chunk size (<= swa_window) */
     int         cur_position;       /* host-side current position for SWA kernel */
 };
+
+static void glm5next_dsa_indexer_scratch_free(glm5next_dsa_indexer_scratch *s) {
+    if (!s) return;
+    for (int i = 0; i < 6; ++i) if (s->d[i]) hipFree(s->d[i]);
+    free(s->key); free(s->gate); free(s->iq); free(s->iw);
+    free(s->kw); free(s->kb); free(s->ape); free(s->pool);
+    memset(s, 0, sizeof(*s));
+}
+
+static int glm5next_dsa_indexer_scratch_get(hip_llm_runner *r,
+        const glm5next_config *c, int max_seq_len) {
+    if (!r || !c || max_seq_len <= 0) return -1;
+    glm5next_dsa_indexer_scratch *s = r->glm5next_dsa_indexer_scratch;
+    if (!s) {
+        s = (glm5next_dsa_indexer_scratch *)calloc(1, sizeof(*s));
+        if (!s) return -1;
+        r->glm5next_dsa_indexer_scratch = s;
+    }
+    size_t pool_floats = ((size_t)max_seq_len / c->indexer_kpool + 1) *
+                         (size_t)c->indexer_key_length;
+    if (s->ready && s->pool_floats >= pool_floats) return 0;
+    if (s->ready) glm5next_dsa_indexer_scratch_free(s);
+    size_t d_n[6] = { (size_t)c->hidden_size, (size_t)c->q_lora_rank,
+        (size_t)c->indexer_key_length, (size_t)c->indexer_key_length,
+        (size_t)c->indexer_heads * c->indexer_key_length,
+        (size_t)c->indexer_heads };
+    for (int i = 0; i < 6; ++i)
+        if (hipMalloc(&s->d[i], d_n[i] * sizeof(float)) != hipSuccess) goto fail;
+    s->key = (float *)malloc((size_t)c->indexer_key_length * sizeof(float));
+    s->gate = (float *)malloc((size_t)c->indexer_key_length * sizeof(float));
+    s->iq = (float *)malloc(d_n[4] * sizeof(float));
+    s->iw = (float *)malloc(d_n[5] * sizeof(float));
+    s->kw = (float *)malloc((size_t)c->indexer_key_length * sizeof(float));
+    s->kb = (float *)malloc((size_t)c->indexer_key_length * sizeof(float));
+    s->ape = (float *)malloc((size_t)c->indexer_kpool * c->indexer_key_length * sizeof(float));
+    s->pool = (float *)malloc(pool_floats * sizeof(float));
+    if (!s->key || !s->gate || !s->iq || !s->iw || !s->kw || !s->kb || !s->ape || !s->pool)
+        goto fail;
+    s->pool_floats = pool_floats;
+    s->ready = 1;
+    return 0;
+fail:
+    glm5next_dsa_indexer_scratch_free(s);
+    return -1;
+}
 
 static inline int gemm_run_bf16_w(hip_llm_runner *r, void *Y, const void *W,
                                   const void *X, int M, int N, int K, void *stream);
@@ -10436,18 +10490,18 @@ static int glm5next_hip_indexer_step(hip_llm_runner *r,
     void *dk = NULL, *dg = NULL, *diq = NULL, *diw = NULL;
     float *key = NULL, *gate = NULL, *iq = NULL, *iw = NULL;
     float *ape = NULL, *pool = NULL, *kw = NULL, *kb = NULL;
+    glm5next_dsa_indexer_scratch *scratch = NULL;
     int tk = 0, tg = 0, tq = 0, tw = 0, count = position + 1, rc = -1;
     char name[128];
     if (!r || !model || !c || !hidden || !qrank_norm || !indexer_keys ||
         !indexer_gates || !selected || position < 0 || position >= max_seq_len) return -1;
     const int dim = c->indexer_key_length, heads = c->indexer_heads, h = c->hidden_size;
     const int qdim = heads * dim;
+    if (glm5next_dsa_indexer_scratch_get(r, c, max_seq_len) != 0) return -1;
+    scratch = r->glm5next_dsa_indexer_scratch;
 #define HIP_IDX_VIEW(dst, suffix) do { \
         snprintf(name, sizeof(name), "blk.%d.%s", layer, (suffix)); \
         if (glm5next_tensor_view_get(model, name, 1, &(dst)) != 0) goto done; \
-    } while (0)
-#define HIP_IDX_ALLOC(ptr, n) do { \
-        if (hipMalloc(&(ptr), (size_t)(n) * sizeof(float)) != hipSuccess) goto done; \
     } while (0)
     HIP_IDX_VIEW(vk, "indexer.attn_k.weight");
     HIP_IDX_VIEW(vg, "indexer_compressor_gate.weight");
@@ -10469,21 +10523,14 @@ static int glm5next_hip_indexer_step(hip_llm_runner *r,
             upload_weight_matrix(&wq, &qtq, &tq) != 0 ||
             upload_weight_matrix(&ww, &qtw, &tw) != 0) goto done;
     }
-    key = (float *)malloc((size_t)dim * sizeof(float));
-    gate = (float *)malloc((size_t)dim * sizeof(float));
-    iq = (float *)malloc((size_t)qdim * sizeof(float));
-    iw = (float *)malloc((size_t)heads * sizeof(float));
-    kw = (float *)malloc((size_t)dim * sizeof(float));
-    kb = (float *)malloc((size_t)dim * sizeof(float));
-    ape = (float *)malloc((size_t)c->indexer_kpool * dim * sizeof(float));
-    pool = (float *)malloc((size_t)((max_seq_len / c->indexer_kpool) + 1) * dim * sizeof(float));
-    if (!key || !gate || !iq || !iw || !kw || !kb || !ape || !pool) goto done;
+    key = scratch->key; gate = scratch->gate; iq = scratch->iq; iw = scratch->iw;
+    kw = scratch->kw; kb = scratch->kb; ape = scratch->ape; pool = scratch->pool;
     if (glm5next_cpu_vector(&vkw, kw, dim) != 0 || glm5next_cpu_vector(&vkb, kb, dim) != 0 ||
         va.type != GGML_TYPE_F32 || va.n_dims != 2 || va.dims[0] != (uint64_t)dim ||
         va.dims[1] != (uint64_t)c->indexer_kpool) goto done;
     memcpy(ape, va.data, (size_t)c->indexer_kpool * dim * sizeof(float));
-    HIP_IDX_ALLOC(dx, h); HIP_IDX_ALLOC(dq, c->q_lora_rank);
-    HIP_IDX_ALLOC(dk, dim); HIP_IDX_ALLOC(dg, dim); HIP_IDX_ALLOC(diq, qdim); HIP_IDX_ALLOC(diw, heads);
+    dx = scratch->d[0]; dq = scratch->d[1]; dk = scratch->d[2]; dg = scratch->d[3];
+    diq = scratch->d[4]; diw = scratch->d[5];
     if (hipMemcpy(dx, hidden, (size_t)h * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
         hipMemcpy(dq, qrank_norm, (size_t)c->q_lora_rank * sizeof(float), hipMemcpyHostToDevice) != hipSuccess) goto done;
     launch_matvec_auto(r, dk, wk, dx, dim, h, tk);
@@ -10512,11 +10559,7 @@ done:
     if (!cache || !cache->indexer_ready) {
         if (wk) hipFree(wk); if (wg) hipFree(wg); if (wq) hipFree(wq); if (ww) hipFree(ww);
     }
-    if (dx) hipFree(dx); if (dq) hipFree(dq); if (dk) hipFree(dk); if (dg) hipFree(dg);
-    if (diq) hipFree(diq); if (diw) hipFree(diw);
-    free(key); free(gate); free(iq); free(iw); free(kw); free(kb); free(ape); free(pool);
     return rc;
-#undef HIP_IDX_ALLOC
 #undef HIP_IDX_VIEW
 }
 
@@ -19461,6 +19504,11 @@ void hip_llm_free(hip_llm_runner *r) {
         }
         free(r->glm5next_dsa_gpu);
         r->glm5next_dsa_gpu = NULL;
+    }
+    if (r->glm5next_dsa_indexer_scratch) {
+        glm5next_dsa_indexer_scratch_free(r->glm5next_dsa_indexer_scratch);
+        free(r->glm5next_dsa_indexer_scratch);
+        r->glm5next_dsa_indexer_scratch = NULL;
     }
     if (r->glm5next_kda_gpu) {
         for (int l = 0; l < r->glm5next.n_layers_all; ++l) {
