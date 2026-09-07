@@ -8266,6 +8266,12 @@ typedef struct {
 } glm5next_dsa_indexer_scratch;
 
 typedef struct {
+    void *d[11];                /* DSA projection, attention, and output scratch */
+    size_t seq_capacity;
+    int ready;
+} glm5next_dsa_decode_scratch;
+
+typedef struct {
     void *matrix[9];
     void *conv[3];
     void *dt_bias;
@@ -8781,6 +8787,7 @@ struct hip_llm_runner {
     gguf_context *glm5next_single_shard;
     glm5next_dsa_gpu_cache *glm5next_dsa_gpu;
     glm5next_dsa_indexer_scratch *glm5next_dsa_indexer_scratch;
+    glm5next_dsa_decode_scratch *glm5next_dsa_decode_scratch;
     glm5next_kda_gpu_cache *glm5next_kda_gpu;
     glm5next_kda_state_gpu *glm5next_kda_state_cache;
     glm5next_mhc_gpu_cache *glm5next_mhc_gpu;
@@ -9155,6 +9162,44 @@ static int glm5next_dsa_indexer_scratch_get(hip_llm_runner *r,
     return 0;
 fail:
     glm5next_dsa_indexer_scratch_free(s);
+    return -1;
+}
+
+static void glm5next_dsa_decode_scratch_free(glm5next_dsa_decode_scratch *s) {
+    if (!s) return;
+    for (int i = 0; i < 11; ++i) if (s->d[i]) hipFree(s->d[i]);
+    memset(s, 0, sizeof(*s));
+}
+
+static int glm5next_dsa_decode_scratch_get(hip_llm_runner *r,
+        const glm5next_config *c, int seq_len) {
+    if (!r || !c || seq_len <= 0) return -1;
+    glm5next_dsa_decode_scratch *s = r->glm5next_dsa_decode_scratch;
+    if (!s) {
+        s = (glm5next_dsa_decode_scratch *)calloc(1, sizeof(*s));
+        if (!s) return -1;
+        r->glm5next_dsa_decode_scratch = s;
+    }
+    if (s->ready && s->seq_capacity >= (size_t)seq_len) return 0;
+    if (s->ready) glm5next_dsa_decode_scratch_free(s);
+    size_t n[11] = {
+        (size_t)c->hidden_size, (size_t)c->q_lora_rank,
+        (size_t)c->attention_heads * c->qk_nope_head_dim,
+        (size_t)c->kv_lora_rank, (size_t)c->kv_lora_rank,
+        (size_t)c->attention_heads * c->qk_nope_head_dim,
+        (size_t)c->attention_heads * c->kv_lora_rank,
+        (size_t)seq_len * c->kv_lora_rank,
+        (size_t)seq_len * c->attention_heads * c->value_head_dim,
+        (size_t)c->attention_heads * c->value_head_dim,
+        (size_t)c->hidden_size
+    };
+    for (int i = 0; i < 11; ++i)
+        if (hipMalloc(&s->d[i], n[i] * sizeof(float)) != hipSuccess) goto fail;
+    s->seq_capacity = (size_t)seq_len;
+    s->ready = 1;
+    return 0;
+fail:
+    glm5next_dsa_decode_scratch_free(s);
     return -1;
 }
 
@@ -15949,7 +15994,9 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     float *qr = NULL, *q = NULL, *kvl = NULL, *norm = NULL, *qhead = NULL;
     float *kcache_host = NULL;
     glm5next_dsa_gpu_cache local_cache; glm5next_dsa_gpu_cache *cache = NULL;
+    glm5next_dsa_decode_scratch *scratch = NULL;
     int persistent_cache = r && r->glm5next_dsa_gpu != NULL;
+    int persistent_scratch = 0;
     int *selected = NULL;
     int otype = 0, rc = -1;
     if (!r || !model || !hidden || !out || !latent_cache || position < 0 || position >= max_seq_len) return -1;
@@ -15964,6 +16011,14 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
          * successive prompt tokens. */
         glm5next_hip_dsa_cache_free(cache);
         return -1;
+    }
+    if (glm5next_dsa_decode_scratch_get(r, c, attn_nt) == 0) {
+        scratch = r->glm5next_dsa_decode_scratch;
+        persistent_scratch = 1;
+        dproj_x = scratch->d[0]; dproj_qr = scratch->d[1]; dproj_q = scratch->d[2];
+        dproj_kv_raw = scratch->d[3]; dproj_kv = scratch->d[4]; dq = scratch->d[5];
+        dqcache = scratch->d[6]; dkcache = scratch->d[7]; dvcache = scratch->d[8];
+        dattn = scratch->d[9]; dout = scratch->d[10];
     }
 #define CB_VIEW(dst, suffix) do { char n[128]; snprintf(n, sizeof(n), "blk.%d.%s", layer, suffix); \
     if (glm5next_tensor_view_get(model, n, 1, &(dst)) != 0) goto done; } while (0)
@@ -16032,10 +16087,11 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
         { qtensor qto = glm5next_as_qtensor(&to);
           if (upload_weight_matrix(&do_w, &qto, &otype) != 0) goto done; }
     }
-    if (hipMalloc(&dq, (size_t)qdim*sizeof(float)) != hipSuccess ||
-        hipMalloc(&dqcache, (size_t)heads*kv*sizeof(float)) != hipSuccess || hipMalloc(&dkcache, (size_t)attn_nt*kv*sizeof(float)) != hipSuccess ||
-        hipMalloc(&dvcache, (size_t)attn_nt*heads*vdim*sizeof(float)) != hipSuccess || hipMalloc(&dattn, (size_t)heads*vdim*sizeof(float)) != hipSuccess ||
-        hipMalloc(&dout, (size_t)h*sizeof(float)) != hipSuccess) goto done;
+    if (!persistent_scratch &&
+        (hipMalloc(&dq, (size_t)qdim*sizeof(float)) != hipSuccess ||
+         hipMalloc(&dqcache, (size_t)heads*kv*sizeof(float)) != hipSuccess || hipMalloc(&dkcache, (size_t)attn_nt*kv*sizeof(float)) != hipSuccess ||
+         hipMalloc(&dvcache, (size_t)attn_nt*heads*vdim*sizeof(float)) != hipSuccess || hipMalloc(&dattn, (size_t)heads*vdim*sizeof(float)) != hipSuccess ||
+         hipMalloc(&dout, (size_t)h*sizeof(float)) != hipSuccess)) goto done;
     kcache_host = (float *)malloc((size_t)attn_nt * kv * sizeof(float));
     if (!kcache_host) goto done;
     for (int si = 0; si < attn_nt; ++si) {
@@ -16072,10 +16128,12 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     rc = 0;
 done:
     if (do_w && (!persistent_cache || do_w != cache->out_weight)) hipFree(do_w);
-    if (dproj_x) hipFree(dproj_x); if (dproj_qr) hipFree(dproj_qr); if (dproj_q) hipFree(dproj_q);
-    if (dproj_kv_raw) hipFree(dproj_kv_raw); if (dproj_kv) hipFree(dproj_kv);
-    if (dq) hipFree(dq); if (dqcache) hipFree(dqcache); if (dkcache) hipFree(dkcache); if (dvcache) hipFree(dvcache);
-    if (dattn) hipFree(dattn); if (dout) hipFree(dout);
+    if (!persistent_scratch) {
+        if (dproj_x) hipFree(dproj_x); if (dproj_qr) hipFree(dproj_qr); if (dproj_q) hipFree(dproj_q);
+        if (dproj_kv_raw) hipFree(dproj_kv_raw); if (dproj_kv) hipFree(dproj_kv);
+        if (dq) hipFree(dq); if (dqcache) hipFree(dqcache); if (dkcache) hipFree(dkcache); if (dvcache) hipFree(dvcache);
+        if (dattn) hipFree(dattn); if (dout) hipFree(dout);
+    }
     free(qr); free(q); free(kvl); free(norm); free(qhead); free(kcache_host);
     free(selected);
     if (!persistent_cache) {
@@ -19509,6 +19567,11 @@ void hip_llm_free(hip_llm_runner *r) {
         glm5next_dsa_indexer_scratch_free(r->glm5next_dsa_indexer_scratch);
         free(r->glm5next_dsa_indexer_scratch);
         r->glm5next_dsa_indexer_scratch = NULL;
+    }
+    if (r->glm5next_dsa_decode_scratch) {
+        glm5next_dsa_decode_scratch_free(r->glm5next_dsa_decode_scratch);
+        free(r->glm5next_dsa_decode_scratch);
+        r->glm5next_dsa_decode_scratch = NULL;
     }
     if (r->glm5next_kda_gpu) {
         for (int l = 0; l < r->glm5next.n_layers_all; ++l) {
