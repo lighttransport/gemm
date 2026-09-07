@@ -5692,6 +5692,14 @@ static const char *hip_kernel_source =
 "    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=rows)return; float s=0.0f;\n"
 "    for(int e=0;e<experts;++e)s+=parts[(size_t)e*rows+i]; accum[i]+=s;\n"
 "}\n"
+"/* IQ1_S DP4A matvec using Q8 activations and an exact offset correction. */\n"
+"__global__ void matvec_iq1_s_dp4a(float *dst,const unsigned char *mat,const signed char *xq,const float *xscale,int n_rows,int n_cols){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;if(row>=n_rows)return;int nb=n_cols/256,qblocks=n_cols/32;float sum=0.0f;const unsigned char *rp=mat+(size_t)row*nb*50;\n"
+"    for(int b=lane;b<qblocks;b+=32){int block=b>>3,ib=b&7;const unsigned char *bp=rp+block*50;const unsigned short *qh=(const unsigned short*)(bp+34);const unsigned char *qs=bp+2;float d=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1),delta=(qh[ib]&0x8000)?-0.125f:0.125f;const signed char *xp=xq+b*32;float dot=0.0f;int sumq=0;\n"
+"        for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);const signed char *g=(const signed char*)&iq1s_grid_dev[gi];int w0=((int)g[0]&255)|(((int)g[1]&255)<<8)|(((int)g[2]&255)<<16)|(((int)g[3]&255)<<24),w1=((int)g[4]&255)|(((int)g[5]&255)<<8)|(((int)g[6]&255)<<16)|(((int)g[7]&255)<<24);const int *qi=(const int*)xp;dot+=(float)dp4a_hw(w0,qi[l*2],0)+(float)dp4a_hw(w1,qi[l*2+1],0);for(int j=0;j<8;++j)sumq+=(int)xp[l*8+j];}\n"
+"        sum+=d*xscale[b]*(dot+delta*(float)sumq);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
+"}\n"
 "/* Fused IQ1_S gate/up projection and SiLU product for one expert. */\n"
 "__global__ void ffn_gate_up_silu_iq1_s_mw(float *dst,const unsigned char *gate,\n"
 "        const unsigned char *up,const float *x,int rows,int cols){\n"
@@ -8667,6 +8675,9 @@ struct hip_llm_runner {
     void *d_act_scale;   /* per-32-block fp32 scale A */
     void *d_act_q8_b;    /* int8 activation B (expert d_gate for down-proj) */
     void *d_act_scale_b; /* per-32-block fp32 scale B */
+    void *iq1_q8_source; /* source represented in d_act_q8 for the current callback */
+    int   iq1_q8_n;
+    int   iq1_q8_valid;
     int   decode_dp4a;   /* LLM_DECODE_DP4A (default on) */
     hipFunction_t fn_matvec_iq2_xxs_f32;
     hipFunction_t fn_matvec_q4_0_f32;
@@ -8681,6 +8692,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq3_s_f32;
     hipFunction_t fn_matvec_iq1_s_f32;
     hipFunction_t fn_matvec_iq1_s_warp_f32;
+    hipFunction_t fn_matvec_iq1_s_dp4a;
     hipFunction_t fn_matvec_iq1_m_f32;
     hipFunction_t fn_matvec_tq1_0_f32;
     hipFunction_t fn_matvec_tq2_0_f32;
@@ -9298,6 +9310,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq3_s_f32);
     GET_FUNC(matvec_iq1_s_f32);
     GET_FUNC(matvec_iq1_s_warp_f32);
+    GET_FUNC(matvec_iq1_s_dp4a);
     GET_FUNC(matvec_iq1_m_f32);
     GET_FUNC(matvec_tq1_0_f32);
     GET_FUNC(matvec_tq2_0_f32);
@@ -10580,6 +10593,7 @@ static int glm5next_hip_mhc_callback(const gguf_shards *model, int layer,
     glm5next_mhc_gpu_cache *mhc_cache = NULL;
     if (!r || !model || !c || !streams || !collapsed || !post || !comb ||
         (site != 0 && site != 1)) return -1;
+    r->iq1_q8_valid = 0;
     snprintf(n, sizeof(n), "blk.%d.%s_fn.weight", layer, suffix);
     if (glm5next_tensor_view_get(model, n, 1, &fn) != 0) goto done;
     snprintf(n, sizeof(n), "blk.%d.%s_base.weight", layer, suffix);
@@ -13194,6 +13208,18 @@ static inline void launch_matvec_iq3_s(hip_llm_runner *r, void *dst, void *mat,
 static inline void launch_matvec_iq1_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    const char *dp_env = getenv("GLM5NEXT_HIP_IQ1_DP4A");
+    if (dp_env && atoi(dp_env) != 0 && n_cols <= 8192 && (n_cols % 256) == 0) {
+        if (!r->iq1_q8_valid || r->iq1_q8_source != x || r->iq1_q8_n != n_cols) {
+            launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
+            r->iq1_q8_source = x;
+            r->iq1_q8_n = n_cols;
+            r->iq1_q8_valid = 1;
+        }
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq1_s_dp4a, (n_rows + 7) / 8, 1, 1,
+               256, 1, 1, 0, r->stream, a2);
+    } else
     if (n_cols >= 1024 && (n_cols % 256) == 0)
         LAUNCH(r->fn_matvec_iq1_s_warp_f32, (n_rows + 7) / 8, 1, 1,
                256, 1, 1, 0, r->stream, args);
@@ -15867,6 +15893,7 @@ static int glm5next_hip_dsa_callback(const gguf_shards *model, int layer,
     int otype = 0, rc = -1;
     if (!r || !model || !hidden || !out || !latent_cache || position < 0 || position >= max_seq_len) return -1;
     if (layer < 0 || layer >= c->n_layers_all) return -1;
+    r->iq1_q8_valid = 0;
     memset(&local_cache, 0, sizeof(local_cache));
     cache = persistent_cache ? &r->glm5next_dsa_gpu[layer] : &local_cache;
     if (!cache->ready && glm5next_hip_dsa_cache_load(r, model, layer, cache) != 0) {
@@ -16087,6 +16114,7 @@ static int glm5next_hip_kda_callback(const gguf_shards *model, int layer,
     int own_weights = 1;
     if (!r || !model || !hidden || !out || !recurrent || !conv_state ||
         glm5next_layer_type(c, layer) != GLM5NEXT_LAYER_KDA) return -1;
+    r->iq1_q8_valid = 0;
     if (select && atoi(select) != layer)
         return glm5next_cpu_kda_forward(model, layer, c, hidden, out, recurrent, conv_state);
     if (r->glm5next_kda_gpu && glm5next_kda_cache_layer_enabled(layer)) {
@@ -16237,6 +16265,7 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     char name[128];
     if (!r || !model || !c || !hidden || !out || layer < 0 ||
         layer >= c->n_layers_all || slots <= 0 || slots > 64) return -1;
+    r->iq1_q8_valid = 0;
     router_cache = r->glm5next_moe_router ? &r->glm5next_moe_router[layer] : NULL;
     {
         const char *select = getenv("GLM5NEXT_HIP_MOE_LAYER");
