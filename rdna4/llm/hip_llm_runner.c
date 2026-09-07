@@ -1821,6 +1821,43 @@ static const char *hip_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
+"__global__ void matvec_q5_K_mw16_f32(float *dst, const unsigned char *mat, const float *x,\n"
+"                                     int n_rows, int n_cols) {\n"
+"    int lane = threadIdx.x & 15;\n"
+"    int row = blockIdx.x * 16 + (threadIdx.x >> 4);\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 176;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 16) {\n"
+"        const unsigned char *bp = row_ptr + b * 176;\n"
+"        float d = half_to_float(*(const half_raw *)(bp));\n"
+"        float dmin = half_to_float(*(const half_raw *)(bp + 2));\n"
+"        const unsigned char *sc = bp + 4, *qh = bp + 16, *qs = bp + 48;\n"
+"        const float *xb = x + b * 256;\n"
+"        float partial = 0.0f; int yi = 0, is = 0;\n"
+"        for (int j = 0; j < 4; ++j) {\n"
+"            unsigned char sv0, mv0, sv1, mv1;\n"
+"            if (is < 4) { sv0 = sc[is] & 63; mv0 = sc[is+4] & 63; }\n"
+"            else { sv0 = (sc[is+4]&0xF)|((sc[is-4]>>6)<<4); mv0 = (sc[is+4]>>4)|((sc[is]>>6)<<4); }\n"
+"            if (is+1 < 4) { sv1 = sc[is+1] & 63; mv1 = sc[is+1+4] & 63; }\n"
+"            else { sv1 = (sc[is+1+4]&0xF)|((sc[is+1-4]>>6)<<4); mv1 = (sc[is+1+4]>>4)|((sc[is+1]>>6)<<4); }\n"
+"            float d1 = d * sv0, m1 = dmin * mv0, d2 = d * sv1, m2 = dmin * mv1;\n"
+"            const unsigned char *q = qs + j * 32;\n"
+"            for (int l = 0; l < 32; ++l) { int bit = (qh[l] >> (2*j)) & 1;\n"
+"                partial += (d1 * ((q[l] & 0xF) | (bit << 4)) - m1) * xb[yi++]; }\n"
+"            for (int l = 0; l < 32; ++l) { int bit = (qh[l] >> (2*j + 1)) & 1;\n"
+"                partial += (d2 * ((q[l] >> 4) | (bit << 4)) - m2) * xb[yi++]; }\n"
+"            is += 2;\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 8; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset, 16);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"\n"
 "__global__ void glm5next_kda_qkv_q5k_f32(float *qout, float *kout, float *vout,\n"
 "        const unsigned char *qw, const unsigned char *kw, const unsigned char *vw,\n"
 "        const float *x, int n_rows, int n_cols) {\n"
@@ -8483,6 +8520,7 @@ struct hip_llm_runner {
     int q4k_g4;                             /* LLM_Q4K_G4: warp-per-row G=nb*4 Q4_K */
     hipFunction_t fn_matvec_q5_K_f32;
     hipFunction_t fn_matvec_q5_K_mw_f32;
+    hipFunction_t fn_matvec_q5_K_mw16_f32;
     hipFunction_t fn_glm5next_kda_qkv_q5k_f32;
     hipFunction_t fn_glm5next_dsa_qkv_a_q5k_f32;
     hipFunction_t fn_matvec_q6_K_f32;
@@ -8950,6 +8988,7 @@ struct hip_llm_runner {
     int decode_wmma;            /* 1 = use WMMA matvec for F16 weights at decode */
     int quant_matvec_opt;       /* 1 = route experimental quant matvec variants */
     int q5_k_mw;                /* 1 = use one-warp-per-row Q5_K matvec */
+    int q5_k_mw16;              /* 1 = use two-rows-per-warp Q5_K matvec */
 
     /* === Phase 5: HIP graph capture for decode === */
     hipFunction_t fn_rope_neox_f32_devp;
@@ -9120,6 +9159,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q4_K_g4_f32);
     GET_FUNC(matvec_q5_K_f32);
     GET_FUNC(matvec_q5_K_mw_f32);
+    GET_FUNC(matvec_q5_K_mw16_f32);
     GET_FUNC(glm5next_kda_qkv_q5k_f32);
     GET_FUNC(glm5next_dsa_qkv_a_q5k_f32);
     GET_FUNC(matvec_q6_K_f32);
@@ -9322,6 +9362,11 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     {
         const char *env_q5 = getenv("LLM_Q5_K_MW");
         if (env_q5) r->q5_k_mw = atoi(env_q5) != 0;
+    }
+    r->q5_k_mw16 = 1;
+    {
+        const char *env_q5_16 = getenv("LLM_Q5_K_MW16");
+        if (env_q5_16) r->q5_k_mw16 = atoi(env_q5_16) != 0;
     }
 
     CHECK_HIP_NULL(hipSetDevice(device_id));
@@ -13012,7 +13057,10 @@ static inline void launch_matvec_q4_K(hip_llm_runner *r, void *dst, void *mat,
 static inline void launch_matvec_q5_K(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
-    if (r->q5_k_mw) {
+    if (r->q5_k_mw16) {
+        LAUNCH(r->fn_matvec_q5_K_mw16_f32, (n_rows + 15) / 16, 1, 1, 256, 1, 1, 0,
+               r->stream, args);
+    } else if (r->q5_k_mw) {
         LAUNCH(r->fn_matvec_q5_K_mw_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0,
                r->stream, args);
     } else {
