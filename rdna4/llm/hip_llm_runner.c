@@ -10518,6 +10518,7 @@ static int glm5next_moe_cache_get(hip_llm_runner *r, const qtensor *gate,
     s->bytes = bytes; s->gate = g; s->up = u; s->down = d;
     s->gate_type = gt; s->up_type = ut; s->down_type = dt;
     r->glm5next_moe_cache_used += bytes;
+    r->moe_stats.h2d_bytes += bytes;
     *out = s;
     return 0;
 }
@@ -20101,6 +20102,8 @@ int hip_llm_max_seq_len(const hip_llm_runner *r) { return r ? r->max_seq_len : 0
 int hip_llm_get_moe_stats(const hip_llm_runner *r, hip_llm_moe_stats *stats) {
     if (!r || !stats) return -1;
     *stats = r->moe_stats;
+    stats->cache_hits += r->glm5next_moe_cache_hits;
+    stats->cache_misses += r->glm5next_moe_cache_misses;
     if (getenv("LLM_MOE_LAYER_STATS")) {
         for (int l = 0; l < r->n_layers && l < 128; ++l) {
             uint64_t h = r->moe_layer_hits[l], m = r->moe_layer_misses[l];
@@ -20117,6 +20120,8 @@ int hip_llm_get_moe_stats(const hip_llm_runner *r, hip_llm_moe_stats *stats) {
 void hip_llm_reset_moe_stats(hip_llm_runner *r) {
     if (r) {
         memset(&r->moe_stats, 0, sizeof(r->moe_stats));
+        r->glm5next_moe_cache_hits = 0;
+        r->glm5next_moe_cache_misses = 0;
         memset(r->moe_layer_hits, 0, sizeof(r->moe_layer_hits));
         memset(r->moe_layer_misses, 0, sizeof(r->moe_layer_misses));
     }
