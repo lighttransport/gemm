@@ -2733,6 +2733,41 @@ static const char *hip_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "\n"
+"/* Pointer-array IQ2_XXS matvec; each z-slice preserves the scalar kernel's\n"
+" * lane/block traversal while sharing the launch across selected experts. */\n"
+"__global__ void matvec_iq2_xxs_ptrs_f32(float *dst, const unsigned char *const *mats,\n"
+"        const float *x, int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id, slot = blockIdx.z;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 66;\n"
+"    const unsigned char *row_ptr = mats[slot] + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = lane; b < nb; b += 32) {\n"
+"        const unsigned char *bp = row_ptr + b * 66;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        float partial = 0.0f; int yi = 0;\n"
+"        for (int ib32 = 0; ib32 < 8; ++ib32) {\n"
+"            unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
+"            unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
+"            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"            const unsigned char *aux8 = (const unsigned char *)&aux0;\n"
+"            for (int l = 0; l < 4; ++l) {\n"
+"                const unsigned char *grid = (const unsigned char *)&iq2xxs_grid_dev[aux8[l]];\n"
+"                unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
+"                const float *xb = x + b * 256;\n"
+"                for (int j = 0; j < 8; ++j)\n"
+"                    partial += db * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f) * xb[yi++];\n"
+"            }\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[(size_t)slot * n_rows + row] = sum;\n"
+"}\n"
+"\n"
 "__device__ static const unsigned long long iq2xs_grid_dev[512] = {\n"
 "    0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,\n"
 "    0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x080808080819192bULL,\n"
@@ -8715,6 +8750,7 @@ struct hip_llm_runner {
     int   iq1_q8_valid;
     int   decode_dp4a;   /* LLM_DECODE_DP4A (default on) */
     hipFunction_t fn_matvec_iq2_xxs_f32;
+    hipFunction_t fn_matvec_iq2_xxs_ptrs_f32;
     hipFunction_t fn_matvec_q4_0_f32;
     hipFunction_t fn_matvec_q4_1_f32;
     hipFunction_t fn_matvec_q5_0_f32;
@@ -9432,6 +9468,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq2_s_lds_f32);
     GET_FUNC(matvec_iq2_s_expert_lds_f32);
     GET_FUNC(matvec_iq2_xxs_f32);
+    GET_FUNC(matvec_iq2_xxs_ptrs_f32);
     GET_FUNC(matvec_q4_0_f32);
     GET_FUNC(matvec_q4_1_f32);
     GET_FUNC(matvec_q5_0_f32);
@@ -13393,6 +13430,12 @@ static inline void launch_matvec_q6_K(hip_llm_runner *r, void *dst, void *mat,
     LAUNCH(r->fn_matvec_q6_K_f32, n_rows, 1, 1, 64, 1, 1, 0, r->stream, args);
 }
 DEFINE_LAUNCH_MATVEC_MW(iq2_xxs, fn_matvec_iq2_xxs_f32)
+static inline void launch_matvec_iq2_xxs_ptrs(hip_llm_runner *r, void *dst,
+        void *mats, void *x, int n_rows, int n_cols, int slots) {
+    void *args[] = { &dst, &mats, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_iq2_xxs_ptrs_f32, (n_rows + 7) / 8, 1, slots,
+           256, 1, 1, 0, r->stream, args);
+}
 DEFINE_LAUNCH_MATVEC(q4_0, fn_matvec_q4_0_f32)
 DEFINE_LAUNCH_MATVEC(q4_1, fn_matvec_q4_1_f32)
 DEFINE_LAUNCH_MATVEC(q5_0, fn_matvec_q5_0_f32)
@@ -16776,7 +16819,36 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
                 launch_scale_add(r, daccum, do_, w, c->hidden_size);
             }
         }
-    } else for (int j = 0; j < slots; ++j) {
+    } else if (!getenv("GLM5NEXT_HIP_IQ2_XXS_GROUPED") ||
+               atoi(getenv("GLM5NEXT_HIP_IQ2_XXS_GROUPED")) != 0) {
+        int all_iq2 = 1;
+        for (int j = 0; j < slots; ++j)
+            if (gtype[j] != GGML_TYPE_IQ2_XXS || utype[j] != GGML_TYPE_IQ2_XXS)
+                all_iq2 = 0;
+        if (!all_iq2) goto moe_scalar_experts;
+        if (hipMemcpyAsync(r->glm5next_moe_ptrs[0], dgw,
+                           (size_t)slots * sizeof(void *), hipMemcpyHostToDevice, r->stream) != hipSuccess ||
+            hipMemcpyAsync(r->glm5next_moe_ptrs[1], duw,
+                           (size_t)slots * sizeof(void *), hipMemcpyHostToDevice, r->stream) != hipSuccess)
+            goto done;
+        launch_matvec_iq2_xxs_ptrs(r, dg, r->glm5next_moe_ptrs[0], dx,
+                                   c->expert_ff_length, c->hidden_size, slots);
+        launch_matvec_iq2_xxs_ptrs(r, du, r->glm5next_moe_ptrs[1], dx,
+                                   c->expert_ff_length, c->hidden_size, slots);
+        float clamp = c->swiglu_clamp_exp ? c->swiglu_clamp_exp[layer] : 0.0f;
+        launch_swiglu_limit(r, dg, du, slots * c->expert_ff_length, clamp);
+        launch_silu_mul(r, dg, du, slots * c->expert_ff_length);
+        for (int j = 0; j < slots; ++j) {
+            float w = c->routed_scaling_factor * weights[j] /
+                      (sum > 0.0f ? sum : 1.0f);
+            launch_matvec_auto(r, do_, ddw[j],
+                               (float *)dg + (size_t)j * c->expert_ff_length,
+                               c->hidden_size, c->expert_ff_length, dtype[j]);
+            launch_scale_add(r, daccum, do_, w, c->hidden_size);
+        }
+    } else {
+moe_scalar_experts:
+        for (int j = 0; j < slots; ++j) {
         qtensor gw = glm5next_as_qtensor(&gate_v);
         qtensor uw = glm5next_as_qtensor(&up_v);
         qtensor dw = glm5next_as_qtensor(&down_v);
@@ -16825,6 +16897,7 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
                                c->expert_ff_length, dtype[j]);
             launch_scale_add(r, daccum, do_, w, c->hidden_size);
         }
+    }
     }
 
     { qtensor sg = glm5next_as_qtensor(&shared_gate_v);
