@@ -10487,7 +10487,14 @@ static int glm5next_mhc_cache_load(hip_llm_runner *r,
     glm5next_mhc_gpu_cache *cache = &r->glm5next_mhc_gpu[layer * 2 + site];
     if (cache->ready) return 0;
     qtensor qfn = glm5next_as_qtensor(fn);
-    if (upload_weight_matrix(&cache->fn, &qfn, &cache->type) != 0) {
+    const char *f32_env = getenv("GLM5NEXT_HIP_MHC_F32");
+    int use_f32 = f32_env && atoi(f32_env) != 0 &&
+        (qfn.type == GGML_TYPE_IQ1_S || qfn.type == GGML_TYPE_IQ1_M ||
+         qfn.type == GGML_TYPE_Q5_K || qfn.type == GGML_TYPE_Q6_K);
+    int upload_rc = use_f32 ?
+        upload_dequant_f32_matrix(&cache->fn, &qfn, &cache->type) :
+        upload_weight_matrix(&cache->fn, &qfn, &cache->type);
+    if (upload_rc != 0) {
         if (cache->fn) hipFree(cache->fn);
         memset(cache, 0, sizeof(*cache));
         return -1;
