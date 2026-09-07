@@ -3922,6 +3922,36 @@ static const char *hip_kernel_source =
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 
+"/* Pointer-array IQ3_XXS matvec for grouped routed down projections. */\n"
+"__global__ void matvec_iq3_xxs_ptrs_f32(float *dst, const unsigned char *const *mats,\n"
+"        const float *x, int n_rows, int n_cols, int x_stride) {\n"
+"    int warp_id = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp_id, slot = blockIdx.z;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 98, G = nb * 32;\n"
+"    const unsigned char *row_ptr = mats[slot] + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5, rem = g & 31, sb = rem >> 2, l = rem & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = *(const unsigned int *)(bp + 66 + 4*sb);\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        const float *xb = x + (size_t)slot * x_stride + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; ++j) {\n"
+"            sum += db * (float)g1[j] * ((sgn & (1 << j)) ? -1.0f : 1.0f) * xb[j];\n"
+"            sum += db * (float)g2[j] * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f) * xb[j+4];\n"
+"        }\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[(size_t)slot * n_rows + row] = sum;\n"
+"}\n"
+"\n"
 "/* ---- matvec_iq2_s_f32: IQ2_S matrix x F32 vector -> F32 ---- */\n"
 "/* Full 32-lane utilization: each lane processes 8-element groups (one (ib32,l)  */\n"
 "/* pair = a single grid entry) striding by 32 over the row's nb*32 groups. Avoids */\n"
@@ -8759,6 +8789,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq4_xs_f32;
     hipFunction_t fn_matvec_iq2_xs_f32;
     hipFunction_t fn_matvec_iq3_xxs_f32;
+    hipFunction_t fn_matvec_iq3_xxs_ptrs_f32;
     hipFunction_t fn_matvec_iq2_s_f32;
     hipFunction_t fn_matvec_iq3_s_f32;
     hipFunction_t fn_matvec_iq1_s_f32;
@@ -9477,6 +9508,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq4_xs_f32);
     GET_FUNC(matvec_iq2_xs_f32);
     GET_FUNC(matvec_iq3_xxs_f32);
+    GET_FUNC(matvec_iq3_xxs_ptrs_f32);
     GET_FUNC(matvec_iq2_s_f32);
     GET_FUNC(matvec_iq3_s_f32);
     GET_FUNC(matvec_iq1_s_f32);
@@ -13444,6 +13476,12 @@ DEFINE_LAUNCH_MATVEC_MW(iq4_nl, fn_matvec_iq4_nl_f32)
 DEFINE_LAUNCH_MATVEC_MW(iq4_xs, fn_matvec_iq4_xs_f32)
 DEFINE_LAUNCH_MATVEC_MW(iq2_xs, fn_matvec_iq2_xs_f32)
 DEFINE_LAUNCH_MATVEC_MW(iq3_xxs, fn_matvec_iq3_xxs_f32)
+static inline void launch_matvec_iq3_xxs_ptrs(hip_llm_runner *r, void *dst,
+        void *mats, void *x, int n_rows, int n_cols, int x_stride, int slots) {
+    void *args[] = { &dst, &mats, &x, &n_rows, &n_cols, &x_stride };
+    LAUNCH(r->fn_matvec_iq3_xxs_ptrs_f32, (n_rows + 7) / 8, 1, slots,
+           256, 1, 1, 0, r->stream, args);
+}
 /* Quantize a F32 activation vector x[n] -> int8 per-32-block (qs) + fp32 scale. */
 static inline void launch_quantize_q8(hip_llm_runner *r, void *x, int n,
                                        void *qs, void *scale) {
@@ -16838,7 +16876,25 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
         float clamp = c->swiglu_clamp_exp ? c->swiglu_clamp_exp[layer] : 0.0f;
         launch_swiglu_limit(r, dg, du, slots * c->expert_ff_length, clamp);
         launch_silu_mul(r, dg, du, slots * c->expert_ff_length);
-        for (int j = 0; j < slots; ++j) {
+        int all_down_iq3 = 1;
+        for (int j = 0; j < slots; ++j)
+            if (dtype[j] != GGML_TYPE_IQ3_XXS) all_down_iq3 = 0;
+        const char *iq3_grouped_env = getenv("GLM5NEXT_HIP_IQ3_XXS_GROUPED");
+        if (all_down_iq3 && (!iq3_grouped_env || atoi(iq3_grouped_env) != 0)) {
+            if (hipMemcpyAsync(r->glm5next_moe_ptrs[2], ddw,
+                               (size_t)slots * sizeof(void *), hipMemcpyHostToDevice, r->stream) != hipSuccess)
+                goto done;
+            launch_matvec_iq3_xxs_ptrs(r, do_, r->glm5next_moe_ptrs[2], dg,
+                                       c->hidden_size, c->expert_ff_length,
+                                       c->expert_ff_length, slots);
+            for (int j = 0; j < slots; ++j) {
+                float w = c->routed_scaling_factor * weights[j] /
+                          (sum > 0.0f ? sum : 1.0f);
+                launch_scale_add(r, daccum,
+                                 (float *)do_ + (size_t)j * c->hidden_size,
+                                 w, c->hidden_size);
+            }
+        } else for (int j = 0; j < slots; ++j) {
             float w = c->routed_scaling_factor * weights[j] /
                       (sum > 0.0f ? sum : 1.0f);
             launch_matvec_auto(r, do_, ddw[j],
