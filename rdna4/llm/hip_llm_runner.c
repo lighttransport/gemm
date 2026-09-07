@@ -8817,6 +8817,16 @@ struct hip_llm_runner {
     glm5next_moe_router_cache *glm5next_moe_router;
     glm5next_dense_gpu_cache *glm5next_dense_gpu;
     glm5next_moe_resident_slot *glm5next_moe_cache;
+    void **glm5next_moe_gate_mapped;
+    void **glm5next_moe_up_mapped;
+    void **glm5next_moe_down_mapped;
+    const void **glm5next_moe_gate_host;
+    const void **glm5next_moe_up_host;
+    const void **glm5next_moe_down_host;
+    size_t *glm5next_moe_gate_bytes;
+    size_t *glm5next_moe_up_bytes;
+    size_t *glm5next_moe_down_bytes;
+    unsigned char *glm5next_moe_mapped_ready;
     int glm5next_moe_cache_slots;
     size_t glm5next_moe_cache_budget;
     size_t glm5next_moe_cache_used;
@@ -10459,6 +10469,58 @@ static size_t glm5next_qtensor_bytes(const qtensor *q) {
     size_t row = dequant_row_size(q->type, q->n_cols);
     if (row) return row * (size_t)q->n_rows;
     return (size_t)q->n_rows * (size_t)q->n_cols * sizeof(uint16_t);
+}
+
+static int glm5next_moe_map_layer(hip_llm_runner *r, int layer,
+        const glm5next_config *c, const glm5next_tensor_view *gate,
+        const glm5next_tensor_view *up, const glm5next_tensor_view *down) {
+    if (!r || !c || !gate || !up || !down || layer < 0 || layer >= c->n_layers ||
+        gate->n_dims != 3 || up->n_dims != 3 || down->n_dims != 3) return 0;
+    if (!r->glm5next_moe_gate_mapped) {
+        size_t n = (size_t)c->n_layers;
+        r->glm5next_moe_gate_mapped = (void **)calloc(n, sizeof(void *));
+        r->glm5next_moe_up_mapped = (void **)calloc(n, sizeof(void *));
+        r->glm5next_moe_down_mapped = (void **)calloc(n, sizeof(void *));
+        r->glm5next_moe_gate_host = (const void **)calloc(n, sizeof(void *));
+        r->glm5next_moe_up_host = (const void **)calloc(n, sizeof(void *));
+        r->glm5next_moe_down_host = (const void **)calloc(n, sizeof(void *));
+        r->glm5next_moe_gate_bytes = (size_t *)calloc(n, sizeof(size_t));
+        r->glm5next_moe_up_bytes = (size_t *)calloc(n, sizeof(size_t));
+        r->glm5next_moe_down_bytes = (size_t *)calloc(n, sizeof(size_t));
+        r->glm5next_moe_mapped_ready = (unsigned char *)calloc(n, 1);
+    }
+    if (!r->glm5next_moe_mapped_ready || r->glm5next_moe_mapped_ready[layer])
+        return r->glm5next_moe_mapped_ready && r->glm5next_moe_mapped_ready[layer];
+    size_t gb = (size_t)dequant_row_size(gate->type, (int)gate->dims[0]) * gate->dims[1] * gate->dims[2];
+    size_t ub = (size_t)dequant_row_size(up->type, (int)up->dims[0]) * up->dims[1] * up->dims[2];
+    size_t db = (size_t)dequant_row_size(down->type, (int)down->dims[0]) * down->dims[1] * down->dims[2];
+    void *gm = NULL, *um = NULL, *dm = NULL;
+    int gr = hipHostRegister((void *)gate->data, gb, 2) == hipSuccess;
+    int ur = gr && hipHostRegister((void *)up->data, ub, 2) == hipSuccess;
+    int dr = ur && hipHostRegister((void *)down->data, db, 2) == hipSuccess;
+    if (gr) hipHostGetDevicePointer(&gm, (void *)gate->data, 0);
+    if (ur) hipHostGetDevicePointer(&um, (void *)up->data, 0);
+    if (dr) hipHostGetDevicePointer(&dm, (void *)down->data, 0);
+    if (!gr || !ur || !dr || !gm || !um || !dm) {
+        if (dr) hipHostUnregister((void *)down->data);
+        if (ur) hipHostUnregister((void *)up->data);
+        if (gr) hipHostUnregister((void *)gate->data);
+        return 0;
+    }
+    r->glm5next_moe_gate_mapped[layer] = gm;
+    r->glm5next_moe_up_mapped[layer] = um;
+    r->glm5next_moe_down_mapped[layer] = dm;
+    r->glm5next_moe_gate_host[layer] = gate->data;
+    r->glm5next_moe_up_host[layer] = up->data;
+    r->glm5next_moe_down_host[layer] = down->data;
+    r->glm5next_moe_gate_bytes[layer] = gb;
+    r->glm5next_moe_up_bytes[layer] = ub;
+    r->glm5next_moe_down_bytes[layer] = db;
+    r->glm5next_moe_mapped_ready[layer] = 1;
+    if (r->verbose >= 1)
+        fprintf(stderr, "hip_llm: GLM5 layer %d expert weights mapped from host (%.1f MiB)\n",
+                layer, (double)(gb + ub + db) / (1024.0 * 1024.0));
+    return 1;
 }
 
 static void glm5next_moe_slot_release(hip_llm_runner *r,
@@ -16459,6 +16521,9 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
     glm5next_moe_router_cache *router_cache = NULL;
     int rc = -1;
     int scratch = 0;
+    int mapped_host = 0;
+    void *mapped_gate = NULL, *mapped_up = NULL, *mapped_down = NULL;
+    size_t mapped_gate_stride = 0, mapped_up_stride = 0, mapped_down_stride = 0;
     char name[128];
     if (!r || !model || !c || !hidden || !out || layer < 0 ||
         layer >= c->n_layers_all || slots <= 0 || slots > 64) return -1;
@@ -16492,6 +16557,17 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
         gate_v.dims[2] != (uint64_t)c->expert_count ||
         up_v.dims[2] != (uint64_t)c->expert_count ||
         down_v.dims[2] != (uint64_t)c->expert_count) goto done;
+    const char *mapped_env = getenv("GLM5NEXT_HIP_MOE_MAPPED");
+    if (mapped_env && atoi(mapped_env) != 0)
+        mapped_host = glm5next_moe_map_layer(r, layer, c, &gate_v, &up_v, &down_v);
+    if (mapped_host) {
+        mapped_gate = r->glm5next_moe_gate_mapped[layer];
+        mapped_up = r->glm5next_moe_up_mapped[layer];
+        mapped_down = r->glm5next_moe_down_mapped[layer];
+        mapped_gate_stride = (size_t)dequant_row_size(gate_v.type, (int)gate_v.dims[0]) * gate_v.dims[1];
+        mapped_up_stride = (size_t)dequant_row_size(up_v.type, (int)up_v.dims[0]) * up_v.dims[1];
+        mapped_down_stride = (size_t)dequant_row_size(down_v.type, (int)down_v.dims[0]) * down_v.dims[1];
+    }
 
     router = (float *)malloc((size_t)c->expert_count * sizeof(float));
     bias = (float *)malloc((size_t)c->expert_count * sizeof(float));
@@ -16587,7 +16663,12 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
         gw.data = (const unsigned char *)gate_v.data + e * gu_stride;
         uw.data = (const unsigned char *)up_v.data + e * gu_stride;
         dw.data = (const unsigned char *)down_v.data + e * dn_stride;
-        if (glm5next_moe_cache_get(r, &gw, &uw, &dw, layer, ids[j], &resident[j]) == 0) {
+        if (mapped_host) {
+            dgw[j] = (unsigned char *)mapped_gate + e * mapped_gate_stride;
+            duw[j] = (unsigned char *)mapped_up + e * mapped_up_stride;
+            ddw[j] = (unsigned char *)mapped_down + e * mapped_down_stride;
+            gtype[j] = gate_v.type; utype[j] = up_v.type; dtype[j] = down_v.type;
+        } else if (glm5next_moe_cache_get(r, &gw, &uw, &dw, layer, ids[j], &resident[j]) == 0) {
             dgw[j] = resident[j]->gate; duw[j] = resident[j]->up; ddw[j] = resident[j]->down;
             gtype[j] = resident[j]->gate_type; utype[j] = resident[j]->up_type;
             dtype[j] = resident[j]->down_type;
@@ -16704,7 +16785,12 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
         gw.data = (const unsigned char *)gate_v.data + e * gu_stride;
         uw.data = (const unsigned char *)up_v.data + e * gu_stride;
         dw.data = (const unsigned char *)down_v.data + e * dn_stride;
-        if (glm5next_moe_cache_get(r, &gw, &uw, &dw, layer, ids[j], &resident[j]) == 0) {
+        if (mapped_host) {
+            dgw[j] = (unsigned char *)mapped_gate + e * mapped_gate_stride;
+            duw[j] = (unsigned char *)mapped_up + e * mapped_up_stride;
+            ddw[j] = (unsigned char *)mapped_down + e * mapped_down_stride;
+            gtype[j] = gate_v.type; utype[j] = up_v.type; dtype[j] = down_v.type;
+        } else if (glm5next_moe_cache_get(r, &gw, &uw, &dw, layer, ids[j], &resident[j]) == 0) {
             dgw[j] = resident[j]->gate; duw[j] = resident[j]->up; ddw[j] = resident[j]->down;
             gtype[j] = resident[j]->gate_type; utype[j] = resident[j]->up_type;
             dtype[j] = resident[j]->down_type;
@@ -19781,6 +19867,27 @@ void hip_llm_free(hip_llm_runner *r) {
         free(r->glm5next_moe_cache);
         r->glm5next_moe_cache = NULL;
     }
+    if (r->glm5next_moe_mapped_ready) {
+        for (int l = 0; l < r->glm5next.n_layers; ++l) {
+            if (!r->glm5next_moe_mapped_ready[l]) continue;
+            hipHostUnregister((void *)r->glm5next_moe_gate_host[l]);
+            hipHostUnregister((void *)r->glm5next_moe_up_host[l]);
+            hipHostUnregister((void *)r->glm5next_moe_down_host[l]);
+        }
+    }
+    free(r->glm5next_moe_gate_mapped); free(r->glm5next_moe_up_mapped);
+    free(r->glm5next_moe_down_mapped);
+    free(r->glm5next_moe_gate_host); free(r->glm5next_moe_up_host);
+    free(r->glm5next_moe_down_host);
+    free(r->glm5next_moe_gate_bytes); free(r->glm5next_moe_up_bytes);
+    free(r->glm5next_moe_down_bytes); free(r->glm5next_moe_mapped_ready);
+    r->glm5next_moe_gate_mapped = r->glm5next_moe_up_mapped = NULL;
+    r->glm5next_moe_down_mapped = NULL;
+    r->glm5next_moe_gate_host = r->glm5next_moe_up_host = NULL;
+    r->glm5next_moe_down_host = NULL;
+    r->glm5next_moe_gate_bytes = r->glm5next_moe_up_bytes = NULL;
+    r->glm5next_moe_down_bytes = NULL;
+    r->glm5next_moe_mapped_ready = NULL;
     if (r->glm5next_moe_router) {
         for (int l = 0; l < r->glm5next.n_layers_all; ++l) {
             if (r->glm5next_moe_router[l].weight)
