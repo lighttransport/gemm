@@ -10484,6 +10484,9 @@ static int glm5next_moe_cache_get(hip_llm_runner *r, const qtensor *gate,
         victim = -1;
         for (int i = 0; i < r->glm5next_moe_cache_slots; ++i) {
             glm5next_moe_resident_slot *s = &r->glm5next_moe_cache[i];
+            /* The callback may already hold pointers to other experts from
+             * this layer. Never evict one while selection is materialized. */
+            if (s->layer == layer) continue;
             if (s->gate && s->expert >= 0 && s->age < oldest) {
                 oldest = s->age; victim = i;
             }
@@ -10499,12 +10502,14 @@ static int glm5next_moe_cache_get(hip_llm_runner *r, const qtensor *gate,
     if (victim < 0) {
         uint64_t oldest = UINT64_MAX;
         for (int i = 0; i < r->glm5next_moe_cache_slots; ++i)
-            if (r->glm5next_moe_cache[i].expert >= 0 &&
+            if (r->glm5next_moe_cache[i].layer != layer &&
+                r->glm5next_moe_cache[i].expert >= 0 &&
                 r->glm5next_moe_cache[i].age < oldest) {
                 oldest = r->glm5next_moe_cache[i].age; victim = i;
             }
         glm5next_moe_slot_release(r, &r->glm5next_moe_cache[victim]);
     }
+    if (victim < 0) return -1;
     glm5next_moe_resident_slot *s = &r->glm5next_moe_cache[victim];
     void *g = NULL, *u = NULL, *d = NULL;
     int gt = 0, ut = 0, dt = 0;
