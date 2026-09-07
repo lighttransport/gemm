@@ -5696,6 +5696,13 @@ static const char *hip_kernel_source =
 "    }\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)out[(size_t)e*rows+row]=sum*weights[e];\n"
 "}\n"
+"__global__ void glm5next_moe_down_iq1s_selected_dp4a(float *out,const unsigned char * const *downs,const signed char *xq,const float *xscale,const float *weights,int rows,int cols,int experts){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,e=blockIdx.y,row=blockIdx.x*8+warp;if(e>=experts||row>=rows)return;int qblocks=cols/32,nb=cols/256;float sum=0.0f;const unsigned char *dw=downs[e]+(size_t)row*nb*50;const signed char *xp=xq+(size_t)e*cols;const float *sc=xscale+(size_t)e*qblocks;\n"
+"    for(int b=lane;b<qblocks;b+=32){int block=b>>3,ib=b&7;const unsigned char *bp=dw+block*50;const unsigned short *qh=(const unsigned short*)(bp+34);const unsigned char *qs=bp+2;float dl=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1),delta=(qh[ib]&0x8000)?-0.125f:0.125f;const signed char *v=xp+b*32;float dot=0.0f;int sumq=0;\n"
+"        for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);const signed char *g=(const signed char*)&iq1s_grid_dev[gi];int w0=((int)g[0]&255)|(((int)g[1]&255)<<8)|(((int)g[2]&255)<<16)|(((int)g[3]&255)<<24),w1=((int)g[4]&255)|(((int)g[5]&255)<<8)|(((int)g[6]&255)<<16)|(((int)g[7]&255)<<24);const int *qi=(const int*)(v+l*8);dot+=(float)dp4a_hw(w0,qi[0],0)+(float)dp4a_hw(w1,qi[1],0);for(int j=0;j<8;++j)sumq+=(int)v[l*8+j];}\n"
+"        sum+=dl*sc[b]*(dot+delta*(float)sumq);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)out[(size_t)e*rows+row]=sum*weights[e];\n"
+"}\n"
 "__global__ void glm5next_moe_reduce_iq1s(float *accum, const float *parts, int rows, int experts) {\n"
 "    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=rows)return; float s=0.0f;\n"
 "    for(int e=0;e<experts;++e)s+=parts[(size_t)e*rows+i]; accum[i]+=s;\n"
@@ -8537,6 +8544,7 @@ struct hip_llm_runner {
     hipFunction_t fn_glm5next_moe_gateup_iq1s_selected;
     hipFunction_t fn_glm5next_moe_gateup_iq1s_selected_dp4a;
     hipFunction_t fn_glm5next_moe_down_iq1s_selected;
+    hipFunction_t fn_glm5next_moe_down_iq1s_selected_dp4a;
     hipFunction_t fn_glm5next_moe_reduce_iq1s;
     hipFunction_t fn_iq1_s_down_accum_f32;
     hipFunction_t fn_qwen4_hc_up_mix_q8;
@@ -8794,6 +8802,8 @@ struct hip_llm_runner {
     void *glm5next_mhc_scratch[5]; /* dx, dy, collapsed, post, comb */
     int glm5next_mhc_scratch_ready;
     void *glm5next_moe_scratch[5]; /* dx, gate, up, down, accumulator */
+    void *glm5next_moe_q8;
+    void *glm5next_moe_q8_scale;
     void *glm5next_moe_ptrs[3];    /* grouped gate/up/down weight pointers */
     int glm5next_moe_scratch_ready;
     /* Reused decode scratch for the serialized GLM5Next KDA callback.
@@ -9272,6 +9282,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(glm5next_moe_gateup_iq1s_selected);
     GET_FUNC(glm5next_moe_gateup_iq1s_selected_dp4a);
     GET_FUNC(glm5next_moe_down_iq1s_selected);
+    GET_FUNC(glm5next_moe_down_iq1s_selected_dp4a);
     GET_FUNC(glm5next_moe_reduce_iq1s);
     GET_FUNC(iq1_s_down_accum_f32);
     GET_FUNC(qwen4_hc_up_mix_q8);
@@ -12847,6 +12858,14 @@ static inline void launch_glm5next_moe_down_iq1s(hip_llm_runner *r,
            256, 1, 1, 0, r->stream, args);
 }
 
+static inline void launch_glm5next_moe_down_iq1s_dp4a(hip_llm_runner *r,
+        void *out, void *downs, void *xq, void *xscale, void *weights,
+        int rows, int cols, int experts) {
+    void *args[] = { &out, &downs, &xq, &xscale, &weights, &rows, &cols, &experts };
+    LAUNCH(r->fn_glm5next_moe_down_iq1s_selected_dp4a, (rows + 7) / 8, experts, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
 static inline void launch_glm5next_moe_reduce_iq1s(hip_llm_runner *r,
         void *accum, void *parts, int rows, int experts) {
     void *args[] = { &accum, &parts, &rows, &experts };
@@ -16361,6 +16380,20 @@ static int glm5next_moe_scratch_get(hip_llm_runner *r, const glm5next_config *c)
             return -1;
         }
     }
+    size_t q8_n = slots * (size_t)c->expert_ff_length;
+    if (hipMalloc(&r->glm5next_moe_q8, q8_n) != hipSuccess ||
+        hipMalloc(&r->glm5next_moe_q8_scale,
+                  ((q8_n + 31) / 32) * sizeof(float)) != hipSuccess) {
+        if (r->glm5next_moe_q8) hipFree(r->glm5next_moe_q8);
+        r->glm5next_moe_q8 = NULL;
+        if (r->glm5next_moe_q8_scale) hipFree(r->glm5next_moe_q8_scale);
+        r->glm5next_moe_q8_scale = NULL;
+        for (int i = 0; i < 5; ++i) hipFree(r->glm5next_moe_scratch[i]);
+        memset(r->glm5next_moe_scratch, 0, sizeof(r->glm5next_moe_scratch));
+        for (int i = 0; i < 3; ++i) hipFree(r->glm5next_moe_ptrs[i]);
+        memset(r->glm5next_moe_ptrs, 0, sizeof(r->glm5next_moe_ptrs));
+        return -1;
+    }
     r->glm5next_moe_scratch_ready = 1;
     return 0;
 }
@@ -16566,9 +16599,19 @@ static int glm5next_hip_moe_callback(const gguf_shards *model, int layer,
         if (hipMemcpyAsync(r->glm5next_moe_ptrs[1], weights,
                            (size_t)slots * sizeof(float), hipMemcpyHostToDevice, r->stream) != hipSuccess)
             goto done;
-        launch_glm5next_moe_down_iq1s(r, do_, r->glm5next_moe_ptrs[0], dg,
-                                      r->glm5next_moe_ptrs[1], c->hidden_size,
-                                      c->expert_ff_length, slots);
+        if (grouped_dp4a) {
+            launch_quantize_q8(r, dg, slots * c->expert_ff_length,
+                               r->glm5next_moe_q8, r->glm5next_moe_q8_scale);
+            launch_glm5next_moe_down_iq1s_dp4a(r, do_, r->glm5next_moe_ptrs[0],
+                                                r->glm5next_moe_q8,
+                                                r->glm5next_moe_q8_scale,
+                                                r->glm5next_moe_ptrs[1],
+                                                c->hidden_size, c->expert_ff_length, slots);
+        } else {
+            launch_glm5next_moe_down_iq1s(r, do_, r->glm5next_moe_ptrs[0], dg,
+                                          r->glm5next_moe_ptrs[1], c->hidden_size,
+                                          c->expert_ff_length, slots);
+        }
         launch_glm5next_moe_reduce_iq1s(r, daccum, do_, c->hidden_size, slots);
     } else for (int j = 0; j < slots; ++j) {
         qtensor gw = glm5next_as_qtensor(&gate_v);
@@ -19613,6 +19656,10 @@ void hip_llm_free(hip_llm_runner *r) {
         r->glm5next_moe_scratch[i] = NULL;
     }
     r->glm5next_moe_scratch_ready = 0;
+    if (r->glm5next_moe_q8) hipFree(r->glm5next_moe_q8);
+    if (r->glm5next_moe_q8_scale) hipFree(r->glm5next_moe_q8_scale);
+    r->glm5next_moe_q8 = NULL;
+    r->glm5next_moe_q8_scale = NULL;
     for (int i = 0; i < 3; ++i) {
         if (r->glm5next_moe_ptrs[i]) hipFree(r->glm5next_moe_ptrs[i]);
         r->glm5next_moe_ptrs[i] = NULL;
