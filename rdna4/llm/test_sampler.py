@@ -13,10 +13,8 @@ int main(void) {
     unsigned ra = 1234, rb = 1234;
     int counts[4] = {0};
     for (int i = 0; i < 20000; ++i) {
-        int x = sample_top_k_p(a, 4, 4, 1, 1, 0, 0,
-                               NULL, NULL, NULL, 0, 0, &ra);
-        int y = sample_top_k_p(b, 4, 4, 1, 1, 0, 0,
-                               NULL, NULL, NULL, 0, 0, &rb);
+        int x = sample_top_k_p(a, 4, 4, 1, 1, 0, 1, 0, NULL, &ra);
+        int y = sample_top_k_p(b, 4, 4, 1, 1, 0, 1, 0, NULL, &rb);
         if (x != y) return 1;
         counts[x]++;
     }

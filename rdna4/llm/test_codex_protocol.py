@@ -115,7 +115,7 @@ class ProtocolTest(unittest.TestCase):
         first, second = threading.Event(), threading.Event()
 
         def generate(event):
-            return backend.generate("test", 4, 1, .95, 40, 0, .01,
+            return backend.generate("test", 4, 1, .95, 40, 0, 1, .01,
                                     cancellation=event)
 
         with patch("codex_server.os.kill") as kill, ThreadPoolExecutor(2) as pool:
@@ -147,7 +147,7 @@ class ProtocolTest(unittest.TestCase):
         cancelled.set()
         with patch("codex_server.os.kill") as kill:
             backend.cancel(cancelled)
-            result = backend.generate("test", 4, 1, .95, 40, 0, .01,
+            result = backend.generate("test", 4, 1, .95, 40, 0, 1, .01,
                                       cancellation=cancelled)
             self.assertEqual(result[4], "cancelled")
             self.assertEqual(backend.proc.stdin.getvalue(), "")
@@ -168,11 +168,11 @@ class ProtocolTest(unittest.TestCase):
                                "Clearing modules and retrying hipModuleLoad\n"
                                + reply("first") + reply("second")
                                + "OK 0 10 0 stop \n"))
-        self.assertEqual(backend.generate("one", 4, 1, .95, 40, 0, .01)[0], "first")
-        self.assertEqual(backend.generate("two", 4, 1, .95, 40, 0, .01)[0], "second")
-        self.assertEqual(backend.generate("empty", 4, 1, .95, 40, 0, .01)[0], "")
+        self.assertEqual(backend.generate("one", 4, 1, .95, 40, 0, 1, .01)[0], "first")
+        self.assertEqual(backend.generate("two", 4, 1, .95, 40, 0, 1, .01)[0], "second")
+        self.assertEqual(backend.generate("empty", 4, 1, .95, 40, 0, 1, .01)[0], "")
         with self.assertRaisesRegex(RuntimeError, "closed"):
-            backend.generate("three", 4, 1, .95, 40, 0, .01)
+            backend.generate("three", 4, 1, .95, 40, 0, 1, .01)
 
 
 if __name__ == "__main__":

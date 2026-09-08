@@ -1119,6 +1119,14 @@ static const char *hip_kernel_source =
 "        for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)total+=sum*weights[sel];}\n"
 "    if(lane==0)acc[row]=total;\n"
 "}\n"
+"__global__ void qwen4_renorm_resident_weights(float *weights,const int *experts,\n"
+"        const int *slot_map,int K){\n"
+"    __shared__ float total; int tid=threadIdx.x;\n"
+"    if(tid==0) total=0.0f; __syncthreads();\n"
+"    float w=(tid<K && slot_map[experts[tid]]>=0)?weights[tid]:0.0f;\n"
+"    if(w>0.0f) atomicAdd(&total,w); __syncthreads();\n"
+"    if(tid<K) weights[tid]=total>0.0f?w/total:0.0f;\n"
+"}\n"
 "__global__ void qwen4_gateup_silu_q4k_batch(float *dst,const unsigned char *gate,\n"
 "        const unsigned char *up,const float *x,int M,int rows,int cols){\n"
 "    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=blockIdx.x*(blockDim.x/32)+warp,m=blockIdx.y;\n"
@@ -8917,6 +8925,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_down_accum_q5_1_selected_2w;
     hipFunction_t fn_qwen4_down_accum_q5_1_map;
     hipFunction_t fn_qwen4_down_accum_q8_0_map;
+    hipFunction_t fn_qwen4_renorm_resident_weights;
     hipFunction_t fn_qwen4_down_accum_q8_0_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_batch;
     hipFunction_t fn_qwen4_gateup_silu_q5k_batch;
@@ -9255,6 +9264,13 @@ struct hip_llm_runner {
     void *hc_head_norm_w, *hc_head_down_w, *hc_head_up_w;
     void *hc_head_down_w_bf16, *hc_head_up_w_bf16;
     int hc_head_down_type, hc_head_up_type;
+    /* Qwen4 NextN prefix: independent wide HC state and sidecar fusion/head. */
+    int qwen4_nextn_fusion_loaded;
+    void *qwen4_nextn_eh_w, *qwen4_nextn_enorm_w, *qwen4_nextn_hnorm_w;
+    void *qwen4_nextn_hc_head_norm_w, *qwen4_nextn_hc_head_down_w, *qwen4_nextn_hc_head_up_w;
+    int qwen4_nextn_eh_type, qwen4_nextn_hc_head_down_type, qwen4_nextn_hc_head_up_type;
+    void *d_qwen4_nextn_hc, *d_qwen4_nextn_token, *d_qwen4_nextn_fusion;
+    void *d_qwen4_nextn_key_cache, *d_qwen4_nextn_value_cache;
     void *d_hc;
     void *d_hc_norm;
     void *d_hc_gate;
@@ -9694,6 +9710,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_down_accum_q5_1_selected_2w);
     GET_FUNC(qwen4_down_accum_q5_1_map);
     GET_FUNC(qwen4_down_accum_q8_0_map);
+    GET_FUNC(qwen4_renorm_resident_weights);
     GET_FUNC(qwen4_down_accum_q8_0_selected);
     GET_FUNC(qwen4_gateup_silu_q4k_batch);
     GET_FUNC(qwen4_gateup_silu_q5k_batch);
@@ -10370,6 +10387,204 @@ static qtensor hllm_load_tensor(const gguf_context *gguf, const char *name, int 
         n_rows *= gguf->tensors[idx].dims[d];
     t.n_rows = (int)n_rows;
     return t;
+}
+
+int hip_llm_qwen4_nextn_inspect(const gguf_shards *sidecar,
+                                 hip_llm_qwen4_nextn_info *info,
+                                 char *error, size_t error_cap) {
+    const gguf_context *gguf;
+    int arch_idx, block_count, layer, n_embd, n_heads, n_kv_heads, head_dim;
+    int n_experts, n_experts_used, expert_ff, hc_count, hc_low_rank;
+    static const char *const suffixes[] = {
+        "attn_k", "attn_k_norm", "attn_output", "attn_q", "attn_q_norm", "attn_v",
+        "ffn_down_exps", "ffn_down_shexp", "ffn_gate_exps", "ffn_gate_inp",
+        "ffn_gate_inp_shexp", "ffn_gate_shexp", "ffn_up_exps", "ffn_up_shexp",
+        "hc_attn_down", "hc_attn_inject", "hc_attn_norm", "hc_attn_up",
+        "hc_ffn_down", "hc_ffn_inject", "hc_ffn_norm", "hc_ffn_up",
+        "indexer.k_norm", "indexer.k_proj", "indexer.q_norm", "indexer.q_proj",
+        "nextn.eh_proj", "nextn.enorm", "nextn.hc_head_down", "nextn.hc_head_norm",
+        "nextn.hc_head_up", "nextn.hnorm",
+    };
+    if (error && error_cap) error[0] = '\0';
+    if (!sidecar || !sidecar->metadata || !info) goto invalid;
+    gguf = sidecar->metadata;
+    arch_idx = gguf_find_key(gguf, "general.architecture");
+    if (arch_idx < 0 || gguf->kv[arch_idx].type != GGUF_TYPE_STRING ||
+        strcmp(gguf->kv[arch_idx].value.str.str, "qwen4exp") != 0) {
+        if (error && error_cap) snprintf(error, error_cap, "sidecar architecture is not qwen4exp");
+        return -1;
+    }
+    if (hllm_get_int(gguf, "qwen4exp.nextn_predict_layers", 0) != 1 ||
+        !hllm_get_int(gguf, "qwen4exp.nextn_shared_target_tensors", 0)) {
+        if (error && error_cap) snprintf(error, error_cap,
+                "sidecar must have one NextN layer with shared target tensors");
+        return -1;
+    }
+    block_count = hllm_get_int(gguf, "qwen4exp.block_count", 0);
+    n_embd = hllm_get_int(gguf, "qwen4exp.embedding_length", 0);
+    n_heads = hllm_get_int(gguf, "qwen4exp.attention.head_count", 0);
+    n_kv_heads = hllm_get_int(gguf, "qwen4exp.attention.head_count_kv", 0);
+    head_dim = hllm_get_int(gguf, "qwen4exp.attention.key_length", 0);
+    n_experts = hllm_get_int(gguf, "qwen4exp.expert_count", 0);
+    n_experts_used = hllm_get_int(gguf, "qwen4exp.expert_used_count", 0);
+    expert_ff = hllm_get_int(gguf, "qwen4exp.expert_feed_forward_length", 0);
+    hc_count = hllm_get_int(gguf, "qwen4exp.hyper_connection.count", 0);
+    hc_low_rank = hllm_get_int(gguf, "qwen4exp.hyper_connection.low_rank", 0);
+    if (block_count < 2 || n_embd <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_dim <= 0 || n_experts <= 0 || n_experts_used <= 0 ||
+        n_experts_used > n_experts || expert_ff <= 0 || hc_count <= 0 || hc_low_rank <= 0) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid Qwen4exp NextN dimensions");
+        return -1;
+    }
+    layer = block_count - 1;
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); ++i) {
+        char name[96];
+        const gguf_context *owner = NULL;
+        int tensor_idx = -1;
+        snprintf(name, sizeof(name), "blk.%d.%s.weight", layer, suffixes[i]);
+        if (gguf_shards_find_tensor(sidecar, name, &owner, &tensor_idx) != 0 ||
+            !owner || tensor_idx < 0) {
+            if (error && error_cap) snprintf(error, error_cap, "missing NextN tensor %s", name);
+            return -1;
+        }
+    }
+#define NN_EXPECT_2D(suffix, d0, d1) do { \
+        const gguf_context *owner = NULL; int tensor_idx = -1; char name[96]; \
+        snprintf(name, sizeof(name), "blk.%d." suffix ".weight", layer); \
+        if (gguf_shards_find_tensor(sidecar, name, &owner, &tensor_idx) != 0 || \
+            !owner || owner->tensors[tensor_idx].n_dims != 2 || \
+            owner->tensors[tensor_idx].dims[0] != (uint64_t)(d0) || \
+            owner->tensors[tensor_idx].dims[1] != (uint64_t)(d1)) { \
+            if (error && error_cap) snprintf(error, error_cap, "invalid NextN tensor shape %s", name); \
+            return -1; \
+        } \
+    } while (0)
+#define NN_EXPECT_3D(suffix, d0, d1, d2) do { \
+        const gguf_context *owner = NULL; int tensor_idx = -1; char name[96]; \
+        snprintf(name, sizeof(name), "blk.%d." suffix ".weight", layer); \
+        if (gguf_shards_find_tensor(sidecar, name, &owner, &tensor_idx) != 0 || \
+            !owner || owner->tensors[tensor_idx].n_dims != 3 || \
+            owner->tensors[tensor_idx].dims[0] != (uint64_t)(d0) || \
+            owner->tensors[tensor_idx].dims[1] != (uint64_t)(d1) || \
+            owner->tensors[tensor_idx].dims[2] != (uint64_t)(d2)) { \
+            if (error && error_cap) snprintf(error, error_cap, "invalid NextN tensor shape %s", name); \
+            return -1; \
+        } \
+    } while (0)
+#define NN_EXPECT_1D(suffix, d0) do { \
+        const gguf_context *owner = NULL; int tensor_idx = -1; char name[96]; \
+        snprintf(name, sizeof(name), "blk.%d." suffix ".weight", layer); \
+        if (gguf_shards_find_tensor(sidecar, name, &owner, &tensor_idx) != 0 || \
+            !owner || owner->tensors[tensor_idx].n_dims != 1 || \
+            owner->tensors[tensor_idx].dims[0] != (uint64_t)(d0)) { \
+            if (error && error_cap) snprintf(error, error_cap, "invalid NextN tensor shape %s", name); \
+            return -1; \
+        } \
+    } while (0)
+    NN_EXPECT_2D("attn_q", n_embd, 2 * n_heads * head_dim);
+    NN_EXPECT_2D("attn_k", n_embd, n_kv_heads * head_dim);
+    NN_EXPECT_2D("attn_v", n_embd, n_kv_heads * head_dim);
+    NN_EXPECT_2D("attn_output", n_heads * head_dim, n_embd);
+    NN_EXPECT_3D("ffn_gate_exps", n_embd, expert_ff, n_experts);
+    NN_EXPECT_3D("ffn_up_exps", n_embd, expert_ff, n_experts);
+    NN_EXPECT_3D("ffn_down_exps", expert_ff, n_embd, n_experts);
+    NN_EXPECT_2D("nextn.eh_proj", 2 * n_embd, n_embd);
+    NN_EXPECT_1D("nextn.enorm", n_embd);
+    /* Qwen4 NextN keeps the complete HC residual, unlike Qwen3.5's
+     * n_embd-wide target hidden state. */
+    NN_EXPECT_1D("nextn.hnorm", hc_count * n_embd);
+    NN_EXPECT_1D("nextn.hc_head_norm", hc_count * n_embd);
+    NN_EXPECT_2D("nextn.hc_head_down", hc_count * n_embd, hc_low_rank);
+    NN_EXPECT_2D("nextn.hc_head_up", hc_low_rank, hc_count * n_embd);
+#undef NN_EXPECT_1D
+#undef NN_EXPECT_2D
+#undef NN_EXPECT_3D
+    *info = (hip_llm_qwen4_nextn_info){
+        layer, n_embd, n_heads, n_kv_heads, head_dim, n_experts,
+        n_experts_used, expert_ff, hc_count, hc_low_rank
+    };
+    return 0;
+invalid:
+    if (error && error_cap) snprintf(error, error_cap, "invalid Qwen4exp NextN inspect arguments");
+    return -1;
+}
+
+int hip_llm_load_qwen4_nextn_fusion(hip_llm_runner *r,
+                                    const gguf_shards *sidecar,
+                                    char *error, size_t error_cap) {
+    hip_llm_qwen4_nextn_info info;
+    const gguf_context *gguf;
+    const gguf_shards *saved;
+    qtensor t;
+    char name[96];
+    if (error && error_cap) error[0] = '\0';
+    if (!r || !r->weights_loaded || !r->is_qwen4exp) goto invalid;
+    if (hip_llm_qwen4_nextn_inspect(sidecar, &info, error, error_cap) != 0) return -1;
+    if (info.layer_index != r->n_layers || info.n_embd != r->n_embd ||
+        info.n_heads != r->n_heads || info.n_kv_heads != r->n_kv_heads ||
+        info.head_dim != r->head_dim || info.n_experts != r->n_experts ||
+        info.hc_count != r->hc_count || info.hc_low_rank != r->hc_low_rank) {
+        if (error && error_cap) snprintf(error, error_cap, "NextN sidecar does not match loaded trunk");
+        return -1;
+    }
+    if (r->qwen4_nextn_fusion_loaded) return 0;
+    gguf = sidecar->metadata;
+    saved = hllm_active_shards;
+    hllm_active_shards = sidecar;
+#define NN_LOAD_MAT(dst, type_dst, suffix) do { \
+        snprintf(name, sizeof(name), "blk.%d." suffix ".weight", info.layer_index); \
+        t = hllm_load_tensor(gguf, name, 1); \
+        if (!t.data || upload_weight_matrix(&(dst), &t, &(type_dst)) != 0) goto fail; \
+    } while (0)
+#define NN_LOAD_NORM(dst, suffix, count) do { \
+        snprintf(name, sizeof(name), "blk.%d." suffix ".weight", info.layer_index); \
+        t = hllm_load_tensor(gguf, name, 1); \
+        if (!t.data || upload_norm_f32(&(dst), &t, (count)) != 0) goto fail; \
+    } while (0)
+    NN_LOAD_MAT(r->qwen4_nextn_eh_w, r->qwen4_nextn_eh_type, "nextn.eh_proj");
+    NN_LOAD_NORM(r->qwen4_nextn_enorm_w, "nextn.enorm", r->n_embd);
+    NN_LOAD_NORM(r->qwen4_nextn_hnorm_w, "nextn.hnorm", r->hc_count * r->n_embd);
+    NN_LOAD_NORM(r->qwen4_nextn_hc_head_norm_w, "nextn.hc_head_norm", r->hc_count * r->n_embd);
+    NN_LOAD_MAT(r->qwen4_nextn_hc_head_down_w, r->qwen4_nextn_hc_head_down_type, "nextn.hc_head_down");
+    NN_LOAD_MAT(r->qwen4_nextn_hc_head_up_w, r->qwen4_nextn_hc_head_up_type, "nextn.hc_head_up");
+#undef NN_LOAD_MAT
+#undef NN_LOAD_NORM
+    hllm_active_shards = saved;
+    if (hipMalloc(&r->d_qwen4_nextn_hc, (size_t)r->hc_count*r->n_embd*sizeof(float)) != hipSuccess ||
+        hipMalloc(&r->d_qwen4_nextn_token, (size_t)r->n_embd*sizeof(float)) != hipSuccess ||
+        hipMalloc(&r->d_qwen4_nextn_fusion, (size_t)2*r->hc_count*r->n_embd*sizeof(float)) != hipSuccess) goto fail;
+    /* The MTP block is always dense attention. Keep its F16 KV state separate
+     * from the trunk: speculative rejection must never modify target KV. */
+    {
+        size_t kv_bytes = (size_t)r->max_seq_len * r->n_kv_heads * r->head_dim * sizeof(uint16_t);
+        if (hipMalloc(&r->d_qwen4_nextn_key_cache, kv_bytes) != hipSuccess ||
+            hipMalloc(&r->d_qwen4_nextn_value_cache, kv_bytes) != hipSuccess) goto fail;
+        hipMemset(r->d_qwen4_nextn_key_cache, 0, kv_bytes);
+        hipMemset(r->d_qwen4_nextn_value_cache, 0, kv_bytes);
+    }
+    r->qwen4_nextn_fusion_loaded = 1;
+    return 0;
+fail:
+    hllm_active_shards = saved;
+    /* This entry point is also used as a capability probe.  Make a failed
+     * probe transactional so callers can either retry with a smaller context
+     * or continue using the trunk without retaining a partial sidecar. */
+    if (r->qwen4_nextn_eh_w) { hipFree(r->qwen4_nextn_eh_w); r->qwen4_nextn_eh_w = NULL; }
+    if (r->qwen4_nextn_enorm_w) { hipFree(r->qwen4_nextn_enorm_w); r->qwen4_nextn_enorm_w = NULL; }
+    if (r->qwen4_nextn_hnorm_w) { hipFree(r->qwen4_nextn_hnorm_w); r->qwen4_nextn_hnorm_w = NULL; }
+    if (r->qwen4_nextn_hc_head_norm_w) { hipFree(r->qwen4_nextn_hc_head_norm_w); r->qwen4_nextn_hc_head_norm_w = NULL; }
+    if (r->qwen4_nextn_hc_head_down_w) { hipFree(r->qwen4_nextn_hc_head_down_w); r->qwen4_nextn_hc_head_down_w = NULL; }
+    if (r->qwen4_nextn_hc_head_up_w) { hipFree(r->qwen4_nextn_hc_head_up_w); r->qwen4_nextn_hc_head_up_w = NULL; }
+    if (r->d_qwen4_nextn_hc) { hipFree(r->d_qwen4_nextn_hc); r->d_qwen4_nextn_hc = NULL; }
+    if (r->d_qwen4_nextn_token) { hipFree(r->d_qwen4_nextn_token); r->d_qwen4_nextn_token = NULL; }
+    if (r->d_qwen4_nextn_fusion) { hipFree(r->d_qwen4_nextn_fusion); r->d_qwen4_nextn_fusion = NULL; }
+    if (r->d_qwen4_nextn_key_cache) { hipFree(r->d_qwen4_nextn_key_cache); r->d_qwen4_nextn_key_cache = NULL; }
+    if (r->d_qwen4_nextn_value_cache) { hipFree(r->d_qwen4_nextn_value_cache); r->d_qwen4_nextn_value_cache = NULL; }
+    if (error && error_cap && !error[0]) snprintf(error, error_cap, "failed to load NextN fusion prefix");
+    return -1;
+invalid:
+    if (error && error_cap) snprintf(error, error_cap, "NextN fusion requires a loaded qwen4exp trunk");
+    return -1;
 }
 
 /* ======================================================================== */
@@ -13949,6 +14164,13 @@ static inline void launch_qwen4_experts_q4k_map(hip_llm_runner *r,
            cl->moe_down_exps_type == GGML_TYPE_Q8_0 ? da_q8 : da_q5);
 }
 
+static inline void launch_qwen4_renorm_resident_weights(hip_llm_runner *r,
+        int K, hip_layer *cl) {
+    void *args[] = { &r->d_moe_w, &r->d_moe_idx, &cl->d_moe_cache_map, &K };
+    LAUNCH(r->fn_qwen4_renorm_resident_weights, 1, 1, 1, 256, 1, 1,
+           0, r->stream, args);
+}
+
 static inline void launch_qwen4_expert_q4k_batch(hip_llm_runner *r,
         float *out, float *act, void *gate, void *up, void *down, float *x,
         int M, int expert_ff, int n_embd, int down_type) {
@@ -15516,11 +15738,22 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
     const char *cpu_decode_env = getenv("LLM_MOE_CPU_DECODE_MISSES");
     int cpu_decode_misses = r->decode_mode && cpu_decode_env && atoi(cpu_decode_env) != 0 &&
         r->moe_cpu_prefill && r->h_moe_xq_decode && r->h_moe_gate_q_decode;
+    const char *approx_env = getenv("LLM_QWEN4_APPROX_DECODE");
+    int approx_decode = r->decode_mode && approx_env && atoi(approx_env) != 0;
+    /* The approximate path deliberately keeps the prefilled resident set
+     * stable.  Delayed host refills add copy-stream work and can invalidate
+     * the hit-only assumption; exact decode continues to use them. */
+    if (approx_decode) delayed_cache = 0;
+    int approx_ready = 0;
+    if (approx_decode && cl->moe_cache_ids)
+        for (int s = 0; s < cl->moe_cache_slots; ++s)
+            if (cl->moe_cache_ids[s] >= 0) { approx_ready = 1; break; }
     const char *min_weight_env = getenv("LLM_MOE_CPU_MIN_WEIGHT");
     float cpu_min_weight = min_weight_env ? strtof(min_weight_env, NULL) : 0.0f;
     const char *hits_only_env = getenv("LLM_QWEN4_DEVICE_HITS_ONLY");
-    int device_hits_only_config = cpu_decode_misses && cpu_min_weight >= 1.0f &&
-        ((hits_only_env && atoi(hits_only_env) != 0) || delayed_cache);
+    int device_hits_only_config = (approx_decode && approx_ready) ||
+        (cpu_decode_misses && cpu_min_weight >= 1.0f &&
+         ((hits_only_env && atoi(hits_only_env) != 0) || delayed_cache));
     const char *refresh_env = getenv("LLM_QWEN4_DEVICE_REFRESH_INTERVAL");
     int refresh_interval = refresh_env ? atoi(refresh_env) : 1;
     const char *refresh_layers_env = getenv("LLM_QWEN4_DEVICE_REFRESH_LAYERS");
@@ -15530,6 +15763,22 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
     int device_hits_only = device_hits_only_config && (delayed_cache ||
         (layer_idx >= refresh_layers || refresh_interval <= 1 ||
          (decode_token % (uint64_t)refresh_interval) != 0));
+    /* Approximate mode skips CPU work only on resident-hit tokens.  A refresh
+     * token must retain its normal CPU miss path; otherwise a cadence merely
+     * repeats the same lossy zero-expert computation. */
+    if (approx_decode && device_hits_only) {
+        /* A resident-only step normally drops cold experts completely.  That
+         * is fast, but some coding prompts depend on the strongest cold
+         * route even when the rest of the top-k can be approximated from the
+         * cache.  Permit an explicit threshold for those steps: e.g. 0.20
+         * evaluates only high-probability cold routes on the CPU, while the
+         * GPU retains the resident routes.  Keep the historic all-hit-only
+         * behavior when the variable is absent. */
+        const char *approx_min_env = getenv("LLM_QWEN4_APPROX_CPU_MIN_WEIGHT");
+        cpu_min_weight = approx_min_env ? strtof(approx_min_env, NULL) : 1.0f;
+        if (cpu_min_weight < 0.0f) cpu_min_weight = 0.0f;
+        if (cpu_min_weight > 1.0f) cpu_min_weight = 1.0f;
+    }
     int device_cache_path = 0;
     const char *device_cache_env = getenv("LLM_QWEN4_DEVICE_CACHE");
     const char *mapped_env = getenv("LLM_QWEN4_MAPPED_MISSES");
@@ -15561,7 +15810,14 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
         LAUNCH(r->fn_moe_router_fused, ne + 1, 1, 1, 256, 1, 1,
                0, r->stream, ra);
         if (device_hits_only && use_device_cache) {
-            if (delayed_cache) {
+            /* Approximate decode only needs a delayed route snapshot when the
+             * delayed cache can actually be refreshed.  Copying the route on
+             * every layer/token defeats the resident-hit fast path; exact
+             * decode keeps the old per-token behavior. */
+            int delayed_snapshot = delayed_cache &&
+                (!approx_decode || delayed_interval <= 1 ||
+                 (decode_token % (uint64_t)delayed_interval) == 0);
+            if (delayed_snapshot) {
                 int *di = r->h_moe_delayed_idx +
                           (size_t)layer_idx * n_experts_used;
                 float *dw = r->h_moe_delayed_w +
@@ -15576,6 +15832,8 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
             }
             hipMemsetAsync(r->d_moe_accum, 0,
                            (size_t)n_embd * sizeof(float), r->stream);
+            if (approx_decode)
+                launch_qwen4_renorm_resident_weights(r, n_experts_used, cl);
             if (cl->moe_gate_exps_type == GGML_TYPE_Q5_K)
                 launch_qwen4_experts_q5k_map(r, cl, n_experts_used,
                                              expert_ff, n_embd, -1);
@@ -18624,7 +18882,11 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             up_w = (char *)cl->moe_up_exps_w + (size_t)e * cl->moe_exp_stride_gu;
             down_w = (char *)cl->moe_down_exps_w + (size_t)e * cl->moe_exp_stride_d;
         }
-        if (grouped_qwen && !grouped_expert[e]) {
+        /* Cold deferral assumes round-robin visits each slot once.  LFU may
+         * recycle an unprotected slot repeatedly, evicting a deferred expert
+         * before its grouped launch.  Compute LFU misses immediately; resident
+         * experts still use the grouped launch above. */
+        if (grouped_qwen && !use_lfu && !grouped_expert[e]) {
             int defer = grouped_cold_seen++ >= grouped_cold_start;
             if (defer) {
                 grouped_expert[e] = 1;
@@ -18794,7 +19056,13 @@ static void forward_one_layer(hip_llm_runner *r, int l) {
     float eps      = r->rms_norm_eps;
     hip_layer *cl  = &r->layers[l];
     const char *pre_graph_env = getenv("LLM_QWEN_PRE_GRAPHS");
+    if (!pre_graph_env)
+        pre_graph_env = getenv("LLM_QWEN4_PRE_GRAPHS");
+    const char *approx_decode_env = getenv("LLM_QWEN4_APPROX_DECODE");
+    int approx_decode = r->decode_mode && approx_decode_env &&
+                        atoi(approx_decode_env) != 0;
     int use_pre_graph = r->is_qwen4exp && l != 1 && !r->debug_layers &&
+        approx_decode &&
         pre_graph_env && atoi(pre_graph_env) != 0 &&
         hipStreamBeginCapture && hipStreamEndCapture &&
         hipGraphInstantiate && hipGraphLaunch &&
@@ -20374,7 +20642,10 @@ static int prefill_chunk_size(const hip_llm_runner *r, int n_tokens) {
     int chunk;
     if (r->is_gemma4)            chunk = r->gemma_prefill_chunk;
     else if (r->moe_prefill_batched) {
-        if (r->is_qwen4exp && !r->gemm_own) chunk = r->batch_max < 512 ? r->batch_max : 512;
+        /* Qwen4's projections support 1024 rows. Larger chunks amortize cold
+         * expert uploads; the batch_max clamp still honors a smaller VRAM
+         * budget and explicit chunk overrides below remain available. */
+        if (r->is_qwen4exp && !r->gemm_own) chunk = r->batch_max < 1024 ? r->batch_max : 1024;
         else chunk = r->gemm_own ? r->batch_max : 256;
     }
     else                         chunk = n_tokens;
@@ -20704,6 +20975,18 @@ void hip_llm_offload(hip_llm_runner *r) {
     if (r->d_xb_q)    { hipFree(r->d_xb_q);    r->d_xb_q = NULL; }
     if (r->d_xb_scale){ hipFree(r->d_xb_scale); r->d_xb_scale = NULL; }
     if (r->d_logits)  { hipFree(r->d_logits);   r->d_logits = NULL; }
+    if (r->qwen4_nextn_eh_w) { hipFree(r->qwen4_nextn_eh_w); r->qwen4_nextn_eh_w = NULL; }
+    if (r->qwen4_nextn_enorm_w) { hipFree(r->qwen4_nextn_enorm_w); r->qwen4_nextn_enorm_w = NULL; }
+    if (r->qwen4_nextn_hnorm_w) { hipFree(r->qwen4_nextn_hnorm_w); r->qwen4_nextn_hnorm_w = NULL; }
+    if (r->qwen4_nextn_hc_head_norm_w) { hipFree(r->qwen4_nextn_hc_head_norm_w); r->qwen4_nextn_hc_head_norm_w = NULL; }
+    if (r->qwen4_nextn_hc_head_down_w) { hipFree(r->qwen4_nextn_hc_head_down_w); r->qwen4_nextn_hc_head_down_w = NULL; }
+    if (r->qwen4_nextn_hc_head_up_w) { hipFree(r->qwen4_nextn_hc_head_up_w); r->qwen4_nextn_hc_head_up_w = NULL; }
+    if (r->d_qwen4_nextn_hc) { hipFree(r->d_qwen4_nextn_hc); r->d_qwen4_nextn_hc = NULL; }
+    if (r->d_qwen4_nextn_token) { hipFree(r->d_qwen4_nextn_token); r->d_qwen4_nextn_token = NULL; }
+    if (r->d_qwen4_nextn_fusion) { hipFree(r->d_qwen4_nextn_fusion); r->d_qwen4_nextn_fusion = NULL; }
+    if (r->d_qwen4_nextn_key_cache) { hipFree(r->d_qwen4_nextn_key_cache); r->d_qwen4_nextn_key_cache = NULL; }
+    if (r->d_qwen4_nextn_value_cache) { hipFree(r->d_qwen4_nextn_value_cache); r->d_qwen4_nextn_value_cache = NULL; }
+    r->qwen4_nextn_fusion_loaded = 0;
     /* Phase 2 batched buffers */
     if (r->d_x_batch)             { hipFree(r->d_x_batch);             r->d_x_batch = NULL; }
     if (r->d_xnorm_batch)         { hipFree(r->d_xnorm_batch);         r->d_xnorm_batch = NULL; }
@@ -20999,6 +21282,17 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_hc_gate)      hipFree(r->d_hc_gate);
     if (r->d_hc_low)       hipFree(r->d_hc_low);
     if (r->d_hc_inject)    hipFree(r->d_hc_inject);
+    if (r->qwen4_nextn_eh_w) hipFree(r->qwen4_nextn_eh_w);
+    if (r->qwen4_nextn_enorm_w) hipFree(r->qwen4_nextn_enorm_w);
+    if (r->qwen4_nextn_hnorm_w) hipFree(r->qwen4_nextn_hnorm_w);
+    if (r->qwen4_nextn_hc_head_norm_w) hipFree(r->qwen4_nextn_hc_head_norm_w);
+    if (r->qwen4_nextn_hc_head_down_w) hipFree(r->qwen4_nextn_hc_head_down_w);
+    if (r->qwen4_nextn_hc_head_up_w) hipFree(r->qwen4_nextn_hc_head_up_w);
+    if (r->d_qwen4_nextn_hc) hipFree(r->d_qwen4_nextn_hc);
+    if (r->d_qwen4_nextn_token) hipFree(r->d_qwen4_nextn_token);
+    if (r->d_qwen4_nextn_fusion) hipFree(r->d_qwen4_nextn_fusion);
+    if (r->d_qwen4_nextn_key_cache) hipFree(r->d_qwen4_nextn_key_cache);
+    if (r->d_qwen4_nextn_value_cache) hipFree(r->d_qwen4_nextn_value_cache);
     if (r->d_ple_conv_state) hipFree(r->d_ple_conv_state);
     if (r->d_ple_emb)      hipFree(r->d_ple_emb);
     if (r->d_ple_value)    hipFree(r->d_ple_value);

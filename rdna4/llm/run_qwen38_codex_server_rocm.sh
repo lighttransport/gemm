@@ -40,14 +40,15 @@ if ! compgen -G '/dev/dri/renderD*' > /dev/null; then
     exit 1
 fi
 
-# LFU replacement currently races grouped Qwen prefill on gfx1201.
-# Grouped Qwen expert execution is enabled for Codex: it is needed to sustain
-# 100+ tok/s prefill. Disable the copy pipeline on gfx1201 because its mutable
-# cache-map reuse can fault under the grouped path.
+# Keep the measured 65K-context profile: 512-row grouped prefill sustains
+# 100+ tok/s within this VRAM budget. Larger batches exhausted VRAM, and
+# ungrouped pipelined prefill reduced subsequent decode throughput. See
+# QWEN38_PREFILL_TUNING.md for the paired prefill/decode measurements.
 # The 640-wide Q4_K experts run faster with one warp per output row.
 # The matching Q5_1 down projection benefits from two warps per output row.
-# Keep CPU_MIN_WEIGHT at zero for exact routing: positive thresholds omit
-# selected experts on cache misses; 1 enables approximate cache-hit-only decode.
+# On fast approximate steps retain cold routes with >=0.20 router weight on
+# the CPU, then run an exact route refresh every four tokens.  This avoids the
+# malformed coding completions observed with all-miss hit-only execution.
 # The runner initializes ggml's CPU lookup tables before using these kernels.
 exec env \
     OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}" \
@@ -70,6 +71,11 @@ exec env \
     LLM_MOE_CPU_LIB="${cpu_lib}" \
     LLM_MOE_CPU_PREFILL_MAX_COUNT="${LLM_MOE_CPU_PREFILL_MAX_COUNT:-2}" \
     LLM_MOE_CPU_PREFILL_MAX_JOBS="${LLM_MOE_CPU_PREFILL_MAX_JOBS:-160}" \
+    LLM_QWEN4_APPROX_DECODE="${LLM_QWEN4_APPROX_DECODE:-1}" \
+    LLM_QWEN4_DEVICE_HITS_ONLY="${LLM_QWEN4_DEVICE_HITS_ONLY:-1}" \
+    LLM_QWEN4_DEVICE_REFRESH_INTERVAL="${LLM_QWEN4_DEVICE_REFRESH_INTERVAL:-4}" \
+    LLM_QWEN4_APPROX_CPU_MIN_WEIGHT="${LLM_QWEN4_APPROX_CPU_MIN_WEIGHT:-0.20}" \
+    LLM_QWEN4_PRE_GRAPHS="${LLM_QWEN4_PRE_GRAPHS:-1}" \
     LLM_BMAX="${LLM_BMAX:-512}" \
     LLM_MOE_GROUPED_PREFILL="${LLM_MOE_GROUPED_PREFILL:-1}" \
     python3 "${runner_dir}/codex_server.py" "${model}" \

@@ -252,12 +252,12 @@ class Backend:
                 except ProcessLookupError:
                     pass
 
-    def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, min_p,
+    def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, repetition, min_p,
                  prefix="", cancellation=None, on_token=None):
         cancellation = cancellation if cancellation is not None else threading.Event()
         prefix_payload = base64.b64encode(prefix.encode("utf-8")).decode("ascii") if prefix else "-"
         payload = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
-        line = f"REQ {max_tokens} {temperature} {top_p} {top_k} {presence} {min_p} {prefix_payload} {payload}\n"
+        line = f"REQ {max_tokens} {temperature} {top_p} {top_k} {presence} {repetition} {min_p} {prefix_payload} {payload}\n"
         with self.lock:
             if self.proc.poll() is not None:
                 raise RuntimeError("runner exited")
@@ -454,23 +454,28 @@ class Handler(BaseHTTPRequestHandler):
             prompt = chat_prompt(messages)
             prefix = chat_prefix(messages)
             # Explicit API sampling controls override the requested coding
-            # profile (T=1, top_p=.95, top_k=40, min_p=.01, no penalties).
+            # profile.  Keep the server default aligned with the local
+            # non-thinking coding evaluation profile; it is deliberately
+            # narrower than the general chat defaults so approximate routed
+            # MoE decode remains both useful and coherent.
             # The child receives these values through the request protocol;
             # its standalone benchmark sampling defaults do not apply here.
             default_temp, default_top_p, default_top_k, default_presence = (
-                (1.0, 0.95, 40, 0.0) if self.coding else (0.2, 0.95, 20, 0.0))
+                (0.7, 0.80, 20, 1.5) if self.coding else (0.2, 0.95, 20, 0.0))
             try:
                 temp = float(req.get("temperature", default_temp))
                 top_p = float(req.get("top_p", default_top_p))
                 top_k = int(req.get("top_k", default_top_k))
                 presence = float(req.get("presence_penalty", default_presence))
-                min_p = float(req.get("min_p", 0.01 if self.coding else 0.0))
+                repetition = float(req.get("repetition_penalty", 1.0))
+                min_p = float(req.get("min_p", 0.0))
             except (TypeError, ValueError):
                 self.send_json(400, {"error": {"message": "sampling parameters must be numeric", "type": "invalid_request_error"}})
                 return
             if (not math.isfinite(temp) or temp < 0 or
                     not math.isfinite(top_p) or not 0 <= top_p <= 1 or
                     top_k < 1 or not math.isfinite(presence) or
+                    not math.isfinite(repetition) or repetition <= 0 or
                     not math.isfinite(min_p) or not 0 <= min_p <= 1):
                 self.send_json(400, {"error": {"message": "invalid sampling parameters", "type": "invalid_request_error"}})
                 return
@@ -532,7 +537,7 @@ class Handler(BaseHTTPRequestHandler):
             watcher.start()
             try:
                 text, cached, ptok, ctok, finish = self.backend.generate(
-                    prompt, limit, temp, top_p, top_k, presence, min_p, prefix, cancelled,
+                    prompt, limit, temp, top_p, top_k, presence, repetition, min_p, prefix, cancelled,
                     stream_token)
             finally:
                 stop_watcher.set()

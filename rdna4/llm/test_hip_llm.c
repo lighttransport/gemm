@@ -64,9 +64,9 @@ static float rel_l2_error(const float *a, const float *b, int n) {
 /* Qwen3.8-Next non-thinking/Instruct defaults from the model card.  Keeping
  * only top-k candidates makes sampling O(vocab*k), with no full-vocab sort. */
 static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
-                          float temperature, float presence_penalty, float min_p,
-                          const unsigned char *seen, const unsigned short *counts,
-                          const int32_t *history, int history_n, int history_start,
+                          float temperature, float presence_penalty,
+                          float repetition_penalty, float min_p,
+                          const unsigned char *seen,
                           unsigned *rng) {
     if (top_k < 1) top_k = 1;
     if (top_k > 64) top_k = 64;
@@ -74,24 +74,12 @@ static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
     float vals[64];
     for (int j = 0; j < top_k; ++j) { ids[j] = -1; vals[j] = -INFINITY; }
     for (int i = 0; i < n; ++i) {
-        /* Prevent a repeated 4-gram within generated output.  Do not include
-         * prompt tokens: system text must not constrain normal completions. */
-        if (history && history_n - history_start >= 3) {
-            int h = history_n - 3;
-            int repeated = 0;
-            for (int j = history_start; j < h; ++j) {
-                if (history[j] == history[h] && history[j + 1] == history[h + 1] &&
-                    history[j + 2] == history[h + 2] && history[j + 3] == i) {
-                    repeated = 1;
-                    break;
-                }
-            }
-            if (repeated) continue;
-        }
-        /* Presence applies to prompt/history tokens; frequency is completion
-         * only and prevents a winning phrase from becoming an infinite loop. */
-        float freq = (counts && counts[i]) ? 0.35f * (float)counts[i] : 0.0f;
-        float v = logits[i] - ((seen && seen[i]) ? presence_penalty : 0.0f) - freq;
+        /* Match the API sampling contract exactly. A neutral repetition
+         * penalty must not turn into a hidden frequency penalty or n-gram
+         * ban, both of which distort ordinary code identifiers. */
+        float v = logits[i] - ((seen && seen[i]) ? presence_penalty : 0.0f);
+        if (seen && seen[i] && repetition_penalty != 1.0f)
+            v = v < 0.0f ? v * repetition_penalty : v / repetition_penalty;
         if (!isfinite(v)) continue;
         if (v <= vals[top_k - 1]) continue;
         int j = top_k - 1;
@@ -229,7 +217,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
     while (fgets(line, sizeof(line), stdin)) {
         g_stdio_cancel = 0;
         int max_tokens = 16, top_k = 20;
-        float temperature = 0.2f, top_p = 0.95f, presence = 0.0f, min_p = 0.0f;
+        float temperature = 0.2f, top_p = 0.95f, presence = 0.0f;
+        float repetition = 1.0f, min_p = 0.0f;
         char *b64 = NULL, *prefix_b64 = NULL;
         static char b64buf[sizeof(line)];
         static char prefix_b64buf[sizeof(line)];
@@ -238,26 +227,28 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                    &top_p, &top_k, &presence) != 5) {
             puts("ERR invalid request"); fflush(stdout); continue;
         }
-        int fields = sscanf(line + 4, "%d %f %f %d %f %f %4194303s %4194303s", &max_tokens,
+        int fields = sscanf(line + 4, "%d %f %f %d %f %f %f %4194303s %4194303s", &max_tokens,
                             &temperature, &top_p, &top_k, &presence,
-                            &min_p, prefix_b64buf, b64buf);
-        if (fields != 8) {
+                            &repetition, &min_p, prefix_b64buf, b64buf);
+        if (fields != 9) {
             min_p = 0.0f;
+            repetition = 1.0f;
             fields = sscanf(line + 4, "%d %f %f %d %f %4194303s %4194303s", &max_tokens,
                             &temperature, &top_p, &top_k, &presence,
                             prefix_b64buf, b64buf);
         }
-        if (fields != 8 && fields != 7) {
+        if (fields != 9 && fields != 7) {
             fields = sscanf(line + 4, "%d %f %f %d %f %4194303s", &max_tokens,
                             &temperature, &top_p, &top_k, &presence, b64buf);
         }
-        if (fields != 8 && fields != 7 && fields != 6) {
+        if (fields != 9 && fields != 7 && fields != 6) {
             puts("ERR missing prompt"); fflush(stdout); continue;
         }
         if (max_tokens < 0 || top_k < 1 ||
             !isfinite(temperature) || temperature < 0.0f ||
             !isfinite(top_p) || top_p < 0.0f || top_p > 1.0f ||
-            !isfinite(presence) || !isfinite(min_p) ||
+            !isfinite(presence) || !isfinite(repetition) || repetition <= 0.0f ||
+            !isfinite(min_p) ||
             min_p < 0.0f || min_p > 1.0f) {
             puts("ERR invalid sampling"); fflush(stdout); continue;
         }
@@ -403,7 +394,6 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         unsigned char *seen = (unsigned char *)calloc((size_t)n_vocab, 1);
         for (int i = 0; i < n_tokens; i++) {
             cache[i] = tokens[i];
-            if (seen && tokens[i] >= 0 && tokens[i] < n_vocab) seen[tokens[i]] = 1;
         }
         cache_n = n_tokens;
         free(tokens);
@@ -425,8 +415,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         for (int k = 0; logits && k < max_tokens; k++) {
             if (g_stdio_cancel) { cancelled = 1; break; }
             int next = (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
-                sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence, min_p,
-                               seen, NULL, NULL, 0, 0, &rng);
+                sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence,
+                               repetition, min_p, seen, &rng);
             int is_stop = next == eos || next == eot || next == im_end;
             const char *piece = bpe_token_to_str(vocab, next);
             if (!is_stop && piece && text) {
@@ -722,6 +712,8 @@ int main(int argc, char **argv) {
     int verify_glm5next_projections = 0;
     int verify_glm5next_kda_layer = 0;
     int verify_glm5next_dsa_layer = 0;
+    const char *inspect_qwen4_nextn = NULL;
+    const char *load_qwen4_nextn_fusion = NULL;
     int glm5next_verify_layer = 0;
     int verify_quant_kernels = 0; /* --verify-quant-kernels: A/B HIP vs CPU per quant type, then exit */
     int verify_moe_routing = 0;
@@ -818,6 +810,10 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--verify-glm5next-dsa-layer") == 0) {
             verify_glm5next_dsa_layer = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') glm5next_verify_layer = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--inspect-qwen4-nextn") == 0 && i + 1 < argc) {
+            inspect_qwen4_nextn = argv[++i];
+        } else if (strcmp(argv[i], "--load-qwen4-nextn-fusion") == 0 && i + 1 < argc) {
+            load_qwen4_nextn_fusion = argv[++i];
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         } else {
@@ -832,6 +828,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       [--verify-glm5next-projections [LAYER]]\n");
             fprintf(stderr, "       [--verify-glm5next-kda-layer [LAYER]]\n");
             fprintf(stderr, "       [--verify-glm5next-dsa-layer [LAYER]]\n");
+            fprintf(stderr, "       [--inspect-qwen4-nextn SIDEcar.gguf]\n");
+            fprintf(stderr, "       [--load-qwen4-nextn-fusion SIDEcar.gguf]\n");
             return 1;
         }
     }
@@ -842,6 +840,25 @@ int main(int argc, char **argv) {
     }
     if (verify_moe_routing) {
         return run_verify_moe_routing();
+    }
+    if (inspect_qwen4_nextn) {
+        gguf_shards *sidecar = gguf_open_shards(inspect_qwen4_nextn, 2);
+        hip_llm_qwen4_nextn_info info;
+        char error[192];
+        int rc = sidecar ? hip_llm_qwen4_nextn_inspect(sidecar, &info,
+            error, sizeof(error)) : -1;
+        if (rc == 0) {
+            fprintf(stderr, "Qwen4 NextN sidecar: blk=%d hidden=%d heads=%d/%d "
+                    "head_dim=%d experts=%d/%d expert_ff=%d hc=%d@%d PASS\n",
+                    info.layer_index, info.n_embd, info.n_heads, info.n_kv_heads,
+                    info.head_dim, info.n_experts, info.n_experts_used,
+                    info.expert_ff, info.hc_count, info.hc_low_rank);
+        } else {
+            fprintf(stderr, "Qwen4 NextN sidecar: FAIL (%s)\n",
+                    sidecar ? error : "could not open GGUF");
+        }
+        if (sidecar) gguf_close_shards(sidecar);
+        return rc == 0 ? 0 : 1;
     }
     if (verify_glm5next_kda) {
         hip_llm_runner *r = hip_llm_init(0, 1);
@@ -1076,6 +1093,20 @@ int main(int argc, char **argv) {
         gguf_close_shards(gguf_model);
         return 1;
     }
+    if (load_qwen4_nextn_fusion) {
+        gguf_shards *sidecar = gguf_open_shards(load_qwen4_nextn_fusion, 2);
+        char error[192];
+        int rc = sidecar ? hip_llm_load_qwen4_nextn_fusion(gpu, sidecar,
+            error, sizeof(error)) : -1;
+        fprintf(stderr, "Qwen4 NextN fusion load: %s%s%s\n", rc == 0 ? "PASS" : "FAIL",
+                rc == 0 ? "" : " (", rc == 0 ? "" : (sidecar ? error : "could not open sidecar"));
+        if (rc != 0) fprintf(stderr, ")\n");
+        if (sidecar) gguf_close_shards(sidecar);
+        hip_llm_free(gpu);
+        if (cpu_model) transformer_free(cpu_model);
+        bpe_vocab_free(vocab); gguf_close_shards(gguf_model);
+        return rc == 0 ? 0 : 1;
+    }
     if (verify_glm5next_model) {
         double rel = 0.0, max_abs = 0.0;
         int rc = hip_llm_verify_glm5next_model_matvec(gpu, gguf_model, 0, &rel, &max_abs);
@@ -1115,7 +1146,6 @@ int main(int argc, char **argv) {
 
     if (bench_mode) {
         unsigned char *seen = NULL;
-        unsigned short *counts = NULL;
         /* ---- Bench mode: split prefill and decode tokens/sec ---- */
         int n_prefill = max_tokens;
         if (n_prefill < 1) n_prefill = 1;
@@ -1182,13 +1212,10 @@ int main(int argc, char **argv) {
         float *last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
         if (!last_logits) { fprintf(stderr, "GPU forward_batch_logits failed\n"); pass = 0; goto bench_done; }
         seen = coding_mode ? (unsigned char *)calloc((size_t)n_vocab, 1) : NULL;
-        counts = coding_mode ? (unsigned short *)calloc((size_t)n_vocab, sizeof(*counts)) : NULL;
         unsigned sample_rng = 0x51f15e5du;
-        if (seen) for (int i = 0; i < n_prefill; ++i)
-            if (tokens[i] >= 0 && tokens[i] < n_vocab) seen[tokens[i]] = 1;
         int next_tok = coding_mode ? sample_top_k_p(last_logits, n_vocab, 20, 0.80f,
-                                                    0.70f, 1.50f, 0.0f, seen, counts,
-                                                    NULL, 0, 0, &sample_rng)
+                                                    0.70f, 1.50f, 1.0f, 0.0f, seen,
+                                                    &sample_rng)
                                    : argmax_logits(last_logits, n_vocab);
         double t_pf1 = get_time_ms();
         double prefill_ms = t_pf1 - t_pf0;
@@ -1212,10 +1239,9 @@ int main(int argc, char **argv) {
                 float *lg = hip_llm_forward_logits(gpu, next_tok, pos);
                 if (!lg) { fprintf(stderr, "GPU forward_logits failed at decode k=%d\n", k); pass = 0; break; }
                 if (seen && next_tok >= 0 && next_tok < n_vocab) seen[next_tok] = 1;
-                if (counts && next_tok >= 0 && next_tok < n_vocab && counts[next_tok] != 0xffffu) counts[next_tok]++;
                 next_tok = coding_mode ? sample_top_k_p(lg, n_vocab, 20, 0.80f,
-                                                        0.70f, 1.50f, 0.0f, seen, counts,
-                                                        NULL, 0, 0, &sample_rng)
+                                                        0.70f, 1.50f, 1.0f, 0.0f, seen,
+                                                        &sample_rng)
                                        : argmax_logits(lg, n_vocab);
                 decoded++;
                 if (gen_text) { const char *s = bpe_token_to_str(vocab, next_tok); if (s) fprintf(stderr, "%s", s); }
@@ -1252,7 +1278,7 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
 bench_done:
-        free(seen); free(counts);
+        free(seen);
     } else {
         /* ---- Correctness mode: per-token CPU vs GPU compare (legacy) ---- */
         fprintf(stderr, "\n=== Running %d tokens (n_embd=%d)%s ===\n",

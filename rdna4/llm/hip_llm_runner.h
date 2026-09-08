@@ -56,7 +56,36 @@ typedef struct {
     double gpu_moe_ms;
 } hip_llm_moe_stats;
 
+/* Contract exported by a Qwen4exp NextN/MTP sidecar.  The sidecar shares the
+ * trunk embedding and output head, so it must be checked before allocating
+ * its independent layer state on the GPU. */
+typedef struct {
+    int layer_index;
+    int n_embd;
+    int n_heads;
+    int n_kv_heads;
+    int head_dim;
+    int n_experts;
+    int n_experts_used;
+    int expert_ff;
+    int hc_count;
+    int hc_low_rank;
+} hip_llm_qwen4_nextn_info;
+
 void hip_llm_load_options_default(hip_llm_load_options *options);
+
+/* Validate a standalone Qwen4exp NextN sidecar.  This only inspects GGUF
+ * metadata/tensor shapes; it does not allocate device memory. */
+int hip_llm_qwen4_nextn_inspect(const gguf_shards *sidecar,
+                                 hip_llm_qwen4_nextn_info *info,
+                                 char *error, size_t error_cap);
+
+/* Load the Qwen4 NextN fusion and draft-head prefix. The caller retains the
+ * sidecar mapping. This is intentionally separate from speculative serving:
+ * full MTP attention/MoE and verified acceptance are added afterward. */
+int hip_llm_load_qwen4_nextn_fusion(hip_llm_runner *r,
+                                    const gguf_shards *sidecar,
+                                    char *error, size_t error_cap);
 
 /* Initialize HIP context + compile kernels via HIPRTC for the given device.
  * Returns NULL on failure. verbose: 0=quiet, 1=info, 2=debug */
