@@ -86,6 +86,9 @@ int hip_llm_qwen4_nextn_inspect(const gguf_shards *sidecar,
 int hip_llm_load_qwen4_nextn_fusion(hip_llm_runner *r,
                                     const gguf_shards *sidecar,
                                     char *error, size_t error_cap);
+/* Apply the measured Qwen4 coding-decode routing profile without relying on
+ * process environment variables. Call after loading weights. */
+void hip_llm_set_qwen4_coding_profile(hip_llm_runner *r);
 
 /* Initialize HIP context + compile kernels via HIPRTC for the given device.
  * Returns NULL on failure. verbose: 0=quiet, 1=info, 2=debug */

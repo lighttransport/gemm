@@ -9266,6 +9266,7 @@ struct hip_llm_runner {
     int hc_head_down_type, hc_head_up_type;
     /* Qwen4 NextN prefix: independent wide HC state and sidecar fusion/head. */
     int qwen4_nextn_fusion_loaded;
+    int qwen4_coding_profile;
     void *qwen4_nextn_eh_w, *qwen4_nextn_enorm_w, *qwen4_nextn_hnorm_w;
     void *qwen4_nextn_hc_head_norm_w, *qwen4_nextn_hc_head_down_w, *qwen4_nextn_hc_head_up_w;
     int qwen4_nextn_eh_type, qwen4_nextn_hc_head_down_type, qwen4_nextn_hc_head_up_type;
@@ -10585,6 +10586,10 @@ fail:
 invalid:
     if (error && error_cap) snprintf(error, error_cap, "NextN fusion requires a loaded qwen4exp trunk");
     return -1;
+}
+
+void hip_llm_set_qwen4_coding_profile(hip_llm_runner *r) {
+    if (r && r->is_qwen4exp) r->qwen4_coding_profile = 1;
 }
 
 /* ======================================================================== */
@@ -15739,7 +15744,8 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
     int cpu_decode_misses = r->decode_mode && cpu_decode_env && atoi(cpu_decode_env) != 0 &&
         r->moe_cpu_prefill && r->h_moe_xq_decode && r->h_moe_gate_q_decode;
     const char *approx_env = getenv("LLM_QWEN4_APPROX_DECODE");
-    int approx_decode = r->decode_mode && approx_env && atoi(approx_env) != 0;
+    int approx_decode = r->decode_mode && (r->qwen4_coding_profile ||
+        (approx_env && atoi(approx_env) != 0));
     /* The approximate path deliberately keeps the prefilled resident set
      * stable.  Delayed host refills add copy-stream work and can invalidate
      * the hit-only assumption; exact decode continues to use them. */
@@ -15755,7 +15761,7 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
         (cpu_decode_misses && cpu_min_weight >= 1.0f &&
          ((hits_only_env && atoi(hits_only_env) != 0) || delayed_cache));
     const char *refresh_env = getenv("LLM_QWEN4_DEVICE_REFRESH_INTERVAL");
-    int refresh_interval = refresh_env ? atoi(refresh_env) : 1;
+    int refresh_interval = r->qwen4_coding_profile ? 4 : (refresh_env ? atoi(refresh_env) : 1);
     const char *refresh_layers_env = getenv("LLM_QWEN4_DEVICE_REFRESH_LAYERS");
     int refresh_layers = refresh_layers_env ? atoi(refresh_layers_env) : r->n_layers;
     uint64_t decode_token = r->n_layers > 0 ?
@@ -15775,7 +15781,8 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
          * GPU retains the resident routes.  Keep the historic all-hit-only
          * behavior when the variable is absent. */
         const char *approx_min_env = getenv("LLM_QWEN4_APPROX_CPU_MIN_WEIGHT");
-        cpu_min_weight = approx_min_env ? strtof(approx_min_env, NULL) : 1.0f;
+        cpu_min_weight = r->qwen4_coding_profile ? 0.20f :
+            (approx_min_env ? strtof(approx_min_env, NULL) : 1.0f);
         if (cpu_min_weight < 0.0f) cpu_min_weight = 0.0f;
         if (cpu_min_weight > 1.0f) cpu_min_weight = 1.0f;
     }

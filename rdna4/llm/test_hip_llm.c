@@ -701,6 +701,7 @@ int main(int argc, char **argv) {
     int prefill_pad = 0;      /* --prefill-len M: pad prompt up to M tokens with last token (for bench) */
     int compare_paths = 0;    /* --compare-paths: report rel-L2 between batched and per-token logits */
     int coding_mode = 0;      /* Qwen3.8 non-thinking coding sampling profile */
+    int qwen4_coding_profile = 0;
     int moe_cache_mb = 0;
     int moe_cpu_only = 0;
     int max_layers = 0;
@@ -786,6 +787,8 @@ int main(int argc, char **argv) {
             compare_paths = 1;
         } else if (strcmp(argv[i], "--coding") == 0) {
             coding_mode = 1;
+        } else if (strcmp(argv[i], "--qwen4-coding-profile") == 0) {
+            qwen4_coding_profile = 1;
         } else if (strcmp(argv[i], "--moe-cache-mb") == 0 && i + 1 < argc) {
             moe_cache_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--moe-cpu") == 0) {
@@ -1093,6 +1096,7 @@ int main(int argc, char **argv) {
         gguf_close_shards(gguf_model);
         return 1;
     }
+    if (qwen4_coding_profile) hip_llm_set_qwen4_coding_profile(gpu);
     if (load_qwen4_nextn_fusion) {
         gguf_shards *sidecar = gguf_open_shards(load_qwen4_nextn_fusion, 2);
         char error[192];

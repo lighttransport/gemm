@@ -168,6 +168,8 @@ class Backend:
             cmd += ["--moe-cache-mb", str(args.moe_cache_mb)]
         if args.coding:
             cmd += ["--coding"]
+        if args.qwen4_coding_profile:
+            cmd += ["--qwen4-coding-profile"]
         self.coding = args.coding
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=None, text=True, bufsize=1)
@@ -676,6 +678,7 @@ def main():
     ap.add_argument("--max-output", type=int, default=256)
     ap.add_argument("--moe-cache-mb", type=int, default=0)
     ap.add_argument("--coding", action="store_true")
+    ap.add_argument("--qwen4-coding-profile", action="store_true")
     args = ap.parse_args()
     Handler.backend = Backend(args)
     Handler.model = Handler.backend.model

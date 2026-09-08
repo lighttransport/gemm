@@ -71,10 +71,6 @@ exec env \
     LLM_MOE_CPU_LIB="${cpu_lib}" \
     LLM_MOE_CPU_PREFILL_MAX_COUNT="${LLM_MOE_CPU_PREFILL_MAX_COUNT:-2}" \
     LLM_MOE_CPU_PREFILL_MAX_JOBS="${LLM_MOE_CPU_PREFILL_MAX_JOBS:-160}" \
-    LLM_QWEN4_APPROX_DECODE="${LLM_QWEN4_APPROX_DECODE:-1}" \
-    LLM_QWEN4_DEVICE_HITS_ONLY="${LLM_QWEN4_DEVICE_HITS_ONLY:-1}" \
-    LLM_QWEN4_DEVICE_REFRESH_INTERVAL="${LLM_QWEN4_DEVICE_REFRESH_INTERVAL:-4}" \
-    LLM_QWEN4_APPROX_CPU_MIN_WEIGHT="${LLM_QWEN4_APPROX_CPU_MIN_WEIGHT:-0.20}" \
     LLM_QWEN4_PRE_GRAPHS="${LLM_QWEN4_PRE_GRAPHS:-1}" \
     LLM_BMAX="${LLM_BMAX:-512}" \
     LLM_MOE_GROUPED_PREFILL="${LLM_MOE_GROUPED_PREFILL:-1}" \
@@ -85,4 +81,4 @@ exec env \
     --port "${port}" \
     --host "${host}" \
     --moe-cache-mb "${cache_mb}" \
-    --coding "$@"
+    --coding --qwen4-coding-profile "$@"
