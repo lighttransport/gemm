@@ -930,3 +930,9 @@ A prototype K-parallel Q5_1 down kernel (one warp per selected expert) was
 also rejected. It expanded the grid from output-row tiles to one block per
 row and measured only `10.64` decode tok/s at 4K, with a changed sequence
 hash. The existing row-parallel kernel therefore remains the exact path.
+
+Validated scaled-I8 KV was also used to reclaim VRAM for the expert cache.
+At 8K context, an 8.7-GiB cache loaded successfully but reached only
+`24.47` decode tok/s (versus the F16-cache control near `25.3`), with the
+same simple hash. A 9.2-GiB request reached weight-loading failure in the
+hipBLASLt setup, so I8 does not currently buy a stable decode improvement.
