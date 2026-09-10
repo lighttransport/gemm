@@ -893,3 +893,9 @@ Exact-mode A/B tests can use `LLM_QWEN4_EXACT_CPU_MIN_WEIGHT=<threshold>`
 without changing the default. At 4K, thresholds through `0.5` retained the
 simple greedy hash but reached only `28.3` tok/s; `0.8` did not improve it.
 No threshold is promoted without coding-prompt parity.
+
+The benchmark harness now selects `LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE=0` for
+requests at or below BMAX and `1` only when the request exceeds BMAX. This
+avoids a measurable regression at exactly 1,024 tokens (`29.26` decode tok/s,
+stable hash) while retaining the true 4K multi-chunk path (`160.23` prefill
+tok/s, stable hash).

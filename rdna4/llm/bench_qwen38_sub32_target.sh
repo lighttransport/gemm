@@ -13,6 +13,13 @@ cache_mb="${QWEN38_SUB32_CACHE_MB:-8500}"
 log_file="${QWEN38_SUB32_LOG:-${root_dir}/tmp/qwen38_sub32_target.log}"
 cpu_lib="${LLM_MOE_CPU_LIB:-/mnt/nvme02/work/llama.cpp/build-codex-hetero-dev2/bin/libggml-cpu.so.0.22.0}"
 prompt="${QWEN38_SUB32_PROMPT:-}"
+bmax="${LLM_BMAX:-1024}"
+multi_chunk_force="${LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE:-}"
+if [[ -z "${multi_chunk_force}" ]]; then
+    # The native single-batch path is faster and more stable at or below BMAX;
+    # force the stateful multi-chunk dispatcher only for longer requests.
+    if (( prefill > bmax )); then multi_chunk_force=1; else multi_chunk_force=0; fi
+fi
 
 [[ -r "${model}" ]] || { echo "model not readable: ${model}" >&2; exit 2; }
 [[ -x "${root_dir}/test_hip_llm" ]] || { echo "build test_hip_llm first" >&2; exit 2; }
@@ -34,8 +41,8 @@ env \
     LLM_QWEN4_EXACT_CPU_MIN_WEIGHT="${LLM_QWEN4_EXACT_CPU_MIN_WEIGHT:-}" \
     LLM_QWEN4_KV_QUANT=none \
     LLM_MOE_CACHE_MB="${cache_mb}" \
-    LLM_BMAX="${LLM_BMAX:-1024}" \
-    LLM_MOE_CHUNK="${LLM_MOE_CHUNK:-${LLM_BMAX:-1024}}" \
+    LLM_BMAX="${bmax}" \
+    LLM_MOE_CHUNK="${LLM_MOE_CHUNK:-${bmax}}" \
     LLM_MOE_REGISTER_HOST=1 \
     LLM_MOE_COPY_PIPELINE=1 \
     LLM_MOE_STREAM_SLOTS="${LLM_MOE_STREAM_SLOTS:-2}" \
@@ -44,7 +51,7 @@ env \
     LLM_QWEN4_BATCH=1 \
     LLM_QWEN4_BATCH_STATEFUL=1 \
     LLM_QWEN4_BATCH_MULTI_CHUNK="${LLM_QWEN4_BATCH_MULTI_CHUNK:-1}" \
-    LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE="${LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE:-1}" \
+    LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE="${multi_chunk_force}" \
     LLM_QWEN4_BATCH_SSM=1 \
     LLM_QWEN4_BATCH_ATTN_MAX_LAYER=47 \
     LLM_QWEN4_NATIVE_BATCH_QKV=1 \
