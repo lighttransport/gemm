@@ -910,3 +910,18 @@ requests at or below BMAX and `1` only when the request exceeds BMAX. This
 avoids a measurable regression at exactly 1,024 tokens (`29.26` decode tok/s,
 stable hash) while retaining the true 4K multi-chunk path (`160.23` prefill
 tok/s, stable hash).
+
+The remaining exact-decode gap was rechecked on the 16-GiB RX 9070 XT. An
+OpenMP sweep at 4K (24/32/48 threads) reached `24.95/13.29/21.94` tok/s;
+the 24-thread result is the best of that matched run and retained the simple
+control hash. A 100-MiB cache increase (8,600 MiB total) reached `25.33`
+tok/s, so the practical 8.5-GiB cache ceiling remains the right default. The
+optional one-warp resident-expert kernel and decode-oriented layer allocation
+were also slower (`24.82` and `23.92` tok/s respectively).
+
+Increasing the prefill staging pool from 512 to 768 MiB was allocatable but
+did not help: the 4K sample measured `159.95` prefill and `24.29` decode
+tok/s. The benchmark now exposes `LLM_QWEN4_PREFILL_STAGE_MB` for cards with
+more VRAM, but 512 MiB remains the 16-GiB setting. Per-layer Qwen HIP graph
+replay was faster in one simple run, but changed the coding-prompt sequence
+hash; it remains disabled for exact production decoding.
