@@ -13738,7 +13738,20 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                     };
                     const char *prefill_balance = getenv("LLM_QWEN4_PREFILL_CACHE_BALANCE");
                     const char *decode_balance = getenv("LLM_QWEN4_DECODE_CACHE_BALANCE");
-                    if (decode_balance && atoi(decode_balance) != 0) {
+                    const char *decode_4k = getenv("LLM_QWEN4_DECODE_CACHE_4K");
+                    if (decode_4k && atoi(decode_4k) != 0) {
+                        /* 4K decode traces concentrate churn in layers 25-34;
+                         * preserve the same bytes by borrowing from saturated
+                         * prefix/suffix layers. This is opt-in pending a
+                         * prompt-diverse quality/speed sweep. */
+                        static const unsigned char decode_4k_target[48] = {
+                            34,28,36,34,38,44,28,32,36,32,38,34,
+                            40,34,38,62,54,54,58,72,66,58,58,78,
+                            72,82,94,104,96,104,112,104,104,112,94,82,
+                            70,62,54,84,84,54,42,48,34,34,30,38
+                        };
+                        w = decode_4k_target[l];
+                    } else if (decode_balance && atoi(decode_balance) != 0) {
                         /* 256K decode traces show the recurrent/deep band
                          * (31, 40, 47 and neighbors) churning while the
                          * earliest layers stay above 95% hit.  Move a fixed

@@ -936,3 +936,10 @@ At 8K context, an 8.7-GiB cache loaded successfully but reached only
 `24.47` decode tok/s (versus the F16-cache control near `25.3`), with the
 same simple hash. A 9.2-GiB request reached weight-loading failure in the
 hipBLASLt setup, so I8 does not currently buy a stable decode improvement.
+
+An opt-in `LLM_QWEN4_DECODE_CACHE_4K=1` allocation table now shifts the same
+8.5-GiB expert-cache budget toward the churn-heavy layers 25--34. At 4K it
+reached `25.84` decode tok/s (versus roughly `25.0` for the standard table),
+with the unchanged simple hash and coding-control hash `4b08c4516a831386`.
+The option is not the default yet: it remains below the 30 tok/s target and
+needs prompt-diverse decode validation.
