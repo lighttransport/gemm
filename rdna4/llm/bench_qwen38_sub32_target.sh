@@ -30,6 +30,9 @@ if [[ -n "${prompt}" ]]; then extra_args+=( -t "${prompt}" ); fi
 if [[ "${QWEN38_PREFILL_STAGING:-0}" != 0 ]]; then
     extra_args+=( --qwen4-prefill-staging )
 fi
+if [[ -n "${LLM_QWEN4_PREFILL_STAGE_MB:-}" ]]; then
+    extra_args+=( --qwen4-prefill-stage-mb "${LLM_QWEN4_PREFILL_STAGE_MB}" )
+fi
 
 # Host routing is slower than GPU top-k but deterministic; GPU top-k caused
 # run-to-run route/hash changes on gfx1201 in this parity experiment.
