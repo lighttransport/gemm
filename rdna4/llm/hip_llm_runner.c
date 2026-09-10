@@ -16959,7 +16959,13 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
             if (cl->moe_cache_ids[s] >= 0) { approx_ready = 1; break; }
     const char *min_weight_env = getenv("LLM_MOE_CPU_MIN_WEIGHT");
     float cpu_min_weight = min_weight_env ? strtof(min_weight_env, NULL) : 0.0f;
-    if (r->qwen4_exact || r->qwen4_nextn_active) cpu_min_weight = 0.0f;
+    if (r->qwen4_exact || r->qwen4_nextn_active) {
+        /* Exact mode normally evaluates every cold route. An explicit
+         * threshold is useful for controlled quality/speed A/B tests, but is
+         * deliberately separate from the approximate-decode knob. */
+        const char *exact_min_env = getenv("LLM_QWEN4_EXACT_CPU_MIN_WEIGHT");
+        cpu_min_weight = exact_min_env ? strtof(exact_min_env, NULL) : 0.0f;
+    }
     const char *hits_only_env = getenv("LLM_QWEN4_DEVICE_HITS_ONLY");
     int device_hits_only_config = (approx_decode && approx_ready) ||
         (cpu_decode_misses && cpu_min_weight >= 1.0f &&

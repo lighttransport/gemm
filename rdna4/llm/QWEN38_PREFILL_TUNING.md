@@ -888,3 +888,8 @@ prompt to fewer CPU misses and reached `37.22` decode tok/s while retaining its
 control hash.  It is not quality-safe in general: the UTF-8 coding prompt fell
 to `7.93` decode tok/s and produced hash `bb602f2deee2e5e7`, so the diagnostic
 script keeps the exact `0.0` threshold by default.
+
+Exact-mode A/B tests can use `LLM_QWEN4_EXACT_CPU_MIN_WEIGHT=<threshold>`
+without changing the default. At 4K, thresholds through `0.5` retained the
+simple greedy hash but reached only `28.3` tok/s; `0.8` did not improve it.
+No threshold is promoted without coding-prompt parity.
