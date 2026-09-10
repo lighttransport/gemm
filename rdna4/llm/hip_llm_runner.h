@@ -39,6 +39,8 @@ typedef struct {
     int moe_cpu_threads;          /* <= 0: physical cores */
     uint64_t host_register_bytes; /* 0: automatic */
     uint64_t gpu_reserve_bytes;   /* 0: default 1 GiB */
+    int qwen4_prefill_staging;    /* opt-in two-tier Qwen4 batched prefill */
+    uint64_t qwen4_prefill_stage_bytes; /* 0: 512 MiB when staging is enabled */
 } hip_llm_load_options;
 
 typedef struct {
@@ -51,6 +53,10 @@ typedef struct {
     uint64_t cache_misses;
     uint64_t cache_evictions;
     uint64_t h2d_bytes;
+    uint64_t stage_h2d_bytes;
+    uint64_t stage_waves;
+    uint64_t stage_promotions;
+    uint64_t stage_fallbacks;
     double cpu_ms;
     double copy_ms;
     double gpu_moe_ms;
@@ -80,15 +86,44 @@ int hip_llm_qwen4_nextn_inspect(const gguf_shards *sidecar,
                                  hip_llm_qwen4_nextn_info *info,
                                  char *error, size_t error_cap);
 
-/* Load the Qwen4 NextN fusion and draft-head prefix. The caller retains the
- * sidecar mapping. This is intentionally separate from speculative serving:
- * full MTP attention/MoE and verified acceptance are added afterward. */
+/* Load the complete Qwen4 NextN layer, independent KV state and expert cache.
+ * Shared embedding/output weights are borrowed from the loaded trunk. */
 int hip_llm_load_qwen4_nextn_fusion(hip_llm_runner *r,
                                     const gguf_shards *sidecar,
                                     char *error, size_t error_cap);
+/* Diagnostic oracle interface: hidden arrays contain hc_count*n_embd floats. */
+int hip_llm_qwen4_nextn_logits(hip_llm_runner *r, int32_t token, int position,
+                               const float *hidden, float *out_hidden, float *logits);
+int hip_llm_verify_qwen4_nextn(hip_llm_runner *r, const gguf_shards *sidecar,
+                              const gguf_shards *target, int steps);
+typedef struct {
+    int32_t tokens[33];
+    int emitted, accepted, drafted, processed;
+    int32_t pending;
+    int stopped;
+    double draft_ms, verify_ms;
+} hip_llm_qwen4_mtp_result;
+/* Enable only after sidecar loading. K is supplied per round. */
+int hip_llm_qwen4_mtp_enable(hip_llm_runner *r);
+/* Before load: reserve NextN/QSA/state memory from the expert-cache budget. */
+int hip_llm_qwen4_mtp_configure(hip_llm_runner *r, size_t cache_bytes, int draft);
+int hip_llm_qwen4_mtp_set_verify(hip_llm_runner *r, int window);
+/* Borrowed host logits for the current committed target state. */
+float *hip_llm_current_logits(hip_llm_runner *r);
+/* Run target forward and return only the greedy token; avoids a full-vocab
+ * device-to-host copy during speculative verification. */
+int hip_llm_forward_argmax(hip_llm_runner *r, int32_t token_id, int position);
+int hip_llm_qwen4_exact_enable(hip_llm_runner *r);
+int hip_llm_verify_qwen4_mtp(hip_llm_runner *r, int32_t anchor, int position, int draft);
+int hip_llm_verify_qwen4_qsa(hip_llm_runner *r);
+int hip_llm_qwen4_mtp_step(hip_llm_runner *r, int32_t anchor, int position,
+                           int draft, int max_emit, const int32_t *stop_ids,
+                           int n_stop, hip_llm_qwen4_mtp_result *result);
 /* Apply the measured Qwen4 coding-decode routing profile without relying on
  * process environment variables. Call after loading weights. */
 void hip_llm_set_qwen4_coding_profile(hip_llm_runner *r);
+void hip_llm_set_qwen4_batched_prefill(hip_llm_runner *r, int enabled);
+void hip_llm_set_qwen4_batch_request_tokens(hip_llm_runner *r, int n_tokens);
 
 /* Initialize HIP context + compile kernels via HIPRTC for the given device.
  * Returns NULL on failure. verbose: 0=quiet, 1=info, 2=debug */
@@ -192,6 +227,11 @@ void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled);
  * their positional device cache, so this snapshots only hybrid SSM/PLE state.
  * The opaque snapshot is owned by the caller and may be reused across turns. */
 hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r);
+/* Snapshot only the attention KV slots in [start_pos, start_pos+n_positions).
+ * This bounded transaction is intended for speculative draft verification. */
+hip_llm_state_snapshot *hip_llm_snapshot_state_window(hip_llm_runner *r,
+                                                       int start_pos,
+                                                       int n_positions);
 int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *snapshot);
 void hip_llm_free_state_snapshot(hip_llm_state_snapshot *snapshot);
 

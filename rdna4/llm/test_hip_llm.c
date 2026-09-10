@@ -16,6 +16,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <signal.h>
+#include <unistd.h>
 
 /* GGUF loader */
 #define GGUF_LOADER_IMPLEMENTATION
@@ -200,7 +201,7 @@ static int prompt_bos_id(const gguf_context *gguf) {
 }
 
 static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
-                            int n_vocab, int max_seq_len, int bos_id) {
+                            int n_vocab, int max_seq_len, int bos_id, int mtp_draft) {
     char line[4 * 1024 * 1024];
     int32_t *cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
     int32_t *prefix_cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
@@ -322,6 +323,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             common = 0;
         }
         if (n_tokens > max_seq_len) n_tokens = max_seq_len;
+        hip_llm_set_qwen4_batch_request_tokens(gpu, n_tokens);
         int batch_size = 128;
         const char *batch_env = getenv("LLM_BMAX");
         if (batch_env) batch_size = atoi(batch_env);
@@ -336,7 +338,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         }
         double t_prefill0 = get_time_ms();
         hip_llm_set_decode_mode(gpu, 0);
-        float *logits = NULL;
+        float *logits = prompt_added == 0 && cache_n > 0 ?
+                        hip_llm_current_logits(gpu) : NULL;
         int cancelled = 0;
         int batch_index = 0;
         for (int off = 0; off < prompt_added; ) {
@@ -412,9 +415,35 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         double t_decode0 = get_time_ms();
         hip_llm_reset_moe_stats(gpu);
         hip_llm_set_decode_mode(gpu, 1);
+        hip_llm_qwen4_mtp_result mtp = {0};
+        int mtp_index = 0, mtp_pending = -1, mtp_error = 0;
+        int mtp_approx_fallback = 0;
+        int mtp_adaptive_fallback = 0;
+        int32_t stops[] = { eos, eot, im_end };
         for (int k = 0; logits && k < max_tokens; k++) {
             if (g_stdio_cancel) { cancelled = 1; break; }
-            int next = (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
+            int use_mtp = mtp_draft > 0 && temperature <= 0.0f &&
+                          !mtp_approx_fallback && !mtp_adaptive_fallback;
+            if (use_mtp && mtp_index == mtp.emitted) {
+                int anchor = mtp_pending >= 0 ? mtp_pending : argmax_logits(logits, n_vocab);
+                if (hip_llm_qwen4_mtp_step(gpu, anchor, cache_n, mtp_draft,
+                        max_tokens-k, stops, 3, &mtp)) { mtp_error = 1; break; }
+                mtp_index = 0; mtp_pending = mtp.pending;
+                fprintf(stderr, "llm_server: MTP backend=%s drafted=%d accepted=%d emitted=%d draft_ms=%.3f verify_ms=%.3f\n",
+                        getenv("LLM_QWEN4_MTP_TRUST_DRAFT") ? "hip-approx" : "hip",
+                        mtp.drafted, mtp.accepted, mtp.emitted, mtp.draft_ms, mtp.verify_ms);
+                if (getenv("LLM_QWEN4_MTP_APPROX") && mtp.drafted > 0 && mtp.accepted == 0) {
+                    mtp_approx_fallback = 1;
+                    fprintf(stderr, "llm_server: MTP approximate acceptance=0; falling back to target decode\n");
+                }
+                if (getenv("LLM_QWEN4_MTP_ADAPTIVE") && mtp.drafted > 0 &&
+                    mtp.accepted * 2 < mtp.drafted) {
+                    mtp_adaptive_fallback = 1;
+                    fprintf(stderr, "llm_server: MTP acceptance=%d/%d; adaptive target fallback\n",
+                            mtp.accepted, mtp.drafted);
+                }
+            }
+            int next = use_mtp ? mtp.tokens[mtp_index++] : (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
                 sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence,
                                repetition, min_p, seen, &rng);
             int is_stop = next == eos || next == eot || next == im_end;
@@ -451,7 +480,11 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 finish_eos = 1;
                 break;
             }
-            logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
+            /* If approximate MTP just fell back after a zero-accept batch,
+             * replay the emitted anchor through the target so the ordinary
+             * decode path resumes with fresh logits and state. */
+            if (!use_mtp || mtp_approx_fallback || mtp_adaptive_fallback)
+                logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
             double token_now = get_time_ms();
             double token_ms = token_now - t_decode0;
             fprintf(stderr,
@@ -462,6 +495,13 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             fflush(stderr);
         }
         if (g_stdio_cancel) cancelled = 1;
+        if (mtp_error) {
+            hip_llm_free_state_snapshot(prefix_snapshot); prefix_snapshot = NULL;
+            prefix_cache_n = cache_n = 0;
+            hip_llm_reset_state(gpu);
+            free(text); free(seen);
+            puts("ERR mtp"); fflush(stdout); continue;
+        }
         double t_decode1 = get_time_ms();
         hip_llm_set_decode_mode(gpu, 0);
         double prefill_ms = t_prefill1 - t_prefill0;
@@ -489,6 +529,17 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             }
         }
         size_t enc_n = 0; char *enc = b64_encode((const unsigned char *)(text ? text : ""), text_n, &enc_n);
+        /* Trusted sidecar MTP advances only the independent NextN state.  The
+         * target recurrent/KV state is therefore not a valid reusable prefix;
+         * drop it before the next HTTP request rather than serving from stale
+         * target state. */
+        if (getenv("LLM_QWEN4_MTP_TRUST_DRAFT")) {
+            hip_llm_free_state_snapshot(prefix_snapshot);
+            prefix_snapshot = NULL;
+            prefix_cache_n = 0;
+            hip_llm_reset_state(gpu);
+            cache_n = 0;
+        }
         if (cancelled) {
             hip_llm_free_state_snapshot(prefix_snapshot);
             prefix_snapshot = NULL;
@@ -693,6 +744,7 @@ static int argmax_logits(const float *logits, int n) {
 int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *prompt = "Hello, how are you?";
+    char *prompt_owned = NULL;
     int max_tokens = 8;
     int max_seq_len = 256;
     int bench_mode = 0;       /* --bench: split prefill/decode tps; skip CPU compare */
@@ -702,6 +754,9 @@ int main(int argc, char **argv) {
     int compare_paths = 0;    /* --compare-paths: report rel-L2 between batched and per-token logits */
     int coding_mode = 0;      /* Qwen3.8 non-thinking coding sampling profile */
     int qwen4_coding_profile = 0;
+    int qwen4_batched_prefill = 0;
+    int qwen4_prefill_staging = 0;
+    int qwen4_prefill_stage_mb = 0;
     int moe_cache_mb = 0;
     int moe_cpu_only = 0;
     int max_layers = 0;
@@ -715,6 +770,21 @@ int main(int argc, char **argv) {
     int verify_glm5next_dsa_layer = 0;
     const char *inspect_qwen4_nextn = NULL;
     const char *load_qwen4_nextn_fusion = NULL;
+    /* Q4_K/Q6_K exact verification is host-synchronization bound; recurrent
+     * width-2 drafts minimize rejected-suffix work on the RX 9070 XT. */
+    /* Scalar exact verification still evaluates the target one token at a
+     * time, so extra sidecar steps only add overhead. Width 1 is the default;
+     * wider windows remain available for the experimental batched verifier. */
+    int qwen4_mtp_draft = 1;
+    int verify_qwen4_nextn = 0;
+    int qwen4_mtp = 0;
+    int qwen4_mtp_trust = 0;
+    int qwen4_mtp_adaptive = 0;
+    int qwen4_exact = 0;
+    int qwen4_mtp_check = 0;
+    int verify_qwen4_qsa = 0;
+    int qwen4_mtp_cache_mb = 128;
+    int qwen4_mtp_window = 0;
     int glm5next_verify_layer = 0;
     int verify_quant_kernels = 0; /* --verify-quant-kernels: A/B HIP vs CPU per quant type, then exit */
     int verify_moe_routing = 0;
@@ -770,6 +840,19 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             prompt = argv[++i];
+        } else if (strcmp(argv[i], "--prompt-file") == 0 && i + 1 < argc) {
+            const char *path = argv[++i];
+            FILE *pf = fopen(path, "rb");
+            if (!pf) { perror("--prompt-file"); return 2; }
+            if (fseek(pf, 0, SEEK_END) != 0) { fclose(pf); return 2; }
+            long n = ftell(pf);
+            if (n < 0 || fseek(pf, 0, SEEK_SET) != 0) { fclose(pf); return 2; }
+            prompt_owned = (char *)malloc((size_t)n + 1);
+            if (!prompt_owned || fread(prompt_owned, 1, (size_t)n, pf) != (size_t)n) {
+                fclose(pf); free(prompt_owned); prompt_owned = NULL;
+                fprintf(stderr, "--prompt-file: read failed\n"); return 2;
+            }
+            fclose(pf); prompt_owned[n] = '\0'; prompt = prompt_owned;
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
@@ -789,6 +872,13 @@ int main(int argc, char **argv) {
             coding_mode = 1;
         } else if (strcmp(argv[i], "--qwen4-coding-profile") == 0) {
             qwen4_coding_profile = 1;
+        } else if (strcmp(argv[i], "--qwen4-batched-prefill") == 0) {
+            qwen4_batched_prefill = 1;
+        } else if (strcmp(argv[i], "--qwen4-prefill-staging") == 0) {
+            qwen4_prefill_staging = 1;
+        } else if (strcmp(argv[i], "--qwen4-prefill-stage-mb") == 0 && i + 1 < argc) {
+            qwen4_prefill_staging = 1;
+            qwen4_prefill_stage_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--moe-cache-mb") == 0 && i + 1 < argc) {
             moe_cache_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--moe-cpu") == 0) {
@@ -815,14 +905,54 @@ int main(int argc, char **argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') glm5next_verify_layer = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--inspect-qwen4-nextn") == 0 && i + 1 < argc) {
             inspect_qwen4_nextn = argv[++i];
+        } else if (strcmp(argv[i], "--verify-qwen4-nextn") == 0 && i + 1 < argc) {
+            verify_qwen4_nextn = 1;
+            load_qwen4_nextn_fusion = argv[++i];
         } else if (strcmp(argv[i], "--load-qwen4-nextn-fusion") == 0 && i + 1 < argc) {
             load_qwen4_nextn_fusion = argv[++i];
+        } else if (strcmp(argv[i], "--qwen4-mtp") == 0 && i + 1 < argc) {
+            /* MTP and the legacy fusion loader share the same sidecar. */
+            load_qwen4_nextn_fusion = argv[++i];
+            qwen4_mtp = 1;
+        } else if (strcmp(argv[i], "--qwen4-exact") == 0) {
+            qwen4_exact = 1;
+        } else if (strcmp(argv[i], "--qwen4-mtp-check") == 0) {
+            qwen4_mtp_check = 1;
+        } else if (strcmp(argv[i], "--verify-qwen4-qsa") == 0) {
+            verify_qwen4_qsa = 1;
+        } else if (strcmp(argv[i], "--qwen4-mtp-cache-mb") == 0 && i+1<argc) {
+            qwen4_mtp_cache_mb=atoi(argv[++i]);
+            if(qwen4_mtp_cache_mb<32 || qwen4_mtp_cache_mb>4096) {
+                fprintf(stderr,"--qwen4-mtp-cache-mb must be 32..4096\n");return 1;
+            }
+        } else if (strcmp(argv[i], "--qwen4-mtp-verify") == 0 && i+1<argc) {
+            const char *mode=argv[++i];
+            if(strcmp(mode,"scalar") && strcmp(mode,"window")) {
+                fprintf(stderr,"--qwen4-mtp-verify must be scalar or window\n");return 1;
+            }
+            qwen4_mtp_window=strcmp(mode,"window")==0;
+        } else if (strcmp(argv[i], "--qwen4-mtp-draft") == 0 && i + 1 < argc) {
+            qwen4_mtp_draft = atoi(argv[++i]);
+            if (qwen4_mtp_draft < 1) qwen4_mtp_draft = 1;
+            if (qwen4_mtp_draft > 32) qwen4_mtp_draft = 32;
+        } else if (strcmp(argv[i], "--qwen4-mtp-trust-draft") == 0) {
+            qwen4_mtp_trust = 1;
+        } else if (strcmp(argv[i], "--qwen4-mtp-adaptive") == 0) {
+            qwen4_mtp_adaptive = 1;
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         } else {
             fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
             fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M] [--coding]\n");
             fprintf(stderr, "       [--moe-cache-mb MiB] [--moe-cpu]\n");
+            fprintf(stderr, "       [--qwen4-mtp SIDECAR.gguf] [--qwen4-mtp-draft 1..32]\n");
+            fprintf(stderr, "       [--qwen4-mtp-cache-mb MiB] [--qwen4-mtp-verify scalar|window]\n");
+            fprintf(stderr, "       [--qwen4-mtp-check] [--qwen4-exact]\n");
+            fprintf(stderr, "       [--qwen4-mtp-trust-draft] (approximate sidecar-only mode)\n");
+            fprintf(stderr, "       [--qwen4-mtp-adaptive] (exact low-acceptance fallback)\n");
+            fprintf(stderr, "       [--verify-qwen4-nextn SIDECAR.gguf] [--verify-qwen4-qsa]\n");
+            fprintf(stderr, "       [--qwen4-batched-prefill] [--qwen4-prefill-staging]\n");
+            fprintf(stderr, "       [--qwen4-prefill-stage-mb MiB]\n");
             fprintf(stderr, "       [--verify-quant-kernels] [--bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]]\n");
             fprintf(stderr, "       [--verify-moe-routing]\n");
             fprintf(stderr, "       [--verify-glm5next-kda [HEAD_DIM]]\n");
@@ -942,7 +1072,7 @@ int main(int argc, char **argv) {
 
     if (!model_path) {
         fprintf(stderr, "Usage: %s <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
-        fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M]\n");
+        fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M] [--prompt-file PATH]\n");
         fprintf(stderr, "       [--verify-quant-kernels]   (standalone; no model needed)\n");
         fprintf(stderr, "       [--verify-moe-routing]     (standalone; no model needed)\n");
         fprintf(stderr, "       [--verify-glm5next-kda [HEAD_DIM]] (standalone)\n");
@@ -950,6 +1080,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "       [--bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]]   (standalone)\n");
         return 1;
     }
+
+    if (qwen4_mtp_trust) {
+        if (!qwen4_mtp || qwen4_exact) {
+            fprintf(stderr, "--qwen4-mtp-trust-draft requires approximate --qwen4-mtp\n");
+            return 2;
+        }
+        setenv("LLM_QWEN4_MTP_APPROX", "1", 1);
+        setenv("LLM_QWEN4_MTP_TRUST_DRAFT", "1", 1);
+        fprintf(stderr, "WARNING: trusted MTP is approximate; target verification is skipped and output quality is not guaranteed\n");
+        /* Keep the standalone trusted profile consistent with the tuned ROCm
+         * launcher, while preserving any caller-provided override. */
+        if (!getenv("LLM_QWEN4_APPROX_DECODE")) setenv("LLM_QWEN4_APPROX_DECODE", "1", 0);
+        if (!getenv("LLM_QWEN4_DEVICE_HITS_ONLY")) setenv("LLM_QWEN4_DEVICE_HITS_ONLY", "1", 0);
+        if (!getenv("LLM_QWEN4_DEVICE_REFRESH_INTERVAL")) setenv("LLM_QWEN4_DEVICE_REFRESH_INTERVAL", "32", 0);
+        if (!getenv("LLM_MOE_LFU_CACHE")) setenv("LLM_MOE_LFU_CACHE", "1", 0);
+        if (!getenv("LLM_MOE_COPY_PIPELINE")) setenv("LLM_MOE_COPY_PIPELINE", "1", 0);
+        if (!getenv("LLM_MOE_STREAM_SLOTS")) setenv("LLM_MOE_STREAM_SLOTS", "4", 0);
+    }
+    if (qwen4_mtp_adaptive) setenv("LLM_QWEN4_MTP_ADAPTIVE", "1", 1);
 
     /* Load GGUF */
     fprintf(stderr, "Loading GGUF: %s\n", model_path);
@@ -1016,7 +1165,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Vocab: %d tokens\n", vocab->n_tokens);
 
     /* Tokenize prompt. Buffer sized to hold a large --prefill-len pad. */
-    int tok_cap = (prefill_pad > 4096) ? (prefill_pad + 16) : 4096;
+    /* Long-context quality/stability runs must not silently truncate at the
+     * historical 4096-token scratch capacity.  Reserve enough room for the
+     * requested context and a small BOS/padding margin. */
+    int tok_cap = max_seq_len > 4096 ? max_seq_len + 16 : 4096;
+    if (prefill_pad > tok_cap - 16) tok_cap = prefill_pad + 16;
     int32_t *tokens = (int32_t *)malloc((size_t)tok_cap * sizeof(int32_t));
     if (!tokens) { fprintf(stderr, "tokens alloc failed\n"); return 1; }
     int n_tokens = bpe_tokenize(vocab, prompt, -1, tokens, tok_cap);
@@ -1053,6 +1206,15 @@ int main(int argc, char **argv) {
     if (bench_mode && max_tokens == 8) max_tokens = n_tokens;
     if (max_tokens > n_tokens) max_tokens = n_tokens;
 
+    /* Avoid loading a model-sized CPU shadow before reporting a missing AMD
+     * device.  The launchers perform the same guard, but this binary is also
+     * invoked directly by benchmarks and the HTTP backend. */
+    if (access("/dev/kfd", R_OK | W_OK) != 0) {
+        fprintf(stderr, "ROCm device unavailable: /dev/kfd is missing or inaccessible\n");
+        fprintf(stderr, "Expose AMD KFD/render nodes before running test_hip_llm\n");
+        return 1;
+    }
+
     /* Load CPU reference model (may fail for MoE -- run GPU-only in that case) */
     int gpu_only = 0;
     transformer_model *cpu_model = NULL;
@@ -1064,6 +1226,29 @@ int main(int argc, char **argv) {
         cpu_model = transformer_load(gguf, max_seq_len);
         if (!cpu_model) {
             fprintf(stderr, "CPU model load failed (MoE?), running GPU-only mode\n");
+            gpu_only = 1;
+        }
+    }
+
+    /* The Qwen4 NextN weights live in a standalone GGUF sidecar.  Attach and
+     * materialize them before closing the sidecar so the CPU shadow context
+     * can safely share the immutable tensor descriptors with the trunk. */
+    if (cpu_model && load_qwen4_nextn_fusion && !qwen4_mtp && !verify_qwen4_nextn) {
+        gguf_shards *nextn_sidecar = gguf_open_shards(load_qwen4_nextn_fusion, 2);
+        char nextn_error[192];
+        int nextn_rc = nextn_sidecar ? transformer_load_nextn_sidecar(
+            cpu_model, nextn_sidecar, nextn_error, sizeof(nextn_error)) : -1;
+        size_t nextn_bytes = nextn_rc == 0 ? transformer_materialize_nextn(cpu_model) : 0;
+        fprintf(stderr, "CPU Qwen4 NextN sidecar: %s%s%s%s (%.3f GB resident)\n",
+                nextn_rc == 0 && nextn_bytes != 0 ? "PASS" : "FAIL",
+                nextn_rc == 0 ? "" : " (",
+                nextn_rc == 0 ? "" : (nextn_sidecar ? nextn_error : "could not open sidecar"),
+                nextn_rc == 0 ? "" : ")",
+                (double)nextn_bytes / 1e9);
+        if (nextn_sidecar) gguf_close_shards(nextn_sidecar);
+        if (nextn_rc != 0 || nextn_bytes == 0) {
+            transformer_free(cpu_model);
+            cpu_model = NULL;
             gpu_only = 1;
         }
     }
@@ -1088,6 +1273,14 @@ int main(int argc, char **argv) {
     load_options.max_seq_len = max_seq_len;
     if (moe_cache_mb > 0) load_options.moe_cache_bytes = (uint64_t)moe_cache_mb << 20;
     if (moe_cpu_only) load_options.moe_mode = HIP_LLM_MOE_CPU;
+    if (qwen4_prefill_staging) load_options.qwen4_prefill_staging = 1;
+    if (qwen4_prefill_stage_mb > 0)
+        load_options.qwen4_prefill_stage_bytes = (uint64_t)qwen4_prefill_stage_mb << 20;
+    if (qwen4_batched_prefill) hip_llm_set_qwen4_batched_prefill(gpu, 1);
+    if(qwen4_mtp) {
+        hip_llm_qwen4_mtp_set_verify(gpu,qwen4_mtp_window);
+        hip_llm_qwen4_mtp_configure(gpu,(size_t)qwen4_mtp_cache_mb<<20,qwen4_mtp_draft);
+    }
     if (hip_llm_load_weights_sharded(gpu, gguf_model, &load_options) != 0) {
         fprintf(stderr, "Failed to load weights to GPU\n");
         hip_llm_free(gpu);
@@ -1097,6 +1290,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (qwen4_coding_profile) hip_llm_set_qwen4_coding_profile(gpu);
+    if (qwen4_exact && hip_llm_qwen4_exact_enable(gpu)) {
+        fprintf(stderr,"Qwen4 exact mode initialization failed\n");
+        hip_llm_free(gpu);
+        if(cpu_model)transformer_free(cpu_model);
+        bpe_vocab_free(vocab);gguf_close_shards(gguf_model);return 1;
+    }
     if (load_qwen4_nextn_fusion) {
         gguf_shards *sidecar = gguf_open_shards(load_qwen4_nextn_fusion, 2);
         char error[192];
@@ -1105,11 +1304,22 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Qwen4 NextN fusion load: %s%s%s\n", rc == 0 ? "PASS" : "FAIL",
                 rc == 0 ? "" : " (", rc == 0 ? "" : (sidecar ? error : "could not open sidecar"));
         if (rc != 0) fprintf(stderr, ")\n");
+        if (rc == 0 && verify_qwen4_nextn)
+            rc = hip_llm_verify_qwen4_nextn(gpu, sidecar, gguf_model, qwen4_mtp_draft);
         if (sidecar) gguf_close_shards(sidecar);
-        hip_llm_free(gpu);
-        if (cpu_model) transformer_free(cpu_model);
-        bpe_vocab_free(vocab); gguf_close_shards(gguf_model);
-        return rc == 0 ? 0 : 1;
+        if (rc == 0 && qwen4_mtp) rc = hip_llm_qwen4_mtp_enable(gpu);
+        if (rc == 0 && qwen4_mtp) rc = hip_llm_qwen4_mtp_set_verify(gpu,qwen4_mtp_window);
+        if (rc != 0 || !qwen4_mtp) {
+            hip_llm_free(gpu);
+            if (cpu_model) transformer_free(cpu_model);
+            bpe_vocab_free(vocab); gguf_close_shards(gguf_model);
+            return rc == 0 ? 0 : 1;
+        }
+    }
+    if (verify_qwen4_qsa) {
+        int rc=hip_llm_verify_qwen4_qsa(gpu);
+        hip_llm_free(gpu);if(cpu_model)transformer_free(cpu_model);
+        bpe_vocab_free(vocab);gguf_close_shards(gguf_model);return rc?1:0;
     }
     if (verify_glm5next_model) {
         double rel = 0.0, max_abs = 0.0;
@@ -1140,7 +1350,8 @@ int main(int argc, char **argv) {
 
     if (stdio_server) {
         int bos = prompt_bos_id(gguf);
-        pass = run_stdio_server(gpu, vocab, n_vocab, n_max_seq, bos) == 0;
+        pass = run_stdio_server(gpu, vocab, n_vocab, n_max_seq, bos,
+                                qwen4_mtp ? qwen4_mtp_draft : 0) == 0;
         hip_llm_free(gpu);
         if (cpu_model) transformer_free(cpu_model);
         bpe_vocab_free(vocab);
@@ -1159,6 +1370,14 @@ int main(int argc, char **argv) {
             if (decode_n < 0) decode_n = 0;
             fprintf(stderr, "Clamped decode to %d (max_seq_len=%d)\n", decode_n, n_max_seq);
         }
+
+        /* Keep the benchmark harness aligned with the server's Qwen4
+         * stateful-batch contract.  The runner uses the published request
+         * length to distinguish a single tile (safe to batch) from a
+         * multi-chunk request (scalar fallback unless explicitly forced).
+         * Without this setter every benchmark looked like an unknown long
+         * request and silently measured the scalar path. */
+        hip_llm_set_qwen4_batch_request_tokens(gpu, n_prefill);
 
         fprintf(stderr, "\n=== Bench: prefill=%d tokens, decode=%d tokens, n_embd=%d, n_vocab=%d ===\n",
                 n_prefill, decode_n, n_embd, n_vocab);
@@ -1208,12 +1427,30 @@ int main(int argc, char **argv) {
             if (!lg) { fprintf(stderr, "GPU prefill warmup %d failed\n", w); pass = 0; goto bench_done; }
         }
 
-        /* Prefill: a single forward_batch_logits call. Phase 1 implementation is a
-         * per-token loop; Phase 2 will swap in a true batched WMMA path. */
+        /* Prefill: normally one forward_batch_logits call.  The optional
+         * LLM_BENCH_STREAM_CHUNK mode models llama-server-style streamed
+         * prefill: each bounded chunk is submitted as its own validated batch
+         * call, while recurrent/KV state carries across calls.  This avoids
+         * asking the Qwen4 batched dispatcher to split one oversized request
+         * internally (that multi-chunk path is not safe on gfx1201). */
         hip_llm_reset_moe_stats(gpu);
         hip_llm_set_decode_mode(gpu, 0);
         double t_pf0 = get_time_ms();
-        float *last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+        float *last_logits = NULL;
+        int stream_chunk = 0;
+        const char *stream_chunk_env = getenv("LLM_BENCH_STREAM_CHUNK");
+        if (stream_chunk_env) stream_chunk = atoi(stream_chunk_env);
+        if (stream_chunk < 1 || stream_chunk >= n_prefill) stream_chunk = 0;
+        if (stream_chunk > 0) {
+            for (int off = 0; off < n_prefill; off += stream_chunk) {
+                int cc = n_prefill - off;
+                if (cc > stream_chunk) cc = stream_chunk;
+                last_logits = hip_llm_forward_batch_logits(gpu, tokens + off, cc, off);
+                if (!last_logits) break;
+            }
+        } else {
+            last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+        }
         if (!last_logits) { fprintf(stderr, "GPU forward_batch_logits failed\n"); pass = 0; goto bench_done; }
         seen = coding_mode ? (unsigned char *)calloc((size_t)n_vocab, 1) : NULL;
         unsigned sample_rng = 0x51f15e5du;
@@ -1224,11 +1461,17 @@ int main(int argc, char **argv) {
         double t_pf1 = get_time_ms();
         double prefill_ms = t_pf1 - t_pf0;
         double prefill_tps = (prefill_ms > 0.0) ? (1000.0 * n_prefill / prefill_ms) : 0.0;
+        hip_llm_moe_stats prefill_moe = {0};
+        hip_llm_get_moe_stats(gpu, &prefill_moe);
 
         /* Decode: greedy-sample decode_n tokens. */
         double decode_ms = 0.0, decode_tps = 0.0;
         int decoded = 0;
         int first_decode_tok = next_tok;
+        if(qwen4_mtp_check && (!qwen4_mtp || coding_mode ||
+            hip_llm_verify_qwen4_mtp(gpu,next_tok,n_prefill,qwen4_mtp_draft))) {
+            fprintf(stderr,"Qwen4 MTP transaction check failed\n");pass=0;goto bench_done;
+        }
         uint64_t decode_hash = 1469598103934665603ULL;
         if (decode_n > 0) {
             hip_llm_reset_moe_stats(gpu);
@@ -1236,17 +1479,50 @@ int main(int argc, char **argv) {
             int gen_text = (getenv("LLM_GEN_TEXT") != NULL);
             if (gen_text) fprintf(stderr, "\n=== Generated text ===\n%s", bpe_token_to_str(vocab, next_tok));
             double t_dec0 = get_time_ms();
+            int mtp_approx_fallback = 0;
+            int mtp_adaptive_fallback = 0;
             for (int k = 0; k < decode_n; k++) {
+                if (qwen4_mtp && !coding_mode && !mtp_approx_fallback && !mtp_adaptive_fallback) {
+                    hip_llm_qwen4_mtp_result mtp;
+                    if (hip_llm_qwen4_mtp_step(gpu, next_tok, n_prefill+k,
+                            qwen4_mtp_draft, decode_n-k, NULL, 0, &mtp)) {
+                        fprintf(stderr, "GPU MTP failed at decode k=%d\n", k); pass=0; break;
+                    }
+                    for (int i=0;i<mtp.emitted;++i) {
+                        decode_hash ^= (uint32_t)mtp.tokens[i]; decode_hash *= 1099511628211ULL;
+                        if (gen_text) { const char *s=bpe_token_to_str(vocab,mtp.tokens[i]); if(s)fprintf(stderr,"%s",s); }
+                    }
+                    decoded += mtp.emitted; k += mtp.emitted-1; next_tok=mtp.pending;
+                    fprintf(stderr,"MTP backend=%s drafted=%d accepted=%d emitted=%d draft_ms=%.3f verify_ms=%.3f\n",
+                            getenv("LLM_QWEN4_MTP_TRUST_DRAFT") ? "hip-approx" : "hip",
+                            mtp.drafted,mtp.accepted,mtp.emitted,mtp.draft_ms,mtp.verify_ms);
+                    if (getenv("LLM_QWEN4_MTP_APPROX") && mtp.drafted > 0 && mtp.accepted == 0) {
+                        mtp_approx_fallback = 1;
+                        fprintf(stderr, "MTP approximate acceptance=0; falling back to target decode\n");
+                    }
+                    if (getenv("LLM_QWEN4_MTP_ADAPTIVE") && mtp.drafted > 0 &&
+                        mtp.accepted * 2 < mtp.drafted) {
+                        mtp_adaptive_fallback = 1;
+                        fprintf(stderr, "MTP acceptance=%d/%d; adaptive target fallback\n",
+                                mtp.accepted, mtp.drafted);
+                    }
+                    continue;
+                }
                 decode_hash ^= (uint32_t)next_tok;
                 decode_hash *= 1099511628211ULL;
                 int pos = n_prefill + k;
-                float *lg = hip_llm_forward_logits(gpu, next_tok, pos);
-                if (!lg) { fprintf(stderr, "GPU forward_logits failed at decode k=%d\n", k); pass = 0; break; }
-                if (seen && next_tok >= 0 && next_tok < n_vocab) seen[next_tok] = 1;
-                next_tok = coding_mode ? sample_top_k_p(lg, n_vocab, 20, 0.80f,
-                                                        0.70f, 1.50f, 1.0f, 0.0f, seen,
-                                                        &sample_rng)
-                                       : argmax_logits(lg, n_vocab);
+                if (!coding_mode) {
+                    int arg = hip_llm_forward_argmax(gpu, next_tok, pos);
+                    if (arg < 0) { fprintf(stderr, "GPU forward_argmax failed at decode k=%d\n", k); pass = 0; break; }
+                    next_tok = arg;
+                } else {
+                    float *lg = hip_llm_forward_logits(gpu, next_tok, pos);
+                    if (!lg) { fprintf(stderr, "GPU forward_logits failed at decode k=%d\n", k); pass = 0; break; }
+                    if (seen && next_tok >= 0 && next_tok < n_vocab) seen[next_tok] = 1;
+                    next_tok = sample_top_k_p(lg, n_vocab, 20, 0.80f,
+                                              0.70f, 1.50f, 1.0f, 0.0f, seen,
+                                              &sample_rng);
+                }
                 decoded++;
                 if (gen_text) { const char *s = bpe_token_to_str(vocab, next_tok); if (s) fprintf(stderr, "%s", s); }
             }
@@ -1255,6 +1531,50 @@ int main(int argc, char **argv) {
             hip_llm_set_decode_mode(gpu, 0);
             decode_ms = t_dec1 - t_dec0;
             decode_tps = (decode_ms > 0.0) ? (1000.0 * decoded / decode_ms) : 0.0;
+        }
+
+        /* CPU reference MTP smoke/transaction path.  This intentionally runs
+         * beside the GPU benchmark until the GPU NextN kernels are available;
+         * it proves sidecar loading, chaining, target rollback, and exact
+         * greedy acceptance on the real model. */
+        if (cpu_model && cpu_model->nextn.loaded && decode_n > 0) {
+            transformer_model *nextn_ctx = transformer_nextn_context_create(cpu_model, 1);
+            int mtp_ok = nextn_ctx != NULL;
+            int32_t mtp_token = -1;
+            if (mtp_ok) {
+                for (int i = 0; i < n_prefill; i++) {
+                    float *cpu_logits = transformer_forward_logits(cpu_model, tokens[i], i);
+                    if (!cpu_logits) {
+                        mtp_ok = 0; break;
+                    }
+                    if (i == n_prefill - 1)
+                        mtp_token = argmax_logits(cpu_logits, n_vocab);
+                }
+            }
+            int mtp_accepted = 0, mtp_emitted = 0;
+            double mtp_ms = get_time_ms();
+            if (mtp_ok) {
+                int pos = n_prefill;
+                for (int k = 0; k < decode_n; ) {
+                    int accepted = 0;
+                    int32_t replacement = -1;
+                    int rc = transformer_nextn_speculate_greedy(
+                        cpu_model, nextn_ctx, mtp_token, pos, qwen4_mtp_draft,
+                        &accepted, &replacement);
+                    if (rc < 0 || replacement < 0) { mtp_ok = 0; break; }
+                    mtp_accepted += accepted;
+                    mtp_emitted += accepted + (accepted < 4 ? 1 : 0);
+                    mtp_token = replacement;
+                    pos += accepted + (accepted < 4 ? 1 : 0);
+                    k = pos - n_prefill;
+                }
+            }
+            mtp_ms = get_time_ms() - mtp_ms;
+            fprintf(stderr, "CPU MTP: %s accepted=%d emitted=%d draft=%d time=%.1f ms\n",
+                    mtp_ok ? "PASS" : "FAIL", mtp_accepted, mtp_emitted,
+                    qwen4_mtp_draft, mtp_ms);
+            transformer_nextn_context_free(nextn_ctx);
+            if (!mtp_ok) pass = 0;
         }
 
         fprintf(stderr, "\n=== Bench results ===\n");
@@ -1267,17 +1587,60 @@ int main(int argc, char **argv) {
                     decoded > 0 ? decode_ms / decoded : 0.0);
             fprintf(stderr, "First decoded token id=%d, last id=%d, sequence hash=%016llx\n",
                     first_decode_tok, next_tok, (unsigned long long)decode_hash);
+            double request_ms = prefill_ms + decode_ms;
+            int request_tokens = n_prefill + decoded;
+            fprintf(stderr, "End-to-end: %d prompt + %d generated tokens in %.2f ms  -> %.2f tok/s (prefill + decode, warm model)\n",
+                    n_prefill, decoded, request_ms,
+                    request_ms > 0.0 ? 1000.0 * request_tokens / request_ms : 0.0);
         }
         {
             hip_llm_moe_stats ms;
-            if (hip_llm_get_moe_stats(gpu, &ms) == 0 &&
-                ms.cache_hits + ms.cache_misses > 0) {
+            int live_ok = hip_llm_get_moe_stats(gpu, &ms) == 0;
+            int have_pf = prefill_moe.cache_hits + prefill_moe.cache_misses > 0;
+            int have_live = live_ok && ms.cache_hits + ms.cache_misses > 0;
+            /* Decode resets the live counters at its start. Keep the two
+             * phases separate so a prefill miss burst cannot hide steady
+             * decode residency (and vice versa). */
+            if (have_pf || have_live) {
+                if (have_pf) {
+                    hip_llm_moe_stats pf = prefill_moe;
+                    double hit = 100.0 * (double)pf.cache_hits /
+                                 (double)(pf.cache_hits + pf.cache_misses);
+                    fprintf(stderr, "MoE cache: %.1f%% hit (%llu/%llu), H2D %.2f GiB, stage %.2f GiB / %llu waves / %llu promotions / %llu fallbacks, CPU-time %.2f ms\n", hit,
+                            (unsigned long long)pf.cache_hits,
+                            (unsigned long long)(pf.cache_hits + pf.cache_misses),
+                            pf.h2d_bytes / (double)(1ULL << 30),
+                            pf.stage_h2d_bytes / (double)(1ULL << 30),
+                            (unsigned long long)pf.stage_waves,
+                            (unsigned long long)pf.stage_promotions,
+                            (unsigned long long)pf.stage_fallbacks, pf.cpu_ms);
+                }
+                if (have_live && decode_n > 0) {
+                    double hit = 100.0 * (double)ms.cache_hits /
+                                 (double)(ms.cache_hits + ms.cache_misses);
+                    fprintf(stderr, "MoE decode cache: %.1f%% hit (%llu/%llu), H2D %.2f GiB, stage %.2f GiB / %llu waves / %llu promotions / %llu fallbacks, CPU-time %.2f ms\n", hit,
+                            (unsigned long long)ms.cache_hits,
+                            (unsigned long long)(ms.cache_hits + ms.cache_misses),
+                            ms.h2d_bytes / (double)(1ULL << 30),
+                            ms.stage_h2d_bytes / (double)(1ULL << 30),
+                            (unsigned long long)ms.stage_waves,
+                            (unsigned long long)ms.stage_promotions,
+                            (unsigned long long)ms.stage_fallbacks, ms.cpu_ms);
+                }
+                /* Preserve the historical single-line label for callers that
+                 * only run a prefill or inspect the benchmark footer. */
+                if (!have_pf && have_live) {
                 double hit = 100.0 * (double)ms.cache_hits /
                              (double)(ms.cache_hits + ms.cache_misses);
-                fprintf(stderr, "MoE cache: %.1f%% hit (%llu/%llu), H2D %.2f GiB, CPU-time %.2f ms\n", hit,
+                fprintf(stderr, "MoE cache: %.1f%% hit (%llu/%llu), H2D %.2f GiB, stage %.2f GiB / %llu waves / %llu promotions / %llu fallbacks, CPU-time %.2f ms\n", hit,
                         (unsigned long long)ms.cache_hits,
                         (unsigned long long)(ms.cache_hits + ms.cache_misses),
-                        ms.h2d_bytes / (double)(1ULL << 30), ms.cpu_ms);
+                        ms.h2d_bytes / (double)(1ULL << 30),
+                        ms.stage_h2d_bytes / (double)(1ULL << 30),
+                        (unsigned long long)ms.stage_waves,
+                        (unsigned long long)ms.stage_promotions,
+                        (unsigned long long)ms.stage_fallbacks, ms.cpu_ms);
+                }
             }
         }
         fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
@@ -1353,6 +1716,7 @@ bench_done:
     if (cpu_model) transformer_free(cpu_model);
     bpe_vocab_free(vocab);
     gguf_close_shards(gguf_model);
+    free(prompt_owned);
 
     return pass ? 0 : 1;
 }
