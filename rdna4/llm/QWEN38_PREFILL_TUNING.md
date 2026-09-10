@@ -925,3 +925,8 @@ tok/s. The benchmark now exposes `LLM_QWEN4_PREFILL_STAGE_MB` for cards with
 more VRAM, but 512 MiB remains the 16-GiB setting. Per-layer Qwen HIP graph
 replay was faster in one simple run, but changed the coding-prompt sequence
 hash; it remains disabled for exact production decoding.
+
+A prototype K-parallel Q5_1 down kernel (one warp per selected expert) was
+also rejected. It expanded the grid from output-row tiles to one block per
+row and measured only `10.64` decode tok/s at 4K, with a changed sequence
+hash. The existing row-parallel kernel therefore remains the exact path.
