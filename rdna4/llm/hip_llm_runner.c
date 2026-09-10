@@ -16566,7 +16566,10 @@ static void hllm_cpu_qwen4_decode_jobs(hip_llm_runner *r, hip_layer *cl,
 #pragma omp for schedule(static)
 #endif
         for (int task = 0; task < jobs * ff; ++task) {
-            int row = task / jobs, j = task % jobs, e = ids[j];
+            /* Expert-major traversal keeps each selected matrix contiguous in
+             * the CPU caches; the previous row-major order interleaved up to
+             * ten independent weight streams for every row. */
+            int j = task / ff, row = task % ff, e = ids[j];
             const unsigned char *gw = (const unsigned char *)cl->moe_gate_exps_host +
                                       (size_t)e * cl->moe_exp_stride_gu + (size_t)row * gur;
             const unsigned char *uw = (const unsigned char *)cl->moe_up_exps_host +
@@ -16590,7 +16593,7 @@ static void hllm_cpu_qwen4_decode_jobs(hip_llm_runner *r, hip_layer *cl,
 #pragma omp for schedule(static)
 #endif
         for (int task = 0; task < jobs * ne; ++task) {
-            int row = task / jobs, j = task % jobs, e = ids[j];
+            int j = task / ne, row = task % ne, e = ids[j];
             const unsigned char *dw = (const unsigned char *)cl->moe_down_exps_host +
                                       (size_t)e * cl->moe_exp_stride_d + (size_t)row * dnr;
             float *out = r->h_moe_tmp + (size_t)j * ne;

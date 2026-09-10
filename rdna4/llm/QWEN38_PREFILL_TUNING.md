@@ -889,6 +889,12 @@ control hash.  It is not quality-safe in general: the UTF-8 coding prompt fell
 to `7.93` decode tok/s and produced hash `bb602f2deee2e5e7`, so the diagnostic
 script keeps the exact `0.0` threshold by default.
 
+The exact CPU cold-miss dot-product loops now traverse selected experts
+expert-major rather than interleaving every expert on each output row. This
+preserves the per-row arithmetic and greedy hash, while improving a matched
+4K/64 sample from `23.96` to `24.50` decode tok/s; 128-token runs remain
+cache-variance limited.
+
 Exact-mode A/B tests can use `LLM_QWEN4_EXACT_CPU_MIN_WEIGHT=<threshold>`
 without changing the default. At 4K, thresholds through `0.5` retained the
 simple greedy hash but reached only `28.3` tok/s; `0.8` did not improve it.
