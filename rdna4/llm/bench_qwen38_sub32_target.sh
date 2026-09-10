@@ -20,13 +20,16 @@ prompt="${QWEN38_SUB32_PROMPT:-}"
 mkdir -p "${root_dir}/tmp"
 extra_args=()
 if [[ -n "${prompt}" ]]; then extra_args+=( -t "${prompt}" ); fi
+if [[ "${QWEN38_PREFILL_STAGING:-0}" != 0 ]]; then
+    extra_args+=( --qwen4-prefill-staging )
+fi
 
 # Host routing is slower than GPU top-k but deterministic; GPU top-k caused
 # run-to-run route/hash changes on gfx1201 in this parity experiment.
 env \
     LLM_MOE_CPU_LIB="${cpu_lib}" \
-    LLM_MOE_CPU_DECODE_MISSES=1 \
-    LLM_QWEN4_EXACT_CPU_MISSES=1 \
+    LLM_MOE_CPU_DECODE_MISSES="${LLM_MOE_CPU_DECODE_MISSES:-1}" \
+    LLM_QWEN4_EXACT_CPU_MISSES="${LLM_QWEN4_EXACT_CPU_MISSES:-1}" \
     LLM_MOE_CPU_MIN_WEIGHT="${LLM_MOE_CPU_MIN_WEIGHT:-0.0}" \
     LLM_QWEN4_KV_QUANT=none \
     LLM_MOE_CACHE_MB="${cache_mb}" \
@@ -39,6 +42,8 @@ env \
     LLM_QWEN4_EXACT_GPU_TOPK="${LLM_QWEN4_EXACT_GPU_TOPK:-0}" \
     LLM_QWEN4_BATCH=1 \
     LLM_QWEN4_BATCH_STATEFUL=1 \
+    LLM_QWEN4_BATCH_MULTI_CHUNK="${LLM_QWEN4_BATCH_MULTI_CHUNK:-1}" \
+    LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE="${LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE:-1}" \
     LLM_QWEN4_BATCH_SSM=1 \
     LLM_QWEN4_BATCH_ATTN_MAX_LAYER=47 \
     LLM_QWEN4_NATIVE_BATCH_QKV=1 \
@@ -47,8 +52,8 @@ env \
     LLM_SSM_BATCH_RECURRENCE=1 \
     LLM_SSM_BATCH_PARITY=1 \
     LLM_SSM_BATCH_WARP=0 \
-    LLM_QWEN4_PREFILL_CACHE_BALANCE=1 \
-    LLM_MOE_GROUPED_PREFILL=0 \
+    LLM_QWEN4_PREFILL_CACHE_BALANCE="${LLM_QWEN4_PREFILL_CACHE_BALANCE:-1}" \
+    LLM_MOE_GROUPED_PREFILL="${LLM_MOE_GROUPED_PREFILL:-0}" \
     LLM_HC_GRAPHS=0 \
     LLM_QWEN_PRE_GRAPHS=0 \
     LLM_QWEN4_PRE_GRAPHS=0 \

@@ -827,6 +827,62 @@ runs with the stable hash.  The target script now defaults to 17 threads;
 18-thread repeats changed the route hash and fell to `23.65` tok/s, so higher
 thread counts are not promoted.
 
+For the true 4K multi-chunk path, disabling exact CPU cold misses moved work to
+the GPU but reduced decode from `24.02` to `22.61` tok/s (same hash), confirming
+that the remaining decode cost is expert-cache churn/H2D rather than CPU
+threading alone.  The script now exposes both CPU-miss gates for controlled
+comparisons while retaining exact CPU misses by default.
+
+Reducing BMAX to 512 did not provide a larger stable cache: 8.7–9.0 GiB cache
+attempts failed with allocation/segmentation faults on gfx1201.  The stable
+8.5 GiB/BMAX=1024 combination remains the practical 16-GiB limit.
+
+At 4K, CPU miss thresholds of 0.2–0.5 removed the 535 ms CPU refill time but
+only reached about `28.3` decode tok/s because GPU cache misses still dominate.
+GPU top-k and mapped-host misses were also slower (`24.33` and `23.31` tok/s),
+so neither is promoted.
+
+A 128-token steady-state decode sample after the 4K prefill measured `28.47`
+tok/s, confirming the deficit persists beyond the first-token handoff.
+
+Disabling the MoE copy pipeline and varying stream slots (1/2/4) was neutral:
+the 128-token decode stayed at `28.55`–`28.58` tok/s with the same hash.  The
+copy stream is therefore not the remaining limiter.
+
+The broader opt-in approximate decode (`LLM_QWEN4_APPROX_DECODE=1`) reached
+`32.59` tok/s for a 128-token simple decode after 4K prefill and preserved that
+simple hash.  It is not quality-safe: on the coding prompt its hash was
+`cd085d716003cbcd` versus the exact `b63472f63a723cc9`.  Keep it explicitly
+opt-in; the exact default remains below 30 tok/s.
+
+The CPU-prefill low-count experiment (`LLM_MOE_CPU_PREFILL_MAX_COUNT=4`) did
+not activate for the batched path: CPU time remained zero and H2D traffic was
+unchanged.  LFU retention was also counterproductive at 4K (`22.35` tok/s,
+888 GiB H2D versus 643 GiB for LRU), so LRU remains the prefill policy.
+
+The optional staged expert-bank path was also checked.  At the 8.5-GiB cache
+budget its staging allocation was unavailable and transparently fell back to
+cache-only prefill; reducing the cache to 7 GiB failed weight allocation before
+the stage could be used.  The script exposes `QWEN38_PREFILL_STAGING=1` for
+future cards with additional VRAM, but it is not a 16-GiB production setting.
+
+The important long-request gate was then corrected: `forward_batch_logits()`
+intentionally falls back to scalar for requests longer than BMAX unless
+`LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE=1` is set.  The target script now enables
+that explicit stateful multi-chunk path by default.  At 4,096 tokens it measured
+`158.71` prefill tok/s with `53.30 GiB` H2D and the same stable hash, versus
+`25.34` tok/s and `643 GiB` H2D in the scalar fallback.  Decode was `24.02`
+tok/s, so long-context decode still needs separate cache/refill work.
+
+Long-context validation exposed a separate limit: with the current exact
+Q6_K/SSM path, a 4,096-token prefill measured only `25.34` tok/s at BMAX=1024
+and `22.39` tok/s at BMAX=2048 (7-GiB cache).  The latter uploaded `875 GiB`
+of expert data with an 84.6% cache-hit rate.  A 5-GiB BMAX=2048 cache measured
+`18.16` tok/s, and disabling cache balancing or enabling grouped prefill did not
+improve it.  BMAX, chunk size, cache balance, and grouped-prefill are now
+explicit script overrides for further investigation; the safe 1K target
+profile remains unchanged.
+
 An optional `LLM_MOE_CPU_MIN_WEIGHT=0.2` control reduced the same simple
 prompt to fewer CPU misses and reached `37.22` decode tok/s while retaining its
 control hash.  It is not quality-safe in general: the UTF-8 coding prompt fell
