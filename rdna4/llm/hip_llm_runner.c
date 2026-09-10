@@ -17301,14 +17301,13 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                 if (pipe_misses)
                     hipEventRecord(r->moe_copy_ready[miss_count], r->moe_copy_stream);
                 int old_e = cl->moe_cache_ids[slot];
-                if (old_e >= 0 && old_e != e) {
+                if (!cpu_decode_misses && old_e >= 0 && old_e != e) {
                     /* Do not queue an async H2D copy from a stack temporary:
                      * the device-side cache path consumes this map after this
                      * loop has returned.  All-bits-one is the representation
                      * of the invalid (-1) slot. */
                     hipMemsetAsync(cl->d_moe_cache_map + old_e, 0xff,
-                                   sizeof(int), cpu_decode_misses ?
-                                   r->moe_copy_stream : r->stream);
+                                   sizeof(int), r->stream);
                 }
                 cl->moe_cache_ids[slot] = cpu_decode_misses ? -2 : e;
                 cl->moe_cache_freq[slot] = 0;
@@ -17319,12 +17318,10 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
                     cl->moe_pending_slot = slot;
                     cl->moe_pending_expert = e;
                 }
-                const int *map_slot_src = cpu_decode_misses ?
-                    &cl->moe_pending_slot : &top_slots[sel];
-                hipMemcpyAsync(cl->d_moe_cache_map + e, map_slot_src, sizeof(slot),
-                               hipMemcpyHostToDevice, cpu_decode_misses ?
-                               r->moe_copy_stream : r->stream);
-                if (cpu_decode_misses) {
+                if (!cpu_decode_misses) {
+                    hipMemcpyAsync(cl->d_moe_cache_map + e, &top_slots[sel],
+                                   sizeof(slot), hipMemcpyHostToDevice, r->stream);
+                } else {
                     hipEventRecord(r->moe_copy_ready[layer_idx], r->moe_copy_stream);
                 }
                 r->moe_stats.cache_misses++;
