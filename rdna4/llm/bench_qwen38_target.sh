@@ -23,6 +23,9 @@ set -euo pipefail
 #   batch-cpu     same but with the mixed CPU/GPU cold-expert path (diagnostic:
 #                 its arithmetic differs from the GPU path, so in-process
 #                 repeats can hash-differ even though fresh processes match)
+#   batch4k       deterministic single-dispatch 4K profile (BMAX=4096, no
+#                 multi-chunk carry, pinned host, 5-GiB cache, GPU top-k,
+#                 direct copies, expert cache reset per repeat)
 #   approx        resident-hit approximate decode (quality-changing; explicit)
 #
 # Examples:
@@ -84,6 +87,7 @@ fi
 # turns these on by default; other profiles keep the parity-safe scalar bodies.
 # The Q6_K SSM projections + fused recurrence are what make batched prefill
 # fast, and they change arithmetic order (diagnostic until parity is proven).
+copy_pipeline="${LLM_MOE_COPY_PIPELINE:-0}"
 native_batch_qkv="${LLM_QWEN4_NATIVE_BATCH_QKV:-0}"
 ssm_batch_q6k="${LLM_SSM_BATCH_Q6K:-0}"
 ssm_batch_conv="${LLM_SSM_BATCH_CONV:-0}"
@@ -141,6 +145,32 @@ case "${profile}" in
             cpu_decode_misses="${LLM_MOE_CPU_DECODE_MISSES:-1}"
         fi
         ;;
+    batch4k)
+        # Deterministic single-dispatch 4K profile: one 4096-row batched prefill
+        # (no multi-chunk state carry), pinned host weights, async cold uploads,
+        # GPU router top-k, and a 5000-MiB resident cache on the 16-GiB card.
+        cache_mb="${QWEN38_MOE_CACHE_MB:-5000}"
+        bmax="${LLM_BMAX:-4096}"
+        register_host="${LLM_MOE_REGISTER_HOST:-1}"
+        gpu_topk="${LLM_QWEN4_PREFILL_GPU_TOPK:-1}"
+        qwen_batch="${LLM_QWEN4_BATCH:-1}"
+        batch_ssm="${QWEN38_TARGET_BATCH_SSM:-1}"
+        attn_max="${QWEN38_TARGET_ATTN_MAX_LAYER:-47}"
+        approx_decode="${LLM_QWEN4_APPROX_DECODE:-0}"
+        device_hits_only="${LLM_QWEN4_DEVICE_HITS_ONLY:-0}"
+        refresh="${LLM_QWEN4_DEVICE_REFRESH_INTERVAL:-2}"
+        stream_chunk="${LLM_BENCH_STREAM_CHUNK:-0}"
+        # The async cold-upload pipeline is faster (~147 vs ~132 prefill) but
+        # leaves copy events/state across repeats, so the deterministic default
+        # uses direct copies.  Set LLM_MOE_COPY_PIPELINE=1 for speed sweeps.
+        copy_pipeline="${LLM_MOE_COPY_PIPELINE:-0}"
+        native_batch_qkv="${LLM_QWEN4_NATIVE_BATCH_QKV:-1}"
+        ssm_batch_q6k="${LLM_SSM_BATCH_Q6K:-1}"
+        ssm_batch_conv="${LLM_SSM_BATCH_CONV:-1}"
+        ssm_batch_recur="${LLM_SSM_BATCH_RECURRENCE:-1}"
+        ssm_batch_parity="${LLM_SSM_BATCH_PARITY:-1}"
+        ssm_batch_warp="${LLM_SSM_BATCH_WARP:-0}"
+        ;;
     approx)
         cache_mb="${QWEN38_MOE_CACHE_MB:-7200}"
         bmax="${LLM_BMAX:-512}"
@@ -155,7 +185,7 @@ case "${profile}" in
         stream_chunk="${LLM_BENCH_STREAM_CHUNK:-512}"
         ;;
     *)
-        echo "unknown QWEN38_TARGET_PROFILE=${profile} (use scalar-exact, fast, batch, approx)" >&2
+        echo "unknown QWEN38_TARGET_PROFILE=${profile} (use scalar-exact, fast, batch, batch-cpu, batch4k, approx)" >&2
         exit 2
         ;;
 esac
@@ -175,11 +205,11 @@ if [[ "${profile}" == "batch" || "${profile}" == "batch-cpu" ]]; then
 fi
 
 if [[ "${QWEN38_DRY_RUN:-0}" != "0" ]]; then
-    printf 'target gate profile: profile=%s prefill=%s decode=%s context=%s repeats=%s cache_mb=%s bmax=%s batch=%s batch_ssm=%s attn_max=%s gpu_topk=%s approx=%s coding=%s stream_chunk=%s q6k=%s recur=%s conv=%s parity=%s native_qkv=%s multi=%s stateful=%s force_multi=%s cpu_prefill_jobs=%s cpu_decode_misses=%s\n' \
+    printf 'target gate profile: profile=%s prefill=%s decode=%s context=%s repeats=%s cache_mb=%s bmax=%s batch=%s batch_ssm=%s attn_max=%s gpu_topk=%s approx=%s coding=%s stream_chunk=%s q6k=%s recur=%s conv=%s parity=%s native_qkv=%s multi=%s stateful=%s force_multi=%s cpu_prefill_jobs=%s cpu_decode_misses=%s copy=%s\n' \
         "${profile}" "${prefill}" "${decode}" "${context}" "${repeats}" "${cache_mb}" \
         "${bmax}" "${qwen_batch}" "${batch_ssm}" "${attn_max}" "${gpu_topk}" "${approx_decode}" "${coding}" "${stream_chunk:-auto}" \
         "${ssm_batch_q6k}" "${ssm_batch_recur}" "${ssm_batch_conv}" "${ssm_batch_parity}" "${native_batch_qkv}" \
-        "${multi_chunk}" "${stateful}" "${force_multi}" "${cpu_prefill_jobs}" "${cpu_decode_misses}"
+        "${multi_chunk}" "${stateful}" "${force_multi}" "${cpu_prefill_jobs}" "${cpu_decode_misses}" "${copy_pipeline}"
     exit 0
 fi
 
@@ -242,7 +272,7 @@ timeout --foreground "${run_timeout}s" env \
     LLM_MOE_CACHE_MB="${cache_mb}" \
     LLM_BMAX="${bmax}" \
     LLM_MOE_CHUNK="${LLM_MOE_CHUNK:-${bmax}}" \
-    LLM_MOE_COPY_PIPELINE="${LLM_MOE_COPY_PIPELINE:-0}" \
+    LLM_MOE_COPY_PIPELINE="${copy_pipeline}" \
     LLM_MOE_STREAM_SLOTS="${LLM_MOE_STREAM_SLOTS:-2}" \
     LLM_MOE_LFU_CACHE="${LLM_MOE_LFU_CACHE:-0}" \
     LLM_QWEN4_PREFILL_GPU_TOPK="${gpu_topk}" \
@@ -263,6 +293,7 @@ timeout --foreground "${run_timeout}s" env \
     LLM_MOE_GROUPED_PREFILL="${LLM_MOE_GROUPED_PREFILL:-0}" \
     LLM_MOE_CPU_DECODE_MISSES="${cpu_decode_misses}" \
     LLM_MOE_CPU_PREFILL_MAX_JOBS="${cpu_prefill_jobs}" \
+    LLM_QWEN4_RESET_MOE_CACHE="${LLM_QWEN4_RESET_MOE_CACHE:-1}" \
     LLM_QWEN4_APPROX_DECODE="${approx_decode}" \
     LLM_QWEN4_DEVICE_HITS_ONLY="${device_hits_only}" \
     LLM_QWEN4_DEVICE_REFRESH_INTERVAL="${refresh}" \

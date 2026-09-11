@@ -193,6 +193,30 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
 - The scalar `fast` route remains repeatable (3/3, hash `6d67721190bdaa83`) but
   only ~24 tok/s prefill at 4K.
 
+### Deterministic 4K batched profile (`batch4k`)
+
+A single 4,096-token batched dispatch fits on the 16-GiB card with BMAX=4096
+and a 5,000-MiB resident cache (peak 14,786 MiB). `bench_qwen38_target.sh
+batch4k` wraps it: pinned host weights, GPU router top-k, direct copies, CPU
+experts off, and `LLM_QWEN4_RESET_MOE_CACHE=1`. Three repeats pass with the
+same hash `afdf60ceeb4f0103` and first token 16 at **median 131.9 prefill /
+20.9 decode / 121.9 end-to-end tok/s** (prefill min 122.3).
+
+Two state-isolation findings drove the profile:
+
+- Expert-cache residency changes the result even with CPU experts off: the
+  first repeat after load differed from later repeats that inherited cache
+  residency. `hip_llm_reset_state` now clears the routed-expert cache under
+  `LLM_QWEN4_RESET_MOE_CACHE=1`, so every repeat/request starts cold.
+- The asynchronous cold-upload pipeline (`LLM_MOE_COPY_PIPELINE=1`) lifts
+  prefill to ~147 tok/s but leaves copy state across repeats and produced a
+  1-in-3 hash divergence; the deterministic default uses direct copies
+  (`~132` tok/s). This is a real request-isolation gap for the pipeline.
+
+Multi-chunk prefills (`prefill > BMAX`) still need the scalar fallback or a
+separate determinism fix; single-chunk 4K is the largest reproducible,
+repeatable batched production profile today.
+
 The shared-memory `atomicAdd(&head_sq[head], ...)` in
 `fused_ssm_out_gated_q6k` is order-dependent but decode-only; the batched SSM
 norm uses the deterministic tree reduction in `gated_rmsnorm_silu_batch_f32`.

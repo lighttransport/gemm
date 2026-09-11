@@ -24461,10 +24461,35 @@ void hip_llm_reset_state(hip_llm_runner *r) {
     }
     hip_llm_set_decode_mode(r, 0);
     if (r->is_qwen4exp && r->layers) {
-        for (int l = 0; l < r->n_layers; ++l)
-            if (r->layers[l].moe_prefill_score)
-                memset(r->layers[l].moe_prefill_score, 0,
+        /* Expert-cache residency changes cold/warm kernel selection, so a
+         * repeated request in the same process can hash-differ from a
+         * fresh-process run.  LLM_QWEN4_RESET_MOE_CACHE=1 makes every reset
+         * (repeat/request) start from an empty cache for request isolation. */
+        const char *reset_moe_env = getenv("LLM_QWEN4_RESET_MOE_CACHE");
+        int reset_moe_cache = reset_moe_env && atoi(reset_moe_env) != 0;
+        for (int l = 0; l < r->n_layers; ++l) {
+            hip_layer *cl = &r->layers[l];
+            if (cl->moe_prefill_score)
+                memset(cl->moe_prefill_score, 0,
                        (size_t)r->n_experts * sizeof(uint32_t));
+            if (!reset_moe_cache) continue;
+            cl->moe_pending_slot = -1;
+            cl->moe_pending_expert = -1;
+            cl->moe_cache_next = 0;
+            if (cl->moe_cache_ids)
+                for (int s = 0; s < cl->moe_cache_slots; ++s)
+                    cl->moe_cache_ids[s] = -1;
+            if (cl->moe_cache_age)
+                for (int s = 0; s < cl->moe_cache_slots; ++s)
+                    cl->moe_cache_age[s] = 0;
+            if (cl->moe_cache_freq)
+                for (int s = 0; s < cl->moe_cache_slots; ++s)
+                    cl->moe_cache_freq[s] = 0;
+            if (cl->d_moe_cache_map)
+                hipMemset(cl->d_moe_cache_map, 0xff,
+                          (size_t)r->n_experts * sizeof(int));
+        }
+        if (reset_moe_cache) r->moe_cache_clock = 0;
     }
     if (r->ple_n_heads > 0) {
         r->ple_history[0] = r->ple_history[1] = r->ple_eos_token;
