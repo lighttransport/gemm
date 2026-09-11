@@ -146,10 +146,10 @@ expect_contains "${out}" 'batch=1'
 expect_contains "${out}" 'multi=0'
 expect_contains "${out}" 'force_multi=0'
 expect_contains "${out}" 'cpu_prefill_jobs=0'
-expect_contains "${out}" 'copy=0'
-out="$(QWEN38_DRY_RUN=1 LLM_MOE_COPY_PIPELINE=1 \
-    QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
 expect_contains "${out}" 'copy=1'
+out="$(QWEN38_DRY_RUN=1 LLM_MOE_COPY_PIPELINE=0 \
+    QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
+expect_contains "${out}" 'copy=0'
 # Ordered MoE combine and synchronous CPU-result publication.
 grep -q 'moe_scatter_accum_ordered' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: ordered MoE scatter missing' >&2

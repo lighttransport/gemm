@@ -24489,7 +24489,17 @@ void hip_llm_reset_state(hip_llm_runner *r) {
                 hipMemset(cl->d_moe_cache_map, 0xff,
                           (size_t)r->n_experts * sizeof(int));
         }
-        if (reset_moe_cache) r->moe_cache_clock = 0;
+        if (reset_moe_cache) {
+            r->moe_cache_clock = 0;
+            /* Drain the async expert-copy pipeline so a pending upload from a
+             * previous repeat cannot land in a slot that this request has
+             * reassigned.  Without this the ~147-tok/s pipeline profile is not
+             * request-isolated. */
+            if (r->stream) hipStreamSynchronize(r->stream);
+            if (r->moe_copy_stream) hipStreamSynchronize(r->moe_copy_stream);
+            for (int l = 0; l < 128 && l < r->n_layers; ++l)
+                r->moe_pipeline_valid[l] = 0;
+        }
     }
     if (r->ple_n_heads > 0) {
         r->ple_history[0] = r->ple_history[1] = r->ple_eos_token;

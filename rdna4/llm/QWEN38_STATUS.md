@@ -196,11 +196,11 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
 ### Deterministic 4K batched profile (`batch4k`)
 
 A single 4,096-token batched dispatch fits on the 16-GiB card with BMAX=4096
-and a 5,000-MiB resident cache (peak 14,786 MiB). `bench_qwen38_target.sh
-batch4k` wraps it: pinned host weights, GPU router top-k, direct copies, CPU
-experts off, and `LLM_QWEN4_RESET_MOE_CACHE=1`. Three repeats pass with the
-same hash `afdf60ceeb4f0103` and first token 16 at **median 131.9 prefill /
-20.9 decode / 121.9 end-to-end tok/s** (prefill min 122.3).
+and a 5,000-MiB resident cache (peak 14,788 MiB). `bench_qwen38_target.sh
+batch4k` wraps it: pinned host weights, GPU router top-k, asynchronous cold
+uploads, CPU experts off, and `LLM_QWEN4_RESET_MOE_CACHE=1`. Three repeats pass
+with the same hash `afdf60ceeb4f0103` and first token 16 at **median 147.4
+prefill / 21.4 decode / 135.2 end-to-end tok/s** (prefill min 137.1).
 
 Two state-isolation findings drove the profile:
 
@@ -208,10 +208,11 @@ Two state-isolation findings drove the profile:
   first repeat after load differed from later repeats that inherited cache
   residency. `hip_llm_reset_state` now clears the routed-expert cache under
   `LLM_QWEN4_RESET_MOE_CACHE=1`, so every repeat/request starts cold.
-- The asynchronous cold-upload pipeline (`LLM_MOE_COPY_PIPELINE=1`) lifts
-  prefill to ~147 tok/s but leaves copy state across repeats and produced a
-  1-in-3 hash divergence; the deterministic default uses direct copies
-  (`~132` tok/s). This is a real request-isolation gap for the pipeline.
+- The asynchronous cold-upload pipeline lifts prefill from ~132 to ~147 tok/s
+  but originally left copy state across repeats (a 1-in-3 hash divergence).
+  The reset now drains `moe_copy_stream` and clears `moe_pipeline_valid`, so
+  the pipeline is request-isolated and is the `batch4k` default
+  (`LLM_MOE_COPY_PIPELINE=0` selects the lower-overhead direct copies).
 
 Multi-chunk prefills (`prefill > BMAX`) still need the scalar fallback or a
 separate determinism fix; single-chunk 4K is the largest reproducible,

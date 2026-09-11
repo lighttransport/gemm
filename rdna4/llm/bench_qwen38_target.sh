@@ -25,7 +25,7 @@ set -euo pipefail
 #                 repeats can hash-differ even though fresh processes match)
 #   batch4k       deterministic single-dispatch 4K profile (BMAX=4096, no
 #                 multi-chunk carry, pinned host, 5-GiB cache, GPU top-k,
-#                 direct copies, expert cache reset per repeat)
+#                 async cold uploads, expert cache reset per repeat)
 #   approx        resident-hit approximate decode (quality-changing; explicit)
 #
 # Examples:
@@ -160,10 +160,11 @@ case "${profile}" in
         device_hits_only="${LLM_QWEN4_DEVICE_HITS_ONLY:-0}"
         refresh="${LLM_QWEN4_DEVICE_REFRESH_INTERVAL:-2}"
         stream_chunk="${LLM_BENCH_STREAM_CHUNK:-0}"
-        # The async cold-upload pipeline is faster (~147 vs ~132 prefill) but
-        # leaves copy events/state across repeats, so the deterministic default
-        # uses direct copies.  Set LLM_MOE_COPY_PIPELINE=1 for speed sweeps.
-        copy_pipeline="${LLM_MOE_COPY_PIPELINE:-0}"
+        # The async cold-upload pipeline is faster (~147 vs ~132 prefill) and is
+        # request-isolated because the cache reset drains the copy stream and
+        # clears moe_pipeline_valid.  Set LLM_MOE_COPY_PIPELINE=0 for direct
+        # copies (a lower-overhead A/B).
+        copy_pipeline="${LLM_MOE_COPY_PIPELINE:-1}"
         native_batch_qkv="${LLM_QWEN4_NATIVE_BATCH_QKV:-1}"
         ssm_batch_q6k="${LLM_SSM_BATCH_Q6K:-1}"
         ssm_batch_conv="${LLM_SSM_BATCH_CONV:-1}"
