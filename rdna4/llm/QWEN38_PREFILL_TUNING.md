@@ -777,6 +777,11 @@ On the 16-GiB RX 9070 XT, the explicit FP8 256K capacity smoke passed with
 matched F16 control requested 6.000 GiB KV and failed during weight finalization
 with HIP allocation error code 2, so F16 has no valid 256K result on this
 memory budget; this is a capacity result, not a generation-quality claim.
+An 8-token prompt plus 64-token greedy generation under the same max-sequence
+allocation also returned `PASS`: 4.84 prefill, 8.05 decode, 7.50 end-to-end
+tok/s, hash `d6951038d33a3c17`, with 370 MiB free and 15.934 GiB peak used.
+This validates generation while the 256K KV allocation is active, but is not a
+256K-token prompt benchmark.
 The flash launcher now pins `OMP_NUM_THREADS=16` by default, matching the
 server launcher and the longer-context measurements; callers can still set an
 explicit worker count for A/B tuning.
