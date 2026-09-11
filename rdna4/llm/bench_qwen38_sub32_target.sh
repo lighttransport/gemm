@@ -6,6 +6,7 @@ set -euo pipefail
 # is not a serving default until coding-prompt parity is complete. The caller
 # owns prompt templating; test_hip_llm tokenizes the supplied bytes verbatim.
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+runner="${QWEN38_RUNNER:-${root_dir}/test_hip_llm}"
 model="${QWEN38_MODEL:-/mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf}"
 max_seq="${QWEN38_SUB32_CONTEXT:-8192}"
 prefill="${QWEN38_SUB32_PREFILL:-1024}"
@@ -58,7 +59,7 @@ if [[ -z "${multi_chunk_force}" ]]; then
 fi
 
 if [[ "${QWEN38_DRY_RUN:-0}" != 0 ]]; then
-    echo "sub32 dispatch: prefill=${prefill} BMAX=${bmax} stream_chunk=${stream_chunk:-single} batch=${qwen_batch} stateful=${qwen_batch_stateful} multi=${qwen_batch_multi} cache_mb=${cache_mb}"
+    echo "sub32 dispatch: runner=${runner} prefill=${prefill} BMAX=${bmax} stream_chunk=${stream_chunk:-single} batch=${qwen_batch} stateful=${qwen_batch_stateful} multi=${qwen_batch_multi} cache_mb=${cache_mb}"
     exit 0
 fi
 
@@ -67,7 +68,7 @@ if [[ -n "${prompt_file}" ]]; then
 fi
 
 [[ -r "${model}" ]] || { echo "model not readable: ${model}" >&2; exit 2; }
-[[ -x "${root_dir}/test_hip_llm" ]] || { echo "build test_hip_llm first" >&2; exit 2; }
+[[ -x "${runner}" ]] || { echo "runner not executable: ${runner}" >&2; exit 2; }
 [[ -r /dev/kfd && -w /dev/kfd ]] || { echo "AMD KFD access unavailable" >&2; exit 2; }
 if command -v rocm-smi >/dev/null 2>&1; then
     # rocm-smi can transiently return nonzero while amdgpu is recovering from
@@ -98,7 +99,7 @@ fi
 
 # Host routing is slower than GPU top-k but deterministic; GPU top-k caused
 # run-to-run route/hash changes on gfx1201 in this parity experiment.
-bench_args=("${root_dir}/test_hip_llm" "${model}" -s "${max_seq}" \
+bench_args=("${runner}" "${model}" -s "${max_seq}" \
     --gpu-only-bench --bench -n "${prefill}" \
     --decode "${decode}" --moe-cache-mb "${cache_mb}" "${extra_args[@]}")
 if [[ "${no_pad}" == 0 ]]; then
