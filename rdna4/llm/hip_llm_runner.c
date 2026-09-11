@@ -17020,6 +17020,7 @@ static float *hip_llm_forward_blocks(hip_llm_runner *r, int position);
 static void debug_hc_state(hip_llm_runner *r, int layer, const char *stage);
 static void debug_f32_state(hip_llm_runner *r, int layer, const char *stage,
                             const void *src, int n);
+static uint64_t debug_hash_f32(const float *v, int n);
 static int hllm_qwen4_nextn_forward(hip_llm_runner *r, int32_t token,
                                    const int *device_token, int position,
                                    const void *hidden);
@@ -18198,6 +18199,7 @@ static void qwen4_ple_forward(hip_llm_runner *r, hip_layer *cl) {
     if (!cl->ple_key_w || qwen4_ple_gather(r, r->ple_token_id) != 0) return;
     const int ne = r->n_embd, ns = r->hc_count, hcd = ne * ns;
     float eps = r->rms_norm_eps;
+    debug_hc_state(r, 1, "pre_ple");
 
     launch_matvec_auto(r, r->d_hc_norm, cl->ple_key_w, r->d_ple_emb,
                        cl->ple_key_rows, cl->ple_key_cols, cl->ple_key_type);
@@ -18213,6 +18215,7 @@ static void qwen4_ple_forward(hip_llm_runner *r, hip_layer *cl) {
     LAUNCH(r->fn_ple_gate_f32, ns, 1, 1, 256, 1, 1, 256*sizeof(float), r->stream, c);
     void *d[] = { &r->d_ple_gated, &r->d_ple_value, &r->d_hc_inject, &ne, &ns };
     LAUNCH(r->fn_ple_broadcast_gate_f32, (hcd+255)/256, 1, 1, 256, 1, 1, 0, r->stream, d);
+    debug_f32_state(r, 1, "ple_inject", r->d_hc_inject, ns);
     debug_f32_state(r, 1, "ple_gated", r->d_ple_gated, hcd);
     void *e[] = { &r->d_ple_conv, &r->d_ple_gated, &cl->ple_norm_conv_w, &ne, &ns, &eps };
     LAUNCH(r->fn_hc_norm_f32, ns, 1, 1, 256, 1, 1, 256*sizeof(float), r->stream, e);
@@ -18235,9 +18238,22 @@ static void debug_hc_state(hip_llm_runner *r, int layer, const char *stage) {
     hipMemcpy(full_hc, r->d_hc, (size_t)hcd * sizeof(float), hipMemcpyDeviceToHost);
     double ss = 0.0;
     for (int i = 0; i < hcd; ++i) ss += (double)full_hc[i] * full_hc[i];
-    fprintf(stderr, "  [L%02d Q4HC %s] norm=%.6f first=[%.6f, %.6f, %.6f, %.6f]\n",
-            layer, stage, sqrt(ss), full_hc[0], full_hc[1], full_hc[2], full_hc[3]);
+    fprintf(stderr, "  [L%02d Q4HC %s] norm=%.6f first=[%.6f, %.6f, %.6f, %.6f] h=%016llx\n",
+            layer, stage, sqrt(ss), full_hc[0], full_hc[1], full_hc[2], full_hc[3],
+            (unsigned long long)debug_hash_f32(full_hc, hcd));
     free(full_hc);
+}
+
+/* Bitwise FNV-1a over the raw F32 bytes.  The 6-decimal norm/first print
+ * cannot see one-ULP differences, which is exactly the scale of a
+ * nondeterministic reduction.  Under LLM_DEBUG_LAYERS this exposes the first
+ * stage whose floating-point result differs between two identical runs. */
+static uint64_t debug_hash_f32(const float *v, int n) {
+    uint64_t h = 1469598103934665603ULL;
+    const unsigned char *p = (const unsigned char *)v;
+    size_t bytes = (size_t)n * sizeof(float);
+    for (size_t i = 0; i < bytes; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
 }
 
 static void debug_f32_state(hip_llm_runner *r, int layer, const char *stage, const void *src, int n) {
@@ -18248,8 +18264,9 @@ static void debug_f32_state(hip_llm_runner *r, int layer, const char *stage, con
     hipMemcpy(v, src, (size_t)n * sizeof(float), hipMemcpyDeviceToHost);
     double ss = 0.0;
     for (int i = 0; i < n; ++i) ss += (double)v[i] * v[i];
-    fprintf(stderr, "  [L%02d %s] norm=%.6f first=[%.6f, %.6f, %.6f, %.6f]\n",
-            layer, stage, sqrt(ss), v[0], v[1], v[2], v[3]);
+    fprintf(stderr, "  [L%02d %s] norm=%.6f first=[%.6f, %.6f, %.6f, %.6f] h=%016llx\n",
+            layer, stage, sqrt(ss), v[0], v[1], v[2], v[3],
+            (unsigned long long)debug_hash_f32(v, n));
     free(v);
 }
 

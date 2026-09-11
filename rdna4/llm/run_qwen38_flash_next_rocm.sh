@@ -181,7 +181,10 @@ fi
 # The approximate coding path has a lower scratch headroom boundary at 8K on
 # gfx1201. Select the validated 7.2-GiB/512-row profile below 16K; longer
 # requests retain the conservative 5.9-GiB profile. Explicit overrides win.
+# The explicit fast-prefill profile (2048-row tile / 7.8-GiB cache) must not be
+# clobbered by this conservative selection; it is an opt-in caller choice.
 if [[ "${exact_profile}" -eq 0 && "${vram_profile}" == "16g" &&
+      "${fast_prefill}" == "0" &&
       "${requested_max_seq}" -ge 8192 && "${requested_max_seq}" -lt 131072 &&
       "${approx_decode}" != "0" ]]; then
     if [[ -z "${QWEN38_MOE_CACHE_MB+x}" ]]; then

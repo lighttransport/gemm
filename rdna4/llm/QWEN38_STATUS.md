@@ -116,6 +116,60 @@ explicit experiments.
   `83452d2dfbc8621b` (first tokens 435 and 5652). Divergence begins after or
   within the first batched layer, not in embedding publication.
 
+## Repeatability gate and batched divergence localization (Phase 0/1)
+
+The runner now has an in-process repeatability gate so a profile cannot be
+promoted without passing it:
+
+- `test_hip_llm --bench-repeat N` resets recurrent/KV/PLE state between N
+  identical requests in one process (the model loads once). `--bench` footers
+  report `First decoded token id` and `sequence hash`.
+- `bench_qwen38_target.sh` runs `scalar-exact`, `fast`, `batch`, or `approx`
+  profiles for N repeats and fails unless every repeat has the same first token
+  and the same full hash. It also reports min/median prefill/decode/end-to-end
+  tok/s, peak VRAM, and `rocm-smi` clock/temp before and after.
+  `bench_qwen38_256k.sh` (`QWEN38_BENCH_REPEATS`, default 2) and
+  `bench_qwen38_sub32_target.sh` (`QWEN38_SUB32_REPEATS`) carry the same gate.
+- `make -C rdna4/llm target-gate target-gate-fast target-gate-batch` wraps it.
+- `debug_f32_state`/`debug_hc_state` now print a bitwise FNV hash of the full
+  state in addition to norm/first under `LLM_DEBUG_LAYERS=1`, exposing one-ULP
+  divergence that the 6-decimal print hides.
+
+Matched results on the RX 9070 XT with the real 9,000-byte `gguf_loader.h`
+prompt (`tmp/qwen38_target_prompt.txt`), profile `fast` (scalar, pinned host,
+BMAX=2048, 7.8-GiB cache, GPU top-k) at 4,096 prefill / 64 decode:
+
+- Three repeats were identical (hash `6d67721190bdaa83`, first token 30):
+  23.96--23.98 prefill, 21.15--23.70 decode, 14,818 MiB peak.
+- The quality-safe scalar route is therefore repeatable, but only ~24 tok/s
+  prefill at 4K; the documented 100--235 tok/s figures are not reachable on the
+  current scalar `fast` profile and require the batched route.
+
+Profile `batch` (`LLM_QWEN4_BATCH=1`, `BATCH_SSM=1`, native Q6_K SSM
+projections, fused recurrence, `BATCH_ATTN_MAX_LAYER=47`, Q6K/CONV/RECURRENCE/
+PARITY, BMAX=1024, 5.9-GiB cache, 1,024-token stream) at 2,048 real tokens
+reproduced the nondeterminism directly: three identical repeats produced three
+different first tokens (32286, 16, 248046) and three different hashes
+(`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`). This is the
+reproducible gate failure the earlier cross-process evidence described.
+
+A two-repeat `LLM_DEBUG_LAYERS=1` trace with the bitwise hash localized the
+first divergence to `L01 Q4HC pre_ple` -- the hyperconnection residual row read
+at the start of the scalar layer-1 PLE body, before any PLE arithmetic. Earlier
+per-token stages (`Q4HC ffn` of the previous token, embedding) matched. The
+scalar per-token path was stable, so the first divergence is carried into
+`d_hc` by the batched layer-0 body (batched attention/MoE + hyperconnection
+combine), not by the PLE kernels. `LLM_QWEN4_BATCH_HC_SCALAR=1` did not
+stabilize the batched route, so the HC combine alone is not the source.
+
+Candidate nondeterministic reductions remain: routed-expert accumulation
+`atomicAdd` into `accum[row]` (`hip_llm_runner.c` moe down kernels and the
+IQ1_S/down-accum kernel), and the grouped MoE token-count/scatter cursors.
+The shared-memory `atomicAdd(&head_sq[head], ...)` in
+`fused_ssm_out_gated_q6k` is also order-dependent but is decode-only; the
+batched SSM norm uses the deterministic tree reduction in
+`gated_rmsnorm_silu_batch_f32`.
+
 ## Explicitly unresolved
 
 - Long exact-MTP I8 diverges from F16 after roughly 16 generated tokens,
@@ -141,14 +195,21 @@ explicit experiments.
 
 ## Remaining tasks
 
-- [ ] Find and fix the remaining batched-dispatch nondeterminism on gfx1201.
-      Repeated identical requests must produce the same first token and full
-      sequence hash before the WMMA path can be promoted from diagnostic-only.
-      Current evidence points to batched state/stream publication or the
-      post-prefill KV/decode handoff; no single kernel isolation has fixed it.
-- [ ] Add a repeatability gate to the streamed 512/2K/4K benchmark: run at
+- [~] Find and fix the remaining batched-dispatch nondeterminism on gfx1201.
+      Use `bench_qwen38_target.sh`/`--bench-repeat` plus `LLM_DEBUG_LAYERS=1`
+      bitwise hashes to bisect the first divergent kernel. Current evidence
+      localizes the first bitwise divergence to `L01 Q4HC pre_ple`, i.e. the
+      hyperconnection residual produced by the batched layer-0 body; candidate
+      sources are the routed-expert `atomicAdd` accumulation and grouped MoE
+      scatter cursors. Repeated identical requests must produce the same first
+      token and full sequence hash before the WMMA path can be promoted from
+      diagnostic-only.
+- [x] Add a repeatability gate to the streamed 512/2K/4K benchmark: run at
       least two identical requests, compare first token and sequence hash, and
       report prefill, decode, and end-to-end wall-clock tok/s together.
+      Delivered as `test_hip_llm --bench-repeat N`,
+      `bench_qwen38_target.sh`, the 256K/sub-32K repeat gates, and the
+      `target-gate` Makefile targets.
 - [ ] Complete a quality-gated 32K+ prompt / 8K+ streamed coding workload
       using 512--2048-token prefill chunks and 64--128-token decode chunks.
       Record coherence, hash/repeatability, peak VRAM, and end-to-end tok/s.

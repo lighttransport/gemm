@@ -813,6 +813,7 @@ int main(int argc, char **argv) {
     int gpu_only_bench = 0;   /* --gpu-only-bench: also skip CPU model load */
     int decode_n = 0;         /* --decode N: greedy-sample N tokens after prefill */
     int prefill_pad = 0;      /* --prefill-len M: pad prompt up to M tokens with last token (for bench) */
+    int bench_repeat = 1;     /* --bench-repeat N: rerun the same request N times in-process */
     int compare_paths = 0;    /* --compare-paths: report rel-L2 between batched and per-token logits */
     int coding_mode = 0;      /* Qwen3.8 non-thinking coding sampling profile */
     int qwen4_coding_profile = 0;
@@ -926,6 +927,10 @@ int main(int argc, char **argv) {
             gpu_only_bench = 1;
         } else if (strcmp(argv[i], "--decode") == 0 && i + 1 < argc) {
             decode_n = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--bench-repeat") == 0 && i + 1 < argc) {
+            bench_repeat = atoi(argv[++i]);
+            if (bench_repeat < 1) bench_repeat = 1;
+            if (bench_repeat > 64) bench_repeat = 64;
         } else if (strcmp(argv[i], "--prefill-len") == 0 && i + 1 < argc) {
             prefill_pad = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--compare-paths") == 0) {
@@ -1425,6 +1430,16 @@ int main(int argc, char **argv) {
 
     if (bench_mode) {
         unsigned char *seen = NULL;
+        if (bench_repeat < 1) bench_repeat = 1;
+        for (int bench_rep = 0; bench_rep < bench_repeat; bench_rep++) {
+        if (bench_repeat > 1)
+            fprintf(stderr, "\n=== Bench repeat %d/%d ===\n", bench_rep + 1, bench_repeat);
+        /* Each repeat is an independent request: drop recurrent/KV/PLE state
+         * from the previous one so a hash mismatch is not just carried-over
+         * state.  This makes the in-process repeatability gate equivalent to
+         * two fresh-process runs while loading the model only once. */
+        hip_llm_reset_state(gpu);
+        free(seen); seen = NULL;
         /* ---- Bench mode: split prefill and decode tokens/sec ---- */
         int n_prefill = max_tokens;
         if (n_prefill < 1) n_prefill = 1;
@@ -1770,6 +1785,7 @@ int main(int argc, char **argv) {
                         vs.peak_used_bytes / (double)(1ULL << 20));
         }
         fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
+        } /* bench_rep */
 bench_done:
         free(seen);
     } else {

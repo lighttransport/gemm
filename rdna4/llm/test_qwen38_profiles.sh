@@ -110,6 +110,26 @@ grep -q 'QWEN38_SUB32_BATCH_ATTN_MAX_LAYER' "${root_dir}/bench_qwen38_sub32_targ
     echo 'profile test: batched attention-prefix control missing' >&2
     exit 1
 }
+grep -q 'bench-repeat' "${root_dir}/test_hip_llm.c" || {
+    echo 'profile test: in-process bench-repeat option missing' >&2
+    exit 1
+}
+grep -q 'hip_llm_reset_state(gpu)' "${root_dir}/test_hip_llm.c" || {
+    echo 'profile test: bench-repeat must reset state between repeats' >&2
+    exit 1
+}
+test -x "${root_dir}/bench_qwen38_target.sh" || {
+    echo 'profile test: target repeatability gate script missing or not executable' >&2
+    exit 1
+}
+grep -q 'sequence hash=' "${root_dir}/bench_qwen38_target.sh" || {
+    echo 'profile test: target gate must compare sequence hashes' >&2
+    exit 1
+}
+grep -q 'nondeterministic sequence hash' "${root_dir}/bench_qwen38_target.sh" || {
+    echo 'profile test: target gate must fail on hash divergence' >&2
+    exit 1
+}
 grep -q 'group<groups' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: I8 KV scale writes lack inactive-group guard' >&2
     exit 1
@@ -211,6 +231,21 @@ out="$(QWEN38_DRY_RUN=1 QWEN38_FAST_PREFILL=1 QWEN38_VRAM_PROFILE=16g \
 expect_contains "${out}" 'cache_mb=7800'
 expect_contains "${out}" 'bmax=2048'
 expect_contains "${out}" 'batch=0'
+
+# The explicit fast-prefill tile/cache must survive the 8K+ conservative
+# approximate auto-selection; otherwise the documented 2048-row profile is
+# silently downgraded to 512 rows.
+for fast_seq in 8192 16384; do
+    out="$(QWEN38_DRY_RUN=1 QWEN38_FAST_PREFILL=1 QWEN38_VRAM_PROFILE=16g \
+        "${flash}" -s "${fast_seq}")"
+    expect_contains "${out}" 'cache_mb=7800'
+    expect_contains "${out}" 'bmax=2048'
+done
+# An explicit BMAX/cache override still wins over the fast-prefill defaults.
+out="$(QWEN38_DRY_RUN=1 QWEN38_FAST_PREFILL=1 QWEN38_VRAM_PROFILE=16g \
+    LLM_BMAX=1024 QWEN38_MOE_CACHE_MB=5000 "${flash}" -s 8192)"
+expect_contains "${out}" 'cache_mb=5000'
+expect_contains "${out}" 'bmax=1024'
 
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g \
     LLM_QWEN4_APPROX_DECODE=1 "${flash}" -s 8192)"

@@ -28,7 +28,7 @@ TARGET = test_hip_llm
 QWEN38_MODEL ?= /mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 QSA_MOE_CACHE_MB ?= 128
 
-.PHONY: all clean run api profile-test bench-256k hipblaslt-status qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda help
+.PHONY: all clean run api profile-test bench-256k target-gate target-gate-fast target-gate-batch hipblaslt-status qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda help
 
 all: $(TARGET)
 
@@ -83,6 +83,17 @@ fp8-test:
 
 bench-256k: $(TARGET)
 	./bench_qwen38_256k.sh
+
+# In-process N-repeat repeatability + throughput gate.  A profile must produce
+# an identical first token and sequence hash on every repeat before promotion.
+target-gate: $(TARGET)
+	./bench_qwen38_target.sh
+
+target-gate-fast: $(TARGET)
+	QWEN38_TARGET_PROFILE=fast ./bench_qwen38_target.sh
+
+target-gate-batch: $(TARGET)
+	QWEN38_TARGET_PROFILE=batch ./bench_qwen38_target.sh
 
 hipblaslt-status:
 	@printf 'hipBLASLt headers: %s\n' '$(if $(HIPBLASLT_HEADERS),available,missing)'

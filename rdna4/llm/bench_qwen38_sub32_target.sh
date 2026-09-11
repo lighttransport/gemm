@@ -19,6 +19,7 @@ prompt_file="${QWEN38_SUB32_PROMPT_FILE:-}"
 bmax="${LLM_BMAX:-1024}"
 multi_chunk_force="${LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE:-}"
 no_pad="${QWEN38_SUB32_NO_PAD:-0}"
+repeats="${QWEN38_SUB32_REPEATS:-1}"
 stream_chunk="${LLM_BENCH_STREAM_CHUNK:-}"
 publish_chunk="${LLM_BENCH_STREAM_PUBLISH_CHUNK:-}"
 run_timeout="${QWEN38_SUB32_TIMEOUT:-900}"
@@ -99,9 +100,14 @@ fi
 
 # Host routing is slower than GPU top-k but deterministic; GPU top-k caused
 # run-to-run route/hash changes on gfx1201 in this parity experiment.
+if ! [[ "${repeats}" =~ ^[0-9]+$ ]] || (( repeats < 1 )); then
+    echo "QWEN38_SUB32_REPEATS must be a positive integer" >&2
+    exit 2
+fi
 bench_args=("${runner}" "${model}" -s "${max_seq}" \
     --gpu-only-bench --bench -n "${prefill}" \
-    --decode "${decode}" --moe-cache-mb "${cache_mb}" "${extra_args[@]}")
+    --decode "${decode}" --bench-repeat "${repeats}" \
+    --moe-cache-mb "${cache_mb}" "${extra_args[@]}")
 if [[ "${no_pad}" == 0 ]]; then
     bench_args+=(--prefill-len "${prefill}")
 fi
@@ -147,4 +153,20 @@ env \
 
 grep -E 'Prefill:|Decode:|End-to-end:|sequence hash=|Result:' "${log_file}"
 grep -q 'Result: PASS' "${log_file}"
+if (( repeats > 1 )); then
+    mapfile -t _hashes < <(grep -oE 'sequence hash=[0-9a-f]+' "${log_file}" | sed 's/sequence hash=//')
+    mapfile -t _firsts < <(grep -oE 'First decoded token id=-?[0-9]+' "${log_file}" | sed 's/.*=//')
+    if (( ${#_hashes[@]} != repeats )); then
+        echo "sub-32K repeat gate FAIL: saw ${#_hashes[@]}/${repeats} hash footers" >&2
+        exit 1
+    fi
+    if [[ "$(printf '%s\n' "${_hashes[@]}" | sort -u | wc -l)" -ne 1 ||
+          "$(printf '%s\n' "${_firsts[@]}" | sort -u | wc -l)" -ne 1 ]]; then
+        echo "sub-32K repeat gate FAIL: nondeterministic output across ${repeats} repeats:" >&2
+        echo "  first tokens: ${_firsts[*]}" >&2
+        echo "  hashes: ${_hashes[*]}" >&2
+        exit 1
+    fi
+    echo "sub-32K repeat gate: ${repeats} identical repeats, hash=${_hashes[0]}, first=${_firsts[0]}"
+fi
 echo "sub-32K diagnostic PASS: ${log_file}"
