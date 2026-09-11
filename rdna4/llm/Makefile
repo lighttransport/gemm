@@ -19,6 +19,9 @@ TEST_SRC = test_hip_llm.c
 # prefill GEMMs via hipBLASLt. Without it, the runner falls back to per-token GEMV.
 HIPBLASLT ?= 1
 CUDA_MOE ?= 0
+HIPBLASLT_HEADERS := $(firstword $(wildcard \
+  $(ROCM_PATH)/include/hipblaslt/hipblaslt.h \
+  $(ROCM_PATH)/core-*/include/hipblaslt/hipblaslt.h))
 
 # Target
 TARGET = test_hip_llm
@@ -37,6 +40,14 @@ else
 BLASLT_OBJ =
 endif
 
+ifeq ($(HIPBLASLT),1)
+ifeq ($(HIPBLASLT_HEADERS),)
+$(warning hipBLASLt headers not found; building the bridge's scalar fallback)
+CFLAGS += -DMM_BLASLT_DISABLE
+BLASLT_BRIDGE_CFLAGS += -DMM_BLASLT_DISABLE
+endif
+endif
+
 ifeq ($(CUDA_MOE),1)
 CFLAGS += -DCUDA_MOE_BRIDGE
 LDFLAGS += -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lstdc++
@@ -49,7 +60,7 @@ cuda_moe_bridge.o: cuda_moe_bridge.cu cuda_moe_bridge.h glm5next_iq1s_grid.h glm
 	nvcc -O3 -arch=sm_120 -Xcompiler -fPIC -c -o $@ $<
 
 mm_blaslt_bridge.o: mm_blaslt_bridge.cpp mm_blaslt_bridge.h
-	$(HIPCC) -O3 -fPIE --offload-arch=gfx1201 -c -o $@ $<
+	$(HIPCC) -O3 -fPIE $(BLASLT_BRIDGE_CFLAGS) --offload-arch=gfx1201 -c -o $@ $<
 
 $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h qwen4_nextn_forward.h qwen4_nextn_ref.h qwen4_qsa_hip.h qwen4_qsa_test.h qwen4_verify_window.h ../../common/qwen4_qsa.h ../hip_runner_common.h ../rocew.h $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ) $(LDFLAGS)
