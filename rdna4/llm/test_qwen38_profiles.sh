@@ -130,6 +130,31 @@ grep -q 'nondeterministic sequence hash' "${root_dir}/bench_qwen38_target.sh" ||
     echo 'profile test: target gate must fail on hash divergence' >&2
     exit 1
 }
+# The deterministic gate must default CPU cold experts off; the mixed CPU/GPU
+# path changes arithmetic with cache warmth and is diagnostic-only.
+out="$(QWEN38_DRY_RUN=1 QWEN38_TARGET_PROFILE=batch "${root_dir}/bench_qwen38_target.sh")"
+expect_contains "${out}" 'cpu_prefill_jobs=0'
+expect_contains "${out}" 'cpu_decode_misses=0'
+out="$(QWEN38_DRY_RUN=1 QWEN38_TARGET_PROFILE=batch-cpu "${root_dir}/bench_qwen38_target.sh")"
+expect_contains "${out}" 'cpu_prefill_jobs=160'
+expect_contains "${out}" 'cpu_decode_misses=1'
+# Ordered MoE combine and synchronous CPU-result publication.
+grep -q 'moe_scatter_accum_ordered' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: ordered MoE scatter missing' >&2
+    exit 1
+}
+grep -q 'd_moe_assign_pos' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: MoE assignment-position map missing' >&2
+    exit 1
+}
+if grep -q 'hipMemcpyAsync(r->d_xb2, r->h_moe_output' "${root_dir}/hip_llm_runner.c"; then
+    echo 'profile test: CPU decode result publication must be synchronous' >&2
+    exit 1
+fi
+grep -q 'hipMemcpy(r->d_xb2, r->h_moe_output' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: CPU decode result publication missing' >&2
+    exit 1
+}
 grep -q 'group<groups' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: I8 KV scale writes lack inactive-group guard' >&2
     exit 1

@@ -18,7 +18,11 @@ set -euo pipefail
 # Profiles (QWEN38_TARGET_PROFILE):
 #   scalar-exact  quality-safe scalar route, exact decode (default)
 #   fast          pinned host + BMAX=2048 + 7.8-GiB cache + GPU prefill top-k
-#   batch         explicit batched prefill (LLM_QWEN4_BATCH=1), exact decode
+#   batch         explicit batched prefill (LLM_QWEN4_BATCH=1), exact decode,
+#                 GPU-only cold experts (deterministic across cache states)
+#   batch-cpu     same but with the mixed CPU/GPU cold-expert path (diagnostic:
+#                 its arithmetic differs from the GPU path, so in-process
+#                 repeats can hash-differ even though fresh processes match)
 #   approx        resident-hit approximate decode (quality-changing; explicit)
 #
 # Examples:
@@ -42,6 +46,19 @@ run_timeout="${QWEN38_TARGET_TIMEOUT:-1800}"
 coding="${QWEN38_TARGET_CODING:-0}"
 prompt="${QWEN38_TARGET_PROMPT:-}"
 prompt_file="${QWEN38_TARGET_PROMPT_FILE:-}"
+# CPU cold-expert execution changes arithmetic relative to the GPU resident
+# path, and expert-cache warmth selects which path an expert takes.  That makes
+# in-process repeats hash-different even though fresh-process runs match.  The
+# gate therefore defaults CPU expert work off (GPU-only, deterministic); set
+# QWEN38_TARGET_CPU_EXPERTS=1 to measure the mixed CPU/GPU path.
+cpu_experts="${QWEN38_TARGET_CPU_EXPERTS:-0}"
+if [[ "${cpu_experts}" == "0" ]]; then
+    cpu_prefill_jobs=0
+    cpu_decode_misses=0
+else
+    cpu_prefill_jobs="${LLM_MOE_CPU_PREFILL_MAX_JOBS:-160}"
+    cpu_decode_misses="${LLM_MOE_CPU_DECODE_MISSES:-1}"
+fi
 log_file="${QWEN38_TARGET_LOG:-${root_dir}/tmp/qwen38_target_${profile}.log}"
 export TMPDIR="${TMPDIR:-${root_dir}/tmp}"
 
@@ -101,7 +118,7 @@ case "${profile}" in
         refresh="${LLM_QWEN4_DEVICE_REFRESH_INTERVAL:-2}"
         stream_chunk="${LLM_BENCH_STREAM_CHUNK:-2048}"
         ;;
-    batch)
+    batch|batch-cpu)
         cache_mb="${QWEN38_MOE_CACHE_MB:-5900}"
         bmax="${LLM_BMAX:-1024}"
         register_host="${LLM_MOE_REGISTER_HOST:-0}"
@@ -119,6 +136,10 @@ case "${profile}" in
         ssm_batch_recur="${LLM_SSM_BATCH_RECURRENCE:-1}"
         ssm_batch_parity="${LLM_SSM_BATCH_PARITY:-1}"
         ssm_batch_warp="${LLM_SSM_BATCH_WARP:-0}"
+        if [[ "${profile}" == "batch-cpu" ]]; then
+            cpu_prefill_jobs="${LLM_MOE_CPU_PREFILL_MAX_JOBS:-160}"
+            cpu_decode_misses="${LLM_MOE_CPU_DECODE_MISSES:-1}"
+        fi
         ;;
     approx)
         cache_mb="${QWEN38_MOE_CACHE_MB:-7200}"
@@ -145,7 +166,7 @@ esac
 multi_chunk="${LLM_QWEN4_BATCH_MULTI_CHUNK:-0}"
 stateful="${LLM_QWEN4_BATCH_STATEFUL:-0}"
 force_multi="${LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE:-0}"
-if [[ "${profile}" == "batch" ]]; then
+if [[ "${profile}" == "batch" || "${profile}" == "batch-cpu" ]]; then
     multi_chunk="${LLM_QWEN4_BATCH_MULTI_CHUNK:-1}"
     stateful="${LLM_QWEN4_BATCH_STATEFUL:-1}"
     if [[ -z "${LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE+x}" ]] && (( prefill > bmax )); then
@@ -154,11 +175,11 @@ if [[ "${profile}" == "batch" ]]; then
 fi
 
 if [[ "${QWEN38_DRY_RUN:-0}" != "0" ]]; then
-    printf 'target gate profile: profile=%s prefill=%s decode=%s context=%s repeats=%s cache_mb=%s bmax=%s batch=%s batch_ssm=%s attn_max=%s gpu_topk=%s approx=%s coding=%s stream_chunk=%s q6k=%s recur=%s conv=%s parity=%s native_qkv=%s multi=%s stateful=%s force_multi=%s\n' \
+    printf 'target gate profile: profile=%s prefill=%s decode=%s context=%s repeats=%s cache_mb=%s bmax=%s batch=%s batch_ssm=%s attn_max=%s gpu_topk=%s approx=%s coding=%s stream_chunk=%s q6k=%s recur=%s conv=%s parity=%s native_qkv=%s multi=%s stateful=%s force_multi=%s cpu_prefill_jobs=%s cpu_decode_misses=%s\n' \
         "${profile}" "${prefill}" "${decode}" "${context}" "${repeats}" "${cache_mb}" \
         "${bmax}" "${qwen_batch}" "${batch_ssm}" "${attn_max}" "${gpu_topk}" "${approx_decode}" "${coding}" "${stream_chunk:-auto}" \
         "${ssm_batch_q6k}" "${ssm_batch_recur}" "${ssm_batch_conv}" "${ssm_batch_parity}" "${native_batch_qkv}" \
-        "${multi_chunk}" "${stateful}" "${force_multi}"
+        "${multi_chunk}" "${stateful}" "${force_multi}" "${cpu_prefill_jobs}" "${cpu_decode_misses}"
     exit 0
 fi
 
@@ -196,7 +217,7 @@ clock_report() {
     } >>"${log_file}"
 }
 
-echo "target gate: profile=${profile} prefill=${prefill} decode=${decode} context=${context} repeats=${repeats} cache_mb=${cache_mb} bmax=${bmax} batch=${qwen_batch} coding=${coding} stream_chunk=${stream_chunk}" | tee -a "${log_file}"
+echo "target gate: profile=${profile} prefill=${prefill} decode=${decode} context=${context} repeats=${repeats} cache_mb=${cache_mb} bmax=${bmax} batch=${qwen_batch} coding=${coding} stream_chunk=${stream_chunk} cpu_prefill_jobs=${cpu_prefill_jobs} cpu_decode_misses=${cpu_decode_misses}" | tee -a "${log_file}"
 
 prompt_args=()
 if [[ -n "${prompt_file}" ]]; then
@@ -240,7 +261,8 @@ timeout --foreground "${run_timeout}s" env \
     LLM_SSM_BATCH_WARP="${ssm_batch_warp}" \
     LLM_QWEN4_PREFILL_CACHE_BALANCE="${LLM_QWEN4_PREFILL_CACHE_BALANCE:-${gpu_topk}}" \
     LLM_MOE_GROUPED_PREFILL="${LLM_MOE_GROUPED_PREFILL:-0}" \
-    LLM_MOE_CPU_DECODE_MISSES="${LLM_MOE_CPU_DECODE_MISSES:-1}" \
+    LLM_MOE_CPU_DECODE_MISSES="${cpu_decode_misses}" \
+    LLM_MOE_CPU_PREFILL_MAX_JOBS="${cpu_prefill_jobs}" \
     LLM_QWEN4_APPROX_DECODE="${approx_decode}" \
     LLM_QWEN4_DEVICE_HITS_ONLY="${device_hits_only}" \
     LLM_QWEN4_DEVICE_REFRESH_INTERVAL="${refresh}" \

@@ -148,27 +148,49 @@ BMAX=2048, 7.8-GiB cache, GPU top-k) at 4,096 prefill / 64 decode:
 Profile `batch` (`LLM_QWEN4_BATCH=1`, `BATCH_SSM=1`, native Q6_K SSM
 projections, fused recurrence, `BATCH_ATTN_MAX_LAYER=47`, Q6K/CONV/RECURRENCE/
 PARITY, BMAX=1024, 5.9-GiB cache, 1,024-token stream) at 2,048 real tokens
-reproduced the nondeterminism directly: three identical repeats produced three
-different first tokens (32286, 16, 248046) and three different hashes
-(`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`). This is the
-reproducible gate failure the earlier cross-process evidence described.
+originally reproduced the nondeterminism directly: three identical repeats
+produced three different first tokens (32286, 16, 248046) and three different
+hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
 
-A two-repeat `LLM_DEBUG_LAYERS=1` trace with the bitwise hash localized the
-first divergence to `L01 Q4HC pre_ple` -- the hyperconnection residual row read
-at the start of the scalar layer-1 PLE body, before any PLE arithmetic. Earlier
-per-token stages (`Q4HC ffn` of the previous token, embedding) matched. The
-scalar per-token path was stable, so the first divergence is carried into
-`d_hc` by the batched layer-0 body (batched attention/MoE + hyperconnection
-combine), not by the PLE kernels. `LLM_QWEN4_BATCH_HC_SCALAR=1` did not
-stabilize the batched route, so the HC combine alone is not the source.
+### Fixes landed
 
-Candidate nondeterministic reductions remain: routed-expert accumulation
-`atomicAdd` into `accum[row]` (`hip_llm_runner.c` moe down kernels and the
-IQ1_S/down-accum kernel), and the grouped MoE token-count/scatter cursors.
+- **Ordered MoE combine.** `moe_scatter_accum` summed the K selected experts
+  with order-dependent `atomicAdd` into the token row. `moe_fill_gather` now
+  records the expert-grouped slot for each `(token, rank)` in
+  `d_moe_assign_pos`, and the new `moe_scatter_accum_ordered` sums the K
+  contributions in fixed rank order. This moved the first bitwise divergence
+  from layer 1 to layer 3 in the debug trace.
+- **Synchronous CPU-result publication.** The CPU expert paths published their
+  host results to the device with `hipMemcpyAsync` from `h_moe_output` /
+  `h_moe_eout_cpu`, which the next token/layer overwrites; a DMA could race the
+  rewrite. Both publications are now synchronous `hipMemcpy`.
+- **CPU vs GPU cold-expert arithmetic.** The CPU expert kernels
+  (`hllm_cpu_*_jobs`) do not reproduce the GPU kernels bit-for-bit, so which of
+  the two evaluates a cold expert changes its contribution. Expert-cache warmth
+  selects that path, so back-to-back in-process requests with the CPU path
+  enabled hash-differ even though two fresh processes matched
+  (`4f21b1d68505eec3` twice at 512/16). The repeatability gate therefore
+  defaults CPU expert work off (`bench_qwen38_target.sh` `batch` profile,
+  `QWEN38_TARGET_CPU_EXPERTS=0`); `batch-cpu` keeps the mixed path for
+  diagnostics.
+
+### Current reproducible state (RX 9070 XT, real 9,000-byte prompt)
+
+- Single-chunk batched (`prefill <= BMAX`), CPU experts off: **deterministic**.
+  1,024 prefill / 64 decode with BMAX=1024 passed 3/3 repeats at hash
+  `de829a7459a1b96b`, first token 220 (median 69.10 prefill / 11.76 decode
+  tok/s, 13,444 MiB peak).
+- Multi-chunk stateful batching (prefill > BMAX, `LLM_QWEN4_BATCH_MULTI_CHUNK_
+  FORCE=1`) remains nondeterministic: 2,048 prefill / 64 decode at BMAX=1024
+  produced different first tokens/hashes across fresh processes and repeats
+  even with CPU experts off. This is now the narrowest remaining batched
+  nondeterminism target.
+- The scalar `fast` route remains repeatable (3/3, hash `6d67721190bdaa83`) but
+  only ~24 tok/s prefill at 4K.
+
 The shared-memory `atomicAdd(&head_sq[head], ...)` in
-`fused_ssm_out_gated_q6k` is also order-dependent but is decode-only; the
-batched SSM norm uses the deterministic tree reduction in
-`gated_rmsnorm_silu_batch_f32`.
+`fused_ssm_out_gated_q6k` is order-dependent but decode-only; the batched SSM
+norm uses the deterministic tree reduction in `gated_rmsnorm_silu_batch_f32`.
 
 ## Explicitly unresolved
 
@@ -195,15 +217,19 @@ batched SSM norm uses the deterministic tree reduction in
 
 ## Remaining tasks
 
-- [~] Find and fix the remaining batched-dispatch nondeterminism on gfx1201.
-      Use `bench_qwen38_target.sh`/`--bench-repeat` plus `LLM_DEBUG_LAYERS=1`
-      bitwise hashes to bisect the first divergent kernel. Current evidence
-      localizes the first bitwise divergence to `L01 Q4HC pre_ple`, i.e. the
-      hyperconnection residual produced by the batched layer-0 body; candidate
-      sources are the routed-expert `atomicAdd` accumulation and grouped MoE
-      scatter cursors. Repeated identical requests must produce the same first
-      token and full sequence hash before the WMMA path can be promoted from
-      diagnostic-only.
+- [~] Find and fix the remaining multi-chunk batched nondeterminism on gfx1201.
+      Single-chunk batched prefill (prefill <= BMAX) with CPU experts off is now
+      deterministic across 3 repeats (`de829a7459a1b96b`, BMAX=1024). The
+      remaining failure is the stateful multi-chunk path (prefill > BMAX,
+      `LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE=1`): 2,048 prefill at BMAX=1024 still
+      diverges. Bisect the inter-chunk state carry (KV slot publication, SSM
+      conv/recurrent handoff, `d_hc_batch` row handoff, expert-cache promotion)
+      with `--bench-repeat` plus `LLM_DEBUG_LAYERS=1` bitwise hashes. Repeated
+      identical requests must match before the WMMA path can be promoted.
+- [ ] Make the CPU cold-expert kernels bit-identical to the GPU kernels (or
+      keep CPU experts opt-in only). CPU and GPU expert arithmetic currently
+      differ, so expert-cache warmth changes a request's output when the CPU
+      path is enabled; `batch-cpu` is diagnostic-only.
 - [x] Add a repeatability gate to the streamed 512/2K/4K benchmark: run at
       least two identical requests, compare first token and sequence hash, and
       report prefill, decode, and end-to-end wall-clock tok/s together.

@@ -7660,15 +7660,37 @@ static const char *hip_kernel_source =
 "        offs[ne] = acc;\n"
 "    }\n"
 "}\n"
-"/* Scatter assignments into expert-grouped order via atomic cursor. */\n"
+"/* Scatter assignments into expert-grouped order via atomic cursor.  apos[t]\n"
+" * records the expert-grouped slot for (token,rank)=t so the final combine can\n"
+" * sum a token's K contributions in a fixed rank order instead of via\n"
+" * order-dependent float atomics. */\n"
 "__global__ void moe_fill_gather(const int *tok_idx, const float *tok_w, int M, int K,\n"
-"                                  int *cursor, int *gsrc, float *gw) {\n"
+"                                  int *cursor, int *gsrc, float *gw, int *apos) {\n"
 "    int t = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (t >= M * K) return;\n"
 "    int e = tok_idx[t];\n"
 "    int p = atomicAdd(&cursor[e], 1);\n"
 "    gsrc[p] = t / K;\n"
 "    gw[p]   = tok_w[t];\n"
+"    apos[t] = p;\n"
+"}\n"
+"/* Deterministic final MoE combine: for each token row, sum the K selected\n"
+" * expert contributions in increasing rank order.  This replaces the float\n"
+" * atomicAdd scatter whose addition order is scheduler-dependent (one-ULP\n"
+" * nondeterminism that accumulates across layers). */\n"
+"__global__ void moe_scatter_accum_ordered(float *dst, const float *src,\n"
+"        const int *apos, const float *gw, int M, int K, int n_embd) {\n"
+"    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    long total = (long)M * n_embd;\n"
+"    if (t >= total) return;\n"
+"    int m = (int)(t / n_embd);\n"
+"    int j = (int)(t - (long)m * n_embd);\n"
+"    float sum = 0.0f;\n"
+"    for (int k = 0; k < K; ++k) {\n"
+"        long p = (long)apos[(long)m * K + k];\n"
+"        sum += gw[p] * src[p * n_embd + j];\n"
+"    }\n"
+"    dst[t] += sum;\n"
 "}\n"
 "/* Grouped GEMM: per expert e, Y[offs[e]..offs[e+1], 0..N) = X[offs[e].., K] x W_e^T. */\n"
 "__global__ void gemm_bf16_grouped(float *Y, const bf16_raw *Wall, const bf16_raw *X,\n"
@@ -9615,6 +9637,7 @@ struct hip_llm_runner {
     hipFunction_t fn_scale_add_dev_f32;
     hipFunction_t fn_moe_gather_rows;
     hipFunction_t fn_moe_scatter_accum;
+    hipFunction_t fn_moe_scatter_accum_ordered;
     hipFunction_t fn_moe_row_scale_add;
     hipFunction_t fn_mmq_iq2s_f32;   /* fused quantized MoE GEMM (gate/up) */
     hipFunction_t fn_mmq_iq3s_f32;   /* fused quantized MoE GEMM (down) */
@@ -10037,12 +10060,15 @@ struct hip_llm_runner {
     void *d_shared_scale_batch;  /* [Mmax] f32 shared-gate sigmoid per token */
     int  *d_moe_gather_src;      /* [Mmax*K] token index per assignment */
     float *d_moe_gather_w;       /* [Mmax*K] softmax weight per assignment */
+    int  *d_moe_assign_pos;      /* [Mmax*K] expert-grouped slot for each (token,rank) */
     float *h_router_batch;       /* host [Mmax*n_experts] */
     int    h_router_batch_pinned;
     int   *h_moe_gather_src;     /* host [Mmax*K] expert-grouped token index */
     int    h_moe_gather_src_pinned;
     float *h_moe_gather_w;       /* host [Mmax*K] expert-grouped weight */
     int    h_moe_gather_w_pinned;
+    int   *h_moe_assign_pos;     /* host [Mmax*K] expert-grouped slot index */
+    int    h_moe_assign_pos_pinned;
     int   *h_moe_tok_idx;        /* host [Mmax*K] per-token top-K expert idx */
     int    h_moe_tok_idx_pinned;
     float *h_moe_tok_w;          /* host [Mmax*K] per-token top-K softmax weight */
@@ -10506,6 +10532,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(scale_add_dev_f32);
     GET_FUNC(moe_gather_rows);
     GET_FUNC(moe_scatter_accum);
+    GET_FUNC(moe_scatter_accum_ordered);
     GET_FUNC(moe_row_scale_add);
     GET_FUNC(mmq_iq2s_f32);
     GET_FUNC(mmq_iq3s_f32);
@@ -14562,6 +14589,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 CHECK_HIP(hipMalloc(&r->d_shared_scale_batch,  (size_t)bm * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_moe_gather_src,      TA * sizeof(int)));
                 CHECK_HIP(hipMalloc(&r->d_moe_gather_w,        TA * sizeof(float)));
+                CHECK_HIP(hipMalloc(&r->d_moe_assign_pos,      TA * sizeof(int)));
                 if (r->moe_cpu_prefill) {
                     size_t in_bytes = TA * r->n_embd * sizeof(float);
                     if (hipHostMalloc((void **)&r->h_moe_gather_in_cpu, in_bytes,
@@ -14618,6 +14646,11 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                         r->h_moe_gather_w_pinned = 1;
                     else
                         r->h_moe_gather_w = (float *)malloc(TA * sizeof(float));
+                    if (hipHostMalloc((void **)&r->h_moe_assign_pos,
+                                      TA * sizeof(int), hipHostMallocDefault) == hipSuccess)
+                        r->h_moe_assign_pos_pinned = 1;
+                    else
+                        r->h_moe_assign_pos = (int *)malloc(TA * sizeof(int));
                     if (hipHostMalloc((void **)&r->h_moe_tok_idx,
                                       TA * sizeof(int), hipHostMallocDefault) == hipSuccess)
                         r->h_moe_tok_idx_pinned = 1;
@@ -14631,6 +14664,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 }
                 r->h_moe_offsets     = (int *)malloc((size_t)(ne + 1) * sizeof(int));
                 if (!r->h_router_batch || !r->h_moe_gather_src || !r->h_moe_gather_w ||
+                    !r->h_moe_assign_pos ||
                     !r->h_moe_tok_idx || !r->h_moe_tok_w || !r->h_moe_offsets) return -1;
                 if (r->verbose >= 1)
                     fprintf(stderr, "hip_llm: batched MoE prefill buffers: ~%.0f MB\n",
@@ -16679,6 +16713,12 @@ static inline void launch_moe_scatter_accum(hip_llm_runner *r, void *dst, void *
     long total = (long)n_assign * n_embd;
     LAUNCH(r->fn_moe_scatter_accum, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, r->stream, args);
 }
+static inline void launch_moe_scatter_accum_ordered(hip_llm_runner *r, void *dst, void *src,
+                                             void *apos, void *gw, int M, int K, int n_embd) {
+    void *args[] = { &dst, &src, &apos, &gw, &M, &K, &n_embd };
+    long total = (long)M * n_embd;
+    LAUNCH(r->fn_moe_scatter_accum_ordered, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, r->stream, args);
+}
 static inline void launch_moe_row_scale_add(hip_llm_runner *r, void *dst, void *src,
                                              void *scale, int M, int n_embd) {
     void *args[] = { &dst, &src, &scale, &M, &n_embd };
@@ -17804,9 +17844,12 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
             r->moe_stats.cpu_ms += hllm_monotonic_ms() - cpu_t0;
         }
         if (cpu_count > 0) {
-            hipMemcpyAsync(r->d_xb2, r->h_moe_output,
-                           (size_t)n_embd * sizeof(float),
-                           hipMemcpyHostToDevice, r->stream);
+            /* Synchronous publication: the next decode token overwrites
+             * h_moe_output on the host, so an async copy could race the DMA
+             * and produce run-to-run variance.  This buffer is tiny. */
+            hipMemcpy(r->d_xb2, r->h_moe_output,
+                      (size_t)n_embd * sizeof(float),
+                      hipMemcpyHostToDevice);
             launch_scale_add(r, r->d_moe_accum, r->d_xb2, 1.0f, n_embd);
         }
         r->moe_stats.gpu_assignments += (uint64_t)gpu_count;
@@ -20384,7 +20427,7 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         { void *a[] = { &r->d_tok_idx, &M, &K, &ne, &r->d_moe_offs, &r->d_cursor };
           LAUNCH(r->fn_moe_count_offs, 1, 1, 1, 256, 1, 1, 0, r->stream, a); }
         { void *a[] = { &r->d_tok_idx, &r->d_tok_w, &M, &K, &r->d_cursor,
-                        &r->d_moe_gather_src, &r->d_moe_gather_w };
+                        &r->d_moe_gather_src, &r->d_moe_gather_w, &r->d_moe_assign_pos };
           LAUNCH(r->fn_moe_fill_gather, (M * K + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a); }
         hipMemcpyAsync(r->h_moe_offsets, r->d_moe_offs, (size_t)(ne + 1) * sizeof(int),
                        hipMemcpyDeviceToHost, r->stream);
@@ -20410,11 +20453,14 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
                     int p = cursor[e]++;
                     r->h_moe_gather_src[p] = m;
                     r->h_moe_gather_w[p]   = r->h_moe_tok_w[(size_t)m * K + k];
+                    r->h_moe_assign_pos[(size_t)m * K + k] = p;
                 }
         }
         hipMemcpyAsync(r->d_moe_gather_src, r->h_moe_gather_src, (size_t)total * sizeof(int),
                        hipMemcpyHostToDevice, r->stream);
         hipMemcpyAsync(r->d_moe_gather_w, r->h_moe_gather_w, (size_t)total * sizeof(float),
+                       hipMemcpyHostToDevice, r->stream);
+        hipMemcpyAsync(r->d_moe_assign_pos, r->h_moe_assign_pos, (size_t)total * sizeof(int),
                        hipMemcpyHostToDevice, r->stream);
     }
 
@@ -20951,19 +20997,25 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         for (int e = 0; e < ne; ++e) {
             if (!cpu_selected[e]) continue;
             int first = offs[e], count = offs[e + 1] - first;
-            hipMemcpyAsync((float *)r->d_moe_eout + (size_t)first * n_embd,
-                           r->h_moe_eout_cpu + (size_t)first * n_embd,
-                           (size_t)count * n_embd * sizeof(float),
-                           hipMemcpyHostToDevice, r->stream);
+            /* Synchronous publication: h_moe_eout_cpu is rewritten by the next
+             * layer's CPU jobs, so an async copy from it can race the DMA and
+             * make the batched route nondeterministic. */
+            hipMemcpy((float *)r->d_moe_eout + (size_t)first * n_embd,
+                      r->h_moe_eout_cpu + (size_t)first * n_embd,
+                      (size_t)count * n_embd * sizeof(float),
+                      hipMemcpyHostToDevice);
         }
         r->moe_stats.cpu_assignments += (uint64_t)cpu_jobs;
     }
 
 experts_done:
-    /* 5. Scatter + weighted accumulate into d_moe_out_batch. */
-    launch_moe_scatter_accum(r, r->d_moe_out_batch, r->d_moe_eout,
-                             r->d_moe_gather_src, r->d_moe_gather_w,
-                             total, n_embd);
+    /* 5. Weighted accumulate into d_moe_out_batch in a fixed per-token rank
+     * order.  Ordering by `apos` (the expert-grouped slot for each (token,rank))
+     * makes the K-expert sum bitwise deterministic, unlike the float-atomic
+     * scatter it replaces.  K is the per-token expert count; total == M*K. */
+    launch_moe_scatter_accum_ordered(r, r->d_moe_out_batch, r->d_moe_eout,
+                                     r->d_moe_assign_pos, r->d_moe_gather_w,
+                                     M, K, n_embd);
 
     /* 6. Shared expert (dense over all M): gate logit -> sigmoid -> gate/up/silu/down -> row-scale add. */
     if (gemm_run_bf16_w(r, r->d_shared_scale_batch, cl->moe_shared_gate_w_bf16,
@@ -22317,8 +22369,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                     r->d_xnorm_batch) != 0) return -1;
             if (r->debug_layers) {
                 debug_f32_state(r, l, "Q4 batch attn_mix",
-                                (float *)r->d_xnorm_batch + (size_t)(M - 1) * n_embd,
-                                n_embd);
+                                (const float *)r->d_xnorm_batch, M * n_embd);
             }
         } else {
             launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
@@ -22475,8 +22526,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                             dt_rank * d_state, M, eps);
             if (r->is_qwen4exp && r->debug_layers)
                 debug_f32_state(r, l, "Q4 batch ssm_norm",
-                                (float *)r->d_ssm_out_batch + (size_t)(M - 1) * d_inner,
-                                d_inner);
+                                (const float *)r->d_ssm_out_batch, M * d_inner);
 
             /* ssm_out projection: d_inner -> n_embd, batched. Reuse d_silu_batch_bf16
              * as packing scratch (sized for n_ff >= d_inner). */
@@ -22662,9 +22712,9 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         }
         if (r->is_qwen4exp && r->debug_layers) {
             debug_f32_state(r, l, "Q4 batch q_rope",
-                            (float *)r->d_q_batch + (size_t)(M - 1) * q_dim, q_dim);
+                            (const float *)r->d_q_batch, M * q_dim);
             debug_f32_state(r, l, "Q4 batch k_rope",
-                            (float *)r->d_k_batch + (size_t)(M - 1) * kv_dim, kv_dim);
+                            (const float *)r->d_k_batch, M * kv_dim);
         }
 
         /* ---- Batched KV cache store ---- */
@@ -22823,8 +22873,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         }
         if (r->is_qwen4exp && r->debug_layers) {
             debug_f32_state(r, l, "Q4 batch attn_out",
-                            (float *)r->d_attn_proj_batch + (size_t)(M - 1) * n_embd,
-                            n_embd);
+                            (const float *)r->d_attn_proj_batch, M * n_embd);
         }
 
         /* Residual with Gemma4 post-attention norm. llama.cpp applies the norm to the
@@ -22883,8 +22932,7 @@ ffn_section:
                         forward_hc_combine_batched(r, M, r->d_moe_out_batch);
                     if (r->debug_layers)
                         debug_f32_state(r, l, "Q4 batch moe_out",
-                                        (float *)r->d_moe_out_batch + (size_t)(M - 1) * n_embd,
-                                        n_embd);
+                                        (const float *)r->d_moe_out_batch, M * n_embd);
                 }
             } else {
                 void *saved_xb = r->d_xb;
@@ -23555,12 +23603,14 @@ void hip_llm_offload(hip_llm_runner *r) {
     if (r->d_shared_scale_batch) hipFree(r->d_shared_scale_batch);
     if (r->d_moe_gather_src) hipFree(r->d_moe_gather_src);
     if (r->d_moe_gather_w) hipFree(r->d_moe_gather_w);
+    if (r->d_moe_assign_pos) hipFree(r->d_moe_assign_pos);
     r->d_router_logits_batch = r->d_router_w_bf16 = NULL;
     r->d_moe_gather_in_bf16 = r->d_moe_eg = r->d_moe_eu = NULL;
     r->d_moe_esilu_bf16 = r->d_moe_out_batch = NULL;
     r->d_xnorm_batch_bf16_moe = r->d_shared_scale_batch = NULL;
     r->d_moe_gather_src = NULL;
     r->d_moe_gather_w = NULL;
+    r->d_moe_assign_pos = NULL;
     hllm_free_qwen4_nextn(r);
     /* Phase 2 batched buffers */
     if (r->d_x_batch)             { hipFree(r->d_x_batch);             r->d_x_batch = NULL; }
@@ -23686,6 +23736,8 @@ void hip_llm_free(hip_llm_runner *r) {
     else free(r->h_moe_gather_src);
     if (r->h_moe_gather_w_pinned) hipHostFree(r->h_moe_gather_w);
     else free(r->h_moe_gather_w);
+    if (r->h_moe_assign_pos_pinned) hipHostFree(r->h_moe_assign_pos);
+    else free(r->h_moe_assign_pos);
     if (r->h_moe_tok_idx_pinned) hipHostFree(r->h_moe_tok_idx);
     else free(r->h_moe_tok_idx);
     if (r->h_moe_tok_w_pinned) hipHostFree(r->h_moe_tok_w);
@@ -23711,6 +23763,7 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_shared_scale_batch) hipFree(r->d_shared_scale_batch);
     if (r->d_moe_gather_src) hipFree(r->d_moe_gather_src);
     if (r->d_moe_gather_w) hipFree(r->d_moe_gather_w);
+    if (r->d_moe_assign_pos) hipFree(r->d_moe_assign_pos);
 
     /* Phase 2 batched buffers */
     if (r->d_x_batch)             hipFree(r->d_x_batch);
