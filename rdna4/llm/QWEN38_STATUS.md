@@ -90,6 +90,10 @@ explicit experiments.
   returned first token 30 and hash `a2d4f49620d5b663`, at 25.84/25.86 and
   25.87/25.83 prefill/end-to-end tok/s. The instability is specific to the
   batched dispatcher, not general GPU state or model loading.
+- For completeness, forcing `OMP_NUM_THREADS=1` on the scalarized batched
+  isolation also failed to stabilize output: hashes `b9ee92610dbbc1cd` and
+  `6254e5064f4050f4` (first tokens 17 and 271). Host OpenMP scheduling is not
+  the remaining explanation.
 
 ## Explicitly unresolved
 
