@@ -114,6 +114,30 @@ grep -q 'group<groups' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: I8 KV scale writes lack inactive-group guard' >&2
     exit 1
 }
+grep -q 'n_heads / n_kv_heads == 12' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: GQA8 I8 ratio guard regressed' >&2
+    exit 1
+}
+grep -q 'lane==0 && key<tn)red\[key\]=sc' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: GQA8 I8 key reduction indexing regressed' >&2
+    exit 1
+}
+grep -q 'hipMemcpy(d_task_e, task_e' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: grouped resident task metadata must not reuse async pageable scratch' >&2
+    exit 1
+}
+grep -q 'hipMemcpy(task_e, r->h_moe_tok_idx' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: staged resident task metadata must not reuse async pageable scratch' >&2
+    exit 1
+}
+grep -q 'hipMemcpy(task_e, r->h_moe_tok_idx, (size_t)tasks' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: staged wave task metadata must not reuse async pageable scratch' >&2
+    exit 1
+}
+if grep -q 'hipMemcpyAsync(d_task_e, task_e' "${root_dir}/hip_llm_runner.c"; then
+    echo 'profile test: deferred grouped task metadata still uses async pageable scratch' >&2
+    exit 1
+fi
 grep -q 'head_dim > 256' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: I8 KV geometry guard missing' >&2
     exit 1
@@ -128,6 +152,10 @@ grep -q 'f32_to_fp8_e4m3_dev' "${runner_c}" || {
 }
 grep -q 'qwen4_kv_fp8' "${runner_c}" || {
     echo 'profile test: FP8 KV format plumbing missing' >&2
+    exit 1
+}
+grep -q 'disable_qsa_env' "${runner_c}" || {
+    echo 'profile test: I8 QSA disable gate missing' >&2
     exit 1
 }
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g \

@@ -50,6 +50,12 @@ The repeatable regression harness is `test_qwen4_i8_quality.sh`; set
 `QWEN38_MODEL` and `QWEN38_MTP`, then use `QWEN4_I8_QUALITY_DECODE=4` for the
 strict short-parity gate or `64` for the coherent long-horizon diagnostic.
 
+For a matched target-only 512-token/64-decode control without the sidecar,
+F16 and FP8 produced the same hash `e7e9b5ace7b8f98a` (26.06 and 24.25
+decode tok/s), while I8 produced `6f231930c119b7e6` (15.86 tok/s). This
+isolates the long-horizon drift to INT8 KV quantization/attention error rather
+than routing or recurrent state; I8 therefore remains explicit-only.
+
 ## Run
 
 From the repository root (set `TARGET` and `NEXTN` to the GGUF paths):

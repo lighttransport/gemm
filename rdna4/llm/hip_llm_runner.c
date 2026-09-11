@@ -8974,7 +8974,11 @@ static const char *hip_kernel_source =
 "      if(key<tn){const signed char *kr=key_cache+(size_t)(ts+key)*kv_dim+kv_h*head_dim;sc=0.0f;\n"
 "        for(int d=lane;d<head_dim;d+=8)sc+=q_sh[d]*qkv_byte_to_float(kr[d],key_scale[((size_t)(ts+key)*n_kv_heads+kv_h)*groups+d/32],fp8);\n"
 "        for(int z=4;z;z>>=1)sc+=__shfl_down(sc,z,8);}\n"
-"      if(tid<32)red[tid]=(tid<tn)?sc:-1e30f;__syncthreads();\n"
+"      /* One eight-lane group owns each key. Only lane 0 has the completed\n"
+"       * dot product; indexing red[] by tid retained keys 0..3 only because\n"
+"       * the other lane-0 threads have tid >= 32. */\n"
+"      if(tid<32)red[tid]=-1e30f;__syncthreads();\n"
+"      if(lane==0 && key<tn)red[key]=sc;__syncthreads();\n"
 "      for(int z=16;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}\n"
 "      float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm);\n"
 "      if(tid<32)prob[tid]=tid<tn?__expf(red[tid]-nm):0.0f;__syncthreads();\n"
@@ -16417,8 +16421,12 @@ static inline void launch_attn_decode_i8(hip_llm_runner *r,
                      &n_heads, &n_kv_heads, &head_dim, &kv_dim, &pos_p, &scale, &fp8 };
     size_t smem = ((size_t)(2 * head_dim + 2 * 256)) * sizeof(float);
     const char *gqa8 = getenv("LLM_ATTN_DECODE_I8_GQA8");
+    /* Qwen4 has a 12:1 query/KV-head ratio (24/2).  The old modulo check
+     * (`n_heads % n_kv_heads == 12`) was unreachable for that shape, so the
+     * opt-in kernel was never actually exercised. */
     if (gqa8 && atoi(gqa8) != 0 && r->fn_attn_decode_gqa8_i8 &&
-        n_heads % n_kv_heads == 12 && head_dim >= 128) {
+        n_kv_heads > 0 && n_heads % n_kv_heads == 0 &&
+        n_heads / n_kv_heads == 12 && head_dim >= 128) {
         LAUNCH(r->fn_attn_decode_gqa8_i8, n_heads, 1, 1, 256, 1, 1,
                smem, r->stream, args);
     } else {
@@ -20201,12 +20209,12 @@ static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
     if (resident_tasks) {
         int *task_e = (int *)r->d_router_logits_batch;
         int *task_p = task_e + resident_tasks;
-        hipMemcpyAsync(task_e, r->h_moe_tok_idx,
-                       (size_t)resident_tasks * sizeof(int),
-                       hipMemcpyHostToDevice, r->stream);
-        hipMemcpyAsync(task_p, r->h_router_batch,
-                       (size_t)resident_tasks * sizeof(int),
-                       hipMemcpyHostToDevice, r->stream);
+        /* The same host scratch is reused while cold experts are staged;
+         * finish the pageable H2D metadata copy before that reuse. */
+        hipMemcpy(task_e, r->h_moe_tok_idx,
+                  (size_t)resident_tasks * sizeof(int), hipMemcpyHostToDevice);
+        hipMemcpy(task_p, r->h_router_batch,
+                  (size_t)resident_tasks * sizeof(int), hipMemcpyHostToDevice);
         launch_qwen4_experts_grouped(r, cl, ne, eff, n_embd, resident_tasks);
     }
     /* Most-used cold experts are staged first. This makes promotion useful on
@@ -20255,10 +20263,13 @@ static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
                   (size_t)ne * sizeof(int), hipMemcpyHostToDevice);
         int *task_e = (int *)r->d_router_logits_batch;
         int *task_p = task_e + tasks;
-        hipMemcpyAsync(task_e, r->h_moe_tok_idx, (size_t)tasks * sizeof(int),
-                       hipMemcpyHostToDevice, r->stream);
-        hipMemcpyAsync(task_p, r->h_router_batch, (size_t)tasks * sizeof(int),
-                       hipMemcpyHostToDevice, r->stream);
+        /* The next staging wave reuses these pageable host arrays.  Publish
+         * the task list synchronously so a later wave cannot alter metadata
+         * before this grouped launch consumes it. */
+        hipMemcpy(task_e, r->h_moe_tok_idx, (size_t)tasks * sizeof(int),
+                  hipMemcpyHostToDevice);
+        hipMemcpy(task_p, r->h_router_batch, (size_t)tasks * sizeof(int),
+                  hipMemcpyHostToDevice);
         launch_qwen4_experts_grouped_stage(r, cl, eff, n_embd, tasks, bank);
         r->moe_stats.stage_waves++;
 
@@ -20643,13 +20654,14 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             int *task_p = (int *)r->h_router_batch;
             int *d_task_e = (int *)r->d_router_logits_batch;
             int *d_task_p = d_task_e + grouped_tasks;
-            /* Queue task metadata on the compute stream.  The host arrays are
-             * runner-owned scratch and remain live through this call, so a
-             * synchronous hipMemcpy here only adds a host/device fence. */
-            hipMemcpyAsync(d_task_e, task_e, (size_t)grouped_tasks * sizeof(int),
-                           hipMemcpyHostToDevice, r->stream);
-            hipMemcpyAsync(d_task_p, task_p, (size_t)grouped_tasks * sizeof(int),
-                           hipMemcpyHostToDevice, r->stream);
+            /* These pageable host arrays are reused immediately by the
+             * cold-expert walk below.  An async H2D copy may still be reading
+             * them when that walk overwrites them, corrupting grouped task
+             * IDs nondeterministically. */
+            hipMemcpy(d_task_e, task_e, (size_t)grouped_tasks * sizeof(int),
+                      hipMemcpyHostToDevice);
+            hipMemcpy(d_task_p, task_p, (size_t)grouped_tasks * sizeof(int),
+                      hipMemcpyHostToDevice);
         }
     }
     if (grouped_qwen && grouped_tasks)
@@ -20882,10 +20894,12 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             int *task_p = (int *)r->h_router_batch;
             int *d_task_e = (int *)r->d_router_logits_batch;
             int *d_task_p = d_task_e + deferred_tasks;
-            hipMemcpyAsync(d_task_e, task_e, (size_t)deferred_tasks * sizeof(int),
-                           hipMemcpyHostToDevice, r->stream);
-            hipMemcpyAsync(d_task_p, task_p, (size_t)deferred_tasks * sizeof(int),
-                           hipMemcpyHostToDevice, r->stream);
+            /* The scratch arrays are shared by every layer invocation, so
+             * they may be rewritten as soon as this function returns. */
+            hipMemcpy(d_task_e, task_e, (size_t)deferred_tasks * sizeof(int),
+                      hipMemcpyHostToDevice);
+            hipMemcpy(d_task_p, task_p, (size_t)deferred_tasks * sizeof(int),
+                      hipMemcpyHostToDevice);
             launch_qwen4_experts_grouped(r, cl, ne, eff, n_embd, deferred_tasks);
             if (r->moe_copy_pipeline) {
                 for (int e = 0; e < ne; ++e) {
@@ -21335,7 +21349,10 @@ static void forward_layer_state(hip_llm_runner *r, hip_layer *cl, int l,
                 if (r->qwen4_forward_error) return;
                 /* QSA is exactly dense through indexer_top_k+ratio-1 tokens. */
                 if ((r->qwen4_kv_i8 || r->qwen4_kv_fp8) && trunk) {
-                    int qsa = r->qwen4_kv_i8 ? hllm_qwen4_qsa_attention(r, cl, key_cache, value_cache) : 0;
+                    const char *disable_qsa_env = getenv("LLM_QWEN4_DISABLE_QSA");
+                    int disable_qsa = disable_qsa_env && atoi(disable_qsa_env) != 0;
+                    int qsa = (r->qwen4_kv_i8 && !disable_qsa) ?
+                              hllm_qwen4_qsa_attention(r, cl, key_cache, value_cache) : 0;
                     if (qsa < 0) { r->qwen4_forward_error = 1; return; }
                     if (!qsa)
                         launch_attn_decode_i8(r, r->d_xb2, r->d_q,
