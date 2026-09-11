@@ -2,6 +2,7 @@
 set -euo pipefail
 
 runner_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+runner="${QWEN38_RUNNER:-${runner_dir}/test_hip_llm}"
 model="${QWEN38_MODEL:-/mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf}"
 # Keep CPU cold-expert work bounded and consistent with the HTTP launcher.
 # Explicit OMP_NUM_THREADS remains authoritative for hardware-specific tuning.
@@ -288,8 +289,8 @@ fi
 qsa_device_select="${LLM_QWEN4_QSA_DEVICE_SELECT:-0}"
 qsa_warp_attn="${LLM_QWEN4_QSA_WARP_ATTN:-0}"
 if [[ "${QWEN38_DRY_RUN:-0}" != "0" ]]; then
-    printf 'q38fn profile: vram=%s max_seq=%s kv=%s cache_mb=%s bmax=%s batch=%s stateful=%s multi=%s balance=%s chunk=%s copy=%s delayed=%s prefill_copy=%s prefill_copy_max=%s mtp_copy=%s cpu_misses=%s exact=%s fast_prefill=%s qsa_select=%s qsa_warp=%s\n' \
-        "${vram_profile}" "${requested_max_seq}" "${kv_quant}" "${cache_mb}" \
+    printf 'q38fn profile: runner=%s vram=%s max_seq=%s kv=%s cache_mb=%s bmax=%s batch=%s stateful=%s multi=%s balance=%s chunk=%s copy=%s delayed=%s prefill_copy=%s prefill_copy_max=%s mtp_copy=%s cpu_misses=%s exact=%s fast_prefill=%s qsa_select=%s qsa_warp=%s\n' \
+        "${runner}" "${vram_profile}" "${requested_max_seq}" "${kv_quant}" "${cache_mb}" \
         "${bmax}" "${qwen_batch}" "${qwen_batch_stateful}" "${qwen_batch_multi}" "${qwen_prefill_balance}" "${prefill_chunk:-auto}" "${copy_pipeline}" "${delayed_cache}" "${prefill_copy_pipeline}" "${prefill_copy_max}" "${mtp_copy_pipeline}" "${cpu_decode_misses}" "${exact_profile}" "${fast_prefill}" "${qsa_device_select}" "${qsa_warp_attn}"
     exit 0
 fi
@@ -334,5 +335,5 @@ exec env \
     LLM_BMAX="${bmax}" \
     LLM_MOE_CPU_PREFILL_MAX_COUNT="${LLM_MOE_CPU_PREFILL_MAX_COUNT:-2}" \
     LLM_MOE_CPU_PREFILL_MAX_JOBS="${LLM_MOE_CPU_PREFILL_MAX_JOBS:-160}" \
-    "${runner_dir}/test_hip_llm" "${model}" \
+    "${runner}" "${model}" \
     --gpu-only-bench "${coding_args[@]}" --moe-cache-mb "${cache_mb}" "$@"
