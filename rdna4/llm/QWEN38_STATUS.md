@@ -108,6 +108,9 @@ explicit experiments.
   scalar KV/attention publication instead changes the first token again. All
   such switches remain opt-in and the scalar dispatcher remains the only
   quality-safe default.
+- `HIP_LAUNCH_BLOCKING=1` also failed to stabilize matched 512-token batched
+  controls: hashes `7c0b751e708b64fd` and `7ec265c22d7a16f8` (first tokens 47
+  and 12920). The variance is not eliminated by global launch serialization.
 
 ## Explicitly unresolved
 
