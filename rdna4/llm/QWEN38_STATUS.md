@@ -271,10 +271,15 @@ single-dispatch profile:
   path becomes deterministic and reproduces the non-staged hash
   (`afdf60ceeb4f0103`), confirming its arithmetic is correct and the raced
   results (`ea20ffd2b071b6c3`, `b05a25a0c51bb35c`, ...) were corrupt.
-  An intermittent wave-scheduling race remains: repeats 1--2 often match the
-  correct hash while a later repeat diverges, and neither a prefill warmup nor
-  extra stream syncs fully removes it. The staged preset is therefore
-  diagnostic; the non-staged `batch4k` stays the deterministic production
+  The residual race is the pinned-host async staging copy: with
+  `LLM_MOE_REGISTER_HOST=0` (pageable host weights, so the H2D copies block)
+  the staged path is deterministic 3/3 and matches `afdf60ceeb4f0103`, but it
+  runs at only ~119 prefill / 17.9 decode -- below the non-staged `batch4k`
+  (147/21). With `LLM_MOE_REGISTER_HOST=1` the copies are truly asynchronous
+  and the kernel reads the staging bank before the copy reliably lands, so
+  neither a prefill warmup, extra stream syncs, nor disabling promotions fully
+  removes the divergence. The staged preset is therefore diagnostic and is not
+  a net win; the non-staged `batch4k` stays the deterministic production
   profile.
 
 The `--qwen4-prefill-staging`, `LLM_QWEN4_STAGE_PROMOTE`, and
