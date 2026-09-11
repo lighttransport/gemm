@@ -218,6 +218,33 @@ Multi-chunk prefills (`prefill > BMAX`) still need the scalar fallback or a
 separate determinism fix; single-chunk 4K is the largest reproducible,
 repeatable batched production profile today.
 
+### Why the 200-tok/s prefill target is not reached yet
+
+The expert working set (512 experts x 48 layers, top-10 routing) is far larger
+than any cache that fits beside the batched scratch, so the routed-expert hit
+rate is routing-limited, not cache-size-limited:
+
+| Config | Prefill tok/s | Cache hit | H2D | Peak MiB |
+| --- | ---: | ---: | ---: | ---: |
+| 4K, BMAX=4096, cache=5000, pipeline | 147.4 | 32.4% | 124 GiB | 14,788 |
+| 4K, BMAX=4096, cache=6200, direct | 136.0 | ~32% | ~124 GiB | 16,010 |
+| 2K, BMAX=2048, cache=7800, pipeline | 142.9 | 25.6% | 90.6 GiB | 15,990 |
+
+The larger-cache 2K run has a *lower* hit rate (25.6% vs 32.4%): a shorter
+prompt issues fewer tokens per expert, so the same routing diversity fits less
+of each expert's assignments. Raising the cache to 6,200 MiB also leaves only
+294 MiB free and, with the async pipeline, reintroduces a first-repeat
+divergence; it is not adopted. `LLM_MOE_STREAM_SLOTS>2` is nondeterministic
+(three different hashes at slots=4), so two slots remain the deterministic
+default.
+
+Reaching 200 prefill / 30 decode needs a different expert execution or overlap
+strategy (for example a deterministic grouped-WMMA routed GEMM, a
+routing-aware residency policy, or halving the MoE scratch to afford a larger
+resident cache), not further tuning of the current knobs. The pipeline is
+already overlapping the transfer; the remaining limit is routed-expert
+transfer volume plus per-expert compute.
+
 The shared-memory `atomicAdd(&head_sq[head], ...)` in
 `fused_ssm_out_gated_q6k` is order-dependent but decode-only; the batched SSM
 norm uses the deterministic tree reduction in `gated_rmsnorm_silu_batch_f32`.
