@@ -111,6 +111,10 @@ explicit experiments.
 - `HIP_LAUNCH_BLOCKING=1` also failed to stabilize matched 512-token batched
   controls: hashes `7c0b751e708b64fd` and `7ec265c22d7a16f8` (first tokens 47
   and 12920). The variance is not eliminated by global launch serialization.
+- Forcing scalar token embedding (`LLM_QWEN4_BATCH_EMBED_SCALAR=1`) likewise
+  left the batched path nondeterministic: hashes `fc6397b74e8e9d83` and
+  `83452d2dfbc8621b` (first tokens 435 and 5652). Divergence begins after or
+  within the first batched layer, not in embedding publication.
 
 ## Explicitly unresolved
 
