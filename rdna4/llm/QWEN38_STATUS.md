@@ -103,6 +103,11 @@ explicit experiments.
   `LLM_QWEN4_BATCH_ATTN_SCALAR=1` did not stabilize the batched path either:
   first tokens were 30 and 220, with hashes `525be427d6b320b5` and
   `f5829d6be7fb6728`. KV-store/attention publication is not a standalone fix.
+- The HC-scalar result is repeatable as a prefill diagnostic but not a serving
+  solution: it agrees on the first token while later decode state diverges;
+  scalar KV/attention publication instead changes the first token again. All
+  such switches remain opt-in and the scalar dispatcher remains the only
+  quality-safe default.
 
 ## Explicitly unresolved
 
