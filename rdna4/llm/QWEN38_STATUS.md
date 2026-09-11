@@ -94,6 +94,11 @@ explicit experiments.
   isolation also failed to stabilize output: hashes `b9ee92610dbbc1cd` and
   `6254e5064f4050f4` (first tokens 17 and 271). Host OpenMP scheduling is not
   the remaining explanation.
+- Forcing `LLM_QWEN4_BATCH_HC_SCALAR=1` stabilized the first decoded token
+  (`907` in both 512-token controls), but later decode still diverged: hashes
+  `3ced02b6184309f7` and `1c91fa80c934253e` at 48.84/48.35 tok/s end-to-end.
+  This identifies batched HC/PLE arithmetic as one prefill mismatch source,
+  while leaving a separate post-prefill decode-state/KV handoff issue.
 
 ## Explicitly unresolved
 
