@@ -186,6 +186,12 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
   expert kernels can read the cache/staging destination before the copy lands,
   whereas pageable copies block -- but do not remove the residual batched race.
   Three-repeat runs are therefore not sufficient evidence for this route.
+  A three-repeat full-batch `LLM_DEBUG_LAYERS=1` trace first diverges at
+  `L39 Q4 batch attn_out` (a late full-attention layer) with `q_rope`/`k_rope`
+  bitwise identical, then propagates; the remaining race is therefore in the
+  batched attention/KV path, not the MoE or SSM bodies. This matches the
+  multi-chunk localization (`L23 attn_out`) and the original "no single kernel
+  isolation fixes it" conclusion.
 - Multi-chunk stateful batching (prefill > BMAX, `LLM_QWEN4_BATCH_MULTI_CHUNK_
   FORCE=1`) remains nondeterministic: 2,048 prefill / 64 decode at BMAX=1024
   produced different first tokens/hashes across fresh processes and repeats
