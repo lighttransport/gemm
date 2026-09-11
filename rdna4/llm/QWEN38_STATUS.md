@@ -139,4 +139,29 @@ explicit experiments.
 - Persistent `/dev/kfd` access requires host/container device passthrough;
   elevated command namespaces are temporary and are not persistent access.
 
+## Remaining tasks
+
+- [ ] Find and fix the remaining batched-dispatch nondeterminism on gfx1201.
+      Repeated identical requests must produce the same first token and full
+      sequence hash before the WMMA path can be promoted from diagnostic-only.
+      Current evidence points to batched state/stream publication or the
+      post-prefill KV/decode handoff; no single kernel isolation has fixed it.
+- [ ] Add a repeatability gate to the streamed 512/2K/4K benchmark: run at
+      least two identical requests, compare first token and sequence hash, and
+      report prefill, decode, and end-to-end wall-clock tok/s together.
+- [ ] Complete a quality-gated 32K+ prompt / 8K+ streamed coding workload
+      using 512--2048-token prefill chunks and 64--128-token decode chunks.
+      Record coherence, hash/repeatability, peak VRAM, and end-to-end tok/s.
+- [ ] Re-run scalar 2K/4K controls in a persistent GPU session and capture a
+      complete footer; do not infer their throughput from timed-out runs.
+- [ ] Obtain a ROCm image with hipBLASLt development headers, rebuild the
+      accelerated prefill path, and compare it against the current scalar and
+      WMMA controls without changing the quality gate.
+- [ ] Continue FP8 KV long-context quality testing and measure the practical
+      256K prompt path. Keep F16/I8/FP8 comparisons separate; no FP4 result is
+      valid until a packed encoding and scale/error policy are specified.
+- [ ] Make GPU device passthrough persistent for benchmark sessions
+      (`/dev/kfd`, `/dev/dri`, `video`, and `render`) so results are not tied to
+      temporary elevated namespaces.
+
 Capacity-only results must not be reported as 256K-prompt throughput.
