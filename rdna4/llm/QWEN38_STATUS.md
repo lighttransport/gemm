@@ -176,16 +176,16 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
 
 ### Current reproducible state (RX 9070 XT, real 9,000-byte prompt)
 
-- Single-chunk batched (`prefill <= BMAX`), CPU experts off, **pageable host
-  weights** (`LLM_MOE_REGISTER_HOST=0`): **deterministic**. 4,096 prefill / 64
-  decode at BMAX=4096 passes 3/3 at hash `afdf60ceeb4f0103`, first token 16,
-  median 142 prefill / 19.6 decode / 129.6 end-to-end tok/s. The residual race
-  that broke earlier runs (`e3d8bf6d47dc6cc3`, `b05a25a0c51bb35c`) was the
-  *registered*-host asynchronous expert H2D: with pinned host weights
-  `hipMemcpyAsync` is truly asynchronous and the expert kernels can read the
-  cache/staging destination before the copy lands. Pageable host weights make
-  those copies block. `LLM_MOE_REGISTER_HOST=1` is ~4 tok/s faster but not
-  repeatable.
+- Single-chunk batched (`prefill <= BMAX`), CPU experts off: **still
+  nondeterministic**, though rarely. 4,096 prefill / 64 decode at BMAX=4096
+  passed multiple 3/3 runs at hash `afdf60ceeb4f0103` (median ~142--147 prefill,
+  ~20 decode), but a 5-repeat run produced four different hashes
+  (`85b97a27836205e6`, `afdf60ceeb4f0103`, `339e6a42aa562d01`,
+  `a46d5f969ea27e86`). Pageable host weights (`LLM_MOE_REGISTER_HOST=0`) fix one
+  contributor -- registered-host `hipMemcpyAsync` is truly asynchronous and the
+  expert kernels can read the cache/staging destination before the copy lands,
+  whereas pageable copies block -- but do not remove the residual batched race.
+  Three-repeat runs are therefore not sufficient evidence for this route.
 - Multi-chunk stateful batching (prefill > BMAX, `LLM_QWEN4_BATCH_MULTI_CHUNK_
   FORCE=1`) remains nondeterministic: 2,048 prefill / 64 decode at BMAX=1024
   produced different first tokens/hashes across fresh processes and repeats
@@ -205,11 +205,12 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
 
 A single 4,096-token batched dispatch fits on the 16-GiB card with BMAX=4096
 and a 5,000-MiB resident cache (peak ~14,900 MiB). `bench_qwen38_target.sh
-batch4k` wraps it: pageable host weights (`LLM_MOE_REGISTER_HOST=0`, required
-for repeatability), GPU router top-k, asynchronous cold uploads, CPU experts
-off, and `LLM_QWEN4_RESET_MOE_CACHE=1`. It passes 3/3 with hash
-`afdf60ceeb4f0103`, first token 16, at **median 142 prefill / 19.6 decode /
-129.6 end-to-end tok/s**.
+batch4k` wraps it: pageable host weights (`LLM_MOE_REGISTER_HOST=0`, which
+blocks the expert H2D copies), GPU router top-k, asynchronous cold uploads, CPU
+experts off, and `LLM_QWEN4_RESET_MOE_CACHE=1`. It usually reproduces hash
+`afdf60ceeb4f0103` at **median ~142 prefill / ~20 decode tok/s**, but a
+5-repeat run diverged, so it is the best-performing batched profile rather than
+a proven repeatable one.
 
 Two state-isolation findings drove the profile:
 
