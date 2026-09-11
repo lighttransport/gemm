@@ -22237,8 +22237,9 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                                 r->qwen4_grouped_tokens[m-1];
                 }
                 r->cur_position = pos;
-                hipMemcpyAsync(r->d_position, &pos, sizeof(int),
-                               hipMemcpyHostToDevice, r->stream);
+                /* pos is loop-local stack storage; do not enqueue an async
+                 * copy from it while the next row can reuse that address. */
+                hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice);
                 /* Grouped exact verification uses the target trunk selector
                  * (2), matching hllm_qwen4_window_forward's scalar replay.
                  * forward_one_layer() uses selector 1 for ordinary decode;
@@ -22664,8 +22665,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 if (scalar_kv_env && atoi(scalar_kv_env) != 0) {
                     for (int m = 0; m < M; ++m) {
                         int pos = position_start + m;
-                        hipMemcpyAsync(r->d_position, &pos, sizeof(int),
-                                       hipMemcpyHostToDevice, r->stream);
+                        hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice);
                         launch_kv_store_i8_devp(r, r->d_key_cache[l], r->d_value_cache[l],
                                                 r->d_key_cache_scale[l], r->d_value_cache_scale[l],
                                                 (float *)r->d_k_batch + (size_t)m * kv_dim,
@@ -22686,8 +22686,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                      * update visible to the following row without a host sync. */
                     for (int m = 0; m < M; ++m) {
                         int pos = position_start + m;
-                        hipMemcpyAsync(r->d_position, &pos, sizeof(int),
-                                       hipMemcpyHostToDevice, r->stream);
+                        hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice);
                         launch_attn_decode_i8(r,
                             (float *)r->d_attn_out_batch + (size_t)m * q_dim,
                             (float *)r->d_q_batch + (size_t)m * q_dim,

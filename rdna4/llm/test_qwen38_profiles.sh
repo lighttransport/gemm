@@ -162,6 +162,10 @@ grep -q 'LLM_QWEN4_BATCH_ROUTER_SCALAR' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: scalar-router parity diagnostic missing' >&2
     exit 1
 }
+grep -q 'hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice)' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: loop-local position publication must be synchronous' >&2
+    exit 1
+}
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g \
     LLM_QWEN4_PREFILL_COPY_PIPELINE_MAX_TOKENS=1024 "${flash}" -s 4096)"
 expect_contains "${out}" 'prefill_copy_max=1024'

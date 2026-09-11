@@ -81,6 +81,11 @@ explicit experiments.
   62.49/60.34 and 62.49/60.37 prefill/end-to-end tok/s. The remaining bug is
   therefore in broader batched state/stream publication, not one isolated
   grouped kernel; scalar dispatch remains the reference path.
+- Per-row fallback and scalar KV diagnostic loops also had an async-copy hazard:
+  each queued position transfer referenced a loop-local stack `pos`. Those
+  publications are now synchronous. Matched post-fix controls still differed
+  (`2aa0ef09c71a181b` vs `fbade0a3d53fbd73`, first tokens 17 vs 11), so this
+  was another real race but not the complete source.
 
 ## Explicitly unresolved
 
