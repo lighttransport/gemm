@@ -166,6 +166,10 @@ grep -q 'hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice)' "${
     echo 'profile test: loop-local position publication must be synchronous' >&2
     exit 1
 }
+if grep -q 'hipMemcpyAsync(r->d_position, &pos' "${root_dir}/hip_llm_runner.c"; then
+    echo 'profile test: loop-local position still uses async host source' >&2
+    exit 1
+fi
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g \
     LLM_QWEN4_PREFILL_COPY_PIPELINE_MAX_TOKENS=1024 "${flash}" -s 4096)"
 expect_contains "${out}" 'prefill_copy_max=1024'
