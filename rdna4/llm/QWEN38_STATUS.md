@@ -70,6 +70,11 @@ explicit experiments.
   first decoded token (17512 vs 220) and sequence hash
   (`70e30279debbe15f` vs `b01463d3c4871377`). The copy-publication race was
   real-risk mitigation, not the complete source of grouped nondeterminism.
+- An opt-in scalar-router diagnostic (`LLM_QWEN4_BATCH_ROUTER_SCALAR=1`) also
+  failed to stabilize matched 512-token controls: hashes were
+  `5c7ed763fe63b0da` and `c6761ef1770a4293` (first tokens 515 and 10586), at
+  71.97/66.68 and 71.10/66.07 prefill/end-to-end tok/s. Router reduction
+  ordering is therefore not the sole remaining source.
 
 ## Explicitly unresolved
 

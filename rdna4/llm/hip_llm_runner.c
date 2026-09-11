@@ -20313,8 +20313,20 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     if (ne > 1024) return -1;  /* cursor[] cap */
     /* 1. Router GEMM: [M,ne] = xnorm[M,n_embd] x Wg[ne,n_embd] (Wg is F32 -> bf16). */
     launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16_moe, r->d_xnorm_batch, M * n_embd);
-    if (gemm_run_bf16_w(r, r->d_router_logits_batch, cl->moe_gate_w_bf16,
-                           r->d_xnorm_batch_bf16_moe, M, ne, n_embd, r->stream) != 0) return -1;
+    const char *router_scalar_env = getenv("LLM_QWEN4_BATCH_ROUTER_SCALAR");
+    if (router_scalar_env && atoi(router_scalar_env) != 0) {
+        /* Diagnostic parity path: one-row router GEMM fixes the reduction
+         * order and removes batched WMMA tie noise from expert selection.
+         * Keep it opt-in because it intentionally sacrifices prefill rate. */
+        for (int m = 0; m < M; ++m) {
+            if (gemm_run_bf16_w(r,
+                    (float *)r->d_router_logits_batch + (size_t)m * ne,
+                    cl->moe_gate_w_bf16,
+                    (const char *)r->d_xnorm_batch_bf16_moe + (size_t)m * n_embd * 2,
+                    1, ne, n_embd, r->stream) != 0) return -1;
+        }
+    } else if (gemm_run_bf16_w(r, r->d_router_logits_batch, cl->moe_gate_w_bf16,
+                                r->d_xnorm_batch_bf16_moe, M, ne, n_embd, r->stream) != 0) return -1;
 
     /* 2. Top-K + softmax per token, group assignments by expert.
      * GPU grouping (no host sync) for supported quant types; host fallback otherwise. */
