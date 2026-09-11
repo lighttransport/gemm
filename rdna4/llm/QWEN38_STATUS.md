@@ -99,6 +99,10 @@ explicit experiments.
   `3ced02b6184309f7` and `1c91fa80c934253e` at 48.84/48.35 tok/s end-to-end.
   This identifies batched HC/PLE arithmetic as one prefill mismatch source,
   while leaving a separate post-prefill decode-state/KV handoff issue.
+- Forcing both `LLM_QWEN4_BATCH_KV_SCALAR=1` and
+  `LLM_QWEN4_BATCH_ATTN_SCALAR=1` did not stabilize the batched path either:
+  first tokens were 30 and 220, with hashes `525be427d6b320b5` and
+  `f5829d6be7fb6728`. KV-store/attention publication is not a standalone fix.
 
 ## Explicitly unresolved
 
