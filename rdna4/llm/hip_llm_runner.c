@@ -20336,7 +20336,9 @@ static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
         /* Promote only repeat-worthy experts.  The cache map is published on
          * this same stream after D2D copies, so the next chunk sees complete
          * weights or an ordinary miss. */
-        for (int i = 0; i < n; ++i) {
+        const char *promote_env = getenv("LLM_QWEN4_STAGE_PROMOTE");
+        int stage_promote = !promote_env || atoi(promote_env) != 0;
+        for (int i = 0; stage_promote && i < n; ++i) {
             int e = cold[first + i];
             if (cl->moe_prefill_score[e] < 4) continue;
             int slot = -1;
@@ -20782,6 +20784,12 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             expert_order[n_order++] = ei;
         }
     }
+    /* A/B diagnostic: the native quantized per-expert kernels are the default
+     * (LLM_QWEN4_NATIVE_EXPERTS=1).  Setting it to 0 falls through to the
+     * per-expert BF16 WMMA path (get_bf16_weight + gemm_bf16_own) to measure
+     * whether dequant-then-WMMA beats the native quantized kernels here. */
+    const char *native_exp_env = getenv("LLM_QWEN4_NATIVE_EXPERTS");
+    int native_experts = !native_exp_env || atoi(native_exp_env) != 0;
     for (int oi = 0; oi < n_order; ++oi) {
         int e = expert_order[oi];
         int cnt = offs[e + 1] - offs[e];
@@ -20886,7 +20894,8 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
                 continue;
             }
         }
-        if (cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
+        if (native_experts &&
+            cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
             cl->moe_up_exps_type == GGML_TYPE_Q4_K &&
             (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
              cl->moe_down_exps_type == GGML_TYPE_Q8_0)) {
@@ -20901,7 +20910,8 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             }
             continue;
         }
-        if (cl->moe_gate_exps_type == GGML_TYPE_Q5_K &&
+        if (native_experts &&
+            cl->moe_gate_exps_type == GGML_TYPE_Q5_K &&
             cl->moe_up_exps_type == GGML_TYPE_Q5_K &&
             cl->moe_down_exps_type == GGML_TYPE_Q8_0) {
             launch_qwen4_expert_q5k_q80_batch(r,
@@ -24499,6 +24509,23 @@ void hip_llm_reset_state(hip_llm_runner *r) {
             if (r->moe_copy_stream) hipStreamSynchronize(r->moe_copy_stream);
             for (int l = 0; l < 128 && l < r->n_layers; ++l)
                 r->moe_pipeline_valid[l] = 0;
+            /* Clear the Qwen4 grouped-prefill staging banks/map so the first
+             * request after load starts from the same state as later ones.
+             * Without this the staged path's first repeat differs. */
+            if (r->d_qwen4_stage_map && r->h_qwen4_stage_map) {
+                memset(r->h_qwen4_stage_map, 0xff,
+                       (size_t)r->n_experts * sizeof(int));
+                hipMemset(r->d_qwen4_stage_map, 0xff,
+                          (size_t)r->n_experts * sizeof(int));
+                size_t sg = (size_t)r->qwen4_stage_slots * r->qwen4_stage_stride_gate;
+                size_t su = (size_t)r->qwen4_stage_slots * r->qwen4_stage_stride_up;
+                size_t sd = (size_t)r->qwen4_stage_slots * r->qwen4_stage_stride_down;
+                for (int b = 0; b < 2; ++b) {
+                    if (r->d_qwen4_stage_gate[b]) hipMemset(r->d_qwen4_stage_gate[b], 0, sg);
+                    if (r->d_qwen4_stage_up[b])   hipMemset(r->d_qwen4_stage_up[b], 0, su);
+                    if (r->d_qwen4_stage_down[b]) hipMemset(r->d_qwen4_stage_down[b], 0, sd);
+                }
+            }
         }
     }
     if (r->ple_n_heads > 0) {

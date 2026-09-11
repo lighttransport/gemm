@@ -239,11 +239,39 @@ divergence; it is not adopted. `LLM_MOE_STREAM_SLOTS>2` is nondeterministic
 default.
 
 Reaching 200 prefill / 30 decode needs a different expert execution or overlap
-strategy (for example a deterministic grouped-WMMA routed GEMM, a
-routing-aware residency policy, or halving the MoE scratch to afford a larger
-resident cache), not further tuning of the current knobs. The pipeline is
-already overlapping the transfer; the remaining limit is routed-expert
-transfer volume plus per-expert compute.
+strategy, not further tuning of the current knobs. The pipeline is already
+overlapping the transfer; the remaining limit is routed-expert transfer volume
+plus per-expert compute.
+
+### Grouped routed-expert investigation
+
+Several grouped strategies were measured against the deterministic 147-tok/s
+single-dispatch profile:
+
+- **Grouped-BF16-WMMA (`gemm_bf16_grouped`) is memory-infeasible here.** The
+  all-expert staging buffer is sized `ne*N*K` bf16 (512 experts), ~15 GiB for
+  this model, and Qwen4 never allocates it (`d_expw_bf16` is skipped for
+  `is_qwen4exp`). Compacting it would require new dequant kernels, and the
+  model is transfer-bound, so doubling weight bytes to bf16 cannot win.
+- **Per-expert BF16-WMMA** (`LLM_QWEN4_NATIVE_EXPERTS=0`, a new A/B gate) was a
+  wash for prefill (146--160 vs 147) and much worse for decode (13.3 vs 21.4
+  tok/s, decode cache hit 65% vs 88%). It is also nondeterministic.
+- **Grouped resident-only** (`LLM_MOE_GROUPED_PREFILL=1`) gave no prefill gain
+  (135--148) because every layer starts with an empty per-layer cache, so there
+  is nothing resident to group; it also diverged on the third repeat.
+- **Staged grouped cold experts** (`--qwen4-prefill-staging`, cache 4000)
+  is the only grouping that helps: median 162--180 prefill / 19.5 decode,
+  hash `ea20ffd2b071b6c3`. It copies cold experts into double-buffered staging
+  banks and runs one grouped gate-up and one grouped down launch per wave
+  (346 waves, 0 fallbacks at 4K). Promotion copies to the resident cache
+  (`LLM_QWEN4_STAGE_PROMOTE=1`, default) are wasted within a single dispatch and
+  were one race source; disabling them removes that race but an intermittent
+  **first-request** divergence remains, so the staged preset is diagnostic and
+  the non-staged `batch4k` stays the deterministic production profile.
+
+The `--qwen4-prefill-staging`, `LLM_QWEN4_STAGE_PROMOTE`, and
+`LLM_QWEN4_NATIVE_EXPERTS` switches are exposed for further work; the staged
+path's first-request hazard is the next thing to isolate.
 
 The shared-memory `atomicAdd(&head_sq[head], ...)` in
 `fused_ssm_out_gated_q6k` is order-dependent but decode-only; the batched SSM

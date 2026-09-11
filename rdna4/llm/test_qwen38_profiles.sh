@@ -150,6 +150,24 @@ expect_contains "${out}" 'copy=1'
 out="$(QWEN38_DRY_RUN=1 LLM_MOE_COPY_PIPELINE=0 \
     QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
 expect_contains "${out}" 'copy=0'
+# Staged grouped-cold diagnostic preset.
+out="$(QWEN38_DRY_RUN=1 QWEN38_TARGET_PROFILE=batch4k-stage \
+    "${root_dir}/bench_qwen38_target.sh")"
+expect_contains "${out}" 'staging=1'
+expect_contains "${out}" 'cache_mb=4000'
+expect_contains "${out}" 'bmax=4096'
+grep -q -- '--qwen4-prefill-staging' "${root_dir}/bench_qwen38_target.sh" || {
+    echo 'profile test: staged grouped-cold switch missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN4_STAGE_PROMOTE' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: staged promotion switch missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN4_NATIVE_EXPERTS' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: native-vs-WMMA expert A/B switch missing' >&2
+    exit 1
+}
 # Ordered MoE combine and synchronous CPU-result publication.
 grep -q 'moe_scatter_accum_ordered' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: ordered MoE scatter missing' >&2
