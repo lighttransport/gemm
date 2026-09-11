@@ -147,6 +147,12 @@ expect_contains "${out}" 'multi=0'
 expect_contains "${out}" 'force_multi=0'
 expect_contains "${out}" 'cpu_prefill_jobs=0'
 expect_contains "${out}" 'copy=1'
+# Registered (pinned) host expert weights break repeatability, so the batched
+# presets must default to pageable host weights.
+expect_contains "${out}" 'reg=0'
+out="$(QWEN38_DRY_RUN=1 LLM_MOE_REGISTER_HOST=1 \
+    QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
+expect_contains "${out}" 'reg=1'
 out="$(QWEN38_DRY_RUN=1 LLM_MOE_COPY_PIPELINE=0 \
     QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
 expect_contains "${out}" 'copy=0'

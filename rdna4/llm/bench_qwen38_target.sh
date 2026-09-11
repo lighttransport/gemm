@@ -162,7 +162,12 @@ case "${profile}" in
             cache_mb="${QWEN38_MOE_CACHE_MB:-5000}"
         fi
         bmax="${LLM_BMAX:-4096}"
-        register_host="${LLM_MOE_REGISTER_HOST:-1}"
+        # Registered (pinned) host expert weights make hipMemcpyAsync truly
+        # asynchronous and the expert kernels can read the cache/staging
+        # destination before the copy lands, so the batched route is not
+        # repeatable.  Pageable host weights (register 0) make those copies
+        # block and are deterministic for ~4 tok/s less prefill.
+        register_host="${LLM_MOE_REGISTER_HOST:-0}"
         gpu_topk="${LLM_QWEN4_PREFILL_GPU_TOPK:-1}"
         qwen_batch="${LLM_QWEN4_BATCH:-1}"
         batch_ssm="${QWEN38_TARGET_BATCH_SSM:-1}"
@@ -217,11 +222,11 @@ if [[ "${profile}" == "batch" || "${profile}" == "batch-cpu" ]]; then
 fi
 
 if [[ "${QWEN38_DRY_RUN:-0}" != "0" ]]; then
-    printf 'target gate profile: profile=%s prefill=%s decode=%s context=%s repeats=%s cache_mb=%s bmax=%s batch=%s batch_ssm=%s attn_max=%s gpu_topk=%s approx=%s coding=%s stream_chunk=%s q6k=%s recur=%s conv=%s parity=%s native_qkv=%s multi=%s stateful=%s force_multi=%s cpu_prefill_jobs=%s cpu_decode_misses=%s copy=%s staging=%s\n' \
+    printf 'target gate profile: profile=%s prefill=%s decode=%s context=%s repeats=%s cache_mb=%s bmax=%s batch=%s batch_ssm=%s attn_max=%s gpu_topk=%s approx=%s coding=%s stream_chunk=%s q6k=%s recur=%s conv=%s parity=%s native_qkv=%s multi=%s stateful=%s force_multi=%s cpu_prefill_jobs=%s cpu_decode_misses=%s copy=%s staging=%s reg=%s\n' \
         "${profile}" "${prefill}" "${decode}" "${context}" "${repeats}" "${cache_mb}" \
         "${bmax}" "${qwen_batch}" "${batch_ssm}" "${attn_max}" "${gpu_topk}" "${approx_decode}" "${coding}" "${stream_chunk:-auto}" \
         "${ssm_batch_q6k}" "${ssm_batch_recur}" "${ssm_batch_conv}" "${ssm_batch_parity}" "${native_batch_qkv}" \
-        "${multi_chunk}" "${stateful}" "${force_multi}" "${cpu_prefill_jobs}" "${cpu_decode_misses}" "${copy_pipeline}" "${prefill_staging}"
+        "${multi_chunk}" "${stateful}" "${force_multi}" "${cpu_prefill_jobs}" "${cpu_decode_misses}" "${copy_pipeline}" "${prefill_staging}" "${register_host}"
     exit 0
 fi
 
