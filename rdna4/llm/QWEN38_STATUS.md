@@ -65,6 +65,11 @@ explicit experiments.
   copies from pageable scratch that was overwritten during the subsequent
   cold-expert walk. Those metadata copies now complete synchronously before
   scratch reuse; runtime parity still needs a model-mounted rerun.
+- The post-fix 2,048-token grouped controls both passed, at 115.61/109.73
+  prefill/end-to-end tok/s and 118.97/113.57 tok/s, but still diverged at the
+  first decoded token (17512 vs 220) and sequence hash
+  (`70e30279debbe15f` vs `b01463d3c4871377`). The copy-publication race was
+  real-risk mitigation, not the complete source of grouped nondeterminism.
 
 ## Explicitly unresolved
 
