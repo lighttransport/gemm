@@ -377,6 +377,12 @@ tokens I8 measured 8.34 decode / 7.38 end-to-end tok/s (hash
 `994e0df7ffcf7854`) and F16 measured 8.36 / 7.34 (hash `4b8937cd7db0e7a7`).
 Thus I8 is validated for short exact parity and coherent output, but is not
 claimed bit-identical beyond the short horizon.
+The matched scalar 512/64 control remains hash-identical, so the divergence is
+not evidence of a basic cache-layout error. It appears only in the longer
+exact-MTP transaction, where repeated quantized trunk attention and MTP
+accept/reject state amplify small symmetric 32-channel reconstruction errors;
+the FP8 control remains hash-identical over the same 64-token probe. I8 stays
+explicit-only while this accumulated-error mechanism is investigated.
 
 The new FP8 path passed target-only and exact-MTP 4K smoke tests. On the same
 28-token/64-output coding probe it reached 8.61 decode and 7.48 end-to-end
