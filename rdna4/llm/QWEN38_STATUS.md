@@ -176,16 +176,24 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
 
 ### Current reproducible state (RX 9070 XT, real 9,000-byte prompt)
 
-- Single-chunk batched (`prefill <= BMAX`), CPU experts off: **deterministic**.
-  1,024 prefill / 64 decode with BMAX=1024 passed 3/3 repeats at hash
-  `de829a7459a1b96b`, first token 220 (median 69.10 prefill / 11.76 decode
-  tok/s, 13,444 MiB peak).
+- Single-chunk batched (`prefill <= BMAX`), CPU experts off: **not yet reliably
+  deterministic**. Early 3/3 passes (1,024 prefill / 64 decode, BMAX=1024,
+  hash `de829a7459a1b96b`; 4,096 prefill, BMAX=4096, hash
+  `afdf60ceeb4f0103`, median 133 prefill / 20.9 decode) were not sufficient: a
+  longer run then produced a divergent repeat (`e3d8bf6d47dc6cc3`,
+  `b05a25a0c51bb35c`) in both the async-pipeline and direct-copy variants. The
+  residual nondeterminism is therefore in the batched MoE path itself (roughly
+  one repeat in three to six), not only in the staged or CPU paths; the
+  repeatability gate catches it. Treat the batched profiles as diagnostic until
+  this is fixed, and use the scalar route for quality-safe serving.
 - Multi-chunk stateful batching (prefill > BMAX, `LLM_QWEN4_BATCH_MULTI_CHUNK_
   FORCE=1`) remains nondeterministic: 2,048 prefill / 64 decode at BMAX=1024
   produced different first tokens/hashes across fresh processes and repeats
   even with CPU experts off. A single 2,048-token chunk with BMAX=2048 and no
-  stream split *is* deterministic (`ef53e9e077515a3a`, 2/2), so the defect is
-  specifically the inter-chunk state carry. A two-repeat full-batch
+  stream split passed 2/2 (`ef53e9e077515a3a`) and the 4,096-token single chunk
+  passed initial 3/3 runs, so the multi-chunk carry is the *larger* defect; a
+  rarer batched-path race still affects all single-chunk sizes intermittently
+  (see above). A two-repeat full-batch
   `LLM_DEBUG_LAYERS=1` trace of the two-chunk run first diverges at
   `L23 Q4 batch attn_out` (~94% through the trace, i.e. inside the second
   chunk); forward outputs of the second chunk are bitwise stable until then.
@@ -193,14 +201,16 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
 - The scalar `fast` route remains repeatable (3/3, hash `6d67721190bdaa83`) but
   only ~24 tok/s prefill at 4K.
 
-### Deterministic 4K batched profile (`batch4k`)
+### 4K batched profile (`batch4k`)
 
 A single 4,096-token batched dispatch fits on the 16-GiB card with BMAX=4096
 and a 5,000-MiB resident cache (peak 14,788 MiB). `bench_qwen38_target.sh
 batch4k` wraps it: pinned host weights, GPU router top-k, asynchronous cold
-uploads, CPU experts off, and `LLM_QWEN4_RESET_MOE_CACHE=1`. Three repeats pass
-with the same hash `afdf60ceeb4f0103` and first token 16 at **median 147.4
-prefill / 21.4 decode / 135.2 end-to-end tok/s** (prefill min 137.1).
+uploads, CPU experts off, and `LLM_QWEN4_RESET_MOE_CACHE=1`. Its first few
+3-repeat runs passed with hash `afdf60ceeb4f0103` and first token 16 at
+**median 147.4 prefill / 21.4 decode / 135.2 end-to-end tok/s** (prefill min
+137.1), but a later run diverged on one repeat, so this is the best-performing
+batched profile, **not** a proven-deterministic one (see the caveat above).
 
 Two state-isolation findings drove the profile:
 
