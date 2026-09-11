@@ -116,6 +116,48 @@ static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
 
 static int argmax_logits(const float *logits, int n);
 
+/* Coding-only sampler variant. Keep the production sampler above with its
+ * small standalone signature because test_sampler.py extracts it directly;
+ * delimiter filtering belongs in this opt-in wrapper instead. */
+static int sample_top_k_p_coding(const float *logits, int n, int top_k, float top_p,
+                                 float temperature, float presence_penalty,
+                                 float repetition_penalty, float min_p,
+                                 const unsigned char *seen, unsigned *rng,
+                                 const bpe_vocab *vocab) {
+    if (top_k < 1) top_k = 1;
+    if (top_k > 64) top_k = 64;
+    int ids[64]; float vals[64];
+    for (int j = 0; j < top_k; ++j) { ids[j] = -1; vals[j] = -INFINITY; }
+    for (int i = 0; i < n; ++i) {
+        const char *piece = vocab ? bpe_token_to_str(vocab, i) : NULL;
+        if (piece && piece[0] == '<' && piece[1] == '|') continue;
+        float v = logits[i] - ((seen && seen[i]) ? presence_penalty : 0.0f);
+        if (seen && seen[i] && repetition_penalty != 1.0f)
+            v = v < 0.0f ? v * repetition_penalty : v / repetition_penalty;
+        if (!isfinite(v) || v <= vals[top_k - 1]) continue;
+        int j = top_k - 1;
+        while (j > 0 && v > vals[j - 1]) {
+            vals[j] = vals[j - 1]; ids[j] = ids[j - 1]; --j;
+        }
+        vals[j] = v; ids[j] = i;
+    }
+    if (ids[0] < 0) return 0;
+    while (top_k > 1 && ids[top_k - 1] < 0) --top_k;
+    if (temperature <= 0.0f || top_k == 1) return ids[0];
+    if (min_p > 0.0f) {
+        float cutoff = vals[0] + logf(min_p);
+        while (top_k > 1 && vals[top_k - 1] < cutoff) --top_k;
+    }
+    float sum = 0.0f, max_logit = vals[0];
+    for (int j = 0; j < top_k; ++j) { vals[j] = expf((vals[j] - max_logit) / temperature); sum += vals[j]; }
+    float keep = 0.0f; int nkeep = 0;
+    do { keep += vals[nkeep++]; } while (nkeep < top_k && keep < top_p * sum);
+    *rng ^= *rng << 13; *rng ^= *rng >> 17; *rng ^= *rng << 5;
+    float pick = ((float)(*rng & 0x00ffffffu) / 16777216.0f) * keep;
+    for (int j = 0; j < nkeep; ++j) { pick -= vals[j]; if (pick <= 0.0f) return ids[j]; }
+    return ids[nkeep - 1];
+}
+
 static volatile sig_atomic_t g_stdio_cancel;
 
 static void stdio_cancel_handler(int signo) {
@@ -328,6 +370,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         const char *batch_env = getenv("LLM_BMAX");
         if (batch_env) batch_size = atoi(batch_env);
         if (batch_size < 1) batch_size = 1;
+        const char *publish_chunk_env = getenv("LLM_QWEN4_PREFILL_COPY_PIPELINE_PUBLISH_CHUNK");
+        int publish_chunk = publish_chunk_env && atoi(publish_chunk_env) != 0;
         int prompt_added = n_tokens - common;
         int batches = prompt_added > 0 ? (prompt_added + batch_size - 1) / batch_size : 0;
         if (!restored_prefix && requested_prefix > common && requested_prefix < n_tokens) {
@@ -346,6 +390,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             if (g_stdio_cancel) { cancelled = 1; break; }
             int cc = prompt_added - off;
             if (cc > batch_size) cc = batch_size;
+            if (publish_chunk)
+                hip_llm_set_qwen4_batch_request_tokens(gpu, cc);
             if (!restored_prefix && requested_prefix > 0 && common + off < requested_prefix &&
                 common + off + cc > requested_prefix)
                 cc = requested_prefix - common - off;
@@ -506,12 +552,18 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         hip_llm_set_decode_mode(gpu, 0);
         double prefill_ms = t_prefill1 - t_prefill0;
         double decode_ms = t_decode1 - t_decode0;
+        double end_to_end_ms = t_decode1 - t_prefill0;
+        int end_to_end_tokens = prompt_added + generated;
         fprintf(stderr,
                 "llm_server: prompt=%d cached=%d added=%d batches=%d batch=%d "
                 "prefill=%.2f ms (%.2f tok/s) decode=%d in %.2f ms (%.2f tok/s)\n",
                 n_tokens, common, prompt_added, batches, batch_size,
                 prefill_ms, prefill_ms > 0.0 ? 1000.0 * prompt_added / prefill_ms : 0.0,
                 generated, decode_ms, decode_ms > 0.0 ? 1000.0 * generated / decode_ms : 0.0);
+        fprintf(stderr,
+                "llm_server: end-to-end=%d prompt-added + %d generated in %.2f ms (%.2f tok/s)\n",
+                prompt_added, generated, end_to_end_ms,
+                end_to_end_ms > 0.0 ? 1000.0 * end_to_end_tokens / end_to_end_ms : 0.0);
         {
             hip_llm_moe_stats ms;
             if (hip_llm_get_moe_stats(gpu, &ms) == 0 &&
@@ -526,6 +578,16 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                         (unsigned long long)ms.cpu_assignments,
                         (unsigned long long)ms.gpu_assignments,
                         (unsigned long long)ms.skipped_assignments, ms.cpu_ms);
+            }
+        }
+        {
+            hip_llm_vram_stats vs = { .struct_size = sizeof(vs) };
+            if (hip_llm_get_vram_stats(gpu, &vs) == 0) {
+                fprintf(stderr,
+                        "llm_server: VRAM free=%.1f MiB total=%.1f MiB peak-used=%.1f MiB\n",
+                        vs.free_bytes / (double)(1ULL << 20),
+                        vs.total_bytes / (double)(1ULL << 20),
+                        vs.peak_used_bytes / (double)(1ULL << 20));
             }
         }
         size_t enc_n = 0; char *enc = b64_encode((const unsigned char *)(text ? text : ""), text_n, &enc_n);
@@ -1318,6 +1380,8 @@ int main(int argc, char **argv) {
     }
     if (verify_qwen4_qsa) {
         int rc=hip_llm_verify_qwen4_qsa(gpu);
+        fprintf(stderr, "Qwen4 QSA verifier: %s (rc=%d)\n",
+                rc ? "FAIL" : "PASS", rc);
         hip_llm_free(gpu);if(cpu_model)transformer_free(cpu_model);
         bpe_vocab_free(vocab);gguf_close_shards(gguf_model);return rc?1:0;
     }
@@ -1440,12 +1504,49 @@ int main(int argc, char **argv) {
         int stream_chunk = 0;
         const char *stream_chunk_env = getenv("LLM_BENCH_STREAM_CHUNK");
         if (stream_chunk_env) stream_chunk = atoi(stream_chunk_env);
+        if (!stream_chunk_env && n_prefill > 2048) {
+            /* Keep direct test_hip_llm invocations on the same bounded
+             * large-request path as the serving launcher.  A single 4K+
+             * dispatch can exhaust gfx1201 scratch before quality or timing
+             * is even observable. */
+            stream_chunk = 512;
+            fprintf(stderr, "Large prefill: defaulting to streamed chunks (%d tokens)\n",
+                    stream_chunk);
+        }
         if (stream_chunk < 1 || stream_chunk >= n_prefill) stream_chunk = 0;
         if (stream_chunk > 0) {
+            const char *batch_env = getenv("LLM_QWEN4_BATCH");
+            const char *publish_chunk_env = getenv("LLM_BENCH_STREAM_PUBLISH_CHUNK");
+            int publish_chunk = publish_chunk_env && atoi(publish_chunk_env) != 0;
+            /* No batch knob means the runner's parity-safe scalar default. */
+            int scalar_stream = !batch_env || atoi(batch_env) == 0;
+            if (scalar_stream)
+                fprintf(stderr, "Large prefill: scalar streamed forward (dispatcher bypass)\n");
             for (int off = 0; off < n_prefill; off += stream_chunk) {
                 int cc = n_prefill - off;
                 if (cc > stream_chunk) cc = stream_chunk;
-                last_logits = hip_llm_forward_batch_logits(gpu, tokens + off, cc, off);
+                /* The overlap path is guarded by the published request
+                 * length.  Serving-shaped chunk publication keeps a long
+                 * request on the validated 1K window instead of enabling a
+                 * single unsafe 4K pipeline reservation. */
+                if (publish_chunk)
+                    hip_llm_set_qwen4_batch_request_tokens(gpu, cc);
+                if (scalar_stream) {
+                    for (int i = 0; i < cc; ++i) {
+                        /* Match hip_llm_forward_batch_logits fallback:
+                         * intermediate prefill tokens only advance the hidden
+                         * state; materialize the vocab head once at the final
+                         * token.  Computing 248K logits for every prompt
+                         * token dominated the supposedly safe path. */
+                        int is_last = (off + i + 1 == n_prefill);
+                        last_logits = is_last ?
+                            hip_llm_forward_logits(gpu, tokens[off + i], off + i) :
+                            hip_llm_forward(gpu, tokens[off + i], off + i);
+                        if (!last_logits) break;
+                    }
+                } else {
+                    last_logits = hip_llm_forward_batch_logits(gpu, tokens + off, cc, off);
+                }
                 if (!last_logits) break;
             }
         } else {
@@ -1454,9 +1555,9 @@ int main(int argc, char **argv) {
         if (!last_logits) { fprintf(stderr, "GPU forward_batch_logits failed\n"); pass = 0; goto bench_done; }
         seen = coding_mode ? (unsigned char *)calloc((size_t)n_vocab, 1) : NULL;
         unsigned sample_rng = 0x51f15e5du;
-        int next_tok = coding_mode ? sample_top_k_p(last_logits, n_vocab, 20, 0.80f,
+        int next_tok = coding_mode ? sample_top_k_p_coding(last_logits, n_vocab, 20, 0.80f,
                                                     0.70f, 1.50f, 1.0f, 0.0f, seen,
-                                                    &sample_rng)
+                                                    &sample_rng, vocab)
                                    : argmax_logits(last_logits, n_vocab);
         double t_pf1 = get_time_ms();
         double prefill_ms = t_pf1 - t_pf0;
@@ -1481,11 +1582,15 @@ int main(int argc, char **argv) {
             double t_dec0 = get_time_ms();
             int mtp_approx_fallback = 0;
             int mtp_adaptive_fallback = 0;
+            int mtp_runtime_draft = qwen4_mtp_draft;
+            const int mtp_adaptive_shrink =
+                getenv("LLM_QWEN4_MTP_ADAPTIVE_SHRINK") &&
+                atoi(getenv("LLM_QWEN4_MTP_ADAPTIVE_SHRINK")) != 0;
             for (int k = 0; k < decode_n; k++) {
                 if (qwen4_mtp && !coding_mode && !mtp_approx_fallback && !mtp_adaptive_fallback) {
                     hip_llm_qwen4_mtp_result mtp;
                     if (hip_llm_qwen4_mtp_step(gpu, next_tok, n_prefill+k,
-                            qwen4_mtp_draft, decode_n-k, NULL, 0, &mtp)) {
+                            mtp_runtime_draft, decode_n-k, NULL, 0, &mtp)) {
                         fprintf(stderr, "GPU MTP failed at decode k=%d\n", k); pass=0; break;
                     }
                     for (int i=0;i<mtp.emitted;++i) {
@@ -1502,9 +1607,22 @@ int main(int argc, char **argv) {
                     }
                     if (getenv("LLM_QWEN4_MTP_ADAPTIVE") && mtp.drafted > 0 &&
                         mtp.accepted * 2 < mtp.drafted) {
-                        mtp_adaptive_fallback = 1;
-                        fprintf(stderr, "MTP acceptance=%d/%d; adaptive target fallback\n",
-                                mtp.accepted, mtp.drafted);
+                        if (mtp_adaptive_shrink && mtp_runtime_draft > 1) {
+                            int old_width = mtp_runtime_draft;
+                            mtp_runtime_draft = (mtp_runtime_draft + 1) / 2;
+                            fprintf(stderr, "MTP acceptance=%d/%d; adaptive draft width %d->%d\n",
+                                    mtp.accepted, mtp.drafted, old_width, mtp_runtime_draft);
+                        } else {
+                            mtp_adaptive_fallback = 1;
+                            fprintf(stderr, "MTP acceptance=%d/%d; adaptive target fallback\n",
+                                    mtp.accepted, mtp.drafted);
+                        }
+                    } else if (mtp_adaptive_shrink && mtp.drafted > 0 &&
+                               mtp.accepted == mtp.drafted &&
+                               mtp_runtime_draft < qwen4_mtp_draft) {
+                        mtp_runtime_draft++;
+                        fprintf(stderr, "MTP full acceptance; adaptive draft width ->%d\n",
+                                mtp_runtime_draft);
                     }
                     continue;
                 }
@@ -1519,9 +1637,9 @@ int main(int argc, char **argv) {
                     float *lg = hip_llm_forward_logits(gpu, next_tok, pos);
                     if (!lg) { fprintf(stderr, "GPU forward_logits failed at decode k=%d\n", k); pass = 0; break; }
                     if (seen && next_tok >= 0 && next_tok < n_vocab) seen[next_tok] = 1;
-                    next_tok = sample_top_k_p(lg, n_vocab, 20, 0.80f,
+                    next_tok = sample_top_k_p_coding(lg, n_vocab, 20, 0.80f,
                                               0.70f, 1.50f, 1.0f, 0.0f, seen,
-                                              &sample_rng);
+                                              &sample_rng, vocab);
                 }
                 decoded++;
                 if (gen_text) { const char *s = bpe_token_to_str(vocab, next_tok); if (s) fprintf(stderr, "%s", s); }
@@ -1642,6 +1760,14 @@ int main(int argc, char **argv) {
                         (unsigned long long)ms.stage_fallbacks, ms.cpu_ms);
                 }
             }
+        }
+        {
+            hip_llm_vram_stats vs = { .struct_size = sizeof(vs) };
+            if (hip_llm_get_vram_stats(gpu, &vs) == 0)
+                fprintf(stderr, "VRAM: free %.1f / %.1f MiB, peak used %.1f MiB\n",
+                        vs.free_bytes / (double)(1ULL << 20),
+                        vs.total_bytes / (double)(1ULL << 20),
+                        vs.peak_used_bytes / (double)(1ULL << 20));
         }
         fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
 bench_done:

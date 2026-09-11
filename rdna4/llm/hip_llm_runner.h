@@ -62,6 +62,13 @@ typedef struct {
     double gpu_moe_ms;
 } hip_llm_moe_stats;
 
+typedef struct {
+    uint32_t struct_size;
+    uint64_t total_bytes;
+    uint64_t free_bytes;
+    uint64_t peak_used_bytes;
+} hip_llm_vram_stats;
+
 /* Contract exported by a Qwen4exp NextN/MTP sidecar.  The sidecar shares the
  * trunk embedding and output head, so it must be checked before allocating
  * its independent layer state on the GPU. */
@@ -139,6 +146,8 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                                  const hip_llm_load_options *options);
 
 int hip_llm_get_moe_stats(const hip_llm_runner *r, hip_llm_moe_stats *stats);
+/* Current free/total VRAM plus high-water usage sampled after forwards. */
+int hip_llm_get_vram_stats(const hip_llm_runner *r, hip_llm_vram_stats *stats);
 void hip_llm_reset_moe_stats(hip_llm_runner *r);
 int hip_llm_verify_hc_batch(hip_llm_runner *r, int batch,
                             double *out_rel_l2, double *out_max_abs);

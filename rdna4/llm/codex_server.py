@@ -163,16 +163,60 @@ def fit_context(messages, context_tokens, output_tokens):
 
 class Backend:
     def __init__(self, args):
+        trust_mtp = getattr(args, "qwen4_mtp_trust_draft", False)
         cmd = [args.runner, args.model, "--stdio-server", "--gpu-only-bench", "-s", str(args.context)]
         if args.moe_cache_mb:
             cmd += ["--moe-cache-mb", str(args.moe_cache_mb)]
-        if args.coding:
+        # The child intentionally disables MTP in coding mode.  Trusted MTP
+        # is an explicit greedy/approximate request, so let it select the
+        # sidecar path even if the surrounding server profile is coding.
+        effective_coding = args.coding and not trust_mtp
+        if effective_coding:
             cmd += ["--coding"]
-        if args.qwen4_coding_profile:
+        if args.qwen4_coding_profile and not trust_mtp:
             cmd += ["--qwen4-coding-profile"]
-        self.coding = args.coding
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=None, text=True, bufsize=1)
+        if args.qwen4_exact:
+            cmd += ["--qwen4-exact"]
+        if args.qwen4_mtp:
+            cmd += ["--qwen4-mtp", args.qwen4_mtp,
+                    "--qwen4-mtp-draft", str(args.qwen4_mtp_draft),
+                    "--qwen4-mtp-cache-mb", str(args.qwen4_mtp_cache_mb),
+                    "--qwen4-mtp-verify", args.qwen4_mtp_verify]
+        runner_env = os.environ.copy()
+        # Keep direct codex_server launches consistent with the ROCm launcher:
+        # explicit approximate decode uses the six-token exact-refresh cadence
+        # that passed the 256K coding control.  An explicit caller override
+        # remains authoritative.
+        if runner_env.get("LLM_QWEN4_APPROX_DECODE", "0") != "0":
+            runner_env.setdefault("LLM_QWEN4_DEVICE_REFRESH_INTERVAL", "6")
+        if args.qwen4_exact and args.qwen4_mtp:
+            # Exact Qwen3.8 MTP uses staged cold misses by default. Direct BAR
+            # mapping remains an explicit diagnostic override; Q6_K/Q8_0
+            # mapped kernels are not parity-safe yet.
+            runner_env.setdefault("LLM_MOE_REGISTER_HOST", "1")
+            runner_env.setdefault("LLM_QWEN4_MAPPED_MISSES", "1")
+            runner_env.setdefault("LLM_QWEN4_DIRECT_MISSES", "0")
+            runner_env.setdefault("LLM_MOE_CPU_DECODE_MISSES", "0")
+            runner_env.setdefault("LLM_BMAX", "1")
+            if not args.moe_cache_mb:
+                cmd += ["--moe-cache-mb", "9728"]
+        if getattr(args, "qwen4_mtp_adaptive", False):
+            runner_env["LLM_QWEN4_MTP_ADAPTIVE"] = "1"
+        self.coding = effective_coding
+        if trust_mtp:
+            if not args.qwen4_mtp or args.qwen4_exact:
+                raise ValueError("--qwen4-mtp-trust-draft requires approximate --qwen4-mtp")
+            runner_env["LLM_QWEN4_MTP_APPROX"] = "1"
+            runner_env["LLM_QWEN4_MTP_TRUST_DRAFT"] = "1"
+        # Put the runner in its own process group.  A timeout or service
+        # manager may terminate this Python parent without running `finally`;
+        # group teardown then prevents a model-sized HIP child from retaining
+        # VRAM and poisoning the next benchmark.
+        popen_kwargs = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=None, text=True, bufsize=1, env=runner_env)
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+        self.proc = subprocess.Popen(cmd, **popen_kwargs)
         self.lock = threading.Lock()
         self.cancel_lock = threading.Lock()
         self.active_cancel = None
@@ -202,11 +246,23 @@ class Backend:
     def close(self):
         """Stop and reap the resident runner during server shutdown."""
         if self.proc.poll() is None:
-            self.proc.terminate()
+            if os.name == "posix" and hasattr(self.proc, "pid"):
+                try:
+                    os.killpg(self.proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                self.proc.terminate()
         try:
             self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
+            if os.name == "posix" and hasattr(self.proc, "pid"):
+                try:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                self.proc.kill()
             self.proc.wait()
 
     def _wait_ready(self, timeout=None):
@@ -256,6 +312,7 @@ class Backend:
 
     def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, repetition, min_p,
                  prefix="", cancellation=None, on_token=None):
+        request_start = time.monotonic()
         cancellation = cancellation if cancellation is not None else threading.Event()
         prefix_payload = base64.b64encode(prefix.encode("utf-8")).decode("ascii") if prefix else "-"
         payload = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
@@ -315,6 +372,14 @@ class Backend:
                                           if float(prefill_ms) > 0 else 0.0)
         self.last_metrics["tg_tok_s"] = (1000.0 * int(completion_tokens) / float(decode_ms)
                                           if float(decode_ms) > 0 else 0.0)
+        # Measure the complete runner request, including protocol and
+        # synchronization overhead.  This is the number users experience for
+        # a streamed 256K request; pp/tg are useful component rates only.
+        e2e_ms = (time.monotonic() - request_start) * 1000.0
+        self.last_metrics["e2e_ms"] = e2e_ms
+        self.last_metrics["e2e_tok_s"] = (
+            1000.0 * (int(prompt_tokens) - int(cached) + int(completion_tokens)) / e2e_ms
+            if e2e_ms > 0.0 else 0.0)
         text = base64.b64decode(encoded).decode("utf-8", "replace")
         return text, int(cached), int(prompt_tokens), int(completion_tokens), finish
 
@@ -679,6 +744,15 @@ def main():
     ap.add_argument("--moe-cache-mb", type=int, default=0)
     ap.add_argument("--coding", action="store_true")
     ap.add_argument("--qwen4-coding-profile", action="store_true")
+    ap.add_argument("--qwen4-mtp", help="NextN sidecar; accelerate greedy requests only")
+    ap.add_argument("--qwen4-exact", action="store_true", help="exact Qwen4 routing/QSA baseline")
+    ap.add_argument("--qwen4-mtp-draft", type=int, choices=range(1, 33), default=1)
+    ap.add_argument("--qwen4-mtp-cache-mb", type=int, default=128)
+    ap.add_argument("--qwen4-mtp-verify", choices=("scalar", "window"), default="scalar")
+    ap.add_argument("--qwen4-mtp-trust-draft", action="store_true",
+                    help="approximate sidecar-only MTP; skips target verification")
+    ap.add_argument("--qwen4-mtp-adaptive", action="store_true",
+                    help="exact MTP fallback after low draft acceptance")
     args = ap.parse_args()
     Handler.backend = Backend(args)
     Handler.model = Handler.backend.model

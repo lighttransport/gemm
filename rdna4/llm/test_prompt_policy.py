@@ -28,7 +28,8 @@ int main(void) {
     kv[1].value.b = 1;
     assert(prompt_bos_id(&ctx) == 248044);
     ctx.n_kv = 1;
-    assert(prompt_bos_id(&ctx) == 248044);
+    /* A BOS id without the explicit add_bos_token flag must not prepend BOS. */
+    assert(prompt_bos_id(&ctx) == -1);
     ctx.n_kv = 0;
     assert(prompt_bos_id(&ctx) == -1);
     setenv("LLM_ADD_BOS", "42", 1);
