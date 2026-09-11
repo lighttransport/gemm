@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 /* ---- Error checking macros (return -1 or NULL) ---- */
 
@@ -71,9 +72,29 @@ static uint8_t hip_f32_to_fp8_e4m3(float f) {
     uint32_t sign = (bits >> 31) & 1;
     int32_t exp = ((bits >> 23) & 0xFF) - 127 + 7; /* rebias to E4M3 */
     uint32_t mant = (bits >> 20) & 0x7; /* top 3 mantissa bits */
+    uint32_t rem = bits & ((1u << 20) - 1u);
+    /* Round to nearest, ties to even before packing the E4M3 mantissa. */
+    if (rem > (1u << 19) || (rem == (1u << 19) && (mant & 1u))) {
+        if (++mant == 8u) { mant = 0; ++exp; }
+    }
     if (exp >= 15) { exp = 15; mant = 0x6; } /* clamp to max finite */
     if (exp <= 0) return (uint8_t)(sign << 7); /* flush subnormals to zero */
     return (uint8_t)((sign << 7) | ((exp & 0xF) << 3) | (mant & 0x7));
+}
+
+/* Inverse of hip_f32_to_fp8_e4m3.  The encoder deliberately flushes
+ * subnormals and clamps finite values to the E4M3 range, so preserve those
+ * semantics here rather than fabricating subnormal support in a future KV
+ * decoder. */
+static float hip_fp8_e4m3_to_f32(uint8_t v) {
+    uint32_t sign = (uint32_t)(v >> 7);
+    uint32_t exp = (uint32_t)((v >> 3) & 0xF);
+    uint32_t mant = (uint32_t)(v & 0x7);
+    if (exp == 0) return sign ? -0.0f : 0.0f;
+    if (exp == 0xF && mant == 0x7) return NAN;
+    float x = (1.0f + (float)mant * (1.0f / 8.0f)) *
+              ldexpf(1.0f, (int)exp - 7);
+    return sign ? -x : x;
 }
 
 /* ---- Raw GPU upload (synchronous) ---- */
@@ -109,7 +130,7 @@ static int hip_compile_kernels_ex(hipModule_t *module, int device_id,
 
     /* HIPRTC compilation dominates cold-start time for the large LLM kernel
      * bundle.  Cache the architecture- and source-specific code object in
-     * /tmp; changing any kernel text or math mode naturally selects a new
+     * TMPDIR (or project-local tmp/); changing kernel text or math mode selects a new
      * entry.  Set HIP_RUNNER_NO_CODE_CACHE=1 to force a fresh compile. */
     uint64_t source_hash = 1469598103934665603ULL;
     for (const unsigned char *p = (const unsigned char *)source; *p; ++p) {
@@ -118,8 +139,10 @@ static int hip_compile_kernels_ex(hipModule_t *module, int device_id,
     }
     source_hash ^= (uint64_t)precise_math;
     char cache_path[320];
-    snprintf(cache_path, sizeof(cache_path), "/tmp/%s_%s_%016llx.co",
-             prefix, arch, (unsigned long long)source_hash);
+    const char *cache_dir = getenv("TMPDIR");
+    if (!cache_dir || !cache_dir[0]) cache_dir = "tmp";
+    snprintf(cache_path, sizeof(cache_path), "%s/%s_%s_%016llx.co",
+             cache_dir, prefix, arch, (unsigned long long)source_hash);
     if (!getenv("HIP_RUNNER_NO_CODE_CACHE")) {
         FILE *fp = fopen(cache_path, "rb");
         if (fp) {
@@ -190,7 +213,7 @@ static int hip_compile_kernels_ex(hipModule_t *module, int device_id,
 
     if (verbose >= 3) {
         char path[256];
-        snprintf(path, sizeof(path), "/tmp/%s.co", prog_name);
+        snprintf(path, sizeof(path), "%s/%s.co", cache_dir, prog_name);
         FILE *fp = fopen(path, "wb");
         if (fp) { fwrite(code, 1, code_sz, fp); fclose(fp);
             fprintf(stderr, "%s: code object saved to %s\n", prefix, path); }

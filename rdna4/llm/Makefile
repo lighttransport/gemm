@@ -22,8 +22,10 @@ CUDA_MOE ?= 0
 
 # Target
 TARGET = test_hip_llm
+QWEN38_MODEL ?= /mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+QSA_MOE_CACHE_MB ?= 128
 
-.PHONY: all clean run api cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda help
+.PHONY: all clean run api profile-test bench-256k qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda help
 
 all: $(TARGET)
 
@@ -49,7 +51,7 @@ cuda_moe_bridge.o: cuda_moe_bridge.cu cuda_moe_bridge.h glm5next_iq1s_grid.h glm
 mm_blaslt_bridge.o: mm_blaslt_bridge.cpp mm_blaslt_bridge.h
 	$(HIPCC) -O3 -fPIE --offload-arch=gfx1201 -c -o $@ $<
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h ../rocew.h $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h qwen4_nextn_forward.h qwen4_nextn_ref.h qwen4_qsa_hip.h qwen4_qsa_test.h qwen4_verify_window.h ../../common/qwen4_qsa.h ../hip_runner_common.h ../rocew.h $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ) $(LDFLAGS)
 
 run: $(TARGET)
@@ -57,6 +59,30 @@ run: $(TARGET)
 
 api: $(TARGET)
 	@echo "Usage: python3 codex_server.py <model.gguf> [--port 8080] [--context 4096]"
+
+profile-test:
+	./test_qwen38_profiles.sh
+
+approx-coherence: $(TARGET)
+	./test_qwen38_approx_coherence.sh
+
+fp8-test:
+	$(CC) -O2 -Wall -Wextra -Wpedantic -I.. -o tmp/test_fp8_e4m3 ../test_fp8_e4m3.c ../rocew.c -ldl -lm
+	./tmp/test_fp8_e4m3
+
+bench-256k: $(TARGET)
+	./bench_qwen38_256k.sh
+
+# Full-window QSA allocation/numerics gate. This does not generate a 256K
+# response; it exercises the index cache and selected-attention verifier.
+qsa-256k: $(TARGET)
+	LLM_QWEN4_QSA_VERIFY_FULL_WINDOW=1 ./$(TARGET) --verify-qwen4-qsa -s 262144 --moe-cache-mb $(QSA_MOE_CACHE_MB) "$(QWEN38_MODEL)"
+
+qsa-256k-device: $(TARGET)
+	LLM_QWEN4_QSA_DEVICE_SELECT=1 LLM_QWEN4_QSA_VERIFY_FULL_WINDOW=1 ./$(TARGET) --verify-qwen4-qsa -s 262144 --moe-cache-mb $(QSA_MOE_CACHE_MB) "$(QWEN38_MODEL)"
+
+qsa-256k-device-warp: $(TARGET)
+	LLM_QWEN4_QSA_DEVICE_SELECT=1 LLM_QWEN4_QSA_WARP_ATTN=1 LLM_QWEN4_QSA_VERIFY_FULL_WINDOW=1 ./$(TARGET) --verify-qwen4-qsa -s 262144 --moe-cache-mb $(QSA_MOE_CACHE_MB) "$(QWEN38_MODEL)"
 
 cpu-expert-bench: bench_cpu_qwen_expert
 

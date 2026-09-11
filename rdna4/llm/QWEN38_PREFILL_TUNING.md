@@ -33,11 +33,15 @@ Ungrouped execution remains the faster standalone setting in this measurement.
 
 ## Server memory profile
 
-The server launcher retains 512-row batches, a 7200 MiB expert cache,
-grouped prefill, and disabled LFU/copy pipeline. With its 65536-token context
+The server launcher retains a 512-row scalar prefill tile, a 7200 MiB expert
+cache, ungrouped prefill, and disabled LFU/copy pipeline. With its 65536-token context
 allocation, the same benchmark measured **120.35 tok/s prefill and 32.91 tok/s
 decode**. This was a runner benchmark with the server's settings, not an HTTP
 latency measurement or a full 65536-token prompt.
+
+The HTTP launcher now also enables the parity-safe depth-weighted prefill cache
+table by default (`LLM_QWEN4_PREFILL_CACHE_BALANCE=1`); `=0` remains an
+explicit decode-focused opt-out.
 
 Increasing that profile to 1024-row batches exhausted VRAM during load.
 Switching to ungrouped pipelined prefill at 512 rows reached 135.21 tok/s,
@@ -318,17 +322,27 @@ bytes = context × 12 × 2(K/V) × 2(KV heads) × 256(head dim) × 2(F16 bytes)
 
 At a 256K context this is 6,442,450,944 bytes = 6.000 GiB of KV alone.  An
 ideal FP8 cache would be 3.000 GiB, and packed 4-bit KV would be 1.500 GiB,
-before per-group scales/zero-points and alignment.  The runner has no validated
-FP8/FP4 KV store or attention-dequant kernel today; enabling one without
-calibration and a quality comparison would risk silently changing coding
-output.  The loader now prints the F16/FP8/FP4 estimates at startup so future
-implementations can be checked against the actual layer geometry.
-The runtime now rejects `LLM_QWEN4_KV_QUANT=fp8`/`fp4` explicitly rather than
-silently allocating an F16 cache; use `none`/`f16` or the validated capacity
-mode `i8`.
+before per-group scales/zero-points and alignment.  The runner now has an
+explicit scaled-E4M3 FP8 store/dequant attention path; FP4 remains
+unimplemented and is rejected rather than silently allocating another format.
+The loader prints the F16/FP8/FP4 estimates at startup so implementations can
+be checked against the actual layer geometry. FP8 is explicit-only pending
+long-context serving qualification; use `none`/`f16` for the quality-safe
+default or `i8` for the established capacity experiment.
 
 The experimental scaled-I8 layout uses eight 32-channel scales per KV head;
 at 256K this adds about 0.18 GiB, for roughly 3.18 GiB total KV-plus-scales.
+However, a fresh RX 9070 XT probe at `-s 4096` hit an HSA memory fault in
+`kv_cache_store_i8_devp` before the first benchmark token and left a stale KFD
+context. Inspection found that the fixed 256-thread launch let inactive warps
+write zero scales beyond the valid 32-channel groups; both single-token and
+batched stores now guard the scale write with `group < groups`.
+Static inspection found a second independent issue in that probe: exact MTP's
+sidecar layer was indexing the target I8 scale table even though its sidecar KV
+cache is F16. The runtime now restricts I8 store/attention to the target trunk
+and keeps the sidecar on F16. A clean elevated GPU rerun after both fixes
+passed: target-only I8 reached `PASS`, and exact-MTP + I8 at 4K reached
+`PASS` with sequence hash `454146399ff97e88`.
 The 256K allocation probe now succeeds on the RX 9070 XT: with the routed
 expert cache disabled, the loader reported 9.65 GiB free before KV allocation,
 reserved 3.000 GiB of I8 K/V, and completed weight loading.  The same max-seq
@@ -336,9 +350,8 @@ profile loaded with BMAX=512 and the batched prefill path enabled.  This proves
 capacity and startup stability; it is not a claim that a 256K prompt reaches
 the short-context 200+ tok/s rate.
 
-`run_qwen38_flash_next_rocm.sh` keeps F16 for ordinary contexts and selects
-`LLM_QWEN4_KV_QUANT=i8` automatically for explicit 16-GiB requests at or above
-131K tokens (override explicitly to compare either path).  The larger
+`run_qwen38_flash_next_rocm.sh` keeps F16 for ordinary contexts and leaves
+the I8 choice explicit for 16-GiB requests at or above 131K tokens. The larger
 `24g`/`32g` profiles retain F16 by default.  The path stores
 symmetric 8-bit K/V values
 with per-token/per-KV-head/group (32-channel) scales.  It is a memory
@@ -352,8 +365,27 @@ has since been extended to 512 prompt tokens plus 64 greedy decode tokens;
 F16 and scaled-I8 produced the identical sequence hash
 `afed1f992f398ac3`, so the remaining quality concern is the experimental
 batched arithmetic rather than the scalar I8 KV representation.
-The same scalar I8 control with the full 262,144-token allocation produced
-hash `88a3e47bf4121b33` for 16 generated tokens and returned `PASS`.
+The same scalar I8 control with the full 262,144-token allocation now produced
+hash `44bc8ad473cbe606` for the one-token capacity smoke and returned `PASS`,
+with 370 MiB VRAM free at peak.
+
+The longer exact-MTP coding probe (28-token prompt) returned `PASS` and
+coherent C/LRU-cache text. At 16 generated tokens I8/F16 measured 8.20/8.67
+decode tok/s and already had different hashes; at 32 tokens they measured
+8.05/8.49 tok/s with hashes `b555c433cfd91cf5` and `165eb389c0515b9f`. At 64
+tokens I8 measured 8.34 decode / 7.38 end-to-end tok/s (hash
+`994e0df7ffcf7854`) and F16 measured 8.36 / 7.34 (hash `4b8937cd7db0e7a7`).
+Thus I8 is validated for short exact parity and coherent output, but is not
+claimed bit-identical beyond the short horizon.
+
+The new FP8 path passed target-only and exact-MTP 4K smoke tests. On the same
+28-token/64-output coding probe it reached 8.61 decode and 7.48 end-to-end
+tok/s, returned `PASS`, and retained the F16 control hash `4b8937cd7db0e7a7`.
+The E4M3 encoder now uses synchronized round-to-nearest-even mantissa packing
+in both the host reference helper and HIPRTC kernel, avoiding systematic
+truncation bias; the short exact-MTP hash remains unchanged.
+This is an initial quality result; FP8 remains explicit-only until a longer
+context sweep is complete.
 
 Measured with the full tuned launcher on the RX 9070 XT (BMAX=2048, GPU
 router top-k, `LLM_QWEN4_BATCH=1`, 16 generated tokens): F16 at 4K reached
@@ -366,6 +398,17 @@ BMAX=1024 because that combination is the one that fits reliably with the
 full 256K allocation.
 The HTTP server launcher was also started with `QWEN38_CONTEXT=262144`; it
 reached `JSONL backend ready` with the automatic I8 profile.
+
+The reproducible `bench_qwen38_256k.sh` smoke was rerun after the I8 store
+fixes with the full 262,144-token allocation and an 8-token warm prompt plus
+8-token decode: prefill 4.79 tok/s, decode 5.46 tok/s, and end-to-end 5.10
+tok/s, `PASS`. This is a short-request stability baseline at 256K capacity,
+not a claim of 256K prompt throughput or 8K-output quality.
+
+The same 256K capacity smoke with explicit FP8 also returned `PASS`: 3.000 GiB
+FP8 KV, 8.72 decode tok/s, 4.89 end-to-end tok/s, and 370 MiB free at peak.
+FP8 therefore provides the expected capacity profile, but this remains a
+short-request smoke rather than full-context generation validation.
 
 Latest scalar quality regression on the same RX 9070 XT coding control
 (F16 KV, `LLM_QWEN4_BATCH=0`, 12 prompt / 4 generated tokens) measured
@@ -657,7 +700,10 @@ Qwen4's 12:1 query/KV grouping.  It is numerically exact on the 32-token and
 256-token controls (matching sequence hashes), but measured `25.6 tok/s` and
 `25.6 tok/s` decode respectively, versus `42.7` and `52.4 tok/s` for the
 existing scalar I8 kernel.  The extra synchronization outweighs the saved
-loads on gfx1201, so the optimized kernel remains diagnostic-only.
+loads on gfx1201, so the optimized kernel remains diagnostic-only. A fresh
+exact-MTP 64-token coding control preserved the I8 hash `994e0df7ffcf7854` and
+measured 8.39 tok/s versus 8.34 tok/s for scalar I8; the marginal gain is
+workload-sensitive and does not justify enabling it by default.
 
 The exact delayed-refill interval was rechecked at 256K with the 6-GiB cache.
 An 8-token sample briefly reached `26.15 tok/s` at interval four, but a
@@ -749,6 +795,12 @@ QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g \
 The standalone `test_hip_llm` binary performs the same `/dev/kfd` check before
 loading the CPU shadow model, so direct benchmark invocations fail quickly and
 consistently when the AMD device is not passed through.
+
+For persistent access, the surrounding container/session must be started with
+the device nodes and render/video groups passed through (for example
+`--device=/dev/kfd --device=/dev/dri --group-add video --group-add render`).
+Creating nodes inside one elevated command namespace is only a temporary test
+workaround; those nodes are not visible to later ordinary commands.
 
 The clean exclusive-GPU 256K smoke was rerun with the production scalar profile
 (`I8 KV`, `BMAX=512`, 5.68-GiB expert cache, direct copies, graphs/plan warmup
@@ -931,8 +983,487 @@ also rejected. It expanded the grid from output-row tiles to one block per
 row and measured only `10.64` decode tok/s at 4K, with a changed sequence
 hash. The existing row-parallel kernel therefore remains the exact path.
 
+An exact GPU top-k A/B was also rerun on a 128-token/16-output scalar control.
+It preserved the host-router sequence hash (`75aa7fd4f21cfee1`) but reduced
+decode from `21.80` to `21.08 tok/s`; the extra device route synchronization
+was not removed in this configuration. `LLM_QWEN4_EXACT_GPU_TOPK=1` therefore
+remains an experiment rather than a production setting.
+
 Validated scaled-I8 KV was also used to reclaim VRAM for the expert cache.
 At 8K context, an 8.7-GiB cache loaded successfully but reached only
 `24.47` decode tok/s (versus the F16-cache control near `25.3`), with the
 same simple hash. A 9.2-GiB request reached weight-loading failure in the
 hipBLASLt setup, so I8 does not currently buy a stable decode improvement.
+
+### Opt-in Q8_K routed-kernel prototype
+
+The exact decoder has a diagnostic `LLM_QWEN4_EXACT_Q8K=1` route for the
+Q4_K/Q4_K gate-up plus Q5_1 down expert layout. It stages the shared input in
+canonical 292-byte Q8_K blocks, stages each SiLU output in 40-byte Q8_1
+blocks, and evaluates selected experts with dedicated HIPRTC kernels. The
+existing F32 routed kernels remain the default until a matched coding hash
+and parity run promotes this path. Scratch allocation is independent of the
+expert cache and is only a few KiB for the Qwen3.8 dimensions. Because the
+prototype previously triggered a gfx1201 reset on the current driver, and
+launching it now additionally requires `LLM_QWEN4_EXACT_Q8K_UNSAFE=1`; this
+second gate is intentional and should only be used under a disposable
+kernel-debug session. The block-sum race in the Q8_K staging kernel is fixed,
+but the path is still numerically non-parity-safe.
+
+A post-fix short smoke compiled and completed successfully (`Result: PASS`)
+without a reset, but still produced hash `9a7b3000c5591075` versus the F32
+control `96b18100c22040bd` (and was slower, `4.53` versus `6.24` decode
+tok/s). This is expected for a first quantized prototype; the switch therefore
+remains diagnostic-only pending a same-process parity comparison and coding
+quality gate.
+
+The approximate coding sweep is available as `make -C rdna4/llm
+approx-coherence`. It tests 1K/4K/8K prefill with refresh intervals 4/6/8,
+captures generated text, checks balanced C output, and runs `gcc -fsyntax-only`
+on the extracted function. Approximate mode remains explicitly opt-in.
+
+Short-context HTTP coding A/B testing found that full-depth resident
+approximation can corrupt conditional syntax even at refresh six. Restricting
+approximation to layers 24--47 while keeping the first 24 layers exact returned
+the complete compilable `clamp` function at 4K; the measured decode rate was
+`21.7 tok/s` versus roughly `31 tok/s` for full-depth approximation. The
+launcher selects this layer-range quality profile automatically below 32K;
+`LLM_QWEN4_DEVICE_REFRESH_START_LAYER=0` restores the faster diagnostic mode.
+
+The standalone GPU benchmark still has a stability boundary for a single
+~4K-prefill dispatch on gfx1201. The supported serving shape is explicit
+streamed chunks (512 tokens in the diagnostic); with `LLM_QWEN4_BATCH=0`, the
+benchmark bypasses the multi-chunk batch dispatcher and advances the stream
+token by token, providing a correctness-first fallback for long contexts.
+The scalar streamed path has completed 4K requests with `Result: PASS`; only
+the unstreamed/experimental dispatcher remains invalid. Set
+`LLM_BENCH_STREAM_CHUNK=0` only for an explicit single-dispatch A/B test.
+On a clean RX 9070 XT this fallback completed a 4096-token request with
+`Result: PASS` at `14.72 tok/s` (278.3 s total). It is stable but not a
+performance solution: the run moved about 1.53 TiB of expert data, so reducing
+per-token cold-expert transfers is the next optimization target.
+
+Repeating the same scalar stream with the full 8.5-GiB expert cache raised the
+4K prefill rate to `19.80 tok/s` (206.8 s), with an 84.9% cache-hit rate and
+861.9 GiB H2D. At 512 tokens, the corresponding comparison was `18.72` versus
+`13.94 tok/s` and `115.5` versus `201.8 GiB` H2D. The 8.5-GiB cache remains the
+preferred 16-GiB scalar-stream setting; further gains require reducing cold
+route churn or retaining experts across requests.
+The existing prefill-staging switch was neutral on the 512-token control
+(`18.80 tok/s`, identical `115.5 GiB` H2D), so it is not promoted as an
+additional optimization for this scalar path.
+With 16 generated tokens on the same 512-token request, decode measured
+`19.11 tok/s` and end-to-end measured `18.63 tok/s`; the run also returned
+`Result: PASS`.
+
+The explicit LFU policy was slower on the same 512-token control (`18.36
+tok/s`, 83.1% hit, 120.1 GiB H2D), confirming LRU as the scalar-prefill
+default.
+
+Delayed expert-cache refill remains an opt-in exact-decode experiment in the
+flash launcher (`LLM_QWEN4_DELAYED_CACHE=0` by default; set `=1` for an A/B
+run). The initial matched 64-token/32-output test appeared to improve decode
+from `21.27` to `22.49 tok/s`, but the result did not reproduce on longer
+streams: at 128 output tokens the delayed/control rates were `22.47`/`24.27
+tok/s`, with identical hash `8afbeab2765b52ab`. A coding prompt likewise kept
+the same hash (`47b4dceb09c65616`). Keep the switch opt-in until a sustained
+workload shows a repeatable gain. The refill remains disabled automatically for
+active MTP sidecars and unsafe direct-BAR combinations.
+
+The scalar streamed fallback now avoids the vocabulary projection for every
+intermediate prompt token and materializes logits only on the final token. The
+512-token control improved from `18.72` to `19.04 tok/s` with unchanged cache
+hits/H2D (`Result: PASS`); this optimization is safe for the long-context
+fallback as well.
+The 4K control improved from `19.80` to `20.21 tok/s` (202.7 s total), again
+with 84.9% hit and 861.9 GiB H2D, and returned `Result: PASS`.
+
+With the depth-weighted prefill cache table enabled, a fresh 512-token scalar
+control reached `21.64 tok/s` (23.659 s), with an 87.9% hit rate and 85.99 GiB
+H2D; it returned `Result: PASS`. This is the new fast-prefill launcher default
+(`LLM_QWEN4_PREFILL_CACHE_BALANCE=0` remains an explicit opt-out). A concurrent
+4K validation did not reach a benchmark footer after the device became stuck
+inside its first streamed chunk, so no 4K speed or quality claim is made for
+the rebalanced table yet.
+
+An opt-in scalar prefill copy-stream pipeline then overlapped cold-expert H2D
+with resident-expert work on the same 512-token control. It reached
+`29.27 tok/s` (17.491 s), with 88.2% cache hit and 83.80 GiB H2D, versus
+`21.64 tok/s` without the pipeline. A matching 16-token coding decode control
+preserved sequence hash `a895417764461896` exactly (pipeline decode 18.11
+tok/s versus 17.56 tok/s without it; both `Result: PASS`). The fast-prefill
+launcher keeps this behind explicit `LLM_MOE_COPY_PIPELINE=1` and
+`LLM_QWEN4_PREFILL_COPY_PIPELINE=1` gates. The runner additionally refuses
+the prefill gate when the published request length exceeds the configured
+ceiling. The validated 2K window completes on gfx1201. Direct copies therefore remain
+the stable large-request default for larger or unbounded requests.
+
+For a controlled hardware sweep, `LLM_QWEN4_PREFILL_COPY_PIPELINE_MAX_TOKENS`
+raises that request-length ceiling (bounded to 4096 by the runner), for example
+`LLM_QWEN4_PREFILL_COPY_PIPELINE=1
+LLM_QWEN4_PREFILL_COPY_PIPELINE_MAX_TOKENS=1024`. The current launcher and
+runner default ceiling is 2,048 tokens; 1K remains a valid conservative
+override.
+The pipeline remains opt-in and direct copies remain the default; the current
+validated explicit ceiling is 2,048 tokens.
+
+The bounded ceiling was exercised at 1,024 tokens on the RX 9070 XT. With
+`LLM_QWEN4_PREFILL_COPY_PIPELINE=1`,
+`LLM_QWEN4_PREFILL_COPY_PIPELINE_MAX_TOKENS=1024`, and a 1K streamed chunk,
+scalar prefill reached `31.45 tok/s` and decode `32.95 tok/s`; the direct-copy
+control figures from that historical row are not comparable because the
+benchmark harness then forced the pipeline for both cases. The pipeline run
+returned simple-control hash `a2d4f49620d5b663` and `Result: PASS`; a corrected
+direct-copy comparison is now required for a clean 1K speed claim. The copy
+pipeline remains opt-in while its bounded ceiling is 1,024 tokens.
+
+A clean-card pipeline repeat reached the benchmark footer and passed (`28.15`
+prefill / `31.25` decode tok/s, hash `1b67330f97f98543`). The corrected direct
+control reached `27.31` prefill / `31.12` decode tok/s with the same hash and
+`Result: PASS`, establishing a repeatable roughly 3.1% prefill gain.
+
+The corrected benchmark harness was then used for a true 2,048-token A/B with
+a 5.0-GiB expert cache. The copy pipeline completed in `102.37 s` (`20.01
+tok/s`, `Result: PASS`), while the direct-copy control completed in `107.58 s`
+(`19.04 tok/s`, `Result: PASS`), a roughly 5.1% prefill improvement. The
+earlier apparent stall was an observation timeout, and the earlier direct-copy
+controls were invalid because the harness had forced `LLM_MOE_COPY_PIPELINE=1`.
+The harness now honors an explicit `=0`; 2K is still opt-in pending a decoded
+quality/hash run, and 4K remains unvalidated for overlap.
+
+A corrected 4K pipeline run with the same 5.0-GiB cache did not reach a footer
+within a bounded 3-minute diagnostic window and was terminated after the
+runner remained resident. No 4K throughput or quality claim is made from that
+attempt; the stable serving path remains direct copies for 4K requests.
+The harness now also exposes `LLM_BENCH_STREAM_PUBLISH_CHUNK=1`, which publishes
+each 1K chunk separately so the 1K guard can be exercised across a long
+request. A four-chunk 4K run still exceeded the 5-minute diagnostic window on
+gfx1201, so this mode remains experimental rather than a serving default.
+The stdio/HTTP server exposes the corresponding opt-in
+`LLM_QWEN4_PREFILL_COPY_PIPELINE_PUBLISH_CHUNK=1`; it is disabled by default
+and is intended only for bounded chunking experiments.
+
+The server-shaped 2K run (four 512-token chunks, 5.0-GiB cache, chunk
+publication enabled) completed at `20.00 tok/s` prefill and `25.30 tok/s`
+decode, with end-to-end `20.01 tok/s`, hash `a2d4f49620d5b663`, and `PASS`.
+This is the recommended bounded 2K experiment; larger requests remain
+unvalidated.
+Splitting that request into two 1,024-token scalar chunks while publishing the
+per-chunk ceiling reproduced the stall as well, so the failure is not solely a
+single oversized tile; the per-chunk publication experiment was removed.
+
+A minimal-prompt 4K end-to-end control with the 8.5-GiB cache completed with
+`19.84 tok/s` prefill, `19.28 tok/s` decode, and `19.83 tok/s` end-to-end
+(`Result: PASS`).
+
+The experimental stateful batched dispatcher was also measured at 512 tokens
+with a 6-GiB cache: `15.89 tok/s`, 76.2% hit rate, and 169.0 GiB H2D. It is
+slower and less resident than the scalar 8.5-GiB path, so it remains disabled
+for the stable profile even below the 4K crash boundary. With the full
+8.5-GiB cache it reaches `19.22 tok/s` with the same 83.7% hit rate and
+115.5 GiB H2D—only a small ~2.7% gain over scalar—so the large-request guard
+still selects scalar streaming while short requests may retain batching.
+
+## VRAM measurement
+
+The HIP runner now exposes `hip_llm_get_vram_stats()`.  It reports current
+free/total VRAM and a high-water `peak_used_bytes` sampled after completed
+forward operations; this is the value to record alongside prefill/decode and
+end-to-end tok/s.  The stdio/HTTP server prints the same values as
+`free=... total=... peak-used=...` after each request.  Peak usage is observed
+runtime telemetry, not the requested expert-cache budget, and remains zero
+until the first completed forward.
+The server footer also reports `end-to-end=... prompt-added + ... generated`
+tok/s, so cached-prefix requests are not confused with decode-only throughput.
+
+A short RX 9070 XT smoke benchmark (`8` prefill + `2` decode, 512-MiB
+expert-cache request) reported `8,194 / 16,304 MiB` free and `8,110 MiB`
+peak used, with an end-to-end `4.37 tok/s` and `Result: PASS`.
+
+The current repository 256K smoke profile (scaled-I8 KV, 5.9-GiB expert
+cache, 8 prefill + 8 decode) completed with `4.97` prefill tok/s, `5.64`
+decode tok/s, and `5.29` end-to-end tok/s. It preserved hash
+`5e003cee3db52848`, reported `15,960 MiB` peak used / `344 MiB` free, and
+returned `Result: PASS`. This is an allocation/end-to-end smoke baseline, not
+a 256K-token generation benchmark.
+
+Matched 256K cache-budget sweep (same 8+8 smoke, scaled-I8 KV) shows the
+resident-cache trade-off while preserving the same greedy hash:
+
+| Expert cache | Prefill tok/s | Decode tok/s | End-to-end tok/s | Peak VRAM |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 MiB | 4.32 | 4.48 | 4.40 | 11,566 MiB |
+| 2,048 MiB | 4.66 | 4.83 | 4.75 | 12,152 MiB |
+| 5,900 MiB | 4.99 | 5.67 | 5.31 | 15,960 MiB |
+
+The 5.9-GiB budget is the fastest measured 16-GiB point but leaves only
+344 MiB free; smaller budgets are safer for concurrent allocations.
+
+For selected-attention diagnostics, the exact device selector and warp-per-
+head attention kernel are both opt-in:
+
+```sh
+make -C rdna4/llm qsa-256k-device-warp
+```
+
+The 256K gate passes score and selected-output parity, but no 2K/4K
+throughput claim is made yet; those runs require a bounded runner job because
+large prefill requests can outlive an external observation timeout.
+
+A persistent-PTY A/B at 2,056 tokens (scaled-I8 KV, 2,048-MiB expert cache,
+device selector enabled) completed cleanly. The warp attention path measured
+`10.17` prefill / `9.94` decode / `10.17` end-to-end tok/s; the 256-thread
+control measured `10.17` / `9.84` / `10.17`. Both returned hash
+`9ac18100c593e9bb`, `PASS`, and `8,898 MiB` peak VRAM. The warp kernel is
+therefore parity-safe but only a ~1% decode improvement in this MoE-dominated
+profile; it remains opt-in.
+
+Increasing only the expert cache from 2,048 to 5,900 MiB on the same
+2,056-token run changed the bottleneck materially: prefill rose from `10.17`
+to `16.68 tok/s`, decode from `9.94` to `15.48 tok/s`, and end-to-end from
+`10.17` to `16.68 tok/s`. The greedy hash stayed `9ac18100c593e9bb`; cache
+hit rate rose from `50.4%` to `76.5%` and H2D fell from `1,415.03` to
+`668.92 GiB`. Peak VRAM was `12,734 MiB` with `3,752 MiB` free, making this
+the preferred 4K selected-attention diagnostic profile on the 16-GiB card.
+
+A second controlled 2,056-token streamed run (BMAX=1, F16 KV, device
+selector plus warp attention, two decode tokens) confirms the fast-prefill
+cache choice used by `QWEN38_FAST_PREFILL=1`. Raising the resident expert
+cache from 5,900 to 7,800 MiB improved prefill from `21.29` to `26.09`
+tok/s and decode from `24.87` to `25.82` tok/s. Both runs retained the exact
+greedy hash `9ac18100c593e9bb` and returned `PASS`; cache hit rose from
+`80.3%` to `87.2%` and prefill H2D fell from `560.56` to `364.94 GiB`.
+The trade-off is peak VRAM: `12,678 MiB` (3,780 MiB free) at 5,900 MiB
+versus `14,576 MiB` (1,728 MiB free) at 7,800 MiB. Therefore 7.8 GiB stays
+an explicit fast-prefill diagnostic setting, while the 5.9 GiB profile remains
+the safer long-context default.
+
+A 32-token decode repeat at 7,800 MiB kept the same prefill rate (`26.07`
+tok/s), reached `30.23` decode tok/s and `26.13` end-to-end tok/s, and also
+returned `PASS`. Its longer-output hash was `482e10d864607703`; the two-token
+smoke's `9ac18100c593e9bb` is expected to differ because the generated length
+is part of the hash.
+
+The same 7.8-GiB/2,056-token run with the validated scaled-I8 KV cache used
+only `14,374 MiB` peak VRAM versus `14,422 MiB` for F16, but measured
+`25.93` prefill / `29.81` decode / `25.99` end-to-end tok/s. It preserved the
+same 32-token hash and `PASS`. At 4K, KV compression is therefore primarily a
+capacity win; the attention kernel is slightly slower than F16. FP8/FP4 remain
+unimplemented runtime formats rather than aliases for this I8 path.
+
+### QSA production-default audit
+
+The exact QSA selector/warp-attention path was rechecked with a matched
+2,056-token scalar request, scaled-I8 KV, 5.9-GiB expert cache, and `BMAX=1`.
+It preserved the exact coding hash, but forced QSA measured only `0.68`
+decode tok/s; the QSA-disabled control measured `14.53` decode tok/s with the
+same hash and cache statistics. QSA therefore remains explicit diagnostic
+coverage (`LLM_QWEN4_QSA_DEVICE_SELECT=1` and/or
+`LLM_QWEN4_QSA_WARP_ATTN=1`) and is no longer selected automatically by the
+flash or Codex launchers. The remaining QSA work is kernel/synchronization
+optimization followed by a matched 8K+ serving benchmark.
+
+The follow-up fix keeps the index-cache update but bypasses selected attention
+when it would remove less than 25% of the context. This avoids the near-dense
+2K case that caused the earlier `0.68` tok/s result: the same forced-QSA
+benchmark now measures `20.01` prefill / `19.13` decode / `20.01` end-to-end
+tok/s, with the unchanged hash `c83dbcf03c2f4d7b` and `PASS`. QSA remains
+opt-in for long contexts, where a larger sparsity win must still be measured.
+
+The QSA score kernel also now receives a device-resident rotary-frequency table
+created once during exact-mode setup, removing per-score-block `powf` calls.
+The 2K forced-QSA control remained numerically identical (`20.02` prefill /
+`19.13` decode, hash `c83dbcf03c2f4d7b`, `PASS`), so the change is ready for
+long-context profiling without altering the production default.
+
+### Scalar streamed chunk sweep
+
+The validated scalar stream was compared at 1,024 and 2,048-token chunk sizes
+using the 5.9-GiB scaled-I8 profile. At 2,056 tokens, 1K measured `20.05`
+prefill / `19.14` decode tok/s and 2K measured `20.07` / `19.18`; both kept
+hash `c83dbcf03c2f4d7b` and returned `PASS`. A full 4,096-token request split
+into two 2K scalar chunks completed at `19.01` prefill / `16.75` decode /
+`19.00` end-to-end tok/s, with the same hash and `PASS`. The larger chunk is
+therefore correctness-safe but not a material throughput win; the serving
+default remains the conservative 512-token stream until overlap improves.
+
+The opt-in prefill copy pipeline was then exercised over the same two 2K
+chunks with per-chunk publication enabled. It completed at `19.86` prefill /
+`17.40` decode / `19.85` end-to-end tok/s, versus `19.01` / `16.75` /
+`19.00` for the direct-copy 2K control, with identical hash
+`c83dbcf03c2f4d7b` and `PASS`. The validated explicit pipeline ceiling is now
+2,048 tokens (`LLM_QWEN4_PREFILL_COPY_PIPELINE_MAX_TOKENS`); the pipeline
+itself remains disabled by default.
+
+The HTTP launcher now automatically enables per-chunk publication when the
+copy pipeline is explicitly enabled, because the runner uses that publication
+to enforce the 2K safety ceiling. An explicit
+`LLM_QWEN4_PREFILL_COPY_PIPELINE_PUBLISH_CHUNK=0` still disables it for a
+controlled experiment.
+
+### No-padding 4K coding gate
+
+The overlap path was checked with the real 4K coherence harness (no repeated
+last-token padding), a ChatML coding request, and 64 generated tokens. Refresh
+4 and refresh 6 both produced the same compilable function:
+
+```c
+int clamp(int x, int lo, int hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+```
+
+Both runs returned hash `a9d9261a7fedaf3a`, `PASS`, and about `12.2` prefill /
+`19.1` decode tok/s. Refresh 8 did not reach a footer within the 900-second
+sweep window. This is the quality-safe result for heterogeneous 4K input; the
+~29 tok/s padded benchmark is not representative of serving throughput.
+
+A focused refresh-6 repeat with a 7.8-GiB expert cache and BMAX=512 raised
+prefill to `12.79` tok/s, cache hit rate to `56.2%`, and reduced H2D to
+`2,334 GiB`; it preserved the same compilable function and returned `PASS`.
+The extra cache consumes nearly all remaining 16-GiB headroom (`1,754 MiB`
+free), so this remains an explicit fast-prefill experiment rather than the
+default 4K profile.
+
+Enabling `LLM_QWEN4_PREFILL_GPU_TOPK=1` on the same run did not change the
+route hash, cache hit rate (`56.2%`), H2D volume, or prefill time (`12.78`
+tok/s). It is therefore not an additional 4K optimization; the host-routing
+profile remains the quality-safe default.
+
+Raising scalar CPU-prefill singleton handling to
+`LLM_MOE_CPU_PREFILL_MAX_COUNT=4` with a 256-job cap was also neutral on this
+real prompt: `12.79` prefill tok/s, `56.2%` cache hit, and `2,334 GiB` H2D,
+with the same syntax-checked output. The cold-transfer bottleneck therefore
+requires better expert residency or transfer reuse rather than router/CPU
+threshold tuning.
+
+Increasing `LLM_MOE_STREAM_SLOTS` from two to four on the same uniform-cache
+4K overlap workload was neutral (`13.40` vs `13.41` prefill tok/s, identical
+hit/H2D statistics and syntax-checked output). Two streams remain the lower
+overhead choice for this single-request path.
+
+On the same real 4K prompt, disabling depth-balanced residency for the
+explicit overlap path (`LLM_QWEN4_PREFILL_CACHE_BALANCE=0`) raised prefill
+from `12.79` to `13.41` tok/s, increased cache hit from `56.2%` to `59.1%`,
+and reduced H2D from `2,334` to `2,177 GiB`; the generated function remained
+identical and syntax-valid. The flash and HTTP launchers now select this
+uniform policy automatically only for explicit pipeline requests at 4K+;
+callers can still force balance with `=1`.
+
+An 8K no-padding run with the 5.9-GiB/512-row profile and 2K overlap chunks
+completed its refresh-6 benchmark at `10.48` prefill / `15.02` decode tok/s.
+The generated fenced C function was coherent after normalizing escaped BPE
+newlines and passed syntax checking, but the cache hit rate fell to `46.7%`
+with `5,650 GiB` of H2D traffic. This confirms the overlap path is stable at
+8K but does not solve the long-context transfer bottleneck; the 8K pipeline
+remains diagnostic-only.
+
+An intermediate 6.5-GiB cache improved the same 8K run to `10.85` prefill
+tok/s (49.3% hit, 5,368 GiB H2D). The validated 7.2-GiB/512-row run reached
+`11.42` prefill / `15.34` decode tok/s, 52.9% hit, and 4,983 GiB H2D while
+still producing syntax-valid C. The launchers now select 7.2 GiB for the
+validated 8K–<16K approximate profile and retain 5.9 GiB at 16K+ until those
+larger contexts are separately validated.
+
+A 16K allocation smoke with the conservative 5.9-GiB/I8 profile also loaded
+and completed one prefill plus one decode token (`Result: PASS`, 3.58 GiB
+free). This validates startup headroom only; it is not a 16K throughput or
+quality claim.
+
+The same 7.2-GiB/512-row allocation was also validated with direct copies
+(pipeline disabled): `10.92` prefill / `15.81` decode tok/s, 51.6% hit,
+5,120 GiB H2D, and syntax-valid output. This confirms the promoted 8K cache
+budget is safe independent of the diagnostic overlap path.
+
+The sub-32K diagnostic runner now wraps each HIP invocation in an internal
+`timeout --foreground` (900 seconds by default, configurable with
+`QWEN38_SUB32_TIMEOUT`). This prevents stalled parity experiments from leaving
+orphaned GPU contexts and stranded VRAM.
+
+Grouped MTP verification now reduces the scalar lm-head logits with one
+deterministic `qwen4_argmax_batch` launch for the entire window instead of one
+argmax launch and device copy per row. The smallest grouped transaction gate
+(draft 4, 8 output tokens, forced reject/rollback coverage) still returned
+`PASS`, with identical transaction checks and hash `9243484866657d53`; the
+control measured `3.35` decode / `3.61` end-to-end tok/s. This is a launch
+overhead reduction only; grouped target-layer parity and throughput remain
+experimental.
+A 16-token grouped control retained hash `34202a88d2a8906a` and measured
+`3.30` decode / `3.46` end-to-end tok/s, up from the earlier `2.79` / `3.05`
+control.
+Important current-build caveat: grouped verification is only entered when
+`LLM_QWEN4_BATCH=1` is explicitly set. Grouped logits can still diverge on
+rejected windows (`pred0=1144` versus scalar `2688`), but forced transaction
+checks now bypass grouped mode and use the scalar oracle, so the full
+reject/EOS suite passes. Grouped throughput remains diagnostic only until its
+state/commit parity is fixed.
+Repeating that exact grouped control with the tuned 9-GiB expert cache completed
+all transaction checks with the same hash and reached `6.08` decode / `5.57`
+end-to-end tok/s. Cache telemetry was `55.0%` on prefill and `80.3%` on decode,
+with `14.76` GiB peak VRAM. This confirms cache residency is the dominant
+limiter for the grouped experiment, but the path remains well below scalar-MTP
+throughput and is not promoted.
+Grouped resident/deferred task lists now use asynchronous H2D copies ordered on
+the compute stream, removing the prior host-visible copy/fence pair. The same
+9-GiB exact control remained hash-identical and passed all rollback checks at
+`6.07` decode / `5.59` end-to-end tok/s; this is currently a scheduling cleanup
+rather than a confirmed throughput improvement.
+For a 32-token coding prompt, allowing all attention layers to batch
+(`LLM_QWEN4_BATCH_ATTN_MAX_LAYER=47`) preserved hash `48f9514bc5863ce4` and
+passed, but was slightly slower (`5.94` vs `6.09` decode tok/s) than the
+parity-safe three-layer prefix. Experimental batched SSM projections were also
+hash-safe but neutral. Grouped performance is consequently dominated by scalar
+SSM recurrence and MoE/cache traffic; the conservative attention limit remains
+the default.
+
+### Host-transfer overlap follow-up
+
+The batched MoE router/grouping scratch buffers (`router_batch`, grouped token
+indices, and grouped weights) are now allocated with `hipHostMalloc` when the
+runtime supports pinned host memory, with a transparent `malloc` fallback.
+Their existing asynchronous H2D/D2H copies can therefore overlap GPU work on
+ROCm instead of silently synchronizing on pageable memory. Destruction now
+releases the buffers through the matching HIP/free path. A real 982-token
+coding prompt on the scalar approximate route completed with `PASS` and a
+syntax-valid clamp function: `10.90` prefill / `19.87` decode / `11.21`
+end-to-end tok/s at 64 generated tokens (hash
+`325c17a54f291bb4`). The separate batched coding benchmark was traced to a
+gfx1201 hipBLASLt workspace `hipMalloc` crash. Qwen4 batched prefill now
+defaults to the self-owned WMMA GEMM backend; explicit `LLM_GEMM=blaslt`
+remains available only for guarded A/B diagnostics because it can reproduce
+the driver crash. The same 512-token coding benchmark
+then completed with `PASS`: `115.19` prefill / `15.43` decode / `104.77`
+end-to-end tok/s (hash `0b93d620afb74848`).
+
+A 2,048-token padded batched control also completed with `PASS` at `121.03`
+prefill / `14.57` decode / `117.68` end-to-end tok/s (hash
+`ae68c4f961193200`), confirming the WMMA default remains stable across the
+validated 512–2K tile range.
+
+The coherence harness can now opt into this route with
+`QWEN38_APPROX_BATCH=1` (plus the stateful/multi-chunk switches). A real
+1,917-token coding prompt completed with syntax-valid output at `10.79`
+prefill / `20.22` decode / `10.95` end-to-end tok/s (hash
+`a9d9261a7fedaf3`). At 3,798 real tokens, the same 4K streamed batched route
+reached `89.49` prefill / `22.40` decode / `85.26` end-to-end tok/s, but
+generated repeated non-code text and failed the syntax gate. Batched WMMA is
+therefore a useful throughput diagnostic, not a quality-safe 4K serving mode;
+the scalar route remains the production quality baseline for long prompts. A
+4K batch run with stateful/multi-chunk carry disabled did not reach a terminal
+footer, so those controls remain experimental as well.
+
+Using exact decode instead of device-hit approximate decode did not repair the
+4K result (`88.56` prefill / `19.67` decode / `83.70` end-to-end tok/s;
+repeated `1.0` output). Splitting the same request into two 2K batched chunks
+raised prefill to `121.36` and end-to-end to `112.69` tok/s, but produced a
+repeated `0` stream. The quality loss is therefore in batched prefill/state
+propagation, not the approximate decoder; no batched 4K profile is promoted.
+Disabling batched SSM scratch (`QWEN38_SUB32_BATCH_SSM=0`) did not reach a
+terminal benchmark footer, so the scalar-SSM hybrid is not currently a safe
+fallback either.
+Constraining batched attention to the documented parity-safe prefix
+(`QWEN38_SUB32_BATCH_ATTN_MAX_LAYER=1`) likewise entered a scalar-heavy
+schedule without reaching a footer; it is not a practical 4K optimization on
+the 16-GiB card.
