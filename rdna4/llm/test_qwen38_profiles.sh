@@ -147,12 +147,12 @@ expect_contains "${out}" 'multi=0'
 expect_contains "${out}" 'force_multi=0'
 expect_contains "${out}" 'cpu_prefill_jobs=0'
 expect_contains "${out}" 'copy=1'
-# Registered (pinned) host expert weights break repeatability, so the batched
-# presets must default to pageable host weights.
-expect_contains "${out}" 'reg=0'
-out="$(QWEN38_DRY_RUN=1 LLM_MOE_REGISTER_HOST=1 \
-    QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
+# Pinned host weights are the faster default now that position publication is
+# stream-ordered; pageable remains an explicit override.
 expect_contains "${out}" 'reg=1'
+out="$(QWEN38_DRY_RUN=1 LLM_MOE_REGISTER_HOST=0 \
+    QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
+expect_contains "${out}" 'reg=0'
 out="$(QWEN38_DRY_RUN=1 LLM_MOE_COPY_PIPELINE=0 \
     QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
 expect_contains "${out}" 'copy=0'
@@ -231,6 +231,17 @@ grep -q 'hipMemcpyAsync(task_e, r->h_moe_tok_idx' "${root_dir}/hip_llm_runner.c"
 }
 grep -q 'Drain the stream first' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: staged wave loop must drain before reusing host scratch' >&2
+    exit 1
+}
+# Per-row position publication must be stream-ordered (async from the stable
+# host array); a blocking hipMemcpy on the null stream raced r->stream kernels
+# and was the residual batched nondeterminism.
+grep -q 'hipMemcpyAsync(r->d_position, &r->h_pos_batch\[m\]' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: per-row position publication not stream-ordered' >&2
+    exit 1
+}
+grep -q 'h_pos_batch\[m\] = position_start + m' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: per-row position host array not precomputed' >&2
     exit 1
 }
 if grep -q 'hipMemcpyAsync(d_task_e, task_e' "${root_dir}/hip_llm_runner.c"; then

@@ -162,12 +162,9 @@ case "${profile}" in
             cache_mb="${QWEN38_MOE_CACHE_MB:-5000}"
         fi
         bmax="${LLM_BMAX:-4096}"
-        # Registered (pinned) host expert weights make hipMemcpyAsync truly
-        # asynchronous and the expert kernels can read the cache/staging
-        # destination before the copy lands, so the batched route is not
-        # repeatable.  Pageable host weights (register 0) make those copies
-        # block and are deterministic for ~4 tok/s less prefill.
-        register_host="${LLM_MOE_REGISTER_HOST:-0}"
+        # Pinned host weights are safe now that the per-row position publication
+        # is stream-ordered; they are ~7 tok/s faster than pageable.
+        register_host="${LLM_MOE_REGISTER_HOST:-1}"
         gpu_topk="${LLM_QWEN4_PREFILL_GPU_TOPK:-1}"
         qwen_batch="${LLM_QWEN4_BATCH:-1}"
         batch_ssm="${QWEN38_TARGET_BATCH_SSM:-1}"

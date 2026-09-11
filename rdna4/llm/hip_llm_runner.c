@@ -10074,6 +10074,7 @@ struct hip_llm_runner {
     float *h_moe_tok_w;          /* host [Mmax*K] per-token top-K softmax weight */
     int    h_moe_tok_w_pinned;
     int   *h_moe_offsets;        /* host [n_experts+1] */
+    int   *h_pos_batch;          /* host [batch_max] positions for per-row fallback */
 
     /* GPU weights */
     int token_embd_type;
@@ -14663,9 +14664,11 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                         r->h_moe_tok_w = (float *)malloc(TA * sizeof(float));
                 }
                 r->h_moe_offsets     = (int *)malloc((size_t)(ne + 1) * sizeof(int));
+                r->h_pos_batch       = (int *)malloc((size_t)bm * sizeof(int));
                 if (!r->h_router_batch || !r->h_moe_gather_src || !r->h_moe_gather_w ||
                     !r->h_moe_assign_pos ||
-                    !r->h_moe_tok_idx || !r->h_moe_tok_w || !r->h_moe_offsets) return -1;
+                    !r->h_moe_tok_idx || !r->h_moe_tok_w || !r->h_moe_offsets ||
+                    !r->h_pos_batch) return -1;
                 if (r->verbose >= 1)
                     fprintf(stderr, "hip_llm: batched MoE prefill buffers: ~%.0f MB\n",
                             (double)(TA * (r->n_embd*6 + eff*5)) / (1024.0*1024.0));
@@ -22219,6 +22222,13 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
     int n_run_layers = r->n_layers;
     if (r->max_layers > 0 && r->max_layers < r->n_layers) n_run_layers = r->max_layers;
 
+    /* Precompute per-row positions once so every per-row fallback publishes
+     * d_position with a stream-ordered async copy from stable host memory.  A
+     * blocking hipMemcpy on the null stream races r->stream kernels that still
+     * read d_position from the prior row. */
+    if (r->h_pos_batch)
+        for (int m = 0; m < M; m++) r->h_pos_batch[m] = position_start + m;
+
     /* One-shot per-runner dispatch summary, gated by LLM_DEBUG_DISPATCH=1.
      * Helpful for diagnosing hybrid / mixed-quant models whose layers fall
      * back to per-row because a weight type lacks a dequant kernel
@@ -22329,9 +22339,14 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                                 r->qwen4_grouped_tokens[m-1];
                 }
                 r->cur_position = pos;
-                /* pos is loop-local stack storage; do not enqueue an async
-                 * copy from it while the next row can reuse that address. */
-                hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice);
+                /* Publish the position on the compute stream from the stable
+                 * h_pos_batch slot, so it is ordered before this row's kernels
+                 * and after the previous row's kernels that read d_position. */
+                if (r->h_pos_batch)
+                    hipMemcpyAsync(r->d_position, &r->h_pos_batch[m], sizeof(int),
+                                   hipMemcpyHostToDevice, r->stream);
+                else
+                    hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice);
                 /* Grouped exact verification uses the target trunk selector
                  * (2), matching hllm_qwen4_window_forward's scalar replay.
                  * forward_one_layer() uses selector 1 for ordinary decode;
@@ -22738,6 +22753,8 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                             (const float *)r->d_q_batch, M * q_dim);
             debug_f32_state(r, l, "Q4 batch k_rope",
                             (const float *)r->d_k_batch, M * kv_dim);
+            debug_f32_state(r, l, "Q4 batch v",
+                            (const float *)r->d_v_batch, M * kv_dim);
         }
 
         /* ---- Batched KV cache store ---- */
@@ -22755,7 +22772,11 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 if (scalar_kv_env && atoi(scalar_kv_env) != 0) {
                     for (int m = 0; m < M; ++m) {
                         int pos = position_start + m;
-                        hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice);
+                        if (r->h_pos_batch)
+                            hipMemcpyAsync(r->d_position, &r->h_pos_batch[m], sizeof(int),
+                                           hipMemcpyHostToDevice, r->stream);
+                        else
+                            hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice);
                         launch_kv_store_i8_devp(r, r->d_key_cache[l], r->d_value_cache[l],
                                                 r->d_key_cache_scale[l], r->d_value_cache_scale[l],
                                                 (float *)r->d_k_batch + (size_t)m * kv_dim,
@@ -22776,7 +22797,11 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                      * update visible to the following row without a host sync. */
                     for (int m = 0; m < M; ++m) {
                         int pos = position_start + m;
-                        hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice);
+                        if (r->h_pos_batch)
+                            hipMemcpyAsync(r->d_position, &r->h_pos_batch[m], sizeof(int),
+                                           hipMemcpyHostToDevice, r->stream);
+                        else
+                            hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice);
                         launch_attn_decode_i8(r,
                             (float *)r->d_attn_out_batch + (size_t)m * q_dim,
                             (float *)r->d_q_batch + (size_t)m * q_dim,
@@ -22799,6 +22824,9 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                               r->d_key_cache[l], r->d_value_cache[l],
                                               n_heads, n_kv_heads, head_dim, kv_dim,
                                               M, position_start, scale);
+                if (r->is_qwen4exp && r->debug_layers)
+                    debug_f32_state(r, l, "Q4 batch attn_raw",
+                                    (const float *)r->d_attn_out_batch, M * q_dim);
             }
         } else if (r->is_gemma4) {
             /* Source (batch) stride must be l_kvdim — the packed width the V/K GEMMs
@@ -23766,6 +23794,7 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->h_moe_tok_w_pinned) hipHostFree(r->h_moe_tok_w);
     else free(r->h_moe_tok_w);
     free(r->h_moe_offsets);
+    free(r->h_pos_batch);
     free(r->h_moe_xq_cpu);
     free(r->h_moe_gate_q_cpu);
     free(r->h_moe_xq_decode);

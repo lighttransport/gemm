@@ -176,49 +176,33 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
 
 ### Current reproducible state (RX 9070 XT, real 9,000-byte prompt)
 
-- Single-chunk batched (`prefill <= BMAX`), CPU experts off: **still
-  nondeterministic**, though rarely. 4,096 prefill / 64 decode at BMAX=4096
-  passed multiple 3/3 runs at hash `afdf60ceeb4f0103` (median ~142--147 prefill,
-  ~20 decode), but a 5-repeat run produced four different hashes
-  (`85b97a27836205e6`, `afdf60ceeb4f0103`, `339e6a42aa562d01`,
-  `a46d5f969ea27e86`). Pageable host weights (`LLM_MOE_REGISTER_HOST=0`) fix one
-  contributor -- registered-host `hipMemcpyAsync` is truly asynchronous and the
-  expert kernels can read the cache/staging destination before the copy lands,
-  whereas pageable copies block -- but do not remove the residual batched race.
-  Three-repeat runs are therefore not sufficient evidence for this route.
-  A three-repeat full-batch `LLM_DEBUG_LAYERS=1` trace first diverges at
-  `L39 Q4 batch attn_out` (a late full-attention layer) with `q_rope`/`k_rope`
-  bitwise identical, then propagates; the remaining race is therefore in the
-  batched attention/KV path, not the MoE or SSM bodies. This matches the
-  multi-chunk localization (`L23 attn_out`) and the original "no single kernel
-  isolation fixes it" conclusion.
+- Single-chunk batched (`prefill <= BMAX`), CPU experts off: **deterministic
+  (resolved)**. The residual race was the per-row position publication: a
+  blocking `hipMemcpy(r->d_position, &pos, ...)` on the null stream raced
+  `r->stream` kernels still reading `d_position` from the prior row (every row
+  of the forced-scalar layer 1). It now uses a stream-ordered
+  `hipMemcpyAsync(r->d_position, &r->h_pos_batch[m], ...)` from a stable
+  precomputed host array. 4,096 prefill / 64 decode at BMAX=4096 passes 5/5 at
+  hash `afdf60ceeb4f0103`, first token 16. `HIP_LAUNCH_BLOCKING=1` had already
+  hidden it (steady repeats matched), confirming it was an ordering bug rather
+  than arithmetic.
 - Multi-chunk stateful batching (prefill > BMAX, `LLM_QWEN4_BATCH_MULTI_CHUNK_
-  FORCE=1`) remains nondeterministic: 2,048 prefill / 64 decode at BMAX=1024
-  produced different first tokens/hashes across fresh processes and repeats
-  even with CPU experts off. A single 2,048-token chunk with BMAX=2048 and no
-  stream split passed 2/2 (`ef53e9e077515a3a`) and the 4,096-token single chunk
-  passed initial 3/3 runs, so the multi-chunk carry is the *larger* defect; a
-  rarer batched-path race still affects all single-chunk sizes intermittently
-  (see above). A two-repeat full-batch
-  `LLM_DEBUG_LAYERS=1` trace of the two-chunk run first diverges at
-  `L23 Q4 batch attn_out` (~94% through the trace, i.e. inside the second
-  chunk); forward outputs of the second chunk are bitwise stable until then.
-  This is now the narrowest remaining batched nondeterminism target.
+  FORCE=1`) still diverges: a 4,096-token prompt split at BMAX=1024 produced a
+  different third-repeat hash. The inter-chunk state carry therefore has a
+  separate remaining race and is the narrowest batched target.
 - The scalar `fast` route remains repeatable (3/3, hash `6d67721190bdaa83`) but
   only ~24 tok/s prefill at 4K.
 
 ### 4K batched profile (`batch4k`)
 
 A single 4,096-token batched dispatch fits on the 16-GiB card with BMAX=4096
-and a 5,000-MiB resident cache (peak ~14,900 MiB). `bench_qwen38_target.sh
-batch4k` wraps it: pageable host weights (`LLM_MOE_REGISTER_HOST=0`, which
-blocks the expert H2D copies), GPU router top-k, asynchronous cold uploads, CPU
-experts off, and `LLM_QWEN4_RESET_MOE_CACHE=1`. It usually reproduces hash
-`afdf60ceeb4f0103` at **median ~142 prefill / ~20 decode tok/s**, but a
-5-repeat run diverged, so it is the best-performing batched profile rather than
-a proven repeatable one.
+and a 5,000-MiB resident cache (peak 14,788 MiB). `bench_qwen38_target.sh
+batch4k` wraps it: pinned host weights, GPU router top-k, asynchronous cold
+uploads, CPU experts off, and `LLM_QWEN4_RESET_MOE_CACHE=1`. It passes 5/5 at
+hash `afdf60ceeb4f0103`, first token 16, at **median 149.2 prefill / 21.4
+decode / 136.7 end-to-end tok/s** (prefill min 149.0).
 
-Two state-isolation findings drove the profile:
+State-isolation findings that drove the profile:
 
 - Expert-cache residency changes the result even with CPU experts off: the
   first repeat after load differed from later repeats that inherited cache
@@ -287,16 +271,12 @@ single-dispatch profile:
   path becomes deterministic and reproduces the non-staged hash
   (`afdf60ceeb4f0103`), confirming its arithmetic is correct and the raced
   results (`ea20ffd2b071b6c3`, `b05a25a0c51bb35c`, ...) were corrupt.
-  The residual race is the pinned-host async staging copy: with
-  `LLM_MOE_REGISTER_HOST=0` (pageable host weights, so the H2D copies block)
-  the staged path is deterministic 3/3 and matches `afdf60ceeb4f0103`, but it
-  runs at only ~119 prefill / 17.9 decode -- below the non-staged `batch4k`
-  (147/21). With `LLM_MOE_REGISTER_HOST=1` the copies are truly asynchronous
-  and the kernel reads the staging bank before the copy reliably lands, so
-  neither a prefill warmup, extra stream syncs, nor disabling promotions fully
-  removes the divergence. The staged preset is therefore diagnostic and is not
-  a net win; the non-staged `batch4k` stays the deterministic production
-  profile.
+  After the per-row position fix, pageable host weights
+  (`LLM_MOE_REGISTER_HOST=0`) make the staged path deterministic 5/5 and it
+  reproduces `afdf60ceeb4f0103`, but only at ~119 prefill / 17.7 decode --
+  below the non-staged `batch4k` (149/21). With pinned host weights the
+  staging-bank async copy still races its consumer (a 5-repeat run diverged),
+  so the staged preset remains diagnostic and is not a net win.
 
 The `--qwen4-prefill-staging`, `LLM_QWEN4_STAGE_PROMOTE`, and
 `LLM_QWEN4_NATIVE_EXPERTS` switches are exposed for further work; the staged
