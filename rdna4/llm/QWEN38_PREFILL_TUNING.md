@@ -766,6 +766,11 @@ defaults to I8 but accepts `LLM_QWEN4_KV_QUANT=i8|fp8|f16|none` for matched
 long-context capacity comparisons. Set
 `QWEN38_EXPECT_HASH=<greedy sequence hash>` to add an optional output-quality
 gate to the smoke run.
+On the 16-GiB RX 9070 XT, the explicit FP8 256K capacity smoke passed with
+3.000 GiB KV, 4.91 prefill, 5.60 decode, and 5.23 end-to-end tok/s. The
+matched F16 control requested 6.000 GiB KV and failed during weight finalization
+with HIP allocation error code 2, so F16 has no valid 256K result on this
+memory budget; this is a capacity result, not a generation-quality claim.
 The flash launcher now pins `OMP_NUM_THREADS=16` by default, matching the
 server launcher and the longer-context measurements; callers can still set an
 explicit worker count for A/B tuning.
