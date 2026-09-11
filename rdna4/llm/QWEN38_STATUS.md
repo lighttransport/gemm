@@ -260,14 +260,22 @@ single-dispatch profile:
   (135--148) because every layer starts with an empty per-layer cache, so there
   is nothing resident to group; it also diverged on the third repeat.
 - **Staged grouped cold experts** (`--qwen4-prefill-staging`, cache 4000)
-  is the only grouping that helps: median 162--180 prefill / 19.5 decode,
-  hash `ea20ffd2b071b6c3`. It copies cold experts into double-buffered staging
-  banks and runs one grouped gate-up and one grouped down launch per wave
-  (346 waves, 0 fallbacks at 4K). Promotion copies to the resident cache
-  (`LLM_QWEN4_STAGE_PROMOTE=1`, default) are wasted within a single dispatch and
-  were one race source; disabling them removes that race but an intermittent
-  **first-request** divergence remains, so the staged preset is diagnostic and
-  the non-staged `batch4k` stays the deterministic production profile.
+  is the only grouping that helps: median 162--180 prefill / 19.5 decode. It
+  copies cold experts into double-buffered staging banks and runs one grouped
+  gate-up and one grouped down launch per wave (~350 waves, 0 fallbacks at 4K).
+  Two race sources were found and fixed: the per-wave staging map and task
+  arrays were published with blocking `hipMemcpy`, which is not ordered against
+  kernels on `r->stream` (now `hipMemcpyAsync` on `r->stream`), and the
+  staged-to-cache promotion copies are now disabled under the per-request cache
+  reset (`LLM_QWEN4_STAGE_PROMOTE=0`). With `HIP_LAUNCH_BLOCKING=1` the staged
+  path becomes deterministic and reproduces the non-staged hash
+  (`afdf60ceeb4f0103`), confirming its arithmetic is correct and the raced
+  results (`ea20ffd2b071b6c3`, `b05a25a0c51bb35c`, ...) were corrupt.
+  An intermittent wave-scheduling race remains: repeats 1--2 often match the
+  correct hash while a later repeat diverges, and neither a prefill warmup nor
+  extra stream syncs fully removes it. The staged preset is therefore
+  diagnostic; the non-staged `batch4k` stays the deterministic production
+  profile.
 
 The `--qwen4-prefill-staging`, `LLM_QWEN4_STAGE_PROMOTE`, and
 `LLM_QWEN4_NATIVE_EXPERTS` switches are exposed for further work; the staged

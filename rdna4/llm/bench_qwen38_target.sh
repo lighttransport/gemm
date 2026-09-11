@@ -310,6 +310,7 @@ timeout --foreground "${run_timeout}s" env \
     LLM_MOE_CPU_PREFILL_MAX_JOBS="${cpu_prefill_jobs}" \
     LLM_QWEN4_RESET_MOE_CACHE="${LLM_QWEN4_RESET_MOE_CACHE:-1}" \
     LLM_QWEN4_STAGE_PROMOTE="${LLM_QWEN4_STAGE_PROMOTE:-0}" \
+    LLM_BENCH_WARMUP="${LLM_BENCH_WARMUP:-0}" \
     LLM_QWEN4_APPROX_DECODE="${approx_decode}" \
     LLM_QWEN4_DEVICE_HITS_ONLY="${device_hits_only}" \
     LLM_QWEN4_DEVICE_REFRESH_INTERVAL="${refresh}" \

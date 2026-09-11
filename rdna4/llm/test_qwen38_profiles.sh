@@ -164,6 +164,16 @@ grep -q 'LLM_QWEN4_STAGE_PROMOTE' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: staged promotion switch missing' >&2
     exit 1
 }
+# Staging metadata must be published on the compute stream (ordered with the
+# grouped launch), not via blocking hipMemcpy on the null stream.
+grep -q 'hipMemcpyAsync(r->d_qwen4_stage_map' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: staged map publication not stream-ordered' >&2
+    exit 1
+}
+grep -q 'LLM_BENCH_WARMUP' "${root_dir}/test_hip_llm.c" || {
+    echo 'profile test: bench warmup hook missing' >&2
+    exit 1
+}
 grep -q 'LLM_QWEN4_NATIVE_EXPERTS' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: native-vs-WMMA expert A/B switch missing' >&2
     exit 1
@@ -209,12 +219,12 @@ grep -q 'hipMemcpy(d_task_e, task_e' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: grouped resident task metadata must not reuse async pageable scratch' >&2
     exit 1
 }
-grep -q 'hipMemcpy(task_e, r->h_moe_tok_idx' "${root_dir}/hip_llm_runner.c" || {
-    echo 'profile test: staged resident task metadata must not reuse async pageable scratch' >&2
+grep -q 'hipMemcpyAsync(task_e, r->h_moe_tok_idx' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: staged task metadata must be stream-ordered' >&2
     exit 1
 }
-grep -q 'hipMemcpy(task_e, r->h_moe_tok_idx, (size_t)tasks' "${root_dir}/hip_llm_runner.c" || {
-    echo 'profile test: staged wave task metadata must not reuse async pageable scratch' >&2
+grep -q 'Drain the stream first' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: staged wave loop must drain before reusing host scratch' >&2
     exit 1
 }
 if grep -q 'hipMemcpyAsync(d_task_e, task_e' "${root_dir}/hip_llm_runner.c"; then

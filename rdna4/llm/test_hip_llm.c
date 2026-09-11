@@ -1431,6 +1431,16 @@ int main(int argc, char **argv) {
     if (bench_mode) {
         unsigned char *seen = NULL;
         if (bench_repeat < 1) bench_repeat = 1;
+        /* Optional throwaway prefill + reset before the measured repeats.  Some
+         * paths (Qwen4 grouped staging, VRAM-tight profiles) differ on their
+         * first invocation only; warming them makes the measured repeats
+         * describe steady-state execution. */
+        if (bench_repeat > 1 && getenv("LLM_BENCH_WARMUP")) {
+            int wn = max_tokens > 0 ? max_tokens : 1;
+            if (wn + 1 > n_max_seq) wn = n_max_seq > 1 ? n_max_seq - 1 : 1;
+            hip_llm_forward_batch_logits(gpu, tokens, wn, 0);
+            hip_llm_reset_state(gpu);
+        }
         for (int bench_rep = 0; bench_rep < bench_repeat; bench_rep++) {
         if (bench_repeat > 1)
             fprintf(stderr, "\n=== Bench repeat %d/%d ===\n", bench_rep + 1, bench_repeat);

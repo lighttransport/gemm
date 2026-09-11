@@ -20269,12 +20269,15 @@ static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
     if (resident_tasks) {
         int *task_e = (int *)r->d_router_logits_batch;
         int *task_p = task_e + resident_tasks;
-        /* The same host scratch is reused while cold experts are staged;
-         * finish the pageable H2D metadata copy before that reuse. */
-        hipMemcpy(task_e, r->h_moe_tok_idx,
-                  (size_t)resident_tasks * sizeof(int), hipMemcpyHostToDevice);
-        hipMemcpy(task_p, r->h_router_batch,
-                  (size_t)resident_tasks * sizeof(int), hipMemcpyHostToDevice);
+        /* Publish on the compute stream so the grouped launch is ordered after
+         * the metadata; the cold-wave loop's stream sync protects the host
+         * scratch from reuse while the copy is in flight. */
+        hipMemcpyAsync(task_e, r->h_moe_tok_idx,
+                       (size_t)resident_tasks * sizeof(int), hipMemcpyHostToDevice,
+                       r->stream);
+        hipMemcpyAsync(task_p, r->h_router_batch,
+                       (size_t)resident_tasks * sizeof(int), hipMemcpyHostToDevice,
+                       r->stream);
         launch_qwen4_experts_grouped(r, cl, ne, eff, n_embd, resident_tasks);
     }
     /* Most-used cold experts are staged first. This makes promotion useful on
@@ -20290,6 +20293,11 @@ static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
         int n = ncold - first;
         if (n > r->qwen4_stage_slots) n = r->qwen4_stage_slots;
         int bank = wave & 1, tasks = 0;
+        /* The staging map and task arrays are shared across waves and are
+         * rewritten with blocking host memcpys that are not ordered against
+         * the previous wave's kernels on r->stream.  Drain the stream first so
+         * wave N+1 cannot overwrite the metadata wave N is still reading. */
+        if (r->stream) hipStreamSynchronize(r->stream);
         for (int e = 0; e < ne; ++e) r->h_qwen4_stage_map[e] = -1;
         for (int i = 0; i < n; ++i) {
             int e = cold[first + i];
@@ -20319,17 +20327,18 @@ static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
                 ((int *)r->h_router_batch)[tasks++] = p;
             }
         }
-        hipMemcpy(r->d_qwen4_stage_map, r->h_qwen4_stage_map,
-                  (size_t)ne * sizeof(int), hipMemcpyHostToDevice);
         int *task_e = (int *)r->d_router_logits_batch;
         int *task_p = task_e + tasks;
-        /* The next staging wave reuses these pageable host arrays.  Publish
-         * the task list synchronously so a later wave cannot alter metadata
-         * before this grouped launch consumes it. */
-        hipMemcpy(task_e, r->h_moe_tok_idx, (size_t)tasks * sizeof(int),
-                  hipMemcpyHostToDevice);
-        hipMemcpy(task_p, r->h_router_batch, (size_t)tasks * sizeof(int),
-                  hipMemcpyHostToDevice);
+        /* Publish the staging map and task list on the compute stream so the
+         * grouped launch is ordered after them.  The wave-loop stream sync
+         * guarantees these complete before the next wave rewrites the host
+         * arrays, so an async copy cannot read a torn host buffer. */
+        hipMemcpyAsync(r->d_qwen4_stage_map, r->h_qwen4_stage_map,
+                       (size_t)ne * sizeof(int), hipMemcpyHostToDevice, r->stream);
+        hipMemcpyAsync(task_e, r->h_moe_tok_idx, (size_t)tasks * sizeof(int),
+                       hipMemcpyHostToDevice, r->stream);
+        hipMemcpyAsync(task_p, r->h_router_batch, (size_t)tasks * sizeof(int),
+                       hipMemcpyHostToDevice, r->stream);
         launch_qwen4_experts_grouped_stage(r, cl, eff, n_embd, tasks, bank);
         r->moe_stats.stage_waves++;
 
@@ -20366,6 +20375,10 @@ static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
             r->moe_stats.stage_promotions++;
         }
     }
+    /* The grouped staging kernels read the staging banks and the shared
+     * d_moe_eg/d_moe_eout scratch.  Complete them before the caller's ordered
+     * combine and before the next layer reuses the banks. */
+    if (r->stream) hipStreamSynchronize(r->stream);
     return 0;
 }
 
