@@ -166,7 +166,7 @@ grep -q 'hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice)' "${
     echo 'profile test: loop-local position publication must be synchronous' >&2
     exit 1
 }
-if grep -q 'hipMemcpyAsync(r->d_position, &pos' "${root_dir}/hip_llm_runner.c"; then
+if grep -q 'hipMemcpyAsync(r->d_position, &pos,' "${root_dir}/hip_llm_runner.c"; then
     echo 'profile test: loop-local position still uses async host source' >&2
     exit 1
 fi
