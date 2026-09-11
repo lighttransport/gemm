@@ -183,8 +183,13 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
 - Multi-chunk stateful batching (prefill > BMAX, `LLM_QWEN4_BATCH_MULTI_CHUNK_
   FORCE=1`) remains nondeterministic: 2,048 prefill / 64 decode at BMAX=1024
   produced different first tokens/hashes across fresh processes and repeats
-  even with CPU experts off. This is now the narrowest remaining batched
-  nondeterminism target.
+  even with CPU experts off. A single 2,048-token chunk with BMAX=2048 and no
+  stream split *is* deterministic (`ef53e9e077515a3a`, 2/2), so the defect is
+  specifically the inter-chunk state carry. A two-repeat full-batch
+  `LLM_DEBUG_LAYERS=1` trace of the two-chunk run first diverges at
+  `L23 Q4 batch attn_out` (~94% through the trace, i.e. inside the second
+  chunk); forward outputs of the second chunk are bitwise stable until then.
+  This is now the narrowest remaining batched nondeterminism target.
 - The scalar `fast` route remains repeatable (3/3, hash `6d67721190bdaa83`) but
   only ~24 tok/s prefill at 4K.
 
