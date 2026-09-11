@@ -28,7 +28,7 @@ TARGET = test_hip_llm
 QWEN38_MODEL ?= /mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 QSA_MOE_CACHE_MB ?= 128
 
-.PHONY: all clean run api profile-test bench-256k qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda help
+.PHONY: all clean run api profile-test bench-256k hipblaslt-status qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda help
 
 all: $(TARGET)
 
@@ -83,6 +83,11 @@ fp8-test:
 
 bench-256k: $(TARGET)
 	./bench_qwen38_256k.sh
+
+hipblaslt-status:
+	@printf 'hipBLASLt headers: %s\n' '$(if $(HIPBLASLT_HEADERS),available,missing)'
+	@printf 'hipBLASLt runtime: %s\n' '$(if $(ROCM_LIB),$(ROCM_LIB)libhipblaslt.so,not-found)'
+	@if [ -z "$(HIPBLASLT_HEADERS)" ]; then echo 'mode: scalar bridge fallback (no acceleration)'; else echo 'mode: accelerated bridge available'; fi
 
 # Full-window QSA allocation/numerics gate. This does not generate a 256K
 # response; it exercises the index cache and selected-attention verifier.
