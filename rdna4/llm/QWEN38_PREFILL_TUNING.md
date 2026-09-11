@@ -761,7 +761,9 @@ the 128+32 control above.  The matching 256K HTTP server reached
 one-line C function with `5.32` prefill and `5.34` decode tok/s end to end.
 The same regression is now available as `make -C rdna4/llm bench-256k` (or
 `rdna4/llm/bench_qwen38_256k.sh`); it keeps its log under `rdna4/llm/tmp/` and
-fails before model loading when KFD/render access is missing.  Set
+fails before model loading when KFD/render access is missing. The benchmark
+defaults to I8 but accepts `LLM_QWEN4_KV_QUANT=i8|fp8|f16|none` for matched
+long-context capacity comparisons. Set
 `QWEN38_EXPECT_HASH=<greedy sequence hash>` to add an optional output-quality
 gate to the smoke run.
 The flash launcher now pins `OMP_NUM_THREADS=16` by default, matching the

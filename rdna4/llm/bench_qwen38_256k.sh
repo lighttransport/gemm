@@ -11,6 +11,11 @@ prefill="${QWEN38_BENCH_PREFILL:-8}"
 decode="${QWEN38_BENCH_DECODE:-8}"
 bench_timeout="${QWEN38_BENCH_TIMEOUT:-600}"
 prefill_topk="${LLM_QWEN4_PREFILL_GPU_TOPK:-1}"
+kv_quant="${LLM_QWEN4_KV_QUANT:-i8}"
+case "${kv_quant}" in
+    i8|fp8|none|f16) ;;
+    *) echo "LLM_QWEN4_KV_QUANT must be i8, fp8, f16, or none" >&2; exit 2 ;;
+esac
 if [[ "${LLM_QWEN4_BATCH:-0}" == "1" && -z "${LLM_QWEN4_PREFILL_GPU_TOPK+x}" ]]; then
     prefill_topk=0
 fi
@@ -55,7 +60,7 @@ fi
 # with the transient graph/plan allocations disabled below.
 timeout --foreground "${bench_timeout}s" env \
     OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}" \
-    LLM_QWEN4_KV_QUANT=i8 \
+    LLM_QWEN4_KV_QUANT="${kv_quant}" \
     LLM_MOE_CACHE_MB="${LLM_MOE_CACHE_MB:-5900}" \
     LLM_BMAX="${LLM_BMAX:-512}" \
     LLM_HC_GRAPHS="${LLM_HC_GRAPHS:-0}" \
@@ -79,11 +84,11 @@ if grep -Eq 'Failed to (load weights to GPU|init HIP runner)|ROCm device unavail
     exit 1
 fi
 grep -q 'Result: PASS' "${log_file}"
-grep -E 'Prefill:|Decode:|End-to-end:' "${log_file}"
+grep -E 'Qwen4 KV cache:|Prefill:|Decode:|End-to-end:' "${log_file}"
 if [[ -n "${QWEN38_EXPECT_HASH:-}" ]]; then
     grep -q "sequence hash=${QWEN38_EXPECT_HASH}" "${log_file}" || {
         echo "256K quality hash mismatch (expected ${QWEN38_EXPECT_HASH})" >&2
         exit 1
     }
 fi
-echo "256K smoke PASS: ${log_file}"
+echo "256K smoke PASS: kv=${kv_quant} log=${log_file}"
