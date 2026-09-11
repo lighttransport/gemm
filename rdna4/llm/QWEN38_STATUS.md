@@ -75,6 +75,12 @@ explicit experiments.
   `5c7ed763fe63b0da` and `c6761ef1770a4293` (first tokens 515 and 10586), at
   71.97/66.68 and 71.10/66.07 prefill/end-to-end tok/s. Router reduction
   ordering is therefore not the sole remaining source.
+- A stricter 512-token isolation with batched SSM, attention, router,
+  projections, grouped MoE, and copy overlap disabled still diverged: hashes
+  `ee573f2372785825` and `fbade0a3d53fbd73` (first tokens 17 and 11), at
+  62.49/60.34 and 62.49/60.37 prefill/end-to-end tok/s. The remaining bug is
+  therefore in broader batched state/stream publication, not one isolated
+  grouped kernel; scalar dispatch remains the reference path.
 
 ## Explicitly unresolved
 
