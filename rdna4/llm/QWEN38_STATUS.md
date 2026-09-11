@@ -82,6 +82,10 @@ explicit experiments.
 - The current ROCm image has `libhipblaslt.so` but no hipBLASLt headers, so the
   200+ tok/s accelerated prefill path cannot be rebuilt here. `make -C rdna4/llm
   hipblaslt-status` reports this directly.
+- FP4 KV is not implemented or aliased: the current cache formats are F16,
+  symmetric I8, and real E4M3 FP8. A useful FP4 implementation would need a
+  specified packed FP4 encoding and scale/error policy first; silently
+  reusing the I8 byte path would not be a valid assessment.
 - Persistent `/dev/kfd` access requires host/container device passthrough;
   elevated command namespaces are temporary and are not persistent access.
 
