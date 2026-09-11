@@ -86,6 +86,10 @@ explicit experiments.
   publications are now synchronous. Matched post-fix controls still differed
   (`2aa0ef09c71a181b` vs `fbade0a3d53fbd73`, first tokens 17 vs 11), so this
   was another real race but not the complete source.
+- Fresh rebuilt scalar controls remain deterministic: both 512-token runs
+  returned first token 30 and hash `a2d4f49620d5b663`, at 25.84/25.86 and
+  25.87/25.83 prefill/end-to-end tok/s. The instability is specific to the
+  batched dispatcher, not general GPU state or model loading.
 
 ## Explicitly unresolved
 
