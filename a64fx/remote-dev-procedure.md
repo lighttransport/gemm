@@ -495,6 +495,83 @@ filesystem.  If the full graph still stops responding during initial loading,
 record it as model I/O and inspect it through a separate control session; do
 not infer a uTofu collective fault from that symptom.
 
+## DS4.1-Flash cross-compilation on a Fugaku frontend
+
+The DS4.1 A64FX foundation can be compiled on a Fugaku frontend without
+allocating a compute node.  Use the Fujitsu cross-compilers explicitly:
+
+| Target | C compiler | C++ compiler | MPI C/C++ wrapper |
+| --- | --- | --- | --- |
+| Frontend cross-build | `fccpx` | `FCCpx` | `mpifccpx` / `mpiFCCpx` |
+| Compute-node native build | `fcc` | `FCC` | `mpifcc` / `mpiFCC` |
+
+From the repository root on the frontend:
+
+```bash
+cd ~/work/gemm/ds4f
+make -C a64fx/ds41f clean
+make -C a64fx/ds41f ds41f_sve_test \
+  A64FX_CC=fccpx \
+  A64FX_CFLAGS='-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast'
+make -C a64fx/ds41f ds41f_utofu_test \
+  A64FX_MPICC=mpifccpx \
+  A64FX_CFLAGS='-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast'
+```
+
+`ds41f_sve_test` is a cross-compiled A64FX binary and should be run only on
+an A64FX compute node. `ds41f_utofu_test` links MPI and `libtofucom` and
+requires a live 12-node allocation. MPI exchanges actual VCQ IDs and provides
+bootstrap barriers; the tested sum/max reductions use uTofu. This test does
+not read `tofu_topo.txt`. Frontend compilation does not exercise uTofu hardware.
+
+For MPI topology-helper builds on the frontend, use the matching wrapper and
+then execute the resulting binary inside the allocation:
+
+```bash
+make -C a64fx/utofu-tests tofu_topo_helper MPICC=mpifccpx
+```
+
+For C++ MPI programs use `mpiFCCpx` instead of `mpifccpx`. Both frontend
+cross-compilers and compute-node native compilers produce AArch64 objects;
+keep compiler options and runtime versions consistent when linking them.
+As with native builds, unload the concurrently loaded LLVM
+module and clear `OPAL_PREFIX` if the MPI wrapper reports wrapper-data or
+`libmpi` resolution errors.
+
+After the 12-node job starts, run the collective self-test from a new shared
+results directory. For `node=12` non-contiguous allocations, use scheduler
+placement with one process per node (`PJM_PROC_BY_NODE=1`, `PJM_MPI_PROC=12`).
+Do not pass a rectangular `-vcoordfile`: physical Tofu coordinates are not
+virtual placement coordinates. The test verifies all 12 ranks have distinct
+physical coordinates before creating communication resources.
+
+```bash
+cd /path/to/repository
+repo_dir=$PWD
+test "$PJM_PROC_BY_NODE" = 1
+test "$PJM_MPI_PROC" = 12
+mkdir -p "/local/$USER/ds41f-tmp"
+export TMPDIR="/local/$USER/ds41f-tmp"
+run_dir=$(mktemp -d "$repo_dir/tmp/ds41f-comm-$PJM_JOBID.XXXXXX")
+cd "$run_dir"
+nohup mpiexec -np 12 -of-proc launcher \
+  "$repo_dir/a64fx/ds41f/ds41f_utofu_test" > launch.log 2>&1 < /dev/null &
+```
+
+Inspect `utofu.rank00.log` through `utofu.rank11.log` on shared storage.
+Each must contain a PASS line:
+
+```text
+DS41F_UTOFU_TEST PASS rank=0 ranks=12 reductions=200
+```
+
+Validated on job `51562789` (12 non-contiguous nodes, six-hour interactive
+allocation): 12/12 unique hosts passed 100 sum and 100 max reductions each,
+cycling payloads of 1, 2, 19, and 5120 FP32 values. The earlier failure came
+from the test's bootstrap (incorrect barrier stride and assumed peer TNI),
+plus an incorrect expected sum. Reading `/local` from the service node only
+sees that node's files and cannot establish how many ranks MPI launched.
+
 ### Resident rank-image workflow
 
 Decode must not mmap or stream weights from either shared storage or
@@ -560,5 +637,22 @@ that state manually only when it is no longer wanted.
 - **Local health fails while the job is running:** confirm both tunnel ends use
   the same login node. The local `REMOTE` alias and compute-side
   `FRONTEND_SSH_TARGET` must identify that node.
+- **`PLE 0008 plexec must be started sequentially`:** another MPI launcher is
+  active in the allocation. Observed while 12-rank DS4.1 staging was running
+  in job 51562789. Keep staging alive and wait for that launch to finish before
+  starting the next distributed test. A separate HTTP shell does not bypass
+  this restriction. Direct non-MPI tests on the initial compute node can run
+  concurrently when memory/CPU headroom permits. Use shared per-rank logs;
+  inspecting the initial node's `/local` cannot establish other ranks' status.
 - **Tunnel drops after a network interruption:** the job supervises `ssh -R`.
   Run `watch_local_tunnel.sh` to supervise and recreate the local `ssh -L` end.
+- **Compute sees stale shared-file content after a frontend edit:** observed
+  in job 51562789: `tail` on the frontend showed newly added test commands,
+  while `tail` through the compute bridge still showed the old script. This
+  is consistent with the shared/LLIO cache path; do not assume a new launch
+  sees an in-place edit. Publish scripts and binaries to a **new versioned
+  shared path**, compare `sha256sum` on both sides, then execute that snapshot.
+  A relocated script must use an explicit binary directory if it normally
+  locates executables relative to itself (`DS41F_BIN_DIR` for the attention
+  test wrapper). Never edit an active shell script: its retained file offset
+  can instead produce truncated execution or an unexpected EOF.
