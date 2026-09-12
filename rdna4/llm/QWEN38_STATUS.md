@@ -176,31 +176,37 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
 
 ### Current reproducible state (RX 9070 XT, real 9,000-byte prompt)
 
-- Single-chunk batched (`prefill <= BMAX`), CPU experts off: **deterministic
-  (resolved)**. The residual race was the per-row position publication: a
-  blocking `hipMemcpy(r->d_position, &pos, ...)` on the null stream raced
-  `r->stream` kernels still reading `d_position` from the prior row (every row
-  of the forced-scalar layer 1). It now uses a stream-ordered
-  `hipMemcpyAsync(r->d_position, &r->h_pos_batch[m], ...)` from a stable
-  precomputed host array. 4,096 prefill / 64 decode at BMAX=4096 passes 5/5 at
-  hash `afdf60ceeb4f0103`, first token 16. `HIP_LAUNCH_BLOCKING=1` had already
-  hidden it (steady repeats matched), confirming it was an ordering bug rather
-  than arithmetic.
+- Single-chunk batched (`prefill <= BMAX`), CPU experts off: **improved but
+  still not reliably deterministic**. One real race was fixed: the per-row
+  position publication used a blocking `hipMemcpy(r->d_position, &pos, ...)` on
+  the null stream, which raced `r->stream` kernels still reading `d_position`
+  from the prior row (every row of the forced-scalar layer 1). It now uses a
+  stream-ordered `hipMemcpyAsync(r->d_position, &r->h_pos_batch[m], ...)` from a
+  stable precomputed host array. With pageable host weights and direct copies
+  an 8-repeat run passed, but repeating the same configuration diverged on
+  2/8, and pinned host weights or the async pipeline diverge on roughly 1/8.
+  `HIP_LAUNCH_BLOCKING=1` largely hides the residual, so at least one more
+  ordering dependency remains; forcing per-token MoE was too slow to finish an
+  8-repeat bisection. The scalar route remains the only quality-safe default.
 - Multi-chunk stateful batching (prefill > BMAX, `LLM_QWEN4_BATCH_MULTI_CHUNK_
   FORCE=1`) still diverges: a 4,096-token prompt split at BMAX=1024 produced a
-  different third-repeat hash. The inter-chunk state carry therefore has a
-  separate remaining race and is the narrowest batched target.
+  different third-repeat hash. The inter-chunk state carry has a separate
+  remaining race.
 - The scalar `fast` route remains repeatable (3/3, hash `6d67721190bdaa83`) but
   only ~24 tok/s prefill at 4K.
 
 ### 4K batched profile (`batch4k`)
 
 A single 4,096-token batched dispatch fits on the 16-GiB card with BMAX=4096
-and a 5,000-MiB resident cache (peak 14,788 MiB). `bench_qwen38_target.sh
-batch4k` wraps it: pinned host weights, GPU router top-k, asynchronous cold
-uploads, CPU experts off, and `LLM_QWEN4_RESET_MOE_CACHE=1`. It passes 5/5 at
-hash `afdf60ceeb4f0103`, first token 16, at **median 149.2 prefill / 21.4
-decode / 136.7 end-to-end tok/s** (prefill min 149.0).
+and a 5,000-MiB resident cache (peak ~14,900 MiB). `bench_qwen38_target.sh
+batch4k` wraps it: GPU router top-k, CPU experts off, and
+`LLM_QWEN4_RESET_MOE_CACHE=1`. It usually reproduces hash
+`afdf60ceeb4f0103` (first token 16). With pageable host weights and direct
+copies (the most-repeatable settings, `reg=0 copy=0`) it measured median
+**125 prefill / 19.6 decode / 115.6 end-to-end tok/s**; with pinned host weights
+and the async pipeline (`reg=1 copy=1`) it reaches median **149.2 prefill /
+21.4 decode / 136.7 end-to-end tok/s** but diverges more often. Neither is fully
+repeatable yet.
 
 State-isolation findings that drove the profile:
 

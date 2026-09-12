@@ -146,16 +146,16 @@ expect_contains "${out}" 'batch=1'
 expect_contains "${out}" 'multi=0'
 expect_contains "${out}" 'force_multi=0'
 expect_contains "${out}" 'cpu_prefill_jobs=0'
-expect_contains "${out}" 'copy=1'
-# Pinned host weights are the faster default now that position publication is
-# stream-ordered; pageable remains an explicit override.
-expect_contains "${out}" 'reg=1'
-out="$(QWEN38_DRY_RUN=1 LLM_MOE_REGISTER_HOST=0 \
-    QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
-expect_contains "${out}" 'reg=0'
-out="$(QWEN38_DRY_RUN=1 LLM_MOE_COPY_PIPELINE=0 \
-    QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
+# Repeatable default: pageable host weights + direct copies.  The faster pinned
+# host and async pipeline are explicit overrides with residual races.
 expect_contains "${out}" 'copy=0'
+expect_contains "${out}" 'reg=0'
+out="$(QWEN38_DRY_RUN=1 LLM_MOE_REGISTER_HOST=1 \
+    QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
+expect_contains "${out}" 'reg=1'
+out="$(QWEN38_DRY_RUN=1 LLM_MOE_COPY_PIPELINE=1 \
+    QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
+expect_contains "${out}" 'copy=1'
 # Staged grouped-cold diagnostic preset.
 out="$(QWEN38_DRY_RUN=1 QWEN38_TARGET_PROFILE=batch4k-stage \
     "${root_dir}/bench_qwen38_target.sh")"

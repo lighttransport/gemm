@@ -151,10 +151,10 @@ case "${profile}" in
         ;;
     batch4k|batch4k-stage)
         # Deterministic single-dispatch 4K profile: one 4096-row batched prefill
-        # (no multi-chunk state carry), pinned host weights, async cold uploads,
-        # GPU router top-k, and a resident cache on the 16-GiB card.  The
-        # `-stage` variant groups cold experts through the staging banks and
-        # uses a 4000-MiB cache to leave headroom (median ~180 prefill).
+        # (no multi-chunk state carry), pageable host weights, direct cold
+        # uploads, GPU router top-k, and a resident cache on the 16-GiB card.
+        # The `-stage` variant groups cold experts through the staging banks
+        # with a 4000-MiB cache (also pageable for repeatability).
         if [[ "${profile}" == "batch4k-stage" ]]; then
             prefill_staging="${QWEN38_TARGET_PREFILL_STAGING:-1}"
             cache_mb="${QWEN38_MOE_CACHE_MB:-4000}"
@@ -162,9 +162,11 @@ case "${profile}" in
             cache_mb="${QWEN38_MOE_CACHE_MB:-5000}"
         fi
         bmax="${LLM_BMAX:-4096}"
-        # Pinned host weights are safe now that the per-row position publication
-        # is stream-ordered; they are ~7 tok/s faster than pageable.
-        register_host="${LLM_MOE_REGISTER_HOST:-1}"
+        # Registered (pinned) host weights and the async copy pipeline are each
+        # ~10-20 tok/s faster but still race their consumer on this ROCm stack
+        # (rare 1-in-8 repeat divergence), so the repeatable default uses
+        # pageable host weights and direct copies.
+        register_host="${LLM_MOE_REGISTER_HOST:-0}"
         gpu_topk="${LLM_QWEN4_PREFILL_GPU_TOPK:-1}"
         qwen_batch="${LLM_QWEN4_BATCH:-1}"
         batch_ssm="${QWEN38_TARGET_BATCH_SSM:-1}"
@@ -173,11 +175,9 @@ case "${profile}" in
         device_hits_only="${LLM_QWEN4_DEVICE_HITS_ONLY:-0}"
         refresh="${LLM_QWEN4_DEVICE_REFRESH_INTERVAL:-2}"
         stream_chunk="${LLM_BENCH_STREAM_CHUNK:-0}"
-        # The async cold-upload pipeline is faster (~147 vs ~132 prefill) and is
-        # request-isolated because the cache reset drains the copy stream and
-        # clears moe_pipeline_valid.  Set LLM_MOE_COPY_PIPELINE=0 for direct
-        # copies (a lower-overhead A/B).
-        copy_pipeline="${LLM_MOE_COPY_PIPELINE:-1}"
+        # Direct copies are the repeatable choice; the async pipeline is faster
+        # but has a residual event-ordering race.
+        copy_pipeline="${LLM_MOE_COPY_PIPELINE:-0}"
         native_batch_qkv="${LLM_QWEN4_NATIVE_BATCH_QKV:-1}"
         ssm_batch_q6k="${LLM_SSM_BATCH_Q6K:-1}"
         ssm_batch_conv="${LLM_SSM_BATCH_CONV:-1}"
