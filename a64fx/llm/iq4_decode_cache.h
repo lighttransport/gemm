@@ -66,7 +66,9 @@ static inline __attribute__((always_inline)) float tf_iq4_cache_dot(
     int nb, const int8_t *palette) {
     const svbool_t pg=svptrue_b32(), p8=svptrue_b8();
     const svbool_t p16=svwhilelt_b8(0,16),p32=svwhilelt_b8(0,32);
-    const svint32_t values=svld1sb_s32(pg,palette);
+    /* All palette integers are exactly representable in FP32. Convert once
+     * per row instead of after each table lookup in the weight loop. */
+    const svfloat32_t values=svcvt_f32_s32_x(pg,svld1sb_s32(pg,palette));
     const svint8_t bytes=svld1_s8(p16,palette);
     const svuint32_t scale_ix=svlsr_n_u32_x(pg,svindex_u32(0,1),2);
     svfloat32_t a0=svdup_f32(0),a1=a0,a2=a0,a3=a0;
@@ -83,10 +85,10 @@ static inline __attribute__((always_inline)) float tf_iq4_cache_dot(
         } else {
             svuint32_t q0=svld1ub_u32(pg,w[b].q+g*32);
             svuint32_t q1=svld1ub_u32(pg,w[b].q+g*32+16);
-            svfloat32_t w0=svcvt_f32_s32_x(pg,svtbl_s32(values,svand_n_u32_x(pg,q0,15)));
-            svfloat32_t w1=svcvt_f32_s32_x(pg,svtbl_s32(values,svand_n_u32_x(pg,q1,15)));
-            svfloat32_t w2=svcvt_f32_s32_x(pg,svtbl_s32(values,svlsr_n_u32_x(pg,q0,4)));
-            svfloat32_t w3=svcvt_f32_s32_x(pg,svtbl_s32(values,svlsr_n_u32_x(pg,q1,4)));
+            svfloat32_t w0=svtbl_f32(values,svand_n_u32_x(pg,q0,15));
+            svfloat32_t w1=svtbl_f32(values,svand_n_u32_x(pg,q1,15));
+            svfloat32_t w2=svtbl_f32(values,svlsr_n_u32_x(pg,q0,4));
+            svfloat32_t w3=svtbl_f32(values,svlsr_n_u32_x(pg,q1,4));
             const float *v=x+b*256+g*64;
             a0=svmla_f32_x(pg,a0,svmul_n_f32_x(pg,w0,d[0]),svld1_f32(pg,v));
             a1=svmla_f32_x(pg,a1,svmul_n_f32_x(pg,w1,d[1]),svld1_f32(pg,v+16));

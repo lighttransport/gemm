@@ -1187,28 +1187,31 @@ static inline float tf_q6_k_dot_sve(const block_q6_K *blocks, const float *x, in
 static inline float tf_iq4_xs_dot_sve(const block_iq4_xs *blocks, const float *x, int n) {
     const svbool_t pg = svptrue_b32();
     const svbool_t p16 = svwhilelt_b32(0, 16);
-    const svint32_t values = svld1sb_s32(p16, kvalues_iq4nl);
-    svfloat32_t acc = svdup_f32(0.0f);
+    const svfloat32_t values = svcvt_f32_s32_x(p16,svld1sb_s32(p16,kvalues_iq4nl));
+    svfloat32_t a0 = svdup_f32(0.0f), a1=a0, a2=a0, a3=a0;
     for (int ib = 0; ib < n / 256; ib++) {
         const block_iq4_xs *b = &blocks[ib];
         const float d = ggml_fp16_to_fp32(b->d);
-        for (int g = 0; g < 8; g++) {
-            int ls = ((b->scales_l[g / 2] >> (4 * (g & 1))) & 15) |
-                     (((b->scales_h >> (2 * g)) & 3) << 4);
-            /* Keep the nonlinear codebook in a vector register; no scalar
-             * lookup loop or temporary FP32 row for each 32-value group. */
-            svuint32_t q = svld1ub_u32(p16, b->qs + g * 16);
-            svfloat32_t lo = svcvt_f32_s32_x(p16,
-                svtbl_s32(values, svand_n_u32_x(p16, q, 15)));
-            svfloat32_t hi = svcvt_f32_s32_x(p16,
-                svtbl_s32(values, svlsr_n_u32_x(p16, q, 4)));
-            acc = svmla_m(p16, acc, svmul_n_f32_x(p16, lo, d * (ls - 32)),
-                          svld1(p16, x + ib * 256 + g * 32));
-            acc = svmla_m(p16, acc, svmul_n_f32_x(p16, hi, d * (ls - 32)),
-                          svld1(p16, x + ib * 256 + g * 32 + 16));
+        #pragma clang loop unroll(disable)
+        for (int g = 0; g < 8; g+=2) {
+            /* Convert the constant palette once, and separate dependent
+             * FMA chains. Weight dequantization precision is unchanged. */
+#define TF_IQ4_XS_GROUP(ALO,AHI,G) do { \
+    int ls=((b->scales_l[(G)/2]>>(4*((G)&1)))&15) | \
+           (((b->scales_h>>(2*(G)))&3)<<4); \
+    float scale=d*(ls-32); \
+    svuint32_t q=svld1ub_u32(p16,b->qs+(G)*16); \
+    svfloat32_t lo=svtbl_f32(values,svand_n_u32_x(p16,q,15)); \
+    svfloat32_t hi=svtbl_f32(values,svlsr_n_u32_x(p16,q,4)); \
+    ALO=svmla_m(p16,ALO,svmul_n_f32_x(p16,lo,scale),svld1(p16,x+ib*256+(G)*32)); \
+    AHI=svmla_m(p16,AHI,svmul_n_f32_x(p16,hi,scale),svld1(p16,x+ib*256+(G)*32+16)); \
+} while(0)
+            TF_IQ4_XS_GROUP(a0,a1,g);
+            TF_IQ4_XS_GROUP(a2,a3,g+1);
+#undef TF_IQ4_XS_GROUP
         }
     }
-    return svaddv_f32(pg, acc);
+    return svaddv_f32(pg,svadd_f32_x(pg,svadd_f32_x(pg,a0,a1),svadd_f32_x(pg,a2,a3)));
 }
 
 #include "../a64fx/llm/mixed_iq_decode.h"

@@ -97,6 +97,38 @@ static void benchmark(const qtensor *mat) {
     free(x); free(y);
 }
 
+/* Cover every nonlinear code and signed six-bit scale, including zero,
+ * independently of the distributions present in a particular checkpoint.
+ * Odd block counts also exercise the final iteration of the decode loop. */
+static int validate_iq4_xs_patterns(void) {
+    const int widths[] = {256, 768, 5120};
+    const float scales[] = {0.0f, 0.00006103515625f, 0.125f, -0.25f};
+    int bad = 0;
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        int K = widths[wi], nb = K / 256;
+        block_iq4_xs *data = calloc((size_t)13 * nb, sizeof(*data));
+        if (!data) exit(2);
+        for (int r = 0; r < 13; r++) {
+            for (int b = 0; b < nb; b++) {
+                block_iq4_xs *w = data + r * nb + b;
+                w->d = ggml_fp32_to_fp16(scales[(r + b) % 4]);
+                for (int g = 0; g < 8; g++) {
+                    int scale = (r * 8 + b * 13 + g) % 64;
+                    w->scales_l[g / 2] |= (scale & 15) << (4 * (g & 1));
+                    w->scales_h |= (scale >> 4) << (2 * g);
+                }
+                for (int k = 0; k < 128; k++)
+                    w->qs[k] = ((k + r) & 15) | (((k / 16 + b) & 15) << 4);
+            }
+        }
+        qtensor mat = {.data=data, .type=GGML_TYPE_IQ4_XS, .n_rows=13, .n_cols=K};
+        puts("SYNTH IQ4_XS signed scales and nonlinear codes");
+        bad += validate(&mat, K, 1, 1);
+        free(data);
+    }
+    return bad;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2 || argc > 4) { fprintf(stderr, "usage: %s GSQ.gguf [max_rows] [q8]\n", argv[0]); return 2; }
 #ifdef A64FX_MIXED_IQ_DECODE_H
@@ -111,7 +143,7 @@ int main(int argc, char **argv) {
     gguf_context *g = gguf_open(argv[1], 3);
     int fd = open(argv[1], O_RDONLY);
     if (!g || fd < 0) return 2;
-    int seen[64] = {0}, bad = 0;
+    int seen[64] = {0}, bad = validate_iq4_xs_patterns();
     for (uint64_t i = 0; i < g->n_tensors; i++) {
         const gguf_tensor_info *t = &g->tensors[i];
         if (t->type >= 64 || seen[t->type] || t->type == GGML_TYPE_IQ3_XXS ||

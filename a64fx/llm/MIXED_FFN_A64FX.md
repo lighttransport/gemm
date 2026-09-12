@@ -253,5 +253,128 @@ allocated their own slabs. These are synthetic read rates, not decode rates.
 
 Evidence is in `tmp/llm-goal/`: `barrier_modes_image.log`,
 `barrier_modes_output.txt`, `iq4local_test.log`, `stream.log`, and
-`workeralloc.log`. **The full-model four-bit cache is not yet validated;
-30+ decode tok/s remains unachieved.**
+`workeralloc.log`. The next section records the subsequent full-model
+four-bit-cache validation. **30+ decode tok/s remains unachieved.**
+
+## Follow-up: full-model IQ cache and FP32 palette lookups
+
+The saved post-commit runs in `tmp/llm-goal/iq4_full_image.log` and
+`iq4_q8_image.log` complete the earlier cache validation. The FP32-activation
+run produces all 96 baseline greedy tokens at **6.18 tok/s** (95 forwards /
+15.371 s). It caches 278 tensors / 12.360 GiB. The optional Q8 run reaches
+8.17 tok/s (95 / 11.623 s), but matches only the first 77 tokens before
+diverging. It caches 287 tensors / 12.810 GiB, so those timings also differ
+in cache coverage. Q8 activations remain explicitly lossy and opt-in.
+The sampled minimum available memory is 7.077 and 6.900 GiB respectively.
+
+The next kernel revision keeps each signed palette in an FP32 SVE register,
+eliminating repeated integer-to-float conversions after table lookups. These
+small integer palette values are exactly representable in FP32. The native
+IQ4_XS dot kernel additionally uses four independent accumulation chains;
+weight and activation precision stay unchanged, but the FP32 addition order
+changes. Greedy agreement on the measured prompt does not imply bit-identical
+logits or agreement on every prompt.
+
+Fresh bounded tests on job **51562789**, initial node **a25-4009c**, pass:
+
+- `test_mixed_tokenmajor`: 42 passing checks in each of FP32 and optional-Q8
+  modes; maximum scaled error 3.96e-8 against the independent double reference.
+- Added synthetic IQ4_XS coverage uses K=256, 768, and 5120, nonlinear palette
+  codes, signed six-bit scales, zero block scales, and changed/zero activations.
+- `test_iq4_decode_cache`: all five formats pass packing and both activation
+  modes, including worker-local dispatch, repeated construction, row slices,
+  and output padding. Maximum scaled error is 1.33e-8.
+
+The pending 16-row panel experiment was also run on this node. Its weight
+reconstruction and both activation modes pass for all five formats, but it
+does not justify production integration. For K=17408, row/panel FP32 times
+are 0.753/0.812 ms (IQ2_XS) and 0.752/0.840 ms (IQ2_XXS); corresponding Q8
+times are 0.177/0.417 and 0.177/0.426 ms. The smaller K=5120 Q8 matrices
+improve modestly. The panel remains an experimental local microbenchmark;
+the runner continues to use worker-local rows. Evidence:
+`tmp/llm-goal/iq4_panel_v2_job51562789.log`, binary SHA256
+`c20ca2239991ec18f42b7adabe250b9f1375c99d5d67d24bba63776d38c01636`.
+
+### Paired full-model measurement
+
+The continuation comparison uses one 48-core A64FX node at 2.0 GHz, with
+the same 12,000 MiB cache budget and flat-spin barrier for both binaries.
+Both cache **264 tensors / 11.708 GiB**, skipping 49. The model and mmproj
+were staged with `stage_model.sh` using its `SRC` and `DST` overrides
+(1 GiB chunks with fsync). Main-model weights use anonymous HBM allocation.
+Each run is detached and guarded by a five-minute timeout and a 6 GiB
+`MemAvailable` floor; no other inference ran concurrently.
+
+| Revision | Decode forwards / seconds | Decode tok/s | Baseline greedy IDs | Minimum available GiB |
+| --- | --- | --- | --- | --- |
+| `297d590e` runner | 95 / 15.421 | 6.16 | 96/96 | 7.757 |
+| FP32 palette + IQ4_XS accumulation chains | 95 / 14.510 | 6.55 | 96/96 | 7.728 |
+
+This paired measurement improves throughput by **6.3%**. Output-head time
+drops from 1365.8 to 960.7 ms across the 95 forwards; FFN gate/up goes from
+6160.8 to 6036.7 ms, and FFN down from 2912.0 to 2744.6 ms. Logits remain
+finite and non-degenerate. Process `read_bytes` stays constant throughout
+the recorded decode samples (18 before, 17 after), at 16,241,852,416 and
+16,196,894,720 bytes respectively. These are cumulative process I/O counters,
+not model sizes or measured HBM traffic.
+
+Frontend builds (Fujitsu TCSDS 1.2.43):
+
+```sh
+mkdir -p tmp/llm-continue-20260912
+export TMPDIR="$PWD/tmp/llm-continue-20260912"
+make -C a64fx/llm llm_runner CC=fccpx OPENMP=1
+for test in test_mixed_tokenmajor test_iq4_decode_cache; do
+    fccpx -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast \
+        -fopenmp -D_GNU_SOURCE -ffunction-sections -fdata-sections \
+        -Wno-unused-function "a64fx/llm/$test.c" \
+        -Wl,--gc-sections -lm -lpthread -lhwb \
+        -o "tmp/llm-continue-20260912/$test"
+done
+```
+
+Bounded commands on the compute node:
+
+```sh
+export TMPDIR=/local/u14346/codex-tmp NUMA_INTERLEAVE=1
+export OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores
+M=/local/u14346/qwen38-gsq/Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf
+tmp/llm-continue-20260912/test_mixed_tokenmajor "$M" 4096
+tmp/llm-continue-20260912/test_mixed_tokenmajor "$M" 4096 q8
+tmp/llm-continue-20260912/test_iq4_decode_cache "$M"
+```
+
+The detached guardian `tmp/llm-continue-20260912/run_validation_v1.py`
+records exact command arrays and runs this full-model command for each
+preserved binary, with the same OpenMP/NUMA settings as above:
+
+```sh
+TF_PREFILL_EMBD_GEMM=1 TF_BATCH_SCRATCH_REUSE=1 TF_DPROF=1 TF_DUMP_LOGITS=1 \
+  a64fx/llm/build/llm_runner "$M" \
+  /local/u14346/qwen38-gsq/mmproj-Qwen3.8-27B-BF16.gguf common/fujisan.jpg \
+  --prompt 'explain the image' --vit-dtype bf16 --max-seq 512 --max-gen 96 \
+  --vit-threads 48 --llm-threads 48 --no-deepstack --prefill-gemm --seed 1 \
+  --iq4-cache-mib 12000 --decode-barrier flat-spin
+```
+
+Logs and memory samples are in `tmp/llm-continue-20260912/`:
+`validation.log` ends in `VALIDATION PASS`; `mixed_f32_output.txt`,
+`mixed_q8_output.txt`, and `iq4_cache_output.txt` contain bounded results;
+`before.log`, `after.log`, and their `_memory.jsonl` files contain the paired
+measurement. The old binary is `llm_runner_before` (SHA256
+`607467bbbd18f43db6efaf55e9c018a4a11719d6fe5f9f18a1b11ad4a939d2fe`);
+the tested candidate is `build/llm_runner` (SHA256
+`965e32e922a9b9e7587f58c6d0b03a195a510486393a4c976268a2369ce15f7d`).
+Binary and guardian hashes were compared on the frontend and compute node
+before launch. The bounded builds introduce no warnings; the isolated VLM
+rebuild reports the existing `_GNU_SOURCE` redefinition warnings in
+`cmg_pool.c` and `test_cmg_pool.c`.
+
+The delivered `a64fx/llm/build/llm_runner` has SHA256
+`525056586be12373877d0d521ccac3e1f27a6bfdba53bda1dd1330a39e053186`,
+verified on both hosts. Its `.text`, `.rodata`, and `.data` sections are
+byte-identical to the measured candidate. At completion no validation or
+inference process remains, and available memory has returned to 29.76 GiB.
+The existing bridge for job 51562789 is reachable at local port 42393
+(login reverse port 32393); the staged model files remain on its initial
+node for continuation until the allocation ends.
