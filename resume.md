@@ -35,9 +35,12 @@ scalar references all disagree with staged prefill; see the new status table.
 Native HC batching now passes the real-model bitwise oracle for48 layers,
 both phases and8 rows, including F16 injection. Its corpus check fails all four prompts; see
 `tmp/nativehc_quality_summary.log`. Do not claim full-model parity from the
-HC oracle. Next: the Q8 SSM input/output projections still use BF16 GEMMs
-because only Q6 has a native SSM batch branch. Preserve the scalar fused
-Q8 reduction order when adding that branch and validate it separately.
+HC oracle. Q8 SSM native batching is now implemented:
+`LLM_QWEN4_BATCH_SSM_NATIVE=1`, binary `tmp/test_hip_llm_nativessm`.
+`--verify-ssm-projections` passes 36 layers x 5 projections x 8 rows bitwise.
+Combined HC+SSM still fails all four corpus cases; see
+`tmp/nativessm_quality_summary.log`. Next numerical candidates are BF16
+router/shared-expert batching. No production default is promoted.
 
 Final validated binary: `rdna4/llm/tmp/test_hip_llm_verified`. Its graph
 check captures47 prefixes with zero failures and matches two4K/64 staged

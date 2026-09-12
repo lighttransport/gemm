@@ -149,6 +149,7 @@ int hip_llm_get_moe_stats(const hip_llm_runner *r, hip_llm_moe_stats *stats);
 /* Current free/total VRAM plus high-water usage sampled after forwards. */
 int hip_llm_get_vram_stats(const hip_llm_runner *r, hip_llm_vram_stats *stats);
 void hip_llm_reset_moe_stats(hip_llm_runner *r);
+int hip_llm_verify_ssm_projections(hip_llm_runner *r, int M);
 int hip_llm_verify_qwen4_ple_split(hip_llm_runner *r, int rows);
 int hip_llm_verify_hc_batch(hip_llm_runner *r, int batch,
                             double *out_rel_l2, double *out_max_abs);

@@ -1162,6 +1162,7 @@ static const char *hip_kernel_source =
 "        else if(row-qrows-zrows<dt_rank)alpha[row-qrows-zrows]=total;\n"
 "        else beta[row-qrows-zrows-dt_rank]=total;}\n"
 "}\n"
+#include "qwen4_ssm_native_kernels.h"
 "/* Fused dense Q8_0 gate/up projection and SiLU product. */\n"
 "__global__ void ffn_gate_up_silu_q8_0_mw(float *dst,const unsigned char *gate,\n"
 "        const unsigned char *up,const float *x,int rows,int cols){\n"
@@ -9589,6 +9590,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_qkv_q8_0_mw;
     hipFunction_t fn_matvec_qz_q8_0_mw;
     hipFunction_t fn_ssm_matvec4_q8_f32;
+    hipFunction_t fn_ssm_matvec4_q8_batch_f32;
     hipFunction_t fn_ffn_gate_up_silu_q8_0_mw;
     hipFunction_t fn_ffn_gate_up_silu_iq1_s_mw;
     hipFunction_t fn_glm5next_moe_gateup_iq1s_selected;
@@ -10504,6 +10506,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_qkv_q8_0_mw);
     GET_FUNC(matvec_qz_q8_0_mw);
     GET_FUNC(ssm_matvec4_q8_f32);
+    GET_FUNC(ssm_matvec4_q8_batch_f32);
     GET_FUNC(ffn_gate_up_silu_q8_0_mw);
     GET_FUNC(ffn_gate_up_silu_iq1_s_mw);
     GET_FUNC(glm5next_moe_gateup_iq1s_selected);
@@ -15370,6 +15373,28 @@ static inline void launch_ssm_matvec4_q8_f32(hip_llm_runner *r,
            256, 1, 1, 0, r->stream, args);
 }
 
+static int qwen4_ssm_native_supported(const hip_layer *cl) {
+    return cl->ssm_qkv_type == GGML_TYPE_Q8_0 &&
+        cl->ssm_gate_type == GGML_TYPE_Q8_0 &&
+        cl->ssm_alpha_type == cl->ssm_beta_type &&
+        (cl->ssm_alpha_type == GGML_TYPE_F16 || cl->ssm_alpha_type == GGML_TYPE_F32) &&
+        cl->ssm_qkv_cols == cl->ssm_gate_cols &&
+        cl->ssm_qkv_cols == cl->ssm_alpha_cols &&
+        cl->ssm_qkv_cols == cl->ssm_beta_cols &&
+        cl->ssm_out_type == GGML_TYPE_Q8_0;
+}
+
+static int launch_ssm_matvec4_q8_batch(hip_llm_runner *r, hip_layer *cl, int M,
+        void *input, void *qkv, void *z, void *alpha, void *beta) {
+    int qrows=cl->ssm_qkv_rows, zrows=cl->ssm_gate_rows, dt=r->ssm_dt_rank;
+    int cols=cl->ssm_qkv_cols, fcols=cl->ssm_alpha_cols;
+    int aux_f16=cl->ssm_alpha_type == GGML_TYPE_F16;
+    void *args[]={&qkv,&z,&alpha,&beta,&cl->ssm_qkv_w,&cl->ssm_gate_w,
+        &cl->ssm_alpha_w,&cl->ssm_beta_w,&input,&qrows,&zrows,&dt,&cols,&fcols,&aux_f16};
+    return LAUNCH(r->fn_ssm_matvec4_q8_batch_f32,qrows+zrows+2*dt,M,1,
+                  256,1,1,0,r->stream,args) == hipSuccess ? 0 : -1;
+}
+
 static inline void launch_ssm_matvec4_q6k_batch(hip_llm_runner *r,
         void *qkv, void *z, void *alpha, void *beta,
         void *qmat, void *zmat, void *amat, void *bmat, void *x,
@@ -18510,6 +18535,7 @@ static void forward_hc_combine_batched(hip_llm_runner *r,int M,void *block){
 }
 
 #include "qwen4_hc_native_test.h"
+#include "qwen4_ssm_native_test.h"
 
 int hip_llm_verify_hc_batch(hip_llm_runner *r,int M,double *rel,double *mx){
     if(!r||!r->is_qwen4exp||M<1||M>r->batch_max)return -1;
@@ -22723,7 +22749,14 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 cl->ssm_gate_type == GGML_TYPE_Q6_K &&
                 cl->ssm_alpha_type == GGML_TYPE_F16 &&
                 cl->ssm_beta_type == GGML_TYPE_F16;
-            if (use_q6_batch) {
+            const char *ssm_native_env = getenv("LLM_QWEN4_BATCH_SSM_NATIVE");
+            int ssm_native = ssm_native_env && atoi(ssm_native_env) != 0 &&
+                             qwen4_ssm_native_supported(cl);
+            if (ssm_native) {
+                if (launch_ssm_matvec4_q8_batch(r,cl,M,r->d_xnorm_batch,
+                    r->d_ssm_qkv_batch,r->d_ssm_z_batch,r->d_ssm_alpha_batch,
+                    r->d_ssm_beta_batch)) return -1;
+            } else if (use_q6_batch) {
                 launch_ssm_matvec4_q6k_batch(r, r->d_ssm_qkv_batch,
                     r->d_ssm_z_batch, r->d_ssm_alpha_batch,
                     r->d_ssm_beta_batch, cl->ssm_qkv_w, cl->ssm_gate_w,
@@ -22850,9 +22883,12 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
 
             /* ssm_out projection: d_inner -> n_embd, batched. Reuse d_silu_batch_bf16
              * as packing scratch (sized for n_ff >= d_inner). */
-            launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
-                                      r->d_ssm_out_batch, M * d_inner);
-            {
+            if (ssm_native) {
+                if (launch_matmul_q8_batch_f32(r,r->d_attn_proj_batch,cl->ssm_out_w,
+                    r->d_ssm_out_batch,M,n_embd,d_inner)) return -1;
+            } else {
+                launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
+                                        r->d_ssm_out_batch, M * d_inner);
                 void *ow = get_bf16_weight(r, cl->ssm_out_w, cl->ssm_out_w_bf16,
                                 cl->ssm_out_type, cl->ssm_out_rows, cl->ssm_out_cols);
                 if (!ow) return -1;

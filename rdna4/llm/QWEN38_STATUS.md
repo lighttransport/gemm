@@ -4,6 +4,29 @@ Current validation appears first. Earlier investigations are retained below as
 history; short-run determinism claims there do not establish scalar F16 parity.
 Scalar F16 remains the default; staged prefill is diagnostic.
 
+## Native Q8 SSM projections
+
+`LLM_QWEN4_BATCH_SSM_NATIVE=1` bypasses BF16 input/output GEMMs for
+supported Q8 SSM layers. The fused Q8 input kernel preserves scalar reduction
+order for QKV, gate, and F16/F32 alpha/beta; the output uses the validated
+native Q8 batch kernel. Unsupported weight combinations retain their existing
+path. The option remains diagnostic and defaults off.
+
+The real-model `--verify-ssm-projections` oracle passes bitwise, with finite
+outputs, on all 36 SSM layers x 5 projections x 8 rows. This validates
+projections, not recurrence or the whole model. Build:
+`TMPDIR=$PWD/rdna4/llm/tmp make -C rdna4/llm TARGET=tmp/test_hip_llm_nativessm`.
+Run with `LLM_BMAX=4096 LLM_QWEN4_BATCH=1 LLM_QWEN4_BATCH_SSM=1`,
+the model path, and `-s 8192 --gpu-only-bench --moe-cache-mb 4000
+--verify-ssm-projections`. Log: `tmp/nativessm_oracle.log`.
+
+Native HC + SSM still fails all four fresh scalar 128/16 references,
+repeatably: coding 107300/dffd736659bc0c82; arithmetic
+248068/9789b7989b7ebc32; prose 248045/355cc01b83b41f71;
+Japanese 248044/2666e2f5535d3399.
+Log: `tmp/nativessm_quality_summary.log`. Router and shared-expert
+batching still use BF16 intermediates and remain unvalidated against scalar.
+
 ## Corrected-routing performance and quality refresh
 
 The corrected staged 4096/64 workload is repeatable across 20 requests in
