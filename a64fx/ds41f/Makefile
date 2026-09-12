@@ -9,14 +9,15 @@ A64FX_CFLAGS ?= -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast
 .DEFAULT_GOAL := all
 
 bench_batch bench_quant ds41f_run test_attention test_index_candidates test_cache test_staged_expert ds41f_kernel_test ds41f_sve_test ds41f_utofu_test: ds41f_quant_sve.h ds41f_kernels.h
+ds41f_run test_attention test_index_candidates test_staged_expert ds41f_utofu_test: ds41f_profile.h
 bench_attention_kernel: bench_attention_kernel.c ds41f_ops.c
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -lm -o $@
 bench_batch: bench_batch.c ds41f_batch.c ds41f_kernels.c ../gemma4-kernels/sgemm_bf16_2x12.S
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -lm -o $@
 bench_hardware: bench_hardware.c
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -lm -o $@
-ds41f_run: ds41f_run.c ds41f_comm.c ds41f_attention.c ds41f_weights.c ds41f_tensor.c ds41f_cache.c ds41f_kernels.c ds41f_sve.c ds41f_ops.c ds41f_expert.c ds41f_engram.c
-	$(A64FX_MPICC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -ltofucom -lm -o $@
+ds41f_run: ds41f_run.c ds41f_comm.c ds41f_attention.c ds41f_weights.c ds41f_tensor.c ds41f_cache.c ds41f_kernels.c ds41f_sve.c ds41f_ops.c ds41f_expert.c ds41f_engram.c ds41f_profile.c ds41f_profile.h ds41f_prefetch.c ds41f_prefetch.h
+	$(A64FX_MPICC) $(A64FX_CFLAGS) -DDS41F_ENABLE_PROFILE -fopenmp -pthread -I. $(filter %.c %.S,$^) -ltofucom -lm -o $@
 test_attention: test_attention.c ds41f_attention.c ds41f_weights.c ds41f_tensor.c ds41f_cache.c ds41f_kernels.c ds41f_sve.c ds41f_ops.c
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -lm -o $@
 test_index_candidates: test_index_candidates.c ds41f_attention.c ds41f_weights.c ds41f_tensor.c ds41f_cache.c ds41f_kernels.c ds41f_sve.c ds41f_ops.c
@@ -31,8 +32,12 @@ bench_quant: bench_quant.c ds41f_sve.c ds41f_kernels.c
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -lm -o $@
 test_ops: test_ops.c ds41f_ops.c
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -lm -o $@
+test_pointwise: test_pointwise.c ds41f_ops.c
+	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -lm -o $@
+test_prefetch: test_prefetch.c ds41f_prefetch.c ds41f_prefetch.h ds41f_engram.c ds41f_kernels.c ds41f_profile.c ds41f_profile.h
+	$(A64FX_CC) $(A64FX_CFLAGS) -DDS41F_ENABLE_PROFILE -pthread -I. $(filter %.c %.S,$^) -lm -o $@
 all: ds41f_stage ds41f_bench ds41f_kernel_test
-a64fx: ds41f_run ds41f_sve_test ds41f_utofu_test test_attention test_index_candidates test_cache test_ops test_engram test_staged_expert bench_batch bench_quant bench_attention_kernel bench_hardware
+a64fx: ds41f_run ds41f_sve_test ds41f_utofu_test test_attention test_index_candidates test_cache test_ops test_pointwise test_prefetch test_engram test_staged_expert bench_batch bench_quant bench_attention_kernel bench_hardware
 
 ds41f_stage: ds41f_stage.c
 	$(CC) $(CFLAGS) -I$(COMMON) $< -o $@
@@ -62,4 +67,4 @@ ds41f_bench_utofu: ds41f_bench.c ds41f_engram.c ds41f_engram.h ../q38fn/ngram_ut
 
 clean:
 	rm -f ds41f_stage ds41f_bench ds41f_bench_utofu ds41f_kernel_test ds41f_sve_test ds41f_utofu_test bench_quant test_ops test_engram test_staged_expert
-	rm -f ds41f_run test_attention test_index_candidates test_cache bench_batch bench_attention_kernel bench_hardware
+	rm -f ds41f_run test_attention test_index_candidates test_cache test_pointwise test_prefetch bench_batch bench_attention_kernel bench_hardware

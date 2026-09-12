@@ -8,6 +8,7 @@
 static float sigmoid(float x) {return x>=0?1/(1+expf(-x)):expf(x)/(1+expf(x));}
 void ds41f_swiglu(float *out,const float *gate,const float *up,size_t n,float limit)
 {
+    #pragma omp parallel for schedule(static) if(n>=512)
     for(size_t i=0;i<n;++i){float g=gate[i],u=up[i];
         if(limit>0){g=fminf(g,limit);u=fminf(limit,fmaxf(-limit,u));}
         out[i]=g*sigmoid(g)*u;
@@ -62,6 +63,7 @@ void ds41f_hc_post(float *out,const float *x,const float *residual,
     #if defined(__clang__)
     #pragma STDC FP_CONTRACT OFF
     #endif
+    #pragma omp parallel for schedule(static) if(dim>=512)
     for(size_t j=0;j<dim;++j){float v[4];
         for(int o=0;o<4;++o){float sum=0;
             for(int i=0;i<4;++i)sum+=comb[i*4+o]*residual[i*dim+j];
@@ -133,7 +135,19 @@ int ds41f_sparse_attention(float *out,const float *q,const float *kv,
         float sum=expf(sink[h]-mx);
         for(size_t i=0;i<selected;++i){s[i]=expf(s[i]-mx);sum+=s[i];}
         for(size_t i=0;i<selected;++i)s[i]/=sum;
-        for(size_t j=0;j<dim;j+=vl){svbool_t tail=svwhilelt_b32(j,dim);svfloat32_t acc=svdup_f32(0);
+        /* Consume a full A64FX cache line from each selected row. Four
+         * independent output vectors share the score/row lookup and hide
+         * FMA latency without changing any output lane's reduction order. */
+        size_t j=0;
+        for(;j+4*vl<=dim;j+=4*vl){svfloat32_t a=svdup_f32(0),b=a,c=a,d=a;
+            for(size_t i=0;i<selected;++i)if(ids[i]>=0){const float *v=kv+(size_t)ids[i]*dim+j;float weight=s[i];
+                a=svmla_n_f32_x(pg,a,svld1(pg,v),weight);
+                b=svmla_n_f32_x(pg,b,svld1(pg,v+vl),weight);
+                c=svmla_n_f32_x(pg,c,svld1(pg,v+2*vl),weight);
+                d=svmla_n_f32_x(pg,d,svld1(pg,v+3*vl),weight);}
+            svst1(pg,out+h*dim+j,a);svst1(pg,out+h*dim+j+vl,b);
+            svst1(pg,out+h*dim+j+2*vl,c);svst1(pg,out+h*dim+j+3*vl,d);}
+        for(;j<dim;j+=vl){svbool_t tail=svwhilelt_b32(j,dim);svfloat32_t acc=svdup_f32(0);
             for(size_t i=0;i<selected;++i)if(ids[i]>=0)
                 acc=svmla_n_f32_m(tail,acc,svld1(tail,kv+(size_t)ids[i]*dim+j),s[i]);
             svst1(tail,out+h*dim+j,acc);}

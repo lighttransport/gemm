@@ -3,6 +3,7 @@
 #include "ds41f_kernels.h"
 #include "ds41f_sve.h"
 #include "ds41f_ops.h"
+#include "ds41f_profile.h"
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -66,6 +67,7 @@ static int update_source(ds41f_attention *s,const ds41f_weights *w,int layer,siz
 static int select_positions(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,const float *x,const float *qr)
 {
     size_t count=(pos+1)/(layer<20?2:1);s->selected_count=0;if(!count)return 0;
+    double pt=P_BEGIN();
     float q[32*128],weights[32];uint8_t packed[68];
     CHECK(linear(w,layer,"indexer.wq_b",q,qr,0));rope(q,32,128,layer,pos,0);
     for(int h=0;h<32;++h){CHECK(ds41f_fp4_pack(packed,q+h*128,128,32,0));CHECK(ds41f_fp4_unpack(q+h*128,packed,128,32,0));}
@@ -73,6 +75,7 @@ static int select_positions(ds41f_attention *s,const ds41f_weights *w,int layer,
     for(int h=0;h<32;++h)weights[h]=bf(weights[h]/64.f);
     float *scores=malloc(count*sizeof(float));if(!scores)return ENOMEM;
     const uint8_t *rows=s->compressed[source(layer)];
+    P_END(INDEX_QUERY,pt);pt=P_BEGIN();
     #pragma omp parallel for schedule(static)
     for(size_t i=0;i<count;++i){
         /* Later query sources only score the candidate source's retained
@@ -82,6 +85,7 @@ static int select_positions(ds41f_attention *s,const ds41f_weights *w,int layer,
         for(int h=0;h<32;++h){float dot=0;
             for(int j=0;j<128;++j)dot+=q[h*128+j]*key[j];
             sum+=bf(fmaxf(bf(dot),0)*weights[h]);}scores[i]=bf(sum);}
+    P_END(INDEX_SCORE,pt);pt=P_BEGIN();
     if(layer==20){size_t blocks=(count+7)/8;float *block_scores=malloc(blocks*sizeof(float));int *ids=malloc(2048*sizeof(int));
         if(!block_scores||!ids){free(block_scores);free(ids);free(scores);return ENOMEM;}
         for(size_t b=0;b<blocks;++b){float best=-INFINITY;for(size_t j=b*8;j<count&&j<b*8+8;++j)best=fmaxf(best,scores[j]);block_scores[b]=best;}
@@ -90,7 +94,7 @@ static int select_positions(ds41f_attention *s,const ds41f_weights *w,int layer,
         for(size_t i=0;i<kept;++i)s->candidate_blocks[ids[i]]=1;
         free(block_scores);free(ids);
     }
-    s->selected_count=ds41f_select_topk(scores,count,512,s->selected);free(scores);return 0;
+    s->selected_count=ds41f_select_topk(scores,count,512,s->selected);free(scores);P_END(INDEX_SELECT,pt);return 0;
 }
 static int grouped_output(const ds41f_weights *w,int layer,float *out,const float *x)
 {
@@ -99,21 +103,27 @@ static int grouped_output(const ds41f_weights *w,int layer,float *out,const floa
     snprintf(name,sizeof name,"layers.%d.attn.wo_a.scale",layer);
     const ds41f_weight *scale=ds41f_weight_find(w,name);
     if(!weight||!scale||strcmp(weight->dtype,"F8_E4M3")||weight->rows!=8192||weight->cols!=4096||scale->bytes!=256*128)return EINVAL;
-    CHECK(ds41f_fp8_grouped_matvec(out,weight->data,scale->data,x,8,1024,4096));
-    ds41f_round_bf16(out,8192);return 0;
+    double pt=P_BEGIN();
+    P_VALUE(FP8_BYTES,weight->bytes+scale->bytes);
+    CHECK(ds41f_fp8_grouped_matvec(out,weight->data,scale->data,x,8,1024,4096));P_END(LINEAR_FP8,pt);
+    pt=P_BEGIN();ds41f_round_bf16(out,8192);P_END(LINEAR_ROUND,pt);return 0;
 }
 int ds41f_attention_step(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,const float *x,float *out)
 {
     if(!s||!w||!x||!out||layer<0||layer>=40||pos>=s->capacity)return EINVAL;
     float qr[1280],q[64*512],kv[512],attended[64*512],projected[8192];
-    CHECK(linear(w,layer,"wq_a",qr,x,0));CHECK(norm(w,layer,"q_norm",qr,qr));
-    CHECK(linear(w,layer,"wq_b",q,qr,0));rope(q,64,512,layer,pos,0);
+    double pt=P_BEGIN();CHECK(linear(w,layer,"wq_a",qr,x,0));CHECK(norm(w,layer,"q_norm",qr,qr));P_END(ATTN_QA,pt);
+    pt=P_BEGIN();CHECK(linear(w,layer,"wq_b",q,qr,0));P_END(ATTN_QB,pt);
+    pt=P_BEGIN();rope(q,64,512,layer,pos,0);P_END(ATTN_Q_ROPE,pt);pt=P_BEGIN();
     CHECK(linear(w,layer,"wkv",kv,x,0));CHECK(norm(w,layer,"kv_norm",kv,kv));
     rope(kv,1,512,layer,pos,0);CHECK(ds41f_act_quant(kv,kv,512));
     float *window=s->window+(size_t)layer*128*512;
     memcpy(window+(pos%128)*512,kv,sizeof kv);
+    P_END(ATTN_KV,pt);pt=P_BEGIN();
     if(is_source(layer))CHECK(update_source(s,w,layer,pos,x));
+    P_END(ATTN_COMPRESS,pt);pt=P_BEGIN();
     if(is_index(layer))CHECK(select_positions(s,w,layer,pos,x,qr));
+    P_END(ATTN_INDEX,pt);pt=P_BEGIN();
     size_t raw_count=pos<128?pos+1:128,extra=layer<2?0:s->selected_count;
     float *rows=malloc((raw_count+extra)*512*sizeof(float));if(!rows)return ENOMEM;
     int ids[128+512];
@@ -126,9 +136,10 @@ int ds41f_attention_step(ds41f_attention *s,const ds41f_weights *w,int layer,siz
     char name[192];snprintf(name,sizeof name,"layers.%d.attn.attn_sink",layer);
     const ds41f_weight *sink=ds41f_weight_find(w,name);
     if(!sink||sink->bytes!=64*4){free(rows);return EINVAL;}
+    P_END(ATTN_ROWS,pt);pt=P_BEGIN();
     int rc=ds41f_sparse_attention(attended,q,rows,sink->data,ids,raw_count+extra,raw_count+extra,64,512);
-    free(rows);if(rc)return rc;
+    free(rows);if(rc)return rc;P_END(ATTN_SPARSE,pt);pt=P_BEGIN();
     ds41f_round_bf16(attended,64*512);rope(attended,64,512,layer,pos,1);
-    CHECK(grouped_output(w,layer,projected,attended));
-    return linear(w,layer,"wo_b",out,projected,0);
+    P_END(ATTN_INVERSE_ROPE,pt);pt=P_BEGIN();CHECK(grouped_output(w,layer,projected,attended));P_END(ATTN_WOA,pt);
+    pt=P_BEGIN();rc=linear(w,layer,"wo_b",out,projected,0);P_END(ATTN_WOB,pt);return rc;
 }

@@ -10,6 +10,8 @@
 /test_index_candidates
 /test_cache
 /test_ops
+/test_pointwise
+/test_prefetch
 /test_engram
 /test_staged_expert
 /bench_batch

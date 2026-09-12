@@ -3,6 +3,7 @@
 #include "ds41f_sve.h"
 #include "ds41f_kernels.h"
 #include "ds41f_ops.h"
+#include "ds41f_profile.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -41,20 +42,21 @@ int ds41f_expert_forward(const ds41f_expert *e,float *out,const float *x,
         reference?ds41f_mxfp4_matvec_ref:ds41f_mxfp4_matvec;
     float *gate=scratch,*up=scratch+2304,*hidden=scratch+4608;
     float *input=scratch+6912;
+    double pt=P_BEGIN();P_VALUE(EXPERT_COUNT,1);P_VALUE(FP4_BYTES,3*((size_t)5120*2304/2+(size_t)5120*2304/32));
     int rc=ds41f_act_quant(input,x,5120);
     if (rc) return rc;
+    P_END(EXPERT_QUANT,pt);pt=P_BEGIN();
     rc=mv(gate,e->weight[0],e->scale[0],input,2304,5120);
     rc|=mv(up,e->weight[2],e->scale[2],input,2304,5120);
     if (rc) return rc;
-    for (int i=0;i<2304;++i) {
-        gate[i]=ds41f_bf16_to_f32(ds41f_f32_to_bf16(gate[i]));
-        up[i]=ds41f_bf16_to_f32(ds41f_f32_to_bf16(up[i]));
-    }
-    ds41f_swiglu(hidden,gate,up,2304,10);
+    P_END(EXPERT_W13,pt);pt=P_BEGIN();
+    ds41f_round_bf16(gate,2304);ds41f_round_bf16(up,2304);
+    P_END(EXPERT_ROUND,pt);pt=P_BEGIN();ds41f_swiglu(hidden,gate,up,2304,10);
     for (int i=0;i<2304;++i) hidden[i]*=route_weight;
-    rc=ds41f_act_quant(hidden,hidden,2304);
+    P_END(EXPERT_SWIGLU,pt);pt=P_BEGIN();rc=ds41f_act_quant(hidden,hidden,2304);
     if (rc) return rc;
-    rc=mv(out,e->weight[1],e->scale[1],hidden,5120,2304);
-    for (int i=0;i<5120;++i) out[i]=ds41f_bf16_to_f32(ds41f_f32_to_bf16(out[i]));
-    return rc;
+    P_END(EXPERT_QUANT,pt);pt=P_BEGIN();rc=mv(out,e->weight[1],e->scale[1],hidden,5120,2304);
+    P_END(EXPERT_W2,pt);pt=P_BEGIN();
+    ds41f_round_bf16(out,5120);
+    P_END(EXPERT_ROUND,pt);return rc;
 }

@@ -270,6 +270,214 @@ complete nine-position numerical gate, GPU parity, batched prefill performance,
 or actual 1M-history execution. All continuation tests finished; job 51562789
 was left idle with its staged shards and working bridge available.
 
+## Single-request profiling at 1K history (job 51562789)
+
+The performance target is **20+ decode tokens/s at approximately 1K actual
+history**, clarified on 2026-09-12. This requires less than 50 ms/token.
+The six-token capital prompt with `--generate 1100 --ignore-eos` supplies the
+same 1,105 input positions as the earlier baseline. Report positions
+1000–1104 (105 samples); retain `--max-context 1048576` for the existing
+memory-admission check. This is not a 1M-history speed measurement.
+
+The bounded profiler records main-thread spans per position/layer/rank with
+`--profile-start 16 --profile-count 1089`; it writes binary arrays and JSON
+metadata after the timed run. The report uses producer-owner spans and the
+slowest parallel expert work. Collective remainders include rendezvous/skew,
+not just transport. No new barriers or in-loop profile writes are introduced.
+
+Initial measured critical path (`tmp/ds41f/job51562789/profile-v1/`):
+
+| Stage | ms/token at positions 1000–1104 |
+| --- | ---: |
+| Attention, including projections/index/RoPE | 145.796 |
+| Routed experts, slowest rank per layer | 34.458 |
+| Shared experts, including output sum/round | 29.312 |
+| mHC mixes/pre/post | 46.615 |
+| Engram local fetch/decode + owner projection | 17.102 |
+| Gate | 4.388 |
+| Head norm/matvec/selection | 3.094 |
+| Broadcasts + reduction rendezvous | 9.099 |
+| Measured token total | **289.802 (3.451 tok/s)** |
+
+The reconstruction differs from token timing by only -0.118 ms/token.
+Nested FP8 GEMVs consume **70.485 ms/token**, reading 6.843 GB/token at an
+effective 97.1 GB/s. The head matvec is only 1.885 ms/token. Scalar output
+rounding alone costs 20.640 ms inside dense linears, plus substantial rounding
+time inside RoPE, mHC and expert spans. Sparse attention costs 24.691 ms.
+Six routed experts activate an average 4.871 of 12 ranks per layer; the busiest
+rank owns 1.910 experts on average. Summing all ranks' collective wait would
+misidentify producer/straggler waits as network traffic.
+
+The profile run took 310.127 s versus 309.411 s for the uninstrumented baseline
+(0.23% longer overall). All 12 ranks finished, all 1,105 input/next-token
+triples and the first nine logit arrays were bitwise unchanged. Minimum final
+MemAvailable was 3,871,997,952 bytes. Binary SHA256:
+`62c3234211e87da23517e011f55492cc7d3c60b7a173a2b16e1716c4953fcf27`.
+
+The first optimization replaces scalar BF16 round/conversion loops with SVE
+integer rounding, preserving ties-to-even, NaN sign/payload handling and tails.
+It also reuses that routine for routed-expert gate/up/output rounding.
+`round-sve-v1/sve-test.log` passes 426,112 bit-exact cases, every BF16 upper
+16-bit pattern at six rounding boundaries, and lengths 0–256 with canaries.
+The full 12-node run takes 219.066 s; positions 1000–1104 average **206.638
+ms/token (4.839 tok/s)**. All 1,105 token triples and the first nine logit
+arrays remain bitwise identical. Minimum final MemAvailable is 3,860,201,472
+bytes. This removes 83.165 ms/token at 1K, a 28.7% latency reduction.
+
+Artifacts contain versioned source snapshots, binaries, SHA checks, launch
+scripts, per-rank logs, `comparison.json`, `profile-1k.json` and
+`report-1k.txt`. Reproduce the report on the frontend:
+
+```sh
+OPENBLAS_NUM_THREADS=2 tmp/ds41f/metadata-venv/bin/python \
+  a64fx/ds41f/profile_report.py tmp/ds41f/job51562789/profile-v1 \
+  --start 1000 --stop 1105 --json tmp/ds41f/job51562789/profile-v1/profile-1k.json
+```
+
+The parallel SwiGLU and mHC post updates (`pointwise-v1`) pass independent
+bit-exact checks at lengths 1, 511, 512, 513, 2304, 5120 and 5123, including
+in-place mHC and separate product rounding. Their full run takes 198.105 s;
+positions 1000–1104 average **187.531 ms/token (5.332 tok/s)**. All 1,105 token
+triples and nine logit arrays match the initial profile run exactly.
+
+Dense FP8-to-BF16 expansion was tested and **rejected**. Although small
+microbenchmarks improved, the complete runner regressed: `dense-bf16-v2`
+took 261.109 s and `dense-adaptive-v1` took 240.602 s, versus 198.105 s for
+the compressed pointwise runner. The expansion option and kernels were removed;
+versioned experiment sources and logs remain under the job directory.
+
+### Engram prefetch and receive-slot correctness
+
+Fine timing attributes 11.920 of 11.980 ms of the Engram fetch stage to
+`pread`, with only 0.051 ms for row conversion (`dense-bf16-v2`, same token
+sequence). `--engram-prefetch` uses one worker/rank and two 24-by-256 FP32
+buffers (49,152 bytes total) to fetch both layers' rows once their IDs are known.
+The main thread waits at layers 1 and 14. The worker does not use MPI/uTofu;
+MPI requests `MPI_THREAD_FUNNELED`, and profiler cursors are thread-local.
+
+The initial `prefetch-v1` trial is **invalid**: it diverged at position 57 and
+aborted with a nonfinite check after position 526. Prefetch exposed a latent
+receive-slot reuse race in the no-ack recursive-doubling transport. A bounded
+reproducer in `comm-skew-v1` delays rank 10 by 3 ms after the receive trailer
+arrives, before reading its payload. Without acknowledgments, iteration 0
+reads 866 instead of 66; with acknowledgments, all 300 reductions of 20,484
+floats pass on all 12 ranks. Exact evidence is in:
+
+- `comm-skew-v1/output.51562789/0/41/stderr.41.10`
+- `comm-skew-v1/output.51562789/0/42/stdout.42.0`
+
+The DS4.1 runner now enables the existing receive-acknowledgment path; the
+shared all-reduce header and its bounded retry policy are unchanged. The
+3 ms skew test validates this case, not arbitrary receiver delays.
+`test_prefetch` checks 96 generations
+against synchronous reads, zero fill for non-owned rows, short-read errors,
+joining with pending work, and profiler isolation. It passes on A64FX and
+the frontend. The corrected `prefetch-v2` run completes in 196.071 s, with
+**186.392 ms/token (5.365 tok/s)** at positions 1000–1104. All 1,105 triples
+and nine logits files are bitwise identical to `profile-v1`; minimum final
+MemAvailable is 3,882,418,176 bytes. The remaining critical-path Engram wait
+is 5.551 ms/token. This comparison includes the required acknowledgment cost.
+
+### Sparse-attention loop
+
+The weighted-value loop loads four adjacent SVE vectors from each selected
+KV row, consuming an A64FX cache line while preserving the original per-lane
+FMA order. The predicated fallback handles the remaining dimensions.
+`test_ops` passes 48 reference cases around vector/block boundaries, including
+empty, masked and duplicate selections with output canaries. The 64-head,
+512-dimensional, 640-selection component benchmark reports max absolute error
+1.49012e-6 versus the independent reference and 0.284 ms for the SVE kernel
+(`sparse-loop-v1/attention-bench.log`).
+
+The full `sparse-loop-v1` run completes in **184.819 s** with Engram prefetch
+enabled. Positions 1000–1104 average **172.438 ms/token (5.799 tok/s)**,
+with p50 172.695 ms and p95 175.904 ms. The sparse-attention span falls from
+25.852 to **11.107 ms/token** versus `prefetch-v2` (57.0% less), reducing
+total token latency by 7.5%. All 12 ranks finish, all 1,105 token triples and
+nine saved logit arrays match the initial profile run bitwise, and minimum
+final MemAvailable is 3,833,987,072 bytes. Runner SHA256:
+`96e4571732ea471beb4c9c3c76319556fa5191b4165e0f0802cfdc1ad3ae837e`.
+
+The final `sparse-no-prefetch-v1` control retains the same acknowledgment and
+sparse-loop changes but omits `--engram-prefetch`. It completes in 189.008 s;
+the 1K window averages **175.922 ms/token (5.684 tok/s)**, p95 181.767 ms.
+All 1,105 triples and nine logit arrays match the uninstrumented baseline
+bitwise; all 12 ranks finish with minimum final MemAvailable 3,863,412,736
+bytes. Prefetch reduces exposed Engram I/O from 11.951 to 5.985 ms/token and
+improves overall throughput by 2.0% in this sequential pair. These are single
+full-run comparisons, not repeated-trial confidence intervals. The final
+warning-clean source differs from the prefetch-on snapshot only by an
+explicit const-array pointer cast in the runner call, plus test cleanup.
+Final runner SHA256:
+`58af7ef72cd965f1c215ea08eed406d2a24fa076811f1559b7a64b0ba640ced4`.
+
+### Completed optimization checkpoint (2026-09-12)
+
+**Paused at the user's requested boundary: Engram prefetch and sparse-attention
+loop optimization are complete.** No further tuning runs are queued. Job
+51562789 is idle with the staged shards and bridge intact; its scheduled end
+is **17:57:45 JST on 2026-09-12**. Node-local staging will need rebuilding
+after the allocation ends. Follow `a64fx/remote-dev-procedure.md` to reconnect
+or allocate again; do not assume the old `/local` paths survive.
+
+| Valid run | 1K ms/token | 1K tok/s | Whole inference loop, seconds |
+| --- | ---: | ---: | ---: |
+| Initial fine profile | 289.802 | 3.451 | 310.127 |
+| SVE BF16 rounding | 206.638 | 4.839 | 219.066 |
+| Parallel pointwise operations | 187.531 | 5.332 | 198.105 |
+| Engram prefetch + receive acknowledgments | 186.392 | 5.365 | 196.071 |
+| Sparse loop + Engram prefetch | **172.438** | **5.799** | **184.819** |
+| Sparse loop, prefetch disabled (control) | 175.922 | 5.684 | 189.008 |
+
+The final optimized run improves throughput by **68.1%** and reduces latency
+by **40.5%** relative to the initial fine profile. The **20+ tok/s target is
+not reached**: 172.438 ms/token still needs to fall below 50 ms. Attention
+remains the largest stage at 84.035 ms/token, including 11.107 ms of sparse
+attention. Across dense projections, compressed FP8 GEMVs take 71.419 ms/token
+for 6.843 GB of weights, approximately 95.8 GB/s. Other large stages are
+shared experts (19.929 ms), routed experts on the slowest rank (19.751 ms),
+and the two mHC mixes (17.014 ms). Within the mixes, serial normalization
+costs 7.319 ms and F32 matvecs 8.323 ms. These nested timings overlap their
+parent stages; they must not be added together. They identify the remaining
+bottlenecks for a later session, without reopening tuning now.
+
+Exact build and validation commands, from the repository root on the frontend:
+
+```sh
+TMPDIR="$PWD/tmp/ds41f" make -C a64fx/ds41f \
+  ds41f_run ds41f_sve_test test_ops test_pointwise test_prefetch \
+  bench_attention_kernel A64FX_CC=fccpx A64FX_MPICC=mpifccpx
+TMPDIR="$PWD/tmp/ds41f" make -C a64fx/ds41f test \
+  CFLAGS='-O2 -Wall -Wextra -Wpedantic -std=c11 -fopenmp'
+```
+
+The cross-build uses `-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast`,
+OpenMP, and pthreads for the runner/prefetch test. Versioned compute launch
+scripts are `prefetch-sparse-v1.sh` and `sparse-no-prefetch-v1/run-v1.sh` under
+`tmp/ds41f/job51562789/`; source snapshots are in each results directory.
+The optimized
+run uses the following command from its fresh shared results directory:
+
+```sh
+env XOS_MMM_L_PAGING_POLICY=demand:demand:demand \
+  OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  mpiexec -np 12 ./ds41f_run \
+  --stage-root /local/u14346/ds41f-51562789 \
+  --prompt-ids /vol0006/mdt0/data/hp250467/work/gemm/ds4f/tmp/ds41f/job51562789/prompt-capital.ids \
+  --generate 1100 --ignore-eos --max-context 1048576 \
+  --logits-prefix logits --logits-count 9 \
+  --profile-start 16 --profile-count 1089 --engram-prefetch
+```
+
+Saved logits cover only positions 0–8, outside the profiling window.
+`comparison.json`, `profile-1k.json`, and `report-1k.txt` in each final run
+directory contain the correctness checks and timing summaries. Component
+logs record `BF16_ROUND PASS bit_exact=426112`, `POINTWISE PASS bit_exact`,
+`SPARSE_TAILS PASS reference_cases=48`, and `PREFETCH PASS ... generations=96`.
+These optimization regressions establish agreement with the existing runner;
+the earlier independent-reference and actual-1M-history limitations still
+apply.
+
 ## Checkpoint accounting and active staging (job 51562789)
 
 Header inventory supersedes the rough per-node fit estimate below:

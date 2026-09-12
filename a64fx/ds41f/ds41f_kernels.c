@@ -96,6 +96,24 @@ float ds41f_bf16_to_f32(uint16_t x)
     return v.f;
 }
 
+void ds41f_round_bf16(float *x,size_t n)
+{
+    #if defined(__ARM_FEATURE_SVE)
+    for(size_t i=0;i<n;i+=svcntw()){
+        svbool_t pg=svwhilelt_b32(i,n);
+        svuint32_t bits=svreinterpret_u32_f32(svld1(pg,x+i));
+        svuint32_t odd=svand_n_u32_x(pg,svlsr_n_u32_x(pg,bits,16),1);
+        svuint32_t rounded=svadd_u32_x(pg,bits,svadd_n_u32_x(pg,odd,0x7fff));
+        /* Match the scalar NaN payload/sign rule, including signaling NaNs. */
+        svbool_t nan=svcmpgt_n_u32(pg,svand_n_u32_x(pg,bits,0x7fffffffu),0x7f800000u);
+        rounded=svsel_u32(nan,svorr_n_u32_x(pg,bits,0x00400000u),rounded);
+        svst1(pg,x+i,svreinterpret_f32_u32(svand_n_u32_x(pg,rounded,0xffff0000u)));
+    }
+    #else
+    for(size_t i=0;i<n;++i)x[i]=ds41f_bf16_to_f32(ds41f_f32_to_bf16(x[i]));
+    #endif
+}
+
 void ds41f_fp8_matvec_ref(float *out, const uint8_t *w, const uint8_t *scale,
                           const float *x, size_t rows, size_t cols,
                           size_t block_cols)

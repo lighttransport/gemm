@@ -7,6 +7,13 @@ node, with MPI startup/bootstrap and uTofu runtime communication. Expert weights
 are resident by `expert_id % 12`, dense layers by `layer % 12`, and Engram rows
 remain on `/local`. Do not launch concurrent MPI programs in the allocation.
 
+The latest measured single-request decode is **5.799 tok/s at approximately
+1K history** (positions 1000–1104), up from 3.451 tok/s before profiling and
+optimization. Enable `--engram-prefetch` for this result. All 1,105 token steps
+and nine saved logit arrays match the baseline exactly. Work is paused after
+Engram prefetch and the sparse-attention loop update; the 20+ tok/s target
+remains open. See [the measurements and resume checkpoint](../doc/ds41f.md#completed-optimization-checkpoint-2026-09-12).
+
 The initial stage and dense ownership phase are complete for job 51562789.
 From a **new shared results directory** inside that allocation:
 
@@ -23,6 +30,43 @@ ID 0; EOS is ID 1. `--ignore-eos` is an explicit benchmark option. `--trace`
 records per-layer residual norms/routes. `--logits-prefix PATH` writes FP32
 logits, optionally bounded by `--logits-count N`. Disable these diagnostics for
 speed measurements. Rank-local logs are `inference.rank00.log` through `11`.
+
+For bounded operator profiling, add `--profile-start 16 --profile-count 1089`
+to the 1,100-output, six-token-prompt benchmark. Profiling is disabled by
+default; the start defaults to the first generated input and the count is
+limited to 4,096 positions. Each rank keeps main-thread wall-clock spans in
+memory and writes `profile.rank<R>.bin` plus JSON metadata after the timed
+inference loop. No profiling collectives or intermediate disk writes are added.
+The 1,089-position profile occupies about 22 MB per rank. Use a new results
+directory: existing profile files are rejected.
+
+Report actual history near 1K separately from warm-up and shorter histories:
+
+```sh
+OPENBLAS_NUM_THREADS=2 python3 a64fx/ds41f/profile_report.py RESULTS \
+  --start 1000 --stop 1105 --json RESULTS/profile-1k.json
+```
+
+The report uses dense-owner timings and the slowest parallel expert stage;
+it does not add collective wait times across ranks. Reduction remainders
+include rendezvous and rank skew, so they are not pure network time. Nested
+attention/index/kernel spans overlap their parents. The unattributed residual
+checks how closely this reconstruction matches measured token latency.
+
+`--engram-prefetch` starts one local I/O worker per rank. At token start it
+fetches both Engram layers' rows into two bounded 24-by-256 FP32 buffers;
+layers 1 and 14 wait for their own buffer only when needed. The worker uses
+no MPI or uTofu calls. MPI requests `MPI_THREAD_FUNNELED`, and runtime
+collectives enable receive acknowledgments to protect receive-slot reuse
+under the tested scheduling skew. The latter is necessary when the I/O worker
+preempts a receiver. Profiling state is
+thread-local; `ENGRAM_PREFETCH` reports overlapping background work and
+must not be added to the decode critical path.
+
+The sparse-attention weighted-value loop processes four SVE vectors at once,
+using a full A64FX cache line per selected row while preserving each output
+lane's accumulation order. Short dimensions retain the predicated tail path.
+Dense FP8 and routed MXFP4 weights retain their compressed representation.
 
 For operator debugging, `--dump-prefix PATH --dump-count N` records the first
 N positions (default 1, maximum 64) in owner-written

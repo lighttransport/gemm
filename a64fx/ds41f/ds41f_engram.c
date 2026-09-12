@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "ds41f_engram.h"
+#include "ds41f_profile.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -163,9 +164,11 @@ int ds41f_engram_read_local(ds41f_engram *e, int layer, uint64_t row,
     if (row < t->first || row >= t->first + t->owned_rows) return ERANGE;
     uint64_t local = row - t->first;
     uint8_t v[DS41F_ENGRAM_DIM], sc[DS41F_ENGRAM_DIM / 32];
+    double pt=P_BEGIN();
     ssize_t a = pread(t->weight_fd, v, sizeof v, (off_t)(local * sizeof v));
     ssize_t b = pread(t->scale_fd, sc, sizeof sc, (off_t)(local * sizeof sc));
     if (a != (ssize_t)sizeof v || b != (ssize_t)sizeof sc) return EIO;
+    P_END(ENGRAM_READ,pt);pt=P_BEGIN();
     for (int i = 0; i < DS41F_ENGRAM_DIM; ++i) {
         float x = fp8_e4m3(v[i]) * e8m0(sc[i / 32]);
         /* The benchmark consumes BF16 rows; conversion is intentionally local
@@ -174,6 +177,6 @@ int ds41f_engram_read_local(ds41f_engram *e, int layer, uint64_t row,
         out[i] = isnan(x) ? (uint16_t)((bits.u >> 16) | 0x40) :
             (uint16_t)((bits.u + 0x7fff + ((bits.u >> 16) & 1)) >> 16);
     }
-    ++t->lookups; ++t->local_rows;
+    P_END(ENGRAM_DECODE,pt);++t->lookups; ++t->local_rows;
     return 0;
 }

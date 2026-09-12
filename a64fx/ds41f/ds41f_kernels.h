@@ -13,6 +13,7 @@ int ds41f_act_quant(float *out,const float *x,size_t n);
 int ds41f_act_quant_ref(float *out,const float *x,size_t n);
 uint16_t ds41f_f32_to_bf16(float x);
 float ds41f_bf16_to_f32(uint16_t x);
+void ds41f_round_bf16(float *x,size_t n);
 /* Checkpoint MXFP4: adjacent low/high nibbles, E2M1 max=6,
  * per-row E8M0 scale for each 32 logical columns. */
 int ds41f_mxfp4_matvec_ref(float *out, const uint8_t *packed,

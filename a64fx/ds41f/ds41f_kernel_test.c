@@ -10,10 +10,41 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void fail(const char *s) { fprintf(stderr, "FAIL: %s\n", s); exit(1); }
 static void near(float a, float b, float tol, const char *s)
 { if (!isfinite(a) || !isfinite(b) || fabsf(a - b) > tol) { fprintf(stderr, "FAIL: %s %.8g %.8g\n", s, a, b); exit(1); } }
+
+static void test_bf16_round(void)
+{
+    const uint32_t low[]={0,1,0x7fff,0x8000,0x8001,0xffff};
+    float x[258];uint32_t expected[256];
+    size_t checked=0;
+    /* Every BF16 sign/exponent/mantissa, at both sides of the FP32 midpoint:
+     * includes zeros, subnormals, overflow, infinities and NaN payloads. */
+    for(size_t k=0;k<sizeof low/sizeof low[0];++k)for(uint32_t base=0;base<65536;base+=256){
+        x[0]=12345;x[257]=-12345;
+        for(uint32_t i=0;i<256;++i){uint32_t bits=((base+i)<<16)|low[k];
+            memcpy(x+1+i,&bits,4);expected[i]=(uint32_t)ds41f_f32_to_bf16(x[1+i])<<16;}
+        ds41f_round_bf16(x+1,256);
+        for(size_t i=0;i<256;++i){uint32_t bits;memcpy(&bits,x+1+i,4);
+            if(bits!=expected[i])fail("BF16 vector rounding vs scalar bits");}
+        if(x[0]!=12345||x[257]!=-12345)fail("BF16 rounding canary");
+        checked+=256;
+    }
+    uint32_t rng=1234567;
+    for(size_t n=0;n<=256;++n){x[0]=12345;x[n+1]=-12345;
+        for(size_t i=0;i<n;++i){rng=rng*1664525u+1013904223u;memcpy(x+1+i,&rng,4);
+            expected[i]=(uint32_t)ds41f_f32_to_bf16(x[1+i])<<16;}
+        ds41f_round_bf16(x+1,n);
+        for(size_t i=0;i<n;++i){uint32_t bits;memcpy(&bits,x+1+i,4);
+            if(bits!=expected[i])fail("BF16 rounding tail/random bits");}
+        if(x[0]!=12345||x[n+1]!=-12345)fail("BF16 rounding tail canary");
+        checked+=n;
+    }
+    printf("BF16_ROUND PASS bit_exact=%zu tails=0..256\n",checked);
+}
 
 static void test_dispatch(void)
 {
@@ -66,6 +97,7 @@ static void test_dispatch(void)
 
 int main(void)
 {
+    test_bf16_round();
     test_dispatch();
     for (int code=0;code<256;++code) {
         if ((code&127)==127) continue;

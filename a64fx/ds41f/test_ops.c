@@ -3,8 +3,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 static void near(float a,float b){if(!isfinite(a)||fabsf(a-b)>1e-5f){fprintf(stderr,"FAIL got=%g expected=%g\n",a,b);exit(1);}}
+static void attention_tails(void)
+{
+    const size_t dims[]={15,16,17,63,64,65,127,128,129,511,512,513};
+    const size_t counts[]={0,1,13,29};
+    float q[3*513],kv[23*513],out[3*513+1],ref[3*513],sink[3]={0,1,-2};
+    int ids[29];for(int i=0;i<29;++i)ids[i]=i%5?(i*7)%23:-1;
+    for(size_t shape=0;shape<sizeof dims/sizeof dims[0];++shape){size_t dim=dims[shape];
+        for(size_t i=0;i<3*dim;++i)q[i]=sinf((float)i*.031f);
+        for(size_t i=0;i<23*dim;++i)kv[i]=cosf((float)i*.017f);
+        for(size_t c=0;c<sizeof counts/sizeof counts[0];++c){out[3*dim]=12345;
+            if(ds41f_sparse_attention_ref(ref,q,kv,sink,ids,counts[c],23,3,dim)||
+               ds41f_sparse_attention(out,q,kv,sink,ids,counts[c],23,3,dim))exit(1);
+            for(size_t i=0;i<3*dim;++i)near(out[i],ref[i]);
+            near(out[3*dim],12345);
+        }
+    }
+    puts("SPARSE_TAILS PASS reference_cases=48 masked duplicate_ids empty canaries");
+}
 int main(void)
 {
+    attention_tails();
     float logits[4]={0,0,0,0},bias[4]={0,1,0,2},weights[2];int ids[2];
     if(ds41f_gate(logits,bias,4,2,1,1.5,ids,weights))return 1;
     if(ids[0]!=3||ids[1]!=1)return 1;

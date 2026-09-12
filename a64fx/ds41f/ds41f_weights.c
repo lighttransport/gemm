@@ -3,6 +3,7 @@
 #include "ds41f_tensor.h"
 #include "ds41f_sve.h"
 #include "ds41f_kernels.h"
+#include "ds41f_profile.h"
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
@@ -10,8 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-void ds41f_round_bf16(float *x,size_t n)
-{for(size_t i=0;i<n;++i)x[i]=ds41f_bf16_to_f32(ds41f_f32_to_bf16(x[i]));}
 void ds41f_weights_free(ds41f_weights *s)
 {
     if(!s)return;
@@ -61,30 +60,38 @@ int ds41f_linear(const ds41f_weights *s,const char *base,float *out,const float 
 {
     char name[192];snprintf(name,sizeof name,"%s.weight",base);
     const ds41f_weight *w=ds41f_weight_find(s,name);if(!w||!w->data)return ENOENT;
+    double pt=P_BEGIN();
     if(!strcmp(w->dtype,"F8_E4M3")){
         snprintf(name,sizeof name,"%s.scale",base);const ds41f_weight *scale=ds41f_weight_find(s,name);
         if(!scale||strcmp(scale->dtype,"F8_E8M0")||scale->rows!=(w->rows+31)/32||scale->cols!=(w->cols+31)/32)return EINVAL;
         float *input=NULL;int rc=0;
         if(!raw){input=malloc(w->cols*sizeof *input);if(!input)return ENOMEM;
             rc=ds41f_act_quant(input,x,w->cols);}
+        P_END(LINEAR_QUANT,pt);pt=P_BEGIN();
+        P_VALUE(FP8_BYTES,w->bytes+scale->bytes);
         if(!rc)rc=ds41f_fp8_matvec(out,w->data,scale->data,input?input:x,w->rows,w->cols);
+        P_END(LINEAR_FP8,pt);
         free(input);if(rc)return rc;
     }else if(!strcmp(w->dtype,"BF16")){
+        P_VALUE(BF16_BYTES,w->bytes);
         ds41f_bf16_f32_matvec(out,w->data,x,w->rows,w->cols);
+        P_END(LINEAR_BF16,pt);
     }else if(!strcmp(w->dtype,"F32")){
+        P_VALUE(F32_BYTES,w->bytes);
         #pragma omp parallel for schedule(static)
         for(size_t r=0;r<w->rows;++r){float sum=0;
             #pragma omp simd reduction(+:sum)
             for(size_t c=0;c<w->cols;++c){size_t i=r*w->cols+c;
                 float value=((float *)w->data)[i];
-                sum+=value*x[c];}out[r]=sum;}
+                sum+=value*x[c];}out[r]=sum;}P_END(LINEAR_F32,pt);
     }else return EINVAL;
-    if(!raw)ds41f_round_bf16(out,w->rows);
+    pt=P_BEGIN();if(!raw)ds41f_round_bf16(out,w->rows);P_END(LINEAR_ROUND,pt);
     return 0;
 }
 int ds41f_norm(const ds41f_weights *s,const char *name,float *out,const float *x)
 {
+    double pt=P_BEGIN();
     const ds41f_weight *w=ds41f_weight_find(s,name);
     if(!w||strcmp(w->dtype,"BF16")||w->rows!=1)return EINVAL;
-    ds41f_rmsnorm_fast(out,x,w->data,w->cols,1e-20f);ds41f_round_bf16(out,w->cols);return 0;
+    ds41f_rmsnorm_fast(out,x,w->data,w->cols,1e-20f);ds41f_round_bf16(out,w->cols);P_END(NORM,pt);return 0;
 }
