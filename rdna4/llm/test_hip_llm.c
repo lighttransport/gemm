@@ -1435,7 +1435,9 @@ int main(int argc, char **argv) {
          * paths (Qwen4 grouped staging, VRAM-tight profiles) differ on their
          * first invocation only; warming them makes the measured repeats
          * describe steady-state execution. */
-        if (bench_repeat > 1 && getenv("LLM_BENCH_WARMUP")) {
+        const char *warmup_env = getenv("LLM_BENCH_WARMUP");
+        if (bench_repeat > 1 && warmup_env && atoi(warmup_env) != 0) {
+            fprintf(stderr, "hip_llm: explicit benchmark warmup\n");
             int wn = max_tokens > 0 ? max_tokens : 1;
             if (wn + 1 > n_max_seq) wn = n_max_seq > 1 ? n_max_seq - 1 : 1;
             hip_llm_forward_batch_logits(gpu, tokens, wn, 0);

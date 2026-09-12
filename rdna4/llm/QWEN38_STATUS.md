@@ -1,10 +1,102 @@
 # Qwen3.8/Qwen4 RDNA4 status
 
-This file records only matched measurements that are currently reproducible on
-the RX 9070 XT. F16 remains the default quality-safe profile; I8 and FP8 are
-explicit experiments.
+Current validation appears first. Earlier investigations are retained below as
+history; short-run determinism claims there do not establish scalar F16 parity.
+Scalar F16 remains the default; staged prefill is diagnostic.
 
-## Verified
+## Bounded staging implementation (2026-09-12)
+
+The selected bounded-wave manager is implemented. Each of two banks owns its
+metadata, quantized weights, Q8_0 repack scratch, and upload/consumption events.
+Both host-source lifetime and device-slot reuse are fenced. Direct prefill now
+uses independent slot fences, including Q8_0 misses and cache-hit consumers.
+The prefill-to-decode map upload completes before its host buffer is freed.
+
+The default pool remains 512 MiB, including device metadata/repack storage.
+`LLM_MOE_COPY_PIPELINE=0` serializes waves; `=1` overlaps two banks. Promotion
+remains off by default. Runtime errors cannot fall through to a partial-result
+fallback. Reset, mode transitions, offload, and free drain outstanding prefill
+work before touching owned storage. See [the staging design and commands](QWEN38_MOE_STAGING.md).
+
+`LLM_BENCH_WARMUP=0` now actually disables the optional warmup (previously any
+present value enabled it). Reference first-token/hash inputs are paired and
+reject a repeatable candidate that differs from the scalar F16 oracle.
+
+Validated:
+
+- Build of the runner and model-free GPU staging test.
+- `make -C rdna4/llm moe-stage-test`: profile, delayed-copy lifecycle,
+  bank ownership, and benchmark-reference/parser tests all pass.
+- CPU ownership test under AddressSanitizer/UndefinedBehaviorSanitizer with
+  leak detection: pass. Removing either host-lifetime or slot-reuse fencing
+  makes delayed-consumer assertions fail.
+- `timeout --foreground 180s ./rdna4/llm/tmp/test_hip_qwen4_moe_stage`: pass
+  on RX 9070 XT. Six Q4_K/Q5_K + Q5_1/Q8_0/Q6_K type combinations, both host
+  registration modes, resident/cold/mixed workloads, partial waves, overlap,
+  promotion, resets, and injected upload failure/recovery match a serialized
+  expert oracle bitwise. This does not establish whole-model scalar parity.
+
+Full-model matrix: RX 9070 XT, 9,000-byte header prompt, 4096 prefill / 64
+decode, context 8192, BMAX4096, 4000 MiB cache, 512 MiB staging, eight measured
+requests per process, warmup disabled, CPU experts/approximation/promotion off.
+The common batched hash is `afdf60ceeb4f0103` (first token 16).
+
+| Registered | Overlap | Common hash / 8 | Prefill min / median tok/s | Decode min / median tok/s | Peak MiB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| No | No | 7 | 86.28 / 117.48 | 9.96 / 17.86 | 14294 |
+| No | Yes | 8 | 97.46 / 128.87 | 17.54 / 17.83 | 14296 |
+| Yes | No | 5 | 122.93 / 122.99 | 11.42 / 19.07 | 14294 |
+| Yes | Yes | 7 | 132.22 / 132.30 | 19.17 / 19.69 | 14296 |
+| Yes | Yes, fresh process | 6 | 132.09 / 132.19 | 11.39 / 19.66 | 14296 |
+| No | Yes, fresh process | 8 | 96.33 / 128.63 | 16.11 / 17.74 | 14296 |
+
+Four of six processes fail repeatability. Pageable overlap passes 8/8 in
+both processes, but this does not establish scalar parity or justify promotion. Full-model nondeterminism remains despite passing ownership tests;
+its cause is not established. Neither throughput target is met. Logs:
+`tmp/qwen38_stage_matrix_[1-6]_r*_p*.log`. A CPU test compilation overlapped
+part of the fourth process; the fresh fifth process had no compiler overlap.
+
+The DIM2048 GPU stress variant also passes the same serial-oracle matrix with
+multi-MiB weight transfers (`tmp/gpu_moe_stage_large.log`).
+
+Direct-cache smoke: `bench_qwen38_target.sh` with profile `batch4k`,
+512 prefill / 8 decode, two repeats, registered weights, BMAX4096/cache4000,
+context8192, the same header prompt, and warmup off passes with copy pipeline
+both 0 and 1. Both return first token 18 / hash `75c0ebdb415406cd` (2/2).
+Serial median prefill/decode is 58.31/11.70 tok/s, peak13778 MiB; overlap is
+54.14/12.21 tok/s, peak13780 MiB. These are bounded regression controls, not
+4K determinism or scalar-parity evidence. Logs: `tmp/qwen38_direct_p[01].log`.
+
+Matched F16 quality corpus (`./rdna4/llm/test_qwen38_staging_quality.sh`):
+**all five candidates fail scalar parity**. Each scalar and staged result is
+repeatable 2/2 within this corpus. The target is 4096/64; the other four are
+128/16. All use context8192, cache4000, BMAX4096, registered weights, CPU
+experts off, and no approximation. Scalar uses `scalar-exact`, batch0/copy0;
+staged uses `batch4k-stage`, batch1/copy1. Exact prompts and remaining profile
+settings are in the script; logs are `tmp/staging_quality/*_{scalar,staged}.log`.
+
+| Prompt | Scalar first / hash | Staged first / hash | Parity |
+| --- | --- | --- | --- |
+| target | 15 / `e3d8bf6d47dc6cc3` | 16 / `afdf60ceeb4f0103` | FAIL |
+| coding | 198 / `bbd62d9e3c85af8d` | 47932 / `12ced4d4ee57e7bb` | FAIL |
+| arithmetic | 198 / `427a8efc219e9443` | 15 / `ee81d9e0e8e89d42` | FAIL |
+| prose | 248068 / `c461a4dabdca797e` | 9619 / `458c70b584329680` | FAIL |
+| japanese | 198 / `b5ad0bef0c9a5696` | 44868 / `a099ba1b986b4c43` | FAIL |
+
+The fresh scalar target measured 10.83 prefill / 15.45 decode tok/s (median),
+peak 11328 MiB. Its hash differs from the historical `fast` profile with
+BMAX2048/7800 MiB cache; the cause of that cross-configuration difference is
+not established. These results test repeatability and reference agreement,
+not independent model-quality correctness. No throughput or quality target
+is claimed, and no serving default is promoted.
+
+
+Device access: the restricted namespace hides `/dev/kfd` and `/dev/dri`, but
+the authorized host execution namespace exposes the RX 9070 XT. Check `fuser`
+and VRAM before each standalone benchmark; never run concurrently with a server.
+
+## Earlier measurements (before bounded staging)
+
 
 - FP8 KV uses real scaled E4M3 encode/decode kernels, not an I8 alias.
 - Short exact-MTP parity: I8, FP8, and F16 all returned hash
@@ -174,7 +266,7 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
   `QWEN38_TARGET_CPU_EXPERTS=0`); `batch-cpu` keeps the mixed path for
   diagnostics.
 
-### Current reproducible state (RX 9070 XT, real 9,000-byte prompt)
+### Pre-manager observations (RX 9070 XT, real 9,000-byte prompt)
 
 - Single-chunk batched (`prefill <= BMAX`), CPU experts off: **improved but
   still not reliably deterministic**. One real race was fixed: the per-row
@@ -229,15 +321,13 @@ State-isolation findings that drove the profile:
   first repeat after load differed from later repeats that inherited cache
   residency. `hip_llm_reset_state` now clears the routed-expert cache under
   `LLM_QWEN4_RESET_MOE_CACHE=1`, so every repeat/request starts cold.
-- The asynchronous cold-upload pipeline lifts prefill from ~132 to ~147 tok/s
-  but originally left copy state across repeats (a 1-in-3 hash divergence).
-  The reset now drains `moe_copy_stream` and clears `moe_pipeline_valid`, so
-  the pipeline is request-isolated and is the `batch4k` default
-  (`LLM_MOE_COPY_PIPELINE=0` selects the lower-overhead direct copies).
+- The earlier asynchronous cold-upload pipeline lifted prefill from ~132 to
+  ~147 tok/s, but its initial request-isolation fix did not remove the rare
+  residual. Overlap remains opt-in; `batch4k` defaults to direct copies.
 
 Multi-chunk prefills (`prefill > BMAX`) still need the scalar fallback or a
-separate determinism fix; single-chunk 4K is the largest reproducible,
-repeatable batched production profile today.
+separate determinism fix; single-chunk 4K is a diagnostic profile, and these earlier short controls did
+not justify a production or scalar-parity claim.
 
 ### Why the 200-tok/s prefill target is not reached yet
 
@@ -266,8 +356,8 @@ plus per-expert compute.
 
 ### Grouped routed-expert investigation
 
-Several grouped strategies were measured against the deterministic 147-tok/s
-single-dispatch profile:
+Several grouped strategies were measured against the then-apparently-stable
+147-tok/s single-dispatch profile; later repeats disproved that determinism claim:
 
 - **Grouped-BF16-WMMA (`gemm_bf16_grouped`) is memory-infeasible here.** The
   all-expert staging buffer is sized `ne*N*K` bf16 (512 experts), ~15 GiB for
@@ -332,15 +422,10 @@ norm uses the deterministic tree reduction in `gated_rmsnorm_silu_batch_f32`.
 
 ## Remaining tasks
 
-- [~] Find and fix the remaining multi-chunk batched nondeterminism on gfx1201.
-      Single-chunk batched prefill (prefill <= BMAX) with CPU experts off is now
-      deterministic across 3 repeats (`de829a7459a1b96b`, BMAX=1024). The
-      remaining failure is the stateful multi-chunk path (prefill > BMAX,
-      `LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE=1`): 2,048 prefill at BMAX=1024 still
-      diverges. Bisect the inter-chunk state carry (KV slot publication, SSM
-      conv/recurrent handoff, `d_hc_batch` row handoff, expert-cache promotion)
-      with `--bench-repeat` plus `LLM_DEBUG_LAYERS=1` bitwise hashes. Repeated
-      identical requests must match before the WMMA path can be promoted.
+- [~] Validate the bounded-wave manager across host-registration/overlap
+      combinations, then compare every candidate to scalar F16 greedy hashes.
+      Repeated agreement within a batched profile is insufficient for promotion.
+      Multi-chunk KV/SSM/HC state carry remains separate unresolved work.
 - [ ] Make the CPU cold-expert kernels bit-identical to the GPU kernels (or
       keep CPU experts opt-in only). CPU and GPU expert arithmetic currently
       differ, so expert-cache warmth changes a request's output when the CPU

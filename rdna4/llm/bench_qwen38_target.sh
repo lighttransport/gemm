@@ -13,22 +13,21 @@ set -euo pipefail
 #
 # This is the Phase 0 gate: no profile may be promoted to a serving default
 # until it passes here.  It is a throughput/stability smoke, not a quality
-# claim (use the coding coherence harness for output quality).
+# claim. Set QWEN38_TARGET_EXPECTED_FIRST_TOKEN and QWEN38_TARGET_EXPECTED_HASH
+# together to enforce a fresh scalar F16 reference for the identical model,
+# prompt/token count, context, and decode length. Coherence is a separate check.
 #
 # Profiles (QWEN38_TARGET_PROFILE):
 #   scalar-exact  quality-safe scalar route, exact decode (default)
 #   fast          pinned host + BMAX=2048 + 7.8-GiB cache + GPU prefill top-k
 #   batch         explicit batched prefill (LLM_QWEN4_BATCH=1), exact decode,
-#                 GPU-only cold experts (deterministic across cache states)
+#                 GPU-only cold experts; repeatability must be measured
 #   batch-cpu     same but with the mixed CPU/GPU cold-expert path (diagnostic:
 #                 its arithmetic differs from the GPU path, so in-process
 #                 repeats can hash-differ even though fresh processes match)
-#   batch4k       deterministic single-dispatch 4K profile (BMAX=4096, no
-#                 multi-chunk carry, pinned host, 5-GiB cache, GPU top-k,
-#                 async cold uploads, expert cache reset per repeat)
-#   batch4k-stage same, but groups cold experts through the staging banks with a
-#                 4-GiB cache; deterministic and ~180 prefill tok/s (the
-#                 grouped-routed profile)
+#   batch4k       diagnostic single-dispatch 4K, pageable + serialized copies
+#   batch4k-stage bounded cold-expert staging, 4,000-MiB cache, 512-MiB pool;
+#                 diagnostic until repeatability AND scalar F16 parity pass
 #   approx        resident-hit approximate decode (quality-changing; explicit)
 #
 # Examples:
@@ -55,8 +54,16 @@ prompt_file="${QWEN38_TARGET_PROMPT_FILE:-}"
 # CPU cold-expert execution changes arithmetic relative to the GPU resident
 # path, and expert-cache warmth selects which path an expert takes.  That makes
 # in-process repeats hash-different even though fresh-process runs match.  The
-# gate therefore defaults CPU expert work off (GPU-only, deterministic); set
+# gate therefore defaults CPU expert work off (GPU-only); set
 # QWEN38_TARGET_CPU_EXPERTS=1 to measure the mixed CPU/GPU path.
+expected_first="${QWEN38_TARGET_EXPECTED_FIRST_TOKEN:-}"
+expected_hash="${QWEN38_TARGET_EXPECTED_HASH:-}"
+if [[ -n "${QWEN38_TARGET_EXPECTED_FIRST_TOKEN+x}${QWEN38_TARGET_EXPECTED_HASH+x}" ]]; then
+    if ! [[ "${expected_first}" =~ ^[0-9]+$ && "${expected_hash}" =~ ^[0-9a-f]{16}$ ]]; then
+        echo "target gate: supply both QWEN38_TARGET_EXPECTED_FIRST_TOKEN (nonnegative integer) and QWEN38_TARGET_EXPECTED_HASH (16 lowercase hex digits)" >&2
+        exit 2
+    fi
+fi
 cpu_experts="${QWEN38_TARGET_CPU_EXPERTS:-0}"
 if [[ "${cpu_experts}" == "0" ]]; then
     cpu_prefill_jobs=0
@@ -150,7 +157,7 @@ case "${profile}" in
         fi
         ;;
     batch4k|batch4k-stage)
-        # Deterministic single-dispatch 4K profile: one 4096-row batched prefill
+        # Diagnostic single-dispatch 4K profile: one 4096-row batched prefill
         # (no multi-chunk state carry), pageable host weights, direct cold
         # uploads, GPU router top-k, and a resident cache on the 16-GiB card.
         # The `-stage` variant groups cold experts through the staging banks
@@ -162,10 +169,8 @@ case "${profile}" in
             cache_mb="${QWEN38_MOE_CACHE_MB:-5000}"
         fi
         bmax="${LLM_BMAX:-4096}"
-        # Registered (pinned) host weights and the async copy pipeline are each
-        # ~10-20 tok/s faster but still race their consumer on this ROCm stack
-        # (rare 1-in-8 repeat divergence), so the repeatable default uses
-        # pageable host weights and direct copies.
+        # Conservative diagnostic defaults. The new bank/slot ownership code
+        # still needs GPU repeatability and scalar-reference parity validation.
         register_host="${LLM_MOE_REGISTER_HOST:-0}"
         gpu_topk="${LLM_QWEN4_PREFILL_GPU_TOPK:-1}"
         qwen_batch="${LLM_QWEN4_BATCH:-1}"
@@ -175,8 +180,7 @@ case "${profile}" in
         device_hits_only="${LLM_QWEN4_DEVICE_HITS_ONLY:-0}"
         refresh="${LLM_QWEN4_DEVICE_REFRESH_INTERVAL:-2}"
         stream_chunk="${LLM_BENCH_STREAM_CHUNK:-0}"
-        # Direct copies are the repeatable choice; the async pipeline is faster
-        # but has a residual event-ordering race.
+        # Overlap remains an explicit override until runtime validation passes.
         copy_pipeline="${LLM_MOE_COPY_PIPELINE:-0}"
         native_batch_qkv="${LLM_QWEN4_NATIVE_BATCH_QKV:-1}"
         ssm_batch_q6k="${LLM_SSM_BATCH_Q6K:-1}"
@@ -336,58 +340,5 @@ if grep -Eq 'Failed to (load weights to GPU|init HIP runner)|ROCm device unavail
     exit 1
 fi
 
-result_lines="$(grep -c 'Result: PASS' "${log_file}" || true)"
-mapfile -t first_tokens < <(grep -oE 'First decoded token id=-?[0-9]+' "${log_file}" | sed 's/.*=//')
-mapfile -t hashes < <(grep -oE 'sequence hash=[0-9a-f]+' "${log_file}" | sed 's/sequence hash=//')
-
-if (( ${#hashes[@]} != repeats )); then
-    echo "target gate FAIL: expected ${repeats} sequence-hash footers, saw ${#hashes[@]} (timed out or crashed mid-repeat?)" >&2
-    grep -E 'Prefill:|Decode:|End-to-end:|Result:' "${log_file}" | tail -20 >&2 || true
-    exit 1
-fi
-if (( ${#first_tokens[@]} != repeats )); then
-    echo "target gate FAIL: expected ${repeats} first-token footers, saw ${#first_tokens[@]}" >&2
-    exit 1
-fi
-if (( result_lines != repeats )); then
-    echo "target gate FAIL: ${result_lines}/${repeats} repeats returned 'Result: PASS'" >&2
-    exit 1
-fi
-
-unique_hashes="$(printf '%s\n' "${hashes[@]}" | sort -u | wc -l)"
-unique_firsts="$(printf '%s\n' "${first_tokens[@]}" | sort -u | wc -l)"
-if (( unique_hashes != 1 )); then
-    echo "target gate FAIL: nondeterministic sequence hash across ${repeats} repeats: ${hashes[*]}" >&2
-    exit 1
-fi
-if (( unique_firsts != 1 )); then
-    echo "target gate FAIL: nondeterministic first token across ${repeats} repeats: ${first_tokens[*]}" >&2
-    exit 1
-fi
-
-# Throughput: summarize min + median over repeats (clock-variance safe) rather
-# than reporting a single best sample.  tok/s is the value after "->".
-tok_s_values() {
-    grep -E "^$1:" "${log_file}" | sed -E 's/.*->[[:space:]]*([0-9.]+)[[:space:]]*tok\/s.*/\1/'
-}
-min_median() {
-    awk '
-        function med(a, n,   b,i,j,t){ for(i=0;i<n;i++)b[i]=a[i]; for(i=0;i<n-1;i++)for(j=i+1;j<n;j++)if(b[j]<b[i]){t=b[i];b[i]=b[j];b[j]=t} return (n%2)?b[int(n/2)]:(b[n/2-1]+b[n/2])/2 }
-        { v[n++]=$1; if(n==1||$1<mn)mn=$1 }
-        END { if(n) printf "%.2f %.2f", mn, med(v,n); else printf "0 0" }'
-}
-vram_line="$(grep -E '^VRAM:' "${log_file}" | tail -1 || true)"
-
-pf_stats="$(tok_s_values Prefill | min_median)"
-dec_stats="$(tok_s_values Decode | min_median)"
-e2e_stats="$(tok_s_values End-to-end | min_median)"
-read -r pf_min pf_med <<<"${pf_stats}"
-read -r dec_min dec_med <<<"${dec_stats}"
-read -r e2e_min e2e_med <<<"${e2e_stats}"
-
-echo "target gate PASS: profile=${profile} repeats=${repeats} hash=${hashes[0]} first_token=${first_tokens[0]}"
-echo "  prefill tok/s: min=${pf_min} median=${pf_med}"
-echo "  decode  tok/s: min=${dec_min} median=${dec_med}"
-echo "  e2e     tok/s: min=${e2e_min} median=${e2e_med}"
-[[ -n "${vram_line}" ]] && echo "  ${vram_line}"
-echo "  log=${log_file}"
+source "${root_dir}/qwen38_target_result.sh"
+qwen38_target_result "${log_file}" "${repeats}" "${profile}" "${expected_first}" "${expected_hash}"

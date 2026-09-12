@@ -122,11 +122,11 @@ test -x "${root_dir}/bench_qwen38_target.sh" || {
     echo 'profile test: target repeatability gate script missing or not executable' >&2
     exit 1
 }
-grep -q 'sequence hash=' "${root_dir}/bench_qwen38_target.sh" || {
+grep -q 'sequence hash=' "${root_dir}/qwen38_target_result.sh" || {
     echo 'profile test: target gate must compare sequence hashes' >&2
     exit 1
 }
-grep -q 'nondeterministic sequence hash' "${root_dir}/bench_qwen38_target.sh" || {
+grep -q 'nondeterministic sequence hash' "${root_dir}/qwen38_target_result.sh" || {
     echo 'profile test: target gate must fail on hash divergence' >&2
     exit 1
 }
@@ -138,7 +138,7 @@ expect_contains "${out}" 'cpu_decode_misses=0'
 out="$(QWEN38_DRY_RUN=1 QWEN38_TARGET_PROFILE=batch-cpu "${root_dir}/bench_qwen38_target.sh")"
 expect_contains "${out}" 'cpu_prefill_jobs=160'
 expect_contains "${out}" 'cpu_decode_misses=1'
-# Deterministic single-dispatch 4K profile.
+# Diagnostic single-dispatch 4K profile.
 out="$(QWEN38_DRY_RUN=1 QWEN38_TARGET_PROFILE=batch4k "${root_dir}/bench_qwen38_target.sh")"
 expect_contains "${out}" 'bmax=4096'
 expect_contains "${out}" 'stream_chunk=0'
@@ -146,8 +146,7 @@ expect_contains "${out}" 'batch=1'
 expect_contains "${out}" 'multi=0'
 expect_contains "${out}" 'force_multi=0'
 expect_contains "${out}" 'cpu_prefill_jobs=0'
-# Repeatable default: pageable host weights + direct copies.  The faster pinned
-# host and async pipeline are explicit overrides with residual races.
+# Conservative defaults: pageable weights and serialized copies; overlap is opt-in.
 expect_contains "${out}" 'copy=0'
 expect_contains "${out}" 'reg=0'
 out="$(QWEN38_DRY_RUN=1 LLM_MOE_REGISTER_HOST=1 \
@@ -170,22 +169,12 @@ grep -q 'LLM_QWEN4_STAGE_PROMOTE' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: staged promotion switch missing' >&2
     exit 1
 }
-# Staging metadata must be published on the compute stream (ordered with the
-# grouped launch), not via blocking hipMemcpy on the null stream.
-grep -q 'hipMemcpyAsync(r->d_qwen4_stage_map' "${root_dir}/hip_llm_runner.c" || {
-    echo 'profile test: staged map publication not stream-ordered' >&2
-    exit 1
-}
 grep -q 'LLM_BENCH_WARMUP' "${root_dir}/test_hip_llm.c" || {
     echo 'profile test: bench warmup hook missing' >&2
     exit 1
 }
 grep -q 'LLM_QWEN4_NATIVE_EXPERTS' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: native-vs-WMMA expert A/B switch missing' >&2
-    exit 1
-}
-grep -q 'hipStreamWaitEvent(r->stream, r->moe_copy_ready\[ev\], 0)' "${root_dir}/hip_llm_runner.c" || {
-    echo 'profile test: direct expert copy not ordered via copy-stream event' >&2
     exit 1
 }
 # Ordered MoE combine and synchronous CPU-result publication.
@@ -225,18 +214,8 @@ grep -q 'lane==0 && key<tn)red\[key\]=sc' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: GQA8 I8 key reduction indexing regressed' >&2
     exit 1
 }
-grep -q 'hipMemcpy(d_task_e, task_e' "${root_dir}/hip_llm_runner.c" || {
-    echo 'profile test: grouped resident task metadata must not reuse async pageable scratch' >&2
-    exit 1
-}
-grep -q 'hipMemcpyAsync(task_e, r->h_moe_tok_idx' "${root_dir}/hip_llm_runner.c" || {
-    echo 'profile test: staged task metadata must be stream-ordered' >&2
-    exit 1
-}
-grep -q 'Drain the stream first' "${root_dir}/hip_llm_runner.c" || {
-    echo 'profile test: staged wave loop must drain before reusing host scratch' >&2
-    exit 1
-}
+# Bank metadata and slot lifetimes are checked behaviorally by
+# test_qwen4_moe_stage.c and test_copy_lifecycle.py.
 # Per-row position publication must be stream-ordered (async from the stable
 # host array); a blocking hipMemcpy on the null stream raced r->stream kernels
 # and was the residual batched nondeterminism.
@@ -248,10 +227,6 @@ grep -q 'h_pos_batch\[m\] = position_start + m' "${root_dir}/hip_llm_runner.c" |
     echo 'profile test: per-row position host array not precomputed' >&2
     exit 1
 }
-if grep -q 'hipMemcpyAsync(d_task_e, task_e' "${root_dir}/hip_llm_runner.c"; then
-    echo 'profile test: deferred grouped task metadata still uses async pageable scratch' >&2
-    exit 1
-fi
 grep -q 'head_dim > 256' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: I8 KV geometry guard missing' >&2
     exit 1
