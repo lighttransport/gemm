@@ -197,7 +197,10 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
   stream wait with a `hipEventRecord`/`hipStreamWaitEvent` pair. With that,
   4,096/64 passes 7/8 repeats (hash `afdf60ceeb4f0103`) at ~125 prefill /
   19.7 decode, versus frequent failures before, but one repeat still diverged
-  (`989013653e29726e`), so a rarer residual remains. A 4-repeat
+  (`989013653e29726e`), so a rarer residual remains. Disabling the
+  `d_moe_eout`/gather alias (`LLM_QWEN4_MOE_EOUT_ALIAS=0`) and switching to host
+  router top-k (`LLM_QWEN4_PREFILL_GPU_TOPK=0`) each still diverged, so neither
+  the alias nor the GPU router is the sole cause. A 4-repeat
   `LLM_DEBUG_LAYERS=1` trace at 1024 did not reproduce it (the per-stage sync
   perturbs timing). The scalar route remains the only quality-safe default.
 - Multi-chunk stateful batching (prefill > BMAX, `LLM_QWEN4_BATCH_MULTI_CHUNK_

@@ -14571,12 +14571,15 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 if (!r->is_qwen4exp)
                     CHECK_HIP(hipMalloc(&r->d_moe_eu, TA * eff * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_moe_esilu_bf16,      TA * eff * 2));
-                if (r->is_qwen4exp) {
+                const char *eout_alias_env = getenv("LLM_QWEN4_MOE_EOUT_ALIAS");
+                int eout_alias = !eout_alias_env || atoi(eout_alias_env) != 0;
+                if (r->is_qwen4exp && eout_alias) {
                     /* Once gate/up have consumed each assignment's gathered
                      * input, its slot can hold the corresponding down output.
                      * Qwen4's expert kernels are ordered on one stream, and
                      * the shared expert also runs after scatter, so this
-                     * saves one TA*n_embd allocation without changing data. */
+                     * saves one TA*n_embd allocation without changing data.
+                     * LLM_QWEN4_MOE_EOUT_ALIAS=0 disables it for diagnosis. */
                     r->d_moe_eout = r->d_moe_gather_in;
                     r->d_moe_eout_alias_gather = 1;
                     r->d_moe_eu = r->d_moe_eout;
@@ -14584,6 +14587,10 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 } else {
                     CHECK_HIP(hipMalloc(&r->d_moe_eout,
                                         TA * r->n_embd * sizeof(float)));
+                    if (r->is_qwen4exp) {
+                        r->d_moe_eu = r->d_moe_eout;
+                        r->d_moe_eu_alias_eout = 1;
+                    }
                 }
                 CHECK_HIP(hipMalloc(&r->d_moe_out_batch,       (size_t)bm * r->n_embd * sizeof(float)));
                 CHECK_HIP(hipMalloc(&r->d_xnorm_batch_bf16_moe,(size_t)bm * r->n_embd * 2));
