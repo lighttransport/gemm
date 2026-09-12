@@ -1,7 +1,172 @@
 # DeepSeek-V4.1-Flash A64FX memory design
 
-Latest continuation: [INT8 optimization on job 51569201](#resumed-int8-optimization-job-51569201).
+Latest continuation: [20/30/40 tokens/s implementation plan](#203040-tokenss-implementation-plan).
 The earlier pause was superseded by the request to pursue INT8 SDOT decode.
+
+## 20/30/40 tokens/s implementation plan
+
+Agreed 2026-09-12, recorded before implementation. Keep 12 A64FX nodes and
+single-request decode around 1K history, all 40 layers, 64 attention heads,
+top-6 routed experts, top-512 selected rows and the 128-token window. Maintain
+two separately reported tracks: numerically validated and speed-first
+approximate. Exact-output speculation is a third, separately measured path.
+Current unprofiled INT8 runs reach 10.36–10.39 tokens/s but fail the numerical
+gate; the FP8 regression control reaches 6.92 tokens/s. Neither is official
+GPU parity. Preserve the original math path as the comparison control.
+
+### Milestone budgets
+
+These mutually exclusive milliseconds/token are engineering targets, not
+predictions or measured results. Apply the budgets independently to each
+quality track; never promote a failing approximate run as validated.
+
+| Component | 20+ target | 30+ target | Ordinary 40+ stretch |
+| --- | ---: | ---: | ---: |
+| Attention projections and preparation | 14 | 8 | 6 |
+| Sparse attention and index | 9 | 5.5 | 4 |
+| Routed and shared experts | 12 | 8 | 6 |
+| mHC mixing | 4 | 2.5 | 2 |
+| Synchronization | 4 | 3 | 2 |
+| Other | 6 | 5 | 4 |
+| **Total ms/token** | **49** | **32** | **24** |
+| **Implied tokens/s** | **20.4** | **31.3** | **41.7** |
+
+The 800 GB/s / 16 GB single-node weight-only estimate is 50 tokens/s. The
+profile counts 13.88 GB of weight operands globally and about 9.81 GB on the
+current serial dense-owner/EP critical path. Neither is a hardware-counter
+HBM measurement. Other nodes wait during owner-only attention; multiplying
+bandwidth by twelve is inappropriate. Eliminating the entire 21.58 ms INT8
+kernel aggregate alone cannot take the present roughly 98 ms step to 20+.
+
+### Stage 1: profile, attention kernels, projection reuse, mHC and transport
+
+1. Split sparse attention into QK, softmax and PV, and separate packing,
+   activation quantization, OpenMP launches and collective arrival skew.
+   Reconstruct the critical path without summing nested spans or rank waits.
+2. Add FP32 QK tiles of four heads by two keys while preserving the existing
+   two-accumulator dot order. Benchmark PV tiles of 2/4/6 heads by 64 channels
+   and retain the fastest complete operator passing its quality track.
+   Decode selected rows once into bounded scratch; do not expand full history.
+3. Adapt ideas from
+   `~/work/clair/a64fx/a64fx/llm-guided-opt/attention_decode_a64fx.c`:
+   reuse K across heads and V across head/channel tiles. Its 12-head, D=256
+   geometry and single-valid-key shortcut are not DS41F semantics: preserve
+   the DS41F sink in the maximum and denominator even with a single key.
+4. Test SDOT QK using exact E2M1*2 integer values with original compressed-KV
+   group-16 scales, and quantized queries/raw keys. Rescale each dot block to
+   FP32 before combining scores; block-dependent scales preclude one global
+   integer coefficient. Initially retain FP32 PV.
+5. Compare libm, corrected FEXPA, integer polynomial-2 and integer affine
+   softmax independently. Reference
+   `~/work/clair/a64fx/a64fx/llm-guided-opt/int_exp2_sdot_a64fx.s`
+   and `integer-exp2-sdot.md`. Their quoted timing is QLAIR simulation, not
+   native evidence; affine/poly2 error bounds are about 2.98%/0.375%.
+   Apply stable maximum subtraction including the sink, multiply by log2(e),
+   extend the original [-16,0] exponent domain to [-31,0], underflow to zero,
+   zero masked entries and use 64-bit Q31 denominator sums. A -16 clamp would
+   add a substantial floor over 640 rows. Check overflow, tails, ABI register
+   preservation, all-masked/sink-only cases and real model inputs.
+6. Reuse activation quantization across compatible projections, shared W1/W3
+   and routed experts without moving FP8/BF16 rounding boundaries. Keep fresh
+   anonymous INT8 pages. Measure cold complete operators including conversion
+   and packing. Fuse MXFP4 W1/W3 with original group-32 scales; the CLAIR
+   `fp4_i8_sdot_a64fx.s`/`sdot_quant.h` integer-grid format, nibble order and
+   ties-away rounding differ from this checkpoint and need adaptation.
+7. Retain the ordered mHC control; gate register-split FP32/FP64 matrix sums
+   and Sinkhorn variants on full-model fixed-history logits. Local norm tests
+   alone did not detect the earlier split-K model regression.
+8. Replace world residual broadcast with owner-to-next-owner handoff (last
+   layer to head rank 11). Pack already-BF16 residual/FFN vectors losslessly;
+   retain FP32 mixing coefficients and route weights, and signed-zero
+   normalization. Publish source-cache bytes directly instead of float codes.
+   Keep robust uTofu ACK reductions initially and all MPI on the main thread
+   under MPI_THREAD_FUNNELED. Do not disable acknowledgements to hide waits.
+9. If this does not meet the 49 ms budget, proceed to TP2 then TP4 without
+   changing the fixed backbone or loosening the validated-track gate.
+
+### Stage 2: dense tensor parallelism for 30+, ordinary 40+ stretch
+
+Add TP=1/2/4, with layer owner `layer % 12` and contiguous group base
+`(owner / TP) * TP`. Fixed rank offsets select 32/16 heads and 4/2 whole
+WO-A groups for TP2/TP4. The original dense and shared payload is balanced
+so these layouts retain the same per-rank total original weight bytes as
+TP1; verify actual converted buffers and peak loading memory separately.
+
+- Initially keep owner QA, KV compression and index. Publish group inputs;
+  shard QB, RoPE, sparse attention and whole WO-A groups. Allgather the
+  already-BF16 8192-element projected vector, row-shard WO-B with its full
+  K dot order, then gather outputs to the owner for mHC and expert routing.
+  Keep replicated packed source caches in the first TP implementation.
+- Distribute index work by whole eight-row candidate blocks, then merge with
+  original score/ID tie rules, selected-ID ordering and forced newest block.
+- Row-shard shared W1/W3, gather its 2304-element hidden vector, and row-shard
+  W2. Distribute the vocabulary head's 4040 blocks of 32 rows over all 12
+  ranks; reduce max with smallest-global-ID ties. Gather full logits only
+  for diagnostics. Avoid duplicating the shared backbone embedding/head.
+- Introduce explicit persistent OpenMP team kernels with main-thread MPI;
+  preserve the existing control and measure launch savings. For the 24 ms
+  stretch, test column-sharded WO-B/shared W2 and combined communication only
+  behind independent numerical gates because their reductions change order.
+- Expose explicit runner arguments for kernels/math/TP and an INT8 tensor
+  allowlist. Version stage metadata with global shapes, local ranges, group
+  mapping and source hashes; retain TP1 compatibility. Stage new dense
+  layouts separately while reusing expert and Engram shards.
+- Convert after reading `/local` when preprocessing is negligible, as with
+  the current 0.27–0.50 s INT8 conversion versus 53–57 s loading. If new
+  preparation is material, write versioned INT8 artifacts beside the shared
+  original weights, then stage them. Account for every workspace, cache and
+  MTP buffer with a 2 GiB minimum MemAvailable; no full-model duplicates.
+
+### Stage 3: exact-output speculative decode for 40+
+
+The checkpoint contains three DSpark/MTP stages, fixed draft block size five,
+noise ID 128799, main hidden taps at layers 37/38/39 and Markov rank 256.
+MTP tensors total 7,932,874,632 bytes; draft MoE uses 128 experts/top-3 while
+the backbone remains 384/top-6. Implement checkpoint behavior from local
+`inference/model.py`, including tap positions/dtypes, main projection,
+stage-specific attention masks, mHC, Markov bias and confidence output.
+
+Shard draft experts with EP and dense weights with TP, reuse backbone
+embedding/head, and admit all state before loading. Always calculate the
+checkpoint's full five-position draft block; benchmark verified prefixes of
+2/4/5. Add verifier microbatches of 1–6 with weight reuse and original per-token
+dot, reduction and BF16 boundaries. Existing batched GEMM changes reduction
+order and is not automatically an exact verifier; use bounded packed tiles.
+
+Given known seed x0, draft x1..xd and verify inputs x0..xd. Accept the matching
+greedy prefix of length a, emit a accepted tokens plus the verifier bonus,
+and commit a+1 input states; the bonus is the next uncached seed. Confidence
+never bypasses verification. Preserve per-token causal index/cache views.
+Journal or shadow overwritten window slots, compressed append counts,
+candidate and pool state, Engram history and prefetch generations; roll back
+the rejected suffix. MTP main-KV receives every committed main hidden position;
+draft noise-KV stays temporary. Handle wrap, EOS and output limits explicitly.
+
+Measure actual emitted tokens divided by draft+verify+commit time, separately
+from ordinary decode. Three emitted tokens need a cycle below 75 ms for 40+.
+Select the fastest measured prefix, preferring fewer drafts on a tie. Default
+speculation off until emitted tokens and committed state match the selected
+validated sequential verifier, including forced rejection at every position.
+
+### Validation and execution order
+
+- Kernel tests use references and real inputs, masks/sinks/tails/canaries,
+  conversion costs and overflow bounds. Test TP1/2/4 across every owner,
+  delayed-rank collectives, BF16 transport, ties, window/compression and top-k
+  boundaries. Finish the corrected independent nine-position reference.
+- Compare identical input histories at early positions and positions
+  1000..1008, plus chat/code prompts. Report cosine, relative RMS, argmax and
+  every approximate-track failure; token agreement alone is insufficient.
+- Run three uninstrumented 1100-output repeats for each retained milestone,
+  measuring positions 1000..1104. Every repeat must exceed the claimed target.
+  Report p95, minimum memory, prompt dependence, binary/staging hashes and a
+  separate profile. Allocating 1M cache is not running at 1M history.
+- Execute and commit coherent stages in this order: this document; detailed
+  profile/kernels/transport; TP2; TP4/shared/head; ordinary 40+ experiments;
+  exact speculative 40+. Update this document with results and remaining work.
+  Use one MPI program per allocation, detached immutable binary/script
+  snapshots, remote SHA verification, `/local` or repository `tmp/`, and check
+  allocation lifetime before each long experiment. Do not edit active scripts.
 
 ## Implementation status, 2026-09-12 (job 51562789)
 
