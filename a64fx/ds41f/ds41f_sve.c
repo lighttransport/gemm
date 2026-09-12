@@ -1,3 +1,4 @@
+#include "ds41f_team.h"
 #include "ds41f_sve.h"
 #include "ds41f_kernels.h"
 #include <errno.h>
@@ -92,8 +93,50 @@ void ds41f_rmsnorm_fast(float *out, const float *x, const uint16_t *weight,
 
 #endif
 
+typedef struct {
+    float * out;
+    const uint16_t * w;
+    const float * x;
+    size_t rows;
+    size_t cols;
+} bf16_f32_matvec_team_job;
+static void bf16_f32_matvec_team_work(void *context,size_t first,size_t last)
+{
+    bf16_f32_matvec_team_job *job=context;
+    float * out=job->out;
+    const uint16_t * w=job->w;
+    const float * x=job->x;
+    size_t rows=job->rows;
+    size_t cols=job->cols;
+    (void)out;
+    (void)w;
+    (void)x;
+    (void)rows;
+    (void)cols;
+    for(size_t task=first;task<last;++task){size_t r=task*(1);
+        #if defined(__ARM_FEATURE_SVE)
+        svbool_t pg=svptrue_b32();size_t vl=svcntw(),c=0;
+        svfloat32_t a=svdup_f32(0),b=svdup_f32(0);
+        for(;c+2*vl<=cols;c+=2*vl){
+            a=svmla_x(pg,a,load_bf16(pg,w+r*cols+c),svld1(pg,x+c));
+            b=svmla_x(pg,b,load_bf16(pg,w+r*cols+c+vl),svld1(pg,x+c+vl));}
+        for(;c<cols;c+=vl){svbool_t tail=svwhilelt_b32(c,cols);
+            a=svmla_m(tail,a,load_bf16(tail,w+r*cols+c),svld1(tail,x+c));}
+        out[r]=svaddv(pg,svadd_x(pg,a,b));
+        #else
+        float sum=0;
+        for(size_t c=0;c<cols;++c){union {uint32_t u;float f;}v={(uint32_t)w[r*cols+c]<<16};sum+=v.f*x[c];}
+        out[r]=sum;
+        #endif
+
+    }
+}
 void ds41f_bf16_f32_matvec(float *out,const uint16_t *w,const float *x,size_t rows,size_t cols)
 {
+    if(ds41f_team_active()){
+        bf16_f32_matvec_team_job job={out, w, x, rows, cols};
+        (void)ds41f_team_for(rows,bf16_f32_matvec_team_work,&job);
+    }else
     #pragma omp parallel for schedule(static)
     for(size_t r=0;r<rows;++r){
         #if defined(__ARM_FEATURE_SVE)
@@ -113,6 +156,48 @@ void ds41f_bf16_f32_matvec(float *out,const uint16_t *w,const float *x,size_t ro
     }
 }
 
+#if defined(__ARM_FEATURE_SVE)
+typedef struct {
+    float * out;
+    const uint8_t * w;
+    const uint8_t * scale;
+    const float * x;
+    size_t cols;
+    const float * lut;
+} mxfp4_matvec_team_job;
+static void mxfp4_matvec_team_work(void *context,size_t first,size_t last)
+{
+    mxfp4_matvec_team_job *job=context;
+    float * out=job->out;
+    const uint8_t * w=job->w;
+    const uint8_t * scale=job->scale;
+    const float * x=job->x;
+    size_t cols=job->cols;
+    const float * lut=job->lut;
+    (void)out;
+    (void)w;
+    (void)scale;
+    (void)x;
+    (void)cols;
+    (void)lut;
+    for(size_t task=first;task<last;++task){size_t r=task*(1);
+        svbool_t pg=svptrue_b32();
+        svfloat32_t table=svld1(pg,lut), acc=svdup_f32(0);
+        for(size_t b=0;b<cols/32;++b) {
+            svuint32_t raw=svld1ub_u32(pg,w+r*(cols/2)+b*16);
+            svfloat32_t lo=svtbl_f32(table,svand_n_u32_x(pg,raw,15));
+            svfloat32_t hi=svtbl_f32(table,svlsr_n_u32_x(pg,raw,4));
+            svfloat32_t a=svld1(pg,x+b*32), z=svld1(pg,x+b*32+16);
+            svfloat32_t even=svuzp1_f32(a,z), odd=svuzp2_f32(a,z);
+            svfloat32_t prod=svmul_x(pg,lo,even);
+            prod=svmla_x(pg,prod,hi,odd);
+            acc=svmla_n_f32_x(pg,acc,prod,scale_e8m0(scale[r*(cols/32)+b]));
+        }
+        out[r]=svaddv(pg,acc);
+
+    }
+}
+#endif
 int ds41f_mxfp4_matvec(float *out, const uint8_t *w, const uint8_t *scale,
                         const float *x, size_t rows, size_t cols)
 {
@@ -120,6 +205,10 @@ int ds41f_mxfp4_matvec(float *out, const uint8_t *w, const uint8_t *scale,
 #if defined(__ARM_FEATURE_SVE)
     if (svcntw()!=16) return ds41f_mxfp4_matvec_ref(out,w,scale,x,rows,cols);
     static const float lut[16]={0,.5f,1,1.5f,2,3,4,6,-0.f,-.5f,-1,-1.5f,-2,-3,-4,-6};
+    if(ds41f_team_active()){
+        mxfp4_matvec_team_job job={out, w, scale, x, cols, lut};
+        (void)ds41f_team_for(rows,mxfp4_matvec_team_work,&job);
+    }else
     #pragma omp parallel for schedule(static)
     for (size_t r=0;r<rows;++r) {
         svbool_t pg=svptrue_b32();
@@ -142,6 +231,90 @@ int ds41f_mxfp4_matvec(float *out, const uint8_t *w, const uint8_t *scale,
 #endif
 }
 
+#if defined(__ARM_FEATURE_SVE)
+typedef struct {
+    float * out;
+    const uint8_t * w;
+    const uint8_t * scale;
+    const float * x;
+    size_t rows;
+    size_t cols;
+    size_t group_rows;
+    size_t tile_rows;
+    const float * lut;
+} fp8_matvec_impl_team_job;
+static void fp8_matvec_impl_team_work(void *context,size_t first,size_t last)
+{
+    fp8_matvec_impl_team_job *job=context;
+    float * out=job->out;
+    const uint8_t * w=job->w;
+    const uint8_t * scale=job->scale;
+    const float * x=job->x;
+    size_t rows=job->rows;
+    size_t cols=job->cols;
+    size_t group_rows=job->group_rows;
+    size_t tile_rows=job->tile_rows;
+    const float * lut=job->lut;
+    (void)out;
+    (void)w;
+    (void)scale;
+    (void)x;
+    (void)rows;
+    (void)cols;
+    (void)group_rows;
+    (void)tile_rows;
+    (void)lut;
+    for(size_t task=first;task<last;++task){size_t r=task*(tile_rows);
+        const float *input=x+(r/group_rows)*cols;
+        svbool_t pg=svptrue_b32();
+        svfloat32_t acc=svdup_f32(0),a1=acc,a2=acc,a3=acc;
+        for(size_t b=0;b<cols;b+=32) {
+            size_t end=b+32<cols?b+32:cols;
+            float sc=scale_e8m0(scale[(r/32)*((cols+31)/32)+b/32]);
+            for(size_t c=b;c<end;c+=svcntw()) {
+                svbool_t q=svwhilelt_b32(c,end);
+                svuint32_t codes=svld1ub_u32(q,w+r*cols+c);
+                #if defined(DS41F_FP8_BITS)
+                svfloat32_t weights=decode_fp8_bits(q,codes);
+                #else
+                svfloat32_t weights=svld1_gather_u32index_f32(q,lut,codes);
+                #endif
+                weights=svmul_n_f32_x(q,weights,sc);
+                svfloat32_t xv=svld1(q,input+c);
+                acc=svmla_m(q,acc,weights,xv);
+                /* Four independent rows preserve each row's accumulation
+                 * order while sharing input loads and the 32-row scale. */
+                if(tile_rows==4&&r+1<rows){codes=svld1ub_u32(q,w+(r+1)*cols+c);
+                    #if defined(DS41F_FP8_BITS)
+                    weights=decode_fp8_bits(q,codes);
+                    #else
+                    weights=svld1_gather_u32index_f32(q,lut,codes);
+                    #endif
+                    a1=svmla_m(q,a1,svmul_n_f32_x(q,weights,sc),xv);}
+                if(tile_rows==4&&r+2<rows){codes=svld1ub_u32(q,w+(r+2)*cols+c);
+                    #if defined(DS41F_FP8_BITS)
+                    weights=decode_fp8_bits(q,codes);
+                    #else
+                    weights=svld1_gather_u32index_f32(q,lut,codes);
+                    #endif
+                    a2=svmla_m(q,a2,svmul_n_f32_x(q,weights,sc),xv);}
+                if(tile_rows==4&&r+3<rows){codes=svld1ub_u32(q,w+(r+3)*cols+c);
+                    #if defined(DS41F_FP8_BITS)
+                    weights=decode_fp8_bits(q,codes);
+                    #else
+                    weights=svld1_gather_u32index_f32(q,lut,codes);
+                    #endif
+                    a3=svmla_m(q,a3,svmul_n_f32_x(q,weights,sc),xv);}
+            }
+        }
+        out[r]=svaddv(pg,acc);
+        if(tile_rows==4&&r+1<rows)out[r+1]=svaddv(pg,a1);
+        if(tile_rows==4&&r+2<rows)out[r+2]=svaddv(pg,a2);
+        if(tile_rows==4&&r+3<rows)out[r+3]=svaddv(pg,a3);
+
+    }
+}
+#endif
 static int fp8_matvec_impl(float *out, const uint8_t *w, const uint8_t *scale,
                       const float *x, size_t rows, size_t cols,size_t group_rows)
 {
@@ -150,10 +323,16 @@ static int fp8_matvec_impl(float *out, const uint8_t *w, const uint8_t *scale,
     #if !defined(DS41F_FP8_BITS)
     float lut[256];
     for(int i=0;i<256;++i) lut[i]=ds41f_fp8_e4m3_to_f32((uint8_t)i);
+    #else
+    const float *lut=NULL;
     #endif
     /* Small matrices benefit from row interleaving. Larger working sets
      * regressed in measured HBM-streaming cases; retain contiguous rows. */
     const size_t tile_rows=rows<=((size_t)16*1024*1024)/cols?4:1;
+    if(ds41f_team_active()){
+        fp8_matvec_impl_team_job job={out, w, scale, x, rows, cols, group_rows, tile_rows, lut};
+        (void)ds41f_team_for((rows+tile_rows-1)/tile_rows,fp8_matvec_impl_team_work,&job);
+    }else
     #pragma omp parallel for schedule(static)
     for(size_t r=0;r<rows;r+=tile_rows) {
         const float *input=x+(r/group_rows)*cols;
@@ -221,6 +400,68 @@ int ds41f_fp8_grouped_matvec(float *out,const uint8_t *w,const uint8_t *scale,
     return fp8_matvec_impl(out,w,scale,x,groups*group_rows,cols,group_rows);
 }
 
+#if defined(__ARM_FEATURE_SVE)
+typedef struct {
+    float * gate;
+    float * up;
+    const uint8_t * wg;
+    const uint8_t * sg;
+    const uint8_t * wu;
+    const uint8_t * su;
+    const float * x;
+    size_t rows;
+    size_t cols;
+    int tile;
+    const float * lut;
+} mxfp4_matvec_pair_team_job;
+static void mxfp4_matvec_pair_team_work(void *context,size_t first,size_t last)
+{
+    mxfp4_matvec_pair_team_job *job=context;
+    float * gate=job->gate;
+    float * up=job->up;
+    const uint8_t * wg=job->wg;
+    const uint8_t * sg=job->sg;
+    const uint8_t * wu=job->wu;
+    const uint8_t * su=job->su;
+    const float * x=job->x;
+    size_t rows=job->rows;
+    size_t cols=job->cols;
+    int tile=job->tile;
+    const float * lut=job->lut;
+    (void)gate;
+    (void)up;
+    (void)wg;
+    (void)sg;
+    (void)wu;
+    (void)su;
+    (void)x;
+    (void)rows;
+    (void)cols;
+    (void)tile;
+    (void)lut;
+    for(size_t task=first;task<last;++task){size_t r=task*(tile);
+            svbool_t pg=svptrue_b32();svfloat32_t table=svld1_f32(pg,lut);
+            svfloat32_t g0=svdup_f32(0),u0=g0,g1=g0,u1=g0;
+            for(size_t b=0;b<cols/32;++b){
+                svfloat32_t a=svld1_f32(pg,x+b*32),z=svld1_f32(pg,x+b*32+16);
+                svfloat32_t even=svuzp1_f32(a,z),odd=svuzp2_f32(a,z);
+                #define PAIR_DOT(acc,weight,scales,row) { \
+                    svuint32_t raw=svld1ub_u32(pg,(weight)+(row)*(cols/2)+b*16); \
+                    svfloat32_t lo=svtbl_f32(table,svand_n_u32_x(pg,raw,15)); \
+                    svfloat32_t hi=svtbl_f32(table,svlsr_n_u32_x(pg,raw,4)); \
+                    svfloat32_t prod=svmul_f32_x(pg,lo,even); \
+                    prod=svmla_f32_x(pg,prod,hi,odd); \
+                    acc=svmla_n_f32_x(pg,acc,prod,scale_e8m0((scales)[(row)*(cols/32)+b])); }
+                PAIR_DOT(g0,wg,sg,r);PAIR_DOT(u0,wu,su,r);
+                if(tile==2&&r+1<rows){PAIR_DOT(g1,wg,sg,r+1);PAIR_DOT(u1,wu,su,r+1);}
+                #undef PAIR_DOT
+            }
+            gate[r]=svaddv_f32(pg,g0);up[r]=svaddv_f32(pg,u0);
+            if(tile==2&&r+1<rows){gate[r+1]=svaddv_f32(pg,g1);up[r+1]=svaddv_f32(pg,u1);}
+
+    }
+}
+#endif
 int ds41f_mxfp4_matvec_pair(float *gate,float *up,const uint8_t *wg,const uint8_t *sg,
                            const uint8_t *wu,const uint8_t *su,const float *x,
                            size_t rows,size_t cols,int tile)
@@ -229,7 +470,11 @@ int ds41f_mxfp4_matvec_pair(float *gate,float *up,const uint8_t *wg,const uint8_
 #if defined(__ARM_FEATURE_SVE)
     if(svcntw()==16){
         static const float lut[16]={0,.5f,1,1.5f,2,3,4,6,-0.f,-.5f,-1,-1.5f,-2,-3,-4,-6};
-        #pragma omp parallel for schedule(static)
+        if(ds41f_team_active()){
+        mxfp4_matvec_pair_team_job job={gate, up, wg, sg, wu, su, x, rows, cols, tile, lut};
+        (void)ds41f_team_for((rows+(size_t)tile-1)/(size_t)tile,mxfp4_matvec_pair_team_work,&job);
+    }else
+    #pragma omp parallel for schedule(static)
         for(size_t r=0;r<rows;r+=(size_t)tile){
             svbool_t pg=svptrue_b32();svfloat32_t table=svld1_f32(pg,lut);
             svfloat32_t g0=svdup_f32(0),u0=g0,g1=g0,u1=g0;

@@ -18,6 +18,7 @@ void ds41f_hc_post(float *out,const float *x,const float *residual,
                    const float post[4],const float comb[16],size_t dim);
 void ds41f_engram_fuse(float *x,const float *key,const float *value,
                        const float *qw,const float *kw,size_t dim,float eps);
+void ds41f_set_rope_cache(int enabled);
 void ds41f_rope(float *x,size_t heads,size_t dim,size_t rope_dim,size_t pos,
                  double theta,double factor,int original,int inverse);
 int ds41f_sparse_attention(float *out,const float *q,const float *kv,
@@ -35,6 +36,11 @@ int ds41f_sparse_attention_tiled_math(float *out,const float *q,const float *kv,
 int ds41f_sparse_attention_tiled(float *out,const float *q,const float *kv,
                                  const float *sink,const int *ids,size_t selected,
                                  size_t tokens,size_t heads,size_t dim,int tile);
+/* Compressed entries point to the original 288-byte KV row; NULL masks a row.
+ * kv contains raw rows followed by their decoded compressed rows, for FP32 PV. */
+int ds41f_sparse_attention_sdot(float *out,const float *q,const float *kv,
+                                const float *sink,const uint8_t *const *compressed,
+                                size_t raw,size_t extra,size_t heads,int math,int reference);
 void ds41f_pool_pair(float *out,const float *a,const float *b,
                       const float *sa,const float *sb,size_t dim);
 #endif

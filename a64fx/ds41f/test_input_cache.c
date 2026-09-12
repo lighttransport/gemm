@@ -1,11 +1,37 @@
+#define _GNU_SOURCE
+#include "ds41f_alloc.h"
+#include "ds41f_fp4_sdot.h"
 #include "ds41f_weights.h"
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+static int check_packed_store(void)
+{
+    ds41f_weights store={0};store.count=2;store.items=calloc(2,sizeof *store.items);store.bytes=68;
+    if(!store.items)return 1;
+    ds41f_weight *scale=store.items,*weight=store.items+1;
+    strcpy(scale->name,"layers.0.ffn.experts.0.w1.scale");strcpy(scale->dtype,"F8_E8M0");
+    scale->rows=4;scale->cols=1;scale->bytes=4;
+    strcpy(weight->name,"layers.0.ffn.experts.0.w1.weight");strcpy(weight->dtype,"I8");
+    weight->rows=4;weight->cols=16;weight->bytes=64;
+    if(ds41f_weights_pack_experts(&store,136)!=EINVAL)return 1;
+    store.fresh_pages=1;
+    if(ds41f_alloc_resident(&scale->data,4,1)||ds41f_alloc_resident(&weight->data,64,1))return 1;
+    for(int i=0;i<4;++i)((uint8_t *)scale->data)[i]=(uint8_t)(125+i);
+    for(int i=0;i<64;++i)((uint8_t *)weight->data)[i]=(uint8_t)(i*17);
+    uint8_t expected[64],expected_scale[4];
+    if(ds41f_mxfp4_pack_sdot(expected,expected_scale,weight->data,scale->data,4,32))return 1;
+    if(ds41f_weights_pack_experts(&store,135)!=ENOMEM)return 1;
+    if(ds41f_weights_pack_experts(&store,136)||!store.packed_experts||store.bytes!=68||
+       memcmp(weight->data,expected,64)||memcmp(scale->data,expected_scale,4))return 1;
+    if(ds41f_weights_pack_experts(&store,136)!=EINVAL)return 1;
+    ds41f_weights_free(&store);puts("EXPERT_STORE PASS fresh_pages bounded_peak lossless_pack teardown");return 0;
+}
 int main(void)
 {
+    if(check_packed_store())return 1;
     ds41f_weights store={0};store.count=2;store.items=calloc(2,sizeof *store.items);if(!store.items)return 1;
     ds41f_weight *s=&store.items[0],*w=&store.items[1];
     strcpy(s->name,"unit.scale");strcpy(s->dtype,"F8_E8M0");s->rows=1;s->cols=160;s->bytes=160;s->data=malloc(160);

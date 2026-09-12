@@ -22,13 +22,18 @@ int main(void)
     float *x=malloc((64*512+1)*sizeof(float)),*y=malloc((64*512+1)*sizeof(float));
     if(!x||!y)return 2;
     size_t count=0;
+    for(int cached=0;cached<2;++cached)
     for(size_t h=0;h<3;++h)for(size_t d=0;d<2;++d)for(size_t r=0;r<3;++r)
     for(size_t p=0;p<5;++p)for(int cfg=0;cfg<2;++cfg)for(int inverse=0;inverse<2;++inverse){
+        ds41f_set_rope_cache(cached);
         size_t n=heads[h]*dims[d];for(size_t i=0;i<n;++i)x[i]=sinf((float)i*.013f);
         x[n]=12345;memcpy(y,x,(n+1)*sizeof(float));double theta=cfg?160000:10000;int original=cfg?65536:0;
         reference(x,heads[h],dims[d],rotary[r],positions[p],theta,16,original,inverse);
         ds41f_rope(y,heads[h],dims[d],rotary[r],positions[p],theta,16,original,inverse);
         if(memcmp(x,y,(n+1)*sizeof(float))||y[n]!=12345){fprintf(stderr,"ROPE_LAYOUT FAIL heads=%zu dim=%zu rd=%zu pos=%zu cfg=%d inverse=%d\n",heads[h],dims[d],rotary[r],positions[p],cfg,inverse);return 1;}
+        if(cached){for(size_t i=0;i<n;++i)y[i]=sinf((float)i*.013f);
+            ds41f_rope(y,heads[h],dims[d],rotary[r],positions[p],theta,16,original,inverse);
+            if(memcmp(x,y,(n+1)*sizeof(float)))return 1;}
         ++count;
     }
     free(x);free(y);printf("ROPE_LAYOUT PASS bit_exact=%zu canaries inverse long_positions\n",count);return 0;

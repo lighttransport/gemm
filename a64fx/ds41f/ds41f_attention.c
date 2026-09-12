@@ -1,3 +1,4 @@
+#include "ds41f_team.h"
 #include "ds41f_attention.h"
 #include "ds41f_alloc.h"
 #include "ds41f_cache.h"
@@ -113,6 +114,44 @@ static float index_dot_heads(const float *packed,const float *key,const float *w
     return bf(svadda_f32(pg,svadda_f32(pg,0,a),b));
 }
 #endif
+typedef struct {
+    float * scores;
+    const float * q;
+    const float * weights;
+    const uint8_t * rows;
+    const uint8_t * candidates;
+    int head_tiles;
+    const float * packed;
+} index_scores_team_job;
+static void index_scores_team_work(void *context,size_t first,size_t last)
+{
+    index_scores_team_job *job=context;
+    float * scores=job->scores;
+    const float * q=job->q;
+    const float * weights=job->weights;
+    const uint8_t * rows=job->rows;
+    const uint8_t * candidates=job->candidates;
+    int head_tiles=job->head_tiles;
+    const float * packed=job->packed;
+    (void)scores;
+    (void)q;
+    (void)weights;
+    (void)rows;
+    (void)candidates;
+    (void)head_tiles;
+    (void)packed;
+    for(size_t task=first;task<last;++task){size_t i=task*(1);
+        if(candidates&&!candidates[i/8]){scores[i]=-INFINITY;continue;}
+        float key[128],sum=0;ds41f_fp4_unpack(key,rows+i*356+288,128,32,0);
+        #if defined(__ARM_FEATURE_SVE)
+        if(head_tiles&&svcntw()==16){scores[i]=index_dot_heads(packed,key,weights);continue;}
+        #endif
+        for(int h=0;h<32;++h){float dot=0;
+            for(int j=0;j<128;++j)dot+=q[h*128+j]*key[j];
+            sum+=bf(fmaxf(bf(dot),0)*weights[h]);}scores[i]=bf(sum);
+
+    }
+}
 int ds41f_index_scores(float *scores,const float *q,const float *weights,const uint8_t *rows,
                        size_t count,const uint8_t *candidates,int head_tiles)
 {
@@ -123,6 +162,10 @@ int ds41f_index_scores(float *scores,const float *q,const float *weights,const u
     #else
     (void)packed;
     #endif
+    if(ds41f_team_active()){
+        index_scores_team_job job={scores, q, weights, rows, candidates, head_tiles, packed};
+        (void)ds41f_team_for(count,index_scores_team_work,&job);
+    }else
     #pragma omp parallel for schedule(static)
     for(size_t i=0;i<count;++i){
         if(candidates&&!candidates[i/8]){scores[i]=-INFINITY;continue;}
@@ -206,6 +249,31 @@ int ds41f_attention_apply(ds41f_attention *s,int layer,size_t pos,const ds41f_at
     memcpy(s->publication,context->publication,356);
     return ds41f_attention_receive(s,layer,pos,context->publication);
 }
+typedef struct {
+    float * rows;
+    ds41f_attention * s;
+    int layer;
+    size_t raw_count;
+    int * ids;
+} attention_project_team_job;
+static void attention_project_team_work(void *context,size_t first,size_t last)
+{
+    attention_project_team_job *job=context;
+    float * rows=job->rows;
+    ds41f_attention * s=job->s;
+    int layer=job->layer;
+    size_t raw_count=job->raw_count;
+    int * ids=job->ids;
+    (void)rows;
+    (void)s;
+    (void)layer;
+    (void)raw_count;
+    (void)ids;
+    for(size_t task=first;task<last;++task){size_t i=task*(1);
+        ds41f_fp4_unpack(rows+(raw_count+i)*512,s->compressed[source(layer)]+(size_t)s->selected[i]*356,512,16,1);
+        ids[raw_count+i]=(int)(raw_count+i);
+    }
+}
 int ds41f_attention_project(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,
                             const float *qr,size_t first_head,size_t heads,float *projected)
 {
@@ -221,6 +289,10 @@ int ds41f_attention_project(ds41f_attention *s,const ds41f_weights *w,int layer,
     int ids[128+512];
     for(size_t i=0;i<raw_count;++i){size_t token=pos+1-raw_count+i;
         memcpy(rows+i*512,window+(token%128)*512,512*sizeof(float));ids[i]=(int)i;}
+    if(ds41f_team_active()){
+        attention_project_team_job job={rows, s, layer, raw_count, ids};
+        (void)ds41f_team_for(extra,attention_project_team_work,&job);
+    }else
     #pragma omp parallel for schedule(static)
     for(size_t i=0;i<extra;++i){
         ds41f_fp4_unpack(rows+(raw_count+i)*512,s->compressed[source(layer)]+(size_t)s->selected[i]*356,512,16,1);
@@ -230,7 +302,9 @@ int ds41f_attention_project(ds41f_attention *s,const ds41f_weights *w,int layer,
     if(!sink||sink->bytes!=64*4)return EINVAL;
     P_END(ATTN_ROWS,pt);pt=P_BEGIN();
     const float *sinks=(const float *)sink->data+first_head;
-    int rc=s->sparse_tile?ds41f_sparse_attention_tiled_math(attended,q,rows,sinks,ids,raw_count+extra,raw_count+extra,heads,512,s->sparse_tile,s->sparse_math):
+    const uint8_t *packed_rows[512];
+    if(s->sparse_sdot)for(size_t i=0;i<extra;++i)packed_rows[i]=s->compressed[source(layer)]+(size_t)s->selected[i]*356;
+    int rc=s->sparse_sdot?ds41f_sparse_attention_sdot(attended,q,rows,sinks,packed_rows,raw_count,extra,heads,s->sparse_math,0):s->sparse_tile?ds41f_sparse_attention_tiled_math(attended,q,rows,sinks,ids,raw_count+extra,raw_count+extra,heads,512,s->sparse_tile,s->sparse_math):
         ds41f_sparse_attention(attended,q,rows,sinks,ids,raw_count+extra,raw_count+extra,heads,512);
     if(rc)return rc;P_END(ATTN_SPARSE,pt);pt=P_BEGIN();
     ds41f_round_bf16(attended,heads*512);rope(attended,heads,512,layer,pos,1);

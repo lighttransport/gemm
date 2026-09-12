@@ -37,3 +37,9 @@
 /test_input_cache
 
 /test_int8_batch
+/test_gate
+/test_quant_parallel
+/test_fp4_sdot
+/test_sparse_sdot
+/test_team
+/test_team_kernels

@@ -113,7 +113,7 @@ def report(directory, start, stop):
                                  for name, x in critical.items()},
                   attention_inclusive=attention, indexer_inclusive=indexer,
                   sparse_components={name: stats(phase(name).max(axis=0).sum(axis=1)) for name in
-                                       ("SPARSE_QK", "SPARSE_SOFTMAX", "SPARSE_PV") if name in index},
+                                       ("SPARSE_PACK", "SPARSE_QK", "SPARSE_SOFTMAX", "SPARSE_PV") if name in index},
                   expert_slowest_rank_components=expert_parts,
                   engram_slowest_rank_components=engram_parts,
                   engram_prefetch_overlap=(stats(phase("ENGRAM_PREFETCH").max(axis=0).sum(axis=1))

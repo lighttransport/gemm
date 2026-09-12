@@ -3,6 +3,161 @@
 Latest continuation: [20/30/40 tokens/s implementation plan](#203040-tokenss-implementation-plan).
 The earlier pause was superseded by the request to pursue INT8 SDOT decode.
 
+## Implementation continuation: persistent workers and SDOT, 2026-09-13
+
+The ordinary **speed-first 20+ milestone is repeatable** near 1K history on
+12 A64FX nodes at 2 GHz. This does **not** establish a numerically validated
+20+ path. All runs retain 40 layers, 64 heads, top-6 routed experts, top-512
+selected rows and the 128-token window. Cache capacity is 1M; measured history
+is approximately 1K. Thirty and forty tokens/s remain unachieved targets.
+
+Three uninstrumented runs on allocation **51575979** use TP4, packed expert
+SDOT, INT8 FP8 projections, approximate mHC mode 1, persistent workers,
+cached RoPE and vector INT8 scale loads. They use the six-token capital prompt,
+1100 outputs and samples at positions 1000..1104 (105 samples):
+
+| Repeat | Mean ms/token | tokens/s | p95 ms/token | Minimum final MemAvailable |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 49.205 | 20.323 | 52.456 | 3,308,453,888 B |
+| 2 | 48.687 | 20.539 | 51.847 | 3,283,484,672 B |
+| 3 | 48.666 | 20.548 | 51.989 | 3,250,913,280 B |
+
+All twelve ranks finish, and all 1105 input/next-token triples agree between
+these repeats and their approximate profile control. Whole-run times are
+56.057/55.421/55.718 seconds; these include the growing shorter-history prefix.
+Binary SHA256 is
+`ac3889d7022c54122ccc2f892939f8141a2935457bb08fa51fdd4dd4ddf7a683`.
+Evidence and immutable launch scripts are under
+`tmp/ds41f/job51575979/scale-rope-runs-v1` and
+`tp4-scale-rope-approx-repeat{1,2,3}-v1/summary.json`.
+The separate instrumented run measures 19.802 tokens/s. The newest fused
+SDOT pair reaches 20.111 tokens/s instrumented on the earlier allocation;
+its own three uninstrumented repeats and fixed-history replay are running.
+Do not attribute the table above to the newest pair fusion.
+
+### Numerical status
+
+The latest INT8 version preserving the existing INT8 control's outputs reaches
+**16.513 tokens/s**, 60.558 ms/token instrumented. All 1105 token triples and
+nine early logit arrays are bitwise identical to that control. The FP8 short
+run also retains its nine control logit arrays bit-for-bit. These are regression
+checks against selected controls, not independent checkpoint validation.
+
+The speed-first configuration above fails the early nine-position FP8 gate:
+minimum cosine **0.996026**, maximum relative RMS **9.081%**, despite matching
+all nine argmax IDs. Fixed-history 1K checks are being collected. Earlier
+individual approximate variants also fail: expert SDOT alone has minimum
+cosine 0.987906 and RMS 19.618%; sparse SDOT alone has cosine 0.996813 and RMS
+8.017%. The gate remains cosine >=0.999 and relative RMS <=1%, with argmax
+agreement; no threshold was relaxed.
+
+The corrected independent NumPy nine-position replay has now **finished**.
+The original FP8 control agrees on all nine argmax IDs, but only position zero
+passes the full numerical gate: five positions fail cosine, eight fail relative
+RMS. Minimum cosine is **0.994260** and maximum relative RMS **10.782%**.
+The histories are verified identical. See
+`tmp/ds41f/job51569201/reference9-v1/comparison-fp8.json`. Consequently neither
+FP8 nor INT8 currently has independent numerical validation or official GPU
+parity. This supersedes earlier notes saying that reference was pending.
+
+### Implemented and tested
+
+- `--persistent-team` creates one OpenMP team around inference. Thread zero
+  remains the MPI caller under MPI_THREAD_FUNNELED; workers acquire published
+  jobs and signal completion through separate cache lines. Quantization,
+  projections, expert kernels, mHC, gate/index and tiled FP32 attention use
+  this team. The original OpenMP path remains available. Dispatch falls from
+  5.850 to 1.831 microseconds on A64FX. Partition, repeated-generation,
+  main-thread and canary tests pass. The combined kernel test checks 36,756
+  output floats bitwise against ordinary execution, including nonfinite cases.
+  The full INT8 run improves from 13.627 to 15.573 tokens/s while retaining
+  all 1105 token triples and nine logit arrays exactly.
+- `--quant-parallel` avoids parallel-region overhead for small vectors. The
+  ordinary-team threshold is 5120; the cheaper persistent dispatch uses 1024.
+  Nine sizes, in-place operation and nonfinite rejection pass native/A64FX
+  tests. Gate top-k uses a sorted bounded insertion list with strict comparisons
+  and ascending-ID ties, retaining original probability/sum order. Fifty cases
+  pass; the standalone gate falls from 51.885 to 15.710 microseconds.
+- `--expert-sdot` packs original MXFP4 nibbles losslessly into four-row tiles,
+  retaining original group-32 E8M0 scales and **the original resident byte
+  count**. Queries use INT8 after the existing FP8 activation boundary; exact
+  E2M1*2 integer weights feed SVE SDOT. The added input quantization and changed
+  dot order make the operator approximate. Cold complete single projections
+  improve 1.69x/1.94x on 2304x5120 and 5120x2304. Tests cover lossless packing,
+  integer oracle, varied scales, zeros/nonfinite inputs, canaries and bounded
+  loader memory. Packing costs 2.44–2.47 seconds/rank versus about 68 seconds
+  loading; FP8-to-INT8 conversion adds roughly 0.45 seconds. Preparation stays
+  below 5% of load time, so conversion after reading `/local` is retained.
+  No shared offline INT8 weight copies are needed for this implementation.
+- With packed experts, `--expert-fused 1` now fuses W1/W3 in a single SDOT
+  loop sharing input loads. It matches two prepared SDOT GEMVs bitwise with
+  distinct weights/scales. Cold paired operators improve 79.730 to 61.613 us
+  and 81.057 to 58.344 us (1.29x/1.39x). A64FX and native tests pass.
+- INT8 GEMV loads four weight scales together and expands them in SVE lanes,
+  preserving every scale product and reduction. All 378 existing 1..6-token
+  batched cases remain bitwise equal to GEMV. `--rope-cache` keeps eight bounded
+  thread-local entries of the original double sine/cosine calculations; its
+  key includes position, both theta settings, original-context setting and
+  inverse direction. It changes no trigonometric or rounding formulas. All
+  720 layout/cache/inverse/long-position cases pass bitwise. The complete
+  INT8 regression with these changes reaches the 16.513 tokens/s above.
+- `--sparse-sdot` quantizes raw keys/queries and packs exact compressed integer
+  keys, rescales each group into FP32, then retains FP32 PV and the sink/mask
+  semantics. Twenty-five oracle, boundary, tail and nonfinite cases pass.
+  **It is slower including packing**: 16 heads and 640 rows take 127.870 us
+  versus 75.673 us for FP32 tile four. Retain `--sparse-tile 4 --sparse-math 0`;
+  sparse SDOT is an explicit experiment and is incompatible with persistent
+  workers until that experimental operator has its own worker implementation.
+
+The latest fused-pair profile spends 22.060 ms/token in attention, 11.335 ms
+in routed/shared experts, 2.704 ms in mHC, 1.115 ms in gating, 2.478 ms in FFN
+broadcast, 1.498 ms in residual handoff and 2.290 ms in expert rendezvous.
+These are measured critical-path spans; nested kernel times are not additive.
+Further ordinary 30/40 work must substantially reduce attention and experts;
+weight-bandwidth arithmetic alone does not predict the end-to-end rate.
+
+Build and representative checks (repository root; native tests use separate
+executables under repository `tmp/ds41f`):
+
+```sh
+TMPDIR="$PWD/tmp/ds41f" make -C a64fx/ds41f a64fx \
+  A64FX_CC=fccpx A64FX_MPICC=mpifccpx \
+  A64FX_CFLAGS='-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall -Wextra -Wpedantic'
+# Inside the allocation, sequentially, with OMP_NUM_THREADS=48,
+# OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active:
+mpiexec -np 1 ./test_team
+mpiexec -np 1 ./test_team_kernels
+mpiexec -np 1 ./test_gate
+mpiexec -np 1 ./test_quant_parallel
+mpiexec -np 1 ./test_fp4_sdot
+mpiexec -np 1 ./test_sparse_sdot
+mpiexec -np 1 ./test_input_cache
+mpiexec -np 1 ./test_rope_layout
+mpiexec -np 1 ./test_int8
+mpiexec -np 1 ./test_int8_batch
+```
+
+The retained fast argument additions are `--dense-tp 4 --sparse-tile 4
+--index-head-tiles --expert-fused 1 --linear-input-cache --quant-parallel
+--persistent-team --rope-cache --fp8-int8-block 32 --expert-sdot --hc-matvec 1`,
+plus `--engram-prefetch --engram-scale-cache --hc-mix-sve --shared-overlap
+--weights-local-pages --mpi-broadcast --compact-comm` and the staged TP4 root.
+Omit `--expert-sdot --hc-matvec 1` to retain the INT8 control's outputs.
+Omit INT8 conversion as well for the FP8 regression control.
+
+Allocation 51569201 has expired. **51575979** remains active until 04:50:08
+JST September 13, bridge 42395/32395/21266. Original and TP4 staging completed
+with exact-byte manifests. One MPI program runs at a time; drivers and
+binaries are immutable snapshots with verified hashes. Repeats above retain
+at least 3.25 GB final MemAvailable, above the 2 GiB admission floor.
+
+Remaining work: finish the newest paired-path repeats and fixed-history 1K
+checks; add chat/code quality and prompt-dependent timing; investigate the
+independent FP8 mismatch before labeling any track validated; then integrate
+DSpark staging/draft execution, causal batched verification and state rollback.
+The exact INT8 1..6-token GEMM is only kernel groundwork. No integrated MTP
+inference, rollback or speculative token-rate result is claimed yet.
+
 ## 20/30/40 tokens/s implementation plan
 
 Agreed 2026-09-12, recorded before implementation. Keep 12 A64FX nodes and

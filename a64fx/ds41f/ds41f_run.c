@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "ds41f_attention.h"
 #include "ds41f_comm.h"
+#include "ds41f_team.h"
 #include "ds41f_engram.h"
 #include "ds41f_expert.h"
 #include "ds41f_kernels.h"
@@ -120,7 +121,7 @@ static void local_experts(int layer,const float *input,const float route[12],flo
 {
     memset(out,0,5120*sizeof(float));float scratch[3*2304+5120],value[5120];
     for(int k=0;k<6;++k){int id=(int)route[k];if(id%12!=rank)continue;
-        ds41f_expert e={{0},{0}};char name[192];
+        ds41f_expert e={{0},{0},0};e.packed_sdot=weights.packed_experts;char name[192];
         for(int i=0;i<3;++i){snprintf(name,sizeof name,"layers.%d.ffn.experts.%d.w%d.weight",layer,id,i+1);e.weight[i]=tensor(name)->data;
             snprintf(name,sizeof name,"layers.%d.ffn.experts.%d.w%d.scale",layer,id,i+1);e.scale[i]=tensor(name)->data;}
         CHECK(ds41f_expert_forward_fused(&e,value,input,route[k+6],scratch,0,expert_fused));
@@ -259,6 +260,20 @@ static int forward(int token,size_t pos,int trace,const char *logits_path)
     }
     pt=P_BEGIN();ds41f_comm_broadcast(&next,1,11);P_END(NEXT_BCAST,pt);P_END(TOKEN,token_start);return (int)next;
 }
+typedef struct {int *tokens;size_t count;int generate,trace,ignore_eos;size_t logits_start,logits_count;
+    const char *logits_path;int produced;} inference_job;
+static void inference_loop(void *context)
+{
+    inference_job *job=context;int next=0;
+    for(size_t pos=0;pos<job->count+(size_t)job->generate-1;++pos){
+        int input=pos<job->count?job->tokens[pos]:next;double t=now();
+        next=forward(input,pos,job->trace,pos>=job->logits_start&&pos-job->logits_start<job->logits_count?job->logits_path:NULL);
+        if(pos+1>=job->count)++job->produced;
+        if(rank==0){fprintf(stderr,"TOKEN pos=%zu input=%d next=%d seconds=%.6f\n",pos,input,next,now()-t);
+            if(pos+1>=job->count){printf("%d\n",next);fflush(stdout);}}
+        if(!job->ignore_eos&&next==1&&pos+1>=job->count)break;
+    }
+}
 int main(int argc,char **argv)
 {
     CHECK(ds41f_comm_init(&argc,&argv,&rank,&ranks));
@@ -270,7 +285,7 @@ int main(int argc,char **argv)
     {int tid=omp_get_thread_num();if(tid<48)cpu[tid]=sched_getcpu();}
     int unique=0;for(int i=0;i<48;++i){int seen=0;for(int j=0;j<i;++j)if(cpu[j]==cpu[i])seen=1;if(cpu[i]>=0&&!seen)++unique;}
     fprintf(stderr,"THREADS max=%d distinct_cpus=%d\n",omp_get_max_threads(),unique);
-    const char *root=NULL,*prompt=NULL,*logits_path=NULL;size_t capacity=4096,logits_count=SIZE_MAX,logits_start=0,profile_start=SIZE_MAX,profile_count=0,int8_block=0;int generate=1,trace=0,ignore_eos=0,prefetch_engram=0,int8_projections=0,engram_scale_cache=0,weights_local_pages=0,sparse_tile=0,sparse_math=0,attention_local_pages=0,index_head_tiles=0,linear_input_cache=0;
+    const char *root=NULL,*prompt=NULL,*logits_path=NULL;size_t capacity=4096,logits_count=SIZE_MAX,logits_start=0,profile_start=SIZE_MAX,profile_count=0,int8_block=0;int generate=1,trace=0,ignore_eos=0,prefetch_engram=0,int8_projections=0,engram_scale_cache=0,weights_local_pages=0,sparse_tile=0,sparse_math=0,attention_local_pages=0,index_head_tiles=0,linear_input_cache=0,expert_sdot=0,sparse_sdot=0,persistent_team=0;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--stage-root")&&i+1<argc)root=argv[++i];
         else if(!strcmp(argv[i],"--prompt-ids")&&i+1<argc)prompt=argv[++i];
@@ -296,6 +311,11 @@ int main(int argc,char **argv)
         else if(!strcmp(argv[i],"--attention-local-pages"))attention_local_pages=1;
         else if(!strcmp(argv[i],"--index-head-tiles"))index_head_tiles=1;
         else if(!strcmp(argv[i],"--linear-input-cache"))linear_input_cache=1;
+        else if(!strcmp(argv[i],"--quant-parallel"))ds41f_set_quant_parallel(1);
+        else if(!strcmp(argv[i],"--expert-sdot"))expert_sdot=1;
+        else if(!strcmp(argv[i],"--sparse-sdot"))sparse_sdot=1;
+        else if(!strcmp(argv[i],"--persistent-team"))persistent_team=1;
+        else if(!strcmp(argv[i],"--rope-cache"))ds41f_set_rope_cache(1);
         else if(!strcmp(argv[i],"--trace"))trace=1;
         else if(!strcmp(argv[i],"--ignore-eos"))ignore_eos=1;
         else if(!strcmp(argv[i],"--engram-prefetch"))prefetch_engram=1;
@@ -318,6 +338,8 @@ int main(int argc,char **argv)
     ds41f_comm_set_tp(dense_tp);
     if(sparse_math<0||sparse_math>3||(sparse_math&&!sparse_tile))ds41f_comm_abort("sparse math 0..3 requires a tile when nonzero",EINVAL);
     if(expert_fused<0||expert_fused>2)ds41f_comm_abort("expert fused must be 0,1,2",EINVAL);
+    if(persistent_team&&(!sparse_tile||sparse_sdot))ds41f_comm_abort("persistent team requires tiled FP32 attention",EINVAL);
+    if(expert_sdot&&!weights_local_pages)ds41f_comm_abort("expert SDOT requires fresh weight pages",EINVAL);
     int *tokens=malloc(capacity*sizeof(int));if(!tokens)ds41f_comm_abort("prompt allocation",ENOMEM);
     FILE *f=fopen(prompt,"r");if(!f)ds41f_comm_abort("prompt open",errno);
     size_t count=0;int token;
@@ -334,8 +356,10 @@ int main(int argc,char **argv)
     CHECK(ds41f_weights_check_tp(&weights,stage,dense_tp,rank));
     if(int8_block){double quant_start=now();CHECK(ds41f_weights_requantize_fp8(&weights,int8_block,memory-reserve,int8_projections));
         fprintf(stderr,"FP8_INT8_READY rank=%d seconds=%.6f available=%zu\n",rank,now()-quant_start,available());}
+    if(expert_sdot){double pack_start=now();CHECK(ds41f_weights_pack_experts(&weights,memory-reserve));
+        fprintf(stderr,"EXPERT_PACKED_READY rank=%d seconds=%.6f available=%zu\n",rank,now()-pack_start,available());}
     if(linear_input_cache)CHECK(ds41f_weights_enable_input_cache(&weights));
-    CHECK(ds41f_attention_init(&attention,capacity));attention.sparse_tile=sparse_tile;attention.sparse_math=sparse_math;attention.index_head_tiles=index_head_tiles;
+    CHECK(ds41f_attention_init(&attention,capacity));attention.sparse_sdot=sparse_sdot;attention.sparse_tile=sparse_tile;attention.sparse_math=sparse_math;attention.index_head_tiles=index_head_tiles;
     if(attention_local_pages)CHECK(ds41f_attention_place_workspace(&attention));
     CHECK(ds41f_engram_open(&engram,stage,rank,12));
     if(engram_scale_cache){size_t headroom=available();double cache_start=now();
@@ -346,14 +370,10 @@ int main(int argc,char **argv)
     if(prefetch_engram)CHECK(ds41f_prefetch_create(&prefetch,&engram));
     fprintf(stderr,"RESIDENT_READY rank=%d bytes=%zu seconds=%.3f available=%zu\n",rank,weights.bytes,now()-start,available());
     if(available()<(size_t)2*1024*1024*1024)ds41f_comm_abort("post-load memory guard",ENOMEM);
-    ds41f_comm_ready();start=now();int next=0,produced=0;
-    for(size_t pos=0;pos<count+(size_t)generate-1;++pos){int input=pos<count?tokens[pos]:next;double t=now();
-        next=forward(input,pos,trace,pos>=logits_start&&pos-logits_start<logits_count?logits_path:NULL);
-        if(pos+1>=count)++produced;
-        if(rank==0){fprintf(stderr,"TOKEN pos=%zu input=%d next=%d seconds=%.6f\n",pos,input,next,now()-t);
-            if(pos+1>=count){printf("%d\n",next);fflush(stdout);}}
-        if(!ignore_eos&&next==1&&pos+1>=count)break;
-    }
+    ds41f_comm_ready();start=now();
+    inference_job job={tokens,count,generate,trace,ignore_eos,logits_start,logits_count,logits_path,0};
+    if(persistent_team)CHECK(ds41f_team_run(inference_loop,&job));else inference_loop(&job);
+    int produced=job.produced;
     fprintf(stderr,"INFERENCE_FINISHED rank=%d prompt=%zu generated=%d seconds=%.3f available=%zu\n",rank,count,produced,now()-start,available());
     fprintf(stderr,"PROFILE rank=%d attention_hc_gate=%.6f local_experts=%.6f shared_hc=%.6f head=%.6f\n",rank,profile_attention,profile_expert,profile_shared,profile_head);
     CHECK(ds41f_profile_write(rank));ds41f_profile_free();

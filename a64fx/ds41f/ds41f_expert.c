@@ -1,4 +1,5 @@
 #include "ds41f_expert.h"
+#include "ds41f_fp4_sdot.h"
 #include "ds41f_tensor.h"
 #include "ds41f_sve.h"
 #include "ds41f_kernels.h"
@@ -45,8 +46,15 @@ int ds41f_expert_forward_fused(const ds41f_expert *e,float *out,const float *x,
     double pt=P_BEGIN();P_VALUE(EXPERT_COUNT,1);P_VALUE(FP4_BYTES,3*((size_t)5120*2304/2+(size_t)5120*2304/32));
     int rc=ds41f_act_quant(input,x,5120);
     if (rc) return rc;
+    ds41f_int8_input prepared={0};
+    if(e->packed_sdot){rc=ds41f_int8_prepare_input(&prepared,input,5120,32);if(rc)return rc;}
     P_END(EXPERT_QUANT,pt);pt=P_BEGIN();
-    if(fused&&!reference)rc=ds41f_mxfp4_matvec_pair(gate,up,e->weight[0],e->scale[0],e->weight[2],e->scale[2],input,2304,5120,fused);
+    if(e->packed_sdot){
+        if(fused&&!reference)rc=ds41f_mxfp4_sdot_pair_prepared(gate,up,e->weight[0],e->scale[0],e->weight[2],e->scale[2],&prepared,2304,5120);
+        else{rc=ds41f_mxfp4_sdot_prepared(gate,e->weight[0],e->scale[0],&prepared,2304,5120,reference);
+            rc|=ds41f_mxfp4_sdot_prepared(up,e->weight[2],e->scale[2],&prepared,2304,5120,reference);}
+        ds41f_int8_input_free(&prepared);
+    }else if(fused&&!reference)rc=ds41f_mxfp4_matvec_pair(gate,up,e->weight[0],e->scale[0],e->weight[2],e->scale[2],input,2304,5120,fused);
     else{rc=mv(gate,e->weight[0],e->scale[0],input,2304,5120);
         rc|=mv(up,e->weight[2],e->scale[2],input,2304,5120);}
     if (rc) return rc;
@@ -56,7 +64,10 @@ int ds41f_expert_forward_fused(const ds41f_expert *e,float *out,const float *x,
     for (int i=0;i<2304;++i) hidden[i]*=route_weight;
     P_END(EXPERT_SWIGLU,pt);pt=P_BEGIN();rc=ds41f_act_quant(hidden,hidden,2304);
     if (rc) return rc;
-    P_END(EXPERT_QUANT,pt);pt=P_BEGIN();rc=mv(out,e->weight[1],e->scale[1],hidden,5120,2304);
+    if(e->packed_sdot){rc=ds41f_int8_prepare_input(&prepared,hidden,2304,32);if(rc)return rc;}
+    P_END(EXPERT_QUANT,pt);pt=P_BEGIN();
+    if(e->packed_sdot){rc=ds41f_mxfp4_sdot_prepared(out,e->weight[1],e->scale[1],&prepared,5120,2304,reference);ds41f_int8_input_free(&prepared);}
+    else rc=mv(out,e->weight[1],e->scale[1],hidden,5120,2304);
     P_END(EXPERT_W2,pt);pt=P_BEGIN();
     ds41f_round_bf16(out,5120);
     P_END(EXPERT_ROUND,pt);return rc;

@@ -1,7 +1,7 @@
 #ifndef DS41F_EXPERT_H
 #define DS41F_EXPERT_H
 #include <stdint.h>
-typedef struct { uint8_t *weight[3], *scale[3]; } ds41f_expert;
+typedef struct { uint8_t *weight[3], *scale[3]; int packed_sdot; } ds41f_expert;
 int ds41f_expert_load(ds41f_expert *expert,const char *stage,int layer,int id);
 void ds41f_expert_free(ds41f_expert *expert);
 /* BF16 boundaries and group-32 dynamic FP8 activations. Scratch contains

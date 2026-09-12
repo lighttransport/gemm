@@ -1,7 +1,12 @@
 #include "ds41f_kernels.h"
+#include "ds41f_team.h"
 #include "ds41f_quant_sve.h"
 #include <math.h>
 #include <errno.h>
+
+static int quant_parallel;
+void ds41f_set_quant_parallel(int enabled){quant_parallel=enabled!=0;}
+int ds41f_get_quant_parallel(void){return quant_parallel;}
 
 uint8_t ds41f_f32_to_fp8(float x)
 {
@@ -33,15 +38,42 @@ int ds41f_act_quant_ref(float *out,const float *x,size_t n)
     return 0;
 }
 
+#if defined(__ARM_FEATURE_SVE)
+typedef struct {float *out;const float *x;int *errors;} act_quant_team_job;
+static void act_quant_team_work(void *context,size_t first,size_t last)
+{
+    act_quant_team_job *job=context;int invalid=0;
+    for(size_t b=first*32;b<last*32;b+=32){uint16_t quant[32];int rc=ds41f_quantize32_bf16(quant,job->x+b);
+        if(rc){invalid|=rc;continue;}
+        for(size_t j=0;j<32;j+=svcntw()){
+            svbool_t pg=svwhilelt_b32(j,(size_t)32);
+            svst1(pg,job->out+b+j,svreinterpret_f32_u32(svlsl_n_u32_x(pg,svld1uh_u32(pg,quant+j),16)));}}
+    if(invalid)job->errors[ds41f_team_thread_id()]=invalid;
+}
+#endif
 int ds41f_act_quant(float *out,const float *x,size_t n)
 {
     #if defined(__ARM_FEATURE_SVE)
     if(!out||!x||!n||n%32)return EINVAL;
-    for(size_t b=0;b<n;b+=32){uint16_t quant[32];int rc=ds41f_quantize32_bf16(quant,x+b);if(rc)return rc;
-        for(size_t j=0;j<32;j+=svcntw()){
-            svbool_t pg=svwhilelt_b32(j,(size_t)32);
-            svst1(pg,out+b+j,svreinterpret_f32_u32(svlsl_n_u32_x(pg,svld1uh_u32(pg,quant+j),16)));}}
-    return 0;
+    int invalid=0;
+    if(ds41f_team_active()&&quant_parallel&&n>=1024){
+        int errors[48]={0};act_quant_team_job job={out,x,errors};
+        (void)ds41f_team_for(n/32,act_quant_team_work,&job);
+        for(int i=0;i<48;++i)invalid|=errors[i];
+    }else if(quant_parallel&&n>=5120){
+        #pragma omp parallel for schedule(static) reduction(|:invalid)
+        for(size_t b=0;b<n;b+=32){uint16_t quant[32];int rc=ds41f_quantize32_bf16(quant,x+b);
+            if(rc){invalid|=rc;continue;}
+            for(size_t j=0;j<32;j+=svcntw()){
+                svbool_t pg=svwhilelt_b32(j,(size_t)32);
+                svst1(pg,out+b+j,svreinterpret_f32_u32(svlsl_n_u32_x(pg,svld1uh_u32(pg,quant+j),16)));}}
+    }else{
+        for(size_t b=0;b<n;b+=32){uint16_t quant[32];int rc=ds41f_quantize32_bf16(quant,x+b);if(rc)return rc;
+            for(size_t j=0;j<32;j+=svcntw()){
+                svbool_t pg=svwhilelt_b32(j,(size_t)32);
+                svst1(pg,out+b+j,svreinterpret_f32_u32(svlsl_n_u32_x(pg,svld1uh_u32(pg,quant+j),16)));}}
+    }
+    return invalid;
     #else
     return ds41f_act_quant_ref(out,x,n);
     #endif

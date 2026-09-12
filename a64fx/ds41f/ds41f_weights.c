@@ -1,5 +1,7 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include "ds41f_weights.h"
+#include "ds41f_fp4_sdot.h"
+#include "ds41f_alloc.h"
 #include "ds41f_tensor.h"
 #include "ds41f_sve.h"
 #include "ds41f_kernels.h"
@@ -202,4 +204,28 @@ int ds41f_norm(const ds41f_weights *s,const char *name,float *out,const float *x
     const ds41f_weight *w=ds41f_weight_find(s,name);
     if(!w||strcmp(w->dtype,"BF16")||w->rows!=1)return EINVAL;
     ds41f_rmsnorm_fast(out,x,w->data,w->cols,1e-20f);ds41f_round_bf16(out,w->cols);P_END(NORM,pt);return 0;
+}
+
+int ds41f_weights_pack_experts(ds41f_weights *s,size_t limit)
+{
+    if(!s||!s->fresh_pages||s->packed_experts)return EINVAL;
+    size_t count=0;
+    for(size_t i=0;i<s->count;++i){ds41f_weight *w=s->items+i;
+        size_t len=strlen(w->name);
+        if(!strstr(w->name,".ffn.experts.")||len<7||strcmp(w->name+len-7,".weight"))continue;
+        char name[192];memcpy(name,w->name,len-7);strcpy(name+len-7,".scale");
+        const ds41f_weight *found=ds41f_weight_find(s,name);
+        if(!found||strcmp(w->dtype,"I8")||strcmp(found->dtype,"F8_E8M0")||
+           !w->data||!found->data||w->rows%4||w->cols%16||found->rows!=w->rows||found->cols!=w->cols/16)return EINVAL;
+        ds41f_weight *scale=s->items+(found-s->items);
+        if(s->bytes>limit||w->bytes+scale->bytes>limit-s->bytes)return ENOMEM;
+        uint8_t *packed=NULL,*scales=NULL;
+        int rc=ds41f_alloc_resident((void **)&packed,w->bytes,1);
+        if(!rc)rc=ds41f_alloc_resident((void **)&scales,scale->bytes,1);
+        if(!rc)rc=ds41f_mxfp4_pack_sdot(packed,scales,w->data,scale->data,w->rows,w->cols*2);
+        if(rc){ds41f_free_resident(packed,w->bytes,1);ds41f_free_resident(scales,scale->bytes,1);return rc;}
+        ds41f_free_resident(w->data,w->bytes,1);ds41f_free_resident(scale->data,scale->bytes,1);
+        w->data=packed;scale->data=scales;++count;
+    }
+    s->packed_experts=1;fprintf(stderr,"EXPERT_PACKED tensors=%zu resident_bytes=%zu\n",count,s->bytes);return 0;
 }

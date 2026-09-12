@@ -9,6 +9,9 @@ float ds41f_e8m0_to_f32(uint8_t x);
 uint8_t ds41f_f32_to_fp8(float x);
 /* BF16 input rounding, group-32 dynamic FP8 with power-of-two scales;
  * returns dequantized floats for the initial CPU linear implementation. */
+/* Set once before worker threads start; zero retains serial small inputs. */
+void ds41f_set_quant_parallel(int enabled);
+int ds41f_get_quant_parallel(void);
 int ds41f_act_quant(float *out,const float *x,size_t n);
 int ds41f_act_quant_ref(float *out,const float *x,size_t n);
 uint16_t ds41f_f32_to_bf16(float x);

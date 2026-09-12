@@ -6,6 +6,7 @@ typedef struct {
     size_t capacity;
     int index_head_tiles;
     int rows_fresh_pages;
+    int sparse_sdot;
     int sparse_math;
     int sparse_tile; /* zero retains the original head-parallel control */
     uint8_t *compressed[4]; /* each row: KV288 + index68 */

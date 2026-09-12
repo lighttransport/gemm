@@ -261,6 +261,88 @@ static void sparse_pv6(float *out,const float *scores,const float *kv,const int 
     svst1_f32(pg,out+2608+channel,a53);
 }
 #endif
+#if defined(__ARM_FEATURE_SVE)
+typedef struct {
+    float * out;
+    float * scores;
+    const float * q;
+    const float * kv;
+    const float * sink;
+    const int * ids;
+    size_t selected;
+    size_t heads;
+    size_t dim;
+    size_t pairs;
+    int tile;
+    int math;
+    float scale;
+    int * errors;
+} sparse_team_job;
+static void sparse_team_qk(void *context,size_t first,size_t last)
+{
+    sparse_team_job *job=context;
+    float * out=job->out; (void)out;
+    float * scores=job->scores; (void)scores;
+    const float * q=job->q; (void)q;
+    const float * kv=job->kv; (void)kv;
+    const float * sink=job->sink; (void)sink;
+    const int * ids=job->ids; (void)ids;
+    size_t selected=job->selected; (void)selected;
+    size_t heads=job->heads; (void)heads;
+    size_t dim=job->dim; (void)dim;
+    size_t pairs=job->pairs; (void)pairs;
+    int tile=job->tile; (void)tile;
+    int math=job->math; (void)math;
+    float scale=job->scale; (void)scale;
+    int * errors=job->errors; (void)errors;
+    for(size_t task=first;task<last;++task){
+        size_t h=(task/pairs)*4,i=(task%pairs)*2;
+        if(tile!=1&&i+1<selected&&ids[i]>=0&&ids[i+1]>=0)
+            sparse_qk4x2(scores+h*selected+i,q+h*dim,kv+(size_t)ids[i]*dim,
+                         kv+(size_t)ids[i+1]*dim,selected,scale);
+        else for(size_t hh=h;hh<h+4;++hh)for(size_t ii=i;ii<selected&&ii<i+2;++ii)
+            scores[hh*selected+ii]=ids[ii]<0?-INFINITY:
+                sparse_dot(q+hh*dim,kv+(size_t)ids[ii]*dim,dim)*scale;
+
+    }
+}
+static void sparse_team_pv(void *context,size_t first,size_t last)
+{
+    sparse_team_job *job=context;
+    float * out=job->out; (void)out;
+    float * scores=job->scores; (void)scores;
+    const float * q=job->q; (void)q;
+    const float * kv=job->kv; (void)kv;
+    const float * sink=job->sink; (void)sink;
+    const int * ids=job->ids; (void)ids;
+    size_t selected=job->selected; (void)selected;
+    size_t heads=job->heads; (void)heads;
+    size_t dim=job->dim; (void)dim;
+    size_t pairs=job->pairs; (void)pairs;
+    int tile=job->tile; (void)tile;
+    int math=job->math; (void)math;
+    float scale=job->scale; (void)scale;
+    int * errors=job->errors; (void)errors;
+    for(size_t task=first;task<last;++task){
+        size_t h=(task/8)*(size_t)tile,j=(task%8)*64;
+        if(h+(size_t)tile>heads){
+            for(;h<heads;++h)sparse_pv1(out+h*dim,scores+h*selected,kv,ids,selected,j);
+        }else switch(tile){
+            case 6:sparse_pv6(out+h*dim,scores+h*selected,kv,ids,selected,j);break;
+            case 4:sparse_pv4(out+h*dim,scores+h*selected,kv,ids,selected,j);break;
+            case 2:sparse_pv2(out+h*dim,scores+h*selected,kv,ids,selected,j);break;
+            default:sparse_pv1(out+h*dim,scores+h*selected,kv,ids,selected,j);break;
+        }
+
+    }
+}
+static void sparse_team_softmax(void *context,size_t first,size_t last)
+{
+    sparse_team_job *job=context;
+    for(size_t h=first;h<last;++h)job->errors[h]=ds41f_attention_softmax(
+        job->scores+h*job->selected,job->selected,job->sink[h],job->math);
+}
+#endif
 int ds41f_sparse_attention_tiled_math(float *out,const float *q,const float *kv,
                                  const float *sink,const int *ids,size_t selected,
                                  size_t tokens,size_t heads,size_t dim,int tile,int math)
@@ -276,6 +358,16 @@ int ds41f_sparse_attention_tiled_math(float *out,const float *q,const float *kv,
     float *scores=malloc(heads*selected*sizeof(float));if(!scores)return ENOMEM;
     float scale=1/sqrtf((float)dim);double pt=P_BEGIN();int invalid=0;
     size_t pairs=(selected+1)/2,head_tiles=(heads+(size_t)tile-1)/(size_t)tile;
+    if(ds41f_team_active()){
+        int errors[64]={0};sparse_team_job job={out,scores,q,kv,sink,ids,selected,heads,dim,pairs,tile,math,scale,errors};
+        (void)ds41f_team_for((heads/4)*pairs,sparse_team_qk,&job);
+        P_END(SPARSE_QK,pt);pt=P_BEGIN();
+        (void)ds41f_team_for(heads,sparse_team_softmax,&job);
+        for(size_t h=0;h<heads;++h)invalid|=errors[h];
+        P_END(SPARSE_SOFTMAX,pt);pt=P_BEGIN();
+        if(!invalid)(void)ds41f_team_for(head_tiles*8,sparse_team_pv,&job);
+        P_END(SPARSE_PV,pt);free(scores);return invalid;
+    }
     #pragma omp parallel reduction(|:invalid)
     {
     #pragma omp for schedule(static)
