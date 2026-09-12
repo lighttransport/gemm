@@ -5,12 +5,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* The shared single-header transport defines entry points unused here. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
 #include "../utofu-tests/tp_allreduce.h"
+#pragma GCC diagnostic pop
 static tp_comm comm;
 static utofu_vcq_hdl_t vcq;
 static int my_rank;
+static int mpi_broadcast;
 static void bootstrap_barrier(void){MPI_Barrier(MPI_COMM_WORLD);}
 void ds41f_comm_ready(void){bootstrap_barrier();}
+void ds41f_comm_use_mpi_broadcast(int enabled){mpi_broadcast=!!enabled;}
 void ds41f_comm_abort(const char *message,int error)
 {fprintf(stderr,"DS41F_ABORT rank=%d %s error=%d\n",my_rank,message,error);fflush(stderr);MPI_Abort(MPI_COMM_WORLD,error?error:1);exit(1);}
 int ds41f_comm_init(int *argc,char ***argv,int *rank,int *ranks)
@@ -39,6 +45,14 @@ int ds41f_comm_init(int *argc,char ***argv,int *rank,int *ranks)
 void ds41f_comm_sum(float *v,size_t n)
 {for(size_t i=0;i<n;i+=32768){size_t count=n-i;if(count>32768)count=32768;tp_allreduce_sum(&comm,v+i,(int)count);}}
 void ds41f_comm_broadcast(float *v,size_t n,int owner)
-{if(my_rank!=owner)memset(v,0,n*sizeof(float));ds41f_comm_sum(v,n);}
+{
+    if(!mpi_broadcast){if(my_rank!=owner)memset(v,0,n*sizeof(float));ds41f_comm_sum(v,n);return;}
+    /* The sum-based broadcast normalizes signed zero. Keep that behavior
+     * when copying the owner's values without arithmetic. */
+    if(my_rank==owner)for(size_t i=0;i<n;++i)if(v[i]==0.f)v[i]=0.f;
+    for(size_t i=0;i<n;i+=32768){size_t count=n-i;if(count>32768)count=32768;
+        int rc=MPI_Bcast(v+i,(int)count,MPI_FLOAT,owner,MPI_COMM_WORLD);
+        if(rc)ds41f_comm_abort("MPI_Bcast",rc);}
+}
 void ds41f_comm_free(void)
 {bootstrap_barrier();tp_comm_free(&comm);utofu_free_vcq(vcq);MPI_Finalize();}

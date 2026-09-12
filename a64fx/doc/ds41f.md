@@ -1,5 +1,8 @@
 # DeepSeek-V4.1-Flash A64FX memory design
 
+Latest continuation: [INT8 optimization on job 51569201](#resumed-int8-optimization-job-51569201).
+The earlier pause was superseded by the request to pursue INT8 SDOT decode.
+
 ## Implementation status, 2026-09-12 (job 51562789)
 
 The 12-node runner now executes all 40 layers with real resident weights and
@@ -413,12 +416,12 @@ Final runner SHA256:
 
 ### Completed optimization checkpoint (2026-09-12)
 
-**Paused at the user's requested boundary: Engram prefetch and sparse-attention
-loop optimization are complete.** No further tuning runs are queued. Job
-51562789 is idle with the staged shards and bridge intact; its scheduled end
-is **17:57:45 JST on 2026-09-12**. Node-local staging will need rebuilding
-after the allocation ends. Follow `a64fx/remote-dev-procedure.md` to reconnect
-or allocate again; do not assume the old `/local` paths survive.
+**Historical pause:** Engram prefetch and sparse-attention loop optimization
+were complete at the requested boundary, with no further runs queued then.
+Job 51562789 ended at **17:57:45 JST on 2026-09-12** and its `/local` data expired.
+The later INT8 request resumed work on job 51569201, described below. Follow
+`a64fx/remote-dev-procedure.md` to reconnect or allocate again; do not assume
+old `/local` paths survive.
 
 | Valid run | 1K ms/token | 1K tok/s | Whole inference loop, seconds |
 | --- | ---: | ---: | ---: |
@@ -547,6 +550,318 @@ Actual long-history/1M execution, KV checkpoint/restore and batched prefill
 integration remain separate deferred tasks. Allocating the 1M cache does not
 validate those paths; use the memory and acceptance sections below when that
 scope is resumed.
+
+## Resumed INT8 optimization (job 51569201)
+
+The user resumed optimization toward **20+ tok/s for a single request around
+1K actual history**, specifically requesting INT8 requantization and SDOT for
+FP8 matrices. The earlier pause no longer applies. Job **51569201** has 12
+nodes in normal 2000 MHz mode, from **18:00:29 JST September 12** until
+**00:00:29 JST September 13**. The initial node is `d29-2208c`; its bridge uses
+local port 42394, reverse port 32394 and server port 21265. Tunnel control
+state is in `tmp/i8`. Port 42393/job 51562789 is expired.
+
+Exact original weights were restaged from `/home/u14346/models/ds41f` into
+`/local/u14346/ds41f-51569201/rank<R>` using bounded, page-cache-evicting copies.
+Original Engram metadata was reused after checking its hash. All 12 staging
+ranks finished. Results and immutable source/binary snapshots are under
+`tmp/ds41f/job51569201/`. Launchers are serialized; do not start another MPI
+program while one is running, and do not edit active scripts or binaries.
+
+### Measured progress
+
+All full runs below generate 1,100 outputs from the same six-token prompt,
+allocate the 1M-token cache, and measure positions 1000–1104 (105 samples).
+They do not establish execution at an actual 1M history. FP8 and INT8 may
+generate different histories; fixed-history quality comparisons are separate.
+
+| Run | ms/token near 1K | tok/s | Whole loop, s | Validation (control stated) |
+| --- | ---: | ---: | ---: | --- |
+| `baseline-v1` | 173.463 | 5.765 | 186.497 | 1,105 token triples + nine logits bit-exact |
+| `fp8-overlap-full-v1` | 147.852 | 6.764 | 159.811 | 1,105 token triples + nine logits bit-exact |
+| `int8-overlap-full-v1` | 122.272 | 8.178 | 131.791 | Experimental INT8; original malloc pack allocation |
+| `int8-retained-full-v1` | 121.064 | 8.260 | 129.734 | Same INT8 arithmetic, warning cleanup |
+| `int8-mmap-probe-v1` | 101.761 | 9.827 | 108.991 | Bit-exact to retained INT8 control |
+| `int8-local-pages-full-v1` | 99.939 | 10.006 | 107.998 | Bit-exact to retained INT8 control |
+| `fp8-local-pages-full-v1` | 147.127 | 6.797 | 158.196 | 1,105 token triples + nine logits bit-exact |
+| `int8-mpi-bcast-full-v1` | 98.448 | 10.158 | 105.687 | Bit-exact to retained INT8 control |
+| `int8-selection-full-v1` | 97.965 | 10.208 | 104.442 | Bit-exact to retained INT8 control |
+| `fp8-selection-full-v1` | 144.516 | 6.920 | 154.926 | 1,105 token triples + nine logits bit-exact |
+
+The exact FP8 improvement combines the contiguous-head RoPE loop, SVE FP64
+mHC normalization, Engram scale caching and shared/routed expert overlap.
+Minimum final MemAvailable is **4,195,811,328 bytes**, with all 12 ranks
+finished. Its binary SHA256 is
+`3d7db1d2d484d82dceef2a7f79bde0df9559367e053676e199c06b2c0d93467a`.
+The norm-only nine-position control `fp8-norm9-v1` also matched bit-exactly.
+The 20+ tok/s target is **not reached**.
+
+The reproduced baseline profile attributes 72.243 ms/token to dense FP8
+GEMVs, reading 6.843 GB/token (95 GB/s effective). Attention takes 85.298 ms,
+shared experts 20.296 ms, routed experts on the slowest rank 19.611 ms, and
+mHC mixes 17.285 ms. After the exact changes, attention is 82.893 ms and the
+combined routed/shared stage is 26.577 ms. The norm drops from 7.430 to about
+0.31 ms/token; the original mHC matrix-reduction order is retained.
+Nested timings overlap their parent stages.
+
+### INT8 format, conversion cost and validation
+
+`--fp8-int8-block 32|64|128|256` enables a row/block-scaled signed INT8 SDOT
+GEMV path. Default zero preserves FP8. The converter applies the original
+FP8 E4M3 and E8M0 scales, finds each row/block maximum, rounds symmetrically
+to [-127,127], and packs groups of rows for paired SVE SDOT accumulators.
+Each row/block has one FP32 scale. Activations retain the existing FP8
+quantization first, then use matching blockwise INT8 quantization; output
+BF16 rounding stays in place. Grouped `wo_a` is supported. The large grouped
+activation buffers are quantized in parallel. Batched INT8 GEMM remains
+unimplemented; this continuation targets batch-one decode GEMV.
+
+Conversion occurs **once after reading the original files from `/local`**,
+releasing each original FP8 matrix after its replacement is ready. Block 32
+adds 12.5% scale storage plus row padding, while admission accounts for both
+representations of the current tensor when source mappings can be released.
+With pooled source allocations, admission conservatively reserves the original
+store plus all packed replacements because the pool can retain freed pages. Full-model conversion measured
+**0.2727–0.4608 seconds per rank**, versus **52.688–57.028 seconds** of resident
+startup. The later fresh-allocation run took at most 0.4914 s/rank.
+This remains below 1% of startup, satisfying the user's inexpensive
+online-requantization condition. No offline converted files were written;
+the original shared safetensors and staged weight files remain authoritative.
+
+The first real-matrix probes (`int8-components-v1`) measured query projection
+32768x1280 at 0.444 -> 0.104 ms (4.27x) and grouped output 8192x4096 at
+0.336 -> 0.157 ms (2.14x), block 32. Parallel activation quantization later
+reduced the grouped probe to 0.115 ms (`overlap-runs-v1/components.log`). These
+are reused-tensor component timings, not a full-run speed claim. Cold-weight
+probes (`int8-tile-v1`) selected the original four-row format: four/eight/sixteen
+rows take 0.0998/0.1083/0.1065 ms for `wq_b`, 0.1219/0.1203/0.1247 ms for
+`wo_a`, and 0.1408/0.1517/0.1309 ms for `wo_b`. The mixed larger-tile gains
+were insufficient to replace the four-row format; both prototypes passed the
+162 arithmetic cases. No larger tile is retained.
+
+Numerical validation distinguishes kernel arithmetic from quantization loss:
+
+- `test_int8` passes **162** reference cases covering blocks 32/64/128/256,
+  padded rows, grouped inputs, the parallel input-quantization branch,
+  canaries, zeros, nonfinite rejection and subnormal scales. SVE SDOT is
+  checked against integer dots with double rescaling; native warning-clean
+  builds also pass. AddressSanitizer was unavailable on this frontend.
+- `test_int8_attention` replays 54 real attention inputs (nine positions in
+  layers 0/1/2/8/14/20). Block 32 passes its cosine >= 0.999 exit gate, but
+  relative RMS reaches 4.23%; this is **not** a pass of the stricter 1% gate.
+  Block 128 fails 11 of 54 cosine checks. Limiting quantization to query/output
+  projections improves this local replay, but not full-model agreement.
+- Full fixed-token replay `int8-all32-v1` matches **9/9 argmax choices**, but
+  minimum logit cosine is **0.994185** and maximum relative RMS **10.77%**.
+  The projection-only control reaches minimum cosine **0.952806** and maximum
+  relative RMS **31.05%**, also with 9/9 argmax choices. Both fail the existing
+  numerical gates and remain experimental; token-choice agreement alone does
+  not establish acceptable model quality.
+- Fixed-history replay at **positions 1000–1008** is complete in
+  `fp8-replay1k-v1` and `int8-replay1k-v1`. All 1,105 input tokens are identical;
+  INT8 next-token choices match **1,065/1,105 overall** and **104/105 at
+  positions 1000–1104**. The nine saved argmax choices agree, but logit cosine
+  falls to **0.902769873** and relative RMS reaches **0.439981917**. All nine
+  fail the numerical gates. `comparison-1k.json` and `token-agreement.json`
+  retain the evidence. These dump-enabled replays are quality runs, not speed
+  measurements. `compare_run_logits.py` rejects missing/divergent histories.
+- A second INT8 residual plane lowers individual matvec relative error to
+  about 5e-5, but the full replay still reaches cosine 0.994099 / relative RMS
+  12.82%, and costs more time/memory. This experiment is **not retained**.
+  Its sources and evidence are in `refined-runs-v1` and
+  `int8-refined32-quality-v1`.
+
+`--fp8-int8-scope projections` selects only `attn.wq_b`, `attn.wo_a`,
+`attn.wo_b` and shared experts; default scope `all` converts every FP8 matrix.
+INT8 remains explicitly opt-in and must not be described as an accepted
+numerical replacement for the FP8 path.
+
+### Resident memory placement
+
+The large gap between component and full-run SDOT timings was traced to
+allocation reuse. In `resident-int8-probe-v1`, rank-zero `wo_a` and `wo_b` took
+about 0.44/0.45 ms even on repeated real inputs, while `wq_b` reached 0.0985 ms.
+The packed `wo_a`/`wo_b` pointers landed at the end of the malloc arena, and
+`int8-retained-full-v1/numa-rank0.txt` shows their full mappings on NUMA node 7.
+The original weight scales were normal (E8M0 codes 114–121), excluding a
+subnormal arithmetic explanation for these tensors.
+
+Fresh anonymous allocations bypass the Fugaku `libmpg` malloc pool and let
+parallel conversion place new pages. Changing only the packed INT8 allocations
+improved **8.260 -> 9.827 tok/s**, with identical 1,105 token triples and nine
+logit arrays. `ds41f_alloc.h` uses Linux LP64 raw anonymous mmap/munmap, with
+posix_memalign/free fallback elsewhere. The weight files are still read into
+resident anonymous buffers using bounded pread plus fadvise; this is not
+file-backed model mmap.
+
+`--weights-local-pages` applies fresh allocation to the original tensors too.
+Together with reusing a single 640x512 attention row workspace, it reached
+**10.006 tok/s** and minimum final MemAvailable **3,993,108,480 bytes**.
+Rank-zero MemAvailable stayed close to its post-load value (4.059 -> 3.993 GB).
+The combined comparison does not isolate the workspace from source allocation.
+The FP8 control remained bit-exact and reached **6.797 tok/s**. The loader
+fixture passes six cases covering ordinary/fresh allocation, page boundaries,
+size rejection and independence from subsequent source-file changes.
+A later `int8-local-pages-full-v1/numa-rank0.txt` capture occurred during
+teardown and must not be used as proof of full-resident placement.
+
+The native MPI broadcast prototype then reached **10.158 tok/s**. Residual
+broadcast time fell from about 5.6 to 3.5 ms/token; other synchronization spans
+changed with rank skew. INT8 token triples and nine saved logits stayed exact.
+It is retained as `--mpi-broadcast`; uTofu still performs reductions. Native
+broadcast normalizes signed zero as the previous sum-based broadcast did.
+The component test checks both modes, 12 owners, seven lengths including a
+32768-float chunk boundary, canaries and delayed receivers.
+
+At this point the critical path is attention **45.511 ms/token**, combined
+experts **20.909 ms**, mHC mixes **10.233 ms**, gate **4.024 ms** and residual/FFN
+broadcasts **6.076 ms**. Attention includes sparse attention **11.600 ms**,
+indexing **6.289 ms**, and query/output INT8 projections **15.362 ms**.
+INT8 kernels read 7.691 GB/token at an aggregate effective **358 GB/s**.
+These nested measurements overlap parent stages. Simply improving INT8 GEMV
+cannot remove the remaining roughly 48 ms needed for the 50 ms/token target.
+
+Vocabulary argmax now uses SVE finite/max scans followed by the first matching
+index. Its measured cost falls from **1.230 to 0.034 ms/token**. Gate score
+calculation uses parallel independent scalar math, retaining the existing
+selection and normalization order; total gate time falls from **4.024 to
+3.498 ms/token**. The combined INT8 run reaches **10.208 tok/s**, with all
+1,105 token triples and nine saved logit arrays unchanged. `test_selection`
+passes 130 argmax cases and 20 bit-exact gate cases, including ties, tails,
+nonfinite rejection and the parallel threshold, on native and SVE builds.
+Its binary SHA256 is
+`45aa28c1b0e27d720f647f8a68b7206c1033a06ff506dcbbe85886dfe54eff87`.
+The same binary's FP8 run reaches **6.920 tok/s** (144.516 ms/token),
+20.0% above the same-allocation baseline. All 1,105 token triples and nine
+saved logits remain bit-exact to original FP8; all 12 ranks finish with minimum
+final MemAvailable **4,044,226,560 bytes**. INT8 minimum final MemAvailable
+is **3,968,729,088 bytes**. These runs use profiling; final unprofiled repeats
+are recorded separately.
+
+With profiling and logit dumps disabled, `int8-final-unprofiled-v1` measures
+**96.494 ms/token / 10.363 tok/s**, p95 **98.467 ms**, over the same 105 positions.
+The whole loop takes **102.940 s**. All 1,105 token triples match the profiled
+INT8 run, all 12 ranks finish, and minimum final MemAvailable is
+**3,997,958,144 bytes**. Per-token timings are the runner's rank-zero wall clock;
+p95 uses linear interpolation. The `summary.json` records each unprofiled run.
+`int8-final-unprofiled-v2` confirms **96.279 ms/token / 10.386 tok/s**,
+p95 **98.463 ms**, whole loop **102.578 s**, and minimum final MemAvailable
+**3,999,596,544 bytes**. It also matches all 1,105 token triples. Thus repeated
+uninstrumented INT8 throughput is **10.36–10.39 tok/s**, still below 20 tok/s.
+Both binaries have the same SHA256 given above.
+
+The matched `int8-source-pool-control-v1` omits only `--weights-local-pages`
+while retaining fresh INT8 allocations and the reused row workspace. It reaches
+**98.015 ms/token / 10.203 tok/s**, p95 **99.889 ms**, whole loop **104.492 s**,
+and minimum final MemAvailable **3,576,233,984 bytes**. All 1,105 token triples
+match. Fresh original-weight allocations therefore add roughly 1.7% throughput
+and about 0.42 GB final headroom in these runs; the explicit flag remains in the
+benchmark configuration, while its default stays off.
+
+All recorded launchers have finished successfully, with no further inference
+runs queued. Job **51569201** remains available until the end time above; its
+original staged `/local` weights can be reused while that allocation lives.
+The 20+ tok/s target and full INT8 numerical acceptance remain **open**.
+
+### Other changes and rejected probes
+
+`--engram-scale-cache` reads each rank's two raw scale shards (about 512 MB)
+into HBM with bounded reads and page-cache eviction. It removes one of the two
+reads per Engram row and retains the 2 GiB admission floor. The prefetch fixture
+checks budget rejection, bit-exact cached/uncached rows, closing the scale FDs
+before cached reads, short-read propagation, pending close and profiler TLS.
+
+`--hc-mix-sve` uses an explicitly vectorized FP64 sum of squares. It passes
+352 bit-exact norm cases with tails. Splitting the 24-row mHC matrix across
+48 K-partitions halved its component time but caused full-model logit drift
+(minimum cosine 0.989646 in `fp8-extras9-v1`); that split was removed.
+The RoPE head/angle loop swap passes 360 bit-exact layout/tail/position cases
+and roughly halves the RoPE component time.
+
+`--shared-overlap` computes the owner's shared expert before the routed
+reduction using the same OpenMP team, while other ranks finish their routed
+experts. It adds the shared output after reduction in the original order.
+The profiler reconstructs `EXPERTS_AND_SHARED` from each rank's combined
+local work, avoiding double-counting the overlap.
+
+Other rejected temporary probes: power-of-two INT8 scales (worse attention
+agreement), INT8 SDOT MXFP4 decoding (slower, especially down projection),
+four-row floating MXFP4 interleaving (slower), and FEXPA sparse softmax
+(only a small gain with extra approximation). None is enabled in the runner.
+
+Retained component checks are archived in `retained-checks-v1/components.log`,
+`local-pages-runs-v1/components.log` and `selection-runs-v1/components.log`
+(with MPI stdout under that run's `output.51569201/`). Representative output:
+
+```text
+DS41F_KERNEL_TEST PASS
+SPARSE_TAILS PASS reference_cases=48 masked duplicate_ids empty canaries
+ROPE_LAYOUT PASS bit_exact=360 canaries inverse long_positions
+MHC_MIX PASS norm_bit_exact=352 tails
+INT8 PASS cases=162 blocks=32,64,128,256 padded_rows grouped canaries zero nonfinite subnormal_scales
+PREFETCH PASS bit_exact generations=96 remote_zeros short_read_error pending_close profiler_TLS scale_cache budget cache_only_reads
+TENSOR_LOCAL PASS cases=6 malloc fresh_pages boundary_sizes source_independence size_rejection
+SELECTION PASS argmax=130 gate=20 first_ties nonfinite_rejection bit_exact_weights
+BROADCAST PASS modes=2 owners=12 sizes=7 chunk_boundary canary signed_zero delayed_receivers
+```
+
+### Reproduction and future tasks
+
+Build on the frontend (no `/tmp`):
+
+```sh
+mkdir -p tmp/ds41f
+TMPDIR="$PWD/tmp/ds41f" make -C a64fx/ds41f ds41f_run test_int8 \
+  test_int8_attention test_tensor_local test_selection test_broadcast \
+  test_rope_layout test_mhc_mix test_prefetch \
+  A64FX_CC=fccpx A64FX_MPICC=mpifccpx \
+  A64FX_CFLAGS='-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall -Wextra -Wpedantic'
+```
+
+Snapshot the binary into a new shared results directory and verify its SHA256
+on the compute node. Inside job 51569201, with no other MPI program running:
+
+```sh
+export TMPDIR=/local/u14346/ds41f-51569201
+export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
+export OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores
+mpiexec -np 12 ./ds41f_run --stage-root /local/u14346/ds41f-51569201 \
+  --prompt-ids /absolute/repo/tmp/ds41f/job51562789/prompt-capital.ids \
+  --generate 1100 --ignore-eos --max-context 1048576 \
+  --engram-prefetch --engram-scale-cache --hc-mix-sve --shared-overlap \
+  --weights-local-pages --mpi-broadcast --fp8-int8-block 32
+```
+
+Omit `--fp8-int8-block 32` for FP8. For an instrumented comparison add
+`--profile-start 16 --profile-count 1089 --logits-prefix logits --logits-count 9`,
+then run `profile_report.py RESULTS --start 1000 --stop 1105` on the frontend.
+For near-1K numerical comparison use the same fixed 1,105-token input file in
+both runs and `--generate 1 --logits-start 1000 --logits-count 9`.
+
+Remaining tasks, in priority order:
+
+1. Resolve accumulated INT8 quality loss. Local cosine/argmax agreement is
+   insufficient; retain the full fixed-history cosine >= 0.999 / relative RMS
+   <= 1% gates. Isolate activation versus weight quantization and sensitive
+   layers with bounded same-input captures. The second-plane and projection-only
+   experiments already failed to resolve the full-model error.
+2. Reduce the remaining attention and expert critical paths. Evaluate dense
+   tensor parallelism with a concrete staging, communication and HBM budget;
+   most ranks currently wait while one owner runs attention. No tensor-parallel
+   implementation is present. Optimize routed MXFP4 using actual cold weights
+   and realistic expert placement before revisiting rejected SDOT probes.
+3. Improve mHC matrix execution while controlling accumulation error. Generated
+   code uses ordered SVE `fadda` within each 20,480-column row; changing the
+   reduction order already caused full-model drift. Benchmark any new layout
+   against both component arithmetic and the full fixed-history replay.
+4. Repeat actual-1K unprofiled performance measurements after every retained
+   structural change; do not claim 20+ tok/s until repeated runs exceed it.
+   Repeat the matched source-allocation control on another allocation before
+   changing the current opt-in default.
+5. Complete the corrected nine-position independent NumPy reference and retain
+   transport skew/ACK regression checks. Actual-1M execution, KV persistence,
+   batched prefill and INT8 GEMM remain separate unvalidated future work.
+
 
 ## Checkpoint accounting and active staging (job 51562789)
 

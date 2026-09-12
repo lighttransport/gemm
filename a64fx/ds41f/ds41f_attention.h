@@ -6,6 +6,7 @@ typedef struct {
     size_t capacity;
     uint8_t *compressed[4]; /* each row: KV288 + index68 */
     float *window;          /* reference execution buffer, 40*128*512 floats */
+    float *rows;            /* reused 640x512 sparse-attention workspace */
     float pool_value[3][512],pool_score[3][512];
     int selected[512];size_t selected_count;
     uint8_t *candidate_blocks;

@@ -1,5 +1,6 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include "ds41f_tensor.h"
+#include "ds41f_alloc.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -10,6 +11,15 @@
 
 int ds41f_tensor_load(const char *directory, const char *name, size_t bytes,
                       void **data)
+{
+    return ds41f_tensor_load_local(directory,name,bytes,data,0);
+}
+
+void ds41f_tensor_free_local(void *data,size_t bytes,int fresh_pages)
+{ds41f_free_resident(data,bytes,fresh_pages);}
+
+int ds41f_tensor_load_local(const char *directory,const char *name,size_t bytes,
+                           void **data,int fresh_pages)
 {
     if (!directory || !name || !data || !bytes || strchr(name,'/')) return EINVAL;
     *data = NULL;
@@ -25,7 +35,7 @@ int ds41f_tensor_load(const char *directory, const char *name, size_t bytes,
         close(fd); return EINVAL;
     }
     void *buffer = NULL;
-    rc = posix_memalign(&buffer,256,bytes);
+    rc = ds41f_alloc_resident(&buffer,bytes,fresh_pages);
     if (rc) { close(fd); return rc; }
     /* Parallel first touch places each row range near its consuming OpenMP
      * workers instead of filling a single CMG's memory first. */
@@ -45,6 +55,6 @@ int ds41f_tensor_load(const char *directory, const char *name, size_t bytes,
         offset += (size_t)got;
     }
     close(fd);
-    if (rc) free(buffer); else *data = buffer;
+    if (rc) ds41f_free_resident(buffer,bytes,fresh_pages); else *data = buffer;
     return rc;
 }

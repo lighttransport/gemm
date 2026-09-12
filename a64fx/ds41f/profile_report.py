@@ -62,8 +62,14 @@ def report(directory, start, stop):
     critical["NEXT_BCAST"] = phase("NEXT_BCAST")[11, :, 40]
     for compute, combine in (("EXPERTS", "EXPERT_SUM"), ("ENGRAM_IO", "ENGRAM_SUM")):
         work = phase(compute)[:, :, :40]
+        label = compute
+        if compute == "EXPERTS" and "SHARED_OVERLAP" in index:
+            shared = phase("SHARED_OVERLAP")[:, :, :40]
+            if shared.any():
+                work = work + shared
+                label = "EXPERTS_AND_SHARED"
         collective = phase(combine)[:, :, :40]
-        critical[compute] = work.max(axis=0).sum(axis=1)
+        critical[label] = work.max(axis=0).sum(axis=1)
         critical[combine + "_RENDEZVOUS"] = ((work + collective).max(axis=0)
                                                - work.max(axis=0)).sum(axis=1)
     critical["UNATTRIBUTED"] = token - sum(critical.values())
@@ -79,6 +85,12 @@ def report(directory, start, stop):
                              weight_GB_per_token=float(size.mean() / 1e9),
                              effective_GB_s=(float(size.sum() / duration.sum() / 1e9)
                                              if duration.sum() else None))
+    if "LINEAR_INT8" in index:
+        duration, size = all_ranks("LINEAR_INT8"), all_ranks("INT8_BYTES")
+        kernels["INT8"] = dict(aggregate_ms=mean_ms(duration),
+                               weight_GB_per_token=float(size.mean() / 1e9),
+                               effective_GB_s=(float(size.sum() / duration.sum() / 1e9)
+                                               if duration.sum() else None))
     experts = phase("EXPERTS")[:, :, :40]
     slowest = experts.argmax(axis=0)
     expert_parts = {}
@@ -109,7 +121,7 @@ def report(directory, start, stop):
                                         mean_active_ranks_per_layer=float((counts > 0).sum(axis=0).mean()),
                                         counts_per_rank_per_token=counts.sum(axis=2).mean(axis=1).tolist()),
                   nested_other={name: stats(all_ranks(name)) for name in
-                                ("LINEAR_QUANT", "LINEAR_ROUND", "NORM", "HC_NORM", "HC_MATVEC", "HC_SPLIT")
+                                ("LINEAR_QUANT", "LINEAR_ROUND", "INT8_INPUT_QUANT", "NORM", "HC_NORM", "HC_MATVEC", "HC_SPLIT")
                                 if name in index},
                   caveat="Parallel reduction remainders include rendezvous and rank skew; nested spans overlap their parents.")
     return result

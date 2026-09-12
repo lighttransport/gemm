@@ -3,32 +3,37 @@
 ## Full text runner
 
 `ds41f_run` executes the real 40-layer model on 12 A64FX nodes, one MPI rank per
-node, with MPI startup/bootstrap and uTofu runtime communication. Expert weights
+node, with MPI startup/bootstrap and uTofu reductions (optional native MPI broadcasts). Expert weights
 are resident by `expert_id % 12`, dense layers by `layer % 12`, and Engram rows
 remain on `/local`. Do not launch concurrent MPI programs in the allocation.
 
-The latest measured single-request decode is **5.799 tok/s at approximately
-1K history** (positions 1000–1104), up from 3.451 tok/s before profiling and
-optimization. Enable `--engram-prefetch` for this result. All 1,105 token steps
-and nine saved logit arrays match the baseline exactly. Work is paused after
-Engram prefetch and the sparse-attention loop update; the 20+ tok/s target
-remains open. See [the measurements and resume checkpoint](../doc/ds41f.md#completed-optimization-checkpoint-2026-09-12).
+The measured exact FP8 path reaches **6.920 tok/s at approximately 1K history**
+(positions 1000–1104), compared with 5.765 tok/s on the same allocation before
+the latest changes. Enable `--engram-prefetch --engram-scale-cache --hc-mix-sve
+--shared-overlap --weights-local-pages --mpi-broadcast` for this result. All 1,105 token steps and nine saved logit
+arrays match the baseline exactly. Optimization has resumed, including an
+experimental FP8-to-INT8 SDOT path measures **10.36–10.39 tok/s** in two
+profiling-disabled repeats with the additional `--fp8-int8-block 32` flag
+(10.208 tok/s with profiling). The 20+ tok/s target
+remains open, and INT8 fails the full-model numerical gates.
+See [the resumed measurements](../doc/ds41f.md#resumed-int8-optimization-job-51569201).
 
-The initial stage and dense ownership phase are complete for job 51562789.
+The initial stage and dense ownership phase are complete for job 51569201.
 From a **new shared results directory** inside that allocation:
 
 ```sh
 env XOS_MMM_L_PAGING_POLICY=demand:demand:demand \
   OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
   mpiexec -np 12 /absolute/repo/a64fx/ds41f/ds41f_run \
-  --stage-root /local/u14346/ds41f-51562789 \
+  --stage-root /local/u14346/ds41f-51569201 \
   --prompt-ids /absolute/path/prompt.ids --generate 32 --max-context 4096
 ```
 
 Prompt files contain whitespace-separated token IDs. Prefix plain text with BOS
 ID 0; EOS is ID 1. `--ignore-eos` is an explicit benchmark option. `--trace`
 records per-layer residual norms/routes. `--logits-prefix PATH` writes FP32
-logits, optionally bounded by `--logits-count N`. Disable these diagnostics for
+logits, optionally bounded by `--logits-start P --logits-count N` (start defaults
+to zero). Disable these diagnostics for
 speed measurements. Rank-local logs are `inference.rank00.log` through `11`.
 
 For bounded operator profiling, add `--profile-start 16 --profile-count 1089`
@@ -63,10 +68,80 @@ preempts a receiver. Profiling state is
 thread-local; `ENGRAM_PREFETCH` reports overlapping background work and
 must not be added to the decode critical path.
 
+`--engram-scale-cache` retains each node's two original Engram scale shards
+(about 512 MB total) in HBM, removing the scale-file read from each row lookup.
+Loading is chunked with page-cache eviction, and admission preserves the
+2 GiB MemAvailable floor. `--hc-mix-sve` vectorizes the FP64 norm used by mHC;
+the original matrix-reduction order is retained. `--shared-overlap` computes
+the owner's shared expert before the routed-expert reduction, with the same
+48-thread team. Its output is still added after that reduction. The profile
+reports `EXPERTS_AND_SHARED` as one parallel stage when this option is used.
+
+`--weights-local-pages` allocates original resident tensors on fresh anonymous
+pages before the existing bounded `/local` reads. INT8 packed weights always
+use fresh pages. This bypasses the Fugaku malloc pool so conversion's parallel
+first writes can place rows near their consuming CMG. It is anonymous HBM,
+not a file-backed model mapping. Reusing pooled pages had placed entire output
+matrices on one CMG and limited INT8 decode to about 8.3 tok/s. The attention
+row scratch buffer is now allocated once and reused.
+A matched original-weight pool control reaches 10.20 tok/s versus 10.36–10.39
+with fresh original weights, and has about 0.42 GB less final memory headroom.
+
+`--mpi-broadcast` uses MPI_Bcast for owner-produced activations and retains
+uTofu sums for experts/Engram. It preserves the old broadcast's signed-zero
+normalization and runs only on the main thread. `test_broadcast` checks both
+modes with all 12 owners, delayed receivers and sizes crossing the chunk
+boundary. Selection tests cover first-tie behavior and nonfinite rejection;
+the SVE vocabulary argmax and parallel gate scoring retain the scalar choices.
+
+### Experimental INT8 projections
+
+`--fp8-int8-block 32` requantizes resident FP8 matrices to signed INT8 with
+per-row, per-K-block FP32 scales, then uses SVE SDOT for decode GEMV, including
+the grouped output projection. Blocks 64, 128 and 256 are also accepted;
+zero/default keeps FP8. `--fp8-int8-scope projections` limits conversion to
+attention `wq_b`, `wo_a`, `wo_b` and shared experts; the default scope is `all`.
+Original FP8 activation quantization and BF16 output boundaries remain in place.
+This is a single-token GEMV implementation; batched INT8 GEMM is not integrated.
+
+Conversion happens once after loading from `/local`, releasing each original
+FP8 tensor as its packed replacement becomes ready. Block 32 adds 12.5% scale
+storage plus at most three padded rows. Admission includes the transient source
+and destination tensor; when the source uses a malloc pool, it conservatively
+budgets all replacements because freed source pages may remain pooled. Full-model conversion takes 0.27–0.50 s/rank
+versus 53–57 s resident startup, so no offline INT8 weight files are required.
+The original shared-storage weights remain the source of truth.
+
+INT8 is lossy and remains opt-in. On identical fixed-token history, next-token
+choices match at 1,065/1,105 positions overall and 104/105 positions near 1K.
+All nine saved near-1K argmax choices agree, but minimum logit cosine is 0.902770
+and maximum relative RMS is 44.0%, failing the 0.999/1% gates. Narrowing the conversion scope and adding a second residual INT8 plane
+did not resolve that drift; the residual-plane experiment is not retained.
+Do not present INT8 throughput as a numerically accepted replacement for FP8.
+
+Use `test_int8` for SDOT/reference, grouped-shape, tail and invalid-input checks;
+`bench_int8 STAGE BASE ROWS COLS BLOCK GROUP_ROWS` measures an actual staged
+matrix. `test_int8_attention STAGE DUMP_PREFIX LAYER POSITIONS BLOCK` reports
+same-input attention comparisons (its exit gate is cosine >= 0.999 only).
+For full-run comparisons with identical input history, including generated
+inputs, use:
+
+```sh
+OPENBLAS_NUM_THREADS=2 python3 a64fx/ds41f/compare_run_logits.py BASELINE ACTUAL \
+  --start 1000 --count 9 --json ACTUAL/comparison-1k.json
+```
+
+Capture that range in both runs and replay the same fixed token history.
+The comparison rejects missing/divergent histories and checks cosine >= 0.999,
+relative RMS <= 0.01 and matching argmax. `--require-exact` additionally checks
+the FP32 bit patterns. The existing `compare_logits.py` independently compares
+CPU-reference prefixes and retains its original interface.
+
 The sparse-attention weighted-value loop processes four SVE vectors at once,
 using a full A64FX cache line per selected row while preserving each output
 lane's accumulation order. Short dimensions retain the predicated tail path.
-Dense FP8 and routed MXFP4 weights retain their compressed representation.
+The default FP8 path and routed MXFP4 experts retain their checkpoint
+representation; the experimental INT8 path replaces only FP8 matrices.
 
 For operator debugging, `--dump-prefix PATH --dump-count N` records the first
 N positions (default 1, maximum 64) in owner-written

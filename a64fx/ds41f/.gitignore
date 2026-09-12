@@ -18,3 +18,13 @@
 /bench_quant
 /bench_attention_kernel
 /bench_hardware
+
+/test_int8
+/bench_int8
+/test_int8_attention
+/test_mhc_mix
+/test_rope_layout
+/test_tensor_local
+
+/test_broadcast
+/test_selection

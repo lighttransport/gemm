@@ -6,6 +6,55 @@
 #include <arm_sve.h>
 #endif
 static float sigmoid(float x) {return x>=0?1/(1+expf(-x)):expf(x)/(1+expf(x));}
+int ds41f_argmax_finite(const float *x,size_t n,size_t *index)
+{
+    if(!x||!n||!index)return EINVAL;
+    #if defined(__ARM_FEATURE_SVE)
+    svfloat32_t maximum=svdup_f32(-INFINITY);
+    for(size_t i=0;i<n;i+=svcntw()){
+        svbool_t pg=svwhilelt_b32(i,n);svfloat32_t v=svld1_f32(pg,x+i);
+        if(svptest_any(pg,svcmpge_n_f32(pg,svabs_f32_x(pg,v),INFINITY))||
+           svptest_any(pg,svcmpuo_f32(pg,v,v)))return EDOM;
+        maximum=svmax_f32_m(pg,maximum,v);
+    }
+    float best=svmaxv_f32(svptrue_b32(),maximum);
+    for(size_t i=0;i<n;i+=svcntw()){
+        svbool_t pg=svwhilelt_b32(i,n);
+        if(svptest_any(pg,svcmpeq_n_f32(pg,svld1_f32(pg,x+i),best))){
+            for(size_t j=i;j<n&&j<i+svcntw();++j)if(x[j]==best){*index=j;return 0;}
+        }
+    }
+    return EDOM;
+    #else
+    size_t best=0;
+    for(size_t i=0;i<n;++i){if(!isfinite(x[i]))return EDOM;if(x[i]>x[best])best=i;}
+    *index=best;return 0;
+    #endif
+}
+float ds41f_hc_inverse_rms(const float *x,size_t n)
+{
+    if(!n)return 0;
+    double ss=0;size_t i=0;
+    #if defined(__ARM_FEATURE_SVE)
+    if(svcntw()==16){
+        svbool_t pg=svptrue_b64(),p8=svptrue_pat_b32(SV_VL8);
+        svfloat64_t a=svdup_f64(0),b=a,c=a,d=a;
+        #define HC_LOAD8(offset) svcvt_f64_f32_x(pg,svreinterpret_f32_u64( \
+            svunpklo_u64(svreinterpret_u32_f32(svld1_f32(p8,x+i+(offset))))))
+        for(;i+32<=n;i+=32){
+            svfloat64_t x0=HC_LOAD8(0),x1=HC_LOAD8(8),x2=HC_LOAD8(16),x3=HC_LOAD8(24);
+            a=svmla_f64_x(pg,a,x0,x0);b=svmla_f64_x(pg,b,x1,x1);
+            c=svmla_f64_x(pg,c,x2,x2);d=svmla_f64_x(pg,d,x3,x3);
+        }
+        for(;i+8<=n;i+=8){svfloat64_t v=HC_LOAD8(0);a=svmla_f64_x(pg,a,v,v);}
+        #undef HC_LOAD8
+        ss=svaddv_f64(pg,svadd_f64_x(pg,svadd_f64_x(pg,a,b),svadd_f64_x(pg,c,d)));
+    }
+    #endif
+    for(;i<n;++i)ss+=(double)x[i]*x[i];
+    return (float)(1/sqrt(ss/n+1e-20));
+}
+
 void ds41f_swiglu(float *out,const float *gate,const float *up,size_t n,float limit)
 {
     #pragma omp parallel for schedule(static) if(n>=512)
@@ -21,10 +70,13 @@ int ds41f_gate(const float *logits,const float *bias,int experts,int k,
        !isfinite(temperature)||temperature<=0||!isfinite(route_scale))return EINVAL;
     float *scores=malloc((size_t)experts*sizeof(float));
     if(!scores)return ENOMEM;
+    int invalid=0;
+    #pragma omp parallel for schedule(static) if(experts>=384) reduction(|:invalid)
     for(int i=0;i<experts;++i){float x=logits[i]/temperature;
-        if(!isfinite(x)||!isfinite(bias[i])){free(scores);return EDOM;}
+        if(!isfinite(x)||!isfinite(bias[i])){invalid=1;scores[i]=0;continue;}
         scores[i]=sqrtf(fmaxf(x,0)+log1pf(expf(-fabsf(x))));
     }
+    if(invalid){free(scores);return EDOM;}
     float sum=0;
     for(int j=0;j<k;++j){int best=-1;
         for(int i=0;i<experts;++i){int used=0;for(int p=0;p<j;++p)if(ids[p]==i)used=1;
@@ -85,6 +137,17 @@ void ds41f_rope(float *x,size_t heads,size_t dim,size_t rd,size_t pos,
     double low=0,high=0;
     if(original){low=fmax(floor(rd*log(original/(32*2*pi))/(2*log(theta))),0);
         high=fmin(ceil(rd*log(original/(2*pi))/(2*log(theta))),rd-1);}
+    if(rd==64){double cosine[32],sine[32];
+        for(size_t j=0;j<32;++j){double freq=pow(theta,-2.0*j/rd);
+            if(original){double ramp=fmax(0,fmin(1,(j-low)/fmax(high-low,1e-3)));freq*=1-ramp+ramp/factor;}
+            double angle=pos*freq*(inverse?-1:1);cosine[j]=cos(angle);sine[j]=sin(angle);}
+        /* Complete each head's contiguous cache line before moving to the
+         * next head; every element keeps the original double arithmetic. */
+        for(size_t h=0;h<heads;++h)for(size_t j=0;j<32;++j){
+            size_t i=h*dim+dim-rd+2*j;float a=x[i],b=x[i+1];double c=cosine[j],s=sine[j];
+            x[i]=(float)(a*c-b*s);x[i+1]=(float)(a*s+b*c);}
+        return;
+    }
     for(size_t j=0;j<rd/2;++j){double freq=pow(theta,-2.0*j/rd);
         if(original){double ramp=fmax(0,fmin(1,(j-low)/fmax(high-low,1e-3)));freq*=1-ramp+ramp/factor;}
         double angle=pos*freq*(inverse?-1:1),c=cos(angle),s=sin(angle);

@@ -24,6 +24,7 @@ static ds41f_weights weights;
 static ds41f_attention attention;
 static ds41f_engram engram;
 static ds41f_prefetch *prefetch;
+static int hc_mix_sve, shared_overlap;
 static double profile_attention,profile_expert,profile_shared,profile_head;
 static const char *dump_prefix;
 static size_t dump_count=1;
@@ -62,13 +63,16 @@ static void mixes(int layer,const char *kind,const float *h,float pre[4],float p
     char name[192];snprintf(name,sizeof name,"layers.%d.hc_%s_fn",layer,kind);
     const ds41f_weight *fn=tensor(name);
     if(strcmp(fn->dtype,"F32")||fn->rows!=24||fn->cols!=20480)ds41f_comm_abort("HC fn geometry",EINVAL);
-    double pt=P_BEGIN(),ss=0;for(int i=0;i<20480;++i)ss+=(double)h[i]*h[i];float inv=(float)(1/sqrt(ss/20480+1e-20));
+    double pt=P_BEGIN();float inv;
+    if(hc_mix_sve)inv=ds41f_hc_inverse_rms(h,20480);
+    else{double ss=0;for(int i=0;i<20480;++i)ss+=(double)h[i]*h[i];inv=(float)(1/sqrt(ss/20480+1e-20));}
     P_END(HC_NORM,pt);pt=P_BEGIN();P_VALUE(F32_BYTES,fn->bytes);
     float mix[24];
-    #pragma omp parallel for
-    for(int r=0;r<24;++r){float sum=0;const float *w=(float *)fn->data+(size_t)r*20480;
-        #pragma omp simd reduction(+:sum)
-        for(int i=0;i<20480;++i)sum+=w[i]*h[i];mix[r]=sum*inv;}
+    {
+        #pragma omp parallel for
+        for(int r=0;r<24;++r){float sum=0;const float *w=(float *)fn->data+(size_t)r*20480;
+            #pragma omp simd reduction(+:sum)
+            for(int i=0;i<20480;++i)sum+=w[i]*h[i];mix[r]=sum*inv;}}
     P_END(HC_MATVEC,pt);P_END(LINEAR_F32,pt);pt=P_BEGIN();
     snprintf(name,sizeof name,"layers.%d.hc_%s_base",layer,kind);const float *base=tensor(name)->data;
     snprintf(name,sizeof name,"layers.%d.hc_%s_scale",layer,kind);const float *scale=tensor(name)->data;
@@ -117,7 +121,7 @@ static void local_experts(int layer,const float *input,const float route[12],flo
 {
     memset(out,0,5120*sizeof(float));float scratch[3*2304+5120],value[5120];
     for(int k=0;k<6;++k){int id=(int)route[k];if(id%12!=rank)continue;
-        ds41f_expert e={0};char name[192];
+        ds41f_expert e={{0},{0}};char name[192];
         for(int i=0;i<3;++i){snprintf(name,sizeof name,"layers.%d.ffn.experts.%d.w%d.weight",layer,id,i+1);e.weight[i]=tensor(name)->data;
             snprintf(name,sizeof name,"layers.%d.ffn.experts.%d.w%d.scale",layer,id,i+1);e.scale[i]=tensor(name)->data;}
         CHECK(ds41f_expert_forward(&e,value,input,route[k+6],scratch,0));
@@ -180,8 +184,13 @@ static int forward(int token,size_t pos,int trace,const char *logits_path)
         pt=P_BEGIN();sync_attention(layer,pos);P_END(ATTN_SYNC,pt);
         pt=P_BEGIN();ds41f_comm_broadcast(ffn_packet,5132,owner);P_END(FFN_BCAST,pt);
         float combined[5120];double phase_start=now();pt=P_BEGIN();local_experts(layer,ffn_input,route,combined);P_END(EXPERTS,pt);profile_expert+=now()-phase_start;
+        float shared[5120];
+        /* Use the same owner thread team before the rendezvous. The shared
+         * output is still added after the routed sum, preserving its rounding. */
+        if(shared_overlap&&rank==owner){pt=P_BEGIN();shared_expert(layer,ffn_input,shared);P_END(SHARED_OVERLAP,pt);}
         pt=P_BEGIN();ds41f_comm_sum(combined,5120);P_END(EXPERT_SUM,pt);
-        if(rank==owner){phase_start=now();pt=P_BEGIN();float shared[5120];shared_expert(layer,ffn_input,shared);
+        if(rank==owner){phase_start=now();pt=P_BEGIN();
+            if(!shared_overlap)shared_expert(layer,ffn_input,shared);
             for(int j=0;j<5120;++j)combined[j]+=shared[j];
             ds41f_round_bf16(combined,5120);P_END(SHARED_EXPERT,pt);
             dump_record(dump,"ffn_output",combined,5120);
@@ -196,13 +205,13 @@ static int forward(int token,size_t pos,int trace,const char *logits_path)
     ds41f_profile_at(pos,40);float next=0;
     if(rank==11){double phase_start=now();pt=P_BEGIN();float x[5120];ds41f_hc_pre(x,h,pre_mix,5120);ds41f_round_bf16(x,5120);CHECK(ds41f_norm(&weights,"norm.weight",x,x));P_END(HEAD_PRE,pt);
         float *logits=malloc(129280*sizeof(float));if(!logits)ds41f_comm_abort("logits",ENOMEM);
-        pt=P_BEGIN();CHECK(ds41f_linear(&weights,"head",logits,x,1));P_END(HEAD_LINEAR,pt);pt=P_BEGIN();int best=0;
-        for(int i=0;i<129280;++i){if(!isfinite(logits[i]))ds41f_comm_abort("nonfinite logits",EDOM);if(logits[i]>logits[best])best=i;}
+        pt=P_BEGIN();CHECK(ds41f_linear(&weights,"head",logits,x,1));P_END(HEAD_LINEAR,pt);pt=P_BEGIN();size_t best;
+        CHECK(ds41f_argmax_finite(logits,129280,&best));
         P_END(HEAD_SELECT,pt);
         if(logits_path){char path[4096];snprintf(path,sizeof path,"%s.pos%zu.bin",logits_path,pos);FILE *f=fopen(path,"wb");
             if(!f||fwrite(logits,sizeof(float),129280,f)!=129280)ds41f_comm_abort("write logits",EIO);
             fclose(f);}
-        next=(float)best;fprintf(stderr,"LOGITS pos=%zu argmax=%d value=%g\n",pos,best,logits[best]);free(logits);profile_head+=now()-phase_start;}
+        next=(float)best;fprintf(stderr,"LOGITS pos=%zu argmax=%zu value=%g\n",pos,best,logits[best]);free(logits);profile_head+=now()-phase_start;}
     pt=P_BEGIN();ds41f_comm_broadcast(&next,1,11);P_END(NEXT_BCAST,pt);P_END(TOKEN,token_start);return (int)next;
 }
 int main(int argc,char **argv)
@@ -216,24 +225,37 @@ int main(int argc,char **argv)
     {int tid=omp_get_thread_num();if(tid<48)cpu[tid]=sched_getcpu();}
     int unique=0;for(int i=0;i<48;++i){int seen=0;for(int j=0;j<i;++j)if(cpu[j]==cpu[i])seen=1;if(cpu[i]>=0&&!seen)++unique;}
     fprintf(stderr,"THREADS max=%d distinct_cpus=%d\n",omp_get_max_threads(),unique);
-    const char *root=NULL,*prompt=NULL,*logits_path=NULL;size_t capacity=4096,logits_count=SIZE_MAX,profile_start=SIZE_MAX,profile_count=0;int generate=1,trace=0,ignore_eos=0,prefetch_engram=0;
+    const char *root=NULL,*prompt=NULL,*logits_path=NULL;size_t capacity=4096,logits_count=SIZE_MAX,logits_start=0,profile_start=SIZE_MAX,profile_count=0,int8_block=0;int generate=1,trace=0,ignore_eos=0,prefetch_engram=0,int8_projections=0,engram_scale_cache=0,weights_local_pages=0;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--stage-root")&&i+1<argc)root=argv[++i];
         else if(!strcmp(argv[i],"--prompt-ids")&&i+1<argc)prompt=argv[++i];
         else if(!strcmp(argv[i],"--max-context")&&i+1<argc)capacity=strtoul(argv[++i],NULL,10);
         else if(!strcmp(argv[i],"--generate")&&i+1<argc)generate=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--logits-prefix")&&i+1<argc)logits_path=argv[++i];
+        else if(!strcmp(argv[i],"--logits-start")&&i+1<argc)logits_start=strtoul(argv[++i],NULL,10);
         else if(!strcmp(argv[i],"--logits-count")&&i+1<argc)logits_count=strtoul(argv[++i],NULL,10);
         else if(!strcmp(argv[i],"--dump-prefix")&&i+1<argc)dump_prefix=argv[++i];
         else if(!strcmp(argv[i],"--dump-count")&&i+1<argc)dump_count=strtoul(argv[++i],NULL,10);
         else if(!strcmp(argv[i],"--profile-start")&&i+1<argc)profile_start=strtoul(argv[++i],NULL,10);
         else if(!strcmp(argv[i],"--profile-count")&&i+1<argc)profile_count=strtoul(argv[++i],NULL,10);
+        else if(!strcmp(argv[i],"--fp8-int8-block")&&i+1<argc)int8_block=strtoul(argv[++i],NULL,10);
+        else if(!strcmp(argv[i],"--fp8-int8-scope")&&i+1<argc){const char *scope=argv[++i];
+            if(!strcmp(scope,"all"))int8_projections=0;
+            else if(!strcmp(scope,"projections"))int8_projections=1;
+            else ds41f_comm_abort("FP8 INT8 scope must be all or projections",EINVAL);}
         else if(!strcmp(argv[i],"--trace"))trace=1;
         else if(!strcmp(argv[i],"--ignore-eos"))ignore_eos=1;
         else if(!strcmp(argv[i],"--engram-prefetch"))prefetch_engram=1;
+        else if(!strcmp(argv[i],"--engram-scale-cache"))engram_scale_cache=1;
+        else if(!strcmp(argv[i],"--hc-mix-sve"))hc_mix_sve=1;
+        else if(!strcmp(argv[i],"--shared-overlap"))shared_overlap=1;
+        else if(!strcmp(argv[i],"--weights-local-pages"))weights_local_pages=1;
+        else if(!strcmp(argv[i],"--mpi-broadcast"))ds41f_comm_use_mpi_broadcast(1);
         else ds41f_comm_abort("unknown/missing option",EINVAL);}
     if(!root||!prompt||!capacity||capacity>1048576||generate<1)ds41f_comm_abort("required --stage-root --prompt-ids; valid context/generate",EINVAL);
     if(!dump_count||dump_count>64)ds41f_comm_abort("dump count must be in [1,64]",EINVAL);
+    if(int8_block&&int8_block!=32&&int8_block!=64&&int8_block!=128&&int8_block!=256)
+        ds41f_comm_abort("FP8 INT8 block must be 0,32,64,128,256",EINVAL);
     int *tokens=malloc(capacity*sizeof(int));if(!tokens)ds41f_comm_abort("prompt allocation",ENOMEM);
     FILE *f=fopen(prompt,"r");if(!f)ds41f_comm_abort("prompt open",errno);
     size_t count=0;int token;
@@ -246,14 +268,21 @@ int main(int argc,char **argv)
     char stage[4096];snprintf(stage,sizeof stage,"%s/rank%d",root,rank);
     size_t memory=available(),reserve=(size_t)4*1024*1024*1024;
     if(memory<=reserve)ds41f_comm_abort("insufficient MemAvailable",ENOMEM);
-    double start=now();CHECK(ds41f_weights_load(&weights,stage,NULL,memory-reserve));
+    double start=now();CHECK(ds41f_weights_load_local(&weights,stage,NULL,memory-reserve,weights_local_pages));
+    if(int8_block){double quant_start=now();CHECK(ds41f_weights_requantize_fp8(&weights,int8_block,memory-reserve,int8_projections));
+        fprintf(stderr,"FP8_INT8_READY rank=%d seconds=%.6f available=%zu\n",rank,now()-quant_start,available());}
     CHECK(ds41f_attention_init(&attention,capacity));CHECK(ds41f_engram_open(&engram,stage,rank,12));
+    if(engram_scale_cache){size_t headroom=available();double cache_start=now();
+        if(headroom<=(size_t)2*1024*1024*1024)ds41f_comm_abort("Engram scale cache memory guard",ENOMEM);
+        CHECK(ds41f_engram_cache_scales(&engram,headroom-(size_t)2*1024*1024*1024));
+        fprintf(stderr,"ENGRAM_SCALE_CACHE_READY rank=%d bytes=%llu seconds=%.6f available=%zu\n",rank,
+            (unsigned long long)((engram.table[0].owned_rows+engram.table[1].owned_rows)*8),now()-cache_start,available());}
     if(prefetch_engram)CHECK(ds41f_prefetch_create(&prefetch,&engram));
     fprintf(stderr,"RESIDENT_READY rank=%d bytes=%zu seconds=%.3f available=%zu\n",rank,weights.bytes,now()-start,available());
     if(available()<(size_t)2*1024*1024*1024)ds41f_comm_abort("post-load memory guard",ENOMEM);
     ds41f_comm_ready();start=now();int next=0,produced=0;
     for(size_t pos=0;pos<count+(size_t)generate-1;++pos){int input=pos<count?tokens[pos]:next;double t=now();
-        next=forward(input,pos,trace,pos<logits_count?logits_path:NULL);
+        next=forward(input,pos,trace,pos>=logits_start&&pos-logits_start<logits_count?logits_path:NULL);
         if(pos+1>=count)++produced;
         if(rank==0){fprintf(stderr,"TOKEN pos=%zu input=%d next=%d seconds=%.6f\n",pos,input,next,now()-t);
             if(pos+1>=count){printf("%d\n",next);fflush(stdout);}}

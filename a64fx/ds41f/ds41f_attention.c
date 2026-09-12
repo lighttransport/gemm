@@ -34,11 +34,12 @@ int ds41f_attention_init(ds41f_attention *s,size_t capacity)
             ((volatile uint8_t *)s->compressed[i])[page*4096]=0;
     }
     s->window=calloc((size_t)40*128*512,sizeof(float));
+    s->rows=malloc((size_t)640*512*sizeof(float));
     s->candidate_blocks=calloc((capacity+7)/8,1);
-    if(!s->window||!s->candidate_blocks){ds41f_attention_free(s);return ENOMEM;}return 0;
+    if(!s->window||!s->rows||!s->candidate_blocks){ds41f_attention_free(s);return ENOMEM;}return 0;
 }
 void ds41f_attention_free(ds41f_attention *s)
-{if(!s)return;for(int i=0;i<4;++i)free(s->compressed[i]);free(s->window);free(s->candidate_blocks);memset(s,0,sizeof *s);}
+{if(!s)return;for(int i=0;i<4;++i)free(s->compressed[i]);free(s->window);free(s->rows);free(s->candidate_blocks);memset(s,0,sizeof *s);}
 int ds41f_attention_receive(ds41f_attention *s,int layer,size_t pos,const uint8_t row[356])
 {
     if(!s||!row||pos>=s->capacity||layer<0||layer>=40)return EINVAL;
@@ -104,13 +105,15 @@ static int grouped_output(const ds41f_weights *w,int layer,float *out,const floa
     const ds41f_weight *scale=ds41f_weight_find(w,name);
     if(!weight||!scale||strcmp(weight->dtype,"F8_E4M3")||weight->rows!=8192||weight->cols!=4096||scale->bytes!=256*128)return EINVAL;
     double pt=P_BEGIN();
-    P_VALUE(FP8_BYTES,weight->bytes+scale->bytes);
-    CHECK(ds41f_fp8_grouped_matvec(out,weight->data,scale->data,x,8,1024,4096));P_END(LINEAR_FP8,pt);
+    if(weight->int8.weight){P_VALUE(INT8_BYTES,weight->int8.bytes);
+        CHECK(ds41f_int8_matvec(out,&weight->int8,x,1024,0));P_END(LINEAR_INT8,pt);}
+    else{P_VALUE(FP8_BYTES,weight->bytes+scale->bytes);
+        CHECK(ds41f_fp8_grouped_matvec(out,weight->data,scale->data,x,8,1024,4096));P_END(LINEAR_FP8,pt);}
     pt=P_BEGIN();ds41f_round_bf16(out,8192);P_END(LINEAR_ROUND,pt);return 0;
 }
 int ds41f_attention_step(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,const float *x,float *out)
 {
-    if(!s||!w||!x||!out||layer<0||layer>=40||pos>=s->capacity)return EINVAL;
+    if(!s||!w||!x||!out||!s->rows||layer<0||layer>=40||pos>=s->capacity)return EINVAL;
     float qr[1280],q[64*512],kv[512],attended[64*512],projected[8192];
     double pt=P_BEGIN();CHECK(linear(w,layer,"wq_a",qr,x,0));CHECK(norm(w,layer,"q_norm",qr,qr));P_END(ATTN_QA,pt);
     pt=P_BEGIN();CHECK(linear(w,layer,"wq_b",q,qr,0));P_END(ATTN_QB,pt);
@@ -125,7 +128,8 @@ int ds41f_attention_step(ds41f_attention *s,const ds41f_weights *w,int layer,siz
     if(is_index(layer))CHECK(select_positions(s,w,layer,pos,x,qr));
     P_END(ATTN_INDEX,pt);pt=P_BEGIN();
     size_t raw_count=pos<128?pos+1:128,extra=layer<2?0:s->selected_count;
-    float *rows=malloc((raw_count+extra)*512*sizeof(float));if(!rows)return ENOMEM;
+    if(extra>512)return EINVAL;
+    float *rows=s->rows;
     int ids[128+512];
     for(size_t i=0;i<raw_count;++i){size_t token=pos+1-raw_count+i;
         memcpy(rows+i*512,window+(token%128)*512,512*sizeof(float));ids[i]=(int)i;}
@@ -135,10 +139,10 @@ int ds41f_attention_step(ds41f_attention *s,const ds41f_weights *w,int layer,siz
         ids[raw_count+i]=(int)(raw_count+i);}
     char name[192];snprintf(name,sizeof name,"layers.%d.attn.attn_sink",layer);
     const ds41f_weight *sink=ds41f_weight_find(w,name);
-    if(!sink||sink->bytes!=64*4){free(rows);return EINVAL;}
+    if(!sink||sink->bytes!=64*4)return EINVAL;
     P_END(ATTN_ROWS,pt);pt=P_BEGIN();
     int rc=ds41f_sparse_attention(attended,q,rows,sink->data,ids,raw_count+extra,raw_count+extra,64,512);
-    free(rows);if(rc)return rc;P_END(ATTN_SPARSE,pt);pt=P_BEGIN();
+    if(rc)return rc;P_END(ATTN_SPARSE,pt);pt=P_BEGIN();
     ds41f_round_bf16(attended,64*512);rope(attended,64,512,layer,pos,1);
     P_END(ATTN_INVERSE_ROPE,pt);pt=P_BEGIN();CHECK(grouped_output(w,layer,projected,attended));P_END(ATTN_WOA,pt);
     pt=P_BEGIN();rc=linear(w,layer,"wo_b",out,projected,0);P_END(ATTN_WOB,pt);return rc;

@@ -27,16 +27,27 @@ int main(int argc,char **argv)
                 if(write(fd,bytes,n)!=(ssize_t)n)return 2;}
         }
     }
+    uint16_t golden[2][32][256];
+    for(int slot=0;slot<2;++slot)for(int row=0;row<32;++row)
+        if(ds41f_engram_read_local(e,slot,(uint64_t)row+7,golden[slot][row]))return 1;
     ds41f_prefetch *p=NULL;if(ds41f_prefetch_create(&p,e)||ds41f_profile_init(0,1))return 1;
     float expected[2][24*256],actual[24*256];uint64_t ids[2][24];
     const uint64_t (*request_ids)[24]=(const uint64_t (*)[24])ids;
     if(ds41f_prefetch_wait(p,0,actual,NULL)!=EINVAL)return 1;
     for(int generation=0;generation<96;++generation){
+        if(generation==48){
+            ds41f_prefetch_destroy(p);p=NULL;
+            if(ds41f_engram_cache_scales(e,511)!=ENOMEM||e->table[0].scale_cache||e->table[1].scale_cache)return 1;
+            if(ds41f_engram_cache_scales(e,512)||ds41f_engram_cache_scales(e,512)!=EINVAL)return 1;
+            /* Cached reads must remain exact without either scale file descriptor. */
+            for(int slot=0;slot<2;++slot){close(e->table[slot].scale_fd);e->table[slot].scale_fd=-1;}
+            if(ds41f_prefetch_create(&p,e))return 1;
+        }
         memset(expected,0,sizeof expected);
         for(int slot=0;slot<2;++slot)for(int i=0;i<24;++i){
             ids[slot][i]=(i%3)?7+(uint64_t)(generation+i+slot)%32:100;
-            if(i%3){uint16_t row[256];if(ds41f_engram_read_local(e,slot,ids[slot][i],row))return 1;
-                for(int j=0;j<256;++j)expected[slot][i*256+j]=ds41f_bf16_to_f32(row[j]);}
+            if(i%3)for(int j=0;j<256;++j)
+                expected[slot][i*256+j]=ds41f_bf16_to_f32(golden[slot][ids[slot][i]-7][j]);
         }
         ds41f_profile_at(0,0);
         if(ds41f_prefetch_submit(p,request_ids))return 1;
@@ -53,5 +64,5 @@ int main(int argc,char **argv)
     ds41f_prefetch_destroy(p);ds41f_profile_free();ds41f_engram_close(e);free(e);
     for(int i=0;i<4;++i)unlink(files[i]);
     rmdir(argv[1]);
-    puts("PREFETCH PASS bit_exact generations=96 remote_zeros short_read_error pending_close profiler_TLS");return 0;
+    puts("PREFETCH PASS bit_exact generations=96 remote_zeros short_read_error pending_close profiler_TLS scale_cache budget cache_only_reads");return 0;
 }

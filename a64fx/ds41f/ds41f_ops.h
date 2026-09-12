@@ -2,6 +2,9 @@
 #define DS41F_OPS_H
 #include <stddef.h>
 /* Single-token reference operations transcribed from inference/model.py. */
+float ds41f_hc_inverse_rms(const float *x,size_t n);
+/* First maximum; reject any nonfinite value and leave index unchanged. */
+int ds41f_argmax_finite(const float *x,size_t n,size_t *index);
 void ds41f_swiglu(float *out,const float *gate,const float *up,size_t n,float limit);
 int ds41f_gate(const float *logits,const float *bias,int experts,int k,
                float temperature,float route_scale,int *ids,float *weights);
