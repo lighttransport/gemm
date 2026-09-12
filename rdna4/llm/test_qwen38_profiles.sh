@@ -184,8 +184,8 @@ grep -q 'LLM_QWEN4_NATIVE_EXPERTS' "${root_dir}/hip_llm_runner.c" || {
     echo 'profile test: native-vs-WMMA expert A/B switch missing' >&2
     exit 1
 }
-grep -q 'LLM_QWEN4_SYNC_EXPERT_COPY' "${root_dir}/hip_llm_runner.c" || {
-    echo 'profile test: expert-copy ordering diagnostic missing' >&2
+grep -q 'hipStreamWaitEvent(r->stream, r->moe_copy_ready\[ev\], 0)' "${root_dir}/hip_llm_runner.c" || {
+    echo 'profile test: direct expert copy not ordered via copy-stream event' >&2
     exit 1
 }
 # Ordered MoE combine and synchronous CPU-result publication.
