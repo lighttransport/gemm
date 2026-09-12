@@ -19,7 +19,7 @@
 #include <omp.h>
 #include <sched.h>
 
-static int rank,ranks,dense_tp=1;
+static int rank,ranks,dense_tp=1,expert_fused;
 static ds41f_weights weights;
 static ds41f_attention attention;
 static ds41f_engram engram;
@@ -123,7 +123,7 @@ static void local_experts(int layer,const float *input,const float route[12],flo
         ds41f_expert e={{0},{0}};char name[192];
         for(int i=0;i<3;++i){snprintf(name,sizeof name,"layers.%d.ffn.experts.%d.w%d.weight",layer,id,i+1);e.weight[i]=tensor(name)->data;
             snprintf(name,sizeof name,"layers.%d.ffn.experts.%d.w%d.scale",layer,id,i+1);e.scale[i]=tensor(name)->data;}
-        CHECK(ds41f_expert_forward(&e,value,input,route[k+6],scratch,0));
+        CHECK(ds41f_expert_forward_fused(&e,value,input,route[k+6],scratch,0,expert_fused));
         for(int i=0;i<5120;++i)out[i]+=value[i];}
 }
 static void shared_expert(int layer,const float *input,float *out)
@@ -270,7 +270,7 @@ int main(int argc,char **argv)
     {int tid=omp_get_thread_num();if(tid<48)cpu[tid]=sched_getcpu();}
     int unique=0;for(int i=0;i<48;++i){int seen=0;for(int j=0;j<i;++j)if(cpu[j]==cpu[i])seen=1;if(cpu[i]>=0&&!seen)++unique;}
     fprintf(stderr,"THREADS max=%d distinct_cpus=%d\n",omp_get_max_threads(),unique);
-    const char *root=NULL,*prompt=NULL,*logits_path=NULL;size_t capacity=4096,logits_count=SIZE_MAX,logits_start=0,profile_start=SIZE_MAX,profile_count=0,int8_block=0;int generate=1,trace=0,ignore_eos=0,prefetch_engram=0,int8_projections=0,engram_scale_cache=0,weights_local_pages=0,sparse_tile=0,sparse_math=0;
+    const char *root=NULL,*prompt=NULL,*logits_path=NULL;size_t capacity=4096,logits_count=SIZE_MAX,logits_start=0,profile_start=SIZE_MAX,profile_count=0,int8_block=0;int generate=1,trace=0,ignore_eos=0,prefetch_engram=0,int8_projections=0,engram_scale_cache=0,weights_local_pages=0,sparse_tile=0,sparse_math=0,attention_local_pages=0,index_head_tiles=0,linear_input_cache=0;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--stage-root")&&i+1<argc)root=argv[++i];
         else if(!strcmp(argv[i],"--prompt-ids")&&i+1<argc)prompt=argv[++i];
@@ -292,6 +292,10 @@ int main(int argc,char **argv)
         else if(!strcmp(argv[i],"--hc-matvec")&&i+1<argc)hc_matvec_mode=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--dense-tp")&&i+1<argc)dense_tp=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--sparse-math")&&i+1<argc)sparse_math=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--expert-fused")&&i+1<argc)expert_fused=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--attention-local-pages"))attention_local_pages=1;
+        else if(!strcmp(argv[i],"--index-head-tiles"))index_head_tiles=1;
+        else if(!strcmp(argv[i],"--linear-input-cache"))linear_input_cache=1;
         else if(!strcmp(argv[i],"--trace"))trace=1;
         else if(!strcmp(argv[i],"--ignore-eos"))ignore_eos=1;
         else if(!strcmp(argv[i],"--engram-prefetch"))prefetch_engram=1;
@@ -313,6 +317,7 @@ int main(int argc,char **argv)
         ds41f_comm_abort("dense TP must be 1,2,4; TP2/TP4 require --shared-overlap",EINVAL);
     ds41f_comm_set_tp(dense_tp);
     if(sparse_math<0||sparse_math>3||(sparse_math&&!sparse_tile))ds41f_comm_abort("sparse math 0..3 requires a tile when nonzero",EINVAL);
+    if(expert_fused<0||expert_fused>2)ds41f_comm_abort("expert fused must be 0,1,2",EINVAL);
     int *tokens=malloc(capacity*sizeof(int));if(!tokens)ds41f_comm_abort("prompt allocation",ENOMEM);
     FILE *f=fopen(prompt,"r");if(!f)ds41f_comm_abort("prompt open",errno);
     size_t count=0;int token;
@@ -329,7 +334,10 @@ int main(int argc,char **argv)
     CHECK(ds41f_weights_check_tp(&weights,stage,dense_tp,rank));
     if(int8_block){double quant_start=now();CHECK(ds41f_weights_requantize_fp8(&weights,int8_block,memory-reserve,int8_projections));
         fprintf(stderr,"FP8_INT8_READY rank=%d seconds=%.6f available=%zu\n",rank,now()-quant_start,available());}
-    CHECK(ds41f_attention_init(&attention,capacity));attention.sparse_tile=sparse_tile;attention.sparse_math=sparse_math;CHECK(ds41f_engram_open(&engram,stage,rank,12));
+    if(linear_input_cache)CHECK(ds41f_weights_enable_input_cache(&weights));
+    CHECK(ds41f_attention_init(&attention,capacity));attention.sparse_tile=sparse_tile;attention.sparse_math=sparse_math;attention.index_head_tiles=index_head_tiles;
+    if(attention_local_pages)CHECK(ds41f_attention_place_workspace(&attention));
+    CHECK(ds41f_engram_open(&engram,stage,rank,12));
     if(engram_scale_cache){size_t headroom=available();double cache_start=now();
         if(headroom<=(size_t)2*1024*1024*1024)ds41f_comm_abort("Engram scale cache memory guard",ENOMEM);
         CHECK(ds41f_engram_cache_scales(&engram,headroom-(size_t)2*1024*1024*1024));

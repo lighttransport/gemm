@@ -33,10 +33,10 @@ int ds41f_expert_load(ds41f_expert *e,const char *stage,int layer,int id)
     }
     return 0;
 }
-int ds41f_expert_forward(const ds41f_expert *e,float *out,const float *x,
-                          float route_weight,float *scratch,int reference)
+int ds41f_expert_forward_fused(const ds41f_expert *e,float *out,const float *x,
+                          float route_weight,float *scratch,int reference,int fused)
 {
-    if (!e || !out || !x || !scratch) return EINVAL;
+    if (!e || !out || !x || !scratch||fused<0||fused>2) return EINVAL;
     for (int i=0;i<3;++i) if (!e->weight[i] || !e->scale[i]) return EINVAL;
     int (*mv)(float *,const uint8_t *,const uint8_t *,const float *,size_t,size_t)=
         reference?ds41f_mxfp4_matvec_ref:ds41f_mxfp4_matvec;
@@ -46,8 +46,9 @@ int ds41f_expert_forward(const ds41f_expert *e,float *out,const float *x,
     int rc=ds41f_act_quant(input,x,5120);
     if (rc) return rc;
     P_END(EXPERT_QUANT,pt);pt=P_BEGIN();
-    rc=mv(gate,e->weight[0],e->scale[0],input,2304,5120);
-    rc|=mv(up,e->weight[2],e->scale[2],input,2304,5120);
+    if(fused&&!reference)rc=ds41f_mxfp4_matvec_pair(gate,up,e->weight[0],e->scale[0],e->weight[2],e->scale[2],input,2304,5120,fused);
+    else{rc=mv(gate,e->weight[0],e->scale[0],input,2304,5120);
+        rc|=mv(up,e->weight[2],e->scale[2],input,2304,5120);}
     if (rc) return rc;
     P_END(EXPERT_W13,pt);pt=P_BEGIN();
     ds41f_round_bf16(gate,2304);ds41f_round_bf16(up,2304);
@@ -60,3 +61,7 @@ int ds41f_expert_forward(const ds41f_expert *e,float *out,const float *x,
     ds41f_round_bf16(out,5120);
     P_END(EXPERT_ROUND,pt);return rc;
 }
+
+int ds41f_expert_forward(const ds41f_expert *e,float *out,const float *x,
+                          float route_weight,float *scratch,int reference)
+{return ds41f_expert_forward_fused(e,out,x,route_weight,scratch,reference,0);}

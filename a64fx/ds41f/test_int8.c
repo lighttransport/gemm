@@ -33,7 +33,12 @@ int main(void)
             double error=0,norm=0;
             for(size_t r=0;r<rows;++r){double d=got[r]-ref[r];error+=d*d;norm+=(double)ref[r]*ref[r];}
             require(error<=1e-10*fmax(norm,1e-20),"SDOT vs integer/double reference");
-            require(got[rows]==12345,"output canary");++cases;
+            require(got[rows]==12345,"output canary");
+            ds41f_int8_input prepared;
+            require(!ds41f_int8_prepare_input(&prepared,x,(rows/group)*cols,block),"prepare shared input");
+            require(!ds41f_int8_matvec_prepared(ref,&q,&prepared,group,0),"prepared kernel");
+            require(!memcmp(got,ref,rows*sizeof(float)),"prepared kernel bit exact");
+            ds41f_int8_input_free(&prepared);++cases;
         }
         memset(x,0,cols*sizeof(float));require(!ds41f_int8_matvec(got,&q,x,rows,0),"zero input");
         for(size_t r=0;r<rows;++r)require(got[r]==0,"zero result");

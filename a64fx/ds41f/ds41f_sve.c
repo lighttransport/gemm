@@ -220,3 +220,39 @@ int ds41f_fp8_grouped_matvec(float *out,const uint8_t *w,const uint8_t *scale,
     if(!groups||!group_rows||group_rows%32||groups>SIZE_MAX/group_rows)return EINVAL;
     return fp8_matvec_impl(out,w,scale,x,groups*group_rows,cols,group_rows);
 }
+
+int ds41f_mxfp4_matvec_pair(float *gate,float *up,const uint8_t *wg,const uint8_t *sg,
+                           const uint8_t *wu,const uint8_t *su,const float *x,
+                           size_t rows,size_t cols,int tile)
+{
+    if(!gate||!up||!wg||!sg||!wu||!su||!x||!cols||cols%32||(tile!=1&&tile!=2))return EINVAL;
+#if defined(__ARM_FEATURE_SVE)
+    if(svcntw()==16){
+        static const float lut[16]={0,.5f,1,1.5f,2,3,4,6,-0.f,-.5f,-1,-1.5f,-2,-3,-4,-6};
+        #pragma omp parallel for schedule(static)
+        for(size_t r=0;r<rows;r+=(size_t)tile){
+            svbool_t pg=svptrue_b32();svfloat32_t table=svld1_f32(pg,lut);
+            svfloat32_t g0=svdup_f32(0),u0=g0,g1=g0,u1=g0;
+            for(size_t b=0;b<cols/32;++b){
+                svfloat32_t a=svld1_f32(pg,x+b*32),z=svld1_f32(pg,x+b*32+16);
+                svfloat32_t even=svuzp1_f32(a,z),odd=svuzp2_f32(a,z);
+                #define PAIR_DOT(acc,weight,scales,row) { \
+                    svuint32_t raw=svld1ub_u32(pg,(weight)+(row)*(cols/2)+b*16); \
+                    svfloat32_t lo=svtbl_f32(table,svand_n_u32_x(pg,raw,15)); \
+                    svfloat32_t hi=svtbl_f32(table,svlsr_n_u32_x(pg,raw,4)); \
+                    svfloat32_t prod=svmul_f32_x(pg,lo,even); \
+                    prod=svmla_f32_x(pg,prod,hi,odd); \
+                    acc=svmla_n_f32_x(pg,acc,prod,scale_e8m0((scales)[(row)*(cols/32)+b])); }
+                PAIR_DOT(g0,wg,sg,r);PAIR_DOT(u0,wu,su,r);
+                if(tile==2&&r+1<rows){PAIR_DOT(g1,wg,sg,r+1);PAIR_DOT(u1,wu,su,r+1);}
+                #undef PAIR_DOT
+            }
+            gate[r]=svaddv_f32(pg,g0);up[r]=svaddv_f32(pg,u0);
+            if(tile==2&&r+1<rows){gate[r+1]=svaddv_f32(pg,g1);up[r+1]=svaddv_f32(pg,u1);}
+        }
+        return 0;
+    }
+#endif
+    int rc=ds41f_mxfp4_matvec(gate,wg,sg,x,rows,cols);
+    return rc?rc:ds41f_mxfp4_matvec(up,wu,su,x,rows,cols);
+}

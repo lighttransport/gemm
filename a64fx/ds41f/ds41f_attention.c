@@ -1,4 +1,5 @@
 #include "ds41f_attention.h"
+#include "ds41f_alloc.h"
 #include "ds41f_cache.h"
 #include "ds41f_kernels.h"
 #include "ds41f_sve.h"
@@ -9,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 
 #define CHECK(call) do {int check_rc=(call);if(check_rc)return check_rc;} while(0)
 static int source(int layer){return layer<8?0:layer<14?1:layer<20?2:3;}
@@ -44,7 +48,17 @@ int ds41f_attention_init(ds41f_attention *s,size_t capacity)
     if(!s->window||!s->rows||!s->candidate_blocks){ds41f_attention_free(s);return ENOMEM;}return 0;
 }
 void ds41f_attention_free(ds41f_attention *s)
-{if(!s)return;for(int i=0;i<4;++i)free(s->compressed[i]);free(s->window);free(s->rows);free(s->candidate_blocks);memset(s,0,sizeof *s);}
+{if(!s)return;for(int i=0;i<4;++i)free(s->compressed[i]);free(s->window);ds41f_free_resident(s->rows,(size_t)640*512*sizeof(float),s->rows_fresh_pages);free(s->candidate_blocks);memset(s,0,sizeof *s);}
+int ds41f_attention_place_workspace(ds41f_attention *s)
+{
+    if(!s||!s->rows)return EINVAL;
+    if(s->rows_fresh_pages)return 0;
+    size_t bytes=(size_t)640*512*sizeof(float);float *rows=NULL;
+    int rc=ds41f_alloc_resident((void **)&rows,bytes,1);if(rc)return rc;
+    #pragma omp parallel for schedule(static)
+    for(size_t page=0;page<(bytes+4095)/4096;++page)((volatile char *)rows)[page*4096]=0;
+    free(s->rows);s->rows=rows;s->rows_fresh_pages=1;return 0;
+}
 int ds41f_attention_receive(ds41f_attention *s,int layer,size_t pos,const uint8_t row[356])
 {
     if(!s||!row||pos>=s->capacity||layer<0||layer>=40)return EINVAL;
@@ -70,6 +84,58 @@ static int update_source(ds41f_attention *s,const ds41f_weights *w,int layer,siz
     CHECK(ds41f_fp4_pack(s->publication,latent,512,16,1));
     return ds41f_attention_receive(s,layer,pos,s->publication);
 }
+#if defined(__ARM_FEATURE_SVE)
+static svfloat32_t index_bf16(svfloat32_t value)
+{
+    svbool_t pg=svptrue_b32();svuint32_t bits=svreinterpret_u32_f32(value);
+    svuint32_t odd=svand_n_u32_x(pg,svlsr_n_u32_x(pg,bits,16),1);
+    svuint32_t rounded=svadd_u32_x(pg,bits,svadd_n_u32_x(pg,odd,0x7fff));
+    svbool_t nan=svcmpgt_n_u32(pg,svand_n_u32_x(pg,bits,0x7fffffffu),0x7f800000u);
+    rounded=svsel_u32(nan,svorr_n_u32_x(pg,bits,0x00400000u),rounded);
+    return svreinterpret_f32_u32(svand_n_u32_x(pg,rounded,0xffff0000u));
+}
+static float index_dot_heads(const float *packed,const float *key,const float *weights)
+{
+    #if defined(__clang__)
+    #pragma STDC FP_CONTRACT OFF
+    #endif
+    svbool_t pg=svptrue_b32();svfloat32_t a=svdup_f32(0),b=a;
+    /* SIMD lanes are heads. Each lane keeps all 128 ordered FP32 products
+     * and additions, avoiding one ordered horizontal reduction per head. */
+    for(size_t j=0;j<128;++j){
+        svfloat32_t q0=svld1_f32(pg,packed+j*32),q1=svld1_f32(pg,packed+j*32+16);
+        svfloat32_t p0=svmul_n_f32_x(pg,q0,key[j]),p1=svmul_n_f32_x(pg,q1,key[j]);
+        a=svadd_f32_x(pg,a,p0);b=svadd_f32_x(pg,b,p1);
+    }
+    a=svmax_n_f32_x(pg,index_bf16(a),0);b=svmax_n_f32_x(pg,index_bf16(b),0);
+    a=index_bf16(svmul_f32_x(pg,a,svld1_f32(pg,weights)));
+    b=index_bf16(svmul_f32_x(pg,b,svld1_f32(pg,weights+16)));
+    return bf(svadda_f32(pg,svadda_f32(pg,0,a),b));
+}
+#endif
+int ds41f_index_scores(float *scores,const float *q,const float *weights,const uint8_t *rows,
+                       size_t count,const uint8_t *candidates,int head_tiles)
+{
+    if(!scores||!q||!weights||!rows||(head_tiles!=0&&head_tiles!=1))return EINVAL;
+    float packed[128*32];
+    #if defined(__ARM_FEATURE_SVE)
+    if(head_tiles&&svcntw()==16)for(size_t j=0;j<128;++j)for(size_t h=0;h<32;++h)packed[j*32+h]=q[h*128+j];
+    #else
+    (void)packed;
+    #endif
+    #pragma omp parallel for schedule(static)
+    for(size_t i=0;i<count;++i){
+        if(candidates&&!candidates[i/8]){scores[i]=-INFINITY;continue;}
+        float key[128],sum=0;ds41f_fp4_unpack(key,rows+i*356+288,128,32,0);
+        #if defined(__ARM_FEATURE_SVE)
+        if(head_tiles&&svcntw()==16){scores[i]=index_dot_heads(packed,key,weights);continue;}
+        #endif
+        for(int h=0;h<32;++h){float dot=0;
+            for(int j=0;j<128;++j)dot+=q[h*128+j]*key[j];
+            sum+=bf(fmaxf(bf(dot),0)*weights[h]);}scores[i]=bf(sum);
+    }
+    return 0;
+}
 static int select_positions(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,const float *x,const float *qr)
 {
     size_t count=(pos+1)/(layer<20?2:1);s->selected_count=0;if(!count)return 0;
@@ -82,15 +148,7 @@ static int select_positions(ds41f_attention *s,const ds41f_weights *w,int layer,
     float *scores=malloc(count*sizeof(float));if(!scores)return ENOMEM;
     const uint8_t *rows=s->compressed[source(layer)];
     P_END(INDEX_QUERY,pt);pt=P_BEGIN();
-    #pragma omp parallel for schedule(static)
-    for(size_t i=0;i<count;++i){
-        /* Later query sources only score the candidate source's retained
-         * blocks. Do not decode/score up to 1M rows merely to mask them later. */
-        if(layer>20&&!s->candidate_blocks[i/8]){scores[i]=-INFINITY;continue;}
-        float key[128],sum=0;ds41f_fp4_unpack(key,rows+i*356+288,128,32,0);
-        for(int h=0;h<32;++h){float dot=0;
-            for(int j=0;j<128;++j)dot+=q[h*128+j]*key[j];
-            sum+=bf(fmaxf(bf(dot),0)*weights[h]);}scores[i]=bf(sum);}
+    CHECK(ds41f_index_scores(scores,q,weights,rows,count,layer>20?s->candidate_blocks:NULL,s->index_head_tiles));
     P_END(INDEX_SCORE,pt);pt=P_BEGIN();
     if(layer==20){size_t blocks=(count+7)/8;float *block_scores=malloc(blocks*sizeof(float));int *ids=malloc(2048*sizeof(int));
         if(!block_scores||!ids){free(block_scores);free(ids);free(scores);return ENOMEM;}
@@ -110,7 +168,8 @@ static int grouped_output(const ds41f_weights *w,int layer,float *out,const floa
     const ds41f_weight *scale=ds41f_weight_find(w,name);
     if(!weight||!scale||strcmp(weight->dtype,"F8_E4M3")||weight->rows!=groups*1024||weight->cols!=4096||scale->bytes!=groups*32*128)return EINVAL;
     double pt=P_BEGIN();
-    if(weight->int8.weight){P_VALUE(INT8_BYTES,weight->int8.bytes);
+    if(weight->int8.weight&&w->input_cache){CHECK(ds41f_linear_int8_cached(w,weight,out,x,1024,0));}
+    else if(weight->int8.weight){P_VALUE(INT8_BYTES,weight->int8.bytes);
         CHECK(ds41f_int8_matvec(out,&weight->int8,x,1024,0));P_END(LINEAR_INT8,pt);}
     else{P_VALUE(FP8_BYTES,weight->bytes+scale->bytes);
         CHECK(ds41f_fp8_grouped_matvec(out,weight->data,scale->data,x,groups,1024,4096));P_END(LINEAR_FP8,pt);}

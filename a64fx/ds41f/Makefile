@@ -19,6 +19,14 @@ ds41f_run test_attention test_index_candidates test_int8_attention: ds41f_attent
 ds41f_run test_attention test_index_candidates test_int8_attention test_int8 bench_int8 test_staged_expert ds41f_utofu_test: ds41f_alloc.h ds41f_tensor.h
 ds41f_run test_prefetch test_engram: ds41f_engram.h
 ds41f_run: ds41f_comm.h ds41f_ops.h
+test_int8_batch: test_int8_batch.c ds41f_int8_batch.c ds41f_int8.c ds41f_int8.h ds41f_kernels.c
+	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c,$^) -lm -o $@
+test_input_cache test_index_heads: ds41f_weights.h ds41f_int8.h ds41f_alloc.h ds41f_tensor.h ds41f_profile.h
+test_index_heads: ds41f_attention.h ds41f_sparse_sve.h ds41f_exp2.h
+test_input_cache: test_input_cache.c ds41f_weights.c ds41f_tensor.c ds41f_sve.c ds41f_kernels.c ds41f_int8.c
+	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c,$^) -lm -o $@
+test_expert_pair: test_expert_pair.c ds41f_sve.c ds41f_kernels.c ds41f_sve.h
+	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c,$^) -lm -o $@
 test_exp2: test_exp2.c ds41f_ops.c ds41f_ops.h
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c,$^) -lm -o $@
 test_sparse_tiles: test_sparse_tiles.c ds41f_ops.c ds41f_ops.h
@@ -33,6 +41,8 @@ ds41f_run: ds41f_run.c ds41f_comm.c ds41f_attention.c ds41f_weights.c ds41f_tens
 	$(A64FX_MPICC) $(A64FX_CFLAGS) -DDS41F_ENABLE_PROFILE -fopenmp -pthread -I. $(filter %.c %.S,$^) -ltofucom -lm -o $@
 test_attention: test_attention.c ds41f_attention.c ds41f_weights.c ds41f_tensor.c ds41f_cache.c ds41f_kernels.c ds41f_sve.c ds41f_ops.c
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -lm -o $@
+test_index_heads: test_index_heads.c ds41f_attention.c ds41f_weights.c ds41f_tensor.c ds41f_cache.c ds41f_kernels.c ds41f_sve.c ds41f_ops.c ds41f_int8.c
+	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c,$^) -lm -o $@
 test_index_candidates: test_index_candidates.c ds41f_attention.c ds41f_weights.c ds41f_tensor.c ds41f_cache.c ds41f_kernels.c ds41f_sve.c ds41f_ops.c
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -lm -o $@
 test_cache: test_cache.c ds41f_cache.c ds41f_kernels.c
@@ -68,7 +78,7 @@ test_broadcast: test_broadcast.c ds41f_comm.c ds41f_comm.h ../utofu-tests/tp_all
 	$(A64FX_MPICC) $(A64FX_CFLAGS) -I. $(filter %.c,$^) -ltofucom -o $@
 test_selection: test_selection.c ds41f_ops.c ds41f_ops.h
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c,$^) -lm -o $@
-a64fx: test_exp2 test_tp_comm test_sparse_tiles test_broadcast test_selection test_tensor_local test_rope_layout test_mhc_mix test_int8 test_int8_attention bench_int8 ds41f_run ds41f_sve_test ds41f_utofu_test test_attention test_index_candidates test_cache test_ops test_pointwise test_prefetch test_engram test_staged_expert bench_batch bench_quant bench_attention_kernel bench_hardware
+a64fx: test_int8_batch test_input_cache test_index_heads test_expert_pair test_exp2 test_tp_comm test_sparse_tiles test_broadcast test_selection test_tensor_local test_rope_layout test_mhc_mix test_int8 test_int8_attention bench_int8 ds41f_run ds41f_sve_test ds41f_utofu_test test_attention test_index_candidates test_cache test_ops test_pointwise test_prefetch test_engram test_staged_expert bench_batch bench_quant bench_attention_kernel bench_hardware
 
 ds41f_stage: ds41f_stage.c
 	$(CC) $(CFLAGS) -I$(COMMON) $< -o $@
@@ -98,4 +108,4 @@ ds41f_bench_utofu: ds41f_bench.c ds41f_engram.c ds41f_engram.h ../q38fn/ngram_ut
 
 clean:
 	rm -f ds41f_stage ds41f_bench ds41f_bench_utofu ds41f_kernel_test ds41f_sve_test ds41f_utofu_test bench_quant test_ops test_engram test_staged_expert
-	rm -f test_exp2 test_tp_comm test_sparse_tiles test_broadcast test_selection ds41f_run test_attention test_index_candidates test_cache test_pointwise test_rope_layout test_mhc_mix test_tensor_local test_prefetch test_int8 test_int8_attention bench_int8 bench_batch bench_attention_kernel bench_hardware
+	rm -f test_int8_batch test_input_cache test_index_heads test_expert_pair test_exp2 test_tp_comm test_sparse_tiles test_broadcast test_selection ds41f_run test_attention test_index_candidates test_cache test_pointwise test_rope_layout test_mhc_mix test_tensor_local test_prefetch test_int8 test_int8_attention bench_int8 bench_batch bench_attention_kernel bench_hardware

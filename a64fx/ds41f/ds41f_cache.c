@@ -51,6 +51,7 @@ static int ascending(const void *a,const void *b)
 size_t ds41f_select_topk(const float *s,size_t n,size_t k,int *ids)
 {
     size_t used=0;if(!s||!ids||!k)return 0;
+    if(n<=k){for(size_t i=0;i<n;++i)if(!isnan(s[i])&&s[i]!=-INFINITY)ids[used++]=(int)i;return used;}
     for(size_t i=0;i<n;++i){if(isnan(s[i])||s[i]==-INFINITY)continue;
         if(used<k){size_t c=used++;ids[c]=(int)i;
             while(c){size_t p=(c-1)/2;if(!worse(s,ids[c],ids[p]))break;
@@ -60,5 +61,9 @@ size_t ds41f_select_topk(const float *s,size_t n,size_t k,int *ids)
                 if(!worse(s,ids[c],ids[p]))break;
                 int t=ids[p];ids[p]=ids[c];ids[c]=t;p=c;}}
     }
-    qsort(ids,used,sizeof *ids,ascending);return used;
+    if(n<=4096){uint8_t selected[4096]={0};
+        for(size_t i=0;i<used;++i)selected[ids[i]]=1;
+        size_t out=0;for(size_t i=0;i<n;++i)if(selected[i])ids[out++]=(int)i;
+    }else qsort(ids,used,sizeof *ids,ascending);
+    return used;
 }

@@ -8,4 +8,6 @@ void ds41f_expert_free(ds41f_expert *expert);
  * 3*2304+5120 floats and must not alias x/out. */
 int ds41f_expert_forward(const ds41f_expert *expert,float *out,const float *x,
                           float route_weight,float *scratch,int reference);
+int ds41f_expert_forward_fused(const ds41f_expert *e,float *out,const float *x,
+                               float route_weight,float *scratch,int reference,int fused);
 #endif

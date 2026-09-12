@@ -32,3 +32,8 @@
 /test_sparse_tiles
 /test_exp2
 /test_tp_comm
+/test_expert_pair
+/test_index_heads
+/test_input_cache
+
+/test_int8_batch

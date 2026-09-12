@@ -9,10 +9,13 @@ typedef struct {
     void *data;
     ds41f_int8 int8;
 } ds41f_weight;
-typedef struct { ds41f_weight *items; size_t count,bytes; int fresh_pages; } ds41f_weights;
+typedef struct { ds41f_weight *items; size_t count,bytes; int fresh_pages; void *input_cache; } ds41f_weights;
 int ds41f_weights_load(ds41f_weights *store,const char *stage,const char *prefix,size_t limit);
 int ds41f_weights_load_local(ds41f_weights *store,const char *stage,const char *prefix,
                             size_t limit,int fresh_pages);
+int ds41f_weights_enable_input_cache(ds41f_weights *store);
+int ds41f_linear_int8_cached(const ds41f_weights *store,const ds41f_weight *weight,
+                            float *out,const float *x,size_t group_rows,int fp8_quantize);
 int ds41f_weights_check_tp(ds41f_weights *store,const char *stage,int tp,int rank);
 int ds41f_weights_requantize_fp8(ds41f_weights *store,size_t block,size_t limit,int projections_only);
 void ds41f_weights_free(ds41f_weights *store);

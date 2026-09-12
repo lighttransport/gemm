@@ -118,6 +118,9 @@ def report(directory, start, stop):
                   engram_slowest_rank_components=engram_parts,
                   engram_prefetch_overlap=(stats(phase("ENGRAM_PREFETCH").max(axis=0).sum(axis=1))
                                            if "ENGRAM_PREFETCH" in index else None),
+                  input_cache_counts=({name: float(all_ranks(name).mean()) for name in
+                                       ("INPUT_CACHE_HIT", "INPUT_CACHE_MISS")}
+                                      if "INPUT_CACHE_HIT" in index else None),
                   kernels_aggregate=kernels,
                   expert_placement=dict(mean_max_experts_per_layer=float(counts.max(axis=0).mean()),
                                         mean_active_ranks_per_layer=float((counts > 0).sum(axis=0).mean()),

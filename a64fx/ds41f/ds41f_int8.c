@@ -99,27 +99,32 @@ static int quantize_input_block(int8_t *input,float *scale,const float *values,s
     return 0;
 }
 
-int ds41f_int8_matvec(float *out,const ds41f_int8 *q,const float *x,
-                     size_t group_rows,int reference)
+void ds41f_int8_input_free(ds41f_int8_input *p)
+{if(p){free(p->data);free(p->scale);memset(p,0,sizeof *p);}}
+int ds41f_int8_prepare_input(ds41f_int8_input *p,const float *x,size_t elements,size_t block)
 {
-    if(!out||!q||!x||!q->weight||!q->scale||!q->rows||!q->cols||
-       q->block<32||q->block>256||q->block%32||q->cols%q->block||!group_rows||q->rows%group_rows||
-       (group_rows!=q->rows&&group_rows%4))return EINVAL;
-    double pt=P_BEGIN();
-    size_t blocks=q->cols/q->block,groups=q->rows/group_rows;
-    if(groups>SIZE_MAX/q->cols/2)return EINVAL;
-    int8_t *input=malloc(groups*q->cols*2);
-    float *scales=malloc(groups*blocks*sizeof(float));
-    if(!input||!scales){free(input);free(scales);return ENOMEM;}
+    if(!p||!x||!elements||block<32||block>256||block%32||elements%block||elements>SIZE_MAX/2)return EINVAL;
+    memset(p,0,sizeof *p);double pt=P_BEGIN();
+    p->data=malloc(elements*2);p->scale=malloc(elements/block*sizeof(float));
+    if(!p->data||!p->scale){ds41f_int8_input_free(p);return ENOMEM;}
     int invalid=0;
-    if(groups*q->cols>=8192){
+    if(elements>=8192){
         #pragma omp parallel for schedule(static) reduction(|:invalid)
-        for(size_t b=0;b<groups*blocks;++b)
-            invalid|=quantize_input_block(input+b*q->block*2,scales+b,x+b*q->block,q->block);
-    }else for(size_t b=0;b<groups*blocks;++b)
-        invalid|=quantize_input_block(input+b*q->block*2,scales+b,x+b*q->block,q->block);
-    if(invalid){free(input);free(scales);return invalid;}
-    P_END(INT8_INPUT_QUANT,pt);
+        for(size_t b=0;b<elements/block;++b)
+            invalid|=quantize_input_block(p->data+b*block*2,p->scale+b,x+b*block,block);
+    }else for(size_t b=0;b<elements/block;++b)
+        invalid|=quantize_input_block(p->data+b*block*2,p->scale+b,x+b*block,block);
+    if(invalid){ds41f_int8_input_free(p);return invalid;}
+    p->elements=elements;p->block=block;P_END(INT8_INPUT_QUANT,pt);return 0;
+}
+int ds41f_int8_matvec_prepared(float *out,const ds41f_int8 *q,const ds41f_int8_input *p,
+                              size_t group_rows,int reference)
+{
+    if(!out||!q||!p||!p->data||!p->scale||!q->weight||!q->scale||!q->rows||!q->cols||
+       q->block<32||q->block>256||q->block%32||q->cols%q->block||!group_rows||q->rows%group_rows||
+       (group_rows!=q->rows&&group_rows%4)||p->block!=q->block||
+       q->rows/group_rows>SIZE_MAX/q->cols||p->elements!=(q->rows/group_rows)*q->cols)return EINVAL;
+    size_t blocks=q->cols/q->block;const int8_t *input=p->data;const float *scales=p->scale;
     #pragma omp parallel for schedule(static)
     for(size_t r=0;r<q->rows;r+=4){
         size_t g=r/group_rows;
@@ -163,5 +168,13 @@ int ds41f_int8_matvec(float *out,const ds41f_int8 *q,const float *x,
             out[r+row]=(float)sum;
         }
     }
-    free(input);free(scales);return 0;
+    return 0;
+}
+
+int ds41f_int8_matvec(float *out,const ds41f_int8 *q,const float *x,size_t group_rows,int reference)
+{
+    if(!q||!group_rows||q->rows%group_rows||!q->cols||q->rows/group_rows>SIZE_MAX/q->cols)return EINVAL;
+    ds41f_int8_input p;int rc=ds41f_int8_prepare_input(&p,x,(q->rows/group_rows)*q->cols,q->block);
+    if(rc)return rc;
+    rc=ds41f_int8_matvec_prepared(out,q,&p,group_rows,reference);ds41f_int8_input_free(&p);return rc;
 }

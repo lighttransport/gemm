@@ -19,4 +19,7 @@ void ds41f_bf16_matvec(float *out, const uint16_t *w, const uint16_t *x,
 void ds41f_rmsnorm_fast(float *out, const float *x, const uint16_t *weight,
                         size_t n, float eps);
 
+int ds41f_mxfp4_matvec_pair(float *gate,float *up,const uint8_t *wg,const uint8_t *sg,
+                           const uint8_t *wu,const uint8_t *su,const float *x,
+                           size_t rows,size_t cols,int tile);
 #endif

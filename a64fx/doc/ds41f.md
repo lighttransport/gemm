@@ -258,6 +258,94 @@ persistent OpenMP teams, any justified changes to projection reduction order,
 and the separately validated DSpark speculative path. MTP/INT8 batched GEMM
 and speculative rollback are not implemented by this continuation yet.
 
+## Implementation continuation: index, experts and input reuse, 2026-09-12
+
+The following results supersede the pending TP4 results above. All rates in
+this table are instrumented samples at positions 1000..1104 on job 51569201,
+2 GHz, twelve nodes, TP4, the fixed six-token capital prompt and 1100 generated
+outputs. Independent uninstrumented repeats are running; these are not 20+
+claims. Every exact-control row below preserves the corresponding 1105 token
+triples and nine saved logits bit-for-bit.
+
+| Configuration | ms/token | tokens/s | Control / limitation |
+| --- | ---: | ---: | --- |
+| FP8, TP4 initial | 105.794 | 9.452 | Nine fixed-history 1K logits match FP8 |
+| INT8, TP4 initial | 87.143 | 11.475 | INT8 control |
+| INT8, active OpenMP wait policy | 81.166 | 12.320 | INT8 control |
+| INT8, vector index heads + fused expert pair | 76.466 | 13.078 | INT8 control |
+| Above + fresh attention scratch pages | 76.958 | 12.994 | No clear gain |
+| Above + input quantization cache | 75.632 | 13.222 | INT8 control |
+| Cache path + approximate mHC mode 1 | 72.244 | 13.842 | Fails mHC numerical gate |
+
+The INT8 control itself still fails the FP8 numerical gate. Bitwise regression
+checks of the new transformations do not make INT8 numerically validated.
+TP4 fixed-history replay also preserves nine INT8 logits at positions
+1000..1008 exactly. The retained FP8 path keeps original checkpoint weights
+and rounding. The completed corrected independent nine-position reference
+will be recorded separately when available.
+
+- `--index-head-tiles` transposes the 32x128 query once and evaluates heads in
+  SVE lanes. Each lane retains the 128-term ordered FP32 sum, BF16 score and
+  weighted-score boundaries; ordered head accumulation retains selection
+  ties. Twenty-four native/A64FX mask, tail and canary cases pass bitwise.
+  At 1105 candidate rows the standalone score kernel falls from 460.85 to
+  42.82 microseconds. Full-model index scoring falls to 0.281 ms/token.
+  Distributing this now-small score phase would likely add more communication
+  than it removes at 1K; reconsider only for longer measured histories.
+- Top-k selection skips heap construction when every valid row fits and uses
+  bounded membership flags for ascending selected IDs below 4096 rows.
+  Larger histories retain the sorted fallback. Existing cache/selection
+  boundary tests pass.
+- `--expert-fused 1/2` shares input loads for routed W1/W3 while preserving
+  their FP32 accumulation order and original MXFP4 group scales. Eighteen
+  geometries with both tiles pass bitwise. Cold 2304x5120 paired projections
+  take 130.84 us originally, 106.18 us for tile one and 127.59 us for tile two;
+  tile one is retained. Packing and SDOT experiments remain separate.
+- `--linear-input-cache` retains up to four prepared activation vectors keyed
+  by complete input contents, length, INT8 block size and FP8 activation
+  rounding boundary. Reused addresses with changed values miss correctly;
+  grouped WO-A keeps its original absence of FP8 activation rounding. The
+  cache stays below 1 MB/rank. Raw/FP8/grouped inputs, changed contents,
+  repeated hits, changing block sizes and nonfinite rejection pass native
+  and A64FX tests. Prepared and ordinary GEMV match in all 162 INT8 cases.
+- `--attention-local-pages` places only bounded selected-row scratch on fresh
+  anonymous pages. It passes the long exact regression but showed no clear
+  speed gain and is omitted from the retained uninstrumented repeats.
+- Corrected FEXPA, integer polynomial-2 and affine softmax all fail the early
+  nine-position full-model gate versus the INT8 control: minimum cosine
+  0.994960/0.994632/0.992309 and maximum relative RMS
+  10.066%/10.451%/12.862%. Keep `--sparse-math 0` for the retained control.
+- The separate `ds41f_int8_matmul[_prepared]` kernel accepts 1..6 tokens and
+  reuses each four-row weight tile while preserving sequential GEMV lane
+  and reduction order. All 378 batch/shape/group/stride/tail/canary cases pass
+  bitwise on native and A64FX builds. Cold complete INT8 operators, including
+  input quantization, improve 1.2–1.5x for batches two through four on TP4
+  WO-B/QB/WO-A geometries; five/six gain little. FP8 activation rounding is a
+  caller boundary outside this microbenchmark. This is verifier groundwork,
+  not an integrated batched verifier or speculative token-rate result.
+
+The cached full profile still spends 29.600 ms in attention, 20.887 ms in
+routed/shared experts and 9.914 ms in mHC mixing. Attention's nested sparse
+span is 4.330 ms; index preparation plus scoring/selection is 3.115 ms.
+The slowest routed rank spends 7.664 ms in W1/W3, 4.648 ms in W2 and 2.214 ms
+in activation quantization. These measurements motivate packed expert SDOT,
+quantization scheduling/reuse and further projection work before speculation.
+Minimum final MemAvailable for the cached run is 3,884,056,576 bytes.
+
+Evidence: `tmp/ds41f/job51569201/{index-pair-check-v1,cache-check-v1,batch-check-v1}`
+and the `tp4-*` run directories, including `comparison.json`, `quality.json`
+and `profile-1k.json`. Builds use the warning flags above; remote checks run
+with `OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active`.
+The immutable retained driver is `retained-runs-v1/run-v1.sh`. The next
+12-node allocation is **51575979**, running 22:50:08–04:50:08 JST, bridge
+42395/32395/21266; safe bounded original/TP4 staging is running in
+`tmp/ds41f/job51575979/staging-v1`. Do not overlap MPI programs per allocation.
+
+Still outstanding: SDOT sparse QK, packed expert experiments, persistent
+OpenMP teams, broader chat/code quality checks and the full DSpark/MTP
+staging, draft execution, causal batched verifier and state rollback. No MTP
+inference or speculative speed claim is implemented by the batch kernel alone.
+
 ## Implementation status, 2026-09-12 (job 51562789)
 
 The 12-node runner now executes all 40 layers with real resident weights and

@@ -11,13 +11,48 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Main-thread-only, bounded four-entry cache. Compare complete input bytes:
+ * stack addresses are reused between layers and cannot serve as identities. */
+typedef struct {float *original;ds41f_int8_input input;int fp8;size_t stamp;} input_entry;
+typedef struct {input_entry entries[4];size_t clock;} input_cache;
+int ds41f_weights_enable_input_cache(ds41f_weights *s)
+{if(!s)return EINVAL;if(s->input_cache)return 0;s->input_cache=calloc(1,sizeof(input_cache));return s->input_cache?0:ENOMEM;}
+static void free_input_cache(input_cache *cache)
+{if(cache){for(int i=0;i<4;++i){free(cache->entries[i].original);ds41f_int8_input_free(&cache->entries[i].input);}free(cache);}}
+int ds41f_linear_int8_cached(const ds41f_weights *s,const ds41f_weight *w,float *out,
+                            const float *x,size_t group_rows,int fp8_quantize)
+{
+    if(!s||!w||!x||!out||!group_rows||w->rows%group_rows||!w->cols||
+       w->rows/group_rows>SIZE_MAX/w->cols)return EINVAL;
+    size_t n=(w->rows/group_rows)*w->cols;if(n>32768||!n)return EINVAL;
+    input_cache *cache=s->input_cache;if(!cache)return EINVAL;
+    input_entry *entry=NULL,*oldest=&cache->entries[0];
+    for(int i=0;i<4;++i){input_entry *e=&cache->entries[i];
+        if(e->input.elements==n&&e->input.block==w->int8.block&&e->fp8==fp8_quantize&&
+           !memcmp(e->original,x,n*sizeof(float))){entry=e;break;}
+        if(e->stamp<oldest->stamp)oldest=e;
+    }
+    if(entry)P_VALUE(INPUT_CACHE_HIT,1);
+    else{
+        P_VALUE(INPUT_CACHE_MISS,1);entry=oldest;free(entry->original);entry->original=NULL;
+        ds41f_int8_input_free(&entry->input);entry->stamp=0;
+        entry->original=malloc(n*sizeof(float));if(!entry->original)return ENOMEM;
+        memcpy(entry->original,x,n*sizeof(float));float *quantized=NULL;int rc=0;double pt=P_BEGIN();
+        if(fp8_quantize){quantized=malloc(n*sizeof(float));if(!quantized)return ENOMEM;rc=ds41f_act_quant(quantized,x,n);}
+        P_END(LINEAR_QUANT,pt);pt=P_BEGIN();
+        if(!rc)rc=ds41f_int8_prepare_input(&entry->input,quantized?quantized:x,n,w->int8.block);
+        P_END(LINEAR_INT8,pt);free(quantized);if(rc)return rc;entry->fp8=fp8_quantize;
+    }
+    entry->stamp=++cache->clock;double pt=P_BEGIN();P_VALUE(INT8_BYTES,w->int8.bytes);
+    int rc=ds41f_int8_matvec_prepared(out,&w->int8,&entry->input,group_rows,0);P_END(LINEAR_INT8,pt);return rc;
+}
 void ds41f_weights_free(ds41f_weights *s)
 {
     if(!s)return;
     for(size_t i=0;i<s->count;++i){
         ds41f_tensor_free_local(s->items[i].data,s->items[i].bytes,s->fresh_pages);
         ds41f_int8_free(&s->items[i].int8);}
-    free(s->items);memset(s,0,sizeof *s);
+    free(s->items);free_input_cache(s->input_cache);memset(s,0,sizeof *s);
 }
 const ds41f_weight *ds41f_weight_find(const ds41f_weights *s,const char *name)
 {
@@ -130,6 +165,9 @@ int ds41f_linear(const ds41f_weights *s,const char *base,float *out,const float 
     if(!strcmp(w->dtype,"F8_E4M3")){
         snprintf(name,sizeof name,"%s.scale",base);const ds41f_weight *scale=ds41f_weight_find(s,name);
         if(!scale||strcmp(scale->dtype,"F8_E8M0")||scale->rows!=(w->rows+31)/32||scale->cols!=(w->cols+31)/32)return EINVAL;
+        if(w->int8.weight&&s->input_cache){
+            int rc=ds41f_linear_int8_cached(s,w,out,x,w->rows,!raw);if(rc)return rc;
+        }else{
         float *input=NULL;int rc=0;
         if(!raw){input=malloc(w->cols*sizeof *input);if(!input)return ENOMEM;
             rc=ds41f_act_quant(input,x,w->cols);}
@@ -141,6 +179,7 @@ int ds41f_linear(const ds41f_weights *s,const char *base,float *out,const float 
             if(!rc)rc=ds41f_fp8_matvec(out,w->data,scale->data,input?input:x,w->rows,w->cols);
             P_END(LINEAR_FP8,pt);}
         free(input);if(rc)return rc;
+        }
     }else if(!strcmp(w->dtype,"BF16")){
         P_VALUE(BF16_BYTES,w->bytes);
         ds41f_bf16_f32_matvec(out,w->data,x,w->rows,w->cols);
