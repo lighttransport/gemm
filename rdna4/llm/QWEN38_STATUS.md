@@ -186,8 +186,13 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
   an 8-repeat run passed, but repeating the same configuration diverged on
   2/8, and pinned host weights or the async pipeline diverge on roughly 1/8.
   `HIP_LAUNCH_BLOCKING=1` largely hides the residual, so at least one more
-  ordering dependency remains; forcing per-token MoE was too slow to finish an
-  8-repeat bisection. The scalar route remains the only quality-safe default.
+  ordering dependency remains. Forcing per-token MoE (`LLM_MOE_PREFILL_SCALAR=1`)
+  at 512 prefill / 8 decode is deterministic 6/6 (`1ae7b536b9c17b1d`), which
+  isolates the residual race to the batched MoE dispatcher
+  (`forward_moe_ffn_batched`), not batched attention/SSM. A 4-repeat
+  `LLM_DEBUG_LAYERS=1` trace at 1024 did not reproduce it (the per-stage sync
+  perturbs timing), so it could not be localized to a single MoE stage. The
+  scalar route remains the only quality-safe default.
 - Multi-chunk stateful batching (prefill > BMAX, `LLM_QWEN4_BATCH_MULTI_CHUNK_
   FORCE=1`) still diverges: a 4,096-token prompt split at BMAX=1024 produced a
   different third-repeat hash. The inter-chunk state carry has a separate
