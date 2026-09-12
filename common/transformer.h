@@ -51,6 +51,7 @@ typedef struct {
     float   *i8s;         /* per-row int8 scale [n_rows] (w ~= i8 * i8s[row]) */
     int      q8_block64;  /* 1/2=Q8 original layout, 3=compact W8A8 groups */
     void    *mixed_iq_cache; /* optional lossless A64FX decode-only expanded codebook */
+    void    *iq4_cache;   /* optional lossless signed-palette worker-local cache */
     void    *tp_owned_data; /* owned contiguous TP column repack, if any */
 } qtensor;
 
@@ -131,13 +132,16 @@ typedef struct {
     float *fusion;             /* [2*n_embd] normalized embedding + hidden */
 } transformer_nextn;
 
-/* Cache-line-separated state for the optional hierarchical persistent-worker
- * barrier.  The default barrier remains the original sense barrier until the
- * hierarchical path has passed an A/B benchmark and output check. */
+/* Separate CMG counters by an A64FX cache line. Four 64-byte states share
+ * one 256-byte line and turn independent local atomics into remote traffic. */
 typedef struct {
     volatile int count;
     volatile int sense;
+#if defined(__aarch64__)
+    char pad[248];
+#else
     char pad[56];
+#endif
 } tf_cmg_barrier_state;
 
 typedef struct {
@@ -278,6 +282,7 @@ typedef struct {
     tf_cmg_barrier_state cmg_bar[4];
     volatile int cmg_leader_count;
     volatile int cmg_leader_sense;
+    int decode_barrier; /* TF_DECODE_BARRIER_*; configure before inference */
 
     /* Tensor parallelism */
     int tp_rank;               /* this rank's position in the TP group (0 if no TP) */
@@ -346,6 +351,15 @@ void transformer_set_f64_accum(transformer_model *model, int enable);
  * Default FP32 retains the original activation precision. */
 void transformer_set_mixed_iq_q8(int enable);
 size_t transformer_cache_mixed_ffn(transformer_model *model, size_t budget_bytes);
+size_t transformer_cache_iq4_decode(transformer_model *model, size_t budget_bytes);
+enum {
+    TF_DECODE_BARRIER_DEFAULT,
+    TF_DECODE_BARRIER_FLAT_SPIN,
+    TF_DECODE_BARRIER_CMG_SPIN,
+    TF_DECODE_BARRIER_CMG_WAIT,
+    TF_DECODE_BARRIER_FLAT_WAIT
+};
+void transformer_set_decode_barrier(transformer_model *model, int mode);
 /* Lossy resident W8A8 conversion for BF16 decode projections.  The int8
  * payload is written into the first half of each staged BF16 row; the BF16
  * source remains addressable for diagnostics but matvec dispatch uses i8. */
@@ -1198,6 +1212,7 @@ static inline float tf_iq4_xs_dot_sve(const block_iq4_xs *blocks, const float *x
 }
 
 #include "../a64fx/llm/mixed_iq_decode.h"
+#include "../a64fx/llm/iq4_decode_cache.h"
 
 static inline void tf_compact_k_check(uint32_t type, const void *row,
                                       const float *x, int n, float got) {
@@ -1439,6 +1454,10 @@ static void *tf_qmatvec_worker(void *arg) {
         return NULL;
     }
 #if defined(__ARM_FEATURE_SVE)
+    if (t->mat->iq4_cache) {
+        tf_iq4_cache_view_rows(t->dst,t->mat->iq4_cache,t->x,t->row_start,t->row_end);
+        return NULL;
+    }
     if (t->mat->mixed_iq_cache) {
         tf_mixed_cached_rows(t->dst, t->mat->mixed_iq_cache, t->x, n_cols,
                              t->row_start, t->row_end);
@@ -1517,6 +1536,11 @@ void transformer_set_mixed_iq_q8(int enable) {
 #else
     (void)enable;
 #endif
+}
+
+void transformer_set_decode_barrier(transformer_model *model, int mode) {
+    if (model && mode >= TF_DECODE_BARRIER_DEFAULT && mode <= TF_DECODE_BARRIER_FLAT_WAIT)
+        model->decode_barrier = mode;
 }
 
 static void tf_pool_shutdown(transformer_model *model);
@@ -3081,7 +3105,8 @@ static inline void tf_iq3_xxs_matvec_rows(float *dst, const qtensor *mat,
 }
 
 static inline int tf_iq3_compatible(const qtensor *a, const qtensor *b, int n_cols) {
-    return a && b && a->type == GGML_TYPE_IQ3_XXS && b->type == GGML_TYPE_IQ3_XXS &&
+    return a && b && !a->iq4_cache && !b->iq4_cache &&
+           a->type == GGML_TYPE_IQ3_XXS && b->type == GGML_TYPE_IQ3_XXS &&
            a->n_cols == n_cols && b->n_cols == n_cols && n_cols % 256 == 0;
 }
 
@@ -3238,6 +3263,8 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
         size_t rb = (size_t)(n_cols / 32) * sizeof(block_q4_0);
         tf_matvec_q4_0_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
 #if defined(__ARM_FEATURE_SVE)
+    } else if (mat->iq4_cache) {
+        tf_iq4_cache_view_rows(dst,mat->iq4_cache,x,row_start,row_end);
     } else if (mat->mixed_iq_cache) {
         tf_mixed_cached_rows(dst, mat->mixed_iq_cache, x, n_cols, row_start, row_end);
     } else if (tf_mixed_iq_supported(mat->type, n_cols)) {
@@ -3444,6 +3471,10 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         return;
     }
 #if defined(__ARM_FEATURE_SVE)
+    if (mat->iq4_cache) {
+        tf_iq4_cache_view_rows(dst,mat->iq4_cache,x,0,n_rows);
+        return;
+    }
     if (mat->mixed_iq_cache) {
         tf_mixed_cached_rows(dst, mat->mixed_iq_cache, x, n_cols, 0, n_rows);
         return;
@@ -6065,6 +6096,18 @@ size_t transformer_cache_mixed_ffn(transformer_model *m, size_t budget_bytes) {
 #endif
 }
 
+#if defined(__ARM_FEATURE_SVE)
+#include "../a64fx/llm/iq4_cache_build.h"
+#endif
+size_t transformer_cache_iq4_decode(transformer_model *m,size_t budget_bytes) {
+#if defined(__ARM_FEATURE_SVE)
+    return tf_iq4_build_decode_cache(m,budget_bytes);
+#else
+    (void)m;(void)budget_bytes;
+    return 0;
+#endif
+}
+
 static size_t tf_qtensor_bytes(const qtensor *t) {
     if (!t || !t->data || t->n_rows <= 0 || t->n_cols <= 0) return 0;
     size_t rb = tf_row_bytes(t->type, t->n_cols);
@@ -7606,6 +7649,20 @@ static inline void tf_hw_barrier_w0(void) {
  * A64FX multi-CMG path is hierarchical; TF_HIER_BARRIER=0 restores the
  * original 48-way barrier for an A/B check. */
 static _Thread_local int tf_barrier_tid;
+static inline void tf_wait_barrier_sense(const volatile int *sense, int wanted, int busy) {
+#if defined(__aarch64__)
+    if (!busy) {
+        __asm__ __volatile__("sevl" ::: "memory");
+        do { __asm__ __volatile__("wfe" ::: "memory"); }
+        while (__atomic_load_n(sense, __ATOMIC_ACQUIRE) != wanted);
+        return;
+    }
+#else
+    (void)busy;
+#endif
+    while (__atomic_load_n(sense, __ATOMIC_ACQUIRE) != wanted) tf_cpu_pause();
+}
+
 static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int nt) {
     static _Thread_local int use_hier = -1;
     static _Thread_local int busy_wait;
@@ -7615,7 +7672,14 @@ static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int n
         e = getenv("TF_BARRIER_BUSY_WAIT");
         busy_wait = e && atoi(e) != 0;
     }
-    if (use_hier && m->numa.enabled && m->numa.n_cmgs == 4 &&
+    int hier = use_hier, busy = busy_wait;
+    if (m->decode_barrier) {
+        hier = m->decode_barrier == TF_DECODE_BARRIER_CMG_SPIN ||
+               m->decode_barrier == TF_DECODE_BARRIER_CMG_WAIT;
+        busy = m->decode_barrier == TF_DECODE_BARRIER_FLAT_SPIN ||
+               m->decode_barrier == TF_DECODE_BARRIER_CMG_SPIN;
+    }
+    if (hier && m->numa.enabled && m->numa.n_cmgs == 4 &&
         nt >= 4 && (nt % 4) == 0) {
         const int per_cmg = nt / 4;
         const int tid = tf_barrier_tid;
@@ -7627,42 +7691,27 @@ static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int n
         if (__sync_add_and_fetch(&cs->count, 1) == per_cmg) {
             cs->count = 0;
             __sync_synchronize();
-            cs->sense = my_sense;
+            __atomic_store_n(&cs->sense, my_sense, __ATOMIC_RELEASE);
 #if defined(__aarch64__)
-            __asm__ __volatile__("sev");
+            if (!busy) __asm__ __volatile__("sev" ::: "memory");
 #endif
         } else {
-#if defined(__aarch64__)
-            __asm__ __volatile__("sevl");
-            do { __asm__ __volatile__("wfe"); } while (cs->sense != my_sense);
-#else
-            while (cs->sense != my_sense) tf_cpu_pause();
-#endif
+            tf_wait_barrier_sense(&cs->sense, my_sense, busy);
         }
 
         if (local_tid == 0) {
             if (__sync_add_and_fetch(&m->cmg_leader_count, 1) == 4) {
                 m->cmg_leader_count = 0;
                 __sync_synchronize();
-                m->cmg_leader_sense = my_sense;
+                __atomic_store_n(&m->cmg_leader_sense, my_sense, __ATOMIC_RELEASE);
 #if defined(__aarch64__)
-                __asm__ __volatile__("sev");
+                if (!busy) __asm__ __volatile__("sev" ::: "memory");
 #endif
             } else {
-#if defined(__aarch64__)
-                __asm__ __volatile__("sevl");
-                do { __asm__ __volatile__("wfe"); } while (m->cmg_leader_sense != my_sense);
-#else
-                while (m->cmg_leader_sense != my_sense) tf_cpu_pause();
-#endif
+                tf_wait_barrier_sense(&m->cmg_leader_sense, my_sense, busy);
             }
         } else {
-#if defined(__aarch64__)
-            __asm__ __volatile__("sevl");
-            do { __asm__ __volatile__("wfe"); } while (m->cmg_leader_sense != my_sense);
-#else
-            while (m->cmg_leader_sense != my_sense) tf_cpu_pause();
-#endif
+            tf_wait_barrier_sense(&m->cmg_leader_sense, my_sense, busy);
         }
         *local_sense = my_sense;
         return;
@@ -7671,26 +7720,12 @@ static inline void tf_spin_barrier(transformer_model *m, int *local_sense, int n
     if (__sync_add_and_fetch(&m->bar_count, 1) == nt) {
         m->bar_count = 0;
         __sync_synchronize();
-        m->bar_sense = my_sense;
+        __atomic_store_n(&m->bar_sense, my_sense, __ATOMIC_RELEASE);
 #if defined(__aarch64__)
-        __asm__ __volatile__("sev");  /* wake all WFE-sleeping cores */
+        if (!busy) __asm__ __volatile__("sev" ::: "memory");
 #endif
     } else {
-#if defined(__aarch64__)
-        if (busy_wait) {
-            while (m->bar_sense != my_sense)
-                __asm__ __volatile__("yield" ::: "memory");
-        } else {
-            /* SEVL makes the first WFE return before rechecking the sense. */
-            __asm__ __volatile__("sevl");
-            do {
-                __asm__ __volatile__("wfe");
-            } while (m->bar_sense != my_sense);
-        }
-#else
-        while (m->bar_sense != my_sense)
-            tf_cpu_pause();
-#endif
+        tf_wait_barrier_sense(&m->bar_sense, my_sense, busy);
     }
     *local_sense = my_sense;
 }

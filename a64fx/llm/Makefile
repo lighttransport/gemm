@@ -182,7 +182,7 @@ vlm_objs:
 	$(MAKE) -C $(VLM_DIR) CC=$(CC) OPENMP=$(OPENMP)
 
 # transformer.h includes the A64FX mixed-format kernels directly.
-$(addprefix $(BUILD)/,llm_runner pp_runner tp_runner qwen38_runner qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner): $(LLM_DIR)mixed_iq_decode.h
+$(addprefix $(BUILD)/,llm_runner pp_runner tp_runner qwen38_runner qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner): $(LLM_DIR)mixed_iq_decode.h $(LLM_DIR)iq4_decode_cache.h $(LLM_DIR)iq4_cache_build.h
 
 $(BUILD)/llm_runner: $(MAIN_SRC) vlm_objs | $(BUILD)
 	$(CC) $(CFLAGS) -DTF_LINK_PODD -o $@ $(MAIN_SRC) $(VLM_OBJS) $(BF16_PODD_KERNEL) $(LDFLAGS)

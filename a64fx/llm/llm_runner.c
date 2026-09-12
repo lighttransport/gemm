@@ -567,6 +567,8 @@ static void usage(const char *p) {
         "  --prefill-gemm            (batch contiguous hybrid prefill text)\n"
         "  --mixed-iq-q8             (opt-in Q8 activations for mixed-IQ decode; lossy)\n"
         "  --mixed-ffn-cache-mib N   (lossless decode weight cache; keeps 6 GiB available)\n"
+        "  --iq4-cache-mib N         (lossless IQ palette cache in worker-local HBM)\n"
+        "  --decode-barrier MODE     (default|flat-spin|cmg-spin|cmg-wait|flat-wait)\n"
         "  --seed N                  (rng seed; default time-based)\n"
         "  --serve-stdio             (persistent JSONL control mode; text-only)\n",
         p);
@@ -601,6 +603,8 @@ int main(int argc, char **argv) {
     int use_prefill_gemm = 0;
     int serve_stdio = 0;
     int mixed_ffn_cache_mib = 0;
+    int iq4_cache_mib = 0;
+    int decode_barrier = TF_DECODE_BARRIER_DEFAULT;
     unsigned seed   = (unsigned)time(NULL);
 
     /* Positionals: first .gguf = model, second .gguf = mmproj, first image = image */
@@ -631,13 +635,22 @@ int main(int argc, char **argv) {
         } else if (!strcmp(a, "--mixed-iq-q8")) {
             transformer_set_mixed_iq_q8(1);
             fprintf(stderr, "mixed IQ decode: Q8 activations enabled (lossy)\n");
-        } else if (!strcmp(a, "--mixed-ffn-cache-mib") && i+1 < argc) {
+        } else if ((!strcmp(a, "--mixed-ffn-cache-mib") || !strcmp(a,"--iq4-cache-mib")) && i+1 < argc) {
             char *end = NULL;
             long value = strtol(argv[++i], &end, 10);
             if (!end || end == argv[i] || *end || value < 0 || value > 32768) {
-                fprintf(stderr, "--mixed-ffn-cache-mib requires 0..32768\n"); return 1;
+                fprintf(stderr, "%s requires 0..32768\n",a); return 1;
             }
-            mixed_ffn_cache_mib = (int)value;
+            if (!strcmp(a,"--iq4-cache-mib")) iq4_cache_mib=(int)value;
+            else mixed_ffn_cache_mib = (int)value;
+        } else if (!strcmp(a, "--decode-barrier") && i+1 < argc) {
+            const char *value = argv[++i];
+            if (!strcmp(value,"default")) decode_barrier=TF_DECODE_BARRIER_DEFAULT;
+            else if (!strcmp(value,"flat-spin")) decode_barrier=TF_DECODE_BARRIER_FLAT_SPIN;
+            else if (!strcmp(value,"cmg-spin")) decode_barrier=TF_DECODE_BARRIER_CMG_SPIN;
+            else if (!strcmp(value,"cmg-wait")) decode_barrier=TF_DECODE_BARRIER_CMG_WAIT;
+            else if (!strcmp(value,"flat-wait")) decode_barrier=TF_DECODE_BARRIER_FLAT_WAIT;
+            else { fprintf(stderr,"invalid --decode-barrier: %s\n",value); return 1; }
         } else if (!strcmp(a, "--serve-stdio")) {
             serve_stdio = 1;
         } else if (!strcmp(a, "--kv-dtype") && i + 1 < argc) {
@@ -669,8 +682,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: <model.gguf> required\n");
         usage(argv[0]); return 1;
     }
-    if (serve_stdio && mixed_ffn_cache_mib) {
-        fprintf(stderr, "--mixed-ffn-cache-mib is currently supported by the single-request runner only\n");
+    if ((serve_stdio && (mixed_ffn_cache_mib || iq4_cache_mib)) ||
+        (mixed_ffn_cache_mib && iq4_cache_mib)) {
+        fprintf(stderr, "decode caches require single-request mode; choose one cache representation\n");
         return 1;
     }
     if (!user_prompt) {
@@ -711,6 +725,7 @@ int main(int argc, char **argv) {
 
     transformer_model *model = transformer_load(gguf_main, max_seq_len);
     if (!model) { fprintf(stderr, "transformer_load failed\n"); return 1; }
+    transformer_set_decode_barrier(model, decode_barrier);
     if (llm_threads > 1) transformer_set_threads(model, llm_threads);
     transformer_numa_setup(model, gguf_main);
     /* Build A64FX panel layout after the (pinned) thread pool exists so each
@@ -1003,15 +1018,16 @@ int main(int argc, char **argv) {
     fprintf(stderr, "prefill total: %.2f s (%d tokens, %.1f tok/s)\n",
             t_pre_end - t_pre, pos, pos / (t_pre_end - t_pre));
 
-    if (mixed_ffn_cache_mib) {
+    if (mixed_ffn_cache_mib || iq4_cache_mib) {
         /* This runner encodes one image. Retire its packed vision cache before
          * allocating the optional FFN cache; keep original LLM weights intact. */
         if (cache) { vit_a64fx_cache_free(cache); cache = NULL; }
         if (pool) { vlm_pool_free(pool); pool = NULL; }
         double cache_start = mono_sec();
-        size_t cache_bytes = transformer_cache_mixed_ffn(model, (size_t)mixed_ffn_cache_mib*1048576);
-        fprintf(stderr, "mixed FFN cache setup: %.3f s, %.3f GiB (outside prefill/decode timings)\n",
-                mono_sec()-cache_start, cache_bytes/1073741824.);
+        size_t cache_bytes = iq4_cache_mib ? transformer_cache_iq4_decode(model,(size_t)iq4_cache_mib*1048576) :
+            transformer_cache_mixed_ffn(model, (size_t)mixed_ffn_cache_mib*1048576);
+        fprintf(stderr, "%s cache setup: %.3f s, %.3f GiB (outside prefill/decode timings)\n",
+                iq4_cache_mib?"IQ4 decode":"mixed FFN",mono_sec()-cache_start, cache_bytes/1073741824.);
     }
 
     /* ── generation ── */

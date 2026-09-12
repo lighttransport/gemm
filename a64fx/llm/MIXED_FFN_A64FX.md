@@ -172,3 +172,86 @@ passed 32/32 baseline tokens: 31 forwards / 7.164 s = 4.33 tok/s,
 unsupported stdio/cache combination return an error before model loading.
 No inference/test process remains running; the interactive allocation is
 left available for continuation until its six-hour limit.
+
+## Follow-up: decode barriers and worker-local palette cache
+
+The same allocation now has an explicit `--decode-barrier` runner option:
+`default`, `flat-spin`, `cmg-spin`, `cmg-wait`, or `flat-wait`. Sense loads
+and stores use acquire/release atomics. CMG state has a 256-byte stride on
+AArch64; padding alone did not improve the benchmark. Default behavior is
+unchanged, and the spin policies are opt-in.
+
+With the existing expanded FFN cache, append:
+
+```sh
+--mixed-ffn-cache-mib 13000 --decode-barrier flat-spin
+```
+
+The 96-token image test completed 95 decode forwards in 18.855 s:
+**5.04 tok/s, 96/96 baseline greedy token IDs**. This is 18% faster than
+the earlier 4.28 tok/s FP32-cache checkpoint, not a result for the new
+four-bit cache. Profile totals were FFN gate/up 6537.1 ms, FFN down
+3395.7 ms, SSM prepare 188.8 ms, SSM scan 205.7 ms, and head 1429.7 ms.
+The output remains a coherent description of the mountain image.
+
+`--iq4-cache-mib N` is a separate, opt-in, decode-only representation of
+IQ2_XXS, IQ2_XS, IQ2_S, IQ3_S, and IQ3_XXS weights. Four-bit indices refer
+to the original signed palette; this is not re-quantization to GGML IQ4.
+Original per-16 FP32 scales are retained, using 192 bytes per 256 weights
+instead of the expanded cache's 320 bytes. FP32 activation precision is
+unchanged except for IQ3_XXS, which already uses Q8 activations in the
+baseline. `--mixed-iq-q8` still explicitly opts into lossy activations for
+the other supported formats.
+
+The builder covers eligible FFN, SSM, and attention projections, keeps the
+source tensors intact, and allocates one slab inside each pinned worker.
+Each worker temporarily selects the default local memory policy, then
+restores its original policy. A user budget and a 6 GiB `MemAvailable`
+reserve bound allocation, including an allowance for huge-page rounding.
+Packing or headroom failure discards the new representation before publishing
+it. The new and old cache options are mutually exclusive; neither is
+supported in stdio serving mode.
+
+Bounded tests pass for all five formats: 4096 real rows per format, exact
+weight reconstruction, changed and zero activations, empty/nonzero row
+slices, output padding, and an independent double-precision dot reference.
+The worker-local builder and dispatch agree with the contiguous cache on
+every output tested; a repeated cache request allocates nothing. Worst
+scaled dot error was 1.33e-8 (threshold 2e-6). Representative FP32 direct
+versus worker-local cache times were 0.310/0.114 ms for IQ2_S and
+0.736/0.337 ms for IQ2_XS. These reused-matrix microbenchmarks do not
+establish whole-model throughput or measured HBM traffic.
+
+Build these bounded tests on the frontend and run on the compute node:
+
+```sh
+mkdir -p tmp/llm-goal
+for test in test_iq4_decode_cache test_decode_sync; do
+    TMPDIR="$PWD/tmp/llm-goal" fccpx -Nclang -O3 -march=armv8.2-a+sve \
+        -ffp-contract=fast -fopenmp -D_GNU_SOURCE -ffunction-sections \
+        -fdata-sections -Wno-unused-function "a64fx/llm/$test.c" \
+        -Wl,--gc-sections -lm -lpthread -lhwb -o "tmp/llm-goal/$test"
+done
+
+# Compute node, with no concurrent inference/benchmark:
+NUMA_INTERLEAVE=1 OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+    tmp/llm-goal/test_iq4_decode_cache \
+    /local/u14346/qwen38-gsq/Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf
+for mode in 0 1 2 3 4; do
+    OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+        tmp/llm-goal/test_decode_sync "$mode"
+done
+OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+    tmp/llm-goal/test_decode_sync stream
+```
+
+Barrier ordering checks pass at 4, 12, and 48 workers. Flat spin reduced
+the 48-worker microbenchmark from about 140 us (baseline hierarchical wait)
+to about 14 us. The bounded read test measured about 380 GB/s with a
+main-thread interleaved allocation versus 737 GB/s when pinned workers
+allocated their own slabs. These are synthetic read rates, not decode rates.
+
+Evidence is in `tmp/llm-goal/`: `barrier_modes_image.log`,
+`barrier_modes_output.txt`, `iq4local_test.log`, `stream.log`, and
+`workeralloc.log`. **The full-model four-bit cache is not yet validated;
+30+ decode tok/s remains unachieved.**
