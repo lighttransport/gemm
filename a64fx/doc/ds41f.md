@@ -478,6 +478,76 @@ These optimization regressions establish agreement with the existing runner;
 the earlier independent-reference and actual-1M-history limitations still
 apply.
 
+### Future tasks after the pause
+
+Resume from commit `dbce50bf` and the `sparse-loop-v1` / `sparse-no-prefetch-v1`
+artifacts. The target remains **single-request decode above 20 tok/s at
+approximately 1K actual history**. Engram prefetch and the sparse value-loop
+update are complete; the tasks below are pending, with no runs queued.
+
+Performance work, in priority order:
+
+1. **Reproduce the final baseline.** Check allocation/bridge health and staged
+   manifests using the remote development procedure; restage if `/local` has
+   expired. Run the final committed binary with prefetch enabled and the same
+   prompt/options, then repeat sequential prefetch-on/off comparisons to
+   distinguish the measured 2.0% gain from run variability. Keep each binary,
+   source snapshot, SHA256 and log in a new results directory. Report positions
+   1000–1104, including mean and p95; also measure with profiling disabled.
+2. **Optimize compressed FP8 projections first.** Their 71.419 ms/token already
+   exceeds the entire 50 ms target budget. Profile the actual `wq_b`, grouped
+   `wo_a`, `wo_b` and shared-expert shapes in `ds41f_sve.c`, separating weight
+   traffic, FP8/scale decoding and arithmetic. Inspect generated SVE code and
+   measure CMG/thread placement and row blocking with realistic weight working
+   sets. Test bounded conversion reuse or fused scale/decode loops. Keep FP8
+   weights resident in compressed form; the rejected full BF16 expansion must
+   not be restored based only on small, warm microbenchmarks.
+3. **Reduce mHC mix overhead.** In `ds41f_run.c:mixes`, investigate the serial
+   normalization (7.319 ms/token) and the 24-row F32 matvecs (8.323 ms/token).
+   Measure vectorization, work distribution and parallel-region overhead.
+   Changes to reduction order require explicit numerical comparison; preserve
+   the separately rounded products in mHC post processing.
+4. **Reduce expert critical-path time.** Shared experts cost 19.929 ms/token
+   and the slowest routed rank costs 19.751 ms/token. Profile MXFP4 decoding,
+   activation quantization, scratch reuse and the observed expert imbalance
+   before changing placement. Evaluate overlap of shared and routed work only
+   with an explicit core budget: concurrent OpenMP teams can compete for the
+   same 48 cores. Keep owner synchronization and receive acknowledgments valid.
+5. **Evaluate dense tensor parallelism if kernel tuning is insufficient.**
+   Dense layers currently execute on one owner at a time. Estimate the extra
+   communication and per-node memory before prototyping projection sharding
+   across a small rank group. Require a measured end-to-end gain; distributing
+   work must not replicate the full dense model or exceed the existing HBM
+   admission budget. This is a larger architecture experiment, not an assumed
+   route to 20 tok/s.
+
+Correctness and acceptance work:
+
+- **Complete independent-reference validation.** Rerun the corrected NumPy
+  full-graph reference for all nine positions; only the corrected three-position
+  check is complete. Retain the cosine >= 0.999 and matching-argmax gates.
+  Extend bounded logit capture to selected positions near 1K in a separate
+  correctness run; current saved arrays cover positions 0–8 only. Continue
+  comparing all 1,105 token triples and component references after math changes.
+- **Harden transport under longer receiver stalls.** Turn the temporary
+  `comm-skew-v1` reproducer into a maintained regression and sweep delayed ranks,
+  payload sizes and delays around/beyond the existing approximately 64 ms ACK
+  retry budget. The shared transport can currently proceed optimistically
+  after retry exhaustion. Design a bounded error/abort or proven receive-slot
+  ownership scheme before claiming correctness under arbitrary scheduling skew;
+  preserve the current 3 ms / 300-reduction passing case.
+- **Require whole-run evidence for each retained optimization.** Keep compressed
+  residency and memory guards, pass the affected component checks, and compare
+  identical prompts and history windows on all 12 ranks. Re-profile the full
+  runner and record MemAvailable, mean/p95 latency and numerical differences.
+  Treat the 20 tok/s target as achieved only with repeated single-request
+  measurements below 50 ms/token at actual 1K history.
+
+Actual long-history/1M execution, KV checkpoint/restore and batched prefill
+integration remain separate deferred tasks. Allocating the 1M cache does not
+validate those paths; use the memory and acceptance sections below when that
+scope is resumed.
+
 ## Checkpoint accounting and active staging (job 51562789)
 
 Header inventory supersedes the rough per-node fit estimate below:
