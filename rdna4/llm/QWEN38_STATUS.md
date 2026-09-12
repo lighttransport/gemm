@@ -4,6 +4,151 @@ Current validation appears first. Earlier investigations are retained below as
 history; short-run determinism claims there do not establish scalar F16 parity.
 Scalar F16 remains the default; staged prefill is diagnostic.
 
+## Corrected-routing performance and quality refresh
+
+The corrected staged 4096/64 workload is repeatable across 20 requests in
+nine processes (first99157, hash601167e3b2fb9425). This is a staged reference,
+not scalar parity. Cache7200 plus the phase arena leaves508 MiB free
+(15796 MiB peak). Geometry128/256/512 and attention output shards1/2/4/8
+retain that hash; neither sweep establishes a compelling throughput gain.
+The shard sweep, without concurrent CPU compilation, spans133–167 prefill
+and6–12 decode tok/s. Logs: `tmp/native_shards_summary.log`,
+`tmp/geometry_sweep_summary.log`. Geometry128 timing overlapped compilation.
+
+`LLM_QWEN4_NATIVE_Q8_BATCH=1` replaces token-at-a-time Q8 projection launches
+with an existing native batch kernel. The expanded GPU oracle compares
+M=1/3/17 at four real projection shapes, including non-power-of-two quant
+scales, bitwise against scalar. It passes. Output initialization is ordered
+on the compute stream. The API trace confirms196608 scalar launches become
+48 batch launches, but overall throughput remains below target.
+
+The corrected-route ROCprof trace (`tmp/rocprof_qwen_api/`) records decode
+H2D2.676 s for30.48 GiB over64 tokens, about42 ms/token and11.4 GiB/s.
+Decode kernels total2.200 s, including0.772 s F16 attention. Host tracing
+shows3143 stream synchronizations and74511 kernel launches during decode.
+Blocking API times overlap GPU execution and must not be added to it.
+Prefill kernel time20.884 s includes7.117 s grouped Q4 gate/up,4.469 s
+Q5 down,2.268 s DeltaNet,1.595 s native Q8 batch and1.506 s attention.
+Profiled135/7 tok/s includes instrumentation and is not an acceptance run.
+
+Fresh matched scalar F16 references and staged runs at128/16, two repeats
+each, fail parity on all four short prompts:
+
+| Prompt | Scalar first / hash | Staged first / hash |
+|---|---|---|
+| Coding |198 / bbd62d9e3c85af8d|1271 / 01976b77d164dc71|
+| Arithmetic |198 / 427a8efc219e9443|95597 / 81052d0486585444|
+| Prose |248068 / c461a4dabdca797e|292 / 81d9d59fdc04f3e6|
+| Japanese |198 / b5ad0bef0c9a5696|57512 / 9fcc5e9faf32dfaa|
+
+Logs: `tmp/fixed_short_quality_summary.log` and
+`tmp/staging_quality_fixed/`. A fresh4K scalar oracle remains outstanding.
+No performance or quality gate has been met.
+
+Native HC and exact decode prefix graphs are opt-in experiments:
+
+- `LLM_QWEN4_BATCH_HC_NATIVE=1` keeps HC down/up and injection in native
+  scalar arithmetic, eliminating BF16 intermediate packing. The real-model
+  `--verify-hc-batch` oracle checks48 layers x2 phases x8 rows; mixed outputs
+  and injection weights all match bitwise and remain finite. It supports
+  Q8 HC down/up and F16/F32/Q8 injection. Log:
+  `tmp/nativehc_f16_oracle.log`. Full prompt parity fails all four128/16 cases, repeatably: coding
+  first169742/hashf0ddf46ba0ec6790; arithmetic225110/f7398932b2a66d89;
+  prose73889/ff576e34061fd89e; Japanese119294/6118d1b7f5ef72b4.
+  Log:`tmp/nativehc_quality_summary.log`. Other batch paths still round
+  through BF16, including this model's Q8 SSM projections.
+- `LLM_QWEN4_EXACT_PRE_GRAPHS=1` captures the existing attention/SSM and HC
+  prefix for single-token decode, excluding PLE layer1 and keeping routed MoE
+  outside capture. Approximate graphs containing MoE cannot be reused as exact
+  prefixes. Offload destroys captures before freeing addresses. Two4096/64
+  requests match the corrected staged hash, at166.76/168.28 prefill min/median,
+  10.87/11.12 decode. Peak15890 MiB. Log:`tmp/exactgraph_4k.log`.
+  A final build confirms47 captured graphs, zero failures, and two matching
+  staged hashes:170.00/170.42 prefill and13.57/13.59 decode min/median.
+  Log:`tmp/verified_graph_4k.log`. Variation across processes still warrants
+  more repeats before attributing that difference to graph replay.
+
+## Routing, attention race, and scratch sharing (2026-09-12 continuation)
+
+Two correctness defects are now demonstrated and fixed:
+
+- `moe_topk_batch` could discard an unselected lower-half expert after choosing
+  its paired upper-half candidate. It now masks each candidate independently.
+  The expanded oracle covers 257/384/512 experts, K=10/64, paired candidates,
+  ties, ascending/descending logits, and seeded random logits. The old kernel
+  fails this oracle; the corrected kernel passes.
+- F16 prefill/decode attention reused the shared maximum-reduction buffer for
+  probability sums before every wave had read the maximum. Asynchronous
+  fingerprints first localized repeat divergence to the attention side of
+  layers 3/39, before FFN routing. A delayed-wave GPU oracle reproduces errors
+  of 0.0238 (prefill) and 0.0392 (decode) with the barrier removed. With the
+  reader barrier, maximum absolute errors are 2.98e-8 and 7.45e-9. The analogous
+  I8 buffer reuse receives the same barrier.
+
+Historical `afdf60ceeb4f0103` throughput used the incorrect top-K kernel and
+must not be treated as a current quality baseline. Correct routing selects a
+more varied expert workload and increases decode transfers.
+
+`LLM_QWEN4_BATCH_PLE_FFN=1` keeps layer 1's PLE/SSM attention row-ordered and
+batches its FFN. The real-weight `--verify-ple-split` oracle compares the
+original interleaved scalar layer with phase-separated scalar attention and
+FFN: HC outputs, PLE convolution, and SSM convolution/recurrent state match
+bitwise. This validates the phase separation, not the batched FFN's scalar
+numerical parity. The opt-in split cuts 4K prefill expert H2D from 132.68 to
+66.24 GiB. Its reused host PLE embedding remains live through each row's
+existing explicit completion.
+
+`LLM_QWEN4_FINGERPRINT=1` records stream-ordered diagnostic hashes for five
+boundaries per layer: HC input, FFN input, router logits, routed sum, and
+shared+routed output. Reporting uses the existing end-of-tile barrier. These
+32-bit fingerprints locate divergence; they are not collision-free equality
+proofs or performance measurements.
+
+After the attention fix, four 4096/64 requests at cache5500/BMAX4096 have
+identical fingerprints at all 48 layers and return first token 99157 / hash
+`601167e3b2fb9425` (4/4). Settings: pinned weights, overlap on, PLE split on,
+staging promotion on, prefill cache balancing off, warmup off. Diagnostic
+throughput is 145.92/146.47 prefill min/median and 12.02/12.17 decode; peak
+15808 MiB. This establishes repeatability for these requests, not scalar F16
+parity. Log: `tmp/attention_fixed_4k.log`.
+
+`LLM_QWEN4_PHASE_SCRATCH=1` shares temporary storage between HC mixing, SSM,
+full attention, and MoE. Residuals, injection weights, normalized layer inputs,
+attention projections, dequantized weights, and copy-stream staging banks
+remain separate. Cleanup clears owned views before ordinary per-field frees.
+At BMAX4096 the arena is 810 MiB and saves 1737 MiB. Both requests with the
+same cache5500 match all baseline fingerprints and the complete decode hash;
+peak falls to 14072 MiB, leaving 2232 MiB free. Log:
+`tmp/arena4_trace_4k.log`. A larger-cache/launch-geometry sweep follows.
+
+Rejected: two-token gate/up tiling initially passed fixtures with power-of-two
+scales, but the expanded non-power-of-two scale fixture detects a one-ULP
+gate difference. The prototype is removed. The down-projection prototype also
+failed parity. The broader fixture remains. `LLM_QWEN4_STAGE_THREADS` changes
+only the existing kernels' block geometry (128/256/512, default256).
+
+A ROCprof trace before the attention fix identified the remaining costs:
+prefill grouped Q4_K gate/up 7.105 s, Q5_1 down 4.448 s, scalar Q8 matvec
+2.526 s, and batched DeltaNet 2.267 s. Decode spent 3.095 s in H2D copies and
+2.279 s in kernels for 64 tokens; F16 attention was 0.772 s. These are trace
+durations, not additive wall-clock throughput claims. Mapped/direct host-read
+decode experiments were slower than copies and failed repeatability; they
+are not promoted. The device link reports PCIe 3.0 x16.
+
+Reproduce the focused checks (GPU jobs must run exclusively):
+
+```sh
+export TMPDIR="$PWD/rdna4/llm/tmp"
+make -C rdna4/llm moe-stage-test
+make -C rdna4/llm qwen4-attention-gpu-test
+make -C rdna4/llm tmp/test_hip_qwen4_moe_stage_large
+LLM_QWEN4_STAGE_THREADS=128 timeout --foreground 180s ./rdna4/llm/tmp/test_hip_qwen4_moe_stage_large
+LLM_QWEN4_STAGE_THREADS=512 timeout --foreground 180s ./rdna4/llm/tmp/test_hip_qwen4_moe_stage_large
+```
+
+The 200/30 target and fresh scalar F16 corpus parity remain required; no
+batched production default is promoted by these diagnostics.
+
 ## Bounded staging implementation (2026-09-12)
 
 The selected bounded-wave manager is implemented. Each of two banks owns its

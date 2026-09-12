@@ -62,7 +62,7 @@ cuda_moe_bridge.o: cuda_moe_bridge.cu cuda_moe_bridge.h glm5next_iq1s_grid.h glm
 mm_blaslt_bridge.o: mm_blaslt_bridge.cpp mm_blaslt_bridge.h
 	$(HIPCC) -O3 -fPIE $(BLASLT_BRIDGE_CFLAGS) --offload-arch=gfx1201 -c -o $@ $<
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h qwen4_moe_stage.h qwen4_nextn_forward.h qwen4_nextn_ref.h qwen4_qsa_hip.h qwen4_qsa_test.h qwen4_verify_window.h ../../common/qwen4_qsa.h ../hip_runner_common.h ../rocew.h $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h qwen4_moe_stage.h qwen4_ple_split_test.h qwen4_phase_scratch.h qwen4_hc_native_kernels.h qwen4_hc_native_test.h qwen4_nextn_forward.h qwen4_nextn_ref.h qwen4_qsa_hip.h qwen4_qsa_test.h qwen4_verify_window.h ../../common/qwen4_qsa.h ../hip_runner_common.h ../rocew.h $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ) $(LDFLAGS)
 
 .PHONY: moe-stage-test moe-stage-gpu-test moe-stage-quality
@@ -74,13 +74,24 @@ moe-stage-test:
 	python3 test_qwen38_target_gate.py
 	bash test_qwen38_profiles.sh
 
-tmp/test_hip_qwen4_moe_stage: test_hip_qwen4_moe_stage.c $(RUNNER_SRC) qwen4_moe_stage.h hip_llm_runner.h $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
+tmp/test_hip_qwen4_moe_stage: test_hip_qwen4_moe_stage.c $(RUNNER_SRC) qwen4_moe_stage.h qwen4_ple_split_test.h qwen4_phase_scratch.h qwen4_hc_native_kernels.h qwen4_hc_native_test.h hip_llm_runner.h $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
 	mkdir -p tmp
 	$(CC) $(CFLAGS) -o $@ test_hip_qwen4_moe_stage.c $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ) $(LDFLAGS)
 
-tmp/test_hip_qwen4_moe_stage_large: test_hip_qwen4_moe_stage.c $(RUNNER_SRC) qwen4_moe_stage.h hip_llm_runner.h $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
+tmp/test_hip_qwen4_moe_stage_large: test_hip_qwen4_moe_stage.c $(RUNNER_SRC) qwen4_moe_stage.h qwen4_ple_split_test.h qwen4_phase_scratch.h qwen4_hc_native_kernels.h qwen4_hc_native_test.h hip_llm_runner.h $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
 	mkdir -p tmp
-	$(CC) $(CFLAGS) -DQWEN4_STAGE_TEST_DIM=2048 -o $@ test_hip_qwen4_moe_stage.c $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ) $(LDFLAGS)
+	$(CC) $(CFLAGS) -DQWEN4_STAGE_TEST_DIM=2560 -o $@ test_hip_qwen4_moe_stage.c $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ) $(LDFLAGS)
+
+tmp/test_hip_qwen4_attention: test_hip_qwen4_attention.c $(RUNNER_SRC) qwen4_moe_stage.h qwen4_ple_split_test.h qwen4_phase_scratch.h qwen4_hc_native_kernels.h qwen4_hc_native_test.h hip_llm_runner.h $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
+	mkdir -p tmp
+	$(CC) $(CFLAGS) -o $@ test_hip_qwen4_attention.c $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ) $(LDFLAGS)
+
+.PHONY: qwen4-attention-gpu-test
+qwen4-attention-gpu-test: tmp/test_hip_qwen4_attention
+	timeout --foreground 180s ./tmp/test_hip_qwen4_attention
+	@if timeout --foreground 180s ./tmp/test_hip_qwen4_attention --unsafe; then \
+	    echo "ERROR: attention barrier mutation was not detected"; exit 1; \
+	else code=$$?; test $$code -eq 1; fi
 
 moe-stage-gpu-test: tmp/test_hip_qwen4_moe_stage
 	timeout --foreground 180s ./tmp/test_hip_qwen4_moe_stage

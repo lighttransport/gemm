@@ -823,7 +823,7 @@ int main(int argc, char **argv) {
     int moe_cache_mb = 0;
     int moe_cpu_only = 0;
     int max_layers = 0;
-    int verify_hc_batch = 0;
+    int verify_hc_batch = 0, verify_ple_split = 0;
     int verify_glm5next_kda = 0;
     int glm5next_kda_dim = 128;
     int verify_glm5next_dsa = 0;
@@ -952,6 +952,8 @@ int main(int argc, char **argv) {
             moe_cpu_only = 1;
         } else if (strcmp(argv[i], "--max-layers") == 0 && i + 1 < argc) {
             max_layers = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--verify-ple-split") == 0) {
+            verify_ple_split = 1;
         } else if (strcmp(argv[i], "--verify-hc-batch") == 0) {
             verify_hc_batch = 1;
         } else if (strcmp(argv[i], "--verify-glm5next-kda") == 0) {
@@ -1142,6 +1144,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M] [--prompt-file PATH]\n");
         fprintf(stderr, "       [--verify-quant-kernels]   (standalone; no model needed)\n");
         fprintf(stderr, "       [--verify-moe-routing]     (standalone; no model needed)\n");
+        fprintf(stderr, "       [--verify-ple-split]       (real-model PLE/SSM phase-order check)\n");
         fprintf(stderr, "       [--verify-glm5next-kda [HEAD_DIM]] (standalone)\n");
         fprintf(stderr, "       [--verify-glm5next-dsa]            (standalone)\n");
         fprintf(stderr, "       [--bench-quant-matvec TYPE ROWS COLS ITERS [REPEATS]]   (standalone)\n");
@@ -1399,6 +1402,14 @@ int main(int argc, char **argv) {
         if (cpu_model) transformer_free(cpu_model);
         bpe_vocab_free(vocab); gguf_close_shards(gguf_model);
         return rc == 0 && rel < 5e-4 ? 0 : 1;
+    }
+    if (verify_ple_split) {
+        int rc = hip_llm_verify_qwen4_ple_split(gpu, 8);
+        fprintf(stderr, "PLE phase-order: HC outputs + PLE/SSM state bitwise %s\n", rc ? "FAIL" : "PASS");
+        hip_llm_free(gpu);
+        if (cpu_model) transformer_free(cpu_model);
+        bpe_vocab_free(vocab); gguf_close_shards(gguf_model);
+        return rc ? 1 : 0;
     }
     if (verify_hc_batch) {
         double rel = 0.0, max_abs = 0.0;

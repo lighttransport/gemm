@@ -27,7 +27,9 @@ static void test_weights(unsigned char *p, size_t bytes, int type, unsigned seed
                    type == GGML_TYPE_Q5_1 ? 24 :
                    type == GGML_TYPE_Q4_K ? 144 : type == GGML_TYPE_Q5_K ? 176 : 210;
     for (size_t i = 0; i < bytes; i += block) {
-        uint16_t scale = 0x1800; /* finite, small, nonzero */
+        seed = seed * 1664525u + 1013904223u;
+        uint16_t scale = (uint16_t)(0x1400u + ((seed >> 16) & 0x7ffu));
+        /* Finite non-power-of-two scales exercise dequantization rounding. */
         size_t offset = type == GGML_TYPE_Q6_K ? 208 : 0;
         memcpy(p + i + offset, &scale, 2);
         if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1)
@@ -100,6 +102,9 @@ static void run_case(hip_llm_runner *r, int gu, int down, int registered) {
         REQUIRE(hipStreamSynchronize(r->stream));
     }
     REQUIRE(hipMemcpy(reference, r->d_moe_eout, out_bytes, hipMemcpyDeviceToHost));
+    float *gate_reference = malloc(out_bytes), *gate_actual = malloc(out_bytes);
+    assert(gate_reference && gate_actual);
+    REQUIRE(hipMemcpy(gate_reference, r->d_moe_eg, out_bytes, hipMemcpyDeviceToHost));
     double magnitude = 0;
     for (size_t i = 0; i < out_bytes / sizeof(float); ++i) { assert(isfinite(reference[i])); magnitude += fabs(reference[i]); }
     assert(magnitude > 0);
@@ -115,7 +120,19 @@ static void run_case(hip_llm_runner *r, int gu, int down, int registered) {
                 REQUIRE(hipMemset(r->d_moe_eout, 0xff, out_bytes));
                 REQUIRE(forward_qwen4_moe_staged(r, &cl, offs, TEST_NE, TEST_DIM, TEST_DIM));
                 REQUIRE(hipMemcpy(actual, r->d_moe_eout, out_bytes, hipMemcpyDeviceToHost));
-                if (memcmp(reference, actual, out_bytes)) {
+                REQUIRE(hipMemcpy(gate_actual, r->d_moe_eg, out_bytes, hipMemcpyDeviceToHost));
+                if (memcmp(reference, actual, out_bytes) ||
+                    memcmp(gate_reference, gate_actual, out_bytes)) {
+                    for (size_t k = 0; k < out_bytes / sizeof(float); ++k) {
+                        if (memcmp(gate_reference+k, gate_actual+k, sizeof(float))) {
+                            fprintf(stderr, "gate first difference [%zu]: %.9g / %.9g\n", k, gate_reference[k], gate_actual[k]); break;
+                        }
+                    }
+                    for (size_t k = 0; k < out_bytes / sizeof(float); ++k) {
+                        if (memcmp(reference+k, actual+k, sizeof(float))) {
+                            fprintf(stderr, "down first difference [%zu]: %.9g / %.9g\n", k, reference[k], actual[k]); break;
+                        }
+                    }
                     fprintf(stderr, "staging mismatch gu=%d down=%d pinned=%d overlap=%d promotion=%d residents=%d repeat=%d\n",
                             gu, down, registered, overlap, promote, residents, repeat); exit(1);
                 }
@@ -135,13 +152,71 @@ static void run_case(hip_llm_runner *r, int gu, int down, int registered) {
     REQUIRE(hipMemcpy(actual, r->d_moe_eout, out_bytes, hipMemcpyDeviceToHost));
     assert(!memcmp(reference, actual, out_bytes));
     if (registered) { REQUIRE(hipHostUnregister(gate)); REQUIRE(hipHostUnregister(up)); REQUIRE(hipHostUnregister(dw)); }
-    free(gate); free(up); free(dw); free(reference); free(actual);
+    free(gate); free(up); free(dw); free(reference); free(actual); free(gate_reference); free(gate_actual);
     REQUIRE(hipFree(cl.moe_cache_gate)); REQUIRE(hipFree(cl.moe_cache_up));
     REQUIRE(hipFree(cl.moe_cache_down)); REQUIRE(hipFree(cl.d_moe_cache_map));
 }
+/* Native Q8 batching must preserve every scalar output, including tails and
+ * reductions crossing multiple lane strides at the model projection widths. */
+static void test_native_q8_batch(hip_llm_runner *r) {
+    const int shapes[][2] = {{13, 2560}, {512, 2560}, {2560, 6144}, {12288, 2560}};
+    const int batches[] = {1, 3, 17};
+    for (int shape = 0; shape < 4; ++shape) {
+        int rows = shapes[shape][0], cols = shapes[shape][1];
+        size_t wb = (size_t)rows * (cols/32) * 36;
+        unsigned char *weights = malloc(wb);
+        float *input = malloc((size_t)17*cols*4);
+        float *reference = malloc((size_t)17*rows*4), *actual = malloc((size_t)17*rows*4);
+        assert(weights && input && reference && actual);
+        unsigned seed = 919u;
+        for (size_t i = 0; i < wb; ++i) {
+            seed = seed*1664525u+1013904223u; weights[i] = (unsigned char)(seed>>24);
+        }
+        for (size_t i = 0; i < wb; i += 36) {
+            uint16_t scale = (uint16_t)(0x1000u + (weights[i] << 3));
+            memcpy(weights+i, &scale, 2); weights[i+2] = weights[i+3] = 0;
+        }
+        for (int i = 0; i < 17*cols; ++i) input[i] = sinf(i*0.073f) + cosf(i*0.011f);
+        void *w = test_alloc(wb), *x = test_alloc((size_t)17*cols*4);
+        void *out = test_alloc((size_t)17*rows*4);
+        REQUIRE(hipMemcpy(w, weights, wb, hipMemcpyHostToDevice));
+        REQUIRE(hipMemcpy(x, input, (size_t)17*cols*4, hipMemcpyHostToDevice));
+        for (int bi = 0; bi < 3; ++bi) {
+            int M = batches[bi];
+            for (int m = 0; m < M; ++m)
+                launch_matvec_q8_f32(r, (float *)out+(size_t)m*rows, w,
+                                     (float *)x+(size_t)m*cols, rows, cols);
+            REQUIRE(hipStreamSynchronize(r->stream));
+            REQUIRE(hipMemcpy(reference, out, (size_t)M*rows*4, hipMemcpyDeviceToHost));
+            REQUIRE(hipMemsetAsync(out, 0xff, (size_t)M*rows*4, r->stream));
+            REQUIRE(launch_matmul_q8_batch_f32(r, out, w, x, M, rows, cols));
+            REQUIRE(hipStreamSynchronize(r->stream));
+            REQUIRE(hipMemcpy(actual, out, (size_t)M*rows*4, hipMemcpyDeviceToHost));
+            for (int i = 0; i < M*rows; ++i) if (!isfinite(actual[i])) {
+                fprintf(stderr,"native Q8 nonfinite M=%d N=%d K=%d index=%d scalar=%.9g batch=%.9g\n",
+                        M,rows,cols,i,reference[i],actual[i]); exit(1);
+            }
+            if (memcmp(reference, actual, (size_t)M*rows*4)) {
+                fprintf(stderr, "native Q8 batch mismatch M=%d N=%d K=%d\n", M, rows, cols);
+                exit(1);
+            }
+        }
+        REQUIRE(hipFree(w)); REQUIRE(hipFree(x)); REQUIRE(hipFree(out));
+        free(weights); free(input); free(reference); free(actual);
+    }
+    puts("Qwen4 native Q8 batch: scalar bitwise parity at model projection shapes: PASS");
+}
+
 int main(void) {
     hip_llm_runner *r = hip_llm_init(0, 0);
     if (!r) { fprintf(stderr, "SKIP: HIP device unavailable\n"); return 77; }
+    test_native_q8_batch(r);
+    int expert_counts[] = {257, 384, 512};
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(hip_llm_verify_moe_routing(r, expert_counts[i], 10));
+        REQUIRE(hip_llm_verify_moe_routing(r, expert_counts[i], 64));
+    }
+    puts("Qwen4 GPU routing: paired candidates, ties, random logits: PASS");
     r->is_qwen4exp = 1; r->n_experts = TEST_NE; r->n_embd = r->expert_ff = TEST_DIM;
     r->qwen4_prefill_staging = 1; r->qwen4_stage_slots = 2;
     r->qwen4_stage_task_capacity = TEST_TASKS;

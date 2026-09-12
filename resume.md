@@ -18,77 +18,107 @@ Stable, quality-safe Qwen3.8-Flash-Next LLM runner on CPU + Radeon RX 9070 XT
 Do not push to any remote without explicit per-action user permission.
 Committing freely is allowed once a coherent unit is done.
 
-## Current implementation (2026-09-12)
+## Current implementation (2026-09-12 continuation)
 
-The approved **bounded-wave staging manager is implemented**. Do not restart
-that implementation. Read `rdna4/llm/QWEN38_MOE_STAGING.md` for ownership and
-commands, and the first section of `rdna4/llm/QWEN38_STATUS.md` for current
-measurements. The earlier history below describes the preceding session.
+The user explicitly asked to keep going until the **200/30** targets are met.
+Neither target nor fresh scalar F16 corpus parity is achieved yet. Keep the
+scalar fallback as the default. Do not restart the owned staging manager
+(committed as `74a68bf2`); details and current measurements are at the top of
+`rdna4/llm/QWEN38_STATUS.md`.
 
-- Two staging banks own pinned metadata, device metadata, quantized weights,
-  Q8_0 scratch, and ready/done events. Host metadata reuse waits for DMA;
-  device reuse waits for compute and promotion consumers.
-- Direct batched cache misses and hits use independent per-slot fences,
-  including Q8_0. Reset/mode changes/offload/free drain prefill streams.
-- Fixed a prefill-to-decode map source lifetime bug: synchronize before free.
-- `LLM_BENCH_WARMUP=0` now disables warmup. Optional paired
-  `QWEN38_TARGET_EXPECTED_FIRST_TOKEN` / `QWEN38_TARGET_EXPECTED_HASH` enforce
-  matched scalar references in the target benchmark.
-- CPU delayed-copy/lifecycle/failure tests and small/large model-free GPU
-  serial-oracle tests pass. Test allocation/error recovery, pinning, overlap,
-  Q8 repack, promotions, and repeated bank reuse are covered.
+Latest follow-up: the corrected-route API profile is in
+`rdna4/llm/tmp/rocprof_qwen_api/`. Decode copies30.48 GiB in2.676 s
+over64 tokens; kernel time2.200 s. Launch geometry and attention sharding
+do not establish a speed gain. Exact-prefix graph replay passes two4K/64
+staged hashes but measures only10.87/11.12 decode min/median. Fresh four-prompt
+scalar references all disagree with staged prefill; see the new status table.
+Native HC batching now passes the real-model bitwise oracle for48 layers,
+both phases and8 rows, including F16 injection. Its corpus check fails all four prompts; see
+`tmp/nativehc_quality_summary.log`. Do not claim full-model parity from the
+HC oracle. Next: the Q8 SSM input/output projections still use BF16 GEMMs
+because only Q6 has a native SSM batch branch. Preserve the scalar fused
+Q8 reduction order when adding that branch and validate it separately.
 
-**The full-model issue remains.** At 4096/64, 4000 MiB cache, BMAX4096,
-512 MiB staging, warmup off, the first five eight-repeat runs returned the common
-batched hash `afdf60ceeb4f0103` in 7/8 (pageable serial), 8/8 (pageable overlap),
-5/8 (pinned serial), 7/8 (pinned overlap), and 6/8 (fresh pinned overlap).
-A fresh pageable-overlap process also passed 8/8 (16/16 across its two
-processes). Pinned overlap measured about 132 prefill / 20 decode tok/s,
-peak 14296 MiB.
-No staged default is promoted; scalar F16 remains the fallback. Neither the
-200/30 performance target nor full-model determinism has been achieved.
-The ownership tests alone do not establish where the remaining bug is.
+Final validated binary: `rdna4/llm/tmp/test_hip_llm_verified`. Its graph
+check captures47 prefixes with zero failures and matches two4K/64 staged
+hashes, at170.00/170.42 prefill and13.57/13.59 decode min/median.
+Log:`tmp/verified_graph_4k.log`. No GPU jobs remain from this checkpoint.
 
-All five matched scalar corpus cases fail staged parity, although each
-scalar and staged sequence repeats 2/2. The fresh `scalar-exact` 4K reference
-is first token 15 / hash `e3d8bf6d47dc6cc3` (10.83/15.45 tok/s); its difference
-from the historical larger-cache `fast` reference is not explained. Full
-results are recorded in `QWEN38_STATUS.md` after the matrix. Reproduce with `make -C rdna4/llm moe-stage-quality`. Its source fixes
-the exact header/coding/arithmetic/prose/Japanese prompts and generates fresh
-references; any mismatch fails the command. Logs remain under
-`rdna4/llm/tmp/staging_quality/`.
+New work in this continuation:
 
-### Next investigation
+- Fixed a demonstrated GPU top-K candidate-masking bug. Expanded tests fail
+  before the fix and pass afterward. Historical `afdf60ceeb4f0103` performance
+  used incorrect routing and is not a current quality baseline.
+- Asynchronous fingerprints localized repeat divergence to attention layers
+  3/39, before FFN routing. Fixed the shared maximum-buffer reader race in
+  F16/I8 prefill/decode attention. Delaying other waves reproduces errors up
+  to 0.056 without the barrier; all four corrected tests pass below 6e-8.
+- `LLM_QWEN4_BATCH_PLE_FFN=1`: keep layer-1 PLE/SSM attention ordered; batch
+  its FFN. Real-weight `--verify-ple-split` matches scalar phase ordering
+  bitwise for HC, PLE, and SSM state. Prefill expert H2D drops from132.68 to
+  66.24 GiB. This does not establish batched-vs-scalar FFN parity.
+- `LLM_QWEN4_PHASE_SCRATCH=1`: one 810 MiB arena for phase-exclusive HC,
+  SSM, attention, and MoE intermediates saves1737 MiB at BMAX4096. Persistent
+  values and copy-stream banks stay separate. Both full-model requests match
+  all baseline layer fingerprints and the complete hash at the same cache.
+- `LLM_QWEN4_FINGERPRINT=1`: five stream-ordered fingerprints per layer,
+  reported at the existing final tile barrier. Diagnostic, not speed mode.
+- Two-token gate/up and down prototypes were rejected and removed after
+  one-ULP failures. The test now uses varied non-power-of-two scales.
+- `LLM_QWEN4_STAGE_THREADS=128/256/512` changes geometry only. Large bitwise
+  oracles pass; the full-model sweep does not show a compelling speed win.
+- `LLM_QWEN4_NATIVE_Q8_BATCH=1` wires the existing native Q8 batch kernel into
+  attention projections. Model-shaped scalar/batch bitwise tests pass. The
+  oracle must initialize outputs on the compute stream; default-stream
+  initialization caused an unwritten/NaN output during the first test.
+- `LLM_QWEN4_DECODE_ATTN_SHARDS=2/4/8` is an opt-in output-column split with
+  unchanged per-output arithmetic. Partial-tile/nonzero-query GPU tests match
+  the original bitwise. Full-model tuning is in progress; no default change.
 
-Localize the first diverging layer without adding host synchronization:
-collect device fingerprints of layer input, routing/assignment buffers,
-routed output, shared output, and layer output asynchronously, then read them
-at an existing end-of-request barrier. Host-synchronized layer tracing can hide
-the timing-sensitive failure. Compare good/bad repeats before changing math.
-Do not assert that ownership fencing fixes all races or blame the driver
-without evidence. GPU assignment grouping uses integer atomics; ordering alone
-is not proof of numerical divergence. Scalar fused routing and batched routing
-have separate diagnostic switches, so disabling one does not disable both.
+Corrected staged baseline: cache5500/BMAX4096, 4096/64, pinned, overlap1,
+PLE split1, promote1, prefill balance0, warmup0 returns first99157 / hash
+`601167e3b2fb9425` in4/4 requests with identical fingerprints at all48 layers.
+Shared scratch matches it2/2. Cache7200 geometry sweep matches it6/6, but
+prefill is only~158–171 tok/s and decode~8–13 tok/s. These are staged-reference
+checks, **not scalar F16 parity**. Some geometry128 timing overlapped a CPU
+test compilation; do not promote its timing. Later sweeps avoid compilation.
 
-### Working environment and checks
+### Live work / next steps
 
-Use repository-local temporary storage (`TMPDIR=$PWD/rdna4/llm/tmp`); never
-`/tmp`. `/local` was absent. The ordinary sandbox hides GPU devices; approved
-host execution (`require_escalated`) exposes `/dev/kfd` and RX 9070 XT. Check
-GPU exclusivity and do not overlap benchmark processes.
+The native-Q8 + attention-shard sweep is running sequentially from
+`rdna4/llm/tmp/run_native_shards_sweep.sh` (logs `native_shards_summary.log`,
+`native_q8_shards_[1248].log`). Early configurations preserve the corrected
+staged hash but do not reach either throughput target. A HIP API + kernel +
+copy trace with exact route logging is the next diagnostic: separate CPU
+submission and PCIe waits, then inspect cache allocation/policy using the
+corrected routing workload. The old cache allocation vectors predate this
+routing fix. Previous ROCprof data is in `tmp/rocprof_qwen_split/`.
+
+Refresh the scalar F16 quality corpus after the fixes. The previous corpus
+failed all5 staged cases; historical references must not replace a fresh
+matched reference. Do not confuse request repeatability with scalar parity.
+
+### Environment and checks
+
+Use `TMPDIR=$PWD/rdna4/llm/tmp`; never `/tmp`. `/local` is absent. GPU devices
+are hidden in the sandbox; approved host execution exposes them. GPU jobs must
+be exclusive. Do not mutate running scripts/binaries, and avoid compilation
+during performance measurements. CPU: Threadripper1950X; GPU: RX9070XT16GiB;
+PCIe reports8GT/s x16.
 
 ```sh
 export TMPDIR="$PWD/rdna4/llm/tmp"
 make -C rdna4/llm moe-stage-test
-make -C rdna4/llm test_hip_llm tmp/test_hip_qwen4_moe_stage tmp/test_hip_qwen4_moe_stage_large
+make -C rdna4/llm qwen4-attention-gpu-test
+make -C rdna4/llm tmp/test_hip_qwen4_moe_stage tmp/test_hip_qwen4_moe_stage_large
 make -C rdna4/llm moe-stage-gpu-test
-timeout --foreground 180s ./rdna4/llm/tmp/test_hip_qwen4_moe_stage_large
 make -C rdna4/llm moe-stage-quality
 ```
 
-Preserve unrelated work under `a64fx/glm5` and `common/transformer.h`. Do not
-commit the stray untracked `rdna4/llm/hip_runner_common.h`; the runner uses
-`../hip_runner_common.h`. Do not push without a new explicit push request.
+Preserve unrelated `a64fx/glm5` / `common/transformer.h` work. Do not commit
+the stray untracked `rdna4/llm/hip_runner_common.h`; the runner includes
+`../hip_runner_common.h`. Commit coherent tested changes and report the hash;
+no push without a new explicit push request.
 
 ## Authoritative paths
 
