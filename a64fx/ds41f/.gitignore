@@ -43,3 +43,11 @@
 /test_sparse_sdot
 /test_team
 /test_team_kernels
+/test_journal
+/test_tp_weights
+/test_mtp_weights
+/test_cache_sve
+
+/test_fp4_batch
+/test_expert_batch
+/test_comm_batch

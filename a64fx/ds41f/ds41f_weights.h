@@ -23,6 +23,14 @@ void ds41f_weights_free(ds41f_weights *store);
 const ds41f_weight *ds41f_weight_find(const ds41f_weights *store,const char *name);
 /* raw=1 skips checkpoint FP8 activation quantization and BF16 output rounding.
  * The experimental INT8 matvec still applies its own input quantization. */
+/* Bounded token-major linear; INT8 reuses weights and preserves GEMV order.
+ * Other formats retain the ordinary per-token operator. */
+int ds41f_linear_batch(const ds41f_weights *store,const char *base,float *out,
+                       size_t output_stride,const float *x,size_t input_stride,
+                       size_t batch,int raw);
+int ds41f_int8_linear_batch(const ds41f_weight *weight,float *out,size_t output_stride,
+                            const float *x,size_t input_stride,size_t batch,
+                            size_t group_rows,int fp8_quantize);
 int ds41f_linear(const ds41f_weights *store,const char *base,float *out,
                  const float *x,int raw);
 int ds41f_norm(const ds41f_weights *store,const char *name,float *out,const float *x);

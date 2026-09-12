@@ -53,6 +53,18 @@ int main(void)
             if(ds41f_int8_matvec(ref,&w->int8,x,4,0)||ds41f_linear_int8_cached(&store,w,got,x,4,0)||memcmp(ref,got,sizeof ref))return 1;
         }
     }
+    float *bx=malloc(6*10240*sizeof(float)),br[48],bg[48];if(!bx)return 1;
+    for(size_t i=0;i<6*10240;++i)bx[i]=sinf((float)i*.087f)*.25f;
+    ds41f_int8_free(&w->int8);if(ds41f_int8_from_fp8(&w->int8,raw,s->data,8,5120,32))return 1;
+    for(size_t batch=1;batch<=6;++batch){
+        for(int raw_input=0;raw_input<2;++raw_input){
+            for(size_t i=0;i<batch;++i)if(ds41f_linear(&store,"unit",br+i*8,bx+i*5120,raw_input))return 1;
+            if(ds41f_linear_batch(&store,"unit",bg,8,bx,5120,batch,raw_input)||memcmp(br,bg,batch*8*sizeof(float)))return 1;
+        }
+        for(size_t i=0;i<batch;++i)if(ds41f_int8_matvec(br+i*8,&w->int8,bx+i*10240,4,0))return 1;
+        if(ds41f_int8_linear_batch(w,bg,8,bx,10240,batch,4,0)||memcmp(br,bg,batch*8*sizeof(float)))return 1;
+    }
+    free(bx);
     x[0]=NAN;
     if(ds41f_linear(&store,"unit",got,x,0)!=EDOM||ds41f_linear(&store,"unit",got,x,0)!=EDOM)return 1;
     ds41f_weights_free(&store);free(raw);free(x);

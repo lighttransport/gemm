@@ -119,6 +119,28 @@ void ds41f_comm_bf16_handoff(float *v,size_t n,size_t tail,int owner,int next)
         if(!rc)unpack_bf16(v,wire,n,tail);}
     if(rc)ds41f_comm_abort("BF16 residual handoff",rc);
 }
+static void bf16_batch_bounds(size_t stride,size_t n,size_t tail,size_t batch,int owner,int next)
+{
+    bf16_bounds(n,tail,owner,next);
+    if(!batch||batch>6||stride<n+tail||stride>SIZE_MAX/sizeof(float)/batch)
+        ds41f_comm_abort("BF16 batch bounds",EINVAL);
+}
+void ds41f_comm_bf16_broadcast_batch(float *v,size_t stride,size_t n,size_t tail,size_t batch,int owner)
+{
+    bf16_batch_bounds(stride,n,tail,batch,owner,owner);uint16_t wire[6*(20480+24)];size_t step=n+tail*2;
+    if(my_rank==owner)for(size_t t=0;t<batch;++t)pack_bf16(wire+t*step,v+t*stride,n,tail);
+    ds41f_comm_bytes(wire,batch*step*2,owner);
+    if(my_rank!=owner)for(size_t t=0;t<batch;++t)unpack_bf16(v+t*stride,wire+t*step,n,tail);
+}
+void ds41f_comm_bf16_handoff_batch(float *v,size_t stride,size_t n,size_t tail,size_t batch,int owner,int next)
+{
+    bf16_batch_bounds(stride,n,tail,batch,owner,next);uint16_t wire[6*(20480+24)];size_t step=n+tail*2;int rc=0;
+    if(my_rank==owner){for(size_t t=0;t<batch;++t)pack_bf16(wire+t*step,v+t*stride,n,tail);
+        if(next!=owner)rc=MPI_Send(wire,(int)(batch*step*2),MPI_BYTE,next,42,MPI_COMM_WORLD);}
+    else if(my_rank==next){rc=MPI_Recv(wire,(int)(batch*step*2),MPI_BYTE,owner,42,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+        if(!rc)for(size_t t=0;t<batch;++t)unpack_bf16(v+t*stride,wire+t*step,n,tail);}
+    if(rc)ds41f_comm_abort("BF16 batch handoff",rc);
+}
 void ds41f_comm_set_tp(int tp)
 {
     if((tp!=1&&tp!=2&&tp!=4)||dense_comm!=MPI_COMM_NULL)ds41f_comm_abort("TP configuration",EINVAL);
@@ -146,6 +168,20 @@ void ds41f_comm_tp_allgather(float *out,float *part,size_t n)
 {tp_collect(out,part,n,my_rank,1);}
 void ds41f_comm_tp_gather(float *out,float *part,size_t n,int owner)
 {tp_collect(out,part,n,owner,0);}
+void ds41f_comm_tp_gather_batch(float *out,size_t os,float *part,size_t ps,size_t n,size_t batch,int owner,int all)
+{
+    if(dense_comm==MPI_COMM_NULL||owner<0||owner>=12||owner/dense_tp!=my_rank/dense_tp||
+       !batch||batch>6||n>8192/(size_t)dense_tp||ps<n||os<n*(size_t)dense_tp||
+       ps>SIZE_MAX/sizeof(float)/batch||os>SIZE_MAX/sizeof(float)/batch)
+        ds41f_comm_abort("TP batch gather bounds",EINVAL);
+    uint16_t send[6*8192],recv[6*8192];
+    for(size_t t=0;t<batch;++t)pack_bf16(send+t*n,part+t*ps,n,0);
+    int rc=all?MPI_Allgather(send,(int)(batch*n*2),MPI_BYTE,recv,(int)(batch*n*2),MPI_BYTE,dense_comm):
+        MPI_Gather(send,(int)(batch*n*2),MPI_BYTE,recv,(int)(batch*n*2),MPI_BYTE,owner%dense_tp,dense_comm);
+    if(rc)ds41f_comm_abort("TP batch gather",rc);
+    if(all||my_rank==owner)for(size_t t=0;t<batch;++t)for(int r=0;r<dense_tp;++r)
+        unpack_bf16(out+t*os+(size_t)r*n,recv+((size_t)r*batch+t)*n,n,0);
+}
 void ds41f_comm_argmax(float *value,int *index)
 {
     struct {float value;int index;} in={*value,*index},out;

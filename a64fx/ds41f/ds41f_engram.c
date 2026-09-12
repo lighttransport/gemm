@@ -11,6 +11,31 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+struct ds41f_engram_row { uint64_t key; uint16_t value[DS41F_ENGRAM_DIM]; };
+void ds41f_engram_clear_rows(ds41f_engram *e)
+{
+    if(!e)return;
+    for(int i=0;i<DS41F_ENGRAM_LAYERS;++i)if(e->table[i].row_cache)
+        memset(e->table[i].row_cache,255,e->table[i].row_cache_entries*sizeof(struct ds41f_engram_row));
+}
+int ds41f_engram_cache_rows(ds41f_engram *e,size_t budget,size_t *allocated)
+{
+    if(allocated)*allocated=0;
+    if(!e)return EINVAL;
+    for(int i=0;i<DS41F_ENGRAM_LAYERS;++i)if(e->table[i].row_cache)return EINVAL;
+    size_t maximum=budget/DS41F_ENGRAM_LAYERS/sizeof(struct ds41f_engram_row);
+    if(!maximum)return ENOMEM;
+    size_t count=1;while(count<=maximum/2)count*=2;
+    for(int i=0;i<DS41F_ENGRAM_LAYERS;++i){
+        e->table[i].row_cache=malloc(count*sizeof(struct ds41f_engram_row));
+        if(!e->table[i].row_cache){for(int j=0;j<i;++j){free(e->table[j].row_cache);e->table[j].row_cache=NULL;e->table[j].row_cache_entries=0;}return ENOMEM;}
+        e->table[i].row_cache_entries=count;
+    }
+    ds41f_engram_clear_rows(e);
+    if(allocated)*allocated=count*DS41F_ENGRAM_LAYERS*sizeof(struct ds41f_engram_row);
+    return 0;
+}
+
 static const uint64_t table_rows[DS41F_ENGRAM_LAYERS] = {
     UINT64_C(384006168), UINT64_C(384016682)
 };
@@ -120,6 +145,7 @@ void ds41f_engram_close(ds41f_engram *e)
         if (e->table[i].weight_fd >= 0) close(e->table[i].weight_fd);
         if (e->table[i].scale_fd >= 0) close(e->table[i].scale_fd);
         free(e->table[i].scale_cache);e->table[i].scale_cache=NULL;
+        free(e->table[i].row_cache);e->table[i].row_cache=NULL;e->table[i].row_cache_entries=0;
         e->table[i].weight_fd = e->table[i].scale_fd = -1;
     }
 }
@@ -196,6 +222,13 @@ int ds41f_engram_read_local(ds41f_engram *e, int layer, uint64_t row,
     ds41f_engram_table *t = &e->table[layer];
     if (row < t->first || row >= t->first + t->owned_rows) return ERANGE;
     uint64_t local = row - t->first;
+    struct ds41f_engram_row *entry=NULL;
+    if(t->row_cache){uint64_t hash=(local*UINT64_C(11400714819323198485))^(local>>17);
+        entry=t->row_cache+(hash&(t->row_cache_entries-1));
+        if(entry->key==row){memcpy(out,entry->value,sizeof entry->value);
+            ++t->row_cache_hits;++t->lookups;++t->local_rows;return 0;}
+        ++t->row_cache_misses;
+    }
     uint8_t v[DS41F_ENGRAM_DIM], sc[DS41F_ENGRAM_DIM / 32];
     double pt=P_BEGIN();
     ssize_t a = pread(t->weight_fd, v, sizeof v, (off_t)(local * sizeof v));
@@ -212,6 +245,8 @@ int ds41f_engram_read_local(ds41f_engram *e, int layer, uint64_t row,
         out[i] = isnan(x) ? (uint16_t)((bits.u >> 16) | 0x40) :
             (uint16_t)((bits.u + 0x7fff + ((bits.u >> 16) & 1)) >> 16);
     }
-    P_END(ENGRAM_DECODE,pt);++t->lookups; ++t->local_rows;
+    P_END(ENGRAM_DECODE,pt);
+    if(entry){memcpy(entry->value,out,sizeof entry->value);entry->key=row;}
+    ++t->lookups; ++t->local_rows;
     return 0;
 }

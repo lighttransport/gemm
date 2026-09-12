@@ -39,6 +39,12 @@ int main(int argc,char **argv)
             ds41f_prefetch_destroy(p);p=NULL;
             if(ds41f_engram_cache_scales(e,511)!=ENOMEM||e->table[0].scale_cache||e->table[1].scale_cache)return 1;
             if(ds41f_engram_cache_scales(e,512)||ds41f_engram_cache_scales(e,512)!=EINVAL)return 1;
+            size_t cached_bytes=123;
+            if(ds41f_engram_cache_rows(e,1023,&cached_bytes)!=ENOMEM||cached_bytes)return 1;
+            if(ds41f_engram_cache_rows(e,8192,&cached_bytes)||!cached_bytes||cached_bytes>8192||
+               ds41f_engram_cache_rows(e,8192,NULL)!=EINVAL)return 1;
+            /* Four rows/table force collisions in the 32-row fixture. */
+            if(e->table[0].row_cache_entries!=4)return 1;
             /* Cached reads must remain exact without either scale file descriptor. */
             for(int slot=0;slot<2;++slot){close(e->table[slot].scale_fd);e->table[slot].scale_fd=-1;}
             if(ds41f_prefetch_create(&p,e))return 1;
@@ -50,13 +56,26 @@ int main(int argc,char **argv)
                 expected[slot][i*256+j]=ds41f_bf16_to_f32(golden[slot][ids[slot][i]-7][j]);
         }
         ds41f_profile_at(0,0);
-        if(ds41f_prefetch_submit(p,request_ids))return 1;
+        uint64_t previous=ds41f_prefetch_generation(p);
+        if(ds41f_prefetch_submit(p,request_ids)||ds41f_prefetch_generation(p)!=previous+1)return 1;
         for(int slot=0;slot<2;++slot){double seconds=-1;
             if(ds41f_prefetch_wait(p,slot,actual,&seconds)||seconds<0||memcmp(actual,expected[slot],sizeof actual))return 1;}
         /* The worker must not record into the submitting thread's spans. */
         if(ds41f_profile_current[DS41F_P_ENGRAM_READ]||ds41f_profile_current[DS41F_P_ENGRAM_DECODE])return 1;
         ds41f_profile_at(1,0);
+        if(ds41f_prefetch_drain(p)||ds41f_prefetch_wait(p,0,actual,NULL)!=EINVAL)return 1;
+        /* Drain while work may still be pending, then reject stale results. */
+        if(ds41f_prefetch_submit(p,request_ids)||ds41f_prefetch_drain(p)||
+           ds41f_prefetch_wait(p,1,actual,NULL)!=EINVAL)return 1;
     }
+    for(int slot=0;slot<2;++slot){uint16_t row[256];
+        if(ds41f_engram_read_local(e,slot,7,row)||memcmp(row,golden[slot][0],sizeof row))return 1;
+        uint64_t hits=e->table[slot].row_cache_hits,lookups=e->table[slot].lookups;
+        if(ds41f_engram_read_local(e,slot,7,row)||memcmp(row,golden[slot][0],sizeof row)||
+           e->table[slot].row_cache_hits!=hits+1||e->table[slot].lookups!=lookups+1)return 1;
+        if(ds41f_engram_read_local(e,slot,6,row)!=ERANGE)return 1;
+    }
+    ds41f_engram_clear_rows(e);
     if(ftruncate(e->table[0].weight_fd,0)||ds41f_prefetch_submit(p,request_ids))return 1;
     if(ds41f_prefetch_wait(p,0,actual,NULL)!=EIO||ds41f_prefetch_wait(p,1,actual,NULL))return 1;
     /* Joining with work pending must not leave a thread using closed files. */
@@ -64,5 +83,5 @@ int main(int argc,char **argv)
     ds41f_prefetch_destroy(p);ds41f_profile_free();ds41f_engram_close(e);free(e);
     for(int i=0;i<4;++i)unlink(files[i]);
     rmdir(argv[1]);
-    puts("PREFETCH PASS bit_exact generations=96 remote_zeros short_read_error pending_close profiler_TLS scale_cache budget cache_only_reads");return 0;
+    puts("PREFETCH PASS bit_exact generations=96 remote_zeros short_read_error pending_close drain_inflight stale_wait generation_counter profiler_TLS scale_cache budget cache_only_reads row_cache collisions isolated_tables logical_counters clear");return 0;
 }

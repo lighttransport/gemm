@@ -29,6 +29,10 @@ int ds41f_attention_apply(ds41f_attention *state,int layer,size_t position,
 int ds41f_attention_project(ds41f_attention *state,const ds41f_weights *weights,
                             int layer,size_t position,const float *qr,
                             size_t first_head,size_t heads,float *projected);
+int ds41f_attention_attend(ds41f_attention *state,const ds41f_weights *weights,int layer,
+                           size_t position,float *q,size_t first_head,size_t heads,float *attended);
+int ds41f_attention_grouped_output(const ds41f_weights *weights,int layer,float *out,
+                                   const float *x,size_t groups);
 int ds41f_attention_output(const ds41f_weights *weights,int layer,const float *projected,float *out);
 int ds41f_index_scores(float *scores,const float *q,const float *weights,const uint8_t *rows,
                        size_t count,const uint8_t *candidates,int head_tiles);

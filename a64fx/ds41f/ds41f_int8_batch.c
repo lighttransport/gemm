@@ -1,4 +1,5 @@
 #include "ds41f_int8.h"
+#include "ds41f_team.h"
 #include <errno.h>
 #include <stdint.h>
 #if defined(__ARM_FEATURE_SVE)
@@ -16,18 +17,21 @@ static void int8_batch_2(float *out,size_t stride,const ds41f_int8 *q,
         const int8_t *w=q->weight+r*q->cols+block*128;
         svint8_t w01=svld1_s8(svptrue_b8(),w),w23=svld1_s8(svptrue_b8(),w+64);
         const float *sc=q->scale+((r/4)*blocks+block)*4;
+        svuint32_t indices=svlsr_n_u32_x(pg,svindex_u32(0,1),3);
+        svfloat32_t scales=svld1_f32(svptrue_pat_b32(SV_VL4),sc);
+        svfloat32_t base01=svtbl_f32(scales,indices),base23=svtbl_f32(scales,svadd_n_u32_x(pg,indices,2));
         {svint8_t x=svld1_s8(svptrue_b8(),input[0].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[0].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a0=svmla_f32_x(pg,a0,svcvt_f32_s32_x(pg,d01),s01);
         b0=svmla_f32_x(pg,b0,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[1].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[1].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a1=svmla_f32_x(pg,a1,svcvt_f32_s32_x(pg,d01),s01);
         b1=svmla_f32_x(pg,b1,svcvt_f32_s32_x(pg,d23),s23);}
     }
@@ -54,25 +58,28 @@ static void int8_batch_3(float *out,size_t stride,const ds41f_int8 *q,
         const int8_t *w=q->weight+r*q->cols+block*128;
         svint8_t w01=svld1_s8(svptrue_b8(),w),w23=svld1_s8(svptrue_b8(),w+64);
         const float *sc=q->scale+((r/4)*blocks+block)*4;
+        svuint32_t indices=svlsr_n_u32_x(pg,svindex_u32(0,1),3);
+        svfloat32_t scales=svld1_f32(svptrue_pat_b32(SV_VL4),sc);
+        svfloat32_t base01=svtbl_f32(scales,indices),base23=svtbl_f32(scales,svadd_n_u32_x(pg,indices,2));
         {svint8_t x=svld1_s8(svptrue_b8(),input[0].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[0].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a0=svmla_f32_x(pg,a0,svcvt_f32_s32_x(pg,d01),s01);
         b0=svmla_f32_x(pg,b0,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[1].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[1].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a1=svmla_f32_x(pg,a1,svcvt_f32_s32_x(pg,d01),s01);
         b1=svmla_f32_x(pg,b1,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[2].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[2].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a2=svmla_f32_x(pg,a2,svcvt_f32_s32_x(pg,d01),s01);
         b2=svmla_f32_x(pg,b2,svcvt_f32_s32_x(pg,d23),s23);}
     }
@@ -104,32 +111,35 @@ static void int8_batch_4(float *out,size_t stride,const ds41f_int8 *q,
         const int8_t *w=q->weight+r*q->cols+block*128;
         svint8_t w01=svld1_s8(svptrue_b8(),w),w23=svld1_s8(svptrue_b8(),w+64);
         const float *sc=q->scale+((r/4)*blocks+block)*4;
+        svuint32_t indices=svlsr_n_u32_x(pg,svindex_u32(0,1),3);
+        svfloat32_t scales=svld1_f32(svptrue_pat_b32(SV_VL4),sc);
+        svfloat32_t base01=svtbl_f32(scales,indices),base23=svtbl_f32(scales,svadd_n_u32_x(pg,indices,2));
         {svint8_t x=svld1_s8(svptrue_b8(),input[0].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[0].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a0=svmla_f32_x(pg,a0,svcvt_f32_s32_x(pg,d01),s01);
         b0=svmla_f32_x(pg,b0,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[1].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[1].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a1=svmla_f32_x(pg,a1,svcvt_f32_s32_x(pg,d01),s01);
         b1=svmla_f32_x(pg,b1,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[2].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[2].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a2=svmla_f32_x(pg,a2,svcvt_f32_s32_x(pg,d01),s01);
         b2=svmla_f32_x(pg,b2,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[3].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[3].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a3=svmla_f32_x(pg,a3,svcvt_f32_s32_x(pg,d01),s01);
         b3=svmla_f32_x(pg,b3,svcvt_f32_s32_x(pg,d23),s23);}
     }
@@ -166,39 +176,42 @@ static void int8_batch_5(float *out,size_t stride,const ds41f_int8 *q,
         const int8_t *w=q->weight+r*q->cols+block*128;
         svint8_t w01=svld1_s8(svptrue_b8(),w),w23=svld1_s8(svptrue_b8(),w+64);
         const float *sc=q->scale+((r/4)*blocks+block)*4;
+        svuint32_t indices=svlsr_n_u32_x(pg,svindex_u32(0,1),3);
+        svfloat32_t scales=svld1_f32(svptrue_pat_b32(SV_VL4),sc);
+        svfloat32_t base01=svtbl_f32(scales,indices),base23=svtbl_f32(scales,svadd_n_u32_x(pg,indices,2));
         {svint8_t x=svld1_s8(svptrue_b8(),input[0].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[0].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a0=svmla_f32_x(pg,a0,svcvt_f32_s32_x(pg,d01),s01);
         b0=svmla_f32_x(pg,b0,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[1].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[1].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a1=svmla_f32_x(pg,a1,svcvt_f32_s32_x(pg,d01),s01);
         b1=svmla_f32_x(pg,b1,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[2].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[2].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a2=svmla_f32_x(pg,a2,svcvt_f32_s32_x(pg,d01),s01);
         b2=svmla_f32_x(pg,b2,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[3].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[3].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a3=svmla_f32_x(pg,a3,svcvt_f32_s32_x(pg,d01),s01);
         b3=svmla_f32_x(pg,b3,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[4].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[4].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a4=svmla_f32_x(pg,a4,svcvt_f32_s32_x(pg,d01),s01);
         b4=svmla_f32_x(pg,b4,svcvt_f32_s32_x(pg,d23),s23);}
     }
@@ -240,46 +253,49 @@ static void int8_batch_6(float *out,size_t stride,const ds41f_int8 *q,
         const int8_t *w=q->weight+r*q->cols+block*128;
         svint8_t w01=svld1_s8(svptrue_b8(),w),w23=svld1_s8(svptrue_b8(),w+64);
         const float *sc=q->scale+((r/4)*blocks+block)*4;
+        svuint32_t indices=svlsr_n_u32_x(pg,svindex_u32(0,1),3);
+        svfloat32_t scales=svld1_f32(svptrue_pat_b32(SV_VL4),sc);
+        svfloat32_t base01=svtbl_f32(scales,indices),base23=svtbl_f32(scales,svadd_n_u32_x(pg,indices,2));
         {svint8_t x=svld1_s8(svptrue_b8(),input[0].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[0].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a0=svmla_f32_x(pg,a0,svcvt_f32_s32_x(pg,d01),s01);
         b0=svmla_f32_x(pg,b0,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[1].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[1].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a1=svmla_f32_x(pg,a1,svcvt_f32_s32_x(pg,d01),s01);
         b1=svmla_f32_x(pg,b1,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[2].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[2].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a2=svmla_f32_x(pg,a2,svcvt_f32_s32_x(pg,d01),s01);
         b2=svmla_f32_x(pg,b2,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[3].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[3].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a3=svmla_f32_x(pg,a3,svcvt_f32_s32_x(pg,d01),s01);
         b3=svmla_f32_x(pg,b3,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[4].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[4].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a4=svmla_f32_x(pg,a4,svcvt_f32_s32_x(pg,d01),s01);
         b4=svmla_f32_x(pg,b4,svcvt_f32_s32_x(pg,d23),s23);}
         {svint8_t x=svld1_s8(svptrue_b8(),input[5].data+g*q->cols*2+block*64);
         svint32_t d01=svdot_s32(svdup_s32(0),w01,x),d23=svdot_s32(svdup_s32(0),w23,x);
         float scale=input[5].scale[g*blocks+block];
-        svfloat32_t s01=svsel_f32(lo,svdup_f32(sc[0]*scale),svdup_f32(sc[1]*scale));
-        svfloat32_t s23=svsel_f32(lo,svdup_f32(sc[2]*scale),svdup_f32(sc[3]*scale));
+        svfloat32_t s01=svmul_n_f32_x(pg,base01,scale);
+        svfloat32_t s23=svmul_n_f32_x(pg,base23,scale);
         a5=svmla_f32_x(pg,a5,svcvt_f32_s32_x(pg,d01),s01);
         b5=svmla_f32_x(pg,b5,svcvt_f32_s32_x(pg,d23),s23);}
     }
@@ -308,6 +324,14 @@ static void int8_batch_6(float *out,size_t stride,const ds41f_int8 *q,
     if(r+2<q->rows)out[5*stride+r+2]=svaddv_f32(lo,b5);
     if(r+3<q->rows)out[5*stride+r+3]=svaddv_f32(hi,b5);
 }
+typedef struct {
+    float *out;size_t stride,group;
+    const ds41f_int8 *q;const ds41f_int8_input *input;
+    void (*kernel)(float *,size_t,const ds41f_int8 *,const ds41f_int8_input *,size_t,size_t);
+} batch_job;
+static void batch_work(void *context,size_t first,size_t last)
+{batch_job *j=context;for(size_t i=first;i<last;++i)j->kernel(j->out,j->stride,j->q,j->input,j->group,i*4);}
+
 #endif
 int ds41f_int8_matmul_prepared(float *out,size_t output_stride,const ds41f_int8 *q,
                               const ds41f_int8_input *input,size_t batch,
@@ -324,6 +348,10 @@ int ds41f_int8_matmul_prepared(float *out,size_t output_stride,const ds41f_int8 
     if(!reference&&q->block==32&&svcntw()==16&&batch>1){
         void (*kernel)(float *,size_t,const ds41f_int8 *,const ds41f_int8_input *,size_t,size_t)=
             batch==2?int8_batch_2:batch==3?int8_batch_3:batch==4?int8_batch_4:batch==5?int8_batch_5:int8_batch_6;
+        if(ds41f_team_active()){
+            batch_job job={out,output_stride,group_rows,q,input,kernel};
+            return ds41f_team_for((q->rows+3)/4,batch_work,&job);
+        }
         #pragma omp parallel for schedule(static)
         for(size_t r=0;r<q->rows;r+=4)kernel(out,output_stride,q,input,group_rows,r);
         return 0;

@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "ds41f_int8.h"
+#include "ds41f_team.h"
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -10,6 +11,9 @@ static void require(int ok,const char *message)
 {if(!ok){fprintf(stderr,"INT8_BATCH FAIL %s\n",message);exit(1);}}
 static double now(void)
 {struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
+typedef struct {float *out;size_t stride,batch,group;const ds41f_int8 *q;const ds41f_int8_input *input;int rc;} team_case;
+static void team_check(void *context)
+{team_case *c=context;c->rc=ds41f_int8_matmul_prepared(c->out,c->stride,c->q,c->input,c->batch,c->group,0);}
 static void check(size_t rows,size_t cols,size_t block,size_t group,int bench)
 {
     size_t elements=(rows/group)*cols,istride=elements+7,ostride=rows+11;
@@ -31,6 +35,10 @@ static void check(size_t rows,size_t cols,size_t block,size_t group,int bench)
         for(size_t i=0;i<6*ostride;++i)got[i]=12345;
         require(!ds41f_int8_matmul_prepared(got,ostride,&q,prepared,batch,group,0),"prepared batch");
         require(!memcmp(got,ref,batch*ostride*4),"prepared bit exact and stride canaries");
+        for(size_t i=0;i<6*ostride;++i)got[i]=12345;
+        team_case c={got,ostride,batch,group,&q,prepared,0};
+        require(!ds41f_team_run(team_check,&c)&&!c.rc,"persistent prepared batch");
+        require(!memcmp(got,ref,batch*ostride*4),"persistent bit exact and stride canaries");
         for(size_t i=batch*ostride;i<6*ostride;++i)require(got[i]==12345,"inactive token canary");
         for(size_t i=0;i<6*ostride;++i)got[i]=12345;
         require(!ds41f_int8_matmul(got,ostride,&q,x,istride,batch,group,0),"input batch");

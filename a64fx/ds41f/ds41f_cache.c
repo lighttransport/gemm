@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 static const float fp4_values[8]={0,.5f,1,1.5f,2,3,4,6};
+static int cache_sve;
+void ds41f_set_cache_sve(int enabled){cache_sve=!!enabled;}
+int ds41f_get_cache_sve(void){return cache_sve;}
+#include "ds41f_cache_sve.h"
 static unsigned encode(float x)
 {
     float a=fabsf(x);unsigned best=0;
@@ -15,6 +19,9 @@ static unsigned encode(float x)
 int ds41f_fp4_pack(uint8_t *out,const float *x,size_t dim,size_t group,int e4)
 {
     if(!out||!x||!dim||(group!=16&&group!=32)||dim%group)return EINVAL;
+#if defined(__ARM_FEATURE_SVE)
+    if(cache_sve&&svcntw()==16)return cache_pack_sve(out,x,dim,group,e4);
+#endif
     memset(out,0,dim/2+dim/group);
     for(size_t b=0;b<dim;b+=group){float a=e4?6.f/512:6.f*0x1p-126f;
         float v[32];
@@ -34,6 +41,9 @@ int ds41f_fp4_pack(uint8_t *out,const float *x,size_t dim,size_t group,int e4)
 int ds41f_fp4_unpack(float *out,const uint8_t *row,size_t dim,size_t group,int e4)
 {
     if(!out||!row||!dim||(group!=16&&group!=32)||dim%group)return EINVAL;
+#if defined(__ARM_FEATURE_SVE)
+    if(cache_sve&&svcntw()==16)return cache_unpack_sve(out,row,dim,group,e4);
+#endif
     static const float values[16]={0,.5,1,1.5,2,3,4,6,-0.f,-.5,-1,-1.5,-2,-3,-4,-6};
     for(size_t base=0;base<dim;base+=group){uint8_t sc=row[dim/2+base/group];
         float scale=e4?ds41f_fp8_e4m3_to_f32(sc):ds41f_e8m0_to_f32(sc);

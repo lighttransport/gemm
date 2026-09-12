@@ -34,45 +34,87 @@ int ds41f_expert_load(ds41f_expert *e,const char *stage,int layer,int id)
     }
     return 0;
 }
-int ds41f_expert_forward_fused(const ds41f_expert *e,float *out,const float *x,
-                          float route_weight,float *scratch,int reference,int fused)
+int ds41f_expert_forward_prepared(const ds41f_expert *e,float *out,const float *input,
+                                  const ds41f_int8_input *prepared,float route_weight,
+                                  float *scratch,int reference,int fused)
 {
-    if (!e || !out || !x || !scratch||fused<0||fused>2) return EINVAL;
-    for (int i=0;i<3;++i) if (!e->weight[i] || !e->scale[i]) return EINVAL;
+    if(!e||!out||!input||!scratch||fused<0||fused>2)return EINVAL;
+    for(int i=0;i<3;++i)if(!e->weight[i]||!e->scale[i])return EINVAL;
+    if(e->packed_sdot&&(!prepared||prepared->elements!=5120||prepared->block!=32))return EINVAL;
     int (*mv)(float *,const uint8_t *,const uint8_t *,const float *,size_t,size_t)=
         reference?ds41f_mxfp4_matvec_ref:ds41f_mxfp4_matvec;
     float *gate=scratch,*up=scratch+2304,*hidden=scratch+4608;
-    float *input=scratch+6912;
     double pt=P_BEGIN();P_VALUE(EXPERT_COUNT,1);P_VALUE(FP4_BYTES,3*((size_t)5120*2304/2+(size_t)5120*2304/32));
-    int rc=ds41f_act_quant(input,x,5120);
-    if (rc) return rc;
-    ds41f_int8_input prepared={0};
-    if(e->packed_sdot){rc=ds41f_int8_prepare_input(&prepared,input,5120,32);if(rc)return rc;}
-    P_END(EXPERT_QUANT,pt);pt=P_BEGIN();
+    int rc=0;
     if(e->packed_sdot){
-        if(fused&&!reference)rc=ds41f_mxfp4_sdot_pair_prepared(gate,up,e->weight[0],e->scale[0],e->weight[2],e->scale[2],&prepared,2304,5120);
-        else{rc=ds41f_mxfp4_sdot_prepared(gate,e->weight[0],e->scale[0],&prepared,2304,5120,reference);
-            rc|=ds41f_mxfp4_sdot_prepared(up,e->weight[2],e->scale[2],&prepared,2304,5120,reference);}
-        ds41f_int8_input_free(&prepared);
+        if(fused&&!reference)rc=ds41f_mxfp4_sdot_pair_prepared(gate,up,e->weight[0],e->scale[0],e->weight[2],e->scale[2],prepared,2304,5120);
+        else{rc=ds41f_mxfp4_sdot_prepared(gate,e->weight[0],e->scale[0],prepared,2304,5120,reference);
+            rc|=ds41f_mxfp4_sdot_prepared(up,e->weight[2],e->scale[2],prepared,2304,5120,reference);}
     }else if(fused&&!reference)rc=ds41f_mxfp4_matvec_pair(gate,up,e->weight[0],e->scale[0],e->weight[2],e->scale[2],input,2304,5120,fused);
     else{rc=mv(gate,e->weight[0],e->scale[0],input,2304,5120);
         rc|=mv(up,e->weight[2],e->scale[2],input,2304,5120);}
-    if (rc) return rc;
+    if(rc)return rc;
     P_END(EXPERT_W13,pt);pt=P_BEGIN();
     ds41f_round_bf16(gate,2304);ds41f_round_bf16(up,2304);
     P_END(EXPERT_ROUND,pt);pt=P_BEGIN();ds41f_swiglu(hidden,gate,up,2304,10);
-    for (int i=0;i<2304;++i) hidden[i]*=route_weight;
+    for(int i=0;i<2304;++i)hidden[i]*=route_weight;
     P_END(EXPERT_SWIGLU,pt);pt=P_BEGIN();rc=ds41f_act_quant(hidden,hidden,2304);
-    if (rc) return rc;
-    if(e->packed_sdot){rc=ds41f_int8_prepare_input(&prepared,hidden,2304,32);if(rc)return rc;}
+    if(rc)return rc;
+    ds41f_int8_input hidden_input={0};
+    if(e->packed_sdot){rc=ds41f_int8_prepare_input(&hidden_input,hidden,2304,32);if(rc)return rc;}
     P_END(EXPERT_QUANT,pt);pt=P_BEGIN();
-    if(e->packed_sdot){rc=ds41f_mxfp4_sdot_prepared(out,e->weight[1],e->scale[1],&prepared,5120,2304,reference);ds41f_int8_input_free(&prepared);}
+    if(e->packed_sdot){rc=ds41f_mxfp4_sdot_prepared(out,e->weight[1],e->scale[1],&hidden_input,5120,2304,reference);ds41f_int8_input_free(&hidden_input);}
     else rc=mv(out,e->weight[1],e->scale[1],hidden,5120,2304);
-    P_END(EXPERT_W2,pt);pt=P_BEGIN();
-    ds41f_round_bf16(out,5120);
+    P_END(EXPERT_W2,pt);pt=P_BEGIN();ds41f_round_bf16(out,5120);
     P_END(EXPERT_ROUND,pt);return rc;
+}
+int ds41f_expert_forward_fused(const ds41f_expert *e,float *out,const float *x,
+                              float route_weight,float *scratch,int reference,int fused)
+{
+    if(!e||!out||!x||!scratch||fused<0||fused>2)return EINVAL;
+    for(int i=0;i<3;++i)if(!e->weight[i]||!e->scale[i])return EINVAL;
+    float *input=scratch+6912;ds41f_int8_input prepared={0};double pt=P_BEGIN();
+    int rc=ds41f_act_quant(input,x,5120);
+    if(!rc&&e->packed_sdot)rc=ds41f_int8_prepare_input(&prepared,input,5120,32);
+    P_END(EXPERT_QUANT,pt);
+    if(!rc)rc=ds41f_expert_forward_prepared(e,out,input,e->packed_sdot?&prepared:NULL,route_weight,scratch,reference,fused);
+    ds41f_int8_input_free(&prepared);return rc;
 }
 
 int ds41f_expert_forward(const ds41f_expert *e,float *out,const float *x,
                           float route_weight,float *scratch,int reference)
 {return ds41f_expert_forward_fused(e,out,x,route_weight,scratch,reference,0);}
+
+/* Input rows already passed the checkpoint FP8 activation boundary. Keep the
+ * original per-token BF16 and routing-weight boundaries after each matrix. */
+int ds41f_expert_batch_prepared(const ds41f_expert *e,float *out,size_t os,
+                               const float *input,size_t xs,const float *route,
+                               float *scratch,size_t batch)
+{
+    if(!e||!out||!input||!route||!scratch||!batch||batch>6||os<5120||xs<5120||
+       os>SIZE_MAX/sizeof(float)/batch||xs>SIZE_MAX/sizeof(float)/batch)return EINVAL;
+    for(int i=0;i<3;++i)if(!e->weight[i]||!e->scale[i])return EINVAL;
+    float *gate=scratch,*up=gate+batch*2304,*hidden=up+batch*2304;
+    ds41f_int8_input prepared[6]={{0}};int rc=0;
+    if(e->packed_sdot){
+        for(size_t i=0;i<batch&&!rc;++i)rc=ds41f_int8_prepare_input(prepared+i,input+i*xs,5120,32);
+        if(!rc)rc=ds41f_mxfp4_sdot_matmul(gate,2304,e->weight[0],e->scale[0],prepared,2304,5120,batch);
+        if(!rc)rc=ds41f_mxfp4_sdot_matmul(up,2304,e->weight[2],e->scale[2],prepared,2304,5120,batch);
+        for(size_t i=0;i<batch;++i)ds41f_int8_input_free(prepared+i);
+    }else{
+        rc=ds41f_mxfp4_matmul(gate,2304,e->weight[0],e->scale[0],input,xs,2304,5120,batch);
+        if(!rc)rc=ds41f_mxfp4_matmul(up,2304,e->weight[2],e->scale[2],input,xs,2304,5120,batch);
+    }
+    if(rc)return rc;
+    for(size_t i=0;i<batch;++i){float *g=gate+i*2304,*u=up+i*2304,*h=hidden+i*2304;
+        ds41f_round_bf16(g,2304);ds41f_round_bf16(u,2304);ds41f_swiglu(h,g,u,2304,10);
+        for(size_t j=0;j<2304;++j)h[j]*=route[i];rc=ds41f_act_quant(h,h,2304);if(rc)return rc;
+    }
+    if(e->packed_sdot){
+        for(size_t i=0;i<batch&&!rc;++i)rc=ds41f_int8_prepare_input(prepared+i,hidden+i*2304,2304,32);
+        if(!rc)rc=ds41f_mxfp4_sdot_matmul(out,os,e->weight[1],e->scale[1],prepared,5120,2304,batch);
+        for(size_t i=0;i<batch;++i)ds41f_int8_input_free(prepared+i);
+    }else rc=ds41f_mxfp4_matmul(out,os,e->weight[1],e->scale[1],hidden,2304,5120,2304,batch);
+    if(!rc)for(size_t i=0;i<batch;++i)ds41f_round_bf16(out+i*os,5120);
+    return rc;
+}

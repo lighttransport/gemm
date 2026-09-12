@@ -100,8 +100,11 @@ int ds41f_weights_load_local(ds41f_weights *s,const char *stage,const char *pref
     }
     return 0;
 }
+static int tp_vocab(const char *name)
+{return !strcmp(name,"head.weight")||!strcmp(name,"mtp.2.markov_head.embed.weight")||
+    !strcmp(name,"mtp.2.markov_head.head.weight");}
 static int tp_sharded(const char *name)
-{return !strcmp(name,"head.weight")||strstr(name,".attn.wq_b.")||strstr(name,".attn.wo_a.")||
+{return tp_vocab(name)||!strcmp(name,"mtp.0.main_proj.weight")||!strcmp(name,"mtp.0.main_proj.scale")||strstr(name,".attn.wq_b.")||strstr(name,".attn.wo_a.")||
     strstr(name,".attn.wo_b.")||strstr(name,".ffn.shared_experts.");}
 int ds41f_weights_check_tp(ds41f_weights *s,const char *stage,int tp,int rank)
 {
@@ -121,7 +124,7 @@ int ds41f_weights_check_tp(ds41f_weights *s,const char *stage,int tp,int rank)
         if(!found||!tp_sharded(name)||found->rows!=local||found->cols!=cols||first>rows||local>rows-first){rc=EINVAL;break;}
         size_t index=(size_t)(found-s->items);
         if(seen[index]){rc=EINVAL;break;}seen[index]=1;
-        if(!strcmp(name,"head.weight")){
+        if(tp_vocab(name)){
             if(rows!=129280||first!=(rows/32*(size_t)rank/12)*32||
                local!=(rows/32*(size_t)(rank+1)/12)*32-first){rc=EINVAL;break;}
         }else if(rows%(size_t)tp||local!=rows/(size_t)tp||first!=(size_t)(rank%tp)*local){rc=EINVAL;break;}
@@ -196,6 +199,39 @@ int ds41f_linear(const ds41f_weights *s,const char *base,float *out,const float 
                 sum+=value*x[c];}out[r]=sum;}P_END(LINEAR_F32,pt);
     }else return EINVAL;
     pt=P_BEGIN();if(!raw)ds41f_round_bf16(out,w->rows);P_END(LINEAR_ROUND,pt);
+    return 0;
+}
+int ds41f_int8_linear_batch(const ds41f_weight *w,float *out,size_t output_stride,
+                            const float *x,size_t input_stride,size_t batch,
+                            size_t group_rows,int fp8_quantize)
+{
+    if(!w||!w->cols||!out||!x||!batch||batch>6||!group_rows||w->rows%group_rows||
+       w->rows/group_rows>SIZE_MAX/w->cols)return EINVAL;
+    size_t n=w->rows/group_rows*w->cols;
+    if(!n||n>32768||input_stride<n||input_stride>SIZE_MAX/sizeof(float)/batch)return EINVAL;
+    ds41f_int8_input input[6]={{0}};float *quantized=fp8_quantize?malloc(n*sizeof(float)):NULL;
+    if(fp8_quantize&&!quantized)return ENOMEM;
+    int rc=0;
+    for(size_t i=0;i<batch;++i){
+        if(fp8_quantize){rc=ds41f_act_quant(quantized,x+i*input_stride,n);if(rc)break;}
+        rc=ds41f_int8_prepare_input(input+i,fp8_quantize?quantized:x+i*input_stride,n,w->int8.block);if(rc)break;
+    }
+    if(!rc)rc=ds41f_int8_matmul_prepared(out,output_stride,&w->int8,input,batch,group_rows,0);
+    for(size_t i=0;i<batch;++i)ds41f_int8_input_free(input+i);
+    free(quantized);return rc;
+}
+int ds41f_linear_batch(const ds41f_weights *s,const char *base,float *out,size_t output_stride,
+                       const float *x,size_t input_stride,size_t batch,int raw)
+{
+    if(!s||!base||!out||!x||!batch||batch>6)return EINVAL;
+    char name[192];int length=snprintf(name,sizeof name,"%s.weight",base);
+    if(length<0||(size_t)length>=sizeof name)return ENAMETOOLONG;
+    const ds41f_weight *w=ds41f_weight_find(s,name);if(!w)return ENOENT;
+    if(output_stride<w->rows||input_stride<w->cols||output_stride>SIZE_MAX/sizeof(float)/batch||
+       input_stride>SIZE_MAX/sizeof(float)/batch)return EINVAL;
+    if(w->int8.weight){int rc=ds41f_int8_linear_batch(w,out,output_stride,x,input_stride,batch,w->rows,!raw);if(rc)return rc;
+        if(!raw)for(size_t i=0;i<batch;++i)ds41f_round_bf16(out+i*output_stride,w->rows);
+    }else for(size_t i=0;i<batch;++i){int rc=ds41f_linear(s,base,out+i*output_stride,x+i*input_stride,raw);if(rc)return rc;}
     return 0;
 }
 int ds41f_norm(const ds41f_weights *s,const char *name,float *out,const float *x)

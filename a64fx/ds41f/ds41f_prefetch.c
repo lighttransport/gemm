@@ -13,7 +13,7 @@ struct ds41f_prefetch {
     pthread_cond_t request,complete;
     ds41f_engram *engram;
     int stop,pending,submitted,ready[2],error[2];
-    uint64_t ids[2][24];
+    uint64_t ids[2][24],generation;
     float rows[2][24*256];
     double seconds[2];
 };
@@ -61,7 +61,7 @@ int ds41f_prefetch_submit(ds41f_prefetch *p,const uint64_t ids[2][24])
     if(!p||!ids)return EINVAL;
     pthread_mutex_lock(&p->mutex);
     if(p->pending){pthread_mutex_unlock(&p->mutex);return EBUSY;}
-    memcpy(p->ids,ids,sizeof p->ids);p->pending=p->submitted=1;
+    memcpy(p->ids,ids,sizeof p->ids);p->pending=p->submitted=1;++p->generation;
     p->ready[0]=p->ready[1]=0;
     pthread_cond_signal(&p->request);pthread_mutex_unlock(&p->mutex);return 0;
 }
@@ -75,6 +75,21 @@ int ds41f_prefetch_wait(ds41f_prefetch *p,int slot,float rows[24*256],double *re
     if(!rc)memcpy(rows,p->rows[slot],sizeof p->rows[slot]);
     if(read_seconds)*read_seconds=p->seconds[slot];
     pthread_mutex_unlock(&p->mutex);return rc;
+}
+int ds41f_prefetch_drain(ds41f_prefetch *p)
+{
+    if(!p)return EINVAL;
+    pthread_mutex_lock(&p->mutex);
+    while(p->pending)pthread_cond_wait(&p->complete,&p->mutex);
+    int rc=p->submitted?(p->error[0]?p->error[0]:p->error[1]):0;
+    p->submitted=0;p->ready[0]=p->ready[1]=0;
+    pthread_mutex_unlock(&p->mutex);return rc;
+}
+uint64_t ds41f_prefetch_generation(ds41f_prefetch *p)
+{
+    if(!p)return 0;
+    pthread_mutex_lock(&p->mutex);uint64_t generation=p->generation;
+    pthread_mutex_unlock(&p->mutex);return generation;
 }
 void ds41f_prefetch_destroy(ds41f_prefetch *p)
 {

@@ -1,7 +1,47 @@
-# DeepSeek-V4.1-Flash A64FX memory design
+# DeepSeek-V4.1-Flash on 12 A64FX nodes
 
-Latest continuation: [20/30/40 tokens/s implementation plan](#203040-tokenss-implementation-plan).
-The earlier pause was superseded by the request to pursue INT8 SDOT decode.
+See the [current results](#current-results-2026-09-13), the original
+[20/30/40 tokens/s implementation plan](#203040-tokenss-implementation-plan),
+and [remaining work](#future-work-after-the-continuation).
+The earlier pause was superseded by the requests to pursue INT8 SDOT decode
+and implement the plan. Dated sections preserve the experiment history;
+their allocation status and unfinished-task notes describe that point in time.
+The current results and remaining-work list supersede those older notes.
+
+## Current results, 2026-09-13
+
+Implemented TP4 dense attention/shared projections, persistent SVE workers,
+INT8 projection and packed expert SDOT paths, exact SVE cache conversion,
+shared prepared expert inputs, bounded Engram row caching, and the three-stage
+DSpark/MTP draft network with causal batched verification and rejected-suffix
+rollback. All paths use explicit runner arguments. Local weight conversion
+and packing remain below 5% of load time, so no offline INT8 weight replica is
+needed. The original fixed backbone, sparse selection and cache capacity are
+retained.
+
+Three ordinary runs after a **1021-token chat prompt** reach **19.680–19.751
+tokens/s**; the **1024-token code prompt** reaches **19.790–20.029 tokens/s**.
+Both exclude prompt processing and measure 128 subsequent steps. Neither
+prompt passes the three-repeat 20+ criterion. Earlier short-prompt runs grown
+to 1K history exceed 20
+repeatedly; the INT8 speculative path repeats at **20.566–20.709 emitted
+tokens/s** on the capital workload, preserving the selected INT8 control's
+outputs. Its burst-cycle p95 is **279–282 ms**, not a per-token latency.
+
+No track has independent checkpoint/GPU numerical validation: the original
+FP8 CPU control itself fails the independent reference gate, and the
+speed-first INT8/expert/mHC approximations introduce additional differences.
+Bitwise control regression and matching token IDs do not resolve this.
+**Thirty and forty tokens/s remain unachieved.** Attention and the combined
+FFN span dominate the final verifier profiles at about **17–18** and **12–13
+ms per emitted token**, respectively.
+
+The final runner SHA256 is
+`c8a4075a41bb21ff8418d2a4780df78b01c8a14cef885d250e02c913ef68f96d`.
+The last suite completed successfully on allocation 51575979; no further
+benchmark drivers are queued. See the [long-prompt results](#ordinary-decode-after-1k-prompts)
+and [batched verifier results](#final-batched-verifier-gates-and-timing) for
+test commands, memory minima and evidence locations.
 
 ## Implementation continuation: persistent workers and SDOT, 2026-09-13
 
@@ -31,13 +71,14 @@ Evidence and immutable launch scripts are under
 `tmp/ds41f/job51575979/scale-rope-runs-v1` and
 `tp4-scale-rope-approx-repeat{1,2,3}-v1/summary.json`.
 The separate instrumented run measures 19.802 tokens/s. The newest fused
-SDOT pair reaches 20.111 tokens/s instrumented on the earlier allocation;
-its own three uninstrumented repeats and fixed-history replay are running.
-Do not attribute the table above to the newest pair fusion.
+SDOT pair reaches 20.111 tokens/s instrumented on the earlier allocation.
+Its completed repeats and fixed-history checks appear in the continuation
+below; the table above belongs to the preceding binary.
 
 ### Numerical status
 
-The latest INT8 version preserving the existing INT8 control's outputs reaches
+The ordinary INT8 version at this stage preserving the existing INT8
+control's outputs reaches
 **16.513 tokens/s**, 60.558 ms/token instrumented. All 1105 token triples and
 nine early logit arrays are bitwise identical to that control. The FP8 short
 run also retains its nine control logit arrays bit-for-bit. These are regression
@@ -45,7 +86,7 @@ checks against selected controls, not independent checkpoint validation.
 
 The speed-first configuration above fails the early nine-position FP8 gate:
 minimum cosine **0.996026**, maximum relative RMS **9.081%**, despite matching
-all nine argmax IDs. Fixed-history 1K checks are being collected. Earlier
+all nine argmax IDs. The continuation below records the failed fixed-history 1K gate. Earlier
 individual approximate variants also fail: expert SDOT alone has minimum
 cosine 0.987906 and RMS 19.618%; sparse SDOT alone has cosine 0.996813 and RMS
 8.017%. The gate remains cosine >=0.999 and relative RMS <=1%, with argmax
@@ -145,18 +186,538 @@ plus `--engram-prefetch --engram-scale-cache --hc-mix-sve --shared-overlap
 Omit `--expert-sdot --hc-matvec 1` to retain the INT8 control's outputs.
 Omit INT8 conversion as well for the FP8 regression control.
 
-Allocation 51569201 has expired. **51575979** remains active until 04:50:08
-JST September 13, bridge 42395/32395/21266. Original and TP4 staging completed
+Allocation 51569201 expired. The following continuation used **51575979**,
+scheduled through 04:50:08 JST September 13, bridge 42395/32395/21266. Original
+and TP4 staging completed
 with exact-byte manifests. One MPI program runs at a time; drivers and
 binaries are immutable snapshots with verified hashes. Repeats above retain
 at least 3.25 GB final MemAvailable, above the 2 GiB admission floor.
 
-Remaining work: finish the newest paired-path repeats and fixed-history 1K
-checks; add chat/code quality and prompt-dependent timing; investigate the
-independent FP8 mismatch before labeling any track validated; then integrate
-DSpark staging/draft execution, causal batched verification and state rollback.
-The exact INT8 1..6-token GEMM is only kernel groundwork. No integrated MTP
-inference, rollback or speculative token-rate result is claimed yet.
+The following continuation records the completed paired-path, fixed-history,
+chat/code and DSpark work. The independent FP8 mismatch remains unresolved;
+no track has independent checkpoint validation.
+
+## Validation and DSpark continuation, 2026-09-13
+
+The fused SDOT pair binary (`997e966b83487cc6864fb64d2629b223309d89bcd147ed61360be14b0ec5dbb9`)
+finishes its own three uninstrumented capital-prompt repeats at
+**20.523 / 20.039 / 20.330 tokens/s**, with p95 **52.528 / 54.640 / 53.199 ms**.
+All 1105 token triples match its approximate profile control. Final minimum
+MemAvailable is 3.279 / 3.249 / 3.213 GB. The separate profile is 20.302 tokens/s.
+There is no clear end-to-end improvement over the preceding unfused SDOT
+configuration once run variation is considered.
+
+The 20+ result is prompt-dependent. One uninstrumented chat run reaches
+**19.360 tokens/s** (51.653 ms mean, 53.259 ms p95), and one code run reaches
+**20.256 tokens/s** (49.368 ms mean, 52.320 ms p95), again at positions
+1000..1104. These are single measurements, not three-repeat milestones.
+The checkpoint chat encoder is used; exact messages and token IDs are in
+`tmp/ds41f/job51575979/validation-runs-v1/{chat,code}.{json,ids}`.
+
+Full fixed-history checks now establish that the newest FP8 and INT8
+regression paths preserve all nine logits at positions 1000..1008 bit-for-bit.
+The optimized FP8 path also matches original FP8 logits bit-for-bit on nine
+positions near the end of each chat/code prompt. The approximate path fails:
+
+| Fixed inputs | Minimum cosine vs FP8 | Maximum relative RMS | Saved argmax matches |
+| --- | ---: | ---: | ---: |
+| 1K replay | 0.900356 | 44.585% | 9/9 |
+| Chat prompt | 0.956396 | 29.682% | 8/9 |
+| Code prompt | 0.968010 | 25.852% | 9/9 |
+
+These results confirm that token agreement cannot replace the numerical gate.
+No quality-validated 20+ claim is made.
+
+The DSpark/MTP implementation now includes:
+
+- `stage_mtp.py` inventories all **2401 MTP tensors**, 7,932,874,632 source
+  bytes, and stages exact bounded ranges separately under
+  `/local/u14346/ds41f-51575979/mtp/rank<R>`. Stage owners are 0/4/8;
+  dense/main projections use TP4; 128 draft experts use expert-ID modulo 12;
+  Markov embedding/head rows use all twelve ranks. Backbone embedding/head
+  are reused. All rank staging, row metadata and converted-load tests pass.
+  Original MTP shards are 613.3–703.8 MB/rank; converted resident shards are
+  618.1–712.2 MB/rank. Admission reads the small index before payload loading.
+- The draft network implements all three stages, the full five-position
+  seed/noise block, hidden taps before layers 37/38/39 attention, main projection
+  and KV seeding, uncompressed theta=10000 RoPE, all-five-draft-key attention,
+  mHC, top-3 MoE, shared backbone head, Markov bias and confidence. Draft KV is
+  temporary; only committed main hidden positions update the MTP windows.
+- A bounded NumPy replay uses the original safetensors and captured main taps.
+  At position eight, all five FP8 draft argmax IDs match: seed 270, proposals
+  3669/223/22/14/270. Minimum logit cosine is 0.999553, maximum relative RMS
+  3.012%; thus this does not pass the full 1% RMS gate or establish GPU parity.
+  The approximate draft differs at one proposed ID and has up to 22.647% RMS
+  error; later Markov inputs then differ too, so those later logit differences
+  are sequence-level draft differences. Confidence never bypasses verification.
+- `ds41f_journal` records only overwritten window/cache rows, pools, selected
+  IDs/candidates, publication bytes and Engram history/counters. The bound is
+  **1,375,280 bytes/rank for six inputs at 1M capacity**. Native and A64FX tests
+  pass all 297 prefix/rejection, window wrap, compression, top-k and memory
+  cases. Prefetch drain waits for pending reads and invalidates stale results;
+  generations remain monotonic. Updated 96-generation tests pass on both hosts.
+- `--speculate 2/4/5` is off by default. The initial sequential verifier
+  calculates every proposal's causal output, commits only the accepted prefix
+  plus bonus input state, and updates MTP KV for each committed position.
+  All twelve sequential-verifier cases pass: draft lengths 2/4/5, forced
+  rejection at positions zero through four, window position 127, selector
+  position 511, FP8 control, and a complete 1100-output INT8 run. The full run
+  preserves all 1105 token triples and nine early logits exactly. Around 1K,
+  complete cycles emit 101 tokens at **15.436 tokens/s**, averaging 5.611 emitted
+  tokens/cycle and 1.050 verified inputs/emitted token. Draft/verify/commit cost
+  is 2.427/62.146/0.213 ms per emitted token; final minimum memory is 2.447 GB.
+  This is slower than ordinary decode and is not a speculative milestone. Ordinary profile mode is rejected with speculation,
+  and `SPEC_CYCLE` records actual draft/verify/commit time and emitted counts.
+- The causal batched verifier passes the regression checks below. It shares INT8 projection
+  weights for 1..6 inputs while preserving GEMV accumulation and BF16 boundaries.
+  Each input has its own bounded 128-token window and small selector state;
+  compressed append data remains shared with position-bounded reads. Six window
+  views cost about 63 MB/rank, never a copy of the full 1M compressed cache.
+  All batch sizes 1..6 preserve nine early FP8 and INT8 logits bit-for-bit;
+  INT8 batch 3 and FP8 batch 6 also preserve nine fixed 1K logits bit-for-bit.
+  The diagnostic sequential/batched runs pass complete state, tap and token
+  checks, including grouped experts and forced rejection at all five positions.
+  Actual emitted-token performance is reported separately below. `--verify-expert-batch` adds
+  FP4/packed-SDOT weight reuse for common expert IDs, with outputs retained by
+  original route slot so that each token's sum order stays unchanged; full
+  A64FX kernels pass all 384 stride/canary/persistent-team cases; the full
+  expert passes every batch size 1..6 bit-for-bit for original FP4 and packed
+  SDOT. Complete expert speedups are about 1.2–1.5x for most batches, but the
+  original six-token packed case was only 0.581/0.570 ms. The latest six-input
+  implementation uses two three-input tiles per output row in one worker
+  dispatch. Its complete packed expert measures **0.405 ms versus 0.597 ms**
+  for six sequential fused calls; the original FP4 expert measures **0.661
+  versus 0.994 ms**. The batched API receives already FP8-quantized inputs;
+  full-run timing includes their preparation. These are current operator
+  comparisons, not an isolated end-to-end
+  attribution to the tile change. The latest 384 A64FX projection cases also
+  cover NaN scales; native undefined-behavior trap instrumentation passes.
+  Full-model checks precede throughput claims.
+
+Evidence is under `tmp/ds41f/job51575979/`: `mtp-stage-check-v1`,
+`mtp-probes-v1`, `mtp-reference-v1`, `spec-sequential-tests-v1` and
+`verifier-checks-v1`. Kernel conversion and staging stay online from `/local`;
+no new offline quantized-weight copies have been written to shared storage.
+Grouped experts now pass early and fixed-1K FP8/INT8 checks, all five forced
+rejection positions, EOS for prefixes 2/4/5, and output limits 1/2/3. EOS and
+limit cases also preserve final backbone/MTP state hashes on all twelve ranks.
+Full 1K speculative comparison and actual emitted-token timing for prefixes
+2/4/5 are reported below. Thirty and forty tokens/s remain unachieved targets.
+
+
+The first full grouped-verifier INT8 runs preserve all 1105 triples and nine
+early logits. Actual complete-cycle throughput near 1K is:
+
+| Verified draft prefix | Emitted tokens/s | Emitted/cycle | Verify ms/emitted | Minimum final memory |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | 18.540 | 2.889 | 48.814 | 2.274 GB |
+| 4 | 19.372 | 4.636 | 48.443 | 2.210 GB |
+| 5 | 19.261 | 5.611 | 49.096 | 2.263 GB |
+
+These use binary `f6f85814893bf59206e600a8aa3e6be264cb8af4aeb1dc0742aea02ed57cc5ac`.
+Four is preferred within the 1% timing tie. There is no 20+ speculative INT8
+milestone yet: increased acceptance does not remove the per-input verifier
+cost. Phase tracing and the later row-cache/batched-transport experiments
+must establish the next improvement. The approximate prefix-five run reaches
+only **16.179 tokens/s**, averaging 4.04 emitted tokens/cycle: verification costs
+57.867 ms per emitted token because more proposals are rejected. Its complete
+1105-token sequence still matches the approximate control. Speculation is not
+yet a speed win over ordinary approximate decode.
+
+The first phase-trace implementation perturbs timing: the INT8 prefix-four
+trace run spends 4.395 ms/emitted in commit versus 0.314 ms without tracing,
+as ranks catch up after shared-storage log writes. The replacement buffers
+at most 256 recent records/rank (595,968 bytes), including per-layer owner
+timings, and writes them after the timed run to `verify-timing.rank<RR>.log`.
+`verify_report.py` attributes each layer to its owner and compares the resulting
+path with actual verification time. Nested maximum expert durations are
+reported separately. Earlier uninstrumented rates remain the performance
+reference; do not treat the synchronous logging delay as model compute.
+
+### Final batched verifier gates and timing
+
+Binary SHA256
+`a75e9981b30057cccfae6ca5f69cf73b341cbf19e5951198ce3c6234725f2637`
+combines the row cache, shared expert inputs, six-input microtiles, batched
+transport and buffered tracing. The short FP8/INT8/approximate checks pass
+sequential-versus-batched state, hidden taps and tokens. The INT8 batch-six
+fixed-input replay preserves all 1105 triples and all nine full logits at
+positions 1000..1008. EOS preserves final backbone and MTP state on all twelve
+ranks. These are selected-control regressions, not independent validation.
+Evidence is under `final-verifier-runs-v2` and `final-verifier-*-v1`.
+
+The first full INT8 five-draft run reaches **20.662 emitted tokens/s** over
+18 complete cycles at positions 1004..1104, emitting 101 tokens. Mean emitted
+count is 5.611/cycle; draft/verify/commit cost is **2.623 / 45.463 / 0.311
+ms/emitted**. Minimum final memory is 2.321 GB. All 1105 triples and nine early
+logits match the INT8 control. Cycle p95 is **280.521 ms**, distinct from
+amortized per-token latency. The buffered profile and repeat results follow below.
+This final version timed INT8 prefix five only; earlier 2/4/5 results
+belong to the preceding binary and do not prove the new optimal prefix.
+
+The approximate two-draft case reaches **20.993 emitted tokens/s**, averaging
+2.667 emitted/cycle. Draft/verify/commit costs **5.492 / 41.715 / 0.428
+ms/emitted**, with minimum final memory 2.250 GB. It preserves all 1105 triples
+and nine early logits of its approximate control. Completed prefix-four/five
+and selected-prefix results follow below; no speculative 30/40 claim is made.
+
+The first approximate five-draft attempt in `final-verifier-runs-v2` stopped
+before inference with ENOMEM from the conversion budget. Rank 0 started with
+30,756,896,768 bytes available, about 31 MB less than the preceding run. The
+static limit reserved future KV/Engram/MTP allocations while also charging the
+currently coexisting source and replacement tensor. It could reject a safe
+transient conversion. `weight_prepare_limit()` instead uses current resident
+bytes plus current MemAvailable above the **unchanged 2 GiB floor**, while
+retaining initial loading admission, later allocation checks and the final
+resident guard. No kernel, dtype, context capacity or decoding setting changed.
+
+The corrected binary is
+`c8a4075a41bb21ff8418d2a4780df78b01c8a14cef885d250e02c913ef68f96d`.
+`final-verifier-runs-v3` completed the missing five-draft case in
+`final-spec-approx-d5-full-v2`, then profiled and repeated the selected prefixes.
+The retry loads with 2,279,473,152 bytes available on rank 0. Existing completed
+results from the prior binary remain valid; the aborted attempt has no token
+rate. Queued long-prompt drivers stopped before launching MPI when their
+predecessor failed and are replaced by the bounded combined suite below.
+
+The corrected five-draft approximate retry finishes at **17.678 tokens/s**
+with 4.04 emitted/cycle and 3.665 / 52.543 / 0.360 ms/emitted in draft / verify /
+commit. Minimum final memory is 2.189 GB; all 1105 triples and nine early logits
+match the approximate control. Prefix two remains the selected approximate
+candidate; prefix four measured 18.772 tokens/s with 3.643 emitted/cycle.
+
+The buffered approximate prefix-two profile reaches **20.751 tokens/s**.
+Its owner-attributed verifier spans are:
+
+| Span | ms per actual emitted token |
+| --- | ---: |
+| Begin: snapshots and Engram preparation on rank 0 | 1.669 |
+| Pre: attention mHC/norm and Engram projection/collection | 3.369 |
+| Attention | 18.080 |
+| Gate: attention post, FFN mHC/norm and routing | 3.489 |
+| FFN broadcast | 2.223 |
+| Owner routed experts | 1.869 |
+| Shared expert and routed reduction/wait | 8.906 |
+| FFN post and residual handoff | 1.743 |
+| Head | 0.619 |
+| **Reconstructed verifier** | **41.969** |
+| **Measured verifier** | **42.177** |
+
+The combined FFN envelope is 12.999 ms; the 6.725 ms maximum routed-expert
+work is nested inside it and must not be added. Layer zero accounts for
+0.953 ms of the broadcast span, largely exposing start-of-batch arrival skew;
+this is not a wire-only measurement. Drafting costs 5.575 ms/emitted and commit
+0.438 ms. Attention and the FFN envelope dominate. Evidence is
+`final-spec-approx-d2-profile-v1/verify-summary.json`. Compiled SVE stores
+also confirm the large causal windows/candidate buffers are physically cleared
+before their admission check; the earlier reservation failure was not a missing
+window initialization.
+
+The selected approximate two-draft path now finishes all three uninstrumented
+repeats at **21.073 / 20.944 / 20.875 emitted tokens/s**. Every run preserves
+all 1105 triples and nine early logits. Amortized-token p95 is **66.855 /
+67.538 / 67.643 ms**; burst-cycle p95 is **133.047 / 134.610 / 134.830 ms**.
+Minimum final MemAvailable is **2.219 / 2.225 / 2.219 GB**. These repeats use
+the corrected `c8a4075a...` binary. This is repeatable 20+ speculation
+against the approximate control, but it does not beat the faster ordinary
+approximate capital measurements. The completed INT8 repeats are recorded below.
+
+The buffered INT8 prefix-five profile reaches **20.625 tokens/s**. It measures
+**45.664 ms/emitted** in verification; the owner reconstruction is **45.496**
+(difference 0.168). Attention is **17.124**, the combined FFN envelope **12.441**,
+and the pre/gate spans **6.540 / 6.667 ms/emitted**. These latter spans include
+ordered mHC, norms, Engram work and routing, not mHC alone. Begin, post/handoff
+and head cost **0.610 / 1.579 / 0.535**. Draft/commit add **2.510 / 0.312**.
+Maximum routed-expert work is **8.452 ms**, nested inside the FFN envelope.
+See `final-spec-int8-d5-profile-v1/verify-summary.json`.
+
+The INT8 five-draft path completes three uninstrumented repeats at
+**20.566 / 20.679 / 20.709 emitted tokens/s**, mean **48.623 / 48.359 /
+48.288 ms/emitted**. All 1105 triples and nine early logits match the INT8
+control. Each selected window contains 18 complete cycles and 101 emitted
+tokens at positions 1004..1104. Amortized-token p95 is **47.449 / 47.083 /
+46.892 ms**; burst-cycle p95 is **281.457 / 282.169 / 278.884 ms**. The
+amortized p95 can be below the mean because a small number of low-acceptance
+cycles contribute fewer than 5% of emitted tokens. Minimum final MemAvailable
+is **2.235 / 2.212 / 2.312 GB**, above 2 GiB. These repeats use the corrected
+`c8a4075a...` binary. This establishes repeatable 20+ speculation against the
+selected INT8 control on this prompt; it does not establish FP8 or GPU parity,
+a new optimal INT8 draft prefix, or a prompt-independent speculative milestone.
+
+### Exact SVE cache conversion
+
+`--cache-sve` vectorizes the FP4 packing used by the sparse index and unpacking
+of selected compressed KV rows. It retains original BF16 rounding, scale
+calculation, rounded-distance comparisons, ties and signed zero. All 17,408
+A64FX conversion cases pass. The 32-query packing/unpacking operator falls
+from 196.708 to 39.829 microseconds; 512-row KV unpack falls from 132.459 to
+18.051 microseconds, including the existing OpenMP launch. Early model logits
+are bit-for-bit identical on FP8, INT8 and the selected approximate control.
+Fixed-1K FP8 and INT8 logits both pass bit-for-bit, as do all early control
+checks. Evidence is under `tmp/ds41f/job51575979/cache-sve-runs-v1`. The separate full-run profile is **47.386 ms/token, 21.103 tokens/s**.
+Index preparation falls from 2.960 to 1.585 ms and selected-row work from
+1.496 to 1.194 ms; total attention is 19.947 ms, experts/shared 11.062 ms.
+The three uninstrumented capital repeats reach **20.583 / 21.070 / 21.309
+tokens/s**, with p95 **54.732 / 51.476 / 50.516 ms** and minimum final
+MemAvailable **3.224 / 3.197 / 3.199 GB**. All 1105 triples match the approximate
+control. Binary SHA-256 is
+`fa58eb9206e5c9f281946bd4652a3bfd82726d555807483abaabcb657ea4da3e`.
+This is a repeatable 20+ approximate result. Code repeats are **20.731 /
+20.755 / 20.896 tokens/s**, with p95 51.544 / 51.253 / 50.747 ms and final
+minimum memory 3.178 / 3.153 / 3.146 GB. All 1148 code triples match their
+approximate control. Chat repeats remain below the milestone as detailed below.
+
+`--expert-input-cache` additionally prepares the original FP8 activation and
+optional SDOT input once per rank/layer, then shares them across locally owned
+routed experts. Hidden activation preparation remains per expert, and original
+route accumulation order is retained. Early FP8/INT8/approximate and fixed-1K
+FP8/INT8 regression checks pass. The separate profile reduces the slowest-rank
+expert quantization component from 1.764 to 1.410 ms, with total latency
+47.616 ms (21.001 tokens/s). Capital repeats reach **21.394 / 21.527 / 21.526
+tokens/s**, p95 **49.796 / 49.885 / 50.276 ms**, minimum final MemAvailable
+**3.077 / 3.118 / 3.064 GB**. All 1105 triples are unchanged. Binary SHA256 is
+`f5d47ab4c997a5c7091e5001231ab8f28ea694148997bca5fc50b3b2ca53b363`;
+evidence is in `expert-input-runs-v1` and `expert-input-approx-*-repeat*-v1`.
+Chat repeats reach **19.710 / 19.737 / 19.017 tokens/s**, p95
+**54.338 / 54.909 / 60.812 ms**, minimum final MemAvailable
+**3.072 / 3.062 / 3.061 GB**; all 1133 triples match their control.
+This does not establish a chat speedup or a prompt-independent 20+ milestone.
+
+The chat repeats are 20.040 / 19.937 / 19.291 tokens/s (p95 51.884 / 51.779 /
+59.602 ms), so this cache-SVE-only configuration does not hold 20+ across
+prompts. The later row-cache results below do. The profile
+still exposes 1.278 ms/token of Engram I/O. The next bounded experiment, `--engram-row-cache-mib 8`, is an
+8 MiB-budget immutable BF16 row cache (4,259,840 bytes actually allocated): direct-mapped entries keyed by table and
+row, no cache insertion after a failed read, and unchanged logical lookup
+counters. One prefetch reader owns it; drain before clearing. It survives
+speculative rollback because cached weight rows are immutable. Include its
+allocation in admission and test collisions, table isolation, hits, errors,
+threaded prefetch and cache clear before measuring end-to-end latency. The
+expanded native and A64FX 96-generation prefetch tests pass all these cases.
+The forced-rejection state/tap/token test, early FP8/INT8/approximate checks,
+and fixed-1K FP8/INT8 checks all pass in `row-cache-runs-v1`. Its first profile
+shows **48.584 ms/token, 20.583 tokens/s**, with 16,005 hits and 37,035 misses
+across all ranks over the full input sequence (30.175% hits). Critical-path
+Engram I/O is 1.162 ms versus 1.173 ms without the row cache. This alone does
+not establish a useful speedup. The three capital repeats are **21.068 /
+20.861 / 21.188 tokens/s**, p95 **52.417 / 53.302 / 51.406 ms**, minimum final
+MemAvailable **3.073 / 3.081 / 3.084 GB**. All are slower than the 21.394–21.527
+range without the row cache, so keep it off in the retained ordinary path.
+Speculative verification keeps it as a separate experiment because rejected
+proposals can increase repeated reads. Chat shows a different outcome:
+**20.612 / 20.692 / 20.620 tokens/s**, p95 **53.315 / 50.809 / 53.224 ms**,
+minimum final memory **3.056 / 3.045 / 3.041 GB**. All 1133 triples agree.
+Its 27,345 hits and 27,039 misses give 50.281% hits across the full sequence.
+These chat repeats all exceed 20; the cache remains explicit and its benefit
+is prompt-dependent. Code repeats are **20.517 / 20.508 / 20.735 tokens/s**,
+p95 **52.327 / 52.446 / 51.432 ms**, minimum final memory **3.056 / 3.055 /
+3.064 GB**. All 1148 triples match; the full-sequence row-cache hit rate is
+38.126%. Row-cache binary SHA256 is
+`934edb2c0f177f2c24eaeabf663225a037eb099cb48dee7e84739fdc70c61601`. Thus this single approximate configuration exceeds 20 in all nine
+short-prompt/grown-history repeats, although the cache-disabled capital/code
+configurations have higher peaks. This remains regression evidence rather
+than independent checkpoint validation.
+
+The ordinary profile spends 2.653 ms in FFN broadcast and 1.335 ms in residual
+handoff. The verifier currently repeats those messages for each input. The next
+transport experiment, `--verify-comm-batch`, packs the 1..6 independent BF16 rows
+and their exact FP32 tails into one message, and combines TP gathers while
+unpacking into the original token/rank order. Keep the existing acknowledged
+expert sum. Bound each wire workspace below 256 KiB, retain signed-zero rules,
+and check every owner, all batch sizes, strides/tails, delayed receivers and
+full-model state/logits before timing. No arithmetic reduction is changed.
+The A64FX transport tests now pass TP1/TP2/TP4, every owner, all six batch
+sizes, zero counts, mixed tails, signed zero, strides/canaries and delayed
+receivers. Evidence is in `final-verifier-runs-v2/output.51575979/0` (launches
+141–145 also contain the FP4 and complete-expert checks).
+
+Next experiments are driven by these remaining costs: common-expert batching
+and dense weight reuse first; then batch input quantization/dispatch, MTP
+projection batching, and tighter transport integration if the verifier profile
+supports them. `--verify-timing` reports rank-local batch phase durations as a
+diagnostic; waits and rank maxima must not be added as independent compute.
+An ordinary 30 tokens/s step needs another 14.05 ms removed from this profile;
+eliminating all expert/shared cost alone is insufficient. Ordinary 40 tokens/s
+needs 22.39 ms removed. Neither is implied by the weight-only bandwidth bound.
+
+### Reproduce the continuation
+
+The new paths remain explicit runner arguments. Use TP4 staging and the
+ordinary arguments listed above, then add `--cache-sve --expert-input-cache`.
+The row-cache experiment adds `--engram-row-cache-mib 8`. The final verifier
+uses all three additions plus:
+
+```sh
+--mtp-stage-root /local/u14346/ds41f-51575979/mtp \
+--speculate 5 --verify-batch --verify-expert-batch --verify-comm-batch
+```
+
+MTP defaults independently to `--mtp-quant 1 --mtp-expert-sdot 1
+--mtp-hc-matvec 1`, including with an FP8 backbone. To inspect the original
+FP8 draft path, explicitly set all three MTP arguments to zero. Draft
+approximation affects acceptance; the selected backbone still verifies every
+emitted token. `--verify-check` runs both verifiers and compares state, taps
+and predictions; it is a correctness diagnostic, not a speed configuration.
+`--spec-force-reject 0..4` tests rejected prefixes. `--state-hash` supports
+EOS/output-limit comparisons across all twelve ranks.
+
+New target builds and representative remote checks:
+
+```sh
+TMPDIR="$PWD/tmp/ds41f" make -C a64fx/ds41f ds41f_run test_cache_sve \
+  test_prefetch test_journal test_tp_weights test_mtp_weights test_int8_batch \
+  test_input_cache test_fp4_batch test_expert_batch test_comm_batch \
+  A64FX_CC=fccpx A64FX_MPICC=mpifccpx \
+  A64FX_CFLAGS='-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall -Wextra -Wpedantic'
+# Snapshot executables first; run one MPI program at a time inside allocation.
+mpiexec -np 1 ./test_cache_sve
+mpiexec -np 1 ./test_prefetch /local/u14346/ds41f-51575979/prefetch-fixture
+mpiexec -np 1 ./test_journal
+mpiexec -np 1 ./test_fp4_batch bench
+mpiexec -np 1 ./test_expert_batch
+mpiexec -np 12 ./test_comm_batch 1
+mpiexec -np 12 ./test_comm_batch 2
+mpiexec -np 12 ./test_comm_batch 4
+```
+
+On the frontend, measure ordinary and speculative runs separately:
+
+```sh
+python3 a64fx/ds41f/decode_report.py RESULTS --baseline MATCHED_CONTROL \
+  --start 1000 --stop 1105 --json RESULTS/summary.json
+python3 a64fx/ds41f/spec_report.py SPEC_RESULTS \
+  --start 1000 --stop 1105 --json SPEC_RESULTS/spec-summary.json
+# Separate profiling run with --verify-timing; logs are written after decoding.
+python3 a64fx/ds41f/verify_report.py PROFILE_RESULTS \
+  --start 1000 --stop 1105 --json PROFILE_RESULTS/verify-summary.json
+```
+
+`decode_report.py` requires every requested position after prompt processing
+and all twelve completed rank logs; it rejects batched fixed-input replay. Its optional baseline comparison checks the entire token trace.
+`spec_report.py` uses complete cycles wholly inside the requested range and
+actual emitted tokens; it reports both amortized token latency and burst cycle
+p95. Forced-rejection diagnostics cannot be reported as performance. Neither
+report substitutes for the nine-position full-logit quality check.
+
+### Ordinary decode after 1K prompts
+
+The additional suite `long-final-runs-v1` completed all eight cases after the
+final verifier runs, with exit status zero.
+Its checkpoint-encoded engineering chat and C-review prompts contain **1021
+and 1024 tokens**, respectively. Exact messages, encoded text, IDs and
+source/tokenizer/encoder hashes are under `long-prompt-inputs-v2`. Each case
+generates 129 outputs and measures the 128 forward steps beginning at the
+prompt length, excluding prompt processing. Row-cache off/on was compared once
+per prompt; both comparisons fell within the 1% tie, so off was retained and
+repeated twice. Chat measures positions **1021..1148**, code **1024..1151**.
+
+| Prompt | Row cache | Repeat | Mean ms/token | tokens/s | p95 ms/token | Minimum final MemAvailable, bytes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Chat | Off | 1 | 50.632 | 19.751 | 55.750 | 3,054,305,280 |
+| Chat | On, 8 MiB budget | 1 | 50.619 | 19.755 | 54.738 | 3,024,420,864 |
+| Chat | Off | 2 | 50.796 | 19.686 | 56.046 | 2,968,780,800 |
+| Chat | Off | 3 | 50.812 | 19.680 | 56.579 | 3,049,193,472 |
+| Code | Off | 1 | 50.399 | 19.842 | 53.787 | 3,031,433,216 |
+| Code | On, 8 MiB budget | 1 | 50.358 | 19.858 | 54.200 | 3,038,904,320 |
+| Code | Off | 2 | 49.929 | 20.029 | 53.311 | 3,045,457,920 |
+| Code | Off | 3 | 50.531 | 19.790 | 55.821 | 2,992,766,976 |
+
+All twelve ranks finish every run. Each cache-enabled run and both later
+cache-disabled repeats preserve the complete matched baseline trace: **1149
+triples for chat**, **1152 for code**. The two first cache-disabled runs define
+these controls; this suite does not compare full logits with an independent
+reference. Every run uses the final `c8a4075a...` binary and the approximate
+backbone settings below. No profiler or logit dump is enabled.
+
+The ordinary **20+ milestone does not hold across these actual 1K prompts**.
+Row caching helps some earlier short-prompt/growing-history workloads, but has
+no material benefit here. Speculative 20+ was measured on the short capital
+prompt grown to 1K, and still needs this long-prompt test. This distinction is
+necessary because generated repetition can change cache hits and draft
+acceptance. Thirty and forty tokens/s have not been demonstrated in either
+history setup.
+
+Evidence is in `tmp/ds41f/job51575979/long-final-{off,on}-{chat,code}-repeat<N>-v1/summary.json`
+and `long-final-runs-v1/selection.json`. Chat/code token-ID SHA256 values are
+`c99b7d162e68154b67cdd3615b2829505d192f697ceffc01156d68c9bdad3923`
+and `61cc865a7d28571115cb9e62c446cbc74345bf2908a3646952a971ffef9cfa65`.
+The driver admitted the full suite only with twenty-four minutes remaining
+before its reserved finish deadline and launched one MPI program at a time.
+
+The complete ordinary chat invocation inside the allocation is below. Use an
+empty result directory containing the verified runner snapshot, and the actual
+repository root for `DS41F_REPO`. Stage paths must be regenerated for a fresh
+allocation because `/local` does not survive it.
+
+```sh
+DS41F_REPO=/vol0006/mdt0/data/hp250467/work/gemm/ds4f
+OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active \
+mpiexec -np 12 ./ds41f_run \
+  --stage-root /local/u14346/ds41f-51575979/tp4 --dense-tp 4 \
+  --max-context 1048576 --engram-prefetch --engram-scale-cache \
+  --hc-mix-sve --shared-overlap --weights-local-pages --mpi-broadcast \
+  --compact-comm --sparse-tile 4 --index-head-tiles --expert-fused 1 \
+  --linear-input-cache --quant-parallel --persistent-team --rope-cache \
+  --cache-sve --expert-input-cache --fp8-int8-block 32 --expert-sdot \
+  --hc-matvec 1 \
+  --prompt-ids "$DS41F_REPO/tmp/ds41f/job51575979/long-prompt-inputs-v2/chat.ids" \
+  --generate 129 --ignore-eos
+python3 "$DS41F_REPO/a64fx/ds41f/decode_report.py" . \
+  --start 1021 --stop 1149 --json summary.json
+```
+
+For code use `code.ids` and report positions `--start 1024 --stop 1152`.
+Adding `--engram-row-cache-mib 8` reproduces the row-cache comparison.
+These are approximate backbone settings; omit `--expert-sdot --hc-matvec 1`
+for the selected INT8 control. Actual immutable arguments for every experiment
+are in its `args.json`; none of these ordinary commands enables speculation.
+
+### Future work after the continuation
+
+1. Resolve the original FP8 independent-reference discrepancy before declaring
+   checkpoint or GPU parity. Keep the fixed-input cosine >=0.999, relative RMS
+   <=1% and argmax gates. Then isolate the additional INT8, expert SDOT and
+   mHC approximations with bounded same-input layer captures.
+2. Use the final buffered verifier profile to choose the next batch operator.
+   Prioritize an exact batched mHC matrix kernel: schedule the independent
+   `(token, row)` pairs together (up to 6 × 24 jobs), retaining every row
+   reduction's original K order, normalization and BF16 boundaries. This can
+   use all 48 workers without the rejected split-K approximation; measure the
+   complete operator and fixed-history verifier before claiming a speedup.
+   QA/KV preparation, index preparation, mHC and MTP projections still contain
+   per-input dispatches. Parallelize the bounded window snapshot copies and
+   overlap Engram preparation with them or early owner work; the first-layer
+   broadcast exposes start-of-batch producer skew. Batch independent
+   projections and quantization while
+   preserving each causal cache view and original rounding boundaries. Judge
+   changes by draft+verify+commit time per emitted token, including rejection.
+   Retune draft prefixes after batch-layout changes, and compare MTP math
+   choices by acceptance as well as draft cost; draft quantization can change
+   proposed IDs. Batched W1/W3 fusion and sharing prepared INT8 expert inputs
+   across common experts remain candidates if the FFN span warrants them.
+3. Revisit ordinary attention and expert cost for 30/40. The latest ordinary
+   profile is about 47.6 ms; 30 requires below 33.33 ms and 40 below 25 ms.
+   Distributing the remaining owner projections or changing WO-B/shared-W2
+   reduction order needs a new communication budget and independent numerical
+   gates. TP2/TP4 row sharding and persistent workers are already implemented.
+4. Defer distributed index scoring at 1K unless a later profile changes its
+   value: scoring is only about 0.215 ms/token after the exact SVE conversion.
+   New collectives can exceed that saving. Longer histories need their own
+   measurements; a 1M allocation does not validate execution at 1M history.
+5. Extend the completed ordinary 1021/1024-token prompt tests to speculation
+   and a wider prompt set. Ordinary chat/code currently reach 19.68–20.03
+   tokens/s and fail the three-repeat 20+ criterion; reducing roughly 0.8 ms
+   from the slowest mean is necessary but leaves no run-variation margin.
+   Profile these retained-input workloads before choosing another ordinary
+   optimization. Earlier capital/chat/code timings grow short prompts through
+   1100 generated tokens with `--ignore-eos`; repetition can improve Engram
+   cache hits and draft acceptance. Keep the two setups distinct and require
+   three repeats for each claimed milestone. Repeat retained configurations
+   on a fresh allocation.
+6. Add a bounded multi-case validation mode that reuses resident weights;
+   loading currently costs about a minute per case. Keep separate request
+   state, reset caches/history explicitly, and retain immutable run metadata.
+   KV checkpoint/restore, actual-1M execution and serving remain separate tasks.
 
 ## 20/30/40 tokens/s implementation plan
 
@@ -165,8 +726,8 @@ single-request decode around 1K history, all 40 layers, 64 attention heads,
 top-6 routed experts, top-512 selected rows and the 128-token window. Maintain
 two separately reported tracks: numerically validated and speed-first
 approximate. Exact-output speculation is a third, separately measured path.
-Current unprofiled INT8 runs reach 10.36–10.39 tokens/s but fail the numerical
-gate; the FP8 regression control reaches 6.92 tokens/s. Neither is official
+At plan approval, unprofiled INT8 runs reached 10.36–10.39 tokens/s but failed
+the numerical gate; the FP8 regression control reached 6.92 tokens/s. Neither is official
 GPU parity. Preserve the original math path as the comparison control.
 
 ### Milestone budgets

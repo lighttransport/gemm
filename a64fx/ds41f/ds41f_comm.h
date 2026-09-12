@@ -12,6 +12,12 @@ void ds41f_comm_bytes(void *values,size_t bytes,int owner);
  * with nonzero low bits instead of silently quantizing a residual. */
 void ds41f_comm_bf16_broadcast(float *values,size_t count,size_t tail,int owner);
 void ds41f_comm_bf16_handoff(float *values,size_t count,size_t tail,int owner,int next);
+/* Token-major strided rows, batch 1..6. The BF16 prefix and FP32 tail keep
+ * the same representation and signed-zero rule as the single-row forms. */
+void ds41f_comm_bf16_broadcast_batch(float *values,size_t stride,size_t count,size_t tail,size_t batch,int owner);
+void ds41f_comm_bf16_handoff_batch(float *values,size_t stride,size_t count,size_t tail,size_t batch,int owner,int next);
+void ds41f_comm_tp_gather_batch(float *out,size_t out_stride,float *part,size_t part_stride,size_t count,size_t batch,int owner,int all);
+
 void ds41f_comm_abort(const char *message,int error);
 void ds41f_comm_set_tp(int tp);
 void ds41f_comm_tp_bytes(void *values,size_t bytes,int owner);
