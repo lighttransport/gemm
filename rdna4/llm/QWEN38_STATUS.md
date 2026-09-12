@@ -189,9 +189,14 @@ hashes (`096888097a00e061`, `97574e0f11abcfd3`, `fb57a917f37a253e`).
   ordering dependency remains. Forcing per-token MoE (`LLM_MOE_PREFILL_SCALAR=1`)
   at 512 prefill / 8 decode is deterministic 6/6 (`1ae7b536b9c17b1d`), which
   isolates the residual race to the batched MoE dispatcher
-  (`forward_moe_ffn_batched`), not batched attention/SSM. A 4-repeat
-  `LLM_DEBUG_LAYERS=1` trace at 1024 did not reproduce it (the per-stage sync
-  perturbs timing), so it could not be localized to a single MoE stage. The
+  (`forward_moe_ffn_batched`), not batched attention/SSM. The batched MoE
+  kernels themselves have no atomics, so the suspect is the cold-expert cache
+  H2D not being ordered with the consuming kernel: adding a stream sync after
+  each cold copy (`LLM_QWEN4_SYNC_EXPERT_COPY=1`) makes 1,024/16 deterministic
+  8/8 and 4,096/64 deterministic 3/3 at ~125 prefill / 19.7 decode, but a
+  second 8-repeat 4K run still diverged once (`b05a25a0c51bb35c`), so it is a
+  contributor rather than the whole cause. A 4-repeat `LLM_DEBUG_LAYERS=1`
+  trace at 1024 did not reproduce it (the per-stage sync perturbs timing). The
   scalar route remains the only quality-safe default.
 - Multi-chunk stateful batching (prefill > BMAX, `LLM_QWEN4_BATCH_MULTI_CHUNK_
   FORCE=1`) still diverges: a 4,096-token prompt split at BMAX=1024 produced a

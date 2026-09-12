@@ -20875,6 +20875,13 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
                     hllm_cache_copy(r, (unsigned char *)cl->moe_cache_down + (size_t)slot*cl->moe_cache_stride_down,
                                     dh, cl->moe_down_exps_type, cl->moe_exp_rows_d, cl->moe_exp_cols_d,
                                     cl->moe_exp_stride_d, cl->moe_cache_stride_down);
+                    /* Diagnostic: the async H2D from host expert weights may not
+                     * be ordered with r->stream kernels on this ROCm stack.
+                     * Force completion to test whether that is the residual
+                     * batched-MoE race. */
+                    const char *sync_copy_env = getenv("LLM_QWEN4_SYNC_EXPERT_COPY");
+                    if (sync_copy_env && atoi(sync_copy_env) != 0)
+                        hipStreamSynchronize(r->stream);
                 }
                 int old_e = cl->moe_cache_ids[slot];
                 if ((r->decode_mode || grouped_qwen) && old_e >= 0 && old_e != e) {
