@@ -4,6 +4,39 @@ Current validation appears first. Earlier investigations are retained below as
 history; short-run determinism claims there do not establish scalar F16 parity.
 Scalar F16 remains the default; staged prefill is diagnostic.
 
+## Native router/shared batching restores short-prompt parity
+
+`LLM_QWEN4_BATCH_MOE_NATIVE=1` computes router logits and the shared gate
+with BF16 weights and F32 input, matching scalar GPU arithmetic. Shared Q8/Q6
+gate/up/SiLU and down accumulation also retain scalar per-output operations.
+The option bypasses BF16 activation packing for these operations and remains
+off by default. Unsupported shared formats fail explicitly when requested.
+Routed expert execution is unchanged.
+
+The real-model `--verify-moe-native` oracle passes bitwise on all 48 layers
+x 8 rows for router logits, shared scale, shared gate output, and accumulated
+output. Log: `tmp/nativemoe_oracle.log`; binary:
+`tmp/test_hip_llm_nativemoe`.
+
+Combining native HC, native SSM, native Q8 attention projections and native
+router/shared batching passes the fresh scalar F16 first-token and full-hash
+checks on **all four short prompts, two repeats each (8/8 requests)**:
+
+| Prompt | Matching first token / 16-token hash |
+|---|---|
+| Coding | 198 / bbd62d9e3c85af8d |
+| Arithmetic | 198 / 427a8efc219e9443 |
+| Prose | 248068 / c461a4dabdca797e |
+| Japanese | 198 / b5ad0bef0c9a5696 |
+
+Settings: 128-token prefill, 16-token decode, context8192, BMAX4096,
+cache4000 MiB, pinned weights, PLE phase split, scratch arena, overlap on,
+staging promotion off. Logs: `tmp/nativemoe_quality_summary.log` and
+`tmp/staging_quality_fixed/*_nativemoe.log`. This is short-prompt greedy
+parity, not bitwise equivalence of every model intermediate. A fresh4K/64
+scalar reference and two native batched requests are running next; the200/30
+performance target remains unmet.
+
 ## Native Q8 SSM projections
 
 `LLM_QWEN4_BATCH_SSM_NATIVE=1` bypasses BF16 input/output GEMMs for

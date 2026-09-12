@@ -18,6 +18,21 @@ Stable, quality-safe Qwen3.8-Flash-Next LLM runner on CPU + Radeon RX 9070 XT
 Do not push to any remote without explicit per-action user permission.
 Committing freely is allowed once a coherent unit is done.
 
+## Latest parity milestone
+
+Native HC + SSM projections + router/shared experts now pass fresh scalar
+first-token/full-hash parity on all four128/16 prompts, two requests each
+(8/8). `LLM_QWEN4_BATCH_MOE_NATIVE=1` removes BF16 activation rounding
+from router/shared batching. Its real-weight `--verify-moe-native` oracle
+passes48 layers x8 rows bitwise. Binary:`tmp/test_hip_llm_nativemoe`.
+Logs:`tmp/nativemoe_oracle.log`, `tmp/nativemoe_quality_summary.log`.
+
+A fresh scalar4K/64 reference followed by two fully native staged requests
+is running via `tmp/run_native_all_4k.sh`. Logs:
+`tmp/native_all_4k_summary.log`, `tmp/native_scalar_4k_reference.log`,
+`tmp/native_all_4k.log`. Do not substitute the old601167e3b2fb9425 staged
+hash for this scalar reference. All200/30 targets remain required.
+
 ## Current implementation (2026-09-12 continuation)
 
 The user explicitly asked to keep going until the **200/30** targets are met.

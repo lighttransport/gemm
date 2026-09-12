@@ -6372,6 +6372,7 @@ static const char *hip_kernel_source =
 "        #pragma unroll\n"
 "        for(int j=0;j<32;j++)s+=(float)q[j]*xb[j];sum+=s*half_to_float(*(const half_raw *)bp);}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)accum[row]+=scale_ptr[0]*sum;}\n"
+#include "qwen4_moe_native_kernels.h"
 "/* ---- matvec_iq1_s_f32: IQ1_S matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq1_s_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -9736,6 +9737,11 @@ struct hip_llm_runner {
     int ssm_out_mw;                             /* LLM_SSM_OUT_MW */
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
+    hipFunction_t fn_qwen4_router_batch_native;
+    hipFunction_t fn_shexp_gateup_silu_q6k_batch;
+    hipFunction_t fn_shexp_down_accum_q6k_batch;
+    hipFunction_t fn_shexp_gateup_silu_q8_batch;
+    hipFunction_t fn_shexp_down_accum_q8_batch;
     hipFunction_t fn_moe_router_fused;      /* decode: router+topk+sgate, 1 launch */
     hipFunction_t fn_moe_cache_slots_valid;
     hipFunction_t fn_deltanet_step_warp_f32; /* decode: warp-per-row deltanet */
@@ -10642,6 +10648,11 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(ssm_inv_mean_f32);
     GET_FUNC(moe_route_decode);
     GET_FUNC(res_rmsnorm_f32);
+    GET_FUNC(qwen4_router_batch_native);
+    GET_FUNC(shexp_gateup_silu_q6k_batch);
+    GET_FUNC(shexp_down_accum_q6k_batch);
+    GET_FUNC(shexp_gateup_silu_q8_batch);
+    GET_FUNC(shexp_down_accum_q8_batch);
     GET_FUNC(moe_router_fused);
     GET_FUNC(moe_cache_slots_valid);
     GET_FUNC(deltanet_step_warp_f32);
@@ -20621,6 +20632,31 @@ fail:
 /* Diagnostic only: stream-ordered hashes, read at the existing tile barrier.
  * Stages: HC layer input, FFN input, router logits, routed sum, shared+routed.
  * These are divergence fingerprints, not collision-free equality proofs. */
+static int qwen4_shared_native_supported(const hip_layer *cl) {
+    int type=cl->moe_shared_gate_type;
+    return (type==GGML_TYPE_Q8_0 || type==GGML_TYPE_Q6_K) &&
+        cl->moe_shared_up_type==type && cl->moe_shared_down_type==type;
+}
+static int launch_qwen4_router_native(hip_llm_runner *r, hip_layer *cl, int M,
+        void *x, void *logits, void *scale) {
+    int ne=r->n_experts, nc=r->n_embd;
+    void *a[]={&cl->moe_gate_w_bf16,&cl->moe_shared_gate_w_bf16,&x,&ne,&nc,&logits,&scale};
+    return LAUNCH(r->fn_qwen4_router_batch_native,ne+1,M,1,256,1,1,0,
+                  r->stream,a)==hipSuccess ? 0 : -1;
+}
+static int launch_qwen4_shared_native(hip_llm_runner *r, hip_layer *cl, int M,
+        void *x, void *gate, void *accum, void *scale) {
+    int ne=r->n_embd, eff=r->shared_expert_ff;
+    int q6=cl->moe_shared_gate_type==GGML_TYPE_Q6_K;
+    int rows=q6?8:4, threads=q6?256:128;
+    hipFunction_t gu=q6?r->fn_shexp_gateup_silu_q6k_batch:r->fn_shexp_gateup_silu_q8_batch;
+    hipFunction_t down=q6?r->fn_shexp_down_accum_q6k_batch:r->fn_shexp_down_accum_q8_batch;
+    void *a[]={&gate,&cl->moe_shared_ffn_gate_w,&cl->moe_shared_ffn_up_w,&x,&eff,&ne};
+    if (LAUNCH(gu,(eff+rows-1)/rows,M,1,threads,1,1,0,r->stream,a)!=hipSuccess) return -1;
+    void *b[]={&accum,&cl->moe_shared_ffn_down_w,&gate,&ne,&eff,&scale};
+    return LAUNCH(down,(ne+rows-1)/rows,M,1,threads,1,1,0,r->stream,b)==hipSuccess ? 0 : -1;
+}
+
 static void qwen4_fingerprint(hip_llm_runner *r, int stage, void *src, int n) {
     if (!r->qwen4_fingerprint_active || !r->d_qwen4_fingerprints || !src) return;
     void *out = (uint64_t *)r->d_qwen4_fingerprints +
@@ -20639,7 +20675,13 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     /* 1. Router GEMM: [M,ne] = xnorm[M,n_embd] x Wg[ne,n_embd] (Wg is F32 -> bf16). */
     launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16_moe, r->d_xnorm_batch, M * n_embd);
     const char *router_scalar_env = getenv("LLM_QWEN4_BATCH_ROUTER_SCALAR");
-    if (router_scalar_env && atoi(router_scalar_env) != 0) {
+    const char *native_moe_env = getenv("LLM_QWEN4_BATCH_MOE_NATIVE");
+    int native_moe = r->is_qwen4exp && native_moe_env && atoi(native_moe_env) != 0;
+    if (native_moe) {
+        if (!qwen4_shared_native_supported(cl) ||
+            launch_qwen4_router_native(r,cl,M,r->d_xnorm_batch,
+                r->d_router_logits_batch,r->d_shared_scale_batch)) return -1;
+    } else if (router_scalar_env && atoi(router_scalar_env) != 0) {
         /* Diagnostic parity path: one-row router GEMM fixes the reduction
          * order and removes batched WMMA tie noise from expert selection.
          * Keep it opt-in because it intentionally sacrifices prefill rate. */
@@ -21284,6 +21326,10 @@ experts_done:
     qwen4_fingerprint(r, 3, r->d_moe_out_batch, M * n_embd);
 
     /* 6. Shared expert (dense over all M): gate logit -> sigmoid -> gate/up/silu/down -> row-scale add. */
+    if (native_moe) {
+        if (launch_qwen4_shared_native(r,cl,M,r->d_xnorm_batch,r->d_moe_eg,
+                r->d_moe_out_batch,r->d_shared_scale_batch)) return -1;
+    } else {
     if (gemm_run_bf16_w(r, r->d_shared_scale_batch, cl->moe_shared_gate_w_bf16,
                            r->d_xnorm_batch_bf16_moe, M, 1, n_embd, r->stream) != 0) return -1;
     launch_sigmoid_inplace(r, r->d_shared_scale_batch, M);
@@ -21305,6 +21351,8 @@ experts_done:
         launch_moe_row_scale_add(r, r->d_moe_out_batch, r->d_moe_eout, r->d_shared_scale_batch, M, n_embd);
     }
 
+    }
+
     qwen4_fingerprint(r, 4, r->d_moe_out_batch, M * n_embd);
 
     /* 7. Residual: x_batch += moe_out. */
@@ -21312,6 +21360,8 @@ experts_done:
         launch_add(r, r->d_x_batch, r->d_moe_out_batch, M * n_embd);
     return 0;
 }
+
+#include "qwen4_moe_native_test.h"
 
 #include "qwen4_qsa_hip.h"
 
