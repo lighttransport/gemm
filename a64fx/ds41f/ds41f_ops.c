@@ -1,7 +1,9 @@
 #include "ds41f_ops.h"
+#include "ds41f_profile.h"
 #include <math.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <stdint.h>
 #if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
 #endif
@@ -184,8 +186,13 @@ int ds41f_sparse_attention(float *out,const float *q,const float *kv,
     if(!selected){for(size_t i=0;i<heads*dim;++i)out[i]=0;return 0;}
     float *scores=malloc(heads*selected*sizeof(float));if(!scores)return ENOMEM;
     float scale=1/sqrtf((float)dim);
-    #pragma omp parallel for schedule(static)
+    int timed=P_BEGIN()!=0;double qk_max=0,softmax_max=0,pv_max=0;
+    #pragma omp parallel reduction(max:qk_max,softmax_max,pv_max)
+    {
+    double qk_time=0,softmax_time=0,pv_time=0;
+    #pragma omp for schedule(static)
     for(size_t h=0;h<heads;++h){float *s=scores+h*selected;float mx=sink[h];
+        double timer=ds41f_profile_worker_clock(timed);
         svbool_t pg=svptrue_b32();size_t vl=svcntw();
         for(size_t i=0;i<selected;++i){
             if(ids[i]<0){s[i]=-INFINITY;continue;}const float *v=kv+(size_t)ids[i]*dim;
@@ -195,9 +202,11 @@ int ds41f_sparse_attention(float *out,const float *q,const float *kv,
             for(;j<dim;j+=vl){svbool_t tail=svwhilelt_b32(j,dim);a=svmla_m(tail,a,svld1(tail,q+h*dim+j),svld1(tail,v+j));}
             s[i]=svaddv(pg,svadd_x(pg,a,b))*scale;mx=fmaxf(mx,s[i]);
         }
+        qk_time+=ds41f_profile_worker_clock(timed)-timer;timer=ds41f_profile_worker_clock(timed);
         float sum=expf(sink[h]-mx);
         for(size_t i=0;i<selected;++i){s[i]=expf(s[i]-mx);sum+=s[i];}
         for(size_t i=0;i<selected;++i)s[i]/=sum;
+        softmax_time+=ds41f_profile_worker_clock(timed)-timer;timer=ds41f_profile_worker_clock(timed);
         /* Consume a full A64FX cache line from each selected row. Four
          * independent output vectors share the score/row lookup and hide
          * FMA latency without changing any output lane's reduction order. */
@@ -214,7 +223,11 @@ int ds41f_sparse_attention(float *out,const float *q,const float *kv,
             for(size_t i=0;i<selected;++i)if(ids[i]>=0)
                 acc=svmla_n_f32_m(tail,acc,svld1(tail,kv+(size_t)ids[i]*dim+j),s[i]);
             svst1(tail,out+h*dim+j,acc);}
+        pv_time+=ds41f_profile_worker_clock(timed)-timer;
     }
+    qk_max=qk_time;softmax_max=softmax_time;pv_max=pv_time;
+    }
+    P_VALUE(SPARSE_QK,qk_max);P_VALUE(SPARSE_SOFTMAX,softmax_max);P_VALUE(SPARSE_PV,pv_max);
     free(scores);return 0;
 #else
     return ds41f_sparse_attention_ref(out,q,kv,sink,ids,selected,tokens,heads,dim);
@@ -223,3 +236,43 @@ int ds41f_sparse_attention(float *out,const float *q,const float *kv,
 void ds41f_pool_pair(float *out,const float *a,const float *b,
                       const float *sa,const float *sb,size_t dim)
 {for(size_t j=0;j<dim;++j){float w=sigmoid(sa[j]-sb[j]);out[j]=a[j]*w+b[j]*(1-w);}}
+
+#include "ds41f_exp2.h"
+#include "ds41f_sparse_sve.h"
+
+int ds41f_hc_matvec(float out[24],const float *w,const float *x,float inv,int mode)
+{
+    if(!out||!w||!x||mode<0||mode>2)return EINVAL;
+    #pragma omp parallel for schedule(static)
+    for(int r=0;r<24;++r){const float *row=w+(size_t)r*20480;float sum=0;
+        #if defined(__ARM_FEATURE_SVE)
+        if(mode==1&&svcntw()==16){svbool_t pg=svptrue_b32();
+            svfloat32_t a=svdup_f32(0),b=a,c=a,d=a;
+            for(size_t i=0;i<20480;i+=4*svcntw()){
+                a=svmla_f32_x(pg,a,svld1_f32(pg,row+i),svld1_f32(pg,x+i));
+                b=svmla_f32_x(pg,b,svld1_f32(pg,row+i+svcntw()),svld1_f32(pg,x+i+svcntw()));
+                c=svmla_f32_x(pg,c,svld1_f32(pg,row+i+2*svcntw()),svld1_f32(pg,x+i+2*svcntw()));
+                d=svmla_f32_x(pg,d,svld1_f32(pg,row+i+3*svcntw()),svld1_f32(pg,x+i+3*svcntw()));}
+            sum=svaddv_f32(pg,svadd_f32_x(pg,svadd_f32_x(pg,a,b),svadd_f32_x(pg,c,d)));
+        }else if(mode==2&&svcntw()==16){
+            svbool_t pg=svptrue_b64(),p8=svptrue_pat_b32(SV_VL8);
+            svfloat64_t a=svdup_f64(0),b=a,c=a,d=a;
+            /* Preserve FP32 products, then accumulate them in FP64. This is
+             * an explicit alternative to the ordered FP32 checkpoint path. */
+            #define HC_PRODUCT(offset) svcvt_f64_f32_x(pg,svreinterpret_f32_u64(svunpklo_u64( \
+                svreinterpret_u32_f32(svmul_f32_x(p8,svld1_f32(p8,row+i+(offset)),svld1_f32(p8,x+i+(offset)))))))
+            for(size_t i=0;i<20480;i+=32){
+                a=svadd_f64_x(pg,a,HC_PRODUCT(0));b=svadd_f64_x(pg,b,HC_PRODUCT(8));
+                c=svadd_f64_x(pg,c,HC_PRODUCT(16));d=svadd_f64_x(pg,d,HC_PRODUCT(24));}
+            #undef HC_PRODUCT
+            sum=(float)svaddv_f64(pg,svadd_f64_x(pg,svadd_f64_x(pg,a,b),svadd_f64_x(pg,c,d)));
+        }else
+        #endif
+        if(mode==2){double total=0;for(size_t i=0;i<20480;++i)total+=(float)(row[i]*x[i]);sum=(float)total;}
+        else{
+            #pragma omp simd reduction(+:sum)
+            for(size_t i=0;i<20480;++i)sum+=row[i]*x[i];}
+        out[r]=sum*inv;
+    }
+    return 0;
+}

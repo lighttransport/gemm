@@ -18,7 +18,8 @@
     X(NORM) X(EXPERT_QUANT) X(EXPERT_W13) X(EXPERT_SWIGLU) X(EXPERT_W2) \
     X(EXPERT_ROUND) X(EXPERT_COUNT) X(FP8_BYTES) X(BF16_BYTES) X(F32_BYTES) X(FP4_BYTES) \
     X(ENGRAM_READ) X(ENGRAM_DECODE) X(HC_NORM) X(HC_MATVEC) X(HC_SPLIT) X(ENGRAM_PREFETCH) \
-    X(LINEAR_INT8) X(INT8_BYTES) X(INT8_INPUT_QUANT) X(SHARED_OVERLAP)
+    X(LINEAR_INT8) X(INT8_BYTES) X(INT8_INPUT_QUANT) X(SHARED_OVERLAP) \
+    X(SPARSE_QK) X(SPARSE_SOFTMAX) X(SPARSE_PV) X(TP_COMM) X(TP_GROUP)
 #define DS41F_PROFILE_ENUM(name) DS41F_P_##name,
 enum ds41f_profile_phase { DS41F_PROFILE_PHASES(DS41F_PROFILE_ENUM) DS41F_P_COUNT };
 #undef DS41F_PROFILE_ENUM
@@ -43,6 +44,16 @@ static inline void ds41f_profile_end(enum ds41f_profile_phase phase,double start
 static inline void ds41f_profile_value(enum ds41f_profile_phase phase,double value)
 {(void)phase;(void)value;}
 #endif
+/* Worker timing is explicitly enabled by the main thread; worker TLS has no
+ * current record. These durations are merged only after joining the team. */
+static inline double ds41f_profile_worker_clock(int enabled)
+{
+#ifdef DS41F_ENABLE_PROFILE
+    return enabled?ds41f_profile_clock():0;
+#else
+    (void)enabled;return 0;
+#endif
+}
 #define P_BEGIN() ds41f_profile_begin()
 #define P_END(name,start) ds41f_profile_end(DS41F_P_##name,start)
 #define P_VALUE(name,value) ds41f_profile_value(DS41F_P_##name,value)

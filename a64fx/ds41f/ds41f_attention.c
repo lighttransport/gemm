@@ -20,7 +20,12 @@ static int linear(const ds41f_weights *w,int layer,const char *part,float *out,c
 static int norm(const ds41f_weights *w,int layer,const char *part,float *out,const float *x)
 {char name[192];snprintf(name,sizeof name,"layers.%d.attn.%s.weight",layer,part);return ds41f_norm(w,name,out,x);}
 static void rope(float *x,size_t heads,size_t dim,int layer,size_t pos,int inverse)
-{ds41f_rope(x,heads,dim,64,pos,layer<2?10000:160000,16,layer<2?0:65536,inverse);ds41f_round_bf16(x,heads*dim);}
+{
+    /* Every caller supplies a BF16-rounded vector. Only the rotary suffix
+     * changes, so rounding the untouched prefix again is redundant. */
+    ds41f_rope(x,heads,dim,64,pos,layer<2?10000:160000,16,layer<2?0:65536,inverse);
+    for(size_t h=0;h<heads;++h)ds41f_round_bf16(x+h*dim+dim-64,64);
+}
 int ds41f_attention_init(ds41f_attention *s,size_t capacity)
 {
     if(!s||!capacity||capacity>1048576)return EINVAL;
@@ -97,36 +102,60 @@ static int select_positions(ds41f_attention *s,const ds41f_weights *w,int layer,
     }
     s->selected_count=ds41f_select_topk(scores,count,512,s->selected);free(scores);P_END(INDEX_SELECT,pt);return 0;
 }
-static int grouped_output(const ds41f_weights *w,int layer,float *out,const float *x)
+static int grouped_output(const ds41f_weights *w,int layer,float *out,const float *x,size_t groups)
 {
     char name[192];snprintf(name,sizeof name,"layers.%d.attn.wo_a.weight",layer);
     const ds41f_weight *weight=ds41f_weight_find(w,name);
     snprintf(name,sizeof name,"layers.%d.attn.wo_a.scale",layer);
     const ds41f_weight *scale=ds41f_weight_find(w,name);
-    if(!weight||!scale||strcmp(weight->dtype,"F8_E4M3")||weight->rows!=8192||weight->cols!=4096||scale->bytes!=256*128)return EINVAL;
+    if(!weight||!scale||strcmp(weight->dtype,"F8_E4M3")||weight->rows!=groups*1024||weight->cols!=4096||scale->bytes!=groups*32*128)return EINVAL;
     double pt=P_BEGIN();
     if(weight->int8.weight){P_VALUE(INT8_BYTES,weight->int8.bytes);
         CHECK(ds41f_int8_matvec(out,&weight->int8,x,1024,0));P_END(LINEAR_INT8,pt);}
     else{P_VALUE(FP8_BYTES,weight->bytes+scale->bytes);
-        CHECK(ds41f_fp8_grouped_matvec(out,weight->data,scale->data,x,8,1024,4096));P_END(LINEAR_FP8,pt);}
-    pt=P_BEGIN();ds41f_round_bf16(out,8192);P_END(LINEAR_ROUND,pt);return 0;
+        CHECK(ds41f_fp8_grouped_matvec(out,weight->data,scale->data,x,groups,1024,4096));P_END(LINEAR_FP8,pt);}
+    pt=P_BEGIN();ds41f_round_bf16(out,groups*1024);P_END(LINEAR_ROUND,pt);return 0;
 }
-int ds41f_attention_step(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,const float *x,float *out)
+int ds41f_attention_prepare(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,
+                            const float *x,ds41f_attention_context *context)
 {
-    if(!s||!w||!x||!out||!s->rows||layer<0||layer>=40||pos>=s->capacity)return EINVAL;
-    float qr[1280],q[64*512],kv[512],attended[64*512],projected[8192];
+    if(!s||!w||!x||!context||layer<0||layer>=40||pos>=s->capacity)return EINVAL;
+    memset(context,0,sizeof *context);float *qr=context->qr,*kv=context->kv;
     double pt=P_BEGIN();CHECK(linear(w,layer,"wq_a",qr,x,0));CHECK(norm(w,layer,"q_norm",qr,qr));P_END(ATTN_QA,pt);
-    pt=P_BEGIN();CHECK(linear(w,layer,"wq_b",q,qr,0));P_END(ATTN_QB,pt);
-    pt=P_BEGIN();rope(q,64,512,layer,pos,0);P_END(ATTN_Q_ROPE,pt);pt=P_BEGIN();
+    pt=P_BEGIN();
     CHECK(linear(w,layer,"wkv",kv,x,0));CHECK(norm(w,layer,"kv_norm",kv,kv));
     rope(kv,1,512,layer,pos,0);CHECK(ds41f_act_quant(kv,kv,512));
     float *window=s->window+(size_t)layer*128*512;
-    memcpy(window+(pos%128)*512,kv,sizeof kv);
+    memcpy(window+(pos%128)*512,kv,512*sizeof(float));
     P_END(ATTN_KV,pt);pt=P_BEGIN();
     if(is_source(layer))CHECK(update_source(s,w,layer,pos,x));
     P_END(ATTN_COMPRESS,pt);pt=P_BEGIN();
     if(is_index(layer))CHECK(select_positions(s,w,layer,pos,x,qr));
     P_END(ATTN_INDEX,pt);pt=P_BEGIN();
+
+    context->selected_count=s->selected_count;
+    memcpy(context->selected,s->selected,s->selected_count*sizeof(int));
+    memcpy(context->publication,s->publication,356);
+    return 0;
+}
+int ds41f_attention_apply(ds41f_attention *s,int layer,size_t pos,const ds41f_attention_context *context)
+{
+    if(!s||!context||layer<0||layer>=40||pos>=s->capacity||context->selected_count>512)return EINVAL;
+    memcpy(s->window+((size_t)layer*128+pos%128)*512,context->kv,512*sizeof(float));
+    s->selected_count=context->selected_count;
+    memcpy(s->selected,context->selected,s->selected_count*sizeof(int));
+    memcpy(s->publication,context->publication,356);
+    return ds41f_attention_receive(s,layer,pos,context->publication);
+}
+int ds41f_attention_project(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,
+                            const float *qr,size_t first_head,size_t heads,float *projected)
+{
+    if(!s||!w||!qr||!projected||!s->rows||layer<0||layer>=40||pos>=s->capacity||
+       !heads||heads%8||first_head+heads>64)return EINVAL;
+    float q[64*512],attended[64*512];
+    double pt=P_BEGIN();CHECK(linear(w,layer,"wq_b",q,qr,0));P_END(ATTN_QB,pt);
+    pt=P_BEGIN();rope(q,heads,512,layer,pos,0);P_END(ATTN_Q_ROPE,pt);pt=P_BEGIN();
+    float *window=s->window+(size_t)layer*128*512;
     size_t raw_count=pos<128?pos+1:128,extra=layer<2?0:s->selected_count;
     if(extra>512)return EINVAL;
     float *rows=s->rows;
@@ -141,9 +170,22 @@ int ds41f_attention_step(ds41f_attention *s,const ds41f_weights *w,int layer,siz
     const ds41f_weight *sink=ds41f_weight_find(w,name);
     if(!sink||sink->bytes!=64*4)return EINVAL;
     P_END(ATTN_ROWS,pt);pt=P_BEGIN();
-    int rc=ds41f_sparse_attention(attended,q,rows,sink->data,ids,raw_count+extra,raw_count+extra,64,512);
+    const float *sinks=(const float *)sink->data+first_head;
+    int rc=s->sparse_tile?ds41f_sparse_attention_tiled_math(attended,q,rows,sinks,ids,raw_count+extra,raw_count+extra,heads,512,s->sparse_tile,s->sparse_math):
+        ds41f_sparse_attention(attended,q,rows,sinks,ids,raw_count+extra,raw_count+extra,heads,512);
     if(rc)return rc;P_END(ATTN_SPARSE,pt);pt=P_BEGIN();
-    ds41f_round_bf16(attended,64*512);rope(attended,64,512,layer,pos,1);
-    P_END(ATTN_INVERSE_ROPE,pt);pt=P_BEGIN();CHECK(grouped_output(w,layer,projected,attended));P_END(ATTN_WOA,pt);
-    pt=P_BEGIN();rc=linear(w,layer,"wo_b",out,projected,0);P_END(ATTN_WOB,pt);return rc;
+    ds41f_round_bf16(attended,heads*512);rope(attended,heads,512,layer,pos,1);
+    P_END(ATTN_INVERSE_ROPE,pt);pt=P_BEGIN();CHECK(grouped_output(w,layer,projected,attended,heads/8));P_END(ATTN_WOA,pt);
+    return 0;
+}
+int ds41f_attention_output(const ds41f_weights *w,int layer,const float *projected,float *out)
+{
+    double pt=P_BEGIN();int rc=linear(w,layer,"wo_b",out,projected,0);P_END(ATTN_WOB,pt);return rc;
+}
+int ds41f_attention_step(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,const float *x,float *out)
+{
+    ds41f_attention_context context;float projected[8192];
+    CHECK(ds41f_attention_prepare(s,w,layer,pos,x,&context));
+    CHECK(ds41f_attention_project(s,w,layer,pos,context.qr,0,64,projected));
+    return ds41f_attention_output(w,layer,projected,out);
 }

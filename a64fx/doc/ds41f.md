@@ -168,6 +168,96 @@ validated sequential verifier, including forced rejection at every position.
   snapshots, remote SHA verification, `/local` or repository `tmp/`, and check
   allocation lifetime before each long experiment. Do not edit active scripts.
 
+## Implementation continuation: attention tiles and dense TP, 2026-09-12
+
+The plan above was committed as `470c45a1` before kernel changes. Experimental
+options remain explicit; none of these measurements establishes 20 tokens/s.
+The active allocation is still 51569201 (12 nodes, 2 GHz, ends 00:00:29 JST
+September 13). Original TP1 staging remains intact; TP2/TP4 use separate
+`/local/u14346/ds41f-51569201/tp{2,4}/rank<R>` directories and reuse local
+expert/Engram files. `stage_tp.py` records versioned ranges, checkpoint header
+hashes and SHA256 sidecars for copied shards. Runtime validates TP/rank and
+weight row-range metadata before conversion.
+
+Implemented stages and initial evidence:
+
+- The finer original attention profile reports maximum worker work durations
+  of 5.185 ms QK, 1.012 ms softmax and 5.066 ms PV per token around 1K.
+  These maxima are nested work measurements, not three additive wall spans.
+  Tiled profiles measure elapsed phases including their barriers.
+- `--sparse-tile 1/2/4/6` adds split-phase attention; 2/4/6 use four-head,
+  two-key QK and corresponding multi-head PV. Zero retains the original path.
+  Tile four reduced the complete sparse span 12.283 to 8.818 ms/token, and
+  full profiled latency 98.596 to 94.418 ms (10.591 tokens/s). Fifty geometry,
+  mask, sink, tail and canary cases pass bitwise against the existing control
+  on A64FX and native scalar builds. All 1105 token triples and nine saved
+  logits also match the INT8 control exactly (`sparse-tile4-full-v1`).
+- `--compact-comm` uses byte source publication, mixed BF16/FP32 FFN packets,
+  and owner-to-next-owner residual handoff (layer 39 to head rank 11).
+  Packing rejects non-BF16 inputs; route weights and mHC coefficients stay
+  FP32. MPI stays on the main thread and robust uTofu ACK sums are retained.
+  All-owner delayed-rank, self-handoff, nonparticipant, signed-zero and canary
+  tests pass. The long run retains all 1105 triples/nine logits exactly and
+  improves total inference 101.311 to 99.851 seconds (`compact-full-v1`).
+- RoPE rounds only its modified 64-coordinate suffix, since every caller has
+  already rounded the untouched coordinates to BF16. The combined exact
+  changes preserve all nine FP8 control logits and all 1105 INT8 token triples
+  plus nine logits (`stage1-fp8-exact9-v1`, `stage1-int8-exact-full-v1`).
+- `--hc-matvec 1/2` tests register-accumulated FP32/FP64 sums; zero retains the
+  ordered FP32 control. FP64 accumulates rounded FP32 products. Both pass
+  bounded local tests but **fail full-model numerical gates**: early nine
+  positions versus INT8 control have minimum cosine 0.993941/0.990968 and
+  maximum relative RMS 11.935%/15.405%. FP32 at fixed 1K history reaches
+  cosine 0.943039 and RMS 33.972%; its mHC span falls to 3.40 ms/token. Keep
+  both clearly marked approximate; local norm agreement is insufficient.
+- `--dense-tp 2/4` distributes QB, whole WO-A groups, row-sharded WO-B and
+  shared W1/W3/W2 within contiguous groups. BF16 allgathers retain complete
+  input K ranges for WO-B/W2, and gathers return outputs to the owner. QA,
+  compression and index remain owner operations. Vocabulary rows are split
+  in blocks of 32 across all 12 ranks; MAXLOC preserves smallest-ID ties,
+  and only diagnostic runs gather full logits. TP requires shared overlap.
+  Both TP sizes pass every-owner transport tests and reproduce all nine FP8
+  and INT8 control logits bit-for-bit. TP2's first long INT8 run also matches
+  all 1105 token triples and nine logits, reaching 89.923 ms/token around 1K
+  (11.121 tokens/s), 97.700 seconds total, minimum final memory 3.861 GB.
+  The head falls to 0.260 ms/token, while attention still takes 40.032 ms.
+  Further TP4 performance and 1K logit checks are running.
+- `--sparse-math 1/2/3` independently selects corrected FEXPA, Q31 integer
+  polynomial-2 or affine softmax with a nonzero sparse tile. Zero retains
+  libm. Integer kernels extend the CLAIR domain to -31 and underflow smaller
+  scores to zero; the denominator is uint64. Exhaustive Q16 domain and
+  extreme-value tests match the scalar integer oracle, respect error bounds,
+  and pass monotonicity, masks/sink, single-key, tail and canary checks on
+  A64FX and native builds. Full-model numerical/performance gates are pending.
+
+Evidence is under `tmp/ds41f/job51569201/`, including `sparse-profile-v1`,
+`sparse-tiles-v1`, `compact-check-v1`, `stage1-runs-v1`, `exp-check-v1`,
+`tp-staging-v1` and `tp-short-runs-v1`. Every remote runner uses an immutable
+snapshot and verified binary hash. Minimum final memory in the completed long
+runs remains above 3.98 GB. The corrected independent nine-position NumPy
+reference is running in `reference9-v1`; do not claim it has passed yet.
+
+Build/check commands for this stage:
+
+```sh
+TMPDIR="$PWD/tmp/ds41f" make -C a64fx/ds41f a64fx \
+  A64FX_CC=fccpx A64FX_MPICC=mpifccpx \
+  A64FX_CFLAGS='-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall -Wextra -Wpedantic'
+python3 a64fx/ds41f/test_stage_tp.py
+# Inside the allocation, with one program at a time:
+OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores ./test_sparse_tiles
+./test_exp2
+mpiexec -np 12 ./test_broadcast
+mpiexec -np 12 ./test_tp_comm 2
+mpiexec -np 12 ./test_tp_comm 4
+```
+
+Remaining planned work includes activation-quantization reuse, fused expert
+kernels, SDOT sparse QK with complete packing costs, distributed index work,
+persistent OpenMP teams, any justified changes to projection reduction order,
+and the separately validated DSpark speculative path. MTP/INT8 batched GEMM
+and speculative rollback are not implemented by this continuation yet.
+
 ## Implementation status, 2026-09-12 (job 51562789)
 
 The 12-node runner now executes all 40 layers with real resident weights and

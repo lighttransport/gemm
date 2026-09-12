@@ -5,6 +5,7 @@
 typedef struct {
     char name[192],dtype[16];
     size_t rows,cols,bytes;
+    size_t global_rows,row_start;
     void *data;
     ds41f_int8 int8;
 } ds41f_weight;
@@ -12,6 +13,7 @@ typedef struct { ds41f_weight *items; size_t count,bytes; int fresh_pages; } ds4
 int ds41f_weights_load(ds41f_weights *store,const char *stage,const char *prefix,size_t limit);
 int ds41f_weights_load_local(ds41f_weights *store,const char *stage,const char *prefix,
                             size_t limit,int fresh_pages);
+int ds41f_weights_check_tp(ds41f_weights *store,const char *stage,int tp,int rank);
 int ds41f_weights_requantize_fp8(ds41f_weights *store,size_t block,size_t limit,int projections_only);
 void ds41f_weights_free(ds41f_weights *store);
 const ds41f_weight *ds41f_weight_find(const ds41f_weights *store,const char *name);

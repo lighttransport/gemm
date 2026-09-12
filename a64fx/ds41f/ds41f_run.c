@@ -19,12 +19,12 @@
 #include <omp.h>
 #include <sched.h>
 
-static int rank,ranks;
+static int rank,ranks,dense_tp=1;
 static ds41f_weights weights;
 static ds41f_attention attention;
 static ds41f_engram engram;
 static ds41f_prefetch *prefetch;
-static int hc_mix_sve, shared_overlap;
+static int hc_matvec_mode,hc_mix_sve, shared_overlap,compact_comm;
 static double profile_attention,profile_expert,profile_shared,profile_head;
 static const char *dump_prefix;
 static size_t dump_count=1;
@@ -67,12 +67,7 @@ static void mixes(int layer,const char *kind,const float *h,float pre[4],float p
     if(hc_mix_sve)inv=ds41f_hc_inverse_rms(h,20480);
     else{double ss=0;for(int i=0;i<20480;++i)ss+=(double)h[i]*h[i];inv=(float)(1/sqrt(ss/20480+1e-20));}
     P_END(HC_NORM,pt);pt=P_BEGIN();P_VALUE(F32_BYTES,fn->bytes);
-    float mix[24];
-    {
-        #pragma omp parallel for
-        for(int r=0;r<24;++r){float sum=0;const float *w=(float *)fn->data+(size_t)r*20480;
-            #pragma omp simd reduction(+:sum)
-            for(int i=0;i<20480;++i)sum+=w[i]*h[i];mix[r]=sum*inv;}}
+    float mix[24];CHECK(ds41f_hc_matvec(mix,fn->data,h,inv,hc_matvec_mode));
     P_END(HC_MATVEC,pt);P_END(LINEAR_F32,pt);pt=P_BEGIN();
     snprintf(name,sizeof name,"layers.%d.hc_%s_base",layer,kind);const float *base=tensor(name)->data;
     snprintf(name,sizeof name,"layers.%d.hc_%s_scale",layer,kind);const float *scale=tensor(name)->data;
@@ -100,10 +95,14 @@ static void sync_attention(int layer,size_t pos)
 {
     int owner=layer%12,is_source=layer==2||layer==8||layer==14||layer==20;
     int ratio=layer<20?2:1;
-    if(is_source&&(pos+1)%ratio==0){float row[356];
+    if(is_source&&(pos+1)%ratio==0){
+        if(compact_comm){
+            ds41f_comm_bytes(attention.publication,356,owner);
+            if(rank!=owner)CHECK(ds41f_attention_receive(&attention,layer,pos,attention.publication));
+        }else{float row[356];
         if(rank==owner)for(int i=0;i<356;++i)row[i]=attention.publication[i];
         ds41f_comm_broadcast(row,356,owner);
-        if(rank!=owner){uint8_t bytes[356];for(int i=0;i<356;++i)bytes[i]=(uint8_t)row[i];CHECK(ds41f_attention_receive(&attention,layer,pos,bytes));}}
+        if(rank!=owner){uint8_t bytes[356];for(int i=0;i<356;++i)bytes[i]=(uint8_t)row[i];CHECK(ds41f_attention_receive(&attention,layer,pos,bytes));}}}
     if(is_source||layer==24||layer==28||layer==32||layer==36){float selection[513]={0};
         if(rank==owner){selection[0]=(float)attention.selected_count;for(size_t i=0;i<attention.selected_count;++i)selection[i+1]=(float)attention.selected[i];}
         ds41f_comm_broadcast(selection,513,owner);attention.selected_count=(size_t)selection[0];
@@ -134,6 +133,31 @@ static void shared_expert(int layer,const float *input,float *out)
     ds41f_swiglu(hidden,gate,up,2304,10);ds41f_round_bf16(hidden,2304);
     named_linear(layer,"ffn.shared_experts.w2",out,hidden,0);
 }
+static int tp_member(int owner){return rank/dense_tp==owner/dense_tp;}
+static void parallel_attention(int layer,size_t pos,const float *x,float *out)
+{
+    int owner=layer%12;if(!tp_member(owner))return;
+    ds41f_attention_context context;float local[8192],projected[8192],part[5120];
+    if(rank==owner)CHECK(ds41f_attention_prepare(&attention,&weights,layer,pos,x,&context));
+    double pt=P_BEGIN();ds41f_comm_tp_bytes(&context,sizeof context,owner);P_END(TP_COMM,pt);
+    if(rank!=owner)CHECK(ds41f_attention_apply(&attention,layer,pos,&context));
+    CHECK(ds41f_attention_project(&attention,&weights,layer,pos,context.qr,
+        (size_t)(rank%dense_tp)*(64/dense_tp),64/dense_tp,local));
+    pt=P_BEGIN();ds41f_comm_tp_allgather(projected,local,8192/dense_tp);P_END(TP_COMM,pt);
+    CHECK(ds41f_attention_output(&weights,layer,projected,part));
+    pt=P_BEGIN();ds41f_comm_tp_gather(out,part,5120/dense_tp,owner);P_END(TP_COMM,pt);
+}
+static void parallel_shared(int layer,const float *input,float *out)
+{
+    int owner=layer%12;if(!tp_member(owner))return;
+    size_t width=2304/dense_tp;float gate[2304],up[2304],local[2304],hidden[2304],part[5120];
+    named_linear(layer,"ffn.shared_experts.w1",gate,input,0);
+    named_linear(layer,"ffn.shared_experts.w3",up,input,0);
+    ds41f_swiglu(local,gate,up,width,10);ds41f_round_bf16(local,width);
+    double pt=P_BEGIN();ds41f_comm_tp_allgather(hidden,local,width);P_END(TP_COMM,pt);
+    named_linear(layer,"ffn.shared_experts.w2",part,hidden,0);
+    pt=P_BEGIN();ds41f_comm_tp_gather(out,part,5120/dense_tp,owner);P_END(TP_COMM,pt);
+}
 static int forward(int token,size_t pos,int trace,const char *logits_path)
 {
     ds41f_profile_at(pos,0);double token_start=P_BEGIN(),pt=P_BEGIN();
@@ -145,7 +169,7 @@ static int forward(int token,size_t pos,int trace,const char *logits_path)
         if(token<0||token>=129280||strcmp(embedding->dtype,"BF16"))ds41f_comm_abort("token/embedding",EINVAL);
         const uint16_t *row=(uint16_t *)embedding->data+(size_t)token*5120;
         for(int c=0;c<4;++c)for(int j=0;j<5120;++j)h[c*5120+j]=ds41f_bf16_to_f32(row[j]);P_END(EMBED,pt);}
-    pt=P_BEGIN();ds41f_comm_broadcast(residual_packet,20484,0);P_END(EMBED_BCAST,pt);
+    pt=P_BEGIN();if(!compact_comm)ds41f_comm_broadcast(residual_packet,20484,0);P_END(EMBED_BCAST,pt);
     uint64_t hashes[2][24];CHECK(ds41f_engram_hash_ids(&engram,(uint32_t)token,hashes));
     if(prefetch)CHECK(ds41f_prefetch_submit(prefetch,(const uint64_t (*)[24])hashes));
     for(int layer=0;layer<40;++layer){int owner=layer%12;
@@ -160,13 +184,18 @@ static int forward(int token,size_t pos,int trace,const char *logits_path)
         float ffn_packet[5132],*ffn_input=ffn_packet,*route=ffn_packet+5120;
         float post[4],comb[16],next_pre[4];
         if(layer==1||layer==14)engram_step(layer,layer==1?0:1,h,hashes[layer==1?0:1]);
-        if(rank==owner){double phase_start=now();float attn_pre[4],attn_post[4],attn_comb[16],x[5120],y[5120];
+        double attention_start=now();float attn_pre[4],attn_post[4],attn_comb[16],x[5120],y[5120];
+        if(rank==owner){
             if(layer==1||layer==14)dump_record(dump,"engram",h,20480);
             pt=P_BEGIN();mixes(layer,"attn",h,attn_pre,attn_post,attn_comb);P_END(HC_ATTN_MIX,pt);
             dump_record(dump,"attn_pre",attn_pre,4);dump_record(dump,"attn_post",attn_post,4);dump_record(dump,"attn_comb",attn_comb,16);
             pt=P_BEGIN();ds41f_hc_pre(x,h,pre_mix,5120);ds41f_round_bf16(x,5120);named_norm(layer,"attn_norm",x,x);P_END(HC_ATTN_PRE,pt);
             dump_record(dump,"attn_input",x,5120);
-            pt=P_BEGIN();CHECK(ds41f_attention_step(&attention,&weights,layer,pos,x,y));P_END(ATTENTION,pt);
+        }
+        pt=P_BEGIN();
+        if(dense_tp>1)parallel_attention(layer,pos,x,y);
+        else if(rank==owner)CHECK(ds41f_attention_step(&attention,&weights,layer,pos,x,y));
+        if(rank==owner){P_END(ATTENTION,pt);P_VALUE(TP_GROUP,dense_tp);
             dump_record(dump,"attn_output",y,5120);
             pt=P_BEGIN();ds41f_hc_post(h,y,h,attn_post,attn_comb,5120);ds41f_round_bf16(h,20480);P_END(HC_ATTN_POST,pt);
             dump_record(dump,"attn_residual",h,20480);
@@ -180,14 +209,17 @@ static int forward(int token,size_t pos,int trace,const char *logits_path)
             CHECK(ds41f_gate(logits,tensor(name)->data,384,6,1,1.5f,ids,prob));
             for(int i=0;i<6;++i){route[i]=(float)ids[i];route[i+6]=prob[i];}P_END(GATE,pt);
             dump_record(dump,"route",route,12);
-            profile_attention+=now()-phase_start;}
+            profile_attention+=now()-attention_start;}
         pt=P_BEGIN();sync_attention(layer,pos);P_END(ATTN_SYNC,pt);
-        pt=P_BEGIN();ds41f_comm_broadcast(ffn_packet,5132,owner);P_END(FFN_BCAST,pt);
+        pt=P_BEGIN();if(compact_comm)ds41f_comm_bf16_broadcast(ffn_packet,5120,12,owner);
+        else ds41f_comm_broadcast(ffn_packet,5132,owner);P_END(FFN_BCAST,pt);
         float combined[5120];double phase_start=now();pt=P_BEGIN();local_experts(layer,ffn_input,route,combined);P_END(EXPERTS,pt);profile_expert+=now()-phase_start;
         float shared[5120];
         /* Use the same owner thread team before the rendezvous. The shared
          * output is still added after the routed sum, preserving its rounding. */
-        if(shared_overlap&&rank==owner){pt=P_BEGIN();shared_expert(layer,ffn_input,shared);P_END(SHARED_OVERLAP,pt);}
+        if(shared_overlap){pt=P_BEGIN();
+            if(dense_tp>1){if(tp_member(owner)){parallel_shared(layer,ffn_input,shared);P_END(SHARED_OVERLAP,pt);}}
+            else if(rank==owner){shared_expert(layer,ffn_input,shared);P_END(SHARED_OVERLAP,pt);}}
         pt=P_BEGIN();ds41f_comm_sum(combined,5120);P_END(EXPERT_SUM,pt);
         if(rank==owner){phase_start=now();pt=P_BEGIN();
             if(!shared_overlap)shared_expert(layer,ffn_input,shared);
@@ -200,18 +232,31 @@ static int forward(int token,size_t pos,int trace,const char *logits_path)
             profile_shared+=now()-phase_start;
             if(trace){double norm=0;for(int j=0;j<20480;++j){if(!isfinite(h[j]))ds41f_comm_abort("nonfinite residual",EDOM);norm+=(double)h[j]*h[j];}
                 fprintf(stderr,"LAYER pos=%zu layer=%d norm=%g experts=%d,%d,%d,%d,%d,%d\n",pos,layer,sqrt(norm),(int)route[0],(int)route[1],(int)route[2],(int)route[3],(int)route[4],(int)route[5]);}}
-        pt=P_BEGIN();ds41f_comm_broadcast(residual_packet,20484,owner);P_END(RESIDUAL_BCAST,pt);
+        pt=P_BEGIN();if(compact_comm)ds41f_comm_bf16_handoff(residual_packet,20480,4,owner,layer==39?11:(layer+1)%12);
+        else ds41f_comm_broadcast(residual_packet,20484,owner);P_END(RESIDUAL_BCAST,pt);
     }
-    ds41f_profile_at(pos,40);float next=0;
-    if(rank==11){double phase_start=now();pt=P_BEGIN();float x[5120];ds41f_hc_pre(x,h,pre_mix,5120);ds41f_round_bf16(x,5120);CHECK(ds41f_norm(&weights,"norm.weight",x,x));P_END(HEAD_PRE,pt);
-        float *logits=malloc(129280*sizeof(float));if(!logits)ds41f_comm_abort("logits",ENOMEM);
-        pt=P_BEGIN();CHECK(ds41f_linear(&weights,"head",logits,x,1));P_END(HEAD_LINEAR,pt);pt=P_BEGIN();size_t best;
-        CHECK(ds41f_argmax_finite(logits,129280,&best));
-        P_END(HEAD_SELECT,pt);
-        if(logits_path){char path[4096];snprintf(path,sizeof path,"%s.pos%zu.bin",logits_path,pos);FILE *f=fopen(path,"wb");
-            if(!f||fwrite(logits,sizeof(float),129280,f)!=129280)ds41f_comm_abort("write logits",EIO);
-            fclose(f);}
-        next=(float)best;fprintf(stderr,"LOGITS pos=%zu argmax=%zu value=%g\n",pos,best,logits[best]);free(logits);profile_head+=now()-phase_start;}
+    ds41f_profile_at(pos,40);float next=0,x[5120];double head_start=now();
+    if(rank==11){pt=P_BEGIN();ds41f_hc_pre(x,h,pre_mix,5120);ds41f_round_bf16(x,5120);CHECK(ds41f_norm(&weights,"norm.weight",x,x));P_END(HEAD_PRE,pt);}
+    pt=P_BEGIN();
+    if(dense_tp>1)ds41f_comm_bf16_broadcast(x,5120,0,11);
+    if(rank==11||dense_tp>1){
+        const ds41f_weight *head=tensor("head.weight");size_t count=head->rows;
+        float *logits=malloc(count*sizeof(float));if(!logits)ds41f_comm_abort("logits",ENOMEM);
+        CHECK(ds41f_linear(&weights,"head",logits,x,1));if(rank==11)P_END(HEAD_LINEAR,pt);
+        pt=P_BEGIN();size_t local_best;CHECK(ds41f_argmax_finite(logits,count,&local_best));
+        float value=logits[local_best];int best=(int)(local_best+head->row_start);
+        if(dense_tp>1)ds41f_comm_argmax(&value,&best);
+        if(rank==11)P_END(HEAD_SELECT,pt);
+        float *full=NULL;
+        if(logits_path&&dense_tp>1){if(rank==11){full=malloc(129280*sizeof(float));if(!full)ds41f_comm_abort("full logits",ENOMEM);}
+            ds41f_comm_head_logits(full,logits,count);}
+        if(rank==11){
+            if(logits_path){char path[4096];snprintf(path,sizeof path,"%s.pos%zu.bin",logits_path,pos);FILE *f=fopen(path,"wb");
+                if(!f||fwrite(full?full:logits,sizeof(float),129280,f)!=129280)ds41f_comm_abort("write logits",EIO);
+                fclose(f);}
+            next=(float)best;fprintf(stderr,"LOGITS pos=%zu argmax=%d value=%g\n",pos,best,value);profile_head+=now()-head_start;}
+        free(full);free(logits);
+    }
     pt=P_BEGIN();ds41f_comm_broadcast(&next,1,11);P_END(NEXT_BCAST,pt);P_END(TOKEN,token_start);return (int)next;
 }
 int main(int argc,char **argv)
@@ -225,7 +270,7 @@ int main(int argc,char **argv)
     {int tid=omp_get_thread_num();if(tid<48)cpu[tid]=sched_getcpu();}
     int unique=0;for(int i=0;i<48;++i){int seen=0;for(int j=0;j<i;++j)if(cpu[j]==cpu[i])seen=1;if(cpu[i]>=0&&!seen)++unique;}
     fprintf(stderr,"THREADS max=%d distinct_cpus=%d\n",omp_get_max_threads(),unique);
-    const char *root=NULL,*prompt=NULL,*logits_path=NULL;size_t capacity=4096,logits_count=SIZE_MAX,logits_start=0,profile_start=SIZE_MAX,profile_count=0,int8_block=0;int generate=1,trace=0,ignore_eos=0,prefetch_engram=0,int8_projections=0,engram_scale_cache=0,weights_local_pages=0;
+    const char *root=NULL,*prompt=NULL,*logits_path=NULL;size_t capacity=4096,logits_count=SIZE_MAX,logits_start=0,profile_start=SIZE_MAX,profile_count=0,int8_block=0;int generate=1,trace=0,ignore_eos=0,prefetch_engram=0,int8_projections=0,engram_scale_cache=0,weights_local_pages=0,sparse_tile=0,sparse_math=0;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--stage-root")&&i+1<argc)root=argv[++i];
         else if(!strcmp(argv[i],"--prompt-ids")&&i+1<argc)prompt=argv[++i];
@@ -243,6 +288,10 @@ int main(int argc,char **argv)
             if(!strcmp(scope,"all"))int8_projections=0;
             else if(!strcmp(scope,"projections"))int8_projections=1;
             else ds41f_comm_abort("FP8 INT8 scope must be all or projections",EINVAL);}
+        else if(!strcmp(argv[i],"--sparse-tile")&&i+1<argc)sparse_tile=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--hc-matvec")&&i+1<argc)hc_matvec_mode=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--dense-tp")&&i+1<argc)dense_tp=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--sparse-math")&&i+1<argc)sparse_math=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--trace"))trace=1;
         else if(!strcmp(argv[i],"--ignore-eos"))ignore_eos=1;
         else if(!strcmp(argv[i],"--engram-prefetch"))prefetch_engram=1;
@@ -250,12 +299,20 @@ int main(int argc,char **argv)
         else if(!strcmp(argv[i],"--hc-mix-sve"))hc_mix_sve=1;
         else if(!strcmp(argv[i],"--shared-overlap"))shared_overlap=1;
         else if(!strcmp(argv[i],"--weights-local-pages"))weights_local_pages=1;
+        else if(!strcmp(argv[i],"--compact-comm"))compact_comm=1;
         else if(!strcmp(argv[i],"--mpi-broadcast"))ds41f_comm_use_mpi_broadcast(1);
         else ds41f_comm_abort("unknown/missing option",EINVAL);}
     if(!root||!prompt||!capacity||capacity>1048576||generate<1)ds41f_comm_abort("required --stage-root --prompt-ids; valid context/generate",EINVAL);
     if(!dump_count||dump_count>64)ds41f_comm_abort("dump count must be in [1,64]",EINVAL);
     if(int8_block&&int8_block!=32&&int8_block!=64&&int8_block!=128&&int8_block!=256)
         ds41f_comm_abort("FP8 INT8 block must be 0,32,64,128,256",EINVAL);
+    if(sparse_tile!=0&&sparse_tile!=1&&sparse_tile!=2&&sparse_tile!=4&&sparse_tile!=6)
+        ds41f_comm_abort("sparse tile must be 0,1,2,4,6",EINVAL);
+    if(hc_matvec_mode<0||hc_matvec_mode>2)ds41f_comm_abort("HC matvec must be 0,1,2",EINVAL);
+    if((dense_tp!=1&&dense_tp!=2&&dense_tp!=4)||(dense_tp>1&&!shared_overlap))
+        ds41f_comm_abort("dense TP must be 1,2,4; TP2/TP4 require --shared-overlap",EINVAL);
+    ds41f_comm_set_tp(dense_tp);
+    if(sparse_math<0||sparse_math>3||(sparse_math&&!sparse_tile))ds41f_comm_abort("sparse math 0..3 requires a tile when nonzero",EINVAL);
     int *tokens=malloc(capacity*sizeof(int));if(!tokens)ds41f_comm_abort("prompt allocation",ENOMEM);
     FILE *f=fopen(prompt,"r");if(!f)ds41f_comm_abort("prompt open",errno);
     size_t count=0;int token;
@@ -269,9 +326,10 @@ int main(int argc,char **argv)
     size_t memory=available(),reserve=(size_t)4*1024*1024*1024;
     if(memory<=reserve)ds41f_comm_abort("insufficient MemAvailable",ENOMEM);
     double start=now();CHECK(ds41f_weights_load_local(&weights,stage,NULL,memory-reserve,weights_local_pages));
+    CHECK(ds41f_weights_check_tp(&weights,stage,dense_tp,rank));
     if(int8_block){double quant_start=now();CHECK(ds41f_weights_requantize_fp8(&weights,int8_block,memory-reserve,int8_projections));
         fprintf(stderr,"FP8_INT8_READY rank=%d seconds=%.6f available=%zu\n",rank,now()-quant_start,available());}
-    CHECK(ds41f_attention_init(&attention,capacity));CHECK(ds41f_engram_open(&engram,stage,rank,12));
+    CHECK(ds41f_attention_init(&attention,capacity));attention.sparse_tile=sparse_tile;attention.sparse_math=sparse_math;CHECK(ds41f_engram_open(&engram,stage,rank,12));
     if(engram_scale_cache){size_t headroom=available();double cache_start=now();
         if(headroom<=(size_t)2*1024*1024*1024)ds41f_comm_abort("Engram scale cache memory guard",ENOMEM);
         CHECK(ds41f_engram_cache_scales(&engram,headroom-(size_t)2*1024*1024*1024));

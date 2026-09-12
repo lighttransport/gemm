@@ -22,5 +22,19 @@ int main(void)
     }
     if(ds41f_hc_inverse_rms(NULL,0)!=0)return 1;
     printf("MHC_MIX PASS norm_bit_exact=%zu tails\n",norms);
+    float *w=malloc((size_t)24*20480*4),out[24],reference[24];
+    if(!w)return 1;
+    for(int trial=0;trial<8;++trial){
+        for(size_t i=0;i<20480;++i)x[i]=sinf((float)i*.013f)*(trial+1);
+        for(size_t i=0;i<(size_t)24*20480;++i)w[i]=cosf((float)i*.071f)/(trial+1);
+        for(int r=0;r<24;++r){double sum=0;for(size_t i=0;i<20480;++i)sum+=(float)(w[(size_t)r*20480+i]*x[i]);reference[r]=(float)sum;}
+        for(int mode=0;mode<3;++mode){
+            if(ds41f_hc_matvec(out,w,x,1,mode))return 1;
+            for(int r=0;r<24;++r)if(!isfinite(out[r])||fabsf(out[r]-reference[r])>1e-3f*(1+fabsf(reference[r]))){
+                fprintf(stderr,"HC_MATVEC FAIL trial=%d mode=%d row=%d ref=%g got=%g\n",trial,mode,r,reference[r],out[r]);return 1;}
+            if(mode==2&&memcmp(out,reference,sizeof out))return 1;
+        }
+    }
+    free(w);puts("HC_MATVEC PASS modes=3 trials=8 FP64_sum_exact FP32_bounded");
     return 0;
 }

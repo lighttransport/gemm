@@ -28,3 +28,7 @@
 
 /test_broadcast
 /test_selection
+
+/test_sparse_tiles
+/test_exp2
+/test_tp_comm

@@ -43,6 +43,7 @@ int ds41f_weights_load_local(ds41f_weights *s,const char *stage,const char *pref
         ds41f_weight item={.rows=0};char extra;
         if(sscanf(line,"%191s %15s %zu %zu %zu %c",item.name,item.dtype,&item.rows,&item.cols,&item.bytes,&extra)!=5){rc=EINVAL;break;}
         if(prefix&&strncmp(item.name,prefix,strlen(prefix)))continue;
+        item.global_rows=item.rows;
         if(!item.rows||!item.cols||!item.bytes||item.rows>SIZE_MAX/item.cols){rc=EINVAL;break;}
         size_t unit=!strcmp(item.dtype,"BF16")?2:!strcmp(item.dtype,"F32")?4:
             (!strcmp(item.dtype,"F8_E4M3")||!strcmp(item.dtype,"F8_E8M0")||!strcmp(item.dtype,"I8"))?1:0;
@@ -61,6 +62,37 @@ int ds41f_weights_load_local(ds41f_weights *s,const char *stage,const char *pref
         if(i%500==0){fprintf(stderr,"LOAD tensor=%zu/%zu %s\n",i,s->count,s->items[i].name);fflush(stderr);}
     }
     return 0;
+}
+static int tp_sharded(const char *name)
+{return !strcmp(name,"head.weight")||strstr(name,".attn.wq_b.")||strstr(name,".attn.wo_a.")||
+    strstr(name,".attn.wo_b.")||strstr(name,".ffn.shared_experts.");}
+int ds41f_weights_check_tp(ds41f_weights *s,const char *stage,int tp,int rank)
+{
+    if(!s||!stage||(tp!=1&&tp!=2&&tp!=4)||rank<0||rank>=12)return EINVAL;
+    char path[4096],line[512];int n=snprintf(path,sizeof path,"%s/weights.tp",stage);
+    if(n<0||(size_t)n>=sizeof path)return ENAMETOOLONG;
+    FILE *f=fopen(path,"r");if(!f)return tp==1&&errno==ENOENT?0:errno;
+    int version,stored_tp,stored_rank,ranks;char extra;
+    int rc=0;
+    if(!fgets(line,sizeof line,f)||sscanf(line,"DS41FTP %d %d %d %d %c",&version,&stored_tp,&stored_rank,&ranks,&extra)!=4||
+       version!=1||tp!=stored_tp||rank!=stored_rank||ranks!=12||tp==1)rc=EINVAL;
+    unsigned char *seen=calloc(s->count,1);if(!seen){fclose(f);return ENOMEM;}
+    while(!rc&&fgets(line,sizeof line,f)){
+        char name[192];size_t rows,cols,first,local;
+        if(sscanf(line,"%191s %zu %zu %zu %zu %c",name,&rows,&cols,&first,&local,&extra)!=5){rc=EINVAL;break;}
+        const ds41f_weight *found=ds41f_weight_find(s,name);
+        if(!found||!tp_sharded(name)||found->rows!=local||found->cols!=cols||first>rows||local>rows-first){rc=EINVAL;break;}
+        size_t index=(size_t)(found-s->items);
+        if(seen[index]){rc=EINVAL;break;}seen[index]=1;
+        if(!strcmp(name,"head.weight")){
+            if(rows!=129280||first!=(rows/32*(size_t)rank/12)*32||
+               local!=(rows/32*(size_t)(rank+1)/12)*32-first){rc=EINVAL;break;}
+        }else if(rows%(size_t)tp||local!=rows/(size_t)tp||first!=(size_t)(rank%tp)*local){rc=EINVAL;break;}
+        s->items[index].global_rows=rows;s->items[index].row_start=first;
+    }
+    if(ferror(f))rc=EIO;
+    if(!rc)for(size_t i=0;i<s->count;++i)if(tp_sharded(s->items[i].name)&&!seen[i]){rc=EINVAL;break;}
+    free(seen);fclose(f);return rc;
 }
 int ds41f_weights_requantize_fp8(ds41f_weights *s,size_t block,size_t limit,int projections_only)
 {

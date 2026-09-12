@@ -73,7 +73,7 @@ def report(directory, start, stop):
         critical[combine + "_RENDEZVOUS"] = ((work + collective).max(axis=0)
                                                - work.max(axis=0)).sum(axis=1)
     critical["UNATTRIBUTED"] = token - sum(critical.values())
-    attention = {name: stats(all_ranks(name)) for name in first["phases"]
+    attention = {name: stats(phase(name).max(axis=0).sum(axis=1)) for name in first["phases"]
                  if name.startswith("ATTN_") and name != "ATTN_SYNC"}
     indexer = {name: stats(all_ranks(name)) for name in ("INDEX_QUERY", "INDEX_SCORE", "INDEX_SELECT")}
     kernels = {}
@@ -112,6 +112,8 @@ def report(directory, start, stop):
                   critical_path={name: dict(stats(x), percent=float(x.mean() / token.mean() * 100))
                                  for name, x in critical.items()},
                   attention_inclusive=attention, indexer_inclusive=indexer,
+                  sparse_components={name: stats(phase(name).max(axis=0).sum(axis=1)) for name in
+                                       ("SPARSE_QK", "SPARSE_SOFTMAX", "SPARSE_PV") if name in index},
                   expert_slowest_rank_components=expert_parts,
                   engram_slowest_rank_components=engram_parts,
                   engram_prefetch_overlap=(stats(phase("ENGRAM_PREFETCH").max(axis=0).sum(axis=1))
@@ -123,7 +125,10 @@ def report(directory, start, stop):
                   nested_other={name: stats(all_ranks(name)) for name in
                                 ("LINEAR_QUANT", "LINEAR_ROUND", "INT8_INPUT_QUANT", "NORM", "HC_NORM", "HC_MATVEC", "HC_SPLIT")
                                 if name in index},
-                  caveat="Parallel reduction remainders include rendezvous and rank skew; nested spans overlap their parents.")
+                  tp_group=(int(phase("TP_GROUP").max()) if "TP_GROUP" in index else 1),
+                  tp_communication_owner=(stats(owner("TP_COMM")) if "TP_COMM" in index else None),
+                  tp_communication=(stats(phase("TP_COMM").max(axis=0).sum(axis=1)) if "TP_COMM" in index else None),
+                  caveat="Reduction remainders include rendezvous/skew; nested spans overlap. Sparse baseline components are maximum worker work durations; tiled components include phase barriers. TP attention components use the maximum shard duration per layer.")
     return result
 
 
@@ -142,7 +147,7 @@ def main():
     print("Critical path (ms/token, percent; reduction includes rendezvous/skew):")
     for name, value in sorted(result["critical_path"].items(), key=lambda item: -item[1]["mean_ms"]):
         print(f"  {name:28s} {value['mean_ms']:9.3f} {value['percent']:7.2f}%")
-    for category in ("attention_inclusive", "indexer_inclusive", "expert_slowest_rank_components",
+    for category in ("attention_inclusive", "sparse_components", "indexer_inclusive", "expert_slowest_rank_components",
                      "engram_slowest_rank_components", "engram_prefetch_overlap", "kernels_aggregate", "expert_placement", "nested_other"):
         print(category + ": " + json.dumps(result[category], sort_keys=True))
 

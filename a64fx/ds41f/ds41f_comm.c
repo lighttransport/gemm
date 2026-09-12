@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 /* The shared single-header transport defines entry points unused here. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -13,7 +17,8 @@
 static tp_comm comm;
 static utofu_vcq_hdl_t vcq;
 static int my_rank;
-static int mpi_broadcast;
+static int mpi_broadcast,dense_tp=1;
+static MPI_Comm dense_comm=MPI_COMM_NULL;
 static void bootstrap_barrier(void){MPI_Barrier(MPI_COMM_WORLD);}
 void ds41f_comm_ready(void){bootstrap_barrier();}
 void ds41f_comm_use_mpi_broadcast(int enabled){mpi_broadcast=!!enabled;}
@@ -54,5 +59,106 @@ void ds41f_comm_broadcast(float *v,size_t n,int owner)
         int rc=MPI_Bcast(v+i,(int)count,MPI_FLOAT,owner,MPI_COMM_WORLD);
         if(rc)ds41f_comm_abort("MPI_Bcast",rc);}
 }
+void ds41f_comm_bytes(void *v,size_t n,int owner)
+{
+    if(owner<0||owner>=12||n>1048576)ds41f_comm_abort("byte broadcast bounds",EINVAL);
+    int rc=MPI_Bcast(v,(int)n,MPI_BYTE,owner,MPI_COMM_WORLD);
+    if(rc)ds41f_comm_abort("byte broadcast",rc);
+}
+static void pack_bf16(uint16_t *wire,float *v,size_t n,size_t tail)
+{
+    size_t i=0;
+    #if defined(__ARM_FEATURE_SVE)
+    for(;i<n;i+=svcntw()){
+        svbool_t pg=svwhilelt_b32(i,n);svfloat32_t f=svld1_f32(pg,v+i);
+        f=svsel_f32(svcmpeq_n_f32(pg,f,0),svdup_f32(0),f);
+        svuint32_t bits=svreinterpret_u32_f32(f);
+        if(svptest_any(pg,svcmpne_n_u32(pg,svand_n_u32_x(pg,bits,65535),0)))
+            ds41f_comm_abort("non-BF16 transport input",EINVAL);
+        svst1_f32(pg,v+i,f);svst1h_u32(pg,wire+i,svlsr_n_u32_x(pg,bits,16));
+    }
+    #else
+    for(;i<n;++i){uint32_t bits;if(v[i]==0.f)v[i]=0.f;memcpy(&bits,v+i,4);
+        if(bits&65535)ds41f_comm_abort("non-BF16 transport input",EINVAL);
+        wire[i]=(uint16_t)(bits>>16);}
+    #endif
+    for(i=0;i<tail;++i)if(v[n+i]==0.f)v[n+i]=0.f;
+    memcpy(wire+n,v+n,tail*sizeof(float));
+}
+static void unpack_bf16(float *v,const uint16_t *wire,size_t n,size_t tail)
+{
+    size_t i=0;
+    #if defined(__ARM_FEATURE_SVE)
+    for(;i<n;i+=svcntw()){
+        svbool_t pg=svwhilelt_b32(i,n);
+        svst1_f32(pg,v+i,svreinterpret_f32_u32(svlsl_n_u32_x(pg,svld1uh_u32(pg,wire+i),16)));}
+    #else
+    for(;i<n;++i){uint32_t bits=(uint32_t)wire[i]<<16;memcpy(v+i,&bits,4);}
+    #endif
+    memcpy(v+n,wire+n,tail*sizeof(float));
+}
+static void bf16_bounds(size_t n,size_t tail,int owner,int next)
+{if(n>20480||tail>12||owner<0||owner>=12||next<0||next>=12)
+    ds41f_comm_abort("BF16 transport bounds",EINVAL);}
+void ds41f_comm_bf16_broadcast(float *v,size_t n,size_t tail,int owner)
+{
+    bf16_bounds(n,tail,owner,owner);uint16_t wire[20480+24];
+    if(my_rank==owner)pack_bf16(wire,v,n,tail);
+    ds41f_comm_bytes(wire,n*2+tail*4,owner);
+    if(my_rank!=owner)unpack_bf16(v,wire,n,tail);
+}
+void ds41f_comm_bf16_handoff(float *v,size_t n,size_t tail,int owner,int next)
+{
+    bf16_bounds(n,tail,owner,next);uint16_t wire[20480+24];int rc=0;
+    /* Fixed tag is safe: a single main thread issues every handoff in layer
+     * order, and each source/destination pair is FIFO. Nonparticipants may
+     * enter the following collective while the next dense owner receives. */
+    if(my_rank==owner){pack_bf16(wire,v,n,tail);
+        if(next!=owner)rc=MPI_Send(wire,(int)(n*2+tail*4),MPI_BYTE,next,41,MPI_COMM_WORLD);}
+    else if(my_rank==next){rc=MPI_Recv(wire,(int)(n*2+tail*4),MPI_BYTE,owner,41,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+        if(!rc)unpack_bf16(v,wire,n,tail);}
+    if(rc)ds41f_comm_abort("BF16 residual handoff",rc);
+}
+void ds41f_comm_set_tp(int tp)
+{
+    if((tp!=1&&tp!=2&&tp!=4)||dense_comm!=MPI_COMM_NULL)ds41f_comm_abort("TP configuration",EINVAL);
+    dense_tp=tp;int rc=MPI_Comm_split(MPI_COMM_WORLD,my_rank/tp,my_rank,&dense_comm);
+    if(rc)ds41f_comm_abort("TP communicator",rc);
+}
+void ds41f_comm_tp_bytes(void *v,size_t n,int owner)
+{
+    if(dense_comm==MPI_COMM_NULL||owner<0||owner>=12||owner/dense_tp!=my_rank/dense_tp||n>1048576)
+        ds41f_comm_abort("TP broadcast bounds",EINVAL);
+    int rc=MPI_Bcast(v,(int)n,MPI_BYTE,owner%dense_tp,dense_comm);
+    if(rc)ds41f_comm_abort("TP broadcast",rc);
+}
+static void tp_collect(float *out,float *part,size_t n,int owner,int all)
+{
+    if(dense_comm==MPI_COMM_NULL||n*(size_t)dense_tp>8192||owner<0||owner>=12||owner/dense_tp!=my_rank/dense_tp)
+        ds41f_comm_abort("TP gather bounds",EINVAL);
+    uint16_t send[8192],recv[8192];pack_bf16(send,part,n,0);
+    int rc=all?MPI_Allgather(send,(int)n*2,MPI_BYTE,recv,(int)n*2,MPI_BYTE,dense_comm):
+        MPI_Gather(send,(int)n*2,MPI_BYTE,recv,(int)n*2,MPI_BYTE,owner%dense_tp,dense_comm);
+    if(rc)ds41f_comm_abort("TP gather",rc);
+    if(all||my_rank==owner)unpack_bf16(out,recv,n*(size_t)dense_tp,0);
+}
+void ds41f_comm_tp_allgather(float *out,float *part,size_t n)
+{tp_collect(out,part,n,my_rank,1);}
+void ds41f_comm_tp_gather(float *out,float *part,size_t n,int owner)
+{tp_collect(out,part,n,owner,0);}
+void ds41f_comm_argmax(float *value,int *index)
+{
+    struct {float value;int index;} in={*value,*index},out;
+    int rc=MPI_Allreduce(&in,&out,1,MPI_FLOAT_INT,MPI_MAXLOC,MPI_COMM_WORLD);
+    if(rc)ds41f_comm_abort("head argmax",rc);*value=out.value;*index=out.index;
+}
+void ds41f_comm_head_logits(float *out,const float *part,size_t n)
+{
+    int counts[12],offsets[12];
+    for(int r=0;r<12;++r){offsets[r]=(4040*r/12)*32;counts[r]=(4040*(r+1)/12)*32-offsets[r];}
+    if(n!=(size_t)counts[my_rank])ds41f_comm_abort("head shard geometry",EINVAL);
+    int rc=MPI_Gatherv(part,(int)n,MPI_FLOAT,out,counts,offsets,MPI_FLOAT,11,MPI_COMM_WORLD);
+    if(rc)ds41f_comm_abort("head logits gather",rc);
+}
 void ds41f_comm_free(void)
-{bootstrap_barrier();tp_comm_free(&comm);utofu_free_vcq(vcq);MPI_Finalize();}
+{bootstrap_barrier();if(dense_comm!=MPI_COMM_NULL)MPI_Comm_free(&dense_comm);tp_comm_free(&comm);utofu_free_vcq(vcq);MPI_Finalize();}

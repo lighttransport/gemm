@@ -8,6 +8,10 @@ A64FX_CFLAGS ?= -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast
 .PHONY: all a64fx clean test validate
 .DEFAULT_GOAL := all
 
+ds41f_run test_attention test_index_candidates test_staged_expert test_ops test_rope_layout \
+ test_mhc_mix test_pointwise test_int8_attention ds41f_utofu_test test_selection \
+ bench_attention_kernel test_sparse_tiles test_exp2: ds41f_sparse_sve.h ds41f_exp2.h
+
 bench_batch bench_quant ds41f_run test_attention test_index_candidates test_cache test_staged_expert ds41f_kernel_test ds41f_sve_test ds41f_utofu_test: ds41f_quant_sve.h ds41f_kernels.h
 ds41f_run test_attention test_index_candidates test_staged_expert ds41f_utofu_test: ds41f_profile.h
 ds41f_run test_attention test_index_candidates: ds41f_int8.c ds41f_int8.h ds41f_weights.h
@@ -15,6 +19,10 @@ ds41f_run test_attention test_index_candidates test_int8_attention: ds41f_attent
 ds41f_run test_attention test_index_candidates test_int8_attention test_int8 bench_int8 test_staged_expert ds41f_utofu_test: ds41f_alloc.h ds41f_tensor.h
 ds41f_run test_prefetch test_engram: ds41f_engram.h
 ds41f_run: ds41f_comm.h ds41f_ops.h
+test_exp2: test_exp2.c ds41f_ops.c ds41f_ops.h
+	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c,$^) -lm -o $@
+test_sparse_tiles: test_sparse_tiles.c ds41f_ops.c ds41f_ops.h
+	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c,$^) -lm -o $@
 bench_attention_kernel: bench_attention_kernel.c ds41f_ops.c
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -lm -o $@
 bench_batch: bench_batch.c ds41f_batch.c ds41f_kernels.c ../gemma4-kernels/sgemm_bf16_2x12.S
@@ -54,11 +62,13 @@ test_int8: test_int8.c ds41f_int8.c ds41f_int8.h ds41f_kernels.c
 bench_int8: bench_int8.c ds41f_int8.c ds41f_int8.h ds41f_sve.c ds41f_kernels.c ds41f_tensor.c
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c %.S,$^) -lm -o $@
 all: ds41f_stage ds41f_bench ds41f_kernel_test
+test_tp_comm: test_tp_comm.c ds41f_comm.c ds41f_comm.h ../utofu-tests/tp_allreduce.h
+	$(A64FX_MPICC) $(A64FX_CFLAGS) -I. $(filter %.c,$^) -ltofucom -o $@
 test_broadcast: test_broadcast.c ds41f_comm.c ds41f_comm.h ../utofu-tests/tp_allreduce.h
 	$(A64FX_MPICC) $(A64FX_CFLAGS) -I. $(filter %.c,$^) -ltofucom -o $@
 test_selection: test_selection.c ds41f_ops.c ds41f_ops.h
 	$(A64FX_CC) $(A64FX_CFLAGS) -fopenmp -I. $(filter %.c,$^) -lm -o $@
-a64fx: test_broadcast test_selection test_tensor_local test_rope_layout test_mhc_mix test_int8 test_int8_attention bench_int8 ds41f_run ds41f_sve_test ds41f_utofu_test test_attention test_index_candidates test_cache test_ops test_pointwise test_prefetch test_engram test_staged_expert bench_batch bench_quant bench_attention_kernel bench_hardware
+a64fx: test_exp2 test_tp_comm test_sparse_tiles test_broadcast test_selection test_tensor_local test_rope_layout test_mhc_mix test_int8 test_int8_attention bench_int8 ds41f_run ds41f_sve_test ds41f_utofu_test test_attention test_index_candidates test_cache test_ops test_pointwise test_prefetch test_engram test_staged_expert bench_batch bench_quant bench_attention_kernel bench_hardware
 
 ds41f_stage: ds41f_stage.c
 	$(CC) $(CFLAGS) -I$(COMMON) $< -o $@
@@ -88,4 +98,4 @@ ds41f_bench_utofu: ds41f_bench.c ds41f_engram.c ds41f_engram.h ../q38fn/ngram_ut
 
 clean:
 	rm -f ds41f_stage ds41f_bench ds41f_bench_utofu ds41f_kernel_test ds41f_sve_test ds41f_utofu_test bench_quant test_ops test_engram test_staged_expert
-	rm -f test_broadcast test_selection ds41f_run test_attention test_index_candidates test_cache test_pointwise test_rope_layout test_mhc_mix test_tensor_local test_prefetch test_int8 test_int8_attention bench_int8 bench_batch bench_attention_kernel bench_hardware
+	rm -f test_exp2 test_tp_comm test_sparse_tiles test_broadcast test_selection ds41f_run test_attention test_index_candidates test_cache test_pointwise test_rope_layout test_mhc_mix test_tensor_local test_prefetch test_int8 test_int8_attention bench_int8 bench_batch bench_attention_kernel bench_hardware

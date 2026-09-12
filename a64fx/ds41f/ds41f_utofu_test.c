@@ -8,7 +8,10 @@
 #include <unistd.h>
 #include <math.h>
 #include "ds41f_expert.h"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
 #include "../utofu-tests/tp_allreduce.h"
+#pragma GCC diagnostic pop
 
 static int rank;
 static void die(const char *what, int rc)
