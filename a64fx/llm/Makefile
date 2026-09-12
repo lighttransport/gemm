@@ -143,9 +143,11 @@ GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COM
 # ── Targets ────────────────────────────────────────────────────────────
 # ds4f_bake MUST be here: the alias target name matches ds4f_bake.c, so without .PHONY make's
 # built-in "%: %.c" rule fires and re-links the finished binary as if it were an object.
-.PHONY: all clean vlm_objs qwen38_runner qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
+.PHONY: all clean vlm_objs llm_runner qwen38_runner qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
 
 all: $(BUILD)/llm_runner
+
+llm_runner: $(BUILD)/llm_runner
 
 qwen38_runner: $(BUILD)/qwen38_runner
 $(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h | $(BUILD)
@@ -179,8 +181,11 @@ $(BUILD):
 vlm_objs:
 	$(MAKE) -C $(VLM_DIR) CC=$(CC) OPENMP=$(OPENMP)
 
+# transformer.h includes the A64FX mixed-format kernels directly.
+$(addprefix $(BUILD)/,llm_runner pp_runner tp_runner qwen38_runner qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner): $(LLM_DIR)mixed_iq_decode.h
+
 $(BUILD)/llm_runner: $(MAIN_SRC) vlm_objs | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $(MAIN_SRC) $(VLM_OBJS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -DTF_LINK_PODD -o $@ $(MAIN_SRC) $(VLM_OBJS) $(BF16_PODD_KERNEL) $(LDFLAGS)
 
 # Multi-node pipeline-parallel decode runner (pure uTofu, no MPI in the binary;
 # mpiexec only places ranks). Links libtofucom for uTofu one-sided Put/barrier.

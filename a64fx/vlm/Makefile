@@ -75,6 +75,10 @@ KERNEL_OBJ := $(patsubst $(KERNELS)/%.c,$(BUILD)/kernels_%.o,$(KERNEL_C)) \
               $(patsubst $(KERNELS)/%.S,$(BUILD)/kernels_%.o,$(KERNEL_S))
 RUNTIME_OBJ := $(patsubst $(SRC)/%.c,$(BUILD)/src_%.o,$(RUNTIME))
 
+# qtensor is embedded in vision_model: all users must see the same layout.
+VISION_HEADERS := $(COMMON)/transformer.h $(COMMON)/qtensor_utils.h \
+                  $(COMMON)/vision_encoder.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h
+
 # ── Targets ────────────────────────────────────────────────────────────
 .PHONY: all clean ref
 
@@ -95,7 +99,9 @@ $(BUILD)/kernels_%.o: $(KERNELS)/%.S | $(BUILD)
 $(BUILD)/src_%.o: $(SRC)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(BUILD)/vlm_runner: $(MAIN_SRC) $(RUNTIME_OBJ) $(KERNEL_OBJ) | $(BUILD)
+$(BUILD)/src_vit_a64fx.o: $(VISION_HEADERS)
+
+$(BUILD)/vlm_runner: $(MAIN_SRC) $(RUNTIME_OBJ) $(KERNEL_OBJ) $(VISION_HEADERS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(MAIN_SRC) $(RUNTIME_OBJ) $(KERNEL_OBJ) $(LDFLAGS)
 
 $(BUILD)/tensor_diff: $(TOOLS)/tensor_diff.c $(SRC)/tensor_dump.c | $(BUILD)

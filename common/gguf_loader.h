@@ -406,6 +406,12 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
 
     gguf_context *ctx = (gguf_context *)calloc(1, sizeof(gguf_context));
     if (!ctx) { fclose(f); return NULL; }
+#ifndef _WIN32
+    /* Ordinary anonymous loads close their source FILE before returning.
+     * Do not mistake calloc's zero for an owned descriptor (stdin) in NUMA
+     * setup or gguf_close.  mmap/deferred-load paths install their own fd. */
+    ctx->fd = -1;
+#endif
     ctx->version = version;
     ctx->n_kv = n_kv;
     ctx->n_tensors = n_tensors;
