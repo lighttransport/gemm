@@ -1,119 +1,230 @@
-# DS4F resume handoff
+# Qwen3.8-Flash-Next RDNA4 runner — resume handoff
 
-Worktree: `/mnt/nvme02/work/gemm/ds4f`
+Worktree: `/mnt/nvme02/work/gemm/main`
 
 ## Objective
 
-Serving target on CPU + Radeon 9070 XT, exact/mHC/tier-B2 quality path:
+Stable, quality-safe Qwen3.8-Flash-Next LLM runner on CPU + Radeon RX 9070 XT
+(gfx1201, 16 GiB), for `rdna4/llm/`.
 
-- preserve output quality first (mHC exact quality gate, see below);
-- single-stream decode around 18 tok/s;
-- prefill around 100-200 tok/s for 1K+ input;
-- prefix/system/tool-token caching for coding-agent requests;
-- harden long-context and multi-context operation.
+- Quality bar: **bit-exact F16 greedy-hash parity** (identical first token +
+  full sequence hash vs the scalar F16 reference) on a diverse prompt set.
+- Performance targets: **prefill >= 200 tok/s** and **single-stream decode
+  >= 30 tok/s**.
+- Decode route: exact single-token decode (no MTP).
+- Prefill route: fix and promote the batched dispatcher; scalar is the
+  quality-safe fallback.
 
-Do not redefine success around the current benchmark numbers. Do not push to any remote without explicit user permission.
+Do not push to any remote without explicit per-action user permission.
+Committing freely is allowed once a coherent unit is done.
 
-## Current status (2026-08-12)
+## Current status (2026-09-12)
 
-**Prefill: ~17.5 tok/s at 1024 tokens** (up from a ~11-15 tok/s baseline this session via a real bug fix). **Decode: ~5.2-5.5 tok/s** (up from ~5.1 baseline). Both still well short of the 100-200 / 18 tok/s targets. Quality gate holds at 8/9 argmax match throughout (one expected W4A8 approximation mismatch at token index 2 — not a regression, do not chase 9/9).
+The performance targets are **not reached**. The scalar route is deterministic
+but slow; the batched route is much faster but has a **rare residual prefill
+nondeterminism** (~1 in 8 repeats), so it is best-effort/diagnostic only.
 
-This session made two genuine, verified, quality-neutral fixes plus a large validated-but-not-yet-beneficial GPU attention kernel:
+Measured on the RX 9070 XT with the real 9,000-byte `common/gguf_loader.h`
+prompt (`rdna4/llm/tmp/qwen38_target_prompt.txt`), 4,096 prefill / 64 decode,
+BMAX=4096, 5,000-MiB cache, `LLM_QWEN4_BATCH=1`:
 
-1. **`DS4F_ATTN_GEMM` platform-default bug (commit `b804fecd`)** — the "fast" 8-head-blocked attention kernel was SVE-only-optimized; on this x86 host it silently fell back to unvectorized scalar code (`common/ds4f_kernels_x86.h`) while bypassing its own genuinely-AVX2-vectorized simpler path. Fixed the default to be platform-conditional. **+~32-34% on the attn phase, prefill baseline 11-15 -> 17.5 tok/s.** This was the single biggest win this session.
-2. **`DS4F_MV_FUSE` default bug (commit `9907c69c`)** — batches independent matvec dispatches into one thread-pool barrier instead of one-per-matvec; was off by default despite the code's own comment quantifying the gap as decode-specific. Bit-exact. **+~6% decode.**
-3. **Tier-B2-aware GPU attention kernel (commits `5e648d50`, `1dbf751d`)** — built and validated *correct* (mHC quality gate bit-identical, unit-tested including a ring-buffer wraparound edge case found and fixed along the way), but measured **slower** (attn phase ~3x slower, prefill -6%, decode -15%) because it dispatches one GPU round-trip per single sequential position, and that per-call latency exceeds the CPU AVX2 path it replaces. Left in the tree as **opt-in, off by default** (`DS4F_ATTN_HYBRID_GPU=0`) — inert, zero risk, but a real foundation for a future batched-attention rewrite.
-4. **Adaptive hot-expert cache (commit `a6ecc5ea`)** — periodic batched re-admission of GPU-resident experts based on a live decode-time routing window. Built, safe, real effect (shifts load from CPU to GPU), but **net-zero throughput** (refresh's own upload cost offsets the CPU time saved). Left in as **opt-in, off by default** (`DS4F_ADAPTIVE_CACHE_PERIOD=0`).
+| Profile | Prefill tok/s | Decode tok/s | Repeatability | Hash |
+| --- | ---: | ---: | --- | --- |
+| scalar `fast` (quality-safe) | ~24 | ~21 | deterministic | `6d67721190bdaa83` |
+| `batch4k` pageable + direct copies | 125 (median) | 19.6 | 7/8 | `afdf60ceeb4f0103` |
+| `batch4k` pinned host + async pipeline | 149 (median) | 21.4 | ~1/8 divergence | `afdf60ceeb4f0103` |
+| `batch4k-stage` (grouped cold, pageable) | ~119 | 17.7 | deterministic | `afdf60ceeb4f0103` |
 
-Everything is committed. Working tree is clean except two untracked runtime log files (`a64fx/llm/ds4f_frontend.log`, `a64fx/llm/ds4f_runner.log` — do not commit these). No server or benchmark process is currently running.
+Batched-prefill cold-expert traffic is the wall: only ~25-33% routed-expert
+cache hits and ~90-124 GiB H2D at 2K-4K, because the 512-expert x 48-layer
+working set is far larger than any cache that fits beside the BMAX=4096
+scratch.
 
-## Why the targets aren't reached (the real bottleneck, confirmed with hard numbers)
+The scalar `fast` route is the only quality-safe deterministic default today.
+At 4K it is only ~24 prefill / ~21 decode, so neither target is met.
 
-- **Prefill's `experts` phase (routed-FFN) is data-volume-bound, not a staging inefficiency.** A single 256-token prefill call transfers ~64GB across ~28,824 individual H2D copies at ~4.17 GB/s, on a confirmed-full-speed PCIe Gen5 x16 link. Two different host-memory staging strategies (full-span `hipHostRegister`, persistent pinned staging buffers) were tried and both failed to help — the bottleneck is genuine per-request data volume (near-full per-layer expert-weight coverage from diverse per-token routing), not the transfer mechanism. Not fixable without either violating the accuracy requirement (approximating routing) or reducing repeat uploads via genuine cross-request/cross-call expert-identity caching (see the adaptive-cache result above, which already tried this for decode and found it net-neutral).
-- **Attention (both prefill and decode) is legitimately compute-bound**, using an already-optimized, now-correctly-vectorized SVE/AVX2 kernel, with a properly bounded (not O(K^2)) sliding window. The only remaining lever is GPU offload, which now exists (Step 3 above) but is slower in its current single-position dispatch form.
-- **The one architectural path to a real win for both targets**: restructure tier-B2's compressor to allow **batching multiple sequential positions into one GPU attention kernel call**, instead of the current one-position-at-a-time dispatch. This requires touching `ds4f_tb2_prepare`'s sequential per-position ring-buffer dependency (each position's compression state depends on the previous position's update) — a materially larger, not-yet-scoped restructuring project. This is the concrete next step, explicitly deferred by user decision twice this session (once for prefill, once for decode) rather than rushed under time pressure.
-- **Alternative architectural path**: cross-request batching (keep the GPU busy with one request's routed-FFN upload while another request's CPU attention runs) — not explored this session, would need serving-scheduler-level changes, not kernel changes.
+## What was fixed this session (all committed)
 
-## TODO / next steps, in priority order
+Key commits (newest first):
 
-1. **Scope and implement tier-B2 compressor restructuring for batched GPU attention.** This is the one remaining lever with real expected payoff for both prefill and decode. Needs its own dedicated session with proper validation runway (unit tests + the mHC exact quality gate at every step, exactly as done for the single-position kernel this session) — do not rush this under time pressure. Once positions can be batched, re-enable and re-benchmark the `DS4F_ATTN_HYBRID_GPU` path built this session (already correct, just needs a batched caller).
-2. If pursuing the routed-FFN data-volume problem further: investigate genuine cross-request expert-identity caching (distinct from the adaptive intra-request cache already tried and found net-neutral) or reducing bytes moved via a different serving pattern.
-3. Re-run 8192-token prefill scaling once the above changes land (last full run was interrupted mid-execution by the harness, not a crash — 256/1024-token results are the reliable current baseline).
-4. Prefix/system/tool-token caching for coding-agent requests, and long-context/multi-context hardening — not investigated this session at all; still open from the original objective.
+- `6b31c751` deterministic single-thread `qwen4_renorm_resident_weights`
+  (decode-path expert-weight renorm used order-dependent `atomicAdd`).
+- `5fdf98e8` `LLM_QWEN4_MOE_EOUT_ALIAS` diagnostic; ruled out the
+  `d_moe_eout`/gather alias as the sole residual.
+- `62904384` direct cold-expert copies ordered via `moe_copy_stream` +
+  `hipEventRecord`/`hipStreamWaitEvent` (a plain `hipMemcpyAsync(..., r->stream)`
+  did not reliably order on this ROCm stack).
+- `96dc1f95` diagnosed the cold-expert H2D ordering.
+- `b933fde2` isolated the residual to `forward_moe_ffn_batched` (per-token MoE
+  is deterministic 6/6; batched attention/SSM are fine).
+- `058d754a` **stream-ordered per-row position publication** — the biggest fix.
+  The forced-scalar layer-1 loop published `r->d_position` with a blocking
+  `hipMemcpy` on the null stream once per row, racing `r->stream` kernels.
+  Now `hipMemcpyAsync` from a precomputed host array `h_pos_batch`.
+- `f2ee146a`, `3b708af8` defaulted `batch4k` to pageable + direct copies and
+  corrected determinism claims.
+- `8f96e6a8`, `411cc2b8` localized/recorded the residual.
+- `6b204f3e`, `a0998941` staged grouped-prefill metadata ordering and its
+  residual staging-bank race.
+- `628d2663` grouped routed-expert investigation: grouped-BF16-WMMA is
+  memory-infeasible (ne*N*K bf16 ~= 15 GiB for 512 experts); grouped
+  resident-only gives no gain; staged grouped cold experts help only at
+  register=0.
+- `70c5a974`, `e6919a79`, `21273851` deterministic single-dispatch 4K profile,
+  async-pipeline request isolation, tuning limits.
+- `3b228443` multi-chunk state-carry localization (L23 `attn_out`).
+- `7d31bc5f` ordered MoE combine (`moe_scatter_accum_ordered` +
+  `d_moe_assign_pos`), synchronous CPU-result publication.
+- `9e290422` repeatability gate (`test_hip_llm --bench-repeat`,
+  `bench_qwen38_target.sh`, 256K/sub-32K gates, `target-gate*`) plus the
+  `QWEN38_FAST_PREFILL` precedence fix.
+
+Real bugs fixed: ordered K-expert combine, CPU result publication race,
+per-row position null-stream race, cold-expert H2D ordering, staged metadata
+ordering, decode renorm atomic order, expert-cache reset between requests.
+
+## The remaining blocker
+
+A **rare residual prefill nondeterminism in the batched MoE dispatcher**.
+Evidence and negative results:
+
+- Per-token MoE (`LLM_MOE_PREFILL_SCALAR=1`) is deterministic 6/6 at 512/8, so
+  the race is in `forward_moe_ffn_batched`.
+- The batched MoE kernels have no atomics, so it is a data-ordering/lifetime
+  issue.
+- With `--decode 4` the **prefill first token itself varies** (16 / 289 / 9616 /
+  37700), so it is not a decode-only issue.
+- Disabling the `d_moe_eout` alias, using host router top-k, using pageable
+  host weights, and a full `hipStreamSynchronize` after each cold copy all
+  still diverge, so no single knob fixes it.
+- `HIP_LAUNCH_BLOCKING=1` largely hides it (steady repeats match), confirming an
+  ordering bug, not arithmetic.
+- A 4-repeat `LLM_DEBUG_LAYERS=1` trace at 1024 does **not** reproduce it (the
+  per-stage sync perturbs timing), so it could not be localized to one stage.
+
+Recommended next approach (not yet implemented): a **device-side expert-cache
+manager** that eliminates host memcpys during a layer — stage all cold experts
+into cache/staging, synchronize once (event), then compute. This removes the
+whole host-copy ordering class rather than patching individual copies.
+
+## TODO / next steps, priority order
+
+1. Implement the device-side cold-expert staging manager to remove the
+   residual batched-MoE race, then re-run the repeatability gate.
+2. Make the async copy pipeline and pinned-host paths repeatable (they reach
+   149 prefill / 21 decode but race).
+3. Push prefill toward 200: raise routed-expert cache hit rate / overlap.
+   Grouped-BF16-WMMA is memory-infeasible at 512 experts; grouped native
+   resident-only does not help because each layer's cache starts empty.
+4. Push exact single-token decode from ~20 to 30 tok/s (cache sizing, SSM/MoE
+   kernel work). Larger cache is VRAM-limited by the BMAX=4096 scratch.
+5. Multi-chunk stateful batching (`prefill > BMAX`) still diverges (inter-chunk
+   carry, first seen at L23 `attn_out`); needed for >4K prompts.
+6. Quality-gated 32K+ prompt workload and 256K capacity path remain open.
+
+## Authoritative paths
+
+```text
+Model:      /mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+MTP:        /mnt/nvme01/models/q38nf/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf
+CPU lib:    /mnt/nvme02/work/llama.cpp/build-codex-hetero-dev2/bin/libggml-cpu.so.0.22.0
+Prompt:     rdna4/llm/tmp/qwen38_target_prompt.txt  (9000 bytes of common/gguf_loader.h)
+Status doc: rdna4/llm/QWEN38_STATUS.md              (authoritative running log)
+Tuning doc: rdna4/llm/QWEN38_PREFILL_TUNING.md
+MTP doc:    rdna4/llm/QWEN4_MTP.md
+```
+
+## Build and test
+
+```sh
+# Build the runner.
+make -C rdna4/llm -j8 test_hip_llm
+
+# Static profile/regression tests (no GPU needed).
+bash rdna4/llm/test_qwen38_profiles.sh
+```
+
+Pre-existing warning noise in `common/gguf_loader.h` / `hip_runner_common.h`;
+no errors expected.
+
+## Repeatability gate (the key tool)
+
+```sh
+# Deterministic single-dispatch 4K profile (pageable + direct copies).
+QWEN38_TARGET_PROFILE=batch4k \
+  QWEN38_TARGET_PREFILL=4096 QWEN38_TARGET_DECODE=64 QWEN38_TARGET_CONTEXT=8192 \
+  QWEN38_TARGET_REPEATS=8 \
+  QWEN38_TARGET_PROMPT_FILE=rdna4/llm/tmp/qwen38_target_prompt.txt \
+  QWEN38_TARGET_LOG=rdna4/llm/tmp/qwen38_batch4k.log \
+  ./rdna4/llm/bench_qwen38_target.sh
+```
+
+`make -C rdna4/llm target-gate target-gate-fast target-gate-batch target-gate-4k`
+wrap the same. The gate fails unless every repeat has the same first token and
+the same full sequence hash, and reports min/median prefill/decode/e2e tok/s,
+peak VRAM, and `rocm-smi` clocks/temps.
+
+Useful env switches (all in `bench_qwen38_target.sh` dry-run output):
+
+```sh
+QWEN38_DRY_RUN=1 QWEN38_TARGET_PROFILE=batch4k ./rdna4/llm/bench_qwen38_target.sh
+# Profiles: scalar-exact | fast | batch | batch-cpu | batch4k | batch4k-stage | approx
+LLM_QWEN4_REGISTER_HOST=0|1      # pageable vs pinned host expert weights
+LLM_MOE_COPY_PIPELINE=0|1        # direct vs async expert uploads
+LLM_QWEN4_MOE_EOUT_ALIAS=0|1     # disable the gathered-input/output alias
+LLM_QWEN4_PREFILL_GPU_TOPK=0|1   # host vs GPU router top-k
+LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE=1 LLM_QWEN4_BATCH_STATEFUL=1
+LLM_MOE_PREFILL_SCALAR=1         # per-token MoE (deterministic, slow)
+LLM_DEBUG_LAYERS=1               # per-layer full-batch bitwise FNV trace
+```
+
+## Debug workflow
+
+```sh
+# Full-batch per-layer bitwise trace, 2-4 repeats, then diff repeats.
+LLM_DEBUG_LAYERS=1 QWEN38_TARGET_PROFILE=batch4k \
+  QWEN38_TARGET_PREFILL=1024 QWEN38_TARGET_DECODE=1 QWEN38_TARGET_REPEATS=4 \
+  QWEN38_TARGET_PROMPT_FILE=rdna4/llm/tmp/qwen38_target_prompt.txt \
+  QWEN38_TARGET_LOG=rdna4/llm/tmp/qwen38_trace.log \
+  ./rdna4/llm/bench_qwen38_target.sh
+# Then split by "=== Bench repeat k/N ===" and compare the `[L..]` lines.
+```
+
+Note: the per-stage `hipStreamSynchronize` in the trace perturbs timing and can
+mask the rare race; use it to localize deterministic divergences, and use the
+plain gate for repeatability.
+
+## Environment / safety
+
+- AMD device access is available in this session (`/dev/kfd`, `/dev/dri/renderD*`,
+  render/video groups). Check exclusivity with `fuser /dev/kfd`; `rocm-smi
+  --showmeminfo vram` to gauge peak. A standalone benchmark loads the full
+  model, so do not run concurrently with a server.
+- gfx1201 has reset under grouped full-depth prefill in the past; use isolated
+  runs and a bounded timeout.
+- Do not `git push` without explicit permission. Do not commit the stray
+  untracked `rdna4/llm/hip_runner_common.h` or `rdna4/llm/tmp/` logs.
 
 ## Resuming prompt
 
-> Continue DS4F serving optimization on CPU + Radeon 9070 XT. Current state: prefill ~17.5 tok/s @ 1024 tokens, decode ~5.2-5.5 tok/s, both short of the 100-200 / 18 tok/s targets, quality gate holding at 8/9 (expected). This session fixed two real platform-default bugs (`DS4F_ATTN_GEMM`, `DS4F_MV_FUSE` — see resume.md) and built a validated-correct-but-not-yet-fast GPU tier-B2 attention kernel (opt-in, `DS4F_ATTN_HYBRID_GPU`). The confirmed next step is restructuring the tier-B2 compressor (`ds4f_tb2_prepare`) to allow batching multiple sequential positions into one GPU attention call — the current per-position dispatch has too much fixed GPU round-trip latency to win over the CPU path. Read resume.md in full before starting. Validate every change against the mHC exact quality gate (`hetero/ds4f/build/test_ds4f_real_tokens --config /tmp/ds4f_quality_exact.json --stage-dir /tmp/ds4f_nocopy_stage --prompt-ids /tmp/ds4f_quality_ids.txt --max-tokens 9`, expect 8/9) and check for orphan processes / VRAM leaks (`rocm-smi --showmeminfo vram`) before and after every risky test. Do not rush unvalidated numeric kernel changes — this session's pattern of incremental build-then-validate-then-commit worked well; keep using it.
-
-## Authoritative model and staging
-
-```text
-GGUF: /mnt/nvme02/models/ds4f-0731/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
-Stage: /tmp/ds4f_nocopy_stage
-Tokenizer: /mnt/nvme02/models/ds4f-0731/tokenizer.json
-Quality prompt IDs: /tmp/ds4f_quality_ids.txt
-Quality config: /tmp/ds4f_quality_exact.json
-```
-
-## Quality gate (run after every change touching numerics)
-
-```sh
-hetero/ds4f/build/test_ds4f_real_tokens \
-  --config /tmp/ds4f_quality_exact.json \
-  --stage-dir /tmp/ds4f_nocopy_stage \
-  --prompt-ids /tmp/ds4f_quality_ids.txt --max-tokens 9
-```
-
-Expect 8/9 argmax match (one W4A8 approximation mismatch at token index 2 is the known-expected baseline — not a regression). Never claim 9/9.
-
-## Build
-
-```sh
-make -C hetero/ds4f -j4
-sh a64fx/llm/build_ds4f_serve.sh
-```
-
-Pre-existing warning noise, no errors expected.
-
-## Benchmark (standalone — do not run concurrently with a live server; it loads its own full model and the two will contend for CPU/memory)
-
-```sh
-timeout 180s env DS4F_STAGE_DIR=/tmp/ds4f_nocopy_stage \
- DS4F_TOKENIZER=/mnt/nvme02/models/ds4f-0731/tokenizer.json \
- DS4F_SERVE_USE_HIP=1 DS4F_HIP_DEVICE=0 LLM_THREADS=16 DS4F_CMGS=4 DS4F_PROF=1 \
- python3 a64fx/llm/ds4f_serve_bench.py \
- --stage-dir /tmp/ds4f_nocopy_stage \
- --tokenizer /mnt/nvme02/models/ds4f-0731/tokenizer.json \
- --prompt-tokens 1024 --warm-decode 4 --decode-tokens 32 \
- --threads 16 --cmgs 4 --hip-device 0 --hip-mxfp4-wmma 1 \
- --hip-routed-ffn 1 --hip-expert-stream 1 --hip-expert-cache-mb 0
-```
-
-Model load takes ~60-70s (156GB staged model) — don't mistake load time for inference throughput. `--hip-expert-cache-mb -1` (or `auto` via the server) enables the static post-prefill hot-expert cache; `DS4F_ADAPTIVE_CACHE_PERIOD=64` additionally enables the (currently net-neutral) periodic adaptive refresh; `DS4F_ATTN_HYBRID_GPU=1` enables the (currently slower) GPU tier-B2 attention path. All default off/safe.
-
-## Server restart command (only when needed)
-
-```sh
-env DS4F_STAGE_DIR=/tmp/ds4f_nocopy_stage \
- DS4F_SERVE_BASE=/tmp/ds4f_cdx \
- DS4F_TOKENIZER=/mnt/nvme02/models/ds4f-0731/tokenizer.json \
- DS4F_SERVE_USE_HIP=1 DS4F_HIP_DEVICE=0 LLM_THREADS=16 DS4F_CMGS=4 \
- ./a64fx/llm/run_ds4f_single_serve.sh \
- --context-memory-ttl-sec 600 --context-disk-ttl-sec 86400 \
- --context-memory-mb 512 --context-disk-mb 8192 \
- --prefill-quantum-tokens 32 --single-prefill-quantum-tokens 2048 \
- --agent-cache-max-tokens 14336 --runner-timeout-sec 3600 \
- --decode-quantum-tokens 4 --scheduler-quantum-ms 250 \
- --hip-mxfp4-wmma 1 --hip-expert-stream 1 --hip-routed-ffn 1 \
- --hip-expert-cache-mb auto --hip-expert-cache-reserve-mb 1536 \
- --hip-expert-cache-stats 1 --default-temperature 0.0 --default-top-p 1.0
-```
-
-Verify with:
-
-```sh
-curl -s --max-time 5 http://127.0.0.1:8080/health
-curl -s --max-time 5 http://127.0.0.1:8080/v1/progress
-```
-
-Check for orphan processes (`ps aux | grep ds4f`) before restarting.
+> Continue the Qwen3.8-Flash-Next RDNA4 runner work in `/mnt/nvme02/work/gemm/main`.
+> Objective: bit-exact F16 greedy-hash parity with prefill >= 200 tok/s and
+> single-token decode >= 30 tok/s on CPU + RX 9070 XT (16 GiB). Current state:
+> the scalar `fast` route is deterministic but only ~24 prefill / ~21 decode at
+> 4K; the batched `batch4k` route reaches ~125-149 prefill / ~20 decode
+> (hash `afdf60ceeb4f0103`) but still has a rare (~1 in 8) prefill
+> nondeterminism inside `forward_moe_ffn_batched`, so it is best-effort only.
+> This session fixed the ordered K-expert combine, CPU-result publication, the
+> null-stream per-row position race, the cold-expert H2D ordering, staged
+> metadata ordering, the decode renorm atomic order, and per-request
+> expert-cache reset (see `rdna4/llm/QWEN38_STATUS.md` and the commit log).
+> The confirmed next step is a device-side cold-expert staging manager that
+> eliminates host memcpys during a layer (stage cold experts, one event sync,
+> then compute) to remove the residual ordering class, then re-run
+> `bench_qwen38_target.sh` with `QWEN38_TARGET_REPEATS=8`. Read
+> `rdna4/llm/QWEN38_STATUS.md` in full before starting. Build with
+> `make -C rdna4/llm -j8 test_hip_llm`; validate with
+> `bash rdna4/llm/test_qwen38_profiles.sh` and the repeatability gate; check
+> `fuser /dev/kfd` and `rocm-smi --showmeminfo vram` before/after heavy runs;
+> use incremental build-then-validate-then-commit. Do not push without
+> explicit permission.
