@@ -247,11 +247,16 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
     char line[4 * 1024 * 1024];
     int32_t *cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
     int32_t *prefix_cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
+    int32_t *prompt_cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
     int cache_n = 0;
     int prefix_cache_n = 0;
+    int prompt_cache_n = 0;
     hip_llm_state_snapshot *prefix_snapshot = NULL;
+    hip_llm_state_snapshot *prompt_snapshot = NULL;
     unsigned rng = 0x51f15e5du;
-    if (!cache || !prefix_cache) { free(cache); free(prefix_cache); return 1; }
+    if (!cache || !prefix_cache || !prompt_cache) {
+        free(cache); free(prefix_cache); free(prompt_cache); return 1;
+    }
     signal(SIGUSR1, stdio_cancel_handler);
     fprintf(stderr, "JSONL backend ready (max_seq_len=%d)\n", max_seq_len);
     fflush(stderr);
@@ -343,11 +348,22 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         free(prefix_tokens); free(prefix);
         int common = 0;
         while (common < cache_n && common < n_tokens && cache[common] == tokens[common]) common++;
+        int prompt_matches_cache = prompt_cache_n > 0 && prompt_cache_n <= n_tokens &&
+                                   prompt_snapshot != NULL;
+        for (int i = 0; prompt_matches_cache && i < prompt_cache_n; ++i)
+            if (prompt_cache[i] != tokens[i]) prompt_matches_cache = 0;
         int prefix_matches_cache = requested_prefix > 0 && requested_prefix == prefix_cache_n;
         for (int i = 0; prefix_matches_cache && i < requested_prefix; ++i)
             if (prefix_cache[i] != tokens[i]) prefix_matches_cache = 0;
         int restored_prefix = 0;
-        if (common != cache_n && prefix_matches_cache && prefix_snapshot &&
+        int restored_prompt = 0;
+        if (common != cache_n && prompt_matches_cache &&
+            hip_llm_restore_state(gpu, prompt_snapshot) == 0) {
+            memcpy(cache, prompt_cache, (size_t)prompt_cache_n * sizeof(int32_t));
+            cache_n = prompt_cache_n;
+            common = prompt_cache_n;
+            restored_prompt = 1;
+        } else if (common != cache_n && prefix_matches_cache && prefix_snapshot &&
             hip_llm_restore_state(gpu, prefix_snapshot) == 0) {
             memcpy(cache, prefix_cache, (size_t)prefix_cache_n * sizeof(int32_t));
             cache_n = prefix_cache_n;
@@ -360,6 +376,9 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             hip_llm_free_state_snapshot(prefix_snapshot);
             prefix_snapshot = NULL;
             prefix_cache_n = 0;
+            hip_llm_free_state_snapshot(prompt_snapshot);
+            prompt_snapshot = NULL;
+            prompt_cache_n = 0;
             hip_llm_reset_state(gpu);
             cache_n = 0;
             common = 0;
@@ -374,7 +393,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         int publish_chunk = publish_chunk_env && atoi(publish_chunk_env) != 0;
         int prompt_added = n_tokens - common;
         int batches = prompt_added > 0 ? (prompt_added + batch_size - 1) / batch_size : 0;
-        if (!restored_prefix && requested_prefix > common && requested_prefix < n_tokens) {
+        if (!restored_prompt && !restored_prefix && requested_prefix > common && requested_prefix < n_tokens) {
             int a = requested_prefix - common;
             int b = n_tokens - requested_prefix;
             batches = (a + batch_size - 1) / batch_size +
@@ -425,6 +444,9 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             hip_llm_free_state_snapshot(prefix_snapshot);
             prefix_snapshot = NULL;
             prefix_cache_n = 0;
+            hip_llm_free_state_snapshot(prompt_snapshot);
+            prompt_snapshot = NULL;
+            prompt_cache_n = 0;
             hip_llm_reset_state(gpu);
             cache_n = 0;
             free(tokens);
@@ -436,9 +458,24 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             hip_llm_free_state_snapshot(prefix_snapshot);
             prefix_snapshot = NULL;
             prefix_cache_n = 0;
+            hip_llm_free_state_snapshot(prompt_snapshot);
+            prompt_snapshot = NULL;
+            prompt_cache_n = 0;
             hip_llm_reset_state(gpu);
             cache_n = 0;
             free(tokens); puts("ERR prefill"); fflush(stdout); continue;
+        }
+        /* Save the state at the complete prompt boundary. Generated text is
+         * decoded to UTF-8 and may not re-tokenize to the original BPE pieces
+         * on the next turn. If that happens, restore this boundary and replay
+         * only the appended conversation suffix instead of resetting. */
+        hip_llm_free_state_snapshot(prompt_snapshot);
+        prompt_snapshot = hip_llm_snapshot_state(gpu);
+        if (prompt_snapshot) {
+            memcpy(prompt_cache, tokens, (size_t)n_tokens * sizeof(int32_t));
+            prompt_cache_n = n_tokens;
+        } else {
+            prompt_cache_n = 0;
         }
         unsigned char *seen = (unsigned char *)calloc((size_t)n_vocab, 1);
         for (int i = 0; i < n_tokens; i++) {
@@ -599,6 +636,9 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             hip_llm_free_state_snapshot(prefix_snapshot);
             prefix_snapshot = NULL;
             prefix_cache_n = 0;
+            hip_llm_free_state_snapshot(prompt_snapshot);
+            prompt_snapshot = NULL;
+            prompt_cache_n = 0;
             hip_llm_reset_state(gpu);
             cache_n = 0;
         }
@@ -606,6 +646,9 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             hip_llm_free_state_snapshot(prefix_snapshot);
             prefix_snapshot = NULL;
             prefix_cache_n = 0;
+            hip_llm_free_state_snapshot(prompt_snapshot);
+            prompt_snapshot = NULL;
+            prompt_cache_n = 0;
             hip_llm_reset_state(gpu);
             cache_n = 0;
         }
@@ -618,7 +661,9 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
     }
     free(cache);
     free(prefix_cache);
+    free(prompt_cache);
     hip_llm_free_state_snapshot(prefix_snapshot);
+    hip_llm_free_state_snapshot(prompt_snapshot);
     return 0;
 }
 

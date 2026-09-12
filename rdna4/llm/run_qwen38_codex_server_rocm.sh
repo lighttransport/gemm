@@ -13,6 +13,8 @@ context="${QWEN38_CONTEXT:-65536}"
 vram_profile="${QWEN38_VRAM_PROFILE:-16g}"
 port="${QWEN38_API_PORT:-8080}"
 host="${QWEN38_API_HOST:-127.0.0.1}"
+runner="${QWEN38_RUNNER:-${runner_dir}/test_hip_llm}"
+fast_prefill="${QWEN38_FAST_PREFILL:-0}"
 # The HTTP shim emits the first SSE event after generation completes. Keep the
 # interactive default bounded; raise QWEN38_MAX_OUTPUT for long code patches.
 max_output="${QWEN38_MAX_OUTPUT:-512}"
@@ -157,6 +159,14 @@ fi
 # production remains unchanged and callers can override either knob explicitly.
 qwen_batch_multi="${LLM_QWEN4_BATCH_MULTI_CHUNK:-0}"
 qwen_batch_stateful="${LLM_QWEN4_BATCH_STATEFUL:-0}"
+qwen_batch_force="${LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE:-0}"
+batch_ssm="${LLM_QWEN4_BATCH_SSM:-0}"
+batch_attn_max="${LLM_QWEN4_BATCH_ATTN_MAX_LAYER:-2}"
+ssm_batch_q6k="${LLM_SSM_BATCH_Q6K:-0}"
+ssm_batch_conv="${LLM_SSM_BATCH_CONV:-0}"
+ssm_batch_recur="${LLM_SSM_BATCH_RECURRENCE:-0}"
+ssm_batch_parity="${LLM_SSM_BATCH_PARITY:-0}"
+native_batch_qkv="${LLM_QWEN4_NATIVE_BATCH_QKV:-0}"
 qwen_batch_min="${LLM_QWEN4_BATCH_MIN_TOKENS:-128}"
 qwen_prefill_gpu_topk="${LLM_QWEN4_PREFILL_GPU_TOPK:-0}"
 # The depth-weighted table is parity-safe and improved the matched scalar
@@ -168,6 +178,27 @@ prefill_copy_pipeline="${LLM_QWEN4_PREFILL_COPY_PIPELINE:-0}"
 prefill_copy_max="${LLM_QWEN4_PREFILL_COPY_PIPELINE_MAX_TOKENS:-2048}"
 prefill_publish_chunk="${LLM_QWEN4_PREFILL_COPY_PIPELINE_PUBLISH_CHUNK:-0}"
 delayed_cache="${LLM_QWEN4_DELAYED_CACHE:-0}"
+if [[ "${fast_prefill}" != "0" ]]; then
+    # Codex sends a large system prefix.  The conservative profile deliberately
+    # falls back to scalar for prompts larger than BMAX; this explicit profile
+    # opts into the measured larger-tile path and its experimental recurrent
+    # state carry.  Every setting remains individually overridable.
+    if [[ -z "${QWEN38_MOE_CACHE_MB+x}" ]]; then cache_mb=5000; fi
+    if [[ -z "${LLM_BMAX+x}" ]]; then LLM_BMAX=2048; fi
+    if [[ -z "${QWEN38_BATCH_PREFILL+x}" && -z "${LLM_QWEN4_BATCH+x}" ]]; then batch_prefill=1; fi
+    if [[ -z "${LLM_QWEN4_BATCH_STATEFUL+x}" ]]; then qwen_batch_stateful=1; fi
+    if [[ -z "${LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE+x}" ]]; then qwen_batch_force=1; fi
+    if [[ -z "${LLM_QWEN4_BATCH_SSM+x}" ]]; then batch_ssm=1; fi
+    if [[ -z "${LLM_QWEN4_BATCH_ATTN_MAX_LAYER+x}" ]]; then batch_attn_max=47; fi
+    if [[ -z "${LLM_SSM_BATCH_Q6K+x}" ]]; then ssm_batch_q6k=1; fi
+    if [[ -z "${LLM_SSM_BATCH_CONV+x}" ]]; then ssm_batch_conv=1; fi
+    if [[ -z "${LLM_SSM_BATCH_RECURRENCE+x}" ]]; then ssm_batch_recur=1; fi
+    if [[ -z "${LLM_SSM_BATCH_PARITY+x}" ]]; then ssm_batch_parity=1; fi
+    if [[ -z "${LLM_QWEN4_NATIVE_BATCH_QKV+x}" ]]; then native_batch_qkv=1; fi
+    if [[ -z "${LLM_QWEN4_PREFILL_GPU_TOPK+x}" ]]; then qwen_prefill_gpu_topk=1; fi
+    if [[ -z "${LLM_MOE_REGISTER_HOST+x}" ]]; then LLM_MOE_REGISTER_HOST=1; fi
+    if [[ -z "${LLM_MOE_COPY_PIPELINE+x}" ]]; then copy_pipeline=1; fi
+fi
 if [[ "${prefill_copy_pipeline}" != "0" &&
       -z "${LLM_QWEN4_PREFILL_COPY_PIPELINE_PUBLISH_CHUNK+x}" ]]; then
     # The overlap guard is keyed by the published per-chunk request length;
@@ -246,8 +277,16 @@ exec env \
     LLM_QWEN4_PREFILL_COPY_PIPELINE_PUBLISH_CHUNK="${prefill_publish_chunk}" \
     LLM_QWEN4_BATCH_MULTI_CHUNK="${qwen_batch_multi}" \
     LLM_QWEN4_BATCH_STATEFUL="${qwen_batch_stateful}" \
+    LLM_QWEN4_BATCH_MULTI_CHUNK_FORCE="${qwen_batch_force}" \
+    LLM_QWEN4_BATCH_SSM="${batch_ssm}" \
+    LLM_QWEN4_BATCH_ATTN_MAX_LAYER="${batch_attn_max}" \
+    LLM_SSM_BATCH_Q6K="${ssm_batch_q6k}" \
+    LLM_SSM_BATCH_CONV="${ssm_batch_conv}" \
+    LLM_SSM_BATCH_RECURRENCE="${ssm_batch_recur}" \
+    LLM_SSM_BATCH_PARITY="${ssm_batch_parity}" \
+    LLM_QWEN4_NATIVE_BATCH_QKV="${native_batch_qkv}" \
     LLM_QWEN4_PREFILL_CACHE_BALANCE="${qwen_prefill_balance}" \
-    LLM_QWEN4_NATIVE_BATCH_QKV="${LLM_QWEN4_NATIVE_BATCH_QKV:-0}" \
+    LLM_QWEN4_NATIVE_BATCH_QKV="${native_batch_qkv}" \
     LLM_QWEN4_KV_QUANT="${LLM_QWEN4_KV_QUANT}" \
     LLM_ATTN_PREFILL_I8_WARP="${LLM_ATTN_PREFILL_I8_WARP:-0}" \
     LLM_ATTN_PREFILL_I8_GQA4="${LLM_ATTN_PREFILL_I8_GQA4:-0}" \
@@ -266,7 +305,7 @@ exec env \
     LLM_BMAX="${LLM_BMAX:-${profile_bmax}}" \
     LLM_MOE_GROUPED_PREFILL="${grouped_prefill}" \
     python3 "${runner_dir}/codex_server.py" "${model}" \
-    --runner "${runner_dir}/test_hip_llm" \
+    --runner "${runner}" \
     --context "${context}" \
     --max-output "${max_output}" \
     --port "${port}" \
