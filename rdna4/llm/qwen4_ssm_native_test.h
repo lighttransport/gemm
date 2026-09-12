@@ -15,6 +15,9 @@ int hip_llm_verify_ssm_projections(hip_llm_runner *r, int M) {
         seed=seed*1664525u+1013904223u;
         input[i]=((seed>>8)*(1.0f/16777216.0f)-0.5f)*0.29f;
     }
+    /* Include signed-zero inputs so empty-warp elision cannot hide a sign change. */
+    for (int i=0;i<ne;i++) input[i]=(i&1)?-0.0f:0.0f;
+    for (int i=0;i<di;i++) input[(size_t)M*ne+i]=(i&1)?-0.0f:0.0f;
 #define SSM_CHECK(call) do { if ((call)!=hipSuccess) goto done; } while (0)
     SSM_CHECK(hipMemcpyAsync(din,input,input_bytes,hipMemcpyHostToDevice,r->stream));
     SSM_CHECK(hipStreamSynchronize(r->stream));

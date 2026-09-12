@@ -4,6 +4,73 @@ Current validation appears first. Earlier investigations are retained below as
 history; short-run determinism claims there do not establish scalar F16 parity.
 Scalar F16 remains the default; staged prefill is diagnostic.
 
+## Scalar-order SSM warp optimization reaches 126/22
+
+`LLM_QWEN4_SSM_NATIVE_WARP=1` maps one output to one physical warp,
+reproducing all eight scalar virtual-warp reductions in order. Mode2 omits
+empty virtual warps and canonicalizes zero. Both pass the real-weight SSM
+projection oracle (36 layers x5 projections x8 rows); mode2 additionally
+includes signed-zero inputs. Logs:`tmp/ssmwarp_oracle.log`,
+`tmp/ssmtrim_oracle.log`. Default0 retains the baseline.
+
+All following two-request4096/64 runs match the fresh scalar first15 /
+hashe3d8bf6d47dc6cc3:
+
+| Change from fully native baseline | Prefill min/median | Decode min/median |
+|---|---:|---:|
+| Native SSM warp1 |122.39 /122.39|19.50 /19.62|
+| Warp1, existing prefill cache balance1, LFU1, attention shards4 |122.47 /122.55|21.70 /21.75|
+| Warp2, same cache settings, shards2 |125.97 /125.97|21.75 /21.79|
+
+The cache changes reduce decode H2D from13.31 to9.87 GiB and raise hits
+from85.0% to88.9%. They do not change routed computations. Latest driver:
+`tmp/run_native_ssmtrim_4k.sh`; log:`tmp/native_ssmtrim_4k.log`;
+binary:`tmp/test_hip_llm_ssmtrim`. Cache7200 MiB, BMAX4096,
+context8192, native HC/SSM/router/shared/attention projections, PLE split,
+scratch arena, exact prefix graphs, pinned overlapped staging, promotion1.
+
+The correct-path profile (`tmp/native_profile_analysis.log`) had33.045 s
+prefill kernel time:8.256 s SSM input projections,7.312 s routed gate/up,
+4.487 s Q5 down,2.934 s other native Q8 batches,2.336 s DeltaNet.
+Decode kernels1.992 s include0.762 s F16 attention, with1.124 s H2D.
+These overlapping trace durations are not additive wall times.
+
+Rejected: a three-kernel parallel-score attention experiment matches scalar
+bits at five positions through4354 but is slower in the undelayed isolated
+benchmark (0.708 vs0.464 ms/call). It is removed from live source; archives
+and logs remain under `tmp/rejected_qwen4_attn_tiles*` and
+`tmp/attntiles_unmodified_benchmark.log`. The first timing comparison
+contained deliberately delayed reference waves and is invalid for speed.
+The expanded attention regression now covers4355 tokens and uses a linear
+CPU prefix-sum reference; the barrier-removal negative control still fails.
+
+**200 prefill /30 decode remains unmet.** Next focus: routed projection
+throughput, with FP32 numerical checks and full scalar greedy hashes.
+
+## Fresh 4K parity passes; native throughput is 114/20
+
+The fully native staged 4096/64 path matches a fresh scalar F16 reference in
+both requests: first token **15**, full hash **e3d8bf6d47dc6cc3**.
+Scalar reference: 13.29 prefill /20.46 decode tok/s, 87.0% decode cache hits,
+11.51 GiB decode H2D. Native staging: **114.38/114.52 prefill min/median**,
+**19.78/19.82 decode min/median**,85.0% hits,13.31 GiB decode H2D,
+65.69 GiB prefill staging,370 waves,2383 promotions,zero fallbacks.
+Peak15890 MiB,414 MiB free. Native arithmetic thus restores short and4K
+greedy parity but does not meet200/30.
+
+Settings: `batch4k-stage`, cache7200 MiB, BMAX4096, context8192,
+pinned weights, copy overlap, PLE split, phase arena, native Q8 attention
+projections, native HC, native SSM projections, native router/shared experts,
+exact prefix graphs; stage promotion1, prefill cache balance0, shards1,
+stage threads256, warmup0. There was no concurrent CPU compilation.
+Logs:`tmp/native_scalar_4k_reference.log`, `tmp/native_all_4k.log`,
+`tmp/native_all_4k_summary.log`. Driver:`tmp/run_native_all_4k.sh`.
+
+The next profile is `tmp/rocprof_qwen_native/`, with route logging in
+`tmp/qwen_native_profile.log`. Optimize this scalar-parity baseline, not
+the historical mismatching170/13.6 path. Longer and multi-chunk quality,
+broader repeat counts, and200/30 remain outstanding.
+
 ## Native router/shared batching restores short-prompt parity
 
 `LLM_QWEN4_BATCH_MOE_NATIVE=1` computes router logits and the shared gate

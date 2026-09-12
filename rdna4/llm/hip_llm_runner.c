@@ -9592,6 +9592,8 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_qz_q8_0_mw;
     hipFunction_t fn_ssm_matvec4_q8_f32;
     hipFunction_t fn_ssm_matvec4_q8_batch_f32;
+    hipFunction_t fn_ssm_matvec4_q8_batch_warp_f32;
+    hipFunction_t fn_ssm_matvec4_q8_batch_warp_trim_f32;
     hipFunction_t fn_ffn_gate_up_silu_q8_0_mw;
     hipFunction_t fn_ffn_gate_up_silu_iq1_s_mw;
     hipFunction_t fn_glm5next_moe_gateup_iq1s_selected;
@@ -10513,6 +10515,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_qz_q8_0_mw);
     GET_FUNC(ssm_matvec4_q8_f32);
     GET_FUNC(ssm_matvec4_q8_batch_f32);
+    GET_FUNC(ssm_matvec4_q8_batch_warp_f32);
+    GET_FUNC(ssm_matvec4_q8_batch_warp_trim_f32);
     GET_FUNC(ffn_gate_up_silu_q8_0_mw);
     GET_FUNC(ffn_gate_up_silu_iq1_s_mw);
     GET_FUNC(glm5next_moe_gateup_iq1s_selected);
@@ -15402,7 +15406,12 @@ static int launch_ssm_matvec4_q8_batch(hip_llm_runner *r, hip_layer *cl, int M,
     int aux_f16=cl->ssm_alpha_type == GGML_TYPE_F16;
     void *args[]={&qkv,&z,&alpha,&beta,&cl->ssm_qkv_w,&cl->ssm_gate_w,
         &cl->ssm_alpha_w,&cl->ssm_beta_w,&input,&qrows,&zrows,&dt,&cols,&fcols,&aux_f16};
-    return LAUNCH(r->fn_ssm_matvec4_q8_batch_f32,qrows+zrows+2*dt,M,1,
+    const char *warp_env=getenv("LLM_QWEN4_SSM_NATIVE_WARP");
+    int warp=warp_env ? atoi(warp_env) : 0;
+    hipFunction_t fn=warp==2?r->fn_ssm_matvec4_q8_batch_warp_trim_f32:
+        warp?r->fn_ssm_matvec4_q8_batch_warp_f32:r->fn_ssm_matvec4_q8_batch_f32;
+    int rows=qrows+zrows+2*dt;
+    return LAUNCH(fn,warp?(rows+7)/8:rows,M,1,
                   256,1,1,0,r->stream,args) == hipSuccess ? 0 : -1;
 }
 

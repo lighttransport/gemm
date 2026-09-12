@@ -18,6 +18,24 @@ Stable, quality-safe Qwen3.8-Flash-Next LLM runner on CPU + Radeon RX 9070 XT
 Do not push to any remote without explicit per-action user permission.
 Committing freely is allowed once a coherent unit is done.
 
+## Latest performance checkpoint
+
+The current scalar-parity-passing4K/64 configuration measures
+**125.97 prefill /21.75–21.83 decode tok/s**, below200/30.
+Driver:`rdna4/llm/tmp/run_native_ssmtrim_4k.sh`; log:
+`tmp/native_ssmtrim_4k.log`; binary:`tmp/test_hip_llm_ssmtrim`.
+Uses all native paths, SSM native warp2, cache balance1, LFU1,
+attention shards2 and exact prefix graphs. Both requests match fresh scalar
+first15/hash e3d8bf6d47dc6cc3. Cache H2D9.87 GiB,88.9% hits.
+SSM warp modes1/2 each pass the full real-weight bitwise oracle; mode2
+adds signed-zero coverage.
+
+A parallel-score attention candidate was bitwise correct but slower in a
+fair microbenchmark and was removed. Archives remain in `tmp/`.
+The native profile is complete; see `tmp/native_profile_analysis.log`.
+No GPU or compiler jobs remain at this checkpoint. Next focus is routed
+gate/up and down throughput. All user performance targets remain required.
+
 ## Latest parity milestone
 
 Native HC + SSM projections + router/shared experts now pass fresh scalar
@@ -27,11 +45,16 @@ from router/shared batching. Its real-weight `--verify-moe-native` oracle
 passes48 layers x8 rows bitwise. Binary:`tmp/test_hip_llm_nativemoe`.
 Logs:`tmp/nativemoe_oracle.log`, `tmp/nativemoe_quality_summary.log`.
 
-A fresh scalar4K/64 reference followed by two fully native staged requests
-is running via `tmp/run_native_all_4k.sh`. Logs:
-`tmp/native_all_4k_summary.log`, `tmp/native_scalar_4k_reference.log`,
-`tmp/native_all_4k.log`. Do not substitute the old601167e3b2fb9425 staged
-hash for this scalar reference. All200/30 targets remain required.
+The fresh scalar4K/64 reference and both native staged requests PASS:
+first15/hash e3d8bf6d47dc6cc3. The qualifying native throughput is
+114.38/114.52 prefill and19.78/19.82 decode min/median. Decode cache hits85%,
+H2D13.31 GiB; prefill staging65.69 GiB. Peak15890 MiB/free414 MiB.
+`tmp/run_native_all_4k.sh` and its three logs capture the exact setup.
+Do not use the old601167e3b2fb9425 hash as the scalar reference.
+
+The native API/kernel/copy profile is complete:
+`tmp/native_profile_analysis.log` and `tmp/rocprof_qwen_native/`.
+Keep GPU jobs exclusive; do not compile during performance measurements.
 
 ## Current implementation (2026-09-12 continuation)
 

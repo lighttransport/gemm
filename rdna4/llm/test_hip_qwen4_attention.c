@@ -32,7 +32,7 @@ int main(int argc, char **argv) {
     if (!r) return 77;
     unsetenv("LLM_ATTN_GQA8"); unsetenv("LLM_ATTN_PREFILL_I8_WARP");
     unsetenv("LLM_ATTN_PREFILL_I8_GQA4");
-    enum { M = 259, H = 24, HK = 2, D = 256, KD = HK*D, QD = H*D };
+    enum { M = 4355, H = 24, HK = 2, D = 256, KD = HK*D, QD = H*D };
     uint16_t *kv = malloc((size_t)M*KD*2);
     float *out = malloc((size_t)M*QD*4), *ref = malloc((size_t)M*KD*4);
     assert(kv && out && ref);
@@ -44,15 +44,15 @@ int main(int argc, char **argv) {
     REQUIRE(hipMemcpy(ds,scales,(size_t)M*HK*(D/32)*4,hipMemcpyHostToDevice));
     setenv("LLM_QWEN4_DECODE_ATTN_SHARDS", "1", 1);
     for (int format=0;format<2;++format) {
+        double running[KD]={0};
         for (int m = 0; m < M; ++m) for (int j = 0; j < KD; ++j) {
             uint16_t v = (uint16_t)(0x3000 + ((m*29+j*11) % 2048));
             if ((m+j)%3 == 0) v |= 0x8000;
             if (!format) kv[(size_t)m*KD+j] = v;
             else ((signed char *)kv)[(size_t)m*KD+j]=(signed char)((m*29+j*11)%127-63);
-            double sum = 0;
-            for (int t = 0; t <= m; ++t) sum += format ?
-                (float)((signed char *)kv)[(size_t)t*KD+j]*0.015625f : ggml_fp16_to_fp32(kv[(size_t)t*KD+j]);
-            ref[(size_t)m*KD+j] = (float)(sum/(m+1));
+            running[j] += format ?
+                (float)((signed char *)kv)[(size_t)m*KD+j]*0.015625f : ggml_fp16_to_fp32(kv[(size_t)m*KD+j]);
+            ref[(size_t)m*KD+j] = (float)(running[j]/(m+1));
         }
         void *dq=NULL, *dkv=NULL, *dout=NULL;
         REQUIRE(hipMalloc(&dq,(size_t)M*QD*4)); REQUIRE(hipMalloc(&dkv,(size_t)M*KD*2));
@@ -87,9 +87,9 @@ int main(int argc, char **argv) {
             for (int i=0;i<QD;++i) query[i]=sinf(i*0.013f)+0.125f*cosf(i*0.071f);
             REQUIRE(hipMemcpy(dq,query,(size_t)QD*4,hipMemcpyHostToDevice));
             r->is_qwen4exp=1;
-            int positions[]={31,255,M-1};
+            int positions[]={0,31,255,256,M-1};
             const char *shards[]={"1","2","4","8"};
-            for(int pi=0;pi<3;++pi) {
+            for(int pi=0;pi<5;++pi) {
                 REQUIRE(hipMemcpy(r->d_position,&positions[pi],4,hipMemcpyHostToDevice));
                 for(int si=0;si<4;++si) {
                     setenv("LLM_QWEN4_DECODE_ATTN_SHARDS",shards[si],1);
