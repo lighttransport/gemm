@@ -23,15 +23,18 @@
 #include <string.h>
 
 enum { H=4096,NH=64,KD=256,VD=256,LAT=512,QKV=16384 };
+static int glm53f_sparse_scalar_reference;
 static void* a256(size_t n){void*p=NULL;if(posix_memalign(&p,256,n))p=NULL;if(!p)MPI_Abort(MPI_COMM_WORLD,2);return p;}
 static void readp(glm53f_st_context*s,const char*n,size_t o,void*p,size_t z,int r){if(glm53f_st_read(s,n,o,p,z)){fprintf(stderr,"rank=%d read failed %s\n",r,n);MPI_Abort(MPI_COMM_WORLD,2);}}
 static inline float fp8dot(const uint8_t*w,const float*sc,const float*x,int n){
+    if (glm53f_sparse_scalar_reference)
+        return glm53f_dot_fp8_block128(w, sc, x, n);
     svfloat32_t a=svdup_f32(0);int vl=(int)svcntw();
     for(int b=0;b<n;b+=128){int e=b+128<n?b+128:n;for(int i=b;i<e;i+=vl){svbool_t p=svwhilelt_b32(i,e);a=svmla_x(p,a,glm53f_fp8_e4m3_bits(p,w,i),svmul_n_f32_x(p,svld1(p,x+i),sc[b/128]));}}
     return svaddv_f32(svptrue_b32(),a);
 }
-static inline float f32dot(const float*a,const float*b,int n){svfloat32_t s=svdup_f32(0);int vl=(int)svcntw();for(int i=0;i<n;i+=vl){svbool_t p=svwhilelt_b32(i,n);s=svmla_x(p,s,svld1(p,a+i),svld1(p,b+i));}return svaddv_f32(svptrue_b32(),s);}
-static inline float bf16dot(const uint16_t*w,const float*x,int n){svfloat32_t s=svdup_f32(0);int vl=(int)svcntw();for(int i=0;i<n;i+=vl){svbool_t p=svwhilelt_b32(i,n);svuint32_t z=svlsl_n_u32_x(p,svld1uh_u32(p,w+i),16);s=svmla_x(p,s,svreinterpret_f32_u32(z),svld1(p,x+i));}return svaddv_f32(svptrue_b32(),s);}
+static inline float f32dot(const float*a,const float*b,int n){if(glm53f_sparse_scalar_reference){double s=0;for(int i=0;i<n;i++)s+=(double)a[i]*b[i];return(float)s;}svfloat32_t s=svdup_f32(0);int vl=(int)svcntw();for(int i=0;i<n;i+=vl){svbool_t p=svwhilelt_b32(i,n);s=svmla_x(p,s,svld1(p,a+i),svld1(p,b+i));}return svaddv_f32(svptrue_b32(),s);}
+static inline float bf16dot(const uint16_t*w,const float*x,int n){if(glm53f_sparse_scalar_reference)return glm53f_dot_bf16(w,x,n);svfloat32_t s=svdup_f32(0);int vl=(int)svcntw();for(int i=0;i<n;i+=vl){svbool_t p=svwhilelt_b32(i,n);svuint32_t z=svlsl_n_u32_x(p,svld1uh_u32(p,w+i),16);s=svmla_x(p,s,svreinterpret_f32_u32(z),svld1(p,x+i));}return svaddv_f32(svptrue_b32(),s);}
 static int mla_one(float*out,const float*q,const float*cache,const uint16_t*w,
                    const int*sel,int nt){
     /* One head is owned by one OpenMP worker.  These scratch arrays are small
@@ -48,7 +51,7 @@ static int mla_heads(float*out,const float*q,const float*z,const uint16_t*w,
 #pragma omp parallel for schedule(static) reduction(|:fail)
     for(int h=0;h<nh;h++){
         const uint16_t*wh=w+(size_t)h*(KD+VD)*LAT;
-        if(getenv("GLM53F_SPARSE_SCALAR"))fail|=
+        if(glm53f_sparse_scalar_reference||getenv("GLM53F_SPARSE_SCALAR"))fail|=
             glm53f_mla_selected_absorbed_bf16(out+(size_t)h*VD,
                 q+(size_t)h*KD,z,wh,sel,nt,1,KD,VD,LAT)!=0;
         else fail|=mla_one(out+(size_t)h*VD,q+(size_t)h*KD,z,wh,sel,nt)!=0;

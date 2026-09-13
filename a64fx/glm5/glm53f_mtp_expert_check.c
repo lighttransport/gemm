@@ -15,12 +15,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int first_offsets(const char *path, uint64_t off[4], int *inter) {
+static int expert_offsets(const char *path, int layer, int expert,
+                          uint64_t off[4], int *inter) {
     FILE *f = fopen(path, "r");
     char line[2048], dtype[16], name[1024];
     int n = 0, nd, rows, cols;
+    char needle[128];
     unsigned long long at;
     if (!f) return -1;
+    snprintf(needle, sizeof(needle), ".layers.%d.mlp.experts.%d.", layer, expert);
     while (n < 4 && fgets(line, sizeof(line), f)) {
         char *last;
         if (line[0] == '#' || sscanf(line, "%llu %15s %d %d %d",
@@ -30,7 +33,7 @@ static int first_offsets(const char *path, uint64_t off[4], int *inter) {
         if (!last) continue;
         snprintf(name, sizeof(name), "%s", last + 1);
         name[strcspn(name, "\r\n")] = 0;
-        if (!strstr(name, ".experts.0.")) continue;
+        if (!strstr(name, needle)) continue;
         off[n++] = at;
         if (strstr(name, "down_proj.weight") && !strstr(name, "scale"))
             *inter = cols;
@@ -46,8 +49,10 @@ int main(int argc, char **argv) {
     unsigned char *blob;
     float *x, *up, *act, *got, *ref, *rup, *ract;
     glm53f_expert_part part;
-    if (argc != 3 || first_offsets(argv[1], off, &inter)) {
-        fprintf(stderr, "usage: %s MANIFEST BLOB\n", argv[0]);
+    int layer = argc > 3 ? atoi(argv[3]) : 3;
+    int expert = argc > 4 ? atoi(argv[4]) : 0;
+    if (argc < 3 || argc > 5 || expert_offsets(argv[1], layer, expert, off, &inter)) {
+        fprintf(stderr, "usage: %s MANIFEST BLOB [layer=3] [expert=0]\n", argv[0]);
         return 2;
     }
     fd = open(argv[2], O_RDONLY);
@@ -64,7 +69,7 @@ int main(int argc, char **argv) {
     if (!x || !up || !act || !got || !ref || !rup || !ract) return 2;
     for (int i = 0; i < 4096; ++i) x[i] = (float)((i % 31) - 15) * .001f;
     part = (glm53f_expert_part){blob + off[0], (const float *)(blob + off[1]),
-                                blob + off[2], (const float *)(blob + off[3]), inter};
+                                blob + off[2], (const float *)(blob + off[3]), inter, 0, 0};
     glm53f_expert_batch_bits(&part, 1, x, up, act, got);
     for (int r = 0; r < 2 * inter; ++r)
         rup[r] = glm53f_dot_fp8_block128(part.gate_up + (size_t)r * 4096,
@@ -85,8 +90,8 @@ int main(int argc, char **argv) {
         if (fabs(d) > max_abs) max_abs = fabs(d);
         finite &= isfinite(got[i]);
     }
-    printf("GLM53F_MTP_EXPERT_CHECK inter=%d finite=%s max_abs=%.9g rel_l2=%.9g checksum=%.9g %s\n",
-           inter, finite ? "YES" : "NO", max_abs, sqrt(se / (sr + 1e-30)), got[0],
+    printf("GLM53F_FP8_EXPERT_SCALAR layer=%d expert=%d inter=%d finite=%s max_abs=%.9g rel_l2=%.9g checksum=%.9g %s\n",
+           layer, expert, inter, finite ? "YES" : "NO", max_abs, sqrt(se / (sr + 1e-30)), got[0],
            finite && sqrt(se / (sr + 1e-30)) < 2e-5 ? "PASS" : "FAIL");
     return finite && sqrt(se / (sr + 1e-30)) < 2e-5 ? 0 : 1;
 }

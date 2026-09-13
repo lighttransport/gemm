@@ -104,6 +104,12 @@ int main(int argc, char **argv) {
                 fclose(rf);
             }
         }
+        const char *output = getenv("GLM53F_KDA_OUTPUT");
+        if (output && *output) {
+            FILE *of = fopen(output, "wb");
+            if (!of || fwrite(a[0], sizeof(float), HIDDEN, of) != HIDDEN ||
+                fclose(of)) MPI_Abort(MPI_COMM_WORLD, 2);
+        }
     }
     if (!rank)
         printf("GLM53F_KDA_DETAIL qkv_ms=%.3f conv_ms=%.3f prep_ms=%.3f "

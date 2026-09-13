@@ -87,6 +87,16 @@ struct glm53f_kda_context_12n {
     int int8_enabled;
 };
 
+static void kda_dump(const char *suffix, const void *data, size_t bytes, int rank) {
+    const char *prefix = getenv("GLM53F_KDA_DUMP_PREFIX");
+    char path[4096];
+    if (!prefix || !*prefix) return;
+    snprintf(path, sizeof(path), "%s.rank%02d.%s.bin", prefix, rank, suffix);
+    FILE *f = fopen(path, "wb");
+    if (!f || fwrite(data, 1, bytes, f) != bytes || fclose(f))
+        MPI_Abort(MPI_COMM_WORLD, 2);
+}
+
 int glm53f_kda_convert_int8_12n(glm53f_kda_context_12n *c) {
     if (!c || c->int8_enabled) return -1;
     uint16_t **source[4] = {&c->w.q, &c->w.k, &c->w.v, &c->w.op};
@@ -163,6 +173,13 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
             {c->detail[4]=MPI_Wtime()-td;}
         }
     }
+    kda_dump("q", q, (size_t)qd * sizeof(float), c->rank);
+    kda_dump("k", k, (size_t)qd * sizeof(float), c->rank);
+    kda_dump("v", v, (size_t)qd * sizeof(float), c->rank);
+    kda_dump("decay", c->decay, (size_t)qd * sizeof(float), c->rank);
+    kda_dump("beta", c->beta, (size_t)hn * sizeof(float), c->rank);
+    kda_dump("core", c->core, (size_t)qd * sizeof(float), c->rank);
+    kda_dump("normed", c->normed, (size_t)qd * sizeof(float), c->rank);
     double t1=MPI_Wtime();
     if (c->int8_enabled) {
         if (glm53f_i8_quantize_x(quant_o, &scale_o, c->normed, qd)) return -1;

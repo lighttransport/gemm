@@ -17,6 +17,11 @@ R(0,a0);R(1,a1);R(2,a2);R(3,a3);R(4,a4);R(5,a5);R(6,a6);R(7,a7);
 #undef R
     }svbool_t p=svptrue_b32();y[0]=svaddv_f32(p,a0);y[1]=svaddv_f32(p,a1);y[2]=svaddv_f32(p,a2);y[3]=svaddv_f32(p,a3);y[4]=svaddv_f32(p,a4);y[5]=svaddv_f32(p,a5);y[6]=svaddv_f32(p,a6);y[7]=svaddv_f32(p,a7);}
 static void mv_b16(float*y,const uint16_t*w,const float*x,int rows,int cols){
+    if(glm53f_sparse_scalar_reference){
+#pragma omp parallel for schedule(static)
+        for(int r=0;r<rows;r++)y[r]=glm53f_dot_bf16(w+(size_t)r*cols,x,cols);
+        return;
+    }
     int nb=rows/8;
 #pragma omp parallel for schedule(static)
     for(int b=0;b<nb;b++)b16dot8(y+b*8,w+(size_t)b*8*cols,x,cols);
@@ -29,6 +34,11 @@ R(0,a0);R(1,a1);R(2,a2);R(3,a3);R(4,a4);R(5,a5);R(6,a6);R(7,a7);
 #undef R
     }}svbool_t p=svptrue_b32();y[0]=svaddv_f32(p,a0);y[1]=svaddv_f32(p,a1);y[2]=svaddv_f32(p,a2);y[3]=svaddv_f32(p,a3);y[4]=svaddv_f32(p,a4);y[5]=svaddv_f32(p,a5);y[6]=svaddv_f32(p,a6);y[7]=svaddv_f32(p,a7);}
 static void mv_f8(float*y,const uint8_t*w,const float*s,const float*x,int rows,int cols){int sb=cols/128,nb=rows/8;
+    if(glm53f_sparse_scalar_reference){
+#pragma omp parallel for schedule(static)
+        for(int r=0;r<rows;r++)y[r]=glm53f_dot_fp8_block128(w+(size_t)r*cols,s+(size_t)(r/128)*sb,x,cols);
+        return;
+    }
 #pragma omp parallel for schedule(static)
     for(int b=0;b<nb;b++)f8dot8(y+b*8,w+(size_t)b*8*cols,s+(size_t)(b*8/128)*sb,x,cols);
 #pragma omp parallel for schedule(static)
@@ -182,7 +192,7 @@ static int select_incremental(glm53f_sparse_context_12n*c,int tokens){int np=tok
     pool_top_exact(c->pool_score_cache,c->pool_score_global,np,nc);
 expand: for(int i=0;i<nc;i++)for(int z=0;z<KPOOL;z++)c->selected[out++]=c->pool_score_cache[i].id*KPOOL+z;for(int z=np*KPOOL;z<tokens;z++)c->selected[out++]=z;return out;}
 static void ensure_mla_shards(glm53f_sparse_context_12n*c){if(c->mla_ql)return;size_t base=(size_t)(TOPK+KPOOL)*LAT,n=base+(size_t)c->hn*(2*LAT+TOPK+KPOOL+8*LAT);float*p=realloc(c->packed,n*4);if(!p)MPI_Abort(MPI_COMM_WORLD,2);c->packed=p;c->mla_ql=p+base;c->mla_log=c->mla_ql+(size_t)c->hn*LAT;c->mla_part=c->mla_log+(size_t)c->hn*(TOPK+KPOOL);c->mla_va=c->mla_part+(size_t)c->hn*8*LAT;}
-static int sparse_attention_local_replicated(glm53f_sparse_context_12n*c,float*attn,const float*x){if(c->length>=c->capacity)return-1;int pos=c->length,tokens=pos+1;mv_f8(c->qres,c->qa,c->qas,x,QA,H);glm53f_rmsnorm_bf16(c->qres,c->qres,c->qan,QA,1e-5f);mv_f8(c->query,c->qb,c->qbs,c->qres,c->qd,QA);mv_f8(c->latent+(size_t)pos*LAT,c->kva,c->kvas,x,LAT,H);glm53f_rmsnorm_bf16(c->latent+(size_t)pos*LAT,c->latent+(size_t)pos*LAT,c->kvan,LAT,1e-5f);float raw[ID];mv_b16(raw,c->wk,x,ID,H);glm53f_layernorm_bf16(c->key+(size_t)pos*ID,raw,c->knw,c->knb,ID,1e-5f);mv_b16(c->gcache+(size_t)pos*ID,c->gatew,x,ID,H);mv_b16(c->iq,c->wqb,c->qres,IH*ID,QA);mv_b16(c->iw,c->wp,x,IH,H);int ns;if(getenv("GLM53F_SPARSE_REFERENCE"))ns=glm53f_index_select_decode(c->pool,c->selected,c->iq,c->iw,c->key,c->gcache,c->apef,tokens,KPOOL,TOPK,IH,ID);else{if(tokens%KPOOL==0)update_completed_pool(c,tokens/KPOOL-1);ns=select_incremental(c,tokens);}if(ns<1)return-1;if(tokens>TOPK+KPOOL-1&&!getenv("GLM53F_SPARSE_NO_PACK")){
+static int sparse_attention_local_replicated(glm53f_sparse_context_12n*c,float*attn,const float*x){if(c->length>=c->capacity)return-1;int pos=c->length,tokens=pos+1;mv_f8(c->qres,c->qa,c->qas,x,QA,H);glm53f_rmsnorm_bf16(c->qres,c->qres,c->qan,QA,1e-5f);mv_f8(c->query,c->qb,c->qbs,c->qres,c->qd,QA);mv_f8(c->latent+(size_t)pos*LAT,c->kva,c->kvas,x,LAT,H);glm53f_rmsnorm_bf16(c->latent+(size_t)pos*LAT,c->latent+(size_t)pos*LAT,c->kvan,LAT,1e-5f);float raw[ID];mv_b16(raw,c->wk,x,ID,H);glm53f_layernorm_bf16(c->key+(size_t)pos*ID,raw,c->knw,c->knb,ID,1e-6f);mv_b16(c->gcache+(size_t)pos*ID,c->gatew,x,ID,H);mv_b16(c->iq,c->wqb,c->qres,IH*ID,QA);mv_b16(c->iw,c->wp,x,IH,H);int ns;if(getenv("GLM53F_SPARSE_REFERENCE"))ns=glm53f_index_select_decode(c->pool,c->selected,c->iq,c->iw,c->key,c->gcache,c->apef,tokens,KPOOL,TOPK,IH,ID);else{if(tokens%KPOOL==0)update_completed_pool(c,tokens/KPOOL-1);ns=select_incremental(c,tokens);}if(ns<1)return-1;if(tokens>TOPK+KPOOL-1&&!getenv("GLM53F_SPARSE_NO_PACK")){
 #pragma omp parallel for schedule(static)
         for(int i=0;i<ns;i++)memcpy(c->packed+(size_t)i*LAT,c->latent+(size_t)c->selected[i]*LAT,LAT*4);ensure_mla_shards(c);if(mla_heads_sharded(attn,c->query,c->packed,c->kvb,ns,c->hn,c->mla_ql,c->mla_log,c->mla_part,c->mla_va))return-1;}else{if(mla_heads(attn,c->query,c->latent,c->kvb,c->selected,ns,c->hn))return-1;}c->length++;return 0;}
 
@@ -274,7 +284,7 @@ static int sparse_attention_local_cp(glm53f_sparse_context_12n *c, float *attn, 
     glm53f_rmsnorm_bf16(c->cp_cur_latent, c->cp_cur_latent, c->kvan, LAT, 1e-5f);
     float raw[ID];
     mv_b16(raw, c->wk, x, ID, H);
-    glm53f_layernorm_bf16(c->cp_cur_key, raw, c->knw, c->knb, ID, 1e-5f);
+    glm53f_layernorm_bf16(c->cp_cur_key, raw, c->knw, c->knb, ID, 1e-6f);
     mv_b16(c->cp_cur_gate, c->gatew, x, ID, H);
     if (owner == c->rank) {
         cp_store_latent(c, slot, c->cp_cur_latent);
@@ -475,10 +485,10 @@ int main(int argc,char**argv){
     for(int i=0;i<H;i++)x[i]=(float)(((i*17+tokens*3+3)%251)-125)/125.0f;float apef[KPOOL*ID];for(int i=0;i<KPOOL*ID;i++)apef[i]=glm53f_bf16_to_f32(ape[i]);float ph[2][4],el[2];int ns[2];int local_cols=hn*VD,local_blocks=local_cols/128;
     /* Build the persistent cache state once. Decode only refreshes the current
      * token and scores already-compressed completed pools. */
-    mv_f8(qres,qa,qas,x,QA,H);glm53f_rmsnorm_bf16(qres,qres,qan,QA,1e-5f);mv_f8(latent+(size_t)(tokens-1)*LAT,kva,kvas,x,LAT,H);glm53f_rmsnorm_bf16(latent+(size_t)(tokens-1)*LAT,latent+(size_t)(tokens-1)*LAT,kvan,LAT,1e-5f);{float raw[ID];mv_b16(raw,wk,x,ID,H);glm53f_layernorm_bf16(key+(size_t)(tokens-1)*ID,raw,knw,knb,ID,1e-5f);}mv_b16(gcache+(size_t)(tokens-1)*ID,gatew,x,ID,H);mv_b16(iq,wqb,qres,IH*ID,QA);mv_b16(iw,wp,x,IH,H);glm53f_index_select_decode(pool,sel,iq,iw,key,gcache,apef,tokens,KPOOL,TOPK,IH,ID);
-    for(int pass=0;pass<2;pass++){double t0=MPI_Wtime();mv_f8(qres,qa,qas,x,QA,H);glm53f_rmsnorm_bf16(qres,qres,qan,QA,1e-5f);mv_f8(query,qb,qbs,qres,qd,QA);mv_f8(latent+(size_t)(tokens-1)*LAT,kva,kvas,x,LAT,H);glm53f_rmsnorm_bf16(latent+(size_t)(tokens-1)*LAT,latent+(size_t)(tokens-1)*LAT,kvan,LAT,1e-5f);float raw[ID];mv_b16(raw,wk,x,ID,H);glm53f_layernorm_bf16(key+(size_t)(tokens-1)*ID,raw,knw,knb,ID,1e-5f);mv_b16(gcache+(size_t)(tokens-1)*ID,gatew,x,ID,H);mv_b16(iq,wqb,qres,IH*ID,QA);mv_b16(iw,wp,x,IH,H);ns[pass]=select_cached(pool,sel,iq,iw,tokens);double t1=MPI_Wtime();if(mla_heads(attn,query,latent,kvb,sel,ns[pass],hn))MPI_Abort(MPI_COMM_WORLD,2);double t2=MPI_Wtime();
+    mv_f8(qres,qa,qas,x,QA,H);glm53f_rmsnorm_bf16(qres,qres,qan,QA,1e-5f);mv_f8(latent+(size_t)(tokens-1)*LAT,kva,kvas,x,LAT,H);glm53f_rmsnorm_bf16(latent+(size_t)(tokens-1)*LAT,latent+(size_t)(tokens-1)*LAT,kvan,LAT,1e-5f);{float raw[ID];mv_b16(raw,wk,x,ID,H);glm53f_layernorm_bf16(key+(size_t)(tokens-1)*ID,raw,knw,knb,ID,1e-6f);}mv_b16(gcache+(size_t)(tokens-1)*ID,gatew,x,ID,H);mv_b16(iq,wqb,qres,IH*ID,QA);mv_b16(iw,wp,x,IH,H);glm53f_index_select_decode(pool,sel,iq,iw,key,gcache,apef,tokens,KPOOL,TOPK,IH,ID);
+    for(int pass=0;pass<2;pass++){glm53f_sparse_scalar_reference=getenv("GLM53F_SPARSE_LAYER_SCALAR_CHECK")&&pass==1;double t0=MPI_Wtime();mv_f8(qres,qa,qas,x,QA,H);glm53f_rmsnorm_bf16(qres,qres,qan,QA,1e-5f);mv_f8(query,qb,qbs,qres,qd,QA);mv_f8(latent+(size_t)(tokens-1)*LAT,kva,kvas,x,LAT,H);glm53f_rmsnorm_bf16(latent+(size_t)(tokens-1)*LAT,latent+(size_t)(tokens-1)*LAT,kvan,LAT,1e-5f);float raw[ID];mv_b16(raw,wk,x,ID,H);glm53f_layernorm_bf16(key+(size_t)(tokens-1)*ID,raw,knw,knb,ID,1e-6f);mv_b16(gcache+(size_t)(tokens-1)*ID,gatew,x,ID,H);mv_b16(iq,wqb,qres,IH*ID,QA);mv_b16(iw,wp,x,IH,H);ns[pass]=select_cached(pool,sel,iq,iw,tokens);double t1=MPI_Wtime();if(mla_heads(attn,query,latent,kvb,sel,ns[pass],hn))MPI_Abort(MPI_COMM_WORLD,2);double t2=MPI_Wtime();
 #pragma omp parallel for schedule(static)
         for(int r=0;r<H;r++)partial[r]=fp8dot(op+(size_t)r*local_cols,ops+(size_t)(r/128)*local_blocks,attn,local_cols);double t3=MPI_Wtime();MPI_Allreduce(partial,out[pass],H,MPI_FLOAT,MPI_SUM,MPI_COMM_WORLD);double t4=MPI_Wtime();ph[pass][0]=t1-t0;ph[pass][1]=t2-t1;ph[pass][2]=t3-t2;ph[pass][3]=t4-t3;el[pass]=t4-t0;}
-    int ok=ns[0]==ns[1]&&!memcmp(out[0],out[1],H*4),all;MPI_Allreduce(&ok,&all,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD);float me,mp[4];MPI_Allreduce(&el[1],&me,1,MPI_FLOAT,MPI_MAX,MPI_COMM_WORLD);MPI_Allreduce(ph[1],mp,4,MPI_FLOAT,MPI_MAX,MPI_COMM_WORLD);double ss=0;for(int i=0;i<H;i++)ss+=(double)out[0][i]*out[0][i];if(!rank)printf("GLM53F_SPARSE_LAYER_12N layer=%d tokens=%d selected=%d max_ms=%.3f front_ms=%.3f mla_ms=%.3f oproj_ms=%.3f ar_ms=%.3f rms=%.9g repeat=%s %s\n",layer,tokens,ns[0],me*1e3f,mp[0]*1e3f,mp[1]*1e3f,mp[2]*1e3f,mp[3]*1e3f,sqrt(ss/H),all?"BIT_EXACT":"FAIL",all?"PASS":"FAIL");MPI_Finalize();return all?0:1;
+    double se=0,sr=0,ma=0;for(int i=0;i<H;i++){double de=(double)out[1][i]-out[0][i];se+=de*de;sr+=(double)out[0][i]*out[0][i];if(fabs(de)>ma)ma=fabs(de);}double rel=sqrt(se/(sr+1e-30));int scalar_check=getenv("GLM53F_SPARSE_LAYER_SCALAR_CHECK")!=NULL;int ok=ns[0]==ns[1]&&(scalar_check?rel<2e-5:!memcmp(out[0],out[1],H*4)),all;MPI_Allreduce(&ok,&all,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD);float me,mp[4];MPI_Allreduce(&el[1],&me,1,MPI_FLOAT,MPI_MAX,MPI_COMM_WORLD);MPI_Allreduce(ph[1],mp,4,MPI_FLOAT,MPI_MAX,MPI_COMM_WORLD);double ss=0;for(int i=0;i<H;i++)ss+=(double)out[0][i]*out[0][i];if(!rank)printf("GLM53F_SPARSE_LAYER_12N layer=%d tokens=%d selected=%d max_ms=%.3f front_ms=%.3f mla_ms=%.3f oproj_ms=%.3f ar_ms=%.3f rms=%.9g scalar_rel_l2=%.9g scalar_max_abs=%.9g repeat=%s %s\n",layer,tokens,ns[0],me*1e3f,mp[0]*1e3f,mp[1]*1e3f,mp[2]*1e3f,mp[3]*1e3f,sqrt(ss/H),rel,ma,all?(scalar_check?"SCALAR_PASS":"BIT_EXACT"):"FAIL",all?"PASS":"FAIL");MPI_Finalize();return all?0:1;
 }
 #endif

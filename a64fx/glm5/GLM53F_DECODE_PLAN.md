@@ -248,6 +248,55 @@ on this sample; this is stronger failure than INT8's complete but defective
 program, but one greedy sample is not a statistically sufficient general model
 quality comparison.
 
+Before interpreting that FP8 result as model behavior, validate the target
+implementation layer by layer against an independent scalar reference. Use
+the same real FP8/BF16 checkpoint bytes and deterministic input/state, but do
+not call the optimized FP8 GEMV, fused mHC, sparse-index, attention, MoE, or
+collective kernels from the reference path. For every layer, compare and stop
+at the first failing boundary: input RMSNorm; attention/KDA or sparse-index
+projection and recurrent/cache state; attention output; attention mHC plus
+residual; post-attention RMSNorm; routed/shared FFN before reduction; reduced
+FFN output; FFN mHC plus residual; and final hidden state. Report relative L2,
+maximum absolute error, finiteness, and argmax/top-k agreement where relevant.
+Cover dense layers 0--2, all 11 sparse layers, representative intervening KDA
+layers, and then all 45 layers once the first mismatch is understood. The FP8
+quality run is quarantined until this scalar gate passes through final logits.
+
+The first independent scalar pass on allocation 51617019 narrows the fault but
+does not yet clear the final-logit gate. Real checkpoint mHC pre/post arithmetic
+passes at all 90 attention/FFN sites in all 45 layers (worst observed maximum
+absolute error below `2.4e-7`). Distributed KDA agrees with a BF16-weight,
+FP64-accumulation scalar implementation at layers 0, 4, 20, and 44: final-output
+relative L2 is `1.72e-7`--`2.41e-7`; layer-0 q/k/v/decay/beta/core/gated-norm
+boundaries are all below `1.50e-7` relative L2.
+
+All three dense FP8 FFNs pass optimized-versus-scalar checks, with output
+relative L2 `3.10e-7`--`3.45e-7`. All 11 real sparse-attention layers also pass
+their complete single-position projection/index/MLA/output-projection path,
+with relative L2 `3.18e-7`--`7.06e-7` and maximum absolute error no larger than
+`1.55e-6`. One staged routed expert shard from every MoE layer 3--44 passes the
+independent scalar FP8/SwiGLU/down-projection oracle; relative L2 is
+`2.88e-7`--`6.30e-7`. These results exclude the optimized arithmetic kernels as
+the source of the gross text failure on the tested sites.
+
+Comparing the graph to the official Transformers GLM-5.3-Flash implementation
+found one real structural mismatch: `Glm5NextTextIndexer.k_norm` is explicitly
+constructed with epsilon `1e-6`, whereas both A64FX sparse paths used `1e-5`.
+The runtime and standalone validator now use `1e-6`. Because this can alter
+pool ranking after 2,048 tokens, the 8K coding prompt is being rerun before
+making any quality claim. Full sequential layer-boundary and final-logit
+agreement still remains required.
+
+The corrected FP8 rerun used the same 8,050-token C++ task prompt and generated
+512 tokens. It is coherent from the first token, accurately restates the API,
+stability, move-only, allocation-fallback, CLI, and self-test requirements, and
+begins a sensible TimSort design. This is qualitatively unlike the quarantined
+pre-fix output. Prompt throughput was 14.472 tok/s, decode throughput was
+13.762 tok/s, and the sampled minimum `MemAvailable` was 3.934 GiB. The short
+512-token run is evidence that the indexer epsilon mismatch caused the gross
+quality failure, not yet a substitute for the requested 8K-output compile and
+self-test gate.
+
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
 their validated existing size. The same allocation resumed the partial 22.25

@@ -47,6 +47,11 @@ static inline float dot_bf16_sve(const uint16_t *w,const float *x,int n) {
     }
     return svaddv_f32(svptrue_b32(),acc);
 }
+static inline float dot_bf16_scalar(const uint16_t *w,const float *x,int n) {
+    double sum=0.0;
+    for(int i=0;i<n;i++)sum+=(double)glm53f_bf16_to_f32(w[i])*x[i];
+    return(float)sum;
+}
 static inline void dot_bf16_sve_8(float *y,const uint16_t *w,
                                   const float *x,int n) {
     svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
@@ -77,6 +82,12 @@ static void *get_tensor(glm53f_st_context *st,const char *name) {
     return p;
 }
 static void mv(float *y,const uint16_t *w,const float *x,int rows,int cols) {
+    if(getenv("GLM53F_KDA_SCALAR_REFERENCE")){
+#pragma omp parallel for schedule(static)
+        for(int r=0;r<rows;r++)
+            y[r]=dot_bf16_scalar(w+(size_t)r*cols,x,cols);
+        return;
+    }
     int blocks=rows/8;
 #pragma omp parallel for schedule(static)
     for(int b=0;b<blocks;b++)
@@ -120,6 +131,14 @@ static int forward(float *out,const float *x,const kda_weight *w,
             s->work+(size_t)h*D);
     mv(s->fsmall,w->ga,x,D,H); mv(s->gate,w->gb,s->fsmall,QKV,D);
     glm53f_rmsnorm_gated_bf16(s->normed,s->core,s->gate,w->onorm,NH,D,1e-5f);
+    const char *prefix=getenv("GLM53F_KDA_DUMP_PREFIX");
+    if(prefix&&*prefix){
+#define DUMP(F,P,N) do{char path[4096];snprintf(path,sizeof(path),"%s.full.%s.bin",prefix,F);FILE*f=fopen(path,"wb");if(!f||fwrite(P,sizeof(float),(N),f)!=(size_t)(N)||fclose(f))return-1;}while(0)
+        DUMP("q",q,QKV);DUMP("k",k,QKV);DUMP("v",v,QKV);
+        DUMP("decay",s->decay,QKV);DUMP("beta",s->beta,NH);
+        DUMP("core",s->core,QKV);DUMP("normed",s->normed,QKV);
+#undef DUMP
+    }
     mv(out,w->op,s->normed,H,QKV);
     for(int i=0;i<H;i++)if(!isfinite(out[i]))return -1;
     return 0;
@@ -150,8 +169,18 @@ int main(int argc,char **argv) {
     s.normed=a256(QKV*sizeof(float));s.work=a256(QKV*sizeof(float));
     if(!x||!out||!replay||!s.qkv||!s.fsmall||!s.gate||!s.decay||
        !s.beta||!s.core||!s.normed||!s.work)return 2;
-    for(int i=0;i<H;i++)x[i]=(float)(((i*17+3)%251)-125)/125.0f;
+    for(int i=0;i<H;i++)x[i]=getenv("GLM53F_KDA_CALLBACK_INPUT")?
+        (float)(((i*29+7)%257)-128)/128.0f:
+        (float)(((i*17+3)%251)-125)/125.0f;
     double t0=now_sec(); if(forward(out,x,&w,&c,&s))return 1; double first=now_sec()-t0;
+    if(getenv("GLM53F_KDA_SINGLE")){
+        const char *dump=getenv("GLM53F_KDA_OUTPUT");
+        if(dump&&*dump){FILE*f=fopen(dump,"wb");if(!f||fwrite(out,sizeof(float),H,f)!=(size_t)H||fclose(f))return 2;}
+        double ss=0.0;for(int i=0;i<H;i++)ss+=(double)out[i]*out[i];
+        printf("GLM53F_KDA_LAYER layer=%d single_ms=%.3f rms=%.9g SINGLE\n",
+               layer,first*1e3,sqrt(ss/H));
+        return 0;
+    }
     copy_cache(&checkpoint,&c);
     for(int i=0;i<H;i++)x[i]=(float)(((i*29+7)%257)-128)/128.0f;
     t0=now_sec();if(forward(out,x,&w,&c,&s))return 1;double decode=now_sec()-t0;

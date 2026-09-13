@@ -113,6 +113,10 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_index_score.c \
     -lm -o test_glm53f_index_score
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_mhc_chain.c \
     -lm -o test_glm53f_mhc_chain
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_mhc_scalar_real.c \
+    -lm -o test_glm53f_mhc_scalar_real
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_mtp_expert_check.c \
+    -lm -o glm53f_mtp_expert_check
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_sparse_math.c \
     "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_math
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_sparse_cp.c \
