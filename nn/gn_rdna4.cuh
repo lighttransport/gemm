@@ -680,9 +680,9 @@ extern "C" __global__ void gn_lt_combine_bias(float *y, const float *high, const
  * positive: native BF16 partial dots, widened once per AccChunk products.
  * This changes the training arithmetic and is always opt-in. */
 template <bool Precise, int MR = 2, int NR = 2, int BK = 32, int AccChunk = -1, int Products = 6,
-          bool Separate = true>
+          bool Separate = true, bool Bias = false>
 __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned short *b, int M,
-                              int N, int K, int add) {
+                              int N, int K, int add, const float *bias) {
     static_assert(!Precise || AccChunk < 0, "BF16 accumulation changes the precision contract");
     constexpr int BM = 32 * MR, BN = 32 * NR, Planes = Precise ? (Products == 3 ? 2 : 3) : 1;
     __shared__ unsigned short sa[Planes][BM][BK + 8] __attribute__((aligned(16)));
@@ -786,35 +786,40 @@ __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned 
                               : Precise && Products == 3 && !Separate
                                   ? high[i][j][q]
                                   : high[i][j][q] + low[i][j][q];
-                    y[r * N + c] = v + (add ? y[r * N + c] : 0);
+                    y[r * N + c] = v + (Bias ? bias[c] : 0) + (add ? y[r * N + c] : 0);
                 }
             }
 }
 extern "C" __global__ __launch_bounds__(128) void gn_mm_tiled(float *y, const unsigned short *a,
                                                               const unsigned short *b, int M, int N,
                                                               int K, int add) {
-    gn_rdna4_body<true, 1, 1>(y, a, b, M, N, K, add);
+    gn_rdna4_body<true, 1, 1>(y, a, b, M, N, K, add, nullptr);
 }
 extern "C" __global__ __launch_bounds__(128) void gn_mm_tiled_fast(float *y,
                                                                    const unsigned short *a,
                                                                    const unsigned short *b, int M,
                                                                    int N, int K, int add) {
-    gn_rdna4_body<false>(y, a, b, M, N, K, add);
+    gn_rdna4_body<false>(y, a, b, M, N, K, add, nullptr);
 }
 /* Two BF16 components, three products. A single FP32 accumulator bank admits
  * fewer registers; qualification covers the altered but still-FP32 sum order. */
 extern "C" __global__ __launch_bounds__(128) void gn_mm_bf16x3(float *y, const unsigned short *a,
                                                                const unsigned short *b, int M,
                                                                int N, int K, int add) {
-    gn_rdna4_body<true, 1, 1, 32, -1, 3, false>(y, a, b, M, N, K, add);
+    gn_rdna4_body<true, 1, 1, 32, -1, 3, false>(y, a, b, M, N, K, add, nullptr);
+}
+extern "C" __global__ __launch_bounds__(128) void
+gn_mm_bf16x3_bias(float *y, const unsigned short *a, const unsigned short *b, const float *bias,
+                  int M, int N, int K, int add) {
+    gn_rdna4_body<true, 1, 1, 32, -1, 3, false, true>(y, a, b, M, N, K, add, bias);
 }
 extern "C" __global__ __launch_bounds__(128) void gn_mm_bf16_acc(float *y, const unsigned short *a,
                                                                  const unsigned short *b, int M,
                                                                  int N, int K, int add, int chunk) {
     if (chunk)
-        gn_rdna4_body<false, 2, 2, 32, 128>(y, a, b, M, N, K, add);
+        gn_rdna4_body<false, 2, 2, 32, 128>(y, a, b, M, N, K, add, nullptr);
     else
-        gn_rdna4_body<false, 2, 2, 32, 0>(y, a, b, M, N, K, add);
+        gn_rdna4_body<false, 2, 2, 32, 0>(y, a, b, M, N, K, add, nullptr);
 }
 
 /* Row quantization. INT16 is a signed high byte and UNSIGNED low byte:

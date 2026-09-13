@@ -781,6 +781,13 @@ test with two 200-step windows per binary measured 1,280.99 examples/s mean
 without the fusion and **1,284.84 examples/s with it** (+0.30%). The paired
 inference means were 18.5463 and **18.2949 ms**, respectively.
 
+The same epilogue is also specialized into the native three-product BF16 WMMA
+kernel. This removes the remaining forward linear-bias pass for matrices below
+the rocBLASLt routing threshold. Batch-16 and batch-64 oracle results remain
+unchanged. Three 100-step runs sustain **1,292.54 examples/s median**
+(1,289.71--1,293.15), 13.9616 useful TFLOP/s and 24.5279 logical product
+TFLOP/s, **12.5784%** of nominal peak. Median inference latency is 18.0798 ms.
+
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
 The precision allocation executes an estimated 18.3703 trillion 16-bit matrix
