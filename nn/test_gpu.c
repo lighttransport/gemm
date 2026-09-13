@@ -21,7 +21,7 @@ static double relative(const float *a, const float *b, size_t n) {
 int main(int argc, char **argv) {
     if (argc < 2 || argc > 6 || (argc == 6 && strcmp(argv[5], "report")) ||
         (argc >= 4 && strcmp(argv[3], "wide") && strcmp(argv[3], "full") &&
-         strcmp(argv[3], "stress") && strcmp(argv[3], "silu")))
+         strcmp(argv[3], "stress") && strcmp(argv[3], "silu") && strcmp(argv[3], "attention")))
         return 2;
     int B = 2;
     int report = argc == 6, numerical_failure = 0;
@@ -47,6 +47,13 @@ int main(int argc, char **argv) {
         c = gn_default_config();
     if (argc >= 4 && !strcmp(argv[3], "silu"))
         c.version = 2;
+    /* Small full-width heads exercise CUDA's 81-token grouped attention and
+     * fused SiLU/BN under sanitizers without allocating the 20-block model. */
+    if (argc >= 4 && !strcmp(argv[3], "attention")) {
+        c.version = 2;
+        c.channels = 64;
+        c.head_dim = 32;
+    }
     gn_model *gpu = gn_create(&c, argv[1], 0);
     if (!gpu) {
         fprintf(stderr, "UNAVAILABLE %s: %s\n", argv[1], gn_error());

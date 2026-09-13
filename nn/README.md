@@ -48,7 +48,9 @@ nn/build/test_gpu hip
 
 GPU tests return 77 for unavailable, not PASS. An optional checkpoint path and
 `wide` or `full` argument test 9×9 C32 or the default C256/20-block network,
-including checkpoint reload. A final optional batch argument defaults to 2;
+including checkpoint reload. A final optional batch argument defaults to 2.
+`attention` selects a small SiLU network with two full-width (D32) heads to
+exercise grouped 81-token CUDA attention and fused normalization under sanitizers.
 `test_gpu hip-blaslt FILE full 16` exercises the hybrid's vendor training shapes.
 `stress` retains a highly correlated sinusoidal
 full-network case that fails the tight gradient gate even in the FP32 path.
@@ -61,6 +63,9 @@ identical already-compared gradients. These are not a strength certification. Be
 The optional trailing `BF16_PEAK_TFLOPS INT8_PEAK_TOPS` overrides the benchmark's
 explicit RX 9070 XT dense reference (195 / 389). JSON separates useful GEMM work,
 precision-compensation products, FP32 attention, and whole-step peak percentages.
+CUDA also reports these percentages when explicit peak arguments are supplied;
+for RTX 5060 Ti, use `47.4 189.5` (BF16/FP32 and INT8/INT32 nominal dense rates;
+see `SM120.md` for the denominator).
 `make -C nn rdna4-precision` builds the standalone accumulator diagnostic;
 `sh nn/test_rdna4_precision.sh` exercises it. `test_gpu BACKEND FILE wide 2 report`
 continues through numerical mismatches to report gradients/update/reload, but

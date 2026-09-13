@@ -64,6 +64,57 @@ static float value(unsigned i) {
     x = (x >> 22) ^ x;
     return (float)(x >> 8) * (2.0f / 16777216) - 1;
 }
+static int check_fused_columns() {
+    int failed = 0;
+    for (int channels : {1, 3, 5, 80, 256}) {
+        int side = channels < 8 ? 3 : 9, R = 2 * side * side;
+        int kernel = channels == 80 ? 5 : 3, K = channels * kernel * kernel;
+        int stride = (K + 31) & ~31;
+        float *x, *col;
+        unsigned short *fused, *reference;
+        CUDA_OK(cudaMalloc(&x, (size_t)R * channels * 4));
+        CUDA_OK(cudaMalloc(&col, (size_t)R * K * 4));
+        size_t count = std::max((size_t)R * stride, (size_t)K * ((R + 31) & ~31)) * 3;
+        CUDA_OK(cudaMalloc(&fused, count * 2));
+        CUDA_OK(cudaMalloc(&reference, count * 2));
+        std::vector<float> input((size_t)R * channels);
+        for (size_t i = 0; i < input.size(); i++)
+            input[i] = value((unsigned)i);
+        CUDA_OK(cudaMemcpy(x, input.data(), input.size() * 4, cudaMemcpyHostToDevice));
+        gn_columns<<<(R * K + 255) / 256, 256>>>(col, x, R, channels, side, kernel);
+        for (int trans : {0, 1}) {
+            for (int precise : {0, 1, 2}) {
+                int planes = precise == 2 ? 2 : precise ? 3 : 1;
+                int rows = trans ? K : R, cols = trans ? R : K;
+                gn_pack_bf16<<<dim3((cols + 31) / 32, (rows + 31) / 32), 256>>>(
+                    reference, col, rows, cols, trans, precise);
+                CUDA_OK(cudaMemset(fused, 0xcd, count * 2));
+                if (trans)
+                    gn_columns_bf16_back<<<dim3((K + 31) / 32, (R + 31) / 32), 256>>>(
+                        fused, x, R, channels, side, kernel, precise);
+                else
+                    gn_columns_bf16<<<(R * stride / 4 + 255) / 256, 256>>>(
+                        fused, x, R, channels, side, kernel, precise);
+                std::vector<unsigned short> a((size_t)rows * ((cols + 31) & ~31) * planes), b(a.size());
+                CUDA_OK(cudaMemcpy(a.data(), fused, a.size() * 2, cudaMemcpyDeviceToHost));
+                CUDA_OK(cudaMemcpy(b.data(), reference, b.size() * 2, cudaMemcpyDeviceToHost));
+                if (a != b) {
+                    fprintf(stderr, "fused columns mismatch C=%d precise=%d trans=%d\n",
+                            channels, precise, trans);
+                    failed = 1;
+                }
+            }
+        }
+        CUDA_OK(cudaFree(x));
+        CUDA_OK(cudaFree(col));
+        CUDA_OK(cudaFree(fused));
+        CUDA_OK(cudaFree(reference));
+    }
+    printf("{\"fused_columns_bitwise_pass\":%s,\"channel_shapes\":5,\"precision_modes\":3,"
+           "\"transpose_modes\":2}\n",
+           failed ? "false" : "true");
+    return failed;
+}
 int main(int argc, char **argv) {
     if (argc != 1 && argc != 7) {
         fprintf(stderr, "usage: bench_sm120 [M N K transpose_A transpose_B iterations]\n");
@@ -117,15 +168,15 @@ int main(int argc, char **argv) {
         hb[i] = value((unsigned)i + 170011);
     CUDA_OK(cudaMemcpy(a, ha.data(), ha.size() * 4, cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(b, hb.data(), hb.size() * 4, cudaMemcpyHostToDevice));
-    int failed = 0;
+    int failed = check_fused_columns();
     const char *names[] = {"legacy_bf16x6", "tiled_bf16x6", "tiled_bf16", "experimental_int8",
-                           "experimental_int16"};
-    for (int mode = 0; mode < 5; mode++) {
-        int precise = mode != 2, bits = mode == 3 ? 8 : 16, add = 0;
+                           "experimental_int16", "tiled_bf16x3", "tiled_bf16x3_n128"};
+    for (int mode = 0; mode < 7; mode++) {
+        int precise = mode >= 5 ? 2 : mode != 2, bits = mode == 3 ? 8 : 16, add = 0;
         auto pack = [&] {
             if (mode == 0)
                 return;
-            if (mode < 3) {
+            if (mode < 3 || mode >= 5) {
                 gn_pack_bf16<<<dim3((K + 31) / 32, (M + 31) / 32), 256>>>(pa, a, M, K, ta, precise);
                 gn_pack_bf16<<<dim3((K + 31) / 32, (N + 31) / 32), 256>>>(pb, b, N, K, !tb,
                                                                           precise);
@@ -142,6 +193,11 @@ int main(int argc, char **argv) {
             else if (mode == 2)
                 gn_mm_tiled_fast<<<dim3((N + 63) / 64, (M + 63) / 64), 128>>>(y, pa, pb, M, N, K,
                                                                               add);
+            else if (mode == 5)
+                gn_mm_bf16x3<<<dim3((N + 63) / 64, (M + 31) / 32), 128>>>(y, pa, pb, M, N, K, add);
+            else if (mode == 6)
+                gn_mm_bf16x3_n128<<<dim3((N + 127) / 128, (M + 31) / 32), 256>>>(
+                    y, pa, pb, M, N, K, add);
             else
                 gn_mm_integer<<<dim3((N + 7) / 8, (M + 15) / 16), 32>>>(
                     y, (signed char *)pa, (signed char *)pb, scales_a, scales_b, M, N, K, add,
@@ -170,14 +226,15 @@ int main(int argc, char **argv) {
             base += ref * ref;
         }
         double relative = sqrt(delta / fmax(base, 1e-30));
-        double tolerance = mode < 2 ? 2e-5 : mode == 4 ? 2e-4 : .02;
+        double tolerance = mode < 2 || mode >= 5 ? 2e-5 : mode == 4 ? 2e-4 : .02;
         if (!std::isfinite(relative) || relative > tolerance)
             failed = 1;
         double useful = 2.0 * M * N * K / (total_ms * 1e9);
         /* Include tail instructions in executed ops, never in useful ops. */
-        double pm = mode == 0 || mode > 2 ? 16 : mode == 1 ? 32 : 64;
-        double pn = mode == 0 || mode > 2 ? 8 : 64;
-        double pk = mode == 0 ? 16 : 32, products = mode < 2 ? 6 : mode == 4 ? 4 : 1;
+        double pm = mode >= 5 ? 32 : mode == 0 || mode > 2 ? 16 : mode == 1 ? 32 : 64;
+        double pn = mode == 6 ? 128 : mode == 5 ? 64 : mode == 0 || mode > 2 ? 8 : 64;
+        double pk = mode == 0 ? 16 : 32;
+        double products = mode >= 5 ? 3 : mode < 2 ? 6 : mode == 4 ? 4 : 1;
         double executed = 2 * ceil(M / pm) * pm * ceil(N / pn) * pn * ceil(K / pk) * pk * products /
                           (kernel_ms * 1e9);
         printf("{\"mode\":\"%s\",\"kernel_ms\":%.6g,\"pack_plus_kernel_ms\":%.6g,\"useful_tera_ops_"

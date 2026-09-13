@@ -317,7 +317,8 @@ int main(int argc, char **argv) {
         printf(strstr(argv[3], "fp16back") ? ",\"attention_matrix_equivalent_tflops\":%.6g"
                                             : ",\"fp32_attention_tflops\":%.6g",
                total_rate - gemm_rate);
-        if (!strncmp(argv[3], "hip", 3) && !strstr(argv[3], "fp32")) {
+        if ((!strncmp(argv[3], "hip", 3) ||
+             (!strncmp(argv[3], "cuda", 4) && argc == 8)) && !strstr(argv[3], "fp32")) {
             double products = gn_gemm_product_ops(m, argv[3]) * iterations / train_seconds / 1e12;
             double peak = integer ? int8_peak : bf16_peak;
             printf(

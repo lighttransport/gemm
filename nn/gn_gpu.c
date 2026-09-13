@@ -240,7 +240,7 @@ static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, 
         if (ci > 0) {
             void *cp[] = {&pa, &a, &M, &ci, &side, &kernel, &g->precise};
             size_t elements = M * stride;
-            if (!g->fp16 && ci == 256 && side == 9 && kernel == 3)
+            if (!g->hip || (!g->fp16 && ci == 256 && side == 9 && kernel == 3))
                 elements /= 4;
             CALL(flat(g, g->fp16 ? 41 : 32, elements, cp));
         } else
@@ -345,8 +345,8 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         fprintf(
             stderr,
             "EXPERIMENTAL %s: reduced-precision matrices, FP32 master/optimizer/nonmatrix state; "
-            "qualification is model/batch specific; see RDNA4.md\n",
-            backend);
+            "qualification is model/batch specific; see %s\n",
+            backend, g->hip ? "RDNA4.md" : "SM120.md");
     g->device = device;
     g->limit = limit;
     int rc = 0;
@@ -493,11 +493,15 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
     }
     if (!g->hip) {
         CUfunction f;
-        rc = (int)cuModuleGetFunction(&f, g->cuda_module, names[32]);
-        g->functions[32] = (void *)f;
-        if (rc) {
-            gn_fail("missing CUDA fused columns kernel");
-            goto bad;
+        const int common[] = {29, 32, 36, 37, 38, 44, 45};
+        for (unsigned j = 0; j < sizeof(common) / sizeof(*common); j++) {
+            int index = common[j];
+            rc = (int)cuModuleGetFunction(&f, g->cuda_module, names[index]);
+            g->functions[index] = (void *)f;
+            if (rc) {
+                gn_fail("missing CUDA fused operation kernel");
+                goto bad;
+            }
         }
         if (g->reduced == 3) {
             rc = (int)cuModuleGetFunction(&f, g->cuda_module, names[35]);
@@ -595,7 +599,7 @@ int gn_gpu_forward(gn_model *m, const float *input) {
         int R = (int)n->r, C = (int)n->c, K = n->k, layer = n->kind == LN;
         uint64_t x = PTR_NODE(m, n->a, 0), y = PTR_NODE(m, i, 0), w = param(m, n->w, 0),
                  bias = param(m, n->bias, 0), aux = PTR_NODE(m, i, 2);
-        if (g->hip && !g->legacy && n->kind == BN && n->a > 0 &&
+        if (!g->legacy && n->kind == BN && n->a > 0 &&
             m->n[n->a].kind == CONV && i + 1 < m->nn &&
             m->n[i + 1].kind == SILU && m->n[i + 1].a == (int)i) {
             uint64_t out = PTR_NODE(m, i + 1, 0), mean = param(m, n->mean, 0),
@@ -640,7 +644,7 @@ int gn_gpu_forward(gn_model *m, const float *input) {
                     x = col;
                 }
             }
-            int fused_bias = g->hip && !g->legacy && i + 2 < m->nn &&
+            int fused_bias = !g->legacy && i + 2 < m->nn &&
                              m->n[i + 1].kind == BN && m->n[i + 1].a == (int)i &&
                              m->n[i + 2].kind == SILU && m->n[i + 2].a == (int)i + 1;
             CALL(mm_columns(g, y, x, w, R, C, K, 0, 1, 0, fused_ci, side, n->k,
@@ -652,7 +656,7 @@ int gn_gpu_forward(gn_model *m, const float *input) {
         } else if (n->kind == BN || n->kind == LN) {
             uint64_t mean = param(m, n->mean, 0), var = param(m, n->variance, 0);
             void *args[] = {&y, &aux, &mean, &var, &x, &w, &bias, &R, &C, &layer, &training};
-            if (g->hip && !g->legacy && !layer)
+            if (!g->legacy && !layer)
                 CALL(launch(g, 36, (C + 7) / 8, 1, 256, args));
             else if (!g->legacy)
                 CALL(launch(g, 18, layer ? R : C, 1, 256, args));
@@ -739,9 +743,10 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
         uint64_t x = PTR_NODE(m, n->a, 0), dx = PTR_NODE(m, n->a, 1), dy = PTR_NODE(m, i, 1),
                  w = param(m, n->w, 0), dw = param(m, n->w, 1), db = param(m, n->bias, 1),
                  aux = PTR_NODE(m, i, 2);
-        if (g->hip && !g->legacy && n->kind == SILU && i > 1) {
+        if (!g->legacy && n->kind == SILU && i > 1) {
             Node *bn = &m->n[i - 1];
-            if (bn->kind == BN && n->a == (int)i - 1) {
+            if (bn->kind == BN && n->a == (int)i - 1 && bn->a > 0 &&
+                m->n[bn->a].kind == CONV) {
                 uint64_t source = PTR_NODE(m, bn->a, 0), dsource = PTR_NODE(m, bn->a, 1),
                          mid = PTR_NODE(m, i - 1, 0), bn_w = param(m, bn->w, 0),
                          bn_dw = param(m, bn->w, 1), bn_db = param(m, bn->bias, 1),
@@ -782,7 +787,8 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
                 gradient = buffer(g, SCRATCH_BASE + 1, (size_t)R * K * 4, NULL);
                 if (!gradient)
                     return -1;
-                if (g->hip && !g->legacy && !g->fp32 && !g->integer &&
+                if (!g->legacy && !g->fp32 && !g->integer &&
+                    (g->hip || g->reduced == 3) &&
                     (g->reduced || (R >= 32 && C >= 32 && K >= 32)))
                     fused_ci = -ci;
                 else {
@@ -811,19 +817,19 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
             }
             if (n->kind == CONV)
                 CALL(columns(g, dx, gradient, R, (int)m->n[n->a].c, side, n->k, 1));
-            int fused_db = g->hip && !g->legacy && i + 2 < m->nn &&
+            int fused_db = !g->legacy && i + 2 < m->nn &&
                            m->n[i + 1].kind == BN && m->n[i + 1].a == (int)i &&
                            m->n[i + 2].kind == SILU && m->n[i + 2].a == (int)i + 1;
             if (!fused_db) {
                 void *args[] = {&db, &dy, &R, &C};
-                if (g->hip && !g->legacy)
+                if (!g->legacy)
                     CALL(launch(g, 29, (C + 7) / 8, 1, 256, args));
                 else
                     CALL(flat(g, 4, C, args));
             }
         } else if (n->kind == BN || n->kind == LN) {
             void *args[] = {&dx, &dw, &db, &x, &dy, &w, &aux, &R, &C, &layer};
-            if (g->hip && !g->legacy && !layer)
+            if (!g->legacy && !layer)
                 CALL(launch(g, 37, (C + 7) / 8, 1, 256, args));
             else if (!g->legacy)
                 CALL(launch(g, 19, layer ? R : C, 1, 256, args));

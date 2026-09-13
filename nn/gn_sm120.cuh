@@ -8,11 +8,27 @@ template <typename T> __device__ T gn_block_sum(T v) {
     int t = threadIdx.x;
     sums[t] = v;
     __syncthreads();
+#if !defined(GN_HIP)
+    /* Preserve the original 128,64,32,16,... reduction tree. Each lane
+     * of warp zero gathers its eight leaves; the final five levels stay
+     * in registers. All callers use exactly 256 threads. */
+    if (t < 32) {
+        T a = (sums[t] + sums[t + 128]) + (sums[t + 64] + sums[t + 192]);
+        T b = (sums[t + 32] + sums[t + 160]) + (sums[t + 96] + sums[t + 224]);
+        v = a + b;
+        for (int d = 16; d; d /= 2)
+            v += __shfl_down_sync(0xffffffffu, v, d);
+        if (!t)
+            sums[0] = v;
+    }
+    __syncthreads();
+#else
     for (int d = 128; d; d /= 2) {
         if (t < d)
             sums[t] += sums[t + d];
         __syncthreads();
     }
+#endif
     return sums[0];
 }
 __device__ float gn_block_max(float v) {
@@ -99,6 +115,219 @@ extern "C" __global__ void gn_layer_param_parallel(float *dw, float *db, const f
         dw[c] += (float)a;
         db[c] += (float)b;
     }
+}
+/* Eight neighboring NHWC channels per CTA. Preserve double statistics and
+ * FP32 normalization, while coalescing the formerly channel-strided loads. */
+__device__ double gn_sum_channels(double v) {
+    __shared__ double sums[256];
+    int t = threadIdx.x;
+    __syncthreads();
+    sums[t] = v;
+    __syncthreads();
+    for (int d = 128; d >= 8; d /= 2) {
+        if (t < d)
+            sums[t] += sums[t + d];
+        __syncthreads();
+    }
+    return sums[t % 8];
+}
+extern "C" __global__ void gn_bn_channels(float *y, float *aux, float *mean, float *var,
+                                          const float *x, const float *w, const float *bias, int R,
+                                          int C, int layer, int training) {
+    int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;
+    double mu = 0, v = 0;
+    if (training) {
+        if (c < C)
+            for (int r = t / 8; r < R; r += 32)
+                mu += x[r * C + c];
+        mu = gn_sum_channels(mu) / R;
+        if (c < C)
+            for (int r = t / 8; r < R; r += 32) {
+                double d = x[r * C + c] - mu;
+                v += d * d;
+            }
+        v = gn_sum_channels(v) / R;
+        if (t < 8 && c < C) {
+            mean[c] = .9f * mean[c] + .1f * (float)mu;
+            var[c] = .9f * var[c] + .1f * (float)(R > 1 ? v * R / (R - 1) : v);
+        }
+    } else if (c < C) {
+        mu = mean[c];
+        v = var[c];
+    }
+    float inv = rsqrtf((float)v + 1e-5f);
+    if (t < 8 && c < C) {
+        aux[c] = (float)mu;
+        aux[C + c] = inv;
+    }
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32)
+            y[r * C + c] = (x[r * C + c] - (float)mu) * inv * w[c] + bias[c];
+    (void)layer;
+}
+extern "C" __global__ void gn_bn_back_channels(float *dx, float *dw, float *db, const float *x,
+                                               const float *dy, const float *w, const float *aux,
+                                               int R, int C, int layer) {
+    int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;
+    float mu = c < C ? aux[c] : 0, inv = c < C ? aux[C + c] : 0;
+    double sum = 0, prod = 0;
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32) {
+            int j = r * C + c;
+            sum += dy[j];
+            prod += dy[j] * (x[j] - mu) * inv;
+        }
+    sum = gn_sum_channels(sum);
+    prod = gn_sum_channels(prod);
+    if (t < 8 && c < C) {
+        dw[c] += (float)prod;
+        db[c] += (float)sum;
+    }
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32) {
+            int j = r * C + c;
+            dx[j] +=
+                inv * w[c] * (dy[j] - (float)(sum / R) - (x[j] - mu) * inv * (float)(prod / R));
+        }
+    (void)layer;
+}
+extern "C" __global__ void gn_bn_silu_channels(float *mid, float *y, float *aux, float *mean,
+                                                float *var, float *x, const float *prebias,
+                                                const float *w, const float *bias, int R, int C,
+                                                int training) {
+    int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;
+    double mu = 0, v = 0;
+    if (training) {
+        if (c < C)
+            for (int r = t / 8; r < R; r += 32)
+                mu += (x[r * C + c] = x[r * C + c] + prebias[c]);
+        mu = gn_sum_channels(mu) / R;
+        if (c < C)
+            for (int r = t / 8; r < R; r += 32) {
+                double d = x[r * C + c] - mu;
+                v += d * d;
+            }
+        v = gn_sum_channels(v) / R;
+        if (t < 8 && c < C) {
+            mean[c] = .9f * mean[c] + .1f * (float)mu;
+            var[c] = .9f * var[c] + .1f * (float)(R > 1 ? v * R / (R - 1) : v);
+        }
+    } else if (c < C) {
+        mu = mean[c];
+        v = var[c];
+        for (int r = t / 8; r < R; r += 32)
+            x[r * C + c] += prebias[c];
+    }
+    float inv = rsqrtf((float)v + 1e-5f);
+    if (t < 8 && c < C) {
+        aux[c] = (float)mu;
+        aux[C + c] = inv;
+    }
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32) {
+            int j = r * C + c;
+            float z = (x[j] - (float)mu) * inv * w[c] + bias[c];
+            mid[j] = z;
+            y[j] = z / (1 + expf(-z));
+        }
+}
+extern "C" __global__ void gn_bn_silu_back_channels(float *dx, float *dw, float *db,
+                                                     const float *x, const float *mid,
+                                                     const float *dy, const float *w,
+                                                     const float *aux, float *conv_db, int R, int C) {
+    int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;
+    float mu = c < C ? aux[c] : 0, inv = c < C ? aux[C + c] : 0;
+    double sum = 0, prod = 0;
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32) {
+            int j = r * C + c;
+            float s = 1 / (1 + expf(-mid[j]));
+            float d = dy[j] * s * (1 + mid[j] * (1 - s));
+            sum += d;
+            prod += d * (x[j] - mu) * inv;
+        }
+    sum = gn_sum_channels(sum);
+    prod = gn_sum_channels(prod);
+    if (t < 8 && c < C) {
+        dw[c] += (float)prod;
+        db[c] += (float)sum;
+    }
+    double conv_sum = 0;
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32) {
+            int j = r * C + c;
+            float s = 1 / (1 + expf(-mid[j]));
+            float d = dy[j] * s * (1 + mid[j] * (1 - s));
+            float v = inv * w[c] *
+                      (d - (float)(sum / R) - (x[j] - mu) * inv * (float)(prod / R));
+            dx[j] += v;
+            conv_sum += v;
+        }
+    conv_sum = gn_sum_channels(conv_sum);
+    if (t < 8 && c < C)
+        conv_db[c] += (float)conv_sum;
+}
+extern "C" __global__ void gn_bias_back_parallel(float *db, const float *dy, int R, int C) {
+    __shared__ double sums[256];
+    int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;
+    double sum = 0;
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32)
+            sum += dy[r * C + c];
+    sums[t] = sum;
+    __syncthreads();
+    for (int d = 128; d >= 8; d /= 2) {
+        if (t < d)
+            sums[t] += sums[t + d];
+        __syncthreads();
+    }
+    if (t < 8 && c < C)
+        db[c] += (float)sums[t];
+}
+/* Backward dW needs im2col transposed. Gather a channel-coalesced tile
+ * straight from NHWC, then transpose/round in LDS. */
+template <int Channels = 0, int Side = 0, int Kernel = 0, bool Half = false>
+__device__ __forceinline__ void gn_columns_pack_back(unsigned short *out, const float *x, int R,
+                                                     int C, int side, int kernel, int precise) {
+    C = Channels ? Channels : C;
+    side = Side ? Side : side;
+    kernel = Kernel ? Kernel : kernel;
+    __shared__ float tile[32][33];
+    int t = threadIdx.x, k0 = blockIdx.x * 32, r0 = blockIdx.y * 32;
+    int K = C * kernel * kernel, stride = (R + 31) & ~31, S = side * side;
+    for (int i = t; i < 1024; i += 256) {
+        int r = r0 + i / 32, k = k0 + i % 32;
+        int yy = r % S / side + k / (C * kernel) - kernel / 2;
+        int xx = r % side + k / C % kernel - kernel / 2;
+        tile[i / 32][i % 32] = r < R && k < K && yy >= 0 && xx >= 0 && yy < side && xx < side
+                                   ? x[(r / S * S + yy * side + xx) * C + k % C]
+                                   : 0;
+    }
+    __syncthreads();
+    for (int i = t; i < 1024; i += 256) {
+        int k = k0 + i / 32, r = r0 + i % 32;
+        if (k >= K)
+            continue;
+        float v = tile[i % 32][i / 32];
+        unsigned short high = Half ? hf(v) : bf(v);
+        out[k * stride + r] = high;
+        if (precise && !Half) {
+            float residual = v - unbf(high);
+            unsigned short low = bf(residual);
+            out[(K + k) * stride + r] = low;
+            if (precise != 2)
+                out[(2 * K + k) * stride + r] = bf(residual - unbf(low));
+        }
+    }
+}
+extern "C" __global__ void gn_columns_bf16_back(unsigned short *out, const float *x, int R, int C,
+                                                int side, int kernel, int precise) {
+    if (side == 9 && C == 256 && kernel == 3)
+        gn_columns_pack_back<256, 9, 3>(out, x, R, C, side, kernel, precise);
+    else if (side == 9 && C == 80 && kernel == 5)
+        gn_columns_pack_back<80, 9, 5>(out, x, R, C, side, kernel, precise);
+    else
+        gn_columns_pack_back<>(out, x, R, C, side, kernel, precise);
 }
 extern "C" __global__ void gn_loss_parallel(float *dp, float *dv, float *loss, const float *p,
                                             const float *v, const float *target,
@@ -192,6 +421,7 @@ extern "C" __global__ void gn_pack_bf16(unsigned short *out, const float *in, in
 }
 /* Emit im2col directly in the packed BF16 layout consumed by the tensor-core
  * kernels, avoiding a full FP32 column write and subsequent pack read. */
+#if !defined(GN_HIP)
 extern "C" __global__ void gn_columns_bf16(unsigned short *out, const float *x, int R, int C,
                                            int side, int kernel, int precise) {
     int vector = blockIdx.x * blockDim.x + threadIdx.x;
@@ -203,17 +433,38 @@ extern "C" __global__ void gn_columns_bf16(unsigned short *out, const float *x, 
     int yy = position / side + k / (C * kernel) - kernel / 2;
     int xx = position % side + k / C % kernel - kernel / 2;
     float4 value = {};
-    if (k + 3 < K && yy >= 0 && xx >= 0 && yy < side && xx < side)
-        value = *reinterpret_cast<const float4 *>(
-            x + (row / S * S + yy * side + xx) * C + k % C);
+    if (!(C & 3)) {
+        if (k + 3 < K && yy >= 0 && xx >= 0 && yy < side && xx < side)
+            value = *reinterpret_cast<const float4 *>(
+                x + (row / S * S + yy * side + xx) * C + k % C);
+    } else {
+        /* A four-element output vector may cross a spatial tap, and the
+         * NHWC source row need not be aligned for a float4 load. */
+        float *v = &value.x;
+        for (int d = 0; d < 4; d++) {
+            int tap = k + d;
+            int sy = position / side + tap / (C * kernel) - kernel / 2;
+            int sx = position % side + tap / C % kernel - kernel / 2;
+            v[d] = tap < K && sy >= 0 && sx >= 0 && sy < side && sx < side
+                       ? x[(row / S * S + sy * side + sx) * C + tap % C] : 0;
+        }
+    }
     ushort4 high = {bf(value.x), bf(value.y), bf(value.z), bf(value.w)};
     *reinterpret_cast<ushort4 *>(out + row * stride + k) = high;
     if (precise) {
         ushort4 low = {bf(value.x - unbf(high.x)), bf(value.y - unbf(high.y)),
                        bf(value.z - unbf(high.z)), bf(value.w - unbf(high.w))};
         *reinterpret_cast<ushort4 *>(out + (R + row) * stride + k) = low;
+        if (precise != 2) {
+            ushort4 lowest = {bf(value.x - unbf(high.x) - unbf(low.x)),
+                              bf(value.y - unbf(high.y) - unbf(low.y)),
+                              bf(value.z - unbf(high.z) - unbf(low.z)),
+                              bf(value.w - unbf(high.w) - unbf(low.w))};
+            *reinterpret_cast<ushort4 *>(out + (2 * R + row) * stride + k) = lowest;
+        }
     }
 }
+#endif
 extern "C" __global__ void gn_pack_fp16(unsigned short *out, const float *in, int R, int K,
                                         int trans, int precise) {
     __shared__ float tile[32][33];
@@ -258,7 +509,7 @@ extern "C" __global__ void gn_attention_parallel(float *y, float *prob, const fl
                                                  const float *bias, int B, int side, int C, int D) {
 #if !defined(GN_HIP)
     if (side == 9 && D == 32) {
-        __shared__ float keys[81][32], values[81][32], scores[8][81];
+        __shared__ float keys[32][81], values[81][32], scores[8][81];
         int t = threadIdx.x, warp = t / 32, lane = t % 32, H = C / 32;
         int group = blockIdx.x % 11, h = blockIdx.x / 11 % H, b = blockIdx.x / (11 * H);
         int query = group * 8 + warp;
@@ -266,33 +517,45 @@ extern "C" __global__ void gn_attention_parallel(float *y, float *prob, const fl
             int j = z / 64, q = z % 64, d = q % 32;
             int offset = (b * 81 + j) * 3 * C + h * 32 + d;
             if (q < 32)
-                keys[j][d] = x[offset + C];
+                keys[d][j] = x[offset + C];
             else
                 values[j][d] = x[offset + 2 * C];
         }
         __syncthreads();
         float q = query < 81 ? x[(b * 81 + query) * 3 * C + h * 32 + lane] : 0;
-        for (int j = 0; j < 81; j++) {
-            float dot = q * keys[j][lane];
-            for (int delta = 16; delta; delta /= 2)
-                dot += __shfl_down_sync(0xffffffffu, dot, delta);
-            if (!lane && query < 81) {
+        /* Lanes own keys, with coalesced shared loads and a broadcast query
+         * component. Three batches replace 81 separate warp reductions. */
+        for (int j0 = 0; j0 < 81; j0 += 32) {
+            int j = j0 + lane;
+            float dot = 0;
+            for (int d = 0; d < 32; d++) {
+                float v = __shfl_sync(0xffffffffu, q, d);
+                dot += v * (j < 81 ? keys[d][j] : 0);
+            }
+            if (j < 81 && query < 81) {
                 int rel = (query / 9 + 8 - j / 9) * 17 + query % 9 + 8 - j % 9;
                 scores[warp][j] = dot * .1767766952966369f + bias[rel * H + h];
             }
         }
-        if (!lane && query < 81) {
+        __syncwarp();
+        if (query < 81) {
             float top = -INFINITY;
-            for (int j = 0; j < 81; j++)
+            for (int j = lane; j < 81; j += 32)
                 top = fmaxf(top, scores[warp][j]);
-            double sum = 0;
-            for (int j = 0; j < 81; j++) {
+            for (int d = 16; d; d /= 2)
+                top = fmaxf(top, __shfl_down_sync(0xffffffffu, top, d));
+            top = __shfl_sync(0xffffffffu, top, 0);
+            for (int j = lane; j < 81; j += 32)
                 scores[warp][j] = expf(scores[warp][j] - top);
-                sum += scores[warp][j];
-            }
+            __syncwarp();
+            double sum = 0;
+            if (!lane)
+                for (int j = 0; j < 81; j++)
+                    sum += scores[warp][j];
+            float denominator = __shfl_sync(0xffffffffu, (float)sum, 0);
             int qi = (b * H + h) * 81 + query;
-            for (int j = 0; j < 81; j++) {
-                scores[warp][j] /= (float)sum;
+            for (int j = lane; j < 81; j += 32) {
+                scores[warp][j] /= denominator;
                 prob[qi * 81 + j] = scores[warp][j];
             }
         }
