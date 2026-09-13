@@ -105,6 +105,18 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_stage.c \
     -o glm53f_q2_stage
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_core_stage.c \
     -o glm53f_core_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_core_add_routers.c \
+    -lm -o glm53f_core_add_routers
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_int8.c \
+    -lm -o test_glm53f_int8
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_index_score.c \
+    -lm -o test_glm53f_index_score
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_sparse_math.c \
+    "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_math
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_sparse_cp.c \
+    "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_cp
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_quant_model_12n.c \
+    "${objects[@]}" "$build_dir/target.o" "${ldflags[@]}" -o test_glm53f_quant_model_12n
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_expert_decode_12n.c \
     "$build_dir/iq_bridge.o" "$build_dir/collective.o" \
     "${ldflags[@]}" -o glm53f_expert_decode_12n

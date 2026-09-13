@@ -55,6 +55,59 @@ static int mla_heads(float*out,const float*q,const float*z,const uint16_t*w,
     }
     return fail?-1:0;
 }
+/* Parallelize latent dimensions, not the token reduction. Each FP32 lane keeps
+ * exactly mla_one's j/t accumulation order; unlike token shards this introduces
+ * no changed summation tree. Packed selected rows are shared read-only. */
+static int mla_heads_exact_parallel(float *out, const float *q, const float *z,
+        const uint16_t *w, int nt, int nh, float *ql, float *log, float *va) {
+    const int tile = 64, tiles = LAT / tile, vl = (int)svcntw();
+#pragma omp parallel
+    {
+#pragma omp for collapse(2) schedule(static)
+        for (int h = 0; h < nh; ++h) for (int b = 0; b < tiles; ++b) {
+            const uint16_t *wh = w + (size_t)h * (KD + VD) * LAT;
+            float *qh = ql + (size_t)h * LAT;
+            memset(qh + b * tile, 0, tile * sizeof(float));
+            for (int j = 0; j < KD; ++j) {
+                float x = q[(size_t)h * KD + j] / sqrtf((float)KD);
+                for (int d = b * tile; d < (b + 1) * tile; d += vl) {
+                    svbool_t p = svwhilelt_b32(d, (b + 1) * tile);
+                    svuint32_t bits = svlsl_n_u32_x(p, svld1uh_u32(p, wh + (size_t)j * LAT + d), 16);
+                    svst1(p, qh + d, svmla_n_f32_x(p, svld1(p, qh + d), svreinterpret_f32_u32(bits), x));
+                }
+            }
+        }
+#pragma omp for collapse(2) schedule(static)
+        for (int h = 0; h < nh; ++h) for (int t = 0; t < nt; ++t)
+            log[(size_t)h * nt + t] = f32dot(ql + (size_t)h * LAT, z + (size_t)t * LAT, LAT);
+#pragma omp for schedule(static)
+        for (int h = 0; h < nh; ++h) {
+            float *lh = log + (size_t)h * nt, mx = -INFINITY, sum = 0;
+            for (int t = 0; t < nt; ++t) if (lh[t] > mx) mx = lh[t];
+            for (int t = 0; t < nt; ++t) { lh[t] = expf(lh[t] - mx); sum += lh[t]; }
+            for (int t = 0; t < nt; ++t) lh[t] /= sum;
+        }
+#pragma omp for collapse(2) schedule(static)
+        for (int h = 0; h < nh; ++h) for (int b = 0; b < tiles; ++b) {
+            float *vh = va + (size_t)h * LAT;
+            memset(vh + b * tile, 0, tile * sizeof(float));
+            for (int t = 0; t < nt; ++t) {
+                float x = log[(size_t)h * nt + t];
+                for (int d = b * tile; d < (b + 1) * tile; d += vl) {
+                    svbool_t p = svwhilelt_b32(d, (b + 1) * tile);
+                    svst1(p, vh + d, svmla_n_f32_x(p, svld1(p, vh + d), svld1(p, z + (size_t)t * LAT + d), x));
+                }
+            }
+        }
+#pragma omp for collapse(2) schedule(static)
+        for (int h = 0; h < nh; ++h) for (int j = 0; j < VD; ++j) {
+            const uint16_t *wv = w + (size_t)h * (KD + VD) * LAT + (size_t)KD * LAT;
+            out[(size_t)h * VD + j] = bf16dot(wv + (size_t)j * LAT, va + (size_t)h * LAT, LAT);
+        }
+    }
+    return 0;
+}
+
 static int mla_heads_sharded(float*out,const float*q,const float*z,const uint16_t*w,
         int nt,int nh,float*ql,float*log,float*part,float*va){enum{SHARDS=8};int vl=(int)svcntw();
 #pragma omp parallel

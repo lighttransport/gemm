@@ -13,6 +13,7 @@
 #include <mpi.h>
 #include <omp.h>
 #include "glm53f_expert_kern.h"
+#include "glm53f_int8.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -81,7 +82,29 @@ struct glm53f_kda_context_12n {
     float *conv,*state,*partial,*batch_partial;
     float *bq,*bk,*bv,*bsmall_f,*bsmall_g,*bgate_f,*bgate_g,*bbeta,*bnormed;
     double phase[3], detail[5];
+    int8_t *int8_weight[4];
+    float *int8_scale[4];
+    int int8_enabled;
 };
+
+int glm53f_kda_convert_int8_12n(glm53f_kda_context_12n *c) {
+    if (!c || c->int8_enabled) return -1;
+    uint16_t **source[4] = {&c->w.q, &c->w.k, &c->w.v, &c->w.op};
+    for (int m = 0; m < 4; ++m) {
+        int rows = m == 3 ? H : c->qd, cols = m == 3 ? c->qd : H, failed = 0;
+        c->int8_weight[m] = a256((size_t)rows * cols);
+        c->int8_scale[m] = a256((size_t)rows * sizeof(float));
+#pragma omp parallel for schedule(static) reduction(|:failed)
+        for (int r = 0; r < rows; r += 64)
+            failed |= glm53f_i8_pack_bf16_tile(c->int8_weight[m] + (size_t)r * cols,
+                c->int8_scale[m] + r, *source[m] + (size_t)r * cols, cols) != 0;
+        if (failed) return -1;
+        free(*source[m]);
+        *source[m] = NULL;
+    }
+    c->int8_enabled = 1;
+    return 0;
+}
 
 glm53f_kda_context_12n *glm53f_kda_create_12n(const char *model,int layer){int rank,nr,h0,hn,qd;char n[256];glm53f_st_context*st;glm53f_kda_context_12n*c;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12)return NULL;glm53f_balanced_slice(NH,rank,nr,&h0,&hn);qd=hn*D;st=glm53f_st_open(model);if(!st)return NULL;c=calloc(1,sizeof(*c));if(!c)MPI_Abort(MPI_COMM_WORLD,2);c->rank=rank;c->h0=h0;c->hn=hn;c->qd=qd;c->detail_profile=getenv("GLM53F_KDA_DETAIL")!=NULL;
 #define PART(F,S,T,OFF,N) do{name(n,layer,S);c->w.F=(T*)a256((size_t)(N)*sizeof(T));read_part(st,n,(size_t)(OFF)*sizeof(T),c->w.F,(size_t)(N)*sizeof(T),rank);}while(0)
@@ -93,11 +116,20 @@ void glm53f_kda_reset_12n(glm53f_kda_context_12n*c){if(!c)return;memset(c->conv,
 static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     weights*w=&c->w;int qd=c->qd,hn=c->hn;double td=c->detail_profile?MPI_Wtime():0;
     double t0=MPI_Wtime();float*q=c->qkv,*k=q+qd,*v=k+qd;
+    int8_t quant_x[H], quant_o[QKV]; float scale_x = 0, scale_o = 0;
+    if (c->int8_enabled && glm53f_i8_quantize_x(quant_x, &scale_x, x, H)) return -1;
 #pragma omp parallel shared(td)
     {
         /* detail_profile is uniform across this team. Keep timing singles
          * inside the condition so disabled instrumentation adds no barriers. */
-        mv3_team(q,k,v,w->q,w->k,w->v,x,qd,H);
+        if (c->int8_enabled) {
+#pragma omp for collapse(2) schedule(static)
+            for (int m = 0; m < 3; ++m)
+                for (int r = 0; r < qd; r += 64)
+                    glm53f_i8_dot64(c->qkv + m * qd + r,
+                        c->int8_weight[m] + (size_t)r * H,
+                        c->int8_scale[m] + r, quant_x, scale_x, H);
+        } else mv3_team(q,k,v,w->q,w->k,w->v,x,qd,H);
         if(c->detail_profile){
 #pragma omp single
             {double t=MPI_Wtime();c->detail[0]=t-td;td=t;}
@@ -132,8 +164,16 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
         }
     }
     double t1=MPI_Wtime();
+    if (c->int8_enabled) {
+        if (glm53f_i8_quantize_x(quant_o, &scale_o, c->normed, qd)) return -1;
+#pragma omp parallel for schedule(static)
+        for (int r = 0; r < H; r += 64)
+            glm53f_i8_dot64(out + r, c->int8_weight[3] + (size_t)r * qd,
+                c->int8_scale[3] + r, quant_o, scale_o, qd);
+    } else {
 #pragma omp parallel for schedule(static)
     for(int r=0;r<H;r++)out[r]=dot1(w->op+(size_t)r*qd,c->normed,qd);
+    }
     double t2=MPI_Wtime();c->phase[0]=t1-t0;c->phase[1]=t2-t1;c->phase[2]=0;return 0;
 }
 int glm53f_kda_sublayer_12n(void*context,float*out,const float*x){glm53f_kda_context_12n*c=context;if(!c||kda_local(c,c->partial,x))return-1;double t=MPI_Wtime();int rc=glm53f_sum_allreduce_12n(c->partial,out,H);c->phase[2]=MPI_Wtime()-t;return rc;}
@@ -161,6 +201,14 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
     size_t bytes = glm53f_kda_state_bytes_12n(c);
     if (!c || !out || !x || tokens < 1 || tokens > 5 || (states && stride < bytes))
         return -1;
+    if (c->int8_enabled) {
+        for (int t = 0; t < tokens; ++t) {
+            if (glm53f_kda_sublayer_12n(c, out + (size_t)t * H, x + (size_t)t * H)) return -1;
+            if (states && glm53f_kda_save_state_12n(c,
+                (unsigned char *)states + (size_t)t * stride, stride)) return -1;
+        }
+        return 0;
+    }
     if (!getenv("GLM53F_KDA_BATCH_TEAM") ||
         !atoi(getenv("GLM53F_KDA_BATCH_TEAM")) || tokens == 1)
         return kda_batch_legacy(c, out, x, tokens, states, stride);
@@ -237,7 +285,7 @@ void glm53f_kda_last_detail_12n(const glm53f_kda_context_12n*c,double p[5]){memc
 size_t glm53f_kda_state_bytes_12n(const glm53f_kda_context_12n*c){return c?((size_t)c->hn*D*D+(size_t)3*c->qd*KERNEL)*sizeof(float):0;}
 int glm53f_kda_save_state_12n(const glm53f_kda_context_12n*c,void*dst,size_t bytes){size_t sb=c?(size_t)c->hn*D*D*sizeof(float):0,need=glm53f_kda_state_bytes_12n(c);if(!c||!dst||bytes<need)return-1;memcpy(dst,c->state,sb);memcpy((unsigned char*)dst+sb,c->conv,need-sb);return 0;}
 int glm53f_kda_restore_state_12n(glm53f_kda_context_12n*c,const void*src,size_t bytes){size_t sb=c?(size_t)c->hn*D*D*sizeof(float):0,need=glm53f_kda_state_bytes_12n(c);if(!c||!src||bytes<need)return-1;memcpy(c->state,src,sb);memcpy(c->conv,(const unsigned char*)src+sb,need-sb);return 0;}
-void glm53f_kda_free_12n(glm53f_kda_context_12n*c){if(!c)return;free(c->bnormed);free(c->bbeta);free(c->bgate_g);free(c->bgate_f);free(c->bsmall_g);free(c->bsmall_f);free(c->bv);free(c->bk);free(c->bq);free(c->batch_partial);free(c->partial);free(c->state);free(c->conv);free(c->work);free(c->normed);free(c->core);free(c->beta);free(c->decay);free(c->gate);free(c->small);free(c->qkv);free(c->w.op);free(c->w.on);free(c->w.ga);free(c->w.fa);free(c->w.gb);free(c->w.b);free(c->w.fb);free(c->w.vc);free(c->w.kc);free(c->w.qc);free(c->w.v);free(c->w.k);free(c->w.q);free(c->w.dt);free(c->w.al);free(c);}
+void glm53f_kda_free_12n(glm53f_kda_context_12n*c){if(!c)return;for(int m=0;m<4;m++){free(c->int8_weight[m]);free(c->int8_scale[m]);}free(c->bnormed);free(c->bbeta);free(c->bgate_g);free(c->bgate_f);free(c->bsmall_g);free(c->bsmall_f);free(c->bv);free(c->bk);free(c->bq);free(c->batch_partial);free(c->partial);free(c->state);free(c->conv);free(c->work);free(c->normed);free(c->core);free(c->beta);free(c->decay);free(c->gate);free(c->small);free(c->qkv);free(c->w.op);free(c->w.on);free(c->w.ga);free(c->w.fa);free(c->w.gb);free(c->w.b);free(c->w.fb);free(c->w.vc);free(c->w.kc);free(c->w.qc);free(c->w.v);free(c->w.k);free(c->w.q);free(c->w.dt);free(c->w.al);free(c);}
 
 #ifndef GLM53F_KDA_NO_MAIN
 int main(int argc,char**argv){

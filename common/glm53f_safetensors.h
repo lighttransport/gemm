@@ -127,8 +127,13 @@ static int glm53f_st_repack_read(const char *kind, const char *name,
     }
     for (int i = 0; i < nentries; ++i) {
         glm53f_st_repack_entry *e = &entries[i];
-        if (e->kind == kind[0] && e->a == a && e->b == b && e->c == c && !strcmp(e->name, name))
-            return pread(fd, dst, nbytes, (off_t)e->blob_offset) == (ssize_t)nbytes ? 0 : -1;
+        if (e->kind == kind[0] && e->a == a && e->b == b && e->c == c && !strcmp(e->name, name)) {
+            ssize_t got = pread(fd, dst, nbytes, (off_t)e->blob_offset);
+            /* dst owns the resident copy. Do not retain a second core image
+             * in the node's page cache while loading the much larger MoE. */
+            if (got > 0) (void)posix_fadvise(fd, (off_t)e->blob_offset, got, POSIX_FADV_DONTNEED);
+            return got == (ssize_t)nbytes ? 0 : -1;
+        }
     }
     if (strict) fprintf(stderr, "GLM53F_REPACK_MISS kind=%s name=%s a=%zu b=%zu c=%zu\n",
                         kind, name, a, b, c);

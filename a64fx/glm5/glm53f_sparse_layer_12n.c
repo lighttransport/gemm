@@ -4,6 +4,9 @@
 #undef main
 #include "glm53f_sparse_12n.h"
 #include "glm53f_collective_12n.h"
+#include "glm53f_index_score.h"
+#include "glm53f_cache_bf16.h"
+#define GLM53F_CP_BF16_LATENT 1
 #include <limits.h>
 
 enum { QA=1536,IH=32,ID=128,KPOOL=4,TOPK=2048 };
@@ -45,14 +48,14 @@ static int select_cached(const float*pool,int*selected,const float*q,const float
 typedef struct{float score;int id;} cp_candidate;
 
 struct glm53f_sparse_context_12n {
-    int rank,ranks,h0,hn,qd,capacity,length,cp,local_capacity,pool_capacity;
+    int rank,ranks,h0,hn,qd,capacity,length,cp,local_capacity,pool_capacity,latent_bf16;
     uint8_t *qa,*qb,*kva,*op;
     float *qas,*qbs,*kvas,*ops;
     uint16_t *qan,*kvan,*kvb,*wk,*knw,*knb,*gatew,*ape,*wqb,*wp;
     float *qres,*query,*latent,*key,*gcache,*iq,*iw,*pool,*attn,*partial,*apef,*packed;
     float *pool_score_local,*pool_score_global;
     float *mla_ql,*mla_log,*mla_part,*mla_va;
-    float *cp_latent,*cp_key,*cp_gate,*cp_pool,*cp_pack,*cp_exchange;
+    float *cp_latent,*cp_key,*cp_gate,*cp_pool,*cp_pack,*cp_exchange,*cp_gather;
     float *cp_cur_latent,*cp_cur_key,*cp_cur_gate;
     int *cp_pack_index;
     cp_candidate *cp_candidate_local,*cp_candidate_gather;
@@ -61,16 +64,57 @@ struct glm53f_sparse_context_12n {
     float *batch_attn, *batch_partial;
 };
 
-glm53f_sparse_context_12n*glm53f_sparse_create_12n(const char*model,int layer,int capacity){int rank,nr,h0,hn,qd;char n[256];glm53f_st_context*st;glm53f_sparse_context_12n*c;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12||capacity<1)return NULL;glm53f_balanced_slice(NH,rank,nr,&h0,&hn);qd=hn*KD;st=glm53f_st_open(model);if(!st)return NULL;c=calloc(1,sizeof(*c));if(!c)MPI_Abort(MPI_COMM_WORLD,2);c->rank=rank;c->ranks=nr;c->h0=h0;c->hn=hn;c->qd=qd;c->capacity=capacity;c->cp=getenv("GLM53F_SPARSE_CP")?atoi(getenv("GLM53F_SPARSE_CP"))!=0:capacity>=65536;c->local_capacity=(capacity+nr-1)/nr;c->pool_capacity=(capacity/KPOOL+nr-1)/nr;
+glm53f_sparse_context_12n*glm53f_sparse_create_format_12n(const char*model,int layer,int capacity,int latent_bf16){int rank,nr,h0,hn,qd;char n[256];glm53f_st_context*st;glm53f_sparse_context_12n*c;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12||capacity<1)return NULL;glm53f_balanced_slice(NH,rank,nr,&h0,&hn);qd=hn*KD;st=glm53f_st_open(model);if(!st)return NULL;c=calloc(1,sizeof(*c));if(!c)MPI_Abort(MPI_COMM_WORLD,2);c->rank=rank;c->ranks=nr;c->h0=h0;c->hn=hn;c->qd=qd;c->capacity=capacity;c->cp=getenv("GLM53F_SPARSE_CP")?atoi(getenv("GLM53F_SPARSE_CP"))!=0:capacity>=65536;c->latent_bf16=latent_bf16!=0;if(c->latent_bf16)c->cp=1;c->local_capacity=(capacity+nr-1)/nr;c->pool_capacity=(capacity/KPOOL+nr-1)/nr;
 #define N(S) snprintf(n,sizeof n,"model.language_model.layers.%d.self_attn.%s",layer,S)
     N("q_a_proj.weight");c->qa=tensor(st,n,rank);N("q_a_proj.weight_scale_inv");c->qas=tensor(st,n,rank);N("q_a_layernorm.weight");c->qan=tensor(st,n,rank);N("q_b_proj.weight");c->qb=a256((size_t)qd*QA);readp(st,n,(size_t)h0*KD*QA,c->qb,(size_t)qd*QA,rank);N("q_b_proj.weight_scale_inv");{int nb=QA/128,tiles=qd/128;c->qbs=a256((size_t)tiles*nb*4);readp(st,n,(size_t)(h0*KD/128)*nb*4,c->qbs,(size_t)tiles*nb*4,rank);}N("kv_a_proj_with_mqa.weight");c->kva=tensor(st,n,rank);N("kv_a_proj_with_mqa.weight_scale_inv");c->kvas=tensor(st,n,rank);N("kv_a_layernorm.weight");c->kvan=tensor(st,n,rank);N("kv_b_proj.weight");c->kvb=a256((size_t)hn*(KD+VD)*LAT*2);readp(st,n,(size_t)h0*(KD+VD)*LAT*2,c->kvb,(size_t)hn*(KD+VD)*LAT*2,rank);{int oc0=h0*VD,ocn=hn*VD,ob=QKV/128,ob0=oc0/128,obn=ocn/128;N("o_proj.weight");c->op=a256((size_t)H*ocn);if(glm53f_st_read_columns(st,n,QKV,oc0,ocn,c->op))MPI_Abort(MPI_COMM_WORLD,2);N("o_proj.weight_scale_inv");c->ops=a256((size_t)(H/128)*obn*sizeof(float));if(glm53f_st_read_columns(st,n,(size_t)ob*sizeof(float),(size_t)ob0*sizeof(float),(size_t)obn*sizeof(float),c->ops))MPI_Abort(MPI_COMM_WORLD,2);}N("indexer.wk.weight");c->wk=tensor(st,n,rank);N("indexer.k_norm.weight");c->knw=tensor(st,n,rank);N("indexer.k_norm.bias");c->knb=tensor(st,n,rank);N("indexer.index_kpool_compress_gate");c->gatew=tensor(st,n,rank);N("indexer.index_kpool_compress_ape");c->ape=tensor(st,n,rank);N("indexer.wq_b.weight");c->wqb=tensor(st,n,rank);N("indexer.weights_proj.weight");c->wp=tensor(st,n,rank);
 #undef N
-    glm53f_st_close(st);c->qres=a256(QA*4);c->query=a256((size_t)qd*4);if(c->cp){c->cp_latent=a256((size_t)c->local_capacity*LAT*4);c->cp_key=a256((size_t)c->local_capacity*ID*4);c->cp_gate=a256((size_t)c->local_capacity*ID*4);c->cp_pool=a256((size_t)(c->pool_capacity+1)*ID*4);c->cp_pack=a256((size_t)(TOPK+KPOOL)*LAT*4);c->cp_exchange=a256((size_t)2*KPOOL*ID*4);c->cp_cur_latent=a256(LAT*4);c->cp_cur_key=a256(ID*4);c->cp_cur_gate=a256(ID*4);c->cp_pack_index=a256((size_t)(TOPK+KPOOL)*sizeof(int));int nc=c->pool_capacity+1>TOPK/KPOOL?c->pool_capacity+1:TOPK/KPOOL;c->cp_candidate_local=a256((size_t)nc*sizeof(cp_candidate));c->cp_candidate_gather=a256((size_t)nr*(TOPK/KPOOL)*sizeof(cp_candidate));}else{c->latent=a256((size_t)capacity*LAT*4);c->key=a256((size_t)capacity*ID*4);c->gcache=a256((size_t)capacity*ID*4);c->pool=a256((size_t)(capacity/KPOOL+1)*ID*4);c->pool_score_cache=a256((size_t)(capacity/KPOOL+1)*sizeof(pool_score));c->pool_score_local=a256((size_t)(capacity/KPOOL+1)*sizeof(float));c->pool_score_global=a256((size_t)(capacity/KPOOL+1)*sizeof(float));c->packed=a256((size_t)(TOPK+KPOOL)*LAT*4);c->packed_index=a256((size_t)(TOPK+KPOOL)*sizeof(int));for(int i=0;i<TOPK+KPOOL;i++)c->packed_index[i]=i;}c->iq=a256((size_t)IH*ID*4);c->iw=a256(IH*4);c->attn=a256((size_t)hn*VD*4);c->partial=a256(H*4);c->selected=a256((size_t)(TOPK+KPOOL)*sizeof(int));c->apef=a256(KPOOL*ID*4);for(int i=0;i<KPOOL*ID;i++)c->apef[i]=glm53f_bf16_to_f32(c->ape[i]);if(getenv("GLM53F_TOUCH_CACHE")){if(c->cp){memset(c->cp_latent,0,(size_t)c->local_capacity*LAT*4);memset(c->cp_key,0,(size_t)c->local_capacity*ID*4);memset(c->cp_gate,0,(size_t)c->local_capacity*ID*4);memset(c->cp_pool,0,(size_t)(c->pool_capacity+1)*ID*4);}else{memset(c->latent,0,(size_t)capacity*LAT*4);memset(c->key,0,(size_t)capacity*ID*4);memset(c->gcache,0,(size_t)capacity*ID*4);memset(c->pool,0,(size_t)(capacity/KPOOL+1)*ID*4);}}return c;}
+    glm53f_st_close(st);c->qres=a256(QA*4);c->query=a256((size_t)qd*4);if(c->cp){c->cp_latent=a256((size_t)c->local_capacity*LAT*(c->latent_bf16?2:4));c->cp_key=a256((size_t)c->local_capacity*ID*4);c->cp_gate=a256((size_t)c->local_capacity*ID*4);c->cp_pool=a256((size_t)(c->pool_capacity+1)*ID*4);c->cp_pack=a256((size_t)(TOPK+KPOOL)*LAT*4);c->cp_exchange=a256((size_t)2*KPOOL*ID*4);c->cp_cur_latent=a256(LAT*4);c->cp_cur_key=a256(ID*4);c->cp_cur_gate=a256(ID*4);c->cp_pack_index=a256((size_t)(TOPK+KPOOL)*sizeof(int));int nc=c->pool_capacity+1>TOPK/KPOOL?c->pool_capacity+1:TOPK/KPOOL;c->cp_candidate_local=a256((size_t)nc*sizeof(cp_candidate));c->cp_candidate_gather=a256((size_t)nr*(TOPK/KPOOL)*sizeof(cp_candidate));}else{c->latent=a256((size_t)capacity*LAT*4);c->key=a256((size_t)capacity*ID*4);c->gcache=a256((size_t)capacity*ID*4);c->pool=a256((size_t)(capacity/KPOOL+1)*ID*4);c->pool_score_cache=a256((size_t)(capacity/KPOOL+1)*sizeof(pool_score));c->pool_score_local=a256((size_t)(capacity/KPOOL+1)*sizeof(float));c->pool_score_global=a256((size_t)(capacity/KPOOL+1)*sizeof(float));c->packed=a256((size_t)(TOPK+KPOOL)*LAT*4);c->packed_index=a256((size_t)(TOPK+KPOOL)*sizeof(int));for(int i=0;i<TOPK+KPOOL;i++)c->packed_index[i]=i;}c->iq=a256((size_t)IH*ID*4);c->iw=a256(IH*4);c->attn=a256((size_t)hn*VD*4);c->partial=a256(H*4);c->selected=a256((size_t)(TOPK+KPOOL)*sizeof(int));c->apef=a256(KPOOL*ID*4);for(int i=0;i<KPOOL*ID;i++)c->apef[i]=glm53f_bf16_to_f32(c->ape[i]);if(getenv("GLM53F_TOUCH_CACHE")){if(c->cp){memset(c->cp_latent,0,(size_t)c->local_capacity*LAT*(c->latent_bf16?2:4));memset(c->cp_key,0,(size_t)c->local_capacity*ID*4);memset(c->cp_gate,0,(size_t)c->local_capacity*ID*4);memset(c->cp_pool,0,(size_t)(c->pool_capacity+1)*ID*4);}else{memset(c->latent,0,(size_t)capacity*LAT*4);memset(c->key,0,(size_t)capacity*ID*4);memset(c->gcache,0,(size_t)capacity*ID*4);memset(c->pool,0,(size_t)(capacity/KPOOL+1)*ID*4);}}return c;}
+glm53f_sparse_context_12n *glm53f_sparse_create_12n(const char *model, int layer, int capacity) {
+    return glm53f_sparse_create_format_12n(model, layer, capacity, 0);
+}
+static void cp_store_latent(glm53f_sparse_context_12n *c, int slot, const float *source) {
+    if (c->latent_bf16) {
+        uint16_t *out = (uint16_t *)c->cp_latent + (size_t)slot * LAT;
+        for (int d = 0; d < LAT; ++d) out[d] = glm53f_cache_bf16_round(source[d]);
+    } else memcpy(c->cp_latent + (size_t)slot * LAT, source, LAT * sizeof(float));
+}
+static void cp_read_latent(float *out, const glm53f_sparse_context_12n *c, int slot) {
+    if (c->latent_bf16) {
+        const uint16_t *in = (const uint16_t *)c->cp_latent + (size_t)slot * LAT;
+        for (int d = 0; d < LAT; d += (int)svcntw()) {
+            svbool_t p = svwhilelt_b32(d, LAT);
+            svst1(p, out + d, svreinterpret_f32_u32(svlsl_n_u32_x(p, svld1uh_u32(p, in + d), 16)));
+        }
+    } else memcpy(out, c->cp_latent + (size_t)slot * LAT, LAT * sizeof(float));
+}
+int glm53f_sparse_touch_cache_12n(glm53f_sparse_context_12n *c) {
+    if (!c || c->length) return -1;
+    if (c->cp) {
+        memset(c->cp_latent, 0, (size_t)c->local_capacity * LAT * (c->latent_bf16 ? 2 : 4));
+        memset(c->cp_key, 0, (size_t)c->local_capacity * ID * 4);
+        memset(c->cp_gate, 0, (size_t)c->local_capacity * ID * 4);
+        memset(c->cp_pool, 0, (size_t)(c->pool_capacity + 1) * ID * 4);
+    } else {
+        memset(c->latent, 0, (size_t)c->capacity * LAT * 4);
+        memset(c->key, 0, (size_t)c->capacity * ID * 4);
+        memset(c->gcache, 0, (size_t)c->capacity * ID * 4);
+        memset(c->pool, 0, (size_t)(c->capacity / KPOOL + 1) * ID * 4);
+    }
+    return 0;
+}
 void glm53f_sparse_reset_12n(glm53f_sparse_context_12n*c){if(c)c->length=0;}
 int glm53f_sparse_length_12n(const glm53f_sparse_context_12n*c){return c?c->length:-1;}
 int glm53f_sparse_restore_length_12n(glm53f_sparse_context_12n*c,int length){if(!c||length<0||length>c->length)return-1;c->length=length;return 0;}
 int glm53f_sparse_is_context_parallel_12n(const glm53f_sparse_context_12n*c){return c?c->cp:0;}
-size_t glm53f_sparse_cache_bytes_12n(const glm53f_sparse_context_12n*c){if(!c)return 0;if(c->cp)return((size_t)c->local_capacity*(LAT+2*ID)+(size_t)(c->pool_capacity+1)*ID+(size_t)(TOPK+KPOOL)*LAT+(size_t)2*KPOOL*ID)*4;return((size_t)c->capacity*(LAT+2*ID)+(size_t)(c->capacity/KPOOL+1)*ID)*4;}
+size_t glm53f_sparse_cache_bytes_12n(const glm53f_sparse_context_12n *c) {
+    if (!c) return 0;
+    if (!c->cp) return ((size_t)c->capacity * (LAT + 2 * ID) + (size_t)(c->capacity / KPOOL + 1) * ID) * 4;
+    size_t n = (size_t)c->local_capacity * LAT * (c->latent_bf16 ? 2 : 4);
+    n += ((size_t)c->local_capacity * 2 * ID + (size_t)(c->pool_capacity + 1) * ID + (size_t)(TOPK + KPOOL) * LAT + 2 * KPOOL * ID) * 4;
+    if (c->cp_gather) n += (size_t)(TOPK + KPOOL) * LAT * 4;
+    if (c->mla_ql) n += (size_t)c->hn * (2 * LAT + TOPK + KPOOL) * 4;
+    return n;
+}
 static void update_completed_pool(glm53f_sparse_context_12n*c,int pool){float*pk=c->pool+(size_t)pool*ID;for(int d=0;d<ID;d++){float mx=-INFINITY,den=0,val=0;for(int z=0;z<KPOOL;z++){float a=c->gcache[(size_t)(pool*KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d];if(a>mx)mx=a;}for(int z=0;z<KPOOL;z++){float a=expf(c->gcache[(size_t)(pool*KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d]-mx);den+=a;val+=a*c->key[(size_t)(pool*KPOOL+z)*ID+d];}pk[d]=val/den;}}
 static int select_incremental(glm53f_sparse_context_12n*c,int tokens){int np=tokens/KPOOL,nc=TOPK/KPOOL,out=0;if(nc>np)nc=np;
     if(tokens<=TOPK+KPOOL-1){
@@ -89,8 +133,79 @@ static int sparse_attention_local_replicated(glm53f_sparse_context_12n*c,float*a
         for(int i=0;i<ns;i++)memcpy(c->packed+(size_t)i*LAT,c->latent+(size_t)c->selected[i]*LAT,LAT*4);ensure_mla_shards(c);if(mla_heads_sharded(attn,c->query,c->packed,c->kvb,ns,c->hn,c->mla_ql,c->mla_log,c->mla_part,c->mla_va))return-1;}else{if(mla_heads(attn,c->query,c->latent,c->kvb,c->selected,ns,c->hn))return-1;}c->length++;return 0;}
 
 static int cp_candidate_cmp(const void*a,const void*b){const cp_candidate*x=a,*y=b;if(x->score>y->score)return-1;if(x->score<y->score)return 1;return x->id<y->id?-1:x->id>y->id;}
+static void cp_heap_down(cp_candidate *h, int n, int p) {
+    for (;;) {
+        int worst = p, left = 2 * p + 1, right = left + 1;
+        if (left < n && cp_candidate_cmp(h + left, h + worst) > 0) worst = left;
+        if (right < n && cp_candidate_cmp(h + right, h + worst) > 0) worst = right;
+        if (worst == p) return;
+        cp_candidate tmp = h[p]; h[p] = h[worst]; h[worst] = tmp; p = worst;
+    }
+}
+/* Same total ordering as qsort, including ties. Only the best k are consumed. */
+static void cp_top_exact(cp_candidate *v, int n, int k) {
+    if (k > n) k = n;
+    if (!k) return;
+    for (int p = k / 2; p-- > 0;) cp_heap_down(v, k, p);
+    for (int p = k; p < n; ++p) if (cp_candidate_cmp(v + p, v) < 0) {
+        v[0] = v[p]; cp_heap_down(v, k, 0);
+    }
+    qsort(v, k, sizeof(*v), cp_candidate_cmp);
+}
+static int cp_mla(glm53f_sparse_context_12n *c, float *attn, int ns) {
+    if (ns < 512 || getenv("GLM53F_CP_MLA_REFERENCE"))
+        return mla_heads(attn, c->query, c->cp_pack, c->kvb, c->cp_pack_index, ns, c->hn);
+    if (!c->mla_ql) {
+        c->packed = a256((size_t)c->hn * (2 * LAT + TOPK + KPOOL) * sizeof(float));
+        c->mla_ql = c->packed;
+        c->mla_log = c->mla_ql + (size_t)c->hn * LAT;
+        c->mla_va = c->mla_log + (size_t)c->hn * (TOPK + KPOOL);
+    }
+    return mla_heads_exact_parallel(attn, c->query, c->cp_pack, c->kvb,
+        ns, c->hn, c->mla_ql, c->mla_log, c->mla_va);
+}
+static int cp_exchange_selected(glm53f_sparse_context_12n *c, int ns) {
+    if (getenv("GLM53F_CP_EXCHANGE_REFERENCE")) {
+        memset(c->cp_pack, 0, (size_t)ns * LAT * sizeof(float));
+        for (int i = 0; i < ns; ++i) {
+            int p = c->selected[i];
+            if (p % c->ranks == c->rank)
+                cp_read_latent(c->cp_pack + (size_t)i * LAT, c, p / c->ranks);
+            c->cp_pack_index[i] = i;
+        }
+        return MPI_Allreduce(MPI_IN_PLACE, c->cp_pack, ns * LAT, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS ? 0 : -1;
+    }
+    /* Each selected latent has exactly one owner. Gather only owned rows,
+     * instead of reducing a mostly-zero 4 MiB vector from every rank. */
+    int counts[12] = {0}, offsets[12], cursor[12], local_rows = 0;
+    if (!c->cp_gather) c->cp_gather = a256((size_t)(TOPK + KPOOL) * LAT * sizeof(float));
+    for (int i = 0; i < ns; ++i) counts[c->selected[i] % c->ranks] += LAT;
+    int total = 0;
+    for (int r = 0; r < c->ranks; ++r) { cursor[r] = offsets[r] = total; total += counts[r]; }
+    for (int i = 0; i < ns; ++i) {
+        int p = c->selected[i], owner = p % c->ranks;
+        c->cp_pack_index[i] = cursor[owner]; cursor[owner] += LAT;
+        if (owner == c->rank)
+            cp_read_latent(c->cp_pack + (size_t)local_rows++ * LAT, c, p / c->ranks);
+    }
+    if (MPI_Allgatherv(c->cp_pack, counts[c->rank], MPI_FLOAT, c->cp_gather,
+            counts, offsets, MPI_FLOAT, MPI_COMM_WORLD) != MPI_SUCCESS) return -1;
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < ns; ++i) {
+        const float *source = c->cp_gather + c->cp_pack_index[i];
+        float *destination = c->cp_pack + (size_t)i * LAT;
+        /* MPI_SUM against other ranks' +0 canonicalized -0 in the reference. */
+        for (int d = 0; d < LAT; ++d) destination[d] = source[d] == 0 ? 0.0f : source[d];
+        c->cp_pack_index[i] = i;
+    }
+    return 0;
+}
 static float cp_pool_score(const float*q,const float*hw,const float*pk){float score=0;for(int h=0;h<IH;h++){double dot=0;for(int d=0;d<ID;d++)dot+=(double)q[(size_t)h*ID+d]*pk[d];if(dot>0)score+=hw[h]*(float)(dot/sqrt((double)ID))/sqrtf((float)IH);}return score;}
-static int sparse_attention_local_cp(glm53f_sparse_context_12n*c,float*attn,const float*x){if(c->length>=c->capacity)return-1;int pos=c->length,tokens=pos+1,owner=pos%c->ranks,slot=pos/c->ranks;mv_f8(c->qres,c->qa,c->qas,x,QA,H);glm53f_rmsnorm_bf16(c->qres,c->qres,c->qan,QA,1e-5f);mv_f8(c->query,c->qb,c->qbs,c->qres,c->qd,QA);mv_f8(c->cp_cur_latent,c->kva,c->kvas,x,LAT,H);glm53f_rmsnorm_bf16(c->cp_cur_latent,c->cp_cur_latent,c->kvan,LAT,1e-5f);float raw[ID];mv_b16(raw,c->wk,x,ID,H);glm53f_layernorm_bf16(c->cp_cur_key,raw,c->knw,c->knb,ID,1e-5f);mv_b16(c->cp_cur_gate,c->gatew,x,ID,H);if(owner==c->rank){memcpy(c->cp_latent+(size_t)slot*LAT,c->cp_cur_latent,LAT*4);memcpy(c->cp_key+(size_t)slot*ID,c->cp_cur_key,ID*4);memcpy(c->cp_gate+(size_t)slot*ID,c->cp_cur_gate,ID*4);}mv_b16(c->iq,c->wqb,c->qres,IH*ID,QA);mv_b16(c->iw,c->wp,x,IH,H);int pools=tokens/KPOOL;if(tokens%KPOOL==0){int pool=pools-1,powner=pool%c->ranks;memset(c->cp_exchange,0,(size_t)2*KPOOL*ID*4);for(int z=0;z<KPOOL;z++){int p=pool*KPOOL+z;if(p%c->ranks==c->rank){int s=p/c->ranks;memcpy(c->cp_exchange+(size_t)z*ID,c->cp_key+(size_t)s*ID,ID*4);memcpy(c->cp_exchange+(size_t)(KPOOL+z)*ID,c->cp_gate+(size_t)s*ID,ID*4);}}if(MPI_Allreduce(MPI_IN_PLACE,c->cp_exchange,2*KPOOL*ID,MPI_FLOAT,MPI_SUM,MPI_COMM_WORLD)!=MPI_SUCCESS)return-1;if(powner==c->rank){float*pk=c->cp_pool+(size_t)(pool/c->ranks)*ID;for(int d=0;d<ID;d++){float mx=-INFINITY,den=0,val=0;for(int z=0;z<KPOOL;z++){float a=c->cp_exchange[(size_t)(KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d];if(a>mx)mx=a;}for(int z=0;z<KPOOL;z++){float a=expf(c->cp_exchange[(size_t)(KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d]-mx);den+=a;val+=a*c->cp_exchange[(size_t)z*ID+d];}pk[d]=val/den;}}}int choose=TOPK/KPOOL;if(choose>pools)choose=pools;int local_pools=(pools+c->ranks-1-c->rank)/c->ranks;cp_candidate*local=c->cp_candidate_local,*gather=c->cp_candidate_gather;for(int i=0;i<local_pools;i++){int p=c->rank+i*c->ranks;local[i]=(cp_candidate){cp_pool_score(c->iq,c->iw,c->cp_pool+(size_t)i*ID),p};}qsort(local,local_pools,sizeof(*local),cp_candidate_cmp);for(int i=local_pools;i<choose;i++)local[i]=(cp_candidate){-INFINITY,INT_MAX};if(choose&&MPI_Allgather(local,choose*(int)sizeof(*local),MPI_BYTE,gather,choose*(int)sizeof(*local),MPI_BYTE,MPI_COMM_WORLD)!=MPI_SUCCESS)return-1;if(choose)qsort(gather,(size_t)c->ranks*choose,sizeof(*gather),cp_candidate_cmp);int ns=0;for(int i=0;i<choose;i++)for(int z=0;z<KPOOL;z++)c->selected[ns++]=gather[i].id*KPOOL+z;for(int p=pools*KPOOL;p<tokens;p++)c->selected[ns++]=p;if(ns<1)return-1;memset(c->cp_pack,0,(size_t)ns*LAT*4);for(int i=0;i<ns;i++){int p=c->selected[i];if(p%c->ranks==c->rank)memcpy(c->cp_pack+(size_t)i*LAT,c->cp_latent+(size_t)(p/c->ranks)*LAT,LAT*4);c->cp_pack_index[i]=i;}if(MPI_Allreduce(MPI_IN_PLACE,c->cp_pack,ns*LAT,MPI_FLOAT,MPI_SUM,MPI_COMM_WORLD)!=MPI_SUCCESS||mla_heads(attn,c->query,c->cp_pack,c->kvb,c->cp_pack_index,ns,c->hn))return-1;c->length++;return 0;}
+static int sparse_attention_local_cp(glm53f_sparse_context_12n*c,float*attn,const float*x){if(c->length>=c->capacity)return-1;int pos=c->length,tokens=pos+1,owner=pos%c->ranks,slot=pos/c->ranks;mv_f8(c->qres,c->qa,c->qas,x,QA,H);glm53f_rmsnorm_bf16(c->qres,c->qres,c->qan,QA,1e-5f);mv_f8(c->query,c->qb,c->qbs,c->qres,c->qd,QA);mv_f8(c->cp_cur_latent,c->kva,c->kvas,x,LAT,H);glm53f_rmsnorm_bf16(c->cp_cur_latent,c->cp_cur_latent,c->kvan,LAT,1e-5f);float raw[ID];mv_b16(raw,c->wk,x,ID,H);glm53f_layernorm_bf16(c->cp_cur_key,raw,c->knw,c->knb,ID,1e-5f);mv_b16(c->cp_cur_gate,c->gatew,x,ID,H);if(owner==c->rank){cp_store_latent(c,slot,c->cp_cur_latent);memcpy(c->cp_key+(size_t)slot*ID,c->cp_cur_key,ID*4);memcpy(c->cp_gate+(size_t)slot*ID,c->cp_cur_gate,ID*4);}mv_b16(c->iq,c->wqb,c->qres,IH*ID,QA);mv_b16(c->iw,c->wp,x,IH,H);int pools=tokens/KPOOL;if(tokens%KPOOL==0){int pool=pools-1,powner=pool%c->ranks;memset(c->cp_exchange,0,(size_t)2*KPOOL*ID*4);for(int z=0;z<KPOOL;z++){int p=pool*KPOOL+z;if(p%c->ranks==c->rank){int s=p/c->ranks;memcpy(c->cp_exchange+(size_t)z*ID,c->cp_key+(size_t)s*ID,ID*4);memcpy(c->cp_exchange+(size_t)(KPOOL+z)*ID,c->cp_gate+(size_t)s*ID,ID*4);}}if(MPI_Allreduce(MPI_IN_PLACE,c->cp_exchange,2*KPOOL*ID,MPI_FLOAT,MPI_SUM,MPI_COMM_WORLD)!=MPI_SUCCESS)return-1;if(powner==c->rank){float*pk=c->cp_pool+(size_t)(pool/c->ranks)*ID;for(int d=0;d<ID;d++){float mx=-INFINITY,den=0,val=0;for(int z=0;z<KPOOL;z++){float a=c->cp_exchange[(size_t)(KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d];if(a>mx)mx=a;}for(int z=0;z<KPOOL;z++){float a=expf(c->cp_exchange[(size_t)(KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d]-mx);den+=a;val+=a*c->cp_exchange[(size_t)z*ID+d];}pk[d]=val/den;}}}int choose=TOPK/KPOOL;if(choose>pools)choose=pools;int local_pools=(pools+c->ranks-1-c->rank)/c->ranks;cp_candidate*local=c->cp_candidate_local,*gather=c->cp_candidate_gather;double qt[IH*ID];glm53f_index_query_transpose(qt,c->iq);int score_reference=getenv("GLM53F_INDEX_REFERENCE")!=NULL;
+/* Each pool score is independent; keep the scalar double accumulation
+ * inside a score unchanged while distributing pools over all cores. */
+#pragma omp parallel for schedule(static)
+for(int i=0;i<local_pools;i++){int p=c->rank+i*c->ranks;local[i]=(cp_candidate){score_reference?cp_pool_score(c->iq,c->iw,c->cp_pool+(size_t)i*ID):glm53f_index_score_transposed(qt,c->iw,c->cp_pool+(size_t)i*ID),p};}if(getenv("GLM53F_CP_TOP_REFERENCE"))qsort(local,local_pools,sizeof(*local),cp_candidate_cmp);else cp_top_exact(local,local_pools,choose);for(int i=local_pools;i<choose;i++)local[i]=(cp_candidate){-INFINITY,INT_MAX};if(choose&&MPI_Allgather(local,choose*(int)sizeof(*local),MPI_BYTE,gather,choose*(int)sizeof(*local),MPI_BYTE,MPI_COMM_WORLD)!=MPI_SUCCESS)return-1;if(choose){if(getenv("GLM53F_CP_TOP_REFERENCE"))qsort(gather,(size_t)c->ranks*choose,sizeof(*gather),cp_candidate_cmp);else cp_top_exact(gather,c->ranks*choose,choose);}int ns=0;for(int i=0;i<choose;i++)for(int z=0;z<KPOOL;z++)c->selected[ns++]=gather[i].id*KPOOL+z;for(int p=pools*KPOOL;p<tokens;p++)c->selected[ns++]=p;if(ns<1)return-1;if(cp_exchange_selected(c,ns)||cp_mla(c,attn,ns))return-1;c->length++;return 0;}
 static int sparse_attention_local(glm53f_sparse_context_12n*c,float*attn,const float*x){return c->cp?sparse_attention_local_cp(c,attn,x):sparse_attention_local_replicated(c,attn,x);}
 int glm53f_sparse_cache_append_12n(glm53f_sparse_context_12n *c, const float *x) {
     if (!c || !x || c->length >= c->capacity) return -1;
@@ -145,7 +260,7 @@ int glm53f_sparse_sublayer_batch_12n(glm53f_sparse_context_12n *c,
                                      c->batch_attn, tokens, H, cols);
     return glm53f_sum_allreduce_12n(c->batch_partial, out, tokens * H);
 }
-void glm53f_sparse_free_12n(glm53f_sparse_context_12n*c){if(!c)return;free(c->batch_partial);free(c->batch_attn);free(c->packed_index);free(c->packed);free(c->pool_score_global);free(c->pool_score_local);free(c->pool_score_cache);free(c->cp_candidate_gather);free(c->cp_candidate_local);free(c->cp_pack_index);free(c->cp_cur_gate);free(c->cp_cur_key);free(c->cp_cur_latent);free(c->cp_exchange);free(c->cp_pack);free(c->cp_pool);free(c->cp_gate);free(c->cp_key);free(c->cp_latent);free(c->apef);free(c->selected);free(c->partial);free(c->attn);free(c->pool);free(c->iw);free(c->iq);free(c->gcache);free(c->key);free(c->latent);free(c->query);free(c->qres);free(c->wp);free(c->wqb);free(c->ape);free(c->gatew);free(c->knb);free(c->knw);free(c->wk);free(c->ops);free(c->op);free(c->kvb);free(c->kvan);free(c->kvas);free(c->kva);free(c->qbs);free(c->qb);free(c->qan);free(c->qas);free(c->qa);free(c);}
+void glm53f_sparse_free_12n(glm53f_sparse_context_12n*c){if(!c)return;free(c->batch_partial);free(c->batch_attn);free(c->packed_index);free(c->packed);free(c->pool_score_global);free(c->pool_score_local);free(c->pool_score_cache);free(c->cp_candidate_gather);free(c->cp_candidate_local);free(c->cp_pack_index);free(c->cp_cur_gate);free(c->cp_cur_key);free(c->cp_cur_latent);free(c->cp_exchange);free(c->cp_gather);free(c->cp_pack);free(c->cp_pool);free(c->cp_gate);free(c->cp_key);free(c->cp_latent);free(c->apef);free(c->selected);free(c->partial);free(c->attn);free(c->pool);free(c->iw);free(c->iq);free(c->gcache);free(c->key);free(c->latent);free(c->query);free(c->qres);free(c->wp);free(c->wqb);free(c->ape);free(c->gatew);free(c->knb);free(c->knw);free(c->wk);free(c->ops);free(c->op);free(c->kvb);free(c->kvan);free(c->kvas);free(c->kva);free(c->qbs);free(c->qb);free(c->qan);free(c->qas);free(c->qa);free(c);}
 #ifndef GLM53F_SPARSE_NO_MAIN
 int main(int argc,char**argv){
     int rank,nr,layer=argc>3?atoi(argv[3]):43,tokens=argc>2?atoi(argv[2]):512,h0,hn,qd;char n[256];glm53f_st_context*st;

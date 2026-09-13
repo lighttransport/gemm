@@ -35,6 +35,9 @@ static int copy_file(const char *src, const char *dst) {
             if (w < 0) { if (errno == EINTR) continue; goto done; }
             done_bytes += w;
         }
+        /* Dirty pages cannot be evicted: bound writeback before advising the
+         * completed range away on a 32 GiB node. */
+        if (fdatasync(out)) goto done;
         (void)posix_fadvise(in, off, n, POSIX_FADV_DONTNEED);
         (void)posix_fadvise(out, off, n, POSIX_FADV_DONTNEED);
         off += n;
@@ -54,7 +57,7 @@ int main(int argc, char **argv) {
     int rank = argc > 3 ? atoi(argv[3]) : rank_id();
     const char *kind = argc > 4 ? argv[4] : "core";
     const char *middle;
-    struct stat sb, sm;
+    struct stat sb, sm, db, dm;
     if (argc < 3 || rank < 0 || rank >= 12 ||
         (strcmp(kind, "core") && strcmp(kind, "model"))) {
         fprintf(stderr, "usage: %s SOURCE_DIR LOCAL_DIR [RANK] [core|model]\n", argv[0]);
@@ -71,7 +74,8 @@ int main(int argc, char **argv) {
     if (stat(src_blob, &sb) || stat(src_manifest, &sm) || sb.st_size <= 0 || sm.st_size <= 0) {
         fprintf(stderr, "rank=%d incomplete source core stage\n", rank); return 2;
     }
-    if (!stat(dst_blob, &sb) && !stat(dst_manifest, &sm) && sb.st_size > 0 && sm.st_size > 0) {
+    if (!stat(dst_blob, &db) && !stat(dst_manifest, &dm) &&
+        db.st_size == sb.st_size && dm.st_size == sm.st_size) {
         printf("SENTINEL glm53f_rank_stage=REUSE kind=%s rank=%d bytes=%lld\n", kind, rank, (long long)sb.st_size);
         return 0;
     }

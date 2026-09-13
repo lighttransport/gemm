@@ -8,6 +8,8 @@ glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
     const char *model_dir, int first_layer, int layer_count);
 void glm53f_moe_stage_set_layer_12n(
     glm53f_moe_stage_context_12n *context, int layer);
+/* Destructive only to the private anonymous copy; /local files stay FP8. */
+int glm53f_moe_stage_convert_int8_12n(glm53f_moe_stage_context_12n *context);
 int glm53f_moe_stage_sublayer_12n(
     void *context, float *output, const float *normalized_input);
 int glm53f_moe_stage_sublayer_batch_12n(

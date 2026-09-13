@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include "../../common/glm53f_safetensors.h"
 #include "glm53f_dense_ffn_12n.h"
 #include "glm53f_embedding_12n.h"
@@ -101,9 +104,9 @@ struct glm53f_target_snapshot_12n {
     int sparse_length[LAYERS];
 };
 
-glm53f_target_model_12n *glm53f_target_model_create_12n(
+static glm53f_target_model_12n *target_model_create_with_kda(
         const char *model_dir, const char *routed, const char *shared,
-        int capacity) {
+        int capacity, int int8_kda, int latent_bf16) {
     int rank,ranks;
     glm53f_st_context *st;
     glm53f_target_model_12n *m = calloc(1, sizeof(*m));
@@ -125,11 +128,13 @@ glm53f_target_model_12n *glm53f_target_model_create_12n(
     m->head = glm53f_target_head_create_12n(model_dir);
     target_memtrace(rank, "embedding_head");
     for (int l = 0; l < LAYERS; ++l) {
-        if (l % 4 == 3) m->sparse[l] = glm53f_sparse_create_12n(model_dir, l, capacity);
+        if (l % 4 == 3) m->sparse[l] = glm53f_sparse_create_format_12n(model_dir, l, capacity, latent_bf16);
         else m->kda[l] = glm53f_kda_create_12n(model_dir, l);
         if (!m->sparse[l] && !m->kda[l]) goto fail;
     }
     target_memtrace(rank, "attention");
+    if (int8_kda && glm53f_target_model_convert_kda_int8_12n(m)) goto fail;
+    if (int8_kda) target_memtrace(rank, "attention_int8");
     for (int l = 0; l < 3; ++l) {
         m->dense[l] = glm53f_dense_ffn_create_12n(model_dir, l);
         if (!m->dense[l]) goto fail;
@@ -157,6 +162,29 @@ glm53f_target_model_12n *glm53f_target_model_create_12n(
 fail:
     glm53f_target_model_free_12n(m);
     return NULL;
+}
+
+glm53f_target_model_12n *glm53f_target_model_create_12n(
+        const char *model_dir, const char *routed, const char *shared, int capacity) {
+    return target_model_create_with_kda(model_dir, routed, shared, capacity, 0, 0);
+}
+
+int glm53f_target_model_convert_int8_12n(glm53f_target_model_12n *m) {
+    return m ? glm53f_moe_stage_convert_int8_12n(m->moe) : -1;
+}
+
+int glm53f_target_model_convert_kda_int8_12n(glm53f_target_model_12n *m) {
+    if (!m) return -1;
+    for (int l = 0; l < LAYERS; ++l)
+        if (m->kda[l] && glm53f_kda_convert_int8_12n(m->kda[l])) return -1;
+    return 0;
+}
+
+int glm53f_target_model_touch_cache_12n(glm53f_target_model_12n *m) {
+    if (!m) return -1;
+    for (int l = 0; l < LAYERS; ++l)
+        if (m->sparse[l] && glm53f_sparse_touch_cache_12n(m->sparse[l])) return -1;
+    return 0;
 }
 
 int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
@@ -415,6 +443,17 @@ void glm53f_target_model_free_12n(glm53f_target_model_12n *m) {
 }
 
 #ifndef GLM53F_TARGET_MODEL_NO_MAIN
+static long target_available_kb(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    char line[256]; long available = 0;
+    if (f) {
+        while (fgets(line, sizeof(line), f))
+            if (sscanf(line, "MemAvailable: %ld kB", &available) == 1) break;
+        fclose(f);
+    }
+    return available;
+}
+
 static int read_token_ids(const char *path, int **ids_out, int *count_out) {
     FILE *f = fopen(path, "r");
     int *ids = NULL, cap = 0, n = 0, id;
@@ -440,6 +479,7 @@ static int read_token_ids(const char *path, int **ids_out, int *count_out) {
 
 int main(int argc, char **argv) {
     int rank, ranks, token, steps, generate = 0;
+    int requested_capacity = 0, touch_cache = 0, load_only = 0, use_int8 = 0, int8_kda = 0, latent_bf16 = 0;
     int *prompt_ids = NULL, *generated_ids = NULL, prompt_count = 0, generated = 0;
     const char *output_ids = NULL;
     glm53f_target_model_12n *model;
@@ -447,10 +487,10 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 4 || ranks != 12) {
-        if (!rank) fprintf(stderr,"usage: %s MODEL ROUTED_STAGE SHARED_STAGE [token=1] [steps=1]\n       %s MODEL ROUTED_STAGE SHARED_STAGE --generate PROMPT_IDS OUTPUT_IDS MAX_NEW\n",argv[0],argv[0]);
+        if (!rank) fprintf(stderr,"usage: %s MODEL ROUTED_STAGE SHARED_STAGE [token=1] [steps=1] [OPTIONS]\n       %s MODEL ROUTED_STAGE SHARED_STAGE --generate PROMPT_IDS OUTPUT_IDS MAX_NEW [OPTIONS]\noptions: --capacity N --weight-format fp8|int8 --int8-kda --cache-format fp32|bf16 --touch-cache --load-only\n",argv[0],argv[0]);
         MPI_Abort(MPI_COMM_WORLD,2);
     }
-    generate = argc == 8 && !strcmp(argv[4], "--generate");
+    generate = argc >= 8 && !strcmp(argv[4], "--generate");
     if (generate) {
         if (read_token_ids(argv[5], &prompt_ids, &prompt_count)) {
             if (!rank) { fprintf(stderr, "cannot read prompt token IDs: %s\n", argv[5]); fflush(stderr); }
@@ -466,16 +506,69 @@ int main(int argc, char **argv) {
         token=argc>4?atoi(argv[4]):1;steps=argc>5?atoi(argv[5]):1;
         if(token<0||token>=154880||steps<1||steps>128)MPI_Abort(MPI_COMM_WORLD,2);
     }
+    for (int i = generate ? 8 : 6; i < argc; ++i) {
+        if (!strcmp(argv[i], "--touch-cache")) touch_cache = 1;
+        else if (!strcmp(argv[i], "--load-only")) load_only = 1;
+        else if (!strcmp(argv[i], "--int8-kda")) int8_kda = 1;
+        else if (!strcmp(argv[i], "--cache-format") && i + 1 < argc) {
+            ++i;
+            if (!strcmp(argv[i], "bf16")) latent_bf16 = 1;
+            else if (!strcmp(argv[i], "fp32")) latent_bf16 = 0;
+            else MPI_Abort(MPI_COMM_WORLD, 2);
+        }
+        else if (!strcmp(argv[i], "--capacity") && i + 1 < argc) {
+            char *end;
+            long n = strtol(argv[++i], &end, 10);
+            if (*end || n < 1 || n > 1048576) MPI_Abort(MPI_COMM_WORLD, 2);
+            requested_capacity = (int)n;
+        } else if (!strcmp(argv[i], "--weight-format") && i + 1 < argc) {
+            ++i;
+            if (!strcmp(argv[i], "int8")) use_int8 = 1;
+            else if (!strcmp(argv[i], "fp8")) use_int8 = 0;
+            else MPI_Abort(MPI_COMM_WORLD, 2);
+        } else {
+            if (!rank) fprintf(stderr, "unknown option: %s\n", argv[i]);
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        }
+    }
     int capacity=getenv("GLM53F_CAPACITY")?atoi(getenv("GLM53F_CAPACITY")):steps;
+    if (requested_capacity) capacity = requested_capacity;
+    if (requested_capacity && generate && prompt_count + steps > capacity)
+        MPI_Abort(MPI_COMM_WORLD, 2);
     if (generate && capacity < prompt_count + steps) capacity = prompt_count + steps;
     if(capacity<steps)MPI_Abort(MPI_COMM_WORLD,2);
     if(getenv("GLM53F_UTOFU")){const char*topo=getenv("TOFU_TOPO_PATH");if(!topo)topo="../utofu-tests/tofu_topo.txt";if(glm53f_collective_init_12n(topo,5*HIDDEN))MPI_Abort(MPI_COMM_WORLD,2);}
-    model=glm53f_target_model_create_12n(argv[1],argv[2],argv[3],capacity);
+    model=target_model_create_with_kda(argv[1],argv[2],argv[3],capacity,int8_kda,latent_bf16);
     if(!model)MPI_Abort(MPI_COMM_WORLD,2);
+    if (use_int8 && glm53f_target_model_convert_int8_12n(model)) MPI_Abort(MPI_COMM_WORLD, 2);
+#if defined(__GLIBC__)
+    /* Return free checkpoint-parser/conversion pages before committing KV.
+     * This does not change allocator thresholds or live weight allocations. */
+    malloc_trim(0);
+#endif
+    if (touch_cache && glm53f_target_model_touch_cache_12n(model)) MPI_Abort(MPI_COMM_WORLD, 2);
+    target_memtrace(rank, "cache_resident");
+    {
+        long available_kb = target_available_kb(), minimum_kb;
+        MPI_Allreduce(&available_kb, &minimum_kb, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
+        if (!rank) printf("GLM53F_TARGET_RESIDENT capacity=%d touched=%d weight_format=%s int8_kda=%d latent_cache=%s min_MemAvailable_GiB=%.6f\n",
+            capacity, touch_cache, use_int8 ? "int8-routed-shared" : "fp8", int8_kda, latent_bf16 ? "bf16" : "fp32", minimum_kb / 1048576.0);
+        fflush(stdout);
+        if (minimum_kb < 2L * 1024 * 1024) MPI_Abort(MPI_COMM_WORLD, 3);
+    }
+    if (load_only) {
+        glm53f_target_model_free_12n(model);
+        glm53f_collective_free_12n();
+        free(prompt_ids); free(generated_ids);
+        MPI_Finalize();
+        return 0;
+    }
     glm53f_target_profile_reset_12n(model);
     MPI_Barrier(MPI_COMM_WORLD);double begin=MPI_Wtime(),prompt_elapsed=0.0,decode_elapsed=0.0,window_begin=begin;
     int total_steps = generate ? prompt_count + steps - 1 : steps;
     int completed_steps = 0;
+    long run_minimum_kb = target_available_kb();
+    MPI_Allreduce(MPI_IN_PLACE, &run_minimum_kb, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
     for(int step=0;step<total_steps;step++){
         double step_begin=MPI_Wtime();
         if(generate&&step==prompt_count-1){window_begin=step_begin;glm53f_target_profile_reset_12n(model);}
@@ -484,6 +577,16 @@ int main(int argc, char **argv) {
         double step_elapsed=MPI_Wtime()-step_begin;
         if(generate&&step<prompt_count-1)prompt_elapsed+=step_elapsed;else decode_elapsed+=step_elapsed;
         completed_steps++;
+        if (step % 32 == 31 || step + 1 == total_steps ||
+            (generate && step >= prompt_count - 1 && (token == 154820 || token == 154827 || token == 154829))) {
+            long available_kb = target_available_kb(), minimum_kb;
+            MPI_Allreduce(&available_kb, &minimum_kb, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
+            if (minimum_kb < run_minimum_kb) run_minimum_kb = minimum_kb;
+            if (minimum_kb < 2L * 1024 * 1024) {
+                if (!rank) fprintf(stderr, "GLM53F_TARGET_HEADROOM step=%d min_MemAvailable_GiB=%.6f reject\n", step, minimum_kb / 1048576.0);
+                MPI_Abort(MPI_COMM_WORLD, 3);
+            }
+        }
         if (generate && !rank && step < prompt_count - 1 && (step + 1) % 512 == 0) {
             printf("GLM53F_TARGET_PROMPT completed=%d total=%d tok_s=%.3f\n",
                    step + 1, prompt_count - 1, (step + 1) / prompt_elapsed);
@@ -502,6 +605,7 @@ int main(int argc, char **argv) {
     }
     double elapsed=MPI_Wtime()-begin,max_elapsed;MPI_Reduce(&elapsed,&max_elapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     if(!rank){
+        printf("GLM53F_TARGET_RUN_MEMORY sampled_min_MemAvailable_GiB=%.6f interval=32\n", run_minimum_kb / 1048576.0);
         if(generate){FILE*f=fopen(output_ids,"w");if(!f)MPI_Abort(MPI_COMM_WORLD,2);for(int i=0;i<generated;i++)fprintf(f,"%d%c",generated_ids[i],i+1==generated?'\n':' ');fclose(f);}
         printf("GLM53F_TARGET_%s_12N steps=%d generated=%d capacity=%d ms_tok=%.3f tok_s=%.3f final_token=%d PASS\n",generate ? "GENERATE" : "DECODE",completed_steps,generate?generated:steps,capacity,max_elapsed*1e3/completed_steps,completed_steps/max_elapsed,token);
         if(generate){printf("GLM53F_TARGET_TIMING prompt_tokens=%d prompt_tok_s=%.3f decode_tokens=%d decode_tok_s=%.3f\n",prompt_count-1,(prompt_count-1)/(prompt_elapsed?prompt_elapsed:1.0),generated,generated/(decode_elapsed?decode_elapsed:1.0));}

@@ -1,6 +1,431 @@
 # GLM-5.3F A64FX 12-node decode-first plan
 
+## Active work: 512K, non-MTP, 30 tok/s (2026-09-13)
+
+The target is one text sequence on 12 A64FX nodes, with 524,288 total context
+positions and at least 30 generated tokens/s (33.333 ms/token), without MTP.
+Use the existing `~/models/glm53f` FP8 checkpoint and its rank-owned `/local`
+images. Preserve a directly comparable FP8 baseline. The historical sustained
+controls are 16.587--16.591 tok/s on job 51098702; other allocations reached
+18.14 tok/s. These are short-context measurements, not 512K decode results.
+
+Current measured status: **512K capacity passes narrowly with BF16 latent
+caches; final INT8 decode reaches 25.164 tok/s short-context and 15.938 tok/s
+after an 8K prompt. The latter leaves only 1.6 MiB above the 2 GiB safety
+guard: more headroom is required for reliable deployment. Neither 30 tok/s nor
+full-model decode after a populated 512K prefill is demonstrated.** See the
+2026-09-13 development log and guarded reproduction commands below.
+
+### Memory and context contract
+
+- The 62 checkpoint files total 305.788 GiB. Existing routed/shared/v2-core
+  images contain approximately 25.075--25.292 GiB per rank for the target.
+  Stage only each rank's files with bounded I/O, fsync, and cache eviction;
+  keep token-time weights resident in anonymous HBM. Do not load vision/MTP.
+- The old load planner below models BF16 latent/index caches and does not
+  describe the integrated runner's FP32 cache. Its theoretical totals must
+  not be used to certify a runtime launch.
+- FP32-reference context-parallel storage includes 512 latent floats, 128 index-key
+  floats, 128 compression-gate floats per owned token, and a 128-float pooled
+  key per four tokens. Eleven sparse layers plus selected-row scratch cost
+  0.759 GiB/rank at 256K, 1.475 GiB at 512K, and 2.908 GiB at 1M. The 34 KDA
+  layers add at most 13.95 MiB/rank of recurrent/convolution state.
+- Reserve 3 GiB/rank for runtime/OS in planning and measure minimum
+  `MemAvailable` on all ranks during loading, full cache commitment, and
+  generation. Abort a benchmark below 2 GiB available. Budget conversion
+  scratch and quantization scales explicitly; never retain two complete
+  routed-weight representations in HBM.
+- Distinguish a 512K capacity/page-touch check, a synthetic populated-cache
+  attention benchmark, and actual prefill followed by decode at 512K. Only
+  the last establishes full-model throughput at that context. Prompt plus
+  generated tokens must fit the declared capacity.
+
+### Execution order and acceptance gates
+
+1. Launch a fresh 12-node, six-hour interactive PJM allocation using
+   `a64fx/remote-dev-procedure.md`, separate bridge ports, and a topology
+   generated in that allocation. Build with the native Fujitsu MPI wrapper.
+   Record job ID, clocks, compiler, thread binding, and commands/results here.
+2. Restore rank-owned images to `/local`, validate all 12 manifests/files,
+   and reproduce the current FP8 target with matched repeated 128-token
+   controls. Record token IDs/logits, load time, per-rank memory, and attention,
+   FFN, mHC, head, and collective timings. Commit the complete 512K cache
+   before making a memory-fit claim.
+3. Profile sparse attention at increasing populated context sizes, including
+   512K. Prioritize the growing index scan/top-k and selected-latent exchange;
+   use exact selection and unchanged cache semantics for the first changes.
+   Profile BF16 KDA projections and mHC separately. Do not infer whole-model
+   gains from isolated routed-expert benchmarks.
+4. Implement an opt-in INT8 representation converted at weight load from
+   the existing `/local` images. Start with bounded real-weight kernel probes
+   and retain FP8 as the control. Fold checkpoint FP8 scales into the INT8
+   quantizer, specify block/row scales and activation quantization, and pack
+   for SVE SDOT. Convert in bounded chunks/in place or release source chunks
+   as destination chunks become resident. No full-model BF16/FP32 expansion.
+   Consider BF16 projection conversion where its memory/compute savings are
+   larger; retain sensitive norms, router decisions, and recurrent state at
+   their reference precision initially.
+5. Check INT8 arithmetic against an independently dequantized reference and
+   report weight/output error against original FP8/BF16. Quantization can
+   change logits and greedy tokens: measure that drift on fixed real prompts,
+   check finiteness and output quality, and do not label it greedy-exact.
+   Adopt a path only when matched repeated full-target runs show a gain.
+6. Run bounded prefill benchmarks and full long-context validation as the
+   allocation allows. Report prefill throughput/time separately from decode.
+   Log measured results and any unachieved gates explicitly; 30 tok/s remains
+   a target until a non-MTP full-model run demonstrates it.
+
+Production choices introduced by this work use explicit program arguments,
+including context capacity and weight format; environment variables remain
+available for existing compatibility and diagnostic controls. Update this
+section with accepted changes, rejected experiments, and reproducible results.
+
+### Development log: interactive job 51604112
+
+- The six-hour request did not allocate promptly; the development allocation is
+  **12 nodes, two hours**, started 2026-09-13 19:09:44 JST, normal 2000 MHz /
+  eco=0. Its first host is `k27-5212c`. The working frontend bridge alias is
+  `login1` (not the frontend's `fn01sv01` hostname); reverse endpoint 32426,
+  compute loopback 21264. A fresh 12-rank topology was generated in this job.
+- Native compiler: `mpifcc -Nclang`, `-O3 -march=armv8.2-a+sve
+  -ffp-contract=fast -fopenmp`, LLVM module unloaded and `OPAL_PREFIX` unset.
+  One rank/node, 47 OpenMP workers, close/core binding, active wait, existing
+  uTofu reduction. Sources are pinned in versioned development snapshots.
+- `/local/glm53f-target-{routed,shared,core}-51604112` holds rank-owned images.
+  Staging now syncs each 32 MiB before evicting dirty pages. Existing v2 core
+  images lacked the 42 replicated MoE routers: strict loading aborted on
+  `layers.3.mlp.gate.weight`. `glm53f_core_add_routers.c` appended 84 bounded
+  tensor records (~94.55 MiB/rank) to these **node-local copies only**. All 12
+  ranks completed; original checkpoint and shared-storage images are unchanged.
+- All performance below excludes model load/conversion and uses no MTP. These
+  initial controls have only 128 populated positions; a declared 512K capacity
+  must not be confused with a populated 512K prefix.
+
+| Initial 128-step control | tok/s | FFN ms/position | attention ms/position |
+| --- | ---: | ---: | ---: |
+| Unmodified HEAD, strict local weights | 20.852 | 18.727 | 20.324 |
+| Candidate FP8 control | 20.914 | 18.607 | 20.171 |
+| Row-scaled INT8 routed/shared, 64-row SDOT work units | 23.581 | 13.616 | 20.158 |
+| Above + INT8 KDA Q/K/V/output projections | 25.867 | 13.562 | 16.493 |
+
+The profile uses independently reduced phase maxima, so its phase sum can
+slightly exceed end-to-end elapsed time. Quantized logits differ from FP8;
+KDA quantization also changed the 128-step final greedy token. These are
+performance/error experiments, not a quality acceptance or a 30 tok/s result.
+
+Implemented opt-in formats and capacity controls: explicit
+`--capacity`, `--weight-format fp8|int8`, `--int8-kda`, `--touch-cache`, and
+`--load-only`; bounded in-place FP8-to-row-INT8 conversion with a 256 KiB tile
+per worker; independently tested BF16-to-INT8 KDA projection conversion;
+parallel/SVE-double CP index scoring; exact top-k heap; dimension-parallel MLA
+that retains each lane's original summation order. Finer 16-row SDOT scheduling
+was tested and rejected in favor of the original 64-row packed work units.
+Sensitive router, gates, norms, and KDA recurrent state retain reference types.
+
+Portable INT8 tests cover zero/random/non-finite/tiny activations, 128--4096
+input widths, original block scales, and independently dequantized arithmetic.
+A real layer-3 expert gate/up slice had 0.956% relative-L2 output error against
+FP8 on the tested vectors. Native index scoring matched all 10,923 scalar
+scores bit-for-bit. Full fixed-input quantization and long-context component
+tests are required before interpreting these as model-quality guarantees.
+
+#### Long-context and error probes (same allocation)
+
+Matched layer-43 runs use real projection weights and a **synthetic populated
+524,288-position cache**, eight measured repetitions after warmup. All four
+builds returned output hash `e66b566fc578a83b` and selection hash
+`cb961ba27a69495d` (all 4096 outputs / 2048 selected IDs, not just a checksum).
+
+| CP implementation | best ms/layer | mean ms/layer |
+| --- | ---: | ---: |
+| Unmodified scalar-index CP | 211.541 | 212.419 |
+| Parallel, bit-exact SVE-double index scan | 6.656 | 7.467 |
+| Above + exact heap selection and dimension-parallel MLA | 5.075 | 5.911 |
+| Above + owned-row Allgatherv instead of zero-filled Allreduce | 3.994 | 4.568 |
+
+The native MLA unit test is bit-exact for 5/6 heads and 1, 7, 128, 2048, 2051
+selected positions. At 2048 positions, its core fell from ~0.62 ms to
+0.19--0.24 ms. The gather requires another ~4 MiB scratch per sparse layer.
+Communication and projection costs still prevent treating this as a 30 tok/s
+full-model result. Existing CP's serial index scan was unusably slow at 512K.
+
+Teacher-forced error probe, first 256 tokens of `prompt_ids_fp8_full.txt`,
+restoring the same initial recurrent state before each format, 16-row scheduling:
+
+| Format | tok/s | argmax agreement with FP8 | hidden relative L2 |
+| --- | ---: | ---: | ---: |
+| FP8/BF16 reference | 20.658 | 256/256 | 0 |
+| INT8 routed/shared | 22.636 | 231/256 | 0.0104948 |
+| Above + INT8 KDA projections | 24.185 | 232/256 | 0.0107426 |
+
+All values were finite. These are fixed-input comparisons, not perplexity,
+free-running response-quality, or long-context recurrent-stability acceptance.
+The matched 16-row vs 64-row full-model A/B is reported below; it confirms
+the 64 MiB microbenchmark's preference for 64 rows (101 vs 93 GB/s).
+
+The initial full FP8 512K page-touch run failed the 2 GiB headroom guard.
+Another launch was SIGKILLed after loading experts with only ~2 GiB available,
+at the router-metadata phase. The loader now finishes router/index parsing
+**before** expert residency, trims dead parser allocations, and checks the
+2 GiB reserve before/during large uploads. Guarded retries rejected safely
+instead of attempting this tight allocation (one rank had 25.456 GiB available
+against 23.632 GiB weights + 2 GiB reserve). INT8 KDA conversion is moved ahead
+of the expert upload. Native XOS rejected `madvise` on its heap with `EINVAL`;
+that reclamation experiment was removed. Per-layer (~5 MiB) INT8 scale arrays
+can reuse freed projection chunks, unlike a monolithic ~205 MiB allocation. Core-image
+reads also evict the redundant source-file pages. Repeat residency checks are
+required; the older blanket 512K-safe statement below is not sufficient.
+
+The guarded FP8 256K-capacity/page-touch + 128-step run passed at 19.585 tok/s,
+minimum sampled `MemAvailable` 2.1975 GiB/rank. Added an explicit
+`--cache-format bf16` option for **CP latent rows only**, saving ~0.458 GiB/rank
+at 512K. Keep index keys, compression gates, pooled keys and KDA state FP32,
+and retain FP32 latent storage as the reference default. The BF16 codec,
+populated-cache output drift, and full 512K commitment were tested below.
+
+#### 512K capacity passes, but production headroom is insufficient
+
+With `OMP_STACKSIZE=1M`, default XOS paging (no interleave override), strict
+node-local core reads, and **BF16 latent / FP32 index caches**, all 12 ranks
+completed a full 524,288-position page-touch followed by 128 decode steps:
+
+| Format / runtime | tok/s at 128 populated positions | minimum sampled available GiB/rank |
+| --- | ---: | ---: |
+| FP8/BF16 weights, 47 workers | 19.713 | 2.0214 |
+| INT8 MoE + KDA, 16-row work units, 47 workers | 22.918 | 2.0732 |
+| Same, 48 workers + `FLIB_BARRIER=HARD`, `OMP_PROC_BIND=false` | 23.868 | 2.0825 |
+
+These certify **512K capacity, not throughput after a 512K prefill**. The
+available-memory margin above the 2 GiB guard is only 22--84 MiB; keep the
+guard enabled and do not add concurrent contexts/background memory users.
+The full FP32-cache launch still rejected safely. The interleave/demand-paging
+experiment was SIGKILLed and is **not** a recommended launch configuration.
+
+BF16 latent-cache codec and native widening tests pass. At the synthetic 512K
+layer probe, selected IDs were unchanged and output relative L2 versus FP32
+was `0.000259062` (0.0259%), maximum absolute error `1.98e-5`. This does not
+guarantee unchanged greedy trajectories: even the short BF16-cache full-model
+run ended at a different token than the FP32-cache control.
+
+The matched 256-token teacher-forced **64-row** INT8 control measured 23.525
+tok/s for MoE and **25.778 tok/s** with KDA, against 20.863 FP8. Its agreement
+counts and hidden-state errors exactly matched the 16-row probe above. Keep
+**64-row SDOT in production**; retain 16-row and row-major kernels only as
+unit/microbenchmark controls. The smaller work units were 6.2% slower overall.
+
+The old 512K-cache footprint estimate is now 1.017 GiB/rank with BF16 latent
+storage, plus ~0.044 GiB/rank of lazy gather/MLA scratch. FP32 latent storage
+still costs 1.475 GiB/rank before that scratch. These values do not include
+all model/runtime allocations; the measured all-rank guard remains decisive.
+
+#### Real 8K prompt, with the full 512K cache committed
+
+The v7 (16-row INT8, 48 workers / HARD barrier) run ingested a real
+8192-token chat prompt: repeated technical notes followed by a request for
+five points about memory and numerical correctness. It generated **175 tokens
+through EOS**. Sequential prefill (8191 positions; the final prompt position
+produces the first generated token) measured **16.593 tok/s**, approximately
+493.6 seconds, and generation measured **15.667 tok/s**. Minimum sampled
+all-rank `MemAvailable` was **2.024902 GiB**. No MTP or synthetic cache
+injection was used in this run.
+
+The decode profile was attention 41.154, FFN 14.512, mHC 8.185, head 1.186,
+embedding 0.092 ms/position (independent phase maxima). Attention dominates
+once selection reaches 2048 latent rows. This is a much more relevant
+long-context warning than the ~26 tok/s short replicated-cache result.
+It is still an **8K populated prefix**, not a 512K full-model benchmark.
+The decoded response contained five coherent, relevant points; this single
+repetitive prompt is only a smoke test, not long-range retrieval/quality proof.
+The final 64-row build is validated separately below.
+
+The final v8 native build passed INT8/BF16 codec, all 10,923 index scores,
+exact top-k, and 5/6-head MLA unit checks. Its **64-row INT8 + KDA, BF16
+latent, 48-worker HARD** 512K-capacity/page-touch + 128-step control measured
+**25.164 tok/s** (39.739 ms/token), minimum sampled available **2.048096 GiB**.
+The complete token/logit stream matches the v7 16-row control. This remains
+a short-populated-context measurement despite its 512K committed capacity.
+
+The final synthetic 512K BF16-cache layer probe measured 3.930 ms best /
+4.434 ms mean; output and selected-ID hashes match v7. Mean MPI time was
+0.834 ms selected-row exchange, 0.450 ms candidate gathering, and 0.179 ms
+pool exchange. This probe appends a pool-completing position every repetition;
+normal decoding only performs pool exchange once per four positions.
+
+The final **v8 64-row** repeat also generated the same **175/175 token IDs
+through EOS** on the 8192-token prompt. It measured **16.965 tok/s prefill**
+(8191 sequential positions, approximately 482.8 seconds) and **15.938 tok/s
+decode**. Decode phase maxima: attention 41.199, FFN 13.289, mHC 8.010,
+head 1.186, embedding 0.086 ms/position. The 64-row change improves FFN time,
+but the full 8K decode gain over v7 is only 1.7% because attention dominates.
+
+Minimum sampled all-rank available memory was **2.001587 GiB**, just
+**1.625 MiB above the 2 GiB guard**. Keep this result as a capacity/stability
+smoke test, **not a robust production memory budget**. The changing minimum
+between otherwise matched launches shows that background/system footprint
+can decide whether this configuration is admitted. Do not lower the guard
+or add another context. Freeing raw index-key/gate history safely is now a
+higher deployment priority than the marginal short-context throughput gain.
+
+The synthetic **1M populated-cache, single sparse layer** probe passes at
+4.453 ms best / 5.009 ms mean, selected exchange 0.877 ms and candidate
+gather 0.590 ms. Output hash `eeb1733b198bf059`, selected-ID hash
+`dad140e96111cb5d`. This low-memory component check does not establish that
+the full 1M-capacity model is resident.
+
+The subsequent full-model **1M capacity admission test was rejected safely**
+by the loader before the large expert upload: rank 8 had **24.820 GiB**
+available versus **25.632 GiB** required (23.632 GiB routed payload + 2 GiB
+reserve); ranks 6 and 10 also rejected. Thus neither FP32 512K nor BF16-latent
+1M is admitted by the current guarded configuration on this allocation.
+Do not replace this result with the older theoretical 1M-fit claim below.
+
+Reproducibility fingerprints (SHA-256 of the whitespace-separated ID files):
+
+- `prompt8192.ids`: `c5e3fff6dded3b41feee43b6cf6f0c129410d2d5a10acc31b90acbea414c1f86`
+- `long-v8-output.ids`: `2e1afa667d8272080753fc9bf636eaa457d9b27ec272cb09e62751e8234d909a`
+
+`cmp` confirms v7/v8 generated IDs match; `diff` of all 128 short-run token
+and logit records is empty. All committed implementation sources match the
+v8 snapshot used for the final native build. The last test completed before
+21:03:46 JST; interactive job 51604112's scheduled expiry is 21:09:44 JST.
+
+#### Reproduce the guarded configuration
+
+Use `a64fx/remote-dev-procedure.md` for the loopback-only bridge. From the
+frontend, keep the interactive launcher attached in tmux; choose an unused
+reverse port (32426 was used for this job):
+
+```bash
+REMOTE=login1 FRONTEND_SSH_TARGET=login1 \
+FRONTEND_PORT=32426 REMOTE_PORT=32426 \
+NODES=12 ELAPSE=02:00:00 WAIT_TIME=600 \
+  a64fx/tools/bash-over-http/run_bash_http_interactive.sh
+```
+
+Inside that allocation, from the repository root (run staging only when no
+model process is resident):
+
+```bash
+module unload LLVM/llvmorg-21.1.0 2>/dev/null || true
+unset OPAL_PREFIX
+job=${PJM_JOBID:?}
+export TMPDIR=/local/glm53f-dev-build-$job
+mkdir -p "$TMPDIR"
+export PJM_PROC_BY_NODE=1 PJM_MPI_PROC=12
+GLM53F_MPICC=mpifcc bash a64fx/glm5/build_glm53f_integrated_12n.sh
+cd a64fx/glm5
+for kind in routed shared core; do
+    source_dir=$HOME/models/glm53f/a64fx_ep12_v1/$kind
+    format=model
+    if [ "$kind" = core ]; then
+        source_dir=$HOME/models/glm53f/a64fx_ep12_v2_core
+        format=core
+    fi
+    mpiexec -np 12 sh -c '
+        rank=${PMIX_RANK:-${PJM_MPI_RANK:-${OMPI_COMM_WORLD_RANK:-0}}}
+        exec ./glm53f_core_stage "$1" "$2" "$rank" "$3"
+    ' sh "$source_dir" "/local/glm53f-target-$kind-$job" "$format"
+done
+mpiexec -np 12 sh -c '
+    rank=${PMIX_RANK:-${PJM_MPI_RANK:-${OMPI_COMM_WORLD_RANK:-0}}}
+    exec ./glm53f_core_add_routers "$1" "$2" "$rank"
+' sh "$HOME/models/glm53f" "/local/glm53f-target-core-$job"
+```
+
+The v2 core files are at the **top level** of `a64fx_ep12_v2_core`, not
+its incomplete `core/` subdirectory. The older all-in-one staging wrapper
+assumes a different directory layout; the explicit commands above match this
+checkpoint. Re-staging a router-augmented core restores the source image,
+so always run the router augmentation **after** staging. No shared checkpoint
+or shared core image is altered.
+
+Then, still inside `a64fx/glm5`:
+
+```bash
+repo=$(pwd)/../..
+logdir=$repo/tmp/glm53f-run-$job
+mkdir -p "$logdir"
+export OMP_NUM_THREADS=48 OMP_DYNAMIC=false OMP_WAIT_POLICY=active
+export OMP_STACKSIZE=1M OMP_PROC_BIND=false OMP_PLACES=cores FLIB_BARRIER=HARD
+export GLM53F_UTOFU=1 GLM53F_PROFILE=1
+export GLM53F_REPACK_DIR=/local/glm53f-target-core-$job GLM53F_REPACK_REQUIRE=1
+(cd "$logdir" && mpiexec -np 12 "$repo/a64fx/utofu-tests/tofu_topo_helper")
+export TOFU_TOPO_PATH=$logdir/tofu_topo.txt
+mpiexec -np 12 -of-proc "$logdir/capacity-512k" \
+    ./glm53f_target_decode_12n "$HOME/models/glm53f" \
+    "/local/glm53f-target-routed-$job" "/local/glm53f-target-shared-$job" \
+    1 128 --capacity 524288 --touch-cache \
+    --weight-format int8 --int8-kda --cache-format bf16
+# For actual generation, replace "1 128" with:
+# --generate /absolute/path/prompt.ids /absolute/path/output.ids 256
+# Prompt length + 256 must not exceed 524288.
+```
+
+Keep default native XOS paging; do not add a NUMA-interleave or demand-paging
+override. INT8 conversion is from the anonymous copy loaded from `/local`,
+not a second model file: routed/shared FP8 bytes are repacked in place with
+~205.45 MiB row scales/rank and at most 12 MiB conversion scratch. KDA
+Q/K/V/output BF16 weights are converted one projection at a time before
+expert residency. Router, gate, normalization, and recurrent-state precision
+are unchanged. No token-time file reads or MTP are used. Construction still
+parses checkpoint metadata headers from shared storage; strict repack loading
+ensures the actual target weight payload comes from the node-local images.
+
+Diagnostic controls: `test_glm53f_int8`, `test_glm53f_index_score`,
+`test_glm53f_sparse_math`; 12-rank `test_glm53f_sparse_cp MODEL 524288 8
+fp32|bf16`; and `test_glm53f_quant_model_12n MODEL ROUTED SHARED PROMPT_IDS
+256`. The last restores the same initial state between three weight formats;
+it is not a perplexity test. Runtime memory samples are all-rank minima every
+32 positions and at termination, not a continuous measurement of every
+transient allocation.
+On native XOS, `/proc` process RSS did not account for the large resident
+heap (rank 8 reported only ~27 MiB RSS with its model loaded); use all-rank
+`MemAvailable` plus explicit cache commitment, not RSS, for this deployment.
+
+Portable GCC INT8/index tests also pass with `-O2 -fopenmp -Wall -Wextra
+-Wpedantic`, and the build script passes `bash -n`. An optional host
+ASan/UBSan link could not run because the frontend lacks its sanitizer runtime
+libraries; it is not recorded as a sanitizer pass. The native full build
+retains existing warnings from shared experimental headers.
+
+#### Remaining work toward 30 tok/s and 512K+
+
+1. **30 tok/s at populated 512K remains unachieved.** The budget is 33.333
+   ms/token; even the measured 8K prefix is substantially slower. Profile
+   selected-row communication separately from projection, selection, and
+   MLA work. Next candidate: transport already-BF16 latent rows as BF16 and
+   widen after exchange, halving that payload without another quantization
+   step. Persistent or topology-aware exchange needs matched full-model
+   validation; a faster isolated collective is not sufficient.
+2. Reduce mHC and remaining projection/team-launch costs only behind exact
+   controls. The new 64-row INT8 path improves the expert/KDA budget, but
+   short-context gains cannot remove the populated-cache communication cost.
+3. **512K+ is not certified; the guarded 1M launch rejected.** Going from 512K to 1M adds
+   approximately 0.974 GiB/rank with the current BF16-latent cache, exceeding
+   the measured margin above the 2 GiB guard. A promising exact memory
+   change is replacing historical raw index keys/compression gates with a
+   bounded recent-token ring once pooled keys are finalized: up to 0.458
+   GiB/rank saved at 512K, 0.917 GiB at 1M. Define and test rollback/snapshot
+   behavior before implementing that representation; do not simply discard
+   history used by existing APIs. More margin is needed for robust operation.
+4. Actual 512K prefill, long-range retrieval/quality, and sustained decode
+   remain required. Sequential prefill at the measured 8K average alone
+   extrapolates to about **8.8 hours** for 512K (not a prediction: index work
+   grows with context). Use a bounded, memory-budgeted batched prefill path
+   and a longer allocation; do not claim the two-hour interactive job
+   performed that validation. INT8 batch callbacks currently use scalar
+   fallback, so they are not an optimized prefill implementation.
+
+All results/scripts for this development allocation are in
+`tmp/glm53f-512k-dev/results-51604112/`; immutable source snapshots are
+`candidate-v2` through `candidate-v8`. These are local development artifacts,
+not files required by the production build.
+
 ## Measured anchors (job 51040571)
+
+Historical experiments follow. In particular, the older theoretical memory
+planner and synthetic cache figures below do **not** supersede this session's
+measured, guarded residency results.
 
 - Full 34-layer/64-head KDA recurrent update, 136 MiB replicated test state:
   **1.483 ms/token** best at 24 threads. The production head-TP layout owns only

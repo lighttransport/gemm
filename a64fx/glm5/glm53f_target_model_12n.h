@@ -8,6 +8,9 @@ glm53f_target_model_12n *glm53f_target_model_create_12n(
     const char *model_dir, const char *routed_stage,
     const char *shared_stage, int capacity);
 void glm53f_target_model_free_12n(glm53f_target_model_12n *model);
+int glm53f_target_model_convert_int8_12n(glm53f_target_model_12n *model);
+int glm53f_target_model_convert_kda_int8_12n(glm53f_target_model_12n *model);
+int glm53f_target_model_touch_cache_12n(glm53f_target_model_12n *model);
 int glm53f_target_model_step_12n(
     glm53f_target_model_12n *model, int input_token,
     int *next_token, float *next_logit, float *target_hidden);

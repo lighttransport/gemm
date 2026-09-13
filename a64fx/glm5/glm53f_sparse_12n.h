@@ -6,6 +6,9 @@ typedef struct glm53f_sparse_context_12n glm53f_sparse_context_12n;
 
 glm53f_sparse_context_12n *glm53f_sparse_create_12n(
     const char *model_dir, int layer, int capacity);
+/* BF16 affects CP latent rows only; index/pool state remains FP32. */
+glm53f_sparse_context_12n *glm53f_sparse_create_format_12n(
+    const char *model_dir, int layer, int capacity, int latent_bf16);
 void glm53f_sparse_reset_12n(glm53f_sparse_context_12n *context);
 void glm53f_sparse_free_12n(glm53f_sparse_context_12n *context);
 int glm53f_sparse_sublayer_12n(
@@ -23,5 +26,7 @@ int glm53f_sparse_is_context_parallel_12n(
     const glm53f_sparse_context_12n *context);
 size_t glm53f_sparse_cache_bytes_12n(
     const glm53f_sparse_context_12n *context);
+/* Commit zero-length cache pages before a capacity check; rejects live state. */
+int glm53f_sparse_touch_cache_12n(glm53f_sparse_context_12n *context);
 
 #endif
