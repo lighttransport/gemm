@@ -62,12 +62,12 @@ static int rdna4_candidate(int m, int n, int k) {
         int m, n, k, candidate;
     };
     static const Choice choices[] = {
-        {5184, 256, 2000, 15}, {5184, 256, 2304, 15}, {5184, 256, 512, 16},
-        {3, 256, 64, 18},      {256, 2592, 64, 18},   {32, 256, 5184, 20},
-        {139, 256, 5184, 2},   {256, 512, 5184, 0},   {512, 256, 5184, 1},
-        {256, 256, 5184, 2},   {768, 256, 5184, 4},   {5184, 256, 768, 15},
-        {256, 2304, 5184, 27}, {5184, 2304, 256, 0},  {256, 2000, 5184, 10},
-        {5184, 2000, 256, 5},
+        {5184, 256, 2000, 2},  {5184, 256, 2304, 0},  {5184, 256, 512, 23},
+        {3, 256, 64, 0},       {256, 2592, 64, 16},   {32, 256, 5184, 20},
+        {139, 256, 5184, 2},   {256, 512, 5184, 4},   {512, 256, 5184, 1},
+        {256, 256, 5184, 28},  {768, 256, 5184, 8},   {5184, 256, 768, 2},
+        {256, 2304, 5184, 27}, {5184, 2304, 256, 0},  {256, 2000, 5184, 7},
+        {5184, 2000, 256, 1},
     };
     for (const auto &choice : choices)
         if (choice.m == m && choice.n == n && choice.k == k)
@@ -190,12 +190,13 @@ extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, i
                                            p->c, trial, p->c, &results[i].algo, workspace,
                                            results[i].workspaceSize, nullptr);
                 };
-                // Warm each candidate, then time repeated non-destructive trials.
+                // Warm each candidate, then amortize timer granularity across
+                // enough launches for sub-100-us RDNA4 kernels.
                 if (run() != HIPBLAS_STATUS_SUCCESS ||
                     c->event_record(start, nullptr) != hipSuccess)
                     continue;
                 bool valid = true;
-                for (int repeat = 0; repeat < 5; repeat++)
+                for (int repeat = 0; repeat < 100; repeat++)
                     valid = run() == HIPBLAS_STATUS_SUCCESS && valid;
                 float ms = 0;
                 valid = c->event_record(stop, nullptr) == hipSuccess && valid;
@@ -219,7 +220,7 @@ extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, i
         p->workspace = results[selected].workspaceSize;
         if (c->tune == 1)
             std::fprintf(stderr, "hipBLASLt tuned M=%d N=%d K=%d beta=%g candidate=%d/%d ms=%.6g\n",
-                         M, N, K, beta, selected, count, best / 5);
+                         M, N, K, beta, selected, count, best / 100);
         try {
             c->plans.push_back(p);
         } catch (...) {

@@ -763,14 +763,15 @@ other than hipBLASLt 1.4.1 (`100401`) disable the mapping rather than assuming
 that heuristic ordering is stable.
 
 Independent CPU-oracle runs pass at batch 16 (output relative L2
-0.000019969416, gradient 0.00081994291) and batch 64 (output 0.000019948652,
-gradient 0.00082694669). Both include AdamW comparison and bit-exact backend
-checkpoint reload. Three fresh 100-step batch-64 runs measure **1,280.16
-examples/s median** (1,277.41--1,280.71), a 1.28% improvement over the prior
-1,263.98/s median. Median useful throughput is 13.8279 TFLOP/s and logical
-product throughput is 24.2930 TFLOP/s, **12.4579%** of the nominal 195-TFLOP/s
-peak. Median inference latency is 18.5466 ms. The 2,000 examples/s and 75%
-peak targets remain open.
+0.000019969416, gradient 0.00081994291) and batch 64 (output 0.000019970799,
+gradient 0.00082566661). Both include AdamW comparison and bit-exact backend
+checkpoint reload. Candidate timing now amortizes each sub-100-us kernel over
+100 launches instead of five before freezing the deterministic mapping. Three
+fresh 100-step batch-64 runs measure **1,282.48 examples/s median**
+(1,278.94--1,284.43), a 1.46% improvement over the prior 1,263.98/s median.
+Median useful throughput is 13.8529 TFLOP/s and logical product throughput is
+24.3369 TFLOP/s, **12.4805%** of the nominal 195-TFLOP/s peak. Median inference
+latency is 18.4899 ms. The 2,000 examples/s and 75% peak targets remain open.
 
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
