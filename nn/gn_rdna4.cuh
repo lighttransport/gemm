@@ -66,9 +66,14 @@ extern "C" __global__ void gn_attention_81(float *y, float *prob, const float *x
     (void)B;
     (void)side;
 }
-/* Generate packed im2col directly: no FP32 column buffer or second read. */
-extern "C" __global__ void gn_columns_bf16(unsigned short *out, const float *x, int R, int C,
-                                           int side, int kernel, int precise) {
+/* Generate packed im2col directly: no FP32 column buffer or second read.
+ * Constant default-network dimensions strength-reduce integer indexing. */
+template <int Channels = 0, int Side = 0, int Kernel = 0>
+__device__ __forceinline__ void gn_columns_pack(unsigned short *out, const float *x, int R, int C,
+                                                int side, int kernel, int precise) {
+    C = Channels ? Channels : C;
+    side = Side ? Side : side;
+    kernel = Kernel ? Kernel : kernel;
     int i = blockIdx.x * blockDim.x + threadIdx.x, K = C * kernel * kernel;
     int stride = (K + 31) & ~31;
     if (i >= R * stride)
@@ -85,8 +90,138 @@ extern "C" __global__ void gn_columns_bf16(unsigned short *out, const float *x, 
         float residual = v - unbf(h);
         unsigned short low = bf(residual);
         out[R * stride + i] = low;
-        out[2 * R * stride + i] = bf(residual - unbf(low));
+        if (precise != 2)
+            out[2 * R * stride + i] = bf(residual - unbf(low));
     }
+}
+extern "C" __global__ void gn_columns_bf16(unsigned short *out, const float *x, int R, int C,
+                                           int side, int kernel, int precise) {
+    if (side == 9 && C == 256 && kernel == 3)
+        gn_columns_pack<256, 9, 3>(out, x, R, C, side, kernel, precise);
+    else if (side == 9 && C == 80 && kernel == 5)
+        gn_columns_pack<80, 9, 5>(out, x, R, C, side, kernel, precise);
+    else
+        gn_columns_pack<>(out, x, R, C, side, kernel, precise);
+}
+/* Backward dW needs im2col transposed. Gather a channel-coalesced tile
+ * straight from NHWC, then transpose/round in LDS. */
+template <int Channels = 0, int Side = 0, int Kernel = 0>
+__device__ __forceinline__ void gn_columns_pack_back(unsigned short *out, const float *x, int R,
+                                                     int C, int side, int kernel, int precise) {
+    C = Channels ? Channels : C;
+    side = Side ? Side : side;
+    kernel = Kernel ? Kernel : kernel;
+    __shared__ float tile[32][33];
+    int t = threadIdx.x, k0 = blockIdx.x * 32, r0 = blockIdx.y * 32;
+    int K = C * kernel * kernel, stride = (R + 31) & ~31, S = side * side;
+    for (int i = t; i < 1024; i += 256) {
+        int r = r0 + i / 32, k = k0 + i % 32;
+        int yy = r % S / side + k / (C * kernel) - kernel / 2;
+        int xx = r % side + k / C % kernel - kernel / 2;
+        tile[i / 32][i % 32] = r < R && k < K && yy >= 0 && xx >= 0 && yy < side && xx < side
+                                   ? x[(r / S * S + yy * side + xx) * C + k % C]
+                                   : 0;
+    }
+    __syncthreads();
+    for (int i = t; i < 1024; i += 256) {
+        int k = k0 + i / 32, r = r0 + i % 32;
+        if (k >= K)
+            continue;
+        float v = tile[i % 32][i / 32];
+        unsigned short high = bf(v);
+        out[k * stride + r] = high;
+        if (precise) {
+            float residual = v - unbf(high);
+            unsigned short low = bf(residual);
+            out[(K + k) * stride + r] = low;
+            if (precise != 2)
+                out[(2 * K + k) * stride + r] = bf(residual - unbf(low));
+        }
+    }
+}
+extern "C" __global__ void gn_columns_bf16_back(unsigned short *out, const float *x, int R, int C,
+                                                int side, int kernel, int precise) {
+    if (side == 9 && C == 256 && kernel == 3)
+        gn_columns_pack_back<256, 9, 3>(out, x, R, C, side, kernel, precise);
+    else if (side == 9 && C == 80 && kernel == 5)
+        gn_columns_pack_back<80, 9, 5>(out, x, R, C, side, kernel, precise);
+    else
+        gn_columns_pack_back<>(out, x, R, C, side, kernel, precise);
+}
+/* Eight neighboring NHWC channels per CTA. Preserve double statistics and
+ * FP32 normalization, while coalescing the formerly channel-strided loads. */
+__device__ double gn_sum_channels(double v) {
+    __shared__ double sums[256];
+    int t = threadIdx.x;
+    __syncthreads();
+    sums[t] = v;
+    __syncthreads();
+    for (int d = 128; d >= 8; d /= 2) {
+        if (t < d)
+            sums[t] += sums[t + d];
+        __syncthreads();
+    }
+    return sums[t % 8];
+}
+extern "C" __global__ void gn_bn_channels(float *y, float *aux, float *mean, float *var,
+                                          const float *x, const float *w, const float *bias, int R,
+                                          int C, int layer, int training) {
+    int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;
+    double mu = 0, v = 0;
+    if (training) {
+        if (c < C)
+            for (int r = t / 8; r < R; r += 32)
+                mu += x[r * C + c];
+        mu = gn_sum_channels(mu) / R;
+        if (c < C)
+            for (int r = t / 8; r < R; r += 32) {
+                double d = x[r * C + c] - mu;
+                v += d * d;
+            }
+        v = gn_sum_channels(v) / R;
+        if (t < 8 && c < C) {
+            mean[c] = .9f * mean[c] + .1f * (float)mu;
+            var[c] = .9f * var[c] + .1f * (float)(R > 1 ? v * R / (R - 1) : v);
+        }
+    } else if (c < C) {
+        mu = mean[c];
+        v = var[c];
+    }
+    float inv = rsqrtf((float)v + 1e-5f);
+    if (t < 8 && c < C) {
+        aux[c] = (float)mu;
+        aux[C + c] = inv;
+    }
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32)
+            y[r * C + c] = (x[r * C + c] - (float)mu) * inv * w[c] + bias[c];
+    (void)layer;
+}
+extern "C" __global__ void gn_bn_back_channels(float *dx, float *dw, float *db, const float *x,
+                                               const float *dy, const float *w, const float *aux,
+                                               int R, int C, int layer) {
+    int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;
+    float mu = c < C ? aux[c] : 0, inv = c < C ? aux[C + c] : 0;
+    double sum = 0, prod = 0;
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32) {
+            int j = r * C + c;
+            sum += dy[j];
+            prod += dy[j] * (x[j] - mu) * inv;
+        }
+    sum = gn_sum_channels(sum);
+    prod = gn_sum_channels(prod);
+    if (t < 8 && c < C) {
+        dw[c] += (float)prod;
+        db[c] += (float)sum;
+    }
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32) {
+            int j = r * C + c;
+            dx[j] +=
+                inv * w[c] * (dy[j] - (float)(sum / R) - (x[j] - mu) * inv * (float)(prod / R));
+        }
+    (void)layer;
 }
 extern "C" __global__ void gn_bias_back_parallel(float *db, const float *dy, int R, int C) {
     __shared__ double sums[256];
@@ -132,11 +267,11 @@ extern "C" __global__ void gn_lt_combine(float *y, const float *high, const floa
 /* AccChunk=-1: FP32 accumulators; 0: native BF16 throughout the dot;
  * positive: native BF16 partial dots, widened once per AccChunk products.
  * This changes the training arithmetic and is always opt-in. */
-template <bool Precise, int MR = 2, int NR = 2, int BK = 32, int AccChunk = -1>
+template <bool Precise, int MR = 2, int NR = 2, int BK = 32, int AccChunk = -1, int Products = 6>
 __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned short *b, int M,
                               int N, int K, int add) {
     static_assert(!Precise || AccChunk < 0, "BF16 accumulation changes the precision contract");
-    constexpr int BM = 32 * MR, BN = 32 * NR, Planes = Precise ? 3 : 1;
+    constexpr int BM = 32 * MR, BN = 32 * NR, Planes = Precise ? (Products == 3 ? 2 : 3) : 1;
     __shared__ unsigned short sa[Planes][BM][BK + 8] __attribute__((aligned(16)));
     __shared__ unsigned short sb[Planes][BN][BK + 8] __attribute__((aligned(16)));
     int t = threadIdx.x, lane = t & 31, wave = t / 32, ix = lane & 15, half = lane / 16;
@@ -181,17 +316,19 @@ __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned 
             for (int i = 0; i < MR; i++) {
 #pragma unroll
                 for (int j = 0; j < NR; j++) {
-                    if (Precise) {
+                    if constexpr (Precise) {
                         low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
                             av[1][i], bv[0][j], low[i][j]);
                         low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
                             av[0][i], bv[1][j], low[i][j]);
-                        low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
-                            av[1][i], bv[1][j], low[i][j]);
-                        low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
-                            av[2][i], bv[0][j], low[i][j]);
-                        low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
-                            av[0][i], bv[2][j], low[i][j]);
+                        if constexpr (Products != 3) {
+                            low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                                av[1][i], bv[1][j], low[i][j]);
+                            low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                                av[2][i], bv[0][j], low[i][j]);
+                            low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                                av[0][i], bv[2][j], low[i][j]);
+                        }
                     }
                     if constexpr (AccChunk < 0) {
                         high[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
@@ -239,6 +376,13 @@ extern "C" __global__ __launch_bounds__(128) void gn_mm_tiled_fast(float *y,
                                                                    int N, int K, int add) {
     gn_rdna4_body<false>(y, a, b, M, N, K, add);
 }
+/* Two BF16 components, three products. Omit second-order residual terms,
+ * retaining separate FP32 high/correction accumulators. Explicit experiment. */
+extern "C" __global__ __launch_bounds__(128) void gn_mm_bf16x3(float *y, const unsigned short *a,
+                                                               const unsigned short *b, int M,
+                                                               int N, int K, int add) {
+    gn_rdna4_body<true, 1, 1, 32, -1, 3>(y, a, b, M, N, K, add);
+}
 extern "C" __global__ __launch_bounds__(128) void gn_mm_bf16_acc(float *y, const unsigned short *a,
                                                                  const unsigned short *b, int M,
                                                                  int N, int K, int add, int chunk) {
@@ -274,9 +418,9 @@ typedef int gn_int2 __attribute__((ext_vector_type(2)));
 typedef int gn_int4 __attribute__((ext_vector_type(4)));
 typedef int gn_int8 __attribute__((ext_vector_type(8)));
 template <int Bits, bool Wide, int MR = 2, int NR = 2>
-__device__ __forceinline__ void gn_rdna4_integer(float *y, const signed char *a, const signed char *b,
-                                 const float *as, const float *bs, int M, int N, int K, int add,
-                                 long long *exact) {
+__device__ __forceinline__ void
+gn_rdna4_integer(float *y, const signed char *a, const signed char *b, const float *as,
+                 const float *bs, int M, int N, int K, int add, long long *exact) {
     constexpr int BM = 32 * MR, BN = 32 * NR, P = Bits / 8;
     __shared__ signed char sa[P][BM][48] __attribute__((aligned(16)));
     __shared__ signed char sb[P][BN][48] __attribute__((aligned(16)));

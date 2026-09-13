@@ -248,7 +248,9 @@ gn_model *gn_create(const gn_config *c, const char *backend, int device) {
                      strcmp(backend, "cuda-int16") && strcmp(backend, "hip-int8") &&
                      strcmp(backend, "hip-int8-i64") && strcmp(backend, "hip-int16") &&
                      strcmp(backend, "hip-bf16") && strcmp(backend, "hip-bf16-acc") &&
-                     strcmp(backend, "hip-bf16-acc128"))) {
+                     strcmp(backend, "hip-bf16-acc128") && strcmp(backend, "hip-bf16-blaslt") &&
+                     strcmp(backend, "hip-bf16x3") && strcmp(backend, "hip-bf16x3-blaslt") &&
+                     strcmp(backend, "hip-bf16-mixed") && strcmp(backend, "hip-bf16-mixed-blaslt"))) {
         fail("unknown backend; expected cpu, cuda or hip");
         return NULL;
     }

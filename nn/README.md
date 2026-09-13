@@ -25,6 +25,15 @@ The last uses four INT8 WMMA products with INT32 partials and an exact INT64
 combine, not native INT16 WMMA. All keep FP32 master/optimizer/non-matrix state.
 These experiments are not enabled by the engine or long-campaign preflight.
 
+The [BF16/FP32 follow-up](RDNA4.md#bf16fp32-follow-up) focuses on FP32 accumulation:
+`hip-bf16-blaslt` enables single-product library training; `hip-bf16x3` uses
+three-product compensation; `hip-bf16-mixed` keeps six-product forward passes
+and uses three products backward. The latter two also accept `-blaslt`.
+Fused backward packing and coalesced BN accelerate the standard path too.
+The 1,000 examples/s **timing** target has been observed at batch 64 in the
+single-product experiment; the strict full-model gradient gate still fails.
+Do not confuse this with a qualified training or 75%-of-peak result.
+
 From GEMM root:
 
 ```sh
@@ -57,6 +66,9 @@ precision-compensation products, FP32 attention, and whole-step peak percentages
 continues through numerical mismatches to report gradients/update/reload, but
 still returns failure if the unchanged numerical gates fail. Its checkpoints
 are diagnostic artifacts, not qualified trained models.
+Report mode also snapshots per-node training values/gradients and counts ReLU
+sign differences against the CPU oracle; this diagnostic transfer is never
+part of the benchmark timing or normal execution.
 
 Defaults: 9×9×80 NHWC, 139 action planes, C256, 20 blocks (every fifth Transformer,
 otherwise two 3×3 convolutions), attention head width 32, 2C SwiGLU, policy linear

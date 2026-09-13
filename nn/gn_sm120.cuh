@@ -157,7 +157,8 @@ extern "C" __global__ void gn_pack_bf16(unsigned short *out, const float *in, in
             float l = x - unbf(h);
             unsigned short lo = bf(l);
             out[(R + r) * stride + k] = lo;
-            out[(2 * R + r) * stride + k] = bf(l - unbf(lo));
+            if (precise != 2)
+                out[(2 * R + r) * stride + k] = bf(l - unbf(lo));
         }
     }
 }

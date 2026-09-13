@@ -62,36 +62,52 @@ static int bf16_exact() {
 
 static int columns_exact() {
     int failed = 0;
-    for (int C : {3, 8, 32})
-        for (int kernel : {3, 5})
-            for (int precise : {0, 1}) {
-                int R = 27, side = 3, K = C * kernel * kernel, stride = (K + 31) & ~31,
-                    planes = precise ? 3 : 1;
-                float *x, *col;
-                unsigned short *a, *b;
-                std::vector<float> input(R * C);
-                for (size_t i = 0; i < input.size(); i++)
-                    input[i] = value((unsigned)i);
-                HIP_OK(hipMalloc(&x, input.size() * 4));
-                HIP_OK(hipMalloc(&col, R * K * 4));
-                HIP_OK(hipMalloc(&a, R * stride * planes * 2));
-                HIP_OK(hipMalloc(&b, R * stride * planes * 2));
-                HIP_OK(hipMemcpy(x, input.data(), input.size() * 4, hipMemcpyHostToDevice));
-                gn_columns<<<(R * K + 255) / 256, 256>>>(col, x, R, C, side, kernel);
-                gn_pack_bf16<<<dim3((K + 31) / 32, (R + 31) / 32), 256>>>(a, col, R, K, 0, precise);
-                gn_columns_bf16<<<(R * stride + 255) / 256, 256>>>(b, x, R, C, side, kernel,
-                                                                   precise);
-                std::vector<unsigned short> ref(R * stride * planes), actual(ref.size());
-                HIP_OK(hipMemcpy(ref.data(), a, ref.size() * 2, hipMemcpyDeviceToHost));
-                HIP_OK(hipMemcpy(actual.data(), b, actual.size() * 2, hipMemcpyDeviceToHost));
-                if (ref != actual)
-                    failed = 1;
-                HIP_OK(hipFree(x));
-                HIP_OK(hipFree(col));
-                HIP_OK(hipFree(a));
-                HIP_OK(hipFree(b));
-            }
-    std::printf("{\"fused_columns_bit_exact\":%s}\n", failed ? "false" : "true");
+    for (int side : {3, 9})
+        for (int C : {3, 8, 32, 80, 256})
+            for (int kernel : {3, 5})
+                for (int precise : {0, 1, 2}) {
+                    int R = 3 * side * side, K = C * kernel * kernel, stride = (K + 31) & ~31,
+                        back_stride = (R + 31) & ~31,
+                        planes = precise == 2 ? 2
+                                 : precise    ? 3
+                                              : 1;
+                    size_t capacity = (size_t)std::max(R * stride, K * back_stride) * planes;
+                    float *x, *col;
+                    unsigned short *a, *b;
+                    std::vector<float> input(R * C);
+                    for (size_t i = 0; i < input.size(); i++)
+                        input[i] = value((unsigned)i);
+                    HIP_OK(hipMalloc(&x, input.size() * 4));
+                    HIP_OK(hipMalloc(&col, R * K * 4));
+                    HIP_OK(hipMalloc(&a, capacity * 2));
+                    HIP_OK(hipMalloc(&b, capacity * 2));
+                    HIP_OK(hipMemcpy(x, input.data(), input.size() * 4, hipMemcpyHostToDevice));
+                    gn_columns<<<(R * K + 255) / 256, 256>>>(col, x, R, C, side, kernel);
+                    gn_pack_bf16<<<dim3((K + 31) / 32, (R + 31) / 32), 256>>>(a, col, R, K, 0,
+                                                                              precise);
+                    gn_columns_bf16<<<(R * stride + 255) / 256, 256>>>(b, x, R, C, side, kernel,
+                                                                       precise);
+                    std::vector<unsigned short> ref(R * stride * planes), actual(ref.size());
+                    HIP_OK(hipMemcpy(ref.data(), a, ref.size() * 2, hipMemcpyDeviceToHost));
+                    HIP_OK(hipMemcpy(actual.data(), b, actual.size() * 2, hipMemcpyDeviceToHost));
+                    if (ref != actual)
+                        failed = 1;
+                    gn_pack_bf16<<<dim3((R + 31) / 32, (K + 31) / 32), 256>>>(a, col, K, R, 1,
+                                                                              precise);
+                    gn_columns_bf16_back<<<dim3((K + 31) / 32, (R + 31) / 32), 256>>>(
+                        b, x, R, C, side, kernel, precise);
+                    ref.resize(K * back_stride * planes);
+                    actual.resize(ref.size());
+                    HIP_OK(hipMemcpy(ref.data(), a, ref.size() * 2, hipMemcpyDeviceToHost));
+                    HIP_OK(hipMemcpy(actual.data(), b, actual.size() * 2, hipMemcpyDeviceToHost));
+                    if (ref != actual)
+                        failed = 1;
+                    HIP_OK(hipFree(x));
+                    HIP_OK(hipFree(col));
+                    HIP_OK(hipFree(a));
+                    HIP_OK(hipFree(b));
+                }
+    std::printf("{\"fused_columns_forward_backward_bit_exact\":%s}\n", failed ? "false" : "true");
     return failed;
 }
 

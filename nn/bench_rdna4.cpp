@@ -68,17 +68,16 @@ static float value(unsigned i) {
     return (float)(x >> 8) * (2.0f / 16777216) - 1;
 }
 int main(int argc, char **argv) {
-    if (argc != 1 && argc != 7 && argc != 8) {
-        std::fprintf(
-            stderr,
-            "usage: bench_rdna4 [M N K transpose_A transpose_B iterations [dense_peak_tflops]]\n");
+    if (argc != 1 && argc != 7 && argc != 8 && argc != 9) {
+        std::fprintf(stderr, "usage: bench_rdna4 [M N K transpose_A transpose_B iterations "
+                             "[dense_peak_tflops [mode]]]\n");
         return 2;
     }
     int M = argc >= 7 ? std::atoi(argv[1]) : 1296, N = argc >= 7 ? std::atoi(argv[2]) : 256;
     int K = argc >= 7 ? std::atoi(argv[3]) : 2304, ta = argc >= 7 ? std::atoi(argv[4]) : 0;
     int tb = argc >= 7 ? std::atoi(argv[5]) : 1, iterations = argc >= 7 ? std::atoi(argv[6]) : 50;
     double peak = 195; /* RX 9070 XT nominal dense 16-bit matrix reference. */
-    if (argc == 8) {
+    if (argc >= 8) {
         char *end;
         peak = std::strtod(argv[7], &end);
         if (*end || !std::isfinite(peak) || peak <= 0)
@@ -94,7 +93,7 @@ int main(int argc, char **argv) {
     std::printf("{\"device\":\"%s\",\"arch\":\"%s\",\"hip_multiprocessors_WGPs\":%d,\"M\":%d,\"N\":"
                 "%d,\"K\":%d,\"ta\":%d,\"tb\":%d}\n",
                 prop.name, prop.gcnArchName, prop.multiProcessorCount, M, N, K, ta, tb);
-    std::printf("{\"nominal_dense_matrix_tflops\":%.6g,\"target_fraction\":0.95,\"not_end_to_end_"
+    std::printf("{\"nominal_dense_matrix_tflops\":%.6g,\"target_fraction\":0.75,\"not_end_to_end_"
                 "training_gate\":true}\n",
                 peak);
     float *a, *b, *y, *high, *low, *sink;
@@ -122,21 +121,35 @@ int main(int argc, char **argv) {
         "legacy_bf16x6",          "tiled_64x64_bf16x6",     "tiled_64x64_bf16",
         "tiled_32x64_bf16x6",     "tiled_64x32_bf16x6",     "tiled_32x32_bf16x6",
         "tiled_64x128_bf16x6",    "hipblaslt_bf16x6",       "hipblaslt_bf16",
-        "tiled_32x32_k64_bf16x6", "tiled_64x64_k64_bf16x6", "tiled_32x64_k64_bf16x6"};
-    int modes = 12, failed = 0;
+        "tiled_32x32_k64_bf16x6", "tiled_64x64_k64_bf16x6", "tiled_32x64_k64_bf16x6",
+        "tiled_32x32_bf16x3"};
+    int modes = 13, failed = 0;
+    if (argc == 9) {
+        bool found = false;
+        for (const char *name : names)
+            found |= !std::strcmp(name, argv[8]);
+        if (!found)
+            return 2;
+    }
 #ifdef GN_HIPBLASLT
-    void *lt = gn_lt_open(), *workspace;
+    void *lt = gn_lt_open(1), *workspace;
     if (!lt)
         return 1;
-    size_t workspace_bytes = 64u * 1024 * 1024;
+    size_t workspace_bytes = 64u * 1024 * 1024 + (((size_t)M * N * 4 + 255) & ~(size_t)255);
     HIP_OK(hipMalloc(&workspace, workspace_bytes));
 #endif
     for (int mode = 0; mode < modes; mode++) {
-#ifndef GN_HIPBLASLT
-        if (mode == 7 || mode == 8)
+        if (argc == 9 && std::strcmp(names[mode], argv[8]))
             continue;
+#ifndef GN_HIPBLASLT
+        if (mode == 7 || mode == 8) {
+            if (argc == 9)
+                return 77;
+            continue;
+        }
 #endif
-        int precise = mode != 2 && mode != 8, add = 0;
+        int precise = mode == 12 ? 2 : mode != 2 && mode != 8, add = 0;
+        int products = mode == 12 ? 3 : precise ? 6 : 1;
         auto pack = [&] {
             if (!mode)
                 return;
@@ -145,6 +158,9 @@ int main(int argc, char **argv) {
         };
         auto kernel = [&] {
             switch (mode) {
+            case 12:
+                gn_mm_bf16x3<<<dim3((N + 31) / 32, (M + 31) / 32), 128>>>(y, pa, pb, M, N, K, add);
+                break;
             case 0:
                 gn_mm<<<dim3((N + 15) / 16, (M + 15) / 16), 32>>>(y, a, b, M, N, K, ta, tb, add, 1);
                 break;
@@ -226,19 +242,25 @@ int main(int argc, char **argv) {
         double relative = std::sqrt(delta / std::fmax(base, 1e-30));
         if (!std::isfinite(relative) || relative > (precise ? 2e-5 : .02))
             failed = 1;
-        int pm = mode == 0 ? 16 : mode == 3 || mode == 5 || mode == 9 || mode == 11 ? 32 : 64;
-        int pn = mode == 0 ? 16 : mode == 4 || mode == 5 || mode == 9 ? 32 : mode == 6 ? 128 : 64;
-        int pk = mode == 0 ? 16 : mode >= 9 ? 64 : 32;
+        int pm = mode == 0                                                         ? 16
+                 : mode == 3 || mode == 5 || mode == 9 || mode == 11 || mode == 12 ? 32
+                                                                                   : 64;
+        int pn = mode == 0                                           ? 16
+                 : mode == 4 || mode == 5 || mode == 9 || mode == 12 ? 32
+                 : mode == 6                                         ? 128
+                                                                     : 64;
+        int pk = mode == 0 ? 16 : mode >= 9 && mode <= 11 ? 64 : 32;
         double executed = 2.0 * ((M + pm - 1) / pm * pm) * ((N + pn - 1) / pn * pn) *
-                          ((K + pk - 1) / pk * pk) * (precise ? 6 : 1);
+                          ((K + pk - 1) / pk * pk) * products;
         std::printf("{\"mode\":\"%s\",\"kernel_ms\":%.6g,\"pack_plus_kernel_ms\":%.6g,\"useful_"
                     "tflops\":%.6g,\"matrix_products_tflops\":%.6g,\"sample_relative_l2\":%.6g",
                     names[mode], kernel_ms, total_ms, 2.0 * M * N * K / (total_ms * 1e9),
-                    2.0 * M * N * K * (precise ? 6 : 1) / (kernel_ms * 1e9), relative);
+                    2.0 * M * N * K * products / (kernel_ms * 1e9), relative);
         /* Vendor instruction padding is not known; never fabricate its count. */
         if (mode < 7 || mode >= 9)
             std::printf(",\"executed_wmma_tflops\":%.6g", executed / (kernel_ms * 1e9));
-        double fraction = 2.0 * M * N * K * (precise ? 6 : 1) / (kernel_ms * 1e9 * peak);
+        double fraction = 2.0 * M * N * K * products / (kernel_ms * 1e9 * peak);
+        std::printf(",\"kernel_product_75pct_rate_met\":%s", fraction >= .75 ? "true" : "false");
         std::printf(",\"matrix_product_peak_fraction\":%.6g,\"kernel_product_95pct_target_met\":%s",
                     fraction,
                     fraction >= .95 && relative <= (precise ? 2e-5 : .02) ? "true" : "false");
@@ -248,10 +270,18 @@ int main(int argc, char **argv) {
         kernel();
         std::vector<float> accumulated(hy.size());
         HIP_OK(hipMemcpy(accumulated.data(), y, hy.size() * 4, hipMemcpyDeviceToHost));
+        size_t add_failures = 0;
+        double max_add_error = 0;
         for (size_t i = 0; i < hy.size(); i++)
             if (!std::isfinite(accumulated[i]) ||
-                std::fabs(accumulated[i] - 3 * hy[i]) > 1e-5f + 1e-6f * std::fabs(hy[i]))
+                std::fabs(accumulated[i] - 3 * hy[i]) > 1e-5f + 1e-6f * std::fabs(hy[i])) {
                 failed = 1;
+                add_failures++;
+                max_add_error = std::fmax(max_add_error, std::fabs(accumulated[i] - 3 * hy[i]));
+            }
+        if (add_failures)
+            std::fprintf(stderr, "%s: add mismatch count=%zu max_abs=%g\n", names[mode],
+                         add_failures, max_add_error);
     }
 #ifdef GN_HIPBLASLT
     gn_lt_close(lt);
@@ -265,5 +295,6 @@ int main(int argc, char **argv) {
     HIP_OK(hipFree(pa));
     HIP_OK(hipFree(pb));
     HIP_OK(hipFree(sink));
+    std::printf("{\"matrix_diagnostic_pass\":%s}\n", failed ? "false" : "true");
     return failed;
 }

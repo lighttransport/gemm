@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-#include "gn.h"
+#include "gn_internal.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,6 +97,24 @@ int main(int argc, char **argv) {
     if (c.blocks == 20)
         fprintf(stderr, "training losses CPU %.9g %.9g GPU %.9g %.9g\n", a.policy, a.value,
                 b.policy, b.value);
+    if (report) {
+        if (check(gn_gpu_debug_nodes(gpu)))
+            goto done;
+        const char *kind[] = {"input", "linear", "conv", "add", "mul",
+                              "relu",  "silu",   "bn",   "ln",  "attention"};
+        for (size_t i = 0; i < cpu->nn; i++) {
+            Node *cn = &cpu->n[i], *gn = &gpu->n[i];
+            size_t count = cn->r * cn->c, flips = 0;
+            if (cn->kind == RELU) {
+                Node *ca = &cpu->n[cn->a], *ga = &gpu->n[gn->a];
+                for (size_t j = 0; j < count; j++)
+                    flips += (ca->x[j] > 0) != (ga->x[j] > 0);
+            }
+            fprintf(stderr, "node %zu %s %zux%zu: value_rel=%.8g grad_rel=%.8g relu_flips=%zu\n", i,
+                    kind[cn->kind], cn->r, cn->c, relative(cn->x, gn->x, count),
+                    relative(cn->g, gn->g, count), flips);
+        }
+    }
     double total_delta = 0, total_base = 0;
     for (size_t i = 0; i < gn_tensor_count(cpu); i++) {
         size_t r, n;
@@ -122,8 +140,8 @@ int main(int argc, char **argv) {
         memcpy(cg, gg, r * n * sizeof(float));
     }
     double grad = sqrt(total_delta / fmax(total_base, 1e-12));
-    if (!isfinite(grad) || !isfinite(a.policy) || !isfinite(b.policy) ||
-        !isfinite(a.value) || !isfinite(b.value) || grad > 0.001 ||
+    if (!isfinite(grad) || !isfinite(a.policy) || !isfinite(b.policy) || !isfinite(a.value) ||
+        !isfinite(b.value) || grad > 0.001 ||
         fabs(a.policy - b.policy) + fabs(a.value - b.value) > tol) {
         fprintf(stderr, "GPU backward mismatch %.9g\n", grad);
         if (!report)

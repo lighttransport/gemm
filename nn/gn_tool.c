@@ -309,19 +309,24 @@ int main(int argc, char **argv) {
                    gemm_rate * (integer == 16 ? 4 : 1));
         printf(",\"fp32_attention_tflops\":%.6g", total_rate - gemm_rate);
         if (!strncmp(argv[3], "hip", 3) && !strstr(argv[3], "fp32")) {
-            double products = gemm_rate * (integer == 16             ? 4
-                                           : integer                 ? 1
-                                           : strstr(argv[3], "bf16") ? 1
-                                                                     : 6);
+            double products = gemm_rate * (integer == 16                   ? 4
+                                           : integer                       ? 1
+                                           : strstr(argv[3], "bf16-mixed") ? 4
+                                           : strstr(argv[3], "bf16x3")     ? 3
+                                           : strstr(argv[3], "bf16")       ? 1
+                                                                           : 6);
             double peak = integer ? int8_peak : bf16_peak;
             printf(
                 ",\"peak_reference\":\"%s\",\"dense_peak_tops\":%.6g,"
                 "\"gemm_product_tops\":%.6g,\"gemm_product_peak_pct\":%.6g,"
                 "\"useful_gemm_peak_pct\":%.6g,\"timing_scope\":\"whole_training_step\","
                 "\"product_count_excludes_padding\":true,\"training_qualification\":\"unresolved\","
-                "\"95pct_training_target_met\":false",
+                "\"95pct_training_target_met\":false,\"75pct_product_rate_met\":%s,"
+                "\"1000_examples_per_second_rate_met\":%s,\"qualified_target_met\":false",
                 argc == 8 ? "user-supplied dense" : "RX 9070 XT nominal dense", peak, products,
-                products / peak * 100, gemm_rate / peak * 100);
+                products / peak * 100, gemm_rate / peak * 100,
+                products / peak >= .75 ? "true" : "false",
+                batch * iterations / train_seconds >= 1000 ? "true" : "false");
         }
         printf("}\n");
         rc = 0;

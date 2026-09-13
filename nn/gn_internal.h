@@ -35,5 +35,7 @@ int gn_gpu_forward(gn_model *, const float *);
 int gn_gpu_backward(gn_model *, const float *, const uint32_t *, gn_metrics *);
 int gn_gpu_update(gn_model *, float, float, float, gn_metrics *);
 int gn_gpu_sync(gn_model *);
+/* Diagnostic only: snapshot resident graph values/gradients after backward. */
+int gn_gpu_debug_nodes(gn_model *);
 void gn_gpu_zero(gn_model *);
 #endif

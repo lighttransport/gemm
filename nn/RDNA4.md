@@ -390,3 +390,178 @@ rates are not used. See [AMD's RX 9070 XT specifications](https://www.amd.com/en
 Next work: diagnose full-model gradient divergence layer by layer, improve
 weight-pack reuse, pack backward im2col directly, time/cache Lt algorithms, and
 pipeline larger LDS tiles. **95% peak is still not achieved.**
+
+## BF16/FP32 follow-up
+
+The current focus is BF16 operands with **FP32 matrix accumulation**, FP32
+master weights/gradients/Adam state, and existing FP32/FP64 nonmatrix math.
+The revised targets are 75% nominal dense matrix peak or 1,000 full-model
+training examples/s. The latter is reached **as timing only** by the
+single-product experiment; no new full-training qualification is claimed.
+BF16 accumulation and integer experiments remain available, but are not the
+default or promoted paths.
+
+### Implemented changes
+
+- Pack backward convolution operands directly from NHWC into transposed BF16
+  tiles, eliminating the FP32 im2col write/read. Both forward/backward packing
+  specialize default C256/3x3 and C80/5x5 indexing; other dimensions retain a
+  generic path. Packing is bit-identical to separate expansion/conversion.
+- Coalesce BN forward/backward over eight neighboring NHWC channels per CTA.
+  Statistics and reduction sums remain double; normalization/state remain FP32.
+  LayerNorm and CUDA dispatch are unchanged.
+- Add `hip-bf16-blaslt` for single-product BF16/FP32 training; add
+  `hip-bf16x3` and `hip-bf16x3-blaslt` for two-component, three-product
+  compensation (`Ahi*Bhi + Alo*Bhi + Ahi*Blo`, separate FP32 high/correction
+  accumulators). These use compensation in inference as well as training.
+- Add `hip-bf16-mixed` and `hip-bf16-mixed-blaslt`: six products forward,
+  including inference, three products backward. This protects forward/ReLU
+  decisions at lower cost than six products for all three matrix operations.
+  All new arithmetic variants are explicit, experimental backends; none is
+  enabled by campaign preflight or the engine.
+- Add per-node value/gradient snapshots and ReLU sign-difference counts to
+  `test_gpu ... report`. These transfers occur only in the diagnostic test,
+  never normal training or performance timing. Numerical gates are unchanged.
+- Add a benchmark-only, 32-candidate hipBLASLt event-timing search. A separate
+  workspace destination preserves the caller's C during beta=1 trials; the
+  shape cache reuses the same algorithm for zero/nonzero beta, avoiding
+  additional reduction-order drift in add checks. Model execution deliberately uses
+  deterministic first-supported heuristics: timed selection varied between
+  model creation/reload and failed exact checkpoint inference. No timings or
+  backend choices are silently serialized into model weights. The adapter
+  explicitly resolves HIP event entry points to avoid collisions with ROCEW's
+  legacy exported function-pointer names. Library calls follow the
+  [public hipBLASLt API](https://rocm.docs.amd.com/projects/hipBLASLt/en/latest/reference/api-reference.html).
+
+The Lt workspace is caller-budgeted: 64 MiB library workspace plus an aligned
+FP32 output-sized scratch region for the benchmark tuning contract. Plans own
+no extra application tensor allocations. The SDK-free build stays SDK-free.
+
+### Measured full-model throughput
+
+RX 9070 XT gfx1201, the same ROCm/HIP/Lt versions documented above, unchanged
+device settings. C256/20 blocks, 22,764,238 learned parameters, synthetic
+resident benchmark input. Timings include forward, backward, gradient clipping,
+and AdamW, but exclude RTC compilation, initialization, initial uploads,
+checkpoint I/O and replay decoding. These are bounded steady-state tests,
+on a shared host without locked clocks, not a sustained dataset-training or
+playing-strength result.
+
+Three alternating before/after runs of 100 measured training steps at batch 16:
+
+| Standard six-product hybrid | Before | After |
+|---|---:|---:|
+| Median examples/s | 398.975 | **439.431** |
+| Range examples/s | 398.406–400.248 | 439.083–441.174 |
+| Inference ms (median across runs) | 6.99530 | 5.74940 |
+
+The normal path gains **10.14%** training throughput without changing its
+six-product training arithmetic. Whole-step useful GEMM rate is 4.71117
+TFLOP/s (2.41598% of dense peak), compensation-product rate 28.2670 TFLOP/s
+(14.4959%), and separate FP32 attention 0.0354276 TFLOP/s.
+
+Matched `rocprofv3` runs of `hip-bf16 16 20` locate the gains outside GEMM.
+Across 52 forward passes (warmups, inference and training), forward column
+packing drops 86.194→42.371 ms and total BN/LN forward 58.649→41.387 ms.
+Across 22 backward passes, BN/LN backward drops 40.565→27.006 ms. Backward
+FP32 columns (35.886 ms) disappear, replaced by 16.576 ms direct BF16 packing,
+also removing 726 ordinary packing calls. GEMM kernel time is approximately
+unchanged (200.285→201.764 ms). These are aggregate profiler kernel times,
+not extra unprofiled speed measurements or sums including overlapping HIP API time.
+
+For the new variants, three runs of 100 measured steps each at **batch 64**:
+
+| Backend | Median examples/s | Range | Useful matrix TFLOP/s including attention | BF16 product TFLOP/s | Product % dense peak |
+|---|---:|---:|---:|---:|---:|
+| `hip-bf16-blaslt` | **1133.28** | 1132.31–1133.97 | 12.2413 | 12.1499 | **6.23073%** |
+| `hip-bf16x3-blaslt` | 782.170 | 781.347–783.306 | 8.44874 | 25.1570 | 12.9011% |
+| `hip-bf16-mixed-blaslt` | 703.266 | 702.055–703.351 | 7.59645 | 30.1590 | 15.4662% |
+
+After the final shape-cache correction, 100-step spot checks were 1139.33
+examples/s for single-product and 703.869 for mixed; exact C32 mixed reload
+also passed. The table retains the three-run medians, not these faster spots.
+
+Host tensor allocation is 2,415,790,304 bytes at batch 64, versus 877,219,808
+at batch 16. Host/device tensor budgets remain separately capped at 6 GiB;
+these numbers are not total process/driver memory. Batch changes also change
+BN statistics: this sweep does **not** change campaign defaults.
+
+Single bounded batch-16 runs measured 772.626 / 584.703 / 529.010 examples/s
+for one-product / three-product / mixed Lt respectively. Batch 32 single-
+product reached 976.067 examples/s. Increasing batch amortizes overhead;
+it does not imply the arithmetic or accuracy is unchanged.
+
+Rates use 2 operations per FMA and no padded-operation inflation. Useful
+conv/linear work is 10,721,055,744 FLOPs/example; FP32 attention contributes
+80,621,568. Product multipliers are 1, 3, and **4 averaged over the full
+forward/backward step** for the three experiments. A higher compensated
+product percentage is not more useful model work. The denominator remains
+the 195 TFLOP/s **dense** 16-bit matrix reference, not the sparse 389 rate;
+75% is 146.25 TFLOP/s. See [AMD product specifications](https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9070xt.html)
+and the [BF16/FP16 RDNA4 throughput table](https://gpuopen.com/learn/using_matrix_core_amd_rdna4/).
+
+The separate tuned one-product Lt diagnostic at 4096 cubed measured
+104.204 TFLOP/s (53.4377%, 1.31895 ms matrix only), or 87.0666 TFLOP/s including
+packing. At 8192 cubed it was slower: 82.0221 TFLOP/s (42.0626%, 13.4051 ms),
+74.9772 including packing. Sampled FP32-reference relative errors were
+0.0021058 / 0.00200313. Tuning did not beat the previous 125.649 TFLOP/s
+4096-cubed result; neither the current nor prior result reaches 75%.
+Register-only issue diagnostics are still **not GEMM or training throughput**.
+
+### Error and qualification
+
+All errors below are dimensionless global gradient relative L2 against the
+independent CPU FP32 implementation. The unchanged acceptance gate is 0.001.
+Accuracy cases below are **batch 16 or 2, not the batch-64 timing run**.
+
+| Full C256/20 backend | Batch | Gradient relative L2 | Result |
+|---|---:|---:|---|
+| Native standard six products | 16 | 0.0028952338 | FAIL, unchanged from before |
+| `hip-bf16-blaslt` | 16 | 0.38367618 | FAIL |
+| `hip-bf16x3-blaslt` | 16 | 0.013713891 | FAIL |
+| `hip-bf16-mixed-blaslt` | 16 | **0.0038323371** | FAIL |
+| `hip-bf16-mixed-blaslt` | 2 | **0.000024398431** | PASS, including update/reload |
+
+Keeping six-product forward passes cuts batch-16 error about **100x** versus
+one-product training and **3.58x** versus all-three-product training. It is
+close to the earlier six-product hybrid error 0.00383229931, but still misses
+the gate. C32 batch-2 three-product WMMA passes with gradient error
+0.00003532031 (one-product previously 0.0746677). This is a precision/speed
+tradeoff, not an accuracy-approved replacement for the default.
+
+Node diagnostics provide evidence for nonsmooth amplification: on the native
+six-product full batch-16 case, ReLU node 144 has two CPU/GPU sign differences.
+Its output-gradient relative error is 0.000011932171, while its input (node
+143) gradient error is 0.00010006454. Node 140 has another two differences;
+additional single differences occur at 10, 53, 71, 93, 104 and 133. This
+locates error amplification at ReLU boundaries; it does not prove all
+remaining differences harmless or justify relaxing the gate. No activation
+function, tolerance, or campaign acceptance rule was changed.
+
+CPU finite-difference/overfit/exact resume, C4/C32 PyTorch oracles, both RTC
+compilers, CTest 14/14 in both builds, six offline DL tooling tests, CUDA C32
+hardware regression, fused forward/backward packing and integer/BF16 exact
+accumulator checks were exercised. Packing tests now cover side 3/9,
+C=3/8/32/80/256, kernels 3/5, all one/two/three-component layouts, and tails.
+No full batch-64 accuracy, AMD race-tool, long convergence or strength
+qualification is claimed. The 75% target remains unmet, and 1,000 examples/s
+is a **rate-only**, not a qualified-training, success.
+
+### Reproduce
+
+```sh
+# Opt-in build and runtime setup are described earlier in this report.
+nn/build-lt/gn_tool bench MODEL.safetensors hip-bf16-blaslt 64 100 195 389
+nn/build-lt/gn_tool bench MODEL.safetensors hip-bf16-mixed-blaslt 64 100 195 389
+nn/build-lt/test_gpu hip-bf16-mixed-blaslt nn/build/mixed-b2.safetensors full 2 report
+nn/build-lt/test_gpu hip-bf16-mixed-blaslt nn/build/mixed-b16.safetensors full 16 report # fails
+nn/build-lt/bench_rdna4 4096 4096 4096 0 1 100 195 hipblaslt_bf16
+sh nn/test_rdna4.sh nn/build-lt/bench_rdna4
+sh nn/test_rdna4_precision.sh nn/build/bench_rdna4_precision
+```
+
+The final benchmark mode argument is optional and exact-name checked. JSON
+now separates `75pct_product_rate_met`, `1000_examples_per_second_rate_met`,
+and `qualified_target_met` (false here). Raw paired/final observations in the
+embedding tinyshogi checkout are `build/dl/bf16fp32-{before,after}-pair-*.json`,
+`bf16fp32-final-*.json`, and the corresponding `bf16fp32-*.log` diagnostics.

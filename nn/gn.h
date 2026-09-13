@@ -29,6 +29,10 @@ gn_config gn_default_config(void);
  * FP32 master weights/moments and non-matrix math. Neither is qualified for
  * full-network training; int16 uses four INT8 products, not native INT16 MMA.
  * hip-bf16: single BF16 product with FP32 accumulation during training too.
+ * hip-bf16x3: two BF16 components and three products in forward/backward.
+ * hip-bf16-mixed: six products forward (including inference), three backward.
+ * All three accept an optional -blaslt suffix in an SDK-enabled build.
+ * Their matrix accumulators remain FP32; they are not accuracy-qualified.
  * hip-bf16-acc / hip-bf16-acc128: native BF16 accumulators throughout each dot
  * or per K=128 partial, respectively (the latter widens partials to FP32).
  * hip-int8 / hip-int8-i64: INT8 WMMA with INT32 / widened INT64 partial sums.

@@ -6,6 +6,7 @@ bench=${1:-nn/build/bench_rdna4}
 for ta in 0 1; do
     for tb in 0 1; do
         "$bench" 35 67 49 "$ta" "$tb" 5
+        "$bench" 3 2 1 "$ta" "$tb" 5 195 tiled_32x32_bf16x3
     done
 done
 "$bench" 1296 256 2304 0 1 30
