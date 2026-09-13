@@ -140,7 +140,6 @@ extern "C" __global__ void gn_pack_bf16(unsigned short *out, const float *in, in
     __shared__ float tile[32][33];
     int t = threadIdx.x, r0 = blockIdx.y * 32, k0 = blockIdx.x * 32;
     int stride = (K + 31) & ~31;
-#if defined(GN_HIP)
     if (!trans) {
         int r = r0 + t / 8, k = k0 + t % 8 * 4;
         if (r < R) {
@@ -169,7 +168,6 @@ extern "C" __global__ void gn_pack_bf16(unsigned short *out, const float *in, in
         }
         return;
     }
-#endif
     for (int i = t; i < 1024; i += 256) {
         int r = i / 32, k = i % 32;
         int sr = trans ? r0 + k : r0 + r, sk = trans ? k0 + r : k0 + k;
