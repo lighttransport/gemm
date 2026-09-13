@@ -679,6 +679,29 @@ gate but regressed to 759.910 examples/s; directly feeding rocBLASLt's two
 compensation outputs into BN was accurate but neutral at 1,039.64 examples/s.
 Neither experiment is retained.
 
+### Backward replay and multi-tensor optimizer
+
+The qualified hybrid records its stable backward DAG as a HIP graph after one
+warm step. Target and label uploads remain outside the graph, while replayed
+kernels read the current device tensors and updated parameter buffers. Graphs
+are invalidated when the batch changes. The report-mode GPU oracle executes two
+backward passes so capture and replay, rather than only graph construction, are
+covered by the numerical check.
+
+Gradient-norm and AdamW processing previously issued 200 launches apiece per
+step. Persistent device descriptor tables now combine each phase into one
+multi-tensor kernel. The Adam kernel retains the original per-element FP32
+arithmetic; only independent tensor/block scheduling and norm reduction order
+change. Batch-64 replay passes with output relative L2 0.000019664309 and global
+gradient relative L2 **0.0008224335**. Three 100-step runs measure **1,076.80
+examples/s median** (1,076.29--1,077.49), 11.6312 useful TFLOP/s and 20.1734
+product TFLOP/s, or **10.3453%** of the nominal 195-TFLOP/s peak.
+
+A 16-query attention CTA was accurate but neutral at 1,076.83 examples/s median
+and is not retained. Dropping one of the three compensated BF16 forward
+products was rejected: output relative L2 rose to 0.004446 and gradient relative
+L2 to 0.135437.
+
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
 The precision allocation executes an estimated 18.3703 trillion 16-bit matrix

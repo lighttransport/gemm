@@ -12,11 +12,19 @@
 #include <string.h>
 #define NODE_BASE (4 * GN_PARAMS)
 #define SCRATCH_BASE (NODE_BASE + 3 * GN_NODES)
-#define SLOT_COUNT (SCRATCH_BASE + 15)
+#define SLOT_COUNT (SCRATCH_BASE + 17)
 typedef struct {
     uint64_t ptr;
     size_t bytes;
 } Buffer;
+typedef struct {
+    uint64_t grad;
+    uint32_t offset, stride, count, pad;
+} NormDesc;
+typedef struct {
+    uint64_t x, mom, var, grad;
+    uint32_t offset, count;
+} AdamDesc;
 typedef struct {
     int hip, device, active, fp32, fp16, hybrid16, precise, synced, legacy, integer, reduced, chunk;
     int wide, mixed;
@@ -26,8 +34,13 @@ typedef struct {
     CUmodule cuda_module;
     hipModule_t hip_module;
     Buffer b[SLOT_COUNT];
-    void *functions[46];
+    void *functions[48];
     void *lt;
+    hipGraph_t backward_graph;
+    hipGraphExec_t backward_exec;
+    size_t backward_batch;
+    int backward_warm;
+    unsigned norm_descriptors, adam_descriptors;
 } Gpu;
 static const char *names[] = {"gn_mm",
                               "gn_columns",
@@ -74,7 +87,9 @@ static const char *names[] = {"gn_mm",
                               "gn_columns_fp16_back",
                               "gn_point_pair",
                               "gn_bn_silu_channels",
-                              "gn_bn_silu_back_channels"};
+                              "gn_bn_silu_back_channels",
+                              "gn_grad_norm_multi",
+                              "gn_adam_multi"};
 static int current(Gpu *g) {
     int rc = g->hip ? (int)hipSetDevice(g->device) : (int)cuCtxSetCurrent(g->context);
     return rc ? gn_fail("cannot activate GPU context") : 0;
@@ -435,7 +450,7 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         gn_fail("GPU module load failed");
         goto bad;
     }
-    for (int i = 0; i < (g->hip ? 46 : 28); i++) {
+    for (int i = 0; i < (g->hip ? 48 : 28); i++) {
         if (g->hip) {
             hipFunction_t f;
             rc = (int)hipModuleGetFunction(&f, g->hip_module, names[i]);
@@ -461,6 +476,10 @@ void gn_gpu_close(void *opaque) {
         return;
     if (g->active) {
         current(g);
+        if (g->backward_exec)
+            hipGraphExecDestroy(g->backward_exec);
+        if (g->backward_graph)
+            hipGraphDestroy(g->backward_graph);
 #ifdef GN_HIPBLASLT
         gn_lt_close(g->lt);
 #endif
@@ -638,6 +657,25 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
     uint64_t p = PTR_NODE(m, m->policy, 0), v = PTR_NODE(m, m->value, 0),
              dp = PTR_NODE(m, m->policy, 1), dv = PTR_NODE(m, m->value, 1);
     void *lossargs[] = {&dp, &dv, &loss, &p, &v, &t, &l, &B, &A};
+    int capture = 0;
+    if (g->hybrid16 && g->backward_batch && g->backward_batch != m->batch) {
+        if (g->backward_exec)
+            hipGraphExecDestroy(g->backward_exec);
+        if (g->backward_graph)
+            hipGraphDestroy(g->backward_graph);
+        g->backward_exec = NULL;
+        g->backward_graph = NULL;
+        g->backward_warm = 0;
+        g->backward_batch = 0;
+    }
+    if (g->hybrid16 && g->backward_exec) {
+        if (hipGraphLaunch(g->backward_exec, NULL) != hipSuccess)
+            return gn_fail("HIP backward graph launch failed");
+        goto backward_done;
+    }
+    if (g->hybrid16 && g->backward_warm && g->backward_batch == m->batch &&
+        hipStreamBeginCapture(NULL, hipStreamCaptureModeRelaxed) == hipSuccess)
+        capture = 1;
     if (!g->legacy)
         CALL(launch(g, 21, B, 1, 256, lossargs));
     else
@@ -772,6 +810,24 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
             CALL(flat(g, 5, (size_t)count, args));
         }
     }
+    if (capture) {
+        hipGraph_t graph = NULL;
+        hipGraphExec_t exec = NULL;
+        if (hipStreamEndCapture(NULL, &graph) != hipSuccess || !graph ||
+            hipGraphInstantiate(&exec, graph, NULL, NULL, 0) != hipSuccess || !exec) {
+            if (graph)
+                hipGraphDestroy(graph);
+            return gn_fail("HIP backward graph capture failed");
+        }
+        g->backward_graph = graph;
+        g->backward_exec = exec;
+        if (hipGraphLaunch(exec, NULL) != hipSuccess)
+            return gn_fail("HIP backward graph launch failed");
+    } else if (g->hybrid16) {
+        g->backward_warm = 1;
+        g->backward_batch = m->batch;
+    }
+backward_done:
     float *values = malloc((size_t)B * 8);
     if (!values)
         return gn_fail("GPU metrics allocation failed");
@@ -794,6 +850,46 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
     free(values);
     return rc;
 }
+static int prepare_optimizer(gn_model *m) {
+    Gpu *g = m->gpu;
+    if (g->norm_descriptors)
+        return 0;
+    size_t nn = 0, na = 0;
+    for (size_t i = 0; i < m->np; i++)
+        if (m->p[i].learned) {
+            size_t blocks = (m->p[i].r * m->p[i].c + 255) / 256;
+            nn += blocks > 64 ? 64 : blocks;
+            na += blocks;
+        }
+    NormDesc *nd = malloc(nn * sizeof(*nd));
+    AdamDesc *ad = malloc(na * sizeof(*ad));
+    if (!nd || !ad) {
+        free(nd);
+        free(ad);
+        return gn_fail("multi-tensor optimizer descriptor allocation failed");
+    }
+    size_t ni = 0, ai = 0;
+    for (size_t i = 0; i < m->np; i++)
+        if (m->p[i].learned) {
+            uint32_t count = (uint32_t)(m->p[i].r * m->p[i].c);
+            uint32_t blocks = (count + 255) / 256, nb = blocks > 64 ? 64 : blocks;
+            uint64_t x = param(m, &m->p[i], 0), grad = param(m, &m->p[i], 1),
+                     mom = param(m, &m->p[i], 2), var = param(m, &m->p[i], 3);
+            for (uint32_t b = 0; b < nb; b++)
+                nd[ni++] = (NormDesc){grad, b * 256, nb * 256, count, 0};
+            for (uint32_t b = 0; b < blocks; b++)
+                ad[ai++] = (AdamDesc){x, mom, var, grad, b * 256, count};
+        }
+    uint64_t ndp = buffer(g, SCRATCH_BASE + 15, nn * sizeof(*nd), nd);
+    uint64_t adp = buffer(g, SCRATCH_BASE + 16, na * sizeof(*ad), ad);
+    free(nd);
+    free(ad);
+    if (!ndp || !adp)
+        return -1;
+    g->norm_descriptors = (unsigned)nn;
+    g->adam_descriptors = (unsigned)na;
+    return 0;
+}
 int gn_gpu_update(gn_model *m, float lr, float decay, float clip, gn_metrics *metrics) {
     Gpu *g = m->gpu;
     g->synced = 0;
@@ -803,17 +899,23 @@ int gn_gpu_update(gn_model *m, float lr, float decay, float clip, gn_metrics *me
         return -1;
     CALL(zero(g, norm, 8));
     float inv = 1.0f / m->accumulated;
-    for (size_t i = 0; i < m->np; i++)
-        if (m->p[i].learned) {
-            int count = (int)(m->p[i].r * m->p[i].c);
-            uint64_t grad = param(m, &m->p[i], 1);
-            void *args[] = {&norm, &grad, &count, &inv};
-            if (g->hip && !g->legacy) {
-                unsigned blocks = (count + 255) / 256;
-                CALL(launch(g, 30, blocks > 64 ? 64 : blocks, 1, 256, args));
-            } else
-                CALL(flat(g, 12, (size_t)count, args));
-        }
+    if (g->hybrid16) {
+        CALL(prepare_optimizer(m));
+        uint64_t descriptors = g->b[SCRATCH_BASE + 15].ptr;
+        void *args[] = {&norm, &descriptors, &g->norm_descriptors, &inv};
+        CALL(launch(g, 46, g->norm_descriptors, 1, 256, args));
+    } else
+        for (size_t i = 0; i < m->np; i++)
+            if (m->p[i].learned) {
+                int count = (int)(m->p[i].r * m->p[i].c);
+                uint64_t grad = param(m, &m->p[i], 1);
+                void *args[] = {&norm, &grad, &count, &inv};
+                if (g->hip && !g->legacy) {
+                    unsigned blocks = (count + 255) / 256;
+                    CALL(launch(g, 30, blocks > 64 ? 64 : blocks, 1, 256, args));
+                } else
+                    CALL(flat(g, 12, (size_t)count, args));
+            }
     float result[2];
     CALL(copy_from(g, result, norm, 8));
     if (result[1] || !isfinite(result[0]))
@@ -821,14 +923,19 @@ int gn_gpu_update(gn_model *m, float lr, float decay, float clip, gn_metrics *me
     float length = sqrtf(result[0]), scale = inv * (length > clip ? clip / length : 1);
     uint64_t step = m->step + 1;
     float b1 = 1 - (float)pow(.9, (double)step), b2 = 1 - (float)pow(.999, (double)step);
-    for (size_t i = 0; i < m->np; i++)
-        if (m->p[i].learned) {
-            int count = (int)(m->p[i].r * m->p[i].c);
-            uint64_t x = param(m, &m->p[i], 0), grad = param(m, &m->p[i], 1),
-                     mom = param(m, &m->p[i], 2), var = param(m, &m->p[i], 3);
-            void *args[] = {&x, &mom, &var, &grad, &count, &scale, &lr, &decay, &b1, &b2};
-            CALL(flat(g, 13, (size_t)count, args));
-        }
+    if (g->hybrid16) {
+        uint64_t descriptors = g->b[SCRATCH_BASE + 16].ptr;
+        void *args[] = {&descriptors, &g->adam_descriptors, &scale, &lr, &decay, &b1, &b2};
+        CALL(launch(g, 47, g->adam_descriptors, 1, 256, args));
+    } else
+        for (size_t i = 0; i < m->np; i++)
+            if (m->p[i].learned) {
+                int count = (int)(m->p[i].r * m->p[i].c);
+                uint64_t x = param(m, &m->p[i], 0), grad = param(m, &m->p[i], 1),
+                         mom = param(m, &m->p[i], 2), var = param(m, &m->p[i], 3);
+                void *args[] = {&x, &mom, &var, &grad, &count, &scale, &lr, &decay, &b1, &b2};
+                CALL(flat(g, 13, (size_t)count, args));
+            }
     int rc = g->hip ? (int)hipDeviceSynchronize() : (int)cuCtxSynchronize();
     if (rc)
         return gn_fail("GPU optimizer execution failed");

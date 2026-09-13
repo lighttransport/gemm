@@ -97,6 +97,13 @@ int main(int argc, char **argv) {
     if (check(gn_backward(cpu, B, x, target, labels, &a)) ||
         check(gn_backward(gpu, B, x, target, labels, &b)))
         goto done;
+    /* Report-mode HIP qualification exercises graph capture/replay, not just
+     * its uncaptured warmup. Accumulating the identical batch twice preserves
+     * the averaged optimizer update while making gradients directly comparable. */
+    if (report && !strncmp(argv[1], "hip", 3) &&
+        (check(gn_backward(cpu, B, x, target, labels, &a)) ||
+         check(gn_backward(gpu, B, x, target, labels, &b))))
+        goto done;
     if (c.blocks == 20)
         fprintf(stderr, "training losses CPU %.9g %.9g GPU %.9g %.9g\n", a.policy, a.value,
                 b.policy, b.value);

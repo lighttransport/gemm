@@ -393,6 +393,53 @@ extern "C" __global__ void gn_grad_norm_parallel(float *norm, const float *g, in
             atomicExch(norm + 1, 1);
     }
 }
+struct gn_norm_desc {
+    unsigned long long grad;
+    unsigned offset, stride, count, pad;
+};
+extern "C" __global__ void gn_grad_norm_multi(float *norm, const gn_norm_desc *descriptors,
+                                              unsigned descriptor_count, float inv) {
+    if (blockIdx.x >= descriptor_count)
+        return;
+    gn_norm_desc d = descriptors[blockIdx.x];
+    const float *g = reinterpret_cast<const float *>(d.grad);
+    float sum = 0;
+    int invalid = 0;
+    for (unsigned i = d.offset + threadIdx.x; i < d.count; i += d.stride) {
+        float v = g[i] * inv;
+        invalid |= !isfinite(v);
+        sum += v * v;
+    }
+    sum = gn_block_sum(sum);
+    invalid = gn_block_sum(invalid);
+    if (!threadIdx.x) {
+        atomicAdd(norm, sum);
+        if (invalid)
+            atomicExch(norm + 1, 1);
+    }
+}
+struct gn_adam_desc {
+    unsigned long long x, mom, var, grad;
+    unsigned offset, count;
+};
+extern "C" __global__ void gn_adam_multi(const gn_adam_desc *descriptors,
+                                         unsigned descriptor_count, float scale, float lr,
+                                         float decay, float b1, float b2) {
+    if (blockIdx.x >= descriptor_count)
+        return;
+    gn_adam_desc d = descriptors[blockIdx.x];
+    unsigned i = d.offset + threadIdx.x;
+    if (i >= d.count)
+        return;
+    float *x = reinterpret_cast<float *>(d.x), *m = reinterpret_cast<float *>(d.mom),
+          *v = reinterpret_cast<float *>(d.var), *g = reinterpret_cast<float *>(d.grad);
+    float grad = g[i] * scale;
+    float a = .9f * m[i] + .1f * grad, q = .999f * v[i] + .001f * grad * grad;
+    m[i] = a;
+    v[i] = q;
+    x[i] -= lr * ((a / b1) / (sqrtf(q / b2) + 1e-8f) + decay * x[i]);
+    g[i] = 0;
+}
 extern "C" __global__ void gn_lt_combine(float *y, const float *high, const float *low, int count,
                                          int add) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
