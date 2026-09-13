@@ -720,6 +720,13 @@ attention matrix products and excludes the 81-to-96 padding. A profile measured
 the forward attention kernel at 72.31 ms aggregate versus 129.48 ms for the
 previous scalar kernel over the same 128 dispatches.
 
+Packing two 16-query tiles into each 384-thread CTA further halves shared K/V
+loading and reduces the launch grid from six to three query groups per head.
+The arithmetic and oracle result are unchanged. Three batch-64 runs measure
+**1,170.75 examples/s median** (1,167.60--1,172.12), 12.6461 useful TFLOP/s and
+22.2167 logical product TFLOP/s, **11.3932%** of nominal peak. Median inference
+latency is 20.6297 ms across the same runs.
+
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
 The precision allocation executes an estimated 18.3703 trillion 16-bit matrix

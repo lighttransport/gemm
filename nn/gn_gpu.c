@@ -612,7 +612,7 @@ int gn_gpu_forward(gn_model *m, const float *input) {
             void *args[] = {&y, &aux, &x, &w, &B, &side, &C, &D};
             if (!g->legacy)
                 if (g->hybrid16 && side == 9 && D == 32)
-                    CALL(launch(g, 33, B * (C / D) * 6, 1, 192, args));
+                    CALL(launch(g, 33, B * (C / D) * 3, 1, 384, args));
                 else
                     CALL(launch(g, 24, R * (C / D), 1, 256, args));
             else
@@ -792,7 +792,7 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
                     return -1;
                 void *score[] = {&ds, &x, &dy, &aux, &B, &side, &C, &D};
                 if (g->hybrid16 && side == 9 && D == 32)
-                    CALL(launch(g, 39, B * (C / D) * 6, 1, 192, score));
+                    CALL(launch(g, 39, B * (C / D) * 3, 1, 384, score));
                 else
                     CALL(launch(g, 25, R * (C / D), 1, 256, score));
                 void *qkv[] = {&dx, &x, &dy, &aux, &ds, &B, &side, &C, &D};
