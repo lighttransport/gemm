@@ -118,6 +118,79 @@ is therefore **not yet 30 tok/s**: the repeatable first-512 result is about
 per-layer collectives; the bounded kernel and quantization variants above do
 not close the gap.
 
+### Structural continuation after the 27.1 tok/s result
+
+Do not spend the remaining 3.54 ms/token gap on more approximate kernels.
+The next implementation changes must preserve the accepted arithmetic and
+first-512 token/logit stream while removing orchestration overhead:
+
+1. Make KDA decode one persistent OpenMP region. Its projection/state path
+   already uses one team, but input quantization is serial and the output
+   projection starts a second team. Move quantization into `single`, keep the
+   existing ordered worksharing kernels, and execute the output projection in
+   that same team. This removes four team creations per generated token.
+2. Make each INT8 MoE layer one persistent region spanning router projection,
+   top-k setup, gate/up, activation quantization, and down projection. Router
+   top-k and task-prefix construction run in `single` with explicit barriers;
+   the numerical kernels and their row ownership stay unchanged. This removes
+   one team boundary in each of the 42 MoE layers and does not enable the
+   rejected INT8-router or 16-row scheduling experiments.
+3. Only after measuring those two changes, introduce team-callable sparse
+   projection/MLA helpers. The prefix path currently creates separate teams
+   for seven front projections, pool scoring/MLA, and output projection in each
+   of 11 sparse layers. Fuse them per layer, but keep uTofu/MPI calls in a
+   single thread outside active worksharing regions and retain barriers around
+   cache publication. This is the bridge to a token-level persistent executor,
+   not permission to change score, softmax, or accumulation order.
+4. If per-sublayer persistence still misses 30 tok/s, add a token-level executor
+   with one 48-worker team across all 45 layers. Every compute helper must have
+   an orphaned/team form; one thread performs each collective while workers wait
+   at an explicit barrier. Do not call the current nested `parallel` entry
+   points from this executor. A more invasive sequence-parallel stream layout
+   is deferred until this exact executor establishes the remaining collective
+   floor.
+
+For every stage: first run focused correctness tests, then an exact 128-position
+target comparison, then a complete 512-position boost-eco run. Promote only a
+repeatable gain with identical token/logit records. Profile OpenMP-region count
+and collective time separately; the 30 tok/s acceptance number remains the
+unprofiled complete first-512 run at or below 33.333 ms/token.
+
+The combined KDA/MoE per-sublayer persistent-team implementation compiled
+with `mpifcc` and passed the real-weight KDA callback (`rel_l2=6.94e-8`, saved
+state bit-exact). Its complete 512-position target run was also bit-for-bit
+identical to the accepted token/logit record, but regressed to **26.710 tok/s
+(37.439 ms/token)**. The same boost allocation measured 26.914 tok/s for the
+unprofiled accepted control and 27.119--27.192 tok/s for profiled controls.
+Reject per-sublayer persistence: with `FLIB_BARRIER=HARD`, workers spinning
+through serial router/top-k and quantization sections plus the added barriers
+cost more than recreating the teams. Do not apply the proposed sparse fusion
+with this structure. A subsequent persistent executor must span layer
+boundaries and schedule independent work while one thread handles serial work,
+or it must reduce the number of barriers/collectives; launch-to-barrier
+substitution alone is not a viable route to 30 tok/s.
+
+The next bounded structural candidate overlaps useful work across the router
+dependency. The shared expert is selected with weight 1.0 for every token and
+does not depend on router top-k, so split one OpenMP team between BF16 router
+rows and the shared expert's INT8 gate/up tiles. After a barrier/top-k, all
+workers process the selected routed experts, activations, and the unchanged
+routed-then-shared down accumulation. Tune the router worker count, keep this
+path opt-in, and require the same exact 128/512 gates. Unlike the rejected
+persistent attempt, this schedule must demonstrate actual router/shared work
+overlap rather than making workers spin through serial sections.
+
+The router/shared-expert overlap compiled natively and its 128-position output
+was bit-for-bit identical to the accepted record. With 12 router workers it
+measured **27.674 tok/s (36.135 ms/token)** versus **27.630 tok/s (36.193
+ms/token)** for the matched accepted run. The 0.058 ms/token difference is
+noise-sized and far below the remaining target gap: reducing router worker
+parallelism cancels the shared gate/up overlap. Reject this candidate and do
+not carry its split-team implementation. The evidence from both structural
+trials rules out intra-sublayer OpenMP rearrangement as the main route; proceed
+only with a cross-layer executor/communication redesign capable of removing
+multiple milliseconds per token.
+
 The target is one text sequence on 12 A64FX nodes, with 524,288 total context
 positions and at least 30 generated tokens/s (33.333 ms/token), without MTP.
 Use the existing `~/models/glm53f` FP8 checkpoint and its rank-owned `/local`
