@@ -627,6 +627,28 @@ not. Benchmark JSON leaves `training_qualification` unresolved because a
 generic timing command cannot infer that an arbitrary checkpoint passed a
 separate CPU-oracle run; qualification is established by the paired test above.
 
+## 2,000 examples/s follow-up baseline
+
+Batch scaling does not provide the requested second doubling: batch 128
+measured 1,037.07 examples/s versus the batch-64 qualified median of 1,025.39,
+while host tensors grew from 2.416 to 4.467 GB. The path is compute/memory
+limited rather than launch-amortization limited.
+
+A `rocprofv3` trace of the qualified hybrid attributes 15.99% of aggregate
+device time to the leading rocBLASLt kernel family, 11.83% to attention
+forward, 10.31% to BF16 im2col packing, 5.16%/3.93% to BN forward/backward,
+3.91% to normalization, 3.69% to FP16 backward im2col, and 3.25% to attention
+score backward. Percentages cover benchmark warmups, inference, and training;
+they identify targets but are not per-step additive timing claims.
+
+A native gfx1201 FP16 WMMA implementation was tested and rejected. Routing all
+FP16 matrices natively measured 945.210 examples/s; routing only short/small
+shapes measured 981.941 examples/s. Both regress against rocBLASLt, so the
+experimental kernel and dispatcher were removed. Reaching 2,000 examples/s on
+the unchanged model now requires eliminating major data-motion passes—most
+plausibly direct convolution fused with operand preparation and normalization—
+rather than substituting the vendor GEMM path or increasing batch size.
+
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
 The precision allocation executes an estimated 18.3703 trillion 16-bit matrix
