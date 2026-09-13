@@ -39,6 +39,8 @@ int main(int argc, char **argv) {
     }
     gn_metrics metrics;
     ok(gn_backward(m, 2, input, target, label, &metrics));
+    assert(gn_matrix_flops(m) == 104256); /* Explicit small architecture: 3 x 34752. */
+    assert(gn_matrix_flops(NULL) == 0);
     float first = metrics.policy + metrics.value;
     size_t checked = 0;
     /* Central differences across every learned tensor, including Q/K/V,
@@ -77,6 +79,7 @@ int main(int argc, char **argv) {
     }
     assert(metrics.policy + metrics.value < first * 0.7f);
     ok(gn_infer(m, 2, input, policy, wdl));
+    assert(gn_matrix_flops(m) == 34752);
     for (int b = 0; b < 2; b++)
         assert(fabsf(wdl[b * 3] + wdl[b * 3 + 1] + wdl[b * 3 + 2] - 1) < 1e-6f);
     ok(gn_save(m, argv[1]));

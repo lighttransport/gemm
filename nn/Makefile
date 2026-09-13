@@ -8,7 +8,7 @@ $(BUILD):
 	mkdir -p $@
 $(BUILD)/gn.o: gn.c gn.h gn_internal.h gn_cpu.h ../common/safetensors.h ../common/safetensors_writer.h | $(BUILD)
 	$(CC) $(CFLAGS) -fPIC -c gn.c -o $@
-$(BUILD)/gn_kernels.inc: gn_kernels.cu embed_kernels.py | $(BUILD)
+$(BUILD)/gn_kernels.inc: gn_kernels.cu gn_sm120.cuh embed_kernels.py | $(BUILD)
 	python3 -B embed_kernels.py $< $@
 $(BUILD)/gn_gpu.o: gn_gpu.c gn.h gn_internal.h $(BUILD)/gn_kernels.inc
 	$(CC) $(CFLAGS) -Wno-overlength-strings -I$(BUILD) -fPIC -c $< -o $@
@@ -28,5 +28,9 @@ $(BUILD)/test_gpu: test_gpu.c $(OBJECTS)
 	$(CC) $(CFLAGS) $^ -lm -ldl -pthread -o $@
 check: all
 	$(BUILD)/test_gn $(BUILD)/roundtrip.safetensors
+.PHONY: sm120-bench
+sm120-bench: $(BUILD)/bench_sm120
+$(BUILD)/bench_sm120: bench_sm120.cu gn_kernels.cu gn_sm120.cuh | $(BUILD)
+	nvcc -O3 -std=c++17 -arch=sm_120 -Xptxas=-v $< -o $@
 clean:
 	$(RM) $(OBJECTS) $(BUILD)/gn_kernels.inc $(BUILD)/libgn.so $(BUILD)/test_gn $(BUILD)/test_gpu $(BUILD)/gn_tool $(BUILD)/roundtrip.safetensors

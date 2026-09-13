@@ -21,6 +21,10 @@ typedef struct {
 } gn_metrics;
 gn_config gn_default_config(void);
 /* backend: cpu (FP32), cuda, hip; cuda-fp32/hip-fp32 are diagnostic paths.
+ * cuda-legacy retains the original CUDA kernels for A/B performance checks.
+ * cuda-int8/cuda-int16 are EXPERIMENTAL quantized-operand matrix paths, with
+ * FP32 master weights/moments and non-matrix math. Neither is qualified for
+ * full-network training; int16 uses four INT8 products, not native INT16 MMA.
  * Unsupported backends fail explicitly; there is no silent CPU fallback. */
 gn_model *gn_create(const gn_config *config, const char *backend, int device);
 void gn_destroy(gn_model *model);
@@ -28,6 +32,10 @@ const char *gn_error(void);
 const gn_config *gn_configuration(const gn_model *model);
 size_t gn_parameter_count(const gn_model *model);
 size_t gn_memory_used(const gn_model *model);
+/* Useful matrix arithmetic of the current graph: forward (inference) or
+ * forward+backward (training), including attention. Excludes padding,
+ * precision compensation, optimizer and non-matrix operations. FMA = 2. */
+double gn_matrix_flops(const gn_model *model);
 uint64_t gn_step(const gn_model *model);
 /* policy [batch, side*side, actions], wdl [batch,3] probabilities. */
 int gn_infer(gn_model *, size_t batch, const float *input, float *policy, float *wdl);

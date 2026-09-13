@@ -9,24 +9,48 @@
 #include <string.h>
 #define NODE_BASE (4 * GN_PARAMS)
 #define SCRATCH_BASE (NODE_BASE + 3 * GN_NODES)
-#define SLOT_COUNT (SCRATCH_BASE + 8)
+#define SLOT_COUNT (SCRATCH_BASE + 12)
 typedef struct {
     uint64_t ptr;
     size_t bytes;
 } Buffer;
 typedef struct {
-    int hip, device, active, fp32, precise, synced;
+    int hip, device, active, fp32, precise, synced, legacy, integer;
     size_t used, limit;
     CUcontext context;
     CUmodule cuda_module;
     hipModule_t hip_module;
     Buffer b[SLOT_COUNT];
-    void *functions[16];
+    void *functions[32];
 } Gpu;
-static const char *names[] = {"gn_mm",          "gn_columns",   "gn_uncolumns",      "gn_bias",
-                              "gn_bias_back",   "gn_point",     "gn_norm",           "gn_norm_back",
-                              "gn_layer_param", "gn_attention", "gn_attention_back", "gn_loss",
-                              "gn_grad_norm",   "gn_adam",      "gn_mm_fp32"};
+static const char *names[] = {"gn_mm",
+                              "gn_columns",
+                              "gn_uncolumns",
+                              "gn_bias",
+                              "gn_bias_back",
+                              "gn_point",
+                              "gn_norm",
+                              "gn_norm_back",
+                              "gn_layer_param",
+                              "gn_attention",
+                              "gn_attention_back",
+                              "gn_loss",
+                              "gn_grad_norm",
+                              "gn_adam",
+                              "gn_mm_fp32",
+                              "gn_pack_bf16",
+                              "gn_mm_tiled",
+                              "gn_mm_tiled_fast",
+                              "gn_norm_parallel",
+                              "gn_norm_back_parallel",
+                              "gn_layer_param_parallel",
+                              "gn_loss_parallel",
+                              "gn_pack_integer",
+                              "gn_mm_integer",
+                              "gn_attention_parallel",
+                              "gn_attention_scores_back",
+                              "gn_attention_qkv_back",
+                              "gn_attention_bias_back"};
 static int current(Gpu *g) {
     int rc = g->hip ? (int)hipSetDevice(g->device) : (int)cuCtxSetCurrent(g->context);
     return rc ? gn_fail("cannot activate GPU context") : 0;
@@ -114,6 +138,37 @@ static int mm(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, i
     void *args[] = {&y, &a, &b, &M, &N, &K, &ta, &tb, &add, &g->precise};
     if (g->fp32)
         return flat(g, 14, (size_t)M * N, args);
+    if (g->integer) {
+        size_t stride = ((size_t)K + 31) & ~(size_t)31;
+        uint64_t pa = buffer(g, SCRATCH_BASE + 8, M * stride * (g->integer / 8), NULL);
+        uint64_t pb = buffer(g, SCRATCH_BASE + 9, N * stride * (g->integer / 8), NULL);
+        uint64_t sa = buffer(g, SCRATCH_BASE + 10, (size_t)M * 4, NULL);
+        uint64_t sb = buffer(g, SCRATCH_BASE + 11, (size_t)N * 4, NULL);
+        if (!pa || !pb || !sa || !sb)
+            return -1;
+        int bt = !tb;
+        void *ap[] = {&pa, &sa, &a, &M, &K, &ta, &g->integer};
+        void *bp[] = {&pb, &sb, &b, &N, &K, &bt, &g->integer};
+        CALL(launch(g, 22, M, 1, 256, ap));
+        CALL(launch(g, 22, N, 1, 256, bp));
+        void *packed[] = {&y, &pa, &pb, &sa, &sb, &M, &N, &K, &add, &g->integer};
+        return launch(g, 23, (N + 7) / 8, (M + 15) / 16, 32, packed);
+    }
+    if (!g->hip && !g->legacy && M >= 32 && N >= 32 && K >= 32) {
+        size_t stride = ((size_t)K + 31) & ~(size_t)31;
+        uint64_t pa = buffer(g, SCRATCH_BASE + 8, M * stride * 2 * (g->precise ? 3 : 1), NULL);
+        uint64_t pb = buffer(g, SCRATCH_BASE + 9, N * stride * 2 * (g->precise ? 3 : 1), NULL);
+        if (!pa || !pb)
+            return -1;
+        int bt = !tb;
+        void *ap[] = {&pa, &a, &M, &K, &ta, &g->precise};
+        void *bp[] = {&pb, &b, &N, &K, &bt, &g->precise};
+        CALL(launch(g, 15, (K + 31) / 32, (M + 31) / 32, 256, ap));
+        CALL(launch(g, 15, (K + 31) / 32, (N + 31) / 32, 256, bp));
+        void *packed[] = {&y, &pa, &pb, &M, &N, &K, &add};
+        return launch(g, g->precise ? 16 : 17, (N + 63) / 64,
+                      g->precise ? (M + 31) / 32 : (M + 63) / 64, 128, packed);
+    }
     return launch(g, 0, (unsigned)((N + (g->hip ? 15 : 7)) / (g->hip ? 16 : 8)),
                   (unsigned)((M + 15) / 16), 32, args);
 }
@@ -129,6 +184,13 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
     }
     g->hip = !strncmp(backend, "hip", 3);
     g->fp32 = strstr(backend, "fp32") != NULL;
+    g->legacy = strstr(backend, "legacy") != NULL;
+    g->integer = strstr(backend, "int16") ? 16 : strstr(backend, "int8") ? 8 : 0;
+    if (g->integer)
+        fprintf(stderr,
+                "EXPERIMENTAL %s: quantized matrix operands, FP32 master state; "
+                "not qualified for full-network training\n",
+                backend);
     g->device = device;
     g->limit = limit;
     int rc = 0;
@@ -243,7 +305,7 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         gn_fail("GPU module load failed");
         goto bad;
     }
-    for (int i = 0; i < 15; i++) {
+    for (int i = 0; i < (g->hip ? 15 : 28); i++) {
         if (g->hip) {
             hipFunction_t f;
             rc = (int)hipModuleGetFunction(&f, g->hip_module, names[i]);
@@ -346,10 +408,16 @@ int gn_gpu_forward(gn_model *m, const float *input) {
         } else if (n->kind == BN || n->kind == LN) {
             uint64_t mean = param(m, n->mean, 0), var = param(m, n->variance, 0);
             void *args[] = {&y, &aux, &mean, &var, &x, &w, &bias, &R, &C, &layer, &training};
-            CALL(flat(g, 6, layer ? R : C, args));
+            if (!g->hip && !g->legacy)
+                CALL(launch(g, 18, layer ? R : C, 1, 256, args));
+            else
+                CALL(flat(g, 6, layer ? R : C, args));
         } else if (n->kind == ATTENTION) {
             void *args[] = {&y, &aux, &x, &w, &B, &side, &C, &D};
-            CALL(flat(g, 9, (size_t)R * (C / D), args));
+            if (!g->hip && !g->legacy)
+                CALL(launch(g, 24, R * (C / D), 1, 256, args));
+            else
+                CALL(flat(g, 9, (size_t)R * (C / D), args));
         } else {
             uint64_t other = n->b >= 0 ? PTR_NODE(m, n->b, 0) : 0, dummy = 0;
             int count = R * C, op = n->kind, back = 0;
@@ -385,7 +453,10 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
     uint64_t p = PTR_NODE(m, m->policy, 0), v = PTR_NODE(m, m->value, 0),
              dp = PTR_NODE(m, m->policy, 1), dv = PTR_NODE(m, m->value, 1);
     void *lossargs[] = {&dp, &dv, &loss, &p, &v, &t, &l, &B, &A};
-    CALL(flat(g, 11, B, lossargs));
+    if (!g->hip && !g->legacy)
+        CALL(launch(g, 21, B, 1, 256, lossargs));
+    else
+        CALL(flat(g, 11, B, lossargs));
     for (size_t i = m->nn; i-- > 1;) {
         Node *n = &m->n[i];
         int R = (int)n->r, C = (int)n->c, K = n->k, layer = n->kind == LN;
@@ -411,14 +482,33 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
             CALL(flat(g, 4, C, args));
         } else if (n->kind == BN || n->kind == LN) {
             void *args[] = {&dx, &dw, &db, &x, &dy, &w, &aux, &R, &C, &layer};
-            CALL(flat(g, 7, layer ? R : C, args));
+            if (!g->hip && !g->legacy)
+                CALL(launch(g, 19, layer ? R : C, 1, 256, args));
+            else
+                CALL(flat(g, 7, layer ? R : C, args));
             if (layer) {
                 void *pa[] = {&dw, &db, &x, &dy, &aux, &R, &C};
-                CALL(flat(g, 8, C, pa));
+                if (!g->hip && !g->legacy)
+                    CALL(launch(g, 20, C, 1, 256, pa));
+                else
+                    CALL(flat(g, 8, C, pa));
             }
         } else if (n->kind == ATTENTION) {
-            void *args[] = {&dx, &dw, &x, &dy, &aux, &B, &side, &C, &D};
-            CALL(flat(g, 10, (size_t)R * (C / D), args));
+            if (!g->hip && !g->legacy) {
+                uint64_t ds =
+                    buffer(g, SCRATCH_BASE + 6, (size_t)R * (C / D) * side * side * 4, NULL);
+                if (!ds)
+                    return -1;
+                void *score[] = {&ds, &x, &dy, &aux, &B, &side, &C, &D};
+                CALL(launch(g, 25, R * (C / D), 1, 256, score));
+                void *qkv[] = {&dx, &x, &dy, &aux, &ds, &B, &side, &C, &D};
+                CALL(flat(g, 26, (size_t)R * C, qkv));
+                void *relative[] = {&dw, &ds, &B, &side, &C, &D};
+                CALL(launch(g, 27, (2 * side - 1) * (2 * side - 1) * (C / D), 1, 256, relative));
+            } else {
+                void *args[] = {&dx, &dw, &x, &dy, &aux, &B, &side, &C, &D};
+                CALL(flat(g, 10, (size_t)R * (C / D), args));
+            }
         } else {
             uint64_t other = n->b >= 0 ? PTR_NODE(m, n->b, 0) : 0,
                      dother = n->b >= 0 ? PTR_NODE(m, n->b, 1) : 0, dummy = 0;

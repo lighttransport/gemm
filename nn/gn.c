@@ -158,7 +158,9 @@ static int node(gn_model *m, Kind kind, int a, int b, size_t r, size_t c, int k,
 static int build(gn_model *m, size_t batch, int training) {
     if (m->nn && m->batch == batch && m->training == training) {
         /* Keep the tape and buffers for steady-state training/inference. */
-        if (training)
+        /* GPU node gradients are resident and cleared by prepare(); their
+         * unused host mirrors must not add hundreds of MB of CPU writes. */
+        if (training && !m->gpu)
             for (size_t i = 0; i < m->nn; i++)
                 memset(m->n[i].g, 0, m->n[i].r * m->n[i].c * sizeof(float));
         return 0;
@@ -240,7 +242,9 @@ gn_model *gn_create(const gn_config *c, const char *backend, int device) {
     (void)device;
     error_text[0] = 0;
     if (!backend || (strcmp(backend, "cpu") && strcmp(backend, "cuda") && strcmp(backend, "hip") &&
-                     strcmp(backend, "cuda-fp32") && strcmp(backend, "hip-fp32"))) {
+                     strcmp(backend, "cuda-fp32") && strcmp(backend, "hip-fp32") &&
+                     strcmp(backend, "cuda-legacy") && strcmp(backend, "cuda-int8") &&
+                     strcmp(backend, "cuda-int16"))) {
         fail("unknown backend; expected cpu, cuda or hip");
         return NULL;
     }
@@ -290,6 +294,21 @@ void gn_destroy(gn_model *m) {
 const gn_config *gn_configuration(const gn_model *m) { return m ? &m->cfg : NULL; }
 size_t gn_parameter_count(const gn_model *m) { return m ? m->parameters : 0; }
 size_t gn_memory_used(const gn_model *m) { return m ? m->bytes : 0; }
+double gn_matrix_flops(const gn_model *m) {
+    if (!m)
+        return 0;
+    double operations = 0;
+    for (size_t i = 0; i < m->nn; i++) {
+        const Node *n = &m->n[i];
+        if (n->kind == LINEAR || n->kind == CONV) {
+            double K = n->kind == LINEAR ? n->k : (double)m->n[n->a].c * n->k * n->k;
+            operations += (m->training ? 6 : 2) * (double)n->r * n->c * K;
+        } else if (n->kind == ATTENTION) {
+            operations += (m->training ? 12 : 4) * (double)n->r * n->c * m->cfg.side * m->cfg.side;
+        }
+    }
+    return operations;
+}
 uint64_t gn_step(const gn_model *m) { return m ? m->step : 0; }
 size_t gn_tensor_count(const gn_model *m) { return m ? m->np : 0; }
 const char *gn_tensor(gn_model *m, size_t i, size_t *r, size_t *c, float **x, float **g) {

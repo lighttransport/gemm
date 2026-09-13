@@ -6,6 +6,12 @@ WMMA implement forward, backward, accumulation/clipping and AdamW. GPU source
 compiles through NVRTC/HIPRTC; compilation is not hardware correctness validation.
 No vendor BLAS or neural runtime is used.
 
+The default `cuda` path now uses tiled asynchronous operand staging and parallel
+training reductions. See [sm120 results and integer experiments](SM120.md) for
+the measured speedup, FLOP accounting and the **unmet 95% peak target**.
+`cuda-legacy` supports A/B checks; `cuda-int8` and `cuda-int16` are explicit,
+unqualified quantized-operand experiments, not integer-only training.
+
 From GEMM root:
 
 ```sh
@@ -53,7 +59,8 @@ uses three-component operand decomposition and six products (component indices
 i+j≤2), with a separate correction accumulator, to approach FP32 accuracy while
 using MMA/WMMA. Three-product compensation was insufficient for the deep model.
 Matrix accumulators/master state stay FP32; sensitive reductions use doubles.
-GPU attention/reduction kernels still need profiling/tuning.
+CUDA attention/reductions are parallelized; further tuning remains. HIP retains
+the original kernels. GPU graph reuse does not clear unused host node gradients.
 
 Safetensors stores model tensors, `adam.m.*`, `adam.v.*`, `__config` U64[12]
 (gn_config field order including memory cap), and `__state` U64[2] (step, RNG).

@@ -30,6 +30,7 @@ def compile_backend(backend):
     destroy.argtypes = [C.POINTER(C.c_void_p)]
     program = C.c_void_p()
     source = Path(__file__).with_name("gn_kernels.cu").read_bytes()
+    source = source.replace(b'#include "gn_sm120.cuh"', Path(__file__).with_name("gn_sm120.cuh").read_bytes())
     assert create(C.byref(program), source, b"gn_kernels.cu", 0, None, None) == 0
     try:
         flags = [b"--std=c++17", b"--gpu-architecture=gfx1201" if hip else b"--gpu-architecture=compute_120"]

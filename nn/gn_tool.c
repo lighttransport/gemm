@@ -260,7 +260,7 @@ int main(int argc, char **argv) {
             goto bench_done;
         for (size_t i = 0; i < X; i++)
             x[i] = sinf((float)i * .1f);
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 10; i++)
             if (gn_infer(m, batch, x, p, wdl))
                 goto bench_done;
         double start = seconds();
@@ -271,15 +271,22 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < A; i++)
             p[i] = 1.0f / (A / batch);
         gn_metrics metrics;
+        for (int i = 0; i < 2; i++)
+            if (gn_backward(m, batch, x, p, labels, &metrics) ||
+                gn_update(m, .001f, .0001f, 1, &metrics))
+                goto bench_done;
         start = seconds();
         for (unsigned i = 0; i < iterations; i++)
             if (gn_backward(m, batch, x, p, labels, &metrics) ||
                 gn_update(m, .001f, .0001f, 1, &metrics))
                 goto bench_done;
-        printf("{\"batch\":%u,\"inference_ms\":%.6g,\"positions_per_second\":%.6g,"
-               "\"train_examples_per_second\":%.6g,\"host_tensor_bytes\":%zu}\n",
-               batch, inference * 1000, batch / inference, batch * iterations / (seconds() - start),
-               gn_memory_used(m));
+        double train_seconds = seconds() - start, flops = gn_matrix_flops(m);
+        printf(
+            "{\"backend\":\"%s\",\"batch\":%u,\"inference_ms\":%.6g,\"positions_per_second\":%.6g,"
+            "\"train_examples_per_second\":%.6g,\"host_tensor_bytes\":%zu,"
+            "\"matrix_flops_per_example\":%.0f,\"useful_train_matrix_tflops\":%.6g}\n",
+            argv[3], batch, inference * 1000, batch / inference, batch * iterations / train_seconds,
+            gn_memory_used(m), flops / batch, flops * iterations / train_seconds / 1e12);
         rc = 0;
     bench_done:
         free(x);

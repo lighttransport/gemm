@@ -396,3 +396,4 @@ __global__ void gn_adam(float *x, float *m, float *v, float *g, int count, float
     g[i] = 0;
 }
 }
+#include "gn_sm120.cuh"
