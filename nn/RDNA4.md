@@ -773,6 +773,14 @@ Median useful throughput is 13.8529 TFLOP/s and logical product throughput is
 24.3369 TFLOP/s, **12.4805%** of the nominal 195-TFLOP/s peak. Median inference
 latency is 18.4899 ms. The 2,000 examples/s and 75% peak targets remain open.
 
+The compensated rocBLASLt output-combine pass now adds the linear bias in the
+same elementwise kernel, eliminating the following bias dispatch and output
+round trip. It preserves the original `(high + low) + bias` FP32 order; the
+batch-16 and batch-64 oracle results above are unchanged. An alternating A/B
+test with two 200-step windows per binary measured 1,280.99 examples/s mean
+without the fusion and **1,284.84 examples/s with it** (+0.30%). The paired
+inference means were 18.5463 and **18.2949 ms**, respectively.
+
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
 The precision allocation executes an estimated 18.3703 trillion 16-bit matrix

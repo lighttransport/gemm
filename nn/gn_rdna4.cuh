@@ -670,6 +670,12 @@ extern "C" __global__ void gn_lt_combine(float *y, const float *high, const floa
     if (i < count)
         y[i] = (high[i] + low[i]) + (add ? y[i] : 0);
 }
+extern "C" __global__ void gn_lt_combine_bias(float *y, const float *high, const float *low,
+                                               const float *bias, int count, int N, int add) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        y[i] = (high[i] + low[i]) + bias[i % N] + (add ? y[i] : 0);
+}
 /* AccChunk=-1: FP32 accumulators; 0: native BF16 throughout the dot;
  * positive: native BF16 partial dots, widened once per AccChunk products.
  * This changes the training arithmetic and is always opt-in. */

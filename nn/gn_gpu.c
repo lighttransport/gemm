@@ -27,14 +27,14 @@ typedef struct {
 } AdamDesc;
 typedef struct {
     int hip, device, active, fp32, fp16, hybrid16, precise, synced, legacy, integer, reduced, chunk;
-    int wide, mixed;
+    int wide, mixed, bias_fused;
     int x3_backward;
     size_t used, limit;
     CUcontext context;
     CUmodule cuda_module;
     hipModule_t hip_module;
     Buffer b[SLOT_COUNT];
-    void *functions[50];
+    void *functions[51];
     void *lt;
     hipGraph_t backward_graph;
     hipGraphExec_t backward_exec;
@@ -91,7 +91,8 @@ static const char *names[] = {"gn_mm",
                               "gn_grad_norm_multi",
                               "gn_adam_multi",
                               "gn_attention_qkv_back_81",
-                              "gn_uncolumns4_256"};
+                              "gn_uncolumns4_256",
+                              "gn_lt_combine_bias"};
 static int current(Gpu *g) {
     int rc = g->hip ? (int)hipSetDevice(g->device) : (int)cuCtxSetCurrent(g->context);
     return rc ? gn_fail("cannot activate GPU context") : 0;
@@ -177,7 +178,8 @@ static uint64_t param(gn_model *m, Param *p, int part) {
 /* ci>0 packs forward im2col into A; ci<0 packs transposed im2col into B
  * for dW, using -ci input channels. ci=0 consumes ordinary FP32 matrices. */
 static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, int ta,
-                      int tb, int add, int ci, int side, int kernel) {
+                      int tb, int add, int ci, int side, int kernel, uint64_t output_bias) {
+    g->bias_fused = 0;
     void *args[] = {&y, &a, &b, &M, &N, &K, &ta, &tb, &add, &g->precise};
     if (g->fp32)
         return flat(g, 14, (size_t)M * N, args);
@@ -274,6 +276,11 @@ static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, 
                               i > 1 ? 1 : 0, (void *)(uintptr_t)workspace, workspace_bytes, 0))
                     return gn_fail("hipBLASLt compensated training matmul failed");
             int count = M * N;
+            if (output_bias) {
+                void *combine[] = {&y, &high, &low, &output_bias, &count, &N, &add};
+                g->bias_fused = 1;
+                return flat(g, 50, count, combine);
+            }
             void *combine[] = {&y, &high, &low, &count, &add};
             return flat(g, 28, count, combine);
         }
@@ -292,7 +299,7 @@ static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, 
 }
 static int mm(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, int ta, int tb,
               int add) {
-    return mm_columns(g, y, a, b, M, N, K, ta, tb, add, 0, 0, 0);
+    return mm_columns(g, y, a, b, M, N, K, ta, tb, add, 0, 0, 0, 0);
 }
 static int columns(Gpu *g, uint64_t col, uint64_t x, int R, int C, int side, int kernel, int back) {
     void *args[] = {&col, &x, &R, &C, &side, &kernel};
@@ -459,7 +466,7 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         gn_fail("GPU module load failed");
         goto bad;
     }
-    for (int i = 0; i < (g->hip ? 50 : 28); i++) {
+    for (int i = 0; i < (g->hip ? 51 : 28); i++) {
         if (g->hip) {
             hipFunction_t f;
             rc = (int)hipModuleGetFunction(&f, g->hip_module, names[i]);
@@ -599,11 +606,12 @@ int gn_gpu_forward(gn_model *m, const float *input) {
                     x = col;
                 }
             }
-            CALL(mm_columns(g, y, x, w, R, C, K, 0, 1, 0, fused_ci, side, n->k));
             int fused_bias = g->hip && !g->legacy && i + 2 < m->nn &&
                              m->n[i + 1].kind == BN && m->n[i + 1].a == (int)i &&
                              m->n[i + 2].kind == SILU && m->n[i + 2].a == (int)i + 1;
-            if (!fused_bias) {
+            CALL(mm_columns(g, y, x, w, R, C, K, 0, 1, 0, fused_ci, side, n->k,
+                            fused_bias ? 0 : bias));
+            if (!fused_bias && !g->bias_fused) {
                 void *args[] = {&y, &bias, &R, &C};
                 CALL(flat(g, 3, (size_t)R * C, args));
             }
@@ -750,7 +758,7 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
             }
             if (g->x3_backward)
                 g->precise = g->x3_backward == 1 || g->x3_backward == 3 ? 0 : 2;
-            CALL(mm_columns(g, dw, dy, input, C, K, R, 1, 0, 1, fused_ci, side, n->k));
+            CALL(mm_columns(g, dw, dy, input, C, K, R, 1, 0, 1, fused_ci, side, n->k, 0));
             if (g->x3_backward)
                 g->precise = g->x3_backward == 2 || g->x3_backward == 3 ? 0 : 2;
             /* FP16 backward is close to the full-gradient gate. Preserve its
