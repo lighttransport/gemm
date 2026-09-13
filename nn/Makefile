@@ -15,7 +15,7 @@ endif
 FORCE:
 $(BUILD)/backend.config: FORCE | $(BUILD)
 	@python3 -B build_config.py $@ '$(HIPBLASLT)' '$(HIPBLASLT_INCLUDE)' '$(HIPBLASLT_LIB)'
-all: $(BUILD)/test_gn $(BUILD)/libgn.so $(BUILD)/gn_tool $(BUILD)/test_gpu $(BUILD)/test_gpu_shared
+all: $(BUILD)/test_gn $(BUILD)/test_checkpoint_io $(BUILD)/libgn.so $(BUILD)/gn_tool $(BUILD)/test_gpu $(BUILD)/test_gpu_shared $(BUILD)/test_gpu_graph
 $(BUILD):
 	mkdir -p $@
 $(BUILD)/gn.o: gn.c gn.h gn_internal.h gn_cpu.h ../common/safetensors.h ../common/safetensors_writer.h | $(BUILD)
@@ -38,14 +38,19 @@ $(BUILD)/libgn.so: $(OBJECTS)
 	$(CC) -shared $^ -lm -ldl -pthread $(LDLIBS) -o $@
 $(BUILD)/test_gn: test_gn.c $(OBJECTS)
 	$(CC) $(CFLAGS) $^ -lm -ldl -pthread $(LDLIBS) -o $@
+$(BUILD)/test_checkpoint_io: test_checkpoint_io.c $(OBJECTS)
+	$(CC) $(CFLAGS) $^ -lm -ldl -pthread $(LDLIBS) -o $@
 $(BUILD)/gn_tool: gn_tool.c gn_replay.h $(OBJECTS)
 	$(CC) $(CFLAGS) gn_tool.c $(OBJECTS) -lm -ldl -pthread $(LDLIBS) -o $@
 $(BUILD)/test_gpu: test_gpu.c $(OBJECTS)
 	$(CC) $(CFLAGS) $^ -rdynamic -lm -ldl -pthread $(LDLIBS) -o $@
 $(BUILD)/test_gpu_shared: test_gpu.c $(BUILD)/libgn.so
 	$(CC) $(CFLAGS) $< -L$(BUILD) -Wl,-rpath,'$$ORIGIN' -lgn -lm -o $@
+$(BUILD)/test_gpu_graph: test_gpu_graph.c $(BUILD)/libgn.so
+	$(CC) $(CFLAGS) $< -L$(BUILD) -Wl,-rpath,'$$ORIGIN' -lgn -lm -o $@
 check: all
 	$(BUILD)/test_gn $(BUILD)/roundtrip.safetensors
+	$(BUILD)/test_checkpoint_io $(BUILD)/checkpoint-io.safetensors
 	python3 -B test_loader_symbols.py $(BUILD)/libgn.so $(BUILD)/test_gpu
 .PHONY: sm120-bench
 sm120-bench: $(BUILD)/bench_sm120
@@ -59,4 +64,4 @@ rdna4-bench: $(BUILD)/bench_rdna4
 $(BUILD)/bench_rdna4: bench_rdna4.cpp gn_kernels.cu gn_sm120.cuh gn_rdna4.cuh $(BUILD)/backend.config $(if $(filter 1,$(HIPBLASLT)),$(BUILD)/gn_hipblaslt.o) | $(BUILD)
 	TMPDIR=$(abspath $(BUILD)) hipcc -O3 -std=c++17 --offload-arch=gfx1201 $(if $(filter 1,$(HIPBLASLT)),-DGN_HIPBLASLT=1) $< $(if $(filter 1,$(HIPBLASLT)),-x none $(BUILD)/gn_hipblaslt.o) -Wl,-rpath,$(ROCM_PATH)/lib $(LDLIBS) -ldl -o $@
 clean:
-	$(RM) $(OBJECTS) $(BUILD)/gn_kernels.inc $(BUILD)/libgn.so $(BUILD)/test_gn $(BUILD)/test_gpu $(BUILD)/test_gpu_shared $(BUILD)/gn_tool $(BUILD)/roundtrip.safetensors
+	$(RM) $(OBJECTS) $(BUILD)/gn_kernels.inc $(BUILD)/libgn.so $(BUILD)/test_gn $(BUILD)/test_checkpoint_io $(BUILD)/test_gpu $(BUILD)/test_gpu_shared $(BUILD)/test_gpu_graph $(BUILD)/gn_tool $(BUILD)/roundtrip.safetensors $(BUILD)/checkpoint-io.safetensors

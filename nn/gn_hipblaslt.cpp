@@ -28,6 +28,7 @@ struct LtPlan {
 };
 struct LtContext {
     int tune = 0; // 0: first supported, 1: timed search, 2: deterministic RDNA4 plan
+    hipStream_t stream = nullptr;
     hipblasLtHandle_t handle = nullptr;
     hipblasLtMatmulPreference_t pref = nullptr;
     std::vector<LtPlan *> plans;
@@ -74,11 +75,12 @@ static int rdna4_candidate(int m, int n, int k) {
             return choice.candidate;
     return 0;
 }
-extern "C" void *gn_lt_open(int tune) {
+extern "C" void *gn_lt_open(int tune, void *stream) {
     auto *c = new (std::nothrow) LtContext;
     if (!c)
         return nullptr;
     c->tune = tune;
+    c->stream = static_cast<hipStream_t>(stream);
     c->runtime = dlopen("libamdhip64.so", RTLD_LAZY | RTLD_LOCAL);
     if (c->runtime) {
         c->event_create =
@@ -188,18 +190,18 @@ extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, i
                 auto run = [&] {
                     return hipblasLtMatmul(c->handle, p->desc, &alpha, b, p->a, a, p->b, &beta, y,
                                            p->c, trial, p->c, &results[i].algo, workspace,
-                                           results[i].workspaceSize, nullptr);
+                                           results[i].workspaceSize, c->stream);
                 };
                 // Warm each candidate, then amortize timer granularity across
                 // enough launches for sub-100-us RDNA4 kernels.
                 if (run() != HIPBLAS_STATUS_SUCCESS ||
-                    c->event_record(start, nullptr) != hipSuccess)
+                    c->event_record(start, c->stream) != hipSuccess)
                     continue;
                 bool valid = true;
                 for (int repeat = 0; repeat < 100; repeat++)
                     valid = run() == HIPBLAS_STATUS_SUCCESS && valid;
                 float ms = 0;
-                valid = c->event_record(stop, nullptr) == hipSuccess && valid;
+                valid = c->event_record(stop, c->stream) == hipSuccess && valid;
                 valid = c->event_sync(stop) == hipSuccess && valid;
                 valid = c->event_elapsed(&ms, start, stop) == hipSuccess && valid;
                 if (valid && ms < best) {
@@ -234,7 +236,7 @@ extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, i
     float alpha = 1;
     return lt_ok(hipblasLtMatmul(c->handle, plan->desc, &alpha, b, plan->a, a, plan->b, &beta, y,
                                  plan->c, y, plan->c, &plan->algo, workspace, plan->workspace,
-                                 nullptr),
+                                 c->stream),
                  "matmul")
                ? 0
                : -1;

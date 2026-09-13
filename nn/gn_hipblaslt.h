@@ -12,7 +12,9 @@ extern "C" {
  * plus the library budget. First-use tuning never modifies the caller's C. */
 /* tune=1 is a benchmark-only timed heuristic search; model execution uses
  * deterministic first-supported selection for exact checkpoint reloads. */
-void *gn_lt_open(int tune);
+/* stream is a caller-owned HIP stream (NULL selects the default stream).
+ * All matmuls and tuning events use it; it must outlive the context. */
+void *gn_lt_open(int tune, void *stream);
 void gn_lt_close(void *context);
 int gn_lt_run(void *context, void *y, const void *a, const void *b, int M, int N, int K, float beta,
               void *workspace, size_t workspace_bytes, int fp16);

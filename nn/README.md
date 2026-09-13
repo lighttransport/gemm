@@ -38,6 +38,9 @@ From GEMM root:
 
 ```sh
 make -C nn check
+cmake -S nn -B nn/build-cmake -DBUILD_TESTING=ON
+cmake --build nn/build-cmake -j
+ctest --test-dir nn/build-cmake --output-on-failure
 python3 -B nn/reference.py              # optional numpy + torch
 python3 -B nn/compile_gpu.py            # compiler-only GPU checks
 nn/build/test_gpu cuda-fp32             # physical hardware required
@@ -52,6 +55,17 @@ must remain private even in `-rdynamic` executables, so they cannot interpose
 CUDA/HIP runtime functions. CMake runs the same host-only regression. The
 shared-library GPU test accepts the same arguments as `test_gpu`, including
 optional hipBLASLt backends when built with `HIPBLASLT=1`.
+The host suite also injects short writes and final buffered-flush failures;
+each failed save must leave the previous checkpoint byte-for-byte intact,
+reloadable, with no partial file left behind.
+
+For the optional AMD graph regression, build with `HIPBLASLT=1` and run
+`nn/build/test_gpu_graph`, or configure CMake with `GN_HIPBLASLT=ON` and
+`GN_GPU_TESTS=ON`. The latter explicitly requires working RX 9070 XT hardware;
+unavailability fails that opted-in test. It asserts capture and cached replay
+and checks gradients across target/weight updates, larger intervening inference
+batches, and shrinking/growing training batches. Hybrid report-mode tests also
+require three passes (warmup, capture+launch, cached replay) and verify counters.
 
 GPU tests return 77 for unavailable, not PASS. An optional checkpoint path and
 `wide` or `full` argument test 9×9 C32 or the default C256/20-block network,
@@ -112,7 +126,8 @@ GPU graph reuse does not clear unused host node gradients.
 Safetensors stores model tensors, `adam.m.*`, `adam.v.*`, `__config` U64[12]
 (gn_config field order including memory cap), and `__state` U64[2] (step, RNG).
 Checkpoints require an optimizer boundary, validate shapes/dtypes/finite values,
-and use fsync+rename. The consuming application owns JSON provenance sidecars.
+and use fsync+rename only after successful writes, including the final buffered
+close. The consuming application owns JSON provenance sidecars.
 CPU tests require exact resumed inference and the next optimizer update.
 
 GNR1 (`gn_replay.h`) is little-endian: magic, u32 side/channels/actions, channel

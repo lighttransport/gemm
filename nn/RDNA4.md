@@ -682,19 +682,29 @@ Neither experiment is retained.
 
 ### Backward replay and multi-tensor optimizer
 
-The qualified hybrid records its stable backward DAG as a HIP graph after one
-warm step. Target and label uploads remain outside the graph, while replayed
-kernels read the current device tensors and updated parameter buffers. Graphs
-are invalidated when the batch changes. The report-mode GPU oracle executes two
-backward passes so capture and replay, rather than only graph construction, are
-covered by the numerical check.
+Audit correction: this change originally attempted capture on the default
+stream. On the tested runtime `hipStreamBeginCapture(NULL, ...)` returned
+`hipErrorStreamCaptureUnsupported` (900), silently leaving the uncaptured path
+active. The historical measurements below remain measurements of that fallback,
+not evidence of graph replay. The original two-pass oracle did not assert graph
+creation and therefore did not qualify replay.
+
+The corrected implementation uses a model-owned nonblocking HIP stream for
+transfers, native kernels, hipBLASLt (including tuning events), and graph launches.
+After a warm backward pass it captures and launches the stable backward DAG;
+later passes reuse the executable. Target/label uploads remain outside capture.
+Graphs are invalidated both on training-batch changes and whenever an existing
+device buffer grows, including during a larger intervening inference batch.
+Capture failures are explicit errors, and failed recording is ended/cleaned up.
+The report-mode hybrid oracle now performs three passes and asserts one capture
+and two graph launches, covering both first launch and cached replay.
 
 Gradient-norm and AdamW processing previously issued 200 launches apiece per
 step. Persistent device descriptor tables now combine each phase into one
 multi-tensor kernel. The Adam kernel retains the original per-element FP32
 arithmetic; only independent tensor/block scheduling and norm reduction order
-change. Batch-64 replay passes with output relative L2 0.000019664309 and global
-gradient relative L2 **0.0008224335**. Three 100-step runs measure **1,076.80
+change. The original uncaptured batch-64 check passes with output relative L2
+0.000019664309 and global gradient relative L2 **0.0008224335**. Three 100-step runs measure **1,076.80
 examples/s median** (1,076.29--1,077.49), 11.6312 useful TFLOP/s and 20.1734
 product TFLOP/s, or **10.3453%** of the nominal 195-TFLOP/s peak.
 
@@ -712,7 +722,7 @@ decomposition as the qualified convolution path. Relative-position bias,
 softmax, and the softmax Jacobian retain serial FP32/double evaluation. Other
 HIP and CPU/CUDA backends retain their original attention kernels.
 
-The batch-64 replay oracle passes with output relative L2 **0.000019973022** and
+The historical uncaptured batch-64 oracle passes with output relative L2 **0.000019973022** and
 global gradient relative L2 **0.00082430711**. Three 100-step runs measure
 **1,150.29 examples/s median** (1,146.69--1,150.81), with 12.4250 useful matrix
 TFLOP/s and 21.8284 logical product TFLOP/s, **11.1941%** of the nominal
@@ -834,3 +844,39 @@ attention: output **0.000020526279**, gradient **0.000065028274**. These tests
 also pass the optimizer and checkpoint reload gates. CPU gradient/resume and
 ELF export checks pass in both builds. No throughput or long-campaign
 qualification claim is added by these fixes.
+
+### Graph-capture audit fixes (2026-09-14)
+
+The explicit-stream correction described above is now checked on RX 9070 XT
+with hipBLASLt 100401. Commands from GEMM root, with the optional SDK include/lib
+overrides described in the build section when required:
+
+```sh
+make -C nn HIPBLASLT=1 check
+nn/build/test_gpu_graph
+nn/build/test_gpu_shared hip-bf16x3-fp16back-blaslt-fast \
+  nn/build/graph-full.safetensors silu 64 report
+nn/build/gn_tool init nn/build/graph-bench.safetensors silu
+nn/build/gn_tool bench nn/build/graph-bench.safetensors \
+  hip-bf16x3-fp16back-blaslt-fast 64 100 195 389
+```
+
+The full C256/20-block/B64 oracle asserts **one capture and two graph launches**
+and passes: output relative L2 **0.000019970799**, gradient relative L2
+**0.00082566564**, plus AdamW and exact checkpoint reload. The separate
+16-step regression exercises four captures and twelve launches while changing
+targets/weights, growing an intervening inference batch, and shrinking/growing
+training batches; worst CPU-oracle gradient relative L2 was **0.000926273458**.
+
+A single 100-step throughput regression run measured **1,314.91 examples/s**,
+**14.2033 useful matrix TFLOP/s**, and **24.9524 product TFLOP/s** (**12.7961%**
+of the nominal dense 195-TFLOP/s reference). This is a whole-step observation,
+not a new median, sustained throughput promise, or convergence/strength result.
+It preserves the approximately 1,300 examples/s accepted target; 75% and 95%
+of peak remain unmet. The generic benchmark JSON retains its conservative
+`training_qualification: unresolved` marker.
+
+Standalone CMake now registers the three host tests; enabling both
+`GN_HIPBLASLT=ON` and `GN_GPU_TESTS=ON` adds the graph hardware regression.
+The host suite includes checkpoint short-write/final-close fault injection,
+which verifies that a failed save preserves the previous file byte-for-byte.

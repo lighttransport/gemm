@@ -104,13 +104,24 @@ int main(int argc, char **argv) {
     if (check(gn_backward(cpu, B, x, target, labels, &a)) ||
         check(gn_backward(gpu, B, x, target, labels, &b)))
         goto done;
-    /* Report-mode HIP qualification exercises graph capture/replay, not just
-     * its uncaptured warmup. Accumulating the identical batch twice preserves
-     * the averaged optimizer update while making gradients directly comparable. */
-    if (report && !strncmp(argv[1], "hip", 3) &&
-        (check(gn_backward(cpu, B, x, target, labels, &a)) ||
-         check(gn_backward(gpu, B, x, target, labels, &b))))
-        goto done;
+    /* Three passes cover warmup, capture+launch, and cached replay. Equal
+     * accumulation on both devices preserves the averaged optimizer update. */
+    if (report && !strncmp(argv[1], "hip", 3)) {
+        for (int repeat = 0; repeat < 2; repeat++)
+            if (check(gn_backward(cpu, B, x, target, labels, &a)) ||
+                check(gn_backward(gpu, B, x, target, labels, &b)))
+                goto done;
+        if (strstr(argv[1], "fp16back")) {
+            uint64_t captures, launches;
+            if (gn_gpu_graph_stats(gpu, &captures, &launches) != 1 ||
+                captures != 1 || launches != 2) {
+                fprintf(stderr, "HIP qualification did not exercise capture and cached replay\n");
+                goto done;
+            }
+            fprintf(stderr, "HIP backward graph: captures=%llu launches=%llu\n",
+                    (unsigned long long)captures, (unsigned long long)launches);
+        }
+    }
     if (c.blocks == 20)
         fprintf(stderr, "training losses CPU %.9g %.9g GPU %.9g %.9g\n", a.policy, a.value,
                 b.policy, b.value);

@@ -24,13 +24,13 @@ template <int MR, int NR, int BK = 32>
 __global__ __launch_bounds__(128) void tile_variant(float *y, const unsigned short *a,
                                                     const unsigned short *b, int M, int N, int K,
                                                     int add) {
-    gn_rdna4_body<true, MR, NR, BK>(y, a, b, M, N, K, add);
+    gn_rdna4_body<true, MR, NR, BK>(y, a, b, M, N, K, add, nullptr);
 }
 template <int MR, int NR>
 __global__ __launch_bounds__(128) void x3_variant(float *y, const unsigned short *a,
                                                   const unsigned short *b, int M, int N, int K,
                                                   int add) {
-    gn_rdna4_body<true, MR, NR, 32, -1, 3>(y, a, b, M, N, K, add);
+    gn_rdna4_body<true, MR, NR, 32, -1, 3>(y, a, b, M, N, K, add, nullptr);
 }
 /* Register issue diagnostic is deliberately NOT called a GEMM/ML throughput. */
 __global__ void issue_ceiling(float *out, int steps) {
@@ -139,7 +139,7 @@ int main(int argc, char **argv) {
             return 2;
     }
 #ifdef GN_HIPBLASLT
-    void *lt = gn_lt_open(1), *workspace;
+    void *lt = gn_lt_open(1, nullptr), *workspace;
     if (!lt)
         return 1;
     size_t workspace_bytes = 64u * 1024 * 1024 + (((size_t)M * N * 4 + 255) & ~(size_t)255);

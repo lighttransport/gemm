@@ -33,6 +33,7 @@ typedef struct {
     CUcontext context;
     CUmodule cuda_module;
     hipModule_t hip_module;
+    hipStream_t stream;
     Buffer b[SLOT_COUNT];
     void *functions[53];
     void *lt;
@@ -40,6 +41,8 @@ typedef struct {
     hipGraphExec_t backward_exec;
     size_t backward_batch;
     int backward_warm;
+    int capturing;
+    uint64_t graph_captures, graph_launches;
     unsigned norm_descriptors, adam_descriptors;
 } Gpu;
 static const char *names[] = {"gn_mm",
@@ -100,27 +103,56 @@ static int current(Gpu *g) {
     return rc ? gn_fail("cannot activate GPU context") : 0;
 }
 static int copy_to(Gpu *g, uint64_t d, const void *s, size_t bytes) {
-    int rc = g->hip ? (int)hipMemcpy((void *)(uintptr_t)d, s, bytes, hipMemcpyHostToDevice)
+    int rc = g->hip ? (int)hipMemcpyAsync((void *)(uintptr_t)d, s, bytes,
+                                         hipMemcpyHostToDevice, g->stream)
                     : (int)cuMemcpyHtoD(d, s, bytes);
+    /* Preserve the synchronous host-buffer lifetime contract on our stream. */
+    if (!rc && g->hip)
+        rc = (int)hipStreamSynchronize(g->stream);
     return rc ? gn_fail("GPU upload failed") : 0;
 }
 static int copy_from(Gpu *g, void *d, uint64_t s, size_t bytes) {
-    int rc = g->hip ? (int)hipMemcpy(d, (void *)(uintptr_t)s, bytes, hipMemcpyDeviceToHost)
+    int rc = g->hip ? (int)hipMemcpyAsync(d, (void *)(uintptr_t)s, bytes,
+                                         hipMemcpyDeviceToHost, g->stream)
                     : (int)cuMemcpyDtoH(d, s, bytes);
+    if (!rc && g->hip)
+        rc = (int)hipStreamSynchronize(g->stream);
     return rc ? gn_fail("GPU download/execution failed") : 0;
 }
 static int zero(Gpu *g, uint64_t p, size_t bytes) {
-    int rc = g->hip ? (int)hipMemset((void *)(uintptr_t)p, 0, bytes) : (int)cuMemsetD8(p, 0, bytes);
+    int rc = g->hip ? (int)hipMemsetAsync((void *)(uintptr_t)p, 0, bytes, g->stream)
+                    : (int)cuMemsetD8(p, 0, bytes);
     return rc ? gn_fail("GPU clear failed") : 0;
+}
+static void discard_backward_graph(Gpu *g) {
+    if (g->backward_exec)
+        hipGraphExecDestroy(g->backward_exec);
+    if (g->backward_graph)
+        hipGraphDestroy(g->backward_graph);
+    g->backward_exec = NULL;
+    g->backward_graph = NULL;
+    g->backward_warm = 0;
+    g->backward_batch = 0;
 }
 static uint64_t buffer(Gpu *g, int slot, size_t bytes, const void *initial) {
     Buffer *b = &g->b[slot];
     if (b->bytes >= bytes)
         return b->ptr;
+    /* Captured kernel arguments contain raw device pointers. An inference
+     * batch can grow these buffers without changing the next training batch. */
+    if (g->capturing) {
+        gn_fail("GPU workspace changed during backward capture; warmup required");
+        return 0;
+    }
     if (b->ptr) {
-        if (g->hip)
+        discard_backward_graph(g);
+        if (g->hip) {
+            if (hipStreamSynchronize(g->stream) != hipSuccess) {
+                gn_fail("GPU workspace synchronization failed");
+                return 0;
+            }
             hipFree((void *)(uintptr_t)b->ptr);
-        else
+        } else
             cuMemFree(b->ptr);
         g->used -= b->bytes;
         b->ptr = 0;
@@ -155,7 +187,7 @@ static uint64_t buffer(Gpu *g, int slot, size_t bytes, const void *initial) {
 }
 static int launch(Gpu *g, int fn, unsigned x, unsigned y, unsigned threads, void **args) {
     int rc = g->hip ? (int)hipModuleLaunchKernel((hipFunction_t)g->functions[fn], x, y, 1, threads,
-                                                 1, 1, 0, 0, args, NULL)
+                                                 1, 1, 0, g->stream, args, NULL)
                     : (int)cuLaunchKernel((CUfunction)g->functions[fn], x, y, 1, threads, 1, 1, 0,
                                           0, args, NULL);
     if (rc) {
@@ -364,12 +396,16 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
             goto bad;
         }
         g->active = 1;
+        if (hipStreamCreateWithFlags(&g->stream, hipStreamNonBlocking) != hipSuccess) {
+            gn_fail("HIP model stream creation failed");
+            goto bad;
+        }
         if (strstr(backend, "blaslt")) {
 #ifdef GN_HIPBLASLT
             fprintf(stderr, "hip-blaslt: consult RDNA4.md for per-backend gradient results\n");
-            g->lt = gn_lt_open(strstr(backend, "blaslt-fast") ? 2
-                               : strstr(backend, "blaslt-tuned") ? 1
-                                                                  : 0);
+            int tune = strstr(backend, "blaslt-fast") ? 2
+                       : strstr(backend, "blaslt-tuned") ? 1 : 0;
+            g->lt = gn_lt_open(tune, g->stream);
             if (!g->lt) {
                 gn_fail("hipBLASLt initialization failed");
                 goto bad;
@@ -529,10 +565,9 @@ void gn_gpu_close(void *opaque) {
         return;
     if (g->active) {
         current(g);
-        if (g->backward_exec)
-            hipGraphExecDestroy(g->backward_exec);
-        if (g->backward_graph)
-            hipGraphDestroy(g->backward_graph);
+        if (g->stream)
+            hipStreamSynchronize(g->stream);
+        discard_backward_graph(g);
 #ifdef GN_HIPBLASLT
         gn_lt_close(g->lt);
 #endif
@@ -546,6 +581,8 @@ void gn_gpu_close(void *opaque) {
     }
     if (g->hip_module)
         hipModuleUnload(g->hip_module);
+    if (g->stream)
+        hipStreamDestroy(g->stream);
     if (g->cuda_module)
         cuModuleUnload(g->cuda_module);
     if (g->context)
@@ -693,7 +730,7 @@ int gn_gpu_forward(gn_model *m, const float *input) {
             return gn_fail("non-finite GPU value output");
     return 0;
 }
-int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn_metrics *metrics) {
+static int backward(gn_model *m, const float *target, const uint32_t *labels, gn_metrics *metrics) {
     Gpu *g = m->gpu;
     if (g->hybrid16) {
         g->fp16 = 1;
@@ -714,25 +751,23 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
     uint64_t p = PTR_NODE(m, m->policy, 0), v = PTR_NODE(m, m->value, 0),
              dp = PTR_NODE(m, m->policy, 1), dv = PTR_NODE(m, m->value, 1);
     void *lossargs[] = {&dp, &dv, &loss, &p, &v, &t, &l, &B, &A};
-    int capture = 0;
-    if (g->hybrid16 && g->backward_batch && g->backward_batch != m->batch) {
-        if (g->backward_exec)
-            hipGraphExecDestroy(g->backward_exec);
-        if (g->backward_graph)
-            hipGraphDestroy(g->backward_graph);
-        g->backward_exec = NULL;
-        g->backward_graph = NULL;
-        g->backward_warm = 0;
-        g->backward_batch = 0;
-    }
+    if (g->hybrid16 && g->backward_batch && g->backward_batch != m->batch)
+        discard_backward_graph(g);
     if (g->hybrid16 && g->backward_exec) {
-        if (hipGraphLaunch(g->backward_exec, NULL) != hipSuccess)
+        if (hipGraphLaunch(g->backward_exec, g->stream) != hipSuccess)
             return gn_fail("HIP backward graph launch failed");
+        g->graph_launches++;
         goto backward_done;
     }
-    if (g->hybrid16 && g->backward_warm && g->backward_batch == m->batch &&
-        hipStreamBeginCapture(NULL, hipStreamCaptureModeRelaxed) == hipSuccess)
-        capture = 1;
+    if (g->hybrid16 && g->backward_warm && g->backward_batch == m->batch) {
+        int rc = (int)hipStreamBeginCapture(g->stream, hipStreamCaptureModeRelaxed);
+        if (rc) {
+            char message[128];
+            snprintf(message, sizeof(message), "HIP backward graph begin capture failed (%d)", rc);
+            return gn_fail(message);
+        }
+        g->capturing = 1;
+    }
     if (!g->legacy)
         CALL(launch(g, 21, B, 1, 256, lossargs));
     else
@@ -872,19 +907,25 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
             CALL(flat(g, 5, (size_t)count, args));
         }
     }
-    if (capture) {
+    if (g->capturing) {
         hipGraph_t graph = NULL;
         hipGraphExec_t exec = NULL;
-        if (hipStreamEndCapture(NULL, &graph) != hipSuccess || !graph ||
+        int rc = (int)hipStreamEndCapture(g->stream, &graph);
+        g->capturing = 0;
+        if (rc != hipSuccess || !graph ||
             hipGraphInstantiate(&exec, graph, NULL, NULL, 0) != hipSuccess || !exec) {
+            if (exec)
+                hipGraphExecDestroy(exec);
             if (graph)
                 hipGraphDestroy(graph);
             return gn_fail("HIP backward graph capture failed");
         }
         g->backward_graph = graph;
         g->backward_exec = exec;
-        if (hipGraphLaunch(exec, NULL) != hipSuccess)
+        g->graph_captures++;
+        if (hipGraphLaunch(exec, g->stream) != hipSuccess)
             return gn_fail("HIP backward graph launch failed");
+        g->graph_launches++;
     } else if (g->hybrid16) {
         g->backward_warm = 1;
         g->backward_batch = m->batch;
@@ -912,6 +953,30 @@ backward_done:
     }
     free(values);
     return rc;
+}
+int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn_metrics *metrics) {
+    Gpu *g = m->gpu;
+    int rc = backward(m, target, labels, metrics);
+    /* Every early kernel/library/allocation error must end capture, otherwise
+     * subsequent operations (including destruction) inherit a poisoned stream. */
+    if (g->capturing) {
+        hipGraph_t graph = NULL;
+        hipStreamEndCapture(g->stream, &graph);
+        g->capturing = 0;
+        if (graph)
+            hipGraphDestroy(graph);
+    }
+    if (rc)
+        discard_backward_graph(g);
+    return rc;
+}
+int gn_gpu_graph_stats(const gn_model *m, uint64_t *captures, uint64_t *launches) {
+    const Gpu *g = m ? m->gpu : NULL;
+    if (!g || !g->hybrid16)
+        return gn_fail("graph statistics require the HIP hybrid backend");
+    *captures = g->graph_captures;
+    *launches = g->graph_launches;
+    return g->backward_exec != NULL;
 }
 static int prepare_optimizer(gn_model *m) {
     Gpu *g = m->gpu;
@@ -999,7 +1064,7 @@ int gn_gpu_update(gn_model *m, float lr, float decay, float clip, gn_metrics *me
                 void *args[] = {&x, &mom, &var, &grad, &count, &scale, &lr, &decay, &b1, &b2};
                 CALL(flat(g, 13, (size_t)count, args));
             }
-    int rc = g->hip ? (int)hipDeviceSynchronize() : (int)cuCtxSynchronize();
+    int rc = g->hip ? (int)hipStreamSynchronize(g->stream) : (int)cuCtxSynchronize();
     if (rc)
         return gn_fail("GPU optimizer execution failed");
     m->step = step;

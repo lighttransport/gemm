@@ -37,5 +37,7 @@ int gn_gpu_update(gn_model *, float, float, float, gn_metrics *);
 int gn_gpu_sync(gn_model *);
 /* Diagnostic only: snapshot resident graph values/gradients after backward. */
 int gn_gpu_debug_nodes(gn_model *);
+/* Diagnostic only: graph readiness and cumulative successful captures/launches. */
+int gn_gpu_graph_stats(const gn_model *, uint64_t *captures, uint64_t *launches);
 void gn_gpu_zero(gn_model *);
 #endif

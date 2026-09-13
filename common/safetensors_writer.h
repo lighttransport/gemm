@@ -179,9 +179,13 @@ int stw_save(const stw_writer *w, const char *path) {
         const stw_tensor *t = &w->tensors[i];
         if (t->nbytes && fwrite(t->data, 1, t->nbytes, fp) != t->nbytes) goto fail;
     }
-    fclose(fp);
-    free(sb.p);
-    return 0;
+    /* The final buffered write can first report failure at close (ENOSPC/EFBIG).
+     * Callers must not publish a partial checkpoint as a successful save. */
+    {
+        int close_status = fclose(fp);
+        free(sb.p);
+        return close_status == 0 ? 0 : -1;
+    }
 fail:
     fclose(fp);
     free(sb.p);
