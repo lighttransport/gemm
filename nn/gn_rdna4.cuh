@@ -381,6 +381,38 @@ __device__ __forceinline__ void gn_columns_pack_back4_fp16_256(unsigned short *o
         *reinterpret_cast<ushort4 *>(out + kk * stride + r) = packed;
     }
 }
+extern "C" __global__ void gn_uncolumns4_256(float *dx, const float *col, int R, int C, int side,
+                                             int kernel) {
+    int vector = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int Channels = 256, Side = 9, Kernel = 3, K = Channels * Kernel * Kernel;
+    if (vector >= R * Channels / 4)
+        return;
+    int row = vector / (Channels / 4), channel = vector % (Channels / 4) * 4;
+    int position = row % (Side * Side), yy = position / Side, xx = position % Side;
+    float4 sum = {};
+    for (int ky = 0; ky < Kernel; ky++)
+        for (int kx = 0; kx < Kernel; kx++) {
+            int oy = yy - ky + Kernel / 2, ox = xx - kx + Kernel / 2;
+            if (oy < 0 || ox < 0 || oy >= Side || ox >= Side)
+                continue;
+            float4 value = *reinterpret_cast<const float4 *>(
+                col + (row / (Side * Side) * (Side * Side) + oy * Side + ox) * K +
+                (ky * Kernel + kx) * Channels + channel);
+            sum.x += value.x;
+            sum.y += value.y;
+            sum.z += value.z;
+            sum.w += value.w;
+        }
+    float4 value = *reinterpret_cast<float4 *>(dx + row * Channels + channel);
+    value.x += sum.x;
+    value.y += sum.y;
+    value.z += sum.z;
+    value.w += sum.w;
+    *reinterpret_cast<float4 *>(dx + row * Channels + channel) = value;
+    (void)C;
+    (void)side;
+    (void)kernel;
+}
 extern "C" __global__ void gn_columns_fp16_back(unsigned short *out, const float *x, int R, int C,
                                                 int side, int kernel, int precise) {
     if (side == 9 && C == 256 && kernel == 3)

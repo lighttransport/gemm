@@ -34,7 +34,7 @@ typedef struct {
     CUmodule cuda_module;
     hipModule_t hip_module;
     Buffer b[SLOT_COUNT];
-    void *functions[49];
+    void *functions[50];
     void *lt;
     hipGraph_t backward_graph;
     hipGraphExec_t backward_exec;
@@ -90,7 +90,8 @@ static const char *names[] = {"gn_mm",
                               "gn_bn_silu_back_channels",
                               "gn_grad_norm_multi",
                               "gn_adam_multi",
-                              "gn_attention_qkv_back_81"};
+                              "gn_attention_qkv_back_81",
+                              "gn_uncolumns4_256"};
 static int current(Gpu *g) {
     int rc = g->hip ? (int)hipSetDevice(g->device) : (int)cuCtxSetCurrent(g->context);
     return rc ? gn_fail("cannot activate GPU context") : 0;
@@ -295,6 +296,8 @@ static int mm(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, i
 }
 static int columns(Gpu *g, uint64_t col, uint64_t x, int R, int C, int side, int kernel, int back) {
     void *args[] = {&col, &x, &R, &C, &side, &kernel};
+    if (back && g->hybrid16 && C == 256 && side == 9 && kernel == 3)
+        return flat(g, 49, (size_t)R * C / 4, args);
     return flat(g, back ? 2 : 1, (size_t)R * C * (back ? 1 : kernel * kernel), args);
 }
 void *gn_gpu_open(const char *backend, int device, size_t limit) {
@@ -454,7 +457,7 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         gn_fail("GPU module load failed");
         goto bad;
     }
-    for (int i = 0; i < (g->hip ? 49 : 28); i++) {
+    for (int i = 0; i < (g->hip ? 50 : 28); i++) {
         if (g->hip) {
             hipFunction_t f;
             rc = (int)hipModuleGetFunction(&f, g->hip_module, names[i]);

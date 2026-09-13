@@ -140,6 +140,36 @@ extern "C" __global__ void gn_pack_bf16(unsigned short *out, const float *in, in
     __shared__ float tile[32][33];
     int t = threadIdx.x, r0 = blockIdx.y * 32, k0 = blockIdx.x * 32;
     int stride = (K + 31) & ~31;
+#if defined(GN_HIP)
+    if (!trans) {
+        int r = r0 + t / 8, k = k0 + t % 8 * 4;
+        if (r < R) {
+            float4 x = {};
+            if (!(K & 3) && k + 3 < K)
+                x = *reinterpret_cast<const float4 *>(in + r * K + k);
+            else {
+                x.x = k < K ? in[r * K + k] : 0;
+                x.y = k + 1 < K ? in[r * K + k + 1] : 0;
+                x.z = k + 2 < K ? in[r * K + k + 2] : 0;
+                x.w = k + 3 < K ? in[r * K + k + 3] : 0;
+            }
+            ushort4 high = {bf(x.x), bf(x.y), bf(x.z), bf(x.w)};
+            *reinterpret_cast<ushort4 *>(out + r * stride + k) = high;
+            if (precise) {
+                float4 residual = {x.x - unbf(high.x), x.y - unbf(high.y), x.z - unbf(high.z),
+                                   x.w - unbf(high.w)};
+                ushort4 low = {bf(residual.x), bf(residual.y), bf(residual.z), bf(residual.w)};
+                *reinterpret_cast<ushort4 *>(out + (R + r) * stride + k) = low;
+                if (precise != 2) {
+                    ushort4 lowest = {bf(residual.x - unbf(low.x)), bf(residual.y - unbf(low.y)),
+                                      bf(residual.z - unbf(low.z)), bf(residual.w - unbf(low.w))};
+                    *reinterpret_cast<ushort4 *>(out + (2 * R + r) * stride + k) = lowest;
+                }
+            }
+        }
+        return;
+    }
+#endif
     for (int i = t; i < 1024; i += 256) {
         int r = i / 32, k = i % 32;
         int sr = trans ? r0 + k : r0 + r, sk = trans ? k0 + r : k0 + k;
@@ -167,6 +197,25 @@ extern "C" __global__ void gn_pack_fp16(unsigned short *out, const float *in, in
     __shared__ float tile[32][33];
     int t = threadIdx.x, r0 = blockIdx.y * 32, k0 = blockIdx.x * 32;
     int stride = (K + 31) & ~31;
+#if defined(GN_HIP)
+    if (!trans) {
+        int r = r0 + t / 8, k = k0 + t % 8 * 4;
+        if (r < R) {
+            float4 x = {};
+            if (!(K & 3) && k + 3 < K)
+                x = *reinterpret_cast<const float4 *>(in + r * K + k);
+            else {
+                x.x = k < K ? in[r * K + k] : 0;
+                x.y = k + 1 < K ? in[r * K + k + 1] : 0;
+                x.z = k + 2 < K ? in[r * K + k + 2] : 0;
+                x.w = k + 3 < K ? in[r * K + k + 3] : 0;
+            }
+            ushort4 packed = {hf(x.x), hf(x.y), hf(x.z), hf(x.w)};
+            *reinterpret_cast<ushort4 *>(out + r * stride + k) = packed;
+        }
+        return;
+    }
+#endif
     for (int i = t; i < 1024; i += 256) {
         int r = i / 32, k = i % 32;
         int sr = trans ? r0 + k : r0 + r, sk = trans ? k0 + r : k0 + k;

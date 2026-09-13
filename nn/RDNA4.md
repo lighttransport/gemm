@@ -742,6 +742,16 @@ examples/s median** (1,238.24--1,240.56), 13.3987 useful matrix TFLOP/s and
 23.5389 logical product TFLOP/s, **12.0712%** of nominal peak. Median inference
 latency is 18.8272 ms.
 
+The matching C256 uncolumns kernel accumulates four adjacent channels per
+thread with the original nine-tap FP32 order. Generic non-transposed BF16 and
+FP16 matrix packing also bypasses LDS: each HIP thread directly converts and
+stores one aligned four-element vector, while transposed and non-multiple-of-
+four inputs retain safe handling. The batch-64 oracle remains bit-for-purpose
+unchanged at 0.00082430711 gradient relative L2. Three 100-step runs measure
+**1,263.98 examples/s median** (1,262.98--1,266.40), 13.6532 useful TFLOP/s and
+23.9860 logical product TFLOP/s, **12.3005%** of nominal peak. Median inference
+latency is 18.6126 ms.
+
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
 The precision allocation executes an estimated 18.3703 trillion 16-bit matrix
