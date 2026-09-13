@@ -18,8 +18,15 @@ nn/build/test_gpu hip-fp32
 nn/build/test_gpu hip
 ```
 
-GPU tests return 77 for unavailable, not PASS. Small-network relative-L2 checks
-are bring-up tests, not full precision/performance certification. Benchmark with
+GPU tests return 77 for unavailable, not PASS. An optional checkpoint path and
+`wide` or `full` argument test 9×9 C32 or the default C256/20-block network,
+including checkpoint reload. `stress` retains a highly correlated sinusoidal
+full-network case that fails the tight gradient gate even in the FP32 path.
+Reduction order and ReLU boundaries are suspected, but the discrepancy is not
+fully diagnosed. The test is retained, not silently skipped. The main tests
+gate global gradient relative L2 at .001, inference
+relative L2 at .01 (BF16) or .0001 (FP32), and check AdamW elementwise using
+identical already-compared gradients. These are not a strength certification. Benchmark with
 `gn_tool bench MODEL BACKEND BATCH ITERATIONS` after validating that backend.
 
 Defaults: 9×9×80 NHWC, 139 action planes, C256, 20 blocks (every fifth Transformer,
@@ -41,7 +48,11 @@ CPU projections have runtime AVX2/FMA dispatch and up to eight persistent worker
 other POSIX architectures use scalar code. CPU backward is serial/vectorized.
 GPU weights, gradients and moments stay resident; host transfers are inference
 results, metrics and checkpoints. Public operations synchronize. BF16 operand
-conversion is round-to-nearest-even, with FP32 accumulators/master state. Basic
+conversion is round-to-nearest-even. Inference uses one BF16 product. Training
+uses three-component operand decomposition and six products (component indices
+i+j≤2), with a separate correction accumulator, to approach FP32 accuracy while
+using MMA/WMMA. Three-product compensation was insufficient for the deep model.
+Matrix accumulators/master state stay FP32; sensitive reductions use doubles.
 GPU attention/reduction kernels still need profiling/tuning.
 
 Safetensors stores model tensors, `adam.m.*`, `adam.v.*`, `__config` U64[12]

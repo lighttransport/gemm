@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: MIT
  * Original CUDA/HIP network kernels. Compiled by NVRTC/HIPRTC, not a framework.
- * Matrix operands round to BF16; accumulation and trainable state stay FP32.
+ * Inference rounds operands to BF16. Training decomposes each FP32 operand
+ * into three BF16 components and uses six products with separate corrections.
+ * Matrix accumulators and trainable state stay FP32.
  */
 #if defined(GN_HIP)
 #ifndef __HIPCC_RTC__
@@ -36,46 +38,90 @@ __device__ float at(const float *p, int r, int c, int rows, int cols, int trans)
         return 0;
     return trans ? p[c * rows + r] : p[r * cols + c];
 }
+__device__ float unbf(unsigned short x) { return __uint_as_float((unsigned)x << 16); }
+#if !defined(GN_HIP)
+__device__ __forceinline__ void mma(float &d0, float &d1, float &d2, float &d3, const unsigned *av,
+                                    const unsigned *bv) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                 : "r"(av[0]), "r"(av[1]), "r"(av[2]), "r"(av[3]), "r"(bv[0]), "r"(bv[1]));
+}
+#endif
 __global__ void gn_mm(float *y, const float *a, const float *b, int M, int N, int K, int ta, int tb,
-                      int add) {
+                      int add, int precise) {
     int lane = threadIdx.x;
 #if defined(GN_HIP)
     int row0 = blockIdx.y * 16, col0 = blockIdx.x * 16, ix = lane & 15, half = lane >> 4;
     float8 acc = {0, 0, 0, 0, 0, 0, 0, 0};
+    float8 correction = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int k = 0; k < K; k += 16) {
-        ushort8 av, bv;
+        ushort8 av, bv, al, bl, all, bll;
         for (int i = 0; i < 8; i++) {
-            av[i] = bf(at(a, row0 + ix, k + half * 8 + i, M, K, ta));
-            bv[i] = bf(at(b, k + half * 8 + i, col0 + ix, K, N, tb));
+            float va = at(a, row0 + ix, k + half * 8 + i, M, K, ta);
+            float vb = at(b, k + half * 8 + i, col0 + ix, K, N, tb);
+            av[i] = bf(va);
+            bv[i] = bf(vb);
+            al[i] = bf(va - unbf(av[i]));
+            bl[i] = bf(vb - unbf(bv[i]));
+            all[i] = bf((va - unbf(av[i])) - unbf(al[i]));
+            bll[i] = bf((vb - unbf(bv[i])) - unbf(bl[i]));
+        }
+        if (precise) {
+            correction = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(al, bv, correction);
+            correction = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(av, bl, correction);
+            correction = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(al, bl, correction);
+            correction = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(all, bv, correction);
+            correction = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(av, bll, correction);
         }
         acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(av, bv, acc);
     }
     for (int i = 0; i < 8; i++) {
         int r = row0 + half * 8 + i, c = col0 + ix;
         if (r < M && c < N)
-            y[r * N + c] = acc[i] + (add ? y[r * N + c] : 0);
+            y[r * N + c] = (acc[i] + correction[i]) + (add ? y[r * N + c] : 0);
     }
 #else
     int row0 = blockIdx.y * 16, col0 = blockIdx.x * 8, g = lane >> 2, t = lane & 3;
     float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    float l0 = 0, l1 = 0, l2 = 0, l3 = 0;
     for (int k = 0; k < K; k += 16) {
-        unsigned av[4], bv[2];
+        unsigned av[4], bv[2], al[4], bl[2], all[4], bll[2];
         for (int q = 0; q < 4; q++) {
             int r = row0 + g + (q % 2) * 8, c = k + t * 2 + (q / 2) * 8;
-            av[q] = (unsigned)bf(at(a, r, c, M, K, ta)) |
-                    ((unsigned)bf(at(a, r, c + 1, M, K, ta)) << 16);
+            float x0 = at(a, r, c, M, K, ta), x1 = at(a, r, c + 1, M, K, ta);
+            unsigned short h0 = bf(x0), h1 = bf(x1);
+            av[q] = (unsigned)h0 | ((unsigned)h1 << 16);
+            al[q] = (unsigned)bf(x0 - unbf(h0)) | ((unsigned)bf(x1 - unbf(h1)) << 16);
+            all[q] = (unsigned)bf((x0 - unbf(h0)) - unbf((unsigned short)al[q])) |
+                     ((unsigned)bf((x1 - unbf(h1)) - unbf((unsigned short)(al[q] >> 16))) << 16);
         }
         for (int q = 0; q < 2; q++) {
             int r = k + t * 2 + q * 8, c = col0 + g;
-            bv[q] = (unsigned)bf(at(b, r, c, K, N, tb)) |
-                    ((unsigned)bf(at(b, r + 1, c, K, N, tb)) << 16);
+            float x0 = at(b, r, c, K, N, tb), x1 = at(b, r + 1, c, K, N, tb);
+            unsigned short h0 = bf(x0), h1 = bf(x1);
+            bv[q] = (unsigned)h0 | ((unsigned)h1 << 16);
+            bl[q] = (unsigned)bf(x0 - unbf(h0)) | ((unsigned)bf(x1 - unbf(h1)) << 16);
+            bll[q] = (unsigned)bf((x0 - unbf(h0)) - unbf((unsigned short)bl[q])) |
+                     ((unsigned)bf((x1 - unbf(h1)) - unbf((unsigned short)(bl[q] >> 16))) << 16);
         }
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                     : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-                     : "r"(av[0]), "r"(av[1]), "r"(av[2]), "r"(av[3]), "r"(bv[0]), "r"(bv[1]));
+        /* Three BF16 components per operand, six products (i+j<=2).
+         * Keep corrections separate from the high-product accumulator so
+         * adding small products does not repeatedly lose their low bits. */
+        if (precise) {
+            mma(l0, l1, l2, l3, al, bv);
+            mma(l0, l1, l2, l3, av, bl);
+            mma(l0, l1, l2, l3, al, bl);
+            mma(l0, l1, l2, l3, all, bv);
+            mma(l0, l1, l2, l3, av, bll);
+        }
+        mma(d0, d1, d2, d3, av, bv);
     }
     int r = row0 + g, c = col0 + t * 2;
+    d0 += l0;
+    d1 += l1;
+    d2 += l2;
+    d3 += l3;
     if (r < M && c < N)
         y[r * N + c] = d0 + (add ? y[r * N + c] : 0);
     if (r < M && c + 1 < N)
@@ -87,7 +133,8 @@ __global__ void gn_mm(float *y, const float *a, const float *b, int M, int N, in
 #endif
 }
 __global__ void gn_mm_fp32(float *y, const float *a, const float *b, int M, int N, int K, int ta,
-                           int tb, int add) {
+                           int tb, int add, int precise) {
+    (void)precise;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= M * N)
         return;
@@ -247,14 +294,14 @@ __global__ void gn_attention(float *y, float *prob, const float *x, const float 
         prob[t * S + j] = p;
         top = fmaxf(top, p);
     }
-    float sum = 0;
+    double sum = 0;
     for (int j = 0; j < S; j++) {
         float p = expf(prob[t * S + j] - top);
         prob[t * S + j] = p;
         sum += p;
     }
     for (int j = 0; j < S; j++)
-        prob[t * S + j] /= sum;
+        prob[t * S + j] /= (float)sum;
     for (int d = 0; d < D; d++) {
         float v = 0;
         for (int j = 0; j < S; j++)
@@ -268,7 +315,8 @@ __global__ void gn_attention_back(float *dx, float *db, const float *x, const fl
     if (t >= B * H * S)
         return;
     int i = t % S, h = (t / S) % H, b = t / (S * H), span = 2 * side - 1;
-    float dp[361], dot = 0, scale = rsqrtf((float)D);
+    float dp[361], scale = rsqrtf((float)D);
+    double dot = 0;
     for (int j = 0; j < S; j++) {
         float v = 0;
         for (int d = 0; d < D; d++) {
@@ -280,7 +328,7 @@ __global__ void gn_attention_back(float *dx, float *db, const float *x, const fl
         dot += v * prob[t * S + j];
     }
     for (int j = 0; j < S; j++) {
-        float ds = prob[t * S + j] * (dp[j] - dot);
+        float ds = prob[t * S + j] * (dp[j] - (float)dot);
         int rel = (i / side + side - 1 - j / side) * span + (i % side + side - 1 - j % side);
         atomicAdd(&db[rel * H + h], ds);
         for (int d = 0; d < D; d++) {

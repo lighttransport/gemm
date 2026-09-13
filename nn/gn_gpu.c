@@ -15,7 +15,7 @@ typedef struct {
     size_t bytes;
 } Buffer;
 typedef struct {
-    int hip, device, active, fp32;
+    int hip, device, active, fp32, precise, synced;
     size_t used, limit;
     CUcontext context;
     CUmodule cuda_module;
@@ -111,7 +111,7 @@ static uint64_t param(gn_model *m, Param *p, int part) {
 }
 static int mm(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, int ta, int tb,
               int add) {
-    void *args[] = {&y, &a, &b, &M, &N, &K, &ta, &tb, &add};
+    void *args[] = {&y, &a, &b, &M, &N, &K, &ta, &tb, &add, &g->precise};
     if (g->fp32)
         return flat(g, 14, (size_t)M * N, args);
     return launch(g, 0, (unsigned)((N + (g->hip ? 15 : 7)) / (g->hip ? 16 : 8)),
@@ -133,9 +133,16 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
     g->limit = limit;
     int rc = 0;
     if (g->hip) {
-        if (rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC) != ROCEW_SUCCESS ||
-            hipInit(0) != hipSuccess || hipSetDevice(device) != hipSuccess) {
-            gn_fail("HIP/HIPRTC or GPU unavailable (requires gfx1201)");
+        int loader = rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC);
+        int init = loader == ROCEW_SUCCESS && rocewHiprtcAvailable() ? (int)hipInit(0) : -1;
+        int selected = init == hipSuccess ? (int)hipSetDevice(device) : -1;
+        if (loader != ROCEW_SUCCESS || init != hipSuccess || selected != hipSuccess) {
+            char message[256];
+            snprintf(message, sizeof(message),
+                     "HIP unavailable: loader=%d hiprtc=%d init=%d device=%d; set ROCEW_ROCM_LIB "
+                     "to ROCm library directory",
+                     loader, rocewHiprtcAvailable(), init, selected);
+            gn_fail(message);
             goto bad;
         }
         g->active = 1;
@@ -311,6 +318,9 @@ static int prepare(gn_model *m) {
 }
 int gn_gpu_forward(gn_model *m, const float *input) {
     Gpu *g = m->gpu;
+    g->precise = m->training;
+    if (m->training)
+        g->synced = 0;
     CALL(prepare(m));
     CALL(copy_to(g, PTR_NODE(m, 0, 0), input, m->n[0].r * m->n[0].c * 4));
     int side = (int)m->cfg.side, B = (int)m->batch, D = (int)m->cfg.head_dim,
@@ -362,6 +372,7 @@ int gn_gpu_forward(gn_model *m, const float *input) {
 }
 int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn_metrics *metrics) {
     Gpu *g = m->gpu;
+    g->synced = 0;
     int B = (int)m->batch, side = (int)m->cfg.side, D = (int)m->cfg.head_dim,
         A = side * side * m->cfg.actions;
     uint64_t t = buffer(g, SCRATCH_BASE + 2, (size_t)B * A * 4, NULL),
@@ -440,6 +451,7 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
 }
 int gn_gpu_update(gn_model *m, float lr, float decay, float clip, gn_metrics *metrics) {
     Gpu *g = m->gpu;
+    g->synced = 0;
     CALL(current(g));
     uint64_t norm = buffer(g, SCRATCH_BASE + 5, 8, NULL);
     if (!norm)
@@ -481,6 +493,8 @@ int gn_gpu_update(gn_model *m, float lr, float decay, float clip, gn_metrics *me
 }
 int gn_gpu_sync(gn_model *m) {
     Gpu *g = m->gpu;
+    if (g->synced)
+        return 0;
     CALL(current(g));
     for (size_t i = 0; i < m->np; i++) {
         Param *p = &m->p[i];
@@ -489,10 +503,12 @@ int gn_gpu_sync(gn_model *m) {
             if (g->b[4 * i + j].ptr)
                 CALL(copy_from(g, dest[j], g->b[4 * i + j].ptr, p->r * p->c * 4));
     }
+    g->synced = 1;
     return 0;
 }
 void gn_gpu_zero(gn_model *m) {
     Gpu *g = m->gpu;
+    g->synced = 0;
     if (current(g))
         return;
     for (size_t i = 0; i < m->np; i++)

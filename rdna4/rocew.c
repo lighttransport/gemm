@@ -255,6 +255,7 @@ static int loadHIP(void)
         "/opt/rocm/lib/libamdhip64.so.6",
         "/opt/rocm/lib/libamdhip64.so.5",
         "/opt/rocm/core-7.14/lib/libamdhip64.so",
+        "/opt/rocm/core/lib/libamdhip64.so",
         "/opt/rocm/core-7.14/lib/libamdhip64.so.7",
         NULL
     };
@@ -409,6 +410,7 @@ static int loadHIPRTC(void)
         "/opt/rocm/lib/libhiprtc.so.6",
         "/opt/rocm/lib/libhiprtc.so.5",
         "/opt/rocm/core-7.14/lib/libhiprtc.so",
+        "/opt/rocm/core/lib/libhiprtc.so",
         "/opt/rocm/core-7.14/lib/libhiprtc.so.7",
         NULL
     };
