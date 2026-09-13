@@ -244,7 +244,8 @@ gn_model *gn_create(const gn_config *c, const char *backend, int device) {
     if (!backend ||
         (strcmp(backend, "cpu") && strcmp(backend, "cuda") && strcmp(backend, "hip") &&
          strcmp(backend, "cuda-fp32") && strcmp(backend, "hip-fp32") &&
-         strcmp(backend, "cuda-legacy") && strcmp(backend, "hip-legacy") &&
+         strcmp(backend, "cuda-legacy") && strcmp(backend, "cuda-bf16x3") &&
+         strcmp(backend, "hip-legacy") &&
          strcmp(backend, "hip-blaslt") && strcmp(backend, "cuda-int8") &&
          strcmp(backend, "cuda-int16") && strcmp(backend, "hip-int8") &&
          strcmp(backend, "hip-int8-i64") && strcmp(backend, "hip-int16") &&

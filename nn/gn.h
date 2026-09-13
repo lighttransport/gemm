@@ -34,6 +34,7 @@ gn_config gn_default_config(void);
  * hip-fp16-blaslt: single FP16 product with FP32 accumulation. This SDK-only
  * path trades FP16 exponent range for three extra mantissa bits versus BF16.
  * hip-bf16x3: two BF16 components and three products in forward/backward.
+ * cuda-bf16x3 is the analogous experimental three-product SM120 path.
  * hip-bf16x3-dx/dw/forward retain three products only in the named phases;
  * these asymmetric experiments currently require the -blaslt SDK build.
  * hip-bf16x3-fp16back-blaslt uses compensated BF16 forward, one-product

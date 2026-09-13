@@ -289,7 +289,7 @@ static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, 
         void *packed[] = {&y, &pa, &pb, &M, &N, &K, &add, &g->chunk};
         if (g->reduced == 2)
             return launch(g, 31, (N + 63) / 64, (M + 63) / 64, 128, packed);
-        if (g->precise == 2 && output_bias) {
+        if (g->hip && g->precise == 2 && output_bias) {
             void *biased[] = {&y, &pa, &pb, &output_bias, &M, &N, &K, &add};
             g->bias_fused = 1;
             return launch(g, 51, (N + 31) / 32, (M + 31) / 32, 128, biased);
@@ -487,6 +487,23 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
             goto bad;
         }
     }
+    if (!g->hip) {
+        CUfunction f;
+        rc = (int)cuModuleGetFunction(&f, g->cuda_module, names[32]);
+        g->functions[32] = (void *)f;
+        if (rc) {
+            gn_fail("missing CUDA fused columns kernel");
+            goto bad;
+        }
+        if (g->reduced == 3) {
+            rc = (int)cuModuleGetFunction(&f, g->cuda_module, names[35]);
+            g->functions[35] = (void *)f;
+            if (rc) {
+                gn_fail("missing CUDA BF16x3 kernel");
+                goto bad;
+            }
+        }
+    }
     return g;
 bad:
     gn_gpu_close(g);
@@ -601,7 +618,8 @@ int gn_gpu_forward(gn_model *m, const float *input) {
             if (n->kind == CONV) {
                 int ci = (int)m->n[n->a].c;
                 K = ci * n->k * n->k;
-                if (g->hip && !g->legacy && !g->fp32 && !g->integer &&
+                if (!g->legacy && !g->fp32 && !g->integer &&
+                    (g->hip || g->reduced == 3) &&
                     (g->reduced || (R >= 32 && C >= 32 && K >= 32))) {
                     fused_ci = ci;
                 } else {
@@ -633,7 +651,9 @@ int gn_gpu_forward(gn_model *m, const float *input) {
         } else if (n->kind == ATTENTION) {
             void *args[] = {&y, &aux, &x, &w, &B, &side, &C, &D};
             if (!g->legacy)
-                if (g->hybrid16 && side == 9 && D == 32)
+                if (!g->hip && side == 9 && D == 32)
+                    CALL(launch(g, 24, B * (C / D) * 11, 1, 256, args));
+                else if (g->hybrid16 && side == 9 && D == 32)
                     CALL(launch(g, 33, B * (C / D) * 3, 1, 384, args));
                 else
                     CALL(launch(g, 24, R * (C / D), 1, 256, args));

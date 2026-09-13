@@ -192,6 +192,30 @@ extern "C" __global__ void gn_pack_bf16(unsigned short *out, const float *in, in
         }
     }
 }
+/* Emit im2col directly in the packed BF16 layout consumed by the tensor-core
+ * kernels, avoiding a full FP32 column write and subsequent pack read. */
+extern "C" __global__ void gn_columns_bf16(unsigned short *out, const float *x, int R, int C,
+                                           int side, int kernel, int precise) {
+    int vector = blockIdx.x * blockDim.x + threadIdx.x;
+    int K = C * kernel * kernel, stride = (K + 31) & ~31, vectors = stride / 4;
+    if (vector >= R * vectors)
+        return;
+    int row = vector / vectors, k = vector % vectors * 4;
+    int S = side * side, position = row % S;
+    int yy = position / side + k / (C * kernel) - kernel / 2;
+    int xx = position % side + k / C % kernel - kernel / 2;
+    float4 value = {};
+    if (k + 3 < K && yy >= 0 && xx >= 0 && yy < side && xx < side)
+        value = *reinterpret_cast<const float4 *>(
+            x + (row / S * S + yy * side + xx) * C + k % C);
+    ushort4 high = {bf(value.x), bf(value.y), bf(value.z), bf(value.w)};
+    *reinterpret_cast<ushort4 *>(out + row * stride + k) = high;
+    if (precise) {
+        ushort4 low = {bf(value.x - unbf(high.x)), bf(value.y - unbf(high.y)),
+                       bf(value.z - unbf(high.z)), bf(value.w - unbf(high.w))};
+        *reinterpret_cast<ushort4 *>(out + (R + row) * stride + k) = low;
+    }
+}
 extern "C" __global__ void gn_pack_fp16(unsigned short *out, const float *in, int R, int K,
                                         int trans, int precise) {
     __shared__ float tile[32][33];
@@ -234,6 +258,57 @@ extern "C" __global__ void gn_pack_fp16(unsigned short *out, const float *in, in
  * atomics and the old per-thread 361-entry stack array in backward. */
 extern "C" __global__ void gn_attention_parallel(float *y, float *prob, const float *x,
                                                  const float *bias, int B, int side, int C, int D) {
+#if !defined(GN_HIP)
+    if (side == 9 && D == 32) {
+        __shared__ float keys[81][32], values[81][32], scores[8][81];
+        int t = threadIdx.x, warp = t / 32, lane = t % 32, H = C / 32;
+        int group = blockIdx.x % 11, h = blockIdx.x / 11 % H, b = blockIdx.x / (11 * H);
+        int query = group * 8 + warp;
+        for (int z = t; z < 81 * 64; z += 256) {
+            int j = z / 64, q = z % 64, d = q % 32;
+            int offset = (b * 81 + j) * 3 * C + h * 32 + d;
+            if (q < 32)
+                keys[j][d] = x[offset + C];
+            else
+                values[j][d] = x[offset + 2 * C];
+        }
+        __syncthreads();
+        float q = query < 81 ? x[(b * 81 + query) * 3 * C + h * 32 + lane] : 0;
+        for (int j = 0; j < 81; j++) {
+            float dot = q * keys[j][lane];
+            for (int delta = 16; delta; delta /= 2)
+                dot += __shfl_down_sync(0xffffffffu, dot, delta);
+            if (!lane && query < 81) {
+                int rel = (query / 9 + 8 - j / 9) * 17 + query % 9 + 8 - j % 9;
+                scores[warp][j] = dot * .1767766952966369f + bias[rel * H + h];
+            }
+        }
+        if (!lane && query < 81) {
+            float top = -INFINITY;
+            for (int j = 0; j < 81; j++)
+                top = fmaxf(top, scores[warp][j]);
+            double sum = 0;
+            for (int j = 0; j < 81; j++) {
+                scores[warp][j] = expf(scores[warp][j] - top);
+                sum += scores[warp][j];
+            }
+            int qi = (b * H + h) * 81 + query;
+            for (int j = 0; j < 81; j++) {
+                scores[warp][j] /= (float)sum;
+                prob[qi * 81 + j] = scores[warp][j];
+            }
+        }
+        __syncwarp();
+        if (query < 81) {
+            float out = 0;
+            for (int j = 0; j < 81; j++)
+                out += scores[warp][j] * values[j][lane];
+            y[(b * 81 + query) * C + h * 32 + lane] = out;
+        }
+        (void)B;
+        return;
+    }
+#endif
     int S = side * side, H = C / D, query = blockIdx.x, t = threadIdx.x;
     int i = query % S, h = (query / S) % H, b = query / (S * H), span = 2 * side - 1;
     float scale = rsqrtf((float)D), top = -INFINITY;
@@ -336,21 +411,22 @@ __device__ __forceinline__ void gn_stage16(unsigned short *dst, const unsigned s
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" ::"r"(address), "l"(src),
                  "r"(bytes));
 }
-template <bool Precise>
+template <bool Precise, int Products = 6>
 __device__ void gn_tiled_body(float *y, const unsigned short *a, const unsigned short *b, int M,
                               int N, int K, int add) {
     /* Training: four 16x32 warps and a 32x64 CTA improve wave occupancy on
      * 1296-row shogi batches. Inference uses a 64x64 CTA. */
     constexpr int MR = Precise ? 1 : 2, Threads = 128, BM = Precise ? 32 : 64;
-    __shared__ unsigned short sa[Precise ? 3 : 1][BM][40];
-    __shared__ unsigned short sb[Precise ? 3 : 1][64][40];
+    constexpr int Planes = Precise ? (Products == 3 ? 2 : 3) : 1;
+    __shared__ unsigned short sa[Planes][BM][40];
+    __shared__ unsigned short sb[Planes][64][40];
     int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     int wr = (warp / 2) * (16 * MR), wc = (warp % 2) * 32;
     int r0 = blockIdx.y * BM, c0 = blockIdx.x * 64, stride = (K + 31) & ~31;
     float high[MR][4][4] = {}, low[MR][4][4] = {};
     for (int k0 = 0; k0 < stride; k0 += 32) {
 #pragma unroll
-        for (int p = 0; p < (Precise ? 3 : 1); p++) {
+        for (int p = 0; p < Planes; p++) {
             for (int i = tid; i < 64 * 4; i += Threads) {
                 int r = i / 4, k = 8 * (i % 4);
                 const unsigned short *ap =
@@ -366,9 +442,9 @@ __device__ void gn_tiled_body(float *y, const unsigned short *a, const unsigned 
         __syncthreads();
 #pragma unroll
         for (int kk = 0; kk < 32; kk += 16) {
-            unsigned av[Precise ? 3 : 1][MR][4], bv[Precise ? 3 : 1][4][2];
+            unsigned av[Planes][MR][4], bv[Planes][4][2];
 #pragma unroll
-            for (int p = 0; p < (Precise ? 3 : 1); p++) {
+            for (int p = 0; p < Planes; p++) {
 #pragma unroll
                 for (int i = 0; i < MR; i++)
                     gn_ld_a(av[p][i], &sa[p][wr + 16 * i + lane % 16][kk + (lane / 16) * 8]);
@@ -377,18 +453,23 @@ __device__ void gn_tiled_body(float *y, const unsigned short *a, const unsigned 
                     gn_ld_b(bv[p][j], &sb[p][wc + 8 * j + lane % 8][kk + ((lane / 8) % 2) * 8]);
             }
 #pragma unroll
-            for (int product = 0; product < (Precise ? 6 : 1); product++) {
+            for (int product = 0; product < (Precise ? Products : 1); product++) {
                 /* Interleave independent output fragments before revisiting
                  * the same correction accumulator. Keep each dot's order. */
-                int ac = product == 0 || product == 2 ? 1 : product == 3 ? 2 : 0;
-                int bc = product == 1 || product == 2 ? 1 : product == 4 ? 2 : 0;
+                int full_product = Products == 3 && product == 2 ? 5 : product;
+                int ac = full_product == 0 || full_product == 2 ? 1
+                         : full_product == 3                     ? 2
+                                                                 : 0;
+                int bc = full_product == 1 || full_product == 2 ? 1
+                         : full_product == 4                     ? 2
+                                                                 : 0;
                 if (!Precise)
                     ac = bc = 0;
 #pragma unroll
                 for (int i = 0; i < MR; i++) {
 #pragma unroll
                     for (int j = 0; j < 4; j++) {
-                        float *acc = Precise && product < 5 ? low[i][j] : high[i][j];
+                        float *acc = Precise && full_product < 5 ? low[i][j] : high[i][j];
                         mma(acc[0], acc[1], acc[2], acc[3], av[ac][i], bv[bc][j]);
                     }
                 }
@@ -420,6 +501,12 @@ extern "C" __global__ __launch_bounds__(128) void gn_mm_tiled_fast(float *y,
                                                                    const unsigned short *b, int M,
                                                                    int N, int K, int add) {
     gn_tiled_body<false>(y, a, b, M, N, K, add);
+}
+extern "C" __global__ __launch_bounds__(128) void gn_mm_bf16x3(float *y,
+                                                               const unsigned short *a,
+                                                               const unsigned short *b, int M,
+                                                               int N, int K, int add) {
+    gn_tiled_body<true, 3>(y, a, b, M, N, K, add);
 }
 
 /* Experimental integer operand training: FP32 master state and dequantization.
