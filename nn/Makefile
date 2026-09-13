@@ -48,7 +48,10 @@ check: all
 sm120-bench: $(BUILD)/bench_sm120
 $(BUILD)/bench_sm120: bench_sm120.cu gn_kernels.cu gn_sm120.cuh gn_rdna4.cuh | $(BUILD)
 	nvcc -O3 -std=c++17 -arch=sm_120 -Xptxas=-v $< -o $@
-.PHONY: rdna4-bench
+.PHONY: rdna4-bench rdna4-precision
+rdna4-precision: $(BUILD)/bench_rdna4_precision
+$(BUILD)/bench_rdna4_precision: bench_rdna4_precision.cpp bench_hip_common.h gn_kernels.cu gn_sm120.cuh gn_rdna4.cuh | $(BUILD)
+	TMPDIR=$(abspath $(BUILD)) hipcc -O3 -std=c++17 --offload-arch=gfx1201 $< -Wl,-rpath,$(ROCM_PATH)/lib -o $@
 rdna4-bench: $(BUILD)/bench_rdna4
 $(BUILD)/bench_rdna4: bench_rdna4.cpp gn_kernels.cu gn_sm120.cuh gn_rdna4.cuh $(BUILD)/backend.config $(if $(filter 1,$(HIPBLASLT)),$(BUILD)/gn_hipblaslt.o) | $(BUILD)
 	TMPDIR=$(abspath $(BUILD)) hipcc -O3 -std=c++17 --offload-arch=gfx1201 $(if $(filter 1,$(HIPBLASLT)),-DGN_HIPBLASLT=1) $< $(if $(filter 1,$(HIPBLASLT)),-x none $(BUILD)/gn_hipblaslt.o) -Wl,-rpath,$(ROCM_PATH)/lib $(LDLIBS) -o $@

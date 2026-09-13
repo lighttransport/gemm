@@ -19,12 +19,13 @@ static double relative(const float *a, const float *b, size_t n) {
     return sqrt(delta / fmax(base, 1e-12));
 }
 int main(int argc, char **argv) {
-    if (argc < 2 || argc > 5 ||
+    if (argc < 2 || argc > 6 || (argc == 6 && strcmp(argv[5], "report")) ||
         (argc >= 4 && strcmp(argv[3], "wide") && strcmp(argv[3], "full") &&
          strcmp(argv[3], "stress")))
         return 2;
     int B = 2;
-    if (argc == 5) {
+    int report = argc == 6, numerical_failure = 0;
+    if (argc >= 5) {
         char *end;
         long batch = strtol(argv[4], &end, 10);
         if (*end || batch < 1 || batch > 64)
@@ -82,9 +83,13 @@ int main(int argc, char **argv) {
     if (check(gn_infer(cpu, B, x, p, v)) || check(gn_infer(gpu, B, x, q, w)))
         goto done;
     double inference = relative(p, q, B * A);
-    if (!isfinite(inference) || inference > tol || relative(v, w, B * 3) > tol) {
+    double value_inference = relative(v, w, B * 3);
+    if (!isfinite(inference) || !isfinite(value_inference) || inference > tol ||
+        value_inference > tol) {
         fprintf(stderr, "GPU forward mismatch %.9g\n", inference);
-        goto done;
+        if (!report)
+            goto done;
+        numerical_failure = 1;
     }
     if (check(gn_backward(cpu, B, x, target, labels, &a)) ||
         check(gn_backward(gpu, B, x, target, labels, &b)))
@@ -117,10 +122,13 @@ int main(int argc, char **argv) {
         memcpy(cg, gg, r * n * sizeof(float));
     }
     double grad = sqrt(total_delta / fmax(total_base, 1e-12));
-    if (!isfinite(grad) || grad > 0.001 ||
+    if (!isfinite(grad) || !isfinite(a.policy) || !isfinite(b.policy) ||
+        !isfinite(a.value) || !isfinite(b.value) || grad > 0.001 ||
         fabs(a.policy - b.policy) + fabs(a.value - b.value) > tol) {
         fprintf(stderr, "GPU backward mismatch %.9g\n", grad);
-        goto done;
+        if (!report)
+            goto done;
+        numerical_failure = 1;
     }
     if (check(gn_update(cpu, .001f, .0001f, 1, &a)) ||
         check(gn_update(gpu, .001f, .0001f, 1, &b)) || check(gn_infer(gpu, B, x, q, w)))
@@ -155,9 +163,11 @@ int main(int argc, char **argv) {
             goto done;
         }
     }
-    printf("PASS %s batch=%d native forward/backward/update: relative output %.8g gradient %.8g\n",
-           argv[1], B, inference, grad);
-    rc = 0;
+    printf("%s %s batch=%d native forward/backward/update: relative output %.8g gradient %.8g\n",
+           numerical_failure ? "UNQUALIFIED" : "PASS", argv[1], B, inference, grad);
+    /* Report mode continues diagnostics after a numerical failure, but must
+     * still return failure. It cannot make a campaign's strict gate pass. */
+    rc = numerical_failure ? 1 : 0;
 done:
     free(x);
     free(target);

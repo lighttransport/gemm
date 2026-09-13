@@ -18,6 +18,12 @@ The `hip` path now uses LDS-tiled WMMA and parallel training operations;
 See [RDNA4 results, builds and qualification](RDNA4.md): **8.12×/8.47×** native/hybrid
 batch-16 speedups were measured, but neither reaches 95% peak, and a new full
 batch-16 gradient discrepancy remains unresolved (including legacy/FP32 paths).
+The [precision follow-up](RDNA4.md#precision-follow-up) adds fused convolution
+packing, coalesced attention, and experimental `hip-bf16`, `hip-bf16-acc`,
+`hip-bf16-acc128`, `hip-int8`, `hip-int8-i64`, and `hip-int16` training paths.
+The last uses four INT8 WMMA products with INT32 partials and an exact INT64
+combine, not native INT16 WMMA. All keep FP32 master/optimizer/non-matrix state.
+These experiments are not enabled by the engine or long-campaign preflight.
 
 From GEMM root:
 
@@ -43,6 +49,14 @@ gate global gradient relative L2 at .001, inference
 relative L2 at .01 (BF16) or .0001 (FP32), and check AdamW elementwise using
 identical already-compared gradients. These are not a strength certification. Benchmark with
 `gn_tool bench MODEL BACKEND BATCH ITERATIONS` after validating that backend.
+The optional trailing `BF16_PEAK_TFLOPS INT8_PEAK_TOPS` overrides the benchmark's
+explicit RX 9070 XT dense reference (195 / 389). JSON separates useful GEMM work,
+precision-compensation products, FP32 attention, and whole-step peak percentages.
+`make -C nn rdna4-precision` builds the standalone accumulator diagnostic;
+`sh nn/test_rdna4_precision.sh` exercises it. `test_gpu BACKEND FILE wide 2 report`
+continues through numerical mismatches to report gradients/update/reload, but
+still returns failure if the unchanged numerical gates fail. Its checkpoints
+are diagnostic artifacts, not qualified trained models.
 
 Defaults: 9×9×80 NHWC, 139 action planes, C256, 20 blocks (every fifth Transformer,
 otherwise two 3×3 convolutions), attention head width 32, 2C SwiGLU, policy linear

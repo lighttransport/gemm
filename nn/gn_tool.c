@@ -242,7 +242,17 @@ int main(int argc, char **argv) {
             fprintf(stderr, "validation failed: malformed replay/model or %s\n", gn_error());
         return rc;
     }
-    if (argc == 6 && !strcmp(argv[1], "bench")) {
+    if ((argc == 6 || argc == 8) && !strcmp(argv[1], "bench")) {
+        double bf16_peak = 195, int8_peak = 389;
+        if (argc == 8) {
+            char *end;
+            bf16_peak = strtod(argv[6], &end);
+            if (*end || !isfinite(bf16_peak) || bf16_peak <= 0)
+                return 2;
+            int8_peak = strtod(argv[7], &end);
+            if (*end || !isfinite(int8_peak) || int8_peak <= 0)
+                return 2;
+        }
         unsigned batch = number(argv[4]), iterations = number(argv[5]);
         if (batch > 256)
             return 2;
@@ -281,12 +291,39 @@ int main(int argc, char **argv) {
                 gn_update(m, .001f, .0001f, 1, &metrics))
                 goto bench_done;
         double train_seconds = seconds() - start, flops = gn_matrix_flops(m);
+        int integer = strstr(argv[3], "int16") ? 16 : strstr(argv[3], "int8") ? 8 : 0;
+        double gemm_rate = gn_gemm_flops(m) * iterations / train_seconds / 1e12;
+        double total_rate = flops * iterations / train_seconds / 1e12;
         printf(
             "{\"backend\":\"%s\",\"batch\":%u,\"inference_ms\":%.6g,\"positions_per_second\":%.6g,"
             "\"train_examples_per_second\":%.6g,\"host_tensor_bytes\":%zu,"
-            "\"matrix_flops_per_example\":%.0f,\"useful_train_matrix_tflops\":%.6g}\n",
+            "\"matrix_equivalent_ops_per_example\":%.0f,\"useful_train_matrix_equivalent_tops\":%."
+            "6g",
             argv[3], batch, inference * 1000, batch / inference, batch * iterations / train_seconds,
-            gn_memory_used(m), flops / batch, flops * iterations / train_seconds / 1e12);
+            gn_memory_used(m), flops / batch, total_rate);
+        if (!integer)
+            printf(",\"matrix_flops_per_example\":%.0f,\"useful_train_matrix_tflops\":%.6g",
+                   flops / batch, total_rate);
+        else
+            printf(",\"useful_integer_gemm_tiops\":%.6g,\"int8_product_tiops\":%.6g", gemm_rate,
+                   gemm_rate * (integer == 16 ? 4 : 1));
+        printf(",\"fp32_attention_tflops\":%.6g", total_rate - gemm_rate);
+        if (!strncmp(argv[3], "hip", 3) && !strstr(argv[3], "fp32")) {
+            double products = gemm_rate * (integer == 16             ? 4
+                                           : integer                 ? 1
+                                           : strstr(argv[3], "bf16") ? 1
+                                                                     : 6);
+            double peak = integer ? int8_peak : bf16_peak;
+            printf(
+                ",\"peak_reference\":\"%s\",\"dense_peak_tops\":%.6g,"
+                "\"gemm_product_tops\":%.6g,\"gemm_product_peak_pct\":%.6g,"
+                "\"useful_gemm_peak_pct\":%.6g,\"timing_scope\":\"whole_training_step\","
+                "\"product_count_excludes_padding\":true,\"training_qualification\":\"unresolved\","
+                "\"95pct_training_target_met\":false",
+                argc == 8 ? "user-supplied dense" : "RX 9070 XT nominal dense", peak, products,
+                products / peak * 100, gemm_rate / peak * 100);
+        }
+        printf("}\n");
         rc = 0;
     bench_done:
         free(x);
@@ -296,9 +333,11 @@ int main(int argc, char **argv) {
         gn_destroy(m);
         return rc ? error() : 0;
     }
-    fprintf(stderr, "usage: gn_tool init MODEL [CHANNELS BLOCKS]\n       gn_tool train REPLAY "
-                    "INPUT OUTPUT STEPS BATCH LR BACKEND [MICRO CHECKPOINT_SECONDS]\n"
-                    "       gn_tool bench MODEL BACKEND BATCH ITERATIONS\n"
-                    "       gn_tool validate REPLAY MODEL BACKEND LIMIT\n");
+    fprintf(
+        stderr,
+        "usage: gn_tool init MODEL [CHANNELS BLOCKS]\n       gn_tool train REPLAY "
+        "INPUT OUTPUT STEPS BATCH LR BACKEND [MICRO CHECKPOINT_SECONDS]\n"
+        "       gn_tool bench MODEL BACKEND BATCH ITERATIONS [BF16_PEAK_TFLOPS INT8_PEAK_TOPS]\n"
+        "       gn_tool validate REPLAY MODEL BACKEND LIMIT\n");
     return 2;
 }

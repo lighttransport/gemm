@@ -18,13 +18,13 @@ typedef struct {
     size_t bytes;
 } Buffer;
 typedef struct {
-    int hip, device, active, fp32, precise, synced, legacy, integer;
+    int hip, device, active, fp32, precise, synced, legacy, integer, reduced, chunk, wide;
     size_t used, limit;
     CUcontext context;
     CUmodule cuda_module;
     hipModule_t hip_module;
     Buffer b[SLOT_COUNT];
-    void *functions[32];
+    void *functions[35];
     void *lt;
 } Gpu;
 static const char *names[] = {"gn_mm",
@@ -57,7 +57,11 @@ static const char *names[] = {"gn_mm",
                               "gn_attention_bias_back",
                               "gn_lt_combine",
                               "gn_bias_back_parallel",
-                              "gn_grad_norm_parallel"};
+                              "gn_grad_norm_parallel",
+                              "gn_mm_bf16_acc",
+                              "gn_columns_bf16",
+                              "gn_attention_81",
+                              "gn_transpose_rows"};
 static int current(Gpu *g) {
     int rc = g->hip ? (int)hipSetDevice(g->device) : (int)cuCtxSetCurrent(g->context);
     return rc ? gn_fail("cannot activate GPU context") : 0;
@@ -140,8 +144,8 @@ static int flat(Gpu *g, int fn, size_t count, void **args) {
 static uint64_t param(gn_model *m, Param *p, int part) {
     return p ? ((Gpu *)m->gpu)->b[4 * (p - m->p) + part].ptr : 0;
 }
-static int mm(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, int ta, int tb,
-              int add) {
+static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, int ta,
+                      int tb, int add, int ci, int side, int kernel) {
     void *args[] = {&y, &a, &b, &M, &N, &K, &ta, &tb, &add, &g->precise};
     if (g->fp32)
         return flat(g, 14, (size_t)M * N, args);
@@ -154,14 +158,40 @@ static int mm(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, i
         if (!pa || !pb || !sa || !sb)
             return -1;
         int bt = !tb;
-        void *ap[] = {&pa, &sa, &a, &M, &K, &ta, &g->integer};
-        void *bp[] = {&pb, &sb, &b, &N, &K, &bt, &g->integer};
+        uint64_t ax = a, bx = b;
+        int at = ta;
+        uint64_t transpose = 0;
+        if (g->hip && K >= 32 && ((ta && M >= 32) || (bt && N >= 32))) {
+            size_t rows = M > N ? M : N;
+            transpose = buffer(g, SCRATCH_BASE + 7, rows * K * 4, NULL);
+            if (!transpose)
+                return -1;
+        }
+        if (transpose && ta && M >= 32) {
+            void *tx[] = {&transpose, &a, &M, &K};
+            CALL(launch(g, 34, (K + 31) / 32, (M + 31) / 32, 256, tx));
+            ax = transpose;
+            at = 0;
+        }
+        void *ap[] = {&pa, &sa, &ax, &M, &K, &at, &g->integer};
         CALL(launch(g, 22, M, 1, 256, ap));
+        if (transpose && bt && N >= 32) {
+            void *tx[] = {&transpose, &b, &N, &K};
+            CALL(launch(g, 34, (K + 31) / 32, (N + 31) / 32, 256, tx));
+            bx = transpose;
+            bt = 0;
+        }
+        void *bp[] = {&pb, &sb, &bx, &N, &K, &bt, &g->integer};
         CALL(launch(g, 22, N, 1, 256, bp));
-        void *packed[] = {&y, &pa, &pb, &sa, &sb, &M, &N, &K, &add, &g->integer};
+        uint64_t exact = 0;
+        void *packed[] = {&y, &pa, &pb, &sa, &sb, &M, &N, &K, &add, &g->integer, &g->wide, &exact};
+        if (g->hip) {
+            int tile_n = g->integer == 16 ? 32 : 64;
+            return launch(g, 23, (N + tile_n - 1) / tile_n, (M + 63) / 64, 128, packed);
+        }
         return launch(g, 23, (N + 7) / 8, (M + 15) / 16, 32, packed);
     }
-    if (!g->legacy && M >= 32 && N >= 32 && K >= 32) {
+    if (g->reduced || (!g->legacy && M >= 32 && N >= 32 && K >= 32)) {
         size_t stride = ((size_t)K + 31) & ~(size_t)31;
         uint64_t pa = buffer(g, SCRATCH_BASE + 8, M * stride * 2 * (g->precise ? 3 : 1), NULL);
         uint64_t pb = buffer(g, SCRATCH_BASE + 9, N * stride * 2 * (g->precise ? 3 : 1), NULL);
@@ -170,7 +200,11 @@ static int mm(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, i
         int bt = !tb;
         void *ap[] = {&pa, &a, &M, &K, &ta, &g->precise};
         void *bp[] = {&pb, &b, &N, &K, &bt, &g->precise};
-        CALL(launch(g, 15, (K + 31) / 32, (M + 31) / 32, 256, ap));
+        if (ci) {
+            void *cp[] = {&pa, &a, &M, &ci, &side, &kernel, &g->precise};
+            CALL(flat(g, 32, M * stride, cp));
+        } else
+            CALL(launch(g, 15, (K + 31) / 32, (M + 31) / 32, 256, ap));
         CALL(launch(g, 15, (K + 31) / 32, (N + 31) / 32, 256, bp));
 #ifdef GN_HIPBLASLT
         /* BLASLt wins the long-K convolutions; native WMMA avoids six vendor
@@ -203,13 +237,19 @@ static int mm(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, i
             return flat(g, 28, count, combine);
         }
 #endif
-        void *packed[] = {&y, &pa, &pb, &M, &N, &K, &add};
+        void *packed[] = {&y, &pa, &pb, &M, &N, &K, &add, &g->chunk};
+        if (g->reduced == 2)
+            return launch(g, 31, (N + 63) / 64, (M + 63) / 64, 128, packed);
         int tile_n = g->hip && g->precise ? 32 : 64, tile_m = g->precise ? 32 : 64;
         return launch(g, g->precise ? 16 : 17, (N + tile_n - 1) / tile_n, (M + tile_m - 1) / tile_m,
                       128, packed);
     }
     return launch(g, 0, (unsigned)((N + (g->hip ? 15 : 7)) / (g->hip ? 16 : 8)),
                   (unsigned)((M + 15) / 16), 32, args);
+}
+static int mm(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, int ta, int tb,
+              int add) {
+    return mm_columns(g, y, a, b, M, N, K, ta, tb, add, 0, 0, 0);
 }
 static int columns(Gpu *g, uint64_t col, uint64_t x, int R, int C, int side, int kernel, int back) {
     void *args[] = {&col, &x, &R, &C, &side, &kernel};
@@ -225,11 +265,15 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
     g->fp32 = strstr(backend, "fp32") != NULL;
     g->legacy = strstr(backend, "legacy") != NULL;
     g->integer = strstr(backend, "int16") ? 16 : strstr(backend, "int8") ? 8 : 0;
-    if (g->integer)
-        fprintf(stderr,
-                "EXPERIMENTAL %s: quantized matrix operands, FP32 master state; "
-                "not qualified for full-network training\n",
-                backend);
+    g->wide = strstr(backend, "i64") != NULL;
+    g->reduced = strstr(backend, "bf16-acc") ? 2 : !strcmp(backend, "hip-bf16") ? 1 : 0;
+    g->chunk = strstr(backend, "acc128") ? 128 : 0;
+    if (g->integer || g->reduced)
+        fprintf(
+            stderr,
+            "EXPERIMENTAL %s: reduced-precision matrices, FP32 master/optimizer/nonmatrix state; "
+            "not qualified for full-network training\n",
+            backend);
     g->device = device;
     g->limit = limit;
     int rc = 0;
@@ -358,9 +402,7 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         gn_fail("GPU module load failed");
         goto bad;
     }
-    for (int i = 0; i < (g->hip ? 31 : 28); i++) {
-        if (g->hip && (i == 22 || i == 23))
-            continue; /* Experimental integer kernels are CUDA-only. */
+    for (int i = 0; i < (g->hip ? 35 : 28); i++) {
         if (g->hip) {
             hipFunction_t f;
             rc = (int)hipModuleGetFunction(&f, g->hip_module, names[i]);
@@ -438,7 +480,7 @@ static int prepare(gn_model *m) {
 }
 int gn_gpu_forward(gn_model *m, const float *input) {
     Gpu *g = m->gpu;
-    g->precise = m->training;
+    g->precise = m->training && !g->reduced;
     if (m->training)
         g->synced = 0;
     CALL(prepare(m));
@@ -451,16 +493,22 @@ int gn_gpu_forward(gn_model *m, const float *input) {
         uint64_t x = PTR_NODE(m, n->a, 0), y = PTR_NODE(m, i, 0), w = param(m, n->w, 0),
                  bias = param(m, n->bias, 0), aux = PTR_NODE(m, i, 2);
         if (n->kind == LINEAR || n->kind == CONV) {
+            int fused_ci = 0;
             if (n->kind == CONV) {
                 int ci = (int)m->n[n->a].c;
                 K = ci * n->k * n->k;
-                uint64_t col = buffer(g, SCRATCH_BASE, (size_t)R * K * 4, NULL);
-                if (!col)
-                    return -1;
-                CALL(columns(g, col, x, R, ci, side, n->k, 0));
-                x = col;
+                if (g->hip && !g->legacy && !g->fp32 && !g->integer &&
+                    (g->reduced || (R >= 32 && C >= 32 && K >= 32))) {
+                    fused_ci = ci;
+                } else {
+                    uint64_t col = buffer(g, SCRATCH_BASE, (size_t)R * K * 4, NULL);
+                    if (!col)
+                        return -1;
+                    CALL(columns(g, col, x, R, ci, side, n->k, 0));
+                    x = col;
+                }
             }
-            CALL(mm(g, y, x, w, R, C, K, 0, 1, 0));
+            CALL(mm_columns(g, y, x, w, R, C, K, 0, 1, 0, fused_ci, side, n->k));
             void *args[] = {&y, &bias, &R, &C};
             CALL(flat(g, 3, (size_t)R * C, args));
         } else if (n->kind == BN || n->kind == LN) {
@@ -473,7 +521,8 @@ int gn_gpu_forward(gn_model *m, const float *input) {
         } else if (n->kind == ATTENTION) {
             void *args[] = {&y, &aux, &x, &w, &B, &side, &C, &D};
             if (!g->legacy)
-                CALL(launch(g, 24, R * (C / D), 1, 256, args));
+                CALL(
+                    launch(g, g->hip && side == 9 && D == 32 ? 33 : 24, R * (C / D), 1, 256, args));
             else
                 CALL(flat(g, 9, (size_t)R * (C / D), args));
         } else {

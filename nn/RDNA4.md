@@ -4,6 +4,8 @@ Measured 2026-09-13 on RX 9070 XT, gfx1201, ROCm Core 10.0 layout,
 HIP runtime 7.15 and hipBLASLt 1.4.1 (`hipblasLtGetVersion=100401`).
 **The 95% peak target is not achieved. Full batch-16 gradient qualification
 also remains unresolved; these throughput results are not training acceptance.**
+The latest iteration is recorded under [Precision follow-up](#precision-follow-up);
+the preceding measurements below describe the initial ROCm optimization.
 
 ## Implementation
 
@@ -194,17 +196,197 @@ and version headers. No system SDK files were installed or modified. Header
 The runtime reports its actual version separately. Prefer a matching complete
 SDK for deployment; this older-header/newer-runtime pairing is the one tested.
 
-## Integer path and next work
+## Precision follow-up
 
-INT8 operand experiments remain a separate qualification task. AMD lists a
-higher INT8 matrix rate, but that is not evidence of correct integer training.
-Do not port the failed full-model CUDA INT8/INT16-style paths into production.
-An INT16-style split into INT8 products would still need scaling/overflow bounds,
-gradient-error tests and convergence evidence, with FP32 master state initially.
-This change does **not** add a qualified HIP integer training backend.
+### Changes and arithmetic contracts
 
-Priority follow-ups: locate the batch-16 gradient divergence layer by layer;
-then fuse im2col with packing, improve weight-pack reuse and attention memory
-access, evaluate cached timed Lt algorithm selection, and investigate pipelined
-LDS tiles. Preserve numerical gates and report useful versus executed FLOPs
-throughout. No long campaign or FukauraOu strength test was run here.
+The normal `hip` and `hip-blaslt` paths now fuse forward im2col directly into
+BF16 packing. This removes the FP32 column write/read and one launch while
+preserving all three packed components bit-for-bit. Default 81-token/32-wide
+attention stages coalesced K/V reads in LDS, retaining the original FP32 dot,
+softmax and output reduction order. Other head sizes use the previous kernel.
+
+Explicit experimental training backends (also usable for diagnostic inference):
+
+| Backend | Matrix operands | Architectural accumulator |
+|---|---|---|
+| `hip-bf16` | One BF16 product | FP32 |
+| `hip-bf16-acc` | One BF16 product | Native BF16 C/D for the whole dot |
+| `hip-bf16-acc128` | One BF16 product | Native BF16 per K=128, then FP32 partial reduction |
+| `hip-int8` | Row-scaled signed INT8 | INT32, with automatic INT64 widening for overflow-length K |
+| `hip-int8-i64` | Row-scaled signed INT8 | INT32 partials reduced in INT64 |
+| `hip-int16` | Row-scaled INT16, four INT8 products | Four INT32 partials, exact INT64 recombination |
+
+AMD's [RDNA4 ISA, WMMA instruction table](https://docs.amd.com/v/u/en-US/rdna4-instruction-set-architecture)
+specifies native BF16 C/D and INT8-to-INT32 operations. It does not list an INT16
+WMMA or INT64 WMMA accumulator. The generated gfx1201 assembly was inspected:
+the experiments issue `v_wmma_bf16_16x16x16_bf16` and
+`v_wmma_i32_16x16x16_iu8`, respectively. INT64 widening is software integer
+arithmetic; it is not attributed to an invented native instruction.
+
+INT16 uses `q = 256*hi + lo`, with signed high and unsigned low bytes. Accumulators
+are widened **before** weighting or adding cross terms. Chunks of at most 16384
+products keep even `255*255*K` below INT32_MAX. Signed INT8 uses an uninterrupted
+INT32 dot only when Kpad32 ≤131040; longer dots automatically use INT64 partial
+reduction. Integer dot products never reduce through FP32: only final conversion,
+row scales and output storage are FP32. Quantization is round-to-nearest-even,
+with a symmetric training range ±127 or ±32767. Exact tests additionally cover
+the full integer endpoints -128 and -32768. Transposed operands use a coalesced,
+bit-preserving FP32 scratch transpose before row scaling; the scratch allocation
+is reused and counted in the device budget. A measured 64×32 INT16 tile replaces
+the first 32×32 tile; the benchmark retains alternatives for reproduction.
+
+All modes retain FP32 master weights, stored activations/gradients, AdamW state,
+scales/dequantization, and non-matrix operations. **None is integer-only or
+BF16-only training.** The default six-product precision contract is unchanged;
+experimental arithmetic is never selected automatically by the normal backend.
+
+### Measured normal-path improvement
+
+Same full model and microbatch 16, three alternating before/after repetitions,
+50 measured steps each. Previous commit `4d982b9dd9bd4cae84f3c447e711db81cc92151f`'s GPU host source and embedded
+kernels were rebuilt with the current reporting-only benchmark front end.
+Median results (no concurrent GPU tests; clocks/power settings unchanged):
+
+| Backend | Before examples/s | After examples/s | Gain | Before inference ms | After inference ms |
+|---|---:|---:|---:|---:|---:|
+| `hip` | 369.981 | 383.233 | 3.58% | 9.56240 | 8.18069 |
+| `hip-blaslt` | 385.503 | 400.245 | 3.82% | 8.30386 | 6.93760 |
+
+The after training ranges were 382.860–384.450 and 399.512–401.999 examples/s.
+These are bounded measurements on this host, not sustained-performance promises.
+The normal hybrid median is 4.32332 useful matrix TFLOP/s including attention.
+Its convolution/linear work is 4.29105 useful TFLOP/s; the six compensation
+products total 25.7463 TFLOP/s over whole-step wall time: **13.2032% of 195**.
+Useful GEMM arithmetic alone is **2.20054%** of that dense reference. Compensation,
+padding, packing, optimizer and other scalar work must not be conflated.
+
+### Measured experimental whole-step throughput
+
+Full model, microbatch 16, 50 measured steps per mode after warmup. These are
+single bounded runs, with no CPU reference job or other GPU benchmark running
+concurrently. All use the same architecture/optimizer; reduced precision changes
+the mathematical trajectory. **Faster unqualified arithmetic is not a trained
+model quality or convergence result.**
+
+| Backend | Examples/s | Useful GEMM Tera-op/s | Matrix-product Tera-op/s | Products / matching dense peak |
+|---|---:|---:|---:|---:|
+| `hip-bf16` | 598.068 | 6.41193 floating | 6.41193 floating | 3.28817% |
+| `hip-bf16-acc` | 592.145 | 6.34842 floating | 6.34842 floating | 3.25560% |
+| `hip-bf16-acc128` | 584.832 | 6.27001 floating | 6.27001 floating | 3.21539% |
+| `hip-int8` | 521.243 | 5.58827 integer | 5.58827 INT8 | 1.43657% |
+| `hip-int8-i64` | 518.739 | 5.56143 integer | 5.56143 INT8 | 1.42967% |
+| `hip-int16` | 442.432 | 4.74334 INT16-equivalent | 18.9734 INT8 | 4.87747% |
+
+The denominator is **entire forward/backward/update wall time**, not just matrix
+kernel duration. FP32 attention is reported separately (0.0357–0.0482 TFLOP/s here).
+INT64 scalar widening and packing are included in elapsed time, not credited as
+INT8 WMMA operations. Host tensor accounting is 877,219,808 bytes for each mode;
+this is not total RSS or driver memory. The first INT16 implementation measured
+387.918 examples/s before tile/transpose/attention improvements, versus 442.432
+after; those two experimental runs used 30/50 iterations and are not the paired
+normal-path comparison above.
+
+### Matrix-only rates versus peak
+
+Final gfx1201 diagnostic, 100 iterations for the three training shapes. Integer
+rows below are INT8 instruction-product TIOP/s, including four products for
+INT16; BF16 rows are TFLOP/s. Percentages use 389 / 195 dense respectively.
+
+| M,N,K | Mode | Kernel ms | Pack+kernel ms | Product Tera-op/s | Product peak % | Padded issue peak % |
+|---|---|---:|---:|---:|---:|---:|
+| 1296,256,2304 | BF16 accumulator | 0.0568460 | 0.0815090 | 26.8941 | 13.7919 | 14.3027 |
+| 1296,256,2304 | INT8/INT32 | 0.0304462 | 0.0804854 | 50.2140 | 12.9085 | 13.3866 |
+| 1296,256,2304 | INT16/INT64, 64×32 | 0.0725887 | 0.125465 | 84.2458 | 21.6570 | 22.4591 |
+| 256,2304,1296 | INT8/INT32 | 0.0231978 | 0.105531 | 65.9037 | 16.9418 | 17.1510 |
+| 256,2304,1296 | INT16/INT64, 64×32 | 0.0583140 | 0.141745 | 104.868 | 26.9584 | 27.2913 |
+| 1296,2304,256 | INT8/INT32 | 0.0356931 | 0.0659414 | 42.8325 | 11.0109 | 11.4187 |
+| 1296,2304,256 | INT16/INT64, 64×32 | 0.0708859 | 0.0991201 | 86.2695 | 22.1773 | 22.9986 |
+
+The first INT16 32×32 convolution kernel took 0.106732 ms; the selected 64×32
+tile takes 0.0725887 ms (1.47× kernel speedup). For weight gradients, initial
+pack+kernel was 0.257673 ms versus 0.141745 ms after tiling/coalesced transpose.
+Enforced device-function inlining avoids an observed out-of-line specialization
+regression; alternative tile measurements are retained rather than inferred.
+
+For 4096³ (30 iterations), BF16 accumulation is 44.7612 TFLOP/s / 22.9545%; INT8
+is 71.3804 TIOP/s / 18.3497%; INT16's four INT8 products are 90.5634 TIOP/s /
+23.2811%. These shapes have no padding. The optional Lt comparison (10 iterations)
+is 125.649 TFLOP/s / **64.4353%** for one BF16 product, and 105.559 TFLOP/s /
+54.1328% for six-product compensation including the combine kernel. Vendor
+internal padding is unknown and is not fabricated. None reaches 95%; the old
+register-only issue ceiling is not GEMM or end-to-end training performance.
+
+Ignored parent build artifacts contain the raw JSONL: `rdna4-precision-final-matrix`,
+`rdna4-precision-final-large`, `rdna4-lt-final-large`, and
+`rdna4-precision-final-training` under `build/dl/`. Before/after normal runs use
+`rdna4-{before,after}-{hip,hip-blaslt}-{1,2,3}.json`. Raw files are local experiment
+artifacts, not installed runtime dependencies.
+
+### Precision and correctness results
+
+The mandatory numerical gates were not relaxed. A new `report` test argument
+continues diagnostics after an approximation mismatch but **still exits 1**;
+normal campaign preflight does not use it or expose these experimental backends.
+Report-mode checkpoint files are unqualified diagnostic artifacts.
+
+| Mode | C32 batch-2 inference relative L2 | C32 gradient relative L2 |
+|---|---:|---:|
+| `hip-bf16` | 0.00852518 | 0.0746677 (fail) |
+| `hip-bf16-acc` | 0.211776 | 0.394561 (fail) |
+| `hip-bf16-acc128` | 0.116112 | 0.331739 (fail) |
+| `hip-int8` / `hip-int8-i64` | 0.0272495 | 0.159798 (fail) |
+| `hip-int16` | 0.000113825 | 0.000190985 (pass) |
+
+INT16's small-network pass does **not** extend to the full C256/20-block model:
+batch-2 inference relative L2 is 0.0000888861 but gradient relative L2 is
+**0.0612931 (fail)**. Normal full-model batch-2 HIP remains a pass with gradient
+relative L2 0.0000153225, identical to the previous path. The existing full-model
+batch-16 discrepancy remains unresolved; the final native rerun is still
+0.00289523382 against the unchanged 0.001 gradient gate. No experimental full-training, long
+convergence or shogi playing-strength qualification is claimed.
+
+On convolution GEMM M=1296,N=256,K=2304, sampled output relative L2 against CPU
+double dots is 0.00222831 (BF16 operands/FP32 accumulator), **0.506040** (native
+BF16 accumulator), **0.0526036** (BF16 partials K128), 0.00570492 (INT8), and
+0.0000228791 (INT16). Pure BF16 accumulation is unsuitable for the current
+precision contract; less FP32 does not automatically mean better throughput or
+acceptable gradients. On 4096³, BF16 accumulator error rises to 0.722769.
+
+The exact-accumulator suite covers all integer outputs for small/medium K,
+sampled outputs at K=131073, both signs/endpoints, mixed signs, K=16385 crossing
+the partial boundary, and signed INT8 overflow-length widening. BF16 tests use
+exactly representable products through K=256 and verify both accumulator modes,
+tails and residual-add behavior. Fused columns match separate expansion/packing
+bit-for-bit across C=3/8/32, 3×3/5×5 kernels, one/three BF16 components. Matrix
+sweeps check all four transposes, dimension tails, quantization against the CPU,
+exact integer sums before dequantization, finite outputs and add semantics.
+
+CPU gradient/overfit/checkpoint tests, C4/C32 PyTorch oracles, CTest 14/14,
+CUDA C32 regression, and NVRTC/HIPRTC compilation pass. No new AMD GPU race-tool
+qualification is claimed.
+
+### Reproduce the follow-up
+
+```sh
+make -C nn check rdna4-precision
+sh nn/test_rdna4_precision.sh nn/build/bench_rdna4_precision
+nn/build/bench_rdna4_precision 4096 4096 4096 0 1 30 195 389
+nn/build/gn_tool bench MODEL.safetensors hip-int16 16 50 195 389
+nn/build/test_gpu hip-int16 nn/build/int16-wide.safetensors wide 2 report
+nn/build/test_gpu hip-int16 nn/build/int16-full.safetensors full 2 report # expected failure
+```
+
+`gn_tool bench` separates useful GEMM work, product work and FP32 attention,
+using whole-step wall time. Integer rates are TIOP/s, not mislabeled TFLOP/s.
+The precision benchmark additionally separates matrix-only and pack-plus-matrix
+event timing, exact padded WMMA issue counts and product/issued percentages.
+Its correctness exit status is separate from approximation/training qualification.
+Peaks default explicitly to RX 9070 XT dense BF16 195 TFLOP/s and INT8 389 TOP/s,
+and can be overridden by arguments. INT16's four INT8 products are compared to
+the INT8 instruction peak; this is **not a native INT16 peak claim**. Sparse
+rates are not used. See [AMD's RX 9070 XT specifications](https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9070xt.html).
+
+Next work: diagnose full-model gradient divergence layer by layer, improve
+weight-pack reuse, pack backward im2col directly, time/cache Lt algorithms, and
+pipeline larger LDS tiles. **95% peak is still not achieved.**

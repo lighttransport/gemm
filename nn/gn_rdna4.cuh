@@ -4,6 +4,90 @@
  * accumulators to preserve the six-product training precision contract.
  */
 #if defined(GN_HIP)
+/* Coalesced transpose before rowwise integer scaling. A reused FP32 scratch
+ * buffer holds an exact bitwise layout change, not an FP32 dot/reduction. */
+extern "C" __global__ void gn_transpose_rows(float *out, const float *in, int R, int K) {
+    __shared__ float tile[32][33];
+    int r0 = blockIdx.y * 32, k0 = blockIdx.x * 32, t = threadIdx.x;
+    for (int i = t; i < 1024; i += 256) {
+        int r = i / 32, k = i % 32;
+        tile[r][k] = r0 + k < R && k0 + r < K ? in[(k0 + r) * R + r0 + k] : 0;
+    }
+    __syncthreads();
+    for (int i = t; i < 1024; i += 256) {
+        int r = r0 + i / 32, k = k0 + i % 32;
+        if (r < R && k < K)
+            out[r * K + k] = tile[i % 32][i / 32];
+    }
+}
+/* Default 81-token, 32-wide head: stage K/V with coalesced global reads.
+ * Transposed LDS K avoids the strided global dot loop; dot/softmax/output
+ * reduction orders remain identical to gn_attention_parallel. */
+extern "C" __global__ void gn_attention_81(float *y, float *prob, const float *x, const float *bias,
+                                           int B, int side, int C, int D) {
+    __shared__ float q[32], keys[32][82], values[81][33], scores[81];
+    int query = blockIdx.x, t = threadIdx.x, H = C / 32;
+    int i = query % 81, h = query / 81 % H, b = query / (81 * H);
+    if (t < 32)
+        q[t] = x[(b * 81 + i) * 3 * C + h * 32 + t];
+    for (int index = t; index < 81 * 32; index += 256) {
+        int j = index / 32, d = index % 32;
+        keys[d][j] = x[(b * 81 + j) * 3 * C + C + h * 32 + d];
+        values[j][d] = x[(b * 81 + j) * 3 * C + 2 * C + h * 32 + d];
+    }
+    __syncthreads();
+    float top = -INFINITY;
+    if (t < 81) {
+        float dot = 0;
+        for (int d = 0; d < 32; d++)
+            dot += q[d] * keys[d][t];
+        int rel = (i / 9 + 8 - t / 9) * 17 + i % 9 + 8 - t % 9;
+        scores[t] = dot * rsqrtf((float)D) + bias[rel * H + h];
+        top = scores[t];
+    }
+    top = gn_block_max(top);
+    double sum = 0;
+    if (t < 81) {
+        scores[t] = expf(scores[t] - top);
+        sum = scores[t];
+    }
+    sum = gn_block_sum(sum);
+    if (t < 81) {
+        scores[t] /= (float)sum;
+        prob[query * 81 + t] = scores[t];
+    }
+    __syncthreads();
+    if (t < 32) {
+        float v = 0;
+        for (int j = 0; j < 81; j++)
+            v += scores[j] * values[j][t];
+        y[(b * 81 + i) * C + h * 32 + t] = v;
+    }
+    (void)B;
+    (void)side;
+}
+/* Generate packed im2col directly: no FP32 column buffer or second read. */
+extern "C" __global__ void gn_columns_bf16(unsigned short *out, const float *x, int R, int C,
+                                           int side, int kernel, int precise) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x, K = C * kernel * kernel;
+    int stride = (K + 31) & ~31;
+    if (i >= R * stride)
+        return;
+    int row = i / stride, k = i % stride, S = side * side;
+    int yy = row % S / side + k / (C * kernel) - kernel / 2;
+    int xx = row % side + k / C % kernel - kernel / 2;
+    float v = k < K && yy >= 0 && xx >= 0 && yy < side && xx < side
+                  ? x[(row / S * S + yy * side + xx) * C + k % C]
+                  : 0;
+    unsigned short h = bf(v);
+    out[i] = h;
+    if (precise) {
+        float residual = v - unbf(h);
+        unsigned short low = bf(residual);
+        out[R * stride + i] = low;
+        out[2 * R * stride + i] = bf(residual - unbf(low));
+    }
+}
 extern "C" __global__ void gn_bias_back_parallel(float *db, const float *dy, int R, int C) {
     __shared__ double sums[256];
     int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;
@@ -45,9 +129,13 @@ extern "C" __global__ void gn_lt_combine(float *y, const float *high, const floa
     if (i < count)
         y[i] = (high[i] + low[i]) + (add ? y[i] : 0);
 }
-template <bool Precise, int MR = 2, int NR = 2, int BK = 32>
+/* AccChunk=-1: FP32 accumulators; 0: native BF16 throughout the dot;
+ * positive: native BF16 partial dots, widened once per AccChunk products.
+ * This changes the training arithmetic and is always opt-in. */
+template <bool Precise, int MR = 2, int NR = 2, int BK = 32, int AccChunk = -1>
 __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned short *b, int M,
                               int N, int K, int add) {
+    static_assert(!Precise || AccChunk < 0, "BF16 accumulation changes the precision contract");
     constexpr int BM = 32 * MR, BN = 32 * NR, Planes = Precise ? 3 : 1;
     __shared__ unsigned short sa[Planes][BM][BK + 8] __attribute__((aligned(16)));
     __shared__ unsigned short sb[Planes][BN][BK + 8] __attribute__((aligned(16)));
@@ -55,6 +143,7 @@ __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned 
     int r0 = blockIdx.y * BM, c0 = blockIdx.x * BN;
     int wr = (wave / 2) * 16 * MR, wc = (wave % 2) * 16 * NR, stride = (K + 31) & ~31;
     float8 high[MR][NR] = {}, low[MR][NR] = {};
+    ushort8 narrow[MR][NR] = {};
     for (int k = 0; k < stride; k += BK) {
 #pragma unroll
         for (int p = 0; p < Planes; p++) {
@@ -104,8 +193,21 @@ __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned 
                         low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
                             av[0][i], bv[2][j], low[i][j]);
                     }
-                    high[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
-                        av[0][i], bv[0][j], high[i][j]);
+                    if constexpr (AccChunk < 0) {
+                        high[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                            av[0][i], bv[0][j], high[i][j]);
+                    } else {
+                        narrow[i][j] = __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32_gfx12(
+                            av[0][i], bv[0][j], narrow[i][j]);
+                        if constexpr (AccChunk > 0) {
+                            if ((k + sub + 16) % AccChunk == 0) {
+#pragma unroll
+                                for (int q = 0; q < 8; q++)
+                                    high[i][j][q] += unbf(narrow[i][j][q]);
+                                narrow[i][j] = ushort8{};
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -118,8 +220,12 @@ __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned 
 #pragma unroll
             for (int q = 0; q < 8; q++) {
                 int r = r0 + wr + 16 * i + half * 8 + q, c = c0 + wc + 16 * j + ix;
-                if (r < M && c < N)
-                    y[r * N + c] = (high[i][j][q] + low[i][j][q]) + (add ? y[r * N + c] : 0);
+                if (r < M && c < N) {
+                    float v = AccChunk == 0  ? unbf(narrow[i][j][q])
+                              : AccChunk > 0 ? high[i][j][q] + unbf(narrow[i][j][q])
+                                             : high[i][j][q] + low[i][j][q];
+                    y[r * N + c] = v + (add ? y[r * N + c] : 0);
+                }
             }
 }
 extern "C" __global__ __launch_bounds__(128) void gn_mm_tiled(float *y, const unsigned short *a,
@@ -132,5 +238,153 @@ extern "C" __global__ __launch_bounds__(128) void gn_mm_tiled_fast(float *y,
                                                                    const unsigned short *b, int M,
                                                                    int N, int K, int add) {
     gn_rdna4_body<false>(y, a, b, M, N, K, add);
+}
+extern "C" __global__ __launch_bounds__(128) void gn_mm_bf16_acc(float *y, const unsigned short *a,
+                                                                 const unsigned short *b, int M,
+                                                                 int N, int K, int add, int chunk) {
+    if (chunk)
+        gn_rdna4_body<false, 2, 2, 32, 128>(y, a, b, M, N, K, add);
+    else
+        gn_rdna4_body<false, 2, 2, 32, 0>(y, a, b, M, N, K, add);
+}
+
+/* Row quantization. INT16 is a signed high byte and UNSIGNED low byte:
+ * q = 256*hi + lo. The four WMMA products below cover the complete INT16
+ * range, including -32768 in the exact-integer diagnostic. */
+extern "C" __global__ void gn_pack_integer(signed char *out, float *scales, const float *in, int R,
+                                           int K, int trans, int bits) {
+    int r = blockIdx.x, t = threadIdx.x, stride = (K + 31) & ~31;
+    float peak = 0;
+    for (int k = t; k < K; k += 256)
+        peak = fmaxf(peak, fabsf(in[trans ? k * R + r : r * K + k]));
+    peak = gn_block_max(peak);
+    int bound = bits == 8 ? 127 : 32767;
+    float scale = peak > 0 ? fmaxf(peak / bound, 1e-30f) : 1;
+    if (!t)
+        scales[r] = scale;
+    for (int k = t; k < stride; k += 256) {
+        float x = k < K ? in[trans ? k * R + r : r * K + k] : 0;
+        int q = max(-bound, min(bound, __float2int_rn(x / scale)));
+        out[r * stride + k] = (signed char)(bits == 8 ? q : q >> 8);
+        if (bits == 16)
+            out[(R + r) * stride + k] = (signed char)(q & 255);
+    }
+}
+typedef int gn_int2 __attribute__((ext_vector_type(2)));
+typedef int gn_int4 __attribute__((ext_vector_type(4)));
+typedef int gn_int8 __attribute__((ext_vector_type(8)));
+template <int Bits, bool Wide, int MR = 2, int NR = 2>
+__device__ __forceinline__ void gn_rdna4_integer(float *y, const signed char *a, const signed char *b,
+                                 const float *as, const float *bs, int M, int N, int K, int add,
+                                 long long *exact) {
+    constexpr int BM = 32 * MR, BN = 32 * NR, P = Bits / 8;
+    __shared__ signed char sa[P][BM][48] __attribute__((aligned(16)));
+    __shared__ signed char sb[P][BN][48] __attribute__((aligned(16)));
+    int t = threadIdx.x, lane = t & 31, wave = t / 32, ix = lane & 15, half = lane / 16;
+    int r0 = blockIdx.y * BM, c0 = blockIdx.x * BN, stride = (K + 31) & ~31;
+    int wr = (wave / 2) * 16 * MR, wc = (wave % 2) * 16 * NR;
+    gn_int8 hh[MR][NR] = {}, hl[MR][NR] = {}, lh[MR][NR] = {}, ll[MR][NR] = {};
+    long long wide[MR][NR][8] = {};
+    for (int k = 0; k < stride; k += 32) {
+#pragma unroll
+        for (int p = 0; p < P; p++) {
+            for (int q = t; q < BM * 2; q += 128) {
+                int r = q / 2, c = (q % 2) * 16;
+                *reinterpret_cast<gn_int4 *>(&sa[p][r][c]) =
+                    r0 + r < M
+                        ? *reinterpret_cast<const gn_int4 *>(a + (p * M + r0 + r) * stride + k + c)
+                        : gn_int4{};
+            }
+            for (int q = t; q < BN * 2; q += 128) {
+                int r = q / 2, c = (q % 2) * 16;
+                *reinterpret_cast<gn_int4 *>(&sb[p][r][c]) =
+                    c0 + r < N
+                        ? *reinterpret_cast<const gn_int4 *>(b + (p * N + c0 + r) * stride + k + c)
+                        : gn_int4{};
+            }
+        }
+        __syncthreads();
+        /* Two K=16 issues consume each 128-bit fragment. The integer dot
+         * is exact, so permuting its K terms cannot change the result. */
+        gn_int4 av[P][MR], bv[P][NR];
+#pragma unroll
+        for (int p = 0; p < P; p++) {
+#pragma unroll
+            for (int i = 0; i < MR; i++)
+                av[p][i] = *reinterpret_cast<gn_int4 *>(&sa[p][wr + 16 * i + ix][half * 16]);
+#pragma unroll
+            for (int j = 0; j < NR; j++)
+                bv[p][j] = *reinterpret_cast<gn_int4 *>(&sb[p][wc + 16 * j + ix][half * 16]);
+        }
+#pragma unroll
+        for (int s = 0; s < 2; s++)
+#pragma unroll
+            for (int i = 0; i < MR; i++)
+#pragma unroll
+                for (int j = 0; j < NR; j++) {
+                    gn_int2 ah = {av[0][i][2 * s], av[0][i][2 * s + 1]};
+                    gn_int2 bh = {bv[0][j][2 * s], bv[0][j][2 * s + 1]};
+                    hh[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, ah, true, bh,
+                                                                                hh[i][j], false);
+                    if constexpr (Bits == 16) {
+                        gn_int2 al = {av[1][i][2 * s], av[1][i][2 * s + 1]};
+                        gn_int2 bl = {bv[1][j][2 * s], bv[1][j][2 * s + 1]};
+                        hl[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                            true, ah, false, bl, hl[i][j], false);
+                        lh[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                            false, al, true, bh, lh[i][j], false);
+                        ll[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                            false, al, false, bl, ll[i][j], false);
+                    }
+                }
+        /* The largest partial is unsigned lo*lo: 16384*255^2 < INT32_MAX.
+         * Widen BEFORE weighting or adding cross terms. No FP32 reduction,
+         * no signed-overflow arithmetic, and no saturating/wrapping dots. */
+        if constexpr (Wide || Bits == 16) {
+            if ((k + 32) % 16384 == 0 || k + 32 == stride) {
+#pragma unroll
+                for (int i = 0; i < MR; i++)
+#pragma unroll
+                    for (int j = 0; j < NR; j++) {
+#pragma unroll
+                        for (int q = 0; q < 8; q++) {
+                            if constexpr (Bits == 16)
+                                wide[i][j][q] += (long long)hh[i][j][q] * 65536 +
+                                                 ((long long)hl[i][j][q] + lh[i][j][q]) * 256 +
+                                                 ll[i][j][q];
+                            else
+                                wide[i][j][q] += hh[i][j][q];
+                        }
+                        hh[i][j] = hl[i][j] = lh[i][j] = ll[i][j] = gn_int8{};
+                    }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < MR; i++)
+#pragma unroll
+        for (int j = 0; j < NR; j++)
+#pragma unroll
+            for (int q = 0; q < 8; q++) {
+                int r = r0 + wr + i * 16 + half * 8 + q, c = c0 + wc + j * 16 + ix;
+                if (r < M && c < N) {
+                    long long v = Wide || Bits == 16 ? wide[i][j][q] : (long long)hh[i][j][q];
+                    if (exact)
+                        exact[r * N + c] = v;
+                    y[r * N + c] = (float)v * as[r] * bs[c] + (add ? y[r * N + c] : 0);
+                }
+            }
+}
+extern "C" __global__
+__launch_bounds__(128) void gn_mm_integer(float *y, const signed char *a, const signed char *b,
+                                          const float *as, const float *bs, int M, int N, int K,
+                                          int add, int bits, int wide, long long *exact) {
+    if (bits == 16)
+        gn_rdna4_integer<16, true, 2, 1>(y, a, b, as, bs, M, N, K, add, exact);
+    else if (wide || K > 131040) /* Account for Kpad32 in the signed INT8 bound. */
+        gn_rdna4_integer<8, true>(y, a, b, as, bs, M, N, K, add, exact);
+    else
+        gn_rdna4_integer<8, false>(y, a, b, as, bs, M, N, K, add, exact);
 }
 #endif

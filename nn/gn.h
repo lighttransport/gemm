@@ -28,6 +28,13 @@ gn_config gn_default_config(void);
  * cuda-int8/cuda-int16 are EXPERIMENTAL quantized-operand matrix paths, with
  * FP32 master weights/moments and non-matrix math. Neither is qualified for
  * full-network training; int16 uses four INT8 products, not native INT16 MMA.
+ * hip-bf16: single BF16 product with FP32 accumulation during training too.
+ * hip-bf16-acc / hip-bf16-acc128: native BF16 accumulators throughout each dot
+ * or per K=128 partial, respectively (the latter widens partials to FP32).
+ * hip-int8 / hip-int8-i64: INT8 WMMA with INT32 / widened INT64 partial sums.
+ * hip-int16: four signed/unsigned INT8 products, INT32 partials, INT64 combine.
+ * All reduced-precision HIP paths are EXPERIMENTAL and retain FP32 master,
+ * optimizer, gradient storage, dequantization, and non-matrix arithmetic.
  * Unsupported backends fail explicitly; there is no silent CPU fallback. */
 gn_model *gn_create(const gn_config *config, const char *backend, int device);
 void gn_destroy(gn_model *model);
@@ -39,6 +46,9 @@ size_t gn_memory_used(const gn_model *model);
  * forward+backward (training), including attention. Excludes padding,
  * precision compensation, optimizer and non-matrix operations. FMA = 2. */
 double gn_matrix_flops(const gn_model *model);
+/* Useful convolution/linear operations only, excluding FP32 attention. This
+ * is an operation-equivalent count for quantized integer matrix backends. */
+double gn_gemm_flops(const gn_model *model);
 uint64_t gn_step(const gn_model *model);
 /* policy [batch, side*side, actions], wdl [batch,3] probabilities. */
 int gn_infer(gn_model *, size_t batch, const float *input, float *policy, float *wdl);

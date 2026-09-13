@@ -2,7 +2,8 @@
  * Original CUDA/HIP network kernels. Compiled by NVRTC/HIPRTC, not a framework.
  * Inference rounds operands to BF16. Training decomposes each FP32 operand
  * into three BF16 components and uses six products with separate corrections.
- * Matrix accumulators and trainable state stay FP32.
+ * Default matrix accumulators and trainable state stay FP32. Explicit RDNA4
+ * experiments in gn_rdna4.cuh also implement BF16/INT32/INT64 accumulators.
  */
 #if defined(GN_HIP)
 #ifndef __HIPCC_RTC__

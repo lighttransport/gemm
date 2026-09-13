@@ -245,7 +245,10 @@ gn_model *gn_create(const gn_config *c, const char *backend, int device) {
                      strcmp(backend, "cuda-fp32") && strcmp(backend, "hip-fp32") &&
                      strcmp(backend, "cuda-legacy") && strcmp(backend, "hip-legacy") &&
                      strcmp(backend, "hip-blaslt") && strcmp(backend, "cuda-int8") &&
-                     strcmp(backend, "cuda-int16"))) {
+                     strcmp(backend, "cuda-int16") && strcmp(backend, "hip-int8") &&
+                     strcmp(backend, "hip-int8-i64") && strcmp(backend, "hip-int16") &&
+                     strcmp(backend, "hip-bf16") && strcmp(backend, "hip-bf16-acc") &&
+                     strcmp(backend, "hip-bf16-acc128"))) {
         fail("unknown backend; expected cpu, cuda or hip");
         return NULL;
     }
@@ -295,7 +298,7 @@ void gn_destroy(gn_model *m) {
 const gn_config *gn_configuration(const gn_model *m) { return m ? &m->cfg : NULL; }
 size_t gn_parameter_count(const gn_model *m) { return m ? m->parameters : 0; }
 size_t gn_memory_used(const gn_model *m) { return m ? m->bytes : 0; }
-double gn_matrix_flops(const gn_model *m) {
+double gn_gemm_flops(const gn_model *m) {
     if (!m)
         return 0;
     double operations = 0;
@@ -304,10 +307,19 @@ double gn_matrix_flops(const gn_model *m) {
         if (n->kind == LINEAR || n->kind == CONV) {
             double K = n->kind == LINEAR ? n->k : (double)m->n[n->a].c * n->k * n->k;
             operations += (m->training ? 6 : 2) * (double)n->r * n->c * K;
-        } else if (n->kind == ATTENTION) {
-            operations += (m->training ? 12 : 4) * (double)n->r * n->c * m->cfg.side * m->cfg.side;
         }
     }
+    return operations;
+}
+double gn_matrix_flops(const gn_model *m) {
+    double operations = gn_gemm_flops(m);
+    if (m)
+        for (size_t i = 0; i < m->nn; i++) {
+            const Node *n = &m->n[i];
+            if (n->kind == ATTENTION)
+                operations +=
+                    (m->training ? 12 : 4) * (double)n->r * n->c * m->cfg.side * m->cfg.side;
+        }
     return operations;
 }
 uint64_t gn_step(const gn_model *m) { return m ? m->step : 0; }
