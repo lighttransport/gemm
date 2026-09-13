@@ -224,6 +224,30 @@ The comparator mismatch and missing direct include are genuine model-output
 defects. Therefore classify this run as structurally complete but not
 build-correct, and do not claim coding-task acceptance.
 
+A matched **FP8/BF16-weight** quality run was then completed on normal-frequency
+allocation 51617019. Because full FP8 weights leave insufficient HBM reserve
+at 524,288 cache capacity, this run used a touched 65,536-position BF16 latent
+cache, which still covers the fixed 8,050-token input plus the 32,768-token
+generation ceiling. Minimum observed HBM headroom was 4.03 GiB. The 8,049
+timed prompt positions averaged **14.808 tok/s**, all **32,768 generated
+tokens** averaged **13.863 tok/s**, and the combined 40,817 timed positions
+averaged **14.039 tok/s**. Across 512 64-token decode windows the unweighted
+mean was 13.863 tok/s (median 13.868, range 13.514--14.049); the first and last
+eight windows averaged 14.012 and 13.743 tok/s.
+
+FP8 quality was worse on this single greedy coding sample. It diverged from
+the INT8 sequence at the first generated token, did not emit EOS, and exhausted
+the complete 32,768-token allowance. The text contained coherent design
+discussion and eventually began a nominal final answer, but repeatedly emitted
+small exploratory code fences and ended mid-statement inside the final C++
+block. The longest extracted C++ fence was only 2,850 characters, versus the
+INT8 run's complete 813-line block. Compiling the unmodified longest candidate
+fails immediately from missing declarations and the truncated class body, so
+no self-test executable exists. Classify FP8 as incomplete and not build-correct
+on this sample; this is stronger failure than INT8's complete but defective
+program, but one greedy sample is not a statistically sufficient general model
+quality comparison.
+
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
 their validated existing size. The same allocation resumed the partial 22.25
