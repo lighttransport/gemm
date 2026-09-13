@@ -24,8 +24,14 @@ static int copy_file(const char *src, const char *dst) {
     char *buf = NULL;
     int in = -1, out = -1, rc = -1;
     off_t off = 0;
+    struct stat si, so;
     if (!(buf = malloc(chunk)) || (in = open(src, O_RDONLY)) < 0 ||
-        (out = open(dst, O_CREAT | O_EXCL | O_WRONLY, 0644)) < 0) goto done;
+        fstat(in, &si) ||
+        (out = open(dst, O_CREAT | O_WRONLY, 0644)) < 0 || fstat(out, &so) ||
+        so.st_size < 0 || so.st_size > si.st_size ||
+        lseek(in, so.st_size, SEEK_SET) != so.st_size ||
+        lseek(out, so.st_size, SEEK_SET) != so.st_size) goto done;
+    off = so.st_size;
     for (;;) {
         ssize_t n = read(in, buf, chunk);
         if (n == 0) break;
@@ -69,8 +75,8 @@ int main(int argc, char **argv) {
     snprintf(src_manifest, sizeof(src_manifest), "%s/rank%02d%s.manifest", argv[1], rank, middle);
     snprintf(dst_blob, sizeof(dst_blob), "%s/rank%02d%s.blob", argv[2], rank, middle);
     snprintf(dst_manifest, sizeof(dst_manifest), "%s/rank%02d%s.manifest", argv[2], rank, middle);
-    snprintf(tmp_blob, sizeof(tmp_blob), "%s/.rank%02d%s.blob.tmp.%ld", argv[2], rank, middle, (long)getpid());
-    snprintf(tmp_manifest, sizeof(tmp_manifest), "%s/.rank%02d%s.manifest.tmp.%ld", argv[2], rank, middle, (long)getpid());
+    snprintf(tmp_blob, sizeof(tmp_blob), "%s/.rank%02d%s.blob.tmp", argv[2], rank, middle);
+    snprintf(tmp_manifest, sizeof(tmp_manifest), "%s/.rank%02d%s.manifest.tmp", argv[2], rank, middle);
     if (stat(src_blob, &sb) || stat(src_manifest, &sm) || sb.st_size <= 0 || sm.st_size <= 0) {
         fprintf(stderr, "rank=%d incomplete source core stage\n", rank); return 2;
     }
@@ -79,7 +85,6 @@ int main(int argc, char **argv) {
         printf("SENTINEL glm53f_rank_stage=REUSE kind=%s rank=%d bytes=%lld\n", kind, rank, (long long)sb.st_size);
         return 0;
     }
-    unlink(tmp_blob); unlink(tmp_manifest);
     if (copy_file(src_blob, tmp_blob) || copy_file(src_manifest, tmp_manifest) ||
         rename(tmp_blob, dst_blob) || rename(tmp_manifest, dst_manifest)) {
         perror("stage"); unlink(tmp_blob); unlink(tmp_manifest); return 1;

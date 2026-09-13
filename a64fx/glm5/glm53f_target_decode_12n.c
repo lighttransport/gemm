@@ -19,7 +19,8 @@
 #include "glm53f_target_model_12n.h"
 #include "glm53f_collective_12n.h"
 
-enum { LAYERS = 45, HIDDEN = 4096, STREAMS = 4, FLAT = 16384, MIX = 24 };
+enum { LAYERS = 45, HIDDEN = 4096, STREAMS = 4, FLAT = 16384, MIX = 24,
+       MAX_GENERATED_TOKENS = 32768 };
 
 static void *a256(size_t bytes) {
     void *p = NULL;
@@ -535,7 +536,8 @@ int main(int argc, char **argv) {
         }
         output_ids = argv[6];
         steps = atoi(argv[7]);
-        if (steps < 1 || steps > 8192) MPI_Abort(MPI_COMM_WORLD, 2);
+        if (steps < 1 || steps > MAX_GENERATED_TOKENS)
+            MPI_Abort(MPI_COMM_WORLD, 2);
         if (!rank && !(generated_ids = malloc((size_t)steps * sizeof(*generated_ids))))
             MPI_Abort(MPI_COMM_WORLD, 2);
         token = prompt_ids[0];

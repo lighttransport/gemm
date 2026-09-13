@@ -191,6 +191,45 @@ trials rules out intra-sublayer OpenMP rearrangement as the main route; proceed
 only with a cross-layer executor/communication redesign capable of removing
 multiple milliseconds per token.
 
+### Long coding-output validation
+
+The first quality run used an 8,050-token C++ stable-sort prompt with
+`Reasoning Effort: Max`. It consumed the entire 8,192-token generation limit
+inside `<think>`, stopped mid-sentence without EOS, and never emitted a
+complete program. At the populated 8K context it measured 18.119 prompt tok/s
+and 17.016 decode tok/s; the 27 tok/s headline therefore remains specific to
+the first approximately 512 positions.
+
+The repeat used `Reasoning Effort: Low` and a 32,768-token generation ceiling,
+with the accepted c7 INT8 weights, INT8 KDA, BF16 latent cache, mHC chaining,
+replicated first-512 prefix, flat robust uTofu, and 524,288 capacity unchanged.
+On normal-frequency allocation 51607843 it stopped naturally after **27,950
+generated tokens** (final special token 154827), rather than reaching the new
+ceiling. The 8,049 timed prompt tokens averaged **16.882 tok/s**, decode
+averaged **15.630 tok/s**, and the combined 35,999 timed positions averaged
+**15.892 tok/s**. Across 436 64-token decode windows the unweighted mean was
+15.630 tok/s (median 15.626, range 15.216--15.894); the first and last eight
+windows averaged 15.880 and 15.457 tok/s. Minimum observed HBM headroom was
+3.13 GiB. This normal-frequency result is not clock-comparable with the prior
+boost-eco run, but it shows the expected modest context-length decay.
+
+Low reasoning materially improved completion quality: the response finished
+its reasoning, emitted a complete 813-line C++20 implementation, and ended
+with a correctness discussion. It nevertheless fails the requested compile
+and self-test gate. The generated `AbsThenValue` accepts `int64_t`, but its
+self-test applies it to `Pair`, producing a hard comparator type mismatch. It
+also uses `std::from_chars` without including `<charconv>`; the available GCC 8
+libstdc++ cannot independently validate that path because it lacks the API.
+The comparator mismatch and missing direct include are genuine model-output
+defects. Therefore classify this run as structurally complete but not
+build-correct, and do not claim coding-task acceptance.
+
+The long interrupted `/local` deployment also exposed a development-cost
+problem. Rank-image staging now resumes stable per-rank temporary files from
+their validated existing size. The same allocation resumed the partial 22.25
+GiB transfer and ultimately reported exact-size `OK`/`REUSE` sentinels on all
+12 ranks, avoiding a complete restart after each bounded bridge invocation.
+
 The target is one text sequence on 12 A64FX nodes, with 524,288 total context
 positions and at least 30 generated tokens/s (33.333 ms/token), without MTP.
 Use the existing `~/models/glm53f` FP8 checkpoint and its rank-owned `/local`
