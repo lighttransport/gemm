@@ -198,6 +198,7 @@ struct glm53f_moe_stage_context_12n {
     float *router_bias, *router_logits;
     glm53f_moe_scratch_12n *scratch;
     float *batch_up, *batch_activation, *batch_shared, *batch_local;
+    float *batch_router, *batch_group_x, *batch_routes;
     float *task_up, *task_activation, *task_output;
     float *int8_scales[NLAYERS];
     int int8_enabled;
@@ -398,7 +399,11 @@ glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
         posix_memalign((void **)&c->batch_up, 256, (size_t)4 * 1024 * 4) ||
         posix_memalign((void **)&c->batch_activation, 256, (size_t)4 * 512 * 4) ||
         posix_memalign((void **)&c->batch_shared, 256, (size_t)4 * 4096 * 4) ||
-        posix_memalign((void **)&c->batch_local, 256, (size_t)4 * 4096 * 4)) goto fail;
+        posix_memalign((void **)&c->batch_local, 256, (size_t)32 * 4096 * 4) ||
+        posix_memalign((void **)&c->batch_router, 256, (size_t)32 * NEXPERTS * 4) ||
+        posix_memalign((void **)&c->batch_group_x, 256, (size_t)4 * 4096 * 4) ||
+        posix_memalign((void **)&c->batch_routes, 256,
+                      (size_t)32 * 8 * 4096 * 4)) goto fail;
     if (!rank) fprintf(stderr, "GLM53F_MOE_LOAD phase=router_read bytes=%zu\n", wn);
     for (int li = 0; li < layer_count; ++li) {
         char n[256];
@@ -437,9 +442,111 @@ int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_m
 
 void glm53f_moe_stage_profile_reset_12n(glm53f_moe_stage_context_12n*c){if(c)memset(c->profile_phase,0,sizeof(c->profile_phase));}
 void glm53f_moe_stage_profile_report_12n(const glm53f_moe_stage_context_12n*c,long positions,const char*label){if(!c||!c->profile)return;double p[3];MPI_Reduce(c->profile_phase,p,3,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);if(!c->rank){double d=positions?positions:1;printf("GLM53F_MOE_PROFILE label=%s router=%.3f local=%.3f allreduce=%.3f ms_pos\n",label?label:"target",p[0]*1e3/d,p[1]*1e3/d,p[2]*1e3/d);}}
+static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
+        const float *x, int tokens, int li, int table_layer) {
+    enum { H = 4096, PANEL = 4 };
+    int selected[32][8];
+    float route_weight[32][8];
+    double begin = c->profile ? MPI_Wtime() : 0.0;
+    for (int base = 0; base < tokens; base += PANEL) {
+        int n = tokens - base;
+        if (n > PANEL) n = PANEL;
+        glm53f_mv_bf16_batch(c->batch_router + (size_t)base * NEXPERTS,
+            c->router_w + (size_t)li * NEXPERTS * H,
+            x + (size_t)base * H, n, NEXPERTS, H);
+    }
+    for (int t = 0; t < tokens; ++t)
+        glm53f_router_topk(c->batch_router + (size_t)t * NEXPERTS,
+            c->router_bias + (size_t)li * NEXPERTS, NEXPERTS, 8, 2.5f,
+            selected[t], route_weight[t]);
+    if (c->profile) {
+        c->profile_phase[0] += MPI_Wtime() - begin;
+        begin = MPI_Wtime();
+    }
+    memset(c->batch_routes, 0, (size_t)tokens * 8 * H * sizeof(float));
+    for (int e = 0; e < NEXPERTS; ++e) {
+        expert_offset *ep = &c->table[table_layer * NEXPERTS + e];
+        if (ep->gate_up == UINT64_MAX) continue;
+        glm53f_expert_part part = {c->blob + ep->gate_up,
+            ep->gate_up_scale == UINT64_MAX ? NULL :
+                (const float *)(c->blob + ep->gate_up_scale),
+            c->blob + ep->down,
+            ep->down_scale == UINT64_MAX ? NULL :
+                (const float *)(c->blob + ep->down_scale),
+            ep->inter, ep->gate_type, ep->down_type};
+        int pos[PANEL], slot[PANEL], count = 0;
+        for (int t = 0; t < tokens; ++t)
+            for (int k = 0; k < 8; ++k)
+                if (selected[t][k] == e) {
+                    pos[count] = t;
+                    slot[count] = k;
+                    memcpy(c->batch_group_x + (size_t)count * H,
+                           x + (size_t)t * H, H * sizeof(float));
+                    if (++count == PANEL) {
+                        glm53f_expert_tokens_bits(&part, count, c->batch_group_x,
+                            c->batch_up, c->batch_activation, c->batch_shared);
+#pragma omp parallel for schedule(static)
+                        for (int q = 0; q < count * H; ++q) {
+                            int g = q / H, i = q - g * H;
+                            c->batch_routes[((size_t)pos[g] * 8 + slot[g]) * H + i] =
+                                c->batch_shared[(size_t)g * H + i];
+                        }
+                        count = 0;
+                    }
+                }
+        if (count) {
+            glm53f_expert_tokens_bits(&part, count, c->batch_group_x,
+                c->batch_up, c->batch_activation, c->batch_shared);
+#pragma omp parallel for schedule(static)
+            for (int q = 0; q < count * H; ++q) {
+                int g = q / H, i = q - g * H;
+                c->batch_routes[((size_t)pos[g] * 8 + slot[g]) * H + i] =
+                    c->batch_shared[(size_t)g * H + i];
+            }
+        }
+    }
+    shared_offset *sp = &c->shared[table_layer];
+    glm53f_expert_part shared = {c->shared_blob + sp->gate_up,
+        (const float *)(c->shared_blob + sp->gate_up_scale),
+        c->shared_blob + sp->down,
+        (const float *)(c->shared_blob + sp->down_scale), sp->inter, 0, 0};
+    for (int base = 0; base < tokens; base += PANEL) {
+        int n = tokens - base;
+        if (n > PANEL) n = PANEL;
+        glm53f_expert_tokens_bits(&shared, n, x + (size_t)base * H,
+            c->batch_up, c->batch_activation, c->batch_shared);
+#pragma omp parallel for schedule(static)
+        for (int q = 0; q < n * H; ++q)
+            c->batch_local[(size_t)base * H + q] = c->batch_shared[q];
+    }
+#pragma omp parallel for schedule(static)
+    for (int q = 0; q < tokens * H; ++q) {
+        int t = q / H, i = q - t * H;
+        float routed = 0.0f;
+        for (int k = 0; k < 8; ++k)
+            routed += route_weight[t][k] *
+                c->batch_routes[((size_t)t * 8 + k) * H + i];
+        c->batch_local[q] += routed;
+    }
+    if (c->profile) {
+        c->profile_phase[1] += MPI_Wtime() - begin;
+        begin = MPI_Wtime();
+    }
+    for (int base = 0; base < tokens; base += PANEL) {
+        int n = tokens - base;
+        if (n > PANEL) n = PANEL;
+        if (glm53f_sum_allreduce_12n(c->batch_local + (size_t)base * H,
+                                    out + (size_t)base * H, n * H)) return -1;
+    }
+    if (c->profile) c->profile_phase[2] += MPI_Wtime() - begin;
+    return 0;
+}
+
 int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out,const float*x,int tokens){
     int li=c?c->active_layer-c->first_layer:-1,table_layer=c?c->active_layer-FIRST_LAYER:-1;
-    if(!c||!out||!x||tokens<1||tokens>4||li<0||li>=c->layer_count||!c->shared_blob)return-1;
+    if(!c||!out||!x||tokens<1||tokens>32||li<0||li>=c->layer_count||!c->shared_blob)return-1;
+    if (tokens > 4 && !c->int8_enabled)
+        return moe_prefill_grouped(c, out, x, tokens, li, table_layer);
     if (c->int8_enabled) {
         for (int t = 0; t < tokens; ++t)
             if (glm53f_moe_stage_sublayer_12n(c, out + (size_t)t * 4096,
@@ -521,7 +628,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
     for(int q=0;q<tokens*H;q++){int t=q/H,i=q-t*H;float v=0.0f;for(int k=0;k<counts[t];k++)v+=weights[t*MAXP+k]*y[((size_t)t*MAXP+k)*H+i];c->batch_local[q]=v+c->batch_shared[q];}
     int rc=glm53f_sum_allreduce_12n(c->batch_local,out,tokens*H);return rc;
 }
-void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;for(int l=0;l<NLAYERS;l++)free(c->int8_scales[l]);free(c->task_output);free(c->task_activation);free(c->task_up);free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_i8_scale);free(c->router_i8);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
+void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;for(int l=0;l<NLAYERS;l++)free(c->int8_scales[l]);free(c->task_output);free(c->task_activation);free(c->task_up);free(c->batch_routes);free(c->batch_group_x);free(c->batch_router);free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_i8_scale);free(c->router_i8);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
 
 #ifndef GLM53F_EXPERT_NO_MAIN
 int main(int argc, char **argv) {

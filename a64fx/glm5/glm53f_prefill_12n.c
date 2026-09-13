@@ -1,4 +1,5 @@
 #include <mpi.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "glm53f_collective_12n.h"
@@ -42,6 +43,26 @@ int main(int argc, char **argv) {
         printf("GLM53F_PREFILL_12N positions=%d chunk=%d seconds=%.6f tok_s=%.3f\n",
                positions, chunk, maximum, positions / maximum);
     glm53f_target_profile_report_12n(m, "prefill");
+    /* Untimed state probe: equal token/logit and hidden checksums across chunk
+     * sizes validate the recurrent and sparse-cache boundary reached by the
+     * prompt-only scheduler without retaining every intermediate hidden. */
+    int probe_token = 0;
+    float probe_logit = 0.0f;
+    float *probe_hidden = malloc(4096 * sizeof(*probe_hidden));
+    if (!probe_hidden || glm53f_target_model_step_12n(
+            m, 31415, &probe_token, &probe_logit, probe_hidden))
+        MPI_Abort(MPI_COMM_WORLD, 4);
+    if (!rank) {
+        double sum = 0.0, sumsq = 0.0;
+        for (int i = 0; i < 4096; ++i) {
+            sum += probe_hidden[i];
+            sumsq += (double)probe_hidden[i] * probe_hidden[i];
+        }
+        printf("GLM53F_PREFILL_PROBE token=%d logit=%.9g hidden_sum=%.17g "
+               "hidden_rms=%.17g\n", probe_token, probe_logit, sum,
+               sqrt(sumsq / 4096.0));
+    }
+    free(probe_hidden);
     free(input);
     glm53f_target_model_free_12n(m);
     glm53f_collective_free_12n();

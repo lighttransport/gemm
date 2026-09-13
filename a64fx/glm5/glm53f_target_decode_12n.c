@@ -379,14 +379,9 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
         } else {
             glm53f_moe_stage_set_layer_12n(m->moe, l);
             if (tokens > VERIFY_BATCH) {
-                for (int tile = 0; tile < tokens; tile += KERNEL_BATCH) {
-                    int panel = tokens - tile;
-                    if (panel > KERNEL_BATCH) panel = KERNEL_BATCH;
-                    if (glm53f_moe_stage_sublayer_batch_12n(
-                            m->moe, m->batch_output + (size_t)tile * HIDDEN,
-                            m->batch_normalized + (size_t)tile * HIDDEN, panel))
-                        return -1;
-                }
+                if (glm53f_moe_stage_sublayer_batch_12n(
+                        m->moe, m->batch_output, m->batch_normalized, tokens))
+                    return -1;
                 goto batch_ffn_done;
             }
             int n = tokens < 5 ? tokens : 4;
@@ -493,7 +488,8 @@ void glm53f_target_profile_report_12n(
                batch[2]*1e3/batch_denom, batch[3]*1e3/batch_denom,
                batch[4]*1e3/batch_denom);
     }
-    glm53f_moe_stage_profile_report_12n(m->moe, m->scalar_steps, label);
+    glm53f_moe_stage_profile_report_12n(
+        m->moe, m->scalar_steps ? m->scalar_steps : m->batch_positions, label);
 }
 
 void glm53f_target_model_free_12n(glm53f_target_model_12n *m) {

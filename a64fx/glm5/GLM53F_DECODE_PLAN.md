@@ -377,6 +377,25 @@ FFN is flat and dominant.  The next implementation must group routed work by
 expert and evaluate the shared expert across a wider token GEMM so that expert
 weights are reused beyond the current four-position kernel panel.
 
+The next FP8 prefill scheduler groups the complete 32-position tile by locally
+resident routed expert.  Router projections remain four-token matrices; each
+expert consumes up to four gathered positions per weight pass, and results are
+stored by original top-k route slot before the final token-major accumulation.
+The shared expert is also evaluated in four-token matrices.  This preserves
+the favorable 4x4 SVE register shape while eliminating repeated routed weight
+passes when an expert is selected by multiple prompt positions.
+
+The exact scheduler reaches **29.484 tok/s** for 512 positions (17.365334 s),
+with 5.239 ms mHC, 13.994 ms attention, and 14.794 ms FFN per position.  The
+MoE subdivision is 0.789 ms router, 12.470 ms local experts, and 1.586 ms
+all-reduce.  This is +8.6% over the first chunk-32 implementation and +27.1%
+over the untuned 23.205 tok/s baseline.  A 128-position chunk-4 versus chunk-32
+state probe is bit-identical: both produce token 198, logit 5.59104729, hidden
+sum -40.713163658045232, and hidden RMS 1.9342837399749639.  An attempted
+one-row/eight-token FP8 kernel was rejected: it reduced throughput to 26.817
+tok/s and increased FFN to 18.027 ms/position because lower row efficiency
+outweighed the additional weight reuse.
+
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
 their validated existing size. The same allocation resumed the partial 22.25
