@@ -88,6 +88,89 @@ allocation; it remains an approximate speed-first path and does not change the
 independent numerical-validation status above. A three-repeat criterion still
 needs repeated launches of this exact configuration.
 
+## Proposed path to 30+ and 40+ tokens/s
+
+The current 1K-history speed-first baseline is 49.684 ms/token (20.127
+tokens/s) with INT8 FP8 weights, packed expert SDOT, approximate mHC, an 8 MiB
+Engram row cache, fresh attention pages and persistent workers. The latest
+buffered profile puts attention near 20--22 ms, routed/shared FFN near
+11--13 ms, mHC near 2.7 ms, gating near 1.1 ms, and the remaining broadcasts,
+handoffs and rendezvous on the critical path. These profile spans overlap;
+they must not be added as independent work.
+
+Thirty tokens/s requires a step at or below 33.333 ms, removing at least
+16.351 ms from the current run. Forty requires at or below 25.000 ms, removing
+24.684 ms. The working critical-path envelopes are:
+
+| Envelope | Current indication | 30+ gate | 40+ gate |
+| --- | ---: | ---: | ---: |
+| Attention preparation, projections, index and sparse QK/PV | 20--22 ms | <=12 ms | <=7 ms |
+| Routed/shared FFN | 11--13 ms | <=7 ms | <=5 ms |
+| mHC, norms and gate | about 4--6 ms | <=4 ms | <=2.5 ms |
+| Communication, handoff, head and other | remainder | <=10 ms | <=9.5 ms |
+| **Total wall time** | **49.684 ms** | **<=33.333 ms** | **<=25.000 ms** |
+
+The 30+ implementation should proceed in these gates:
+
+1. **Prepack and fuse attention.** Store compressed-KV integer tiles and their
+   group scales when a source row is published, so decode does not repack or
+   unpack the same row. Replace the current separate `sparse_sdot` QK,
+   softmax and PV passes with a reusable score workspace or an online
+   max/subtract/exp2/PV loop. Adapt
+   `~/work/clair/a64fx/a64fx/llm-guided-opt/int_exp2_sdot_a64fx.s` only after
+   preserving the sink in the maximum and denominator, the `[-31,0]` exponent
+   domain, masks and tails. The resumed sparse-SDOT run is 16.520 tokens/s
+   because it still pays packing and phase overhead; that path is not a
+   candidate until those costs disappear. First target: <=15 ms attention;
+   advance only when fixed-input logits and token IDs are checked.
+2. **Reduce selected-row work on the speed-first track.** Benchmark adaptive
+   512/384/256 selected rows with the original index and tie rules. Keep the
+   FP32 PV path initially; use 256 only if its fixed-history error and output
+   behavior are explicitly recorded. The 30+ gate needs <=12 ms total
+   attention, including index, projections, row preparation and collectives.
+3. **Finish the FFN critical path.** Quantize one activation per layer, keep it
+   resident across all local routes, and tile fused W1/W3/W2 SDOT so expert
+   setup, scale loads and output stores are shared. Replace the full-vector
+   expert sum with a topology-aware reduce-scatter/allgather experiment, and
+   row-shard the shared expert across every participating rank. Preserve the
+   current ordered FP32 control as a separate track. Target <=7 ms for the
+   routed/shared envelope.
+4. **Fuse mHC and synchronization.** Combine mHC pre/post, norm and BF16
+   rounding passes where the selected track permits it; keep the original
+   reduction order for the validated track. Pack route, selection and
+   residual metadata once, post nonblocking owner-to-next-owner transfers,
+   and overlap shared-expert work with routed reduction while retaining uTofu
+   acknowledgements. Target <=4 ms for mHC/norm/gate and <=10 ms for all
+   communication/head/other work.
+5. **Use all twelve nodes for dense work if the first four gates miss 33.333
+   ms.** Current TP4 activates four ranks for a layer group. Add a staged TP12
+   layout for QKV, sparse attention, WO-A/WO-B and the shared expert, then
+   measure allgather/gather latency against the compute saved. TP12 is the
+   likely 30+ step when attention remains above 12 ms; it must be admitted
+   only with per-rank memory and transport measurements.
+
+Forty tokens/s is a second architecture gate, not a smaller tuning pass. It
+requires TP12 (or an equivalent all-rank schedule), prepacked fused
+attention at <=7 ms, <=5 ms routed/shared FFN, <=2.5 ms mHC/norm/gate and
+<=9.5 ms for communication and everything else. This implies a fused
+owner-free layer schedule: all-rank dense projections, hierarchical expert
+reduction, shared-expert overlap, and a single residual handoff. The current
+sparse-SDOT implementation, TP4 owner groups and extra per-layer barriers
+cannot reach that budget by themselves.
+
+Exact-output 40+ is a separate possibility through MTP speculation. A cycle
+that emits three tokens must finish below 75 ms; the present verifier and
+forced-rejection measurements are far above that, so MTP needs the same
+TP12/fused attention and batched FFN work before it can be considered. Count
+actual emitted tokens including rejected drafts and commit time, rather than
+draft length. Keep this path separate from the approximate ordinary track.
+
+Each retained speed-first stage needs three fresh 1K-history repeats, every
+repeat above its target, p95 and minimum `MemAvailable`, and a full input/
+next-token regression against its predecessor. The validated track additionally
+keeps the independent FP8 cosine/RMS gate; no 30+ or 40+ claim is promoted
+from an approximate path without labeling it.
+
 ## Implementation continuation: persistent workers and SDOT, 2026-09-13
 
 The ordinary **speed-first 20+ milestone is repeatable** near 1K history on
