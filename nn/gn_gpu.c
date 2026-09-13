@@ -298,7 +298,8 @@ static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, 
         if (!g->hip && g->precise == 2 && M >= 256 && N >= 512 && !(N & 127))
             return launch(g, 52, (N + 127) / 128, (M + 31) / 32, 256, packed);
         if (g->precise == 2)
-            return launch(g, 35, (N + 31) / 32, (M + 31) / 32, 128, packed);
+            return launch(g, 35, (N + (g->hip ? 31 : 63)) / (g->hip ? 32 : 64),
+                          (M + 31) / 32, 128, packed);
         int tile_n = g->hip && g->precise ? 32 : 64, tile_m = g->precise ? 32 : 64;
         return launch(g, g->precise ? 16 : 17, (N + tile_n - 1) / tile_n, (M + tile_m - 1) / tile_m,
                       128, packed);
