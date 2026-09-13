@@ -297,6 +297,32 @@ pre-fix output. Prompt throughput was 14.472 tok/s, decode throughput was
 quality failure, not yet a substitute for the requested 8K-output compile and
 self-test gate.
 
+The full corrected 8K-output gate was completed on the same allocation with an
+8,050-token prompt and an 8,192-token output allowance. Both formats remain
+unqualified on this deliberately oversized coding task:
+
+| Format | Prompt tok/s | Decode tok/s | Combined tok/s | EOS | C++ result |
+|---|---:|---:|---:|---|---|
+| FP8/BF16 | 14.233 | 13.451 | 13.826 | no | 4 closed C++ fragments; none compile |
+| INT8 routed/shared + INT8 KDA | 16.360 | 15.341 | 15.829 | no | 3 closed C++ fragments; none compile |
+
+Both outputs are locally coherent technical reasoning, but spend the entire
+allowance repeatedly refining the design and never emit the requested complete
+single-file program. FP8 produced 31,280 decoded characters and INT8 produced
+31,106. Clang 21 with `-std=c++20 -O2 -Wall -Wextra -Wpedantic` rejected every
+language-tagged fence; consequently no `--self-test` executable exists. The
+sequences diverge at generated token 9, so INT8 is not an approximation of the
+FP8 greedy trajectory. INT8 is 14.9% faster for prompt processing and 14.1%
+faster for decode in this matched run, but neither clears the quality gate.
+
+The prompt itself reaches ~8K tokens by repeating 211 acceptance-scenario
+variants before the actual task. That is a useful instruction-retention stress
+case, but the common failure mode now points above FP8/INT8 arithmetic: either
+the checkpoint's reasoning-control/chat-template semantics or generation
+policy causes unbounded internal deliberation. Do not resume speed optimization
+until a normal non-repeated ~8K coding corpus and the checkpoint's canonical
+reasoning-control tokens are tested against the same compile/self-test gate.
+
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
 their validated existing size. The same allocation resumed the partial 22.25
