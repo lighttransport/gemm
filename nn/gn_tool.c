@@ -316,15 +316,7 @@ int main(int argc, char **argv) {
                    gemm_rate * (integer == 16 ? 4 : 1));
         printf(",\"fp32_attention_tflops\":%.6g", total_rate - gemm_rate);
         if (!strncmp(argv[3], "hip", 3) && !strstr(argv[3], "fp32")) {
-            double multiplier = integer == 16                       ? 4
-                                : integer                           ? 1
-                                : strstr(argv[3], "bf16-mixed")     ? 4
-                                : strstr(argv[3], "bf16x3-forward") ? 5.0 / 3
-                                : strstr(argv[3], "bf16x3-d")       ? 7.0 / 3
-                                : strstr(argv[3], "bf16x3")         ? 3
-                                : strstr(argv[3], "bf16") || strstr(argv[3], "fp16") ? 1
-                                                                    : 6;
-            double products = gemm_rate * multiplier;
+            double products = gn_gemm_product_ops(m, argv[3]) * iterations / train_seconds / 1e12;
             double peak = integer ? int8_peak : bf16_peak;
             printf(
                 ",\"peak_reference\":\"%s\",\"dense_peak_tops\":%.6g,"

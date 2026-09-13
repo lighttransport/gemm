@@ -238,6 +238,37 @@ __global__ void gn_point(float *y, float *dx, float *db, const float *x, const f
         dx[i] += dy[i] * s * (1 + x[i] * (1 - s));
     }
 }
+/* Fuse the two common pointwise graph pairs while retaining the intermediate
+ * value required by diagnostics and the second operation's derivative.
+ * op=0 is add->SiLU; op=1 is SiLU->multiply. */
+__global__ void gn_point_pair(float *mid, float *y, float *dx, float *db, const float *x,
+                              const float *b, const float *dy, int count, int op, int back) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+    if (!back) {
+        float s;
+        if (!op) {
+            mid[i] = x[i] + b[i];
+            s = mid[i] / (1 + expf(-mid[i]));
+        } else {
+            mid[i] = x[i] / (1 + expf(-x[i]));
+            s = mid[i] * b[i];
+        }
+        y[i] = s;
+        return;
+    }
+    if (!op) {
+        float s = 1 / (1 + expf(-mid[i]));
+        float d = dy[i] * s * (1 + mid[i] * (1 - s));
+        dx[i] += d;
+        db[i] += d;
+    } else {
+        float s = 1 / (1 + expf(-x[i]));
+        dx[i] += dy[i] * b[i] * s * (1 + x[i] * (1 - s));
+        db[i] += dy[i] * mid[i];
+    }
+}
 __global__ void gn_norm(float *y, float *aux, float *mean, float *var, const float *x,
                         const float *w, const float *bias, int R, int C, int layer, int training) {
     int group = blockIdx.x * blockDim.x + threadIdx.x, G = layer ? R : C, N = layer ? C : R;

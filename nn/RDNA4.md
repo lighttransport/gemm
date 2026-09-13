@@ -595,3 +595,45 @@ one-query-per-CTA attention forward measured 805.210 examples/s, slightly
 below the grouped-forward 810.623 observation, while retaining the same
 0.00041490896 gradient result. These are short observations, not sustained-
 performance guarantees.
+
+## Qualified 1,000 examples/s hybrid
+
+The final `hip-bf16x3-fp16back-blaslt` allocation uses three-product BF16/FP32
+for forward, single-product FP16/FP32 for convolution backward and parameter
+gradients, and three-product BF16/FP32 for the less numerous linear dX paths.
+Fusing residual-add/SiLU and SiLU/gate-multiply pairs removes intermediate
+pointwise launches and gradient-memory passes without changing graph values.
+
+The full version-2 C256/20 model passes the unchanged independent CPU gate at
+the same batch used for performance:
+
+| Batch | Output relative L2 | Global gradient relative L2 | Gate/result |
+|---:|---:|---:|---|
+| 16 | 0.000019643069 | 0.00083100988 | <=0.001, PASS |
+| 64 | 0.000019664309 | **0.00082061858** | <=0.001, PASS |
+
+Both runs include AdamW comparison and bit-exact same-backend checkpoint
+reload. The batch-64 alignment diagnostic leaves 0.00082060973 residual error
+after optimal scalar alignment, showing that the pass is not due to a hidden
+global rescale.
+
+Three final 100-step batch-64 runs measured **1,025.39 examples/s median**
+(1,023.25--1,026.55), meeting the requested 1,000 examples/s target in every
+run. Median useful matrix throughput was 11.0759 TFLOP/s. Accounting for the
+actual per-node product allocation—not a uniform multiplier—gives 19.2103
+16-bit product TFLOP/s, **9.85142%** of the nominal 195-TFLOP/s dense peak.
+Thus the qualified rate target passes; the alternative 75%-of-peak target does
+not. Benchmark JSON leaves `training_qualification` unresolved because a
+generic timing command cannot infer that an arbitrary checkpoint passed a
+separate CPU-oracle run; qualification is established by the paired test above.
+
+Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
+median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
+The precision allocation executes an estimated 18.3703 trillion 16-bit matrix
+product operations/s, **9.42065%** of the 195-TFLOP/s nominal dense reference.
+Thus the requested qualified 1,000 examples/s alternative is met; the separate
+75%-of-peak target is not. Product accounting uses the 5/3 average multiplier
+for three forward products and the mixed backward allocation and excludes
+padding. Benchmark JSON deliberately leaves qualification `unresolved`
+because a timing-only command cannot prove arbitrary checkpoint accuracy; the
+paired `test_gpu` result above is the qualification evidence.

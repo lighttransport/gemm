@@ -36,6 +36,8 @@ gn_config gn_default_config(void);
  * hip-bf16x3: two BF16 components and three products in forward/backward.
  * hip-bf16x3-dx/dw/forward retain three products only in the named phases;
  * these asymmetric experiments currently require the -blaslt SDK build.
+ * hip-bf16x3-fp16back-blaslt uses compensated BF16 forward, one-product
+ * FP16/FP32 backward, and compensated linear dX propagation.
  * hip-bf16-mixed: six products forward (including inference), three backward.
  * All three accept an optional -blaslt suffix in an SDK-enabled build.
  * Their matrix accumulators remain FP32; they are not accuracy-qualified.
@@ -59,6 +61,9 @@ double gn_matrix_flops(const gn_model *model);
 /* Useful convolution/linear operations only, excluding FP32 attention. This
  * is an operation-equivalent count for quantized integer matrix backends. */
 double gn_gemm_flops(const gn_model *model);
+/* Actual operand-product operations selected by a backend for conv/linear
+ * matrices, excluding padding and attention. Used for peak-rate accounting. */
+double gn_gemm_product_ops(const gn_model *model, const char *backend);
 uint64_t gn_step(const gn_model *model);
 /* policy [batch, side*side, actions], wdl [batch,3] probabilities. */
 int gn_infer(gn_model *, size_t batch, const float *input, float *policy, float *wdl);

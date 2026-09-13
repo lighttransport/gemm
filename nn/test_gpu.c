@@ -131,7 +131,7 @@ int main(int argc, char **argv) {
                     relative(cn->g, gn->g, count), flips, largest_flip);
         }
     }
-    double total_delta = 0, total_base = 0;
+    double total_delta = 0, total_base = 0, total_gpu = 0, total_dot = 0;
     for (size_t i = 0; i < gn_tensor_count(cpu); i++) {
         size_t r, n;
         float *cg, *gg;
@@ -145,6 +145,8 @@ int main(int argc, char **argv) {
             double d = cg[j] - gg[j];
             total_delta += d * d;
             total_base += (double)cg[j] * cg[j];
+            total_gpu += (double)gg[j] * gg[j];
+            total_dot += (double)cg[j] * gg[j];
             local_delta += d * d;
             local_base += (double)cg[j] * cg[j];
         }
@@ -156,6 +158,13 @@ int main(int argc, char **argv) {
         memcpy(cg, gg, r * n * sizeof(float));
     }
     double grad = sqrt(total_delta / fmax(total_base, 1e-12));
+    if (report) {
+        double scale = total_dot / fmax(total_gpu, 1e-30);
+        double aligned = sqrt(fmax(0, total_base - total_dot * total_dot / fmax(total_gpu, 1e-30)) /
+                              fmax(total_base, 1e-30));
+        fprintf(stderr, "gradient alignment: optimal_gpu_scale=%.9g residual_relative=%.9g\n",
+                scale, aligned);
+    }
     if (!isfinite(grad) || !isfinite(a.policy) || !isfinite(b.policy) || !isfinite(a.value) ||
         !isfinite(b.value) || grad > 0.001 ||
         fabs(a.policy - b.policy) + fabs(a.value - b.value) > tol) {

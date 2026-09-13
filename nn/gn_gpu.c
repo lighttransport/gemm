@@ -18,14 +18,15 @@ typedef struct {
     size_t bytes;
 } Buffer;
 typedef struct {
-    int hip, device, active, fp32, fp16, precise, synced, legacy, integer, reduced, chunk, wide, mixed;
+    int hip, device, active, fp32, fp16, hybrid16, precise, synced, legacy, integer, reduced, chunk;
+    int wide, mixed;
     int x3_backward;
     size_t used, limit;
     CUcontext context;
     CUmodule cuda_module;
     hipModule_t hip_module;
     Buffer b[SLOT_COUNT];
-    void *functions[43];
+    void *functions[44];
     void *lt;
 } Gpu;
 static const char *names[] = {"gn_mm",
@@ -70,7 +71,8 @@ static const char *names[] = {"gn_mm",
                               "gn_attention_scores_back_81",
                               "gn_pack_fp16",
                               "gn_columns_fp16",
-                              "gn_columns_fp16_back"};
+                              "gn_columns_fp16_back",
+                              "gn_point_pair"};
 static int current(Gpu *g) {
     int rc = g->hip ? (int)hipSetDevice(g->device) : (int)cuCtxSetCurrent(g->context);
     return rc ? gn_fail("cannot activate GPU context") : 0;
@@ -282,7 +284,8 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
     }
     g->hip = !strncmp(backend, "hip", 3);
     g->fp32 = strstr(backend, "fp32") != NULL;
-    g->fp16 = strstr(backend, "fp16") != NULL;
+    g->hybrid16 = strstr(backend, "fp16back") != NULL;
+    g->fp16 = strstr(backend, "fp16") != NULL && !g->hybrid16;
     g->legacy = strstr(backend, "legacy") != NULL;
     g->integer = strstr(backend, "int16") ? 16 : strstr(backend, "int8") ? 8 : 0;
     g->wide = strstr(backend, "i64") != NULL;
@@ -430,7 +433,7 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         gn_fail("GPU module load failed");
         goto bad;
     }
-    for (int i = 0; i < (g->hip ? 43 : 28); i++) {
+    for (int i = 0; i < (g->hip ? 44 : 28); i++) {
         if (g->hip) {
             hipFunction_t f;
             rc = (int)hipModuleGetFunction(&f, g->hip_module, names[i]);
@@ -508,6 +511,8 @@ static int prepare(gn_model *m) {
 }
 int gn_gpu_forward(gn_model *m, const float *input) {
     Gpu *g = m->gpu;
+    if (g->hybrid16)
+        g->fp16 = 0;
     g->precise = g->mixed ? 1 : g->reduced == 3 ? 2 : m->training && !g->reduced;
     if (m->training)
         g->synced = 0;
@@ -520,6 +525,23 @@ int gn_gpu_forward(gn_model *m, const float *input) {
         int R = (int)n->r, C = (int)n->c, K = n->k, layer = n->kind == LN;
         uint64_t x = PTR_NODE(m, n->a, 0), y = PTR_NODE(m, i, 0), w = param(m, n->w, 0),
                  bias = param(m, n->bias, 0), aux = PTR_NODE(m, i, 2);
+        if (g->hip && !g->legacy && i + 1 < m->nn) {
+            Node *next = &m->n[i + 1];
+            int pair = n->kind == ADD && next->kind == SILU && next->a == (int)i   ? 0
+                       : n->kind == SILU && next->kind == MUL && next->a == (int)i ? 1
+                                                                                   : -1;
+            if (pair >= 0) {
+                uint64_t out = PTR_NODE(m, i + 1, 0);
+                uint64_t other = pair ? PTR_NODE(m, next->b, 0) : PTR_NODE(m, n->b, 0);
+                uint64_t dummy = 0;
+                int count = R * C, back = 0;
+                void *args[] = {&y, &out, &dummy, &dummy, &x, &other,
+                                &dummy, &count, &pair,  &back};
+                CALL(flat(g, 43, (size_t)count, args));
+                i++;
+                continue;
+            }
+        }
         if (n->kind == LINEAR || n->kind == CONV) {
             int fused_ci = 0;
             if (n->kind == CONV) {
@@ -579,6 +601,10 @@ int gn_gpu_forward(gn_model *m, const float *input) {
 }
 int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn_metrics *metrics) {
     Gpu *g = m->gpu;
+    if (g->hybrid16) {
+        g->fp16 = 1;
+        g->precise = 0;
+    }
     if (g->mixed)
         g->precise = 2;
     g->synced = 0;
@@ -604,6 +630,25 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
         uint64_t x = PTR_NODE(m, n->a, 0), dx = PTR_NODE(m, n->a, 1), dy = PTR_NODE(m, i, 1),
                  w = param(m, n->w, 0), dw = param(m, n->w, 1), db = param(m, n->bias, 1),
                  aux = PTR_NODE(m, i, 2);
+        if (g->hip && !g->legacy && i > 1) {
+            Node *first = &m->n[i - 1];
+            int pair = n->kind == SILU && first->kind == ADD && n->a == (int)i - 1   ? 0
+                       : n->kind == MUL && first->kind == SILU && n->a == (int)i - 1 ? 1
+                                                                                     : -1;
+            if (pair >= 0) {
+                uint64_t mid = PTR_NODE(m, i - 1, 0), source = PTR_NODE(m, first->a, 0);
+                uint64_t other = pair ? PTR_NODE(m, n->b, 0) : PTR_NODE(m, first->b, 0);
+                uint64_t dsource = PTR_NODE(m, first->a, 1);
+                uint64_t dother = pair ? PTR_NODE(m, n->b, 1) : PTR_NODE(m, first->b, 1);
+                uint64_t dummy = 0;
+                int count = R * C, back = 1;
+                void *args[] = {&mid, &dummy, &dsource, &dother, &source,
+                                &other, &dy,   &count,   &pair,    &back};
+                CALL(flat(g, 43, (size_t)count, args));
+                i--;
+                continue;
+            }
+        }
         if (n->kind == LINEAR || n->kind == CONV) {
             uint64_t input = x, gradient = dx;
             int fused_ci = 0;
@@ -628,7 +673,18 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
             CALL(mm_columns(g, dw, dy, input, C, K, R, 1, 0, 1, fused_ci, side, n->k));
             if (g->x3_backward)
                 g->precise = g->x3_backward == 2 || g->x3_backward == 3 ? 0 : 2;
+            /* FP16 backward is close to the full-gradient gate. Preserve its
+             * fast convolution path, but compensate the less numerous linear
+             * dX propagations that feed attention and policy/value heads. */
+            if (g->hybrid16 && n->kind == LINEAR) {
+                g->fp16 = 0;
+                g->precise = 2;
+            }
             CALL(mm(g, gradient, dy, w, R, K, C, 0, 0, n->kind == LINEAR));
+            if (g->hybrid16 && n->kind == LINEAR) {
+                g->fp16 = 1;
+                g->precise = 0;
+            }
             if (n->kind == CONV)
                 CALL(columns(g, dx, gradient, R, (int)m->n[n->a].c, side, n->k, 1));
             void *args[] = {&db, &dy, &R, &C};

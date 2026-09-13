@@ -253,6 +253,7 @@ gn_model *gn_create(const gn_config *c, const char *backend, int device) {
          strcmp(backend, "hip-bf16x3") && strcmp(backend, "hip-bf16x3-blaslt") &&
          strcmp(backend, "hip-bf16x3-blaslt-tuned") && strcmp(backend, "hip-bf16x3-dx-blaslt") &&
          strcmp(backend, "hip-bf16x3-dw-blaslt") && strcmp(backend, "hip-bf16x3-forward-blaslt") &&
+         strcmp(backend, "hip-bf16x3-fp16back-blaslt") &&
          strcmp(backend, "hip-bf16-mixed") && strcmp(backend, "hip-bf16-mixed-blaslt") &&
          strcmp(backend, "hip-fp16-blaslt"))) {
         fail("unknown backend; expected cpu, cuda or hip");
@@ -316,6 +317,34 @@ double gn_gemm_flops(const gn_model *m) {
         }
     }
     return operations;
+}
+double gn_gemm_product_ops(const gn_model *m, const char *backend) {
+    if (!m || !backend)
+        return 0;
+    if (m->training && strstr(backend, "fp16back")) {
+        double operations = 0;
+        for (size_t i = 0; i < m->nn; i++) {
+            const Node *n = &m->n[i];
+            if (n->kind != LINEAR && n->kind != CONV)
+                continue;
+            double K = n->kind == LINEAR ? n->k : (double)m->n[n->a].c * n->k * n->k;
+            /* Three forward products, one dW product, and either one
+             * convolution dX or three compensated linear dX products. */
+            double products = n->kind == LINEAR ? 7 : 5;
+            operations += products * 2 * (double)n->r * n->c * K;
+        }
+        return operations;
+    }
+    int integer = strstr(backend, "int16") ? 16 : strstr(backend, "int8") ? 8 : 0;
+    double multiplier = integer == 16                   ? 4
+                        : integer                       ? 1
+                        : strstr(backend, "bf16-mixed") ? 4
+                        : strstr(backend, "bf16x3-forward") ? 5.0 / 3
+                        : strstr(backend, "bf16x3-d")       ? 7.0 / 3
+                        : strstr(backend, "bf16x3")         ? 3
+                        : strstr(backend, "bf16") || strstr(backend, "fp16") ? 1
+                                                                              : 6;
+    return gn_gemm_flops(m) * multiplier;
 }
 double gn_matrix_flops(const gn_model *m) {
     double operations = gn_gemm_flops(m);
