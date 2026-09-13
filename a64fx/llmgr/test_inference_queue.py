@@ -35,7 +35,7 @@ class InferenceQueueTest(unittest.TestCase):
         body = {"model": "laguna-s21", "messages": [{"role": "user",
                                                         "content": "q"}]}
         native = {"ids": [2, 3], "max_new": 2}
-        with mock.patch.object(server, "_ready_laguna",
+        with mock.patch.object(server, "_ready_serve",
                                return_value=SimpleNamespace(port=8080, id="run-1")), \
              mock.patch.object(server.urllib.request, "urlopen",
                                return_value=FakeResponse()):

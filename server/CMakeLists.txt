@@ -9,6 +9,8 @@ option(DIFFUSION_SERVER_ENABLE_SAM3_CUDA "Enable SAM3 CUDA backend (NVRTC via cu
 option(DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA "Enable SAM3.1 CUDA backend (NVRTC via cuew)" OFF)
 option(DIFFUSION_SERVER_ENABLE_MCP "Enable minimal MCP stdio mode" OFF)
 option(DIFFUSION_SERVER_ENABLE_LLM "Enable LLM/VLM OpenAI-compatible API server" ON)
+option(DIFFUSION_SERVER_ENABLE_DS4F_HETERO "Enable native staged DS4F x86 session" OFF)
+option(DIFFUSION_SERVER_ENABLE_DS4F_HIP "Build the optional DS4F HIP dense-bank attachment" ON)
 
 set(ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
@@ -34,7 +36,8 @@ target_compile_definitions(diffusion-server PRIVATE
     $<$<BOOL:${DIFFUSION_SERVER_ENABLE_SAM3}>:DIFFUSION_SERVER_ENABLE_SAM3=1>
     $<$<BOOL:${DIFFUSION_SERVER_ENABLE_SAM3_CUDA}>:DIFFUSION_SERVER_ENABLE_SAM3_CUDA=1>
     $<$<BOOL:${DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA}>:DIFFUSION_SERVER_ENABLE_SAM3_1_CUDA=1>
-    $<$<BOOL:${DIFFUSION_SERVER_ENABLE_MCP}>:DIFFUSION_SERVER_ENABLE_MCP=1>)
+    $<$<BOOL:${DIFFUSION_SERVER_ENABLE_MCP}>:DIFFUSION_SERVER_ENABLE_MCP=1>
+    $<$<BOOL:${DIFFUSION_SERVER_ENABLE_DS4F_HETERO}>:DIFFUSION_SERVER_ENABLE_DS4F_HETERO=1>)
 
 target_compile_options(diffusion-server PRIVATE -Wall -Wextra -Wno-unused-function -Wno-unused-parameter)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
@@ -120,10 +123,30 @@ endif()
 
 if(DIFFUSION_SERVER_ENABLE_LLM)
     target_sources(diffusion-server PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/server_llm.c)
+        ${CMAKE_CURRENT_SOURCE_DIR}/server_llm.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/image_decode.c)
     target_include_directories(diffusion-server PRIVATE
         ${ROOT_DIR}/cpu/llm
         ${ROOT_DIR}/cpu/vlm)
     target_compile_definitions(diffusion-server PRIVATE
         DIFFUSION_SERVER_ENABLE_LLM=1)
+endif()
+
+if(DIFFUSION_SERVER_ENABLE_DS4F_HETERO)
+    if(NOT DIFFUSION_SERVER_ENABLE_LLM)
+        message(FATAL_ERROR "DIFFUSION_SERVER_ENABLE_DS4F_HETERO requires DIFFUSION_SERVER_ENABLE_LLM")
+    endif()
+    target_sources(diffusion-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/server_ds4f.c)
+    target_include_directories(diffusion-server PRIVATE
+        ${ROOT_DIR}/hetero/ds4f)
+    if(DIFFUSION_SERVER_ENABLE_DS4F_HIP)
+        target_sources(diffusion-server PRIVATE
+            ${ROOT_DIR}/hetero/ds4f/hip_ds4f_dense.c)
+        target_compile_definitions(diffusion-server PRIVATE
+            DIFFUSION_SERVER_ENABLE_DS4F_HIP=1)
+        if(NOT DIFFUSION_SERVER_ENABLE_QWEN_IMAGE_HIP)
+            target_sources(diffusion-server PRIVATE ${ROOT_DIR}/rdna4/rocew.c)
+        endif()
+    endif()
 endif()

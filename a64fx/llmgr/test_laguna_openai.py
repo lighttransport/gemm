@@ -7,6 +7,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 import laguna_openai as api
 
 
+class FakeTokenizer:
+    def encode(self, text, add_bos=False):
+        return ([1] if add_bos else []) + [ord(ch) for ch in text]
+
+    def decode(self, ids, raw=False):
+        return "".join(chr(i) for i in ids if i > 1)
+
+
 class LagunaOpenAITest(unittest.TestCase):
     def test_reasoning_and_content(self):
         got = api.parse_assistant("<think>check carefully</think>The answer is 4.")
@@ -64,7 +72,7 @@ class LagunaOpenAITest(unittest.TestCase):
                 "messages": [{"role": "user", "content": "ping"}],
                 "cache_load": "/tmp/cache-load.bin",
                 "cache_save": "/tmp/cache-save.bin",
-            })
+            }, tokenizer=FakeTokenizer())
         self.assertEqual(req["cache_load"], "/tmp/cache-load.bin")
         self.assertEqual(req["cache_save"], "/tmp/cache-save.bin")
 
@@ -75,7 +83,7 @@ class LagunaOpenAITest(unittest.TestCase):
             "prompt_cache_retention": "24h",
             "parallel_tool_calls": False,
             "response_format": {"type": "text"},
-        })
+        }, tokenizer=FakeTokenizer())
         self.assertNotIn("prompt_cache_key", req)
         self.assertNotIn("prompt_cache_retention", req)
         self.assertNotIn("parallel_tool_calls", req)
@@ -127,7 +135,7 @@ class LagunaOpenAITest(unittest.TestCase):
             "top_k": 3,
             "min_p": 0.2,
             "seed": 123,
-        })
+        }, tokenizer=FakeTokenizer())
         self.assertEqual(req["top_k"], 3)
         self.assertEqual(req["min_p"], 0.2)
         self.assertEqual(req["seed"], 123)
@@ -136,7 +144,7 @@ class LagunaOpenAITest(unittest.TestCase):
         req, _tok = api.native_request({
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 32,
-        })
+        }, tokenizer=FakeTokenizer())
         self.assertEqual(req["max_new"], 32)
 
     def test_n_must_be_one(self):
@@ -144,7 +152,7 @@ class LagunaOpenAITest(unittest.TestCase):
             api.native_request({
                 "messages": [{"role": "user", "content": "ping"}],
                 "n": 2,
-            })
+            }, tokenizer=FakeTokenizer())
 
 
 if __name__ == "__main__":

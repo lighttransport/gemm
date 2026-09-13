@@ -23,6 +23,11 @@
 #define GGML_DEQUANT_IMPLEMENTATION
 #include "../../../common/ggml_dequant.h"
 
+/* Keep vision_model's qtensor layout identical to the hybrid LLM runner.
+ * transformer.h owns the extended GGUF qtensor (packed/prefill metadata);
+ * including it before qtensor_utils prevents this TU from using the smaller
+ * safetensors-only layout. */
+#include "../../../common/transformer.h"
 #include "../../../common/qtensor_utils.h"   /* qtensor struct */
 
 #define VISION_ENCODER_IMPLEMENTATION

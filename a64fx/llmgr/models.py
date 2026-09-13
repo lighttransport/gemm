@@ -18,17 +18,32 @@ Standard library only.
 
 import glob
 import os
+import re
+import shutil
 import time
+import urllib.error
+import urllib.request
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 LAGUNA_DIR = os.path.join(REPO, "a64fx", "laguna-s21")
 GEMMA4_DIR = os.path.join(REPO, "a64fx", "gemma4-mn")
 K3_DIR = os.path.join(REPO, "a64fx", "k3")
 UTOFU_DIR = os.path.join(REPO, "a64fx", "utofu-tests")
+DS4F_DIR = os.path.join(REPO, "a64fx", "llm")
 
 
 class ConfigError(ValueError):
     """Bad request config -- reported to the client as HTTP 400."""
+
+
+def _expanded_path(value, field):
+    try:
+        path = os.fspath(value)
+    except TypeError:
+        raise ConfigError("%s must be a string path (got %r)" % (field, value))
+    if not isinstance(path, str) or not path or "\0" in path:
+        raise ConfigError("%s must be a non-empty NUL-free string path" % field)
+    return os.path.abspath(os.path.expanduser(path))
 
 
 def _int(cfg, key, default=None, required=False):
@@ -92,6 +107,7 @@ class Adapter:
     supports_serve = False
     supports_cache = False
     openai_models = ()
+    proxy_protocol = False
 
     def default_np(self):
         return int(os.environ.get("PJM_MPI_PROC", "12"))
@@ -176,14 +192,31 @@ class Adapter:
                 fn = self.profile_argv
             else:
                 fn = getattr(self, mode)
-            if fn.__func__ is not getattr(Adapter, mode, None):
+            base = getattr(Adapter, "profile_argv" if mode == "profile" else mode,
+                           None)
+            if getattr(fn, "__func__", fn) is not base:
                 modes.append(mode)
         return {"modes": modes, "supports_cache": self.supports_cache,
+                "protocol_proxy": self.proxy_protocol,
                 "openai_models": list(self.openai_models),
                 "runner_contract": "llmgr.v1"}
 
     def cache_flags(self, action, path):
         return []
+
+    # Semantic API hooks.  A runner that advertises OpenAI/Anthropic serving
+    # owns these translations; the supervisor must not import a model module.
+    def native_request(self, body, chat=True):
+        raise ConfigError("model %s has no semantic request translator" % self.name)
+
+    def completion_response(self, body, text, native, chat=True, request_id=None):
+        raise ConfigError("model %s has no semantic response translator" % self.name)
+
+    def responses_request(self, body):
+        raise ConfigError("model %s has no Responses API translator" % self.name)
+
+    def responses_response(self, body, chat_response, request_id=None):
+        raise ConfigError("model %s has no Responses API renderer" % self.name)
 
 
 class LagunaAdapter(Adapter):
@@ -209,12 +242,33 @@ class LagunaAdapter(Adapter):
         "fp8": "laguna_s21_fp8_ep_runner",
     }
     _FP16_KV_RUNNER_BIN = "laguna_s21_fp8_kvfp16_ep_runner"
-    _DEFAULT_MODEL_DIR = {
-        "int4": "~/models/laguna-s21-int4",
-        "bf16": "~/models/laguna-s21",
-        "fp8": "~/models/laguna-s21-fp8",
-    }
-    _DEFAULT_NSHARDS = {"int4": 15, "bf16": 46, "fp8": 24}
+
+    def tokenizer_path(self, cfg):
+        path = cfg.get("tokenizer")
+        if path is None:
+            path = (os.environ.get("LLMGR_TOKENIZER") or
+                    os.environ.get("LAGUNA_TOKENIZER"))
+        if path is None:
+            path = os.path.join(self.model_dir(cfg), "tokenizer.json")
+        return os.path.expanduser(os.fspath(path))
+
+    def native_request(self, body, chat=True):
+        from laguna_openai import native_request
+        request = dict(body)
+        request["tokenizer"] = self.tokenizer_path(body)
+        return native_request(request, chat=chat)
+
+    def completion_response(self, body, text, native, chat=True, request_id=None):
+        from laguna_openai import completion_response
+        return completion_response(body, text, native, chat=chat, request_id=request_id)
+
+    def responses_request(self, body):
+        from laguna_openai import responses_request
+        return responses_request(body)
+
+    def responses_response(self, body, chat_response, request_id=None):
+        from laguna_openai import responses_response
+        return responses_response(body, chat_response, request_id=request_id)
 
     def _variant_flag(self, variant):
         return [] if variant == "int4" else ["--%s" % variant]
@@ -245,12 +299,16 @@ class LagunaAdapter(Adapter):
         np_ = _int(cfg, "np", self.default_np())
         user = os.environ.get("USER", "unknown")
         suffix = {"int4": "", "bf16": "-bf16", "fp8": "-fp8"}[variant]
-        return "/local/%s/laguna-s21%s-ep%d" % (user, suffix, np_)
+        root = os.environ.get("LLMGR_STAGE_ROOT", "/local")
+        return os.path.join(root, user, "laguna-s21%s-ep%d" % (suffix, np_))
 
     def model_dir(self, cfg):
         if cfg.get("model_dir"):
             return str(cfg["model_dir"])
-        return os.path.expanduser(self._DEFAULT_MODEL_DIR[self.variant(cfg)])
+        root = os.environ.get("LLMGR_MODEL_ROOT", "~/models")
+        names = {"int4": "laguna-s21-int4", "bf16": "laguna-s21",
+                 "fp8": "laguna-s21-fp8"}
+        return os.path.expanduser(os.path.join(root, names[self.variant(cfg)]))
 
     def build(self, cfg):
         variant = self.variant(cfg)
@@ -428,12 +486,15 @@ class Gemma4Adapter(Adapter):
         return self.variant(cfg)
 
     def stage_dir(self, cfg):
-        default = "/local/gemma4_tp" if self._variant(cfg) == "tp" else "/local/gemma4_pp"
+        root = os.environ.get("LLMGR_STAGE_ROOT", "/local")
+        default = os.path.join(root, "gemma4_%s" % self._variant(cfg))
         return str(cfg.get("stage_dir") or default)
 
     def model_dir(self, cfg):
-        return str(cfg.get("gguf") or os.path.expanduser(
-            "~/models/gemma4/12b/gemma-4-12b-it-BF16.gguf"))
+        root = os.environ.get("LLMGR_MODEL_ROOT", "~/models")
+        default = os.path.join(root, "gemma4", "12b",
+                               "gemma-4-12b-it-BF16.gguf")
+        return str(cfg.get("gguf") or os.path.expanduser(default))
 
     def _env(self, cfg, *, skip_stage):
         """Gemma4 launchers are env-driven, not flag-driven."""
@@ -547,10 +608,13 @@ class K3Adapter(Adapter):
             return str(cfg["stage_dir"])
         user = os.environ.get("USER", "unknown")
         job = os.environ.get("PJM_JOBID", "interactive")
-        return "/local/%s/k3-llmgr-%s" % (user, job)
+        root = os.environ.get("LLMGR_STAGE_ROOT", "/local")
+        return os.path.join(root, user, "k3-llmgr-%s" % job)
 
     def model_dir(self, cfg):
-        return str(cfg.get("model_dir") or os.path.expanduser("~/models/kimi-k3"))
+        root = os.environ.get("LLMGR_MODEL_ROOT", "~/models")
+        return str(cfg.get("model_dir") or os.path.expanduser(
+            os.path.join(root, "kimi-k3")))
 
     def _result_dir(self, cfg, operation):
         if cfg.get("result_dir"):
@@ -661,7 +725,249 @@ class K3Adapter(Adapter):
                 "--topo", "tofu_topo.txt", "--profile"] + _extra(cfg)
 
 
-ADAPTERS = {a.name: a() for a in (LagunaAdapter, Gemma4Adapter, K3Adapter)}
+class Ds4fAdapter(Adapter):
+    """DeepSeek-V4-Flash full-weight EP server.
+
+    DS4F already implements the OpenAI Responses/chat and Anthropic wire
+    protocols in its controller-side frontend.  llmgr supervises the MPI
+    wrapper and proxies those protocol requests without trying to tokenize or
+    reimplement the DS4F request state machine.
+    """
+
+    name = "ds4f"
+    variants = ("full",)
+    default_variant = "full"
+    supports_serve = True
+    openai_models = ("ds4f", "deepseek-v4-flash")
+    proxy_protocol = True
+
+    LAUNCHER = os.path.join(DS4F_DIR, "run_ds4f_serve_11n.sh")
+    STAGER = os.path.join(DS4F_DIR, "run_ds4f_stage_11n.sh")
+    SINGLE_LAUNCHER = os.path.join(DS4F_DIR, "run_ds4f_single_serve.sh")
+    SINGLE_STAGER = os.path.join(DS4F_DIR, "stage_ds4f_single.sh")
+
+    def deployment(self, cfg):
+        value = cfg.get("deployment") or os.environ.get("DS4F_DEPLOYMENT", "single")
+        if value not in ("single", "ep"):
+            raise ConfigError("deployment must be single or ep (got %r)" % value)
+        return value
+
+    def default_np(self):
+        return int(os.environ.get("DS4F_NP", "11"))
+
+    def _root(self, cfg):
+        return os.path.abspath(os.path.expanduser(
+            str(cfg.get("work_dir") or os.environ.get("DS4F_WORK_DIR", DS4F_DIR))))
+
+    def model_dir(self, cfg):
+        return os.path.expanduser(str(
+            cfg.get("model_dir") or os.environ.get("DS4F_MODEL_DIR", "~/models/ds4f")))
+
+    def stage_dir(self, cfg):
+        return os.path.expanduser(str(
+            cfg.get("stage_dir") or os.environ.get("DS4F_STAGE_DIR", "/local/ds4f")))
+
+    def _env(self, cfg, port=None):
+        env = _env_overrides(cfg)
+        env.setdefault("DS4F_REAL", "1")
+        env.setdefault("DS4F_STAGE_DIR", self.stage_dir(cfg))
+        env.setdefault("DS4F_MODEL_DIR", self.model_dir(cfg))
+        np_ = str(_int(cfg, "np", self.default_np()))
+        env.setdefault("DS4F_NP", np_)
+        # The existing DS4F shell launchers consume the generic NP variable.
+        env.setdefault("NP", np_)
+        deployment = self.deployment(cfg)
+        env.setdefault("DS4F_DEPLOYMENT", deployment)
+        if port is not None:
+            env["PORT"] = str(port)
+        if deployment == "single":
+            root = self._root(cfg)
+            env.setdefault("DS4F_SERVE_BASE", os.path.join(root, ".ds4f_serve"))
+            env.setdefault("DS4F_RUNNER_LOG", os.path.join(root, "ds4f_runner.log"))
+            env.setdefault("DS4F_SERVE_USE_HIP", "1")
+        for key in ("tok", "tokenizer"):
+            if cfg.get(key):
+                env["TOK"] = str(cfg[key])
+                break
+        for key, envname in (("ctx", "CTX"), ("model", "DS4F_MODEL"),
+                             ("exclude", "EXCLUDE"), ("vcoord", "VCOORD"),
+                             ("nshards", "DS4F_NSHARDS"),
+                             ("prefill_gemm", "DS4F_PREFILL_GEMM"),
+                             ("q8_dense", "DS4F_Q8_DENSE"),
+                             ("fp8_bf16", "DS4F_FP8_BF16"),
+                             ("mhc", "DS4F_MHC"), ("hc_par", "DS4F_HC_PAR"),
+                             ("hc_rmspar", "DS4F_HC_RMSPAR")):
+            if cfg.get(key) is not None:
+                env[envname] = str(cfg[key])
+        return env
+
+    def build(self, cfg):
+        cc = str(cfg.get("cc", "fcc"))
+        argv = ["make", "-C", DS4F_DIR, "ds4f_ep_runner",
+                "CC=%s" % cc, "OPENMP=1"]
+        if cfg.get("clean"):
+            argv = ["sh", "-c", "make -C %s clean && %s" %
+                    (DS4F_DIR, " ".join(shlex_quote(x) for x in argv))]
+        return argv, self._env(cfg), DS4F_DIR
+
+    def stage(self, cfg):
+        if self.deployment(cfg) == "single":
+            return [self.SINGLE_STAGER], self._env(cfg), DS4F_DIR
+        return [self.STAGER], self._env(cfg), self._root(cfg)
+
+    def serve(self, cfg):
+        port = _int(cfg, "port", required=True)
+        launcher = (self.SINGLE_LAUNCHER if self.deployment(cfg) == "single"
+                    else self.LAUNCHER)
+        return [launcher], self._env(cfg, port=port), self._root(cfg)
+
+    def readiness(self, cfg, since):
+        root = self._root(cfg)
+        if self.deployment(cfg) == "single":
+            path = os.path.join(root, "ds4f_runner.log")
+            try:
+                with open(path, "r", errors="replace") as f:
+                    ready = "serving on" in f.read()
+            except OSError:
+                ready = False
+            return ready, "single-node runner log=%s" % os.path.basename(path)
+        paths = glob.glob(os.path.join(root, "ds4f_ep_rank*.txt"))
+        expected = _int(cfg, "np", self.default_np())
+        ready = 0
+        for path in paths:
+            try:
+                with open(path, "r", errors="replace") as f:
+                    if re.search(r"SERVE(?:-BATCH|-DYNBATCH)? ready", f.read()):
+                        ready += 1
+            except OSError:
+                pass
+        return ready >= expected, "serve-ready %d/%d root=%s" % (
+            ready, expected, os.path.basename(root))
+
+    def runner_bin(self, cfg):
+        return os.path.join(DS4F_DIR, "build", "ds4f_ep_runner")
+
+
+class Qwen36Adapter(Adapter):
+    """Qwen3.6/Qwen3.5 GGUF through a local llama.cpp server.
+
+    The model is a qwen35 hybrid GGUF even when its filename says Qwen3.6.
+    llama.cpp owns the graph and heterogeneous Vulkan/ROCm device split; llmgr
+    only supervises its OpenAI-compatible HTTP server.  Paths and device names
+    are intentionally configuration-driven so this adapter is usable with any
+    llama.cpp build and any GGUF model.
+    """
+
+    name = "qwen36"
+    variants = ("q5",)
+    default_variant = "q5"
+    supports_serve = True
+    openai_models = ("qwen36", "qwen3.6", "qwen3.5")
+    proxy_protocol = True
+
+    def _server(self, cfg):
+        value = cfg.get("server") or os.environ.get("LLMGR_LLAMA_SERVER")
+        value = value or shutil.which("llama-server")
+        if not value:
+            raise ConfigError("llama-server not found; set server or LLMGR_LLAMA_SERVER")
+        return _expanded_path(value, "server")
+
+    def model_path(self, cfg):
+        value = cfg.get("model") or cfg.get("model_path") or os.environ.get("QWEN36_MODEL")
+        if not value:
+            raise ConfigError("missing model path: set model or QWEN36_MODEL")
+        return _expanded_path(value, "model")
+
+    def default_np(self):
+        return 1
+
+    def _env(self, cfg):
+        env = _env_overrides(cfg)
+        if cfg.get("library_path"):
+            env["LD_LIBRARY_PATH"] = _expanded_path(cfg["library_path"], "library_path")
+        return env
+
+    def serve(self, cfg):
+        port = _int(cfg, "port", required=True)
+        model = self.model_path(cfg)
+        devices = str(cfg.get("devices") or os.environ.get(
+            "LLMGR_LLAMA_DEVICES", "Vulkan1,Vulkan0"))
+        split = str(cfg.get("split_mode", "layer"))
+        # The 5060 Ti exposes less usable VRAM than the 9070 XT on this host;
+        # leave a little more weight/KV headroom on the AMD primary for 512K.
+        tensor_split = str(cfg.get("tensor_split", "1.4,1"))
+        ctx = _int(cfg, "ctx", 524288)
+        cache_k = str(cfg.get("cache_type_k", "q4_0"))
+        cache_v = str(cfg.get("cache_type_v", "q4_0"))
+        batch = _int(cfg, "batch", 512)
+        ubatch = _int(cfg, "ubatch", batch)
+        slot_save_path = cfg.get("slot_save_path") or os.environ.get(
+            "LLMGR_QWEN36_CACHE_DIR")
+        argv = [self._server(cfg), "-m", model, "--host", "127.0.0.1",
+                "--port", str(port), "--device", devices,
+                "--main-gpu", str(_int(cfg, "main_gpu", 0)),
+                "--split-mode", split, "--tensor-split", tensor_split,
+                "--ctx-size", str(ctx), "--cache-type-k", cache_k,
+                "--cache-type-v", cache_v, "--batch-size", str(batch),
+                "--ubatch-size", str(ubatch),
+                "--flash-attn", str(cfg.get("flash_attn", "on"))]
+        if slot_save_path:
+            argv += ["--slot-save-path", os.path.abspath(os.path.expanduser(
+                os.fspath(slot_save_path)))]
+        for key, flag in (("gpu_layers", "--n-gpu-layers"),
+                          ("fit", "--fit"), ("fit_target", "--fit-target"),
+                          ("threads", "--threads"),
+                          ("threads_batch", "--threads-batch")):
+            if cfg.get(key) is not None:
+                argv += [flag, str(cfg[key])]
+        if cfg.get("fit") is None:
+            argv += ["--fit", "on"]
+        if cfg.get("fit_target") is None:
+            argv += ["--fit-target", str(os.environ.get(
+                "LLMGR_LLAMA_FIT_TARGET", "512"))]
+        argv += _extra(cfg)
+        return argv, self._env(cfg), os.path.dirname(model) or os.getcwd()
+
+    def readiness(self, cfg, since):
+        port = _int(cfg, "port", required=True)
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/health" % port,
+                                        timeout=0.5) as response:
+                if response.status == 200:
+                    return True, "llama-server healthy on %d" % port
+        except (OSError, urllib.error.URLError):
+            pass
+        return False, "waiting for llama-server health on %d" % port
+
+    def stage_dir(self, cfg):
+        return os.path.dirname(self.model_path(cfg)) or os.getcwd()
+
+    def runner_bin(self, cfg):
+        return self._server(cfg)
+
+def shlex_quote(value):
+    """Small local quote helper to keep the adapter Python-3.6 compatible."""
+    import shlex
+    return shlex.quote(str(value))
+
+
+ADAPTERS = {a.name: a() for a in
+            (LagunaAdapter, Gemma4Adapter, K3Adapter, Ds4fAdapter, Qwen36Adapter)}
+
+
+def default_model():
+    """Return the configured default adapter name.
+
+    The first serving-capable adapter is the fallback, so adding a serving
+    adapter does not require editing the supervisor's dispatch code.
+    """
+    configured = os.environ.get("LLMGR_DEFAULT_MODEL")
+    if configured:
+        return configured
+    for adapter in ADAPTERS.values():
+        if adapter.supports_serve:
+            return adapter.name
+    return next(iter(ADAPTERS), None)
 
 
 def get(model):
@@ -686,8 +992,12 @@ def describe():
 
 
 def get_by_openai_model(model):
-    if model in (None, "", "laguna"):
-        model = "laguna-s21"
+    if model in (None, ""):
+        model = default_model()
+    if model in ADAPTERS:
+        adapter = ADAPTERS[model]
+        if adapter.supports_serve:
+            return adapter
     for a in ADAPTERS.values():
         if model in a.openai_models:
             return a

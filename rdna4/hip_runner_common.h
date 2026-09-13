@@ -88,9 +88,10 @@ static void *hip_upload_raw(const void *data, size_t bytes) {
 
 /* ---- HIPRTC kernel compilation ---- */
 
-static int hip_compile_kernels(hipModule_t *module, int device_id,
-                                const char *source, const char *prog_name,
-                                int verbose, const char *prefix) {
+static int hip_compile_kernels_ex(hipModule_t *module, int device_id,
+                                   const char *source, const char *prog_name,
+                                   int verbose, const char *prefix,
+                                   int precise_override) {
     const char *arch = rocewGetRDNA4ArchString(device_id);
     if (!arch) {
         /* Fallback: get arch from device properties */
@@ -103,7 +104,47 @@ static int hip_compile_kernels(hipModule_t *module, int device_id,
     }
 
     const char *precise_env = getenv("HIP_RUNNER_PRECISE_MATH");
-    int precise_math = precise_env && precise_env[0] && strcmp(precise_env, "0") != 0;
+    int precise_math = precise_override >= 0 ? precise_override :
+        (precise_env && precise_env[0] && strcmp(precise_env, "0") != 0);
+
+    /* HIPRTC compilation dominates cold-start time for the large LLM kernel
+     * bundle.  Cache the architecture- and source-specific code object in
+     * /tmp; changing any kernel text or math mode naturally selects a new
+     * entry.  Set HIP_RUNNER_NO_CODE_CACHE=1 to force a fresh compile. */
+    uint64_t source_hash = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)source; *p; ++p) {
+        source_hash ^= *p;
+        source_hash *= 1099511628211ULL;
+    }
+    source_hash ^= (uint64_t)precise_math;
+    char cache_path[320];
+    snprintf(cache_path, sizeof(cache_path), "/tmp/%s_%s_%016llx.co",
+             prefix, arch, (unsigned long long)source_hash);
+    if (!getenv("HIP_RUNNER_NO_CODE_CACHE")) {
+        FILE *fp = fopen(cache_path, "rb");
+        if (fp) {
+            if (fseek(fp, 0, SEEK_END) == 0) {
+                long end = ftell(fp);
+                if (end > 0 && fseek(fp, 0, SEEK_SET) == 0) {
+                    char *cached = (char *)malloc((size_t)end);
+                    if (cached && fread(cached, 1, (size_t)end, fp) == (size_t)end) {
+                        hipError_t load_err = hipModuleLoadData(module, cached);
+                        free(cached); fclose(fp);
+                        if (load_err == hipSuccess) {
+                            if (verbose >= 1)
+                                fprintf(stderr, "%s: loaded cached kernels from %s\n",
+                                        prefix, cache_path);
+                            return 1;
+                        }
+                        if (verbose >= 2)
+                            fprintf(stderr, "%s: cached code object rejected (%d), recompiling\n",
+                                    prefix, (int)load_err);
+                    } else free(cached);
+                }
+            }
+            fclose(fp);
+        }
+    }
 
     if (verbose >= 1)
         fprintf(stderr, "%s: compiling kernels for %s (%s math) ...\n",
@@ -156,6 +197,10 @@ static int hip_compile_kernels(hipModule_t *module, int device_id,
     }
 
     hipError_t err = hipModuleLoadData(module, code);
+    if (err == hipSuccess && !getenv("HIP_RUNNER_NO_CODE_CACHE")) {
+        FILE *fp = fopen(cache_path, "wb");
+        if (fp) { fwrite(code, 1, code_sz, fp); fclose(fp); }
+    }
     free(code);
     if (err != hipSuccess) {
         fprintf(stderr, "%s: hipModuleLoadData failed: %d\n", prefix, (int)err);
@@ -164,6 +209,13 @@ static int hip_compile_kernels(hipModule_t *module, int device_id,
 
     /* Return a positive value to indicate success (arch-dependent) */
     return 1;
+}
+
+static int hip_compile_kernels(hipModule_t *module, int device_id,
+                               const char *source, const char *prog_name,
+                               int verbose, const char *prefix) {
+    return hip_compile_kernels_ex(module, device_id, source, prog_name,
+                                  verbose, prefix, -1);
 }
 
 #endif /* HIP_RUNNER_COMMON_IMPLEMENTATION */

@@ -15,12 +15,48 @@
 
 #include <stdint.h>
 #include "../../common/gguf_loader.h"
+#include "../../common/glm5next.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct hip_llm_runner hip_llm_runner;
+typedef struct hip_llm_state_snapshot hip_llm_state_snapshot;
+
+typedef enum {
+    HIP_LLM_MOE_AUTO = 0,
+    HIP_LLM_MOE_HYBRID,
+    HIP_LLM_MOE_CPU,
+    HIP_LLM_MOE_GPU_STREAM,
+} hip_llm_moe_mode;
+
+typedef struct {
+    uint32_t struct_size;
+    int max_seq_len;              /* <= 0: model default */
+    hip_llm_moe_mode moe_mode;
+    uint64_t moe_cache_bytes;     /* 0: consume safe remaining VRAM */
+    int moe_cpu_threads;          /* <= 0: physical cores */
+    uint64_t host_register_bytes; /* 0: automatic */
+    uint64_t gpu_reserve_bytes;   /* 0: default 1 GiB */
+} hip_llm_load_options;
+
+typedef struct {
+    uint64_t tokens;
+    uint64_t assignments;
+    uint64_t gpu_assignments;
+    uint64_t cpu_assignments;
+    uint64_t skipped_assignments;
+    uint64_t cache_hits;
+    uint64_t cache_misses;
+    uint64_t cache_evictions;
+    uint64_t h2d_bytes;
+    double cpu_ms;
+    double copy_ms;
+    double gpu_moe_ms;
+} hip_llm_moe_stats;
+
+void hip_llm_load_options_default(hip_llm_load_options *options);
 
 /* Initialize HIP context + compile kernels via HIPRTC for the given device.
  * Returns NULL on failure. verbose: 0=quiet, 1=info, 2=debug */
@@ -29,6 +65,43 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose);
 /* Load model weights from GGUF onto GPU. max_seq_len <= 0 uses model default.
  * Returns 0 on success, -1 on error. */
 int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len);
+
+/* Load a logical model spanning one or more GGUF shards.  The caller owns the
+ * shard mappings and must keep them alive until hip_llm_offload/free. */
+int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
+                                 const hip_llm_load_options *options);
+
+int hip_llm_get_moe_stats(const hip_llm_runner *r, hip_llm_moe_stats *stats);
+void hip_llm_reset_moe_stats(hip_llm_runner *r);
+int hip_llm_verify_hc_batch(hip_llm_runner *r, int batch,
+                            double *out_rel_l2, double *out_max_abs);
+
+/* Verify the standalone GLM5Next KDA recurrent step against its scalar CPU
+ * oracle. This does not require model weights to be loaded. */
+int hip_llm_verify_glm5next_kda(hip_llm_runner *r, int head_dim,
+                                double *out_rel_l2, double *out_max_abs);
+int hip_llm_verify_glm5next_kda_heads(hip_llm_runner *r, int n_heads, int head_dim,
+                                      double *out_rel_l2, double *out_max_abs);
+int hip_llm_verify_glm5next_dsa_attention(hip_llm_runner *r, int n_heads,
+                                          int kv_dim, int value_dim, int n_tokens,
+                                          double *out_rel_l2, double *out_max_abs);
+int hip_llm_verify_glm5next_model_matvec(hip_llm_runner *r, gguf_shards *model,
+                                         int layer, double *out_rel_l2,
+                                         double *out_max_abs);
+/* Stage all three real KDA input projections together and execute them in one
+ * stream.  This is the first model-weighted GPU graph boundary; it is kept as
+ * a public verifier until the complete staged layer is wired into forward(). */
+int hip_llm_verify_glm5next_model_kda_projections(hip_llm_runner *r,
+                                                   gguf_shards *model, int layer,
+                                                   double *out_rel_l2,
+                                                   double *out_max_abs,
+                                                   double *out_ms);
+int hip_llm_verify_glm5next_model_kda_layer(hip_llm_runner *r, gguf_shards *model,
+                                            int layer, double *out_rel_l2,
+                                            double *out_max_abs, double *out_ms);
+int hip_llm_verify_glm5next_model_dsa_layer(hip_llm_runner *r, gguf_shards *model,
+                                            int layer, double *out_rel_l2,
+                                            double *out_max_abs, double *out_ms);
 
 /* Load Qwen3 dense weights from a safetensors file (text-encoder path). */
 int hip_llm_load_weights_qwen3_safetensors(hip_llm_runner *r, const char *model_path, int max_seq_len);
@@ -40,6 +113,11 @@ float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position);
 /* Run one token and return logits [n_vocab]. Applies lm_head after hidden state.
  * The returned pointer is valid until the next call (host-side buffer). */
 float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position);
+
+/* Run the optional GLM5Next speculative/NextN block using the latest trunk
+ * hidden state and the token that should be embedded by the draft head.  The
+ * returned logits are valid until the next call. */
+float *hip_llm_forward_nextn_logits(hip_llm_runner *r, int32_t prev_token, int position);
 
 /* Run forward pass with a pre-computed F32 embedding [n_embd] instead of token lookup.
  * Used to inject vision embeddings. embd_stride is the stride between embeddings
@@ -76,6 +154,14 @@ void hip_llm_offload(hip_llm_runner *r);
 
 /* Reset all SSM state (conv + recurrent). Call between conversations for hybrid models. */
 void hip_llm_reset_state(hip_llm_runner *r);
+void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled);
+
+/* Save/restore recurrent state at a prompt boundary. KV entries remain in
+ * their positional device cache, so this snapshots only hybrid SSM/PLE state.
+ * The opaque snapshot is owned by the caller and may be reused across turns. */
+hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r);
+int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *snapshot);
+void hip_llm_free_state_snapshot(hip_llm_state_snapshot *snapshot);
 
 /* Read last hidden state (d_x) from GPU into dst. n = n_embd. */
 int hip_llm_read_hidden(const hip_llm_runner *r, float *dst, int n);
@@ -134,11 +220,20 @@ int hip_llm_bench_quant_matvec(
         int warmup, int iters,
         float *out_ms);
 
+/* Verify batched MoE top-k routing, including expert ids above 255. */
+int hip_llm_verify_moe_routing(hip_llm_runner *r, int n_experts, int n_used);
+
 /* Query model dimensions (valid after load_weights). */
 int hip_llm_n_embd(const hip_llm_runner *r);
 int hip_llm_n_layers(const hip_llm_runner *r);
 int hip_llm_n_vocab(const hip_llm_runner *r);
 int hip_llm_max_seq_len(const hip_llm_runner *r);
+
+/* Inspect the GLM5Next GGUF contract without initializing HIP.  This is used
+ * by CPU bring-up and by launchers to reject an incomplete model cleanly. */
+int hip_llm_glm5next_inspect(gguf_shards *model, glm5next_config *config,
+                             glm5next_state_layout *layout, int max_seq_len,
+                             char *error, size_t error_cap);
 
 #ifdef __cplusplus
 }

@@ -61,6 +61,8 @@ export DS4F_SERVE_SOCK=${DS4F_SERVE_SOCK:-0}        # 1 = TCP transport (needs D
 # SYSCACHE: preload a persisted context (built once with a cache_save request) into slot 0 so every
 # conversation starts with the system prompt already prefilled -- instant TTFT, survives restarts.
 [ -n "$DS4F_SERVE_SYSCACHE" ] && export DS4F_SERVE_SYSCACHE
+# Per-agent durable system-prefix cache directory used by the HTTP frontend.
+export DS4F_SERVE_AGENT_CACHE_DIR=${DS4F_SERVE_AGENT_CACHE_DIR:-$BASE.agent-cache}
 # real-weight decode bundle (== --preset decode); dense stays int8 (Q8) for fast decode by default
 export DS4F_REAL=1 DS4F_FP8_BF16=1 DS4F_Q8_DENSE=1 DS4F_TIERB2=1 DS4F_MHC=1 DS4F_HC_PAR=1 DS4F_HC_RMSPAR=1
 export DS4F_NUMA=${DS4F_NUMA:-1}

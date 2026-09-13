@@ -2252,3 +2252,1042 @@ them in FP32 reaches only 49--108 GFLOP/s/core, below the 137 GFLOP/s/core BF16
 p-odd kernel, while retaining unstable error. It was rejected. The two-run 750
 tok/s gate remains open; reaching it requires a new mixed-precision kernel or a
 materially different parallel decomposition, not additional PP handoff tuning.
+
+## Two- and four-node decode topology recommendation (2026-08-31)
+
+For one autoregressive Qwen3.8-27B decode stream, use tensor parallelism on all
+available nodes: **TP2 on two nodes and TP4 on four nodes**.  Layer/pipeline
+parallelism reduces the number of collectives, but it executes each layer range
+serially for a single token.  The saved communication is smaller than the
+weight-streaming time saved by running each projection concurrently across the
+TP ranks.
+
+Qwen3.8-27B reduces a 5120-element FP32 residual buffer 129 times per generated
+token.  On the compact four-node topology, the earlier 16 KiB probe measured
+13.88 us warm and 25.40 us cold per collective, corresponding to a 1.8--3.3 ms
+transport floor.  Real TP4 decode spends approximately 4.5--8 ms/token in the
+collective phase once cache effects and rank-arrival skew are included.  This is
+only about 15--20% of a representative 34--40 ms BF16 token, so eliminating the
+collectives does not compensate for serializing the layer stages.
+
+The dedicated `a64fx/utofu-tests/qwen38_allreduce_bench` measures the exact
+20 KiB decode payload.  It runs TP2 as two concurrent pairs followed by TP4 on
+all four nodes, uses the production recursive-doubling collective, and reports
+the projection for 129 reductions/token.  Its payload, barrier, send, and receive
+regions are 256-byte aligned and strictly `MPOL_BIND`-bound to the CMG containing
+the pinned communication thread.  `wire_GB/s` and `link_peak_pct` count actual
+recursive-doubling wire bytes against one Tofu-D TNI's 6.8 GB/s peak.  The 20 KiB
+synchronous collective is latency- and reduction-bound and must not be expected
+to attain the large-message raw-Put peak.
+
+### Recommended configurations
+
+| workload | two nodes | four nodes |
+|---|---|---|
+| one decode stream, lowest latency | **PP1 x TP2** | **PP1 x TP4** |
+| latency-sensitive serving | **TP2** | **TP4** |
+| several continuously busy streams | TP2 or PP2 after measurement | evaluate **PP2 x TP2** or PP4 |
+| long-prompt prefill | TP2 | TP4 for four nodes; mixed PP x TP becomes useful with more nodes/chunks |
+
+The measured native-Q8 decode sweep confirms the single-stream choice: TP2
+reached 8.44 tok/s, while TP4 reached 14.09 tok/s.  Adding ranks reduced the
+per-node streamed weight set more than the extra collective round cost.  The
+four-node BF16 path similarly reaches roughly 25--31 tok/s plain decode, with
+representative profiles around 28--34 ms compute plus 4.5--8 ms communication.
+The accepted TP4 speculative path reaches 53.43 tok/s, which further favors
+retaining TP4 as the decode topology.
+
+A four-node **PP2 x TP2** layout is not preferred for a single stream.  Its two
+half-model stages are sequential, so their summed compute resembles a full TP2
+decode rather than TP4; the smaller TP2 collective cannot recover the lost
+parallel weight bandwidth.  Pure PP4 has the same issue across four serial
+stages.  Both layouts can become useful for aggregate serving throughput when
+independent requests keep every pipeline stage occupied.  In that case PP2 x
+TP2 is the balanced first configuration to measure: it retains two-way tensor
+parallelism within each stage and permits two requests to overlap.  PP4 is a
+throughput-oriented alternative when at least four independent sequences remain
+ready and per-request latency is secondary.
+
+For combined prefill and decode on larger allocations, use mixed parallelism
+for token-chunked prefill and switch to independent TP4 decode groups when the
+runtime supports a correct state handoff.  The established twelve-node example
+is PP3 x TP4 for prefill.  This does not make pipeline parallelism preferable for
+single-token decode: prefill has enough token chunks to fill the stages, whereas
+one decode dependency chain does not.
+## 2026-08-31: Qwen3.8-27B TP4 mixed-Q4 bring-up
+
+The native TP stage now accepts the complete mixed `Qwen3.8-27B-UD-Q4_K_XL.gguf`
+layout rather than silently retaining only its F32 tensors.  The model contains
+866 tensors: F32 360, Q4_K 97, Q5_K 325, Q6_K 19, and IQ4_XS 65.  Column slices
+are required to start and end on each format's GGML block boundary.  Every file
+entry and the registered uTofu collective regions remain 256-byte aligned.
+
+TP4 stages 5.756 GB per rank.  A cold, one-token end-to-end check loaded all 866
+tensors on all four nodes and produced token 198 in lockstep.  Strict MPOL_BIND
+placed the barrier and all-reduce source/landing regions on persistent worker
+0's CMG (reported NUMA node 4 on this allocation), preventing inter-CMG access
+in the communication path.
+
+The first compact-Q4 correctness baseline is 315.58 ms/token (3.15 tok/s):
+295.08 ms compute and 20.50 ms communication across 129 reductions.  This is a
+bring-up baseline, not an optimized result.  Q5_K, Q6_K, and IQ4_XS currently
+fall through the generic full-row F32 dequantizer; native compact SVE/SDOT
+kernels are therefore the gating work for the 100 tok/s plain and 120 tok/s MTP
+targets.  The existing weight-byte estimator reports 14.31 GB/token for this
+mixed stage and must be corrected before using its derived 48 GB/s figure.
+
+Direct compact SVE dots now cover Q5_K, Q6_K, and IQ4_XS in addition to the
+existing Q4_K kernel. They decode packed bitplanes and scales inside registers
+and never allocate or materialize an F32 row. A first-token TP4 check improved
+forward time from 315.58 to 171.76 ms (3.15 to 5.76 tok/s) while retaining token
+198. The opt-in `TF_COMPACT_K_CHECK=1` oracle compared the first row of each
+format against GGML dequantization plus a double-precision dot on every rank;
+the worst relative error was 9.22e-7. These are exact compact SVE/FMA kernels.
+An SDOT variant requires activation/weight requantization and remains behind
+the quantized quality gate rather than silently changing the exact Q4 path.
+
+### TP4 BF16/Q8 SDOT comparison (2026-08-31)
+
+Short identical 16-token measured regions (`TP_AR_BATCH=1`, four warm-up
+tokens) gave the following directional results. Exact BF16 remained fastest at
+32.26 ms/token. Converting BF16 weights in place to row INT8 took 49.57
+ms/token; using INT16 activations with compact INT8 weights took 49.88 ms/token.
+The INT16 stream matched all 20 exact-BF16 token IDs, while INT8 first diverged
+at token 8. Thus H-to-D SDOT is retained as an accuracy experiment, not a speed
+profile: it is about 55% slower than the optimized BF16 path.
+
+For the native Q8 stage, row INT8 and INT16-activation SDOT measured 101.26 and
+98.20 ms/token respectively. Native block64 Q8 measured 107.82 ms/token. A new
+four-row row-INT8 kernel shares each activation load across four weight rows;
+it improved the Q8 row probe to 96.60 ms/token, but did not improve the BF16
+conversion path outside run-to-run noise. These short probes are not the final
+three-repeat 256-token acceptance gate, and neither Q8 token stream has yet
+passed the teacher-forced quality threshold.
+
+### Exact BF16 follow-up profile (2026-08-31)
+
+The current TP4 exact-PV path measures 32.36 ms/token with the validated
+default collective and retains the 20-token reference stream. Of that, 27.51
+ms is compute/rank-arrival time and 4.85 ms is 129 FP32 reductions. Profiling
+rank 0 attributes 8.27 ms to FFN gate/up, 5.74 ms to FFN down, 5.11 ms to SSM
+input, 4.09 ms to SSM output, 1.97 ms to attention projections, and 2.66 ms to
+SSM preparation/core.
+
+BF16-PV prefetch distances 4, 12, and 16 measured 32.51, 32.18, and 33.24
+ms/token in short A/B runs, so the launcher now uses 12. Hierarchical barriers
+regressed to 103.42 ms/token; projection/communication overlap regressed to
+52.79 ms/token and increased reductions from 129 to 641. A single-accumulator
+BF16 reduction tree was neutral once given equal prefetching and was removed.
+These results put the remaining 40 tok/s gap in projection scheduling and
+resident bandwidth, not scalar activation work or collective-buffer tuning.
+
+After the four-node allocation restarted, the rank-local BF16 shards were
+restaged and all 866 tensors loaded within the HBM guard.  A 32-token warmed
+profile reproduced the exact 48-token reference stream.  Production-kernel
+microbenchmarks then showed that distance 8 is the stronger general setting:
+at K=4352 it reached 766.56 GB/s versus 764.77 GB/s at distance 12, and at
+K=5120 it reached 815.94 versus 805.98 GB/s.  Same-session end-to-end A/B runs
+measured 33.78 ms/token at distance 8 and 34.75 ms/token at distance 12, so the
+launcher default is now 8.  A separate K=1536 specialization was rejected:
+although its isolated kernel reached 588.87 GB/s at distance 8, it was neutral
+end to end and added no useful model-level speedup.
+
+### BF16 K=5 MTP runtime fix (2026-09-01)
+
+The restarted sustained-MTP baseline exposed an OpenMP runtime failure rather
+than a math-kernel limit: K=5 verification took about 9.4 seconds per round and
+delivered only 0.23--0.29 tok/s.  The batch verifier opens many short OpenMP
+regions, while the launcher's `KMP_BLOCKTIME=1` repeatedly put the 48-worker
+team to sleep.  Holding the team warm globally fixed verification but slowed
+the ordinary prompt pass, so `tp_runner` now changes Fujitsu's exported
+`kmp_set_blocktime` dynamically: 200 ms during batched verification and zero
+before the pthread NextN draft.
+
+The K=5 BF16 dispatch also replaces the register-heavy 4-row x 5-token kernel
+with compact 4x3 plus exact 8x2 kernels.  On the 180-token sustained prompt,
+the accepted combination reduced verification to 89.34 ms/round and preserved
+the normal 17.79 tok/s prompt pass.  Six rounds generated 16 tokens at 17.21
+tok/s with nondegenerate greedy agreement (13/24, alpha 0.5417), versus 0.29
+tok/s before the runtime fix.  Draft generation is now the dominant cost at
+65.51 ms/round; verification is no longer catastrophically stalled.
+
+An initial independently staged TP4-sharded NextN test reduced draft time to
+56.25 ms but failed correctness (`teacher match=0/178`, alpha zero).  The cause
+and corrected sharded result are documented below.
+
+### Correct BF16 NextN TP4 and K=2 selection
+
+The sharded-stage failure was a layout/scheduler mismatch.  The BF16 loader
+automatically PV-packed every sliced tensor, including NextN K/V.  Each local
+K/V matrix has 256 rows, and the fused QKV scheduler splits it across 48
+workers in 5--6-row ranges; the PV kernel requires 8-row-aligned ranges.  The
+loader now leaves NextN row-major unless `TP_NEXTN_PV_MASK` explicitly selects
+a scheduler-safe tensor.  This restored the replicated reference gate exactly:
+teacher match 55/178 and the same offset histogram.
+
+Individual quality sweeps selected mask 5 (EH fusion plus attention output).
+PV Q changed draft argmaxes, while attention output retained 55/178.  K/V and
+gate/up intentionally have no PV mask bit.  With direct small-buffer all-to-all
+enabled, the 64-token K sweep selected K=2:
+
+- K=4: 16.51 tok/s, 48/90 greedy matches;
+- K=3: 20.21 tok/s, 40/62 greedy matches;
+- K=2: **26.24 tok/s**, 26/39 greedy matches and alpha 0.6667.
+
+The accepted K=2 profile uses 39 rounds, 50.51 ms verification and 11.97 ms
+draft time per round.  It preserves teacher match 55/178, processes the
+180-token prompt at 19.40 tok/s, and reduces the effective generated-token
+forward time to 38.08 ms (33.02 ms compute plus 5.06 ms communication).  This
+is a large correction over the 0.29 tok/s stalled baseline, though it remains
+below plain BF16 decode and the requested 80 tok/s MTP target.
+
+Use `run_qwen38_bf16_tp4.sh stage-mtp` after each allocation restart to build
+the separate `/local/...-nextnshard` image, then run `mtp-sustained`.  The MTP
+mode now selects TP4 NextN sharding, mask 5, direct all-to-all, and K=2 by
+default; ordinary BF16 stage/decode settings are unchanged.
+
+#### Post-restart BF16 sweep (2026-09-01)
+
+The `stage-mtp` workflow was restaged on a fresh four-node allocation and
+reproduced the accepted teacher gate (55/178).  The short K=2 profile measured
+52.56 ms verification, 13.25 ms draft, and 26.99 tok/s.  Raw target hidden
+states slightly increased the offline teacher score to 58/178 but left runtime
+acceptance at 26/39 and reduced the 64-token result to 25.42 tok/s; hidden-first
+fusion failed completely at 0/178.  Both remain disabled.
+
+Verifier blocktimes 100 and 400 ms, MTP2 prefetch distances 8 and 16, poll-spin
+32, a 16,384-float all-to-all cutoff, and adding FFN-down PV all regressed from
+the accepted defaults (200 ms, distance 12, poll-spin 8, cutoff 8192, mask 5).
+A PV-aware NextN fused gate/up implementation preserved 55/178 but raised draft
+time to 14.58 ms and was removed.
+
+Direct all-to-all was also retested for exact plain BF16 decode.  The initially
+recorded standard-collective token hash could not be reproduced: an adjacent
+control run with recursive doubling produced the same 96-token SHA256 as
+all-to-all, `737b132892e98a47c9f69f10779d0075d1c071579b94c4a16045d7d385239f94`.
+An explicit four-rank arithmetic-tree implementation produced that same hash
+as well, ruling out the A2A fold order as the cause of the earlier sequence.
+It was removed rather than retaining unnecessary code.
+
+In the final same-build A/B, recursive doubling measured 34.40 ms/token and
+the simple direct A2A path measured 33.49 ms/token over the 64-token measured
+region, a 0.91 ms/token (2.6%) reduction with identical token hashes.  TP4 now
+enables A2A for reductions up to 8192 floats in both ordinary decode and MTP;
+set `TP_AR_A2A=0` for a recursive-doubling control.  Larger reductions continue
+to use the tree collective.
+
+A finer same-session BF16-PV prefetch sweep then found distance 6 preferable to
+the prior distance 8 default.  Distance 6 measured 32.59 ms/token over the
+32-token screen, while distance 4 measured 33.54 ms/token.  Its 64-token
+acceptance run measured 32.65 ms/token (27.10 ms compute and 5.55 ms
+communication on rank 1) and retained the control SHA256 above.  The launcher
+therefore uses distance 6 for single-token BF16 kernels; the independently
+tuned two-token MTP kernel remains at distance 12.
+
+Production-shape microbenchmarks show the exact BF16-PV kernel is already close
+to the local streaming limit: 773.79 GB/s at K=4352 (84.3% of a 918.17 GB/s
+read ceiling) and 832.54 GB/s at K=5120 (91.0% of 915.02 GB/s).  The remaining
+model-level gap is therefore primarily scheduling, barriers, and rank skew.  A
+two-chunk SVE unroll retained the token hash but regressed decode to 35.19
+ms/token through added register pressure.  Vectorizing the persistent worker's
+small per-thread SiLU slices also retained the long hash but regressed to 36.10
+ms/token and made rank 0 the straggler.  Both kernel experiments were removed.
+BF16 collective transport was also rejected: although its 96-token hash matched
+the current FP32 control, conversion overhead and disabling direct A2A raised
+decode to 36.86 ms/token, with roughly 10 ms/token charged to communication on
+the waiting ranks.  FP32 direct A2A remains the TP4 decode transport.
+
+#### Resident INT8/INT16 SDOT follow-up
+
+The row-major BF16 stage was quantized in place to compact per-row INT8 weights
+and tested with both INT8 and INT16 activations.  Full-projection W8A8 measured
+51.28 ms/token (about 19.5 tok/s); H-to-D W8A16 measured 51.15 ms/token.  Both
+were slower than the 32.65 ms/token BF16-PV path and produced quantized token
+streams.  A four-row W8A16 kernel retained its stream but regressed to 56.30
+ms/token from SVE register pressure, so it was removed; the existing four-row
+W8A8 kernel remains active.
+
+`TP_INT8_MODE=row-ffn` now provides a memory-neutral diagnostic that quantizes
+only FFN gate/up/down in place while leaving attention, SSM, and the head BF16.
+One-token screens measured 50.56 ms for INT8 SDOT and 48.77 ms for INT16 SDOT,
+still well behind BF16.  The allocating block64 FFN pack requested another
+4.412 GB while retaining the 17.165 GB stage and was killed on rank 0; it is not
+safe for this 32 GB interactive configuration.  Decode P-at-V is not converted:
+it would require a scaled, transposed INT8 value cache, and its small current
+context cost cannot recover the projection/FFN regression.
+
+#### BF16 MTP 50 tok/s target
+
+On the repeated 359-token production prompt, runtime draft agreement is much
+higher than the earlier short-context sweep.  K=2 accepted 32/33 second drafts
+and measured 30.16 tok/s (52.01 ms verify plus 12.24 ms draft per round).  A
+same-session K sweep measured 32.35 tok/s at K=3, **34.90 tok/s at K=4**, and
+32.53 tok/s at K=5.  K=4 retained 49/51 draft matches (alpha 0.9608), so the
+sustained launcher now defaults to K=4.
+
+The 50 tok/s target is not yet met.  K=4 spends about 71 ms verifying and 37 ms
+building its three sequential NextN drafts.  A forced-accept diagnostic with
+draft generation removed reached **55.26 tok/s**, establishing that the batched
+verifier is fast enough but leaving only about 7 ms/round for a production
+draft path.  A private 48-thread shadow pool reduced draft time only to 34.94
+ms and did not improve end-to-end throughput.  MTP4 prefetch distances 0, 4,
+and 12 did not beat distance 8 in the 64-token acceptance run.  Reaching 50+
+therefore requires a persistent/fused NextN implementation or a different
+near-zero-cost proposer, not another trunk-verifier prefetch adjustment.
+
+`TF_NEXTN_PROFILE=1` now reports per-call draft phases.  Stable mask-5 calls
+take roughly 8--10 ms each: EH 0.8--1.5 ms, QKV 0.8--1.4 ms, attention about
+0.8--1.3 ms, output 0.9--1.8 ms, FFN 1.9--3.0 ms, and the local vocabulary
+head 1.4--2.3 ms.  Thus three autoregressive calls have a measured 24--30 ms
+floor even after dispatch jitter is removed.  Shadow pools with 24 and 12
+threads measured 34.41 and 37.73 ms/round and did not help.
+
+A separately staged mask-37 experiment added BF16-PV packing for the NextN
+vocabulary head.  It retained 25/27 runtime matches but regressed the 32-token
+screen to 30.41 tok/s (76.69 ms verify, 40.17 ms draft); head time remained
+about 1.6--2.0 ms.  Mask 5 remains the accepted layout.  The result reinforces
+that 50+ needs speculative lookahead overlapped with verification (and a
+separate collective stream), rather than another per-call layout change.
+
+#### Asynchronous K=4 drafting experiment
+
+`TP_MTP_ASYNC=1` implements the proposed continuation pipeline.  At the start
+of a round, a background thread predicts the next four-token queue from the
+current bonus token while the trunk verifies `[input,draft0,draft1,draft2]`.
+The continuation is adopted only when all three drafts and the bonus token
+match.  A rejected chain is discarded and regenerated from the selected target
+hidden state, so speculative state never changes the committed trunk state.
+
+The draft uses an independent NextN scratch/KV context and pthread pool.  Its
+collectives use a second uTofu VCQ on TNI 1, a separate stag, and a 256-byte
+aligned 405 KiB communication region.  The default 36/12 split reserves three
+cores in every CMG for drafting; the striped affinity keeps each weight row on
+its owning CMG and avoids inter-CMG reads.  The verifier's batch helpers now
+consistently honor the reduced team size.  The SSM scan maps an arbitrary equal
+number of lanes to each of the 12 local recurrent heads, supporting both the
+48-thread control and reduced verifier teams without the snapshot-heavy scalar
+fallback.
+
+Two correctness/performance faults found during bring-up are now guarded in
+the implementation.  A completed worker waits for the consumer instead of
+executing the same request repeatedly, and blocked attention, SSM convolution,
+SSM preparation, projections, and FFN all use the same verifier thread count.
+Before those fixes, stale draft requests flooded the second TNI and mixed
+36/48-thread OpenMP regions took 10--22 seconds per verification round.  After
+the fixes, the 36-thread verifier returned to 73.52 ms/round.
+
+The experiment does not improve sustained throughput on A64FX.  With the
+359-token prompt, 36 verifier plus 12 draft cores measured 73.52 ms verification
+but 207.63 ms for the concurrent four-step continuation, including 150.01 ms
+of exposed wait; the 32-token screen reached 9.65 tok/s.  A 24/24 split measured
+91.14 ms verification, 227.97 ms continuation, and 154.69 ms exposed wait,
+reaching 10.00 tok/s over 64 tokens.  Giving the draft more cores did not help:
+the verifier and NextN projections contend for the same HBM bandwidth in every
+CMG.  A second TNI removes collective serialization, but cannot remove this
+weight-stream contention.
+
+Therefore asynchronous full-NextN drafting is retained as an opt-in diagnostic,
+not enabled by the production launcher.  The measured break-even requires the
+four-step continuation to finish within roughly the 72 ms verifier window and
+the verifier itself to fall toward 55 ms/round; current concurrent continuation
+is about three times that budget.  Reaching 50+ BF16 MTP needs a materially
+smaller proposer or reuse/fusion that avoids rereading the full NextN weights,
+plus the planned 25--30% verifier reduction.  Merely repartitioning the 48 cores
+or adding a second communication stream is insufficient on this memory-bound
+node.
+
+#### Post-async verifier and proposer probes
+
+K=3 cannot replace K=4/K=5 as the route to 50 tok/s.  A 128-token forced-full-
+accept run measured 68.99 ms/round; even three emitted tokens per round cap at
+43.5 tok/s before proposer cost.  A current exact K=5/256 run retained the
+established oracle SHA256
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`,
+but the present allocation delivered only 531--561 GB/s/node effective local
+bandwidth versus the earlier accepted 868--870 GB/s/node.  Its 93.09 ms verify,
+48.57 ms draft, and 32.84 tok/s result should therefore not replace the
+previous sustained 53.43 tok/s headline.
+
+Two further algorithmic probes were rejected.  A snapshot-free vector SSM
+ceiling reduced K=5 verification by about 8% (roughly 94 to 86.94 ms and 55.05
+tok/s with drafting removed).  Full lazy rollback/replay was exact at both 128
+and 256 tokens, including the established `7b86e983...` oracle, but eight
+rejected-round replays raised batch calls from 55 to 63, cost 79.37 ms/round,
+and reduced throughput to 24.17 tok/s.  Direct per-token recurrent snapshots
+remain substantially faster.  Connecting the existing BF16-PV fused local-argmax helper to the
+NextN vocabulary head did preserve the complete 256-token oracle, but raised
+draft time from 48.57 to 57.50 ms and reduced throughput from 32.84 to 30.02
+tok/s.  Both code experiments were fully removed.
+
+The original attempt to extend the direct TP4 all-to-all cutoff from 8192 to
+32768 floats changed the K=5 token stream because its rank-order fold did not
+match the deterministic reduction tree.  The replacement sends the same
+one-round peer puts but folds the gathered TP4 inputs as
+`(rank0 + rank1) + (rank2 + rank3)`, exactly matching the fixed-root tree's FP32
+expression.  Both 128- and 256-token gates now reproduce the established
+`6b136ca0...` and `7b86e983...` SHA256 oracles.
+
+In an adjacent 128-token direct run on the currently bandwidth-degraded
+allocation, the exact one-round path improved **31.16 to 33.37 tok/s** (+7.1%),
+reduced K=5 verifier time **96.12 to 89.93 ms/round** (-6.4%), and reduced
+reported collective cost **6.35 to 5.81 ms/token** (-8.5%).  The sustained TP4
+launcher enables it for deterministic MTP runs and raises the cutoff to 32768;
+`TP_AR_A2A_TREE=0 TP_AR_A2A=0` retains the two-round control.  The communication
+region and every generation/rank slot remain 256-byte aligned and CMG-local.
+
+The verifier previously followed every sharded SSM/attention/FFN reduction
+with a separate pass over the complete `[K,5120]` residual tile.  The TP4
+one-round fold now optionally writes the exact result directly into that
+residual as `residual + ((rank0+rank1)+(rank2+rank3))`; other collective modes
+retain the reduce-then-add fallback.  `TP_AR_FUSED_ADD=0` is the control, while
+the runner enables fusion by default.  An adjacent 128-token comparison kept
+the `6b136ca0...` oracle and reduced verifier time from **93.19 to 88.40
+ms/round** (-5.1%); observed throughput was 28.71 versus 33.80 tok/s, although
+the draft portion of that delta included shared-node jitter.  A 256-token gate
+also reproduced `7b86e983...`, with 88.37 ms verifier rounds and 32.04 tok/s on
+the currently degraded interactive rank-0 node.
+
+The sustained launcher now selects that complete validated profile by default:
+K=5 plus deterministic TP4 reduction, which activates the exact one-round fold
+and fused residual add.  This replaces the older K=4/nondeterministic defaults
+that silently bypassed the later communication work.  `TP_SPEC_K=4` and
+`TP_AR_DETERMINISTIC=0` remain available for controlled sweeps.  The clean-node
+headline remains the exact K=5 **53.43 tok/s** result; on the interactive node,
+pinning the Codex process to one core improved the same exact 128-token run to
+35.03 tok/s and balanced ranks at 602--611 GB/s, still well below the clean
+868--870 GB/s/node weight-stream rate.
+
+The K=5 BF16-PV verifier now uses its existing compact 4-row by 5-token SVE
+kernel instead of replaying every weight tile through separate 4x3 and 8x2
+passes.  Compiler inspection had already shown that all twenty accumulators stay
+in registers; the old source comment claiming spills was stale.  The direct
+128-token A/B gate preserved `6b136ca0...` and reduced verifier time from
+**88.96 to 84.48 ms/round** (-5.0%).  The 256-token gate preserved
+`7b86e983...`, measured 80.09 ms/round, and reached 34.65 tok/s at only 602
+GB/s/node on the interactive rank-0 node.  `TF_BF16PV_MTP5_FUSED=1` is now the
+launcher default; zero restores the two-pass control.
+
+Prefetch distances 0, 8, 16, and 24 all remained exact and measured 85.64,
+83.89, 84.48, and 84.83 ms/round respectively in short runs.  That spread is
+comparable to live-node jitter, so the established distance 16 remains the
+default rather than overfitting the current allocation.
+
+Two follow-on fusion probes were exact but rejected.  Routing the two sharded
+NextN reductions through the fused residual callback saved only 160 KiB of
+local traffic per K=5 round and measured 71.68 ms draft time versus 62.11 ms
+for the adjacent unfused control.  Combining verifier FFN gate and up into one
+OpenMP region preserved `6b136ca0...`, but processing both matrices per row
+group disrupted the favorable whole-matrix/CMG streaming order: it reached
+27.51 tok/s versus 35.68 tok/s adjacent, and its FFN projection phase itself
+rose from 364.8 to 392.8 ms over 27 calls.  Both implementations were fully
+removed.  Disassembly also confirms that the exact TP4 fold is already SVE
+vectorized, so an intrinsic transcription would not eliminate another scalar
+pass.
+
+### Canonical clean-node BF16 MTP result: 53.43 tok/s
+
+The accepted clean-node result used four A64FX nodes, one TP rank per node and
+48 pinned threads per rank. NextN was replicated: each rank read the same
+17.724 GB staged image from `/local/u14346/qwen38-bf16-tp4`. The 359-token raw
+tracked prompt was repeated twice, followed by 256 generated tokens in 55 K=5
+rounds. Runtime was 4.790 s, or **53.43 tok/s**. Verification averaged 68.79
+ms/round, drafting 18.26 ms/round, acceptance was 205/220 = 0.9318, and each
+node sustained about 868 GB/s of effective weight traffic. The exact 256-token
+SHA256 was `7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`;
+the 128-token gate was
+`6b136ca08910eb2b47a820d1be2efc5eed1a38c7bf8f8a43de009c6b29f274c2`.
+
+The historical-equivalent launcher configuration is deliberately distinct
+from the newer optimized defaults (sharded NextN, one-round exact reduction,
+fused residual add, and the compact 4x5 verifier kernel):
+
+```sh
+cd a64fx/llm
+TP_SIZE=4 TP_NEXTN_SHARD=0 \
+  TP_STAGE_DIR=/local/u14346/qwen38-bf16-tp4 \
+  bash run_qwen38_bf16_tp4.sh stage
+
+TP_SIZE=4 TP_NEXTN_SHARD=0 \
+  TP_STAGE_DIR=/local/u14346/qwen38-bf16-tp4 \
+  TP_SPEC_K=5 TP_AR_DETERMINISTIC=1 \
+  TP_AR_A2A=0 TP_AR_A2A_TREE=0 TP_AR_FUSED_ADD=0 \
+  TF_BF16PV_MTP5_FUSED=0 TF_BF16PV_PREFETCH=8 \
+  TP_NEXTN_PV_MASK=1 TP_MAXGEN=256 \
+  bash run_qwen38_bf16_tp4.sh mtp-sustained
+```
+
+All production measurements run the uTofu-enabled binary directly through
+`mpiexec`; no `pjsub` wrapper is involved. Communication buffers, rank slots,
+and generation slots are 256-byte aligned. Each rank allocates and first-
+touches its own communication and model storage locally, and the 48-thread
+layout keeps weight rows within their owning 12-core CMG so kernels do not read
+another CMG's HBM partition. A result is clean only when every rank reaches at
+least 800 GB/s effective weight bandwidth, rank wall-time skew is at most 3%,
+memory remains below 32 GB/node, and the token hash is exact.
+
+### BF16 TP4 optimization plan: 40+ decode and 60+ MTP
+
+The target platform is four A64FX nodes with one TP rank per node and 48 pinned
+threads per rank. Runs launch the uTofu binary directly with `mpiexec`; no
+`pjsub` is used. Non-MTP decode must reach at least 40 tok/s and exact K=5 MTP
+must reach at least 60 tok/s.
+
+Correctness gates are the 128-token SHA256
+`6b136ca08910eb2b47a820d1be2efc5eed1a38c7bf8f8a43de009c6b29f274c2`
+and the 256-token SHA256
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`.
+A clean performance run requires at least 800 GB/s effective weight bandwidth
+on every node, no more than 3% rank wall-time skew, stable memory below 32
+GB/node, 256-byte communication alignment, and no inter-CMG weight access.
+Final acceptance requires three consecutive exact 256-token runs meeting the
+applicable throughput target.
+
+#### Phase 0: reproduce and profile
+
+- [ ] Re-stage the BF16 TP4 trunk and replicated/sharded NextN images under
+  `/local/u14346/` after every node or session restart.
+- [ ] Reproduce non-MTP and MTP baselines with direct `mpiexec` on clean nodes.
+- [ ] Record per-rank wall time, effective GB/s, collective time, verifier and
+  draft time, acceptance, peak memory, and output hash.
+- [ ] Use `TF_DPROF=1` to split DeltaNet input/core/output, attention QKV/core/
+  output, FFN gate-up/down, vocabulary head, barriers, and all-reduces.
+- [ ] A/B replicated versus sharded NextN with otherwise identical settings.
+
+#### Phase 1: non-MTP decode to 40+ tok/s
+
+- [x] Route persistent Qwen SSM/attention output and FFN-down collectives
+  through the exact reduce-plus-residual callback. The old path remains active
+  when projection/collective overlap is requested.
+- [x] Complete the clean-node A/B against `TP_AR_FUSED_ADD=0`. Both canonical
+  320-token runs passed; the adjacent sustained run improved 31.55 to
+  32.31 tok/s (+2.4%), confirming the earlier short result.
+- [ ] Sweep BF16-PV prefetch by shape: K=4352 at 8/12/16, and K=5120/6144 at
+  4/6/8/12. `TF_BF16PV_PREFETCH_K4352`, `_K5120`, and `_K6144` now override
+  the global default independently; promote only a repeatable whole-model gain.
+- [ ] Reduce persistent DeltaNet dispatch/barrier cost by grouping independent
+  QKV/gate/alpha/beta work while preserving CMG-owned row ranges.
+- [x] Profile the vocabulary head and test local per-rank argmax plus a small
+  winner exchange; keep the full-logit route as exact control. The exact
+  greedy-only BF16 PV path was neutral because logit traffic is negligible
+  beside the local weight shard, so it remains opt-in.
+- [ ] Revisit projection/collective overlap only with CMG-local buffers and no
+  lost weight-stream worker or reordered exact fold.
+
+Exit this phase only after three clean, exact 256-token runs reach 40 tok/s and
+beat an adjacent control.
+
+#### Phase 2: MTP to 60+ tok/s
+
+- [ ] Rebaseline the combined exact one-round TP4 fold, fused batch residual,
+  compact single-pass BF16 4x5 verifier, K=5, and replicated NextN with a
+  48-thread shadow runtime. At clean-node
+  bandwidth the combined changes may already cross 60 tok/s.
+- [ ] Measure verifier and proposer separately. At observed acceptance, the
+  60 tok/s budget is roughly 75--80 ms total per accepted K=5 round.
+- [ ] Keep full-NextN asynchronous drafting disabled: two concurrent weight
+  streams contend for the same HBM and previously missed the overlap window.
+- [ ] If proposer time remains exposed, build a persistent NextN K-step chain
+  retaining workers and recurrent scratch, eliminating wakeups and redundant
+  preparation without rereading trunk weights.
+- [ ] Tune BF16-PV shapes separately for the K=5 verifier and single-vector
+  proposer; do not infer proposer settings from verifier results.
+- [ ] Test local vocabulary winner exchange only with exact tie-breaking.
+- [ ] Overlap only small communication/preparation work, never two full weight
+  streams on the same CMGs.
+
+Exit this phase only after three clean, exact 256-token runs reach 60 tok/s.
+Report median and minimum throughput, not only the best run.
+
+The canonical direct commands for the current profile are:
+
+```sh
+cd a64fx/llm
+
+TP_SIZE=4 TP_NEXTN_SHARD=0 \
+  TP_STAGE_DIR=/local/u14346/qwen38-bf16-tp4 \
+  bash run_qwen38_bf16_tp4.sh stage-mtp
+
+TP_SIZE=4 TP_NEXTN_SHARD=0 TP_MAXGEN=256 \
+  bash run_qwen38_bf16_tp4.sh bench
+
+TP_SIZE=4 TP_NEXTN_SHARD=0 TP_SPEC_K=5 TP_MAXGEN=256 \
+  TP_MTP_SHADOW_THREADS=48 \
+  TF_NEXTN_FFN_PERSIST=1 \
+  TF_NEXTN_BLOCK_PERSIST=1 \
+  TF_NEXTN_FULL_PERSIST=1 \
+  TF_NEXTN_ATTN_BLOCK_PERSIST=1 \
+  TF_BF16PV_PREFETCH_NEXTN=8 \
+  TP_AR_DETERMINISTIC=1 TP_AR_A2A_TREE=1 TP_AR_FUSED_ADD=1 \
+  TF_BF16PV_MTP5_FUSED=1 \
+  bash run_qwen38_bf16_tp4.sh mtp-sustained
+```
+
+#### Optimization result ledger
+
+| Date | Change/config | Clean? | Exact? | tok/s | Verify ms | Draft ms | GB/s/rank | Decision |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| historical | replicated NextN K=5 | yes | yes | 53.43 | 68.79 | 18.26 | ~868 | reference |
+| 2026-09-04 | SVE snapshot convolution, sharded NextN K=5 | yes | 128/256 yes | 52.98 / 51.99 | 73.87 / 73.96 | 15.54 / 15.51 | 882--946 (256) | promote; preparation 127.5 to 51.7 ms/27 calls in adjacent 128 A/B |
+| 2026-09-04 | current non-MTP TP4 baseline, 64 warm + 256 measured | yes | 320 yes | 31.53 | n/a | n/a | 523--564 | 40 tok/s still open; 31.74 ms limiting rank, 129 reductions/token |
+| 2026-09-04 | prefetch next CMG-local projection during TP reduction | yes | first 80 canonical | 32.52 vs 32.59 adjacent | n/a | n/a | 548--572 vs 544--566 | reject and remove; 30.81 vs 30.68 ms/token |
+| 2026-09-04 | MRQ one-Put recheck after SVE snapshot convolution | yes | 128 yes | 53.13 vs 52.98 | 73.68 vs 73.87 | 15.49 vs 15.54 | 906--935 | neutral; collective 362.1 vs 357.4 ms/27 calls, retain two-Put default |
+| 2026-09-04 | KMP blocktime 200 ms / remove verifier K scratch copy | yes | 128 yes | 52.74 / 52.91 | 74.03 / 73.97 | 15.79 / 15.58 | 894--933 / rank0 899 | reject both; neither beats the adjacent 52.98 default |
+| 2026-09-04 | K=5 bonus proposal probe | yes | 128 yes | 50.54 | 74.65 | 19.09 | rank0 857 | boundary token 24/27 (88.9%); optimistic overlap is viable only if 48-thread numerics/bandwidth are preserved |
+| 2026-09-04 | K=5 async 36-verifier/12-draft split | no | 128 yes | 43.21 | 72.04 | 17.67 exposed | 695--749 | reject and remove; reuse fell to 17/33 and verifier lost HBM bandwidth |
+| 2026-09-04 | sequential 12-thread K=5 bonus control | no | 128 yes | 40.14 | 74.51 | 43.51 | 650--695 | preserves 26/27 full acceptance and 24/27 boundary hits; async quality loss is predicted-hidden seeding, not thread-count numerics |
+| 2026-09-04 | verifier `TF_SSM_PREEXP=1` | yes | no | 54.17 | 75.14 | 15.68 | 915--992 | reject; output hash changed to `a0f96c3b...` |
+| 2026-09-04 | one hot OpenMP team for complete K=5 FFN gate/up streams | yes | 128 yes | 52.40 | 74.86 | 15.55 | 893--951 | reject and remove; FFN projection saved only 0.20 ms/round and wall time regressed |
+| 2026-09-04 | defer K=5 SSM output norm/gate to 60-task pass | yes | 128 yes | 52.99 | 73.96 | 15.43 | 884--951 | reject and remove; scan rose 121.1 to 128.3 ms/27 calls, wall gain was collective variance |
+| 2026-09-04 | worker-private verifier attention-score arena | yes | 128/256 yes | 56.57 / 55.53 | 68.41 / 68.41 | 15.33 / 15.35 | 927--945 (256) | promote; 256-byte-aligned per-worker slices remove 768 contended allocator pairs per K=5 round |
+| 2026-09-04 | 30-thread verifier attention team | no | 128 yes | 13.69 | 330.85 | 15.36 | 220--251 | reject and remove; changing team size stalls Fujitsu OpenMP reuse and poisons later phases |
+| 2026-09-04 | four-line BF16 PV startup prime, non-MTP | yes | short bench inconclusive | 32.62 vs 32.70 | n/a | n/a | 550--553 vs 549--555 | reject and remove; startup hints are neutral, and short bench hashes varied despite unchanged arithmetic |
+| 2026-09-04 | retain verifier score arena across rounds | yes | 128 yes | 55.64 | 69.74 | 15.40 | 934--960 | reject and remove; no reduction in the unprofiled gap versus 56.57 promoted baseline |
+| 2026-09-04 | `TF_PODD_FFN_PIPE=1` on BF16-PV stage | yes | 128 yes | 56.44 | 68.63 | 15.29 | 936--958 | no-op; staged verifier matrices lack the p-odd pipeline precondition |
+| 2026-09-04 | explicit SVE TP4 exact-tree fold | yes | 128 yes | 56.18 vs 56.80 | 68.89 vs 68.15 | 15.43 vs 15.25 | 937--960 vs 951--964 | reject and remove; fold saved ~0.24 ms/round internally but did not improve wall time |
+| 2026-09-04 | compact BF16 PV 2-row x 6-token verifier | yes | 128 yes | 53.09 | 85.97 | 18.79 | 876--892 | retain as K=6 improvement; 4x6 spilled (47.30), 1x6 lacked MLP (36.80), and K=5 remains faster at 56.80 |
+| 2026-09-04 | compact BF16 PV 2-row x 8-token verifier | yes | 128 yes | 44.34 / 48.31 | 118.67 / 106.70 | 25.58 / 25.72 | 831--844 / 798--847 | reject and remove; second result raises exact one-round cutoff 32768 to 65536, but kernel/runtime phases still lose to K=5 |
+| 2026-09-04 | prefetch upcoming FFN during non-MTP collective | yes | short bench only | 32.30 / 32.37 (8 / 2 lines) vs 32.70 | n/a | n/a | 546--552 | reject and remove; cache warming is neutral-to-negative |
+| 2026-09-04 | static verifier attention task schedule / SVE attention gate | yes | 128 yes | 56.36 / 56.27 | 68.90 / 68.83 | 15.15 / 15.36 | 941--964 | reject static schedule; leave SVE gate opt-in, both are wall-neutral |
+| 2026-09-04 | futex park / pre-park OpenMP barrier | yes | 128 yes | 55.88 / 56.00 | 68.72 / 68.52 | 16.06 / 16.06 | 931--969 | reject and remove; neither beats pthread-cond parking without an added barrier |
+| 2026-09-04 | direct all-peer draft argmax transport | yes | 128 yes | 55.84 | 69.63 | 15.19 | 930--970 | reject and remove; exact but wall-neutral versus the established TP argmax |
+| 2026-09-04 | worker-owned NextN local argmax | yes | 128/256 yes | 56.36 vs 56.21; 55.87 long | 69.33 vs 68.65; 68.55 long | 14.72 vs 15.63; 14.70 long | 943--964 (256) | promote; adjacent enabled/disabled A/B saves 0.91 ms of drafting |
+| 2026-09-04 | inline BF16-PV NextN head winner | yes | 128/256 yes | 56.97 vs 56.75; 55.98 long | 68.79 vs 68.83; 68.72 long | 14.36 vs 14.64; 14.36 long | 944--961 (256) | promote; avoids full logits store/reread |
+| 2026-09-04 | snapshot-aware four-lane SSM verifier scan | yes | 128 yes | 56.68 | 68.97 | 14.59 | 952--982 | reject and remove; scan remained 122.4 ms/27 calls, so recurrent snapshot traffic is bandwidth-bound |
+| 2026-09-04 | balanced non-MTP profile / K5120 prefetch 8 | yes | 96 same hash | 32.47 / 32.36 | n/a | n/a | 549--557 / 546--555 | retain global distance 6; K5120=8 regressed limiting-rank time from 30.79 to 30.93 ms |
+| 2026-09-04 | K4352 decode prefetch distance 8 | yes | short stream only | 31.48 vs 31.59 | n/a | n/a | 529--552 vs 535--557 | reject; retain global distance 6 |
+| 2026-09-04 | L1-locality exact BF16-PV prefetch | yes | short stream only | 26.36 vs 31.59 | n/a | n/a | 429--431 vs 535--557 | reject and remove; L1 pollution raises compute from 25.7--26.7 to 33.2--33.4 ms/token |
+| 2026-09-04 | non-MTP uTofu poll cadence 4/8/16/32 | yes | 96 yes; 320@8/16 yes | 32.30 / 32.47 / 32.58 / 32.34 short; 32.21 / 32.31 long at 8/16 | n/a | n/a | 542--550 (long) | promote 16 for ordinary decode; MTP retains independently proven 8 |
+| 2026-09-04 | fused TP reduce-plus-residual long A/B | yes | 320 both yes | 32.31 vs 31.55 enabled/disabled | n/a | n/a | 544--550 / 525--544 | retain default; exact sustained +2.4% at poll cadence 16 |
+| 2026-09-04 | lean robustness under one-Put/cadence-16 decode | yes | 96 yes | 31.86 | n/a | n/a | 543--555 | reject; current robust=1 path remains faster |
+| 2026-09-04 | pair low/high chunks in exact single-vector BF16-PV loop | yes | no; 96-token hash changed | 27.61 vs 31.59 | n/a | n/a | 454--459 vs 535--557 | reject and remove; compiler scheduling/reassociation defeated the source-level exact tree and cut bandwidth |
+| 2026-09-04 | MTP one-Put remote-notice transport | yes | 128/256 yes | 57.08 vs 56.85 short; 56.25 long | 68.59 vs 68.79; 68.31 long | 14.40 vs 14.53; 14.37 long | 942--966 (256) | promote; verifier collective 10.66 vs 10.91 ms/round in adjacent A/B |
+| 2026-09-04 | compact 4x5 verifier prefetch 10/12/16 | yes | 128 all; 256@12 yes | 57.73 / 57.81 / 57.10 short; 56.86 long | 67.59 / 67.69 / 68.67; 67.47 long | 14.47 / 14.24 / 14.29; 14.32 long | 956--972 (256) | promote 12; long gain +0.61 tok/s over prior distance-16 best |
+| 2026-09-04 | persistent 256-byte-partitioned verifier scratch arena | yes | 128/256 yes | 57.98 enabled vs 57.83 disabled short; **57.06 long** | 67.36 vs 67.66 short; **67.09 long** | 14.34 vs 14.25 short; **14.41 long** | 953--966 (256) | promote; removes eleven alloc/free pairs per K=5 verify call and improves the prior 56.86 tok/s sustained baseline |
+| 2026-09-04 | shape-specific MTP5 prefetch 4352/5120/6144=10/12/10 | yes | 128 yes | 56.82 | 69.01 | 14.36 | 964--992 | reject and remove; down saved ~0.19 ms/round but combined verifier did not improve over global 12 |
+| 2026-09-04 | current K=6 compact-kernel prefetch 12/10/8 | yes | 128 all yes | 54.30 / 54.74 / 54.91 | 84.49 / 84.02 / 83.78 | 17.93 / 17.57 / 17.50 | 913--931 (8) | retain 8 as K=6 fallback; K=5 remains faster at 57.81 short / 56.86 long |
+| 2026-09-04 | inline K=5 verifier-head local argmax | yes | 128 both yes | 57.91 vs 57.89 | 67.43 vs 67.41 | 14.37 vs 14.42 | 970--998 | reject and remove; skipping 1.24 MB logits traffic is neutral beside the 1.27 GB local head stream |
+| 2026-09-04 | fused paired BF16-PV projections (`TF_BF16PV_FUSED_PAIR=1`) | no | 128 yes | 48.28 vs 56.18 disabled | 74.50 vs 69.43 | 23.57 vs 14.90 | allocation-contended | reject; the paired stream preserves the 104/108 draft match but stalls the persistent NextN path badly |
+| 2026-09-04 | compact 3-row x 6-token verifier | yes | 128/256 yes | 55.75 short; 52.80 long | 82.25 short; 83.08 long | 17.51 short; 17.86 long | 901--914 (256) | promote for K=6 fallback; exact and materially faster than the adjacent 2x6 control at 52.14 tok/s / 89.18 ms verify, but K=5 remains production |
+| 2026-09-04 | compact 2-row x 8-token verifier / serial N=8 norm / 65536 exact-tree slot | no | 128 yes | 44.14 / 44.48 | 121.26 / 112.49 | 23.65 / 31.34 | 750--867 | reject and remove; K=8 acceptance fell to 0.8286 and larger verifier/collective phases overwhelmed the extra horizon |
+| 2026-09-04 | restaged combined optimized K=5 MTP | yes | 128/256 yes | 56.18 short; 54.90 long | 69.78 short; 69.60 long | 14.55 short; 15.11 long | 934--965 (256) | current allocation baseline; exact but below the prior 57.06 tok/s long result and the 60 tok/s exit gate |
+| 2026-09-03 | persistent decode reduce+add | no | 128/256 yes | 26.83 vs 26.19 (128); 31.40 (256) | n/a | n/a | 540--617 (256) | +2.4% adjacent; clean pending |
+| 2026-09-03 | MTP5 prefetch 8 / 24 | no | 128 yes | 25.69 / 29.92 | n/a | n/a | 428 / 526 | allocation varies; retain default 16 |
+| 2026-09-03 | decode prefetch K4352=12 K5120=6 K6144=8 | no | short stream yes | 31.93 ms/tok vs 31.45 control | n/a | n/a | 540 / 537 | reject values; retain global 6 |
+| 2026-09-03 | replicated NextN + shadow48 | no | 128 yes | 29.77 vs 26.73 | 90.37 | 68.86 | 528--658 | +11.4%; promote launcher default, clean gate pending |
+| 2026-09-03 | persistent NextN FFN | no | 128/256 yes | 36.65 short; 27.63 sustained | 83.37 / 98.85 | 45.96 / 69.62 | 647--701 / 471--677 | promote; 256 draft -9.5% at lower rank-0 BW |
+| 2026-09-03 | persistent NextN output+FFN block | no | 128/256 yes | 40.90 short; 30.14 sustained | 81.96 / degraded allocation | 33.89 / degraded allocation | 697--752 / 522--730 | promote; short draft -26.3% vs FFN-only, long run rank-0 limited |
+| 2026-09-03 | persistent NextN full block through vocab head | no | 128/256 yes | 42.55 short; 35.76 sustained | 83.46 / 84.66 | 27.90 / 45.45 | 744--803 / 611--764 | promote; removes final pool wake, clean gate pending |
+| 2026-09-03 | persistent NextN attention-to-vocab tail | near/no | 128/256 yes | 44.52 short; 40.48 sustained | 83.10 / 83.59 | 23.33 / 31.32 | 767--821 / 711--811 | promote; exact original head ownership, clean gate pending |
+| 2026-09-03 | NextN-private BF16 prefetch 0/6/8/12 | no | 128 all yes; 256@8 yes | 32.43 / 35.85 / 36.55 / 31.94 | allocation varied | 50.91 / 46.05 / 39.73 / 56.73 | rank0 548 / 606 / 620 / 534 | promote 8 from adjacent 6/8; clean A/B pending |
+| 2026-09-03 | extend persistent tail through NextN QKV | near | 128 yes | 44.32 vs 46.11 control | 80.53 vs 79.55 | 26.38 vs 23.19 | 786--852 vs 780--831 | reject and remove; serial QK/RoPE phase strands workers |
+| 2026-09-03 | verifier OpenMP blocktime 1 ms | no | run aborted | <1 | >300,000 | n/a | n/a | reject; only ~7 cores active, restore 200 ms |
+| 2026-09-03 | uTofu poll cadence 4/8/16 | near | 128 all yes | 45.15 / 46.11 / 45.39 | 81.08 / 79.55 / 80.56 | 23.85 / 23.19 / 23.82 | 772--829 / 780--831 / 772--829 | retain 8 |
+| 2026-09-03 | persistent-trunk per-worker SVE SiLU | no | short stream changed | 23.39 vs 24.15 control | n/a | n/a | peers 526--539 | reject and remove; slices too small to amortize vector setup |
+| 2026-09-03 | paired verifier SSM alpha/beta team | near | 128 twice yes | 46.39 / 46.36 vs 44.59 control | 79.09 / 79.12 vs 82.73 | 23.03 / 23.07 vs 23.51 | 781--835 / 782--835 vs 775--826 | promote; exact, repeatable +4.0%, clean gate narrowly missed |
+| 2026-09-03 | paired verifier SSM QKV/gate team | near | 128 yes | 45.55 vs 46.09 control | 81.23 vs 79.60 | 22.79 vs 23.20 | 771--844 vs 785--833 | reject and remove; large HBM phases regress inside retained team |
+| 2026-09-03 | 24-thread SSM alpha/beta pair | no | 128 yes | 4.37 | 1027.23 | 57.72 | 68--89 | reject and remove; alternating 24/48-thread regions defeats Fujitsu hot-team reuse |
+| 2026-09-03 | exact-slot contiguous uTofu Put, non-MTP | no | 128 repeated only | 31.04 vs 26.99 | n/a | n/a | 535--555 vs 531--548 peers | reject and revert; trailer visibility does not guarantee payload completion |
+| 2026-09-03 | exact-slot contiguous uTofu Put, MTP | near | 128 yes | 44.01 vs 46.36 | 79.84 vs 79.12 | 27.81 vs 23.07 | 785--825 vs 782--835 | reject 25600 slot; retain 32768 for MTP |
+| 2026-09-03 | late TCQ polling after peer arrival | no | 128 twice yes | 30.65 / 30.93 vs 31.04 reference | n/a | n/a | 527--554 / 536--544 | reject and remove; collective time neutral |
+| 2026-09-03 | strong-order trailer-only TCQ notice | no | 128 yes | 26.89 vs 26.99 control | n/a | n/a | 536--552 peers | reject and remove; comm 10.49--11.26 ms/token, no polling win |
+| 2026-09-04 | MRQ-completed one-Put A2A, non-MTP | no | 128 twice + 256 yes | 30.07 / 29.83 / 30.29 vs 29.37 control | n/a | n/a | 545--563 peers | promote for non-MTP; remote completion replaces unsafe memory trailer |
+| 2026-09-04 | MRQ-completed one-Put A2A, MTP | near | 128 yes | 47.00 vs 46.83 control | 77.32 vs 77.45 | 23.49 vs 23.72 | 785--837 | neutral; retain two-Put MTP default pending sustained A/B |
+
+The promoted NextN block dispatch extends the persistent proposer workers
+backward across attention output, its optional all-reduce, residual add, and
+FFN norm.  The exact 128-token run produced the canonical
+`6b136ca08910eb2b47a820d1be2efc5eed1a38c7bf8f8a43de009c6b29f274c2`
+hash at **40.90 tok/s**, with 81.96 ms verification and 33.89 ms drafting per
+round.  All ranks were balanced at 697--752 GB/s.  This reduced draft time by
+26.3% relative to the nearby persistent-FFN result (45.96 ms), although the
+runs were not on an acceptance-quality clean allocation.
+
+The 256-token validation produced the canonical
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`
+hash.  It reached 30.14 tok/s while rank 0 fell to 522 GB/s and the other ranks
+held 687--730 GB/s.  The ranks nevertheless finished within 0.11%, identifying
+the loss as rank-0 compute bandwidth/interference rather than synchronization
+skew.  Clean-node acceptance still requires three exact 256-token runs and the
+60 tok/s median/minimum gate above.
+
+The next extension retains those same workers through FFN completion, the
+final residual and RMSNorm, and the rank-local 62,080-row vocabulary head.
+`TF_NEXTN_FULL_PERSIST=1` therefore removes the last pool wake in each NextN
+call without changing the BF16 projection kernel or the global argmax. Its
+128-token run was canonical at **42.55 tok/s**, 83.46 ms verification, and
+27.90 ms drafting. The 256-token run was also canonical at **35.76 tok/s**,
+84.66 ms verification, and 45.45 ms drafting, despite rank 0 reaching only
+611 GB/s while its peers reached 723--764 GB/s. This is promoted as the
+default MTP path, but neither measurement qualifies as a clean-node result.
+
+`TF_NEXTN_ATTN_BLOCK_PERSIST=1` extends the same dispatch backward through the
+per-head attention calculation and gated-attention activation. It preserves
+the original head assignment (including idle workers when there are fewer
+heads than threads), then crosses explicit dependency barriers before the
+attention-output projection. This avoids one more pool wake without moving
+weight rows between their CMG owners. The canonical 128-token run reached
+**44.52 tok/s**, with 83.10 ms verification and 23.33 ms drafting at
+767--821 GB/s. The canonical 256-token run reached **40.48 tok/s**, with 83.59
+ms verification and 31.32 ms drafting at 711--811 GB/s. Both had under 0.2%
+rank wall-time skew; neither passes the all-ranks 800 GB/s clean gate.
+
+The shadow pool now has a thread-local single-token BF16 prefetch override, so
+proposer tuning no longer changes the verifier or trunk workers in the same
+process. Distances 0, 6, 8, and 12 were all canonical at 128 tokens. The most
+comparable 6/8 pair ran at 606/620 GB/s on limiting rank 0: distance 8 reduced
+draft time from 46.05 to 39.73 ms and improved throughput from 35.85 to 36.55
+tok/s. Distance 12 regressed to 56.73 ms. The 256-token distance-8 validation
+was canonical at 35.95 tok/s, 91.20 ms verification, and 38.19 ms drafting,
+with rank 0 limited to 622 GB/s. `TF_BF16PV_PREFETCH_NEXTN=8` is promoted,
+subject to the same clean-node A/B gate.
+
+Extending the persistent tail one boundary farther, through the NextN QKV
+projection, was exact but counterproductive. The fused run reached 44.32
+tok/s with 26.38 ms drafting at 786--852 GB/s. Its immediately adjacent
+QKV-unfused control reached **46.11 tok/s** with 23.19 ms drafting at
+780--831 GB/s. Keeping all workers inside the dispatch while worker zero did
+the exact Q/K normalization, RoPE, and cache copies cost more than the saved
+pool wake. The QKV experiment was removed completely; the production
+persistent region continues to start at per-head attention.
+
+Reducing `TP_MTP_VERIFY_BLOCKTIME` from 200 to 1 ms was rejected without a
+completed timing sample. The confirmed live 128-token process was still in
+decode after five minutes and used only about seven cores' worth of CPU,
+instead of completing load plus decode in roughly 30 seconds on the same
+allocation. Repeated sleep/wake between the verifier's many OpenMP regions is
+catastrophic; the run was terminated and the 200 ms default is retained.
+
+The exact TP4 uTofu all-gather/tree path was also swept at trailer-invalidation
+cadences 4, 8, and 16 on comparable near-clean MTP runs. All three retained the
+128-token canonical hash. Cadence 8 remained best at 46.11 tok/s, versus 45.15
+and 45.39 tok/s; no polling default changed.
+
+Finally, applying the bulk SVE SiLU approximation inside each persistent trunk
+worker regressed non-MTP throughput from 24.15 to 23.39 tok/s while peer-rank
+weight bandwidth remained 526--539 GB/s. Each worker owns only about 91 FFN
+elements, so vector exponential/reciprocal setup does not amortize as it does
+in the batched activation path. The experiment was removed completely.
+
+An additional SSM scheduling probe normalized Q/K directly into each expanded
+head, replacing the normalize/expand pair with one worker phase and removing
+48 global barriers per token. It retained the short token stream exactly, but
+the three heads mapped to each source group redundantly recomputed its norm.
+SSM preparation rose from 1.46 to 2.15 ms/token and total decode regressed from
+31.10 to 32.70 ms/token in the adjacent run. The direct-normalization code was
+removed; the two-phase shared normalization remains production.
+
+A follow-on group-owner version avoided redundant norm sums and reduced the
+short-profile SSM preparation counter from 1.46 to 1.29 ms/token. It still
+failed the 128-token stream comparison. The legacy expand call also executes
+the normalization loop, so its workers may copy groups while their owners are
+performing that second normalization; replacing it with a single owner phase
+changes the historical floating-point state. The owner version was removed as
+well. Removing this barrier now requires an explicitly approved oracle change,
+not a decode-performance-only substitution.
+
+The verifier now evaluates each SSM layer's 12-row alpha and beta projections
+under one OpenMP team (`TF_SSM_AB_PAIR=1`). Those tensors cannot use the PV8
+layout because their row count is not divisible by eight; the old path created
+two 48-thread teams per layer, or 96 tiny team launches per verifier round.
+Both the ordinary and paired dispatchers call the same factored SVE row
+primitive, preserving the exact accumulation and reduction order. Two adjacent
+paired 128-token runs reproduced the canonical
+`6b136ca08910eb2b47a820d1be2efc5eed1a38c7bf8f8a43de009c6b29f274c2`
+hash at **46.39 and 46.36 tok/s**, with 79.09/79.12 ms verification and
+23.03/23.07 ms drafting per round. The intervening disabled control was also
+exact but reached 44.59 tok/s and 82.73 ms verification. Accumulated verifier
+projection time fell from 480.5 to 444.8/450.4 ms over 27 rounds. This is a
+repeatable 4.0% end-to-end short-run improvement and is promoted as the
+launcher default. The samples remain classified near-clean because one rank
+measured 781--782 GB/s, just below the 800 GB/s acceptance threshold.
+
+The analogous shared-team experiment for the much larger SSM QKV and gate
+projections was rejected and removed. It retained the canonical hash, the same
+static row ownership, and an explicit phase barrier, but reached only 45.55
+tok/s with 81.23 ms verification. The immediately adjacent disabled control
+reached 46.09 tok/s with 79.60 ms verification. Projection time increased from
+447.5 to 461.4 ms over 27 rounds, so these long HBM-streaming phases benefit
+from ending the first region instead of holding its team through the barrier.
+
+Capping the paired alpha/beta region at its 24 actual row tasks was also
+rejected and removed. Although it retained the canonical token hash, repeatedly
+alternating between 48-worker projection teams and a 24-worker scalar team
+prevented the Fujitsu OpenMP runtime from reusing its hot team. Throughput
+collapsed to 4.37 tok/s and accumulated verifier projection time increased to
+18.5 seconds over 27 rounds. The pair therefore intentionally wakes the same
+48-worker team as the surrounding projections even though half its workers
+have no row assigned.
+
+An exact-slot all-to-all experiment combined payload and its fixed trailer in
+one Put when `count == TP_AR_A2A_MAX`. The repeated short streams happened to
+match and performance improved from 26.99 to 31.04 tok/s, but this cannot be
+retained as an exact protocol: observing the last eight bytes of a multi-packet
+Put does not prove that all preceding payload cache lines are visible. The
+earlier `TP_AR_BATCH=1` experiment had already demonstrated divergence with
+the same publication assumption. The combined Put and 5,120-float launcher
+default were therefore reverted; production again uses distinct payload and
+trailer Puts with the 8,192-float slot.
+
+A safe attempt to reduce only local completion work kept payload and trailer as
+separate remote Puts, applied `UTOFU_ONESIDED_FLAG_STRONG_ORDER`, and requested
+a TCQ notice only for the trailing descriptor. It retained the 128-token hash
+but reached 26.89 tok/s versus the comparable ordinary path at 26.99 tok/s;
+peer communication was 10.49--11.26 ms/token rather than 10.09--10.92. The
+branch was removed: TCQ polling is not the dominant cost, and production keeps
+an explicit completion notice for every Put.
+
+The safe one-Put replacement uses uTofu remote-completion notices rather than
+inferring completion from bytes inside the payload Put. Each peer receives one
+payload with `UTOFU_ONESIDED_FLAG_REMOTE_MRQ_NOTICE`; the fold begins only after
+all three matching `RMT_PUT` notices and all three local TCQ completions arrive.
+This platform preserves only one byte of `edata`, so notices are matched by the
+reported destination end address to the containing double-buffered
+generation/sender slot. A small communicator mailbox preserves notices from a
+faster peer if generic MRQ cleanup encounters the next collective early.
+
+Non-MTP produced the same 128-token hash in repeated runs at 30.07, 29.83, and
+30.29 tok/s versus an adjacent 29.37 tok/s two-Put control. Peer collective
+wait fell by about 0.5 ms/token. A 256-token run completed 33,024 reductions
+without timeout or overflow, reproduced
+`382c37645708049d46069500a771f46c70769ba59311f3e37b313e14168d2624`,
+and reached 30.11 tok/s. The launcher therefore enables
+`TP_AR_A2A_MRQ_ONEPUT=1` for ordinary decode.
+
+The exact K=5 MTP A/B was neutral: one-Put reached 47.00 tok/s with 77.32 ms
+verification and 23.49 ms drafting, while the adjacent two-Put control reached
+46.83 tok/s, 77.45 ms, and 23.72 ms. MTP keeps the two-Put default until a
+256-token repeated comparison establishes a sustained gain.
+
+The corresponding MTP slot experiment was not promoted. A 25,600-float slot
+made the K=5 batched residual contiguous, but verifier collective time remained
+flat and the smaller sequential draft reductions became slower. The canonical
+run reached 44.01 tok/s, 79.84 ms verification, and 27.81 ms drafting versus
+46.36 tok/s, 79.12 ms, and 23.07 ms with the 32,768-float default. MTP therefore
+continues to override the single-token default with 32,768 floats.
+
+Deferring local TCQ completion polling until after remote trailer arrival was
+also exact but neutral. Two 128-token runs reached 30.65 and 30.93 tok/s with
+balanced peer collective times of 5.36--6.77 and 5.64--6.03 ms/token. The
+original completion-first exact-slot run reached 31.04 tok/s and
+5.45--6.43 ms/token. The late-poll branch was removed to keep the simpler
+ordering and avoid accumulating unobserved completions during peer waits.
+
+A 256-token exact-slot stability run completed without a protocol timeout or
+MRQ overflow, producing 28.44 tok/s. Its per-token curve held communication
+near 5 ms on rank 0, but rank-0 compute stalls between tokens 177 and 226 made
+peers report 8.19--8.97 ms average wait and reduced aggregate throughput. It is
+therefore stability evidence only, not a clean sustained performance result.
+
+An exact BF16 gate/up panel-interleaving probe was rejected and removed. It
+kept each persistent worker's original eight-row range and called the unchanged
+PV8 kernel first for one gate panel and then the matching up panel. Thus it
+preserved CMG ownership and reproduced the 64-token hash, but profiled gate/up
+time remained 7.8--8.0 ms/token, indistinguishable from the sequential-stream
+control. Alternating two large weight streams does not improve reuse: the
+shared 5,120-float activation already fits in L2 and the weights are consumed
+once. The production scheduler continues to finish its local gate range before
+starting up.
+
+The existing greedy-only vocabulary-head path was also tested explicitly with
+`TP_LMHEAD_ARGMAX=1`. It invokes the same BF16 PV8 dot kernel while retaining
+only the per-worker winning logit, then leaves the other logits at negative
+infinity for the unchanged TP argmax. The token hash remained exact, but the
+adjacent runs were both 43.8 ms/token on the limiting rank, so eliminating the
+roughly 1 MB logit write/read is immaterial next to the 1.27 GB local head
+weight stream. It remains opt-in.
+
+These probes sharpen the current non-MTP bottleneck. On the same impaired
+allocation, ranks 1--3 sustained 538--547 GB/s and about 26.2 ms compute, while
+rank 0 sustained only 364 GB/s and took 39.3 ms compute; peers charged the
+resulting 17.3--17.7 ms wait to collectives. The next 40 tok/s work should
+therefore target rank-0 placement/interference and the unclassified serial
+persistent-worker path, rather than logit stores or gate/up scheduling. A
+minor hot-loop cleanup now caches `TF_TRACE_LAYERS` once per worker invocation
+instead of calling `getenv` three times per layer.
+
+The null-GEMM diagnostic now supports `TF_NULL_SCAN=0`, which preserves every
+persistent-worker phase, output zeroing, barrier, SSM state update, and TP
+collective while omitting weight reads. The launcher also preserves an
+explicit caller value of `TF_NULL_GEMM` in `null` mode instead of forcing it to
+one. A 256-token flat-barrier run measured **15.12 ms/token** across the four
+ranks (rank-0 compute 8.07 ms plus 6.96 ms collective). This is a 66 tok/s
+schedule/communication ceiling and proves the 40 tok/s plain-decode target is
+not blocked by irreducible scalar work.
+
+The corresponding decode-shaped weight scan measured 37.80 ms/token and only
+577--585 GB/s on the peer ranks. In contrast, five batched passes over the same
+17.724 GB stage measured **810.2--831.4 GB/s** on all ranks, including 826.8
+GB/s on rank 0. HBM placement and CMG ownership are therefore healthy; frequent
+short projections, barriers, and collectives prevent the production stream
+from reaching its steady-state bandwidth. `TF_HIER_BARRIER=1` is not a remedy:
+the no-scan A/B regressed catastrophically to 109.2 ms/token, so the launcher
+continues to default to the flat barrier.
+
+For an uninstrumented serial-floor measurement use:
+
+```sh
+cd a64fx/llm
+TP_MAXGEN=256 TP_PERF_WARMUP=64 TF_NULL_SCAN=0 \
+  bash run_qwen38_bf16_tp4.sh null
+```
+
+A controller-free 128-token MTP rebaseline of the current combined defaults
+was exact (`6b136ca0...`) and reached **46.95 tok/s**, with 77.78 ms verifier
+and 23.12 ms draft time. Rank bandwidth was 789--828 GB/s; because two ranks
+were just below the 800 GB/s gate, it is near-clean evidence rather than an
+accepted result. The same configuration with local Codex processes competing
+on rank 0 reached only 29.36 tok/s (rank 0 460 GB/s), quantifying why interactive
+results must not replace clean-node acceptance. A historical-control attempt
+landed on a lower 711--745 GB/s interval and is not a valid adjacent comparison.
+
+The persistent DeltaNet convolution now publishes state and output by channel
+inside each owning worker (`TF_SSM_CONV_INLINE_COPY=1`). Depthwise convolution
+has no cross-channel dependency, so after producing `[j0,j1)` the worker copies
+the original QKV slice to the same ring-state slice and replaces that QKV slice
+with its convolution result. The floating-point operations and their order are
+unchanged, and every read/write remains in the worker's existing CMG-owned
+channel range. This removes thread 0's two serial 10,240-float copies and one
+global barrier from each of the 48 SSM layers per token.
+
+The adjacent 64-token A/B reproduced the same
+`1ccdd24cc33593fcf2aa8058357848fdbf995526930e98cf2782169d23f71799`
+hash. Forward time improved from 31.84 to **31.61 ms/token** (0.7%), and overall
+throughput improved from 31.34 to **31.51 tok/s**. A controller-free MTP gate
+also reproduced canonical `6b136ca0...` and reached 47.41 tok/s with 76.32 ms
+verification and 23.61 ms drafting. `TF_SSM_CONV_INLINE_COPY=0` retains the
+legacy serial-copy/barrier path for exact comparisons.
+
+The first inline-copy implementation advanced the convolution ring index from
+thread 0 inside its channel worker. A 64-token gate happened to pass, but the
+256-token gate exposed that a delayed peer could read the new index before
+entering its worker. That uncommitted runtime was discarded. The corrected
+path advances the index on thread 0 only after the existing all-worker
+convolution barrier. With both inline copy enabled and disabled, the corrected
+320-token stream produced the same
+`031bdd2014e6b8614b9b92b86aa0ef06857a4df4c0b1564f97ec659ffa74540b`
+hash.
+
+Attention preparation is now head-owned under `TF_ATTN_PREP_HEADS=1`. TP4 has
+six local Q heads; workers 0--5 independently de-interleave one complete head,
+then execute its unchanged RMSNorm, bias addition, and RoPE sequence. Thread 0
+continues to prepare the single local K/V head and publish its cache. The
+dependency barrier remains, and no head or weight range crosses a CMG.
+
+The no-weight 256-token serial-floor A/B fell from **15.82 to 12.88 ms/token**,
+with rank-0 compute falling from 10.82 to 7.65 ms. The 64-token weight-stream
+A/B was exact and improved 31.33 to 31.24 ms/token; the longer 256-token pair
+improved 32.07 to **31.73 ms/token** on the limiting rank. Its 320-token hash
+matched the serial preparation control. The 128-token MTP gate also retained
+canonical `6b136ca0...`; its 45.22 tok/s sample was bandwidth-degraded at
+761--812 GB/s and is correctness evidence only. Set `TF_ATTN_PREP_HEADS=0` for
+the legacy serial attention preparation.
+
+The replicated NextN proposer now extends its persistent worker region backward
+through QKV (`TF_NEXTN_QKV_PERSIST=1`). Each worker computes its unchanged
+static Q/K/V row ranges, then independent Q-head owners perform the established
+de-interleave, RMSNorm, and RoPE sequence. K-head owners normalize/rotate and
+publish disjoint key/value-cache slices. Two explicit dependency barriers
+separate projection, head preparation, and attention. This fixes the earlier
+QKV-extension experiment's serial-thread-0 preparation bottleneck without
+changing a dot product or moving a weight row between CMGs.
+
+The adjacent exact 128-token A/B reduced proposer time from 22.91 to **20.18
+ms/round** (-11.9%) and improved throughput from 47.47 to 48.19 tok/s despite
+1.2 ms of verifier jitter. The enabled sample passed the clean bandwidth gate
+at 806--854 GB/s. The required 256-token run also passed: canonical
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`,
+809--847 GB/s on all ranks, 76.37 ms verification, 20.00 ms drafting, and
+**48.27 tok/s**. This is promoted for MTP; setting the option to zero restores
+the separate QKV pool and serial head preparation.
+
+K=6 was rechecked after this proposer improvement and rejected again. It kept
+the canonical 128-token stream and normally accepted five drafts, but the
+generic verifier grew to 101.64 ms and drafting to 24.80 ms, yielding only
+43.99 tok/s. K=5 remains the production point; reaching 60 tok/s still requires
+removing about 19 ms from its 96.4 ms round or hiding most proposer work without
+concurrent full-weight HBM contention.
+
+With persistent QKV enabled, TP-sharding the NextN layer is profitable again.
+The new `/local/u14346/qwen38-bf16-tp4-nextnshard` image is 17.165 GB/rank and
+keeps the same CMG-local row placement. The exact 128-token run reduced draft
+time from the replicated 20.18 ms to **15.37 ms/round** and reached 51.20 tok/s
+at 863--905 GB/s. Its 256-token acceptance run reproduced canonical
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`
+at **49.96 tok/s**, with 77.58 ms verification, 15.51 ms drafting, and
+851--896 GB/s on every rank. The launcher now defaults `stage-mtp` and
+`mtp-sustained` to `TP_NEXTN_SHARD=1`; set it to zero for the replicated
+historical control.
+
+The safe remote-completion one-Put protocol was neutral on this newly sharded
+path. Its exact clean 128-token result was 51.10 tok/s with 77.17/15.55 ms
+verify/draft versus 51.20 tok/s and 77.16/15.37 ms for the adjacent two-Put
+default. MTP therefore continues to use the separate payload/trailer protocol.
+At the measured 4.65 emitted tokens per round, 60 tok/s requires approximately
+77.5 ms total; the current 93.1 ms round still needs about 15.6 ms removed,
+primarily from verification.
+
+The clean sharded path also rechecked verifier-kernel prefetch distance 8
+against the established MTP5 distance 16. Distance 8 reproduced the 128-token
+oracle at 51.19 tok/s with 77.07/15.49 ms verify/draft, indistinguishable from
+51.20 tok/s at distance 16. The MTP5 default remains 16.
+
+The batched verifier now allocates one attention-score arena for the complete
+K=5 call instead of issuing a `malloc` and `free` from every one of 48 workers
+in each of 16 attention layers. `TF_BATCH_ATTN_SCORE_ARENA=1` divides the arena
+into 256-byte-aligned, worker-private slices; first touch therefore stays with
+the worker and its CMG, and no slice is shared across CMGs. The adjacent
+128-token control was exact at 52.58 tok/s, 74.39 ms verification, and 15.70 ms
+drafting. Enabling the arena retained canonical `6b136ca0...`, reduced total
+attention time over 27 verifier calls from 130.6 to 36.0 ms, and reached
+**56.57 tok/s** with 68.41/15.33 ms verify/draft.
+
+The required long gate also retained canonical
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`.
+It generated 256 tokens at **55.53 tok/s**, with 68.41 ms verification, 15.35 ms
+drafting, and 927--945 GB/s weight bandwidth across the four nodes. The
+launcher enables the arena for `mtp-sustained`; setting the variable to zero
+restores the allocator-heavy exact control. At the observed 4.65 emitted
+tokens per round, the current 83.76 ms verify-plus-draft budget still needs
+roughly 6.3 ms removed to sustain 60 tok/s.
+
+A fresh `TF_NEXTN_PROFILE=1` run on the sharded persistent proposer attributes
+about 0.7--1.2 ms of each call to hidden/embedding fusion and 1.8--2.9 ms to the
+single persistent QKV-through-head worker region. Four calls therefore account
+for roughly 12.5 ms of the 15.5 ms draft round; parking and four sequential
+argmax handoffs account for the remaining roughly 3 ms. Replacing the pthread
+condition wait with a direct futex, or adding a 48-worker barrier before sleep,
+raised draft time to 16.06 ms. The current condition-variable parking path is
+retained. Meaningful proposer progress must reduce a weight stream or an argmax
+handoff, not substitute another worker-sleep primitive.
+
+The persistent NextN head now also computes one local argmax per worker over
+the exact eight-row groups already owned by that worker. The caller folds the
+48 cached winners, with the same lower-index tie break, before invoking the
+unchanged TP argmax. The logits and reduction arithmetic are unchanged; every
+scan stays within its worker's first-touched row range, so it adds neither
+cross-CMG access nor weaker alignment. An adjacent 128-token enabled/disabled
+A/B retained canonical `6b136ca0...` in both runs. Enabling the path reached
+56.36 versus 56.21 tok/s and reduced draft time from 15.63 to 14.72 ms despite
+verification jitter from 68.65 to 69.33 ms. `mtp-sustained` therefore enables
+`TF_NEXTN_LOCAL_ARGMAX=1`; set it to zero for the serial-scan control.
+The promoted 256-token gate retained canonical
+`7b86e9830096198c4066689d487ad18b3cd6efbad02626494a0d3fb9460d2f14`
+at **55.87 tok/s**, 68.55/14.70 ms verify/draft, alpha 0.9364, and
+943--964 GB/s across the four ranks.
+
+A direct all-peer transport for the tiny argmax record was also exact, but
+only reached 55.84 tok/s with 69.63/15.19 ms verify/draft and 930--970 GB/s.
+It was removed: changing the collective does not beat removing the redundant
+serial vocabulary scan.
+
+`TF_NEXTN_INLINE_ARGMAX=1` takes the next step for the persistent BF16-PV
+head: each worker compares the eight outputs immediately from its stack-local
+kernel result and publishes only its winner. It therefore avoids storing and
+rereading the complete 62,080-row local logit slice. The adjacent 128-token
+enabled/disabled runs both retained canonical `6b136ca0...`; enabled reached
+56.97 versus 56.75 tok/s and reduced drafting from 14.64 to 14.36 ms. The
+required 256-token gate retained canonical `7b86e983...` at **55.98 tok/s**,
+68.72/14.36 ms verify/draft, and 944--961 GB/s. The launcher now enables this
+path for `mtp-sustained`. Since the long-run wall gain is only 0.11 tok/s, the
+next material MTP work must reduce the 68.7 ms verifier rather than continue
+micro-optimizing the 14.4 ms proposer.

@@ -21,6 +21,9 @@
  *   DS4F_MAXGEN    synthetic decode tokens (default 16)
  *   DS4F_MAXPOS    KV cache capacity / max position (default 4096)
  *   DS4F_LAYERS    override n_layers (default 43; small for quick smoke)
+ *   DS4F_PROMPT_IDS file of token ids; enables real-token greedy generation
+ *   DS4F_MAX_NEW    generated tokens in prompt mode (default DS4F_MAXGEN)
+ *   DS4F_GEN_OUT    output file for generated token ids
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -62,6 +65,40 @@ static double sm_next(void) {
     return (double)(z >> 11) / (double)(1ull << 53);   /* [0,1) */
 }
 
+#define DS4F_EOS_ID 1
+
+static int read_prompt_ids(const char *path, int **out, int *nout) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int cap = 256, n = 0, v;
+    int *ids = (int *)malloc((size_t)cap * sizeof(*ids));
+    if (!ids) { fclose(f); return -1; }
+    while (fscanf(f, "%d", &v) == 1) {
+        if (n == cap) {
+            cap *= 2;
+            int *p = (int *)realloc(ids, (size_t)cap * sizeof(*ids));
+            if (!p) { free(ids); fclose(f); return -1; }
+            ids = p;
+        }
+        ids[n++] = v;
+    }
+    fclose(f);
+    if (n < 1) { free(ids); return -1; }
+    *out = ids; *nout = n;
+    return 0;
+}
+
+static int embed_lookup(const ds4f_model *m, int tok, float *x) {
+    if (tok < 0 || tok >= m->cfg.vocab || m->emb_rows != m->cfg.vocab)
+        return -1;
+    const uint16_t *row = m->embed + (size_t)tok * (size_t)m->cfg.hidden;
+    for (int i = 0; i < m->cfg.hidden; ++i) {
+        uint32_t u = (uint32_t)row[i] << 16;
+        memcpy(x + i, &u, sizeof(u));
+    }
+    return 0;
+}
+
 int main(void) {
     int n_threads = envi("LLM_THREADS", 48);
     int n_cmgs    = envi("DS4F_CMGS", 4);
@@ -72,6 +109,20 @@ int main(void) {
     int maxpos    = envi("DS4F_MAXPOS", 4096);
     int layers    = envi("DS4F_LAYERS", 0);
     int ctx_warm  = envi("DS4F_CTX_WARM", 0);   /* prefill synthetic KV to this ctx, decode from there */
+    const char *prompt_path = getenv("DS4F_PROMPT_IDS");
+    const char *gen_out = getenv("DS4F_GEN_OUT");
+    int gen_mode = prompt_path && *prompt_path;
+    int max_new = envi("DS4F_MAX_NEW", maxgen);
+    int *prompt_ids = NULL, n_prompt = 0;
+    if (gen_mode) {
+        if (read_prompt_ids(prompt_path, &prompt_ids, &n_prompt) != 0) {
+            fprintf(stderr, "cannot read DS4F_PROMPT_IDS=%s\n", prompt_path);
+            return 1;
+        }
+        prefill = n_prompt;
+        maxgen = max_new;
+        ctx_warm = 0;
+    }
 
     ds4f_config cfg = ds4f_config_from_env();
     cfg.max_pos = maxpos;
@@ -105,8 +156,12 @@ int main(void) {
     int dense_mxfp4 = envi("DS4F_DENSE_MXFP4", 0);      /* overrides FP8/BF16: 0.53 B/elem */
     const char *pv_e = getenv("DS4F_BF16_PV");          /* auto-on with predequant unless explicitly set */
     int bf16_pv = (pv_e && *pv_e) ? (atoi(pv_e) != 0) : dense_bf16;
+    ds4f_runtime_options arena_opt = ds4f_runtime_options_debug_env(
+        cfg, NULL, ep_rank, ep_size, n_threads, n_cmgs);
+    arena_opt.cfg = cfg;
     size_t arena_est = ds4f_arena_size(&cfg, ep_rank, ep_size, dense_bf16,
-                                       envi("DS4F_TIERB2", 0) && !envi("DS4F_INT8_KV", 0));
+                                       envi("DS4F_TIERB2", 0) && !envi("DS4F_INT8_KV", 0),
+                                       &arena_opt);
     const char *dlabel = dense_mxfp4 ? "MXFP4(split,0.53B)" :
                          dense_bf16 ? (bf16_pv ? "BF16(predequant,pv)" : "BF16(predequant)") : "FP8(on-demand)";
     printf("arena reservation: %.2f GB   dense=%s\n", arena_est / (1024.0*1024.0*1024.0), dlabel);
@@ -120,9 +175,24 @@ int main(void) {
     int real_weights = envi("DS4F_REAL", 0);
     const char *blob_dir = getenv("DS4F_STAGE_DIR");
     double t_alloc0 = now_sec();
-    ds4f_model *m = real_weights
-        ? ds4f_load_real(cfg, ep_rank, ep_size, blob_dir, n_threads, n_cmgs)
-        : ds4f_alloc_synth(cfg, ep_rank, ep_size, n_threads, n_cmgs);
+    /* The real Flash checkpoint's exact graph includes mHC and Tier-B2.  The
+     * legacy ds4f_load_real wrapper only mirrors environment switches, so a
+     * standalone `DS4F_EXACT=1` generation previously omitted both unless the
+     * caller knew to set two additional implementation flags.  That evaluates
+     * an incompatible graph and produces incoherent continuations.  Match the
+     * serving loader's real-exact configuration here. */
+    ds4f_model *m;
+    if (real_weights) {
+        ds4f_runtime_options load_opt = ds4f_runtime_options_debug_env(
+            cfg, blob_dir, ep_rank, ep_size, n_threads, n_cmgs);
+        if (load_opt.exact) {
+            load_opt.mhc = 1;
+            load_opt.tierb2 = 1;
+        }
+        m = ds4f_load_real_opts(&load_opt);
+    } else {
+        m = ds4f_alloc_synth(cfg, ep_rank, ep_size, n_threads, n_cmgs);
+    }
     if (!m) { fprintf(stderr, "model alloc/load failed\n"); return 1; }
     double t_alloc = now_sec() - t_alloc0;
     size_t rss = rss_bytes();
@@ -166,6 +236,7 @@ int main(void) {
     sm_state = 0xD5F00D ^ ((uint64_t)ep_rank << 32);
     double t_pf = 0; size_t pf_bytes = 0;
     int nan_count = 0; double xnorm = 0.0;
+    int pf_last_tok = -1;
 
     if (prefill_check && prefill_batch > 0 && prefill > 0) {
         /* ---- correctness mode: batched vs token-at-a-time on identical inputs ---- */
@@ -228,9 +299,17 @@ int main(void) {
         /* ---- prefill (sequential token-at-a-time) ---- */
         double t_pf0 = now_sec();
         for (int p = 0; p < prefill; p++) {
-            for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
+            if (gen_mode) {
+                if (embed_lookup(m, prompt_ids[p], x) != 0) {
+                    fprintf(stderr, "real generation needs replicated embedding "
+                                    "(set DS4F_TP_EMBED=0)\n");
+                    free(prompt_ids); free(x); ds4f_free(m); return 1;
+                }
+            } else {
+                for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
+            }
             m->bytes_read = 0;
-            ds4f_forward_token(m, x, p);
+            pf_last_tok = ds4f_forward_token(m, x, p);
             pf_bytes += m->bytes_read;
         }
         t_pf = now_sec() - t_pf0;
@@ -274,13 +353,35 @@ int main(void) {
     memset(m->prof, 0, sizeof(m->prof));
     double t_dec0 = now_sec();
     size_t dec_bytes = 0;
-    int last_tok = 0;
+    int last_tok = pf_last_tok, n_gen = 0, dec_steps = 0;
+    int *gen_ids = gen_mode ? (int *)malloc((size_t)(maxgen + 1) * sizeof(int)) : NULL;
     for (int g = 0; g < maxgen; g++) {
+        if (gen_mode) {
+            gen_ids[n_gen++] = last_tok;
+            if (last_tok == DS4F_EOS_ID) break;
+            if (embed_lookup(m, last_tok, x) != 0) {
+                fprintf(stderr, "generated token %d has no local embedding\n", last_tok);
+                free(gen_ids); free(prompt_ids); free(x); ds4f_free(m); return 1;
+            }
+        } else {
+            for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
+        }
         int pos = dec_base + g;
-        for (int i = 0; i < C; i++) x[i] = (float)(sm_next() * 2.0 - 1.0);
         m->bytes_read = 0;
         last_tok = ds4f_forward_token(m, x, pos);
         dec_bytes += m->bytes_read;
+        dec_steps++;
+    }
+    if (gen_mode) maxgen = dec_steps;  /* throughput counts actual decode forwards */
+    if (gen_mode && gen_out && *gen_out) {
+        FILE *f = fopen(gen_out, "w");
+        if (!f) fprintf(stderr, "warning: cannot write DS4F_GEN_OUT=%s\n", gen_out);
+        else {
+            for (int i = 0; i < n_gen; ++i)
+                fprintf(f, "%d%s", gen_ids[i], i + 1 < n_gen ? " " : "\n");
+            fclose(f);
+            printf("generated %d token ids -> %s\n", n_gen, gen_out);
+        }
     }
     double t_dec = now_sec() - t_dec0;
 
@@ -307,6 +408,8 @@ int main(void) {
     }
 
     printf("\nRSS final=%.2f GB  (budget 32 GB/node)\n", rss_bytes()/(1024.0*1024.0*1024.0));
+    free(gen_ids);
+    free(prompt_ids);
     free(x);
     ds4f_free(m);
     return 0;

@@ -1,0 +1,252 @@
+#define _GNU_SOURCE
+#include "ds41f_engram.h"
+#include "ds41f_profile.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+struct ds41f_engram_row { uint64_t key; uint16_t value[DS41F_ENGRAM_DIM]; };
+void ds41f_engram_clear_rows(ds41f_engram *e)
+{
+    if(!e)return;
+    for(int i=0;i<DS41F_ENGRAM_LAYERS;++i)if(e->table[i].row_cache)
+        memset(e->table[i].row_cache,255,e->table[i].row_cache_entries*sizeof(struct ds41f_engram_row));
+}
+int ds41f_engram_cache_rows(ds41f_engram *e,size_t budget,size_t *allocated)
+{
+    if(allocated)*allocated=0;
+    if(!e)return EINVAL;
+    for(int i=0;i<DS41F_ENGRAM_LAYERS;++i)if(e->table[i].row_cache)return EINVAL;
+    size_t maximum=budget/DS41F_ENGRAM_LAYERS/sizeof(struct ds41f_engram_row);
+    if(!maximum)return ENOMEM;
+    size_t count=1;while(count<=maximum/2)count*=2;
+    for(int i=0;i<DS41F_ENGRAM_LAYERS;++i){
+        e->table[i].row_cache=malloc(count*sizeof(struct ds41f_engram_row));
+        if(!e->table[i].row_cache){for(int j=0;j<i;++j){free(e->table[j].row_cache);e->table[j].row_cache=NULL;e->table[j].row_cache_entries=0;}return ENOMEM;}
+        e->table[i].row_cache_entries=count;
+    }
+    ds41f_engram_clear_rows(e);
+    if(allocated)*allocated=count*DS41F_ENGRAM_LAYERS*sizeof(struct ds41f_engram_row);
+    return 0;
+}
+
+static const uint64_t table_rows[DS41F_ENGRAM_LAYERS] = {
+    UINT64_C(384006168), UINT64_C(384016682)
+};
+static const int table_layers[DS41F_ENGRAM_LAYERS] = { 1, 14 };
+
+static int load_meta(ds41f_engram *e, const char *stage)
+{
+    char path[2048]; snprintf(path, sizeof path, "%s/engram_meta.bin", stage);
+    FILE *f = fopen(path, "rb");
+    if (!f) return errno == ENOENT ? 0 : errno;
+    char magic[9]; uint32_t raw, compressed, heads;
+    if (fread(magic, 1, 9, f) != 9 || memcmp(magic, "DS41FENG1", 9) ||
+        fread(&raw, sizeof raw, 1, f) != 1 || fread(&compressed, sizeof compressed, 1, f) != 1 ||
+        fread(&heads, sizeof heads, 1, f) != 1 || raw != 129280 || compressed != 99092 || heads != 8) {
+        fclose(f); return EINVAL;
+    }
+    uint32_t *map = malloc(129280 * sizeof *map);
+    if (!map || fread(map, sizeof *map, 129280, f) != 129280 ||
+        fread(e->multipliers, sizeof e->multipliers, 1, f) != 1 ||
+        fread(e->primes, sizeof e->primes, 1, f) != 1) {
+        free(map); fclose(f); return EIO;
+    }
+    for (size_t i = 0; i < 129280; ++i) {
+        if (map[i] >= compressed) {free(map);fclose(f);return EINVAL;}
+        e->token_map[i] = map[i];
+    }
+    free(map); fclose(f);
+    for (int l=0;l<2;++l) {
+        uint64_t total=0;
+        for (int j=0;j<4;++j)
+            if (!(e->multipliers[l][j]&1) || e->multipliers[l][j] > INT64_MAX/compressed)
+                return EINVAL;
+        for (int n=0;n<3;++n) for (int h=0;h<8;++h) {
+            uint64_t prime=e->primes[l][n][h];
+            if (!prime || prime>table_rows[l]-total) return EINVAL;
+            total+=prime;
+        }
+        if (total!=table_rows[l]) return EINVAL;
+    }
+    return 0;
+}
+
+static float fp8_e4m3(uint8_t x)
+{
+    int sign = x & 0x80 ? -1 : 1;
+    int exp = (x >> 3) & 0xf;
+    int mant = x & 7;
+    if (!exp) return sign * ldexpf((float)mant, -9);
+    if (exp == 15 && mant == 7) return NAN;
+    return sign * ldexpf(1.0f + mant / 8.0f, exp - 7);
+}
+
+static float e8m0(uint8_t x)
+{
+    return x == 255 ? NAN : ldexpf(1.0f, (int)x - 127);
+}
+
+static int open_layer(ds41f_engram *e, const char *stage, int i)
+{
+    char wp[2048], sp[2048];
+    snprintf(wp, sizeof wp, "%s/layer%d.weight", stage, table_layers[i]);
+    snprintf(sp, sizeof sp, "%s/layer%d.scale", stage, table_layers[i]);
+    e->table[i].weight_fd = open(wp, O_RDONLY);
+    if (e->table[i].weight_fd < 0 && errno == ENOENT) {
+        snprintf(wp, sizeof wp, "%s/layers.%d.engram.embed.weight.bin", stage, table_layers[i]);
+        snprintf(sp, sizeof sp, "%s/layers.%d.engram.embed.scale.bin", stage, table_layers[i]);
+        e->table[i].weight_fd = open(wp, O_RDONLY);
+    }
+    e->table[i].scale_fd = open(sp, O_RDONLY);
+    if (e->table[i].weight_fd < 0 || e->table[i].scale_fd < 0) return errno;
+    e->table[i].rows = table_rows[i];
+    e->table[i].first = ((table_rows[i] + e->table[i].ranks - 1) /
+                         e->table[i].ranks) * e->table[i].rank;
+    if (e->table[i].first >= table_rows[i]) e->table[i].first = table_rows[i];
+    e->table[i].owned_rows = e->table[i].first < table_rows[i] ?
+        table_rows[i] - e->table[i].first : 0;
+    if (e->table[i].owned_rows > (table_rows[i] + e->table[i].ranks - 1) /
+        e->table[i].ranks)
+        e->table[i].owned_rows = (table_rows[i] + e->table[i].ranks - 1) /
+                                 e->table[i].ranks;
+    return 0;
+}
+
+int ds41f_engram_open(ds41f_engram *e, const char *stage, uint32_t rank,
+                      uint32_t ranks)
+{
+    if (!e || !stage || !ranks || ranks > DS41F_ENGRAM_MAX_RANKS || rank >= ranks)
+        return EINVAL;
+    memset(e, 0, sizeof *e);
+    for (int i = 0; i < DS41F_ENGRAM_LAYERS; ++i) {
+        e->table[i].rank = rank; e->table[i].ranks = ranks;
+        e->table[i].weight_fd = e->table[i].scale_fd = -1;
+    }
+    for (int i = 0; i < DS41F_ENGRAM_LAYERS; ++i) {
+        int rc = open_layer(e, stage, i);
+        if (rc) { ds41f_engram_close(e); return rc; }
+    }
+    int rc = load_meta(e, stage);
+    if (rc) { ds41f_engram_close(e); return rc; }
+    return 0;
+}
+
+void ds41f_engram_close(ds41f_engram *e)
+{
+    if (!e) return;
+    for (int i = 0; i < DS41F_ENGRAM_LAYERS; ++i) {
+        if (e->table[i].weight_fd >= 0) close(e->table[i].weight_fd);
+        if (e->table[i].scale_fd >= 0) close(e->table[i].scale_fd);
+        free(e->table[i].scale_cache);e->table[i].scale_cache=NULL;
+        free(e->table[i].row_cache);e->table[i].row_cache=NULL;e->table[i].row_cache_entries=0;
+        e->table[i].weight_fd = e->table[i].scale_fd = -1;
+    }
+}
+
+int ds41f_engram_cache_scales(ds41f_engram *e,size_t budget)
+{
+    if(!e)return EINVAL;
+    size_t bytes[2],total=0;int rc=0;
+    for(int i=0;i<2;++i){
+        if(e->table[i].scale_cache||e->table[i].scale_fd<0||
+           e->table[i].owned_rows>SIZE_MAX/8)return EINVAL;
+        bytes[i]=(size_t)e->table[i].owned_rows*8;
+        if(bytes[i]>budget-total)return ENOMEM;
+        total+=bytes[i];
+        struct stat st;if(fstat(e->table[i].scale_fd,&st))return errno;
+        if(st.st_size<0||(uint64_t)st.st_size!=bytes[i])return EINVAL;
+    }
+    for(int i=0;i<2;++i){
+        if(!bytes[i])continue;
+        e->table[i].scale_cache=malloc(bytes[i]);
+        if(!e->table[i].scale_cache){rc=ENOMEM;break;}
+        size_t offset=0;
+        while(offset<bytes[i]){size_t n=bytes[i]-offset;if(n>8*1024*1024)n=8*1024*1024;
+            ssize_t got=pread(e->table[i].scale_fd,e->table[i].scale_cache+offset,n,(off_t)offset);
+            if(got<0&&errno==EINTR)continue;
+            if(got<=0){rc=got<0?errno:EIO;break;}
+            posix_fadvise(e->table[i].scale_fd,(off_t)offset,got,POSIX_FADV_DONTNEED);
+            offset+=(size_t)got;
+        }
+        if(rc)break;
+    }
+    if(rc)for(int i=0;i<2;++i){free(e->table[i].scale_cache);e->table[i].scale_cache=NULL;}
+    return rc;
+}
+
+/* The production caller loads the exact token_map/multipliers generated by
+ * make_token_map.py. Without that file, token IDs are treated as already
+ * compressed and the zero-initialized metadata is unsuitable for lookup. */
+int ds41f_engram_hash_ids(ds41f_engram *e, uint32_t token,
+                          uint64_t ids[DS41F_ENGRAM_LAYERS][DS41F_ENGRAM_HASH_COLS])
+{
+    if (!e || !ids || token >= 129280) return EINVAL;
+    if (!e->primes[0][0][0] || !e->multipliers[0][0]) return ENOENT;
+    uint32_t pad = (uint32_t)e->token_map[2];
+    uint32_t compressed = (uint32_t)e->token_map[token];
+    uint32_t t[4] = { pad, pad, pad, compressed };
+    for (uint32_t i = 0; i < e->history_len && i < 3; ++i)
+        t[2 - i] = e->history[e->history_len - 1 - i];
+    for (int l = 0; l < DS41F_ENGRAM_LAYERS; ++l) {
+        for (int n = 0; n < 3; ++n) {
+            uint64_t rolling = 0;
+            for (int j = 0; j <= n + 1; ++j)
+                rolling ^= (uint64_t)t[3 - j] * e->multipliers[l][j];
+            uint64_t offset = 0;
+            for (int prior = 0; prior < n; ++prior)
+                for (int ph = 0; ph < DS41F_ENGRAM_HEADS; ++ph)
+                    offset += e->primes[l][prior][ph];
+            for (int h = 0; h < DS41F_ENGRAM_HEADS; ++h) {
+                if (!e->primes[l][n][h]) return EINVAL;
+                ids[l][n * DS41F_ENGRAM_HEADS + h] = offset + rolling % e->primes[l][n][h];
+                offset += e->primes[l][n][h];
+            }
+        }
+    }
+    if (e->history_len < 3) e->history[e->history_len++] = compressed;
+    else { e->history[0] = e->history[1]; e->history[1] = e->history[2]; e->history[2] = compressed; }
+    return 0;
+}
+
+int ds41f_engram_read_local(ds41f_engram *e, int layer, uint64_t row,
+                            uint16_t *out)
+{
+    if (!e || !out || layer < 0 || layer >= DS41F_ENGRAM_LAYERS) return EINVAL;
+    ds41f_engram_table *t = &e->table[layer];
+    if (row < t->first || row >= t->first + t->owned_rows) return ERANGE;
+    uint64_t local = row - t->first;
+    struct ds41f_engram_row *entry=NULL;
+    if(t->row_cache){uint64_t hash=(local*UINT64_C(11400714819323198485))^(local>>17);
+        entry=t->row_cache+(hash&(t->row_cache_entries-1));
+        if(entry->key==row){memcpy(out,entry->value,sizeof entry->value);
+            ++t->row_cache_hits;++t->lookups;++t->local_rows;return 0;}
+        ++t->row_cache_misses;
+    }
+    uint8_t v[DS41F_ENGRAM_DIM], sc[DS41F_ENGRAM_DIM / 32];
+    double pt=P_BEGIN();
+    ssize_t a = pread(t->weight_fd, v, sizeof v, (off_t)(local * sizeof v));
+    ssize_t b;
+    if(t->scale_cache){memcpy(sc,t->scale_cache+local*sizeof sc,sizeof sc);b=sizeof sc;}
+    else b=pread(t->scale_fd, sc, sizeof sc, (off_t)(local * sizeof sc));
+    if (a != (ssize_t)sizeof v || b != (ssize_t)sizeof sc) return EIO;
+    P_END(ENGRAM_READ,pt);pt=P_BEGIN();
+    for (int i = 0; i < DS41F_ENGRAM_DIM; ++i) {
+        float x = fp8_e4m3(v[i]) * e8m0(sc[i / 32]);
+        /* The benchmark consumes BF16 rows; conversion is intentionally local
+         * and independent of the model's later wkv projection. */
+        union { float f; uint32_t u; } bits = { x };
+        out[i] = isnan(x) ? (uint16_t)((bits.u >> 16) | 0x40) :
+            (uint16_t)((bits.u + 0x7fff + ((bits.u >> 16) & 1)) >> 16);
+    }
+    P_END(ENGRAM_DECODE,pt);
+    if(entry){memcpy(entry->value,out,sizeof entry->value);entry->key=row;}
+    ++t->lookups; ++t->local_rows;
+    return 0;
+}

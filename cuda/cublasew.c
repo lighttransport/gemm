@@ -32,6 +32,7 @@ typedef int cublasComputeType_t;
 typedef int cublasSideMode_t;
 
 enum {
+    CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 = 2,
     CUBLAS_STATUS_SUCCESS = 0,
     CUBLAS_OP_N = 0,
     CUBLAS_OP_T = 1,
@@ -71,6 +72,8 @@ enum {
     CUBLASLT_MATMUL_DESC_B_SCALE_POINTER = 18,
     CUBLASLT_MATMUL_DESC_C_SCALE_POINTER = 19,
     CUBLASLT_MATMUL_DESC_D_SCALE_POINTER = 20,
+    CUBLASLT_MATMUL_DESC_A_SCALE_MODE = 31,
+    CUBLASLT_MATMUL_DESC_B_SCALE_MODE = 32,
 
     CUBLASLT_MATMUL_PREF_SEARCH_MODE = 0,
     CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES = 1,
@@ -84,6 +87,11 @@ enum {
     CUBLASLT_EPILOGUE_GELU = 32,
     CUBLASLT_EPILOGUE_GELU_BIAS = 36,
     CUBLASLT_ORDER_ROW = 1
+};
+
+enum {
+    CUBLASLT_MATMUL_MATRIX_SCALE_VEC128_32F = 4,
+    CUBLASLT_MATMUL_MATRIX_SCALE_BLK128x128_32F = 5
 };
 
 typedef void *cublasLtHandle_t;
@@ -1053,6 +1061,50 @@ int cublasew_gemm_f16_f32_rowmajor_nt(cublasew_context *ctx,
 
     /* Blackwell fallback: caller must provide F16 input buffer via d_X_f16 */
     return -1;
+}
+
+int cublasew_gemm_fp8_scaled_rowmajor_nt(cublasew_context *ctx,
+                                         CUdeviceptr d_Y,
+                                         CUdeviceptr d_W_fp8,
+                                         CUdeviceptr d_W_scale,
+                                         CUdeviceptr d_X_fp8,
+                                         CUdeviceptr d_X_scale,
+                                         int n_tok, int n_out, int n_in) {
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasLtMatmulDesc_t desc = NULL;
+    cublasLtMatrixLayout_t al = NULL, bl = NULL, dl = NULL;
+    cublasLtMatmulHeuristicResult_t heur;
+    int op_n = CUBLAS_OP_N, row = CUBLASLT_ORDER_ROW;
+    int asmode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+    int bsmode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+    void *asp = (void *)(uintptr_t)d_X_scale, *bsp = (void *)(uintptr_t)d_W_scale;
+    cublasStatus_t st = -1;
+    if (!ctx || !ctx->lt_handle || !g_cublaslt_available) return -1;
+    if (p_cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) goto done;
+    if (p_cublasLtMatmulDescSetAttribute(desc,CUBLASLT_MATMUL_DESC_TRANSA,&op_n,sizeof(op_n)) ||
+        p_cublasLtMatmulDescSetAttribute(desc,CUBLASLT_MATMUL_DESC_TRANSB,&op_n,sizeof(op_n)) ||
+        p_cublasLtMatmulDescSetAttribute(desc,CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,&asp,sizeof(asp)) ||
+        p_cublasLtMatmulDescSetAttribute(desc,CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,&bsp,sizeof(bsp)) ||
+        p_cublasLtMatmulDescSetAttribute(desc,CUBLASLT_MATMUL_DESC_A_SCALE_MODE,&asmode,sizeof(asmode)) ||
+        p_cublasLtMatmulDescSetAttribute(desc,CUBLASLT_MATMUL_DESC_B_SCALE_MODE,&bsmode,sizeof(bsmode))) goto done;
+    if (p_cublasLtMatrixLayoutCreate(&al,CUDA_R_8F_E4M3,n_tok,n_in,n_in) ||
+        p_cublasLtMatrixLayoutSetAttribute(al,CUBLASLT_MATRIX_LAYOUT_ORDER,&row,sizeof(row)) ||
+        p_cublasLtMatrixLayoutCreate(&bl,CUDA_R_8F_E4M3,n_in,n_out,n_in) ||
+        p_cublasLtMatrixLayoutCreate(&dl,CUDA_R_32F,n_tok,n_out,n_out) ||
+        p_cublasLtMatrixLayoutSetAttribute(dl,CUBLASLT_MATRIX_LAYOUT_ORDER,&row,sizeof(row))) goto done;
+    memset(&heur,0,sizeof(heur));
+    if (cublasewLtGetHeuristic(ctx->lt_handle,desc,al,bl,dl,dl,ctx->pref,&heur,
+                               "fp8_scaled_nt",n_tok,n_out,n_in)) goto done;
+    st=p_cublasLtMatmul(ctx->lt_handle,desc,&alpha,
+        (void *)(uintptr_t)d_X_fp8,al,(void *)(uintptr_t)d_W_fp8,bl,&beta,
+        (void *)(uintptr_t)d_Y,dl,(void *)(uintptr_t)d_Y,dl,&heur.algo,
+        (void *)(uintptr_t)ctx->d_workspace,ctx->workspace_bytes,ctx->stream);
+done:
+    if (dl) p_cublasLtMatrixLayoutDestroy(dl);
+    if (bl) p_cublasLtMatrixLayoutDestroy(bl);
+    if (al) p_cublasLtMatrixLayoutDestroy(al);
+    if (desc) p_cublasLtMatmulDescDestroy(desc);
+    return st==CUBLAS_STATUS_SUCCESS?0:-1;
 }
 
 int cublasew_gemm_f16_f16_f32_rowmajor_nt(cublasew_context *ctx,

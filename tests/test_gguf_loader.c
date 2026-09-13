@@ -86,12 +86,18 @@ static void print_kv(const gguf_kv *kv, int snip_n) {
 int main(int argc, char **argv) {
     const char *path = "/mnt/disk1/models/qwen3-vl-embedding-8b-q4_k_m.gguf";
     int snip_n = DEFAULT_SNIP_N;
+    int all_names = 0;
+    int multi = 0;
 
     /* parse args: [path] [-n snip_count] */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             snip_n = atoi(argv[++i]);
             if (snip_n <= 0) snip_n = DEFAULT_SNIP_N;
+        } else if (strcmp(argv[i], "--multi") == 0) {
+            multi = 1;
+        } else if (strcmp(argv[i], "--all-names") == 0) {
+            all_names = 1;
         } else {
             path = argv[i];
         }
@@ -99,7 +105,7 @@ int main(int argc, char **argv) {
 
     printf("Loading: %s\n", path);
     printf("Array snip: first/last %d items\n", snip_n);
-    gguf_context *ctx = gguf_open(path, 1);
+    gguf_context *ctx = multi ? gguf_open_multi(path, 1) : gguf_open(path, 1);
     if (!ctx) { fprintf(stderr, "Failed to open GGUF file\n"); return 1; }
 
     printf("Version:   %u\n", ctx->version);
@@ -122,6 +128,11 @@ int main(int argc, char **argv) {
         printf("]  size=%zu  data=%s\n",
                gguf_tensor_size(ctx, (int)i),
                gguf_tensor_data(ctx, (int)i) ? "OK" : "NULL");
+    }
+    if (all_names) {
+        printf("\n--- All tensor names ---\n");
+        for (uint64_t i = 0; i < ctx->n_tensors; i++)
+            printf("%" PRIu64 " %s\n", i, ctx->tensors[i].name.str);
     }
 
     gguf_close(ctx);

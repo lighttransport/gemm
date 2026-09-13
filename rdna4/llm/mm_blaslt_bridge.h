@@ -29,6 +29,13 @@ int  mm_blaslt_run_bf16(void *d_y_f32, const void *d_w_bf16,
                        const void *d_x_bf16,
                        int M, int N, int K, void *stream);
 
+/* Strided-batched form. Matrices are tightly packed with strides N*K, M*K,
+ * and M*N elements for W, X, and Y respectively. */
+int mm_blaslt_run_bf16_strided_batch(void *d_y_f32, const void *d_w_bf16,
+                                     const void *d_x_bf16,
+                                     int M, int N, int K, int batch_count,
+                                     void *stream);
+
 /* Same as mm_blaslt_run_bf16 but with fused F32 bias epilogue: Y = X*W^T + bias[N].
  * bias may be NULL — in that case behavior matches mm_blaslt_run_bf16. */
 int  mm_blaslt_run_bf16_bias(void *d_y_f32, const void *d_w_bf16,

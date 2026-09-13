@@ -97,6 +97,9 @@ thipMalloc3D hipMalloc3D = NULL;
 thipFree hipFree = NULL;
 thipMallocHost hipMallocHost = NULL;
 thipHostMalloc hipHostMalloc = NULL;
+thipHostRegister hipHostRegister = NULL;
+thipHostGetDevicePointer hipHostGetDevicePointer = NULL;
+thipHostUnregister hipHostUnregister = NULL;
 thipFreeHost hipFreeHost = NULL;
 thipHostFree hipHostFree = NULL;
 thipMallocManaged hipMallocManaged = NULL;
@@ -200,6 +203,21 @@ static DynamicLibrary dynamic_library_open_find(const char** paths)
     return NULL;
 }
 
+/* Some ROCm packages install the core runtime below a versioned prefix (for
+ * example /opt/rocm/core-7.14/lib) instead of the traditional /opt/rocm/lib.
+ * Let callers override that directory without requiring a link-time ROCm
+ * dependency, while keeping the historical search list below. */
+static DynamicLibrary dynamic_library_open_env(const char *env_name,
+                                               const char *soname)
+{
+    const char *dir = getenv(env_name);
+    if (!dir || !*dir) return NULL;
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/%s", dir, soname);
+    if (n < 0 || (size_t)n >= sizeof(path)) return NULL;
+    return dynamic_library_open(path);
+}
+
 static void rocewExit(void)
 {
     if (hip_lib != NULL) {
@@ -236,11 +254,15 @@ static int loadHIP(void)
         "/opt/rocm/lib/libamdhip64.so",
         "/opt/rocm/lib/libamdhip64.so.6",
         "/opt/rocm/lib/libamdhip64.so.5",
+        "/opt/rocm/core-7.14/lib/libamdhip64.so",
+        "/opt/rocm/core-7.14/lib/libamdhip64.so.7",
         NULL
     };
 #endif
 
-    hip_lib = dynamic_library_open_find(hip_paths);
+    hip_lib = dynamic_library_open_env("ROCEW_ROCM_LIB", "libamdhip64.so");
+    if (hip_lib == NULL)
+        hip_lib = dynamic_library_open_find(hip_paths);
     if (hip_lib == NULL) {
         return ROCEW_ERROR_OPEN_FAILED;
     }
@@ -286,8 +308,13 @@ static int loadHIP(void)
     HIP_LIBRARY_FIND(hipFree);
     HIP_LIBRARY_FIND(hipMallocHost);
     HIP_LIBRARY_FIND(hipHostMalloc);
+    HIP_LIBRARY_FIND(hipHostRegister);
+    HIP_LIBRARY_FIND(hipHostGetDevicePointer);
+    HIP_LIBRARY_FIND(hipHostUnregister);
     HIP_LIBRARY_FIND(hipFreeHost);
     HIP_LIBRARY_FIND(hipHostFree);
+    HIP_LIBRARY_FIND(hipHostRegister);
+    HIP_LIBRARY_FIND(hipHostUnregister);
     HIP_LIBRARY_FIND(hipMallocManaged);
     HIP_LIBRARY_FIND(hipMemcpy);
     HIP_LIBRARY_FIND(hipMemcpyAsync);
@@ -381,11 +408,15 @@ static int loadHIPRTC(void)
         "/opt/rocm/lib/libhiprtc.so",
         "/opt/rocm/lib/libhiprtc.so.6",
         "/opt/rocm/lib/libhiprtc.so.5",
+        "/opt/rocm/core-7.14/lib/libhiprtc.so",
+        "/opt/rocm/core-7.14/lib/libhiprtc.so.7",
         NULL
     };
 #endif
 
-    hiprtc_lib = dynamic_library_open_find(hiprtc_paths);
+    hiprtc_lib = dynamic_library_open_env("ROCEW_ROCM_LIB", "libhiprtc.so");
+    if (hiprtc_lib == NULL)
+        hiprtc_lib = dynamic_library_open_find(hiprtc_paths);
     if (hiprtc_lib == NULL) {
         return ROCEW_ERROR_HIPRTC_OPEN_FAILED;
     }

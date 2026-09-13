@@ -558,12 +558,17 @@ static void usage(const char *p) {
         "  --max-gen N               (default 32)\n"
         "  --max-seq N               (KV cache size, default 1024)\n"
         "  --image-size S            (longer-side target, default 384)\n"
-        "  --vit-dtype fp32|bf16|fp16 (default fp16)\n"
+        "  --vit-dtype fp32|bf16|fp16 (default bf16)\n"
         "  --vit-threads N           (vision encoder threads)\n"
         "  --llm-threads N           (LLM forward threads; default 1)\n"
         "  --no-deepstack            (disable deepstack injection)\n"
         "  --mmap                    (file-backed weights; slower per matvec)\n"
         "  --kv-dtype f32|f16|q8     (KV cache element format; default f16)\n"
+        "  --prefill-gemm            (batch contiguous hybrid prefill text)\n"
+        "  --mixed-iq-q8             (opt-in Q8 activations for mixed-IQ decode; lossy)\n"
+        "  --mixed-ffn-cache-mib N   (lossless decode weight cache; keeps 6 GiB available)\n"
+        "  --iq4-cache-mib N         (lossless IQ palette cache in worker-local HBM)\n"
+        "  --decode-barrier MODE     (default|flat-spin|cmg-spin|cmg-wait|flat-wait)\n"
         "  --seed N                  (rng seed; default time-based)\n"
         "  --serve-stdio             (persistent JSONL control mode; text-only)\n",
         p);
@@ -588,12 +593,18 @@ int main(int argc, char **argv) {
     int max_gen     = 32;
     int max_seq_len = 1024;
     int img_size    = 384;
-    int vit_dtype   = VIT_DTYPE_FP16;
+    /* Qwen3.8's mmproj is BF16-native; select the packed BF16 A64FX path by
+     * default while retaining --vit-dtype for explicit comparisons. */
+    int vit_dtype   = VIT_DTYPE_BF16;
     int vit_threads = 0;
     int llm_threads = 1;
     int use_deepstack = 1;
     int use_mmap_main = 0;
+    int use_prefill_gemm = 0;
     int serve_stdio = 0;
+    int mixed_ffn_cache_mib = 0;
+    int iq4_cache_mib = 0;
+    int decode_barrier = TF_DECODE_BARRIER_DEFAULT;
     unsigned seed   = (unsigned)time(NULL);
 
     /* Positionals: first .gguf = model, second .gguf = mmproj, first image = image */
@@ -619,6 +630,27 @@ int main(int argc, char **argv) {
             use_deepstack = 0;
         } else if (!strcmp(a, "--mmap")) {
             use_mmap_main = 1;
+        } else if (!strcmp(a, "--prefill-gemm")) {
+            use_prefill_gemm = 1;
+        } else if (!strcmp(a, "--mixed-iq-q8")) {
+            transformer_set_mixed_iq_q8(1);
+            fprintf(stderr, "mixed IQ decode: Q8 activations enabled (lossy)\n");
+        } else if ((!strcmp(a, "--mixed-ffn-cache-mib") || !strcmp(a,"--iq4-cache-mib")) && i+1 < argc) {
+            char *end = NULL;
+            long value = strtol(argv[++i], &end, 10);
+            if (!end || end == argv[i] || *end || value < 0 || value > 32768) {
+                fprintf(stderr, "%s requires 0..32768\n",a); return 1;
+            }
+            if (!strcmp(a,"--iq4-cache-mib")) iq4_cache_mib=(int)value;
+            else mixed_ffn_cache_mib = (int)value;
+        } else if (!strcmp(a, "--decode-barrier") && i+1 < argc) {
+            const char *value = argv[++i];
+            if (!strcmp(value,"default")) decode_barrier=TF_DECODE_BARRIER_DEFAULT;
+            else if (!strcmp(value,"flat-spin")) decode_barrier=TF_DECODE_BARRIER_FLAT_SPIN;
+            else if (!strcmp(value,"cmg-spin")) decode_barrier=TF_DECODE_BARRIER_CMG_SPIN;
+            else if (!strcmp(value,"cmg-wait")) decode_barrier=TF_DECODE_BARRIER_CMG_WAIT;
+            else if (!strcmp(value,"flat-wait")) decode_barrier=TF_DECODE_BARRIER_FLAT_WAIT;
+            else { fprintf(stderr,"invalid --decode-barrier: %s\n",value); return 1; }
         } else if (!strcmp(a, "--serve-stdio")) {
             serve_stdio = 1;
         } else if (!strcmp(a, "--kv-dtype") && i + 1 < argc) {
@@ -649,6 +681,11 @@ int main(int argc, char **argv) {
     if (!model_path) {
         fprintf(stderr, "error: <model.gguf> required\n");
         usage(argv[0]); return 1;
+    }
+    if ((serve_stdio && (mixed_ffn_cache_mib || iq4_cache_mib)) ||
+        (mixed_ffn_cache_mib && iq4_cache_mib)) {
+        fprintf(stderr, "decode caches require single-request mode; choose one cache representation\n");
+        return 1;
     }
     if (!user_prompt) {
         user_prompt = mmproj_path ? "Explain the image" : "Hello";
@@ -688,6 +725,7 @@ int main(int argc, char **argv) {
 
     transformer_model *model = transformer_load(gguf_main, max_seq_len);
     if (!model) { fprintf(stderr, "transformer_load failed\n"); return 1; }
+    transformer_set_decode_barrier(model, decode_barrier);
     if (llm_threads > 1) transformer_set_threads(model, llm_threads);
     transformer_numa_setup(model, gguf_main);
     /* Build A64FX panel layout after the (pinned) thread pool exists so each
@@ -721,6 +759,8 @@ int main(int argc, char **argv) {
     float           *vision_embd = NULL;
     int              n_vision_tokens = 0;
     int              vit_embd_dim    = 0;  /* per-token stride (proj_dim*(1+n_ds)) */
+    int              vision_grid_w   = 0;
+    int              vision_grid_h   = 0;
 
     if (mmproj_path) {
         t = mono_sec();
@@ -759,6 +799,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "      synth checkerboard %dx%d\n", img_w, img_h);
             img_rgb = make_checkerboard(img_w, img_h, 64);
         }
+        /* The encoder emits merged tokens in row-major order. Keep the
+         * merged grid so Qwen's M-RoPE receives spatial coordinates rather
+         * than the scalar position used by the old text-only fallback. */
+        vision_grid_w = img_w / (vm->patch_size * vm->spatial_merge);
+        vision_grid_h = img_h / (vm->patch_size * vm->spatial_merge);
 
         float *img_norm = vision_normalize_image(vm, img_rgb, img_w, img_h);
         free(img_rgb);
@@ -848,7 +893,8 @@ int main(int argc, char **argv) {
      * KV cache identically to the per-token path; returns last-token logits. NULL =>
      * unsupported (no KV written yet) => fall through to the per-token loops below. */
     int gemm_prefill_done = 0;
-    if (getenv("TF_PREFILL_GEMM") && n_vision_tokens == 0 && (n_before + n_after) > 0) {
+    if ((use_prefill_gemm || getenv("TF_PREFILL_GEMM")) &&
+        n_vision_tokens == 0 && (n_before + n_after) > 0) {
         int M = n_before + n_after;
         int32_t *toks = (int32_t *)malloc((size_t)M * sizeof(int32_t));
         if (toks) {
@@ -862,8 +908,18 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  TF_PREFILL_GEMM: unsupported config, using per-token prefill\n");
     }
 
+    /* Batch the short text prefix without an unused vocabulary projection. */
+    int prefix_done = 0;
+    if (!gemm_prefill_done && n_vision_tokens > 0 && n_before > 1 &&
+        (use_prefill_gemm || getenv("TF_PREFILL_GEMM")) &&
+        transformer_prefill_range(model, tokens_before, NULL, n_before, 0,
+                                  0, model->n_layers, TF_PREFILL_EMBED)) {
+        prefix_done = n_before;
+        pos = n_before;
+        fprintf(stderr, "  pre-vision text GEMM prefill: %d tokens\n", n_before);
+    }
     /* text before */
-    for (int i = 0; !gemm_prefill_done && i < n_before; i++) {
+    for (int i = prefix_done; !gemm_prefill_done && i < n_before; i++) {
         double tt0 = trace_per_tok ? mono_sec() : 0.0;
         transformer_forward(model, tokens_before[i], pos);
         if (trace_per_tok) {
@@ -876,14 +932,61 @@ int main(int argc, char **argv) {
     /* vision */
     if (n_vision_tokens > 0) {
         double tv0 = mono_sec();
-        for (int i = 0; i < n_vision_tokens; i++) {
+        int batched_visual = 0;
+        int *vpt = NULL, *vph = NULL, *vpw = NULL;
+        /* Keep the new token-major embedding batch path explicitly gated while
+         * its long multimodal prefill is being benchmarked. */
+        if (model->is_hybrid && model->ds_embd_stride == 0 &&
+            n_vision_tokens >= 32 &&
+            getenv("TF_PREFILL_EMBD_GEMM")) {
+            if (model->use_mrope && vision_grid_w > 0 && vision_grid_h > 0) {
+                vpt = (int *)malloc((size_t)n_vision_tokens * sizeof(int));
+                vph = (int *)malloc((size_t)n_vision_tokens * sizeof(int));
+                vpw = (int *)malloc((size_t)n_vision_tokens * sizeof(int));
+                if (vpt && vph && vpw) {
+                    for (int i = 0; i < n_vision_tokens; i++) {
+                        vpt[i] = 0;
+                        vph[i] = i / vision_grid_w;
+                        vpw[i] = i % vision_grid_w;
+                    }
+                }
+            }
+            const int *pt = (vpt && vph && vpw) ? vpt : NULL;
+            logits = transformer_prefill_embd(model, vision_embd, vit_embd_dim,
+                                              n_vision_tokens, pos, pt,
+                                              pt ? vph : NULL, pt ? vpw : NULL);
+            if (logits) {
+                pos += n_vision_tokens;
+                batched_visual = 1;
+                fprintf(stderr, "  batched vision prefill: %d tokens\n", n_vision_tokens);
+            } else fprintf(stderr, "  batched vision prefill unavailable; using token loop\n");
+        }
+        if (!batched_visual) for (int i = 0; i < n_vision_tokens; i++) {
             const float *embd_i = vision_embd + (size_t)i * vit_embd_dim;
-            transformer_forward_embd(model, embd_i, pos);
+            if (model->use_mrope && vision_grid_w > 0 && vision_grid_h > 0) {
+                int my = i / vision_grid_w;
+                int mx = i % vision_grid_w;
+                transformer_forward_embd_pos(model, embd_i, pos, 0, my, mx);
+            } else transformer_forward_embd(model, embd_i, pos);
             pos++;
         }
+        free(vpt); free(vph); free(vpw);
         double tv1 = mono_sec();
         fprintf(stderr, "  vision prefill: %.2f s (%.2f tok/s)\n",
                 tv1 - tv0, n_vision_tokens / (tv1 - tv0));
+    }
+    /* The visual segment needs per-token M-RoPE injection, but the text
+     * suffix is contiguous and can use Qwen3.8's batched hybrid prefill. */
+    if (!gemm_prefill_done && (use_prefill_gemm || getenv("TF_PREFILL_GEMM")) &&
+        n_vision_tokens > 0 && n_after > 0) {
+        logits = transformer_prefill_gemm(model, tokens_after, n_after, pos);
+        if (logits) {
+            pos += n_after;
+            gemm_prefill_done = 1;
+            fprintf(stderr, "  post-vision text GEMM prefill: %d tokens\n", n_after);
+        } else {
+            fprintf(stderr, "  post-vision TF_PREFILL_GEMM unsupported; using per-token prefill\n");
+        }
     }
     /* Make sure ds_embd doesn't leak into the post-vision text tokens.
      * transformer_forward_embd_pos already nulls ds_embd before returning,
@@ -915,6 +1018,18 @@ int main(int argc, char **argv) {
     fprintf(stderr, "prefill total: %.2f s (%d tokens, %.1f tok/s)\n",
             t_pre_end - t_pre, pos, pos / (t_pre_end - t_pre));
 
+    if (mixed_ffn_cache_mib || iq4_cache_mib) {
+        /* This runner encodes one image. Retire its packed vision cache before
+         * allocating the optional FFN cache; keep original LLM weights intact. */
+        if (cache) { vit_a64fx_cache_free(cache); cache = NULL; }
+        if (pool) { vlm_pool_free(pool); pool = NULL; }
+        double cache_start = mono_sec();
+        size_t cache_bytes = iq4_cache_mib ? transformer_cache_iq4_decode(model,(size_t)iq4_cache_mib*1048576) :
+            transformer_cache_mixed_ffn(model, (size_t)mixed_ffn_cache_mib*1048576);
+        fprintf(stderr, "%s cache setup: %.3f s, %.3f GiB (outside prefill/decode timings)\n",
+                iq4_cache_mib?"IQ4 decode":"mixed FFN",mono_sec()-cache_start, cache_bytes/1073741824.);
+    }
+
     /* ── generation ── */
     /* After prefill: pos == total_prompt; `logits` is the prediction for
      * position `total_prompt`. The first generated token therefore lives
@@ -923,13 +1038,18 @@ int main(int argc, char **argv) {
     fflush(stderr);
     transformer_pool_profile_reset(); /* steady-state decode profile only */
     double t_gen0 = mono_sec();
+    double decode_seconds = 0;
+    int decode_forwards = 0;
     int n_gen = 0;
     int32_t next = -1;
 
     for (int g = 0; g < max_gen; g++) {
         if (g > 0) {
             /* forward(next, pos) consumes the previous gen token at slot pos */
+            double decode_start = mono_sec();
             logits = transformer_forward_logits(model, next, pos);
+            decode_seconds += mono_sec() - decode_start;
+            decode_forwards++;
             pos++;
         }
         if (!logits) { fprintf(stderr, "\n[no logits]\n"); break; }
@@ -969,6 +1089,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "gen: %d tokens in %.2f s (%.2f tok/s)\n",
                 n_gen, t_gen1 - t_gen0, n_gen / (t_gen1 - t_gen0));
     }
+    if (decode_forwards && decode_seconds > 0)
+        fprintf(stderr, "decode: %d forwards in %.3f s (%.2f tok/s; excludes first token from prefill)\n",
+                decode_forwards, decode_seconds, decode_forwards / decode_seconds);
+    if (tf_dprof > 0)
+        fprintf(stderr, "decode profile (ms): SSM in=%.1f prepare=%.1f scan=%.1f out=%.1f "
+                "QKV=%.1f attn_out=%.1f FFN gate/up=%.1f down=%.1f head=%.1f\n",
+                tf_decode_ssm_in_ms, tf_decode_ssm_prepare_ms, tf_decode_ssm_core_ms,
+                tf_decode_ssm_out_ms, tf_decode_attn_qkv_ms, tf_decode_attn_out_ms,
+                tf_decode_ffn_gateup_ms, tf_decode_ffn_down_ms, tf_decode_lm_head_ms);
 
     prof_summary();
 

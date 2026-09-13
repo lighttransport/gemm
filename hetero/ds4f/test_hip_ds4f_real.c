@@ -1,0 +1,1212 @@
+/* Real-staged DS4F FP8 tensor A/B gate: CPU matvec versus HIPRTC matvec. */
+
+#include "../../common/ds4f.h"
+#include "hip_ds4f_dense.h"
+#include "dual_ds4f_prefill.h"
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+static double wall_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void usage(const char *prog) {
+    fprintf(stderr, "Usage: %s [--config file.json] [--stage-dir dir] [--model flash|ds4p|ds4fbase] "
+                    "[--ep-size n --ep-rank n --threads n --cmgs n --max-pos n] "
+                    "[--layers n --bank-layers n --iters n --pos0 n --warm n --decode-verify n --decode-min-cosine f "
+                    "--prefill-batch n --prefill-context n] "
+                    "[--hip-device n --hip-verbose 0|1 --hip-async 0|1 "
+                    "--hip-shared-bf16 0|1 --hip-shared-bf16-layers n "
+                    "--hip-shared-fp16 0|1 --hip-shared-fp16-layers n "
+                    "--hip-ordered-wkv-layers n "
+                    "--hip-ordered-fp8-layers n "
+                    "--hip-mxfp4-widen-layers n "
+                    "--hip-mxfp4-resident-layers n "
+                    "--hip-mxfp4-resident-auto 0|1 --hip-vram-reserve-mb n "
+                    "--hip-mxfp4-stream-raw 0|1 "
+                    "--hip-expert-cache-mb 0|auto|MB --hip-expert-cache-stats 0|1 "
+                    "--hip-prefill-attn 0|1 --hip-tb2-batch 0|1 --hip-qkv-fuse 0|1 "
+                    "--hip-qkv-device-chain 0|1 --hip-attn-device-chain 0|1 "
+                    "--hip-attn-no-d2h 0|1 --hip-routed-ffn 0|1 "
+                    "--hip-fp8-wmma 0|1|2 --hip-bf16-wmma 0|1 "
+                    "--hip-attn-wmma 0|1 --hip-oproj-group-wmma 0|1|2 "
+                    "--hip-mxfp4-wmma 0|1|2 --hip-block-threads 64|128|256 "
+                    "--hip-decode-routed-ffn 0|1 --hip-decode-qkv-fuse 0|1 "
+                    "--hip-decode-attn-oproj 0|1 --hip-decode-kv-resident 0|1 "
+                    "--hip-fused-shared-ffn 0|1 "
+                    "[--dual-gpu 0|1 --cuda-device n --dual-cuda-mxfp4 0|1 --dual-cuda-terms 1|2 "
+                    "--dual-cuda-small-buckets 0|1 --dual-cuda-resident-from n "
+                    "--prefill-repeat n] "
+                    "[--hip-mxfp4-gemm-test] [--hip-mxfp4-widened-gemm-test] "
+                    "--hip-exact-prefill 0|1] [--debug-env]\n", prog);
+}
+
+/* Set by --hip-fused-shared-ffn; see attach sites. */
+static int ds4f_fused_shared_ffn_on = 0;
+
+static int hip_async_enabled(const ds4f_runtime_options *opt) {
+    return opt->hip_async != 0;
+}
+
+static int hip_shared_bf16_layer(const ds4f_runtime_options *opt, int layer) {
+    return opt->hip_shared_bf16 &&
+           (opt->hip_shared_bf16_layers <= 0 || layer < opt->hip_shared_bf16_layers);
+}
+
+static int hip_shared_fp16_layer(const ds4f_runtime_options *opt, int layer) {
+    return opt->hip_shared_fp16 &&
+           (opt->hip_shared_fp16_layers <= 0 || layer < opt->hip_shared_fp16_layers);
+}
+
+static int hip_ordered_wkv_layer(const ds4f_runtime_options *opt, int layer) {
+    return opt->hip_ordered_wkv_layers > 0 &&
+           layer < opt->hip_ordered_wkv_layers;
+}
+
+static int hip_ordered_fp8_layer(const ds4f_runtime_options *opt, int layer) {
+    return opt->hip_ordered_fp8_layers > 0 && layer < opt->hip_ordered_fp8_layers;
+}
+
+static int hip_mxfp4_streaming(const ds4f_runtime_options *opt) {
+    return opt->hip_mxfp4_widen_layers > 0 ||
+           opt->hip_mxfp4_resident_layers > 0 ||
+           opt->hip_mxfp4_resident_auto;
+}
+
+static float max_rel_error(const float *a, const float *b, int n, float *max_abs) {
+    float rel = 0.0f, absmax = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float e = fabsf(a[i] - b[i]);
+        if (e > absmax) absmax = e;
+        float r = e / fmaxf(1.0f, fabsf(a[i]));
+        if (r > rel) rel = r;
+    }
+    *max_abs = absmax;
+    return rel;
+}
+
+static int cmp_float_asc(const void *pa, const void *pb) {
+    float a = *(const float *)pa, b = *(const float *)pb;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/* Distribution-level comparison for a reference/GPU logit pair. Log-sum-exp
+ * keeps the metrics stable even when logits have large magnitudes. The target
+ * is the reference argmax here because this synthetic prefill probe has no
+ * teacher-forced token labels; real-token gates can pass actual labels later. */
+static void report_distribution_metrics(const float *ref, const float *got,
+                                         int n, int ref_tok, double *kl_out,
+                                         double *ce_ref_out, double *ce_got_out,
+                                         int *top10_out) {
+    float mr = ref[0], mg = got[0];
+    for (int i = 0; i < n; ++i) {
+        if (ref[i] > mr) mr = ref[i];
+        if (got[i] > mg) mg = got[i];
+    }
+    double sr = 0.0, sg = 0.0;
+    for (int i = 0; i < n; ++i) { sr += exp((double)ref[i] - mr); sg += exp((double)got[i] - mg); }
+    double kl = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double pr = exp((double)ref[i] - mr) / sr;
+        double pg = exp((double)got[i] - mg) / sg;
+        if (pr > 0.0 && pg > 0.0) kl += pr * log(pr / pg);
+    }
+    int k = 10, top = 0;
+    int *ri = (int *)malloc((size_t)k * sizeof(*ri));
+    int *gi = (int *)malloc((size_t)k * sizeof(*gi));
+    for (int j = 0; j < k; ++j) { ri[j] = gi[j] = -1; }
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < k; ++j) if (ri[j] < 0 || ref[i] > ref[ri[j]]) {
+            for (int z = k - 1; z > j; --z) ri[z] = ri[z-1];
+            ri[j] = i; break;
+        }
+        for (int j = 0; j < k; ++j) if (gi[j] < 0 || got[i] > got[gi[j]]) {
+            for (int z = k - 1; z > j; --z) gi[z] = gi[z-1];
+            gi[j] = i; break;
+        }
+    }
+    for (int i = 0; i < k; ++i) for (int j = 0; j < k; ++j) if (ri[i] == gi[j]) top++;
+    double prt = exp((double)ref[ref_tok] - mr) / sr;
+    double pgt = exp((double)got[ref_tok] - mg) / sg;
+    *kl_out = kl; *ce_ref_out = -log(fmax(prt, 1e-30)); *ce_got_out = -log(fmax(pgt, 1e-30));
+    *top10_out = top;
+    free(ri); free(gi);
+}
+
+static int check_mxfp4_gemm(ds4f_model *m, hip_ds4f_dense *hip, int widened) {
+    if (!m || !m->mxfp4_raw || !m->layers[0].ex_w1 ||
+        m->layers[0].ex_w1[0].type != DS4F_MXFP4) {
+        printf("real MXFP4 GEMM: SKIP (raw MXFP4 expert bank unavailable)\n");
+        return 1;
+    }
+    ds4f_tensor *t = &m->layers[0].ex_w1[0];
+    const int M = 16, K = t->cols, N = t->rows;
+    float *x = (float *)ds4f_mem_alloc(m->mem, (size_t)M*K*4, 256, 0);
+    float *ref = (float *)ds4f_mem_alloc(m->mem, (size_t)M*N*4, 256, 0);
+    float *got = (float *)ds4f_mem_alloc(m->mem, (size_t)M*N*4, 256, 0);
+    if (!x || !ref || !got) return 0;
+    for (int i = 0; i < M*K; i++) x[i] = (float)((i * 17) % 101 - 50) / 31.0f;
+    int old_w4a8 = m->mxfp4_w4a8;
+    m->mxfp4_w4a8 = 0; /* compare the widened F32 LUT path first */
+    t->gpu_id = -1;
+    for (int mm = 0; mm < M; mm++)
+        ds4f_matvec(m, ref + (size_t)mm*N, t, x + (size_t)mm*K);
+    int id = widened
+        ? hip_ds4f_dense_bind_mxfp4_widened_tensor(hip, t)
+        : hip_ds4f_dense_bind_mxfp4_tensor(hip, t);
+    if (!widened && id >= 0) {
+        int mvrc = hip_ds4f_dense_matvec_tensor(hip, got, t, x);
+        float mvabs = 0.0f;
+        float mvrel = mvrc == 0 ? max_rel_error(ref, got, N, &mvabs) : 1.0f;
+        printf("real MXFP4 raw decode matvec: N=%d K=%d max_abs=%.8g max_rel=%.8g %s\n",
+               N, K, mvabs, mvrel,
+               mvrc == 0 && mvrel <= 2.0e-5f ? "PASS" : "FAIL");
+        if (mvrc != 0 || mvrel > 2.0e-5f) {
+            m->mxfp4_w4a8 = old_w4a8;
+            return 0;
+        }
+    }
+    int rc = id >= 0 ? hip_ds4f_dense_gemm_tensor(hip, got, t, x, M, N, K) : -1;
+    float absmax = 0.0f, rel = rc == 0 ? max_rel_error(ref, got, M*N, &absmax) : 1.0f;
+    double t0 = wall_seconds();
+    int bench_iters = 8;
+    for (int it = 0; rc == 0 && it < bench_iters; ++it)
+        rc = hip_ds4f_dense_gemm_tensor(hip, got, t, x, M, N, K);
+    double elapsed = wall_seconds() - t0;
+    printf("real MXFP4 %sGEMM: M=%d N=%d K=%d max_abs=%.8g max_rel=%.8g %s\n",
+           widened ? "widened FP8 " : "raw LUT ", M, N, K, absmax, rel,
+           rc == 0 && rel <= 2.0e-5f ? "PASS" : "FAIL");
+    if (rc == 0)
+        printf("real MXFP4 %sGEMM: %.3f ms/call %.1f batch-token/s\n",
+               widened ? "widened FP8 " : "raw LUT ",
+               elapsed * 1000.0 / bench_iters,
+               (double)(M * bench_iters) / elapsed);
+    m->mxfp4_w4a8 = old_w4a8;
+    return rc == 0 && rel <= 2.0e-5f;
+}
+
+static int forward_ab(ds4f_model *m, hip_ds4f_dense *hip,
+                      const ds4f_runtime_options *opt) {
+    const int C = m->cfg.hidden, V = m->cfg.vocab;
+    float *x_cpu = (float *)ds4f_mem_alloc(m->mem, (size_t)C * sizeof(float), 256, 0);
+    float *x_gpu = (float *)ds4f_mem_alloc(m->mem, (size_t)C * sizeof(float), 256, 0);
+    float *logits_cpu = (float *)ds4f_mem_alloc(m->mem, (size_t)V * sizeof(float), 256, 0);
+    if (!x_cpu || !x_gpu || !logits_cpu) {
+        fprintf(stderr, "real hybrid forward: allocation failed\n");
+        return 0;
+    }
+    for (int i = 0; i < C; ++i)
+        x_cpu[i] = x_gpu[i] = ((float)((i * 29) % 101) - 50.0f) / 37.0f;
+
+    /* Run both passes on the same model. Position zero overwrites the cache
+     * slot used by this check; all layer scratch is recomputed. */
+    m->gpu_dense_ctx = NULL;
+    m->gpu_dense_matvec = NULL;
+    m->gpu_dense_async_multi = NULL;
+    m->gpu_dense_wait = NULL;
+    int cpu_best = ds4f_forward_token(m, x_cpu, 0);
+    memcpy(logits_cpu, m->s_logits, (size_t)V * sizeof(float));
+    m->gpu_dense_ctx = hip;
+    m->gpu_dense_matvec = hip_ds4f_dense_matvec_tensor;
+    m->gpu_dense_async_multi = hip_async_enabled(opt)
+        ? hip_ds4f_dense_matvec_tensors_async : NULL;
+    m->gpu_dense_wait = hip_ds4f_dense_wait_tensors;
+    m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
+    m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
+    m->gpu_dense_layer_prefetch = NULL;
+    m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
+        ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_stream_layer_raw
+                                     : hip_ds4f_dense_stream_layer) : NULL;
+    m->gpu_dense_stream_prefill_only = hip_mxfp4_streaming(opt);
+    if (hip_mxfp4_streaming(opt))
+        m->mxfp4_w4a8 = 0;
+    int gpu_best = ds4f_forward_token(m, x_gpu, 0);
+
+    float x_abs = 0.0f, logits_abs = 0.0f;
+    float x_rel = max_rel_error(x_cpu, x_gpu, C, &x_abs);
+    float logits_rel = max_rel_error(logits_cpu, m->s_logits, V, &logits_abs);
+    int finite = 1;
+    for (int i = 0; i < C; ++i) if (!isfinite(x_gpu[i])) { finite = 0; break; }
+    for (int i = 0; i < V; ++i) if (!isfinite(m->s_logits[i])) { finite = 0; break; }
+    printf("real hybrid forward: x_max_abs=%.8g x_rel=%.8g "
+           "logits_max_abs=%.8g logits_rel=%.8g cpu_argmax=%d gpu_argmax=%d\n",
+           x_abs, x_rel, logits_abs, logits_rel, cpu_best, gpu_best);
+    m->gpu_dense_ctx = NULL;
+    m->gpu_dense_matvec = NULL;
+    m->gpu_dense_async_multi = NULL;
+    m->gpu_dense_wait = NULL;
+    m->gpu_dense_blockdiag = NULL;
+    m->gpu_dense_gemm = NULL;
+    m->gpu_dense_layer_begin = NULL;
+    m->gpu_dense_layer_prefetch = NULL;
+    m->gpu_dense_stream_prefill_only = 0;
+    m->gpu_dense_gemm_multi = NULL;
+    m->gpu_prefill_attn = NULL;
+    m->gpu_prefill_qkv = NULL;
+    m->gpu_prefill_qkv_enabled = 0;
+    m->gpu_qkv_device_chain = 0;
+    m->gpu_attn_device_chain = 0;
+    m->gpu_attn_no_d2h = 0;
+    m->gpu_routed_ffn_enabled = 0;
+    m->gpu_dense_mixed = 0;
+    int strict = x_rel <= 3.0e-4f && logits_rel <= 3.0e-4f;
+    if (!strict && m->cfg.n_layers > 1 && cpu_best == gpu_best && finite)
+        printf("real hybrid forward: cumulative multi-layer drift is above the "
+               "single-layer gate; argmax remains locked\n");
+    return cpu_best == gpu_best && finite &&
+           (strict || m->cfg.n_layers > 1);
+}
+
+
+static void detach_gpu_hooks(ds4f_model *m) {
+    m->gpu_dense_ctx = NULL;
+    m->gpu_dense_matvec = NULL;
+    m->gpu_dense_async_multi = NULL;
+    m->gpu_dense_wait = NULL;
+    m->gpu_dense_blockdiag = NULL;
+    m->gpu_dense_gemm = NULL;
+    m->gpu_dense_gemm_multi = NULL;
+    m->gpu_shared_ffn = NULL;
+    m->gpu_dense_layer_begin = NULL;
+    m->gpu_dense_layer_prefetch = NULL;
+    m->gpu_dense_stream_prefill_only = 0;
+    m->gpu_prefill_attn = NULL;
+    m->gpu_dense_mixed = 0;
+}
+
+static void attach_decode_hooks(ds4f_model *m, hip_ds4f_dense *hip,
+                                const ds4f_runtime_options *opt) {
+    m->gpu_dense_ctx = hip;
+    m->gpu_dense_matvec = hip_ds4f_dense_matvec_tensor;
+    m->gpu_dense_async_multi = hip_async_enabled(opt)
+        ? hip_ds4f_dense_matvec_tensors_async : NULL;
+    m->gpu_dense_wait = hip_ds4f_dense_wait_tensors;
+    m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
+    m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
+    m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
+    m->gpu_dense_layer_prefetch = NULL;
+    m->gpu_prefill_attn = (opt->hip_prefill_attn || opt->hip_decode_attn_oproj)
+        ? hip_ds4f_dense_prefill_attention : NULL;
+    m->gpu_decode_attn_enabled = opt->hip_decode_attn_oproj;
+    m->gpu_decode_attn_oproj_enabled = opt->hip_decode_attn_oproj;
+    m->gpu_decode_qkv_enabled = opt->hip_decode_qkv_fuse;
+    if (opt->hip_decode_qkv_fuse) m->gpu_prefill_qkv = hip_ds4f_dense_prefill_qkv;
+    hip_ds4f_dense_set_decode_features(hip, opt->hip_decode_kv_resident);
+    m->gpu_oproj = hip_ds4f_dense_oproj;
+    m->gpu_prefill_qkv = opt->hip_qkv_fuse ? hip_ds4f_dense_prefill_qkv : NULL;
+    m->gpu_routed_ffn = opt->hip_decode_routed_ffn ? hip_ds4f_dense_routed_ffn : NULL;
+    m->gpu_decode_routed_ffn_enabled = opt->hip_decode_routed_ffn;
+    m->gpu_prefill_qkv_enabled = opt->hip_qkv_fuse;
+    m->gpu_qkv_device_chain = opt->hip_qkv_device_chain;
+    m->gpu_attn_device_chain = opt->hip_attn_device_chain || opt->hip_decode_attn_oproj;
+    m->gpu_attn_no_d2h = opt->hip_attn_no_d2h || opt->hip_decode_attn_oproj;
+    hip_ds4f_dense_set_prefill_features(hip, opt->hip_qkv_fuse,
+        opt->hip_qkv_device_chain, m->gpu_attn_device_chain,
+        m->gpu_attn_no_d2h, opt->hip_fp8_wmma, opt->hip_bf16_wmma,
+        opt->hip_attn_wmma, opt->hip_oproj_group_wmma, opt->hip_mxfp4_wmma,
+        opt->hip_block_threads);
+    /* The legacy fused callback expects host-normalized Q.  With the device
+     * QKV chain enabled, use the separate attention -> device-resident O-proj
+     * callbacks instead; this preserves residency and performs qnorm/rope in
+     * the attention callback's proven path. */
+    m->gpu_prefill_attn_oproj = (opt->hip_prefill_attn && !opt->hip_qkv_device_chain)
+        ? hip_ds4f_dense_prefill_attn_oproj : NULL;
+    m->gpu_dense_mixed = 1;
+    m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
+        ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_stream_layer_raw
+                                     : hip_ds4f_dense_stream_layer) : NULL;
+    m->gpu_dense_stream_prefill_only = hip_mxfp4_streaming(opt);
+    if (hip_mxfp4_streaming(opt))
+        m->mxfp4_w4a8 = 0;
+}
+
+/* Multi-step CPU-referenced decode gate.
+ *
+ * forward_ab() checks one token at position 0.  Nothing checked whether the
+ * GPU decode path tracks the CPU path as a KV history accumulates, which is
+ * exactly where a reduction-order change would show up.  At each position the
+ * CPU pass runs first and the GPU pass reruns the SAME position, so both read
+ * an identical history and write the same cache slot; the GPU result is what
+ * survives into the next step.  Inputs are deterministic per position, so the
+ * comparison is teacher-forced rather than a free-running rollout (which
+ * diverges chaotically after any single flip and proves nothing). */
+static int decode_verify(ds4f_model *m, hip_ds4f_dense *hip, int steps,
+                         int pos0, int warm, float min_cosine,
+                         const ds4f_runtime_options *opt) {
+    const int C = m->cfg.hidden, V = m->cfg.vocab;
+    float *x_cpu = (float *)ds4f_mem_alloc(m->mem, (size_t)C * sizeof(float), 256, 0);
+    float *x_gpu = (float *)ds4f_mem_alloc(m->mem, (size_t)C * sizeof(float), 256, 0);
+    float *lg_cpu = (float *)ds4f_mem_alloc(m->mem, (size_t)V * sizeof(float), 256, 0);
+    if (!x_cpu || !x_gpu || !lg_cpu) {
+        fprintf(stderr, "real decode verify: allocation failed\n");
+        return 0;
+    }
+    if (pos0 < 1) pos0 = 1;
+    if (warm > 0) {
+        if (warm > pos0) warm = pos0;
+        ds4f_warm_kv(m, warm);
+        ds4f_warm_tb2(m, warm);
+    }
+    int mismatches = 0;
+    float worst_logit_rel = 0.0f;
+    double cosine_sum = 0.0;
+    float cosine_min = 1.0f;
+    int worst_step = -1;
+    for (int t = 0; t < steps; ++t) {
+        int pos = pos0 + t;
+        for (int i = 0; i < C; ++i)
+            x_cpu[i] = x_gpu[i] =
+                ((float)((i * 29 + pos * 17) % 101) - 50.0f) / 37.0f;
+
+        detach_gpu_hooks(m);
+        int cpu_best = ds4f_forward_token(m, x_cpu, pos);
+        memcpy(lg_cpu, m->s_logits, (size_t)V * sizeof(float));
+
+        attach_decode_hooks(m, hip, opt);
+        int gpu_best = ds4f_forward_token(m, x_gpu, pos);
+
+        float abs_err = 0.0f;
+        float rel = max_rel_error(lg_cpu, m->s_logits, V, &abs_err);
+        double dot = 0.0, nr = 0.0, ng = 0.0;
+        for (int i = 0; i < V; ++i) {
+            dot += (double)lg_cpu[i] * m->s_logits[i];
+            nr += (double)lg_cpu[i] * lg_cpu[i];
+            ng += (double)m->s_logits[i] * m->s_logits[i];
+        }
+        float cosine = (float)(dot / sqrt(fmax(1e-30, nr * ng)));
+        cosine_sum += cosine;
+        if (cosine < cosine_min) cosine_min = cosine;
+        if (rel > worst_logit_rel) { worst_logit_rel = rel; worst_step = t; }
+        if (cpu_best != gpu_best) {
+            ++mismatches;
+            printf("real decode verify: step %d pos %d cpu_argmax=%d gpu_argmax=%d "
+                   "logit_rel=%.6g\n", t, pos, cpu_best, gpu_best, rel);
+        }
+        for (int i = 0; i < V; ++i)
+            if (!isfinite(m->s_logits[i])) {
+                printf("real decode verify: non-finite logit at step %d\n", t);
+                detach_gpu_hooks(m);
+                return 0;
+            }
+    }
+    detach_gpu_hooks(m);
+    printf("real decode verify: steps=%d pos %d..%d argmax_mismatch=%d "
+           "worst_logit_rel=%.6g (step %d) cosine_mean=%.8g cosine_min=%.8g",
+           steps, pos0, pos0 + steps - 1, mismatches, worst_logit_rel, worst_step,
+           cosine_sum / steps, cosine_min);
+    if (min_cosine >= 0.0f) printf(" min_cosine=%.8g %s", min_cosine,
+        cosine_min >= min_cosine ? "PASS" : "FAIL");
+    putchar('\n');
+    return mismatches == 0 && (min_cosine < 0.0f || cosine_min >= min_cosine);
+}
+
+static int benchmark_forward(ds4f_model *m, hip_ds4f_dense *hip, int iters,
+                             int pos0, int warm,
+                             const ds4f_runtime_options *opt) {
+    const int C = m->cfg.hidden;
+    float *x = (float *)ds4f_mem_alloc(m->mem, (size_t)C * sizeof(float), 256, 0);
+    if (!x) return 0;
+    memset(m->prof, 0, sizeof(m->prof));
+    m->gpu_dense_ctx = hip;
+    m->gpu_dense_matvec = hip_ds4f_dense_matvec_tensor;
+    m->gpu_dense_async_multi = hip_async_enabled(opt)
+        ? hip_ds4f_dense_matvec_tensors_async : NULL;
+    m->gpu_dense_wait = hip_ds4f_dense_wait_tensors;
+    m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
+    m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
+    m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
+    m->gpu_dense_layer_prefetch = NULL;
+    m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
+    m->gpu_prefill_attn_partial = opt->hip_prefill_attn
+        ? hip_ds4f_dense_prefill_attention_partial : NULL;
+    m->gpu_tb2_batch_enabled = opt->hip_prefill_attn && opt->hip_tb2_batch;
+    /* Mixed dispatch is not a precision mode.  Without it a group holding
+     * one CPU-only member (the router gate beside shared w2) sends every
+     * member to the CPU; each member keeps its own arithmetic either way. */
+    m->gpu_dense_mixed = 1;
+    m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
+        ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_stream_layer_raw
+                                     : hip_ds4f_dense_stream_layer) : NULL;
+    m->gpu_dense_stream_prefill_only = hip_mxfp4_streaming(opt);
+    if (hip_mxfp4_streaming(opt))
+        m->mxfp4_w4a8 = 0;
+
+    if (pos0 < 0) pos0 = 0;
+    if (pos0 + iters > m->cfg.max_pos) iters = m->cfg.max_pos - pos0;
+    if (iters < 1) {
+        fprintf(stderr, "real hybrid decode: no positions available (pos0=%d max_pos=%d)\n",
+                pos0, m->cfg.max_pos);
+        return 0;
+    }
+    if (warm > 0) {
+        if (warm > pos0) warm = pos0;
+        ds4f_warm_kv(m, warm);
+        ds4f_warm_tb2(m, warm);
+        fprintf(stderr, "real hybrid decode: synthetic KV context warmed to %d, measuring pos %d..%d\n",
+                warm, pos0, pos0 + iters - 1);
+    }
+
+    if (opt->hip_expert_cache_mb != 0) {
+        const int train_tokens = 8;
+        double cache_t0 = wall_seconds();
+        for (int k = 0; k < train_tokens; ++k) {
+            for (int i = 0; i < C; ++i)
+                x[i] = ((float)((i * 29 + k * 17) % 101) - 50.0f) / 37.0f;
+            (void)ds4f_forward_token(m, x, k % m->cfg.max_pos);
+        }
+        int admitted = hip_ds4f_dense_cache_hot_experts(
+            hip, m, opt->hip_expert_cache_mb, opt->hip_vram_reserve_mb,
+            opt->hip_expert_cache_stats);
+        if (admitted < 0) {
+            fprintf(stderr, "real hybrid decode: prompt-hot expert cache setup failed\n");
+            return 0;
+        }
+        fprintf(stderr,
+                "real hybrid decode: expert-cache training=%d tokens bundles=%d setup=%.3fs\n",
+                train_tokens, admitted, wall_seconds() - cache_t0);
+        memset(m->prof, 0, sizeof(m->prof));
+    }
+
+    double t0 = wall_seconds();
+    int last = -1;
+    for (int k = 0; k < iters; ++k) {
+        for (int i = 0; i < C; ++i)
+            x[i] = ((float)((i * 29 + k * 17) % 101) - 50.0f) / 37.0f;
+        last = ds4f_forward_token(m, x, pos0 + k);
+    }
+    double elapsed = wall_seconds() - t0;
+    printf("real hybrid decode: layers=%d tokens=%d %.3f ms/token %.3f tok/s last_argmax=%d\n",
+           m->cfg.n_layers, iters, elapsed * 1000.0 / iters,
+           iters / elapsed, last);
+    if (getenv("DS4F_PROF") && atoi(getenv("DS4F_PROF")) != 0) {
+        double accounted = 0.0;
+        for (int i = 0; i <= DS4F_P_TB2PREP; i++) accounted += m->prof[i];
+        printf("real hybrid phase profile (ms/token):\n");
+        for (int i = 0; i <= DS4F_P_TB2PREP; i++) {
+            double ms = m->prof[i] * 1000.0 / iters;
+            if (ms > 0.001)
+                printf("  %-9s %8.3f ms %5.1f%%\n", ds4f_prof_names[i], ms,
+                       accounted > 0.0 ? 100.0 * m->prof[i] / accounted : 0.0);
+        }
+        printf("  qkv sub: wq_a+wkv %.3f  wq_b %.3f  wkv_solo %.3f  rope %.3f ms\n",
+               m->prof[DS4F_P_QKV_A] * 1000.0 / iters,
+               m->prof[DS4F_P_QKV_B] * 1000.0 / iters,
+               m->prof[DS4F_P_QKV_KV] * 1000.0 / iters,
+               m->prof[DS4F_P_QKV_ROPE] * 1000.0 / iters);
+    }
+
+    m->gpu_dense_ctx = NULL;
+    m->gpu_dense_matvec = NULL;
+    m->gpu_dense_async_multi = NULL;
+    m->gpu_dense_wait = NULL;
+    m->gpu_dense_blockdiag = NULL;
+    m->gpu_dense_gemm = NULL;
+    m->gpu_dense_gemm_multi = NULL;
+    m->gpu_prefill_attn = NULL;
+    m->gpu_dense_mixed = 0;
+    m->gpu_dense_layer_begin = NULL;
+    m->gpu_dense_layer_prefetch = NULL;
+    m->gpu_dense_stream_prefill_only = 0;
+    return 1;
+}
+
+static void fill_prefill_inputs(float *x, int batch, int C, int pos0) {
+    for (int mm = 0; mm < batch; mm++) for (int i = 0; i < C; i++)
+        x[(size_t)mm*C+i] = ((float)((i * 29 + (mm + pos0) * 17) % 101) - 50.0f) / 37.0f;
+}
+
+static void attach_prefill_backend(ds4f_model *m, hip_ds4f_dense *hip,
+                                   dual_ds4f_prefill *dual,
+                                   const ds4f_runtime_options *opt) {
+    m->gpu_dense_ctx = hip;
+    m->gpu_dense_matvec = hip_ds4f_dense_matvec_tensor;
+    m->gpu_dense_async_multi = hip_async_enabled(opt)
+        ? hip_ds4f_dense_matvec_tensors_async : NULL;
+    m->gpu_dense_wait = hip_ds4f_dense_wait_tensors;
+    m->gpu_dense_blockdiag = hip_ds4f_dense_matvec_blockdiag;
+    m->gpu_dense_gemm = hip_ds4f_dense_gemm_tensor;
+    m->gpu_dense_gemm_multi = hip_ds4f_dense_gemm_tensors;
+    /* The fused chain keeps the two [M, shared_inter] intermediates resident
+     * on the device.  Its SiLU uses a bit-exact port of glibc's expf and runs
+     * in its own always-precise HIPRTC module, so it never changes the dense
+     * GEMM results or the argmax.  Opt-in; see --hip-fused-shared-ffn. */
+    m->gpu_shared_ffn = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn : NULL;
+    m->gpu_routed_ffn = opt->hip_routed_ffn ? hip_ds4f_dense_routed_ffn : NULL;
+    m->gpu_shared_ffn_begin = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn_begin : NULL;
+    m->gpu_shared_ffn_wait = ds4f_fused_shared_ffn_on ? hip_ds4f_dense_shared_ffn_wait : NULL;
+    m->gpu_oproj = hip_ds4f_dense_oproj;
+    m->gpu_prefill_attn = opt->hip_prefill_attn ? hip_ds4f_dense_prefill_attention : NULL;
+    m->gpu_prefill_qkv = opt->hip_qkv_fuse ? hip_ds4f_dense_prefill_qkv : NULL;
+    m->gpu_prefill_qkv_enabled = opt->hip_qkv_fuse;
+    m->gpu_qkv_device_chain = opt->hip_qkv_device_chain;
+    m->gpu_attn_device_chain = opt->hip_attn_device_chain;
+    m->gpu_attn_no_d2h = opt->hip_attn_no_d2h;
+    m->gpu_routed_ffn_enabled = opt->hip_routed_ffn;
+    m->gpu_decode_routed_ffn_enabled = opt->hip_decode_routed_ffn;
+    hip_ds4f_dense_set_prefill_features(hip, opt->hip_qkv_fuse,
+        opt->hip_qkv_device_chain, opt->hip_attn_device_chain,
+        opt->hip_attn_no_d2h, opt->hip_fp8_wmma, opt->hip_bf16_wmma,
+        opt->hip_attn_wmma, opt->hip_oproj_group_wmma, opt->hip_mxfp4_wmma,
+        opt->hip_block_threads);
+    m->gpu_prefill_attn_oproj = (opt->hip_prefill_attn && !opt->hip_qkv_device_chain)
+        ? hip_ds4f_dense_prefill_attn_oproj : NULL;
+    /* MXFP4 expert layer residency: install the HIP entry points BEFORE the
+     * dual wrapper swaps gpu_dense_ctx, so dual can capture and forward them.
+     * Dual owns expert routing and keeps small buckets on the exact CPU path,
+     * so streaming would only upload weights the dispatcher never uses; leave
+     * the callbacks off there. */
+    if (!dual) {
+        m->gpu_dense_layer_prefetch = opt->hip_mxfp4_stream_raw &&
+            hip_mxfp4_streaming(opt)
+            ? hip_ds4f_dense_prefetch_layer_raw : NULL;
+        m->gpu_dense_layer_begin = hip_mxfp4_streaming(opt)
+            ? (opt->hip_mxfp4_stream_raw ? hip_ds4f_dense_begin_layer
+                                         : hip_ds4f_dense_stream_layer) : NULL;
+        m->gpu_dense_stream_prefill_only = hip_mxfp4_streaming(opt);
+    } else {
+        m->gpu_dense_layer_prefetch = NULL;
+        m->gpu_dense_layer_begin = NULL;
+        m->gpu_dense_stream_prefill_only = 0;
+    }
+    /* Mixed dispatch is not a precision mode.  Without it a group holding
+     * one CPU-only member (the router gate beside shared w2) sends every
+     * member to the CPU; each member keeps its own arithmetic either way. */
+    m->gpu_dense_mixed = 1;
+    /* Dual overrides only the batched GEMM entry points.  It must not drop
+     * the rest: without gpu_dense_matvec/wait/blockdiag the M=1 residual
+     * matvecs fall back to the CPU, which is a different reduction order from
+     * the single-GPU path and showed up as a spurious argmax mismatch. */
+    if (dual)
+        dual_ds4f_prefill_attach_model(m, dual);
+}
+
+/* GPU-only batched-GEMM timing.  Whole-phase prefill numbers mix in CPU
+ * rmsnorm/RoPE/SwiGLU/expert work, so they move with host load; this times
+ * repeated device GEMMs on real bound tensors and nothing else. */
+static void gemm_bench(ds4f_model *m, hip_ds4f_dense *hip, int M) {
+    struct { const char *name; const ds4f_tensor *t; } cases[] = {
+        { "wq_b",  &m->layers[0].wq_b  },
+        { "wo_b",  &m->layers[0].wo_b  },
+        { "sh_w1", &m->layers[0].sh_w1 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const ds4f_tensor *t = cases[i].t;
+        if (!t || t->gpu_id < 0) continue;
+        int N = t->rows, K = t->cols;
+        float *x = (float *)ds4f_mem_alloc(m->mem, (size_t)M * K * 4, 256, 0);
+        float *y = (float *)ds4f_mem_alloc(m->mem, (size_t)M * N * 4, 256, 0);
+        if (!x || !y) return;
+        for (size_t j = 0; j < (size_t)M * K; ++j)
+            x[j] = (float)((j * 17) % 101 - 50) / 31.0f;
+        if (hip_ds4f_dense_gemm_tensor(hip, y, t, x, M, N, K) != 0) continue;
+        enum { ITERS = 20 };
+        double t0 = wall_seconds();
+        for (int it = 0; it < ITERS; ++it)
+            if (hip_ds4f_dense_gemm_tensor(hip, y, t, x, M, N, K) != 0) break;
+        double el = wall_seconds() - t0;
+        double gflop = 2.0 * (double)M * N * K * ITERS / 1e9;
+        printf("gemm bench: %-5s M=%d N=%d K=%d %.3f ms/call %.1f GFLOP/s\n",
+               cases[i].name, M, N, K, el * 1000.0 / ITERS, gflop / el);
+    }
+}
+
+static int benchmark_prefill(ds4f_model *m, hip_ds4f_dense *hip,
+                             dual_ds4f_prefill *dual, int batch,
+                             int context, const ds4f_runtime_options *opt,
+                             int repeat, int approx, int skip_cpu_ref) {
+    if (!m->exact || m->mhc || m->tierb2 || m->int8_kv) {
+        fprintf(stderr, "real hybrid prefill: requires exact && !mhc && !tierb2 && !int8_kv\n");
+        return 0;
+    }
+    int C = m->cfg.hidden;
+    float *x = (float *)ds4f_mem_alloc(m->mem, (size_t)batch * C * sizeof(float), 256, 0);
+    int warm_batch = context > 0 ? m->cfg.window_size : 0;
+    if (warm_batch > context) warm_batch = context;
+    float *warm_x = warm_batch > 0
+        ? (float *)ds4f_mem_alloc(m->mem, (size_t)warm_batch * C * sizeof(float), 256, 0)
+        : NULL;
+    int *warm_tok = warm_batch > 0
+        ? (int *)ds4f_mem_alloc(m->mem, (size_t)warm_batch * sizeof(int), 64, 0)
+        : NULL;
+    int *cpu_tok = (int *)ds4f_mem_alloc(m->mem, (size_t)batch * sizeof(int), 64, 0);
+    int *gpu_tok = (int *)ds4f_mem_alloc(m->mem, (size_t)batch * sizeof(int), 64, 0);
+    const char *diag_env = getenv("DS4F_PREFILL_DIAG");
+    int diag = diag_env && atoi(diag_env) != 0;
+    int hrows = m->head.rows;
+    float *cpu_logits = diag
+        ? (float *)ds4f_mem_alloc(m->mem, (size_t)batch * hrows * sizeof(float), 256, 0)
+        : NULL;
+    double cpu_prof[DS4F_NPHASE] = {0}, gpu_prof[DS4F_NPHASE];
+    double cpu_s = 0.0, warm_cpu_s = 0.0, warm_gpu_s = 0.0, t0 = 0.0;
+    if (!x || !cpu_tok || !gpu_tok || (warm_batch > 0 && (!warm_x || !warm_tok)) ||
+        (diag && !cpu_logits)) return 0;
+    if (context < 0 || context + batch > m->cfg.max_pos) {
+        fprintf(stderr, "real hybrid prefill: context=%d batch=%d exceeds max_pos=%d\n",
+                context, batch, m->cfg.max_pos);
+        return 0;
+    }
+    ds4f_alloc_prefill_batch(m, batch > warm_batch ? batch : warm_batch);
+    fill_prefill_inputs(x, batch, C, context);
+    if (warm_batch > 0) fill_prefill_inputs(warm_x, warm_batch, C, context - warm_batch);
+
+    /* First run the same batched forward with all device hooks detached.  For
+     * the large-batch throughput probe this reference is ~minutes; skip it
+    * (--skip-cpu-ref) and report the GPU rate only. */
+    if (!skip_cpu_ref) {
+        if (batch >= 512)
+            fprintf(stderr, "prefill: CPU reference batch=%d can take many minutes; use --skip-cpu-ref 1 for performance-only runs\n", batch);
+        m->gpu_dense_ctx = NULL;
+        m->gpu_dense_matvec = NULL;
+        m->gpu_dense_async_multi = NULL;
+        m->gpu_dense_wait = NULL;
+        m->gpu_dense_blockdiag = NULL;
+        m->gpu_dense_gemm = NULL;
+        m->gpu_dense_gemm_multi = NULL;
+        m->gpu_shared_ffn = NULL;
+        m->gpu_routed_ffn = NULL;
+        m->gpu_shared_ffn_begin = NULL;
+        m->gpu_shared_ffn_wait = NULL;
+        m->gpu_routed_ffn = NULL;
+        m->gpu_prefill_qkv = NULL;
+        m->gpu_prefill_qkv_enabled = 0;
+        m->gpu_qkv_device_chain = 0;
+        m->gpu_attn_device_chain = 0;
+        m->gpu_attn_no_d2h = 0;
+        m->gpu_routed_ffn_enabled = 0;
+        m->gpu_decode_routed_ffn_enabled = 0;
+        m->gpu_decode_attn_enabled = 0;
+        m->gpu_decode_attn_oproj_enabled = 0;
+        m->gpu_decode_qkv_enabled = 0;
+        m->gpu_oproj = NULL;
+        m->gpu_prefill_attn = NULL;
+        m->gpu_dense_mixed = 0;
+        memset(m->prof, 0, sizeof(m->prof));
+        if (warm_batch > 0) {
+            double tw = wall_seconds();
+            ds4f_forward_prefill(m, warm_x, warm_batch, context - warm_batch, warm_tok);
+            warm_cpu_s = wall_seconds() - tw;
+        }
+        t0 = wall_seconds();
+        ds4f_forward_prefill(m, x, batch, context, cpu_tok);
+        cpu_s = wall_seconds() - t0;
+        memcpy(cpu_prof, m->prof, sizeof(cpu_prof));
+        if (diag) memcpy(cpu_logits, m->p_logits,
+                         (size_t)batch * hrows * sizeof(float));
+    }
+
+    attach_prefill_backend(m, hip, dual, opt);
+    if (dual) {
+        m->gpu_dense_gemm_multi = dual_ds4f_prefill_gemm_multi;
+        m->gpu_dense_gemm = dual_ds4f_prefill_gemm;
+    }
+    /* Mixed dispatch is not a precision mode.  Without it a group holding
+     * one CPU-only member (the router gate beside shared w2) sends every
+     * member to the CPU; each member keeps its own arithmetic either way. */
+    m->gpu_dense_mixed = 1;
+    memset(m->prof, 0, sizeof(m->prof));
+    if (warm_batch > 0) {
+        double tw = wall_seconds();
+        ds4f_forward_prefill(m, warm_x, warm_batch, context - warm_batch, warm_tok);
+        warm_gpu_s = wall_seconds() - tw;
+    }
+    t0 = wall_seconds();
+    ds4f_forward_prefill(m, x, batch, context, gpu_tok);
+    double gpu_s = wall_seconds() - t0;
+    memcpy(gpu_prof, m->prof, sizeof(gpu_prof));
+    if (repeat > 1) {
+        /* Single-node server proxy: re-run the same batch on the same model.
+         * The first iteration pays the CUDA expert weight upload; later ones
+         * reuse the resident cache, so the per-iteration tok/s shows the
+         * amortization.  Same inputs => deterministic. */
+        printf("prefill repeat: iter tok/s  (gpu)\n");
+        for (int it = 0; it < repeat; ++it) {
+            double tt = wall_seconds();
+            ds4f_forward_prefill(m, x, batch, context, gpu_tok);
+            double ts = wall_seconds() - tt;
+            printf("prefill repeat: %3d  %7.3f%s\n", it, batch / ts,
+                   it == 0 ? "  (first: pays weight upload)" : "");
+        }
+    }
+
+    int mismatches = 0;
+    if (!skip_cpu_ref)
+        for (int i = 0; i < batch; i++) if (cpu_tok[i] != gpu_tok[i]) mismatches++;
+    printf("real hybrid prefill: layers=%d context=%d batch=%d cpu=%.3f tok/s gpu=%.3f tok/s "
+           "speedup=%.3fx argmax_mismatch=%d", m->cfg.n_layers, context, batch,
+           skip_cpu_ref ? 0.0 : batch / cpu_s, batch / gpu_s,
+           skip_cpu_ref ? 0.0 : cpu_s / gpu_s, mismatches);
+    if (warm_batch > 0)
+        printf(" warm_tail=%d cpu=%.3fs gpu=%.3fs", warm_batch, warm_cpu_s, warm_gpu_s);
+    putchar('\n');
+    if (diag) {
+        float max_abs = 0.0f, max_rel = 0.0f;
+        double sum_kl = 0.0, sum_ce_ref = 0.0, sum_ce_gpu = 0.0;
+        double sum_sq = 0.0, sum_dot = 0.0, sum_nr = 0.0, sum_ng = 0.0;
+        int sum_top10 = 0; float *kls = (float *)malloc((size_t)batch * sizeof(*kls));
+        for (int mm = 0; mm < batch; mm++) {
+            const float *a = cpu_logits + (size_t)mm * hrows;
+            const float *b = m->p_logits + (size_t)mm * hrows;
+            for (int v = 0; v < hrows; v++) {
+                float e = fabsf(a[v] - b[v]);
+                if (e > max_abs) max_abs = e;
+                float r = e / fmaxf(1.0f, fabsf(a[v]));
+                if (r > max_rel) max_rel = r;
+            }
+            if (cpu_tok[mm] != gpu_tok[mm]) {
+                int cb = cpu_tok[mm] - m->head_r0;
+                int gb = gpu_tok[mm] - m->head_r0;
+                printf("  prefill mismatch token=%d cpu=%d gpu=%d "
+                       "cpu_logit=%.8g gpu_at_cpu=%.8g "
+                       "gpu_logit=%.8g cpu_at_gpu=%.8g\n", mm,
+                       cpu_tok[mm], gpu_tok[mm], a[cb], b[cb], b[gb], a[gb]);
+            }
+            double kl, ce_r, ce_g; int top10;
+            int target = cpu_tok[mm] - m->head_r0;
+            if (target < 0 || target >= hrows) target = 0;
+            report_distribution_metrics(a, b, hrows, target,
+                                        &kl, &ce_r, &ce_g, &top10);
+            sum_kl += kl; sum_ce_ref += ce_r; sum_ce_gpu += ce_g; sum_top10 += top10;
+            kls[mm] = (float)kl;
+            double ar=0, ag=0, dot=0;
+            for (int v=0; v<hrows; ++v) {
+                double da = (double)a[v] - b[v];
+                sum_sq += da * da;
+                ar += (double)a[v]*a[v]; ag += (double)b[v]*b[v]; dot += (double)a[v]*b[v];
+            }
+            sum_nr += ar; sum_ng += ag; sum_dot += dot;
+        }
+        printf("real hybrid prefill logits: max_abs=%.8g max_rel=%.8g\n",
+               max_abs, max_rel);
+        qsort(kls, (size_t)batch, sizeof(*kls), cmp_float_asc);
+        float p95 = kls[(int)(0.95 * (batch - 1))];
+        printf("real hybrid prefill quality: rmse=%.8g cosine=%.8g "
+               "mean_kl=%.8g p95_kl=%.8g refargmax_ce=%.8g gpu_ce=%.8g "
+               "top10_overlap=%.2f/10\n",
+               sqrt(sum_sq / fmax(1.0, (double)batch * hrows)),
+               sum_dot / sqrt(fmax(1e-30, sum_nr * sum_ng)),
+               sum_kl / batch, p95, sum_ce_ref / batch, sum_ce_gpu / batch,
+               (double)sum_top10 / batch);
+        free(kls);
+    }
+    const char *prof = getenv("DS4F_PROF");
+    if (prof && atoi(prof) != 0) {
+        double cpu_total = 0.0, gpu_total = 0.0;
+        for (int i = 0; i <= DS4F_P_TB2PREP; i++) {
+            cpu_total += cpu_prof[i];
+            gpu_total += gpu_prof[i];
+        }
+        printf("real hybrid prefill profile (ms/token):\n");
+        for (int i = 0; i <= DS4F_P_TB2PREP; i++) {
+            double cms = cpu_prof[i] * 1000.0 / batch;
+            double gms = gpu_prof[i] * 1000.0 / batch;
+            if (cms > 0.001 || gms > 0.001)
+                printf("  %-9s cpu=%8.3f (%5.1f%%) gpu=%8.3f (%5.1f%%)\n",
+                       ds4f_prof_names[i], cms,
+                       cpu_total > 0.0 ? 100.0 * cpu_prof[i] / cpu_total : 0.0,
+                       gms, gpu_total > 0.0 ? 100.0 * gpu_prof[i] / gpu_total : 0.0);
+        }
+    }
+
+    m->gpu_dense_ctx = NULL;
+    m->gpu_dense_matvec = NULL;
+    m->gpu_dense_async_multi = NULL;
+    m->gpu_dense_wait = NULL;
+    m->gpu_dense_blockdiag = NULL;
+    m->gpu_dense_gemm = NULL;
+    m->gpu_dense_gemm_multi = NULL;
+    m->gpu_shared_ffn = NULL;
+    m->gpu_shared_ffn_begin = NULL;
+    m->gpu_shared_ffn_wait = NULL;
+    m->gpu_oproj = NULL;
+    m->gpu_prefill_attn = NULL;
+    m->gpu_dense_layer_prefetch = NULL;
+    m->gpu_dense_layer_begin = NULL;
+    m->gpu_dense_stream_prefill_only = 0;
+    m->gpu_dense_mixed = 0;
+    /* The CUDA small-bucket expert path is approximate (SM120 activation
+     * quantization); report the mismatches but do not fail the gate. */
+    return approx ? 1 : mismatches == 0;
+}
+
+static int check_tensor(ds4f_model *m, hip_ds4f_dense *hip,
+                        const char *name, const ds4f_tensor *t, int id,
+                        int benchmark) {
+    if ((t->type != DS4F_FP8 && t->type != DS4F_BF16) || !t->w ||
+        (t->type == DS4F_FP8 && !t->scale)) {
+        fprintf(stderr, "real dense A/B: %s has an unsupported tensor layout\n", name);
+        return 0;
+    }
+    float *x = (float *)ds4f_mem_alloc(m->mem, (size_t)t->cols * sizeof(float), 256, 0);
+    float *cpu = (float *)ds4f_mem_alloc(m->mem, (size_t)t->rows * sizeof(float), 256, 0);
+    float *gpu = (float *)ds4f_mem_alloc(m->mem, (size_t)t->rows * sizeof(float), 256, 0);
+    if (!x || !cpu || !gpu) {
+        fprintf(stderr, "real DS4F A/B allocation failed for %s\n", name);
+        return 0;
+    }
+    for (int i = 0; i < t->cols; ++i)
+        x[i] = ((float)((i * 31 + t->rows) % 127) - 63.0f) / 41.0f;
+
+    ds4f_matvec(m, cpu, t, x);
+    int rc = hip_ds4f_dense_matvec_id(hip, id, x, gpu);
+    if (rc != 0) {
+        return 0;
+    }
+
+    float max_abs = 0.0f;
+    float max_rel = max_rel_error(cpu, gpu, t->rows, &max_abs);
+    int pass = max_rel <= 3.0e-5f && max_abs <= 3.0e-2f;
+    printf("real dense A/B: layer=0 tensor=%s rows=%d cols=%d max_abs=%.8g max_rel=%.8g %s\n",
+           name, t->rows, t->cols, max_abs, max_rel, pass ? "PASS" : "FAIL");
+
+    if (benchmark) {
+        enum { ITERS = 20 };
+        double t0 = wall_seconds();
+        for (int i = 0; i < ITERS; ++i)
+            if (hip_ds4f_dense_matvec_id(hip, id, x, gpu) != 0) { pass = 0; break; }
+        double elapsed = wall_seconds() - t0;
+        if (pass) {
+            size_t bytes = (size_t)t->rows * (size_t)t->cols + ds4f_sbytes(t->type, t->rows, t->cols);
+            printf("real %s persistent: %.3f ms/call %.2f GB/s (weight+scale read)\n",
+                   name, elapsed * 1000.0 / ITERS,
+                   (double)bytes * ITERS / (elapsed * 1e9));
+        }
+    }
+    return pass;
+}
+
+int main(int argc, char **argv) {
+    /* Fusing the independent wq_a/wkv pair into one dispatch is bit-exact by
+     * construction (same rowsplit, kernel and per-row dot order; only the
+     * barrier is shared) and worth about 1.4 tok/s of decode here, but the
+     * shared default stays 0 because it has not been re-measured on A64FX.
+     * Enable it for this x86 harness only; an explicit env setting still wins. */
+    setenv("DS4F_MV_FUSE", "1", 0);
+    ds4f_runtime_options opt;
+    ds4f_runtime_options_init(&opt);
+    char config_path[1024] = {0};
+    int debug_env = 0, bank_layers = 1, layers = 0, dual_gpu = 0, cuda_device = 0;
+    int dual_cuda_mxfp4 = 1, dual_cuda_terms = 1, dual_cuda_small = 0;
+    int dual_cuda_resident_from = 0, dual_cuda_preload = 1;
+    int mxfp4_test = 0, mxfp4_widened_test = 0;
+    int iters = 0, pos0 = 1, warm = 0, prefill_batch = 0, prefill_context = 0;
+    int prefill_repeat = 1;
+    int skip_cpu_ref = 0;
+    int decode_verify_steps = 0, gemm_bench_m = 0;
+    float decode_min_cosine = -1.0f;
+    /* Load JSON first so explicit command-line values have the conventional
+     * higher precedence regardless of where --config appears in argv. */
+    for (int i = 1; i + 1 < argc; i++)
+        if (strcmp(argv[i], "--config") == 0)
+            snprintf(config_path, sizeof(config_path), "%s", argv[i + 1]);
+    if (config_path[0] && ds4f_runtime_options_load_json(&opt, config_path) != 0) {
+        fprintf(stderr, "cannot load DS4F config: %s\n", config_path); return 2;
+    }
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "--config") == 0 && i + 1 < argc) { i++; }
+        else if (strcmp(a, "--stage-dir") == 0 && i + 1 < argc) snprintf(opt.stage_dir, sizeof(opt.stage_dir), "%s", argv[++i]);
+        else if (strcmp(a, "--model") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            opt.cfg = strcmp(v, "ds4p") == 0 ? ds4f_pro_config() :
+                      strcmp(v, "ds4fbase") == 0 ? ds4f_base_config() : ds4f_default_config();
+        } else if (strcmp(a, "--ep-size") == 0 && i + 1 < argc) opt.ep_size = atoi(argv[++i]);
+        else if (strcmp(a, "--ep-rank") == 0 && i + 1 < argc) opt.ep_rank = atoi(argv[++i]);
+        else if (strcmp(a, "--threads") == 0 && i + 1 < argc) opt.n_threads = atoi(argv[++i]);
+        else if (strcmp(a, "--cmgs") == 0 && i + 1 < argc) opt.n_cmgs = atoi(argv[++i]);
+        else if (strcmp(a, "--max-pos") == 0 && i + 1 < argc) opt.cfg.max_pos = atoi(argv[++i]);
+        else if (strcmp(a, "--layers") == 0 && i + 1 < argc) layers = atoi(argv[++i]);
+        else if (strcmp(a, "--bank-layers") == 0 && i + 1 < argc) bank_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--iters") == 0 && i + 1 < argc) iters = atoi(argv[++i]);
+        else if (strcmp(a, "--pos0") == 0 && i + 1 < argc) pos0 = atoi(argv[++i]);
+        else if (strcmp(a, "--warm") == 0 && i + 1 < argc) warm = atoi(argv[++i]);
+        else if (strcmp(a, "--decode-verify") == 0 && i + 1 < argc) decode_verify_steps = atoi(argv[++i]);
+        else if (strcmp(a, "--decode-min-cosine") == 0 && i + 1 < argc) decode_min_cosine = strtof(argv[++i], NULL);
+        else if (strcmp(a, "--gemm-bench") == 0 && i + 1 < argc) gemm_bench_m = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-fused-shared-ffn") == 0 && i + 1 < argc) ds4f_fused_shared_ffn_on = atoi(argv[++i]);
+        else if (strcmp(a, "--prefill-batch") == 0 && i + 1 < argc) prefill_batch = atoi(argv[++i]);
+        else if (strcmp(a, "--prefill-context") == 0 && i + 1 < argc) prefill_context = atoi(argv[++i]);
+        else if (strcmp(a, "--prefill-repeat") == 0 && i + 1 < argc) prefill_repeat = atoi(argv[++i]);
+        else if (strcmp(a, "--skip-cpu-ref") == 0 && i + 1 < argc) skip_cpu_ref = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-device") == 0 && i + 1 < argc) opt.hip_device = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-verbose") == 0 && i + 1 < argc) opt.hip_verbose = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-async") == 0 && i + 1 < argc) opt.hip_async = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-shared-bf16") == 0 && i + 1 < argc) opt.hip_shared_bf16 = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-shared-bf16-layers") == 0 && i + 1 < argc) opt.hip_shared_bf16_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-shared-fp16") == 0 && i + 1 < argc) opt.hip_shared_fp16 = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-shared-fp16-layers") == 0 && i + 1 < argc) opt.hip_shared_fp16_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-ordered-wkv-layers") == 0 && i + 1 < argc) opt.hip_ordered_wkv_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-ordered-fp8-layers") == 0 && i + 1 < argc) opt.hip_ordered_fp8_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-mxfp4-widen-layers") == 0 && i + 1 < argc) opt.hip_mxfp4_widen_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-mxfp4-resident-layers") == 0 && i + 1 < argc) opt.hip_mxfp4_resident_layers = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-mxfp4-resident-auto") == 0 && i + 1 < argc) opt.hip_mxfp4_resident_auto = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-vram-reserve-mb") == 0 && i + 1 < argc) opt.hip_vram_reserve_mb = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-mxfp4-stream-raw") == 0 && i + 1 < argc) opt.hip_mxfp4_stream_raw = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-expert-cache-mb") == 0 && i + 1 < argc) {
+            const char *v = argv[++i]; opt.hip_expert_cache_mb = strcmp(v, "auto") == 0 ? -1 : atoi(v);
+        }
+        else if (strcmp(a, "--hip-expert-cache-stats") == 0 && i + 1 < argc) opt.hip_expert_cache_stats = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-prefill-attn") == 0 && i + 1 < argc) opt.hip_prefill_attn = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-tb2-batch") == 0 && i + 1 < argc) opt.hip_tb2_batch = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-qkv-fuse") == 0 && i + 1 < argc) opt.hip_qkv_fuse = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-qkv-device-chain") == 0 && i + 1 < argc) opt.hip_qkv_device_chain = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-attn-device-chain") == 0 && i + 1 < argc) opt.hip_attn_device_chain = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-attn-no-d2h") == 0 && i + 1 < argc) opt.hip_attn_no_d2h = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-routed-ffn") == 0 && i + 1 < argc) opt.hip_routed_ffn = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-fp8-wmma") == 0 && i + 1 < argc) opt.hip_fp8_wmma = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-bf16-wmma") == 0 && i + 1 < argc) opt.hip_bf16_wmma = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-attn-wmma") == 0 && i + 1 < argc) opt.hip_attn_wmma = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-oproj-group-wmma") == 0 && i + 1 < argc) opt.hip_oproj_group_wmma = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-mxfp4-wmma") == 0 && i + 1 < argc) opt.hip_mxfp4_wmma = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-block-threads") == 0 && i + 1 < argc) opt.hip_block_threads = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-decode-routed-ffn") == 0 && i + 1 < argc) opt.hip_decode_routed_ffn = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-decode-qkv-fuse") == 0 && i + 1 < argc) opt.hip_decode_qkv_fuse = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-decode-kv-resident") == 0 && i + 1 < argc) opt.hip_decode_kv_resident = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-decode-attn-oproj") == 0 && i + 1 < argc) opt.hip_decode_attn_oproj = atoi(argv[++i]);
+        else if (strcmp(a, "--dual-gpu") == 0 && i + 1 < argc) dual_gpu = atoi(argv[++i]);
+        else if (strcmp(a, "--cuda-device") == 0 && i + 1 < argc) cuda_device = atoi(argv[++i]);
+        else if (strcmp(a, "--dual-cuda-mxfp4") == 0 && i + 1 < argc) dual_cuda_mxfp4 = atoi(argv[++i]);
+        else if (strcmp(a, "--dual-cuda-terms") == 0 && i + 1 < argc) dual_cuda_terms = atoi(argv[++i]);
+        else if (strcmp(a, "--dual-cuda-small-buckets") == 0 && i + 1 < argc) dual_cuda_small = atoi(argv[++i]);
+        else if (strcmp(a, "--dual-cuda-resident-from") == 0 && i + 1 < argc) dual_cuda_resident_from = atoi(argv[++i]);
+        else if (strcmp(a, "--dual-cuda-preload") == 0 && i + 1 < argc) dual_cuda_preload = atoi(argv[++i]);
+        else if (strcmp(a, "--hip-mxfp4-gemm-test") == 0) mxfp4_test = 1;
+        else if (strcmp(a, "--hip-mxfp4-widened-gemm-test") == 0) mxfp4_widened_test = 1;
+        else if (strcmp(a, "--hip-exact-prefill") == 0 && i + 1 < argc) opt.hip_exact_prefill = atoi(argv[++i]);
+        else if (strcmp(a, "--debug-env") == 0) debug_env = 1;
+        else { usage(argv[0]); return 2; }
+    }
+    if (getenv("DS4F_DEBUG_ENV") && atoi(getenv("DS4F_DEBUG_ENV"))) debug_env = 1;
+    if (debug_env) {
+        ds4f_runtime_options envopt = ds4f_runtime_options_debug_env(opt.cfg,
+            opt.stage_dir[0] ? opt.stage_dir : NULL, opt.ep_rank, opt.ep_size,
+            opt.n_threads, opt.n_cmgs);
+        envopt.cfg.max_pos = opt.cfg.max_pos;
+        envopt.hip_device = opt.hip_device; envopt.hip_async = opt.hip_async;
+        envopt.hip_verbose = opt.hip_verbose; opt = envopt;
+    }
+    if (!opt.stage_dir[0]) {
+        printf("SKIP: pass --stage-dir/--config (or --debug-env for DS4F_STAGE_DIR)\n");
+        return 0;
+    }
+    ds4f_config cfg = opt.cfg;
+    if (layers > 0) cfg.n_layers = layers;
+    { const char *mp = getenv("DS4F_MAX_POS");
+      if (mp && *mp) { long v = atol(mp); if (v > 0) cfg.max_pos = (int)v; } }
+    if (cfg.max_pos < 2) cfg.max_pos = 2;
+    if (cfg.max_pos > 16384) cfg.max_pos = 16384;
+    opt.cfg = cfg;
+    if (opt.hip_mxfp4_widen_layers > 0)
+        mxfp4_test = mxfp4_widened_test = 0;
+    if (bank_layers < 1) bank_layers = 1;
+    if (bank_layers > cfg.n_layers) bank_layers = cfg.n_layers;
+    opt.cfg.n_layers = bank_layers;
+    ds4f_model *m = ds4f_load_real_opts(&opt);
+    if (!m) {
+        fprintf(stderr, "real DS4F load failed\n");
+        return 1;
+    }
+    hip_ds4f_dense *hip = hip_ds4f_dense_create_ex(opt.hip_device, opt.hip_verbose,
+        opt.hip_ordered_fp8_layers > 0 || opt.hip_ordered_wkv_layers > 0);
+    if (!hip) {
+        printf("SKIP: HIP/hipRTC unavailable\n");
+        ds4f_free(m);
+        return 0;
+    }
+    dual_ds4f_prefill *dual = dual_gpu
+        ? dual_ds4f_prefill_wrap_hip(hip, cuda_device, opt.hip_verbose) : NULL;
+    if (dual) {
+        dual_ds4f_prefill_set_cuda_mxfp4(dual, dual_cuda_mxfp4);
+        dual_ds4f_prefill_set_cuda_terms(dual, dual_cuda_terms);
+        dual_ds4f_prefill_set_max_batch(dual, prefill_batch);
+        dual_ds4f_prefill_set_cuda_small_buckets(dual, dual_cuda_small);
+    }
+    if (dual_gpu && !dual) {
+        fprintf(stderr, "dual GPU dispatcher unavailable\n");
+        hip_ds4f_dense_destroy(hip); ds4f_free(m); return 0;
+    }
+
+    ds4f_layer *ly = &m->layers[0];
+    struct { const char *name; ds4f_tensor *t; int bench; } cases[] = {
+        { "wq_a", &ly->wq_a, 0 }, { "wq_b", &ly->wq_b, 1 },
+        { "wkv",  &ly->wkv,  0 }, { "wo_a", &ly->wo_a, 0 },
+        { "wo_b", &ly->wo_b, 0 }, { "sh_w1", &ly->sh_w1, 0 },
+        { "sh_w3", &ly->sh_w3, 0 }, { "sh_w2", &ly->sh_w2, 0 },
+        { "gate",  &ly->gate,  0 },
+    };
+    int pass = 1;
+    int ids[sizeof(cases) / sizeof(cases[0])];
+    size_t bank_bytes = 0;
+    int bank_matrices = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        if (i == 8 && !hip_shared_bf16_layer(&opt, 0)) {
+            ids[i] = -1;
+            continue;
+        }
+        int shared_fp16 = hip_shared_fp16_layer(&opt, 0) && i >= 5 &&
+                          cases[i].t->type == DS4F_FP8;
+        int shared_bf16 = !shared_fp16 && hip_shared_bf16_layer(&opt, 0) && i >= 5 &&
+                          cases[i].t->type == DS4F_FP8;
+        int ordered_wkv = (i == 2 && hip_ordered_wkv_layer(&opt, 0)) ||
+                          (hip_ordered_fp8_layer(&opt, 0) && !shared_fp16 && !shared_bf16);
+        /* Dense tensors always bind through the HIP chain, even in dual mode:
+         * dual wraps this same HIP context, and routing them through
+         * dual_ds4f_prefill_bind_tensor() would silently drop the ordered /
+         * fp16 / bf16 variant selection below.  That is what made dual mode
+         * miss --hip-ordered-fp8-layers and report a spurious mismatch.
+         * Dual's own bind is only for the MXFP4 experts. */
+        ids[i] = cases[i].t->type == DS4F_BF16
+            ? hip_ds4f_dense_bind_bf16_tensor(hip, cases[i].t)
+            : ordered_wkv
+                ? hip_ds4f_dense_bind_fp8_ordered_tensor(hip, cases[i].t)
+            : shared_fp16
+                ? hip_ds4f_dense_bind_fp8_fp16_tensor(hip, cases[i].t)
+                : shared_bf16
+                ? hip_ds4f_dense_bind_fp8_bf16_tensor(hip, cases[i].t)
+                : hip_ds4f_dense_bind_tensor(hip, cases[i].t);
+        if (ids[i] < 0) pass = 0;
+        else {
+            bank_bytes += (shared_fp16 || shared_bf16)
+                ? (size_t)cases[i].t->rows * (size_t)cases[i].t->cols * sizeof(uint16_t)
+                : ds4f_wbytes(cases[i].t->type, cases[i].t->rows, cases[i].t->cols)
+                    + ds4f_sbytes(cases[i].t->type, cases[i].t->rows, cases[i].t->cols);
+            bank_matrices++;
+        }
+    }
+    for (int L = 1; L < cfg.n_layers; ++L) {
+        ds4f_layer *z = &m->layers[L];
+        ds4f_tensor *ts[] = {
+            &z->wq_a, &z->wq_b, &z->wkv, &z->wo_a, &z->wo_b,
+            &z->sh_w1, &z->sh_w3, &z->sh_w2, &z->gate,
+        };
+        for (size_t j = 0; j < sizeof(ts) / sizeof(ts[0]); ++j) {
+            if (j == 8 && !hip_shared_bf16_layer(&opt, L)) continue;
+            int shared_fp16 = hip_shared_fp16_layer(&opt, L) && j >= 5 &&
+                              ts[j]->type == DS4F_FP8;
+            int shared_bf16 = !shared_fp16 && hip_shared_bf16_layer(&opt, L) && j >= 5 &&
+                              ts[j]->type == DS4F_FP8;
+            int ordered_wkv = (j == 2 && hip_ordered_wkv_layer(&opt, L)) ||
+                              (hip_ordered_fp8_layer(&opt, L) && !shared_fp16 && !shared_bf16);
+            int id = ts[j]->type == DS4F_BF16
+                ? hip_ds4f_dense_bind_bf16_tensor(hip, ts[j])
+                : ordered_wkv
+                    ? hip_ds4f_dense_bind_fp8_ordered_tensor(hip, ts[j])
+                : shared_fp16
+                    ? hip_ds4f_dense_bind_fp8_fp16_tensor(hip, ts[j])
+                    : shared_bf16
+                    ? hip_ds4f_dense_bind_fp8_bf16_tensor(hip, ts[j])
+                    : hip_ds4f_dense_bind_tensor(hip, ts[j]);
+            if (id < 0) pass = 0;
+            else {
+                bank_bytes += (shared_fp16 || shared_bf16)
+                    ? (size_t)ts[j]->rows * (size_t)ts[j]->cols * sizeof(uint16_t)
+                    : ds4f_wbytes(ts[j]->type, ts[j]->rows, ts[j]->cols)
+                        + ds4f_sbytes(ts[j]->type, ts[j]->rows, ts[j]->cols);
+                bank_matrices++;
+            }
+        }
+    }
+    if (dual) {
+        for (int L = 0; L < cfg.n_layers && pass; ++L) {
+            ds4f_layer *z = &m->layers[L];
+            int resident = L >= dual_cuda_resident_from;
+            for (int e = 0; e < z->n_owned; ++e) {
+                if (resident) {
+                    if (dual_ds4f_prefill_bind_tensor(dual, &z->ex_w1[e]) < 0 ||
+                        dual_ds4f_prefill_bind_tensor(dual, &z->ex_w2[e]) < 0 ||
+                        dual_ds4f_prefill_bind_tensor(dual, &z->ex_w3[e]) < 0) {
+                        fprintf(stderr, "dual GPU expert bind failed at layer=%d expert=%d\n", L, e);
+                        pass = 0;
+                        break;
+                    }
+                } else {
+                    /* Hybrid: the head layers stay CPU-exact so their expert
+                     * weights are never uploaded, leaving the ~12 GB CUDA cache
+                     * for the resident tail (no LRU churn across prompts). */
+                    z->ex_w1[e].gpu_id = -1;
+                    z->ex_w2[e].gpu_id = -1;
+                    z->ex_w3[e].gpu_id = -1;
+                }
+            }
+        }
+    }
+    if (dual && dual_cuda_small && dual_cuda_resident_from > 0 && dual_cuda_preload) {
+        fprintf(stderr, "preloading CUDA resident expert weights (layers %d..%d)\n",
+                dual_cuda_resident_from, cfg.n_layers - 1);
+        for (int L = dual_cuda_resident_from; L < cfg.n_layers && pass; ++L) {
+            ds4f_layer *z = &m->layers[L];
+            for (int e = 0; e < z->n_owned; ++e) {
+                if (dual_ds4f_prefill_warm(dual, &z->ex_w1[e]) < 0 ||
+                    dual_ds4f_prefill_warm(dual, &z->ex_w2[e]) < 0 ||
+                    dual_ds4f_prefill_warm(dual, &z->ex_w3[e]) < 0) {
+                    fprintf(stderr, "CUDA expert preload failed at layer=%d expert=%d\n", L, e);
+                    pass = 0;
+                    break;
+                }
+            }
+        }
+    }
+    int head_id = -1;
+    if (m->head.type == DS4F_BF16)
+        head_id = hip_ds4f_dense_bind_bf16_tensor(hip, &m->head);
+    if (head_id < 0) pass = 0;
+    else {
+        bank_bytes += ds4f_wbytes(m->head.type, m->head.rows, m->head.cols);
+        bank_matrices++;
+    }
+    if (pass && (opt.hip_mxfp4_resident_layers > 0 || opt.hip_mxfp4_resident_auto)) {
+        int nr = opt.hip_mxfp4_resident_layers;
+        if (opt.hip_mxfp4_resident_auto)
+            nr = hip_ds4f_dense_recommend_mxfp4_resident_layers(
+                hip, m->layers, cfg.n_layers, opt.hip_mxfp4_stream_raw,
+                opt.hip_vram_reserve_mb > 0 ? opt.hip_vram_reserve_mb : 512);
+        if (nr > cfg.n_layers) nr = cfg.n_layers;
+        for (int L = 0; L < nr; ++L)
+            if (hip_ds4f_dense_resident_mxfp4_layer(
+                    hip, &m->layers[L], opt.hip_mxfp4_stream_raw) != 0) {
+                fprintf(stderr, "GPU MXFP4 resident upload failed at layer %d\n", L);
+                pass = 0;
+                break;
+            }
+        if (pass)
+            fprintf(stderr, "GPU MXFP4 resident experts: layers=%d%s mode=%s\n",
+                    nr, opt.hip_mxfp4_resident_auto ? " (auto)" : "",
+                    opt.hip_mxfp4_stream_raw ? "raw" : "widened");
+    }
+    printf("GPU dense bank: layers=%d matrices=%d resident=%.3f GB\n",
+           cfg.n_layers, bank_matrices, bank_bytes / 1e9);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
+        if (ids[i] >= 0)
+            pass &= check_tensor(m, hip, cases[i].name, cases[i].t,
+                                 ids[i], cases[i].bench);
+    if (head_id >= 0)
+        pass &= check_tensor(m, hip, "head_bf16", &m->head, head_id, 0);
+    if (pass) {
+        if (mxfp4_test) pass &= check_mxfp4_gemm(m, hip, 0);
+        if (mxfp4_widened_test) pass &= check_mxfp4_gemm(m, hip, 1);
+        /* With one layer this is the small A/B gate; with the full bank it is
+         * the production multi-layer attachment check.  EP>1 intentionally
+         * remains a mechanical path check because the local shard is partial. */
+        if (gemm_bench_m > 0) gemm_bench(m, hip, gemm_bench_m);
+        pass &= forward_ab(m, hip, &opt);
+        if (decode_verify_steps > 0)
+            pass &= decode_verify(m, hip, decode_verify_steps, pos0, warm,
+                                  decode_min_cosine, &opt);
+        if (iters > 0) pass &= benchmark_forward(m, hip, iters, pos0, warm, &opt);
+        if (prefill_batch > 1)
+            pass &= benchmark_prefill(m, hip, dual, prefill_batch, prefill_context, &opt, prefill_repeat, dual_cuda_small, skip_cpu_ref);
+    }
+    printf("%s\n", pass ? "PASS" : "FAIL");
+    ds4f_route_report(m, stderr);
+
+    dual_ds4f_prefill_destroy(dual);
+    hip_ds4f_dense_destroy(hip);
+    ds4f_free(m);
+    return pass ? 0 : 1;
+}

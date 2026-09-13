@@ -1,4 +1,4 @@
-/* Rank-local BF16 tensor-parallel stage builder for Qwen3.8-27B.
+/* Rank-local tensor-parallel stage builder for Qwen3.8-27B.
  *
  * The source split GGUF remains on the shared filesystem.  Each MPI rank writes
  * only its final TP tensor slices to its node-local /local filesystem.  The
@@ -144,13 +144,21 @@ static int tensor_index(const gguf_context *g, const char *name) {
 }
 
 static uint64_t tensor_row_bytes(uint32_t type, int cols) {
-    if (type == GGML_TYPE_F32) return (uint64_t)cols * 4u;
-    if (type == GGML_TYPE_BF16 || type == GGML_TYPE_F16) return (uint64_t)cols * 2u;
-    if (type == GGML_TYPE_Q8_0) {
-        if (cols <= 0 || (cols % 32) != 0) return 0;
-        return (uint64_t)(cols / 32) * 34u;
-    }
-    return 0;
+    if (type >= sizeof(ggml_type_info) / sizeof(ggml_type_info[0]) || cols <= 0)
+        return 0;
+    const int block = ggml_type_info[type].block_size;
+    const int bytes = ggml_type_info[type].type_size;
+    if (block <= 0 || bytes <= 0 || cols % block != 0) return 0;
+    return (uint64_t)(cols / block) * (uint64_t)bytes;
+}
+
+static int tensor_block_layout(uint32_t type, uint32_t *block, uint32_t *bytes) {
+    if (type >= sizeof(ggml_type_info) / sizeof(ggml_type_info[0])) return 0;
+    if (ggml_type_info[type].block_size <= 0 || ggml_type_info[type].type_size <= 0)
+        return 0;
+    *block = (uint32_t)ggml_type_info[type].block_size;
+    *bytes = (uint32_t)ggml_type_info[type].type_size;
+    return 1;
 }
 
 static int make_entry(const gguf_context *g, int ti, int rank, int size,
@@ -158,9 +166,9 @@ static int make_entry(const gguf_context *g, int ti, int rank, int size,
     const char *name = gguf_tensor_name(g, ti), *suf = NULL;
     int l = -1, kind = 0, r0 = 0, r1 = 0, c0 = 0, c1 = 0, qk = 0;
     const gguf_tensor_info *t = &g->tensors[ti];
+    uint32_t type_block = 0, type_bytes = 0;
     if ((t->n_dims != 1 && t->n_dims != 2) ||
-        (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_BF16 &&
-         t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q8_0)) return 0;
+        !tensor_block_layout(t->type, &type_block, &type_bytes)) return 0;
     int cols = (int)t->dims[0], rows = t->n_dims == 1 ? 1 : (int)t->dims[1];
     uint64_t src_rb = tensor_row_bytes(t->type, cols);
     if (!src_rb) return 0;
@@ -251,7 +259,14 @@ static int make_entry(const gguf_context *g, int ti, int rank, int size,
     e->local_cols = (uint32_t)(kind == Q38TP_SLICE_COLS ? c1 - c0 : cols);
     e->source_row_bytes = src_rb;
     e->local_row_bytes = tensor_row_bytes(t->type, (int)e->local_cols);
-    if (!e->local_row_bytes) return 0;
+    if (!e->local_row_bytes ||
+        (kind == Q38TP_SLICE_COLS && ((uint32_t)c0 % type_block) != 0)) {
+        fprintf(stderr,
+                "qwen38_tp_stage: tensor %s cannot be sliced at columns [%d,%d) "
+                "with type=%s block=%u\n",
+                name, c0, c1, ggml_type_name(t->type), type_block);
+        return -1;
+    }
     e->byte_length = (uint64_t)e->local_rows * e->local_row_bytes;
     return 1;
 }
@@ -280,10 +295,15 @@ int main(int argc, char **argv) {
     for (uint64_t i = 0; i < g->n_tensors; i++) {
         if (h->n_entries >= Q38TP_MAX_ENTRIES) { fprintf(stderr, "too many entries\n"); return 4; }
         q38tp_entry e;
-        if (make_entry(g, (int)i, (int)rank, (int)size, &e)) h->entries[h->n_entries++] = e;
+        int made = make_entry(g, (int)i, (int)rank, (int)size, &e);
+        if (made < 0) return 4;
+        if (made) h->entries[h->n_entries++] = e;
     }
-    if (h->n_entries < 700) {
-        fprintf(stderr, "qwen38_tp_stage: incomplete v3 shard, found only %u tensors\n", h->n_entries); return 4;
+    if (h->n_entries != g->n_tensors) {
+        fprintf(stderr,
+                "qwen38_tp_stage: incomplete v%u shard, selected %u of %llu tensors\n",
+                Q38TP_VERSION, h->n_entries, (unsigned long long)g->n_tensors);
+        return 4;
     }
     if (getenv("Q38TP_PLAN") && atoi(getenv("Q38TP_PLAN"))) {
         uint64_t planned = Q38TP_HEADER_BYTES;
@@ -291,9 +311,17 @@ int main(int argc, char **argv) {
             planned = align_up(planned, 256);
             planned += h->entries[i].byte_length;
         }
-        printf("qwen38_tp_stage plan rank=%ld/%ld entries=%u data=%.3fGB file=%.3fGB\n",
+        uint32_t type_count[GGML_TYPE_COUNT] = {0};
+        for (uint32_t i = 0; i < h->n_entries; i++)
+            if (h->entries[i].type < GGML_TYPE_COUNT) type_count[h->entries[i].type]++;
+        printf("qwen38_tp_stage plan rank=%ld/%ld entries=%u data=%.3fGB file=%.3fGB types=",
                rank, size, h->n_entries, (double)(planned-Q38TP_HEADER_BYTES)/1e9,
                (double)planned/1e9);
+        for (uint32_t type = 0, printed = 0; type < GGML_TYPE_COUNT; type++) {
+            if (!type_count[type]) continue;
+            printf("%s%s:%u", printed++ ? "," : "", ggml_type_name(type), type_count[type]);
+        }
+        putchar('\n');
         if (getenv("Q38TP_VERBOSE"))
             for (uint32_t i = 0; i < h->n_entries; i++)
                 if (!strncmp(h->entries[i].name, "blk.64.", 7))
@@ -349,9 +377,12 @@ int main(int argc, char **argv) {
             uint64_t n = (uint64_t)(e->row1 - e->row0) * src_rb;
             rc = copy_contiguous(sfd, soff + (uint64_t)e->row0 * src_rb, out, off, n, &hash);
         } else if (e->kind == Q38TP_SLICE_COLS) {
-            uint64_t byte0 = t->type == GGML_TYPE_Q8_0
-                           ? (uint64_t)(e->col0 / 32u) * 34u
-                           : (uint64_t)e->col0 * 2u;
+            uint32_t block = 0, bytes = 0;
+            if (!tensor_block_layout(t->type, &block, &bytes) || e->col0 % block != 0) {
+                fprintf(stderr, "qwen38_tp_stage: invalid column block offset %s\n", e->name);
+                return 5;
+            }
+            uint64_t byte0 = (uint64_t)(e->col0 / block) * bytes;
             rc = copy_columns(sfd, soff, out, off, e->source_rows, src_rb,
                               byte0,
                               e->local_row_bytes, &hash);

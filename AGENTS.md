@@ -25,6 +25,21 @@ Run commands from repo root unless noted:
 - `./vulkan/build/test_vision_encoder` (or `test_vision_multimodal`) runs Vulkan-side validation.
 - `make -C a64fx/int8-new 5x4 COMPILER=fcc` builds an A64FX target; use `make -C <dir> clean` to reset artifacts.
 
+### A64FX development on Fugaku
+
+Follow [a64fx/remote-dev-procedure.md](a64fx/remote-dev-procedure.md) for
+remote development through Fugaku. It documents the `rsync` deployment,
+login1 SSH forwarding, PJM allocation, and the persistent bash-over-HTTP
+workflow. The canonical bridge scripts are in
+`a64fx/tools/bash-over-http/`; use the project-local `.bash-over-http.json`
+or user-global `${XDG_CONFIG_HOME:-$HOME/.config}/bash-over-http/setup.json`
+for connection defaults.
+
+For Qwen3.8-Flash-Next bring-up, use [q38fn/README.md](q38fn/README.md).
+Do not replicate its 51B BF16 PLE n-gram table: shard it across nodes and use
+the documented row-scaled INT8 HBM representation. Run the bounded validator
+and `q38fn/ngram_probe.c` before attempting multi-node inference.
+
 ## Coding Style & Naming Conventions
 - Languages: C, C++, and architecture-specific `.S` assembly.
 - Use 4-space indentation and keep brace/style conventions consistent with nearby files.
@@ -107,3 +122,36 @@ short gibberish-prompt prefix is unpredictable): G=32~0.0, G=48~0.47, **G=128~0.
 G=256~0.88** — so use G>=128 to see the real rate. Headline: **8.4 tok/s @ alpha 0.78
 G=128 / 0.88 G=256**. The anon load now peaks ~26 GB with no thrash (fadvise). Guard a
 run by killing if `MemAvailable < 2 GB`. Full work log: `project_gemma4_12b_bf16` memory.
+
+### AMD ROCm DS4F runner options
+
+ROCm performance and execution tuning must be supplied as `test_hip_ds4f_real`
+program arguments, not `DS4F_HIP_*` environment variables. The full device-
+resident prefill chain is enabled with:
+
+```
+--hip-prefill-attn 1 --hip-qkv-fuse 1 --hip-qkv-device-chain 1 --hip-attn-device-chain 1 \
+--hip-attn-no-d2h 1 --hip-routed-ffn 1 --hip-fp8-wmma 2 \
+--hip-bf16-wmma 1 --hip-attn-wmma 1 --hip-oproj-group-wmma 2 \
+--hip-mxfp4-wmma 1 --hip-block-threads 128
+```
+
+Decode experiments are independently gated with `--hip-decode-qkv-fuse 1`,
+`--hip-decode-routed-ffn 1`, and `--hip-decode-attn-oproj 1`; each retains CPU
+fallback on unsupported or non-resident tensors. The QKV option currently
+fuses the single-upload projection stage; persistent device KV residency is
+available through `--hip-decode-kv-resident 1` for the GPU attention path.
+
+These flags are intentionally explicit runner arguments. Environment
+variables are reserved for diagnostics/debugging and profiling (for example
+`DS4F_DEBUG_ENV` and `DS4F_PROF`); they must not select a tuned production path.
+
+### DS4F HTTP server options
+
+Serving behavior follows the same argument-only rule. Use
+`--prefill-quantum-tokens` for contended fair-share prefill,
+`--single-prefill-quantum-tokens` for the optimized single-request tile
+(default 2048; benchmark 512/1024/2048 before changing it for another GPU),
+`--agent-cache-max-tokens` for Codex/Claude system-prefix
+caching (default 14336), and `--decode-batch-size` for opt-in multi-context
+decode. Do not add production tuning environment variables for these paths.

@@ -1,0 +1,579 @@
+/* Reusable single-token GLM5Next CPU runtime.  DSA retains latent and pooled
+ * indexer state, while KDA retains recurrent and convolution state across
+ * calls.  This is also the correctness oracle for the HIP runner. */
+#ifndef GLM5NEXT_CPU_RUNTIME_H
+#define GLM5NEXT_CPU_RUNTIME_H
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "glm5next_cpu_kda.h"
+
+typedef int (*glm5next_nextn_fusion_callback)(const gguf_shards *model,
+        const glm5next_config *config, const float *embedding_norm,
+        const float *hidden_norm, float *out, void *opaque);
+
+typedef struct {
+    const gguf_shards *model;
+    glm5next_config config;
+    float *streams, *recurrent, *conv, *latent_kv, *hidden, *target_hidden, *normed, *logits;
+    float *nextn_latent_kv, *nextn_hidden, *nextn_fusion;
+    int max_seq_len;
+    int position;
+    int target_position;
+    int nextn_chain_active;
+    glm5next_dsa_callback dsa_callback;
+    void *dsa_callback_opaque;
+    glm5next_kda_callback kda_callback;
+    void *kda_callback_opaque;
+    glm5next_kda_batch_callback kda_batch_callback;
+    void *kda_batch_callback_opaque;
+    glm5next_moe_callback moe_callback;
+    void *moe_callback_opaque;
+    glm5next_moe_batch_callback moe_batch_callback;
+    void *moe_batch_callback_opaque;
+    glm5next_dense_callback dense_callback;
+    void *dense_callback_opaque;
+    glm5next_mhc_callback mhc_callback;
+    void *mhc_callback_opaque;
+    glm5next_output_callback output_callback;
+    void *output_callback_opaque;
+    glm5next_output_callback nextn_output_callback;
+    void *nextn_output_callback_opaque;
+    glm5next_nextn_fusion_callback nextn_fusion_callback;
+    void *nextn_fusion_callback_opaque;
+    float *indexer_keys;
+    float *indexer_gates;
+} glm5next_cpu_runtime;
+
+static inline void glm5next_cpu_runtime_set_dsa_callback(glm5next_cpu_runtime *r,
+        glm5next_dsa_callback callback, void *opaque) {
+    if (!r) return;
+    r->dsa_callback = callback;
+    r->dsa_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_kda_callback(glm5next_cpu_runtime *r,
+        glm5next_kda_callback callback, void *opaque) {
+    if (!r) return;
+    r->kda_callback = callback;
+    r->kda_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_kda_batch_callback(glm5next_cpu_runtime *r,
+        glm5next_kda_batch_callback callback, void *opaque) {
+    if (!r) return;
+    r->kda_batch_callback = callback;
+    r->kda_batch_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_moe_callback(glm5next_cpu_runtime *r,
+        glm5next_moe_callback callback, void *opaque) {
+    if (!r) return;
+    r->moe_callback = callback;
+    r->moe_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_moe_batch_callback(glm5next_cpu_runtime *r,
+        glm5next_moe_batch_callback callback, void *opaque) {
+    if (!r) return;
+    r->moe_batch_callback = callback;
+    r->moe_batch_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_dense_callback(glm5next_cpu_runtime *r,
+        glm5next_dense_callback callback, void *opaque) {
+    if (!r) return;
+    r->dense_callback = callback;
+    r->dense_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_mhc_callback(glm5next_cpu_runtime *r,
+        glm5next_mhc_callback callback, void *opaque) {
+    if (!r) return;
+    r->mhc_callback = callback;
+    r->mhc_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_output_callback(glm5next_cpu_runtime *r,
+        glm5next_output_callback callback, void *opaque) {
+    if (!r) return;
+    r->output_callback = callback;
+    r->output_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_nextn_output_callback(glm5next_cpu_runtime *r,
+        glm5next_output_callback callback, void *opaque) {
+    if (!r) return;
+    r->nextn_output_callback = callback;
+    r->nextn_output_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_set_nextn_fusion_callback(glm5next_cpu_runtime *r,
+        glm5next_nextn_fusion_callback callback, void *opaque) {
+    if (!r) return;
+    r->nextn_fusion_callback = callback;
+    r->nextn_fusion_callback_opaque = opaque;
+}
+
+static inline void glm5next_cpu_runtime_free(glm5next_cpu_runtime *r) {
+    if (!r) return;
+    free(r->streams); free(r->recurrent); free(r->conv); free(r->latent_kv);
+    free(r->indexer_keys); free(r->indexer_gates);
+    free(r->hidden); free(r->normed); free(r->logits);
+    free(r->target_hidden); free(r->nextn_latent_kv); free(r->nextn_hidden); free(r->nextn_fusion);
+    glm5next_config_free(&r->config); memset(r, 0, sizeof(*r));
+}
+
+static inline int glm5next_cpu_runtime_init(glm5next_cpu_runtime *r,
+        const gguf_shards *model, int max_seq_len, char *error, size_t error_cap) {
+    if (!r || !model) return -1;
+    memset(r, 0, sizeof(*r));
+    if (glm5next_config_load(model->metadata, &r->config, error, error_cap) != 0 ||
+        glm5next_validate_tensors(model, &r->config, error, error_cap) != 0) {
+        glm5next_cpu_runtime_free(r); return -1;
+    }
+    int h = r->config.hidden_size, hc = r->config.hc_count, d = r->config.linear_head_dim;
+    if (max_seq_len < 1 || max_seq_len > r->config.context_length) max_seq_len = 256;
+    size_t rn = (size_t)r->config.n_layers * r->config.attention_heads * d * d;
+    size_t cn = (size_t)r->config.n_layers * 3 * r->config.attention_heads * d *
+                (r->config.short_conv_kernel - 1);
+    r->streams = (float *)malloc((size_t)hc * h * sizeof(float));
+    r->recurrent = (float *)calloc(rn, sizeof(float));
+    r->conv = (float *)calloc(cn, sizeof(float));
+    r->latent_kv = (float *)calloc((size_t)r->config.n_layers * max_seq_len *
+                                   r->config.kv_lora_rank, sizeof(float));
+    r->indexer_keys = (float *)calloc((size_t)r->config.n_layers * max_seq_len *
+                                      r->config.indexer_key_length, sizeof(float));
+    r->indexer_gates = (float *)calloc((size_t)r->config.n_layers * max_seq_len *
+                                       r->config.indexer_key_length, sizeof(float));
+    r->hidden = (float *)malloc((size_t)h * sizeof(float));
+    r->normed = (float *)malloc((size_t)h * sizeof(float));
+    r->logits = (float *)malloc((size_t)r->config.vocab_size * sizeof(float));
+    r->target_hidden = (float *)malloc((size_t)h * sizeof(float));
+    r->nextn_latent_kv = r->config.n_nextn_layers > 0
+        ? (float *)calloc((size_t)r->config.n_nextn_layers * max_seq_len *
+                          r->config.kv_lora_rank, sizeof(float)) : NULL;
+    r->nextn_hidden = r->config.n_nextn_layers > 0
+        ? (float *)malloc((size_t)h * sizeof(float)) : NULL;
+    r->nextn_fusion = r->config.n_nextn_layers > 0
+        ? (float *)malloc((size_t)2 * h * sizeof(float)) : NULL;
+    r->model = model; r->max_seq_len = max_seq_len; r->position = 0; r->target_position = -1;
+    r->nextn_chain_active = 0;
+    if (!r->streams || !r->recurrent || !r->conv || !r->latent_kv ||
+        !r->indexer_keys || !r->indexer_gates || !r->hidden || !r->target_hidden ||
+        !r->normed || !r->logits || (r->config.n_nextn_layers > 0 &&
+        (!r->nextn_latent_kv || !r->nextn_hidden || !r->nextn_fusion))) {
+        glm5next_cpu_runtime_free(r); return -1;
+    }
+    return 0;
+}
+
+static inline void glm5next_cpu_runtime_reset(glm5next_cpu_runtime *r) {
+    if (!r) return;
+    int h = r->config.hidden_size, hc = r->config.hc_count, d = r->config.linear_head_dim;
+    size_t rn = (size_t)r->config.n_layers * r->config.attention_heads * d * d;
+    size_t cn = (size_t)r->config.n_layers * 3 * r->config.attention_heads * d *
+                (r->config.short_conv_kernel - 1);
+    memset(r->streams, 0, (size_t)hc * h * sizeof(float));
+    memset(r->recurrent, 0, rn * sizeof(float)); memset(r->conv, 0, cn * sizeof(float));
+    memset(r->latent_kv, 0, (size_t)r->config.n_layers * r->max_seq_len *
+           r->config.kv_lora_rank * sizeof(float));
+    memset(r->indexer_keys, 0, (size_t)r->config.n_layers * r->max_seq_len *
+           r->config.indexer_key_length * sizeof(float));
+    memset(r->indexer_gates, 0, (size_t)r->config.n_layers * r->max_seq_len *
+           r->config.indexer_key_length * sizeof(float));
+    if (r->nextn_latent_kv)
+        memset(r->nextn_latent_kv, 0, (size_t)r->config.n_nextn_layers * r->max_seq_len *
+               r->config.kv_lora_rank * sizeof(float));
+    r->position = 0;
+    r->target_position = -1;
+    r->nextn_chain_active = 0;
+}
+
+static inline int glm5next_cpu_runtime_step(glm5next_cpu_runtime *r, int token,
+                                             int position) {
+    if (!r || !r->model || token < 0 || token >= r->config.vocab_size ||
+        position < 0 || position >= r->max_seq_len ||
+        (position != 0 && position != r->position)) return -1;
+    int h = r->config.hidden_size, hc = r->config.hc_count, d = r->config.linear_head_dim;
+    const int profile = getenv("GLM5NEXT_PROFILE") && atoi(getenv("GLM5NEXT_PROFILE")) != 0;
+    double profile_layers_ms = 0.0;
+    struct timespec profile_t0, profile_t1;
+    glm5next_tensor_view t;
+    if (position == 0) glm5next_cpu_runtime_reset(r);
+    if (glm5next_tensor_view_get(r->model, "token_embd.weight", 1, &t) != 0 ||
+        t.n_dims != 2 || t.dims[0] != (uint64_t)h ||
+        dequant_row(t.type, (const unsigned char *)t.data +
+                    dequant_row_size(t.type, h) * (size_t)token, r->hidden, h) != 0)
+    {
+        fprintf(stderr, "glm5next: embedding lookup failed for token %d\n", token);
+        return -1;
+    }
+    for (int s = 0; s < hc; ++s)
+        memcpy(r->streams + (size_t)s * h, r->hidden, (size_t)h * sizeof(float));
+    for (int l = 0; l < r->config.n_layers; ++l) {
+        if (profile) clock_gettime(CLOCK_MONOTONIC, &profile_t0);
+        float *rs = r->recurrent + (size_t)l * r->config.attention_heads * d * d;
+        float *cs = r->conv + (size_t)l * 3 * r->config.attention_heads * d *
+                    (r->config.short_conv_kernel - 1);
+        int rc;
+        if (glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA) {
+            rc = l < r->config.first_k_dense_replace
+                ? glm5next_cpu_kda_dense_block_cb(r->model, l, &r->config, r->streams, rs, cs,
+                    r->kda_callback, r->moe_callback, r->kda_callback_opaque,
+                    r->moe_callback_opaque, r->dense_callback,
+                    r->dense_callback_opaque, r->mhc_callback, r->mhc_callback_opaque)
+                : glm5next_cpu_kda_moe_block_cb(r->model, l, &r->config, r->streams, rs, cs,
+                    r->kda_callback, r->moe_callback, r->kda_callback_opaque,
+                    r->moe_callback_opaque, r->mhc_callback, r->mhc_callback_opaque);
+        } else {
+            float *cache = r->latent_kv + (size_t)l * r->max_seq_len * r->config.kv_lora_rank;
+            rc = glm5next_cpu_dsa_moe_block_cached_cb(r->model, l, &r->config, r->streams,
+                cache, r->max_seq_len, position, r->dsa_callback,
+                r->moe_callback, r->dsa_callback_opaque, r->moe_callback_opaque,
+                r->indexer_keys + (size_t)l * r->max_seq_len * r->config.indexer_key_length,
+                r->indexer_gates + (size_t)l * r->max_seq_len * r->config.indexer_key_length,
+                r->mhc_callback, r->mhc_callback_opaque);
+        }
+        if (rc != 0) {
+            fprintf(stderr, "glm5next: layer %d (%s) failed at position %d\n", l,
+                    glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA ? "KDA" : "DSA",
+                    position);
+            return -1;
+        }
+        if (profile) {
+            clock_gettime(CLOCK_MONOTONIC, &profile_t1);
+            double ms = (double)(profile_t1.tv_sec - profile_t0.tv_sec) * 1000.0 +
+                        (double)(profile_t1.tv_nsec - profile_t0.tv_nsec) / 1000000.0;
+            profile_layers_ms += ms;
+            fprintf(stderr, "glm5next profile: pos=%d layer=%d kind=%s %.3f ms\n", position, l,
+                    glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA ? "KDA" : "DSA", ms);
+        }
+    }
+    for (int i = 0; i < h; ++i) {
+        double sum = 0.0; for (int s = 0; s < hc; ++s) sum += r->streams[(size_t)s * h + i];
+        r->hidden[i] = (float)(sum / hc);
+    }
+    memcpy(r->target_hidden, r->hidden, (size_t)h * sizeof(float));
+    r->target_position = position;
+    /* A trunk token establishes a new draft base.  Chained NextN calls are
+     * valid only until the next trunk step; never carry a prior draft hidden
+     * into a later target position. */
+    r->nextn_chain_active = 0;
+    if (r->output_callback) {
+        if (profile) clock_gettime(CLOCK_MONOTONIC, &profile_t0);
+        if (r->output_callback(r->model, &r->config, r->hidden, r->logits,
+                               r->output_callback_opaque) != 0) return -1;
+        if (profile) {
+            clock_gettime(CLOCK_MONOTONIC, &profile_t1);
+            double ms = (double)(profile_t1.tv_sec - profile_t0.tv_sec) * 1000.0 +
+                        (double)(profile_t1.tv_nsec - profile_t0.tv_nsec) / 1000000.0;
+            fprintf(stderr, "glm5next profile: pos=%d output %.3f ms layers %.3f ms total %.3f ms\n",
+                    position, ms, profile_layers_ms, profile_layers_ms + ms);
+        }
+    } else {
+        if (glm5next_tensor_view_get(r->model, "output_norm.weight", 1, &t) != 0 ||
+            glm5next_cpu_vector(&t, r->normed, h) != 0) return -1;
+        glm5next_cpu_rmsnorm(r->hidden, r->hidden, r->normed, h, r->config.norm_epsilon);
+        if (glm5next_tensor_view_get(r->model, "output.weight", 1, &t) != 0 ||
+            glm5next_cpu_matvec(r->logits, &t, r->hidden) != 0) return -1;
+    }
+    r->position = position + 1; return 0;
+}
+
+/* Run a short contiguous target batch.  KDA/DSA attention remains ordered in
+ * token order so recurrent and indexer state are exact, but each layer stops
+ * at the normalized FFN input and calls the batch-MoE callback once.  This is
+ * the state layout required by speculative verification: the callback sees
+ * [tokens][hidden] activations while the layer's attention state advances
+ * normally.  With no batch callback this is an exact scalar-compatible
+ * implementation and is useful as a reference path. */
+static inline int glm5next_cpu_runtime_step_batch(glm5next_cpu_runtime *r,
+        const int *tokens, int count, int position, float *logits_out) {
+    if (!r || !r->model || !tokens || count < 1 || count > 8 ||
+        position < 0 || position + count > r->max_seq_len ||
+        (position != 0 && position != r->position)) return -1;
+    int h = r->config.hidden_size, hc = r->config.hc_count;
+    int d = r->config.linear_head_dim;
+    size_t stream_n = (size_t)hc * h;
+    size_t rn_layer = (size_t)r->config.attention_heads * d * d;
+    size_t cn_layer = (size_t)3 * r->config.attention_heads * d *
+                      (r->config.short_conv_kernel - 1);
+    float *emb = NULL, *streams = NULL, *residual = NULL, *ffn_norm = NULL;
+    float *attn_norm = NULL, *attn_out = NULL, *attn_post = NULL, *attn_comb = NULL;
+    float *ffn_out = NULL, *post = NULL, *comb = NULL, *hidden = NULL;
+    float *norm = NULL;
+    int rc = -1;
+    if (position == 0) glm5next_cpu_runtime_reset(r);
+    emb = (float *)malloc((size_t)count * h * sizeof(float));
+    streams = (float *)malloc((size_t)count * stream_n * sizeof(float));
+    residual = (float *)malloc((size_t)count * stream_n * sizeof(float));
+    ffn_norm = (float *)malloc((size_t)count * h * sizeof(float));
+    ffn_out = (float *)malloc((size_t)count * h * sizeof(float));
+    attn_norm = (float *)malloc((size_t)count * h * sizeof(float));
+    attn_out = (float *)malloc((size_t)count * h * sizeof(float));
+    post = (float *)malloc((size_t)count * hc * sizeof(float));
+    comb = (float *)malloc((size_t)count * hc * hc * sizeof(float));
+    attn_post = (float *)malloc((size_t)count * hc * sizeof(float));
+    attn_comb = (float *)malloc((size_t)count * hc * hc * sizeof(float));
+    hidden = (float *)malloc((size_t)count * h * sizeof(float));
+    norm = (float *)malloc((size_t)h * sizeof(float));
+    if (!emb || !streams || !residual || !ffn_norm || !ffn_out || !attn_norm ||
+        !attn_out || !post || !comb || !attn_post || !attn_comb || !hidden || !norm) goto done;
+    glm5next_tensor_view t;
+    if (glm5next_tensor_view_get(r->model, "token_embd.weight", 1, &t) != 0 ||
+        t.n_dims != 2 || t.dims[0] != (uint64_t)h) goto done;
+    size_t erow = dequant_row_size(t.type, h);
+    for (int k = 0; k < count; ++k) {
+        if (tokens[k] < 0 || tokens[k] >= r->config.vocab_size ||
+            dequant_row(t.type, (const unsigned char *)t.data + erow *
+                        (size_t)tokens[k], emb + (size_t)k * h, h) != 0) goto done;
+        for (int s = 0; s < hc; ++s)
+            memcpy(streams + (size_t)k * stream_n + (size_t)s * h,
+                   emb + (size_t)k * h, (size_t)h * sizeof(float));
+    }
+    for (int l = 0; l < r->config.n_layers; ++l) {
+        glm5next_cpu_mhc_workspace *w = glm5next_cpu_mhc_workspace_get(&r->config);
+        if (!w) goto done;
+        char name[128]; glm5next_tensor_view fn, base, scale;
+#define BATCH_VIEW(s, dst) do { snprintf(name, sizeof(name), "blk.%d.%s", l, (s)); \
+            if (glm5next_tensor_view_get(r->model, name, 1, &(dst)) != 0) goto done; } while (0)
+        /* Attention is ordered, but its result is retained independently for
+         * every verifier token before the common FFN/MoE stage. */
+        int use_kda_batch = glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA &&
+                            r->kda_batch_callback != NULL;
+        if (use_kda_batch) {
+            for (int k = 0; k < count; ++k) {
+                float *sk = streams + (size_t)k * stream_n;
+                float *rs = r->recurrent + (size_t)l * rn_layer;
+                float *cs = r->conv + (size_t)l * cn_layer;
+                memcpy(residual + (size_t)k * stream_n, sk,
+                       stream_n * sizeof(float));
+                BATCH_VIEW("hc_attn_fn.weight", fn);
+                BATCH_VIEW("hc_attn_base.weight", base);
+                BATCH_VIEW("hc_attn_scale.weight", scale);
+                if (glm5next_cpu_mhc_pre_cb(r->model, l, &r->config, 0, &fn, &base,
+                        &scale, residual + (size_t)k * stream_n,
+                        attn_norm + (size_t)k * h, attn_post + (size_t)k * hc,
+                        attn_comb + (size_t)k * hc * hc, r->mhc_callback,
+                        r->mhc_callback_opaque) != 0) goto done;
+                BATCH_VIEW("attn_norm.weight", fn);
+                if (glm5next_cpu_vector(&fn, norm, h) != 0) goto done;
+                glm5next_cpu_rmsnorm(attn_norm + (size_t)k * h,
+                    attn_norm + (size_t)k * h, norm, h, r->config.norm_epsilon);
+            }
+            if (r->kda_batch_callback(r->model, l, &r->config, attn_norm,
+                    attn_out, r->recurrent + (size_t)l * rn_layer,
+                    r->conv + (size_t)l * cn_layer, count,
+                    r->kda_batch_callback_opaque) != 0) goto done;
+            for (int k = 0; k < count; ++k)
+                glm5next_cpu_mhc_post(&r->config, streams + (size_t)k * stream_n,
+                    residual + (size_t)k * stream_n, attn_out + (size_t)k * h,
+                    attn_post + (size_t)k * hc, attn_comb + (size_t)k * hc * hc);
+        } else for (int k = 0; k < count; ++k) {
+            float *sk = streams + (size_t)k * stream_n;
+            float *rs = r->recurrent + (size_t)l * rn_layer;
+            float *cs = r->conv + (size_t)l * cn_layer;
+            memcpy(w->residual, sk, stream_n * sizeof(float));
+            BATCH_VIEW("hc_attn_fn.weight", fn);
+            BATCH_VIEW("hc_attn_base.weight", base);
+            BATCH_VIEW("hc_attn_scale.weight", scale);
+            if (glm5next_cpu_mhc_pre_cb(r->model, l, &r->config, 0, &fn, &base,
+                    &scale, w->residual, w->collapsed, w->post, w->comb,
+                    r->mhc_callback, r->mhc_callback_opaque) != 0) goto done;
+            BATCH_VIEW("attn_norm.weight", fn);
+            if (glm5next_cpu_vector(&fn, norm, h) != 0) goto done;
+            glm5next_cpu_rmsnorm(w->collapsed, w->collapsed, norm, h,
+                                 r->config.norm_epsilon);
+            int ar;
+            if (glm5next_layer_type(&r->config, l) == GLM5NEXT_LAYER_KDA) {
+                ar = r->kda_callback
+                    ? r->kda_callback(r->model, l, &r->config, w->collapsed,
+                                      w->sublayer, rs, cs, r->kda_callback_opaque)
+                    : glm5next_cpu_kda_forward(r->model, l, &r->config,
+                                      w->collapsed, w->sublayer, rs, cs);
+            } else {
+                float *cache = r->latent_kv + (size_t)l * r->max_seq_len *
+                               r->config.kv_lora_rank;
+                ar = r->dsa_callback
+                    ? r->dsa_callback(r->model, l, &r->config, w->collapsed,
+                          w->sublayer, cache, r->indexer_keys + (size_t)l *
+                          r->max_seq_len * r->config.indexer_key_length,
+                          r->indexer_gates + (size_t)l * r->max_seq_len *
+                          r->config.indexer_key_length, r->max_seq_len,
+                          position + k, r->dsa_callback_opaque)
+                    : glm5next_cpu_dsa_forward_cached_indexed(r->model, l,
+                          &r->config, w->collapsed, w->sublayer, cache,
+                          r->indexer_keys + (size_t)l * r->max_seq_len *
+                          r->config.indexer_key_length, r->indexer_gates +
+                          (size_t)l * r->max_seq_len * r->config.indexer_key_length,
+                          r->max_seq_len, position + k);
+            if (ar != 0) goto done;
+            glm5next_cpu_mhc_post(&r->config, sk, w->residual, w->sublayer,
+                                  w->post, w->comb);
+        }
+        for (int k = 0; k < count; ++k) {
+            float *sk = streams + (size_t)k * stream_n;
+            memcpy(residual + (size_t)k * stream_n, sk,
+                   stream_n * sizeof(float));
+            BATCH_VIEW("hc_ffn_fn.weight", fn);
+            BATCH_VIEW("hc_ffn_base.weight", base);
+            BATCH_VIEW("hc_ffn_scale.weight", scale);
+            if (glm5next_cpu_mhc_pre_cb(r->model, l, &r->config, 1, &fn, &base,
+                    &scale, residual + (size_t)k * stream_n,
+                    ffn_norm + (size_t)k * h, post + (size_t)k * hc,
+                    comb + (size_t)k * hc * hc, r->mhc_callback,
+                    r->mhc_callback_opaque) != 0) goto done;
+            BATCH_VIEW("ffn_norm.weight", fn);
+            if (glm5next_cpu_vector(&fn, norm, h) != 0) goto done;
+            glm5next_cpu_rmsnorm(ffn_norm + (size_t)k * h,
+                                 ffn_norm + (size_t)k * h, norm, h,
+                                 r->config.norm_epsilon);
+        }
+        if (l < r->config.first_k_dense_replace) {
+            for (int k = 0; k < count; ++k) {
+                if (glm5next_cpu_dense_ffn_cb(r->model, l, &r->config,
+                        ffn_norm + (size_t)k * h, ffn_out + (size_t)k * h,
+                        r->dense_callback, r->dense_callback_opaque) != 0) goto done;
+            }
+        } else if (glm5next_cpu_moe_ffn_batch_cb(r->model, l, &r->config,
+                ffn_norm, ffn_out, count, r->moe_batch_callback,
+                r->moe_callback, r->moe_batch_callback
+                    ? r->moe_batch_callback_opaque : r->moe_callback_opaque) != 0) goto done;
+        for (int k = 0; k < count; ++k)
+            glm5next_cpu_mhc_post(&r->config, streams + (size_t)k * stream_n,
+                residual + (size_t)k * stream_n, ffn_out + (size_t)k * h,
+                post + (size_t)k * hc, comb + (size_t)k * hc * hc);
+#undef BATCH_VIEW
+    }
+    }
+    for (int k = 0; k < count; ++k) {
+        float *sk = streams + (size_t)k * stream_n;
+        float *hk = hidden + (size_t)k * h;
+        for (int i = 0; i < h; ++i) {
+            double sum = 0.0;
+            for (int s = 0; s < hc; ++s) sum += sk[(size_t)s * h + i];
+            hk[i] = (float)(sum / hc);
+        }
+        float *lo = logits_out ? logits_out + (size_t)k * r->config.vocab_size : r->logits;
+        if (r->output_callback) {
+            if (r->output_callback(r->model, &r->config, hk, lo,
+                                   r->output_callback_opaque) != 0) goto done;
+        } else {
+            if (glm5next_tensor_view_get(r->model, "output_norm.weight", 1, &t) != 0 ||
+                glm5next_cpu_vector(&t, norm, h) != 0) goto done;
+            glm5next_cpu_rmsnorm(hk, hk, norm, h, r->config.norm_epsilon);
+            if (glm5next_tensor_view_get(r->model, "output.weight", 1, &t) != 0 ||
+                glm5next_cpu_matvec(lo, &t, hk) != 0) goto done;
+        }
+    }
+    memcpy(r->streams, streams + (size_t)(count - 1) * stream_n,
+           stream_n * sizeof(float));
+    memcpy(r->hidden, hidden + (size_t)(count - 1) * h, (size_t)h * sizeof(float));
+    memcpy(r->target_hidden, r->hidden, (size_t)h * sizeof(float));
+    r->position = position + count;
+    r->target_position = position + count - 1;
+    r->nextn_chain_active = 0;
+    rc = 0;
+done:
+    free(emb); free(streams); free(residual); free(ffn_norm); free(ffn_out);
+    free(attn_norm); free(attn_out); free(post); free(comb);
+    free(attn_post); free(attn_comb); free(hidden); free(norm);
+    return rc;
+}
+
+/* Execute one GLM5Next NextN/MTP block from the trunk's un-normalized final
+ * hidden state.  NextN is a plain residual block: embedding/hidden fusion,
+ * absorbed MLA attention (without the trunk indexer), MoE FFN, then the
+ * shared draft head.  This mirrors the GLM-DSA MTP graph and keeps its KV
+ * state separate from the trunk DSA caches. */
+static inline float *glm5next_cpu_runtime_nextn_logits(glm5next_cpu_runtime *r,
+                                                       int prev_token, int position) {
+    if (!r || !r->model || r->config.n_nextn_layers <= 0 || !r->target_hidden ||
+        !r->nextn_latent_kv || !r->nextn_hidden || !r->nextn_fusion ||
+        prev_token < 0 || prev_token >= r->config.vocab_size || position < 0 ||
+        position >= r->max_seq_len || r->target_position < 0 ||
+        position != r->target_position + 1) return NULL;
+    int h = r->config.hidden_size, layer = r->config.n_layers;
+    float *embedding = (float *)malloc((size_t)h * sizeof(float));
+    float *enorm = (float *)malloc((size_t)h * sizeof(float));
+    float *hnorm = (float *)malloc((size_t)h * sizeof(float));
+    float *x = (float *)malloc((size_t)h * sizeof(float));
+    float *norm = (float *)malloc((size_t)h * sizeof(float));
+    float *attn = (float *)malloc((size_t)h * sizeof(float));
+    float *ffn_norm = (float *)malloc((size_t)h * sizeof(float));
+    float *ffn = (float *)malloc((size_t)h * sizeof(float));
+    float *head_norm = (float *)malloc((size_t)h * sizeof(float));
+    glm5next_tensor_view t;
+    char name[128];
+    int rc = -1;
+    if (!embedding || !enorm || !hnorm || !x || !norm || !attn || !ffn_norm ||
+        !ffn || !head_norm) goto done;
+    if (glm5next_tensor_view_get(r->model, "token_embd.weight", 1, &t) != 0 ||
+        t.n_dims != 2 || t.dims[0] != (uint64_t)h ||
+        dequant_row(t.type, (const unsigned char *)t.data +
+                    dequant_row_size(t.type, h) * (size_t)prev_token, embedding, h) != 0)
+        goto done;
+#define NEXTN_GET(s) do { snprintf(name, sizeof(name), "blk.%d.%s", layer, (s)); \
+    if (glm5next_tensor_view_get(r->model, name, 1, &t) != 0) goto done; } while (0)
+    NEXTN_GET("nextn.enorm.weight");
+    if (glm5next_cpu_vector(&t, norm, h) != 0) goto done;
+    glm5next_cpu_rmsnorm(enorm, embedding, norm, h, r->config.norm_epsilon);
+    NEXTN_GET("nextn.hnorm.weight");
+    if (glm5next_cpu_vector(&t, norm, h) != 0) goto done;
+    const float *draft_base = r->nextn_chain_active ? r->nextn_hidden : r->target_hidden;
+    glm5next_cpu_rmsnorm(hnorm, draft_base, norm, h, r->config.norm_epsilon);
+    memcpy(r->nextn_fusion, enorm, (size_t)h * sizeof(float));
+    memcpy(r->nextn_fusion + h, hnorm, (size_t)h * sizeof(float));
+    if (r->nextn_fusion_callback) {
+        if (r->nextn_fusion_callback(r->model, &r->config, enorm, hnorm, x,
+                                     r->nextn_fusion_callback_opaque) != 0) goto done;
+    } else {
+        NEXTN_GET("nextn.eh_proj.weight");
+        if (glm5next_cpu_matvec(x, &t, r->nextn_fusion) != 0) goto done;
+    }
+    NEXTN_GET("attn_norm.weight");
+    if (glm5next_cpu_vector(&t, norm, h) != 0) goto done;
+    glm5next_cpu_rmsnorm(ffn_norm, x, norm, h, r->config.norm_epsilon);
+    if ((r->dsa_callback
+            ? r->dsa_callback(r->model, layer, &r->config, ffn_norm, attn,
+                              r->nextn_latent_kv, NULL, NULL, r->max_seq_len,
+                              position, r->dsa_callback_opaque)
+            : glm5next_cpu_dsa_forward_cached(r->model, layer, &r->config, ffn_norm, attn,
+                              r->nextn_latent_kv, r->max_seq_len, position)) != 0) goto done;
+    for (int i = 0; i < h; ++i) x[i] += attn[i];
+    NEXTN_GET("ffn_norm.weight");
+    if (glm5next_cpu_vector(&t, norm, h) != 0) goto done;
+    glm5next_cpu_rmsnorm(ffn_norm, x, norm, h, r->config.norm_epsilon);
+    if ((r->moe_callback
+            ? r->moe_callback(r->model, layer, &r->config, ffn_norm, ffn,
+                               r->moe_callback_opaque)
+            : glm5next_cpu_moe_ffn(r->model, layer, &r->config, ffn_norm, ffn)) != 0) goto done;
+    for (int i = 0; i < h; ++i) x[i] += ffn[i];
+    memcpy(r->nextn_hidden, x, (size_t)h * sizeof(float));
+    NEXTN_GET("nextn.shared_head_norm.weight");
+    if (glm5next_cpu_vector(&t, norm, h) != 0) goto done;
+    glm5next_cpu_rmsnorm(head_norm, x, norm, h, r->config.norm_epsilon);
+    if (r->nextn_output_callback) {
+        memcpy(r->nextn_hidden, x, (size_t)h * sizeof(float));
+        if (r->nextn_output_callback(r->model, &r->config, r->nextn_hidden,
+                                     r->logits, r->nextn_output_callback_opaque) != 0)
+            goto done;
+    } else if (glm5next_tensor_view_get(r->model, "output.weight", 1, &t) != 0 ||
+               glm5next_cpu_matvec(r->logits, &t, head_norm) != 0) goto done;
+    rc = 0;
+done:
+    free(embedding); free(enorm); free(hnorm); free(x); free(norm); free(attn);
+    free(ffn_norm); free(ffn); free(head_norm);
+    if (rc == 0) {
+        r->target_position = position;
+        r->nextn_chain_active = 1;
+    }
+    return rc == 0 ? r->logits : NULL;
+#undef NEXTN_GET
+}
+
+#endif /* GLM5NEXT_CPU_RUNTIME_H */

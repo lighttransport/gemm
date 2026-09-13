@@ -48,6 +48,25 @@ class ServerKVRouteTest(unittest.TestCase):
         h._err = err
         return h, out
 
+    def test_ds4f_wire_proxy_forwards_responses_request(self):
+        h, out = self._fake_handler()
+        response = SimpleNamespace(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            read=lambda: b'{"id":"resp-1","status":"completed"}',
+            close=lambda: None,
+        )
+        runner = SimpleNamespace(port=8088)
+        with mock.patch.object(server, "_ready_serve", return_value=runner), \
+                mock.patch.object(server.urllib.request, "urlopen",
+                                  return_value=response) as urlopen:
+            h._proxy_protocol(models.get("ds4f"), "/v1/responses", {
+                "model": "ds4f", "input": "hello"})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:8088/v1/responses")
+        self.assertEqual(out["status"], 200)
+        self.assertEqual(out["body"]["id"], "resp-1")
+
     def test_k3_kv_load_returns_cache_flags(self):
         h, out = self._fake_handler()
         with mock.patch.object(
@@ -518,6 +537,12 @@ class ServerKVRouteTest(unittest.TestCase):
                 mock.patch.object(server.models, "get_by_openai_model") as resolve, \
                 mock.patch.object(server.laguna_openai, "native_request",
                                   side_effect=fake_native_request), \
+                mock.patch.object(adapter, "responses_request",
+                                  side_effect=server.laguna_openai.responses_request), \
+                mock.patch.object(adapter, "responses_response",
+                                  side_effect=server.laguna_openai.responses_response), \
+                mock.patch.object(adapter, "native_request",
+                                  side_effect=fake_native_request), \
                 mock.patch.object(server._inference, "submit", return_value=job), \
                 mock.patch.object(adapter, "supports_serve", True):
             resolve.return_value = adapter
@@ -587,6 +612,12 @@ class ServerKVRouteTest(unittest.TestCase):
                 mock.patch.object(server.models, "get_by_openai_model") as resolve, \
                 mock.patch.object(server.laguna_openai, "native_request",
                                   side_effect=fake_native_request), \
+                mock.patch.object(adapter, "responses_request",
+                                  side_effect=server.laguna_openai.responses_request), \
+                mock.patch.object(adapter, "responses_response",
+                                  side_effect=server.laguna_openai.responses_response), \
+                mock.patch.object(adapter, "native_request",
+                                  side_effect=fake_native_request), \
                 mock.patch.object(server._inference, "submit", return_value=job), \
                 mock.patch.object(adapter, "supports_serve", True):
             resolve.return_value = adapter
@@ -620,6 +651,12 @@ class ServerKVRouteTest(unittest.TestCase):
                                   return_value=SimpleNamespace(port=8080)), \
                 mock.patch.object(server.models, "get_by_openai_model") as resolve, \
                 mock.patch.object(server.laguna_openai, "native_request",
+                                  side_effect=fake_native_request), \
+                mock.patch.object(adapter, "responses_request",
+                                  side_effect=server.laguna_openai.responses_request), \
+                mock.patch.object(adapter, "responses_response",
+                                  side_effect=server.laguna_openai.responses_response), \
+                mock.patch.object(adapter, "native_request",
                                   side_effect=fake_native_request), \
                 mock.patch.object(server._inference, "submit", return_value=job), \
                 mock.patch.object(adapter, "supports_serve", True):
@@ -658,6 +695,12 @@ class ServerKVRouteTest(unittest.TestCase):
                                   return_value=SimpleNamespace(port=8080)), \
                 mock.patch.object(server.models, "get_by_openai_model") as resolve, \
                 mock.patch.object(server.laguna_openai, "native_request",
+                                  side_effect=fake_native_request), \
+                mock.patch.object(adapter, "responses_request",
+                                  side_effect=server.laguna_openai.responses_request), \
+                mock.patch.object(adapter, "responses_response",
+                                  side_effect=server.laguna_openai.responses_response), \
+                mock.patch.object(adapter, "native_request",
                                   side_effect=fake_native_request), \
                 mock.patch.object(server._inference, "submit", return_value=job), \
                 mock.patch.object(adapter, "supports_serve", True):

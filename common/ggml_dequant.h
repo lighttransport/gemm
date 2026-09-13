@@ -1928,6 +1928,41 @@ static inline uint16_t ggml_fp32_to_fp16(float f) {
  *
  * Constraints: n_cols % vl (= 16 on A64FX) == 0, n_rows % 8 == 0.
  * Caller must have packed weights via pack_bf16_rows_to_pv first. */
+/* Decode matrices have three dominant K widths in Qwen3.8 (4352 for the TP
+ * FFN shard, 5120 for residual projections, and 6144 for SSM inner work).
+ * A single global prefetch distance makes the first width a worker sees choose
+ * the setting for all later matrices.  Keep the global setting as the exact
+ * compatibility default, but allow measured per-width overrides. */
+/* A private runtime (for example the Qwen NextN shadow pool) may select a
+ * different distance without perturbing trunk workers that use this header in
+ * the same process. Negative keeps the environment/shape defaults below. */
+static _Thread_local int tf_bf16pv_decode_prefetch_override = -1;
+
+static inline int tf_bf16pv_decode_prefetch_dist(int n) {
+    if (__builtin_expect(tf_bf16pv_decode_prefetch_override >= 0, 0))
+        return tf_bf16pv_decode_prefetch_override;
+    static _Thread_local int initialized, generic, k4352, k5120, k6144;
+    if (__builtin_expect(!initialized, 0)) {
+        const char *e = getenv("TF_BF16PV_PREFETCH");
+        generic = (e && *e && *e != '0') ? atoi(e) : 0;
+        if (generic == 1) generic = 8;
+        k4352 = generic;
+        k5120 = generic;
+        k6144 = generic;
+        e = getenv("TF_BF16PV_PREFETCH_K4352");
+        if (e && *e) k4352 = atoi(e);
+        e = getenv("TF_BF16PV_PREFETCH_K5120");
+        if (e && *e) k5120 = atoi(e);
+        e = getenv("TF_BF16PV_PREFETCH_K6144");
+        if (e && *e) k6144 = atoi(e);
+        initialized = 1;
+    }
+    if (n == 4352) return k4352;
+    if (n == 5120) return k5120;
+    if (n == 6144) return k6144;
+    return generic;
+}
+
 static inline void matvec_bf16_8row_pv(float *dst,
                                         const uint16_t *pAB, const uint16_t *pCD,
                                         const uint16_t *pEF, const uint16_t *pGH,
@@ -1952,15 +1987,7 @@ static inline void matvec_bf16_8row_pv(float *dst,
      * pair stream, to L2 (locality=2). With ~12 threads/CMG × 4 pair streams
      * the HW prefetcher's ~16 slots/CMG are oversubscribed; an L2-only hint
      * provides headroom without blowing the L1. Guarded by TF_BF16PV_PREFETCH=1. */
-    static _Thread_local int pf_env_done = 0, pf_dist = 0;
-    if (__builtin_expect(!pf_env_done, 0)) {
-        const char *e = getenv("TF_BF16PV_PREFETCH");
-        if (e && *e && *e != '0') pf_dist = atoi(e);
-        /* Preserve the original boolean interface while allowing measured
-         * distances to be selected directly (2, 4, 8, 12, ... chunks). */
-        if (pf_dist == 1) pf_dist = 8;
-        pf_env_done = 1;
-    }
+    int pf_dist = tf_bf16pv_decode_prefetch_dist(n);
     const int pfd_hw = pf_dist * 2 * vl;
     for (; i + vl - 1 < n; i += vl) {
         /* pair[hw_base = 2*i] points at chunk c = i/vl */
@@ -2225,6 +2252,110 @@ static inline void matvec_bf16_4x5_pv(float *d0, float *d1, float *d2,
     d2[0]=svaddv(pg,a02);d2[1]=svaddv(pg,a12);d2[2]=svaddv(pg,a22);d2[3]=svaddv(pg,a32);
     d3[0]=svaddv(pg,a03);d3[1]=svaddv(pg,a13);d3[2]=svaddv(pg,a23);d3[3]=svaddv(pg,a33);
     d4[0]=svaddv(pg,a04);d4[1]=svaddv(pg,a14);d4[2]=svaddv(pg,a24);d4[3]=svaddv(pg,a34);
+}
+
+/* Two rows by six verifier tokens.  Twelve accumulators plus six activation
+ * vectors leave register headroom while still reading every weight once. */
+static inline void matvec_bf16_2x6_pv(float *d0, float *d1, float *d2,
+                                      float *d3, float *d4, float *d5,
+                                      const uint16_t *pAB,
+                                      const float *x0, const float *x1,
+                                      const float *x2, const float *x3,
+                                      const float *x4, const float *x5, int n) {
+    svbool_t pg=svptrue_b32(),ph=svptrue_b16();
+    svuint16_t ix=svindex_u16(0,1);
+    svbool_t po=svcmpne_n_u16(ph,svand_n_u16_x(ph,ix,1),0);
+    svfloat32_t a00=svdup_f32(0),a10=svdup_f32(0);
+    svfloat32_t a01=svdup_f32(0),a11=svdup_f32(0);
+    svfloat32_t a02=svdup_f32(0),a12=svdup_f32(0);
+    svfloat32_t a03=svdup_f32(0),a13=svdup_f32(0);
+    svfloat32_t a04=svdup_f32(0),a14=svdup_f32(0);
+    svfloat32_t a05=svdup_f32(0),a15=svdup_f32(0);
+    static _Thread_local int pf_done=0,pf_dist=16;
+    if(__builtin_expect(!pf_done,0)){
+        const char*e=getenv("TF_BF16PV_PREFETCH_MTP6");
+        if(e&&*e)pf_dist=atoi(e);
+        pf_done=1;
+    }
+    int vl=(int)svcntw(),pfd=pf_dist*2*vl;
+    for(int i=0;i<n;i+=vl){
+        const uint16_t*ab=pAB+2*i;
+        if(pf_dist)__builtin_prefetch(ab+pfd,0,2);
+        svfloat32_t v0=svld1(pg,x0+i),v1=svld1(pg,x1+i),v2=svld1(pg,x2+i);
+        svfloat32_t v3=svld1(pg,x3+i),v4=svld1(pg,x4+i),v5=svld1(pg,x5+i),w;
+        #define TF_BF16PV_MTP6_ROW(A, W) do { \
+            (A##0)=svmla_x(pg,(A##0),(W),v0); (A##1)=svmla_x(pg,(A##1),(W),v1); \
+            (A##2)=svmla_x(pg,(A##2),(W),v2); (A##3)=svmla_x(pg,(A##3),(W),v3); \
+            (A##4)=svmla_x(pg,(A##4),(W),v4); (A##5)=svmla_x(pg,(A##5),(W),v5); \
+        } while (0)
+        w=svreinterpret_f32(svld1_u16(po,ab-1));TF_BF16PV_MTP6_ROW(a0,w);
+        w=svreinterpret_f32(svld1_u16(po,ab));  TF_BF16PV_MTP6_ROW(a1,w);
+        #undef TF_BF16PV_MTP6_ROW
+    }
+    #define TF_BF16PV_MTP6_STORE(D, J) do { \
+        (D)[0]=svaddv(pg,a0##J); (D)[1]=svaddv(pg,a1##J); \
+    } while (0)
+    TF_BF16PV_MTP6_STORE(d0,0); TF_BF16PV_MTP6_STORE(d1,1);
+    TF_BF16PV_MTP6_STORE(d2,2); TF_BF16PV_MTP6_STORE(d3,3);
+    TF_BF16PV_MTP6_STORE(d4,4); TF_BF16PV_MTP6_STORE(d5,5);
+    #undef TF_BF16PV_MTP6_STORE
+}
+
+/* Three arbitrary PV rows by six verifier tokens.  Passing the already
+ * parity-adjusted row addresses lets callers span pair boundaries without
+ * repacking the rank-local stage.  Eighteen accumulators, six activations and
+ * one transient weight fit in the 32-register A64FX SVE file. */
+static inline void matvec_bf16_3x6_pv(float *d0, float *d1, float *d2,
+                                      float *d3, float *d4, float *d5,
+                                      const uint16_t *p0,
+                                      const uint16_t *p1,
+                                      const uint16_t *p2,
+                                      const float *x0, const float *x1,
+                                      const float *x2, const float *x3,
+                                      const float *x4, const float *x5, int n) {
+    svbool_t pg=svptrue_b32(),ph=svptrue_b16();
+    svuint16_t ix=svindex_u16(0,1);
+    svbool_t po=svcmpne_n_u16(ph,svand_n_u16_x(ph,ix,1),0);
+    svfloat32_t a00=svdup_f32(0),a10=svdup_f32(0),a20=svdup_f32(0);
+    svfloat32_t a01=svdup_f32(0),a11=svdup_f32(0),a21=svdup_f32(0);
+    svfloat32_t a02=svdup_f32(0),a12=svdup_f32(0),a22=svdup_f32(0);
+    svfloat32_t a03=svdup_f32(0),a13=svdup_f32(0),a23=svdup_f32(0);
+    svfloat32_t a04=svdup_f32(0),a14=svdup_f32(0),a24=svdup_f32(0);
+    svfloat32_t a05=svdup_f32(0),a15=svdup_f32(0),a25=svdup_f32(0);
+    static _Thread_local int pf_done=0,pf_dist=8;
+    if(__builtin_expect(!pf_done,0)){
+        const char*e=getenv("TF_BF16PV_PREFETCH_MTP6");
+        if(e&&*e)pf_dist=atoi(e);
+        pf_done=1;
+    }
+    int vl=(int)svcntw(),pfd=pf_dist*2*vl;
+    for(int i=0;i<n;i+=vl){
+        const uint16_t*r0=p0+2*i,*r1=p1+2*i,*r2=p2+2*i;
+        if(pf_dist){
+            __builtin_prefetch(r0+pfd,0,2);
+            __builtin_prefetch(r1+pfd,0,2);
+            __builtin_prefetch(r2+pfd,0,2);
+        }
+        svfloat32_t v0=svld1(pg,x0+i),v1=svld1(pg,x1+i),v2=svld1(pg,x2+i);
+        svfloat32_t v3=svld1(pg,x3+i),v4=svld1(pg,x4+i),v5=svld1(pg,x5+i),w;
+        #define TF_BF16PV_MTP6_ROW3(A, W) do { \
+            (A##0)=svmla_x(pg,(A##0),(W),v0); (A##1)=svmla_x(pg,(A##1),(W),v1); \
+            (A##2)=svmla_x(pg,(A##2),(W),v2); (A##3)=svmla_x(pg,(A##3),(W),v3); \
+            (A##4)=svmla_x(pg,(A##4),(W),v4); (A##5)=svmla_x(pg,(A##5),(W),v5); \
+        } while (0)
+        w=svreinterpret_f32(svld1_u16(po,r0));TF_BF16PV_MTP6_ROW3(a0,w);
+        w=svreinterpret_f32(svld1_u16(po,r1));TF_BF16PV_MTP6_ROW3(a1,w);
+        w=svreinterpret_f32(svld1_u16(po,r2));TF_BF16PV_MTP6_ROW3(a2,w);
+        #undef TF_BF16PV_MTP6_ROW3
+    }
+    #define TF_BF16PV_MTP6_STORE3(D, J) do { \
+        (D)[0]=svaddv(pg,a0##J); (D)[1]=svaddv(pg,a1##J); \
+        (D)[2]=svaddv(pg,a2##J); \
+    } while (0)
+    TF_BF16PV_MTP6_STORE3(d0,0); TF_BF16PV_MTP6_STORE3(d1,1);
+    TF_BF16PV_MTP6_STORE3(d2,2); TF_BF16PV_MTP6_STORE3(d3,3);
+    TF_BF16PV_MTP6_STORE3(d4,4); TF_BF16PV_MTP6_STORE3(d5,5);
+    #undef TF_BF16PV_MTP6_STORE3
 }
 
 /* Register-blocked 8-row x 3-token accumulating pv GEMM microkernel.
@@ -2712,6 +2843,13 @@ static inline void matvec_mxfp4_8row_2x(float *dst0, float *dst1,
     dst1[4]=svaddv(pg,b4); dst1[5]=svaddv(pg,b5); dst1[6]=svaddv(pg,b6); dst1[7]=svaddv(pg,b7);
 }
 #endif /* __ARM_FEATURE_SVE */
+
+/* x86 counterparts of the DS4F 8-row decode matvec kernels above. Same
+ * signatures and weight layouts, so ds4f_impl.h's call sites are common. */
+#if !defined(__ARM_FEATURE_SVE)
+#include "ds4f_matvec_avx2.h"
+#endif
+
 
 /* ======================================================================== */
 #ifdef GGML_DEQUANT_IMPLEMENTATION

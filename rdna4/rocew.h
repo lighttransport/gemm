@@ -286,6 +286,7 @@ typedef enum hipFuncAttribute_t {
 #define hipHostMallocWriteCombined 0x04
 #define hipHostMallocCoherent 0x40000000
 #define hipHostMallocNonCoherent 0x80000000
+#define hipHostRegisterDefault 0x00
 
 /* ============================================================================
  * HIPRTC Types
@@ -364,6 +365,9 @@ typedef hipError_t (HIPAPI *thipMallocHost)(void** ptr, size_t size);
 typedef hipError_t (HIPAPI *thipHostMalloc)(void** ptr, size_t size, unsigned int flags);
 typedef hipError_t (HIPAPI *thipFreeHost)(void* ptr);
 typedef hipError_t (HIPAPI *thipHostFree)(void* ptr);
+typedef hipError_t (HIPAPI *thipHostRegister)(void* ptr, size_t size, unsigned int flags);
+typedef hipError_t (HIPAPI *thipHostGetDevicePointer)(void** devPtr, void* hstPtr, unsigned int flags);
+typedef hipError_t (HIPAPI *thipHostUnregister)(void* ptr);
 typedef hipError_t (HIPAPI *thipMallocManaged)(void** ptr, size_t size, unsigned int flags);
 typedef hipError_t (HIPAPI *thipMemcpy)(void* dst, const void* src, size_t size, hipMemcpyKind kind);
 typedef hipError_t (HIPAPI *thipMemcpyAsync)(void* dst, const void* src, size_t size, hipMemcpyKind kind, hipStream_t stream);
@@ -526,6 +530,9 @@ extern thipMalloc3D hipMalloc3D;
 extern thipFree hipFree;
 extern thipMallocHost hipMallocHost;
 extern thipHostMalloc hipHostMalloc;
+extern thipHostRegister hipHostRegister;
+extern thipHostGetDevicePointer hipHostGetDevicePointer;
+extern thipHostUnregister hipHostUnregister;
 extern thipFreeHost hipFreeHost;
 extern thipHostFree hipHostFree;
 extern thipMallocManaged hipMallocManaged;

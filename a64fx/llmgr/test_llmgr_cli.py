@@ -9,6 +9,19 @@ import llmgr_cli as cli
 
 
 class LlmgCliTest(unittest.TestCase):
+    def test_start_preserves_explicit_zero_for_ds4f_full_weights(self):
+        calls = []
+
+        def fake_call(args, method, path, body=None, **_kwargs):
+            calls.append(body)
+            return {"ok": True}
+
+        with mock.patch.object(cli, "call", side_effect=fake_call):
+            self.assertEqual(cli.main(["start", "--model", "ds4f",
+                                       "--mode", "serve", "--port", "8080",
+                                       "--q8-dense", "0", "--fp8-bf16", "1"]), 0)
+        self.assertEqual(calls[0]["q8_dense"], 0)
+        self.assertEqual(calls[0]["fp8_bf16"], 1)
     def test_chat_forwards_cache_flags(self):
         calls = []
 

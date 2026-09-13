@@ -27,7 +27,7 @@ def _input(block):
     return value if isinstance(value, dict) else {"input": value}
 
 
-def request(body):
+def request(body, model=None):
     """Translate an Anthropic Messages request to OpenAI chat fields."""
     messages = []
     system = body.get("system")
@@ -73,9 +73,12 @@ def request(body):
         messages.extend(tool_results)
     if not messages:
         raise ValueError("messages must be a non-empty array")
-    out = {"model": "laguna-s21", "messages": messages,
+    model = model or body.get("model")
+    out = {"messages": messages,
            "max_tokens": int(body.get("max_tokens", 256)),
            "stream": bool(body.get("stream"))}
+    if model:
+        out["model"] = model
     for source, target in (("temperature", "temperature"),
                            ("top_p", "top_p"), ("stop_sequences", "stop"),
                            ("prompt_cache_key", "prompt_cache_key"),

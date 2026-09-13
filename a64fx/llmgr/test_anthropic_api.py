@@ -30,6 +30,7 @@ class AnthropicApiTest(unittest.TestCase):
         self.assertEqual(got["messages"][2]["tool_calls"][0]["id"], "call-1")
         self.assertEqual(got["messages"][3]["role"], "tool")
         self.assertEqual(got["tools"][0]["function"]["name"], "bash")
+        self.assertEqual(got["model"], "claude-sonnet-4")
 
     def test_response_and_stream_events_use_anthropic_shape(self):
         result = anthropic_api.response(

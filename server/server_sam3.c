@@ -14,39 +14,12 @@
 
 #define _POSIX_C_SOURCE 200809L
 
-/* server.c already carries STB_IMAGE_WRITE_IMPLEMENTATION, so include the
- * header here for declarations only. STB_IMAGE_IMPLEMENTATION (the decoder)
- * is unique to this TU since server.c does not decode input images. */
-#define STB_IMAGE_IMPLEMENTATION
+/* server.c already carries STB_IMAGE_WRITE_IMPLEMENTATION. The shared input
+ * decoder lives in image_decode.c so LLM-only builds can use it too. */
 #include "../common/stb_image.h"
 #include "../common/stb_image_write.h"
 
-/* WebP decoder (freestanding-mode: memory APIs only). */
-#define twp_NO_STDIO
-#define twp_IMPLEMENTATION
-#include "../common/tiny_webp.h"
-
 #include "image_decode.h"
-
-unsigned char *server_decode_image_rgb(const unsigned char *bytes,
-                                       size_t len, int *W, int *H) {
-    /* WebP? RIFF....WEBP header. */
-    if (len >= 12 &&
-        bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == 'F' &&
-        bytes[8] == 'W' && bytes[9] == 'E' && bytes[10] == 'B' && bytes[11] == 'P') {
-        int w = 0, h = 0;
-        unsigned char *rgb = twp_read_from_memory((void *)bytes, (int)len, &w, &h,
-                                                  twp_FORMAT_RGB, 0);
-        if (!rgb) return NULL;
-        *W = w; *H = h;
-        return rgb;
-    }
-    int w = 0, h = 0, c = 0;
-    unsigned char *rgb = stbi_load_from_memory(bytes, (int)len, &w, &h, &c, 3);
-    if (!rgb) return NULL;
-    *W = w; *H = h;
-    return rgb;
-}
 
 #include "../cpu/sam3/sam3_runner.h"
 #include "../cpu/sam3/sam3_clip_bpe.h"

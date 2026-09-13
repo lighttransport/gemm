@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import models
@@ -40,6 +41,20 @@ class LagunaAdapterTest(unittest.TestCase):
         self.assertNotIn("--quality-cpp", serve)
         with self.assertRaises(models.ConfigError):
             self.a.generate({"variant": "fp8", "quality_cpp": True})
+
+    def test_asset_roots_and_tokenizer_are_configurable(self):
+        with mock.patch.dict(os.environ, {
+                "LLMGR_MODEL_ROOT": "/weights",
+                "LLMGR_STAGE_ROOT": "/scratch",
+                "LLMGR_TOKENIZER": "/tokenizers/custom.json",
+        }, clear=False):
+            self.assertEqual(self.a.model_dir({"variant": "int4"}),
+                             "/weights/laguna-s21-int4")
+            self.assertEqual(self.a.stage_dir({"variant": "int4", "np": 4}),
+                             "/scratch/%s/laguna-s21-ep4" %
+                             os.environ.get("USER", "unknown"))
+            self.assertEqual(self.a.tokenizer_path({"variant": "int4"}),
+                             "/tokenizers/custom.json")
 
 
 if __name__ == "__main__":

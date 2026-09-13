@@ -7,6 +7,7 @@
  *
  * API:
  *   st_context     *safetensors_open(const char *path);
+ *   st_context     *safetensors_open_header(const char *path);  (metadata only)
  *   void            safetensors_close(st_context *ctx);
  *   int             safetensors_find(const st_context *ctx, const char *name);
  *   const char     *safetensors_name(const st_context *ctx, int i);
@@ -71,9 +72,12 @@ typedef struct {
     void           *map_base;      /* mmap'd whole file */
     size_t          map_size;
     uint8_t        *data;          /* = map_base + 8 + header_size */
+    int             header_only;   /* map_base is malloc'd header storage */
+    size_t          data_offset;   /* file offset of the tensor data section */
 } st_context;
 
 st_context     *safetensors_open(const char *path);
+st_context     *safetensors_open_header(const char *path);
 void            safetensors_close(st_context *ctx);
 int             safetensors_find(const st_context *ctx, const char *name);
 const char     *safetensors_name(const st_context *ctx, int i);
@@ -326,6 +330,81 @@ size_t safetensors_dtype_size(const char *dtype_str) {
     return 0;
 }
 
+static st_context *safetensors_parse_header(void *map, size_t map_size,
+                                            size_t file_size, int header_only) {
+    uint64_t header_size;
+    json_val *root;
+    int n_tensors = 0, ti = 0, i;
+    st_tensor_info *tensors;
+    st_context *ctx;
+    memcpy(&header_size, map, 8);
+    if (8 + header_size > file_size || 8 + header_size > map_size) return NULL;
+    root = json_parse((const char *)map + 8, (int)header_size);
+    if (!root || root->type != JSON_OBJECT) { json_free(root); return NULL; }
+    for (i = 0; i < root->obj.count; i++)
+        if (strcmp(root->obj.keys[i], "__metadata__") != 0) n_tensors++;
+    tensors = (st_tensor_info *)calloc((size_t)n_tensors, sizeof(st_tensor_info));
+    if (!tensors) { json_free(root); return NULL; }
+    for (i = 0; i < root->obj.count; i++) {
+        json_val *entry;
+        st_tensor_info *t;
+        json_val *jdtype, *jshape, *joff;
+        if (strcmp(root->obj.keys[i], "__metadata__") == 0) continue;
+        entry = &root->obj.vals[i];
+        if (entry->type != JSON_OBJECT) continue;
+        t = &tensors[ti++]; t->name = strdup(root->obj.keys[i]);
+        jdtype = json_obj_get(entry, "dtype");
+        if (jdtype && jdtype->type == JSON_STRING) {
+            int dl = jdtype->str.len < 7 ? jdtype->str.len : 7;
+            memcpy(t->dtype_str, jdtype->str.ptr, (size_t)dl); t->dtype_str[dl] = '\0';
+        }
+        jshape = json_obj_get(entry, "shape");
+        if (jshape && jshape->type == JSON_ARRAY) {
+            t->n_dims = jshape->arr.count < ST_MAX_DIMS ? jshape->arr.count : ST_MAX_DIMS;
+            for (int d = 0; d < t->n_dims; d++) t->shape[d] = (uint64_t)jshape->arr.items[d].num;
+        }
+        joff = json_obj_get(entry, "data_offsets");
+        if (joff && joff->type == JSON_ARRAY && joff->arr.count >= 2) {
+            uint64_t a = (uint64_t)joff->arr.items[0].num, b = (uint64_t)joff->arr.items[1].num;
+            t->offset = (size_t)a; t->nbytes = (size_t)(b - a);
+            if (b > file_size - 8 - (size_t)header_size) {
+                for (int j = 0; j < ti; j++) free(tensors[j].name);
+                free(tensors); json_free(root); return NULL;
+            }
+        }
+    }
+    json_free(root);
+    ctx = (st_context *)calloc(1, sizeof(*ctx));
+    if (!ctx) { for (i = 0; i < n_tensors; i++) free(tensors[i].name); free(tensors); return NULL; }
+    ctx->tensors = tensors; ctx->n_tensors = n_tensors; ctx->map_base = map;
+    ctx->map_size = map_size; ctx->data = header_only ? NULL : (uint8_t *)map + 8 + header_size;
+    ctx->data_offset = (size_t)(8 + header_size);
+    ctx->header_only = header_only;
+    return ctx;
+}
+
+st_context *safetensors_open_header(const char *path) {
+    int fd = open(path, O_RDONLY);
+    struct stat st;
+    uint64_t hs;
+    size_t n;
+    void *buf;
+    st_context *ctx;
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < 8) { if (fd >= 0) close(fd); return NULL; }
+    if (read(fd, &hs, 8) != 8 || hs > 64u * 1024u * 1024u || 8 + hs > (uint64_t)st.st_size) {
+        close(fd); return NULL;
+    }
+    n = (size_t)(8 + hs); buf = malloc(n);
+    if (!buf) { close(fd); return NULL; }
+    if (lseek(fd, 0, SEEK_SET) < 0 || read(fd, buf, n) != (ssize_t)n) {
+        free(buf); close(fd); return NULL;
+    }
+    close(fd);
+    ctx = safetensors_parse_header(buf, n, (size_t)st.st_size, 1);
+    if (!ctx) free(buf);
+    return ctx;
+}
+
 st_context *safetensors_open(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { fprintf(stderr, "safetensors: cannot open %s\n", path); return NULL; }
@@ -428,6 +507,8 @@ st_context *safetensors_open(const char *path) {
     ctx->map_base = map;
     ctx->map_size = file_size;
     ctx->data = (uint8_t *)map + 8 + header_size;
+    ctx->header_only = 0;
+    ctx->data_offset = (size_t)(8 + header_size);
     return ctx;
 }
 
@@ -436,7 +517,8 @@ void safetensors_close(st_context *ctx) {
     for (int i = 0; i < ctx->n_tensors; i++)
         free(ctx->tensors[i].name);
     free(ctx->tensors);
-    munmap(ctx->map_base, ctx->map_size);
+    if (ctx->header_only) free(ctx->map_base);
+    else munmap(ctx->map_base, ctx->map_size);
     free(ctx);
 }
 
