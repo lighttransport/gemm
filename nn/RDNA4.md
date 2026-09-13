@@ -565,3 +565,33 @@ now separates `75pct_product_rate_met`, `1000_examples_per_second_rate_met`,
 and `qualified_target_met` (false here). Raw paired/final observations in the
 embedding tinyshogi checkout are `build/dl/bf16fp32-{before,after}-pair-*.json`,
 `bf16fp32-final-*.json`, and the corresponding `bf16fp32-*.log` diagnostics.
+
+## Smooth-activation qualification and FP16 comparison
+
+Configuration version 2 replaces configurable ReLUs with SiLU and records
+that graph-semantic choice in the checkpoint. Version 1 remains loadable and
+unchanged. On the full C256/20 version-2 model, batch 16, the three-product
+`hip-bf16x3-blaslt` backend passed the unchanged global parameter-gradient
+relative-L2 gate: **0.00041490896 <= 0.001**. Output relative L2 was
+0.000019643069 and update/reload also passed.
+
+At batch 64, three 100-step runs measured **807.838 examples/s median**
+(806.399--809.994), 8.72600 useful matrix TFLOP/s and 25.9826 BF16 product
+TFLOP/s at the median. The latter is **13.3244%** of the RX 9070 XT
+195-TFLOP/s nominal dense reference. Neither the 1,000 examples/s nor
+75%-of-peak target is met by the qualified path.
+
+An explicit one-product `hip-fp16-blaslt` experiment uses FP16 operands and
+FP32 matrix accumulation, master weights, gradients and optimizer state. It
+measured **1,148.55 examples/s** at batch 64 (12.4063 useful TFLOP/s,
+**6.31471%** of nominal peak), but it is not qualified: the full version-2
+batch-16 global gradient error was **0.0241998443**. Its finer mantissa and
+faster rate therefore do not make it a safe substitute for compensated BF16.
+
+Two routing experiments were rejected. Sending the large K=256 convolution
+backward matrices to three rocBLASLt calls reduced whole-step throughput to
+760.583 examples/s despite a favorable isolated GEMM result. Restoring the
+one-query-per-CTA attention forward measured 805.210 examples/s, slightly
+below the grouped-forward 810.623 observation, while retaining the same
+0.00041490896 gradient result. These are short observations, not sustained-
+performance guarantees.

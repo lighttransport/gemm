@@ -21,7 +21,7 @@ static double relative(const float *a, const float *b, size_t n) {
 int main(int argc, char **argv) {
     if (argc < 2 || argc > 6 || (argc == 6 && strcmp(argv[5], "report")) ||
         (argc >= 4 && strcmp(argv[3], "wide") && strcmp(argv[3], "full") &&
-         strcmp(argv[3], "stress")))
+         strcmp(argv[3], "stress") && strcmp(argv[3], "silu")))
         return 2;
     int B = 2;
     int report = argc == 6, numerical_failure = 0;
@@ -42,8 +42,11 @@ int main(int argc, char **argv) {
     c.head_dim = argc >= 4 ? 8 : 4;
     c.value_channels = 3;
     c.value_hidden = 8;
-    if (argc >= 4 && (!strcmp(argv[3], "full") || !strcmp(argv[3], "stress")))
+    if (argc >= 4 &&
+        (!strcmp(argv[3], "full") || !strcmp(argv[3], "stress") || !strcmp(argv[3], "silu")))
         c = gn_default_config();
+    if (argc >= 4 && !strcmp(argv[3], "silu"))
+        c.version = 2;
     gn_model *gpu = gn_create(&c, argv[1], 0);
     if (!gpu) {
         fprintf(stderr, "UNAVAILABLE %s: %s\n", argv[1], gn_error());
@@ -105,14 +108,27 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < cpu->nn; i++) {
             Node *cn = &cpu->n[i], *gn = &gpu->n[i];
             size_t count = cn->r * cn->c, flips = 0;
+            float largest_flip = 0;
             if (cn->kind == RELU) {
                 Node *ca = &cpu->n[cn->a], *ga = &gpu->n[gn->a];
-                for (size_t j = 0; j < count; j++)
-                    flips += (ca->x[j] > 0) != (ga->x[j] > 0);
+                for (size_t j = 0; j < count; j++) {
+                    if ((ca->x[j] > 0) != (ga->x[j] > 0)) {
+                        flips++;
+                        largest_flip = fmaxf(largest_flip, fmaxf(fabsf(ca->x[j]), fabsf(ga->x[j])));
+                        if (flips <= 4)
+                            fprintf(stderr,
+                                    "relu flip node=%zu index=%zu cpu=%.9g gpu=%.9g "
+                                    "upstream_grad_cpu=%.9g "
+                                    "upstream_grad_gpu=%.9g\n",
+                                    i, j, ca->x[j], ga->x[j], cn->g[j], gn->g[j]);
+                    }
+                }
             }
-            fprintf(stderr, "node %zu %s %zux%zu: value_rel=%.8g grad_rel=%.8g relu_flips=%zu\n", i,
-                    kind[cn->kind], cn->r, cn->c, relative(cn->x, gn->x, count),
-                    relative(cn->g, gn->g, count), flips);
+            fprintf(stderr,
+                    "node %zu %s %zux%zu: value_rel=%.8g grad_rel=%.8g relu_flips=%zu "
+                    "largest_flip=%.9g\n",
+                    i, kind[cn->kind], cn->r, cn->c, relative(cn->x, gn->x, count),
+                    relative(cn->g, gn->g, count), flips, largest_flip);
         }
     }
     double total_delta = 0, total_base = 0;

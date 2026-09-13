@@ -34,6 +34,33 @@ __device__ unsigned short bf(float x) {
         return (unsigned short)((v.u >> 16) | 64);
     return (unsigned short)((v.u + 0x7fffU + ((v.u >> 16) & 1)) >> 16);
 }
+__device__ unsigned short hf(float x) {
+    union {
+        float f;
+        unsigned u;
+    } v;
+    v.f = x;
+    unsigned sign = (v.u >> 16) & 0x8000, bits = v.u & 0x7fffffff;
+    int exponent = (int)(bits >> 23) - 127 + 15;
+    unsigned mantissa = bits & 0x7fffff;
+    if ((bits >> 23) == 255)
+        return (unsigned short)(sign | (mantissa ? 0x7e00 : 0x7c00));
+    if (exponent >= 31)
+        return (unsigned short)(sign | 0x7c00);
+    if (exponent <= 0) {
+        if (exponent < -10)
+            return (unsigned short)sign;
+        mantissa |= 0x800000;
+        int shift = 14 - exponent;
+        unsigned value = mantissa >> shift, remainder = mantissa & ((1u << shift) - 1);
+        unsigned halfway = 1u << (shift - 1);
+        value += remainder > halfway || (remainder == halfway && (value & 1));
+        return (unsigned short)(sign | value);
+    }
+    unsigned value = ((unsigned)exponent << 10) | (mantissa >> 13), remainder = mantissa & 0x1fff;
+    value += remainder > 0x1000 || (remainder == 0x1000 && (value & 1));
+    return (unsigned short)(sign | value);
+}
 __device__ float at(const float *p, int r, int c, int rows, int cols, int trans) {
     if (r >= rows || c >= cols)
         return 0;

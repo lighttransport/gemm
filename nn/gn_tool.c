@@ -35,19 +35,26 @@ int main(int argc, char **argv) {
     signal(SIGTERM, stop);
     if (argc >= 3 && !strcmp(argv[1], "init")) {
         gn_config c = gn_default_config();
-        if (argc == 5) {
+        if (argc == 4 && !strcmp(argv[3], "silu"))
+            c.version = 2;
+        else if (argc == 5 || argc == 6) {
             c.channels = number(argv[3]);
             c.blocks = number(argv[4]);
             c.head_dim = c.channels < 32 ? c.channels : 32;
             c.attention_every = c.blocks < 5 ? c.blocks : 5;
+            if (argc == 6) {
+                if (strcmp(argv[5], "silu"))
+                    return 2;
+                c.version = 2;
+            }
         } else if (argc != 3)
             return 2;
         gn_model *m = gn_create(&c, "cpu", 0);
         if (!m)
             return error();
         int rc = gn_save(m, argv[2]);
-        printf("{\"parameters\":%zu,\"channels\":%u,\"blocks\":%u}\n", gn_parameter_count(m),
-               c.channels, c.blocks);
+        printf("{\"parameters\":%zu,\"channels\":%u,\"blocks\":%u,\"activation\":\"%s\"}\n",
+               gn_parameter_count(m), c.channels, c.blocks, c.version >= 2 ? "silu" : "relu");
         gn_destroy(m);
         return rc ? error() : 0;
     }
@@ -309,12 +316,15 @@ int main(int argc, char **argv) {
                    gemm_rate * (integer == 16 ? 4 : 1));
         printf(",\"fp32_attention_tflops\":%.6g", total_rate - gemm_rate);
         if (!strncmp(argv[3], "hip", 3) && !strstr(argv[3], "fp32")) {
-            double products = gemm_rate * (integer == 16                   ? 4
-                                           : integer                       ? 1
-                                           : strstr(argv[3], "bf16-mixed") ? 4
-                                           : strstr(argv[3], "bf16x3")     ? 3
-                                           : strstr(argv[3], "bf16")       ? 1
-                                                                           : 6);
+            double multiplier = integer == 16                       ? 4
+                                : integer                           ? 1
+                                : strstr(argv[3], "bf16-mixed")     ? 4
+                                : strstr(argv[3], "bf16x3-forward") ? 5.0 / 3
+                                : strstr(argv[3], "bf16x3-d")       ? 7.0 / 3
+                                : strstr(argv[3], "bf16x3")         ? 3
+                                : strstr(argv[3], "bf16") || strstr(argv[3], "fp16") ? 1
+                                                                    : 6;
+            double products = gemm_rate * multiplier;
             double peak = integer ? int8_peak : bf16_peak;
             printf(
                 ",\"peak_reference\":\"%s\",\"dense_peak_tops\":%.6g,"

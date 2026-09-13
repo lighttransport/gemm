@@ -20,55 +20,96 @@ extern "C" __global__ void gn_transpose_rows(float *out, const float *in, int R,
             out[r * K + k] = tile[i % 32][i / 32];
     }
 }
-/* Default 81-token, 32-wide head: stage K/V with coalesced global reads.
- * Transposed LDS K avoids the strided global dot loop; dot/softmax/output
- * reduction orders remain identical to gn_attention_parallel. */
+/* Default 81-token, 32-wide head: eight waves own eight queries and share one
+ * staged K/V tile. Wave leaders use the CPU softmax order. */
 extern "C" __global__ void gn_attention_81(float *y, float *prob, const float *x, const float *bias,
                                            int B, int side, int C, int D) {
-    __shared__ float q[32], keys[32][82], values[81][33], scores[81];
-    int query = blockIdx.x, t = threadIdx.x, H = C / 32;
-    int i = query % 81, h = query / 81 % H, b = query / (81 * H);
-    if (t < 32)
-        q[t] = x[(b * 81 + i) * 3 * C + h * 32 + t];
+    __shared__ float q[8][32], keys[32][82], values[81][33], scores[8][81];
+    int t = threadIdx.x, wave = t / 32, lane = t % 32, H = C / 32, groups = 11;
+    int group = blockIdx.x % groups, h = blockIdx.x / groups % H;
+    int b = blockIdx.x / (groups * H), i = group * 8 + wave;
+    if (i < 81)
+        q[wave][lane] = x[(b * 81 + i) * 3 * C + h * 32 + lane];
     for (int index = t; index < 81 * 32; index += 256) {
         int j = index / 32, d = index % 32;
         keys[d][j] = x[(b * 81 + j) * 3 * C + C + h * 32 + d];
         values[j][d] = x[(b * 81 + j) * 3 * C + 2 * C + h * 32 + d];
     }
     __syncthreads();
-    float top = -INFINITY;
-    if (t < 81) {
-        float dot = 0;
-        for (int d = 0; d < 32; d++)
-            dot += q[d] * keys[d][t];
-        int rel = (i / 9 + 8 - t / 9) * 17 + i % 9 + 8 - t % 9;
-        scores[t] = dot * rsqrtf((float)D) + bias[rel * H + h];
-        top = scores[t];
-    }
-    top = gn_block_max(top);
-    double sum = 0;
-    if (t < 81) {
-        scores[t] = expf(scores[t] - top);
-        sum = scores[t];
-    }
-    sum = gn_block_sum(sum);
-    if (t < 81) {
-        scores[t] /= (float)sum;
-        prob[query * 81 + t] = scores[t];
+    if (i < 81)
+        for (int j = lane; j < 81; j += 32) {
+            float dot = 0;
+            for (int d = 0; d < 32; d++)
+                dot += q[wave][d] * keys[d][j];
+            int rel = (i / 9 + 8 - j / 9) * 17 + i % 9 + 8 - j % 9;
+            scores[wave][j] = dot * rsqrtf((float)D) + bias[rel * H + h];
+        }
+    __syncthreads();
+    if (!lane && i < 81) {
+        float top = -INFINITY;
+        for (int j = 0; j < 81; j++)
+            top = fmaxf(top, scores[wave][j]);
+        double sum = 0;
+        for (int j = 0; j < 81; j++) {
+            scores[wave][j] = expf(scores[wave][j] - top);
+            sum += scores[wave][j];
+        }
+        int query = (b * H + h) * 81 + i;
+        for (int j = 0; j < 81; j++) {
+            scores[wave][j] /= (float)sum;
+            prob[query * 81 + j] = scores[wave][j];
+        }
     }
     __syncthreads();
-    if (t < 32) {
+    if (i < 81) {
         float v = 0;
         for (int j = 0; j < 81; j++)
-            v += scores[j] * values[j][t];
-        y[(b * 81 + i) * C + h * 32 + t] = v;
+            v += scores[wave][j] * values[j][lane];
+        y[(b * 81 + i) * C + h * 32 + lane] = v;
     }
     (void)B;
     (void)side;
 }
+/* Matching grouped backward score kernel. Eight query waves share V, reducing
+ * CTA count and redundant global reads; per-query FP32 dp order and serial
+ * double softmax-Jacobian dot match the CPU reference. */
+extern "C" __global__ void gn_attention_scores_back_81(float *ds, const float *x, const float *dy,
+                                                       const float *prob, int B, int side, int C,
+                                                       int D) {
+    __shared__ float dys[8][32], values[81][33], scores[8][81];
+    int t = threadIdx.x, wave = t / 32, lane = t % 32, H = C / 32, groups = 11;
+    int group = blockIdx.x % groups, h = blockIdx.x / groups % H;
+    int b = blockIdx.x / (groups * H), i = group * 8 + wave;
+    if (i < 81)
+        dys[wave][lane] = dy[(b * 81 + i) * C + h * 32 + lane];
+    for (int index = t; index < 81 * 32; index += 256) {
+        int j = index / 32, d = index % 32;
+        values[j][d] = x[(b * 81 + j) * 3 * C + 2 * C + h * 32 + d];
+    }
+    __syncthreads();
+    if (i < 81)
+        for (int j = lane; j < 81; j += 32) {
+            float dp = 0;
+            for (int d = 0; d < 32; d++)
+                dp += dys[wave][d] * values[j][d];
+            scores[wave][j] = dp;
+        }
+    __syncthreads();
+    if (!lane && i < 81) {
+        int query = (b * H + h) * 81 + i;
+        double dot = 0;
+        for (int j = 0; j < 81; j++)
+            dot += scores[wave][j] * prob[query * 81 + j];
+        for (int j = 0; j < 81; j++)
+            ds[query * 81 + j] = prob[query * 81 + j] * (scores[wave][j] - (float)dot);
+    }
+    (void)B;
+    (void)side;
+    (void)D;
+}
 /* Generate packed im2col directly: no FP32 column buffer or second read.
  * Constant default-network dimensions strength-reduce integer indexing. */
-template <int Channels = 0, int Side = 0, int Kernel = 0>
+template <int Channels = 0, int Side = 0, int Kernel = 0, bool Half = false>
 __device__ __forceinline__ void gn_columns_pack(unsigned short *out, const float *x, int R, int C,
                                                 int side, int kernel, int precise) {
     C = Channels ? Channels : C;
@@ -84,15 +125,24 @@ __device__ __forceinline__ void gn_columns_pack(unsigned short *out, const float
     float v = k < K && yy >= 0 && xx >= 0 && yy < side && xx < side
                   ? x[(row / S * S + yy * side + xx) * C + k % C]
                   : 0;
-    unsigned short h = bf(v);
+    unsigned short h = Half ? hf(v) : bf(v);
     out[i] = h;
-    if (precise) {
+    if (precise && !Half) {
         float residual = v - unbf(h);
         unsigned short low = bf(residual);
         out[R * stride + i] = low;
         if (precise != 2)
             out[2 * R * stride + i] = bf(residual - unbf(low));
     }
+}
+extern "C" __global__ void gn_columns_fp16(unsigned short *out, const float *x, int R, int C,
+                                           int side, int kernel, int precise) {
+    if (side == 9 && C == 256 && kernel == 3)
+        gn_columns_pack<256, 9, 3, true>(out, x, R, C, side, kernel, precise);
+    else if (side == 9 && C == 80 && kernel == 5)
+        gn_columns_pack<80, 9, 5, true>(out, x, R, C, side, kernel, precise);
+    else
+        gn_columns_pack<0, 0, 0, true>(out, x, R, C, side, kernel, precise);
 }
 extern "C" __global__ void gn_columns_bf16(unsigned short *out, const float *x, int R, int C,
                                            int side, int kernel, int precise) {
@@ -105,7 +155,7 @@ extern "C" __global__ void gn_columns_bf16(unsigned short *out, const float *x, 
 }
 /* Backward dW needs im2col transposed. Gather a channel-coalesced tile
  * straight from NHWC, then transpose/round in LDS. */
-template <int Channels = 0, int Side = 0, int Kernel = 0>
+template <int Channels = 0, int Side = 0, int Kernel = 0, bool Half = false>
 __device__ __forceinline__ void gn_columns_pack_back(unsigned short *out, const float *x, int R,
                                                      int C, int side, int kernel, int precise) {
     C = Channels ? Channels : C;
@@ -128,9 +178,9 @@ __device__ __forceinline__ void gn_columns_pack_back(unsigned short *out, const 
         if (k >= K)
             continue;
         float v = tile[i % 32][i / 32];
-        unsigned short high = bf(v);
+        unsigned short high = Half ? hf(v) : bf(v);
         out[k * stride + r] = high;
-        if (precise) {
+        if (precise && !Half) {
             float residual = v - unbf(high);
             unsigned short low = bf(residual);
             out[(K + k) * stride + r] = low;
@@ -138,6 +188,15 @@ __device__ __forceinline__ void gn_columns_pack_back(unsigned short *out, const 
                 out[(2 * K + k) * stride + r] = bf(residual - unbf(low));
         }
     }
+}
+extern "C" __global__ void gn_columns_fp16_back(unsigned short *out, const float *x, int R, int C,
+                                                int side, int kernel, int precise) {
+    if (side == 9 && C == 256 && kernel == 3)
+        gn_columns_pack_back<256, 9, 3, true>(out, x, R, C, side, kernel, precise);
+    else if (side == 9 && C == 80 && kernel == 5)
+        gn_columns_pack_back<80, 9, 5, true>(out, x, R, C, side, kernel, precise);
+    else
+        gn_columns_pack_back<0, 0, 0, true>(out, x, R, C, side, kernel, precise);
 }
 extern "C" __global__ void gn_columns_bf16_back(unsigned short *out, const float *x, int R, int C,
                                                 int side, int kernel, int precise) {
@@ -267,7 +326,8 @@ extern "C" __global__ void gn_lt_combine(float *y, const float *high, const floa
 /* AccChunk=-1: FP32 accumulators; 0: native BF16 throughout the dot;
  * positive: native BF16 partial dots, widened once per AccChunk products.
  * This changes the training arithmetic and is always opt-in. */
-template <bool Precise, int MR = 2, int NR = 2, int BK = 32, int AccChunk = -1, int Products = 6>
+template <bool Precise, int MR = 2, int NR = 2, int BK = 32, int AccChunk = -1, int Products = 6,
+          bool Separate = true>
 __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned short *b, int M,
                               int N, int K, int add) {
     static_assert(!Precise || AccChunk < 0, "BF16 accumulation changes the precision contract");
@@ -316,11 +376,21 @@ __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned 
             for (int i = 0; i < MR; i++) {
 #pragma unroll
                 for (int j = 0; j < NR; j++) {
+                    if constexpr (Precise && Products == 3 && !Separate)
+                        high[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                            av[0][i], bv[0][j], high[i][j]);
                     if constexpr (Precise) {
-                        low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
-                            av[1][i], bv[0][j], low[i][j]);
-                        low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
-                            av[0][i], bv[1][j], low[i][j]);
+                        if constexpr (Separate) {
+                            low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                                av[1][i], bv[0][j], low[i][j]);
+                            low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                                av[0][i], bv[1][j], low[i][j]);
+                        } else {
+                            high[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                                av[1][i], bv[0][j], high[i][j]);
+                            high[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                                av[0][i], bv[1][j], high[i][j]);
+                        }
                         if constexpr (Products != 3) {
                             low[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
                                 av[1][i], bv[1][j], low[i][j]);
@@ -330,7 +400,7 @@ __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned 
                                 av[0][i], bv[2][j], low[i][j]);
                         }
                     }
-                    if constexpr (AccChunk < 0) {
+                    if constexpr (AccChunk < 0 && !(Precise && Products == 3 && !Separate)) {
                         high[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
                             av[0][i], bv[0][j], high[i][j]);
                     } else {
@@ -360,7 +430,9 @@ __device__ void gn_rdna4_body(float *y, const unsigned short *a, const unsigned 
                 if (r < M && c < N) {
                     float v = AccChunk == 0  ? unbf(narrow[i][j][q])
                               : AccChunk > 0 ? high[i][j][q] + unbf(narrow[i][j][q])
-                                             : high[i][j][q] + low[i][j][q];
+                              : Precise && Products == 3 && !Separate
+                                  ? high[i][j][q]
+                                  : high[i][j][q] + low[i][j][q];
                     y[r * N + c] = v + (add ? y[r * N + c] : 0);
                 }
             }
@@ -376,12 +448,12 @@ extern "C" __global__ __launch_bounds__(128) void gn_mm_tiled_fast(float *y,
                                                                    int N, int K, int add) {
     gn_rdna4_body<false>(y, a, b, M, N, K, add);
 }
-/* Two BF16 components, three products. Omit second-order residual terms,
- * retaining separate FP32 high/correction accumulators. Explicit experiment. */
+/* Two BF16 components, three products. A single FP32 accumulator bank admits
+ * fewer registers; qualification covers the altered but still-FP32 sum order. */
 extern "C" __global__ __launch_bounds__(128) void gn_mm_bf16x3(float *y, const unsigned short *a,
                                                                const unsigned short *b, int M,
                                                                int N, int K, int add) {
-    gn_rdna4_body<true, 1, 1, 32, -1, 3>(y, a, b, M, N, K, add);
+    gn_rdna4_body<true, 1, 1, 32, -1, 3, false>(y, a, b, M, N, K, add);
 }
 extern "C" __global__ __launch_bounds__(128) void gn_mm_bf16_acc(float *y, const unsigned short *a,
                                                                  const unsigned short *b, int M,

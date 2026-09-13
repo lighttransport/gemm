@@ -18,13 +18,14 @@ typedef struct {
     size_t bytes;
 } Buffer;
 typedef struct {
-    int hip, device, active, fp32, precise, synced, legacy, integer, reduced, chunk, wide, mixed;
+    int hip, device, active, fp32, fp16, precise, synced, legacy, integer, reduced, chunk, wide, mixed;
+    int x3_backward;
     size_t used, limit;
     CUcontext context;
     CUmodule cuda_module;
     hipModule_t hip_module;
     Buffer b[SLOT_COUNT];
-    void *functions[39];
+    void *functions[43];
     void *lt;
 } Gpu;
 static const char *names[] = {"gn_mm",
@@ -65,7 +66,11 @@ static const char *names[] = {"gn_mm",
                               "gn_mm_bf16x3",
                               "gn_bn_channels",
                               "gn_bn_back_channels",
-                              "gn_columns_bf16_back"};
+                              "gn_columns_bf16_back",
+                              "gn_attention_scores_back_81",
+                              "gn_pack_fp16",
+                              "gn_columns_fp16",
+                              "gn_columns_fp16_back"};
 static int current(Gpu *g) {
     int rc = g->hip ? (int)hipSetDevice(g->device) : (int)cuCtxSetCurrent(g->context);
     return rc ? gn_fail("cannot activate GPU context") : 0;
@@ -209,15 +214,15 @@ static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, 
         void *bp[] = {&pb, &b, &N, &K, &bt, &g->precise};
         if (ci > 0) {
             void *cp[] = {&pa, &a, &M, &ci, &side, &kernel, &g->precise};
-            CALL(flat(g, 32, M * stride, cp));
+            CALL(flat(g, g->fp16 ? 41 : 32, M * stride, cp));
         } else
-            CALL(launch(g, 15, (K + 31) / 32, (M + 31) / 32, 256, ap));
+            CALL(launch(g, g->fp16 ? 40 : 15, (K + 31) / 32, (M + 31) / 32, 256, ap));
         if (ci < 0) {
             int channels = -ci;
             void *cp[] = {&pb, &b, &K, &channels, &side, &kernel, &g->precise};
-            CALL(launch(g, 38, (N + 31) / 32, (K + 31) / 32, 256, cp));
+            CALL(launch(g, g->fp16 ? 42 : 38, (N + 31) / 32, (K + 31) / 32, 256, cp));
         } else
-            CALL(launch(g, 15, (K + 31) / 32, (N + 31) / 32, 256, bp));
+            CALL(launch(g, g->fp16 ? 40 : 15, (K + 31) / 32, (N + 31) / 32, 256, bp));
 #ifdef GN_HIPBLASLT
         /* BLASLt wins the long-K convolutions; native WMMA avoids six vendor
          * launches and intermediate writes for short-K/small training GEMMs. */
@@ -229,7 +234,7 @@ static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, 
             if (!g->precise) {
                 if (gn_lt_run(g->lt, (void *)(uintptr_t)y, (void *)(uintptr_t)pa,
                               (void *)(uintptr_t)pb, M, N, K, add ? 1 : 0,
-                              (void *)(uintptr_t)workspace, workspace_bytes))
+                              (void *)(uintptr_t)workspace, workspace_bytes, g->fp16))
                     return gn_fail("hipBLASLt inference matmul failed");
                 return 0;
             }
@@ -242,7 +247,7 @@ static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, 
                 if (gn_lt_run(g->lt, (void *)(uintptr_t)(i ? low : high),
                               (void *)(uintptr_t)(pa + ai[i] * M * stride * 2),
                               (void *)(uintptr_t)(pb + bi[i] * N * stride * 2), M, N, K,
-                              i > 1 ? 1 : 0, (void *)(uintptr_t)workspace, workspace_bytes))
+                              i > 1 ? 1 : 0, (void *)(uintptr_t)workspace, workspace_bytes, 0))
                     return gn_fail("hipBLASLt compensated training matmul failed");
             int count = M * N;
             void *combine[] = {&y, &high, &low, &count, &add};
@@ -277,11 +282,17 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
     }
     g->hip = !strncmp(backend, "hip", 3);
     g->fp32 = strstr(backend, "fp32") != NULL;
+    g->fp16 = strstr(backend, "fp16") != NULL;
     g->legacy = strstr(backend, "legacy") != NULL;
     g->integer = strstr(backend, "int16") ? 16 : strstr(backend, "int8") ? 8 : 0;
     g->wide = strstr(backend, "i64") != NULL;
     g->mixed = strstr(backend, "bf16-mixed") != NULL;
-    g->reduced = strstr(backend, "bf16x3")     ? 3
+    g->x3_backward = strstr(backend, "bf16x3-dx")        ? 1
+                     : strstr(backend, "bf16x3-dw")      ? 2
+                     : strstr(backend, "bf16x3-forward") ? 3
+                                                         : 0;
+    g->reduced = g->fp16                       ? 1
+                 : strstr(backend, "bf16x3")  ? 3
                  : strstr(backend, "bf16-acc") ? 2
                  : strstr(backend, "bf16")     ? 1
                                                : 0;
@@ -290,7 +301,7 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         fprintf(
             stderr,
             "EXPERIMENTAL %s: reduced-precision matrices, FP32 master/optimizer/nonmatrix state; "
-            "not qualified for full-network training\n",
+            "qualification is model/batch specific; see RDNA4.md\n",
             backend);
     g->device = device;
     g->limit = limit;
@@ -311,9 +322,8 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         g->active = 1;
         if (strstr(backend, "blaslt")) {
 #ifdef GN_HIPBLASLT
-            fprintf(stderr,
-                    "hip-blaslt: full batch-16 gradient qualification unresolved; see RDNA4.md\n");
-            g->lt = gn_lt_open(0);
+            fprintf(stderr, "hip-blaslt: consult RDNA4.md for per-backend gradient results\n");
+            g->lt = gn_lt_open(strstr(backend, "blaslt-tuned") != NULL);
             if (!g->lt) {
                 gn_fail("hipBLASLt initialization failed");
                 goto bad;
@@ -420,7 +430,7 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         gn_fail("GPU module load failed");
         goto bad;
     }
-    for (int i = 0; i < (g->hip ? 39 : 28); i++) {
+    for (int i = 0; i < (g->hip ? 43 : 28); i++) {
         if (g->hip) {
             hipFunction_t f;
             rc = (int)hipModuleGetFunction(&f, g->hip_module, names[i]);
@@ -541,8 +551,10 @@ int gn_gpu_forward(gn_model *m, const float *input) {
         } else if (n->kind == ATTENTION) {
             void *args[] = {&y, &aux, &x, &w, &B, &side, &C, &D};
             if (!g->legacy)
-                CALL(
-                    launch(g, g->hip && side == 9 && D == 32 ? 33 : 24, R * (C / D), 1, 256, args));
+                if (g->hip && side == 9 && D == 32)
+                    CALL(launch(g, 33, B * (C / D) * 11, 1, 256, args));
+                else
+                    CALL(launch(g, 24, R * (C / D), 1, 256, args));
             else
                 CALL(flat(g, 9, (size_t)R * (C / D), args));
         } else {
@@ -611,7 +623,11 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
                     CALL(columns(g, input, x, R, ci, side, n->k, 0));
                 }
             }
+            if (g->x3_backward)
+                g->precise = g->x3_backward == 1 || g->x3_backward == 3 ? 0 : 2;
             CALL(mm_columns(g, dw, dy, input, C, K, R, 1, 0, 1, fused_ci, side, n->k));
+            if (g->x3_backward)
+                g->precise = g->x3_backward == 2 || g->x3_backward == 3 ? 0 : 2;
             CALL(mm(g, gradient, dy, w, R, K, C, 0, 0, n->kind == LINEAR));
             if (n->kind == CONV)
                 CALL(columns(g, dx, gradient, R, (int)m->n[n->a].c, side, n->k, 1));
@@ -642,7 +658,10 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
                 if (!ds)
                     return -1;
                 void *score[] = {&ds, &x, &dy, &aux, &B, &side, &C, &D};
-                CALL(launch(g, 25, R * (C / D), 1, 256, score));
+                if (g->hip && side == 9 && D == 32)
+                    CALL(launch(g, 39, B * (C / D) * 11, 1, 256, score));
+                else
+                    CALL(launch(g, 25, R * (C / D), 1, 256, score));
                 void *qkv[] = {&dx, &x, &dy, &aux, &ds, &B, &side, &C, &D};
                 CALL(flat(g, 26, (size_t)R * C, qkv));
                 void *relative[] = {&dw, &ds, &B, &side, &C, &D};

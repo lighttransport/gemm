@@ -15,7 +15,7 @@ extern "C" {
 void *gn_lt_open(int tune);
 void gn_lt_close(void *context);
 int gn_lt_run(void *context, void *y, const void *a, const void *b, int M, int N, int K, float beta,
-              void *workspace, size_t workspace_bytes);
+              void *workspace, size_t workspace_bytes, int fp16);
 #ifdef __cplusplus
 }
 #endif

@@ -26,6 +26,12 @@ __global__ __launch_bounds__(128) void tile_variant(float *y, const unsigned sho
                                                     int add) {
     gn_rdna4_body<true, MR, NR, BK>(y, a, b, M, N, K, add);
 }
+template <int MR, int NR>
+__global__ __launch_bounds__(128) void x3_variant(float *y, const unsigned short *a,
+                                                  const unsigned short *b, int M, int N, int K,
+                                                  int add) {
+    gn_rdna4_body<true, MR, NR, 32, -1, 3>(y, a, b, M, N, K, add);
+}
 /* Register issue diagnostic is deliberately NOT called a GEMM/ML throughput. */
 __global__ void issue_ceiling(float *out, int steps) {
     ushort8 a = {0x3b00, 0x3b00, 0x3b00, 0x3b00, 0x3b00, 0x3b00, 0x3b00, 0x3b00};
@@ -122,8 +128,9 @@ int main(int argc, char **argv) {
         "tiled_32x64_bf16x6",     "tiled_64x32_bf16x6",     "tiled_32x32_bf16x6",
         "tiled_64x128_bf16x6",    "hipblaslt_bf16x6",       "hipblaslt_bf16",
         "tiled_32x32_k64_bf16x6", "tiled_64x64_k64_bf16x6", "tiled_32x64_k64_bf16x6",
-        "tiled_32x32_bf16x3"};
-    int modes = 13, failed = 0;
+        "tiled_32x32_bf16x3",     "tiled_32x64_bf16x3",     "tiled_64x32_bf16x3",
+        "tiled_64x64_bf16x3"};
+    int modes = 16, failed = 0;
     if (argc == 9) {
         bool found = false;
         for (const char *name : names)
@@ -148,8 +155,8 @@ int main(int argc, char **argv) {
             continue;
         }
 #endif
-        int precise = mode == 12 ? 2 : mode != 2 && mode != 8, add = 0;
-        int products = mode == 12 ? 3 : precise ? 6 : 1;
+        int precise = mode >= 12 ? 2 : mode != 2 && mode != 8, add = 0;
+        int products = mode >= 12 ? 3 : precise ? 6 : 1;
         auto pack = [&] {
             if (!mode)
                 return;
@@ -160,6 +167,18 @@ int main(int argc, char **argv) {
             switch (mode) {
             case 12:
                 gn_mm_bf16x3<<<dim3((N + 31) / 32, (M + 31) / 32), 128>>>(y, pa, pb, M, N, K, add);
+                break;
+            case 13:
+                x3_variant<1, 2>
+                    <<<dim3((N + 63) / 64, (M + 31) / 32), 128>>>(y, pa, pb, M, N, K, add);
+                break;
+            case 14:
+                x3_variant<2, 1>
+                    <<<dim3((N + 31) / 32, (M + 63) / 64), 128>>>(y, pa, pb, M, N, K, add);
+                break;
+            case 15:
+                x3_variant<2, 2>
+                    <<<dim3((N + 63) / 64, (M + 63) / 64), 128>>>(y, pa, pb, M, N, K, add);
                 break;
             case 0:
                 gn_mm<<<dim3((N + 15) / 16, (M + 15) / 16), 32>>>(y, a, b, M, N, K, ta, tb, add, 1);
@@ -205,13 +224,13 @@ int main(int argc, char **argv) {
                 for (int q = 0; q < 6; q++)
                     if (gn_lt_run(lt, q ? low : high, pa + (size_t)ai[q] * M * stride,
                                   pb + (size_t)bi[q] * N * stride, M, N, K, q > 1 ? 1 : 0,
-                                  workspace, workspace_bytes))
+                                  workspace, workspace_bytes, 0))
                         std::exit(1);
                 gn_lt_combine<<<(M * N + 255) / 256, 256>>>(y, high, low, M * N, add);
                 break;
             }
             case 8:
-                if (gn_lt_run(lt, y, pa, pb, M, N, K, add ? 1 : 0, workspace, workspace_bytes))
+                if (gn_lt_run(lt, y, pa, pb, M, N, K, add ? 1 : 0, workspace, workspace_bytes, 0))
                     std::exit(1);
                 break;
 #endif
@@ -242,13 +261,14 @@ int main(int argc, char **argv) {
         double relative = std::sqrt(delta / std::fmax(base, 1e-30));
         if (!std::isfinite(relative) || relative > (precise ? 2e-5 : .02))
             failed = 1;
-        int pm = mode == 0                                                         ? 16
-                 : mode == 3 || mode == 5 || mode == 9 || mode == 11 || mode == 12 ? 32
+        int pm = mode == 0 ? 16
+                 : mode == 3 || mode == 5 || mode == 9 || mode == 11 || mode == 12 || mode == 13
+                     ? 32
+                     : 64;
+        int pn = mode == 0                                                         ? 16
+                 : mode == 4 || mode == 5 || mode == 9 || mode == 12 || mode == 14 ? 32
+                 : mode == 6                                                       ? 128
                                                                                    : 64;
-        int pn = mode == 0                                           ? 16
-                 : mode == 4 || mode == 5 || mode == 9 || mode == 12 ? 32
-                 : mode == 6                                         ? 128
-                                                                     : 64;
         int pk = mode == 0 ? 16 : mode >= 9 && mode <= 11 ? 64 : 32;
         double executed = 2.0 * ((M + pm - 1) / pm * pm) * ((N + pn - 1) / pn * pn) *
                           ((K + pk - 1) / pk * pk) * products;

@@ -10,7 +10,7 @@
 #include <vector>
 
 struct LtPlan {
-    int m, n, k;
+    int m, n, k, fp16;
     hipblasLtMatmulDesc_t desc = nullptr;
     hipblasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
     hipblasLtMatmulAlgo_t algo{};
@@ -88,12 +88,12 @@ extern "C" void *gn_lt_open(int tune) {
     }
     int version = 0;
     hipblasLtGetVersion(c->handle, &version);
-    std::fprintf(stderr, "hipBLASLt version=%d: explicit BF16/FP32 matrix backend\n", version);
+    std::fprintf(stderr, "hipBLASLt version=%d: explicit 16-bit/FP32 matrix backend\n", version);
     return c;
 }
 extern "C" void gn_lt_close(void *context) { delete static_cast<LtContext *>(context); }
 extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, int M, int N, int K,
-                         float beta, void *workspace, size_t workspace_bytes) {
+                         float beta, void *workspace, size_t workspace_bytes, int fp16) {
     auto *c = static_cast<LtContext *>(context);
     if (!c || !y || !a || !b || M < 1 || N < 1 || K < 1)
         return -1;
@@ -104,7 +104,7 @@ extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, i
     void *trial = static_cast<char *>(workspace) + library_bytes;
     LtPlan *plan = nullptr;
     for (auto *p : c->plans)
-        if (p->m == M && p->n == N && p->k == K) {
+        if (p->m == M && p->n == N && p->k == K && p->fp16 == fp16) {
             plan = p;
             break;
         }
@@ -117,6 +117,7 @@ extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, i
         p->m = M;
         p->n = N;
         p->k = K;
+        p->fp16 = fp16;
         int stride = (K + 31) & ~31;
         hipblasOperation_t trans = HIPBLAS_OP_T;
         uint64_t budget = library_bytes;
@@ -126,8 +127,10 @@ extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, i
             lt_ok(hipblasLtMatmulDescSetAttribute(p->desc, HIPBLASLT_MATMUL_DESC_TRANSA, &trans,
                                                   sizeof(trans)),
                   "transpose") &&
-            lt_ok(hipblasLtMatrixLayoutCreate(&p->a, HIP_R_16BF, K, N, stride), "layout B") &&
-            lt_ok(hipblasLtMatrixLayoutCreate(&p->b, HIP_R_16BF, K, M, stride), "layout A") &&
+            lt_ok(hipblasLtMatrixLayoutCreate(&p->a, fp16 ? HIP_R_16F : HIP_R_16BF, K, N, stride),
+                  "layout B") &&
+            lt_ok(hipblasLtMatrixLayoutCreate(&p->b, fp16 ? HIP_R_16F : HIP_R_16BF, K, M, stride),
+                  "layout A") &&
             lt_ok(hipblasLtMatrixLayoutCreate(&p->c, HIP_R_32F, N, M, N), "layout Y") &&
             lt_ok(hipblasLtMatmulPreferenceSetAttribute(
                       c->pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &budget, sizeof(budget)),

@@ -10,6 +10,8 @@ extern "C" {
 #endif
 typedef struct gn_model gn_model;
 typedef struct {
+    /* version 1 uses ReLU; version 2 uses SiLU for all configurable
+     * activations. The version is checkpointed and changes graph semantics. */
     uint32_t version, side, inputs, actions, channels, blocks;
     uint32_t attention_every, head_dim, value_channels, value_hidden;
     uint64_t seed;
@@ -29,7 +31,11 @@ gn_config gn_default_config(void);
  * FP32 master weights/moments and non-matrix math. Neither is qualified for
  * full-network training; int16 uses four INT8 products, not native INT16 MMA.
  * hip-bf16: single BF16 product with FP32 accumulation during training too.
+ * hip-fp16-blaslt: single FP16 product with FP32 accumulation. This SDK-only
+ * path trades FP16 exponent range for three extra mantissa bits versus BF16.
  * hip-bf16x3: two BF16 components and three products in forward/backward.
+ * hip-bf16x3-dx/dw/forward retain three products only in the named phases;
+ * these asymmetric experiments currently require the -blaslt SDK build.
  * hip-bf16-mixed: six products forward (including inference), three backward.
  * All three accept an optional -blaslt suffix in an SDK-enabled build.
  * Their matrix accumulators remain FP32; they are not accuracy-qualified.

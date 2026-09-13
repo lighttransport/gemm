@@ -162,6 +162,24 @@ extern "C" __global__ void gn_pack_bf16(unsigned short *out, const float *in, in
         }
     }
 }
+extern "C" __global__ void gn_pack_fp16(unsigned short *out, const float *in, int R, int K,
+                                        int trans, int precise) {
+    __shared__ float tile[32][33];
+    int t = threadIdx.x, r0 = blockIdx.y * 32, k0 = blockIdx.x * 32;
+    int stride = (K + 31) & ~31;
+    for (int i = t; i < 1024; i += 256) {
+        int r = i / 32, k = i % 32;
+        int sr = trans ? r0 + k : r0 + r, sk = trans ? k0 + r : k0 + k;
+        tile[r][k] = sr < R && sk < K ? in[trans ? sk * R + sr : sr * K + sk] : 0;
+    }
+    __syncthreads();
+    for (int i = t; i < 1024; i += 256) {
+        int r = r0 + i / 32, k = k0 + i % 32;
+        if (r < R)
+            out[r * stride + k] = hf(trans ? tile[i % 32][i / 32] : tile[i / 32][i % 32]);
+    }
+    (void)precise;
+}
 
 /* One CTA owns a query. Separate Q/K/V reductions avoid contended float
  * atomics and the old per-thread 361-entry stack array in backward. */

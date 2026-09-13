@@ -169,13 +169,13 @@ static int build(gn_model *m, size_t batch, int training) {
     m->batch = batch;
     m->training = training;
     size_t S = m->cfg.side * m->cfg.side, C = m->cfg.channels, R = batch * S;
-    int t;
+    int t, activation = m->cfg.version >= 2 ? SILU : RELU;
     if (!batch || batch > 4096)
         return fail("batch must be in 1..4096");
     N(INPUT, -1, -1, R, m->cfg.inputs, 0, "");
     N(CONV, t, -1, R, C, 5, "stem");
     N(BN, t, -1, R, C, 0, "stem_norm");
-    N(RELU, t, -1, R, C, 0, "");
+    N(activation, t, -1, R, C, 0, "");
     for (unsigned block = 0; block < m->cfg.blocks; block++) {
         int skip = t;
         char key[80];
@@ -209,13 +209,13 @@ static int build(gn_model *m, size_t batch, int training) {
             N(CONV, t, -1, R, C, 3, key);
             KEY("norm1");
             N(BN, t, -1, R, C, 0, key);
-            N(RELU, t, -1, R, C, 0, "");
+            N(activation, t, -1, R, C, 0, "");
             KEY("conv2");
             N(CONV, t, -1, R, C, 3, key);
             KEY("norm2");
             N(BN, t, -1, R, C, 0, key);
             N(ADD, t, skip, R, C, 0, "");
-            N(RELU, t, -1, R, C, 0, "");
+            N(activation, t, -1, R, C, 0, "");
         }
 #undef KEY
     }
@@ -223,9 +223,9 @@ static int build(gn_model *m, size_t batch, int training) {
     N(LINEAR, trunk, -1, R, m->cfg.actions, (int)C, "policy");
     m->policy = t;
     N(LINEAR, trunk, -1, R, m->cfg.value_channels, (int)C, "value.project");
-    N(RELU, t, -1, R, m->cfg.value_channels, 0, "");
+    N(activation, t, -1, R, m->cfg.value_channels, 0, "");
     N(LINEAR, t, -1, batch, m->cfg.value_hidden, (int)(S * m->cfg.value_channels), "value.hidden");
-    N(RELU, t, -1, batch, m->cfg.value_hidden, 0, "");
+    N(activation, t, -1, batch, m->cfg.value_hidden, 0, "");
     N(LINEAR, t, -1, batch, 3, (int)m->cfg.value_hidden, "value.output");
     m->value = t;
     return 0;
@@ -241,24 +241,28 @@ gn_config gn_default_config(void) {
 gn_model *gn_create(const gn_config *c, const char *backend, int device) {
     (void)device;
     error_text[0] = 0;
-    if (!backend || (strcmp(backend, "cpu") && strcmp(backend, "cuda") && strcmp(backend, "hip") &&
-                     strcmp(backend, "cuda-fp32") && strcmp(backend, "hip-fp32") &&
-                     strcmp(backend, "cuda-legacy") && strcmp(backend, "hip-legacy") &&
-                     strcmp(backend, "hip-blaslt") && strcmp(backend, "cuda-int8") &&
-                     strcmp(backend, "cuda-int16") && strcmp(backend, "hip-int8") &&
-                     strcmp(backend, "hip-int8-i64") && strcmp(backend, "hip-int16") &&
-                     strcmp(backend, "hip-bf16") && strcmp(backend, "hip-bf16-acc") &&
-                     strcmp(backend, "hip-bf16-acc128") && strcmp(backend, "hip-bf16-blaslt") &&
-                     strcmp(backend, "hip-bf16x3") && strcmp(backend, "hip-bf16x3-blaslt") &&
-                     strcmp(backend, "hip-bf16-mixed") && strcmp(backend, "hip-bf16-mixed-blaslt"))) {
+    if (!backend ||
+        (strcmp(backend, "cpu") && strcmp(backend, "cuda") && strcmp(backend, "hip") &&
+         strcmp(backend, "cuda-fp32") && strcmp(backend, "hip-fp32") &&
+         strcmp(backend, "cuda-legacy") && strcmp(backend, "hip-legacy") &&
+         strcmp(backend, "hip-blaslt") && strcmp(backend, "cuda-int8") &&
+         strcmp(backend, "cuda-int16") && strcmp(backend, "hip-int8") &&
+         strcmp(backend, "hip-int8-i64") && strcmp(backend, "hip-int16") &&
+         strcmp(backend, "hip-bf16") && strcmp(backend, "hip-bf16-acc") &&
+         strcmp(backend, "hip-bf16-acc128") && strcmp(backend, "hip-bf16-blaslt") &&
+         strcmp(backend, "hip-bf16x3") && strcmp(backend, "hip-bf16x3-blaslt") &&
+         strcmp(backend, "hip-bf16x3-blaslt-tuned") && strcmp(backend, "hip-bf16x3-dx-blaslt") &&
+         strcmp(backend, "hip-bf16x3-dw-blaslt") && strcmp(backend, "hip-bf16x3-forward-blaslt") &&
+         strcmp(backend, "hip-bf16-mixed") && strcmp(backend, "hip-bf16-mixed-blaslt") &&
+         strcmp(backend, "hip-fp16-blaslt"))) {
         fail("unknown backend; expected cpu, cuda or hip");
         return NULL;
     }
-    if (!c || c->version != 1 || c->side < 1 || c->side > 19 || !c->inputs || c->inputs > 1024 ||
-        !c->actions || c->actions > 1024 || c->channels < 1 || c->channels > 1024 ||
-        c->blocks > 80 || !c->head_dim || c->channels % c->head_dim || !c->value_channels ||
-        c->value_channels > 1024 || !c->value_hidden || c->value_hidden > 4096 ||
-        !c->memory_limit) {
+    if (!c || (c->version != 1 && c->version != 2) || c->side < 1 || c->side > 19 || !c->inputs ||
+        c->inputs > 1024 || !c->actions || c->actions > 1024 || c->channels < 1 ||
+        c->channels > 1024 || c->blocks > 80 || !c->head_dim || c->channels % c->head_dim ||
+        !c->value_channels || c->value_channels > 1024 || !c->value_hidden ||
+        c->value_hidden > 4096 || !c->memory_limit) {
         fail("invalid network configuration");
         return NULL;
     }
