@@ -275,6 +275,33 @@ __device__ __forceinline__ void gn_columns_pack(unsigned short *out, const float
             out[2 * R * stride + i] = bf(residual - unbf(low));
     }
 }
+/* C256 keeps every four-channel vector within one spatial tap. Vector packing
+ * amortizes row/tap address arithmetic and emits naturally aligned 64-bit
+ * high/residual stores without changing the packed matrix layout. */
+__device__ __forceinline__ void gn_columns_pack4_256(unsigned short *out, const float *x, int R,
+                                                     int side, int kernel, int precise) {
+    int vector = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int C = 256, Side = 9, Kernel = 3, K = C * Kernel * Kernel;
+    constexpr int Vectors = K / 4;
+    if (vector >= R * Vectors)
+        return;
+    int row = vector / Vectors, k = vector % Vectors * 4, position = row % (Side * Side);
+    int yy = position / Side + k / (C * Kernel) - Kernel / 2;
+    int xx = position % Side + k / C % Kernel - Kernel / 2;
+    float4 value = {};
+    if (yy >= 0 && xx >= 0 && yy < Side && xx < Side)
+        value = *reinterpret_cast<const float4 *>(
+            x + (row / (Side * Side) * (Side * Side) + yy * Side + xx) * C + k % C);
+    ushort4 high = {bf(value.x), bf(value.y), bf(value.z), bf(value.w)};
+    *reinterpret_cast<ushort4 *>(out + row * K + k) = high;
+    if (precise) {
+        ushort4 low = {bf(value.x - unbf(high.x)), bf(value.y - unbf(high.y)),
+                       bf(value.z - unbf(high.z)), bf(value.w - unbf(high.w))};
+        *reinterpret_cast<ushort4 *>(out + R * K + row * K + k) = low;
+    }
+    (void)side;
+    (void)kernel;
+}
 extern "C" __global__ void gn_columns_fp16(unsigned short *out, const float *x, int R, int C,
                                            int side, int kernel, int precise) {
     if (side == 9 && C == 256 && kernel == 3)
@@ -287,7 +314,7 @@ extern "C" __global__ void gn_columns_fp16(unsigned short *out, const float *x, 
 extern "C" __global__ void gn_columns_bf16(unsigned short *out, const float *x, int R, int C,
                                            int side, int kernel, int precise) {
     if (side == 9 && C == 256 && kernel == 3)
-        gn_columns_pack<256, 9, 3>(out, x, R, C, side, kernel, precise);
+        gn_columns_pack4_256(out, x, R, side, kernel, precise);
     else if (side == 9 && C == 80 && kernel == 5)
         gn_columns_pack<80, 9, 5>(out, x, R, C, side, kernel, precise);
     else
@@ -329,10 +356,35 @@ __device__ __forceinline__ void gn_columns_pack_back(unsigned short *out, const 
         }
     }
 }
+__device__ __forceinline__ void gn_columns_pack_back4_fp16_256(unsigned short *out, const float *x,
+                                                              int R) {
+    __shared__ float tile[32][33];
+    int t = threadIdx.x, k0 = blockIdx.x * 32, r0 = blockIdx.y * 32;
+    constexpr int C = 256, Side = 9, Kernel = 3, K = C * Kernel * Kernel;
+    int rr = t / 8, u = t % 8 * 4, row = r0 + rr, k = k0 + u;
+    float4 value = {};
+    int position = row % (Side * Side);
+    int yy = position / Side + k / (C * Kernel) - Kernel / 2;
+    int xx = position % Side + k / C % Kernel - Kernel / 2;
+    if (row < R && k + 3 < K && yy >= 0 && xx >= 0 && yy < Side && xx < Side)
+        value = *reinterpret_cast<const float4 *>(
+            x + (row / (Side * Side) * (Side * Side) + yy * Side + xx) * C + k % C);
+    tile[rr][u] = value.x;
+    tile[rr][u + 1] = value.y;
+    tile[rr][u + 2] = value.z;
+    tile[rr][u + 3] = value.w;
+    __syncthreads();
+    int kk = k0 + t / 8, r = r0 + t % 8 * 4, stride = (R + 31) & ~31;
+    if (kk < K) {
+        ushort4 packed = {hf(tile[t % 8 * 4][t / 8]), hf(tile[t % 8 * 4 + 1][t / 8]),
+                          hf(tile[t % 8 * 4 + 2][t / 8]), hf(tile[t % 8 * 4 + 3][t / 8])};
+        *reinterpret_cast<ushort4 *>(out + kk * stride + r) = packed;
+    }
+}
 extern "C" __global__ void gn_columns_fp16_back(unsigned short *out, const float *x, int R, int C,
                                                 int side, int kernel, int precise) {
     if (side == 9 && C == 256 && kernel == 3)
-        gn_columns_pack_back<256, 9, 3, true>(out, x, R, C, side, kernel, precise);
+        gn_columns_pack_back4_fp16_256(out, x, R);
     else if (side == 9 && C == 80 && kernel == 5)
         gn_columns_pack_back<80, 9, 5, true>(out, x, R, C, side, kernel, precise);
     else

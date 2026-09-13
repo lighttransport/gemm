@@ -234,7 +234,10 @@ static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, 
         void *bp[] = {&pb, &b, &N, &K, &bt, &g->precise};
         if (ci > 0) {
             void *cp[] = {&pa, &a, &M, &ci, &side, &kernel, &g->precise};
-            CALL(flat(g, g->fp16 ? 41 : 32, M * stride, cp));
+            size_t elements = M * stride;
+            if (!g->fp16 && ci == 256 && side == 9 && kernel == 3)
+                elements /= 4;
+            CALL(flat(g, g->fp16 ? 41 : 32, elements, cp));
         } else
             CALL(launch(g, g->fp16 ? 40 : 15, (K + 31) / 32, (M + 31) / 32, 256, ap));
         if (ci < 0) {

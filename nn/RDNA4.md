@@ -727,6 +727,21 @@ The arithmetic and oracle result are unchanged. Three batch-64 runs measure
 22.2167 logical product TFLOP/s, **11.3932%** of nominal peak. Median inference
 latency is 20.6297 ms across the same runs.
 
+### Vectorized convolution packing
+
+The C256 forward BF16 im2col packer now converts four adjacent channels per
+thread and stores aligned four-element high/residual vectors. The FP16 dW
+packer likewise loads four adjacent channels into its 32x32 transpose tile and
+emits four transposed values per thread. C256 and all spatial dimensions are
+compile-time constants; other shapes retain the scalar generic kernels. These
+are layout-only transformations and do not change any floating-point operation.
+
+Batch-64 qualification remains output relative L2 **0.000019973022** and global
+gradient relative L2 **0.00082430711**. Three 100-step runs measure **1,240.43
+examples/s median** (1,238.24--1,240.56), 13.3987 useful matrix TFLOP/s and
+23.5389 logical product TFLOP/s, **12.0712%** of nominal peak. Median inference
+latency is 18.8272 ms.
+
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
 The precision allocation executes an estimated 18.3703 trillion 16-bit matrix
