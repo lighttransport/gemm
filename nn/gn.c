@@ -254,6 +254,8 @@ gn_model *gn_create(const gn_config *c, const char *backend, int device) {
          strcmp(backend, "hip-bf16x3-blaslt-tuned") && strcmp(backend, "hip-bf16x3-dx-blaslt") &&
          strcmp(backend, "hip-bf16x3-dw-blaslt") && strcmp(backend, "hip-bf16x3-forward-blaslt") &&
          strcmp(backend, "hip-bf16x3-fp16back-blaslt") &&
+         strcmp(backend, "hip-bf16x3-fp16back-blaslt-fast") &&
+         strcmp(backend, "hip-bf16x3-fp16back-blaslt-tuned") &&
          strcmp(backend, "hip-bf16-mixed") && strcmp(backend, "hip-bf16-mixed-blaslt") &&
          strcmp(backend, "hip-fp16-blaslt"))) {
         fail("unknown backend; expected cpu, cuda or hip");

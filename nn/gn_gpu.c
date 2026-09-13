@@ -350,7 +350,9 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         if (strstr(backend, "blaslt")) {
 #ifdef GN_HIPBLASLT
             fprintf(stderr, "hip-blaslt: consult RDNA4.md for per-backend gradient results\n");
-            g->lt = gn_lt_open(strstr(backend, "blaslt-tuned") != NULL);
+            g->lt = gn_lt_open(strstr(backend, "blaslt-fast") ? 2
+                               : strstr(backend, "blaslt-tuned") ? 1
+                                                                  : 0);
             if (!g->lt) {
                 gn_fail("hipBLASLt initialization failed");
                 goto bad;

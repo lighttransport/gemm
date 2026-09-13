@@ -27,7 +27,7 @@ struct LtPlan {
     }
 };
 struct LtContext {
-    int tune = 0;
+    int tune = 0; // 0: first supported, 1: timed search, 2: deterministic RDNA4 plan
     hipblasLtHandle_t handle = nullptr;
     hipblasLtMatmulPreference_t pref = nullptr;
     std::vector<LtPlan *> plans;
@@ -56,6 +56,23 @@ static bool lt_ok(hipblasStatus_t status, const char *operation) {
         return true;
     std::fprintf(stderr, "hipBLASLt %s failed: status=%d\n", operation, (int)status);
     return false;
+}
+static int rdna4_candidate(int m, int n, int k) {
+    struct Choice {
+        int m, n, k, candidate;
+    };
+    static const Choice choices[] = {
+        {5184, 256, 2000, 15}, {5184, 256, 2304, 15}, {5184, 256, 512, 16},
+        {3, 256, 64, 18},      {256, 2592, 64, 18},   {32, 256, 5184, 20},
+        {139, 256, 5184, 2},   {256, 512, 5184, 0},   {512, 256, 5184, 1},
+        {256, 256, 5184, 2},   {768, 256, 5184, 4},   {5184, 256, 768, 15},
+        {256, 2304, 5184, 27}, {5184, 2304, 256, 0},  {256, 2000, 5184, 10},
+        {5184, 2000, 256, 5},
+    };
+    for (const auto &choice : choices)
+        if (choice.m == m && choice.n == n && choice.k == k)
+            return choice.candidate;
+    return 0;
 }
 extern "C" void *gn_lt_open(int tune) {
     auto *c = new (std::nothrow) LtContext;
@@ -88,6 +105,13 @@ extern "C" void *gn_lt_open(int tune) {
     }
     int version = 0;
     hipblasLtGetVersion(c->handle, &version);
+    if (c->tune == 2 && version != 100401) {
+        std::fprintf(stderr,
+                     "hipBLASLt: RX 9070 XT fast plans require version 100401; using default "
+                     "selection for version %d\n",
+                     version);
+        c->tune = 0;
+    }
     std::fprintf(stderr, "hipBLASLt version=%d: explicit 16-bit/FP32 matrix backend\n", version);
     return c;
 }
@@ -141,7 +165,8 @@ extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, i
             ok = lt_ok(hipblasLtMatmulAlgoGetHeuristic(c->handle, p->desc, p->a, p->b, p->c, p->c,
                                                        c->pref, 32, results, &count),
                        "heuristic");
-        int selected = -1;
+        int selected = -1, fallback = -1;
+        int preferred = c->tune == 2 ? rdna4_candidate(M, N, K) : -1;
         float best = 1e30f, alpha = 1;
         hipEvent_t start = nullptr, stop = nullptr;
         if (c->event_create(&start) != hipSuccess || c->event_create(&stop) != hipSuccess) {
@@ -152,10 +177,14 @@ extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, i
         }
         for (int i = 0; ok && i < count; i++)
             if (results[i].state == HIPBLAS_STATUS_SUCCESS && results[i].workspaceSize <= budget) {
-                if (!c->tune) {
+                if (fallback < 0)
+                    fallback = i;
+                if (!c->tune || (c->tune == 2 && i == preferred)) {
                     selected = i;
                     break;
                 }
+                if (c->tune == 2)
+                    continue;
                 auto run = [&] {
                     return hipblasLtMatmul(c->handle, p->desc, &alpha, b, p->a, a, p->b, &beta, y,
                                            p->c, trial, p->c, &results[i].algo, workspace,
@@ -177,6 +206,8 @@ extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, i
                     best = ms;
                 }
             }
+        if (c->tune == 2 && selected < 0)
+            selected = fallback;
         (void)c->event_destroy(start);
         (void)c->event_destroy(stop);
         if (selected < 0) {
@@ -186,7 +217,7 @@ extern "C" int gn_lt_run(void *context, void *y, const void *a, const void *b, i
         }
         p->algo = results[selected].algo;
         p->workspace = results[selected].workspaceSize;
-        if (c->tune)
+        if (c->tune == 1)
             std::fprintf(stderr, "hipBLASLt tuned M=%d N=%d K=%d beta=%g candidate=%d/%d ms=%.6g\n",
                          M, N, K, beta, selected, count, best / 5);
         try {

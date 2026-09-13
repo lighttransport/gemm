@@ -38,6 +38,8 @@ gn_config gn_default_config(void);
  * these asymmetric experiments currently require the -blaslt SDK build.
  * hip-bf16x3-fp16back-blaslt uses compensated BF16 forward, one-product
  * FP16/FP32 backward, and compensated linear dX propagation.
+ * Append -fast for deterministic RX 9070 XT batch-64 hipBLASLt plans.
+ * Append -tuned for benchmark-only timed hipBLASLt algorithm selection.
  * hip-bf16-mixed: six products forward (including inference), three backward.
  * All three accept an optional -blaslt suffix in an SDK-enabled build.
  * Their matrix accumulators remain FP32; they are not accuracy-qualified.

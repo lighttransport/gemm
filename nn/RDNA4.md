@@ -2,8 +2,9 @@
 
 Measured 2026-09-13 on RX 9070 XT, gfx1201, ROCm Core 10.0 layout,
 HIP runtime 7.15 and hipBLASLt 1.4.1 (`hipblasLtGetVersion=100401`).
-**The 95% peak target is not achieved. Full batch-16 gradient qualification
-also remains unresolved; these throughput results are not training acceptance.**
+**The 95% and 75% peak targets are not achieved. The current deterministic
+fast-plan path passes full batch-16 and batch-64 gradient qualification, but
+does not yet reach the requested 2,000 examples/s.**
 The latest iteration is recorded under [Precision follow-up](#precision-follow-up);
 the preceding measurements below describe the initial ROCm optimization.
 
@@ -751,6 +752,25 @@ unchanged at 0.00082430711 gradient relative L2. Three 100-step runs measure
 **1,263.98 examples/s median** (1,262.98--1,266.40), 13.6532 useful TFLOP/s and
 23.9860 logical product TFLOP/s, **12.3005%** of nominal peak. Median inference
 latency is 18.6126 ms.
+
+### Deterministic hipBLASLt fast plans
+
+The `hip-bf16x3-fp16back-blaslt-fast` backend selects measured heuristic
+ordinals for the batch-64 C256/20 matrix shapes on RX 9070 XT. Unlike the
+benchmark-only `-tuned` search, the mapping is deterministic across model
+reloads. Unmatched shapes use the first supported heuristic, and SDK versions
+other than hipBLASLt 1.4.1 (`100401`) disable the mapping rather than assuming
+that heuristic ordering is stable.
+
+Independent CPU-oracle runs pass at batch 16 (output relative L2
+0.000019969416, gradient 0.00081994291) and batch 64 (output 0.000019948652,
+gradient 0.00082694669). Both include AdamW comparison and bit-exact backend
+checkpoint reload. Three fresh 100-step batch-64 runs measure **1,280.16
+examples/s median** (1,277.41--1,280.71), a 1.28% improvement over the prior
+1,263.98/s median. Median useful throughput is 13.8279 TFLOP/s and logical
+product throughput is 24.2930 TFLOP/s, **12.4579%** of the nominal 195-TFLOP/s
+peak. Median inference latency is 18.5466 ms. The 2,000 examples/s and 75%
+peak targets remain open.
 
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
