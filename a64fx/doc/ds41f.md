@@ -38,10 +38,55 @@ ms per emitted token**, respectively.
 
 The final runner SHA256 is
 `c8a4075a41bb21ff8418d2a4780df78b01c8a14cef885d250e02c913ef68f96d`.
-The last suite completed successfully on allocation 51575979; no further
-benchmark drivers are queued. See the [long-prompt results](#ordinary-decode-after-1k-prompts)
-and [batched verifier results](#final-batched-verifier-gates-and-timing) for
-test commands, memory minima and evidence locations.
+The preceding full suite completed successfully on allocation 51575979, and
+the resumed validation on 51592153 is recorded below. See the
+[long-prompt results](#ordinary-decode-after-1k-prompts) and [batched verifier
+results](#final-batched-verifier-gates-and-timing) for the earlier test
+commands, memory minima and evidence locations.
+
+### Resumed allocation 51592153 validation
+
+The 12-node normal-mode interactive allocation **51592153** (first compute
+host `f26-6202c`) was resumed through the bash-over-HTTP bridge on local port
+42396 (login reverse port 32396). Its per-node staging root was
+`/local/u14346/ds41f-51592153`. An attached, fail-fast MPI staging pass
+completed all original, dense, Engram and TP4 manifests; the 12-rank manifest
+gate returned `STAGE_VERIFY_MPI_RC=0`. A detached MPI request had previously
+left only rank 0 staged, and the first attached request reached the 1800-second
+bridge timeout while flushing the large Engram shards. The corrected pass used
+absolute script paths, `set -e`, and a 7200-second request timeout. This is the
+required staging pattern for this allocation size.
+
+All short full-model checks returned zero. The nine-token replay produced
+next-token ID 270 in the exact FP8 run (0.714 s), the INT8 block-32 run
+(0.596 s), and the INT8 + expert-SDOT + mHC-matvec run (0.497 s). The latter
+is the speed-first approximation; matching IDs are a control regression, not
+checkpoint validation. The batched MTP verifier used five-token drafts with
+forced rejection at draft index 4. It verified 27 rows, emitted 23 rows across
+five cycles, printed five `VERIFY_CHECK PASS` lines (including the final
+three-row batch), and completed 24 requested generated tokens on all ranks;
+the 12-rank exit code was zero. Per-rank state hashes are retained in
+`tmp/ds41f/job51592153/mtp-verify-short-v1`.
+
+The sustained runs use the 1024-token code history and 128 generated tokens;
+the report measures the 127 steady-state positions 1024..1150. All rows below
+completed on all twelve ranks with binary SHA256
+`c8a4075a41bb21ff8418d2a4780df78b01c8a14cef885d250e02c913ef68f96d`:
+
+| Configuration | Mean ms/token | p95 ms/token | tokens/s | Minimum final MemAvailable |
+| --- | ---: | ---: | ---: | ---: |
+| INT8 + expert SDOT + mHC matvec | 50.0018 | 51.1856 | 19.9993 | 4,768,202,752 B |
+| Above + 8 MiB Engram row cache | 49.9753 | 50.9034 | 20.0099 | 4,765,843,456 B |
+| Above + attention local pages | **49.6843** | **51.0560** | **20.1271** | 4,799,660,032 B |
+| Sparse SDOT attention (no persistent team) | 60.5319 | 62.3369 | 16.5202 | 4,791,730,176 B |
+
+The row-cache and local-page runs have bitwise-identical input/next-token
+triples over the full 1151-position trace. Sparse SDOT completes without an
+error but is slower and is not selected for the 20+ path. The local-page
+configuration clears 20 tokens/s at approximately 1K history on this resumed
+allocation; it remains an approximate speed-first path and does not change the
+independent numerical-validation status above. A three-repeat criterion still
+needs repeated launches of this exact configuration.
 
 ## Implementation continuation: persistent workers and SDOT, 2026-09-13
 
