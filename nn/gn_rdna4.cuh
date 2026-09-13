@@ -295,9 +295,15 @@ __device__ __forceinline__ void gn_columns_pack4_256(unsigned short *out, const 
     ushort4 high = {bf(value.x), bf(value.y), bf(value.z), bf(value.w)};
     *reinterpret_cast<ushort4 *>(out + row * K + k) = high;
     if (precise) {
-        ushort4 low = {bf(value.x - unbf(high.x)), bf(value.y - unbf(high.y)),
-                       bf(value.z - unbf(high.z)), bf(value.w - unbf(high.w))};
+        float4 residual = {value.x - unbf(high.x), value.y - unbf(high.y),
+                           value.z - unbf(high.z), value.w - unbf(high.w)};
+        ushort4 low = {bf(residual.x), bf(residual.y), bf(residual.z), bf(residual.w)};
         *reinterpret_cast<ushort4 *>(out + R * K + row * K + k) = low;
+        if (precise != 2) {
+            ushort4 tail = {bf(residual.x - unbf(low.x)), bf(residual.y - unbf(low.y)),
+                            bf(residual.z - unbf(low.z)), bf(residual.w - unbf(low.w))};
+            *reinterpret_cast<ushort4 *>(out + 2 * R * K + row * K + k) = tail;
+        }
     }
     (void)side;
     (void)kernel;

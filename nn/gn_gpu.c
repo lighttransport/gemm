@@ -890,6 +890,7 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
         g->backward_batch = m->batch;
     }
 backward_done:
+    ; /* A label precedes a statement, not a declaration, in C11. */
     float *values = malloc((size_t)B * 8);
     if (!values)
         return gn_fail("GPU metrics allocation failed");

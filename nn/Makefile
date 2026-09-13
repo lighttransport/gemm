@@ -15,7 +15,7 @@ endif
 FORCE:
 $(BUILD)/backend.config: FORCE | $(BUILD)
 	@python3 -B build_config.py $@ '$(HIPBLASLT)' '$(HIPBLASLT_INCLUDE)' '$(HIPBLASLT_LIB)'
-all: $(BUILD)/test_gn $(BUILD)/libgn.so $(BUILD)/gn_tool $(BUILD)/test_gpu
+all: $(BUILD)/test_gn $(BUILD)/libgn.so $(BUILD)/gn_tool $(BUILD)/test_gpu $(BUILD)/test_gpu_shared
 $(BUILD):
 	mkdir -p $@
 $(BUILD)/gn.o: gn.c gn.h gn_internal.h gn_cpu.h ../common/safetensors.h ../common/safetensors_writer.h | $(BUILD)
@@ -28,10 +28,10 @@ $(BUILD)/gn_gpu_lt.o: gn_gpu.c gn.h gn_internal.h gn_hipblaslt.h $(BUILD)/gn_ker
 	$(CC) $(CFLAGS) -DGN_HIPBLASLT=1 -Wno-overlength-strings -I$(BUILD) -fPIC -c $< -o $@
 $(BUILD)/gn_cpu.o: gn_cpu.c gn_cpu.h gn.h gn_internal.h | $(BUILD)
 	$(CC) $(CFLAGS) -fPIC -pthread -c $< -o $@
-$(BUILD)/cuew.o: ../cuda/cuew.c | $(BUILD)
-	$(CC) -O2 -fPIC -c $< -o $@
-$(BUILD)/rocew.o: ../rdna4/rocew.c | $(BUILD)
-	$(CC) -O2 -fPIC -c $< -o $@
+$(BUILD)/cuew.o: ../cuda/cuew.c Makefile | $(BUILD)
+	$(CC) -O2 -fPIC -fvisibility=hidden -c $< -o $@
+$(BUILD)/rocew.o: ../rdna4/rocew.c Makefile | $(BUILD)
+	$(CC) -O2 -fPIC -fvisibility=hidden -c $< -o $@
 $(BUILD)/gn_hipblaslt.o: gn_hipblaslt.cpp gn_hipblaslt.h $(BUILD)/backend.config | $(BUILD)
 	$(CXX) -O2 -std=c++17 -Wall -Wextra -fPIC -D__HIP_PLATFORM_AMD__ -I$(ROCM_PATH)/include -I$(HIPBLASLT_INCLUDE) -c $< -o $@
 $(BUILD)/libgn.so: $(OBJECTS)
@@ -41,9 +41,12 @@ $(BUILD)/test_gn: test_gn.c $(OBJECTS)
 $(BUILD)/gn_tool: gn_tool.c gn_replay.h $(OBJECTS)
 	$(CC) $(CFLAGS) gn_tool.c $(OBJECTS) -lm -ldl -pthread $(LDLIBS) -o $@
 $(BUILD)/test_gpu: test_gpu.c $(OBJECTS)
-	$(CC) $(CFLAGS) $^ -lm -ldl -pthread $(LDLIBS) -o $@
+	$(CC) $(CFLAGS) $^ -rdynamic -lm -ldl -pthread $(LDLIBS) -o $@
+$(BUILD)/test_gpu_shared: test_gpu.c $(BUILD)/libgn.so
+	$(CC) $(CFLAGS) $< -L$(BUILD) -Wl,-rpath,'$$ORIGIN' -lgn -lm -o $@
 check: all
 	$(BUILD)/test_gn $(BUILD)/roundtrip.safetensors
+	python3 -B test_loader_symbols.py $(BUILD)/libgn.so $(BUILD)/test_gpu
 .PHONY: sm120-bench
 sm120-bench: $(BUILD)/bench_sm120
 $(BUILD)/bench_sm120: bench_sm120.cu gn_kernels.cu gn_sm120.cuh gn_rdna4.cuh | $(BUILD)
@@ -56,4 +59,4 @@ rdna4-bench: $(BUILD)/bench_rdna4
 $(BUILD)/bench_rdna4: bench_rdna4.cpp gn_kernels.cu gn_sm120.cuh gn_rdna4.cuh $(BUILD)/backend.config $(if $(filter 1,$(HIPBLASLT)),$(BUILD)/gn_hipblaslt.o) | $(BUILD)
 	TMPDIR=$(abspath $(BUILD)) hipcc -O3 -std=c++17 --offload-arch=gfx1201 $(if $(filter 1,$(HIPBLASLT)),-DGN_HIPBLASLT=1) $< $(if $(filter 1,$(HIPBLASLT)),-x none $(BUILD)/gn_hipblaslt.o) -Wl,-rpath,$(ROCM_PATH)/lib $(LDLIBS) -ldl -o $@
 clean:
-	$(RM) $(OBJECTS) $(BUILD)/gn_kernels.inc $(BUILD)/libgn.so $(BUILD)/test_gn $(BUILD)/test_gpu $(BUILD)/gn_tool $(BUILD)/roundtrip.safetensors
+	$(RM) $(OBJECTS) $(BUILD)/gn_kernels.inc $(BUILD)/libgn.so $(BUILD)/test_gn $(BUILD)/test_gpu $(BUILD)/test_gpu_shared $(BUILD)/gn_tool $(BUILD)/roundtrip.safetensors

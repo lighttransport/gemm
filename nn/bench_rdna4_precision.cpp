@@ -85,23 +85,36 @@ static int columns_exact() {
                     gn_columns<<<(R * K + 255) / 256, 256>>>(col, x, R, C, side, kernel);
                     gn_pack_bf16<<<dim3((K + 31) / 32, (R + 31) / 32), 256>>>(a, col, R, K, 0,
                                                                               precise);
-                    gn_columns_bf16<<<(R * stride + 255) / 256, 256>>>(b, x, R, C, side, kernel,
-                                                                       precise);
+                    /* Detect omitted writes even when the allocator returns zeros.
+                     * Match the runtime's vectorized launch geometry. */
+                    HIP_OK(hipMemset(b, 0xa5, capacity * 2));
+                    int elements = R * stride;
+                    if (side == 9 && C == 256 && kernel == 3)
+                        elements /= 4;
+                    gn_columns_bf16<<<(elements + 255) / 256, 256>>>(b, x, R, C, side, kernel,
+                                                                    precise);
                     std::vector<unsigned short> ref(R * stride * planes), actual(ref.size());
                     HIP_OK(hipMemcpy(ref.data(), a, ref.size() * 2, hipMemcpyDeviceToHost));
                     HIP_OK(hipMemcpy(actual.data(), b, actual.size() * 2, hipMemcpyDeviceToHost));
-                    if (ref != actual)
+                    if (ref != actual) {
+                        std::fprintf(stderr, "forward packing mismatch side=%d C=%d kernel=%d precise=%d\n",
+                                     side, C, kernel, precise);
                         failed = 1;
+                    }
                     gn_pack_bf16<<<dim3((R + 31) / 32, (K + 31) / 32), 256>>>(a, col, K, R, 1,
                                                                               precise);
+                    HIP_OK(hipMemset(b, 0xa5, capacity * 2));
                     gn_columns_bf16_back<<<dim3((K + 31) / 32, (R + 31) / 32), 256>>>(
                         b, x, R, C, side, kernel, precise);
                     ref.resize(K * back_stride * planes);
                     actual.resize(ref.size());
                     HIP_OK(hipMemcpy(ref.data(), a, ref.size() * 2, hipMemcpyDeviceToHost));
                     HIP_OK(hipMemcpy(actual.data(), b, actual.size() * 2, hipMemcpyDeviceToHost));
-                    if (ref != actual)
+                    if (ref != actual) {
+                        std::fprintf(stderr, "backward packing mismatch side=%d C=%d kernel=%d precise=%d\n",
+                                     side, C, kernel, precise);
                         failed = 1;
+                    }
                     HIP_OK(hipFree(x));
                     HIP_OK(hipFree(col));
                     HIP_OK(hipFree(a));

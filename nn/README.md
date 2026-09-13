@@ -44,7 +44,14 @@ nn/build/test_gpu cuda-fp32             # physical hardware required
 nn/build/test_gpu cuda
 nn/build/test_gpu hip-fp32
 nn/build/test_gpu hip
+nn/build/test_gpu_shared hip            # exercise libgn.so, not linked objects
 ```
+
+`make check` also checks ELF exports with `nm`: CUEW/ROCEW loader variables
+must remain private even in `-rdynamic` executables, so they cannot interpose
+CUDA/HIP runtime functions. CMake runs the same host-only regression. The
+shared-library GPU test accepts the same arguments as `test_gpu`, including
+optional hipBLASLt backends when built with `HIPBLASLT=1`.
 
 GPU tests return 77 for unavailable, not PASS. An optional checkpoint path and
 `wide` or `full` argument test 9×9 C32 or the default C256/20-block network,

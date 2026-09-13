@@ -8,6 +8,10 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/gn_kernels.inc
   DEPENDS gn_kernels.cu gn_sm120.cuh gn_rdna4.cuh embed_kernels.py VERBATIM)
 add_library(gn STATIC gn.c gn_cpu.c gn_gpu.c ../cuda/cuew.c ../rdna4/rocew.c
   ${CMAKE_CURRENT_BINARY_DIR}/gn_kernels.inc)
+# Loader pointer variables have the vendor function names. Keep them local,
+# including when this archive is linked into an executable with -rdynamic.
+set_source_files_properties(../cuda/cuew.c ../rdna4/rocew.c
+  PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden")
 set_target_properties(gn PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 target_include_directories(gn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
@@ -37,4 +41,7 @@ if(BUILD_TESTING)
   add_test(NAME gn-native COMMAND gn-test ${CMAKE_CURRENT_BINARY_DIR}/roundtrip.safetensors)
   add_executable(gn-gpu-test test_gpu.c)
   target_link_libraries(gn-gpu-test PRIVATE gn)
+  set_target_properties(gn-gpu-test PROPERTIES ENABLE_EXPORTS ON)
+  add_test(NAME gn-loader-symbols COMMAND ${Python3_EXECUTABLE} -B
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_loader_symbols.py $<TARGET_FILE:gn-gpu-test>)
 endif()

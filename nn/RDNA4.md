@@ -798,3 +798,39 @@ for three forward products and the mixed backward allocation and excludes
 padding. Benchmark JSON deliberately leaves qualification `unresolved`
 because a timing-only command cannot prove arbitrary checkpoint accuracy; the
 paired `test_gpu` result above is the qualification evidence.
+
+## Pre-push correctness fixes (2026-09-14)
+
+The audit found two regressions independent of the accepted BF16x3/FP16
+throughput result. The C256/9x9/3x3 vectorized forward packer omitted its third
+component in six-product mode. It now writes that component, including padded
+spatial taps. The packing diagnostic poisons output storage before each pass
+and uses the same vector launch geometry as the runtime. Separately, shared
+`libgn.so` exported the CUEW/ROCEW function-pointer variables under vendor
+function names; hipBLASLt initialization called the `hipMalloc` data symbol and
+crashed. Both build systems now hide these internal loader symbols, including
+when a static archive is linked into an export-enabled executable.
+
+Validation on RX 9070 XT / RTX 5060 Ti, with fresh Make builds both without
+and with hipBLASLt 100401:
+
+```sh
+make -C nn check rdna4-precision
+nn/build/bench_rdna4_precision check
+nn/build/test_gpu hip CHECKPOINT full 2
+# SDK-enabled build, using a separate BUILD directory:
+make -C nn BUILD=build-lt HIPBLASLT=1 check
+nn/build-lt/test_gpu_shared hip-bf16x3-fp16back-blaslt-fast CHECKPOINT attention 3
+nn/build/test_gpu_shared cuda-bf16x3 CHECKPOINT attention 3
+```
+
+Supply installed SDK header/library overrides as described above when needed;
+use different writable checkpoint paths for each invocation. All exact BF16,
+integer accumulation and poisoned forward/backward packing checks pass.
+Full six-product `hip` B2: output relative L2 **0.005736607**, gradient relative
+L2 **0.000015322475**. Shared-library hybrid B3 attention: output
+**0.000022067923**, gradient **0.00038926958**. Shared-library CUDA BF16x3 B3
+attention: output **0.000020526279**, gradient **0.000065028274**. These tests
+also pass the optimizer and checkpoint reload gates. CPU gradient/resume and
+ELF export checks pass in both builds. No throughput or long-campaign
+qualification claim is added by these fixes.
