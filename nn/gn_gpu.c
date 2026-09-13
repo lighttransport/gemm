@@ -3,13 +3,16 @@
 #include "../rdna4/rocew.h"
 #include "gn_internal.h"
 #include "gn_kernels.inc"
+#ifdef GN_HIPBLASLT
+#include "gn_hipblaslt.h"
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #define NODE_BASE (4 * GN_PARAMS)
 #define SCRATCH_BASE (NODE_BASE + 3 * GN_NODES)
-#define SLOT_COUNT (SCRATCH_BASE + 12)
+#define SLOT_COUNT (SCRATCH_BASE + 15)
 typedef struct {
     uint64_t ptr;
     size_t bytes;
@@ -22,6 +25,7 @@ typedef struct {
     hipModule_t hip_module;
     Buffer b[SLOT_COUNT];
     void *functions[32];
+    void *lt;
 } Gpu;
 static const char *names[] = {"gn_mm",
                               "gn_columns",
@@ -50,7 +54,10 @@ static const char *names[] = {"gn_mm",
                               "gn_attention_parallel",
                               "gn_attention_scores_back",
                               "gn_attention_qkv_back",
-                              "gn_attention_bias_back"};
+                              "gn_attention_bias_back",
+                              "gn_lt_combine",
+                              "gn_bias_back_parallel",
+                              "gn_grad_norm_parallel"};
 static int current(Gpu *g) {
     int rc = g->hip ? (int)hipSetDevice(g->device) : (int)cuCtxSetCurrent(g->context);
     return rc ? gn_fail("cannot activate GPU context") : 0;
@@ -154,7 +161,7 @@ static int mm(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, i
         void *packed[] = {&y, &pa, &pb, &sa, &sb, &M, &N, &K, &add, &g->integer};
         return launch(g, 23, (N + 7) / 8, (M + 15) / 16, 32, packed);
     }
-    if (!g->hip && !g->legacy && M >= 32 && N >= 32 && K >= 32) {
+    if (!g->legacy && M >= 32 && N >= 32 && K >= 32) {
         size_t stride = ((size_t)K + 31) & ~(size_t)31;
         uint64_t pa = buffer(g, SCRATCH_BASE + 8, M * stride * 2 * (g->precise ? 3 : 1), NULL);
         uint64_t pb = buffer(g, SCRATCH_BASE + 9, N * stride * 2 * (g->precise ? 3 : 1), NULL);
@@ -165,9 +172,41 @@ static int mm(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, int K, i
         void *bp[] = {&pb, &b, &N, &K, &bt, &g->precise};
         CALL(launch(g, 15, (K + 31) / 32, (M + 31) / 32, 256, ap));
         CALL(launch(g, 15, (K + 31) / 32, (N + 31) / 32, 256, bp));
+#ifdef GN_HIPBLASLT
+        /* BLASLt wins the long-K convolutions; native WMMA avoids six vendor
+         * launches and intermediate writes for short-K/small training GEMMs. */
+        if (g->lt && (!g->precise || (K >= 512 && (size_t)M * N >= 262144))) {
+            size_t workspace_bytes = 64u * 1024 * 1024;
+            uint64_t workspace = buffer(g, SCRATCH_BASE + 12, workspace_bytes, NULL);
+            if (!workspace)
+                return -1;
+            if (!g->precise) {
+                if (gn_lt_run(g->lt, (void *)(uintptr_t)y, (void *)(uintptr_t)pa,
+                              (void *)(uintptr_t)pb, M, N, K, add ? 1 : 0,
+                              (void *)(uintptr_t)workspace, workspace_bytes))
+                    return gn_fail("hipBLASLt inference matmul failed");
+                return 0;
+            }
+            uint64_t high = buffer(g, SCRATCH_BASE + 13, (size_t)M * N * 4, NULL);
+            uint64_t low = buffer(g, SCRATCH_BASE + 14, (size_t)M * N * 4, NULL);
+            if (!high || !low)
+                return -1;
+            const int ai[] = {0, 1, 0, 1, 2, 0}, bi[] = {0, 0, 1, 1, 0, 2};
+            for (int i = 0; i < 6; i++)
+                if (gn_lt_run(g->lt, (void *)(uintptr_t)(i ? low : high),
+                              (void *)(uintptr_t)(pa + ai[i] * M * stride * 2),
+                              (void *)(uintptr_t)(pb + bi[i] * N * stride * 2), M, N, K,
+                              i > 1 ? 1 : 0, (void *)(uintptr_t)workspace, workspace_bytes))
+                    return gn_fail("hipBLASLt compensated training matmul failed");
+            int count = M * N;
+            void *combine[] = {&y, &high, &low, &count, &add};
+            return flat(g, 28, count, combine);
+        }
+#endif
         void *packed[] = {&y, &pa, &pb, &M, &N, &K, &add};
-        return launch(g, g->precise ? 16 : 17, (N + 63) / 64,
-                      g->precise ? (M + 31) / 32 : (M + 63) / 64, 128, packed);
+        int tile_n = g->hip && g->precise ? 32 : 64, tile_m = g->precise ? 32 : 64;
+        return launch(g, g->precise ? 16 : 17, (N + tile_n - 1) / tile_n, (M + tile_m - 1) / tile_m,
+                      128, packed);
     }
     return launch(g, 0, (unsigned)((N + (g->hip ? 15 : 7)) / (g->hip ? 16 : 8)),
                   (unsigned)((M + 15) / 16), 32, args);
@@ -208,6 +247,20 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
             goto bad;
         }
         g->active = 1;
+        if (strstr(backend, "blaslt")) {
+#ifdef GN_HIPBLASLT
+            fprintf(stderr,
+                    "hip-blaslt: full batch-16 gradient qualification unresolved; see RDNA4.md\n");
+            g->lt = gn_lt_open();
+            if (!g->lt) {
+                gn_fail("hipBLASLt initialization failed");
+                goto bad;
+            }
+#else
+            gn_fail("hip-blaslt requires an opt-in HIPBLASLT=1 / GN_HIPBLASLT=ON build");
+            goto bad;
+#endif
+        }
         hiprtcProgram program = NULL;
         if (hiprtcCreateProgram(&program, gn_kernel_source, "gn_kernels.cu", 0, NULL, NULL) !=
             HIPRTC_SUCCESS) {
@@ -305,7 +358,9 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         gn_fail("GPU module load failed");
         goto bad;
     }
-    for (int i = 0; i < (g->hip ? 15 : 28); i++) {
+    for (int i = 0; i < (g->hip ? 31 : 28); i++) {
+        if (g->hip && (i == 22 || i == 23))
+            continue; /* Experimental integer kernels are CUDA-only. */
         if (g->hip) {
             hipFunction_t f;
             rc = (int)hipModuleGetFunction(&f, g->hip_module, names[i]);
@@ -331,6 +386,9 @@ void gn_gpu_close(void *opaque) {
         return;
     if (g->active) {
         current(g);
+#ifdef GN_HIPBLASLT
+        gn_lt_close(g->lt);
+#endif
         for (int i = 0; i < SLOT_COUNT; i++)
             if (g->b[i].ptr) {
                 if (g->hip)
@@ -408,13 +466,13 @@ int gn_gpu_forward(gn_model *m, const float *input) {
         } else if (n->kind == BN || n->kind == LN) {
             uint64_t mean = param(m, n->mean, 0), var = param(m, n->variance, 0);
             void *args[] = {&y, &aux, &mean, &var, &x, &w, &bias, &R, &C, &layer, &training};
-            if (!g->hip && !g->legacy)
+            if (!g->legacy)
                 CALL(launch(g, 18, layer ? R : C, 1, 256, args));
             else
                 CALL(flat(g, 6, layer ? R : C, args));
         } else if (n->kind == ATTENTION) {
             void *args[] = {&y, &aux, &x, &w, &B, &side, &C, &D};
-            if (!g->hip && !g->legacy)
+            if (!g->legacy)
                 CALL(launch(g, 24, R * (C / D), 1, 256, args));
             else
                 CALL(flat(g, 9, (size_t)R * (C / D), args));
@@ -453,7 +511,7 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
     uint64_t p = PTR_NODE(m, m->policy, 0), v = PTR_NODE(m, m->value, 0),
              dp = PTR_NODE(m, m->policy, 1), dv = PTR_NODE(m, m->value, 1);
     void *lossargs[] = {&dp, &dv, &loss, &p, &v, &t, &l, &B, &A};
-    if (!g->hip && !g->legacy)
+    if (!g->legacy)
         CALL(launch(g, 21, B, 1, 256, lossargs));
     else
         CALL(flat(g, 11, B, lossargs));
@@ -479,22 +537,25 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
             if (n->kind == CONV)
                 CALL(columns(g, dx, gradient, R, (int)m->n[n->a].c, side, n->k, 1));
             void *args[] = {&db, &dy, &R, &C};
-            CALL(flat(g, 4, C, args));
+            if (g->hip && !g->legacy)
+                CALL(launch(g, 29, (C + 7) / 8, 1, 256, args));
+            else
+                CALL(flat(g, 4, C, args));
         } else if (n->kind == BN || n->kind == LN) {
             void *args[] = {&dx, &dw, &db, &x, &dy, &w, &aux, &R, &C, &layer};
-            if (!g->hip && !g->legacy)
+            if (!g->legacy)
                 CALL(launch(g, 19, layer ? R : C, 1, 256, args));
             else
                 CALL(flat(g, 7, layer ? R : C, args));
             if (layer) {
                 void *pa[] = {&dw, &db, &x, &dy, &aux, &R, &C};
-                if (!g->hip && !g->legacy)
+                if (!g->legacy)
                     CALL(launch(g, 20, C, 1, 256, pa));
                 else
                     CALL(flat(g, 8, C, pa));
             }
         } else if (n->kind == ATTENTION) {
-            if (!g->hip && !g->legacy) {
+            if (!g->legacy) {
                 uint64_t ds =
                     buffer(g, SCRATCH_BASE + 6, (size_t)R * (C / D) * side * side * 4, NULL);
                 if (!ds)
@@ -553,7 +614,11 @@ int gn_gpu_update(gn_model *m, float lr, float decay, float clip, gn_metrics *me
             int count = (int)(m->p[i].r * m->p[i].c);
             uint64_t grad = param(m, &m->p[i], 1);
             void *args[] = {&norm, &grad, &count, &inv};
-            CALL(flat(g, 12, (size_t)count, args));
+            if (g->hip && !g->legacy) {
+                unsigned blocks = (count + 255) / 256;
+                CALL(launch(g, 30, blocks > 64 ? 64 : blocks, 1, 256, args));
+            } else
+                CALL(flat(g, 12, (size_t)count, args));
         }
     float result[2];
     CALL(copy_from(g, result, norm, 8));

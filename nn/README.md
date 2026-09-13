@@ -4,13 +4,20 @@ MIT, independently authored generic C API (`gn.h`), with no shogi/rules or ML
 framework dependency. CPU FP32, custom CUDA sm120 BF16 MMA, and HIP gfx1201 BF16
 WMMA implement forward, backward, accumulation/clipping and AdamW. GPU source
 compiles through NVRTC/HIPRTC; compilation is not hardware correctness validation.
-No vendor BLAS or neural runtime is used.
+Default backends use no vendor BLAS or neural runtime. An explicit optional
+`hip-blaslt` build/backend uses AMD hipBLASLt for selected matrices.
 
 The default `cuda` path now uses tiled asynchronous operand staging and parallel
 training reductions. See [sm120 results and integer experiments](SM120.md) for
 the measured speedup, FLOP accounting and the **unmet 95% peak target**.
 `cuda-legacy` supports A/B checks; `cuda-int8` and `cuda-int16` are explicit,
 unqualified quantized-operand experiments, not integer-only training.
+
+The `hip` path now uses LDS-tiled WMMA and parallel training operations;
+`hip-blaslt` is an opt-in hybrid and `hip-legacy` retains the original kernels.
+See [RDNA4 results, builds and qualification](RDNA4.md): **8.12×/8.47×** native/hybrid
+batch-16 speedups were measured, but neither reaches 95% peak, and a new full
+batch-16 gradient discrepancy remains unresolved (including legacy/FP32 paths).
 
 From GEMM root:
 
@@ -26,7 +33,9 @@ nn/build/test_gpu hip
 
 GPU tests return 77 for unavailable, not PASS. An optional checkpoint path and
 `wide` or `full` argument test 9×9 C32 or the default C256/20-block network,
-including checkpoint reload. `stress` retains a highly correlated sinusoidal
+including checkpoint reload. A final optional batch argument defaults to 2;
+`test_gpu hip-blaslt FILE full 16` exercises the hybrid's vendor training shapes.
+`stress` retains a highly correlated sinusoidal
 full-network case that fails the tight gradient gate even in the FP32 path.
 Reduction order and ReLU boundaries are suspected, but the discrepancy is not
 fully diagnosed. The test is retained, not silently skipped. The main tests
@@ -59,8 +68,8 @@ uses three-component operand decomposition and six products (component indices
 i+j≤2), with a separate correction accumulator, to approach FP32 accuracy while
 using MMA/WMMA. Three-product compensation was insufficient for the deep model.
 Matrix accumulators/master state stay FP32; sensitive reductions use doubles.
-CUDA attention/reductions are parallelized; further tuning remains. HIP retains
-the original kernels. GPU graph reuse does not clear unused host node gradients.
+CUDA/HIP attention and reductions are parallelized; further tuning remains.
+GPU graph reuse does not clear unused host node gradients.
 
 Safetensors stores model tensors, `adam.m.*`, `adam.v.*`, `__config` U64[12]
 (gn_config field order including memory cap), and `__state` U64[2] (step, RNG).

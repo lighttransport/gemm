@@ -19,21 +19,29 @@ static double relative(const float *a, const float *b, size_t n) {
     return sqrt(delta / fmax(base, 1e-12));
 }
 int main(int argc, char **argv) {
-    if (argc < 2 || argc > 4 ||
-        (argc == 4 && strcmp(argv[3], "wide") && strcmp(argv[3], "full") &&
+    if (argc < 2 || argc > 5 ||
+        (argc >= 4 && strcmp(argv[3], "wide") && strcmp(argv[3], "full") &&
          strcmp(argv[3], "stress")))
         return 2;
+    int B = 2;
+    if (argc == 5) {
+        char *end;
+        long batch = strtol(argv[4], &end, 10);
+        if (*end || batch < 1 || batch > 64)
+            return 2;
+        B = (int)batch;
+    }
     gn_config c = gn_default_config();
-    c.side = argc == 4 ? 9 : 3;
+    c.side = argc >= 4 ? 9 : 3;
     c.inputs = 5;
-    c.channels = argc == 4 ? 32 : 8;
+    c.channels = argc >= 4 ? 32 : 8;
     c.actions = 7;
     c.blocks = 2;
     c.attention_every = 2;
-    c.head_dim = argc == 4 ? 8 : 4;
+    c.head_dim = argc >= 4 ? 8 : 4;
     c.value_channels = 3;
     c.value_hidden = 8;
-    if (argc == 4 && (!strcmp(argv[3], "full") || !strcmp(argv[3], "stress")))
+    if (argc >= 4 && (!strcmp(argv[3], "full") || !strcmp(argv[3], "stress")))
         c = gn_default_config();
     gn_model *gpu = gn_create(&c, argv[1], 0);
     if (!gpu) {
@@ -46,37 +54,40 @@ int main(int argc, char **argv) {
         return 1;
     }
     int X = (int)c.side * c.side * c.inputs, A = (int)c.side * c.side * c.actions;
-    float *x = malloc(2 * X * sizeof(float)), *target = malloc(2 * A * sizeof(float));
-    float *p = malloc(2 * A * sizeof(float)), *q = malloc(2 * A * sizeof(float)), v[6], w[6];
+    float *x = malloc(B * X * sizeof(float)), *target = malloc(B * A * sizeof(float));
+    float *p = malloc(B * A * sizeof(float)), *q = malloc(B * A * sizeof(float));
+    float *v = malloc(B * 3 * sizeof(float)), *w = malloc(B * 3 * sizeof(float));
+    uint32_t *labels = malloc(B * sizeof(*labels));
     int rc = 1;
-    if (!x || !target || !p || !q)
+    if (!x || !target || !p || !q || !v || !w || !labels)
         goto done;
-    uint32_t labels[2] = {0, 2};
+    for (int b = 0; b < B; b++)
+        labels[b] = b % 2 ? 2 : 0;
     uint32_t random = 12345;
-    for (int i = 0; i < 2 * X; i++) {
+    for (int i = 0; i < B * X; i++) {
         random = random * 1664525U + 1013904223U;
         x[i] = c.blocks == 20 && strcmp(argv[3], "stress")
                    ? (float)(random >> 8) * (2.0f / 16777216.0f) - 1
                    : sinf((float)i * .19f);
     }
-    for (int i = 0; i < 2 * A; i++)
+    for (int i = 0; i < B * A; i++)
         target[i] = -1;
-    for (int b = 0; b < 2; b++) {
+    for (int b = 0; b < B; b++) {
         target[b * A + 1] = .3f;
         target[b * A + 31] = .7f;
         target[b * A + 8] = 0;
     }
     gn_metrics a, b;
     double tol = strstr(argv[1], "fp32") ? 0.0001 : 0.01;
-    if (check(gn_infer(cpu, 2, x, p, v)) || check(gn_infer(gpu, 2, x, q, w)))
+    if (check(gn_infer(cpu, B, x, p, v)) || check(gn_infer(gpu, B, x, q, w)))
         goto done;
-    double inference = relative(p, q, 2 * A);
-    if (!isfinite(inference) || inference > tol || relative(v, w, 6) > tol) {
+    double inference = relative(p, q, B * A);
+    if (!isfinite(inference) || inference > tol || relative(v, w, B * 3) > tol) {
         fprintf(stderr, "GPU forward mismatch %.9g\n", inference);
         goto done;
     }
-    if (check(gn_backward(cpu, 2, x, target, labels, &a)) ||
-        check(gn_backward(gpu, 2, x, target, labels, &b)))
+    if (check(gn_backward(cpu, B, x, target, labels, &a)) ||
+        check(gn_backward(gpu, B, x, target, labels, &b)))
         goto done;
     if (c.blocks == 20)
         fprintf(stderr, "training losses CPU %.9g %.9g GPU %.9g %.9g\n", a.policy, a.value,
@@ -112,7 +123,7 @@ int main(int argc, char **argv) {
         goto done;
     }
     if (check(gn_update(cpu, .001f, .0001f, 1, &a)) ||
-        check(gn_update(gpu, .001f, .0001f, 1, &b)) || check(gn_infer(gpu, 2, x, q, w)))
+        check(gn_update(gpu, .001f, .0001f, 1, &b)) || check(gn_infer(gpu, B, x, q, w)))
         goto done;
     if (b.step != 1)
         goto done;
@@ -136,21 +147,25 @@ int main(int argc, char **argv) {
         gn_model *resumed = gn_load(argv[2], argv[1], 0);
         if (!resumed)
             goto done;
-        int status = gn_infer(resumed, 2, x, p, v);
+        int status = gn_infer(resumed, B, x, p, v);
         gn_destroy(resumed);
-        if (check(status) || memcmp(p, q, 2 * A * sizeof(float)) || memcmp(v, w, sizeof(v))) {
+        if (check(status) || memcmp(p, q, B * A * sizeof(float)) ||
+            memcmp(v, w, B * 3 * sizeof(float))) {
             fprintf(stderr, "GPU checkpoint inference mismatch\n");
             goto done;
         }
     }
-    printf("PASS %s native forward/backward/update: relative output %.8g gradient %.8g\n", argv[1],
-           inference, grad);
+    printf("PASS %s batch=%d native forward/backward/update: relative output %.8g gradient %.8g\n",
+           argv[1], B, inference, grad);
     rc = 0;
 done:
     free(x);
     free(target);
     free(p);
     free(q);
+    free(v);
+    free(w);
+    free(labels);
     gn_destroy(cpu);
     gn_destroy(gpu);
     return rc;

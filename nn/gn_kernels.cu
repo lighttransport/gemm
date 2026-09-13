@@ -397,3 +397,4 @@ __global__ void gn_adam(float *x, float *m, float *v, float *g, int count, float
 }
 }
 #include "gn_sm120.cuh"
+#include "gn_rdna4.cuh"

@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: MIT
- * Original sm120 tiled kernels. No vendor BLAS or copied kernel code.
+ * Original shared parallel operations and sm120 tiled kernels.
  * A and B are packed as [component, row, padded K]; B is logically transposed.
  */
-#if !defined(GN_HIP)
 template <typename T> __device__ T gn_block_sum(T v) {
     __shared__ T sums[256];
     __syncthreads();
@@ -249,6 +248,7 @@ extern "C" __global__ void gn_attention_bias_back(float *db, const float *ds, in
         db[rel * H + h] += (float)sum;
 }
 
+#if !defined(GN_HIP)
 __device__ __forceinline__ void gn_ld_a(unsigned *v, const unsigned short *p) {
     unsigned address = (unsigned)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"

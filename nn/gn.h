@@ -21,7 +21,10 @@ typedef struct {
 } gn_metrics;
 gn_config gn_default_config(void);
 /* backend: cpu (FP32), cuda, hip; cuda-fp32/hip-fp32 are diagnostic paths.
- * cuda-legacy retains the original CUDA kernels for A/B performance checks.
+ * cuda-legacy/hip-legacy retain the original kernels for A/B checks.
+ * hip-blaslt opts into an SDK-enabled hybrid: hipBLASLt for inference and
+ * large long-K training matrices, native WMMA elsewhere. Build HIPBLASLT=1.
+ * Full batch-16 gradient qualification is unresolved; see RDNA4.md.
  * cuda-int8/cuda-int16 are EXPERIMENTAL quantized-operand matrix paths, with
  * FP32 master weights/moments and non-matrix math. Neither is qualified for
  * full-network training; int16 uses four INT8 products, not native INT16 MMA.
