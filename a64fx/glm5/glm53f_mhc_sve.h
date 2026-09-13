@@ -172,6 +172,66 @@ static inline void glm53f_mhc_post_sve(
         }
 }
 
+/* Finish one site and prepare the next in one team. This is deliberately an
+ * arithmetic-preserving scalar-decode optimization: loop schedules, FP64
+ * post accumulation, Sinkhorn, and the serial RMS normalization match the
+ * separate post/pre calls above. */
+static inline void glm53f_mhc_post_pre_sve(
+        float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
+        const glm53f_mhc_site *next_site, const uint16_t *next_norm) {
+    double sumsq = 0.0;
+    float inv = 0.0f, logits[GLM53F_MHC_MIX];
+#pragma omp parallel shared(sumsq,inv,logits)
+    {
+#pragma omp for collapse(2) schedule(static)
+        for (int k = 0; k < GLM53F_MHC_STREAMS; ++k)
+            for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {
+                double v = (double)scratch->post[k] * sublayer[d];
+                for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)
+                    v += (double)scratch->combine[(size_t)j * GLM53F_MHC_STREAMS + k] *
+                         scratch->residual[(size_t)j * GLM53F_MHC_WIDTH + d];
+                streams[(size_t)k * GLM53F_MHC_WIDTH + d] = (float)v;
+            }
+#pragma omp for reduction(+:sumsq)
+        for (int i = 0; i < GLM53F_MHC_FLAT; ++i)
+            sumsq += (double)streams[i] * streams[i];
+#pragma omp single
+        { inv = 1.0f / sqrtf((float)(sumsq / GLM53F_MHC_FLAT) + 1e-5f); }
+#pragma omp for schedule(static)
+        for (int m = 0; m < GLM53F_MHC_MIX; ++m)
+            logits[m] = glm53f_mhc_dot_bf16_sve(
+                next_site->fn + (size_t)m * GLM53F_MHC_FLAT, streams,
+                GLM53F_MHC_FLAT) * inv;
+#pragma omp single
+        {
+            for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
+                logits[k] = glm53f_sigmoid(logits[k] * next_site->scale[0] +
+                                            next_site->base[k]) + 1e-6f;
+                scratch->post[k] = 2.0f * glm53f_sigmoid(
+                    logits[GLM53F_MHC_STREAMS + k] * next_site->scale[1] +
+                    next_site->base[GLM53F_MHC_STREAMS + k]);
+            }
+            for (int m = 0; m < GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS; ++m)
+                scratch->combine[m] = logits[2 * GLM53F_MHC_STREAMS + m] *
+                                      next_site->scale[2] + next_site->base[2 * GLM53F_MHC_STREAMS + m];
+            glm53f_mhc_sinkhorn(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
+        }
+#pragma omp for schedule(static)
+        for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {
+            float value = 0.0f;
+            for (int k = 0; k < GLM53F_MHC_STREAMS; ++k)
+                value += logits[k] * streams[(size_t)k * GLM53F_MHC_WIDTH + d];
+            scratch->collapsed[d] = value;
+        }
+#pragma omp single
+        {
+            memcpy(scratch->residual, streams, sizeof(scratch->residual));
+            glm53f_rmsnorm_bf16(scratch->normalized, scratch->collapsed,
+                                next_norm, GLM53F_MHC_WIDTH, 1e-5f);
+        }
+    }
+}
+
 /* Batch-only post mix.  Verification positions are independent at this
  * point, so distribute the (otherwise scalar) mHC post over token/head
  * pairs.  The inner accumulation order is identical to glm53f_mhc_post,

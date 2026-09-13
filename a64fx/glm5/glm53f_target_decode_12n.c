@@ -94,9 +94,10 @@ struct glm53f_target_model_12n {
     float *batch_streams, *batch_normalized, *batch_output;
     unsigned char *batch_state;
     size_t batch_state_stride;
-    int profile;
+    int profile, mhc_chained;
     long scalar_steps, batch_calls, batch_positions;
     double scalar_phase[5], batch_phase[5];
+    double scalar_detail[4]; /* KDA, sparse, dense FFN, MoE. */
 };
 struct glm53f_target_snapshot_12n {
     unsigned char *kda_state;
@@ -112,6 +113,7 @@ static glm53f_target_model_12n *target_model_create_with_kda(
     glm53f_target_model_12n *m = calloc(1, sizeof(*m));
     if (!m || capacity < 1) goto fail;
     m->profile = getenv("GLM53F_PROFILE") != NULL;
+    m->mhc_chained = getenv("GLM53F_MHC_CHAINED") && atoi(getenv("GLM53F_MHC_CHAINED"));
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     if (ranks != 12) goto fail;
@@ -170,7 +172,11 @@ glm53f_target_model_12n *glm53f_target_model_create_12n(
 }
 
 int glm53f_target_model_convert_int8_12n(glm53f_target_model_12n *m) {
-    return m ? glm53f_moe_stage_convert_int8_12n(m->moe) : -1;
+    if (!m || glm53f_moe_stage_convert_int8_12n(m->moe)) return -1;
+    if (getenv("GLM53F_INT8_SPARSE"))
+        for (int l = 0; l < LAYERS; ++l)
+            if (m->sparse[l] && glm53f_sparse_convert_int8_12n(m->sparse[l])) return -1;
+    return 0;
 }
 
 int glm53f_target_model_convert_kda_int8_12n(glm53f_target_model_12n *m) {
@@ -195,10 +201,12 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
     if (m->profile) m->scalar_phase[0] += MPI_Wtime() - begin;
     for (int l = 0; l < LAYERS; ++l) {
         const glm53f_target_layer_weights_12n *w = &m->layer_weight[l];
-        begin = m->profile ? MPI_Wtime() : 0.0;
-        glm53f_mhc_pre_sve(&m->scratch->mhc, m->streams, &w->attention_mhc,
-                           w->input_norm);
-        if (m->profile) m->scalar_phase[1] += MPI_Wtime() - begin;
+        if (!m->mhc_chained || !l) {
+            begin = m->profile ? MPI_Wtime() : 0.0;
+            glm53f_mhc_pre_sve(&m->scratch->mhc, m->streams, &w->attention_mhc,
+                               w->input_norm);
+            if (m->profile) m->scalar_phase[1] += MPI_Wtime() - begin;
+        }
         begin = m->profile ? MPI_Wtime() : 0.0;
         int rc = m->kda[l] ?
             glm53f_kda_sublayer_12n(m->kda[l], m->scratch->sublayer_output,
@@ -206,12 +214,22 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             glm53f_sparse_sublayer_12n(m->sparse[l], m->scratch->sublayer_output,
                                        m->scratch->mhc.normalized);
         if (rc) return -1;
-        if (m->profile) m->scalar_phase[2] += MPI_Wtime() - begin;
+        if (m->profile) {
+            double elapsed = MPI_Wtime() - begin;
+            m->scalar_phase[2] += elapsed;
+            m->scalar_detail[m->kda[l] ? 0 : 1] += elapsed;
+        }
         begin = m->profile ? MPI_Wtime() : 0.0;
-        glm53f_mhc_post_sve(m->streams, m->scratch->sublayer_output,
-                            &m->scratch->mhc);
-        glm53f_mhc_pre_sve(&m->scratch->mhc, m->streams, &w->ffn_mhc,
-                           w->post_attention_norm);
+        if (m->mhc_chained)
+            glm53f_mhc_post_pre_sve(m->streams, m->scratch->sublayer_output,
+                                    &m->scratch->mhc, &w->ffn_mhc,
+                                    w->post_attention_norm);
+        else {
+            glm53f_mhc_post_sve(m->streams, m->scratch->sublayer_output,
+                                &m->scratch->mhc);
+            glm53f_mhc_pre_sve(&m->scratch->mhc, m->streams, &w->ffn_mhc,
+                               w->post_attention_norm);
+        }
         if (m->profile) m->scalar_phase[1] += MPI_Wtime() - begin;
         begin = m->profile ? MPI_Wtime() : 0.0;
         if (l < 3) {
@@ -225,10 +243,20 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
                 m->scratch->mhc.normalized);
         }
         if (rc) return -1;
-        if (m->profile) m->scalar_phase[3] += MPI_Wtime() - begin;
+        if (m->profile) {
+            double elapsed = MPI_Wtime() - begin;
+            m->scalar_phase[3] += elapsed;
+            m->scalar_detail[l < 3 ? 2 : 3] += elapsed;
+        }
         begin = m->profile ? MPI_Wtime() : 0.0;
-        glm53f_mhc_post_sve(m->streams, m->scratch->sublayer_output,
-                            &m->scratch->mhc);
+        if (m->mhc_chained && l + 1 < LAYERS) {
+            const glm53f_target_layer_weights_12n *next = &m->layer_weight[l + 1];
+            glm53f_mhc_post_pre_sve(m->streams, m->scratch->sublayer_output,
+                                    &m->scratch->mhc, &next->attention_mhc,
+                                    next->input_norm);
+        } else
+            glm53f_mhc_post_sve(m->streams, m->scratch->sublayer_output,
+                                &m->scratch->mhc);
         if (m->profile) m->scalar_phase[1] += MPI_Wtime() - begin;
     }
     begin = m->profile ? MPI_Wtime() : 0.0;
@@ -385,17 +413,21 @@ void glm53f_target_profile_reset_12n(glm53f_target_model_12n *m) {
     m->scalar_steps = m->batch_calls = m->batch_positions = 0;
     memset(m->scalar_phase, 0, sizeof(m->scalar_phase));
     memset(m->batch_phase, 0, sizeof(m->batch_phase));
+    memset(m->scalar_detail, 0, sizeof(m->scalar_detail));
+    glm53f_moe_stage_profile_reset_12n(m->moe);
 }
 
 void glm53f_target_profile_report_12n(
         const glm53f_target_model_12n *m, const char *label) {
     if (!m || !m->profile) return;
     int rank;
-    double scalar[5], batch[5];
+    double scalar[5], batch[5], detail[4];
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Reduce(m->scalar_phase, scalar, 5, MPI_DOUBLE, MPI_MAX, 0,
                MPI_COMM_WORLD);
     MPI_Reduce(m->batch_phase, batch, 5, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
+    MPI_Reduce(m->scalar_detail, detail, 4, MPI_DOUBLE, MPI_MAX, 0,
                MPI_COMM_WORLD);
     if (!rank) {
         double scalar_denom = m->scalar_steps ? m->scalar_steps : 1;
@@ -407,6 +439,10 @@ void glm53f_target_profile_report_12n(
                scalar[0]*1e3/scalar_denom, scalar[1]*1e3/scalar_denom,
                scalar[2]*1e3/scalar_denom, scalar[3]*1e3/scalar_denom,
                scalar[4]*1e3/scalar_denom);
+        printf("GLM53F_TARGET_PROFILE_DETAIL label=%s kda=%.3f sparse=%.3f "
+               "dense_ffn=%.3f moe=%.3f ms_pos\n", label ? label : "target",
+               detail[0]*1e3/scalar_denom, detail[1]*1e3/scalar_denom,
+               detail[2]*1e3/scalar_denom, detail[3]*1e3/scalar_denom);
         printf("GLM53F_TARGET_PROFILE label=%s kind=batch calls=%ld positions=%ld "
                "ms_pos=%.3f embed=%.3f mhc=%.3f attention=%.3f ffn=%.3f "
                "head=%.3f\n", label ? label : "target", m->batch_calls,
@@ -416,6 +452,7 @@ void glm53f_target_profile_report_12n(
                batch[2]*1e3/batch_denom, batch[3]*1e3/batch_denom,
                batch[4]*1e3/batch_denom);
     }
+    glm53f_moe_stage_profile_report_12n(m->moe, m->scalar_steps, label);
 }
 
 void glm53f_target_model_free_12n(glm53f_target_model_12n *m) {
@@ -504,7 +541,7 @@ int main(int argc, char **argv) {
         token = prompt_ids[0];
     } else {
         token=argc>4?atoi(argv[4]):1;steps=argc>5?atoi(argv[5]):1;
-        if(token<0||token>=154880||steps<1||steps>128)MPI_Abort(MPI_COMM_WORLD,2);
+        if(token<0||token>=154880||steps<1||steps>2048)MPI_Abort(MPI_COMM_WORLD,2);
     }
     for (int i = generate ? 8 : 6; i < argc; ++i) {
         if (!strcmp(argv[i], "--touch-cache")) touch_cache = 1;
@@ -537,7 +574,7 @@ int main(int argc, char **argv) {
         MPI_Abort(MPI_COMM_WORLD, 2);
     if (generate && capacity < prompt_count + steps) capacity = prompt_count + steps;
     if(capacity<steps)MPI_Abort(MPI_COMM_WORLD,2);
-    if(getenv("GLM53F_UTOFU")){const char*topo=getenv("TOFU_TOPO_PATH");if(!topo)topo="../utofu-tests/tofu_topo.txt";if(glm53f_collective_init_12n(topo,5*HIDDEN))MPI_Abort(MPI_COMM_WORLD,2);}
+    if(getenv("GLM53F_UTOFU")){const char*topo=getenv("TOFU_TOPO_PATH");if(!topo)topo="../utofu-tests/tofu_topo.txt";if(glm53f_collective_init_12n(topo,8*HIDDEN))MPI_Abort(MPI_COMM_WORLD,2);}
     model=target_model_create_with_kda(argv[1],argv[2],argv[3],capacity,int8_kda,latent_bf16);
     if(!model)MPI_Abort(MPI_COMM_WORLD,2);
     if (use_int8 && glm53f_target_model_convert_int8_12n(model)) MPI_Abort(MPI_COMM_WORLD, 2);

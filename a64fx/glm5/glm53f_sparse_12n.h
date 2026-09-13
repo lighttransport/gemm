@@ -9,6 +9,7 @@ glm53f_sparse_context_12n *glm53f_sparse_create_12n(
 /* BF16 affects CP latent rows only; index/pool state remains FP32. */
 glm53f_sparse_context_12n *glm53f_sparse_create_format_12n(
     const char *model_dir, int layer, int capacity, int latent_bf16);
+int glm53f_sparse_convert_int8_12n(glm53f_sparse_context_12n *context);
 void glm53f_sparse_reset_12n(glm53f_sparse_context_12n *context);
 void glm53f_sparse_free_12n(glm53f_sparse_context_12n *context);
 int glm53f_sparse_sublayer_12n(

@@ -2,6 +2,122 @@
 
 ## Active work: 512K, non-MTP, 30 tok/s (2026-09-13)
 
+### Continuation: first ~512 positions, 30 tok/s
+
+The next acceptance target is non-MTP scalar decode while the populated
+prefix is at most approximately 512 positions. Keep 524,288 allocated
+capacity as the deployment contract, but use matched short controls to avoid
+conflating this goal with populated-512K performance. The accepted v8 INT8
+trajectory and 48-worker HARD-barrier runtime are the correctness/performance
+baseline: 25.164 tok/s over 128 positions, or 39.739 ms/token. Reaching
+30 tok/s requires at least 6.406 ms/token of repeatable improvement.
+
+Profile and test two exact candidates first:
+
+1. Chain each mHC post-mix with the following mHC pre-mix in one OpenMP team.
+   Preserve the existing FP64 post accumulation, reduction scheduling,
+   Sinkhorn iterations, and normalization order. The scalar graph currently
+   creates hundreds of short parallel regions per token; the chained form
+   should remove three team launches at each of 89 adjacent mHC boundaries.
+   Keep it opt-in until the complete token/logit stream and matched target
+   timing pass.
+2. For the first 512 CP positions, mirror only the latent rows in unused tail
+   slots of the already committed local cache. Every rank computes the same
+   current latent, so sparse MLA can read the replicated prefix without the
+   selected-row collective or candidate gather. Continue writing the normal
+   owner key/gate/latent slots. To preserve the reference softmax accumulation
+   order, compute each completed pool on all ranks and reproduce the exact
+   global score ordering locally; the first aggressive identity-order attempt
+   diverged at position 8 and was rejected. At position 513, the unchanged
+   owner-pool long-context selection resumes. Allocate no additional cache
+   bytes and test the boundary at 511/512/513.
+
+Measure mHC, KDA, sparse attention, routed/shared FFN, head, and collective
+subphases separately. Accept each candidate only with identical outputs and
+at least two matched 512-step runs. The 30 tok/s claim requires a complete
+non-MTP target run, not the component tests.
+
+The first end-to-end prefix measurement reaches 27.127 tok/s and leaves MoE
+at 12.118 ms/token. Its replicated BF16 router projection is already parallel,
+so do not speculate from the aggregate number: first split MoE time into
+router/top-k, INT8 gate/up plus activation plus down, and the 4096-float
+all-reduce. Optimize the measured dominant phase while preserving each dot
+product's accumulation order, then require identical token/logit records and
+repeated 512-token timing.
+
+The phase measurement is router **2.106 ms**, INT8 local expert **7.348 ms**,
+and all-reduce **2.956 ms** per token. As a bounded accuracy experiment, pack
+the replicated router BF16 weights into 16-row INT8/SVE tiles during the
+existing load-time conversion and reuse the input quantization for routed
+experts. Keep this separately gated because quantized router logits can change
+top-k membership; reject it on any token-stream mismatch.
+
+The first 512-step combined run hit a native-MPI segmentation fault at the
+position-512 CP pool completion (`2 * 64 * 256 = 32768` floats). The bounded
+513-position component validator had passed, but a full-run claim cannot rely
+on that transient behavior. Raise the existing uTofu workspace from 20480 to
+32768 floats and route this pool exchange through the checked project
+collective; revalidate positions 511/512/513 and two full 512-step runs.
+
+The corrected normal-frequency 512-step run passes at 26.313 tok/s; sparse
+attention rises to 8.299 ms/token. Before 512 selected rows, CP MLA still uses
+one worker per local head (only 5--6 of 48 workers), while the exact latent-
+dimension implementation is artificially gated at 512 rows. Add a tunable
+exact-parallel threshold and sweep 32/64/128/256 on the 513-position component
+test, then use the best exact threshold in end-to-end 512-token runs.
+
+The exact threshold sweep rejected early parallel MLA: cumulative candidate
+times for thresholds 32/64/128/256/512 were respectively 460.812, 465.472,
+464.776, 463.522, and **442.628 ms** through position 513. Keep 512 as the
+default; extra team-wide worksharing overhead dominates before that point.
+The load-time INT8 router candidate was also exact but a null: 27.163 tok/s,
+router 2.126 ms versus the BF16 router's 27.175 tok/s and 2.106 ms. It remains
+diagnostic-only and is not part of the accepted path.
+
+Because the earlier FP32 mHC post path was exact but inside short-run noise,
+retest it only as a matched 512-position build on the final prefix path. Do
+not promote it unless the longer run gives a repeatable end-to-end gain.
+
+With sparse attention still at 8.299 ms/token, extend the requested load-time
+INT8 experiment to the four large sparse MLA FP8 projections (`q_a`, local
+`q_b`, `kv_a`, and local output). Pack private anonymous copies in 64-row
+SDOT layout, free their FP8 copies, and keep indexer BF16 math unchanged.
+Gate the path independently and require the full generated stream to match;
+unlike the rejected router conversion, these projections do not make a
+discrete top-k routing decision.
+
+The all-four sparse INT8 trial cuts sparse time from 7.17 to 6.66 ms at 128
+positions but diverges in generated tokens and reaches only 27.635 tok/s, so
+reject it from the accepted path. Next, use the existing exact 16-row view of
+the 64-row packed MoE INT8 tiles for gate/up and down scheduling. Typical
+gate/up work currently exposes only about 16 coarse tasks to 48 workers;
+quarter-tile tasks improve utilization without changing integer dot products.
+
+The 16-row MoE schedule is exact but slower: 26.443 tok/s and 8.413 ms local
+expert time versus 27.175 tok/s and 7.348 ms, so reject it. Final throughput
+must also be measured with `GLM53F_PROFILE` unset: phase profiling introduces
+hundreds of `MPI_Wtime` calls per token and is not a production serving flag.
+
+Final measurements from jobs 51608030 (normal) and 51610526 (boost-eco):
+
+| accepted exact path | positions | tok/s | ms/token |
+|---|---:|---:|---:|
+| normal, profiled | 128 | 27.179 | 36.794 |
+| normal, profiled | 512 | 26.313 | 38.004 |
+| boost-eco, profiled, repeat 1 | 512 | 27.192 | 36.776 |
+| boost-eco, profiled, repeat 2 | 512 | 27.119 | 36.874 |
+| boost-eco, production/no profile | 512 | 26.914 | 37.155 |
+
+The normal run's first 128 token/logit records match the baseline exactly,
+and the two boost 512-token records match each other exactly. Memory headroom
+is 3.2--3.4 GiB/rank with full 524,288 capacity touched. The measured target
+is therefore **not yet 30 tok/s**: the repeatable first-512 result is about
+27.1 tok/s, 3.54 ms/token above 30 tok/s. Remaining measured costs are mHC
+7.15 ms, attention 16.46 ms (KDA 7.71, sparse 8.75), and FFN 12.34 ms (MoE
+11.44). Further work needs a cross-layer persistent OpenMP region and/or fewer
+per-layer collectives; the bounded kernel and quantization variants above do
+not close the gap.
+
 The target is one text sequence on 12 A64FX nodes, with 524,288 total context
 positions and at least 30 generated tokens/s (33.333 ms/token), without MTP.
 Use the existing `~/models/glm53f` FP8 checkpoint and its rank-owned `/local`
@@ -9,11 +125,10 @@ images. Preserve a directly comparable FP8 baseline. The historical sustained
 controls are 16.587--16.591 tok/s on job 51098702; other allocations reached
 18.14 tok/s. These are short-context measurements, not 512K decode results.
 
-Current measured status: **512K capacity passes narrowly with BF16 latent
-caches; final INT8 decode reaches 25.164 tok/s short-context and 15.938 tok/s
-after an 8K prompt. The latter leaves only 1.6 MiB above the 2 GiB safety
-guard: more headroom is required for reliable deployment. Neither 30 tok/s nor
-full-model decode after a populated 512K prefill is demonstrated.** See the
+Current measured status: **512K capacity passes with BF16 latent caches; the
+accepted exact path reaches 27.18 tok/s over 128 positions and 27.12--27.19
+tok/s over 512 positions on boost-eco. The target remains unmet, and full-
+model decode after a populated 512K prefill is not demonstrated.** See the
 2026-09-13 development log and guarded reproduction commands below.
 
 ### Memory and context contract

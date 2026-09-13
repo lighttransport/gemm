@@ -15,6 +15,10 @@ int glm53f_moe_stage_sublayer_12n(
 int glm53f_moe_stage_sublayer_batch_12n(
     glm53f_moe_stage_context_12n *context, float *output,
     const float *normalized_input, int tokens);
+void glm53f_moe_stage_profile_reset_12n(glm53f_moe_stage_context_12n *context);
+void glm53f_moe_stage_profile_report_12n(
+    const glm53f_moe_stage_context_12n *context, long positions,
+    const char *label);
 void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n *context);
 
 #endif
