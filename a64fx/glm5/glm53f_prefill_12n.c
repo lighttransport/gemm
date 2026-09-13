@@ -11,10 +11,15 @@ int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-    if (argc < 4 || ranks != 12 || positions < 1 || chunk < 1 || chunk > 5)
+    if (argc < 4 || ranks != 12 || positions < 1 || chunk < 1 || chunk > 32)
         MPI_Abort(MPI_COMM_WORLD, 2);
+    /* The outer prompt tile is consumed by four-position arithmetic panels;
+     * no collective carries the complete tile.  Register only the largest
+     * actual payload, avoiding a needlessly large uTofu region at chunk 32. */
+    int collective_tokens = chunk < 4 ? chunk : 4;
     if (getenv("GLM53F_UTOFU") &&
-        glm53f_collective_init_12n(getenv("TOFU_TOPO_PATH"), chunk * 4096))
+        glm53f_collective_init_12n(getenv("TOFU_TOPO_PATH"),
+                                  collective_tokens * 4096))
         MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_target_model_12n *m = glm53f_target_model_create_12n(
         argv[1], argv[2], argv[3], positions + 1);

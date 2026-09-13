@@ -140,13 +140,18 @@ static inline void glm53f_mhc_pre_batch_sve(
         glm53f_mhc_scratch *scratch, const float *streams,
         const glm53f_mhc_site *site, const uint16_t *norm, int tokens,
         size_t scratch_stride, float *normalized) {
-    float inv[5],logits[5*GLM53F_MHC_MIX];
+    enum { GLM53F_MHC_PREFILL_BATCH = 32 };
+    float inv[GLM53F_MHC_PREFILL_BATCH];
+    float logits[GLM53F_MHC_PREFILL_BATCH * GLM53F_MHC_MIX];
     for(int t=0;t<tokens;t++){double sumsq=0;const float*s=streams+(size_t)t*GLM53F_MHC_FLAT;
 #pragma omp parallel for reduction(+:sumsq)
         for(int i=0;i<GLM53F_MHC_FLAT;i++)sumsq+=(double)s[i]*s[i];inv[t]=1.0f/sqrtf((float)(sumsq/GLM53F_MHC_FLAT)+1e-5f);}
-    int n=tokens<5?tokens:4;glm53f_mhc_mv_batch4(logits,site->fn,streams,n);if(tokens==5){const float*s=streams+(size_t)4*GLM53F_MHC_FLAT;float*z=logits+(size_t)4*GLM53F_MHC_MIX;
-#pragma omp parallel for schedule(static)
-        for(int m=0;m<GLM53F_MHC_MIX;m++)z[m]=glm53f_mhc_dot_bf16_sve(site->fn+(size_t)m*GLM53F_MHC_FLAT,s,GLM53F_MHC_FLAT);}
+    for (int base = 0; base < tokens; base += 4) {
+        int n = tokens - base;
+        if (n > 4) n = 4;
+        glm53f_mhc_mv_batch4(logits + (size_t)base * GLM53F_MHC_MIX,
+            site->fn, streams + (size_t)base * GLM53F_MHC_FLAT, n);
+    }
     for(int t=0;t<tokens;t++){glm53f_mhc_scratch*q=(glm53f_mhc_scratch*)((unsigned char*)scratch+(size_t)t*scratch_stride);const float*s=streams+(size_t)t*GLM53F_MHC_FLAT;float*z=logits+(size_t)t*GLM53F_MHC_MIX;for(int m=0;m<GLM53F_MHC_MIX;m++)z[m]*=inv[t];for(int k=0;k<GLM53F_MHC_STREAMS;k++){z[k]=glm53f_sigmoid(z[k]*site->scale[0]+site->base[k])+1e-6f;q->post[k]=2.0f*glm53f_sigmoid(z[GLM53F_MHC_STREAMS+k]*site->scale[1]+site->base[GLM53F_MHC_STREAMS+k]);}for(int m=0;m<GLM53F_MHC_STREAMS*GLM53F_MHC_STREAMS;m++)q->combine[m]=z[2*GLM53F_MHC_STREAMS+m]*site->scale[2]+site->base[2*GLM53F_MHC_STREAMS+m];glm53f_mhc_sinkhorn(q->combine,GLM53F_MHC_STREAMS,20,1e-6f);
 #pragma omp parallel for schedule(static)
         for(int d=0;d<GLM53F_MHC_WIDTH;d++){float v=0;for(int k=0;k<GLM53F_MHC_STREAMS;k++)v+=z[k]*s[(size_t)k*GLM53F_MHC_WIDTH+d];q->collapsed[d]=v;}memcpy(q->residual,s,sizeof(q->residual));glm53f_rmsnorm_bf16(q->normalized,q->collapsed,norm,GLM53F_MHC_WIDTH,1e-5f);memcpy(normalized+(size_t)t*GLM53F_MHC_WIDTH,q->normalized,GLM53F_MHC_WIDTH*4);}

@@ -323,6 +323,60 @@ policy causes unbounded internal deliberation. Do not resume speed optimization
 until a normal non-repeated ~8K coding corpus and the checkpoint's canonical
 reasoning-control tokens are tested against the same compile/self-test gate.
 
+### 100+ tok/s prefill workstream
+
+Output quality is provisionally accepted for performance development. The next
+target is **at least 100 prompt tokens/s on 12 A64FX nodes**, reported separately
+from decode and with exact token/state agreement against the scalar step path.
+The current five-position verifier is only a decode-oriented microbatch: its
+public API caps chunks at five, sparse attention still advances positions
+serially, and layer 42 MoE plus 35 KDA layers repeatedly pay small-batch OpenMP
+and collective overhead. It is not an adequate prefill architecture.
+
+Work in this order:
+
+1. Establish 512/2,048/8,192-position profiles for chunk sizes 1--5, separating
+   mHC, KDA, sparse attention, dense FFN, MoE, embedding, and head. Preserve a
+   chunk-1 token/state oracle and record memory headroom.
+2. Raise the internal prefill tile limit independently of speculative verify.
+   Start with 8/16/32 positions, make KDA convolution and recurrence causal
+   within each tile, and batch BF16/FP8 projections across the token dimension.
+3. Replace per-token MoE dispatch with a tile scheduler grouped by
+   `(owner, expert)`, reuse each expert shard for all selected positions, and
+   perform one reduced output slab per tile. The shared expert is a conventional
+   token GEMM and must not be evaluated as repeated GEMV.
+4. For sparse layers, batch q/kv/indexer projections while advancing cache and
+   causal selection in order. Batch MLA/output projection only among positions
+   whose selected sets are already materialized. Do not weaken exact sparse
+   selection to reach the throughput target.
+5. Fuse adjacent mHC post/pre operations across the position tile and eliminate
+   the final vocabulary head during prompt-only ingestion. The last prompt
+   position alone needs logits.
+6. Accept a change only if a mixed KDA/sparse 128-token comparison preserves all
+   hidden states, recurrent state, sparse cache length/content, and final argmax.
+   Then measure 512, 8K, and bounded long-context prefill. The 100 tok/s claim
+   requires sustained 8K throughput, not a warm 32-token microbenchmark.
+
+Initial measurements on job 51617019 establish the current FP8 baseline.  At
+512 positions, chunk 5 without the causal KDA team path measured **23.205
+tok/s** (43.290 ms/position).  Enabling `GLM53F_KDA_BATCH_TEAM=1` improved it
+to **25.513 tok/s**, with 6.363 ms mHC, 15.395 ms attention, and 17.473 ms FFN
+per position.  Prompt tiling is now independent of the five-position
+speculative-verification ABI: prompt-only calls accept up to 32 positions,
+advance KDA and sparse state causally in four-position arithmetic panels, and
+do not allocate snapshots for every prompt position.  The mHC front end was
+likewise made panel-safe instead of indexing fixed five-entry stack arrays.
+
+The first chunk-32 run measures **27.149 tok/s** (18.858906 s / 512 tokens):
+5.218 ms mHC, 14.026 ms attention, and 17.641 ms FFN per position.  This is
+17.0% over the untuned chunk-5 baseline but still far below 100 tok/s.  The
+unchanged five-token scalar/batch gate is exact after the split (`probe=92/92`,
+all five token IDs and logits identical) and its batch speedup increased to
+1.949x in that run.  Outer tiling has therefore exhausted its easy benefit;
+FFN is flat and dominant.  The next implementation must group routed work by
+expert and evaluate the shared expert across a wider token GEMM so that expert
+weights are reused beyond the current four-position kernel panel.
+
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
 their validated existing size. The same allocation resumed the partial 22.25

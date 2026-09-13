@@ -20,7 +20,8 @@
 #include "glm53f_collective_12n.h"
 
 enum { LAYERS = 45, HIDDEN = 4096, STREAMS = 4, FLAT = 16384, MIX = 24,
-       MAX_GENERATED_TOKENS = 32768 };
+       MAX_GENERATED_TOKENS = 32768, VERIFY_BATCH = 5, PREFILL_BATCH = 32,
+       KERNEL_BATCH = 4 };
 
 static void *a256(size_t bytes) {
     void *p = NULL;
@@ -148,15 +149,17 @@ static glm53f_target_model_12n *target_model_create_with_kda(
     target_memtrace(rank, "moe_after");
     m->scratch = a256(sizeof(*m->scratch));
     m->streams = a256((size_t)FLAT * sizeof(float));
-    m->batch_scratch = a256((size_t)5 * sizeof(*m->batch_scratch));
-    m->batch_streams = a256((size_t)5 * FLAT * sizeof(float));
-    m->batch_normalized = a256((size_t)5 * HIDDEN * sizeof(float));
-    m->batch_output = a256((size_t)5 * HIDDEN * sizeof(float));
+    m->batch_scratch = a256((size_t)PREFILL_BATCH * sizeof(*m->batch_scratch));
+    m->batch_streams = a256((size_t)PREFILL_BATCH * FLAT * sizeof(float));
+    m->batch_normalized = a256((size_t)PREFILL_BATCH * HIDDEN * sizeof(float));
+    m->batch_output = a256((size_t)PREFILL_BATCH * HIDDEN * sizeof(float));
     for (int l = 0; l < LAYERS; l++) {
         size_t n = glm53f_kda_state_bytes_12n(m->kda[l]);
         if (n > m->batch_state_stride) m->batch_state_stride = n;
     }
-    m->batch_state = a256((size_t)5 * m->batch_state_stride);
+    /* Prompt-only tiles do not capture recurrent snapshots.  Keep that large
+     * allocation at the speculative verifier's independent ABI limit. */
+    m->batch_state = a256((size_t)VERIFY_BATCH * m->batch_state_stride);
     if (!m->embedding || !m->head || !m->moe || !m->scratch || !m->streams ||
         !m->batch_scratch || !m->batch_streams || !m->batch_normalized ||
         !m->batch_output || !m->batch_state) goto fail;
@@ -283,7 +286,9 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
                                        float *logit, float *hidden,
                                        glm53f_target_snapshot_12n **after) {
     double begin = m && m->profile ? MPI_Wtime() : 0.0;
-    if (!m || !input || (!next != !logit) || tokens < 1 || tokens > 5)
+    if (!m || !input || (!next != !logit) || tokens < 1 ||
+        tokens > PREFILL_BATCH ||
+        ((next || hidden || after) && tokens > VERIFY_BATCH))
         return -1;
     for (int t = 0; t < tokens; t++)
         if (glm53f_embedding_streams_12n(m->embedding, input[t],
@@ -302,10 +307,17 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
         begin = m->profile ? MPI_Wtime() : 0.0;
         if (m->kda[l]) {
             size_t bytes = glm53f_kda_state_bytes_12n(m->kda[l]);
-            if (glm53f_kda_sublayer_batch_capture_12n(
-                    m->kda[l], m->batch_output, m->batch_normalized, tokens,
-                    after ? m->batch_state : NULL, m->batch_state_stride))
-                return -1;
+            for (int tile = 0; tile < tokens; tile += KERNEL_BATCH) {
+                int n = tokens - tile;
+                if (n > KERNEL_BATCH) n = KERNEL_BATCH;
+                if (glm53f_kda_sublayer_batch_capture_12n(
+                        m->kda[l], m->batch_output + (size_t)tile * HIDDEN,
+                        m->batch_normalized + (size_t)tile * HIDDEN, n,
+                        after ? m->batch_state +
+                            (size_t)tile * m->batch_state_stride : NULL,
+                        m->batch_state_stride))
+                    return -1;
+            }
             if (after)
                 for (int t = 0; t < tokens; t++) {
                     if (!after[t] || after[t]->kda_bytes < state_off + bytes)
@@ -317,9 +329,14 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
             state_off += bytes;
         } else {
             int base = glm53f_sparse_length_12n(m->sparse[l]);
-            if (glm53f_sparse_sublayer_batch_12n(m->sparse[l], m->batch_output,
-                                                 m->batch_normalized, tokens))
-                return -1;
+            for (int tile = 0; tile < tokens; tile += KERNEL_BATCH) {
+                int n = tokens - tile;
+                if (n > KERNEL_BATCH) n = KERNEL_BATCH;
+                if (glm53f_sparse_sublayer_batch_12n(
+                        m->sparse[l], m->batch_output + (size_t)tile * HIDDEN,
+                        m->batch_normalized + (size_t)tile * HIDDEN, n))
+                    return -1;
+            }
             if (after)
                 for (int t = 0; t < tokens; t++) {
                     if (!after[t])
@@ -339,6 +356,17 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
         if (m->profile) m->batch_phase[1] += MPI_Wtime() - begin;
         begin = m->profile ? MPI_Wtime() : 0.0;
         if (l < 3) {
+            if (tokens > VERIFY_BATCH) {
+                for (int tile = 0; tile < tokens; tile += KERNEL_BATCH) {
+                    int panel = tokens - tile;
+                    if (panel > KERNEL_BATCH) panel = KERNEL_BATCH;
+                    if (glm53f_dense_ffn_sublayer_batch_12n(
+                            m->dense[l], m->batch_output + (size_t)tile * HIDDEN,
+                            m->batch_normalized + (size_t)tile * HIDDEN, panel))
+                        return -1;
+                }
+                goto batch_ffn_done;
+            }
             int n = tokens < 5 ? tokens : 4;
             if (glm53f_dense_ffn_sublayer_batch_12n(
                     m->dense[l], m->batch_output, m->batch_normalized, n))
@@ -350,6 +378,17 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
                 return -1;
         } else {
             glm53f_moe_stage_set_layer_12n(m->moe, l);
+            if (tokens > VERIFY_BATCH) {
+                for (int tile = 0; tile < tokens; tile += KERNEL_BATCH) {
+                    int panel = tokens - tile;
+                    if (panel > KERNEL_BATCH) panel = KERNEL_BATCH;
+                    if (glm53f_moe_stage_sublayer_batch_12n(
+                            m->moe, m->batch_output + (size_t)tile * HIDDEN,
+                            m->batch_normalized + (size_t)tile * HIDDEN, panel))
+                        return -1;
+                }
+                goto batch_ffn_done;
+            }
             int n = tokens < 5 ? tokens : 4;
             if (glm53f_moe_stage_sublayer_batch_12n(m->moe, m->batch_output,
                                                     m->batch_normalized, n))
@@ -359,6 +398,7 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
                                    m->batch_normalized + (size_t)4 * HIDDEN))
                 return -1;
         }
+batch_ffn_done:
         if (m->profile) m->batch_phase[3] += MPI_Wtime() - begin;
         begin = m->profile ? MPI_Wtime() : 0.0;
         glm53f_mhc_post_batch_sve(m->batch_streams, m->batch_output,
