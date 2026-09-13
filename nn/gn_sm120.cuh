@@ -409,23 +409,24 @@ __device__ __forceinline__ void gn_stage16(unsigned short *dst, const unsigned s
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" ::"r"(address), "l"(src),
                  "r"(bytes));
 }
-template <bool Precise, int Products = 6>
+template <bool Precise, int Products = 6, int BN = 64>
 __device__ void gn_tiled_body(float *y, const unsigned short *a, const unsigned short *b, int M,
                               int N, int K, int add) {
     /* Training: four 16x32 warps and a 32x64 CTA improve wave occupancy on
      * 1296-row shogi batches. Inference uses a 64x64 CTA. */
-    constexpr int MR = Precise ? 1 : 2, Threads = 128, BM = Precise ? 32 : 64;
+    constexpr int MR = Precise ? 1 : 2, Threads = BN == 128 ? 256 : 128;
+    constexpr int BM = Precise ? 32 : 64, WarpColumns = BN / 32;
     constexpr int Planes = Precise ? (Products == 3 ? 2 : 3) : 1;
     __shared__ unsigned short sa[Planes][BM][40];
-    __shared__ unsigned short sb[Planes][64][40];
+    __shared__ unsigned short sb[Planes][BN][40];
     int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    int wr = (warp / 2) * (16 * MR), wc = (warp % 2) * 32;
-    int r0 = blockIdx.y * BM, c0 = blockIdx.x * 64, stride = (K + 31) & ~31;
+    int wr = (warp / WarpColumns) * (16 * MR), wc = (warp % WarpColumns) * 32;
+    int r0 = blockIdx.y * BM, c0 = blockIdx.x * BN, stride = (K + 31) & ~31;
     float high[MR][4][4] = {}, low[MR][4][4] = {};
     for (int k0 = 0; k0 < stride; k0 += 32) {
 #pragma unroll
         for (int p = 0; p < Planes; p++) {
-            for (int i = tid; i < 64 * 4; i += Threads) {
+            for (int i = tid; i < BN * 4; i += Threads) {
                 int r = i / 4, k = 8 * (i % 4);
                 const unsigned short *ap =
                     a + (r0 + r < M ? (p * M + r0 + r) * stride + k0 + k : 0);
@@ -505,6 +506,10 @@ extern "C" __global__ __launch_bounds__(128) void gn_mm_bf16x3(float *y,
                                                                const unsigned short *b, int M,
                                                                int N, int K, int add) {
     gn_tiled_body<true, 3>(y, a, b, M, N, K, add);
+}
+extern "C" __global__ __launch_bounds__(256) void gn_mm_bf16x3_n128(
+    float *y, const unsigned short *a, const unsigned short *b, int M, int N, int K, int add) {
+    gn_tiled_body<true, 3, 128>(y, a, b, M, N, K, add);
 }
 
 /* Experimental integer operand training: FP32 master state and dequantization.

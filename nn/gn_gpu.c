@@ -34,7 +34,7 @@ typedef struct {
     CUmodule cuda_module;
     hipModule_t hip_module;
     Buffer b[SLOT_COUNT];
-    void *functions[52];
+    void *functions[53];
     void *lt;
     hipGraph_t backward_graph;
     hipGraphExec_t backward_exec;
@@ -93,7 +93,8 @@ static const char *names[] = {"gn_mm",
                               "gn_attention_qkv_back_81",
                               "gn_uncolumns4_256",
                               "gn_lt_combine_bias",
-                              "gn_mm_bf16x3_bias"};
+                              "gn_mm_bf16x3_bias",
+                              "gn_mm_bf16x3_n128"};
 static int current(Gpu *g) {
     int rc = g->hip ? (int)hipSetDevice(g->device) : (int)cuCtxSetCurrent(g->context);
     return rc ? gn_fail("cannot activate GPU context") : 0;
@@ -294,6 +295,8 @@ static int mm_columns(Gpu *g, uint64_t y, uint64_t a, uint64_t b, int M, int N, 
             g->bias_fused = 1;
             return launch(g, 51, (N + 31) / 32, (M + 31) / 32, 128, biased);
         }
+        if (!g->hip && g->precise == 2 && M >= 256 && N >= 512 && !(N & 127))
+            return launch(g, 52, (N + 127) / 128, (M + 31) / 32, 256, packed);
         if (g->precise == 2)
             return launch(g, 35, (N + 31) / 32, (M + 31) / 32, 128, packed);
         int tile_n = g->hip && g->precise ? 32 : 64, tile_m = g->precise ? 32 : 64;
@@ -500,6 +503,12 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
             g->functions[35] = (void *)f;
             if (rc) {
                 gn_fail("missing CUDA BF16x3 kernel");
+                goto bad;
+            }
+            rc = (int)cuModuleGetFunction(&f, g->cuda_module, names[52]);
+            g->functions[52] = (void *)f;
+            if (rc) {
+                gn_fail("missing CUDA BF16x3 N128 kernel");
                 goto bad;
             }
         }
