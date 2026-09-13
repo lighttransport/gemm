@@ -667,6 +667,18 @@ TFLOP/s, **9.99857%** of the nominal dense peak. Packed-activation caching,
 rocBLASLt combine/bias fusion, and a materialized fused BN gradient were also
 tested but were neutral or slower and are not retained.
 
+The backward fusion now also accumulates each preceding convolution's bias
+gradient while producing the BN input gradient. This removes the separate
+channel-reduction launch and its full gradient-tensor read without changing the
+stored FP32 gradient. The batch-64 CPU-oracle result remains output relative L2
+0.000019664309 and global gradient relative L2 **0.00082243384**. Three 100-step
+runs measured **1,044.73 examples/s median** (1,044.00--1,046.56), with 11.2848
+useful TFLOP/s and 19.5725 product TFLOP/s, or **10.0372%** of the 195-TFLOP/s
+nominal peak. A direct C256 3x3 WMMA convolution passed the batch-16 gradient
+gate but regressed to 759.910 examples/s; directly feeding rocBLASLt's two
+compensation outputs into BN was accurate but neutral at 1,039.64 examples/s.
+Neither experiment is retained.
+
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
 The precision allocation executes an estimated 18.3703 trillion 16-bit matrix

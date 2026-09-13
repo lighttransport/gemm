@@ -654,9 +654,10 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
                 uint64_t source = PTR_NODE(m, bn->a, 0), dsource = PTR_NODE(m, bn->a, 1),
                          mid = PTR_NODE(m, i - 1, 0), bn_w = param(m, bn->w, 0),
                          bn_dw = param(m, bn->w, 1), bn_db = param(m, bn->bias, 1),
-                         bn_aux = PTR_NODE(m, i - 1, 2);
+                         bn_aux = PTR_NODE(m, i - 1, 2),
+                         conv_db = param(m, m->n[bn->a].bias, 1);
                 void *args[] = {&dsource, &bn_dw, &bn_db, &source, &mid,
-                                &dy,      &bn_w,  &bn_aux, &R,      &C};
+                                &dy,      &bn_w,  &bn_aux, &conv_db, &R, &C};
                 CALL(launch(g, 45, (C + 7) / 8, 1, 256, args));
                 i--;
                 continue;
@@ -719,11 +720,16 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
             }
             if (n->kind == CONV)
                 CALL(columns(g, dx, gradient, R, (int)m->n[n->a].c, side, n->k, 1));
-            void *args[] = {&db, &dy, &R, &C};
-            if (g->hip && !g->legacy)
-                CALL(launch(g, 29, (C + 7) / 8, 1, 256, args));
-            else
-                CALL(flat(g, 4, C, args));
+            int fused_db = g->hip && !g->legacy && i + 2 < m->nn &&
+                           m->n[i + 1].kind == BN && m->n[i + 1].a == (int)i &&
+                           m->n[i + 2].kind == SILU && m->n[i + 2].a == (int)i + 1;
+            if (!fused_db) {
+                void *args[] = {&db, &dy, &R, &C};
+                if (g->hip && !g->legacy)
+                    CALL(launch(g, 29, (C + 7) / 8, 1, 256, args));
+                else
+                    CALL(flat(g, 4, C, args));
+            }
         } else if (n->kind == BN || n->kind == LN) {
             void *args[] = {&dx, &dw, &db, &x, &dy, &w, &aux, &R, &C, &layer};
             if (g->hip && !g->legacy && !layer)

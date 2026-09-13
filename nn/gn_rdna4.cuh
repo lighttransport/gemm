@@ -325,7 +325,7 @@ extern "C" __global__ void gn_bn_silu_channels(float *mid, float *y, float *aux,
 extern "C" __global__ void gn_bn_silu_back_channels(float *dx, float *dw, float *db,
                                                      const float *x, const float *mid,
                                                      const float *dy, const float *w,
-                                                     const float *aux, int R, int C) {
+                                                     const float *aux, float *conv_db, int R, int C) {
     int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;
     float mu = c < C ? aux[c] : 0, inv = c < C ? aux[C + c] : 0;
     double sum = 0, prod = 0;
@@ -343,14 +343,20 @@ extern "C" __global__ void gn_bn_silu_back_channels(float *dx, float *dw, float 
         dw[c] += (float)prod;
         db[c] += (float)sum;
     }
+    double conv_sum = 0;
     if (c < C)
         for (int r = t / 8; r < R; r += 32) {
             int j = r * C + c;
             float s = 1 / (1 + expf(-mid[j]));
             float d = dy[j] * s * (1 + mid[j] * (1 - s));
-            dx[j] += inv * w[c] *
-                     (d - (float)(sum / R) - (x[j] - mu) * inv * (float)(prod / R));
+            float v = inv * w[c] *
+                      (d - (float)(sum / R) - (x[j] - mu) * inv * (float)(prod / R));
+            dx[j] += v;
+            conv_sum += v;
         }
+    conv_sum = gn_sum_channels(conv_sum);
+    if (t < 8 && c < C)
+        conv_db[c] += (float)conv_sum;
 }
 extern "C" __global__ void gn_bias_back_parallel(float *db, const float *dy, int R, int C) {
     __shared__ double sums[256];
