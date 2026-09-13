@@ -65,6 +65,10 @@ int ds41f_journal_finish(ds41f_journal *j,size_t keep)
         a->selected_count=c->selected_count;memcpy(a->candidate_blocks,j->candidates+keep*j->candidate_bytes,j->candidate_bytes);
         memcpy(e->history,c->history,sizeof c->history);e->history_len=c->history_len;
         for(int i=0;i<2;++i){e->table[i].lookups=c->counters[i][0];e->table[i].local_rows=c->counters[i][1];e->table[i].remote_rows=c->counters[i][2];}
+        /* Decoded attention rows are derived state. A rejected suffix may
+         * have overwritten a cache slot for a committed row, so invalidate
+         * the bounded cache after restoring compressed source rows. */
+        ds41f_attention_clear_row_cache(a);
     }
     /* Prefetch generations remain monotonic. Both saved results were drained
      * and invalidated; the next forward must submit fresh hashes. */

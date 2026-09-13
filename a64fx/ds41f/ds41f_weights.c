@@ -103,14 +103,24 @@ int ds41f_weights_load_local(ds41f_weights *s,const char *stage,const char *pref
 static int tp_vocab(const char *name)
 {return !strcmp(name,"head.weight")||!strcmp(name,"mtp.2.markov_head.embed.weight")||
     !strcmp(name,"mtp.2.markov_head.head.weight");}
+static int tp_shared(const char *name)
+{return strstr(name,".ffn.shared_experts.")!=NULL;}
+static int tp_attention(const char *name)
+{return strstr(name,".attn.wq_b.")||strstr(name,".attn.wo_a.")||strstr(name,".attn.wo_b.");}
 static int tp_sharded(const char *name)
 {return tp_vocab(name)||!strcmp(name,"mtp.0.main_proj.weight")||!strcmp(name,"mtp.0.main_proj.scale")||strstr(name,".attn.wq_b.")||strstr(name,".attn.wo_a.")||
-    strstr(name,".attn.wo_b.")||strstr(name,".ffn.shared_experts.");}
+    strstr(name,".attn.wo_b.")||tp_shared(name);}
 int ds41f_weights_check_tp(ds41f_weights *s,const char *stage,int tp,int rank)
 {
     if(!s||!stage||(tp!=1&&tp!=2&&tp!=4)||rank<0||rank>=12)return EINVAL;
-    char path[4096],line[512];int n=snprintf(path,sizeof path,"%s/weights.tp",stage);
+    char path[4096],shared_path[4096],attention_path[4096],line[512];int n=snprintf(path,sizeof path,"%s/weights.tp",stage);
     if(n<0||(size_t)n>=sizeof path)return ENAMETOOLONG;
+    n=snprintf(shared_path,sizeof shared_path,"%s/weights.shared.tp",stage);
+    if(n<0||(size_t)n>=sizeof shared_path)return ENAMETOOLONG;
+    n=snprintf(attention_path,sizeof attention_path,"%s/weights.attention.tp",stage);
+    if(n<0||(size_t)n>=sizeof attention_path)return ENAMETOOLONG;
+    FILE *shared_file=fopen(shared_path,"r");int has_shared_manifest=shared_file!=NULL;if(shared_file)fclose(shared_file);
+    FILE *attention_file=fopen(attention_path,"r");int has_attention_manifest=attention_file!=NULL;if(attention_file)fclose(attention_file);
     FILE *f=fopen(path,"r");if(!f)return tp==1&&errno==ENOENT?0:errno;
     int version,stored_tp,stored_rank,ranks;char extra;
     int rc=0;
@@ -122,6 +132,7 @@ int ds41f_weights_check_tp(ds41f_weights *s,const char *stage,int tp,int rank)
         if(sscanf(line,"%191s %zu %zu %zu %zu %c",name,&rows,&cols,&first,&local,&extra)!=5){rc=EINVAL;break;}
         const ds41f_weight *found=ds41f_weight_find(s,name);
         if(!found||!tp_sharded(name)||found->rows!=local||found->cols!=cols||first>rows||local>rows-first){rc=EINVAL;break;}
+        if((has_shared_manifest&&tp_shared(name))||(has_attention_manifest&&tp_attention(name))){rc=EINVAL;break;}
         size_t index=(size_t)(found-s->items);
         if(seen[index]){rc=EINVAL;break;}seen[index]=1;
         if(tp_vocab(name)){
@@ -131,7 +142,100 @@ int ds41f_weights_check_tp(ds41f_weights *s,const char *stage,int tp,int rank)
         s->items[index].global_rows=rows;s->items[index].row_start=first;
     }
     if(ferror(f))rc=EIO;
-    if(!rc)for(size_t i=0;i<s->count;++i)if(tp_sharded(s->items[i].name)&&!seen[i]){rc=EINVAL;break;}
+    if(!rc)for(size_t i=0;i<s->count;++i)
+        if(tp_sharded(s->items[i].name)&&
+           !((has_shared_manifest&&tp_shared(s->items[i].name))||
+             (has_attention_manifest&&tp_attention(s->items[i].name)))&&!seen[i]){rc=EINVAL;break;}
+    free(seen);fclose(f);return rc;
+}
+int ds41f_weights_check_shared_tp(ds41f_weights *s,const char *stage,int tp,int rank)
+{
+    if(!s||!stage||(tp!=4&&tp!=12)||rank<0||rank>=12)return EINVAL;
+    char path[4096],line[512];int n=snprintf(path,sizeof path,"%s/weights.shared.tp",stage);
+    if(n<0||(size_t)n>=sizeof path)return ENAMETOOLONG;
+    FILE *f=fopen(path,"r");if(!f)return errno;
+    int version,stored_tp,stored_rank,ranks;char extra;int rc=0;
+    if(!fgets(line,sizeof line,f)||sscanf(line,"DS41FSH %d %d %d %d %c",&version,&stored_tp,&stored_rank,&ranks,&extra)!=4||
+       version!=1||stored_tp!=tp||stored_rank!=rank||ranks!=12)rc=EINVAL;
+    unsigned char *seen=calloc(s->count,1);if(!seen){fclose(f);return ENOMEM;}
+    while(!rc&&fgets(line,sizeof line,f)){
+        char name[192];size_t rows,cols,first,local;
+        if(sscanf(line,"%191s %zu %zu %zu %zu %c",name,&rows,&cols,&first,&local,&extra)!=5){rc=EINVAL;break;}
+        const ds41f_weight *found=ds41f_weight_find(s,name);
+        if(!found||!tp_shared(name)||found->rows!=local||found->cols!=cols||first>rows||local>rows-first){rc=EINVAL;break;}
+        size_t index=(size_t)(found-s->items);if(seen[index]){rc=EINVAL;break;}seen[index]=1;
+        int local_rank=rank%tp;size_t alignment=(!strcmp(found->dtype,"F8_E4M3")&&
+            strstr(name,".ffn.shared_experts.")&&strstr(name,".weight"))?32:1;
+        if(rows%alignment){rc=EINVAL;break;}
+        size_t blocks=rows/alignment;
+        size_t expected_first=(blocks*(size_t)local_rank/(size_t)tp)*alignment;
+        size_t expected_end=(blocks*(size_t)(local_rank+1)/(size_t)tp)*alignment;
+        if(first!=expected_first||local!=expected_end-expected_first){rc=EINVAL;break;}
+        ((ds41f_weight *)found)->global_rows=rows;((ds41f_weight *)found)->row_start=first;
+    }
+    if(ferror(f))rc=EIO;
+    if(!rc)for(size_t i=0;i<s->count;++i)if(tp_shared(s->items[i].name)&&!seen[i]){rc=EINVAL;break;}
+    /* An FP8 scale row describes one 32-row output group.  Check the pair
+     * after parsing both manifests so an uneven W2 split cannot pair 14
+     * weight groups with 13 scale rows on one rank. */
+    if(!rc)for(size_t i=0;i<s->count;++i){const ds41f_weight *w=&s->items[i];
+        if(!tp_shared(w->name)||strcmp(w->dtype,"F8_E4M3")||
+           strlen(w->name)<7||strcmp(w->name+strlen(w->name)-7,".weight"))continue;
+        char scale_name[192];size_t len=strlen(w->name)-7;
+        if(len+7>=sizeof scale_name){rc=ENAMETOOLONG;break;}
+        memcpy(scale_name,w->name,len);memcpy(scale_name+len,".scale",7);
+        const ds41f_weight *scale=ds41f_weight_find(s,scale_name);
+        if(!scale||strcmp(scale->dtype,"F8_E8M0")||
+           scale->global_rows!=(w->global_rows+31)/32||
+           scale->row_start!=w->row_start/32||scale->rows!=(w->rows+31)/32){rc=EINVAL;break;}}
+    free(seen);fclose(f);return rc;
+}
+int ds41f_weights_check_attention_tp(ds41f_weights *s,const char *stage,int rank)
+{
+    if(!s||!stage||rank<0||rank>=12)return EINVAL;
+    char path[4096],line[512];int n=snprintf(path,sizeof path,"%s/weights.attention.tp",stage);
+    if(n<0||(size_t)n>=sizeof path)return ENAMETOOLONG;
+    FILE *f=fopen(path,"r");if(!f)return errno;
+    int version,stored_tp,stored_rank,ranks;char extra;int rc=0;
+    if(!fgets(line,sizeof line,f)||sscanf(line,"DS41FA %d %d %d %d %c",
+       &version,&stored_tp,&stored_rank,&ranks,&extra)!=4||version!=1||stored_tp!=8||
+       stored_rank!=rank||ranks!=12){rc=EINVAL;}
+    unsigned char *seen=calloc(s->count,1);if(!seen){fclose(f);return ENOMEM;}
+    while(!rc&&fgets(line,sizeof line,f)){
+        char name[192];size_t rows,cols,first,local;
+        if(sscanf(line,"%191s %zu %zu %zu %zu %c",name,&rows,&cols,&first,&local,&extra)!=5){rc=EINVAL;break;}
+        const ds41f_weight *found=ds41f_weight_find(s,name);
+        if(!found||!tp_attention(name)||found->rows!=local||found->cols!=cols||
+           first>rows||local>rows-first){rc=EINVAL;break;}
+        int head_shard=strstr(name,".attn.wq_b.")||strstr(name,".attn.wo_a.");
+        int degree=head_shard?8:12;if(head_shard&&rank>=8){rc=EINVAL;break;}
+        size_t name_len=strlen(name);
+        int weight_suffix=name_len>=7&&!strcmp(name+name_len-7,".weight");
+        size_t alignment=(!strcmp(found->dtype,"F8_E4M3")&&weight_suffix&&!head_shard)?32:1;
+        if(rows%alignment){rc=EINVAL;break;}
+        size_t blocks=rows/alignment,local_rank=(size_t)rank;
+        size_t expected_first=(blocks*local_rank/(size_t)degree)*alignment;
+        size_t expected_end=(blocks*(local_rank+1)/(size_t)degree)*alignment;
+        if(first!=expected_first||local!=expected_end-expected_first){rc=EINVAL;break;}
+        size_t index=(size_t)(found-s->items);if(seen[index]){rc=EINVAL;break;}seen[index]=1;
+        ((ds41f_weight *)found)->global_rows=rows;((ds41f_weight *)found)->row_start=first;
+    }
+    if(ferror(f))rc=EIO;
+    /* The manifest lists only the rows used by this rank.  Q/WO-A are
+     * present on ranks 0..7; every rank carries a WO-B output shard. */
+    if(!rc)for(size_t i=0;i<s->count;++i){const ds41f_weight *w=&s->items[i];
+        if(!tp_attention(w->name))continue;
+        int want=!((strstr(w->name,".attn.wq_b.")||strstr(w->name,".attn.wo_a."))&&rank>=8);
+        if((int)seen[i]!=want){rc=EINVAL;break;}}
+    /* Each FP8 scale row corresponds to a 32-row output group. */
+    if(!rc)for(size_t i=0;i<s->count;++i){const ds41f_weight *w=&s->items[i];
+        size_t len=strlen(w->name);
+        if(!tp_attention(w->name)||strcmp(w->dtype,"F8_E4M3")||len<7||strcmp(w->name+len-7,".weight"))continue;
+        char scale_name[192];if(len>=sizeof scale_name){rc=ENAMETOOLONG;break;}
+        memcpy(scale_name,w->name,len-7);memcpy(scale_name+len-7,".scale",7);
+        const ds41f_weight *scale=ds41f_weight_find(s,scale_name);
+        if(!scale||strcmp(scale->dtype,"F8_E8M0")||scale->global_rows!=(w->global_rows+31)/32||
+           scale->row_start!=w->row_start/32||scale->rows!=(w->rows+31)/32){rc=EINVAL;break;}}
     free(seen);fclose(f);return rc;
 }
 int ds41f_weights_requantize_fp8(ds41f_weights *s,size_t block,size_t limit,int projections_only)

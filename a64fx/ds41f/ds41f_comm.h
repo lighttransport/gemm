@@ -26,4 +26,19 @@ void ds41f_comm_tp_gather(float *out,float *part,size_t count,int owner);
 void ds41f_comm_argmax(float *value,int *index);
 void ds41f_comm_head_logits(float *out,const float *part,size_t count);
 void ds41f_comm_free(void);
+/* The shared expert may use a communicator independent of dense attention.
+ * A TP12 shared path uses every rank while dense attention remains TP4. */
+void ds41f_comm_set_shared_tp(int tp);
+int ds41f_comm_shared_member(int owner);
+void ds41f_comm_shared_range(size_t global_count,size_t *first,size_t *count);
+void ds41f_comm_shared_range_aligned(size_t global_count,size_t alignment,
+                                     size_t *first,size_t *count);
+void ds41f_comm_shared_allgather(float *out,const float *part,size_t count);
+void ds41f_comm_shared_gather(float *out,const float *part,size_t count,
+                              int owner,size_t global_count);
+void ds41f_comm_shared_gather_aligned(float *out,const float *part,size_t count,
+                                      int owner,size_t global_count,size_t alignment);
+void ds41f_comm_shared_reduce_scatter(float *out,const float *in,size_t global_count);
+void ds41f_comm_shared_reduce_scatter_aligned(float *out,const float *in,
+                                              size_t global_count,size_t alignment);
 #endif

@@ -69,6 +69,72 @@ class LayoutTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             stage_tp.layout(Path('.'), 12, 2)
 
+    def test_shared_tp12_uses_all_ranks_and_uneven_output_rows(self):
+        layouts = [stage_tp.layout(Path('.'), rank, 4, shared_tp=12)
+                   for rank in range(12)]
+        for name in ('layers.0.ffn.shared_experts.w1.weight',
+                     'layers.0.ffn.shared_experts.w2.weight'):
+            shards = []
+            for rank, items in enumerate(layouts):
+                found = [x for x in items if x['name'] == name]
+                self.assertEqual(len(found), 1)
+                shards.append((rank, found[0]))
+            self.assertEqual(len(shards), 12)
+            expected = 0
+            original = next(x for x in self.dense if x['name'] == name)
+            for rank, item in shards:
+                self.assertEqual(item['first_row'], expected)
+                alignment = 32 if name.endswith('.weight') else 1
+                end = (original['shape'][0] // alignment) * (rank + 1) // 12 * alignment
+                self.assertEqual(item['shape'][0], end - expected)
+                expected += item['shape'][0]
+            self.assertEqual(expected, original['shape'][0])
+            scale_name = name[:-7] + '.scale'
+            scale_shards = []
+            for rank, items in enumerate(layouts):
+                found = [x for x in items if x['name'] == scale_name]
+                self.assertEqual(len(found), 1)
+                scale_shards.append((rank, found[0]))
+            scale_original = next(x for x in self.dense if x['name'] == scale_name)
+            self.assertEqual(sum(x['shape'][0] for _, x in scale_shards),
+                             scale_original['shape'][0])
+            for (_, weight), (_, scale) in zip(shards, scale_shards):
+                self.assertEqual(scale['first_row'], weight['first_row'] // 32)
+                self.assertEqual(scale['shape'][0], weight['shape'][0] // 32)
+
+    def test_attention_tp12_uses_eight_head_and_twelve_output_shards(self):
+        layouts = [stage_tp.layout(Path('.'), rank, 4, shared_tp=12,
+                                   attention_tp12=True) for rank in range(12)]
+        for name, degree, alignment in (
+                ('layers.0.attn.wq_b.weight', 8, 1),
+                ('layers.0.attn.wo_a.weight', 8, 1),
+                ('layers.0.attn.wo_b.weight', 12, 32)):
+            original = next(x for x in self.dense if x['name'] == name)
+            shards = [(rank, next((x for x in items if x['name'] == name), None))
+                      for rank, items in enumerate(layouts)]
+            present = [(rank, item) for rank, item in shards if item is not None]
+            self.assertEqual(len(present), degree)
+            expected = 0
+            for shard_index, (rank, item) in enumerate(present):
+                self.assertEqual(rank, shard_index)
+                self.assertEqual(item['first_row'], expected)
+                blocks = original['shape'][0] // alignment
+                end = blocks * (shard_index + 1) // degree * alignment
+                self.assertEqual(item['shape'][0], end - expected)
+                expected = end
+            self.assertEqual(expected, original['shape'][0])
+            scale_name = name[:-7] + '.scale'
+            scale_shards = [(rank, next((x for x in items if x['name'] == scale_name), None))
+                            for rank, items in enumerate(layouts)]
+            scale_present = [(rank, item) for rank, item in scale_shards if item is not None]
+            self.assertEqual(len(scale_present), degree)
+            for (_, weight), (_, scale) in zip(present, scale_present):
+                self.assertEqual(scale['first_row'], weight['first_row'] // 32)
+                self.assertEqual(scale['shape'][0], weight['shape'][0] // 32)
+        sinks = [sum(x['name'] == 'layers.0.attn.attn_sink' for x in items)
+                 for items in layouts]
+        self.assertEqual(sinks, [1] * 8 + [0] * 4)
+
 
 if __name__ == '__main__':
     unittest.main()

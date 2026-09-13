@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
 #endif
@@ -17,8 +18,8 @@
 static tp_comm comm;
 static utofu_vcq_hdl_t vcq;
 static int my_rank;
-static int mpi_broadcast,dense_tp=1;
-static MPI_Comm dense_comm=MPI_COMM_NULL;
+static int mpi_broadcast,dense_tp=1,shared_tp=1;
+static MPI_Comm dense_comm=MPI_COMM_NULL,shared_comm=MPI_COMM_NULL;
 static void bootstrap_barrier(void){MPI_Barrier(MPI_COMM_WORLD);}
 void ds41f_comm_ready(void){bootstrap_barrier();}
 void ds41f_comm_use_mpi_broadcast(int enabled){mpi_broadcast=!!enabled;}
@@ -196,5 +197,94 @@ void ds41f_comm_head_logits(float *out,const float *part,size_t n)
     int rc=MPI_Gatherv(part,(int)n,MPI_FLOAT,out,counts,offsets,MPI_FLOAT,11,MPI_COMM_WORLD);
     if(rc)ds41f_comm_abort("head logits gather",rc);
 }
+void ds41f_comm_set_shared_tp(int tp)
+{
+    if(tp!=1&&tp!=4&&tp!=12)ds41f_comm_abort("shared TP must be 1,4,12",EINVAL);
+    if(shared_comm!=MPI_COMM_NULL){MPI_Comm_free(&shared_comm);shared_comm=MPI_COMM_NULL;}
+    shared_tp=tp;
+    if(tp>1){
+        int rc=MPI_Comm_split(MPI_COMM_WORLD,my_rank/tp,my_rank,&shared_comm);
+        if(rc)ds41f_comm_abort("MPI shared communicator",rc);
+    }
+}
+int ds41f_comm_shared_member(int owner)
+{
+    if(owner<0||owner>=12)ds41f_comm_abort("shared owner bounds",EINVAL);
+    return shared_tp==1?my_rank==owner:my_rank/shared_tp==owner/shared_tp;
+}
+void ds41f_comm_shared_range_aligned(size_t global_count,size_t alignment,size_t *first,size_t *count)
+{
+    if(!first||!count||!global_count||!alignment||shared_tp<1||global_count>INT_MAX||global_count%alignment)
+        ds41f_comm_abort("shared range bounds",EINVAL);
+    int local=shared_tp==1?0:my_rank%shared_tp;
+    size_t blocks=global_count/alignment;
+    /* Match stage_tp.py's floor-boundary partition.  This keeps the runtime
+     * row_start/rows contract identical to every staged weight, including
+     * the 160-block W2 tensor split over 12 ranks. */
+    size_t first_block=blocks*(size_t)local/(size_t)shared_tp;
+    size_t end_block=blocks*(size_t)(local+1)/(size_t)shared_tp;
+    *first=first_block*alignment;*count=(end_block-first_block)*alignment;
+}
+void ds41f_comm_shared_range(size_t global_count,size_t *first,size_t *count)
+{ds41f_comm_shared_range_aligned(global_count,1,first,count);}
+static void shared_bounds(int owner,size_t global_count,size_t local_count,size_t alignment)
+{
+    if(shared_tp<=1||shared_comm==MPI_COMM_NULL||owner<0||owner>=12||
+       !ds41f_comm_shared_member(owner)||global_count>8192||local_count>global_count)
+        ds41f_comm_abort("shared collective bounds",EINVAL);
+    size_t first,expected;ds41f_comm_shared_range_aligned(global_count,alignment,&first,&expected);
+    (void)first;
+    if(local_count!=expected)ds41f_comm_abort("shared shard range",EINVAL);
+}
+void ds41f_comm_shared_allgather(float *out,const float *part,size_t count)
+{
+    if(!out||!part||shared_tp<=1||shared_comm==MPI_COMM_NULL||!count||
+       count>(size_t)4096||count>(size_t)INT_MAX/(size_t)shared_tp)
+        ds41f_comm_abort("shared allgather bounds",EINVAL);
+    uint16_t send[4096],recv[49152];pack_bf16(send,(float *)part,count,0);
+    int rc=MPI_Allgather(send,(int)(count*2),MPI_BYTE,recv,(int)(count*2),MPI_BYTE,shared_comm);
+    if(rc)ds41f_comm_abort("shared allgather",rc);
+    unpack_bf16(out,recv,count*(size_t)shared_tp,0);
+}
+void ds41f_comm_shared_gather(float *out,const float *part,size_t count,
+                              int owner,size_t global_count)
+{ds41f_comm_shared_gather_aligned(out,part,count,owner,global_count,1);}
+void ds41f_comm_shared_gather_aligned(float *out,const float *part,size_t count,
+                                      int owner,size_t global_count,size_t alignment)
+{
+    if(!out||!part||global_count>8192||!alignment||global_count%alignment)
+        ds41f_comm_abort("shared gather bounds",EINVAL);
+    if(shared_tp==1){if(my_rank==owner)memcpy(out,part,global_count*sizeof(float));return;}
+    shared_bounds(owner,global_count,count,alignment);
+    uint16_t send[8192],recv[8192];int counts[12]={0},displs[12]={0};
+    for(int r=0;r<shared_tp;++r){size_t blocks=global_count/alignment;
+        size_t begin=blocks*(size_t)r/(size_t)shared_tp*alignment;
+        size_t end=blocks*(size_t)(r+1)/(size_t)shared_tp*alignment;
+        size_t rows=end-begin;
+        counts[r]=(int)(rows*2);displs[r]=(int)(begin*2);}
+    pack_bf16(send,(float *)part,count,0);
+    int rc=MPI_Gatherv(send,(int)(count*2),MPI_BYTE,recv,counts,displs,
+                       MPI_BYTE,owner%shared_tp,shared_comm);
+    if(rc)ds41f_comm_abort("shared gather",rc);
+    if(my_rank/shared_tp==owner/shared_tp&&my_rank%shared_tp==owner%shared_tp)
+        unpack_bf16(out,recv,global_count,0);
+}
+void ds41f_comm_shared_reduce_scatter_aligned(float *out,const float *in,size_t global_count,size_t alignment)
+{
+    if(!out||!in||shared_tp<=1||shared_comm==MPI_COMM_NULL||global_count>INT_MAX||!alignment||global_count%alignment)
+        ds41f_comm_abort("shared reduce-scatter bounds",EINVAL);
+    int counts[12]={0};size_t blocks=global_count/alignment;
+    for(int r=0;r<shared_tp;++r){size_t begin=blocks*(size_t)r/(size_t)shared_tp;
+        size_t end=blocks*(size_t)(r+1)/(size_t)shared_tp;
+        size_t rows=(end-begin)*alignment;
+        if(rows>(size_t)INT_MAX)ds41f_comm_abort("shared reduce-scatter count",EINVAL);
+        counts[r]=(int)rows;
+    }
+    int rc=MPI_Reduce_scatter(in,out,counts,MPI_FLOAT,MPI_SUM,shared_comm);
+    if(rc)ds41f_comm_abort("shared reduce-scatter",rc);
+}
+void ds41f_comm_shared_reduce_scatter(float *out,const float *in,size_t global_count)
+{ds41f_comm_shared_reduce_scatter_aligned(out,in,global_count,1);}
 void ds41f_comm_free(void)
-{bootstrap_barrier();if(dense_comm!=MPI_COMM_NULL)MPI_Comm_free(&dense_comm);tp_comm_free(&comm);utofu_free_vcq(vcq);MPI_Finalize();}
+{bootstrap_barrier();if(shared_comm!=MPI_COMM_NULL)MPI_Comm_free(&shared_comm);
+    if(dense_comm!=MPI_COMM_NULL)MPI_Comm_free(&dense_comm);tp_comm_free(&comm);utofu_free_vcq(vcq);MPI_Finalize();}

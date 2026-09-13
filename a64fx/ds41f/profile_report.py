@@ -126,7 +126,8 @@ def report(directory, start, stop):
                                         mean_active_ranks_per_layer=float((counts > 0).sum(axis=0).mean()),
                                         counts_per_rank_per_token=counts.sum(axis=2).mean(axis=1).tolist()),
                   nested_other={name: stats(all_ranks(name)) for name in
-                                ("LINEAR_QUANT", "LINEAR_ROUND", "INT8_INPUT_QUANT", "NORM", "HC_NORM", "HC_MATVEC", "HC_SPLIT")
+                                ("LINEAR_QUANT", "LINEAR_ROUND", "INT8_INPUT_QUANT", "NORM", "HC_NORM", "HC_MATVEC", "HC_SPLIT",
+                                 "SHARED_W13", "SHARED_W2", "SHARED_REDUCE", "ATTN_PREPACK", "ATTN_ONLINE", "HANDOFF_WAIT")
                                 if name in index},
                   tp_group=(int(phase("TP_GROUP").max()) if "TP_GROUP" in index else 1),
                   tp_communication_owner=(stats(owner("TP_COMM")) if "TP_COMM" in index else None),

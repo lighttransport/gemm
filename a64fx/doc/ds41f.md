@@ -88,6 +88,52 @@ allocation; it remains an approximate speed-first path and does not change the
 independent numerical-validation status above. A three-repeat criterion still
 needs repeated launches of this exact configuration.
 
+### TP12 shared FFN and attention experiment
+
+The next implementation gate keeps dense TP4 for the routed path and uses an
+independent TP12 communicator for the shared expert. W1/W3 are row-sharded over
+all twelve ranks, their 2304-element hidden tile is BF16-allgathered, and W2 is
+row-sharded in 32-row FP8 groups. The hierarchical mode adds each rank's W2
+rows before a 32-row aligned reduce-scatter and gathers the reduced rows back to
+the layer owner. A full gather mode remains available for comparison.
+
+An attention TP12 layout was also staged. Ranks 0--7 each own an 8-head WQ-B
+and WO-A group; WO-B rows and scales are split over all twelve ranks. Every
+rank participates in the projected 1024-element allgather and the owner gathers
+the final 5120-element output. `weights.shared.tp` and `weights.attention.tp`
+bind the split ranges and FP8 scale pairs, while the legacy `weights.tp`
+manifest continues to describe the remaining dense tensors. The synthetic mapping,
+aligned communicator, and fresh-path manifest tests pass, and the actual
+12-node stage reports `TP_STAGE PASS` on all ranks.
+
+On allocation 51592153, the fixed 1105-token replay returned `next=19`, and
+the TP12 attention trace matched the TP4 selected-row control for all 1232
+positions. The speed-first command used hierarchical shared reduction,
+selected-row 256, attention row prepack, INT8 FP8 weights, packed expert SDOT,
+cached RoPE, Engram prefetch/row cache, and persistent workers. Its 128
+steady-state tokens at positions 1105--1232 measured **44.904 ms/token**,
+**22.269 tokens/s**, p95 **47.203 ms**, with minimum `MemAvailable`
+**4,864,475,136 B**. This is an approximate speed-first result and does not
+meet the 30-token/s gate.
+
+The corresponding 32-token profile identifies the remaining wall-time budget:
+attention **19.203 ms**, routed plus shared experts **11.281 ms**, expert-sum
+rendezvous **4.576 ms**, FFN broadcast **1.412 ms**, residual handoff
+**1.295 ms**, and Engram projection **1.288 ms**. Attention's nested spans
+include QA 1.639, QB 1.743, index 1.435, sparse QK/PV 2.269, WO-A 1.256,
+and WO-B 1.538 ms. The integer exp2 softmax option (`--sparse-math 2`)
+reduces the profiled attention span to **18.845 ms** and the complete profile
+to **21.728 tokens/s**, still below 30.
+
+The existing integer SDOT attention remains an explicit experiment. Its
+nonpersistent TP4 run measured **16.520 tokens/s** because it repacks raw rows
+and retains a separate FP32 PV pass. A persistent-team SDOT probe was rejected
+after the worker implementation made the first token take about 46 seconds;
+the production guard therefore keeps SDOT separate from persistent tiled-FP32
+attention. The next 30+ work item is an online prepacked QK/softmax/PV loop
+using the integer `sdot` and `exp2` kernels, followed by owner-free shared
+reduction and projection overlap. Thirty and forty tokens/s remain unachieved.
+
 ## Proposed path to 30+ and 40+ tokens/s
 
 The current 1K-history speed-first baseline is 49.684 ms/token (20.127

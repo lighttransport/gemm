@@ -12,8 +12,12 @@ typedef struct {
     uint8_t *compressed[4]; /* each row: KV288 + index68 */
     float *window;          /* reference execution buffer, 40*128*512 floats */
     float *rows;            /* reused 640x512 sparse-attention workspace */
+    float *decoded_rows;    /* bounded decoded compressed-row cache */
+    uint64_t *decoded_keys;
+    size_t decoded_capacity,decoded_clock;
+    int decoded_fresh_pages;
     float pool_value[3][512],pool_score[3][512];
-    int selected[512];size_t selected_count;
+    int selected[512];size_t selected_count,selected_limit;
     uint8_t *candidate_blocks;
     uint8_t publication[356];
 } ds41f_attention;
@@ -38,6 +42,8 @@ int ds41f_index_scores(float *scores,const float *q,const float *weights,const u
                        size_t count,const uint8_t *candidates,int head_tiles);
 int ds41f_attention_init(ds41f_attention *state,size_t max_tokens);
 int ds41f_attention_place_workspace(ds41f_attention *state);
+int ds41f_attention_enable_row_cache(ds41f_attention *state,size_t rows);
+void ds41f_attention_clear_row_cache(ds41f_attention *state);
 void ds41f_attention_free(ds41f_attention *state);
 int ds41f_attention_step(ds41f_attention *state,const ds41f_weights *weights,
                          int layer,size_t position,const float *x,float *out);

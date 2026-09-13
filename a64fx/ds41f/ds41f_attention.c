@@ -34,7 +34,7 @@ static void rope(float *x,size_t heads,size_t dim,int layer,size_t pos,int inver
 int ds41f_attention_init(ds41f_attention *s,size_t capacity)
 {
     if(!s||!capacity||capacity>1048576)return EINVAL;
-    memset(s,0,sizeof *s);s->capacity=capacity;
+    memset(s,0,sizeof *s);s->capacity=capacity;s->selected_limit=512;
     for(int i=0;i<4;++i){size_t rows=i==3?capacity:(capacity+1)/2;
         s->compressed[i]=calloc(rows,356);if(!s->compressed[i]){ds41f_attention_free(s);return ENOMEM;}
         /* Commit cache pages now: the admission check must cover the real
@@ -49,7 +49,28 @@ int ds41f_attention_init(ds41f_attention *s,size_t capacity)
     if(!s->window||!s->rows||!s->candidate_blocks){ds41f_attention_free(s);return ENOMEM;}return 0;
 }
 void ds41f_attention_free(ds41f_attention *s)
-{if(!s)return;for(int i=0;i<4;++i)free(s->compressed[i]);free(s->window);ds41f_free_resident(s->rows,(size_t)640*512*sizeof(float),s->rows_fresh_pages);free(s->candidate_blocks);memset(s,0,sizeof *s);}
+{if(!s)return;for(int i=0;i<4;++i)free(s->compressed[i]);free(s->window);
+    ds41f_free_resident(s->rows,(size_t)640*512*sizeof(float),s->rows_fresh_pages);
+    ds41f_free_resident(s->decoded_rows,s->decoded_capacity*512*sizeof(float),s->decoded_fresh_pages);
+    free(s->decoded_keys);free(s->candidate_blocks);memset(s,0,sizeof *s);}
+int ds41f_attention_enable_row_cache(ds41f_attention *s,size_t rows)
+{
+    if(!s||!rows||rows>65536||s->decoded_rows)return EINVAL;
+    if(rows>SIZE_MAX/512/sizeof(float))return EOVERFLOW;
+    size_t bytes=rows*512*sizeof(float);float *values=NULL;uint64_t *keys=calloc(rows,sizeof *keys);
+    if(!keys)return ENOMEM;
+    int rc=ds41f_alloc_resident((void **)&values,bytes,1);
+    if(rc){free(keys);return rc;}
+    for(size_t i=0;i<rows;++i)keys[i]=UINT64_MAX;
+    s->decoded_rows=values;s->decoded_keys=keys;s->decoded_capacity=rows;s->decoded_clock=0;s->decoded_fresh_pages=1;
+    return 0;
+}
+void ds41f_attention_clear_row_cache(ds41f_attention *s)
+{
+    if(!s||!s->decoded_keys)return;
+    for(size_t i=0;i<s->decoded_capacity;++i)s->decoded_keys[i]=UINT64_MAX;
+    s->decoded_clock=0;
+}
 int ds41f_attention_place_workspace(ds41f_attention *s)
 {
     if(!s||!s->rows)return EINVAL;
@@ -58,14 +79,30 @@ int ds41f_attention_place_workspace(ds41f_attention *s)
     int rc=ds41f_alloc_resident((void **)&rows,bytes,1);if(rc)return rc;
     #pragma omp parallel for schedule(static)
     for(size_t page=0;page<(bytes+4095)/4096;++page)((volatile char *)rows)[page*4096]=0;
-    free(s->rows);s->rows=rows;s->rows_fresh_pages=1;return 0;
+    free(s->rows);s->rows=rows;s->rows_fresh_pages=1;
+    if(s->decoded_rows&&!s->decoded_fresh_pages){
+        size_t cache_bytes=s->decoded_capacity*512*sizeof(float);float *decoded=NULL;
+        rc=ds41f_alloc_resident((void **)&decoded,cache_bytes,1);if(rc)return rc;
+        #pragma omp parallel for schedule(static)
+        for(size_t page=0;page<(cache_bytes+4095)/4096;++page)((volatile char *)decoded)[page*4096]=0;
+        free(s->decoded_rows);s->decoded_rows=decoded;s->decoded_fresh_pages=1;
+    }
+    return 0;
 }
 int ds41f_attention_receive(ds41f_attention *s,int layer,size_t pos,const uint8_t row[356])
 {
     if(!s||!row||pos>=s->capacity||layer<0||layer>=40)return EINVAL;
     if(!is_source(layer))return 0;
     int ratio=layer<20?2:1;if((pos+1)%ratio)return 0;
-    memcpy(s->compressed[source(layer)]+(pos/ratio)*356,row,356);return 0;
+    int src=source(layer);size_t row_index=pos/(size_t)ratio;
+    memcpy(s->compressed[src]+row_index*356,row,356);
+    if(s->decoded_rows){
+        size_t slot=row_index%s->decoded_capacity;
+        double pt=P_BEGIN();
+        int rc=ds41f_fp4_unpack(s->decoded_rows+slot*512,row,512,16,1);P_END(ATTN_PREPACK,pt);if(rc)return rc;
+        s->decoded_keys[slot]=((uint64_t)(unsigned)src<<32)|(uint64_t)row_index;
+    }
+    return 0;
 }
 static int update_source(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,const float *x)
 {
@@ -201,7 +238,7 @@ static int select_positions(ds41f_attention *s,const ds41f_weights *w,int layer,
         for(size_t i=0;i<kept;++i)s->candidate_blocks[ids[i]]=1;
         free(block_scores);free(ids);
     }
-    s->selected_count=ds41f_select_topk(scores,count,512,s->selected);free(scores);P_END(INDEX_SELECT,pt);return 0;
+    s->selected_count=ds41f_select_topk(scores,count,s->selected_limit,s->selected);free(scores);P_END(INDEX_SELECT,pt);return 0;
 }
 int ds41f_attention_grouped_output(const ds41f_weights *w,int layer,float *out,const float *x,size_t groups)
 {
@@ -256,6 +293,15 @@ typedef struct {
     size_t raw_count;
     int * ids;
 } attention_project_team_job;
+static void decode_attention_row(float *dst,const ds41f_attention *s,int src,size_t row)
+{
+    if(s->decoded_rows){
+        size_t slot=row%s->decoded_capacity;
+        uint64_t key=((uint64_t)(unsigned)src<<32)|(uint64_t)row;
+        if(s->decoded_keys[slot]==key){memcpy(dst,s->decoded_rows+slot*512,512*sizeof *dst);return;}
+    }
+    (void)ds41f_fp4_unpack(dst,s->compressed[src]+row*356,512,16,1);
+}
 static void attention_project_team_work(void *context,size_t first,size_t last)
 {
     attention_project_team_job *job=context;
@@ -269,8 +315,9 @@ static void attention_project_team_work(void *context,size_t first,size_t last)
     (void)layer;
     (void)raw_count;
     (void)ids;
+    int src=source(layer);
     for(size_t task=first;task<last;++task){size_t i=task*(1);
-        ds41f_fp4_unpack(rows+(raw_count+i)*512,s->compressed[source(layer)]+(size_t)s->selected[i]*356,512,16,1);
+        decode_attention_row(rows+(raw_count+i)*512,s,src,(size_t)s->selected[i]);
         ids[raw_count+i]=(int)(raw_count+i);
     }
 }
@@ -293,7 +340,7 @@ int ds41f_attention_attend(ds41f_attention *s,const ds41f_weights *w,int layer,s
     }else
     #pragma omp parallel for schedule(static)
     for(size_t i=0;i<extra;++i){
-        ds41f_fp4_unpack(rows+(raw_count+i)*512,s->compressed[source(layer)]+(size_t)s->selected[i]*356,512,16,1);
+        decode_attention_row(rows+(raw_count+i)*512,s,source(layer),(size_t)s->selected[i]);
         ids[raw_count+i]=(int)(raw_count+i);}
     char name[192];snprintf(name,sizeof name,"layers.%d.attn.attn_sink",layer);
     const ds41f_weight *sink=ds41f_weight_find(w,name);

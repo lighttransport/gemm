@@ -18,6 +18,8 @@ int ds41f_weights_enable_input_cache(ds41f_weights *store);
 int ds41f_linear_int8_cached(const ds41f_weights *store,const ds41f_weight *weight,
                             float *out,const float *x,size_t group_rows,int fp8_quantize);
 int ds41f_weights_check_tp(ds41f_weights *store,const char *stage,int tp,int rank);
+int ds41f_weights_check_shared_tp(ds41f_weights *store,const char *stage,int tp,int rank);
+int ds41f_weights_check_attention_tp(ds41f_weights *store,const char *stage,int rank);
 int ds41f_weights_requantize_fp8(ds41f_weights *store,size_t block,size_t limit,int projections_only);
 void ds41f_weights_free(ds41f_weights *store);
 const ds41f_weight *ds41f_weight_find(const ds41f_weights *store,const char *name);
