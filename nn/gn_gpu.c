@@ -26,7 +26,7 @@ typedef struct {
     CUmodule cuda_module;
     hipModule_t hip_module;
     Buffer b[SLOT_COUNT];
-    void *functions[44];
+    void *functions[46];
     void *lt;
 } Gpu;
 static const char *names[] = {"gn_mm",
@@ -72,7 +72,9 @@ static const char *names[] = {"gn_mm",
                               "gn_pack_fp16",
                               "gn_columns_fp16",
                               "gn_columns_fp16_back",
-                              "gn_point_pair"};
+                              "gn_point_pair",
+                              "gn_bn_silu_channels",
+                              "gn_bn_silu_back_channels"};
 static int current(Gpu *g) {
     int rc = g->hip ? (int)hipSetDevice(g->device) : (int)cuCtxSetCurrent(g->context);
     return rc ? gn_fail("cannot activate GPU context") : 0;
@@ -433,7 +435,7 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         gn_fail("GPU module load failed");
         goto bad;
     }
-    for (int i = 0; i < (g->hip ? 44 : 28); i++) {
+    for (int i = 0; i < (g->hip ? 46 : 28); i++) {
         if (g->hip) {
             hipFunction_t f;
             rc = (int)hipModuleGetFunction(&f, g->hip_module, names[i]);
@@ -525,6 +527,17 @@ int gn_gpu_forward(gn_model *m, const float *input) {
         int R = (int)n->r, C = (int)n->c, K = n->k, layer = n->kind == LN;
         uint64_t x = PTR_NODE(m, n->a, 0), y = PTR_NODE(m, i, 0), w = param(m, n->w, 0),
                  bias = param(m, n->bias, 0), aux = PTR_NODE(m, i, 2);
+        if (g->hip && !g->legacy && n->kind == BN && n->a > 0 &&
+            m->n[n->a].kind == CONV && i + 1 < m->nn &&
+            m->n[i + 1].kind == SILU && m->n[i + 1].a == (int)i) {
+            uint64_t out = PTR_NODE(m, i + 1, 0), mean = param(m, n->mean, 0),
+                     var = param(m, n->variance, 0), prebias = param(m, m->n[n->a].bias, 0);
+            void *args[] = {&y, &out, &aux, &mean, &var, &x, &prebias,
+                            &w, &bias, &R,   &C,    &training};
+            CALL(launch(g, 44, (C + 7) / 8, 1, 256, args));
+            i++;
+            continue;
+        }
         if (g->hip && !g->legacy && i + 1 < m->nn) {
             Node *next = &m->n[i + 1];
             int pair = n->kind == ADD && next->kind == SILU && next->a == (int)i   ? 0
@@ -559,8 +572,13 @@ int gn_gpu_forward(gn_model *m, const float *input) {
                 }
             }
             CALL(mm_columns(g, y, x, w, R, C, K, 0, 1, 0, fused_ci, side, n->k));
-            void *args[] = {&y, &bias, &R, &C};
-            CALL(flat(g, 3, (size_t)R * C, args));
+            int fused_bias = g->hip && !g->legacy && i + 2 < m->nn &&
+                             m->n[i + 1].kind == BN && m->n[i + 1].a == (int)i &&
+                             m->n[i + 2].kind == SILU && m->n[i + 2].a == (int)i + 1;
+            if (!fused_bias) {
+                void *args[] = {&y, &bias, &R, &C};
+                CALL(flat(g, 3, (size_t)R * C, args));
+            }
         } else if (n->kind == BN || n->kind == LN) {
             uint64_t mean = param(m, n->mean, 0), var = param(m, n->variance, 0);
             void *args[] = {&y, &aux, &mean, &var, &x, &w, &bias, &R, &C, &layer, &training};
@@ -630,6 +648,20 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
         uint64_t x = PTR_NODE(m, n->a, 0), dx = PTR_NODE(m, n->a, 1), dy = PTR_NODE(m, i, 1),
                  w = param(m, n->w, 0), dw = param(m, n->w, 1), db = param(m, n->bias, 1),
                  aux = PTR_NODE(m, i, 2);
+        if (g->hip && !g->legacy && n->kind == SILU && i > 1) {
+            Node *bn = &m->n[i - 1];
+            if (bn->kind == BN && n->a == (int)i - 1) {
+                uint64_t source = PTR_NODE(m, bn->a, 0), dsource = PTR_NODE(m, bn->a, 1),
+                         mid = PTR_NODE(m, i - 1, 0), bn_w = param(m, bn->w, 0),
+                         bn_dw = param(m, bn->w, 1), bn_db = param(m, bn->bias, 1),
+                         bn_aux = PTR_NODE(m, i - 1, 2);
+                void *args[] = {&dsource, &bn_dw, &bn_db, &source, &mid,
+                                &dy,      &bn_w,  &bn_aux, &R,      &C};
+                CALL(launch(g, 45, (C + 7) / 8, 1, 256, args));
+                i--;
+                continue;
+            }
+        }
         if (g->hip && !g->legacy && i > 1) {
             Node *first = &m->n[i - 1];
             int pair = n->kind == SILU && first->kind == ADD && n->a == (int)i - 1   ? 0

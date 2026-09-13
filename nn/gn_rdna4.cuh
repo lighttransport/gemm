@@ -282,6 +282,76 @@ extern "C" __global__ void gn_bn_back_channels(float *dx, float *dw, float *db, 
         }
     (void)layer;
 }
+extern "C" __global__ void gn_bn_silu_channels(float *mid, float *y, float *aux, float *mean,
+                                                float *var, float *x, const float *prebias,
+                                                const float *w, const float *bias, int R, int C,
+                                                int training) {
+    int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;
+    double mu = 0, v = 0;
+    if (training) {
+        if (c < C)
+            for (int r = t / 8; r < R; r += 32)
+                mu += (x[r * C + c] = x[r * C + c] + prebias[c]);
+        mu = gn_sum_channels(mu) / R;
+        if (c < C)
+            for (int r = t / 8; r < R; r += 32) {
+                double d = x[r * C + c] - mu;
+                v += d * d;
+            }
+        v = gn_sum_channels(v) / R;
+        if (t < 8 && c < C) {
+            mean[c] = .9f * mean[c] + .1f * (float)mu;
+            var[c] = .9f * var[c] + .1f * (float)(R > 1 ? v * R / (R - 1) : v);
+        }
+    } else if (c < C) {
+        mu = mean[c];
+        v = var[c];
+        for (int r = t / 8; r < R; r += 32)
+            x[r * C + c] += prebias[c];
+    }
+    float inv = rsqrtf((float)v + 1e-5f);
+    if (t < 8 && c < C) {
+        aux[c] = (float)mu;
+        aux[C + c] = inv;
+    }
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32) {
+            int j = r * C + c;
+            float z = (x[j] - (float)mu) * inv * w[c] + bias[c];
+            mid[j] = z;
+            y[j] = z / (1 + expf(-z));
+        }
+}
+extern "C" __global__ void gn_bn_silu_back_channels(float *dx, float *dw, float *db,
+                                                     const float *x, const float *mid,
+                                                     const float *dy, const float *w,
+                                                     const float *aux, int R, int C) {
+    int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;
+    float mu = c < C ? aux[c] : 0, inv = c < C ? aux[C + c] : 0;
+    double sum = 0, prod = 0;
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32) {
+            int j = r * C + c;
+            float s = 1 / (1 + expf(-mid[j]));
+            float d = dy[j] * s * (1 + mid[j] * (1 - s));
+            sum += d;
+            prod += d * (x[j] - mu) * inv;
+        }
+    sum = gn_sum_channels(sum);
+    prod = gn_sum_channels(prod);
+    if (t < 8 && c < C) {
+        dw[c] += (float)prod;
+        db[c] += (float)sum;
+    }
+    if (c < C)
+        for (int r = t / 8; r < R; r += 32) {
+            int j = r * C + c;
+            float s = 1 / (1 + expf(-mid[j]));
+            float d = dy[j] * s * (1 + mid[j] * (1 - s));
+            dx[j] += inv * w[c] *
+                     (d - (float)(sum / R) - (x[j] - mu) * inv * (float)(prod / R));
+        }
+}
 extern "C" __global__ void gn_bias_back_parallel(float *db, const float *dy, int R, int C) {
     __shared__ double sums[256];
     int t = threadIdx.x, c = blockIdx.x * 8 + t % 8;

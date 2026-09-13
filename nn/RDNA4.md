@@ -649,6 +649,24 @@ the unchanged model now requires eliminating major data-motion passes—most
 plausibly direct convolution fused with operand preparation and normalization—
 rather than substituting the vendor GEMM path or increasing batch size.
 
+### Normalization/activation fusion
+
+The version-2 residual tower now fuses convolution bias, batch normalization,
+and SiLU forward, plus SiLU derivative and batch-normalization backward. The
+biased convolution and normalized intermediate values remain materialized, so
+backward and diagnostic graph semantics are unchanged; the standalone bias and
+activation launches and intermediate activation-gradient pass are removed.
+
+The exact timed batch-64 configuration still passes the independent CPU oracle:
+output relative L2 0.000019664309 and global parameter-gradient relative L2
+**0.00082243384** (gate 0.001), including AdamW and exact checkpoint reload.
+Three 100-step runs measured **1,040.70 examples/s median**
+(1,037.93--1,041.43), up 1.49% from the prior 1,025.39 median. Median useful
+matrix throughput is 11.2414 TFLOP/s; actual product throughput is 19.4972
+TFLOP/s, **9.99857%** of the nominal dense peak. Packed-activation caching,
+rocBLASLt combine/bias fusion, and a materialized fused BN gradient were also
+tested but were neutral or slower and are not retained.
+
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
 The precision allocation executes an estimated 18.3703 trillion 16-bit matrix
