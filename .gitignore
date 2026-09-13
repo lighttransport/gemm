@@ -171,6 +171,7 @@ server/sam3d/__pycache__/
 
 # External / generated
 ref/*
+!ref/pixal3d/
 !ref/hy3d/
 !ref/trellis2/
 !ref/llm/
@@ -245,6 +246,7 @@ cuda/llm/scan/deltanet_chunk_test
 
 # Python venv (tooling, e.g. git-filter-repo)
 .venv/
+/tmp/
 
 # Vulkan CMake build directories (regenerate via cmake)
 vulkan/build/

@@ -38,7 +38,7 @@ void usage(const char* argv0) {
   fprintf(stderr,
     "usage: %s --in mesh.safetensors [--texture base.png] [--out beauty.png] [--exr aov.exr]\n"
     "         [--stats stats.json]\n"
-    "         [-w 800] [-h 600] [--yaw 35] [--pitch 20]\n"
+    "         [-w 800] [-h 600] [--yaw 35] [--pitch 20] [--frame-scale 1]\n"
     "         [--sun-yaw 45] [--sun-elev 50] [--turbidity 2.5] [--exposure 0.0]\n",
     argv0);
 }
@@ -152,6 +152,7 @@ int main(int argc, char** argv) {
   const char* stats_path = nullptr;
   uint32_t W = 800, H = 600;
   float yaw = 35.0f, pitch = 20.0f;
+  float frame_scale = 1.0f;
   float sun_yaw = 45.0f, sun_elev = 50.0f;
   float turbidity = 2.5f;
   float exposure = 0.0f;
@@ -171,6 +172,7 @@ int main(int argc, char** argv) {
     else if (a == "-h")          H = (uint32_t)std::atoi(need("-h"));
     else if (a == "--yaw")       yaw = (float)std::atof(need("--yaw"));
     else if (a == "--pitch")     pitch = (float)std::atof(need("--pitch"));
+    else if (a == "--frame-scale") frame_scale = (float)std::atof(need("--frame-scale"));
     else if (a == "--sun-yaw")   sun_yaw = (float)std::atof(need("--sun-yaw"));
     else if (a == "--sun-elev")  sun_elev = (float)std::atof(need("--sun-elev"));
     else if (a == "--turbidity") turbidity = (float)std::atof(need("--turbidity"));
@@ -178,6 +180,9 @@ int main(int argc, char** argv) {
     else { usage(argv[0]); return 2; }
   }
   if (!in_path) { usage(argv[0]); return 2; }
+  if (!std::isfinite(frame_scale) || frame_scale <= 0) {
+    fprintf(stderr, "--frame-scale must be finite and positive\n"); return 2;
+  }
   if (!png_path && !exr_path) png_path = "preview.png";
 
   // ---- load mesh ---------------------------------------------------------
@@ -252,7 +257,7 @@ int main(int argc, char** argv) {
   }
   lightrt::Vec3 ctr = (mn + mx) * 0.5f;
   lightrt::Vec3 ext = mx - mn;
-  float radius = trellis2::vlen(ext) * 0.85f;
+  float radius = trellis2::vlen(ext) * 0.85f * frame_scale;
   trellis2::Camera cam = trellis2::Camera::fromOrbit(ctr, radius, yaw, pitch, 35.0f);
 
   // ---- render ------------------------------------------------------------

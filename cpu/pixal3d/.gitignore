@@ -1,0 +1,6 @@
+*.o
+/pixal3d
+/test_pixal3d
+
+*.d
+*.new

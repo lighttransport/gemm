@@ -1,0 +1,1353 @@
+{
+  "date_jst": "2026-09-14",
+  "scope": "Pixal3D main release, 1024 cascade, 12 diffusion steps in each of four stages, 4096 PBR textures; paper/Direct3D-S2 deferred",
+  "host": {
+    "cpu": "AMD Ryzen Threadripper 1950X, 16 cores / 32 threads",
+    "ram_gib": 192,
+    "cuda": "NVIDIA GeForce RTX 5060 Ti, sm_120, 16 GB",
+    "rocm": "AMD Radeon RX 9070 XT, gfx1201, 16 GB",
+    "compiler": "GCC 13.3.0",
+    "native_cuda": "13.2",
+    "native_hip": "7.15.26333; AMD clang 23.0.0git",
+    "reference_python": "3.12.12",
+    "reference_torch": {
+      "cpu": "2.7.1+cpu",
+      "cuda": "2.7.1+cu128",
+      "rocm": "2.11.0+rocm7.2.2"
+    }
+  },
+  "sources": {
+    "pixal3d": {
+      "url": "https://github.com/TencentARC/Pixal3D.git",
+      "revision": "f7cf38429b0bd264f1995f0f8743a88b1c728b94",
+      "branch": "master",
+      "scope": "README main release; paper/Direct3D-S2 deferred"
+    },
+    "naf": {
+      "url": "https://github.com/valeoai/NAF.git",
+      "revision": "37f2dfc180f2de53d98bd601109c0da0dd6b0f43"
+    },
+    "cumesh": {
+      "url": "https://github.com/JeffreyXiang/CuMesh.git",
+      "revision": "12289e1062f0603f2f0d0771b02e1395d247f26f"
+    },
+    "flexgemm": {
+      "url": "https://github.com/JeffreyXiang/FlexGEMM.git",
+      "revision": "6dd94a859c26ee8246888502eada3dd8ad85532e"
+    },
+    "naf_weights": "https://github.com/valeoai/NAF/releases/download/model/naf_release.pth",
+    "hipblas_abi": "https://github.com/ROCm/hipBLAS/tree/rocm-7.2.2",
+    "hipblas_common_abi": "https://github.com/ROCm/hipBLAS-common/tree/rocm-7.2.2",
+    "trellis2": {
+      "url": "https://github.com/microsoft/TRELLIS.2.git",
+      "revision": "75fbf0183001ed9876c8dbb35de6b68552ee08bd"
+    },
+    "naf_checkpoint_sha256": "c096c1ab2217a5c3ac136365f721685e2201379cb69d509cfb0261183847c98f",
+    "opencv_inpaint": {
+      "url": "https://github.com/opencv/opencv/blob/4.12.0/modules/photo/src/inpaint.cpp",
+      "source_sha256": "15c66e1f742fd8a08590996e80e06895c5355126bd9457ab613be03179019734"
+    }
+  },
+  "checkpoint_manifest": {
+    "sources": {
+      "pixal3d": {
+        "url": "https://github.com/TencentARC/Pixal3D.git",
+        "revision": "f7cf38429b0bd264f1995f0f8743a88b1c728b94",
+        "branch": "master",
+        "scope": "README main release; paper/Direct3D-S2 deferred"
+      },
+      "naf": {
+        "url": "https://github.com/valeoai/NAF.git",
+        "revision": "37f2dfc180f2de53d98bd601109c0da0dd6b0f43"
+      },
+      "cumesh": {
+        "url": "https://github.com/JeffreyXiang/CuMesh.git",
+        "revision": "12289e1062f0603f2f0d0771b02e1395d247f26f"
+      },
+      "flexgemm": {
+        "url": "https://github.com/JeffreyXiang/FlexGEMM.git",
+        "revision": "6dd94a859c26ee8246888502eada3dd8ad85532e"
+      },
+      "naf_weights": "https://github.com/valeoai/NAF/releases/download/model/naf_release.pth",
+      "hipblas_abi": "https://github.com/ROCm/hipBLAS/tree/rocm-7.2.2",
+      "hipblas_common_abi": "https://github.com/ROCm/hipBLAS-common/tree/rocm-7.2.2",
+      "trellis2": {
+        "url": "https://github.com/microsoft/TRELLIS.2.git",
+        "revision": "75fbf0183001ed9876c8dbb35de6b68552ee08bd"
+      },
+      "naf_checkpoint_sha256": "c096c1ab2217a5c3ac136365f721685e2201379cb69d509cfb0261183847c98f",
+      "opencv_inpaint": {
+        "url": "https://github.com/opencv/opencv/blob/4.12.0/modules/photo/src/inpaint.cpp",
+        "source_sha256": "15c66e1f742fd8a08590996e80e06895c5355126bd9457ab613be03179019734"
+      }
+    },
+    "torch": "2.7.1+cpu",
+    "cuda": null,
+    "hip": null,
+    "checkpoints": [
+      {
+        "path": "/mnt/nvme01/models/Pixal3D/ckpts/ss_dec_conv3d_16l8_fp16.safetensors",
+        "bytes": 147591972,
+        "header_sha256": "6add9b37125ee2973b61e08893187d8910ccf0829950ea0a2efbbee7d9fa51f6",
+        "dtypes": {
+          "F32": 38,
+          "F16": 36
+        },
+        "tensor_count": 74,
+        "sha256": "1c76d4a40519aa2d711cc263a8404105231ac26db31d946bed48b84fee79009a"
+      },
+      {
+        "path": "/mnt/nvme01/models/Pixal3D/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+        "bytes": 5359822584,
+        "header_sha256": "ba04a19deed5ef5e9f6b5ae693fbae62f4ea0d8f32b1cae0a44e9fa895b20ec2",
+        "dtypes": {
+          "C64": 1,
+          "F32": 700
+        },
+        "tensor_count": 701,
+        "sha256": "6d0147bb347eb61fa81c304cc68c7fd69d447e91870357a549b47e1d0fd77242"
+      },
+      {
+        "path": "/mnt/nvme01/models/Pixal3D/ckpts/shape_dec_next_dc_f16c32_fp16.safetensors",
+        "bytes": 948490494,
+        "header_sha256": "fa87665c604012a8168f518604a20eaa2fc9f117dc69d2f5f23e1ca3d270f3dc",
+        "dtypes": {
+          "F16": 292
+        },
+        "tensor_count": 292,
+        "sha256": "e3b718d3e43e4f8780e9a24ac6fff231811a67e3b058e336e10fe654c911d581"
+      },
+      {
+        "path": "/mnt/nvme01/models/Pixal3D/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+        "bytes": 5546764048,
+        "header_sha256": "a6cc13076d909dc0ce3f4e466147ff899e8139504622339a5058c054c2128f03",
+        "dtypes": {
+          "F32": 700
+        },
+        "tensor_count": 700,
+        "sha256": "63569838c1da93f010e2fa805b202ecf802cc758830230abac202a81b70e5b45"
+      },
+      {
+        "path": "/mnt/nvme01/models/Pixal3D/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+        "bytes": 5546764048,
+        "header_sha256": "a6cc13076d909dc0ce3f4e466147ff899e8139504622339a5058c054c2128f03",
+        "dtypes": {
+          "F32": 700
+        },
+        "tensor_count": 700,
+        "sha256": "3e6d1df0e62bc5bc863320d1d63d6b996235eef4abb8b851e878c88f316369f1"
+      },
+      {
+        "path": "/mnt/nvme01/models/Pixal3D/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors",
+        "bytes": 948458812,
+        "header_sha256": "46577afb9087543271d0e1fa25747bf76d86f5b0f2b0764a429f912abe2fa96d",
+        "dtypes": {
+          "F16": 284
+        },
+        "tensor_count": 284,
+        "sha256": "97ea69addea2ecd9312910f5f548234665eef51c088386180b7cd5b258645e3c"
+      },
+      {
+        "path": "/mnt/nvme01/models/Pixal3D/ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
+        "bytes": 5546960656,
+        "header_sha256": "6951f99f0d45c38356c218950079894ac3535cce6bf86cd0628a65a6be18ffe4",
+        "dtypes": {
+          "F32": 700
+        },
+        "tensor_count": 700,
+        "sha256": "65df179ad02f9e92bc18335d7861fadd95f268e6249217352468dd83cb79d1d0"
+      },
+      {
+        "path": "/mnt/nvme01/models/dinov3-vitl16/model.safetensors",
+        "bytes": 1212347640,
+        "header_sha256": "035fb9231309ec7e3e5849f83c0ef16041f381f0f57f217f093dcf570bf1cb05",
+        "dtypes": {
+          "F32": 318
+        },
+        "tensor_count": 318,
+        "sha256": "45172f209c9583c40538afc26b60a07033e6fcc2e8c30228338e6b2e932e7941"
+      },
+      {
+        "path": "/mnt/nvme02/work/gemm/pixal3d/ref/pixal3d/weights/naf_release.safetensors",
+        "bytes": 2653968,
+        "header_sha256": "f2dfb2484d3e54dbe0a6e845f667d90b07cb0ca0c92a8d1bb9402464a4aee0e3",
+        "dtypes": {
+          "F32": 37
+        },
+        "tensor_count": 37,
+        "sha256": "4892f932863ef152827ded31443bc277f8905d59c8735bc0a69d8f044b6c77ee"
+      }
+    ],
+    "pipeline": {
+      "name": "Trellis2ImageTo3DPipeline",
+      "args": {
+        "models": {
+          "sparse_structure_decoder": "ckpts/ss_dec_conv3d_16l8_fp16",
+          "sparse_structure_flow_model": "ckpts/ss_flow_img_dit_1_3B_64_bf16",
+          "shape_slat_decoder": "ckpts/shape_dec_next_dc_f16c32_fp16",
+          "shape_slat_flow_model_512": "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16",
+          "shape_slat_flow_model_1024": "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16",
+          "tex_slat_decoder": "ckpts/tex_dec_next_dc_f16c32_fp16",
+          "tex_slat_flow_model_1024": "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16"
+        },
+        "sparse_structure_sampler": {
+          "name": "FlowEulerGuidanceIntervalSampler",
+          "args": {
+            "sigma_min": 1e-05
+          },
+          "params": {
+            "steps": 12,
+            "guidance_strength": 7.5,
+            "guidance_rescale": 0.7,
+            "guidance_interval": [
+              0.6,
+              1.0
+            ],
+            "rescale_t": 5.0
+          }
+        },
+        "shape_slat_sampler": {
+          "name": "FlowEulerGuidanceIntervalSampler",
+          "args": {
+            "sigma_min": 1e-05
+          },
+          "params": {
+            "steps": 12,
+            "guidance_strength": 7.5,
+            "guidance_rescale": 0.5,
+            "guidance_interval": [
+              0.6,
+              1.0
+            ],
+            "rescale_t": 3.0
+          }
+        },
+        "shape_slat_normalization": {
+          "mean": [
+            0.781296,
+            0.018091,
+            -0.495192,
+            -0.558457,
+            1.06053,
+            0.093252,
+            1.518149,
+            -0.933218,
+            -0.732996,
+            2.604095,
+            -0.118341,
+            -2.143904,
+            0.495076,
+            -2.179512,
+            -2.130751,
+            -0.996944,
+            0.261421,
+            -2.217463,
+            1.260067,
+            -0.150213,
+            3.790713,
+            1.481266,
+            -1.046058,
+            -1.523667,
+            -0.059621,
+            2.22078,
+            1.621212,
+            0.87723,
+            0.567247,
+            -3.175944,
+            -3.186688,
+            1.578665
+          ],
+          "std": [
+            5.972266,
+            4.706852,
+            5.44501,
+            5.209927,
+            5.32022,
+            4.547237,
+            5.020802,
+            5.444004,
+            5.226681,
+            5.683095,
+            4.831436,
+            5.286469,
+            5.652043,
+            5.367606,
+            5.525084,
+            4.730578,
+            4.805265,
+            5.124013,
+            5.530808,
+            5.619001,
+            5.10393,
+            5.41767,
+            5.269677,
+            5.547194,
+            5.634698,
+            5.235274,
+            6.110351,
+            5.511298,
+            6.237273,
+            4.879207,
+            5.347008,
+            5.405691
+          ]
+        },
+        "tex_slat_sampler": {
+          "name": "FlowEulerGuidanceIntervalSampler",
+          "args": {
+            "sigma_min": 1e-05
+          },
+          "params": {
+            "steps": 12,
+            "guidance_strength": 1.0,
+            "guidance_rescale": 0.0,
+            "guidance_interval": [
+              0.6,
+              0.9
+            ],
+            "rescale_t": 3.0
+          }
+        },
+        "tex_slat_normalization": {
+          "mean": [
+            3.501659,
+            2.212398,
+            2.226094,
+            0.251093,
+            -0.026248,
+            -0.687364,
+            0.439898,
+            -0.928075,
+            0.029398,
+            -0.339596,
+            -0.869527,
+            1.038479,
+            -0.972385,
+            0.126042,
+            -1.129303,
+            0.455149,
+            -1.209521,
+            2.069067,
+            0.544735,
+            2.569128,
+            -0.323407,
+            2.293,
+            -1.925608,
+            -1.217717,
+            1.213905,
+            0.971588,
+            -0.023631,
+            0.10675,
+            2.021786,
+            0.250524,
+            -0.662387,
+            -0.768862
+          ],
+          "std": [
+            2.665652,
+            2.743913,
+            2.765121,
+            2.595319,
+            3.037293,
+            2.291316,
+            2.144656,
+            2.911822,
+            2.969419,
+            2.501689,
+            2.154811,
+            3.163343,
+            2.621215,
+            2.381943,
+            3.186697,
+            3.021588,
+            2.295916,
+            3.234985,
+            3.233086,
+            2.26014,
+            2.874801,
+            2.810596,
+            3.29272,
+            2.674999,
+            2.680878,
+            2.372054,
+            2.451546,
+            2.353556,
+            2.995195,
+            2.379849,
+            2.786195,
+            2.77519
+          ]
+        },
+        "image_cond_model": {
+          "name": "DinoV3FeatureExtractor",
+          "args": {
+            "model_name": "facebook/dinov3-vitl16-pretrain-lvd1689m"
+          }
+        },
+        "rembg_model": {
+          "name": "BiRefNet",
+          "args": {
+            "model_name": "briaai/RMBG-2.0"
+          }
+        },
+        "default_pipeline_type": "1536_cascade"
+      }
+    }
+  },
+  "tolerances": {
+    "primitives": {
+      "atol": 1e-05,
+      "rtol": 0.0001
+    },
+    "isolated_checkpoint_stages": {
+      "max_nrmse": 0.02,
+      "min_cosine": 0.999
+    },
+    "geometry": {
+      "min_fscore": 0.99,
+      "distance_voxels": 2
+    }
+  },
+  "primitive_and_flow_block_checks": {
+    "cpu": [
+      {
+        "backend": "cpu",
+        "test": "gemm_torch.float32",
+        "max_abs": 7.152557373046875e-07,
+        "nrmse": 1.2234412106349691e-07,
+        "cosine": 0.9999999999999928
+      },
+      {
+        "backend": "cpu",
+        "test": "gemm_torch.bfloat16",
+        "max_abs": 9.5367431640625e-07,
+        "nrmse": 1.5640259568711903e-08,
+        "cosine": 0.9999999999999999
+      },
+      {
+        "backend": "cpu",
+        "test": "attention_137_137",
+        "max_abs": 3.3527612686157227e-08,
+        "nrmse": 2.881035714014275e-07,
+        "cosine": 0.9999999999999588
+      },
+      {
+        "backend": "cpu",
+        "test": "attention_137_5",
+        "max_abs": 5.960464477539063e-08,
+        "nrmse": 8.543203339795398e-08,
+        "cosine": 0.9999999999999963
+      },
+      {
+        "backend": "cpu",
+        "test": "attention_1037_1139",
+        "max_abs": 1.4901161193847656e-08,
+        "nrmse": 3.802193687584786e-07,
+        "cosine": 0.9999999999999287
+      },
+      {
+        "backend": "cpu",
+        "test": "grid_sample_border",
+        "max_abs": 2.3748725652694702e-07,
+        "nrmse": 1.2198792772756913e-07,
+        "cosine": 0.9999999999999927
+      },
+      {
+        "backend": "cpu",
+        "test": "upstream_ss_flow_block_float32",
+        "max_abs": 5.245208740234375e-06,
+        "nrmse": 5.907805257205003e-07,
+        "cosine": 0.9999999999998588
+      },
+      {
+        "backend": "cpu",
+        "test": "upstream_ss_flow_block_bfloat16",
+        "max_abs": 0.028027355670928955,
+        "nrmse": 0.0031306865539127552,
+        "cosine": 0.9999951212904686
+      }
+    ],
+    "cuda": [
+      {
+        "backend": "cuda",
+        "test": "gemm_torch.float32",
+        "max_abs": 7.152557373046875e-07,
+        "nrmse": 1.8670497238705335e-07,
+        "cosine": 0.9999999999999825
+      },
+      {
+        "backend": "cuda",
+        "test": "gemm_torch.bfloat16",
+        "max_abs": 0.0,
+        "nrmse": 0.0,
+        "cosine": 1.0000000000000002
+      },
+      {
+        "backend": "cuda",
+        "test": "attention_137_137",
+        "max_abs": 3.3527612686157227e-08,
+        "nrmse": 3.071039329873683e-07,
+        "cosine": 0.9999999999999758
+      },
+      {
+        "backend": "cuda",
+        "test": "attention_137_5",
+        "max_abs": 8.940696716308594e-08,
+        "nrmse": 1.5737105396005882e-07,
+        "cosine": 0.9999999999999888
+      },
+      {
+        "backend": "cuda",
+        "test": "attention_1037_1139",
+        "max_abs": 1.4901161193847656e-08,
+        "nrmse": 3.587865945851003e-07,
+        "cosine": 0.9999999999999535
+      },
+      {
+        "backend": "cuda",
+        "test": "grid_sample_border",
+        "max_abs": 2.3748725652694702e-07,
+        "nrmse": 1.2198792772756913e-07,
+        "cosine": 0.9999999999999927
+      },
+      {
+        "backend": "cuda",
+        "test": "upstream_ss_flow_block_float32",
+        "max_abs": 7.152557373046875e-06,
+        "nrmse": 7.408488983487825e-07,
+        "cosine": 0.9999999999997568
+      },
+      {
+        "backend": "cuda",
+        "test": "upstream_ss_flow_block_bfloat16",
+        "max_abs": 0.028603553771972656,
+        "nrmse": 0.003472373087710759,
+        "cosine": 0.9999939722246186
+      }
+    ],
+    "rocm": [
+      {
+        "backend": "rocm",
+        "test": "gemm_torch.float32",
+        "max_abs": 0.0,
+        "nrmse": 0.0,
+        "cosine": 0.9999999999999999
+      },
+      {
+        "backend": "rocm",
+        "test": "gemm_torch.bfloat16",
+        "max_abs": 0.0,
+        "nrmse": 0.0,
+        "cosine": 1.0000000000000002
+      },
+      {
+        "backend": "rocm",
+        "test": "attention_137_137",
+        "max_abs": 5.960464477539063e-08,
+        "nrmse": 3.092937080765913e-07,
+        "cosine": 0.9999999999999524
+      },
+      {
+        "backend": "rocm",
+        "test": "attention_137_5",
+        "max_abs": 5.960464477539063e-08,
+        "nrmse": 8.973023528458032e-08,
+        "cosine": 0.9999999999999963
+      },
+      {
+        "backend": "rocm",
+        "test": "attention_1037_1139",
+        "max_abs": 4.470348358154297e-08,
+        "nrmse": 8.972531506868321e-07,
+        "cosine": 0.9999999999995985
+      },
+      {
+        "backend": "rocm",
+        "test": "grid_sample_border",
+        "max_abs": 2.3748725652694702e-07,
+        "nrmse": 1.2198792772756913e-07,
+        "cosine": 0.9999999999999927
+      },
+      {
+        "backend": "rocm",
+        "test": "upstream_ss_flow_block_float32",
+        "max_abs": 3.814697265625e-06,
+        "nrmse": 3.4314743182151984e-07,
+        "cosine": 0.999999999999947
+      },
+      {
+        "backend": "rocm",
+        "test": "upstream_ss_flow_block_bfloat16",
+        "max_abs": 0.02290058135986328,
+        "nrmse": 0.003368294606194652,
+        "cosine": 0.9999943289547232
+      }
+    ]
+  },
+  "full_step_checks": {
+    "structure": [
+      {
+        "backend": "rocm",
+        "stage": "structure",
+        "step": 1,
+        "nrmse": 0.0003825914031891878,
+        "cosine": 0.9999999268148902,
+        "max_abs": 0.005618453025817871
+      },
+      {
+        "backend": "rocm",
+        "stage": "structure",
+        "step": 12,
+        "nrmse": 0.007136372102607393,
+        "cosine": 0.9999745359986867,
+        "max_abs": 0.06762251257896423
+      }
+    ],
+    "shape512": [
+      {
+        "backend": "rocm",
+        "stage": "shape512",
+        "step": 1,
+        "nrmse": 0.0011498793577995536,
+        "cosine": 0.999999338888515,
+        "max_abs": 0.008961915969848633
+      },
+      {
+        "backend": "rocm",
+        "stage": "shape512",
+        "step": 12,
+        "nrmse": 0.0024681321889299095,
+        "cosine": 0.9999969544177378,
+        "max_abs": 0.015815258026123047
+      }
+    ],
+    "shape1024": [
+      {
+        "backend": "rocm",
+        "stage": "shape1024",
+        "step": 1,
+        "nrmse": 0.0011736524528237063,
+        "cosine": 0.9999993112729788,
+        "max_abs": 0.01116400957107544
+      },
+      {
+        "backend": "rocm",
+        "stage": "shape1024",
+        "step": 12,
+        "nrmse": 0.002629485321295818,
+        "cosine": 0.9999965428982325,
+        "max_abs": 0.018169164657592773
+      }
+    ],
+    "texture": [
+      {
+        "backend": "rocm",
+        "stage": "texture",
+        "step": 1,
+        "nrmse": 0.000187489625616101,
+        "cosine": 0.9999999824239671,
+        "max_abs": 0.002013564109802246
+      },
+      {
+        "backend": "rocm",
+        "stage": "texture",
+        "step": 12,
+        "nrmse": 0.002135770914271902,
+        "cosine": 0.9999977192399025,
+        "max_abs": 0.022672414779663086
+      }
+    ]
+  },
+  "trajectory_diagnostics": {
+    "structure": [
+      {
+        "a": "native-rocm",
+        "b": "cuda-auto",
+        "nrmse": 0.049228897645858825,
+        "cosine": 0.9987875624509325
+      },
+      {
+        "a": "native-rocm",
+        "b": "rocm-math",
+        "nrmse": 0.0448018697685441,
+        "cosine": 0.998996542193861
+      },
+      {
+        "a": "native-rocm",
+        "b": "rocm-auto",
+        "nrmse": 0.037129157520824,
+        "cosine": 0.999310797660714
+      },
+      {
+        "a": "cuda-auto",
+        "b": "rocm-math",
+        "nrmse": 0.046754670163568275,
+        "cosine": 0.9989101125577662
+      },
+      {
+        "a": "cuda-auto",
+        "b": "rocm-auto",
+        "nrmse": 0.0701298255654271,
+        "cosine": 0.9975461509244664
+      },
+      {
+        "a": "rocm-math",
+        "b": "rocm-auto",
+        "nrmse": 0.053445492131609394,
+        "cosine": 0.9985717577952243
+      }
+    ],
+    "shape512": [
+      {
+        "a": "native",
+        "b": "pytorch-cuda-auto",
+        "nrmse": 0.03567157507562993,
+        "cosine": 0.9993636082427355
+      },
+      {
+        "a": "native",
+        "b": "pytorch-rocm-auto",
+        "nrmse": 0.03872310777450127,
+        "cosine": 0.9992501521982509
+      },
+      {
+        "a": "pytorch-cuda-auto",
+        "b": "pytorch-rocm-auto",
+        "nrmse": 0.03789804016392486,
+        "cosine": 0.9992820209763212
+      }
+    ],
+    "shape1024": [
+      {
+        "a": "native",
+        "b": "pytorch-cuda-auto",
+        "nrmse": 0.06341213715632255,
+        "cosine": 0.9979892995345678
+      },
+      {
+        "a": "native",
+        "b": "pytorch-rocm-auto",
+        "nrmse": 0.06840697682506827,
+        "cosine": 0.9976609806845911
+      },
+      {
+        "a": "pytorch-cuda-auto",
+        "b": "pytorch-rocm-auto",
+        "nrmse": 0.06433999070702669,
+        "cosine": 0.9979310245800033
+      }
+    ],
+    "texture": [
+      {
+        "a": "native",
+        "b": "pytorch-cuda-auto",
+        "nrmse": 0.004173323839184999,
+        "cosine": 0.9999912929485703
+      },
+      {
+        "a": "native",
+        "b": "pytorch-rocm-auto",
+        "nrmse": 0.004135071151300691,
+        "cosine": 0.9999914576896711
+      },
+      {
+        "a": "pytorch-cuda-auto",
+        "b": "pytorch-rocm-auto",
+        "nrmse": 0.004084706071648843,
+        "cosine": 0.9999916706714804
+      }
+    ],
+    "note": "Diagnostic only. Full BF16 structure/shape trajectories exceed isolated-step tolerances; original PyTorch backends also diverge. Full-trajectory equivalence is not established."
+  },
+  "runs": {
+    "cuda-house": {
+      "execution": "staged native inference + native postprocessing replay",
+      "glb": {
+        "path": "tmp/pixal3d/runs/cuda-house/mesh.glb",
+        "bytes": 107295476,
+        "vertices": 907527,
+        "triangles": 977612,
+        "bounds": [
+          [
+            -0.32463937997817993,
+            -0.40713953971862793,
+            -0.2660275995731354
+          ],
+          [
+            0.3564983010292053,
+            0.4967765808105469,
+            0.2698403000831604
+          ]
+        ],
+        "texture_size": 4096,
+        "normal_max_error": 1.7881393432617188e-07,
+        "base_median": [
+          52.0,
+          50.0,
+          40.0,
+          254.0
+        ],
+        "material_median": [
+          0.0,
+          206.0,
+          38.0
+        ]
+      },
+      "monitor": {
+        "backend": "cuda",
+        "pid": 1275165,
+        "attached": false,
+        "command": [
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runtime-final/cpu/pixal3d/pixal3d",
+          "--backend",
+          "cuda",
+          "--input",
+          "/mnt/nvme02/work/gemm/pixal3d/ref/pixal3d/upstream/assets/images/1_img.png",
+          "--output",
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runs/cuda-house/mesh.glb",
+          "--fov",
+          "0.857556",
+          "--seed",
+          "1",
+          "--threads",
+          "8",
+          "--dump-dir",
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runs/cuda-house/dumps"
+        ],
+        "exit_code": -15,
+        "observed_seconds": 2718.2082767600077,
+        "samples": 2713,
+        "baseline_device_used": 3061448704,
+        "peak_device_total_used": 9630777344,
+        "peak_process_device_used": 1071644672,
+        "peak_host_rss": 10594508800,
+        "device_capacity": 17103323136,
+        "note": "AMD device counter includes other processes; NVML reports both device and process use. Sampling interval: 1 second."
+      },
+      "preview_inspected": true,
+      "glb_sha256": "409ea2230ca6b174ccb87db11fe7f055136d615332d763675b8e60e0f0d01fc9",
+      "input_sha256": "fdd82d60b7ec11e6d5699df29693d8ab538f9dab4b04e3f2abaa59ccd7b4709a",
+      "note": "Original neural pipeline completed; process was stopped before export to replay corrected native postprocessing from decoder dumps. Monitor does not cover the complete final export; do not interpret observed_seconds as full invocation latency."
+    },
+    "rocm-house": {
+      "execution": "staged native inference + native postprocessing replay",
+      "glb": {
+        "path": "tmp/pixal3d/runs/rocm-house/mesh.glb",
+        "bytes": 101478428,
+        "vertices": 857859,
+        "triangles": 992202,
+        "bounds": [
+          [
+            -0.32682037353515625,
+            -0.40721800923347473,
+            -0.26625189185142517
+          ],
+          [
+            0.3557579517364502,
+            0.4970738887786865,
+            0.26086077094078064
+          ]
+        ],
+        "texture_size": 4096,
+        "normal_max_error": 1.7881393432617188e-07,
+        "base_median": [
+          53.0,
+          52.0,
+          44.0,
+          254.0
+        ],
+        "material_median": [
+          0.0,
+          216.0,
+          8.0
+        ]
+      },
+      "monitor": {
+        "backend": "rocm",
+        "pid": 1206292,
+        "attached": true,
+        "command": [
+          "/mnt/nvme02/work/gemm/pixal3d/cpu/pixal3d/pixal3d",
+          "--backend",
+          "rocm",
+          "--input",
+          "ref/pixal3d/upstream/assets/images/1_img.png",
+          "--output",
+          "tmp/pixal3d/runs/rocm-house/mesh.glb",
+          "--fov",
+          "0.857556",
+          "--seed",
+          "1",
+          "--threads",
+          "16"
+        ],
+        "exit_code": null,
+        "observed_seconds": 3175.067933205981,
+        "samples": 3172,
+        "baseline_device_used": 694190080,
+        "peak_device_total_used": 5120925696,
+        "peak_process_device_used": 0,
+        "peak_host_rss": 10293063680,
+        "device_capacity": 17095983104,
+        "note": "AMD device counter includes other processes; NVML reports both device and process use. Sampling interval: 1 second."
+      },
+      "preview_inspected": true,
+      "glb_sha256": "1372d1acdaa2e5a73431a15da93ee2b266fb55e6e3721af0c939f7eda6791067",
+      "input_sha256": "fdd82d60b7ec11e6d5699df29693d8ab538f9dab4b04e3f2abaa59ccd7b4709a",
+      "note": "Original neural pipeline completed; process was stopped before export to replay corrected native postprocessing from decoder dumps. Monitor does not cover the complete final export; do not interpret observed_seconds as full invocation latency."
+    },
+    "cuda-crab": {
+      "execution": "complete native CLI invocation",
+      "glb": {
+        "path": "tmp/pixal3d/runs/cuda-crab/mesh.glb",
+        "bytes": 97541028,
+        "vertices": 816236,
+        "triangles": 947466,
+        "bounds": [
+          [
+            -0.4741913974285126,
+            -0.3432498276233673,
+            -0.38394346833229065
+          ],
+          [
+            0.45386022329330444,
+            0.4311816096305847,
+            0.4933377504348755
+          ]
+        ],
+        "texture_size": 4096,
+        "normal_max_error": 1.7881393432617188e-07,
+        "base_median": [
+          49.0,
+          56.0,
+          58.0,
+          254.0
+        ],
+        "material_median": [
+          0.0,
+          109.0,
+          35.0
+        ]
+      },
+      "monitor": {
+        "backend": "cuda",
+        "pid": 1345480,
+        "attached": false,
+        "command": [
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runtime-final/cpu/pixal3d/pixal3d",
+          "--backend",
+          "cuda",
+          "--input",
+          "/mnt/nvme02/work/gemm/pixal3d/ref/pixal3d/upstream/assets/images/9_img.png",
+          "--output",
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runs/cuda-crab/mesh.glb",
+          "--fov",
+          "0.857556",
+          "--seed",
+          "2",
+          "--threads",
+          "8",
+          "--dump-dir",
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runs/cuda-crab/dumps"
+        ],
+        "exit_code": 0,
+        "observed_seconds": 4957.300428945979,
+        "samples": 4949,
+        "baseline_device_used": 3049848832,
+        "peak_device_total_used": 7662600192,
+        "peak_process_device_used": 1071644672,
+        "peak_host_rss": 14813417472,
+        "device_capacity": 17103323136,
+        "note": "AMD device counter includes other processes; NVML reports both device and process use. Sampling interval: 1 second."
+      },
+      "preview_inspected": true,
+      "glb_sha256": "e02f2671a56e57920c6df505fb5583579a836bf4f4b5d2daf7ccd8d4984ed65e",
+      "input_sha256": "d7e716abe8f8895080f562d1dc26b14fa0e20a05aa5beb2770c6fb3b87b3476a",
+      "stats": {
+        "vertices": 816236,
+        "triangles": 947466,
+        "shape_tokens": 17773,
+        "seconds": 4947.57,
+        "peak_device_bytes": 866140160,
+        "peak_host_bytes": 14805991424
+      }
+    },
+    "rocm-crab": {
+      "execution": "complete native CLI invocation",
+      "glb": {
+        "path": "tmp/pixal3d/runs/rocm-crab/mesh.glb",
+        "bytes": 99121452,
+        "vertices": 813492,
+        "triangles": 988586,
+        "bounds": [
+          [
+            -0.47711804509162903,
+            -0.34273651242256165,
+            -0.38127601146698
+          ],
+          [
+            0.45373570919036865,
+            0.43108758330345154,
+            0.4942700266838074
+          ]
+        ],
+        "texture_size": 4096,
+        "normal_max_error": 1.7881393432617188e-07,
+        "base_median": [
+          58.0,
+          57.0,
+          57.0,
+          254.0
+        ],
+        "material_median": [
+          0.0,
+          112.0,
+          30.0
+        ]
+      },
+      "monitor": {
+        "backend": "rocm",
+        "pid": 1339803,
+        "attached": false,
+        "command": [
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runtime-final/cpu/pixal3d/pixal3d",
+          "--backend",
+          "rocm",
+          "--input",
+          "/mnt/nvme02/work/gemm/pixal3d/ref/pixal3d/upstream/assets/images/9_img.png",
+          "--output",
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runs/rocm-crab/mesh.glb",
+          "--fov",
+          "0.857556",
+          "--seed",
+          "2",
+          "--threads",
+          "8",
+          "--dump-dir",
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runs/rocm-crab/dumps"
+        ],
+        "exit_code": 0,
+        "observed_seconds": 5839.975809885014,
+        "samples": 5834,
+        "baseline_device_used": 59912192,
+        "peak_device_total_used": 5808529408,
+        "peak_process_device_used": 0,
+        "peak_host_rss": 14249271296,
+        "device_capacity": 17095983104,
+        "note": "AMD device counter includes other processes; NVML reports both device and process use. Sampling interval: 1 second."
+      },
+      "preview_inspected": true,
+      "glb_sha256": "2f4188ff8af63a7c9b048be7be58539ec62539be801f0c09c0489185a0f7edd6",
+      "input_sha256": "d7e716abe8f8895080f562d1dc26b14fa0e20a05aa5beb2770c6fb3b87b3476a",
+      "stats": {
+        "vertices": 813492,
+        "triangles": 988586,
+        "shape_tokens": 17688,
+        "seconds": 5831.248,
+        "peak_device_bytes": 866140160,
+        "peak_host_bytes": 14242693120
+      }
+    },
+    "cuda-jester": {
+      "execution": "complete native CLI invocation",
+      "glb": {
+        "path": "tmp/pixal3d/runs/cuda-jester/mesh.glb",
+        "bytes": 95880872,
+        "vertices": 726825,
+        "triangles": 940418,
+        "bounds": [
+          [
+            -0.48792585730552673,
+            -0.40413111448287964,
+            -0.2659202516078949
+          ],
+          [
+            0.3995908498764038,
+            0.40900617837905884,
+            0.32873278856277466
+          ]
+        ],
+        "texture_size": 4096,
+        "normal_max_error": 1.7881393432617188e-07,
+        "base_median": [
+          75.0,
+          44.0,
+          46.0,
+          254.0
+        ],
+        "material_median": [
+          0.0,
+          158.0,
+          135.0
+        ]
+      },
+      "monitor": {
+        "backend": "cuda",
+        "pid": 1438166,
+        "attached": false,
+        "command": [
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runtime-final/cpu/pixal3d/pixal3d",
+          "--backend",
+          "cuda",
+          "--input",
+          "/mnt/nvme02/work/gemm/pixal3d/ref/pixal3d/upstream/assets/images/21_img.png",
+          "--output",
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runs/cuda-jester/mesh.glb",
+          "--fov",
+          "0.857556",
+          "--seed",
+          "3",
+          "--threads",
+          "8",
+          "--dump-dir",
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runs/cuda-jester/dumps"
+        ],
+        "exit_code": 0,
+        "observed_seconds": 1704.0800189329893,
+        "samples": 1702,
+        "baseline_device_used": 2094792704,
+        "peak_device_total_used": 3171942400,
+        "peak_process_device_used": 1071644672,
+        "peak_host_rss": 8275001344,
+        "device_capacity": 17103323136,
+        "note": "AMD device counter includes other processes; NVML reports both device and process use. Sampling interval: 1 second."
+      },
+      "preview_inspected": true,
+      "glb_sha256": "8949a085db220b54380d6d0e10c2a60f400e6f254d8c77925f45fca7aca7eb03",
+      "input_sha256": "5793b52a21507a5cdd661f8d87681b303e420057a8c65aaa16e0560409a7a34e",
+      "visual_note": "Recognizable complete figure and textures; a small detached ornament remains in the generated geometry. No connected-component removal was applied.",
+      "stats": {
+        "vertices": 726825,
+        "triangles": 940418,
+        "shape_tokens": 8049,
+        "seconds": 1695.77,
+        "peak_device_bytes": 866140160,
+        "peak_host_bytes": 8267608064
+      }
+    },
+    "rocm-jester": {
+      "execution": "complete native CLI invocation",
+      "glb": {
+        "path": "tmp/pixal3d/runs/rocm-jester/mesh.glb",
+        "bytes": 95945260,
+        "vertices": 723461,
+        "triangles": 932596,
+        "bounds": [
+          [
+            -0.4982389807701111,
+            -0.40005379915237427,
+            -0.26649782061576843
+          ],
+          [
+            0.4019719660282135,
+            0.4109944999217987,
+            0.3130001425743103
+          ]
+        ],
+        "texture_size": 4096,
+        "normal_max_error": 1.7881393432617188e-07,
+        "base_median": [
+          76.0,
+          48.0,
+          50.0,
+          254.0
+        ],
+        "material_median": [
+          0.0,
+          179.0,
+          153.0
+        ]
+      },
+      "monitor": {
+        "backend": "rocm",
+        "pid": 1442420,
+        "attached": false,
+        "command": [
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runtime-final/cpu/pixal3d/pixal3d",
+          "--backend",
+          "rocm",
+          "--input",
+          "/mnt/nvme02/work/gemm/pixal3d/ref/pixal3d/upstream/assets/images/21_img.png",
+          "--output",
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runs/rocm-jester/mesh.glb",
+          "--fov",
+          "0.857556",
+          "--seed",
+          "3",
+          "--threads",
+          "8",
+          "--dump-dir",
+          "/mnt/nvme02/work/gemm/pixal3d/tmp/pixal3d/runs/rocm-jester/dumps"
+        ],
+        "exit_code": 0,
+        "observed_seconds": 2304.7038230890175,
+        "samples": 2303,
+        "baseline_device_used": 59912192,
+        "peak_device_total_used": 763924480,
+        "peak_process_device_used": 0,
+        "peak_host_rss": 8281985024,
+        "device_capacity": 17095983104,
+        "note": "AMD device counter includes other processes; NVML reports both device and process use. Sampling interval: 1 second."
+      },
+      "preview_inspected": true,
+      "glb_sha256": "9531e6df0c6e267dcea13c93a84fe1a1024d5c967d0ccd385f1aa4e92e283209",
+      "input_sha256": "5793b52a21507a5cdd661f8d87681b303e420057a8c65aaa16e0560409a7a34e",
+      "visual_note": "Recognizable complete figure and textures; a small detached ornament remains in the generated geometry. No connected-component removal was applied.",
+      "stats": {
+        "vertices": 723461,
+        "triangles": 932596,
+        "shape_tokens": 7955,
+        "seconds": 2297.074,
+        "peak_device_bytes": 866140160,
+        "peak_host_bytes": 8274628608
+      }
+    },
+    "cpu-pencil": {
+      "execution": "complete native CLI invocation",
+      "glb": {
+        "path": "tmp/pixal3d/runs/cpu-pencil/mesh.glb",
+        "bytes": 62482704,
+        "vertices": 670220,
+        "triangles": 960992,
+        "bounds": [
+          [
+            -0.04007700830698013,
+            -0.5009146332740784,
+            0.06480111181735992
+          ],
+          [
+            0.035559311509132385,
+            0.5000953078269958,
+            0.162587508559227
+          ]
+        ],
+        "texture_size": 4096,
+        "normal_max_error": 1.7881393432617188e-07,
+        "base_median": [
+          253.0,
+          160.0,
+          52.0,
+          254.0
+        ],
+        "material_median": [
+          0.0,
+          254.0,
+          0.0
+        ]
+      },
+      "monitor": {
+        "backend": "cpu",
+        "pid": 10,
+        "attached": false,
+        "command": [
+          "/home/syoyo/work/gemm/pixal3d/tmp/pixal3d/runtime-final/cpu/pixal3d/pixal3d",
+          "--backend",
+          "cpu",
+          "--input",
+          "tmp/pixal3d/cpu-fixture/pencil-rgb.png",
+          "--output",
+          "tmp/pixal3d/runs/cpu-pencil/mesh.glb",
+          "--fov",
+          "0.857556",
+          "--seed",
+          "4",
+          "--threads",
+          "12",
+          "--dump-dir",
+          "tmp/pixal3d/runs/cpu-pencil/dumps",
+          "--mask",
+          "tmp/pixal3d/cpu-fixture/pencil-mask.png"
+        ],
+        "exit_code": 0,
+        "observed_seconds": 3765.0189052789938,
+        "samples": 3762,
+        "baseline_device_used": 0,
+        "peak_device_total_used": 0,
+        "peak_process_device_used": 0,
+        "peak_host_rss": 6493474816,
+        "device_capacity": 0,
+        "note": "AMD device counter includes other processes; NVML reports both device and process use. Sampling interval: 1 second."
+      },
+      "preview_inspected": true,
+      "glb_sha256": "8a663326de0a9f0b50e860f728ac94f98936593376928d71ac76bb015a528f37",
+      "input_sha256": "947efc62306bf49651e4c177ab672a420c5aa45452200a569d04463cb2b18790",
+      "mask_sha256": "72abc9f78027022d12e8a233011ebc38353a46e09c457f7338df5552133bbb2e",
+      "stats": {
+        "vertices": 670220,
+        "triangles": 960992,
+        "shape_tokens": 1132,
+        "seconds": 3760.38,
+        "peak_device_bytes": 0,
+        "peak_host_bytes": 6488096768
+      }
+    }
+  },
+  "native_c_smoke_test": {
+    "command": "make -C cpu/pixal3d test",
+    "result": "PASS",
+    "flags": "-std=c11 -Wall -Wextra -Wpedantic"
+  },
+  "cpu_full_step_checks": {
+    "structure": [
+      {
+        "stage": "structure",
+        "step": 12,
+        "trajectory": false,
+        "attention": "auto",
+        "nrmse": 0.012060682569997897,
+        "cosine": 0.9999273081184651,
+        "max_abs": 0.024901777505874634,
+        "within_step_tolerance": true,
+        "native_backend": "cpu",
+        "reference_backend": "cuda"
+      }
+    ],
+    "shape512": [
+      {
+        "stage": "shape512",
+        "step": 12,
+        "trajectory": false,
+        "attention": "auto",
+        "nrmse": 0.003377828484818329,
+        "cosine": 0.9999942971330744,
+        "max_abs": 0.0179329514503479,
+        "within_step_tolerance": true,
+        "native_backend": "cpu",
+        "reference_backend": "cuda"
+      }
+    ]
+  },
+  "real_house_geometry": [
+    {
+      "stage": "remesh",
+      "resolution": 1024,
+      "native_vertices": 6847719,
+      "native_faces": 13744436,
+      "reference_vertices": 6847721,
+      "reference_faces": 13744440,
+      "precision": 1.0,
+      "recall": 1.0,
+      "fscore": 1.0,
+      "max_surface_distance": 0.00031275046057999134
+    },
+    {
+      "stage": "simplify",
+      "resolution": 1024,
+      "native_vertices": 484748,
+      "native_faces": 992202,
+      "reference_vertices": 488478,
+      "reference_faces": 999635,
+      "precision": 0.9999498967466739,
+      "recall": 0.9998709775400121,
+      "fscore": 0.9999104355861432,
+      "max_surface_distance": 0.003597857430577278
+    }
+  ],
+  "measurement_notes": [
+    "Jobs ran concurrently with each other and some PyTorch reference checks; elapsed times are functional test observations, not isolated performance benchmarks.",
+    "Native peak_device_bytes measures scratch allocations, excluding driver and BLAS overhead. NVIDIA external monitoring includes per-process and total device VRAM; AMD counters are total device VRAM and include other processes.",
+    "Native seconds excludes GLB serialization. Native peak_host_bytes is process-lifetime peak RSS; external samples are taken once per second and can miss brief allocation peaks.",
+    "Both checkpoint header hashes and streamed full-file SHA256 hashes are recorded. The original NAF checkpoint has a separately enforced SHA256 before conversion.",
+    "The complex CPU house attempt was stopped partway through shape512 and is not a completed run. The final CPU run uses the reproducible narrow pencil RGB+mask fixture with unchanged resolution and steps."
+  ]
+}

@@ -1,0 +1,10 @@
+/.venv*
+/upstream/
+/naf-upstream/
+/cumesh-upstream/
+/flexgemm-upstream/
+/deps/
+/weights/
+/dumps/
+/.cache/
+__pycache__/

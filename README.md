@@ -21,6 +21,7 @@ High-performance GEMM, FlashAttention kernels, and full LLM/VLM inference engine
 | Vulkan LLM Runner | `vulkan/` | Vulkan LLM with cooperative matrix |
 | SAM 2 / SAM 2.1 | `ref/sam2/`, `cpu/sam2/`, `rdna4/sam2/`, `cuda/sam2/` | Point/box-prompted image (+ video) segmentation (Meta). Shared arch for 2.0 and 2.1 weights. |
 | SAM 3 | `ref/sam3/`, `cpu/sam3/`, `rdna4/sam3/`, `cuda/sam3/` | Concept-level (text + exemplar) promptable segmentation (Meta, 2025). |
+| [Pixal3D main](cpu/pixal3d/README.md) | `cpu/pixal3d/`, `cuda/pixal3d/`, `rdna4/pixal3d/`, `ref/pixal3d/` | Native single-view 1024-cascade shape and 4096 PBR GLB inference, with bounded GPU workspace. |
 
 See [VLM_LLM.md](VLM_LLM.md) for detailed VLM/LLM feature matrix, supported models, and TODOs.
 

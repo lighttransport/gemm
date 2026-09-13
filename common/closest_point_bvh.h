@@ -140,6 +140,7 @@ public:
       uint32_t i0 = static_cast<uint32_t>(faces[3 * f + 0]);
       uint32_t i1 = static_cast<uint32_t>(faces[3 * f + 1]);
       uint32_t i2 = static_cast<uint32_t>(faces[3 * f + 2]);
+      if (i0 >= num_v || i1 >= num_v || i2 >= num_v) return false;
       const float* p0 = vertices + 3 * i0;
       const float* p1 = vertices + 3 * i1;
       const float* p2 = vertices + 3 * i2;

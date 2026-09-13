@@ -48,6 +48,9 @@ t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
 /* Variant for coords stored as [N,4] int32 (batch, z, y, x). */
 t2_fdg_mesh t2_fdg_to_mesh_bzyx(const int32_t *coords, const float *feats,
                                    int N, float voxel_size, const float aabb[6]);
+/* Upstream Pixal3D coordinates are (batch,x,y,z), with matching XYZ offsets. */
+t2_fdg_mesh t2_fdg_to_mesh_bxyz(const int32_t *coords, const float *feats,
+                                   int N, float voxel_size, const float aabb[6]);
 
 /* Same as t2_fdg_to_mesh_bzyx, but retains the internal voxel hash in the
  * returned mesh for downstream users that need coord->row lookup. */
@@ -137,7 +140,7 @@ static const int edge_offsets[3][4][3] = {
 static t2_fdg_mesh t2_fdg_to_mesh_strided(const int32_t *coords, const float *feats,
                                              int N, int stride, int base,
                                              float voxel_size, const float aabb[6],
-                                             int keep_hash) {
+                                             int keep_hash, int xyz) {
     t2_fdg_mesh mesh = {0};
 
     /* 1. Compute mesh vertices: (coord + dual_vertex) * voxel_size + aabb_min */
@@ -148,9 +151,9 @@ static t2_fdg_mesh t2_fdg_to_mesh_strided(const int32_t *coords, const float *fe
         float vx = feats[i * 7 + 0];
         float vy = feats[i * 7 + 1];
         float vz = feats[i * 7 + 2];
-        verts[i * 3 + 0] = ((float)c[2] + vx) * voxel_size + aabb[0];  /* x */
+        verts[i * 3 + 0] = ((float)c[xyz ? 0 : 2] + vx) * voxel_size + aabb[0];  /* x */
         verts[i * 3 + 1] = ((float)c[1] + vy) * voxel_size + aabb[1];  /* y */
-        verts[i * 3 + 2] = ((float)c[0] + vz) * voxel_size + aabb[2];  /* z */
+        verts[i * 3 + 2] = ((float)c[xyz ? 2 : 0] + vz) * voxel_size + aabb[2];  /* z */
     }
 
     /* 2. Build spatial hash */
@@ -227,17 +230,22 @@ static t2_fdg_mesh t2_fdg_to_mesh_strided(const int32_t *coords, const float *fe
 
 t2_fdg_mesh t2_fdg_to_mesh(const int32_t *coords, const float *feats,
                               int N, float voxel_size, const float aabb[6]) {
-    return t2_fdg_to_mesh_strided(coords, feats, N, 3, 0, voxel_size, aabb, 0);
+    return t2_fdg_to_mesh_strided(coords, feats, N, 3, 0, voxel_size, aabb, 0, 0);
 }
 
 t2_fdg_mesh t2_fdg_to_mesh_bzyx(const int32_t *coords, const float *feats,
                                    int N, float voxel_size, const float aabb[6]) {
-    return t2_fdg_to_mesh_strided(coords, feats, N, 4, 1, voxel_size, aabb, 0);
+    return t2_fdg_to_mesh_strided(coords, feats, N, 4, 1, voxel_size, aabb, 0, 0);
+}
+
+t2_fdg_mesh t2_fdg_to_mesh_bxyz(const int32_t *coords, const float *feats,
+                                   int N, float voxel_size, const float aabb[6]) {
+    return t2_fdg_to_mesh_strided(coords, feats, N, 4, 1, voxel_size, aabb, 0, 1);
 }
 
 t2_fdg_mesh t2_fdg_to_mesh_bzyx_with_hash(const int32_t *coords, const float *feats,
                                              int N, float voxel_size, const float aabb[6]) {
-    return t2_fdg_to_mesh_strided(coords, feats, N, 4, 1, voxel_size, aabb, 1);
+    return t2_fdg_to_mesh_strided(coords, feats, N, 4, 1, voxel_size, aabb, 1, 0);
 }
 
 void t2_fdg_mesh_free(t2_fdg_mesh *m) {

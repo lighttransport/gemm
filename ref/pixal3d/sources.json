@@ -1,0 +1,32 @@
+{
+  "pixal3d": {
+    "url": "https://github.com/TencentARC/Pixal3D.git",
+    "revision": "f7cf38429b0bd264f1995f0f8743a88b1c728b94",
+    "branch": "master",
+    "scope": "README main release; paper/Direct3D-S2 deferred"
+  },
+  "naf": {
+    "url": "https://github.com/valeoai/NAF.git",
+    "revision": "37f2dfc180f2de53d98bd601109c0da0dd6b0f43"
+  },
+  "cumesh": {
+    "url": "https://github.com/JeffreyXiang/CuMesh.git",
+    "revision": "12289e1062f0603f2f0d0771b02e1395d247f26f"
+  },
+  "flexgemm": {
+    "url": "https://github.com/JeffreyXiang/FlexGEMM.git",
+    "revision": "6dd94a859c26ee8246888502eada3dd8ad85532e"
+  },
+  "naf_weights": "https://github.com/valeoai/NAF/releases/download/model/naf_release.pth",
+  "hipblas_abi": "https://github.com/ROCm/hipBLAS/tree/rocm-7.2.2",
+  "hipblas_common_abi": "https://github.com/ROCm/hipBLAS-common/tree/rocm-7.2.2",
+  "trellis2": {
+    "url": "https://github.com/microsoft/TRELLIS.2.git",
+    "revision": "75fbf0183001ed9876c8dbb35de6b68552ee08bd"
+  },
+  "naf_checkpoint_sha256": "c096c1ab2217a5c3ac136365f721685e2201379cb69d509cfb0261183847c98f",
+  "opencv_inpaint": {
+    "url": "https://github.com/opencv/opencv/blob/4.12.0/modules/photo/src/inpaint.cpp",
+    "source_sha256": "15c66e1f742fd8a08590996e80e06895c5355126bd9457ab613be03179019734"
+  }
+}
