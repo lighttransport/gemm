@@ -22,50 +22,108 @@ extern "C" __global__ void gn_transpose_rows(float *out, const float *in, int R,
 }
 /* Default 81-token, 32-wide head: eight waves own eight queries and share one
  * staged K/V tile. Wave leaders use the CPU softmax order. */
-extern "C" __global__ void gn_attention_81(float *y, float *prob, const float *x, const float *bias,
-                                           int B, int side, int C, int D) {
-    __shared__ float q[8][32], keys[32][82], values[81][33], scores[8][81];
-    int t = threadIdx.x, wave = t / 32, lane = t % 32, H = C / 32, groups = 11;
-    int group = blockIdx.x % groups, h = blockIdx.x / groups % H;
-    int b = blockIdx.x / (groups * H), i = group * 8 + wave;
-    if (i < 81)
-        q[wave][lane] = x[(b * 81 + i) * 3 * C + h * 32 + lane];
-    for (int index = t; index < 81 * 32; index += 256) {
-        int j = index / 32, d = index % 32;
-        keys[d][j] = x[(b * 81 + j) * 3 * C + C + h * 32 + d];
-        values[j][d] = x[(b * 81 + j) * 3 * C + 2 * C + h * 32 + d];
+extern "C" __global__ __launch_bounds__(192) void
+gn_attention_81(float *y, float *prob, const float *x, const float *bias, int B, int side, int C,
+                int D) {
+    union Storage {
+        struct {
+            unsigned short q[2][16][32], k[2][96][32];
+            float score[16][96];
+        } qk;
+        struct {
+            unsigned short p[2][16][96], v[2][32][96];
+        } pv;
+    };
+    __shared__ Storage s;
+    int t = threadIdx.x, wave = t / 32, lane = t % 32, ix = lane & 15, half = lane / 16;
+    int H = C / 32, groups = 6, group = blockIdx.x % groups;
+    int h = blockIdx.x / groups % H, b = blockIdx.x / (groups * H), q0 = group * 16;
+    for (int z = t; z < 16 * 32; z += 192) {
+        int i = z / 32, d = z % 32, query = q0 + i;
+        float value = query < 81 ? x[(b * 81 + query) * 3 * C + h * 32 + d] : 0;
+        unsigned short high = bf(value);
+        s.qk.q[0][i][d] = high;
+        s.qk.q[1][i][d] = bf(value - unbf(high));
+    }
+    for (int z = t; z < 96 * 32; z += 192) {
+        int j = z / 32, d = z % 32;
+        float value = j < 81 ? x[(b * 81 + j) * 3 * C + C + h * 32 + d] : 0;
+        unsigned short high = bf(value);
+        s.qk.k[0][j][d] = high;
+        s.qk.k[1][j][d] = bf(value - unbf(high));
     }
     __syncthreads();
-    if (i < 81)
-        for (int j = lane; j < 81; j += 32) {
-            float dot = 0;
-            for (int d = 0; d < 32; d++)
-                dot += q[wave][d] * keys[d][j];
-            int rel = (i / 9 + 8 - j / 9) * 17 + i % 9 + 8 - j % 9;
-            scores[wave][j] = dot * rsqrtf((float)D) + bias[rel * H + h];
-        }
+    float8 acc = {};
+    ushort8 qh = *reinterpret_cast<ushort8 *>(&s.qk.q[0][ix][half * 8]);
+    ushort8 ql = *reinterpret_cast<ushort8 *>(&s.qk.q[1][ix][half * 8]);
+    ushort8 kh = *reinterpret_cast<ushort8 *>(&s.qk.k[0][wave * 16 + ix][half * 8]);
+    ushort8 kl = *reinterpret_cast<ushort8 *>(&s.qk.k[1][wave * 16 + ix][half * 8]);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(qh, kh, acc);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(ql, kh, acc);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(qh, kl, acc);
+    qh = *reinterpret_cast<ushort8 *>(&s.qk.q[0][ix][16 + half * 8]);
+    ql = *reinterpret_cast<ushort8 *>(&s.qk.q[1][ix][16 + half * 8]);
+    kh = *reinterpret_cast<ushort8 *>(&s.qk.k[0][wave * 16 + ix][16 + half * 8]);
+    kl = *reinterpret_cast<ushort8 *>(&s.qk.k[1][wave * 16 + ix][16 + half * 8]);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(qh, kh, acc);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(ql, kh, acc);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(qh, kl, acc);
+    for (int r = 0; r < 8; r++)
+        s.qk.score[half * 8 + r][wave * 16 + ix] = acc[r];
     __syncthreads();
-    if (!lane && i < 81) {
+    if (t < 16 && q0 + t < 81) {
+        int query = q0 + t;
         float top = -INFINITY;
-        for (int j = 0; j < 81; j++)
-            top = fmaxf(top, scores[wave][j]);
+        for (int j = 0; j < 81; j++) {
+            int rel = (query / 9 + 8 - j / 9) * 17 + query % 9 + 8 - j % 9;
+            float value = s.qk.score[t][j] * rsqrtf((float)D) + bias[rel * H + h];
+            s.qk.score[t][j] = value;
+            top = fmaxf(top, value);
+        }
         double sum = 0;
         for (int j = 0; j < 81; j++) {
-            scores[wave][j] = expf(scores[wave][j] - top);
-            sum += scores[wave][j];
+            s.qk.score[t][j] = expf(s.qk.score[t][j] - top);
+            sum += s.qk.score[t][j];
         }
-        int query = (b * H + h) * 81 + i;
+        int qi = (b * H + h) * 81 + query;
         for (int j = 0; j < 81; j++) {
-            scores[wave][j] /= (float)sum;
-            prob[query * 81 + j] = scores[wave][j];
+            s.qk.score[t][j] /= (float)sum;
+            prob[qi * 81 + j] = s.qk.score[t][j];
         }
     }
     __syncthreads();
-    if (i < 81) {
-        float v = 0;
-        for (int j = 0; j < 81; j++)
-            v += scores[wave][j] * values[j][lane];
-        y[(b * 81 + i) * C + h * 32 + lane] = v;
+    for (int z = t; z < 16 * 96; z += 192) {
+        int i = z / 96, j = z % 96;
+        float value = q0 + i < 81 && j < 81 ? s.qk.score[i][j] : 0;
+        unsigned short high = bf(value);
+        s.pv.p[0][i][j] = high;
+        s.pv.p[1][i][j] = bf(value - unbf(high));
+    }
+    __syncthreads();
+    for (int z = t; z < 32 * 96; z += 192) {
+        int d = z / 96, j = z % 96;
+        float value = j < 81 ? x[(b * 81 + j) * 3 * C + 2 * C + h * 32 + d] : 0;
+        unsigned short high = bf(value);
+        s.pv.v[0][d][j] = high;
+        s.pv.v[1][d][j] = bf(value - unbf(high));
+    }
+    __syncthreads();
+    if (wave < 2) {
+        float8 out = {};
+        for (int k = 0; k < 96; k += 16) {
+            ushort8 ph = *reinterpret_cast<ushort8 *>(&s.pv.p[0][ix][k + half * 8]);
+            ushort8 pl = *reinterpret_cast<ushort8 *>(&s.pv.p[1][ix][k + half * 8]);
+            ushort8 vh = *reinterpret_cast<ushort8 *>(&s.pv.v[0][wave * 16 + ix][k + half * 8]);
+            ushort8 vl = *reinterpret_cast<ushort8 *>(&s.pv.v[1][wave * 16 + ix][k + half * 8]);
+            out = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(ph, vh, out);
+            out = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(pl, vh, out);
+            out = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(ph, vl, out);
+        }
+        for (int r = 0; r < 8; r++) {
+            int query = q0 + half * 8 + r, d = wave * 16 + ix;
+            if (query < 81)
+                y[(b * 81 + query) * C + h * 32 + d] = out[r];
+        }
     }
     (void)B;
     (void)side;
@@ -76,32 +134,107 @@ extern "C" __global__ void gn_attention_81(float *y, float *prob, const float *x
 extern "C" __global__ void gn_attention_scores_back_81(float *ds, const float *x, const float *dy,
                                                        const float *prob, int B, int side, int C,
                                                        int D) {
-    __shared__ float dys[8][32], values[81][33], scores[8][81];
-    int t = threadIdx.x, wave = t / 32, lane = t % 32, H = C / 32, groups = 11;
+    __shared__ unsigned short dys[2][16][32], values[2][96][32];
+    __shared__ float scores[16][96];
+    int t = threadIdx.x, wave = t / 32, lane = t % 32, ix = lane & 15, half = lane / 16;
+    int H = C / 32, groups = 6;
     int group = blockIdx.x % groups, h = blockIdx.x / groups % H;
-    int b = blockIdx.x / (groups * H), i = group * 8 + wave;
-    if (i < 81)
-        dys[wave][lane] = dy[(b * 81 + i) * C + h * 32 + lane];
-    for (int index = t; index < 81 * 32; index += 256) {
-        int j = index / 32, d = index % 32;
-        values[j][d] = x[(b * 81 + j) * 3 * C + 2 * C + h * 32 + d];
+    int b = blockIdx.x / (groups * H), q0 = group * 16;
+    for (int z = t; z < 16 * 32; z += 192) {
+        int i = z / 32, d = z % 32, query = q0 + i;
+        float value = query < 81 ? dy[(b * 81 + query) * C + h * 32 + d] : 0;
+        unsigned short high = bf(value);
+        dys[0][i][d] = high;
+        dys[1][i][d] = bf(value - unbf(high));
+    }
+    for (int z = t; z < 96 * 32; z += 192) {
+        int j = z / 32, d = z % 32;
+        float value = j < 81 ? x[(b * 81 + j) * 3 * C + 2 * C + h * 32 + d] : 0;
+        unsigned short high = bf(value);
+        values[0][j][d] = high;
+        values[1][j][d] = bf(value - unbf(high));
     }
     __syncthreads();
-    if (i < 81)
-        for (int j = lane; j < 81; j += 32) {
-            float dp = 0;
-            for (int d = 0; d < 32; d++)
-                dp += dys[wave][d] * values[j][d];
-            scores[wave][j] = dp;
-        }
+    float8 acc = {};
+    ushort8 dh = *reinterpret_cast<ushort8 *>(&dys[0][ix][half * 8]);
+    ushort8 dl = *reinterpret_cast<ushort8 *>(&dys[1][ix][half * 8]);
+    ushort8 vh = *reinterpret_cast<ushort8 *>(&values[0][wave * 16 + ix][half * 8]);
+    ushort8 vl = *reinterpret_cast<ushort8 *>(&values[1][wave * 16 + ix][half * 8]);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(dh, vh, acc);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(dl, vh, acc);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(dh, vl, acc);
+    dh = *reinterpret_cast<ushort8 *>(&dys[0][ix][16 + half * 8]);
+    dl = *reinterpret_cast<ushort8 *>(&dys[1][ix][16 + half * 8]);
+    vh = *reinterpret_cast<ushort8 *>(&values[0][wave * 16 + ix][16 + half * 8]);
+    vl = *reinterpret_cast<ushort8 *>(&values[1][wave * 16 + ix][16 + half * 8]);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(dh, vh, acc);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(dl, vh, acc);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(dh, vl, acc);
+    for (int r = 0; r < 8; r++)
+        scores[half * 8 + r][wave * 16 + ix] = acc[r];
     __syncthreads();
-    if (!lane && i < 81) {
-        int query = (b * H + h) * 81 + i;
+    if (t < 16 && q0 + t < 81) {
+        int query = (b * H + h) * 81 + q0 + t;
         double dot = 0;
         for (int j = 0; j < 81; j++)
-            dot += scores[wave][j] * prob[query * 81 + j];
+            dot += scores[t][j] * prob[query * 81 + j];
         for (int j = 0; j < 81; j++)
-            ds[query * 81 + j] = prob[query * 81 + j] * (scores[wave][j] - (float)dot);
+            ds[query * 81 + j] = prob[query * 81 + j] * (scores[t][j] - (float)dot);
+    }
+    (void)B;
+    (void)side;
+    (void)D;
+}
+extern "C" __global__ __launch_bounds__(128) void gn_attention_qkv_back_81(
+    float *dx, const float *x, const float *dy, const float *prob, const float *ds, int B, int side,
+    int C, int D) {
+    __shared__ unsigned short a[2][16][96], v[2][32][96];
+    int t = threadIdx.x, wave = t / 32, lane = t % 32, ix = lane & 15, half = lane / 16;
+    int H = C / 32, groups = 6, group = blockIdx.x % groups;
+    int h = blockIdx.x / groups % H, b = blockIdx.x / (groups * H), row0 = group * 16;
+    int base = (b * H + h) * 81 * 81;
+    for (int phase = 0; phase < 3; phase++) {
+        for (int z = t; z < 16 * 96; z += 128) {
+            int r = z / 96, k = z % 96, row = row0 + r;
+            float value = 0;
+            if (row < 81 && k < 81)
+                value = phase == 0   ? ds[base + row * 81 + k] * .1767766952966369f
+                        : phase == 1 ? ds[base + k * 81 + row] * .1767766952966369f
+                                     : prob[base + k * 81 + row];
+            unsigned short high = bf(value);
+            a[0][r][k] = high;
+            a[1][r][k] = bf(value - unbf(high));
+        }
+        for (int z = t; z < 32 * 96; z += 128) {
+            int d = z / 96, k = z % 96;
+            float value = 0;
+            if (k < 81)
+                value = phase == 0   ? x[(b * 81 + k) * 3 * C + C + h * 32 + d]
+                        : phase == 1 ? x[(b * 81 + k) * 3 * C + h * 32 + d]
+                                     : dy[(b * 81 + k) * C + h * 32 + d];
+            unsigned short high = bf(value);
+            v[0][d][k] = high;
+            v[1][d][k] = bf(value - unbf(high));
+        }
+        __syncthreads();
+        if (wave < 2) {
+            float8 out = {};
+            for (int k = 0; k < 96; k += 16) {
+                ushort8 ah = *reinterpret_cast<ushort8 *>(&a[0][ix][k + half * 8]);
+                ushort8 al = *reinterpret_cast<ushort8 *>(&a[1][ix][k + half * 8]);
+                ushort8 vh = *reinterpret_cast<ushort8 *>(&v[0][wave * 16 + ix][k + half * 8]);
+                ushort8 vl = *reinterpret_cast<ushort8 *>(&v[1][wave * 16 + ix][k + half * 8]);
+                out = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(ah, vh, out);
+                out = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(al, vh, out);
+                out = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(ah, vl, out);
+            }
+            for (int r = 0; r < 8; r++) {
+                int row = row0 + half * 8 + r, d = wave * 16 + ix;
+                if (row < 81)
+                    dx[(b * 81 + row) * 3 * C + phase * C + h * 32 + d] += out[r];
+            }
+        }
+        __syncthreads();
     }
     (void)B;
     (void)side;

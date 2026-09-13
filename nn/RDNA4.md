@@ -702,6 +702,24 @@ and is not retained. Dropping one of the three compensated BF16 forward
 products was rejected: output relative L2 rose to 0.004446 and gradient relative
 L2 to 0.135437.
 
+### Fused WMMA attention
+
+The hybrid's 81-token, 32-wide attention now computes QK, probability-times-V,
+the backward score product, and the Q/K/V gradient triplet with gfx1201 WMMA.
+Each matrix product uses the same high-high, low-high, and high-low BF16
+decomposition as the qualified convolution path. Relative-position bias,
+softmax, and the softmax Jacobian retain serial FP32/double evaluation. Other
+HIP and CPU/CUDA backends retain their original attention kernels.
+
+The batch-64 replay oracle passes with output relative L2 **0.000019973022** and
+global gradient relative L2 **0.00082430711**. Three 100-step runs measure
+**1,150.29 examples/s median** (1,146.69--1,150.81), with 12.4250 useful matrix
+TFLOP/s and 21.8284 logical product TFLOP/s, **11.1941%** of the nominal
+195-TFLOP/s dense peak. Product accounting includes the nine compensated
+attention matrix products and excludes the 81-to-96 padding. A profile measured
+the forward attention kernel at 72.31 ms aggregate versus 129.48 ms for the
+previous scalar kernel over the same 128 dispatches.
+
 Three final batch-64 runs of 100 measured steps sustain **1,028.09 examples/s
 median** (1,026.46--1,029.80). Median useful matrix work is 11.1050 TFLOP/s.
 The precision allocation executes an estimated 18.3703 trillion 16-bit matrix

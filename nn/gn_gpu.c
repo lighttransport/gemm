@@ -34,7 +34,7 @@ typedef struct {
     CUmodule cuda_module;
     hipModule_t hip_module;
     Buffer b[SLOT_COUNT];
-    void *functions[48];
+    void *functions[49];
     void *lt;
     hipGraph_t backward_graph;
     hipGraphExec_t backward_exec;
@@ -89,7 +89,8 @@ static const char *names[] = {"gn_mm",
                               "gn_bn_silu_channels",
                               "gn_bn_silu_back_channels",
                               "gn_grad_norm_multi",
-                              "gn_adam_multi"};
+                              "gn_adam_multi",
+                              "gn_attention_qkv_back_81"};
 static int current(Gpu *g) {
     int rc = g->hip ? (int)hipSetDevice(g->device) : (int)cuCtxSetCurrent(g->context);
     return rc ? gn_fail("cannot activate GPU context") : 0;
@@ -450,7 +451,7 @@ void *gn_gpu_open(const char *backend, int device, size_t limit) {
         gn_fail("GPU module load failed");
         goto bad;
     }
-    for (int i = 0; i < (g->hip ? 48 : 28); i++) {
+    for (int i = 0; i < (g->hip ? 49 : 28); i++) {
         if (g->hip) {
             hipFunction_t f;
             rc = (int)hipModuleGetFunction(&f, g->hip_module, names[i]);
@@ -610,8 +611,8 @@ int gn_gpu_forward(gn_model *m, const float *input) {
         } else if (n->kind == ATTENTION) {
             void *args[] = {&y, &aux, &x, &w, &B, &side, &C, &D};
             if (!g->legacy)
-                if (g->hip && side == 9 && D == 32)
-                    CALL(launch(g, 33, B * (C / D) * 11, 1, 256, args));
+                if (g->hybrid16 && side == 9 && D == 32)
+                    CALL(launch(g, 33, B * (C / D) * 6, 1, 192, args));
                 else
                     CALL(launch(g, 24, R * (C / D), 1, 256, args));
             else
@@ -790,12 +791,15 @@ int gn_gpu_backward(gn_model *m, const float *target, const uint32_t *labels, gn
                 if (!ds)
                     return -1;
                 void *score[] = {&ds, &x, &dy, &aux, &B, &side, &C, &D};
-                if (g->hip && side == 9 && D == 32)
-                    CALL(launch(g, 39, B * (C / D) * 11, 1, 256, score));
+                if (g->hybrid16 && side == 9 && D == 32)
+                    CALL(launch(g, 39, B * (C / D) * 6, 1, 192, score));
                 else
                     CALL(launch(g, 25, R * (C / D), 1, 256, score));
                 void *qkv[] = {&dx, &x, &dy, &aux, &ds, &B, &side, &C, &D};
-                CALL(flat(g, 26, (size_t)R * C, qkv));
+                if (g->hybrid16 && side == 9 && D == 32)
+                    CALL(launch(g, 48, B * (C / D) * 6, 1, 128, qkv));
+                else
+                    CALL(flat(g, 26, (size_t)R * C, qkv));
                 void *relative[] = {&dw, &ds, &B, &side, &C, &D};
                 CALL(launch(g, 27, (2 * side - 1) * (2 * side - 1) * (C / D), 1, 256, relative));
             } else {

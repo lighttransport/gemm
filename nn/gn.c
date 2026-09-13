@@ -325,6 +325,12 @@ double gn_gemm_product_ops(const gn_model *m, const char *backend) {
         double operations = 0;
         for (size_t i = 0; i < m->nn; i++) {
             const Node *n = &m->n[i];
+            if (n->kind == ATTENTION) {
+                /* Fused forward uses three BF16 products for QK^T and PV;
+                 * score backward uses three for dO*V^T. */
+                operations += 36 * (double)n->r * n->c * m->cfg.side * m->cfg.side;
+                continue;
+            }
             if (n->kind != LINEAR && n->kind != CONV)
                 continue;
             double K = n->kind == LINEAR ? n->k : (double)m->n[n->a].c * n->k * n->k;
