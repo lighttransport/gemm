@@ -307,9 +307,13 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
         begin = m->profile ? MPI_Wtime() : 0.0;
         if (m->kda[l]) {
             size_t bytes = glm53f_kda_state_bytes_12n(m->kda[l]);
-            for (int tile = 0; tile < tokens; tile += KERNEL_BATCH) {
+            int wide_kda = tokens > VERIFY_BATCH &&
+                getenv("GLM53F_KDA_WIDE_TILE") &&
+                atoi(getenv("GLM53F_KDA_WIDE_TILE"));
+            for (int tile = 0; tile < tokens;
+                 tile += wide_kda ? tokens : KERNEL_BATCH) {
                 int n = tokens - tile;
-                if (n > KERNEL_BATCH) n = KERNEL_BATCH;
+                if (!wide_kda && n > KERNEL_BATCH) n = KERNEL_BATCH;
                 if (glm53f_kda_sublayer_batch_capture_12n(
                         m->kda[l], m->batch_output + (size_t)tile * HIDDEN,
                         m->batch_normalized + (size_t)tile * HIDDEN, n,

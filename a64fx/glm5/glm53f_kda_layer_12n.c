@@ -120,7 +120,7 @@ glm53f_kda_context_12n *glm53f_kda_create_12n(const char *model,int layer){int r
 #define PART(F,S,T,OFF,N) do{name(n,layer,S);c->w.F=(T*)a256((size_t)(N)*sizeof(T));read_part(st,n,(size_t)(OFF)*sizeof(T),c->w.F,(size_t)(N)*sizeof(T),rank);}while(0)
     PART(al,"A_log",float,h0,hn);PART(dt,"dt_bias",float,h0*D,qd);PART(q,"q_proj.weight",uint16_t,(size_t)h0*D*H,(size_t)qd*H);PART(k,"k_proj.weight",uint16_t,(size_t)h0*D*H,(size_t)qd*H);PART(v,"v_proj.weight",uint16_t,(size_t)h0*D*H,(size_t)qd*H);PART(qc,"q_conv1d.weight",uint16_t,(size_t)h0*D*KERNEL,(size_t)qd*KERNEL);PART(kc,"k_conv1d.weight",uint16_t,(size_t)h0*D*KERNEL,(size_t)qd*KERNEL);PART(vc,"v_conv1d.weight",uint16_t,(size_t)h0*D*KERNEL,(size_t)qd*KERNEL);PART(fb,"f_b_proj.weight",uint16_t,(size_t)h0*D*D,(size_t)qd*D);PART(b,"b_proj.weight",uint16_t,(size_t)h0*H,(size_t)hn*H);PART(gb,"g_b_proj.weight",uint16_t,(size_t)h0*D*D,(size_t)qd*D);PART(fa,"f_a_proj.weight",uint16_t,0,(size_t)D*H);PART(ga,"g_a_proj.weight",uint16_t,0,(size_t)D*H);PART(on,"o_norm.weight",uint16_t,0,D);name(n,layer,"o_proj.weight");c->w.op=a256((size_t)H*qd*sizeof(uint16_t));read_cols(st,n,c->w.op,H,QKV,h0*D,qd,rank);
 #undef PART
-    glm53f_st_close(st);c->qkv=a256((size_t)3*qd*4);c->small=a256(D*4);c->gate=a256(qd*4);c->decay=a256(qd*4);c->beta=a256(hn*4);c->core=a256(qd*4);c->normed=a256(qd*4);c->work=a256(qd*4);c->conv=a256((size_t)3*qd*KERNEL*4);c->state=a256((size_t)hn*D*D*4);c->partial=a256(H*4);c->batch_partial=a256((size_t)4*H*4);c->bq=a256((size_t)4*qd*4);c->bk=a256((size_t)4*qd*4);c->bv=a256((size_t)4*qd*4);c->bsmall_f=a256((size_t)4*D*4);c->bsmall_g=a256((size_t)4*D*4);c->bgate_f=a256((size_t)4*qd*4);c->bgate_g=a256((size_t)4*qd*4);c->bbeta=a256((size_t)4*hn*4);c->bnormed=a256((size_t)4*qd*4);glm53f_kda_reset_12n(c);return c;}
+    glm53f_st_close(st);c->qkv=a256((size_t)3*qd*4);c->small=a256(D*4);c->gate=a256(qd*4);c->decay=a256(qd*4);c->beta=a256(hn*4);c->core=a256(qd*4);c->normed=a256(qd*4);c->work=a256(qd*4);c->conv=a256((size_t)3*qd*KERNEL*4);c->state=a256((size_t)hn*D*D*4);c->partial=a256(H*4);c->batch_partial=a256((size_t)32*H*4);c->bq=a256((size_t)32*qd*4);c->bk=a256((size_t)32*qd*4);c->bv=a256((size_t)32*qd*4);c->bsmall_f=a256((size_t)32*D*4);c->bsmall_g=a256((size_t)32*D*4);c->bgate_f=a256((size_t)32*qd*4);c->bgate_g=a256((size_t)32*qd*4);c->bbeta=a256((size_t)32*hn*4);c->bnormed=a256((size_t)32*qd*4);glm53f_kda_reset_12n(c);return c;}
 
 void glm53f_kda_reset_12n(glm53f_kda_context_12n*c){if(!c)return;memset(c->conv,0,(size_t)3*c->qd*KERNEL*4);memset(c->state,0,(size_t)c->hn*D*D*4);}
 static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
@@ -213,10 +213,23 @@ static void mv_batch_team(float *y, const uint16_t *w, const float *x,
     }
 }
 
+static void mv_batch_wide_team(float *y, const uint16_t *w, const float *x,
+                               int tokens, int rows, int cols) {
+    for (int base = 0; base < tokens; base += 4) {
+        int n = tokens - base;
+        if (n > 4) n = 4;
+        mv_batch_team(y + (size_t)base * rows, w,
+                      x + (size_t)base * cols, n, rows, cols);
+    }
+}
+
 int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
         float *out, const float *x, int tokens, void *states, size_t stride) {
     size_t bytes = glm53f_kda_state_bytes_12n(c);
-    if (!c || !out || !x || tokens < 1 || tokens > 5 || (states && stride < bytes))
+    int wide = getenv("GLM53F_KDA_WIDE_TILE") &&
+               atoi(getenv("GLM53F_KDA_WIDE_TILE"));
+    if (!c || !out || !x || tokens < 1 || tokens > (wide ? 32 : 5) ||
+        (states && stride < bytes))
         return -1;
     if (c->int8_enabled) {
         for (int t = 0; t < tokens; ++t) {
@@ -241,14 +254,14 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
     double start = MPI_Wtime(), front_end = start;
 #pragma omp parallel shared(front_end)
     {
-        mv_batch_team(c->bq, w->q, x, tokens, qd, H);
-        mv_batch_team(c->bk, w->k, x, tokens, qd, H);
-        mv_batch_team(c->bv, w->v, x, tokens, qd, H);
-        mv_batch_team(c->bsmall_f, w->fa, x, tokens, D, H);
-        mv_batch_team(c->bgate_f, w->fb, c->bsmall_f, tokens, qd, D);
-        mv_batch_team(c->bbeta, w->b, x, tokens, hn, H);
-        mv_batch_team(c->bsmall_g, w->ga, x, tokens, D, H);
-        mv_batch_team(c->bgate_g, w->gb, c->bsmall_g, tokens, qd, D);
+        mv_batch_wide_team(c->bq, w->q, x, tokens, qd, H);
+        mv_batch_wide_team(c->bk, w->k, x, tokens, qd, H);
+        mv_batch_wide_team(c->bv, w->v, x, tokens, qd, H);
+        mv_batch_wide_team(c->bsmall_f, w->fa, x, tokens, D, H);
+        mv_batch_wide_team(c->bgate_f, w->fb, c->bsmall_f, tokens, qd, D);
+        mv_batch_wide_team(c->bbeta, w->b, x, tokens, hn, H);
+        mv_batch_wide_team(c->bsmall_g, w->ga, x, tokens, D, H);
+        mv_batch_wide_team(c->bgate_g, w->gb, c->bsmall_g, tokens, qd, D);
         /* Tokens remain causal; parallelize independent channels/heads within
          * each position and retain every snapshot before advancing state. */
         for (int t = 0; t < tokens; t++) {
@@ -287,12 +300,18 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
         }
 #pragma omp master
         front_end = MPI_Wtime();
-        mv_batch_team(c->batch_partial, w->op, c->bnormed, tokens, H, qd);
+        mv_batch_wide_team(c->batch_partial, w->op, c->bnormed, tokens, H, qd);
     }
     double projection_end = MPI_Wtime();
     c->phase[0] = front_end - start;
     c->phase[1] = projection_end - front_end;
-    int rc = glm53f_sum_allreduce_12n(c->batch_partial, out, tokens * H);
+    int rc = 0;
+    for (int base = 0; base < tokens && !rc; base += 4) {
+        int n = tokens - base;
+        if (n > 4) n = 4;
+        rc = glm53f_sum_allreduce_12n(c->batch_partial + (size_t)base * H,
+                                     out + (size_t)base * H, n * H);
+    }
     c->phase[2] = MPI_Wtime() - projection_end;
     return rc;
 }

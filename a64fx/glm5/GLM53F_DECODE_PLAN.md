@@ -419,6 +419,32 @@ four-position collective payload. The next substantial gain must therefore
 come from a true token-matrix INT8/FP8 kernel or attention redesign, not from
 larger orchestration tiles alone.
 
+The next attention experiment keeps one OpenMP team alive across an entire
+32-position KDA tile. All independent Q/K/V, gate, beta, and output
+projections are computed as consecutive four-token arithmetic panels inside
+that team; causal convolution and recurrent state updates still advance one
+position at a time. The output remains reduced in four-position slabs because
+that is the validated uTofu registration limit. Gate this structural path with
+`GLM53F_KDA_WIDE_TILE=1 GLM53F_KDA_BATCH_TEAM=1`, require an exact state probe,
+and retain it only if attention time improves against the 13.994 ms/position
+grouped-FP8 control and the 13.0 ms/position expert-INT8 runs.
+
+Job 51628852 passes that gate. At 128 FP8 positions the same-allocation control
+measures **28.566 tok/s** with 13.986 ms/position attention; the wide KDA tile
+measures **30.463 tok/s** with 12.028 ms/position attention. The complete probe
+is bit-identical in both runs: token 198, logit 5.59104729, hidden sum
+-40.713163658045232, and hidden RMS 1.9342837399749639. This is a 6.6%
+end-to-end gain and a 14.0% attention reduction.
+
+Combined with BF16-router expert INT8, the 512-position control measures
+**31.995 tok/s** (14.225 ms attention, 12.055 ms FFN), while wide KDA reaches
+**34.258 tok/s** (12.348 ms attention, 11.837 ms FFN), a same-allocation 7.1%
+gain. Both probes are bit-identical: token 198, logit 5.30986309, hidden sum
+-31.889146824833006, and hidden RMS 1.8924755182359696. Retain the gated wide
+KDA implementation. It removes repeated OpenMP team construction across the
+eight four-token panels but deliberately retains causal recurrence and
+four-token uTofu reductions.
+
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
 their validated existing size. The same allocation resumed the partial 22.25
