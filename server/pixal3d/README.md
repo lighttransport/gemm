@@ -19,5 +19,9 @@ removed after each request.
 
 `POST /v1/infer` accepts JSON fields `image_b64`, optional `mask_b64`,
 `image_ext`, `backend`, `fov`, `distance`, `mesh_scale`, `seed`, `threads`,
-`device`, and `vram_budget_mib`. The response contains `glb_b64` and native
-runner `stats`. `GET /health` reports binary, GPU-library, and model readiness.
+`device`, and `vram_budget_mib`. Set `reference: true` with CUDA or ROCm to
+also run the pinned upstream PyTorch pipeline; the response includes a second
+GLB for comparison. This is opt-in because it loads another model stack and
+requires an image without a separate mask upload. The browser displays native
+AMD and PyTorch reference meshes side by side or as an opacity overlay.
+`GET /health` reports binary, GPU-library, and model readiness.

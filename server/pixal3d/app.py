@@ -12,8 +12,6 @@ import base64
 import binascii
 import json
 import math
-import mimetypes
-import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -80,6 +78,8 @@ class PixalServer:
         self.work_dir = Path(args.work_dir).resolve()
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.locks = {backend: threading.Lock() for backend in ("cpu", "cuda", "rocm")}
+        self.reference_script = ROOT / "ref/pixal3d/upstream/inference.py"
+        self.reference_launcher = ROOT / "ref/pixal3d/run.sh"
 
     def health(self) -> dict:
         lib = {
@@ -154,6 +154,41 @@ class PixalServer:
             return {"ok": True, "backend": backend, "elapsed_ms": round((time.monotonic() - started) * 1000),
                     "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"), "stats": stats}
 
+    def reference(self, request: dict) -> dict:
+        """Run the pinned upstream PyTorch pipeline for visual verification."""
+        backend = request.get("backend", self.args.backend)
+        if backend not in ("cuda", "rocm"):
+            raise ValueError("PyTorch reference comparison requires CUDA or ROCm")
+        if request.get("mask_b64"):
+            raise ValueError("PyTorch reference comparison currently requires an image without a separate mask")
+        image = decode_b64(request.get("image_b64"), "image_b64", MAX_IMAGE_BYTES)
+        ext = str(request.get("image_ext", ".png")).lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+            ext = ".png"
+        fov = finite_number(request.get("fov", 0.857556), "fov", 0.05, 3.14)
+        seed = int(request.get("seed", 42))
+        with self.locks[backend], tempfile.TemporaryDirectory(prefix="reference-", dir=self.work_dir) as td:
+            run_dir = Path(td)
+            image_path = run_dir / ("input" + ext)
+            output_path = run_dir / "reference.glb"
+            image_path.write_bytes(image)
+            cmd = [str(self.reference_launcher), backend, str(self.reference_script), "--image", str(image_path),
+                   "--output", str(output_path), "--seed", str(seed), "--fov", str(fov),
+                   "--model_path", str(self.model_dir), "--low_vram", "--resolution", "1024"]
+            started = time.monotonic()
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.args.reference_timeout)
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(f"PyTorch reference exceeded {self.args.reference_timeout:g}s") from exc
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "PyTorch reference failed").strip()[-4000:]
+                raise RuntimeError(detail)
+            if not output_path.is_file() or output_path.stat().st_size > MAX_GLB_BYTES:
+                raise RuntimeError("PyTorch reference did not produce a valid GLB")
+            return {"backend": backend, "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"),
+                    "log_tail": (proc.stdout or "").strip()[-2000:]}
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Pixal3DWeb/1.0"
@@ -189,6 +224,8 @@ class Handler(BaseHTTPRequestHandler):
             if length < 0 or length > MAX_BODY_BYTES: raise ValueError("request body too large")
             request = json.loads(self.rfile.read(length))
             result = self.server.pixal.infer(request)
+            if request.get("reference"):
+                result["reference"] = self.server.pixal.reference(request)
             self.json_response(200, result)
         except TimeoutError as exc: self.json_response(504, {"ok": False, "error": str(exc)})
         except (ValueError, json.JSONDecodeError) as exc: self.json_response(400, {"ok": False, "error": str(exc)})
@@ -203,7 +240,7 @@ def main() -> None:
     p.add_argument("--backend", choices=("cpu", "cuda", "rocm"), default="cuda")
     p.add_argument("--binary", default=str(ROOT / "cpu/pixal3d/pixal3d")); p.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
     p.add_argument("--dinov3", default=str(DEFAULT_DINOV3)); p.add_argument("--naf", default=str(DEFAULT_NAF))
-    p.add_argument("--work-dir", default=str(ROOT / "tmp/pixal3d/web-runs")); p.add_argument("--threads", type=int, default=0); p.add_argument("--timeout", type=float, default=7200)
+    p.add_argument("--work-dir", default=str(ROOT / "tmp/pixal3d/web-runs")); p.add_argument("--threads", type=int, default=0); p.add_argument("--timeout", type=float, default=7200); p.add_argument("--reference-timeout", type=float, default=10800)
     args = p.parse_args(); srv = ThreadingHTTPServer((args.bind, args.port), Handler); srv.pixal = PixalServer(args)
     print(f"Pixal3D demo: http://{args.bind}:{args.port}/ (backend={args.backend})", flush=True); srv.serve_forever()
 
