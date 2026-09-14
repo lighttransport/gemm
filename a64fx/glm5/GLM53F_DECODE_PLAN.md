@@ -1,5 +1,175 @@
 # GLM-5.3F A64FX 12-node decode-first plan
 
+## Prefill and decode: measured results and ceilings (2026-09-15)
+
+This section summarizes existing measurements and engineering estimates; no
+new inference benchmark was run for this assessment. All rates are for one
+sequence on 12 A64FX nodes, without MTP. **Allocated cache capacity is not
+populated context length.** Estimates below are not achieved throughput or
+quality acceptance, and do not supersede the failed generated-code compile
+tests recorded later. Output quality is accepted for the current performance
+workstream at the user's direction.
+
+### Measured end-to-end rates
+
+| Workload | Prefill tok/s | Decode tok/s | Scope / configuration |
+| --- | ---: | ---: | --- |
+| Synthetic 8192-token prefill, final v5 | **108.238** | not measured in this test | Three-run aggregate; 2.0 GHz, INT8 experts, BF16 KDA/router, FP8 sparse projections, replicated cache |
+| C++ stable-sort 8050-token prefill, final v5 | **106.765** | not measured in this test | Same configuration; three-run aggregate |
+| First 512 positions, accepted c7, boost-eco | — | **26.914** | Unprofiled production-path control; INT8 experts + KDA; 512K BF16 cache committed; replicated first-512 prefix |
+| Same first-512 path, two profiled repeats | — | **27.192 / 27.119** | Matching token/logit records; not a populated-512K measurement |
+| Same first-512 path, normal-frequency profiled run | — | **26.313** | Different allocation/clock mode from boost-eco |
+| Corrected C++ task, 8050 input + 8192 generated, FP8/BF16 | 14.233 | **13.451** | Earlier scalar-prefill runner; normal frequency; 65536 BF16-cache capacity; CP path |
+| Corrected C++ task, 8050 input + 8192 generated, INT8 experts + KDA | 16.360 | **15.341** | Matched task/allocation; 65536 BF16-cache capacity; CP path |
+| v4 512K-capacity/page-touch smoke test | **57.076** | **21.066** | Only 256 timed prompt positions and 16 generated tokens; INT8 experts, BF16 KDA; CP fallback |
+| Full-model prefill/decode at a populated 512K context | **not measured** | **not measured** | Capacity and isolated-layer probes do not establish this rate |
+
+The v5 prefill numbers exclude loading, validation trace I/O, and the final
+continuation probe. Their average is total tokens / total elapsed seconds
+across three runs, with each run timed by the slowest rank. The corrected
+coding runs separately time 8049 prompt-only steps and 8192 generation steps;
+the final prompt token predicts the first generated token. Do not combine the
+v5 prefill and older decode numbers into a claimed same-run serving result:
+cache distribution, KDA precision, runtime, and sometimes clock mode differ.
+The prefill-only work did not remeasure sustained decode on the v5 binary.
+
+Primary local records (paths are relative to this document):
+
+- [Synthetic v5 prefill](../../tmp/glm53f-prefill-redesign/synth8192_v5.35.0)
+  and [C++ v5 prefill](../../tmp/glm53f-prefill-redesign/sort8050_v5.34.0).
+- First-512 [unprofiled c7](../../tmp/glm53f-first512/results-51610526/target-noprofile-c7-boost-512.10.0),
+  [profiled repeat 1](../../tmp/glm53f-first512/results-51610526/target-both-c7-512-r1.8.0),
+  [profiled repeat 2](../../tmp/glm53f-first512/results-51610526/target-both-c7-512-r2.9.0),
+  and [normal-frequency control](../../tmp/glm53f-first512/results-51608030/target-both-c7-normal-512.18.0).
+- Corrected 8K-output [FP8](../../tmp/glm53f-quality-fp8-epsfix-8k/run.34.0)
+  and [INT8](../../tmp/glm53f-quality-int8-epsfix-8k/run.35.0) coding runs.
+- [512K-capacity v4 smoke test](../../tmp/glm53f-prefill-redesign/capacity512k_v4.30.0).
+
+### Practical optimization estimates, not measured results
+
+| Regime | Practical target tok/s | Structural stretch tok/s | Qualification |
+| --- | ---: | ---: | --- |
+| Approximately 8K prefill, v5 mixed-precision replicated-cache path | **130--160** | **180--200** | Budget around 150; combined attention, expert, and collective improvements |
+| First approximately 512 decode positions, accepted INT8 experts + KDA path | **30--35** | **40--45** | Budget 30 first; remove cross-layer scheduling/communication cost, not just rearrange teams |
+| Decode after an approximately 8K prompt on the INT8 CP path | **20--25** | **30** | Lower-confidence planning range; substantial sparse-attention/CP redesign required |
+| Actual populated 512K prefill or decode | **unestablished** | **unestablished** | Require long-context profiling and complete-model measurements |
+
+For prefill, the median C++ v5 run is 75.334226 s / 8050 = **9.358 ms/token**.
+Its phase maxima are KDA 2.661, sparse attention 2.260, local MoE 1.962,
+MoE all-reduce/wait 1.668, mHC 0.559, router 0.097, dense FFN 0.223, and
+embedding 0.047 ms/token. KDA and sparse totals already include their
+communication. Phase maxima are independently reduced across ranks, so they
+are useful approximate budgets, not an additive critical-path trace.
+
+Reaching 150 tok/s requires 6.667 ms/token, about **2.692 ms saved**. A
+planning scenario with 25% less attention time, one-third less local MoE
+time, and 0.6 ms less MoE reduction/wait saves approximately 2.48 ms/token
+and lands near 145 tok/s; modest further improvement reaches 150. These
+assumed savings are not separately demonstrated. Doubling only local MoE
+speed predicts about **119 tok/s**; even making that phase free predicts
+only **135 tok/s**. At 200 tok/s, approximately 47% of present elapsed time
+must disappear, requiring a much larger redesign.
+
+For short decode, use the unprofiled **37.155 ms/token** result as the
+production baseline, not the slightly faster profiled runs:
+
+| Decode target tok/s | Allowed ms/token | Saving from unprofiled baseline, ms/token |
+| --- | ---: | ---: |
+| 30 | 33.333 | **3.822** |
+| 35 | 28.571 | **8.584** |
+| 40 | 25.000 | **12.155** |
+| 45 | 22.222 | **14.933** |
+
+The matched profiled repeat gives mHC **7.146**, KDA **7.709**, sparse
+attention **8.749**, FFN **12.340**, head **1.114**, and embedding **0.100
+ms/token. Within MoE, router/local/reduction maxima are 1.944/6.943/2.791
+ms/token; these nested, independently reduced maxima must not be added to
+the FFN total. Halving mHC alone would save about 3.57 ms/token, nearly but
+not fully closing the production 30 tok/s gap. Together with moderate
+attention/FFN improvements, this supports 30--35 as an engineering target,
+not a promise. The already-tested per-sublayer persistent-team and
+router/shared-overlap attempts were regressions or noise-sized changes;
+they do not demonstrate these projected savings.
+
+At approximately 8K populated context, the earlier full-model INT8 CP
+technical-notes run measured 15.938 decode tok/s with 41.199 ms/token in
+attention. Approximately halving that attention budget while keeping other
+work unchanged would put the run near 24 tok/s. This motivates the
+lower-confidence 20--25 planning range, but cannot be applied directly to
+the different coding trajectory or to 512K. Its log is
+[v8 8K technical-notes decode](../../tmp/glm53f-512k-dev/results-51604112/long-v8-int8-bf16-8k.39.0).
+
+### Conditional theoretical bounds
+
+These distinguish an empirical transport model from an arithmetic-only
+silicon bound. Neither is a measured end-to-end maximum.
+
+The graph has **90 full-hidden-vector reductions per logical token**:
+34 KDA + 11 sparse output + 42 MoE + 3 dense FFN. The
+[isolated 12-rank payload sweep](../../tmp/glm53f-prefill-redesign/collective_v5.31.0)
+measured 35.832 us/token for single-token payloads, 26.800 for four-token
+payloads, and 22.627 for 32-token payloads. It did not have the integrated
+48-worker compute team active. This is the 2.0 GHz job 51646260, not a
+clock-matched collective measurement for the older boost-eco decode runs.
+
+| Conditional model | Reduction-only ms/token | Zero-compute equivalent tok/s |
+| --- | ---: | ---: |
+| Prefill current grouping: 79 four-token + 11 single-token reductions | 2.511 | **398** |
+| Prefill hypothetical 32-token grouping for all 90 reductions | 2.036 | **491** |
+| Non-MTP single-sequence decode: 90 single-token reductions | 3.225 | **310** |
+
+Thus the useful rounded transport-model ceilings are **400--490 tok/s for
+prefill** and **about 310 tok/s for decode**, with computation unrealistically
+free. They exclude index-score exchange, CP candidate/selected-row/pool
+communication, vocabulary argmax, memory traffic, and arrival skew. They are
+not physical hardware limits: a different transport or parallel decomposition
+could change them. Larger prefill payloads still require integrated
+correctness/performance checks. Decode cannot use cross-token payload batching
+for a single autoregressive sequence without speculation or changing the
+workload to multiple independent sequences.
+
+For an even looser prefill arithmetic-only bound, Fujitsu specifies per node
+at 2.0 GHz 6.144 TFLOP/s FP32 and 1024 GB/s HBM bandwidth; its system INT8
+peak implies approximately 24.576 TOPS/node. Twelve nodes therefore supply
+73.728 TFLOP/s FP32, approximately 294.912 TOPS INT8, and 12.288 TB/s peak
+aggregate HBM bandwidth. These are separate resource peaks, not numbers to
+add together. [Fujitsu Fugaku specifications](https://global.fujitsu/en-global/technology/research/fugaku/specifications).
+
+Approximate v5 work per prefill token is **23 GFLOP plus 19.0 billion INT8
+operations**, counting a multiply-add as two operations and including
+replicated projections. The INT8 term is
+`42 * (8 routed + 1 shared) * 3 * 4096 * 2048 * 2 = 19.025e9`.
+The floating-point estimate includes about 10.14 GFLOP KDA projections,
+6.22 sparse/index projections, 2.58 selected-latent MLA at an 8K-average
+prefix, and approximately 3.57 for the remaining projections, router, mHC,
+and recurrence. Model dimensions come from `common/glm53f_arch.h` and the
+12-node layer implementations, not the older GLM-5.2 `prefill_sim.py`.
+
+`23e9 / 73.728e12 + 19.025e9 / 294.912e12` is approximately 0.376 ms/token,
+or 2656 tok/s. Report this only as a loose **2500--2800 tok/s arithmetic-only
+ceiling**. It ignores conversion instructions, nonlinear functions,
+FP64-specific throughput, cache/HBM limits, imperfect utilization, and all
+communication; it is not a deployable target. FP8/BF16 storage does not give
+this implementation native tensor-core arithmetic. Do not transfer this
+prefill estimate to decode: decode lacks cross-token weight reuse, computes
+the vocabulary head for each output, and the accepted fast path also uses
+INT8 KDA rather than v5's BF16 KDA.
+
+As a more immediate decode bound, retaining the measured 16.458 ms/token
+short-context attention implementation would cap an otherwise-free graph
+near **61 tok/s**. Reaching even that requires eliminating every other
+phase; 40--45 is already an aggressive multi-component target, and 100+
+non-MTP single-stream decode is not supported by these measurements.
+
+For **512K**, the latest BF16-cache page-touch passed with minimum sampled
+3.188 GiB/rank available, but its populated prefix was short. At long
+prefixes, index work grows and each sparse layer can gather roughly 4 MiB
+of selected FP32 latents per query despite BF16 cache storage. The 8K
+prefill estimate and first-512 decode estimate therefore cannot certify
+512K throughput. Keep separate goals: approximately **150 tok/s 8K prefill**,
+**30 tok/s first-512 decode**, and a newly measured full-model long-context
+budget before assigning a populated-512K practical maximum.
+
 ## Active work: 512K, non-MTP, 30 tok/s (2026-09-13)
 
 ### Continuation: first ~512 positions, 30 tok/s
