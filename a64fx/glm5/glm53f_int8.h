@@ -182,6 +182,81 @@ static inline void glm53f_i8_dot16(float *out, const int8_t *w,
     }
 }
 
+/* Token-matrix form of dot16; retain the on-load packed weight layout and
+ * per-token activation scales. Two K chains for eight tokens, or four chains
+ * for four tokens, provide sixteen independent SDOT accumulators. Integer
+ * reassociation is exact (model K <= 4096, far below signed int32 overflow).
+ * No horizontal float reduction or changed dequantization expression. */
+static inline void glm53f_i8_dot16_batch(float *out, size_t out_stride,
+        const int8_t *w, const float *scale, const int8_t *x, size_t x_stride,
+        const float *xscale, int tokens, int cols) {
+    int base = 0;
+#if defined(__ARM_FEATURE_SVE)
+    if (svcntw() == 16) {
+        svbool_t pb = svptrue_b8(), ps = svptrue_b32();
+        for (; base + 8 <= tokens; base += 8) {
+            svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0;
+            svint32_t b0=a0,b1=a0,b2=a0,b3=a0,b4=a0,b5=a0,b6=a0,b7=a0;
+            for (int c = 0; c < cols; c += 8) {
+#define GLM53F_I8_BT(T,A,O) do { \
+                int32_t word; memcpy(&word, x + (size_t)(base+(T))*x_stride+c+(O), 4); \
+                A = svdot_s32(A, weight, svreinterpret_s8_s32(svdup_s32(word))); \
+            } while (0)
+                svint8_t weight = svld1_s8(pb, w + (size_t)c * 64);
+                GLM53F_I8_BT(0,a0,0); GLM53F_I8_BT(1,a1,0);
+                GLM53F_I8_BT(2,a2,0); GLM53F_I8_BT(3,a3,0);
+                GLM53F_I8_BT(4,a4,0); GLM53F_I8_BT(5,a5,0);
+                GLM53F_I8_BT(6,a6,0); GLM53F_I8_BT(7,a7,0);
+                weight = svld1_s8(pb, w + (size_t)(c + 4) * 64);
+                GLM53F_I8_BT(0,b0,4); GLM53F_I8_BT(1,b1,4);
+                GLM53F_I8_BT(2,b2,4); GLM53F_I8_BT(3,b3,4);
+                GLM53F_I8_BT(4,b4,4); GLM53F_I8_BT(5,b5,4);
+                GLM53F_I8_BT(6,b6,4); GLM53F_I8_BT(7,b7,4);
+#undef GLM53F_I8_BT
+            }
+#define GLM53F_I8_BSTORE(T,A,B) svst1(ps, out + (size_t)(base+(T))*out_stride, \
+                svmul_f32_x(ps, svcvt_f32_s32_x(ps, svadd_s32_x(ps,A,B)), \
+                    svmul_n_f32_x(ps,svld1(ps,scale),xscale[base+(T)])))
+            GLM53F_I8_BSTORE(0,a0,b0); GLM53F_I8_BSTORE(1,a1,b1);
+            GLM53F_I8_BSTORE(2,a2,b2); GLM53F_I8_BSTORE(3,a3,b3);
+            GLM53F_I8_BSTORE(4,a4,b4); GLM53F_I8_BSTORE(5,a5,b5);
+            GLM53F_I8_BSTORE(6,a6,b6); GLM53F_I8_BSTORE(7,a7,b7);
+#undef GLM53F_I8_BSTORE
+        }
+        for (; base + 4 <= tokens; base += 4) {
+            svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0;
+            svint32_t b0=a0,b1=a0,b2=a0,b3=a0,c0=a0,c1=a0,c2=a0,c3=a0;
+            svint32_t d0=a0,d1=a0,d2=a0,d3=a0;
+            for (int c = 0; c < cols; c += 16) {
+#define GLM53F_I8_BT(T,A,O) do { \
+                int32_t word; memcpy(&word, x + (size_t)(base+(T))*x_stride+c+(O), 4); \
+                A = svdot_s32(A, weight, svreinterpret_s8_s32(svdup_s32(word))); \
+            } while (0)
+#define GLM53F_I8_BSTEP(O,A,B,C,D) do { \
+                svint8_t weight = svld1_s8(pb,w+(size_t)(c+(O))*64); \
+                GLM53F_I8_BT(0,A,O); GLM53F_I8_BT(1,B,O); \
+                GLM53F_I8_BT(2,C,O); GLM53F_I8_BT(3,D,O); \
+            } while (0)
+                GLM53F_I8_BSTEP(0,a0,a1,a2,a3); GLM53F_I8_BSTEP(4,b0,b1,b2,b3);
+                GLM53F_I8_BSTEP(8,c0,c1,c2,c3); GLM53F_I8_BSTEP(12,d0,d1,d2,d3);
+#undef GLM53F_I8_BSTEP
+#undef GLM53F_I8_BT
+            }
+#define GLM53F_I8_BSTORE(T,A,B,C,D) svst1(ps,out+(size_t)(base+(T))*out_stride, \
+                svmul_f32_x(ps,svcvt_f32_s32_x(ps,svadd_s32_x(ps, \
+                    svadd_s32_x(ps,A,B),svadd_s32_x(ps,C,D))), \
+                    svmul_n_f32_x(ps,svld1(ps,scale),xscale[base+(T)])))
+            GLM53F_I8_BSTORE(0,a0,b0,c0,d0); GLM53F_I8_BSTORE(1,a1,b1,c1,d1);
+            GLM53F_I8_BSTORE(2,a2,b2,c2,d2); GLM53F_I8_BSTORE(3,a3,b3,c3,d3);
+#undef GLM53F_I8_BSTORE
+        }
+    }
+#endif
+    for (; base < tokens; ++base)
+        glm53f_i8_dot16(out + (size_t)base * out_stride, w, scale,
+                        x + (size_t)base * x_stride, xscale[base], cols);
+}
+
 /* Row-major control used to compare the packed stream with eight independent
  * weight streams. Both accumulate exactly the same integer dot products. */
 static inline void glm53f_i8_dot8_rows(float *out, const int8_t *w,

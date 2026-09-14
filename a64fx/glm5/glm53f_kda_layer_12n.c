@@ -215,6 +215,25 @@ static void mv_batch_team(float *y, const uint16_t *w, const float *x,
 
 static void mv_batch_wide_team(float *y, const uint16_t *w, const float *x,
                                int tokens, int rows, int cols) {
+    if (tokens > 5 && getenv("GLM53F_KDA_PREFILL") && atoi(getenv("GLM53F_KDA_PREFILL"))) {
+        int n4 = rows / 4;
+#pragma omp for collapse(2) schedule(static)
+        for (int r = 0; r < n4; ++r)
+            for (int base = 0; base < tokens; base += 4) {
+                int n = tokens - base;
+                if (n > 4) n = 4;
+                glm53f_matvec_bf16_4x4(y + (size_t)base * rows + r * 4, rows,
+                    w + (size_t)r * 4 * cols, x + (size_t)base * cols, n, cols);
+            }
+        if (rows % 4) {
+#pragma omp for collapse(2) schedule(static)
+            for (int t = 0; t < tokens; ++t)
+                for (int r = n4 * 4; r < rows; ++r)
+                    y[(size_t)t * rows + r] = glm53f_dot_bf16_sve(
+                        w + (size_t)r * cols, x + (size_t)t * cols, cols);
+        }
+        return;
+    }
     for (int base = 0; base < tokens; base += 4) {
         int n = tokens - base;
         if (n > 4) n = 4;
@@ -262,6 +281,47 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
         mv_batch_wide_team(c->bbeta, w->b, x, tokens, hn, H);
         mv_batch_wide_team(c->bsmall_g, w->ga, x, tokens, D, H);
         mv_batch_wide_team(c->bgate_g, w->gb, c->bsmall_g, tokens, qd, D);
+        int prefill_recurrence = !states && tokens > 5 &&
+            getenv("GLM53F_KDA_PREFILL") && atoi(getenv("GLM53F_KDA_PREFILL"));
+        if (prefill_recurrence) {
+            /* Each convolution channel owns its chronological history. All
+             * raw projections are available; normalization must not feed back
+             * into convolution state. Then each head advances its recurrence
+             * across the tile without a barrier between consecutive tokens. */
+#pragma omp for schedule(static)
+            for (int j = 0; j < 3 * qd; ++j) {
+                int which = j / qd, channel = j % qd;
+                float *projection = which == 0 ? c->bq : which == 1 ? c->bk : c->bv;
+                const uint16_t *conv_weight = which == 0 ? w->qc : which == 1 ? w->kc : w->vc;
+                float *state = c->conv + (size_t)j * KERNEL;
+                for (int t = 0; t < tokens; ++t) {
+                    float *value = projection + (size_t)t * qd + channel;
+                    memmove(state, state + 1, (KERNEL - 1) * sizeof(float));
+                    state[KERNEL - 1] = *value;
+                    float y = 0;
+                    for (int z = 0; z < KERNEL; ++z)
+                        y += state[z] * glm53f_bf16_to_f32(conv_weight[(size_t)channel * KERNEL + z]);
+                    *value = y / (1.0f + expf(-y));
+                }
+            }
+#pragma omp for schedule(static)
+            for (int h = 0; h < hn; ++h)
+                for (int t = 0; t < tokens; ++t) {
+                    float *q = c->bq + (size_t)t * qd + h * D;
+                    float *k = c->bk + (size_t)t * qd + h * D;
+                    float *v = c->bv + (size_t)t * qd + h * D;
+                    float *beta = c->bbeta + (size_t)t * hn + h;
+                    glm53f_l2norm(q, D, 1e-6f);
+                    glm53f_l2norm(k, D, 1e-6f);
+                    glm53f_kda_safe_log_decay(c->decay + h * D,
+                        c->bgate_f + (size_t)t * qd + h * D, w->dt + h * D, w->al[h], -5.0f, D);
+                    *beta = glm53f_sigmoid(*beta);
+                    glm53f_kda_step_vec_streamed(c->state + (size_t)h * D * D,
+                        q, k, v, c->decay + h * D, *beta, D, D, c->core + h * D, c->work + h * D);
+                    glm53f_rmsnorm_gated_bf16(c->bnormed + (size_t)t * qd + h * D,
+                        c->core + h * D, c->bgate_g + (size_t)t * qd + h * D, w->on, 1, D, 1e-5f);
+                }
+        } else
         /* Tokens remain causal; parallelize independent channels/heads within
          * each position and retain every snapshot before advancing state. */
         for (int t = 0; t < tokens; t++) {

@@ -109,6 +109,14 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_core_add_routers.c \
     -lm -o glm53f_core_add_routers
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_int8.c \
     -lm -o test_glm53f_int8
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_int8_batch.c \
+    -lm -o test_glm53f_int8_batch
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_mhc_prefill.c \
+    -lm -o test_glm53f_mhc_prefill
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_sparse_prefill.c \
+    "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_prefill
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_collective_payload_12n.c \
+    "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_collective_payload_12n
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_index_score.c \
     -lm -o test_glm53f_index_score
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_mhc_chain.c \

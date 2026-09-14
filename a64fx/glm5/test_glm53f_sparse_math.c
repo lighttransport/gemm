@@ -77,6 +77,24 @@ int main(void) {
             nh, nt, mismatch, ref_best * 1e3, candidate_best * 1e3, mismatch ? "FAIL" : "PASS");
         failed |= mismatch;
     }
+    float *packed = a256((size_t)TOKENS * LAT * sizeof(float));
+    float *part = a256((size_t)HEADS * 8 * LAT * sizeof(float));
+    for (int t = 0; t < TOKENS; ++t) {
+        selected[t] = (t * 37) % TOKENS;
+        memcpy(packed + (size_t)t * LAT, z + (size_t)selected[t] * LAT, LAT * sizeof(float));
+    }
+    for (int nh = 5; nh <= HEADS; ++nh) for (int j = 0; j < 5; ++j) {
+        int nt = lengths[j];
+        mla_heads_sharded(expected, q, packed, w, nt, nh, ql, log, part, va);
+#pragma omp parallel for schedule(static)
+        for (int h = 0; h < nh; ++h)
+            mla_one_sharded_indexed(actual + h * VD, q + h * KD, z,
+                w + (size_t)h * (KD + VD) * LAT, selected, nt);
+        int mismatch = memcmp(expected, actual, (size_t)nh * VD * sizeof(float)) != 0;
+        failed |= mismatch;
+        printf("MLA_SHARDED_INDEXED heads=%d selected=%d exact=%d\n", nh, nt, !mismatch);
+    }
+    free(part); free(packed);
     free(va); free(log); free(ql); free(actual); free(expected); free(w); free(z); free(q);
     return failed;
 }

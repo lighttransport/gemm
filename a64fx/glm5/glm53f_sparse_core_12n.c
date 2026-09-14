@@ -111,6 +111,50 @@ static int mla_heads_exact_parallel(float *out, const float *q, const float *z,
     return 0;
 }
 
+/* One independent query/head task, retaining the long-context eight-shard
+ * value reduction exactly. Indexed cache reads replace per-query 4 MiB packs;
+ * prefill parallelism comes from query/head tasks, not a changed sum tree. */
+static int mla_one_sharded_indexed(float *out, const float *q,
+        const float *cache, const uint16_t *w, const int *selected, int nt) {
+    enum { SHARDS = 8 };
+    float ql[LAT] = {0}, va[LAT], log[2052], part[SHARDS * LAT];
+    int vl = (int)svcntw();
+    for (int j = 0; j < KD; ++j) {
+        float x = q[j] / sqrtf((float)KD);
+        for (int d = 0; d < LAT; d += vl) {
+            svbool_t p = svwhilelt_b32(d, LAT);
+            svuint32_t b = svlsl_n_u32_x(p, svld1uh_u32(p, w + (size_t)j * LAT + d), 16);
+            svst1(p, ql + d, svmla_n_f32_x(p, svld1(p, ql + d), svreinterpret_f32_u32(b), x));
+        }
+    }
+    float mx = -INFINITY, sum = 0;
+    for (int t = 0; t < nt; ++t) log[t] = f32dot(ql, cache + (size_t)selected[t] * LAT, LAT);
+    for (int t = 0; t < nt; ++t) if (log[t] > mx) mx = log[t];
+    for (int t = 0; t < nt; ++t) { log[t] = expf(log[t] - mx); sum += log[t]; }
+    for (int t = 0; t < nt; ++t) log[t] /= sum;
+    for (int s = 0; s < SHARDS; ++s) {
+        float *pv = part + s * LAT;
+        memset(pv, 0, LAT * sizeof(float));
+        int begin = (int)((long long)nt * s / SHARDS);
+        int end = (int)((long long)nt * (s + 1) / SHARDS);
+        for (int t = begin; t < end; ++t) {
+            const float *z = cache + (size_t)selected[t] * LAT;
+            for (int d = 0; d < LAT; d += vl) {
+                svbool_t p = svwhilelt_b32(d, LAT);
+                svst1(p, pv + d, svmla_n_f32_x(p, svld1(p, pv + d), svld1(p, z + d), log[t]));
+            }
+        }
+    }
+    for (int d = 0; d < LAT; ++d) {
+        float v = 0;
+        for (int s = 0; s < SHARDS; ++s) v += part[s * LAT + d];
+        va[d] = v;
+    }
+    const uint16_t *wv = w + (size_t)KD * LAT;
+    for (int j = 0; j < VD; ++j) out[j] = bf16dot(wv + (size_t)j * LAT, va, LAT);
+    return 0;
+}
+
 static int mla_heads_sharded(float*out,const float*q,const float*z,const uint16_t*w,
         int nt,int nh,float*ql,float*log,float*part,float*va){enum{SHARDS=8};int vl=(int)svcntw();
 #pragma omp parallel

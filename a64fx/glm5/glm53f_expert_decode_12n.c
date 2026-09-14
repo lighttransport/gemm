@@ -17,6 +17,7 @@
 #include "glm53f_moe_stage_12n.h"
 #include "glm53f_collective_12n.h"
 #include "glm53f_int8.h"
+#include "glm53f_prefill.h"
 #include "../../common/glm53f_safetensors.h"
 #include "../../common/glm53f_ref.h"
 
@@ -204,7 +205,20 @@ struct glm53f_moe_stage_context_12n {
     int int8_enabled;
     int profile;
     double profile_phase[3];
+    unsigned long long occupancy[5]; /* 0, 1, 2-3, 4-7, >=8 tokens/expert. */
+    void *i8_prefill_storage;
 };
+
+static void moe_profile_occupancy(glm53f_moe_stage_context_12n *c,
+                                  const int *selected, int tokens) {
+    if (!c->profile || c->rank) return;
+    int count[NEXPERTS] = {0};
+    for (int i = 0; i < tokens * 8; ++i) ++count[selected[i]];
+    for (int e = 0; e < NEXPERTS; ++e) {
+        int n = count[e];
+        ++c->occupancy[n < 2 ? n : n < 4 ? 2 : n < 8 ? 3 : 4];
+    }
+}
 
 int glm53f_moe_stage_convert_int8_12n(glm53f_moe_stage_context_12n *c) {
     if (!c || c->int8_enabled || !c->shared_blob) return -1;
@@ -399,11 +413,11 @@ glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
         posix_memalign((void **)&c->batch_up, 256, (size_t)4 * 1024 * 4) ||
         posix_memalign((void **)&c->batch_activation, 256, (size_t)4 * 512 * 4) ||
         posix_memalign((void **)&c->batch_shared, 256, (size_t)4 * 4096 * 4) ||
-        posix_memalign((void **)&c->batch_local, 256, (size_t)32 * 4096 * 4) ||
-        posix_memalign((void **)&c->batch_router, 256, (size_t)32 * NEXPERTS * 4) ||
+        posix_memalign((void **)&c->batch_local, 256, (size_t)GLM53F_PREFILL_MAX_TOKENS * 4096 * 4) ||
+        posix_memalign((void **)&c->batch_router, 256, (size_t)GLM53F_PREFILL_MAX_TOKENS * NEXPERTS * 4) ||
         posix_memalign((void **)&c->batch_group_x, 256, (size_t)4 * 4096 * 4) ||
         posix_memalign((void **)&c->batch_routes, 256,
-                      (size_t)32 * 8 * 4096 * 4)) goto fail;
+                      (size_t)GLM53F_PREFILL_MAX_TOKENS * 8 * 4096 * 4)) goto fail;
     if (!rank) fprintf(stderr, "GLM53F_MOE_LOAD phase=router_read bytes=%zu\n", wn);
     for (int li = 0; li < layer_count; ++li) {
         char n[256];
@@ -440,13 +454,166 @@ int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_m
 #pragma omp parallel for schedule(static)
     for(int q=0;q<NEXPERTS/16;q++){int g=q/4,j=q%4;glm53f_i8_dot16(c->router_logits+q*16,c->router_i8+((size_t)li*NEXPERTS+g*64)*4096+j*64,c->router_i8_scale+(size_t)li*NEXPERTS+q*16,router_qx,router_xs,4096);}}glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);if(c->profile){c->profile_phase[0]+=MPI_Wtime()-t;t=MPI_Wtime();}int table_layer=c->active_layer-FIRST_LAYER;if(c->int8_enabled){if(moe_int8_local(c,c->scratch->local_output,x,c->router_i8?router_qx:NULL,router_xs,selected,route_weight,table_layer))return-1;if(c->profile){c->profile_phase[1]+=MPI_Wtime()-t;t=MPI_Wtime();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=MPI_Wtime()-t;return rc;}for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};part_weight[npart++]=route_weight[k];}if(c->shared_blob){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter,0,0};part_weight[npart++]=1.0f;}glm53f_moe_local_12n(c->scratch->local_output,part,part_weight,npart,x,c->scratch);if(c->profile){c->profile_phase[1]+=MPI_Wtime()-t;t=MPI_Wtime();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=MPI_Wtime()-t;return rc;}
 
-void glm53f_moe_stage_profile_reset_12n(glm53f_moe_stage_context_12n*c){if(c)memset(c->profile_phase,0,sizeof(c->profile_phase));}
-void glm53f_moe_stage_profile_report_12n(const glm53f_moe_stage_context_12n*c,long positions,const char*label){if(!c||!c->profile)return;double p[3];MPI_Reduce(c->profile_phase,p,3,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);if(!c->rank){double d=positions?positions:1;printf("GLM53F_MOE_PROFILE label=%s router=%.3f local=%.3f allreduce=%.3f ms_pos\n",label?label:"target",p[0]*1e3/d,p[1]*1e3/d,p[2]*1e3/d);}}
+void glm53f_moe_stage_profile_reset_12n(glm53f_moe_stage_context_12n *c) {
+    if (c) {
+        memset(c->profile_phase, 0, sizeof(c->profile_phase));
+        memset(c->occupancy, 0, sizeof(c->occupancy));
+    }
+}
+void glm53f_moe_stage_profile_report_12n(const glm53f_moe_stage_context_12n *c,
+                                        long positions, const char *label) {
+    if (!c || !c->profile) return;
+    double p[3], minimum[3];
+    MPI_Reduce(c->profile_phase,p,3,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    MPI_Reduce(c->profile_phase,minimum,3,MPI_DOUBLE,MPI_MIN,0,MPI_COMM_WORLD);
+    if (!c->rank) {
+        double d = positions ? positions : 1;
+        printf("GLM53F_MOE_PROFILE label=%s router=%.3f local=%.3f allreduce=%.3f ms_pos\n",
+               label?label:"target", p[0]*1e3/d, p[1]*1e3/d, p[2]*1e3/d);
+        printf("GLM53F_MOE_RANK_MIN label=%s router=%.3f local=%.3f allreduce=%.3f ms_pos\n",
+               label?label:"target", minimum[0]*1e3/d, minimum[1]*1e3/d, minimum[2]*1e3/d);
+        printf("GLM53F_MOE_OCCUPANCY empty=%llu one=%llu two_three=%llu four_seven=%llu eight_plus=%llu\n",
+               c->occupancy[0],c->occupancy[1],c->occupancy[2],c->occupancy[3],c->occupancy[4]);
+    }
+}
+/* One shared workspace for every routed layer. Group all expert panels before
+ * entering the team: unlike the previous grouped experiment, no expert or
+ * token pays a separate OpenMP launch. The shared expert is the final group. */
+static int moe_prefill_int8_local(glm53f_moe_stage_context_12n *c, float *out,
+        const float *x, int tokens, int table_layer, const int selected[][8],
+        const float route_weight[][8]) {
+    enum { H = 4096, MAX_SLOTS = GLM53F_PREFILL_MAX_TOKENS * 9 };
+    const size_t input_bytes = (size_t)GLM53F_PREFILL_MAX_TOKENS * H;
+    const size_t group_bytes = (size_t)MAX_SLOTS * H;
+    const size_t act_bytes = (size_t)MAX_SLOTS * 512;
+    const size_t up_bytes = (size_t)MAX_SLOTS * 1024 * sizeof(float);
+    const size_t bytes = input_bytes + group_bytes + act_bytes + up_bytes +
+        (GLM53F_PREFILL_MAX_TOKENS + 2 * MAX_SLOTS) * sizeof(float);
+    if (!c->i8_prefill_storage &&
+        posix_memalign(&c->i8_prefill_storage, 256, bytes)) return -1;
+    int8_t *qx = c->i8_prefill_storage, *gx = qx + input_bytes;
+    int8_t *ga = gx + group_bytes;
+    float *up = (float *)(ga + act_bytes);
+    float *xs = (float *)((unsigned char *)up + up_bytes);
+    float *gs = xs + GLM53F_PREFILL_MAX_TOKENS, *as = gs + MAX_SLOTS;
+    int counts[NEXPERTS + 1] = {0}, start[NEXPERTS + 2], cursor[NEXPERTS + 1];
+    int pos[MAX_SLOTS], slot[MAX_SLOTS], slots = 0, panels = 0, failed = 0;
+    const expert_offset *table = c->table + table_layer * NEXPERTS;
+    typedef struct {
+        const expert_offset *weight;
+        const unsigned char *blob;
+        int begin, count;
+    } panel_task;
+    panel_task task[MAX_SLOTS];
+    for (int t = 0; t < tokens; ++t)
+        for (int k = 0; k < 8; ++k)
+            if (table[selected[t][k]].gate_up != UINT64_MAX) ++counts[selected[t][k]];
+    counts[NEXPERTS] = tokens;
+    for (int e = 0; e <= NEXPERTS; ++e) {
+        cursor[e] = start[e] = slots;
+        slots += counts[e];
+    }
+    start[NEXPERTS + 1] = slots;
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < 8; ++k) {
+            int e = selected[t][k];
+            if (table[e].gate_up == UINT64_MAX) continue;
+            int s = cursor[e]++;
+            pos[s] = t; slot[s] = k;
+        }
+        int s = cursor[NEXPERTS]++;
+        pos[s] = t; slot[s] = 8;
+    }
+    for (int e = 0; e <= NEXPERTS; ++e)
+        for (int s = start[e]; s < start[e + 1]; s += 8) {
+            int n = start[e + 1] - s;
+            if (n > 8) n = 8;
+            task[panels++] = (panel_task){e == NEXPERTS ? c->shared + table_layer : table + e,
+                e == NEXPERTS ? c->shared_blob : c->blob, s, n};
+        }
+    memset(c->batch_routes, 0, (size_t)tokens * 8 * H * sizeof(float));
+#pragma omp parallel reduction(|:failed)
+    {
+#pragma omp for schedule(static)
+        for (int t = 0; t < tokens; ++t)
+            if (glm53f_i8_quantize_x(qx + (size_t)t * H, xs + t,
+                                     x + (size_t)t * H, H)) {
+                memset(qx + (size_t)t * H, 0, H); xs[t] = 0; failed = 1;
+            }
+#pragma omp for schedule(static)
+        for (int s = 0; s < slots; ++s) {
+            memcpy(gx + (size_t)s * H, qx + (size_t)pos[s] * H, H);
+            gs[s] = xs[pos[s]];
+        }
+#pragma omp for collapse(2) schedule(static)
+        for (int p = 0; p < panels; ++p)
+            for (int r = 0; r < 1024; r += 16) {
+                const panel_task *q = task + p;
+                const expert_offset *w = q->weight;
+                if (r >= 2 * w->inter) continue;
+                glm53f_i8_dot16_batch(up + (size_t)q->begin * 1024 + r, 1024,
+                    (const int8_t *)(q->blob + w->gate_up +
+                        (size_t)(r / 64) * 64 * H + (r % 64) * 4),
+                    w->i8_gate_scale + r, gx + (size_t)q->begin * H, H,
+                    gs + q->begin, q->count, H);
+            }
+#pragma omp for schedule(static)
+        for (int p = 0; p < panels; ++p) {
+            const panel_task *q = task + p;
+            int n = q->weight->inter;
+            for (int t = 0; t < q->count; ++t) {
+                int s = q->begin + t;
+                float act[512];
+                for (int i = 0; i < n; ++i) {
+                    float g = up[(size_t)s * 1024 + i];
+                    float u = up[(size_t)s * 1024 + n + i];
+                    if (g > 10) g = 10;
+                    if (g < -100) g = -100;
+                    if (u > 10) u = 10;
+                    if (u < -10) u = -10;
+                    act[i] = (g / (1 + expf(-g))) * u;
+                }
+                if (glm53f_i8_quantize_x(ga + (size_t)s * 512, as + s, act, n)) {
+                    memset(ga + (size_t)s * 512, 0, n); as[s] = 0; failed = 1;
+                }
+            }
+        }
+#pragma omp for collapse(2) schedule(static)
+        for (int p = 0; p < panels; ++p)
+            for (int r = 0; r < H; r += 16) {
+                const panel_task *q = task + p;
+                const expert_offset *w = q->weight;
+                float value[8 * 16];
+                glm53f_i8_dot16_batch(value, 16,
+                    (const int8_t *)(q->blob + w->down +
+                        (size_t)(r / 64) * 64 * w->inter + (r % 64) * 4),
+                    w->i8_down_scale + r, ga + (size_t)q->begin * 512, 512,
+                    as + q->begin, q->count, w->inter);
+                for (int t = 0; t < q->count; ++t) {
+                    int s = q->begin + t;
+                    float *dest = slot[s] == 8 ? c->batch_local + (size_t)pos[s] * H :
+                        c->batch_routes + ((size_t)pos[s] * 8 + slot[s]) * H;
+                    memcpy(dest + r, value + t * 16, 16 * sizeof(float));
+                }
+            }
+#pragma omp for schedule(static)
+        for (int q = 0; q < tokens * H; ++q) {
+            int t = q / H, i = q % H;
+            float sum = 0;
+            for (int k = 0; k < 8; ++k)
+                if (table[selected[t][k]].gate_up != UINT64_MAX)
+                    sum += route_weight[t][k] * c->batch_routes[((size_t)t * 8 + k) * H + i];
+            out[q] = sum + c->batch_local[q];
+        }
+    }
+    return failed ? -1 : 0;
+}
+
 static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
         const float *x, int tokens, int li, int table_layer) {
     enum { H = 4096, PANEL = 4 };
-    int selected[32][8];
-    float route_weight[32][8];
+    int selected[GLM53F_PREFILL_MAX_TOKENS][8];
+    float route_weight[GLM53F_PREFILL_MAX_TOKENS][8];
     double begin = c->profile ? MPI_Wtime() : 0.0;
     for (int base = 0; base < tokens; base += PANEL) {
         int n = tokens - base;
@@ -463,6 +630,7 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
         c->profile_phase[0] += MPI_Wtime() - begin;
         begin = MPI_Wtime();
     }
+    moe_profile_occupancy(c, &selected[0][0], tokens);
     memset(c->batch_routes, 0, (size_t)tokens * 8 * H * sizeof(float));
     for (int e = 0; e < NEXPERTS; ++e) {
         expert_offset *ep = &c->table[table_layer * NEXPERTS + e];
@@ -544,35 +712,74 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
 
 int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out,const float*x,int tokens){
     int li=c?c->active_layer-c->first_layer:-1,table_layer=c?c->active_layer-FIRST_LAYER:-1;
-    if(!c||!out||!x||tokens<1||tokens>32||li<0||li>=c->layer_count||!c->shared_blob)return-1;
+    if(!c||!out||!x||tokens<1||tokens>GLM53F_PREFILL_MAX_TOKENS||li<0||li>=c->layer_count||!c->shared_blob)return-1;
     if (tokens > 4 && !c->int8_enabled)
         return moe_prefill_grouped(c, out, x, tokens, li, table_layer);
     if (c->int8_enabled) {
+        int grouped = getenv("GLM53F_MOE_I8_GROUPED") &&
+                      atoi(getenv("GLM53F_MOE_I8_GROUPED"));
+        int router_prefill = tokens > 5 && getenv("GLM53F_MOE_ROUTER_PREFILL") &&
+                             atoi(getenv("GLM53F_MOE_ROUTER_PREFILL"));
         int batch_router = tokens > 1 && !c->router_i8 &&
-            getenv("GLM53F_MOE_I8_BATCH_ROUTER") &&
-            atoi(getenv("GLM53F_MOE_I8_BATCH_ROUTER"));
+            (grouped || router_prefill || (getenv("GLM53F_MOE_I8_BATCH_ROUTER") &&
+            atoi(getenv("GLM53F_MOE_I8_BATCH_ROUTER"))));
         if (batch_router) {
             double begin = c->profile ? MPI_Wtime() : 0.0;
-            int selected[32][8];
-            float route_weight[32][8];
+            int selected[GLM53F_PREFILL_MAX_TOKENS][8];
+            float route_weight[GLM53F_PREFILL_MAX_TOKENS][8];
             const uint16_t *router = c->router_w + (size_t)li * NEXPERTS * 4096;
-            for (int base = 0; base < tokens; base += 4) {
-                int n = tokens - base;
-                if (n > 4) n = 4;
+            if (router_prefill) {
+#pragma omp parallel
+                {
+#pragma omp for collapse(2) schedule(static)
+                    for (int r = 0; r < NEXPERTS; r += 4)
+                        for (int base = 0; base < tokens; base += 4) {
+                            int n = tokens - base;
+                            if (n > 4) n = 4;
+                            glm53f_matvec_bf16_4x4(
+                                c->batch_router + (size_t)base * NEXPERTS + r,
+                                NEXPERTS, router + (size_t)r * 4096,
+                                x + (size_t)base * 4096, n, 4096);
+                        }
+#pragma omp for schedule(static)
+                    for (int t = 0; t < tokens; ++t)
+                        glm53f_router_topk(c->batch_router + (size_t)t * NEXPERTS,
+                            c->router_bias + (size_t)li * NEXPERTS, NEXPERTS, 8,
+                            2.5f, selected[t], route_weight[t]);
+                }
+            } else {
+                for (int base = 0; base < tokens; base += 4) {
+                    int n = tokens - base;
+                    if (n > 4) n = 4;
 #pragma omp parallel for schedule(static)
-                for (int r = 0; r < NEXPERTS; r += 4)
-                    glm53f_matvec_bf16_4x4(
-                        c->batch_router + (size_t)base * NEXPERTS + r,
-                        NEXPERTS, router + (size_t)r * 4096,
-                        x + (size_t)base * 4096, n, 4096);
+                    for (int r = 0; r < NEXPERTS; r += 4)
+                        glm53f_matvec_bf16_4x4(
+                            c->batch_router + (size_t)base * NEXPERTS + r,
+                            NEXPERTS, router + (size_t)r * 4096,
+                            x + (size_t)base * 4096, n, 4096);
+                }
+                for (int t = 0; t < tokens; ++t)
+                    glm53f_router_topk(c->batch_router + (size_t)t * NEXPERTS,
+                        c->router_bias + (size_t)li * NEXPERTS, NEXPERTS, 8,
+                        2.5f, selected[t], route_weight[t]);
             }
-            for (int t = 0; t < tokens; ++t)
-                glm53f_router_topk(c->batch_router + (size_t)t * NEXPERTS,
-                    c->router_bias + (size_t)li * NEXPERTS, NEXPERTS, 8,
-                    2.5f, selected[t], route_weight[t]);
             if (c->profile) {
                 c->profile_phase[0] += MPI_Wtime() - begin;
                 begin = MPI_Wtime();
+            }
+            moe_profile_occupancy(c, &selected[0][0], tokens);
+            if (grouped) {
+                if (moe_prefill_int8_local(c, c->batch_local, x, tokens,
+                                           table_layer, selected, route_weight)) return -1;
+                if (c->profile) {
+                    c->profile_phase[1] += MPI_Wtime() - begin;
+                    begin = MPI_Wtime();
+                }
+                for (int t = 0; t < tokens; ++t)
+                    if (glm53f_sum_allreduce_12n(c->batch_local + (size_t)t * 4096,
+                                                 out + (size_t)t * 4096, 4096)) return -1;
+                if (c->profile) c->profile_phase[2] += MPI_Wtime() - begin;
+                return 0;
             }
             for (int t = 0; t < tokens; ++t) {
                 if (moe_int8_local(c, c->scratch->local_output,
@@ -671,7 +878,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
     for(int q=0;q<tokens*H;q++){int t=q/H,i=q-t*H;float v=0.0f;for(int k=0;k<counts[t];k++)v+=weights[t*MAXP+k]*y[((size_t)t*MAXP+k)*H+i];c->batch_local[q]=v+c->batch_shared[q];}
     int rc=glm53f_sum_allreduce_12n(c->batch_local,out,tokens*H);return rc;
 }
-void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;for(int l=0;l<NLAYERS;l++)free(c->int8_scales[l]);free(c->task_output);free(c->task_activation);free(c->task_up);free(c->batch_routes);free(c->batch_group_x);free(c->batch_router);free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_i8_scale);free(c->router_i8);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
+void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;free(c->i8_prefill_storage);for(int l=0;l<NLAYERS;l++)free(c->int8_scales[l]);free(c->task_output);free(c->task_activation);free(c->task_up);free(c->batch_routes);free(c->batch_group_x);free(c->batch_router);free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_i8_scale);free(c->router_i8);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
 
 #ifndef GLM53F_EXPERT_NO_MAIN
 int main(int argc, char **argv) {

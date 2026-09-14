@@ -18,9 +18,11 @@
 #include "glm53f_target_layer_12n.h"
 #include "glm53f_target_model_12n.h"
 #include "glm53f_collective_12n.h"
+#include "glm53f_state_io.h"
 
 enum { LAYERS = 45, HIDDEN = 4096, STREAMS = 4, FLAT = 16384, MIX = 24,
-       MAX_GENERATED_TOKENS = 32768, VERIFY_BATCH = 5, PREFILL_BATCH = 32,
+       MAX_GENERATED_TOKENS = 32768, VERIFY_BATCH = 5,
+       PREFILL_BATCH = GLM53F_PREFILL_MAX_TOKENS,
        KERNEL_BATCH = 4 };
 
 static void *a256(size_t bytes) {
@@ -94,6 +96,8 @@ struct glm53f_target_model_12n {
     float *streams;
     glm53f_target_layer_scratch_12n *batch_scratch;
     float *batch_streams, *batch_normalized, *batch_output;
+    glm53f_sparse_prefill_workspace_12n *sparse_prefill;
+    glm53f_state_io *trace;
     unsigned char *batch_state;
     size_t batch_state_stride;
     int profile, mhc_chained;
@@ -272,6 +276,8 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             target_hidden[i] = z / STREAMS;
         }
     }
+    if (m->trace && glm53f_state_io_bytes(m->trace, m->streams,
+            FLAT * sizeof(float), "hidden_streams")) return -1;
     int rc = glm53f_target_head_argmax_12n(
         m->head, m->streams, next_token, next_logit);
     if (m->profile) {
@@ -311,8 +317,10 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
                 getenv("GLM53F_KDA_WIDE_TILE") &&
                 atoi(getenv("GLM53F_KDA_WIDE_TILE"));
             for (int tile = 0; tile < tokens;
-                 tile += wide_kda ? tokens : KERNEL_BATCH) {
+                 tile += wide_kda ? GLM53F_PREFILL_ATTN_TOKENS : KERNEL_BATCH) {
                 int n = tokens - tile;
+                if (wide_kda && n > GLM53F_PREFILL_ATTN_TOKENS)
+                    n = GLM53F_PREFILL_ATTN_TOKENS;
                 if (!wide_kda && n > KERNEL_BATCH) n = KERNEL_BATCH;
                 if (glm53f_kda_sublayer_batch_capture_12n(
                         m->kda[l], m->batch_output + (size_t)tile * HIDDEN,
@@ -333,13 +341,21 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
             state_off += bytes;
         } else {
             int base = glm53f_sparse_length_12n(m->sparse[l]);
-            for (int tile = 0; tile < tokens; tile += KERNEL_BATCH) {
+            int wide_sparse = tokens > VERIFY_BATCH && getenv("GLM53F_SPARSE_PREFILL") &&
+                              atoi(getenv("GLM53F_SPARSE_PREFILL"));
+            if (wide_sparse && !m->sparse_prefill)
+                m->sparse_prefill = glm53f_sparse_prefill_workspace_create_12n();
+            int panel = wide_sparse ? GLM53F_PREFILL_ATTN_TOKENS : KERNEL_BATCH;
+            for (int tile = 0; tile < tokens; tile += panel) {
                 int n = tokens - tile;
-                if (n > KERNEL_BATCH) n = KERNEL_BATCH;
-                if (glm53f_sparse_sublayer_batch_12n(
+                if (n > panel) n = panel;
+                int rc = wide_sparse ? glm53f_sparse_prefill_12n(m->sparse[l],
+                    m->sparse_prefill, m->batch_output + (size_t)tile * HIDDEN,
+                    m->batch_normalized + (size_t)tile * HIDDEN, n) :
+                    glm53f_sparse_sublayer_batch_12n(
                         m->sparse[l], m->batch_output + (size_t)tile * HIDDEN,
-                        m->batch_normalized + (size_t)tile * HIDDEN, n))
-                    return -1;
+                        m->batch_normalized + (size_t)tile * HIDDEN, n);
+                if (rc) return -1;
             }
             if (after)
                 for (int t = 0; t < tokens; t++) {
@@ -431,6 +447,8 @@ batch_ffn_done:
             hidden[(size_t)t * HIDDEN + i] = z / STREAMS;
         }
     }
+    if (m->trace && glm53f_state_io_bytes(m->trace, m->batch_streams,
+            (size_t)tokens * FLAT * sizeof(float), "hidden_streams")) return -1;
     int rc = next ? glm53f_target_head_argmax_batch_12n(
         m->head, m->batch_streams, tokens, next, logit) : 0;
     if (m->profile) {
@@ -439,6 +457,41 @@ batch_ffn_done:
         m->batch_positions += tokens;
     }
     return rc;
+}
+
+int glm53f_target_trace_open_12n(glm53f_target_model_12n *m, const char *prefix, int compare) {
+    if (!m || !prefix || m->trace) return -1;
+    char path[1024];
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (snprintf(path, sizeof(path), "%s.rank%02d.bin", prefix, rank) >= (int)sizeof(path)) return -1;
+    glm53f_state_io *io = calloc(1, sizeof(*io));
+    if (!io) return -1;
+    io->compare = compare;
+    io->file = fopen(path, compare ? "rb" : "wbx");
+    if (!io->file) { perror(path); free(io); return -1; }
+    m->trace = io;
+    const uint64_t header[] = {UINT64_C(0x474c4d3533465452), 1, LAYERS, FLAT};
+    return glm53f_state_io_bytes(io, header, sizeof(header), "header");
+}
+
+int glm53f_target_trace_close_12n(glm53f_target_model_12n *m) {
+    if (!m || !m->trace) return -1;
+    glm53f_state_io *io = m->trace;
+    glm53f_target_snapshot_12n *s = glm53f_target_snapshot_create_12n(m);
+    int failed = !s || glm53f_target_snapshot_save_12n(m, s);
+    if (!failed) {
+        failed |= glm53f_state_io_bytes(io, s->kda_state, s->kda_bytes, "kda_state") != 0;
+        failed |= glm53f_state_io_bytes(io, s->sparse_length, sizeof(s->sparse_length), "sparse_lengths") != 0;
+        for (int l = 0; l < LAYERS; ++l)
+            if (m->sparse[l]) failed |= glm53f_sparse_state_io_12n(m->sparse[l], io) != 0;
+    }
+    glm53f_target_snapshot_free_12n(s);
+    if (io->compare) failed |= fgetc(io->file) != EOF || ferror(io->file);
+    else failed |= fflush(io->file) || fsync(fileno(io->file));
+    failed |= fclose(io->file) != 0 || io->failed;
+    free(io); m->trace = NULL;
+    return failed ? -1 : 0;
 }
 
 glm53f_target_snapshot_12n *glm53f_target_snapshot_create_12n(
@@ -464,6 +517,8 @@ void glm53f_target_profile_reset_12n(glm53f_target_model_12n *m) {
     memset(m->scalar_detail, 0, sizeof(m->scalar_detail));
     memset(m->batch_detail, 0, sizeof(m->batch_detail));
     glm53f_moe_stage_profile_reset_12n(m->moe);
+    for (int l = 0; l < LAYERS; ++l)
+        glm53f_sparse_profile_reset_12n(m->sparse[l]);
 }
 
 void glm53f_target_profile_report_12n(
@@ -480,6 +535,12 @@ void glm53f_target_profile_report_12n(
                MPI_COMM_WORLD);
     MPI_Reduce(m->batch_detail, batch_detail, 4, MPI_DOUBLE, MPI_MAX, 0,
                MPI_COMM_WORLD);
+    double sparse_local[GLM53F_SPARSE_PROFILE_PHASES] = {0};
+    double sparse_max[GLM53F_SPARSE_PROFILE_PHASES];
+    for (int l = 0; l < LAYERS; ++l)
+        glm53f_sparse_profile_add_12n(m->sparse[l], sparse_local);
+    MPI_Reduce(sparse_local, sparse_max, GLM53F_SPARSE_PROFILE_PHASES,
+               MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!rank) {
         double scalar_denom = m->scalar_steps ? m->scalar_steps : 1;
         double batch_denom = m->batch_positions ? m->batch_positions : 1;
@@ -509,12 +570,23 @@ void glm53f_target_profile_report_12n(
                batch_detail[2]*1e3/batch_denom,
                batch_detail[3]*1e3/batch_denom);
     }
+    if (!rank) {
+        double n = m->scalar_steps + m->batch_positions;
+        if (n < 1) n = 1;
+        printf("GLM53F_SPARSE_PROFILE label=%s front=%.3f index=%.3f "
+               "pack=%.3f mla=%.3f output=%.3f allreduce=%.3f cp_unsplit=%.3f ms_pos\n",
+               label ? label : "target", sparse_max[0]*1e3/n,
+               sparse_max[1]*1e3/n, sparse_max[2]*1e3/n, sparse_max[3]*1e3/n,
+               sparse_max[4]*1e3/n, sparse_max[5]*1e3/n, sparse_max[6]*1e3/n);
+    }
     glm53f_moe_stage_profile_report_12n(
         m->moe, m->scalar_steps ? m->scalar_steps : m->batch_positions, label);
 }
 
 void glm53f_target_model_free_12n(glm53f_target_model_12n *m) {
     if (!m) return;
+    glm53f_sparse_prefill_workspace_free_12n(m->sparse_prefill);
+    if (m->trace) { fclose(m->trace->file); free(m->trace); }
     free(m->batch_state); free(m->batch_output); free(m->batch_normalized);
     free(m->batch_streams); free(m->batch_scratch);
     free(m->streams); free(m->scratch);
@@ -575,6 +647,7 @@ static int read_token_ids(const char *path, int **ids_out, int *count_out) {
 int main(int argc, char **argv) {
     int rank, ranks, token, steps, generate = 0;
     int requested_capacity = 0, touch_cache = 0, load_only = 0, use_int8 = 0, int8_kda = 0, latent_bf16 = 0;
+    int prefill_chunk = 1;
     int *prompt_ids = NULL, *generated_ids = NULL, prompt_count = 0, generated = 0;
     const char *output_ids = NULL;
     glm53f_target_model_12n *model;
@@ -582,7 +655,7 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 4 || ranks != 12) {
-        if (!rank) fprintf(stderr,"usage: %s MODEL ROUTED_STAGE SHARED_STAGE [token=1] [steps=1] [OPTIONS]\n       %s MODEL ROUTED_STAGE SHARED_STAGE --generate PROMPT_IDS OUTPUT_IDS MAX_NEW [OPTIONS]\noptions: --capacity N --weight-format fp8|int8 --int8-kda --cache-format fp32|bf16 --touch-cache --load-only\n",argv[0],argv[0]);
+        if (!rank) fprintf(stderr,"usage: %s MODEL ROUTED_STAGE SHARED_STAGE [token=1] [steps=1] [OPTIONS]\n       %s MODEL ROUTED_STAGE SHARED_STAGE --generate PROMPT_IDS OUTPUT_IDS MAX_NEW [OPTIONS]\noptions: --capacity N --weight-format fp8|int8 --int8-kda --cache-format fp32|bf16 --touch-cache --load-only --prefill-chunk N (1..256, generate only)\n",argv[0],argv[0]);
         MPI_Abort(MPI_COMM_WORLD,2);
     }
     generate = argc >= 8 && !strcmp(argv[4], "--generate");
@@ -606,6 +679,13 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--touch-cache")) touch_cache = 1;
         else if (!strcmp(argv[i], "--load-only")) load_only = 1;
         else if (!strcmp(argv[i], "--int8-kda")) int8_kda = 1;
+        else if (!strcmp(argv[i], "--prefill-chunk") && i + 1 < argc) {
+            char *end;
+            long n = strtol(argv[++i], &end, 10);
+            if (!generate || !*argv[i] || *end || n < 1 || n > PREFILL_BATCH)
+                MPI_Abort(MPI_COMM_WORLD, 2);
+            prefill_chunk = (int)n;
+        }
         else if (!strcmp(argv[i], "--cache-format") && i + 1 < argc) {
             ++i;
             if (!strcmp(argv[i], "bf16")) latent_bf16 = 1;
@@ -665,7 +745,34 @@ int main(int argc, char **argv) {
     int completed_steps = 0;
     long run_minimum_kb = target_available_kb();
     MPI_Allreduce(MPI_IN_PLACE, &run_minimum_kb, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
-    for(int step=0;step<total_steps;step++){
+    int first_step = 0;
+    if (generate && prefill_chunk > 1) {
+        /* Last prompt token produces the first generated token, so it stays
+         * on the scalar path. Prompt-only tiles never request verifier state
+         * or a vocabulary head, and preserve the five-token verifier ABI. */
+        for (int base = 0; base < prompt_count - 1; base += prefill_chunk) {
+            int n = prompt_count - 1 - base;
+            if (n > prefill_chunk) n = prefill_chunk;
+            double tile_begin = MPI_Wtime();
+            if (glm53f_target_model_step_batch_12n(model, prompt_ids + base,
+                    n, NULL, NULL, NULL, NULL)) MPI_Abort(MPI_COMM_WORLD, 2);
+            prompt_elapsed += MPI_Wtime() - tile_begin;
+            completed_steps += n;
+            long available_kb = target_available_kb(), minimum_kb;
+            MPI_Allreduce(&available_kb, &minimum_kb, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
+            if (minimum_kb < run_minimum_kb) run_minimum_kb = minimum_kb;
+            if (minimum_kb < 2L * 1024 * 1024) MPI_Abort(MPI_COMM_WORLD, 3);
+            if (!rank && ((base + n) % 512 == 0 || base + n == prompt_count - 1)) {
+                printf("GLM53F_TARGET_PROMPT completed=%d total=%d chunk=%d tok_s=%.3f\n",
+                       base + n, prompt_count - 1, prefill_chunk, (base + n) / prompt_elapsed);
+                fflush(stdout);
+            }
+        }
+        first_step = prompt_count - 1;
+        token = prompt_ids[first_step];
+        glm53f_target_profile_report_12n(model, "prefill");
+    }
+    for(int step=first_step;step<total_steps;step++){
         double step_begin=MPI_Wtime();
         if(generate&&step==prompt_count-1){window_begin=step_begin;glm53f_target_profile_reset_12n(model);}
         float value;
@@ -700,11 +807,13 @@ int main(int argc, char **argv) {
         if (generate && step + 1 < prompt_count) token = prompt_ids[step + 1];
     }
     double elapsed=MPI_Wtime()-begin,max_elapsed;MPI_Reduce(&elapsed,&max_elapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    double local_phase_seconds[2] = {prompt_elapsed, decode_elapsed}, phase_seconds[2];
+    MPI_Reduce(local_phase_seconds, phase_seconds, 2, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if(!rank){
-        printf("GLM53F_TARGET_RUN_MEMORY sampled_min_MemAvailable_GiB=%.6f interval=32\n", run_minimum_kb / 1048576.0);
+        printf("GLM53F_TARGET_RUN_MEMORY sampled_min_MemAvailable_GiB=%.6f decode_interval=32 prefill_interval=%d\n", run_minimum_kb / 1048576.0, prefill_chunk > 1 ? prefill_chunk : 32);
         if(generate){FILE*f=fopen(output_ids,"w");if(!f)MPI_Abort(MPI_COMM_WORLD,2);for(int i=0;i<generated;i++)fprintf(f,"%d%c",generated_ids[i],i+1==generated?'\n':' ');fclose(f);}
         printf("GLM53F_TARGET_%s_12N steps=%d generated=%d capacity=%d ms_tok=%.3f tok_s=%.3f final_token=%d PASS\n",generate ? "GENERATE" : "DECODE",completed_steps,generate?generated:steps,capacity,max_elapsed*1e3/completed_steps,completed_steps/max_elapsed,token);
-        if(generate){printf("GLM53F_TARGET_TIMING prompt_tokens=%d prompt_tok_s=%.3f decode_tokens=%d decode_tok_s=%.3f\n",prompt_count-1,(prompt_count-1)/(prompt_elapsed?prompt_elapsed:1.0),generated,generated/(decode_elapsed?decode_elapsed:1.0));}
+        if(generate){printf("GLM53F_TARGET_TIMING prompt_tokens=%d prompt_tok_s=%.3f decode_tokens=%d decode_tok_s=%.3f\n",prompt_count-1,(prompt_count-1)/(phase_seconds[0]?phase_seconds[0]:1.0),generated,generated/(phase_seconds[1]?phase_seconds[1]:1.0));}
         const char *report=getenv("GLM53F_TARGET_REPORT");
         if(report&&*report){FILE *rf=fopen(report,"w");if(rf){fprintf(rf,"GLM53F_TARGET_DECODE_12N steps=%d capacity=%d ms_tok=%.3f tok_s=%.3f final_token=%d PASS\n",steps,capacity,max_elapsed*1e3/steps,steps/max_elapsed,token);fclose(rf);}}
     }

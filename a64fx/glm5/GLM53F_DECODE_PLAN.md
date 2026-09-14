@@ -330,7 +330,7 @@ target is **at least 100 prompt tokens/s on 12 A64FX nodes**, reported separatel
 from decode and with exact token/state agreement against the scalar step path.
 The current five-position verifier is only a decode-oriented microbatch: its
 public API caps chunks at five, sparse attention still advances positions
-serially, and layer 42 MoE plus 35 KDA layers repeatedly pay small-batch OpenMP
+serially, and the 42 MoE plus 34 KDA layers repeatedly pay small-batch OpenMP
 and collective overhead. It is not an adequate prefill architecture.
 
 Work in this order:
@@ -413,9 +413,10 @@ tok/s** and raises attention to 21.054 ms/position. Grouping INT8 routed
 experts by expert across the complete tile reaches only **32.003 tok/s** for
 64 positions: local expert time rises to 10.979 ms/position versus 7.533 ms
 for the existing scalar-INT8 loop, despite an identical state probe. A
-32-position all-reduce slab is also unsupported by the current uTofu
-registration path (initialization aborts at 131,072 floats); retain the proven
-four-position collective payload. The next substantial gain must therefore
+32-position all-reduce experiment also aborted while requesting 131,072
+floats, but that launch had confounded model/staging arguments and does not
+establish a registration limit. Retain the proven four-position collective
+payload pending an isolated check. The next substantial gain must therefore
 come from a true token-matrix INT8/FP8 kernel or attention redesign, not from
 larger orchestration tiles alone.
 
@@ -423,8 +424,8 @@ The next attention experiment keeps one OpenMP team alive across an entire
 32-position KDA tile. All independent Q/K/V, gate, beta, and output
 projections are computed as consecutive four-token arithmetic panels inside
 that team; causal convolution and recurrent state updates still advance one
-position at a time. The output remains reduced in four-position slabs because
-that is the validated uTofu registration limit. Gate this structural path with
+position at a time. The output remains reduced in the validated four-position
+slabs (not a demonstrated uTofu registration limit). Gate this structural path with
 `GLM53F_KDA_WIDE_TILE=1 GLM53F_KDA_BATCH_TEAM=1`, require an exact state probe,
 and retain it only if attention time improves against the 13.994 ms/position
 grouped-FP8 control and the 13.0 ms/position expert-INT8 runs.
@@ -500,7 +501,7 @@ The first fully optimized 8,192-position run sustains **30.416 tok/s**
 (269.333475 s). FFN remains flat at 11.639 ms/position, while attention grows
 from 10.544 ms at 512 positions to 16.265 ms at 8K; mHC is 5.005 ms. The cache
 uses 0.269 GiB/rank and the final probe completes normally. Add batch-profile
-separation for the 35 KDA and 11 sparse layers before the next kernel change,
+separation for the 34 KDA and 11 sparse layers before the next kernel change,
 then optimize the measured sparse selection/MLA component rather than fixed
 expert compute.
 
@@ -508,8 +509,269 @@ Batch-detail instrumentation confirms the short-context split at 512
 positions: KDA is 3.560 ms/position while only 11 sparse layers consume 7.069
 ms/position; dense FFN is 0.233 ms and MoE is 11.334 ms. The run reaches
 36.807 tok/s and retains the exact probe. Sparse attention is already twice
-the cost of all 35 KDA layers before the 8K growth, so the next profile must
+the cost of all 34 KDA layers before the 8K growth, so the next profile must
 split sparse causal front/selection+MLA, FP8 output projection, and reduction.
+
+#### Measured 100 tok/s redesign (implementation sequence)
+
+The 8K baseline is 269.333475 s / 8192 = 32.878 ms/token; 100 tok/s
+requires <=81.92 s, a 3.29x speedup. Attention alone cannot close this gap:
+even zero attention leaves 5.005 ms mHC + 11.639 ms FFN + 0.061 ms
+embedding, approximately 60 tok/s. Working budgets are 4 ms attention,
+4 ms FFN including communication, 1 ms mHC, and 0.5 ms other work. These
+are requirements, not measured or forecast performance. Profile components
+are independent rank maxima and must not be treated as one critical rank.
+
+Implement in bounded, separately gated steps:
+
+1. Split sparse timing into projection, selection, packing, MLA, output
+   projection, and reduction; repeat 8K before interpreting the 512-token
+   KDA/sparse split as a long-context profile. Record expert occupancy and
+   rank timing spread. Collective time includes rank-arrival imbalance.
+2. Raise prompt-only tiles to 256 independently of the five-token verifier.
+   Reuse model-owned scratch across layers, with <=256 MiB additional scratch
+   per rank, and retain chunk 32 as the control. Accept explicit input token
+   IDs as well as the historical synthetic prompt in the benchmark.
+3. Batch independent sparse projections and query/head MLA work after causal
+   selected lists are materialized. Preserve completed-pool eligibility,
+   selected order, and the existing eight-shard reduction above 2051 positions.
+   Do not allocate a selected-latent matrix for every token in a wide tile.
+   Keep KDA recurrence chronological while reusing projection weights.
+4. Group INT8 expert work across the wide tile. A uniform-routing estimate is
+   only 32*8/288=0.89 tokens/expert at tile 32, versus 7.11 at tile 256;
+   measure actual routing rather than assuming this distribution. Implement
+   16-row/eight-token SDOT with independent accumulation chains, a four-token
+   kernel, and scalar tails. Keep the existing activation quantization, exact
+   integer sums, top-k accumulation order, and shared expert last.
+5. Parallelize mHC over positions rather than retaining per-token barriers in
+   one team. Benchmark collective segments separately before changing the
+   proven payloads; the historical enlarged-registration failure is not a
+   demonstrated hardware limit without an isolated reproducer.
+
+Use a 12-node interactive remote allocation with staged `/local` weights,
+original attention/KDA weights, BF16 routing, load-time INT8 experts, and no
+MTP. Preserve scalar/small-tile fallbacks and the numerical contract. Validate
+full hidden/recurrent/cache state and selected indices, not just final probes;
+include four-token pool boundaries and 2051/2052 transitions. Compare tiles
+32/64/128/256 and three complete 8K runs on both synthetic IDs and the existing
+coding prompt. Claim 100+ only when both sustain it with safe memory and
+continuation checks. Report long-context/512K performance separately.
+
+The isolated profile was repeated on job 51646260 from a uniquely versioned
+source bundle (LLIO returned stale source at the original pathname). The
+updated chunk-32 control measures **30.507 tok/s** at 8192 positions, with
+the original probe unchanged. KDA is **3.539 ms/token**, sparse **12.606**;
+sparse components are front **4.330**, index/score exchange **2.713**, pack
+**0.659**, MLA **4.359**, output **0.313**, and output reduction **0.595**.
+This confirms that front projection, MLA, and index work all need attention.
+The eight-token INT8 matrix kernel passes native exact integer/scalar checks;
+microbenchmarks measure 5.995x gate/up and 5.708x down speedup. These are
+isolated kernel gains, not full-model throughput claims.
+
+The first 257-position whole-model differential sweep passes byte-for-byte
+comparison for chunk 256 alone, grouped INT8, token-parallel mHC, sparse
+prefill, and their combination. The diagnostic compares every token's final
+four hidden streams and all live recurrent, latent, index-key, gate, pool,
+and selected-index state on every rank; it does not rely on a checksum probe.
+The combined diagnostic run is 95.351 tok/s including trace I/O, not an 8K
+throughput claim. Expert local work drops from about 8.0 to 1.73 ms/token;
+mHC drops from about 5.1 to 0.59 ms/token. The real-weight isolated sparse
+test is byte-exact through position 2084 and improves 3.799x.
+
+The independently gated `GLM53F_KDA_PREFILL=1` (row/token projection
+work and head-owned chronological recurrence) and `GLM53F_SPARSE_INDEX_BATCH=1`
+(query/pool work across the sparse tile, preserving the baseline FP64-short /
+FP32-long index arithmetic and per-query collective) also pass the complete
+257-position byte-state comparison. The real-weight sparse test with the
+batched index passes every output, cache row and selected list through 2084
+positions, including the 2051/2052 arithmetic transition; its isolated speedup
+is 8.201x against the scalar-step sparse layer.
+
+Expose the same prompt-only scheduler to ordinary generation through an
+opt-in `--prefill-chunk N` (1..256, default 1). Process all but the last prompt
+token without vocabulary-head work; leave that last token and every generated
+token on the unchanged scalar decode path. Keep capacity and memory guards,
+and validate generated-ID equivalence against scalar prefill.
+
+#### Sustained prefill redesign measurements (2026-09-15)
+
+**The 100+ tok/s approximately-8K prefill target is met:** final three-run
+averages are **108.238 tok/s for 8192 synthetic tokens** and **106.765 tok/s
+for the 8050-token C++ stable-sort prompt**, with unchanged continuation
+probes. This is an 8K replicated-cache result, not a populated-512K result.
+
+Job **51646260**, 12 A64FX nodes, **2.0 GHz / eco_state=0** (PJM allocation),
+48 pinned OpenMP workers per node, LLVM 21
+`mpiclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp`; no fast-math.
+Weights are read from the rank-owned `/local` images, with routed/shared
+experts converted in place to INT8. Attention stays original FP8, KDA and
+router projections stay BF16. There is no MTP. All timing below excludes
+loading, state-trace I/O and the final continuation probe, and uses the
+maximum elapsed time across ranks. The average is total tokens / total time,
+not the arithmetic mean of per-run rates.
+
+| Input / configuration | Tokens per run | Seconds (three runs) | Average tok/s | Median tok/s |
+| --- | ---: | --- | ---: | ---: |
+| Synthetic, old chunk-32 control | 8192 | 268.525799 (one run) | 30.507 | — |
+| Synthetic, pre-router candidate | 8192 | 81.299423 / 80.835551 / 80.744536 | 101.186 | 101.342 |
+| Technical notes, pre-router candidate | 8192 | 81.525284 / 81.121505 / 81.038255 | 100.851 | 100.984 |
+| Synthetic, final chunk 256 | 8192 | 75.980862 / 75.501556 / 75.572098 | **108.238** | **108.400** |
+| C++ stable-sort task, final chunk 256 | 8050 | 75.639915 / 75.222847 / 75.334226 | **106.765** | **106.857** |
+
+The final synthetic result is **3.55x** the measured 30.507 tok/s control;
+every run is at least 107.817 tok/s. Its minimum sampled available memory
+is **3.838 GiB/rank**. The median-run phase maxima are mHC **0.557**,
+attention **5.011**, FFN **3.607**, and embedding **0.057 ms/token** (each
+phase is independently reduced across ranks). Attention remains above its
+initial 4 ms working budget, but the other reductions bring the complete
+prefill below the required 10 ms/token.
+
+The pre-router synthetic runs are **3.32x** the measured control and all
+three exceed 100 tok/s. All continuation probes exactly match the control:
+token `8004`, logit `5.28218365`, hidden sum `30.397819160949439`, RMS
+`1.9708149856442838`. Minimum sampled available memory is **3.840 GiB/rank**.
+Median-run phase maxima are mHC **0.558**, attention **5.001**, FFN **4.261**,
+and embedding **0.057 ms/token**. The dominant reductions were sparse
+attention (12.606 to about 2.31 ms/token), expert local compute (8.039 to
+1.696), and mHC (4.999 to 0.558).
+
+A three-repeat 512-token tile sweep measured median **90.900 / 100.354 /
+108.045 / 112.384 tok/s** for chunks **32 / 64 / 128 / 256**, respectively.
+The 8192-token `tmp/glm53f-512k-dev/prompt8192.ids` is the older technical-notes
+prompt, **not** the C++ sorting task (its exploratory log prefix misleadingly
+says `coding8192_v3`). Use the actual low-reasoning sorting prompt at
+`tmp/glm53f-quality-low-32k/prompt.ids`, **8050 tokens**, SHA-256
+`f13b3ff5ca0b9495ece0740d05ff743c14b8160732c68448cfb0f47c811d0dd2`,
+for the coding-workload acceptance check.
+
+The first sorting-prompt pass is **99.376 tok/s**, below the acceptance gate:
+FFN rises to 4.519 ms/token, including 0.769 ms routing and 1.962 ms local
+expert work. Next independently gate `GLM53F_MOE_ROUTER_PREFILL=1`: flatten
+the existing BF16 four-row/four-token router projections across the full
+tile inside one OpenMP team, then parallelize independent per-token top-k.
+Keep every dot product and top-k comparison unchanged. Require byte-state
+equivalence before repeating both approximately-8K workloads; do not round
+this initial coding result up to 100.
+
+The router follow-up passes all **ten** 257-position whole-state cases,
+including the independently gated router path, all optimizations together,
+and the single-token entry point. Its router phase is 0.098--0.101 ms/token
+versus 0.755--0.781 ms for the previous batched router in this diagnostic.
+The pre-router sorting candidate finishes three runs at 81.005766 /
+80.773696 / 80.754743 seconds: **99.574 tok/s average**, still below target.
+With that router enabled, the C++ task improves to **106.765 tok/s average**
+across three complete runs (106.425--107.015), **7.22%** faster than its
+pre-router control. All three continuation probes match the control exactly:
+token `553`, logit `16.4524746`, hidden sum `79.500898176804185`, RMS
+`0.80259146378972024`. Minimum sampled available memory is **3.857 GiB/rank**.
+
+These results use an approximately 8K replicated cache. The wide sparse path
+deliberately falls back to the existing context-parallel implementation for
+large capacities; **100 tok/s is not a 512K-capacity or populated-512K claim**.
+
+Reproduce inside the allocated 12-node job after the normal bounded staging
+and native build (`bash a64fx/glm5/build_glm53f_integrated_12n.sh`):
+
+```bash
+root=$PWD                         # repository root on the compute node
+job=${PJM_JOBID:?}
+export OMP_NUM_THREADS=48 OMP_DYNAMIC=false OMP_WAIT_POLICY=active
+export OMP_PROC_BIND=close OMP_PLACES=cores
+export GLM53F_UTOFU=1 TOFU_TOPO_PATH=$root/tmp/tofu_topo.$job.txt
+export GLM53F_REPACK_DIR=/local/glm53f-target-core-$job GLM53F_REPACK_REQUIRE=0
+export GLM53F_PROFILE=1 GLM53F_PREFILL_INT8=1
+export GLM53F_KDA_BATCH_TEAM=1 GLM53F_KDA_WIDE_TILE=1
+export GLM53F_MOE_I8_BATCH_ROUTER=1 GLM53F_SPARSE_BATCH_OP=2
+export GLM53F_MOE_I8_GROUPED=1 GLM53F_MHC_PREFILL=1
+export GLM53F_KDA_PREFILL=1 GLM53F_SPARSE_PREFILL=1 GLM53F_SPARSE_INDEX_BATCH=1
+export GLM53F_MOE_ROUTER_PREFILL=1
+bench=$root/a64fx/glm5/glm53f_prefill_12n
+mpiexec -np 12 "$bench" "$HOME/models/glm53f" \
+    /local/glm53f-target-routed-$job /local/glm53f-target-shared-$job \
+    8192 256 --repeats 3
+mpiexec -np 12 "$bench" "$HOME/models/glm53f" \
+    /local/glm53f-target-routed-$job /local/glm53f-target-shared-$job \
+    8050 256 --input-ids "$root/tmp/glm53f-quality-low-32k/prompt.ids" --repeats 3
+```
+
+`--chunk-sweep` compares 32/64/128/256 after one load. For a differential
+check, use `257 256 --sweep --state-out "$root/tmp/UNUSED_TRACE_PREFIX"`
+with repeats left at one: the first case writes a reference, the others
+compare all token outputs and persistent state byte-for-byte; these I/O runs
+are not speed measurements. `--state-check` accepts an existing trace.
+`--scalar-reference` uses the single-token entry point with the same numerical
+kernels, not an independent all-FP64 transformer implementation. The separate
+INT8 test includes an independent int64 oracle.
+
+Generation uses the same flags and the ordinary target executable with
+`--generate INPUT_IDS OUTPUT_IDS MAX_NEW --weight-format int8 --prefill-chunk 256`.
+Its default remains scalar prefill (`--prefill-chunk 1`). The new six tuning
+gates are independently disableable; all payloads retain their existing size.
+On a running LLIO allocation, do **not** overwrite previously read source or
+executable paths and assume the node sees the change: use a uniquely versioned
+source bundle and binary, and compare source SHA-256 values on login/compute.
+The pre-router measured builds are `tmp/glm53f-prefill-redesign/src-v3/` /
+`src-v4/` and `prefill_v3` / `prefill_v4`. The final router candidate is
+`src-v5/` / `prefill_v5`; no old executable was silently replaced.
+Final logs are `sort8050_v5.34.0` and `synth8192_v5.35.0` in that development
+directory. The full ten-case trace check is `sweep257_v5.33.0`; all cases
+match the older `state257_v2.rankNN.bin` reference. The final native build
+and test suite completed successfully; `git diff --check` and shell syntax
+checks pass. Compiler, source, and test artifacts remain available there.
+
+Validation completed before accepting the router follow-up:
+
+- Native `test_glm53f_int8_batch`: all 66 shape/tail cases are byte-exact
+  against the existing scalar-token kernel and the independent int64 oracle.
+- Native `test_glm53f_mhc_prefill`: all scratch and normalized outputs exact
+  for 1/3/4/5/31/32/64/128/256 positions.
+- Native `test_glm53f_sparse_math`: exact top-k, BF16 codec, MLA and indexed
+  eight-shard MLA checks pass for both five- and six-head ranks.
+- Twelve-rank `test_glm53f_sparse_prefill MODEL 2084`: every output/cache row
+  and per-query selected list exact, including partial-pool rollback with
+  changed inputs and the converted-INT8-attention fallback.
+- Eight INT8-expert 257-position A/B cases pass complete token-stream and
+  persistent-state comparison; a separate **single-token-entry-point** run
+  matches the same trace. Nine FP8 33-position cases also pass, including
+  the single-token entry point. These are inference-equivalence checks, not
+  new claims about the model's previously accepted generation quality.
+- The original five-token FP8 verifier and snapshot-continuation test passes;
+  all printed logits are identical.
+- Ordinary generation with a 257-token prefix from the C++ prompt produces
+  identical 16-token output ID files with scalar prefill and
+  `--prefill-chunk 256` (`cmp` passes). This checks the prompt/decode boundary,
+  not the completeness or compilation of a newly generated C++ answer.
+
+Additional steady explicit heap buffers versus the old chunk-32 implementation
+are approximately **100.864 MiB/rank at 8K**, at most **104.364 MiB/rank** in
+the default replicated-cache regime (capacity below 65536): target tile growth
+45.517 MiB, MoE tile growth 31.746
+MiB, grouped INT8 scratch 20.144 MiB, shared sparse workspace 2.958 MiB, and
+0.5--4 MiB score buffers. Score-buffer growth can briefly retain another
+2 MiB before releasing the previous allocation. The 34 KDA contexts retain their existing 32-token
+scratch; sparse scratch is shared across all eleven layers. These counts
+exclude allocator/thread-stack effects, so sampled `MemAvailable` is still
+the decisive safety check.
+
+The revised generation runner also passes full **524,288-position BF16-cache
+page commitment**, followed by a 257-token prompt and 16 decode steps. All
+eleven sparse layers use context parallelism; routed/shared experts are INT8
+and KDA remains BF16 (`int8_kda=0`). The cache is 1.017 GiB/rank, available
+memory after page touch is at least 3.439 GiB/rank, and the sampled run minimum
+is **3.187744 GiB/rank**. The short 256-position prompt-only phase is 57.076
+tok/s on the CP fallback, **not** the 100+ replicated-cache path. This certifies
+current capacity/scheduler safety, not 512K population, long-range quality,
+or 512K throughput. BF16 latent caching may change generated IDs, as before.
+
+The isolated twelve-rank collective test **successfully registers 131,072
+floats** and passes exact arithmetic at slabs 1/2/4/8/16/32, both without skew
+and with `(rank % 3) * 20 us` arrival skew per call. With no skew, measured
+wall time is 35.832 us/token at slab 1 and 22.627 at slab 32; with injected
+skew, 74.936 and 23.046. These are small standalone buffers with no model or
+active 48-worker teams. They disprove the historical registration-limit claim
+but do not predict integrated gains or establish bitwise equivalence for
+arbitrary FP32 inputs. **No model collective payload was changed** in this
+redesign; any future slab change needs its own whole-model state and timing A/B.
 
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
