@@ -445,6 +445,19 @@ KDA implementation. It removes repeated OpenMP team construction across the
 eight four-token panels but deliberately retains causal recurrence and
 four-token uTofu reductions.
 
+Next, test a persistent-team mHC prefill front end. The current batch routine
+creates a new OpenMP team for every token RMS reduction, every four-token
+24-row projection panel, and every token collapse. `GLM53F_MHC_BATCH_TEAM=1`
+will execute those same loops, schedules, and per-token reduction order inside
+one team per mHC pre call. Accept only a bit-identical 128-position probe and a
+measurable reduction from the current 5.0--6.2 ms/position mHC total.
+
+The candidate is bit-identical but rejected. With wide KDA and expert INT8,
+the 128-position persistent-team run measures **34.212 tok/s** and 5.797 ms
+mHC per position, versus **35.048 tok/s** and 5.040 ms for its same-allocation
+control. Barriers between the many low-row phases cost more than the removed
+team entries; keep the independently scheduled batch implementation.
+
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
 their validated existing size. The same allocation resumed the partial 22.25
