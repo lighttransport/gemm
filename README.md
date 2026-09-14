@@ -23,6 +23,10 @@ High-performance GEMM, FlashAttention kernels, and full LLM/VLM inference engine
 | SAM 3 | `ref/sam3/`, `cpu/sam3/`, `rdna4/sam3/`, `cuda/sam3/` | Concept-level (text + exemplar) promptable segmentation (Meta, 2025). |
 | [Pixal3D main](cpu/pixal3d/README.md) | `cpu/pixal3d/`, `cuda/pixal3d/`, `rdna4/pixal3d/`, `ref/pixal3d/` | Native single-view 1024-cascade shape and 4096 PBR GLB inference, with bounded GPU workspace. |
 
+The Pixal3D browser demo is provided by [`server/pixal3d`](server/pixal3d/README.md):
+`sh server/pixal3d/run.sh --backend cuda --port 8765`, then open
+<http://127.0.0.1:8765/>.
+
 See [VLM_LLM.md](VLM_LLM.md) for detailed VLM/LLM feature matrix, supported models, and TODOs.
 
 ## Supported Architectures
