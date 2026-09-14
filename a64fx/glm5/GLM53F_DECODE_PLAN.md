@@ -458,6 +458,25 @@ mHC per position, versus **35.048 tok/s** and 5.040 ms for its same-allocation
 control. Barriers between the many low-row phases cost more than the removed
 team entries; keep the independently scheduled batch implementation.
 
+The next sparse-layer experiment separates output-projection batching from
+collective batching. The earlier `GLM53F_SPARSE_BATCH_OP=1` path reused FP8
+output weights across four positions but regressed because its 16,384-float
+collective was slower than four 4,096-float reductions. Mode 2 will retain the
+four-token FP8 projection and restore one proven-size reduction per position.
+Require the same final state probe and a lower attention time before retaining
+this mode.
+
+Mode 2 passes. On job 51646260, the 128-position optimized control measures
+**34.829 tok/s** with 11.621 ms/position attention; mode 2 reaches **37.102
+tok/s** with 9.740 ms/position attention, a same-allocation 6.5% end-to-end
+gain and 16.2% attention reduction. Both probes are bit-identical: token 198,
+logit 5.63674068, hidden sum -47.380540531128645, and hidden RMS
+1.8783314756027496. The 512-position confirmation reaches **36.315 tok/s**
+(14.098822 s), with 5.032 ms mHC, 10.544 ms attention, and 11.993 ms FFN per
+position; its probe matches the earlier optimized 512 run exactly. Retain
+`GLM53F_SPARSE_BATCH_OP=2`; mode 1 remains rejected because it combines the
+projection with the slower enlarged collective.
+
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
 their validated existing size. The same allocation resumed the partial 22.25

@@ -438,7 +438,9 @@ int glm53f_sparse_sublayer_batch_12n(glm53f_sparse_context_12n *c,
         float *out, const float *x, int tokens) {
     if (!c || !out || !x || tokens < 1 || tokens > 5 || c->length + tokens > c->capacity)
         return -1;
-    if (!getenv("GLM53F_SPARSE_BATCH_OP") || !atoi(getenv("GLM53F_SPARSE_BATCH_OP"))) {
+    int batch_mode = getenv("GLM53F_SPARSE_BATCH_OP") ?
+                     atoi(getenv("GLM53F_SPARSE_BATCH_OP")) : 0;
+    if (!batch_mode) {
         for (int t = 0; t < tokens; t++)
             if (glm53f_sparse_sublayer_12n(c, out + (size_t)t * H, x + (size_t)t * H))
                 return -1;
@@ -461,6 +463,12 @@ int glm53f_sparse_sublayer_batch_12n(glm53f_sparse_context_12n *c,
                                    x + (size_t)t * H)) return -1;
     glm53f_mv_fp8_block128_bits_batch(c->batch_partial, c->op, c->ops,
                                      c->batch_attn, tokens, H, cols);
+    if (batch_mode == 2) {
+        for (int t = 0; t < tokens; ++t)
+            if (glm53f_sum_allreduce_12n(c->batch_partial + (size_t)t * H,
+                                         out + (size_t)t * H, H)) return -1;
+        return 0;
+    }
     return glm53f_sum_allreduce_12n(c->batch_partial, out, tokens * H);
 }
 void glm53f_sparse_free_12n(glm53f_sparse_context_12n*c){if(!c)return;for(int i=0;i<4;i++){free(c->int8_scale[i]);free(c->int8_weight[i]);}free(c->batch_partial);free(c->batch_attn);free(c->packed_index);free(c->packed);free(c->pool_score_global);free(c->pool_score_local);free(c->pool_score_cache);free(c->cp_candidate_gather);free(c->cp_candidate_local);free(c->cp_pack_index);free(c->cp_cur_gate);free(c->cp_cur_key);free(c->cp_cur_latent);free(c->cp_exchange);free(c->cp_gather);free(c->cp_pack);free(c->cp_pool);free(c->cp_gate);free(c->cp_key);free(c->cp_latent);free(c->apef);free(c->selected);free(c->partial);free(c->attn);free(c->pool);free(c->iw);free(c->iq);free(c->gcache);free(c->key);free(c->latent);free(c->query);free(c->qres);free(c->wp);free(c->wqb);free(c->ape);free(c->gatew);free(c->knb);free(c->knw);free(c->wk);free(c->ops);free(c->op);free(c->kvb);free(c->kvan);free(c->kvas);free(c->kva);free(c->qbs);free(c->qb);free(c->qan);free(c->qas);free(c->qa);free(c);}
