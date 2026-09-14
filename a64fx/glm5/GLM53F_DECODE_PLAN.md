@@ -477,6 +477,25 @@ position; its probe matches the earlier optimized 512 run exactly. Retain
 `GLM53F_SPARSE_BATCH_OP=2`; mode 1 remains rejected because it combines the
 projection with the slower enlarged collective.
 
+Next, isolate router batching for the expert-INT8 path. The current INT8 batch
+falls back to 32 complete scalar MoE calls and spends about 1.5 ms/position in
+the BF16 router. `GLM53F_MOE_I8_BATCH_ROUTER=1` will compute router logits in
+the already validated four-token BF16 matrix kernel, then retain the exact
+per-token top-k, INT8 expert computation, accumulation, and reduction order.
+The grouped-FP8 scheduler established that this router kernel can preserve the
+state probe; require the same gate here and a lower router profile time.
+
+The batched router is exact and cuts its isolated cost nearly in half. At 128
+positions the complete optimized path improves from **37.102 to 37.906 tok/s**
+and router time falls from 1.509 to 0.782 ms/position; the state probe is
+bit-identical. At 512 positions it reaches **36.387 tok/s**, versus 36.315
+tok/s without router batching, with router time 0.781 ms/position. The longer
+end-to-end delta is only 0.2% because local expert and all-reduce variation
+absorbs most of the saved router time. Retain
+`GLM53F_MOE_I8_BATCH_ROUTER=1` as an exact opt-in, but keep **36.315 tok/s** as
+the conservative sustained headline until a repeated 512 run shows a stable
+overall gain.
+
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
 their validated existing size. The same allocation resumed the partial 22.25

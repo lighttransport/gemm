@@ -548,6 +548,49 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
     if (tokens > 4 && !c->int8_enabled)
         return moe_prefill_grouped(c, out, x, tokens, li, table_layer);
     if (c->int8_enabled) {
+        int batch_router = tokens > 1 && !c->router_i8 &&
+            getenv("GLM53F_MOE_I8_BATCH_ROUTER") &&
+            atoi(getenv("GLM53F_MOE_I8_BATCH_ROUTER"));
+        if (batch_router) {
+            double begin = c->profile ? MPI_Wtime() : 0.0;
+            int selected[32][8];
+            float route_weight[32][8];
+            const uint16_t *router = c->router_w + (size_t)li * NEXPERTS * 4096;
+            for (int base = 0; base < tokens; base += 4) {
+                int n = tokens - base;
+                if (n > 4) n = 4;
+#pragma omp parallel for schedule(static)
+                for (int r = 0; r < NEXPERTS; r += 4)
+                    glm53f_matvec_bf16_4x4(
+                        c->batch_router + (size_t)base * NEXPERTS + r,
+                        NEXPERTS, router + (size_t)r * 4096,
+                        x + (size_t)base * 4096, n, 4096);
+            }
+            for (int t = 0; t < tokens; ++t)
+                glm53f_router_topk(c->batch_router + (size_t)t * NEXPERTS,
+                    c->router_bias + (size_t)li * NEXPERTS, NEXPERTS, 8,
+                    2.5f, selected[t], route_weight[t]);
+            if (c->profile) {
+                c->profile_phase[0] += MPI_Wtime() - begin;
+                begin = MPI_Wtime();
+            }
+            for (int t = 0; t < tokens; ++t) {
+                if (moe_int8_local(c, c->scratch->local_output,
+                        x + (size_t)t * 4096, NULL, 0.0f, selected[t],
+                        route_weight[t], table_layer)) return -1;
+                if (c->profile) {
+                    c->profile_phase[1] += MPI_Wtime() - begin;
+                    begin = MPI_Wtime();
+                }
+                if (glm53f_sum_allreduce_12n(c->scratch->local_output,
+                        out + (size_t)t * 4096, 4096)) return -1;
+                if (c->profile) {
+                    c->profile_phase[2] += MPI_Wtime() - begin;
+                    begin = MPI_Wtime();
+                }
+            }
+            return 0;
+        }
         for (int t = 0; t < tokens; ++t)
             if (glm53f_moe_stage_sublayer_12n(c, out + (size_t)t * 4096,
                                              x + (size_t)t * 4096)) return -1;
