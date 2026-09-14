@@ -396,6 +396,29 @@ one-row/eight-token FP8 kernel was rejected: it reduced throughput to 26.817
 tok/s and increased FFN to 18.027 ms/position because lower row efficiency
 outweighed the additional weight reuse.
 
+Load-time conversion of the routed and shared expert weights to the existing
+INT8 layout is now available to the prompt runner with
+`GLM53F_PREFILL_INT8=1`. Keep the router projection in BF16: enabling its
+separate INT8 conversion faults during the first layer, while the BF16-router
+configuration completes normally. At 512 positions and chunk 32, the latter
+measures **32.393 tok/s**, with 11.962 ms FFN per position (1.513 ms router,
+7.534 ms local expert compute, and 2.789 ms all-reduce). This is +9.9% over
+the exact grouped-FP8 result and +39.6% over the original 23.205 tok/s
+baseline. Its 64-position state probe produces token 271, logit 5.62643242,
+hidden sum -32.185017458163202, and hidden RMS 1.7271280070972912.
+
+Two follow-up INT8 batching experiments are rejected. Converting KDA weights
+and batching four SDOT projections reduces 128-position throughput to **24.330
+tok/s** and raises attention to 21.054 ms/position. Grouping INT8 routed
+experts by expert across the complete tile reaches only **32.003 tok/s** for
+64 positions: local expert time rises to 10.979 ms/position versus 7.533 ms
+for the existing scalar-INT8 loop, despite an identical state probe. A
+32-position all-reduce slab is also unsupported by the current uTofu
+registration path (initialization aborts at 131,072 floats); retain the proven
+four-position collective payload. The next substantial gain must therefore
+come from a true token-matrix INT8/FP8 kernel or attention redesign, not from
+larger orchestration tiles alone.
+
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
 their validated existing size. The same allocation resumed the partial 22.25

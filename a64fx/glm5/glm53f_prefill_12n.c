@@ -26,6 +26,10 @@ int main(int argc, char **argv) {
         argv[1], argv[2], argv[3], positions + 1);
     int *input = malloc((size_t)chunk * sizeof(*input));
     if (!m || !input) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (getenv("GLM53F_PREFILL_INT8") &&
+        atoi(getenv("GLM53F_PREFILL_INT8")) &&
+        glm53f_target_model_convert_int8_12n(m))
+        MPI_Abort(MPI_COMM_WORLD, 2);
     MPI_Barrier(MPI_COMM_WORLD);
     double begin = MPI_Wtime();
     for (int base = 0; base < positions; base += chunk) {
