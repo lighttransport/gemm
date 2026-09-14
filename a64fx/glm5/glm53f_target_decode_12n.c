@@ -99,7 +99,7 @@ struct glm53f_target_model_12n {
     int profile, mhc_chained;
     long scalar_steps, batch_calls, batch_positions;
     double scalar_phase[5], batch_phase[5];
-    double scalar_detail[4]; /* KDA, sparse, dense FFN, MoE. */
+    double scalar_detail[4], batch_detail[4]; /* KDA, sparse, dense FFN, MoE. */
 };
 struct glm53f_target_snapshot_12n {
     unsigned char *kda_state;
@@ -348,7 +348,11 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
                     after[t]->sparse_length[l] = base + t + 1;
                 }
         }
-        if (m->profile) m->batch_phase[2] += MPI_Wtime() - begin;
+        if (m->profile) {
+            double elapsed = MPI_Wtime() - begin;
+            m->batch_phase[2] += elapsed;
+            m->batch_detail[m->kda[l] ? 0 : 1] += elapsed;
+        }
         begin = m->profile ? MPI_Wtime() : 0.0;
         glm53f_mhc_post_batch_sve(m->batch_streams, m->batch_output,
                                   &m->batch_scratch[0].mhc, tokens,
@@ -398,7 +402,11 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
                 return -1;
         }
 batch_ffn_done:
-        if (m->profile) m->batch_phase[3] += MPI_Wtime() - begin;
+        if (m->profile) {
+            double elapsed = MPI_Wtime() - begin;
+            m->batch_phase[3] += elapsed;
+            m->batch_detail[l < 3 ? 2 : 3] += elapsed;
+        }
         begin = m->profile ? MPI_Wtime() : 0.0;
         glm53f_mhc_post_batch_sve(m->batch_streams, m->batch_output,
                                   &m->batch_scratch[0].mhc, tokens,
@@ -454,6 +462,7 @@ void glm53f_target_profile_reset_12n(glm53f_target_model_12n *m) {
     memset(m->scalar_phase, 0, sizeof(m->scalar_phase));
     memset(m->batch_phase, 0, sizeof(m->batch_phase));
     memset(m->scalar_detail, 0, sizeof(m->scalar_detail));
+    memset(m->batch_detail, 0, sizeof(m->batch_detail));
     glm53f_moe_stage_profile_reset_12n(m->moe);
 }
 
@@ -461,13 +470,15 @@ void glm53f_target_profile_report_12n(
         const glm53f_target_model_12n *m, const char *label) {
     if (!m || !m->profile) return;
     int rank;
-    double scalar[5], batch[5], detail[4];
+    double scalar[5], batch[5], detail[4], batch_detail[4];
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Reduce(m->scalar_phase, scalar, 5, MPI_DOUBLE, MPI_MAX, 0,
                MPI_COMM_WORLD);
     MPI_Reduce(m->batch_phase, batch, 5, MPI_DOUBLE, MPI_MAX, 0,
                MPI_COMM_WORLD);
     MPI_Reduce(m->scalar_detail, detail, 4, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
+    MPI_Reduce(m->batch_detail, batch_detail, 4, MPI_DOUBLE, MPI_MAX, 0,
                MPI_COMM_WORLD);
     if (!rank) {
         double scalar_denom = m->scalar_steps ? m->scalar_steps : 1;
@@ -491,6 +502,12 @@ void glm53f_target_profile_report_12n(
                batch[0]*1e3/batch_denom, batch[1]*1e3/batch_denom,
                batch[2]*1e3/batch_denom, batch[3]*1e3/batch_denom,
                batch[4]*1e3/batch_denom);
+        printf("GLM53F_TARGET_PROFILE_DETAIL label=%s kind=batch kda=%.3f "
+               "sparse=%.3f dense_ffn=%.3f moe=%.3f ms_pos\n",
+               label ? label : "target", batch_detail[0]*1e3/batch_denom,
+               batch_detail[1]*1e3/batch_denom,
+               batch_detail[2]*1e3/batch_denom,
+               batch_detail[3]*1e3/batch_denom);
     }
     glm53f_moe_stage_profile_report_12n(
         m->moe, m->scalar_steps ? m->scalar_steps : m->batch_positions, label);

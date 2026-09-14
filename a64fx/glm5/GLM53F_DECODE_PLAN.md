@@ -496,6 +496,21 @@ absorbs most of the saved router time. Retain
 the conservative sustained headline until a repeated 512 run shows a stable
 overall gain.
 
+The first fully optimized 8,192-position run sustains **30.416 tok/s**
+(269.333475 s). FFN remains flat at 11.639 ms/position, while attention grows
+from 10.544 ms at 512 positions to 16.265 ms at 8K; mHC is 5.005 ms. The cache
+uses 0.269 GiB/rank and the final probe completes normally. Add batch-profile
+separation for the 35 KDA and 11 sparse layers before the next kernel change,
+then optimize the measured sparse selection/MLA component rather than fixed
+expert compute.
+
+Batch-detail instrumentation confirms the short-context split at 512
+positions: KDA is 3.560 ms/position while only 11 sparse layers consume 7.069
+ms/position; dense FFN is 0.233 ms and MoE is 11.334 ms. The run reaches
+36.807 tok/s and retains the exact probe. Sparse attention is already twice
+the cost of all 35 KDA layers before the 8K growth, so the next profile must
+split sparse causal front/selection+MLA, FP8 output projection, and reduction.
+
 The long interrupted `/local` deployment also exposed a development-cost
 problem. Rank-image staging now resumes stable per-rank temporary files from
 their validated existing size. The same allocation resumed the partial 22.25
