@@ -28,7 +28,7 @@ TARGET = test_hip_llm
 QWEN38_MODEL ?= /mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 QSA_MOE_CACHE_MB ?= 128
 
-.PHONY: all clean run api profile-test bench-256k target-gate target-gate-fast target-gate-batch target-gate-4k hipblaslt-status qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda help
+.PHONY: all clean run api gsq gsq-target iq2-bw profile-test bench-256k target-gate target-gate-fast target-gate-batch target-gate-4k hipblaslt-status qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda help
 
 all: $(TARGET)
 
@@ -104,6 +104,15 @@ run: $(TARGET)
 
 api: $(TARGET)
 	@echo "Usage: python3 codex_server.py <model.gguf> [--port 8080] [--context 4096]"
+
+gsq: $(TARGET)
+	./run_qwen38_gsq_rocm.sh
+
+gsq-target: $(TARGET)
+	./bench_qwen38_gsq_decode.sh
+
+iq2-bw: $(TARGET)
+	./bench_iq2_matvec_bw.sh
 
 profile-test:
 	./test_qwen38_profiles.sh

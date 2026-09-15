@@ -31,6 +31,24 @@ typedef enum {
     HIP_LLM_MOE_GPU_STREAM,
 } hip_llm_moe_mode;
 
+typedef enum {
+    HIP_LLM_KV_AUTO = 0,
+    HIP_LLM_KV_F32,
+    HIP_LLM_KV_F16,
+} hip_llm_kv_cache_type;
+
+typedef enum {
+    HIP_LLM_DECODE_KERNEL_DEFAULT = 0,
+    HIP_LLM_DECODE_KERNEL_NATIVE,
+    HIP_LLM_DECODE_KERNEL_DP4A2,
+    HIP_LLM_DECODE_KERNEL_AUTO,
+} hip_llm_decode_kernel_mode;
+
+typedef enum {
+    HIP_LLM_DECODE_LAYOUT_NATIVE = 0,
+    HIP_LLM_DECODE_LAYOUT_AUTO_REPACK,
+} hip_llm_decode_layout_mode;
+
 typedef struct {
     uint32_t struct_size;
     int max_seq_len;              /* <= 0: model default */
@@ -41,6 +59,11 @@ typedef struct {
     uint64_t gpu_reserve_bytes;   /* 0: default 1 GiB */
     int qwen4_prefill_staging;    /* opt-in two-tier Qwen4 batched prefill */
     uint64_t qwen4_prefill_stage_bytes; /* 0: 512 MiB when staging is enabled */
+    hip_llm_kv_cache_type kv_cache_type;
+    hip_llm_decode_kernel_mode decode_kernel_mode;
+    hip_llm_decode_layout_mode decode_layout_mode;
+    const char *decode_layout_cache_path; /* borrowed for the duration of load */
+    uint64_t decode_layout_budget_bytes;
 } hip_llm_load_options;
 
 typedef struct {

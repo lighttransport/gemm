@@ -788,15 +788,17 @@ static const char *hip_kernel_source =
 "__device__ __forceinline__ int dp4a_hw(int a, int b, int c) {\n"
 "    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);\n"
 "}\n"
+"__device__ static const unsigned int signmask4_dev[16] = {\n"
+"    0x00000000u, 0x000000ffu, 0x0000ff00u, 0x0000ffffu,\n"
+"    0x00ff0000u, 0x00ff00ffu, 0x00ffff00u, 0x00ffffffu,\n"
+"    0xff000000u, 0xff0000ffu, 0xff00ff00u, 0xff00ffffu,\n"
+"    0xffff0000u, 0xffff00ffu, 0xffffff00u, 0xffffffffu\n"
+"};\n"
 "/* Build a packed int8x4 from 4 uint8 grid magnitudes, negating byte k when\n"
 "   sign bit (base+k) of sb is set (matches the scalar IQ sign convention). */\n"
 "__device__ __forceinline__ int apply_sign4(unsigned int g, unsigned int sb, int base) {\n"
-"    int r = 0; signed char *o = (signed char *)&r; const unsigned char *gb = (const unsigned char *)&g;\n"
-"    o[0] = (sb & (1u << (base+0))) ? -(int)gb[0] : (int)gb[0];\n"
-"    o[1] = (sb & (1u << (base+1))) ? -(int)gb[1] : (int)gb[1];\n"
-"    o[2] = (sb & (1u << (base+2))) ? -(int)gb[2] : (int)gb[2];\n"
-"    o[3] = (sb & (1u << (base+3))) ? -(int)gb[3] : (int)gb[3];\n"
-"    return r;\n"
+"    unsigned int m = signmask4_dev[(sb >> base) & 15u];\n"
+"    return (int)((g ^ m) + (m & 0x01010101u));\n"
 "}\n"
 "/* ---- quantize_q8_32: F32 vector -> int8 per-32-block + fp32 scale ---- */\n"
 "/* grid = n/32 blocks, blockDim 32 (one warp per 32-element block).          */\n"
@@ -813,6 +815,28 @@ static const char *hip_kernel_source =
 "        q = q > 127 ? 127 : (q < -127 ? -127 : q);\n"
 "        qs[idx] = (signed char)q;\n"
 "    }\n"
+"}\n"
+"/* Two-term Q8 expansion: x ~= s0*q0 + s1*q1.  Quantizing the residual\n"
+" * cuts activation error to second order while preserving int8 DP4A dots. */\n"
+"__global__ void quantize_q8x2_32(signed char *q0, float *s0, signed char *q1,\n"
+"                                  float *s1, const float *x, int n) {\n"
+"    int g = blockIdx.x, lane = threadIdx.x, idx = g * 32 + lane;\n"
+"    float v = (idx < n) ? x[idx] : 0.0f;\n"
+"    float a = fabsf(v);\n"
+"    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_down(a, o));\n"
+"    a = __shfl(a, 0);\n"
+"    float d0 = a / 127.0f, inv0 = a > 0.0f ? 127.0f / a : 0.0f;\n"
+"    int z0 = (int)rintf(v * inv0);\n"
+"    z0 = z0 > 127 ? 127 : (z0 < -127 ? -127 : z0);\n"
+"    float r = v - d0 * (float)z0;\n"
+"    float ar = fabsf(r);\n"
+"    for (int o = 16; o > 0; o >>= 1) ar = fmaxf(ar, __shfl_down(ar, o));\n"
+"    ar = __shfl(ar, 0);\n"
+"    float d1 = ar / 127.0f, inv1 = ar > 0.0f ? 127.0f / ar : 0.0f;\n"
+"    int z1 = (int)rintf(r * inv1);\n"
+"    z1 = z1 > 127 ? 127 : (z1 < -127 ? -127 : z1);\n"
+"    if (lane == 0) { s0[g] = d0; s1[g] = d1; }\n"
+"    if (idx < n) { q0[idx] = (signed char)z0; q1[idx] = (signed char)z1; }\n"
 "}\n"
 
 "/* Canonical GGML-compatible Q8_K/Q8_1 activation staging for the exact\n"
@@ -1775,6 +1799,24 @@ static const char *hip_kernel_source =
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
 "    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_q2_K_dp4a2(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*(blockDim.x/32)+warp;\n"
+"    if(row>=n_rows)return;int nb=n_cols/256,G=nb*4;float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*84;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>2,gi=g&3,n0=gi>>1,half=gi&1;\n"
+"      const unsigned char *bp=rp+b*84,*sc=bp,*qs=bp+16+n0*32+half*16;\n"
+"      float d=half_to_float(*(const half_raw*)(bp+80)),dm=half_to_float(*(const half_raw*)(bp+82));\n"
+"      for(int j=0;j<4;++j){unsigned char sv=sc[n0*8+j*2+half];float dl=d*(float)(sv&15),ml=dm*(float)(sv>>4);\n"
+"        int shift=j*2,qb=b*8+n0*4+j;const signed char *p0=q0+(size_t)qb*32+half*16;\n"
+"        const signed char *p1=q1+(size_t)qb*32+half*16;int z0=0,z1=0,t0=0,t1=0;\n"
+"        for(int t=0;t<4;++t){int k=t*4;int w=((qs[k]>>shift)&3)|(((qs[k+1]>>shift)&3)<<8)|(((qs[k+2]>>shift)&3)<<16)|(((qs[k+3]>>shift)&3)<<24);\n"
+"          z0=dp4a_hw(w,((const int*)p0)[t],z0);z1=dp4a_hw(w,((const int*)p1)[t],z1);}\n"
+"        for(int t=0;t<16;++t){t0+=(int)p0[t];t1+=(int)p1[t];}\n"
+"        sum+=dl*(s0[qb]*(float)z0+s1[qb]*(float)z1)-ml*(s0[qb]*(float)t0+s1[qb]*(float)t1);}}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
 "}\n"
 "/* ---- 15. matvec_q3_K_f32: Q3_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q3_K block: 110 bytes = hmask[32] + qs[64] + scales[12] + d(f16), 256 elements */\n"
@@ -3220,34 +3262,35 @@ static const char *hip_kernel_source =
 "                                     int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 66;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    int G = nb * 32;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5; int rem = g & 31; int ib32 = rem >> 2; int l = rem & 3;\n"
 "        const unsigned char *bp = row_ptr + b * 66;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
-"        const float *xb = x + b * 256;\n"
-"        float partial = 0.0f;\n"
-"        int yi = 0;\n"
-"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
-"            unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
-"            unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
-"            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
-"            const unsigned char *aux8 = (const unsigned char *)&aux0;\n"
-"            for (int l = 0; l < 4; l++) {\n"
-"                const unsigned char *grid = (const unsigned char *)&iq2xxs_grid_dev[aux8[l]];\n"
-"                unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
-"                for (int j = 0; j < 8; j++) {\n"
-"                    float w = db * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
-"                    partial += w * xb[yi++];\n"
-"                }\n"
-"            }\n"
-"        }\n"
-"        sum += partial;\n"
+"        unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
+"        unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
+"        float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"        unsigned int grid_idx = (aux0 >> (8 * l)) & 255;\n"
+"        const unsigned char *grid = (const unsigned char *)&iq2xxs_grid_dev[grid_idx];\n"
+"        unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
+"        const float *xb = x + b * 256 + ib32 * 32 + l * 8;\n"
+"        float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;\n"
+"        p0 += (float)grid[0] * ((signs &   1) ? -xb[0] : xb[0]);\n"
+"        p1 += (float)grid[1] * ((signs &   2) ? -xb[1] : xb[1]);\n"
+"        p2 += (float)grid[2] * ((signs &   4) ? -xb[2] : xb[2]);\n"
+"        p3 += (float)grid[3] * ((signs &   8) ? -xb[3] : xb[3]);\n"
+"        p0 += (float)grid[4] * ((signs &  16) ? -xb[4] : xb[4]);\n"
+"        p1 += (float)grid[5] * ((signs &  32) ? -xb[5] : xb[5]);\n"
+"        p2 += (float)grid[6] * ((signs &  64) ? -xb[6] : xb[6]);\n"
+"        p3 += (float)grid[7] * ((signs & 128) ? -xb[7] : xb[7]);\n"
+"        sum += db * ((p0 + p1) + (p2 + p3));\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
@@ -4384,32 +4427,36 @@ static const char *hip_kernel_source =
 "                                    int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 136;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    int groups = nb * 8;\n"
+"    for (int g = lane; g < groups; g += 32) {\n"
+"        int b = g >> 3, ib = g & 7;\n"
 "        const unsigned char *bp = row_ptr + b * 136;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        unsigned short scales_h = *(const unsigned short *)(bp + 2);\n"
 "        const unsigned char *scales_l = bp + 4;\n"
-"        const unsigned char *qs = bp + 8;\n"
-"        const float *xb = x + b * 256;\n"
-"        float partial = 0.0f;\n"
-"        for (int ib = 0; ib < 8; ib++) {\n"
-"            int ls = ((scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((scales_h >> 2*ib) & 3) << 4);\n"
-"            float dl = d * (float)(ls - 32);\n"
-"            for (int j = 0; j < 16; j++) {\n"
-"                float v0 = dl * (float)kvalues_iq4nl_dev[qs[j] & 0xf];\n"
-"                float v1 = dl * (float)kvalues_iq4nl_dev[qs[j] >>  4];\n"
-"                partial += v0 * xb[j] + v1 * xb[j + 16];\n"
-"            }\n"
-"            xb += 32;\n"
-"            qs += 16;\n"
+"        const unsigned char *qs = bp + 8 + ib * 16;\n"
+"        const float *xb = x + b * 256 + ib * 32;\n"
+"        int ls = ((scales_l[ib/2] >> (4*(ib%2))) & 0xf) |\n"
+"                 (((scales_h >> (2*ib)) & 3) << 4);\n"
+"        float dl = d * (float)(ls - 32);\n"
+"        float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;\n"
+"        for (int j = 0; j < 16; j += 4) {\n"
+"            p0 += (float)kvalues_iq4nl_dev[qs[j+0] & 0xf] * xb[j+0]\n"
+"                + (float)kvalues_iq4nl_dev[qs[j+0] >> 4] * xb[j+16];\n"
+"            p1 += (float)kvalues_iq4nl_dev[qs[j+1] & 0xf] * xb[j+1]\n"
+"                + (float)kvalues_iq4nl_dev[qs[j+1] >> 4] * xb[j+17];\n"
+"            p2 += (float)kvalues_iq4nl_dev[qs[j+2] & 0xf] * xb[j+2]\n"
+"                + (float)kvalues_iq4nl_dev[qs[j+2] >> 4] * xb[j+18];\n"
+"            p3 += (float)kvalues_iq4nl_dev[qs[j+3] & 0xf] * xb[j+3]\n"
+"                + (float)kvalues_iq4nl_dev[qs[j+3] >> 4] * xb[j+19];\n"
 "        }\n"
-"        sum += partial;\n"
+"        sum += dl * ((p0 + p1) + (p2 + p3));\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
@@ -4421,33 +4468,36 @@ static const char *hip_kernel_source =
 "                                    int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int rows_per_block = blockDim.x / 32;\n"
+"    int row = blockIdx.x * rows_per_block + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 74;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    /* One lane per 8-value codebook group.  The old block-per-lane loop\n"
+"     * activated only nb lanes (20/32 for Qwen3.8's 5120-wide projections)\n"
+"     * and decoded all 32 groups serially in each active lane. */\n"
+"    int groups = nb * 32;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int g = lane; g < groups; g += 32) {\n"
+"        int b = g >> 5;\n"
+"        int rem = g & 31;\n"
+"        int ib32 = rem >> 2;\n"
+"        int l = rem & 3;\n"
 "        const unsigned char *bp = row_ptr + b * 74;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
 "        const unsigned char *scales = bp + 2 + 64;  /* 8 scale bytes at end */\n"
-"        const float *xb = x + b * 256;\n"
+"        const float *xb = x + b * 256 + ib32 * 32 + l * 8;\n"
 "        float partial = 0.0f;\n"
-"        int yi = 0;\n"
-"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
-"            float db0 = d * (0.5f + (float)(scales[ib32] & 0xf)) * 0.25f;\n"
-"            float db1 = d * (0.5f + (float)(scales[ib32] >>  4)) * 0.25f;\n"
-"            for (int l = 0; l < 4; l++) {\n"
-"                float dl = (l < 2) ? db0 : db1;\n"
-"                unsigned short qval = qs[4*ib32 + l];\n"
-"                const unsigned char *grid = (const unsigned char *)&iq2xs_grid_dev[qval & 511];\n"
-"                unsigned char signs = ksigns_iq2xs_dev[qval >> 9];\n"
-"                for (int j = 0; j < 8; j++) {\n"
-"                    float w = dl * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
-"                    partial += w * xb[yi++];\n"
-"                }\n"
-"            }\n"
+"        float dl = d * (0.5f + (float)((l < 2) ?\n"
+"            (scales[ib32] & 0xf) : (scales[ib32] >> 4))) * 0.25f;\n"
+"        unsigned short qval = qs[4 * ib32 + l];\n"
+"        const unsigned char *grid = (const unsigned char *)&iq2xs_grid_dev[qval & 511];\n"
+"        unsigned char signs = ksigns_iq2xs_dev[qval >> 9];\n"
+"        for (int j = 0; j < 8; j++) {\n"
+"            float w = dl * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
+"            partial += w * xb[j];\n"
 "        }\n"
 "        sum += partial;\n"
 "    }\n"
@@ -4492,7 +4542,7 @@ static const char *hip_kernel_source =
 "                                     int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 98;\n"
@@ -4628,7 +4678,8 @@ static const char *hip_kernel_source =
 "                                   int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int rows_per_block = blockDim.x / 32;\n"
+"    int row = blockIdx.x * rows_per_block + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 82;\n"
@@ -4649,10 +4700,15 @@ static const char *hip_kernel_source =
 "        const unsigned char *grid = (const unsigned char *)&iq2s_grid_dev[grid_idx];\n"
 "        unsigned char s = bp[34 + ib32 * 4 + l];\n"
 "        const float *xb = x + b * 256 + ib32 * 32 + l * 8;\n"
-"        float partial = 0.0f;\n"
-"        for (int j = 0; j < 8; j++)\n"
-"            partial += db * (float)grid[j] * ((s & (1 << j)) ? -1.0f : 1.0f) * xb[j];\n"
-"        sum += partial;\n"
+"        float p0 = (float)grid[0] * ((s &   1) ? -xb[0] : xb[0]);\n"
+"        float p1 = (float)grid[1] * ((s &   2) ? -xb[1] : xb[1]);\n"
+"        float p2 = (float)grid[2] * ((s &   4) ? -xb[2] : xb[2]);\n"
+"        float p3 = (float)grid[3] * ((s &   8) ? -xb[3] : xb[3]);\n"
+"        p0 += (float)grid[4] * ((s &  16) ? -xb[4] : xb[4]);\n"
+"        p1 += (float)grid[5] * ((s &  32) ? -xb[5] : xb[5]);\n"
+"        p2 += (float)grid[6] * ((s &  64) ? -xb[6] : xb[6]);\n"
+"        p3 += (float)grid[7] * ((s & 128) ? -xb[7] : xb[7]);\n"
+"        sum += db * ((p0 + p1) + (p2 + p3));\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
@@ -4666,7 +4722,7 @@ static const char *hip_kernel_source =
 "                                   int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 110;\n"
@@ -4937,6 +4993,42 @@ static const char *hip_kernel_source =
 "    int row = blockIdx.x * 8 + warp_id; if (row >= n_rows) return;\n"
 "    IQ3S_DP4A_BODY\n"
 "}\n"
+"__global__ void matvec_iq3_s_dp4a2(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 110, G = nb * 16;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int gg = lane; gg < G; gg += 32) {\n"
+"        int ibg = gg >> 1, half = gg & 1, b = ibg >> 3, ib = ibg & 7;\n"
+"        const unsigned char *bp = rp + b * 110;\n"
+"        float dw = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2 + ib * 8;\n"
+"        const unsigned char *sg = bp + 74 + ib * 4;\n"
+"        unsigned char qh = bp[66 + ib], sc = bp[106 + (ib >> 1)];\n"
+"        int ls = (ib & 1) ? ((sc >> 4) & 15) : (sc & 15);\n"
+"        int qb = b * 8 + ib;\n"
+"        const int *u0 = (const int *)(q0 + (size_t)qb * 32);\n"
+"        const int *u1 = (const int *)(q1 + (size_t)qb * 32);\n"
+"        int z0 = 0, z1 = 0;\n"
+"        for (int t = 0; t < 2; ++t) {\n"
+"            int l = half * 4 + t * 2;\n"
+"            unsigned int gx = iq3s_grid_dev[qs[l] | ((qh << (8-l)) & 0x100)];\n"
+"            unsigned int gy = iq3s_grid_dev[qs[l+1] | ((qh << (7-l)) & 0x100)];\n"
+"            unsigned char sb = sg[l >> 1];\n"
+"            int w0 = apply_sign4(gx, sb, 0), w1 = apply_sign4(gy, sb, 4);\n"
+"            z0 = dp4a_hw(w0, u0[l], z0); z0 = dp4a_hw(w1, u0[l+1], z0);\n"
+"            z1 = dp4a_hw(w0, u1[l], z1); z1 = dp4a_hw(w1, u1[l+1], z1);\n"
+"        }\n"
+"        float act_dot = s0[qb] * (float)z0 + s1[qb] * (float)z1;\n"
+"        sum += dw * (float)(1 + 2*ls) * act_dot;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
 "__global__ void matvec_iq3_s_expert_dp4a(float *dst, const unsigned char *base,\n"
 "                                         const signed char *xq, const float *xs,\n"
 "                                         int n_rows, int n_cols,\n"
@@ -4978,15 +5070,149 @@ static const char *hip_kernel_source =
 "                                  const signed char *xq, const float *xs,\n"
 "                                  int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id; if (row >= n_rows) return;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id; if (row >= n_rows) return;\n"
 "    IQ2S_DP4A_BODY\n"
+"}\n"
+"__global__ void matvec_iq2_s_dp4a2(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 82, G = nb * 16;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int gg = lane; gg < G; gg += 32) {\n"
+"        int ibg = gg >> 1, half = gg & 1, b = ibg >> 3, ib = ibg & 7;\n"
+"        const unsigned char *bp = rp + b * 82;\n"
+"        float dw = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2 + ib * 4;\n"
+"        const unsigned char *sg = bp + 34 + ib * 4;\n"
+"        unsigned char qh = bp[66 + ib], sc = bp[74 + ib];\n"
+"        int ls = half ? (sc >> 4) : (sc & 15);\n"
+"        int qb = b * 8 + ib;\n"
+"        const int *u0 = (const int *)(q0 + (size_t)qb * 32);\n"
+"        const int *u1 = (const int *)(q1 + (size_t)qb * 32);\n"
+"        int z0 = 0, z1 = 0;\n"
+"        for (int t = 0; t < 2; ++t) {\n"
+"            int l = half * 2 + t;\n"
+"            int idx = qs[l] | ((qh << (8 - 2*l)) & 0x300);\n"
+"            const int *gp = (const int *)&iq2s_grid_dev[idx];\n"
+"            int w0 = apply_sign4(gp[0], sg[l], 0);\n"
+"            int w1 = apply_sign4(gp[1], sg[l], 4);\n"
+"            z0 = dp4a_hw(w0, u0[l*2], z0); z0 = dp4a_hw(w1, u0[l*2+1], z0);\n"
+"            z1 = dp4a_hw(w0, u1[l*2], z1); z1 = dp4a_hw(w1, u1[l*2+1], z1);\n"
+"        }\n"
+"        float act_dot = s0[qb] * (float)z0 + s1[qb] * (float)z1;\n"
+"        sum += dw * 0.25f * ((float)ls + 0.5f) * act_dot;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq2_xxs_dp4a2(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 66, G = nb * 8;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int qb = lane; qb < G; qb += 32) {\n"
+"        int b = qb >> 3, ib = qb & 7;\n"
+"        const unsigned char *bp = rp + b * 66;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        unsigned int a0 = qs[4*ib] | ((unsigned int)qs[4*ib+1] << 16);\n"
+"        unsigned int a1 = qs[4*ib+2] | ((unsigned int)qs[4*ib+3] << 16);\n"
+"        const int *u0 = (const int *)(q0 + (size_t)qb * 32);\n"
+"        const int *u1 = (const int *)(q1 + (size_t)qb * 32);\n"
+"        int z0 = 0, z1 = 0;\n"
+"        for (int l = 0; l < 4; ++l) {\n"
+"            unsigned long long gv = iq2xxs_grid_dev[(a0 >> (8*l)) & 255];\n"
+"            unsigned char sb = ksigns_iq2xs_dev[(a1 >> (7*l)) & 127];\n"
+"            int w0 = apply_sign4((unsigned int)gv, sb, 0);\n"
+"            int w1 = apply_sign4((unsigned int)(gv >> 32), sb, 4);\n"
+"            z0 = dp4a_hw(w0, u0[l*2], z0); z0 = dp4a_hw(w1, u0[l*2+1], z0);\n"
+"            z1 = dp4a_hw(w0, u1[l*2], z1); z1 = dp4a_hw(w1, u1[l*2+1], z1);\n"
+"        }\n"
+"        float ad = s0[qb] * (float)z0 + s1[qb] * (float)z1;\n"
+"        sum += d * (0.5f + (float)(a1 >> 28)) * 0.25f * ad;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq3_xxs_dp4a2(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 98, G = nb * 8;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int qb = lane; qb < G; qb += 32) {\n"
+"        int b = qb >> 3, sb = qb & 7;\n"
+"        const unsigned char *bp = rp + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = __builtin_nontemporal_load((const unsigned int *)(bp + 66 + 4*sb));\n"
+"        const int *u0 = (const int *)(q0 + (size_t)qb * 32);\n"
+"        const int *u1 = (const int *)(q1 + (size_t)qb * 32);\n"
+"        int z0 = 0, z1 = 0;\n"
+"        for (int l = 0; l < 4; ++l) {\n"
+"            unsigned char sg = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"            int w0 = apply_sign4(iq3xxs_grid_dev[qs[8*sb+2*l]], sg, 0);\n"
+"            int w1 = apply_sign4(iq3xxs_grid_dev[qs[8*sb+2*l+1]], sg, 4);\n"
+"            z0 = dp4a_hw(w0, u0[2*l], z0); z0 = dp4a_hw(w1, u0[2*l+1], z0);\n"
+"            z1 = dp4a_hw(w0, u1[2*l], z1); z1 = dp4a_hw(w1, u1[2*l+1], z1);\n"
+"        }\n"
+"        float ad = s0[qb] * (float)z0 + s1[qb] * (float)z1;\n"
+"        sum += d * (0.5f + (float)(aux >> 28)) * 0.5f * ad;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq2_xs_dp4a2(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 74, G = nb * 8;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int qb = lane; qb < G; qb += 32) {\n"
+"        int b = qb >> 3, ib = qb & 7;\n"
+"        const unsigned char *bp = rp + b * 74;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        unsigned char sc = bp[66 + ib];\n"
+"        const int *u0 = (const int *)(q0 + (size_t)qb * 32);\n"
+"        const int *u1 = (const int *)(q1 + (size_t)qb * 32);\n"
+"        float block_sum = 0.0f;\n"
+"        for (int l = 0; l < 4; ++l) {\n"
+"            unsigned short qv = qs[4*ib+l];\n"
+"            unsigned long long gv = iq2xs_grid_dev[qv & 511];\n"
+"            unsigned char sb = ksigns_iq2xs_dev[qv >> 9];\n"
+"            int w0 = apply_sign4((unsigned int)gv, sb, 0);\n"
+"            int w1 = apply_sign4((unsigned int)(gv >> 32), sb, 4);\n"
+"            int z0 = dp4a_hw(w0, u0[l*2], 0); z0 = dp4a_hw(w1, u0[l*2+1], z0);\n"
+"            int z1 = dp4a_hw(w0, u1[l*2], 0); z1 = dp4a_hw(w1, u1[l*2+1], z1);\n"
+"            float ls = 0.5f + (float)(l < 2 ? (sc & 15) : (sc >> 4));\n"
+"            block_sum += ls * (s0[qb] * (float)z0 + s1[qb] * (float)z1);\n"
+"        }\n"
+"        sum += d * 0.25f * block_sum;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "__global__ void matvec_iq2_s_expert_dp4a(float *dst, const unsigned char *base,\n"
 "                                         const signed char *xq, const float *xs,\n"
 "                                         int n_rows, int n_cols,\n"
 "                                         const int *eidx, int slot, long long stride) {\n"
 "    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id; if (row >= n_rows) return;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id; if (row >= n_rows) return;\n"
 "    const unsigned char *mat = base + (long long)eidx[slot] * stride;\n"
 "    IQ2S_DP4A_BODY\n"
 "}\n"
@@ -6423,35 +6649,34 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 
-"/* Warp-specialized IQ1_S matvec. Two lanes cooperate on each 256-value\n"
-" * block, keeping all 32 lanes useful for the common 4096-wide projections. */\n"
+"/* Warp-specialized IQ1_S matvec. Assign one lane to each 8-value grid\n"
+" * group so metadata decode and the short dot products run in parallel. */\n"
 "__global__ void matvec_iq1_s_warp_f32(float *dst, const unsigned char *mat,\n"
 "                                   const float *x, int n_rows, int n_cols) {\n"
 "    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
-"    int row = blockIdx.x * 8 + warp;\n"
+"    int row = blockIdx.x * (blockDim.x >> 5) + warp;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256, row_bytes = nb * 50;\n"
 "    float sum = 0.0f;\n"
 "    const float delta0 = 0.125f;\n"
-"    for (int b = lane >> 1; b < nb; b += 16) {\n"
+"    int ng = nb * 32;\n"
+"    for (int g = lane; g < ng; g += 32) {\n"
+"        int b = g >> 5, rem = g & 31;\n"
+"        int ib = rem >> 2, l = rem & 3;\n"
 "        const unsigned char *bp = mat + (size_t)row * row_bytes + b * 50;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned char *qs0 = bp + 2;\n"
 "        const unsigned short *qh = (const unsigned short *)(bp + 34);\n"
 "        const float *xb = x + b * 256;\n"
-"        int ib0 = (lane & 1) * 4;\n"
-"        for (int ib = ib0; ib < ib0 + 4; ++ib) {\n"
-"            float dl = d * (float)(2 * ((qh[ib] >> 12) & 7) + 1);\n"
-"            float delta = (qh[ib] & 0x8000) ? -delta0 : delta0;\n"
-"            const unsigned char *qs = qs0 + ib * 4;\n"
-"            for (int l = 0; l < 4; ++l) {\n"
-"                int grid_idx = qs[l] | (((qh[ib] >> (3 * l)) & 7) << 8);\n"
-"                const signed char *grid = (const signed char *)&iq1s_grid_dev[grid_idx];\n"
-"                int base = ib * 32 + l * 8;\n"
-"                for (int j = 0; j < 8; ++j)\n"
-"                    sum += dl * ((float)grid[j] + delta) * xb[base + j];\n"
-"            }\n"
-"        }\n"
+"        float dl = d * (float)(2 * ((qh[ib] >> 12) & 7) + 1);\n"
+"        float delta = (qh[ib] & 0x8000) ? -delta0 : delta0;\n"
+"        int grid_idx = qs0[ib * 4 + l] | (((qh[ib] >> (3 * l)) & 7) << 8);\n"
+"        const signed char *grid = (const signed char *)&iq1s_grid_dev[grid_idx];\n"
+"        int base = ib * 32 + l * 8;\n"
+"        float dot = 0.0f;\n"
+"        for (int j = 0; j < 8; ++j)\n"
+"            dot += ((float)grid[j] + delta) * xb[base + j];\n"
+"        sum += dl * dot;\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
@@ -6546,6 +6771,30 @@ static const char *hip_kernel_source =
 "        sum+=d*xscale[b]*(dot+delta*(float)sumq);}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
 "}\n"
+"/* Two-term accurate IQ1_S DP4A.  The affine delta is applied to each Q8\n"
+" * term's integer activation sum before the corresponding scale. */\n"
+"__global__ void matvec_iq1_s_dp4a2(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*(blockDim.x/32)+warp;\n"
+"    if(row>=n_rows)return;int nb=n_cols/256,qblocks=n_cols/32;float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*50;\n"
+"    for(int b=lane;b<qblocks;b+=32){int block=b>>3,ib=b&7;\n"
+"      const unsigned char *bp=rp+block*50;const unsigned short *qh=(const unsigned short*)(bp+34);\n"
+"      const unsigned char *qs=bp+2;float dw=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1);\n"
+"      float delta=(qh[ib]&0x8000)?-0.125f:0.125f;const int *u0=(const int*)(q0+(size_t)b*32);\n"
+"      const int *u1=(const int*)(q1+(size_t)b*32);int z0=0,z1=0,t0=0,t1=0;\n"
+"      for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);\n"
+"        const signed char *g=(const signed char*)&iq1s_grid_dev[gi];\n"
+"        int w0=((int)g[0]&255)|(((int)g[1]&255)<<8)|(((int)g[2]&255)<<16)|(((int)g[3]&255)<<24);\n"
+"        int w1=((int)g[4]&255)|(((int)g[5]&255)<<8)|(((int)g[6]&255)<<16)|(((int)g[7]&255)<<24);\n"
+"        z0=dp4a_hw(w0,u0[l*2],z0);z0=dp4a_hw(w1,u0[l*2+1],z0);\n"
+"        z1=dp4a_hw(w0,u1[l*2],z1);z1=dp4a_hw(w1,u1[l*2+1],z1);\n"
+"        const signed char *p0=(const signed char*)&u0[l*2],*p1=(const signed char*)&u1[l*2];\n"
+"        for(int j=0;j<8;++j){t0+=(int)p0[j];t1+=(int)p1[j];}}\n"
+"      sum+=dw*(s0[b]*((float)z0+delta*(float)t0)+s1[b]*((float)z1+delta*(float)t1));}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
+"}\n"
 "/* Fused IQ1_S gate/up projection and SiLU product for one expert. */\n"
 "__global__ void ffn_gate_up_silu_iq1_s_mw(float *dst,const unsigned char *gate,\n"
 "        const unsigned char *up,const float *x,int rows,int cols){\n"
@@ -6586,16 +6835,18 @@ static const char *hip_kernel_source =
 "/* ---- matvec_iq1_m_f32: IQ1_M matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq1_m_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 56;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
 "    const float IQ1S_DELTA = 0.125f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    int G = nb * 32;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5; int rem = g & 31; int ib = rem >> 2; int l = rem & 3;\n"
 "        const unsigned char *bp = row_ptr + b * 56;\n"
 "        /* block_iq1_m layout: qs(32) + qh(16) + scales(8) */\n"
 "        const unsigned char *qs = bp;\n"
@@ -6604,44 +6855,44 @@ static const char *hip_kernel_source =
 "        /* Reconstruct f16 scale from 4 stolen nibbles */\n"
 "        unsigned short scale_u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0u) | ((sc[2] >> 4) & 0x0f00u) | (sc[3] & 0xf000u);\n"
 "        float d = half_to_float(*(const half_raw *)&scale_u16);\n"
-"        const float *xb = x + b * 256;\n"
-"        float partial = 0.0f;\n"
-"        int yi = 0;\n"
-"        for (int ib = 0; ib < 8; ib++) {\n"
-"            float dl1 = d * (float)(2*((sc[ib/2] >> (6*(ib%2)+0)) & 0x7) + 1);\n"
-"            float dl2 = d * (float)(2*((sc[ib/2] >> (6*(ib%2)+3)) & 0x7) + 1);\n"
-"            unsigned short idx0 = qs[0] | ((unsigned short)(qh[0] << 8) & 0x700u);\n"
-"            unsigned short idx1 = qs[1] | ((unsigned short)(qh[0] << 4) & 0x700u);\n"
-"            unsigned short idx2 = qs[2] | ((unsigned short)(qh[1] << 8) & 0x700u);\n"
-"            unsigned short idx3 = qs[3] | ((unsigned short)(qh[1] << 4) & 0x700u);\n"
-"            float delta0 = (qh[0] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;\n"
-"            float delta1 = (qh[0] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;\n"
-"            float delta2 = (qh[1] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;\n"
-"            float delta3 = (qh[1] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;\n"
-"            const signed char *g0 = (const signed char *)&iq1s_grid_dev[idx0];\n"
-"            const signed char *g1 = (const signed char *)&iq1s_grid_dev[idx1];\n"
-"            const signed char *g2 = (const signed char *)&iq1s_grid_dev[idx2];\n"
-"            const signed char *g3 = (const signed char *)&iq1s_grid_dev[idx3];\n"
-"            for (int j = 0; j < 8; j++) partial += dl1 * ((float)g0[j] + delta0) * xb[yi++];\n"
-"            for (int j = 0; j < 8; j++) partial += dl1 * ((float)g1[j] + delta1) * xb[yi++];\n"
-"            for (int j = 0; j < 8; j++) partial += dl2 * ((float)g2[j] + delta2) * xb[yi++];\n"
-"            for (int j = 0; j < 8; j++) partial += dl2 * ((float)g3[j] + delta3) * xb[yi++];\n"
-"            qs += 4; qh += 2;\n"
-"        }\n"
-"        sum += partial;\n"
+"        unsigned short sw = sc[ib/2];\n"
+"        int shift = 6*(ib%2) + (l >= 2 ? 3 : 0);\n"
+"        float dl = d * (float)(2*((sw >> shift) & 0x7) + 1);\n"
+"        unsigned char qhv = qh[2*ib + (l >> 1)];\n"
+"        int qshift = (l & 1) ? 4 : 8;\n"
+"        unsigned short idx = qs[4*ib + l] | ((unsigned short)(qhv << qshift) & 0x700u);\n"
+"        float delta = (qhv & ((l & 1) ? 0x80 : 0x08)) ? -IQ1S_DELTA : IQ1S_DELTA;\n"
+"        const signed char *grid = (const signed char *)&iq1s_grid_dev[idx];\n"
+"        const float *xb = x + b * 256 + ib * 32 + l * 8;\n"
+"        for (int j = 0; j < 8; j++) sum += dl * ((float)grid[j] + delta) * xb[j];\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
-"    __shared__ float ws_iq1m[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws_iq1m[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) total += ws_iq1m[w];\n"
-"        dst[row] = total;\n"
-"    }\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq1_m_dp4a2(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*(blockDim.x/32)+warp;\n"
+"    if(row>=n_rows)return;int nb=n_cols/256,G=nb*32;float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*56;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,rem=g&31,ib=rem>>2,l=rem&3,qb=b*8+ib;\n"
+"      const unsigned char *bp=rp+b*56,*qs=bp,*qh=bp+32;const unsigned short *sc=(const unsigned short*)(bp+48);\n"
+"      unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"      float d=half_to_float(*(const half_raw*)&su);unsigned short sw=sc[ib/2];\n"
+"      int shift=6*(ib%2)+(l>=2?3:0);float dl=d*(float)(2*((sw>>shift)&7)+1);\n"
+"      unsigned char hv=qh[2*ib+(l>>1)];int qshift=(l&1)?4:8;\n"
+"      unsigned short idx=qs[4*ib+l]|((unsigned short)(hv<<qshift)&0x700u);\n"
+"      float delta=(hv&((l&1)?0x80:0x08))?-0.125f:0.125f;\n"
+"      const signed char *grid=(const signed char*)&iq1s_grid_dev[idx];\n"
+"      int w0=((int)grid[0]&255)|(((int)grid[1]&255)<<8)|(((int)grid[2]&255)<<16)|(((int)grid[3]&255)<<24);\n"
+"      int w1=((int)grid[4]&255)|(((int)grid[5]&255)<<8)|(((int)grid[6]&255)<<16)|(((int)grid[7]&255)<<24);\n"
+"      const signed char *p0=q0+(size_t)qb*32+l*8,*p1=q1+(size_t)qb*32+l*8;\n"
+"      const int *u0=(const int*)p0,*u1=(const int*)p1;int z0=dp4a_hw(w1,u0[1],dp4a_hw(w0,u0[0],0));\n"
+"      int z1=dp4a_hw(w1,u1[1],dp4a_hw(w0,u1[0],0)),t0=0,t1=0;\n"
+"      for(int j=0;j<8;++j){t0+=(int)p0[j];t1+=(int)p1[j];}\n"
+"      sum+=dl*(s0[qb]*((float)z0+delta*(float)t0)+s1[qb]*((float)z1+delta*(float)t1));}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
 "}\n"
 
 "/* ---- matvec_tq1_0_f32: TQ1_0 matrix x F32 vector -> F32 ---- */\n"
@@ -9648,6 +9899,7 @@ struct hip_llm_runner {
     hipFunction_t fn_embed_q4_0_devtoken;
     hipFunction_t fn_matvec_q2_K_f32;
     hipFunction_t fn_matvec_q2_K_g4_f32;
+    hipFunction_t fn_matvec_q2_K_dp4a2;
     hipFunction_t fn_matvec_q3_K_f32;
     hipFunction_t fn_matvec_q3_K_g4_f32;
     int q2k_g4, q3k_g4;                     /* LLM_Q2K_G4 / LLM_Q3K_G4 warp-per-row */
@@ -9782,8 +10034,14 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq4_xs_expert_f32;
     /* DP4A decode path: per-32-block q8 activation + hardware int8 dot */
     hipFunction_t fn_quantize_q8_32;
+    hipFunction_t fn_quantize_q8x2_32;
     hipFunction_t fn_matvec_iq2_s_dp4a;
+    hipFunction_t fn_matvec_iq2_s_dp4a2;
     hipFunction_t fn_matvec_iq3_s_dp4a;
+    hipFunction_t fn_matvec_iq3_s_dp4a2;
+    hipFunction_t fn_matvec_iq2_xxs_dp4a2;
+    hipFunction_t fn_matvec_iq3_xxs_dp4a2;
+    hipFunction_t fn_matvec_iq2_xs_dp4a2;
     hipFunction_t fn_matvec_iq2_s_expert_dp4a;
     hipFunction_t fn_matvec_iq3_s_expert_dp4a;
     /* LDS-cached grid decode path */
@@ -9792,14 +10050,26 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq2_s_lds_f32;
     hipFunction_t fn_matvec_iq2_s_expert_lds_f32;
     int lds_grid;        /* LLM_LDS_GRID: cache iq2s/iq3s grids in shared memory */
-    void *d_act_q8;      /* int8 activation A (d_xb), per-32-block (<= 8192 cols) */
+    void *d_act_q8;      /* int8 activation A, per-32-block (<= 17408 cols) */
     void *d_act_scale;   /* per-32-block fp32 scale A */
     void *d_act_q8_b;    /* int8 activation B (expert d_gate for down-proj) */
     void *d_act_scale_b; /* per-32-block fp32 scale B */
     void *iq1_q8_source; /* source represented in d_act_q8 for the current callback */
     int   iq1_q8_n;
     int   iq1_q8_valid;
+    void *q8x2_reuse_source;
+    int   q8x2_reuse_n;
+    int   q8x2_reuse_active;
+    int   q8x2_reuse_valid;
     int   decode_dp4a;   /* LLM_DECODE_DP4A (default on) */
+    int   decode_dp4a2;  /* LLM_DECODE_DP4A2: two-term accurate Q8 expansion */
+    hip_llm_kv_cache_type requested_kv_cache_type;
+    hip_llm_kv_cache_type kv_cache_type;
+    hip_llm_decode_kernel_mode requested_decode_kernel_mode;
+    hip_llm_decode_layout_mode requested_decode_layout_mode;
+    const char *requested_decode_layout_cache_path;
+    uint64_t requested_decode_layout_budget_bytes;
+    size_t kv_element_bytes;
     hipFunction_t fn_matvec_iq2_xxs_f32;
     hipFunction_t fn_matvec_iq2_xxs_ptrs_f32;
     hipFunction_t fn_matvec_iq2_xxs_gateup_ptrs_f32;
@@ -9820,7 +10090,9 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq1_s_f32;
     hipFunction_t fn_matvec_iq1_s_warp_f32;
     hipFunction_t fn_matvec_iq1_s_dp4a;
+    hipFunction_t fn_matvec_iq1_s_dp4a2;
     hipFunction_t fn_matvec_iq1_m_f32;
+    hipFunction_t fn_matvec_iq1_m_dp4a2;
     hipFunction_t fn_matvec_tq1_0_f32;
     hipFunction_t fn_matvec_tq2_0_f32;
 
@@ -10571,6 +10843,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(embed_f16_devtoken);
     GET_FUNC(matvec_q2_K_f32);
     GET_FUNC(matvec_q2_K_g4_f32);
+    GET_FUNC(matvec_q2_K_dp4a2);
     GET_FUNC(matvec_q3_K_f32);
     GET_FUNC(matvec_q3_K_g4_f32);
     GET_FUNC(matvec_q4_K_f32);
@@ -10682,8 +10955,14 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq3_xxs_batch_ptrs_f32);
     /* DP4A decode path */
     GET_FUNC(quantize_q8_32);
+    GET_FUNC(quantize_q8x2_32);
     GET_FUNC(matvec_iq2_s_dp4a);
+    GET_FUNC(matvec_iq2_s_dp4a2);
     GET_FUNC(matvec_iq3_s_dp4a);
+    GET_FUNC(matvec_iq3_s_dp4a2);
+    GET_FUNC(matvec_iq2_xxs_dp4a2);
+    GET_FUNC(matvec_iq3_xxs_dp4a2);
+    GET_FUNC(matvec_iq2_xs_dp4a2);
     GET_FUNC(matvec_iq2_s_expert_dp4a);
     GET_FUNC(matvec_iq3_s_expert_dp4a);
     GET_FUNC(matvec_iq3_s_lds_f32);
@@ -10709,7 +10988,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq1_s_f32);
     GET_FUNC(matvec_iq1_s_warp_f32);
     GET_FUNC(matvec_iq1_s_dp4a);
+    GET_FUNC(matvec_iq1_s_dp4a2);
     GET_FUNC(matvec_iq1_m_f32);
+    GET_FUNC(matvec_iq1_m_dp4a2);
     GET_FUNC(matvec_tq1_0_f32);
     GET_FUNC(matvec_tq2_0_f32);
     /* Gemma4 kernels */
@@ -10861,13 +11142,16 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
         return NULL;
     }
 
-    /* DP4A decode path (opt-in via LLM_DECODE_DP4A=1). Default OFF: on gfx1201
-     * the IQ2_S/IQ3_S matvecs are grid-lookup-dequant bound, not multiply bound,
-     * so int8 DP4A + q8 activation is ~2% slower than the full-utilization F32
-     * kernels. Kept gated/validated (rel_l2 ~1e-3 vs float ref) for reference and
-     * future tuning (e.g. SIMD sign via __vsub4, LDS-cached grids). */
+    /* DP4A decode path (opt-in via LLM_DECODE_DP4A=1). Default OFF because Q8
+     * activation quantization measures rel_l2 ~1.6e-3 for IQ2_S versus the
+     * strict F32 reference. The packed-sign implementation reaches >90% of
+     * peak bandwidth at the Qwen 17408x5120 projection shape when explicitly
+     * selected for throughput experiments. */
     r->decode_dp4a = 0;
     { const char *e = getenv("LLM_DECODE_DP4A"); if (e) r->decode_dp4a = atoi(e) != 0; }
+    r->decode_dp4a2 = 0;
+    { const char *e = getenv("LLM_DECODE_DP4A2"); if (e) r->decode_dp4a2 = atoi(e) != 0; }
+    if (r->decode_dp4a2) r->decode_dp4a = 1;
     r->lds_grid = 0;
     { const char *e = getenv("LLM_LDS_GRID"); if (e) r->lds_grid = atoi(e) != 0; }
     r->moe_fused_decode = 1;
@@ -10895,13 +11179,14 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     r->gemm_own = 1;  /* self-owned WMMA GEMM default (faster than blaslt path) */
     { const char *e = getenv("LLM_GEMM"); if (e && strcmp(e, "blaslt") == 0) r->gemm_own = 0; }
     {
-        const size_t QCAP = 8192;
+        const size_t QCAP = 17408;
         if (hipMalloc(&r->d_act_q8,     QCAP)                     != hipSuccess ||
             hipMalloc(&r->d_act_scale,  (QCAP/32) * sizeof(float)) != hipSuccess ||
             hipMalloc(&r->d_act_q8_b,   QCAP)                     != hipSuccess ||
             hipMalloc(&r->d_act_scale_b,(QCAP/32) * sizeof(float)) != hipSuccess) {
             fprintf(stderr, "hip_llm: q8 activation scratch alloc failed; DP4A disabled\n");
             r->decode_dp4a = 0;
+            r->decode_dp4a2 = 0;
         }
     }
 
@@ -12476,6 +12761,7 @@ static int glm5next_moe_gu_pool_get(hip_llm_runner *r, const qtensor *gate,
 static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols,
                                       int weight_type);
+static inline void launch_quantize_q8x2(hip_llm_runner *r, void *x, int n);
 
 static int glm5next_hip_indexer_step(hip_llm_runner *r,
         const gguf_shards *model, int layer, const glm5next_config *c,
@@ -13730,6 +14016,17 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
         }
     }
 
+    if (getenv("LLM_DUMP_LAYER_TYPES")) {
+        for (int l = 0; l < r->n_layers; ++l) {
+            hip_layer *cl = &r->layers[l];
+            fprintf(stderr,
+                    "hip_llm: layer %d attn=%d/%d/%d/%d ffn=%d/%d/%d moe=%d\n",
+                    l, cl->attn_q_type, cl->attn_k_type, cl->attn_v_type,
+                    cl->attn_output_type, cl->ffn_gate_type, cl->ffn_up_type,
+                    cl->ffn_down_type, cl->is_moe);
+        }
+    }
+
     return hip_llm_finalize_load(r, max_seq_len);
 }
 
@@ -13765,6 +14062,9 @@ void hip_llm_load_options_default(hip_llm_load_options *options) {
     options->struct_size = sizeof(*options);
     options->moe_mode = HIP_LLM_MOE_AUTO;
     options->gpu_reserve_bytes = 1ull << 30;
+    options->kv_cache_type = HIP_LLM_KV_AUTO;
+    options->decode_kernel_mode = HIP_LLM_DECODE_KERNEL_DEFAULT;
+    options->decode_layout_mode = HIP_LLM_DECODE_LAYOUT_NATIVE;
 }
 
 int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
@@ -13811,6 +14111,23 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
         r->requested_qwen4_prefill_staging = options->qwen4_prefill_staging != 0;
         r->requested_qwen4_prefill_stage_bytes = options->qwen4_prefill_stage_bytes;
     }
+    if (options->struct_size == 0 ||
+        options->struct_size >= offsetof(hip_llm_load_options, decode_layout_budget_bytes) +
+                                sizeof(options->decode_layout_budget_bytes)) {
+        r->requested_kv_cache_type = options->kv_cache_type;
+        r->requested_decode_kernel_mode = options->decode_kernel_mode;
+        r->requested_decode_layout_mode = options->decode_layout_mode;
+        r->requested_decode_layout_cache_path = options->decode_layout_cache_path;
+        r->requested_decode_layout_budget_bytes = options->decode_layout_budget_bytes;
+        if (options->decode_kernel_mode == HIP_LLM_DECODE_KERNEL_NATIVE) {
+            r->decode_dp4a = 0;
+            r->decode_dp4a2 = 0;
+        } else if (options->decode_kernel_mode == HIP_LLM_DECODE_KERNEL_DP4A2 ||
+                   options->decode_kernel_mode == HIP_LLM_DECODE_KERNEL_AUTO) {
+            r->decode_dp4a = 1;
+            r->decode_dp4a2 = 1;
+        }
+    }
     int rc = hip_llm_load_weights_impl(r, model->metadata, options->max_seq_len);
     hllm_active_shards = NULL;
     return rc;
@@ -13837,13 +14154,52 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         kv_dim = r->n_kv_heads * r->head_dim_full;
     }
 
-    /* Allocate KV cache */
+    /* Allocate KV cache.  Keep legacy generic models on F32 unless the caller
+     * explicitly selects F16; the tuned Qwen3.5 launcher does so through load
+     * options rather than an environment-only production switch. */
+    r->kv_cache_type = HIP_LLM_KV_F32;
+    if (r->is_qwen4exp ||
+        (r->is_hybrid && !r->is_qwen4exp &&
+         r->requested_kv_cache_type == HIP_LLM_KV_F16))
+        r->kv_cache_type = HIP_LLM_KV_F16;
+    r->kv_element_bytes = r->kv_cache_type == HIP_LLM_KV_F16 ?
+                          sizeof(uint16_t) : sizeof(float);
     if (r->verbose >= 1) {
         size_t free_b = 0, total_b = 0;
         if (hipMemGetInfo(&free_b, &total_b) == hipSuccess)
             fprintf(stderr, "hip_llm: VRAM before KV: %.1f / %.1f MiB free\n",
                     (double)free_b / (1024.0*1024.0),
                     (double)total_b / (1024.0*1024.0));
+    }
+    /* Clamp an oversized Qwen3.5 context after weights are resident,
+     * oversized advertised/requested context after weights are resident,
+     * when the actual remaining VRAM is known.  This is especially important
+     * for the 27B GSQ checkpoint: 32K KV is 4 GiB, but only ~3.8 GiB remains
+     * on a 16-GiB RX 9070 XT before scratch allocation. */
+    if (r->is_hybrid && !r->is_qwen4exp) {
+        size_t free_b = 0, total_b = 0;
+        if (hipMemGetInfo(&free_b, &total_b) == hipSuccess) {
+            int attention_layers = 0;
+            for (int l = 0; l < r->n_layers; ++l)
+                if (!r->layers[l].is_ssm) ++attention_layers;
+            size_t kv_bytes_per_token = (size_t)attention_layers * 2 *
+                r->n_kv_heads * r->head_dim * r->kv_element_bytes;
+            size_t reserve = (size_t)768 << 20;
+            if (kv_bytes_per_token > 0 && free_b > reserve) {
+                size_t fit = (free_b - reserve) / kv_bytes_per_token;
+                fit = (fit / 1024) * 1024;
+                if (fit >= 1024 && fit < (size_t)max_seq_len) {
+                    fprintf(stderr,
+                            "hip_llm: clamping qwen35 context %d -> %zu "
+                            "from free VRAM (KV %.1f MiB, reserve %.0f MiB)\n",
+                            max_seq_len, fit,
+                            (double)(fit * kv_bytes_per_token) / (1024.0 * 1024.0),
+                            (double)reserve / (1024.0 * 1024.0));
+                    max_seq_len = (int)fit;
+                    r->max_seq_len = max_seq_len;
+                }
+            }
+        }
     }
     if (r->is_qwen4exp) {
         const char *kvq = getenv("LLM_QWEN4_KV_QUANT");
@@ -13893,7 +14249,9 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             }
         } else {
             kv_cache_size = (size_t)max_seq_len * kv_dim *
-                            (r->is_qwen4exp ? ((r->qwen4_kv_i8 || r->qwen4_kv_fp8) ? sizeof(int8_t) : sizeof(uint16_t)) : sizeof(float));
+                            (r->is_qwen4exp ?
+                             ((r->qwen4_kv_i8 || r->qwen4_kv_fp8) ? sizeof(int8_t) : sizeof(uint16_t)) :
+                             r->kv_element_bytes);
         }
         if (r->is_qwen4exp) {
             qwen4_kv_bytes += 2 * kv_cache_size; /* separate K and V */
@@ -13922,7 +14280,8 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 f16_gib * 0.5, f16_gib * 0.25);
     }
     if (r->verbose >= 1)
-        fprintf(stderr, "hip_llm: finalize KV complete\n");
+        fprintf(stderr, "hip_llm: finalize KV complete (%s)\n",
+                r->kv_cache_type == HIP_LLM_KV_F16 ? "F16" : "F32");
 
     /* Allocate scratch buffers */
     int max_dim = r->n_embd;
@@ -15887,8 +16246,22 @@ static inline void launch_matvec_##name(hip_llm_runner *r, void *dst, void *mat,
     LAUNCH(r->fn_field, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args); \
 }
 
+static inline void launch_quantize_q8x2(hip_llm_runner *r, void *x, int n);
+
 static inline void launch_matvec_q2_K(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
+    const char *experimental = getenv("LLM_EXPERIMENTAL_Q2K_DP4A2");
+    if (r->decode_dp4a2 && experimental && atoi(experimental) != 0 &&
+        n_cols <= 17408 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        int rows_per_block = r->mw_threads / 32;
+        LAUNCH(r->fn_matvec_q2_K_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+        return;
+    }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     if (r->q2k_g4)
         LAUNCH(r->fn_matvec_q2_K_g4_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
@@ -15956,7 +16329,23 @@ static inline void launch_matvec_q6_K(hip_llm_runner *r, void *dst, void *mat,
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     LAUNCH(r->fn_matvec_q6_K_f32, n_rows, 1, 1, 64, 1, 1, 0, r->stream, args);
 }
-DEFINE_LAUNCH_MATVEC_MW(iq2_xxs, fn_matvec_iq2_xxs_f32)
+static inline void launch_matvec_iq2_xxs(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    int rows_per_block = r->mw_threads / 32;
+    if (r->decode_dp4a2 && (n_cols % 256) == 0 && n_cols <= 17408) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq2_xxs_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+    } else {
+        LAUNCH(r->fn_matvec_iq2_xxs_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+    }
+}
 static inline void launch_matvec_iq2_xxs_ptrs(hip_llm_runner *r, void *dst,
         void *mats, void *x, int n_rows, int n_cols, int slots) {
     void *args[] = { &dst, &mats, &x, &n_rows, &n_cols };
@@ -15983,15 +16372,54 @@ DEFINE_LAUNCH_MATVEC(q4_1, fn_matvec_q4_1_f32)
 DEFINE_LAUNCH_MATVEC(q5_0, fn_matvec_q5_0_f32)
 DEFINE_LAUNCH_MATVEC(q5_1, fn_matvec_q5_1_f32)
 DEFINE_LAUNCH_MATVEC_MW(iq4_nl, fn_matvec_iq4_nl_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq4_xs, fn_matvec_iq4_xs_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq2_xs, fn_matvec_iq2_xs_f32)
+static inline void launch_matvec_iq4_xs(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    int rows_per_block = r->mw_threads / 32;
+    LAUNCH(r->fn_matvec_iq4_xs_f32,
+           (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq2_xs(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    int rows_per_block = r->mw_threads / 32;
+    if (r->decode_dp4a2 && (n_cols % 256) == 0 && n_cols <= 17408) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq2_xs_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+    } else {
+        LAUNCH(r->fn_matvec_iq2_xs_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+    }
+}
 static inline void launch_matvec_iq2_xs_ptrs(hip_llm_runner *r, void *dst,
         void *mats, void *x, int n_rows, int n_cols, int slots) {
     void *args[] = { &dst, &mats, &x, &n_rows, &n_cols, &slots };
     LAUNCH(r->fn_matvec_iq2_xs_ptrs_f32, (n_rows + 7) / 8, 1, slots,
            256, 1, 1, 0, r->stream, args);
 }
-DEFINE_LAUNCH_MATVEC_MW(iq3_xxs, fn_matvec_iq3_xxs_f32)
+static inline void launch_matvec_iq3_xxs(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    int rows_per_block = r->mw_threads / 32;
+    if (r->decode_dp4a2 && n_cols <= 17408 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq3_xxs_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+    } else {
+        LAUNCH(r->fn_matvec_iq3_xxs_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+    }
+}
 static inline void launch_matvec_iq3_xxs_ptrs(hip_llm_runner *r, void *dst,
         void *mats, void *x, int n_rows, int n_cols, int x_stride, int slots) {
     void *args[] = { &dst, &mats, &x, &n_rows, &n_cols, &x_stride };
@@ -16013,9 +16441,41 @@ static inline void launch_matvec_iq3_xxs_batch_ptrs(hip_llm_runner *r,
 }
 /* Quantize a F32 activation vector x[n] -> int8 per-32-block (qs) + fp32 scale. */
 static inline void launch_quantize_q8(hip_llm_runner *r, void *x, int n,
-                                       void *qs, void *scale) {
+                                      void *qs, void *scale) {
     void *args[] = { &qs, &scale, &x, &n };
     LAUNCH(r->fn_quantize_q8_32, (n + 31) / 32, 1, 1, 32, 1, 1, 0, r->stream, args);
+}
+static inline void launch_quantize_q8x2(hip_llm_runner *r, void *x, int n) {
+    if (r->q8x2_reuse_active && r->q8x2_reuse_valid &&
+        r->q8x2_reuse_source == x && r->q8x2_reuse_n == n)
+        return;
+    void *args[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_q8_b,
+                     &r->d_act_scale_b, &x, &n };
+    LAUNCH(r->fn_quantize_q8x2_32, (n + 31) / 32, 1, 1, 32, 1, 1,
+           0, r->stream, args);
+    if (r->q8x2_reuse_active) {
+        r->q8x2_reuse_source = x;
+        r->q8x2_reuse_n = n;
+        r->q8x2_reuse_valid = 1;
+    }
+}
+
+static inline void begin_q8x2_reuse(hip_llm_runner *r) {
+    r->q8x2_reuse_active = 1;
+    r->q8x2_reuse_valid = 0;
+}
+
+static inline void end_q8x2_reuse(hip_llm_runner *r) {
+    r->q8x2_reuse_active = 0;
+    r->q8x2_reuse_valid = 0;
+}
+static inline void launch_matvec_iq2_s_dp4a_prequant(hip_llm_runner *r,
+        void *dst, void *mat, void *qs, void *scale, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &qs, &scale, &n_rows, &n_cols };
+    int rows_per_block = r->mw_threads / 32;
+    LAUNCH(r->fn_matvec_iq2_s_dp4a,
+           (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
 }
 /* IQ2_S / IQ3_S: DP4A path when enabled (quantize x then int8 dot), else the
  * full-utilization F32 fallback. Used by launch_matvec_auto + verify harness. */
@@ -16025,12 +16485,25 @@ static inline void launch_matvec_iq2_s(hip_llm_runner *r, void *dst, void *mat,
     if (r->lds_grid) {
         LAUNCH(r->fn_matvec_iq2_s_lds_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1,
                1024 * sizeof(unsigned long long), r->stream, args);
-    } else if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 8192) {
-        launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
-        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
-        LAUNCH(r->fn_matvec_iq2_s_dp4a, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a2);
+    } else if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 17408) {
+        if (r->decode_dp4a2) {
+            launch_quantize_q8x2(r, x, n_cols);
+            void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                           &r->d_act_q8_b, &r->d_act_scale_b,
+                           &n_rows, &n_cols };
+            int rpb = r->mw_threads / 32;
+            LAUNCH(r->fn_matvec_iq2_s_dp4a2, (n_rows + rpb - 1) / rpb,
+                   1, 1, (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+        } else {
+            launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
+            launch_matvec_iq2_s_dp4a_prequant(r, dst, mat, r->d_act_q8,
+                                              r->d_act_scale, n_rows, n_cols);
+        }
     } else {
-        LAUNCH(r->fn_matvec_iq2_s_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+        int rows_per_block = r->mw_threads / 32;
+        LAUNCH(r->fn_matvec_iq2_s_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
     }
 }
 static inline void launch_matvec_iq3_s(hip_llm_runner *r, void *dst, void *mat,
@@ -16039,19 +16512,41 @@ static inline void launch_matvec_iq3_s(hip_llm_runner *r, void *dst, void *mat,
     if (r->lds_grid) {
         LAUNCH(r->fn_matvec_iq3_s_lds_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1,
                512 * sizeof(unsigned int), r->stream, args);
-    } else if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 8192) {
-        launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
-        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
-        LAUNCH(r->fn_matvec_iq3_s_dp4a, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a2);
+    } else if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 17408) {
+        if (r->decode_dp4a2) {
+            launch_quantize_q8x2(r, x, n_cols);
+            void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                           &r->d_act_q8_b, &r->d_act_scale_b,
+                           &n_rows, &n_cols };
+            int rpb = r->mw_threads / 32;
+            LAUNCH(r->fn_matvec_iq3_s_dp4a2, (n_rows + rpb - 1) / rpb,
+                   1, 1, (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+        } else {
+            launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
+            void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+            LAUNCH(r->fn_matvec_iq3_s_dp4a, (n_rows + 7) / 8, 1, 1,
+                   256, 1, 1, 0, r->stream, a2);
+        }
     } else {
-        LAUNCH(r->fn_matvec_iq3_s_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+        int rows_per_block = r->mw_threads / 32;
+        LAUNCH(r->fn_matvec_iq3_s_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
     }
 }
 static inline void launch_matvec_iq1_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     const char *dp_env = getenv("GLM5NEXT_HIP_IQ1_DP4A");
-    if (dp_env && atoi(dp_env) != 0 && n_cols <= 8192 && (n_cols % 256) == 0) {
+    if (r->decode_dp4a2 && n_cols <= 17408 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        int rows_per_block = r->mw_threads / 32;
+        LAUNCH(r->fn_matvec_iq1_s_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+    } else if (dp_env && atoi(dp_env) != 0 && n_cols <= 17408 && (n_cols % 256) == 0) {
         if (!r->iq1_q8_valid || r->iq1_q8_source != x || r->iq1_q8_n != n_cols) {
             launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
             r->iq1_q8_source = x;
@@ -16062,14 +16557,35 @@ static inline void launch_matvec_iq1_s(hip_llm_runner *r, void *dst, void *mat,
         LAUNCH(r->fn_matvec_iq1_s_dp4a, (n_rows + 7) / 8, 1, 1,
                256, 1, 1, 0, r->stream, a2);
     } else
-    if (n_cols >= 1024 && (n_cols % 256) == 0)
-        LAUNCH(r->fn_matvec_iq1_s_warp_f32, (n_rows + 7) / 8, 1, 1,
-               256, 1, 1, 0, r->stream, args);
+    if (n_cols >= 1024 && (n_cols % 256) == 0) {
+        int rows_per_block = r->mw_threads / 32;
+        LAUNCH(r->fn_matvec_iq1_s_warp_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+    }
     else
         LAUNCH(r->fn_matvec_iq1_s_f32, n_rows, 1, 1, 256, 1, 1,
                0, r->stream, args);
 }
-DEFINE_LAUNCH_MATVEC(iq1_m, fn_matvec_iq1_m_f32)
+static inline void launch_matvec_iq1_m(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    int rows_per_block = r->mw_threads / 32;
+    const char *experimental = getenv("LLM_EXPERIMENTAL_IQ1M_DP4A2");
+    if (r->decode_dp4a2 && experimental && atoi(experimental) != 0 &&
+        n_cols <= 17408 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq1_m_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+    } else {
+        LAUNCH(r->fn_matvec_iq1_m_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+    }
+}
 DEFINE_LAUNCH_MATVEC(tq1_0, fn_matvec_tq1_0_f32)
 DEFINE_LAUNCH_MATVEC(tq2_0, fn_matvec_tq2_0_f32)
 
@@ -16927,7 +17443,10 @@ static inline void launch_matvec_expert_dp4a(hip_llm_runner *r, void *dst, void 
     void *args[] = { &dst, &base, &qs, &scale, &n_rows, &n_cols, &r->d_moe_idx, &slot, &stride };
     hipFunction_t fn = (type == GGML_TYPE_IQ3_S) ? r->fn_matvec_iq3_s_expert_dp4a
                                                  : r->fn_matvec_iq2_s_expert_dp4a;
-    LAUNCH(fn, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+    unsigned threads = type == GGML_TYPE_IQ2_S ? (unsigned)r->mw_threads : 256u;
+    int rows_per_block = (int)threads / 32;
+    LAUNCH(fn, (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+           threads, 1, 1, 0, r->stream, args);
 }
 /* Expert-indexed matvec: base resolved on-device from r->d_moe_idx[slot]. */
 static inline void launch_matvec_expert_auto(hip_llm_runner *r, void *dst, void *base,
@@ -21599,6 +22118,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                               &r->d_xb, &qkv_rows, &z_rows, &dt_rank, &n_cols };
                 LAUNCH(r->fn_ssm_matvec4_iq3xxs, qkv_rows + z_rows + 2 * dt_rank, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
+            begin_q8x2_reuse(r);
             if (cl->ssm_qkv_type == GGML_TYPE_Q8_0 &&
                 cl->ssm_gate_type == GGML_TYPE_Q8_0 &&
                 cl->ssm_alpha_type == GGML_TYPE_F32 &&
@@ -21639,6 +22159,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                                cl->ssm_alpha_rows, cl->ssm_alpha_cols, cl->ssm_alpha_type);
             launch_matvec_auto(r, r->d_ssm_beta, cl->ssm_beta_w, r->d_xb,
                                cl->ssm_beta_rows, cl->ssm_beta_cols, cl->ssm_beta_type);
+            end_q8x2_reuse(r);
             }
 
             debug_f32_state(r, l, "Q4 ssm_qkv", r->d_ssm_qkv, qkv_dim);
@@ -21740,10 +22261,12 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_iq3xxs, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
+            begin_q8x2_reuse(r);
             launch_matvec_auto(r, r->d_xb2, cl->attn_q_w, r->d_xb,
                               cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
             launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
             launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+            end_q8x2_reuse(r);
             }
             launch_deinterleave_qgate(r, r->d_q, r->d_attn_gate, r->d_xb2, n_heads, head_dim);
 
@@ -21801,12 +22324,22 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                                              n_heads, n_kv_heads, head_dim, kv_dim, scale);
                 }
             } else {
-                launch_kv_store_devp(r, key_cache, value_cache,
-                                     r->d_k, r->d_v, kv_dim, r->max_seq_len);
-                size_t smem_attn = (size_t)r->max_seq_len * sizeof(float);
-                launch_attention_devp(r, r->d_xb2, r->d_q,
-                                       key_cache, value_cache,
-                                       n_heads, n_kv_heads, head_dim, kv_dim, scale, smem_attn);
+                if (r->kv_cache_type == HIP_LLM_KV_F16) {
+                    launch_kv_store_f16_devp(r, key_cache, value_cache,
+                                             r->d_k, r->d_v, kv_dim);
+                    launch_attn_decode_flash_f16(r, r->d_xb2, r->d_q,
+                                                 key_cache, value_cache,
+                                                 n_heads, n_kv_heads, head_dim,
+                                                 kv_dim, scale);
+                } else {
+                    launch_kv_store_devp(r, key_cache, value_cache,
+                                         r->d_k, r->d_v, kv_dim, r->max_seq_len);
+                    size_t smem_attn = (size_t)r->max_seq_len * sizeof(float);
+                    launch_attention_devp(r, r->d_xb2, r->d_q,
+                                           key_cache, value_cache,
+                                           n_heads, n_kv_heads, head_dim, kv_dim,
+                                           scale, smem_attn);
+                }
             }
 
             int q_dim_local = n_heads * head_dim;
@@ -21852,9 +22385,11 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_iq3xxs, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
+                begin_q8x2_reuse(r);
                 launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb, cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
                 launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
                 launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+                end_q8x2_reuse(r);
             }
 
             /* Attention biases (Qwen2.5-VL) */
@@ -21983,10 +22518,12 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 } else
                     LAUNCH(r->fn_ffn_gate_up_silu_iq3xxs, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
+                begin_q8x2_reuse(r);
                 launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
                               cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
                 launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
                               cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
+                end_q8x2_reuse(r);
                 launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
             }
             if (r->ssm_fused_decode && cl->ffn_down_type == GGML_TYPE_Q6_K) {
@@ -23211,6 +23748,10 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             launch_kv_store_batch_strided(r, r->d_key_cache[l], r->d_value_cache[l],
                                           r->d_k_batch, r->d_v_batch,
                                           position_start, M, l_kvdim, l_kvdim, pf_cache_len);
+        } else if (r->is_hybrid && r->kv_cache_type == HIP_LLM_KV_F16) {
+            launch_kv_store_f16_batch(r, r->d_key_cache[l], r->d_value_cache[l],
+                                      r->d_k_batch, r->d_v_batch, kv_dim,
+                                      position_start, M);
         } else {
             launch_kv_store_batch(r, r->d_key_cache[l], r->d_value_cache[l],
                                   r->d_k_batch, r->d_v_batch,
@@ -23239,6 +23780,11 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                            n_heads, l_nkv, l_hd, l_kvdim,
                                            M, position_start, l_scale, pf_window, pf_cache_len);
             }
+        } else if (r->is_hybrid && r->kv_cache_type == HIP_LLM_KV_F16) {
+            launch_attn_prefill_flash_f16(r, r->d_attn_out_batch, r->d_q_batch,
+                                          r->d_key_cache[l], r->d_value_cache[l],
+                                          n_heads, n_kv_heads, head_dim, kv_dim,
+                                          M, position_start, scale);
         } else if (r->fa_path_ok) {
             int kv_len = position_start + M;
             /* Pack K/V cache slice [0..kv_len) into transposed F16 scratch. */
@@ -24886,14 +25432,28 @@ int hip_llm_bench_quant_matvec(
         goto done;
     }
 
+    int prequant = weight_type == GGML_TYPE_IQ2_S && r->decode_dp4a &&
+        getenv("LLM_BENCH_QMV_PREQUANT") &&
+        atoi(getenv("LLM_BENCH_QMV_PREQUANT")) != 0;
+    if (prequant)
+        launch_quantize_q8(r, d_x, n_cols, r->d_act_q8, r->d_act_scale);
+
     for (int i = 0; i < warmup; i++) {
-        launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
+        if (prequant)
+            launch_matvec_iq2_s_dp4a_prequant(r, d_dst, d_mat, r->d_act_q8,
+                                              r->d_act_scale, n_rows, n_cols);
+        else
+            launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
     }
     if (hipStreamSynchronize(r->stream) != hipSuccess) goto done;
 
     if (hipEventRecord(ev_start, r->stream) != hipSuccess) goto done;
     for (int i = 0; i < iters; i++) {
-        launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
+        if (prequant)
+            launch_matvec_iq2_s_dp4a_prequant(r, d_dst, d_mat, r->d_act_q8,
+                                              r->d_act_scale, n_rows, n_cols);
+        else
+            launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
     }
     if (hipEventRecord(ev_stop, r->stream) != hipSuccess) goto done;
     if (hipEventSynchronize(ev_stop) != hipSuccess) goto done;

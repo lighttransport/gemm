@@ -3,6 +3,7 @@ set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 flash="${root_dir}/run_qwen38_flash_next_rocm.sh"
+gsq="${root_dir}/run_qwen38_gsq_rocm.sh"
 server="${root_dir}/run_qwen38_codex_server_rocm.sh"
 nextn_forward="${root_dir}/qwen4_nextn_forward.h"
 runner_c="${root_dir}/hip_llm_runner.c"
@@ -13,6 +14,24 @@ expect_contains() {
         printf 'profile test: expected %q in %s\n' "${needle}" "${haystack}" >&2
         return 1
     }
+}
+
+out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}")"
+expect_contains "${out}" 'Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf'
+expect_contains "${out}" 'selected_context=36864'
+out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}" -s 262144)"
+expect_contains "${out}" 'safe_context=36864'
+expect_contains "${out}" 'selected_context=36864'
+out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g QWEN38_GSQ_ALLOW_UNSAFE_CONTEXT=1 "${gsq}" -s 262144)"
+expect_contains "${out}" 'selected_context=262144'
+
+grep -q 'One lane per 8-value codebook group' "${runner_c}" || {
+    echo 'profile test: full-wave IQ2_XS decode kernel missing' >&2
+    exit 1
+}
+grep -q 'QWEN38_GSQ_DECODE_TARGET:-30' "${root_dir}/bench_qwen38_gsq_decode.sh" || {
+    echo 'profile test: GSQ 30 tok/s target gate missing' >&2
+    exit 1
 }
 
 # The sidecar checkpoint ring must retain the pre-anchor state at slot zero;

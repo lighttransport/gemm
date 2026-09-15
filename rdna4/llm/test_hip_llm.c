@@ -867,6 +867,11 @@ int main(int argc, char **argv) {
     int qwen4_prefill_stage_mb = 0;
     int moe_cache_mb = 0;
     int moe_cpu_only = 0;
+    hip_llm_kv_cache_type kv_cache_type = HIP_LLM_KV_AUTO;
+    hip_llm_decode_kernel_mode decode_kernel_mode = HIP_LLM_DECODE_KERNEL_DEFAULT;
+    hip_llm_decode_layout_mode decode_layout_mode = HIP_LLM_DECODE_LAYOUT_NATIVE;
+    const char *decode_layout_cache_path = NULL;
+    int decode_layout_budget_mib = 0;
     int max_layers = 0;
     int verify_hc_batch = 0, verify_ple_split = 0, verify_ssm_projections = 0, verify_moe_native = 0;
     int verify_glm5next_kda = 0;
@@ -995,6 +1000,30 @@ int main(int argc, char **argv) {
             moe_cache_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--moe-cpu") == 0) {
             moe_cpu_only = 1;
+        } else if (strcmp(argv[i], "--kv-cache") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (!strcmp(mode, "auto")) kv_cache_type = HIP_LLM_KV_AUTO;
+            else if (!strcmp(mode, "f32")) kv_cache_type = HIP_LLM_KV_F32;
+            else if (!strcmp(mode, "f16")) kv_cache_type = HIP_LLM_KV_F16;
+            else { fprintf(stderr, "--kv-cache must be auto, f32, or f16\n"); return 2; }
+        } else if (strcmp(argv[i], "--decode-kernels") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (!strcmp(mode, "native")) decode_kernel_mode = HIP_LLM_DECODE_KERNEL_NATIVE;
+            else if (!strcmp(mode, "dp4a2")) decode_kernel_mode = HIP_LLM_DECODE_KERNEL_DP4A2;
+            else if (!strcmp(mode, "auto")) decode_kernel_mode = HIP_LLM_DECODE_KERNEL_AUTO;
+            else { fprintf(stderr, "--decode-kernels must be native, dp4a2, or auto\n"); return 2; }
+        } else if (strcmp(argv[i], "--decode-layout") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (!strcmp(mode, "native")) decode_layout_mode = HIP_LLM_DECODE_LAYOUT_NATIVE;
+            else if (!strcmp(mode, "auto")) decode_layout_mode = HIP_LLM_DECODE_LAYOUT_AUTO_REPACK;
+            else { fprintf(stderr, "--decode-layout must be native or auto\n"); return 2; }
+        } else if (strcmp(argv[i], "--decode-layout-cache") == 0 && i + 1 < argc) {
+            decode_layout_cache_path = argv[++i];
+        } else if (strcmp(argv[i], "--decode-layout-budget-mib") == 0 && i + 1 < argc) {
+            decode_layout_budget_mib = atoi(argv[++i]);
+            if (decode_layout_budget_mib < 0 || decode_layout_budget_mib > 4096) {
+                fprintf(stderr, "--decode-layout-budget-mib must be 0..4096\n"); return 2;
+            }
         } else if (strcmp(argv[i], "--max-layers") == 0 && i + 1 < argc) {
             max_layers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--verify-ple-split") == 0) {
@@ -1063,6 +1092,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
             fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M] [--coding]\n");
             fprintf(stderr, "       [--moe-cache-mb MiB] [--moe-cpu]\n");
+            fprintf(stderr, "       [--kv-cache auto|f32|f16] [--decode-kernels native|dp4a2|auto]\n");
+            fprintf(stderr, "       [--decode-layout native|auto] [--decode-layout-cache auto|off|PATH]\n");
+            fprintf(stderr, "       [--decode-layout-budget-mib MiB]\n");
             fprintf(stderr, "       [--qwen4-mtp SIDECAR.gguf] [--qwen4-mtp-draft 1..32]\n");
             fprintf(stderr, "       [--qwen4-mtp-cache-mb MiB] [--qwen4-mtp-verify scalar|window]\n");
             fprintf(stderr, "       [--qwen4-mtp-check] [--qwen4-exact]\n");
@@ -1397,6 +1429,12 @@ int main(int argc, char **argv) {
     if (qwen4_prefill_staging) load_options.qwen4_prefill_staging = 1;
     if (qwen4_prefill_stage_mb > 0)
         load_options.qwen4_prefill_stage_bytes = (uint64_t)qwen4_prefill_stage_mb << 20;
+    load_options.kv_cache_type = kv_cache_type;
+    load_options.decode_kernel_mode = decode_kernel_mode;
+    load_options.decode_layout_mode = decode_layout_mode;
+    load_options.decode_layout_cache_path = decode_layout_cache_path;
+    if (decode_layout_budget_mib > 0)
+        load_options.decode_layout_budget_bytes = (uint64_t)decode_layout_budget_mib << 20;
     if (qwen4_batched_prefill) hip_llm_set_qwen4_batched_prefill(gpu, 1);
     if(qwen4_mtp) {
         hip_llm_qwen4_mtp_set_verify(gpu,qwen4_mtp_window);
