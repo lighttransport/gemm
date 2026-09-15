@@ -17,9 +17,11 @@ p.add_argument("--trajectory",action="store_true",help="Diagnose accumulated err
 p.add_argument("--attention",choices=["auto","math"],default="auto",help="Select the PyTorch SDPA reference kernel")
 p.add_argument("--save-reference",type=Path,help="Save reference output before checking tolerance")
 p.add_argument("--model-dir",type=Path,default=Path("/mnt/disk2/models/Pixal3D"))
+p.add_argument("--reference-device",choices=["cpu","cuda"],default=None,
+               help="PyTorch oracle device; native dump/backend remains --backend")
 a=p.parse_args()
 torch.set_num_threads(16)
-device="cpu" if a.backend=="cpu" else "cuda"
+device=a.reference_device or ("cpu" if a.backend=="cpu" else "cuda")
 if device=="cuda":
     assert torch.cuda.is_available() and bool(torch.version.hip)==(a.backend=="rocm")
     torch.cuda.set_per_process_memory_fraction(.45)

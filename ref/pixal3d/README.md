@@ -53,8 +53,21 @@ make -C cpu/pixal3d test
 ref/pixal3d/run.sh cpu ref/pixal3d/validate.py --backend cpu --flow
 ref/pixal3d/run.sh cuda ref/pixal3d/validate.py --backend cuda --flow
 ref/pixal3d/run.sh rocm ref/pixal3d/validate.py --backend rocm --flow
+# Keep the native GPU backend while using slow CPU PyTorch as a deterministic oracle.
+ref/pixal3d/run.sh cuda ref/pixal3d/validate.py --backend cuda --reference-device cpu \
+  --gpu-execution resident --gpu-kernels auto
 ref/pixal3d/run.sh cpu ref/pixal3d/validate_projection.py
 ref/pixal3d/run.sh cpu ref/pixal3d/validate_api.py
+
+# Resumable per-submodule verification for a recorded CUDA/ROCm run. Each JSONL
+# row is an independent primitive, conditioning, flow-stage, or decoder result;
+# rerunning with --skip-complete keeps passed rows and continues after failures.
+ref/pixal3d/run.sh cuda ref/pixal3d/verify_gpu_run.py --backend cuda \
+  --dump-dir tmp/pixal3d/runs/cuda-house/dumps --fov 0.857556 --all \
+  --reference-device cpu --output tmp/pixal3d/verification/cuda-house.jsonl
+ref/pixal3d/run.sh rocm ref/pixal3d/verify_gpu_run.py --backend rocm \
+  --dump-dir tmp/pixal3d/runs/rocm-house/dumps --fov 0.857556 --all \
+  --reference-device cpu --output tmp/pixal3d/verification/rocm-house.jsonl
 
 ref/pixal3d/run.sh cuda ref/pixal3d/validate_conditioning.py --backend cuda --natten
 ref/pixal3d/run.sh rocm ref/pixal3d/validate_conditioning.py --backend rocm

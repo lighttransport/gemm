@@ -15,17 +15,20 @@ p.add_argument("--flow", action="store_true")
 p.add_argument("--model-dir", type=Path, default=Path("/mnt/disk2/models/Pixal3D"))
 p.add_argument("--gpu-execution",choices=["legacy","resident"],default="legacy")
 p.add_argument("--gpu-kernels",choices=["auto","blas","mma"],default="auto")
+p.add_argument("--reference-device",choices=["cpu","cuda"],default=None,
+               help="PyTorch oracle device; native backend remains --backend")
 a = p.parse_args()
 backend = ["cpu", "cuda", "rocm"].index(a.backend)
-device = "cpu" if not backend else "cuda"
+device = a.reference_device or ("cpu" if not backend else "cuda")
 torch.set_num_threads(16)
 torch.manual_seed(923)
 if backend:
-    assert torch.cuda.is_available()
-    assert bool(torch.version.hip) == (a.backend == "rocm")
-    torch.cuda.set_per_process_memory_fraction(.45)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    if device == "cuda":
+        assert torch.cuda.is_available()
+        assert bool(torch.version.hip) == (a.backend == "rocm")
+        torch.cuda.set_per_process_memory_fraction(.45)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 lib = C.CDLL(str(ROOT.parent.parent / "cpu/pixal3d/libpixal3d_validation.so"))
 lib.px_test_error.restype = C.c_char_p
 lib.px_test_set_gpu.argtypes=[C.c_int,C.c_int]

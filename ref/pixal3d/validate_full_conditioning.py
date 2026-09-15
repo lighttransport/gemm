@@ -23,8 +23,10 @@ p.add_argument('--stage',choices=['structure','shape512','shape1024','texture'],
 p.add_argument('--fov',type=float,required=True)
 p.add_argument('--distance',type=float,default=0)
 p.add_argument('--mesh-scale',type=float,default=1)
+p.add_argument('--reference-device',choices=['cpu','cuda'],default=None,
+               help='PyTorch oracle device; native dump/backend remains --backend')
 a=p.parse_args();torch.set_num_threads(8)
-device='cpu' if a.backend=='cpu' else 'cuda'
+device=a.reference_device or ('cpu' if a.backend=='cpu' else 'cuda')
 if device=='cuda':
     assert torch.cuda.is_available() and bool(torch.version.hip)==(a.backend=='rocm')
     torch.cuda.set_per_process_memory_fraction(.45)
