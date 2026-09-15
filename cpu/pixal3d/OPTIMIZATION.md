@@ -3,9 +3,11 @@
 Scope: Pixal3D main release, BF16 flows, FP16 decoders, FP32 conditioning and
 boundary layers. CPU geometry and PBR processing are unchanged. Enable with
 `--gpu-execution resident --gpu-kernels auto`; legacy remains the default.
-Resident flow uses BF16 by default. `--gpu-flow-precision fp32` keeps the flow
-stack in FP32 for accuracy-sensitive runs; decoder precision and conditioning
-boundaries are unchanged.
+Resident flow uses BF16 by default. `--gpu-flow-precision mixed` keeps state,
+normalization and residual math in FP32 while retaining BF16 GEMMs and
+attention; this is the recommended accuracy/performance point. `fp32` keeps
+the complete flow stack in FP32 for diagnostic runs. Decoder precision and
+conditioning boundaries are unchanged.
 
 ## Implementation
 
@@ -21,7 +23,8 @@ boundaries are unchanged.
   extract the existing source strings, avoiding a second maintained kernel copy.
 - Explicit CUDA MMA and gfx12 WMMA GEMM kernels handle BF16/FP16 tails. They are
   opt-in through `--gpu-kernels mma`; automatic dispatch retains faster vendor
-  GEMM. FP32 operations do not use the low-precision attention kernels.
+  GEMM. Mixed mode intentionally uses the low-precision attention kernels while
+  keeping surrounding state and sensitive pointwise operations in FP32.
 - Dense and sparse decoders use tiled device neighborhood gathering and GEMM.
   Subdivision indices and threshold decisions stay on the CPU. NAF guide
   encoding and sampling share device features. Identical DINO inputs are cached
@@ -64,9 +67,10 @@ compared with the matching PyTorch model at `t=1`. FP32 reduced NRMSE by about
 | RTX 5060 Ti | 0.008680 | 0.00000131 | 0.0000205 |
 | RX 9070 XT | 0.006139 | 0.000000929 | 0.0000124 |
 
-The switch is exposed by the CLI as `--gpu-flow-precision fp32`; BF16 remains
-the default for memory and throughput. Reproduce the isolated experiment with
-`validate_flow_precision.py --stage structure --precision bf16|fp32`. Full
+The modes are exposed by the CLI as `--gpu-flow-precision bf16|mixed|fp32`; BF16 remains
+the default for memory and throughput, with `mixed` providing the recommended
+quality/speed tradeoff. Reproduce the isolated experiment with
+`validate_flow_precision.py --stage structure --precision bf16|mixed|fp32`. Full
 twelve-step cascade accuracy and VRAM cost should be measured before making
 FP32 the default.
 

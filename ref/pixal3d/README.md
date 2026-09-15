@@ -56,7 +56,7 @@ ref/pixal3d/run.sh rocm ref/pixal3d/validate.py --backend rocm --flow
 # Keep the native GPU backend while using slow CPU PyTorch as a deterministic oracle.
 ref/pixal3d/run.sh cuda ref/pixal3d/validate.py --backend cuda --reference-device cpu \
   --gpu-execution resident --gpu-kernels auto
-# The experimental FP32 flow mode uses the FP32 PyTorch oracle for its flow block.
+# Mixed and FP32 flow modes use the FP32 PyTorch oracle for their flow block.
 ref/pixal3d/run.sh cuda ref/pixal3d/validate.py --backend cuda --reference-device cpu --flow \
   --gpu-execution resident --gpu-flow-precision fp32
 
