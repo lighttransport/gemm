@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -714,6 +715,46 @@ static long target_available_kb(void) {
     return available;
 }
 
+/* Draw from the full sharded vocabulary after a decode step.  The normal
+ * path remains greedy (temperature <= 0); sampling is opt-in and gathers the
+ * ~0.6 MiB logits vector once per token. */
+static int target_sample_token(const glm53f_target_model_12n *m, int rank,
+                               int ranks, float temperature, float top_p,
+                               uint64_t *state, int greedy_token) {
+    if (!(temperature > 0.0f)) return greedy_token;
+    int first = 0, count = 0;
+    const float *local = glm53f_target_model_logits_12n(m, &first, &count);
+    if (!local || count <= 0) return greedy_token;
+    int *counts = (int *)malloc((size_t)ranks * sizeof(*counts));
+    int *displs = (int *)malloc((size_t)ranks * sizeof(*displs));
+    float *all = (float *)malloc((size_t)154880 * sizeof(*all));
+    if (!counts || !displs || !all) { free(counts); free(displs); free(all); return greedy_token; }
+    for (int r = 0; r < ranks; ++r) {
+        displs[r] = (int)((long long)154880 * r / ranks);
+        counts[r] = (int)((long long)154880 * (r + 1) / ranks) - displs[r];
+    }
+    MPI_Allgatherv(local, count, MPI_FLOAT, all, counts, displs, MPI_FLOAT, MPI_COMM_WORLD);
+    int chosen = greedy_token;
+    if (!rank) {
+        float mx = -INFINITY, inv_t = 1.0f / temperature;
+        for (int i = 0; i < 154880; ++i) if (all[i] > mx) mx = all[i];
+        double sum = 0.0;
+        for (int i = 0; i < 154880; ++i) sum += exp((double)(all[i] - mx) * inv_t);
+        uint64_t x = *state;
+        x ^= x << 7; x ^= x >> 9; x ^= x << 8; *state = x;
+        double target = (double)(x >> 11) * (1.0 / 9007199254740992.0) * sum;
+        double acc = 0.0;
+        for (int i = 0; i < 154880; ++i) {
+            acc += exp((double)(all[i] - mx) * inv_t);
+            if (acc >= target) { chosen = i; break; }
+        }
+        (void)top_p; /* top_p=1.0 requested; no nucleus truncation needed. */
+    }
+    MPI_Bcast(&chosen, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    free(counts); free(displs); free(all);
+    return chosen;
+}
+
 static int read_token_ids(const char *path, int **ids_out, int *count_out) {
     FILE *f = fopen(path, "r");
     int *ids = NULL, cap = 0, n = 0, id;
@@ -741,6 +782,8 @@ int main(int argc, char **argv) {
     int rank, ranks, token, steps, generate = 0;
     int requested_capacity = 0, touch_cache = 0, load_only = 0, use_int8 = 0, int8_kda = 0, latent_bf16 = 0;
     int prefill_chunk = 1, prefill_chunk_given = 0;
+    float temperature = 0.0f, top_p = 1.0f;
+    uint64_t sample_state = 88172645463393265ULL;
     glm53f_prefill_config prefill_config = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     int *prompt_ids = NULL, *generated_ids = NULL, prompt_count = 0, generated = 0;
     const char *output_ids = NULL;
@@ -749,7 +792,7 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 4 || ranks != 12) {
-        if (!rank) fprintf(stderr,"usage: %s MODEL ROUTED_STAGE SHARED_STAGE [token=1] [steps=1] [OPTIONS]\n       %s MODEL ROUTED_STAGE SHARED_STAGE --generate PROMPT_IDS OUTPUT_IDS MAX_NEW [OPTIONS]\noptions: --capacity N --weight-format fp8|int8 --int8-kda --cache-format fp32|bf16 --touch-cache --load-only --prefill-chunk N (1..256; up to 512 with --prefill-mode fast, generate only)\n",argv[0],argv[0]);
+        if (!rank) fprintf(stderr,"usage: %s MODEL ROUTED_STAGE SHARED_STAGE [token=1] [steps=1] [OPTIONS]\n       %s MODEL ROUTED_STAGE SHARED_STAGE --generate PROMPT_IDS OUTPUT_IDS MAX_NEW [OPTIONS]\noptions: --capacity N --weight-format fp8|int8 --int8-kda --cache-format fp32|bf16 --temperature T --top-p P --seed N --touch-cache --load-only --prefill-chunk N (1..256; up to 512 with --prefill-mode fast, generate only)\n",argv[0],argv[0]);
         MPI_Abort(MPI_COMM_WORLD,2);
     }
     generate = argc >= 8 && !strcmp(argv[4], "--generate");
@@ -776,6 +819,9 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--touch-cache")) touch_cache = 1;
         else if (!strcmp(argv[i], "--load-only")) load_only = 1;
         else if (!strcmp(argv[i], "--int8-kda")) int8_kda = 1;
+        else if (!strcmp(argv[i], "--temperature") && i + 1 < argc) temperature = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) sample_state = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--prefill-chunk") && i + 1 < argc) {
             char *end;
             long n = strtol(argv[++i], &end, 10);
@@ -879,7 +925,9 @@ int main(int argc, char **argv) {
         double step_begin=MPI_Wtime();
         if(generate&&step==prompt_count-1){window_begin=step_begin;glm53f_target_profile_reset_12n(model);}
         float value;
-        if(glm53f_target_model_step_12n(model,token,&token,&value,NULL))MPI_Abort(MPI_COMM_WORLD,2);
+        int greedy_token;
+        if(glm53f_target_model_step_12n(model,token,&greedy_token,&value,NULL))MPI_Abort(MPI_COMM_WORLD,2);
+        token = target_sample_token(model, rank, ranks, temperature, top_p, &sample_state, greedy_token);
         double step_elapsed=MPI_Wtime()-step_begin;
         if(generate&&step<prompt_count-1)prompt_elapsed+=step_elapsed;else decode_elapsed+=step_elapsed;
         completed_steps++;
