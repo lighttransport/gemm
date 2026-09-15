@@ -1665,7 +1665,7 @@ int main(int argc, char **argv) {
         int stream_chunk = 0;
         const char *stream_chunk_env = getenv("LLM_BENCH_STREAM_CHUNK");
         if (stream_chunk_env) stream_chunk = atoi(stream_chunk_env);
-        if (!stream_chunk_env && n_prefill > 2048) {
+        if (!stream_chunk_env && n_prefill >= 2048) {
             /* Keep direct test_hip_llm invocations on the same bounded
              * large-request path as the serving launcher.  A single 4K+
              * dispatch can exhaust gfx1201 scratch before quality or timing
@@ -1680,7 +1680,8 @@ int main(int argc, char **argv) {
             const char *publish_chunk_env = getenv("LLM_BENCH_STREAM_PUBLISH_CHUNK");
             int publish_chunk = publish_chunk_env && atoi(publish_chunk_env) != 0;
             /* No batch knob means the runner's parity-safe scalar default. */
-            int scalar_stream = !batch_env || atoi(batch_env) == 0;
+            int scalar_stream = (!batch_env || atoi(batch_env) == 0) &&
+                                !qwen35_batched_prefill;
             if (scalar_stream)
                 fprintf(stderr, "Large prefill: scalar streamed forward (dispatcher bypass)\n");
             for (int off = 0; off < n_prefill; off += stream_chunk) {

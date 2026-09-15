@@ -25257,11 +25257,6 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                        r->d_key_cache_scale[l], r->d_value_cache_scale[l],
                                        r->d_k_batch, r->d_v_batch, n_kv_heads, head_dim,
                                        position_start, M);
-            launch_attn_prefill_q8q4(r, r->d_attn_out_batch, r->d_q_batch,
-                                     r->d_key_cache[l], r->d_value_cache[l],
-                                     r->d_key_cache_scale[l], r->d_value_cache_scale[l],
-                                     n_heads, n_kv_heads, head_dim, kv_dim,
-                                     M, position_start, scale);
         } else if (r->is_hybrid && r->kv_cache_type == HIP_LLM_KV_F16) {
             launch_kv_store_f16_batch(r, r->d_key_cache[l], r->d_value_cache[l],
                                       r->d_k_batch, r->d_v_batch, kv_dim,
