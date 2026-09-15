@@ -20,7 +20,8 @@ removed after each request.
 `POST /v1/infer` accepts JSON fields `image_b64`, optional `mask_b64`,
 `image_ext`, `backend`, `fov`, `distance`, `mesh_scale`, `seed`, `threads`,
 `device`, `vram_budget_mib`, `gpu_execution` (`legacy`/`resident`), and
-`gpu_kernels` (`auto`/`blas`/`mma`). Responses include a `profile` object with
+`gpu_kernels` (`auto`/`blas`/`mma`), and `gpu_flow_precision`
+(`bf16`/`mixed`/`fp32`). Responses include a `profile` object with
 phase timings and device counters. Server defaults can be selected with
 `--gpu-execution resident --gpu-kernels auto`; the browser also exposes these
 choices. Set `reference: true` with CUDA or ROCm to
