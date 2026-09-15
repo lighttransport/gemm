@@ -43,8 +43,7 @@ if a.all or a.conditioning:
     for stage in ("structure", "shape512", "shape1024", "texture"):
         if has_dump(stage + "_projected"):
             checks.append(("conditioning-" + stage, ["validate_full_conditioning.py", *oracle,
-                "--dump-dir", str(a.dump_dir), "--stage", stage, "--fov", str(a.fov),
-                "--model-dir", str(a.model_dir)]))
+                "--dump-dir", str(a.dump_dir), "--stage", stage, "--fov", str(a.fov)]))
 if a.all or a.flow:
     for stage in ("structure", "shape512", "shape1024", "texture"):
         if has_dump(stage + "_step_12"):
