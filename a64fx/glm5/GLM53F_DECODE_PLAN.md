@@ -49,6 +49,42 @@ is claimed in this section after allocation 51669230 expired.
    and allocation-failure self-tests, and report truncation separately from
    semantic/compiler failures.
 
+## Fresh planning prompt: 150+ prefill / 20+ long-context decode
+
+Use the following prompt to start a new optimization pass:
+
+> You are optimizing **GLM-5.3-Flash** on 12 normal-frequency A64FX nodes
+> (48 pinned workers per rank). Preserve the qualified FP8-weight numerical
+> path and the mask27/slab16/tree-packed fast prefill recipe. The practical
+> goals are **at least 150 tok/s prefill** for 8K--16K prompts and **at least
+> 20 tok/s average decode** while the context grows to approximately 16K.
+> Measure both goals; do not infer 16K performance from an 8K result.
+>
+> First establish controls using the same prompt and allocation: greedy decode
+> with FP32 KV, greedy decode with BF16 KV, and the current fast prefill. Report
+> load time separately, prompt tok/s, decode tok/s in 512-token windows, and
+> the average over the full 16K-context trajectory. Record per-rank minimum
+> MemAvailable and verify no rank crosses the 2 GiB safety guard.
+>
+> Then optimize decode only. Profile KDA recurrence, MLA/cache bandwidth, MoE
+> routing/experts, inter-rank reductions, and vocabulary readout. Keep greedy
+> output bit-exact or numerically equivalent to the scalar reference. For
+> temperature 0.95/top-p 1.0, replace the current per-token full-vocabulary
+> all-gather with a persistent, communication-efficient candidate/top-K design
+> only after comparing its probability mass, KL, and sampled-token agreement
+> against an exact scalar sampler.
+>
+> Preserve 512K capacity behavior and the existing prefill numerical gates.
+> Validate every candidate with the 4K C++ coding prompt, at least 8K output
+> tokens or EOS, compiler warnings enabled, executable self-tests, and an
+> allocation-failure test. Reject any candidate that is faster but truncates,
+> emits incoherent code, changes selected indices, or fails compilation.
+>
+> Required deliverables: implementation diff, exact remote commands, three
+> repeated measurements for 8K and 16K contexts, windowed and aggregate rates,
+> memory minima, quality/compile results, and a clear recommendation for the
+> production default. Do not claim a target until the complete-run gate passes.
+
 ## Implemented prefill fast path: 150+ gate met (2026-09-15)
 
 On interactive job **51656483**, 12 A64FX nodes at normal 2.0 GHz, all six
