@@ -5166,6 +5166,37 @@ static const char *hip_kernel_source =
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
 "}\n"
 
+"/* IQ2_S four-token reuse variant.  The packed IQ2_S block is decoded once\n"
+" * per lane and reused across four prompt rows; this is exact relative to\n"
+" * matvec_iq2_s_dp4a2_batch and reduces repeated weight traffic at M>=32. */\n"
+"__global__ void matvec_iq2_s_dp4a2_batch_reuse4(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp;\n"
+"    int token0=blockIdx.y*4; if(row>=n_rows)return;\n"
+"    int nb=n_cols/256,G=nb*16; const unsigned char *rp=mat+(size_t)row*nb*82;\n"
+"    float sum[4]={0,0,0,0};\n"
+"    for(int gg=lane;gg<G;gg+=32){\n"
+"        int ibg=gg>>1,half=gg&1,b=ibg>>3,ib=ibg&7;\n"
+"        const unsigned char *bp=rp+b*82; float dw=half_to_float(*(const half_raw*)bp);\n"
+"        const unsigned char *qs=bp+2+ib*4,*sg=bp+34+ib*4;\n"
+"        unsigned char qh=bp[66+ib],sc=bp[74+ib];\n"
+"        int ls=half?(sc>>4):(sc&15),qb=b*8+ib;\n"
+"        for(int t=0;t<4;t++){int token=token0+t;if(token<M){\n"
+"            const int *u0=(const int*)(q0+(size_t)token*n_cols+qb*32);\n"
+"            const int *u1=(const int*)(q1+(size_t)token*n_cols+qb*32);\n"
+"            const float *ts0=s0+(size_t)token*(n_cols/32),*ts1=s1+(size_t)token*(n_cols/32);\n"
+"            int z0=0,z1=0; for(int l=0;l<2;l++){int ll=half*2+l,idx=qs[ll]|((qh<<(8-2*ll))&0x300);\n"
+"                const int *gp=(const int*)&iq2s_grid_dev[idx]; int w0=apply_sign4(gp[0],sg[ll],0),w1=apply_sign4(gp[1],sg[ll],4);\n"
+"                z0=dp4a_hw(w0,u0[ll*2],z0); z0=dp4a_hw(w1,u0[ll*2+1],z0);\n"
+"                z1=dp4a_hw(w0,u1[ll*2],z1); z1=dp4a_hw(w1,u1[ll*2+1],z1);}\n"
+"            sum[t]+=dw*0.25f*((float)ls+0.5f)*(ts0[qb]*(float)z0+ts1[qb]*(float)z1);\n"
+"        }}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
+
 "/* ---- matvec_iq3_s_f32: IQ3_S matrix x F32 vector -> F32 ---- */\n"
 "/* Full 32-lane utilization: one lane per 8-element (sub-block,l) group.        */\n"
 "/* block_iq3_s layout: d(2) + qs(64) + qh(8) + signs(32) + scales(4)            */\n"
@@ -10882,12 +10913,14 @@ struct hip_llm_runner {
     hipFunction_t fn_quantize_q8x2_batch_32;
     hipFunction_t fn_matvec_iq2_s_dp4a;
     hipFunction_t fn_matvec_iq2_s_dp4a2;
+    hipFunction_t fn_matvec_iq2_s_dp4a2_batch_reuse4;
     hipFunction_t fn_matvec_iq3_s_dp4a;
     hipFunction_t fn_matvec_iq3_s_dp4a2;
     hipFunction_t fn_matvec_iq2_xxs_dp4a2;
     hipFunction_t fn_matvec_iq3_xxs_dp4a2;
     hipFunction_t fn_matvec_iq2_xs_dp4a2;
     hipFunction_t fn_matvec_iq2_xs_dp4a2_batch;
+    hipFunction_t fn_matvec_iq2_xs_dp4a2_batch_reuse4;
     hipFunction_t fn_matvec_iq2_xs_dp4a2_batch_tile;
     hipFunction_t fn_matvec_iq2_s_expert_dp4a;
     hipFunction_t fn_matvec_iq3_s_expert_dp4a;
@@ -11842,12 +11875,14 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(quantize_q8x2_batch_32);
     GET_FUNC(matvec_iq2_s_dp4a);
     GET_FUNC(matvec_iq2_s_dp4a2);
+    GET_FUNC(matvec_iq2_s_dp4a2_batch_reuse4);
     GET_FUNC(matvec_iq3_s_dp4a);
     GET_FUNC(matvec_iq3_s_dp4a2);
     GET_FUNC(matvec_iq2_xxs_dp4a2);
     GET_FUNC(matvec_iq3_xxs_dp4a2);
     GET_FUNC(matvec_iq2_xs_dp4a2);
     GET_FUNC(matvec_iq2_xs_dp4a2_batch);
+    GET_FUNC(matvec_iq2_xs_dp4a2_batch_reuse4);
     GET_FUNC(matvec_iq2_xs_dp4a2_batch_tile);
     GET_FUNC(matvec_iq2_s_expert_dp4a);
     GET_FUNC(matvec_iq3_s_expert_dp4a);
@@ -17371,6 +17406,13 @@ static inline void launch_matvec_iq2_xs_batch(hip_llm_runner *r, void *dst,
         void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
                        &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
                        &n_rows, &n_cols, &M };
+        const char *reuse_dp = getenv("LLM_QWEN35_NATIVE_IQ2XS_DP4A_REUSE4");
+        if (reuse_dp && atoi(reuse_dp) != 0) {
+            LAUNCH(r->fn_matvec_iq2_xs_dp4a2_batch_reuse4,
+                   (n_rows + 7) / 8, (M + 3) / 4, 1,
+                   256, 1, 1, 0, r->stream, da);
+            return;
+        }
         const char *tile_env = getenv("LLM_QWEN35_NATIVE_IQ2_DP4A_TILE");
         if (tile_env && atoi(tile_env) != 0) {
             LAUNCH(r->fn_matvec_iq2_xs_dp4a2_batch_tile,
@@ -17538,6 +17580,13 @@ static inline void launch_matvec_iq2_s_batch(hip_llm_runner *r, void *dst,
         void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
                        &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
                        &n_rows, &n_cols, &M };
+        const char *reuse_env = getenv("LLM_QWEN35_NATIVE_IQ2S_DP4A_REUSE4");
+        if (reuse_env && atoi(reuse_env) != 0) {
+            LAUNCH(r->fn_matvec_iq2_s_dp4a2_batch_reuse4,
+                   (n_rows + 7) / 8, (M + 3) / 4, 1,
+                   256, 1, 1, 0, r->stream, da);
+            return;
+        }
         LAUNCH(r->fn_matvec_iq2_s_dp4a2_batch, (n_rows + 7) / 8, M, 1,
                256, 1, 1, 0, r->stream, da);
         return;
