@@ -1,9 +1,409 @@
 # GLM-5.3F A64FX 12-node decode-first plan
 
+## Implemented prefill fast path: 150+ gate met (2026-09-15)
+
+On interactive job **51656483**, 12 A64FX nodes at normal 2.0 GHz, all six
+unprofiled complete prompt runs exceed 150 tok/s. **200 tok/s is not achieved.**
+This result is approximately-8K replicated-cache prefill, not a populated-512K
+context result. Weight precision is unchanged from v5.
+
+| Prompt | Run times, seconds | Aggregate tok/s | Median tok/s | Minimum tok/s |
+| --- | --- | ---: | ---: | ---: |
+| C++ stable-sort, 8050 tokens | 52.370787 / 52.074667 / 52.204315 | **154.166** | 154.202 | **153.712** |
+| Synthetic, 8192 tokens | 53.808003 / 53.666977 / 53.615906 | **152.560** | 152.645 | **152.245** |
+
+Aggregate means total tokens / total slowest-rank elapsed seconds across
+three runs. The full packing/compute/communication path is timed; loading,
+state-validation I/O, and the final untimed probe are excluded. Production
+profiling is explicitly absent. Logs: `tmp/glm53f-prefill150/`
+`sort8050-slab16-3-v11.37.*` and `synth8192-slab16-3-v11.38.*`.
+The archived v5 three-run rates were 106.765 and 108.238 respectively
+(profiled, earlier allocation); do not call that an unprofiled matched control.
+
+The selected explicit recipe is **mask27, outer512, slab16, tree-packed**:
+exact-tree reduce-scatter/allgather, chronological column-blocked KDA,
+16-token INT8 expert panels with redundant route clears removed, and
+independent-register MLA. Projection GEMM bit4 and the rejected ring are off.
+Legacy/omitted-option defaults remain unchanged. Shared-key union GEMM is
+deferred; it is not required for this achieved 150+ checkpoint.
+
+Both full prompts pass against v5 with zero hidden/state/cache numerical
+error, unchanged selected indices, and **256/256** matching teacher-forced
+continuation predictions, mean KL=0 and NLL delta=0. The 257/2084 boundary
+checks pass as well. Five-token scalar/batch, snapshot-probe, invalid-length,
+and invalid-readout checks pass for both FP8 and INT8 (`batch-five-fp8-v11.31.*`,
+`batch-five-int8-v11.32.*`; restored probes 92/92). The **524288-token cache
+capacity/page-touch smoke test passes**, retaining the CP fallback
+(`features=0 collective=0`), with resident minimum 3.265076 GiB and sampled
+run minimum **3.080505 GiB** available. For its short 256-token timed prefill
+plus 16-token decode, rates are 57.655 and 21.048 tok/s, respectively; final
+token 1172 matches the old capacity smoke test. It does **not** measure a
+populated-512K context. Log: `capacity512k-v11.33.*`.
+
+Slab16 is selected following the plan's <2% rule. The fully qualified slab32
+checkpoint measured **153.165 tok/s C++** (52.579220 / 52.607851 / 52.486529 s)
+and **155.074 tok/s synthetic** (52.980299 / 52.713587 / 52.785090 s), with all
+six runs above 150 (`sort8050-unprofiled-v11.29.*`,
+`synth8192-unprofiled-v11.30.*`). Slab16 is 0.65% faster on C++ and 1.62%
+slower on synthetic, so the smaller payload wins the tie; collective
+registration remains bounded at the same 32-token capacity. Its preliminary
+single C++ run was 153.272 tok/s (`sort8050-slab16-v11.34.*`), excluded from
+the three-run aggregates above.
+
+Slab16 full-prompt qualification passes on both inputs: the all-rank audit
+contains **1464 numerical fields with zero errors, 264 unchanged selected-index
+lists, and two 256/256 continuations with KL=0 and NLL=0**, with no failures
+(`qualify8050-slab16-v11.35.*`, `qualify8192-slab16-v11.36.*`). The five-token
+and CP tests above used configured slab32 but exercise identical fallbacks
+with slab16: those paths do not select the new prefill reductions.
+
+Per-rank minimum `MemAvailable` over the three unprofiled runs, GiB:
+
+| Rank | C++ 8050 | Synthetic 8192 |
+| ---: | ---: | ---: |
+| 0 | 3.645386 | 3.633911 |
+| 1 | 4.045898 | 4.080933 |
+| 2 | 3.820312 | 3.826965 |
+| 3 | 4.087280 | 4.080750 |
+| 4 | 4.079651 | 4.088562 |
+| 5 | 3.801575 | 3.801147 |
+| 6 | 4.052002 | 4.061523 |
+| 7 | 4.077454 | 4.080078 |
+| 8 | 3.844910 | 3.824829 |
+| 9 | 4.078308 | 4.073059 |
+| 10 | 4.055664 | 4.065063 |
+| 11 | 3.829285 | 3.797852 |
+
+### Approved plan and chronological development record
+
+The final results above supersede the pending statuses in the historical
+checkpoints below.
+
+Approved scope: the existing approximately-8K replicated-cache benchmarks on
+12 normal-frequency A64FX nodes, not populated-512K prefill. Acceptance is
+three complete runs above 150 tok/s on both the 8050-token sorting prompt and
+8192 synthetic inputs; 200 tok/s is a stretch, not the minimum completion gate.
+Preserve v5 as the control. Floating-point reassociation with bounded drift is
+allowed, but weight precision and nonlinear functions stay unchanged: INT8
+routed/shared experts, BF16 KDA/router, FP8 sparse projections, FP32 activations.
+
+Implementation order, recorded before code changes:
+
+1. Add explicit `--prefill-mode v5|fast` recipes and model configuration,
+   preserving omitted-option behavior, scalar decode, five-token verification,
+   snapshots, and the CP fallback. Extend per-rank KDA/MoE/collective diagnostics;
+   keep instrumented runs separate from performance acceptance.
+2. Separate reduction slabs from arithmetic panels. Register up to 32*4096
+   FP32 elements, check capacity, and test 8/16/32-token KDA/MoE/sparse-output
+   slabs. Batch owner-only sparse-index score exchanges with causal padding;
+   preserve local short-context FP64 selection. Keep MPI/uTofu on the main thread.
+3. Use bounded packed FP32 GEMM panels (8 tokens x 48 outputs, K block 128,
+   output block 192) for BF16/FP8 attention projections. Include packing time;
+   never retain a full FP32 weight copy or round FP32 activations to BF16.
+   Parallelize KDA recurrence into eight independent 16-value-column tasks per
+   head using aligned value-blocked scratch; advance tokens chronologically,
+   precompute q/k/decay/beta, and restore canonical state before returning.
+4. Add exact 16-output x 16-token SDOT for sufficiently occupied MoE groups,
+   keeping 8/4/scalar tails and existing activation scales. Reuse quantized
+   inputs, parallelize activation by token slot, and include packing/combine
+   costs when selecting dispatch thresholds.
+5. After preserving a qualified 150+ checkpoint, test fast-only 512-token
+   outer tiles, FP32 reduce-scatter/allgatherv, and shared-key sparse MLA GEMM.
+   Use the latter only for selected-row unions <=4096 rows and <=2x mean
+   selected count; mask nonselected/future rows and otherwise retain indexed MLA.
+
+Numerical gates: INT8 integer kernels remain exact. Isolated projection and
+attention/recurrence relative L2 <=1e-4 and maximum error <=1e-6 +
+5e-4*max_abs(reference). Integrated floating hidden/state/cache relative L2
+<=1e-3 at 257, 2084 and approximately 8K positions; metadata remains exact.
+Compare 256 teacher-forced v5 continuation tokens per main prompt: top-1
+agreement >=99%, mean KL <=1e-4, mean reference-token NLL increase <=0.01 nat.
+Do not silently loosen gates or reopen the previously accepted oversized
+generated-code compile task. Retain legacy byte-exact tests and test boundaries
+4/5, 31/32/33, 255/256/257, 511/512/513 and 2047--2053, plus tails, zeros,
+cancellation-heavy inputs, causal selection, restoration and finite values.
+
+Execution: use the remote 12-node interactive procedure, <=6 hours/allocation,
+normal 2.0 GHz and 48 pinned workers, bounded rank-owned `/local` staging and
+anonymous HBM loading. Use unique source/binary paths with SHA-256 records to
+avoid stale LLIO reads. Additional scratch budget is 256 MiB/rank steady and
+384 MiB/rank peak; retain the 2 GiB guard and separately recheck 512K capacity.
+Never load two model copies concurrently. Time all prompt packing/compute/
+communication, excluding loading and validation I/O; report three-run aggregate,
+median/minimum, per-rank memory minima and exact commands. Prefer a smaller
+reduction slab when complete-run differences are below 2%.
+
+Working 150 tok/s budget (not an additive critical-path assertion): KDA 1.80,
+sparse 1.50, local MoE 1.35, MoE reduction 1.10, other 0.85 ms/token, total
+6.60 ms/token. No new performance result is claimed by this implementation plan.
+
+Implementation checkpoint (job 51656483, interactive 12 nodes, normal mode):
+the fast recipe, checked 32-token collectives, causal score slabs, blocked KDA
+recurrence, 16-token SDOT and projection GEMM experiments are implemented.
+The initial GEMM experiment uses one **model-shared 32 MiB arena**, packing
+one projection at a time and reusing it across all 8-token panels, instead of
+repacking each K=128/N=192 tile. This is an explicit implementation experiment,
+not a precision change or a persistent FP32 model copy. Its complete packing
+cost must beat v5 before this feature is accepted.
+
+Host and A64FX checks pass: 32 KDA state/output comparisons (bit-exact on
+A64FX), 84 INT8 cases against int64 sums, and 132 BF16/FP8 GEMM cases against
+FP64 scalar dots, including short output tails and FP8 scale-block crossings.
+Logs: `tmp/glm53f-prefill150/{kda,gemm,int8}-native-v2.log`. Full-model numeric
+qualification and performance are still pending. The native v1 build completed;
+staging was resumed after its 900-second diagnostic timeout, retaining the
+bounded partial files. During staging the compiler waited in filesystem I/O;
+node memory remained healthy (~29.8 GiB available before model loading).
+
+The 257-token integrated qualification now passes on all ranks: every typed
+hidden/state/cache comparison has relative L2=0, selected indices are unchanged,
+and the fixed 256-token continuation has **256/256 top-1, mean KL=0, NLL delta=0**.
+This is candidate v2 with feature mask 11 (communication + recurrence + INT8
+16-token panels); it does not qualify the separate GEMM experiment or 8K yet.
+Log: `tmp/glm53f-prefill150/qualify257-v2.7.0` (per-rank companion logs).
+
+The current fast default excludes GEMM: the initial full-projection packing
+was much slower than v5. K=128 packing tiles, vector decode/scatter and full
+8-token specialization are being tested behind feature bit 4. Do not promote
+that bit from isolated compute performance alone. The new 12-rank collective
+sweep is exact at all tested sizes: slab 1/4/8/16/32 measures
+36.080/27.114/25.126/24.128/22.552 us/token (no worker team or model).
+Log: `tmp/glm53f-prefill150/collective-v1.3.0`.
+
+### New prefill controls and qualification
+
+`--prefill-mode v5|fast` selects the named recipe; omitted mode preserves the
+existing environment-selected behavior. Named modes default to outer chunk
+256 unless explicitly supplied, while scalar and five-token APIs remain
+unchanged. `--prefill-slab 4|8|16|32` controls communication only. Diagnostic
+`--prefill-features MASK` selects bits 1=slabs, 2=column recurrence, 4=experimental
+packed GEMM, 8=INT8 panel16; current fast default is 11. CP caches disable these
+new features. Neither recipe selects weight precision: use
+`GLM53F_PREFILL_INT8=1` for the benchmark or `--weight-format int8` for generation.
+
+`--qualify-prefix /local/UNIQUE_PREFIX` runs v5 then fast in **one resident
+model**, resetting to the empty snapshot between them. It writes and checks
+typed state traces and teacher-forces 256 v5 continuation tokens using local
+vocabulary-shard logits (no full-vocabulary gather). Reference-token NLL and
+KL use FP64 global reductions. The starting diagnostic continuation token is
+31415, matching the existing benchmark's untimed probe. Qualification requires
+`--prefill-mode fast`, one repeat, and a new prefix (trace files are exclusive).
+`--state-check` remains byte-exact; `--state-check-numeric` checks FP32 fields at
+relative L2<=1e-3, exact metadata, and separately reports selected-index changes.
+These validation-I/O runs must never be reported as production throughput.
+From candidate v5 onward the qualification harness reads the actual final
+prompt token's logits without advancing state, then teacher-forces v5's
+continuation. The earlier v2 checks used the explicitly documented extra probe;
+their zero state/cache error remains valid, but they are not the new readout test.
+Candidate v10 adds `--weight-format fp8|int8` to the prefill benchmark (explicit
+arguments override the older environment selector), plus per-rank memory
+minima outside the timed interval. Feature bit 16 is the independent-register
+MLA experiment; mask 27 combines it with current fast mask 11. The diagnostic
+mask range is now 0--31; bit 4 remains the unqualified projection GEMM.
+
+Inside the allocation, using the versioned scripts/binaries in
+`tmp/glm53f-prefill150/`:
+
+```sh
+bash tmp/glm53f-prefill150/run.sh "$PWD/tmp/glm53f-prefill150/prefill_v2" \
+    257 256 qualify257-v2 --prefill-mode fast --prefill-features 11 \
+    --qualify-prefix /local/glm53f-qual257-v2
+bash tmp/glm53f-prefill150/run.sh "$PWD/tmp/glm53f-prefill150/prefill_v2" \
+    8192 256 synth8192-fast11-v2 --prefill-mode fast --prefill-features 11 --repeats 3
+```
+
+Native unit tests: `test_glm53f_kda_prefill`, `test_glm53f_int8_batch`,
+`test_glm53f_prefill_gemm`, and `test_glm53f_state_io /local` (the latter also
+deliberately tests rejected drift/nonfinite values and exact metadata).
+
+First measured checkpoint: candidate v2/mask11/slab32, job 51656483, synthetic
+8192, three complete runs **63.130946 / 62.969691 / 63.065128 s**, aggregate
+**129.918 tok/s**, median 129.897, range 129.762--130.094, minimum available
+memory **3.830 GiB**. This is ~20% faster than the recorded v5 synthetic
+108.238 tok/s, but **does not meet 150** and the coding prompt is pending.
+The 2084-token numeric/continuation qualification also passes with all floating
+relative errors zero, no changed selected indices, top1=256/256, KL=0, NLL=0.
+Logs: `synth8192-fast11-v2.9.0`, `qualify2084-v2.8.0` and per-rank companions
+under `tmp/glm53f-prefill150/`.
+
+Implementation sequencing update based on that measurement: move the planned
+reduce-scatter/allgather experiment ahead of the 150 checkpoint rather than
+blocking it behind the unmet target. The opt-in prefill-only
+`--prefill-collective mpi-rsag|ring` compares MPI Reduce_scatter/Allgatherv with
+an FP32 uTofu ring (11 disjoint receive slots per phase, mandatory barriers
+before reuse and return to legacy collectives). Default `utofu` remains the
+qualified recursive-doubling path. Slabs <=5 retain legacy reductions;
+scalar decode, verification and CP fallback never select either experiment.
+Both experiments require independent collective tests and full-model numeric
+qualification; they are not yet measured model throughput.
+
+**Ring rejected by the numerical gate:** v4 at 257 tokens measured hidden
+relative L2=0.0863841 (gate 0.001) and stopped before candidate continuation.
+Do not interpret its legacy log's `top1=0/256` as a completed continuation test.
+The corrected harness explicitly reports the number of evaluated steps.
+The elementary floating collective itself differs from recursive doubling by
+only 8.21e-8 relative L2; this does not establish full-model numerical safety.
+The gate is unchanged. Logs: `qualify257-ring-v4.13.*` and
+`collective-v5-2.15.0` under `tmp/glm53f-prefill150/`.
+
+The replacement `--prefill-collective tree-rsag` preserves the original
+prefold + XOR 1/2/4 FP32 summation tree, assigning bit-reversed ownership during
+reduce-scatter and reversing the masks for allgather. It is **byte-exact**
+against the original collective on nonuniform floating inputs; isolated slab32
+cost is **16.176 us/token** versus 22.614 for the old tree. `tree-packed` is a
+further opt-in variant: shortened payloads are right-aligned against the same
+fixed sequence footer so each stage uses one contiguous Put. The footer never
+overlaps old payload data. Neither is the default.
+
+The packed tree now passes both 257- and 2084-token integrated checks with
+all floating fields exact, selected indices unchanged, and actual prompt
+readout / teacher-forced continuation **256/256, KL=0, NLL delta=0**.
+Logs: `qualify257-treepacked-v6.19.*`, `qualify2084-treepacked-v6.20.*`.
+The native collective stress test additionally passes 256 barrier-free calls
+of varying sizes mixed with scalar reductions. Slab32 isolated time is
+15.884 us/token, or 18.118 with injected rank skew, versus the unpacked
+tree's 16.390 / 17.869. This small difference does not select a winner yet.
+
+Candidate v7 also moves the planned fast-only 512-token outer scheduler ahead
+of the unmet 150 checkpoint. Attention panels remain 32, v5/legacy limit 256,
+and five-token verification is unchanged. CP fallback splits 512 into old
+256-token calls. Enlarged shared batch storage must still pass memory and
+numerical qualification; it is not the default chunk. `--recipe-sweep` loads
+one model and resets between v5, communication/recurrence/expert ablations,
+8/16/32 slabs, the exact-tree transports and 256/512 outer chunks.
+
+Next bounded sparse-MLA experiment: retain each query's selected rows, exact
+dot/reduction order, softmax and eight long-context value shards, but keep
+four independent latent-column vectors in registers during query absorption
+and value accumulation, and use eight independent output-row dots. This is
+not the deferred union-key GEMM or a changed summation tree. Gate it separately
+behind feature bit 16 and compare byte-for-byte against existing MLA before
+model qualification and throughput measurement.
+
+The INT8 grouped fast path will also omit the full `tokens*8*4096` route
+buffer clear: every rank-owned selected slot is fully overwritten by the
+down projection, and combine explicitly skips all nonowned slots. The old
+path retains the clear. This removes about 42 GiB of unnecessary stores per
+8192-token prefill per rank without changing arithmetic; qualification must
+confirm that ownership/overwrite invariant on the real routing workload.
+
+Same-allocation v7 synthetic-8192 recipe sweep (one profiled run each,
+**diagnostic, not three-run acceptance**): v5 107.085, communication-only
+119.936, communication + column recurrence 130.304, mask11 at slab8/16/32
+128.258 / 129.228 / 131.626, tree-rsag/slab32 141.872, tree-packed/slab32
+143.232, and tree-rsag / tree-packed at outer512 **148.178 / 149.667** tok/s.
+The final case's minimum available memory was 3.656 GiB. Every case has the
+same probe token/logit and hidden checksums. These probes do not replace full
+state and continuation qualification. Log: `synth8192-recipes-v7.21.*`.
+The v7 binary SHA-256 is
+`3168b0439f844dc12eff90bf5923d25c3a67153bcf724c9a01e923846d98d16f`.
+
+The v10 register-blocked MLA passes **34 native byte-exact cases** against
+both established one-shard and eight-shard orders, including selected counts
+2047--2051, short boundaries and zero queries. At 2051 selected rows the
+192-query/head-task microbenchmark improves from 4.444 to 3.505 ms (1.268x,
+eight shards); this is not an end-to-end speedup. Extended mHC tests through
+511/512 and all 84 INT8 cases including -128 also pass. Logs are
+`{mla_prefill,mhc_prefill,int8_batch,kda_prefill,prefill_config,state_io}-native-v10.log`.
+The combined mask27/outer512/packed-tree 257-token integrated check passes
+with zero floating error, unchanged indices, top1=256/256, KL=0, NLL=0
+(`qualify257-mask27-v10.22.*`).
+
+Final acceptance timings must **unset** `GLM53F_PROFILE`: the legacy model
+checks presence, so merely setting it to `0` still enables instrumentation.
+An in-place update to the old task runner was **not sufficient**: at 10:19 JST
+the compute node still saw the old script SHA `91bc1eaad8eb2ecdd82626d0f131c8a21c01c199666f5d27f50100844e512e41`
+while the login node saw `13272080f0c6059b0c69bbca7f70f712af642fe53d4eb5bb0760542fcb51e80c`.
+`/proc/PID/environ` confirmed `GLM53F_PROFILE=1`. Therefore the unfortunately
+named `synth8192-final-v11` run is a **profiled diagnostic**, not unprofiled
+acceptance. It completed at **154.755 tok/s aggregate**, with run times
+53.042276 / 52.935575 / 52.828214 s and unchanged probes. The subsequent
+`sort8050-final-v11` launch was deliberately stopped during loading (rank 0
+SIGTERM) to replace it with the clean run; it has no timing result.
+A new immutable `run-unprofiled-v11.sh` removes the
+flag in the parent and uses `env -u GLM53F_PROFILE -u GLM53F_PROFILE_RANKS`
+on every MPI rank before executing the model. Accept only its separate logs.
+Its SHA-256 matches on login and compute nodes:
+`27c2187164e9e8d50232eda92f8440796c70541288a8751d2d1b3571ae19833e`.
+
+Candidate v11 freezes the same inference arithmetic, adds coordinated aborts
+for qualification setup failures, and advances the slab loop by its actual
+final count to avoid integer overshoot. The complete canonical integrated
+build passes (`build-canonical-v11.log`), including existing decode/MTP tools.
+The final native collective stress sweep passes
+(`collective-final-v11.24.*`). The 2084-token v10 combined qualification also
+passes with zero state/cache drift and 256/256, KL=0, NLL=0
+(`qualify2084-mask27-v10.23.*`). Main-prompt qualification and unprofiled
+timing acceptance are still pending.
+
+Full synthetic-8192 v11 qualification passes: all floating hidden/state/cache
+relative errors and maximum errors are zero, selected indices are unchanged,
+and the 256-token teacher-forced continuation is **256/256, KL=0, NLL=0**.
+Log: `qualify8192-mask27-v11.25.*`. The **8050-token C++ prompt also passes**
+the same zero-error, unchanged-index, 256/256, KL=0, NLL=0 gates
+(`qualify8050-mask27-v11.26.*`). This preserves the accepted v5 behavior; it
+does not re-open or claim success for the previously failed code-compilation
+evaluation. Both archived v5 probe signatures match the new runs as well.
+
+The first clean unprofiled C++ run is **153.102 tok/s** (52.579220 s,
+3.703 GiB minimum available). `/proc/PID/environ` confirmed profiling absent;
+the per-rank `/usr/bin/env -u` wrapper also prevents an inherited diagnostic
+flag. Full three-run acceptance remains pending. Optional host ASan/UBSan
+linking was unavailable because this host lacks those runtime libraries;
+the native numerical/boundary tests and ordinary host INT8/config tests passed.
+
+Selected-recipe allocation accounting versus the old 256-token v5 maximum:
+outer buffers add 88.30 MiB/rank, shared INT8 grouped workspace 20.14 MiB,
+KDA blocked scratch at most 19.13 MiB (using six local heads for all 34
+layers), and 32-token collective registration 5.25 MiB. With additional
+short-MLA worker-stack scratch the conservative total is **below 135 MiB/rank**,
+within the 256 MiB steady budget. These are reserved-buffer bounds, not RSS
+measurements; demand paging and omitted route-buffer clears reduce residency.
+The unselected projection-GEMM arena would add 32 MiB; qualification adds
+approximately 25 MiB/rank of logit shards and a temporary state snapshot,
+remaining below the separate 384 MiB peak budget. Recheck actual headroom
+at both 8K and committed 512K capacity before final acceptance.
+
+#### Reproduce the candidate inside the existing 12-node allocation
+
+Build an immutable deployed source copy with
+`bash a64fx/glm5/build_glm53f_integrated_12n.sh` (matching site MPI wrapper,
+LLVM 21 in this allocation; do not enable fast-math). Stage rank-owned images
+to `/local` with the existing bounded staging procedure before running.
+The equivalent unprofiled benchmark invocation is:
+
+```sh
+export OMP_NUM_THREADS=48 OMP_DYNAMIC=false OMP_WAIT_POLICY=active
+export OMP_PROC_BIND=close OMP_PLACES=cores
+export GLM53F_REPACK_DIR=/local/glm53f-target-core-$PJM_JOBID
+export GLM53F_REPACK_REQUIRE=0 GLM53F_UTOFU=1
+export TOFU_TOPO_PATH=$PWD/tmp/tofu_topo.$PJM_JOBID.txt
+unset GLM53F_PROFILE GLM53F_PROFILE_RANKS
+prefill_binary=$PWD/tmp/glm53f-prefill150/prefill_v11
+mpiexec -np 12 -of-proc tmp/prefill-synth-$PJM_JOBID \
+    /usr/bin/env -u GLM53F_PROFILE -u GLM53F_PROFILE_RANKS "$prefill_binary" \
+    "$HOME/models/glm53f" /local/glm53f-target-routed-$PJM_JOBID \
+    /local/glm53f-target-shared-$PJM_JOBID 8192 512 \
+    --weight-format int8 --prefill-mode fast --prefill-features 27 \
+    --prefill-slab 16 --prefill-collective tree-packed --repeats 3
+```
+
+For the coding workload use positions 8050 and
+`--input-ids tmp/glm53f-quality-low-32k/prompt.ids`; its SHA-256 is
+`f13b3ff5ca0b9495ece0740d05ff743c14b8160732c68448cfb0f47c811d0dd2`.
+For qualification replace `--repeats 3` with
+`--qualify-prefix /local/NEW_UNIQUE_PREFIX`; never reuse an output trace prefix.
+For the v5 control use chunk 256 and `--prefill-mode v5`.
+The v11 benchmark SHA-256 is
+`a3a8fbc14ea57e82ef1905a5de40435351284790b6b0ea601dae4f37e5621466`.
+No production default or omitted-option behavior is changed: the complete
+candidate recipe is explicit. Ring and packed projection GEMM remain rejected
+or unqualified experiments, not part of mask27/packed-tree.
+
 ## Prefill and decode: measured results and ceilings (2026-09-15)
 
-This section summarizes existing measurements and engineering estimates; no
-new inference benchmark was run for this assessment. All rates are for one
+The original ceiling assessment predates the implementation above; the table
+also includes explicitly labeled v11 follow-up measurements. All rates are for one
 sequence on 12 A64FX nodes, without MTP. **Allocated cache capacity is not
 populated context length.** Estimates below are not achieved throughput or
 quality acceptance, and do not supersede the failed generated-code compile
@@ -14,6 +414,8 @@ workstream at the user's direction.
 
 | Workload | Prefill tok/s | Decode tok/s | Scope / configuration |
 | --- | ---: | ---: | --- |
+| Synthetic 8192-token prefill, v11 fast | **152.560** | not measured in this test | Three unprofiled runs, normal 2.0 GHz, selected mask27/outer512/slab16/packed tree; main-prompt numeric and continuation gates pass |
+| C++ stable-sort 8050-token prefill, v11 fast | **154.166** | not measured in this test | Same qualified configuration and three unprofiled runs |
 | Synthetic 8192-token prefill, final v5 | **108.238** | not measured in this test | Three-run aggregate; 2.0 GHz, INT8 experts, BF16 KDA/router, FP8 sparse projections, replicated cache |
 | C++ stable-sort 8050-token prefill, final v5 | **106.765** | not measured in this test | Same configuration; three-run aggregate |
 | First 512 positions, accepted c7, boost-eco | — | **26.914** | Unprofiled production-path control; INT8 experts + KDA; 512K BF16 cache committed; replicated first-512 prefix |
@@ -22,6 +424,7 @@ workstream at the user's direction.
 | Corrected C++ task, 8050 input + 8192 generated, FP8/BF16 | 14.233 | **13.451** | Earlier scalar-prefill runner; normal frequency; 65536 BF16-cache capacity; CP path |
 | Corrected C++ task, 8050 input + 8192 generated, INT8 experts + KDA | 16.360 | **15.341** | Matched task/allocation; 65536 BF16-cache capacity; CP path |
 | v4 512K-capacity/page-touch smoke test | **57.076** | **21.066** | Only 256 timed prompt positions and 16 generated tokens; INT8 experts, BF16 KDA; CP fallback |
+| v11 512K-capacity/page-touch smoke test | **57.655** | **21.048** | Same bounded 256+16 scope, INT8 experts/BF16 KDA, CP fallback; 3.080505 GiB minimum available |
 | Full-model prefill/decode at a populated 512K context | **not measured** | **not measured** | Capacity and isolated-layer probes do not establish this rate |
 
 The v5 prefill numbers exclude loading, validation trace I/O, and the final
@@ -114,11 +517,16 @@ clock-matched collective measurement for the older boost-eco decode runs.
 
 | Conditional model | Reduction-only ms/token | Zero-compute equivalent tok/s |
 | --- | ---: | ---: |
-| Prefill current grouping: 79 four-token + 11 single-token reductions | 2.511 | **398** |
+| INT8 v5 prefill current grouping: 37 four-token + 53 single-token reductions | 2.891 | **346** |
 | Prefill hypothetical 32-token grouping for all 90 reductions | 2.036 | **491** |
 | Non-MTP single-sequence decode: 90 single-token reductions | 3.225 | **310** |
 
-Thus the useful rounded transport-model ceilings are **400--490 tok/s for
+Code inspection during implementation corrected the original grouping estimate:
+the **INT8 grouped MoE reduces one token per call** (42 layers); the four-token
+MoE loop belongs to the separate FP8 path. The 37 four-token calls are 34 KDA
+and 3 dense FFN; the 53 single-token calls are 42 MoE and 11 sparse output.
+
+Thus the useful rounded transport-model ceilings are **350--490 tok/s for
 prefill** and **about 310 tok/s for decode**, with computation unrealistically
 free. They exclude index-score exchange, CP candidate/selected-row/pool
 communication, vocabulary argmax, memory traffic, and arrival skew. They are

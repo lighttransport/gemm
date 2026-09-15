@@ -111,6 +111,16 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_int8.c \
     -lm -o test_glm53f_int8
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_int8_batch.c \
     -lm -o test_glm53f_int8_batch
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_kda_prefill.c \
+    -lm -o test_glm53f_kda_prefill
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_prefill_gemm.c \
+    -lm -o test_glm53f_prefill_gemm
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_mla_prefill.c \
+    "${ldflags[@]}" -o test_glm53f_mla_prefill
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_prefill_config.c \
+    -lm -o test_glm53f_prefill_config
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_state_io.c \
+    -lm -o test_glm53f_state_io
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_mhc_prefill.c \
     -lm -o test_glm53f_mhc_prefill
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_sparse_prefill.c \

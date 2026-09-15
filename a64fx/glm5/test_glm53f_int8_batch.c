@@ -25,11 +25,11 @@ static void matrix(float *out, const int8_t *w, const float *scale,
         }
     } else {
 #pragma omp parallel for collapse(2) schedule(static)
-        for (int t = 0; t < tokens; t += 8)
+        for (int t = 0; t < tokens; t += 16)
             for (int r = 0; r < rows; r += 16) {
                 int n = tokens - t;
-                if (n > 8) n = 8;
-                glm53f_i8_dot16_batch(out + (size_t)t * rows + r, rows,
+                if (n > 16) n = 16;
+                glm53f_i8_dot16_batch16(out + (size_t)t * rows + r, rows,
                     w + (size_t)(r / 64) * 64 * cols + (r % 64) * 4,
                     scale + r, x + (size_t)t * cols, cols, xs + t, n, cols);
             }
@@ -47,13 +47,13 @@ static int check(int rows, int cols, int tokens, int reps) {
     for (int r = 0; r < rows; ++r) {
         scale[r] = r == 0 ? 0.0f : 0.0001f * (1 + r % 17);
         for (int c = 0; c < cols; ++c)
-            w[(size_t)r * cols + c] = (int8_t)((r * 37 + c * 19) % 255 - 127);
+            w[(size_t)r * cols + c] = (int8_t)((r * 37 + c * 19) % 256 - 128);
     }
     for (int t = 0; t < tokens; ++t) {
         xs[t] = 0.001f * (1 + t % 13);
         for (int c = 0; c < cols; ++c)
             x[(size_t)t * cols + c] = t == 0 ? 0 : t == 1 ? 127 :
-                t == 2 ? -127 : (int8_t)((t * 71 + c * 53) % 255 - 127);
+                t == 2 ? -128 : (int8_t)((t * 71 + c * 53) % 256 - 128);
     }
     matrix(ref, w, scale, x, xs, rows, cols, tokens, 0);
     matrix(out, w, scale, x, xs, rows, cols, tokens, 1);
@@ -94,11 +94,11 @@ int main(int argc, char **argv) {
         int rows = atoi(argv[1]), cols = atoi(argv[2]), tokens = atoi(argv[3]);
         int reps = atoi(argv[4]);
         if (rows < 64 || rows % 64 || cols < 128 || cols > 4096 ||
-            cols % 128 || tokens < 2 || tokens > 256 || reps < 1) return 2;
+            cols % 128 || tokens < 2 || tokens > 512 || reps < 1) return 2;
         return check(rows, cols, tokens, reps);
     }
     const int sizes[] = {128, 256, 512, 640, 768, 4096};
-    const int batches[] = {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 32};
+    const int batches[] = {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33};
     int failed = 0;
     for (unsigned k = 0; k < sizeof(sizes)/sizeof(sizes[0]); ++k)
         for (unsigned t = 0; t < sizeof(batches)/sizeof(batches[0]); ++t)

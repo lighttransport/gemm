@@ -7,7 +7,7 @@ int main(void) {
     uint16_t *w = malloc(weights * sizeof(*w));
     uint16_t norm[GLM53F_MHC_WIDTH];
     float base[GLM53F_MHC_MIX], scale[3] = {0.25f, 0.5f, 0.125f};
-    const int sizes[] = {1, 3, 4, 5, 31, 32, 64, 128, 256};
+    const int sizes[] = {1, 3, 4, 5, 31, 32, 33, 64, 128, 255, 256, 257, 511, 512};
     int failed = 0;
     if (!w) return 2;
     for (size_t i = 0; i < weights; ++i) {

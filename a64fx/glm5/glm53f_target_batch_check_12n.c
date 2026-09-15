@@ -9,6 +9,8 @@ enum { TOKENS = 5 };
 
 int main(int argc, char **argv) {
     int rank, ranks, ok, local_ok = 1;
+    int use_int8 = 0;
+    glm53f_prefill_config config = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     const int input[TOKENS] = {1, 17, 42, 314, 2718};
     int seq[TOKENS], bat[TOKENS], probe_seq, probe_bat;
     float seq_logit[TOKENS], bat_logit[TOKENS], probe_seq_logit, probe_bat_logit;
@@ -16,12 +18,25 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 4 || ranks != 12) MPI_Abort(MPI_COMM_WORLD, 2);
+    for (int i=4;i<argc;++i) {
+        int parsed=glm53f_prefill_option(&config,argc,argv,&i);
+        if (parsed<0) MPI_Abort(MPI_COMM_WORLD,2);
+        if (parsed>0) continue;
+        if (!strcmp(argv[i],"--weight-format") && i+1<argc) {
+            ++i;
+            if (!strcmp(argv[i],"int8")) use_int8=1;
+            else if (strcmp(argv[i],"fp8")) MPI_Abort(MPI_COMM_WORLD,2);
+        } else MPI_Abort(MPI_COMM_WORLD,2);
+    }
     const char *topology = getenv("TOFU_TOPO_PATH");
     if (getenv("GLM53F_UTOFU") &&
-            glm53f_collective_init_12n(topology, TOKENS * 4096))
+            glm53f_collective_init_12n(topology,
+                (config.mode == GLM53F_PREFILL_FAST ? 32 : TOKENS) * 4096))
         MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_target_model_12n *m = glm53f_target_model_create_12n(
         argv[1], argv[2], argv[3], TOKENS + 1);
+    if (!m || (use_int8 && glm53f_target_model_convert_int8_12n(m)) ||
+        glm53f_target_model_configure_prefill_12n(m,&config)) MPI_Abort(MPI_COMM_WORLD,2);
     glm53f_target_snapshot_12n *initial = glm53f_target_snapshot_create_12n(m);
     glm53f_target_snapshot_12n *seq_final = glm53f_target_snapshot_create_12n(m);
     glm53f_target_snapshot_12n *after[TOKENS];
@@ -30,6 +45,18 @@ int main(int argc, char **argv) {
     for (int t = 0; t < TOKENS; t++)
         if (!after[t]) MPI_Abort(MPI_COMM_WORLD, 2);
     local_ok &= !glm53f_target_snapshot_save_12n(m, initial);
+    /* Rejected requests must not inspect the deliberately five-element input
+     * or advance state. Larger prompt-only tiles have no verification outputs. */
+    local_ok &= glm53f_target_model_step_batch_12n(
+        m, input, 0, NULL, NULL, NULL, NULL) != 0;
+    local_ok &= glm53f_target_model_step_batch_12n(
+        m, input, GLM53F_PREFILL_MAX_TOKENS + 1, NULL, NULL, NULL, NULL) != 0;
+    local_ok &= glm53f_target_model_step_batch_12n(
+        m, input, TOKENS + 1, bat, bat_logit, NULL, NULL) != 0;
+    if (config.mode != GLM53F_PREFILL_FAST)
+        local_ok &= glm53f_target_model_step_batch_12n(
+            m, input, GLM53F_PREFILL_V5_TOKENS + 1, NULL, NULL, NULL, NULL) != 0;
+    local_ok &= glm53f_target_model_readout_12n(m, &probe_bat, &probe_bat_logit) != 0;
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
     for (int t = 0; t < TOKENS; t++)
@@ -38,6 +65,7 @@ int main(int argc, char **argv) {
     double seq_sec = MPI_Wtime() - t0;
     local_ok &= !glm53f_target_snapshot_save_12n(m, seq_final);
     local_ok &= !glm53f_target_snapshot_restore_12n(m, initial);
+    local_ok &= glm53f_target_model_readout_12n(m, &probe_bat, &probe_bat_logit) != 0;
     MPI_Barrier(MPI_COMM_WORLD);
     t0 = MPI_Wtime();
     local_ok &= !glm53f_target_model_step_batch_12n(

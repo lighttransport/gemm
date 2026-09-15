@@ -1,9 +1,12 @@
 #ifndef GLM53F_SPARSE_12N_H
 #define GLM53F_SPARSE_12N_H
 #include <stddef.h>
+#include "glm53f_prefill.h"
 
 typedef struct glm53f_sparse_context_12n glm53f_sparse_context_12n;
 typedef struct glm53f_sparse_prefill_workspace_12n glm53f_sparse_prefill_workspace_12n;
+void glm53f_sparse_configure_prefill_12n(glm53f_sparse_context_12n *context,
+                                        const glm53f_prefill_config *config);
 struct glm53f_state_io;
 int glm53f_sparse_state_io_12n(const glm53f_sparse_context_12n *context,
                                struct glm53f_state_io *io);

@@ -1,12 +1,15 @@
 #ifndef GLM53F_KDA_12N_H
 #define GLM53F_KDA_12N_H
 #include <stddef.h>
+#include "glm53f_prefill.h"
 
 typedef struct glm53f_kda_context_12n glm53f_kda_context_12n;
 
 glm53f_kda_context_12n *glm53f_kda_create_12n(
     const char *model_dir, int layer);
 void glm53f_kda_reset_12n(glm53f_kda_context_12n *context);
+void glm53f_kda_configure_prefill_12n(glm53f_kda_context_12n *context,
+                                     const glm53f_prefill_config *config);
 void glm53f_kda_free_12n(glm53f_kda_context_12n *context);
 int glm53f_kda_convert_int8_12n(glm53f_kda_context_12n *context);
 int glm53f_kda_sublayer_12n(

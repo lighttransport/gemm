@@ -1,7 +1,10 @@
 #ifndef GLM53F_MOE_STAGE_12N_H
 #define GLM53F_MOE_STAGE_12N_H
+#include "glm53f_prefill.h"
 
 typedef struct glm53f_moe_stage_context_12n glm53f_moe_stage_context_12n;
+void glm53f_moe_configure_prefill_12n(glm53f_moe_stage_context_12n *context,
+                                     const glm53f_prefill_config *config);
 
 glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
     const char *routed_stage, const char *shared_stage,

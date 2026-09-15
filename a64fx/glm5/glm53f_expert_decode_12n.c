@@ -189,6 +189,7 @@ static void route8(int token, int layer, int expert[8]) {
 #endif
 
 struct glm53f_moe_stage_context_12n {
+    glm53f_prefill_config prefill;
     int rank, first_layer, layer_count, active_layer;
     expert_offset *table;
     shared_offset shared[NLAYERS];
@@ -208,6 +209,11 @@ struct glm53f_moe_stage_context_12n {
     unsigned long long occupancy[5]; /* 0, 1, 2-3, 4-7, >=8 tokens/expert. */
     void *i8_prefill_storage;
 };
+
+void glm53f_moe_configure_prefill_12n(glm53f_moe_stage_context_12n *c,
+                                     const glm53f_prefill_config *config) {
+    if (c && config) c->prefill = *config;
+}
 
 static void moe_profile_occupancy(glm53f_moe_stage_context_12n *c,
                                   const int *selected, int tokens) {
@@ -466,6 +472,11 @@ void glm53f_moe_stage_profile_report_12n(const glm53f_moe_stage_context_12n *c,
     double p[3], minimum[3];
     MPI_Reduce(c->profile_phase,p,3,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     MPI_Reduce(c->profile_phase,minimum,3,MPI_DOUBLE,MPI_MIN,0,MPI_COMM_WORLD);
+    if (getenv("GLM53F_PROFILE_RANKS")) {
+        double d = positions ? positions : 1;
+        printf("GLM53F_MOE_RANK rank=%d router_ms=%.6f local_ms=%.6f allreduce_ms=%.6f\n",
+            c->rank,c->profile_phase[0]*1e3/d,c->profile_phase[1]*1e3/d,c->profile_phase[2]*1e3/d);
+    }
     if (!c->rank) {
         double d = positions ? positions : 1;
         printf("GLM53F_MOE_PROFILE label=%s router=%.3f local=%.3f allreduce=%.3f ms_pos\n",
@@ -476,6 +487,23 @@ void glm53f_moe_stage_profile_report_12n(const glm53f_moe_stage_context_12n *c,
                c->occupancy[0],c->occupancy[1],c->occupancy[2],c->occupancy[3],c->occupancy[4]);
     }
 }
+static inline int moe_prefill_activation(int8_t *ga, float *scale,
+                                          const float *up, int n) {
+    float act[512];
+    for (int i = 0; i < n; ++i) {
+        float g = up[i], u = up[n + i];
+        if (g > 10) g = 10;
+        if (g < -100) g = -100;
+        if (u > 10) u = 10;
+        if (u < -10) u = -10;
+        act[i] = (g / (1 + expf(-g))) * u;
+    }
+    if (glm53f_i8_quantize_x(ga, scale, act, n)) {
+        memset(ga, 0, n); *scale = 0; return 1;
+    }
+    return 0;
+}
+
 /* One shared workspace for every routed layer. Group all expert panels before
  * entering the team: unlike the previous grouped experiment, no expert or
  * token pays a separate OpenMP launch. The shared expert is the final group. */
@@ -497,7 +525,8 @@ static int moe_prefill_int8_local(glm53f_moe_stage_context_12n *c, float *out,
     float *xs = (float *)((unsigned char *)up + up_bytes);
     float *gs = xs + GLM53F_PREFILL_MAX_TOKENS, *as = gs + MAX_SLOTS;
     int counts[NEXPERTS + 1] = {0}, start[NEXPERTS + 2], cursor[NEXPERTS + 1];
-    int pos[MAX_SLOTS], slot[MAX_SLOTS], slots = 0, panels = 0, failed = 0;
+    int pos[MAX_SLOTS], slot[MAX_SLOTS], inter[MAX_SLOTS], slots = 0, panels = 0, failed = 0;
+    int panel_size = tokens > 5 && (c->prefill.features & GLM53F_PREFILL_EXPERT16) ? 16 : 8;
     const expert_offset *table = c->table + table_layer * NEXPERTS;
     typedef struct {
         const expert_offset *weight;
@@ -525,13 +554,17 @@ static int moe_prefill_int8_local(glm53f_moe_stage_context_12n *c, float *out,
         pos[s] = t; slot[s] = 8;
     }
     for (int e = 0; e <= NEXPERTS; ++e)
-        for (int s = start[e]; s < start[e + 1]; s += 8) {
+        for (int s = start[e]; s < start[e + 1]; s += panel_size) {
             int n = start[e + 1] - s;
-            if (n > 8) n = 8;
+            if (n > panel_size) n = panel_size;
             task[panels++] = (panel_task){e == NEXPERTS ? c->shared + table_layer : table + e,
                 e == NEXPERTS ? c->shared_blob : c->blob, s, n};
+            for (int t = 0; t < n; ++t) inter[s + t] = task[panels - 1].weight->inter;
         }
-    memset(c->batch_routes, 0, (size_t)tokens * 8 * H * sizeof(float));
+    /* Every owned slot is overwritten across all H down-projection rows.
+     * Combine skips nonowned slots, so fast prefill need not clear them. */
+    if (panel_size != 16)
+        memset(c->batch_routes, 0, (size_t)tokens * 8 * H * sizeof(float));
 #pragma omp parallel reduction(|:failed)
     {
 #pragma omp for schedule(static)
@@ -551,30 +584,25 @@ static int moe_prefill_int8_local(glm53f_moe_stage_context_12n *c, float *out,
                 const panel_task *q = task + p;
                 const expert_offset *w = q->weight;
                 if (r >= 2 * w->inter) continue;
-                glm53f_i8_dot16_batch(up + (size_t)q->begin * 1024 + r, 1024,
+                glm53f_i8_dot16_batch16(up + (size_t)q->begin * 1024 + r, 1024,
                     (const int8_t *)(q->blob + w->gate_up +
                         (size_t)(r / 64) * 64 * H + (r % 64) * 4),
                     w->i8_gate_scale + r, gx + (size_t)q->begin * H, H,
                     gs + q->begin, q->count, H);
             }
+        if (panel_size == 16) {
 #pragma omp for schedule(static)
-        for (int p = 0; p < panels; ++p) {
-            const panel_task *q = task + p;
-            int n = q->weight->inter;
-            for (int t = 0; t < q->count; ++t) {
-                int s = q->begin + t;
-                float act[512];
-                for (int i = 0; i < n; ++i) {
-                    float g = up[(size_t)s * 1024 + i];
-                    float u = up[(size_t)s * 1024 + n + i];
-                    if (g > 10) g = 10;
-                    if (g < -100) g = -100;
-                    if (u > 10) u = 10;
-                    if (u < -10) u = -10;
-                    act[i] = (g / (1 + expf(-g))) * u;
-                }
-                if (glm53f_i8_quantize_x(ga + (size_t)s * 512, as + s, act, n)) {
-                    memset(ga + (size_t)s * 512, 0, n); as[s] = 0; failed = 1;
+            for (int s = 0; s < slots; ++s)
+                failed |= moe_prefill_activation(ga + (size_t)s * 512, as + s,
+                                                  up + (size_t)s * 1024, inter[s]);
+        } else {
+#pragma omp for schedule(static)
+            for (int p = 0; p < panels; ++p) {
+                const panel_task *q = task + p;
+                for (int t = 0; t < q->count; ++t) {
+                    int s = q->begin + t;
+                    failed |= moe_prefill_activation(ga + (size_t)s * 512, as + s,
+                                                      up + (size_t)s * 1024, inter[s]);
                 }
             }
         }
@@ -583,8 +611,8 @@ static int moe_prefill_int8_local(glm53f_moe_stage_context_12n *c, float *out,
             for (int r = 0; r < H; r += 16) {
                 const panel_task *q = task + p;
                 const expert_offset *w = q->weight;
-                float value[8 * 16];
-                glm53f_i8_dot16_batch(value, 16,
+                float value[16 * 16];
+                glm53f_i8_dot16_batch16(value, 16,
                     (const int8_t *)(q->blob + w->down +
                         (size_t)(r / 64) * 64 * w->inter + (r % 64) * 4),
                     w->i8_down_scale + r, ga + (size_t)q->begin * 512, 512,
@@ -775,9 +803,10 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
                     c->profile_phase[1] += MPI_Wtime() - begin;
                     begin = MPI_Wtime();
                 }
-                for (int t = 0; t < tokens; ++t)
-                    if (glm53f_sum_allreduce_12n(c->batch_local + (size_t)t * 4096,
-                                                 out + (size_t)t * 4096, 4096)) return -1;
+                int slab = tokens > 5 && (c->prefill.features & GLM53F_PREFILL_COMM) ?
+                           c->prefill.slab_tokens : 1;
+                if (glm53f_sum_allreduce_slabs_12n(c->batch_local, out,
+                                                   tokens, 4096, slab)) return -1;
                 if (c->profile) c->profile_phase[2] += MPI_Wtime() - begin;
                 return 0;
             }
