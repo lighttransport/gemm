@@ -35,6 +35,8 @@ typedef enum {
     HIP_LLM_KV_AUTO = 0,
     HIP_LLM_KV_F32,
     HIP_LLM_KV_F16,
+    /* Explicit llama.cpp-compatible full-attention cache: q8_0 K/q4_0 V. */
+    HIP_LLM_KV_Q8_0_Q4_0,
 } hip_llm_kv_cache_type;
 
 typedef enum {
@@ -64,6 +66,10 @@ typedef struct {
     hip_llm_decode_layout_mode decode_layout_mode;
     const char *decode_layout_cache_path; /* borrowed for the duration of load */
     uint64_t decode_layout_budget_bytes;
+    /* Prefill microbatch size. 0 keeps the backend default (512 for Qwen3.5). */
+    int prefill_batch_tokens;
+    /* 0: quality-safe scalar dispatcher; 1: enable Qwen3.5 batched path. */
+    int qwen35_batched_prefill;
 } hip_llm_load_options;
 
 typedef struct {

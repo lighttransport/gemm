@@ -876,6 +876,8 @@ int main(int argc, char **argv) {
     hip_llm_decode_layout_mode decode_layout_mode = HIP_LLM_DECODE_LAYOUT_NATIVE;
     const char *decode_layout_cache_path = NULL;
     int decode_layout_budget_mib = 0;
+    int prefill_batch_tokens = 0;
+    int qwen35_batched_prefill = 0;
     int max_layers = 0;
     int verify_hc_batch = 0, verify_ple_split = 0, verify_ssm_projections = 0, verify_moe_native = 0;
     int verify_glm5next_kda = 0;
@@ -1011,7 +1013,15 @@ int main(int argc, char **argv) {
             if (!strcmp(mode, "auto")) kv_cache_type = HIP_LLM_KV_AUTO;
             else if (!strcmp(mode, "f32")) kv_cache_type = HIP_LLM_KV_F32;
             else if (!strcmp(mode, "f16")) kv_cache_type = HIP_LLM_KV_F16;
-            else { fprintf(stderr, "--kv-cache must be auto, f32, or f16\n"); return 2; }
+            else if (!strcmp(mode, "q8q4")) kv_cache_type = HIP_LLM_KV_Q8_0_Q4_0;
+            else { fprintf(stderr, "--kv-cache must be auto, f32, f16, or q8q4\n"); return 2; }
+        } else if (strcmp(argv[i], "--ubatch") == 0 && i + 1 < argc) {
+            prefill_batch_tokens = atoi(argv[++i]);
+            if (prefill_batch_tokens < 1 || prefill_batch_tokens > 8192) {
+                fprintf(stderr, "--ubatch must be in 1..8192\n"); return 2;
+            }
+        } else if (strcmp(argv[i], "--qwen35-batched-prefill") == 0) {
+            qwen35_batched_prefill = 1;
         } else if (strcmp(argv[i], "--decode-kernels") == 0 && i + 1 < argc) {
             const char *mode = argv[++i];
             if (!strcmp(mode, "native")) decode_kernel_mode = HIP_LLM_DECODE_KERNEL_NATIVE;
@@ -1098,7 +1108,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
             fprintf(stderr, "       [--bench] [--gpu-only-bench] [--gpu-only] [--decode N] [--prefill-len M] [--coding]\n");
             fprintf(stderr, "       [--moe-cache-mb MiB] [--moe-cpu]\n");
-            fprintf(stderr, "       [--kv-cache auto|f32|f16] [--decode-kernels native|dp4a2|auto]\n");
+            fprintf(stderr, "       [--kv-cache auto|f32|f16|q8q4] [--ubatch N] [--qwen35-batched-prefill]\n");
+            fprintf(stderr, "       [--decode-kernels native|dp4a2|auto]\n");
             fprintf(stderr, "       [--decode-layout native|auto] [--decode-layout-cache auto|off|PATH]\n");
             fprintf(stderr, "       [--decode-layout-budget-mib MiB]\n");
             fprintf(stderr, "       [--qwen4-mtp SIDECAR.gguf] [--qwen4-mtp-draft 1..32]\n");
@@ -1436,6 +1447,8 @@ int main(int argc, char **argv) {
     if (qwen4_prefill_stage_mb > 0)
         load_options.qwen4_prefill_stage_bytes = (uint64_t)qwen4_prefill_stage_mb << 20;
     load_options.kv_cache_type = kv_cache_type;
+    load_options.prefill_batch_tokens = prefill_batch_tokens;
+    load_options.qwen35_batched_prefill = qwen35_batched_prefill;
     load_options.decode_kernel_mode = decode_kernel_mode;
     load_options.decode_layout_mode = decode_layout_mode;
     load_options.decode_layout_cache_path = decode_layout_cache_path;
