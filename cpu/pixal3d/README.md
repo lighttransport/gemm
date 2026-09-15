@@ -9,6 +9,39 @@ The CLI and [C API](../../common/pixal3d.h) run in C/C++ without Python or PyTor
 CPU uses OpenBLAS; CUDA and ROCm use separately built native plugins. Python is
 confined to the [reference/validation environment](../../ref/pixal3d/README.md).
 
+## Resident GPU execution
+
+See [validation and measured performance](OPTIMIZATION.md).
+
+Add `--gpu-execution resident --gpu-kernels auto` to retain NN activations and
+packed weights on the GPU. The default remains `legacy`. `auto` uses vendor
+BF16/FP16 GEMM, CUDA FA2 or gfx12 WMMA for BF16 self-attention, and a dedicated
+five-key cross-attention kernel. `blas` disables matrix-instruction attention;
+`mma` additionally forces the experimental explicit MMA/WMMA GEMMs, which can
+be slower than vendor GEMM. FP32 conditioning and boundary layers stay FP32;
+there is no FP8, INT8 or TF32 precision reduction.
+
+Resident execution covers flow blocks, sparse/dense decoders, DINO and NAF.
+Coordinate construction, subdivision decisions, Euler updates, and mesh/PBR
+postprocessing remain on the CPU. DINO outputs are reused for identical images
+within a generation. Weights are cached in their compute type; activation
+buffers hold FP32 values rounded at the model's BF16/FP16 boundaries. Device
+scratch is reused within a stage and released at stage changes and before
+postprocessing. The existing `--vram-budget-mib` cap applies to resident
+allocations as well as legacy workspaces.
+
+`--profile-json tmp/pixal3d/profile.json` records conditioning, diffusion,
+decoder and postprocessing times, transfers, allocations, dispatch counts and
+reserved device peak. `resident_command_ms` measures resident device commands
+with GPU events; enabling it synchronizes each command and adds overhead.
+Generation time excludes GLB serialization. External process/device VRAM can
+be measured with `ref/pixal3d/run_fixture.py`.
+
+The C API uses a separate versioned `pixal3d_gpu_options` structure initialized
+with `pixal3d_default_gpu_options`, then applied with `pixal3d_configure_gpu`
+before generation. The original options/result layouts are unchanged. Rebuild
+both the host library and GPU plugins together for resident execution.
+
 ## Build
 
 Run from the repository root. Requirements: Linux x86-64, GCC 12+ or a Clang compiler with `_Float16`, C++17, OpenMP,

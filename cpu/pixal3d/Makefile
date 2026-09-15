@@ -8,7 +8,7 @@ OPENCV_ROOT ?= $(abspath ../../ref/pixal3d/deps/opencv/usr)
 CXXFLAGS += -MMD -MP -I$(OPENCV_ROOT)/include/opencv4
 LDLIBS += -L$(OPENCV_ROOT)/lib/x86_64-linux-gnu -Wl,-rpath,$(OPENCV_ROOT)/lib/x86_64-linux-gnu -lopencv_core -lopencv_imgproc
 export TMPDIR := $(abspath ../../tmp/pixal3d)
-OBJECTS = io.o math.o engine.o pointwise.o flow.o conditioning.o decoders.o preprocess.o json.o pipeline.o geometry.o remesh.o simplify.o unwrap.o postprocess.o inpaint_opencv.o glb.o lightrt.o xatlas.o
+OBJECTS = io.o math.o engine.o resident.o pointwise.o flow.o conditioning.o decoders.o preprocess.o json.o pipeline.o geometry.o remesh.o simplify.o unwrap.o postprocess.o inpaint_opencv.o glb.o lightrt.o xatlas.o
 all: libpixal3d.so pixal3d
 pixal3d: main.o libpixal3d.so
 	$(CXX) -o $@.new main.o -L. -lpixal3d -Wl,-rpath,'$$ORIGIN' $(LDLIBS)

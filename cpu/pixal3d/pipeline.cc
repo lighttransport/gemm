@@ -56,6 +56,7 @@ struct Pipeline {
     Json config;
     std::mt19937 random;
     std::string dumps;
+    std::map<int, std::pair<Image, Vec>> dino_cache;
     Pipeline(Engine &e, const pixal3d_options &o)
         : engine(e), options(o), config(read_json(std::string(o.model_dir) + "/pipeline.json").at("args")),
           random(o.seed), dumps(o.dump_dir ? o.dump_dir : "") {}
@@ -64,12 +65,18 @@ struct Pipeline {
     }
     Conditioning conditioning(const Image &image, const Coords &coords, int resolution, int target,
                               const pixal3d_camera &camera, const std::string &stage) {
+        auto started = std::chrono::steady_clock::now();
         std::fprintf(stderr, "Pixal3D %s: conditioning %dx%d, %zu tokens\n", stage.c_str(), image.width,
                      image.height, coords.size() / 4);
         Vec features;
-        {
+        auto cached = dino_cache.find(image.width);
+        if (engine.resident() && cached != dino_cache.end() && cached->second.first.pixels == image.pixels)
+            features = cached->second.second;
+        else {
             Weights weights(options.dinov3_path);
             features = dino(engine, weights, image_float(image, true, true), image.width);
+            if (engine.resident())
+                dino_cache[image.width] = {image, features};
         }
         Conditioning cond;
         cond.global.assign(features.begin(), features.begin() + 5 * 1024);
@@ -94,10 +101,13 @@ struct Pipeline {
             cond.projected = std::move(low);
         dump(dumps, stage + "_global", cond.global, 1024);
         dump(dumps, stage + "_projected", cond.projected, target ? 2048 : 1024, coords);
+        engine.record(stage + ".conditioning",
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
         return cond;
     }
     Sparse sample(const std::string &key, const std::string &sampler, const Coords &coords,
                   const Conditioning &cond, const std::string &stage, const Sparse *concat = nullptr) {
+        auto started = std::chrono::steady_clock::now();
         Weights weights(model_path(key));
         int channels = weights.shape("out_layer.weight")[0];
         Sparse x{coords, Vec(coords.size() / 4 * channels), channels};
@@ -151,6 +161,8 @@ struct Pipeline {
             dump(dumps, stage + "_step_" + std::to_string(step + 1), x.feats, channels, coords);
             std::fprintf(stderr, "Pixal3D %s: step %d/%d\n", stage.c_str(), step + 1, steps);
         }
+        engine.record(stage + ".diffusion",
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
         return x;
     }
     void run(const pixal3d_image &source, const pixal3d_camera &camera, pixal3d_result &result) {
@@ -177,7 +189,11 @@ struct Pipeline {
         Vec occupancy;
         {
             Weights weights(model_path("sparse_structure_decoder"));
+            auto decoder_start = std::chrono::steady_clock::now();
             occupancy = decode_structure(engine, weights, structure.feats);
+            engine.record(
+                "structure.decoder",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - decoder_start).count());
         }
         dump(dumps, "structure_decoded", occupancy, 1);
         Coords low;
@@ -204,7 +220,11 @@ struct Pipeline {
         {
             Weights weights(model_path("shape_slat_decoder"));
             std::vector<Subdivision> subs;
+            auto decoder_start = std::chrono::steady_clock::now();
             Sparse up = decode_sparse(engine, weights, shape_low, true, subs, false);
+            engine.record(
+                "shape512.decoder",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - decoder_start).count());
             high.resize(up.coords.size());
             int64_t n = pixal3d_cascade_coords(up.coords.data(), up.rows(), 512, 1024, high.data());
             require(n > 0, "Invalid cascade coordinates");
@@ -228,11 +248,19 @@ struct Pipeline {
         Sparse shape_out, texture_out;
         {
             Weights weights(model_path("shape_slat_decoder"));
+            auto decoder_start = std::chrono::steady_clock::now();
             shape_out = decode_sparse(engine, weights, shape, false, subs, false);
+            engine.record(
+                "shape1024.decoder",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - decoder_start).count());
         }
         {
             Weights weights(model_path("tex_slat_decoder"));
+            auto decoder_start = std::chrono::steady_clock::now();
             texture_out = decode_sparse(engine, weights, texture, false, subs, true);
+            engine.record(
+                "texture.decoder",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - decoder_start).count());
         }
         require(shape_out.coords == texture_out.coords, "Shape and texture coordinates differ");
         for (float &v : texture_out.feats)
@@ -240,7 +268,11 @@ struct Pipeline {
         dump(dumps, "shape_decoded", shape_out.feats, 7, shape_out.coords);
         dump(dumps, "texture_decoded", texture_out.feats, 6, texture_out.coords);
         result.stats.shape_tokens = shape.rows();
+        engine.clear_weights();
+        auto post_started = std::chrono::steady_clock::now();
         postprocess(shape_out, texture_out, options, result);
+        engine.record("postprocess",
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - post_started).count());
     }
 };
 } // namespace px
@@ -249,6 +281,24 @@ struct pixal3d_context {
     std::string model, dino, naf, dump, error;
     std::unique_ptr<px::Engine> engine;
 };
+extern "C" void pixal3d_default_gpu_options(pixal3d_gpu_options *o) {
+    if (o) {
+        *o = {};
+        o->struct_size = sizeof(*o);
+        o->version = 1;
+    }
+}
+extern "C" int pixal3d_configure_gpu(pixal3d_context *c, const pixal3d_gpu_options *o) {
+    if (!c || !o)
+        return -1;
+    try {
+        c->engine->configure(*o);
+        return 0;
+    } catch (const std::exception &e) {
+        c->error = e.what();
+        return -1;
+    }
+}
 static thread_local std::string creation_error;
 extern "C" void pixal3d_default_options(pixal3d_options *o) {
     if (!o)
@@ -311,6 +361,7 @@ extern "C" int pixal3d_generate(pixal3d_context *c, const pixal3d_image *image, 
     c->error.clear();
     auto start = std::chrono::steady_clock::now();
     try {
+        c->engine->begin_profile();
         px::Pipeline(*c->engine, c->options).run(*image, *camera, *result);
         result->stats.elapsed_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -320,6 +371,8 @@ extern "C" int pixal3d_generate(pixal3d_context *c, const pixal3d_image *image, 
         result->stats.peak_host_bytes = size_t(usage.ru_maxrss) * 1024;
         result->stats.vertices = result->vertex_count;
         result->stats.triangles = result->triangle_count;
+        c->engine->record("generate", result->stats.elapsed_seconds);
+        c->engine->write_profile();
         return 0;
     } catch (const std::exception &e) {
         c->error = e.what();

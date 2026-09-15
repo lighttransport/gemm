@@ -32,6 +32,9 @@ template <typename T> static T integer_argument(const std::string &key, const st
 int main(int argc, char **argv) {
     pixal3d_options options;
     pixal3d_default_options(&options);
+    pixal3d_gpu_options gpu_options;
+    pixal3d_default_gpu_options(&gpu_options);
+    std::string profile;
     pixal3d_camera camera{0, 0, 1};
     std::string input, mask, output, model, dino, naf, dump;
     try {
@@ -44,6 +47,7 @@ int main(int argc, char **argv) {
                     "  --mask MASK.png (required for RGB)  --distance FLOAT  --mesh-scale FLOAT\n"
                     "  --model-dir DIR  --dinov3 FILE  --naf FILE  --seed N\n"
                     "  --vram-budget-mib N (maximum 14336)  --dump-dir DIR\n"
+                    "  --gpu-execution legacy|resident  --gpu-kernels auto|blas|mma  --profile-json FILE\n"
                     "Single-view Pixal3D main: 1024 cascade, BF16 flow, FP16 decoders, 4096 PBR textures.");
                 return 0;
             }
@@ -56,6 +60,24 @@ int main(int argc, char **argv) {
                 output = value;
             else if (key == "--mask")
                 mask = value;
+            else if (key == "--gpu-execution") {
+                if (value == "legacy")
+                    gpu_options.execution = PIXAL3D_GPU_LEGACY;
+                else if (value == "resident")
+                    gpu_options.execution = PIXAL3D_GPU_RESIDENT;
+                else
+                    throw std::runtime_error("Invalid GPU execution mode");
+            } else if (key == "--gpu-kernels") {
+                if (value == "auto")
+                    gpu_options.kernels = PIXAL3D_KERNEL_AUTO;
+                else if (value == "blas")
+                    gpu_options.kernels = PIXAL3D_KERNEL_BLAS;
+                else if (value == "mma")
+                    gpu_options.kernels = PIXAL3D_KERNEL_MMA;
+                else
+                    throw std::runtime_error("Invalid GPU kernel mode");
+            } else if (key == "--profile-json")
+                profile = value;
             else if (key == "--backend") {
                 if (value == "cpu")
                     options.backend = PIXAL3D_CPU;
@@ -127,6 +149,9 @@ int main(int argc, char **argv) {
                                                                              pixal3d_destroy);
         if (!context)
             throw std::runtime_error(pixal3d_last_error(nullptr));
+        gpu_options.profile_json = profile.empty() ? nullptr : profile.c_str();
+        if (pixal3d_configure_gpu(context.get(), &gpu_options))
+            throw std::runtime_error(pixal3d_last_error(context.get()));
         pixal3d_result result{};
         if (pixal3d_generate(context.get(), &image, &camera, &result))
             throw std::runtime_error(pixal3d_last_error(context.get()));

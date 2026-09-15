@@ -289,3 +289,29 @@ of exact image reconstruction or full-trajectory PyTorch equivalence.
 GLBs, previews, stage dumps and detailed logs remain under ignored
 `tmp/pixal3d/runs/`. Reproduce exports with `run_fixture.py` and the fixture
 arguments above; use `validate_glb.py` and `preview_glb.py` to check them.
+
+## Resident GPU validation and benchmarking
+
+Build host and both plugins as described in `cpu/pixal3d/README.md`. Run all
+Python commands through the existing per-backend `uv` environments:
+
+```sh
+ref/pixal3d/run.sh cuda ref/pixal3d/validate_resident.py --backend cuda --benchmark
+ref/pixal3d/run.sh rocm ref/pixal3d/validate_resident.py --backend rocm --benchmark
+ref/pixal3d/run.sh cuda ref/pixal3d/validate.py --backend cuda --flow --gpu-execution resident
+ref/pixal3d/run.sh rocm ref/pixal3d/validate_conditioning.py --backend rocm --gpu-execution resident
+ref/pixal3d/run.sh cuda ref/pixal3d/validate_decoders.py --backend cuda --stage shape --guided tmp/pixal3d/guided-shape --gpu-execution resident
+```
+
+`benchmark_flow_block.py` now keeps one engine and weight mapping alive across
+calls, separates load/cold/warm times, and accepts `--stage`, `--blocks 30`,
+`--tokens`, `--repeats`, `--gpu-execution`, and `--gpu-kernels`. Zero/omitted
+`--tokens` uses every recorded token. Texture input includes the matching final
+normalized shape features. Compare modes with identical dumps and block counts;
+run them sequentially on each GPU. The emitted JSON lives beside the output
+safetensors. Warm flow speedups exclude conditioning, decoders and postprocessing.
+
+`run_fixture.py --gpu-execution resident --gpu-kernels auto --dump` records full
+runs, profiles and memory samples. Its default timeout is four hours. Apply
+`validate_flow_stage.py` to the new dumps, and `validate_glb.py` to the new export;
+old generation artifacts are not evidence for the resident implementation.

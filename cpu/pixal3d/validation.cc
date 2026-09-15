@@ -6,6 +6,15 @@
 #include <omp.h>
 static thread_local std::string last_error;
 static thread_local int test_threads = 16;
+static thread_local pixal3d_gpu_options test_gpu_options{sizeof(pixal3d_gpu_options), 1, PIXAL3D_GPU_LEGACY,
+                                                         PIXAL3D_KERNEL_AUTO, nullptr};
+extern "C" int px_test_set_gpu(int execution, int kernels) {
+    if (execution < 0 || execution > 1 || kernels < 0 || kernels > 2)
+        return -1;
+    test_gpu_options.execution = pixal3d_gpu_execution(execution);
+    test_gpu_options.kernels = pixal3d_gpu_kernels(kernels);
+    return 0;
+}
 extern "C" int px_test_set_threads(int threads) {
     if (threads <= 0)
         return -1;
@@ -22,7 +31,8 @@ static pixal3d_options options(int backend) {
 extern "C" const char *px_test_error() { return last_error.c_str(); }
 #define TEST_BEGIN                                                                                           \
     try {                                                                                                    \
-        px::Engine e(options(backend));
+        px::Engine e(options(backend));                                                                      \
+        e.configure(test_gpu_options);
 #define TEST_END                                                                                             \
     return 0;                                                                                                \
     }                                                                                                        \
@@ -158,8 +168,9 @@ extern "C" int px_test_naf(int backend, const char *path, float *y, float *guide
     TEST_BEGIN px::Weights w(path);
     auto g = px::naf_guide(e, w, px::Vec(x, x + size_t(size) * size * 3), size, target);
     std::copy(g.begin(), g.end(), guide);
-    auto out = px::naf_sample(g, target, px::Vec(patches, patches + size_t(grid) * grid * 1024), grid,
-                              px::Vec(xy, xy + 2 * n));
+    auto p = px::Vec(patches, patches + size_t(grid) * grid * 1024), coords = px::Vec(xy, xy + 2 * n);
+    auto out = e.resident() ? px::naf_sample_gpu(e, g, target, p, grid, coords)
+                            : px::naf_sample(g, target, p, grid, coords);
     std::copy(out.begin(), out.end(), y);
     TEST_END
 }
@@ -182,6 +193,39 @@ extern "C" int px_test_flow(int backend, const char *path, float *y, const float
                         px::Vec(global, global + 5 * gc), px::Vec(proj, proj + size_t(n) * pc), blocks, bf);
     std::copy(out.begin(), out.end(), y);
     TEST_END
+}
+
+// A benchmark session owns both the model mapping and the engine across warm runs.
+struct FlowSession {
+    px::Engine engine;
+    px::Weights weights;
+    FlowSession(int backend, const char *path) : engine(options(backend)), weights(path) {
+        engine.configure(test_gpu_options);
+    }
+};
+extern "C" void *px_test_flow_open(int backend, const char *path) {
+    try {
+        return new FlowSession(backend, path);
+    } catch (const std::exception &ex) {
+        last_error = ex.what();
+        return nullptr;
+    }
+}
+extern "C" void px_test_flow_close(void *session) { delete static_cast<FlowSession *>(session); }
+extern "C" int px_test_flow_run(void *session, float *y, const float *x, const int32_t *coords, int n, int ci,
+                                const float *global, int gc, const float *proj, int pc, float t, int blocks,
+                                int precision) {
+    try {
+        auto &s = *static_cast<FlowSession *>(session);
+        auto out = px::flow(s.engine, s.weights, px::Vec(x, x + size_t(n) * ci),
+                            px::Coords(coords, coords + size_t(n) * 4), t, px::Vec(global, global + 5 * gc),
+                            px::Vec(proj, proj + size_t(n) * pc), blocks, precision);
+        std::copy(out.begin(), out.end(), y);
+        return 0;
+    } catch (const std::exception &ex) {
+        last_error = ex.what();
+        return -1;
+    }
 }
 
 extern "C" int px_test_inpaint(uint8_t *pixels, const uint8_t *mask, int size, int channels, int radius) {

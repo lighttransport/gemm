@@ -23,6 +23,41 @@ static void rope2d(Vec &x, int grid, int heads, int dim, int prefix, const float
                 x[k + half] = b * co + a * si;
             }
 }
+static Vec dino_gpu(Engine &e, Weights &w, const Vec &patches, int grid, int blocks) {
+    e.bind(w);
+    int n = grid * grid + 5, c = 1024;
+    Vec initial(size_t(n) * c, 0);
+    std::copy_n(w.get("cls_token"), c, initial.data());
+    std::copy_n(w.get(w.has("reg_token") ? "reg_token" : "storage_tokens"), 4 * c, initial.data() + c);
+    auto h = e.upload(initial), input = e.upload(patches);
+    auto weight = e.weight(w, "patch_embed.proj.weight"), bias = e.weight(w, "patch_embed.proj.bias");
+    e.execute(
+        {PX_LINEAR, 0, n - 5, c, 768, 0, 5, 0, 0, h.get(), input.get(), weight.get(), bias.get(), nullptr});
+    auto norm_gpu = [&](const Tensor &x, const std::string &name) {
+        return e.operation(PX_NORM, x, c, 0, e.weight(w, name + ".weight"), e.weight(w, name + ".bias"), 0, 0,
+                           1e-5f);
+    };
+    for (int block = 0; block < blocks; ++block) {
+        std::string b = "blocks." + std::to_string(block) + ".";
+        auto x = norm_gpu(h, b + "norm1");
+        auto qkv = e.linear(x, w, b + "attn.qkv");
+        auto q = e.operation(PX_PART, qkv, c, 0, {}, {}, 3, 0);
+        auto k = e.operation(PX_PART, qkv, c, 0, {}, {}, 3, 1);
+        auto v = e.operation(PX_PART, qkv, c, 0, {}, {}, 3, 2);
+        for (auto *t : {&q, &k})
+            e.execute({PX_ROPE2, 0, grid, 64, 0, 16, 5, 0, 0, t->get(), t->get(), nullptr, nullptr, nullptr});
+        x = e.linear(e.attention(q, k, v, 16, 64, 0), w, b + "attn.proj");
+        auto gamma = e.weight(w, w.has(b + "gamma_1") ? b + "gamma_1" : b + "ls1.gamma");
+        e.inplace(PX_SCALE_ADD, h, c, 0, x, gamma);
+        x = norm_gpu(h, b + "norm2");
+        x = e.linear(x, w, b + "mlp.fc1");
+        e.inplace(PX_GELU, x, 1, 0);
+        x = e.linear(x, w, b + "mlp.fc2");
+        gamma = e.weight(w, w.has(b + "gamma_2") ? b + "gamma_2" : b + "ls2.gamma");
+        e.inplace(PX_SCALE_ADD, h, c, 0, x, gamma);
+    }
+    return e.download(e.operation(PX_NORM, h, c, 0, {}, {}, 0, 0, 1e-5f));
+}
 Vec dino(Engine &e, Weights &w, const Vec &chw, int size, int blocks) {
     require(size > 0 && size % 16 == 0 && chw.size() == size_t(size) * size * 3, "Invalid DINO image");
     auto shape = w.shape("patch_embed.proj.weight");
@@ -36,6 +71,8 @@ Vec dino(Engine &e, Weights &w, const Vec &chw, int size, int blocks) {
                 for (int x = 0; x < 16; ++x)
                     patches[size_t(p) * 768 + ch * 256 + y * 16 + x] =
                         chw[size_t(ch) * size * size + (p / grid * 16 + y) * size + p % grid * 16 + x];
+    if (e.resident())
+        return dino_gpu(e, w, patches, grid, blocks);
     Vec h(size_t(n) * c);
     e.gemm(h.data() + 5 * c, patches.data(), w.get("patch_embed.proj.weight"), w.get("patch_embed.proj.bias"),
            n - 5, c, 768);
@@ -145,8 +182,53 @@ static Vec average(const Vec &x, int source, int target, int channels) {
     }
     return out;
 }
+static Tensor conv2d_gpu(Engine &e, Weights &w, const Tensor &x, int size, const std::string &name) {
+    auto s = w.shape(name + ".weight");
+    int co = s[0], ci = s[1], kernel = s[2], kk = ci * kernel * kernel, rows = size * size;
+    auto out = e.tensor(size_t(rows) * co), weight = e.weight(w, name + ".weight"),
+         bias = e.weight(w, name + ".bias");
+    for (int start = 0; start < rows; start += 512) {
+        int n = std::min(512, rows - start);
+        auto gather = e.tensor(size_t(n) * kk);
+        e.execute({PX_CONV2_GATHER, 0, n, kk, kernel, 0, start, size, 0, gather.get(), x.get(), nullptr,
+                   nullptr, nullptr});
+        e.execute({PX_LINEAR, 0, n, co, kk, 0, start, 0, 0, out.get(), gather.get(), weight.get(), bias.get(),
+                   nullptr});
+    }
+    return out;
+}
+static Tensor naf_guide_gpu(Engine &e, Weights &w, const Vec &image, int size, int target) {
+    require(size >= 3 && size <= 4 * target && image.size() == size_t(size) * size * 3, "Invalid NAF image");
+    e.bind(w);
+    auto input = e.upload(image), guide = e.tensor(size_t(target) * target * 256);
+    auto group = [&](Tensor &x, const std::string &name) {
+        e.inplace(PX_GROUP_SILU, x, 128, 0, e.weight(w, name + ".weight"), e.weight(w, name + ".bias"));
+    };
+    for (int branch = 0; branch < 2; ++branch) {
+        std::string b = branch ? "image_encoder.sem_encoder." : "image_encoder.encoder.";
+        auto x = conv2d_gpu(e, w, input, size, b + "0");
+        for (int block = 1; block <= 2; ++block) {
+            std::string p = b + std::to_string(block) + ".";
+            group(x, p + "norm1");
+            x = conv2d_gpu(e, w, x, size, p + "conv1");
+            group(x, p + "norm2");
+            x = conv2d_gpu(e, w, x, size, p + "conv2");
+        }
+        auto pooled = e.tensor(size_t(target) * target * 128);
+        e.execute({PX_AVERAGE, 0, target * target, 128, size, 0, 0, target, 0, pooled.get(), x.get(), nullptr,
+                   nullptr, nullptr});
+        e.execute({PX_JOIN, 0, target * target, 128, 0, 0, branch * 128, 0, 0, guide.get(), pooled.get(),
+                   nullptr, nullptr, nullptr});
+    }
+    auto periods = e.weight(w, "image_encoder.rope.periods");
+    e.execute(
+        {PX_ROPE2, 0, target, 64, 0, 4, 0, 0, 0, guide.get(), guide.get(), periods.get(), nullptr, nullptr});
+    return guide;
+}
 Vec naf_guide(Engine &e, Weights &w, const Vec &image, int size, int target) {
     require(size >= 3 && size <= 4 * target && image.size() == size_t(size) * size * 3, "Invalid NAF image");
+    if (e.resident())
+        return e.download(naf_guide_gpu(e, w, image, size, target));
     Vec guide(size_t(target) * target * 256);
     for (int branch = 0; branch < 2; ++branch) {
         std::string b = branch ? "image_encoder.sem_encoder." : "image_encoder.encoder.";
@@ -231,8 +313,26 @@ Vec naf_sample(const Vec &guide, int target, const Vec &patches, int grid, const
     }
     return out;
 }
+static Vec naf_sample_tensor(Engine &e, const Tensor &g, int target, const Vec &patches, int grid,
+                             const Vec &xy) {
+    require(grid >= 9 && target % grid == 0 && xy.size() % 2 == 0 &&
+                g.size == size_t(target) * target * 256 && patches.size() == size_t(grid) * grid * 1024,
+            "Invalid resident NAF geometry");
+    auto p = e.upload(patches), coords = e.upload(xy), keys = e.tensor(size_t(grid) * grid * 256),
+         out = e.tensor(xy.size() / 2 * 1024);
+    e.execute({PX_AVERAGE, 0, grid * grid, 256, target, 0, 0, grid, 0, keys.get(), g.get(), nullptr, nullptr,
+               nullptr});
+    e.execute({PX_NAF_SAMPLE, 0, int(xy.size() / 2), 1024, target, 0, 0, grid, 0, out.get(), g.get(),
+               keys.get(), coords.get(), p.get()});
+    return e.download(out);
+}
+Vec naf_sample_gpu(Engine &e, const Vec &guide, int target, const Vec &patches, int grid, const Vec &xy) {
+    return naf_sample_tensor(e, e.upload(guide), target, patches, grid, xy);
+}
 Vec naf(Engine &e, Weights &w, const Vec &image, int size, const Vec &patches, int grid, int target,
         const Vec &xy) {
+    if (e.resident())
+        return naf_sample_tensor(e, naf_guide_gpu(e, w, image, size, target), target, patches, grid, xy);
     return naf_sample(naf_guide(e, w, image, size, target), target, patches, grid, xy);
 }
 } // namespace px

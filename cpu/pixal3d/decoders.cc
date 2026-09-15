@@ -77,9 +77,101 @@ static void layer_norm(Vec &out, const Vec &x, int c, Weights &w, const std::str
          w.has(name + ".bias") ? w.get(name + ".bias") : nullptr);
     round_precision(out, precision);
 }
+static Sparse decode_sparse_gpu(Engine &e, Weights &w, const Sparse &input, bool upsample_only,
+                                std::vector<Subdivision> &subdivisions, bool guided, int precision,
+                                std::vector<Sparse> *subdivision_logits) {
+    e.bind(w);
+    Coords coords = input.coords;
+    int channels = w.shape("from_latent.weight")[0];
+    auto h = e.linear(e.upload(input.feats), w, "from_latent");
+    e.inplace(PX_ROUND, h, 1, precision);
+    if (!guided)
+        subdivisions.clear();
+    auto norm_gpu = [&](const Tensor &x, int c, const std::string &name) {
+        return e.operation(PX_NORM, x, c, precision, e.weight(w, name + ".weight"),
+                           e.weight(w, name + ".bias"), 0, 0, 1e-6f);
+    };
+    for (int stage = 0; stage < 5; ++stage) {
+        if (stage == 4 && upsample_only)
+            return {coords, e.download(h), channels};
+        auto map = neighbors(coords);
+        auto nbr = e.upload(map.data(), map.size());
+        std::string prefix = "blocks." + std::to_string(stage) + ".";
+        int block = 0;
+        while (w.has(prefix + std::to_string(block) + ".conv.weight")) {
+            std::string b = prefix + std::to_string(block) + ".";
+            auto x = e.convolution(h, w, b + "conv", nbr, precision);
+            auto y = norm_gpu(x, channels, b + "norm");
+            y = e.linear(y, w, b + "mlp.0", precision);
+            e.inplace(PX_SILU, y, 1, precision);
+            y = e.linear(y, w, b + "mlp.2", precision);
+            e.inplace(PX_ADD, h, channels, precision, y, {}, 1);
+            ++block;
+        }
+        if (stage == 4)
+            break;
+        std::string b = prefix + std::to_string(block) + ".";
+        int ci = channels, co = w.shape(b + "conv2.weight")[0];
+        require(ci % 8 == 0 && co % (ci / 8) == 0, "Invalid resident subdivision ratio");
+        Subdivision sub;
+        if (!guided || subdivision_logits) {
+            auto logits = e.download(e.linear(h, w, b + "to_subdiv", precision));
+            if (subdivision_logits)
+                subdivision_logits->push_back({coords, logits, 8});
+            if (!guided) {
+                for (size_t p = 0; p < coords.size() / 4; ++p)
+                    for (int s = 0; s < 8; ++s)
+                        if (logits[p * 8 + s] > 0) {
+                            sub.parents.push_back(p);
+                            sub.slots.push_back(s);
+                            sub.coords.push_back(0);
+                            for (int a = 0; a < 3; ++a)
+                                sub.coords.push_back(coords[p * 4 + a + 1] * 2 + ((s >> a) & 1));
+                        }
+                subdivisions.push_back(sub);
+            }
+        }
+        if (guided) {
+            require(subdivisions.size() == 4, "Decoder requires four subdivisions");
+            sub = subdivisions[stage];
+        }
+        require(!sub.parents.empty(), "Resident decoder predicted no occupied voxels");
+        for (size_t r = 0; r < sub.parents.size(); ++r)
+            require(sub.parents[r] >= 0 && size_t(sub.parents[r]) < coords.size() / 4 && sub.slots[r] >= 0 &&
+                        sub.slots[r] < 8,
+                    "Invalid subdivision guide");
+        auto parents = e.upload(sub.parents.data(), sub.parents.size()),
+             slots = e.upload(sub.slots.data(), sub.slots.size());
+        auto x = norm_gpu(h, ci, b + "norm1");
+        e.inplace(PX_SILU, x, 1, precision);
+        x = e.convolution(x, w, b + "conv1", nbr, precision);
+        int rows = int(sub.parents.size());
+        auto fine = e.tensor(size_t(rows) * co), skip = e.tensor(size_t(rows) * co);
+        e.execute(
+            {PX_C2S, 0, rows, co, ci, 0, 0, 0, 0, fine.get(), x.get(), parents.get(), slots.get(), nullptr});
+        e.execute(
+            {PX_SKIP, 0, rows, co, ci, 0, 0, 0, 0, skip.get(), h.get(), parents.get(), slots.get(), nullptr});
+        x = norm_gpu(fine, co, b + "norm2");
+        e.inplace(PX_SILU, x, 1, precision);
+        map = neighbors(sub.coords);
+        nbr = e.upload(map.data(), map.size());
+        fine = e.convolution(x, w, b + "conv2", nbr, precision);
+        e.inplace(PX_ADD, fine, co, precision, skip, {}, 1);
+        h = std::move(fine);
+        coords = std::move(sub.coords);
+        channels = co;
+        std::fprintf(stderr, "Pixal3D resident decoder stage %d: %zu voxels\n", stage, coords.size() / 4);
+    }
+    auto x = e.operation(PX_NORM, h, channels, 0, {}, {}, 0, 0, 1e-5f);
+    h = e.linear(x, w, "output_layer");
+    return {coords, e.download(h), w.shape("output_layer.weight")[0]};
+}
 Sparse decode_sparse(Engine &e, Weights &w, const Sparse &input, bool upsample_only,
                      std::vector<Subdivision> &subdivisions, bool guided, int precision,
                      std::vector<Sparse> *subdivision_logits) {
+    if (e.resident())
+        return decode_sparse_gpu(e, w, input, upsample_only, subdivisions, guided, precision,
+                                 subdivision_logits);
     Sparse h{input.coords, e.linear(input.feats, w, "from_latent"), w.shape("from_latent.weight")[0]};
     round_precision(h.feats, precision);
     if (!guided)
@@ -169,8 +261,61 @@ static std::vector<int> dense_neighbors(int size) {
                 }
     return out;
 }
+static Vec decode_structure_gpu(Engine &e, Weights &w, const Vec &latent, int precision) {
+    e.bind(w);
+    int size = 16, c = 512;
+    auto map = dense_neighbors(size);
+    auto nbr = e.upload(map.data(), map.size());
+    auto h = e.convolution(e.upload(latent), w, "input_layer", nbr, 0, true);
+    e.inplace(PX_ROUND, h, 1, precision);
+    auto norm_gpu = [&](const Tensor &x, const std::string &name, int p) {
+        return e.operation(PX_NORM, x, c, p, e.weight(w, name + ".weight"), e.weight(w, name + ".bias"), 0, 0,
+                           1e-5f);
+    };
+    auto resblock = [&](const std::string &b) {
+        auto x = norm_gpu(h, b + "norm1", precision);
+        e.inplace(PX_SILU, x, 1, precision);
+        x = e.convolution(x, w, b + "conv1", nbr, precision, true);
+        auto y = norm_gpu(x, b + "norm2", precision);
+        e.inplace(PX_SILU, y, 1, precision);
+        y = e.convolution(y, w, b + "conv2", nbr, precision, true);
+        e.inplace(PX_ADD, h, c, precision, y, {}, 1);
+    };
+    resblock("middle_block.0.");
+    resblock("middle_block.1.");
+    for (int block = 0; block < 8; ++block) {
+        std::string b = "blocks." + std::to_string(block) + ".";
+        if (w.has(b + "conv1.weight")) {
+            resblock(b);
+            continue;
+        }
+        auto x = e.convolution(h, w, b + "conv", nbr, precision, true);
+        c = w.shape(b + "conv.weight")[0] / 8;
+        int next = size * 2, rows = next * next * next;
+        std::vector<int> parents(rows), slots(rows);
+        for (int p = 0; p < size * size * size; ++p)
+            for (int slot = 0; slot < 8; ++slot) {
+                int a = p / (size * size) * 2 + (slot >> 2), b = p / size % size * 2 + ((slot >> 1) & 1),
+                    z = p % size * 2 + (slot & 1);
+                int r = (a * next + b) * next + z;
+                parents[r] = p;
+                slots[r] = slot;
+            }
+        auto dp = e.upload(parents.data(), parents.size()), ds = e.upload(slots.data(), slots.size());
+        h = e.tensor(size_t(rows) * c);
+        e.execute({PX_C2S, 0, rows, c, 0, 0, 0, 1, 0, h.get(), x.get(), dp.get(), ds.get(), nullptr});
+        size = next;
+        map = dense_neighbors(size);
+        nbr = e.upload(map.data(), map.size());
+    }
+    auto x = norm_gpu(h, "out_layer.0", 0);
+    e.inplace(PX_SILU, x, 1, 0);
+    return e.download(e.convolution(x, w, "out_layer.2", nbr, 0, true));
+}
 Vec decode_structure(Engine &e, Weights &w, const Vec &latent, int precision) {
     require(latent.size() == 4096 * 8, "Expected 16-cubed structure latent");
+    if (e.resident())
+        return decode_structure_gpu(e, w, latent, precision);
     int size = 16, c = 512;
     auto nbr = dense_neighbors(size);
     Vec h = convolution(e, w, latent, nbr, "input_layer", 0, true);

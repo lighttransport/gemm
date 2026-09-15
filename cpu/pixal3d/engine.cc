@@ -1,7 +1,8 @@
 #include "engine.hh"
+#include <atomic>
 #include <cblas.h>
-#include <dlfcn.h>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <filesystem>
 #include <limits>
 #include <omp.h>
@@ -16,6 +17,8 @@ static float half_to_float(uint16_t h) {
     return sign ? -x : x;
 }
 Weights::Weights(const std::string &path) {
+    static std::atomic<uint64_t> next{1};
+    identity = next++;
     st = safetensors_open(path.c_str());
     require(st, "Cannot open weights: " + path);
 }
@@ -71,6 +74,7 @@ const float *Weights::get(const std::string &name) {
     return out.data();
 }
 Engine::Engine(const pixal3d_options &o) : threads(o.threads) {
+    cache_limit_ = o.vram_budget_mib * 1024 * 1024 / 2;
     require(threads > 0, "threads must be positive");
     openblas_set_num_threads(threads);
     omp_set_num_threads(threads);
@@ -99,6 +103,16 @@ Engine::Engine(const pixal3d_options &o) : threads(o.threads) {
         PX_SYM(attention, "px_gpu_attention");
         PX_SYM(peak, "px_gpu_peak");
         PX_SYM(error, "px_gpu_error");
+        api_.version = reinterpret_cast<decltype(api_.version)>(dlsym(library_, "px_gpu_device_version"));
+        if (api_.version && api_.version() == PX_DEVICE_ABI) {
+            PX_SYM(configure, "px_gpu_configure");
+            PX_SYM(allocate, "px_gpu_allocate");
+            PX_SYM(release, "px_gpu_release");
+            PX_SYM(copy, "px_gpu_copy");
+            PX_SYM(execute, "px_gpu_execute");
+            PX_SYM(metrics, "px_gpu_metrics");
+            PX_SYM(trim, "px_gpu_trim");
+        }
         gpu_ = api_.create(o.device, o.vram_budget_mib * 1024 * 1024);
         require(gpu_, "GPU initialization failed; verify device access and memory budget");
     } catch (...) {
@@ -109,6 +123,9 @@ Engine::Engine(const pixal3d_options &o) : threads(o.threads) {
 #undef PX_SYM
 }
 Engine::~Engine() {
+    // Destruction must remain safe after a device error.
+    conditioning_cache_.clear();
+    weights_.clear();
     if (gpu_)
         api_.destroy(gpu_);
     if (library_)

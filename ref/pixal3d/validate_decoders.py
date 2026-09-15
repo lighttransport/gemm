@@ -17,6 +17,8 @@ parser.add_argument("--noise-device",choices=["cpu","backend"],default="backend"
 parser.add_argument("--reference-device",choices=["cpu","cuda"],help="Override the PyTorch oracle device, independently of the native backend")
 parser.add_argument("--stage",choices=["structure","shape","texture"],required=True)
 parser.add_argument("--model-dir",type=Path,default=Path("/mnt/disk2/models/Pixal3D"))
+parser.add_argument("--gpu-execution",choices=["legacy","resident"],default="legacy")
+parser.add_argument("--gpu-kernels",choices=["auto","blas","mma"],default="auto")
 args=parser.parse_args()
 if args.stage=="texture" and not args.guided:parser.error("texture requires --guided DIR for shape subdivisions")
 backend=["cpu","cuda","rocm"].index(args.backend)
@@ -32,6 +34,8 @@ if device=="cuda":
     torch.backends.cudnn.allow_tf32=False
 lib=C.CDLL(str(ROOT.parent.parent/"cpu/pixal3d/libpixal3d_validation.so"))
 lib.px_test_error.restype=C.c_char_p
+lib.px_test_set_gpu.argtypes=[C.c_int,C.c_int]
+assert lib.px_test_set_gpu(int(args.gpu_execution=="resident"),["auto","blas","mma"].index(args.gpu_kernels))==0
 fp=np.ctypeslib.ndpointer(dtype=np.float32,flags="C_CONTIGUOUS")
 ip=np.ctypeslib.ndpointer(dtype=np.int32,flags="C_CONTIGUOUS")
 install()

@@ -94,7 +94,9 @@ class PixalServer:
                 "gpu_library": str(lib[backend]) if backend != "cpu" else None,
                 "models_ready": model_ready(self.model_dir, self.dinov3, self.naf),
             }
-        return {"ok": True, "service": "pixal3d", "default_backend": self.args.backend, "backends": out}
+        return {"ok": True, "service": "pixal3d", "default_backend": self.args.backend,
+                "default_gpu_execution": self.args.gpu_execution,
+                "default_gpu_kernels": self.args.gpu_kernels, "backends": out}
 
     def infer(self, request: dict) -> dict:
         backend = request.get("backend", self.args.backend)
@@ -124,6 +126,14 @@ class PixalServer:
             cmd = [str(self.binary), "--backend", backend, "--input", str(image_path), "--output", str(output_path),
                    "--fov", str(fov), "--distance", str(distance), "--mesh-scale", str(mesh_scale), "--seed", str(seed),
                    "--model-dir", str(self.model_dir), "--dinov3", str(self.dinov3), "--naf", str(self.naf)]
+            execution = request.get("gpu_execution", self.args.gpu_execution)
+            kernels = request.get("gpu_kernels", self.args.gpu_kernels)
+            if execution not in ("legacy", "resident") or kernels not in ("auto", "blas", "mma"):
+                raise ValueError("Invalid GPU execution or kernel selection")
+            if backend == "cpu":
+                execution = "legacy"
+            profile = run_dir / "profile.json"
+            cmd += ["--gpu-execution", execution, "--gpu-kernels", kernels, "--profile-json", str(profile)]
             if threads:
                 cmd += ["--threads", str(threads)]
             if request.get("device") is not None:
@@ -152,7 +162,8 @@ class PixalServer:
                 except ValueError:
                     continue
             return {"ok": True, "backend": backend, "elapsed_ms": round((time.monotonic() - started) * 1000),
-                    "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"), "stats": stats}
+                    "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"), "stats": stats,
+                    "profile": json.loads(profile.read_text()) if profile.is_file() else {}}
 
     def reference(self, request: dict) -> dict:
         """Run the pinned upstream PyTorch pipeline for visual verification."""
@@ -237,6 +248,8 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     p = argparse.ArgumentParser(description="Pixal3D Python web demo server")
     p.add_argument("--bind", default="127.0.0.1"); p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--gpu-execution", choices=("legacy", "resident"), default="legacy")
+    p.add_argument("--gpu-kernels", choices=("auto", "blas", "mma"), default="auto")
     p.add_argument("--backend", choices=("cpu", "cuda", "rocm"), default="cuda")
     p.add_argument("--binary", default=str(ROOT / "cpu/pixal3d/pixal3d")); p.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
     p.add_argument("--dinov3", default=str(DEFAULT_DINOV3)); p.add_argument("--naf", default=str(DEFAULT_NAF))

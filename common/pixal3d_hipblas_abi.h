@@ -10,6 +10,7 @@ typedef enum { HIPBLAS_OP_N = 111, HIPBLAS_OP_T = 112 } hipblasOperation_t;
 typedef enum { HIPBLAS_COMPUTE_32F = 2 } hipblasComputeType_t;
 typedef enum { HIPBLAS_GEMM_DEFAULT = 160 } hipblasGemmAlgo_t;
 extern "C" {
+hipblasStatus_t hipblasSetStream(hipblasHandle_t handle, hipStream_t stream);
 hipblasStatus_t hipblasCreate(hipblasHandle_t *);
 hipblasStatus_t hipblasDestroy(hipblasHandle_t);
 hipblasStatus_t hipblasSgemm(hipblasHandle_t, hipblasOperation_t, hipblasOperation_t, int, int, int,

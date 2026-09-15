@@ -10,6 +10,18 @@ extern "C" {
 
 typedef enum { PIXAL3D_CPU, PIXAL3D_CUDA, PIXAL3D_ROCM } pixal3d_backend;
 typedef struct pixal3d_context pixal3d_context;
+/* Separate configuration keeps the original options/result ABI unchanged. */
+typedef enum { PIXAL3D_GPU_LEGACY, PIXAL3D_GPU_RESIDENT } pixal3d_gpu_execution;
+typedef enum { PIXAL3D_KERNEL_AUTO, PIXAL3D_KERNEL_BLAS, PIXAL3D_KERNEL_MMA } pixal3d_gpu_kernels;
+typedef struct {
+    size_t struct_size;
+    uint32_t version;
+    pixal3d_gpu_execution execution;
+    pixal3d_gpu_kernels kernels;
+    const char *profile_json;
+} pixal3d_gpu_options;
+void pixal3d_default_gpu_options(pixal3d_gpu_options *options);
+int pixal3d_configure_gpu(pixal3d_context *context, const pixal3d_gpu_options *options);
 typedef struct {
     pixal3d_backend backend;
     int device, threads;

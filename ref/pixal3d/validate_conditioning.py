@@ -14,6 +14,8 @@ parser=argparse.ArgumentParser()
 parser.add_argument("--backend",choices=["cpu","cuda","rocm"],required=True)
 parser.add_argument("--natten",action="store_true")
 parser.add_argument("--dino",default="/mnt/disk2/models/dinov3-vitl16/model.safetensors")
+parser.add_argument("--gpu-execution",choices=["legacy","resident"],default="legacy")
+parser.add_argument("--gpu-kernels",choices=["auto","blas","mma"],default="auto")
 args=parser.parse_args()
 backend=["cpu","cuda","rocm"].index(args.backend)
 device="cuda" if backend else "cpu"
@@ -25,6 +27,8 @@ if backend:
     torch.backends.cudnn.allow_tf32=False
 lib=C.CDLL(str(ROOT.parent.parent/"cpu/pixal3d/libpixal3d_validation.so"))
 lib.px_test_error.restype=C.c_char_p
+lib.px_test_set_gpu.argtypes=[C.c_int,C.c_int]
+assert lib.px_test_set_gpu(int(args.gpu_execution=="resident"),["auto","blas","mma"].index(args.gpu_kernels))==0
 fp=np.ctypeslib.ndpointer(dtype=np.float32,flags="C_CONTIGUOUS")
 lib.px_test_dino.argtypes=[C.c_int,C.c_char_p,fp,fp,C.c_int,C.c_int]
 lib.px_test_naf.argtypes=[C.c_int,C.c_char_p,fp,fp,fp,C.c_int,fp,C.c_int,C.c_int,fp,C.c_int]

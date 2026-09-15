@@ -13,6 +13,8 @@ p = argparse.ArgumentParser()
 p.add_argument("--backend", choices=["cpu", "cuda", "rocm"], required=True)
 p.add_argument("--flow", action="store_true")
 p.add_argument("--model-dir", type=Path, default=Path("/mnt/disk2/models/Pixal3D"))
+p.add_argument("--gpu-execution",choices=["legacy","resident"],default="legacy")
+p.add_argument("--gpu-kernels",choices=["auto","blas","mma"],default="auto")
 a = p.parse_args()
 backend = ["cpu", "cuda", "rocm"].index(a.backend)
 device = "cpu" if not backend else "cuda"
@@ -26,6 +28,8 @@ if backend:
     torch.backends.cudnn.allow_tf32 = False
 lib = C.CDLL(str(ROOT.parent.parent / "cpu/pixal3d/libpixal3d_validation.so"))
 lib.px_test_error.restype = C.c_char_p
+lib.px_test_set_gpu.argtypes=[C.c_int,C.c_int]
+assert lib.px_test_set_gpu(int(a.gpu_execution=="resident"),["auto","blas","mma"].index(a.gpu_kernels))==0
 fp = np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS")
 ip = np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS")
 lib.px_test_gemm.argtypes = [C.c_int, fp, fp, fp, fp] + [C.c_int]*4

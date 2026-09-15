@@ -19,7 +19,11 @@ removed after each request.
 
 `POST /v1/infer` accepts JSON fields `image_b64`, optional `mask_b64`,
 `image_ext`, `backend`, `fov`, `distance`, `mesh_scale`, `seed`, `threads`,
-`device`, and `vram_budget_mib`. Set `reference: true` with CUDA or ROCm to
+`device`, `vram_budget_mib`, `gpu_execution` (`legacy`/`resident`), and
+`gpu_kernels` (`auto`/`blas`/`mma`). Responses include a `profile` object with
+phase timings and device counters. Server defaults can be selected with
+`--gpu-execution resident --gpu-kernels auto`; the browser also exposes these
+choices. Set `reference: true` with CUDA or ROCm to
 also run the pinned upstream PyTorch pipeline; the response includes a second
 GLB for comparison. This is opt-in because it loads another model stack and
 requires an image without a separate mask upload. The browser displays native

@@ -57,6 +57,12 @@ int main(void) {
     pixal3d_euler_cfg(rescaled, rescale_positive, zero, 2, 1, .5f, 2, 1, 0);
     CHECK(near(rescaled[0], .25f) && near(rescaled[1], 1.25f));
 
+    pixal3d_gpu_options gpu;
+    pixal3d_default_gpu_options(&gpu);
+    CHECK(gpu.struct_size == sizeof(gpu) && gpu.version == 1);
+    CHECK(gpu.execution == PIXAL3D_GPU_LEGACY && gpu.kernels == PIXAL3D_KERNEL_AUTO);
+    CHECK(gpu.profile_json == NULL && pixal3d_configure_gpu(NULL, &gpu) == -1);
+    pixal3d_default_gpu_options(NULL);
     pixal3d_options options;
     pixal3d_default_options(&options);
     CHECK(options.backend == PIXAL3D_CPU && options.texture_size == 4096);

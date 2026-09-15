@@ -23,7 +23,11 @@ p.add_argument('--seed',type=int,default=1)
 p.add_argument('--threads',type=int,default=16)
 p.add_argument('--dump',action='store_true')
 p.add_argument('--attach',type=int,help='Monitor an already running native process')
+p.add_argument('--gpu-execution',choices=['legacy','resident'],default='legacy')
+p.add_argument('--gpu-kernels',choices=['auto','blas','mma'],default='auto')
+p.add_argument('--timeout',type=float,default=14400)
 a=p.parse_args()
+assert a.timeout>0
 class Memory(C.Structure):
     _fields_=[('total',C.c_ulonglong),('free',C.c_ulonglong),('used',C.c_ulonglong)]
 class Process(C.Structure):
@@ -54,6 +58,7 @@ def memory(pid):
 a.output_dir.mkdir(parents=True,exist_ok=True)
 command=[str(a.binary),'--backend',a.backend,'--input',str(a.input),'--output',str(a.output_dir/'mesh.glb'),
          '--fov',str(a.fov),'--seed',str(a.seed),'--threads',str(a.threads)]
+command+=['--gpu-execution',a.gpu_execution,'--gpu-kernels',a.gpu_kernels,'--profile-json',str(a.output_dir/'profile.json')]
 if a.dump:command+=['--dump-dir',str(a.output_dir/'dumps')]
 if a.mask:command+=['--mask',str(a.mask)]
 if a.attach:
@@ -65,6 +70,11 @@ else:
 start=time.monotonic();peak_device=peak_process=peak_host=0;baseline,total,_=memory(process.pid);samples=0
 with (a.output_dir/'memory.jsonl').open('w') as log:
     while True:
+        if not a.attach and time.monotonic()-start>a.timeout:
+            child.terminate()
+            try:child.wait(timeout=10)
+            except subprocess.TimeoutExpired:child.kill();child.wait()
+            break
         try:
             if not process.is_running() or process.status()==psutil.STATUS_ZOMBIE:break
             host=process.memory_info().rss
