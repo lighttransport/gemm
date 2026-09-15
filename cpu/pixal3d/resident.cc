@@ -243,6 +243,7 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
     bool mixed = precision == PIXAL3D_FLOW_MIXED;
     int linear_precision = mixed ? 3 : (bf ? 1 : 0);
     int op_precision = bf ? 1 : 0;
+    int attention_precision = mixed ? 1 : op_precision;
     int c = w.shape("input_layer.weight")[0], heads = w.shape("blocks.0.self_attn.q_rms_norm.gamma")[0];
     require(heads > 0 && c % heads == 0 && coords.size() % 4 == 0 &&
                 input.size() == coords.size() / 4 * size_t(w.shape("input_layer.weight")[1]) &&
@@ -283,7 +284,7 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
         e.inplace(PX_RMS, k, hd, op_precision, e.weight(w, b + "self_attn.k_rms_norm.gamma"), {}, heads);
         e.inplace(PX_ROPE, q, hd, op_precision, phases, {}, heads, 0, 0, 1);
         e.inplace(PX_ROPE, k, hd, op_precision, phases, {}, heads, 0, 0, 1);
-        h = e.attention(q, k, v, heads, hd, op_precision);
+        h = e.attention(q, k, v, heads, hd, attention_precision);
         h = e.linear(h, w, b + "self_attn.to_out", linear_precision);
         e.inplace(PX_RESIDUAL, hidden, c, op_precision, h, mod, 0, 2 * c);
         h = e.operation(PX_NORM, hidden, c, bf, e.weight(w, b + "norm2.weight"),
@@ -298,7 +299,7 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
         k = cached->keys[i];
         v = cached->values[i];
         e.inplace(PX_RMS, q, hd, op_precision, e.weight(w, ca + "q_rms_norm.gamma"), {}, heads);
-        h = e.attention(q, k, v, heads, hd, op_precision);
+        h = e.attention(q, k, v, heads, hd, attention_precision);
         h = e.linear(h, w, ca + "to_out", linear_precision);
         auto projection = e.linear(projected, w, b + "cross_attn.proj_linear", linear_precision);
         e.inplace(PX_ADD, h, c, op_precision, projection, {}, 1);
