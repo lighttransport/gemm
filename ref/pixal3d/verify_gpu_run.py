@@ -15,6 +15,7 @@ p.add_argument("--model-dir", type=Path, default=Path("/mnt/disk2/models/Pixal3D
 p.add_argument("--reference-device", choices=("cpu", "cuda"), default="cpu")
 p.add_argument("--gpu-execution", choices=("legacy", "resident"), default="resident")
 p.add_argument("--gpu-kernels", choices=("auto", "blas", "mma"), default="auto")
+p.add_argument("--gpu-flow-precision", choices=("bf16", "fp32"), default="bf16")
 p.add_argument("--output", type=Path, default=Path("tmp/pixal3d/verification/results.jsonl"))
 p.add_argument("--skip-complete", action="store_true")
 p.add_argument("--primitives", action="store_true")
@@ -38,7 +39,7 @@ common = ["--backend", a.backend, "--reference-device", a.reference_device,
           "--gpu-execution", a.gpu_execution, "--gpu-kernels", a.gpu_kernels]
 oracle = ["--backend", a.backend, "--reference-device", a.reference_device]
 if a.all or a.primitives:
-    checks.append(("primitives", ["validate.py", *common]))
+    checks.append(("primitives", ["validate.py", *common, "--gpu-flow-precision", a.gpu_flow_precision]))
 if a.all or a.conditioning:
     for stage in ("structure", "shape512", "shape1024", "texture"):
         if has_dump(stage + "_projected"):

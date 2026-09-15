@@ -86,6 +86,7 @@ class Engine {
     GpuApi api_;
     bool resident_ = false;
     pixal3d_gpu_kernels kernels_ = PIXAL3D_KERNEL_AUTO;
+    pixal3d_flow_precision flow_precision_ = PIXAL3D_FLOW_BF16;
     uint64_t model_identity_ = 0;
     std::map<std::string, Tensor> weights_;
     std::vector<std::shared_ptr<DeviceConditioning>> conditioning_cache_;
@@ -99,6 +100,7 @@ class Engine {
     ~Engine();
     void configure(const pixal3d_gpu_options &options);
     bool resident() const { return resident_; }
+    bool flow_bfloat(bool requested) const { return requested && flow_precision_ == PIXAL3D_FLOW_BF16; }
     void bind(Weights &w);
     void clear_weights();
     std::shared_ptr<DeviceConditioning> condition(Weights &w, const Vec &global, const Vec &projected,

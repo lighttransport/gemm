@@ -3,6 +3,9 @@
 Scope: Pixal3D main release, BF16 flows, FP16 decoders, FP32 conditioning and
 boundary layers. CPU geometry and PBR processing are unchanged. Enable with
 `--gpu-execution resident --gpu-kernels auto`; legacy remains the default.
+Resident flow uses BF16 by default. `--gpu-flow-precision fp32` keeps the flow
+stack in FP32 for accuracy-sensitive runs; decoder precision and conditioning
+boundaries are unchanged.
 
 ## Implementation
 
@@ -49,6 +52,23 @@ warm medians, without per-command profiling.
 These are flow-pass speedups, not total generation or aggregate NN-stage
 speedups. Conditioning, decoders, CPU postprocessing, model loading and GLB
 serialization are excluded. No 5x total-generation claim is made.
+
+## FP32 flow accuracy experiment
+
+On the recorded 4096-token structure input, a complete 30-block flow stack was
+compared with the matching PyTorch model at `t=1`. FP32 reduced NRMSE by about
+6,600x on both cards while keeping cosine error below 1e-12:
+
+| GPU | BF16 NRMSE | FP32 NRMSE | FP32 max abs |
+|---|---:|---:|---:|
+| RTX 5060 Ti | 0.008680 | 0.00000131 | 0.0000205 |
+| RX 9070 XT | 0.006139 | 0.000000929 | 0.0000124 |
+
+The switch is exposed by the CLI as `--gpu-flow-precision fp32`; BF16 remains
+the default for memory and throughput. Reproduce the isolated experiment with
+`validate_flow_precision.py --stage structure --precision bf16|fp32`. Full
+twelve-step cascade accuracy and VRAM cost should be measured before making
+FP32 the default.
 
 Reproduce each row with the same recorded dumps:
 

@@ -96,7 +96,8 @@ class PixalServer:
             }
         return {"ok": True, "service": "pixal3d", "default_backend": self.args.backend,
                 "default_gpu_execution": self.args.gpu_execution,
-                "default_gpu_kernels": self.args.gpu_kernels, "backends": out}
+                "default_gpu_kernels": self.args.gpu_kernels,
+                "default_gpu_flow_precision": self.args.gpu_flow_precision, "backends": out}
 
     def infer(self, request: dict) -> dict:
         backend = request.get("backend", self.args.backend)
@@ -128,12 +129,14 @@ class PixalServer:
                    "--model-dir", str(self.model_dir), "--dinov3", str(self.dinov3), "--naf", str(self.naf)]
             execution = request.get("gpu_execution", self.args.gpu_execution)
             kernels = request.get("gpu_kernels", self.args.gpu_kernels)
-            if execution not in ("legacy", "resident") or kernels not in ("auto", "blas", "mma"):
+            flow_precision = request.get("gpu_flow_precision", self.args.gpu_flow_precision)
+            if execution not in ("legacy", "resident") or kernels not in ("auto", "blas", "mma") or flow_precision not in ("bf16", "fp32"):
                 raise ValueError("Invalid GPU execution or kernel selection")
             if backend == "cpu":
                 execution = "legacy"
             profile = run_dir / "profile.json"
-            cmd += ["--gpu-execution", execution, "--gpu-kernels", kernels, "--profile-json", str(profile)]
+            cmd += ["--gpu-execution", execution, "--gpu-kernels", kernels,
+                    "--gpu-flow-precision", flow_precision, "--profile-json", str(profile)]
             if threads:
                 cmd += ["--threads", str(threads)]
             if request.get("device") is not None:
@@ -250,6 +253,7 @@ def main() -> None:
     p.add_argument("--bind", default="127.0.0.1"); p.add_argument("--port", type=int, default=8765)
     p.add_argument("--gpu-execution", choices=("legacy", "resident"), default="legacy")
     p.add_argument("--gpu-kernels", choices=("auto", "blas", "mma"), default="auto")
+    p.add_argument("--gpu-flow-precision", choices=("bf16", "fp32"), default="bf16")
     p.add_argument("--backend", choices=("cpu", "cuda", "rocm"), default="cuda")
     p.add_argument("--binary", default=str(ROOT / "cpu/pixal3d/pixal3d")); p.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
     p.add_argument("--dinov3", default=str(DEFAULT_DINOV3)); p.add_argument("--naf", default=str(DEFAULT_NAF))

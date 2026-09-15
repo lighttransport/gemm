@@ -47,8 +47,9 @@ int main(int argc, char **argv) {
                     "  --mask MASK.png (required for RGB)  --distance FLOAT  --mesh-scale FLOAT\n"
                     "  --model-dir DIR  --dinov3 FILE  --naf FILE  --seed N\n"
                     "  --vram-budget-mib N (maximum 14336)  --dump-dir DIR\n"
-                    "  --gpu-execution legacy|resident  --gpu-kernels auto|blas|mma  --profile-json FILE\n"
-                    "Single-view Pixal3D main: 1024 cascade, BF16 flow, FP16 decoders, 4096 PBR textures.");
+                    "  --gpu-execution legacy|resident  --gpu-kernels auto|blas|mma\n"
+                    "  --gpu-flow-precision bf16|fp32  --profile-json FILE\n"
+                    "Single-view Pixal3D main: 1024 cascade, BF16 flow by default, FP16 decoders, 4096 PBR textures.");
                 return 0;
             }
             if (++i >= argc)
@@ -76,6 +77,13 @@ int main(int argc, char **argv) {
                     gpu_options.kernels = PIXAL3D_KERNEL_MMA;
                 else
                     throw std::runtime_error("Invalid GPU kernel mode");
+            } else if (key == "--gpu-flow-precision") {
+                if (value == "bf16")
+                    gpu_options.flow_precision = PIXAL3D_FLOW_BF16;
+                else if (value == "fp32")
+                    gpu_options.flow_precision = PIXAL3D_FLOW_FP32;
+                else
+                    throw std::runtime_error("Invalid GPU flow precision");
             } else if (key == "--profile-json")
                 profile = value;
             else if (key == "--backend") {

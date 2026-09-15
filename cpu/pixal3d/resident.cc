@@ -7,7 +7,8 @@ namespace px {
 void Engine::configure(const pixal3d_gpu_options &o) {
     require(o.struct_size >= sizeof(o) && o.version == 1, "Unsupported GPU options version");
     require(o.execution >= PIXAL3D_GPU_LEGACY && o.execution <= PIXAL3D_GPU_RESIDENT &&
-                o.kernels >= PIXAL3D_KERNEL_AUTO && o.kernels <= PIXAL3D_KERNEL_MMA,
+                o.kernels >= PIXAL3D_KERNEL_AUTO && o.kernels <= PIXAL3D_KERNEL_MMA &&
+                o.flow_precision >= PIXAL3D_FLOW_BF16 && o.flow_precision <= PIXAL3D_FLOW_FP32,
             "Invalid GPU execution options");
     require(!o.execution || (gpu_ && api_.configure), "Resident execution requires a compatible GPU plugin");
     clear_weights();
@@ -15,6 +16,7 @@ void Engine::configure(const pixal3d_gpu_options &o) {
         require(api_.configure(gpu_, o.kernels, o.profile_json && *o.profile_json) == 0, api_.error(gpu_));
     resident_ = o.execution == PIXAL3D_GPU_RESIDENT;
     kernels_ = o.kernels;
+    flow_precision_ = o.flow_precision;
     profile_ = o.profile_json ? o.profile_json : "";
 }
 void Engine::clear_weights() {

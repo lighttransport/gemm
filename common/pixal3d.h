@@ -13,11 +13,13 @@ typedef struct pixal3d_context pixal3d_context;
 /* Separate configuration keeps the original options/result ABI unchanged. */
 typedef enum { PIXAL3D_GPU_LEGACY, PIXAL3D_GPU_RESIDENT } pixal3d_gpu_execution;
 typedef enum { PIXAL3D_KERNEL_AUTO, PIXAL3D_KERNEL_BLAS, PIXAL3D_KERNEL_MMA } pixal3d_gpu_kernels;
+typedef enum { PIXAL3D_FLOW_BF16, PIXAL3D_FLOW_FP32 } pixal3d_flow_precision;
 typedef struct {
     size_t struct_size;
     uint32_t version;
     pixal3d_gpu_execution execution;
     pixal3d_gpu_kernels kernels;
+    pixal3d_flow_precision flow_precision;
     const char *profile_json;
 } pixal3d_gpu_options;
 void pixal3d_default_gpu_options(pixal3d_gpu_options *options);

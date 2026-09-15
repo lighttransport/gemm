@@ -17,6 +17,7 @@ p.add_argument("--gpu-execution",choices=["legacy","resident"],default="legacy")
 p.add_argument("--gpu-kernels",choices=["auto","blas","mma"],default="auto")
 p.add_argument("--reference-device",choices=["cpu","cuda"],default=None,
                help="PyTorch oracle device; native backend remains --backend")
+p.add_argument("--gpu-flow-precision",choices=["bf16","fp32"],default="bf16")
 a = p.parse_args()
 backend = ["cpu", "cuda", "rocm"].index(a.backend)
 device = a.reference_device or ("cpu" if not backend else "cuda")
@@ -33,6 +34,9 @@ lib = C.CDLL(str(ROOT.parent.parent / "cpu/pixal3d/libpixal3d_validation.so"))
 lib.px_test_error.restype = C.c_char_p
 lib.px_test_set_gpu.argtypes=[C.c_int,C.c_int]
 assert lib.px_test_set_gpu(int(a.gpu_execution=="resident"),["auto","blas","mma"].index(a.gpu_kernels))==0
+if hasattr(lib, "px_test_set_gpu_flow_precision"):
+    lib.px_test_set_gpu_flow_precision.argtypes=[C.c_int]
+    assert lib.px_test_set_gpu_flow_precision(["bf16","fp32"].index(a.gpu_flow_precision))==0
 fp = np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS")
 ip = np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS")
 lib.px_test_gemm.argtypes = [C.c_int, fp, fp, fp, fp] + [C.c_int]*4
@@ -61,7 +65,8 @@ rng = np.random.default_rng(173)
 rand = lambda shape: rng.standard_normal(shape).astype(np.float32) * .2
 for bf in [0, 1]:
     x,w,b = rand((139, 160)),rand((96,160)),rand((96,))
-    dtype = torch.bfloat16 if bf else torch.float32
+    effective_bf = bf and not (backend and a.gpu_execution == "resident" and a.gpu_flow_precision == "fp32")
+    dtype = torch.bfloat16 if effective_bf else torch.float32
     expected = F.linear(torch.tensor(x,device=device,dtype=dtype),
                         torch.tensor(w,device=device,dtype=dtype),
                         torch.tensor(b,device=device,dtype=dtype))
@@ -102,8 +107,10 @@ if a.flow:
     xyz=np.indices((4,4,4)).reshape(3,-1).T.astype(np.int32)
     coords=np.ascontiguousarray(np.column_stack([np.zeros(len(xyz),np.int32),xyz]))
     x,global_cond,proj=rand((64,8)),rand((5,1024)),rand((64,1024))
-    for bf in [0,1]:
-        config["dtype"]="bfloat16" if bf else "float32"
+    requested = [0] if (backend and a.gpu_execution == "resident" and a.gpu_flow_precision == "fp32") else [0, 1]
+    for bf in requested:
+        effective_bf = bf and not (backend and a.gpu_execution == "resident" and a.gpu_flow_precision == "fp32")
+        config["dtype"]="bfloat16" if effective_bf else "float32"
         model=SparseStructureFlowModel(**config).eval()
         with safe_open(str(stem.with_suffix(".safetensors")),framework="pt") as weights:
             state={k:weights.get_tensor(k) for k in model.state_dict() if k!="rope_phases"}
@@ -120,7 +127,7 @@ if a.flow:
         actual=np.empty_like(x)
         call(lib.px_test_flow,backend,str(stem.with_suffix(".safetensors")).encode(),
              actual,x,coords,64,8,global_cond,1024,proj,1024,.73,1,bf)
-        check(f"upstream_ss_flow_block_{config['dtype']}",actual,expected,stage=True)
+        check(f"upstream_ss_flow_block_{config['dtype']}_{a.gpu_flow_precision if bf else 'fp32'}",actual,expected,stage=True)
         del model
         if backend: torch.cuda.empty_cache()
 print(f"{a.backend}: PASS",flush=True)

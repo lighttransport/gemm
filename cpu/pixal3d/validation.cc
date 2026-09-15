@@ -7,12 +7,18 @@
 static thread_local std::string last_error;
 static thread_local int test_threads = 16;
 static thread_local pixal3d_gpu_options test_gpu_options{sizeof(pixal3d_gpu_options), 1, PIXAL3D_GPU_LEGACY,
-                                                         PIXAL3D_KERNEL_AUTO, nullptr};
+                                                         PIXAL3D_KERNEL_AUTO, PIXAL3D_FLOW_BF16, nullptr};
 extern "C" int px_test_set_gpu(int execution, int kernels) {
     if (execution < 0 || execution > 1 || kernels < 0 || kernels > 2)
         return -1;
     test_gpu_options.execution = pixal3d_gpu_execution(execution);
     test_gpu_options.kernels = pixal3d_gpu_kernels(kernels);
+    return 0;
+}
+extern "C" int px_test_set_gpu_flow_precision(int precision) {
+    if (precision < 0 || precision > 1)
+        return -1;
+    test_gpu_options.flow_precision = pixal3d_flow_precision(precision);
     return 0;
 }
 extern "C" int px_test_set_threads(int threads) {
