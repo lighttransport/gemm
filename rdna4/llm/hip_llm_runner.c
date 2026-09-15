@@ -17495,7 +17495,10 @@ static inline void launch_matvec_iq2_xxs_batch(hip_llm_runner *r, void *dst,
                        &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
                        &n_rows, &n_cols, &M };
         const char *reuse_dp = getenv("LLM_QWEN35_NATIVE_IQ2_DP4A_REUSE4");
-        if (reuse_dp && atoi(reuse_dp) != 0) {
+        /* IQ2_XXS reuse4 preserves the baseline reduction order and was
+         * parity-checked on Qwen3.8 IQ2_XS at M=128 and streamed 2K. Keep it
+         * on by default; setting the knob to 0 restores the per-token tile. */
+        if (!reuse_dp || atoi(reuse_dp) != 0) {
             LAUNCH(r->fn_matvec_iq2_xxs_dp4a2_batch_reuse4,
                    (n_rows + 7) / 8, (M + 3) / 4, 1,
                    256, 1, 1, 0, r->stream, da);
