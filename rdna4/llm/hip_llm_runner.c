@@ -24095,6 +24095,14 @@ ffn_section:
 }
 
 static int batched_path_eligible(const hip_llm_runner *r, int M) {
+    /* Qwen3.5 recurrent state is not yet parity-safe in the experimental
+     * multi-token path: a scalar-vs-batched check on the 27B GSQ model showed
+     * rel_L2 ~= 0.95 and changed the next-token argmax.  Keep generation
+     * correct by default; retain an explicit opt-in for batch-kernel work. */
+    if (r->is_hybrid && !r->is_qwen4exp) {
+        const char *e = getenv("LLM_QWEN35_BATCH");
+        if (!e || atoi(e) == 0) return 0;
+    }
     /* Exact MTP normally stays on the scalar path.  The grouped verifier
      * explicitly opts into this dispatcher after taking a transaction
      * snapshot; it uses the same exact router/top-k policy but amortizes the

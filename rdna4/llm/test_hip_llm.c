@@ -243,7 +243,8 @@ static int prompt_bos_id(const gguf_context *gguf) {
 }
 
 static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
-                            int n_vocab, int max_seq_len, int bos_id, int mtp_draft) {
+                            int n_vocab, int max_seq_len, int bos_id, int mtp_draft,
+                            int coding_mode) {
     char line[4 * 1024 * 1024];
     int32_t *cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
     int32_t *prefix_cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
@@ -527,8 +528,10 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 }
             }
             int next = use_mtp ? mtp.tokens[mtp_index++] : (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
-                sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence,
-                               repetition, min_p, seen, &rng);
+                (coding_mode ? sample_top_k_p_coding(logits, n_vocab, top_k, top_p,
+                               temperature, presence, repetition, min_p, seen, &rng, vocab) :
+                 sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence,
+                               repetition, min_p, seen, &rng));
             int is_stop = next == eos || next == eot || next == im_end;
             const char *piece = bpe_token_to_str(vocab, next);
             if (!is_stop && piece && text) {
@@ -1537,7 +1540,8 @@ int main(int argc, char **argv) {
     if (stdio_server) {
         int bos = prompt_bos_id(gguf);
         pass = run_stdio_server(gpu, vocab, n_vocab, n_max_seq, bos,
-                                qwen4_mtp ? qwen4_mtp_draft : 0) == 0;
+                                qwen4_mtp ? qwen4_mtp_draft : 0,
+                                coding_mode) == 0;
         hip_llm_free(gpu);
         if (cpu_model) transformer_free(cpu_model);
         bpe_vocab_free(vocab);
