@@ -1,5 +1,54 @@
 # GLM-5.3F A64FX 12-node decode-first plan
 
+## Current GLM-5.3-Flash result and next opportunities (2026-09-16)
+
+The tested checkpoint is **GLM-5.3-Flash** (`/home/u14346/models/glm53f`),
+not the larger GLM-5 model. The qualified 12-node A64FX recipe is FP8
+weights, BF16 KV cache for capacity, `prefill-mode fast`, slab16, feature mask
+27, and tree-packed collective. The optimized prefill remains above the
+100-tok/s requirement and the latest unprofiled 8K measurements are about
+153--155 tok/s. A populated 512K throughput measurement is still pending.
+
+Greedy decode is numerically coherent and is the quality control. The prior
+full coding response reached about 14.6 tok/s with BF16 KV and about 19--20
+tok/s with the FP32 KV configuration. A 4K coding prompt produced valid C++
+structure immediately under greedy decoding, although the earlier complete
+answer exposed model-generated algorithm defects (compile failure and a
+non-terminating allocation-fallback self-test). Those are output-quality
+issues, not evidence of FP8/int8 arithmetic corruption.
+
+Temperature/top-p sampling controls were added in commit `0356d41b`:
+`--temperature`, `--top-p`, and `--seed`. With temperature **0.95** and
+top-p **1.0**, the implementation gathers all 154,880 vocabulary logits on
+every rank for an exact categorical draw. This produced a malformed opening
+and incomplete coding answer in the bounded test, and reduced decode to only
+roughly 3--4 tok/s. The slowdown is therefore attributable to the sampling
+collective, not the GLM-5.3-Flash model or prefill kernels. No new A64FX run
+is claimed in this section after allocation 51669230 expired.
+
+### Unmeasured optimization opportunities
+
+1. Keep greedy/FP32-KV as the quality and speed baseline; benchmark a fresh
+   512--2,048-token decode with an explicit timing file before changing the
+   kernel path. Recheck BF16 KV only when 512K capacity is required.
+2. Replace exact full-vocabulary sampling communication with a distributed
+   candidate path: select local top-K logits, exchange candidates, and perform
+   nucleus accumulation on the merged set. Validate KL/top-p mass against a
+   scalar full-vocabulary reference before using it for production quality.
+   A fused persistent candidate buffer should avoid malloc/all-gather setup on
+   every token.
+3. If exact sampling is required, pipeline logits reduction with the next
+   layer or use a persistent uTofu reduction buffer; do not allocate and free
+   the 154,880-float vector per token. Measure whether this restores 20+
+   tok/s without changing probabilities.
+4. Profile decode separately for KDA recurrence, MLA/cache reads, MoE routing,
+   and vocabulary readout. Preserve the established prefill mask27 path and
+   its >150 tok/s qualification while tuning decode-only kernels.
+5. For coding validation, run at least 8K generated tokens (or EOS), extract
+   every fenced C++ block, compile with warnings enabled, execute deterministic
+   and allocation-failure self-tests, and report truncation separately from
+   semantic/compiler failures.
+
 ## Implemented prefill fast path: 150+ gate met (2026-09-15)
 
 On interactive job **51656483**, 12 A64FX nodes at normal 2.0 GHz, all six
