@@ -23094,6 +23094,14 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
     float scale    = 1.0f / sqrtf((float)head_dim);
     const char *native_batch_env = getenv("LLM_QWEN4_NATIVE_BATCH_QKV");
     int native_batch_qkv = native_batch_env && atoi(native_batch_env) != 0;
+    /* The scalar Qwen3.5 path evaluates IQ* projections directly from the
+     * quantized weights.  Converting those weights to BF16 for a batched GEMM
+     * changes the recurrent input enough to compound across 64 layers.  Keep
+     * the batched state/attention scheduling, but retain exact quantized
+     * projections unless the BF16 experiment is explicitly requested. */
+    const char *qwen35_bf16_env = getenv("LLM_QWEN35_BATCH_BF16_PROJ");
+    int qwen35_bf16_proj = qwen35_bf16_env && atoi(qwen35_bf16_env) != 0;
+    int qwen35_scalar_proj = r->is_hybrid && !r->is_qwen4exp && !qwen35_bf16_proj;
 
     int n_run_layers = r->n_layers;
     if (r->max_layers > 0 && r->max_layers < r->n_layers) n_run_layers = r->max_layers;
@@ -23347,10 +23355,27 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 cl->ssm_gate_type == GGML_TYPE_Q6_K &&
                 cl->ssm_alpha_type == GGML_TYPE_F16 &&
                 cl->ssm_beta_type == GGML_TYPE_F16;
+            int scalar_ssm_proj = qwen35_scalar_proj;
             const char *ssm_native_env = getenv("LLM_QWEN4_BATCH_SSM_NATIVE");
             int ssm_native = ssm_native_env && atoi(ssm_native_env) != 0 &&
                              qwen4_ssm_native_supported(cl);
-            if (ssm_native) {
+            if (scalar_ssm_proj) {
+                for (int m = 0; m < M; ++m) {
+                    float *xrow = (float *)r->d_xnorm_batch + (size_t)m * n_embd;
+                    launch_matvec_auto(r, (float *)r->d_ssm_qkv_batch + (size_t)m * cl->ssm_qkv_rows,
+                                       cl->ssm_qkv_w, xrow, cl->ssm_qkv_rows,
+                                       cl->ssm_qkv_cols, cl->ssm_qkv_type);
+                    launch_matvec_auto(r, (float *)r->d_ssm_z_batch + (size_t)m * cl->ssm_gate_rows,
+                                       cl->ssm_gate_w, xrow, cl->ssm_gate_rows,
+                                       cl->ssm_gate_cols, cl->ssm_gate_type);
+                    launch_matvec_auto(r, (float *)r->d_ssm_alpha_batch + (size_t)m * cl->ssm_alpha_rows,
+                                       cl->ssm_alpha_w, xrow, cl->ssm_alpha_rows,
+                                       cl->ssm_alpha_cols, cl->ssm_alpha_type);
+                    launch_matvec_auto(r, (float *)r->d_ssm_beta_batch + (size_t)m * cl->ssm_beta_rows,
+                                       cl->ssm_beta_w, xrow, cl->ssm_beta_rows,
+                                       cl->ssm_beta_cols, cl->ssm_beta_type);
+                }
+            } else if (ssm_native) {
                 if (launch_ssm_matvec4_q8_batch(r,cl,M,r->d_xnorm_batch,
                     r->d_ssm_qkv_batch,r->d_ssm_z_batch,r->d_ssm_alpha_batch,
                     r->d_ssm_beta_batch)) return -1;
@@ -23416,16 +23441,37 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
 
             float *conv_out_base = (float *)r->d_ssm_conv_out_batch;
             float *K_raw_base    = conv_out_base + (size_t)n_group * d_state;
-            launch_l2_norm_heads_batch(r, conv_out_base, n_group, d_state,
-                                       qkv_dim, M, eps);                 /* Q */
-            launch_l2_norm_heads_batch(r, K_raw_base,    n_group, d_state,
-                                       qkv_dim, M, eps);                 /* K */
-            launch_repeat_tile_batch(r, r->d_ssm_Q_exp_batch, conv_out_base,
-                                     dt_rank, d_state, n_group,
-                                     qkv_dim, dt_rank * d_state, M);
-            launch_repeat_tile_batch(r, r->d_ssm_K_exp_batch, K_raw_base,
-                                     dt_rank, d_state, n_group,
-                                     qkv_dim, dt_rank * d_state, M);
+            if (qwen35_scalar_proj) {
+                /* Preserve the scalar reduction/order for Qwen3.5.  These
+                 * normalizations feed the recurrent matrix update directly;
+                 * a different parallel reduction is amplified by later
+                 * tokens even when the projections themselves match. */
+                for (int m = 0; m < M; ++m) {
+                    size_t qoff = (size_t)m * qkv_dim;
+                    size_t eoff = (size_t)m * dt_rank * d_state;
+                    launch_l2_norm_heads(r, conv_out_base + qoff,
+                                         n_group, d_state, eps);
+                    launch_l2_norm_heads(r, K_raw_base + qoff,
+                                         n_group, d_state, eps);
+                    launch_repeat_tile(r, (float *)r->d_ssm_Q_exp_batch + eoff,
+                                       conv_out_base + qoff,
+                                       dt_rank, d_state, n_group);
+                    launch_repeat_tile(r, (float *)r->d_ssm_K_exp_batch + eoff,
+                                       K_raw_base + qoff,
+                                       dt_rank, d_state, n_group);
+                }
+            } else {
+                launch_l2_norm_heads_batch(r, conv_out_base, n_group, d_state,
+                                           qkv_dim, M, eps);             /* Q */
+                launch_l2_norm_heads_batch(r, K_raw_base,    n_group, d_state,
+                                           qkv_dim, M, eps);             /* K */
+                launch_repeat_tile_batch(r, r->d_ssm_Q_exp_batch, conv_out_base,
+                                         dt_rank, d_state, n_group,
+                                         qkv_dim, dt_rank * d_state, M);
+                launch_repeat_tile_batch(r, r->d_ssm_K_exp_batch, K_raw_base,
+                                         dt_rank, d_state, n_group,
+                                         qkv_dim, dt_rank * d_state, M);
+            }
 
             /* Phase B: fused multi-token deltanet step. V lives inside conv_out
              * at offset 2*n_group*d_state with stride qkv_dim per row. */
@@ -23471,17 +23517,34 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 }
             }
 
-            /* Batched gated_rmsnorm_silu: one launch over dt_rank × M heads. */
-            launch_gated_rmsnorm_silu_batch(r, r->d_ssm_out_batch, r->d_ssm_z_batch,
-                                            cl->ssm_norm_w, dt_rank, d_state,
-                                            dt_rank * d_state, M, eps);
+            /* Batched gated_rmsnorm_silu: one launch over dt_rank × M heads.
+             * Qwen3.5 uses the scalar reduction for parity for the same reason
+             * as the Q/K head norms above. */
+            if (qwen35_scalar_proj) {
+                for (int m = 0; m < M; ++m)
+                    launch_gated_rmsnorm_silu(r,
+                        (float *)r->d_ssm_out_batch + (size_t)m * d_inner,
+                        (float *)r->d_ssm_z_batch + (size_t)m * d_inner,
+                        cl->ssm_norm_w, dt_rank, d_state, eps);
+            } else {
+                launch_gated_rmsnorm_silu_batch(r, r->d_ssm_out_batch, r->d_ssm_z_batch,
+                                                cl->ssm_norm_w, dt_rank, d_state,
+                                                dt_rank * d_state, M, eps);
+            }
             if (r->is_qwen4exp && r->debug_layers)
                 debug_f32_state(r, l, "Q4 batch ssm_norm",
                                 (const float *)r->d_ssm_out_batch, M * d_inner);
 
             /* ssm_out projection: d_inner -> n_embd, batched. Reuse d_silu_batch_bf16
              * as packing scratch (sized for n_ff >= d_inner). */
-            if (ssm_native) {
+            if (qwen35_scalar_proj) {
+                for (int m = 0; m < M; ++m)
+                    launch_matvec_auto(r,
+                        (float *)r->d_attn_proj_batch + (size_t)m * n_embd,
+                        cl->ssm_out_w,
+                        (float *)r->d_ssm_out_batch + (size_t)m * d_inner,
+                        n_embd, d_inner, cl->ssm_out_type);
+            } else if (ssm_native) {
                 if (launch_matmul_q8_batch_f32(r,r->d_attn_proj_batch,cl->ssm_out_w,
                     r->d_ssm_out_batch,M,n_embd,d_inner)) return -1;
             } else {
@@ -23514,7 +23577,8 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
          * Gated attn: Q projection produces [M, 2*q_dim] into d_qfull_batch,
          * then deinterleave_qgate_batch splits into d_q_batch + d_attn_gate_batch. */
         const char *scalar_proj_env = getenv("LLM_QWEN4_BATCH_PROJ_SCALAR");
-        int scalar_proj = scalar_proj_env && atoi(scalar_proj_env) != 0;
+        int scalar_proj = (scalar_proj_env && atoi(scalar_proj_env) != 0) ||
+                          qwen35_scalar_proj;
         {
             int q_proj_rows = cl->attn_q_rows;  /* q_dim or 2*q_dim */
             void *q_dst = is_gated_attn ? r->d_qfull_batch : r->d_q_batch;
@@ -23824,7 +23888,8 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         /* ---- Output projection: [M, q_dim] x W_o^T -> [M, n_embd] ---- */
         int o_rows = r->is_gemma4 ? l_qdim : q_dim;
         const char *scalar_proj_out_env = getenv("LLM_QWEN4_BATCH_PROJ_SCALAR");
-        if (scalar_proj_out_env && atoi(scalar_proj_out_env) != 0) {
+        if ((scalar_proj_out_env && atoi(scalar_proj_out_env) != 0) ||
+            qwen35_scalar_proj) {
             for (int m = 0; m < M; ++m)
                 launch_matvec_auto(r,
                     (char *)r->d_attn_proj_batch + (size_t)m * n_embd * sizeof(float),
@@ -23940,43 +24005,63 @@ ffn_section:
             continue;
         }
 
-        launch_pack_bf16_from_f32(r, r->d_ffn_norm_batch_bf16,
-                                  r->d_xnorm_batch, M * n_embd);
-
-        /* ---- gate/up GEMMs ---- */
-        {
-            void *gw = get_bf16_weight(r, cl->ffn_gate_w, cl->ffn_gate_w_bf16,
-                                       cl->ffn_gate_type, cl->ffn_gate_rows, cl->ffn_gate_cols);
-            if (!gw) return -1;
-            if (gemm_run_bf16_w(r, r->d_gate_batch, gw,
-                                   r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
-        }
-        {
-            void *uw = get_bf16_weight(r, cl->ffn_up_w, cl->ffn_up_w_bf16,
-                                       cl->ffn_up_type, cl->ffn_up_rows, cl->ffn_up_cols);
-            if (!uw) return -1;
-            if (gemm_run_bf16_w(r, r->d_up_batch, uw,
-                                   r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
-        }
-
-        /* SiLU(gate) * up — elementwise across [M, n_ff] */
-        if (r->is_gemma4) {
-            int n = M * n_ff;
-            void *a[] = { &r->d_gate_batch, &r->d_up_batch, &n };
-            LAUNCH(r->fn_gelu_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        if (qwen35_scalar_proj) {
+            /* Keep IQ2/IQ3 arithmetic identical to the scalar reference.  A
+             * BF16 weight staging round-trip here is especially damaging for
+             * the gated FFN because its two quantized products are multiplied
+             * elementwise before the down projection. */
+            for (int m = 0; m < M; ++m) {
+                float *xrow = (float *)r->d_xnorm_batch + (size_t)m * n_embd;
+                launch_matvec_auto(r, (float *)r->d_gate_batch + (size_t)m * n_ff,
+                                   cl->ffn_gate_w, xrow, n_ff, n_embd, cl->ffn_gate_type);
+                launch_matvec_auto(r, (float *)r->d_up_batch + (size_t)m * n_ff,
+                                   cl->ffn_up_w, xrow, n_ff, n_embd, cl->ffn_up_type);
+                launch_silu_mul(r, (float *)r->d_gate_batch + (size_t)m * n_ff,
+                                (float *)r->d_up_batch + (size_t)m * n_ff, n_ff);
+                launch_matvec_auto(r, (float *)r->d_down_batch + (size_t)m * n_embd,
+                                   cl->ffn_down_w,
+                                   (float *)r->d_gate_batch + (size_t)m * n_ff,
+                                   n_embd, n_ff, cl->ffn_down_type);
+            }
         } else {
-            launch_silu_mul(r, r->d_gate_batch, r->d_up_batch, M * n_ff);
-        }
+            launch_pack_bf16_from_f32(r, r->d_ffn_norm_batch_bf16,
+                                      r->d_xnorm_batch, M * n_embd);
 
-        /* Pack and down projection */
-        launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
-                                  r->d_gate_batch, M * n_ff);
-        {
-            void *dw = get_bf16_weight(r, cl->ffn_down_w, cl->ffn_down_w_bf16,
-                                       cl->ffn_down_type, cl->ffn_down_rows, cl->ffn_down_cols);
-            if (!dw) return -1;
-            if (gemm_run_bf16_w(r, r->d_down_batch, dw,
-                                   r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
+            /* ---- gate/up GEMMs ---- */
+            {
+                void *gw = get_bf16_weight(r, cl->ffn_gate_w, cl->ffn_gate_w_bf16,
+                                           cl->ffn_gate_type, cl->ffn_gate_rows, cl->ffn_gate_cols);
+                if (!gw) return -1;
+                if (gemm_run_bf16_w(r, r->d_gate_batch, gw,
+                                       r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
+            }
+            {
+                void *uw = get_bf16_weight(r, cl->ffn_up_w, cl->ffn_up_w_bf16,
+                                           cl->ffn_up_type, cl->ffn_up_rows, cl->ffn_up_cols);
+                if (!uw) return -1;
+                if (gemm_run_bf16_w(r, r->d_up_batch, uw,
+                                       r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
+            }
+
+            /* SiLU(gate) * up — elementwise across [M, n_ff] */
+            if (r->is_gemma4) {
+                int n = M * n_ff;
+                void *a[] = { &r->d_gate_batch, &r->d_up_batch, &n };
+                LAUNCH(r->fn_gelu_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else {
+                launch_silu_mul(r, r->d_gate_batch, r->d_up_batch, M * n_ff);
+            }
+
+            /* Pack and down projection */
+            launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
+                                      r->d_gate_batch, M * n_ff);
+            {
+                void *dw = get_bf16_weight(r, cl->ffn_down_w, cl->ffn_down_w_bf16,
+                                           cl->ffn_down_type, cl->ffn_down_rows, cl->ffn_down_cols);
+                if (!dw) return -1;
+                if (gemm_run_bf16_w(r, r->d_down_batch, dw,
+                                       r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
+            }
         }
 
         /* Residual + Gemma4 post-FFN norm */
@@ -24095,10 +24180,10 @@ ffn_section:
 }
 
 static int batched_path_eligible(const hip_llm_runner *r, int M) {
-    /* Qwen3.5 recurrent state is not yet parity-safe in the experimental
-     * multi-token path: a scalar-vs-batched check on the 27B GSQ model showed
-     * rel_L2 ~= 0.95 and changed the next-token argmax.  Keep generation
-     * correct by default; retain an explicit opt-in for batch-kernel work. */
+    /* Qwen3.5 keeps batching opt-in until the complete hybrid path has passed
+     * a scalar-vs-batched parity check.  The batched implementation now has an
+     * exact-quantized projection mode, but the gate remains conservative while
+     * attention/state numerical validation is still in progress. */
     if (r->is_hybrid && !r->is_qwen4exp) {
         const char *e = getenv("LLM_QWEN35_BATCH");
         if (!e || atoi(e) == 0) return 0;
