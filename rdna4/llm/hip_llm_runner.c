@@ -23180,7 +23180,17 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         const char *qwen4_batch_ssm_env = getenv("LLM_QWEN4_BATCH_SSM");
         int qwen4_batch_ssm = r->is_qwen4exp && qwen4_batch_ssm_env &&
                               atoi(qwen4_batch_ssm_env) != 0;
+        const char *qwen35_batch_max_env = getenv("LLM_QWEN35_BATCH_MAX_LAYER");
+        int qwen35_batch_max_layer = qwen35_batch_max_env ?
+                                     atoi(qwen35_batch_max_env) : r->n_layers - 1;
+        int qwen35_layer_batch_ok = !r->is_hybrid || r->is_qwen4exp ||
+                                    l <= qwen35_batch_max_layer;
+        const char *qwen35_ssm_env = getenv("LLM_QWEN35_BATCH_SSM");
+        int qwen35_batch_ssm = r->is_qwen4exp ||
+                               (qwen35_ssm_env && atoi(qwen35_ssm_env) != 0);
         int can_batch_ssm  =  cl->is_ssm &&
+                             qwen35_layer_batch_ok &&
+                             qwen35_batch_ssm &&
                              (!r->is_qwen4exp || qwen4_batch_ssm) &&
                              ssm_layer_is_batched_eligible(cl);
         const char *qwen4_batch_attn_env = getenv("LLM_QWEN4_BATCH_ATTN");
@@ -23201,7 +23211,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
          * the historical all-layer default. */
         int batch_attn_max_layer = batch_attn_max_env ? atoi(batch_attn_max_env) :
             (r->is_qwen4exp ? 2 : r->n_layers - 1);
-        int can_batch_attn = qwen4_batch_attn && !cl->is_ssm &&
+        int can_batch_attn = qwen35_layer_batch_ok && qwen4_batch_attn && !cl->is_ssm &&
                              l <= batch_attn_max_layer &&
                              layer_is_batched_eligible(cl);
         /* The grouped verifier defaults to scalar layer bodies because the
