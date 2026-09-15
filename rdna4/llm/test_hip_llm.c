@@ -856,6 +856,7 @@ int main(int argc, char **argv) {
     int max_seq_len = 256;
     int bench_mode = 0;       /* --bench: split prefill/decode tps; skip CPU compare */
     int gpu_only_bench = 0;   /* --gpu-only-bench: also skip CPU model load */
+    int gpu_only = 0;         /* --gpu-only: generate normally without CPU shadow */
     int decode_n = 0;         /* --decode N: greedy-sample N tokens after prefill */
     int prefill_pad = 0;      /* --prefill-len M: pad prompt up to M tokens with last token (for bench) */
     int bench_repeat = 1;     /* --bench-repeat N: rerun the same request N times in-process */
@@ -975,6 +976,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--gpu-only-bench") == 0) {
             bench_mode = 1;
             gpu_only_bench = 1;
+        } else if (strcmp(argv[i], "--gpu-only") == 0) {
+            gpu_only = 1;
         } else if (strcmp(argv[i], "--decode") == 0 && i + 1 < argc) {
             decode_n = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--bench-repeat") == 0 && i + 1 < argc) {
@@ -1090,7 +1093,7 @@ int main(int argc, char **argv) {
             model_path = argv[i];
         } else {
             fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
-            fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M] [--coding]\n");
+            fprintf(stderr, "       [--bench] [--gpu-only-bench] [--gpu-only] [--decode N] [--prefill-len M] [--coding]\n");
             fprintf(stderr, "       [--moe-cache-mb MiB] [--moe-cpu]\n");
             fprintf(stderr, "       [--kv-cache auto|f32|f16] [--decode-kernels native|dp4a2|auto]\n");
             fprintf(stderr, "       [--decode-layout native|auto] [--decode-layout-cache auto|off|PATH]\n");
@@ -1369,11 +1372,11 @@ int main(int argc, char **argv) {
     }
 
     /* Load CPU reference model (may fail for MoE -- run GPU-only in that case) */
-    int gpu_only = 0;
     transformer_model *cpu_model = NULL;
-    if (gpu_only_bench) {
+    if (gpu_only_bench || gpu_only) {
         gpu_only = 1;
-        fprintf(stderr, "\n=== Skipping CPU reference (--gpu-only-bench) ===\n");
+        fprintf(stderr, "\n=== Skipping CPU reference (--%s) ===\n",
+                gpu_only_bench ? "gpu-only-bench" : "gpu-only");
     } else {
         fprintf(stderr, "\n=== Loading CPU reference model ===\n");
         cpu_model = transformer_load(gguf, max_seq_len);

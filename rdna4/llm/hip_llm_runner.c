@@ -16407,7 +16407,9 @@ static inline void launch_matvec_iq3_xxs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     int rows_per_block = r->mw_threads / 32;
-    if (r->decode_dp4a2 && n_cols <= 17408 && (n_cols % 256) == 0) {
+    const char *experimental = getenv("LLM_EXPERIMENTAL_IQ3XXS_DP4A2");
+    if (r->decode_dp4a2 && experimental && atoi(experimental) != 0 &&
+        n_cols <= 17408 && (n_cols % 256) == 0) {
         launch_quantize_q8x2(r, x, n_cols);
         void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
                        &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
