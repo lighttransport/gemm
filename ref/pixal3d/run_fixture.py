@@ -25,6 +25,7 @@ p.add_argument('--dump',action='store_true')
 p.add_argument('--attach',type=int,help='Monitor an already running native process')
 p.add_argument('--gpu-execution',choices=['legacy','resident'],default='legacy')
 p.add_argument('--gpu-kernels',choices=['auto','blas','mma'],default='auto')
+p.add_argument('--gpu-flow-precision',choices=['bf16','fp32'],default='bf16')
 p.add_argument('--timeout',type=float,default=14400)
 a=p.parse_args()
 assert a.timeout>0
@@ -58,7 +59,8 @@ def memory(pid):
 a.output_dir.mkdir(parents=True,exist_ok=True)
 command=[str(a.binary),'--backend',a.backend,'--input',str(a.input),'--output',str(a.output_dir/'mesh.glb'),
          '--fov',str(a.fov),'--seed',str(a.seed),'--threads',str(a.threads)]
-command+=['--gpu-execution',a.gpu_execution,'--gpu-kernels',a.gpu_kernels,'--profile-json',str(a.output_dir/'profile.json')]
+command+=['--gpu-execution',a.gpu_execution,'--gpu-kernels',a.gpu_kernels,
+          '--gpu-flow-precision',a.gpu_flow_precision,'--profile-json',str(a.output_dir/'profile.json')]
 if a.dump:command+=['--dump-dir',str(a.output_dir/'dumps')]
 if a.mask:command+=['--mask',str(a.mask)]
 if a.attach:
