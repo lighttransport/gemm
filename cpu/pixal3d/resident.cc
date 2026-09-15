@@ -8,7 +8,7 @@ void Engine::configure(const pixal3d_gpu_options &o) {
     require(o.struct_size >= sizeof(o) && o.version == 1, "Unsupported GPU options version");
     require(o.execution >= PIXAL3D_GPU_LEGACY && o.execution <= PIXAL3D_GPU_RESIDENT &&
                 o.kernels >= PIXAL3D_KERNEL_AUTO && o.kernels <= PIXAL3D_KERNEL_MMA &&
-                o.flow_precision >= PIXAL3D_FLOW_BF16 && o.flow_precision <= PIXAL3D_FLOW_FP32,
+                o.flow_precision >= PIXAL3D_FLOW_BF16 && o.flow_precision <= PIXAL3D_FLOW_MIXED,
             "Invalid GPU execution options");
     require(!o.execution || (gpu_ && api_.configure), "Resident execution requires a compatible GPU plugin");
     clear_weights();
@@ -93,7 +93,8 @@ Tensor Engine::weight(Weights &w, const std::string &name, int precision) {
     if (!w.has(name))
         return {};
     bind(w);
-    std::string key = name + ":" + std::to_string(precision);
+    int storage_precision = precision == 3 ? 1 : precision;
+    std::string key = name + ":" + std::to_string(storage_precision);
     auto it = weights_.find(key);
     if (it != weights_.end())
         return it->second;
@@ -105,14 +106,14 @@ Tensor Engine::weight(Weights &w, const std::string &name, int precision) {
     int index = safetensors_find(w.st, name.c_str());
     const char *dtype = safetensors_dtype(w.st, index);
     Tensor t;
-    if (precision && !std::strcmp(dtype, precision == 1 ? "BF16" : "F16")) {
+    if (storage_precision && !std::strcmp(dtype, storage_precision == 1 ? "BF16" : "F16")) {
         require(safetensors_nbytes(w.st, index) == n * 2, "Invalid packed weight size: " + name);
-        t = upload(safetensors_data(w.st, index), n, precision);
-    } else if (precision) {
+        t = upload(safetensors_data(w.st, index), n, storage_precision);
+    } else if (storage_precision) {
         const float *v = w.get(name);
         std::vector<uint16_t> packed(n);
         for (size_t i = 0; i < n; ++i) {
-            if (precision == 1) {
+            if (storage_precision == 1) {
                 float f = bf16(v[i]);
                 uint32_t u;
                 std::memcpy(&u, &f, 4);
@@ -122,10 +123,10 @@ Tensor Engine::weight(Weights &w, const std::string &name, int precision) {
                 std::memcpy(&packed[i], &h, 2);
             }
         }
-        t = upload(packed.data(), n, precision);
+        t = upload(packed.data(), n, storage_precision);
     } else
         t = upload(w.get(name), n);
-    size_t bytes = n * (precision ? 2 : 4);
+    size_t bytes = n * (storage_precision ? 2 : 4);
     if (cache_bytes_ + bytes <= cache_limit_) {
         weights_[key] = t;
         cache_bytes_ += bytes;
@@ -235,8 +236,13 @@ void Engine::write_profile() {
 }
 
 Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords, float t,
-                  const Vec &global_input, const Vec &projected_input, int blocks, bool bf) {
+                  const Vec &global_input, const Vec &projected_input, int blocks,
+                  pixal3d_flow_precision precision) {
     e.bind(w);
+    bool bf = precision == PIXAL3D_FLOW_BF16;
+    bool mixed = precision == PIXAL3D_FLOW_MIXED;
+    int linear_precision = mixed ? 3 : (bf ? 1 : 0);
+    int op_precision = bf ? 1 : 0;
     int c = w.shape("input_layer.weight")[0], heads = w.shape("blocks.0.self_attn.q_rms_norm.gamma")[0];
     require(heads > 0 && c % heads == 0 && coords.size() % 4 == 0 &&
                 input.size() == coords.size() / 4 * size_t(w.shape("input_layer.weight")[1]) &&
@@ -257,54 +263,54 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
     e.inplace(PX_SILU, tm, c);
     tm = e.linear(tm, w, "t_embedder.mlp.2");
     e.inplace(PX_SILU, tm, c);
-    auto modulation = e.linear(tm, w, "adaLN_modulation.1");
-    auto hidden = e.linear(e.upload(input), w, "input_layer");
+    auto modulation = e.linear(tm, w, "adaLN_modulation.1", linear_precision);
+    auto hidden = e.linear(e.upload(input), w, "input_layer", linear_precision);
     for (Tensor *x : {&modulation, &hidden})
         e.inplace(PX_ROUND, *x, 1, bf);
-    auto cached = e.condition(w, global_input, projected_input, coords, bf);
+    auto cached = e.condition(w, global_input, projected_input, coords, bf ? 1 : 0);
     auto global = cached->global, projected = cached->projected, phases = cached->rope_phases;
     for (int i = 0; i < blocks; ++i) {
         std::string b = "blocks." + std::to_string(i) + ".", ca = b + "cross_attn.cross_attn_block.";
-        auto mod = e.operation(PX_ADD, modulation, 6 * c, bf, e.weight(w, b + "modulation"));
+        auto mod = e.operation(PX_ADD, modulation, 6 * c, op_precision, e.weight(w, b + "modulation"));
         auto h = e.operation(PX_NORM, hidden, c, 0, {}, {}, 0, 0, 1e-6f);
-        e.inplace(PX_MODULATE, h, c, bf, mod);
-        auto qkv = e.linear(h, w, b + "self_attn.to_qkv", bf);
+        e.inplace(PX_MODULATE, h, c, op_precision, mod);
+        auto qkv = e.linear(h, w, b + "self_attn.to_qkv", linear_precision);
         auto q = e.operation(PX_PART, qkv, c, 0, {}, {}, 3, 0);
         auto k = e.operation(PX_PART, qkv, c, 0, {}, {}, 3, 1);
         auto v = e.operation(PX_PART, qkv, c, 0, {}, {}, 3, 2);
         qkv = {};
-        e.inplace(PX_RMS, q, hd, bf, e.weight(w, b + "self_attn.q_rms_norm.gamma"), {}, heads);
-        e.inplace(PX_RMS, k, hd, bf, e.weight(w, b + "self_attn.k_rms_norm.gamma"), {}, heads);
-        e.inplace(PX_ROPE, q, hd, bf, phases, {}, heads, 0, 0, 1);
-        e.inplace(PX_ROPE, k, hd, bf, phases, {}, heads, 0, 0, 1);
-        h = e.attention(q, k, v, heads, hd, bf);
-        h = e.linear(h, w, b + "self_attn.to_out", bf);
-        e.inplace(PX_RESIDUAL, hidden, c, bf, h, mod, 0, 2 * c);
+        e.inplace(PX_RMS, q, hd, op_precision, e.weight(w, b + "self_attn.q_rms_norm.gamma"), {}, heads);
+        e.inplace(PX_RMS, k, hd, op_precision, e.weight(w, b + "self_attn.k_rms_norm.gamma"), {}, heads);
+        e.inplace(PX_ROPE, q, hd, op_precision, phases, {}, heads, 0, 0, 1);
+        e.inplace(PX_ROPE, k, hd, op_precision, phases, {}, heads, 0, 0, 1);
+        h = e.attention(q, k, v, heads, hd, op_precision);
+        h = e.linear(h, w, b + "self_attn.to_out", linear_precision);
+        e.inplace(PX_RESIDUAL, hidden, c, op_precision, h, mod, 0, 2 * c);
         h = e.operation(PX_NORM, hidden, c, bf, e.weight(w, b + "norm2.weight"),
                         e.weight(w, b + "norm2.bias"), 0, 0, 1e-6f);
-        q = e.linear(h, w, ca + "to_q", bf);
+        q = e.linear(h, w, ca + "to_q", linear_precision);
         if (!cached->keys[i].get()) {
-            auto kv = e.linear(global, w, ca + "to_kv", bf);
+            auto kv = e.linear(global, w, ca + "to_kv", linear_precision);
             cached->keys[i] = e.operation(PX_PART, kv, c, 0, {}, {}, 2, 0);
             cached->values[i] = e.operation(PX_PART, kv, c, 0, {}, {}, 2, 1);
-            e.inplace(PX_RMS, cached->keys[i], hd, bf, e.weight(w, ca + "k_rms_norm.gamma"), {}, heads);
+            e.inplace(PX_RMS, cached->keys[i], hd, op_precision, e.weight(w, ca + "k_rms_norm.gamma"), {}, heads);
         }
         k = cached->keys[i];
         v = cached->values[i];
-        e.inplace(PX_RMS, q, hd, bf, e.weight(w, ca + "q_rms_norm.gamma"), {}, heads);
-        h = e.attention(q, k, v, heads, hd, bf);
-        h = e.linear(h, w, ca + "to_out", bf);
-        auto projection = e.linear(projected, w, b + "cross_attn.proj_linear", bf);
-        e.inplace(PX_ADD, h, c, bf, projection, {}, 1);
-        e.inplace(PX_RESIDUAL, hidden, c, bf, h);
+        e.inplace(PX_RMS, q, hd, op_precision, e.weight(w, ca + "q_rms_norm.gamma"), {}, heads);
+        h = e.attention(q, k, v, heads, hd, op_precision);
+        h = e.linear(h, w, ca + "to_out", linear_precision);
+        auto projection = e.linear(projected, w, b + "cross_attn.proj_linear", linear_precision);
+        e.inplace(PX_ADD, h, c, op_precision, projection, {}, 1);
+        e.inplace(PX_RESIDUAL, hidden, c, op_precision, h);
         h = e.operation(PX_NORM, hidden, c, 0, {}, {}, 0, 0, 1e-6f);
-        e.inplace(PX_MODULATE, h, c, bf, mod, {}, 0, 3 * c);
-        h = e.linear(h, w, b + "mlp.mlp.0", bf);
-        e.inplace(PX_GELU, h, 1, bf, {}, {}, 1);
-        h = e.linear(h, w, b + "mlp.mlp.2", bf);
-        e.inplace(PX_RESIDUAL, hidden, c, bf, h, mod, 0, 5 * c);
+        e.inplace(PX_MODULATE, h, c, op_precision, mod, {}, 0, 3 * c);
+        h = e.linear(h, w, b + "mlp.mlp.0", linear_precision);
+        e.inplace(PX_GELU, h, 1, op_precision, {}, {}, 1);
+        h = e.linear(h, w, b + "mlp.mlp.2", linear_precision);
+        e.inplace(PX_RESIDUAL, hidden, c, op_precision, h, mod, 0, 5 * c);
     }
     auto h = e.operation(PX_NORM, hidden, c, 0, {}, {}, 0, 0, 1e-5f);
-    return e.download(e.linear(h, w, "out_layer"));
+    return e.download(e.linear(h, w, "out_layer", linear_precision));
 }
 } // namespace px

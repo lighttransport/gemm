@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
                     "  --model-dir DIR  --dinov3 FILE  --naf FILE  --seed N\n"
                     "  --vram-budget-mib N (maximum 14336)  --dump-dir DIR\n"
                     "  --gpu-execution legacy|resident  --gpu-kernels auto|blas|mma\n"
-                    "  --gpu-flow-precision bf16|fp32  --profile-json FILE\n"
+                    "  --gpu-flow-precision bf16|fp32|mixed  --profile-json FILE\n"
                     "Single-view Pixal3D main: 1024 cascade, BF16 flow by default, FP16 decoders, 4096 PBR textures.");
                 return 0;
             }
@@ -82,6 +82,8 @@ int main(int argc, char **argv) {
                     gpu_options.flow_precision = PIXAL3D_FLOW_BF16;
                 else if (value == "fp32")
                     gpu_options.flow_precision = PIXAL3D_FLOW_FP32;
+                else if (value == "mixed")
+                    gpu_options.flow_precision = PIXAL3D_FLOW_MIXED;
                 else
                     throw std::runtime_error("Invalid GPU flow precision");
             } else if (key == "--profile-json")

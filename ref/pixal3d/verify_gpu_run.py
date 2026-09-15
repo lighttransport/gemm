@@ -15,7 +15,7 @@ p.add_argument("--model-dir", type=Path, default=Path("/mnt/disk2/models/Pixal3D
 p.add_argument("--reference-device", choices=("cpu", "cuda"), default="cpu")
 p.add_argument("--gpu-execution", choices=("legacy", "resident"), default="resident")
 p.add_argument("--gpu-kernels", choices=("auto", "blas", "mma"), default="auto")
-p.add_argument("--gpu-flow-precision", choices=("bf16", "fp32"), default="bf16")
+p.add_argument("--gpu-flow-precision", choices=("bf16", "fp32", "mixed"), default="bf16")
 p.add_argument("--output", type=Path, default=Path("tmp/pixal3d/verification/results.jsonl"))
 p.add_argument("--skip-complete", action="store_true")
 p.add_argument("--primitives", action="store_true")

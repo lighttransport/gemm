@@ -16,7 +16,7 @@ extern "C" int px_test_set_gpu(int execution, int kernels) {
     return 0;
 }
 extern "C" int px_test_set_gpu_flow_precision(int precision) {
-    if (precision < 0 || precision > 1)
+    if (precision < 0 || precision > 2)
         return -1;
     test_gpu_options.flow_precision = pixal3d_flow_precision(precision);
     return 0;

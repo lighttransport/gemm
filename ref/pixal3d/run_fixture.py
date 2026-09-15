@@ -25,7 +25,7 @@ p.add_argument('--dump',action='store_true')
 p.add_argument('--attach',type=int,help='Monitor an already running native process')
 p.add_argument('--gpu-execution',choices=['legacy','resident'],default='legacy')
 p.add_argument('--gpu-kernels',choices=['auto','blas','mma'],default='auto')
-p.add_argument('--gpu-flow-precision',choices=['bf16','fp32'],default='bf16')
+p.add_argument('--gpu-flow-precision',choices=['bf16','fp32','mixed'],default='bf16')
 p.add_argument('--timeout',type=float,default=14400)
 a=p.parse_args()
 assert a.timeout>0

@@ -12,7 +12,7 @@ p = argparse.ArgumentParser()
 p.add_argument('--backend', choices=['cuda', 'rocm'], required=True)
 p.add_argument('--dump-dir', type=Path, required=True)
 p.add_argument('--stage', choices=['structure', 'shape512', 'shape1024', 'texture'], required=True)
-p.add_argument('--precision', choices=['bf16', 'fp32'], default='bf16')
+p.add_argument('--precision', choices=['bf16', 'fp32', 'mixed'], default='bf16')
 p.add_argument('--model-dir', type=Path, default=Path('/mnt/disk2/models/Pixal3D'))
 p.add_argument('--gpu-kernels', choices=['auto', 'blas', 'mma'], default='auto')
 p.add_argument('--blocks', type=int, default=30)
@@ -26,7 +26,7 @@ lib.px_test_error.restype = C.c_char_p
 lib.px_test_set_gpu.argtypes = [C.c_int, C.c_int]
 assert lib.px_test_set_gpu(1, ['auto', 'blas', 'mma'].index(a.gpu_kernels)) == 0
 lib.px_test_set_gpu_flow_precision.argtypes = [C.c_int]
-assert lib.px_test_set_gpu_flow_precision(int(a.precision == 'fp32')) == 0
+assert lib.px_test_set_gpu_flow_precision({'bf16': 0, 'fp32': 1, 'mixed': 2}[a.precision]) == 0
 fp = np.ctypeslib.ndpointer(dtype=np.float32, flags='C_CONTIGUOUS')
 ip = np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS')
 lib.px_test_flow_open.argtypes = [C.c_int, C.c_char_p]; lib.px_test_flow_open.restype = C.c_void_p

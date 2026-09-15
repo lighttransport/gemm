@@ -408,6 +408,8 @@ extern "C" int px_gpu_metrics(void *p, px_device_metrics *out) {
 }
 static void px_resident_linear(Device &d, const px_device_command &op) {
     int n = op.n, co = op.c, ci = op.k;
+    bool mixed = op.precision == 3;
+    int lowp = mixed ? 1 : op.precision;
     px_extent(op.x, size_t(n) * ci);
     px_extent(op.w, size_t(co) * ci, op.precision ? 2 : 4);
     px_extent(op.out, size_t(n + op.offset) * co);
@@ -424,21 +426,21 @@ static void px_resident_linear(Device &d, const px_device_command &op) {
               *out = px_float(op.out) + size_t(start + op.offset) * co;
         if (op.precision) {
             cast_bfloat<<<(size_t(rows) * ci + 255) / 256, 256, 0, d.stream>>>(
-                (unsigned short *)packed->p, x, size_t(rows) * ci, op.precision);
-            if (d.kernels == 2) {
+                (unsigned short *)packed->p, x, size_t(rows) * ci, lowp);
+            if (d.kernels == 2 && !mixed) {
                 px_gemm_mma<<<dim3((co + 15) / 16, (rows + 15) / 16), 32, 0, d.stream>>>(
                     out, (const unsigned short *)packed->p, (const unsigned short *)px_buffer(op.w).p, rows,
-                    co, ci, op.precision);
+                    co, ci, lowp);
                 d.metrics.mma_gemms++;
             } else {
-                auto type = op.precision == 1 ? BF16_TYPE : F16_TYPE;
+                auto type = lowp == 1 ? BF16_TYPE : F16_TYPE;
                 GPU(blasGemmEx(d.blas, OP_T, OP_N, co, rows, ci, &one, px_buffer(op.w).p, type, ci, packed->p,
                                type, ci, &zero, out, F32_TYPE, co, COMPUTE_F32, ALGO_DEFAULT));
             }
         } else
             GPU(blasSgemm(d.blas, OP_T, OP_N, co, rows, ci, &one, px_float(op.w), ci, x, ci, &zero, out, co));
         finish_gemm<<<(size_t(rows) * co + 255) / 256, 256, 0, d.stream>>>(
-            out, px_float(op.b), size_t(rows) * co, co, op.precision);
+            out, px_float(op.b), size_t(rows) * co, co, mixed ? 0 : op.precision);
         d.metrics.gemms++;
     }
 }
@@ -518,7 +520,7 @@ extern "C" int px_gpu_execute(void *p, const px_device_command *command) {
     try {
         GPU(gpuSetDevice(d.ordinal));
         if (!command || command->n <= 0 || command->c <= 0 || command->precision < 0 ||
-            command->precision > 2)
+            command->precision > 3)
             throw std::runtime_error("Invalid resident command");
         const auto &o = *command;
         if (o.offset < 0 || o.k < 0 || o.heads < 0)

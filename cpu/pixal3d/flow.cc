@@ -20,7 +20,7 @@ static void modulate(Vec &y, const Vec &x, int c, const Vec &mod, int offset, bo
 Vec flow(Engine &e, Weights &w, const Vec &input, const Coords &coords, float t, const Vec &global_input,
          const Vec &projected_input, int blocks, bool bf) {
     if (e.resident())
-        return flow_resident(e, w, input, coords, t, global_input, projected_input, blocks, e.flow_bfloat(bf));
+        return flow_resident(e, w, input, coords, t, global_input, projected_input, blocks, e.flow_mode(bf));
     const int n = int(coords.size() / 4), c = w.shape("input_layer.weight")[0];
     auto gs = w.shape("blocks.0.self_attn.q_rms_norm.gamma");
     require(gs.size() == 2, "Invalid QK normalization weights");

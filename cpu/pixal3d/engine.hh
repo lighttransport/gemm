@@ -100,7 +100,11 @@ class Engine {
     ~Engine();
     void configure(const pixal3d_gpu_options &options);
     bool resident() const { return resident_; }
-    bool flow_bfloat(bool requested) const { return requested && flow_precision_ == PIXAL3D_FLOW_BF16; }
+    pixal3d_flow_precision flow_mode(bool requested) const {
+        if (!requested || flow_precision_ == PIXAL3D_FLOW_FP32)
+            return PIXAL3D_FLOW_FP32;
+        return flow_precision_;
+    }
     void bind(Weights &w);
     void clear_weights();
     std::shared_ptr<DeviceConditioning> condition(Weights &w, const Vec &global, const Vec &projected,
@@ -136,7 +140,7 @@ void rope(Vec &x, const Coords &coords, int heads, int dim);
 Vec flow(Engine &e, Weights &w, const Vec &input, const Coords &coords, float t, const Vec &global,
          const Vec &projected, int blocks, bool bfloat);
 Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords, float t, const Vec &global,
-                  const Vec &projected, int blocks, bool bfloat);
+                  const Vec &projected, int blocks, pixal3d_flow_precision precision);
 Vec naf(Engine &e, Weights &w, const Vec &image, int image_size, const Vec &patches, int patch_grid,
         int target, const Vec &xy);
 Vec naf_guide(Engine &e, Weights &w, const Vec &image, int size, int target);
