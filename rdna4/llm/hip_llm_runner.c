@@ -2903,6 +2903,46 @@ static const char *hip_kernel_source =
 "    for (int i = tid; i < head_dim; i += blockDim.x) v[i] *= inv;\n"
 "}\n"
 "\n"
+"/* Normalize Q/K heads and expand each group head to dt_rank in one launch.\n"
+"   This is algebraically the same as l2_norm_heads_batch_f32 followed by\n"
+"   repeat_tile_batch_f32, but avoids the normalized Q/K round-trip. */\n"
+"__global__ void l2_norm_repeat_qk_batch_f32(\n"
+"    float *q_exp, float *k_exp, float *qk, int n_group, int head_dim,\n"
+"    int dt_rank, int qkv_stride, int exp_stride, int M, float eps) {\n"
+"    int h = blockIdx.x;\n"
+"    int m = blockIdx.y;\n"
+"    if (h >= n_group || m >= M) return;\n"
+"    extern __shared__ float sdata[];\n"
+"    int tid = threadIdx.x;\n"
+"    size_t row = (size_t)m * qkv_stride;\n"
+"    size_t qoff = row + (size_t)h * head_dim;\n"
+"    size_t koff = row + (size_t)(n_group + h) * head_dim;\n"
+"    float sq = 0.0f, sk = 0.0f;\n"
+"    for (int i = tid; i < head_dim; i += blockDim.x) {\n"
+"        float q = qk[qoff + i], k = qk[koff + i];\n"
+"        sq += q * q; sk += k * k;\n"
+"    }\n"
+"    sdata[tid] = sq;\n"
+"    sdata[blockDim.x + tid] = sk;\n"
+"    __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) {\n"
+"            sdata[tid] += sdata[tid + s];\n"
+"            sdata[blockDim.x + tid] += sdata[blockDim.x + tid + s];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float iq = rsqrtf(sdata[0] + eps);\n"
+"    float ik = rsqrtf(sdata[blockDim.x] + eps);\n"
+"    for (int rep = h; rep < dt_rank; rep += n_group) {\n"
+"        size_t qo = (size_t)m * exp_stride + (size_t)rep * head_dim;\n"
+"        for (int i = tid; i < head_dim; i += blockDim.x) {\n"
+"            q_exp[qo + i] = qk[qoff + i] * iq;\n"
+"            k_exp[qo + i] = qk[koff + i] * ik;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- 23b. repeat_tile_batch_f32: broadcast n_group heads to dt_rank, M rows ---- */\n"
 "__global__ void repeat_tile_batch_f32(float *dst, const float *src,\n"
 "                                        int dt_rank, int d_state, int n_group,\n"
@@ -11043,6 +11083,7 @@ struct hip_llm_runner {
     hipFunction_t fn_glm5next_mhc_finish_f32;
     hipFunction_t fn_deltanet_step_batch_f32;
     hipFunction_t fn_l2_norm_heads_batch_f32;
+    hipFunction_t fn_l2_norm_repeat_qk_batch_f32;
     hipFunction_t fn_repeat_tile_batch_f32;
     hipFunction_t fn_gated_rmsnorm_silu_batch_f32;
     hipFunction_t fn_conv1d_depthwise_silu_batch_f32;
@@ -12032,6 +12073,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(glm5next_mhc_finish_f32);
     GET_FUNC(deltanet_step_batch_f32);
     GET_FUNC(l2_norm_heads_batch_f32);
+    GET_FUNC(l2_norm_repeat_qk_batch_f32);
     GET_FUNC(repeat_tile_batch_f32);
     GET_FUNC(gated_rmsnorm_silu_batch_f32);
     GET_FUNC(conv1d_depthwise_silu_batch_f32);
@@ -19111,6 +19153,16 @@ static inline void launch_l2_norm_heads_batch(hip_llm_runner *r, void *data,
            threads * sizeof(float), r->stream, args);
 }
 
+static inline void launch_l2_norm_repeat_qk_batch(hip_llm_runner *r,
+    void *q_exp, void *k_exp, void *qk, int n_group, int head_dim,
+    int dt_rank, int qkv_stride, int exp_stride, int M, float eps) {
+    int threads = (head_dim <= 128) ? 128 : 256;
+    void *args[] = { &q_exp, &k_exp, &qk, &n_group, &head_dim, &dt_rank,
+                     &qkv_stride, &exp_stride, &M, &eps };
+    LAUNCH(r->fn_l2_norm_repeat_qk_batch_f32, n_group, M, 1, threads, 1, 1,
+           2 * threads * sizeof(float), r->stream, args);
+}
+
 static inline void launch_repeat_tile_batch(hip_llm_runner *r, void *dst, void *src,
     int dt_rank, int d_state, int n_group,
     int src_row_stride, int dst_row_stride, int M) {
@@ -25372,6 +25424,12 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                        K_raw_base + qoff,
                                        dt_rank, d_state, n_group);
                 }
+            } else if (!getenv("LLM_SSM_BATCH_QK_FUSE") ||
+                       atoi(getenv("LLM_SSM_BATCH_QK_FUSE")) != 0) {
+                launch_l2_norm_repeat_qk_batch(r,
+                    r->d_ssm_Q_exp_batch, r->d_ssm_K_exp_batch,
+                    r->d_ssm_conv_out_batch, n_group, d_state, dt_rank,
+                    qkv_dim, dt_rank * d_state, M, eps);
             } else {
                 launch_l2_norm_heads_batch(r, conv_out_base, n_group, d_state,
                                            qkv_dim, M, eps);             /* Q */
