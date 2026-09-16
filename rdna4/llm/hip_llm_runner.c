@@ -10940,6 +10940,29 @@ static const char *hip_kernel_source =
 "    int h=blockIdx.x,tid=threadIdx.x;if(h>=n_heads)return;extern __shared__ float red[];size_t stride=head_dim+2;float mx=-1e30f;if(tid==0){for(int sp=0;sp<splits;sp++){float v=partial[((size_t)h*splits+sp)*stride];mx=fmaxf(mx,v);}red[0]=mx;}__syncthreads();mx=red[0];\n"
 "    if(tid==0){float den=0.0f;for(int sp=0;sp<splits;sp++){size_t b=((size_t)h*splits+sp)*stride;float m=partial[b];if(m>-1e29f)den+=partial[b+1]*__expf(m-mx);}red[0]=den;}__syncthreads();float den=red[0];for(int d=tid;d<head_dim;d+=blockDim.x){float num=0.0f;for(int sp=0;sp<splits;sp++){size_t b=((size_t)h*splits+sp)*stride;float m=partial[b];if(m>-1e29f)num+=partial[b+2+d]*__expf(m-mx);}out[(size_t)h*head_dim+d]=den>0.0f?num/den:0.0f;}\n"
 "}\n"
+"/* Vector-Q4V split decode, adapted from llama.cpp's fattn-vec layout.\n"
+" * One lane owns two adjacent value channels, so a packed Q4 byte is read\n"
+" * once for both outputs.  QK remains the exact DP4A path; only the V phase\n"
+" * changes its lane mapping.  This is deliberately opt-in pending parity. */\n"
+"__global__ void attn_decode_q8q4_split_dp4a_vecv(float *partial, const signed char *q8, const float *qscale, const signed char *kc, const unsigned char *vc, const float *ks, const float *vs, int n_heads, int n_kv_heads, int head_dim, int kv_dim, int value_stride, const int *pos_p, float scale, int splits, int chunk) {\n"
+"    extern __shared__ float smem[];int h=blockIdx.x,sp=blockIdx.y,tid=threadIdx.x,NT=blockDim.x,pos=*pos_p;\n"
+"    if(h>=n_heads||sp>=splits)return;int start=sp*chunk,end=start+chunk;if(end>pos+1)end=pos+1;\n"
+"    size_t base=((size_t)h*splits+sp)*(head_dim+2);if(start>pos){if(tid==0){partial[base]=-1e30f;partial[base+1]=0.0f;}return;}\n"
+"    int groups=(head_dim+31)/32;float *pr=smem,*red=pr+NT;const signed char *qh=q8+(size_t)h*head_dim;\n"
+"    float mi=-1e30f,li=0.0f,a0=0.0f,a1=0.0f;\n"
+"    for(int ts=start;ts<end;ts+=NT){int kp=ts+tid,tn=end-ts;if(tn>NT)tn=NT;float sc=-1e30f;\n"
+"        if(kp<end){const signed char *kr=kc+(size_t)kp*kv_dim+(h/(n_heads/n_kv_heads))*head_dim;float dot=0.0f;\n"
+"            for(int g=0;g<groups;g++){const int *qa=(const int *)(qh+g*32);const int *ka=(const int *)(kr+g*32);int z=0;\n"
+"                for(int j=0;j<8;j++)z=dp4a_hw(qa[j],ka[j],z);dot+=(float)z*qscale[(size_t)h*groups+g]*ks[((size_t)kp*n_kv_heads+h/(n_heads/n_kv_heads))*groups+g];}sc=dot*scale;}\n"
+"        red[tid]=sc;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}\n"
+"        float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm),pv=kp<end?__expf(sc-nm):0.0f;pr[tid]=pv;red[tid]=pv;__syncthreads();\n"
+"        for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]+=red[tid+z];__syncthreads();}li=li*corr+red[0];\n"
+"        if(tid<head_dim/2){int d=tid*2;float b0=a0*corr,b1=a1*corr;int kv_h=h/(n_heads/n_kv_heads);\n"
+"            for(int t=0;t<tn;t++){size_t vi=(size_t)(ts+t)*value_stride+kv_h*(head_dim/2)+tid;unsigned char p=vc[vi];\n"
+"                float sv=vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d/32];int q0=(int)(p&15)-8,q1=(int)(p>>4)-8;b0+=pr[t]*(float)q0*sv;b1+=pr[t]*(float)q1*sv;}a0=b0;a1=b1;}\n"
+"        mi=nm;__syncthreads();}\n"
+"    if(tid<head_dim/2){partial[base]=mi;partial[base+1]=li;partial[base+2+tid*2]=a0;partial[base+3+tid*2]=a1;}\n"
+"}\n"
 "__global__ void attn_prefill_flash_q8q4(float *out, const float *q, const signed char *kc, const unsigned char *vc, const float *ks, const float *vs, int n_heads, int n_kv_heads, int head_dim, int kv_dim, int value_stride, int M, int position_start, float scale) {\n"
 "    int h=blockIdx.x,m=blockIdx.y;if(h>=n_heads||m>=M)return;int kv_h=h/(n_heads/n_kv_heads),pos=position_start+m,tid=threadIdx.x,NT=blockDim.x,groups=(head_dim+31)/32;extern __shared__ float smem[];float *qv=smem,*acc=qv+head_dim,*pr=acc+head_dim,*red=pr+NT;const float *qh=q+(size_t)m*n_heads*head_dim+h*head_dim;for(int d=tid;d<head_dim;d+=NT){qv[d]=qh[d]*scale;acc[d]=0.0f;}__syncthreads();float mi=-1e30f,li=0.0f;for(int ts=0;ts<=pos;ts+=NT){int kp=ts+tid,tn=pos-ts+1;if(tn>NT)tn=NT;float sc=-1e30f;if(kp<=pos){const signed char *kr=kc+(size_t)kp*kv_dim+kv_h*head_dim;for(int d=0;d<head_dim;d++)sc+=qv[d]*(float)kr[d]*ks[((size_t)kp*n_kv_heads+kv_h)*groups+d/32];}red[tid]=sc;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm),pv=kp<=pos?__expf(sc-nm):0.0f;pr[tid]=pv;red[tid]=pv;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]+=red[tid+z];__syncthreads();}li=li*corr+red[0];for(int d=tid;d<head_dim;d+=NT){float a=acc[d]*corr;for(int t=0;t<tn;t++){size_t vi=(size_t)(ts+t)*value_stride+kv_h*(head_dim/2)+d/2;a+=pr[t]*q4_cache_to_float(vc,vi,vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d/32],d);}acc[d]=a;}mi=nm;__syncthreads();}float inv=li>0.0f?1.0f/li:0.0f;for(int d=tid;d<head_dim;d+=NT)out[(size_t)m*n_heads*head_dim+h*head_dim+d]=acc[d]*inv;\n"
 "}\n"
@@ -12272,6 +12295,7 @@ struct hip_llm_runner {
     hipFunction_t fn_attn_decode_q8q4_warpred;
     hipFunction_t fn_attn_decode_q8q4_split;
     hipFunction_t fn_attn_decode_q8q4_split_dp4a;
+    hipFunction_t fn_attn_decode_q8q4_split_dp4a_vecv;
     hipFunction_t fn_attn_decode_q8q4_split_combine;
     hipFunction_t fn_attn_prefill_flash_q8q4;
     hipFunction_t fn_attn_prefill_flash_i8_warp;
@@ -12790,6 +12814,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(attn_decode_q8q4_warpred);
     GET_FUNC(attn_decode_q8q4_split);
     GET_FUNC(attn_decode_q8q4_split_dp4a);
+    GET_FUNC(attn_decode_q8q4_split_dp4a_vecv);
     GET_FUNC(attn_decode_q8q4_split_combine);
     GET_FUNC(attn_prefill_flash_q8q4);
     GET_FUNC(attn_prefill_flash_i8_warp);
@@ -19773,6 +19798,25 @@ static inline void launch_attn_decode_q8q4(hip_llm_runner *r, void *out, void *q
          * valid as position advances. Inactive tail segments self-clear their
          * partials in the kernel. */
         int splits = r->d_attn_decode_partial_splits;
+        const char *vecv = getenv("LLM_ATTN_DECODE_Q8Q4_VECV");
+        if (vecv && atoi(vecv) != 0 && r->fn_attn_decode_q8q4_split_dp4a_vecv &&
+            n_heads > 0 && n_kv_heads > 0 && head_dim == 256) {
+            launch_quantize_q8(r, q, n_heads * head_dim,
+                               r->d_act_q8, r->d_act_scale);
+            int vthreads = 128;
+            void *va[] = { &r->d_attn_decode_partial, &r->d_act_q8,
+                           &r->d_act_scale, &kc, &vc, &ks, &vs,
+                           &n_heads, &n_kv_heads, &head_dim, &kv_dim,
+                           &value_stride, &pos_p, &scale, &splits,
+                           (void *)&chunk };
+            LAUNCH(r->fn_attn_decode_q8q4_split_dp4a_vecv, n_heads, splits, 1,
+                   vthreads, 1, 1, (size_t)(2 * vthreads) * sizeof(float),
+                   r->stream, va);
+            void *ca[] = { &out, &r->d_attn_decode_partial, &n_heads, &head_dim, &splits };
+            LAUNCH(r->fn_attn_decode_q8q4_split_combine, n_heads, 1, 1, 256, 1, 1,
+                   sizeof(float), r->stream, ca);
+            return;
+        }
         if (split_dp4a && atoi(split_dp4a) != 0) {
             launch_quantize_q8(r, q, n_heads * head_dim,
                                r->d_act_q8, r->d_act_scale);
