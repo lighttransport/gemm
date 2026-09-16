@@ -19,6 +19,10 @@ expect_contains() {
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}")"
 expect_contains "${out}" 'Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf'
 expect_contains "${out}" 'selected_context=53248'
+grep -q 'LLM_ATTN_DECODE_Q8Q4_VECV="\${LLM_ATTN_DECODE_Q8Q4_VECV:-\${perf_profile}}"' "${gsq}" || {
+    echo 'profile test: vectorized Q4V performance selector missing' >&2
+    exit 1
+}
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}" -s 262144)"
 expect_contains "${out}" 'safe_context=53248'
 expect_contains "${out}" 'selected_context=53248'
