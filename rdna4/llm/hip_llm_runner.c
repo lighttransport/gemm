@@ -10961,7 +10961,7 @@ static const char *hip_kernel_source =
 "        if(tid<head_dim/2){int d=tid*2;float b0=a0*corr,b1=a1*corr;int kv_h=h/(n_heads/n_kv_heads);\n"
 "            #pragma unroll 4\n"
 "            for(int t=0;t<tn;t++){size_t vi=(size_t)(ts+t)*value_stride+kv_h*(head_dim/2)+tid;unsigned char p=vc[vi];\n"
-"                float sv=vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d/32];int q0=(int)(p&15)-8,q1=(int)(p>>4)-8;b0+=pr[t]*(float)q0*sv;b1+=pr[t]*(float)q1*sv;}a0=b0;a1=b1;}\n"
+"                float sv=vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d/32];int q0=(int)(p&15)-8,q1=(int)(p>>4)-8;b0+=pr[t]*((float)q0*sv);b1+=pr[t]*((float)q1*sv);}a0=b0;a1=b1;}\n"
 "        mi=nm;__syncthreads();}\n"
 "    if(tid<head_dim/2){partial[base]=mi;partial[base+1]=li;partial[base+2+tid*2]=a0;partial[base+3+tid*2]=a1;}\n"
 "}\n"
