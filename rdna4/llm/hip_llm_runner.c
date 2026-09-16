@@ -17709,6 +17709,13 @@ static inline void launch_matvec_iq2_xs_batch(hip_llm_runner *r, void *dst,
                        &n_rows, &n_cols, &M, &term0, &scalar };
         LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma, (n_rows + 127) / 128,
                (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, mw);
+        /* llama.cpp's IQ2 MMQ uses one Q8 activation term.  Our exact
+         * expansion has a second residual term; skipping it is substantially
+         * faster but approximate, so keep it opt-in and never silently change
+         * the numerical default. */
+        const char *single_env = getenv("LLM_QWEN35_IQ2_MMQ_SINGLE");
+        if (single_env && atoi(single_env) != 0)
+            return;
         mw[9] = &term1;
         LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma, (n_rows + 127) / 128,
                (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, mw);
@@ -17854,6 +17861,9 @@ static inline void launch_matvec_iq2_xxs_batch(hip_llm_runner *r, void *dst,
                        &term0 };
         LAUNCH(r->fn_gemm_iq2_xxs_mmq_wmma, (n_rows + 127) / 128,
                (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        const char *single_env = getenv("LLM_QWEN35_IQ2_MMQ_SINGLE");
+        if (single_env && atoi(single_env) != 0)
+            return;
         wa[9] = &term1;
         LAUNCH(r->fn_gemm_iq2_xxs_mmq_wmma, (n_rows + 127) / 128,
                (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
@@ -18034,6 +18044,9 @@ static inline void launch_matvec_iq2_s_batch(hip_llm_runner *r, void *dst,
                        &term0 };
         LAUNCH(r->fn_gemm_iq2_s_mmq_wmma, (n_rows + 127) / 128,
                (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        const char *single_env = getenv("LLM_QWEN35_IQ2_MMQ_SINGLE");
+        if (single_env && atoi(single_env) != 0)
+            return;
         wa[9] = &term1;
         LAUNCH(r->fn_gemm_iq2_s_mmq_wmma, (n_rows + 127) / 128,
                (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
