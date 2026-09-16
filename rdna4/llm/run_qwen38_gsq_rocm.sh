@@ -68,8 +68,11 @@ if [[ "${vram_profile}" == "16g" && "${allow_unsafe}" == "0" ]] &&
 fi
 
 perf_profile="${QWEN38_GSQ_PERF:-0}"
-fast_prefill="${QWEN38_GSQ_FAST_PREFILL:-0}"
-fast_all_iq2="${QWEN38_GSQ_FAST_ALL_IQ2:-0}"
+# The performance profile uses BF16 staging for every IQ2 projection.  This
+# is the path that clears 300 tok/s at 32K on gfx1201; normal mode remains the
+# parity-oriented path, and either knob can still be explicitly set to 0.
+fast_prefill="${QWEN38_GSQ_FAST_PREFILL:-${perf_profile}}"
+fast_all_iq2="${QWEN38_GSQ_FAST_ALL_IQ2:-${perf_profile}}"
 fast_iq2_max_layer="${QWEN38_GSQ_FAST_IQ2_MAX_LAYER:-${LLM_QWEN35_IQ2_BF16_MAX_LAYER:-}}"
 fast_prefill_pins=""
 if [[ "${fast_prefill}" != "0" ]]; then
@@ -102,9 +105,9 @@ if [[ "${QWEN38_DRY_RUN:-0}" != "0" ]]; then
     exit 0
 fi
 
-# IQ2_XXS/S BF16 dequant is a separate approximate mode: it clears the
-# 300 tok/s long-context target, but changes later-token numerics. Keep it
-# explicit so the normal fast profile retains its existing quality gate.
+# IQ2_XXS/S BF16 dequant is approximate: it clears the 300 tok/s long-context
+# target, but changes later-token numerics. It is therefore selected only by
+# the explicit performance profile (or an explicit FAST_ALL_IQ2=1 override).
 exec env QWEN38_MODEL="${model}" \
     LLM_BMAX="${selected_bmax}" \
     LLM_BENCH_STREAM_CHUNK="${LLM_BENCH_STREAM_CHUNK:-${selected_bmax}}" \
