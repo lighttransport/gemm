@@ -17997,16 +17997,13 @@ static inline void launch_matvec_iq3_s_batch(hip_llm_runner *r, void *dst,
     if (wmma_env && atoi(wmma_env) != 0 && x_stride == n_cols && M >= 32 &&
         (n_cols % 256) == 0) {
         launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        /* The 64-row prototype is not bounds-safe at large ubatches.  Keep
+         * it compiled for follow-up work, but route the opt-in path through
+         * the validated 128-row kernel until its edge handling is repaired. */
         void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
                        &r->d_act_scale_batch, &n_rows, &n_cols, &M };
-        const char *small_env = getenv("LLM_QWEN35_IQ3_Q8_WMMA64");
-        if (small_env && atoi(small_env) != 0) {
-            LAUNCH(r->fn_gemm_iq3_s_q8_wmma64, (n_rows + 127) / 128,
-                   (M + 63) / 64, 1, 256, 1, 1, 0, r->stream, wa);
-        } else {
-            LAUNCH(r->fn_gemm_iq3_s_q8_wmma, (n_rows + 127) / 128,
-                   (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
-        }
+        LAUNCH(r->fn_gemm_iq3_s_q8_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
         return;
     }
     const char *dp_env = getenv("LLM_QWEN35_NATIVE_IQ3_DP4A_BATCH");
