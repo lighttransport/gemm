@@ -18,10 +18,10 @@ expect_contains() {
 
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}")"
 expect_contains "${out}" 'Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf'
-expect_contains "${out}" 'selected_context=36864'
+expect_contains "${out}" 'selected_context=53248'
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}" -s 262144)"
-expect_contains "${out}" 'safe_context=36864'
-expect_contains "${out}" 'selected_context=36864'
+expect_contains "${out}" 'safe_context=53248'
+expect_contains "${out}" 'selected_context=53248'
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g QWEN38_GSQ_ALLOW_UNSAFE_CONTEXT=1 "${gsq}" -s 262144)"
 expect_contains "${out}" 'selected_context=262144'
 
