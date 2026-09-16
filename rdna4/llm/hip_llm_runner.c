@@ -10954,6 +10954,7 @@ static const char *hip_kernel_source =
 "        if(kp<end){const signed char *kr=kc+(size_t)kp*kv_dim+(h/(n_heads/n_kv_heads))*head_dim;float dot=0.0f;\n"
 "            #pragma unroll\n"
 "            for(int g=0;g<groups;g++){const int *qa=(const int *)(qh+g*32);const int *ka=(const int *)(kr+g*32);int z=0;\n"
+"                #pragma unroll\n"
 "                for(int j=0;j<8;j++)z=dp4a_hw(qa[j],ka[j],z);dot+=(float)z*qscale[(size_t)h*groups+g]*ks[((size_t)kp*n_kv_heads+h/(n_heads/n_kv_heads))*groups+g];}sc=dot*scale;}\n"
 "        red[tid]=sc;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}\n"
 "        float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm),pv=kp<end?__expf(sc-nm):0.0f;pr[tid]=pv;red[tid]=pv;__syncthreads();\n"
