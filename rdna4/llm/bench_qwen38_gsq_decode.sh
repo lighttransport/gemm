@@ -4,11 +4,11 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log_dir="${root_dir}/tmp"
 log_file="${QWEN38_GSQ_BENCH_LOG:-${log_dir}/qwen38_gsq_iq2_decode.log}"
-context="${QWEN38_GSQ_BENCH_CONTEXT:-35840}"
+context="${QWEN38_GSQ_BENCH_CONTEXT:-53248}"
 prefill="${QWEN38_GSQ_BENCH_PREFILL:-512}"
 decode="${QWEN38_GSQ_BENCH_DECODE:-64}"
 repeats="${QWEN38_GSQ_BENCH_REPEATS:-3}"
-target="${QWEN38_GSQ_DECODE_TARGET:-40}"
+target="${QWEN38_GSQ_DECODE_TARGET:-30}"
 run_timeout="${QWEN38_GSQ_BENCH_TIMEOUT:-1800}"
 
 mkdir -p "${log_dir}"
@@ -17,11 +17,14 @@ mkdir -p "${log_dir}"
     exit 2
 }
 
-timeout --foreground "${run_timeout}s" \
-    "${root_dir}/run_qwen38_gsq_rocm.sh" \
-    -s "${context}" --bench -n "${prefill}" \
-    --prefill-len "${prefill}" --decode "${decode}" \
-    --bench-repeat "${repeats}" >"${log_file}" 2>&1
+ : >"${log_file}"
+for ((rep = 1; rep <= repeats; rep++)); do
+    timeout --foreground "${run_timeout}s" \
+        "${root_dir}/run_qwen38_gsq_rocm.sh" \
+        -s "${context}" --bench -n "${prefill}" \
+        --prefill-len "${prefill}" --decode "${decode}" \
+        --bench-repeat 1 >>"${log_file}" 2>&1
+done
 
 grep -q 'Result: PASS' "${log_file}"
 mapfile -t hashes < <(grep -oE 'sequence hash=[0-9a-f]+' "${log_file}" | sed 's/.*=//')

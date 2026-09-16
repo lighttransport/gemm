@@ -28579,6 +28579,11 @@ void hip_llm_reset_state(hip_llm_runner *r) {
     if (!r) return;
 
     if (qwen4_prefill_copies_drain(r)) return;
+    /* Request resets are normally followed by work on r->stream.  Make the
+     * previous request quiescent before clearing persistent hybrid state;
+     * this is important for the batched conv path, which keeps the conv
+     * history live across all rows of a tile. */
+    if (r->stream) hipStreamSynchronize(r->stream);
     r->qwen4_forward_error = 0;
     r->qwen4_nextn_start = -1;
     r->cur_position = 0;
@@ -28655,14 +28660,20 @@ void hip_llm_reset_state(hip_llm_runner *r) {
             if (!cl->is_ssm) continue;
             if (cl->d_conv_state) {
                 size_t conv_bytes = (size_t)(r->ssm_conv_kernel - 1) * r->ssm_qkv_dim * sizeof(float);
-                hipMemset(cl->d_conv_state, 0, conv_bytes);
+                if (hipMemsetAsync(cl->d_conv_state, 0, conv_bytes, r->stream) != hipSuccess)
+                    r->qwen4_forward_error = 1;
             }
             if (cl->d_recurrent_state) {
                 size_t rec_bytes = (size_t)r->ssm_dt_rank * r->ssm_d_state * r->ssm_d_state * sizeof(float);
-                hipMemset(cl->d_recurrent_state, 0, rec_bytes);
+                if (hipMemsetAsync(cl->d_recurrent_state, 0, rec_bytes, r->stream) != hipSuccess)
+                    r->qwen4_forward_error = 1;
             }
         }
     }
+    /* hipMemset/hipMemsetAsync implementations differ in whether the device
+     * write is ordered with a non-default stream.  Fence the reset so the
+     * first batched SSM tile cannot observe a prior request's history. */
+    if (r->stream) hipStreamSynchronize(r->stream);
     if (r->is_gemma4) {
         for (int l = 0; l < r->n_layers; l++) {
             hip_layer *cl = &r->layers[l];
