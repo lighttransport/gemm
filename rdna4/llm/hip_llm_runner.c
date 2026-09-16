@@ -7448,6 +7448,33 @@ static const char *hip_kernel_source =
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);\n"
 "    if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
 "}\n"
+"__global__ void matvec_iq1_s_dp4a2_batch_reuse4(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols,int M){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp,token0=blockIdx.y*4;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,qblocks=n_cols/32; float sum[4]={0,0,0,0};\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*50;\n"
+"    for(int b=lane;b<qblocks;b+=32){int block=b>>3,ib=b&7;\n"
+"        const unsigned char *bp=rp+block*50; const unsigned short *qh=(const unsigned short*)(bp+34);\n"
+"        const unsigned char *qs=bp+2; float dw=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1);\n"
+"        float delta=(qh[ib]&0x8000)?-0.125f:0.125f;\n"
+"        for(int t=0;t<4;t++){int token=token0+t;if(token<M){\n"
+"            const signed char *x0=q0+(size_t)token*n_cols+(size_t)b*32,*x1=q1+(size_t)token*n_cols+(size_t)b*32;\n"
+"            const int *u0=(const int*)x0,*u1=(const int*)x1; int z0=0,z1=0,t0=0,t1=0;\n"
+"            for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);\n"
+"                const signed char *g=(const signed char*)&iq1s_grid_dev[gi];\n"
+"                int w0=((int)g[0]&255)|((int)g[1]&255)<<8|((int)g[2]&255)<<16|((int)g[3]&255)<<24;\n"
+"                int w1=((int)g[4]&255)|((int)g[5]&255)<<8|((int)g[6]&255)<<16|((int)g[7]&255)<<24;\n"
+"                z0=dp4a_hw(w0,u0[2*l],z0); z0=dp4a_hw(w1,u0[2*l+1],z0);\n"
+"                z1=dp4a_hw(w0,u1[2*l],z1); z1=dp4a_hw(w1,u1[2*l+1],z1);\n"
+"                const signed char *p0=x0+l*8,*p1=x1+l*8;\n"
+"                for(int j=0;j<8;j++){t0+=(int)p0[j];t1+=(int)p1[j];}\n"
+"            }\n"
+"            sum[t]+=dw*(s0[(size_t)token*qblocks+b]*((float)z0+delta*(float)t0)+s1[(size_t)token*qblocks+b]*((float)z1+delta*(float)t1));\n"
+"        }}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
 "/* Fused IQ1_S gate/up projection and SiLU product for one expert. */\n"
 "__global__ void ffn_gate_up_silu_iq1_s_mw(float *dst,const unsigned char *gate,\n"
 "        const unsigned char *up,const float *x,int rows,int cols){\n"
@@ -7590,6 +7617,30 @@ static const char *hip_kernel_source =
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
 "}\n"
 
+"__global__ void matvec_iq1_m_dp4a2_batch_reuse4(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols,int M){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp,token0=blockIdx.y*4;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*32; float sum[4]={0,0,0,0};\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*56;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,rem=g&31,ib=rem>>2,l=rem&3,qb=b*8+ib;\n"
+"      const unsigned char *bp=rp+b*56,*qs=bp,*qh=bp+32; const unsigned short *sc=(const unsigned short*)(bp+48);\n"
+"      unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"      float d=half_to_float(*(const half_raw*)&su); unsigned short sw=sc[ib/2];\n"
+"      int shift=6*(ib%2)+(l>=2?3:0); float dl=d*(float)(2*((sw>>shift)&7)+1);\n"
+"      unsigned char hv=qh[2*ib+(l>>1)]; int qshift=(l&1)?4:8;\n"
+"      unsigned short idx=qs[4*ib+l]|((unsigned short)(hv<<qshift)&0x700u);\n"
+"      float delta=(hv&((l&1)?0x80:0x08))?-0.125f:0.125f; const signed char *grid=(const signed char*)&iq1s_grid_dev[idx];\n"
+"      int w0=((int)(unsigned char)grid[0])|((int)(unsigned char)grid[1]<<8)|((int)(unsigned char)grid[2]<<16)|((int)(unsigned char)grid[3]<<24);\n"
+"      int w1=((int)(unsigned char)grid[4])|((int)(unsigned char)grid[5]<<8)|((int)(unsigned char)grid[6]<<16)|((int)(unsigned char)grid[7]<<24);\n"
+"      for(int t=0;t<4;t++){int token=token0+t;if(token<M){const signed char *p0=q0+(size_t)token*n_cols+qb*32+l*8,*p1=q1+(size_t)token*n_cols+qb*32+l*8;\n"
+"        const int *u0=(const int*)p0,*u1=(const int*)p1; int z0=dp4a_hw(w1,u0[1],dp4a_hw(w0,u0[0],0));\n"
+"        int z1=dp4a_hw(w1,u1[1],dp4a_hw(w0,u1[0],0)),t0=0,t1=0;\n"
+"        for(int j=0;j<8;j++){t0+=(int)p0[j];t1+=(int)p1[j];}\n"
+"        sum[t]+=dl*(s0[(size_t)token*(n_cols/32)+qb]*((float)z0+delta*(float)t0)+s1[(size_t)token*(n_cols/32)+qb]*((float)z1+delta*(float)t1));}}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
 "/* ---- matvec_tq1_0_f32: TQ1_0 matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_tq1_0_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -7760,6 +7811,30 @@ static const char *hip_kernel_source =
 "    dst[out_idx] = f32_to_bf16(val);\n"
 "}\n"
 "\n"
+"/* Per-call dequant of IQ1_M (56 B/block) to BF16. */\n"
+"__global__ void dequant_iq1_m_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x, b = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    const unsigned char *bp = mat + (size_t)row * n_blocks_per_row * 56 + b * 56;\n"
+"    const unsigned char *qs = bp, *qh = bp + 32;\n"
+"    const unsigned short *sc = (const unsigned short *)(bp + 48);\n"
+"    int tid = threadIdx.x, ib = tid >> 5, sub = tid & 31;\n"
+"    int l = sub >> 3, j = sub & 7;\n"
+"    unsigned short su = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0u) |\n"
+"                        ((sc[2] >> 4) & 0x0f00u) | (sc[3] & 0xf000u);\n"
+"    float d = half_to_float(*(const half_raw *)&su);\n"
+"    unsigned short sw = sc[ib / 2];\n"
+"    int shift = 6 * (ib % 2) + (l >= 2 ? 3 : 0);\n"
+"    float dl = d * (float)(2 * ((sw >> shift) & 7) + 1);\n"
+"    unsigned char hv = qh[2 * ib + (l >> 1)];\n"
+"    int qshift = (l & 1) ? 4 : 8;\n"
+"    unsigned short idx = qs[4 * ib + l] | ((unsigned short)(hv << qshift) & 0x700u);\n"
+"    float delta = (hv & ((l & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;\n"
+"    const signed char *grid = (const signed char *)&iq1s_grid_dev[idx];\n"
+"    float val = dl * ((float)grid[j] + delta);\n"
+"    dst[(size_t)row * n_cols + (size_t)b * 256 + tid] = f32_to_bf16(val);\n"
+"}\n"
 "/* Per-call dequant of TQ1_0 (54 B/block) to BF16. */\n"
 "__global__ void dequant_tq1_0_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
 "                                        int n_rows, int n_cols) {\n"
@@ -8428,6 +8503,171 @@ static const char *hip_kernel_source =
 "    }\n"
 "    i32x8 *dummy[1]; (void)dummy; float8 *ff[8]={&f00,&f01,&f10,&f11,&f20,&f21,&f30,&f31}; int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};\n"
 "    for(int t=0;t<8;t++){int col=n0+wN*32+ns[t]+idx;if(col>=N)continue; for(int i=0;i<8;i++){int row=m0+wM*64+ms[t]+half*8+i;if(row<M){size_t yi=(size_t)row*N+col;if(term)Y[yi]+=(*ff[t])[i];else Y[yi]=(*ff[t])[i];}}}\n"
+"}\n"
+"/* Experimental IQ2_XS RDNA4 MMQ tile.  This follows llama.cpp's 32-packed\n"
+" * 84 int shared stride for the IQ2_XS weight row and 36 int stride for\n"
+" * the q8 activation row.  The two q8 activation terms are launched\n"
+" * separately.  Keep behind LLM_QWEN35_IQ2XS_MMQ_WMMA until parity is proven. */\n"
+"__global__ void gemm_iq2_xs_mmq_wmma(float *Y, const unsigned char *W,\n"
+"        const signed char *X, const float *S, const signed char *X1,\n"
+"        const float *S1, int N, int K, int M, int term, int scalar) {\n"
+"    typedef int i32x2 __attribute__((__vector_size__(2 * sizeof(int))));\n"
+"    typedef int i32x8 __attribute__((__vector_size__(8 * sizeof(int))));\n"
+"    int tid=threadIdx.x,warp=tid>>5,lane=tid&31;\n"
+"    int m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    const signed char *Xq=term?X1:X; const float *Sq=term?S1:S;\n"
+"    __shared__ int sx[128*84],sy[128*36];\n"
+"    float8 sum[8];\n"
+"    for(int q=0;q<8;q++)sum[q]=(float8){0,0,0,0,0,0,0,0};\n"
+"    float scalar_sum=0.0f;\n"
+"    for(int k=0;k<K;k+=128){\n"
+"        /* Pack q-values at llama.cpp's 8*kqsx + 2*l positions.  A prior\n"
+"         * prototype wrote them densely, which broke MMQ numerical parity. */\n"
+"        for(int e=tid;e<128*16;e+=256){\n"
+"            int r=e>>4,l=e&15,col=n0+r,kqsx=l>>2,ql=l&3;\n"
+"            sx[r*84+8*kqsx+2*ql]=0; sx[r*84+8*kqsx+2*ql+1]=0;\n"
+"            if(col<N){int rem=k&255,qidx=(rem>>3)+l; const unsigned char *bp=W+(size_t)col*nb*74+(k>>8)*74;\n"
+"                const unsigned short *qs=(const unsigned short *)(bp+2); unsigned short qv=qs[qidx];\n"
+"                unsigned long long gv=iq2xs_grid_dev[qv&511]; unsigned char sg=ksigns_iq2xs_dev[qv>>9];\n"
+"                sx[r*84+8*kqsx+2*ql]=apply_sign4((unsigned int)gv,sg,0);\n"
+"                sx[r*84+8*kqsx+2*ql+1]=apply_sign4((unsigned int)(gv>>32),sg,4);}\n"
+"        }\n"
+"        for(int e=tid;e<128;e+=256){\n"
+"            int r=e,col=n0+r; float *xd=(float *)sx+64+r*84;\n"
+"            for(int z=0;z<8;z++)xd[z]=0.0f;\n"
+"            if(col<N){int rem=k&255; const unsigned char *bp=W+(size_t)col*nb*74+(k>>8)*74;\n"
+"                float d=half_to_float(*(const half_raw *)bp);\n"
+"                for(int z=0;z<8;z++){int qidx=(rem>>3)+(z>>1)*4+(z&1)*2,ib=qidx>>2,l=qidx&3; unsigned char sc=bp[66+ib];\n"
+"                    xd[z]=d*(0.5f+(float)((l<2)?(sc&15):(sc>>4)))*0.25f;}}\n"
+"        }\n"
+"        for(int e=tid;e<128*128;e+=256){int r=e>>7,kk=e&127; signed char *qy=(signed char *)sy;\n"
+"            qy[r*144+16+kk]=(m0+r<M&&k+kk<K)?Xq[(size_t)(m0+r)*K+k+kk]:0;}\n"
+"        for(int r=tid;r<128;r+=256){float *yd=(float *)sy+r*36;\n"
+"            for(int z=0;z<4;z++)yd[z]=(m0+r<M&&k+z*32<K)?Sq[(size_t)(m0+r)*(K/32)+k/32+z]:0.0f;}\n"
+"        __syncthreads();\n"
+"        float *xd=(float *)sx+64; float *yd=(float *)sy;\n"
+"        if(scalar==1 && blockIdx.x==0 && blockIdx.y==0 && tid<256){\n"
+"            int sr=tid>>7, sc=tid&127;\n"
+"            const signed char *aq=(const signed char *)sy+sr*144+16;\n"
+"            for(int p=0;p<32;p++){\n"
+"                int z=dp4a_hw(sx[sc*84+p],*(const int *)(aq+p*4),0);\n"
+"                scalar_sum+=xd[sc*84+p/4]*yd[sr*36+p/8]*(float)z;\n"
+"            }\n"
+"        }\n"
+"        if(scalar==1){__syncthreads();continue;}\n"
+"        int row0=warp*16;\n"
+"        for(int k01=0;k01<32;k01+=4){\n"
+"            i32x2 b0; int jr=row0+(lane&15),ao=2*(lane>>4);\n"
+"                b0[0]=sy[jr*36+4+k01+ao]; b0[1]=sy[jr*36+4+k01+ao+1];\n"
+"            for(int n=0;n<8;n++){\n"
+"                i32x2 a0; int ar=n*16+(lane&15);\n"
+"                a0[0]=sx[ar*84+k01+ao]; a0[1]=sx[ar*84+k01+ao+1];\n"
+"                i32x8 c={0,0,0,0,0,0,0,0};\n"
+"                c=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,c,false);\n"
+"                int half=lane>>4,row=row0+(lane&15);\n"
+"                for(int l=0;l<8;l++){int col=n*16+8*half+l;\n"
+"                    sum[n][l]+=(float)c[l]*xd[col*84+k01/4]*yd[row*36+k01/8];}\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int half=lane>>4;\n"
+"    if(scalar==1){if(blockIdx.x==0&&blockIdx.y==0&&tid<256)\n"
+"        {size_t at=(size_t)(m0+(tid>>7))*N+n0+(tid&127);\n"
+"         if(term)Y[at]+=scalar_sum;else Y[at]=scalar_sum;}return;}\n"
+"    for(int n=0;n<8;n++)for(int l=0;l<8;l++){int row=m0+warp*16+(lane&15),col=n0+n*16+8*half+l;\n"
+"        if(row<M&&col<N){size_t at=(size_t)row*N+col;\n"
+"            if(term)Y[at]+=sum[n][l];else Y[at]=sum[n][l];}}\n"
+"}\n"
+"/* IQ2_S RDNA4 MMQ tile.  The tile/reduction mapping is shared with the\n"
+" * IQ2_XS path, while the loader follows llama.cpp's block_iq2_s layout:\n"
+" * four 2-bit code bytes, four sign bytes, qh, and packed nibbles. */\n"
+"/* IQ2_XXS RDNA4 MMQ tile.  The packed pair stores four code bytes, four\n"
+" * sign indices and one scale per 32-value group. */\n"
+"__global__ void gemm_iq2_xxs_mmq_wmma(float *Y, const unsigned char *W,\n"
+"        const signed char *X, const float *S, const signed char *X1,\n"
+"        const float *S1, int N, int K, int M, int term) {\n"
+"    typedef int i32x2 __attribute__((__vector_size__(2 * sizeof(int))));\n"
+"    typedef int i32x8 __attribute__((__vector_size__(8 * sizeof(int))));\n"
+"    int tid=threadIdx.x,warp=tid>>5,lane=tid&31;\n"
+"    int m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    const signed char *Xq=term?X1:X; const float *Sq=term?S1:S;\n"
+"    __shared__ int sx[128*84],sy[128*36]; float8 sum[8];\n"
+"    for(int q=0;q<8;q++)sum[q]=(float8){0,0,0,0,0,0,0,0};\n"
+"    for(int k=0;k<K;k+=128){\n"
+"        for(int e=tid;e<128*16;e+=256){int r=e>>4,l=e&15,col=n0+r,kqsx=l>>2,ql=l&3;\n"
+"            sx[r*84+8*kqsx+2*ql]=0; sx[r*84+8*kqsx+2*ql+1]=0;\n"
+"            if(col<N){int rem=k&255,qidx=(rem>>3)+l,ib=qidx>>2,ll=qidx&3;\n"
+"                const unsigned char *bp=W+(size_t)col*nb*66+(k>>8)*66; const unsigned short *qs=(const unsigned short *)(bp+2);\n"
+"                unsigned int a0=qs[4*ib]|((unsigned int)qs[4*ib+1]<<16),a1=qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
+"                unsigned long long gv=iq2xxs_grid_dev[(a0>>(8*ll))&255]; unsigned char sg=ksigns_iq2xs_dev[(a1>>(7*ll))&127];\n"
+"                sx[r*84+8*kqsx+2*ql]=apply_sign4((unsigned int)gv,sg,0); sx[r*84+8*kqsx+2*ql+1]=apply_sign4((unsigned int)(gv>>32),sg,4);}\n"
+"        }\n"
+"        for(int e=tid;e<128;e+=256){int r=e,col=n0+r; float *xd=(float *)sx+64+r*84; for(int z=0;z<8;z++)xd[z]=0.0f;\n"
+"            if(col<N){int rem=k&255; const unsigned char *bp=W+(size_t)col*nb*66+(k>>8)*66; float d=half_to_float(*(const half_raw *)bp); const unsigned short *qs=(const unsigned short *)(bp+2);\n"
+"                for(int z=0;z<8;z++){int qidx=(rem>>3)+(z>>1)*4+(z&1)*2,ib=qidx>>2; unsigned int a1=qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16); xd[z]=d*(0.5f+(float)(a1>>28))*0.25f;}}\n"
+"        }\n"
+"        for(int e=tid;e<128*128;e+=256){int r=e>>7,kk=e&127; ((signed char *)sy)[r*144+16+kk]=(m0+r<M&&k+kk<K)?Xq[(size_t)(m0+r)*K+k+kk]:0;}\n"
+"        for(int r=tid;r<128;r+=256){float *yd=(float *)sy+r*36; for(int z=0;z<4;z++)yd[z]=(m0+r<M&&k+z*32<K)?Sq[(size_t)(m0+r)*(K/32)+k/32+z]:0.0f;}\n"
+"        __syncthreads(); float *xd=(float *)sx+64,*yd=(float *)sy; int row0=warp*16;\n"
+"        for(int k01=0;k01<32;k01+=4){i32x2 b0; int jr=row0+(lane&15),ao=2*(lane>>4); b0[0]=sy[jr*36+4+k01+ao]; b0[1]=sy[jr*36+4+k01+ao+1];\n"
+"            for(int n=0;n<8;n++){i32x2 a0; int ar=n*16+(lane&15); a0[0]=sx[ar*84+k01+ao]; a0[1]=sx[ar*84+k01+ao+1]; i32x8 c={0,0,0,0,0,0,0,0};\n"
+"                c=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,c,false); int half=lane>>4,row=row0+(lane&15);\n"
+"                for(int l=0;l<8;l++){int col=n*16+8*half+l; sum[n][l]+=(float)c[l]*xd[col*84+k01/4]*yd[row*36+k01/8];}}}\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int half=lane>>4; for(int n=0;n<8;n++)for(int l=0;l<8;l++){int row=m0+warp*16+(lane&15),col=n0+n*16+8*half+l; if(row<M&&col<N){size_t at=(size_t)row*N+col; if(term)Y[at]+=sum[n][l];else Y[at]=sum[n][l];}}\n"
+"}\n"
+"__global__ void gemm_iq2_s_mmq_wmma(float *Y, const unsigned char *W,\n"
+"        const signed char *X, const float *S, const signed char *X1,\n"
+"        const float *S1, int N, int K, int M, int term) {\n"
+"    typedef int i32x2 __attribute__((__vector_size__(2 * sizeof(int))));\n"
+"    typedef int i32x8 __attribute__((__vector_size__(8 * sizeof(int))));\n"
+"    int tid=threadIdx.x,warp=tid>>5,lane=tid&31;\n"
+"    int m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    const signed char *Xq=term?X1:X; const float *Sq=term?S1:S;\n"
+"    __shared__ int sx[128*84],sy[128*36];\n"
+"    float8 sum[8]; for(int q=0;q<8;q++)sum[q]=(float8){0,0,0,0,0,0,0,0};\n"
+"    for(int k=0;k<K;k+=128){\n"
+"        for(int e=tid;e<128*16;e+=256){\n"
+"            int r=e>>4,l=e&15,col=n0+r,kqsx=l>>2,ql=l&3;\n"
+"            sx[r*84+8*kqsx+2*ql]=0; sx[r*84+8*kqsx+2*ql+1]=0;\n"
+"            if(col<N){int rem=k&255,qidx=(rem>>3)+l; const unsigned char *bp=W+(size_t)col*nb*82+(k>>8)*82;\n"
+"                int ib=qidx>>2, ll=qidx&3; const unsigned char *qs=bp+2+ib*4, *sg=bp+34+ib*4;\n"
+"                int qv=qs[ll]|(((int)bp[66+ib]<<(8-2*ll))&0x300);\n"
+"                unsigned long long gv=iq2s_grid_dev[qv];\n"
+"                sx[r*84+8*kqsx+2*ql]=apply_sign4((unsigned int)gv,sg[ll],0);\n"
+"                sx[r*84+8*kqsx+2*ql+1]=apply_sign4((unsigned int)(gv>>32),sg[ll],4);}\n"
+"        }\n"
+"        for(int e=tid;e<128;e+=256){\n"
+"            int r=e,col=n0+r; float *xd=(float *)sx+64+r*84;\n"
+"            for(int z=0;z<8;z++)xd[z]=0.0f;\n"
+"            if(col<N){int rem=k&255; const unsigned char *bp=W+(size_t)col*nb*82+(k>>8)*82;\n"
+"                float d=half_to_float(*(const half_raw *)bp);\n"
+"                for(int z=0;z<8;z++){int qidx=(rem>>3)+(z>>1)*4+(z&1)*2,ib=qidx>>2,ll=qidx&3; unsigned char sc=bp[74+ib];\n"
+"                    xd[z]=d*(0.5f+(float)((ll<2)?(sc&15):(sc>>4)))*0.25f;}}\n"
+"        }\n"
+"        for(int e=tid;e<128*128;e+=256){int r=e>>7,kk=e&127; signed char *qy=(signed char *)sy;\n"
+"            qy[r*144+16+kk]=(m0+r<M&&k+kk<K)?Xq[(size_t)(m0+r)*K+k+kk]:0;}\n"
+"        for(int r=tid;r<128;r+=256){float *yd=(float *)sy+r*36;\n"
+"            for(int z=0;z<4;z++)yd[z]=(m0+r<M&&k+z*32<K)?Sq[(size_t)(m0+r)*(K/32)+k/32+z]:0.0f;}\n"
+"        __syncthreads();\n"
+"        float *xd=(float *)sx+64; float *yd=(float *)sy; int row0=warp*16;\n"
+"        for(int k01=0;k01<32;k01+=4){\n"
+"            i32x2 b0; int jr=row0+(lane&15),ao=2*(lane>>4);\n"
+"            b0[0]=sy[jr*36+4+k01+ao]; b0[1]=sy[jr*36+4+k01+ao+1];\n"
+"            for(int n=0;n<8;n++){i32x2 a0; int ar=n*16+(lane&15);\n"
+"                a0[0]=sx[ar*84+k01+ao]; a0[1]=sx[ar*84+k01+ao+1]; i32x8 c={0,0,0,0,0,0,0,0};\n"
+"                c=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,c,false);\n"
+"                int half=lane>>4,row=row0+(lane&15);\n"
+"                for(int l=0;l<8;l++){int col=n*16+8*half+l; sum[n][l]+=(float)c[l]*xd[col*84+k01/4]*yd[row*36+k01/8];}\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int half=lane>>4;\n"
+"    for(int n=0;n<8;n++)for(int l=0;l<8;l++){int row=m0+warp*16+(lane&15),col=n0+n*16+8*half+l;\n"
+"        if(row<M&&col<N){size_t at=(size_t)row*N+col; if(term)Y[at]+=sum[n][l];else Y[at]=sum[n][l];}}\n"
 "}\n"
 "/* ---- BF16 GEMM with double-buffered LDS (hides global load behind WMMA).       */\n"
 "__global__ void gemm_bf16_own_db(float *Y, const bf16_raw *W, const bf16_raw *X,\n"
@@ -10881,6 +11121,9 @@ struct hip_llm_runner {
     hipFunction_t fn_gemm_iq3_s_q8_wmma;
     hipFunction_t fn_gemm_iq3_s_q8_wmma64;
     hipFunction_t fn_gemm_iq2_xxs_q8_wmma;
+    hipFunction_t fn_gemm_iq2_xxs_mmq_wmma;
+    hipFunction_t fn_gemm_iq2_xs_mmq_wmma;
+    hipFunction_t fn_gemm_iq2_s_mmq_wmma;
     hipFunction_t fn_gemm_bf16_own_db;      /* double-buffered LDS variant */
     int gemm_own;                           /* LLM_GEMM=own -> 1, blaslt -> 0 */
     hipFunction_t fn_dequant_iq2s_all;      /* all-expert dequant (grouped prefill) */
@@ -10996,9 +11239,11 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq1_s_dp4a;
     hipFunction_t fn_matvec_iq1_s_dp4a2;
     hipFunction_t fn_matvec_iq1_s_dp4a2_batch;
+    hipFunction_t fn_matvec_iq1_s_dp4a2_batch_reuse4;
     hipFunction_t fn_matvec_iq1_m_f32;
     hipFunction_t fn_matvec_iq1_m_batch_f32;
     hipFunction_t fn_matvec_iq1_m_dp4a2_batch;
+    hipFunction_t fn_matvec_iq1_m_dp4a2_batch_reuse4;
     hipFunction_t fn_matvec_iq1_m_dp4a2;
     hipFunction_t fn_matvec_tq1_0_f32;
     hipFunction_t fn_matvec_tq2_0_f32;
@@ -11021,6 +11266,7 @@ struct hip_llm_runner {
     hipFunction_t fn_dequant_iq2_s_to_bf16;
     hipFunction_t fn_dequant_iq3_s_to_bf16;
     hipFunction_t fn_dequant_iq1_s_to_bf16;
+    hipFunction_t fn_dequant_iq1_m_to_bf16;
     hipFunction_t fn_dequant_tq1_0_to_bf16;
     hipFunction_t fn_dequant_iq2_xxs_to_bf16;
 
@@ -11851,6 +12097,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(gemm_iq3_s_q8_wmma);
     GET_FUNC(gemm_iq3_s_q8_wmma64);
     GET_FUNC(gemm_iq2_xxs_q8_wmma);
+    GET_FUNC(gemm_iq2_xxs_mmq_wmma);
+    GET_FUNC(gemm_iq2_xs_mmq_wmma);
+    GET_FUNC(gemm_iq2_s_mmq_wmma);
     GET_FUNC(gemm_bf16_own_db);
     GET_FUNC(dequant_iq2s_all);
     GET_FUNC(dequant_iq3s_all);
@@ -11927,9 +12176,11 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq1_s_dp4a);
     GET_FUNC(matvec_iq1_s_dp4a2);
     GET_FUNC(matvec_iq1_s_dp4a2_batch);
+    GET_FUNC(matvec_iq1_s_dp4a2_batch_reuse4);
     GET_FUNC(matvec_iq1_m_f32);
     GET_FUNC(matvec_iq1_m_batch_f32);
     GET_FUNC(matvec_iq1_m_dp4a2_batch);
+    GET_FUNC(matvec_iq1_m_dp4a2_batch_reuse4);
     GET_FUNC(matvec_iq1_m_dp4a2);
     GET_FUNC(matvec_tq1_0_f32);
     GET_FUNC(matvec_tq2_0_f32);
@@ -11980,6 +12231,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(dequant_iq2_s_to_bf16);
     GET_FUNC(dequant_iq3_s_to_bf16);
     GET_FUNC(dequant_iq1_s_to_bf16);
+    GET_FUNC(dequant_iq1_m_to_bf16);
     GET_FUNC(dequant_tq1_0_to_bf16);
     GET_FUNC(dequant_iq2_xxs_to_bf16);
 
@@ -16317,8 +16569,10 @@ static inline int gemm_run_bf16_w(hip_llm_runner *r, void *Y, const void *W,
     if (!r->gemm_own)
         return mm_blaslt_run_bf16(Y, W, X, M, N, K, stream);
     void *args[] = { &Y, &W, &X, &N, &K, &M };
-    hipFunction_t fn = (M >= 128 && K >= 128 && r->fn_gemm_bf16_own_db) ? r->fn_gemm_bf16_own_db
-                                                            : r->fn_gemm_bf16_own;
+    const char *db_env = getenv("LLM_GEMM_OWN_DB");
+    int use_db = !db_env || atoi(db_env) != 0;
+    hipFunction_t fn = (use_db && M >= 128 && K >= 128 && r->fn_gemm_bf16_own_db) ?
+                       r->fn_gemm_bf16_own_db : r->fn_gemm_bf16_own;
     hipError_t err = LAUNCH(fn, (unsigned)((N + 127) / 128),
                             (unsigned)((M + 127) / 128), 1, 256, 1, 1, 0,
                             (hipStream_t)stream, args);
@@ -17399,6 +17653,110 @@ static inline void launch_matvec_iq2_xs_batch(hip_llm_runner *r, void *dst,
         }
         /* A staging failure falls through to the exact native path. */
     }
+    /* The RDNA4 MMQ path is parity-validated against DP4A and is the default
+     * for full-width Qwen3.5 IQ2_XS batches.  Set the variable to 0 for an
+     * exact DP4A A/B control run. */
+    const char *mmq_wmma = getenv("LLM_QWEN35_IQ2XS_MMQ_WMMA");
+    int mmq_wmma_enable = !mmq_wmma || atoi(mmq_wmma) != 0;
+    if (mmq_wmma_enable && x_stride == n_cols && M >= 128 &&
+        n_rows >= 128 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        int term0 = 0, term1 = 1, scalar = 0;
+        void *mw[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M, &term0, &scalar };
+        LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, mw);
+        mw[9] = &term1;
+        LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, mw);
+        /* One-shot differential check against the exact DP4A batch kernel.
+         * This is intentionally diagnostic-only: it synchronizes once and
+         * allocates a temporary output, and is never enabled in production. */
+        static int mmq_compare_done = 0;
+        const char *cmp_env = getenv("LLM_QWEN35_IQ2XS_MMQ_COMPARE");
+        if (!mmq_compare_done && cmp_env && atoi(cmp_env) != 0) {
+            mmq_compare_done = 1;
+            void *d_ref = NULL;
+            void *d_scalar = NULL;
+            size_t out_bytes = (size_t)M * (size_t)n_rows * sizeof(float);
+            if (hipMalloc(&d_ref, out_bytes) == hipSuccess &&
+                hipMalloc(&d_scalar, out_bytes) == hipSuccess) {
+                void *scalar_dst = d_scalar;
+                scalar = 1; mw[0] = &scalar_dst; mw[9] = &term0;
+                LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma,
+                       (n_rows + 127) / 128, (M + 127) / 128,
+                       1, 256, 1, 1, 0, r->stream, mw);
+                mw[9] = &term1;
+                LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma,
+                       (n_rows + 127) / 128, (M + 127) / 128,
+                       1, 256, 1, 1, 0, r->stream, mw);
+                scalar = 0; mw[0] = &dst;
+                void *da[] = { &d_ref, &mat, &r->d_act_q8_batch,
+                               &r->d_act_scale_batch,
+                               &r->d_act_q8_batch_b,
+                               &r->d_act_scale_batch_b,
+                               &n_rows, &n_cols, &M };
+                LAUNCH(r->fn_matvec_iq2_xs_dp4a2_batch,
+                       (n_rows + 7) / 8, M, 1, 256, 1, 1, 0, r->stream, da);
+                if (hipStreamSynchronize(r->stream) == hipSuccess) {
+                    float *h_ref = (float *)malloc(out_bytes);
+                    float *h_mmq = (float *)malloc(out_bytes);
+                    float *h_scalar = (float *)malloc(out_bytes);
+                    if (h_ref && h_mmq &&
+                        h_scalar &&
+                        hipMemcpy(h_ref, d_ref, out_bytes,
+                                  hipMemcpyDeviceToHost) == hipSuccess &&
+                        hipMemcpy(h_mmq, dst, out_bytes,
+                                  hipMemcpyDeviceToHost) == hipSuccess &&
+                        hipMemcpy(h_scalar, d_scalar, out_bytes,
+                                  hipMemcpyDeviceToHost) == hipSuccess) {
+                        double sum2 = 0.0, ref2 = 0.0, max_abs = 0.0;
+                        float max_ref = 0.0f;
+                        size_t max_at = 0;
+                        for (size_t i = 0; i < (size_t)M * (size_t)n_rows; ++i) {
+                            double d = (double)h_mmq[i] - (double)h_ref[i];
+                            double a = fabs(d);
+                            sum2 += d * d; ref2 += (double)h_ref[i] * h_ref[i];
+                            if (a > max_abs) { max_abs = a; max_at = i; }
+                            if (fabsf(h_ref[i]) > max_ref) max_ref = fabsf(h_ref[i]);
+                        }
+                        double scalar_sum2 = 0.0, scalar_ref2 = 0.0;
+                        int scalar_rows = n_rows < 128 ? n_rows : 128;
+                        for (int t = 0; t < 2 && t < M; ++t)
+                            for (int j = 0; j < scalar_rows; ++j) {
+                                size_t at = (size_t)t * (size_t)n_rows + (size_t)j;
+                                double d = (double)h_scalar[at] - (double)h_ref[at];
+                                scalar_sum2 += d*d;
+                                scalar_ref2 += (double)h_ref[at]*h_ref[at];
+                            }
+                        fprintf(stderr, "hip_llm: IQ2_XS MMQ compare n=%d M=%d "
+                                "max_abs=%.8g at=%zu mmq=%.8g ref=%.8g "
+                                "rms_rel=%.8g scalar_rel=%.8g ref_max=%.8g "
+                                "first=[%.6g/%.6g/%.6g %.6g/%.6g/%.6g "
+                                "%.6g/%.6g/%.6g %.6g/%.6g/%.6g]\n",
+                                n_rows, M, max_abs, max_at,
+                                h_mmq[max_at], h_ref[max_at],
+                                sqrt(sum2 / (double)((size_t)M * (size_t)n_rows)) /
+                                    fmax((double)max_ref, 1e-12),
+                                sqrt(scalar_sum2 / (double)(2 * scalar_rows)) /
+                                    sqrt(scalar_ref2 / (double)(2 * scalar_rows)), max_ref,
+                                h_mmq[0], h_ref[0], h_scalar[0],
+                                h_mmq[1], h_ref[1], h_scalar[1],
+                                h_mmq[2], h_ref[2], h_scalar[2],
+                                h_mmq[3], h_ref[3], h_scalar[3]);
+                    }
+                    free(h_ref); free(h_mmq); free(h_scalar);
+                }
+                hipFree(d_ref);
+                hipFree(d_scalar);
+            } else {
+                if (d_ref) hipFree(d_ref);
+                if (d_scalar) hipFree(d_scalar);
+            }
+        }
+        return;
+    }
     const char *dp_env = getenv("LLM_QWEN35_NATIVE_IQ2_DP4A_BATCH");
     if (dp_env && atoi(dp_env) != 0 && M > 0 && M <= 512 && n_cols <= 17408 &&
         (n_cols % 256) == 0) {
@@ -17443,6 +17801,52 @@ static inline void launch_matvec_iq2_xs_batch(hip_llm_runner *r, void *dst,
 static inline void launch_matvec_iq2_xxs_batch(hip_llm_runner *r, void *dst,
         void *mat, void *x, int M, int n_rows, int n_cols, int x_stride) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
+    const char *mmq_wmma_env = getenv("LLM_QWEN35_IQ2XXS_MMQ_WMMA");
+    if ((!mmq_wmma_env || atoi(mmq_wmma_env) != 0) && x_stride == n_cols && M >= 128 &&
+        n_rows >= 128 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        int term0 = 0, term1 = 1;
+        void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                       &r->d_act_scale_batch_b, &n_rows, &n_cols, &M,
+                       &term0 };
+        LAUNCH(r->fn_gemm_iq2_xxs_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        wa[9] = &term1;
+        LAUNCH(r->fn_gemm_iq2_xxs_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        static int iq2xxs_mmq_compare_done = 0;
+        const char *cmp_env = getenv("LLM_QWEN35_IQ2XXS_MMQ_COMPARE");
+        if (!iq2xxs_mmq_compare_done && cmp_env && atoi(cmp_env) != 0) {
+            iq2xxs_mmq_compare_done = 1;
+            size_t bytes = (size_t)M * (size_t)n_rows * sizeof(float);
+            void *ref = NULL;
+            if (hipMalloc(&ref, bytes) == hipSuccess) {
+                void *da[] = { &ref, &mat, &r->d_act_q8_batch,
+                               &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                               &r->d_act_scale_batch_b, &n_rows, &n_cols, &M };
+                LAUNCH(r->fn_matvec_iq2_xxs_dp4a2_batch,
+                       (n_rows + 7) / 8, M, 1, 256, 1, 1, 0, r->stream, da);
+                if (hipStreamSynchronize(r->stream) == hipSuccess) {
+                    float *hm = (float *)malloc(bytes), *hr = (float *)malloc(bytes);
+                    if (hm && hr && hipMemcpy(hm, dst, bytes, hipMemcpyDeviceToHost) == hipSuccess &&
+                        hipMemcpy(hr, ref, bytes, hipMemcpyDeviceToHost) == hipSuccess) {
+                        double e2 = 0.0, r2 = 0.0; float ma = 0.0f;
+                        for (size_t i = 0; i < (size_t)M * (size_t)n_rows; ++i) {
+                            float d = hm[i] - hr[i]; e2 += (double)d*d; r2 += (double)hr[i]*hr[i];
+                            if (fabsf(d) > ma) ma = fabsf(d);
+                        }
+                        fprintf(stderr, "hip_llm: IQ2_XXS MMQ compare M=%d N=%d rel_l2=%.8g max_abs=%.8g first=[%.7g/%.7g %.7g/%.7g]\n",
+                                M, n_rows, sqrt(e2 / fmax(r2, 1e-30)), ma,
+                                hm[0], hr[0], hm[1], hr[1]);
+                    }
+                    free(hm); free(hr);
+                }
+                hipFree(ref);
+            }
+        }
+        return;
+    }
     const char *q8_wmma = getenv("LLM_QWEN35_IQ2_Q8_WMMA");
     if (q8_wmma && atoi(q8_wmma) != 0 && x_stride == n_cols && M >= 32 &&
         (n_cols % 256) == 0) {
@@ -17577,6 +17981,52 @@ static inline void launch_matvec_iq3_s_batch(hip_llm_runner *r, void *dst,
 static inline void launch_matvec_iq2_s_batch(hip_llm_runner *r, void *dst,
         void *mat, void *x, int M, int n_rows, int n_cols, int x_stride) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
+    const char *mmq_env = getenv("LLM_QWEN35_IQ2S_MMQ_WMMA");
+    if ((!mmq_env || atoi(mmq_env) != 0) && x_stride == n_cols && M >= 128 &&
+        n_rows >= 128 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        int term0 = 0, term1 = 1;
+        void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                       &r->d_act_scale_batch_b, &n_rows, &n_cols, &M,
+                       &term0 };
+        LAUNCH(r->fn_gemm_iq2_s_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        wa[9] = &term1;
+        LAUNCH(r->fn_gemm_iq2_s_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        static int iq2s_mmq_compare_done = 0;
+        const char *cmp_env = getenv("LLM_QWEN35_IQ2S_MMQ_COMPARE");
+        if (!iq2s_mmq_compare_done && cmp_env && atoi(cmp_env) != 0) {
+            iq2s_mmq_compare_done = 1;
+            size_t bytes = (size_t)M * (size_t)n_rows * sizeof(float);
+            void *ref = NULL;
+            if (hipMalloc(&ref, bytes) == hipSuccess) {
+                void *da[] = { &ref, &mat, &r->d_act_q8_batch,
+                               &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                               &r->d_act_scale_batch_b, &n_rows, &n_cols, &M };
+                LAUNCH(r->fn_matvec_iq2_s_dp4a2_batch,
+                       (n_rows + 7) / 8, M, 1, 256, 1, 1, 0, r->stream, da);
+                if (hipStreamSynchronize(r->stream) == hipSuccess) {
+                    float *hm = (float *)malloc(bytes), *hr = (float *)malloc(bytes);
+                    if (hm && hr && hipMemcpy(hm, dst, bytes, hipMemcpyDeviceToHost) == hipSuccess &&
+                        hipMemcpy(hr, ref, bytes, hipMemcpyDeviceToHost) == hipSuccess) {
+                        double e2 = 0.0, r2 = 0.0; float ma = 0.0f;
+                        for (size_t i = 0; i < (size_t)M * (size_t)n_rows; ++i) {
+                            float d = hm[i] - hr[i]; e2 += (double)d*d; r2 += (double)hr[i]*hr[i];
+                            if (fabsf(d) > ma) ma = fabsf(d);
+                        }
+                        fprintf(stderr, "hip_llm: IQ2_S MMQ compare M=%d N=%d rel_l2=%.8g max_abs=%.8g first=[%.7g/%.7g %.7g/%.7g]\n",
+                                M, n_rows, sqrt(e2 / fmax(r2, 1e-30)), ma,
+                                hm[0], hr[0], hm[1], hr[1]);
+                    }
+                    free(hm); free(hr);
+                }
+                hipFree(ref);
+            }
+        }
+        return;
+    }
     const char *dp_env = getenv("LLM_QWEN35_NATIVE_IQ2_DP4A_BATCH");
     if (dp_env && atoi(dp_env) != 0 && M > 0 && M <= 512 && (n_cols % 256) == 0) {
         launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
@@ -17607,8 +18057,15 @@ static inline void launch_matvec_iq1_s_batch(hip_llm_runner *r, void *dst,
         void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
                        &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
                        &n_rows, &n_cols, &M };
-        LAUNCH(r->fn_matvec_iq1_s_dp4a2_batch, (n_rows + 7) / 8, M, 1,
-               256, 1, 1, 0, r->stream, da);
+        const char *reuse_env = getenv("LLM_QWEN35_NATIVE_IQ1S_DP4A_REUSE4");
+        if (!reuse_env || atoi(reuse_env) != 0) {
+            LAUNCH(r->fn_matvec_iq1_s_dp4a2_batch_reuse4,
+                   (n_rows + 7) / 8, (M + 3) / 4, 1,
+                   256, 1, 1, 0, r->stream, da);
+        } else {
+            LAUNCH(r->fn_matvec_iq1_s_dp4a2_batch, (n_rows + 7) / 8, M, 1,
+                   256, 1, 1, 0, r->stream, da);
+        }
         return;
     }
     LAUNCH(r->fn_matvec_iq1_s_batch_f32, (n_rows + 7) / 8, M, 1,
@@ -17624,8 +18081,15 @@ static inline void launch_matvec_iq1_m_batch(hip_llm_runner *r, void *dst,
         void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
                        &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
                        &n_rows, &n_cols, &M };
-        LAUNCH(r->fn_matvec_iq1_m_dp4a2_batch, (n_rows + 7) / 8, M, 1,
-               256, 1, 1, 0, r->stream, da);
+        const char *reuse_env = getenv("LLM_QWEN35_NATIVE_IQ1M_DP4A_REUSE4");
+        if (!reuse_env || atoi(reuse_env) != 0) {
+            LAUNCH(r->fn_matvec_iq1_m_dp4a2_batch_reuse4,
+                   (n_rows + 7) / 8, (M + 3) / 4, 1,
+                   256, 1, 1, 0, r->stream, da);
+        } else {
+            LAUNCH(r->fn_matvec_iq1_m_dp4a2_batch, (n_rows + 7) / 8, M, 1,
+                   256, 1, 1, 0, r->stream, da);
+        }
         return;
     }
     LAUNCH(r->fn_matvec_iq1_m_batch_f32, (n_rows + 7) / 8, M, 1,
@@ -17987,6 +18451,7 @@ DEFINE_LAUNCH_KQ_DEQUANT(iq2_xs)
 DEFINE_LAUNCH_KQ_DEQUANT(iq2_s)
 DEFINE_LAUNCH_KQ_DEQUANT(iq3_s)
 DEFINE_LAUNCH_KQ_DEQUANT(iq1_s)
+DEFINE_LAUNCH_KQ_DEQUANT(iq1_m)
 DEFINE_LAUNCH_KQ_DEQUANT(tq1_0)
 DEFINE_LAUNCH_KQ_DEQUANT(iq2_xxs)
 #undef DEFINE_LAUNCH_KQ_DEQUANT
@@ -18049,7 +18514,8 @@ static inline int batch_qtype_ok(int type) {
            type == GGML_TYPE_Q6_K    || type == GGML_TYPE_IQ3_XXS ||
            type == GGML_TYPE_IQ4_XS  || type == GGML_TYPE_IQ2_XS  ||
            type == GGML_TYPE_IQ2_S   || type == GGML_TYPE_IQ3_S   ||
-           type == GGML_TYPE_IQ1_S   || type == GGML_TYPE_TQ1_0   ||
+           type == GGML_TYPE_IQ1_S   || type == GGML_TYPE_IQ1_M   ||
+           type == GGML_TYPE_TQ1_0   ||
            type == GGML_TYPE_IQ2_XXS;
 }
  
@@ -18156,6 +18622,9 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
             return r->d_wbuf_bf16;
         case GGML_TYPE_IQ1_S:
             if (launch_dequant_iq1_s_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_IQ1_M:
+            if (launch_dequant_iq1_m_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
             return r->d_wbuf_bf16;
         case GGML_TYPE_TQ1_0:
             if (launch_dequant_tq1_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
@@ -24465,13 +24934,22 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
      * the batched state/attention scheduling, but retain exact quantized
      * projections unless the BF16 experiment is explicitly requested. */
     const char *qwen35_bf16_env = getenv("LLM_QWEN35_BATCH_BF16_PROJ");
-    int qwen35_bf16_proj = qwen35_bf16_env && atoi(qwen35_bf16_env) != 0;
+    const char *qwen35_bf16_ffn_env = getenv("LLM_QWEN35_BF16_FFN_ONLY");
+    int qwen35_bf16_ffn_only = qwen35_bf16_ffn_env && atoi(qwen35_bf16_ffn_env) != 0;
+    int qwen35_bf16_proj = qwen35_bf16_env && atoi(qwen35_bf16_env) != 0 &&
+                           !qwen35_bf16_ffn_only;
     int qwen35_scalar_proj = r->is_hybrid && !r->is_qwen4exp && !qwen35_bf16_proj;
     const char *qwen35_native_env = getenv("LLM_QWEN35_NATIVE_IQ2_BATCH");
     int qwen35_native_iq2 = qwen35_scalar_proj && qwen35_native_env &&
                             atoi(qwen35_native_env) != 0;
+    /* In BF16 projection experiments, retain the exact native Qwen3.5 SSM
+     * projections.  The small alpha/beta shapes are both numerically
+     * sensitive and trigger a gfx1201 hipBLASLt plan crash; attention/FFN
+     * projections remain on the fast BF16 GEMM route. */
+    int qwen35_native_ssm = qwen35_native_env && atoi(qwen35_native_env) != 0;
     const char *qwen35_fast_ssm_env = getenv("LLM_QWEN35_BATCH_SSM_FAST");
-    int qwen35_fast_ssm = qwen35_scalar_proj && qwen35_fast_ssm_env &&
+    int qwen35_scalar_ssm = qwen35_scalar_proj || qwen35_native_ssm;
+    int qwen35_fast_ssm = qwen35_scalar_ssm && qwen35_fast_ssm_env &&
                           atoi(qwen35_fast_ssm_env) != 0;
 
     int n_run_layers = r->n_layers;
@@ -24509,6 +24987,16 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
 
     for (int l = 0; l < n_run_layers; l++) {
         hip_layer *cl = &r->layers[l];
+        /* BF16 staging is safe for dense attention/FFN blocks, but not for
+         * recurrent SSM inputs.  Recompute the per-layer dispatch gates here
+         * because the model interleaves both block kinds. */
+        qwen35_scalar_proj = r->is_hybrid && !r->is_qwen4exp &&
+                             (!qwen35_bf16_proj || cl->is_ssm);
+        qwen35_native_iq2 = qwen35_scalar_proj && qwen35_native_env &&
+                            atoi(qwen35_native_env) != 0;
+        qwen35_scalar_ssm = qwen35_scalar_proj || qwen35_native_ssm;
+        qwen35_fast_ssm = qwen35_scalar_ssm && qwen35_fast_ssm_env &&
+                          atoi(qwen35_fast_ssm_env) != 0;
         r->batch_q8_valid = 0;
         r->qwen4_fingerprint_layer = l;
         if (fingerprint) qwen4_fingerprint(r, 0, r->d_hc_batch,
@@ -24737,17 +25225,17 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 cl->ssm_gate_type == GGML_TYPE_Q6_K &&
                 cl->ssm_alpha_type == GGML_TYPE_F16 &&
                 cl->ssm_beta_type == GGML_TYPE_F16;
-            int scalar_ssm_proj = qwen35_scalar_proj;
+            int scalar_ssm_proj = qwen35_scalar_ssm;
             const char *ssm_native_env = getenv("LLM_QWEN4_BATCH_SSM_NATIVE");
             int ssm_native = ssm_native_env && atoi(ssm_native_env) != 0 &&
                              qwen4_ssm_native_supported(cl);
-            if (scalar_ssm_proj) {
-                int native_qkv = qwen35_native_iq2 && qwen35_native_batch_type(cl->ssm_qkv_type);
-                int native_gate = qwen35_native_iq2 && qwen35_native_batch_type(cl->ssm_gate_type);
+            if (scalar_ssm_proj || qwen35_native_ssm) {
+                int native_qkv = qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_qkv_type);
+                int native_gate = qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_gate_type);
                 const char *aux_env = getenv("LLM_QWEN35_NATIVE_IQ2_SSM_AUX");
                 int native_aux = aux_env && atoi(aux_env) != 0;
-                int native_alpha = native_aux && qwen35_native_iq2 && qwen35_native_batch_type(cl->ssm_alpha_type);
-                int native_beta = native_aux && qwen35_native_iq2 && qwen35_native_batch_type(cl->ssm_beta_type);
+                int native_alpha = native_aux && qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_alpha_type);
+                int native_beta = native_aux && qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_beta_type);
                 int batch_alpha = cl->ssm_alpha_type == GGML_TYPE_F16;
                 int batch_beta = cl->ssm_beta_type == GGML_TYPE_F16;
                 if (native_qkv)
@@ -24865,7 +25353,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
 
             float *conv_out_base = (float *)r->d_ssm_conv_out_batch;
             float *K_raw_base    = conv_out_base + (size_t)n_group * d_state;
-            if (qwen35_scalar_proj && !qwen35_fast_ssm) {
+            if (qwen35_scalar_ssm && !qwen35_fast_ssm) {
                 /* Preserve the scalar reduction/order for Qwen3.5.  These
                  * normalizations feed the recurrent matrix update directly;
                  * a different parallel reduction is amplified by later
@@ -24944,10 +25432,10 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             /* Batched gated_rmsnorm_silu: one launch over dt_rank × M heads.
              * Qwen3.5 uses the scalar reduction for parity for the same reason
              * as the Q/K head norms above. */
-            if (qwen35_scalar_proj && qwen35_native_iq2 && qwen35_native_batch_type(cl->ssm_out_type)) {
+            if (qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_out_type)) {
                 launch_matvec_qwen35_native_batch(r, r->d_attn_proj_batch, cl->ssm_out_w,
                     r->d_ssm_out_batch, M, n_embd, d_inner, d_inner, cl->ssm_out_type);
-            } else if (qwen35_scalar_proj && !qwen35_fast_ssm) {
+            } else if (qwen35_scalar_ssm && !qwen35_fast_ssm) {
                 for (int m = 0; m < M; ++m)
                     launch_gated_rmsnorm_silu(r,
                         (float *)r->d_ssm_out_batch + (size_t)m * d_inner,
@@ -24964,12 +25452,11 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
 
             /* ssm_out projection: d_inner -> n_embd, batched. Reuse d_silu_batch_bf16
              * as packing scratch (sized for n_ff >= d_inner). */
-            if (qwen35_scalar_proj && qwen35_native_iq2 &&
-                qwen35_native_batch_type(cl->ssm_out_type)) {
+            if (qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_out_type)) {
                 launch_matvec_qwen35_native_batch(r, r->d_attn_proj_batch,
                     cl->ssm_out_w, r->d_ssm_out_batch, M, n_embd, d_inner,
                     d_inner, cl->ssm_out_type);
-            } else if (qwen35_scalar_proj) {
+            } else if (qwen35_scalar_ssm) {
                 for (int m = 0; m < M; ++m)
                     launch_matvec_auto(r,
                         (float *)r->d_attn_proj_batch + (size_t)m * n_embd,
@@ -25468,7 +25955,7 @@ ffn_section:
             continue;
         }
 
-        if (qwen35_scalar_proj) {
+        if (qwen35_scalar_proj && !qwen35_bf16_ffn_only) {
             /* Keep IQ2/IQ3 arithmetic identical to the scalar reference.  A
              * BF16 weight staging round-trip here is especially damaging for
              * the gated FFN because its two quantized products are multiplied
