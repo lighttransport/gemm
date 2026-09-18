@@ -308,6 +308,22 @@ GLM53F_STREAM_PAYLOAD_JOB PASS job=51760204
 This run retained all 45 stage payloads and the final payload in
 `tmp/glm53f-stream-validation-51760204/graph/manifest.jsonl` (46 records).
 
+Job 51766725 repeated the complete streamed chain with
+`GLM53F_STREAM_TOKEN=1234`, providing a third real embedding/input variant.
+All 45 trunk layers again produced finite 16,384-element artifacts. The
+layer-0 hash was `279d0a0b3f24bcdc`, distinct from the token-1 and token-42
+runs, and the terminal comparison matched exactly:
+
+```text
+GLM53F_STREAM_GRAPH PASS layers=45 hidden=16384
+GLM53F_STREAM_CUSTOM_FINAL token=29656 llama_token=29656 rel_l2=1.76643041e-07 exact=YES PASS
+GLM53F_STREAM_GRAPH layer=45 hidden=154880 finite=154880 ... token=29656 PASS
+GLM53F_STREAM_PAYLOAD_JOB PASS job=51766725
+```
+
+This extends the full streamed final-token gate across three distinct real
+input token variants: `1 -> 5556`, `42 -> 154822`, and `1234 -> 29656`.
+
 The layer-3 attention/FFN increment uses the same artifact contract and adds
 real custom-vs-llama.cpp intermediate values before the final-token gate. The
 router adapter remains an algorithm/serialization gate, not a full-model
