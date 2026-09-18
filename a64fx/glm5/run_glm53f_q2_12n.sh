@@ -30,7 +30,8 @@ run_tag=${GLM53F_Q2_RUN_TAG:-$$}
 # mpifcc is the Fujitsu wrapper.  Keep compiler and launcher in one MPI tree.
 export OPAL_PREFIX=${GLM53F_MPI_HOME:-/opt/FJSVxtclanga/tcsds-1.2.43}
 export MPI_HOME=$OPAL_PREFIX
-mpiexec_bin=$OPAL_PREFIX/bin/mpiexec
+export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:${PATH}"
+mpiexec_bin=${GLM53F_MPIEXEC:-mpiexec}
 export GLM53F_MPICC=${GLM53F_MPICC:-mpifcc}
 export GLM53F_BUILD_DIR=${GLM53F_BUILD_DIR:-/local/glm53f-q2-build-$job}
 export GLM53F_FAST_MATH=${GLM53F_FAST_MATH:-1}
