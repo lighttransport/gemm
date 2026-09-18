@@ -434,7 +434,28 @@ GLM53F_STREAM_PAYLOAD layer=11 tensors=31 bytes=3276747096
 GLM53F_STREAM_PAYLOAD_JOB PASS job=51749156
 ```
 
-This validates the storage/residency primitive needed by the final streamed
-runner. It is not yet a token-output check; the remaining implementation must
-attach this per-layer transaction to llama.cpp's GLM5NEXT graph and carry the
-hidden streams plus KDA/DSA state between transactions.
+This validates the storage/residency primitive used by the final streamed
+runner. By itself it is not a token-output check; the graph and component
+gates below provide the hidden-stream, KDA/DSA, and terminal comparisons.
+
+Job 51765982 independently reran the committed llama.cpp component module on
+one A64FX node after the streamed graph implementation was committed. The
+direct `pjsub --interact` allocation used `proc=1`, six-hour `int`, and the
+localtmp LLIO reservation. The build and executable smoke tests passed, then
+all bounded cross-lane stages passed:
+
+```text
+LLAMA_MODULE PASS cross_lane_artifacts=embedding,router,ffn_layer0,dsa_indexer,kda_layer3,mla,moe,mhc,norm,logits,greedy_token
+DENSE_STAGE PASS tokens=3 max_rel_l2=0 max_abs=0
+INDEXER_STAGE rel_l2=7.1443207e-8 max_abs=3.7252903e-9 PASS
+KDA_STAGE attn_rel_l2=3.11955503e-7 state_rel_l2=6.56265577e-8 PASS
+variant=0 ... exact_tokens=YES PASS
+variant=1 ... exact_tokens=YES PASS
+variant=2 ... exact_tokens=YES PASS
+```
+
+The embedding and router artifact comparison covered token IDs
+`0,1,2,42,1234,154820,154822,154827` with zero observed difference. The
+three tail variants each matched all 32 greedy token positions exactly. This
+is a fresh multi-input component verification of the llama.cpp module; it does
+not change the separate full-checkpoint one-token result above.
