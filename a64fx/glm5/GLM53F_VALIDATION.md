@@ -293,6 +293,25 @@ comparison. Full per-layer custom artifact equivalence remains a useful
 stronger diagnostic, while the custom runner's individual attention/FFN/router
 lanes are covered by the bounded gates below.
 
+The production-vs-llama.cpp equality check must use the same checkpoint
+representation. A token-1234 production rerun (job 51768151) reported
+`final_token=198`, whereas the Q2 GGUF streamed chain above reported
+`final_token=29656`. The production runner reads the BF16 safetensors
+`model.language_model.embed_tokens.weight`; llama.cpp reads and dequantizes
+the Q2 GGUF `token_embd.weight`. The bounded row comparator in
+`glm53f_embedding_compare.cpp` measured the first divergence directly:
+
+```text
+GLM53F_EMBED_COMPARE token=1234 ... rel_l2=0.0358545767 max_abs=0.0012024045 DIFFERENT
+```
+
+This is a real cross-representation mismatch, not an inference nondeterminism
+or HBM failure. The token-1 equality (`5556`) is therefore only a result for
+that input and cannot be generalized. The next production equality gate must
+either feed the custom runner the same Q2 GGUF embedding/output rows or use a
+llama.cpp reference built from the same BF16 safetensors weights; the current
+token-1234 gate is explicitly FAIL until that alignment is implemented.
+
 To exercise a second real embedding/input variant, job 51760204 used an
 explicit in-job `GLM53F_STREAM_TOKEN=42` wrapper. Its layer-0 hash differed
 from token 1 (`ed0ec7e7ff5637b3` versus `e79ad917bd8c1afd`), all 45 trunk

@@ -69,9 +69,13 @@ test "$(grep -vc '^#' tofu_topo.txt)" -eq 12
 export GLM53F_UTOFU=1 TOFU_TOPO_PATH=$PWD/tofu_topo.txt
 
 steps=${GLM53F_TARGET_STEPS:-128}
-echo "running GLM-5.3-Flash Q2-routed decode steps=$steps"
+input_token=${GLM53F_TARGET_INPUT_TOKEN:-1}
+case "$input_token" in
+    ''|*[!0-9]*) echo "invalid GLM53F_TARGET_INPUT_TOKEN=$input_token" >&2; exit 2;;
+esac
+echo "running GLM-5.3-Flash Q2-routed decode input_token=$input_token steps=$steps"
 "$mpiexec_bin" -n 12 -of-proc "$logdir/decode-$run_tag" \
-    ./glm53f_target_decode_12n "$model" "$q2_stage" "$shared_stage" 1 "$steps"
+    ./glm53f_target_decode_12n "$model" "$q2_stage" "$shared_stage" "$input_token" "$steps"
 cat "$logdir"/decode-$run_tag.*.0
 result=$(grep 'GLM53F_TARGET_DECODE_12N' "$logdir"/decode-$run_tag.*.0 | tail -1)
 rate=$(printf '%s\n' "$result" | sed -n 's/.* tok_s=\([0-9.]*\).*/\1/p')

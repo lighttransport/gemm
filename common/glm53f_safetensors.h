@@ -112,7 +112,8 @@ static int glm53f_st_repack_read(const char *kind, const char *name,
                 else e.blob_offset = off;
                 e.name = glm53f_st_dup(parsed_name);
                 if (!e.name) break;
-                glm53f_st_repack_entry *p = realloc(entries, (size_t)(nentries + 1) * sizeof(*entries));
+                glm53f_st_repack_entry *p = (glm53f_st_repack_entry *) realloc(
+                    entries, (size_t)(nentries + 1) * sizeof(*entries));
                 if (!p) { free(e.name); break; }
                 entries = p; entries[nentries++] = e;
             }
