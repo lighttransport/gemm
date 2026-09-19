@@ -73,6 +73,38 @@ class PixalServerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "finite"):
             app.camera_matrix([[float("nan")] * 4 for _ in range(4)], "camera")
 
+    def test_multiview_reference_uses_pinned_entry_point(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        captured = {}
+        with tempfile.TemporaryDirectory(prefix="reference-", dir=scratch) as td:
+            server = self.make_server(Path(td))
+
+            def reference_run(command, **kwargs):
+                views_dir = Path(command[command.index("--views_dir") + 1])
+                output = Path(command[command.index("--output") + 1])
+                captured["command"] = command
+                captured["manifest"] = json.loads(
+                    (views_dir / "transforms.json").read_text())
+                output.write_bytes(b"glTF-reference")
+                return subprocess.CompletedProcess(command, 0, "reference complete\n", "")
+
+            encoded = base64.b64encode(b"rgba-image").decode()
+            request = {
+                "backend": "cuda", "seed": 9, "fov": 0.75,
+                "mesh_scale": 1.5,
+                "views": [{"image_b64": encoded,
+                           "transform_matrix": IDENTITY, "fov": 0.85}],
+            }
+            with mock.patch.object(app.subprocess, "run", side_effect=reference_run):
+                result = server.reference(request)
+
+        self.assertEqual(base64.b64decode(result["glb_b64"]), b"glTF-reference")
+        self.assertEqual(Path(captured["command"][2]), server.reference_mv_script)
+        self.assertIn("--low_vram", captured["command"])
+        self.assertEqual(captured["manifest"]["mesh_scale"], 1.5)
+        self.assertEqual(captured["manifest"]["frames"][0]["camera_angle_x"], 0.85)
+
 
 if __name__ == "__main__":
     unittest.main()

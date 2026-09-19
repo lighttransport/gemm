@@ -27,7 +27,9 @@ are kept only under `tmp/pixal3d/` and removed after each request.
 (`bf16`/`mixed`/`fp32`). Responses include a `profile` object with
 phase timings and device counters. Server defaults can be selected with
 `--gpu-execution resident --gpu-kernels auto`; the browser also exposes these
-choices. The browser defaults to a 12288 MiB budget; native allocation remains
+choices. Resident execution and mixed precision are the GPU server defaults;
+CPU requests automatically use legacy execution. The browser defaults to a
+12288 MiB budget; native allocation remains
 clamped to currently free VRAM, preserving the lower-memory path on smaller
 cards. Set `reference: true` with CUDA or ROCm to
 also run the pinned upstream PyTorch pipeline; the response includes a second
@@ -52,5 +54,6 @@ frames without one, and `mesh_scale` applies to the complete view set:
 }
 ```
 
-The pinned PyTorch comparison remains single-view only. Use the upstream
-`inference_mv.py` reference directly for multiview validation.
+The pinned PyTorch comparison supports both single-view and multiview GPU
+requests. It runs after native inference and reuses the validated ordered view
+manifest, so enabling it can add several minutes to a request.

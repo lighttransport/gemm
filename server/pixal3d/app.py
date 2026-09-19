@@ -218,11 +218,13 @@ class PixalServer:
         backend = request.get("backend", self.args.backend)
         if backend not in ("cuda", "rocm"):
             raise ValueError("PyTorch reference comparison requires CUDA or ROCm")
-        if request.get("views") is not None:
-            raise ValueError("Web PyTorch comparison for multiview is not enabled; use inference_mv.py directly")
-        if request.get("mask_b64"):
+        multiview = request.get("views") is not None
+        views = request.get("views") if multiview else None
+        if multiview and (not isinstance(views, list) or not 1 <= len(views) <= 16):
+            raise ValueError("views must contain 1 to 16 posed images")
+        if not multiview and request.get("mask_b64"):
             raise ValueError("PyTorch reference comparison currently requires an image without a separate mask")
-        image = decode_b64(request.get("image_b64"), "image_b64", MAX_IMAGE_BYTES)
+        image = None if multiview else decode_b64(request.get("image_b64"), "image_b64", MAX_IMAGE_BYTES)
         ext = str(request.get("image_ext", ".png")).lower()
         if ext not in (".png", ".jpg", ".jpeg", ".webp"):
             ext = ".png"
@@ -230,12 +232,34 @@ class PixalServer:
         seed = int(request.get("seed", 42))
         with self.locks[backend], tempfile.TemporaryDirectory(prefix="reference-", dir=self.work_dir) as td:
             run_dir = Path(td)
-            image_path = run_dir / ("input" + ext)
             output_path = run_dir / "reference.glb"
-            image_path.write_bytes(image)
-            cmd = [str(self.reference_launcher), backend, str(self.reference_script), "--image", str(image_path),
-                   "--output", str(output_path), "--seed", str(seed), "--fov", str(fov),
-                   "--model_path", str(self.model_dir), "--low_vram", "--resolution", "1024"]
+            if multiview:
+                frames = []
+                for index, item in enumerate(views):
+                    if not isinstance(item, dict):
+                        raise ValueError("each view must be an object")
+                    data = decode_b64(item.get("image_b64"), f"views[{index}].image_b64", MAX_IMAGE_BYTES)
+                    name = f"view{index:02d}.png"
+                    (run_dir / name).write_bytes(data)
+                    frame = {"file_path": name,
+                             "transform_matrix": camera_matrix(item.get("transform_matrix"),
+                                                                 f"views[{index}].transform_matrix")}
+                    if item.get("fov") is not None:
+                        frame["camera_angle_x"] = finite_number(item["fov"], f"views[{index}].fov", 0.05, 3.14)
+                    frames.append(frame)
+                mesh_scale = finite_number(request.get("mesh_scale", 1.0), "mesh_scale", 1e-5, 1000.0)
+                (run_dir / "transforms.json").write_text(json.dumps(
+                    {"camera_angle_x": fov, "mesh_scale": mesh_scale, "frames": frames}))
+                cmd = [str(self.reference_launcher), backend, str(self.reference_mv_script),
+                       "--views_dir", str(run_dir), "--output", str(output_path),
+                       "--seed", str(seed), "--model_path", str(self.model_dir),
+                       "--low_vram", "--resolution", "1024"]
+            else:
+                image_path = run_dir / ("input" + ext)
+                image_path.write_bytes(image)
+                cmd = [str(self.reference_launcher), backend, str(self.reference_script), "--image", str(image_path),
+                       "--output", str(output_path), "--seed", str(seed), "--fov", str(fov),
+                       "--model_path", str(self.model_dir), "--low_vram", "--resolution", "1024"]
             started = time.monotonic()
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.args.reference_timeout)
@@ -298,9 +322,9 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     p = argparse.ArgumentParser(description="Pixal3D Python web demo server")
     p.add_argument("--bind", default="127.0.0.1"); p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--gpu-execution", choices=("legacy", "resident"), default="legacy")
+    p.add_argument("--gpu-execution", choices=("legacy", "resident"), default="resident")
     p.add_argument("--gpu-kernels", choices=("auto", "blas", "mma"), default="auto")
-    p.add_argument("--gpu-flow-precision", choices=("bf16", "fp32", "mixed"), default="bf16")
+    p.add_argument("--gpu-flow-precision", choices=("bf16", "fp32", "mixed"), default="mixed")
     p.add_argument("--backend", choices=("cpu", "cuda", "rocm"), default="cuda")
     p.add_argument("--binary", default=str(ROOT / "cpu/pixal3d/pixal3d")); p.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
     p.add_argument("--dinov3", default=str(DEFAULT_DINOV3)); p.add_argument("--naf", default=str(DEFAULT_NAF))
