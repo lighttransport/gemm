@@ -75,6 +75,21 @@ ref/pixal3d/run.sh cuda ref/pixal3d/run_fixture.py \
   --gpu-flow-precision mixed --vram-budget-mib 7168 --timeout 1200
 ```
 
+Multiview conditioning caches DINO outputs per view and resolution for one
+generation. Shape-512 reuses the structure stage's 512 features, and texture
+reuses shape-1024's 1024 features. On the four-view fixture this removed
+9.86 GB of host-to-device traffic and about 5 seconds of duplicate
+conditioning. Cached features live in host memory, so the optimization does
+not raise the 7 GiB native GPU floor. The web demo requests a 12 GiB budget for
+additional dense-output headroom and automatically falls back to available
+VRAM minus the runtime reserve.
+
+With the final unchanged 2048-row GEMM schedule, a 12 GiB budget reduced the
+warm 30-block, 10,765-token shape flow median from 3.279 s to 3.141 s (4.2%)
+by retaining more packed weights. Outputs were bit-identical. A tested
+4096-row schedule was removed: its microbenchmark gain did not survive the
+full dense multiview run because differently sized workspaces reused poorly.
+
 ## Matched flow benchmark
 
 Hardware: RTX 5060 Ti (`sm_120`) and RX 9070 XT (`gfx1201`). Host GCC 13.3;

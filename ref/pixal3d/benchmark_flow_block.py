@@ -20,10 +20,11 @@ p.add_argument('--repeats',type=int,default=3)
 p.add_argument('--gpu-execution',choices=['legacy','resident'],default='legacy')
 p.add_argument('--gpu-kernels',choices=['auto','blas','mma'],default='auto')
 p.add_argument('--gpu-flow-precision',choices=['bf16','fp32','mixed'],default='bf16')
+p.add_argument('--vram-budget-mib',type=int,default=12288)
 p.add_argument('--tokens',type=int,default=0,help='Limit recorded token count for bounded tuning')
 p.add_argument('--check-cache',action='store_true',help='Check alternating guidance, changed content and restored content on the same engine')
 a=p.parse_args()
-assert 1<=a.blocks<=30 and a.repeats>0 and a.tokens>=0
+assert 1<=a.blocks<=30 and a.repeats>0 and a.tokens>=0 and 512<a.vram_budget_mib<=14336
 lib=C.CDLL(str(a.library));lib.px_test_error.restype=C.c_char_p
 if hasattr(lib,'px_test_set_threads'):
     lib.px_test_set_threads.argtypes=[C.c_int]
@@ -32,6 +33,8 @@ else:assert a.threads==16,'This older validation bridge has a fixed thread count
 fp=np.ctypeslib.ndpointer(dtype=np.float32,flags='C_CONTIGUOUS');ip=np.ctypeslib.ndpointer(dtype=np.int32,flags='C_CONTIGUOUS')
 lib.px_test_set_gpu.argtypes=[C.c_int,C.c_int]
 assert lib.px_test_set_gpu(int(a.gpu_execution=='resident'),['auto','blas','mma'].index(a.gpu_kernels))==0
+lib.px_test_set_vram_budget.argtypes=[C.c_size_t]
+assert lib.px_test_set_vram_budget(a.vram_budget_mib)==0
 if hasattr(lib,'px_test_set_gpu_flow_precision'):
     lib.px_test_set_gpu_flow_precision.argtypes=[C.c_int]
     assert lib.px_test_set_gpu_flow_precision(['bf16','fp32','mixed'].index(a.gpu_flow_precision))==0
@@ -75,6 +78,7 @@ finally:lib.px_test_flow_close(session)
 a.output.parent.mkdir(parents=True,exist_ok=True)
 save_file({'feats':actual},str(a.output))
 report=dict(backend=a.backend,execution=a.gpu_execution,kernels=a.gpu_kernels,stage=a.stage,blocks=a.blocks,
-    threads=a.threads,tokens=len(actual),load_seconds=load_seconds,cold_seconds=times[0],warm_seconds=times[1:],median=float(np.median(times[1:])))
+    threads=a.threads,tokens=len(actual),vram_budget_mib=a.vram_budget_mib,load_seconds=load_seconds,
+    cold_seconds=times[0],warm_seconds=times[1:],median=float(np.median(times[1:])))
 a.output.with_suffix('.json').write_text(json.dumps(report,indent=2)+'\n')
 print(json.dumps(report),flush=True)

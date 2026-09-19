@@ -6,6 +6,7 @@
 #include <omp.h>
 static thread_local std::string last_error;
 static thread_local int test_threads = 16;
+static thread_local size_t test_vram_budget_mib = 14336;
 static thread_local pixal3d_gpu_options test_gpu_options{sizeof(pixal3d_gpu_options), 1, PIXAL3D_GPU_LEGACY,
                                                          PIXAL3D_KERNEL_AUTO, PIXAL3D_FLOW_BF16, nullptr};
 extern "C" int px_test_set_gpu(int execution, int kernels) {
@@ -27,11 +28,17 @@ extern "C" int px_test_set_threads(int threads) {
     test_threads = threads;
     return 0;
 }
+extern "C" int px_test_set_vram_budget(size_t mib) {
+    if (mib <= 512 || mib > 14336)
+        return -1;
+    test_vram_budget_mib = mib;
+    return 0;
+}
 static pixal3d_options options(int backend) {
     pixal3d_options o{};
     o.backend = pixal3d_backend(backend);
     o.threads = test_threads;
-    o.vram_budget_mib = 14336;
+    o.vram_budget_mib = test_vram_budget_mib;
     return o;
 }
 extern "C" const char *px_test_error() { return last_error.c_str(); }

@@ -24,7 +24,9 @@ removed after each request.
 (`bf16`/`mixed`/`fp32`). Responses include a `profile` object with
 phase timings and device counters. Server defaults can be selected with
 `--gpu-execution resident --gpu-kernels auto`; the browser also exposes these
-choices. Set `reference: true` with CUDA or ROCm to
+choices. The browser defaults to a 12288 MiB budget; native allocation remains
+clamped to currently free VRAM, preserving the lower-memory path on smaller
+cards. Set `reference: true` with CUDA or ROCm to
 also run the pinned upstream PyTorch pipeline; the response includes a second
 GLB for comparison. This is opt-in because it loads another model stack and
 requires an image without a separate mask upload. The browser displays native

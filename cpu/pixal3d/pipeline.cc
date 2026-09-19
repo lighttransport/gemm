@@ -101,6 +101,7 @@ struct Pipeline {
     std::vector<Image> view512, view1024;
     std::vector<pixal3d_camera> view_cameras;
     std::vector<std::array<float, 16>> view_matrices;
+    std::map<int, std::vector<Vec>> multiview_dino_cache;
     Pipeline(Engine &e, const pixal3d_options &o, bool multiview = false)
         : engine(e), options(o),
           config(read_json(std::string(o.model_dir) + (multiview ? "/pipeline_mv.json" : "/pipeline.json")).at("args")),
@@ -166,9 +167,15 @@ struct Pipeline {
         std::unique_ptr<Weights> naf_weights;
         if (target)
             naf_weights = std::make_unique<Weights>(options.naf_path);
+        auto &cached_features = multiview_dino_cache[images[0].width];
+        if (cached_features.empty())
+            cached_features.resize(images.size());
+        require(cached_features.size() == images.size(), "Multiview DINO cache mismatch");
         for (size_t view = 0; view < images.size(); ++view) {
             const Image &image = images[view];
-            Vec features = dino(engine, dino_weights, image_float(image, true, true), image.width);
+            Vec &features = cached_features[view];
+            if (features.empty())
+                features = dino(engine, dino_weights, image_float(image, true, true), image.width);
             for (size_t i = 0; i < cond.global.size(); ++i)
                 cond.global[i] += features[i];
             Vec patches(features.begin() + 5 * 1024, features.end()), xy(coords.size() / 2);

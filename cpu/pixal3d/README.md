@@ -128,6 +128,9 @@ The four-view upstream example completed on the RTX 5060 Ti in 521.5 seconds
 with mixed precision and a 7168 MiB native budget. Peak native reservation was
 6.99 GiB. Its exported 4096-texture GLB passed mesh bounds, index, triangle,
 normal and material validation with 655,071 vertices and 961,142 triangles.
+For 12 GB and larger cards, pass `--vram-budget-mib 12288`. The runtime still
+clamps the effective budget to free VRAM minus its safety reserve, so the same
+command retains the lower-memory fallback on smaller or contended devices.
 
 Select `--backend rocm` for the RX 9070 XT or `--backend cpu` for CPU execution.
 `--device` selects the backend-local device ordinal. `--threads` controls host
