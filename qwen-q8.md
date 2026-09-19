@@ -3373,3 +3373,56 @@ Although all IQ4_XS tensors are eligible, a combined Q5R+IQ4R image leaves
 only about 3.4 GB of nominal HBM before runtime state. It must be a replacement
 staged image rather than an additive cache, and integration needs an explicit
 KV/state/scratch budget before a full-load attempt.
+
+### Rank-local k-quant sidecar stage
+
+`a64fx/llm/qwen38_kquant_stage.c` now converts an existing rank-local `Q38TP`
+compact stage into a separate versioned `Q38KQC1` decode sidecar. This keeps
+the compact representation available for prefill while avoiding a full-model
+single-node additive cache. Each `rankNN.kquant` header records the cache-layout
+version, TP rank/size, source-stage version and size, source entry-table hash,
+and per-tensor source/cache checksums, shapes, types, formats, offsets, and
+lengths. Q5_K and IQ4_XS tensors that satisfy the eight-row/256-column layout
+constraints become Q5R and IQ4R entries; unsupported tensors remain solely in
+the compact stage and therefore retain an explicit fallback.
+
+The builder allocates only one compact tensor and its packed result at a time,
+uses positioned I/O, drops processed source/output pages with
+`POSIX_FADV_DONTNEED`, writes through a PID-qualified partial file, and renames
+only after the header and payload are synced. `--plan` reports compact, cache,
+and combined rank-local storage without writing the sidecar. Reuse checks the
+source identity, planned metadata, stage size, and entry-table checksum; a
+synthetic corruption check confirms that a damaged header causes a rebuild.
+
+Build and run the bounded end-to-end test with:
+
+```sh
+TMPDIR=/local/u14346/codex-research \
+  make -B -C a64fx/llm qwen38_kquant_stage qwen38_kquant_stage_test \
+  CC=fcc OPENMP=1
+OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./a64fx/llm/build/test_qwen38_kquant_stage \
+  ./a64fx/llm/build/qwen38_kquant_stage \
+  /local/u14346/codex-research/kquant-stage-test
+```
+
+The test creates a two-entry synthetic compact stage under `/local`, checks
+plan/build/reuse, compares both sidecar payloads byte-for-byte with the shared
+packers, verifies all relevant hashes, corrupts the entry-table checksum, and
+requires a successful rebuild. Its completion line is:
+
+```text
+SENTINEL qwen38_kquant_stage=OK entries=2 q5r=2240 iq4r=2176 reuse=1 corrupt_rebuild=1
+```
+
+The shared four-pattern kernel test still passes after separating pack-only
+code from the SVE runner, and a real layer-0 IQ4_XS wave rerun measured 0.466
+ms native A8 versus 0.213 ms IQ4R, 222.3 GB/s effective bandwidth, with exact
+native-A8 output.
+
+This milestone does not yet attach the sidecar to `tp_runner`. Runtime work
+must validate the sidecar before exposing pointers, first-touch/cache-map row
+groups in their owning CMGs, dispatch Q5R/IQ4R only for validated entries, and
+retain compact dispatch otherwise. The current `common/transformer.h` has
+unrelated local edits and was deliberately not modified by this focused stage
+change.

@@ -64,6 +64,7 @@ static int pack_q5r(uint8_t *dst, const block_q5_K *src, int rows, int cols) {
     return 0;
 }
 
+#ifndef TF_KQUANT_CACHE_PACK_ONLY
 static inline void packed_q5r_dot8(float out[8], const uint8_t *weights,
                                    const tf_kquant_a8_block *x, int nb) {
     const svbool_t p8 = svptrue_b8(), pg = svptrue_b32();
@@ -131,6 +132,7 @@ static int run_packed_q5r(float *y, const uint8_t *weights,
     }
     return 0;
 }
+#endif
 
 typedef struct {
     float d;
@@ -139,6 +141,11 @@ typedef struct {
 } packed_iq4r_header;
 
 _Static_assert(sizeof(packed_iq4r_header) == 16, "packed IQ4R header size");
+
+static const int8_t packed_iq4r_values[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+       1,   13,  25,  38,  53,  69,  89, 113,
+};
 
 static size_t packed_iq4r_block_bytes(void) {
     return 8 * sizeof(packed_iq4r_header) + 8 * 256;
@@ -173,8 +180,8 @@ static int pack_iq4r(uint8_t *dst, const block_iq4_xs *src,
                     int8_t *qrow = q + ((ib / 2) * 8 + rr) * 64 + (ib & 1) * 32;
                     const uint8_t *packed = wb->qs + ib * 16;
                     for (int k = 0; k < 16; k++) {
-                        qrow[k] = kvalues_iq4nl[packed[k] & 15];
-                        qrow[16 + k] = kvalues_iq4nl[packed[k] >> 4];
+                        qrow[k] = packed_iq4r_values[packed[k] & 15];
+                        qrow[16 + k] = packed_iq4r_values[packed[k] >> 4];
                     }
                 }
             }
@@ -183,6 +190,7 @@ static int pack_iq4r(uint8_t *dst, const block_iq4_xs *src,
     return 0;
 }
 
+#ifndef TF_KQUANT_CACHE_PACK_ONLY
 static inline void packed_iq4r_dot8(float out[8], const uint8_t *weights,
                                     const tf_kquant_a8_block *x, int nb) {
     const svbool_t p8 = svptrue_b8(), pg = svptrue_b32();
@@ -244,5 +252,6 @@ static int run_packed_iq4r(float *y, const uint8_t *weights,
     }
     return 0;
 }
+#endif
 
 #endif

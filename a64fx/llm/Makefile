@@ -143,7 +143,7 @@ GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COM
 # ── Targets ────────────────────────────────────────────────────────────
 # ds4f_bake MUST be here: the alias target name matches ds4f_bake.c, so without .PHONY make's
 # built-in "%: %.c" rule fires and re-links the finished binary as if it were an object.
-.PHONY: all clean vlm_objs llm_runner qwen38_runner qwen38_kquant_bench qwen38_kquant_test qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
+.PHONY: all clean vlm_objs llm_runner qwen38_runner qwen38_kquant_bench qwen38_kquant_test qwen38_kquant_stage qwen38_kquant_stage_test qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
 
 all: $(BUILD)/llm_runner
 
@@ -160,6 +160,14 @@ $(BUILD)/bench_qwen38_kquants: $(LLM_DIR)bench_qwen38_kquants.c $(LLM_DIR)kquant
 qwen38_kquant_test: $(BUILD)/test_qwen38_kquant_cache
 $(BUILD)/test_qwen38_kquant_cache: $(LLM_DIR)test_qwen38_kquant_cache.c $(LLM_DIR)kquant_decode_cache.h $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h | $(BUILD)
 	$(CC) $(filter-out -g -rdynamic,$(CFLAGS)) $(QWEN_CFLAGS) -o $@ $(LLM_DIR)test_qwen38_kquant_cache.c $(LDFLAGS)
+
+qwen38_kquant_stage: $(BUILD)/qwen38_kquant_stage
+$(BUILD)/qwen38_kquant_stage: $(LLM_DIR)qwen38_kquant_stage.c $(LLM_DIR)qwen38_kquant_stage.h $(LLM_DIR)qwen38_tp_stage.h $(LLM_DIR)kquant_decode_cache.h $(COMMON)/ggml_dequant.h | $(BUILD)
+	$(CC) $(filter-out -g -rdynamic,$(CFLAGS)) $(QWEN_CFLAGS) -o $@ $(LLM_DIR)qwen38_kquant_stage.c $(LDFLAGS)
+
+qwen38_kquant_stage_test: $(BUILD)/test_qwen38_kquant_stage
+$(BUILD)/test_qwen38_kquant_stage: $(LLM_DIR)test_qwen38_kquant_stage.c $(LLM_DIR)qwen38_kquant_stage.h $(LLM_DIR)qwen38_tp_stage.h $(LLM_DIR)kquant_decode_cache.h $(COMMON)/ggml_dequant.h | $(BUILD)
+	$(CC) $(filter-out -g -rdynamic,$(CFLAGS)) $(QWEN_CFLAGS) -o $@ $(LLM_DIR)test_qwen38_kquant_stage.c $(LDFLAGS)
 
 qwen38_pp_runner: $(BUILD)/qwen38_pp_runner
 $(BUILD)/qwen38_pp_runner: $(LLM_DIR)qwen38_pp_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h | $(BUILD)

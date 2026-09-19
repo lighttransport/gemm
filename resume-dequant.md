@@ -1,157 +1,219 @@
-# Resume Qwen3.8 k-quant decode work
+# Goal: finish Qwen3.8 rank-local k-quant decode integration
 
-## Current state
+Continue the Qwen3.8-27B UD-Q4_K_XL A64FX work from the verified Q5R/IQ4R
+layouts and rank-local sidecar builder to a safe, measured `tp_runner` decode
+path. The finished path must preserve compact weights for prefill and fallback,
+load only the local rank's decode sidecar, retain CMG-local row ownership, and
+pass exact 128- and 256-token greedy-output gates before promotion.
 
-The exploratory Qwen3.8 Q5_K/IQ4_XS benchmark is committed in `b383fc0b`
-(`Add Qwen Q5 decode layout benchmark`). The current branch has subsequently
-advanced; do not reset it. The relevant files are:
+Do not reset the branch or discard unrelated work. Do not push without explicit
+permission in the current user request.
+
+## Definition of done
+
+The goal is complete only when all of the following are true:
+
+1. A real rank-local `Q38TP` stage can be planned and converted to a versioned
+   `Q38KQC1` sidecar with bounded memory and I/O.
+2. The TP loader validates source identity, layout version, shapes, offsets,
+   entry-table hashes, and payload hashes before making a cache entry usable.
+3. Decode dispatch uses Q5R/IQ4R only for validated compatible tensors and
+   falls back to the unchanged compact kernel for every unsupported, missing,
+   invalid, or tail case. Prefill continues to use its required compact form.
+4. Cache pages are first-touched or mapped consistently with the persistent
+   pool's row/CMG ownership; the eight-row scheduler neither crosses ownership
+   boundaries nor drops tail rows.
+5. Compact and cached paths produce identical greedy token hashes for the same
+   prompts at 128 and 256 generated tokens. Q5R's small floating-point
+   accumulation differences are not grounds to waive this token gate.
+6. A clean-node run records per-rank stage sizes, peak/steady `MemAvailable`,
+   sidecar load time, total decode tok/s, and compact-versus-cache performance.
+7. `qwen-q8.md` contains exact commands and representative correctness,
+   memory, and performance output, and the focused work is committed without
+   unrelated files.
+
+## Verified starting point
+
+The initial Q5 layout benchmark is commit `b383fc0b` and the shared exact-cache
+milestone is commit `7d37cd3c`. The current branch has advanced beyond those
+commits; they are landmarks, not reset targets.
+
+Relevant files:
 
 - `a64fx/llm/bench_qwen38_kquants.c`
-- `a64fx/llm/Makefile` (`qwen38_kquant_bench` target)
-- `qwen-q8.md`, section `Q5_K row-interleaved decode probe (2026-09-20)`
+- `a64fx/llm/kquant_decode_cache.h`
+- `a64fx/llm/test_qwen38_kquant_cache.c`
+- `a64fx/llm/qwen38_kquant_stage.[ch]`
+- `a64fx/llm/test_qwen38_kquant_stage.c`
+- `a64fx/llm/qwen38_tp_stage.h`
+- `a64fx/llm/Makefile`
+- `qwen-q8.md`, `Q5_K row-interleaved decode probe` and child sections
 
-The benchmark uses the real
-`/home/u14346/models/qwen38/27b/Qwen3.8-27B-UD-Q4_K_XL.gguf`, lazy-maps the
-GGUF, and copies only the tensor under test into HBM. It is safe to run on one
-32 GB A64FX node. Compiler scratch must use `/local`, never `/tmp`:
+The real model used for the isolated benchmark is:
+
+```text
+/home/u14346/models/qwen38/27b/Qwen3.8-27B-UD-Q4_K_XL.gguf
+```
+
+Q5R interleaves eight rows by 256 columns, expands Q5 values once, and retains
+the original affine scales/minima. It occupies 280 bytes per original
+row/block versus 176 bytes for Q5_K. IQ4R expands the original nonlinear
+palette exactly and occupies 272 bytes per row/block versus 136 bytes for
+IQ4_XS. Both layouts have version 1.
+
+Validated real layer-0 results at 2.0 GHz and 48 threads:
+
+| Projection | Compact A8 | Row-interleaved | Speedup/effective BW |
+|---|---:|---:|---:|
+| Q5_K up, 17408 x 5120 | 1.100 ms | 0.244 ms | 4.5x / 251.5 GB/s |
+| Q5_K down, 5120 x 17408 | 0.881 ms | 0.265 ms | 3.3x / 230.9 GB/s |
+| IQ4_XS gate, 17408 x 5120 | 0.466 ms | 0.213 ms | 2.2x / 222.3 GB/s |
+
+IQ4R is bit-identical to native A8 over wave, sparse, high-dynamic-range, and
+deterministic random inputs. Q5R retains native-A8 NRMSE; observed differences
+from native A8 were `2.83e-8`--about `1e-6` normalized RMS depending on shape
+and pattern, with a worst recorded absolute difference of `1.53e-5`.
+
+The metadata scan reports:
+
+```text
+model tensors=866 tensor_bytes=17.912GB Q5_K=325/12.936GB Q5R_eligible=325/20.581GB Q5R_delta=7.644GB projected=25.557GB
+IQ4_XS=65/3.078GB IQ4R_eligible=65/6.155GB IQ4R_delta=3.078GB Q5R_IQ4R_projected=28.634GB
+```
+
+A combined single-node replacement leaves only about 3.4 GB before runtime
+state, and an additive cache cannot fit. The selected design therefore builds
+a separate sidecar from each already-sharded compact `Q38TP` rank file.
+
+`qwen38_kquant_stage` writes `rankNN.kquant` through a PID-qualified partial
+file and atomic rename. Its header records rank/size, source stage identity,
+layout version, tensor metadata, and source/cache checksums. Conversion holds
+only one compact tensor and its packed result at a time, uses positioned I/O,
+and calls `POSIX_FADV_DONTNEED`. `--plan` performs no output writes. Valid
+sidecars are reused; inconsistent header metadata or hashes cause a rebuild.
+
+The bounded synthetic stage test verifies plan/build/reuse, exact Q5R/IQ4R
+payload bytes, all relevant hashes, and rebuild after deliberate header
+corruption:
+
+```text
+SENTINEL qwen38_kquant_stage=OK entries=2 q5r=2240 iq4r=2176 reuse=1 corrupt_rebuild=1
+```
+
+No real compact `rank00.blob` was present under `/local/u14346` during the
+sidecar milestone, so real per-rank planning and conversion remain required.
+The sidecar is not yet attached to `tp_runner`.
+
+## Constraints and safety rules
+
+- Read `AGENTS.md` and this entire file before changing code.
+- Use `/local/u14346/codex-research` for compiler scratch and temporary staged
+  test data. Never use `/tmp`.
+- Never `cat` or make an interactive full copy of a multi-gigabyte model.
+  Keep model and stage access lazy or bounded, use positioned/chunked I/O, and
+  discard page cache as work progresses.
+- Run `qwen38_kquant_stage --plan` and establish a per-rank compact + cache +
+  KV/state/scratch budget before building or loading real sidecars.
+- Monitor `MemAvailable`; do full-load speed work detached or in a batch job.
+- Production tuning selection must be a runner argument, not a new production
+  environment-variable switch. Environment variables may remain diagnostics.
+- Preserve compact prefill and correctness fallbacks. Never silently accept a
+  cache whose source identity, format, dimensions, offsets, or checksum fails.
+- Preserve all unrelated dirty-worktree files. In particular,
+  `common/transformer.h` already contains unrelated user changes. Inspect its
+  diff before editing it and keep this work separable; if runtime attachment
+  cannot be isolated safely, stop and ask rather than overwriting or staging
+  those changes.
+
+## Remaining work, in order
+
+1. **Revalidate the focused baseline.** Build the benchmark, shared-layout
+   test, builder, and builder test. Run both tests and one real IQ4R benchmark.
+
+2. **Exercise a real rank-local stage.** Locate or create the intended compact
+   Q38TP stage using the existing safe staging workflow. For every rank, run
+   `--plan`, record entry counts and compact/cache/combined sizes, then build
+   the sidecar with bounded memory. Do not infer the rank budget from the
+   single-node GGUF summary.
+
+3. **Add a read-only sidecar loader.** Prefer a small dedicated module so
+   validation can be tested independently of the already-dirty transformer
+   header. Validate header and entry bounds before hashing variable-length
+   tables or payloads. Match tensors by name plus source type, local shape, and
+   source checksum. Reject duplicates. Expose no pointer until its payload hash
+   succeeds. Add tests for bad magic/version/layout, truncated files, invalid
+   offsets, duplicate entries, source mismatch, and payload corruption.
+
+4. **Attach decode dispatch explicitly.** Add a runner argument for the cache
+   stage/directory and keep the default compact behavior unchanged. Route only
+   compatible Q5_K and IQ4_XS decode matvecs to `run_packed_q5r` and
+   `run_packed_iq4r`. Keep compact dispatch for prefill, missing caches,
+   unsupported dimensions, failed validation, and ownership-alignment tails.
+
+5. **Preserve NUMA/CMG placement.** Reconcile each cached tensor's eight-row
+   groups with the persistent pool's static worker ranges. Load/first-touch
+   worker-owned ranges locally or prove that the selected file mapping gives
+   equivalent placement. Add an ownership/tail test rather than relying only
+   on divisible current shapes.
+
+6. **Run correctness acceptance.** Use the same prompt and settings for compact
+   and cached paths. Require exact token hashes at 128 and 256 generated tokens.
+   Also retain the isolated multi-pattern tests so an end-to-end pass cannot
+   conceal a tensor-level regression.
+
+7. **Measure and document.** On a clean node record load/stage timings, peak
+   and steady memory, forward/decode timing, total tok/s, and per-rank storage.
+   Update `qwen-q8.md`, run `git diff --check`, stage only the focused files,
+   commit an imperative single-subsystem change, and report the hash. Do not
+   push.
+
+## Revalidation commands
 
 ```sh
 mkdir -p /local/u14346/codex-research
 TMPDIR=/local/u14346/codex-research \
-  make -B -C a64fx/llm qwen38_kquant_bench CC=fcc OPENMP=1
+  make -B -C a64fx/llm \
+  qwen38_kquant_bench qwen38_kquant_test \
+  qwen38_kquant_stage qwen38_kquant_stage_test \
+  CC=fcc OPENMP=1
+
+OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./a64fx/llm/build/test_qwen38_kquant_cache
+
+OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./a64fx/llm/build/test_qwen38_kquant_stage \
+  ./a64fx/llm/build/qwen38_kquant_stage \
+  /local/u14346/codex-research/kquant-stage-test
+
 OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
   numactl --interleave=all ./a64fx/llm/build/bench_qwen38_kquants \
-  /home/u14346/models/qwen38/27b/Qwen3.8-27B-UD-Q4_K_XL.gguf 7
+  /home/u14346/models/qwen38/27b/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  7 blk.0.ffn_gate.weight wave
 ```
 
-The useful candidate is `packed_q5r`. It interleaves eight rows by 256-column
-block, expands the 5-bit values to bytes once, and stores decoded FP32 `d` and
-`dmin` plus eight scale and minimum bytes per row/block. One packed block is:
-
-```text
-8 x 24-byte metadata headers + 8 x 256 expanded values = 2240 bytes
-```
-
-This is 280 bytes per original row/block versus 176 bytes for Q5_K, or a
-1.5909x expansion. The hot kernel retains the original affine Q5 values and
-uses the existing A8 activation quantizer.
-
-Validated layer-0 results at 2.0 GHz, 48 threads:
-
-| Projection | Native Q5_K A8 | packed_q5r | Speedup | packed_q5r effective BW |
-|---|---:|---:|---:|---:|
-| up, 17408 x 5120 | 1.100 ms | 0.244 ms | 4.5x | 251.5 GB/s |
-| down, 5120 x 17408 | 0.881 ms | 0.265 ms | 3.3x | 230.9 GB/s |
-
-Q5R retains the native A8 NRMSE against the compact-weight/FP32-activation
-reference: 0.00378 for up and 0.00367 for down. It is not bit-identical to the
-native A8 kernel: normalized RMS difference is about `1e-6`, with maximum
-absolute differences of `2.62e-6` and `4.29e-6`. End-to-end greedy-token
-agreement therefore remains a required gate.
-
-The Q8 repacks are rejected candidates, but remain in the benchmark for
-comparison. Whole-row Q8 and global-activation i32 are no faster than Q5R and
-raise NRMSE to 0.0133--0.0159. Per-64 Q8 is also no faster and has about 0.009
-NRMSE.
-
-The metadata-only footprint command is:
+For an existing real compact stage, substitute its actual directories and
+rank count only after verifying them:
 
 ```sh
-./a64fx/llm/build/bench_qwen38_kquants \
-  /home/u14346/models/qwen38/27b/Qwen3.8-27B-UD-Q4_K_XL.gguf --summary
+Q38TP_RANK=0 Q38TP_SIZE=4 ./a64fx/llm/build/qwen38_kquant_stage \
+  --plan /local/u14346/ACTUAL_COMPACT_STAGE \
+  /local/u14346/ACTUAL_KQUANT_STAGE
 ```
-
-Its validated output is:
-
-```text
-model tensors=866 tensor_bytes=17.912GB Q5_K=325/12.936GB Q5R_eligible=325/20.581GB Q5R_delta=7.644GB projected=25.557GB
-```
-
-All 325 Q5_K tensors are structurally eligible. A complete replacement image
-fits nominally in 32 GB HBM, but an additive cache does not: retaining 12.936 GB
-of original Q5_K while allocating 20.581 GB of Q5R already exceeds the node,
-before the remaining model tensors and runtime state.
-
-## Completed after the initial handoff
-
-- Added exact `packed_iq4r`: 2x compact storage, about 2.2x faster than native
-  IQ4_XS A8, and bit-identical across wave, sparse, high-dynamic-range, and
-  deterministic pseudo-random activations. All 65 real IQ4_XS tensors are
-  gate-shaped 17408 x 5120 matrices; the model has no transposed IQ4_XS case.
-- Revalidated Q5R across the same four patterns. Additional normalized
-  differences from native A8 are `2.83e-8`--`1.80e-7`; the dynamic pattern's
-  maximum absolute difference is `1.53e-5`.
-- Extracted both version-1 layouts, validated size helpers, packers, and SVE
-  kernels into `a64fx/llm/kquant_decode_cache.h`. The real-tensor benchmark now
-  consumes the shared implementation. `qwen38_kquant_test` supplies a focused
-  model-independent four-pattern test.
-- Extended `--summary`: 65 IQ4_XS tensors occupy 3.078 GB and expand to 6.155
-  GB. A combined replacement Q5R+IQ4R image projects to 28.634 GB, leaving only
-  about 3.4 GB before runtime state.
-
-## Remaining work, in priority order
-
-1. **Choose a replacement-load design before integrating the full model.** Do
-   not build a full additive Q5R cache on top of an anonymous 17.9 GB GGUF.
-   Prefer a baked/staged decode image or sidecar with a manifest, offsets,
-   source identity/hash, layout version, tensor shapes, and types. The loader
-   must be able to release or avoid faulting the original Q5_K pages. Use
-   bounded chunked I/O plus `posix_fadvise(POSIX_FADV_DONTNEED)`; never copy or
-   `cat` the complete model interactively.
-
-2. **Preserve NUMA/CMG ownership.** The benchmark first-touches row groups in
-   the same static partition used for execution. Production packing/loading
-   must retain worker-local placement. Reconcile the eight-row group schedule
-   with existing persistent-pool row ranges, and implement a safe compact
-   fallback for any non-multiple-of-eight tail rather than silently dropping
-   rows.
-
-3. **Separate decode and prefill requirements.** Q5R is a decode-oriented
-   layout. Determine whether the selected Qwen runner needs the compact tensor
-   for batched prefill. If both representations are needed, account for their
-   peak and steady-state memory explicitly; do not assume 25.557 GB tensor
-   storage leaves enough space for KV/state/scratch buffers.
-
-4. **Integrate behind an explicit runner argument or diagnostic gate.** Follow
-   the repository convention that production tuning choices are arguments,
-   not new environment-variable-selected production paths. Retain the compact
-   kernel as a correctness fallback for unsupported tensors and failed cache
-   validation.
-
-5. **Run end-to-end acceptance.** At minimum compare compact and repacked paths
-   on the same prompt for 128 and 256 greedy tokens, record token hashes, and
-   require exact token agreement. Then measure total tok/s and stage timings,
-   not only isolated matvecs. Track `MemAvailable` and abort before unsafe HBM
-   pressure. A full-load performance run should be detached or batch-run when
-   it approaches the node memory limit.
-
-6. **Update `qwen-q8.md` and commit a focused unit.** Include exact build/run
-   commands, model, compiler, thread placement, memory footprint, correctness
-   evidence, and before/after timings. Do not include unrelated DSpark, GLM5,
-   DS4F, generated binary, or log changes. Do not push without explicit
-   current-turn permission.
 
 ## Resume prompt
 
 ```text
-Continue the Qwen3.8 k-quant/dequant decode work described in
-resume-dequant.md. Start by reading the whole file, AGENTS.md, the committed
-benchmark in a64fx/llm/bench_qwen38_kquants.c, and the Q5_K work-log section in
-qwen-q8.md. Preserve all unrelated dirty-worktree changes and do not reset the
-branch; b383fc0b is the completed Q5R benchmark commit, not necessarily HEAD.
+Continue the active goal in resume-dequant.md: finish safe rank-local Q5R/IQ4R
+decode integration for Qwen3.8 on A64FX. Read AGENTS.md and the whole goal file
+first, inspect git status/diffs, and preserve every unrelated dirty-worktree
+change. The exact layouts, kernel tests, and versioned Q38KQC1 sidecar builder
+are complete; revalidate them, then continue at the first unfinished item.
 
-The exact Q5R/IQ4R layouts and multi-pattern tests are complete in
-a64fx/llm/kquant_decode_cache.h and test_qwen38_kquant_cache.c. Revalidate the
-focused test and real-tensor benchmark first, then design and implement a
-replacement staged/baked load path with a versioned manifest, source identity,
-bounded chunked I/O, and explicit memory accounting. Use
-/local/u14346/codex-research for compiler scratch and never /tmp. Keep model
-access lazy/bounded and do not make a full model copy.
-
-Do not allocate a full additive Q5R/IQ4R cache while the anonymous compact
-model is resident. Preserve worker-local NUMA/CMG placement, provide compact
-fallbacks, and resolve decode-versus-prefill representation requirements before
-a full-load run. Require 128/256-token greedy hash agreement before promotion.
-Build and test on A64FX, update qwen-q8.md with exact evidence, commit only the
-focused files, report commit hashes, and do not push.
+Do not create a full single-node additive cache. Plan real per-rank memory
+before conversion, use bounded I/O and /local/u14346/codex-research, preserve
+compact prefill/fallback, validate all sidecar metadata and payload hashes, and
+retain CMG-local row ownership. common/transformer.h has unrelated user edits,
+so isolate runtime work and never overwrite or stage those edits. Require exact
+128/256-token greedy hashes plus clean-node memory and tok/s evidence. Update
+qwen-q8.md, commit only focused files, report the commit hash, and do not push.
 ```
