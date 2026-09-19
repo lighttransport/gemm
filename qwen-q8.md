@@ -3337,3 +3337,39 @@ Q5_K storage while building the cache, and it still needs to budget model
 state and scratch buffers. The benchmark therefore establishes the kernel and
 layout result only; production integration should use a baked/staged Q5R image
 or another replacement load path rather than an additive full-model cache.
+
+### Exact IQ4_XS row interleave and shared cache layouts
+
+The corresponding exact IQ4_XS layout is also profitable. `packed_iq4r`
+decodes the original nonlinear nibbles through the unchanged 16-value palette,
+stores the original signed per-32 scales, and interleaves eight expanded rows
+by 256-column block. It uses 272 bytes per row/block versus 136 bytes for
+compact IQ4_XS, exactly 2x storage. All 65 IQ4_XS tensors in this model are
+`ffn_gate` matrices with shape 17408 x 5120; there is no transposed IQ4_XS
+tensor available for a second real-shape test.
+
+On the same 2.0 GHz, 48-thread node, layer-0 gate improved from 0.465--0.471 ms
+for native IQ4_XS A8 to 0.207--0.216 ms for IQ4R, or about 2.2x. The wave
+baseline reached 222.5 GB/s effective original-weight bandwidth. IQ4R was
+bit-identical to native A8 for wave, sparse, high-dynamic-range, and
+deterministic pseudo-random activations. Across the same four patterns, Q5R
+retained native-A8 NRMSE within `2.83e-8`--`1.80e-7` for the additional test
+cases; the high-dynamic-range maximum absolute difference was `1.53e-5`.
+
+The promoted experimental layouts now live in
+`a64fx/llm/kquant_decode_cache.h`, with layout version 1, dimension checks,
+packers, and eight-row SVE matvecs. The real-tensor benchmark consumes this
+shared implementation. `make -C a64fx/llm qwen38_kquant_test CC=fcc OPENMP=1`
+builds a model-independent synthetic check; its four patterns pass strict
+IQ4R bit identity and the Q5R numerical gate.
+
+The footprint summary now also reports:
+
+```text
+IQ4_XS=65/3.078GB IQ4R_eligible=65/6.155GB IQ4R_delta=3.078GB Q5R_IQ4R_projected=28.634GB
+```
+
+Although all IQ4_XS tensors are eligible, a combined Q5R+IQ4R image leaves
+only about 3.4 GB of nominal HBM before runtime state. It must be a replacement
+staged image rather than an additive cache, and integration needs an explicit
+KV/state/scratch budget before a full-load attempt.

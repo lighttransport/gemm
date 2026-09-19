@@ -20,6 +20,38 @@ static double seconds(void) {
     return t.tv_sec + 1e-9 * t.tv_nsec;
 }
 
+static int fill_activation(float *x, int n, const char *pattern) {
+    if (!strcmp(pattern, "wave")) {
+        for (int i = 0; i < n; i++)
+            x[i] = 0.75f * sinf((float)i * 0.0137f) +
+                   0.2f * cosf((float)i * 0.071f);
+        return 0;
+    }
+    if (!strcmp(pattern, "sparse")) {
+        for (int i = 0; i < n; i++)
+            x[i] = i % 31 == 0 ? sinf((float)i * 0.17f) : 0.0f;
+        return 0;
+    }
+    if (!strcmp(pattern, "dynamic")) {
+        for (int i = 0; i < n; i++) {
+            float magnitude = ldexpf(0.75f, i % 17 - 8);
+            x[i] = i & 1 ? -magnitude : magnitude;
+        }
+        return 0;
+    }
+    if (!strcmp(pattern, "random")) {
+        uint32_t state = 0x38f53a17u;
+        for (int i = 0; i < n; i++) {
+            state = state * 1664525u + 1013904223u;
+            x[i] = ((float)(state >> 8) * (2.0f / 16777215.0f) - 1.0f) *
+                   (0.25f + 0.75f * (float)(i % 29) / 28.0f);
+        }
+        return 0;
+    }
+    fprintf(stderr, "unknown activation pattern: %s\n", pattern);
+    return -1;
+}
+
 typedef struct {
     uint16_t d, dmin;
     uint8_t scales[12];
@@ -121,114 +153,7 @@ static void run_packed_q5(float *y, const packed_q5_block *weights,
     }
 }
 
-typedef struct {
-    float d, dmin;
-    uint8_t scales[8];
-    uint8_t mins[8];
-} packed_q5r_header;
-
-_Static_assert(sizeof(packed_q5r_header) == 24, "packed Q5R header size");
-
-static size_t packed_q5r_block_bytes(void) {
-    return 8 * sizeof(packed_q5r_header) + 8 * 256;
-}
-
-static void pack_q5r(uint8_t *dst, const block_q5_K *src, int rows, int cols) {
-    int nb = cols / 256;
-    size_t bb = packed_q5r_block_bytes();
-#pragma omp parallel for schedule(static)
-    for (int rg = 0; rg < rows / 8; rg++) {
-        for (int b = 0; b < nb; b++) {
-            uint8_t *block = dst + ((size_t)rg * nb + b) * bb;
-            packed_q5r_header *headers = (packed_q5r_header *)block;
-            int8_t *q = (int8_t *)(block + 8 * sizeof(*headers));
-            for (int rr = 0; rr < 8; rr++) {
-                const block_q5_K *wb = src + (size_t)(rg * 8 + rr) * nb + b;
-                headers[rr].d = ggml_fp16_to_fp32(wb->d);
-                headers[rr].dmin = ggml_fp16_to_fp32(wb->dmin);
-                for (int i = 0; i < 8; i++)
-                    get_scale_min_k4(i, wb->scales,
-                                     &headers[rr].scales[i], &headers[rr].mins[i]);
-                for (int g = 0; g < 4; g++) {
-                    int8_t *qrow = q + (g * 8 + rr) * 64;
-                    for (int k = 0; k < 32; k++) {
-                        uint8_t v = wb->qs[g * 32 + k];
-                        qrow[k] = (int8_t)((v & 15) |
-                            (((wb->qh[k] >> (2 * g)) & 1) << 4));
-                        qrow[32 + k] = (int8_t)((v >> 4) |
-                            (((wb->qh[k] >> (2 * g + 1)) & 1) << 4));
-                    }
-                }
-            }
-        }
-    }
-}
-
-static inline void packed_q5r_dot8(float out[8], const uint8_t *weights,
-                                   const tf_kquant_a8_block *x, int nb) {
-    const svbool_t p8 = svptrue_b8(), pg = svptrue_b32();
-    const svbool_t first8 = svwhilelt_b32(0, 8);
-    svfloat32_t a0 = svdup_f32(0), a1 = a0, a2 = a0, a3 = a0;
-    svfloat32_t a4 = a0, a5 = a0, a6 = a0, a7 = a0;
-    float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-    float c4 = 0, c5 = 0, c6 = 0, c7 = 0;
-    size_t bb = packed_q5r_block_bytes();
-    for (int b = 0; b < nb; b++) {
-        const uint8_t *block = weights + (size_t)b * bb;
-        const packed_q5r_header *headers = (const packed_q5r_header *)block;
-        const int8_t *q = (const int8_t *)(block + 8 * sizeof(*headers));
-        svint32_t i0 = svdup_s32(0), i1 = i0, i2 = i0, i3 = i0;
-        svint32_t i4 = i0, i5 = i0, i6 = i0, i7 = i0;
-        for (int g = 0; g < 4; g++) {
-            svint8_t xv = svld1_s8(p8, x[b].q + g * 64);
-#define PACKED_Q5R_ROW(R, IA, C) do { \
-    const packed_q5r_header *h = &headers[R]; \
-    uint8_t s0 = h->scales[2 * g], s1 = h->scales[2 * g + 1]; \
-    uint8_t m0 = h->mins[2 * g], m1 = h->mins[2 * g + 1]; \
-    svint32_t dot = svdot_s32(svdup_s32(0), \
-        svld1_s8(p8, q + (g * 8 + (R)) * 64), xv); \
-    IA = svmla_s32_x(pg, IA, dot, \
-        svsel_s32(first8, svdup_s32(s0), svdup_s32(s1))); \
-    C -= h->dmin * x[b].d[0] * \
-        ((float)m0 * x[b].sum[2 * g] + (float)m1 * x[b].sum[2 * g + 1]); \
-} while (0)
-            PACKED_Q5R_ROW(0, i0, c0); PACKED_Q5R_ROW(1, i1, c1);
-            PACKED_Q5R_ROW(2, i2, c2); PACKED_Q5R_ROW(3, i3, c3);
-            PACKED_Q5R_ROW(4, i4, c4); PACKED_Q5R_ROW(5, i5, c5);
-            PACKED_Q5R_ROW(6, i6, c6); PACKED_Q5R_ROW(7, i7, c7);
-#undef PACKED_Q5R_ROW
-        }
-#define PACKED_Q5R_SCALE(R, A, I) \
-    A = svmla_n_f32_x(pg, A, svcvt_f32_s32_x(pg, I), \
-        headers[R].d * x[b].d[0])
-        PACKED_Q5R_SCALE(0, a0, i0); PACKED_Q5R_SCALE(1, a1, i1);
-        PACKED_Q5R_SCALE(2, a2, i2); PACKED_Q5R_SCALE(3, a3, i3);
-        PACKED_Q5R_SCALE(4, a4, i4); PACKED_Q5R_SCALE(5, a5, i5);
-        PACKED_Q5R_SCALE(6, a6, i6); PACKED_Q5R_SCALE(7, a7, i7);
-#undef PACKED_Q5R_SCALE
-    }
-    out[0] = svaddv_f32(pg, a0) + c0; out[1] = svaddv_f32(pg, a1) + c1;
-    out[2] = svaddv_f32(pg, a2) + c2; out[3] = svaddv_f32(pg, a3) + c3;
-    out[4] = svaddv_f32(pg, a4) + c4; out[5] = svaddv_f32(pg, a5) + c5;
-    out[6] = svaddv_f32(pg, a6) + c6; out[7] = svaddv_f32(pg, a7) + c7;
-}
-
-static void run_packed_q5r(float *y, const uint8_t *weights,
-                           const float *x, int rows, int cols) {
-    int nb = cols / 256;
-    size_t row_group_bytes = (size_t)nb * packed_q5r_block_bytes();
-#pragma omp parallel
-    {
-        int tid = omp_get_thread_num(), nt = omp_get_num_threads();
-        int g0 = (rows / 8) * tid / nt;
-        int g1 = (rows / 8) * (tid + 1) / nt;
-        tf_kquant_a8_block *qx = alloca((size_t)nb * sizeof(*qx));
-        tf_kquant_quant_a8(qx, x, cols);
-        for (int g = g0; g < g1; g++)
-            packed_q5r_dot8(y + g * 8, weights + (size_t)g * row_group_bytes,
-                            qx, nb);
-    }
-}
+#include "kquant_decode_cache.h"
 
 static size_t q8r_group_bytes(int cols) { return 32 + (size_t)8*cols; }
 
@@ -402,29 +327,50 @@ static int find_tensor(const gguf_context *g, const char *name) {
 
 static void print_model_summary(const gguf_context *g) {
     size_t total_bytes = 0, q5_bytes = 0, q5r_bytes = 0;
+    size_t iq4_bytes = 0, iq4r_bytes = 0;
     uint64_t q5_count = 0, q5r_count = 0;
+    uint64_t iq4_count = 0, iq4r_count = 0;
     for (uint64_t i = 0; i < g->n_tensors; i++) {
         const gguf_tensor_info *info = &g->tensors[i];
         size_t bytes = gguf_tensor_size(g, (int)i);
         total_bytes += bytes;
-        if (info->type != GGML_TYPE_Q5_K) continue;
-        q5_count++;
-        q5_bytes += bytes;
-        if (info->n_dims == 2 && info->dims[0] % 256 == 0 &&
-            info->dims[1] % 8 == 0) {
+        if (info->type == GGML_TYPE_Q5_K) {
+            q5_count++;
+            q5_bytes += bytes;
+        } else if (info->type == GGML_TYPE_IQ4_XS) {
+            iq4_count++;
+            iq4_bytes += bytes;
+        } else {
+            continue;
+        }
+        if (info->n_dims != 2 || info->dims[0] % 256 != 0 ||
+            info->dims[1] % 8 != 0) continue;
+        if (info->type == GGML_TYPE_Q5_K) {
             size_t cols = (size_t)info->dims[0];
             size_t rows = (size_t)info->dims[1];
             q5r_count++;
             q5r_bytes += (rows / 8) * (cols / 256) * packed_q5r_block_bytes();
+        } else {
+            size_t cols = (size_t)info->dims[0];
+            size_t rows = (size_t)info->dims[1];
+            iq4r_count++;
+            iq4r_bytes += (rows / 8) * (cols / 256) * packed_iq4r_block_bytes();
         }
     }
-    size_t projected = total_bytes - q5_bytes + q5r_bytes;
+    size_t q5_projected = total_bytes - q5_bytes + q5r_bytes;
+    size_t combined_projected = q5_projected - iq4_bytes + iq4r_bytes;
     printf("model tensors=%llu tensor_bytes=%.3fGB Q5_K=%llu/%.3fGB "
            "Q5R_eligible=%llu/%.3fGB Q5R_delta=%.3fGB projected=%.3fGB\n",
            (unsigned long long)g->n_tensors, total_bytes / 1e9,
            (unsigned long long)q5_count, q5_bytes / 1e9,
            (unsigned long long)q5r_count, q5r_bytes / 1e9,
-           ((double)q5r_bytes - (double)q5_bytes) / 1e9, projected / 1e9);
+           ((double)q5r_bytes - (double)q5_bytes) / 1e9, q5_projected / 1e9);
+    printf("IQ4_XS=%llu/%.3fGB IQ4R_eligible=%llu/%.3fGB IQ4R_delta=%.3fGB "
+           "Q5R_IQ4R_projected=%.3fGB\n",
+           (unsigned long long)iq4_count, iq4_bytes / 1e9,
+           (unsigned long long)iq4r_count, iq4r_bytes / 1e9,
+           ((double)iq4r_bytes - (double)iq4_bytes) / 1e9,
+           combined_projected / 1e9);
 }
 
 static void run_rows(float *y, const void *weights, uint32_t type,
@@ -461,7 +407,8 @@ static void run_rows(float *y, const void *weights, uint32_t type,
     }
 }
 
-static int bench_tensor(const gguf_context *g, const char *name, int reps) {
+static int bench_tensor(const gguf_context *g, const char *name, int reps,
+                        const char *pattern) {
     int ti = find_tensor(g, name);
     if (ti < 0) { fprintf(stderr, "missing tensor: %s\n", name); return -1; }
     const gguf_tensor_info *info = &g->tensors[ti];
@@ -480,8 +427,7 @@ static int bench_tensor(const gguf_context *g, const char *name, int reps) {
     float *a8 = aligned_alloc(256, ((size_t)rows * sizeof(*a8) + 255) & ~(size_t)255);
     if (!weights || !x || !ref || !a8) { fprintf(stderr, "allocation failed\n"); return -1; }
     memcpy(weights, gguf_tensor_data(g, ti), bytes);
-    for (int i = 0; i < cols; i++)
-        x[i] = 0.75f * sinf((float)i * 0.0137f) + 0.2f * cosf((float)i * 0.071f);
+    if (fill_activation(x, cols, pattern)) return -1;
 
     run_rows(ref, weights, info->type, x, rows, cols, 0);
     run_rows(a8, weights, info->type, x, rows, cols, 1);
@@ -504,10 +450,10 @@ static int bench_tensor(const gguf_context *g, const char *name, int reps) {
         }
         checksum += mode ? a8[rep % rows] : ref[rep % rows];
     }
-    printf("%s type=%s shape=%dx%d bytes=%.3fMB threads=%d "
+    printf("%s type=%s shape=%dx%d pattern=%s bytes=%.3fMB threads=%d "
            "fp32=%.3fms/%.1fGB/s a8=%.3fms/%.1fGB/s speedup=%.3fx "
            "nrmse=%.3g max_rel=%.3g checksum=%g\n",
-           name, ggml_type_name(info->type), rows, cols, bytes / 1e6,
+           name, ggml_type_name(info->type), rows, cols, pattern, bytes / 1e6,
            omp_get_max_threads(), best_ref * 1e3, bytes / best_ref / 1e9,
            best_a8 * 1e3, bytes / best_a8 / 1e9, best_ref / best_a8,
            sqrt(err2 / (ref2 + 1e-30)), max_rel, checksum);
@@ -606,6 +552,45 @@ static int bench_tensor(const gguf_context *g, const char *name, int reps) {
         fflush(stdout);
         free(q8r64);
         free(native_a8);
+    } else if (rows % 8 == 0) {
+        size_t output_bytes = (size_t)rows * sizeof(*a8);
+        float *native_a8 = aligned_alloc(256, (output_bytes + 255) & ~(size_t)255);
+        if (!native_a8) { fprintf(stderr, "native A8 copy allocation failed\n"); return -1; }
+        memcpy(native_a8, a8, output_bytes);
+        size_t iq4rbytes = (size_t)(rows / 8) * (cols / 256) *
+                           packed_iq4r_block_bytes();
+        uint8_t *iq4r = aligned_alloc(256, (iq4rbytes + 255) & ~(size_t)255);
+        if (!iq4r) { fprintf(stderr, "packed IQ4R allocation failed\n"); return -1; }
+        pack_iq4r(iq4r, (const block_iq4_xs *)weights, rows, cols);
+        run_packed_iq4r(a8, iq4r, x, rows, cols);
+        double pe = 0.0, pn = 0.0;
+        double a8_err2 = 0.0, a8_norm2 = 0.0, a8_max_abs = 0.0;
+        for (int r = 0; r < rows; r++) {
+            double e = a8[r] - ref[r];
+            pe += e * e;
+            pn += (double)ref[r] * ref[r];
+            double ae = (double)a8[r] - native_a8[r];
+            double aa = fabs(ae);
+            a8_err2 += ae * ae;
+            a8_norm2 += (double)native_a8[r] * native_a8[r];
+            if (aa > a8_max_abs) a8_max_abs = aa;
+        }
+        double best = 1e9;
+        for (int rep = 0; rep < reps; rep++) {
+            double t0 = seconds();
+            run_packed_iq4r(a8, iq4r, x, rows, cols);
+            double dt = seconds() - t0;
+            if (dt < best) best = dt;
+        }
+        printf("  packed_iq4r storage=%.3fMB expansion=%.3fx time=%.3fms physical=%.1fGB/s "
+               "effective=%.1fGB/s nrmse=%.3g a8_nrmse=%.3g a8_max_abs=%.3g\n",
+               iq4rbytes / 1e6, (double)iq4rbytes / bytes, best * 1e3,
+               iq4rbytes / best / 1e9, bytes / best / 1e9,
+               sqrt(pe / (pn + 1e-30)), sqrt(a8_err2 / (a8_norm2 + 1e-30)),
+               a8_max_abs);
+        fflush(stdout);
+        free(iq4r);
+        free(native_a8);
     }
     free(a8); free(ref); free(x); free(weights);
     return 0;
@@ -613,7 +598,8 @@ static int bench_tensor(const gguf_context *g, const char *name, int reps) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s MODEL [REPS] [TENSOR]\n"
+        fprintf(stderr, "usage: %s MODEL [REPS] [TENSOR] [PATTERN]\n"
+                        "       PATTERN: wave (default), sparse, dynamic, random\n"
                         "       %s MODEL --summary\n", argv[0], argv[0]);
         return 2;
     }
@@ -627,15 +613,16 @@ int main(int argc, char **argv) {
     }
     int reps = argc > 2 ? atoi(argv[2]) : 3;
     if (reps < 1) reps = 1;
+    const char *pattern = argc > 4 ? argv[4] : "wave";
     int rc = 0;
     if (argc > 3) {
-        rc = bench_tensor(g, argv[3], reps);
+        rc = bench_tensor(g, argv[3], reps, pattern);
         gguf_close(g);
         return rc != 0;
     }
-    rc |= bench_tensor(g, "blk.0.ffn_gate.weight", reps);
-    rc |= bench_tensor(g, "blk.0.ffn_up.weight", reps);
-    rc |= bench_tensor(g, "blk.0.ffn_down.weight", reps);
+    rc |= bench_tensor(g, "blk.0.ffn_gate.weight", reps, pattern);
+    rc |= bench_tensor(g, "blk.0.ffn_up.weight", reps, pattern);
+    rc |= bench_tensor(g, "blk.0.ffn_down.weight", reps, pattern);
     gguf_close(g);
     return rc != 0;
 }
