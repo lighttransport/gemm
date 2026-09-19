@@ -46,6 +46,8 @@ For long browser runs, `POST /v1/jobs` accepts the same body and returns a job
 ID immediately. Poll `GET /v1/jobs/ID`; when its state is `complete`, fetch
 `GET /v1/jobs/ID/result`. `DELETE /v1/jobs/ID` cancels a queued request or
 terminates the active native/reference child process.
+Job status includes a monotonic `progress` percentage and a `phase` derived
+from native conditioning, diffusion, mesh, and texture milestones.
 The bounded in-memory queue defaults to four active requests and four retained
 terminal results; change it with `--retained-jobs`.
 Errors include a stable `error_code` such as `invalid_request`, `queue_full`,

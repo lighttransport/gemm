@@ -15,6 +15,7 @@ import json
 import math
 from pathlib import Path
 import queue
+import re
 import subprocess
 import tempfile
 import threading
@@ -89,31 +90,79 @@ class UploadStore:
         return resolved, paths
 
 
-def run_command(command: list[str], timeout: float,
-                cancel: threading.Event | None = None) -> subprocess.CompletedProcess:
-    if cancel is None:
+def run_command(command: list[str], timeout: float, cancel: threading.Event | None = None,
+                progress=None) -> subprocess.CompletedProcess:
+    if cancel is None and progress is None:
         return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, bufsize=1)
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def drain(stream, lines, report=False):
+        for line in iter(stream.readline, ""):
+            lines.append(line)
+            if report and progress is not None:
+                progress(line.rstrip())
+
+    readers = [threading.Thread(target=drain, args=(process.stdout, stdout_lines), daemon=True),
+               threading.Thread(target=drain, args=(process.stderr, stderr_lines, True), daemon=True)]
+    for reader in readers:
+        reader.start()
     deadline = time.monotonic() + timeout
-    while True:
-        if cancel.is_set():
+    cancelled = False
+    timed_out = False
+    while process.poll() is None:
+        if cancel is not None and cancel.is_set():
+            cancelled = True
             process.terminate()
             try:
-                process.communicate(timeout=5)
+                process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.communicate()
-            raise JobCancelled("job cancelled")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+                process.wait()
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
             process.kill()
-            process.communicate()
-            raise subprocess.TimeoutExpired(command, timeout)
-        try:
-            stdout, stderr = process.communicate(timeout=min(0.25, remaining))
-            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-        except subprocess.TimeoutExpired:
-            pass
+            process.wait()
+            break
+        time.sleep(0.1)
+    for reader in readers:
+        reader.join(timeout=5)
+    process.stdout.close()
+    process.stderr.close()
+    if cancelled:
+        raise JobCancelled("job cancelled")
+    if timed_out:
+        raise subprocess.TimeoutExpired(command, timeout,
+                                        output="".join(stdout_lines), stderr="".join(stderr_lines))
+    return subprocess.CompletedProcess(command, process.returncode,
+                                       "".join(stdout_lines), "".join(stderr_lines))
+
+
+def native_progress(line: str) -> tuple[str, int] | None:
+    """Translate stable native stderr messages into monotonic UI milestones."""
+    match = re.search(r"Pixal3D (structure|shape512|shape1024|texture): step (\d+)/(\d+)", line)
+    if match:
+        stage, step, total = match.group(1), int(match.group(2)), int(match.group(3))
+        start, span = {"structure": (3, 17), "shape512": (23, 17),
+                       "shape1024": (45, 17), "texture": (65, 17)}[stage]
+        return f"{stage} diffusion {step}/{total}", start + span * step // total
+    match = re.search(r"Pixal3D (structure|shape512|shape1024|texture): conditioning", line)
+    if match:
+        stage = match.group(1)
+        return f"{stage} conditioning", {"structure": 2, "shape512": 22,
+                                          "shape1024": 44, "texture": 64}[stage]
+    if "Pixal3D FDG:" in line:
+        return "mesh extraction", 84
+    if "Pixal3D simplify:" in line:
+        return "mesh simplification", 89
+    if "Pixal3D bake:" in line:
+        return "PBR texture baking", 94
+    if "Pixal3D inpaint:" in line:
+        return "texture inpainting", 97
+    return None
 
 
 def decode_b64(value: object, name: str, limit: int) -> bytes:
@@ -217,7 +266,7 @@ class PixalServer:
                 "limits": {"body_bytes": MAX_BODY_BYTES, "image_bytes": MAX_IMAGE_BYTES,
                            "glb_bytes": MAX_GLB_BYTES, "views": 16}, "backends": out}
 
-    def infer(self, request: dict, cancel: threading.Event | None = None) -> dict:
+    def infer(self, request: dict, cancel: threading.Event | None = None, progress=None) -> dict:
         backend = request.get("backend", self.args.backend)
         if backend not in ("cpu", "cuda", "rocm"):
             raise ValueError("backend must be cpu, cuda, or rocm")
@@ -297,7 +346,7 @@ class PixalServer:
                 cmd += ["--mask", str(mask_path)]
             started = time.monotonic()
             try:
-                proc = run_command(cmd, self.args.timeout, cancel)
+                proc = run_command(cmd, self.args.timeout, cancel, progress)
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(f"inference exceeded {self.args.timeout:g}s") from exc
             if proc.returncode != 0:
@@ -416,7 +465,7 @@ class JobQueue:
                               key=lambda j: j["updated_at"])
             while len(terminal) >= self.retained:
                 self.jobs.pop(terminal.pop(0)["id"], None)
-            self.jobs[job_id] = {"id": job_id, "state": "queued", "phase": "queued",
+            self.jobs[job_id] = {"id": job_id, "state": "queued", "phase": "queued", "progress": 0,
                                  "created_at": now, "updated_at": now, "request": request,
                                  "_cancel": threading.Event(), "_uploads": upload_paths}
         self.pending.put(job_id)
@@ -466,18 +515,26 @@ class JobQueue:
                     if job["state"] == "cancelled":
                         continue
                     request = job["request"]
-                self._update(job_id, state="running", phase="native inference", started_at=time.time())
+                self._update(job_id, state="running", phase="starting native inference",
+                             progress=1, started_at=time.time())
                 cancel = job["_cancel"]
-                result = self.pixal.infer(request, cancel)
+                def report(line):
+                    update = native_progress(line)
+                    if update:
+                        phase, percent = update
+                        with self.lock:
+                            previous = self.jobs[job_id].get("progress", 0)
+                        self._update(job_id, phase=phase, progress=max(previous, percent))
+                result = self.pixal.infer(request, cancel, report)
                 with self.lock:
                     cancelled = self.jobs[job_id].get("cancel_requested", False)
                 if cancelled:
                     self._update(job_id, state="cancelled", phase="cancelled")
                     continue
                 if request.get("reference"):
-                    self._update(job_id, phase="PyTorch reference")
+                    self._update(job_id, phase="PyTorch reference", progress=98)
                     result["reference"] = self.pixal.reference(request, cancel)
-                self._update(job_id, state="complete", phase="complete", result=result,
+                self._update(job_id, state="complete", phase="complete", progress=100, result=result,
                              completed_at=time.time())
             except JobCancelled:
                 self._update(job_id, state="cancelled", phase="cancelled",

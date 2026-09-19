@@ -124,7 +124,8 @@ class PixalServerTest(unittest.TestCase):
 
     def test_job_queue_reports_phase_and_result(self):
         class FakePixal:
-            def infer(self, request, cancel=None):
+            def infer(self, request, cancel=None, progress=None):
+                progress("Pixal3D shape1024: step 6/12")
                 return {"ok": True, "value": request["value"]}
             def reference(self, request, cancel=None):
                 return {"value": "reference"}
@@ -139,12 +140,13 @@ class PixalServerTest(unittest.TestCase):
                 break
             time.sleep(0.01)
         self.assertEqual(status["phase"], "complete")
+        self.assertEqual(status["progress"], 100)
         self.assertEqual(status["result"]["value"], 7)
         self.assertEqual(status["result"]["reference"]["value"], "reference")
 
     def test_job_failure_has_stable_error_code(self):
         class InvalidPixal:
-            def infer(self, request, cancel=None):
+            def infer(self, request, cancel=None, progress=None):
                 raise ValueError("bad camera")
         jobs = app.JobQueue(InvalidPixal(), retained=1)
         job = jobs.submit({})
@@ -160,7 +162,7 @@ class PixalServerTest(unittest.TestCase):
     def test_queued_job_can_be_cancelled(self):
         gate = __import__("threading").Event()
         class BlockingPixal:
-            def infer(self, request, cancel=None):
+            def infer(self, request, cancel=None, progress=None):
                 gate.wait(2)
                 return {"ok": True}
             def reference(self, request, cancel=None):
@@ -188,6 +190,16 @@ class PixalServerTest(unittest.TestCase):
         timer.cancel()
         self.assertLess(time.monotonic() - started, 2)
 
+    def test_native_progress_streaming(self):
+        updates = []
+        command = [sys.executable, "-c",
+                   "import sys; print('Pixal3D structure: conditioning 512x512, 4096 tokens', file=sys.stderr, flush=True); print('Pixal3D structure: step 6/12', file=sys.stderr, flush=True)"]
+        result = app.run_command(command, timeout=5, progress=updates.append)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual([app.native_progress(line) for line in updates],
+                         [("structure conditioning", 2), ("structure diffusion 6/12", 11)])
+        self.assertEqual(app.native_progress("unrelated diagnostic"), None)
+
     def test_raw_upload_is_consumed_and_cleaned(self):
         scratch = app.ROOT / "tmp/pixal3d/tests"
         scratch.mkdir(parents=True, exist_ok=True)
@@ -196,7 +208,7 @@ class PixalServerTest(unittest.TestCase):
             upload_id = uploads.put(b"raw-image")
 
             class UploadPixal:
-                def infer(self, request, cancel=None):
+                def infer(self, request, cancel=None, progress=None):
                     self.path = request["image_b64"]
                     return {"ok": True, "bytes": app.decode_b64(
                         self.path, "image_b64", app.MAX_IMAGE_BYTES).decode()}

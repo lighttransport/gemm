@@ -66,7 +66,7 @@ async function runJob(body){
   for(;;){
     const statusResponse=await fetch('/v1/jobs/'+activeJobId),job=await statusResponse.json();
     if(!statusResponse.ok)throw new Error(job.error||'Could not read job status');
-    $('status').textContent=job.state==='queued'?'Queued · position '+job.queue_position:job.phase+'…';
+    $('status').textContent=job.state==='queued'?'Queued · position '+job.queue_position:job.phase+' · '+(job.progress??0)+'%';
     if(job.state==='failed')throw new Error(job.error||'Inference failed');
     if(job.state==='cancelled')throw new Error('Job cancelled');
     if(job.state==='complete'){
