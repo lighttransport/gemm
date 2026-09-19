@@ -99,8 +99,9 @@ RoPE is reconstructed from coordinates.
 
 Supply an RGBA image, or an RGB image plus a same-size foreground mask. Supply
 horizontal FOV in radians for the cropped input. Foreground cropping, Lanczos
-resizing, black compositing and camera projection follow upstream. Automatic
-BiRefNet masking and MoGe camera estimation are outside this first implementation.
+resizing, black compositing and camera projection follow upstream. The native API
+keeps these inputs explicit. The project reference helper and web server can add
+RMBG-2.0 alpha and estimate FOV/distance with MoGe-2 before invoking the native CLI.
 
 ```sh
 cpu/pixal3d/pixal3d --backend cuda \

@@ -28,6 +28,8 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL_DIR = Path("/mnt/disk2/models/Pixal3D")
 DEFAULT_DINOV3 = Path("/mnt/disk2/models/dinov3-vitl16/model.safetensors")
 DEFAULT_NAF = ROOT / "ref/pixal3d/weights/naf_release.safetensors"
+DEFAULT_RMBG = Path("/mnt/disk2/models/RMBG-2.0")
+DEFAULT_MOGE = Path("/mnt/disk2/models/moge-2-vitl/model.pt")
 MAX_BODY_BYTES = 256 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_GLB_BYTES = 256 * 1024 * 1024
@@ -43,6 +45,17 @@ class QueueFull(Exception):
 
 def error_payload(code: str, message: str) -> dict:
     return {"ok": False, "error": message, "error_code": code}
+
+
+def reference_request(request: dict, native_result: dict) -> dict:
+    """Carry resolved automatic camera values into the comparison run."""
+    resolved = copy.deepcopy(request)
+    preparation = native_result.get("preparation")
+    if preparation and "fov" in preparation:
+        resolved["fov"] = preparation["fov"]
+        resolved["distance"] = preparation["distance"]
+        resolved["auto_camera"] = False
+    return resolved
 
 
 class UploadStore:
@@ -208,6 +221,12 @@ def bounded_integer(value: object, name: str, lo: int, hi: int) -> int:
     return out
 
 
+def boolean(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
 def camera_matrix(value: object, name: str) -> list[list[float]]:
     if not (isinstance(value, list) and len(value) == 4 and
             all(isinstance(row, list) and len(row) == 4 for row in value)):
@@ -231,6 +250,11 @@ def model_ready(model_dir: Path, dino: Path, naf: Path) -> bool:
     return True
 
 
+def rmbg_ready(path: Path) -> bool:
+    return ((path / "config.json").is_file() and
+            (any(path.glob("*.safetensors")) or any(path.glob("pytorch_model*.bin"))))
+
+
 class PixalServer:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -238,12 +262,15 @@ class PixalServer:
         self.model_dir = Path(args.model_dir).resolve()
         self.dinov3 = Path(args.dinov3).resolve()
         self.naf = Path(args.naf).resolve()
+        self.rembg = Path(getattr(args, "rembg", DEFAULT_RMBG)).resolve()
+        self.moge = Path(getattr(args, "moge", DEFAULT_MOGE)).resolve()
         self.work_dir = Path(args.work_dir).resolve()
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.locks = {backend: threading.Lock() for backend in ("cpu", "cuda", "rocm")}
         self.reference_script = ROOT / "ref/pixal3d/upstream/inference.py"
         self.reference_mv_script = ROOT / "ref/pixal3d/upstream/inference_mv.py"
         self.reference_launcher = ROOT / "ref/pixal3d/run.sh"
+        self.prepare_script = ROOT / "ref/pixal3d/prepare_input.py"
 
     def health(self) -> dict:
         lib = {
@@ -263,6 +290,8 @@ class PixalServer:
                 "default_gpu_execution": self.args.gpu_execution,
                 "default_gpu_kernels": self.args.gpu_kernels,
                 "default_gpu_flow_precision": self.args.gpu_flow_precision,
+                "preparation": {"mask_ready": rmbg_ready(self.rembg),
+                                "camera_ready": self.moge.is_file()},
                 "limits": {"body_bytes": MAX_BODY_BYTES, "image_bytes": MAX_IMAGE_BYTES,
                            "glb_bytes": MAX_GLB_BYTES, "views": 16}, "backends": out}
 
@@ -274,6 +303,12 @@ class PixalServer:
         views = request.get("views") if multiview else None
         if multiview and (not isinstance(views, list) or not 1 <= len(views) <= 16):
             raise ValueError("views must contain 1 to 16 posed images")
+        auto_mask = boolean(request.get("auto_mask", False), "auto_mask")
+        auto_camera = boolean(request.get("auto_camera", False), "auto_camera")
+        if multiview and auto_camera:
+            raise ValueError("auto_camera is only available for single-view inference")
+        if auto_camera and not self.moge.is_file():
+            raise ValueError(f"automatic camera estimation is unavailable; missing MoGe model: {self.moge}")
         image = None if multiview else decode_b64(request.get("image_b64"), "image_b64", MAX_IMAGE_BYTES)
         mask = None if multiview else (decode_b64(request["mask_b64"], "mask_b64", MAX_IMAGE_BYTES) if request.get("mask_b64") else None)
         ext = str(request.get("image_ext", ".png")).lower()
@@ -296,20 +331,41 @@ class PixalServer:
             run_dir = Path(td)
             output_path = run_dir / "output.glb"
             ply_path = run_dir / "output.ply"
+            preparation = None
             mask_path = None
             if multiview:
                 frames = []
+                view_preparation = []
                 for index, item in enumerate(views):
                     if not isinstance(item, dict):
                         raise ValueError("each view must be an object")
                     data = decode_b64(item.get("image_b64"), f"views[{index}].image_b64", MAX_IMAGE_BYTES)
                     name = f"view{index:02d}.png"
-                    (run_dir / name).write_bytes(data)
+                    view_path = run_dir / name
+                    view_path.write_bytes(data)
                     matrix = camera_matrix(item.get("transform_matrix"), f"views[{index}].transform_matrix")
                     frame = {"file_path": name, "transform_matrix": matrix}
                     if item.get("fov") is not None:
                         frame["camera_angle_x"] = finite_number(item["fov"], f"views[{index}].fov", 0.05, 3.14)
+                    if auto_mask:
+                        prepared = run_dir / f"view{index:02d}-prepared.png"
+                        metadata = run_dir / f"view{index:02d}-prepared.json"
+                        prep = [str(self.reference_launcher), backend, str(self.prepare_script),
+                                "--input", str(view_path), "--output", str(prepared),
+                                "--metadata", str(metadata), "--rembg-model", str(self.rembg),
+                                "--fov", str(frame.get("camera_angle_x", fov)),
+                                "--mesh-scale", str(mesh_scale), "--device",
+                                "cpu" if backend == "cpu" else "cuda"]
+                        proc = run_command(prep, self.args.reference_timeout, cancel)
+                        if proc.returncode:
+                            raise RuntimeError((proc.stderr or proc.stdout).strip()[-4000:])
+                        frame["file_path"] = prepared.name
+                        item_preparation = json.loads(metadata.read_text())
+                        item_preparation["view"] = index
+                        view_preparation.append(item_preparation)
                     frames.append(frame)
+                if view_preparation:
+                    preparation = {"views": view_preparation}
                 (run_dir / "transforms.json").write_text(json.dumps({"camera_angle_x": fov, "mesh_scale": mesh_scale, "frames": frames}))
                 cmd = [str(self.binary), "--backend", backend, "--views-dir", str(run_dir), "--output", str(output_path),
                        "--seed", str(seed), "--model-dir", str(self.model_dir), "--dinov3", str(self.dinov3), "--naf", str(self.naf)]
@@ -319,6 +375,28 @@ class PixalServer:
                 if mask is not None:
                     mask_path = run_dir / "mask.png"
                     mask_path.write_bytes(mask)
+                if auto_mask or auto_camera:
+                    prepared = run_dir / "prepared.png"
+                    metadata = run_dir / "prepared.json"
+                    prep = [str(self.reference_launcher), backend, str(self.prepare_script),
+                            "--input", str(image_path), "--output", str(prepared),
+                            "--metadata", str(metadata), "--mesh-scale", str(mesh_scale),
+                            "--device", "cpu" if backend == "cpu" else "cuda"]
+                    if mask_path:
+                        prep += ["--mask", str(mask_path)]
+                    if auto_mask:
+                        prep += ["--rembg-model", str(self.rembg)]
+                    if auto_camera:
+                        prep += ["--moge-model", str(self.moge)]
+                    else:
+                        prep += ["--fov", str(fov)]
+                    proc = run_command(prep, self.args.reference_timeout, cancel)
+                    if proc.returncode:
+                        raise RuntimeError((proc.stderr or proc.stdout).strip()[-4000:])
+                    preparation = json.loads(metadata.read_text())
+                    image_path = prepared
+                    mask_path = None
+                    fov, distance = preparation["fov"], preparation["distance"]
                 cmd = [str(self.binary), "--backend", backend, "--input", str(image_path), "--output", str(output_path),
                        "--fov", str(fov), "--distance", str(distance), "--mesh-scale", str(mesh_scale), "--seed", str(seed),
                        "--model-dir", str(self.model_dir), "--dinov3", str(self.dinov3), "--naf", str(self.naf)]
@@ -372,6 +450,8 @@ class PixalServer:
                       "profile": json.loads(profile.read_text()) if profile.is_file() else {}}
             if include_ply:
                 result["ply_b64"] = base64.b64encode(ply_path.read_bytes()).decode("ascii")
+            if preparation is not None:
+                result["preparation"] = preparation
             return result
 
     def reference(self, request: dict, cancel: threading.Event | None = None) -> dict:
@@ -390,7 +470,7 @@ class PixalServer:
         if ext not in (".png", ".jpg", ".jpeg", ".webp"):
             ext = ".png"
         fov = finite_number(request.get("fov", 0.857556), "fov", 0.05, 3.14)
-        seed = int(request.get("seed", 42))
+        seed = bounded_integer(request.get("seed", 42), "seed", 0, 2**32 - 1)
         with self.locks[backend], tempfile.TemporaryDirectory(prefix="reference-", dir=self.work_dir) as td:
             run_dir = Path(td)
             output_path = run_dir / "reference.glb"
@@ -533,7 +613,7 @@ class JobQueue:
                     continue
                 if request.get("reference"):
                     self._update(job_id, phase="PyTorch reference", progress=98)
-                    result["reference"] = self.pixal.reference(request, cancel)
+                    result["reference"] = self.pixal.reference(reference_request(request, result), cancel)
                 self._update(job_id, state="complete", phase="complete", progress=100, result=result,
                              completed_at=time.time())
             except JobCancelled:
@@ -609,7 +689,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response(202, self.server.jobs.submit(request)); return
             result = self.server.pixal.infer(request)
             if request.get("reference"):
-                result["reference"] = self.server.pixal.reference(request)
+                result["reference"] = self.server.pixal.reference(reference_request(request, result))
             self.json_response(200, result)
         except QueueFull as exc: self.json_response(429, error_payload("queue_full", str(exc)))
         except TimeoutError as exc: self.json_response(504, error_payload("timeout", str(exc)))
@@ -636,6 +716,7 @@ def main() -> None:
     p.add_argument("--backend", choices=("cpu", "cuda", "rocm"), default="cuda")
     p.add_argument("--binary", default=str(ROOT / "cpu/pixal3d/pixal3d")); p.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
     p.add_argument("--dinov3", default=str(DEFAULT_DINOV3)); p.add_argument("--naf", default=str(DEFAULT_NAF))
+    p.add_argument("--rembg", default=str(DEFAULT_RMBG)); p.add_argument("--moge", default=str(DEFAULT_MOGE))
     p.add_argument("--work-dir", default=str(ROOT / "tmp/pixal3d/web-runs")); p.add_argument("--threads", type=int, default=0); p.add_argument("--timeout", type=float, default=7200); p.add_argument("--reference-timeout", type=float, default=10800)
     p.add_argument("--retained-jobs", type=int, default=4)
     p.add_argument("--retained-uploads", type=int, default=64)

@@ -221,6 +221,31 @@ ref/pixal3d/run.sh cpu ref/pixal3d/manifest.py --full-hash \
   --output tmp/pixal3d/model-manifest.json
 ```
 
+Automatic single-view preparation uses the upstream RMBG-2.0 and MoGe-2
+semantics without loading the Pixal3D generation stack. Fetch the pinned source
+and locally available checkpoints, then emit an RGBA image and resolved camera
+metadata with:
+
+```sh
+ref/pixal3d/run.sh cpu ref/pixal3d/prepare_refs.py
+ref/pixal3d/run.sh cpu ref/pixal3d/prepare_auto_models.py \
+  --model-root /mnt/disk2/models
+ref/pixal3d/run.sh cuda ref/pixal3d/prepare_input.py \
+  --input input.png --output tmp/pixal3d/prepared.png \
+  --metadata tmp/pixal3d/prepared.json \
+  --rembg-model /mnt/disk2/models/RMBG-2.0 \
+  --moge-model /mnt/disk2/models/moge-2-vitl/model.pt
+```
+
+RMBG-2.0 is gated by its publisher and needs an authorized Hugging Face account.
+Images that already have non-opaque alpha do not load RMBG. The MoGe-2 checkpoint
+is pinned to revision `39c4d5e9` and SHA-256 `3eefd4ab...e0111cd5`; on the upstream
+house asset it estimated FOV `0.6061274` radians and distance `1.598996` on the
+RTX 5060 Ti. The pinned upstream helper matched within `1.14e-8` radians and
+`2.3e-16` distance. Reproduce that comparison with `validate_auto_camera.py`.
+`test_prepare_input.py` covers alpha preservation, explicit masks, manual camera
+resolution, metadata, and the missing-mask diagnostic without model weights.
+
 Completed during implementation on this host:
 
 | Check | Representative result |

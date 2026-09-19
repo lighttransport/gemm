@@ -24,6 +24,17 @@
     "url": "https://github.com/microsoft/TRELLIS.2.git",
     "revision": "75fbf0183001ed9876c8dbb35de6b68552ee08bd"
   },
+  "moge2": {
+    "url": "https://github.com/microsoft/MoGe.git",
+    "revision": "b942f00bdc2a2a23ebb474fbe034d487e6dcceec",
+    "model": "Ruicheng/moge-2-vitl",
+    "model_revision": "39c4d5e957afe587e04eec59dc2bcc3be5ecd968",
+    "model_sha256": "3eefd4abb2102f38f12b2d1992e5ff15e4923e5431c67dd494afe157e0111cd5"
+  },
+  "rmbg": {
+    "model": "briaai/RMBG-2.0",
+    "revision": "5df4c9c76d8170882c34f6986e848ee07fd0ba43"
+  },
   "naf_checkpoint_sha256": "c096c1ab2217a5c3ac136365f721685e2201379cb69d509cfb0261183847c98f",
   "opencv_inpaint": {
     "url": "https://github.com/opencv/opencv/blob/4.12.0/modules/photo/src/inpaint.cpp",

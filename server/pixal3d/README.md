@@ -42,6 +42,15 @@ requires an image without a separate mask upload. The browser displays native
 AMD and PyTorch reference meshes side by side or as an opacity overlay.
 `GET /health` reports binary, GPU-library, and model readiness.
 
+For single-view requests, `auto_mask: true` uses the pinned RMBG-2.0 reference
+when the image lacks useful alpha, and `auto_camera: true` estimates horizontal
+FOV with pinned MoGe-2. The response includes resolved values and sources in
+`preparation`. Multiview accepts automatic masking while retaining calibrated
+FOV and transforms from its manifest. Configure model locations with `--rembg`
+and `--moge`; `/health` reports each preparation model separately. RMBG-2.0 is
+gated by its publisher and requires an authorized Hugging Face account when
+running `prepare_auto_models.py`.
+
 For long browser runs, `POST /v1/jobs` accepts the same body and returns a job
 ID immediately. Poll `GET /v1/jobs/ID`; when its state is `complete`, fetch
 `GET /v1/jobs/ID/result`. `DELETE /v1/jobs/ID` cancels a queued request or

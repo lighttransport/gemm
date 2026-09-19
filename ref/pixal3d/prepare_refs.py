@@ -9,7 +9,8 @@ from safetensors.torch import save_file
 
 root=Path(__file__).resolve().parent
 sources=json.loads((root/'sources.json').read_text())
-for name,directory in [('pixal3d','upstream'),('naf','naf-upstream'),('cumesh','cumesh-upstream'),('flexgemm','flexgemm-upstream')]:
+for name,directory in [('pixal3d','upstream'),('naf','naf-upstream'),('cumesh','cumesh-upstream'),
+                       ('flexgemm','flexgemm-upstream'),('moge2','moge-upstream')]:
     source=sources[name];dest=root/directory
     if not dest.exists():
         dest.mkdir()

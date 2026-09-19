@@ -48,6 +48,7 @@ def main():
         for marker in ("Pixal3D Studio", 'id="view-folder"', 'id="camera-map"',
                        'id="texture-size"', 'id="triangle-target"', 'id="cancel"',
                        'id="include-ply"', 'id="ply-download"',
+                       'id="auto-mask"', 'id="auto-camera"',
                        "'/v1/uploads'", "CUDA: ready · multiview"):
             assert marker in document, marker
         print("Pixal3D browser UI smoke test: PASS")

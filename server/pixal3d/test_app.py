@@ -34,6 +34,12 @@ class PixalServerTest(unittest.TestCase):
 
             def native_run(command, **kwargs):
                 output = Path(command[command.index("--output") + 1])
+                if str(server.prepare_script) in command:
+                    output.write_bytes(b"prepared-rgba")
+                    Path(command[command.index("--metadata") + 1]).write_text(json.dumps(
+                        {"fov": 0.8, "distance": 1.2, "mesh_scale": 1.25,
+                         "mask_source": "alpha", "camera_source": "manual"}))
+                    return subprocess.CompletedProcess(command, 0, "{}\n", "")
                 ply_output = Path(command[command.index("--ply-output") + 1])
                 views_dir = Path(command[command.index("--views-dir") + 1])
                 captured["command"] = command
@@ -52,6 +58,7 @@ class PixalServerTest(unittest.TestCase):
                 "seed": 7, "device": 0, "vram_budget_mib": 12288,
                 "texture_size": 2048, "triangle_target": 500000,
                 "include_ply": True,
+                "auto_mask": True,
                 "mesh_scale": 1.25, "fov": 0.8,
                 "views": [
                     {"image_b64": encoded, "transform_matrix": IDENTITY},
@@ -64,6 +71,8 @@ class PixalServerTest(unittest.TestCase):
 
         self.assertEqual(base64.b64decode(result["glb_b64"]), b"glTF-test")
         self.assertEqual(base64.b64decode(result["ply_b64"]), b"ply-test")
+        self.assertEqual(len(result["preparation"]["views"]), 2)
+        self.assertEqual(result["preparation"]["views"][1]["view"], 1)
         self.assertEqual(result["stats"], {"views": 2})
         self.assertEqual(result["profile"]["peak_vram_mib"], 1024)
         self.assertIn("--views-dir", captured["command"])
@@ -82,6 +91,14 @@ class PixalServerTest(unittest.TestCase):
             app.bounded_integer(1.5, "device", 0, 255)
         with self.assertRaisesRegex(ValueError, "finite"):
             app.camera_matrix([[float("nan")] * 4 for _ in range(4)], "camera")
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            app.boolean("yes", "auto_camera")
+        resolved = app.reference_request(
+            {"fov": 0.8, "auto_camera": True},
+            {"preparation": {"fov": 0.6, "distance": 1.5}})
+        self.assertEqual((resolved["fov"], resolved["distance"], resolved["auto_camera"]),
+                         (0.6, 1.5, False))
+        self.assertFalse(app.rmbg_ready(Path("/missing/rmbg")))
         scratch = app.ROOT / "tmp/pixal3d/tests"
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="web-", dir=scratch) as td:
@@ -89,6 +106,40 @@ class PixalServerTest(unittest.TestCase):
             encoded = base64.b64encode(b"image-data").decode()
             with self.assertRaisesRegex(ValueError, "include_ply"):
                 server.infer({"image_b64": encoded, "include_ply": "yes"})
+
+    def test_automatic_camera_prepares_native_input(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        commands = []
+        with tempfile.TemporaryDirectory(prefix="prepare-", dir=scratch) as td:
+            server = self.make_server(Path(td))
+            server.moge = Path("/mnt/disk2/models/moge-2-vitl/model.pt")
+
+            def run(command, **kwargs):
+                commands.append(command)
+                output = Path(command[command.index("--output") + 1])
+                if str(server.prepare_script) in command:
+                    output.write_bytes(b"prepared-rgba")
+                    metadata = Path(command[command.index("--metadata") + 1])
+                    metadata.write_text(json.dumps({"fov": 0.6, "distance": 1.5,
+                                                    "mesh_scale": 1.0,
+                                                    "mask_source": "alpha",
+                                                    "camera_source": "moge-2"}))
+                    return subprocess.CompletedProcess(command, 0, "{}\n", "")
+                output.write_bytes(b"glTF-auto")
+                Path(command[command.index("--profile-json") + 1]).write_text("{}")
+                return subprocess.CompletedProcess(command, 0, "{}\n", "")
+
+            request = {"backend": "cuda", "image_b64": base64.b64encode(b"rgba").decode(),
+                       "auto_camera": True}
+            with mock.patch.object(app.subprocess, "run", side_effect=run):
+                result = server.infer(request)
+
+        self.assertEqual(result["preparation"]["camera_source"], "moge-2")
+        native = commands[1]
+        self.assertEqual(native[native.index("--input") + 1].split("/")[-1], "prepared.png")
+        self.assertEqual(native[native.index("--fov") + 1], "0.6")
+        self.assertEqual(native[native.index("--distance") + 1], "1.5")
 
     def test_multiview_reference_uses_pinned_entry_point(self):
         scratch = app.ROOT / "tmp/pixal3d/tests"
