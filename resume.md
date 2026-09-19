@@ -1,5 +1,28 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Native DFlash2 experiment (2026-09-20)
+
+The runner now loads the IncoAI Qwen3.8-27B DFlash2 Q4_K_M sidecar and runs
+its five-layer block-diffusion graph entirely through HIP.  Target inputs from
+layers 6/20/34/48/62 seed a private 2048-token draft KV ring.  The rank-256,
+top-16 selector proposes up to seven tokens, while the existing exact Q8/Q8
+target window remains the only source of emitted tokens and committed state.
+
+On the 4096-token C clamp prompt, K=4 accepted 37/40 drafts and K=7 accepted
+41/42.  Both produced the ordinary target's exact 46-token response, EOS and
+sequence hash `15f17d2640c1adfc`; the emitted C is coherent and compilable.
+K=7 measured 32.04 tok/s decode and 449.07 tok/s prefill, versus 37.82 and
+489.49 tok/s for ordinary native execution.  K=4 measured 30.37 and 451.22.
+The upstream llama.cpp server path measured 16.54 tok/s at K=4 with the same
+37/40 acceptance, versus its 25.88 tok/s baseline.  Native drafting is much
+faster than upstream but still loses to ordinary native decode because exact
+target multi-row projections do not yet reuse enough weights.  Keep it opt-in.
+
+CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
+requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
+and `--kv-cache q8q8`.  Details and the reproduction command:
+[QWEN38_DFLASH2.md](rdna4/llm/QWEN38_DFLASH2.md).
+
 ## Long-context Q8/Q8 prefill (2026-09-20)
 
 The IQ2 runner now sustains **413.25 tok/s** while processing 65,536 random

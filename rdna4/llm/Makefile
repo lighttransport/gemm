@@ -80,6 +80,9 @@ reference_sampler.o: reference_sampler.cpp reference_sampler.h
 qwen35_attention_q8.inc: qwen35_attention_q8.hip
 	python3 -c 'import json,pathlib; print("static const char qwen35_attention_q8_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
 
+qwen35_dflash2.inc: qwen35_dflash2.hip
+	python3 -c 'import json,pathlib; print("static const char qwen35_dflash2_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
+
 qwen35_matvec_q2k.inc: qwen35_matvec_q2k.hip
 	python3 -c 'import json,pathlib; print("static const char qwen35_matvec_q2k_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
 
@@ -87,7 +90,7 @@ qwen35_matvec_iq.inc: qwen35_matvec_iq.hip embed_hip_source.py qwen35_iq2xxs_gri
 	python3 embed_hip_source.py $< qwen35_matvec_iq_source > $@
 
 # Other test executables include the runner translation unit directly.
-HIPRTC_INCLUDES = qwen35_attention_q8.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc qwen35_reference_math.h qwen35_nextn.h
+HIPRTC_INCLUDES = qwen35_attention_q8.inc qwen35_dflash2.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc qwen35_reference_math.h qwen35_nextn.h qwen35_dflash2.h
 $(TARGET) tmp/test_hip_qwen4_moe_stage tmp/test_hip_qwen4_moe_stage_large tmp/test_hip_qwen4_attention test_glm5next_nextn: $(HIPRTC_INCLUDES)
 
 LLAMA_REFERENCE ?= ../../tmp/qwen38/reference-build
@@ -247,7 +250,7 @@ bench_cpu_qwen_expert: bench_cpu_qwen_expert.c
 	$(CC) -O3 -Wall -Wextra -march=native -fopenmp -o $@ $< -ldl -lm
 
 clean:
-	rm -f $(TARGET) test_fattn_vec_half2 bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full test_glm5next_cpu_runtime test_glm5next_nextn mm_blaslt_bridge.o reference_sampler.o cuda_moe_bridge.o qwen35_attention_q8.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc
+	rm -f $(TARGET) test_fattn_vec_half2 bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full test_glm5next_cpu_runtime test_glm5next_nextn mm_blaslt_bridge.o reference_sampler.o cuda_moe_bridge.o qwen35_attention_q8.inc qwen35_dflash2.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc
 
 help:
 	@echo "HIP LLM Runner (HIPRTC-based, no hipcc needed)"

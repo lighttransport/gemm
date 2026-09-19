@@ -177,6 +177,15 @@ int hip_llm_qwen35_mtp_propose(hip_llm_runner *r, int32_t anchor, int position,
 float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
                                 int rows, int position);
 int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed);
+
+/* Qwen3.8 DFlash2 block-diffusion drafter. Target verification remains exact;
+ * only verified target tokens are committed to the caller. */
+int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
+                               char *error, size_t error_cap);
+int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
+                                  int position, int count, int32_t *drafts);
+int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,
+                                 int processed);
 /* Run target forward and return only the greedy token; avoids a full-vocab
  * device-to-host copy during speculative verification. */
 int hip_llm_forward_argmax(hip_llm_runner *r, int32_t token_id, int position);

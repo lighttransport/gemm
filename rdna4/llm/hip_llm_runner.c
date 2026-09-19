@@ -67,6 +67,7 @@ static double hllm_monotonic_ms(void) {
 #include "qwen35_matvec_q2k.inc"
 #include "qwen35_matvec_iq.inc"
 #include "qwen35_attention_q8.inc"
+#include "qwen35_dflash2.inc"
 
 #ifdef LLM_HIPBLASLT_ENABLED
 #include "mm_blaslt_bridge.h"
@@ -13472,6 +13473,7 @@ struct hip_llm_runner {
     void *d_native_argmax_scores, *d_native_argmax_indices;
     hipModule_t iq_module;
     struct hllm_qwen35_mtp *qwen35_mtp;
+    struct hllm_qwen35_dflash2 *qwen35_dflash2;
     hipFunction_t fn_qwen35_matvec_iq2xxs, fn_qwen35_matvec_iq2xs;
     hipFunction_t fn_qwen35_matvec_iq2s, fn_qwen35_matvec_iq3xxs, fn_qwen35_matvec_iq3s;
     hipFunction_t fn_qwen35_matvec_iq4xs;
@@ -28304,11 +28306,14 @@ static int embed_tokens_batch(hip_llm_runner *r, const int32_t *tokens, int M);
 static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                        int position_start,
                                        const int32_t *token_ids);
+static void hllm_qwen35_dflash2_capture(hip_llm_runner *r, int layer,
+                                        void *hidden, int rows);
 
 /* Per-token forward over all layers + final RMSNorm. */
 #include "qwen4_verify_window.h"
 #include "qwen4_nextn_forward.h"
 #include "qwen35_nextn.h"
+#include "qwen35_dflash2.h"
 #include "qwen4_nextn_ref.h"
 #include "qwen4_qsa_test.h"
 
@@ -28988,6 +28993,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
     for (int l = 0; l < n_run_layers; l++) {
         r->active_layer = l;
         hip_layer *cl = &r->layers[l];
+        hllm_qwen35_dflash2_capture(r, l, r->d_x_batch, M);
         /* Keep recurrent SSM projections scalar unless the explicit BF16
          * prefill experiment is selected. Recompute these gates for the
          * interleaved attention and SSM blocks. */
@@ -30769,6 +30775,12 @@ ffn_section:
                              r->d_output_norm, n_embd, M, n_embd, eps);
     }
 
+    /* Keep the draft cache aligned with the target prompt.  Feature capture
+     * occurs at layer input above; injection is independent of the target's
+     * final norm and may safely follow the complete target tile. */
+    if (r->qwen35_dflash2 &&
+        hllm_qwen35_dflash2_inject(r, position_start, M) != 0) return -1;
+
     /* Copy last row into r->d_x so callers (and lm_head path) see the result. */
     float *last_row = (float *)r->d_x_batch + (size_t)(M - 1) * n_embd;
     debug_f32_state(r, -1, "result_norm", last_row, n_embd);
@@ -31393,6 +31405,7 @@ void hip_llm_offload(hip_llm_runner *r) {
     r->d_moe_gather_w = NULL;
     r->d_moe_assign_pos = NULL;
     hllm_free_qwen4_nextn(r);
+    hllm_qwen35_dflash2_free(r);
     hllm_free_qwen35_mtp(r);
     /* Phase 2 batched buffers */
     if (r->d_x_batch)             { hipFree(r->d_x_batch);             r->d_x_batch = NULL; }
@@ -31750,6 +31763,7 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_hc_low)       hipFree(r->d_hc_low);
     if (r->d_hc_inject)    hipFree(r->d_hc_inject);
     hllm_free_qwen4_nextn(r);
+    hllm_qwen35_dflash2_free(r);
     hllm_free_qwen35_mtp(r);
     if (r->d_ple_conv_state) hipFree(r->d_ple_conv_state);
     if (r->d_ple_emb)      hipFree(r->d_ple_emb);
@@ -32289,6 +32303,10 @@ void hip_llm_reset_state(hip_llm_runner *r) {
     r->qwen4_forward_error = 0;
     r->qwen4_nextn_start = -1;
     if (r->qwen35_mtp) { r->qwen35_mtp->origin = -1; r->qwen35_mtp->verify_rows = 0; }
+    if (r->qwen35_dflash2) {
+        r->qwen35_dflash2->feature_rows = 0;
+        r->qwen35_dflash2->kv_end = 0;
+    }
     r->cur_position = 0;
     if (r->qwen4_exact && r->layers) {
         for (int l=0;l<r->n_layers;++l)

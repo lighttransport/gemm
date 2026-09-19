@@ -56,16 +56,26 @@ static void hllm_free_qwen35_mtp(hip_llm_runner *r) {
     r->qwen35_mtp = NULL;
 }
 
+/* DFlash2 shares the exact multi-row target verifier with dense NextN but
+ * does not own a Qwen3.5 NextN layer.  Keep verifier allocation lazy; this
+ * small shell only establishes the transaction state used by verify/commit. */
+static int hllm_qwen35_verify_workspace_create(hip_llm_runner *r) {
+    if (!r || r->qwen35_mtp) return -1;
+    hllm_qwen35_mtp *m = calloc(1, sizeof(*m));
+    if (!m) return -1;
+    m->origin = -1;
+    r->qwen35_mtp = m;
+    return 0;
+}
+
 int hip_llm_qwen35_mtp_load(hip_llm_runner *r, const char *path,
                            char *error, size_t error_cap) {
     const gguf_shards *saved = hllm_active_shards;
     if (error && error_cap) snprintf(error, error_cap, "Unsupported dense NextN target/configuration");
     if (!r || !r->weights_loaded || !r->is_hybrid || r->is_moe ||
         r->is_qwen4exp || r->n_layers > 128 || r->qwen35_mtp || !path) return -1;
-    hllm_qwen35_mtp *m = calloc(1, sizeof(*m));
-    if (!m) return -1;
-    r->qwen35_mtp = m;
-    m->origin = -1;
+    if (hllm_qwen35_verify_workspace_create(r)) return -1;
+    hllm_qwen35_mtp *m = r->qwen35_mtp;
     m->source = gguf_open_shards(path, 2);
     if (!m->source) goto fail;
     hllm_active_shards = m->source;
@@ -148,7 +158,7 @@ fail:
 int hip_llm_qwen35_mtp_propose(hip_llm_runner *r, int32_t anchor, int position,
                               int count, int32_t *drafts) {
     hllm_qwen35_mtp *m = r ? r->qwen35_mtp : NULL;
-    if (!m || m->verify_rows || !drafts || count < 1 || count > 16 || anchor < 0 ||
+    if (!m || !m->source || !m->head || m->verify_rows || !drafts || count < 1 || count > 16 || anchor < 0 ||
         anchor >= r->n_vocab || position < 0 || position > r->max_seq_len-count) return -1;
     if (m->origin < 0) { m->origin = position; m->kv_end = 0; }
     if (position < m->origin) return -1;
@@ -394,6 +404,7 @@ float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
         for (int l = 0; l < r->n_layers; ++l) {
             r->active_layer = l;
             hip_layer *cl = &r->layers[l];
+            hllm_qwen35_dflash2_capture(r, l, m->verify_x, rows);
             /* Group each projection so its weights remain hot across rows.
              * Fused Q6/Q8 FFNs retain their original scalar execution. */
             int grouped = cl->ffn_gate_type != GGML_TYPE_Q6_K &&
