@@ -130,6 +130,21 @@ class PixalServerTest(unittest.TestCase):
         self.assertEqual(status["result"]["value"], 7)
         self.assertEqual(status["result"]["reference"]["value"], "reference")
 
+    def test_job_failure_has_stable_error_code(self):
+        class InvalidPixal:
+            def infer(self, request, cancel=None):
+                raise ValueError("bad camera")
+        jobs = app.JobQueue(InvalidPixal(), retained=1)
+        job = jobs.submit({})
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            status = jobs.status(job["id"])
+            if status["state"] == "failed":
+                break
+            time.sleep(0.01)
+        self.assertEqual(status["error_code"], "invalid_request")
+        self.assertEqual(app.error_payload("not_found", "missing")["error_code"], "not_found")
+
     def test_queued_job_can_be_cancelled(self):
         gate = __import__("threading").Event()
         class BlockingPixal:

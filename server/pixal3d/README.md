@@ -46,6 +46,9 @@ ID immediately. Poll `GET /v1/jobs/ID`; when its state is `complete`, fetch
 terminates the active native/reference child process.
 The bounded in-memory queue defaults to four active requests and four retained
 terminal results; change it with `--retained-jobs`.
+Errors include a stable `error_code` such as `invalid_request`, `queue_full`,
+`timeout`, `not_found`, or `internal_error`. Queue saturation returns HTTP 429,
+and `/health` publishes request, image, output, and view-count limits.
 
 Run the server unit tests with `python3 -m unittest server.pixal3d.test_app`.
 When Chrome or Chromium is installed, `python3 server/pixal3d/test_browser.py`

@@ -35,6 +35,14 @@ class JobCancelled(Exception):
     pass
 
 
+class QueueFull(Exception):
+    pass
+
+
+def error_payload(code: str, message: str) -> dict:
+    return {"ok": False, "error": message, "error_code": code}
+
+
 def run_command(command: list[str], timeout: float,
                 cancel: threading.Event | None = None) -> subprocess.CompletedProcess:
     if cancel is None:
@@ -155,7 +163,9 @@ class PixalServer:
         return {"ok": True, "service": "pixal3d", "default_backend": self.args.backend,
                 "default_gpu_execution": self.args.gpu_execution,
                 "default_gpu_kernels": self.args.gpu_kernels,
-                "default_gpu_flow_precision": self.args.gpu_flow_precision, "backends": out}
+                "default_gpu_flow_precision": self.args.gpu_flow_precision,
+                "limits": {"body_bytes": MAX_BODY_BYTES, "image_bytes": MAX_IMAGE_BYTES,
+                           "glb_bytes": MAX_GLB_BYTES, "views": 16}, "backends": out}
 
     def infer(self, request: dict, cancel: threading.Event | None = None) -> dict:
         backend = request.get("backend", self.args.backend)
@@ -330,7 +340,7 @@ class JobQueue:
         with self.lock:
             active = sum(j["state"] in ("queued", "running") for j in self.jobs.values())
             if active >= self.retained:
-                raise RuntimeError("job queue is full")
+                raise QueueFull("job queue is full")
             terminal = sorted((j for j in self.jobs.values()
                                if j["state"] not in ("queued", "running")),
                               key=lambda j: j["updated_at"])
@@ -403,7 +413,9 @@ class JobQueue:
                 self._update(job_id, state="cancelled", phase="cancelled",
                              completed_at=time.time())
             except Exception as exc:
-                self._update(job_id, state="failed", phase="failed", error=str(exc),
+                code = ("invalid_request" if isinstance(exc, ValueError) else
+                        "timeout" if isinstance(exc, TimeoutError) else "execution_failed")
+                self._update(job_id, state="failed", phase="failed", error=str(exc), error_code=code,
                              completed_at=time.time())
             finally:
                 self.pending.task_done()
@@ -439,34 +451,37 @@ class Handler(BaseHTTPRequestHandler):
                 job_id, tail = (path[len("/v1/jobs/"):].split("/", 1) + [""])[:2]
                 self.json_response(200, self.server.jobs.status(job_id, tail == "result"))
             except KeyError:
-                self.json_response(404, {"ok": False, "error": "job not found"})
+                self.json_response(404, error_payload("not_found", "job not found"))
             return
-        self.json_response(404, {"ok": False, "error": "not found"})
+        self.json_response(404, error_payload("not_found", "not found"))
     def do_POST(self):
         path = urlparse(self.path).path
         if path not in ("/v1/infer", "/v1/jobs"):
-            self.json_response(404, {"ok": False, "error": "not found"}); return
+            self.json_response(404, error_payload("not_found", "not found")); return
         try:
             length = int(self.headers.get("Content-Length", "-1"))
             if length < 0 or length > MAX_BODY_BYTES: raise ValueError("request body too large")
             request = json.loads(self.rfile.read(length))
+            if not isinstance(request, dict):
+                raise ValueError("request body must be a JSON object")
             if path == "/v1/jobs":
                 self.json_response(202, self.server.jobs.submit(request)); return
             result = self.server.pixal.infer(request)
             if request.get("reference"):
                 result["reference"] = self.server.pixal.reference(request)
             self.json_response(200, result)
-        except TimeoutError as exc: self.json_response(504, {"ok": False, "error": str(exc)})
-        except (ValueError, json.JSONDecodeError) as exc: self.json_response(400, {"ok": False, "error": str(exc)})
-        except Exception as exc: self.json_response(500, {"ok": False, "error": str(exc)})
+        except QueueFull as exc: self.json_response(429, error_payload("queue_full", str(exc)))
+        except TimeoutError as exc: self.json_response(504, error_payload("timeout", str(exc)))
+        except (ValueError, json.JSONDecodeError) as exc: self.json_response(400, error_payload("invalid_request", str(exc)))
+        except Exception as exc: self.json_response(500, error_payload("internal_error", str(exc)))
     def do_DELETE(self):
         path = urlparse(self.path).path
         if not path.startswith("/v1/jobs/"):
-            self.json_response(404, {"ok": False, "error": "not found"}); return
+            self.json_response(404, error_payload("not_found", "not found")); return
         try:
             self.json_response(200, self.server.jobs.cancel(path[len("/v1/jobs/"):]))
         except KeyError:
-            self.json_response(404, {"ok": False, "error": "job not found"})
+            self.json_response(404, error_payload("not_found", "job not found"))
     def log_message(self, fmt, *args):
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {fmt % args}", flush=True)
 
