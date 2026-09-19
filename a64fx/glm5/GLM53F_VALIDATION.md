@@ -362,6 +362,37 @@ final-token equality therefore requires aligning those two boundary weights
 and the remaining safetensors/GGUF trunk weights; it cannot be fixed by the
 embedding loader alone.
 
+The production runner's Q2 embedding stage was then validated directly on 12
+A64FX nodes. Two earlier attempts did not reach the embedding gate: job
+51787488 placed the twelve 8,252,817,408-byte routed images in one node's
+87-GiB `/local` allocation and stopped with `ENOSPC`, while job 51789689 used a
+smaller effective quota and stopped with `EDQUOT`. Job 51796626 instead used
+`rscgrp=int,node=12`, `proc=12`, and one rank per distinct host. Every host
+reported 91,226,112 KiB available under `/local`; all twelve routed, Q5_K
+embedding, shared-expert, and compact-core stage sentinels passed. Each
+embedding shard contained 12,906 or 12,907 rows and occupied 211,451,904 or
+211,468,288 bytes.
+
+The job ran three Q2-embedding inputs and a same-allocation BF16-embedding
+control, one decode step each:
+
+| Input | Production embedding | Production token/logit | Streamed Q2 token | Result |
+| ---: | --- | --- | ---: | --- |
+| 1 | Q2 GGUF | `5556 / 8.51486969` | 5556 | exact |
+| 42 | Q2 GGUF | `154822 / 11.8808479` | 154822 | exact |
+| 1234 | Q2 GGUF | `198 / 10.6972504` | 29656 | mismatch |
+| 1234 | BF16 safetensors | `198 / 11.487524` | n/a | control |
+
+The changed token-1234 logit proves that the production runner consumed the
+staged Q2 row even though its greedy ID remained 198. Aligning only the input
+embedding is therefore insufficient for the failing input; the production
+trunk and vocabulary head still use safetensors-derived weights. All four
+executions were finite and reported `PASS`. The first load took 101.73 seconds,
+with 18.84 GiB minimum `MemAvailable` after residency and 18.66 GiB during the
+decode. The run used HEAD `56f89642` plus the then-current dirty worktree,
+captured in the log directory with diff SHA-256
+`468f970446d0380a2f74d0c7ef46aeb4fc45ce597fa70de5a6810f16029d5a13`.
+
 Job 51766725 repeated the complete streamed chain with
 `GLM53F_STREAM_TOKEN=1234`, providing a third real embedding/input variant.
 All 45 trunk layers again produced finite 16,384-element artifacts. The
