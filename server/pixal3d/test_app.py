@@ -289,6 +289,47 @@ class PixalServerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown or expired"):
                 uploads.claim({"image_upload": upload_id})
 
+    def test_upload_expiry_delete_and_startup_cleanup(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="upload-life-", dir=scratch) as td:
+            root = Path(td)
+            stale = root / "left-by-old-server"
+            stale.write_bytes(b"stale")
+            uploads = app.UploadStore(root, retained=2, ttl=0.01)
+            self.assertFalse(stale.exists())
+
+            first = uploads.put(b"first")
+            self.assertTrue(uploads.delete(first))
+            self.assertFalse(uploads.delete(first))
+            second = uploads.put(b"second")
+            time.sleep(0.02)
+            with self.assertRaisesRegex(ValueError, "unknown or expired"):
+                uploads.claim({"image_upload": second})
+            self.assertFalse(any(root.iterdir()))
+
+    def test_terminal_job_expiry_and_explicit_delete(self):
+        class ImmediatePixal:
+            def infer(self, request, cancel=None, progress=None):
+                return {"ok": True}
+
+        jobs = app.JobQueue(ImmediatePixal(), retained=2, ttl=0.02)
+        first = jobs.submit({})
+        deadline = time.monotonic() + 2
+        while jobs.status(first["id"])["state"] != "complete" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        deleted = jobs.delete(first["id"])
+        self.assertTrue(deleted["deleted"])
+        with self.assertRaises(KeyError):
+            jobs.status(first["id"])
+
+        second = jobs.submit({})
+        while jobs.status(second["id"])["state"] != "complete" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.03)
+        with self.assertRaises(KeyError):
+            jobs.status(second["id"])
+
 
 if __name__ == "__main__":
     unittest.main()

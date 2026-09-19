@@ -39,8 +39,10 @@ cards. Set `reference: true` with CUDA or ROCm to
 also run the pinned upstream PyTorch pipeline; the response includes a second
 GLB for comparison. This is opt-in because it loads another model stack and
 requires an image without a separate mask upload. The browser displays native
-AMD and PyTorch reference meshes side by side or as an opacity overlay.
-`GET /health` reports binary, GPU-library, and model readiness.
+AMD and PyTorch reference meshes side by side or as an opacity overlay. Viewer
+cameras remain synchronized while comparing the meshes. `GET /health` reports
+binary, GPU-library, native-model, preparation-model, and pinned PyTorch
+reference readiness.
 
 For single-view requests, `auto_mask: true` uses the pinned RMBG-2.0 reference
 when the image lacks useful alpha, and `auto_camera: true` estimates horizontal
@@ -59,6 +61,9 @@ Job status includes a monotonic `progress` percentage and a `phase` derived
 from native conditioning, diffusion, mesh, and texture milestones.
 The bounded in-memory queue defaults to four active requests and four retained
 terminal results; change it with `--retained-jobs`.
+Terminal jobs expire after 24 hours by default. Deleting a completed, failed,
+or cancelled job releases it immediately; deleting queued or running work
+continues to request cancellation. Configure expiry with `--job-ttl` in seconds.
 Errors include a stable `error_code` such as `invalid_request`, `queue_full`,
 `timeout`, `not_found`, or `internal_error`. Queue saturation returns HTTP 429,
 and `/health` publishes request, image, output, and view-count limits.
@@ -67,7 +72,9 @@ The browser sends each image as raw bytes to `POST /v1/uploads`, then places
 the returned `upload_id` in `image_upload`, `mask_upload`, or each view's
 `image_upload`. This avoids base64 expansion and keeps queued JSON requests
 small. Upload IDs are single-use and their files are removed when the job
-finishes or is cancelled. Existing `image_b64` clients remain supported.
+finishes or is cancelled. Unclaimed uploads expire after one hour by default,
+and `DELETE /v1/uploads/ID` releases one immediately. Configure expiry with
+`--upload-ttl` in seconds. Existing `image_b64` clients remain supported.
 
 Run the server unit tests with `python3 -m unittest server.pixal3d.test_app`.
 When Chrome or Chromium is installed, `python3 server/pixal3d/test_browser.py`
