@@ -255,6 +255,10 @@ def rmbg_ready(path: Path) -> bool:
             (any(path.glob("*.safetensors")) or any(path.glob("pytorch_model*.bin"))))
 
 
+def valid_output(path: Path, limit: int = MAX_GLB_BYTES) -> bool:
+    return path.is_file() and 0 < path.stat().st_size <= limit
+
+
 class PixalServer:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -430,9 +434,9 @@ class PixalServer:
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "native runner failed").strip()[-4000:]
                 raise RuntimeError(detail)
-            if not output_path.is_file() or output_path.stat().st_size > MAX_GLB_BYTES:
+            if not valid_output(output_path):
                 raise RuntimeError("native runner did not produce a valid GLB")
-            if include_ply and (not ply_path.is_file() or ply_path.stat().st_size > MAX_GLB_BYTES):
+            if include_ply and not valid_output(ply_path):
                 raise RuntimeError("native runner did not produce a valid PLY")
             stats = {}
             for line in reversed(proc.stdout.splitlines()):
@@ -509,7 +513,7 @@ class PixalServer:
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "PyTorch reference failed").strip()[-4000:]
                 raise RuntimeError(detail)
-            if not output_path.is_file() or output_path.stat().st_size > MAX_GLB_BYTES:
+            if not valid_output(output_path):
                 raise RuntimeError("PyTorch reference did not produce a valid GLB")
             return {"backend": backend, "elapsed_ms": round((time.monotonic() - started) * 1000),
                     "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"),

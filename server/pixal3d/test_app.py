@@ -99,6 +99,13 @@ class PixalServerTest(unittest.TestCase):
         self.assertEqual((resolved["fov"], resolved["distance"], resolved["auto_camera"]),
                          (0.6, 1.5, False))
         self.assertFalse(app.rmbg_ready(Path("/missing/rmbg")))
+        scratch_file = app.ROOT / "tmp/pixal3d/tests/empty-output"
+        scratch_file.parent.mkdir(parents=True, exist_ok=True)
+        scratch_file.write_bytes(b"")
+        self.assertFalse(app.valid_output(scratch_file))
+        scratch_file.write_bytes(b"mesh")
+        self.assertTrue(app.valid_output(scratch_file))
+        scratch_file.unlink()
         scratch = app.ROOT / "tmp/pixal3d/tests"
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="web-", dir=scratch) as td:

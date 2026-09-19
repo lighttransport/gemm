@@ -93,3 +93,26 @@ frames without one, and `mesh_scale` applies to the complete view set:
 The pinned PyTorch comparison supports both single-view and multiview GPU
 requests. It runs after native inference and reuses the validated ordered view
 manifest, so enabling it can add several minutes to a request.
+
+## Deployment
+
+The built-in server is intended for a trusted workstation or an application
+behind an authenticated reverse proxy. It binds to loopback by default. When
+exposing it through a proxy, keep the 256 MiB request limit, allow multi-hour
+upstream timeouts, disable proxy response buffering for job polling, and add
+TLS and authentication at the proxy. Do not expose an unauthenticated
+`--bind 0.0.0.0` endpoint.
+
+Run one server process per physical GPU. The process serializes requests for
+each backend, but separate server processes do not share locks or VRAM budgets.
+Keep `tmp/pixal3d/web-runs` on a local filesystem with room for uploads and
+generated assets. Terminal results are retained in memory, including base64
+GLBs, optional PLY data, and reference GLBs; size `--retained-jobs` for the
+largest enabled response rather than only the native GLB. Four retained jobs
+can require over 1 GiB when reference and PLY outputs are both enabled.
+
+Use a service manager to restart the process and set a file-descriptor limit
+appropriate for concurrent uploads. Check `GET /health` after startup and
+before routing traffic. Its readiness fields distinguish the native model,
+multiview checkpoints, RMBG, and MoGe so a missing optional model does not hide
+core inference readiness.
