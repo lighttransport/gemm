@@ -241,6 +241,17 @@ RMBG-2.0 is gated by its publisher and needs an authorized Hugging Face account.
 Pinned multiview verification can still run on inputs with useful RGBA alpha
 through `run_reference_mv.py`. Its placeholder raises on RGB or fully opaque
 views, so it does not replace RMBG or change reference masking behavior.
+
+After producing the two full multiview budget runs, repeat resident recovery,
+mixed/FP32 matched-reference checks, invalid-input handling, queue cancellation,
+and artifact validation while sampling RSS and device memory with:
+
+```sh
+ref/pixal3d/run.sh cuda ref/pixal3d/validate_cuda_reliability.py \
+  --dump-dir tmp/pixal3d/resident-runs/cuda-house/dumps \
+  --multiview-runs tmp/pixal3d/mv-budget-7168 tmp/pixal3d/mv-budget-12288 \
+  --output tmp/pixal3d/cuda-reliability.json
+```
 Images that already have non-opaque alpha do not load RMBG. The MoGe-2 checkpoint
 is pinned to revision `39c4d5e9` and SHA-256 `3eefd4ab...e0111cd5`; on the upstream
 house asset it estimated FOV `0.6061274` radians and distance `1.598996` on the

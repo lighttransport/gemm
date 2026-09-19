@@ -156,6 +156,15 @@ ref/pixal3d/run.sh cpu ref/pixal3d/validate_multiview_budgets.py \
   tmp/pixal3d/mv-budget-7168 tmp/pixal3d/mv-budget-12288
 ```
 
+A bounded post-run reliability soak repeated the resident allocator/kernel
+suite twice, then ran matched mixed and FP32 structure checks, native invalid
+input recovery, web queue/cancellation tests, and multiview artifact validation.
+Both matched flow checks reported NRMSE `1.3173e-6`; total device usage returned
+from 3,485,532,160 bytes before the soak to 3,485,401,088 bytes afterward. The
+two PyTorch comparisons peaked at 13.82 GB total device use and about 13.0 GB
+host RSS. The complete machine-readable record is emitted by
+`validate_cuda_reliability.py` rather than checked into the repository.
+
 ## Matched flow benchmark
 
 Hardware: RTX 5060 Ti (`sm_120`) and RX 9070 XT (`gfx1201`). Host GCC 13.3;
