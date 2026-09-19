@@ -12,6 +12,8 @@ typedef struct hllm_qwen35_mtp {
     void *verify_x, *verify_logits, *verify_positions;
     void *verify_norm, *verify_gate, *verify_up;
     void *verify_q, *verify_scales;
+    void *verify_quant_source;
+    int verify_quant_rows, verify_quant_cols;
     void *verify_ssm_qkv, *verify_ssm_z, *verify_ssm_alpha, *verify_ssm_beta, *verify_ssm_out;
     void *verify_conv[128], *verify_rec[128];
     float *host_logits;
@@ -260,9 +262,26 @@ int hip_llm_qwen35_mtp_propose(hip_llm_runner *r, int32_t anchor, int position,
 static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
         void *x, int rows, int nr, int nc, int type) {
     hllm_qwen35_mtp *m = r->qwen35_mtp;
+    if (rows <= 8 && nc % 256 == 0 && nc <= r->n_ff &&
+        (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M)) {
+        /* The generic batch scratch is shared by mixed-format projections.
+         * Requantize every IQ1 launch so a Q/K/V format change cannot leave
+         * stale Q8_1 sums behind under graph replay. */
+        launch_quantize_q81_iq1_batch(r, x, nc, rows, nc);
+        hipFunction_t iq1_fn = type == GGML_TYPE_IQ1_S ?
+            r->fn_matvec_iq1_s_q81_reuse8 : r->fn_matvec_iq1_m_q81_reuse8;
+        void *a[] = { &dst, &w, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                      &r->d_act_scale_batch_b, &nr, &nc, &rows };
+        LAUNCH(iq1_fn, (nr+7)/8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        r->q8x2_reuse_valid = r->iq1_q8_valid = r->batch_q8_valid = 0;
+        return;
+    }
     hipFunction_t fn = NULL;
     switch (type) {
-        case GGML_TYPE_Q2_K: if (rows <= 4 && nc <= 6144) fn=r->fn_qwen35_matvec_q2k_multi4; break;
+        case GGML_TYPE_Q2_K: if (rows <= 8 && nc <= 6144)
+            fn = rows <= 4 ? r->fn_qwen35_matvec_q2k_multi4 :
+                             r->fn_qwen35_matvec_q2k_multi8;
+            break;
         case GGML_TYPE_IQ2_XXS: fn=r->fn_qwen35_matvec_iq2xxs; break;
         case GGML_TYPE_IQ2_XS: fn=r->fn_qwen35_matvec_iq2xs; break;
         case GGML_TYPE_IQ2_S: fn=r->fn_qwen35_matvec_iq2s; break;
@@ -271,19 +290,45 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
         case GGML_TYPE_IQ4_XS: fn=r->fn_qwen35_matvec_iq4xs; break;
     }
     if (fn && nc % 256 == 0 && nc <= r->n_ff) {
-        int total = rows*nc;
-        void *qa[] = { &m->verify_q, &m->verify_scales, &x, &total };
-        LAUNCH(r->fn_qwen35_quantize_q81, total/32, 1, 1, 32, 1, 1, 0, r->stream, qa);
+        if (m->verify_quant_source != x || m->verify_quant_rows != rows ||
+            m->verify_quant_cols != nc) {
+            int total = rows*nc;
+            void *qa[] = { &m->verify_q, &m->verify_scales, &x, &total };
+            LAUNCH(r->fn_qwen35_quantize_q81, total/32, 1, 1, 32, 1, 1, 0,
+                   r->stream, qa);
+            m->verify_quant_source = x;
+            m->verify_quant_rows = rows;
+            m->verify_quant_cols = nc;
+        }
         void *a[] = { &dst, &w, &m->verify_q, &m->verify_scales, &nr, &nc };
         if (type == GGML_TYPE_Q2_K) {
             void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales, &nr, &nc, &rows };
             LAUNCH(fn, (nr+3)/4, 1, 1, 128, 1, 1, 0, r->stream, ma);
-        } else if (rows <= 4 && type != GGML_TYPE_IQ4_XS &&
+        } else if (rows > 4 && type == GGML_TYPE_IQ4_XS) {
+            void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
+                           &nr, &nc, &rows };
+            LAUNCH(r->fn_qwen35_matvec_iq4xs_multi8, (nr+3)/4, 1, 1,
+                   128, 1, 1, 0, r->stream, ma);
+        } else if (rows <= 8 && type != GGML_TYPE_IQ4_XS &&
                    !(type == GGML_TYPE_IQ2_S && nc > 6144)) {
             int kind = type==GGML_TYPE_IQ2_XXS ? 0 : type==GGML_TYPE_IQ2_XS ? 1 :
                 type==GGML_TYPE_IQ2_S ? 2 : type==GGML_TYPE_IQ3_XXS ? 3 : 4;
-            void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales, &nr, &nc, &kind, &rows };
-            LAUNCH(r->fn_qwen35_matvec_iq_multi4, (nr+3)/4, 1, 1, 128, 1, 1, 0, r->stream, ma);
+            if (rows <= 4) {
+                void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
+                               &nr, &nc, &kind, &rows };
+                LAUNCH(r->fn_qwen35_matvec_iq_multi4, (nr+3)/4, 1, 1,
+                       128, 1, 1, 0, r->stream, ma);
+            } else {
+                hipFunction_t multi = type==GGML_TYPE_IQ2_XXS ? r->fn_qwen35_matvec_iq2xxs_multi8 :
+                    type==GGML_TYPE_IQ2_XS ? r->fn_qwen35_matvec_iq2xs_multi8 :
+                    type==GGML_TYPE_IQ2_S ? r->fn_qwen35_matvec_iq2s_multi8 :
+                    type==GGML_TYPE_IQ3_XXS ? r->fn_qwen35_matvec_iq3xxs_multi8 :
+                                              r->fn_qwen35_matvec_iq3s_multi8;
+                void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
+                               &nr, &nc, &rows };
+                LAUNCH(multi, (nr+3)/4, 1, 1, 128, 1, 1, 0,
+                       r->stream, ma);
+            }
         } else LAUNCH(fn, (nr+7)/8, rows, 1, 256, 1, 1, 0, r->stream, a);
     } else {
         for (int i = 0; i < rows; ++i)
@@ -293,20 +338,13 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
     r->q8x2_reuse_valid = r->iq1_q8_valid = 0;
 }
 
-static int hllm_dense_mtp_native_iq(int type) {
-    return type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
-        type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS ||
-        type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS;
-}
-
 static void hllm_dense_mtp_ssm(hip_llm_runner *r, hip_layer *cl, int l, int rows,
                               size_t conv, size_t rec) {
     hllm_qwen35_mtp *m = r->qwen35_mtp;
     int ne = r->n_embd, dt = r->ssm_dt_rank, ds = r->ssm_d_state;
     float eps = r->rms_norm_eps;
-    for (int i = 0; i < rows; ++i)
-        launch_rmsnorm(r, (float *)m->verify_norm+(size_t)i*ne,
-            (float *)m->verify_x+(size_t)i*ne, cl->attn_norm_w, ne, eps);
+    launch_rmsnorm_batch(r, m->verify_norm, m->verify_x, cl->attn_norm_w,
+                         ne, rows, ne, eps);
     hllm_dense_mtp_projection(r, m->verify_ssm_qkv, cl->ssm_qkv_w, m->verify_norm,
         rows, cl->ssm_qkv_rows, cl->ssm_qkv_cols, cl->ssm_qkv_type);
     hllm_dense_mtp_projection(r, m->verify_ssm_z, cl->ssm_gate_w, m->verify_norm,
@@ -340,18 +378,79 @@ static void hllm_dense_mtp_ssm(hip_llm_runner *r, hip_layer *cl, int l, int rows
     r->d_ssm_qkv=qkv; r->d_ssm_z=z; r->d_ssm_alpha=alpha; r->d_ssm_beta=beta; r->d_ssm_out=out;
     hllm_dense_mtp_projection(r, m->verify_norm, cl->ssm_out_w, m->verify_ssm_out,
         rows, cl->ssm_out_rows, cl->ssm_out_cols, cl->ssm_out_type);
-    for (int i = 0; i < rows; ++i) {
-        void *x = (float *)m->verify_x+(size_t)i*ne;
-        void *y = (float *)m->verify_norm+(size_t)i*ne;
-        const char *split = getenv("LLM_QWEN35_SPLIT_RES_RMSNORM");
-        if (split && atoi(split)) {
+    const char *split = getenv("LLM_QWEN35_SPLIT_RES_RMSNORM");
+    if (split && atoi(split)) {
+        for (int i = 0; i < rows; ++i) {
+            void *x = (float *)m->verify_x+(size_t)i*ne;
+            void *y = (float *)m->verify_norm+(size_t)i*ne;
             launch_add(r, x, y, ne);
             launch_rmsnorm(r, y, x, cl->ffn_norm_w, ne, eps);
-        } else {
-            void *a[] = { &x, &y, &y, &cl->ffn_norm_w, &ne, &eps };
-            LAUNCH(r->fn_res_rmsnorm_f32, 1, 1, 1, 256, 1, 1, 256*sizeof(float), r->stream, a);
         }
+    } else {
+        void *a[] = { &m->verify_x, &m->verify_norm, &m->verify_norm,
+                      &cl->ffn_norm_w, &ne, &rows, &eps };
+        LAUNCH(r->fn_res_rmsnorm_batch_f32, rows, 1, 1, 256, 1, 1,
+               256*sizeof(float), r->stream, a);
     }
+}
+
+/* Exact gated-attention verifier with grouped weight projections.  Positions
+ * stay device-resident so the captured graph can be replayed at every decode
+ * offset.  The per-row RoPE/KV/attention sequence deliberately matches scalar
+ * decode; only the four IQ projections share target weight decoding. */
+static void hllm_dense_mtp_attention(hip_llm_runner *r, hip_layer *cl,
+                                     int l, int rows) {
+    hllm_qwen35_mtp *m = r->qwen35_mtp;
+    int ne = r->n_embd, qd = r->n_heads*r->head_dim;
+    int kd = r->n_kv_heads*r->head_dim;
+    float eps = r->rms_norm_eps;
+    launch_rmsnorm_batch(r, r->d_xnorm_batch, m->verify_x,
+                         cl->attn_norm_w, ne, rows, ne, eps);
+
+    hllm_dense_mtp_projection(r, r->d_qfull_batch, cl->attn_q_w,
+        r->d_xnorm_batch, rows, cl->attn_q_rows, cl->attn_q_cols,
+        cl->attn_q_type);
+    launch_deinterleave_qgate_batch(r, r->d_q_batch, r->d_attn_gate_batch,
+                                    r->d_qfull_batch, r->n_heads,
+                                    r->head_dim, rows);
+    hllm_dense_mtp_projection(r, r->d_k_batch, cl->attn_k_w,
+        r->d_xnorm_batch, rows, cl->attn_k_rows, cl->attn_k_cols,
+        cl->attn_k_type);
+    hllm_dense_mtp_projection(r, r->d_v_batch, cl->attn_v_w,
+        r->d_xnorm_batch, rows, cl->attn_v_rows, cl->attn_v_cols,
+        cl->attn_v_type);
+    launch_qknorm_batch(r, r->d_q_batch, cl->attn_q_norm_w,
+                        r->n_heads, r->head_dim, rows, qd, eps);
+    launch_qknorm_batch(r, r->d_k_batch, cl->attn_k_norm_w,
+                        r->n_kv_heads, r->head_dim, rows, kd, eps);
+
+    for (int i = 0; i < rows; ++i) {
+        void *q = (float *)r->d_q_batch+(size_t)i*qd;
+        void *k = (float *)r->d_k_batch+(size_t)i*kd;
+        void *v = (float *)r->d_v_batch+(size_t)i*kd;
+        void *out = (float *)r->d_attn_out_batch+(size_t)i*qd;
+        hipMemcpyAsync(r->d_position, (int *)m->verify_positions+i,
+                       sizeof(int), hipMemcpyDeviceToDevice, r->stream);
+        launch_rope_devp(r, q, r->n_heads, r->head_dim, r->rope_freq_base);
+        launch_rope_devp(r, k, r->n_kv_heads, r->head_dim, r->rope_freq_base);
+        void *a[] = { &r->d_key_cache[l], &r->d_value_cache[l],
+            &r->d_key_cache_scale[l], &r->d_value_cache_scale[l], &k, &v,
+            &r->n_kv_heads, &r->head_dim, &r->d_position };
+        LAUNCH(r->fn_kv_cache_store_q8q8_devp, r->n_kv_heads, 1, 1,
+               256, 1, 1, 0, r->stream, a);
+        launch_attn_decode_native_q8(r, out, q, r->d_key_cache[l],
+            r->d_value_cache[l], r->d_key_cache_scale[l],
+            r->d_value_cache_scale[l]);
+    }
+    launch_sigmoid_mul(r, r->d_attn_out_batch, r->d_attn_gate_batch,
+                       rows*qd);
+    hllm_dense_mtp_projection(r, r->d_attn_proj_batch,
+        cl->attn_output_w, r->d_attn_out_batch, rows,
+        cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+    void *a[] = { &m->verify_x, &r->d_attn_proj_batch, &m->verify_norm,
+                  &cl->ffn_norm_w, &ne, &rows, &eps };
+    LAUNCH(r->fn_res_rmsnorm_batch_f32, rows, 1, 1, 256, 1, 1,
+           256*sizeof(float), r->stream, a);
 }
 
 /* Capture a layer-major window using precisely the scalar target kernels.
@@ -412,12 +511,14 @@ float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
                 cl->ffn_gate_type != GGML_TYPE_Q8_0 && cl->ffn_up_type != GGML_TYPE_Q8_0 &&
                 r->fn_qwen35_matvec_iq3xxs;
             int grouped_ssm = grouped && cl->is_ssm &&
-                hllm_dense_mtp_native_iq(cl->ssm_qkv_type) &&
-                hllm_dense_mtp_native_iq(cl->ssm_gate_type) &&
-                hllm_dense_mtp_native_iq(cl->ssm_out_type) &&
                 (cl->ssm_alpha_type == GGML_TYPE_F16 || cl->ssm_alpha_type == GGML_TYPE_BF16) &&
                 (cl->ssm_beta_type == GGML_TYPE_F16 || cl->ssm_beta_type == GGML_TYPE_BF16);
+            int grouped_attn = grouped && !cl->is_ssm &&
+                r->d_qfull_batch && r->d_attn_gate_batch &&
+                r->d_q_batch && r->d_k_batch && r->d_v_batch &&
+                r->d_attn_out_batch && r->d_attn_proj_batch;
             if (grouped_ssm) hllm_dense_mtp_ssm(r, cl, l, rows, conv, rec);
+            else if (grouped_attn) hllm_dense_mtp_attention(r, cl, l, rows);
             else for (int i = 0; i < rows; ++i) {
                 r->d_x = (float *)m->verify_x + (size_t)i*r->n_embd;
                 r->cur_position = position+i;
@@ -446,12 +547,11 @@ float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
                 launch_add(r, m->verify_x, m->verify_norm, rows*r->n_embd);
             }
         }
-        for (int i = 0; i < rows; ++i) {
-            void *x = (float *)m->verify_x + (size_t)i*r->n_embd;
-            launch_rmsnorm(r, x, x, r->d_output_norm, r->n_embd, r->rms_norm_eps);
-            launch_matvec_auto(r, (float *)m->verify_logits+(size_t)i*r->n_vocab,
-                r->d_output_w, x, r->n_vocab, r->n_embd, r->output_w_type);
-        }
+        launch_rmsnorm_batch(r, m->verify_x, m->verify_x,
+            r->d_output_norm, r->n_embd, rows, r->n_embd,
+            r->rms_norm_eps);
+        hllm_dense_mtp_projection(r, m->verify_logits, r->d_output_w,
+            m->verify_x, rows, r->n_vocab, r->n_embd, r->output_w_type);
         r->d_x = saved_x;
         r->cur_position = saved_position;
         r->active_layer = saved_layer;

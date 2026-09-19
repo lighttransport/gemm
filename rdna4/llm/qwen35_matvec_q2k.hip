@@ -136,28 +136,29 @@ extern "C" __global__ void qwen35_matvec_q2k_rows(
     if (lane == 0) out[row] = sum;
 }
 
-extern "C" __global__ void qwen35_matvec_q2k_multi4(
+template<int MAX_COUNT>
+__device__ __forceinline__ void qwen35_matvec_q2k_multi(
         float *out, const unsigned char *weights, const signed char *q,
         const float *scales, int rows, int cols, int count) {
     int lane=threadIdx.x&31, row=blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
     if (row>=rows) return;
     int blocks=cols/256, iqs=lane&15;
     const unsigned char *w=weights+(size_t)row*blocks*84;
-    float sum[4]={};
+    float sum[MAX_COUNT]={};
 #pragma unroll
     for (int vw=0; vw<8; ++vw) {
-        float partial[4]={};
+        float partial[MAX_COUNT]={};
         for (int b=lane/16+2*vw; b<blocks; b+=16) {
             const unsigned char *p=w+b*84;
             const unsigned char *s=p+(iqs&~7)+(iqs&7)/4;
             int v=((const int *)(p+16))[iqs];
-            float sd[4]={}, sm[4]={};
+            float sd[MAX_COUNT]={}, sm[MAX_COUNT]={};
 #pragma unroll
             for (int j=0; j<4; ++j) {
                 int qb=b*8+4*(iqs/8)+j;
                 int low=s[2*j]&15, high=(s[2*j]>>4)*0x01010101;
 #pragma unroll
-                for (int t=0; t<4; ++t) if (t<count) {
+                for (int t=0; t<MAX_COUNT; ++t) if (t<count) {
                     int u=((const int *)(q+(size_t)t*cols+qb*32))[iqs&7];
                     int z=__builtin_amdgcn_sudot4(true,(v>>(2*j))&0x03030303,true,u,0,false);
                     int zm=__builtin_amdgcn_sudot4(true,high,true,u,0,false);
@@ -167,14 +168,26 @@ extern "C" __global__ void qwen35_matvec_q2k_multi4(
             }
             float d=(float)*(const _Float16 *)(p+80), dm=(float)*(const _Float16 *)(p+82);
 #pragma unroll
-            for (int t=0; t<4; ++t) if (t<count) partial[t]+=d*sd[t]-dm*sm[t];
+            for (int t=0; t<MAX_COUNT; ++t) if (t<count) partial[t]+=d*sd[t]-dm*sm[t];
         }
 #pragma unroll
-        for (int t=0; t<4; ++t) if (t<count) sum[t]+=partial[t];
+        for (int t=0; t<MAX_COUNT; ++t) if (t<count) sum[t]+=partial[t];
     }
 #pragma unroll
-    for (int t=0; t<4; ++t) if (t<count) {
+    for (int t=0; t<MAX_COUNT; ++t) if (t<count) {
         for (int offset=16; offset; offset>>=1) sum[t]+=__shfl_xor(sum[t],offset,32);
         if (lane==0) out[(size_t)t*rows+row]=sum[t];
     }
+}
+
+extern "C" __global__ void qwen35_matvec_q2k_multi4(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    qwen35_matvec_q2k_multi<4>(out,weights,q,scales,rows,cols,count);
+}
+
+extern "C" __global__ void qwen35_matvec_q2k_multi8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    qwen35_matvec_q2k_multi<8>(out,weights,q,scales,rows,cols,count);
 }

@@ -1,6 +1,6 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
-## Native DFlash2 experiment (2026-09-20)
+## Optimized native DFlash2 (2026-09-20)
 
 The runner now loads the IncoAI Qwen3.8-27B DFlash2 Q4_K_M sidecar and runs
 its five-layer block-diffusion graph entirely through HIP.  Target inputs from
@@ -9,14 +9,26 @@ top-16 selector proposes up to seven tokens, while the existing exact Q8/Q8
 target window remains the only source of emitted tokens and committed state.
 
 On the 4096-token C clamp prompt, K=4 accepted 37/40 drafts and K=7 accepted
-41/42.  Both produced the ordinary target's exact 46-token response, EOS and
-sequence hash `15f17d2640c1adfc`; the emitted C is coherent and compilable.
-K=7 measured 32.04 tok/s decode and 449.07 tok/s prefill, versus 37.82 and
-489.49 tok/s for ordinary native execution.  K=4 measured 30.37 and 451.22.
-The upstream llama.cpp server path measured 16.54 tok/s at K=4 with the same
-37/40 acceptance, versus its 25.88 tok/s baseline.  Native drafting is much
-faster than upstream but still loses to ordinary native decode because exact
-target multi-row projections do not yet reuse enough weights.  Keep it opt-in.
+40/42.  Both produced the ordinary target's exact 46-token response, EOS and
+sequence hash `15f17d2640c1adfc`; the emitted C is coherent, compiles warning
+free as C17 and passes `INT_MIN`/`INT_MAX` boundary cases.  The final warm K=7
+run measured **43.68 tok/s decode and 446.38 tok/s prefill**, versus 37.82 and
+489.49 for ordinary native execution.  K=4 measured 38.91 and 446.24.  The
+upstream llama.cpp server path measured 16.54 tok/s at K=4 with the same 37/40
+acceptance, versus its 25.88 baseline.  Native K=4 is 2.35x faster than
+upstream DFlash2, and K=7 is 15 percent faster than ordinary native decode.
+
+The exact verifier now reuses decoded weights across up to eight rows for
+Q2_K, IQ1_S, IQ1_M, IQ2/IQ3 and IQ4_XS.  Eight-row IQ kernels specialize the
+quantization format at compile time, eliminating runtime codebook branches.
+RMSNorm and residual-plus-RMSNorm use one batched launch with an independent
+block and unchanged reduction per row.  The DFlash draft reuses Q4_K weights
+across eight rows and K/V values across four attention rows.  K=7 timing for
+the final 46-token response is draft 198.01 ms, target verify 814.35 ms and
+commit 15.51 ms.  Target verification remains the largest cost; profiling
+before the final norm batching assigned the largest exact kernels to Q2_K
+multi-row (93.96 ms), IQ multi-row (265.74 ms combined), IQ4_XS (61.20 ms),
+target Q8 attention (56.78 ms including combine), and state/norm work.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`

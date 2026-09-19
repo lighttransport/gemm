@@ -47,8 +47,8 @@ both K and V:
 | Path | Prefill tok/s | Decode tok/s | Accepted drafts | Sequence hash |
 |---|---:|---:|---:|---|
 | Ordinary target | 489.49 | 37.82 | — | `15f17d2640c1adfc` |
-| Native DFlash2, K=4 | 451.22 | 30.37 | 37/40 | `15f17d2640c1adfc` |
-| Native DFlash2, K=7 | 449.07 | 32.04 | 41/42 | `15f17d2640c1adfc` |
+| Native DFlash2, K=4 | 446.24 | 38.91 | 37/40 | `15f17d2640c1adfc` |
+| Native DFlash2, K=7 | 446.38 | 43.68 | 41/42 | `15f17d2640c1adfc` |
 
 All three paths emitted the same 46-token response and EOS.  The response is
 valid C and implements the requested inclusive clamp without overflow-prone
@@ -64,12 +64,22 @@ int clamp(int x, int lo, int hi) {
 
 The upstream llama.cpp server reference accepted 37/40 drafts at K=4 on the
 same prompt, but measured 16.54 tok/s versus its 25.88 tok/s ordinary path.
-The native implementation reproduces that acceptance exactly and is about
-1.84 times as fast as the upstream DFlash2 result.  It is still slower than
-ordinary native decode, so DFlash2 remains opt-in.  The main remaining cost is
-target verification: current IQ multi-row kernels preserve scalar arithmetic
-but do not reuse enough target weights across eight rows.  DFlash prompt-cache
-injection also reduces 4K prefill by about eight percent.
+The native K=4 implementation reproduces that acceptance exactly and is 2.35
+times as fast.  K=7 is 15 percent faster than ordinary native decode on this
+prompt.  DFlash prompt-cache injection still reduces 4K prefill by about nine
+percent, and the feature remains opt-in while serving integration and broader
+quality coverage are incomplete.
+
+The optimized target verifier decodes IQ and Q2_K weights once for up to eight
+candidate rows.  Quantization-format-specific kernels remove runtime codebook
+branches; exact Q8_1 IQ1_S/IQ1_M kernels reuse each decoded group; IQ4_XS keeps
+the reference's eight virtual sums.  RMSNorm and residual-plus-RMSNorm launch
+one independent block per candidate row.  The draft also reuses Q4_K weights
+and holds one K/V vector while evaluating four mask rows.  These changes keep
+the target sequence unchanged while reducing the K=7 draft/verify/commit split
+to 197.28/813.57/15.51 ms for the complete 46-token response.  The emitted
+source passes `gcc -std=c17 -Wall -Wextra -Wpedantic -Werror` and boundary
+tests using `INT_MIN` and `INT_MAX`.
 
 The tested sidecar is
 `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, SHA-256

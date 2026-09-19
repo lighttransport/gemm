@@ -2092,7 +2092,7 @@ int main(int argc, char **argv) {
             int selected = 0;
             int32_t dense_drafts[16];
             int dense_count = 0, dense_index = 0, dense_proposed = 0, dense_accepted = 0;
-            double dense_draft_ms = 0;
+            double dense_draft_ms = 0, dense_verify_ms = 0, dense_commit_ms = 0;
             float *dense_logits = NULL;
             int dense_window_rows = 0;
             const int dense_dflash2 = qwen35_dflash2_path != NULL;
@@ -2203,7 +2203,9 @@ int main(int argc, char **argv) {
                         int32_t inputs[16]; inputs[0] = next_tok;
                         memcpy(inputs+1, dense_drafts, (size_t)dense_count*sizeof(int32_t));
                         dense_window_rows = dense_count+1;
+                        double tv = get_time_ms();
                         dense_logits = hip_llm_qwen35_mtp_verify(gpu, inputs, dense_window_rows, pos);
+                        dense_verify_ms += get_time_ms()-tv;
                         if (!dense_logits) { pass = 0; finish_reason = "error"; break; }
                     }
                 }
@@ -2231,10 +2233,12 @@ int main(int argc, char **argv) {
                     dense_index++;
                     if (matched) dense_accepted++;
                     if (!matched || dense_index == dense_window_rows) {
+                        double tc = get_time_ms();
                         int commit_rc = dense_dflash2 ?
                             hip_llm_qwen35_dflash2_commit(gpu, pos-dense_index+1,
                                                           dense_index) :
                             hip_llm_qwen35_mtp_commit(gpu, dense_index);
+                        dense_commit_ms += get_time_ms()-tc;
                         if (commit_rc) { pass=0; finish_reason="error"; break; }
                         dense_window_rows = dense_index = dense_count = 0;
                     }
@@ -2244,17 +2248,21 @@ int main(int argc, char **argv) {
                 }
             }
             if (dense_window_rows && dense_index > 0) {
+                double tc = get_time_ms();
                 int commit_rc = dense_dflash2 ?
                     hip_llm_qwen35_dflash2_commit(gpu,
                         bench_depth+n_prefill+decoded-dense_index,dense_index) :
                     hip_llm_qwen35_mtp_commit(gpu,dense_index);
+                dense_commit_ms += get_time_ms()-tc;
                 if (commit_rc) pass=0;
             }
             if (gen_text) fprintf(stderr, "\n=== end ===\n");
             if (dense_path)
-                fprintf(stderr, "%s drafted=%d accepted=%d draft_ms=%.3f verify=%s\n",
+                fprintf(stderr, "%s drafted=%d accepted=%d draft_ms=%.3f "
+                        "verify_ms=%.3f commit_ms=%.3f verify=%s\n",
                         dense_dflash2 ? "DFLASH2" : "DENSE_MTP",
                         dense_proposed, dense_accepted, dense_draft_ms,
+                        dense_verify_ms, dense_commit_ms,
                         dense_window ? "window" : "sequential");
             double t_dec1 = get_time_ms();
             fprintf(stderr, "GENERATION finish=%s selected=%d emitted=%d synthetic=%d\n",

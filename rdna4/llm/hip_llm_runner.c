@@ -2461,6 +2461,29 @@ static const char *hip_kernel_source =
 "    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
 "        if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
 "}\n"
+"/* Eight-row DFlash2 specialization.  It retains the scalar g4 operation\n"
+" * order independently for each row and halves Q4_K weight traffic versus\n"
+" * launching the four-row tile twice. */\n"
+"__global__ void matvec_q4_K_batch_reuse8(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token0=blockIdx.y*8;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*4;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*144; float sum[8]={0,0,0,0,0,0,0,0};\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>2,c=g&3,is=2*c;\n"
+"        const unsigned char *bp=rp+b*144; float d=half_to_float(*(const half_raw*)bp);\n"
+"        float dm=half_to_float(*(const half_raw*)(bp+2)); const unsigned char *sc=bp+4;\n"
+"        unsigned char sv0,mv0,sv1,mv1;\n"
+"        if(is<4){sv0=sc[is]&63;mv0=sc[is+4]&63;}\n"
+"        else {sv0=(sc[is+4]&15)|((sc[is-4]>>6)<<4);mv0=(sc[is+4]>>4)|((sc[is]>>6)<<4);}\n"
+"        if(is+1<4){sv1=sc[is+1]&63;mv1=sc[is+1+4]&63;}\n"
+"        else {sv1=(sc[is+1+4]&15)|((sc[is+1-4]>>6)<<4);mv1=(sc[is+1+4]>>4)|((sc[is+1]>>6)<<4);}\n"
+"        float d1=d*sv0,m1=dm*mv0,d2=d*sv1,m2=dm*mv1; const unsigned char *q=bp+16+c*32;\n"
+"        for(int t=0;t<8;t++){int token=token0+t;if(token<M){const float *xb=x+(size_t)token*x_stride+b*256+c*64;\n"
+"            float p=0.0f;for(int l=0;l<32;l++)p+=(d1*(q[l]&15)-m1)*xb[l]+(d2*(q[l]>>4)-m2)*xb[l+32];sum[t]+=p;}}\n"
+"    }\n"
+"    for(int t=0;t<8;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
 "\n"
 "/* ---- 17. matvec_q6_K_f32: Q6_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q6_K block: 210 bytes = ql[128] + qh[64] + scales[16] + d(f16), 256 elements */\n"
@@ -7974,6 +7997,16 @@ static const char *hip_kernel_source =
 "    float inv = rsqrtf(sd[0] / n + eps);\n"
 "    for (int i = tid; i < n; i += blockDim.x) xb[i] = x[i] * inv * w[i];\n"
 "}\n"
+"/* Same reduction contract, one independent row per block. */\n"
+"__global__ void res_rmsnorm_batch_f32(float *x, const float *res, float *xb,\n"
+"        const float *w, int n, int rows, float eps) {\n"
+"    extern __shared__ float sd[]; int row=blockIdx.x,tid=threadIdx.x;\n"
+"    if(row>=rows)return; x+=(size_t)row*n;res+=(size_t)row*n;xb+=(size_t)row*n;\n"
+"    float ss=0.0f;for(int i=tid;i<n;i+=blockDim.x){float v=x[i]+res[i];x[i]=v;ss+=v*v;}\n"
+"    sd[tid]=ss;__syncthreads();\n"
+"    for(int st=blockDim.x/2;st>0;st>>=1){if(tid<st)sd[tid]+=sd[tid+st];__syncthreads();}\n"
+"    float inv=rsqrtf(sd[0]/n+eps);for(int i=tid;i<n;i+=blockDim.x)xb[i]=x[i]*inv*w[i];\n"
+"}\n"
 "/* ---- moe_router_fused: per-block expert dot, last block does topK+softmax. */\n"
 "/* grid = ne+1 blocks x 256 thr. Block ne = shared-gate dot + sigmoid. Counter */\n"
 "/* must be 0 before launch; the topk block resets it for the next layer.       */\n"
@@ -8534,6 +8567,28 @@ static const char *hip_kernel_source =
 "        const signed char *q,const float *sd,const float *ss,int nr,int nc,int M){\n"
 "    iq1_s_q81_body(dst,mat,q,sd,ss,nr,nc,M,0);\n"
 "}\n"
+"/* Exact Q8_1 IQ1_S verification for up to eight rows.  A warp owns one\n"
+" * output row and decodes each weight group once while retaining a distinct\n"
+" * accumulator for every speculative row. */\n"
+"__global__ void matvec_iq1_s_q81_reuse8(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *sd,const float *ss,int nr,int nc,int M){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;\n"
+"    if(row>=nr)return; int nb=nc/256,G=nb*8; float sum[8]={0,0,0,0,0,0,0,0};\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*50; int qblocks=nc/32;\n"
+"    for(int qb=lane;qb<G;qb+=32){int b=qb>>3,ib=qb&7; const unsigned char *bp=rp+b*50;\n"
+"        const unsigned short *qh=(const unsigned short*)(bp+34); const unsigned char *qs=bp+2;\n"
+"        float dw=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1);\n"
+"        float delta=(qh[ib]&0x8000)?(-1.0f-0.125f):(-1.0f+0.125f);\n"
+"        unsigned int grid[4];\n"
+"        for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);grid[l]=iq1s_grid_gpu_dev[gi];}\n"
+"        for(int t=0;t<M;++t){const signed char *xp=q+(size_t)t*nc+(size_t)qb*32; int z=0;\n"
+"            for(int l=0;l<4;++l){int w0=(int)(grid[l]&0x0f0f0f0fu),w1=(int)((grid[l]>>4)&0x0f0f0f0fu);\n"
+"                const int *u=(const int*)(xp+l*8);z=dp4a_hw(w0,u[0],z);z=dp4a_hw(w1,u[1],z);}\n"
+"            sum[t]+=dw*(sd[(size_t)t*qblocks+qb]*(float)z+ss[(size_t)t*qblocks+qb]*delta);}\n"
+"    }\n"
+"    for(int t=0;t<M;++t){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0)dst[(size_t)t*nr+row]=sum[t];}\n"
+"}\n"
 "__global__ void matvec_iq1_s_mmq_scales(float *dst,const unsigned char *mat,\n"
 "        const signed char *q,const float *sd,const float *ss,int nr,int nc,int M){\n"
 "    iq1_s_q81_body(dst,mat,q,sd,ss,nr,nc,M,1);\n"
@@ -8786,6 +8841,28 @@ static const char *hip_kernel_source =
 "        sum+=base*(float)scode*td[qb]*((float)z+delta*(float)qsum);\n"
 "    }\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"/* Exact Q8_1 IQ1_M verification with the same per-row accumulation order as\n"
+" * matvec_iq1_m_q81_batch and one shared weight decode for up to eight rows. */\n"
+"__global__ void matvec_iq1_m_q81_reuse8(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *sd,const float *ss,int nr,int nc,int M){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;\n"
+"    if(row>=nr)return; int nb=nc/256,G=nb*32,qblocks=nc/32; float sum[8]={0,0,0,0,0,0,0,0};\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*56;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,rem=g&31,ib=rem>>2,l=rem&3,qb=b*8+ib;\n"
+"        const unsigned char *bp=rp+b*56,*qs=bp,*qh=bp+32;const unsigned short *sc=(const unsigned short*)(bp+48);\n"
+"        unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"        float base=half_to_float(*(const half_raw*)&su);unsigned short sw=sc[ib/2];int sh=6*(ib%2);\n"
+"        int scode=2*((sw>>(sh+(l>=2?3:0)))&7)+1;unsigned char hv=qh[2*ib+(l>>1)];\n"
+"        int qshift=(l&1)?4:8;unsigned short gi=qs[4*ib+l]|((unsigned short)(hv<<qshift)&0x700u);\n"
+"        float delta=(hv&((l&1)?0x80:0x08))?(-1.0f-0.125f):(-1.0f+0.125f);\n"
+"        unsigned int grid=iq1s_grid_gpu_dev[gi];int w0=(int)(grid&0x0f0f0f0fu),w1=(int)((grid>>4)&0x0f0f0f0fu);\n"
+"        for(int t=0;t<M;++t){const signed char *xp=q+(size_t)t*nc+(size_t)qb*32+l*8;const int *u=(const int*)xp;\n"
+"            int z=dp4a_hw(w0,u[0],0);z=dp4a_hw(w1,u[1],z);int qsum=0;for(int j=0;j<8;++j)qsum+=(int)xp[j];\n"
+"            sum[t]+=base*(float)scode*sd[(size_t)t*qblocks+qb]*((float)z+delta*(float)qsum);}\n"
+"    }\n"
+"    for(int t=0;t<M;++t){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0)dst[(size_t)t*nr+row]=sum[t];}\n"
 "}\n"
 "__global__ void matvec_iq1_m_dp4a2_batch(float *dst,const unsigned char *mat,\n"
 "        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
@@ -12694,6 +12771,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q4_K_mw_f32;
     hipFunction_t fn_matvec_q4_K_g4_f32;
     hipFunction_t fn_matvec_q4_K_batch_reuse4;
+    hipFunction_t fn_matvec_q4_K_batch_reuse8;
     int q4k_g4;                             /* LLM_Q4K_G4: warp-per-row G=nb*4 Q4_K */
     hipFunction_t fn_matvec_q5_K_f32;
     hipFunction_t fn_matvec_q5_K_mw_f32;
@@ -12787,6 +12865,7 @@ struct hip_llm_runner {
     int ssm_out_mw;                             /* LLM_SSM_OUT_MW */
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
+    hipFunction_t fn_res_rmsnorm_batch_f32;
     hipFunction_t fn_qwen4_router_batch_native;
     hipFunction_t fn_shexp_gateup_silu_q6k_batch;
     hipFunction_t fn_shexp_down_accum_q6k_batch;
@@ -12950,12 +13029,14 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq1_s_dp4a2;
     hipFunction_t fn_matvec_iq1_s_dp4a2_batch;
     hipFunction_t fn_matvec_iq1_s_q81_batch;
+    hipFunction_t fn_matvec_iq1_s_q81_reuse8;
     hipFunction_t fn_matvec_iq1_s_mmq_scales;
     hipFunction_t fn_matvec_iq1_s_dp4a2_batch_reuse4;
     hipFunction_t fn_matvec_iq1_m_f32;
     hipFunction_t fn_matvec_iq1_m_batch_f32;
     hipFunction_t fn_matvec_iq1_m_dp4a2_batch;
     hipFunction_t fn_matvec_iq1_m_q81_batch;
+    hipFunction_t fn_matvec_iq1_m_q81_reuse8;
     hipFunction_t fn_matvec_iq1_m_dp4a2_batch_reuse4;
     hipFunction_t fn_matvec_iq1_q8_single_batch;
     hipFunction_t fn_matvec_iq1_m_dp4a2;
@@ -13466,7 +13547,7 @@ struct hip_llm_runner {
     hipModule_t q2k_module;
     hipFunction_t fn_qwen35_quantize_q81, fn_qwen35_matvec_q2k;
     hipFunction_t fn_qwen35_matvec_q2k_rows;
-    hipFunction_t fn_qwen35_matvec_q2k_multi4;
+    hipFunction_t fn_qwen35_matvec_q2k_multi4, fn_qwen35_matvec_q2k_multi8;
     void *d_native_q81, *d_native_scale, *native_q81_source;
     int native_q81_valid, native_q81_n;
     hipFunction_t fn_qwen35_argmax_parts, fn_qwen35_argmax_finish;
@@ -13476,8 +13557,11 @@ struct hip_llm_runner {
     struct hllm_qwen35_dflash2 *qwen35_dflash2;
     hipFunction_t fn_qwen35_matvec_iq2xxs, fn_qwen35_matvec_iq2xs;
     hipFunction_t fn_qwen35_matvec_iq2s, fn_qwen35_matvec_iq3xxs, fn_qwen35_matvec_iq3s;
-    hipFunction_t fn_qwen35_matvec_iq4xs;
-    hipFunction_t fn_qwen35_matvec_iq_multi4;
+    hipFunction_t fn_qwen35_matvec_iq4xs, fn_qwen35_matvec_iq4xs_multi8;
+    hipFunction_t fn_qwen35_matvec_iq_multi4, fn_qwen35_matvec_iq_multi8;
+    hipFunction_t fn_qwen35_matvec_iq2xxs_multi8, fn_qwen35_matvec_iq2xs_multi8;
+    hipFunction_t fn_qwen35_matvec_iq2s_multi8, fn_qwen35_matvec_iq3xxs_multi8;
+    hipFunction_t fn_qwen35_matvec_iq3s_multi8;
     hipGraph_t  graph_hidden;     /* captured forward (no lm_head) pipeline */
     hipGraphExec_t graph_exec_hidden;
     hipGraph_t hc_graph[97];
@@ -13783,6 +13867,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q4_K_mw_f32);
     GET_FUNC(matvec_q4_K_g4_f32);
     GET_FUNC(matvec_q4_K_batch_reuse4);
+    GET_FUNC(matvec_q4_K_batch_reuse8);
     GET_FUNC(matvec_q5_K_f32);
     GET_FUNC(matvec_q5_K_mw_f32);
     GET_FUNC(matvec_q5_K_mw16_f32);
@@ -13866,6 +13951,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(ssm_inv_mean_f32);
     GET_FUNC(moe_route_decode);
     GET_FUNC(res_rmsnorm_f32);
+    GET_FUNC(res_rmsnorm_batch_f32);
     GET_FUNC(qwen4_router_batch_native);
     GET_FUNC(shexp_gateup_silu_q6k_batch);
     GET_FUNC(shexp_down_accum_q6k_batch);
@@ -13929,8 +14015,10 @@ static int compile_kernels(hip_llm_runner *r) {
         }
     }
     GET_FUNC(matvec_iq1_s_q81_batch);
+    GET_FUNC(matvec_iq1_s_q81_reuse8);
     GET_FUNC(matvec_iq1_s_mmq_scales);
     GET_FUNC(matvec_iq1_m_q81_batch);
+    GET_FUNC(matvec_iq1_m_q81_reuse8);
     GET_FUNC(matvec_iq2_xs_q81_batch);
     GET_FUNC(matvec_iq2_xs_mmq_scales);
     GET_FUNC(matvec_iq2_xxs_q81_batch);
@@ -17299,6 +17387,8 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                       r->q2k_module, "qwen35_matvec_q2k_rows"));
             CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k_multi4,
                       r->q2k_module, "qwen35_matvec_q2k_multi4"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k_multi8,
+                      r->q2k_module, "qwen35_matvec_q2k_multi8"));
             if (!r->d_native_q81) CHECK_HIP(hipMalloc(&r->d_native_q81, 17408));
             if (!r->d_native_scale) CHECK_HIP(hipMalloc(&r->d_native_scale, 17408/32*sizeof(float)));
             CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_argmax_parts, r->q2k_module, "qwen35_argmax_parts"));
@@ -17324,8 +17414,22 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                           r->iq_module, "qwen35_matvec_iq3s"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs,
                           r->iq_module, "qwen35_matvec_iq4xs"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs_multi8,
+                          r->iq_module, "qwen35_matvec_iq4xs_multi8"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq_multi4,
                           r->iq_module, "qwen35_matvec_iq_multi4"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq_multi8,
+                          r->iq_module, "qwen35_matvec_iq_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xxs_multi8,
+                          r->iq_module, "qwen35_matvec_iq2xxs_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_multi8,
+                          r->iq_module, "qwen35_matvec_iq2xs_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2s_multi8,
+                          r->iq_module, "qwen35_matvec_iq2s_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3xxs_multi8,
+                          r->iq_module, "qwen35_matvec_iq3xxs_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s_multi8,
+                          r->iq_module, "qwen35_matvec_iq3s_multi8"));
             }
         }
         if (options->decode_kernel_mode == HIP_LLM_DECODE_KERNEL_NATIVE) {
@@ -20659,8 +20763,11 @@ static inline void launch_matvec_qwen35_native_batch(hip_llm_runner *r,
     if (type == GGML_TYPE_Q4_K && (!q4k_batch_env || atoi(q4k_batch_env) != 0) &&
         M > 0 && M <= r->batch_max && (n_cols % 256) == 0) {
         void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
-        LAUNCH(r->fn_matvec_q4_K_batch_reuse4, (n_rows + 7) / 8,
-               (M + 3) / 4, 1, 256, 1, 1, 0, r->stream, args);
+        hipFunction_t fn = M > 4 ? r->fn_matvec_q4_K_batch_reuse8 :
+                                   r->fn_matvec_q4_K_batch_reuse4;
+        int tile = M > 4 ? 8 : 4;
+        LAUNCH(fn, (n_rows + 7) / 8, (M + tile - 1) / tile, 1,
+               256, 1, 1, 0, r->stream, args);
     } else if (type == GGML_TYPE_IQ2_XXS)
         launch_matvec_iq2_xxs_batch(r, dst, mat, x, M, n_rows, n_cols, x_stride);
     else if (type == GGML_TYPE_IQ2_XS)

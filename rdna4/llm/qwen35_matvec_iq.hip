@@ -269,8 +269,11 @@ extern "C" __global__ void qwen35_matvec_iq3s(
     if (lane == 0) out[row] = sum;
 }
 
-/* Decode each IQ grid once for up to four speculative activation rows. */
-extern "C" __global__ void qwen35_matvec_iq_multi4(
+/* Decode each IQ grid once for several speculative activation rows.  DFlash2
+ * verifies five or eight rows at a time, so keep a wider specialization in
+ * addition to the lower-register four-row kernel used by dense NextN. */
+template<int MAX_COUNT>
+__device__ __forceinline__ void qwen35_matvec_iq_multi(
         float *out, const unsigned char *weights, const signed char *q,
         const float *scales, int rows, int cols, int kind, int count) {
     int lane = threadIdx.x & 31;
@@ -278,13 +281,13 @@ extern "C" __global__ void qwen35_matvec_iq_multi4(
     if (row >= rows) return;
     int bs = kind==0 ? 66 : kind==1 ? 74 : kind==2 ? 82 : kind==3 ? 98 : 110;
     const unsigned char *w = weights+(size_t)row*(cols/256)*bs;
-    float sum[4] = {};
+    float sum[MAX_COUNT] = {};
     for (int qb = lane; qb < cols/32; qb += 32) {
         int ib = qb&7;
         const unsigned char *p = w+(qb/8)*bs;
         unsigned int aux = kind==0 ? *(const unsigned int *)(p+6+ib*8) :
             kind==3 ? *(const unsigned int *)(p+66+ib*4) : 0;
-        int z0[4] = {}, z1[4] = {};
+        int z0[MAX_COUNT] = {}, z1[MAX_COUNT] = {};
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             unsigned int lo, hi, signs;
@@ -315,7 +318,7 @@ extern "C" __global__ void qwen35_matvec_iq_multi4(
             }
             int a=qwen35_signed_grid(lo, signs, 0), b=qwen35_signed_grid(hi, signs, 4);
 #pragma unroll
-            for (int m = 0; m < 4; ++m) if (m < count) {
+            for (int m = 0; m < MAX_COUNT; ++m) if (m < count) {
                 const int *u=(const int *)(q+(size_t)m*cols+qb*32);
                 if ((kind==1 || kind==2) && j>=2) {
                     z1[m]=qwen35_dot4(a,u[2*j],z1[m]);
@@ -327,7 +330,7 @@ extern "C" __global__ void qwen35_matvec_iq_multi4(
             }
         }
 #pragma unroll
-        for (int m = 0; m < 4; ++m) if (m < count) {
+        for (int m = 0; m < MAX_COUNT; ++m) if (m < count) {
             int z=z0[m];
             if (kind==0) z=z*(int)((aux>>27)|1)/8;
             else if (kind==1 || kind==2) {
@@ -340,8 +343,102 @@ extern "C" __global__ void qwen35_matvec_iq_multi4(
         }
     }
 #pragma unroll
-    for (int m = 0; m < 4; ++m) if (m < count) {
+    for (int m = 0; m < MAX_COUNT; ++m) if (m < count) {
         for (int offset=16; offset; offset>>=1) sum[m]+=__shfl_xor(sum[m],offset,32);
+        if (lane==0) out[(size_t)m*rows+row]=sum[m];
+    }
+}
+
+extern "C" __global__ void qwen35_matvec_iq_multi4(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int kind, int count) {
+    qwen35_matvec_iq_multi<4>(out,weights,q,scales,rows,cols,kind,count);
+}
+
+extern "C" __global__ void qwen35_matvec_iq_multi8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int kind, int count) {
+    qwen35_matvec_iq_multi<8>(out,weights,q,scales,rows,cols,kind,count);
+}
+
+/* Give the compiler a constant format for the eight-row verifier.  The
+ * generic entry point keeps its runtime selector for diagnostics, while
+ * these production variants discard the unused codebook branches and their
+ * live values. */
+extern "C" __global__ void qwen35_matvec_iq2xxs_multi8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    qwen35_matvec_iq_multi<8>(out,weights,q,scales,rows,cols,0,count);
+}
+extern "C" __global__ void qwen35_matvec_iq2xs_multi8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    qwen35_matvec_iq_multi<8>(out,weights,q,scales,rows,cols,1,count);
+}
+extern "C" __global__ void qwen35_matvec_iq2s_multi8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    qwen35_matvec_iq_multi<8>(out,weights,q,scales,rows,cols,2,count);
+}
+extern "C" __global__ void qwen35_matvec_iq3xxs_multi8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    qwen35_matvec_iq_multi<8>(out,weights,q,scales,rows,cols,3,count);
+}
+extern "C" __global__ void qwen35_matvec_iq3s_multi8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    qwen35_matvec_iq_multi<8>(out,weights,q,scales,rows,cols,4,count);
+}
+
+/* IQ4_XS keeps eight virtual reference sums per output row.  Reuse decoded
+ * nibbles across the verifier rows without changing that per-row summation
+ * order. */
+extern "C" __global__ void qwen35_matvec_iq4xs_multi8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    int lane=threadIdx.x&31;
+    int row=blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
+    if (row>=rows) return;
+    int blocks=cols/256;
+    const unsigned char *w=weights+(size_t)row*blocks*136;
+    float sum[8]={};
+#pragma unroll
+    for (int vw=0; vw<8; ++vw) {
+        float partial[8]={};
+        for (int qb=lane+32*vw; qb<blocks*8; qb+=256) {
+            int ib=qb&7;
+            const unsigned char *p=w+(qb/8)*136;
+            const unsigned int *v=(const unsigned int *)(p+8+ib*16);
+            int z[8]={};
+#pragma unroll
+            for (int j=0; j<4; ++j) {
+                int lo=qwen35_iq4_lookup(v[j]);
+                int hi=qwen35_iq4_lookup(v[j]>>4);
+#pragma unroll
+                for (int m=0; m<8; ++m) if (m<count) {
+                    const int *u=(const int *)(q+(size_t)m*cols+qb*32);
+                    z[m]=qwen35_dot4(lo,u[j],z[m]);
+                    z[m]=qwen35_dot4(hi,u[j+4],z[m]);
+                }
+            }
+            int ls=((p[4+ib/2]>>(4*(ib&1)))&15) |
+                   (((*(const unsigned short *)(p+2)>>(2*ib))&3)<<4);
+#pragma unroll
+            for (int m=0; m<8; ++m) if (m<count) {
+                int zz=z[m]*(ls-32);
+                float d=(float)*(const _Float16 *)p *
+                        scales[(size_t)m*(cols/32)+qb];
+                partial[m]+=d*zz;
+            }
+        }
+#pragma unroll
+        for (int m=0; m<8; ++m) if (m<count) sum[m]+=partial[m];
+    }
+#pragma unroll
+    for (int m=0; m<8; ++m) if (m<count) {
+        for (int offset=16; offset; offset>>=1)
+            sum[m]+=__shfl_xor(sum[m],offset,32);
         if (lane==0) out[(size_t)m*rows+row]=sum[m];
     }
 }
