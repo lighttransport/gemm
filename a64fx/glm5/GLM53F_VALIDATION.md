@@ -611,3 +611,65 @@ The embedding and router artifact comparison covered token IDs
 three tail variants each matched all 32 greedy token positions exactly. This
 is a fresh multi-input component verification of the llama.cpp module; it does
 not change the separate full-checkpoint one-token result above.
+
+## Production Q2 trunk localization
+
+The token-1234 production mismatch was localized with full 45-layer hidden
+stream traces. Job 51802532 used the aligned Q5_K embedding, Q4_K vocabulary
+head, and Q2 routed-expert images, then compared each production layer output
+with the retained streamed-GGUF reference from job 51766725. The baseline
+remained finite and returned token 2 at 0.895 tok/s, but the error was already
+present after layer 0 and accumulated through the trunk:
+
+| Layer | Relative L2 | Maximum absolute error |
+| ---: | ---: | ---: |
+| 0 | 0.0308757 | 0.00123223 |
+| 2 | 0.0190865 | 0.00496860 |
+| 7 | 0.234865 | 1.20450 |
+| 11 | 0.669431 | 0.807597 |
+| 19 | 1.34434 | 79.6162 |
+| 44 | 1.17157 | 12.8315 |
+
+Job 51803138 then dequantized the GGUF compact-core tensors for layer 0 into
+the rank-local production image. This reduced layer-0 relative L2 from
+0.0308757 to 0.01635, but changed the final token only from 2 to 198. Job
+51803737 extended that conversion to all compact-core tensors, router weights,
+and shared experts. Its final token changed to 565, still not the streamed
+reference token 29656. These are localization experiments, not equality
+passes.
+
+The remaining dense layers 0--2 were exercised natively in job 51805752.
+Unlike the compact image's block-128 FP8 representation, the new dense stage
+preserved the original GGUF blocks and used the production GGML dequantization
+contract. The job ran four arms from one allocation and retained 45 layer
+artifacts from each:
+
+| Arm | Layer 0 rel L2 | Layer 2 rel L2 | Layer 11 rel L2 | Layer 44 rel L2 | Final token/logit | tok/s |
+| --- | ---: | ---: | ---: | ---: | --- | ---: |
+| safetensors trunk baseline | 0.0308757 | 0.0190865 | 0.669431 | 1.17157 | `2 / 10.5463228` | 0.831 |
+| native GGUF dense 0--2 | 0.0299168 | 0.0132937 | 0.640100 | 1.13520 | `198 / 10.5412445` | 0.849 |
+| native dense + compact core 0--2 | 0.0158535 | 0.0103608 | 0.657187 | 1.15790 | `198 / 11.3150311` | 0.881 |
+| native dense + all compact core/shared | 0.0158535 | 0.0103608 | 0.517100 | 1.15297 | `2 / 10.6294079` | 0.823 |
+
+Every build, preflight, staging, conversion, trace-count, finite-output, and
+decode sentinel passed. Peak observed load-time headroom remained about 20
+GiB `MemAvailable`. Job 51804830 was the same validation with a one-hour
+allocation; it expired harmlessly while staging routed experts at layer 42
+and produced no decode result. Job 51805752 repeated it with a six-hour
+allocation and completed.
+
+This result rules out the dense FFNs, shared experts, routers, and boundary
+weights as individually sufficient explanations. The first residual is
+inside layer 0. Layers 0--2 are KDA layers: their GGUF attention matrices are
+currently dequantized and rounded into the compact BF16 production layout,
+whereas the streamed reference applies the original GGUF quantized operators.
+The reduction from 0.03088 to 0.01585 after source alignment is evidence that
+the source mismatch mattered, but it is not an exact-arithmetic gate. The next
+full-model equality increment should preserve native GGUF blocks for the KDA
+attention projections (or add sublayer artifacts around KDA and mHC to prove a
+different first boundary) before spending another run on later MoE layers.
+
+The complete job log and four trace directories are under
+`tmp/glm53f-q2-native-dense-51805752/`. The run captured HEAD `5db7e65d`, its
+dirty source status, and a binary source diff so the uncommitted validation
+implementation remains reproducible.
