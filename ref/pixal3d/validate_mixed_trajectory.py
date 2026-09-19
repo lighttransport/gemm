@@ -1,4 +1,4 @@
-"""Compare a complete native mixed structure trajectory to PyTorch FP32."""
+"""Compare a complete native mixed trajectory to its PyTorch FP32 model."""
 import argparse
 import ctypes as C
 import json
@@ -13,6 +13,8 @@ from upstream_import import ROOT, prepare
 
 p = argparse.ArgumentParser()
 p.add_argument("--dump-dir", type=Path, required=True)
+p.add_argument("--stage", choices=("structure", "shape512", "shape1024", "texture"),
+               default="structure")
 p.add_argument("--model-dir", type=Path, default=Path("/mnt/disk2/models/Pixal3D"))
 p.add_argument("--gpu-kernels", choices=("auto", "blas", "mma"), default="auto")
 a = p.parse_args()
@@ -23,41 +25,65 @@ torch.cuda.set_per_process_memory_fraction(.45)
 torch.backends.cuda.matmul.allow_tf32 = False
 
 pipeline = json.loads((a.model_dir / "pipeline.json").read_text())["args"]
-stem = a.model_dir / pipeline["models"]["sparse_structure_flow_model"]
+keys = {
+    "structure": ("sparse_structure_flow_model", "sparse_structure_sampler"),
+    "shape512": ("shape_slat_flow_model_512", "shape_slat_sampler"),
+    "shape1024": ("shape_slat_flow_model_1024", "shape_slat_sampler"),
+    "texture": ("tex_slat_flow_model_1024", "tex_slat_sampler"),
+}
+model_key, sampler_key = keys[a.stage]
+stem = a.model_dir / pipeline["models"][model_key]
 config = json.loads(stem.with_suffix(".json").read_text())["args"]
 config["dtype"] = "float32"
 from pixal3d.models.sparse_structure_flow import SparseStructureFlowModel
+from pixal3d.models.structured_latent_flow import SLatFlowModel
+from pixal3d.modules.sparse import SparseTensor
 from pixal3d.pipelines.samplers import FlowEulerGuidanceIntervalSampler
 
-model = SparseStructureFlowModel(**config)
-state = load_file(stem.with_suffix(".safetensors"))
-model.load_state_dict(state)
+model = (SparseStructureFlowModel if a.stage == "structure" else SLatFlowModel)(**config)
+model.load_state_dict(load_file(stem.with_suffix(".safetensors")))
 model.eval().to("cuda")
+
 
 def read(name):
     return load_file(a.dump_dir / f"{name}.safetensors")
 
-noise = read("structure_noise")
+noise = read(a.stage + "_noise")
 x0 = noise["feats"].numpy().astype(np.float32)
 coords = noise["coords"].numpy().astype(np.int32)
-global_np = read("structure_global")["feats"].numpy().astype(np.float32)
-projected_np = read("structure_projected")["feats"].numpy().astype(np.float32)
-
-sample = torch.tensor(x0.T.reshape(1, 8, 16, 16, 16), device="cuda")
+global_np = read(a.stage + "_global")["feats"].numpy().astype(np.float32)
+projected_np = read(a.stage + "_projected")["feats"].numpy().astype(np.float32)
 global_cond = torch.tensor(global_np[None], device="cuda")
-projected = torch.tensor(projected_np[None], device="cuda")
+projected_tensor = torch.tensor(projected_np, device="cuda")
+extra = {}
+shape_np = None
+if a.stage == "structure":
+    sample = torch.tensor(x0.T.reshape(1, x0.shape[1], 16, 16, 16), device="cuda")
+    projected = projected_tensor[None]
+else:
+    coords_tensor = torch.tensor(coords, device="cuda")
+    sample = SparseTensor(feats=torch.tensor(x0, device="cuda"), coords=coords_tensor)
+    projected = SparseTensor(feats=projected_tensor, coords=coords_tensor)
+    if a.stage == "texture":
+        shape = read("shape1024_step_12")
+        shape_np = shape["feats"].numpy().astype(np.float32)
+        np.testing.assert_array_equal(coords, shape["coords"].numpy())
+        extra["concat_cond"] = SparseTensor(
+            feats=torch.tensor(shape_np, device="cuda"), coords=coords_tensor)
 cond = {"global": global_cond, "proj": projected}
-neg_cond = {"global": torch.zeros_like(global_cond), "proj": torch.zeros_like(projected)}
-spec = pipeline["sparse_structure_sampler"]
+negative_projected = torch.zeros_like(projected) if a.stage == "structure" else projected.replace(
+    torch.zeros_like(projected.feats))
+neg_cond = {"global": torch.zeros_like(global_cond), "proj": negative_projected}
+spec = pipeline[sampler_key]
 params = dict(spec["params"])
 steps = params.pop("steps")
 rescale_t = params.pop("rescale_t")
 with torch.inference_mode():
     expected = FlowEulerGuidanceIntervalSampler(**spec["args"]).sample(
         model, sample, cond=cond, neg_cond=neg_cond, steps=steps,
-        rescale_t=rescale_t, verbose=False, **params).samples
-expected = expected[0].flatten(1).T.float().cpu().numpy()
-del model, sample, cond, neg_cond
+        rescale_t=rescale_t, verbose=False, **params, **extra).samples
+expected = (expected[0].flatten(1).T if a.stage == "structure" else expected.feats).float().cpu().numpy()
+del model, sample, cond, neg_cond, projected
 torch.cuda.empty_cache()
 
 lib = C.CDLL(str(ROOT.parent.parent / "cpu/pixal3d/libpixal3d_validation.so"))
@@ -88,14 +114,16 @@ session = lib.px_test_flow_open(1, str(stem.with_suffix(".safetensors")).encode(
 assert session, lib.px_test_error().decode()
 try:
     for t, t_next in zip(times[:-1], times[1:]):
-        assert lib.px_test_flow_run(session, positive, native, coords, len(native), 8,
+        model_input = (np.ascontiguousarray(np.concatenate([native, shape_np], 1))
+                       if shape_np is not None else native)
+        assert lib.px_test_flow_run(session, positive, model_input, coords, len(native), model_input.shape[1],
                                     global_np, global_np.shape[1], projected_np,
-                                    projected_np.shape[1], float(t), 30, 0) == 0
+                                    projected_np.shape[1], float(t), 30, 0) == 0, lib.px_test_error().decode()
         guided = lo <= t <= hi
         if guided:
-            assert lib.px_test_flow_run(session, negative, native, coords, len(native), 8,
+            assert lib.px_test_flow_run(session, negative, model_input, coords, len(native), model_input.shape[1],
                                         zeros_global, zeros_global.shape[1], zeros_projected,
-                                        zeros_projected.shape[1], float(t), 30, 0) == 0
+                                        zeros_projected.shape[1], float(t), 30, 0) == 0, lib.px_test_error().decode()
         else:
             negative[:] = positive
         lib.pixal3d_euler_cfg(native, positive, negative, native.size, float(t),
@@ -109,9 +137,9 @@ xx = native.astype(np.float64).ravel()
 yy = expected.astype(np.float64).ravel()
 nrmse = np.linalg.norm(xx - yy) / np.linalg.norm(yy)
 cosine = np.dot(xx, yy) / (np.linalg.norm(xx) * np.linalg.norm(yy))
-result = {"backend": "cuda", "stage": "structure", "precision": "mixed",
-          "steps": steps, "nrmse": float(nrmse), "cosine": float(cosine),
-          "max_abs": float(np.max(np.abs(xx - yy)))}
+result = {"backend": "cuda", "stage": a.stage, "precision": "mixed",
+          "steps": steps, "tokens": len(native), "nrmse": float(nrmse),
+          "cosine": float(cosine), "max_abs": float(np.max(np.abs(xx - yy)))}
 print(json.dumps(result))
 assert nrmse < .001 and cosine > .999999
 print("Mixed FP32-reference trajectory PASS")

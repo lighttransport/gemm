@@ -154,18 +154,27 @@ the default for memory and throughput, with `mixed` providing the recommended
 quality/speed tradeoff. Reproduce the isolated experiment with
 `validate_flow_precision.py --stage structure --precision bf16|mixed|fp32`. Full
 twelve-step structure sampling from identical native noise and conditioning
-was also compared to an FP32 PyTorch sampler on the RTX 5060 Ti. Mixed mode
-measured NRMSE `0.0000711`, cosine `0.9999999975`, and max absolute error
-`0.001858`, passing the `<0.001` trajectory target without switching its BF16
-GEMMs or self-attention to FP32. Reproduce with:
+was also compared to the matching FP32 PyTorch sampler on the RTX 5060 Ti.
+All four cascade trajectories pass the `<0.001` NRMSE target without switching
+their BF16 GEMMs or self-attention to FP32:
+
+| Stage | Tokens | Mixed NRMSE | Cosine | Max abs |
+|---|---:|---:|---:|---:|
+| Structure | 4096 | 0.0000711 | 0.9999999975 | 0.001858 |
+| Shape-512 | 2423 | 0.00000945 | 0.99999999996 | 0.000231 |
+| Shape-1024 | 10765 | 0.0000247 | 0.99999999970 | 0.001926 |
+| Texture | 10765 | 0.00000109 | 0.999999999999 | 0.0000258 |
+
+Texture includes the saved Shape-1024 latent as its concatenated condition, so
+the check also covers that cross-stage input. Reproduce one stage or iterate all
+four with:
 
 ```sh
-ref/pixal3d/run.sh cuda ref/pixal3d/validate_mixed_trajectory.py \
-  --dump-dir tmp/pixal3d/resident-runs/cuda-house/dumps
+for stage in structure shape512 shape1024 texture; do
+  ref/pixal3d/run.sh cuda ref/pixal3d/validate_mixed_trajectory.py \
+    --dump-dir tmp/pixal3d/resident-runs/cuda-house/dumps --stage "$stage"
+done
 ```
-
-The remaining cascade stages still require the same matched mixed/FP32
-trajectory check before making a broader full-generation accuracy claim.
 
 Reproduce each row with the same recorded dumps:
 
