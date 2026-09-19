@@ -13463,9 +13463,17 @@ struct hip_llm_runner {
     hipModule_t q2k_module;
     hipFunction_t fn_qwen35_quantize_q81, fn_qwen35_matvec_q2k;
     hipFunction_t fn_qwen35_matvec_q2k_rows;
+    hipFunction_t fn_qwen35_matvec_q2k_multi4;
+    void *d_native_q81, *d_native_scale, *native_q81_source;
+    int native_q81_valid, native_q81_n;
+    hipFunction_t fn_qwen35_argmax_parts, fn_qwen35_argmax_finish;
+    void *d_native_argmax_scores, *d_native_argmax_indices;
     hipModule_t iq_module;
+    struct hllm_qwen35_mtp *qwen35_mtp;
     hipFunction_t fn_qwen35_matvec_iq2xxs, fn_qwen35_matvec_iq2xs;
     hipFunction_t fn_qwen35_matvec_iq2s, fn_qwen35_matvec_iq3xxs, fn_qwen35_matvec_iq3s;
+    hipFunction_t fn_qwen35_matvec_iq4xs;
+    hipFunction_t fn_qwen35_matvec_iq_multi4;
     hipGraph_t  graph_hidden;     /* captured forward (no lm_head) pipeline */
     hipGraphExec_t graph_exec_hidden;
     hipGraph_t hc_graph[97];
@@ -17285,6 +17293,14 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                       r->q2k_module, "qwen35_matvec_q2k"));
             CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k_rows,
                       r->q2k_module, "qwen35_matvec_q2k_rows"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k_multi4,
+                      r->q2k_module, "qwen35_matvec_q2k_multi4"));
+            if (!r->d_native_q81) CHECK_HIP(hipMalloc(&r->d_native_q81, 17408));
+            if (!r->d_native_scale) CHECK_HIP(hipMalloc(&r->d_native_scale, 17408/32*sizeof(float)));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_argmax_parts, r->q2k_module, "qwen35_argmax_parts"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_argmax_finish, r->q2k_module, "qwen35_argmax_finish"));
+            if (!r->d_native_argmax_scores) CHECK_HIP(hipMalloc(&r->d_native_argmax_scores, 256*sizeof(float)));
+            if (!r->d_native_argmax_indices) CHECK_HIP(hipMalloc(&r->d_native_argmax_indices, 256*sizeof(int)));
             if (native_mmvq) {
                 if (hip_compile_kernels_ex(&r->iq_module, r->device,
                         qwen35_matvec_iq_source, "qwen35_iq.hip", r->verbose,
@@ -17302,6 +17318,10 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                           r->iq_module, "qwen35_matvec_iq3xxs"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s,
                           r->iq_module, "qwen35_matvec_iq3s"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs,
+                          r->iq_module, "qwen35_matvec_iq4xs"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq_multi4,
+                          r->iq_module, "qwen35_matvec_iq_multi4"));
             }
         }
         if (options->decode_kernel_mode == HIP_LLM_DECODE_KERNEL_NATIVE) {
@@ -19576,15 +19596,38 @@ static inline void launch_matvec_##name(hip_llm_runner *r, void *dst, void *mat,
 
 static inline void launch_quantize_q8x2(hip_llm_runner *r, void *x, int n);
 
+/* A dedicated buffer makes scoped native Q8_1 reuse independent of legacy
+ * IQ/Q8x2 scratch. Callers delimit immutable Q/K/V or gate/up inputs. */
+static inline void launch_native_q81(hip_llm_runner *r, void *x, int n) {
+    if (r->q8x2_reuse_active && r->native_q81_valid &&
+        r->native_q81_source == x && r->native_q81_n == n) return;
+    void *a[] = { &r->d_native_q81, &r->d_native_scale, &x, &n };
+    LAUNCH(r->fn_qwen35_quantize_q81, n/32, 1, 1, 32, 1, 1, 0, r->stream, a);
+    r->native_q81_source = x;
+    r->native_q81_n = n;
+    r->native_q81_valid = r->q8x2_reuse_active;
+}
+
+static inline void launch_qwen35_argmax(hip_llm_runner *r, void *x, void *out) {
+    int groups=(r->n_vocab+4095)/4096;
+    if (r->fn_qwen35_argmax_parts && groups <= 256) {
+        void *a[] = { &x, &r->n_vocab, &r->d_native_argmax_scores, &r->d_native_argmax_indices };
+        LAUNCH(r->fn_qwen35_argmax_parts, groups, 1, 1, 256, 1, 1, 0, r->stream, a);
+        void *b[] = { &r->d_native_argmax_scores, &r->d_native_argmax_indices, &groups, &out };
+        LAUNCH(r->fn_qwen35_argmax_finish, 1, 1, 1, 256, 1, 1, 0, r->stream, b);
+    } else {
+        void *a[] = { &x, &r->n_vocab, &out };
+        LAUNCH(r->fn_qwen4_argmax, 1, 1, 1, 256, 1, 1, 0, r->stream, a);
+    }
+}
+
 static inline void launch_matvec_q2_K(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
     if (r->fn_qwen35_matvec_q2k && n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
-        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &x, &n_cols };
-        LAUNCH(r->fn_qwen35_quantize_q81, n_cols / 32, 1, 1,
-               32, 1, 1, 0, r->stream, qa);
-        void *args[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+        launch_native_q81(r, x, n_cols);
+        void *args[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale,
                          &n_rows, &n_cols };
         if (n_cols == 5120 && n_rows >= 5120) {
             LAUNCH(r->fn_qwen35_matvec_q2k_rows, (n_rows + 7) / 8, 1, 1,
@@ -19706,9 +19749,8 @@ static inline void launch_matvec_iq2_xxs(hip_llm_runner *r, void *dst,
     if (r->fn_qwen35_matvec_iq2xxs && n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
-        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &x, &n_cols };
-        LAUNCH(r->fn_qwen35_quantize_q81, n_cols / 32, 1, 1, 32, 1, 1, 0, r->stream, qa);
-        void *a[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
         LAUNCH(r->fn_qwen35_matvec_iq2xxs, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
         return;
     }
@@ -19771,6 +19813,13 @@ DEFINE_LAUNCH_MATVEC(q5_1, fn_matvec_q5_1_f32)
 DEFINE_LAUNCH_MATVEC_MW(iq4_nl, fn_matvec_iq4_nl_f32)
 static inline void launch_matvec_iq4_xs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
+    if (r->fn_qwen35_matvec_iq4xs && n_cols <= 17408 && n_cols % 256 == 0) {
+        r->q8x2_reuse_valid = r->iq1_q8_valid = 0;
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
+        LAUNCH(r->fn_qwen35_matvec_iq4xs, (n_rows+7)/8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        return;
+    }
     const char *q81_env = getenv("LLM_IQ4_XS_Q81_SCALAR");
     const char *q81_max_env = getenv("LLM_IQ4_XS_Q81_MAX_LAYER");
     int q81_max_layer = q81_max_env ? atoi(q81_max_env) : 0x7fffffff;
@@ -19808,9 +19857,8 @@ static inline void launch_matvec_iq2_xs(hip_llm_runner *r, void *dst,
     if (r->fn_qwen35_matvec_iq2xs && n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
-        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &x, &n_cols };
-        LAUNCH(r->fn_qwen35_quantize_q81, n_cols / 32, 1, 1, 32, 1, 1, 0, r->stream, qa);
-        void *a[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
         LAUNCH(r->fn_qwen35_matvec_iq2xs, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
         return;
     }
@@ -20629,10 +20677,11 @@ static inline void launch_matvec_iq3_xxs(hip_llm_runner *r, void *dst,
     if (r->fn_qwen35_matvec_iq3xxs && n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
-        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &x, &n_cols };
-        LAUNCH(r->fn_qwen35_quantize_q81, n_cols / 32, 1, 1, 32, 1, 1, 0, r->stream, qa);
-        void *a[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
-        LAUNCH(r->fn_qwen35_matvec_iq3xxs, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
+        int threads = n_rows == 5120 ? 1024 : 256;
+        int rpb = threads/32;
+        LAUNCH(r->fn_qwen35_matvec_iq3xxs, (n_rows+rpb-1)/rpb, 1, 1, threads, 1, 1, 0, r->stream, a);
         return;
     }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -20821,11 +20870,13 @@ static inline void launch_quantize_q8x2(hip_llm_runner *r, void *x, int n) {
 static inline void begin_q8x2_reuse(hip_llm_runner *r) {
     r->q8x2_reuse_active = 1;
     r->q8x2_reuse_valid = 0;
+    r->native_q81_valid = 0;
 }
 
 static inline void end_q8x2_reuse(hip_llm_runner *r) {
     r->q8x2_reuse_active = 0;
     r->q8x2_reuse_valid = 0;
+    r->native_q81_valid = 0;
 }
 /* Batched projections commonly share the same activation matrix (Q/K/V and
  * gate/up). Reuse its Q8x2 representation until the next layer changes the
@@ -21033,9 +21084,8 @@ static inline void launch_matvec_iq2_s(hip_llm_runner *r, void *dst, void *mat,
     if (r->fn_qwen35_matvec_iq2s && n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
-        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &x, &n_cols };
-        LAUNCH(r->fn_qwen35_quantize_q81, n_cols / 32, 1, 1, 32, 1, 1, 0, r->stream, qa);
-        void *a[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
         LAUNCH(r->fn_qwen35_matvec_iq2s, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
         return;
     }
@@ -21100,9 +21150,8 @@ static inline void launch_matvec_iq3_s(hip_llm_runner *r, void *dst, void *mat,
     if (r->fn_qwen35_matvec_iq3s && n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
-        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &x, &n_cols };
-        LAUNCH(r->fn_qwen35_quantize_q81, n_cols / 32, 1, 1, 32, 1, 1, 0, r->stream, qa);
-        void *a[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
         LAUNCH(r->fn_qwen35_matvec_iq3s, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
         return;
     }
@@ -21403,7 +21452,8 @@ static inline void launch_matvec_ssm_auto(hip_llm_runner *r, void *dst, void *ma
         (type == GGML_TYPE_IQ2_XS && r->fn_qwen35_matvec_iq2xs) ||
         (type == GGML_TYPE_IQ2_S && r->fn_qwen35_matvec_iq2s) ||
         (type == GGML_TYPE_IQ3_XXS && r->fn_qwen35_matvec_iq3xxs) ||
-        (type == GGML_TYPE_IQ3_S && r->fn_qwen35_matvec_iq3s)) {
+        (type == GGML_TYPE_IQ3_S && r->fn_qwen35_matvec_iq3s) ||
+        (type == GGML_TYPE_IQ4_XS && r->fn_qwen35_matvec_iq4xs)) {
         launch_matvec_auto(r, dst, mat, x, n_rows, n_cols, type);
         return;
     }
@@ -27389,6 +27439,71 @@ experts_done:
 
 #include "qwen4_qsa_hip.h"
 
+/* Recurrent core shared by scalar decode and exact MTP windows. */
+static void forward_dense_ssm_core(hip_llm_runner *r, hip_layer *cl, int l) {
+    int qkv_dim = r->ssm_qkv_dim, d_state = r->ssm_d_state;
+    int n_group = r->ssm_n_group, dt_rank = r->ssm_dt_rank;
+    int conv_k = r->ssm_conv_kernel;
+    float eps = r->rms_norm_eps;
+    debug_f32_state(r, l, "Q4 ssm_qkv", r->d_ssm_qkv, qkv_dim);
+
+    /* Preparation is independent of the GDN reduction choice. Its
+     * scalar-contract fusion is bitwise tested for the native IQ
+     * decode path; reference RMSNorm uses a different L2 contract. */
+    if ((r->ssm_fused_decode || (r->fn_qwen35_matvec_iq3xxs &&
+         !r->fn_qwen35_rmsnorm_reference)) &&
+        (qkv_dim - 2 * n_group * d_state) % n_group == 0 &&
+        dt_rank % n_group == 0 && d_state <= 256) {
+        /* Fused conv+silu+state, l2norm Q/K, repeat-tile, softplus, sigmoid:
+         * 7 launches -> 1. */
+        void *args[] = { &r->d_ssm_conv_out, &cl->d_conv_state, &r->d_ssm_qkv,
+                         &cl->ssm_conv1d_w, &r->d_ssm_alpha, &r->d_ssm_beta,
+                         &cl->ssm_dt_bias, &cl->ssm_a,
+                         &r->d_ssm_Q_exp, &r->d_ssm_K_exp,
+                         &qkv_dim, &conv_k, &d_state, &n_group, &dt_rank, &eps };
+        LAUNCH(r->fn_ssm_prep_f32, n_group, 1, 1, 256, 1, 1, 0, r->stream, args);
+    } else {
+        debug_f32_state(r, l, "Q4 gdn_alpha_raw", r->d_ssm_alpha, dt_rank);
+        debug_f32_state(r, l, "Q4 gdn_beta_raw", r->d_ssm_beta, dt_rank);
+        launch_softplus_mul(r, r->d_ssm_alpha, r->d_ssm_alpha, cl->ssm_dt_bias, cl->ssm_a, dt_rank);
+        launch_sigmoid_inplace(r, r->d_ssm_beta, dt_rank);
+        debug_f32_state(r, l, "Q4 gdn_alpha", r->d_ssm_alpha, dt_rank);
+        debug_f32_state(r, l, "Q4 gdn_beta", r->d_ssm_beta, dt_rank);
+
+        launch_conv1d(r, r->d_ssm_conv_out, cl->d_conv_state, r->d_ssm_qkv,
+                     cl->ssm_conv1d_w, qkv_dim, conv_k);
+        if (getenv("LLM_DEBUG_DUMP_CONV_STATE") && l == 0)
+            debug_f32_state(r, l, "Q4 conv_state", cl->d_conv_state,
+                            (conv_k - 1) * qkv_dim);
+
+        /* Keep this before Q/K L2 normalization: llama.cpp exposes both
+         * conv_output_raw and conv_output_silu, while the existing trace
+         * below reflects the subsequently normalized Q/K slices. */
+        debug_f32_state(r, l, "Q4 ssm_conv_silu_raw", r->d_ssm_conv_out, qkv_dim);
+
+        launch_l2_norm_heads(r, r->d_ssm_conv_out, n_group, d_state, eps);
+        void *K_raw = (void *)((char *)r->d_ssm_conv_out + (size_t)n_group * d_state * sizeof(float));
+        launch_l2_norm_heads(r, K_raw, n_group, d_state, eps);
+        debug_f32_state(r, l, "Q4 gdn_q_norm", r->d_ssm_conv_out, n_group * d_state);
+        debug_f32_state(r, l, "Q4 gdn_k_norm", K_raw, n_group * d_state);
+
+        launch_repeat_tile(r, r->d_ssm_Q_exp, r->d_ssm_conv_out, dt_rank, d_state, n_group);
+        launch_repeat_tile(r, r->d_ssm_K_exp, K_raw, dt_rank, d_state, n_group);
+    }
+
+    debug_f32_state(r, l, "Q4 ssm_conv", r->d_ssm_conv_out, qkv_dim);
+
+    void *V_ptr = (void *)((char *)r->d_ssm_conv_out + (size_t)2 * n_group * d_state * sizeof(float));
+
+    launch_deltanet_step(r, cl->d_recurrent_state, r->d_ssm_out,
+                        r->d_ssm_Q_exp, r->d_ssm_K_exp, V_ptr,
+                        r->d_ssm_alpha, r->d_ssm_beta, dt_rank, d_state);
+
+    debug_f32_state(r, l, "Q4 ssm_delta", r->d_ssm_out, r->ssm_d_inner);
+    debug_f32_state(r, l, "Q4 ssm_z", r->d_ssm_z, r->ssm_d_inner);
+
+}
+
 static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
         void *key_cache, void *value_cache, int trunk, int attention_only) {
     int n_embd     = r->n_embd;
@@ -27599,11 +27714,8 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
 
     } else if (r->is_hybrid && cl->is_ssm) {
             /* === SSM (Delta-Net) layer === */
-            int qkv_dim = r->ssm_qkv_dim;
             int d_state = r->ssm_d_state;
-            int n_group = r->ssm_n_group;
             int dt_rank = r->ssm_dt_rank;
-            int conv_k  = r->ssm_conv_kernel;
 
             if (r->ssm_fused_decode &&
                 cl->ssm_qkv_type == GGML_TYPE_Q6_K && cl->ssm_gate_type == GGML_TYPE_Q6_K &&
@@ -27694,58 +27806,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
             end_q8x2_reuse(r);
             }
 
-            debug_f32_state(r, l, "Q4 ssm_qkv", r->d_ssm_qkv, qkv_dim);
-
-            if (r->ssm_fused_decode &&
-                (qkv_dim - 2 * n_group * d_state) % n_group == 0 &&
-                dt_rank % n_group == 0 && d_state <= 256) {
-                /* Fused conv+silu+state, l2norm Q/K, repeat-tile, softplus, sigmoid:
-                 * 7 launches -> 1. */
-                void *args[] = { &r->d_ssm_conv_out, &cl->d_conv_state, &r->d_ssm_qkv,
-                                 &cl->ssm_conv1d_w, &r->d_ssm_alpha, &r->d_ssm_beta,
-                                 &cl->ssm_dt_bias, &cl->ssm_a,
-                                 &r->d_ssm_Q_exp, &r->d_ssm_K_exp,
-                                 &qkv_dim, &conv_k, &d_state, &n_group, &dt_rank, &eps };
-                LAUNCH(r->fn_ssm_prep_f32, n_group, 1, 1, 256, 1, 1, 0, r->stream, args);
-            } else {
-            debug_f32_state(r, l, "Q4 gdn_alpha_raw", r->d_ssm_alpha, dt_rank);
-            debug_f32_state(r, l, "Q4 gdn_beta_raw", r->d_ssm_beta, dt_rank);
-            launch_softplus_mul(r, r->d_ssm_alpha, r->d_ssm_alpha, cl->ssm_dt_bias, cl->ssm_a, dt_rank);
-            launch_sigmoid_inplace(r, r->d_ssm_beta, dt_rank);
-            debug_f32_state(r, l, "Q4 gdn_alpha", r->d_ssm_alpha, dt_rank);
-            debug_f32_state(r, l, "Q4 gdn_beta", r->d_ssm_beta, dt_rank);
-
-            launch_conv1d(r, r->d_ssm_conv_out, cl->d_conv_state, r->d_ssm_qkv,
-                         cl->ssm_conv1d_w, qkv_dim, conv_k);
-            if (getenv("LLM_DEBUG_DUMP_CONV_STATE") && l == 0)
-                debug_f32_state(r, l, "Q4 conv_state", cl->d_conv_state,
-                                (conv_k - 1) * qkv_dim);
-
-            /* Keep this before Q/K L2 normalization: llama.cpp exposes both
-             * conv_output_raw and conv_output_silu, while the existing trace
-             * below reflects the subsequently normalized Q/K slices. */
-            debug_f32_state(r, l, "Q4 ssm_conv_silu_raw", r->d_ssm_conv_out, qkv_dim);
-
-            launch_l2_norm_heads(r, r->d_ssm_conv_out, n_group, d_state, eps);
-            void *K_raw = (void *)((char *)r->d_ssm_conv_out + (size_t)n_group * d_state * sizeof(float));
-            launch_l2_norm_heads(r, K_raw, n_group, d_state, eps);
-            debug_f32_state(r, l, "Q4 gdn_q_norm", r->d_ssm_conv_out, n_group * d_state);
-            debug_f32_state(r, l, "Q4 gdn_k_norm", K_raw, n_group * d_state);
-
-            launch_repeat_tile(r, r->d_ssm_Q_exp, r->d_ssm_conv_out, dt_rank, d_state, n_group);
-            launch_repeat_tile(r, r->d_ssm_K_exp, K_raw, dt_rank, d_state, n_group);
-            }
-
-            debug_f32_state(r, l, "Q4 ssm_conv", r->d_ssm_conv_out, qkv_dim);
-
-            void *V_ptr = (void *)((char *)r->d_ssm_conv_out + (size_t)2 * n_group * d_state * sizeof(float));
-
-            launch_deltanet_step(r, cl->d_recurrent_state, r->d_ssm_out,
-                                r->d_ssm_Q_exp, r->d_ssm_K_exp, V_ptr,
-                                r->d_ssm_alpha, r->d_ssm_beta, dt_rank, d_state);
-
-            debug_f32_state(r, l, "Q4 ssm_delta", r->d_ssm_out, r->ssm_d_inner);
-            debug_f32_state(r, l, "Q4 ssm_z", r->d_ssm_z, r->ssm_d_inner);
+            forward_dense_ssm_core(r, cl, l);
 
              if (r->ssm_fused_decode && cl->ssm_out_type == GGML_TYPE_Q6_K && r->ssm_out_mw) {
                 int nr = cl->ssm_out_rows;
@@ -28104,6 +28165,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
             goto ffn_done;
         } else {
             /* Dense FFN */
+            if (attention_only) return; /* d_xb is the exact normalized FFN input. */
             if (r->debug_layers && debug_attention_layer_selected(l))
                 debug_f32_state(r, l, "scalar ffn_norm_input", r->d_xb, n_embd);
             if (cl->ffn_gate_type == GGML_TYPE_Q8_0 &&
@@ -28221,6 +28283,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
 /* Per-token forward over all layers + final RMSNorm. */
 #include "qwen4_verify_window.h"
 #include "qwen4_nextn_forward.h"
+#include "qwen35_nextn.h"
 #include "qwen4_nextn_ref.h"
 #include "qwen4_qsa_test.h"
 
@@ -28403,8 +28466,7 @@ static void hip_llm_phase5_capture(hip_llm_runner *r) {
             forward_blocks_body(r);
             launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
                                r->n_vocab, r->n_embd, r->output_w_type);
-            void *a[] = { &r->d_logits, &r->n_vocab, &r->d_argmax };
-            LAUNCH(r->fn_qwen4_argmax, 1, 1, 1, 256, 1, 1, 0, r->stream, a);
+            launch_qwen35_argmax(r, r->d_logits, r->d_argmax);
             hipMemcpyAsync(r->h_output, r->d_argmax, sizeof(int), hipMemcpyDeviceToHost, r->stream);
             err = hipStreamEndCapture(r->stream, &r->graph_argmax);
             if (err == hipSuccess && r->graph_argmax &&
@@ -28714,8 +28776,7 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
             LAUNCH(r->fn_logit_softcap_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
         }
         if (r->qwen4_argmax_only && !r->is_qwen4exp && r->d_argmax) {
-            void *aa[] = { &r->d_logits, &r->n_vocab, &r->d_argmax };
-            LAUNCH(r->fn_qwen4_argmax, 1, 1, 1, 256, 1, 1, 0, r->stream, aa);
+            launch_qwen35_argmax(r, r->d_logits, r->d_argmax);
             hipMemcpyAsync(r->h_output, r->d_argmax, sizeof(int), hipMemcpyDeviceToHost, r->stream);
             r->argmax_valid = 1;
         } else if (r->qwen4_argmax_only && r->is_qwen4exp && r->d_moe_idx) {
@@ -31307,6 +31368,7 @@ void hip_llm_offload(hip_llm_runner *r) {
     r->d_moe_gather_w = NULL;
     r->d_moe_assign_pos = NULL;
     hllm_free_qwen4_nextn(r);
+    hllm_free_qwen35_mtp(r);
     /* Phase 2 batched buffers */
     if (r->d_x_batch)             { hipFree(r->d_x_batch);             r->d_x_batch = NULL; }
     if (r->d_xnorm_batch)         { hipFree(r->d_xnorm_batch);         r->d_xnorm_batch = NULL; }
@@ -31663,6 +31725,7 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_hc_low)       hipFree(r->d_hc_low);
     if (r->d_hc_inject)    hipFree(r->d_hc_inject);
     hllm_free_qwen4_nextn(r);
+    hllm_free_qwen35_mtp(r);
     if (r->d_ple_conv_state) hipFree(r->d_ple_conv_state);
     if (r->d_ple_emb)      hipFree(r->d_ple_emb);
     if (r->d_ple_value)    hipFree(r->d_ple_value);
@@ -31708,6 +31771,10 @@ void hip_llm_free(hip_llm_runner *r) {
 
     if (r->reference_math_module) hipModuleUnload(r->reference_math_module);
     if (r->q2k_module) hipModuleUnload(r->q2k_module);
+    if (r->d_native_q81) hipFree(r->d_native_q81);
+    if (r->d_native_scale) hipFree(r->d_native_scale);
+    if (r->d_native_argmax_scores) hipFree(r->d_native_argmax_scores);
+    if (r->d_native_argmax_indices) hipFree(r->d_native_argmax_indices);
     if (r->iq_module) hipModuleUnload(r->iq_module);
     if (r->d_q8_attention_parts) hipFree(r->d_q8_attention_parts);
     if (r->d_q8_attention_meta) hipFree(r->d_q8_attention_meta);
@@ -32195,6 +32262,7 @@ void hip_llm_reset_state(hip_llm_runner *r) {
     if (r->stream) hipStreamSynchronize(r->stream);
     r->qwen4_forward_error = 0;
     r->qwen4_nextn_start = -1;
+    if (r->qwen35_mtp) { r->qwen35_mtp->origin = -1; r->qwen35_mtp->verify_rows = 0; }
     r->cur_position = 0;
     if (r->qwen4_exact && r->layers) {
         for (int l=0;l<r->n_layers;++l)

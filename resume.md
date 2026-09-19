@@ -1,5 +1,65 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Final decode validation (2026-09-20)
+
+RX 9070 XT / gfx1201 / ROCm 10, 4096 prompt tokens, 512-token chunks,
+context 8192, Q8 K and Q8 V. Warm repetitions reset all target/draft state;
+timing excludes trace I/O. Sampled mode uses temperature 0.6 and seed 42.
+
+| Model / path / sampling | Warm decode tok/s | Warm prefill tok/s |
+|---|---:|---:|
+| IQ2 / ordinary / greedy | 37.99–38.02 | 554.57–555.77 |
+| IQ2 / ordinary / sampled | 37.20–37.21 | 550.91–551.58 |
+| IQ2 / MTP K=3 / greedy | 35.80–35.86 | 550.83–551.39 |
+| IQ2 / MTP K=3 / sampled | 35.25–35.27 | 550.61–550.94 |
+| IQ3 / ordinary / greedy | 36.12 | 573.38–573.72 |
+| IQ3 / ordinary / sampled | 35.19–35.47 | 572.75–573.14 |
+| IQ3 / MTP K=3 / greedy | 33.76 | 572.32–573.07 |
+| IQ3 / MTP K=3 / sampled | 34.99–35.01 | 571.43–571.59 |
+
+**The 40 tok/s decode and 60 tok/s MTP targets remain unmet.** Ordinary
+greedy decode improved from 33.8 to 38.0 tok/s on IQ2 and 32.1 to 36.1 on
+IQ3 (about 12–13%). MTP is opt-in because this verified implementation is
+slower on the tested coding response. The next performance work belongs in
+multirow projection reuse and reducing verification/checkpoint overhead.
+
+All eight complete C++ responses match the pinned llama.cpp token IDs, EOS
+and output bytes. Each passes C++17 compilation, ASan/UBSan, fixed edge cases
+and 10,000 randomized cases. Both models and both sampling modes additionally
+match every ordinary-target logit bitwise with MTP enabled. Artifacts:
+`tmp/qwen38/decode-final-{iq2,iq3}{,-mtp}/`, including `result.json`, manifests,
+and `target-*-parity.json`. Reference outputs/timings are reused from the
+hash-checked pinned build; runner timings are fresh.
+
+Exact native operator checks cover 2,948,352 activation values, 9,951,984
+matrix outputs, 4,528,128 fused SSM preparation values and 39,536,640 attention
+outputs. Parallel greedy selection passes 40 shape/pattern comparisons and
+reduces its standalone time from 207.6 to 11.6 microseconds. Retained decode
+changes include native IQ4_XS, computed IQ signs, selected packed IQ3_S loads,
+shape-specific launch sizes, scoped activation reuse, fused SSM preparation,
+and shared-grid multirow IQ/Q2_K projections.
+
+The final retrieval gate repeats the exact 4096-token early-context fixture
+on both models with ordinary decode and MTP draft widths 1 and 3. All six
+outputs are exactly `ZEPHYR-7319`, including identical selected tokens and
+EOS; MTP also preserves every ordinary-target logit bitwise. Artifacts and
+commands: `tmp/qwen38/decode-final-retrieval/manifest.json` and adjacent
+comparison files.
+
+Dense NextN implementation and reproduction details:
+[QWEN38_DENSE_MTP.md](rdna4/llm/QWEN38_DENSE_MTP.md). The benchmark/C API
+supports `--qwen35-mtp SIDECAR --qwen35-mtp-draft 3 --qwen35-mtp-window`;
+HTTP/stdio scheduling is not implemented. Draft state is independent, all
+emitted tokens come from exact target verification, and sampler RNG advances
+only for consumed target logits. The draft starts at generation rather than
+replaying the prompt. A three-step independent llama.cpp NextN oracle checks
+the post-output-norm hidden-input contract (matching top tokens; relative L2
+0.01254/0.01218/0.01512), not bitwise draft-logit parity.
+
+Full-model llama.cpp logits still differ; BF16 prefill remains approximate.
+The byte-parity evidence is fixture-specific. Keep MTP opt-in until it
+outperforms ordinary decode. Preserve unrelated A64FX/common edits; no push.
+
 ## Native Q8/Q8 prefill and reference validation (2026-09-20)
 
 On RX 9070 XT / gfx1201 / ROCm 10, native Q8/Q8 attention now exceeds the

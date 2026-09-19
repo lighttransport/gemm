@@ -54,12 +54,18 @@ def main():
     parser.add_argument("--native-q8-prefill", action="store_true")
     parser.add_argument("--native-q2k", action="store_true")
     parser.add_argument("--native-mmvq", action="store_true")
+    parser.add_argument("--mtp", type=Path, help="dense NextN sidecar, with exact target window verification")
+    parser.add_argument("--mtp-draft", type=int, default=3)
     parser.add_argument("--cpp-merge", action="store_true")
     args = parser.parse_args()
     if args.decode < 1 or args.decode > 4096 or args.repeats < 2:
         parser.error("decode must be 1..4096 and repeats at least 2 (cold + warm)")
     root = Path(__file__).resolve().parents[2]
     args.model = args.model.resolve()
+    if args.mtp:
+        args.mtp = args.mtp.resolve()
+        if not 1 <= args.mtp_draft <= 15:
+            parser.error("MTP draft width must be 1..15")
     args.reference, args.out = args.reference.resolve(), args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=False)
     if args.prompt is None:
@@ -82,6 +88,8 @@ def main():
                 "environment": {k: v for k, v in env.items() if k == "TMPDIR" or k.startswith(("QWEN38_", "LLM_", "MM_BLASLT_", "HIP_RUNNER_"))}}
     for path in (runner, args.model, args.prompt):
         manifest["sha256"][str(path)] = digest(path)
+    if args.mtp:
+        manifest["sha256"][str(args.mtp)] = digest(args.mtp)
     previous = None
     if args.reuse_reference:
         args.reuse_reference = args.reuse_reference.resolve()
@@ -132,6 +140,9 @@ def main():
             commands["ours"].append("--qwen35-native-q2k")
         if args.native_mmvq:
             commands["ours"].append("--qwen35-native-mmvq")
+        if args.mtp:
+            commands["ours"] += ["--qwen35-mtp", str(args.mtp), "--qwen35-mtp-draft",
+                                 str(args.mtp_draft), "--qwen35-mtp-window"]
         prefixes = {}
         for backend, command in commands.items():
             reuse = backend == "llama" and previous is not None

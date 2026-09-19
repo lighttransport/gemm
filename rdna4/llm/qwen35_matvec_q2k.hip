@@ -15,6 +15,42 @@ extern "C" __global__ void qwen35_quantize_q81(
     if (threadIdx.x == 0) scales[blockIdx.x] = (float)(_Float16)d;
 }
 
+extern "C" __global__ void qwen35_argmax_parts(const float *x, int n,
+                                               float *scores, int *indices) {
+    __shared__ float values[256];
+    __shared__ int ids[256];
+    int t=threadIdx.x, id=0, begin=blockIdx.x*4096;
+    float value=-3.402823466e38f;
+    for (int i=begin+t; i<n && i<begin+4096; i+=256)
+        if (x[i]>value || (x[i]==value && i<id)) { value=x[i]; id=i; }
+    values[t]=value; ids[t]=id;
+    __syncthreads();
+    for (int s=128; s; s>>=1) {
+        if (t<s && (values[t+s]>values[t] || (values[t+s]==values[t] && ids[t+s]<ids[t]))) {
+            values[t]=values[t+s]; ids[t]=ids[t+s];
+        }
+        __syncthreads();
+    }
+    if (!t) { scores[blockIdx.x]=values[0]; indices[blockIdx.x]=ids[0]; }
+}
+
+extern "C" __global__ void qwen35_argmax_finish(const float *scores,
+        const int *indices, int n, int *out) {
+    __shared__ float values[256];
+    __shared__ int ids[256];
+    int t=threadIdx.x;
+    values[t]=t<n ? scores[t] : -3.402823466e38f;
+    ids[t]=t<n ? indices[t] : 0;
+    __syncthreads();
+    for (int s=128; s; s>>=1) {
+        if (t<s && (values[t+s]>values[t] || (values[t+s]==values[t] && ids[t+s]<ids[t]))) {
+            values[t]=values[t+s]; ids[t]=ids[t+s];
+        }
+        __syncthreads();
+    }
+    if (!t) *out=ids[0];
+}
+
 extern "C" __global__ void qwen35_matvec_q2k(
         float *out, const unsigned char *weights, const signed char *q,
         const float *scales, int rows, int cols) {
@@ -98,4 +134,47 @@ extern "C" __global__ void qwen35_matvec_q2k_rows(
     for (int offset = 16; offset; offset >>= 1)
         sum += __shfl_xor(sum, offset, 32);
     if (lane == 0) out[row] = sum;
+}
+
+extern "C" __global__ void qwen35_matvec_q2k_multi4(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    int lane=threadIdx.x&31, row=blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
+    if (row>=rows) return;
+    int blocks=cols/256, iqs=lane&15;
+    const unsigned char *w=weights+(size_t)row*blocks*84;
+    float sum[4]={};
+#pragma unroll
+    for (int vw=0; vw<8; ++vw) {
+        float partial[4]={};
+        for (int b=lane/16+2*vw; b<blocks; b+=16) {
+            const unsigned char *p=w+b*84;
+            const unsigned char *s=p+(iqs&~7)+(iqs&7)/4;
+            int v=((const int *)(p+16))[iqs];
+            float sd[4]={}, sm[4]={};
+#pragma unroll
+            for (int j=0; j<4; ++j) {
+                int qb=b*8+4*(iqs/8)+j;
+                int low=s[2*j]&15, high=(s[2*j]>>4)*0x01010101;
+#pragma unroll
+                for (int t=0; t<4; ++t) if (t<count) {
+                    int u=((const int *)(q+(size_t)t*cols+qb*32))[iqs&7];
+                    int z=__builtin_amdgcn_sudot4(true,(v>>(2*j))&0x03030303,true,u,0,false);
+                    int zm=__builtin_amdgcn_sudot4(true,high,true,u,0,false);
+                    float scale=scales[(size_t)t*(cols/32)+qb];
+                    sd[t]+=scale*(z*low); sm[t]+=scale*zm;
+                }
+            }
+            float d=(float)*(const _Float16 *)(p+80), dm=(float)*(const _Float16 *)(p+82);
+#pragma unroll
+            for (int t=0; t<4; ++t) if (t<count) partial[t]+=d*sd[t]-dm*sm[t];
+        }
+#pragma unroll
+        for (int t=0; t<4; ++t) if (t<count) sum[t]+=partial[t];
+    }
+#pragma unroll
+    for (int t=0; t<4; ++t) if (t<count) {
+        for (int offset=16; offset; offset>>=1) sum[t]+=__shfl_xor(sum[t],offset,32);
+        if (lane==0) out[(size_t)t*rows+row]=sum[t];
+    }
 }

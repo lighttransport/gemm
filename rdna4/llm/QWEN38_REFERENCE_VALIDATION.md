@@ -211,8 +211,8 @@ prefill remains an explicitly approximate projection path. Exact native MMQ
 prefill, the remaining coupled SSM/projection differences and broader prompt
 coverage are required before claiming general byte-identical generation.
 
-Dense Qwen3.8-27B NextN/MTP is still unimplemented. Its sidecar has its own
-embedding/output head and one dense block; the existing Qwen4 MoE/HC MTP path
-cannot simply be enabled. The pinned Qwen3.5 graph exports NextN hidden input
-**after final output normalization**. Transactional target state, KV and RNG
-rollback plus exact verification are required before any MTP throughput claim.
+Dense Qwen3.8-27B NextN/MTP is now implemented for the benchmark runner and
+C API, with independent draft state and exact target-window verification.
+See [QWEN38_DENSE_MTP.md](QWEN38_DENSE_MTP.md) for current measurements,
+reproduction commands and the verification contract. It remains opt-in:
+verified MTP has not yet outperformed ordinary decode on this fixture.

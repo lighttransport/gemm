@@ -161,6 +161,22 @@ int hip_llm_qwen4_mtp_configure(hip_llm_runner *r, size_t cache_bytes, int draft
 int hip_llm_qwen4_mtp_set_verify(hip_llm_runner *r, int window);
 /* Borrowed host logits for the current committed target state. */
 float *hip_llm_current_logits(hip_llm_runner *r);
+/* Dense Qwen3.5/3.8 NextN owns its weights and KV. Proposals never advance
+ * target state or sampler RNG; the caller must verify every proposed token.
+ * The draft starts a fresh KV prefix at the first generation position. */
+int hip_llm_qwen35_mtp_load(hip_llm_runner *r, const char *path,
+                           char *error, size_t error_cap);
+int hip_llm_qwen35_mtp_propose(hip_llm_runner *r, int32_t anchor, int position,
+                              int count, int32_t *drafts);
+/* Verify a window, then commit exactly its accepted input prefix before any
+ * new proposal/target forward. Requires Q8/Q8 KV and the native decode graph.
+ * The first window fixes capacity (1..16 rows); later windows may be smaller.
+ * Logits are row-major and borrowed until the next verification call.
+ * Commit accepts 1..rows inputs, including the anchor. On an execution error
+ * reset the target before reuse; partially executed GPU work is not reusable. */
+float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
+                                int rows, int position);
+int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed);
 /* Run target forward and return only the greedy token; avoids a full-vocab
  * device-to-host copy during speculative verification. */
 int hip_llm_forward_argmax(hip_llm_runner *r, int32_t token_id, int position);

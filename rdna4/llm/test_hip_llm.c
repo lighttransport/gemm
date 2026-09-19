@@ -997,6 +997,9 @@ int main(int argc, char **argv) {
     int verify_glm5next_kda_layer = 0;
     int verify_glm5next_dsa_layer = 0;
     const char *inspect_qwen4_nextn = NULL;
+    const char *qwen35_mtp_path = NULL;
+    int qwen35_mtp_draft = 3;
+    int qwen35_mtp_window = 0;
     const char *load_qwen4_nextn_fusion = NULL;
     /* Q4_K/Q6_K exact verification is host-synchronization bound; recurrent
      * width-2 drafts minimize rejected-suffix work on the RX 9070 XT. */
@@ -1219,6 +1222,12 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--verify-glm5next-dsa-layer") == 0) {
             verify_glm5next_dsa_layer = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') glm5next_verify_layer = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--qwen35-mtp") == 0 && i + 1 < argc) {
+            qwen35_mtp_path = argv[++i];
+        } else if (strcmp(argv[i], "--qwen35-mtp-draft") == 0 && i + 1 < argc) {
+            qwen35_mtp_draft = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--qwen35-mtp-window") == 0) {
+            qwen35_mtp_window = 1;
         } else if (strcmp(argv[i], "--inspect-qwen4-nextn") == 0 && i + 1 < argc) {
             inspect_qwen4_nextn = argv[++i];
         } else if (strcmp(argv[i], "--verify-qwen4-nextn") == 0 && i + 1 < argc) {
@@ -1267,6 +1276,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       [--qwen35-native-q8-prefill] (also use native Q8/Q8 for prefill)\n");
             fprintf(stderr, "       [--qwen35-native-q2k] (native Q2_K x Q8_1 decode on gfx1201)\n");
             fprintf(stderr, "       [--qwen35-native-mmvq] (native Q2_K, IQ2_XXS/XS/S, IQ3_XXS/S x Q8_1 decode)\n");
+            fprintf(stderr, "       [--qwen35-mtp SIDECAR --qwen35-mtp-draft 1..16] (verified dense NextN, benchmark mode)\n");
+            fprintf(stderr, "       [--qwen35-mtp-window] (exact Q8/Q8 target windows, draft <=15; requires decode graph)\n");
             fprintf(stderr, "       [--qwen35-reference-math] (diagnostic; incomplete whole-model parity)\n");
             fprintf(stderr, "       [--sampling-profile llama] [--seed N] [--temp T] [--top-k K] [--top-p P] [--min-p P]\n");
             fprintf(stderr, "       [--repeat-penalty R] [--presence-penalty P] [--frequency-penalty F] [--penalty-last-n N]\n");
@@ -1650,6 +1661,18 @@ int main(int argc, char **argv) {
         if(cpu_model)transformer_free(cpu_model);
         bpe_vocab_free(vocab);gguf_close_shards(gguf_model);return 1;
     }
+    if (qwen35_mtp_path) {
+        char error[192] = "invalid benchmark mode or draft width";
+        if (!bench_mode || stdio_server || qwen4_mtp || qwen35_mtp_draft < 1 || qwen35_mtp_draft > 16 ||
+            (qwen35_mtp_window && qwen35_mtp_draft > 15) ||
+            hip_llm_qwen35_mtp_load(gpu, qwen35_mtp_path, error, sizeof(error))) {
+            fprintf(stderr, "Dense NextN load/configuration failed: %s\n", error);
+            hip_llm_free(gpu);
+            if (cpu_model) transformer_free(cpu_model);
+            bpe_vocab_free(vocab); gguf_close_shards(gguf_model); return 1;
+        }
+        fprintf(stderr, "Dense NextN loaded: draft=%d, target verification enabled\n", qwen35_mtp_draft);
+    }
     if (load_qwen4_nextn_fusion) {
         gguf_shards *sidecar = gguf_open_shards(load_qwen4_nextn_fusion, 2);
         char error[192];
@@ -1960,6 +1983,11 @@ int main(int argc, char **argv) {
             if (gen_text) fprintf(stderr, "\n=== Generated text ===\n");
             const char *finish_reason = "length";
             int selected = 0;
+            int32_t dense_drafts[16];
+            int dense_count = 0, dense_index = 0, dense_proposed = 0, dense_accepted = 0;
+            double dense_draft_ms = 0;
+            float *dense_logits = NULL;
+            int dense_window_rows = 0;
             float *selection_logits = last_logits;
             int32_t stop_ids[3] = {text_eos, text_eot, -1};
             for (int id = 0; id < n_vocab; ++id) {
@@ -2043,7 +2071,33 @@ int main(int argc, char **argv) {
                 if (sampler) hllm_sampler_accept(sampler, next_tok);
                 if (k + 1 == decode_n) break;
                 int pos = n_prefill + k;
-                if (!coding_mode && (!sampler || sampler_argmax) && !trace.logits) {
+                if (qwen35_mtp_path && (qwen35_mtp_window ? !dense_window_rows : dense_index == dense_count)) {
+                    dense_count = qwen35_mtp_draft;
+                    int available = decode_n-k-1-qwen35_mtp_window;
+                    if (dense_count > available) dense_count = available;
+                    dense_index = 0;
+                    double td = get_time_ms();
+                    if (dense_count > 0 && hip_llm_qwen35_mtp_propose(gpu, next_tok, pos, dense_count, dense_drafts)) {
+                        pass = 0; finish_reason = "error"; break;
+                    }
+                    dense_draft_ms += get_time_ms()-td;
+                    dense_proposed += dense_count;
+                    if (qwen35_mtp_window && dense_count > 0) {
+                        int32_t inputs[16]; inputs[0] = next_tok;
+                        memcpy(inputs+1, dense_drafts, (size_t)dense_count*sizeof(int32_t));
+                        dense_window_rows = dense_count+1;
+                        dense_logits = hip_llm_qwen35_mtp_verify(gpu, inputs, dense_window_rows, pos);
+                        if (!dense_logits) { pass = 0; finish_reason = "error"; break; }
+                    }
+                }
+                if (dense_window_rows) {
+                    selection_logits = dense_logits + (size_t)dense_index*n_vocab;
+                    if (seen) seen[next_tok] = 1;
+                    next_tok = sampler ? hllm_sampler_sample(sampler, selection_logits) : coding_mode ?
+                        sample_top_k_p_coding(selection_logits, n_vocab, 20, 0.80f,
+                            0.70f, 1.50f, 1.0f, 0.0f, seen, &sample_rng, vocab) :
+                        argmax_logits(selection_logits, n_vocab);
+                } else if (!coding_mode && (!sampler || sampler_argmax) && !trace.logits) {
                     next_tok = hip_llm_forward_argmax(gpu, next_tok, pos);
                     if (next_tok < 0) { pass = 0; finish_reason = "error"; break; }
                 } else {
@@ -2055,8 +2109,25 @@ int main(int argc, char **argv) {
                             0.70f, 1.50f, 1.0f, 0.0f, seen, &sample_rng, vocab) :
                         argmax_logits(selection_logits, n_vocab);
                 }
+                if (dense_window_rows) {
+                    int matched = dense_index < dense_count && next_tok == dense_drafts[dense_index];
+                    dense_index++;
+                    if (matched) dense_accepted++;
+                    if (!matched || dense_index == dense_window_rows) {
+                        if (hip_llm_qwen35_mtp_commit(gpu, dense_index)) { pass=0; finish_reason="error"; break; }
+                        dense_window_rows = dense_index = dense_count = 0;
+                    }
+                } else if (qwen35_mtp_path && dense_count > 0) {
+                    if (next_tok == dense_drafts[dense_index++]) dense_accepted++;
+                    else dense_count = dense_index = 0;
+                }
             }
+            if (dense_window_rows && dense_index > 0 && hip_llm_qwen35_mtp_commit(gpu, dense_index)) pass=0;
             if (gen_text) fprintf(stderr, "\n=== end ===\n");
+            if (qwen35_mtp_path)
+                fprintf(stderr, "DENSE_MTP drafted=%d accepted=%d draft_ms=%.3f verify=%s\n",
+                        dense_proposed, dense_accepted, dense_draft_ms,
+                        qwen35_mtp_window ? "window" : "sequential");
             double t_dec1 = get_time_ms();
             fprintf(stderr, "GENERATION finish=%s selected=%d emitted=%d synthetic=%d\n",
                     finish_reason, selected, decoded, bench_ignore_eos);

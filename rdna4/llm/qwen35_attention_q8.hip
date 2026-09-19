@@ -86,11 +86,13 @@ void qwen35_attention_q8_decode(float *out, float *parts, float2 *meta,
         }
     }
     __syncthreads();
-    int qr[32]; float dr[32];
+    int qr[32]; float dr[8];
     #pragma unroll
     for (int i = 0; i < 32; ++i) {
-        qr[i] = qi[2 * i + lane % 2]; dr[i] = qd[(2 * i + lane % 2) / 8];
+        qr[i] = qi[2 * i + lane % 2];
     }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) dr[i] = qd[i];
     q8_half2 acc[4] = {};
     float maximum = -3.402823466e+38f / 2, sum = 0;
     int padded = (length + 255) / 256 * 256;
@@ -103,11 +105,14 @@ void qwen35_attention_q8_decode(float *out, float *parts, float2 *meta,
             if (row < length) {
                 const int *k = (const int *)(kc + (size_t)row * stride + kh * 256);
                 const float *d = ks + (size_t)row * scale_stride + kh * 8;
+                float scale[8];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) scale[i] = d[i] * dr[i];
                 #pragma unroll
                 for (int i = 0; i < 32; ++i) {
                     int word = 2 * i + lane % 2;
                     int product = __builtin_amdgcn_sudot4(true, k[word], true, qr[i], 0, false);
-                    dot += (d[word / 8] * dr[i]) * (float)product;
+                    dot += scale[i / 4] * (float)product;
                 }
             }
             dot += __shfl_xor(dot, 1, 32);
@@ -137,9 +142,10 @@ void qwen35_attention_q8_decode(float *out, float *parts, float2 *meta,
                 q8_half2 v0 = {}, v1 = {};
                 if (row < length) {
                     const signed char *v = vc + (size_t)row * stride + kh * 256 + dim;
+                    unsigned int packed = *(const unsigned int *)v;
                     q8_half2 d = q8_hsplat(vs[(size_t)row * scale_stride + kh * 8 + dim / 32]);
-                    v0 = q8_hmul(d, q8_hpair(v[0], v[1]));
-                    v1 = q8_hmul(d, q8_hpair(v[2], v[3]));
+                    v0 = q8_hmul(d, q8_hpair((signed char)packed, (signed char)(packed >> 8)));
+                    v1 = q8_hmul(d, q8_hpair((signed char)(packed >> 16), (signed char)(packed >> 24)));
                 }
                 acc[2 * tile] = q8_hfma(v0, p, acc[2 * tile]);
                 acc[2 * tile + 1] = q8_hfma(v1, p, acc[2 * tile + 1]);
