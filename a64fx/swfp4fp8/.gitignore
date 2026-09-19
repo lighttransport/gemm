@@ -1,0 +1,4 @@
+*.o
+bench_swfp4fp8
+test_swfp4fp8
+tmp/
