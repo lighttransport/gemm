@@ -17,15 +17,17 @@ void simplify(Mesh &m, int target) {
     int stalled = 0;
     while (m.numF() > uint32_t(target)) {
         int nv = int(m.numV()), nf = int(m.numF());
-        std::vector<std::vector<int>> adjacent(nv);
+        // Compact adjacency avoids millions of small allocations each round.
+        // Filling it in face order preserves the former traversal order.
+        std::vector<int> offsets(size_t(nv) + 1), adjacent(size_t(nf) * 3);
         std::vector<uint64_t> edges;
         edges.reserve(m.f.size());
         std::vector<std::array<float, 10>> qem(nv);
         for (int f = 0; f < nf; ++f) {
             int a = m.f[3 * f], b = m.f[3 * f + 1], c = m.f[3 * f + 2];
-            adjacent[a].push_back(f);
-            adjacent[b].push_back(f);
-            adjacent[c].push_back(f);
+            ++offsets[size_t(a) + 1];
+            ++offsets[size_t(b) + 1];
+            ++offsets[size_t(c) + 1];
             edges.push_back(edge(a, b));
             edges.push_back(edge(b, c));
             edges.push_back(edge(c, a));
@@ -43,6 +45,11 @@ void simplify(Mesh &m, int target) {
                         qem[id][k++] += p[i] * p[j];
             }
         }
+        std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+        std::vector<int> cursor(offsets.begin(), offsets.end() - 1);
+        for (int f = 0; f < nf; ++f)
+            for (int j = 0; j < 3; ++j)
+                adjacent[cursor[m.f[3 * f + j]]++] = f;
         __gnu_parallel::sort(edges.begin(), edges.end());
         std::vector<uint8_t> boundary(nv);
         for (size_t i = 0; i < edges.size();) {
@@ -74,7 +81,8 @@ void simplify(Mesh &m, int target) {
             int triangles = 0;
             bool valid = true;
             for (int endpoint : {a, b})
-                for (int f : adjacent[endpoint]) {
+                for (int position = offsets[endpoint]; position < offsets[endpoint + 1]; ++position) {
+                    int f = adjacent[position];
                     int ids[3] = {m.f[3 * f], m.f[3 * f + 1], m.f[3 * f + 2]}, other = endpoint == a ? b : a;
                     if (ids[0] == other || ids[1] == other || ids[2] == other)
                         continue;
@@ -117,10 +125,10 @@ void simplify(Mesh &m, int target) {
         for (size_t i = 0; i < edges.size(); ++i) {
             uint64_t p = packed(i);
             int a = int(edges[i] >> 32), b = uint32_t(edges[i]);
-            for (int f : adjacent[a])
-                atomic_min(&best[f], p);
-            for (int f : adjacent[b])
-                atomic_min(&best[f], p);
+            for (int position = offsets[a]; position < offsets[a + 1]; ++position)
+                atomic_min(&best[adjacent[position]], p);
+            for (int position = offsets[b]; position < offsets[b + 1]; ++position)
+                atomic_min(&best[adjacent[position]], p);
         }
         std::vector<int> mapping(nv);
         std::iota(mapping.begin(), mapping.end(), 0);
@@ -132,13 +140,13 @@ void simplify(Mesh &m, int target) {
             uint64_t p = packed(i);
             int a = int(edges[i] >> 32), b = uint32_t(edges[i]);
             bool valid = true;
-            for (int f : adjacent[a])
-                if (best[f] != p) {
+            for (int position = offsets[a]; position < offsets[a + 1]; ++position)
+                if (best[adjacent[position]] != p) {
                     valid = false;
                     break;
                 }
-            for (int f : adjacent[b])
-                if (best[f] != p) {
+            for (int position = offsets[b]; position < offsets[b + 1]; ++position)
+                if (best[adjacent[position]] != p) {
                     valid = false;
                     break;
                 }
@@ -151,9 +159,11 @@ void simplify(Mesh &m, int target) {
             m.v[3 * a + 2] = v.z;
             mapping[b] = a;
             ++collapsed;
-            for (int f : adjacent[a])
+            for (int position = offsets[a]; position < offsets[a + 1]; ++position) {
+                int f = adjacent[position];
                 if (m.f[3 * f] == b || m.f[3 * f + 1] == b || m.f[3 * f + 2] == b)
                     keep[f] = 0;
+            }
         }
         Mesh next;
         std::vector<int> compact(nv, -1);

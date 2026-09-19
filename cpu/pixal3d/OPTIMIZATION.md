@@ -66,12 +66,15 @@ diagnostic environment variable `PIXAL3D_PROFILE_COMMANDS=1` when individual
 resident command timing is required.
 
 Postprocessing replays can emit the same subphase profile without repeating
-diffusion. On the saved CUDA jester decoder outputs, the current 4096-texture
+diffusion. On the saved CUDA jester decoder outputs, the original 4096-texture
 path took 121.1 seconds: simplification 44.2 s, inpainting 23.8 s,
 hole filling plus original-mesh BVH construction 17.7 s, unwrap/normals
 16.7 s, remeshing 7.6 s, baking 3.0 s, FDG extraction 0.9 s, and rasterization
-0.3 s. This identifies simplification as the first CPU optimization target;
-texture baking is already a small part of total postprocessing. Reproduce with:
+0.3 s. Replacing the simplifier's per-vertex vectors with compact CSR face
+adjacency reduced simplification to 27.2 s and the replay to 101.9 s (15.9%
+end-to-end). Every collapse-round face count matched, the 93.8 MB GLB remained
+byte-identical (`6d8c267b...11a8b7`), and the GLB validator passed. Texture
+baking is already a small part of total postprocessing. Reproduce with:
 
 ```sh
 ref/pixal3d/run.sh cpu ref/pixal3d/replay_postprocess.py \
