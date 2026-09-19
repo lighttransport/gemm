@@ -19,8 +19,36 @@ expect_contains() {
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}")"
 expect_contains "${out}" 'Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf'
 expect_contains "${out}" 'selected_context=53248'
+expect_contains "${out}" 'kv_cache=q8q4'
+out="$(QWEN38_DRY_RUN=1 QWEN38_GSQ_KV_CACHE=q8q8 "${gsq}" -s 8192)"
+expect_contains "${out}" 'kv_cache=q8q8'
+expect_contains "${out}" 'selected_context=8192'
+out="$(QWEN38_DRY_RUN=1 QWEN38_GSQ_KV_CACHE=q8q4 "${gsq}" --kv-cache q8q8 -s 8192)"
+expect_contains "${out}" 'kv_cache=q8q8'
+# Numerical-parity policy is model-specific: pure IQ2 and mixed IQ3 enable the
+# validated IQ2_XS Q8_1 adapter, while IQ2_XXS remains direct-F32.
+grep -q 'iq2_xs_q81_default=1' "${gsq}" || {
+    echo 'profile test: pure IQ2 IQ2_XS Q8_1 default missing' >&2
+    exit 1
+}
+grep -q 'iq2_q81_default=0' "${gsq}" || {
+    echo 'profile test: pure IQ2_XXS direct-F32 default missing' >&2
+    exit 1
+}
+grep -q 'iq3_mixed_q81_default=0' "${gsq}" || {
+    echo 'profile test: pure IQ2 IQ1 direct-F32 default missing' >&2
+    exit 1
+}
 grep -q 'LLM_ATTN_DECODE_Q8Q4_VECV="\${LLM_ATTN_DECODE_Q8Q4_VECV:-\${perf_profile}}"' "${gsq}" || {
     echo 'profile test: vectorized Q4V performance selector missing' >&2
+    exit 1
+}
+grep -q 'LLM_SSM_FUSED="\${LLM_SSM_FUSED:-\${ssm_fused_default}}"' "${gsq}" || {
+    echo 'profile test: model-specific GDN default missing' >&2
+    exit 1
+}
+grep -q 'ssm_fused_default=1' "${gsq}" || {
+    echo 'profile test: IQ3 fused GDN default missing' >&2
     exit 1
 }
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}" -s 262144)"
@@ -31,6 +59,10 @@ expect_contains "${out}" 'selected_context=262144'
 
 grep -q 'One lane per 8-value codebook group' "${runner_c}" || {
     echo 'profile test: full-wave IQ2_XS decode kernel missing' >&2
+    exit 1
+}
+grep -q 'matvec_q2_K_q81' "${runner_c}" || {
+    echo 'profile test: llama.cpp Q2_K Q8_1 A/B kernel missing' >&2
     exit 1
 }
 grep -q 'QWEN38_GSQ_DECODE_TARGET:-30' "${root_dir}/bench_qwen38_gsq_decode.sh" || {

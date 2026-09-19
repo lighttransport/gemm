@@ -14,6 +14,10 @@ extern "C" int mm_blaslt_run_bf16(void *, const void *, const void *,
                                   int, int, int, void *) { return -1; }
 extern "C" int mm_blaslt_run_bf16_strided_batch(
     void *, const void *, const void *, int, int, int, int, void *) { return -1; }
+extern "C" int mm_blaslt_run_f32(void *, const void *, const void *,
+                                  int, int, int, void *) { return -1; }
+extern "C" int mm_blaslt_run_f16(void *, const void *, const void *,
+                                  int, int, int, void *) { return -1; }
 
 extern "C" int mm_blaslt_run_bf16_bias(void *, const void *, const void *,
                                        const void *, int, int, int, void *) {
@@ -43,6 +47,7 @@ extern "C" void mm_blaslt_destroy(void) {}
 #else
 
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
 #include <hipblaslt/hipblaslt-ext.hpp>
 
@@ -51,6 +56,14 @@ extern "C" void mm_blaslt_destroy(void) {}
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+#include <dlfcn.h>
+
+/* rocew exports HIP entry points as function-pointer variables. A direct HIP
+ * call from this C++ translation unit can bind to that variable as executable
+ * code. Resolve the runtime functions from their library instead. */
+static hipError_t (*bridge_hip_malloc)(void **, size_t) = nullptr;
+static hipError_t (*bridge_hip_free)(void *) = nullptr;
+static const char *(*bridge_hip_error_string)(hipError_t) = nullptr;
 
 #define HBLT_RET(expr)                                                         \
   do {                                                                         \
@@ -67,7 +80,7 @@ extern "C" void mm_blaslt_destroy(void) {}
     hipError_t _err = (expr);                                                  \
     if (_err != hipSuccess) {                                                  \
       std::fprintf(stderr, "[mm_blaslt] HIP error %s:%d: %s\n", __FILE__,      \
-                   __LINE__, hipGetErrorString(_err));                         \
+                   __LINE__, bridge_hip_error_string(_err));                   \
       return -1;                                                               \
     }                                                                          \
   } while (0)
@@ -151,6 +164,7 @@ static int g_list_algos = 0;
 
 struct State {
   hipblasLtHandle_t handle = nullptr;
+  hipblasHandle_t hipblas = nullptr;
   hipblasLtMatmulPreference_t pref = nullptr;
   std::unordered_map<ShapeKey, Plan, ShapeKeyHash> plans;
   bool initialized = false;
@@ -161,7 +175,7 @@ State g_state;
 
 void destroy_plan(Plan &p) {
   if (p.workspace) {
-    (void)hipFree(p.workspace);
+    (void)bridge_hip_free(p.workspace);
     p.workspace = nullptr;
   }
   if (p.d) hipblasLtMatrixLayoutDestroy(p.d);
@@ -176,6 +190,8 @@ int build_plan(int M, int N, int K, int batch, int flags, Plan &p) {
   bool with_bias = (flags & 1) != 0;
   bool gelu_bf16d = (flags & 2) != 0;
   bool bias_bf16d = (flags & 4) != 0;
+  bool f32_io = (flags & 8) != 0;
+  bool f16_io = (flags & 16) != 0;
   HBLT_RET(hipblasLtMatmulDescCreate(&p.matmul, HIPBLAS_COMPUTE_32F,
                                      HIP_R_32F));
   hipblasOperation_t trans_a = HIPBLAS_OP_T;
@@ -196,10 +212,11 @@ int build_plan(int M, int N, int K, int batch, int flags, Plan &p) {
   }
 
   hipDataType d_dt = (gelu_bf16d || bias_bf16d) ? HIP_R_16BF : HIP_R_32F;
-  /* W [N,K] BF16 row-major == [K,N] col-major with op=T */
-  HBLT_RET(hipblasLtMatrixLayoutCreate(&p.a, HIP_R_16BF, K, N, K));
-  /* X [M,K] BF16 row-major == [K,M] col-major with op=N */
-  HBLT_RET(hipblasLtMatrixLayoutCreate(&p.b, HIP_R_16BF, K, M, K));
+  hipDataType io_dt = f32_io ? HIP_R_32F : (f16_io ? HIP_R_16F : HIP_R_16BF);
+  /* W [N,K] row-major == [K,N] col-major with op=T */
+  HBLT_RET(hipblasLtMatrixLayoutCreate(&p.a, io_dt, K, N, K));
+  /* X [M,K] row-major == [K,M] col-major with op=N */
+  HBLT_RET(hipblasLtMatrixLayoutCreate(&p.b, io_dt, K, M, K));
   /* Y [M,N] D-type row-major == [N,M] col-major */
   HBLT_RET(hipblasLtMatrixLayoutCreate(&p.c, d_dt, N, M, N));
   HBLT_RET(hipblasLtMatrixLayoutCreate(&p.d, d_dt, N, M, N));
@@ -283,7 +300,7 @@ int build_plan(int M, int N, int K, int batch, int flags, Plan &p) {
   p.algo = results[best].algo;
   p.workspace_size = results[best].workspaceSize;
   if (p.workspace_size > 0) {
-    HIP_RET(hipMalloc(&p.workspace, p.workspace_size));
+    HIP_RET(bridge_hip_malloc(&p.workspace, p.workspace_size));
   }
   p.valid = true;
   if (g_state.verbose) {
@@ -299,6 +316,19 @@ int build_plan(int M, int N, int K, int batch, int flags, Plan &p) {
 
 extern "C" int mm_blaslt_init(void) {
   if (g_state.initialized) return 0;
+  static void *runtime = dlopen("libamdhip64.so", RTLD_NOW | RTLD_LOCAL);
+  if (!runtime) {
+    std::fprintf(stderr, "[mm_blaslt] cannot load HIP runtime: %s\n", dlerror());
+    return -1;
+  }
+  bridge_hip_malloc = reinterpret_cast<decltype(bridge_hip_malloc)>(dlsym(runtime, "hipMalloc"));
+  bridge_hip_free = reinterpret_cast<decltype(bridge_hip_free)>(dlsym(runtime, "hipFree"));
+  bridge_hip_error_string = reinterpret_cast<decltype(bridge_hip_error_string)>(dlsym(runtime, "hipGetErrorString"));
+  if (!bridge_hip_malloc || !bridge_hip_free || !bridge_hip_error_string) {
+    std::fprintf(stderr, "[mm_blaslt] HIP allocation entry points unavailable\n");
+    return -1;
+  }
+  HBLT_RET(hipblasCreate(&g_state.hipblas));
   HBLT_RET(hipblasLtCreate(&g_state.handle));
   HBLT_RET(hipblasLtMatmulPreferenceCreate(&g_state.pref));
   uint64_t max_ws = 256ull << 20;
@@ -367,6 +397,47 @@ extern "C" int mm_blaslt_run_bf16_bias(void *d_y_f32, const void *d_w_bf16,
                                        int M, int N, int K, void *stream) {
   return mm_blaslt_run_bf16_bias_residual(d_y_f32, nullptr, d_w_bf16, d_x_bf16,
                                           d_bias_f32, M, N, K, stream);
+}
+
+extern "C" int mm_blaslt_run_f32(void *d_y_f32, const void *d_w_f32,
+                                  const void *d_x_f32, int M, int N, int K,
+                                  void *stream) {
+  if (!g_state.initialized && mm_blaslt_init() != 0) return -1;
+  const int flags = 8;
+  ShapeKey key{M, N, K, 1, flags};
+  auto it = g_state.plans.find(key);
+  if (it == g_state.plans.end()) {
+    Plan p;
+    if (build_plan(M, N, K, 1, flags, p) != 0) {
+      destroy_plan(p);
+      return -1;
+    }
+    it = g_state.plans.emplace(key, p).first;
+  }
+  Plan &p = it->second;
+  if (!p.valid) return -1;
+  const float alpha = 1.0f, beta = 0.0f;
+  HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha,
+                           d_w_f32, p.a, d_x_f32, p.b, &beta,
+                           d_y_f32, p.c, d_y_f32, p.d, &p.algo,
+                           p.workspace, p.workspace_size,
+                           static_cast<hipStream_t>(stream)));
+  return 0;
+}
+
+extern "C" int mm_blaslt_run_f16(void *d_y_f32, const void *d_w_f16,
+                                  const void *d_x_f16, int M, int N, int K,
+                                  void *stream) {
+  const float alpha = 1.0f, beta = 0.0f;
+  if (!g_state.initialized && mm_blaslt_init() != 0) return -1;
+  HBLT_RET(hipblasSetStream(g_state.hipblas, static_cast<hipStream_t>(stream)));
+  HBLT_RET(hipblasGemmEx(g_state.hipblas, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                         N, M, K, &alpha,
+                         d_w_f16, HIP_R_16F, K,
+                         d_x_f16, HIP_R_16F, K, &beta,
+                         d_y_f32, HIP_R_32F, N,
+                         HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+  return 0;
 }
 
 extern "C" int mm_blaslt_run_bf16_bias_residual(
@@ -493,6 +564,10 @@ extern "C" void mm_blaslt_destroy(void) {
   if (g_state.handle) {
     hipblasLtDestroy(g_state.handle);
     g_state.handle = nullptr;
+  }
+  if (g_state.hipblas) {
+    hipblasDestroy(g_state.hipblas);
+    g_state.hipblas = nullptr;
   }
   g_state.initialized = false;
 }

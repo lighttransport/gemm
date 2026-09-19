@@ -28,13 +28,24 @@ TARGET = test_hip_llm
 QWEN38_MODEL ?= /mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 QSA_MOE_CACHE_MB ?= 128
 
-.PHONY: all clean run api gsq gsq-target iq2-bw profile-test bench-256k target-gate target-gate-fast target-gate-batch target-gate-4k hipblaslt-status qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda help
+.PHONY: all clean run api gsq gsq-target iq2-bw profile-test bench-256k target-gate target-gate-fast target-gate-batch target-gate-4k hipblaslt-status qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda half2-test help
 
 all: $(TARGET)
 
+test_fattn_vec_half2: test_fattn_vec_half2.cu
+	$(HIPCC) -O2 --offload-arch=gfx1201 $< -o $@
+
+half2-test: test_fattn_vec_half2
+	env LD_LIBRARY_PATH=$(ROCM_PATH)/core-10.0/lib ./test_fattn_vec_half2
+
+.PHONY: kv-q8q8-test
+kv-q8q8-test:
+	python3 test_kv_q8q8.py --hipcc $(HIPCC) --out tmp/kv-q8q8
+	env LD_LIBRARY_PATH=$(ROCM_LIB) ./tmp/kv-q8q8/test
+
 ifeq ($(HIPBLASLT),1)
 CFLAGS += -DLLM_HIPBLASLT_ENABLED
-LDFLAGS += -L$(ROCM_LIB) -Wl,-rpath,$(ROCM_LIB) -lhipblaslt -lstdc++
+LDFLAGS += -L$(ROCM_LIB) -Wl,-rpath,$(ROCM_LIB) -lhipblaslt -lhipblas -lstdc++
 BLASLT_OBJ = mm_blaslt_bridge.o
 else
 BLASLT_OBJ =
@@ -197,7 +208,7 @@ bench_cpu_qwen_expert: bench_cpu_qwen_expert.c
 	$(CC) -O3 -Wall -Wextra -march=native -fopenmp -o $@ $< -ldl -lm
 
 clean:
-	rm -f $(TARGET) bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full test_glm5next_cpu_runtime test_glm5next_nextn mm_blaslt_bridge.o cuda_moe_bridge.o
+	rm -f $(TARGET) test_fattn_vec_half2 bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full test_glm5next_cpu_runtime test_glm5next_nextn mm_blaslt_bridge.o cuda_moe_bridge.o
 
 help:
 	@echo "HIP LLM Runner (HIPRTC-based, no hipcc needed)"

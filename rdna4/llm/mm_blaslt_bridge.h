@@ -36,6 +36,17 @@ int mm_blaslt_run_bf16_strided_batch(void *d_y_f32, const void *d_w_bf16,
                                      int M, int N, int K, int batch_count,
                                      void *stream);
 
+/* F32 input/weight variant used by llama.cpp's batched F32 MMF fallback. */
+int mm_blaslt_run_f32(void *d_y_f32, const void *d_w_f32,
+                      const void *d_x_f32, int M, int N, int K,
+                      void *stream);
+
+/* F16 input/weight variant with F32 accumulation and F32 output, matching
+ * llama.cpp's RDNA4 cuBLAS path for batched F16 projections. */
+int mm_blaslt_run_f16(void *d_y_f32, const void *d_w_f16,
+                      const void *d_x_f16, int M, int N, int K,
+                      void *stream);
+
 /* Same as mm_blaslt_run_bf16 but with fused F32 bias epilogue: Y = X*W^T + bias[N].
  * bias may be NULL — in that case behavior matches mm_blaslt_run_bf16. */
 int  mm_blaslt_run_bf16_bias(void *d_y_f32, const void *d_w_bf16,

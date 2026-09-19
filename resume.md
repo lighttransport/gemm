@@ -1,293 +1,292 @@
-# Qwen3.8-Flash-Next RDNA4 runner — resume handoff
+# Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
-Worktree: `/mnt/nvme02/work/gemm/main`
+## Latest continuation: real Q8/Q8 support (2026-09-19)
 
-## Objective
+User clarified Q8_0 for **both K and V**, and selected the opt-in BF16
+projection fast path. Implemented `--kv-cache q8q8` and appended public enum
+`HIP_LLM_KV_Q8_0_Q8_0`. Existing format defaults remain IQ2 Q8/Q4 and IQ3 F32.
 
-Stable, quality-safe Qwen3.8-Flash-Next LLM runner on CPU + Radeon RX 9070 XT
-(gfx1201, 16 GiB), for `rdna4/llm/`.
+New cache writer matches llama.cpp's HIP quantizer on identical inputs.
+Protected reciprocal and quotient refinement is necessary under fast-math;
+ordinary division changes integer decisions at half-integer boundaries.
+The actual runner kernels pass 14,741,204 code, scale, unpack, and boundary
+checks with zero mismatches. Tests: `rdna4/llm/test_kv_q8q8.py` and `.cu`.
 
-- Quality bar: **bit-exact F16 greedy-hash parity** (identical first token +
-  full sequence hash vs the scalar F16 reference) on a diverse prompt set.
-- Performance targets: **prefill >= 200 tok/s** and **single-stream decode
-  >= 30 tok/s**.
-- Decode route: exact single-token decode (no MTP).
-- Prefill route: fix and promote the batched dispatcher; scalar is the
-  quality-safe fallback.
+Fixed quantized K allocation (previously incorrectly F32-sized), included
+context-dependent F16 packing scratch in memory estimates, and restricted
+Q4-specific direct kernels to Q8/Q4. Q8/Q8 uses the existing packed-F16
+attention path; native llama.cpp Q8/Q8 decode arithmetic is still distinct.
 
-Do not push to any remote without explicit per-action user permission.
-Committing freely is allowed once a coherent unit is done.
+A 40-token BF16 smoke test exposed a separate hipBLASLt workspace crash:
+direct `hipMalloc` calls bound to rocew's function-pointer variable. The
+bridge now resolves allocation/free/error functions from libamdhip64.
 
-## Resume from here
+Completed Q8/Q8 4096-token / 512-chunk / capacity-8192 fast runs:
 
-The quality milestone is complete for the exercised workloads: native HC,
-SSM projections, router/shared experts, and exact prefix graphs pass fresh
-scalar F16 greedy parity on four short prompts and the 4K/64 staged case. The
-best measured native result is about **126 prefill / 22 decode tok/s**; the
-requested **200 / 30** target is still open.
+| Model | First pass | Warm 1 | Warm 2 | Peak MiB | Logit rel L2 / max vs Q8/Q8 llama |
+|---|---:|---:|---:|---:|---:|
+| IQ2_XS | 409.69 | 465.07 | 464.11 | 9782 | 0.088450366 / 1.062415123 |
+| IQ3_XXS | 414.20 | 478.35 | 477.66 | 13446 | 0.068600276 / 0.862522125 |
 
-Start by reading this file and `rdna4/llm/QWEN38_STATUS.md`, then inspect the
-worktree and running jobs:
+All six generated clamp functions pass syntax and 196 UBSan cases. Each
+model repeats its generation hash exactly; reference/runner argmax is 71093.
+This is experimental BF16 prefill, not whole-model numerical parity.
 
-```sh
-cd /mnt/nvme02/work/gemm/main
-export TMPDIR="$PWD/rdna4/llm/tmp"
-git status --short
-ps -eo pid,etime,comm,args | rg 'cc1|test_hip|make|rocprof' || true
-```
+Output-integrity follow-up: benchmark generation now byte-decodes every BPE
+piece before printing it, so GPT-2 display markers such as `Ġ` and `Ċ` no
+longer leak into user-visible text. It also hides ChatML/EOS control pieces
+after the first stop token, including duplicate control strings found in
+some converted vocabularies. Decode benchmarking still runs the requested
+token count, so throughput and sequence hashes retain their old meaning.
 
-When the GPU is idle, repeat the checkpoint with:
+Fresh 4K boundary runs cover IQ2 chunks 256/511/512/513 and IQ3 chunks
+511/512/513. All seven runs have finite full-vocabulary logits, first token
+and argmax 71093, strict UTF-8 output, and a functional clamp implementation
+that passes all 196 UBSan cases. BF16 batch-shape arithmetic changes the final
+logits modestly (maximum relative L2 0.032505 for IQ2 and 0.018762 for IQ3),
+but there is no chunk-boundary corruption.
 
-```sh
-sh rdna4/llm/tmp/run_native_ssmtrim_4k.sh
-```
+A stronger exact-4096-token test places `ZEPHYR-7319` in the first prompt
+line, fills the intervening context, and asks for the passphrase at the end.
+The 512-token Q8/Q8 fast path returns exactly `ZEPHYR-7319` for both models,
+at 410.03 tok/s for IQ2 and 423.10 tok/s for IQ3. This verifies that all
+eight prefill chunks contribute to the response rather than merely checking
+a task located at the prompt tail. Artifacts are under
+`tmp/qwen38/prefill-output-fidelity/`; `rdna4/llm/test_prefill_output.py`
+checks strict UTF-8, raw tokenizer/control-marker absence, benchmark success,
+first-token consistency, requested response text, and generated C behavior.
 
-Compare first-token/full-hash output with
-`rdna4/llm/tmp/native_scalar_4k_reference.log`; expected hash:
-`e3d8bf6d47dc6cc3`. Keep temporary artifacts under `rdna4/llm/tmp` and never
-use `/tmp`.
+Scalar Q8/Q8 4K baselines: IQ2 28.18 tok/s, rel L2 0.103469486;
+IQ3 23.34 tok/s, rel L2 0.064371208. BF16 improves IQ2's error here, but
+raises IQ3 relative L2 by ~6.6% while reducing its maximum error. Both
+legacy-format 40-token logit files remain byte-identical to saved baselines.
 
-The next optimization pass should target routed Q4 gate/up and Q5 down
-kernels, then decode transfer and cache overlap. Preserve scalar arithmetic,
-rerun the real-weight HC/SSM/MoE oracles and short corpus after each change,
-and keep the paired-token routed prototype rejected because its numeric oracle
-failed.
+Artifacts and exact command/environment manifests:
+`tmp/qwen38/prefill-q8q8-4k-512/`. `run.py` runs the sequential validation
+matrix (completed successful jobs are skipped); `summarize.py` calculates
+errors and verifies generated C. All 16 jobs passed: eight finite full-logit
+comparisons, 16 generated-C tests (196 UBSan cases each), both default
+regressions, and both warm throughput/repeatability gates. The documented
+`make -C rdna4/llm kv-q8q8-test HIPCC=/opt/rocm/core-10.0/bin/hipcc` also
+passes on final source. Build, profile, CLI, shell syntax, and whitespace
+checks pass; existing compiler warnings remain.
 
-### Copy/paste resuming prompt
+Fresh synthetic llama-bench Q8/Q8: IQ2 293.060813 tok/s (293.117 / 293.005),
+IQ3 422.700387 (422.799 / 422.601). Matched natural-prompt reference runs,
+without warmup: IQ2 250.196 and IQ3 344.217 tok/s. Keep timing methods distinct.
+Short (40-token) Q8/Q8 scalar -> BF16 relative L2: IQ2 0.060560054 ->
+0.050156043; IQ3 0.041533788 -> 0.061390913. These are limited fixture
+checks, not a broad quality equivalence claim. Production defaults remain
+unchanged. Full details and the reproduction command are in the final
+Q8/Q8 section of `rdna4/llm/QWEN38_STATUS.md`.
 
-> Continue the Qwen3.8-Flash-Next RDNA4 performance work in
-> `/mnt/nvme02/work/gemm/main`. Read `resume.md` and
-> `rdna4/llm/QWEN38_STATUS.md` first. Preserve unrelated worktree changes and
-> do not use `/tmp`; set `TMPDIR=$PWD/rdna4/llm/tmp`. The current validated
-> native path is scalar-parity exact on the four short prompts and 4K/64,
-> with best measured performance about 126 prefill / 22 decode tok/s. The
-> required targets remain 200 / 30 tok/s. Check for running GPU/compiler jobs,
-> rerun `rdna4/llm/tmp/run_native_ssmtrim_4k.sh` only when the GPU is idle,
-> then use `rdna4/llm/tmp/native_profile_analysis.log` to optimize routed Q4
-> gate/up, Q5 down, and decode transfer/cache overlap. Preserve scalar
-> arithmetic, run the real-weight HC/SSM/MoE oracles and quality corpus after
-> each change, and do not promote the rejected paired-token or tiled-attention
-> prototypes. Commit coherent tested changes if appropriate; never push
-> without explicit per-action authorization.
+No commits or pushes. Preserve the existing unrelated dirty work.
 
-## Latest performance checkpoint
+## Latest continuation: 4K / 512 prefill throughput
 
-The current scalar-parity-passing 4K/64 configuration measures
-**125.97 prefill / 21.75–21.83 decode tok/s**, below 200/30.
-Driver:`rdna4/llm/tmp/run_native_ssmtrim_4k.sh`; log:
-`tmp/native_ssmtrim_4k.log`; binary:`tmp/test_hip_llm_ssmtrim`.
-Uses all native paths, SSM native warp2, cache balance1, LFU1,
-attention shards2 and exact prefix graphs. Both requests match fresh scalar
-first15/hash `e3d8bf6d47dc6cc3`. Cache H2D 9.87 GiB, 88.9% hits.
-SSM warp modes1/2 each pass the full real-weight bitwise oracle; mode2
-adds signed-zero coverage.
+User requested >=150 tok/s prefill, matching llama.cpp's 4K/512 shape.
+The target is exceeded with new opt-in `--qwen35-prefill-bf16`:
 
-A parallel-score attention candidate was bitwise correct but slower in a
-fair microbenchmark and was removed. Archives remain in `tmp/`.
-The native profile is complete; see `tmp/native_profile_analysis.log`.
-No GPU or compiler jobs remain at this checkpoint. Next focus is routed
-gate/up and down throughput. All user performance targets remain required.
+| Model, Q8 K / Q4 V | First pass | Second pass | Decode |
+|---|---:|---:|---:|
+| IQ2_XS default | 28.17 tok/s | — | 19.35 tok/s |
+| IQ2_XS BF16 prefill | 409.85 tok/s | 462.89 tok/s | 19.50 / 19.49 tok/s |
+| IQ3_XXS BF16 prefill | 421.33 tok/s | 476.50 tok/s | 19.71 / 19.74 tok/s |
 
-## Latest parity milestone
+All use the meaningful, exactly 4096-token fixture
+`tmp/qwen38/prefill-4k-512/coding-4096.txt`, 512-token chunks, BMAX=512,
+context capacity 8192, and 80-token --coding generation. Same generation
+hash on both fast passes; extracted C passes syntax and 196 UBSan cases.
 
-Native HC + SSM projections + router/shared experts now pass fresh scalar
-first-token/full-hash parity on all four128/16 prompts, two requests each
-(8/8). `LLM_QWEN4_BATCH_MOE_NATIVE=1` removes BF16 activation rounding
-from router/shared batching. Its real-weight `--verify-moe-native` oracle
-passes48 layers x8 rows bitwise. Binary:`tmp/test_hip_llm_nativemoe`.
-Logs:`tmp/nativemoe_oracle.log`, `tmp/nativemoe_quality_summary.log`.
+Fresh llama-bench IQ2, 4K/512: Q8/Q8 KV 293.87 tok/s; Q8/Q4 KV 293.49 tok/s.
+The runner's measured configuration is Q8/Q4, NOT newly implemented Q8/Q8.
+The matched coding-prompt llama helper measured ~254 IQ2 / 349.80 IQ3 tok/s
+without warmup. Do not mix that timing with warmed llama-bench samples.
 
-The fresh scalar4K/64 reference and both native staged requests PASS:
-first15/hash e3d8bf6d47dc6cc3. The qualifying native throughput is
-114.38/114.52 prefill and19.78/19.82 decode min/median. Decode cache hits85%,
-H2D13.31 GiB; prefill staging65.69 GiB. Peak15890 MiB/free414 MiB.
-`tmp/run_native_all_4k.sh` and its three logs capture the exact setup.
-Do not use the old601167e3b2fb9425 hash as the scalar reference.
+Matched-cache full-logit relative L2 / max error, argmax 71093 on all paths:
+- IQ2 default: 0.170325388 / 2.245854616.
+- IQ2 BF16 prefill: 0.171977136 / 2.299321413.
+- IQ3 BF16 prefill: 0.132160331 / 1.575695515.
 
-The native API/kernel/copy profile is complete:
-`tmp/native_profile_analysis.log` and `tmp/rocprof_qwen_native/`.
-Keep GPU jobs exclusive; do not compile during performance measurements.
+This is an experimental BF16 arithmetic choice, not exact MMQ/MMVQ parity.
+Production defaults and decode dispatch remain unchanged. The argument
+enables batched SSM as well as attention/FFN GEMMs and bypasses the SSM
+per-row output projection. No QWEN38_GSQ_PERF setting is needed.
+The main bottleneck was all 48 SSM blocks falling back to per-token compute.
 
-## Current implementation (2026-09-12 continuation)
+API: `hip_llm_load_options.qwen35_prefill_bf16` (appended field, opt-in).
+Diagnostic: `LLM_QWEN35_PROFILE_PREFILL=1` logs synchronized per-layer timings;
+disable profiling for throughput measurements. Source also updates CLI help.
 
-The user explicitly asked to keep going until the **200/30** targets are met.
-The targets are not met yet, but fresh scalar F16 parity is now established
-for the documented short corpus and 4K/64 run. Keep the scalar fallback as the
-default for unvalidated workloads. Do not restart the owned staging manager
-(committed as `74a68bf2`); details and current measurements are at the top of
-`rdna4/llm/QWEN38_STATUS.md`.
+Re-run by adding `--qwen35-prefill-bf16` to the launcher and selecting
+`--prompt-file tmp/qwen38/prefill-4k-512/coding-4096.txt --ubatch 512
+--decode 80 --coding --bench-repeat 2 -s 8192`, with
+`LLM_BMAX=512 LLM_BENCH_STREAM_CHUNK=512 QWEN38_GSQ_KV_CACHE=q8q4`.
+Use the existing absolute QWEN38_RUNNER_BIN / TMPDIR convention below.
 
-Latest follow-up: the corrected-route API profile is in
-`rdna4/llm/tmp/rocprof_qwen_api/`. Decode copies30.48 GiB in2.676 s
-over64 tokens; kernel time2.200 s. Launch geometry and attention sharding
-do not establish a speed gain. Exact-prefix graph replay passes two 4K/64
-staged hashes. Native HC batching passes the real-model bitwise oracle for 48
-layers, both phases and 8 rows, including F16 injection. Q8 SSM native
-batching is implemented:
-`LLM_QWEN4_BATCH_SSM_NATIVE=1`, binary `tmp/test_hip_llm_nativessm`.
-`--verify-ssm-projections` passes 36 layers x 5 projections x 8 rows bitwise.
-The combined native path and native router/shared experts pass the four-prompt
-corpus; see `tmp/nativemoe_quality_summary.log`. No production default is
-promoted for workloads outside the validated set.
+Artifacts and full commands: `tmp/qwen38/prefill-4k-512/` and the final section
+of `rdna4/llm/QWEN38_STATUS.md`. `summarize.py` recomputes `summary.json` and
+validates all extracted C. Build, profile tests, syntax/help and whitespace
+checks pass. No commits or pushes.
 
-Final validated binary: `rdna4/llm/tmp/test_hip_llm_verified`. Its graph
-check captures47 prefixes with zero failures and matches two4K/64 staged
-hashes, at170.00/170.42 prefill and13.57/13.59 decode min/median.
-Log:`tmp/verified_graph_4k.log`. No GPU jobs remain from this checkpoint.
+Further work should expand quality coverage of this fast mode and reduce
+its remaining numerical gap. Keep the prior exact IQ3_S diagnostic below
+separate: it is not needed for the prefill speedup.
 
-New work in this continuation:
+## Objective and constraints
 
-- Fixed a demonstrated GPU top-K candidate-masking bug. Expanded tests fail
-  before the fix and pass afterward. Historical `afdf60ceeb4f0103` performance
-  used incorrect routing and is not a current quality baseline.
-- Asynchronous fingerprints localized repeat divergence to attention layers
-  3/39, before FFN routing. Fixed the shared maximum-buffer reader race in
-  F16/I8 prefill/decode attention. Delaying other waves reproduces errors up
-  to 0.056 without the barrier; all four corrected tests pass below 6e-8.
-- `LLM_QWEN4_BATCH_PLE_FFN=1`: keep layer-1 PLE/SSM attention ordered; batch
-  its FFN. Real-weight `--verify-ple-split` matches scalar phase ordering
-  bitwise for HC, PLE, and SSM state. Prefill expert H2D drops from132.68 to
-  66.24 GiB. This does not establish batched-vs-scalar FFN parity.
-- `LLM_QWEN4_PHASE_SCRATCH=1`: one 810 MiB arena for phase-exclusive HC,
-  SSM, attention, and MoE intermediates saves1737 MiB at BMAX4096. Persistent
-  values and copy-stream banks stay separate. Both full-model requests match
-  all baseline layer fingerprints and the complete hash at the same cache.
-- `LLM_QWEN4_FINGERPRINT=1`: five stream-ordered fingerprints per layer,
-  reported at the existing final tile barrier. Diagnostic, not speed mode.
-- Two-token gate/up and down prototypes were rejected and removed after
-  one-ULP failures. The test now uses varied non-power-of-two scales.
-- `LLM_QWEN4_STAGE_THREADS=128/256/512` changes geometry only. Large bitwise
-  oracles pass; the full-model sweep does not show a compelling speed win.
-- `LLM_QWEN4_NATIVE_Q8_BATCH=1` wires the existing native Q8 batch kernel into
-  attention projections. Model-shaped scalar/batch bitwise tests pass. The
-  oracle must initialize outputs on the compute stream; default-stream
-  initialization caused an unwritten/NaN output during the first test.
-- `LLM_QWEN4_DECODE_ATTN_SHARDS=2/4/8` is an opt-in output-column split with
-  unchanged per-output arithmetic. Partial-tile/nonzero-query GPU tests match
-  the original bitwise. Full-model tuning is in progress; no default change.
+Continue closing the IQ2/IQ3 numerical gap on RX 9070 XT (RDNA4), then validate
+long-context prefill/decode performance. Whole-model parity is NOT achieved.
 
-Corrected staged baseline: cache5500/BMAX4096, 4096/64, pinned, overlap1,
-PLE split1, promote1, prefill balance0, warmup0 returns first99157 / hash
-`601167e3b2fb9425` in4/4 requests with identical fingerprints at all48 layers.
-Shared scratch matches it2/2. Cache7200 geometry sweep matches it6/6, but
-prefill is only~158–171 tok/s and decode~8–13 tok/s. These are staged-reference
-checks, **not scalar F16 parity**. Some geometry128 timing overlapped a CPU
-test compilation; do not promote its timing. Later sweeps avoid compilation.
+- Work in /mnt/nvme02/work/gemm/main; use repo-local tmp/, never /tmp.
+- Preserve unrelated dirty changes. Use apply_patch for source edits.
+- AMD GPU commands require escalated execution.
+- Do not push. Commit only when explicitly requested.
+- Read rdna4/llm/QWEN38_STATUS.md, especially its final two sections.
+- Production defaults remain at the validated hip-prod configuration.
 
-### Live work / next steps
+## Current files and new diagnostic
 
-No performance sweep is currently required to resume. Begin with the native
-SSM-trim checkpoint above, then profile and optimize routed Q4 gate/up and Q5
-down throughput. Keep GPU measurements exclusive and do not compile while a
-timing run is active. The rejected attention-tile and paired-token prototypes
-are archived under `rdna4/llm/tmp/` for reference only.
+Primary files:
+- rdna4/llm/hip_llm_runner.c
+- rdna4/llm/run_qwen38_gsq_rocm.sh
+- rdna4/llm/QWEN38_STATUS.md
+- rdna4/llm/test_iq3s_mmvq_replay.py
+- rdna4/llm/test_iq3s_mmvq_replay.cu
 
-### Multi-turn coding quality checkpoint (2026-09-12)
+The earlier gate/up TODO was stale. GGUF metadata confirms layer 0:
+- attn_qkv.weight: IQ3_S, [5120, 10240]
+- ffn_gate.weight: IQ1_S, [5120, 17408]
+- ffn_up.weight: IQ1_M, [5120, 17408]
 
-The exact-profile HTTP path was exercised with a persistent three-turn C
-coding task using `tmp/test_hip_llm_ssmtrim`. Turn 1 compiled and ran
-successfully. Turn 2 preserved the prior implementation and added the
-requested swapped-bound branch; its test exposed an ambiguous requirement
-(`clamp(3,5,1)==5` conflicts with the conventional bound-swap result of 3).
-Turn 3 hit the 256-token output limit while adding an array API and was
-syntactically incomplete. A larger queue task also hit both 220- and
-512-token limits before producing complete code.
+The earlier cache-layout fix and Q8_1/SSM/FFN improvements are already present.
+Current production IQ2 F32-KV error is 0.046010129, not the older 0.1056/0.0910.
 
-The stdio server now saves a state snapshot at each complete prompt boundary
-and restores it when the next request still begins with that prompt. This
-handles BPE re-tokenization differences in generated text without discarding
-the whole recurrent/KV state. The rebuilt GPU retest reports cached tokens
-`0 -> 186 -> 231` across three growing turns; turn 3 processed 250 new tokens
-out of 481, confirming suffix replay instead of a full reset. The short exact
-HTTP turns measured about 6--12 prefill and 9.9--11.4 decode tok/s; these are
-cold short-request figures and are not comparable to the 4K staged ~126/22
-checkpoint.
+Added opt-in LLM_IQ3S_MMVQ_REF=1. It substitutes
+matvec_iq3_s_q81_mmvq_batch for existing IQ3_S Q8_1 routes only.
+Unset/zero preserves production. Do not promote it: full IQ2 logits regress.
 
-The output-budget and prompt-quality issues remain separate: 256 tokens still
-truncates a larger array task, and the swapped-bound test requirement must be
-made explicit about whether bounds are swapped or the original lower bound is
-preferred. Keep those quality checks pending while retaining this cache fix.
+## Exact local result
 
-The Codex launcher now honors `QWEN38_RUNNER`; before this fix it silently
-overrode the requested native runner. A real `CODEX_HOME=/home/syoyo/.codex-local`
-probe reached the API, but the full Codex system prompt requires roughly 12K
-tokens. At the safe 16 GiB `BMAX=512` setting, native batched prefill measured
-12.84--13.20 tok/s, so the bounded probe was stopped before a completed answer.
-`BMAX=4096` fails GPU initialization at 16K context from VRAM pressure. This is
-an integration/performance limitation, not output-quality evidence.
+The replay includes the actual local llama.cpp vec_dot_iq3_s_q8_1 and extracts
+the actual runner kernel from hip_llm_runner.c. Both consume the SAME
+GPU-quantized captured input; this isolates the matvec, not the quantizer.
 
-The explicit `QWEN38_FAST_PREFILL=1` profile now forwards the native Q6K SSM,
-native batch QKV, full-layer batch attention, and multi-chunk stateful controls.
-With `CODEX_HOME=/home/syoyo/.codex-local`, a real 12,116-token Codex system
-prompt ran at 162 tok/s for the first chunk and 137.81 tok/s overall across
-seven chunks. The request completed, but the 256-token answer was gibberish;
-the multi-chunk recurrent batch carry is therefore still not quality-safe.
-Keep this profile diagnostic-only until a fresh scalar output/parity gate passes.
-Disabling only fused SSM convolution and recurrence did not fix the result:
-the same Codex turn returned only `</think>` at 124.52 tok/s. The remaining
-quality defect is therefore in batched attention/MoE or cross-chunk state
-handoff, not solely the fused SSM kernels. The launcher also now preserves an
-explicit `LLM_QWEN4_NATIVE_BATCH_QKV` override instead of resetting it later.
+Confirmed IQ3_S schedule: QI=16, VDR=2, nwarps=1, blocks_per_iter=4,
+kbx=tid/8, kqs=2*(tid%8). This is identical to the runner's lane-per-Q8-block,
+stride-32 schedule. The old QI=8/four-thread description was wrong and is now
+corrected in QWEN38_STATUS.md. Do not rewrite this mapping.
 
-The documented layer-2 attention cap is exact on the short comparator, but a
-4K real-weight run with scalar SSM transitions did not complete within three
-minutes, so it misses the requested 50 tok/s floor. It is not a practical
-Codex serving profile yet. Quality-first serving should continue using the
-scalar route while the batched attention/MoE state handoff is repaired.
+The missing contract:
+1. Scale the integer dot by the odd scale code before converting to float.
+2. Round weight_d * q8_d separately.
+3. FMA the scaled integer into the accumulator; XOR warp reduction.
 
-### Environment and checks
+Ordinary expressions (also a __fmul_rn/__fadd_rn attempt) were not sufficient
+under fast-math. Explicit v_mul_f32 and v_fma_f32 produce exact replay.
+The local llama HIP mmvq build uses -O3 WITHOUT fast-math; the harness compiles
+it separately from the runner's -O3 -ffast-math translation unit.
 
-Use `TMPDIR=$PWD/rdna4/llm/tmp`; never `/tmp`. `/local` is absent. GPU devices
-are hidden in the sandbox; approved host execution exposes them. GPU jobs must
-be exclusive. Do not mutate running scripts/binaries, and avoid compilation
-during performance measurements. CPU: Threadripper1950X; GPU: RX9070XT16GiB;
-PCIe reports8GT/s x16.
+All 10,240 rows, five inputs (captured, three deterministic random, zero):
+- Production: 27753/51200 exact, rel 5.76739e-8, max 7.62939e-6.
+- Protected mul plus separate add: 26320/51200 exact.
+- Protected mul plus FMA: 51200/51200 exact, rel=0, max=0.
+- Individual dot contributions: 8192000/8192000 exact.
+- Partial row-block test: 13 rows x 5 inputs, 65/65 exact.
 
-```sh
-export TMPDIR="$PWD/rdna4/llm/tmp"
-make -C rdna4/llm moe-stage-test
-make -C rdna4/llm qwen4-attention-gpu-test
-make -C rdna4/llm tmp/test_hip_qwen4_moe_stage tmp/test_hip_qwen4_moe_stage_large
-make -C rdna4/llm moe-stage-gpu-test
-make -C rdna4/llm moe-stage-quality
-```
+## Full-model measurements
 
-Preserve unrelated `a64fx/glm5` / `common/transformer.h` work. Do not commit
-the stray untracked `rdna4/llm/hip_runner_common.h`; the runner includes
-`../hip_runner_common.h`. Commit coherent tested changes and report the hash;
-no push without a new explicit push request.
+Models under /mnt/nvme02/models/qwen38/27b/gsq/:
+- Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf
+- Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf
 
-## Authoritative paths
+Canonical prompt: tmp/qwen38/coding-prompt.txt, exactly 40 tokens.
+Preserve its two trailing newlines (final token 271, not 198).
 
-```text
-Model:      /mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
-MTP:        /mnt/nvme01/models/q38nf/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf
-CPU lib:    /mnt/nvme02/work/llama.cpp/build-codex-hetero-dev2/bin/libggml-cpu.so.0.22.0
-Prompt:     rdna4/llm/tmp/qwen38_target_prompt.txt  (9000 bytes of common/gguf_loader.h)
-Status doc: rdna4/llm/QWEN38_STATUS.md              (authoritative running log)
-Tuning doc: rdna4/llm/QWEN38_PREFILL_TUNING.md
-MTP doc:    rdna4/llm/QWEN4_MTP.md
-```
+Fresh llama.cpp sequential references from checkout 1859b5209 with local
+changes, build-codex-hetero-dev2. Match KV format when comparing.
 
-## Historical evidence and remaining work
+| Mode | Relative L2 | Max absolute | Argmax |
+|---|---:|---:|---:|
+| IQ2 production, F32 KV | 0.046010129 | 0.540599227 | 71093 |
+| IQ2 diagnostic, F32 KV | 0.073783392 | 0.692957401 | 71093 |
+| IQ2 production, Q8/Q4 KV | 0.129714052 | 1.625519276 | 71093 |
+| IQ2 diagnostic, Q8/Q4 KV | 0.155747498 | 1.728286982 | 71093 |
+| IQ3 production, F32 KV | 0.039762184 | 0.428576946 | 71093 |
 
-Read `rdna4/llm/QWEN38_STATUS.md` in full for preceding investigations and
-measurements. Historical scalar `fast` at BMAX2048/7800 MiB cache returned
-first token 30 / hash `6d67721190bdaa83` in three repeats at about 24/21 tok/s.
-Do not substitute it for fresh references with different profile settings.
+All reference argmaxes are also 71093. The local exact fix is not a monotone
+end-to-end improvement; other stage differences still perturb Q8 rounding.
 
-Earlier per-token-MoE controls passed 6/6 at 512/8. Disabling the gathered
-input/output alias, host router top-k, pageable weights, and per-copy stream
-synchronization individually did not eliminate full-model divergence. Launch
-blocking or host-synchronized layer tracing can mask the failure. These tests
-narrow the investigation but do not prove a unique root cause.
+Production IQ2 Q8/Q4 logits remain byte-identical to
+tmp/qwen38/current-audit-20260919/hip-prod-q8q4.bin.
+Production IQ3 logits are byte-identical before/after this session's changes.
 
-The previous request to stage all cold experts before compute was superseded
-by the user's explicit choice of bounded waves. The implementation preserves
-the 512 MiB pool; full-layer weight staging is not the pending task.
+40-token prompt, 80-token --coding generation, warm model, -s 256:
+- IQ2 production Q8/Q4: prefill 28.86 tok/s; decode 24.78 tok/s.
+- IQ2 diagnostic F32: prefill 28.83 tok/s; decode 25.55 tok/s.
+- IQ3 production final: prefill 27.77 tok/s; decode 25.40 tok/s.
 
-After localization and strict scalar parity, investigate routed cache hit
-rate/overlap for prefill and exact single-token kernels for decode. Stateful
-multi-chunk prefill, diverse 32K+ quality checks, and the 256K capacity path
-remain separate open work. No MTP or approximation promotion is authorized by
-this staging milestone.
+All produced the complete two-comparison clamp function. Both llama references
+and all generated HIP clamp sources passed C11 syntax checking and 196
+functional cases, including INT_MIN/INT_MAX, under UBSan.
+These short runs do not establish long-context performance.
+
+## Artifacts and commands
+
+Everything from this continuation:
+tmp/qwen38/iq3s-replay-20260919/
+
+Important files:
+- summary.json / summary.txt; summarize.py recomputes errors and C tests.
+- iq2-before.bin / iq2-ref.bin: F32-KV production / diagnostic.
+- iq2-default.bin / iq2-ref-q8q4.bin: Q8/Q4 production / diagnostic.
+- iq3-before.bin / iq3-final.bin: unchanged IQ3 production.
+- iq3-ref.bin: IQ3 diagnostic A/B, byte-identical to production.
+- llama-iq2.bin / llama-iq2-q8q4.bin / llama-iq3.bin: fresh references.
+- full/result.txt and multi/result.txt: exact isolated GPU replay.
+- *-clamp.c, *-clamp-test.c: syntax and functional checks.
+- build-final.log: host runner build; existing unrelated warnings remain.
+
+Build:
+    make -C rdna4/llm -j2
+
+Replay preparation:
+    export TMPDIR="$PWD/tmp"
+    export PYTHONPATH=/mnt/nvme02/work/llama.cpp/gguf-py
+    python3 rdna4/llm/test_iq3s_mmvq_replay.py \
+      /mnt/nvme02/models/qwen38/27b/gsq/Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf \
+      tmp/qwen38/llama-iq2-q8q4-trace2/llama-attn-norm-00.bin \
+      --out tmp/qwen38/iq3s-replay-20260919/full --random-vectors 3
+
+Run with AMD access:
+    env LD_LIBRARY_PATH=/opt/rocm/core-10.0/lib \
+      tmp/qwen38/iq3s-replay-20260919/full/replay \
+      tmp/qwen38/iq3s-replay-20260919/full 10240 5120 5
+
+Full runner pattern (absolute /mnt path avoids physical /home alias issues):
+    env TMPDIR=/mnt/nvme02/work/gemm/main/tmp \
+      QWEN38_RUNNER_BIN=/mnt/nvme02/work/gemm/main/rdna4/llm/test_hip_llm \
+      LLM_LOGITS_PATH=/mnt/nvme02/work/gemm/main/tmp/qwen38/NEW.bin \
+      bash /mnt/nvme02/work/gemm/main/rdna4/llm/run_qwen38_gsq_rocm.sh \
+      --gpu-only-bench --bench \
+      --prompt-file /mnt/nvme02/work/gemm/main/tmp/qwen38/coding-prompt.txt \
+      --decode 0 -s 256
+
+Set QWEN38_GSQ_KV_CACHE=f32 for F32 comparison; omit for IQ2 production Q8/Q4.
+Set QWEN38_MODEL to the IQ3 model for its profile (F32 KV default).
+Set LLM_IQ3S_MMVQ_REF=1 only for the diagnostic.
+For generation add LLM_GEN_TEXT=1 and --decode 80 --coding.
+
+## Next work
+
+1. Keep production defaults unchanged. The isolated IQ3_S gap is closed, but
+   the final gap is not; do not re-run abandoned plain-expression variants.
+2. Extend captured-input GPU replay to the next coupled layer-0 stages:
+   wide RMSNorm, SSM Q/K normalization and gated RMSNorm, conv/SiLU, and the
+   IQ4_XS output projection. Verify each stage independently before combining.
+3. Earlier norm ports were reverted because final logits regressed. Revisit
+   them with stage equality and the new IQ3_S diagnostic together; do not
+   infer local correctness solely from final logits.
+4. Preserve matching prompt tokens and KV precision for every A/B.
+5. Revalidate IQ2/IQ3 generated C and report numerical and throughput results
+   separately. Long-context optimization remains outstanding.

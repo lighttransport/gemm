@@ -37,6 +37,8 @@ typedef enum {
     HIP_LLM_KV_F16,
     /* Explicit llama.cpp-compatible full-attention cache: q8_0 K/q4_0 V. */
     HIP_LLM_KV_Q8_0_Q4_0,
+    /* Q8_0 for both K and V; supported by Qwen3.5 hybrid attention. */
+    HIP_LLM_KV_Q8_0_Q8_0,
 } hip_llm_kv_cache_type;
 
 typedef enum {
@@ -70,6 +72,9 @@ typedef struct {
     int prefill_batch_tokens;
     /* 0: quality-safe scalar dispatcher; 1: enable Qwen3.5 batched path. */
     int qwen35_batched_prefill;
+    /* Experimental BF16 projection GEMMs during Qwen3.5 prefill only.
+     * Changes quantized projection arithmetic; decode remains unchanged. */
+    int qwen35_prefill_bf16;
 } hip_llm_load_options;
 
 typedef struct {

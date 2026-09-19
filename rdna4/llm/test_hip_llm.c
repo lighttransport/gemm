@@ -116,6 +116,32 @@ static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
 
 static int argmax_logits(const float *logits, int n);
 
+/* Vocabulary strings use GPT-2/Qwen's byte-to-Unicode display alphabet.
+ * Decode every piece before it reaches a user-visible stream so spaces,
+ * newlines, arbitrary UTF-8, and byte-fallback tokens are emitted as bytes
+ * rather than tokenizer markers such as U+0120/U+010A (Ġ/Ċ). */
+static void print_decoded_token(FILE *stream, const bpe_vocab *vocab, int token_id) {
+    const char *piece = bpe_token_to_str(vocab, token_id);
+    if (!stream || !piece) return;
+    int decoded_len = 0;
+    char *decoded = bpe_byte_decode(piece, (int)strlen(piece), &decoded_len);
+    if (!decoded) return;
+    if (decoded_len > 0)
+        fwrite(decoded, 1, (size_t)decoded_len, stream);
+    free(decoded);
+}
+
+static int is_generation_stop(const bpe_vocab *vocab, int token_id,
+                              int eos, int eot) {
+    if (token_id == eos || token_id == eot) return 1;
+    /* Some converted vocabularies contain duplicate control-token strings.
+     * Match the piece as well as the metadata ID so benchmark text never
+     * exposes a duplicate ChatML turn terminator. */
+    const char *piece = bpe_token_to_str(vocab, token_id);
+    return piece && (strcmp(piece, "<|im_end|>") == 0 ||
+                     strcmp(piece, "<|endoftext|>") == 0);
+}
+
 /* Coding-only sampler variant. Keep the production sampler above with its
  * small standalone signature because test_sampler.py extracts it directly;
  * delimiter filtering belongs in this opt-in wrapper instead. */
@@ -532,7 +558,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                                temperature, presence, repetition, min_p, seen, &rng, vocab) :
                  sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence,
                                repetition, min_p, seen, &rng));
-            int is_stop = next == eos || next == eot || next == im_end;
+            int is_stop = is_generation_stop(vocab, next, eos, eot) ||
+                          next == im_end;
             const char *piece = bpe_token_to_str(vocab, next);
             if (!is_stop && piece && text) {
                 int raw_n = (int)strlen(piece), dec_n = 0;
@@ -851,6 +878,30 @@ static int argmax_logits(const float *logits, int n) {
     return best;
 }
 
+static void dump_top_logits(const float *logits, int n) {
+    const char *dump_path = getenv("LLM_DUMP_LOGITS_BIN");
+    if (dump_path) {
+        FILE *f = fopen(dump_path, "wb");
+        if (f) { fwrite(logits, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (!getenv("LLM_DUMP_LOGITS")) return;
+    int ids[20];
+    float vals[20];
+    int count = 0;
+    for (int id = 0; id < n; id++) {
+        float v = logits[id];
+        int p = count < 20 ? count++ : 19;
+        if (count == 20 && v <= vals[19]) continue;
+        while (p > 0 && v > vals[p - 1]) {
+            if (p < 20) { vals[p] = vals[p - 1]; ids[p] = ids[p - 1]; }
+            p--;
+        }
+        vals[p] = v; ids[p] = id;
+    }
+    fprintf(stderr, "top logits:\n");
+    for (int i = 0; i < count; i++) fprintf(stderr, "%d %.9g\n", ids[i], vals[i]);
+}
+
 int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *prompt = "Hello, how are you?";
@@ -878,6 +929,7 @@ int main(int argc, char **argv) {
     int decode_layout_budget_mib = 0;
     int prefill_batch_tokens = 0;
     int qwen35_batched_prefill = 0;
+    int qwen35_prefill_bf16 = 0;
     int max_layers = 0;
     int verify_hc_batch = 0, verify_ple_split = 0, verify_ssm_projections = 0, verify_moe_native = 0;
     int verify_glm5next_kda = 0;
@@ -1014,7 +1066,8 @@ int main(int argc, char **argv) {
             else if (!strcmp(mode, "f32")) kv_cache_type = HIP_LLM_KV_F32;
             else if (!strcmp(mode, "f16")) kv_cache_type = HIP_LLM_KV_F16;
             else if (!strcmp(mode, "q8q4")) kv_cache_type = HIP_LLM_KV_Q8_0_Q4_0;
-            else { fprintf(stderr, "--kv-cache must be auto, f32, f16, or q8q4\n"); return 2; }
+            else if (!strcmp(mode, "q8q8")) kv_cache_type = HIP_LLM_KV_Q8_0_Q8_0;
+            else { fprintf(stderr, "--kv-cache must be auto, f32, f16, q8q4, or q8q8\n"); return 2; }
         } else if (strcmp(argv[i], "--ubatch") == 0 && i + 1 < argc) {
             prefill_batch_tokens = atoi(argv[++i]);
             if (prefill_batch_tokens < 1 || prefill_batch_tokens > 8192) {
@@ -1022,6 +1075,9 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--qwen35-batched-prefill") == 0) {
             qwen35_batched_prefill = 1;
+        } else if (strcmp(argv[i], "--qwen35-prefill-bf16") == 0) {
+            qwen35_batched_prefill = 1;
+            qwen35_prefill_bf16 = 1;
         } else if (strcmp(argv[i], "--decode-kernels") == 0 && i + 1 < argc) {
             const char *mode = argv[++i];
             if (!strcmp(mode, "native")) decode_kernel_mode = HIP_LLM_DECODE_KERNEL_NATIVE;
@@ -1108,7 +1164,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
             fprintf(stderr, "       [--bench] [--gpu-only-bench] [--gpu-only] [--decode N] [--prefill-len M] [--coding]\n");
             fprintf(stderr, "       [--moe-cache-mb MiB] [--moe-cpu]\n");
-            fprintf(stderr, "       [--kv-cache auto|f32|f16|q8q4] [--ubatch N] [--qwen35-batched-prefill]\n");
+            fprintf(stderr, "       [--kv-cache auto|f32|f16|q8q4|q8q8] [--ubatch N] [--qwen35-batched-prefill]\n");
+            fprintf(stderr, "       [--qwen35-prefill-bf16] (experimental BF16 prefill projections; unchanged decode kernels)\n");
             fprintf(stderr, "       [--decode-kernels native|dp4a2|auto]\n");
             fprintf(stderr, "       [--decode-layout native|auto] [--decode-layout-cache auto|off|PATH]\n");
             fprintf(stderr, "       [--decode-layout-budget-mib MiB]\n");
@@ -1397,6 +1454,13 @@ int main(int argc, char **argv) {
         if (!cpu_model) {
             fprintf(stderr, "CPU model load failed (MoE?), running GPU-only mode\n");
             gpu_only = 1;
+        } else {
+            const char *tf_threads = getenv("TF_THREADS");
+            if (tf_threads && atoi(tf_threads) > 1) {
+                int n = atoi(tf_threads);
+                transformer_set_threads(cpu_model, n);
+                fprintf(stderr, "CPU reference threads: %d (TF_THREADS)\n", n);
+            }
         }
     }
 
@@ -1449,6 +1513,7 @@ int main(int argc, char **argv) {
     load_options.kv_cache_type = kv_cache_type;
     load_options.prefill_batch_tokens = prefill_batch_tokens;
     load_options.qwen35_batched_prefill = qwen35_batched_prefill;
+    load_options.qwen35_prefill_bf16 = qwen35_prefill_bf16;
     load_options.decode_kernel_mode = decode_kernel_mode;
     load_options.decode_layout_mode = decode_layout_mode;
     load_options.decode_layout_cache_path = decode_layout_cache_path;
@@ -1715,6 +1780,18 @@ int main(int argc, char **argv) {
             last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
         }
         if (!last_logits) { fprintf(stderr, "GPU forward_batch_logits failed\n"); pass = 0; goto bench_done; }
+        dump_top_logits(last_logits, n_vocab);
+        const char *logits_path = getenv("LLM_LOGITS_PATH");
+        if (logits_path && *logits_path) {
+            FILE *lf = fopen(logits_path, "wb");
+            if (lf) {
+                fwrite(last_logits, sizeof(float), (size_t)n_vocab, lf);
+                fclose(lf);
+                fprintf(stderr, "Wrote logits: %s\n", logits_path);
+            } else {
+                fprintf(stderr, "Cannot write logits: %s\n", logits_path);
+            }
+        }
         seen = coding_mode ? (unsigned char *)calloc((size_t)n_vocab, 1) : NULL;
         unsigned sample_rng = 0x51f15e5du;
         int next_tok = coding_mode ? sample_top_k_p_coding(last_logits, n_vocab, 20, 0.80f,
@@ -1740,7 +1817,15 @@ int main(int argc, char **argv) {
             hip_llm_reset_moe_stats(gpu);
             hip_llm_set_decode_mode(gpu, 1);
             int gen_text = (getenv("LLM_GEN_TEXT") != NULL);
-            if (gen_text) fprintf(stderr, "\n=== Generated text ===\n%s", bpe_token_to_str(vocab, next_tok));
+            int text_finished = 0;
+            const int text_eos = bpe_eos_id(vocab);
+            const int text_eot = bpe_eot_id(vocab);
+            if (gen_text) {
+                fprintf(stderr, "\n=== Generated text ===\n");
+                text_finished = is_generation_stop(
+                    vocab, next_tok, text_eos, text_eot);
+                if (!text_finished) print_decoded_token(stderr, vocab, next_tok);
+            }
             double t_dec0 = get_time_ms();
             int mtp_approx_fallback = 0;
             int mtp_adaptive_fallback = 0;
@@ -1757,7 +1842,12 @@ int main(int argc, char **argv) {
                     }
                     for (int i=0;i<mtp.emitted;++i) {
                         decode_hash ^= (uint32_t)mtp.tokens[i]; decode_hash *= 1099511628211ULL;
-                        if (gen_text) { const char *s=bpe_token_to_str(vocab,mtp.tokens[i]); if(s)fprintf(stderr,"%s",s); }
+                        if (gen_text && !text_finished) {
+                            text_finished = is_generation_stop(
+                                vocab, mtp.tokens[i], text_eos, text_eot);
+                            if (!text_finished)
+                                print_decoded_token(stderr, vocab, mtp.tokens[i]);
+                        }
                     }
                     decoded += mtp.emitted; k += mtp.emitted-1; next_tok=mtp.pending;
                     fprintf(stderr,"MTP backend=%s drafted=%d accepted=%d emitted=%d draft_ms=%.3f verify_ms=%.3f\n",
@@ -1804,7 +1894,12 @@ int main(int argc, char **argv) {
                                               &sample_rng, vocab);
                 }
                 decoded++;
-                if (gen_text) { const char *s = bpe_token_to_str(vocab, next_tok); if (s) fprintf(stderr, "%s", s); }
+                if (gen_text && !text_finished) {
+                    text_finished = is_generation_stop(
+                        vocab, next_tok, text_eos, text_eot);
+                    if (!text_finished)
+                        print_decoded_token(stderr, vocab, next_tok);
+                }
             }
             if (gen_text) fprintf(stderr, "\n=== end ===\n");
             double t_dec1 = get_time_ms();
