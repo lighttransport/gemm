@@ -208,6 +208,10 @@ simplification against original CuMesh using every vertex and face centroid.
 then use `preview_glb.py FILE.glb --output-dir DIR` for four CPU-rendered views.
 The preview copy is uniformly scaled to avoid the renderer's fixed triangle-size
 epsilon and uses wider camera framing; exported GLB geometry is unchanged.
+`compare_outputs.py NATIVE.glb REFERENCE.glb` deterministically samples both
+surfaces and reports bidirectional Chamfer distances and nearest-face normal
+agreement. Pass matching `--native-renders` and `--reference-renders`
+directories to add RGB error, PSNR, and silhouette IoU for rendered PNG views.
 
 ## Validation record
 
