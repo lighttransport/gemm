@@ -182,6 +182,20 @@ XOS_MMM_L_HUGETLB_FALLBACK=0 \
 The measured 240 MiB, 12-core sweep sustained 227.76--229.71 GB/s across
 0--64 KiB skews; `smaps` confirmed 2048 KiB kernel/MMU pages.
 
+To measure how much arithmetic fits under HBM latency/bandwidth, add fixed
+SDOT or FMLA work per 256-byte line and pair it with a read measurement on the
+same arena:
+
+```sh
+# Supported counts: 4, 8, 12, 16, 24, 32, 40, 48, 52, 56, 60, 64.
+./bench_hbm_color --page-mode xos --op sdot --ops-per-line 48 \
+  --paired-baseline --max-skew-kib 0
+```
+
+On the measured CMG, 48 SVE SDOT or FMLA instructions retained approximately
+229.5 GB/s. At 52 instructions bandwidth fell to about 224.2 GB/s, making 48
+instructions per 256 packed bytes the measured no-degradation budget.
+
 For production staging, allocate all twelve regions from one CMG-local arena
 and first-touch it on that CMG. Re-run the placement sweep if payload size,
 page policy, allocator, CMG, or node configuration changes.

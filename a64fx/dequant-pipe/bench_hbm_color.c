@@ -17,12 +17,23 @@ enum { CACHE_LINE = 256, MAX_CORES = 12, MAX_TRIALS = 31 };
 typedef enum { PAGE_THP, PAGE_BASE, PAGE_XOS } page_mode;
 
 extern void hbm_read_256_sve(const uint8_t *, size_t);
+#define DECLARE_COMPUTE(kind, n) extern void hbm_read_256_##kind##_##n##_sve(const uint8_t *, size_t)
+DECLARE_COMPUTE(sdot, 4); DECLARE_COMPUTE(sdot, 8); DECLARE_COMPUTE(sdot, 12);
+DECLARE_COMPUTE(sdot, 16); DECLARE_COMPUTE(sdot, 24); DECLARE_COMPUTE(sdot, 32);
+DECLARE_COMPUTE(sdot, 40); DECLARE_COMPUTE(sdot, 48); DECLARE_COMPUTE(sdot, 64);
+DECLARE_COMPUTE(sdot, 52); DECLARE_COMPUTE(sdot, 56); DECLARE_COMPUTE(sdot, 60);
+DECLARE_COMPUTE(fmla, 4); DECLARE_COMPUTE(fmla, 8); DECLARE_COMPUTE(fmla, 12);
+DECLARE_COMPUTE(fmla, 16); DECLARE_COMPUTE(fmla, 24); DECLARE_COMPUTE(fmla, 32);
+DECLARE_COMPUTE(fmla, 40); DECLARE_COMPUTE(fmla, 48); DECLARE_COMPUTE(fmla, 64);
+DECLARE_COMPUTE(fmla, 52); DECLARE_COMPUTE(fmla, 56); DECLARE_COMPUTE(fmla, 60);
+typedef void (*stream_fn)(const uint8_t *, size_t);
 
 typedef struct {
     const uint8_t *source;
     size_t bytes;
     int cpu;
     int iterations;
+    stream_fn stream;
     atomic_int *ready;
     atomic_int *start;
     uint64_t begin;
@@ -62,7 +73,7 @@ static void *worker_main(void *opaque)
     w->begin = cntvct();
     if (!w->error)
         for (int i = 0; i < w->iterations; ++i)
-            hbm_read_256_sve(w->source, w->bytes);
+            w->stream(w->source, w->bytes);
     w->end = cntvct();
     return NULL;
 }
@@ -76,6 +87,7 @@ static int compare_double(const void *lhs, const void *rhs)
 
 static int measure(const uint8_t *arena, size_t bytes, size_t skew, int cores,
                    int core_base, int iterations, int trials,
+                   stream_fn stream,
                    double *median, double *best)
 {
     const size_t per_core = bytes / (size_t)cores;
@@ -92,6 +104,7 @@ static int measure(const uint8_t *arena, size_t bytes, size_t skew, int cores,
                 .bytes = per_core,
                 .cpu = core_base + c,
                 .iterations = iterations,
+                .stream = stream,
                 .ready = &ready,
                 .start = &start,
             };
@@ -146,8 +159,23 @@ static void usage(const char *name)
             "          [--min-skew-kib N] [--max-skew-kib N] "
             "[--step-bytes N] [--bit-sweep]\n"
             "          [--sweep-base] [--fixed-skew-kib N] "
-            "[--max-base-kib N] [--page-mode thp|base|xos]\n",
+            "[--max-base-kib N] [--page-mode thp|base|xos]\n"
+            "          [--op read|sdot|fmla] [--ops-per-line N] [--paired-baseline]\n",
             name);
+}
+
+static stream_fn select_stream(const char *op, int count)
+{
+    if (!strcmp(op, "read") && count == 0) return hbm_read_256_sve;
+#define SELECT(kind, n) if (!strcmp(op, #kind) && count == n) return hbm_read_256_##kind##_##n##_sve
+    SELECT(sdot, 4); SELECT(sdot, 8); SELECT(sdot, 12); SELECT(sdot, 16);
+    SELECT(sdot, 24); SELECT(sdot, 32); SELECT(fmla, 4); SELECT(fmla, 8);
+    SELECT(fmla, 12); SELECT(fmla, 16); SELECT(fmla, 24); SELECT(fmla, 32);
+    SELECT(sdot, 40); SELECT(sdot, 48); SELECT(sdot, 64);
+    SELECT(fmla, 40); SELECT(fmla, 48); SELECT(fmla, 64);
+    SELECT(sdot, 52); SELECT(sdot, 56); SELECT(sdot, 60);
+    SELECT(fmla, 52); SELECT(fmla, 56); SELECT(fmla, 60);
+    return NULL;
 }
 
 static void report_mapping(const void *address)
@@ -209,6 +237,9 @@ int main(int argc, char **argv)
     size_t fixed_skew_kib = 0, max_base_kib = 2048;
     bool bit_sweep = false, sweep_base = false;
     page_mode pages = PAGE_THP;
+    const char *op_name = "read";
+    int ops_per_line = 0;
+    bool paired_baseline = false;
     static const struct option options[] = {
         {"cores", required_argument, NULL, 'c'},
         {"core-base", required_argument, NULL, 'b'},
@@ -223,6 +254,9 @@ int main(int argc, char **argv)
         {"fixed-skew-kib", required_argument, NULL, 1005},
         {"max-base-kib", required_argument, NULL, 1006},
         {"page-mode", required_argument, NULL, 1007},
+        {"op", required_argument, NULL, 1008},
+        {"ops-per-line", required_argument, NULL, 1009},
+        {"paired-baseline", no_argument, NULL, 1010},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -247,6 +281,9 @@ int main(int argc, char **argv)
             else if (!strcmp(optarg, "xos")) pages = PAGE_XOS;
             else { fprintf(stderr, "page mode must be thp, base, or xos\n"); return 2; }
             break;
+        case 1008: op_name = optarg; break;
+        case 1009: ops_per_line = (int)parse_size(optarg, "ops-per-line"); break;
+        case 1010: paired_baseline = true; break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 2;
         }
@@ -255,6 +292,11 @@ int main(int argc, char **argv)
         trials > MAX_TRIALS || step == 0 || step % CACHE_LINE != 0 ||
         min_skew_kib > max_skew_kib || mib > SIZE_MAX / 1048576u) {
         usage(argv[0]);
+        return 2;
+    }
+    stream_fn stream = select_stream(op_name, ops_per_line);
+    if (!stream) {
+        fprintf(stderr, "unsupported --op/--ops-per-line combination\n");
         return 2;
     }
     size_t bytes = mib * 1048576u;
@@ -303,24 +345,30 @@ int main(int argc, char **argv)
     printf("# cores=%d core_base=%d payload_mib=%zu per_core_mib=%.6f iterations=%d trials=%d\n",
            cores, core_base, mib, (double)(bytes / (size_t)cores) / 1048576.0,
            iterations, trials);
+    printf("# op=%s ops_per_256B_line=%d\n", op_name, ops_per_line);
     const char *page_name = pages == PAGE_XOS ? "xos" :
                             pages == PAGE_THP ? "thp" : "base";
     printf("# arena=%p allocation_bytes=%zu page_mode=%s\n", (void *)arena,
            allocation_bytes, page_name);
     report_mapping(arena);
     report_pfns(arena, bytes, cores);
-    printf("base_offset_bytes,skew_bytes,changed_bit,median_GBps,best_GBps,percent_of_256GBps\n");
+    printf("base_offset_bytes,skew_bytes,changed_bit,median_GBps,best_GBps,percent_of_256GBps,paired_read_GBps,percent_of_paired\n");
     int rc = 0;
     if (sweep_base) {
         for (size_t base_offset = 0; base_offset <= max_base; base_offset += step) {
             double median, best;
+            double read_median = 0.0, read_best;
+            if (paired_baseline && measure(arena + base_offset, bytes, fixed_skew,
+                    cores, core_base, iterations, trials, hbm_read_256_sve,
+                    &read_median, &read_best) != 0) { rc = 1; break; }
             if (measure(arena + base_offset, bytes, fixed_skew, cores, core_base,
-                        iterations, trials, &median, &best) != 0) {
+                        iterations, trials, stream, &median, &best) != 0) {
                 rc = 1;
                 break;
             }
-            printf("%zu,%zu,-1,%.3f,%.3f,%.2f\n", base_offset, fixed_skew,
-                   median, best, median / 2.56);
+            printf("%zu,%zu,-1,%.3f,%.3f,%.2f,%.3f,%.2f\n", base_offset, fixed_skew,
+                   median, best, median / 2.56, read_median,
+                   read_median ? 100.0 * median / read_median : 0.0);
             fflush(stdout);
             if (max_base - base_offset < step) break;
         }
@@ -329,10 +377,15 @@ int main(int argc, char **argv)
             size_t skew = (size_t)1u << bit;
             if (skew > max_skew) break;
             double median, best;
-            if (measure(arena, bytes, skew, cores, core_base, iterations, trials,
+            double read_median = 0.0, read_best;
+            if (paired_baseline && measure(arena, bytes, skew, cores, core_base,
+                    iterations, trials, hbm_read_256_sve, &read_median,
+                    &read_best) != 0) { rc = 1; break; }
+            if (measure(arena, bytes, skew, cores, core_base, iterations, trials, stream,
                         &median, &best) != 0) { rc = 1; break; }
-            printf("0,%zu,%u,%.3f,%.3f,%.2f\n", skew, bit, median, best,
-                   median / 2.56);
+            printf("0,%zu,%u,%.3f,%.3f,%.2f,%.3f,%.2f\n", skew, bit, median, best,
+                   median / 2.56, read_median,
+                   read_median ? 100.0 * median / read_median : 0.0);
             fflush(stdout);
         }
     } else {
@@ -341,10 +394,15 @@ int main(int argc, char **argv)
         first = (first + step - 1) / step * step;
         for (size_t skew = first; skew <= last; skew += step) {
             double median, best;
-            if (measure(arena, bytes, skew, cores, core_base, iterations, trials,
+            double read_median = 0.0, read_best;
+            if (paired_baseline && measure(arena, bytes, skew, cores, core_base,
+                    iterations, trials, hbm_read_256_sve, &read_median,
+                    &read_best) != 0) { rc = 1; break; }
+            if (measure(arena, bytes, skew, cores, core_base, iterations, trials, stream,
                         &median, &best) != 0) { rc = 1; break; }
-            printf("0,%zu,-1,%.3f,%.3f,%.2f\n", skew, median, best,
-                   median / 2.56);
+            printf("0,%zu,-1,%.3f,%.3f,%.2f,%.3f,%.2f\n", skew, median, best,
+                   median / 2.56, read_median,
+                   read_median ? 100.0 * median / read_median : 0.0);
             fflush(stdout);
             if (last - skew < step) break;
         }

@@ -43,6 +43,67 @@ hbm_read_256_pf_sve:
     ret
     .size hbm_read_256_pf_sve, .-hbm_read_256_pf_sve
 
+/* HBM roofline probes: four 64-byte loads plus N independent arithmetic ops. */
+    .altmacro
+    .macro COMPUTE_OP kind, acc, src
+    .ifc \kind,sdot
+    sdot z\acc\().s, z\src\().b, z28.b
+    .else
+    fmla z\acc\().s, p0/m, z\src\().s, z28.s
+    .endif
+    .endm
+
+    .macro GEN_HBM_COMPUTE kind, count
+    .global hbm_read_256_\kind\()_\count\()_sve
+    .type hbm_read_256_\kind\()_\count\()_sve, %function
+hbm_read_256_\kind\()_\count\()_sve:
+    ptrue p0.b
+    mov z28.b, #1
+    cbz x1, 2f
+1:
+    ld1b {z24.b}, p0/z, [x0]
+    ld1b {z25.b}, p0/z, [x0, #1, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #2, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #3, mul vl]
+    .set n, 0
+    .rept \count
+    COMPUTE_OP \kind, %(n % 24), %(24 + (n % 4))
+    .set n, n + 1
+    .endr
+    add x0, x0, #256
+    subs x1, x1, #256
+    b.ne 1b
+2:
+    ret
+    .size hbm_read_256_\kind\()_\count\()_sve, .-hbm_read_256_\kind\()_\count\()_sve
+    .endm
+
+    GEN_HBM_COMPUTE sdot, 4
+    GEN_HBM_COMPUTE sdot, 8
+    GEN_HBM_COMPUTE sdot, 12
+    GEN_HBM_COMPUTE sdot, 16
+    GEN_HBM_COMPUTE sdot, 24
+    GEN_HBM_COMPUTE sdot, 32
+    GEN_HBM_COMPUTE sdot, 40
+    GEN_HBM_COMPUTE sdot, 48
+    GEN_HBM_COMPUTE sdot, 52
+    GEN_HBM_COMPUTE sdot, 56
+    GEN_HBM_COMPUTE sdot, 60
+    GEN_HBM_COMPUTE sdot, 64
+    GEN_HBM_COMPUTE fmla, 4
+    GEN_HBM_COMPUTE fmla, 8
+    GEN_HBM_COMPUTE fmla, 12
+    GEN_HBM_COMPUTE fmla, 16
+    GEN_HBM_COMPUTE fmla, 24
+    GEN_HBM_COMPUTE fmla, 32
+    GEN_HBM_COMPUTE fmla, 40
+    GEN_HBM_COMPUTE fmla, 48
+    GEN_HBM_COMPUTE fmla, 52
+    GEN_HBM_COMPUTE fmla, 56
+    GEN_HBM_COMPUTE fmla, 60
+    GEN_HBM_COMPUTE fmla, 64
+    .noaltmacro
+
 /* Pure load/store controls for the HBM -> L2 -> L2 transport benchmark. */
     .global null_expand1_sve
     .type null_expand1_sve, %function

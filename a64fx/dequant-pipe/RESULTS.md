@@ -43,6 +43,34 @@ not headline hardware-barrier results.
 
 ## No-degradation INT8 result
 
+### Arithmetic budget at full HBM bandwidth
+
+A fixed-instruction roofline probe uses the same four SVE loads per 256-byte
+line and adds independent SVE SDOT or FMLA instructions. Each point measures a
+read-only baseline on the same XOS 2 MiB hugepage arena. With twelve cores and
+a roughly 229.5 GB/s paired baseline:
+
+| instructions / 256 B line | SDOT GB/s | percent of paired read |
+|---------------------------:|----------:|-----------------------:|
+| 48 | 229.51 | 99.96% |
+| 52 | 224.25 | 97.68% |
+| 56 | 216.44 | 94.32% |
+| 60 | 201.71 | 87.88% |
+| 64 | 190.39 | 83.00% |
+
+FMLA has the same valid 52/60/64 curve within measurement noise; separate
+48-instruction FMLA measurements also retained full bandwidth. Thus the safe
+measured budget is **48 SVE arithmetic instructions per 256 packed bytes**.
+At 229.5 GB/s and 2.0 GHz, each core receives one line every 26.8 cycles, so
+this is about 1.79 arithmetic instructions/cycle. The two-pipe theoretical
+limit is about 53.5 instructions/line, but 52 instructions already reduce HBM
+bandwidth by 2.3%; production kernels also need dequantization, address, and
+control instructions within the same deadline.
+
+Transient runs where the paired read itself fell to about 120 GB/s were
+discarded for this threshold. `--paired-baseline` exposes that state directly
+and should always be used for compute-budget measurements.
+
 Command:
 
 ```sh
