@@ -61,3 +61,5 @@ lm-head, and A64FX DS4F shapes. `--scaling` limits execution to the
 `N=5120,K=1536,M=1` shape and includes exact panel/row and lossy controls.
 
 See `RESULTS.md` for measurements from the implementation node.
+See `FORMAT_GUIDE.md` for the format-to-SVE instruction analysis and the
+recommended MXFP4/QPN8 mixed-format policy.
