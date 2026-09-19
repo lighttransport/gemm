@@ -136,6 +136,26 @@ A tested
 4096-row schedule was removed: its microbenchmark gain did not survive the
 full dense multiview run because differently sized workspaces reused poorly.
 
+Complete four-view generation was also validated at the 8 GB-card and 12 GiB
+target profiles on the RTX 5060 Ti. Both runs used the pinned four-view example,
+seed 42, mixed precision, 4096 textures and the one-million-triangle target.
+
+| Native budget | Native generation | Peak native reserved | Sampled process VRAM | Output SHA-256 |
+|---:|---:|---:|---:|---|
+| 7168 MiB | 506.207 s | 7160.6 MiB | 7364 MiB | `a5a22a90...c700383` |
+| 12288 MiB | 484.915 s | 8488.0 MiB | 8706 MiB | `a5a22a90...c700383` |
+
+The outputs are byte-identical: 655,071 vertices, 961,142 triangles, valid
+normalized normals and 4096 PBR textures. The 12 GiB profile is 4.2% faster
+while using 1.33 GiB more native reserved memory. The constrained path leaves
+about 840 MiB between its sampled 7.19 GiB process peak and an 8 GiB device.
+Reproduce and compare existing run directories with:
+
+```sh
+ref/pixal3d/run.sh cpu ref/pixal3d/validate_multiview_budgets.py \
+  tmp/pixal3d/mv-budget-7168 tmp/pixal3d/mv-budget-12288
+```
+
 ## Matched flow benchmark
 
 Hardware: RTX 5060 Ti (`sm_120`) and RX 9070 XT (`gfx1201`). Host GCC 13.3;
