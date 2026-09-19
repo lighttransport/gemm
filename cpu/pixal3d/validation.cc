@@ -125,6 +125,36 @@ extern "C" int px_test_postprocess_dump(const int32_t *coords, const float *shap
         return -1;
     }
 }
+extern "C" int px_test_postprocess_profile(const int32_t *coords, const float *shape, const float *texture,
+                                           int n, const char *output, const char *dump_dir,
+                                           const char *profile_json) {
+    pixal3d_result result{};
+    try {
+        omp_set_num_threads(16);
+        pixal3d_options o;
+        pixal3d_default_options(&o);
+        o.dump_dir = dump_dir;
+        px::Engine profile(o);
+        pixal3d_gpu_options gpu;
+        pixal3d_default_gpu_options(&gpu);
+        gpu.profile_json = profile_json;
+        profile.configure(gpu);
+        profile.begin_profile();
+        px::postprocess(
+            {px::Coords(coords, coords + size_t(n) * 4), px::Vec(shape, shape + size_t(n) * 7), 7},
+            {px::Coords(coords, coords + size_t(n) * 4), px::Vec(texture, texture + size_t(n) * 6), 6}, o,
+            result, &profile);
+        profile.write_profile();
+        int rc = pixal3d_write_glb(output, &result);
+        pixal3d_result_free(&result);
+        px::require(rc == 0, "GLB validation export failed");
+        return 0;
+    } catch (const std::exception &ex) {
+        pixal3d_result_free(&result);
+        last_error = ex.what();
+        return -1;
+    }
+}
 extern "C" int px_test_postprocess(const int32_t *coords, const float *shape, const float *texture, int n,
                                    const char *output) {
     return px_test_postprocess_dump(coords, shape, texture, n, output, nullptr);
