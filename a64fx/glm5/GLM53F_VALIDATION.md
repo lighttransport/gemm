@@ -673,3 +673,64 @@ The complete job log and four trace directories are under
 `tmp/glm53f-q2-native-dense-51805752/`. The run captured HEAD `5db7e65d`, its
 dirty source status, and a binary source diff so the uncommitted validation
 implementation remains reproducible.
+
+Job 51806404 refined the first-layer result by capturing production-side
+sublayer artifacts from the fully patched arm. The production build, staging,
+native dense/core/shared conversion, and one-token decode all passed; it again
+returned token 2 with logit 10.6294079. Its in-allocation streamed-probe build
+then stopped on a trace-initialization scope error, after the production
+artifacts had already been retained. Job 51807822 fixed that build error and
+ran the streamed GGUF layer 0 on one A64FX node. The callback materialized the
+named llama.cpp graph tensors, and comparison against the retained production
+artifacts gave:
+
+| Layer-0 boundary | Elements | Relative L2 | Maximum absolute error |
+| --- | ---: | ---: | ---: |
+| attention mHC + RMS norm (`attn_norm`) | 4,096 | 2.44086e-5 | 8.07643e-6 |
+| KDA output projection (`kda_out`) | 4,096 | 0.0132845 | 0.000357994 |
+| attention mHC post (`hc_attn_post`) | 16,384 | 0.0126917 | 0.000710147 |
+| FFN RMS norm (`ffn_norm`) | 4,096 | 0.0149400 | 0.00745830 |
+| dense FFN output (`ffn_out`) | 4,096 | 0.0302042 | 0.000770556 |
+| layer output streams (`l_last`) | 16,384 | 0.0158535 | 0.000742178 |
+
+The initial `hc_init` repeat is not independently scheduled by llama.cpp and
+therefore was not callback-materialized; it is excluded from the comparison.
+The `attn_norm` result shows that the Q2 embedding, attention mHC pre-mix, and
+input RMS normalization are aligned to 2.5e-5 relative error. The jump to
+1.33e-2 at `kda_out` is the first material discrepancy. This directly
+localizes the residual to the layer-0 KDA body, before attention mHC post and
+the dense FFN. The streamed callback also retained the internal `kda_qkv`,
+`kda_conv`, normalized q/k, gate, beta, scan, and gated-norm tensors under
+`tmp/glm53f-q2-sublayer-stream-51807822/stream/`.
+
+Jobs 51808558 and 51808940 then added layer-indexed production KDA artifacts.
+Layer indexing is essential: the first attempt, job 51808076, used one filename
+per rank and stage, so later KDA layers overwrote layer 0 and its internal
+comparison numbers are invalid. Job 51808558 corrected the filenames and
+validated the post-convolution and recurrent boundaries. Job 51808940 added
+the missing pre-convolution Q/K/V projection boundary. Both jobs passed their
+12-rank artifact-count and comparison sentinels. The final layer-0 results are:
+
+| Layer-0 KDA boundary | Elements | Relative L2 | Maximum absolute error |
+| --- | ---: | ---: | ---: |
+| Q projection | 8,192 | 0.00389751 | 0.00320598 |
+| K projection | 8,192 | 0.00384870 | 0.00387424 |
+| V projection | 8,192 | 0.00463627 | 0.00380646 |
+| normalized Q after convolution | 8,192 | 0.00291404 | 0.00254056 |
+| normalized K after convolution | 8,192 | 0.00460525 | 0.00773221 |
+| V after convolution | 8,192 | 0.00372901 | 0.000126634 |
+| log-decay gate | 8,192 | 0.00204821 | 0.0289049 |
+| beta | 64 | 0.000375840 | 0.000607073 |
+| recurrent scan output | 8,192 | 0.00222877 | 4.36133e-6 |
+| gated output norm | 8,192 | 0.00483780 | 9.31919e-5 |
+
+The first measurable KDA discrepancy is therefore already present in the
+three Q/K/V matrix-vector projections, immediately after an `attn_norm` input
+that agrees to 2.44e-5. The causal convolution does not introduce a new error
+jump, and the recurrent scan reduces rather than amplifies the relative error.
+The production SVE recurrence is not the source of the layer-0 divergence.
+The final KDA output projection amplifies the roughly 0.2--0.5% internal error
+to 1.33%; this is consistent with quantization error in the KDA projection
+chain rather than a recurrence or tensor-layout bug. Logs and artifacts are
+under `tmp/glm53f-q2-sublayer-51808558/` and
+`tmp/glm53f-q2-sublayer-51808940/`.

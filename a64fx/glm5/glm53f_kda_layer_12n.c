@@ -78,7 +78,7 @@ static void read_cols(glm53f_st_context*st,const char*n,uint16_t*p,int rows,int 
 static void name(char*out,int l,const char*s){snprintf(out,256,"model.language_model.layers.%d.self_attn.%s",l,s);}
 
 struct glm53f_kda_context_12n {
-    int rank, h0, hn, qd, detail_profile;
+    int rank, layer, h0, hn, qd, detail_profile;
     glm53f_prefill_config prefill;
     weights w;
     float *qkv,*small,*gate,*decay,*beta,*core,*normed,*work;
@@ -96,11 +96,13 @@ void glm53f_kda_configure_prefill_12n(glm53f_kda_context_12n *c,
     if (c && config) c->prefill = *config;
 }
 
-static void kda_dump(const char *suffix, const void *data, size_t bytes, int rank) {
+static void kda_dump(const char *suffix, const void *data, size_t bytes,
+                     int rank, int layer) {
     const char *prefix = getenv("GLM53F_KDA_DUMP_PREFIX");
     char path[4096];
     if (!prefix || !*prefix) return;
-    snprintf(path, sizeof(path), "%s.rank%02d.%s.bin", prefix, rank, suffix);
+    snprintf(path, sizeof(path), "%s.rank%02d.layer%02d.%s.bin",
+             prefix, rank, layer, suffix);
     FILE *f = fopen(path, "wb");
     if (!f || fwrite(data, 1, bytes, f) != bytes || fclose(f))
         MPI_Abort(MPI_COMM_WORLD, 2);
@@ -125,7 +127,7 @@ int glm53f_kda_convert_int8_12n(glm53f_kda_context_12n *c) {
     return 0;
 }
 
-glm53f_kda_context_12n *glm53f_kda_create_12n(const char *model,int layer){int rank,nr,h0,hn,qd;char n[256];glm53f_st_context*st;glm53f_kda_context_12n*c;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12)return NULL;glm53f_balanced_slice(NH,rank,nr,&h0,&hn);qd=hn*D;st=glm53f_st_open(model);if(!st)return NULL;c=calloc(1,sizeof(*c));if(!c)MPI_Abort(MPI_COMM_WORLD,2);c->rank=rank;c->h0=h0;c->hn=hn;c->qd=qd;c->detail_profile=getenv("GLM53F_KDA_DETAIL")!=NULL;
+glm53f_kda_context_12n *glm53f_kda_create_12n(const char *model,int layer){int rank,nr,h0,hn,qd;char n[256];glm53f_st_context*st;glm53f_kda_context_12n*c;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12)return NULL;glm53f_balanced_slice(NH,rank,nr,&h0,&hn);qd=hn*D;st=glm53f_st_open(model);if(!st)return NULL;c=calloc(1,sizeof(*c));if(!c)MPI_Abort(MPI_COMM_WORLD,2);c->rank=rank;c->layer=layer;c->h0=h0;c->hn=hn;c->qd=qd;c->detail_profile=getenv("GLM53F_KDA_DETAIL")!=NULL;
 #define PART(F,S,T,OFF,N) do{name(n,layer,S);c->w.F=(T*)a256((size_t)(N)*sizeof(T));read_part(st,n,(size_t)(OFF)*sizeof(T),c->w.F,(size_t)(N)*sizeof(T),rank);}while(0)
     PART(al,"A_log",float,h0,hn);PART(dt,"dt_bias",float,h0*D,qd);PART(q,"q_proj.weight",uint16_t,(size_t)h0*D*H,(size_t)qd*H);PART(k,"k_proj.weight",uint16_t,(size_t)h0*D*H,(size_t)qd*H);PART(v,"v_proj.weight",uint16_t,(size_t)h0*D*H,(size_t)qd*H);PART(qc,"q_conv1d.weight",uint16_t,(size_t)h0*D*KERNEL,(size_t)qd*KERNEL);PART(kc,"k_conv1d.weight",uint16_t,(size_t)h0*D*KERNEL,(size_t)qd*KERNEL);PART(vc,"v_conv1d.weight",uint16_t,(size_t)h0*D*KERNEL,(size_t)qd*KERNEL);PART(fb,"f_b_proj.weight",uint16_t,(size_t)h0*D*D,(size_t)qd*D);PART(b,"b_proj.weight",uint16_t,(size_t)h0*H,(size_t)hn*H);PART(gb,"g_b_proj.weight",uint16_t,(size_t)h0*D*D,(size_t)qd*D);PART(fa,"f_a_proj.weight",uint16_t,0,(size_t)D*H);PART(ga,"g_a_proj.weight",uint16_t,0,(size_t)D*H);PART(on,"o_norm.weight",uint16_t,0,D);name(n,layer,"o_proj.weight");c->w.op=a256((size_t)H*qd*sizeof(uint16_t));read_cols(st,n,c->w.op,H,QKV,h0*D,qd,rank);
 #undef PART
@@ -149,6 +151,12 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
                         c->int8_weight[m] + (size_t)r * H,
                         c->int8_scale[m] + r, quant_x, scale_x, H);
         } else mv3_team(q,k,v,w->q,w->k,w->v,x,qd,H);
+#pragma omp single
+        {
+            kda_dump("q_proj", q, (size_t)qd * sizeof(float), c->rank, c->layer);
+            kda_dump("k_proj", k, (size_t)qd * sizeof(float), c->rank, c->layer);
+            kda_dump("v_proj", v, (size_t)qd * sizeof(float), c->rank, c->layer);
+        }
         if(c->detail_profile){
 #pragma omp single
             {double t=MPI_Wtime();c->detail[0]=t-td;td=t;}
@@ -182,13 +190,13 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
             {c->detail[4]=MPI_Wtime()-td;}
         }
     }
-    kda_dump("q", q, (size_t)qd * sizeof(float), c->rank);
-    kda_dump("k", k, (size_t)qd * sizeof(float), c->rank);
-    kda_dump("v", v, (size_t)qd * sizeof(float), c->rank);
-    kda_dump("decay", c->decay, (size_t)qd * sizeof(float), c->rank);
-    kda_dump("beta", c->beta, (size_t)hn * sizeof(float), c->rank);
-    kda_dump("core", c->core, (size_t)qd * sizeof(float), c->rank);
-    kda_dump("normed", c->normed, (size_t)qd * sizeof(float), c->rank);
+    kda_dump("q", q, (size_t)qd * sizeof(float), c->rank, c->layer);
+    kda_dump("k", k, (size_t)qd * sizeof(float), c->rank, c->layer);
+    kda_dump("v", v, (size_t)qd * sizeof(float), c->rank, c->layer);
+    kda_dump("decay", c->decay, (size_t)qd * sizeof(float), c->rank, c->layer);
+    kda_dump("beta", c->beta, (size_t)hn * sizeof(float), c->rank, c->layer);
+    kda_dump("core", c->core, (size_t)qd * sizeof(float), c->rank, c->layer);
+    kda_dump("normed", c->normed, (size_t)qd * sizeof(float), c->rank, c->layer);
     double t1=MPI_Wtime();
     if (c->int8_enabled) {
         if (glm53f_i8_quantize_x(quant_o, &scale_o, c->normed, qd)) return -1;

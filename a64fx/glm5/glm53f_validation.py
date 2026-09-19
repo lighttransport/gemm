@@ -187,6 +187,33 @@ def cmd_compare(args):
     return 0 if rel <= args.threshold else 1
 
 
+def cmd_compare_shards(args):
+    ref = list(floats(args.ref))
+    got = []
+    for path in args.got:
+        got.extend(floats(path))
+    count = args.count if args.count is not None else len(got)
+    if args.ref_offset < 0 or count < 0 or len(got) != count or \
+            args.ref_offset + count > len(ref):
+        print("size mismatch ref=%d offset=%d count=%d got=%d" %
+              (len(ref), args.ref_offset, count, len(got)), file=sys.stderr)
+        return 2
+    sum_d = sum_r = max_abs = 0.0
+    for x, y in zip(ref[args.ref_offset:args.ref_offset + count], got):
+        if not math.isfinite(x) or not math.isfinite(y):
+            print("non-finite value", file=sys.stderr)
+            return 2
+        d = x - y
+        sum_d += d * d
+        sum_r += y * y
+        max_abs = max(max_abs, abs(d))
+    rel = math.sqrt(sum_d / sum_r) if sum_r else (0.0 if sum_d == 0 else float("inf"))
+    print("count=%d rel_l2=%.9g max_abs=%.9g threshold=%.9g %s" %
+          (count, rel, max_abs, args.threshold,
+           "PASS" if rel <= args.threshold else "FAIL"))
+    return 0 if rel <= args.threshold else 1
+
+
 def cmd_trace_index(args):
     # Native C layout: the two uint64 fields are aligned after seven uint32s.
     record = struct.Struct("<QIIIIIII4xQQdff")
@@ -302,6 +329,13 @@ def main():
     c.add_argument("got")
     c.add_argument("--threshold", type=float, default=1e-3)
     c.set_defaults(func=cmd_compare)
+    cs = sub.add_parser("compare-shards")
+    cs.add_argument("ref")
+    cs.add_argument("got", nargs="+")
+    cs.add_argument("--ref-offset", type=int, default=0)
+    cs.add_argument("--count", type=int)
+    cs.add_argument("--threshold", type=float, default=1e-3)
+    cs.set_defaults(func=cmd_compare_shards)
     t = sub.add_parser("trace-index")
     t.add_argument("path")
     t.add_argument("--limit", type=int, default=1000000)

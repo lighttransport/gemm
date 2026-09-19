@@ -17,6 +17,59 @@
 #include <sys/stat.h>
 #include <vector>
 
+struct sublayer_trace {
+    const char * dir = nullptr;
+    int layer = -1;
+};
+
+static bool trace_name(const char * name, int layer) {
+    static const char * prefixes[] = {
+        "hc_attn_pre", "attn_norm", "kda_qkv", "kda_conv",
+        "kda_q_norm", "kda_k_norm", "kda_gate", "kda_beta",
+        "kda_scan_out", "kda_normed", "kda_out", "hc_attn_post",
+        "hc_ffn_pre", "ffn_norm", "ffn_out", "l_last",
+    };
+    if (std::strcmp(name, "hc_init") == 0) return true;
+    char wanted[128];
+    for (const char * prefix : prefixes) {
+        std::snprintf(wanted, sizeof(wanted), "%s-%d", prefix, layer);
+        if (std::strcmp(name, wanted) == 0) return true;
+    }
+    return false;
+}
+
+static bool trace_sublayer_cb(ggml_tensor * tensor, bool ask, void * opaque) {
+    auto * trace = static_cast<sublayer_trace *>(opaque);
+    if (!trace || !trace->dir || !*trace->dir ||
+        !trace_name(tensor->name, trace->layer)) return false;
+    if (ask) return true;
+    if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) {
+        std::fprintf(stderr, "GLM53F_STREAM_SUBLAYER_FAIL name=%s type=%s contiguous=%d\n",
+                     tensor->name, ggml_type_name(tensor->type),
+                     ggml_is_contiguous(tensor));
+        return false;
+    }
+    if (mkdir(trace->dir, 0755) != 0 && errno != EEXIST) return false;
+    char path[4096];
+    if (std::snprintf(path, sizeof(path), "%s/%s.f32", trace->dir,
+                      tensor->name) >= (int) sizeof(path)) return false;
+    const size_t bytes = ggml_nbytes(tensor);
+    std::vector<unsigned char> data(bytes);
+    ggml_backend_tensor_get(tensor, data.data(), 0, bytes);
+    FILE * out = std::fopen(path, "wb");
+    if (!out) return false;
+    const bool ok = std::fwrite(data.data(), 1, bytes, out) == bytes &&
+                    std::fclose(out) == 0;
+    if (!ok) {
+        std::fprintf(stderr, "GLM53F_STREAM_SUBLAYER_FAIL name=%s path=%s\n",
+                     tensor->name, path);
+        return false;
+    }
+    std::fprintf(stderr, "GLM53F_STREAM_SUBLAYER name=%s count=%zu PASS\n",
+                 tensor->name, bytes / sizeof(float));
+    return true;
+}
+
 struct loaded_tensor {
     ggml_tensor * tensor = nullptr;
     void * data = nullptr;
@@ -191,6 +244,11 @@ int main(int argc, char ** argv) {
         const int layer = argc >= 4 ? std::atoi(argv[3]) : 0;
         const bool final = layer == n_layers;
         if (layer < 0 || layer > n_layers) throw std::runtime_error("invalid stream layer");
+        sublayer_trace trace = {std::getenv("GLM53F_STREAM_SUBLAYER_DIR"), layer};
+        if (trace.dir && *trace.dir) {
+            cp.cb_eval = trace_sublayer_cb;
+            cp.cb_eval_user_data = &trace;
+        }
         std::vector<float> hidden(stream_n);
         for (size_t i = 0; i < hidden.size(); ++i)
             hidden[i] = 0.001f * (float)((int)(i % 97) - 48);
