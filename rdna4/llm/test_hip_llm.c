@@ -959,6 +959,7 @@ int main(int argc, char **argv) {
     int decode_n = 0;         /* --decode N: greedy-sample N tokens after prefill */
     int prefill_pad = 0;      /* --prefill-len M: pad prompt up to M tokens with last token (for bench) */
     int bench_repeat = 1;     /* --bench-repeat N: rerun the same request N times in-process */
+    int bench_depth = 0;      /* --bench-depth N: zero dummy KV rows before the measured request */
     int compare_paths = 0;    /* --compare-paths: report rel-L2 between batched and per-token logits */
     int coding_mode = 0;      /* Qwen3.8 non-thinking coding sampling profile */
     int reference_sampling = 0;
@@ -1101,6 +1102,9 @@ int main(int argc, char **argv) {
             bench_repeat = atoi(argv[++i]);
             if (bench_repeat < 1) bench_repeat = 1;
             if (bench_repeat > 64) bench_repeat = 64;
+        } else if (strcmp(argv[i], "--bench-depth") == 0 && i + 1 < argc) {
+            bench_depth = atoi(argv[++i]);
+            if (bench_depth < 0) { fprintf(stderr, "Invalid benchmark depth\n"); return 2; }
         } else if (strcmp(argv[i], "--prefill-len") == 0 && i + 1 < argc) {
             prefill_pad = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--compare-paths") == 0) {
@@ -1268,7 +1272,7 @@ int main(int argc, char **argv) {
             model_path = argv[i];
         } else {
             fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
-            fprintf(stderr, "       [--bench] [--gpu-only-bench] [--gpu-only] [--decode N] [--prefill-len M] [--coding]\n");
+            fprintf(stderr, "       [--bench] [--gpu-only-bench] [--gpu-only] [--decode N] [--prefill-len M] [--bench-depth N] [--coding]\n");
             fprintf(stderr, "       [--moe-cache-mb MiB] [--moe-cpu]\n");
             fprintf(stderr, "       [--kv-cache auto|f32|f16|q8q4|q8q8] [--ubatch N] [--qwen35-batched-prefill]\n");
             fprintf(stderr, "       [--qwen35-prefill-bf16] (experimental BF16 prefill projections; unchanged decode kernels)\n");
@@ -1802,8 +1806,11 @@ int main(int argc, char **argv) {
         int n_prefill = max_tokens;
         if (n_prefill < 1) n_prefill = 1;
         if (decode_n < 0) decode_n = 0;
-        if (n_prefill + decode_n > n_max_seq) {
-            decode_n = n_max_seq - n_prefill;
+        if (bench_depth && !bench_mode) {
+            fprintf(stderr, "--bench-depth requires benchmark mode\n"); pass = 0; goto bench_done;
+        }
+        if (bench_depth + n_prefill + decode_n > n_max_seq) {
+            decode_n = n_max_seq - bench_depth - n_prefill;
             if (decode_n < 0) decode_n = 0;
             fprintf(stderr, "Clamped decode to %d (max_seq_len=%d)\n", decode_n, n_max_seq);
         }
@@ -1824,21 +1831,30 @@ int main(int argc, char **argv) {
          * request and silently measured the scalar path. */
         hip_llm_set_qwen4_batch_request_tokens(gpu, n_prefill);
 
-        fprintf(stderr, "\n=== Bench: prefill=%d tokens, decode=%d tokens, n_embd=%d, n_vocab=%d ===\n",
-                n_prefill, decode_n, n_embd, n_vocab);
+        if (bench_depth && hip_llm_prepare_dummy_kv(gpu, bench_depth)) {
+            fprintf(stderr, "Failed to prepare %d dummy KV rows\n", bench_depth);
+            pass = 0; goto bench_done;
+        }
+
+        fprintf(stderr, "\n=== Bench: depth=%d, prefill=%d tokens, decode=%d tokens, n_embd=%d, n_vocab=%d ===\n",
+                bench_depth, n_prefill, decode_n, n_embd, n_vocab);
 
         if (compare_paths && hip_llm_batched_path_available(gpu)) {
             /* Run prefill via per-token path */
             hip_llm_set_batched_path(gpu, 0);
-            float *log_p = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+            float *log_p = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, bench_depth);
             if (!log_p) { fprintf(stderr, "compare: per-token path failed\n"); pass = 0; goto bench_done; }
             float *buf_p = (float *)malloc((size_t)n_vocab * sizeof(float));
             memcpy(buf_p, log_p, (size_t)n_vocab * sizeof(float));
 
             /* Run prefill via batched path */
             hip_llm_reset_state(gpu);
+            if (bench_depth && hip_llm_prepare_dummy_kv(gpu, bench_depth)) {
+                fprintf(stderr, "compare: failed to restore dummy KV prefix\n");
+                free(buf_p); pass = 0; goto bench_done;
+            }
             hip_llm_set_batched_path(gpu, 1);
-            float *log_b = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+            float *log_b = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, bench_depth);
             if (!log_b) { fprintf(stderr, "compare: batched path failed\n"); free(buf_p); pass = 0; goto bench_done; }
 
             double diff_sq = 0.0, ref_sq = 0.0, batch_sq = 0.0;
@@ -1868,8 +1884,15 @@ int main(int argc, char **argv) {
         const char *warmup_env = getenv("LLM_PREFILL_WARMUP");
         int n_warmup = warmup_env ? atoi(warmup_env) : 0;
         for (int w = 0; w < n_warmup; w++) {
-            float *lg = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+            float *lg = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, bench_depth);
             if (!lg) { fprintf(stderr, "GPU prefill warmup %d failed\n", w); pass = 0; goto bench_done; }
+        }
+        if (compare_paths || n_warmup) {
+            hip_llm_reset_state(gpu);
+            if (bench_depth && hip_llm_prepare_dummy_kv(gpu, bench_depth)) {
+                fprintf(stderr, "Failed to restore dummy KV prefix after warmup\n");
+                pass = 0; goto bench_done;
+            }
         }
 
         /* Prefill: normally one forward_batch_logits call.  The optional
@@ -1922,17 +1945,17 @@ int main(int argc, char **argv) {
                          * token dominated the supposedly safe path. */
                         int is_last = (off + i + 1 == n_prefill);
                         last_logits = is_last ?
-                            hip_llm_forward_logits(gpu, tokens[off + i], off + i) :
-                            hip_llm_forward(gpu, tokens[off + i], off + i);
+                            hip_llm_forward_logits(gpu, tokens[off + i], bench_depth + off + i) :
+                            hip_llm_forward(gpu, tokens[off + i], bench_depth + off + i);
                         if (!last_logits) break;
                     }
                 } else {
-                    last_logits = hip_llm_forward_batch_logits(gpu, tokens + off, cc, off);
+                    last_logits = hip_llm_forward_batch_logits(gpu, tokens + off, cc, bench_depth + off);
                 }
                 if (!last_logits) break;
             }
         } else {
-            last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+            last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, bench_depth);
         }
         if (!last_logits) { fprintf(stderr, "GPU forward_batch_logits failed\n"); pass = 0; goto bench_done; }
         double t_pf1 = get_time_ms();
@@ -1969,7 +1992,7 @@ int main(int argc, char **argv) {
         int decoded = 0;
         int first_decode_tok = next_tok;
         if(qwen4_mtp_check && (!qwen4_mtp || coding_mode ||
-            hip_llm_verify_qwen4_mtp(gpu,next_tok,n_prefill,qwen4_mtp_draft))) {
+            hip_llm_verify_qwen4_mtp(gpu,next_tok,bench_depth+n_prefill,qwen4_mtp_draft))) {
             fprintf(stderr,"Qwen4 MTP transaction check failed\n");pass=0;goto bench_done;
         }
         uint64_t decode_hash = 1469598103934665603ULL;
@@ -2004,7 +2027,7 @@ int main(int argc, char **argv) {
             for (int k = 0; k < decode_n; k++) {
                 if (qwen4_mtp && !coding_mode && !mtp_approx_fallback && !mtp_adaptive_fallback) {
                     hip_llm_qwen4_mtp_result mtp;
-                    if (hip_llm_qwen4_mtp_step(gpu, next_tok, n_prefill+k,
+                    if (hip_llm_qwen4_mtp_step(gpu, next_tok, bench_depth+n_prefill+k,
                             mtp_runtime_draft, decode_n-k,
                             bench_ignore_eos ? NULL : stop_ids, bench_ignore_eos ? 0 : 3, &mtp)) {
                         fprintf(stderr, "GPU MTP failed at decode k=%d\n", k); pass=0; break;
@@ -2070,7 +2093,7 @@ int main(int argc, char **argv) {
                 decoded++;
                 if (sampler) hllm_sampler_accept(sampler, next_tok);
                 if (k + 1 == decode_n) break;
-                int pos = n_prefill + k;
+                int pos = bench_depth + n_prefill + k;
                 if (qwen35_mtp_path && (qwen35_mtp_window ? !dense_window_rows : dense_index == dense_count)) {
                     dense_count = qwen35_mtp_draft;
                     int available = decode_n-k-1-qwen35_mtp_window;

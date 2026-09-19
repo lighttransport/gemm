@@ -25,6 +25,8 @@ __device__ __forceinline__ q8_half2 q8_hfma(q8_half2 x, q8_half2 y, q8_half2 z) 
 __device__ __forceinline__ int q8_attention_splits(int length, int heads,
                                                  int nsm, int occupancy) {
     int tiles = (length + 255) / 256;
+    if (length >= 16384)
+        return min(128, max(occupancy, (length + 511) / 512));
     int result = min(occupancy, tiles), best = 0, waves_best = 0;
     int blocks_per_wave = nsm * occupancy;
     for (int trial = result; trial <= tiles; ++trial) {
@@ -50,12 +52,21 @@ void qwen35_attention_q8_decode(float *out, float *parts, float2 *meta,
         const float *ks, const float *vs, const int *position,
         int heads, int kv_heads, int nsm, int occupancy, int forced_splits,
         int queries, int position_start) {
-    int query = blockIdx.x;
+    int query = queries == 1 ? 0 : blockIdx.x;
     int length = position_start < 0 ? *position + 1 : position_start + query + 1;
     int splits = forced_splits ? forced_splits : q8_attention_splits(length, heads, nsm, occupancy);
-    if ((int)blockIdx.y >= splits) return;
+    int head, split;
+    if (queries == 1) {
+        int flat = blockIdx.x;
+        if (flat >= heads * splits) return;
+        if (length >= 16384) { head = flat % heads; split = flat / heads; }
+        else { head = flat / splits; split = flat % splits; }
+    } else {
+        split = blockIdx.y; head = blockIdx.z;
+        if (split >= splits) return;
+    }
     int lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
-    int head = blockIdx.z, kh = head / (heads / kv_heads);
+    int kh = head / (heads / kv_heads);
     int stride = kv_heads * 256, scale_stride = kv_heads * 8;
     q += (query * heads + head) * 256;
     __shared__ int qi[64];
@@ -96,7 +107,7 @@ void qwen35_attention_q8_decode(float *out, float *parts, float2 *meta,
     q8_half2 acc[4] = {};
     float maximum = -3.402823466e+38f / 2, sum = 0;
     int padded = (length + 255) / 256 * 256;
-    for (int base = blockIdx.y * 128; base < padded; base += splits * 128) {
+    for (int base = split * 128; base < padded; base += splits * 128) {
         float score = 0, next_max = maximum;
         #pragma unroll
         for (int pair = 0; pair < 2; ++pair) {
@@ -178,9 +189,9 @@ void qwen35_attention_q8_decode(float *out, float *parts, float2 *meta,
         #pragma unroll
         for (int w = 0; w < 4; ++w) value += (float)probabilities[w * 256 + base + tid];
         if (splits == 1) out[(query * heads + head) * 256 + base + tid] = value / sum;
-        else parts[((query * heads + head) * splits + blockIdx.y) * 256 + base + tid] = value;
+        else parts[((query * heads + head) * splits + split) * 256 + base + tid] = value;
     }
-    if (tid == 0 && splits > 1) meta[(query * heads + head) * splits + blockIdx.y] = make_float2(next_max, sum);
+    if (tid == 0 && splits > 1) meta[(query * heads + head) * splits + split] = make_float2(next_max, sum);
     (void)queries;
 }
 

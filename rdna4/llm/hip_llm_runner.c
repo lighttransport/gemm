@@ -17390,6 +17390,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                   r->q8_attention_module, "qwen35_attention_q8_combine"));
         r->q8_attention_nsm = props.multiProcessorCount;
         r->q8_attention_max_splits = (max_seq_len + 255) / 256;
+        if (r->q8_attention_max_splits > 128) r->q8_attention_max_splits = 128;
         size_t parts = (size_t)r->n_heads * r->q8_attention_max_splits;
         CHECK_HIP(hipMalloc(&r->d_q8_attention_parts, parts * 256 * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_q8_attention_meta, parts * 2 * sizeof(float)));
@@ -17427,8 +17428,11 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                                      r->head_dim / 2 : r->head_dim)) +
                     (size_t)attention_layers * 2 * r->n_kv_heads *
                     ((r->head_dim + 31) / 32) * sizeof(float);
-            /* Shared F16 packing scratch also grows with context. */
-            if (r->head_dim <= 256)
+            /* Shared F16 packing scratch also grows with context unless the
+             * native Q8/Q8 decode and prefill paths never unpack the cache. */
+            if (r->head_dim <= 256 && !(r->requested_qwen35_native_q8_attention &&
+                r->requested_qwen35_native_q8_prefill &&
+                r->requested_kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0))
                 kv_bytes_per_token += (size_t)4 * r->n_kv_heads * r->head_dim;
             size_t reserve = (size_t)768 << 20;
             if (kv_bytes_per_token > 0 && free_b > reserve) {
@@ -18549,7 +18553,10 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             /* Qwen4 has its own causal attention kernels (including the
              * scaled-I8 path). Avoid reserving an unused max-context K/V
              * packing buffer; at 256K this wastes about 1 GiB on 16-GiB cards. */
-            int fa_eligible = !r->is_qwen4exp && !fa_disable
+            int native_q8_only = r->requested_qwen35_native_q8_attention &&
+                r->requested_qwen35_native_q8_prefill &&
+                r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0;
+            int fa_eligible = !r->is_qwen4exp && !fa_disable && !native_q8_only
                 && r->head_dim > 0 && r->head_dim <= 256
                 && r->n_kv_heads > 0
                 && (r->n_heads % r->n_kv_heads) == 0;
@@ -22075,7 +22082,7 @@ static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
     void *a[] = { &out, &r->d_q8_attention_parts, &r->d_q8_attention_meta,
         &q, &k, &v, &ks, &vs, &r->d_position, &r->n_heads, &r->n_kv_heads,
         &r->q8_attention_nsm, &occupancy, &forced_splits, &queries, &position_start };
-    LAUNCH(r->fn_q8_attention_decode, 1, r->q8_attention_max_splits, r->n_heads,
+    LAUNCH(r->fn_q8_attention_decode, r->n_heads * r->q8_attention_max_splits, 1, 1,
            32, 4, 1, 0, r->stream, a);
     void *b[] = { &out, &r->d_q8_attention_parts, &r->d_q8_attention_meta,
         &r->d_position, &r->n_heads, &r->q8_attention_nsm, &occupancy, &forced_splits };
@@ -32367,6 +32374,30 @@ void hip_llm_reset_state(hip_llm_runner *r) {
             if (r->d_value_cache[l]) hipMemset(r->d_value_cache[l], 0, kv_bytes);
         }
     }
+}
+
+int hip_llm_prepare_dummy_kv(hip_llm_runner *r, int depth) {
+    if (!r || !r->weights_loaded || depth < 0 || depth >= r->max_seq_len ||
+        !r->is_hybrid || !r->kv_quantized || !r->d_key_cache ||
+        !r->d_value_cache || !r->d_key_cache_scale || !r->d_value_cache_scale)
+        return -1;
+    if (r->stream && hipStreamSynchronize(r->stream) != hipSuccess) return -1;
+    size_t codes = (size_t)depth * r->n_kv_heads * r->head_dim;
+    size_t scales = (size_t)depth * r->n_kv_heads *
+        ((r->head_dim + 31) / 32) * sizeof(float);
+    for (int l = 0; l < r->n_layers; ++l) {
+        if (r->layers[l].is_ssm) continue;
+        size_t value_codes = r->kv_cache_type == HIP_LLM_KV_Q8_0_Q4_0 ?
+            codes / 2 : codes;
+        if (!r->d_key_cache[l] || !r->d_value_cache[l] ||
+            !r->d_key_cache_scale[l] || !r->d_value_cache_scale[l] ||
+            hipMemsetAsync(r->d_key_cache[l], 0, codes, r->stream) != hipSuccess ||
+            hipMemsetAsync(r->d_value_cache[l], 0, value_codes, r->stream) != hipSuccess ||
+            hipMemsetAsync(r->d_key_cache_scale[l], 0, scales, r->stream) != hipSuccess ||
+            hipMemsetAsync(r->d_value_cache_scale[l], 0, scales, r->stream) != hipSuccess)
+            return -1;
+    }
+    return !r->stream || hipStreamSynchronize(r->stream) == hipSuccess ? 0 : -1;
 }
 
 struct hip_llm_state_snapshot {

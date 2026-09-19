@@ -293,6 +293,10 @@ void hip_llm_offload(hip_llm_runner *r);
 
 /* Reset all SSM state (conv + recurrent). Call between conversations for hybrid models. */
 void hip_llm_reset_state(hip_llm_runner *r);
+/* Prepare a synthetic zero-valued prefix for context-depth benchmarking.
+ * This clears the first `depth` KV rows and their scales in every attention
+ * layer. It does not run the model or alter recurrent state. */
+int hip_llm_prepare_dummy_kv(hip_llm_runner *r, int depth);
 void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled);
 
 /* Save/restore recurrent state at a prompt boundary. KV entries remain in

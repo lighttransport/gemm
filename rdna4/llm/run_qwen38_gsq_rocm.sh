@@ -41,12 +41,21 @@ esac
 
 args=()
 requested_context=0
+bench_depth=0
 for ((i=1; i<=$#; i++)); do
     arg="${!i}"
     if [[ "${arg}" == "-s" || "${arg}" == "--max-seq-len" ]]; then
         j=$((i + 1))
         if (( j <= $# )); then
             requested_context="${!j}"
+            args+=("${arg}" "${!j}")
+            ((i++))
+            continue
+        fi
+    elif [[ "${arg}" == "--bench-depth" ]]; then
+        j=$((i + 1))
+        if (( j <= $# )); then
+            bench_depth="${!j}"
             args+=("${arg}" "${!j}")
             ((i++))
             continue
@@ -63,13 +72,20 @@ fi
     exit 2
 }
 selected_context="${requested_context}"
+selected_safe_context="${safe_context}"
+# Q8/Q8 dummy-depth decode was measured with 66,560 allocated rows and
+# 4.4 GiB still free for IQ2 on the 16-GiB profile. Keep the normal serving
+# default conservative while allowing the explicit 64K benchmark through.
+if [[ "${bench_depth}" =~ ^[1-9][0-9]*$ ]] && (( bench_depth <= 65536 )); then
+    selected_safe_context=66560
+fi
 if [[ "${vram_profile}" == "16g" && "${allow_unsafe}" == "0" ]] &&
-   (( requested_context > safe_context )); then
-    echo "Qwen3.8 GSQ: clamping context ${requested_context} to ${safe_context} for the 16-GiB profile" >&2
-    selected_context="${safe_context}"
+   (( requested_context > selected_safe_context )); then
+    echo "Qwen3.8 GSQ: clamping context ${requested_context} to ${selected_safe_context} for the 16-GiB profile" >&2
+    selected_context="${selected_safe_context}"
     for ((i=0; i<${#args[@]}; i++)); do
         if [[ "${args[i]}" == "-s" || "${args[i]}" == "--max-seq-len" ]]; then
-            args[i+1]="${safe_context}"
+            args[i+1]="${selected_safe_context}"
             break
         fi
     done

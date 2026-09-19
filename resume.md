@@ -1,5 +1,36 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Sustained decode at 64K synthetic depth (2026-09-20)
+
+Added `--bench-depth 65536` and
+`rdna4/llm/bench_qwen38_gsq_decode_64k.sh`. Each repeat resets the model,
+creates 65,536 zero Q8 K/Q8 V cache rows outside timing, evaluates one prompt
+token at that offset, and measures 512 decode tokens. This isolates deep-cache
+attention cost; unlike `llama-bench -d`, it does not run 64K random tokens, and
+Qwen3.8 recurrent state starts from reset.
+
+On RX 9070 XT / gfx1201 / ROCm 10, IQ2 sustains 28.04/27.98/27.94 tok/s and
+IQ3 sustains 26.99/26.95/26.94 tok/s. All repeats are deterministic. Long Q8
+attention now uses 128 splits with split-major block ordering; the 64K
+attention microbenchmark improved from 718.9 microseconds at 16 splits to
+578.6 microseconds at 128. IQ2's sustained minimum improved 4.3% over the
+26.79 tok/s baseline. Unused F16 cache-packing scratch is no longer allocated
+for the fully native Q8/Q8 path, recovering about 266 MiB; final free VRAM is
+4434 MiB for IQ2 and 770 MiB for IQ3.
+
+The 40 tok/s sustained target remains unmet. The 64K profile assigns about
+9.8 ms/token to attention and about 26 ms/token to the projection/state path.
+Dense NextN draft width three is slower here at 21.21 tok/s with 168/259 draft
+acceptance, so it stays opt-in. Full results and commands:
+[QWEN38_64K_DECODE.md](rdna4/llm/QWEN38_64K_DECODE.md).
+
+The pinned-kernel differential test passes 39,567,360 bitwise Q8/Q8 values,
+including matching split counts at 64K. Fresh normal-context IQ2 and IQ3
+greedy/sampled C++ outputs remain byte-identical to llama.cpp and pass fixed
+cases plus 10,000 randomized cases. Artifacts:
+`tmp/qwen38/depth64-final-iq2-v2/` and `depth64-final-iq3/`. Preserve unrelated
+A64FX/common edits; no push.
+
 ## Final decode validation (2026-09-20)
 
 RX 9070 XT / gfx1201 / ROCm 10, 4096 prompt tokens, 512-token chunks,

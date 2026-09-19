@@ -170,3 +170,11 @@ and the executable rebuilt. The release binary repeats IQ2 MTP retrieval with
 bitwise-identical logits and rejects draft width 17 with a deterministic error.
 `release-manifest.json` records this final binary hash; the timing manifests
 retain the preceding binary hash. No inference math changed in that rebuild.
+
+## Synthetic 64K depth follow-up
+
+The 64K-offset benchmark and long-context attention scheduling are documented
+in [QWEN38_64K_DECODE.md](QWEN38_64K_DECODE.md). Ordinary IQ2 decode sustains
+27.94 tok/s. Dense NextN with draft width three reached 21.21 tok/s on the
+same zero-prefix method, with 168 accepted of 259 proposed tokens, so the MTP
+path remains opt-in at long context as well.

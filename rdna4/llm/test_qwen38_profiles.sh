@@ -54,6 +54,8 @@ grep -q 'ssm_fused_default=1' "${gsq}" || {
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}" -s 262144)"
 expect_contains "${out}" 'safe_context=53248'
 expect_contains "${out}" 'selected_context=53248'
+out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}" -s 66560 --bench-depth 65536)"
+expect_contains "${out}" 'selected_context=66560'
 out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g QWEN38_GSQ_ALLOW_UNSAFE_CONTEXT=1 "${gsq}" -s 262144)"
 expect_contains "${out}" 'selected_context=262144'
 

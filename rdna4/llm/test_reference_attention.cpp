@@ -31,8 +31,9 @@ int main() {
     printf("reference_batch_occupancy=%d\n",batch_occupancy);
     for(int queries : {1,2,7,512})
     for(int pattern : {0,1,2})
-    for(int length : {1,31,127,128,129,255,256,257,511,512,513,4096,4097,8192}) {
+    for(int length : {1,31,127,128,129,255,256,257,511,512,513,4096,4097,8192,65536}) {
         if(queries>1 && (pattern!=0 || (length!=512 && length!=4097))) continue;
+        if(length==65536 && (queries!=1 || pattern!=2)) continue;
         const int output_size=heads*dim*queries;
         int occupancy=queries==1?ref_occupancy:batch_occupancy;
         const int padded=(length+255)/256*256;
@@ -61,9 +62,12 @@ int main() {
         float *ours=nullptr,*ref=nullptr,*op=nullptr,*rp=nullptr;
         float2 *om=nullptr,*rm=nullptr;
         CHECK(hipMalloc(&ours,output_size*4));CHECK(hipMalloc(&ref,output_size*4));
-        CHECK(hipMalloc(&op,output_size*32*4));CHECK(hipMalloc(&rp,output_size*32*4));
-        CHECK(hipMalloc(&om,queries*heads*32*8));CHECK(hipMalloc(&rm,queries*heads*32*8));
-        for(int requested : {0,1,2,4,8,14,16,32}) {
+        constexpr int max_splits=256;
+        CHECK(hipMalloc(&op,output_size*max_splits*4));CHECK(hipMalloc(&rp,output_size*max_splits*4));
+        CHECK(hipMalloc(&om,queries*heads*max_splits*8));CHECK(hipMalloc(&rm,queries*heads*max_splits*8));
+        for(int requested : {0,1,2,4,8,14,16,32,64,128,256}) {
+            if(length==65536 && requested!=16 && requested!=32 && requested!=64 && requested!=128 && requested!=256) continue;
+            if(length!=65536 && requested>32) continue;
             int splits=requested;
             if(!splits) {
                 int tiles=padded/256, best=0, waves_best=0, tiles_dst=heads*((queries+1)/2);
@@ -91,7 +95,9 @@ int main() {
                     if(splits>1) flash_attn_combine_results<256><<<dim3(queries,heads),256,splits*8>>>(rp,rm,ref,splits);
                 } else {
                     int force=queries==1?requested:splits;
-                    qwen35_attention_q8_decode<<<dim3(queries,force?splits:32,heads),dim3(32,4)>>>(
+                    dim3 grid = queries==1 ? dim3(heads*(force?splits:128),1,1) :
+                                             dim3(queries,force?splits:128,heads);
+                    qwen35_attention_q8_decode<<<grid,dim3(32,4)>>>(
                         ours,op,om,dq,dk,dv,dks,dvs,dp,heads,kv_heads,props.multiProcessorCount,occupancy,force,
                         queries,queries==1?-1:length-queries);
                     qwen35_attention_q8_combine<<<dim3(heads,queries),256,32*8>>>(ours,op,om,dp,heads,props.multiProcessorCount,occupancy,force);
@@ -111,6 +117,15 @@ int main() {
                 ++checked;
             }
             if(wrong) { fprintf(stderr,"mismatches=%zu/%d max=%.9g\n",wrong,output_size,worst);return 1; }
+            if(length==65536) {
+                hipEvent_t start,stop;CHECK(hipEventCreate(&start));CHECK(hipEventCreate(&stop));
+                CHECK(hipEventRecord(start));
+                for(int i=0;i<20;++i) run(false);
+                CHECK(hipEventRecord(stop));CHECK(hipEventSynchronize(stop));
+                float elapsed=0;CHECK(hipEventElapsedTime(&elapsed,start,stop));
+                printf("ours attention length=65536 splits=%d %.3f us\n",splits,elapsed*50);
+                CHECK(hipEventDestroy(start));CHECK(hipEventDestroy(stop));
+            }
             if(pattern==0 && ((queries==1 && length==4096 && requested==16) || (queries==512 && length==4097 && requested==0))) {
                 for(bool reference : {true,false}) {
                     hipEvent_t start,stop;
