@@ -1,5 +1,25 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Latest validation: matched C++ coding output (2026-09-19)
+
+An exact 4,096-token prompt asked for a C++17 `merge_intervals` function and
+supplied the required standard headers. Greedy generation used Q8 K/Q8 V,
+512-token chunks, the opt-in BF16 prefill path, and a 256-token ceiling.
+Our runner and llama.cpp produced the same 560-byte implementation for both
+IQ2_XS and IQ3_XXS (SHA-256 `4a0cb461966fae9a...`). The raw responses are
+strict UTF-8 and contain no tokenizer markers, replacement characters,
+Markdown fences, or exposed ChatML controls.
+
+All four responses compile under C++17 with warnings as errors, ASan, UBSan,
+and libstdc++ assertions. Each passes fixed empty/overlap/nesting/duplicate/
+adjacency/INT_MIN/INT_MAX cases and 10,000 randomized comparisons. The new
+`rdna4/llm/test_cpp_merge_output.py` reproduces these checks from runner and
+llama.cpp generation logs. First-pass prefill was 413.64 tok/s (ours) versus
+256.93 (llama.cpp) for IQ2, and 421.97 versus 352.63 for IQ3. Final prompt
+argmax matched at token 1771. Full-logit relative L2 remained nonzero:
+0.176949976 for IQ2 and 0.072349927 for IQ3, so the result establishes this
+coding task's output equivalence rather than full numerical parity.
+
 ## Latest continuation: real Q8/Q8 support (2026-09-19)
 
 User clarified Q8_0 for **both K and V**, and selected the opt-in BF16

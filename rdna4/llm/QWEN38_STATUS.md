@@ -6156,3 +6156,44 @@ checks benchmark status, strict UTF-8, decoded display text, hidden control
 tokens, and optional first-token consistency. Logs, logits, the exact prompt,
 and its tokenizer-based generator are in
 `tmp/qwen38/prefill-output-fidelity/`.
+
+## Matched C++ coding-output validation (2026-09-19)
+
+The Q8/Q8 BF16 prefill path was tested on an exact 4,096-token C++17 task,
+using 512-token chunks and greedy generation. The task requested a single
+`merge_intervals` definition, with standard headers supplied by the caller,
+and explicitly covered empty input, duplicates, nesting, adjacency,
+`INT_MIN`, and `INT_MAX`. Both quantized models were compared with llama.cpp
+using the same model, prompt, Q8 K/Q8 V cache types, and generation ceiling.
+
+| Model | Our prefill | llama.cpp prefill | Visible response |
+|---|---:|---:|---|
+| IQ2_XS | 413.64 tok/s | 256.93 tok/s | byte-identical |
+| IQ3_XXS | 421.97 tok/s | 352.63 tok/s | byte-identical |
+
+All four responses contain the same 560-byte implementation, SHA-256
+`4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354`.
+The output sorts the pairs, performs one forward merge pass, uses the required
+inclusive overlap comparison, preserves merely adjacent intervals, and does
+no overflow-prone arithmetic. It is strict UTF-8 and contains no raw BPE
+markers, replacement characters, Markdown fences, or ChatML controls.
+
+`test_cpp_merge_output.py` compiles each raw response with C++17, warnings as
+errors, ASan, UBSan, and libstdc++ assertions. Each executable passes fixed
+edge cases and 10,000 deterministic randomized comparisons. Recheck saved
+logs with:
+
+```sh
+TMPDIR="$PWD/tmp" python3 rdna4/llm/test_cpp_merge_output.py \
+  --require-identical \
+  tmp/qwen38/cpp-output-validation/ours-iq2-final.out \
+  tmp/qwen38/cpp-output-validation/llama-iq2-final.out \
+  tmp/qwen38/cpp-output-validation/ours-iq3-final.out \
+  tmp/qwen38/cpp-output-validation/llama-iq3-final.out
+```
+
+The final prompt argmax is 1771 on every path. Full-vocabulary runner versus
+llama.cpp relative L2 / maximum absolute error is
+0.176949976 / 2.302000046 for IQ2 and 0.072349927 / 0.785731316 for IQ3.
+The identical completed generation is strong task-level evidence, while the
+remaining logit differences still preclude a whole-model parity claim.
