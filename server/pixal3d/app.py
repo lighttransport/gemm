@@ -16,6 +16,7 @@ import math
 from pathlib import Path
 import queue
 import re
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -613,13 +614,53 @@ class JobQueue:
         self.jobs: dict[str, dict] = {}
         self.pending: queue.Queue[str] = queue.Queue()
         self.lock = threading.Lock()
+        work_dir = getattr(pixal, "work_dir", None)
+        self.result_root = Path(work_dir) / "results" if work_dir is not None else None
+        if self.result_root is not None:
+            self.result_root.mkdir(parents=True, exist_ok=True)
+            for path in self.result_root.iterdir():
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
         threading.Thread(target=self._worker, daemon=True, name="pixal3d-jobs").start()
+
+    def _remove_artifacts_locked(self, job: dict) -> None:
+        directory = job.get("_artifact_dir")
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def _store_artifacts(self, job_id: str, result: dict) -> None:
+        if self.result_root is None:
+            return
+        directory = self.result_root / job_id
+        directory.mkdir()
+        stored = {}
+
+        def save(container: dict, field: str, name: str, public: str) -> None:
+            encoded = container.pop(field, None)
+            if encoded is None:
+                return
+            path = directory / name
+            path.write_bytes(base64.b64decode(encoded, validate=True))
+            stored[name] = path
+            container.setdefault("artifacts", {})[public] = (
+                f"/v1/jobs/{job_id}/artifacts/{name}")
+
+        save(result, "glb_b64", "native.glb", "glb")
+        save(result, "ply_b64", "native.ply", "ply")
+        if isinstance(result.get("reference"), dict):
+            save(result["reference"], "glb_b64", "reference.glb", "glb")
+        with self.lock:
+            self.jobs[job_id]["_artifact_dir"] = directory
+            self.jobs[job_id]["_artifacts"] = stored
 
     def _expire_locked(self, now: float | None = None) -> None:
         cutoff = (time.time() if now is None else now) - self.ttl
         for job_id, job in list(self.jobs.items()):
             if (job["state"] not in ("queued", "running") and
                     job.get("updated_at", job["created_at"]) < cutoff):
+                self._remove_artifacts_locked(job)
                 self.jobs.pop(job_id, None)
 
     def submit(self, request: dict) -> dict:
@@ -639,7 +680,9 @@ class JobQueue:
                                if j["state"] not in ("queued", "running")),
                               key=lambda j: j["updated_at"])
             while len(terminal) >= self.retained:
-                self.jobs.pop(terminal.pop(0)["id"], None)
+                expired = terminal.pop(0)
+                self._remove_artifacts_locked(expired)
+                self.jobs.pop(expired["id"], None)
             self.jobs[job_id] = {"id": job_id, "state": "queued", "phase": "queued", "progress": 0,
                                  "created_at": now, "updated_at": now, "request": request,
                                  "_cancel": threading.Event(), "_uploads": upload_paths}
@@ -689,7 +732,19 @@ class JobQueue:
                     job["updated_at"] = time.time()
                 return {"id": job_id, "state": job["state"], "deleted": False}
             self.jobs.pop(job_id)
+            self._remove_artifacts_locked(job)
             return {"id": job_id, "state": "deleted", "deleted": True}
+
+    def artifact(self, job_id: str, name: str) -> Path:
+        if name not in ("native.glb", "native.ply", "reference.glb"):
+            raise KeyError(name)
+        with self.lock:
+            self._expire_locked()
+            job = self.jobs.get(job_id)
+            path = None if job is None else job.get("_artifacts", {}).get(name)
+            if path is None or not path.is_file():
+                raise KeyError(name)
+            return path
 
     def _queue_position(self, job_id: str) -> int:
         queued = sorted((j for j in self.jobs.values() if j["state"] == "queued"),
@@ -732,6 +787,7 @@ class JobQueue:
                     reference_mesh = result["reference"].get("mesh_summary", {})
                     if native_mesh.get("vertices") and reference_mesh.get("vertices"):
                         result["comparison"] = mesh_comparison(native_mesh, reference_mesh)
+                self._store_artifacts(job_id, result)
                 self._update(job_id, state="complete", phase="complete", progress=100, result=result,
                              completed_at=time.time())
             except JobCancelled:
@@ -760,6 +816,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(data)
+    def file_response(self, path: Path):
+        data = path.read_bytes()
+        content_type = "model/gltf-binary" if path.suffix == ".glb" else "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.end_headers()
+        self.wfile.write(data)
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -778,6 +843,10 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/v1/jobs/"):
             try:
                 job_id, tail = (path[len("/v1/jobs/"):].split("/", 1) + [""])[:2]
+                if tail.startswith("artifacts/"):
+                    self.file_response(self.server.jobs.artifact(
+                        job_id, tail[len("artifacts/"):]))
+                    return
                 self.json_response(200, self.server.jobs.status(job_id, tail == "result"))
             except KeyError:
                 self.json_response(404, error_payload("not_found", "job not found"))

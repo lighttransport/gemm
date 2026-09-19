@@ -353,6 +353,37 @@ class PixalServerTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             jobs.status(second["id"])
 
+    def test_queued_results_are_file_backed(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="artifacts-", dir=scratch) as td:
+            class ArtifactPixal:
+                work_dir = Path(td)
+                def infer(self, request, cancel=None, progress=None):
+                    return {"ok": True,
+                            "glb_b64": base64.b64encode(b"native-glb").decode(),
+                            "ply_b64": base64.b64encode(b"native-ply").decode()}
+                def reference(self, request, cancel=None):
+                    return {"glb_b64": base64.b64encode(b"reference-glb").decode()}
+
+            jobs = app.JobQueue(ArtifactPixal(), retained=1)
+            submitted = jobs.submit({"reference": True})
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                status = jobs.status(submitted["id"], include_result=True)
+                if status["state"] == "complete":
+                    break
+                time.sleep(0.01)
+            result = status["result"]
+            self.assertNotIn("glb_b64", result)
+            self.assertEqual(jobs.artifact(submitted["id"], "native.glb").read_bytes(),
+                             b"native-glb")
+            self.assertEqual(jobs.artifact(submitted["id"], "reference.glb").read_bytes(),
+                             b"reference-glb")
+            artifact_dir = jobs.artifact(submitted["id"], "native.ply").parent
+            jobs.delete(submitted["id"])
+            self.assertFalse(artifact_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

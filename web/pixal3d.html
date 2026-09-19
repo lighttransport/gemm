@@ -93,9 +93,9 @@ $('form').onsubmit=async e=>{
     else{body.image_upload=await uploadFile(image);body.image_ext='.'+(image.name.split('.').pop()||'png').toLowerCase();const mask=$('mask').files[0];if(mask)body.mask_upload=await uploadFile(mask)}
     if($('device').value)body.device=Number($('device').value);if($('vram').value)body.vram_budget_mib=Number($('vram').value);
     const j=await runJob(body),toUrl=b64=>URL.createObjectURL(new Blob([Uint8Array.from(atob(b64),c=>c.charCodeAt(0))],{type:'model/gltf-binary'}));
-    if(objectUrl)URL.revokeObjectURL(objectUrl);objectUrl=toUrl(j.glb_b64);$('model').src=objectUrl;$('download').href=objectUrl;$('download').hidden=false;
-    if(plyUrl)URL.revokeObjectURL(plyUrl);plyUrl=null;if(j.ply_b64){plyUrl=URL.createObjectURL(new Blob([Uint8Array.from(atob(j.ply_b64),c=>c.charCodeAt(0))],{type:'application/octet-stream'}));$('ply-download').href=plyUrl;$('ply-download').hidden=false}
-    if(j.reference){if(referenceUrl)URL.revokeObjectURL(referenceUrl);referenceUrl=toUrl(j.reference.glb_b64);$('reference-model').src=referenceUrl;$('reference-download').href=referenceUrl;$('reference-download').hidden=false}else referenceUrl=null;
+    if(objectUrl?.startsWith('blob:'))URL.revokeObjectURL(objectUrl);objectUrl=j.artifacts?.glb||toUrl(j.glb_b64);$('model').src=objectUrl;$('download').href=objectUrl;$('download').hidden=false;
+    if(plyUrl?.startsWith('blob:'))URL.revokeObjectURL(plyUrl);plyUrl=null;if(j.artifacts?.ply||j.ply_b64){plyUrl=j.artifacts?.ply||URL.createObjectURL(new Blob([Uint8Array.from(atob(j.ply_b64),c=>c.charCodeAt(0))],{type:'application/octet-stream'}));$('ply-download').href=plyUrl;$('ply-download').hidden=false}
+    if(j.reference){if(referenceUrl?.startsWith('blob:'))URL.revokeObjectURL(referenceUrl);referenceUrl=j.reference.artifacts?.glb||toUrl(j.reference.glb_b64);$('reference-model').src=referenceUrl;$('reference-download').href=referenceUrl;$('reference-download').hidden=false}else referenceUrl=null;
     applyView();$('stats').textContent=JSON.stringify({mode,views:mode==='multi'?bundle.views.length:1,precision:body.gpu_flow_precision,preparation:j.preparation,stats:j.stats,profile:j.profile,mesh:j.mesh_summary,comparison:j.comparison},null,2)+'\nElapsed: '+j.elapsed_ms+' ms'+(j.reference?'\nPyTorch reference: '+j.reference.elapsed_ms+' ms':'');$('status').textContent='Complete';
   }catch(err){await discardPendingUploads();$('status').innerHTML='<span class="error">'+String(err.message||err)+'</span>'}
   finally{activeJobId=null;$('run').disabled=false;$('cancel').hidden=true}

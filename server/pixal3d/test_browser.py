@@ -143,6 +143,7 @@ def main():
     server.pixal = pixal
     scratch = app.ROOT / "tmp/pixal3d/browser-test"
     scratch.mkdir(parents=True, exist_ok=True)
+    pixal.work_dir = scratch
     server.uploads = app.UploadStore(scratch / "uploads", retained=16)
     server.jobs = app.JobQueue(pixal, retained=4, uploads=server.uploads)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -174,6 +175,7 @@ def main():
                 cdp.evaluate("document.getElementById('include-ply').checked=true; document.getElementById('reference').checked=true; document.getElementById('form').requestSubmit()")
                 wait_for(cdp, "document.getElementById('status').textContent === 'Complete'")
                 assert cdp.evaluate("!document.getElementById('download').hidden && !document.getElementById('ply-download').hidden && !document.getElementById('reference-download').hidden")
+                assert cdp.evaluate("Promise.all(['download','ply-download','reference-download'].map(id=>fetch(document.getElementById(id).href).then(r=>r.ok&&r.arrayBuffer()).then(b=>b.byteLength))).then(v=>v.every(n=>n>0))")
                 assert len(pixal.requests) == 1 and "views" not in pixal.requests[0]
 
                 transforms = scratch / "transforms.json"

@@ -62,6 +62,10 @@ For long browser runs, `POST /v1/jobs` accepts the same body and returns a job
 ID immediately. Poll `GET /v1/jobs/ID`; when its state is `complete`, fetch
 `GET /v1/jobs/ID/result`. `DELETE /v1/jobs/ID` cancels a queued request or
 terminates the active native/reference child process.
+Queued results expose GLB and optional PLY URLs under `artifacts`; the binary
+files remain on disk instead of being retained as base64 strings in server
+memory. The synchronous `POST /v1/infer` response keeps its original base64
+fields for API compatibility.
 Job status includes a monotonic `progress` percentage and a `phase` derived
 from native conditioning, diffusion, mesh, and texture milestones.
 The bounded in-memory queue defaults to four active requests and four retained
@@ -119,10 +123,9 @@ TLS and authentication at the proxy. Do not expose an unauthenticated
 Run one server process per physical GPU. The process serializes requests for
 each backend, but separate server processes do not share locks or VRAM budgets.
 Keep `tmp/pixal3d/web-runs` on a local filesystem with room for uploads and
-generated assets. Terminal results are retained in memory, including base64
-GLBs, optional PLY data, and reference GLBs; size `--retained-jobs` for the
-largest enabled response rather than only the native GLB. Four retained jobs
-can require over 1 GiB when reference and PLY outputs are both enabled.
+generated assets. Queued output artifacts are retained under its `results`
+directory until job expiry or deletion. Size `--retained-jobs` and filesystem
+capacity for native GLB, optional PLY, and reference GLB output together.
 
 Use a service manager to restart the process and set a file-descriptor limit
 appropriate for concurrent uploads. Check `GET /health` after startup and
