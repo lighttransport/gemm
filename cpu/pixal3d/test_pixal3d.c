@@ -76,6 +76,30 @@ int main(void) {
     CHECK(pixal3d_create(NULL) == NULL && strlen(pixal3d_last_error(NULL)) > 0);
     CHECK(pixal3d_generate(NULL, NULL, NULL, NULL) == -1);
     CHECK(pixal3d_generate_multiview(NULL, NULL, 0, NULL) == -1);
+
+    float ply_vertices[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+    float ply_normals[] = {0, 0, 1, 0, 0, 1, 0, 0, 1};
+    float ply_uvs[] = {0, 0, 1, 0, 0, 1};
+    uint32_t ply_triangles[] = {0, 1, 2};
+    pixal3d_result ply = {0};
+    ply.vertices = ply_vertices;
+    ply.normals = ply_normals;
+    ply.uvs = ply_uvs;
+    ply.triangles = ply_triangles;
+    ply.vertex_count = 3;
+    ply.triangle_count = 1;
+    const char *ply_path = "../../tmp/pixal3d/test-export.ply";
+    CHECK(pixal3d_write_ply(ply_path, &ply) == 0);
+    FILE *ply_file = fopen(ply_path, "rb");
+    CHECK(ply_file != NULL);
+    char ply_header[256] = {0};
+    CHECK(fread(ply_header, 1, sizeof(ply_header) - 1, ply_file) > 100);
+    CHECK(!memcmp(ply_header, "ply\nformat binary_little_endian 1.0\n", 36));
+    CHECK(strstr(ply_header, "element vertex 3\n") && strstr(ply_header, "element face 1\n"));
+    fclose(ply_file);
+    CHECK(remove(ply_path) == 0);
+    CHECK(pixal3d_write_ply(NULL, &ply) == -1);
+
     pixal3d_result result = {0};
     result.vertices = malloc(3 * sizeof(float));
     CHECK(result.vertices != NULL);

@@ -34,11 +34,13 @@ class PixalServerTest(unittest.TestCase):
 
             def native_run(command, **kwargs):
                 output = Path(command[command.index("--output") + 1])
+                ply_output = Path(command[command.index("--ply-output") + 1])
                 views_dir = Path(command[command.index("--views-dir") + 1])
                 captured["command"] = command
                 captured["manifest"] = json.loads(
                     (views_dir / "transforms.json").read_text())
                 output.write_bytes(b"glTF-test")
+                ply_output.write_bytes(b"ply-test")
                 Path(command[command.index("--profile-json") + 1]).write_text(
                     '{"peak_vram_mib": 1024}')
                 return subprocess.CompletedProcess(command, 0, '{"views":2}\n', "")
@@ -49,6 +51,7 @@ class PixalServerTest(unittest.TestCase):
                 "gpu_kernels": "mma", "gpu_flow_precision": "mixed",
                 "seed": 7, "device": 0, "vram_budget_mib": 12288,
                 "texture_size": 2048, "triangle_target": 500000,
+                "include_ply": True,
                 "mesh_scale": 1.25, "fov": 0.8,
                 "views": [
                     {"image_b64": encoded, "transform_matrix": IDENTITY},
@@ -60,12 +63,14 @@ class PixalServerTest(unittest.TestCase):
                 result = server.infer(request)
 
         self.assertEqual(base64.b64decode(result["glb_b64"]), b"glTF-test")
+        self.assertEqual(base64.b64decode(result["ply_b64"]), b"ply-test")
         self.assertEqual(result["stats"], {"views": 2})
         self.assertEqual(result["profile"]["peak_vram_mib"], 1024)
         self.assertIn("--views-dir", captured["command"])
         self.assertNotIn("--input", captured["command"])
         self.assertEqual(captured["command"][captured["command"].index("--texture-size") + 1], "2048")
         self.assertEqual(captured["command"][captured["command"].index("--triangle-target") + 1], "500000")
+        self.assertIn("--ply-output", captured["command"])
         self.assertEqual(captured["manifest"]["mesh_scale"], 1.25)
         self.assertEqual(len(captured["manifest"]["frames"]), 2)
         self.assertEqual(captured["manifest"]["frames"][1]["camera_angle_x"], 0.9)
@@ -77,6 +82,13 @@ class PixalServerTest(unittest.TestCase):
             app.bounded_integer(1.5, "device", 0, 255)
         with self.assertRaisesRegex(ValueError, "finite"):
             app.camera_matrix([[float("nan")] * 4 for _ in range(4)], "camera")
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="web-", dir=scratch) as td:
+            server = self.make_server(Path(td))
+            encoded = base64.b64encode(b"image-data").decode()
+            with self.assertRaisesRegex(ValueError, "include_ply"):
+                server.infer({"image_b64": encoded, "include_ply": "yes"})
 
     def test_multiview_reference_uses_pinned_entry_point(self):
         scratch = app.ROOT / "tmp/pixal3d/tests"

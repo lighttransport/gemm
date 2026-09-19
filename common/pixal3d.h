@@ -71,8 +71,10 @@ int pixal3d_generate(pixal3d_context *context, const pixal3d_image *image, const
 int pixal3d_generate_multiview(pixal3d_context *context, const pixal3d_view *views, size_t view_count,
                                pixal3d_result *result);
 /* result must be zero-initialized; free a previous result before reusing it.
- * write_glb returns -1 on error and prints the export diagnostic to stderr. */
+ * Exporters return -1 on error and print the diagnostic to stderr. PLY carries
+ * geometry, normals and UVs; GLB additionally embeds the PBR textures. */
 int pixal3d_write_glb(const char *path, const pixal3d_result *result);
+int pixal3d_write_ply(const char *path, const pixal3d_result *result);
 void pixal3d_result_free(pixal3d_result *result);
 void pixal3d_destroy(pixal3d_context *context);
 

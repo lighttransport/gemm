@@ -240,9 +240,13 @@ class PixalServer:
             raise ValueError("texture_size must be 1024, 2048, or 4096")
         triangle_target = bounded_integer(request.get("triangle_target", 1000000),
                                           "triangle_target", 10000, 5000000)
+        include_ply = request.get("include_ply", False)
+        if not isinstance(include_ply, bool):
+            raise ValueError("include_ply must be a boolean")
         with self.locks[backend], tempfile.TemporaryDirectory(prefix="request-", dir=self.work_dir) as td:
             run_dir = Path(td)
             output_path = run_dir / "output.glb"
+            ply_path = run_dir / "output.ply"
             mask_path = None
             if multiview:
                 frames = []
@@ -280,6 +284,8 @@ class PixalServer:
             cmd += ["--gpu-execution", execution, "--gpu-kernels", kernels,
                     "--gpu-flow-precision", flow_precision, "--profile-json", str(profile),
                     "--texture-size", str(texture_size), "--triangle-target", str(triangle_target)]
+            if include_ply:
+                cmd += ["--ply-output", str(ply_path)]
             if threads:
                 cmd += ["--threads", str(threads)]
             if request.get("device") is not None:
@@ -299,6 +305,8 @@ class PixalServer:
                 raise RuntimeError(detail)
             if not output_path.is_file() or output_path.stat().st_size > MAX_GLB_BYTES:
                 raise RuntimeError("native runner did not produce a valid GLB")
+            if include_ply and (not ply_path.is_file() or ply_path.stat().st_size > MAX_GLB_BYTES):
+                raise RuntimeError("native runner did not produce a valid PLY")
             stats = {}
             for line in reversed(proc.stdout.splitlines()):
                 try:
@@ -308,9 +316,14 @@ class PixalServer:
                         break
                 except ValueError:
                     continue
-            return {"ok": True, "backend": backend, "elapsed_ms": round((time.monotonic() - started) * 1000),
-                    "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"), "stats": stats,
-                    "profile": json.loads(profile.read_text()) if profile.is_file() else {}}
+            result = {"ok": True, "backend": backend,
+                      "elapsed_ms": round((time.monotonic() - started) * 1000),
+                      "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"),
+                      "stats": stats,
+                      "profile": json.loads(profile.read_text()) if profile.is_file() else {}}
+            if include_ply:
+                result["ply_b64"] = base64.b64encode(ply_path.read_bytes()).decode("ascii")
+            return result
 
     def reference(self, request: dict, cancel: threading.Event | None = None) -> dict:
         """Run the pinned upstream PyTorch pipeline for visual verification."""

@@ -108,6 +108,10 @@ cpu/pixal3d/pixal3d --backend cuda \
   --fov 0.857556 --seed 1 --output tmp/pixal3d/house.glb
 ```
 
+Use a `.ply` output path for a binary little-endian geometry export containing
+positions, normals, UVs and indexed triangles. GLB remains the default choice
+for rendered assets because it also embeds the generated PBR textures.
+
 Posed multiview inference uses Tencent's `pipeline_mv.json` and `_mv`
 checkpoints. Supply a directory containing RGBA frames and a NeRF/Blender-style
 `transforms.json`; frame zero defines the output orientation. Each view is
@@ -189,7 +193,8 @@ counts, timing and peak memory; progress and errors go to standard error.
 ## C API
 
 Initialize options with `pixal3d_default_options`, set backend/model paths, create
-one context, then call `pixal3d_generate` and optionally `pixal3d_write_glb`.
+one context, then call `pixal3d_generate` and optionally `pixal3d_write_glb` or
+`pixal3d_write_ply`.
 Release results with `pixal3d_result_free`, and contexts with `pixal3d_destroy`.
 Input data is borrowed for the duration of the call; results own their buffers.
 Zero-initialize each result, and free its buffers before passing it to another generation.

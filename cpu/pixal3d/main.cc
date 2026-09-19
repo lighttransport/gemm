@@ -1,5 +1,6 @@
 #include "../../common/pixal3d.h"
 #include "../../common/stb_image.h"
+#include <cctype>
 #include <cmath>
 #include <boost/json.hpp>
 #include <cstdio>
@@ -41,18 +42,18 @@ int main(int argc, char **argv) {
     bool gpu_execution_explicit = false;
     std::string profile;
     pixal3d_camera camera{0, 0, 1};
-    std::string input, views_dir, mask, output, model, dino, naf, dump;
+    std::string input, views_dir, mask, output, ply_output, model, dino, naf, dump;
     size_t num_views = 0;
     try {
         for (int i = 1; i < argc; ++i) {
             std::string key = argv[i];
             if (key == "--help") {
                 std::puts(
-                    "Usage: pixal3d (--input RGBA.png --fov RADIANS | --views-dir DIR) --output mesh.glb\n"
+                    "Usage: pixal3d (--input RGBA.png --fov RADIANS | --views-dir DIR) --output mesh.glb|mesh.ply\n"
                     "  --backend cpu|cuda|rocm  --device N  --threads N\n"
                     "  --mask MASK.png (required for RGB)  --distance FLOAT  --mesh-scale FLOAT\n"
                     "  --model-dir DIR  --dinov3 FILE  --naf FILE  --seed N\n"
-                    "  --vram-budget-mib N (maximum 14336)  --dump-dir DIR\n"
+                    "  --vram-budget-mib N (maximum 14336)  --dump-dir DIR  --ply-output FILE\n"
                     "  --gpu-execution legacy|resident  --gpu-kernels auto|blas|mma\n"
                     "  --gpu-flow-precision bf16|fp32|mixed  --profile-json FILE\n"
                     "  --texture-size 1024|2048|4096  --triangle-target N (10000..5000000)\n"
@@ -72,6 +73,8 @@ int main(int argc, char **argv) {
                 num_views = integer_argument<size_t>(key, value);
             else if (key == "--output")
                 output = value;
+            else if (key == "--ply-output")
+                ply_output = value;
             else if (key == "--mask")
                 mask = value;
             else if (key == "--gpu-execution") {
@@ -154,6 +157,23 @@ int main(int argc, char **argv) {
         std::filesystem::create_directories(parent);
         if (access(parent.c_str(), W_OK) || std::filesystem::is_directory(output))
             throw std::runtime_error("Output path is not writable: " + output);
+        auto lowercase_extension = [](const std::string &path) {
+            std::string extension = std::filesystem::path(path).extension().string();
+            for (char &c : extension)
+                c = char(std::tolower(static_cast<unsigned char>(c)));
+            return extension;
+        };
+        std::string extension = lowercase_extension(output);
+        if (extension != ".glb" && extension != ".ply")
+            throw std::runtime_error("Output extension must be .glb or .ply");
+        if (!ply_output.empty()) {
+            auto ply_parent = std::filesystem::absolute(ply_output).parent_path();
+            std::filesystem::create_directories(ply_parent);
+            if (access(ply_parent.c_str(), W_OK) || std::filesystem::is_directory(ply_output) ||
+                lowercase_extension(ply_output) != ".ply" ||
+                std::filesystem::absolute(ply_output) == std::filesystem::absolute(output))
+                throw std::runtime_error("PLY output must be a distinct writable .ply path");
+        }
         if (!model.empty())
             options.model_dir = model.c_str();
         if (!dino.empty())
@@ -238,7 +258,10 @@ int main(int argc, char **argv) {
             if (pixal3d_generate_multiview(context.get(), views.data(), views.size(), &result))
                 throw std::runtime_error(pixal3d_last_error(context.get()));
         }
-        int rc = pixal3d_write_glb(output.c_str(), &result);
+        int rc = extension == ".glb" ? pixal3d_write_glb(output.c_str(), &result)
+                                     : pixal3d_write_ply(output.c_str(), &result);
+        if (!rc && !ply_output.empty())
+            rc = pixal3d_write_ply(ply_output.c_str(), &result);
         std::printf("{\"vertices\":%d,\"triangles\":%d,\"shape_tokens\":%d,\"seconds\":%.3f,\"peak_device_"
                     "bytes\":%zu,\"peak_host_bytes\":%zu}\n",
                     result.vertex_count, result.triangle_count, result.stats.shape_tokens,
