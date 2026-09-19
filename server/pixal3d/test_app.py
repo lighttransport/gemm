@@ -176,6 +176,37 @@ class PixalServerTest(unittest.TestCase):
         timer.cancel()
         self.assertLess(time.monotonic() - started, 2)
 
+    def test_raw_upload_is_consumed_and_cleaned(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="uploads-", dir=scratch) as td:
+            uploads = app.UploadStore(Path(td), retained=2)
+            upload_id = uploads.put(b"raw-image")
+
+            class UploadPixal:
+                def infer(self, request, cancel=None):
+                    self.path = request["image_b64"]
+                    return {"ok": True, "bytes": app.decode_b64(
+                        self.path, "image_b64", app.MAX_IMAGE_BYTES).decode()}
+                def reference(self, request, cancel=None):
+                    raise AssertionError("reference should not run")
+
+            pixal = UploadPixal()
+            jobs = app.JobQueue(pixal, retained=1, uploads=uploads)
+            job = jobs.submit({"image_upload": upload_id})
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                status = jobs.status(job["id"], include_result=True)
+                if status["state"] == "complete":
+                    break
+                time.sleep(0.01)
+            self.assertEqual(status["result"]["bytes"], "raw-image")
+            while pixal.path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(pixal.path.exists())
+            with self.assertRaisesRegex(ValueError, "unknown or expired"):
+                uploads.claim({"image_upload": upload_id})
+
 
 if __name__ == "__main__":
     unittest.main()

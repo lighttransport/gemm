@@ -50,6 +50,12 @@ Errors include a stable `error_code` such as `invalid_request`, `queue_full`,
 `timeout`, `not_found`, or `internal_error`. Queue saturation returns HTTP 429,
 and `/health` publishes request, image, output, and view-count limits.
 
+The browser sends each image as raw bytes to `POST /v1/uploads`, then places
+the returned `upload_id` in `image_upload`, `mask_upload`, or each view's
+`image_upload`. This avoids base64 expansion and keeps queued JSON requests
+small. Upload IDs are single-use and their files are removed when the job
+finishes or is cancelled. Existing `image_b64` clients remain supported.
+
 Run the server unit tests with `python3 -m unittest server.pixal3d.test_app`.
 When Chrome or Chromium is installed, `python3 server/pixal3d/test_browser.py`
 boots the real HTTP handler and verifies the JavaScript-rendered control and

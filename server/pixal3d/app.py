@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import copy
 import json
 import math
 from pathlib import Path
@@ -43,6 +44,51 @@ def error_payload(code: str, message: str) -> dict:
     return {"ok": False, "error": message, "error_code": code}
 
 
+class UploadStore:
+    """Own raw request images until a queued job consumes them."""
+    def __init__(self, root: Path, retained: int = 64):
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.retained = retained
+        self.files: dict[str, Path] = {}
+        self.lock = threading.Lock()
+
+    def put(self, data: bytes) -> str:
+        if not data or len(data) > MAX_IMAGE_BYTES:
+            raise ValueError(f"upload exceeds the {MAX_IMAGE_BYTES // (1024 * 1024)} MiB limit")
+        upload_id = uuid.uuid4().hex
+        path = self.root / upload_id
+        with self.lock:
+            if len(self.files) >= self.retained:
+                raise QueueFull("upload store is full")
+            path.write_bytes(data)
+            self.files[upload_id] = path
+        return upload_id
+
+    def claim(self, request: dict) -> tuple[dict, list[Path]]:
+        resolved = copy.deepcopy(request)
+        refs: list[tuple[dict, str, str]] = []
+        for source, destination in (("image_upload", "image_b64"),
+                                    ("mask_upload", "mask_b64")):
+            if source in resolved:
+                refs.append((resolved, source, destination))
+        if isinstance(resolved.get("views"), list):
+            for view in resolved["views"]:
+                if isinstance(view, dict) and "image_upload" in view:
+                    refs.append((view, "image_upload", "image_b64"))
+        ids = [container[source] for container, source, _ in refs]
+        if len(ids) != len(set(ids)):
+            raise ValueError("an upload ID may only be used once")
+        with self.lock:
+            if any(not isinstance(item, str) or item not in self.files for item in ids):
+                raise ValueError("unknown or expired upload ID")
+            paths = [self.files.pop(item) for item in ids]
+        for (container, source, destination), path in zip(refs, paths):
+            container[destination] = path
+            del container[source]
+        return resolved, paths
+
+
 def run_command(command: list[str], timeout: float,
                 cancel: threading.Event | None = None) -> subprocess.CompletedProcess:
     if cancel is None:
@@ -71,6 +117,10 @@ def run_command(command: list[str], timeout: float,
 
 
 def decode_b64(value: object, name: str, limit: int) -> bytes:
+    if isinstance(value, Path):
+        if not value.is_file() or value.stat().st_size <= 0 or value.stat().st_size > limit:
+            raise ValueError(f"{name} exceeds the {limit // (1024 * 1024)} MiB limit")
+        return value.read_bytes()
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a non-empty base64 string")
     if value.startswith("data:"):
@@ -326,20 +376,27 @@ class PixalServer:
 
 class JobQueue:
     """Bounded in-memory queue for long-running demo requests."""
-    def __init__(self, pixal: PixalServer, retained: int = 4):
+    def __init__(self, pixal: PixalServer, retained: int = 4,
+                 uploads: UploadStore | None = None):
         self.pixal = pixal
         self.retained = retained
+        self.uploads = uploads
         self.jobs: dict[str, dict] = {}
         self.pending: queue.Queue[str] = queue.Queue()
         self.lock = threading.Lock()
         threading.Thread(target=self._worker, daemon=True, name="pixal3d-jobs").start()
 
     def submit(self, request: dict) -> dict:
+        upload_paths: list[Path] = []
+        if self.uploads:
+            request, upload_paths = self.uploads.claim(request)
         job_id = uuid.uuid4().hex
         now = time.time()
         with self.lock:
             active = sum(j["state"] in ("queued", "running") for j in self.jobs.values())
             if active >= self.retained:
+                for path in upload_paths:
+                    path.unlink(missing_ok=True)
                 raise QueueFull("job queue is full")
             terminal = sorted((j for j in self.jobs.values()
                                if j["state"] not in ("queued", "running")),
@@ -348,7 +405,7 @@ class JobQueue:
                 self.jobs.pop(terminal.pop(0)["id"], None)
             self.jobs[job_id] = {"id": job_id, "state": "queued", "phase": "queued",
                                  "created_at": now, "updated_at": now, "request": request,
-                                 "_cancel": threading.Event()}
+                                 "_cancel": threading.Event(), "_uploads": upload_paths}
         self.pending.put(job_id)
         return self.status(job_id)
 
@@ -418,6 +475,10 @@ class JobQueue:
                 self._update(job_id, state="failed", phase="failed", error=str(exc), error_code=code,
                              completed_at=time.time())
             finally:
+                with self.lock:
+                    paths = self.jobs[job_id].get("_uploads", [])
+                for path in paths:
+                    path.unlink(missing_ok=True)
                 self.pending.task_done()
 
 
@@ -456,6 +517,16 @@ class Handler(BaseHTTPRequestHandler):
         self.json_response(404, error_payload("not_found", "not found"))
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/v1/uploads":
+            try:
+                length = int(self.headers.get("Content-Length", "-1"))
+                if length <= 0 or length > MAX_IMAGE_BYTES:
+                    raise ValueError("invalid upload size")
+                upload_id = self.server.uploads.put(self.rfile.read(length))
+                self.json_response(201, {"ok": True, "upload_id": upload_id, "bytes": length})
+            except QueueFull as exc: self.json_response(429, error_payload("queue_full", str(exc)))
+            except ValueError as exc: self.json_response(400, error_payload("invalid_request", str(exc)))
+            return
         if path not in ("/v1/infer", "/v1/jobs"):
             self.json_response(404, error_payload("not_found", "not found")); return
         try:
@@ -497,8 +568,11 @@ def main() -> None:
     p.add_argument("--dinov3", default=str(DEFAULT_DINOV3)); p.add_argument("--naf", default=str(DEFAULT_NAF))
     p.add_argument("--work-dir", default=str(ROOT / "tmp/pixal3d/web-runs")); p.add_argument("--threads", type=int, default=0); p.add_argument("--timeout", type=float, default=7200); p.add_argument("--reference-timeout", type=float, default=10800)
     p.add_argument("--retained-jobs", type=int, default=4)
+    p.add_argument("--retained-uploads", type=int, default=64)
     args = p.parse_args(); srv = ThreadingHTTPServer((args.bind, args.port), Handler); srv.pixal = PixalServer(args)
-    srv.jobs = JobQueue(srv.pixal, bounded_integer(args.retained_jobs, "retained_jobs", 1, 32))
+    srv.uploads = UploadStore(srv.pixal.work_dir / "uploads",
+                              bounded_integer(args.retained_uploads, "retained_uploads", 1, 256))
+    srv.jobs = JobQueue(srv.pixal, bounded_integer(args.retained_jobs, "retained_jobs", 1, 32), srv.uploads)
     print(f"Pixal3D demo: http://{args.bind}:{args.port}/ (backend={args.backend})", flush=True); srv.serve_forever()
 
 
