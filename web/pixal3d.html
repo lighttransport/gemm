@@ -96,7 +96,7 @@ $('form').onsubmit=async e=>{
     if(objectUrl)URL.revokeObjectURL(objectUrl);objectUrl=toUrl(j.glb_b64);$('model').src=objectUrl;$('download').href=objectUrl;$('download').hidden=false;
     if(plyUrl)URL.revokeObjectURL(plyUrl);plyUrl=null;if(j.ply_b64){plyUrl=URL.createObjectURL(new Blob([Uint8Array.from(atob(j.ply_b64),c=>c.charCodeAt(0))],{type:'application/octet-stream'}));$('ply-download').href=plyUrl;$('ply-download').hidden=false}
     if(j.reference){if(referenceUrl)URL.revokeObjectURL(referenceUrl);referenceUrl=toUrl(j.reference.glb_b64);$('reference-model').src=referenceUrl;$('reference-download').href=referenceUrl;$('reference-download').hidden=false}else referenceUrl=null;
-    applyView();$('stats').textContent=JSON.stringify({mode,views:mode==='multi'?bundle.views.length:1,precision:body.gpu_flow_precision,preparation:j.preparation,stats:j.stats,profile:j.profile},null,2)+'\nElapsed: '+j.elapsed_ms+' ms'+(j.reference?'\nPyTorch reference: '+j.reference.elapsed_ms+' ms':'');$('status').textContent='Complete';
+    applyView();$('stats').textContent=JSON.stringify({mode,views:mode==='multi'?bundle.views.length:1,precision:body.gpu_flow_precision,preparation:j.preparation,stats:j.stats,profile:j.profile,mesh:j.mesh_summary,comparison:j.comparison},null,2)+'\nElapsed: '+j.elapsed_ms+' ms'+(j.reference?'\nPyTorch reference: '+j.reference.elapsed_ms+' ms':'');$('status').textContent='Complete';
   }catch(err){await discardPendingUploads();$('status').innerHTML='<span class="error">'+String(err.message||err)+'</span>'}
   finally{activeJobId=null;$('run').disabled=false;$('cancel').hidden=true}
 };

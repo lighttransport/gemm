@@ -44,6 +44,11 @@ cameras remain synchronized while comparing the meshes. `GET /health` reports
 binary, GPU-library, native-model, preparation-model, and pinned PyTorch
 reference readiness.
 
+Native and reference results include `mesh_summary` with byte, vertex and
+triangle counts and declared position bounds. A paired run also returns
+`comparison` with relative count differences and the maximum bounds delta;
+these provide reproducible structural diagnostics alongside visual inspection.
+
 For single-view requests, `auto_mask: true` uses the pinned RMBG-2.0 reference
 when the image lacks useful alpha, and `auto_camera: true` estimates horizontal
 FOV with pinned MoGe-2. The response includes resolved values and sources in

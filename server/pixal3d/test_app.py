@@ -3,6 +3,7 @@ import base64
 import json
 from pathlib import Path
 import subprocess
+import struct
 import sys
 import tempfile
 import time
@@ -113,6 +114,28 @@ class PixalServerTest(unittest.TestCase):
             encoded = base64.b64encode(b"image-data").decode()
             with self.assertRaisesRegex(ValueError, "include_ply"):
                 server.infer({"image_b64": encoded, "include_ply": "yes"})
+
+    def test_glb_mesh_comparison_summary(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests/summary.glb"
+        scratch.parent.mkdir(parents=True, exist_ok=True)
+        scene = {"meshes": [{"primitives": [{"attributes": {"POSITION": 0},
+                                                "indices": 1}]}],
+                 "accessors": [{"count": 12, "min": [-0.5, -0.4, -0.3],
+                                 "max": [0.5, 0.4, 0.3]},
+                                {"count": 30}]}
+        encoded = json.dumps(scene, separators=(",", ":")).encode()
+        encoded += b" " * (-len(encoded) % 4)
+        raw = (struct.pack("<III", 0x46546c67, 2, 20 + len(encoded)) +
+               struct.pack("<II", len(encoded), 0x4e4f534a) + encoded)
+        scratch.write_bytes(raw)
+        summary = app.glb_mesh_summary(scratch)
+        scratch.unlink()
+        self.assertEqual((summary["vertices"], summary["triangles"]), (12, 10))
+        comparison = app.mesh_comparison(summary, {
+            "bytes": 1, "vertices": 10, "triangles": 8,
+            "bounds": [[-0.4, -0.4, -0.3], [0.5, 0.4, 0.2]]})
+        self.assertAlmostEqual(comparison["vertices_relative_delta"], 0.2)
+        self.assertAlmostEqual(comparison["bounds_max_abs_delta"], 0.1)
 
     def test_automatic_camera_prepares_native_input(self):
         scratch = app.ROOT / "tmp/pixal3d/tests"

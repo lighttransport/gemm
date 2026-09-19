@@ -16,6 +16,7 @@ import math
 from pathlib import Path
 import queue
 import re
+import struct
 import subprocess
 import tempfile
 import threading
@@ -287,6 +288,37 @@ def valid_output(path: Path, limit: int = MAX_GLB_BYTES) -> bool:
     return path.is_file() and 0 < path.stat().st_size <= limit
 
 
+def glb_mesh_summary(path: Path) -> dict:
+    """Read comparison-scale mesh facts without decoding textures."""
+    raw = path.read_bytes()
+    magic, version, total = struct.unpack_from("<III", raw)
+    if magic != 0x46546c67 or version != 2 or total != len(raw):
+        raise ValueError("invalid GLB header")
+    json_size, json_kind = struct.unpack_from("<II", raw, 12)
+    if json_kind != 0x4e4f534a:
+        raise ValueError("missing GLB JSON chunk")
+    scene = json.loads(raw[20:20 + json_size])
+    primitive = scene["meshes"][0]["primitives"][0]
+    position = scene["accessors"][primitive["attributes"]["POSITION"]]
+    indices = scene["accessors"][primitive["indices"]]
+    bounds = [position.get("min"), position.get("max")]
+    return {"bytes": len(raw), "vertices": position["count"],
+            "triangles": indices["count"] // 3, "bounds": bounds}
+
+
+def mesh_comparison(native: dict, reference: dict) -> dict:
+    result = {"native": native, "reference": reference}
+    if native.get("bounds") and reference.get("bounds"):
+        result["bounds_max_abs_delta"] = max(
+            abs(float(a) - float(b))
+            for side_a, side_b in zip(native["bounds"], reference["bounds"])
+            for a, b in zip(side_a, side_b))
+    for name in ("vertices", "triangles"):
+        denominator = max(1, int(reference[name]))
+        result[f"{name}_relative_delta"] = (int(native[name]) - int(reference[name])) / denominator
+    return result
+
+
 class PixalServer:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -492,6 +524,10 @@ class PixalServer:
                       "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"),
                       "stats": stats,
                       "profile": json.loads(profile.read_text()) if profile.is_file() else {}}
+            try:
+                result["mesh_summary"] = glb_mesh_summary(output_path)
+            except (KeyError, IndexError, OSError, TypeError, ValueError, struct.error):
+                result["mesh_summary"] = {"available": False}
             if include_ply:
                 result["ply_b64"] = base64.b64encode(ply_path.read_bytes()).decode("ascii")
             if preparation is not None:
@@ -555,9 +591,15 @@ class PixalServer:
                 raise RuntimeError(detail)
             if not valid_output(output_path):
                 raise RuntimeError("PyTorch reference did not produce a valid GLB")
-            return {"backend": backend, "elapsed_ms": round((time.monotonic() - started) * 1000),
-                    "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"),
-                    "log_tail": (proc.stdout or "").strip()[-2000:]}
+            result = {"backend": backend,
+                      "elapsed_ms": round((time.monotonic() - started) * 1000),
+                      "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"),
+                      "log_tail": (proc.stdout or "").strip()[-2000:]}
+            try:
+                result["mesh_summary"] = glb_mesh_summary(output_path)
+            except (KeyError, IndexError, OSError, TypeError, ValueError, struct.error):
+                result["mesh_summary"] = {"available": False}
+            return result
 
 
 class JobQueue:
@@ -686,6 +728,10 @@ class JobQueue:
                 if request.get("reference"):
                     self._update(job_id, phase="PyTorch reference", progress=98)
                     result["reference"] = self.pixal.reference(reference_request(request, result), cancel)
+                    native_mesh = result.get("mesh_summary", {})
+                    reference_mesh = result["reference"].get("mesh_summary", {})
+                    if native_mesh.get("vertices") and reference_mesh.get("vertices"):
+                        result["comparison"] = mesh_comparison(native_mesh, reference_mesh)
                 self._update(job_id, state="complete", phase="complete", progress=100, result=result,
                              completed_at=time.time())
             except JobCancelled:
@@ -762,6 +808,10 @@ class Handler(BaseHTTPRequestHandler):
             result = self.server.pixal.infer(request)
             if request.get("reference"):
                 result["reference"] = self.server.pixal.reference(reference_request(request, result))
+                native_mesh = result.get("mesh_summary", {})
+                reference_mesh = result["reference"].get("mesh_summary", {})
+                if native_mesh.get("vertices") and reference_mesh.get("vertices"):
+                    result["comparison"] = mesh_comparison(native_mesh, reference_mesh)
             self.json_response(200, result)
         except QueueFull as exc: self.json_response(429, error_payload("queue_full", str(exc)))
         except TimeoutError as exc: self.json_response(504, error_payload("timeout", str(exc)))
