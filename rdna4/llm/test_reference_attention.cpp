@@ -117,6 +117,29 @@ int main() {
                 ++checked;
             }
             if(wrong) { fprintf(stderr,"mismatches=%zu/%d max=%.9g\n",wrong,output_size,worst);return 1; }
+            if(queries==512 && length==4097 && pattern==0 && requested==0) {
+                qwen35_attention_q8_prefill_wmma<<<dim3(heads,(queries+127)/128),512>>>(
+                    ours,dq,dk,dv,dks,dvs,heads,kv_heads,queries,length-queries);
+                CHECK(hipDeviceSynchronize());
+                CHECK(hipMemcpy(a.data(),ours,output_size*4,hipMemcpyDeviceToHost));
+                double error2=0.0, reference2=0.0;float approximate_worst=0.0f;
+                for(int i=0;i<output_size;++i) {
+                    if(!std::isfinite(a[i])) {
+                        fprintf(stderr,"WMMA prefill produced non-finite output at %d\n",i);
+                        return 1;
+                    }
+                    double error=(double)a[i]-b[i];
+                    error2+=error*error;reference2+=(double)b[i]*b[i];
+                    approximate_worst=fmaxf(approximate_worst,fabsf(a[i]-b[i]));
+                }
+                double relative_l2=sqrt(error2/reference2);
+                printf("WMMA prefill queries=512 length=4097 rel_l2=%.9g max=%.9g\n",
+                       relative_l2,approximate_worst);
+                if(relative_l2>0.01 || approximate_worst>0.1f) {
+                    fprintf(stderr,"WMMA prefill exceeded numerical tolerance\n");
+                    return 1;
+                }
+            }
             if(length==65536) {
                 hipEvent_t start,stop;CHECK(hipEventCreate(&start));CHECK(hipEventCreate(&stop));
                 CHECK(hipEventRecord(start));

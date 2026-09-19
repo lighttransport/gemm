@@ -13454,7 +13454,9 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen35_conv_reference, fn_qwen35_silu_gate_reference;
     int requested_qwen35_native_q8_attention;
     hipModule_t q8_attention_module;
+    hipModule_t q8_prefill_module;
     hipFunction_t fn_q8_attention_decode, fn_q8_attention_combine;
+    hipFunction_t fn_q8_attention_prefill_wmma;
     void *d_q8_attention_parts, *d_q8_attention_meta;
     int q8_attention_max_splits, q8_attention_nsm;
     int requested_qwen35_native_q8_prefill;
@@ -17388,6 +17390,11 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                   r->q8_attention_module, "qwen35_attention_q8_decode"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine,
                   r->q8_attention_module, "qwen35_attention_q8_combine"));
+        if (hip_compile_kernels_ex(&r->q8_prefill_module, r->device,
+                qwen35_attention_q8_source, "qwen35_attention_q8_prefill.hip", r->verbose,
+                "qwen35_attention_q8_prefill", 0) <= 0) return -1;
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_prefill_wmma,
+                  r->q8_prefill_module, "qwen35_attention_q8_prefill_wmma"));
         r->q8_attention_nsm = props.multiProcessorCount;
         r->q8_attention_max_splits = (max_seq_len + 255) / 256;
         if (r->q8_attention_max_splits > 128) r->q8_attention_max_splits = 128;
@@ -22092,6 +22099,17 @@ static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
 
 static int launch_attn_prefill_native_q8(hip_llm_runner *r, void *out,
         void *q, void *k, void *v, void *ks, void *vs, int queries, int position_start) {
+    /* At long context the exact vector kernel re-reads K/V for every query.
+     * Switch only after the ordinary 4K workload to the 128-query WMMA tile,
+     * whose paired waves keep D=256 below the gfx1201 register cliff. */
+    if (r->fn_q8_attention_prefill_wmma && queries >= 64 &&
+        position_start + queries > 4096) {
+        void *wmma[] = { &out, &q, &k, &v, &ks, &vs, &r->n_heads,
+            &r->n_kv_heads, &queries, &position_start };
+        CHECK_HIP(LAUNCH(r->fn_q8_attention_prefill_wmma, r->n_heads,
+            (queries + 127) / 128, 1, 512, 1, 1, 0, r->stream, wmma));
+        return 0;
+    }
     /* Updated only alongside the two-column pinned reference differential test. */
     int occupancy = 9;
     int tiles = (position_start + queries + 255) / 256;
@@ -31788,6 +31806,7 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_q8_prefill_parts) hipFree(r->d_q8_prefill_parts);
     if (r->d_q8_prefill_meta) hipFree(r->d_q8_prefill_meta);
     if (r->q8_attention_module) hipModuleUnload(r->q8_attention_module);
+    if (r->q8_prefill_module) hipModuleUnload(r->q8_prefill_module);
     if (r->module) hipModuleUnload(r->module);
 
 #ifdef LLM_HIPBLASLT_ENABLED

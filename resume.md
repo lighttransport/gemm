@@ -1,5 +1,36 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Long-context Q8/Q8 prefill (2026-09-20)
+
+The IQ2 runner now sustains **413.25 tok/s** while processing 65,536 random
+tokens in 512-token chunks on RX 9070 XT / gfx1201 / ROCm 10. The previous
+native Q8/Q8 path took 460.37 seconds at 142.36 tok/s; the new path takes
+158.59 seconds, a 2.90x speedup. It leaves 4282 MiB free at a 12,024 MiB peak.
+
+Long-context chunks use a gfx1201 WMMA attention kernel after position 4096.
+Eight pairs of waves process 128 queries per block, split the 256-wide head
+dimension across each pair, consume resident Q8 K/V directly, and use signed
+INT8 QK plus F16 PV matrix instructions. The pinned exact vector kernel remains
+the dispatch through 4K, so the validated short-context output path is unchanged.
+The optimized kernel is separately compiled with fast math; exact decode and
+short prefill retain the precise module.
+
+A separate exact 65,536-token retrieval prompt sustained **412.34 tok/s** and
+generated exactly the eleven bytes `ZEPHYR-7319`, retrieving the passphrase
+from the prompt's first line after about 440 KB of filler. The output validator
+passed. Against the pinned llama.cpp attention kernel, the WMMA path measures
+0.000259 relative L2 and 0.01816 maximum absolute error at 4097 positions;
+the existing exact path still passes 39,567,360 bitwise comparisons. The
+optimized reduction order is approximate, so this is a semantic long-context
+check rather than a general byte-parity claim. Artifacts:
+`rdna4/llm/tmp/qwen38_gsq_iq2_64k_wmma_i8_local.log` and
+`rdna4/llm/tmp/long-retrieval/`.
+
+`bench_qwen38_gsq_decode_64k.sh` now gates depth prefill at 400 tok/s as well as
+checking sustained decode, deterministic hashes, and real random-token cache
+state. Override the prefill threshold with
+`QWEN38_GSQ_64K_PREFILL_FLOOR_TPS` when evaluating other hardware.
+
 ## Sustained decode at 64K synthetic depth (2026-09-20)
 
 `--bench-depth 65536` now matches llama-bench depth semantics: it processes a
@@ -7,7 +38,7 @@ deterministic random-token prefix through the complete model, then restores the
 resulting recurrent state before each timed repeat while retaining the prefix
 K/V rows on device. Seed one produces prefix hash `90178de69a24a76e`.
 
-On RX 9070 XT / gfx1201 / ROCm 10, the 65,536-token IQ2 prefix took 460.37
+Before the long-prefill WMMA change, the 65,536-token IQ2 prefix took 460.37
 seconds at 142.36 tok/s. Three 512-token decode repeats sustain
 26.92/26.91/26.90 tok/s and share sequence hash `b01a17fae16f806d`. The prior
 27.94 tok/s result used zero cache values and is superseded. Long Q8 attention

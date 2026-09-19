@@ -7,6 +7,17 @@
  */
 typedef _Float16 q8_half;
 typedef q8_half q8_half2 __attribute__((ext_vector_type(2)));
+typedef q8_half q8_half8 __attribute__((ext_vector_type(8)));
+typedef float q8_float8 __attribute__((ext_vector_type(8)));
+typedef int q8_int8 __attribute__((ext_vector_type(8)));
+typedef unsigned int q8_uint2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ unsigned int q8_pack4(signed char a, signed char b,
+                                                  signed char c, signed char d) {
+    return (unsigned int)(unsigned char)a |
+           ((unsigned int)(unsigned char)b << 8) |
+           ((unsigned int)(unsigned char)c << 16) |
+           ((unsigned int)(unsigned char)d << 24);
+}
 __device__ __forceinline__ q8_half2 q8_hpair(float x, float y) {
     return (q8_half2){(q8_half)x, (q8_half)y};
 }
@@ -44,6 +55,219 @@ __device__ __forceinline__ int q8_attention_splits(int length, int heads,
 __device__ __forceinline__ float q8_attention_sum(float x) {
     for (int offset = 16; offset; offset >>= 1) x += __shfl_xor(x, offset, 32);
     return x;
+}
+
+/* Long-context prefill kernel for gfx1201.  Eight pairs of waves process eight
+ * 16-query tiles while sharing each 16-row K/V tile.  The two waves in a pair
+ * split D=256 in half.  This keeps the Q and output accumulators below the
+ * register cliff of the older one-wave D=256 kernel and reads the resident
+ * Q8/Q8 cache directly, so no O(context) unpack pass is needed per layer.
+ *
+ * Q uses the same per-32-value Q8_1 quantization contract as the runner's
+ * packed-F16 flash path. K/V scales were rounded to F16 when the cache row was
+ * written; casting dequantized V to F16 therefore matches that input contract.
+ * Grid: (heads, ceil(queries/128)), block: 512. */
+extern "C" __global__ __launch_bounds__(512, 1)
+void qwen35_attention_q8_prefill_wmma(float *out, const float *q,
+        const signed char *kc, const signed char *vc,
+        const float *ks, const float *vs, int heads, int kv_heads,
+        int queries, int position_start) {
+    constexpr int BQ = 128, BKV = 16, WMMA_K = 16, HD = 256, HALF_HD = 128;
+    int head = blockIdx.x;
+    int q0 = blockIdx.y * BQ;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lid = tid & 31;
+    int group = wid >> 1;
+    int part = wid & 1;
+    int half = lid >> 4;
+    int idx = lid & 15;
+    int query = q0 + group * 16 + idx;
+    int dbase = part * HALF_HD;
+    int kh = head / (heads / kv_heads);
+    int stride = kv_heads * HD;
+    int scale_stride = kv_heads * (HD / 32);
+
+    __shared__ signed char sm_k[BKV * HD];
+    __shared__ q8_half sm_v[HD * BKV];
+    __shared__ float sm_score[16 * WMMA_K * WMMA_K];
+    __shared__ q8_half sm_p[8 * WMMA_K * WMMA_K];
+
+    q8_uint2 qcode[8];
+    float qscale[4];
+    const float *qh = q + ((size_t)query * heads + head) * HD + dbase;
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        float x[2][8];
+        signed char code[2][8];
+        float amax = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int d = g * 32 + k * 16 + half * 8 + i;
+                float value = query < queries ? .0625f * qh[d] : 0.0f;
+                x[k][i] = value;
+                amax = fmaxf(amax, fabsf(value));
+            }
+        }
+        amax = fmaxf(amax, __shfl_xor(amax, 16, 32));
+        float d = amax / 127.0f;
+        #pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int quant = d != 0.0f ? (int)roundf(x[k][i] / d) : 0;
+                quant = max(-127, min(127, quant));
+                code[k][i] = (signed char)quant;
+            }
+            qcode[2 * g + k][0] = q8_pack4(code[k][0], code[k][1], code[k][2], code[k][3]);
+            qcode[2 * g + k][1] = q8_pack4(code[k][4], code[k][5], code[k][6], code[k][7]);
+        }
+        qscale[g] = d;
+    }
+
+    /* llama.cpp's Q8 value path also accumulates PV in packed F16.  Using the
+     * native F16-accumulate WMMA form halves the accumulator register file. */
+    q8_half8 acc[8];
+    #pragma unroll
+    for (int kb = 0; kb < 8; ++kb)
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) acc[kb][i] = (q8_half)0.0f;
+    float maximum[8], sum[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        maximum[i] = -3.402823466e+38f / 2;
+        sum[i] = 0.0f;
+    }
+
+    int max_length = position_start + min(queries, q0 + BQ);
+    int tiles = (max_length + BKV - 1) / BKV;
+    for (int tile = 0; tile < tiles; ++tile) {
+        int kv0 = tile * BKV;
+        #pragma unroll
+        for (int e = tid; e < BKV * HD; e += 512) {
+            int row = e / HD;
+            int dim = e - row * HD;
+            int pos = kv0 + row;
+            signed char kval = 0;
+            float vval = 0.0f;
+            if (pos < max_length) {
+                size_t code_index = (size_t)pos * stride + kh * HD + dim;
+                size_t scale_index = (size_t)pos * scale_stride + kh * 8 + dim / 32;
+                kval = kc[code_index];
+                vval = (float)vc[code_index] * vs[scale_index];
+            }
+            sm_k[row * HD + dim] = kval;
+            sm_v[dim * BKV + row] = (q8_half)vval;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int sub = 0; sub < BKV / WMMA_K; ++sub) {
+            q8_float8 partial = {0, 0, 0, 0, 0, 0, 0, 0};
+            #pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                q8_int8 integer = {0, 0, 0, 0, 0, 0, 0, 0};
+                #pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    q8_uint2 key;
+                    int key_base = (sub * WMMA_K + idx) * HD + dbase +
+                                   g * 32 + k * 16 + half * 8;
+                    key[0] = q8_pack4(sm_k[key_base + 0], sm_k[key_base + 1],
+                                      sm_k[key_base + 2], sm_k[key_base + 3]);
+                    key[1] = q8_pack4(sm_k[key_base + 4], sm_k[key_base + 5],
+                                      sm_k[key_base + 6], sm_k[key_base + 7]);
+                    integer = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                        true, qcode[2 * g + k], true, key, integer, false);
+                }
+                int kpos = kv0 + sub * WMMA_K + idx;
+                float kd = kpos < max_length ?
+                    ks[(size_t)kpos * scale_stride + kh * 8 + part * 4 + g] : 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    float qd = __shfl(qscale[g], half * 8 + i, 32);
+                    partial[i] += (float)integer[i] * qd * kd;
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                sm_score[wid * 256 + lid * 8 + i] = partial[i];
+            __syncthreads();
+
+            q8_float8 score;
+            int score_base = (group * 2) * 256 + lid * 8;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                float value = sm_score[score_base + i] + sm_score[score_base + 256 + i];
+                int qrow = q0 + group * 16 + half * 8 + i;
+                int kpos = kv0 + sub * WMMA_K + idx;
+                if (qrow >= queries || kpos >= max_length ||
+                    kpos > position_start + qrow) value = -__builtin_inff();
+                score[i] = value;
+            }
+
+            q8_half8 alpha_h;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                float row_max = score[i];
+                row_max = fmaxf(row_max, __shfl_xor(row_max, 1, 32));
+                row_max = fmaxf(row_max, __shfl_xor(row_max, 2, 32));
+                row_max = fmaxf(row_max, __shfl_xor(row_max, 4, 32));
+                row_max = fmaxf(row_max, __shfl_xor(row_max, 8, 32));
+                float next_max = fmaxf(maximum[i], row_max);
+                float alpha = maximum[i] < -1.0e30f ? 0.0f :
+                    __expf(maximum[i] - next_max);
+                float probability = __expf(score[i] - next_max);
+                float tile_sum = probability;
+                tile_sum += __shfl_xor(tile_sum, 1, 32);
+                tile_sum += __shfl_xor(tile_sum, 2, 32);
+                tile_sum += __shfl_xor(tile_sum, 4, 32);
+                tile_sum += __shfl_xor(tile_sum, 8, 32);
+                sum[i] = sum[i] * alpha + tile_sum;
+                maximum[i] = next_max;
+                score[i] = probability;
+                alpha_h[i] = (q8_half)alpha;
+            }
+            #pragma unroll
+            for (int kb = 0; kb < 8; ++kb) acc[kb] *= alpha_h;
+            if (part == 0) {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    sm_p[group * 256 + (half * 8 + i) * 16 + idx] =
+                        (q8_half)score[i];
+            }
+            __syncthreads();
+            q8_half8 probability;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                probability[i] = sm_p[group * 256 + idx * 16 + half * 8 + i];
+            #pragma unroll
+            for (int kb = 0; kb < 8; ++kb) {
+                q8_half8 value;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    value[i] = sm_v[(dbase + kb * 16 + idx) * BKV +
+                                        sub * WMMA_K + half * 8 + i];
+                acc[kb] = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(
+                    probability, value, acc[kb]);
+            }
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (int kb = 0; kb < 8; ++kb) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int qrow = q0 + group * 16 + half * 8 + i;
+            int dim = dbase + kb * 16 + idx;
+            if (qrow < queries)
+                out[((size_t)qrow * heads + head) * HD + dim] =
+                    (float)acc[kb][i] /
+                    (sum[i] > 0.0f ? sum[i] : 1.0f);
+        }
+    }
 }
 
 extern "C" __global__ __launch_bounds__(128, 1)
