@@ -42,7 +42,8 @@ requires an image without a separate mask upload. The browser displays native
 AMD and PyTorch reference meshes side by side or as an opacity overlay. Viewer
 cameras remain synchronized while comparing the meshes. `GET /health` reports
 binary, GPU-library, native-model, preparation-model, and pinned PyTorch
-reference readiness.
+reference readiness. Reference readiness includes the project Python and
+compiled `o_voxel`/CuMesh dependencies; missing names are returned explicitly.
 
 Native and reference results include `mesh_summary` with byte, vertex and
 triangle counts and declared position bounds. A paired run also returns

@@ -285,6 +285,23 @@ def rmbg_ready(path: Path) -> bool:
             (any(path.glob("*.safetensors")) or any(path.glob("pytorch_model*.bin"))))
 
 
+def reference_environment_ready(backend: str) -> tuple[bool, list[str]]:
+    environment = ROOT / f"ref/pixal3d/.venv-{backend}"
+    missing = []
+    if not (environment / "bin/python").is_file():
+        missing.append("python")
+    site_packages = list((environment / "lib").glob("python*/site-packages"))
+    if not site_packages or not any((site / "o_voxel").is_dir() or
+                                    any(site.glob("o_voxel*.so"))
+                                    for site in site_packages):
+        missing.append("o_voxel")
+    if backend == "cuda":
+        cumesh = ROOT / "ref/pixal3d/cumesh-upstream/cumesh"
+        if not any(cumesh.glob("_C*.so")):
+            missing.append("cumesh")
+    return not missing, missing
+
+
 def valid_output(path: Path, limit: int = MAX_GLB_BYTES) -> bool:
     return path.is_file() and 0 < path.stat().st_size <= limit
 
@@ -333,7 +350,8 @@ class PixalServer:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.locks = {backend: threading.Lock() for backend in ("cpu", "cuda", "rocm")}
         self.reference_script = ROOT / "ref/pixal3d/upstream/inference.py"
-        self.reference_mv_script = ROOT / "ref/pixal3d/upstream/inference_mv.py"
+        self.reference_mv_script = ROOT / "ref/pixal3d/run_reference_mv.py"
+        self.reference_mv_upstream = ROOT / "ref/pixal3d/upstream/inference_mv.py"
         self.reference_launcher = ROOT / "ref/pixal3d/run.sh"
         self.prepare_script = ROOT / "ref/pixal3d/prepare_input.py"
 
@@ -354,13 +372,17 @@ class PixalServer:
         reference = {}
         for backend in ("cuda", "rocm"):
             environment = ROOT / f"ref/pixal3d/.venv-{backend}/bin/python"
+            environment_ready, missing = reference_environment_ready(backend)
             reference[backend] = {
-                "available": (environment.is_file() and self.reference_script.is_file() and
-                              self.reference_mv_script.is_file() and model_ready(
+                "available": (environment_ready and self.reference_script.is_file() and
+                              self.reference_mv_script.is_file() and
+                              self.reference_mv_upstream.is_file() and model_ready(
                                   self.model_dir, self.dinov3, self.naf)),
                 "environment": str(environment),
                 "single_view_source": self.reference_script.is_file(),
                 "multiview_source": self.reference_mv_script.is_file(),
+                "multiview_upstream_source": self.reference_mv_upstream.is_file(),
+                "missing_dependencies": missing,
             }
         return {"ok": True, "service": "pixal3d", "default_backend": self.args.backend,
                 "default_gpu_execution": self.args.gpu_execution,

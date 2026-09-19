@@ -100,6 +100,10 @@ class PixalServerTest(unittest.TestCase):
         self.assertEqual((resolved["fov"], resolved["distance"], resolved["auto_camera"]),
                          (0.6, 1.5, False))
         self.assertFalse(app.rmbg_ready(Path("/missing/rmbg")))
+        ready, missing = app.reference_environment_ready("missing-backend")
+        self.assertFalse(ready)
+        self.assertIn("python", missing)
+        self.assertIn("o_voxel", missing)
         scratch_file = app.ROOT / "tmp/pixal3d/tests/empty-output"
         scratch_file.parent.mkdir(parents=True, exist_ok=True)
         scratch_file.write_bytes(b"")
