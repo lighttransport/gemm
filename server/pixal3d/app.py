@@ -13,10 +13,12 @@ import binascii
 import json
 import math
 from pathlib import Path
+import queue
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -275,6 +277,93 @@ class PixalServer:
                     "log_tail": (proc.stdout or "").strip()[-2000:]}
 
 
+class JobQueue:
+    """Bounded in-memory queue for long-running demo requests."""
+    def __init__(self, pixal: PixalServer, retained: int = 4):
+        self.pixal = pixal
+        self.retained = retained
+        self.jobs: dict[str, dict] = {}
+        self.pending: queue.Queue[str] = queue.Queue()
+        self.lock = threading.Lock()
+        threading.Thread(target=self._worker, daemon=True, name="pixal3d-jobs").start()
+
+    def submit(self, request: dict) -> dict:
+        job_id = uuid.uuid4().hex
+        now = time.time()
+        with self.lock:
+            active = sum(j["state"] in ("queued", "running") for j in self.jobs.values())
+            if active >= self.retained:
+                raise RuntimeError("job queue is full")
+            terminal = sorted((j for j in self.jobs.values()
+                               if j["state"] not in ("queued", "running")),
+                              key=lambda j: j["updated_at"])
+            while len(terminal) >= self.retained:
+                self.jobs.pop(terminal.pop(0)["id"], None)
+            self.jobs[job_id] = {"id": job_id, "state": "queued", "phase": "queued",
+                                 "created_at": now, "updated_at": now, "request": request}
+        self.pending.put(job_id)
+        return self.status(job_id)
+
+    def status(self, job_id: str, include_result: bool = False) -> dict:
+        with self.lock:
+            if job_id not in self.jobs:
+                raise KeyError(job_id)
+            job = self.jobs[job_id]
+            out = {key: value for key, value in job.items() if key not in ("request", "result")}
+            out["queue_position"] = self._queue_position(job_id) if job["state"] == "queued" else None
+            if include_result and job["state"] == "complete":
+                out["result"] = job["result"]
+            return out
+
+    def cancel(self, job_id: str) -> dict:
+        with self.lock:
+            if job_id not in self.jobs:
+                raise KeyError(job_id)
+            job = self.jobs[job_id]
+            if job["state"] == "queued":
+                job.update(state="cancelled", phase="cancelled", updated_at=time.time())
+            elif job["state"] == "running":
+                job["cancel_requested"] = True
+                job["updated_at"] = time.time()
+            return {key: value for key, value in job.items() if key not in ("request", "result")}
+
+    def _queue_position(self, job_id: str) -> int:
+        queued = sorted((j for j in self.jobs.values() if j["state"] == "queued"),
+                        key=lambda j: j["created_at"])
+        return next((i + 1 for i, job in enumerate(queued) if job["id"] == job_id), 0)
+
+    def _update(self, job_id: str, **values):
+        with self.lock:
+            self.jobs[job_id].update(values, updated_at=time.time())
+
+    def _worker(self):
+        while True:
+            job_id = self.pending.get()
+            try:
+                with self.lock:
+                    job = self.jobs[job_id]
+                    if job["state"] == "cancelled":
+                        continue
+                    request = job["request"]
+                self._update(job_id, state="running", phase="native inference", started_at=time.time())
+                result = self.pixal.infer(request)
+                with self.lock:
+                    cancelled = self.jobs[job_id].get("cancel_requested", False)
+                if cancelled:
+                    self._update(job_id, state="cancelled", phase="cancelled")
+                    continue
+                if request.get("reference"):
+                    self._update(job_id, phase="PyTorch reference")
+                    result["reference"] = self.pixal.reference(request)
+                self._update(job_id, state="complete", phase="complete", result=result,
+                             completed_at=time.time())
+            except Exception as exc:
+                self._update(job_id, state="failed", phase="failed", error=str(exc),
+                             completed_at=time.time())
+            finally:
+                self.pending.task_done()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Pixal3DWeb/1.0"
     def json_response(self, status: int, payload: dict):
@@ -289,7 +378,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
     def do_GET(self):
         path = urlparse(self.path).path
@@ -300,14 +389,24 @@ class Handler(BaseHTTPRequestHandler):
             data = (ROOT / "web/pixal3d.html").read_bytes()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
             return
+        if path.startswith("/v1/jobs/"):
+            try:
+                job_id, tail = (path[len("/v1/jobs/"):].split("/", 1) + [""])[:2]
+                self.json_response(200, self.server.jobs.status(job_id, tail == "result"))
+            except KeyError:
+                self.json_response(404, {"ok": False, "error": "job not found"})
+            return
         self.json_response(404, {"ok": False, "error": "not found"})
     def do_POST(self):
-        if urlparse(self.path).path != "/v1/infer":
+        path = urlparse(self.path).path
+        if path not in ("/v1/infer", "/v1/jobs"):
             self.json_response(404, {"ok": False, "error": "not found"}); return
         try:
             length = int(self.headers.get("Content-Length", "-1"))
             if length < 0 or length > MAX_BODY_BYTES: raise ValueError("request body too large")
             request = json.loads(self.rfile.read(length))
+            if path == "/v1/jobs":
+                self.json_response(202, self.server.jobs.submit(request)); return
             result = self.server.pixal.infer(request)
             if request.get("reference"):
                 result["reference"] = self.server.pixal.reference(request)
@@ -315,6 +414,14 @@ class Handler(BaseHTTPRequestHandler):
         except TimeoutError as exc: self.json_response(504, {"ok": False, "error": str(exc)})
         except (ValueError, json.JSONDecodeError) as exc: self.json_response(400, {"ok": False, "error": str(exc)})
         except Exception as exc: self.json_response(500, {"ok": False, "error": str(exc)})
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        if not path.startswith("/v1/jobs/"):
+            self.json_response(404, {"ok": False, "error": "not found"}); return
+        try:
+            self.json_response(200, self.server.jobs.cancel(path[len("/v1/jobs/"):]))
+        except KeyError:
+            self.json_response(404, {"ok": False, "error": "job not found"})
     def log_message(self, fmt, *args):
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {fmt % args}", flush=True)
 
@@ -329,7 +436,9 @@ def main() -> None:
     p.add_argument("--binary", default=str(ROOT / "cpu/pixal3d/pixal3d")); p.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
     p.add_argument("--dinov3", default=str(DEFAULT_DINOV3)); p.add_argument("--naf", default=str(DEFAULT_NAF))
     p.add_argument("--work-dir", default=str(ROOT / "tmp/pixal3d/web-runs")); p.add_argument("--threads", type=int, default=0); p.add_argument("--timeout", type=float, default=7200); p.add_argument("--reference-timeout", type=float, default=10800)
+    p.add_argument("--retained-jobs", type=int, default=4)
     args = p.parse_args(); srv = ThreadingHTTPServer((args.bind, args.port), Handler); srv.pixal = PixalServer(args)
+    srv.jobs = JobQueue(srv.pixal, bounded_integer(args.retained_jobs, "retained_jobs", 1, 32))
     print(f"Pixal3D demo: http://{args.bind}:{args.port}/ (backend={args.backend})", flush=True); srv.serve_forever()
 
 

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -104,6 +105,46 @@ class PixalServerTest(unittest.TestCase):
         self.assertIn("--low_vram", captured["command"])
         self.assertEqual(captured["manifest"]["mesh_scale"], 1.5)
         self.assertEqual(captured["manifest"]["frames"][0]["camera_angle_x"], 0.85)
+
+    def test_job_queue_reports_phase_and_result(self):
+        class FakePixal:
+            def infer(self, request):
+                return {"ok": True, "value": request["value"]}
+            def reference(self, request):
+                return {"value": "reference"}
+
+        jobs = app.JobQueue(FakePixal(), retained=2)
+        submitted = jobs.submit({"value": 7, "reference": True})
+        self.assertIn(submitted["state"], ("queued", "running", "complete"))
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            status = jobs.status(submitted["id"], include_result=True)
+            if status["state"] == "complete":
+                break
+            time.sleep(0.01)
+        self.assertEqual(status["phase"], "complete")
+        self.assertEqual(status["result"]["value"], 7)
+        self.assertEqual(status["result"]["reference"]["value"], "reference")
+
+    def test_queued_job_can_be_cancelled(self):
+        gate = __import__("threading").Event()
+        class BlockingPixal:
+            def infer(self, request):
+                gate.wait(2)
+                return {"ok": True}
+            def reference(self, request):
+                raise AssertionError("reference should not run")
+
+        jobs = app.JobQueue(BlockingPixal(), retained=2)
+        first = jobs.submit({})
+        deadline = time.monotonic() + 2
+        while jobs.status(first["id"])["state"] == "queued" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        second = jobs.submit({})
+        cancelled = jobs.cancel(second["id"])
+        gate.set()
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertEqual(jobs.status(second["id"])["phase"], "cancelled")
 
 
 if __name__ == "__main__":

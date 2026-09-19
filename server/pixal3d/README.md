@@ -38,6 +38,13 @@ requires an image without a separate mask upload. The browser displays native
 AMD and PyTorch reference meshes side by side or as an opacity overlay.
 `GET /health` reports binary, GPU-library, and model readiness.
 
+For long browser runs, `POST /v1/jobs` accepts the same body and returns a job
+ID immediately. Poll `GET /v1/jobs/ID`; when its state is `complete`, fetch
+`GET /v1/jobs/ID/result`. `DELETE /v1/jobs/ID` cancels a queued request or
+prevents a requested reference pass from starting after native inference.
+The bounded in-memory queue defaults to four active requests and four retained
+terminal results; change it with `--retained-jobs`.
+
 For multiview API requests, replace `image_b64` with `views`, an ordered array
 of 1 to 16 objects. Each object contains `image_b64`, a 4-by-4
 `transform_matrix`, and an optional `fov`. Top-level `fov` is the default for
