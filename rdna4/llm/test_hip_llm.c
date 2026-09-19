@@ -959,7 +959,7 @@ int main(int argc, char **argv) {
     int decode_n = 0;         /* --decode N: greedy-sample N tokens after prefill */
     int prefill_pad = 0;      /* --prefill-len M: pad prompt up to M tokens with last token (for bench) */
     int bench_repeat = 1;     /* --bench-repeat N: rerun the same request N times in-process */
-    int bench_depth = 0;      /* --bench-depth N: zero dummy KV rows before the measured request */
+    int bench_depth = 0;      /* --bench-depth N: random-token prefix before the measured request */
     int compare_paths = 0;    /* --compare-paths: report rel-L2 between batched and per-token logits */
     int coding_mode = 0;      /* Qwen3.8 non-thinking coding sampling profile */
     int reference_sampling = 0;
@@ -1769,11 +1769,25 @@ int main(int argc, char **argv) {
         unsigned char *seen = NULL;
         hllm_sampler *sampler = NULL;
         hllm_generation_trace trace = {0};
+        int32_t *depth_tokens = NULL;
+        hip_llm_state_snapshot *depth_snapshot = NULL;
         if ((reference_sampling && (coding_mode || qwen4_mtp)) || (trace_prefix && qwen4_mtp)) {
             fprintf(stderr, "Reference sampler cannot use coding filters or Qwen4 MTP\n");
             pass = 0; goto bench_done;
         }
         if (bench_repeat < 1) bench_repeat = 1;
+        {
+            int n_prefill = max_tokens > 0 ? max_tokens : 1;
+            if (bench_depth + n_prefill > n_max_seq) {
+                fprintf(stderr, "Benchmark depth and prompt exceed max_seq_len=%d\n", n_max_seq);
+                pass = 0; goto bench_done;
+            }
+            if (bench_depth + n_prefill + decode_n > n_max_seq) {
+                decode_n = n_max_seq - bench_depth - n_prefill;
+                if (decode_n < 0) decode_n = 0;
+                fprintf(stderr, "Clamped decode to %d (max_seq_len=%d)\n", decode_n, n_max_seq);
+            }
+        }
         /* Optional throwaway prefill + reset before the measured repeats.  Some
          * paths (Qwen4 grouped staging, VRAM-tight profiles) differ on their
          * first invocation only; warming them makes the measured repeats
@@ -1786,14 +1800,65 @@ int main(int argc, char **argv) {
             hip_llm_forward_batch_logits(gpu, tokens, wn, 0);
             hip_llm_reset_state(gpu);
         }
+        if (bench_depth > 0) {
+            const unsigned depth_seed = 1;
+            int depth_chunk = prefill_batch_tokens > 0 ? prefill_batch_tokens : 512;
+            if (depth_chunk > bench_depth) depth_chunk = bench_depth;
+            depth_tokens = (int32_t *)malloc((size_t)bench_depth * sizeof(*depth_tokens));
+            if (!depth_tokens) {
+                fprintf(stderr, "Random depth token allocation failed\n");
+                pass = 0; goto bench_done;
+            }
+            srand(depth_seed);
+            int bos = prompt_bos_id(gguf);
+            for (int i = 0; i < bench_depth; ++i)
+                depth_tokens[i] = i == 0 && bos >= 0 ? bos : rand() % n_vocab;
+            uint64_t depth_hash = 1469598103934665603ULL;
+            for (int i = 0; i < bench_depth; ++i) {
+                depth_hash ^= (uint32_t)depth_tokens[i];
+                depth_hash *= 1099511628211ULL;
+            }
+            hip_llm_reset_state(gpu);
+            hip_llm_set_decode_mode(gpu, 0);
+            hip_llm_set_qwen4_batch_request_tokens(gpu, bench_depth);
+            double depth_start = get_time_ms();
+            for (int off = 0; off < bench_depth; off += depth_chunk) {
+                int count = bench_depth - off;
+                if (count > depth_chunk) count = depth_chunk;
+                if (!hip_llm_forward_batch(gpu, depth_tokens + off, count, off)) {
+                    fprintf(stderr, "Random depth prefill failed at %d/%d\n", off, bench_depth);
+                    pass = 0; goto bench_done;
+                }
+                if ((off + count) % 8192 == 0 || off + count == bench_depth)
+                    fprintf(stderr, "Depth prefill: %d/%d tokens\n", off + count, bench_depth);
+            }
+            depth_snapshot = hip_llm_snapshot_state(gpu);
+            if (!depth_snapshot) {
+                fprintf(stderr, "Failed to snapshot random depth state\n");
+                pass = 0; goto bench_done;
+            }
+            double depth_ms = get_time_ms() - depth_start;
+            fprintf(stderr,
+                "Depth prefill: %d random tokens in %.2f ms -> %.2f tok/s "
+                "(seed=%u hash=%016llx)\n",
+                bench_depth, depth_ms,
+                depth_ms > 0.0 ? 1000.0 * bench_depth / depth_ms : 0.0,
+                depth_seed, (unsigned long long)depth_hash);
+        }
         for (int bench_rep = 0; bench_rep < bench_repeat; bench_rep++) {
         if (bench_repeat > 1)
             fprintf(stderr, "\n=== Bench repeat %d/%d ===\n", bench_rep + 1, bench_repeat);
-        /* Each repeat is an independent request: drop recurrent/KV/PLE state
-         * from the previous one so a hash mismatch is not just carried-over
-         * state.  This makes the in-process repeatability gate equivalent to
-         * two fresh-process runs while loading the model only once. */
-        hip_llm_reset_state(gpu);
+        /* Restore the random depth's recurrent state before every repeat.
+         * Prefix KV rows remain resident and measured rows are overwritten at
+         * identical positions, matching llama-bench's cached-depth restore. */
+        if (depth_snapshot) {
+            if (hip_llm_restore_state(gpu, depth_snapshot)) {
+                fprintf(stderr, "Failed to restore random depth state\n");
+                pass = 0; goto bench_done;
+            }
+        } else {
+            hip_llm_reset_state(gpu);
+        }
         free(seen); seen = NULL;
         hllm_sampler_free(sampler); sampler = NULL;
         hllm_trace_close(&trace);
@@ -1808,11 +1873,6 @@ int main(int argc, char **argv) {
         if (decode_n < 0) decode_n = 0;
         if (bench_depth && !bench_mode) {
             fprintf(stderr, "--bench-depth requires benchmark mode\n"); pass = 0; goto bench_done;
-        }
-        if (bench_depth + n_prefill + decode_n > n_max_seq) {
-            decode_n = n_max_seq - bench_depth - n_prefill;
-            if (decode_n < 0) decode_n = 0;
-            fprintf(stderr, "Clamped decode to %d (max_seq_len=%d)\n", decode_n, n_max_seq);
         }
 
         if (trace_prefix && bench_rep == 0) {
@@ -1831,11 +1891,6 @@ int main(int argc, char **argv) {
          * request and silently measured the scalar path. */
         hip_llm_set_qwen4_batch_request_tokens(gpu, n_prefill);
 
-        if (bench_depth && hip_llm_prepare_dummy_kv(gpu, bench_depth)) {
-            fprintf(stderr, "Failed to prepare %d dummy KV rows\n", bench_depth);
-            pass = 0; goto bench_done;
-        }
-
         fprintf(stderr, "\n=== Bench: depth=%d, prefill=%d tokens, decode=%d tokens, n_embd=%d, n_vocab=%d ===\n",
                 bench_depth, n_prefill, decode_n, n_embd, n_vocab);
 
@@ -1848,10 +1903,13 @@ int main(int argc, char **argv) {
             memcpy(buf_p, log_p, (size_t)n_vocab * sizeof(float));
 
             /* Run prefill via batched path */
-            hip_llm_reset_state(gpu);
-            if (bench_depth && hip_llm_prepare_dummy_kv(gpu, bench_depth)) {
-                fprintf(stderr, "compare: failed to restore dummy KV prefix\n");
-                free(buf_p); pass = 0; goto bench_done;
+            if (depth_snapshot) {
+                if (hip_llm_restore_state(gpu, depth_snapshot)) {
+                    fprintf(stderr, "compare: failed to restore depth state\n");
+                    free(buf_p); pass = 0; goto bench_done;
+                }
+            } else {
+                hip_llm_reset_state(gpu);
             }
             hip_llm_set_batched_path(gpu, 1);
             float *log_b = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, bench_depth);
@@ -1888,10 +1946,13 @@ int main(int argc, char **argv) {
             if (!lg) { fprintf(stderr, "GPU prefill warmup %d failed\n", w); pass = 0; goto bench_done; }
         }
         if (compare_paths || n_warmup) {
-            hip_llm_reset_state(gpu);
-            if (bench_depth && hip_llm_prepare_dummy_kv(gpu, bench_depth)) {
-                fprintf(stderr, "Failed to restore dummy KV prefix after warmup\n");
-                pass = 0; goto bench_done;
+            if (depth_snapshot) {
+                if (hip_llm_restore_state(gpu, depth_snapshot)) {
+                    fprintf(stderr, "Failed to restore depth state after warmup\n");
+                    pass = 0; goto bench_done;
+                }
+            } else {
+                hip_llm_reset_state(gpu);
             }
         }
 
@@ -2283,6 +2344,8 @@ int main(int argc, char **argv) {
 bench_done:
         hllm_trace_close(&trace);
         hllm_sampler_free(sampler);
+        hip_llm_free_state_snapshot(depth_snapshot);
+        free(depth_tokens);
         free(seen);
     } else {
         /* ---- Correctness mode: per-token CPU vs GPU compare (legacy) ---- */

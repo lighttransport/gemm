@@ -2,26 +2,24 @@
 
 ## Sustained decode at 64K synthetic depth (2026-09-20)
 
-Added `--bench-depth 65536` and
-`rdna4/llm/bench_qwen38_gsq_decode_64k.sh`. Each repeat resets the model,
-creates 65,536 zero Q8 K/Q8 V cache rows outside timing, evaluates one prompt
-token at that offset, and measures 512 decode tokens. This isolates deep-cache
-attention cost; unlike `llama-bench -d`, it does not run 64K random tokens, and
-Qwen3.8 recurrent state starts from reset.
+`--bench-depth 65536` now matches llama-bench depth semantics: it processes a
+deterministic random-token prefix through the complete model, then restores the
+resulting recurrent state before each timed repeat while retaining the prefix
+K/V rows on device. Seed one produces prefix hash `90178de69a24a76e`.
 
-On RX 9070 XT / gfx1201 / ROCm 10, IQ2 sustains 28.04/27.98/27.94 tok/s and
-IQ3 sustains 26.99/26.95/26.94 tok/s. All repeats are deterministic. Long Q8
-attention now uses 128 splits with split-major block ordering; the 64K
+On RX 9070 XT / gfx1201 / ROCm 10, the 65,536-token IQ2 prefix took 460.37
+seconds at 142.36 tok/s. Three 512-token decode repeats sustain
+26.92/26.91/26.90 tok/s and share sequence hash `b01a17fae16f806d`. The prior
+27.94 tok/s result used zero cache values and is superseded. Long Q8 attention
+uses 128 splits with split-major block ordering; the 64K
 attention microbenchmark improved from 718.9 microseconds at 16 splits to
-578.6 microseconds at 128. IQ2's sustained minimum improved 4.3% over the
-26.79 tok/s baseline. Unused F16 cache-packing scratch is no longer allocated
-for the fully native Q8/Q8 path, recovering about 266 MiB; final free VRAM is
-4434 MiB for IQ2 and 770 MiB for IQ3.
+578.6 microseconds at 128. Unused F16 cache-packing scratch is not allocated
+for the fully native Q8/Q8 path; the random-depth run leaves 4284 MiB free.
 
 The 40 tok/s sustained target remains unmet. The 64K profile assigns about
 9.8 ms/token to attention and about 26 ms/token to the projection/state path.
-Dense NextN draft width three is slower here at 21.21 tok/s with 168/259 draft
-acceptance, so it stays opt-in. Full results and commands:
+The old 64K MTP measurement also used zero cache values, so MTP stays opt-in
+pending a random-depth rerun. Full results and commands:
 [QWEN38_64K_DECODE.md](rdna4/llm/QWEN38_64K_DECODE.md).
 
 The pinned-kernel differential test passes 39,567,360 bitwise Q8/Q8 values,

@@ -3,12 +3,12 @@ set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log_dir="${root_dir}/tmp"
-log_file="${QWEN38_GSQ_64K_LOG:-${log_dir}/qwen38_gsq_iq2_decode_64k.log}"
+log_file="${QWEN38_GSQ_64K_LOG:-${log_dir}/qwen38_gsq_iq2_decode_64k_random.log}"
 depth="${QWEN38_GSQ_64K_DEPTH:-65536}"
 context="${QWEN38_GSQ_64K_CONTEXT:-66560}"
 decode="${QWEN38_GSQ_64K_DECODE:-512}"
 repeats="${QWEN38_GSQ_64K_REPEATS:-3}"
-floor_tps="${QWEN38_GSQ_64K_FLOOR_TPS:-27.5}"
+floor_tps="${QWEN38_GSQ_64K_FLOOR_TPS:-26.5}"
 
 mkdir -p "${log_dir}"
 [[ -x "${root_dir}/test_hip_llm" ]] || {
@@ -25,6 +25,10 @@ mkdir -p "${log_dir}"
     --bench-repeat "${repeats}" >"${log_file}" 2>&1
 
 grep -q 'Result: PASS' "${log_file}"
+grep -q "Depth prefill: ${depth} random tokens .*seed=1" "${log_file}" || {
+    echo "64K decode gate FAIL: random-token depth preparation missing" >&2
+    exit 1
+}
 mapfile -t hashes < <(grep -oE 'sequence hash=[0-9a-f]+' "${log_file}" | sed 's/.*=//')
 if (( ${#hashes[@]} != repeats )) ||
    [[ "$(printf '%s\n' "${hashes[@]}" | sort -u | wc -l)" -ne 1 ]]; then
@@ -44,5 +48,5 @@ awk -v got="${minimum}" -v want="${floor_tps}" 'BEGIN { exit !(got + 0 >= want +
     exit 1
 }
 
-grep -E '^=== Bench:|^Decode:|^VRAM:' "${log_file}"
+grep -E '^Depth prefill: [0-9]+ random tokens|^=== Bench:|^Decode:|^VRAM:' "${log_file}"
 echo "64K decode gate PASS: ${minimum} tok/s >= ${floor_tps} tok/s; hash=${hashes[0]}"

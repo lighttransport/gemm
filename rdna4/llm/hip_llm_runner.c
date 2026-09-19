@@ -32376,30 +32376,6 @@ void hip_llm_reset_state(hip_llm_runner *r) {
     }
 }
 
-int hip_llm_prepare_dummy_kv(hip_llm_runner *r, int depth) {
-    if (!r || !r->weights_loaded || depth < 0 || depth >= r->max_seq_len ||
-        !r->is_hybrid || !r->kv_quantized || !r->d_key_cache ||
-        !r->d_value_cache || !r->d_key_cache_scale || !r->d_value_cache_scale)
-        return -1;
-    if (r->stream && hipStreamSynchronize(r->stream) != hipSuccess) return -1;
-    size_t codes = (size_t)depth * r->n_kv_heads * r->head_dim;
-    size_t scales = (size_t)depth * r->n_kv_heads *
-        ((r->head_dim + 31) / 32) * sizeof(float);
-    for (int l = 0; l < r->n_layers; ++l) {
-        if (r->layers[l].is_ssm) continue;
-        size_t value_codes = r->kv_cache_type == HIP_LLM_KV_Q8_0_Q4_0 ?
-            codes / 2 : codes;
-        if (!r->d_key_cache[l] || !r->d_value_cache[l] ||
-            !r->d_key_cache_scale[l] || !r->d_value_cache_scale[l] ||
-            hipMemsetAsync(r->d_key_cache[l], 0, codes, r->stream) != hipSuccess ||
-            hipMemsetAsync(r->d_value_cache[l], 0, value_codes, r->stream) != hipSuccess ||
-            hipMemsetAsync(r->d_key_cache_scale[l], 0, scales, r->stream) != hipSuccess ||
-            hipMemsetAsync(r->d_value_cache_scale[l], 0, scales, r->stream) != hipSuccess)
-            return -1;
-    }
-    return !r->stream || hipStreamSynchronize(r->stream) == hipSuccess ? 0 : -1;
-}
-
 struct hip_llm_state_snapshot {
     int n_layers;
     void **conv_host;

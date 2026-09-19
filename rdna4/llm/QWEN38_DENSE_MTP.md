@@ -174,7 +174,7 @@ retain the preceding binary hash. No inference math changed in that rebuild.
 ## Synthetic 64K depth follow-up
 
 The 64K-offset benchmark and long-context attention scheduling are documented
-in [QWEN38_64K_DECODE.md](QWEN38_64K_DECODE.md). Ordinary IQ2 decode sustains
-27.94 tok/s. Dense NextN with draft width three reached 21.21 tok/s on the
-same zero-prefix method, with 168 accepted of 259 proposed tokens, so the MTP
-path remains opt-in at long context as well.
+in [QWEN38_64K_DECODE.md](QWEN38_64K_DECODE.md). The benchmark now processes
+random tokens through the model, matching llama-bench depth semantics. The
+older zero-cache MTP number is obsolete; MTP remains opt-in pending a new
+random-depth measurement.

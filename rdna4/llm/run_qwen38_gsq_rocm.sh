@@ -73,7 +73,7 @@ fi
 }
 selected_context="${requested_context}"
 selected_safe_context="${safe_context}"
-# Q8/Q8 dummy-depth decode was measured with 66,560 allocated rows and
+# Q8/Q8 random-depth decode was measured with 66,560 allocated rows and
 # 4.4 GiB still free for IQ2 on the 16-GiB profile. Keep the normal serving
 # default conservative while allowing the explicit 64K benchmark through.
 if [[ "${bench_depth}" =~ ^[1-9][0-9]*$ ]] && (( bench_depth <= 65536 )); then
