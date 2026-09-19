@@ -342,15 +342,25 @@ boundary as well: GGUF `output_norm.weight` versus safetensors
 `model.language_model.norm.weight`, and selected GGUF `output.weight` rows
 versus safetensors `lm_head.weight` rows. The source change is in
 `glm53f_embedding_compare.cpp`; it still reads only one row at a time and
-fits the HBM2 limit. Jobs 51786010, 51786102, 51786161, 51786195, and
-51786434 rebuilt the native A64FX llama.cpp component successfully, but the
-standalone comparator link was blocked by the Fugaku image's
-`libllama-common.so` unresolved `common_params_sampling::~common_params_sampling()`
-dependency. Job 51786895 also tried a linker group and reached the same link
-failure. No terminal head/norm values are claimed from those jobs; the
-previous four-token embedding measurements above remain the verified result.
-The next run should add this comparator as a CMake target so llama.cpp's
-transitive link dependencies are resolved by its build system.
+fits the HBM2 limit. The repo-local CMake wrapper is
+`a64fx/glm5/compare/CMakeLists.txt`; use `BUILD_SHARED_LIBS=OFF` on Fugaku
+because the shared build exposes an unresolved `common_params_sampling`
+destructor in this image. Job 51787360 built and ran the static target on one
+A64FX node and produced:
+
+```text
+GLM53F_NORM_COMPARE token=-1 ... rel_l2=0 max_abs=0 MATCH
+token=1      embed rel_l2=0.0364667797  head rel_l2=0.073792577  DIFFERENT
+token=42     embed rel_l2=0.03640382    head rel_l2=0.0713734826 DIFFERENT
+token=1234   embed rel_l2=0.0358545767  head rel_l2=0.0720562673 DIFFERENT
+token=154822 embed rel_l2=0.0352607695  head rel_l2=0.0717283678 DIFFERENT
+```
+
+This proves the final norm is representation-identical, while both the input
+embedding and vocabulary head are independently quantization-divergent. Full
+final-token equality therefore requires aligning those two boundary weights
+and the remaining safetensors/GGUF trunk weights; it cannot be fixed by the
+embedding loader alone.
 
 Job 51766725 repeated the complete streamed chain with
 `GLM53F_STREAM_TOKEN=1234`, providing a third real embedding/input variant.

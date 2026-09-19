@@ -71,7 +71,9 @@ int main(int argc, char ** argv) {
         const size_t head_row_bytes = ggml_row_size(hw->tensor->type, 4096);
         const auto * nw = loader.get_weight("output_norm.weight");
         const auto * ntraits = nw ? ggml_get_type_traits(nw->tensor->type) : nullptr;
-        if (!nw || !ntraits || !ntraits->to_float) throw std::runtime_error("missing GGUF output_norm.weight dequantizer");
+        if (!nw || (nw->tensor->type != GGML_TYPE_F32 && (!ntraits || !ntraits->to_float))) {
+            throw std::runtime_error("missing GGUF output_norm.weight dequantizer");
+        }
         glm53f_st_context * st = glm53f_st_open(argv[2]);
         if (!st) throw std::runtime_error("cannot open safetensors model");
         std::vector<unsigned char> raw(row_bytes);
@@ -79,10 +81,14 @@ int main(int argc, char ** argv) {
         std::vector<float> gguf(4096), safe(4096);
         std::vector<float> head_gguf(4096), head_safe(4096);
         std::vector<float> norm_gguf(4096), norm_safe(4096);
+        const size_t norm_bytes = ggml_row_size(nw->tensor->type, 4096);
+        std::vector<unsigned char> norm_raw(norm_bytes);
         std::vector<uint16_t> bf16(safe.size());
         int failed = 0;
         if (nw->tensor->ne[0] != 4096) throw std::runtime_error("unexpected GGUF output norm width");
-        loader.load_data_range(*nw, 0, 4096 * sizeof(float), norm_gguf.data());
+        loader.load_data_range(*nw, 0, norm_bytes, norm_raw.data());
+        if (nw->tensor->type == GGML_TYPE_F32) std::memcpy(norm_gguf.data(), norm_raw.data(), 4096 * sizeof(float));
+        else ntraits->to_float(norm_raw.data(), norm_gguf.data(), norm_gguf.size());
         std::vector<uint16_t> norm_bf16(norm_safe.size());
         if (glm53f_st_read(st, "model.language_model.norm.weight", 0,
                            norm_bf16.data(), norm_bf16.size() * sizeof(uint16_t))) {
