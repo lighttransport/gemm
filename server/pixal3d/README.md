@@ -78,8 +78,9 @@ and `DELETE /v1/uploads/ID` releases one immediately. Configure expiry with
 
 Run the server unit tests with `python3 -m unittest server.pixal3d.test_app`.
 When Chrome or Chromium is installed, `python3 server/pixal3d/test_browser.py`
-boots the real HTTP handler and verifies the JavaScript-rendered control and
-health surface in a headless browser.
+boots the real HTTP handler and drives the page through Chrome DevTools. It
+verifies single-view and multiview uploads, queued polling, native/reference
+downloads, PLY delivery, readiness rendering, and active-job cancellation.
 
 For multiview API requests, replace `image_b64` with `views`, an ordered array
 of 1 to 16 objects. Each object contains `image_b64`, a 4-by-4
