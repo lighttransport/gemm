@@ -75,6 +75,16 @@ typedef struct {
     /* Experimental BF16 projection GEMMs during Qwen3.5 prefill only.
      * Changes quantized projection arithmetic; decode remains unchanged. */
     int qwen35_prefill_bf16;
+    /* Opt-in graph-safe Q8/Q8 decode; arithmetic matches uncaptured decode. */
+    int qwen35_decode_graph;
+    /* Diagnostic reference arithmetic profile; whole-model parity is WIP. */
+    int qwen35_reference_math;
+    /* Native Q8/Q8 D=256 decode using the pinned gfx1201 attention order. */
+    int qwen35_native_q8_attention;
+    /* Extend native Q8/Q8 attention to prefill (also enables native decode). */
+    int qwen35_native_q8_prefill;
+    int qwen35_native_q2k; /* precise Q2_K x Q8_1 decode on gfx1201 */
+    int qwen35_native_mmvq; /* also IQ2_S, IQ3_XXS, IQ3_S with precise Q8_1 staging */
 } hip_llm_load_options;
 
 typedef struct {

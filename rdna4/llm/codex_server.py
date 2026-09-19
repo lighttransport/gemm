@@ -311,12 +311,17 @@ class Backend:
                     pass
 
     def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, repetition, min_p,
-                 prefix="", cancellation=None, on_token=None):
+                 prefix="", cancellation=None, on_token=None, seed=None,
+                 frequency=0.0, penalty_last_n=64):
         request_start = time.monotonic()
         cancellation = cancellation if cancellation is not None else threading.Event()
         prefix_payload = base64.b64encode(prefix.encode("utf-8")).decode("ascii") if prefix else "-"
         payload = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
         line = f"REQ {max_tokens} {temperature} {top_p} {top_k} {presence} {repetition} {min_p} {prefix_payload} {payload}\n"
+        if seed is not None:
+            line = (f"REQ2 {seed} {max_tokens} {temperature} {top_p} {top_k} "
+                    f"{presence} {repetition} {min_p} {frequency} {penalty_last_n} "
+                    f"{prefix_payload} {payload}\n")
         with self.lock:
             if self.proc.poll() is not None:
                 raise RuntimeError("runner exited")
@@ -536,14 +541,21 @@ class Handler(BaseHTTPRequestHandler):
                 presence = float(req.get("presence_penalty", default_presence))
                 repetition = float(req.get("repetition_penalty", 1.0))
                 min_p = float(req.get("min_p", 0.0))
+                seed = int(req["seed"]) if "seed" in req else None
+                frequency = float(req.get("frequency_penalty", 0.0))
+                penalty_last_n = int(req.get("penalty_last_n", 64))
+                if seed is None and (frequency != 0 or penalty_last_n != 64):
+                    seed = 42
             except (TypeError, ValueError):
                 self.send_json(400, {"error": {"message": "sampling parameters must be numeric", "type": "invalid_request_error"}})
                 return
             if (not math.isfinite(temp) or temp < 0 or
                     not math.isfinite(top_p) or not 0 <= top_p <= 1 or
-                    top_k < 1 or not math.isfinite(presence) or
+                    (top_k < 1 and seed is None) or not math.isfinite(presence) or
                     not math.isfinite(repetition) or repetition <= 0 or
-                    not math.isfinite(min_p) or not 0 <= min_p <= 1):
+                    not math.isfinite(min_p) or not 0 <= min_p <= 1 or
+                    not math.isfinite(frequency) or penalty_last_n < 0 or
+                    (seed is not None and (seed < 0 or seed >= 2**32 - 1 or self.coding))):
                 self.send_json(400, {"error": {"message": "invalid sampling parameters", "type": "invalid_request_error"}})
                 return
             stop_watcher = threading.Event()
@@ -605,7 +617,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 text, cached, ptok, ctok, finish = self.backend.generate(
                     prompt, limit, temp, top_p, top_k, presence, repetition, min_p, prefix, cancelled,
-                    stream_token)
+                    stream_token, seed=seed, frequency=frequency,
+                    penalty_last_n=penalty_last_n)
             finally:
                 stop_watcher.set()
                 watcher.join(timeout=0.2)

@@ -13,6 +13,20 @@ from codex_server import Backend, responses_input_messages
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_seed_uses_versioned_reference_sampler_request(self):
+        backend = Backend.__new__(Backend)
+        backend.lock = threading.Lock()
+        backend.cancel_lock = threading.Lock()
+        backend.active_cancel = None
+        backend.ready = True
+        backend.proc = SimpleNamespace(
+            poll=lambda: None, stdin=io.StringIO(),
+            stdout=io.StringIO("OK 0 1 0 stop \n"))
+        backend.generate("test", 4, .6, .95, 0, 1.5, 1.1, .05,
+                         seed=42, frequency=.2, penalty_last_n=32)
+        self.assertEqual(backend.proc.stdin.getvalue(),
+                         "REQ2 42 4 0.6 0.95 0 1.5 1.1 0.05 0.2 32 - dGVzdA==\n")
+
     def test_responses_tool_output_is_preserved(self):
         messages = responses_input_messages([
             {"role": "user", "content": "Call echo."},

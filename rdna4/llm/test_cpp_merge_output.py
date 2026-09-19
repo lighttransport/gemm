@@ -80,11 +80,12 @@ int main() {
 
 def generated_text(path):
     text = path.read_text(encoding="utf-8", errors="strict")
-    match = re.search(r"=== Generated text ===\n(.*?)\n=== end ===", text,
-                      re.S)
-    if not match:
-        raise RuntimeError(f"{path}: generated response missing")
-    body = match.group(1)
+    matches = re.findall(r"=== Generated text ===\n(.*?)\n=== end ===", text, re.S)
+    if len(matches) != 1:
+        raise RuntimeError(f"{path}: expected one complete response, found {len(matches)}")
+    body = matches[0]
+    if "Result: FAIL" in text or "GENERATION finish=error" in text:
+        raise RuntimeError(f"{path}: generation failed")
     markers = ("Ġ", "Ċ", "�", "<|im_start|>", "<|im_end|>",
                "<|endoftext|>", "```")
     leaked = [marker for marker in markers if marker in body]
@@ -106,6 +107,7 @@ def main():
     run_env = dict(os.environ)
     # LeakSanitizer cannot inspect a process under some agent sandboxes.
     run_env["ASAN_OPTIONS"] = "detect_leaks=0"
+    run_env["UBSAN_OPTIONS"] = "halt_on_error=1:print_stacktrace=1"
 
     with tempfile.TemporaryDirectory(prefix="cpp-merge-output-",
                                      dir=tmp_root) as tmp:
@@ -121,6 +123,7 @@ def main():
                 "g++", "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
                 "-pedantic", "-D_GLIBCXX_ASSERTIONS",
                 "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                "-fno-sanitize-recover=undefined",
                 str(source), "-o", str(binary),
             ], check=True)
             result = subprocess.check_output(

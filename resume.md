@@ -1,5 +1,60 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Native Q8/Q8 prefill and reference validation (2026-09-20)
+
+On RX 9070 XT / gfx1201 / ROCm 10, native Q8/Q8 attention now exceeds the
+500 tok/s warm prefill target with the existing opt-in BF16 projections:
+
+| Model / sampling | Warm prefill tok/s | Warm decode tok/s |
+|---|---:|---:|
+| IQ2_XS greedy | 551.73–552.31 | 33.25–33.27 |
+| IQ2_XS temperature 0.6, seed 42 | 551.25–551.64 | 32.80–32.85 |
+| IQ3_XXS greedy | 572.40–573.10 | 30.77–30.78 |
+| IQ3_XXS temperature 0.6, seed 42 | 572.96–573.28 | 30.43–30.48 |
+
+These are full 4096-token, 512-chunk, context-8192 requests, Q8 K **and** V.
+Repetitions reset KV and recurrent state and do not reuse prompt results.
+Timing excludes trace I/O. Cold passes are 491–508 tok/s. Both sampling modes
+match the pinned llama.cpp reference's complete token IDs, EOS and raw output
+bytes for the C++ merge task. Every timing repetition reproduces its traced
+response. All outputs pass C++17 compilation, ASan/UBSan, fixed edge cases and
+10,000 randomized cases. This establishes fixture equivalence, not general
+byte parity: full-model logits still differ and BF16 projections are approximate.
+
+The final configuration also retrieves `ZEPHYR-7319` from the first line of
+an exact 4096-token prompt on both models. All four runner/reference outputs
+are exactly those ten bytes, with identical selected tokens and EOS. This
+checks that the early prefill chunks still affect generation. Artifacts:
+`tmp/qwen38/final-native-retrieval/`.
+
+New controls: `--sampling-profile llama`, `--qwen35-decode-graph`,
+`--qwen35-native-q8-attn`, `--qwen35-native-q8-prefill`, and diagnostic
+`--qwen35-reference-math`. `--qwen35-native-mmvq` enables native Q2_K, IQ2_S,
+IQ3_XXS and IQ3_S decode; `--qwen35-native-q2k` isolates Q2_K. The native
+matrix-vector kernels and quantizer pass 1,609,728 activation and 1,239,732
+output comparisons against actual reference kernels. Normal generation stops at EOS; use the explicit
+`--bench-ignore-eos` only for synthetic timing. Native attention eliminates
+the repeated Q8-to-F16 expansion and follows the pinned reference's Q8_1
+query quantization, half2 arithmetic and split reductions. Its standalone
+test passes 39,536,640 bitwise comparisons against actual llama.cpp HIP kernels.
+The independent sampler passes 13,801,002 exact comparisons against libllama.
+Graph replay before changing attention matches uncaptured logits bitwise.
+
+Reproduction and remaining work: [QWEN38_REFERENCE_VALIDATION.md](rdna4/llm/QWEN38_REFERENCE_VALIDATION.md).
+Reference source is pinned to `1859b520910af6f682256fd7299797774111a27a`, exported
+and checked without changing the external checkout. Full manifests and traces:
+`tmp/qwen38/final-iq2-native-mmvq-v2/` and `final-iq3-native-mmvq-v2/`.
+IQ2 reuses the audited reference artifacts from `final-iq2-native-q2k/`;
+the harness verifies model, prompt, reference hashes and exact sampler commands.
+Attention-only baselines remain in `final-iq2-native-prefill/` and
+`final-iq3-native-prefill/` (25.6–26.0 tok/s decode).
+The validation script includes the exact 4096-token C++ prompt by default.
+
+Decode 40 tok/s, dense NextN/MTP 60 tok/s, and general byte parity remain open.
+The existing Qwen4 MoE/HC MTP implementation is incompatible with the dense
+27B sidecar. The pinned graph passes the **post-output-norm** hidden vector
+to NextN. Do not use the earlier pre-norm assumption.
+
 ## Latest validation: matched C++ coding output (2026-09-19)
 
 An exact 4,096-token prompt asked for a C++17 `merge_intervals` function and
