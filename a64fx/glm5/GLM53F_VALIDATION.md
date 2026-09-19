@@ -312,6 +312,16 @@ either feed the custom runner the same Q2 GGUF embedding/output rows or use a
 llama.cpp reference built from the same BF16 safetensors weights; the current
 token-1234 gate is explicitly FAIL until that alignment is implemented.
 
+Job 51783542 relaunched the bounded comparator for four inputs in one process,
+confirming that the difference is systematic rather than token-specific:
+
+```text
+token=1      rel_l2=0.0364667797 DIFFERENT
+token=42     rel_l2=0.03640382   DIFFERENT
+token=1234   rel_l2=0.0358545767 DIFFERENT
+token=154822 rel_l2=0.0352607695 DIFFERENT
+```
+
 To exercise a second real embedding/input variant, job 51760204 used an
 explicit in-job `GLM53F_STREAM_TOKEN=42` wrapper. Its layer-0 hash differed
 from token 1 (`ed0ec7e7ff5637b3` versus `e79ad917bd8c1afd`), all 45 trunk
