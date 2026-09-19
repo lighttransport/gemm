@@ -119,7 +119,9 @@ static void bench_one(swfp4fp8_context *ctx, swfp4fp8_format f,
     for(size_t i=0;i<m*sh->k;++i)a[i]=((int)(mix32((uint32_t)i)%1024)-512)/4096.f;
     swfp4fp8_kernel kernel=lossy==1?SWFP4FP8_KERNEL_FP8_FTZ:
                             lossy==2?SWFP4FP8_KERNEL_FP4_SDOT:
-                            lossy==3?SWFP4FP8_KERNEL_ROW:SWFP4FP8_KERNEL_AUTO;
+                            lossy==3?SWFP4FP8_KERNEL_ROW:
+                            lossy==4?SWFP4FP8_KERNEL_MXFP4_FUSED_SDOT:
+                            SWFP4FP8_KERNEL_AUTO;
     swfp4fp8_gemm_f32(ctx,w,a,sh->k,c,sh->n,m,kernel);
     double t[7];
     for(int r=0;r<7;++r){double t0=now_sec();swfp4fp8_gemm_f32(ctx,w,a,sh->k,c,sh->n,m,kernel);t[r]=now_sec()-t0;}
@@ -132,16 +134,50 @@ static void bench_one(swfp4fp8_context *ctx, swfp4fp8_format f,
     free(a);free(c);swfp4fp8_matrix_destroy(w);
 }
 
+static void bench_ffn(swfp4fp8_context *ctx, int threads, double ceiling) {
+    const size_t d = 4096, h = 8192;
+    swfp4fp8_matrix *gate = NULL, *up = NULL, *down = NULL;
+    if (make_matrix(ctx, &gate, SWFP4FP8_MXFP4_G32, h, d) ||
+        make_matrix(ctx, &up, SWFP4FP8_MXFP4_G32, h, d) ||
+        make_matrix(ctx, &down, SWFP4FP8_MXFP4_G32, d, h)) {
+        fprintf(stderr, "FFN matrix allocation failed\n"); exit(2);
+    }
+    float *x = malloc(d * sizeof(*x)), *y = malloc(d * sizeof(*y));
+    float *scratch = malloc(2 * h * sizeof(*scratch));
+    if (!x || !y || !scratch) { fprintf(stderr, "FFN buffer allocation failed\n"); exit(2); }
+    for (size_t i = 0; i < d; ++i) x[i] = ((int)(mix32((uint32_t)i) % 1024) - 512) / 4096.f;
+    swfp4fp8_ffn_mxfp4_sdot(ctx, gate, up, down, x, y, scratch);
+    double t[7];
+    for (int r = 0; r < 7; ++r) {
+        double t0 = now_sec();
+        swfp4fp8_ffn_mxfp4_sdot(ctx, gate, up, down, x, y, scratch);
+        t[r] = now_sec() - t0;
+    }
+    double sec = median(t, 7);
+    double bytes = (double)(swfp4fp8_matrix_bytes(gate) +
+                            swfp4fp8_matrix_bytes(up) +
+                            swfp4fp8_matrix_bytes(down));
+    printf("mxfp4-fused-ffn d=%zu h=%zu T=%d %.3f ms %.2f GB/s %.1f%%R chk=%g\n",
+           d, h, threads, sec * 1e3, bytes / sec / 1e9,
+           ceiling ? 100.0 * bytes / sec / 1e9 / ceiling : 0.0,
+           (double)y[d - 1]);
+    free(x); free(y); free(scratch);
+    swfp4fp8_matrix_destroy(gate); swfp4fp8_matrix_destroy(up);
+    swfp4fp8_matrix_destroy(down);
+}
+
 static void usage(const char *p) {
-    fprintf(stderr,"usage: %s [--quick|--full|--scaling] [--threads N]\n",p);
+    fprintf(stderr,"usage: %s [--quick|--full|--scaling|--fused|--ffn] [--threads N]\n",p);
 }
 
 int main(int argc,char **argv) {
-    int threads=48,full=0,scaling=0;
+    int threads=48,full=0,scaling=0,fused=0,ffn=0;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--quick"))full=0;
         else if(!strcmp(argv[i],"--full"))full=1;
         else if(!strcmp(argv[i],"--scaling")){full=0;scaling=1;}
+        else if(!strcmp(argv[i],"--fused")){fused=1;}
+        else if(!strcmp(argv[i],"--ffn")){ffn=1;}
         else if(!strcmp(argv[i],"--threads")&&i+1<argc)threads=atoi(argv[++i]);
         else{usage(argv[0]);return 2;}
     }
@@ -152,6 +188,15 @@ int main(int argc,char **argv) {
     double ceiling=raw_read_ceiling(threads,raw_bytes);
     printf("# A64FX SVE=%zu bits threads=%d raw_read=%.2f GB/s pool=%zu MiB\n",svcntb()*8,threads,ceiling,raw_bytes>>20);
     printf("# effective bandwidth counts one resident compressed matrix per call\n");
+    if (fused) {
+        const shape_t fs = {32768,4096,"fused-wide"};
+        bench_one(ctx, SWFP4FP8_MXFP4_G32, &fs, 1, threads, ceiling, 4);
+        swfp4fp8_context_destroy(ctx); return 0;
+    }
+    if (ffn) {
+        bench_ffn(ctx, threads, ceiling);
+        swfp4fp8_context_destroy(ctx); return 0;
+    }
     const shape_t quick[]={{5120,1536,"qkv"},{3584,5120,"expert"},{8192,4096,"a64fx-wide"}};
     const shape_t all[]={{5120,1536,"qkv"},{5120,4352,"proj"},{8704,5120,"gate"},{4096,5120,"down"},{2048,5120,"small"},{62080,5120,"lm-head"},{3584,5120,"expert"},{8192,4096,"a64fx-wide"},{32768,1024,"a64fx-qb"},{4096,8192,"a64fx-bigk"}};
     const shape_t *sh=full?all:quick;size_t nsh=scaling?1:(full?sizeof(all)/sizeof(all[0]):sizeof(quick)/sizeof(quick[0]));

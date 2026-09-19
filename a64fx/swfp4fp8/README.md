@@ -36,6 +36,14 @@ compressed representation, not the sum of the two experimental layouts.
 - `fp4-sdot`: explicitly lossy FP4 path.  E2M1 weights are represented exactly
   as doubled integers; activations are dynamically quantized to int8 per
   K=16/K=32 scale group and consumed with SVE `sdot`.
+- `mxfp4-fused-sdot`: M=1 MXFP4 path with an SDOT-native packed panel. It
+  expands E2M1 nibbles in registers and never writes expanded weights. Four
+  independent K quartets are software-pipelined, and interleaving nibble
+  indices before `tbl` reduces decoding to one lookup per quartet.
+
+`swfp4fp8_ffn_mxfp4_sdot()` composes fused gate/up projections, SwiGLU, and a
+fused down projection. Its scratch contract is `2 * intermediate_size`
+floats; input and output are single FP32 token vectors.
 
 `auto` never selects a lossy kernel.  Current A64FX measurements select the
 panel path; the row override remains useful for experiments.
@@ -48,6 +56,18 @@ make -C a64fx/swfp4fp8 test CC=fcc
 ./a64fx/swfp4fp8/bench_swfp4fp8 --quick --threads 48
 ./a64fx/swfp4fp8/bench_swfp4fp8 --scaling --threads 12
 ./a64fx/swfp4fp8/bench_swfp4fp8 --full --threads 48
+```
+
+The fused single-CMG runs use Fujitsu XOS 2 MiB pages:
+
+```sh
+LD_PRELOAD=/opt/FJSVxos/mmm/lib64/libmpg.so.1 \
+XOS_MMM_L_HPAGE_TYPE=hugetlbfs XOS_MMM_L_HUGETLB_SZ=2M \
+XOS_MMM_L_HUGE_MALLOC=1 XOS_MMM_L_FORCE_MMAP_THRESHOLD=1 \
+XOS_MMM_L_HUGETLB_FALLBACK=0 SWFP4FP8_XOS_ALLOC=1 \
+  ./a64fx/swfp4fp8/bench_swfp4fp8 --fused --threads 12
+
+# Replace --fused with --ffn for gate + up + SwiGLU + down.
 ```
 
 The Makefile uses FCC's native SVE target and routes compiler temporary files

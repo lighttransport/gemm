@@ -61,6 +61,32 @@ that shape.  FP4 SDOT was much slower (about 0.6 GB/s at 48 cores) because the
 current experiment dynamically materializes group-local int8 vectors; it is an
 accuracy/dataflow probe, not a dispatch candidate.
 
+## Fused MXFP4 SDOT and FFN
+
+The new M=1 kernel uses an SDOT-native `[N/16][K/32][8][32-byte]` layout.
+Every packed 32-byte quartet block is expanded only in SVE registers using
+`lsr`, `and`, `zip1`, one `tbl`, and `sdot`. Activation quantization is once
+per K=32 group, and E8M0 weight scales are constructed directly as FP32
+exponent bits. No expanded-weight buffer is stored.
+
+Correctness against the FP64 MXFP4 reference passes at relative L2
+`0.00294425`; the error is solely dynamic INT8 activation quantization.
+
+On one CMG with twelve cores and XOS 2 MiB pages:
+
+| benchmark | compressed bytes | median | effective bandwidth | raw read |
+|:----------|-----------------:|-------:|--------------------:|---------:|
+| fused projection, N=32768 K=4096 | 71.3 MB | 1.702 ms | **41.89 GB/s** | 225.17 GB/s |
+| fused SwiGLU FFN, d=4096 h=8192 | 53.5 MB | 1.483 ms | **36.06 GB/s** | 226.05 GB/s |
+
+This is roughly 70x faster than the old approximately 0.6 GB/s experimental
+FP4-SDOT path because the old path materialized group-local INT8 weights.
+It does **not** sustain HBM bandwidth: the projection reaches 18.6% and the
+complete FFN 16.0% of the paired read ceiling. Software-pipelining four
+quartets, halving TBL count, and putting the loop branch in the preferred
+decode slot were all measured; the E2M1 decode/permutation chain remains the
+limit rather than HBM traffic.
+
 ## Conclusions
 
 - Fresh anonymous first-touch is mandatory: recycled heap placement initially

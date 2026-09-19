@@ -25,7 +25,8 @@ typedef enum {
     SWFP4FP8_KERNEL_PANEL = 1,
     SWFP4FP8_KERNEL_ROW = 2,
     SWFP4FP8_KERNEL_FP8_FTZ = 3,
-    SWFP4FP8_KERNEL_FP4_SDOT = 4
+    SWFP4FP8_KERNEL_FP4_SDOT = 4,
+    SWFP4FP8_KERNEL_MXFP4_FUSED_SDOT = 5
 } swfp4fp8_kernel;
 
 typedef struct swfp4fp8_context swfp4fp8_context;
@@ -81,6 +82,13 @@ int swfp4fp8_gemm_f16(swfp4fp8_context *ctx,
                       const swfp4fp8_matrix *matrix,
                       const uint16_t *a, size_t lda, uint16_t *c, size_t ldc,
                       size_t m, swfp4fp8_kernel kernel);
+
+/* M=1 SwiGLU FFN: silu(gate*x) * (up*x), followed by down projection. */
+int swfp4fp8_ffn_mxfp4_sdot(swfp4fp8_context *ctx,
+                            const swfp4fp8_matrix *gate,
+                            const swfp4fp8_matrix *up,
+                            const swfp4fp8_matrix *down,
+                            const float *x, float *y, float *scratch);
 
 /* Scalar helpers are public for validation and import tooling. */
 float swfp4fp8_decode_e2m1(uint8_t code);

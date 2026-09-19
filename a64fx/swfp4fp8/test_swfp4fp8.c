@@ -159,6 +159,10 @@ static int run_tests(void) {
     rc=swfp4fp8_pack_mxfp4(ctx,&w,n,k,fp4,s32); fail|=rc;
     if(!rc){ uint8_t *u=malloc(n*k/2); swfp4fp8_unpack_codes(w,u); fail|=memcmp(u,fp4,n*k/2)!=0; free(u);
         swfp4fp8_gemm_f32(ctx,w,a,k,got,n,m,SWFP4FP8_KERNEL_PANEL); ref_fp4(ref,a,m,n,k,fp4,s32,32,1.f,1); fail|=check_close("mxfp4 native",got,ref,m*n,2e-5); swfp4fp8_matrix_destroy(w); }
+    rc=swfp4fp8_pack_mxfp4(ctx,&w,32,k,fp4,s32); fail|=rc;
+    if(!rc){ swfp4fp8_gemm_f32(ctx,w,a,k,got,32,1,SWFP4FP8_KERNEL_MXFP4_FUSED_SDOT);
+        ref_fp4(ref,a,1,32,k,fp4,s32,32,1.f,1);
+        fail|=check_close("mxfp4 fused sdot",got,ref,32,3e-2); swfp4fp8_matrix_destroy(w); }
 
     float ts[2]={256.f,128.f};
     uint8_t *f8q=malloc(nq*k),*q8=malloc(nq*k); for(size_t i=0;i<nq*k;++i){uint8_t q=(uint8_t)rng_u32();f8q[i]=((q&0x7f)==0x7f)?0x38:q;} make_qpn8(q8,f8q,nq,k);

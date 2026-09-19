@@ -27,13 +27,19 @@ struct swfp4fp8_matrix {
     size_t groups;
     uint8_t *codes;
     uint8_t *row_codes;
+    uint8_t *sdot_codes;
     uint8_t *scales8;
     float *scales32;
     size_t code_bytes;
     size_t row_code_bytes;
     size_t scale_bytes;
     float global_scale;
+    int heap_backed;
 };
+
+extern void swfp4_mxfp4_sdot_panel16(const uint8_t *, const uint8_t *,
+                                     const int8_t *, const float *, size_t,
+                                     float *);
 
 static uint32_t fp8_lut[256];
 static uint32_t e8m0_lut[256];
@@ -134,6 +140,7 @@ static void *aligned_zero(size_t bytes) {
 
 static void *mapped_zero(size_t bytes) {
     if (!bytes) return NULL;
+    if (getenv("SWFP4FP8_XOS_ALLOC")) return aligned_zero(bytes);
     void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return p == MAP_FAILED ? NULL : p;
@@ -155,9 +162,13 @@ static int matrix_alloc(swfp4fp8_matrix **out, swfp4fp8_format format,
                                  format == SWFP4FP8_MXFP4_G32 ? 2 : 1);
     w->codes = mapped_zero(w->code_bytes);
     w->row_codes = mapped_zero(w->row_code_bytes);
+    w->heap_backed = getenv("SWFP4FP8_XOS_ALLOC") != NULL;
     if (!w->codes || !w->row_codes) {
-        if (w->codes) munmap(w->codes, w->code_bytes);
-        if (w->row_codes) munmap(w->row_codes, w->row_code_bytes);
+        if (w->heap_backed) { free(w->codes); free(w->row_codes); }
+        else {
+            if (w->codes) munmap(w->codes, w->code_bytes);
+            if (w->row_codes) munmap(w->row_codes, w->row_code_bytes);
+        }
         free(w);
         return ENOMEM;
     }
@@ -307,7 +318,8 @@ int swfp4fp8_pack_mxfp4(swfp4fp8_context *ctx, swfp4fp8_matrix **out,
     if (rc) return rc;
     w->scale_bytes = (w->n_pad / 16) * w->groups * 16;
     w->scales8 = mapped_zero(w->scale_bytes);
-    if (!w->scales8) { swfp4fp8_matrix_destroy(w); return ENOMEM; }
+    w->sdot_codes = mapped_zero(w->code_bytes);
+    if (!w->scales8 || !w->sdot_codes) { swfp4fp8_matrix_destroy(w); return ENOMEM; }
     #pragma omp parallel for num_threads(ctx->nthreads) schedule(static)
     for (size_t p = 0; p < w->n_pad / 16; ++p) {
         pin_worker(ctx);
@@ -325,6 +337,17 @@ int swfp4fp8_pack_mxfp4(swfp4fp8_context *ctx, swfp4fp8_matrix **out,
                     uint8_t c1 = k1 < 16 ? sb[k1] & 15 : sb[k1 - 16] >> 4;
                     w->codes[((p * w->groups + g) * 16 + pair) * 16 + lane] =
                         c0 | (uint8_t)(c1 << 4);
+                }
+                for (size_t q = 0; q < 8; ++q) {
+                    size_t k0 = q * 4;
+                    uint8_t c0 = k0 < 16 ? sb[k0] & 15 : sb[k0 - 16] >> 4;
+                    uint8_t c1 = k0 + 1 < 16 ? sb[k0 + 1] & 15 : sb[k0 - 15] >> 4;
+                    uint8_t c2 = k0 + 2 < 16 ? sb[k0 + 2] & 15 : sb[k0 - 14] >> 4;
+                    uint8_t c3 = k0 + 3 < 16 ? sb[k0 + 3] & 15 : sb[k0 - 13] >> 4;
+                    uint8_t *dp = w->sdot_codes +
+                        ((p * w->groups + g) * 8 + q) * 32 + lane * 2;
+                    dp[0] = c0 | (uint8_t)(c1 << 4);
+                    dp[1] = c2 | (uint8_t)(c3 << 4);
                 }
             }
         }
@@ -365,10 +388,16 @@ int swfp4fp8_pack_fp8_block128(swfp4fp8_context *ctx,
 
 void swfp4fp8_matrix_destroy(swfp4fp8_matrix *w) {
     if (!w) return;
-    if (w->codes) munmap(w->codes, w->code_bytes);
-    if (w->row_codes) munmap(w->row_codes, w->row_code_bytes);
-    if (w->scales8) munmap(w->scales8, w->scale_bytes);
-    if (w->scales32) munmap(w->scales32, w->scale_bytes);
+    if (w->heap_backed) {
+        free(w->codes); free(w->row_codes); free(w->sdot_codes);
+        free(w->scales8); free(w->scales32);
+    } else {
+        if (w->codes) munmap(w->codes, w->code_bytes);
+        if (w->row_codes) munmap(w->row_codes, w->row_code_bytes);
+        if (w->sdot_codes) munmap(w->sdot_codes, w->code_bytes);
+        if (w->scales8) munmap(w->scales8, w->scale_bytes);
+        if (w->scales32) munmap(w->scales32, w->scale_bytes);
+    }
     free(w);
 }
 
@@ -583,6 +612,34 @@ static int run_fp4_sdot(swfp4fp8_context *ctx,const swfp4fp8_matrix *w,
     free(xq);free(xs);return 0;
 }
 
+static int run_mxfp4_fused_sdot(swfp4fp8_context *ctx,
+                                const swfp4fp8_matrix *w,
+                                const float *x, float *y) {
+    if (w->format != SWFP4FP8_MXFP4_G32 || !w->sdot_codes || w->n % 16)
+        return EINVAL;
+    int8_t *xq = aligned_zero(w->k);
+    float *xs = aligned_zero(w->groups * sizeof(*xs));
+    if (!xq || !xs) { free(xq); free(xs); return ENOMEM; }
+    for (size_t g = 0; g < w->groups; ++g) {
+        float ma = 0.0f;
+        for (size_t j = 0; j < 32; ++j) ma = fmaxf(ma, fabsf(x[g * 32 + j]));
+        float scale = ma > 0.0f ? ma / 127.0f : 1.0f;
+        xs[g] = 0.5f * scale;
+        for (size_t j = 0; j < 32; ++j)
+            xq[g * 32 + j] = (int8_t)lrintf(x[g * 32 + j] / scale);
+    }
+    size_t panels = w->n / 16;
+    #pragma omp parallel for num_threads(ctx->nthreads) schedule(static)
+    for (size_t p = 0; p < panels; ++p) {
+        pin_worker(ctx);
+        swfp4_mxfp4_sdot_panel16(w->sdot_codes + p * w->groups * 256,
+                                 w->scales8 + p * w->groups * 16,
+                                 xq, xs, w->groups, y + p * 16);
+    }
+    free(xq); free(xs);
+    return 0;
+}
+
 int swfp4fp8_gemm_f32(swfp4fp8_context *ctx,
                       const swfp4fp8_matrix *w,
                       const float *a, size_t lda, float *c, size_t ldc,
@@ -592,6 +649,10 @@ int swfp4fp8_gemm_f32(swfp4fp8_context *ctx,
     if(kernel==SWFP4FP8_KERNEL_FP4_SDOT){
         if(w->format!=SWFP4FP8_NVFP4_G16&&w->format!=SWFP4FP8_MXFP4_G32)return EINVAL;
         return run_fp4_sdot(ctx,w,a,lda,c,ldc,m);
+    }
+    if (kernel == SWFP4FP8_KERNEL_MXFP4_FUSED_SDOT) {
+        if (m != 1) return EINVAL;
+        return run_mxfp4_fused_sdot(ctx, w, a, c);
     }
     int ftz = kernel == SWFP4FP8_KERNEL_FP8_FTZ;
     if (ftz && w->format != SWFP4FP8_QPN8_TILE32 &&
@@ -616,6 +677,30 @@ int swfp4fp8_gemm_f32(swfp4fp8_context *ctx,
         }
     }
     return 0;
+}
+
+int swfp4fp8_ffn_mxfp4_sdot(swfp4fp8_context *ctx,
+                            const swfp4fp8_matrix *gate,
+                            const swfp4fp8_matrix *up,
+                            const swfp4fp8_matrix *down,
+                            const float *x, float *y, float *scratch) {
+    if (!ctx || !gate || !up || !down || !x || !y || !scratch ||
+        gate->format != SWFP4FP8_MXFP4_G32 ||
+        up->format != SWFP4FP8_MXFP4_G32 ||
+        down->format != SWFP4FP8_MXFP4_G32 || gate->k != up->k ||
+        gate->n != up->n || down->k != gate->n)
+        return EINVAL;
+    float *gate_out = scratch;
+    float *up_out = scratch + gate->n;
+    int rc = run_mxfp4_fused_sdot(ctx, gate, x, gate_out);
+    if (!rc) rc = run_mxfp4_fused_sdot(ctx, up, x, up_out);
+    if (rc) return rc;
+    #pragma omp parallel for num_threads(ctx->nthreads) schedule(static)
+    for (size_t i = 0; i < gate->n; ++i) {
+        float v = gate_out[i];
+        gate_out[i] = (v / (1.0f + expf(-v))) * up_out[i];
+    }
+    return run_mxfp4_fused_sdot(ctx, down, gate_out, y);
 }
 
 static float half_to_float(uint16_t h) {
@@ -695,6 +780,6 @@ const char *swfp4fp8_format_name(swfp4fp8_format f) {
 }
 
 const char *swfp4fp8_kernel_name(swfp4fp8_kernel k) {
-    static const char *names[] = {"auto", "panel", "row", "fp8-ftz", "fp4-sdot"};
-    return (unsigned)k < 5 ? names[k] : "unknown";
+    static const char *names[] = {"auto", "panel", "row", "fp8-ftz", "fp4-sdot", "mxfp4-fused-sdot"};
+    return (unsigned)k < 6 ? names[k] : "unknown";
 }
