@@ -111,6 +111,31 @@ Image preprocess(const pixal3d_image &src) {
         }
     return result;
 }
+Image preprocess_view(const pixal3d_image &src, int size) {
+    require(src.pixels && src.width > 0 && src.height > 0 && (src.channels == 3 || src.channels == 4),
+            "Expected RGB/RGBA view");
+    require(src.channels == 4 || src.mask, "RGB multiview input requires a mask");
+    require(src.width <= 16384 && src.height <= 16384, "Input view exceeds 16384 pixels per axis");
+    Image rgba{{}, src.width, src.height, 4};
+    rgba.pixels.resize(size_t(src.width) * src.height * 4);
+    bool foreground = false;
+    for (size_t i = 0; i < size_t(src.width) * src.height; ++i) {
+        uint8_t alpha = src.mask ? src.mask[i] : src.pixels[4 * i + 3];
+        foreground |= alpha > 0;
+        std::copy_n(src.pixels + i * src.channels, 3, rgba.pixels.data() + 4 * i);
+        rgba.pixels[4 * i + 3] = alpha;
+    }
+    require(foreground, "Multiview mask contains no foreground");
+    rgba = resize(rgba, size, size);
+    Image result{{}, size, size, 3};
+    result.pixels.resize(size_t(size) * size * 3);
+    for (size_t i = 0; i < size_t(size) * size; ++i)
+        for (int c = 0; c < 3; ++c) {
+            int value = rgba.pixels[4 * i + c] * rgba.pixels[4 * i + 3] + 128;
+            result.pixels[3 * i + c] = uint8_t((value + (value >> 8)) >> 8);
+        }
+    return result;
+}
 Vec image_float(const Image &image, bool normalized, bool chw) {
     require(image.channels == 3, "Expected RGB image");
     Vec x(image.pixels.size());

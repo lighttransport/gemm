@@ -49,6 +49,73 @@ extern "C" int pixal3d_project(const int32_t *coords, size_t count, int grid, in
     return 0;
 }
 
+static bool inverse4(const float *m, double *out) {
+    double a[4][8]{};
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            a[r][c] = m[4 * r + c];
+            a[r][c + 4] = r == c;
+        }
+    for (int c = 0; c < 4; ++c) {
+        int pivot = c;
+        for (int r = c + 1; r < 4; ++r)
+            if (std::abs(a[r][c]) > std::abs(a[pivot][c]))
+                pivot = r;
+        if (std::abs(a[pivot][c]) < 1e-12)
+            return false;
+        for (int k = 0; k < 8; ++k)
+            std::swap(a[c][k], a[pivot][k]);
+        double scale = a[c][c];
+        for (double &v : a[c])
+            v /= scale;
+        for (int r = 0; r < 4; ++r)
+            if (r != c) {
+                double factor = a[r][c];
+                for (int k = 0; k < 8; ++k)
+                    a[r][k] -= factor * a[c][k];
+            }
+    }
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            out[4 * r + c] = a[r][c + 4];
+    return true;
+}
+
+extern "C" int pixal3d_project_matrix(const int32_t *coords, size_t count, int grid, int image, float fov,
+                                      float mesh_scale, const float transform[16], float *xy) {
+    if (!coords || !xy || !transform || grid < 2 || image <= 0 || !std::isfinite(fov) || fov <= 0 ||
+        fov >= 3.14159265358979323846f || !std::isfinite(mesh_scale) || mesh_scale <= 0)
+        return -1;
+    double world_to_camera[16];
+    if (!inverse4(transform, world_to_camera))
+        return -1;
+    const double focal = image * .5 / std::tan(fov * .5);
+    for (size_t i = 0; i < count; ++i) {
+        if (coords[4 * i] != 0)
+            return -1;
+        double p[4] = {0, 0, 0, 1};
+        for (int a = 0; a < 3; ++a) {
+            int c = coords[4 * i + 1 + a];
+            if (c < 0 || c >= grid)
+                return -1;
+            p[a] = (2. * c / (grid - 1) - 1.) / (2. * mesh_scale);
+        }
+        // ProjGrid rotates grid (x,y,z) to Blender world (x,-z,y).
+        double world[4] = {p[0], -p[2], p[1], 1}, camera[4]{};
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c)
+                camera[r] += world_to_camera[4 * r + c] * world[c];
+        double depth = -camera[2] + 1e-8;
+        double x = focal * camera[0] / depth + image * .5;
+        double y = -focal * camera[1] / depth + image * .5;
+        xy[2 * i] = float((x + .5) / image * 2 - 1);
+        xy[2 * i + 1] = float((y + .5) / image * 2 - 1);
+        if (!std::isfinite(xy[2 * i]) || !std::isfinite(xy[2 * i + 1]))
+            return -1;
+    }
+    return 0;
+}
+
 extern "C" int pixal3d_sample_features(const float *hwc, int h, int w, int c, const float *xy, size_t count,
                                        float *out) {
     if (!hwc || !xy || !out || h < 1 || w < 1 || c < 1)

@@ -30,6 +30,12 @@ int main(void) {
     CHECK(pixal3d_project(coords, 3, 3, 8, &camera, projected) == 0);
     for (size_t i = 0; i < 6; ++i)
         CHECK(near(projected[i], expected_projection[i]));
+    const float front_view[] = {1, 0, 0, 0, 0, 0, -1, -1, 0, 1, 0, 0, 0, 0, 0, 1};
+    float matrix_projected[6];
+    CHECK(pixal3d_project_matrix(coords, 3, 3, 8, half_pi, 1, front_view, matrix_projected) == 0);
+    for (size_t i = 0; i < 6; ++i)
+        CHECK(near(matrix_projected[i], expected_projection[i]));
+    CHECK(pixal3d_project_matrix(coords, 3, 3, 8, half_pi, 1, (float[16]){0}, matrix_projected) == -1);
 
     /* Pixel center, four-pixel mean and opposite border clamps in HWC order. */
     const float features[] = {0, 10, 2, 12, 4, 14, 6, 16};
@@ -69,6 +75,7 @@ int main(void) {
     CHECK(options.vram_budget_mib == 14336 && options.decimation_target == 1000000);
     CHECK(pixal3d_create(NULL) == NULL && strlen(pixal3d_last_error(NULL)) > 0);
     CHECK(pixal3d_generate(NULL, NULL, NULL, NULL) == -1);
+    CHECK(pixal3d_generate_multiview(NULL, NULL, 0, NULL) == -1);
     pixal3d_result result = {0};
     result.vertices = malloc(3 * sizeof(float));
     CHECK(result.vertices != NULL);

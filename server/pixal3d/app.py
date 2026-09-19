@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL_DIR = Path("/mnt/disk2/models/Pixal3D")
 DEFAULT_DINOV3 = Path("/mnt/disk2/models/dinov3-vitl16/model.safetensors")
 DEFAULT_NAF = ROOT / "ref/pixal3d/weights/naf_release.safetensors"
-MAX_BODY_BYTES = 64 * 1024 * 1024
+MAX_BODY_BYTES = 256 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_GLB_BYTES = 256 * 1024 * 1024
 
@@ -79,6 +79,7 @@ class PixalServer:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.locks = {backend: threading.Lock() for backend in ("cpu", "cuda", "rocm")}
         self.reference_script = ROOT / "ref/pixal3d/upstream/inference.py"
+        self.reference_mv_script = ROOT / "ref/pixal3d/upstream/inference_mv.py"
         self.reference_launcher = ROOT / "ref/pixal3d/run.sh"
 
     def health(self) -> dict:
@@ -93,6 +94,7 @@ class PixalServer:
                 "binary": str(self.binary),
                 "gpu_library": str(lib[backend]) if backend != "cpu" else None,
                 "models_ready": model_ready(self.model_dir, self.dinov3, self.naf),
+                "multiview_ready": (self.model_dir / "pipeline_mv.json").is_file(),
             }
         return {"ok": True, "service": "pixal3d", "default_backend": self.args.backend,
                 "default_gpu_execution": self.args.gpu_execution,
@@ -103,8 +105,12 @@ class PixalServer:
         backend = request.get("backend", self.args.backend)
         if backend not in ("cpu", "cuda", "rocm"):
             raise ValueError("backend must be cpu, cuda, or rocm")
-        image = decode_b64(request.get("image_b64"), "image_b64", MAX_IMAGE_BYTES)
-        mask = decode_b64(request["mask_b64"], "mask_b64", MAX_IMAGE_BYTES) if request.get("mask_b64") else None
+        multiview = request.get("views") is not None
+        views = request.get("views") if multiview else None
+        if multiview and (not isinstance(views, list) or not 1 <= len(views) <= 16):
+            raise ValueError("views must contain 1 to 16 posed images")
+        image = None if multiview else decode_b64(request.get("image_b64"), "image_b64", MAX_IMAGE_BYTES)
+        mask = None if multiview else (decode_b64(request["mask_b64"], "mask_b64", MAX_IMAGE_BYTES) if request.get("mask_b64") else None)
         ext = str(request.get("image_ext", ".png")).lower()
         if ext not in (".png", ".jpg", ".jpeg", ".webp"):
             ext = ".png"
@@ -117,16 +123,35 @@ class PixalServer:
             raise ValueError("threads must be between 0 and 1024")
         with self.locks[backend], tempfile.TemporaryDirectory(prefix="request-", dir=self.work_dir) as td:
             run_dir = Path(td)
-            image_path = run_dir / ("input" + ext)
             output_path = run_dir / "output.glb"
-            image_path.write_bytes(image)
             mask_path = None
-            if mask is not None:
-                mask_path = run_dir / "mask.png"
-                mask_path.write_bytes(mask)
-            cmd = [str(self.binary), "--backend", backend, "--input", str(image_path), "--output", str(output_path),
-                   "--fov", str(fov), "--distance", str(distance), "--mesh-scale", str(mesh_scale), "--seed", str(seed),
-                   "--model-dir", str(self.model_dir), "--dinov3", str(self.dinov3), "--naf", str(self.naf)]
+            if multiview:
+                frames = []
+                for index, item in enumerate(views):
+                    if not isinstance(item, dict):
+                        raise ValueError("each view must be an object")
+                    data = decode_b64(item.get("image_b64"), f"views[{index}].image_b64", MAX_IMAGE_BYTES)
+                    name = f"view{index:02d}.png"
+                    (run_dir / name).write_bytes(data)
+                    matrix = item.get("transform_matrix")
+                    if not (isinstance(matrix, list) and len(matrix) == 4 and all(isinstance(row, list) and len(row) == 4 for row in matrix)):
+                        raise ValueError(f"views[{index}].transform_matrix must be 4x4")
+                    frame = {"file_path": name, "transform_matrix": matrix}
+                    if item.get("fov") is not None:
+                        frame["camera_angle_x"] = finite_number(item["fov"], f"views[{index}].fov", 0.05, 3.14)
+                    frames.append(frame)
+                (run_dir / "transforms.json").write_text(json.dumps({"camera_angle_x": fov, "mesh_scale": mesh_scale, "frames": frames}))
+                cmd = [str(self.binary), "--backend", backend, "--views-dir", str(run_dir), "--output", str(output_path),
+                       "--seed", str(seed), "--model-dir", str(self.model_dir), "--dinov3", str(self.dinov3), "--naf", str(self.naf)]
+            else:
+                image_path = run_dir / ("input" + ext)
+                image_path.write_bytes(image)
+                if mask is not None:
+                    mask_path = run_dir / "mask.png"
+                    mask_path.write_bytes(mask)
+                cmd = [str(self.binary), "--backend", backend, "--input", str(image_path), "--output", str(output_path),
+                       "--fov", str(fov), "--distance", str(distance), "--mesh-scale", str(mesh_scale), "--seed", str(seed),
+                       "--model-dir", str(self.model_dir), "--dinov3", str(self.dinov3), "--naf", str(self.naf)]
             execution = request.get("gpu_execution", self.args.gpu_execution)
             kernels = request.get("gpu_kernels", self.args.gpu_kernels)
             flow_precision = request.get("gpu_flow_precision", self.args.gpu_flow_precision)
@@ -173,6 +198,8 @@ class PixalServer:
         backend = request.get("backend", self.args.backend)
         if backend not in ("cuda", "rocm"):
             raise ValueError("PyTorch reference comparison requires CUDA or ROCm")
+        if request.get("views") is not None:
+            raise ValueError("Web PyTorch comparison for multiview is not enabled; use inference_mv.py directly")
         if request.get("mask_b64"):
             raise ValueError("PyTorch reference comparison currently requires an image without a separate mask")
         image = decode_b64(request.get("image_b64"), "image_b64", MAX_IMAGE_BYTES)

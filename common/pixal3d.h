@@ -1,4 +1,4 @@
-/* Native Pixal3D single-view inference. All tuning is explicit configuration.
+/* Native Pixal3D single- and multi-view inference. All tuning is explicit configuration.
  * SPDX-License-Identifier: MIT */
 #ifndef PIXAL3D_H
 #define PIXAL3D_H
@@ -43,6 +43,12 @@ typedef struct {
     int width, height, channels;
 } pixal3d_image;
 typedef struct {
+    pixal3d_image image;
+    pixal3d_camera camera;
+    /* Row-major camera-to-world matrix. Camera looks along -Z with +Y up. */
+    float transform_matrix[16];
+} pixal3d_view;
+typedef struct {
     double elapsed_seconds;
     size_t peak_device_bytes, peak_host_bytes;
     int shape_tokens, vertices, triangles;
@@ -60,6 +66,10 @@ pixal3d_context *pixal3d_create(const pixal3d_options *options);
 const char *pixal3d_last_error(const pixal3d_context *context);
 int pixal3d_generate(pixal3d_context *context, const pixal3d_image *image, const pixal3d_camera *camera,
                      pixal3d_result *result);
+/* Frame zero defines the output orientation. Views must retain their calibrated
+ * framing; unlike single-view generation they are resized but not cropped. */
+int pixal3d_generate_multiview(pixal3d_context *context, const pixal3d_view *views, size_t view_count,
+                               pixal3d_result *result);
 /* result must be zero-initialized; free a previous result before reusing it.
  * write_glb returns -1 on error and prints the export diagnostic to stderr. */
 int pixal3d_write_glb(const char *path, const pixal3d_result *result);
@@ -71,6 +81,9 @@ void pixal3d_destroy(pixal3d_context *context);
 int pixal3d_camera_distance(float fov, float mesh_scale, float *distance);
 int pixal3d_project(const int32_t *coords, size_t count, int grid_resolution, int image_resolution,
                     const pixal3d_camera *camera, float *xy_normalized);
+int pixal3d_project_matrix(const int32_t *coords, size_t count, int grid_resolution, int image_resolution,
+                           float fov, float mesh_scale, const float transform_matrix[16],
+                           float *xy_normalized);
 int pixal3d_sample_features(const float *hwc, int height, int width, int channels, const float *xy_normalized,
                             size_t count, float *out);
 /* Returns unique coordinate count, or -1. output needs count*4 integers. */

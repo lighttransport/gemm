@@ -14,11 +14,14 @@ import psutil
 ROOT=Path(__file__).resolve().parent.parent.parent
 p=argparse.ArgumentParser()
 p.add_argument('--backend',choices=['cpu','cuda','rocm'],required=True)
-p.add_argument('--input',type=Path,required=True)
+source=p.add_mutually_exclusive_group(required=True)
+source.add_argument('--input',type=Path)
+source.add_argument('--views-dir',type=Path)
+p.add_argument('--num-views',type=int)
 p.add_argument('--mask',type=Path)
 p.add_argument('--output-dir',type=Path,required=True)
 p.add_argument('--binary',type=Path,default=ROOT/'cpu/pixal3d/pixal3d')
-p.add_argument('--fov',type=float,required=True)
+p.add_argument('--fov',type=float,default=0.857556)
 p.add_argument('--seed',type=int,default=1)
 p.add_argument('--threads',type=int,default=16)
 p.add_argument('--dump',action='store_true')
@@ -58,8 +61,13 @@ def memory(pid):
     return used,total,process
 
 a.output_dir.mkdir(parents=True,exist_ok=True)
-command=[str(a.binary),'--backend',a.backend,'--input',str(a.input),'--output',str(a.output_dir/'mesh.glb'),
-         '--fov',str(a.fov),'--seed',str(a.seed),'--threads',str(a.threads)]
+command=[str(a.binary),'--backend',a.backend,'--output',str(a.output_dir/'mesh.glb'),
+         '--seed',str(a.seed),'--threads',str(a.threads)]
+if a.input:
+    command += ['--input',str(a.input),'--fov',str(a.fov)]
+else:
+    command += ['--views-dir',str(a.views_dir)]
+    if a.num_views is not None:command += ['--num-views',str(a.num_views)]
 command+=['--gpu-execution',a.gpu_execution,'--gpu-kernels',a.gpu_kernels,
           '--gpu-flow-precision',a.gpu_flow_precision,'--vram-budget-mib',str(a.vram_budget_mib),
           '--profile-json',str(a.output_dir/'profile.json')]

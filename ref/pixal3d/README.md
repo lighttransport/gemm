@@ -318,6 +318,7 @@ Python commands through the existing per-backend `uv` environments:
 ```sh
 ref/pixal3d/run.sh cuda ref/pixal3d/validate_resident.py --backend cuda --benchmark
 ref/pixal3d/run.sh rocm ref/pixal3d/validate_resident.py --backend rocm --benchmark
+ref/pixal3d/run.sh cpu ref/pixal3d/validate_multiview.py
 ref/pixal3d/run.sh cuda ref/pixal3d/validate.py --backend cuda --flow --gpu-execution resident
 ref/pixal3d/run.sh rocm ref/pixal3d/validate_conditioning.py --backend rocm --gpu-execution resident
 ref/pixal3d/run.sh cuda ref/pixal3d/validate_decoders.py --backend cuda --stage shape --guided tmp/pixal3d/guided-shape --gpu-execution resident

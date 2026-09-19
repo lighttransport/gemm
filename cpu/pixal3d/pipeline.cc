@@ -1,5 +1,6 @@
 #include "pipeline.hh"
 #include "../../common/safetensors_writer.h"
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -50,6 +51,45 @@ static void normalize(Sparse &x, const Json &config, bool inverse) {
 struct Conditioning {
     Vec global, projected;
 };
+static void multiply4(const float *a, const float *b, float *out) {
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            out[4 * r + c] = 0;
+            for (int k = 0; k < 4; ++k)
+                out[4 * r + c] += a[4 * r + k] * b[4 * k + c];
+        }
+}
+static bool inverse4(const float *m, float *out) {
+    double a[4][8]{};
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            a[r][c] = m[4 * r + c];
+            a[r][c + 4] = r == c;
+        }
+    for (int c = 0; c < 4; ++c) {
+        int pivot = c;
+        for (int r = c + 1; r < 4; ++r)
+            if (std::abs(a[r][c]) > std::abs(a[pivot][c]))
+                pivot = r;
+        if (std::abs(a[pivot][c]) < 1e-12)
+            return false;
+        for (int k = 0; k < 8; ++k)
+            std::swap(a[c][k], a[pivot][k]);
+        double scale = a[c][c];
+        for (double &value : a[c])
+            value /= scale;
+        for (int r = 0; r < 4; ++r)
+            if (r != c) {
+                double factor = a[r][c];
+                for (int k = 0; k < 8; ++k)
+                    a[r][k] -= factor * a[c][k];
+            }
+    }
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            out[4 * r + c] = float(a[r][c + 4]);
+    return true;
+}
 struct Pipeline {
     Engine &engine;
     const pixal3d_options &options;
@@ -57,8 +97,13 @@ struct Pipeline {
     std::mt19937 random;
     std::string dumps;
     std::map<int, std::pair<Image, Vec>> dino_cache;
-    Pipeline(Engine &e, const pixal3d_options &o)
-        : engine(e), options(o), config(read_json(std::string(o.model_dir) + "/pipeline.json").at("args")),
+    bool multiview = false;
+    std::vector<Image> view512, view1024;
+    std::vector<pixal3d_camera> view_cameras;
+    std::vector<std::array<float, 16>> view_matrices;
+    Pipeline(Engine &e, const pixal3d_options &o, bool multiview = false)
+        : engine(e), options(o),
+          config(read_json(std::string(o.model_dir) + (multiview ? "/pipeline_mv.json" : "/pipeline.json")).at("args")),
           random(o.seed), dumps(o.dump_dir ? o.dump_dir : "") {}
     std::string model_path(const std::string &key) {
         return std::string(options.model_dir) + "/" + string(config.at("models").at(key)) + ".safetensors";
@@ -104,6 +149,65 @@ struct Pipeline {
         engine.record(stage + ".conditioning",
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
         return cond;
+    }
+    Conditioning conditioning(const std::vector<Image> &images, const std::vector<pixal3d_camera> &cameras,
+                              const std::vector<std::array<float, 16>> &matrices, const Coords &coords,
+                              int resolution, int target, const std::string &stage) {
+        auto started = std::chrono::steady_clock::now();
+        require(!images.empty() && images.size() == cameras.size() && images.size() == matrices.size(),
+                "Invalid multiview conditioning bundle");
+        std::fprintf(stderr, "Pixal3D %s: conditioning %zu posed views, %zu tokens\n", stage.c_str(),
+                     images.size(), coords.size() / 4);
+        Conditioning cond;
+        int rows = int(coords.size() / 4), channels = target ? 2048 : 1024;
+        cond.global.assign(5 * 1024, 0);
+        cond.projected.assign(size_t(rows) * channels, 0);
+        Weights dino_weights(options.dinov3_path);
+        std::unique_ptr<Weights> naf_weights;
+        if (target)
+            naf_weights = std::make_unique<Weights>(options.naf_path);
+        for (size_t view = 0; view < images.size(); ++view) {
+            const Image &image = images[view];
+            Vec features = dino(engine, dino_weights, image_float(image, true, true), image.width);
+            for (size_t i = 0; i < cond.global.size(); ++i)
+                cond.global[i] += features[i];
+            Vec patches(features.begin() + 5 * 1024, features.end()), xy(coords.size() / 2);
+            require(pixal3d_project_matrix(coords.data(), rows, resolution, image.width, cameras[view].fov,
+                                           cameras[view].mesh_scale, matrices[view].data(), xy.data()) == 0,
+                    "Invalid multiview camera projection");
+            Vec low(size_t(rows) * 1024);
+            int grid = image.width / 16;
+            require(pixal3d_sample_features(patches.data(), grid, grid, 1024, xy.data(), rows, low.data()) == 0,
+                    "Invalid multiview conditioning sample");
+            Vec high;
+            if (target)
+                high = naf(engine, *naf_weights, image_float(image, false, false), image.width, patches, grid,
+                           target, xy);
+#pragma omp parallel for schedule(static)
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < channels; ++c) {
+                    float value = c < 1024 ? low[size_t(r) * 1024 + c]
+                                           : high[size_t(r) * 1024 + c - 1024];
+                    cond.projected[size_t(r) * channels + c] += value;
+                }
+        }
+        float inverse_views = 1.f / images.size();
+        for (float &value : cond.global)
+            value *= inverse_views;
+#pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < cond.projected.size(); ++i)
+            cond.projected[i] *= inverse_views;
+        dump(dumps, stage + "_global", cond.global, 1024);
+        dump(dumps, stage + "_projected", cond.projected, channels, coords);
+        engine.record(stage + ".conditioning",
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+        return cond;
+    }
+    Conditioning stage_conditioning(const Image &image, const Coords &coords, int resolution, int target,
+                                    const pixal3d_camera &camera, const std::string &stage) {
+        return multiview ? conditioning(image.width == 512 ? view512 : view1024, view_cameras, view_matrices,
+                                        coords, resolution, target, stage)
+                         : conditioning(image, coords, resolution, target, camera, stage);
     }
     Sparse sample(const std::string &key, const std::string &sampler, const Coords &coords,
                   const Conditioning &cond, const std::string &stage, const Sparse *concat = nullptr) {
@@ -165,13 +269,12 @@ struct Pipeline {
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
         return x;
     }
-    void run(const pixal3d_image &source, const pixal3d_camera &camera, pixal3d_result &result) {
+    void run_prepared(const Image &image512, const Image &image1024, const pixal3d_camera &camera,
+                      pixal3d_result &result) {
         float distance;
         require(pixal3d_camera_distance(camera.fov, camera.mesh_scale, &distance) == 0,
                 "Invalid camera FOV or mesh scale");
         require(std::isfinite(camera.distance), "Camera distance must be finite");
-        Image cropped = preprocess(source), image512 = resize(cropped, 512, 512),
-              image1024 = resize(cropped, 1024, 1024);
         dump(dumps, "image512", image_float(image512, false, false), 3);
         dump(dumps, "image1024", image_float(image1024, false, false), 3);
         Coords dense(4096 * 4);
@@ -182,7 +285,7 @@ struct Pipeline {
         }
         Sparse structure;
         {
-            auto cond = conditioning(image512, dense, 16, 0, camera, "structure");
+            auto cond = stage_conditioning(image512, dense, 16, 0, camera, "structure");
             structure =
                 sample("sparse_structure_flow_model", "sparse_structure_sampler", dense, cond, "structure");
         }
@@ -211,7 +314,7 @@ struct Pipeline {
         require(!low.empty(), "Structure decoder produced no occupied voxels");
         Sparse shape_low;
         {
-            auto cond = conditioning(image512, low, 32, 512, camera, "shape512");
+            auto cond = stage_conditioning(image512, low, 32, 512, camera, "shape512");
             shape_low = sample("shape_slat_flow_model_512", "shape_slat_sampler", low, cond, "shape512");
         }
         normalize(shape_low, config.at("shape_slat_normalization"), false);
@@ -232,12 +335,12 @@ struct Pipeline {
         }
         Sparse shape;
         {
-            auto cond = conditioning(image1024, high, 64, 512, camera, "shape1024");
+            auto cond = stage_conditioning(image1024, high, 64, 512, camera, "shape1024");
             shape = sample("shape_slat_flow_model_1024", "shape_slat_sampler", high, cond, "shape1024");
         }
         Sparse texture;
         {
-            auto cond = conditioning(image1024, high, 64, 1024, camera, "texture");
+            auto cond = stage_conditioning(image1024, high, 64, 1024, camera, "texture");
             texture = sample("tex_slat_flow_model_1024", "tex_slat_sampler", high, cond, "texture", &shape);
         }
         normalize(shape, config.at("shape_slat_normalization"), false);
@@ -273,6 +376,36 @@ struct Pipeline {
         postprocess(shape_out, texture_out, options, result, &engine);
         engine.record("postprocess",
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - post_started).count());
+    }
+    void run(const pixal3d_image &source, const pixal3d_camera &camera, pixal3d_result &result) {
+        Image cropped = preprocess(source);
+        run_prepared(resize(cropped, 512, 512), resize(cropped, 1024, 1024), camera, result);
+    }
+    void run(const pixal3d_view *views, size_t count, pixal3d_result &result) {
+        require(views && count >= 1 && count <= 16, "Multiview inference requires 1 to 16 views");
+        multiview = true;
+        view512.reserve(count);
+        view1024.reserve(count);
+        view_cameras.reserve(count);
+        view_matrices.resize(count);
+        float inverse_main[16];
+        require(inverse4(views[0].transform_matrix, inverse_main), "Main camera transform is singular");
+        float main_distance = views[0].camera.distance;
+        require(std::isfinite(main_distance) && main_distance > 0, "Main multiview camera distance must be positive");
+        float front[16] = {1, 0, 0, 0, 0, 0, -1, -main_distance, 0, 1, 0, 0, 0, 0, 0, 1};
+        float aligned[16];
+        multiply4(front, inverse_main, aligned);
+        for (size_t i = 0; i < count; ++i) {
+            require(std::isfinite(views[i].camera.fov) && views[i].camera.fov > 0 &&
+                        views[i].camera.fov < 3.14159265358979323846f &&
+                        std::isfinite(views[i].camera.mesh_scale) && views[i].camera.mesh_scale > 0,
+                    "Invalid multiview camera parameters");
+            view512.push_back(preprocess_view(views[i].image, 512));
+            view1024.push_back(preprocess_view(views[i].image, 1024));
+            view_cameras.push_back(views[i].camera);
+            multiply4(aligned, views[i].transform_matrix, view_matrices[i].data());
+        }
+        run_prepared(view512[0], view1024[0], view_cameras[0], result);
     }
 };
 } // namespace px
@@ -367,6 +500,37 @@ extern "C" int pixal3d_generate(pixal3d_context *c, const pixal3d_image *image, 
             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         result->stats.peak_device_bytes = c->engine->peak();
         struct rusage usage{};
+        getrusage(RUSAGE_SELF, &usage);
+        result->stats.peak_host_bytes = size_t(usage.ru_maxrss) * 1024;
+        result->stats.vertices = result->vertex_count;
+        result->stats.triangles = result->triangle_count;
+        c->engine->record("generate", result->stats.elapsed_seconds);
+        c->engine->write_profile();
+        return 0;
+    } catch (const std::exception &e) {
+        c->error = e.what();
+        pixal3d_result_free(result);
+        return -1;
+    }
+}
+extern "C" int pixal3d_generate_multiview(pixal3d_context *c, const pixal3d_view *views, size_t count,
+                                          pixal3d_result *result) {
+    if (!c || !views || !count || !result) {
+        (c ? c->error : creation_error) = "Missing generation context, views or result";
+        return -1;
+    }
+    *result = {};
+    c->error.clear();
+    auto start = std::chrono::steady_clock::now();
+    try {
+        px::require(std::filesystem::is_regular_file(c->model + "/pipeline_mv.json"),
+                    "Missing multiview configuration: " + c->model + "/pipeline_mv.json");
+        c->engine->begin_profile();
+        px::Pipeline(*c->engine, c->options, true).run(views, count, *result);
+        result->stats.elapsed_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        result->stats.peak_device_bytes = c->engine->peak();
+        struct rusage usage {};
         getrusage(RUSAGE_SELF, &usage);
         result->stats.peak_host_bytes = size_t(usage.ru_maxrss) * 1024;
         result->stats.vertices = result->vertex_count;

@@ -107,6 +107,28 @@ cpu/pixal3d/pixal3d --backend cuda \
   --fov 0.857556 --seed 1 --output tmp/pixal3d/house.glb
 ```
 
+Posed multiview inference uses Tencent's `pipeline_mv.json` and `_mv`
+checkpoints. Supply a directory containing RGBA frames and a NeRF/Blender-style
+`transforms.json`; frame zero defines the output orientation. Each view is
+projected with `F * inverse(C0) * Ci`, then global and DINO/NAF grid features
+are averaged like the upstream multiview extractor. Calibrated framing is
+preserved, so multiview inputs are resized without foreground cropping.
+
+```sh
+cpu/pixal3d/pixal3d --backend cuda \
+  --views-dir ref/pixal3d/upstream/assets/mv_images/example \
+  --output tmp/pixal3d/multiview.glb --seed 42 \
+  --gpu-execution resident --gpu-flow-precision mixed --vram-budget-mib 7168
+```
+
+Use `--num-views N` to select the first N frames. The C API exposes the same
+path through `pixal3d_generate_multiview` and `pixal3d_view`.
+
+The four-view upstream example completed on the RTX 5060 Ti in 521.5 seconds
+with mixed precision and a 7168 MiB native budget. Peak native reservation was
+6.99 GiB. Its exported 4096-texture GLB passed mesh bounds, index, triangle,
+normal and material validation with 655,071 vertices and 961,142 triangles.
+
 Select `--backend rocm` for the RX 9070 XT or `--backend cpu` for CPU execution.
 `--device` selects the backend-local device ordinal. `--threads` controls host
 OpenMP/OpenBLAS threads. `--distance` overrides the FOV-derived camera distance;

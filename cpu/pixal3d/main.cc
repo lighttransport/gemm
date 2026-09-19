@@ -1,10 +1,12 @@
 #include "../../common/pixal3d.h"
 #include "../../common/stb_image.h"
 #include <cmath>
+#include <boost/json.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -36,20 +38,22 @@ int main(int argc, char **argv) {
     pixal3d_default_gpu_options(&gpu_options);
     std::string profile;
     pixal3d_camera camera{0, 0, 1};
-    std::string input, mask, output, model, dino, naf, dump;
+    std::string input, views_dir, mask, output, model, dino, naf, dump;
+    size_t num_views = 0;
     try {
         for (int i = 1; i < argc; ++i) {
             std::string key = argv[i];
             if (key == "--help") {
                 std::puts(
-                    "Usage: pixal3d --input RGBA.png --output mesh.glb --fov RADIANS\n"
+                    "Usage: pixal3d (--input RGBA.png --fov RADIANS | --views-dir DIR) --output mesh.glb\n"
                     "  --backend cpu|cuda|rocm  --device N  --threads N\n"
                     "  --mask MASK.png (required for RGB)  --distance FLOAT  --mesh-scale FLOAT\n"
                     "  --model-dir DIR  --dinov3 FILE  --naf FILE  --seed N\n"
                     "  --vram-budget-mib N (maximum 14336)  --dump-dir DIR\n"
                     "  --gpu-execution legacy|resident  --gpu-kernels auto|blas|mma\n"
                     "  --gpu-flow-precision bf16|fp32|mixed  --profile-json FILE\n"
-                    "Single-view Pixal3D main: 1024 cascade, BF16 flow by default, FP16 decoders, 4096 PBR textures.");
+                    "  --num-views N (use the first N frames from transforms.json)\n"
+                    "Pixal3D main: single or posed multiview 1024 cascade, BF16 flow by default, FP16 decoders.");
                 return 0;
             }
             if (++i >= argc)
@@ -57,6 +61,10 @@ int main(int argc, char **argv) {
             std::string value = argv[i];
             if (key == "--input")
                 input = value;
+            else if (key == "--views-dir")
+                views_dir = value;
+            else if (key == "--num-views")
+                num_views = integer_argument<size_t>(key, value);
             else if (key == "--output")
                 output = value;
             else if (key == "--mask")
@@ -122,11 +130,14 @@ int main(int argc, char **argv) {
             else
                 throw std::runtime_error("Unknown argument: " + key);
         }
-        if (input.empty() || output.empty() || camera.fov <= 0)
-            throw std::runtime_error("--input, --output and --fov are required; see --help");
-        float distance;
-        if (pixal3d_camera_distance(camera.fov, camera.mesh_scale, &distance))
-            throw std::runtime_error("Invalid camera FOV or mesh scale");
+        if (output.empty() || (input.empty() == views_dir.empty()) || (!views_dir.empty() && !mask.empty()) ||
+            (!input.empty() && camera.fov <= 0))
+            throw std::runtime_error("Select exactly one of --input with --fov or --views-dir; see --help");
+        if (!input.empty()) {
+            float distance;
+            if (pixal3d_camera_distance(camera.fov, camera.mesh_scale, &distance))
+                throw std::runtime_error("Invalid camera FOV or mesh scale");
+        }
         auto parent = std::filesystem::absolute(output).parent_path();
         std::filesystem::create_directories(parent);
         if (access(parent.c_str(), W_OK) || std::filesystem::is_directory(output))
@@ -139,22 +150,6 @@ int main(int argc, char **argv) {
             options.naf_path = naf.c_str();
         if (!dump.empty())
             options.dump_dir = dump.c_str();
-        pixal3d_image image{};
-        int channels;
-        std::unique_ptr<uint8_t, decltype(&stbi_image_free)> pixels(
-            stbi_load(input.c_str(), &image.width, &image.height, &channels, 0), stbi_image_free);
-        if (!pixels)
-            throw std::runtime_error(std::string("Cannot load input: ") + stbi_failure_reason());
-        image.channels = channels;
-        image.pixels = pixels.get();
-        std::unique_ptr<uint8_t, decltype(&stbi_image_free)> mask_pixels(nullptr, stbi_image_free);
-        if (!mask.empty()) {
-            int w, h, c;
-            mask_pixels.reset(stbi_load(mask.c_str(), &w, &h, &c, 1));
-            if (!mask_pixels || w != image.width || h != image.height)
-                throw std::runtime_error("Mask must match input dimensions");
-            image.mask = mask_pixels.get();
-        }
         std::unique_ptr<pixal3d_context, decltype(&pixal3d_destroy)> context(pixal3d_create(&options),
                                                                              pixal3d_destroy);
         if (!context)
@@ -163,8 +158,74 @@ int main(int argc, char **argv) {
         if (pixal3d_configure_gpu(context.get(), &gpu_options))
             throw std::runtime_error(pixal3d_last_error(context.get()));
         pixal3d_result result{};
-        if (pixal3d_generate(context.get(), &image, &camera, &result))
-            throw std::runtime_error(pixal3d_last_error(context.get()));
+        if (!input.empty()) {
+            pixal3d_image image{};
+            int channels;
+            std::unique_ptr<uint8_t, decltype(&stbi_image_free)> pixels(
+                stbi_load(input.c_str(), &image.width, &image.height, &channels, 0), stbi_image_free);
+            if (!pixels)
+                throw std::runtime_error(std::string("Cannot load input: ") + stbi_failure_reason());
+            image.channels = channels;
+            image.pixels = pixels.get();
+            std::unique_ptr<uint8_t, decltype(&stbi_image_free)> mask_pixels(nullptr, stbi_image_free);
+            if (!mask.empty()) {
+                int w, h, c;
+                mask_pixels.reset(stbi_load(mask.c_str(), &w, &h, &c, 1));
+                if (!mask_pixels || w != image.width || h != image.height)
+                    throw std::runtime_error("Mask must match input dimensions");
+                image.mask = mask_pixels.get();
+            }
+            if (pixal3d_generate(context.get(), &image, &camera, &result))
+                throw std::runtime_error(pixal3d_last_error(context.get()));
+        } else {
+            std::filesystem::path directory = views_dir;
+            std::ifstream stream(directory / "transforms.json");
+            if (!stream)
+                throw std::runtime_error("Cannot open multiview transforms.json");
+            std::string text((std::istreambuf_iterator<char>(stream)), {});
+            auto metadata = boost::json::parse(text).as_object();
+            const auto &frames = metadata.at("frames").as_array();
+            size_t count = num_views ? num_views : frames.size();
+            if (!count || count > frames.size() || count > 16)
+                throw std::runtime_error("--num-views must select between 1 and 16 available frames");
+            float scale = metadata.contains("mesh_scale") ? float(metadata.at("mesh_scale").to_number<double>()) : 1.f;
+            std::vector<pixal3d_view> views(count);
+            std::vector<std::unique_ptr<uint8_t, decltype(&stbi_image_free)>> storage;
+            storage.reserve(count);
+            for (size_t n = 0; n < count; ++n) {
+                const auto &frame = frames[n].as_object();
+                std::filesystem::path path = directory / std::string(frame.at("file_path").as_string());
+                int channels;
+                pixal3d_view &view = views[n];
+                storage.emplace_back(stbi_load(path.c_str(), &view.image.width, &view.image.height, &channels, 0),
+                                     stbi_image_free);
+                if (!storage.back() || channels != 4)
+                    throw std::runtime_error("Multiview inputs must be RGBA images: " + path.string());
+                view.image = {storage.back().get(), nullptr, view.image.width, view.image.height, channels};
+                const auto &matrix = frame.at("transform_matrix").as_array();
+                if (matrix.size() != 4)
+                    throw std::runtime_error("Expected a 4x4 transform_matrix");
+                for (int r = 0; r < 4; ++r) {
+                    const auto &row = matrix[r].as_array();
+                    if (row.size() != 4)
+                        throw std::runtime_error("Expected a 4x4 transform_matrix");
+                    for (int c = 0; c < 4; ++c)
+                        view.transform_matrix[4 * r + c] = float(row[c].to_number<double>());
+                }
+                auto fov_value = frame.if_contains("camera_angle_x");
+                if (!fov_value)
+                    fov_value = metadata.if_contains("camera_angle_x");
+                if (!fov_value)
+                    throw std::runtime_error("camera_angle_x is missing from transforms.json");
+                view.camera.fov = float(fov_value->to_number<double>());
+                view.camera.distance = std::sqrt(view.transform_matrix[3] * view.transform_matrix[3] +
+                                                 view.transform_matrix[7] * view.transform_matrix[7] +
+                                                 view.transform_matrix[11] * view.transform_matrix[11]);
+                view.camera.mesh_scale = scale;
+            }
+            if (pixal3d_generate_multiview(context.get(), views.data(), views.size(), &result))
+                throw std::runtime_error(pixal3d_last_error(context.get()));
+        }
         int rc = pixal3d_write_glb(output.c_str(), &result);
         std::printf("{\"vertices\":%d,\"triangles\":%d,\"shape_tokens\":%d,\"seconds\":%.3f,\"peak_device_"
                     "bytes\":%zu,\"peak_host_bytes\":%zu}\n",

@@ -10,6 +10,7 @@ struct Image {
 };
 Image resize(const Image &image, int width, int height);
 Image preprocess(const pixal3d_image &image);
+Image preprocess_view(const pixal3d_image &image, int size);
 Vec image_float(const Image &image, bool normalized, bool chw);
 void dump(const std::string &dir, const std::string &name, const Vec &feats, int channels,
           const Coords &coords = {});
