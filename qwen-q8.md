@@ -3291,3 +3291,49 @@ required 256-token gate retained canonical `7b86e983...` at **55.98 tok/s**,
 path for `mtp-sustained`. Since the long-run wall gain is only 0.11 tok/s, the
 next material MTP work must reduce the 68.7 ms verifier rather than continue
 micro-optimizing the 14.4 ms proposer.
+
+## Q5_K row-interleaved decode probe (2026-09-20)
+
+`a64fx/llm/bench_qwen38_kquants.c` now compares the native compact Q5_K and
+IQ4_XS decode kernels with one-time decode-oriented repacks of the real
+Qwen3.8-27B UD-Q4_K_XL projections. Build and run it on an A64FX node with:
+
+```sh
+TMPDIR=/local/u14346/codex-research \
+  make -B -C a64fx/llm qwen38_kquant_bench CC=fcc OPENMP=1
+OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  numactl --interleave=all ./a64fx/llm/build/bench_qwen38_kquants \
+  /home/u14346/models/qwen38/27b/Qwen3.8-27B-UD-Q4_K_XL.gguf 7
+```
+
+The useful layout is `packed_q5r`: groups of eight rows are interleaved by
+256-column Q5_K block, the 5-bit values are expanded once to bytes, and the
+packed scale/min metadata plus FP16 multipliers are decoded once at repack
+time. It retains the original affine Q5_K values and the existing A8 activation
+quantizer. On the 2.0 GHz one-node allocation, the layer-0 up projection fell
+from 1.100 ms for native Q5_K A8 to 0.244 ms (4.5x), and the down projection
+fell from 0.881 to 0.265 ms (3.3x). Effective original-weight bandwidth was
+251.5 and 230.9 GB/s respectively. Q5R's NRMSE against the FP32-activation
+compact-weight reference remained 0.00378/0.00367, the same as native A8; its
+difference from native A8 was about 1e-6 normalized RMS with maximum absolute
+differences of 2.62e-6/4.29e-6.
+
+The lossy row-Q8 alternatives are no longer attractive. Whole-row Q8 and
+per-64 Q8 reached similar or lower speed while increasing NRMSE to
+0.0133--0.0159 and about 0.009 respectively. Global-activation i32 accumulation
+was also neutral or slower.
+
+Use the metadata-only footprint check before integration:
+
+```sh
+./a64fx/llm/build/bench_qwen38_kquants \
+  /home/u14346/models/qwen38/27b/Qwen3.8-27B-UD-Q4_K_XL.gguf --summary
+```
+
+All 325 Q5_K tensors are structurally eligible. Replacing their 12.936 GB with
+20.581 GB of Q5R raises total tensor storage from 17.912 to 25.557 GB. This is
+nominally below 32 GB HBM, but a runtime must not retain the original anonymous
+Q5_K storage while building the cache, and it still needs to budget model
+state and scratch buffers. The benchmark therefore establishes the kernel and
+layout result only; production integration should use a baked/staged Q5R image
+or another replacement load path rather than an additive full-model cache.
