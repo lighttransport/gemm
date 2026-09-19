@@ -337,6 +337,21 @@ GLM53F_STREAM_PAYLOAD_JOB PASS job=51760204
 This run retained all 45 stage payloads and the final payload in
 `tmp/glm53f-stream-validation-51760204/graph/manifest.jsonl` (46 records).
 
+The bounded representation diagnostic was extended to inspect the terminal
+boundary as well: GGUF `output_norm.weight` versus safetensors
+`model.language_model.norm.weight`, and selected GGUF `output.weight` rows
+versus safetensors `lm_head.weight` rows. The source change is in
+`glm53f_embedding_compare.cpp`; it still reads only one row at a time and
+fits the HBM2 limit. Jobs 51786010, 51786102, 51786161, 51786195, and
+51786434 rebuilt the native A64FX llama.cpp component successfully, but the
+standalone comparator link was blocked by the Fugaku image's
+`libllama-common.so` unresolved `common_params_sampling::~common_params_sampling()`
+dependency. Job 51786895 also tried a linker group and reached the same link
+failure. No terminal head/norm values are claimed from those jobs; the
+previous four-token embedding measurements above remain the verified result.
+The next run should add this comparator as a CMake target so llama.cpp's
+transitive link dependencies are resolved by its build system.
+
 Job 51766725 repeated the complete streamed chain with
 `GLM53F_STREAM_TOKEN=1234`, providing a third real embedding/input variant.
 All 45 trunk layers again produced finite 16,384-element artifacts. The
