@@ -270,14 +270,21 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
         alpha[id] = color[5];
     }
     mark("bake");
-    inpaint(base, 3, missing, size, 3);
     std::vector<uint8_t> material(pixels * 3);
     for (size_t i = 0; i < pixels; ++i) {
         material[3 * i] = metal[i];
         material[3 * i + 1] = rough[i];
         material[3 * i + 2] = alpha[i];
     }
-    inpaint(material, 3, missing, size, 1);
+    // The two Telea solves share only the immutable missing-pixel mask.
+    // Execute them concurrently without changing either numerical path.
+#pragma omp parallel sections num_threads(2)
+    {
+#pragma omp section
+        inpaint(base, 3, missing, size, 3);
+#pragma omp section
+        inpaint(material, 3, missing, size, 1);
+    }
     for (size_t i = 0; i < pixels; ++i) {
         metal[i] = material[3 * i];
         rough[i] = material[3 * i + 1];

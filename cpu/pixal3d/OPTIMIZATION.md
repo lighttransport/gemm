@@ -74,7 +74,10 @@ hole filling plus original-mesh BVH construction 17.7 s, unwrap/normals
 adjacency reduced simplification to 27.2 s and the replay to 101.9 s (15.9%
 end-to-end). Every collapse-round face count matched, the 93.8 MB GLB remained
 byte-identical (`6d8c267b...11a8b7`), and the GLB validator passed. Texture
-baking is already a small part of total postprocessing. Reproduce with:
+baking is already a small part of total postprocessing. Running the independent
+base-color and packed material Telea solves concurrently reduced the measured
+inpaint phase from 21.6 s to 17.2 s on the same CSR build; output remained
+byte-identical. Reproduce with:
 
 ```sh
 ref/pixal3d/run.sh cpu ref/pixal3d/replay_postprocess.py \
