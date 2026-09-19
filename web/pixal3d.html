@@ -14,7 +14,7 @@ label{display:block;font-weight:650;font-size:12px;margin:10px 0 5px;color:#c6d2
 button{background:var(--accent);border:0;color:#06271f;font-weight:800;cursor:pointer}button:disabled{opacity:.55;cursor:wait}.tabs{display:flex;gap:8px;margin-bottom:14px}.tabs button{background:#18232a;color:#b8c7cc;border:1px solid var(--line)}.tabs button.active{background:var(--accent);color:#06271f}
 .drop{border:1px dashed #4b626c;border-radius:10px;padding:14px;background:#0d151a}.hint,.status{color:var(--muted);font-size:12px}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
 #preview{max-width:100%;max-height:260px;margin-top:10px;border-radius:9px;background:#080c0f}.views{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;margin-top:12px}.view-card{background:#0a1115;border:1px solid var(--line);border-radius:9px;overflow:hidden}.view-card img{display:block;width:100%;height:84px;object-fit:cover}.view-card div{padding:6px;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.run{margin-top:16px;padding:12px}.status{min-height:18px;margin-top:9px}.error{color:var(--danger)}.health{font:12px ui-monospace,monospace;color:var(--muted);white-space:pre-wrap}
+.actions{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:16px}.run{padding:12px}.cancel{width:auto;background:#3a2025;color:#ffadb4;border:1px solid #71343d}.status{min-height:18px;margin-top:9px}.error{color:var(--danger)}.health{font:12px ui-monospace,monospace;color:var(--muted);white-space:pre-wrap}
 .viewer{grid-column:1/-1}.models{display:grid;grid-template-columns:1fr 1fr;gap:12px}.model-wrap{position:relative}.model-wrap>b{display:block;margin-bottom:7px}.models model-viewer{display:block;width:100%;height:520px;background:linear-gradient(#172129,#0c1115);border-radius:10px}.stats{white-space:pre-wrap;color:var(--muted);font:12px ui-monospace,monospace;margin-top:10px}.download{display:inline-block;color:var(--accent);margin:10px 14px 0 0}.compare{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:end}
 @media(max-width:850px){.layout{grid-template-columns:1fr}.models{grid-template-columns:1fr}.grid3{grid-template-columns:1fr 1fr}.models model-viewer{height:410px}}@media(max-width:480px){.grid2,.grid3,.compare{grid-template-columns:1fr}}
 </style>
@@ -34,7 +34,7 @@ button{background:var(--accent);border:0;color:#06271f;font-weight:800;cursor:po
 </div>
 <aside>
 <section class="panel"><h2>Compute</h2><div class="grid2"><div><label>Backend</label><select id="backend"><option value="cuda">CUDA</option><option value="rocm">ROCm</option><option value="cpu">CPU</option></select></div><div><label>Device</label><input id="device" type="number" min="0" placeholder="0"></div><div><label>GPU execution</label><select id="execution"><option value="resident">Resident</option><option value="legacy">Legacy</option></select></div><div><label>GPU kernels</label><select id="kernels"><option value="auto">Automatic</option><option value="blas">Vendor BLAS</option><option value="mma">MMA / WMMA</option></select></div></div><label>Flow precision</label><select id="precision"><option value="mixed">Mixed BF16/FP32 (recommended)</option><option value="bf16">BF16</option><option value="fp32">FP32</option></select>
-<button id="run" class="run" type="submit">Generate GLB</button><div id="status" class="status"></div></section>
+<div class="actions"><button id="run" class="run" type="submit">Generate GLB</button><button id="cancel" class="cancel" type="button" hidden>Cancel</button></div><div id="status" class="status"></div></section>
 <section class="panel"><h2>Verification</h2><label><input id="reference" type="checkbox" style="width:auto"> Run pinned PyTorch reference</label><p id="reference-hint" class="hint">Available for single-view and posed multiview GPU inference.</p><div class="compare"><div><label>Display</label><select id="view"><option value="native">Native result</option><option value="side">Side by side</option><option value="overlay">Overlay</option></select></div><div id="opacity-wrap" hidden><label>Reference opacity</label><input id="opacity" type="range" min="0" max="1" step=".01" value=".5"></div></div></section>
 <section class="panel"><h2>Server</h2><div id="health" class="health">Checking…</div></section>
 </aside>
@@ -42,7 +42,7 @@ button{background:var(--accent);border:0;color:#06271f;font-weight:800;cursor:po
 </div></form>
 </main>
 <script>
-const $=id=>document.getElementById(id);let mode='single',bundle=null,objectUrl,referenceUrl,previewUrl;
+const $=id=>document.getElementById(id);let mode='single',bundle=null,objectUrl,referenceUrl,previewUrl,activeJobId;
 const basename=p=>String(p||'').replaceAll('\\','/').split('/').filter(Boolean).pop()||'';
 const fileB64=file=>new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(String(r.result).split(',')[1]);r.onerror=reject;r.readAsDataURL(file)});
 function validMatrix(m){return Array.isArray(m)&&m.length===4&&m.every(row=>Array.isArray(row)&&row.length===4&&row.every(Number.isFinite))}
@@ -57,7 +57,43 @@ $('image').onchange=()=>{const f=$('image').files[0];if(previewUrl)URL.revokeObj
 async function health(){try{const j=await(await fetch('/health')).json();$('backend').value=j.default_backend||'cuda';$('execution').value=j.default_gpu_execution||'resident';$('kernels').value=j.default_gpu_kernels||'auto';$('precision').value=j.default_gpu_flow_precision||'mixed';$('health').textContent=Object.entries(j.backends).map(([k,v])=>k.toUpperCase()+': '+(v.available&&v.models_ready?'ready':'unavailable')+(v.multiview_ready?' · multiview':'')).join('\n')}catch(e){$('health').textContent='Unavailable: '+e}}
 function applyView(){const has=Boolean(referenceUrl),view=$('view').value,pane=$('reference-pane');pane.hidden=!has||view==='native';$('opacity-wrap').hidden=!has||view!=='overlay';$('models').style.gridTemplateColumns=view==='overlay'?'1fr':'1fr 1fr';pane.style.marginTop=view==='overlay'?'-549px':'';$('reference-model').style.opacity=view==='overlay'?$('opacity').value:'1'}
 $('view').onchange=applyView;$('opacity').oninput=applyView;
-$('form').onsubmit=async e=>{e.preventDefault();const image=$('image').files[0];if(mode==='single'&&!image){$('status').innerHTML='<span class="error">Choose an input image.</span>';return}if(mode==='multi'&&!bundle){$('status').innerHTML='<span class="error">Load a valid multiview set.</span>';return}$('run').disabled=true;$('status').textContent='Preparing input…';$('stats').textContent='';$('download').hidden=true;$('reference-download').hidden=true;try{const body={backend:$('backend').value,gpu_execution:$('execution').value,gpu_kernels:$('kernels').value,gpu_flow_precision:$('precision').value,fov:Number($('fov').value),distance:Number($('distance').value),mesh_scale:Number($('scale').value),seed:Number($('seed').value),threads:Number($('threads').value),reference:$('reference').checked};if(mode==='multi'){body.views=[];for(let i=0;i<bundle.views.length;i++){const v=bundle.views[i];$('status').textContent='Encoding view '+(i+1)+' of '+bundle.views.length+'…';body.views.push({image_b64:await fileB64(v.file),transform_matrix:v.transform_matrix,...(v.fov===undefined?{}:{fov:v.fov})})}}else{body.image_b64=await fileB64(image);body.image_ext='.'+(image.name.split('.').pop()||'png').toLowerCase();const mask=$('mask').files[0];if(mask)body.mask_b64=await fileB64(mask)}if($('device').value)body.device=Number($('device').value);if($('vram').value)body.vram_budget_mib=Number($('vram').value);$('status').textContent='Running '+body.backend+' inference…';const r=await fetch('/v1/infer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'Inference failed');const toUrl=b64=>URL.createObjectURL(new Blob([Uint8Array.from(atob(b64),c=>c.charCodeAt(0))],{type:'model/gltf-binary'}));if(objectUrl)URL.revokeObjectURL(objectUrl);objectUrl=toUrl(j.glb_b64);$('model').src=objectUrl;$('download').href=objectUrl;$('download').hidden=false;if(j.reference){if(referenceUrl)URL.revokeObjectURL(referenceUrl);referenceUrl=toUrl(j.reference.glb_b64);$('reference-model').src=referenceUrl;$('reference-download').href=referenceUrl;$('reference-download').hidden=false}else referenceUrl=null;applyView();$('stats').textContent=JSON.stringify({mode,views:mode==='multi'?bundle.views.length:1,precision:body.gpu_flow_precision,stats:j.stats,profile:j.profile},null,2)+'\nElapsed: '+j.elapsed_ms+' ms'+(j.reference?'\nPyTorch reference: '+j.reference.elapsed_ms+' ms':'');$('status').textContent='Complete'}catch(err){$('status').innerHTML='<span class="error">'+String(err.message||err)+'</span>'}finally{$('run').disabled=false}};
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function runJob(body){
+  const response=await fetch('/v1/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const created=await response.json();if(!response.ok)throw new Error(created.error||'Could not queue job');
+  activeJobId=created.id;$('cancel').hidden=false;
+  for(;;){
+    const statusResponse=await fetch('/v1/jobs/'+activeJobId),job=await statusResponse.json();
+    if(!statusResponse.ok)throw new Error(job.error||'Could not read job status');
+    $('status').textContent=job.state==='queued'?'Queued · position '+job.queue_position:job.phase+'…';
+    if(job.state==='failed')throw new Error(job.error||'Inference failed');
+    if(job.state==='cancelled')throw new Error('Job cancelled');
+    if(job.state==='complete'){
+      const resultResponse=await fetch('/v1/jobs/'+activeJobId+'/result'),payload=await resultResponse.json();
+      if(!resultResponse.ok||!payload.result)throw new Error(payload.error||'Could not retrieve result');
+      return payload.result;
+    }
+    await wait(1000);
+  }
+}
+$('cancel').onclick=async()=>{if(!activeJobId)return;$('cancel').disabled=true;$('status').textContent='Cancelling…';try{await fetch('/v1/jobs/'+activeJobId,{method:'DELETE'})}finally{$('cancel').disabled=false}};
+$('form').onsubmit=async e=>{
+  e.preventDefault();const image=$('image').files[0];
+  if(mode==='single'&&!image){$('status').innerHTML='<span class="error">Choose an input image.</span>';return}
+  if(mode==='multi'&&!bundle){$('status').innerHTML='<span class="error">Load a valid multiview set.</span>';return}
+  $('run').disabled=true;$('status').textContent='Preparing input…';$('stats').textContent='';$('download').hidden=true;$('reference-download').hidden=true;
+  try{
+    const body={backend:$('backend').value,gpu_execution:$('execution').value,gpu_kernels:$('kernels').value,gpu_flow_precision:$('precision').value,fov:Number($('fov').value),distance:Number($('distance').value),mesh_scale:Number($('scale').value),seed:Number($('seed').value),threads:Number($('threads').value),reference:$('reference').checked};
+    if(mode==='multi'){body.views=[];for(let i=0;i<bundle.views.length;i++){const v=bundle.views[i];$('status').textContent='Encoding view '+(i+1)+' of '+bundle.views.length+'…';body.views.push({image_b64:await fileB64(v.file),transform_matrix:v.transform_matrix,...(v.fov===undefined?{}:{fov:v.fov})})}}
+    else{body.image_b64=await fileB64(image);body.image_ext='.'+(image.name.split('.').pop()||'png').toLowerCase();const mask=$('mask').files[0];if(mask)body.mask_b64=await fileB64(mask)}
+    if($('device').value)body.device=Number($('device').value);if($('vram').value)body.vram_budget_mib=Number($('vram').value);
+    const j=await runJob(body),toUrl=b64=>URL.createObjectURL(new Blob([Uint8Array.from(atob(b64),c=>c.charCodeAt(0))],{type:'model/gltf-binary'}));
+    if(objectUrl)URL.revokeObjectURL(objectUrl);objectUrl=toUrl(j.glb_b64);$('model').src=objectUrl;$('download').href=objectUrl;$('download').hidden=false;
+    if(j.reference){if(referenceUrl)URL.revokeObjectURL(referenceUrl);referenceUrl=toUrl(j.reference.glb_b64);$('reference-model').src=referenceUrl;$('reference-download').href=referenceUrl;$('reference-download').hidden=false}else referenceUrl=null;
+    applyView();$('stats').textContent=JSON.stringify({mode,views:mode==='multi'?bundle.views.length:1,precision:body.gpu_flow_precision,stats:j.stats,profile:j.profile},null,2)+'\nElapsed: '+j.elapsed_ms+' ms'+(j.reference?'\nPyTorch reference: '+j.reference.elapsed_ms+' ms':'');$('status').textContent='Complete';
+  }catch(err){$('status').innerHTML='<span class="error">'+String(err.message||err)+'</span>'}
+  finally{activeJobId=null;$('run').disabled=false;$('cancel').hidden=true}
+};
 setMode('single');health();
 </script>
 </body></html>
