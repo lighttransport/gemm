@@ -153,8 +153,19 @@ The modes are exposed by the CLI as `--gpu-flow-precision bf16|mixed|fp32`; BF16
 the default for memory and throughput, with `mixed` providing the recommended
 quality/speed tradeoff. Reproduce the isolated experiment with
 `validate_flow_precision.py --stage structure --precision bf16|mixed|fp32`. Full
-twelve-step cascade accuracy and VRAM cost should be measured before making
-FP32 the default.
+twelve-step structure sampling from identical native noise and conditioning
+was also compared to an FP32 PyTorch sampler on the RTX 5060 Ti. Mixed mode
+measured NRMSE `0.0000711`, cosine `0.9999999975`, and max absolute error
+`0.001858`, passing the `<0.001` trajectory target without switching its BF16
+GEMMs or self-attention to FP32. Reproduce with:
+
+```sh
+ref/pixal3d/run.sh cuda ref/pixal3d/validate_mixed_trajectory.py \
+  --dump-dir tmp/pixal3d/resident-runs/cuda-house/dumps
+```
+
+The remaining cascade stages still require the same matched mixed/FP32
+trajectory check before making a broader full-generation accuracy claim.
 
 Reproduce each row with the same recorded dumps:
 
