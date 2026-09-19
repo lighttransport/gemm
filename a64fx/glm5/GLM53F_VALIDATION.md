@@ -734,3 +734,65 @@ to 1.33%; this is consistent with quantization error in the KDA projection
 chain rather than a recurrence or tensor-layout bug. Logs and artifacts are
 under `tmp/glm53f-q2-sublayer-51808558/` and
 `tmp/glm53f-q2-sublayer-51808940/`.
+
+### Token-1234 full-chain and first MLA localization
+
+Job 51810689 streamed token 1234 through all 45 GGUF trunk layers on one
+A64FX node, retaining every 16,384-element layer stream. All values were
+finite. The terminal custom projection agreed with llama.cpp to
+`1.76643041e-7` relative L2 and both selected token 29656. The fully patched
+12-node production run instead selected token 2, so the current Q2 conversion
+is **not** terminal-token equivalent even though its execution sentinel passes.
+
+Comparing the retained streams shows the first larger jump at the periodic MLA
+layers, not in the three leading KDA/dense layers:
+
+| Layer | Relative L2 | Note |
+| ---: | ---: | --- |
+| 0 | 0.0158535 | KDA + dense FFN |
+| 1 | 0.0149899 | KDA + dense FFN |
+| 2 | 0.0103608 | KDA + dense FFN |
+| 3 | 0.0634054 | first MLA + routed FFN |
+| 7 | 0.235688 | next MLA layer |
+| 11 | 0.517100 | next MLA layer |
+| 19 | 1.31996 | accumulated trunk divergence |
+| 44 | 1.15297 | final trunk output |
+
+Jobs 51811610 and 51811661 traced layer 3 from the retained streamed chain and
+the patched production chain respectively. Job 51811661 completed the decode
+and retained all six production artifacts; its generalized summary stopped on
+an overly strict reference-file-count assertion, so the artifacts were
+compared directly:
+
+| Layer-3 boundary | Relative L2 | Maximum absolute error |
+| --- | ---: | ---: |
+| attention input norm | 0.0111027 | 0.000923374 |
+| DSA/MLA output | 0.0167153 | 0.0339226 |
+| attention mHC post | 0.234516 | 0.160058 |
+| FFN input norm | 0.118182 | 0.559373 |
+| routed FFN output | 0.0450804 | 0.572758 |
+| layer output streams | 0.0634054 | 0.171907 |
+
+The mHC comparison used separate `post` and `pre` calls;
+`GLM53F_MHC_CHAINED` was not enabled. Its high relative value is therefore not
+a fused-mHC implementation failure. The post mix is cancellation-sensitive,
+and the ratio falls back to 6.34% at the layer output. The underlying mismatch
+enters through the compact-core conversion: llama.cpp executes GGUF Q5_K
+weights with a Q8_K activation path, while production dequantizes and then
+restages compact-core tensors as BF16 or block-128 FP8.
+
+A direct host projection probe quantified this distinction. For layer-0 Q,
+F32-dequantized Q5_K matvec differed from llama.cpp by 0.00379022 relative L2,
+BF16-restaged math by 0.00389691, and BF16 versus F32 by only 0.000925536.
+For the KDA output projection the corresponding values were 0.0123377,
+0.0124102, and 0.00162521. Thus changing BF16 compact weights to F32 would
+remove only a small part of the callback difference. Exact GGUF parity requires
+preserving the original quantized blocks and matching the Q5_K/Q8_K dot path;
+it should not be pursued by degrading the existing higher-precision matvec to
+chase a callback produced by a different arithmetic backend.
+
+The diagnostic harness thresholds were corrected from `2.0` (which labeled up
+to 200% relative error as PASS) to 0.05 for high-level streams and 0.01 for KDA
+internals. The layer-3 reference artifact count was also fixed. With these
+gates, the leading KDA validation remains green while the current layer-3/full
+chain correctly fails equivalence instead of producing a false PASS.

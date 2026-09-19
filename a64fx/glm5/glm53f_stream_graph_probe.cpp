@@ -27,7 +27,9 @@ static bool trace_name(const char * name, int layer) {
         "hc_attn_pre", "attn_norm", "kda_qkv", "kda_conv",
         "kda_q_norm", "kda_k_norm", "kda_gate", "kda_beta",
         "kda_scan_out", "kda_normed", "kda_out", "hc_attn_post",
-        "hc_ffn_pre", "ffn_norm", "ffn_out", "l_last",
+        "dsa_q_a_norm", "dsa_q_b", "dsa_kv_a_norm", "dsa_q_absorbed",
+        "dsa_kv_latent", "dsa_out", "hc_ffn_pre", "ffn_norm", "ffn_out",
+        "l_last",
     };
     if (std::strcmp(name, "hc_init") == 0) return true;
     char wanted[128];
