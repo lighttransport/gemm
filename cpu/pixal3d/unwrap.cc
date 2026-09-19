@@ -2,6 +2,7 @@
 #include "mesh.hh"
 #include "../../common/xatlas.h"
 #include <numeric>
+#include <parallel/algorithm>
 namespace px {
 using V3 = lightrt::Vec3;
 static V3 point(const Mesh &m, int i) { return V3(m.v[3 * i], m.v[3 * i + 1], m.v[3 * i + 2]); }
@@ -63,7 +64,8 @@ void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, 
             edges.push_back({(uint64_t(a) << 32) | uint32_t(b), f});
         }
     }
-    std::sort(edges.begin(), edges.end(), [](const auto &a, const auto &b) { return a.edge < b.edge; });
+    __gnu_parallel::sort(edges.begin(), edges.end(),
+                         [](const auto &a, const auto &b) { return a.edge < b.edge; });
     std::vector<Adjacency> adjacency;
     for (size_t i = 0; i < edges.size();) {
         size_t j = i + 1;

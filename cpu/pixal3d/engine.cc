@@ -115,6 +115,11 @@ Engine::Engine(const pixal3d_options &o) : threads(o.threads) {
         }
         gpu_ = api_.create(o.device, o.vram_budget_mib * 1024 * 1024);
         require(gpu_, "GPU initialization failed; verify device access and memory budget");
+        if (api_.metrics) {
+            px_device_metrics metrics{};
+            require(api_.metrics(gpu_, &metrics) == 0, api_.error(gpu_));
+            cache_limit_ = metrics.effective_budget_bytes / 2;
+        }
     } catch (...) {
         dlclose(library_);
         library_ = nullptr;

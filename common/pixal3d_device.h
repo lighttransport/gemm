@@ -3,7 +3,7 @@
 #define PIXAL3D_DEVICE_H
 #include <stddef.h>
 #include <stdint.h>
-#define PX_DEVICE_ABI 1
+#define PX_DEVICE_ABI 2
 enum px_device_op {
     PX_LINEAR,
     PX_NORM,
@@ -49,5 +49,6 @@ struct px_device_command {
 struct px_device_metrics {
     uint64_t uploads, downloads, allocations, gemms, mma_gemms, attentions, mma_attentions;
     double kernel_ms;
+    uint64_t effective_budget_bytes, active_bytes, pooled_bytes, peak_active_bytes, largest_allocation_bytes;
 };
 #endif

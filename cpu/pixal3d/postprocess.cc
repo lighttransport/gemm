@@ -3,6 +3,7 @@
 #include "mesh.hh"
 #include <filesystem>
 #include <opencv2/photo.hpp>
+#include <parallel/algorithm>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -13,25 +14,34 @@ static uint64_t packed(int x, int y, int z) {
     return uint64_t(x) | (uint64_t(y) << 21) | (uint64_t(z) << 42);
 }
 void fill_holes(Mesh &m) {
-    std::map<uint64_t, int> edges;
+    std::vector<uint64_t> edges;
+    edges.reserve(m.f.size());
     for (size_t f = 0; f < m.f.size(); f += 3)
         for (int j = 0; j < 3; ++j) {
             int a = m.f[f + j], b = m.f[f + (j + 1) % 3];
             if (a > b)
                 std::swap(a, b);
-            ++edges[(uint64_t(a) << 32) | uint32_t(b)];
+            edges.push_back((uint64_t(a) << 32) | uint32_t(b));
         }
-    std::map<int, std::vector<int>> adjacency;
-    for (const auto &e : edges)
-        if (e.second == 1) {
-            int a = int(e.first >> 32), b = uint32_t(e.first);
+    __gnu_parallel::sort(edges.begin(), edges.end());
+    std::vector<std::vector<int>> adjacency(m.numV());
+    for (size_t i = 0; i < edges.size();) {
+        size_t j = i + 1;
+        while (j < edges.size() && edges[j] == edges[i])
+            ++j;
+        if (j == i + 1) {
+            int a = int(edges[i] >> 32), b = uint32_t(edges[i]);
             adjacency[a].push_back(b);
             adjacency[b].push_back(a);
         }
+        i = j;
+    }
+    edges.clear();
+    edges.shrink_to_fit();
     std::unordered_set<int> visited;
-    for (const auto &e : adjacency) {
-        int start = e.first;
-        if (visited.count(start) || e.second.size() != 2)
+    for (size_t start_index = 0; start_index < adjacency.size(); ++start_index) {
+        int start = int(start_index);
+        if (visited.count(start) || adjacency[start].size() != 2)
             continue;
         std::vector<int> loop;
         int last = -1, current = start;
@@ -129,7 +139,15 @@ static void dump_mesh(const pixal3d_options &options, const char *name, const Me
     require(stw_save(writer.get(), path.c_str()) == 0, "Cannot save mesh dump: " + path);
 }
 void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_options &options,
-                 pixal3d_result &result) {
+                 pixal3d_result &result, Engine *profile) {
+    auto phase = std::chrono::steady_clock::now();
+    auto mark = [&](const char *name) {
+        auto now = std::chrono::steady_clock::now();
+        if (profile)
+            profile->record(std::string("postprocess.") + name,
+                            std::chrono::duration<double>(now - phase).count());
+        phase = now;
+    };
     require(shape.channels == 7 && texture.channels == 6 && shape.coords == texture.coords,
             "Invalid shape/texture decoder outputs");
     Vec decoded = shape.feats;
@@ -145,16 +163,20 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
     original.set(extracted.vertices, extracted.n_verts, extracted.triangles, extracted.n_tris);
     t2_fdg_mesh_free(&extracted);
     require(original.numF() > 0, "FDG extraction produced no faces");
+    mark("fdg");
     fill_holes(original);
     dump_mesh(options, "mesh_fdg", original);
     std::fprintf(stderr, "Pixal3D FDG: %u vertices, %u faces\n", original.numV(), original.numF());
     trellis2::ClosestPointBVH bvh;
     require(bvh.build(original.v.data(), original.numV(), original.f.data(), original.numF()),
             "Cannot build original mesh BVH");
+    mark("holes_bvh");
     Mesh mesh = remesh(original, bvh);
+    mark("remesh");
     dump_mesh(options, "mesh_remeshed", mesh);
     simplify(mesh, options.decimation_target);
     clean_for_uv(mesh);
+    mark("simplify");
     dump_mesh(options, "mesh_simplified", mesh);
     Vec vertices, uv, normals;
     std::vector<int32_t> faces, vmap;
@@ -164,6 +186,7 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
     normals.resize(vertices.size());
     for (size_t i = 0; i < vmap.size(); ++i)
         std::copy_n(original_normals.data() + size_t(vmap[i]) * 3, 3, normals.data() + i * 3);
+    mark("unwrap_normals");
     int size = options.texture_size;
     size_t pixels = size_t(size) * size;
     std::vector<int> raster(pixels, -1);
@@ -197,6 +220,7 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
                 }
             }
     }
+    mark("raster");
     std::unordered_map<uint64_t, int> index;
     index.reserve(texture.rows() * 2);
     for (int i = 0; i < texture.rows(); ++i)
@@ -245,10 +269,21 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
         rough[id] = color[4];
         alpha[id] = color[5];
     }
+    mark("bake");
     inpaint(base, 3, missing, size, 3);
-    inpaint(metal, 1, missing, size, 1);
-    inpaint(rough, 1, missing, size, 1);
-    inpaint(alpha, 1, missing, size, 1);
+    std::vector<uint8_t> material(pixels * 3);
+    for (size_t i = 0; i < pixels; ++i) {
+        material[3 * i] = metal[i];
+        material[3 * i + 1] = rough[i];
+        material[3 * i + 2] = alpha[i];
+    }
+    inpaint(material, 3, missing, size, 1);
+    for (size_t i = 0; i < pixels; ++i) {
+        metal[i] = material[3 * i];
+        rough[i] = material[3 * i + 1];
+        alpha[i] = material[3 * i + 2];
+    }
+    mark("inpaint");
     std::vector<uint8_t> rgba(pixels * 4), mr(pixels * 3);
     for (size_t i = 0; i < pixels; ++i) {
         std::copy_n(base.data() + i * 3, 3, rgba.data() + i * 4);

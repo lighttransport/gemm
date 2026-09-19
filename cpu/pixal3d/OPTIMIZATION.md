@@ -32,9 +32,48 @@ conditioning boundaries are unchanged.
   RoPE phases, and per-block global K/V are also cached, with exact value-based
   invalidation.
 
-Weights use their compute storage type. Activations currently use F32 storage
-with BF16/FP16 rounding at model boundaries. Packed activation storage and
+Weights use their compute storage type. Flow activations use F32 storage with
+BF16/FP16 rounding at model boundaries. Sparse decoder gathers are written
+directly in FP16/BF16 and consumed by GEMM without an intermediate F32 tensor
+or a second conversion allocation. More packed flow activation storage and
 additional GEMM tiling remain opportunities for further optimization.
+
+## 8 GB memory profile and exact postprocessing
+
+The allocator reports its effective budget, active and pooled bytes, peak
+active bytes, and largest allocation through private device ABI version 2.
+The scratch pool is capped at the smaller of one eighth of the device budget
+and 768 MiB; stage trims now return all pooled storage. The host weight cache
+uses the plugin's effective budget after the runtime accounts for free device
+memory, rather than the requested CLI limit. This also makes a contended run
+fail at the native budget boundary instead of relying on a driver OOM.
+
+On the RTX 5060 Ti, the complete house fixture in mixed precision succeeds
+with `--vram-budget-mib 7168`, leaving 1 GiB of an 8 GiB card outside the
+native allocator. It used 6.48 GiB peak active storage, 7.00 GiB peak reserved
+storage, and 6.88 GiB sampled process VRAM. The largest single allocation was
+1.85 GiB. The output SHA-256 is
+`e4ff6b24d5578aaa4f91334208450c76e48ce8225c0bca24837aafcc19858b35`,
+identical to the earlier mixed-precision reference.
+
+CPU mesh processing keeps exact ordering while replacing tree-based edge
+counting with sorted vectors and deterministic parallel sorts/reductions.
+The three radius-one material channels share one inpaint call. On the same
+fixture postprocessing fell from about 230 s to 175.3 s with the exact same
+GLB bytes; the complete invocation took 369.6 s. Per-command GPU events are
+disabled during normal profiling because they serialize the stream. Set the
+diagnostic environment variable `PIXAL3D_PROFILE_COMMANDS=1` when individual
+resident command timing is required.
+
+Reproduce the constrained full run with:
+
+```sh
+ref/pixal3d/run.sh cuda ref/pixal3d/run_fixture.py \
+  --backend cuda --input ref/pixal3d/upstream/assets/images/1_img.png \
+  --output-dir tmp/pixal3d/cuda-house-7168 --fov 0.857556 --seed 1 \
+  --threads 8 --gpu-execution resident --gpu-kernels auto \
+  --gpu-flow-precision mixed --vram-budget-mib 7168 --timeout 1200
+```
 
 ## Matched flow benchmark
 

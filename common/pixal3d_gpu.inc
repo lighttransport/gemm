@@ -101,7 +101,8 @@ struct Device {
     blasHandle blas{};
     gpuStream stream{};
     int ordinal = 0;
-    size_t budget = 0, live = 0, peak = 0;
+    size_t budget = 0, live = 0, peak = 0, active = 0, peak_active = 0, pool_bytes = 0, pool_limit = 0,
+           largest_allocation = 0;
     std::string error;
     bool pool_enabled = false, profile = false;
     int kernels = 0;
@@ -144,7 +145,10 @@ struct Buffer {
             if (best != d.pool.end()) {
                 p = best->first;
                 bytes = best->second;
+                d.pool_bytes -= bytes;
                 d.pool.erase(best);
+                d.active += bytes;
+                d.peak_active = std::max(d.peak_active, d.active);
                 return;
             }
             while (n > d.budget - d.live && !d.pool.empty()) {
@@ -152,6 +156,7 @@ struct Buffer {
                 d.pool.pop_back();
                 GPU(gpuFree(b.first));
                 d.live -= b.second;
+                d.pool_bytes -= b.second;
             }
         }
         if (n > d.budget - d.live)
@@ -159,14 +164,19 @@ struct Buffer {
         GPU(gpuMalloc(&p, n));
         d.metrics.allocations++;
         d.live += n;
+        d.active += n;
         d.peak = std::max(d.peak, d.live);
+        d.peak_active = std::max(d.peak_active, d.active);
+        d.largest_allocation = std::max(d.largest_allocation, n);
     }
     ~Buffer() {
         if (p) {
             (void)gpuSetDevice(d.ordinal);
-            if (d.pool_enabled) {
+            d.active -= bytes;
+            if (d.pool_enabled && bytes <= d.pool_limit - std::min(d.pool_limit, d.pool_bytes)) {
                 try {
                     d.pool.emplace_back(p, bytes);
+                    d.pool_bytes += bytes;
                     return;
                 } catch (...) {
                     // Release directly if the host cannot grow the free list.
@@ -251,6 +261,7 @@ extern "C" void *px_gpu_create(int device, size_t budget) {
         if (free <= 512ull * 1024 * 1024)
             throw std::runtime_error("Insufficient free GPU memory");
         d->budget = std::min<size_t>(budget, free - 512ull * 1024 * 1024);
+        d->pool_limit = std::min<size_t>(d->budget / 8, 768ull * 1024 * 1024);
         GPU(blasCreate(&d->blas));
         GPU(gpuStreamCreate(&d->stream));
         GPU(blasSetStream(d->blas, d->stream));

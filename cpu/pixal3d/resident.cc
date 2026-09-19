@@ -12,8 +12,10 @@ void Engine::configure(const pixal3d_gpu_options &o) {
             "Invalid GPU execution options");
     require(!o.execution || (gpu_ && api_.configure), "Resident execution requires a compatible GPU plugin");
     clear_weights();
+    const char *commands = std::getenv("PIXAL3D_PROFILE_COMMANDS");
+    bool detailed_profile = o.profile_json && *o.profile_json && commands && !std::strcmp(commands, "1");
     if (gpu_ && api_.configure)
-        require(api_.configure(gpu_, o.kernels, o.profile_json && *o.profile_json) == 0, api_.error(gpu_));
+        require(api_.configure(gpu_, o.kernels, detailed_profile) == 0, api_.error(gpu_));
     resident_ = o.execution == PIXAL3D_GPU_RESIDENT;
     kernels_ = o.kernels;
     flow_precision_ = o.flow_precision;
@@ -195,10 +197,10 @@ Tensor Engine::convolution(const Tensor &x, Weights &w, const std::string &name,
     auto out = tensor(size_t(n) * co);
     for (int start = 0; start < n; start += 2048) {
         int rows = std::min(2048, n - start);
-        auto gather = tensor(size_t(rows) * ci * 27);
-        execute({PX_GATHER, 0, rows, ci * 27, 0, 0, start, int(dense), 0, gather.get(), x.get(),
+        auto gather = tensor(size_t(rows) * ci * 27, precision);
+        execute({PX_GATHER, precision, rows, ci * 27, 0, 0, start, int(dense), 0, gather.get(), x.get(),
                  neighbors.get(), nullptr, nullptr});
-        execute({PX_LINEAR, precision, rows, co, ci * 27, 0, start, 0, 0, out.get(), gather.get(), wt.get(),
+        execute({PX_LINEAR, precision, rows, co, ci * 27, 0, start, int(precision != 0), 0, out.get(), gather.get(), wt.get(),
                  bias.get(), nullptr});
     }
     return out;
@@ -231,7 +233,11 @@ void Engine::write_profile() {
     f << "},\"h2d_bytes\":" << m.uploads << ",\"d2h_bytes\":" << m.downloads
       << ",\"allocations\":" << m.allocations << ",\"gemms\":" << m.gemms << ",\"mma_gemms\":" << m.mma_gemms
       << ",\"attentions\":" << m.attentions << ",\"mma_attentions\":" << m.mma_attentions
-      << ",\"resident_command_ms\":" << m.kernel_ms << ",\"peak_reserved_device_bytes\":" << peak() << "}\n";
+      << ",\"resident_command_ms\":" << m.kernel_ms << ",\"effective_budget_bytes\":"
+      << m.effective_budget_bytes << ",\"active_device_bytes\":" << m.active_bytes
+      << ",\"pooled_device_bytes\":" << m.pooled_bytes << ",\"peak_active_device_bytes\":"
+      << m.peak_active_bytes << ",\"largest_allocation_bytes\":" << m.largest_allocation_bytes
+      << ",\"peak_reserved_device_bytes\":" << peak() << "}\n";
     require(bool(f), "Failed writing GPU profile");
 }
 

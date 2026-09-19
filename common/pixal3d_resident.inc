@@ -189,15 +189,19 @@ __global__ void px_cross5(float *out, const float *q, const float *k, const floa
         out[size_t(row) * c + head * hd + d] = round_precision(value, precision);
     }
 }
-__global__ void px_gather(float *out, const float *x, const int *map, int start, int rows, int ci,
-                          int dense) {
+__global__ void px_gather(void *output, const float *x, const int *map, int start, int rows, int ci,
+                          int dense, int precision) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(rows) * 27 * ci)
         return;
     size_t row = i / (27 * ci), j = i % (27 * ci);
     int ch = dense ? j / 27 : j % ci, slot = dense ? j % 27 : j / ci;
     int src = map[(size_t(start) + row) * 27 + slot];
-    out[i] = src >= 0 ? x[size_t(src) * ci + ch] : 0;
+    float value = src >= 0 ? x[size_t(src) * ci + ch] : 0;
+    if (precision)
+        static_cast<unsigned short *>(output)[i] = px_pack(value, precision);
+    else
+        static_cast<float *>(output)[i] = value;
 }
 __global__ void px_c2s(float *out, const float *x, const int *parent, const int *slot, int n, int co, int ci,
                        int skip, int dense) {
@@ -385,6 +389,7 @@ extern "C" int px_gpu_trim(void *p) {
             auto block = d.pool.back();
             GPU(gpuFree(block.first));
             d.live -= block.second;
+            d.pool_bytes -= block.second;
             d.pool.pop_back();
         }
         // A later resident allocation enables pooling again. This also restores
@@ -398,19 +403,27 @@ extern "C" int px_gpu_trim(void *p) {
 }
 extern "C" int px_gpu_metrics(void *p, px_device_metrics *out) {
     auto &d = *static_cast<Device *>(p);
-    if (out)
+    if (out) {
         *out = d.metrics;
-    else {
+        out->effective_budget_bytes = d.budget;
+        out->active_bytes = d.active;
+        out->pooled_bytes = d.pool_bytes;
+        out->peak_active_bytes = d.peak_active;
+        out->largest_allocation_bytes = d.largest_allocation;
+    } else {
         d.metrics = {};
         d.peak = d.live;
+        d.peak_active = d.active;
+        d.largest_allocation = 0;
     }
     return 0;
 }
 static void px_resident_linear(Device &d, const px_device_command &op) {
     int n = op.n, co = op.c, ci = op.k;
     bool mixed = op.precision == 3;
+    bool packed_input = op.extra != 0;
     int lowp = mixed ? 1 : op.precision;
-    px_extent(op.x, size_t(n) * ci);
+    px_extent(op.x, size_t(n) * ci, packed_input ? 2 : 4);
     px_extent(op.w, size_t(co) * ci, op.precision ? 2 : 4);
     px_extent(op.out, size_t(n + op.offset) * co);
     if (op.b)
@@ -418,23 +431,29 @@ static void px_resident_linear(Device &d, const px_device_command &op) {
     float one = 1, zero = 0;
     int tile = std::min(n, 2048);
     std::unique_ptr<Buffer> packed;
-    if (op.precision)
+    if (op.precision && !packed_input)
         packed = std::make_unique<Buffer>(d, size_t(tile) * ci * 2);
     for (int start = 0; start < n; start += tile) {
         int rows = std::min(tile, n - start);
         float *x = px_float(op.x) + size_t(start) * ci,
               *out = px_float(op.out) + size_t(start + op.offset) * co;
         if (op.precision) {
-            cast_bfloat<<<(size_t(rows) * ci + 255) / 256, 256, 0, d.stream>>>(
-                (unsigned short *)packed->p, x, size_t(rows) * ci, lowp);
+            const void *input;
+            if (packed_input)
+                input = static_cast<const unsigned short *>(px_buffer(op.x).p) + size_t(start) * ci;
+            else {
+                cast_bfloat<<<(size_t(rows) * ci + 255) / 256, 256, 0, d.stream>>>(
+                    (unsigned short *)packed->p, x, size_t(rows) * ci, lowp);
+                input = packed->p;
+            }
             if (d.kernels == 2 && !mixed) {
                 px_gemm_mma<<<dim3((co + 15) / 16, (rows + 15) / 16), 32, 0, d.stream>>>(
-                    out, (const unsigned short *)packed->p, (const unsigned short *)px_buffer(op.w).p, rows,
+                    out, (const unsigned short *)input, (const unsigned short *)px_buffer(op.w).p, rows,
                     co, ci, lowp);
                 d.metrics.mma_gemms++;
             } else {
                 auto type = lowp == 1 ? BF16_TYPE : F16_TYPE;
-                GPU(blasGemmEx(d.blas, OP_T, OP_N, co, rows, ci, &one, px_buffer(op.w).p, type, ci, packed->p,
+                GPU(blasGemmEx(d.blas, OP_T, OP_N, co, rows, ci, &one, px_buffer(op.w).p, type, ci, input,
                                type, ci, &zero, out, F32_TYPE, co, COMPUTE_F32, ALGO_DEFAULT));
             }
         } else
@@ -539,7 +558,7 @@ extern "C" int px_gpu_execute(void *p, const px_device_command *command) {
             GPU(gpuEventRecord(start, d.stream));
         }
         size_t count = size_t(o.n) * o.c;
-        px_extent(o.out, count);
+        px_extent(o.out, count, o.op == PX_GATHER && o.precision ? 2 : 4);
         if (o.op == PX_PART)
             px_extent(o.x, count * o.k);
         else if ((o.op >= PX_NORM && o.op <= PX_RESIDUAL) || o.op == PX_SCALE_ADD || o.op == PX_GROUP_SILU)
@@ -595,9 +614,9 @@ extern "C" int px_gpu_execute(void *p, const px_device_command *command) {
             px_rope2<<<(size_t(o.n) * o.n * o.heads * o.c / 2 + 255) / 256, 256, 0, d.stream>>>(
                 px_float(o.out), px_float(o.x), px_float(o.w), o.n, o.heads, o.c, o.offset);
         else if (o.op == PX_GATHER)
-            px_gather<<<(count + 255) / 256, 256, 0, d.stream>>>(px_float(o.out), px_float(o.x),
+            px_gather<<<(count + 255) / 256, 256, 0, d.stream>>>(px_buffer(o.out).p, px_float(o.x),
                                                                  (const int *)px_buffer(o.w).p, o.offset, o.n,
-                                                                 o.c / 27, o.extra);
+                                                                 o.c / 27, o.extra, o.precision);
         else if (o.op == PX_C2S || o.op == PX_SKIP)
             px_c2s<<<(count + 255) / 256, 256, 0, d.stream>>>(
                 px_float(o.out), px_float(o.x), (const int *)px_buffer(o.w).p, (const int *)px_buffer(o.b).p,

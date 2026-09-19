@@ -270,7 +270,7 @@ struct Pipeline {
         result.stats.shape_tokens = shape.rows();
         engine.clear_weights();
         auto post_started = std::chrono::steady_clock::now();
-        postprocess(shape_out, texture_out, options, result);
+        postprocess(shape_out, texture_out, options, result, &engine);
         engine.record("postprocess",
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - post_started).count());
     }

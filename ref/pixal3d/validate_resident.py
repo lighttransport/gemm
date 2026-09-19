@@ -30,9 +30,9 @@ lib.px_gpu_execute.argtypes=[C.c_void_p,C.POINTER(Op)]
 lib.px_gpu_configure.argtypes=[C.c_void_p,C.c_int,C.c_int]
 lib.px_gpu_trim.argtypes=[C.c_void_p]
 class Metrics(C.Structure):
-    _fields_=[(name,C.c_uint64) for name in ['uploads','downloads','allocations','gemms','mma_gemms','attentions','mma_attentions']]+[('kernel_ms',C.c_double)]
+    _fields_=[(name,C.c_uint64) for name in ['uploads','downloads','allocations','gemms','mma_gemms','attentions','mma_attentions']]+[('kernel_ms',C.c_double)]+[(name,C.c_uint64) for name in ['effective_budget_bytes','active_bytes','pooled_bytes','peak_active_bytes','largest_allocation_bytes']]
 lib.px_gpu_metrics.argtypes=[C.c_void_p,C.POINTER(Metrics)]
-assert lib.px_gpu_device_version()==1
+assert lib.px_gpu_device_version()==2
 d=lib.px_gpu_create(0,1024**3)
 assert d
 assert lib.px_gpu_configure(d,['auto','blas','mma'].index(a.kernels),0)==0
@@ -115,7 +115,11 @@ try:
         free()
     assert lib.px_gpu_metrics(d,C.byref(after))==0
     assert after.allocations-before.allocations==1, 'Repeated workspace should be reused'
+    assert after.effective_budget_bytes==1024**3 and after.active_bytes==0
+    assert after.pooled_bytes>0 and after.peak_active_bytes>=4 and after.largest_allocation_bytes>=4
     assert lib.px_gpu_trim(d)==0
+    trimmed=Metrics();assert lib.px_gpu_metrics(d,C.byref(trimmed))==0
+    assert trimmed.active_bytes==0 and trimmed.pooled_bytes==0
     print('Resident kernel validation PASS',flush=True)
 finally:
     free();lib.px_gpu_destroy(d)

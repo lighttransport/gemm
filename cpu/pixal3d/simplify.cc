@@ -1,6 +1,7 @@
 /* CPU port of CuMesh's parallel midpoint QEM collapse scheduling. */
 #include "mesh.hh"
 #include <numeric>
+#include <parallel/algorithm>
 namespace px {
 using V3 = lightrt::Vec3;
 static V3 vertex(const Mesh &m, int i) {
@@ -42,7 +43,7 @@ void simplify(Mesh &m, int target) {
                         qem[id][k++] += p[i] * p[j];
             }
         }
-        std::sort(edges.begin(), edges.end());
+        __gnu_parallel::sort(edges.begin(), edges.end());
         std::vector<uint8_t> boundary(nv);
         for (size_t i = 0; i < edges.size();) {
             size_t j = i + 1;
@@ -106,13 +107,20 @@ void simplify(Mesh &m, int target) {
             return (uint64_t(u) << 32) | uint32_t(i);
         };
         std::vector<uint64_t> best(nf, UINT64_MAX);
+        auto atomic_min = [](uint64_t *dst, uint64_t value) {
+            uint64_t old = __atomic_load_n(dst, __ATOMIC_RELAXED);
+            while (value < old &&
+                   !__atomic_compare_exchange_n(dst, &old, value, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            }
+        };
+#pragma omp parallel for schedule(static)
         for (size_t i = 0; i < edges.size(); ++i) {
             uint64_t p = packed(i);
             int a = int(edges[i] >> 32), b = uint32_t(edges[i]);
             for (int f : adjacent[a])
-                best[f] = std::min(best[f], p);
+                atomic_min(&best[f], p);
             for (int f : adjacent[b])
-                best[f] = std::min(best[f], p);
+                atomic_min(&best[f], p);
         }
         std::vector<int> mapping(nv);
         std::iota(mapping.begin(), mapping.end(), 0);

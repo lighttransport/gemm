@@ -15,5 +15,5 @@ void dump(const std::string &dir, const std::string &name, const Vec &feats, int
           const Coords &coords = {});
 Json read_json(const std::string &path);
 void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_options &options,
-                 pixal3d_result &result);
+                 pixal3d_result &result, Engine *profile = nullptr);
 } // namespace px
