@@ -445,7 +445,7 @@ extern "C" void pixal3d_default_options(pixal3d_options *o) {
         return;
     *o = {};
     o->threads = 16;
-    o->vram_budget_mib = 14336;
+    o->vram_budget_mib = 12288;
     o->model_dir = "/mnt/disk2/models/Pixal3D";
     o->dinov3_path = "/mnt/disk2/models/dinov3-vitl16/model.safetensors";
     o->naf_path = "ref/pixal3d/weights/naf_release.safetensors";

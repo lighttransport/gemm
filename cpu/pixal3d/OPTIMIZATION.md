@@ -1,9 +1,9 @@
 # Pixal3D resident GPU validation
 
 Scope: Pixal3D main release, BF16 flows, FP16 decoders, FP32 conditioning and
-boundary layers. CPU geometry and PBR processing are unchanged. Enable with
-`--gpu-execution resident --gpu-kernels auto`; legacy remains the default.
-Resident flow uses BF16 by default. `--gpu-flow-precision mixed` keeps state,
+boundary layers. CPU geometry and PBR processing are unchanged. GPU CLI runs
+default to `--gpu-execution resident --gpu-kernels auto`; CPU runs retain
+legacy execution. Mixed flow keeps state,
 normalization and residual math in FP32 while retaining BF16 GEMMs and
 attention; this is the recommended accuracy/performance point. `fp32` keeps
 the complete flow stack in FP32 for diagnostic runs. Decoder precision and
@@ -149,9 +149,9 @@ compared with the matching PyTorch model at `t=1`. FP32 reduced NRMSE by about
 | RTX 5060 Ti | 0.008680 | 0.00000131 | 0.0000205 |
 | RX 9070 XT | 0.006139 | 0.000000929 | 0.0000124 |
 
-The modes are exposed by the CLI as `--gpu-flow-precision bf16|mixed|fp32`; BF16 remains
-the default for memory and throughput, with `mixed` providing the recommended
-quality/speed tradeoff. Reproduce the isolated experiment with
+The modes are exposed by the CLI as `--gpu-flow-precision bf16|mixed|fp32`;
+`mixed` is the GPU default and provides the recommended quality/speed tradeoff.
+Reproduce the isolated experiment with
 `validate_flow_precision.py --stage structure --precision bf16|mixed|fp32`. Full
 twelve-step structure sampling from identical native noise and conditioning
 was also compared to the matching FP32 PyTorch sampler on the RTX 5060 Ti.

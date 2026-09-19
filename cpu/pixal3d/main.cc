@@ -36,6 +36,9 @@ int main(int argc, char **argv) {
     pixal3d_default_options(&options);
     pixal3d_gpu_options gpu_options;
     pixal3d_default_gpu_options(&gpu_options);
+    gpu_options.execution = PIXAL3D_GPU_RESIDENT;
+    gpu_options.flow_precision = PIXAL3D_FLOW_MIXED;
+    bool gpu_execution_explicit = false;
     std::string profile;
     pixal3d_camera camera{0, 0, 1};
     std::string input, views_dir, mask, output, model, dino, naf, dump;
@@ -54,7 +57,8 @@ int main(int argc, char **argv) {
                     "  --gpu-flow-precision bf16|fp32|mixed  --profile-json FILE\n"
                     "  --texture-size 1024|2048|4096  --triangle-target N (10000..5000000)\n"
                     "  --num-views N (use the first N frames from transforms.json)\n"
-                    "Pixal3D main: single or posed multiview 1024 cascade, BF16 flow by default, FP16 decoders.");
+                    "Pixal3D main: single or posed multiview 1024 cascade; GPUs default to resident mixed flow.\n"
+                    "CPU defaults to legacy execution; FP16 decoders are used on every backend.");
                 return 0;
             }
             if (++i >= argc)
@@ -71,6 +75,7 @@ int main(int argc, char **argv) {
             else if (key == "--mask")
                 mask = value;
             else if (key == "--gpu-execution") {
+                gpu_execution_explicit = true;
                 if (value == "legacy")
                     gpu_options.execution = PIXAL3D_GPU_LEGACY;
                 else if (value == "resident")
@@ -138,6 +143,8 @@ int main(int argc, char **argv) {
         if (output.empty() || (input.empty() == views_dir.empty()) || (!views_dir.empty() && !mask.empty()) ||
             (!input.empty() && camera.fov <= 0))
             throw std::runtime_error("Select exactly one of --input with --fov or --views-dir; see --help");
+        if (options.backend == PIXAL3D_CPU && !gpu_execution_explicit)
+            gpu_options.execution = PIXAL3D_GPU_LEGACY;
         if (!input.empty()) {
             float distance;
             if (pixal3d_camera_distance(camera.fov, camera.mesh_scale, &distance))

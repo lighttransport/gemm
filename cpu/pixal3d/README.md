@@ -13,8 +13,9 @@ confined to the [reference/validation environment](../../ref/pixal3d/README.md).
 
 See [validation and measured performance](OPTIMIZATION.md).
 
-Add `--gpu-execution resident --gpu-kernels auto` to retain NN activations and
-packed weights on the GPU. The default remains `legacy`. `auto` uses vendor
+GPU CLI runs default to `--gpu-execution resident --gpu-kernels auto` to retain
+NN activations and packed weights on the GPU. CPU runs default to legacy
+execution. `auto` uses vendor
 BF16/FP16 GEMM, CUDA FA2 or gfx12 WMMA for BF16 self-attention, and a dedicated
 five-key cross-attention kernel. `blas` disables matrix-instruction attention;
 `mma` additionally forces the experimental explicit MMA/WMMA GEMMs, which can
@@ -151,7 +152,7 @@ normalized for glTF output.
 
 ## Memory and numerical behavior
 
-The default workspace budget is 14 GiB (`--vram-budget-mib 14336`). At creation,
+The default workspace budget is 12 GiB (`--vram-budget-mib 12288`). At creation,
 it is reduced to available device memory minus 512 MiB. GEMMs stream rows and
 attention tiles queries while retaining every key. Weights/activations live in
 host memory between operations, and stages release model allocations before the

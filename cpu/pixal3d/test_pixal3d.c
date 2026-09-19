@@ -72,7 +72,7 @@ int main(void) {
     pixal3d_options options;
     pixal3d_default_options(&options);
     CHECK(options.backend == PIXAL3D_CPU && options.texture_size == 4096);
-    CHECK(options.vram_budget_mib == 14336 && options.decimation_target == 1000000);
+    CHECK(options.vram_budget_mib == 12288 && options.decimation_target == 1000000);
     CHECK(pixal3d_create(NULL) == NULL && strlen(pixal3d_last_error(NULL)) > 0);
     CHECK(pixal3d_generate(NULL, NULL, NULL, NULL) == -1);
     CHECK(pixal3d_generate_multiview(NULL, NULL, 0, NULL) == -1);
