@@ -41,7 +41,7 @@ AMD and PyTorch reference meshes side by side or as an opacity overlay.
 For long browser runs, `POST /v1/jobs` accepts the same body and returns a job
 ID immediately. Poll `GET /v1/jobs/ID`; when its state is `complete`, fetch
 `GET /v1/jobs/ID/result`. `DELETE /v1/jobs/ID` cancels a queued request or
-prevents a requested reference pass from starting after native inference.
+terminates the active native/reference child process.
 The bounded in-memory queue defaults to four active requests and four retained
 terminal results; change it with `--retained-jobs`.
 

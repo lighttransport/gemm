@@ -31,6 +31,37 @@ MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_GLB_BYTES = 256 * 1024 * 1024
 
 
+class JobCancelled(Exception):
+    pass
+
+
+def run_command(command: list[str], timeout: float,
+                cancel: threading.Event | None = None) -> subprocess.CompletedProcess:
+    if cancel is None:
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        if cancel.is_set():
+            process.terminate()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            raise JobCancelled("job cancelled")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            process.kill()
+            process.communicate()
+            raise subprocess.TimeoutExpired(command, timeout)
+        try:
+            stdout, stderr = process.communicate(timeout=min(0.25, remaining))
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def decode_b64(value: object, name: str, limit: int) -> bytes:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a non-empty base64 string")
@@ -126,7 +157,7 @@ class PixalServer:
                 "default_gpu_kernels": self.args.gpu_kernels,
                 "default_gpu_flow_precision": self.args.gpu_flow_precision, "backends": out}
 
-    def infer(self, request: dict) -> dict:
+    def infer(self, request: dict, cancel: threading.Event | None = None) -> dict:
         backend = request.get("backend", self.args.backend)
         if backend not in ("cpu", "cuda", "rocm"):
             raise ValueError("backend must be cpu, cuda, or rocm")
@@ -194,7 +225,7 @@ class PixalServer:
                 cmd += ["--mask", str(mask_path)]
             started = time.monotonic()
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.args.timeout)
+                proc = run_command(cmd, self.args.timeout, cancel)
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(f"inference exceeded {self.args.timeout:g}s") from exc
             if proc.returncode != 0:
@@ -215,7 +246,7 @@ class PixalServer:
                     "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"), "stats": stats,
                     "profile": json.loads(profile.read_text()) if profile.is_file() else {}}
 
-    def reference(self, request: dict) -> dict:
+    def reference(self, request: dict, cancel: threading.Event | None = None) -> dict:
         """Run the pinned upstream PyTorch pipeline for visual verification."""
         backend = request.get("backend", self.args.backend)
         if backend not in ("cuda", "rocm"):
@@ -264,7 +295,7 @@ class PixalServer:
                        "--model_path", str(self.model_dir), "--low_vram", "--resolution", "1024"]
             started = time.monotonic()
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.args.reference_timeout)
+                proc = run_command(cmd, self.args.reference_timeout, cancel)
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(f"PyTorch reference exceeded {self.args.reference_timeout:g}s") from exc
             if proc.returncode != 0:
@@ -300,7 +331,8 @@ class JobQueue:
             while len(terminal) >= self.retained:
                 self.jobs.pop(terminal.pop(0)["id"], None)
             self.jobs[job_id] = {"id": job_id, "state": "queued", "phase": "queued",
-                                 "created_at": now, "updated_at": now, "request": request}
+                                 "created_at": now, "updated_at": now, "request": request,
+                                 "_cancel": threading.Event()}
         self.pending.put(job_id)
         return self.status(job_id)
 
@@ -309,7 +341,8 @@ class JobQueue:
             if job_id not in self.jobs:
                 raise KeyError(job_id)
             job = self.jobs[job_id]
-            out = {key: value for key, value in job.items() if key not in ("request", "result")}
+            out = {key: value for key, value in job.items()
+                   if key not in ("request", "result") and not key.startswith("_")}
             out["queue_position"] = self._queue_position(job_id) if job["state"] == "queued" else None
             if include_result and job["state"] == "complete":
                 out["result"] = job["result"]
@@ -324,8 +357,10 @@ class JobQueue:
                 job.update(state="cancelled", phase="cancelled", updated_at=time.time())
             elif job["state"] == "running":
                 job["cancel_requested"] = True
+                job["_cancel"].set()
                 job["updated_at"] = time.time()
-            return {key: value for key, value in job.items() if key not in ("request", "result")}
+            return {key: value for key, value in job.items()
+                    if key not in ("request", "result") and not key.startswith("_")}
 
     def _queue_position(self, job_id: str) -> int:
         queued = sorted((j for j in self.jobs.values() if j["state"] == "queued"),
@@ -346,7 +381,8 @@ class JobQueue:
                         continue
                     request = job["request"]
                 self._update(job_id, state="running", phase="native inference", started_at=time.time())
-                result = self.pixal.infer(request)
+                cancel = job["_cancel"]
+                result = self.pixal.infer(request, cancel)
                 with self.lock:
                     cancelled = self.jobs[job_id].get("cancel_requested", False)
                 if cancelled:
@@ -354,8 +390,11 @@ class JobQueue:
                     continue
                 if request.get("reference"):
                     self._update(job_id, phase="PyTorch reference")
-                    result["reference"] = self.pixal.reference(request)
+                    result["reference"] = self.pixal.reference(request, cancel)
                 self._update(job_id, state="complete", phase="complete", result=result,
+                             completed_at=time.time())
+            except JobCancelled:
+                self._update(job_id, state="cancelled", phase="cancelled",
                              completed_at=time.time())
             except Exception as exc:
                 self._update(job_id, state="failed", phase="failed", error=str(exc),

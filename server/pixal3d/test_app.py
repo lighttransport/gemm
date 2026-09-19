@@ -3,6 +3,7 @@ import base64
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -108,9 +109,9 @@ class PixalServerTest(unittest.TestCase):
 
     def test_job_queue_reports_phase_and_result(self):
         class FakePixal:
-            def infer(self, request):
+            def infer(self, request, cancel=None):
                 return {"ok": True, "value": request["value"]}
-            def reference(self, request):
+            def reference(self, request, cancel=None):
                 return {"value": "reference"}
 
         jobs = app.JobQueue(FakePixal(), retained=2)
@@ -129,10 +130,10 @@ class PixalServerTest(unittest.TestCase):
     def test_queued_job_can_be_cancelled(self):
         gate = __import__("threading").Event()
         class BlockingPixal:
-            def infer(self, request):
+            def infer(self, request, cancel=None):
                 gate.wait(2)
                 return {"ok": True}
-            def reference(self, request):
+            def reference(self, request, cancel=None):
                 raise AssertionError("reference should not run")
 
         jobs = app.JobQueue(BlockingPixal(), retained=2)
@@ -145,6 +146,17 @@ class PixalServerTest(unittest.TestCase):
         gate.set()
         self.assertEqual(cancelled["state"], "cancelled")
         self.assertEqual(jobs.status(second["id"])["phase"], "cancelled")
+
+    def test_cancellable_command_terminates_child(self):
+        cancel = __import__("threading").Event()
+        timer = __import__("threading").Timer(0.05, cancel.set)
+        timer.start()
+        started = time.monotonic()
+        with self.assertRaises(app.JobCancelled):
+            app.run_command([sys.executable, "-c", "import time; time.sleep(10)"],
+                            timeout=20, cancel=cancel)
+        timer.cancel()
+        self.assertLess(time.monotonic() - started, 2)
 
 
 if __name__ == "__main__":
