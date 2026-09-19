@@ -53,6 +53,29 @@ def finite_number(value: object, name: str, lo: float, hi: float) -> float:
     return out
 
 
+def bounded_integer(value: object, name: str, lo: int, hi: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not math.isfinite(number) or not number.is_integer():
+        raise ValueError(f"{name} must be an integer")
+    out = int(number)
+    if out < lo or out > hi:
+        raise ValueError(f"{name} must be an integer in [{lo}, {hi}]")
+    return out
+
+
+def camera_matrix(value: object, name: str) -> list[list[float]]:
+    if not (isinstance(value, list) and len(value) == 4 and
+            all(isinstance(row, list) and len(row) == 4 for row in value)):
+        raise ValueError(f"{name} must be a 4x4 array")
+    return [[finite_number(cell, f"{name}[{r}][{c}]", -1e6, 1e6)
+             for c, cell in enumerate(row)] for r, row in enumerate(value)]
+
+
 def model_ready(model_dir: Path, dino: Path, naf: Path) -> bool:
     # pipeline.json names the remaining checkpoints; checking it plus the two
     # explicit files catches the common setup errors without loading weights.
@@ -117,10 +140,8 @@ class PixalServer:
         fov = finite_number(request.get("fov", 0.857556), "fov", 0.05, 3.14)
         distance = finite_number(request.get("distance", 0.0), "distance", 0.0, 1000.0)
         mesh_scale = finite_number(request.get("mesh_scale", 1.0), "mesh_scale", 1e-5, 1000.0)
-        seed = int(request.get("seed", 42))
-        threads = int(request.get("threads", self.args.threads))
-        if threads < 0 or threads > 1024:
-            raise ValueError("threads must be between 0 and 1024")
+        seed = bounded_integer(request.get("seed", 42), "seed", 0, 2**32 - 1)
+        threads = bounded_integer(request.get("threads", self.args.threads), "threads", 0, 1024)
         with self.locks[backend], tempfile.TemporaryDirectory(prefix="request-", dir=self.work_dir) as td:
             run_dir = Path(td)
             output_path = run_dir / "output.glb"
@@ -133,9 +154,7 @@ class PixalServer:
                     data = decode_b64(item.get("image_b64"), f"views[{index}].image_b64", MAX_IMAGE_BYTES)
                     name = f"view{index:02d}.png"
                     (run_dir / name).write_bytes(data)
-                    matrix = item.get("transform_matrix")
-                    if not (isinstance(matrix, list) and len(matrix) == 4 and all(isinstance(row, list) and len(row) == 4 for row in matrix)):
-                        raise ValueError(f"views[{index}].transform_matrix must be 4x4")
+                    matrix = camera_matrix(item.get("transform_matrix"), f"views[{index}].transform_matrix")
                     frame = {"file_path": name, "transform_matrix": matrix}
                     if item.get("fov") is not None:
                         frame["camera_angle_x"] = finite_number(item["fov"], f"views[{index}].fov", 0.05, 3.14)
@@ -165,9 +184,10 @@ class PixalServer:
             if threads:
                 cmd += ["--threads", str(threads)]
             if request.get("device") is not None:
-                cmd += ["--device", str(request["device"])]
+                cmd += ["--device", str(bounded_integer(request["device"], "device", 0, 255))]
             if request.get("vram_budget_mib") is not None:
-                cmd += ["--vram-budget-mib", str(int(request["vram_budget_mib"]))]
+                cmd += ["--vram-budget-mib", str(bounded_integer(request["vram_budget_mib"],
+                                                                  "vram_budget_mib", 513, 14336))]
             if mask_path:
                 cmd += ["--mask", str(mask_path)]
             started = time.monotonic()

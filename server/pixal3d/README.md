@@ -13,9 +13,12 @@ sh server/pixal3d/run.sh --backend cuda --bind 127.0.0.1 --port 8765
 ```
 
 Open <http://127.0.0.1:8765/>. Select an image, optionally provide a mask, and
-choose CPU, CUDA, or ROCm. GPU runs are serialized per backend to avoid VRAM
-contention. Temporary uploads and GLBs are kept only under `tmp/pixal3d/` and
-removed after each request.
+choose CPU, CUDA, or ROCm. For multiview inference, select **Posed multiview**
+and choose a folder containing `transforms.json` and its images. The browser
+shows the resolved images in frame order before upload. A separate JSON and
+image picker is available when folder selection is unsupported. GPU runs are
+serialized per backend to avoid VRAM contention. Temporary uploads and GLBs
+are kept only under `tmp/pixal3d/` and removed after each request.
 
 `POST /v1/infer` accepts JSON fields `image_b64`, optional `mask_b64`,
 `image_ext`, `backend`, `fov`, `distance`, `mesh_scale`, `seed`, `threads`,
@@ -32,3 +35,22 @@ GLB for comparison. This is opt-in because it loads another model stack and
 requires an image without a separate mask upload. The browser displays native
 AMD and PyTorch reference meshes side by side or as an opacity overlay.
 `GET /health` reports binary, GPU-library, and model readiness.
+
+For multiview API requests, replace `image_b64` with `views`, an ordered array
+of 1 to 16 objects. Each object contains `image_b64`, a 4-by-4
+`transform_matrix`, and an optional `fov`. Top-level `fov` is the default for
+frames without one, and `mesh_scale` applies to the complete view set:
+
+```json
+{
+  "backend": "cuda",
+  "views": [
+    {"image_b64": "...", "transform_matrix": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]}
+  ],
+  "fov": 0.857556,
+  "mesh_scale": 1.0
+}
+```
+
+The pinned PyTorch comparison remains single-view only. Use the upstream
+`inference_mv.py` reference directly for multiview validation.
