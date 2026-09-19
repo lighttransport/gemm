@@ -1,4 +1,4 @@
-"""Validate native GLB structure, mesh attributes and embedded 4096 PBR images."""
+"""Validate native GLB structure, mesh attributes and embedded PBR images."""
 import argparse
 import io
 import json
@@ -34,16 +34,19 @@ assert (area>0).all(),'Zero-area GLB faces'
 material=scene['materials'][0];assert material['alphaMode']=='OPAQUE' and not material['doubleSided']
 pbr=material['pbrMetallicRoughness'];assert pbr['metallicFactor']==pbr['roughnessFactor']==1
 images=[]
+texture_size=None
 for item in scene['images']:
     assert item['mimeType']=='image/png'
     view=scene['bufferViews'][item['bufferView']];offset=view.get('byteOffset',0)
     image=Image.open(io.BytesIO(blob[offset:offset+view['byteLength']]))
-    assert image.size==(4096,4096)
+    assert image.width==image.height and image.width in (1024,2048,4096)
+    texture_size=texture_size or image.width
+    assert image.width==texture_size
     data=np.asarray(image);assert data.max()>0
     images.append(data)
-assert images[0].shape==(4096,4096,4) and images[1].shape==(4096,4096,3)
+assert images[0].shape==(texture_size,texture_size,4) and images[1].shape==(texture_size,texture_size,3)
 assert (images[1][:,:,0]==0).all()
 print(json.dumps(dict(path=str(a.path),bytes=len(raw),vertices=len(v),triangles=len(f),
-    bounds=[v.min(0).tolist(),v.max(0).tolist()],texture_size=4096,normal_max_error=float(abs(np.linalg.norm(n,axis=1)-1).max()),
+    bounds=[v.min(0).tolist(),v.max(0).tolist()],texture_size=texture_size,normal_max_error=float(abs(np.linalg.norm(n,axis=1)-1).max()),
     base_median=np.median(images[0].reshape(-1,4),axis=0).tolist(),material_median=np.median(images[1].reshape(-1,3),axis=0).tolist())),flush=True)
 print('GLB PASS',flush=True)

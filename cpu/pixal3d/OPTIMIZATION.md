@@ -86,6 +86,13 @@ ref/pixal3d/run.sh cpu ref/pixal3d/replay_postprocess.py \
   --profile-json tmp/pixal3d/postprocess-profile/jester.json
 ```
 
+The explicit lower-output preset (`--texture-size 1024
+--triangle-target 500000`) completed the same replay in 65.2 s and produced a
+23 MB GLB with 484,580 triangles, versus 90 MB and 970,090 triangles for the
+default. Both 1K and 4K outputs pass mesh, normal, texture, and material
+validation. This option changes output fidelity and remains opt-in; 4K/1M is
+the default used for reference-quality comparisons.
+
 Reproduce the constrained full run with:
 
 ```sh

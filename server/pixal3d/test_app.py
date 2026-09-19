@@ -48,6 +48,7 @@ class PixalServerTest(unittest.TestCase):
                 "backend": "cuda", "gpu_execution": "resident",
                 "gpu_kernels": "mma", "gpu_flow_precision": "mixed",
                 "seed": 7, "device": 0, "vram_budget_mib": 12288,
+                "texture_size": 2048, "triangle_target": 500000,
                 "mesh_scale": 1.25, "fov": 0.8,
                 "views": [
                     {"image_b64": encoded, "transform_matrix": IDENTITY},
@@ -63,6 +64,8 @@ class PixalServerTest(unittest.TestCase):
         self.assertEqual(result["profile"]["peak_vram_mib"], 1024)
         self.assertIn("--views-dir", captured["command"])
         self.assertNotIn("--input", captured["command"])
+        self.assertEqual(captured["command"][captured["command"].index("--texture-size") + 1], "2048")
+        self.assertEqual(captured["command"][captured["command"].index("--triangle-target") + 1], "500000")
         self.assertEqual(captured["manifest"]["mesh_scale"], 1.25)
         self.assertEqual(len(captured["manifest"]["frames"]), 2)
         self.assertEqual(captured["manifest"]["frames"][1]["camera_angle_x"], 0.9)

@@ -135,7 +135,9 @@ command retains the lower-memory fallback on smaller or contended devices.
 Select `--backend rocm` for the RX 9070 XT or `--backend cpu` for CPU execution.
 `--device` selects the backend-local device ordinal. `--threads` controls host
 OpenMP/OpenBLAS threads. `--distance` overrides the FOV-derived camera distance;
-`--mesh-scale` defaults to 1. All execution choices are explicit arguments.
+`--mesh-scale` defaults to 1. `--texture-size` selects 1024, 2048, or the
+quality-preserving 4096 default; `--triangle-target` accepts 10000–5000000 and
+defaults to one million. All execution choices are explicit arguments.
 
 The pipeline executes DINOv3/NAF conditioning, 12-step sparse structure diffusion,
 structure decoding, 512 shape diffusion, four learned subdivisions, the 1024

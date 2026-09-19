@@ -127,13 +127,16 @@ extern "C" int px_test_postprocess_dump(const int32_t *coords, const float *shap
 }
 extern "C" int px_test_postprocess_profile(const int32_t *coords, const float *shape, const float *texture,
                                            int n, const char *output, const char *dump_dir,
-                                           const char *profile_json) {
+                                           const char *profile_json, int texture_size,
+                                           int triangle_target) {
     pixal3d_result result{};
     try {
         omp_set_num_threads(16);
         pixal3d_options o;
         pixal3d_default_options(&o);
         o.dump_dir = dump_dir;
+        o.texture_size = texture_size;
+        o.decimation_target = triangle_target;
         px::Engine profile(o);
         pixal3d_gpu_options gpu;
         pixal3d_default_gpu_options(&gpu);

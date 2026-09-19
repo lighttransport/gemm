@@ -456,8 +456,9 @@ extern "C" pixal3d_context *pixal3d_create(const pixal3d_options *o) {
     try {
         px::require(o && o->model_dir && o->dinov3_path && o->naf_path, "Missing Pixal3D model paths");
         px::require(o->device >= 0, "Device ordinal must be nonnegative");
-        px::require(o->texture_size == 4096 && o->decimation_target > 0,
-                    "Expected 4096 texture and positive face target");
+        px::require((o->texture_size == 1024 || o->texture_size == 2048 || o->texture_size == 4096) &&
+                        o->decimation_target >= 10000 && o->decimation_target <= 5000000,
+                    "Texture size must be 1024, 2048 or 4096 and face target in [10000,5000000]");
         px::require(o->vram_budget_mib > 512 && o->vram_budget_mib <= 14336,
                     "GPU budget must be in (512,14336] MiB");
         auto c = std::make_unique<pixal3d_context>();

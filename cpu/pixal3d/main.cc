@@ -52,6 +52,7 @@ int main(int argc, char **argv) {
                     "  --vram-budget-mib N (maximum 14336)  --dump-dir DIR\n"
                     "  --gpu-execution legacy|resident  --gpu-kernels auto|blas|mma\n"
                     "  --gpu-flow-precision bf16|fp32|mixed  --profile-json FILE\n"
+                    "  --texture-size 1024|2048|4096  --triangle-target N (10000..5000000)\n"
                     "  --num-views N (use the first N frames from transforms.json)\n"
                     "Pixal3D main: single or posed multiview 1024 cascade, BF16 flow by default, FP16 decoders.");
                 return 0;
@@ -119,6 +120,10 @@ int main(int argc, char **argv) {
                 options.device = integer_argument<int>(key, value);
             else if (key == "--vram-budget-mib")
                 options.vram_budget_mib = integer_argument<size_t>(key, value);
+            else if (key == "--texture-size")
+                options.texture_size = integer_argument<int>(key, value);
+            else if (key == "--triangle-target")
+                options.decimation_target = integer_argument<int>(key, value);
             else if (key == "--model-dir")
                 model = value;
             else if (key == "--dinov3")

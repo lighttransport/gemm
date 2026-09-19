@@ -26,7 +26,7 @@ lib.pixal3d_destroy.argtypes=[C.c_void_p]
 lib.pixal3d_generate.argtypes=[C.c_void_p,C.POINTER(Image),C.POINTER(Camera),C.POINTER(Result)]
 lib.pixal3d_result_free.argtypes=[C.POINTER(Result)]
 lib.pixal3d_write_glb.argtypes=[C.c_char_p,C.POINTER(Result)]
-for field,value in [('threads',0),('device',-1),('backend',3),('vram_budget_mib',14337),('texture_size',1024),('model_dir',b'/missing/pixal3d')]:
+for field,value in [('threads',0),('device',-1),('backend',3),('vram_budget_mib',14337),('texture_size',1536),('decimation_target',9999),('model_dir',b'/missing/pixal3d')]:
     options=Options();lib.pixal3d_default_options(C.byref(options));setattr(options,field,value)
     context=lib.pixal3d_create(C.byref(options))
     assert not context,field
@@ -53,7 +53,7 @@ try:
     assert lib.pixal3d_write_glb(None,C.byref(result))==-1
 finally:lib.pixal3d_destroy(context)
 base=[str(ROOT/'cpu/pixal3d/pixal3d'),'--input','unused.png','--output',str(ROOT/'tmp/pixal3d/unused.glb'),'--fov','.85']
-for args in [[],['--backend','invalid'],['--seed','-1'],['--seed','4294967296'],['--threads','2x'],['--fov','nan'],['--distance','inf'],['--fov','.8junk'],['--device']]:
+for args in [[],['--backend','invalid'],['--seed','-1'],['--seed','4294967296'],['--threads','2x'],['--fov','nan'],['--distance','inf'],['--fov','.8junk'],['--texture-size','1536'],['--triangle-target','9999'],['--device']]:
     command=[base[0]] if not args else base+args
     run=subprocess.run(command,capture_output=True,text=True,timeout=10)
     assert run.returncode and 'Pixal3D:' in run.stderr,(args,run)

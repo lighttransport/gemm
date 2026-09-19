@@ -175,6 +175,11 @@ class PixalServer:
         mesh_scale = finite_number(request.get("mesh_scale", 1.0), "mesh_scale", 1e-5, 1000.0)
         seed = bounded_integer(request.get("seed", 42), "seed", 0, 2**32 - 1)
         threads = bounded_integer(request.get("threads", self.args.threads), "threads", 0, 1024)
+        texture_size = bounded_integer(request.get("texture_size", 4096), "texture_size", 1024, 4096)
+        if texture_size not in (1024, 2048, 4096):
+            raise ValueError("texture_size must be 1024, 2048, or 4096")
+        triangle_target = bounded_integer(request.get("triangle_target", 1000000),
+                                          "triangle_target", 10000, 5000000)
         with self.locks[backend], tempfile.TemporaryDirectory(prefix="request-", dir=self.work_dir) as td:
             run_dir = Path(td)
             output_path = run_dir / "output.glb"
@@ -213,7 +218,8 @@ class PixalServer:
                 execution = "legacy"
             profile = run_dir / "profile.json"
             cmd += ["--gpu-execution", execution, "--gpu-kernels", kernels,
-                    "--gpu-flow-precision", flow_precision, "--profile-json", str(profile)]
+                    "--gpu-flow-precision", flow_precision, "--profile-json", str(profile),
+                    "--texture-size", str(texture_size), "--triangle-target", str(triangle_target)]
             if threads:
                 cmd += ["--threads", str(threads)]
             if request.get("device") is not None:

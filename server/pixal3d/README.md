@@ -24,7 +24,9 @@ are kept only under `tmp/pixal3d/` and removed after each request.
 `image_ext`, `backend`, `fov`, `distance`, `mesh_scale`, `seed`, `threads`,
 `device`, `vram_budget_mib`, `gpu_execution` (`legacy`/`resident`), and
 `gpu_kernels` (`auto`/`blas`/`mma`), and `gpu_flow_precision`
-(`bf16`/`mixed`/`fp32`). Responses include a `profile` object with
+(`bf16`/`mixed`/`fp32`). Output controls are `texture_size`
+(`1024`/`2048`/`4096`, default `4096`) and `triangle_target`
+(`10000`–`5000000`, default `1000000`). Responses include a `profile` object with
 phase timings and device counters. Server defaults can be selected with
 `--gpu-execution resident --gpu-kernels auto`; the browser also exposes these
 choices. Resident execution and mixed precision are the GPU server defaults;
