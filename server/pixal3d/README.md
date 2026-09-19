@@ -47,6 +47,11 @@ terminates the active native/reference child process.
 The bounded in-memory queue defaults to four active requests and four retained
 terminal results; change it with `--retained-jobs`.
 
+Run the server unit tests with `python3 -m unittest server.pixal3d.test_app`.
+When Chrome or Chromium is installed, `python3 server/pixal3d/test_browser.py`
+boots the real HTTP handler and verifies the JavaScript-rendered control and
+health surface in a headless browser.
+
 For multiview API requests, replace `image_b64` with `views`, an ordered array
 of 1 to 16 objects. Each object contains `image_b64`, a 4-by-4
 `transform_matrix`, and an optional `fov`. Top-level `fov` is the default for
