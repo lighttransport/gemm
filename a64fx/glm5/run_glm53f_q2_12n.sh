@@ -1,7 +1,7 @@
 #!/bin/bash
-# Build, stage and run the GLM-5.3-Flash mixed-IQ routed-expert path directly
-# inside an allocated 12-node Fugaku job.  All large rank-local files live on
-# each compute node's /local filesystem.
+# Build, stage and run the GLM-5.3-Flash mixed-IQ routed-expert path with its
+# GGUF embedding and vocabulary head inside an allocated 12-node Fugaku job.
+# All large rank-local files live on each compute node's /local filesystem.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -18,6 +18,7 @@ q2=${GLM53F_Q2_MODEL:-$q2_root/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf}
 model=${GLM53F_MODEL_DIR:-$HOME/models/glm53f}
 q2_stage=${GLM53F_STAGE_DIR:-/local/glm53f-q2-routed-$job}
 embed_stage=${GLM53F_Q2_EMBED_STAGE:-/local/glm53f-q2-embed-$job}
+head_stage=${GLM53F_Q2_HEAD_STAGE:-/local/glm53f-q2-head-$job}
 shared_stage=${GLM53F_SHARED_STAGE_DIR:-/local/glm53f-q2-shared-$job}
 core_stage=${GLM53F_REPACK_STAGE_DIR:-/local/glm53f-q2-core-$job}
 shared_source=${GLM53F_SHARED_SOURCE:-$model/a64fx_ep12_v1/shared}
@@ -52,6 +53,12 @@ echo "staging Q2 input embeddings to $embed_stage"
     ./glm53f_q2_embed_stage "$q2" "$embed_stage"
 test "$(grep -l 'SENTINEL glm53f_q2_embed_stage=' "$logdir"/q2-embed-stage-$run_tag.*.* | wc -l)" -eq 12
 export GLM53F_Q2_EMBED_STAGE=$embed_stage
+
+echo "staging Q2 vocabulary head to $head_stage"
+"$mpiexec_bin" -n 12 -of-proc "$logdir/q2-head-stage-$run_tag" \
+    ./glm53f_q2_head_stage "$q2" "$head_stage"
+test "$(grep -l 'SENTINEL glm53f_q2_head_stage=' "$logdir"/q2-head-stage-$run_tag.*.* | wc -l)" -eq 12
+export GLM53F_Q2_HEAD_STAGE=$head_stage
 
 echo "staging shared expert and compact core to node-local storage"
 "$mpiexec_bin" -n 12 -of-proc "$logdir/shared-stage-$run_tag" sh -c '

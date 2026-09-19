@@ -1,6 +1,7 @@
 # GLM-5.3-Flash Q2 routed decode on 12 A64FX nodes
 
-This path consumes the mixed-IQ routed experts from
+This path consumes the mixed-IQ routed experts, Q5_K input embedding, and
+Q4_K vocabulary head from
 `~/models/glm53f-gguf/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf` directly.
 The compact attention/dense core and shared expert still come from the existing
 GLM-5.3 safetensors-derived rank images.  It is therefore a Q2-routed hybrid,
@@ -14,8 +15,10 @@ sh a64fx/glm5/run_glm53f_q2_12n.sh
 
 The launcher fixes the Fujitsu MPI environment, builds with `mpifcc -Nclang`,
 stages all large files under node-local `/local`, creates the uTofu topology,
-and enforces a 20 tok/s default gate.  Completed Q2 images are reused when the
-manifest layer range and blob size match.
+and enforces a 20 tok/s default gate. The runner sets
+`GLM53F_Q2_EMBED_STAGE` and `GLM53F_Q2_HEAD_STAGE` after their twelve-rank
+stage contracts pass. Completed routed Q2 images are reused when the manifest
+layer range and blob size match.
 
 ## Layout and memory
 
@@ -28,10 +31,26 @@ layer.
 The full layers 3 through 44 image is 8,252,817,408 bytes per rank.  Staging
 uses bounded positional I/O, periodically syncs output, advises source and
 destination pages away, and atomically renames the completed blob/manifest.
-During the validated run rank 0 retained about 19.5 GiB `MemAvailable` after
-loading the 7.686 GiB routed image and 0.062 GiB shared image.
+During the vocabulary-boundary validation, rank 0 retained 19.96 GiB minimum
+`MemAvailable` after loading the 7.686 GiB routed image, 0.062 GiB shared
+image, and rank-local F32 embedding/head shards.
 
-## Results (job 51321372, 2026-09-04)
+## Vocabulary-boundary validation (job 51800324, 2026-09-20)
+
+All twelve Q5_K embedding and Q4_K head stage sentinels passed. With both GGUF
+boundaries active, one-step inputs 1 and 42 retained exact streamed-reference
+tokens 5556 and 154822. Input 1234 changed from 198 with the BF16 head to 2
+with the Q4_K head, while the complete streamed GGUF reference is 29656. This
+proves both staged boundaries are consumed and leaves the safetensors-derived
+compact core/shared expert as the remaining representation mismatch. See
+`GLM53F_VALIDATION.md` for logits and memory measurements.
+
+A separate 128-step production run in job 51801251 passed the default 20
+tok/s gate at **22.404 tok/s** (**44.635 ms/token**) with 18.36 GiB minimum
+`MemAvailable` during decode. This validates the staged F32 Q4_K head path as
+both finite and fast enough for the current runner contract.
+
+## Routed-only performance results (job 51321372, 2026-09-04)
 
 All figures use 128 single-stream decode steps, 12 ranks, the hardware OpenMP
 barrier, uTofu FP32 all-reduce, and finite-logit/PASS validation.

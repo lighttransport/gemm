@@ -393,6 +393,57 @@ decode. The run used HEAD `56f89642` plus the then-current dirty worktree,
 captured in the log directory with diff SHA-256
 `468f970446d0380a2f74d0c7ef46aeb4fc45ce597fa70de5a6810f16029d5a13`.
 
+The production vocabulary head was aligned next. The same bounded matrix
+dequantizer now specializes for GGUF `output.weight`, and
+`GLM53F_Q2_HEAD_STAGE` makes the target head consume the resulting rank-local
+F32 rows while retaining the safetensors BF16 fallback. Job 51800324 ran this
+path on twelve distinct A64FX nodes. All twelve routed, embedding, head,
+shared-expert, and compact-core stage contracts passed. The source
+`output.weight` is Q4_K; each head shard contained 12,906 or 12,907 rows and
+occupied 211,451,904 or 211,468,288 bytes. The input embedding remained Q5_K
+with the same output shard dimensions.
+
+The job held the Q2 embedding fixed, compared Q4_K and BF16 head paths, and
+ran the two previously exact Q2 inputs:
+
+| Input | Production head | Production token/logit | Streamed Q2 token | Result |
+| ---: | --- | --- | ---: | --- |
+| 1 | Q4_K GGUF | `5556 / 8.4312458` | 5556 | exact |
+| 42 | Q4_K GGUF | `154822 / 11.8937874` | 154822 | exact |
+| 1234 | Q4_K GGUF | `2 / 10.5463228` | 29656 | mismatch |
+| 1234 | BF16 safetensors | `198 / 10.6972504` | n/a | control |
+
+The control exactly reproduced the preceding Q2-embedding/BF16-head result.
+Changing only `output.weight` therefore moves token 1234 from 198 to 2 and
+proves that the Q4_K head is active, but it does not close the reference gap
+to 29656. Tokens 1 and 42 remain exact. This narrows the residual mismatch to
+the production trunk's safetensors-derived compact attention/dense and shared
+expert weights; the final norm is already representation-identical. All four
+executions were finite and reported `PASS`. The first load took 104.54
+seconds, with 19.96 GiB minimum `MemAvailable` after residency and 19.80 GiB
+during decode. These single-step rates are diagnostic and are not throughput
+headlines. Logs are in `tmp/glm53f-q2-embed-matrix-51800324/`. The run used
+HEAD `7245c916` plus a captured dirty diff with SHA-256
+`264861f8fd376cb5ce9e86d454fdb5bf26da7c39381fc241ad2f54d6b5656c9b`.
+
+Job 51801251 then exercised the new default boundary path for 128 decode
+steps with the normal 20 tok/s acceptance gate. All five twelve-rank stage
+groups passed again, followed by 128/128 finite tokens:
+
+```text
+GLM53F_TARGET_RESIDENT ... min_MemAvailable_GiB=18.533081
+GLM53F_TARGET_RUN_MEMORY sampled_min_MemAvailable_GiB=18.364380 ...
+GLM53F_TARGET_DECODE_12N steps=128 generated=128 capacity=128
+  ms_tok=44.635 tok_s=22.404 final_token=3196 PASS
+SENTINEL glm53f_q2_head_perf=PASS job=51801251
+```
+
+Thus the Q4_K head path also preserves the production throughput contract.
+This is an end-to-end performance/finite-output gate, not a full-trajectory
+equality claim. Logs are in `tmp/glm53f-q2-head-perf-51801251/`; the captured
+source diff SHA-256 is
+`ab572bb92271abec4a49b9908f3df3c9d0aa940fd2f341016608114818a80a02`.
+
 Job 51766725 repeated the complete streamed chain with
 `GLM53F_STREAM_TOKEN=1234`, providing a third real embedding/input variant.
 All 45 trunk layers again produced finite 16,384-element artifacts. The

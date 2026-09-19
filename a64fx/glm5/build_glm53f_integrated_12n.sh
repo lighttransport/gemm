@@ -105,6 +105,11 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_stage.c \
     -o glm53f_q2_stage
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_embed_stage.c \
     -o glm53f_q2_embed_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
+    '-DGLM53F_Q2_MATRIX_NAME="output.weight"' \
+    '-DGLM53F_Q2_STAGE_LABEL="glm53f_q2_head_stage"' \
+    '-DGLM53F_Q2_STAGE_MANIFEST="GLM53F_Q2_HEAD_V1"' \
+    glm53f_q2_embed_stage.c -o glm53f_q2_head_stage
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_core_stage.c \
     -o glm53f_core_stage
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_core_add_routers.c \
