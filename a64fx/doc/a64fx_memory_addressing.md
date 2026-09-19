@@ -124,6 +124,13 @@ a64fx/dequant-pipe/bench_hbm_color --sweep-base --fixed-skew-kib 0 \
 a64fx/dequant-pipe/bench_hbm_color --page-mode thp --bit-sweep
 a64fx/dequant-pipe/bench_hbm_color --page-mode base --bit-sweep
 
+# Use Fujitsu XOS/libmpg 2 MiB hugetlbfs pages.
+LD_PRELOAD=/opt/FJSVxos/mmm/lib64/libmpg.so.1 \
+XOS_MMM_L_HPAGE_TYPE=hugetlbfs XOS_MMM_L_HUGETLB_SZ=2M \
+XOS_MMM_L_HUGE_MALLOC=1 XOS_MMM_L_FORCE_MMAP_THRESHOLD=1 \
+XOS_MMM_L_HUGETLB_FALLBACK=0 \
+  a64fx/dequant-pipe/bench_hbm_color --page-mode xos
+
 # Sample independent allocation epochs and retain machine-readable output.
 cd a64fx/dequant-pipe
 EPOCHS=20 OUTPUT=hbm-color-epochs.csv ./run_hbm_color_epochs.sh
@@ -155,6 +162,12 @@ every gap was about 120 GB/s. The 16 KiB conclusion was therefore confounded
 by physical allocation/page placement. The supported result is that placement
 can produce a roughly twofold bandwidth state; the responsible address bits
 and whether the conflict is in L2, MIB/MAC, or HBM remain unknown.
+
+With XOS 2 MiB hugetlbfs backing, a 240 MiB twelve-core sweep measured
+229.712 GB/s at zero skew and 227.759--228.641 GB/s for 16--64 KiB skews.
+`smaps` confirmed 2048 KiB kernel and MMU pages. This removes the earlier
+all-slow allocation state in this run and reinforces that 16 KiB skew is not
+the selector; controlled large-page placement is the useful configuration.
 
 Operational rules:
 

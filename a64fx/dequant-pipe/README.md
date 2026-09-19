@@ -169,6 +169,18 @@ EPOCHS=20 OUTPUT=hbm-color-epochs.csv ./run_hbm_color_epochs.sh
 The probe reports per-core start PFNs when the kernel permits pagemap access.
 On the measured node Linux masks those PFNs, so the epoch runner can discover
 repeatable fast allocations but cannot yet name physical HBM selector bits.
+For controlled 2 MiB XOS pages, select the heap-backed allocation path:
+
+```sh
+LD_PRELOAD=/opt/FJSVxos/mmm/lib64/libmpg.so.1 \
+XOS_MMM_L_HPAGE_TYPE=hugetlbfs XOS_MMM_L_HUGETLB_SZ=2M \
+XOS_MMM_L_HUGE_MALLOC=1 XOS_MMM_L_FORCE_MMAP_THRESHOLD=1 \
+XOS_MMM_L_HUGETLB_FALLBACK=0 \
+  a64fx/dequant-pipe/bench_hbm_color --page-mode xos
+```
+
+The measured 240 MiB, 12-core sweep sustained 227.76--229.71 GB/s across
+0--64 KiB skews; `smaps` confirmed 2048 KiB kernel/MMU pages.
 
 For production staging, allocate all twelve regions from one CMG-local arena
 and first-touch it on that CMG. Re-run the placement sweep if payload size,

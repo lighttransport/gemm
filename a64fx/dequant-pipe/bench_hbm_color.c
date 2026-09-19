@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 enum { CACHE_LINE = 256, MAX_CORES = 12, MAX_TRIALS = 31 };
+typedef enum { PAGE_THP, PAGE_BASE, PAGE_XOS } page_mode;
 
 extern void hbm_read_256_sve(const uint8_t *, size_t);
 
@@ -145,7 +146,7 @@ static void usage(const char *name)
             "          [--min-skew-kib N] [--max-skew-kib N] "
             "[--step-bytes N] [--bit-sweep]\n"
             "          [--sweep-base] [--fixed-skew-kib N] "
-            "[--max-base-kib N] [--page-mode thp|base]\n",
+            "[--max-base-kib N] [--page-mode thp|base|xos]\n",
             name);
 }
 
@@ -206,7 +207,8 @@ int main(int argc, char **argv)
     int cores = 12, core_base = 12, iterations = 5, trials = 3;
     size_t mib = 240, min_skew_kib = 0, max_skew_kib = 64, step = 256;
     size_t fixed_skew_kib = 0, max_base_kib = 2048;
-    bool bit_sweep = false, sweep_base = false, use_thp = true;
+    bool bit_sweep = false, sweep_base = false;
+    page_mode pages = PAGE_THP;
     static const struct option options[] = {
         {"cores", required_argument, NULL, 'c'},
         {"core-base", required_argument, NULL, 'b'},
@@ -240,9 +242,10 @@ int main(int argc, char **argv)
         case 1005: fixed_skew_kib = parse_size(optarg, "fixed-skew-kib"); break;
         case 1006: max_base_kib = parse_size(optarg, "max-base-kib"); break;
         case 1007:
-            if (!strcmp(optarg, "thp")) use_thp = true;
-            else if (!strcmp(optarg, "base")) use_thp = false;
-            else { fprintf(stderr, "page mode must be thp or base\n"); return 2; }
+            if (!strcmp(optarg, "thp")) pages = PAGE_THP;
+            else if (!strcmp(optarg, "base")) pages = PAGE_BASE;
+            else if (!strcmp(optarg, "xos")) pages = PAGE_XOS;
+            else { fprintf(stderr, "page mode must be thp, base, or xos\n"); return 2; }
             break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 2;
@@ -270,20 +273,27 @@ int main(int argc, char **argv)
     if (page_size <= 0) return 1;
     allocation_bytes = (allocation_bytes + (size_t)page_size - 1) /
                        (size_t)page_size * (size_t)page_size;
-    uint8_t *arena = mmap(NULL, allocation_bytes, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (arena == MAP_FAILED)
-        return 1;
-    if (madvise(arena, allocation_bytes,
-                use_thp ? MADV_HUGEPAGE : MADV_NOHUGEPAGE) != 0) {
-        perror("madvise");
-        munmap(arena, allocation_bytes);
-        return 1;
+    uint8_t *arena;
+    if (pages == PAGE_XOS) {
+        if (posix_memalign((void **)&arena, 2u * 1024u * 1024u,
+                           allocation_bytes) != 0)
+            return 1;
+    } else {
+        arena = mmap(NULL, allocation_bytes, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (arena == MAP_FAILED)
+            return 1;
+        if (madvise(arena, allocation_bytes,
+                    pages == PAGE_THP ? MADV_HUGEPAGE : MADV_NOHUGEPAGE) != 0) {
+            perror("madvise");
+            munmap(arena, allocation_bytes);
+            return 1;
+        }
     }
     if (pin_cpu(core_base) != 0) {
         fprintf(stderr, "cannot pin allocator to CPU %d: %s\n", core_base,
                 strerror(errno));
-        munmap(arena, allocation_bytes);
+        if (pages == PAGE_XOS) free(arena); else munmap(arena, allocation_bytes);
         return 1;
     }
     for (size_t offset = 0; offset < allocation_bytes; offset += 4096)
@@ -293,8 +303,10 @@ int main(int argc, char **argv)
     printf("# cores=%d core_base=%d payload_mib=%zu per_core_mib=%.6f iterations=%d trials=%d\n",
            cores, core_base, mib, (double)(bytes / (size_t)cores) / 1048576.0,
            iterations, trials);
+    const char *page_name = pages == PAGE_XOS ? "xos" :
+                            pages == PAGE_THP ? "thp" : "base";
     printf("# arena=%p allocation_bytes=%zu page_mode=%s\n", (void *)arena,
-           allocation_bytes, use_thp ? "thp" : "base");
+           allocation_bytes, page_name);
     report_mapping(arena);
     report_pfns(arena, bytes, cores);
     printf("base_offset_bytes,skew_bytes,changed_bit,median_GBps,best_GBps,percent_of_256GBps\n");
@@ -337,6 +349,6 @@ int main(int argc, char **argv)
             if (last - skew < step) break;
         }
     }
-    munmap(arena, allocation_bytes);
+    if (pages == PAGE_XOS) free(arena); else munmap(arena, allocation_bytes);
     return rc;
 }
