@@ -112,9 +112,27 @@ not raise the 7 GiB native GPU floor. The web demo requests a 12 GiB budget for
 additional dense-output headroom and automatically falls back to available
 VRAM minus the runtime reserve.
 
-With the final unchanged 2048-row GEMM schedule, a 12 GiB budget reduced the
-warm 30-block, 10,765-token shape flow median from 3.279 s to 3.141 s (4.2%)
-by retaining more packed weights. Outputs were bit-identical. A tested
+With the final unchanged 2048-row GEMM schedule, a controlled RTX 5060 Ti run
+of the same 30-block, 10,765-token Shape-1024 prediction measured:
+
+| Native budget | Warm median | Relative to 7 GiB | Output SHA-256 |
+|---:|---:|---:|---|
+| 7168 MiB (8 GB card path) | 3.542 s | baseline | `b510f666...e722387` |
+| 12288 MiB (default) | 3.454 s | 2.5% faster | `b510f666...e722387` |
+| 14336 MiB (maximum) | 3.467 s | 2.1% faster | `b510f666...e722387` |
+
+All output tensors were byte-identical. The 12 GiB default is the measured
+sweet spot: it retains more packed weights than the 8 GB path without a gain
+from raising the cap to 14 GiB. These are requested native allocation budgets;
+the plugin still clamps them against current free device memory. Reproduce the
+matrix with:
+
+```sh
+ref/pixal3d/run.sh cuda ref/pixal3d/validate_budget_matrix.py \
+  --dump-dir tmp/pixal3d/resident-runs/cuda-house/dumps
+```
+
+A tested
 4096-row schedule was removed: its microbenchmark gain did not survive the
 full dense multiview run because differently sized workspaces reused poorly.
 

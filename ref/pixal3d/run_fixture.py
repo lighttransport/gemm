@@ -29,7 +29,7 @@ p.add_argument('--attach',type=int,help='Monitor an already running native proce
 p.add_argument('--gpu-execution',choices=['legacy','resident'],default='legacy')
 p.add_argument('--gpu-kernels',choices=['auto','blas','mma'],default='auto')
 p.add_argument('--gpu-flow-precision',choices=['bf16','fp32','mixed'],default='bf16')
-p.add_argument('--vram-budget-mib',type=int,default=14336)
+p.add_argument('--vram-budget-mib',type=int,default=12288)
 p.add_argument('--timeout',type=float,default=14400)
 a=p.parse_args()
 assert a.timeout>0 and 512<a.vram_budget_mib<=14336
