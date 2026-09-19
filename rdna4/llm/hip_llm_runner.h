@@ -84,7 +84,7 @@ typedef struct {
     /* Extend native Q8/Q8 attention to prefill (also enables native decode). */
     int qwen35_native_q8_prefill;
     int qwen35_native_q2k; /* precise Q2_K x Q8_1 decode on gfx1201 */
-    int qwen35_native_mmvq; /* also IQ2_S, IQ3_XXS, IQ3_S with precise Q8_1 staging */
+    int qwen35_native_mmvq; /* also IQ2_XXS/XS/S, IQ3_XXS/S with precise Q8_1 staging */
 } hip_llm_load_options;
 
 typedef struct {

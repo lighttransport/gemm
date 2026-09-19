@@ -8,15 +8,15 @@ implementation or validation path.
 ## Native Q8/Q8 prefill and deterministic sampling (2026-09-20)
 
 Warm, uncached 4096-token prefill with 512-token chunks now reaches
-**551–552 tok/s for IQ2_XS** and **572–573 tok/s for IQ3_XXS**, with Q8 K and V,
+**552–553 tok/s for IQ2_XS** and **575–576 tok/s for IQ3_XXS**, with Q8 K and V,
 BF16 projections, native Q8 attention and native MMVQ. Warm decode reaches
-**32.8–33.3 tok/s for IQ2** and **30.4–30.8 tok/s for IQ3**. Greedy and
+**33.4–33.8 tok/s for IQ2** and **31.8–32.1 tok/s for IQ3**. Greedy and
 temperature-0.6/seed-42 C++ merge responses match the pinned llama.cpp
 reference byte-for-byte, including complete token and EOS traces. Every
 warm timing repetition reproduces those responses. Generated functions
 pass C++17/ASan/UBSan tests with 10,000 randomized cases.
 Both models also recover the first-line passphrase from an exact 4096-token
-prompt, matching the reference's ten output bytes, selected IDs and EOS.
+prompt, matching the reference's eleven output bytes, selected IDs and EOS.
 
 Use `--qwen35-decode-graph --qwen35-native-q8-prefill --qwen35-native-mmvq` alongside
 `--kv-cache q8q8 --qwen35-prefill-bf16 --ubatch 512`. The new

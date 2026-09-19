@@ -2,6 +2,12 @@
  * Copyright (c) 2023-2026 The ggml authors, MIT license (see
  * reference_sampler.cpp for the complete retained license).
  * Compile without fast-math. Each warp owns one output row. */
+__device__ static const unsigned long long qwen35_iq2xxs_grid[256] = {
+#include "qwen35_iq2xxs_grid.inc"
+};
+__device__ static const unsigned long long qwen35_iq2xs_grid[512] = {
+#include "qwen35_iq2xs_grid.inc"
+};
 __device__ static const unsigned long long qwen35_iq2s_grid[1024] = {
 #include "../../common/iq2s_grid.inc"
 };
@@ -28,6 +34,71 @@ __device__ __forceinline__ int qwen35_signed_grid(unsigned int grid, unsigned in
 }
 __device__ __forceinline__ int qwen35_dot4(int a, int b, int sum) {
     return __builtin_amdgcn_sudot4(true, a, true, b, sum, false);
+}
+
+extern "C" __global__ void qwen35_matvec_iq2xxs(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    int blocks = cols / 256;
+    const unsigned char *w = weights + (size_t)row * blocks * 66;
+    float sum = 0.0f;
+    for (int qb = lane; qb < blocks * 8; qb += 32) {
+        int b = qb / 8, ib = qb & 7;
+        const unsigned char *p = w + b * 66;
+        const int *u = (const int *)(q + qb * 32);
+        unsigned int aux = *(const unsigned int *)(p + 6 + ib * 8);
+        int z = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned long long grid = qwen35_iq2xxs_grid[p[2 + ib * 8 + j]];
+            unsigned int signs = qwen35_iq_signs[(aux >> (7*j)) & 127];
+            int lo = qwen35_signed_grid((unsigned int)grid, signs, 0);
+            int hi = qwen35_signed_grid((unsigned int)(grid >> 32), signs, 4);
+            z = qwen35_dot4(lo, u[2*j], z);
+            z = qwen35_dot4(hi, u[2*j+1], z);
+        }
+        z = z * (int)((aux >> 27) | 1) / 8;
+        float d = (float)*(const _Float16 *)p * scales[qb];
+        sum += d * z;
+    }
+    for (int offset = 16; offset; offset >>= 1) sum += __shfl_xor(sum, offset, 32);
+    if (lane == 0) out[row] = sum;
+}
+
+extern "C" __global__ void qwen35_matvec_iq2xs(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    int blocks = cols / 256;
+    const unsigned char *w = weights + (size_t)row * blocks * 74;
+    float sum = 0.0f;
+    for (int qb = lane; qb < blocks * 8; qb += 32) {
+        int b = qb / 8, ib = qb & 7;
+        const unsigned char *p = w + b * 74;
+        const int *u = (const int *)(q + qb * 32);
+        int z0 = 0, z1 = 0;
+        unsigned int sc = p[66 + ib];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int code = ((const unsigned short *)(p + 2))[ib * 4 + j];
+            unsigned long long grid = qwen35_iq2xs_grid[code & 511];
+            unsigned int signs = qwen35_iq_signs[code >> 9];
+            int lo = qwen35_signed_grid((unsigned int)grid, signs, 0);
+            int hi = qwen35_signed_grid((unsigned int)(grid >> 32), signs, 4);
+            if (j < 2) { z0 = qwen35_dot4(lo, u[2*j], z0); z0 = qwen35_dot4(hi, u[2*j+1], z0); }
+            else { z1 = qwen35_dot4(lo, u[2*j], z1); z1 = qwen35_dot4(hi, u[2*j+1], z1); }
+        }
+        int z = (z0 * (int)(sc & 15) + z1 * (int)(sc >> 4) + (z0 + z1)/2)/4;
+        float d = (float)*(const _Float16 *)p * scales[qb];
+        sum += d * z;
+    }
+    for (int offset = 16; offset; offset >>= 1) sum += __shfl_xor(sum, offset, 32);
+    if (lane == 0) out[row] = sum;
 }
 
 extern "C" __global__ void qwen35_matvec_iq2s(

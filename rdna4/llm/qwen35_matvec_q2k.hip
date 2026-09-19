@@ -54,3 +54,48 @@ extern "C" __global__ void qwen35_matvec_q2k(
         sum += __shfl_xor(sum, offset, 32);
     if (lane == 0) out[row] = sum;
 }
+
+/* One warp per row, evaluated as eight virtual reference warps. Keeping
+ * their accumulators separate preserves the eight-warp reduction order.
+ * This improves tall 5120-column projections; the original kernel remains
+ * preferable for the 17408-column down projections. */
+extern "C" __global__ void qwen35_matvec_q2k_rows(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    int blocks = cols / 256, iqs = lane & 15;
+    const unsigned char *w = weights + (size_t)row * blocks * 84;
+    float parts[8] = {};
+#pragma unroll
+    for (int vw = 0; vw < 8; ++vw) {
+        for (int b = lane / 16 + 2 * vw; b < blocks; b += 16) {
+            const unsigned char *p = w + b * 84;
+            const unsigned char *s = p + (iqs & ~7) + (iqs & 7) / 4;
+            int v = ((const int *)(p + 16))[iqs];
+            float sd = 0.0f, sm = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                int qb = b * 8 + 4 * (iqs / 8) + j;
+                int u = ((const int *)(q + qb * 32))[iqs & 7];
+                int z = __builtin_amdgcn_sudot4(true, (v >> (2*j)) & 0x03030303,
+                                              true, u, 0, false);
+                sd += scales[qb] * (z * (s[2*j] & 15));
+                int m = s[2*j] >> 4;
+                m |= m << 8; m |= m << 16;
+                int zm = __builtin_amdgcn_sudot4(true, m, true, u, 0, false);
+                sm += scales[qb] * zm;
+            }
+            float d = (float)*(const _Float16 *)(p + 80);
+            float dm = (float)*(const _Float16 *)(p + 82);
+            parts[vw] += d * sd - dm * sm;
+        }
+    }
+    float sum = parts[0];
+#pragma unroll
+    for (int vw = 1; vw < 8; ++vw) sum += parts[vw];
+    for (int offset = 16; offset; offset >>= 1)
+        sum += __shfl_xor(sum, offset, 32);
+    if (lane == 0) out[row] = sum;
+}

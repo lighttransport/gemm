@@ -13462,7 +13462,9 @@ struct hip_llm_runner {
     size_t q8_prefill_capacity;
     hipModule_t q2k_module;
     hipFunction_t fn_qwen35_quantize_q81, fn_qwen35_matvec_q2k;
+    hipFunction_t fn_qwen35_matvec_q2k_rows;
     hipModule_t iq_module;
+    hipFunction_t fn_qwen35_matvec_iq2xxs, fn_qwen35_matvec_iq2xs;
     hipFunction_t fn_qwen35_matvec_iq2s, fn_qwen35_matvec_iq3xxs, fn_qwen35_matvec_iq3s;
     hipGraph_t  graph_hidden;     /* captured forward (no lm_head) pipeline */
     hipGraphExec_t graph_exec_hidden;
@@ -17281,6 +17283,8 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                       r->q2k_module, "qwen35_quantize_q81"));
             CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k,
                       r->q2k_module, "qwen35_matvec_q2k"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k_rows,
+                      r->q2k_module, "qwen35_matvec_q2k_rows"));
             if (native_mmvq) {
                 if (hip_compile_kernels_ex(&r->iq_module, r->device,
                         qwen35_matvec_iq_source, "qwen35_iq.hip", r->verbose,
@@ -17290,6 +17294,10 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                 }
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2s,
                           r->iq_module, "qwen35_matvec_iq2s"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xxs,
+                          r->iq_module, "qwen35_matvec_iq2xxs"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs,
+                          r->iq_module, "qwen35_matvec_iq2xs"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3xxs,
                           r->iq_module, "qwen35_matvec_iq3xxs"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s,
@@ -19578,8 +19586,13 @@ static inline void launch_matvec_q2_K(hip_llm_runner *r, void *dst, void *mat,
                32, 1, 1, 0, r->stream, qa);
         void *args[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
                          &n_rows, &n_cols };
-        LAUNCH(r->fn_qwen35_matvec_q2k, n_rows, 1, 1,
-               256, 1, 1, 0, r->stream, args);
+        if (n_cols == 5120 && n_rows >= 5120) {
+            LAUNCH(r->fn_qwen35_matvec_q2k_rows, (n_rows + 7) / 8, 1, 1,
+                   256, 1, 1, 0, r->stream, args);
+        } else {
+            LAUNCH(r->fn_qwen35_matvec_q2k, n_rows, 1, 1,
+                   256, 1, 1, 0, r->stream, args);
+        }
         return;
     }
     const char *q81_env = getenv("LLM_Q2K_Q81_SCALAR");
@@ -19690,6 +19703,15 @@ static inline hipFunction_t iq_d4_or_q81_quantizer(hip_llm_runner *r) {
 }
 static inline void launch_matvec_iq2_xxs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
+    if (r->fn_qwen35_matvec_iq2xxs && n_cols <= 17408 && n_cols % 256 == 0) {
+        r->q8x2_reuse_valid = 0;
+        r->iq1_q8_valid = 0;
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &x, &n_cols };
+        LAUNCH(r->fn_qwen35_quantize_q81, n_cols / 32, 1, 1, 32, 1, 1, 0, r->stream, qa);
+        void *a[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+        LAUNCH(r->fn_qwen35_matvec_iq2xxs, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        return;
+    }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     int rows_per_block = r->mw_threads / 32;
     const char *q81_env = getenv("LLM_IQ2_XXS_Q81_SCALAR");
@@ -19783,6 +19805,15 @@ static inline void launch_matvec_iq4_xs(hip_llm_runner *r, void *dst,
 }
 static inline void launch_matvec_iq2_xs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
+    if (r->fn_qwen35_matvec_iq2xs && n_cols <= 17408 && n_cols % 256 == 0) {
+        r->q8x2_reuse_valid = 0;
+        r->iq1_q8_valid = 0;
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &x, &n_cols };
+        LAUNCH(r->fn_qwen35_quantize_q81, n_cols / 32, 1, 1, 32, 1, 1, 0, r->stream, qa);
+        void *a[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+        LAUNCH(r->fn_qwen35_matvec_iq2xs, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        return;
+    }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     int rows_per_block = r->mw_threads / 32;
     const char *q81_env = getenv("LLM_IQ2_XS_Q81_SCALAR");
@@ -21368,7 +21399,9 @@ static inline void launch_matvec_ssm_auto(hip_llm_runner *r, void *dst, void *ma
                                            void *x, int n_rows, int n_cols, int type,
                                            int is_qkv) {
     /* Explicit native MMVQ takes precedence over historical diagnostic gates. */
-    if ((type == GGML_TYPE_IQ2_S && r->fn_qwen35_matvec_iq2s) ||
+    if ((type == GGML_TYPE_IQ2_XXS && r->fn_qwen35_matvec_iq2xxs) ||
+        (type == GGML_TYPE_IQ2_XS && r->fn_qwen35_matvec_iq2xs) ||
+        (type == GGML_TYPE_IQ2_S && r->fn_qwen35_matvec_iq2s) ||
         (type == GGML_TYPE_IQ3_XXS && r->fn_qwen35_matvec_iq3xxs) ||
         (type == GGML_TYPE_IQ3_S && r->fn_qwen35_matvec_iq3s)) {
         launch_matvec_auto(r, dst, mat, x, n_rows, n_cols, type);

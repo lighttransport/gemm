@@ -7,14 +7,14 @@ On RX 9070 XT / gfx1201 / ROCm 10, native Q8/Q8 attention now exceeds the
 
 | Model / sampling | Warm prefill tok/s | Warm decode tok/s |
 |---|---:|---:|
-| IQ2_XS greedy | 551.73–552.31 | 33.25–33.27 |
-| IQ2_XS temperature 0.6, seed 42 | 551.25–551.64 | 32.80–32.85 |
-| IQ3_XXS greedy | 572.40–573.10 | 30.77–30.78 |
-| IQ3_XXS temperature 0.6, seed 42 | 572.96–573.28 | 30.43–30.48 |
+| IQ2_XS greedy | 552.66–553.28 | 33.80–33.82 |
+| IQ2_XS temperature 0.6, seed 42 | 551.56–551.81 | 33.40–33.42 |
+| IQ3_XXS greedy | 575.37–575.62 | 32.07–32.08 |
+| IQ3_XXS temperature 0.6, seed 42 | 574.77–575.13 | 31.78–31.79 |
 
 These are full 4096-token, 512-chunk, context-8192 requests, Q8 K **and** V.
 Repetitions reset KV and recurrent state and do not reuse prompt results.
-Timing excludes trace I/O. Cold passes are 491–508 tok/s. Both sampling modes
+Timing excludes trace I/O. Cold passes are 492–515 tok/s. Both sampling modes
 match the pinned llama.cpp reference's complete token IDs, EOS and raw output
 bytes for the C++ merge task. Every timing repetition reproduces its traced
 response. All outputs pass C++17 compilation, ASan/UBSan, fixed edge cases and
@@ -23,15 +23,15 @@ byte parity: full-model logits still differ and BF16 projections are approximate
 
 The final configuration also retrieves `ZEPHYR-7319` from the first line of
 an exact 4096-token prompt on both models. All four runner/reference outputs
-are exactly those ten bytes, with identical selected tokens and EOS. This
+are exactly those eleven bytes, with identical selected tokens and EOS. This
 checks that the early prefill chunks still affect generation. Artifacts:
-`tmp/qwen38/final-native-retrieval/`.
+`tmp/qwen38/final-native-retrieval-v4/` (reuses the earlier pinned reference).
 
 New controls: `--sampling-profile llama`, `--qwen35-decode-graph`,
 `--qwen35-native-q8-attn`, `--qwen35-native-q8-prefill`, and diagnostic
-`--qwen35-reference-math`. `--qwen35-native-mmvq` enables native Q2_K, IQ2_S,
-IQ3_XXS and IQ3_S decode; `--qwen35-native-q2k` isolates Q2_K. The native
-matrix-vector kernels and quantizer pass 1,609,728 activation and 1,239,732
+`--qwen35-reference-math`. `--qwen35-native-mmvq` enables native Q2_K,
+IQ2_XXS/XS/S and IQ3_XXS/S decode; `--qwen35-native-q2k` isolates Q2_K. The native
+matrix-vector kernels and quantizer pass 2,515,200 activation and 3,950,820
 output comparisons against actual reference kernels. Normal generation stops at EOS; use the explicit
 `--bench-ignore-eos` only for synthetic timing. Native attention eliminates
 the repeated Q8-to-F16 expansion and follows the pinned reference's Q8_1
@@ -43,9 +43,14 @@ Graph replay before changing attention matches uncaptured logits bitwise.
 Reproduction and remaining work: [QWEN38_REFERENCE_VALIDATION.md](rdna4/llm/QWEN38_REFERENCE_VALIDATION.md).
 Reference source is pinned to `1859b520910af6f682256fd7299797774111a27a`, exported
 and checked without changing the external checkout. Full manifests and traces:
-`tmp/qwen38/final-iq2-native-mmvq-v2/` and `final-iq3-native-mmvq-v2/`.
-IQ2 reuses the audited reference artifacts from `final-iq2-native-q2k/`;
-the harness verifies model, prompt, reference hashes and exact sampler commands.
+`tmp/qwen38/final-iq2-native-mmvq-v4/` and `final-iq3-native-mmvq-v4/`.
+IQ2 reuses the audited reference artifacts from `final-iq2-native-q2k/`,
+and IQ3 from `final-iq3-native-mmvq-v2/`. The harness verifies model, prompt,
+reference hashes and exact sampler commands. The Q2_K scheduling change
+preserves all logged logits bitwise against v3 across both sampling modes
+and models (648 selections). Native IQ2_XXS/XS raises IQ3's greedy full-logit
+relative L2 from 0.03119 (v2) to 0.03641 (v3/v4), despite exact individual
+operator results and identical tested output. This coupled gap remains open.
 Attention-only baselines remain in `final-iq2-native-prefill/` and
 `final-iq3-native-prefill/` (25.6–26.0 tok/s decode).
 The validation script includes the exact 4096-token C++ prompt by default.

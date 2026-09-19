@@ -29,9 +29,12 @@ The runner does not link libllama; its sampler and kernels are independent ports
   the two-column reference's split schedule (occupancy 9) and uses separate
   prefill scratch so allocation growth cannot invalidate decode graphs.
 - `--qwen35-native-q2k`: native Q2_K x Q8_1 scalar projections on gfx1201,
-  with the reference quantizer and eight-warp reduction order. This overrides
-  the old diagnostic Q2_K environment switches.
-- `--qwen35-native-mmvq`: also use native IQ2_S, IQ3_XXS and IQ3_S x Q8_1 scalar
+  with the reference quantizer and eight-warp reduction order. For 5120-column
+  matrices with at least 5120 rows, one physical warp evaluates eight virtual
+  reference warps per row; other shapes retain eight physical warps per row.
+  This overrides the old diagnostic Q2_K environment switches.
+- `--qwen35-native-mmvq`: also use native IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS
+  and IQ3_S x Q8_1 scalar
   projections. It includes native Q2_K and preserves the reference reduction
   order while assigning eight independent IQ rows to each workgroup. It takes
   precedence over diagnostic SSM projection switches and the old fused IQ3
@@ -100,11 +103,14 @@ timing is explicitly marked in the result; it is not a new measurement.
   inputs and the model's 5120/6144/17408-column shapes. Reproduce with
   `test_reference_q2k.py --llama tmp/qwen38/reference-build/source --out tmp/qwen38/reference-q2k`,
   then run `tmp/qwen38/reference-q2k/test` with the ROCm library path.
-  The expanded test also covers IQ2_S, IQ3_XXS and IQ3_S with
-  32/64/128/256-thread launches: **1,609,728** activation checks and
-  **1,239,732** output comparisons across all four types.
+  The expanded test also covers IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S with
+  32/64/128/256-thread launches and both Q2_K schedules:
+  **2,515,200** activation checks and **3,950,820** output comparisons
+  across all six types, including 17408-row Q2_K projections.
   Representative 5120x17408 IQ2_S/IQ3_XXS kernels
   take 46.3/53.6 microseconds versus 88.7/93.2 for the pinned reference.
+  IQ2_XXS/IQ2_XS take 49.3/52.6 microseconds versus 88.0/88.0; test log:
+  `tmp/qwen38/reference-iq2xxs-xs-test.log`.
 - Graph replay before changing attention: both IQ2 and IQ3 match uncaptured
   logits bitwise across all 155 selections of the C++ response.
 - Native attention: both models emit the same 560-byte greedy C++ response as
@@ -133,7 +139,8 @@ repetitions reproduce those bytes. Sampled uses temperature 0.6, top-k 20,
 top-p 0.95, min-p 0, neutral penalties and seed 42. These measurements do not
 enable the separate native Q2_K option.
 
-With `--qwen35-native-mmvq`, the final warm measurements are:
+Before extending native MMVQ to IQ2_XXS/IQ2_XS and tuning Q2_K scheduling,
+the warm measurements were:
 
 | Model / sampling | Prefill tok/s | Decode tok/s |
 |---|---:|---:|
@@ -153,13 +160,47 @@ full-logit relative L2 is still 0.02710 (IQ2) and 0.03119 (IQ3).
 The same final configuration also passes an early-context retrieval check:
 an exact 4096-token prompt places `ZEPHYR-7319` on its first line and asks for
 it after the intervening context. Both models and both backends emit exactly
-those ten bytes, with identical selected IDs and EOS. Artifacts and commands
-are in `tmp/qwen38/final-native-retrieval/`. This covers retention across all
+those eleven bytes, with identical selected IDs and EOS. Artifacts and commands
+are in `tmp/qwen38/final-native-retrieval/`. The final v4 runner also passes
+against those audited reference traces; its results and commands are in
+`tmp/qwen38/final-native-retrieval-v4/`. This covers retention across all
 eight prefill chunks in addition to the C++ task at the prompt tail.
 
 Q2_K alone raises IQ2 decode to 30.9 tok/s, but slightly slows IQ3's existing
 Q2_K path. Use the combined MMVQ option for the reported final configuration;
 the isolated option remains available for differential experiments.
+
+The final configuration also ports IQ2_XXS and IQ2_XS to the precise native
+module and groups Q2_K rows for tall 5120-column projections. The latter
+preserves the reference's eight partial sums per row before reduction;
+17408-column down projections retain the original schedule. A same-run
+17408x5120 microbenchmark improved from 71.5 to 55.6 microseconds.
+
+Final warm measurements (all Q8 K/Q8 V, 4096/512, context 8192):
+
+| Model / sampling | Prefill tok/s | Decode tok/s |
+|---|---:|---:|
+| IQ2_XS greedy | 552.66–553.28 | 33.80–33.82 |
+| IQ2_XS sampled | 551.56–551.81 | 33.40–33.42 |
+| IQ3_XXS greedy | 575.37–575.62 | 32.07–32.08 |
+| IQ3_XXS sampled | 574.77–575.13 | 31.78–31.79 |
+
+All four complete outputs still match the pinned reference's tokens, bytes
+and EOS, pass the C++ execution tests, and repeat identically in the three
+uncached timing runs. Artifacts: `tmp/qwen38/final-iq2-native-mmvq-v4/` and
+`tmp/qwen38/final-iq3-native-mmvq-v4/`; audited reference runs are reused from
+`final-iq2-native-q2k/` and `final-iq3-native-mmvq-v2/`, respectively.
+Those reference warm greedy runs measured 292.5/27.2–27.3 tok/s for IQ2 and
+420.0–420.3/25.1–25.3 tok/s for IQ3 (prefill/decode).
+
+The Q2_K scheduling change also preserves **every logged full-model logit**
+against v3 for all four C++ runs (648 selections total); see each output
+directory's `logits-vs-v3-*.json`. This comparison is against the previous
+runner, not whole-model llama.cpp numerical parity. Final greedy relative L2
+against llama.cpp is 0.02754 (IQ2) and 0.03641 (IQ3); sampled is 0.02548 and
+0.04316. The IQ3 greedy error increased from v2's 0.03119 when enabling the
+exact IQ2 ports. Local operator parity alone does not close the coupled
+model's error, although these complete tested responses remain identical.
 
 ## Outstanding requirements
 

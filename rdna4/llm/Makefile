@@ -83,7 +83,7 @@ qwen35_attention_q8.inc: qwen35_attention_q8.hip
 qwen35_matvec_q2k.inc: qwen35_matvec_q2k.hip
 	python3 -c 'import json,pathlib; print("static const char qwen35_matvec_q2k_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
 
-qwen35_matvec_iq.inc: qwen35_matvec_iq.hip embed_hip_source.py ../../common/iq2s_grid.inc ../../common/iq3xxs_grid.inc ../../common/iq3s_grid.inc ../../common/ksigns_iq2xs.inc
+qwen35_matvec_iq.inc: qwen35_matvec_iq.hip embed_hip_source.py qwen35_iq2xxs_grid.inc qwen35_iq2xs_grid.inc ../../common/iq2s_grid.inc ../../common/iq3xxs_grid.inc ../../common/iq3s_grid.inc ../../common/ksigns_iq2xs.inc
 	python3 embed_hip_source.py $< qwen35_matvec_iq_source > $@
 
 # Other test executables include the runner translation unit directly.

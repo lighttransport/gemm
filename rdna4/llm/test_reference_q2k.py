@@ -38,13 +38,16 @@ def main():
 int main() {
     std::mt19937 rng(7319);
     size_t quant_checked=0, matrix_checked=0;
-    for(int kind : {0,1,2,3})
+    for(int kind : {0,1,2,3,4,5})
     for(int cols : {256,512,4096,5120,6144,17408})
-    for(int rows : {1,48,129,5120})
+    for(int rows : {1,48,129,5120,17408})
     for(int pattern : {0,1,2}) {
+        if(kind!=0 && rows==17408) continue;
         int nb=cols/256;
-        int bs=kind==0?84:kind==1?82:kind==2?98:110;
-        const char *name=kind==0?"Q2_K":kind==1?"IQ2_S":kind==2?"IQ3_XXS":"IQ3_S";
+        const int block_sizes[] = {84,82,98,110,66,74};
+        const char *names[] = {"Q2_K","IQ2_S","IQ3_XXS","IQ3_S","IQ2_XXS","IQ2_XS"};
+        int bs=block_sizes[kind];
+        const char *name=names[kind];
         std::vector<unsigned char> w((size_t)rows*nb*bs);
         for(auto &v:w) v=rng();
         for(int i=0;i<rows*nb;++i) {
@@ -89,16 +92,23 @@ int main() {
                 if(kind==0) { REF(GGML_TYPE_Q2_K,8); }
                 else if(kind==1) { REF(GGML_TYPE_IQ2_S,1); }
                 else if(kind==2) { REF(GGML_TYPE_IQ3_XXS,1); }
-                else { REF(GGML_TYPE_IQ3_S,1); }
-            } else if(kind==0) qwen35_matvec_q2k<<<rows,256>>>(da,dw,dq,ds,rows,cols);
+                else if(kind==3) { REF(GGML_TYPE_IQ3_S,1); }
+                else if(kind==4) { REF(GGML_TYPE_IQ2_XXS,1); }
+                else { REF(GGML_TYPE_IQ2_XS,1); }
+            } else if(kind==0) {
+                if(threads==512) qwen35_matvec_q2k<<<rows,256>>>(da,dw,dq,ds,rows,cols);
+                else qwen35_matvec_q2k_rows<<<(rows+threads/32-1)/(threads/32),threads>>>(da,dw,dq,ds,rows,cols);
+            }
             else if(kind==1) qwen35_matvec_iq2s<<<(rows+threads/32-1)/(threads/32),threads>>>(da,dw,dq,ds,rows,cols);
             else if(kind==2) qwen35_matvec_iq3xxs<<<(rows+threads/32-1)/(threads/32),threads>>>(da,dw,dq,ds,rows,cols);
-            else qwen35_matvec_iq3s<<<(rows+threads/32-1)/(threads/32),threads>>>(da,dw,dq,ds,rows,cols);
+            else if(kind==3) qwen35_matvec_iq3s<<<(rows+threads/32-1)/(threads/32),threads>>>(da,dw,dq,ds,rows,cols);
+            else if(kind==4) qwen35_matvec_iq2xxs<<<(rows+threads/32-1)/(threads/32),threads>>>(da,dw,dq,ds,rows,cols);
+            else qwen35_matvec_iq2xs<<<(rows+threads/32-1)/(threads/32),threads>>>(da,dw,dq,ds,rows,cols);
 #undef REF
         };
         run(true);
-        for(int threads : {32,64,128,256}) {
-        if(kind==0 && threads!=256) continue;
+        for(int threads : {32,64,128,256,512}) {
+        if(kind!=0 && threads==512) continue;
         run(false,threads);CHECK(hipDeviceSynchronize());
         CHECK(hipMemcpy(a.data(),da,rows*4,hipMemcpyDeviceToHost));
         CHECK(hipMemcpy(b.data(),db,rows*4,hipMemcpyDeviceToHost));
@@ -109,7 +119,7 @@ int main() {
             }
             ++matrix_checked;
         }
-        if(rows==5120 && pattern==0 && (cols==5120 || cols==17408)) {
+        if((rows==5120 || rows==17408) && pattern==0 && (cols==5120 || cols==17408)) {
             for(bool reference : {true,false}) {
                 if(reference && threads!=256) continue;
                 hipEvent_t start,stop;CHECK(hipEventCreate(&start));CHECK(hipEventCreate(&stop));
@@ -117,8 +127,9 @@ int main() {
                 for(int i=0;i<200;++i) run(reference,threads);
                 CHECK(hipEventRecord(stop));CHECK(hipEventSynchronize(stop));
                 float elapsed;CHECK(hipEventElapsedTime(&elapsed,start,stop));
-                printf("%s %s rows=%d cols=%d threads=%d %.3f us\n",reference?"llama":"ours",name,rows,cols,
-                    reference?(kind==0?256:32):threads,elapsed*5);
+                printf("%s %s rows=%d cols=%d threads=%d %.3f us\n",
+                    reference?"llama":threads==512?"ours-eight-warps":"ours",name,rows,cols,
+                    reference?(kind==0?256:32):threads==512?256:threads,elapsed*5);
                 CHECK(hipEventDestroy(start));CHECK(hipEventDestroy(stop));
             }
         }

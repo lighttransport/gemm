@@ -1266,7 +1266,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       [--qwen35-decode-graph] [--qwen35-native-q8-attn] (gfx1201 Q8/Q8 decode)\n");
             fprintf(stderr, "       [--qwen35-native-q8-prefill] (also use native Q8/Q8 for prefill)\n");
             fprintf(stderr, "       [--qwen35-native-q2k] (native Q2_K x Q8_1 decode on gfx1201)\n");
-            fprintf(stderr, "       [--qwen35-native-mmvq] (native Q2_K, IQ2_S, IQ3_XXS, IQ3_S x Q8_1 decode)\n");
+            fprintf(stderr, "       [--qwen35-native-mmvq] (native Q2_K, IQ2_XXS/XS/S, IQ3_XXS/S x Q8_1 decode)\n");
             fprintf(stderr, "       [--qwen35-reference-math] (diagnostic; incomplete whole-model parity)\n");
             fprintf(stderr, "       [--sampling-profile llama] [--seed N] [--temp T] [--top-k K] [--top-p P] [--min-p P]\n");
             fprintf(stderr, "       [--repeat-penalty R] [--presence-penalty P] [--frequency-penalty F] [--penalty-last-n N]\n");
