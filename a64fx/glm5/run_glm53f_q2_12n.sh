@@ -17,6 +17,7 @@ q2_root=${GLM53F_Q2_ROOT:-$HOME/models/glm53f-gguf}
 q2=${GLM53F_Q2_MODEL:-$q2_root/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf}
 model=${GLM53F_MODEL_DIR:-$HOME/models/glm53f}
 q2_stage=${GLM53F_STAGE_DIR:-/local/glm53f-q2-routed-$job}
+embed_stage=${GLM53F_Q2_EMBED_STAGE:-/local/glm53f-q2-embed-$job}
 shared_stage=${GLM53F_SHARED_STAGE_DIR:-/local/glm53f-q2-shared-$job}
 core_stage=${GLM53F_REPACK_STAGE_DIR:-/local/glm53f-q2-core-$job}
 shared_source=${GLM53F_SHARED_SOURCE:-$model/a64fx_ep12_v1/shared}
@@ -45,6 +46,12 @@ echo "staging Q2 routed experts to $q2_stage"
 "$mpiexec_bin" -n 12 -of-proc "$logdir/q2-stage-$run_tag" \
     ./glm53f_q2_stage "$q2" "$q2_stage"
 test "$(grep -l 'SENTINEL glm53f_q2_stage=' "$logdir"/q2-stage-$run_tag.*.* | wc -l)" -eq 12
+
+echo "staging Q2 input embeddings to $embed_stage"
+"$mpiexec_bin" -n 12 -of-proc "$logdir/q2-embed-stage-$run_tag" \
+    ./glm53f_q2_embed_stage "$q2" "$embed_stage"
+test "$(grep -l 'SENTINEL glm53f_q2_embed_stage=' "$logdir"/q2-embed-stage-$run_tag.*.* | wc -l)" -eq 12
+export GLM53F_Q2_EMBED_STAGE=$embed_stage
 
 echo "staging shared expert and compact core to node-local storage"
 "$mpiexec_bin" -n 12 -of-proc "$logdir/shared-stage-$run_tag" sh -c '

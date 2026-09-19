@@ -103,6 +103,8 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
     "${ldflags[@]}" -o glm53f_sparse_batch_check
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_stage.c \
     -o glm53f_q2_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_embed_stage.c \
+    -o glm53f_q2_embed_stage
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_core_stage.c \
     -o glm53f_core_stage
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_core_add_routers.c \

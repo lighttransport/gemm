@@ -9,6 +9,7 @@
 #include "../../common/glm53f_ref.h"
 #include "glm53f_embedding_12n.h"
 #include <mpi.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,7 @@ enum { GLM53F_EMBED_HIDDEN = 4096, GLM53F_EMBED_STREAMS = 4,
 struct glm53f_embedding_context_12n {
     int rank, ranks, row0, rows;
     uint16_t *weight;
+    float *q2_weight;
     float row[GLM53F_EMBED_HIDDEN];
 };
 
@@ -31,6 +33,25 @@ glm53f_embedding_context_12n *glm53f_embedding_create_12n(const char *model) {
     if (c->ranks != 12) goto fail;
     c->row0 = (int)((long long)GLM53F_EMBED_VOCAB * c->rank / c->ranks);
     c->rows = (int)((long long)GLM53F_EMBED_VOCAB * (c->rank + 1) / c->ranks) - c->row0;
+    const char *stage = getenv("GLM53F_Q2_EMBED_STAGE");
+    if (stage && *stage) {
+        char path[4096];
+        FILE *f;
+        snprintf(path, sizeof(path), "%s/rank%02d.f32", stage, c->rank);
+        f = fopen(path, "rb");
+        if (!f) goto fail;
+        if (posix_memalign((void **)&c->q2_weight, 256,
+                           (size_t)c->rows * GLM53F_EMBED_HIDDEN * sizeof(float))) {
+            fclose(f); goto fail;
+        }
+        if (fread(c->q2_weight, sizeof(float),
+                  (size_t)c->rows * GLM53F_EMBED_HIDDEN, f) !=
+            (size_t)c->rows * GLM53F_EMBED_HIDDEN) {
+            fclose(f); goto fail;
+        }
+        fclose(f);
+        return c;
+    }
     if (posix_memalign((void **)&c->weight, 256,
                        (size_t)c->rows * GLM53F_EMBED_HIDDEN * sizeof(uint16_t))) goto fail;
     st = glm53f_st_open(model);
@@ -50,6 +71,7 @@ fail:
 void glm53f_embedding_free_12n(glm53f_embedding_context_12n *c) {
     if (!c) return;
     free(c->weight);
+    free(c->q2_weight);
     free(c);
 }
 
@@ -64,9 +86,14 @@ int glm53f_embedding_streams_12n(
     }
     if (owner < 0) return -1;
     if (owner == c->rank) {
-        const uint16_t *src = c->weight + (size_t)(token - c->row0) * GLM53F_EMBED_HIDDEN;
-        for (int i = 0; i < GLM53F_EMBED_HIDDEN; ++i)
-            c->row[i] = glm53f_bf16_to_f32(src[i]);
+        if (c->q2_weight) {
+            const float *src = c->q2_weight + (size_t)(token - c->row0) * GLM53F_EMBED_HIDDEN;
+            memcpy(c->row, src, sizeof(c->row));
+        } else {
+            const uint16_t *src = c->weight + (size_t)(token - c->row0) * GLM53F_EMBED_HIDDEN;
+            for (int i = 0; i < GLM53F_EMBED_HIDDEN; ++i)
+                c->row[i] = glm53f_bf16_to_f32(src[i]);
+        }
     }
     if (MPI_Bcast(c->row, GLM53F_EMBED_HIDDEN, MPI_FLOAT, owner,
                   MPI_COMM_WORLD) != MPI_SUCCESS) return -1;
