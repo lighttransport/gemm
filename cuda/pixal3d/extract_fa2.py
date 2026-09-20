@@ -5,7 +5,7 @@ import re
 import sys
 
 source = Path(__file__).resolve().parents[1] / 'fa2/cuda_fa2_kernels.h'
-text = source.read_text().split('static const char *k_fa2_attn_src =', 1)[1]
+text = source.read_text(encoding='utf-8').split('static const char *k_fa2_attn_src =', 1)[1]
 text = text.split('static const char *k_fa2_attn_fp8_src', 1)[0]
 lines = []
 for line in text.splitlines():
@@ -25,4 +25,4 @@ for dtype in ['bf16', 'fp16']:
     for macro in sorted(set(re.findall(r'^#define\s+(FA2_\w+)', body, re.M)) | {'FA2_BF16'}):
         out += [f'#undef {macro}\n']
 path = Path(sys.argv[1]); path.parent.mkdir(parents=True, exist_ok=True)
-path.write_text(''.join(out))
+path.write_text(''.join(out), encoding='utf-8')

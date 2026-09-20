@@ -246,11 +246,14 @@ cuda/llm/scan/deltanet_chunk_test
 
 # Python venv (tooling, e.g. git-filter-repo)
 .venv/
+.venv-pixal3d-cuda/
+.cuda/
 /tmp/
 
 # Vulkan CMake build directories (regenerate via cmake)
 vulkan/build/
 vulkan/build_t2/
+cuda/pixal3d/build-windows/
 
 # Generated / compiled artifacts that must never be committed
 *.cubin

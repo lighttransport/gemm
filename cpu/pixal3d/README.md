@@ -80,6 +80,37 @@ Ampere (sm_80) or newer. ROCm uses `HIPCC`, `ROCM_LIB`, and its own
 are loaded relative to `cpu/pixal3d/libpixal3d.so`, preserving the repository's
 `cpu/`, `cuda/` and `rdna4/` directory layout when installing elsewhere.
 
+### Windows CUDA kernel build
+
+Native Windows currently builds and validates the standalone CUDA resident
+plugin. From a PowerShell prompt in the repository root, create the local uv
+environment and build for an RTX 3070 (`sm_86`) with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ref\pixal3d\setup_windows.ps1
+powershell -ExecutionPolicy Bypass -File ref\pixal3d\build_windows.ps1 `
+  -Architecture 86
+```
+
+The setup installs PyTorch 2.7.1 CUDA 12.8 and the NVIDIA compiler-support pip
+package inside `.venv-pixal3d-cuda`. NVIDIA's CUDA 13.3 compiler, runtime, NVVM,
+and cuBLAS redistributable archives are installed without administrator access
+under `.cuda\13.3`; this version matches the tested 610.62 driver's reported
+maximum CUDA level. Pass `-SkipToolkit` to use an existing complete toolkit and
+`-CudaRoot` to select it. The build script compiles `pixal3d_cuda.dll` with MSVC
+and runs the resident GEMM, attention, RoPE-cache, allocation, and
+error-recovery checks against PyTorch.
+The complete CPU host pipeline remains a Linux build because it depends on the
+project's Linux OpenBLAS/OpenCV and dynamic-loader path.
+
+This path was validated on `titanv-win10` with an RTX 3070 8 GB, driver 610.62,
+MSVC 19.44, CUDA compiler 13.3.73, and PyTorch 2.7.1+cu128. The generated Ninja
+rule contains only `compute_86,sm_86`. Resident FP32/BF16/FP16 GEMM and
+attention, cached RoPE, bounded allocation reuse, invalid-command recovery, and
+pool trimming all passed against PyTorch. Median 12-head BF16 attention times
+were 0.373 ms at 1024 tokens and 3.730 ms at 4096 tokens for the retained MMA
+kernel, versus 3.781 ms and 25.116 ms for the diagnostic BLAS path.
+
 The inpainting implementation is pinned to OpenCV 4.12 to match the Python
 reference. It uses its stable priority heap even when the system libraries are
 4.6; the old 4.6 photo implementation is prohibitively slow on some 4096 atlases.

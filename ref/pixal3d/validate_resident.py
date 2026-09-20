@@ -3,6 +3,8 @@ import argparse
 import ctypes as C
 from pathlib import Path
 import json
+import os
+import sys
 import time
 import numpy as np
 import torch
@@ -12,12 +14,29 @@ p = argparse.ArgumentParser()
 p.add_argument('--backend', choices=['cuda', 'rocm'], required=True)
 p.add_argument('--kernels', choices=['auto', 'blas', 'mma'], default='mma')
 p.add_argument('--benchmark',action='store_true')
+p.add_argument('--library',type=Path,
+               help='GPU plugin path (defaults to the in-tree Linux or Windows build)')
+p.add_argument('--dll-directory',type=Path,action='append',default=[],
+               help='Windows dependency search directory; may be repeated')
 a = p.parse_args()
 assert torch.cuda.is_available() and bool(torch.version.hip) == (a.backend == 'rocm')
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.manual_seed(17)
 root = Path(__file__).resolve().parents[2]
-lib = C.CDLL(str(root / ('cuda' if a.backend == 'cuda' else 'rdna4') / 'pixal3d' / f'libpixal3d_{a.backend}.so'))
+if a.library is not None:
+    library = a.library.resolve()
+elif sys.platform == 'win32':
+    if a.backend != 'cuda':
+        raise RuntimeError('The Windows validation path currently supports CUDA only')
+    library = root / 'cuda/pixal3d/build-windows/pixal3d_cuda.dll'
+else:
+    library = (root / ('cuda' if a.backend == 'cuda' else 'rdna4') /
+               'pixal3d' / f'libpixal3d_{a.backend}.so')
+dll_directories = []
+if sys.platform == 'win32':
+    dll_directories = [os.add_dll_directory(str(path.resolve()))
+                       for path in a.dll_directory]
+lib = C.CDLL(str(library))
 class Op(C.Structure):
     _fields_ = [(x, C.c_int) for x in ['op','precision','n','c','k','heads','offset','extra']] + [('epsilon',C.c_float)] + [(x,C.c_void_p) for x in ['out','x','w','b','v']]
 lib.px_gpu_create.argtypes=[C.c_int,C.c_size_t];lib.px_gpu_create.restype=C.c_void_p
@@ -93,9 +112,9 @@ try:
                 assert lib.px_gpu_configure(d,mode,0)==0
                 seconds=[]
                 for repeat in range(4):
-                    torch.cuda.synchronize();start=time.monotonic()
+                    torch.cuda.synchronize();start=time.perf_counter()
                     assert lib.px_gpu_execute(d,C.byref(op))==0,lib.px_gpu_error(d)
-                    torch.cuda.synchronize();seconds.append(time.monotonic()-start)
+                    torch.cuda.synchronize();seconds.append(time.perf_counter()-start)
                 print(json.dumps(dict(benchmark='attention',backend=a.backend,tokens=n,kernels=['auto','blas','mma'][mode],seconds=seconds[1:])),flush=True)
             free()
     # The allocator must reject an oversized request without invalidating the context.
