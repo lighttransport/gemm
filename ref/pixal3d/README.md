@@ -204,13 +204,16 @@ It is a development utility, not a Python implementation of the inference pipeli
 `validate_mesh_stage.py --dump-dir DIR` compares the saved 1024 remesh and
 simplification against original CuMesh using every vertex and face centroid.
 `validate_glb.py FILE.glb` verifies mesh/UV/normal/material attributes and embedded
-4096 images. Build the shared preview renderer with `ref/pixal3d/build_preview.sh`,
+4096 images. It reports the pinned exporter's rare collapsed boundary faces and
+zero boundary normals separately, while still bounding their count and requiring
+every other normal to be unit length. Build the shared preview renderer with `ref/pixal3d/build_preview.sh`,
 then use `preview_glb.py FILE.glb --output-dir DIR` for four CPU-rendered views.
 The preview copy is uniformly scaled to avoid the renderer's fixed triangle-size
 epsilon and uses wider camera framing; exported GLB geometry is unchanged.
 `compare_outputs.py NATIVE.glb REFERENCE.glb` deterministically samples both
-surfaces and reports bidirectional Chamfer distances and nearest-face normal
-agreement. Pass matching `--native-renders` and `--reference-renders`
+surfaces and reports bidirectional Chamfer distances plus oriented and
+orientation-independent nearest-face normal agreement. Pass matching
+`--native-renders` and `--reference-renders`
 directories to add RGB error, PSNR, and silhouette IoU for rendered PNG views.
 
 ## Validation record
@@ -261,12 +264,16 @@ This environment is separate from the per-backend validation environments so
 the native-versus-PyTorch checks retain their newer PyTorch setup. The setup
 pins Torch 2.7.1/cu128 for `sm_120`, rebuilds Torch-ABI extensions from pinned
 source revisions, and uses PyTorch SDPA plus bounded chunked NAF attention on
-Blackwell. On the 16 GB RTX 5060 Ti, four-view 1024 reference inference reaches
-both shape samplers but the texture-conditioning NAF output alone needs a 4 GiB
-allocation with about 12.4 GiB already live. Full four-view reference output
-therefore requires a larger CUDA GPU; native four-view inference remains
-validated at the 7 and 12 GiB budgets. Single-view and submodule reference
-validation remain available on the 5060 Ti.
+Blackwell. NAF projection evaluates only the four bilinear source pixels needed
+by each projected grid point, avoiding the otherwise 4 GiB dense 1024-square
+feature tensor. This enabled the complete four-view 1024 reference pipeline on
+the 16 GB RTX 5060 Ti. Against the native 12 GiB-budget run at seed 42, 200,000
+surface samples measured symmetric Chamfer RMS 0.005548; directional means were
+0.004367 native-to-reference and 0.004147 reference-to-native. Absolute normal
+cosine means were 0.9533 and 0.9586, which avoids conflating local winding
+differences with surface-direction disagreement. The outputs had 961,142 and
+960,561 triangles respectively. Native four-view inference is also validated at
+the 7 GiB budget.
 
 Verify the bounded NAF fallback against a direct PyTorch implementation with:
 

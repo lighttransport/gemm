@@ -49,12 +49,15 @@ def sample(mesh, count, rng):
 def directed(source, source_normals, target, target_normals):
     distance, nearest = cKDTree(target).query(source, workers=-1)
     cosine = np.sum(source_normals * target_normals[nearest], axis=1)
+    absolute_cosine = np.abs(cosine)
     return {"mean": float(distance.mean()),
             "rms": float(np.sqrt(np.mean(distance * distance))),
             "p95": float(np.quantile(distance, .95)),
             "max": float(distance.max()),
             "normal_cosine_mean": float(cosine.mean()),
-            "normal_cosine_p05": float(np.quantile(cosine, .05))}
+            "normal_cosine_p05": float(np.quantile(cosine, .05)),
+            "normal_abs_cosine_mean": float(absolute_cosine.mean()),
+            "normal_abs_cosine_p05": float(np.quantile(absolute_cosine, .05))}
 
 
 native = load_mesh(a.native)
