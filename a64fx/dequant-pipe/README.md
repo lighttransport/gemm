@@ -59,6 +59,38 @@ a64fx/dequant-pipe/bench_dequant_pipe \
   --n 384 --k 256 --iterations 1 --trials 1 --verify
 ```
 
+## Fused W8A16 and W8A32
+
+`bench_w8` covers signed INT8, E4M3FN (`e4m3`), and IEEE E5M2 (`e5m2`).
+`--bits 16` uses FP16 activations and sequential FP16 FMA accumulation;
+`--bits 32` uses FP32 activations and sequential FP32 FMA accumulation.
+All finite code points are decoded exactly, with subnormals retained.
+E5M2 infinities and both formats' NaNs are supported; NaN payloads are not
+part of the comparison contract. There is no activation quantization.
+
+The fixed K=128 layout is `[K][N]` byte weights, with N=256 (FP16) or N=128
+(FP32), one shared activation vector, and a same-width output vector.
+These unscaled M=1 probes omit block scales and tails. Rates count original
+weight bytes, while charging conversion and FMA to elapsed time.
+
+```sh
+TMPDIR="$PWD/tmp/dequant" make -C a64fx/dequant-pipe test CC=fcc
+bash a64fx/dequant-pipe/run_w8_acceptance.sh
+```
+
+The script applies startup affinity and XOS 2 MiB pages, runs three fresh
+launches per combination, and requires every five-trial median to reach
+220 GB/s with paired reads >=220 GB/s. **INT8 passes at 228.7--230.3 GB/s;
+FP8 currently fails.** See [RESULTS.md](RESULTS.md) for all launch medians,
+exact commands, and the E5M2/FP16 subnormal-sensitive slowdown.
+
+The executable accepts `--format int8|e4m3|e5m2 --bits 16|32`, `--verify`,
+`--cores`, `--core-base`, `--mib`, `--iterations`, and `--trials`. It always
+brackets compute with read controls on the same allocation. All-finite
+weights (including subnormals) are the default; `--normal-weights` is a
+separately labeled diagnostic and does not satisfy the acceptance gate.
+The script exits 1 on the current FP8 performance failures.
+
 ## Benchmarking
 
 Before running the paired pipeline, verify the HBM read prerequisite in one

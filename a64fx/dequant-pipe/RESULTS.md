@@ -4,6 +4,140 @@ Measured 2026-09-19 with Fujitsu `fcc` 4.12.2 on CPUs 12--23 of one 2.0 GHz
 A64FX CMG.  All end-to-end numbers below use `--sync atomic`; they are controls,
 not headline hardware-barrier results.
 
+## W8A16 / W8A32: 2026-09-20
+
+The signed INT8 paths meet the **220--230 GB/s** target with both FP16 and
+FP32 activations/accumulation. **Neither FP8 format is accepted at that target.**
+All six implementations are numerically validated; performance acceptance
+must remain separate from correctness.
+
+| weight format | activation / accumulation | launch 1 median | launch 2 median | launch 3 median | >=220 GB/s |
+|:--------------|:--------------------------|----------------:|----------------:|----------------:|:-----------|
+| signed INT8 | FP16 / FP16 | 229.04 | 230.30 | 229.17 | PASS |
+| signed INT8 | FP32 / FP32 | 229.37 | 229.37 | 228.67 | PASS |
+| E4M3FN | FP16 / FP16 | 143.20 | 143.19 | 143.18 | FAIL |
+| E4M3FN | FP32 / FP32 | 92.25 | 92.24 | 92.24 | FAIL |
+| E5M2 | FP16 / FP16 | 116.89 | 116.88 | 116.87 | FAIL |
+| E5M2 | FP32 / FP32 | 200.52 | 200.46 | 200.44 | FAIL |
+
+Rates count stored one-byte weights, not widened traffic. Three fresh
+launches per combination use 240 MiB, CPUs 12--23, ten iterations, and five
+timed trials. Every CPU reports 2.0 GHz; every allocation reports 2 MiB pages
+on NUMA node 4, and FPCR is zero. Paired-read medians span
+227.63--229.77 GB/s; all eighteen runs qualify. No placement failure explains
+the FP8 misses. Raw logs, source/binary hashes, and CPU settings:
+`tmp/dequant/w8-acceptance.gFdxIs/`.
+
+The benchmark samples all finite byte codes, including FP8 subnormals, using
+a deterministic PRNG; NaN/infinity codes are replaced only in the timed
+weight distribution. Activations are `(k % 7 - 3) / 32`. Special weight codes
+are checked exhaustively in correctness tests. The optional
+`--normal-weights` diagnostic additionally excludes subnormal/zero weights;
+it is explicitly labeled and cannot qualify for the all-finite gate.
+With the original native pipelined E5M2 implementation that diagnostic measured
+203.33 GB/s FP16 and 201.01 GB/s FP32, compared with 16.13/201.09 on all-finite
+inputs in the adjacent development sweep. This isolates a large
+subnormal-sensitive FP16 cost; it is consistent with hardware arithmetic
+assists, but no assist PMU counter was collected. Neither diagnostic is a
+220 GB/s result. FPCR is never changed and no values are flushed or clipped.
+The selected guarded-rescaling kernel now raises all-finite E5M2/FP16 to
+116.87--116.89 GB/s without changing the FMA result. Earlier native acceptance
+logs are retained at `tmp/dequant/w8-acceptance.mwKtHH/`.
+
+### Kernel contract and selected schedules
+
+`w8.h` defines K=128 and one shared activation vector. Weights are ordinary
+INT8/E4M3FN/E5M2 bytes in `[K][N]` order, where N=256 for FP16 and N=128 for
+FP32. Each kernel retains eight output vectors and sequential ascending-K
+FMA order. A canonical `[N][K]` model tensor must be transposed into this
+explicit tile layout; no type conversion is performed during that packing.
+Output has the same width as activation. Scales, tails, and model integration
+are outside this probe.
+
+INT8 uses signed widening loads and exact `SCVTF`. E5M2 shifts the byte into
+IEEE FP16 bits, with `FCVT` for the FP32 path. INT8, E5M2/FP32, and the
+native E5M2/FP16 fallback use a two-K pipeline:
+prepare K=0, retire two steps in each of 63 iterations, then retire K=126
+and drain K=127 without another input load. No accumulator is reassociated.
+
+The selected E5M2/FP16 path avoids feeding subnormal weights into FMA by
+using `w*4` and `a/4` for those lanes. The three nonzero subnormal magnitudes
+become normal FP16 values through integer table corrections. Each finite
+nonzero activation must have FP16 exponent >=3; dividing by four then stays
+normal and is exactly representable. The real product is unchanged, and a
+single half FMA performs the same rounding as before. Normal-weight lanes
+keep the original activation. Zero, infinity, and NaN behavior is retained.
+A whole-tile activation check and a nondefault-FPCR check select the unchanged
+native fallback when the preconditions fail. Scalar/native comparisons cover
+both sides of the activation guard (0x0bff and 0x0c00), signed zero, infinities,
+and tiny activations. This improves the default distribution substantially,
+but unsafe tiny activations still encounter the native subnormal cost.
+
+E4M3FN/FP16 uses signed widening and an integer bit transform with a wrapped
+`(code+1)&127` correction-table index. One table corrects all seven nonzero
+subnormals, zero, and NaNs without a separate sign-selection branch.
+E4M3FN/FP32 builds the exact BF16 high/low bytes in two independent 64-byte
+streams, then interleaves zero low halfwords to obtain FP32. All E4M3FN
+finite values are exactly representable in BF16; this step adds no rounding.
+These conversions remain the performance bottleneck, rather than HBM.
+
+The verifier isolates all 256 codes, including E5M2 infinities, and compares
+sequential scalar half-FMADD / FP32 `fmaf` against each SVE implementation.
+Random finite streams, fractional values, subnormals, cancellation, half
+accumulation overflow, and a wider FP32 activation range are also covered.
+Finite results must match bits; NaNs must match classification (payloads
+are not promised). The existing exhaustive W4/INT16 checks still pass.
+
+### Development measurements and rejected schedules
+
+All figures are five-trial medians with qualified paired reads:
+
+| schedule | E4M3 FP16 | E4M3 FP32 | E5M2 FP32 |
+|:---------|----------:|----------:|----------:|
+| initial separate sign/subnormal/NaN decoder | 118.61 | 59.26 | 165.09 |
+| grouped E5M2 shifts before conversion | -- | -- | 173.46 |
+| wrapped E4M3 correction; cross-K E5M2 pipeline | **143.62** | 72.04 | **201.15** |
+| serial byte tables and BF16 assembly | 121.03 | 84.51 | unchanged |
+| two independent byte-table streams | 126.99 | **92.09** | unchanged |
+
+The selected assembly combines the faster wrapped halfword FP16 decoder
+with the parallel byte-wise FP32 decoder. Disassembly shows no inner-loop
+spills. The halfword E4M3 schedule needs 64 vector arithmetic instructions
+per 256 input bytes; byte-wise FP32 needs 76 (including permutations and
+FMAs), well above the earlier measured 48-instruction full-bandwidth budget.
+Those counts explain why simple scheduling alone is unlikely to close the
+remaining gap, without establishing a universal lower bound on conversion.
+The E5M2 FP32 pipeline has 48 vector arithmetic instructions per 256 bytes,
+but includes half-to-single conversions rather than the previous pure-FMA
+roofline; its measured ~201 GB/s must not be replaced with that roofline.
+
+Guarded E5M2 FP16 rescaling first measured 116.69 GB/s with paired reads
+227.86/228.29 GB/s; the final three launches above confirm that gain.
+Logs: `tmp/dequant/w8-rescale-*`; the pre-rescaling assembly is retained at
+`tmp/dequant/w8-before-rescale.S`.
+
+Development logs/snapshots are under `tmp/dequant/w8-v1-*`, `w8-v2-normal-*`,
+`w8-v3b-*`, `w8-v4b-*`, and `w8-v5-*`. The `w8-v3-*` runs accidentally used
+the previous binary after an assembly error and are **not candidate results**;
+the corrected build/test/run chain uses fail-fast shell execution. Rejected
+assembly snapshots are `tmp/dequant/w8-v{1,2,3b,4b,5}.S`.
+
+Reproduce:
+
+```sh
+mkdir -p tmp/dequant
+TMPDIR="$PWD/tmp/dequant" make -C a64fx/dequant-pipe test CC=fcc
+bash a64fx/dequant-pipe/run_w8_acceptance.sh
+# Expected current result / exit status 1:
+# acceptance=FAIL qualified=18/18 measured=18 failed_targets=12 threshold_GB/s=220
+```
+
+The acceptance script retains every launch, checks all-finite distribution
+and both read controls, and fails if any of the eighteen FMA medians is below
+220 GB/s. Remaining work is a lower-cost exact E4M3 conversion, further E5M2
+FP32 conversion scheduling, and reducing the guarded E5M2
+FP16 rescaling overhead while retaining its exact fallback. Do not promote FP8 or hide those cases to pass the gate.
+
 ## FP16 above 200 GB/s: 2026-09-20
 
 The new `--path fp16 --kernel f16pipe` passes the raised **>200 GB/s**

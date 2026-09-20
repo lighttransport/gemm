@@ -2,7 +2,7 @@ CC = fcc
 CFLAGS ?= -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -Wall -Wextra -Wpedantic -pthread
 LDFLAGS ?= -pthread -lm -lhwb
 
-TARGETS := bench_dequant_pipe bench_null_pipe bench_hbm_read bench_hbm_color bench_fused_sdot
+TARGETS := bench_w8 bench_dequant_pipe bench_null_pipe bench_hbm_read bench_hbm_color bench_fused_sdot
 
 .PHONY: all clean test
 
@@ -47,10 +47,20 @@ kernels_opt.o: kernels_opt.S
 fused_opt.o: fused_opt.c fused_opt.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-test: bench_dequant_pipe bench_fused_sdot
+test: bench_dequant_pipe bench_fused_sdot bench_w8
+	./bench_w8 --verify --cores 1 --mib 1 --iterations 1 --trials 1
 	./bench_dequant_pipe --self-test
 	./bench_fused_sdot --verify --format int4 --path int16 --kernel super \
 		--cores 1 --mib 1 --iterations 1 --trials 1
 
 clean:
-	rm -f $(TARGETS) bench_dequant_pipe.o bench_null_pipe.o bench_hbm_read.o bench_hbm_color.o bench_fused_sdot.o kernels.o kernels_opt.o fused_opt.o
+	rm -f $(TARGETS) bench_w8.o w8.o bench_dequant_pipe.o bench_null_pipe.o bench_hbm_read.o bench_hbm_color.o bench_fused_sdot.o kernels.o kernels_opt.o fused_opt.o
+
+bench_w8: bench_w8.o w8.o fused_opt.o kernels_opt.o kernels.o
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
+
+bench_w8.o: bench_w8.c w8.h fused_opt.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+w8.o: w8.S
+	$(CC) -Nclang -march=armv8.2-a+sve -c $< -o $@

@@ -254,6 +254,63 @@ Q38TP_RANK=0 Q38TP_SIZE=4 ./a64fx/llm/build/qwen38_kquant_stage \
 
 ## Resume prompts
 
+### Current task: W8A16 / W8A32 at 220--230 GB/s
+
+The user requested FP8 and signed INT8 weights with FP16/FP32 activations
+and matching FMA accumulation, explicitly including both E4M3FN and E5M2.
+Work directly on this native A64FX node; keep scratch/logs in `tmp/dequant/`.
+This is the active single-CMG kernel task, not the separate Qwen TP4 goal.
+
+Implemented and numerically verified all six combinations in
+`a64fx/dequant-pipe/w8.S`, `w8.h`, and `bench_w8.c`. Fixed K=128, K-major
+byte weights `[K][N]`, N=256 for FP16 and N=128 for FP32, shared activations,
+sequential K-order FMA, no scales/tails or activation quantization. FP8
+subnormals/specials are supported; no flush-to-zero is selected.
+
+Three-launch medians (GB/s):
+
+| weights | FP16 accumulation | FP32 accumulation |
+|:--------|:------------------|:------------------|
+| INT8 | 229.04 / 230.30 / 229.17 | 229.37 / 229.37 / 228.67 |
+| E4M3FN | 143.20 / 143.19 / 143.18 | 92.25 / 92.24 / 92.24 |
+| E5M2 | 116.89 / 116.88 / 116.87 | 200.52 / 200.46 / 200.44 |
+
+**INT8 passes; FP8 target is still unmet.** Every run qualified on paired
+reads (227.63--229.77 GB/s), 2 MiB pages, NUMA node 4, CPUs 12--23 at 2 GHz,
+FPCR=0. Logs: `tmp/dequant/w8-acceptance.gFdxIs/`.
+`run_w8_acceptance.sh` requires all eighteen medians >=220 GB/s and correctly
+returns failure for twelve FP8 misses. Do not lower the gate or omit
+subnormal weights to claim success.
+
+`make -C a64fx/dequant-pipe test CC=fcc` passes all new exhaustive code tests
+and existing W4/full-range INT16 regressions. Use `TMPDIR="$PWD/tmp/dequant"`.
+The verifier isolates special codes (including E5M2 infinities), tests
+sequential random/cancellation/overflow cases, and requires finite bit
+identity and NaN classification. `--normal-weights` is a labeled diagnostic,
+not acceptance: the native kernel reached 203.33 GB/s, versus 16.13 on all-finite
+weights. FP32 was nearly unchanged, isolating a large subnormal-sensitive
+FP16 arithmetic cost in the original native pipeline; no assist PMU counter
+was collected. The selected guarded rescaling now raises all-finite FP16 to
+116.87--116.89 GB/s. It uses integer corrections to multiply subnormal weights
+by four, and divides the associated activation lanes by four only when that
+is exact and remains normal. A tile-wide activation exponent check (>=3 for
+finite nonzero values) plus FPCR=0 precondition protects the transform;
+otherwise it calls `w8_e5m2_f16_native`. Native/scalar bit comparisons include
+both sides of the guard, zero, infinities, and tiny values. No product or
+FMA-rounding change is permitted.
+
+Continue with lower-cost exact E4M3 conversion and E5M2 FP32 conversion
+scheduling; investigate E5M2 FP16 subnormal handling without weakening its
+numerical contract. Current E4M3 FP16 uses a wrapped correction table;
+FP32 uses parallel byte tables producing exact BF16 bits, then zero-extends
+into FP32 bits. INT8/E5M2 FP32 and the native FP16 fallback use cross-K prologue/drain
+pipelines; guarded FP16 rescaling is the selected E5M2 path.
+See RESULTS.md for rejected schedules, instruction counts, all commands,
+and source snapshots. The current exact FP8 paths must remain experimental
+until they meet the performance gate. Keep the accepted W4 paths passing,
+preserve unrelated edits, commit focused milestones, and do not push.
+
+
 ### A64FX W4A16 fused-kernel follow-up (2026-09-20)
 
 Both requested single-CMG targets now pass for INT4 and E2M1 FP4. Three fresh

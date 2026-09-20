@@ -343,6 +343,42 @@ These are still unscaled M=1 probes. Full results and rejected schedules are
 in [RESULTS.md](../dequant-pipe/RESULTS.md); raw acceptance logs are under
 `tmp/dequant/w4a16-acceptance.s5EThb/`.
 
+### Eight-bit weights: INT8 meets the read-bandwidth target, FP8 does not
+
+The follow-up keeps one byte per weight and tests both FP16 and FP32
+activations with same-width sequential FMA accumulation. Signed INT8 widens
+and converts exactly, reaching **229.04--230.30 GB/s for FP16** and
+**228.67--229.37 GB/s for FP32** across three fresh launches. A cross-K
+pipeline separates conversion from its FMA consumers.
+
+FP8 is more expensive even at the same storage width. Exact E4M3FN decoding
+needs subnormal and NaN correction as well as sign/exponent translation.
+The selected FP16 decoder reaches **143.18--143.20 GB/s**. Decoding two
+64-byte streams into exact BF16 bit patterns before widening to FP32 reaches
+**92.24--92.25 GB/s**. Neither meets the 220 GB/s acceptance threshold.
+
+E5M2 embeds directly into IEEE half bits. The FP32 route shifts and converts
+those bits before FMA and reaches **200.44--200.52 GB/s**. The original FP16
+kernel fell to 14.15--16.13 GB/s on the distribution
+including subnormals. The selected guarded rescaling raises this to
+**116.87--116.89 GB/s**: subnormal weights are multiplied by four via integer
+bit corrections, and their activation lanes use an exact division by four.
+A precheck requires every finite nonzero activation to have FP16 exponent
+>=3, making the division normal and exact. The real product and the single
+half-FMA rounding are unchanged. Unsafe activations or a nondefault FPCR
+use the original native kernel. This is a numerical transformation with an
+explicit precondition, not flush-to-zero; the scalar/native tests pass bits.
+It still misses the bandwidth target. FPCR remains zero in all measurements.
+
+All eighteen final runs had 227.63--229.77 GB/s paired reads, 2 MiB pages
+on NUMA node 4, and twelve 2.0 GHz cores. Thus the FP8 misses are not
+slow-placement results. Exhaustive code-point tests and sequential scalar
+FMA comparisons pass; finite results match bits and NaNs match classification.
+These remain unscaled probes, and FP8 performance acceptance is explicitly
+**FAIL**. The full commands, launch medians, rejected decoders, and outstanding
+work are in [RESULTS.md](../dequant-pipe/RESULTS.md); reproduce with
+`bash a64fx/dequant-pipe/run_w8_acceptance.sh`.
+
 ### Establish placement before judging arithmetic
 
 The initial bounded radix-256 kernel was incorrectly rejected after a
