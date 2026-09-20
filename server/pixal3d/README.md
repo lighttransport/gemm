@@ -19,6 +19,9 @@ shows the resolved images in frame order before upload. A separate JSON and
 image picker is available when folder selection is unsupported. GPU runs are
 serialized per backend to avoid VRAM contention. Temporary uploads and GLBs
 are kept only under `tmp/pixal3d/` and removed after each request.
+Each multiview frame may name an explicit `mask_path` beside `file_path`.
+The browser resolves and previews that association, then uploads each mask
+with its view.
 
 `POST /v1/infer` accepts JSON fields `image_b64`, optional `mask_b64`,
 `image_ext`, `backend`, `fov`, `distance`, `mesh_scale`, `seed`, `threads`,
@@ -69,10 +72,12 @@ For long browser runs, `POST /v1/jobs` accepts the same body and returns a job
 ID immediately. Poll `GET /v1/jobs/ID`; when its state is `complete`, fetch
 `GET /v1/jobs/ID/result`. `DELETE /v1/jobs/ID` cancels a queued request or
 terminates the active native/reference child process.
-Queued results expose GLB and optional PLY URLs under `artifacts`; the binary
-files remain on disk instead of being retained as base64 strings in server
-memory. The synchronous `POST /v1/infer` response keeps its original base64
-fields for API compatibility.
+Queued results expose GLB and optional PLY URLs under `artifacts`. Native and
+reference runners write `.partial` files directly in the job directory; the
+server validates, flushes, and atomically publishes them without encoding or
+decoding base64. Artifact downloads are streamed in 1 MiB blocks. The
+synchronous `POST /v1/infer` response keeps its original base64 fields for
+API compatibility.
 Job status includes a monotonic `progress` percentage and a `phase` derived
 from native conditioning, diffusion, mesh, and texture milestones.
 The bounded worker queue defaults to four active requests and four retained
@@ -92,8 +97,8 @@ and view-count limits.
 
 The browser sends each image as raw bytes to `POST /v1/uploads`, then places
 the returned `upload_id` in `image_upload`, `mask_upload`, or each view's
-`image_upload`. This avoids base64 expansion and keeps queued JSON requests
-small. Upload IDs are single-use and their files are removed when the job
+`image_upload` and optional `mask_upload`. This avoids base64 expansion and
+keeps queued JSON requests small. Upload IDs are single-use and their files are removed when the job
 finishes or is cancelled. Unclaimed uploads expire after one hour by default,
 and `DELETE /v1/uploads/ID` releases one immediately. Configure expiry with
 `--upload-ttl` in seconds. Existing `image_b64` clients remain supported.
@@ -147,14 +152,14 @@ RMS was `0.015580`; directional p95 distances were `0.027573` and `0.034187`.
 
 For multiview API requests, replace `image_b64` with `views`, an ordered array
 of 1 to 16 objects. Each object contains `image_b64`, a 4-by-4
-`transform_matrix`, and an optional `fov`. Top-level `fov` is the default for
+`transform_matrix`, and optional `mask_b64` and `fov`. Top-level `fov` is the default for
 frames without one, and `mesh_scale` applies to the complete view set:
 
 ```json
 {
   "backend": "cuda",
   "views": [
-    {"image_b64": "...", "transform_matrix": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]}
+    {"image_b64": "...", "mask_b64": "...", "transform_matrix": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]}
   ],
   "fov": 0.857556,
   "mesh_scale": 1.0
@@ -163,7 +168,9 @@ frames without one, and `mesh_scale` applies to the complete view set:
 
 The pinned PyTorch comparison supports both single-view and multiview GPU
 requests. It runs after native inference and reuses the validated ordered view
-manifest, so enabling it can add several minutes to a request.
+manifest. Automatic and explicit per-view masks are resolved once; the exact
+prepared RGBA files are passed to both native and PyTorch pipelines. Enabling
+the comparison can add several minutes to a request.
 
 ## Deployment
 

@@ -278,6 +278,83 @@ class PixalServerTest(unittest.TestCase):
         self.assertEqual(captured["manifest"]["mesh_scale"], 1.5)
         self.assertEqual(captured["manifest"]["frames"][0]["camera_angle_x"], 0.85)
 
+    def test_multiview_masks_share_exact_prepared_reference_views(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        captured = {"preparations": [], "reference_inputs": []}
+        with tempfile.TemporaryDirectory(prefix="masked-multiview-", dir=scratch) as td:
+            server = self.make_server(Path(td))
+            artifact_dir = Path(td) / "results" / ("e" * 32)
+            artifact_dir.mkdir(parents=True)
+
+            def run(command, **kwargs):
+                output = Path(command[command.index("--output") + 1])
+                if str(server.prepare_script) in command:
+                    input_path = Path(command[command.index("--input") + 1])
+                    prepared = b"prepared-" + input_path.read_bytes()
+                    output.write_bytes(prepared)
+                    Path(command[command.index("--metadata") + 1]).write_text(json.dumps({
+                        "fov": 0.8, "distance": 0.0, "mesh_scale": 1.0,
+                        "mask_source": "mask" if "--mask" in command else "rmbg-2.0",
+                        "camera_source": "manual"}))
+                    captured["preparations"].append(command)
+                    return subprocess.CompletedProcess(command, 0, "{}", "")
+                if str(server.reference_mv_script) in command:
+                    views_dir = Path(command[command.index("--views_dir") + 1])
+                    manifest = json.loads((views_dir / "transforms.json").read_text())
+                    captured["reference_inputs"] = [
+                        (views_dir / frame["file_path"]).read_bytes()
+                        for frame in manifest["frames"]]
+                    output.write_bytes(b"reference-glb")
+                    return subprocess.CompletedProcess(command, 0, "reference", "")
+                output.write_bytes(b"native-glb")
+                Path(command[command.index("--profile-json") + 1]).write_text("{}")
+                return subprocess.CompletedProcess(command, 0, "{}", "")
+
+            request = {
+                "backend": "cuda", "reference": True, "auto_mask": True,
+                "_artifact_dir": artifact_dir,
+                "views": [
+                    {"image_b64": base64.b64encode(b"first").decode(),
+                     "mask_b64": base64.b64encode(b"mask").decode(),
+                     "transform_matrix": IDENTITY},
+                    {"image_b64": base64.b64encode(b"second").decode(),
+                     "transform_matrix": IDENTITY},
+                ],
+            }
+            with mock.patch.object(app.subprocess, "run", side_effect=run):
+                native = server.infer(request)
+                reference = server.reference(app.reference_request(request, native))
+            captured["native_artifact"] = native["_artifact_files"]["native.glb"].read_bytes()
+            captured["reference_artifact"] = (
+                reference["_artifact_files"]["reference.glb"].read_bytes())
+
+        self.assertNotIn("glb_b64", native)
+        self.assertNotIn("glb_b64", reference)
+        self.assertEqual(captured["native_artifact"], b"native-glb")
+        self.assertEqual(captured["reference_artifact"], b"reference-glb")
+        self.assertIn("--mask", captured["preparations"][0])
+        self.assertNotIn("--rembg-model", captured["preparations"][0])
+        self.assertIn("--rembg-model", captured["preparations"][1])
+        self.assertEqual(captured["reference_inputs"],
+                         [b"prepared-first", b"prepared-second"])
+
+    def test_view_mask_upload_is_claimed_once(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="view-mask-upload-", dir=scratch) as td:
+            uploads = app.UploadStore(Path(td), retained=2)
+            image_id = uploads.put(b"image")
+            mask_id = uploads.put(b"mask")
+            request, paths = uploads.claim({"views": [{
+                "image_upload": image_id, "mask_upload": mask_id,
+                "transform_matrix": IDENTITY}]})
+            self.assertEqual(app.decode_b64(request["views"][0]["image_b64"],
+                                           "image", 100), b"image")
+            self.assertEqual(app.decode_b64(request["views"][0]["mask_b64"],
+                                           "mask", 100), b"mask")
+            self.assertEqual(len(paths), 2)
+
     def test_job_queue_reports_phase_and_result(self):
         class FakePixal:
             def infer(self, request, cancel=None, progress=None):
@@ -484,7 +561,7 @@ class PixalServerTest(unittest.TestCase):
 
             directory = Path(td) / "results" / submitted["id"]
             manifest = json.loads((directory / "job.json").read_text())
-            self.assertEqual((manifest["version"], manifest["state"]), (1, "complete"))
+            self.assertEqual((manifest["version"], manifest["state"]), (2, "complete"))
             self.assertNotIn("request", manifest)
             self.assertFalse(any(path.name.endswith(".tmp") for path in directory.iterdir()))
 

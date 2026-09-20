@@ -109,8 +109,12 @@ class UploadStore:
                 refs.append((resolved, source, destination))
         if isinstance(resolved.get("views"), list):
             for view in resolved["views"]:
-                if isinstance(view, dict) and "image_upload" in view:
-                    refs.append((view, "image_upload", "image_b64"))
+                if not isinstance(view, dict):
+                    continue
+                for source, destination in (("image_upload", "image_b64"),
+                                            ("mask_upload", "mask_b64")):
+                    if source in view:
+                        refs.append((view, source, destination))
         ids = [container[source] for container, source, _ in refs]
         if len(ids) != len(set(ids)):
             raise ValueError("an upload ID may only be used once")
@@ -310,6 +314,40 @@ def valid_output(path: Path, limit: int = MAX_GLB_BYTES) -> bool:
     return path.is_file() and 0 < path.stat().st_size <= limit
 
 
+def publish_artifact(partial: Path, final: Path, limit: int = MAX_GLB_BYTES) -> Path:
+    """Validate and atomically publish a runner output in retained job storage."""
+    if not valid_output(partial, limit):
+        raise RuntimeError(f"runner did not produce a valid {final.suffix.lstrip('.').upper()}")
+    with partial.open("rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(partial, final)
+    descriptor = os.open(final.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return final
+
+
+def retained_artifact_dir(request: dict) -> Path | None:
+    value = request.get("_artifact_dir")
+    return value if isinstance(value, Path) else None
+
+
+def retain_reference_input(request: dict, name: str, source: Path) -> Path | None:
+    """Keep prepared RGBA alive between native and queued reference stages."""
+    directory = retained_artifact_dir(request)
+    if directory is None:
+        return None
+    inputs = directory / ".reference-inputs"
+    inputs.mkdir(parents=True, exist_ok=True)
+    target = inputs / name
+    temporary = inputs / f".{name}.{uuid.uuid4().hex}.partial"
+    shutil.copyfile(source, temporary)
+    os.replace(temporary, target)
+    return target
+
+
 def glb_mesh_summary(path: Path) -> dict:
     """Read comparison-scale mesh facts without decoding textures."""
     raw = path.read_bytes()
@@ -454,8 +492,13 @@ class PixalServer:
             raise ValueError("include_ply must be a boolean")
         with self.locks[backend], tempfile.TemporaryDirectory(prefix="request-", dir=self.work_dir) as td:
             run_dir = Path(td)
-            output_path = run_dir / "output.glb"
-            ply_path = run_dir / "output.ply"
+            artifact_dir = retained_artifact_dir(request)
+            if artifact_dir is not None:
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+            output_path = ((artifact_dir / ".native.glb.partial") if artifact_dir
+                           else run_dir / "output.glb")
+            ply_path = ((artifact_dir / ".native.ply.partial") if artifact_dir
+                        else run_dir / "output.ply")
             preparation = None
             mask_path = None
             if multiview:
@@ -468,19 +511,30 @@ class PixalServer:
                     name = f"view{index:02d}.png"
                     view_path = run_dir / name
                     view_path.write_bytes(data)
+                    view_mask = (decode_b64(item["mask_b64"],
+                                            f"views[{index}].mask_b64", MAX_IMAGE_BYTES)
+                                 if item.get("mask_b64") else None)
+                    view_mask_path = None
+                    if view_mask is not None:
+                        view_mask_path = run_dir / f"view{index:02d}-mask.png"
+                        view_mask_path.write_bytes(view_mask)
                     matrix = camera_matrix(item.get("transform_matrix"), f"views[{index}].transform_matrix")
                     frame = {"file_path": name, "transform_matrix": matrix}
                     if item.get("fov") is not None:
                         frame["camera_angle_x"] = finite_number(item["fov"], f"views[{index}].fov", 0.05, 3.14)
-                    if auto_mask:
+                    if auto_mask or view_mask_path is not None:
                         prepared = run_dir / f"view{index:02d}-prepared.png"
                         metadata = run_dir / f"view{index:02d}-prepared.json"
                         prep = [str(self.python_launcher), backend, str(self.prepare_script),
                                 "--input", str(view_path), "--output", str(prepared),
-                                "--metadata", str(metadata), "--rembg-model", str(self.rembg),
+                                "--metadata", str(metadata),
                                 "--fov", str(frame.get("camera_angle_x", fov)),
                                 "--mesh-scale", str(mesh_scale), "--device",
                                 "cpu" if backend == "cpu" else "cuda"]
+                        if view_mask_path is not None:
+                            prep += ["--mask", str(view_mask_path)]
+                        elif auto_mask:
+                            prep += ["--rembg-model", str(self.rembg)]
                         proc = run_command(prep, self.args.reference_timeout, cancel)
                         if proc.returncode:
                             raise RuntimeError((proc.stderr or proc.stdout).strip()[-4000:])
@@ -488,6 +542,13 @@ class PixalServer:
                         item_preparation = json.loads(metadata.read_text())
                         item_preparation["view"] = index
                         view_preparation.append(item_preparation)
+                        retained = retain_reference_input(
+                            request, f"view{index:02d}.png", prepared)
+                        if retained is not None:
+                            item["_reference_image_path"] = retained
+                        elif request.get("reference"):
+                            item["_reference_image_b64"] = base64.b64encode(
+                                prepared.read_bytes()).decode("ascii")
                     frames.append(frame)
                 if view_preparation:
                     preparation = {"views": view_preparation}
@@ -523,8 +584,12 @@ class PixalServer:
                     mask_path = None
                     fov, distance = preparation["fov"], preparation["distance"]
                     if request.get("reference"):
-                        request["_reference_image_b64"] = base64.b64encode(
-                            prepared.read_bytes()).decode("ascii")
+                        retained = retain_reference_input(request, "single.png", prepared)
+                        if retained is not None:
+                            request["_reference_image_path"] = retained
+                        else:
+                            request["_reference_image_b64"] = base64.b64encode(
+                                prepared.read_bytes()).decode("ascii")
                         request["_reference_image_ext"] = ".png"
                 cmd = [str(self.binary), "--backend", backend, "--input", str(image_path), "--output", str(output_path),
                        "--fov", str(fov), "--distance", str(distance), "--mesh-scale", str(mesh_scale), "--seed", str(seed),
@@ -559,10 +624,15 @@ class PixalServer:
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "native runner failed").strip()[-4000:]
                 raise RuntimeError(detail)
-            if not valid_output(output_path):
-                raise RuntimeError("native runner did not produce a valid GLB")
-            if include_ply and not valid_output(ply_path):
-                raise RuntimeError("native runner did not produce a valid PLY")
+            if artifact_dir is not None:
+                output_path = publish_artifact(output_path, artifact_dir / "native.glb")
+                if include_ply:
+                    ply_path = publish_artifact(ply_path, artifact_dir / "native.ply")
+            else:
+                if not valid_output(output_path):
+                    raise RuntimeError("native runner did not produce a valid GLB")
+                if include_ply and not valid_output(ply_path):
+                    raise RuntimeError("native runner did not produce a valid PLY")
             stats = {}
             for line in reversed(proc.stdout.splitlines()):
                 try:
@@ -574,15 +644,21 @@ class PixalServer:
                     continue
             result = {"ok": True, "backend": backend,
                       "elapsed_ms": round((time.monotonic() - started) * 1000),
-                      "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"),
                       "stats": stats,
                       "profile": json.loads(profile.read_text()) if profile.is_file() else {}}
+            if artifact_dir is not None:
+                result["_artifact_files"] = {"native.glb": output_path}
+            else:
+                result["glb_b64"] = base64.b64encode(output_path.read_bytes()).decode("ascii")
             try:
                 result["mesh_summary"] = glb_mesh_summary(output_path)
             except (KeyError, IndexError, OSError, TypeError, ValueError, struct.error):
                 result["mesh_summary"] = {"available": False}
             if include_ply:
-                result["ply_b64"] = base64.b64encode(ply_path.read_bytes()).decode("ascii")
+                if artifact_dir is not None:
+                    result["_artifact_files"]["native.ply"] = ply_path
+                else:
+                    result["ply_b64"] = base64.b64encode(ply_path.read_bytes()).decode("ascii")
             if preparation is not None:
                 result["preparation"] = preparation
             return result
@@ -596,12 +672,12 @@ class PixalServer:
         views = request.get("views") if multiview else None
         if multiview and (not isinstance(views, list) or not 1 <= len(views) <= 16):
             raise ValueError("views must contain 1 to 16 posed images")
-        prepared_image = request.get("_reference_image_b64")
+        prepared_image = request.get("_reference_image_path") or request.get("_reference_image_b64")
         if not multiview and request.get("mask_b64") and not prepared_image:
             raise ValueError("explicit-mask reference comparison requires prepared RGBA input")
         image = None if multiview else decode_b64(
             prepared_image or request.get("image_b64"),
-            "_reference_image_b64" if prepared_image else "image_b64", MAX_IMAGE_BYTES)
+            "prepared reference image" if prepared_image else "image_b64", MAX_IMAGE_BYTES)
         ext = str(request.get(
             "_reference_image_ext" if prepared_image else "image_ext", ".png")).lower()
         if ext not in (".png", ".jpg", ".jpeg", ".webp"):
@@ -610,14 +686,20 @@ class PixalServer:
         seed = bounded_integer(request.get("seed", 42), "seed", 0, 2**32 - 1)
         with self.locks[backend], tempfile.TemporaryDirectory(prefix="reference-", dir=self.work_dir) as td:
             run_dir = Path(td)
-            output_path = run_dir / "reference.glb"
+            artifact_dir = retained_artifact_dir(request)
+            output_path = ((artifact_dir / ".reference.glb.partial") if artifact_dir
+                           else run_dir / "reference.glb")
             launcher = self.reference_launcher if backend == "cuda" else self.python_launcher
             if multiview:
                 frames = []
                 for index, item in enumerate(views):
                     if not isinstance(item, dict):
                         raise ValueError("each view must be an object")
-                    data = decode_b64(item.get("image_b64"), f"views[{index}].image_b64", MAX_IMAGE_BYTES)
+                    prepared_view = (item.get("_reference_image_path") or
+                                     item.get("_reference_image_b64"))
+                    data = decode_b64(prepared_view or item.get("image_b64"),
+                                      f"views[{index}].prepared_image" if prepared_view else
+                                      f"views[{index}].image_b64", MAX_IMAGE_BYTES)
                     name = f"view{index:02d}.png"
                     (run_dir / name).write_bytes(data)
                     frame = {"file_path": name,
@@ -647,12 +729,17 @@ class PixalServer:
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "PyTorch reference failed").strip()[-4000:]
                 raise RuntimeError(detail)
-            if not valid_output(output_path):
+            if artifact_dir is not None:
+                output_path = publish_artifact(output_path, artifact_dir / "reference.glb")
+            elif not valid_output(output_path):
                 raise RuntimeError("PyTorch reference did not produce a valid GLB")
             result = {"backend": backend,
                       "elapsed_ms": round((time.monotonic() - started) * 1000),
-                      "glb_b64": base64.b64encode(output_path.read_bytes()).decode("ascii"),
                       "log_tail": (proc.stdout or "").strip()[-2000:]}
+            if artifact_dir is not None:
+                result["_artifact_files"] = {"reference.glb": output_path}
+            else:
+                result["glb_b64"] = base64.b64encode(output_path.read_bytes()).decode("ascii")
             try:
                 result["mesh_summary"] = glb_mesh_summary(output_path)
             except (KeyError, IndexError, OSError, TypeError, ValueError, struct.error):
@@ -666,8 +753,16 @@ class PixalServer:
             directory = Path(td)
             native_path = directory / "native.glb"
             reference_path = directory / "reference.glb"
-            native_path.write_bytes(base64.b64decode(native["glb_b64"], validate=True))
-            reference_path.write_bytes(base64.b64decode(reference["glb_b64"], validate=True))
+            native_files = native.get("_artifact_files", {})
+            reference_files = reference.get("_artifact_files", {})
+            if native_files.get("native.glb"):
+                native_path = Path(native_files["native.glb"])
+            else:
+                native_path.write_bytes(base64.b64decode(native["glb_b64"], validate=True))
+            if reference_files.get("reference.glb"):
+                reference_path = Path(reference_files["reference.glb"])
+            else:
+                reference_path.write_bytes(base64.b64decode(reference["glb_b64"], validate=True))
             command = [str(self.python_launcher), "cpu", str(self.compare_script),
                        str(native_path), str(reference_path), "--samples", "50000"]
             proc = run_command(command, min(self.args.reference_timeout, 600), cancel)
@@ -681,7 +776,7 @@ class PixalServer:
 class JobQueue:
     """Bounded queue with atomic manifests for retained job results."""
     MANIFEST = "job.json"
-    MANIFEST_VERSION = 1
+    MANIFEST_VERSION = 2
     TERMINAL = ("complete", "failed", "cancelled")
 
     def __init__(self, pixal: PixalServer, retained: int = 4,
@@ -761,7 +856,7 @@ class JobQueue:
                 continue
             try:
                 payload = json.loads((directory / self.MANIFEST).read_text())
-                if (payload.get("version") != self.MANIFEST_VERSION or
+                if (payload.get("version") not in (1, self.MANIFEST_VERSION) or
                         payload.get("id") != directory.name or
                         payload.get("state") not in (*self.TERMINAL, "queued", "running")):
                     raise ValueError("invalid job manifest")
@@ -813,6 +908,27 @@ class JobQueue:
         directory.mkdir(parents=True, exist_ok=True)
         stored = {}
 
+        for container in (result, result.get("reference")):
+            if not isinstance(container, dict):
+                continue
+            files = container.pop("_artifact_files", {})
+            if not isinstance(files, dict):
+                raise ValueError("invalid retained artifact map")
+            for name, source in files.items():
+                if name not in ("native.glb", "native.ply", "reference.glb"):
+                    raise ValueError(f"invalid retained artifact name: {name}")
+                path = Path(source)
+                try:
+                    path.relative_to(directory)
+                except ValueError as exc:
+                    raise ValueError("retained artifact escaped job storage") from exc
+                if not valid_output(path):
+                    raise ValueError(f"missing retained artifact {name}")
+                stored[name] = path
+                public = "ply" if name.endswith(".ply") else "glb"
+                container.setdefault("artifacts", {})[public] = (
+                    f"/v1/jobs/{job_id}/artifacts/{name}")
+
         def save(container: dict, field: str, name: str, public: str) -> None:
             encoded = container.pop(field, None)
             if encoded is None:
@@ -859,6 +975,8 @@ class JobQueue:
                 expired = terminal.pop(0)
                 self._remove_artifacts_locked(expired)
                 self.jobs.pop(expired["id"], None)
+            if self.result_root is not None:
+                request["_artifact_dir"] = self.result_root / job_id
             self.jobs[job_id] = {"id": job_id, "state": "queued", "phase": "queued", "progress": 0,
                                  "created_at": now, "updated_at": now, "request": request,
                                  "_cancel": threading.Event(), "_uploads": upload_paths}
@@ -941,6 +1059,7 @@ class JobQueue:
     def _worker(self):
         while True:
             job_id = self.pending.get()
+            request = None
             try:
                 with self.lock:
                     job = self.jobs.get(job_id)
@@ -987,6 +1106,11 @@ class JobQueue:
                     paths = [] if job is None else job.get("_uploads", [])
                 for path in paths:
                     path.unlink(missing_ok=True)
+                artifact_dir = retained_artifact_dir(request) if request is not None else None
+                if artifact_dir is not None:
+                    shutil.rmtree(artifact_dir / ".reference-inputs", ignore_errors=True)
+                    for partial in artifact_dir.glob(".*.partial"):
+                        partial.unlink(missing_ok=True)
                 self.pending.task_done()
 
 
@@ -1001,14 +1125,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
     def file_response(self, path: Path):
-        data = path.read_bytes()
         content_type = "model/gltf-binary" if path.suffix == ".glb" else "application/octet-stream"
         self.send_response(200)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(path.stat().st_size))
         self.send_header("Cache-Control", "private, max-age=3600")
         self.end_headers()
-        self.wfile.write(data)
+        with path.open("rb") as handle:
+            shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
