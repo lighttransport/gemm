@@ -152,8 +152,8 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
         hipFunction_t iq4_fn = nc == 5120 ?
             r->fn_qwen35_matvec_iq4xs_5120_multi8 :
             r->fn_qwen35_matvec_iq4xs_multi8;
-        LAUNCH(iq4_fn, (nr+3)/4, 1, 1,
-               128, 1, 1, 0, r->stream, ma);
+        LAUNCH(iq4_fn, (nr+7)/8, 1, 1,
+               256, 1, 1, 0, r->stream, ma);
     } else if (q4_q81) {
         if(d->q81_source!=x||d->q81_rows!=rows||d->q81_cols!=nc){
             int total=rows*nc;

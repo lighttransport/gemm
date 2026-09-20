@@ -16,11 +16,11 @@ On the 4096-token C clamp prompt, K=4 accepted 37/40 drafts and K=7 accepted
 41/42.  Both produced the ordinary target's exact 46-token response, EOS and
 sequence hash `15f17d2640c1adfc`; the emitted C is coherent, compiles warning
 free as C17 and passes `INT_MIN`/`INT_MAX` boundary cases. The final K=7 run
-measured **80.61 tok/s decode and 536.78 tok/s prefill**. K=4 measured 54.49
+measured **81.05 tok/s decode and 540.43 tok/s prefill**. K=4 measured 54.49
 and 537.42. A recent ordinary native baseline measured 39.55 and 533.19.
 The upstream llama.cpp server path measured 16.54 tok/s at K=4 with the same
-37/40 acceptance, versus its 25.88 baseline.  Native K=4 is 3.19x faster than
-upstream DFlash2, and K=7 is 93 percent faster than the recent ordinary native
+37/40 acceptance, versus its 25.88 baseline.  Native K=4 is 3.29x faster than
+upstream DFlash2, and K=7 is 105 percent faster than the recent ordinary native
 decode baseline.  Both short-context performance targets are met.
 
 The broader 4096-token C++ merge-intervals gate now passes at K=4 and K=7.
@@ -29,9 +29,9 @@ Greedy output matches the pinned llama.cpp bytes and token IDs with SHA-256
 temperature-0.6 output uses the exact-target fallback and matches SHA-256
 `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac`.
 Both functions pass ASan/UBSan, fixed edge cases and 10,000 randomized cases.
-Warm K=7 greedy runs sustain 607.44–608.13 tok/s prefill and
-85.05–85.06 tok/s decode. K=4 sustains 605.19–605.76 and 60.54–60.57.
-Sampled exact-target decode sustains 39.75–40.02 tok/s. The early-context
+Warm K=7 greedy runs sustain 606.05–606.91 tok/s prefill and
+85.15–85.26 tok/s decode. K=4 sustains 604.88–605.60 and 60.76–60.83.
+Sampled exact-target decode sustains 39.84–39.93 tok/s. The early-context
 retrieval gate also emits exactly `ZEPHYR-7319` at K=7 with the pinned token
 sequence and EOS.
 
@@ -47,6 +47,10 @@ Q2_K, IQ1_S, IQ1_M, IQ2/IQ3 and IQ4_XS.  Eight-row IQ kernels specialize the
 quantization format at compile time, eliminating runtime codebook branches.
 Compact Q2_K, IQ2 and IQ3_S schedules finish one verifier query at a time to
 lower accumulator pressure without changing the reference reduction order.
+The fixed-eight Q2_K/IQ and IQ4_XS multi-row kernels now use eight-wave,
+256-thread blocks. In matched traces this reduced aggregate fixed-eight
+projection time from 223.706 to 222.336 ms and IQ4_XS time from 47.068 to
+46.624 ms without changing any validated output bit.
 RMSNorm and residual-plus-RMSNorm use one batched launch with an independent
 block and unchanged reduction per row. The DFlash draft quantizes each row to
 Q8_1 and evaluates Q4_K projections with packed gfx1201 integer dots, reusing
@@ -55,8 +59,8 @@ projections. It also reuses K/V values across four attention rows. Exact target
 attention now loads each old Q8 K/V row once while evaluating up to eight
 adjacent verifier queries.  It retains the pinned query quantization, online
 softmax, packed-F16 accumulation and split-combine order.  K=7 timing for the
-final 46-token response is draft 77.625 ms, target verify 481.791 ms and
-commit 10.511 ms, for 570.66 ms total. The exact attention differential
+final 46-token response is draft 77.239 ms, target verify 478.857 ms and
+commit 10.624 ms, for 566.720 ms total. The exact attention differential
 passes 46,743,552 values; its eight-query operator takes 213.382 microseconds
 at 4K and 3.076784 milliseconds at 64K with eight splits.
 
@@ -84,8 +88,8 @@ CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
 and `--kv-cache q8q8`.  `validate_qwen38_reference.py` accepts `--dflash2`
 and `--dflash2-draft` for the greedy/sampled C++ gate.  Current artifacts are
-under `tmp/qwen38/dflash2-q4k-q81-k4/`,
-`tmp/qwen38/dflash2-q4k-q81-k7-v2/`, and
+under `tmp/qwen38/dflash2-launch256-k4/`,
+`tmp/qwen38/dflash2-launch256-k7-v2/`, and
 `tmp/qwen38/dflash2-retrieval-k7.*`.  Details and the reproduction command:
 [QWEN38_DFLASH2.md](rdna4/llm/QWEN38_DFLASH2.md).
 

@@ -68,7 +68,7 @@ both K and V:
 |---|---:|---:|---:|---|
 | Ordinary target, recent baseline | 533.19 | 39.55 | — | `15f17d2640c1adfc` |
 | Native DFlash2, K=4 | 537.42 | 54.49 | 37/40 | `15f17d2640c1adfc` |
-| Native DFlash2, K=7 | 536.78 | 80.61 | 41/42 | `15f17d2640c1adfc` |
+| Native DFlash2, K=7 | 540.43 | 81.05 | 41/42 | `15f17d2640c1adfc` |
 
 All three paths emitted the same 46-token response and EOS.  The response is
 valid C and implements the requested inclusive clamp without overflow-prone
@@ -89,20 +89,20 @@ ASan/UBSan, and 10,000 randomized cases.  Warm results were:
 
 | Draft width / selection | Prefill tok/s | Decode tok/s | Output SHA-256 |
 |---|---:|---:|---|
-| K=4 / greedy | 605.19–605.76 | 60.54–60.57 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
-| K=7 / greedy | 607.44–608.13 | 85.05–85.06 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
-| sampled exact-target fallback | 604.12–607.44 | 39.75–40.02 | `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac` |
+| K=4 / greedy | 604.88–605.60 | 60.76–60.83 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
+| K=7 / greedy | 606.05–606.91 | 85.15–85.26 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
+| sampled exact-target fallback | 605.12–605.87 | 39.84–39.93 | `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac` |
 
 The 4096-token early-context retrieval fixture also returns exactly
 `ZEPHYR-7319` with K=7, including the ordinary target's token sequence and
-EOS.  These results are under `tmp/qwen38/dflash2-q4k-q81-k4/`,
-`tmp/qwen38/dflash2-q4k-q81-k7-v2/`, and
+EOS.  These results are under `tmp/qwen38/dflash2-launch256-k4/`,
+`tmp/qwen38/dflash2-launch256-k7-v2/`, and
 `tmp/qwen38/dflash2-retrieval-k7.*`.
 
 The upstream llama.cpp server reference accepted 37/40 drafts at K=4 on the
 same prompt, but measured 16.54 tok/s versus its 25.88 tok/s ordinary path.
-The native K=4 implementation reproduces that acceptance exactly and is 3.19
-times as fast.  K=7 is 93 percent faster than the retained recent ordinary
+The native K=4 implementation reproduces that acceptance exactly and is 3.29
+times as fast.  K=7 is 105 percent faster than the retained recent ordinary
 native baseline on this prompt.  DFlash prefill also clears the 500 tok/s
 target.  The feature remains opt-in while serving integration and broader
 quality coverage remain incomplete.
@@ -118,7 +118,7 @@ residual-plus-RMSNorm launch one independent block per candidate row. Q4_K
 draft projections quantize each candidate activation in 32-value Q8_1 groups,
 reuse one decoded weight chunk across all rows, and use gfx1201 packed integer
 dots. Adjacent projections with the same activation reuse the quantized input.
-This reduces the 4K K=7 draft phase from 109.739 to 77.625 ms. Draft arithmetic
+This reduces the 4K K=7 draft phase from 109.739 to 77.239 ms. Draft arithmetic
 may change rejected proposals; accepted tokens and state still come only from
 the exact target verifier. The exact Q8/Q8 verifier attention
 now loads each old K/V row once and evaluates up to eight adjacent causal
@@ -127,8 +127,16 @@ online softmax, packed-F16 accumulation and split-combine order.  The draft
 also reuses Q4_K weights and holds one K/V vector while evaluating four mask
 rows.
 
+The exact fixed-eight Q2_K/IQ kernels and IQ4_XS multi-row projection use
+eight-wave, 256-thread blocks. This changes only the assignment of eight
+output rows to a block; each row retains its existing arithmetic. In matched
+K=7 traces it reduced aggregate fixed-eight projection time from 223.706 to
+222.336 ms and IQ4_XS multi-row time from 47.068 to 46.624 ms. The projection
+differential passes 2,948,352 exact activation values and 13,191,360 bitwise
+outputs with the production launch geometry.
+
 These changes keep the target sequence unchanged while reducing the K=7
-draft/verify/commit split to 77.625/481.791/10.511 ms for the complete
+draft/verify/commit split to 77.239/478.857/10.624 ms for the complete
 46-token response.  The eight-query attention operator takes 213.382
 microseconds at 4K and 3.076784 milliseconds at 64K with eight splits.  The
 pinned llama.cpp differential test passes 46,743,552 bitwise Q8/Q8 output
@@ -161,8 +169,8 @@ The tested sidecar is
 
 ## Remaining optimization opportunities
 
-The short-context K=7 response emits 46 tokens in 570.66 ms, clearing the
-60 tok/s target with about 34 percent throughput headroom. DFlash also clears
+The short-context K=7 response emits 46 tokens in 566.72 ms, clearing the
+60 tok/s target with about 35 percent throughput headroom. DFlash also clears
 40 tok/s after a real random-token 64K prefix. Ordinary one-token decode now
 reaches 33.31 tok/s at 64K after exact GQA reuse and scalar IQ codebook
 staging, so work that helps
@@ -197,7 +205,7 @@ reflects the remaining measured costs.
    adjacent operations when their intermediate values need no external
    checkpoint.
 6. **Remaining draft cost.** Top-k and selector decisions already run on the
-   GPU, and packed Q4_K/Q8_1 projections cut draft work to 77.625 ms at 4K and
+   GPU, and packed Q4_K/Q8_1 projections cut draft work to 77.239 ms at 4K and
    474.117 ms across the 256-token 64K suffix. Position-parallel attention and
    cheaper draft-cache storage are the next candidates, provided K=4/K=7
    acceptance and authoritative output remain stable.

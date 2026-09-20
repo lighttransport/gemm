@@ -361,8 +361,8 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
             if (rows == HLLM_DENSE_MTP_REUSE_ROWS) {
                 void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
                                &nr, &nc, &rows };
-                LAUNCH(r->fn_qwen35_matvec_q2k_fixed8, (nr+3)/4, 1, 1,
-                       128, 1, 1, 0, r->stream, ma);
+                LAUNCH(r->fn_qwen35_matvec_q2k_fixed8, (nr+7)/8, 1, 1,
+                       256, 1, 1, 0, r->stream, ma);
             } else {
                 int first = rows <= HLLM_DENSE_MTP_SMALL_REUSE_ROWS ? rows :
                     HLLM_DENSE_MTP_SMALL_REUSE_ROWS;
@@ -388,8 +388,8 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
             hipFunction_t iq4_fn = nc == 5120 ?
                 r->fn_qwen35_matvec_iq4xs_5120_multi8 :
                 r->fn_qwen35_matvec_iq4xs_multi8;
-            LAUNCH(iq4_fn, (nr+3)/4, 1, 1,
-                   128, 1, 1, 0, r->stream, ma);
+            LAUNCH(iq4_fn, (nr+7)/8, 1, 1,
+                   256, 1, 1, 0, r->stream, ma);
         } else if (rows <= HLLM_DENSE_MTP_REUSE_ROWS &&
                    type != GGML_TYPE_IQ4_XS &&
                    !(type == GGML_TYPE_IQ2_S && nc > 6144)) {
@@ -405,7 +405,7 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
                     hllm_dense_mtp_iq_multi8(r, type);
                 void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
                                &nr, &nc, &rows };
-                LAUNCH(multi, (nr+3)/4, 1, 1, 128, 1, 1, 0,
+                LAUNCH(multi, (nr+7)/8, 1, 1, 256, 1, 1, 0,
                        r->stream, ma);
             }
         } else LAUNCH(fn, (nr+7)/8, rows, 1, 256, 1, 1, 0, r->stream, a);

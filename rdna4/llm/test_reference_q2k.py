@@ -169,15 +169,15 @@ int main() {
                     if(kind==4) qwen35_matvec_iq2xxs<<<(rows+7)/8,256>>>(o,dw,q,sc,rows,cols);
                     if(kind==5) qwen35_matvec_iq2xs<<<(rows+7)/8,256>>>(o,dw,q,sc,rows,cols);
                     if(kind==6) qwen35_matvec_iq4xs<<<(rows+7)/8,256>>>(o,dw,q,sc,rows,cols);
-                } else if(kind==0 && count==8) qwen35_matvec_q2k_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                } else if(kind==0 && count==8) qwen35_matvec_q2k_fixed8<<<(rows+7)/8,256>>>(mo,dw,mq,ms,rows,cols,count);
                 else if(kind==0) qwen35_matvec_q2k_multi4<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
-                else if(kind==6) qwen35_matvec_iq4xs_5120_multi8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                else if(kind==6) qwen35_matvec_iq4xs_5120_multi8<<<(rows+7)/8,256>>>(mo,dw,mq,ms,rows,cols,count);
                 else if(count==8) {
-                    if(kind==1) qwen35_matvec_iq2s_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
-                    if(kind==2) qwen35_matvec_iq3xxs_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
-                    if(kind==3) qwen35_matvec_iq3s_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
-                    if(kind==4) qwen35_matvec_iq2xxs_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
-                    if(kind==5) qwen35_matvec_iq2xs_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                    if(kind==1) qwen35_matvec_iq2s_fixed8<<<(rows+7)/8,256>>>(mo,dw,mq,ms,rows,cols,count);
+                    if(kind==2) qwen35_matvec_iq3xxs_fixed8<<<(rows+7)/8,256>>>(mo,dw,mq,ms,rows,cols,count);
+                    if(kind==3) qwen35_matvec_iq3s_fixed8<<<(rows+7)/8,256>>>(mo,dw,mq,ms,rows,cols,count);
+                    if(kind==4) qwen35_matvec_iq2xxs_fixed8<<<(rows+7)/8,256>>>(mo,dw,mq,ms,rows,cols,count);
+                    if(kind==5) qwen35_matvec_iq2xs_fixed8<<<(rows+7)/8,256>>>(mo,dw,mq,ms,rows,cols,count);
                 }
                 else qwen35_matvec_iq_multi4<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,multi_kind,count);
             };
