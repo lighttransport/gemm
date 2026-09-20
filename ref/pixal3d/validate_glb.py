@@ -6,6 +6,7 @@ from pathlib import Path
 import struct
 import numpy as np
 from PIL import Image
+from mesh_components import component_diagnostics
 p=argparse.ArgumentParser();p.add_argument('path',type=Path)
 p.add_argument('--allow-material-red',action='store_true',
                help='accept reference exporters that use the material red channel')
@@ -63,6 +64,7 @@ assert images[0].shape==(texture_size,texture_size,4) and images[1].shape==(text
 red_limit=0 if all(item['mimeType']=='image/png' for item in scene['images']) else 32
 material_red_max=int(images[1][:,:,0].max())
 assert a.allow_material_red or material_red_max<=red_limit
+components=component_diagnostics(v,f,area)
 print(json.dumps(dict(path=str(a.path),bytes=len(raw),vertices=len(v),triangles=len(f),
     bounds=[v.min(0).tolist(),v.max(0).tolist()],texture_size=texture_size,
     zero_normal_count=int(zero_normals.sum()),
@@ -71,5 +73,5 @@ print(json.dumps(dict(path=str(a.path),bytes=len(raw),vertices=len(v),triangles=
     normal_max_error=float(abs(normal_lengths[~zero_normals]-1).max(initial=0)),
     base_median=np.median(images[0].reshape(-1,4),axis=0).tolist(),
     material_median=np.median(images[1].reshape(-1,3),axis=0).tolist(),
-    material_red_max=material_red_max)),flush=True)
+    material_red_max=material_red_max,components=components)),flush=True)
 print('GLB PASS',flush=True)

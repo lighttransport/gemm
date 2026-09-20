@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "source": {
+    "repository": "https://github.com/TencentARC/Pixal3D.git",
+    "revision": "f7cf38429b0bd264f1995f0f8743a88b1c728b94",
+    "directory": "ref/pixal3d/upstream/assets/images"
+  },
+  "defaults": {
+    "fov": 0.857556,
+    "mesh_scale": 1.0,
+    "backend": "cuda",
+    "gpu_execution": "resident",
+    "gpu_kernels": "auto",
+    "gpu_flow_precision": "mixed",
+    "vram_budget_mib": 12288
+  },
+  "assets": [
+    {"id": "turtle", "file": "0_img.png", "bytes": 14005813, "sha256": "6959e517ee4bc6852791f69bd6ece696a435abcda8321727c07db8daf7f457cf"},
+    {"id": "house", "file": "1_img.png", "bytes": 226408, "sha256": "fdd82d60b7ec11e6d5699df29693d8ab538f9dab4b04e3f2abaa59ccd7b4709a"},
+    {"id": "crab", "file": "9_img.png", "bytes": 594232, "sha256": "d7e716abe8f8895080f562d1dc26b14fa0e20a05aa5beb2770c6fb3b87b3476a"},
+    {"id": "astronaut", "file": "10_img.webp", "bytes": 117870, "sha256": "9558307682a1e723f86291af377f0b53970c0d301304c1f43dec741fedc209d7"},
+    {"id": "foliage", "file": "11_img.png", "bytes": 8406710, "sha256": "fbef7bb66e4ffa0cf4866399cf2b0841c56239086772f2fedea87a76718dde4d"},
+    {"id": "still-life", "file": "12_img.png", "bytes": 7956804, "sha256": "c8a4b4e92b4fa6a8eeec352f25af3f66b65ee0c743ad483b727404c9cb9a6914"},
+    {"id": "jester", "file": "21_img.png", "bytes": 724846, "sha256": "5793b52a21507a5cdd661f8d87681b303e420057a8c65aaa16e0560409a7a34e"}
+  ],
+  "native_runs": [
+    {"name": "turtle-smoke", "asset": "turtle", "seed": 42, "texture_size": 1024, "triangle_target": 250000},
+    {"name": "house-smoke", "asset": "house", "seed": 42, "texture_size": 1024, "triangle_target": 250000},
+    {"name": "crab-smoke", "asset": "crab", "seed": 42, "texture_size": 1024, "triangle_target": 250000},
+    {"name": "astronaut-smoke", "asset": "astronaut", "seed": 42, "texture_size": 1024, "triangle_target": 250000},
+    {"name": "foliage-smoke", "asset": "foliage", "seed": 42, "texture_size": 1024, "triangle_target": 250000},
+    {"name": "still-life-smoke", "asset": "still-life", "seed": 42, "texture_size": 1024, "triangle_target": 250000},
+    {"name": "jester-smoke", "asset": "jester", "seed": 42, "texture_size": 1024, "triangle_target": 250000},
+    {"name": "house-seed-1", "asset": "house", "seed": 1, "texture_size": 1024, "triangle_target": 250000},
+    {"name": "jester-seed-3", "asset": "jester", "seed": 3, "texture_size": 1024, "triangle_target": 250000},
+    {"name": "turtle-full", "asset": "turtle", "seed": 42, "texture_size": 4096, "triangle_target": 1000000},
+    {"name": "house-full", "asset": "house", "seed": 42, "texture_size": 4096, "triangle_target": 1000000},
+    {"name": "foliage-full", "asset": "foliage", "seed": 42, "texture_size": 4096, "triangle_target": 1000000},
+    {"name": "jester-full", "asset": "jester", "seed": 42, "texture_size": 4096, "triangle_target": 1000000}
+  ],
+  "reference_pairs": [
+    {"name": "house", "native_run": "house-smoke"},
+    {"name": "jester", "native_run": "jester-smoke"}
+  ],
+  "thresholds": {
+    "symmetric_chamfer_rms_max": 0.03,
+    "normal_abs_cosine_mean_min": 0.90,
+    "render_psnr_min": 20.0,
+    "silhouette_iou_min": 0.95
+  }
+}

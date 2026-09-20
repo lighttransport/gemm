@@ -217,6 +217,44 @@ orientation-independent nearest-face normal agreement. Pass matching
 `--native-renders` and `--reference-renders`
 directories to add RGB error, PSNR, and silhouette IoU for rendered PNG views.
 
+`validate_glb.py` also reports deterministic edge-connected mesh components.
+It welds exact duplicate positions introduced by UV seams before building the
+face graph. The report includes component count, largest face/area fractions,
+and bounded per-component bounds. This is diagnostic only: production Pixal3D
+does not remove detached components.
+
+## Tiered regression and quality corpus
+
+`check.py` is the unified regression entry point. It writes command logs and
+an atomic machine-readable summary under `tmp/pixal3d/checks/`:
+
+```sh
+ref/pixal3d/run.sh cpu ref/pixal3d/check.py --tier quick
+ref/pixal3d/run.sh cpu ref/pixal3d/check.py --tier web
+ref/pixal3d/run.sh cuda ref/pixal3d/check.py --tier cuda
+ref/pixal3d/run.sh cuda ref/pixal3d/check.py --tier quality
+```
+
+`quick` covers native units/builds, preparation, component diagnostics, server
+units, and the consolidated evidence schema. `web` adds the headless Chrome
+flow. `cuda` adds the CUDA build, MMA/reference checks, and resident tests;
+pass `--cuda-dump-dir` plus two `--multiview-runs` artifacts to include the
+long reliability soak. `quality` is resumable and uses the checked
+`quality-corpus.json` manifest.
+
+The quality corpus pins seven diverse upstream assets and their SHA-256 hashes.
+It runs 1024/250k smoke generation for all seven, two extra seeds, and
+4096/1M full generation for turtle, house, foliage, and jester. House and
+jester additionally run the pinned PyTorch reference plus matched four-view
+render comparisons. Required paired thresholds are symmetric Chamfer RMS below
+0.03, both absolute-normal means above 0.90, every finite render PSNR above
+20 dB, and every available silhouette IoU above 0.95. Use `--runs NAME ...`
+for a bounded subset and `--no-resume` to regenerate existing outputs.
+
+`--tier all` runs every tier and requires `--postprocess-dump DIR`. Its final
+4096/1M replay must retain the established byte-identical GLB SHA-256
+`6d8c267b006df8cf60e3c5ea71d470e89c3cb734f61b91b5e1c622e1f711a8b7`.
+
 ## Validation record
 
 Checkpoints are taken from `/mnt/disk2/models/Pixal3D` and the local timm DINOv3
