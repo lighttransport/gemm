@@ -796,3 +796,26 @@ to 200% relative error as PASS) to 0.05 for high-level streams and 0.01 for KDA
 internals. The layer-3 reference artifact count was also fixed. With these
 gates, the leading KDA validation remains green while the current layer-3/full
 chain correctly fails equivalence instead of producing a false PASS.
+
+Job 51817920 added production-side MLA front-end artifacts to distinguish a
+bad tensor layout from accumulated compact-arithmetic error. It passed build,
+staging, baseline decode, patched decode, and all three new internal gates:
+
+| Layer-3 MLA internal | Elements | Relative L2 | Maximum absolute error |
+| --- | ---: | ---: | ---: |
+| normalized Q-A LoRA residual | 1,536 | 0.0163912 | 0.0448251 |
+| sharded Q-B projection | 16,384 | 0.0108243 | 0.107875 |
+| normalized KV-A latent | 512 | 0.00723716 | 0.0106776 |
+
+The attention input and final DSA output remained at 0.0111027 and 0.0167153
+relative L2. This rules out a head-shard ordering error, transposed Q-B, or
+misplaced KV normalization: all MLA front-end tensors have the expected shape
+and agree within 1.7%. The 0.234516 mHC-post ratio is the first 5% gate failure,
+but the unfused mHC equations consume already-different streams near a
+cancellation point; it is an amplifier, not the source discrepancy.
+
+The existing `glm53f_iq_bridge` already contains an A64FX SVE Q5_K-by-Q8
+activation kernel. The shortest implementation path is therefore to extend
+the rank-local native-GGUF stage used by dense layers to the sparse compact
+projections and attach those staged Q5_K/Q8_0 tensors in the sparse runtime.
+That avoids both the Q5_K-to-FP8 conversion and a second dequantized model copy.
