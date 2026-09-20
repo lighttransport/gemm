@@ -59,6 +59,15 @@ RMS, both directional p95 distances, and orientation-independent normal
 agreement. These provide reproducible geometry diagnostics alongside visual
 inspection without retaining decoded meshes in the job record.
 
+Set `render_comparison: true` together with `reference: true` to render four
+camera-matched views of both results. The comparison then includes per-view
+RGB MAE, RMSE, PSNR, and silhouette IoU in `comparison.renders`. Queued jobs
+also retain two contact sheets at
+`comparison.artifacts.native_preview` and
+`comparison.artifacts.reference_preview`; the web demo displays them below
+the interactive viewers. Build the bounded CPU preview renderer once with
+`ref/pixal3d/build_preview.sh`. Its readiness is reported by `GET /health`.
+
 For single-view requests, `auto_mask: true` uses the pinned RMBG-2.0 reference
 when the image lacks useful alpha, and `auto_camera: true` estimates horizontal
 FOV with pinned MoGe-2. The response includes resolved values and sources in

@@ -36,6 +36,7 @@ DEFAULT_MOGE = Path("/mnt/disk2/models/moge-2-vitl/model.pt")
 MAX_BODY_BYTES = 256 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_GLB_BYTES = 256 * 1024 * 1024
+MAX_PREVIEW_BYTES = 32 * 1024 * 1024
 
 
 class JobCancelled(Exception):
@@ -379,7 +380,8 @@ def mesh_comparison(native: dict, reference: dict) -> dict:
     return result
 
 
-def attach_comparison(pixal, result: dict, cancel: threading.Event | None = None) -> None:
+def attach_comparison(pixal, result: dict, cancel: threading.Event | None = None,
+                      render_comparison: bool = False) -> None:
     """Attach cheap structural and optional bounded surface diagnostics."""
     native_mesh = result.get("mesh_summary", {})
     reference = result.get("reference", {})
@@ -389,7 +391,15 @@ def attach_comparison(pixal, result: dict, cancel: threading.Event | None = None
     comparison = mesh_comparison(native_mesh, reference_mesh)
     if hasattr(pixal, "surface_comparison"):
         try:
-            comparison["surface"] = pixal.surface_comparison(result, reference, cancel)
+            measured = pixal.surface_comparison(
+                result, reference, cancel, render_comparison=render_comparison)
+            renders = measured.pop("_renders", None)
+            preview_files = measured.pop("_preview_files", None)
+            comparison["surface"] = measured
+            if renders is not None:
+                comparison["renders"] = renders
+            if preview_files:
+                result["_comparison_artifact_files"] = preview_files
         except JobCancelled:
             raise
         except Exception as exc:
@@ -416,6 +426,8 @@ class PixalServer:
         self.reference_launcher = ROOT / "ref/pixal3d/run_reference_cuda310.sh"
         self.prepare_script = ROOT / "ref/pixal3d/prepare_input.py"
         self.compare_script = ROOT / "ref/pixal3d/compare_outputs.py"
+        self.preview_script = ROOT / "ref/pixal3d/preview_glb.py"
+        self.preview_renderer = ROOT / "ref/pixal3d/.cache/preview_render"
 
     def health(self) -> dict:
         lib = {
@@ -453,7 +465,10 @@ class PixalServer:
                 "default_gpu_kernels": self.args.gpu_kernels,
                 "default_gpu_flow_precision": self.args.gpu_flow_precision,
                 "preparation": {"mask_ready": rmbg_ready(self.rembg),
-                                "camera_ready": self.moge.is_file()},
+                                "camera_ready": self.moge.is_file(),
+                                "render_comparison_ready": (
+                                    self.preview_script.is_file() and
+                                    self.preview_renderer.is_file())},
                 "reference": reference,
                 "limits": {"body_bytes": MAX_BODY_BYTES, "image_bytes": MAX_IMAGE_BYTES,
                            "glb_bytes": MAX_GLB_BYTES, "views": 16}, "backends": out}
@@ -490,6 +505,13 @@ class PixalServer:
         include_ply = request.get("include_ply", False)
         if not isinstance(include_ply, bool):
             raise ValueError("include_ply must be a boolean")
+        render_comparison = boolean(request.get("render_comparison", False),
+                                    "render_comparison")
+        if render_comparison and not request.get("reference"):
+            raise ValueError("render_comparison requires reference: true")
+        if render_comparison and not self.preview_renderer.is_file():
+            raise ValueError(
+                "render comparison is unavailable; run ref/pixal3d/build_preview.sh")
         with self.locks[backend], tempfile.TemporaryDirectory(prefix="request-", dir=self.work_dir) as td:
             run_dir = Path(td)
             artifact_dir = retained_artifact_dir(request)
@@ -747,7 +769,8 @@ class PixalServer:
             return result
 
     def surface_comparison(self, native: dict, reference: dict,
-                           cancel: threading.Event | None = None) -> dict:
+                           cancel: threading.Event | None = None,
+                           render_comparison: bool = False) -> dict:
         """Run bounded geometry metrics in an isolated short-lived process."""
         with tempfile.TemporaryDirectory(prefix="comparison-", dir=self.work_dir) as td:
             directory = Path(td)
@@ -765,12 +788,43 @@ class PixalServer:
                 reference_path.write_bytes(base64.b64decode(reference["glb_b64"], validate=True))
             command = [str(self.python_launcher), "cpu", str(self.compare_script),
                        str(native_path), str(reference_path), "--samples", "50000"]
+            native_renders = directory / "native-renders"
+            reference_renders = directory / "reference-renders"
+            if render_comparison:
+                for source, destination in ((native_path, native_renders),
+                                            (reference_path, reference_renders)):
+                    preview = [str(self.python_launcher), "cpu", str(self.preview_script),
+                               str(source), "--renderer", str(self.preview_renderer),
+                               "--output-dir", str(destination)]
+                    rendered = run_command(
+                        preview, min(self.args.reference_timeout, 600), cancel)
+                    if rendered.returncode:
+                        raise RuntimeError(
+                            (rendered.stderr or rendered.stdout).strip()[-2000:])
+                command += ["--native-renders", str(native_renders),
+                            "--reference-renders", str(reference_renders)]
             proc = run_command(command, min(self.args.reference_timeout, 600), cancel)
             if proc.returncode:
                 raise RuntimeError((proc.stderr or proc.stdout).strip()[-2000:])
             measured = json.loads(proc.stdout)
-            return {"available": True, "samples": measured["samples"],
-                    "seed": measured["seed"], **measured["geometry"]}
+            result = {"available": True, "samples": measured["samples"],
+                      "seed": measured["seed"], **measured["geometry"]}
+            if render_comparison:
+                result["_renders"] = measured["renders"]
+                artifact_files = native.get("_artifact_files", {})
+                native_artifact = artifact_files.get("native.glb")
+                if native_artifact:
+                    artifact_dir = Path(native_artifact).parent
+                    previews = {}
+                    for name, source in (
+                            ("native-preview.png", native_renders / "views.png"),
+                            ("reference-preview.png", reference_renders / "views.png")):
+                        partial = artifact_dir / f".{name}.partial"
+                        shutil.copyfile(source, partial)
+                        previews[name] = publish_artifact(
+                            partial, artifact_dir / name, MAX_PREVIEW_BYTES)
+                    result["_preview_files"] = previews
+            return result
 
 
 class JobQueue:
@@ -830,6 +884,12 @@ class JobQueue:
                     (result, "ply", "native.ply", False)]
         if isinstance(result.get("reference"), dict):
             expected.append((result["reference"], "glb", "reference.glb", True))
+        comparison = result.get("comparison")
+        if isinstance(comparison, dict) and isinstance(comparison.get("artifacts"), dict):
+            expected.extend([
+                (comparison, "native_preview", "native-preview.png", False),
+                (comparison, "reference_preview", "reference-preview.png", False),
+            ])
         for container, public, name, required in expected:
             artifacts = container.get("artifacts")
             if not isinstance(artifacts, dict) or public not in artifacts:
@@ -928,6 +988,25 @@ class JobQueue:
                 public = "ply" if name.endswith(".ply") else "glb"
                 container.setdefault("artifacts", {})[public] = (
                     f"/v1/jobs/{job_id}/artifacts/{name}")
+
+        comparison_files = result.pop("_comparison_artifact_files", {})
+        if not isinstance(comparison_files, dict):
+            raise ValueError("invalid comparison artifact map")
+        for name, source in comparison_files.items():
+            if name not in ("native-preview.png", "reference-preview.png"):
+                raise ValueError(f"invalid comparison artifact name: {name}")
+            path = Path(source)
+            try:
+                path.relative_to(directory)
+            except ValueError as exc:
+                raise ValueError("comparison artifact escaped job storage") from exc
+            if not valid_output(path, MAX_PREVIEW_BYTES):
+                raise ValueError(f"missing comparison artifact {name}")
+            stored[name] = path
+            public = ("native_preview" if name.startswith("native-")
+                      else "reference_preview")
+            result.setdefault("comparison", {}).setdefault("artifacts", {})[public] = (
+                f"/v1/jobs/{job_id}/artifacts/{name}")
 
         def save(container: dict, field: str, name: str, public: str) -> None:
             encoded = container.pop(field, None)
@@ -1034,7 +1113,8 @@ class JobQueue:
             return {"id": job_id, "state": "deleted", "deleted": True}
 
     def artifact(self, job_id: str, name: str) -> Path:
-        if name not in ("native.glb", "native.ply", "reference.glb"):
+        if name not in ("native.glb", "native.ply", "reference.glb",
+                        "native-preview.png", "reference-preview.png"):
             raise KeyError(name)
         with self.lock:
             self._expire_locked()
@@ -1088,7 +1168,9 @@ class JobQueue:
                     self._update(job_id, phase="PyTorch reference", progress=98)
                     result["reference"] = self.pixal.reference(reference_request(request, result), cancel)
                     self._update(job_id, phase="surface comparison", progress=99)
-                    attach_comparison(self.pixal, result, cancel)
+                    attach_comparison(
+                        self.pixal, result, cancel,
+                        render_comparison=request.get("render_comparison", False))
                 self._store_artifacts(job_id, result)
                 self._update(job_id, state="complete", phase="complete", progress=100, result=result,
                              completed_at=time.time())
@@ -1125,7 +1207,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
     def file_response(self, path: Path):
-        content_type = "model/gltf-binary" if path.suffix == ".glb" else "application/octet-stream"
+        content_type = ("model/gltf-binary" if path.suffix == ".glb" else
+                        "image/png" if path.suffix == ".png" else
+                        "application/octet-stream")
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(path.stat().st_size))
@@ -1185,7 +1269,9 @@ class Handler(BaseHTTPRequestHandler):
             result = self.server.pixal.infer(request)
             if request.get("reference"):
                 result["reference"] = self.server.pixal.reference(reference_request(request, result))
-                attach_comparison(self.server.pixal, result)
+                attach_comparison(
+                    self.server.pixal, result,
+                    render_comparison=request.get("render_comparison", False))
             self.json_response(200, result)
         except QueueFull as exc: self.json_response(429, error_payload("queue_full", str(exc)))
         except TimeoutError as exc: self.json_response(504, error_payload("timeout", str(exc)))

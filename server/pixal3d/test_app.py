@@ -246,6 +246,52 @@ class PixalServerTest(unittest.TestCase):
         self.assertEqual(result["comparison"]["surface"]["symmetric_chamfer_rms"], 0.01)
         self.assertEqual(captured["command"][captured["command"].index("--samples") + 1], "50000")
 
+    def test_rendered_comparison_publishes_metrics_and_previews(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="render-comparison-", dir=scratch) as td:
+            server = self.make_server(Path(td))
+            server.preview_renderer = Path(td) / "preview-render"
+            server.preview_renderer.write_bytes(b"renderer")
+            artifact_dir = Path(td) / "results" / ("f" * 32)
+            artifact_dir.mkdir(parents=True)
+            native_path = artifact_dir / "native.glb"
+            reference_path = artifact_dir / "reference.glb"
+            native_path.write_bytes(b"native")
+            reference_path.write_bytes(b"reference")
+            measured = {"samples": 50000, "seed": 17, "geometry": {
+                "symmetric_chamfer_rms": 0.01,
+                "native_to_reference": {"p95": 0.02},
+                "reference_to_native": {"p95": 0.03}},
+                "renders": [{"name": "view-0.png", "rgb_mae": 0.01,
+                             "rgb_rmse": 0.02, "rgb_psnr": 33.98,
+                             "silhouette_iou": 0.99}]}
+
+            def run(command, **kwargs):
+                if str(server.preview_script) in command:
+                    output_dir = Path(command[command.index("--output-dir") + 1])
+                    output_dir.mkdir(parents=True)
+                    (output_dir / "views.png").write_bytes(b"preview")
+                    return subprocess.CompletedProcess(command, 0, "views.png\n", "")
+                return subprocess.CompletedProcess(command, 0, json.dumps(measured), "")
+
+            result = {
+                "mesh_summary": {"vertices": 10, "triangles": 8,
+                                 "bounds": [[0, 0, 0], [1, 1, 1]]},
+                "_artifact_files": {"native.glb": native_path},
+                "reference": {
+                    "mesh_summary": {"vertices": 9, "triangles": 7,
+                                     "bounds": [[0, 0, 0], [1, 1, 1]]},
+                    "_artifact_files": {"reference.glb": reference_path},
+                }}
+            with mock.patch.object(app.subprocess, "run", side_effect=run):
+                app.attach_comparison(server, result, render_comparison=True)
+
+            self.assertEqual(result["comparison"]["renders"][0]["rgb_psnr"], 33.98)
+            previews = result["_comparison_artifact_files"]
+            self.assertEqual(previews["native-preview.png"].read_bytes(), b"preview")
+            self.assertEqual(previews["reference-preview.png"].read_bytes(), b"preview")
+
     def test_multiview_reference_uses_pinned_entry_point(self):
         scratch = app.ROOT / "tmp/pixal3d/tests"
         scratch.mkdir(parents=True, exist_ok=True)
@@ -512,9 +558,18 @@ class PixalServerTest(unittest.TestCase):
             class ArtifactPixal:
                 work_dir = Path(td)
                 def infer(self, request, cancel=None, progress=None):
+                    directory = request["_artifact_dir"]
+                    native_preview = directory / "native-preview.png"
+                    reference_preview = directory / "reference-preview.png"
+                    native_preview.write_bytes(b"native-preview")
+                    reference_preview.write_bytes(b"reference-preview")
                     return {"ok": True,
                             "glb_b64": base64.b64encode(b"native-glb").decode(),
-                            "ply_b64": base64.b64encode(b"native-ply").decode()}
+                            "ply_b64": base64.b64encode(b"native-ply").decode(),
+                            "comparison": {"renders": []},
+                            "_comparison_artifact_files": {
+                                "native-preview.png": native_preview,
+                                "reference-preview.png": reference_preview}}
                 def reference(self, request, cancel=None):
                     return {"glb_b64": base64.b64encode(b"reference-glb").decode()}
 
@@ -532,6 +587,11 @@ class PixalServerTest(unittest.TestCase):
                              b"native-glb")
             self.assertEqual(jobs.artifact(submitted["id"], "reference.glb").read_bytes(),
                              b"reference-glb")
+            self.assertEqual(result["comparison"]["artifacts"]["native_preview"],
+                             f"/v1/jobs/{submitted['id']}/artifacts/native-preview.png")
+            self.assertEqual(
+                jobs.artifact(submitted["id"], "reference-preview.png").read_bytes(),
+                b"reference-preview")
             artifact_dir = jobs.artifact(submitted["id"], "native.ply").parent
             jobs.delete(submitted["id"])
             self.assertFalse(artifact_dir.exists())

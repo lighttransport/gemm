@@ -33,7 +33,8 @@ class FakePixal:
         return {"ok": True, "service": "pixal3d", "default_backend": "cuda",
                 "default_gpu_execution": "resident", "default_gpu_kernels": "auto",
                 "default_gpu_flow_precision": "mixed",
-                "preparation": {"mask_ready": True, "camera_ready": True},
+                "preparation": {"mask_ready": True, "camera_ready": True,
+                                "render_comparison_ready": True},
                 "reference": {"cuda": reference, "rocm": reference},
                 "backends": {name: ready for name in ("cpu", "cuda", "rocm")}}
 
@@ -58,11 +59,17 @@ class FakePixal:
                 "mesh_summary": {"vertices": 99, "triangles": 79,
                                  "bounds": [[-.5, -.5, -.5], [.5, .5, .5]]}}
 
-    def surface_comparison(self, native, reference, cancel=None):
-        return {"available": True, "samples": 50000, "seed": 17,
+    def surface_comparison(self, native, reference, cancel=None,
+                           render_comparison=False):
+        result = {"available": True, "samples": 50000, "seed": 17,
                 "symmetric_chamfer_rms": .01,
                 "native_to_reference": {"p95": .02, "normal_abs_cosine_mean": .98},
                 "reference_to_native": {"p95": .03, "normal_abs_cosine_mean": .97}}
+        if render_comparison:
+            result["_renders"] = [{"name": "view-0.png", "rgb_mae": .01,
+                                    "rgb_rmse": .02, "rgb_psnr": 34.0,
+                                    "silhouette_iou": .99}]
+        return result
 
 
 class Cdp:
