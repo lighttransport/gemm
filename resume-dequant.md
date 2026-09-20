@@ -254,7 +254,51 @@ Q38TP_RANK=0 Q38TP_SIZE=4 ./a64fx/llm/build/qwen38_kquant_stage \
 
 ## Resume prompts
 
-### Current task: W8A16 / W8A32 at 220--230 GB/s
+### Current task: E4M3FN >200 GB/s with modest packing expansion
+
+Latest user authorization allows modest expansion and requires original-byte
+rate to remain visible. Native implementation milestone is `1aab727a`.
+The new explicit `--packing p9` layout in `a64fx/dequant-pipe/e4_pack.[Sch]`
+uses 9 bits/weight plus a 64-byte header, with exact reversible magnitude
+encoding and transposed sign bits. It expands total storage by 12.70% for
+FP16 and 12.89% for FP32. No production model path has been changed.
+
+Three fresh launch medians, original FP8 GB/s / stored GB/s:
+
+- FP16: 203.39/229.21, 204.32/230.26, 204.26/230.19 — >200 PASS.
+- FP32: 183.83/207.53, 183.89/207.60, 183.95/207.67 — >200 FAIL.
+
+All six launches qualified: paired reads 228.38--229.80 GB/s, 2 MiB pages,
+NUMA node 4, CPUs 12--23 at 2 GHz, FPCR=0. Logs and hashes are in
+`tmp/dequant/e4-p9-acceptance.oaCn3W/`. Run
+`bash a64fx/dequant-pipe/run_e4_p9_acceptance.sh`; it correctly exits 1 for
+the three FP32 misses. Do not replace original-byte rate with expanded-byte
+rate to claim FP32 success. The previous 220 GB/s native gate is unchanged.
+
+FP16 shifts exact magnitude bits and applies signs with SVE predicates.
+FP32 interprets magnitudes as `w * 2^-112` (all nonzero weights normal),
+reuses prepared `a * 2^112`, and keeps sequential K-order FMA. Preparation
+requires FPCR=0 and finite |a| <= 0x1.fffffep15, with FPCR unchanged until
+use; NaN weights or unsafe activations use unpack/native fallback. Preparation
+is about 548 ns per 128 values, separately reported and excluded from kernel
+timing. Finite outputs are bit-exact; NaN payloads and FPSR flags are not
+promised. Tests cover guard boundaries, invalid records, FPCR fallback,
+minimum FP32 subnormals and all 256 weight codes, plus all W4 regressions.
+`TMPDIR="$PWD/tmp/dequant" make -C a64fx/dequant-pipe test CC=fcc` passes.
+
+The remaining target is FP32 >200 original GB/s. Selected eight-K unrolling
+uses 16 shifts + 16 sign XORs + 16 FMAs + 12 predicate transposes per 256
+original bytes; no PMU port diagnosis yet. Sequential sign packing was only
+140.94 GB/s; transposed signs reached 174.44 before schedule improvements.
+The no-expansion FP16 `--packing bias` comparator reaches 185.99 GB/s.
+A native-byte `2^-120` FP32 rescaling experiment was exact but only 7.17 GB/s
+because it creates subnormal weight operands; do not revive it based on a
+normal-only distribution. Full measurements and API contract are in
+`a64fx/dequant-pipe/RESULTS.md`, README.md and e4_pack.h. Keep original
+kernels, use repository-local scratch, preserve unrelated changes and do not
+push. The older W8 task status below is retained as baseline history.
+
+### Previous task: native W8A16 / W8A32 at 220--230 GB/s
 
 The user requested FP8 and signed INT8 weights with FP16/FP32 activations
 and matching FMA accumulation, explicitly including both E4M3FN and E5M2.

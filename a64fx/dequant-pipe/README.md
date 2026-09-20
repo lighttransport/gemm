@@ -91,6 +91,32 @@ weights (including subnormals) are the default; `--normal-weights` is a
 separately labeled diagnostic and does not satisfy the acceptance gate.
 The script exits 1 on the current FP8 performance failures.
 
+### E4M3FN with modest packing expansion
+
+`--packing p9` stores exact magnitude bytes plus a transposed sign plane:
+9 bits per weight and a 64-byte tile header. Total expansion is 12.70% for
+FP16 and 12.89% for FP32. Three-launch medians are **203.39--204.32 GB/s**
+for FP16 and **183.83--183.95 GB/s** for FP32, counting original FP8 bytes.
+Stored-byte rates are 229.21--230.26 and 207.53--207.67 GB/s, respectively.
+Only FP16 passes the revised >200 original-byte target.
+
+```sh
+TMPDIR="$PWD/tmp/dequant" make -C a64fx/dequant-pipe test CC=fcc
+bash a64fx/dequant-pipe/run_e4_p9_acceptance.sh
+```
+
+The combined script exits 1 while FP32 remains below target. The existing
+native-layout 220 GB/s acceptance script is unchanged. `--packing bias`
+provides an exactly-eight-bit E4M3/FP16 comparator at about 186 GB/s.
+
+P9 preserves sequential same-width FMA outputs. The FP32 fast path uses exact
+power-of-two rescaling with reusable activation preparation (about 548 ns
+per 128 values, excluded from kernel timing). Unsafe activations or weight
+NaNs use the native kernel after unpacking. See [e4_pack.h](e4_pack.h) for
+buffer/layout and FPCR requirements, and [RESULTS.md](RESULTS.md) for all
+launch medians, fallback tests, packing cost and rejected schedules.
+Scales, tails and model integration remain outside this probe.
+
 ## Benchmarking
 
 Before running the paired pipeline, verify the HBM read prerequisite in one

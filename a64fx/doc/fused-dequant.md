@@ -406,6 +406,32 @@ loads, integer-to-float conversion, tails, dispatch, and layer integration.
 The robust conclusion is that the K-major supertile and a good allocation can
 let expansion plus SDOT fit under the memory deadline.
 
+## E4M3FN: spending one extra bit on simpler decoding
+
+The E4M3FN follow-up makes the packing tradeoff explicit: each weight has an
+exact FP16 magnitude byte (`magnitude_bits >> 7`) and a separate sign bit.
+The sign plane is transposed within 64-column groups for SVE predicates.
+Including a 64-byte tile header, storage grows by 12.70% for FP16 and 12.89%
+for FP32. This replaces the original special-value correction tables in the
+hot FP16 loop with a shift and predicated sign operation.
+
+Three fresh launches reach **203.39--204.32 GB/s of original FP8 bytes** with
+FP16 FMA, corresponding to 229.21--230.26 GB/s of stored input. The FP32
+path reaches 183.83--183.95 original GB/s, or 207.53--207.67 stored GB/s;
+it still fails the >200 original-byte target. Paired reads are
+228.38--229.80 GB/s. Expansion cannot be counted as useful original-byte
+throughput when comparing to the native 143.2/92.2 GB/s kernels.
+
+FP32 decodes finite weights at an exact `2^-112` scale and reuses activations
+scaled by `2^112`, preserving each exact product and sequential FMA rounding.
+A preparation guard and native fallback cover activation overflow risk,
+nondefault FPCR and weight NaNs. Preparation takes about 548 ns per 128
+activations, reusable across output tiles and excluded from the kernel rate.
+All FP8 codes, guard boundaries and subnormal inputs pass output comparisons;
+NaN payloads and exception flags are outside this contract. These remain
+unscaled, fixed-shape M=1 probes. The [full result log](../dequant-pipe/RESULTS.md)
+and [packing contract](../dequant-pipe/e4_pack.h) describe the costs and limits.
+
 ## Placement and threading
 
 Partition work so every core owns disjoint output rows or tiles and reads a

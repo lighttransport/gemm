@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "w8.h"
+#include "e4_pack.h"
 #include "fused_opt.h"
 #include <errno.h>
 #include <math.h>
@@ -43,6 +44,9 @@ static float decode(unsigned q, int format)
 }
 int verify_w8(void)
 {
+    uint8_t p9[36928], unpacked[K * 256];
+    e4_p9_activation prepared;
+    uint8_t packed[K * 256];
     uint8_t w[K * 256] __attribute__((aligned(256)));
     _Float16 ah[K], yh[256], native[256];
     float af[K], yf[128];
@@ -75,6 +79,21 @@ int verify_w8(void)
         }
         if (pass < 256) memset(w, 0, (K - 1) * 256);
         half_kernels[f](w, ah, yh);
+        if (f == 1) {
+            for (size_t j = 0; j < sizeof(w); ++j) packed[j] = (uint8_t)(w[j] + 1);
+            w8_e4m3_bias_f16(packed, ah, native);
+            for (int n = 0; n < 256; ++n)
+                if (!(isnan((float)yh[n]) && isnan((float)native[n])) && memcmp(yh+n, native+n, 2))
+                    return fprintf(stderr, "E4M3 biased mismatch pass=%d n=%d\n", pass, n), 1;
+        }
+        if (f == 1) {
+            if (e4_pack_p9(p9, w, 16) || e4_unpack_p9(unpacked, p9, 16) || memcmp(w, unpacked, sizeof(w)))
+                return fprintf(stderr, "P9 half roundtrip failed\n"), 1;
+            w8_e4m3_p9_f16(p9, ah, native);
+            for (int n = 0; n < 256; ++n)
+                if (!(isnan((float)yh[n]) && isnan((float)native[n])) && memcmp(yh+n, native+n, 2))
+                    return fprintf(stderr, "P9 half mismatch pass=%d n=%d\n", pass, n), 1;
+        }
         if (f == 2) {
             w8_e5m2_f16_native(w, ah, native);
             for (int n = 0; n < 256; ++n)
@@ -92,6 +111,16 @@ int verify_w8(void)
             memset(w + (K - 1) * 128, pass, 128);
         }
         float_kernels[f](w, af, yf);
+        if (f == 1) {
+            float yp[128];
+            if (e4_pack_p9(p9, w, 32) || e4_unpack_p9(unpacked, p9, 32) || memcmp(w, unpacked, K*128))
+                return fprintf(stderr, "P9 float roundtrip failed\n"), 1;
+            e4_p9_prepare(&prepared, af);
+            w8_e4m3_p9_f32(p9, &prepared, yp);
+            for (int n = 0; n < 128; ++n)
+                if (!(isnan(yf[n]) && isnan(yp[n])) && memcmp(yf+n, yp+n, 4))
+                    return fprintf(stderr, "P9 float mismatch pass=%d n=%d got=%a ref=%a\n", pass, n, yp[n], yf[n]), 1;
+        }
         for (int n = 0; n < 128; ++n) {
             float ref = 0;
             for (int k = 0; k < K; ++k) ref = fmaf(decode(w[k*128+n], f), af[k], ref);
@@ -105,7 +134,7 @@ int verify_w8(void)
 typedef struct {
     uint8_t *weights;
     size_t bytes;
-    int cpu, format, bits, iterations, read_only, error;
+    int cpu, format, bits, iterations, read_only, error, packing;
     atomic_int *ready, *start;
     uint64_t begin, end, checksum;
 } worker;
@@ -113,21 +142,26 @@ static void *run(void *arg)
 {
     worker *w = arg;
     _Float16 ah[K], yh[256]; float af[K], yf[128];
+    e4_p9_activation prepared;
     for (int k = 0; k < K; ++k) af[k] = (float)(ah[k] = (_Float16)((k % 7 - 3) * 0.03125f));
+    if (w->packing == 2 && w->bits == 32) e4_p9_prepare(&prepared, af);
     w->error = pin(w->cpu);
     atomic_fetch_add_explicit(w->ready, 1, memory_order_release);
     while (!atomic_load_explicit(w->start, memory_order_acquire)) __asm__ volatile("yield");
     w->begin = ticks();
     if (!w->error) for (int it = 0; it < w->iterations; ++it) {
         if (w->read_only) { hbm_read_256_sve(w->weights, w->bytes); continue; }
-        size_t group = w->bits == 16 ? 32768 : 16384;
+        size_t group = w->packing == 2 ? e4_p9_bytes(w->bits) : w->bits == 16 ? 32768 : 16384;
         for (size_t off = 0; off < w->bytes; off += group) {
             uint32_t value = 0;
             if (w->bits == 16) {
-                half_kernels[w->format](w->weights+off, ah, yh);
+                if (w->packing == 2) w8_e4m3_p9_f16(w->weights+off, ah, yh);
+                else if (w->packing == 1) w8_e4m3_bias_f16(w->weights+off, ah, yh);
+                else half_kernels[w->format](w->weights+off, ah, yh);
                 memcpy(&value, yh + (off / group % 256), 2);
             } else {
-                float_kernels[w->format](w->weights+off, af, yf);
+                if (w->packing == 2) w8_e4m3_p9_f32(w->weights+off, &prepared, yf);
+                else float_kernels[w->format](w->weights+off, af, yf);
                 memcpy(&value, yf + (off / group % 128), 4);
             }
             w->checksum += value;
@@ -137,43 +171,67 @@ static void *run(void *arg)
 }
 int main(int argc, char **argv)
 {
-    int format = 0, bits = 16, cores = 12, core_base = 12, iterations = 10, trials = 5, verify = 0, normal_only = 0;
+    int format = 0, bits = 16, cores = 12, core_base = 12, iterations = 10, trials = 5, verify = 0, normal_only = 0, packing = 0;
     size_t mib = 240;
+    double target_gbps = 220;
     static const struct option opts[] = {
-        {"normal-weights",0,0,'n'}, {"format",1,0,'f'}, {"bits",1,0,'b'}, {"cores",1,0,'c'}, {"core-base",1,0,'p'},
+        {"target-gbps",1,0,'g'}, {"packing",1,0,'l'}, {"normal-weights",0,0,'n'}, {"format",1,0,'f'}, {"bits",1,0,'b'}, {"cores",1,0,'c'}, {"core-base",1,0,'p'},
         {"iterations",1,0,'i'}, {"trials",1,0,'t'}, {"mib",1,0,'m'}, {"verify",0,0,'v'}, {0,0,0,0}
     };
     int c;
-    while ((c = getopt_long(argc,argv,"f:b:c:p:i:t:m:vn",opts,NULL)) != -1) {
+    while ((c = getopt_long(argc,argv,"f:b:c:p:i:t:m:l:g:vn",opts,NULL)) != -1) {
         switch(c) {
         case 'f': for (format=0; format<3 && strcmp(optarg,formats[format]); ++format) {} break;
         case 'b': bits=atoi(optarg); break; case 'c': cores=atoi(optarg); break;
         case 'p': core_base=atoi(optarg); break; case 'i': iterations=atoi(optarg); break;
         case 't': trials=atoi(optarg); break; case 'm': mib=strtoull(optarg,NULL,0); break;
+        case 'g': target_gbps=strtod(optarg,NULL); break;
+        case 'l': if (!strcmp(optarg, "p9")) packing=2; else if (!strcmp(optarg, "bias")) packing=1; else if (!strcmp(optarg, "native")) packing=0; else return 2; break;
         case 'v': verify=1; break; case 'n': normal_only=1; break; default: return 2;
         }
     }
     if (format >= 3 || (bits != 16 && bits != 32) || cores < 1 || cores > MAX_CORES ||
         trials < 1 || trials > 32 || iterations < 1 || core_base < 0 || core_base + cores > CPU_SETSIZE ||
-        !mib || mib > 1024) {
-        fprintf(stderr,"usage: %s --format int8|e4m3|e5m2 --bits 16|32 [--verify] [--normal-weights] [--cores 1..12 --core-base 12 --mib 1..1024 --iterations 10 --trials 5]\n",argv[0]); return 2;
+        !mib || mib > 1024 || !isfinite(target_gbps) || target_gbps <= 0) {
+        fprintf(stderr,"usage: %s --format int8|e4m3|e5m2 --bits 16|32 [--packing native|bias|p9] [--target-gbps 220] [--verify] [--normal-weights] [--cores 1..12 --core-base 12 --mib 1..1024 --iterations 10 --trials 5]\n",argv[0]); return 2;
     }
+    if (packing && (format != 1 || (packing == 1 && bits != 16))) return 2;
     if (verify && verify_w8()) return 1;
-    size_t group = bits == 16 ? 32768 : 16384, per_core = mib*1024*1024/cores/group*group;
-    size_t bytes = per_core*cores;
+    size_t logical_group = bits == 16 ? 32768 : 16384;
+    size_t group = packing == 2 ? e4_p9_bytes(bits) : logical_group;
+    size_t groups_per_core = mib*1024*1024/cores/logical_group;
+    /* Four P9 records preserve the reader's 256-byte extent alignment. */
+    if (packing == 2) groups_per_core -= groups_per_core % 4;
+    size_t per_core = groups_per_core * group, bytes = per_core * cores;
+    size_t logical_bytes = groups_per_core * cores * logical_group;
     if (!bytes || pin(core_base)) return 1;
     uint8_t *w;
     if (posix_memalign((void **)&w, 2*1024*1024, bytes)) return 1;
     uint32_t rng = 113;
-    for (size_t j = 0; j < bytes; ++j) {
-        rng = rng*1664525u+1013904223u;
-        unsigned q = rng >> 24;
-        /* Time finite weights, including all subnormal codes. NaNs/infinities
-         * are exhaustively tested above rather than poisoning every output. */
-        if (format && ((format == 1 && (q&127)==127) || (format == 2 && (q&127)>=124))) q=56;
-        if (normal_only && format && (q & 127) < (format == 1 ? 8u : 4u)) q = (q & 128) | 56;
-        w[j]=(uint8_t)q;
+    uint8_t raw[32768];
+    uint64_t pack_begin = ticks();
+    for (size_t off = 0; off < bytes; off += group) {
+        for (size_t j = 0; j < logical_group; ++j) {
+            rng = rng*1664525u+1013904223u;
+            unsigned q = rng >> 24;
+            if (format && ((format == 1 && (q&127)==127) || (format == 2 && (q&127)>=124))) q=56;
+            if (normal_only && format && (q & 127) < (format == 1 ? 8u : 4u)) q = (q & 128) | 56;
+            raw[j] = (uint8_t)(q + (packing == 1));
+        }
+        if (packing == 2) e4_pack_p9(w+off, raw, bits);
+        else memcpy(w+off, raw, logical_group);
     }
+    printf("# generation_and_pack_ms=%.3f stored_bytes=%zu logical_fp8_bytes=%zu\n",
+           (double)(ticks()-pack_begin)*1000/frequency(), bytes, logical_bytes);
+    if (packing == 2 && bits == 32) {
+        float a[128]; e4_p9_activation prepared;
+        for (int k = 0; k < 128; ++k) a[k] = (k % 7 - 3) * 0.03125f;
+        uint64_t begin = ticks();
+        for (int r = 0; r < 10000; ++r) e4_p9_prepare(&prepared, a);
+        printf("# activation_prepare_ns=%.2f per_128_values safe=%u (amortized_across_output_tiles)\n",
+               (double)(ticks()-begin)*1e9/frequency()/10000, prepared.safe);
+    }
+    printf("# packing=%s\n", packing == 2 ? "p9" : packing ? "bias" : "native");
     printf("# weight_distribution=%s\n", normal_only ? "normal-only" : "all-finite");
     uint64_t fpcr;
     __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
@@ -188,7 +246,7 @@ int main(int argc, char **argv)
             atomic_int ready, start; atomic_init(&ready,0); atomic_init(&start,0);
             for (int j=0;j<cores;++j) {
                 ws[j]=(worker){.weights=w+j*per_core,.bytes=per_core,.cpu=core_base+j,.format=format,
-                    .bits=bits,.iterations=iterations,.read_only=phase!=1,.ready=&ready,.start=&start};
+                    .bits=bits,.packing=packing,.iterations=iterations,.read_only=phase!=1,.ready=&ready,.start=&start};
                 int rc=pthread_create(threads+j,NULL,run,ws+j);
                 if (rc) { fprintf(stderr,"pthread_create: %s\n",strerror(rc)); return 1; }
             }
@@ -202,15 +260,18 @@ int main(int argc, char **argv)
                 if (ws[j].end>last) last=ws[j].end;
                 sum+=ws[j].checksum;
             }
-            double bw=(double)bytes*iterations*frequency()/(last-first)/1e9;
+            double stored_bw=(double)bytes*iterations*frequency()/(last-first)/1e9;
+            double bw = phase == 1 ? stored_bw * logical_bytes / bytes : stored_bw;
             if (trial) values[trial-1]=bw;
-            printf("format=%s bits=%d phase=%d trial=%d GB/s=%.2f checksum=%lu\n",formats[format],bits,phase,trial,bw,(unsigned long)sum);
+            printf("format=%s bits=%d phase=%d trial=%d GB/s=%.2f stored_GB/s=%.2f checksum=%lu\n",formats[format],bits,phase,trial,bw,stored_bw,(unsigned long)sum);
         }
         for (int i=0;i<trials;++i) for(int j=i+1;j<trials;++j) if(values[j]<values[i]) { double t=values[i];values[i]=values[j];values[j]=t; }
         medians[phase]=(values[(trials-1)/2]+values[trials/2])/2;
-        printf("summary format=%s bits=%d path=%s GB/s_median=%.2f best=%.2f\n",formats[format],bits,phase==1?"fma":"read",medians[phase],values[trials-1]);
+        printf("summary format=%s bits=%d path=%s GB/s_median=%.2f best=%.2f stored_GB/s_median=%.2f basis=%s\n",formats[format],bits,phase==1?"fma":"read",medians[phase],values[trials-1],
+               medians[phase] * (phase == 1 ? (double)bytes/logical_bytes : 1),
+               phase == 1 ? "original-weight-bytes" : "stored-bytes");
     }
-    printf("paired_read_before=%.2f after=%.2f qualified=%s target=%s\n",medians[0],medians[2],
-           medians[0]>=220 && medians[2]>=220?"yes":"no",medians[1]>=220?"PASS":"FAIL");
+    printf("paired_read_before=%.2f after=%.2f qualified=%s target=%s threshold_GB/s=%.2f\n",medians[0],medians[2],
+           medians[0]>=220 && medians[2]>=220?"yes":"no",medians[1]>target_gbps?"PASS":"FAIL",target_gbps);
     free(w); return 0;
 }

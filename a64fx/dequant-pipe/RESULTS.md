@@ -4,6 +4,112 @@ Measured 2026-09-19 with Fujitsu `fcc` 4.12.2 on CPUs 12--23 of one 2.0 GHz
 A64FX CMG.  All end-to-end numbers below use `--sync atomic`; they are controls,
 not headline hardware-barrier results.
 
+## E4M3FN packing follow-up: 2026-09-20
+
+The new P9 layout meets the revised **>200 GB/s original-FP8-byte target for
+W8A16**. W8A32 nearly doubles the native rate but remains below that target.
+Both stored-byte and original-byte rates are shown; expansion is not credited
+as extra original FP8 throughput.
+
+| activation / accumulation | launch | original FP8 GB/s median | stored GB/s median | >200 original |
+|:--------------------------|-------:|-------------------------:|-------------------:|:--------------|
+| FP16 / FP16 | 1 | 203.39 | 229.21 | PASS |
+| FP16 / FP16 | 2 | 204.32 | 230.26 | PASS |
+| FP16 / FP16 | 3 | 204.26 | 230.19 | PASS |
+| FP32 / FP32 | 1 | 183.83 | 207.53 | FAIL |
+| FP32 / FP32 | 2 | 183.89 | 207.60 | FAIL |
+| FP32 / FP32 | 3 | 183.95 | 207.67 | FAIL |
+
+Every launch uses 240 MiB of original FP8 weights, 12 cores on CPUs 12--23,
+ten iterations and five timed trials after warmup. All six allocations use
+2 MiB pages on NUMA node 4; all CPUs report 2.0 GHz and FPCR is zero.
+Paired reads on the same stored arenas range from 228.38 to 229.80 GB/s.
+Raw logs and source/binary hashes: `tmp/dequant/e4-p9-acceptance.oaCn3W/`.
+The combined gate correctly reports `acceptance=FAIL qualified=6/6
+passed_targets=3/6`: only FP16 passes the original-byte target.
+
+```sh
+mkdir -p tmp/dequant
+TMPDIR="$PWD/tmp/dequant" make -C a64fx/dequant-pipe test CC=fcc
+bash a64fx/dequant-pipe/run_e4_p9_acceptance.sh
+```
+
+The script invokes `bench_w8 --format e4m3 --bits 16|32 --packing p9
+--target-gbps 200 --cores 12 --core-base 12 --mib 240 --iterations 10
+--trials 5`, with the same startup pinning and XOS settings as the original
+W8 gate. That original six-format 220 GB/s gate remains unchanged.
+These are unscaled M=1 microkernel rates, not model throughput.
+
+### P9 representation and exact arithmetic
+
+`e4_pack.[ch]` defines version 1 of a fixed K=128 tile: a 64-byte header,
+then N magnitude bytes and N/8 sign bytes for each K row. N=256 for FP16 and
+128 for FP32. Magnitudes are the exact FP16 magnitude bits shifted right by
+seven. Sign bits are transposed within each 64 columns to feed SVE predicates;
+the complete bit-index formula is in the public header. Zero and both NaN
+codes roundtrip, as do all other codes. A tile occupies 36,928 or 18,496
+bytes: **12.70% / 12.89% total expansion**, including its header, versus
+12.5% for payload alone. The measured arenas occupy 283,607,040 and
+284,098,560 bytes, respectively, for 251,658,240 original bytes.
+
+FP16 shifts the magnitude by seven, applies the sign predicate and performs
+the original ascending-K half FMA. The FP32 fast path shifts by twenty,
+which represents each finite weight as `w * 2^-112`; all nonzero weights
+remain normal FP32. Activations are prepared as `a * 2^112`, exactly, under
+FPCR=0 with finite `|a| <= 0x1.fffffep15`. This leaves each exact product and
+single FMA rounding unchanged, including tiny original activations. Keep
+FPCR unchanged between preparation and use. A weight NaN or unsafe activation
+selects unpacking plus the unchanged native FP32 kernel. FPSR exception flags
+and NaN payload identity are outside the output-value contract.
+
+Activation preparation costs about **548 ns per 128 values**, once for an
+activation vector reusable across output tiles. It is separately reported
+and excluded from kernel timing. Weight generation plus packing takes about
+3.2 seconds per 240 MiB in these runs; the benchmark labels that combined
+cost explicitly, rather than attributing RNG time to pure packing. Neither
+preparation is hidden inside the bandwidth numerator.
+
+The assembly requires complete trusted packer output (or a complete record
+successfully checked by the unpacker), fixed SVE512 shapes and full-sized
+buffers. It is not a general file loader. Correctness tests exhaust all 256
+codes, compare sequential native/scalar outputs bit-for-bit for finite
+results, and compare NaN classification. Additional tests reject malformed
+headers, unused magnitude codes and inconsistent NaN flags; verify both
+activation guard boundaries, minimum FP32 subnormals, huge inputs and
+special values; and exercise nondefault-FPCR fallback. All existing W4 and
+full-domain INT16 tests continue to pass.
+
+### Controlled alternatives and remaining limit
+
+Exploratory five-trial medians on qualified same-arena reads:
+
+| candidate | FP16 original GB/s | FP32 original GB/s |
+|:----------|-------------------:|-------------------:|
+| native byte format (previous accepted measurements) | 143.18--143.20 | 92.24--92.25 |
+| biased byte `(q+1) mod 256`, no expansion | 185.99 | unsupported |
+| P9 with sequential sign bits | 202.92 | 140.94 |
+| P9 transposed sign bits | 204.47 | 174.44 |
+| early sign loads | 203.05 | 177.74 |
+| interleaved sign/FMA, four-K unroll | 203.13 | 182.45 |
+| selected eight-K FP32 unroll, exploratory | 204.04 | 183.19 |
+
+The exact eight-bit bias comparator remains available as `--packing bias`
+for E4M3/FP16; it does not meet 200 GB/s. Moving sign reconstruction into
+predicates and transposing the sign plane is the main P9 improvement.
+The selected FP32 loop uses 16 shifts, 16 sign XORs, 16 FMAs and 12 predicate
+transposes per 256 original bytes. Eight-K unrolling reduces loop overhead;
+there are no reassociated partial sums. FP16 is near the measured memory
+ceiling after expansion. FP32 still has a substantial decode/scheduling cost:
+its stored rate is about 207.6 GB/s against paired reads near 229 GB/s.
+No PMU measurement isolates a single limiting execution port.
+
+An alternative native-byte interpretation with weights scaled by `2^-120`
+and activations scaled by `2^120` passed output checks but fell to **7.17
+GB/s** on all-finite weights: FP8 subnormal weights become FP32 subnormal
+operands. This experiment was discarded, not selected via a normal-only
+benchmark. Its scratch logs are `tmp/dequant/e4-scale120-32.log`; selected
+schedule snapshots and exploratory logs remain under `tmp/dequant/e4-*`.
+
 ## W8A16 / W8A32: 2026-09-20
 
 The signed INT8 paths meet the **220--230 GB/s** target with both FP16 and
