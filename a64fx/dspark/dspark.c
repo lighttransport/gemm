@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef _OPENMP
@@ -26,6 +27,12 @@ static int ds_error(char *buf, size_t size, int code, const char *fmt, ...) {
         va_end(ap);
     }
     return code;
+}
+
+static double ds_now_sec(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
 }
 
 static char *ds_path(const char *dir, const char *name) {
@@ -432,6 +439,10 @@ int dspark_state_propose(dspark_state*s,int32_t anchor,dspark_proposal*p,char*er
     if(anchor<0||anchor>=DS_VOCAB)return ds_error(error,error_size,DSPARK_ERANGE,"anchor token is outside vocabulary");
     if(s->cursor+DSPARK_BLOCK_SIZE>DS_MAX_POSITION)return ds_error(error,error_size,DSPARK_ERANGE,"proposal positions exceed model limit");
     const dspark_model*m=s->model;const size_t B=DSPARK_BLOCK_SIZE;
+    const int profile=getenv("DSPARK_PROFILE")!=NULL;
+    double pt=profile?ds_now_sec():0.0,embed_ms=0,norm_ms=0,qkv_ms=0,qk_ms=0;
+    double attn_ms=0,oproj_ms=0,ffn_proj_ms=0,ffn_act_ms=0,ffn_down_ms=0;
+    double lm_norm_ms=0,lm_head_ms=0,markov_ms=0;
     float *h=malloc(B*DS_HIDDEN*sizeof(float)),*xn=malloc(B*DS_HIDDEN*sizeof(float));
     float *q=malloc(B*DS_Q_DIM*sizeof(float)),*k=malloc(B*DS_KV_DIM*sizeof(float)),*v=malloc(B*DS_KV_DIM*sizeof(float));
     uint16_t *kb=malloc(B*DS_KV_DIM*sizeof(uint16_t)),*vb=malloc(B*DS_KV_DIM*sizeof(uint16_t));
@@ -443,26 +454,39 @@ int dspark_state_propose(dspark_state*s,int32_t anchor,dspark_proposal*p,char*er
         int id=r?m->mask_token_id:anchor;const uint16_t*e=m->embedding+(size_t)id*DS_HIDDEN;
         for(int i=0;i<DS_HIDDEN;i++)h[r*DS_HIDDEN+i]=ds_bf16_to_f32(e[i]);
     }
+    if(profile){double t=ds_now_sec();embed_ms=(t-pt)*1e3;pt=t;}
     for(int l=0;l<DS_LAYERS;l++){
         const ds_layer*z=&m->layers[l];ds_rmsnorm(z->input_norm,h,xn,B,DS_HIDDEN,DS_RMS_EPS,m->threads);
+        if(profile){double t=ds_now_sec();norm_ms+=(t-pt)*1e3;pt=t;}
         ds_gemm_bf16(m,z->q_proj.data,DS_Q_DIM,DS_HIDDEN,xn,B,q);ds_gemm_bf16(m,z->k_proj.data,DS_KV_DIM,DS_HIDDEN,xn,B,k);ds_gemm_bf16(m,z->v_proj.data,DS_KV_DIM,DS_HIDDEN,xn,B,v);
+        if(profile){double t=ds_now_sec();qkv_ms+=(t-pt)*1e3;pt=t;}
         ds_head_rmsnorm(z->q_norm,q,B,DS_HEADS,DS_HEAD_DIM,DS_RMS_EPS,m->threads);ds_head_rmsnorm(z->k_norm,k,B,DS_KV_HEADS,DS_HEAD_DIM,DS_RMS_EPS,m->threads);
         ds_apply_rope(m,q,B,DS_HEADS,s->cursor,m->threads);ds_apply_rope(m,k,B,DS_KV_HEADS,s->cursor,m->threads);
         #pragma omp parallel for num_threads(m->threads) schedule(static)
         for(size_t i=0;i<B*DS_KV_DIM;i++){kb[i]=ds_f32_to_bf16(k[i]);vb[i]=ds_f32_to_bf16(v[i]);}
+        if(profile){double t=ds_now_sec();qk_ms+=(t-pt)*1e3;pt=t;}
         if(ds_attention(s,l,q,kb,vb,att)){
             free(base);free(up);free(gate);free(tmp);free(att);free(vb);free(kb);free(v);free(k);free(q);free(xn);free(h);
             return ds_error(error,error_size,DSPARK_ENOMEM,"attention score allocation failed");
         }
+        if(profile){double t=ds_now_sec();attn_ms+=(t-pt)*1e3;pt=t;}
         ds_gemm_bf16(m,z->o_proj.data,DS_HIDDEN,DS_Q_DIM,att,B,tmp);
         for(size_t i=0;i<B*DS_HIDDEN;i++)h[i]+=tmp[i];
         ds_rmsnorm(z->post_norm,h,xn,B,DS_HIDDEN,DS_RMS_EPS,m->threads);
-        ds_gemm_bf16(m,z->gate_proj.data,DS_INTERMEDIATE,DS_HIDDEN,xn,B,gate);ds_gemm_bf16(m,z->up_proj.data,DS_INTERMEDIATE,DS_HIDDEN,xn,B,up);
+        if(profile){double t=ds_now_sec();oproj_ms+=(t-pt)*1e3;pt=t;}
+        ds_gemm_bf16_pair(m,z->gate_proj.data,z->up_proj.data,DS_INTERMEDIATE,
+                           DS_HIDDEN,xn,B,gate,up);
+        if(profile){double t=ds_now_sec();ffn_proj_ms+=(t-pt)*1e3;pt=t;}
         #pragma omp parallel for num_threads(m->threads) schedule(static)
         for(size_t i=0;i<B*DS_INTERMEDIATE;i++){float g=gate[i];gate[i]=(g/(1.0f+expf(-g)))*up[i];}
+        if(profile){double t=ds_now_sec();ffn_act_ms+=(t-pt)*1e3;pt=t;}
         ds_gemm_bf16(m,z->down_proj.data,DS_HIDDEN,DS_INTERMEDIATE,gate,B,tmp);for(size_t i=0;i<B*DS_HIDDEN;i++)h[i]+=tmp[i];
+        if(profile){double t=ds_now_sec();ffn_down_ms+=(t-pt)*1e3;pt=t;}
     }
-    ds_rmsnorm(m->norm,h,xn,B,DS_HIDDEN,DS_RMS_EPS,m->threads);ds_nvfp4_gemm(m,&m->lm_head,xn,B,base);
+    ds_rmsnorm(m->norm,h,xn,B,DS_HIDDEN,DS_RMS_EPS,m->threads);
+    if(profile){double t=ds_now_sec();lm_norm_ms=(t-pt)*1e3;pt=t;}
+    ds_nvfp4_gemm(m,&m->lm_head,xn,B,base);
+    if(profile){double t=ds_now_sec();lm_head_ms=(t-pt)*1e3;pt=t;}
     int prev=anchor;p->count=B;
     for(size_t r=0;r<B;r++){
         const uint16_t*latent_bf16=m->markov_w1.data+(size_t)prev*DS_MARKOV_RANK;
@@ -472,6 +496,14 @@ int dspark_state_propose(dspark_state*s,int32_t anchor,dspark_proposal*p,char*er
         for(int i=0;i<DS_HIDDEN;i++)c=fmaf(xn[r*DS_HIDDEN+i],ds_bf16_to_f32(m->confidence_weight[i]),c);
         for(int i=0;i<DS_MARKOV_RANK;i++)c=fmaf(latent[i],ds_bf16_to_f32(m->confidence_weight[DS_HIDDEN+i]),c);
         p->confidence[r]=ds_sigmoid(c);prev=id;
+    }
+    if(profile){
+        double t=ds_now_sec();markov_ms=(t-pt)*1e3;
+        fprintf(stderr,"DSPARK_PROFILE threads=%d context=%zu embed=%.3f norm=%.3f qkv=%.3f qknorm_rope=%.3f attention=%.3f oproj_norm=%.3f ffn_up_gate=%.3f ffn_act=%.3f ffn_down=%.3f lm_norm=%.3f lm_head=%.3f markov_conf=%.3f total=%.3f ms\n",
+                m->threads,s->cursor,embed_ms,norm_ms,qkv_ms,qk_ms,attn_ms,oproj_ms,
+                ffn_proj_ms,ffn_act_ms,ffn_down_ms,lm_norm_ms,lm_head_ms,markov_ms,
+                embed_ms+norm_ms+qkv_ms+qk_ms+attn_ms+oproj_ms+ffn_proj_ms+
+                ffn_act_ms+ffn_down_ms+lm_norm_ms+lm_head_ms+markov_ms);
     }
     free(base);free(up);free(gate);free(tmp);free(att);free(vb);free(kb);free(v);free(k);free(q);free(xn);free(h);return DSPARK_OK;
 }

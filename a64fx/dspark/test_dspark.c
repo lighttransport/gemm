@@ -17,8 +17,9 @@ static void test_formats(void){
 
 static void test_gemm(void){
     dspark_model m={0};m.backend=DSPARK_BACKEND_SCALAR;m.threads=2;
-    uint16_t w[3*5];float x[7*5],y[7*3],ref[7*3];
+    uint16_t w[3*5],w1[3*5];float x[7*5],y[7*3],y1[7*3],ref[7*3],ref1[7*3];
     for(int i=0;i<15;i++)w[i]=ds_f32_to_bf16((float)(i-7)/8.0f);
+    for(int i=0;i<15;i++)w1[i]=ds_f32_to_bf16((float)(11-i)/9.0f);
     for(int i=0;i<35;i++)x[i]=(float)(i%9-4)/7.0f;
     ds_gemm_bf16(&m,w,3,5,x,7,y);
     for(int b=0;b<7;b++)for(int r=0;r<3;r++){float z=0;for(int k=0;k<5;k++)z=fmaf(x[b*5+k],ds_bf16_to_f32(w[r*5+k]),z);ref[b*3+r]=z;}
@@ -28,6 +29,10 @@ static void test_gemm(void){
     m.backend=DSPARK_BACKEND_SVE;memset(y,0,sizeof(y));ds_gemm_bf16(&m,w,3,5,x,7,y);mx=0;
     for(int i=0;i<21;i++){float e=fabsf(y[i]-ref[i]);if(e>mx)mx=e;}
     check(mx<1e-5f,"BF16 GEMM scalar/SVE");
+    m.backend=DSPARK_BACKEND_SCALAR;ds_gemm_bf16_pair(&m,w,w1,3,5,x,7,ref,ref1);
+    m.backend=DSPARK_BACKEND_SVE;ds_gemm_bf16_pair(&m,w,w1,3,5,x,7,y,y1);mx=0;
+    for(int i=0;i<21;i++){float e=fmaxf(fabsf(y[i]-ref[i]),fabsf(y1[i]-ref1[i]));if(e>mx)mx=e;}
+    check(mx<1e-5f,"BF16 GEMM pair scalar/SVE");
 #endif
 }
 

@@ -98,6 +98,18 @@ OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
   ./a64fx/dspark/bench_dspark "$DRAFT" "$TARGET"
 ```
 
+Set `DSPARK_PROFILE=1` on a validator or benchmark run to print opt-in phase
+timings for each proposal. This is a diagnostic flag only; it does not select
+a production implementation:
+
+```sh
+DSPARK_PROFILE=1 OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./a64fx/dspark/validate_dspark --full "$DRAFT" "$TARGET"
+```
+
+The output separates embedding, normalization, QKV, attention, output
+projection, FFN, NVFP4 LM-head, and sequential Markov/confidence costs.
+
 The dominant SVE kernels are width-1-through-8 BF16 GEMM, GQA attention, and
 a width-seven NVFP4 output-panel kernel. The width-seven paths stream each
 weight matrix once rather than decomposing the proposal into 4+2+1 passes.

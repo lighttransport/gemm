@@ -206,22 +206,37 @@ The drafter therefore fits safely on one A64FX node. Do not introduce tensor
 or data parallelism for the standalone validator; reserve the other allocated
 nodes for independent experiments or later target-model integration.
 
+`DSPARK_PROFILE=1` enables proposal phase timing. Four fresh-load profiles on
+the same job produced three stable totals of 65.6--67.8 ms and one 98.2 ms
+scheduling outlier. In the stable runs, FFN up/gate plus down projections cost
+27.4--28.1 ms, the NVFP4 LM head cost 16.1--16.8 ms, and sequential
+Markov/confidence correction cost 9.3--10.5 ms. Those phases account for about
+80% of proposal time. Two-token attention normally cost less than 1 ms; one
+32 ms attention sample was the source of the scheduling outlier. Use multiple
+profiles and medians when evaluating changes.
+
+The first profile-guided change combines each FFN gate/up projection pair in
+one OpenMP workshare, with the two matrices processed concurrently while
+retaining the same per-row SVE accumulation order. Four fresh-load runs gave
+stable totals of 64.3--66.6 ms and gate/up times of 17.4--17.9 ms, versus
+65.6--67.8 ms total and 18.8--19.1 ms for gate/up before the change. Real
+checkpoint proposals remained exactly unchanged. A dedicated paired-GEMM
+scalar/SVE test covers both outputs.
+
 Continue in this order:
 
 1. Generate the independent golden fixture and run the golden validator; the
    native full validator and scalar/SVE cross-check already pass.
 2. Reproduce the 1/12/48-thread real-weight baseline at least three times and
    characterize the observed 48-thread run-to-run variation.
-3. Add phase-level timing around embedding, draft blocks, attention, Markov
-   correction, confidence head, and NVFP4 LM head; keep it opt-in so normal
-   runs have no timing overhead.
-4. Optimize only the measured dominant phase. Likely candidates are the
-   width-seven BF16 GEMMs, GQA attention/dot reductions, and the NVFP4 output
-   panel. Preserve FP32 accumulation and the existing numerical thresholds.
-5. Re-run unit, long-K, full-checkpoint, golden, and scalar/SVE benchmark
+3. Optimize only the measured dominant phase. Start with the width-seven FFN
+   BF16 GEMMs, then the NVFP4 output panel and Markov correction. Preserve
+   FP32 accumulation and the existing numerical thresholds. Re-profile at a
+   representative long context before changing attention.
+4. Re-run unit, long-K, full-checkpoint, golden, and scalar/SVE benchmark
    gates after every kernel change. Revert changes that move cost elsewhere or
    improve only a synthetic microbenchmark.
-6. Integrate the drafter with target verification only after standalone
+5. Integrate the drafter with target verification only after standalone
    correctness and performance are stable. The target remains authoritative:
    append only accepted target features, and use truncate/reset transactionally
    after rejected speculative rows.

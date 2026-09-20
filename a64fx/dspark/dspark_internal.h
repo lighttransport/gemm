@@ -81,6 +81,9 @@ float ds_decode_e4m3(uint8_t x);
 void ds_gemm_bf16(const dspark_model *model, const uint16_t *w,
                   size_t rows, size_t cols, const float *x, size_t m,
                   float *y);
+void ds_gemm_bf16_pair(const dspark_model *model, const uint16_t *w0,
+                       const uint16_t *w1, size_t rows, size_t cols,
+                       const float *x, size_t m, float *y0, float *y1);
 void ds_rmsnorm(const uint16_t *weight, const float *x, float *y,
                 size_t rows, size_t cols, float eps, int threads);
 void ds_head_rmsnorm(const uint16_t *weight, float *x, size_t rows,

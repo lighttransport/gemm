@@ -64,10 +64,15 @@ static inline svfloat32_t ds_load_bf16_lo(svbool_t pg, const uint16_t *p) {
     return svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, p), 16));
 }
 
-static void ds_gemm_bf16_sve(const uint16_t *w, size_t rows, size_t cols,
-                             const float *x, size_t m, float *y, int threads) {
+static void ds_gemm_bf16_sve(const uint16_t *w0, const uint16_t *w1,
+                             size_t rows, size_t cols, const float *x,
+                             size_t m, float *y0, float *y1, int threads) {
+    size_t jobs = w1 ? 2 * rows : rows;
     #pragma omp parallel for num_threads(threads) schedule(static)
-    for (size_t r = 0; r < rows; ++r) {
+    for (size_t job = 0; job < jobs; ++job) {
+        size_t r = job < rows ? job : job - rows;
+        const uint16_t *w = job < rows ? w0 : w1;
+        float *y = job < rows ? y0 : y1;
         const uint16_t *wr = w + r * cols;
         svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
         svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
@@ -111,7 +116,7 @@ void ds_gemm_bf16(const dspark_model *model, const uint16_t *w,
     if (!model || !w || !x || !y || !m || m > 8) return;
 #if defined(__ARM_FEATURE_SVE)
     if (model->backend == DSPARK_BACKEND_SVE) {
-        ds_gemm_bf16_sve(w, rows, cols, x, m, y, model->threads);
+        ds_gemm_bf16_sve(w, NULL, rows, cols, x, m, y, NULL, model->threads);
         return;
     }
 #endif
@@ -126,6 +131,21 @@ void ds_gemm_bf16(const dspark_model *model, const uint16_t *w,
             y[j * rows + r] = sum;
         }
     }
+}
+
+void ds_gemm_bf16_pair(const dspark_model *model, const uint16_t *w0,
+                       const uint16_t *w1, size_t rows, size_t cols,
+                       const float *x, size_t m, float *y0, float *y1) {
+    if (!model || !w0 || !w1 || !x || !y0 || !y1 || !m || m > 8) return;
+#if defined(__ARM_FEATURE_SVE)
+    if (model->backend == DSPARK_BACKEND_SVE) {
+        ds_gemm_bf16_sve(w0, w1, rows, cols, x, m, y0, y1,
+                         model->threads);
+        return;
+    }
+#endif
+    ds_gemm_bf16(model, w0, rows, cols, x, m, y0);
+    ds_gemm_bf16(model, w1, rows, cols, x, m, y1);
 }
 
 void ds_rmsnorm(const uint16_t *weight, const float *x, float *y,
