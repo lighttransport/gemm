@@ -57,13 +57,17 @@ mkdir -p tmp/pixal3d
 ref/pixal3d/setup_native.sh
 make -C cpu/pixal3d -j4
 make -C cuda/pixal3d                 # CUDA 13.2, sm_120 by default
+make -C cuda/pixal3d GPU_ARCH=sm_89  # Ada; sm_80 and sm_120 are also supported
+make -C cuda/pixal3d check-architectures # compile-check all supported CUDA ISAs
 make -C rdna4/pixal3d               # hipcc, gfx1201 by default
 make -C cpu/pixal3d test            # C API / analytic math; no weights or GPU needed
 ```
 
 For system OpenCV development packages, use `make -C cpu/pixal3d OPENCV_ROOT=/usr`.
-CUDA toolkit location is selected with `CUDA_PATH`; ROCm with `HIPCC`, `ROCM_LIB`
-and `GPU_ARCH`. The tested AMD installation uses `/opt/rocm/core/lib`. Plugins
+CUDA toolkit location is selected with `CUDA_PATH` and its target with
+`GPU_ARCH=sm_80|sm_89|sm_120`. The explicit BF16/FP16 MMA path requires
+Ampere (sm_80) or newer. ROCm uses `HIPCC`, `ROCM_LIB`, and its own
+`GPU_ARCH`. The tested AMD installation uses `/opt/rocm/core/lib`. Plugins
 are loaded relative to `cpu/pixal3d/libpixal3d.so`, preserving the repository's
 `cpu/`, `cuda/` and `rdna4/` directory layout when installing elsewhere.
 
