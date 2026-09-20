@@ -80,7 +80,7 @@ int main() {
                 }
             }
             if(splits>(padded+127)/128) continue;
-            auto run=[&](bool reference) {
+            auto run=[&](bool reference, bool gqa3=false) {
                 if(reference) {
                     if(queries==1) flash_attn_ext_vec<256,1,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false><<<dim3(1,splits,heads),dim3(32,4)>>>(
                         (char *)dq,(char *)drk,(char *)drv,(char *)dm,nullptr,nullptr,splits==1?ref:rp,rm,
@@ -95,11 +95,16 @@ int main() {
                     if(splits>1) flash_attn_combine_results<256><<<dim3(queries,heads),256,splits*8>>>(rp,rm,ref,splits);
                 } else {
                     int force=queries==1?requested:splits;
-                    dim3 grid = queries==1 ? dim3(heads*(force?splits:128),1,1) :
+                    dim3 grid = queries==1 ?
+                        dim3((gqa3?2*kv_heads:heads)*(force?splits:128),1,1) :
                                              dim3(queries,force?splits:128,heads);
-                    qwen35_attention_q8_decode<<<grid,dim3(32,4)>>>(
-                        ours,op,om,dq,dk,dv,dks,dvs,dp,heads,kv_heads,props.multiProcessorCount,occupancy,force,
-                        queries,queries==1?-1:length-queries);
+                    if(gqa3) qwen35_attention_q8_decode_gqa3<<<grid,dim3(32,12)>>>(
+                            ours,op,om,dq,dk,dv,dks,dvs,dp,heads,kv_heads,
+                            props.multiProcessorCount,occupancy,force,queries,-1);
+                    else qwen35_attention_q8_decode<<<grid,dim3(32,4)>>>(
+                            ours,op,om,dq,dk,dv,dks,dvs,dp,heads,kv_heads,
+                            props.multiProcessorCount,occupancy,force,
+                            queries,queries==1?-1:length-queries);
                     qwen35_attention_q8_combine<<<dim3(heads,queries),256,32*8>>>(ours,op,om,dp,heads,props.multiProcessorCount,occupancy,force);
                 }
             };
@@ -117,6 +122,21 @@ int main() {
                 ++checked;
             }
             if(wrong) { fprintf(stderr,"mismatches=%zu/%d max=%.9g\n",wrong,output_size,worst);return 1; }
+            if(queries==1) {
+                run(false,true);CHECK(hipDeviceSynchronize());
+                CHECK(hipMemcpy(a.data(),ours,output_size*4,hipMemcpyDeviceToHost));
+                wrong=0;worst=0;
+                for(int i=0;i<output_size;++i) {
+                    if(memcmp(&a[i],&b[i],4) || !std::isfinite(a[i])) {
+                        if(wrong++<3) fprintf(stderr,
+                            "gqa3 length=%d splits=%d i=%d ours=%.9g ref=%.9g\n",
+                            length,splits,i,a[i],b[i]);
+                        worst=fmaxf(worst,fabsf(a[i]-b[i]));
+                    }
+                    ++checked;
+                }
+                if(wrong) { fprintf(stderr,"gqa3 mismatches=%zu/%d max=%.9g\n",wrong,output_size,worst);return 1; }
+            }
             if(queries==512 && length==4097 && pattern==0 && requested==0) {
                 qwen35_attention_q8_prefill_wmma<<<dim3(heads,(queries+127)/128),512>>>(
                     ours,dq,dk,dv,dks,dvs,heads,kv_heads,queries,length-queries);
@@ -141,13 +161,16 @@ int main() {
                 }
             }
             if(length==65536) {
-                hipEvent_t start,stop;CHECK(hipEventCreate(&start));CHECK(hipEventCreate(&stop));
-                CHECK(hipEventRecord(start));
-                for(int i=0;i<20;++i) run(false);
-                CHECK(hipEventRecord(stop));CHECK(hipEventSynchronize(stop));
-                float elapsed=0;CHECK(hipEventElapsedTime(&elapsed,start,stop));
-                printf("ours attention length=65536 splits=%d %.3f us\n",splits,elapsed*50);
-                CHECK(hipEventDestroy(start));CHECK(hipEventDestroy(stop));
+                for(bool gqa3 : {false,true}) {
+                    hipEvent_t start,stop;CHECK(hipEventCreate(&start));CHECK(hipEventCreate(&stop));
+                    CHECK(hipEventRecord(start));
+                    for(int i=0;i<20;++i) run(false,gqa3);
+                    CHECK(hipEventRecord(stop));CHECK(hipEventSynchronize(stop));
+                    float elapsed=0;CHECK(hipEventElapsedTime(&elapsed,start,stop));
+                    printf("%s attention length=65536 splits=%d %.3f us\n",
+                           gqa3?"gqa3":"ours",splits,elapsed*50);
+                    CHECK(hipEventDestroy(start));CHECK(hipEventDestroy(stop));
+                }
             }
             if(pattern==0 && ((queries==1 && length==4096 && requested==16) || (queries==512 && length==4097 && requested==0))) {
                 for(bool reference : {true,false}) {

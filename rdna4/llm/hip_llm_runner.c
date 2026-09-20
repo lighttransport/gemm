@@ -13705,7 +13705,8 @@ struct hip_llm_runner {
     int requested_qwen35_native_q8_attention;
     hipModule_t q8_attention_module;
     hipModule_t q8_prefill_module;
-    hipFunction_t fn_q8_attention_decode, fn_q8_attention_combine;
+    hipFunction_t fn_q8_attention_decode, fn_q8_attention_decode_gqa3;
+    hipFunction_t fn_q8_attention_combine;
     hipFunction_t fn_q8_attention_prefill_wmma;
     void *d_q8_attention_parts, *d_q8_attention_meta;
     int q8_attention_max_splits, q8_attention_nsm;
@@ -17682,6 +17683,8 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 "qwen35_attention_q8", 1) <= 0) return -1;
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode,
                   r->q8_attention_module, "qwen35_attention_q8_decode"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_gqa3,
+                  r->q8_attention_module, "qwen35_attention_q8_decode_gqa3"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine,
                   r->q8_attention_module, "qwen35_attention_q8_combine"));
         if (hip_compile_kernels_ex(&r->q8_prefill_module, r->device,
@@ -19955,8 +19958,13 @@ static inline void launch_matvec_q2_K(hip_llm_runner *r, void *dst, void *mat,
         void *args[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale,
                          &n_rows, &n_cols };
         if (n_cols == 5120 && n_rows >= 5120) {
-            LAUNCH(r->fn_qwen35_matvec_q2k_rows, (n_rows + 7) / 8, 1, 1,
-                   256, 1, 1, 0, r->stream, args);
+            /* Tall FFN gate/up projections are faster with four rows per
+             * block; shorter output/QKV shapes retain eight for occupancy. */
+            int threads = n_rows >= 16000 ? 128 : 256;
+            int rows_per_block = threads / 32;
+            LAUNCH(r->fn_qwen35_matvec_q2k_rows,
+                   (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+                   threads, 1, 1, 0, r->stream, args);
         } else {
             LAUNCH(r->fn_qwen35_matvec_q2k, n_rows, 1, 1,
                    256, 1, 1, 0, r->stream, args);
@@ -22403,8 +22411,15 @@ static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
     void *a[] = { &out, &r->d_q8_attention_parts, &r->d_q8_attention_meta,
         &q, &k, &v, &ks, &vs, &r->d_position, &r->n_heads, &r->n_kv_heads,
         &r->q8_attention_nsm, &occupancy, &forced_splits, &queries, &position_start };
-    LAUNCH(r->fn_q8_attention_decode, r->n_heads * r->q8_attention_max_splits, 1, 1,
-           32, 4, 1, 0, r->stream, a);
+    if (r->n_heads == 6 * r->n_kv_heads && r->fn_q8_attention_decode_gqa3) {
+        LAUNCH(r->fn_q8_attention_decode_gqa3,
+               2 * r->n_kv_heads * r->q8_attention_max_splits, 1, 1,
+               32, 12, 1, 0, r->stream, a);
+    } else {
+        LAUNCH(r->fn_q8_attention_decode,
+               r->n_heads * r->q8_attention_max_splits, 1, 1,
+               32, 4, 1, 0, r->stream, a);
+    }
     void *b[] = { &out, &r->d_q8_attention_parts, &r->d_q8_attention_meta,
         &r->d_position, &r->n_heads, &r->q8_attention_nsm, &occupancy, &forced_splits };
     LAUNCH(r->fn_q8_attention_combine, r->n_heads, 1, 1, 256, 1, 1,
