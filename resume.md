@@ -82,8 +82,11 @@ It drafted 259 tokens, accepted 217, and spent 474.117/4585.996/56.181 ms in
 draft/verify/commit.  This meets the random-depth 40 tok/s goal.  Ordinary
 scalar decode now stages the IQ2_XXS, IQ2_XS and IQ3_XXS codebooks in LDS. A
 512-token zero-depth run sustains 41.90--42.03 tok/s with unchanged hash
-`c08c332d32a63532`; after the real 64K prefix it sustains 33.31 tok/s with the
-retained `051e7338c23a544e` hash. The 40 tok/s long-context target remains
+`c08c332d32a63532`. The exact three-head attention kernel now computes each
+K/Q scale product once per four packed dots while preserving the dot and
+accumulation sequence. After the real 64K prefix, a 256-token suffix sustains
+34.08 tok/s with retained hash `f4b35758fb99e6db`; the prefix sustains 445.67
+tok/s with hash `90178de69a24a76e`. The 40 tok/s long-context target remains
 open.
 
 Prioritize ordinary one-row target projection traffic first, followed by the
@@ -160,7 +163,8 @@ takes 3.077 ms per layer at 64K, compared with 8.654 ms for the generic
 verifier at the same eight-split schedule.  DFlash therefore meets the 40
 tok/s random-depth target. Ordinary decode remains below 40 tok/s. Its exact
 three-head K/V-reuse kernel cuts the 128-split attention operator from about
-606 to 363 microseconds per layer, leaving about 5.8 ms/token in attention and
+606 to about 348 microseconds per layer after the grouped scale-product
+change, leaving about 5.6 ms/token in attention and
 25 ms/token in the projection/state path. Dense NextN still needs a real
 random-depth rerun.
 Full results and commands:

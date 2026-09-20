@@ -669,15 +669,21 @@ void qwen35_attention_q8_decode_gqa3_reuse(float *out, float *parts,
                 const float *key_scale = ks +
                     (size_t)row * scale_stride + kh * 8;
                 #pragma unroll
-                for (int i = 0; i < 32; ++i) {
-                    int word = 2 * i + lane % 2;
-                    int key_word = key[word];
+                for (int g = 0; g < 8; ++g) {
+                    float scale[3];
                     #pragma unroll
-                    for (int h = 0; h < 3; ++h) {
-                        int product = __builtin_amdgcn_sudot4(
-                            true, key_word, true, qi[h][word], 0, false);
-                        float scale = key_scale[i / 4] * qd[h][i / 4];
-                        dot[h] += scale * (float)product;
+                    for (int h = 0; h < 3; ++h)
+                        scale[h] = key_scale[g] * qd[h][g];
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        int word = 8 * g + 2 * j + lane % 2;
+                        int key_word = key[word];
+                        #pragma unroll
+                        for (int h = 0; h < 3; ++h) {
+                            int product = __builtin_amdgcn_sudot4(
+                                true, key_word, true, qi[h][word], 0, false);
+                            dot[h] += scale[h] * (float)product;
+                        }
                     }
                 }
             }

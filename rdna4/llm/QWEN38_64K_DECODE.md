@@ -45,6 +45,7 @@ RX 9070 XT / gfx1201 / ROCm 10, Q8 K and Q8 V, greedy sampling:
 | IQ2_XS ordinary, original exact gate | 3 x 512 tokens | 26.92 / 26.91 / 26.90 | 142.36 | 4284 MiB | `b01a17fae16f806d` |
 | IQ2_XS ordinary, exact three-head K/V reuse | 512 tokens | 32.56 | 444.31 | 4282 MiB | `051e7338c23a544e` |
 | IQ2_XS ordinary, staged IQ codebooks | 512 tokens | 33.31 | 443.44 | 4282 MiB | `051e7338c23a544e` |
+| IQ2_XS ordinary, hoisted GQA scales | 256 tokens | 34.08 | 445.67 | 4282 MiB | `f4b35758fb99e6db` |
 | IQ2_XS + DFlash2 K=7, optimized | 256 tokens | 47.72 | 445.71 | 1274 MiB | `2ddd068dca63669a` |
 | IQ2_XS + DFlash2 K=7, packed Q4_K/Q8_1 draft | 256 tokens | 49.74 | 443.57 | 1274 MiB | `2ddd068dca63669a` |
 
@@ -66,10 +67,13 @@ Four waves load each K/V row once and update three independent query heads;
 each head retains llama.cpp's dot, online-softmax, packed-F16 accumulation and
 split-combine order. The decode graph records both the short and long kernels,
 which gate themselves from the device position so graph capture at position
-zero cannot freeze the short path. At 64K and 128 splits, the complete
-attention operator fell from about 606 to 363 microseconds per layer. The
-runner also avoids allocating F16 Q/K/V packing buffers when native Q8/Q8
-decode and prefill are both selected, recovering about 266 MiB.
+zero cannot freeze the short path. The kernel now also computes each K/Q scale
+product once per four adjacent packed dots rather than repeating it for every
+dot. The dot and accumulation sequence is unchanged. At 64K and 128 splits,
+the complete attention operator fell from about 361 to 348 microseconds per
+layer after this scale hoist (and from about 606 microseconds before GQA
+reuse). The runner also avoids allocating F16 Q/K/V packing buffers when
+native Q8/Q8 decode and prefill are both selected, recovering about 266 MiB.
 
 The exact DFlash verifier now evaluates up to eight adjacent causal queries in
 one four-wave block.  Each old K/V row is loaded once, while each query retains
@@ -80,9 +84,9 @@ generic verifier at the same split count.  The DFlash path therefore clears
 the 40 tok/s sustained target without approximating authoritative target
 output.
 
-Ordinary one-token decode now reaches 33.31 tok/s in the latest retained run,
+Ordinary one-token decode now reaches 34.08 tok/s in the latest retained run,
 so its 40 tok/s target remains open. The 16 attention layers now cost about
-5.8 ms/token at 64K; the remaining projection, SSM, normalization and output
+5.6 ms/token at 64K; the remaining projection, SSM, normalization and output
 path is about 25 ms/token. Reducing projection weight traffic and recurrent
 state work is now more useful than further attention-only work.
 
