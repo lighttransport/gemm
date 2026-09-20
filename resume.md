@@ -89,6 +89,14 @@ accumulation sequence. After the real 64K prefix, a 256-token suffix sustains
 tok/s with hash `90178de69a24a76e`. The 40 tok/s long-context target remains
 open.
 
+The exact three-head attention kernel now also reuses each head's packed
+probability across both 128-dimension value tiles. This removes half of those
+LDS reads while retaining every packed-F16 FMA. The 49,188,864-comparison
+differential remains bitwise clean; the 64K/128-split operator measures
+321.8--323.6 microseconds per layer. A fresh full random-depth run sustains
+443.63 tok/s for the 65,536-token prefix and 34.21 tok/s for the 256-token
+suffix, with the same `90178de69a24a76e` and `f4b35758fb99e6db` hashes.
+
 The two exact F16 projections that form each recurrent layer's alpha and beta
 vectors now share one flattened launch.  Every row retains the
 `matvec_f16_llama_f32` FMA and XOR-reduction order.  A 65-row kernel trace

@@ -715,6 +715,11 @@ void qwen35_attention_q8_decode_gqa3_reuse(float *out, float *parts,
         #pragma unroll
         for (int col = 0; col < 32; ++col) {
             int row = base + warp * 32 + col;
+            q8_half2 probability[3];
+            #pragma unroll
+            for (int h = 0; h < 3; ++h)
+                probability[h] = q8_hsplat(
+                    probabilities[h][warp * 32 + col]);
             #pragma unroll
             for (int tile = 0; tile < 2; ++tile) {
                 int dim = tile * 128 + lane * 4;
@@ -732,12 +737,10 @@ void qwen35_attention_q8_decode_gqa3_reuse(float *out, float *parts,
                 }
                 #pragma unroll
                 for (int h = 0; h < 3; ++h) {
-                    q8_half2 p = q8_hsplat(
-                        probabilities[h][warp * 32 + col]);
                     acc[h][2 * tile] = q8_hfma(
-                        v0, p, acc[h][2 * tile]);
+                        v0, probability[h], acc[h][2 * tile]);
                     acc[h][2 * tile + 1] = q8_hfma(
-                        v1, p, acc[h][2 * tile + 1]);
+                        v1, probability[h], acc[h][2 * tile + 1]);
                 }
             }
         }

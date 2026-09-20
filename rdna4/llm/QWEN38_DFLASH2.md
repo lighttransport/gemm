@@ -191,8 +191,8 @@ row.  Zero-depth decode measures 42.83--43.04 tok/s and keeps the pinned
 The short-context K=7 response emits 46 tokens in 566.72 ms, clearing the
 60 tok/s target with about 35 percent throughput headroom. DFlash also clears
 40 tok/s after a real random-token 64K prefix. Ordinary one-token decode now
-reaches 34.08 tok/s at 64K after exact GQA reuse, grouped K/Q scale products
-and scalar IQ codebook staging, so work that helps
+reaches 34.21 tok/s at 64K after exact GQA reuse, grouped K/Q scale products,
+packed-probability reuse and scalar IQ codebook staging, so work that helps
 both ordinary and verifier execution remains useful. The following order
 reflects the remaining measured costs.
 
@@ -200,7 +200,10 @@ reflects the remaining measured costs.
    IQ3_XXS now stage their small codebooks in LDS, lifting zero-depth decode
    from about 40.7 to 41.9--42.0 tok/s and 64K decode from 32.56 to 33.31
    tok/s. Hoisting repeated K/Q scale products in the exact three-head
-   attention kernel raises the latest 256-token 64K run to 34.08 tok/s, so the
+   attention kernel raised the 256-token 64K run to 34.08 tok/s. Reusing each
+   packed probability across both value tiles lowers the exact 128-split
+   operator to 321.8--323.6 microseconds per layer and raises the full run to
+   34.21 tok/s with unchanged prefix and suffix hashes, so the
    remaining gap is dominated by work outside attention. Fixed-eight Q2_K/IQ
    projections already share decoded weights, but
    ordinary decode still streams weights for one row at a time. Reuse the
