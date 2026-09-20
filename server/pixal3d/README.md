@@ -89,6 +89,9 @@ synchronous `POST /v1/infer` response keeps its original base64 fields for
 API compatibility.
 Job status includes a monotonic `progress` percentage and a `phase` derived
 from native conditioning, diffusion, mesh, and texture milestones.
+Read `GET /v1/jobs/ID/log` for the retained diagnostic tail. The default
+`--job-log-bytes 65536` cap is enforced while the child runs, so noisy native
+diagnostics cannot grow without bound.
 The bounded worker queue defaults to four active requests and four retained
 terminal results; change it with `--retained-jobs`. Each state transition is
 written to an atomic `results/ID/job.json` manifest. On startup, completed
@@ -100,9 +103,10 @@ Terminal jobs expire after 24 hours by default. Deleting a completed, failed,
 or cancelled job releases it immediately; deleting queued or running work
 continues to request cancellation. Configure expiry with `--job-ttl` in seconds.
 Errors include a stable `error_code` such as `invalid_request`, `queue_full`,
-`timeout`, `not_found`, `server_restarted`, or `internal_error`. Queue
-saturation returns HTTP 429, and `/health` publishes request, image, output,
-and view-count limits.
+`device_busy`, `storage_full`, `server_shutdown`, `timeout`, `not_found`,
+`server_restarted`, or `internal_error`. Queue saturation returns HTTP 429
+and low storage admission returns HTTP 507. `/health` publishes request,
+image, output, view-count, admission, storage, logging, and device-lock status.
 
 The browser sends each image as raw bytes to `POST /v1/uploads`, then places
 the returned `upload_id` in `image_upload`, `mask_upload`, or each view's
@@ -190,8 +194,11 @@ upstream timeouts, disable proxy response buffering for job polling, and add
 TLS and authentication at the proxy. Do not expose an unauthenticated
 `--bind 0.0.0.0` endpoint.
 
-Run one server process per physical GPU. The process serializes requests for
-each backend, but separate server processes do not share locks or VRAM budgets.
+CUDA inference is serialized across processes with Linux `flock` files under
+`tmp/pixal3d/device-locks` by default. Select a shared local directory with
+`--device-lock-dir` when services use different work trees. The lock is keyed
+by CUDA device index; waiting is cancellable and counts against the existing
+inference/reference timeout. A timeout is reported as `device_busy`.
 Keep `tmp/pixal3d/web-runs` on a local filesystem with room for uploads and
 generated assets. Queued output artifacts are retained under its `results`
 directory until job expiry or deletion. Size `--retained-jobs` and filesystem
@@ -200,6 +207,12 @@ Keep that directory on one local filesystem: manifests are flushed to a
 temporary file beside the final path and installed with an atomic rename.
 Recovery applies the configured TTL and retained-job limit before serving
 requests.
+
+New jobs are rejected before consuming uploads when free space is below
+`--min-free-disk-mib` (default 1024). On SIGINT or SIGTERM the server stops
+admission, marks queued jobs `server_shutdown`, cancels the active child,
+persists terminal state, and waits up to `--shutdown-timeout` seconds
+(default 30) before closing the HTTP listener.
 
 Use a service manager to restart the process and set a file-descriptor limit
 appropriate for concurrent uploads. Check `GET /health` after startup and

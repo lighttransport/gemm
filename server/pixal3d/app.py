@@ -11,6 +11,8 @@ import argparse
 import base64
 import binascii
 import copy
+from contextlib import contextmanager
+import fcntl
 import json
 import math
 import os
@@ -18,6 +20,7 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import tempfile
@@ -44,6 +47,18 @@ class JobCancelled(Exception):
 
 
 class QueueFull(Exception):
+    pass
+
+
+class DeviceBusy(Exception):
+    pass
+
+
+class StorageFull(Exception):
+    pass
+
+
+class ServerShuttingDown(Exception):
     pass
 
 
@@ -188,6 +203,33 @@ def run_command(command: list[str], timeout: float, cancel: threading.Event | No
                                         output="".join(stdout_lines), stderr="".join(stderr_lines))
     return subprocess.CompletedProcess(command, process.returncode,
                                        "".join(stdout_lines), "".join(stderr_lines))
+
+
+@contextmanager
+def cancellable_file_lock(path: Path, timeout: float,
+                          cancel: threading.Event | None = None):
+    """Acquire a process-shared advisory lock with bounded cancellable waiting."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise JobCancelled("job cancelled")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise DeviceBusy(
+                        f"CUDA device remained busy for {timeout:g}s")
+                time.sleep(0.1)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def native_progress(line: str) -> tuple[str, int] | None:
@@ -419,6 +461,9 @@ class PixalServer:
         self.work_dir = Path(args.work_dir).resolve()
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.locks = {backend: threading.Lock() for backend in ("cpu", "cuda", "rocm")}
+        self.device_lock_dir = Path(getattr(
+            args, "device_lock_dir", ROOT / "tmp/pixal3d/device-locks")).resolve()
+        self.device_lock_dir.mkdir(parents=True, exist_ok=True)
         self.reference_script = ROOT / "ref/pixal3d/run_reference_sv.py"
         self.reference_mv_script = ROOT / "ref/pixal3d/run_reference_mv.py"
         self.reference_mv_upstream = ROOT / "ref/pixal3d/upstream/inference_mv.py"
@@ -428,6 +473,28 @@ class PixalServer:
         self.compare_script = ROOT / "ref/pixal3d/compare_outputs.py"
         self.preview_script = ROOT / "ref/pixal3d/preview_glb.py"
         self.preview_renderer = ROOT / "ref/pixal3d/.cache/preview_render"
+
+    @contextmanager
+    def execution_lock(self, backend: str, device: int, timeout: float,
+                       cancel: threading.Event | None = None):
+        """Serialize this process and, for CUDA, other workstation services."""
+        deadline = time.monotonic() + timeout
+        local = self.locks[backend]
+        while not local.acquire(timeout=min(0.1, max(0.0, deadline - time.monotonic()))):
+            if cancel is not None and cancel.is_set():
+                raise JobCancelled("job cancelled")
+            if time.monotonic() >= deadline:
+                raise DeviceBusy(f"{backend.upper()} device remained busy for {timeout:g}s")
+        try:
+            remaining = max(0.0, deadline - time.monotonic())
+            if backend == "cuda":
+                with cancellable_file_lock(
+                        self.device_lock_dir / f"cuda-{device}.lock", remaining, cancel):
+                    yield max(0.0, deadline - time.monotonic())
+            else:
+                yield remaining
+        finally:
+            local.release()
 
     def health(self) -> dict:
         lib = {
@@ -464,6 +531,7 @@ class PixalServer:
                 "default_gpu_execution": self.args.gpu_execution,
                 "default_gpu_kernels": self.args.gpu_kernels,
                 "default_gpu_flow_precision": self.args.gpu_flow_precision,
+                "device_lock": {"cuda": True, "directory": str(self.device_lock_dir)},
                 "preparation": {"mask_ready": rmbg_ready(self.rembg),
                                 "camera_ready": self.moge.is_file(),
                                 "render_comparison_ready": (
@@ -502,6 +570,7 @@ class PixalServer:
             raise ValueError("texture_size must be 1024, 2048, or 4096")
         triangle_target = bounded_integer(request.get("triangle_target", 1000000),
                                           "triangle_target", 10000, 5000000)
+        device = bounded_integer(request.get("device", 0), "device", 0, 255)
         include_ply = request.get("include_ply", False)
         if not isinstance(include_ply, bool):
             raise ValueError("include_ply must be a boolean")
@@ -512,7 +581,8 @@ class PixalServer:
         if render_comparison and not self.preview_renderer.is_file():
             raise ValueError(
                 "render comparison is unavailable; run ref/pixal3d/build_preview.sh")
-        with self.locks[backend], tempfile.TemporaryDirectory(prefix="request-", dir=self.work_dir) as td:
+        with self.execution_lock(backend, device, self.args.timeout, cancel) as execution_timeout, \
+                tempfile.TemporaryDirectory(prefix="request-", dir=self.work_dir) as td:
             run_dir = Path(td)
             artifact_dir = retained_artifact_dir(request)
             if artifact_dir is not None:
@@ -632,7 +702,7 @@ class PixalServer:
             if threads:
                 cmd += ["--threads", str(threads)]
             if request.get("device") is not None:
-                cmd += ["--device", str(bounded_integer(request["device"], "device", 0, 255))]
+                cmd += ["--device", str(device)]
             if request.get("vram_budget_mib") is not None:
                 cmd += ["--vram-budget-mib", str(bounded_integer(request["vram_budget_mib"],
                                                                   "vram_budget_mib", 513, 14336))]
@@ -640,7 +710,7 @@ class PixalServer:
                 cmd += ["--mask", str(mask_path)]
             started = time.monotonic()
             try:
-                proc = run_command(cmd, self.args.timeout, cancel, progress)
+                proc = run_command(cmd, execution_timeout, cancel, progress)
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(f"inference exceeded {self.args.timeout:g}s") from exc
             if proc.returncode != 0:
@@ -706,7 +776,10 @@ class PixalServer:
             ext = ".png"
         fov = finite_number(request.get("fov", 0.857556), "fov", 0.05, 3.14)
         seed = bounded_integer(request.get("seed", 42), "seed", 0, 2**32 - 1)
-        with self.locks[backend], tempfile.TemporaryDirectory(prefix="reference-", dir=self.work_dir) as td:
+        device = bounded_integer(request.get("device", 0), "device", 0, 255)
+        with self.execution_lock(
+                backend, device, self.args.reference_timeout, cancel) as execution_timeout, \
+                tempfile.TemporaryDirectory(prefix="reference-", dir=self.work_dir) as td:
             run_dir = Path(td)
             artifact_dir = retained_artifact_dir(request)
             output_path = ((artifact_dir / ".reference.glb.partial") if artifact_dir
@@ -745,7 +818,7 @@ class PixalServer:
                        "--model_path", str(self.model_dir), "--low_vram", "--resolution", "1024"]
             started = time.monotonic()
             try:
-                proc = run_command(cmd, self.args.reference_timeout, cancel)
+                proc = run_command(cmd, execution_timeout, cancel)
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(f"PyTorch reference exceeded {self.args.reference_timeout:g}s") from exc
             if proc.returncode != 0:
@@ -834,20 +907,27 @@ class JobQueue:
     TERMINAL = ("complete", "failed", "cancelled")
 
     def __init__(self, pixal: PixalServer, retained: int = 4,
-                 uploads: UploadStore | None = None, ttl: float = 86400):
+                 uploads: UploadStore | None = None, ttl: float = 86400,
+                 min_free_disk_mib: int = 1024, job_log_bytes: int = 65536):
         self.pixal = pixal
         self.retained = retained
         self.uploads = uploads
         self.ttl = ttl
+        self.min_free_disk_bytes = min_free_disk_mib * 1024 * 1024
+        self.job_log_bytes = job_log_bytes
+        self.accepting = True
         self.jobs: dict[str, dict] = {}
         self.pending: queue.Queue[str] = queue.Queue()
         self.lock = threading.Lock()
+        self.log_lock = threading.Lock()
         work_dir = getattr(pixal, "work_dir", None)
         self.result_root = Path(work_dir) / "results" if work_dir is not None else None
         if self.result_root is not None:
             self.result_root.mkdir(parents=True, exist_ok=True)
             self._recover()
-        threading.Thread(target=self._worker, daemon=True, name="pixal3d-jobs").start()
+        self.worker = threading.Thread(
+            target=self._worker, daemon=True, name="pixal3d-jobs")
+        self.worker.start()
 
     @staticmethod
     def _public_job(job: dict) -> dict:
@@ -961,6 +1041,36 @@ class JobQueue:
         if directory is not None:
             shutil.rmtree(directory, ignore_errors=True)
 
+    def _append_log(self, job_id: str, message: str) -> None:
+        if self.result_root is None or self.job_log_bytes <= 0:
+            return
+        directory = self.result_root / job_id
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "job.log"
+        data = (message.rstrip() + "\n").encode("utf-8", errors="replace")
+        with self.log_lock:
+            with path.open("ab") as handle:
+                handle.write(data)
+            if path.stat().st_size > self.job_log_bytes:
+                with path.open("rb") as handle:
+                    handle.seek(-self.job_log_bytes, os.SEEK_END)
+                    tail = handle.read()
+                newline = tail.find(b"\n")
+                if newline >= 0:
+                    tail = tail[newline + 1:]
+                temporary = directory / ".job.log.partial"
+                temporary.write_bytes(tail)
+                os.replace(temporary, path)
+
+    def health(self) -> dict:
+        free = (shutil.disk_usage(self.result_root).free
+                if self.result_root is not None else None)
+        return {"accepting": self.accepting,
+                "free_disk_bytes": free,
+                "min_free_disk_bytes": self.min_free_disk_bytes,
+                "job_log_bytes": self.job_log_bytes,
+                "storage_ready": free is None or free >= self.min_free_disk_bytes}
+
     def _store_artifacts(self, job_id: str, result: dict) -> None:
         if self.result_root is None:
             return
@@ -1035,12 +1145,22 @@ class JobQueue:
                 self.jobs.pop(job_id, None)
 
     def submit(self, request: dict) -> dict:
+        if not self.accepting:
+            raise ServerShuttingDown("server is shutting down")
+        if (self.result_root is not None and
+                shutil.disk_usage(self.result_root).free < self.min_free_disk_bytes):
+            raise StorageFull(
+                f"job storage has less than {self.min_free_disk_bytes // (1024 * 1024)} MiB free")
         upload_paths: list[Path] = []
         if self.uploads:
             request, upload_paths = self.uploads.claim(request)
         job_id = uuid.uuid4().hex
         now = time.time()
         with self.lock:
+            if not self.accepting:
+                for path in upload_paths:
+                    path.unlink(missing_ok=True)
+                raise ServerShuttingDown("server is shutting down")
             self._expire_locked(now)
             active = sum(j["state"] in ("queued", "running") for j in self.jobs.values())
             if active >= self.retained:
@@ -1061,6 +1181,7 @@ class JobQueue:
                                  "_cancel": threading.Event(), "_uploads": upload_paths}
             self._persist_locked(self.jobs[job_id])
         self.pending.put(job_id)
+        self._append_log(job_id, "queued")
         return self.status(job_id)
 
     def status(self, job_id: str, include_result: bool = False) -> dict:
@@ -1124,6 +1245,17 @@ class JobQueue:
                 raise KeyError(name)
             return path
 
+    def log(self, job_id: str) -> Path:
+        with self.lock:
+            self._expire_locked()
+            job = self.jobs.get(job_id)
+            if job is None or self.result_root is None:
+                raise KeyError(job_id)
+            path = self.result_root / job_id / "job.log"
+            if not path.is_file():
+                raise KeyError(job_id)
+            return path
+
     def _queue_position(self, job_id: str) -> int:
         queued = sorted((j for j in self.jobs.values() if j["state"] == "queued"),
                         key=lambda j: j["created_at"])
@@ -1136,22 +1268,51 @@ class JobQueue:
             if "state" in values:
                 self._persist_locked(job)
 
+    def stop_accepting(self) -> None:
+        self.accepting = False
+
+    def shutdown(self, timeout: float = 30) -> bool:
+        self.stop_accepting()
+        now = time.time()
+        with self.lock:
+            for job in self.jobs.values():
+                if job["state"] == "queued":
+                    job.update(state="failed", phase="failed", updated_at=now,
+                               completed_at=now, error_code="server_shutdown",
+                               error="server shut down before job started",
+                               _shutdown=True)
+                    self._persist_locked(job)
+                elif job["state"] == "running":
+                    job["_shutdown"] = True
+                    job["cancel_requested"] = True
+                    job["_cancel"].set()
+                    job["updated_at"] = now
+                    self._persist_locked(job)
+        self.pending.put(None)
+        self.worker.join(timeout=max(0.0, timeout))
+        return not self.worker.is_alive()
+
     def _worker(self):
         while True:
             job_id = self.pending.get()
+            if job_id is None:
+                self.pending.task_done()
+                break
             request = None
             try:
                 with self.lock:
                     job = self.jobs.get(job_id)
                     if job is None:
                         continue
-                    if job["state"] == "cancelled":
+                    if job["state"] != "queued":
                         continue
                     request = job["request"]
                 self._update(job_id, state="running", phase="starting native inference",
                              progress=1, started_at=time.time())
+                self._append_log(job_id, "starting native inference")
                 cancel = job["_cancel"]
                 def report(line):
+                    self._append_log(job_id, line)
                     update = native_progress(line)
                     if update:
                         phase, percent = update
@@ -1166,22 +1327,39 @@ class JobQueue:
                     continue
                 if request.get("reference"):
                     self._update(job_id, phase="PyTorch reference", progress=98)
+                    self._append_log(job_id, "starting PyTorch reference")
                     result["reference"] = self.pixal.reference(reference_request(request, result), cancel)
+                    if result["reference"].get("log_tail"):
+                        self._append_log(job_id, result["reference"]["log_tail"])
                     self._update(job_id, phase="surface comparison", progress=99)
+                    self._append_log(job_id, "starting surface comparison")
                     attach_comparison(
                         self.pixal, result, cancel,
                         render_comparison=request.get("render_comparison", False))
                 self._store_artifacts(job_id, result)
                 self._update(job_id, state="complete", phase="complete", progress=100, result=result,
                              completed_at=time.time())
+                self._append_log(job_id, "complete")
             except JobCancelled:
-                self._update(job_id, state="cancelled", phase="cancelled",
-                             completed_at=time.time())
+                with self.lock:
+                    shutting_down = self.jobs[job_id].get("_shutdown", False)
+                if shutting_down:
+                    self._update(job_id, state="failed", phase="failed",
+                                 error="server shut down during job",
+                                 error_code="server_shutdown",
+                                 completed_at=time.time())
+                    self._append_log(job_id, "failed: server shutdown")
+                else:
+                    self._update(job_id, state="cancelled", phase="cancelled",
+                                 completed_at=time.time())
+                    self._append_log(job_id, "cancelled")
             except Exception as exc:
                 code = ("invalid_request" if isinstance(exc, ValueError) else
+                        "device_busy" if isinstance(exc, DeviceBusy) else
                         "timeout" if isinstance(exc, TimeoutError) else "execution_failed")
                 self._update(job_id, state="failed", phase="failed", error=str(exc), error_code=code,
                              completed_at=time.time())
+                self._append_log(job_id, f"failed [{code}]: {exc}")
             finally:
                 with self.lock:
                     job = self.jobs.get(job_id)
@@ -1209,6 +1387,7 @@ class Handler(BaseHTTPRequestHandler):
     def file_response(self, path: Path):
         content_type = ("model/gltf-binary" if path.suffix == ".glb" else
                         "image/png" if path.suffix == ".png" else
+                        "text/plain; charset=utf-8" if path.suffix == ".log" else
                         "application/octet-stream")
         self.send_response(200)
         self.send_header("Content-Type", content_type)
@@ -1226,7 +1405,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
-            self.json_response(200, self.server.pixal.health())
+            health = self.server.pixal.health()
+            health["admission"] = self.server.jobs.health()
+            self.json_response(200, health)
             return
         if path in ("/", "/index.html"):
             data = (ROOT / "web/pixal3d.html").read_bytes()
@@ -1239,6 +1420,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.file_response(self.server.jobs.artifact(
                         job_id, tail[len("artifacts/"):]))
                     return
+                if tail == "log":
+                    self.file_response(self.server.jobs.log(job_id))
+                    return
                 self.json_response(200, self.server.jobs.status(job_id, tail == "result"))
             except KeyError:
                 self.json_response(404, error_payload("not_found", "job not found"))
@@ -1248,12 +1432,20 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/v1/uploads":
             try:
+                if not self.server.jobs.accepting:
+                    raise ServerShuttingDown("server is shutting down")
+                if not self.server.jobs.health()["storage_ready"]:
+                    raise StorageFull("job storage is below its free-space reserve")
                 length = int(self.headers.get("Content-Length", "-1"))
                 if length <= 0 or length > MAX_IMAGE_BYTES:
                     raise ValueError("invalid upload size")
                 upload_id = self.server.uploads.put(self.rfile.read(length))
                 self.json_response(201, {"ok": True, "upload_id": upload_id, "bytes": length})
             except QueueFull as exc: self.json_response(429, error_payload("queue_full", str(exc)))
+            except ServerShuttingDown as exc:
+                self.json_response(503, error_payload("server_shutdown", str(exc)))
+            except StorageFull as exc:
+                self.json_response(507, error_payload("storage_full", str(exc)))
             except ValueError as exc: self.json_response(400, error_payload("invalid_request", str(exc)))
             return
         if path not in ("/v1/infer", "/v1/jobs"):
@@ -1274,6 +1466,10 @@ class Handler(BaseHTTPRequestHandler):
                     render_comparison=request.get("render_comparison", False))
             self.json_response(200, result)
         except QueueFull as exc: self.json_response(429, error_payload("queue_full", str(exc)))
+        except StorageFull as exc: self.json_response(507, error_payload("storage_full", str(exc)))
+        except ServerShuttingDown as exc:
+            self.json_response(503, error_payload("server_shutdown", str(exc)))
+        except DeviceBusy as exc: self.json_response(503, error_payload("device_busy", str(exc)))
         except TimeoutError as exc: self.json_response(504, error_payload("timeout", str(exc)))
         except (ValueError, json.JSONDecodeError) as exc: self.json_response(400, error_payload("invalid_request", str(exc)))
         except Exception as exc: self.json_response(500, error_payload("internal_error", str(exc)))
@@ -1311,13 +1507,35 @@ def main() -> None:
     p.add_argument("--retained-uploads", type=int, default=64)
     p.add_argument("--job-ttl", type=float, default=86400)
     p.add_argument("--upload-ttl", type=float, default=3600)
-    args = p.parse_args(); srv = ThreadingHTTPServer((args.bind, args.port), Handler); srv.pixal = PixalServer(args)
+    p.add_argument("--device-lock-dir", default=str(ROOT / "tmp/pixal3d/device-locks"))
+    p.add_argument("--min-free-disk-mib", type=int, default=1024)
+    p.add_argument("--job-log-bytes", type=int, default=65536)
+    p.add_argument("--shutdown-timeout", type=float, default=30)
+    args = p.parse_args(); srv = ThreadingHTTPServer((args.bind, args.port), Handler); srv.daemon_threads = True; srv.pixal = PixalServer(args)
     srv.uploads = UploadStore(srv.pixal.work_dir / "uploads",
                               bounded_integer(args.retained_uploads, "retained_uploads", 1, 256),
                               finite_number(args.upload_ttl, "upload_ttl", 1, 604800))
     srv.jobs = JobQueue(srv.pixal, bounded_integer(args.retained_jobs, "retained_jobs", 1, 32),
-                        srv.uploads, finite_number(args.job_ttl, "job_ttl", 1, 2592000))
-    print(f"Pixal3D demo: http://{args.bind}:{args.port}/ (backend={args.backend})", flush=True); srv.serve_forever()
+                        srv.uploads, finite_number(args.job_ttl, "job_ttl", 1, 2592000),
+                        bounded_integer(args.min_free_disk_mib, "min_free_disk_mib", 0, 1048576),
+                        bounded_integer(args.job_log_bytes, "job_log_bytes", 1024, 1048576))
+    shutdown_timeout = finite_number(
+        args.shutdown_timeout, "shutdown_timeout", 0, 600)
+    stopping = threading.Event()
+    def stop_server(_signum, _frame):
+        if stopping.is_set():
+            return
+        stopping.set()
+        srv.jobs.stop_accepting()
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+    signal.signal(signal.SIGINT, stop_server)
+    signal.signal(signal.SIGTERM, stop_server)
+    print(f"Pixal3D demo: http://{args.bind}:{args.port}/ (backend={args.backend})", flush=True)
+    try:
+        srv.serve_forever()
+    finally:
+        srv.jobs.shutdown(shutdown_timeout)
+        srv.server_close()
 
 
 if __name__ == "__main__": main()

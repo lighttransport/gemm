@@ -469,6 +469,69 @@ class PixalServerTest(unittest.TestCase):
         timer.cancel()
         self.assertLess(time.monotonic() - started, 2)
 
+    def test_cuda_file_lock_wait_is_cancellable_and_bounded(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="device-lock-", dir=scratch) as td:
+            path = Path(td) / "cuda-0.lock"
+            cancel = __import__("threading").Event()
+            timer = __import__("threading").Timer(0.05, cancel.set)
+            with app.cancellable_file_lock(path, 1):
+                timer.start()
+                with self.assertRaises(app.JobCancelled):
+                    with app.cancellable_file_lock(path, 1, cancel):
+                        pass
+                timer.cancel()
+                with self.assertRaises(app.DeviceBusy):
+                    with app.cancellable_file_lock(path, 0.01):
+                        pass
+
+    def test_disk_admission_and_bounded_job_log(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="job-ops-", dir=scratch) as td:
+            class LoggingPixal:
+                work_dir = Path(td)
+                def infer(self, request, cancel=None, progress=None):
+                    progress("x" * 80)
+                    progress("tail-marker")
+                    return {"ok": True}
+
+            jobs = app.JobQueue(LoggingPixal(), retained=1,
+                                min_free_disk_mib=1, job_log_bytes=64)
+            with mock.patch.object(app.shutil, "disk_usage",
+                                   return_value=mock.Mock(free=0)):
+                with self.assertRaises(app.StorageFull):
+                    jobs.submit({})
+            submitted = jobs.submit({})
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                status = jobs.status(submitted["id"])
+                if status["state"] == "complete":
+                    break
+                time.sleep(0.01)
+            log = jobs.log(submitted["id"]).read_text()
+            self.assertLessEqual(len(log.encode()), 64)
+            self.assertIn("tail-marker", log)
+            self.assertIn("complete", log)
+
+    def test_graceful_shutdown_stops_admission_and_fails_active_job(self):
+        started = __import__("threading").Event()
+        class BlockingPixal:
+            def infer(self, request, cancel=None, progress=None):
+                started.set()
+                cancel.wait(2)
+                raise app.JobCancelled("stopped")
+
+        jobs = app.JobQueue(BlockingPixal(), retained=1)
+        submitted = jobs.submit({})
+        self.assertTrue(started.wait(1))
+        self.assertTrue(jobs.shutdown(1))
+        status = jobs.status(submitted["id"])
+        self.assertEqual(status["error_code"], "server_shutdown")
+        with self.assertRaises(app.ServerShuttingDown):
+            jobs.submit({})
+
     def test_native_progress_streaming(self):
         updates = []
         command = [sys.executable, "-c",
