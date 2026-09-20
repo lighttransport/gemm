@@ -220,12 +220,23 @@ by exactly 12 launches per row; it is under
 `tmp/qwen38/ordinary-decode-profile-attngateq81/`.  Set
 `LLM_QWEN35_SPLIT_ATTN_GATE_Q81=1` for the split path.
 
+The exact one-row IQ scheduler now chooses its block geometry by projection
+shape: IQ2_XS uses sixteen waves, the 17408-row IQ2_S shape uses sixteen, and
+the frequent 5120/17408-row IQ3_S shapes use four. A wave still owns one
+output row, preserving the reduction order. Matched 64-row traces save about
+0.23 ms per decoded token; the tuned and eight-wave fallback paths produce
+bitwise-identical 248,320-entry logits with SHA-256
+`5b5f2f1a334ae644ac5633908e3d447c6d741c764a61dc0e9573addf699553c0`.
+The authoritative 64K run keeps prefix/suffix hashes
+`90178de69a24a76e`/`f4b35758fb99e6db` at 441.44 prefill and 34.98 decode
+tok/s. `LLM_QWEN35_IQ_SHAPE_THREADS=0` restores the diagnostic fallback.
+
 ## Remaining optimization opportunities
 
 The short-context K=7 response emits 46 tokens in 566.72 ms, clearing the
 60 tok/s target with about 35 percent throughput headroom. DFlash also clears
 40 tok/s after a real random-token 64K prefix. Ordinary one-token decode now
-reaches 34.21 tok/s at 64K after exact GQA reuse, grouped K/Q scale products,
+reaches 34.98 tok/s at 64K after exact GQA reuse, grouped K/Q scale products,
 packed-probability reuse and scalar IQ codebook staging, so work that helps
 both ordinary and verifier execution remains useful. The following order
 reflects the remaining measured costs.
@@ -237,7 +248,7 @@ reflects the remaining measured costs.
    attention kernel raised the 256-token 64K run to 34.08 tok/s. Reusing each
    packed probability across both value tiles lowers the exact 128-split
    operator to 321.8--323.6 microseconds per layer and raises the full run to
-   34.21 tok/s with unchanged prefix and suffix hashes, so the
+   34.98 tok/s with unchanged prefix and suffix hashes, so the
    remaining gap is dominated by work outside attention. SiLU and Q8_1
    staging for 58 dense down projections now share one exact launch; gated
    RMSNorm and Q8_1 staging do the same for all 48 recurrent output

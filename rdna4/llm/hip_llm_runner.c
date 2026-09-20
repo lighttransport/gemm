@@ -20196,6 +20196,11 @@ static inline int qwen35_native_q81_matvec_type(hip_llm_runner *r, int type) {
            (type == GGML_TYPE_IQ4_XS && r->fn_qwen35_matvec_iq4xs);
 }
 
+static inline int qwen35_iq_shape_threads_enabled(void) {
+    const char *env = getenv("LLM_QWEN35_IQ_SHAPE_THREADS");
+    return !env || atoi(env) != 0;
+}
+
 static inline void launch_qwen35_argmax(hip_llm_runner *r, void *x, void *out) {
     int groups=(r->n_vocab+4095)/4096;
     if (r->fn_qwen35_argmax_parts && groups <= 256) {
@@ -20452,7 +20457,14 @@ static inline void launch_matvec_iq2_xs(hip_llm_runner *r, void *dst,
         r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
-        LAUNCH(r->fn_qwen35_matvec_iq2xs, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        /* Sixteen waves improve the exact IQ2_XS shapes used by this model,
+         * especially the 10240-row QKV projection, without changing the
+         * one-wave-per-row arithmetic. */
+        int threads = qwen35_iq_shape_threads_enabled() ? 512 : 256;
+        int rows_per_block = threads / 32;
+        LAUNCH(r->fn_qwen35_matvec_iq2xs,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               threads, 1, 1, 0, r->stream, a);
         return;
     }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -21691,7 +21703,12 @@ static inline void launch_matvec_iq2_s(hip_llm_runner *r, void *dst, void *mat,
         r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
-        LAUNCH(r->fn_qwen35_matvec_iq2s, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        int threads = qwen35_iq_shape_threads_enabled() && n_rows == 17408 ?
+            512 : 256;
+        int rows_per_block = threads / 32;
+        LAUNCH(r->fn_qwen35_matvec_iq2s,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               threads, 1, 1, 0, r->stream, a);
         return;
     }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -21757,7 +21774,12 @@ static inline void launch_matvec_iq3_s(hip_llm_runner *r, void *dst, void *mat,
         r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
-        LAUNCH(r->fn_qwen35_matvec_iq3s, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        int threads = qwen35_iq_shape_threads_enabled() &&
+            (n_rows == 5120 || n_rows == 17408) ? 128 : 256;
+        int rows_per_block = threads / 32;
+        LAUNCH(r->fn_qwen35_matvec_iq3s,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               threads, 1, 1, 0, r->stream, a);
         return;
     }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };

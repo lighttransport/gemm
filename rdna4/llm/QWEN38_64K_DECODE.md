@@ -47,6 +47,7 @@ RX 9070 XT / gfx1201 / ROCm 10, Q8 K and Q8 V, greedy sampling:
 | IQ2_XS ordinary, staged IQ codebooks | 512 tokens | 33.31 | 443.44 | 4282 MiB | `051e7338c23a544e` |
 | IQ2_XS ordinary, hoisted GQA scales | 256 tokens | 34.08 | 445.67 | 4282 MiB | `f4b35758fb99e6db` |
 | IQ2_XS ordinary, reused packed probabilities | 256 tokens | 34.21 | 443.63 | 4282 MiB | `f4b35758fb99e6db` |
+| IQ2_XS ordinary, shape-tuned IQ blocks | 256 tokens | 34.98 | 441.44 | 4282 MiB | `f4b35758fb99e6db` |
 | IQ2_XS + DFlash2 K=7, optimized | 256 tokens | 47.72 | 445.71 | 1274 MiB | `2ddd068dca63669a` |
 | IQ2_XS + DFlash2 K=7, packed Q4_K/Q8_1 draft | 256 tokens | 49.74 | 443.57 | 1274 MiB | `2ddd068dca63669a` |
 
@@ -88,11 +89,20 @@ generic verifier at the same split count.  The DFlash path therefore clears
 the 40 tok/s sustained target without approximating authoritative target
 output.
 
-Ordinary one-token decode now reaches 34.21 tok/s in the latest retained run,
+Ordinary one-token decode now reaches 34.98 tok/s in the latest retained run,
 so its 40 tok/s target remains open. The 16 attention layers now cost about
-5.6 ms/token at 64K; the remaining projection, SSM, normalization and output
-path is about 25 ms/token. Reducing projection weight traffic and recurrent
+5.7 ms/token at 64K; the remaining projection, SSM, normalization and output
+path is about 23 ms/token. Reducing projection weight traffic and recurrent
 state work is now more useful than further attention-only work.
+
+The one-row IQ scheduler now uses sixteen waves for IQ2_XS, sixteen for the
+17408-row IQ2_S projection, and four for the 5120/17408-row IQ3_S shapes.
+Each wave still owns one output row, so the arithmetic is unchanged. Matched
+64-row traces predict a 0.23 ms/token reduction compared with eight waves for
+all three formats. The tuned and fallback paths are bitwise identical across
+all 248,320 final logits (SHA-256 `5b5f2f1a...953c0`), and both retain the
+zero-depth and 64K suffix hashes. Set the diagnostic
+`LLM_QWEN35_IQ_SHAPE_THREADS=0` to restore eight waves for the A/B.
 
 The scalar IQ2_XXS, IQ2_XS and IQ3_XXS kernels stage their 1--4 KiB decode
 tables in LDS once per block. IQ3_XXS uses four waves because eight or more

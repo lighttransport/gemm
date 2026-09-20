@@ -137,6 +137,15 @@ and all three 256-token repeats retain `3c53b75f283cb9b0`.  Matched means are
 launches, 12 per row.  Trace artifact:
 `tmp/qwen38/ordinary-decode-profile-attngateq81/`.
 
+The one-row IQ2_XS, tall IQ2_S, and common IQ3_S projections now use measured
+shape-specific wave counts while retaining one output row per wave. The
+tuned/eight-wave A/B is bitwise identical across all 248,320 logits with
+SHA-256 `5b5f2f1a334ae644ac5633908e3d447c6d741c764a61dc0e9573addf699553c0`.
+Matched traces save about 0.23 ms per row; a real 65,536-token random-prefix
+run keeps prefix/suffix hashes `90178de69a24a76e`/`f4b35758fb99e6db` and
+measures 441.44 tok/s prefill plus 34.98 tok/s ordinary decode. Use
+`LLM_QWEN35_IQ_SHAPE_THREADS=0` only for the eight-wave diagnostic fallback.
+
 Prioritize ordinary one-row target projection traffic first, followed by the
 long-context verifier attention tail, sampled verifier-row parity audit, and
 fusion of the remaining activation/state-preparation launches.
