@@ -233,6 +233,12 @@ seven tokens; maximum confidence difference is `1.31279e-4` and maximum
 selected-logit relative difference is `3.58070e-4`. A direct scalar/SVE test
 covers split persistent/current K/V inputs.
 
+A 32768-token synthetic-context probe completed in 306.5 ms, including
+240.3 ms of attention. Peak RSS remained 8,572,160 KiB (the transient model
+load buffer is still the high-water mark), with zero swaps. This confirms the
+optimized attention path and state allocation remain safe well beyond the
+8192-token default on one node.
+
 Continue in this order:
 
 1. Generate the independent golden fixture and run the golden validator; the
