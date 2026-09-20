@@ -130,10 +130,15 @@ cpu/pixal3d/pixal3d --backend cuda \
 Use `--num-views N` to select the first N frames. The C API exposes the same
 path through `pixal3d_generate_multiview` and `pixal3d_view`.
 
-The four-view upstream example completed on the RTX 5060 Ti in 521.5 seconds
-with mixed precision and a 7168 MiB native budget. Peak native reservation was
-6.99 GiB. Its exported 4096-texture GLB passed mesh bounds, index, triangle,
-normal and material validation with 655,071 vertices and 961,142 triangles.
+The four-view upstream example was validated on the RTX 5060 Ti with resident
+execution, mixed precision, seed 42, 4096 textures and the one-million-triangle
+target. Under desktop GPU/CPU contention, the 7168 MiB path took 506.207 s in
+the native generation timer and 512.737 s wall clock including GLB serialization;
+peak native reservation was 6.99 GiB. The 12288 MiB path took 484.915 s and
+490.727 s respectively, with an 8.29 GiB native reserved peak. Both produced
+the byte-identical `a5a22a90...c700383` GLB with 655,071 vertices and 961,142
+triangles and passed mesh, normal, and material validation. These are functional
+observations under contention, not isolated throughput measurements.
 For 12 GB and larger cards, pass `--vram-budget-mib 12288`. The runtime still
 clamps the effective budget to free VRAM minus its safety reserve, so the same
 command retains the lower-memory fallback on smaller or contended devices.
@@ -159,14 +164,14 @@ normalized for glTF output.
 
 The default workspace budget is 12 GiB (`--vram-budget-mib 12288`). At creation,
 it is reduced to available device memory minus 512 MiB. GEMMs stream rows and
-attention tiles queries while retaining every key. Weights/activations live in
-host memory between operations, and stages release model allocations before the
-next stage. Geometry and PBR processing run on CPU. This trades host RAM and PCIe
-traffic for bounded VRAM; it is not a fully device-resident fast path.
-Recorded complete GPU invocations took 28–97 minutes under concurrent validation
-load; the narrow CPU pencil fixture took 63 minutes. Observed host RSS ranged
-from 6.05 to 13.80 GiB. See the [execution table](../../ref/pixal3d/README.md#full-pipeline-runs)
-for fixture sizes, memory counters and measurement conditions.
+attention tiles queries while retaining every key. Resident execution keeps
+NN weights and activations on the GPU within each model stage, then releases
+stage allocations before loading the next model. Geometry and PBR processing
+run on CPU. The historical `legacy` path instead transfers operation inputs and
+outputs across PCIe to bound device workspaces; its 28–97 minute functional runs
+under concurrent validation load, including GLB serialization, are retained in
+the [historical execution table](../../ref/pixal3d/README.md#historical-host-offloaded-full-pipeline-runs)
+only to document that tradeoff.
 
 No resolution fallback or token truncation is used. A workspace allocation that
 cannot fit fails with a diagnostic. The reported `peak_device_bytes` covers
@@ -181,10 +186,12 @@ Floating-point reductions differ between BLAS backends. Values close to zero
 can change occupancy/subdivision decisions: seeds do not guarantee bit-identical
 meshes across CPU/CUDA/ROCm. Reference tests separately measure continuous feature
 error and exact coordinate expansion with shared subdivision decisions.
-Isolated checkpoint-stage tests pass their 2% NRMSE bound, but accumulated BF16
-structure/shape trajectories exceed it. Original PyTorch CUDA/ROCm trajectories
-also differ; full-trajectory equivalence is not established. See the measured
-comparisons in the [reference validation record](../../ref/pixal3d/README.md).
+Isolated checkpoint-stage tests pass their 2% NRMSE bound. The recommended
+mixed mode also passes complete twelve-step comparisons against pinned FP32
+PyTorch for all four stages: NRMSE ranges from `1.09e-6` to `7.11e-5`. Pure
+BF16 accumulated structure/shape trajectories remain diagnostic and can differ
+substantially across PyTorch CUDA/ROCm backends. See the measured comparisons in
+the [reference validation record](../../ref/pixal3d/README.md).
 
 Use `--dump-dir DIR` to save preprocessing, conditioning, noise, every diffusion
 step, decoded outputs, and the FDG/remeshed/simplified meshes as safetensors for reference replay. Dumps can occupy

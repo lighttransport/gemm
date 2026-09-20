@@ -122,12 +122,20 @@ Both commands write their reproducibility record and validated artifacts under
 the local model paths reported by `/health`, and an NVIDIA GPU.
 
 On 2026-09-20, the automatic-mask command passed on an RTX 5060 Ti 16 GB in
-312.1 seconds, including cancellation and recovery. The recovery generation
+312.1 seconds of harness wall time. This includes the queued upload, automatic
+RMBG preparation, cancellation, recovery resident-mixed generation, GLB
+serialization, download and artifact validation. The server serialized the
+CUDA backend with no competing test job, although desktop GPU processes remained.
+The recovery generation
 peaked at 11,656,101,888 device bytes and 6,946,299,904 aggregate host RSS
 bytes and produced a validated 9,335,888-byte GLB. The input SHA-256 was
 `fdd82d60b7ec11e6d5699df29693d8ab538f9dab4b04e3f2abaa59ccd7b4709a`.
-The paired explicit-mask command passed in 689.2 seconds, peaked at
-13,285,916,672 device bytes and 25,487,593,472 aggregate host RSS bytes, and
+The paired explicit-mask command passed in 689.2 seconds of harness wall time,
+including serialized resident-mixed native inference, GLB serialization, pinned
+PyTorch inference, reference serialization, downloads and surface validation.
+It ran through the same single CUDA worker with desktop GPU processes present.
+The run peaked at 13,285,916,672 device bytes and 25,487,593,472 aggregate host
+RSS bytes and
 produced validated native/reference GLBs. Its 50,000-sample symmetric Chamfer
 RMS was `0.015580`; directional p95 distances were `0.027573` and `0.034187`.
 

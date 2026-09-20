@@ -9,6 +9,7 @@ RMBG/MoGe preparation, GLB/PLY export, and the Python web demo are implemented.
 
 Recent commits:
 
+- `3258a09f` evaluates and rejects unhelpful CUDA activation packing/tiling.
 - `13a50a3b` reduces byte-identical postprocessing allocations and UV overhead.
 - `d73dde4b` consolidates reproducible Pixal3D validation evidence.
 - `aadd125c` documents RMBG/BiRefNet mask-parity provenance.
@@ -33,7 +34,10 @@ Validated hardware and model locations:
 
 Important measured results:
 
-- Four-view native output is byte-identical at 7168 and 12288 MiB budgets.
+- Four-view resident-mixed native output is byte-identical at 7168 and 12288
+  MiB budgets. Under desktop contention, generation excluding serialization
+  took 506.207/484.915 s; wall time including serialization was
+  512.737/490.727 s.
 - Four-view native versus pinned PyTorch symmetric Chamfer RMS: `0.005548`.
 - Absolute normal cosine means: `0.9533` and `0.9586`.
 - Matched preview PSNR: `26.39–29.09 dB`; silhouette IoU: `0.9885–0.9949`.
@@ -41,13 +45,17 @@ Important measured results:
 - Exact upstream BiRefNet with normal semantics: `0.998310`.
 - Asset-tuned BiRefNet/Lanczos/threshold-122 diagnostic: `0.999004`; do not
   present this threshold-tuned result as general production quality.
-- Byte-identical 4K/1M postprocessing replay: 92.6 s, SHA-256
+- Byte-identical CPU-only replay of saved CUDA jester outputs at 4K/1M: 92.6 s
+  wall time including GLB serialization under variable host load, SHA-256
   `6d8c267b006df8cf60e3c5ea71d470e89c3cb734f61b91b5e1c622e1f711a8b7`.
-- Real queued automatic-mask test: 312.1 s, 11.66 GB peak device memory;
-  cancellation, recovery, artifact download, and native GLB validation passed.
-- Real paired explicit-mask test: 689.2 s, 13.29 GB peak device memory;
-  native/reference GLB validation passed and 50k-sample Chamfer RMS was
-  `0.015580` for the pinned public upstream image.
+- Real queued automatic-mask harness: 312.1 s wall time including RMBG,
+  cancellation, recovery, resident-mixed native generation, serialization,
+  download and validation; 11.66 GB peak device memory.
+- Real paired explicit-mask harness: 689.2 s wall time including serialized
+  resident-mixed native and pinned-PyTorch runs, both GLB serializations,
+  downloads and comparison; 13.29 GB peak device memory and 50k-sample Chamfer
+  RMS `0.015580` for the pinned public upstream image. Both web tests used one
+  serialized CUDA worker while desktop GPU processes remained.
 
 ## Completed in the current follow-up
 
@@ -73,20 +81,13 @@ Important measured results:
   complete-generation scale. Both packing variants and the 4096-row schedule
   were removed because they did not improve reserved memory and end-to-end
   time. Current mixed trajectories remain below `0.001` NRMSE for all stages.
+- Reconciled performance wording across native, optimization, reference, web,
+  and resume documentation; retained timings now identify mode, fixture,
+  concurrency and serialization scope.
 
 ## Remaining work, in priority order
 
-### 1. Refresh user-facing performance wording
-
-Some older documentation describes the initial host-offloaded implementation
-and 28–97 minute runs under concurrent load, while the resident path and newer
-complete runs are substantially different. Reconcile `cpu/pixal3d/README.md`,
-`cpu/pixal3d/OPTIMIZATION.md`, and `ref/pixal3d/README.md` so each timing names
-its execution mode, fixture, concurrency conditions, and whether serialization
-is included. Keep historical results only when they explain a regression or
-tradeoff.
-
-### 2. Optional service durability
+### 1. Optional service durability
 
 Queued artifacts are file-backed, but job metadata remains in memory and is
 discarded on server restart. If the demo is promoted beyond a workstation
@@ -149,8 +150,8 @@ Torch-ABI extensions for `sm_120`.
 Resume Pixal3D work in /mnt/nvme02/work/gemm/pixal3d on branch pixal3d.
 Read AGENTS.md and resume-pixal3d.md first. Treat the current worktree and
 artifacts as authoritative. Work through the prioritized remaining tasks,
-starting with byte-identical CPU postprocessing profiling and optimization,
-then measured CUDA memory/performance work.
+starting with the optional persistent terminal-job manifests and startup
+recovery if the workstation service warrants the added state.
 Keep scope on Pixal3D main. Exclude Direct3D-S2/paper work, all HIP/ROCm-specific
 work, previously excluded items 1 and 15, and git push. Use the per-project uv
 environments and repository tmp/ only. Preserve the verified 7168 MiB minimum

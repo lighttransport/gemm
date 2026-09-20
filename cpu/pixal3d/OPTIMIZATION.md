@@ -9,6 +9,15 @@ attention; this is the recommended accuracy/performance point. `fp32` keeps
 the complete flow stack in FP32 for diagnostic runs. Decoder precision and
 conditioning boundaries are unchanged.
 
+Timing terms are consistent throughout this file. A **generation** time is the
+native profile's `generate` timer and excludes final GLB serialization. A
+**full invocation** or **wall time** includes serialization. A **flow** time is
+one recorded neural stage and excludes conditioning, decoders, postprocessing,
+model loading and serialization. A **postprocessing replay** starts from saved
+decoder tensors and its wall time includes GLB serialization. Concurrency is
+called out for every performance table; historical functional observations
+under contention are not treated as isolated benchmarks.
+
 ## Implementation
 
 - A private versioned plugin interface owns device tensors, a bounded reusable
@@ -60,15 +69,19 @@ identical to the earlier mixed-precision reference.
 CPU mesh processing keeps exact ordering while replacing tree-based edge
 counting with sorted vectors and deterministic parallel sorts/reductions.
 The three radius-one material channels share one inpaint call. On the same
-fixture postprocessing fell from about 230 s to 175.3 s with the exact same
-GLB bytes; the complete invocation took 369.6 s. Per-command GPU events are
+single-view house fixture, an earlier resident mixed run under desktop load
+reduced the native postprocessing phase from about 230 s to 175.3 s with the
+exact same GLB bytes; wall time for the full invocation, including
+serialization, was 369.6 s. Per-command GPU events are
 disabled during normal profiling because they serialize the stream. Set the
 diagnostic environment variable `PIXAL3D_PROFILE_COMMANDS=1` when individual
 resident command timing is required.
 
 Postprocessing replays can emit the same subphase profile without repeating
-diffusion. On the saved CUDA jester decoder outputs, the original 4096-texture
-path took 121.1 seconds: simplification 44.2 s, inpainting 23.8 s,
+diffusion. All replay wall times in this section use the saved CUDA jester
+decoder tensors, eight host threads, the 4K/1M defaults, and include GLB
+serialization; phase times exclude serialization. Under variable desktop host
+load, the original path took 121.1 seconds: simplification 44.2 s, inpainting 23.8 s,
 hole filling plus original-mesh BVH construction 17.7 s, unwrap/normals
 16.7 s, remeshing 7.6 s, baking 3.0 s, FDG extraction 0.9 s, and rasterization
 0.3 s. Replacing the simplifier's per-vertex vectors with compact CSR face
@@ -134,14 +147,17 @@ ref/pixal3d/run.sh cuda ref/pixal3d/run_fixture.py \
 Multiview conditioning caches DINO outputs per view and resolution for one
 generation. Shape-512 reuses the structure stage's 512 features, and texture
 reuses shape-1024's 1024 features. On the four-view fixture this removed
-9.86 GB of host-to-device traffic and about 5 seconds of duplicate
-conditioning. Cached features live in host memory, so the optimization does
-not raise the 7 GiB native GPU floor. The web demo requests a 12 GiB budget for
-additional dense-output headroom and automatically falls back to available
-VRAM minus the runtime reserve.
+9.86 GB of host-to-device traffic and about 5 seconds of duplicate conditioning
+inside the resident generation profile; this component delta excludes GLB
+serialization and was observed under desktop load. Cached features live in host
+memory, so the optimization does not raise the 7 GiB native GPU floor. The web
+demo requests a 12 GiB budget for additional dense-output headroom and
+automatically falls back to available VRAM minus the runtime reserve.
 
-With the final unchanged 2048-row GEMM schedule, a controlled RTX 5060 Ti run
-of the same 30-block, 10,765-token Shape-1024 prediction measured:
+With the final unchanged 2048-row GEMM schedule, sequential RTX 5060 Ti runs
+of the same 30-block, 10,765-token Shape-1024 flow pass measured the following
+warm medians after one cold pass. These stage-only timings exclude conditioning,
+decoders, postprocessing, model loading and serialization:
 
 | Native budget | Warm median | Relative to 7 GiB | Output SHA-256 |
 |---:|---:|---:|---|
@@ -185,8 +201,11 @@ Structure, Shape-512, Shape-1024, and Texture respectively. All remain below
 `0.001`.
 
 Complete four-view generation was also validated at the 8 GB-card and 12 GiB
-target profiles on the RTX 5060 Ti. Both runs used the pinned four-view example,
-seed 42, mixed precision, 4096 textures and the one-million-triangle target.
+target profiles on the RTX 5060 Ti. Both resident mixed runs used the pinned
+four-view example, seed 42, 4096 textures and the one-million-triangle target.
+The native generation column excludes final GLB serialization. Observed wall
+times including serialization were 512.737 s and 490.727 s respectively. Other
+desktop GPU/CPU work was present, so the timings are functional observations.
 
 | Native budget | Native generation | Peak native reserved | Sampled process VRAM | Output SHA-256 |
 |---:|---:|---:|---:|---|
@@ -301,10 +320,13 @@ shape/texture subdivisions. Decoder acceptance is NRMSE <= 0.02 and cosine
 >= 0.999; guided coordinates must match exactly. Changed subdivision decisions
 must remain within 0.02 of the upstream zero threshold.
 
-Five complete 1024-cascade generations (12 steps per stage, 4096 PBR textures)
-passed GLB bounds, normals, mesh indices, nonzero triangle areas and texture
-checks. Four-view renders were inspected, including the jester's detached
-accessory geometry; numerical checks do not guarantee artifact-free geometry.
+Five earlier resident-auto 1024-cascade generations (12 steps per stage, 4096
+PBR textures) passed GLB bounds, normals, mesh indices, nonzero triangle areas
+and texture checks. Their full-invocation wall times include GLB serialization.
+Other validation work overlapped CPU postprocessing, so they are retained as
+functional coverage rather than current performance baselines. Four-view
+renders were inspected, including the jester's detached accessory geometry;
+numerical checks do not guarantee artifact-free geometry.
 
 | GPU / image / seed | Full invocation | Native reserved peak | Sampled VRAM |
 |---|---:|---:|---:|

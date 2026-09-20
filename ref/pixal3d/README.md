@@ -389,7 +389,7 @@ Completed during implementation on this host:
 | Vector rounding/residual/modulation | Exact vs PyTorch |
 | Vectorized real 10636-token flow block | Bit-identical to previous native output |
 | CPU attention across a 1024-query tile boundary | Max absolute error 1.49e-8 vs PyTorch |
-| Larger CPU attention tiles, real 10636-token block | 28.3s to 19.2s median at 16 threads under concurrent load; NRMSE 2.76e-5 vs prior native |
+| Larger CPU attention tiles, real 10636-token flow block | 28.3 s to 19.2 s warm median at 16 threads under concurrent host load; flow only, excluding conditioning, decoding, postprocessing, model loading and serialization; NRMSE 2.76e-5 vs prior native |
 | UV degenerate/unreferenced cleanup | Exact vs CuMesh |
 | Area-weighted normals with cancellation fallback | PASS on 484748 real mesh vertices |
 | FDG vertices/triangles and legacy axis mapping | PASS |
@@ -400,9 +400,29 @@ Completed during implementation on this host:
 | OpenCV 4.12 inpaint, varied holes/channels/radii | Byte-exact |
 | Geometry fixture: 1024 remesh + 4096 PBR GLB | PASS |
 
-### Full pipeline runs
+### Current resident CUDA multiview runs
 
-Recorded on 2026-09-14 (JST). All seven exported GLBs passed mesh, UV,
+The current complete-generation reference uses resident-auto execution, mixed
+precision, the pinned four-view upstream example, seed 42, 4096 textures and a
+one-million-triangle target on the RTX 5060 Ti. Desktop GPU/CPU work was present,
+so these are functional observations. The native generation timer excludes GLB
+serialization; wall time includes it.
+
+| Native budget | Generation | Wall time | Native reserved peak | Output SHA-256 |
+|---:|---:|---:|---:|---|
+| 7168 MiB | 506.207 s | 512.737 s | 7160.6 MiB | `a5a22a90...c700383` |
+| 12288 MiB | 484.915 s | 490.727 s | 8488.0 MiB | `a5a22a90...c700383` |
+
+Both outputs are byte-identical and pass mesh, normal and 4096 PBR texture
+validation with 655,071 vertices and 961,142 triangles. These runs establish
+the 8 GB-card minimum and 12 GiB target behavior; isolated Shape-1024 flow
+benchmarks are documented separately in `cpu/pixal3d/OPTIMIZATION.md`.
+
+### Historical host-offloaded full pipeline runs
+
+Recorded on 2026-09-14 (JST) with legacy host-offloaded execution. These results
+are retained to explain its bounded-VRAM/PCIe tradeoff and are not current
+resident performance claims. All seven exported GLBs passed mesh, UV,
 unit-normal and embedded 4096 PBR texture checks, and their four-view previews
 were inspected. Raw metrics, exact commands, input/export hashes and full
 checkpoint SHA256 hashes are retained in [validation-results.json](validation-results.json).
@@ -467,7 +487,8 @@ ref/pixal3d/run.sh cuda ref/pixal3d/validate_decoders.py --backend cuda --stage 
 
 `benchmark_flow_block.py` now keeps one engine and weight mapping alive across
 calls, separates load/cold/warm times, and accepts `--stage`, `--blocks 30`,
-`--tokens`, `--repeats`, `--gpu-execution`, and `--gpu-kernels`. Zero/omitted
+`--tokens`, `--repeats`, `--gpu-execution`, `--gpu-kernels`, and
+`--profile-json`. Zero/omitted
 `--tokens` uses every recorded token. Texture input includes the matching final
 normalized shape features. Compare modes with identical dumps and block counts;
 run them sequentially on each GPU. The emitted JSON lives beside the output
