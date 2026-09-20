@@ -135,7 +135,10 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
                r->stream, qa);
         void *ma[] = { &dst, &weight, &r->d_act_q8_batch,
                        &r->d_act_scale_batch, &nr, &nc, &rows };
-        LAUNCH(r->fn_qwen35_matvec_iq4xs_multi8, (nr+3)/4, 1, 1,
+        hipFunction_t iq4_fn = nc == 5120 ?
+            r->fn_qwen35_matvec_iq4xs_5120_multi8 :
+            r->fn_qwen35_matvec_iq4xs_multi8;
+        LAUNCH(iq4_fn, (nr+3)/4, 1, 1,
                128, 1, 1, 0, r->stream, ma);
     } else if (type == GGML_TYPE_Q4_K && rows > 1) {
         launch_matvec_qwen35_native_batch(r, dst, weight, x, rows, nr, nc,

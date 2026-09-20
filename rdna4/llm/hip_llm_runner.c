@@ -354,6 +354,13 @@ static const char *hip_kernel_source =
 "        (val[t+s]==val[t] && idx[t+s]<idx[t]))){val[t]=val[t+s];idx[t]=idx[t+s];}__syncthreads();}\n"
 "    if(t==0)out[row]=idx[0];\n"
 "}\n"
+"__global__ void copy_state_row_f32(float **dst, const float **src,\n"
+"        size_t elements, size_t row_stride, int row, int layers) {\n"
+"    int layer=blockIdx.y; size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;\n"
+"    size_t vectors=elements/4,stride=row_stride/4;\n"
+"    if(layer<layers && i<vectors)((uint4 *)dst[layer])[i]=\n"
+"        ((const uint4 *)src[layer])[(size_t)row*stride+i];\n"
+"}\n"
 "__global__ void hc_norm_f32(float *dst, const float *x, const float *w,\n"
 "                            int n_embd, int n_stream, float eps) {\n"
 "    int s = blockIdx.x; if (s >= n_stream) return;\n"
@@ -12763,6 +12770,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_selected_attn_i8_warp;
     hipFunction_t fn_qwen4_argmax;
     hipFunction_t fn_qwen4_argmax_batch;
+    hipFunction_t fn_copy_state_row_f32;
     hipFunction_t fn_qwen4_qsa_scores;
     hipFunction_t fn_qwen4_qsa_sort_blocks;
     hipFunction_t fn_qwen4_qsa_merge_ids;
@@ -13669,10 +13677,14 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen35_matvec_iq2xxs, fn_qwen35_matvec_iq2xs;
     hipFunction_t fn_qwen35_matvec_iq2s, fn_qwen35_matvec_iq3xxs, fn_qwen35_matvec_iq3s;
     hipFunction_t fn_qwen35_matvec_iq4xs, fn_qwen35_matvec_iq4xs_multi8;
+    hipFunction_t fn_qwen35_matvec_iq4xs_5120_multi8;
     hipFunction_t fn_qwen35_matvec_iq_multi4;
     hipFunction_t fn_qwen35_matvec_iq2xxs_multi8, fn_qwen35_matvec_iq2xs_multi8;
     hipFunction_t fn_qwen35_matvec_iq2s_multi8, fn_qwen35_matvec_iq3xxs_multi8;
     hipFunction_t fn_qwen35_matvec_iq3s_multi8;
+    hipFunction_t fn_qwen35_matvec_iq2xxs_fixed8, fn_qwen35_matvec_iq2xs_fixed8;
+    hipFunction_t fn_qwen35_matvec_iq2s_fixed8, fn_qwen35_matvec_iq3xxs_fixed8;
+    hipFunction_t fn_qwen35_matvec_iq3s_fixed8;
     hipGraph_t  graph_hidden;     /* captured forward (no lm_head) pipeline */
     hipGraphExec_t graph_exec_hidden;
     hipGraph_t hc_graph[97];
@@ -13861,6 +13873,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_selected_attn_i8_warp);
     GET_FUNC(qwen4_argmax);
     GET_FUNC(qwen4_argmax_batch);
+    GET_FUNC(copy_state_row_f32);
     GET_FUNC(qwen4_qsa_scores);
     GET_FUNC(qwen4_qsa_sort_blocks);
     GET_FUNC(qwen4_qsa_merge_ids);
@@ -17531,6 +17544,8 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                           r->iq_module, "qwen35_matvec_iq4xs"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs_multi8,
                           r->iq_module, "qwen35_matvec_iq4xs_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs_5120_multi8,
+                          r->iq_module, "qwen35_matvec_iq4xs_5120_multi8"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq_multi4,
                           r->iq_module, "qwen35_matvec_iq_multi4"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xxs_multi8,
@@ -17543,6 +17558,16 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                           r->iq_module, "qwen35_matvec_iq3xxs_multi8"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s_multi8,
                           r->iq_module, "qwen35_matvec_iq3s_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xxs_fixed8,
+                          r->iq_module, "qwen35_matvec_iq2xxs_fixed8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_fixed8,
+                          r->iq_module, "qwen35_matvec_iq2xs_fixed8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2s_fixed8,
+                          r->iq_module, "qwen35_matvec_iq2s_fixed8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3xxs_fixed8,
+                          r->iq_module, "qwen35_matvec_iq3xxs_fixed8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s_fixed8,
+                          r->iq_module, "qwen35_matvec_iq3s_fixed8"));
             }
         }
         if (options->decode_kernel_mode == HIP_LLM_DECODE_KERNEL_NATIVE) {

@@ -23,10 +23,12 @@ typedef struct hllm_qwen35_mtp {
     void *verify_ssm_qkv, *verify_ssm_z, *verify_ssm_alpha, *verify_ssm_beta, *verify_ssm_out;
     void *verify_attn_parts, *verify_attn_meta;
     void *verify_conv[128], *verify_rec[128];
+    void *verify_conv_dst_ptrs, *verify_conv_src_ptrs;
+    void *verify_rec_dst_ptrs, *verify_rec_src_ptrs;
     float *host_logits;
     hipGraph_t graphs[HLLM_DENSE_MTP_MAX_ROWS + 1];
     hipGraphExec_t executions[HLLM_DENSE_MTP_MAX_ROWS + 1];
-    int verify_capacity, verify_rows, verify_position;
+    int verify_capacity, verify_rows, verify_position, verify_ssm_layers;
 } hllm_qwen35_mtp;
 
 static void hllm_free_qwen35_mtp(hip_llm_runner *r) {
@@ -45,6 +47,8 @@ static void hllm_free_qwen35_mtp(hip_llm_runner *r) {
     DENSE_FREE(m->verify_ssm_qkv); DENSE_FREE(m->verify_ssm_z);
     DENSE_FREE(m->verify_ssm_alpha); DENSE_FREE(m->verify_ssm_beta); DENSE_FREE(m->verify_ssm_out);
     DENSE_FREE(m->verify_attn_parts); DENSE_FREE(m->verify_attn_meta);
+    DENSE_FREE(m->verify_conv_dst_ptrs); DENSE_FREE(m->verify_conv_src_ptrs);
+    DENSE_FREE(m->verify_rec_dst_ptrs); DENSE_FREE(m->verify_rec_src_ptrs);
     for (int i = 0; i < 128; ++i) {
         DENSE_FREE(m->verify_conv[i]); DENSE_FREE(m->verify_rec[i]);
     }
@@ -291,6 +295,17 @@ static hipFunction_t hllm_dense_mtp_iq_multi8(hip_llm_runner *r, int type) {
     }
 }
 
+static hipFunction_t hllm_dense_mtp_iq_fixed8(hip_llm_runner *r, int type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: return r->fn_qwen35_matvec_iq2xxs_fixed8;
+        case GGML_TYPE_IQ2_XS: return r->fn_qwen35_matvec_iq2xs_fixed8;
+        case GGML_TYPE_IQ2_S: return r->fn_qwen35_matvec_iq2s_fixed8;
+        case GGML_TYPE_IQ3_XXS: return r->fn_qwen35_matvec_iq3xxs_fixed8;
+        case GGML_TYPE_IQ3_S: return r->fn_qwen35_matvec_iq3s_fixed8;
+        default: return NULL;
+    }
+}
+
 static void hllm_dense_mtp_res_rmsnorm_batch(hip_llm_runner *r, void *x,
         void *res, void *normalized, void *weight, int width, int rows) {
     float eps = r->rms_norm_eps;
@@ -362,7 +377,10 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
                    type == GGML_TYPE_IQ4_XS) {
             void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
                            &nr, &nc, &rows };
-            LAUNCH(r->fn_qwen35_matvec_iq4xs_multi8, (nr+3)/4, 1, 1,
+            hipFunction_t iq4_fn = nc == 5120 ?
+                r->fn_qwen35_matvec_iq4xs_5120_multi8 :
+                r->fn_qwen35_matvec_iq4xs_multi8;
+            LAUNCH(iq4_fn, (nr+3)/4, 1, 1,
                    128, 1, 1, 0, r->stream, ma);
         } else if (rows <= HLLM_DENSE_MTP_REUSE_ROWS &&
                    type != GGML_TYPE_IQ4_XS &&
@@ -374,7 +392,9 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
                 LAUNCH(r->fn_qwen35_matvec_iq_multi4, (nr+3)/4, 1, 1,
                        128, 1, 1, 0, r->stream, ma);
             } else {
-                hipFunction_t multi = hllm_dense_mtp_iq_multi8(r, type);
+                hipFunction_t multi = rows == HLLM_DENSE_MTP_REUSE_ROWS ?
+                    hllm_dense_mtp_iq_fixed8(r, type) :
+                    hllm_dense_mtp_iq_multi8(r, type);
                 void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
                                &nr, &nc, &rows };
                 LAUNCH(multi, (nr+3)/4, 1, 1, 128, 1, 1, 0,
@@ -573,10 +593,31 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
             hipMalloc(&m->verify_argmax, (size_t)capacity*sizeof(int32_t))) return NULL;
         m->host_logits = malloc((size_t)capacity*r->n_vocab*sizeof(float));
         if (!m->host_logits) return NULL;
+        void *conv_dst[128], *conv_src[128], *rec_dst[128], *rec_src[128];
+        int ssm_layers = 0;
         for (int l = 0; l < r->n_layers; ++l) if (r->layers[l].is_ssm) {
             if (hipMalloc(&m->verify_conv[l], (size_t)capacity*conv) ||
                 hipMalloc(&m->verify_rec[l], (size_t)capacity*rec)) return NULL;
+            conv_dst[ssm_layers] = r->layers[l].d_conv_state;
+            conv_src[ssm_layers] = m->verify_conv[l];
+            rec_dst[ssm_layers] = r->layers[l].d_recurrent_state;
+            rec_src[ssm_layers] = m->verify_rec[l];
+            ++ssm_layers;
         }
+        size_t ptr_bytes = (size_t)ssm_layers*sizeof(void *);
+        if (hipMalloc(&m->verify_conv_dst_ptrs, ptr_bytes) ||
+            hipMalloc(&m->verify_conv_src_ptrs, ptr_bytes) ||
+            hipMalloc(&m->verify_rec_dst_ptrs, ptr_bytes) ||
+            hipMalloc(&m->verify_rec_src_ptrs, ptr_bytes) ||
+            hipMemcpyAsync(m->verify_conv_dst_ptrs, conv_dst, ptr_bytes,
+                           hipMemcpyHostToDevice, r->stream) ||
+            hipMemcpyAsync(m->verify_conv_src_ptrs, conv_src, ptr_bytes,
+                           hipMemcpyHostToDevice, r->stream) ||
+            hipMemcpyAsync(m->verify_rec_dst_ptrs, rec_dst, ptr_bytes,
+                           hipMemcpyHostToDevice, r->stream) ||
+            hipMemcpyAsync(m->verify_rec_src_ptrs, rec_src, ptr_bytes,
+                           hipMemcpyHostToDevice, r->stream)) return NULL;
+        m->verify_ssm_layers = ssm_layers;
         m->verify_capacity = capacity;
         hllm_vram_sample(r);
     }
@@ -692,10 +733,15 @@ int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed) {
     int last = processed-1;
     size_t conv = (size_t)(r->ssm_conv_kernel-1)*r->ssm_qkv_dim*sizeof(float);
     size_t rec = (size_t)r->ssm_dt_rank*r->ssm_d_state*r->ssm_d_state*sizeof(float);
-    for (int l = 0; l < r->n_layers; ++l) if (r->layers[l].is_ssm) {
-        if (hipMemcpyAsync(r->layers[l].d_conv_state,(char *)m->verify_conv[l]+(size_t)last*conv,conv,hipMemcpyDeviceToDevice,r->stream) ||
-            hipMemcpyAsync(r->layers[l].d_recurrent_state,(char *)m->verify_rec[l]+(size_t)last*rec,rec,hipMemcpyDeviceToDevice,r->stream)) return -1;
-    }
+    size_t conv_elements = conv/sizeof(float), rec_elements = rec/sizeof(float);
+    void *conv_args[] = { &m->verify_conv_dst_ptrs, &m->verify_conv_src_ptrs,
+        &conv_elements, &conv_elements, &last, &m->verify_ssm_layers };
+    void *rec_args[] = { &m->verify_rec_dst_ptrs, &m->verify_rec_src_ptrs,
+        &rec_elements, &rec_elements, &last, &m->verify_ssm_layers };
+    LAUNCH(r->fn_copy_state_row_f32, (conv_elements/4+255)/256,
+           m->verify_ssm_layers, 1, 256, 1, 1, 0, r->stream, conv_args);
+    LAUNCH(r->fn_copy_state_row_f32, (rec_elements/4+255)/256,
+           m->verify_ssm_layers, 1, 256, 1, 1, 0, r->stream, rec_args);
     r->cur_position = m->verify_position+last;
     if (hipMemcpyAsync(r->d_x,(float *)m->verify_x+(size_t)last*r->n_embd,(size_t)r->n_embd*sizeof(float),hipMemcpyDeviceToDevice,r->stream) ||
         hipMemcpyAsync(r->d_logits,(float *)m->verify_logits+(size_t)last*r->n_vocab,(size_t)r->n_vocab*sizeof(float),hipMemcpyDeviceToDevice,r->stream) ||
