@@ -3519,3 +3519,58 @@ writes small logs and hashes under `tmp/qwen38_q4_kquant_tp4_$PJM_JOBID`.
 `run_qwen38_q4_tp4.sh` also exposes `kquant-plan`, `kquant-stage`, and
 `kquant-check`; setting `TP_KQUANT_STAGE_DIR` on a decode mode is translated
 to the runner's explicit `--kquant-stage` argument.
+
+### TP4 physical staging and Q5R token-gate rejection
+
+Four-node job `51815999` completed physical compact/sidecar staging and strict
+validation on all TP4 ranks.  Each rank produced the planned 866-entry,
+5,757,905,920-byte compact stage and 390-entry, 7,809,826,816-byte sidecar.
+Full payload validation took 31.056--32.304 seconds:
+
+```text
+SENTINEL qwen38_kquant_check=OK rank=0/4 entries=390 file_bytes=7809826816 seconds=31.056
+SENTINEL qwen38_kquant_check=OK rank=1/4 entries=390 file_bytes=7809826816 seconds=32.304
+SENTINEL qwen38_kquant_check=OK rank=2/4 entries=390 file_bytes=7809826816 seconds=32.137
+SENTINEL qwen38_kquant_check=OK rank=3/4 entries=390 file_bytes=7809826816 seconds=32.123
+```
+
+`MemAvailable` remained 31.34--31.58 GB after compact staging and
+31.35--31.53 GB after sidecar validation, confirming that staging and hashing
+remained bounded and evicted their file pages.  The full Q5R+IQ4R anonymous
+materialization then reported
+`MemAvailable=16.85--17.07GB` and took 42.0--46.4 seconds.  Every rank printed
+`prepared 390 tensors` and `decode attach OK entries=390`.
+
+The full cache is a clear speed win but fails the non-negotiable long token
+gate.  At 128 generated tokens compact and cached output were byte-identical
+with SHA-256
+`71be3f6ecc65e1433ae5457412c11a7e161ad16032f1d52344a107d7ea76ac4c`;
+decode rose from 11.73 to 25.40 tok/s.  At 256 tokens compact measured 11.76
+tok/s and full cache measured 25.22 tok/s, but the streams diverged at token
+17 (`5f4604...` compact versus `82ce0f...` cached).  This is the expected risk
+from Q5R's small accumulation-order differences and is a gate failure, not an
+acceptable tolerance.
+
+An exact Q5R experiment retained raw FP16 block multipliers and replayed the
+compact worker's four-row accumulation schedule.  It was bit-identical on the
+focused patterns and real layer-0 tensors, but was slower than compact and was
+rejected: `ffn_up` took 1.776 ms versus 1.044 ms compact A8, and `ffn_down`
+took 1.420 ms versus 0.830 ms.  The version-1 sidecar layout therefore remains
+unchanged.
+
+Q5R is now disabled by default.  `--kquant-stage DIR` validates the complete
+sidecar but materializes and attaches only the 65 exact IQ4R entries (about
+1.54 GB per TP4 rank); `--kquant-q5` is an explicit diagnostic opt-in for the
+rejected full-cache behavior.  The launcher exposes the latter only through
+`TP_KQUANT_Q5=1`.  The acceptance job labels its default results
+`cached_iq4_128` and `cached_iq4_256` and still requires byte-for-byte token
+files.  A fresh four-node run of that IQ4-only gate remains required before
+promotion.
+
+The native-node focused revalidation after this safety change used repo-local
+compiler/test scratch and passed:
+
+```text
+SENTINEL qwen38_kquant_cache=OK layout_version=1 q5r_bytes=8960 iq4r_bytes=8704 ownership_threads=3 tail_fallback=1 q5_default_skip=1 attach_detach=1
+SENTINEL qwen38_kquant_stage=OK entries=2 q5r=2240 iq4r=2176 reuse=1 corrupt_rebuild=1 loader_rejects=9
+```

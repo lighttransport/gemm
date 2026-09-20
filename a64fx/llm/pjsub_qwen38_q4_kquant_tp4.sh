@@ -30,6 +30,9 @@ export TP_MAXSEQ=512 TP_DUMP_TOKENS=1
 # Q5R/IQ4R retain the established compact-A8 activation quantizer.  Compare
 # against that exact compact-weight baseline, not the separate FP32-x kernel.
 export TF_KQUANT_A8=1
+# Q5R remains diagnostic-only because the full-cache run failed the 256-token
+# greedy gate.  The default cache path materializes and attaches exact IQ4R.
+export TP_KQUANT_Q5=0
 mkdir -p "$COMPILER_TMP"
 export TMPDIR=$COMPILER_TMP
 
@@ -79,20 +82,21 @@ for tokens in 128 256; do
     TP_MAXGEN=$tokens bash ./run_qwen38_q4_tp4.sh bench
     save_run compact_$tokens
 
-    echo "=== cached decode $tokens: $(date) ==="
+    echo "=== IQ4R cached decode $tokens: $(date) ==="
     TP_MAXGEN=$tokens TP_KQUANT_STAGE_DIR=$KQUANT_STAGE \
         bash ./run_qwen38_q4_tp4.sh bench
-    save_run cached_$tokens
+    save_run cached_iq4_$tokens
 
     cmp -s "$RESULT/compact_$tokens/tp_tokens_rank00.txt" \
-           "$RESULT/cached_$tokens/tp_tokens_rank00.txt"
+           "$RESULT/cached_iq4_$tokens/tp_tokens_rank00.txt"
 done
 
 record_memory final
 sha256sum "$RESULT"/compact_*/tp_tokens_rank00.txt \
-          "$RESULT"/cached_*/tp_tokens_rank00.txt \
+          "$RESULT"/cached_iq4_*/tp_tokens_rank00.txt \
     | tee "$RESULT/token-hashes.txt"
 grep -hE 'decode\(|kquant decode cache attached|kquant_stage:' \
-    "$RESULT"/cached_*/tp_run_*.txt "$RESULT"/cached_*/tp_stderr_rank*.txt \
+    "$RESULT"/cached_iq4_*/tp_run_*.txt \
+    "$RESULT"/cached_iq4_*/tp_stderr_rank*.txt \
     | tee "$RESULT/summary.txt"
 echo "SENTINEL qwen38_q4_kquant_tp4=OK result=$RESULT $(date)"

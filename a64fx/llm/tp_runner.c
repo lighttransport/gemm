@@ -1267,13 +1267,16 @@ static double tp_local_weight_bytes(const transformer_model *m) {
 int main(int argc, char **argv) {
     int rc;
     if (argc != 2 &&
-        !(argc == 4 && !strcmp(argv[2], "--kquant-stage"))) {
-        fprintf(stderr, "usage: %s <model-shard1.gguf> [--kquant-stage DIR]\n",
+        !(argc == 4 && !strcmp(argv[2], "--kquant-stage")) &&
+        !(argc == 5 && !strcmp(argv[2], "--kquant-stage") &&
+          !strcmp(argv[4], "--kquant-q5"))) {
+        fprintf(stderr, "usage: %s <model-shard1.gguf> [--kquant-stage DIR [--kquant-q5]]\n",
                 argv[0]);
         return 1;
     }
     const char *model_path = argv[1];
-    const char *kquant_stage_dir = argc == 4 ? argv[3] : "";
+    const char *kquant_stage_dir = argc >= 4 ? argv[3] : "";
+    int kquant_enable_q5 = argc == 5;
     const char *prompt_env = envs("TP_PROMPT", "Hello, who are you?");
     const char *prompt_file = envs("TP_PROMPT_FILE", "");
     char *prompt_file_text = NULL;
@@ -1743,6 +1746,7 @@ int main(int argc, char **argv) {
         int local_ready = tp_stage_dir[0] &&
             q38kc_model_prepare(&kquant_cache, m, tp_stage_dir,
                                 kquant_stage_dir, MyRank, N,
+                                kquant_enable_q5,
                                 error, sizeof(error)) == 0;
         double kc1 = now_sec();
         float ready_votes = local_ready ? 1.0f : 0.0f;
@@ -1750,10 +1754,11 @@ int main(int argc, char **argv) {
         if ((int)(ready_votes + 0.5f) == N) {
             kquant_prepared = 1;
             fprintf(stderr,
-                    "kquant_stage: rank %d prepared %u tensors %.3f GB in %.3f s MemAvailable=%.2fGB\n",
-                    MyRank, kquant_cache.loaded.header->n_entries,
+                    "kquant_stage: rank %d prepared %u tensors %.3f/%.3f GB in %.3f s MemAvailable=%.2fGB q5=%d\n",
+                    MyRank, kquant_cache.materialized_entries,
+                    (double)kquant_cache.materialized_bytes / 1e9,
                     (double)kquant_cache.loaded.mapping_bytes / 1e9,
-                    kc1 - kc0, tf_mem_available_gb());
+                    kc1 - kc0, tf_mem_available_gb(), kquant_enable_q5);
         } else {
             if (local_ready) q38kc_model_close(&kquant_cache, m);
             fprintf(stderr,
@@ -2104,8 +2109,8 @@ int main(int argc, char **argv) {
                     "kquant_stage: rank %d decode attach OK entries=%u\n",
                     MyRank, kquant_cache.attached_entries);
             if (is_first)
-                logmsg("kquant decode cache attached after compact prefill: entries=%u\n",
-                       kquant_cache.attached_entries);
+                logmsg("kquant decode cache attached after compact prefill: entries=%u q5=%d\n",
+                       kquant_cache.attached_entries, kquant_enable_q5);
         } else {
             if (local_attached) q38kc_model_detach(&kquant_cache, m);
             q38kc_model_close(&kquant_cache, m);

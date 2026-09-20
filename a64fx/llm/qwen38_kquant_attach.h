@@ -18,7 +18,10 @@
 
 typedef struct {
     q38kc_loaded loaded;
+    uint64_t materialized_bytes;
+    uint32_t materialized_entries;
     uint32_t attached_entries;
+    int enable_q5;
 } q38kc_model_cache;
 
 typedef struct {
@@ -27,6 +30,7 @@ typedef struct {
     const q38kc_header *header;
     int tid;
     int threads;
+    int enable_q5;
     int failed;
 } q38kc_materialize_task;
 
@@ -60,6 +64,8 @@ static void *q38kc_materialize_worker(void *argument) {
     const size_t chunk_max = 8u * 1024u * 1024u;
     for (uint32_t i = 0; i < task->header->n_entries; i++) {
         const q38kc_entry *entry = &task->header->entries[i];
+        if (entry->source_type == GGML_TYPE_Q5_K && !task->enable_q5)
+            continue;
         uint64_t groups = entry->local_rows / TF_KQUANT_CACHE_ROWS;
         uint64_t group_bytes = groups ? entry->byte_length / groups : 0;
         uint64_t group0 = groups * (uint64_t)task->tid /
@@ -91,8 +97,17 @@ static int q38kc_model_materialize(q38kc_model_cache *cache,
                                    const char *path,
                                    char *error, size_t error_bytes) {
     size_t bytes = cache->loaded.mapping_bytes;
+    uint64_t materialized_bytes = Q38KC_HEADER_BYTES;
+    uint32_t materialized_entries = 0;
+    for (uint32_t i = 0; i < cache->loaded.header->n_entries; i++) {
+        const q38kc_entry *entry = &cache->loaded.header->entries[i];
+        if (entry->source_type != GGML_TYPE_Q5_K || cache->enable_q5) {
+            materialized_bytes += entry->byte_length;
+            materialized_entries++;
+        }
+    }
     double available = tf_mem_available_gb();
-    double required = (double)bytes / 1e9 + 3.0;
+    double required = (double)materialized_bytes / 1e9 + 3.0;
     if (available >= 0.0 && available < required)
         return q38kc_model_error(error, error_bytes,
                                   "insufficient HBM: %.2f GB available, %.2f GB required",
@@ -116,7 +131,8 @@ static int q38kc_model_materialize(q38kc_model_cache *cache,
         (q38kc_materialize_task *)alloca((size_t)threads * sizeof(*tasks));
     for (int tid = 0; tid < threads; tid++)
         tasks[tid] = (q38kc_materialize_task){
-            fd, anonymous, cache->loaded.header, tid, threads, 0
+            fd, anonymous, cache->loaded.header, tid, threads,
+            cache->enable_q5, 0
         };
     if (!failed) {
         if (threads > 1)
@@ -142,6 +158,8 @@ static int q38kc_model_materialize(q38kc_model_cache *cache,
     }
     munmap(cache->loaded.mapping, cache->loaded.mapping_bytes);
     cache->loaded.mapping = anonymous;
+    cache->materialized_bytes = materialized_bytes;
+    cache->materialized_entries = materialized_entries;
     return 0;
 }
 
@@ -149,12 +167,13 @@ static int q38kc_model_prepare(q38kc_model_cache *cache,
                                transformer_model *model,
                                const char *compact_dir,
                                const char *cache_dir,
-                               int rank, int size,
+                               int rank, int size, int enable_q5,
                                char *error, size_t error_bytes) {
     if (!cache || !model || !compact_dir || !*compact_dir ||
         !cache_dir || !*cache_dir || rank < 0 || size <= 1)
         return q38kc_model_error(error, error_bytes, "invalid cache arguments");
     memset(cache, 0, sizeof(*cache));
+    cache->enable_q5 = enable_q5 != 0;
 
     char compact_path[PATH_MAX], cache_path[PATH_MAX];
     int n0 = snprintf(compact_path, sizeof(compact_path),
@@ -188,6 +207,8 @@ static int q38kc_model_prepare(q38kc_model_cache *cache,
 
     for (uint32_t i = 0; i < cache->loaded.header->n_entries; i++) {
         const q38kc_entry *entry = &cache->loaded.header->entries[i];
+        if (entry->source_type == GGML_TYPE_Q5_K && !cache->enable_q5)
+            continue;
         qtensor *tensor = tf_tp_stage_tensor(model, entry->name);
         if (!tensor || !tensor->data || tensor->type != entry->source_type ||
             tensor->n_rows != (int)entry->local_rows ||
@@ -222,6 +243,8 @@ static int q38kc_model_attach(q38kc_model_cache *cache,
     /* Validate the complete mapping first so attachment is all-or-nothing. */
     for (uint32_t i = 0; i < cache->loaded.header->n_entries; i++) {
         const q38kc_entry *entry = &cache->loaded.header->entries[i];
+        if (entry->source_type == GGML_TYPE_Q5_K && !cache->enable_q5)
+            continue;
         qtensor *tensor = tf_tp_stage_tensor(model, entry->name);
         if (!tensor || tensor->type != entry->source_type ||
             tensor->n_rows != (int)entry->local_rows ||
@@ -232,12 +255,18 @@ static int q38kc_model_attach(q38kc_model_cache *cache,
     }
     for (uint32_t i = 0; i < cache->loaded.header->n_entries; i++) {
         const q38kc_entry *entry = &cache->loaded.header->entries[i];
+        if (entry->source_type == GGML_TYPE_Q5_K && !cache->enable_q5)
+            continue;
         qtensor *tensor = tf_tp_stage_tensor(model, entry->name);
         tensor->kquant_cache =
             (uint8_t *)cache->loaded.mapping + entry->file_offset;
         tensor->kquant_cache_format = entry->cache_format;
     }
-    cache->attached_entries = cache->loaded.header->n_entries;
+    cache->attached_entries = 0;
+    for (uint32_t i = 0; i < cache->loaded.header->n_entries; i++)
+        if (cache->enable_q5 ||
+            cache->loaded.header->entries[i].source_type != GGML_TYPE_Q5_K)
+            cache->attached_entries++;
     return 0;
 }
 

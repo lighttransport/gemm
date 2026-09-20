@@ -90,6 +90,9 @@ case "$MODE" in
         runner_args=("$MODEL")
         if [ -n "$KQUANT_STAGE" ]; then
             runner_args+=(--kquant-stage "$KQUANT_STAGE")
+            if [ "${TP_KQUANT_Q5:-0}" != 0 ]; then
+                runner_args+=(--kquant-q5)
+            fi
         fi
         exec mpiexec -np "$TP_SIZE" "$RUNNER" "${runner_args[@]}"
         ;;

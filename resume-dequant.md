@@ -114,13 +114,11 @@ loader into the TP runner and persistent-pool dispatch without weakening those
 checks.
 
 No real compact `rank00.blob` was present under `/local/u14346` during the
-sidecar-builder milestone. A later bounded rank-0 run built and checked the
-real mixed-Q4 artifact. All four TP4 metadata plans are symmetric: 866
-compact entries, a 5.758 GB compact file, 390 cache entries, a 7.810 GB
-sidecar, and 13.568 GB combined files per rank. Rank 0 produced exact file
-sizes of `5,757,905,920` and `7,809,826,816` bytes. Full payload validation
-passed in 31.635 seconds, builder reuse passed, and `MemAvailable` remained
-about 30.8 GB. Ranks 1--3 still require physical builds on their own nodes.
+sidecar-builder milestone. Later bounded runs built and checked the real
+mixed-Q4 artifact on all four TP4 nodes. All ranks have 866 compact entries, a
+5,757,905,920-byte compact file, 390 cache entries, and a 7,809,826,816-byte
+sidecar. Job 51815999 validated every payload in 31.056--32.304 seconds per
+rank while leaving `MemAvailable` at about 31.3--31.5 GB after staging.
 
 The decode-only runtime attachment is now implemented. `tp_runner` accepts
 `--kquant-stage DIR`; every rank validates its local compact identity and all
@@ -135,8 +133,12 @@ the source pages. This makes the sidecar resident before decode and preserves
 CMG-local first touch.
 Synthetic coverage includes uneven three-worker ownership, unaligned ranged
 dispatch, a 15-row compact fallback, invalid format rejection, and model
-attach/detach. Fujitsu builds of the focused test and full runner pass; the
-multi-node token and performance gates have not run yet.
+attach/detach. Fujitsu builds of the focused test and full runner pass. The
+full Q5R+IQ4R TP4 path reached 25.40 tok/s versus 11.73 compact and matched 128
+tokens, but failed the 256-token gate at token 17. An exact Q5R scheduling
+experiment was slower than compact and was rejected. Q5R is therefore skipped
+by default and available only through explicit `--kquant-q5`; the default
+validated sidecar path materializes and attaches only exact IQ4R entries.
 
 ## Constraints and safety rules
 
@@ -161,32 +163,27 @@ multi-node token and performance gates have not run yet.
 
 ## Remaining work, in order
 
-1. **Complete real staging on all TP4 nodes.** Rank 0 is built and fully hash-
-   validated; metadata plans cover ranks 0--3. On a four-node allocation, build
-   the compact stage and sidecar locally on ranks 1--3, run
-   `qwen38_kquant_check` on every rank, and record validation time plus
-   `MemAvailable`. Do not copy rank 0's `/local` files between nodes. The full
-   gate is scripted by `a64fx/llm/pjsub_qwen38_q4_kquant_tp4.sh`; submit it from
-   a login node with `pjsub --no-check-directory` because the current one-node
-   compute allocation cannot request additional nodes.
+1. **Run the IQ4-only correctness gate on TP4.** Re-run
+   `a64fx/llm/pjsub_qwen38_q4_kquant_tp4.sh` on four clean nodes. The updated
+   job explicitly keeps `TP_KQUANT_Q5=0`, labels results `cached_iq4_128` and
+   `cached_iq4_256`, and requires byte-identical token files at both lengths.
+   Confirm each rank reports `prepared 65 tensors` and post-prefill
+   `decode attach OK entries=65`.
 
-2. **Run the integrated smoke test on TP4.** Use the explicit
-   `--kquant-stage` argument with all four local compact/sidecar pairs. Confirm
-   every rank reports `prepared` before prefill and `decode attach OK` after
-   prefill. Exercise one missing/corrupt sidecar on a disposable synthetic or
-   staged copy and confirm the all-rank vote selects compact fallback. Do not
-   corrupt the validated rank artifacts.
+2. **Complete fallback acceptance.** Exercise one missing/corrupt sidecar on a
+   disposable synthetic or staged copy and confirm the all-rank vote selects
+   compact fallback. Do not corrupt the validated rank artifacts.
 
-3. **Run correctness acceptance.** Use the same prompt and settings for compact
-   and cached paths. Require exact token hashes at 128 and 256 generated tokens.
-   Also retain the isolated multi-pattern tests so an end-to-end pass cannot
-   conceal a tensor-level regression.
+3. **Keep Q5R quarantined.** The fast layout is useful only as an explicit
+   diagnostic until a new implementation is both faster than compact and
+   passes exact 128/256-token hashes. Do not waive the failed token gate or
+   promote the slower exact scheduling experiment.
 
-4. **Measure and document.** On clean nodes record load/stage timings, peak
-   and steady memory, forward/decode timing, total tok/s, and per-rank storage.
-   Add the exact multi-node commands and representative output to `qwen-q8.md`,
-   run `git diff --check`, commit only focused follow-up files, and report the
-   hash. Do not push.
+4. **Measure and document the promoted IQ4 path.** Record its sidecar-load
+   time, peak/steady memory, forward/decode timing, total tok/s, and per-rank
+   resident bytes. Add representative output to `qwen-q8.md`, run
+   `git diff --check`, commit only focused follow-up files, and report the hash.
+   Do not push.
 
 ## Revalidation commands
 
@@ -235,18 +232,22 @@ first, inspect git status/diffs, and preserve every unrelated dirty-worktree
 change. The exact layouts, kernel tests, versioned Q38KQC1 sidecar builder,
 strict loader, explicit `tp_runner --kquant-stage DIR` attachment, all-rank
 fallback votes, decode-only activation, and persistent eight-row ownership are
-implemented. Real rank 0 is built and hash-validated; metadata plans cover all
-four symmetric TP4 ranks. Revalidate the focused tests, then continue at the
-first unfinished item: physically stage and check ranks 1--3 in a four-node
-allocation by submitting `a64fx/llm/pjsub_qwen38_q4_kquant_tp4.sh` from a
-Fugaku login node. That job also runs the integrated TP4 smoke test.
+implemented. Job 51815999 physically built and hash-validated all four TP4
+ranks. The full Q5R+IQ4R path matched 128 tokens and reached 25.40 tok/s versus
+11.73 compact, but failed the 256-token gate at token 17. The exact Q5R
+scheduling experiment was slower than compact, so Q5R is now explicit
+diagnostic opt-in only. Revalidate the focused tests, then continue at the
+first unfinished item: run the updated IQ4-only 128/256-token gate in a fresh
+four-node allocation and record its `prepared 65 tensors`/`decode attach OK
+entries=65` diagnostics, memory, load time, and throughput.
 
 Do not create a full single-node additive cache. Plan real per-rank memory
 before conversion, use bounded I/O and /local/u14346/codex-research, preserve
 compact prefill/fallback, and verify the `prepared`/post-prefill `decode attach
 OK` diagnostics on every rank. common/transformer.h may retain unrelated user
 edits, so never overwrite or stage them. Require exact 128/256-token compact
-versus cached greedy hashes plus clean-node sidecar-load, memory, bandwidth, and
-tok/s evidence. Update qwen-q8.md, commit only focused files, report the commit
+versus IQ4R greedy hashes plus clean-node sidecar-load, memory, bandwidth, and
+tok/s evidence. Keep Q5R disabled unless a faster exact implementation passes
+the same gates. Update qwen-q8.md, commit only focused files, report the commit
 hash, and do not push.
 ```

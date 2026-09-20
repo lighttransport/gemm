@@ -96,6 +96,33 @@ static void reference_a8(float *dst, uint32_t type, const void *weights,
     }
 }
 
+static void compact_a8(float *q5_dst, float *iq4_dst,
+                       const block_q5_K *q5, const block_iq4_xs *iq4,
+                       const float *x) {
+    const int nb = TEST_COLS / 256;
+#pragma omp parallel
+    {
+        int tid = omp_get_thread_num(), threads = omp_get_num_threads();
+        int row0 = TEST_ROWS * tid / threads;
+        int row1 = TEST_ROWS * (tid + 1) / threads;
+        tf_kquant_a8_block qx[TEST_COLS / 256];
+        tf_kquant_quant_a8(qx, x, TEST_COLS);
+        int row = row0;
+        for (; row + 3 < row1; row += 4) {
+            const block_q5_K *w = q5 + (size_t)row * nb;
+            tf_q5_k_a8_dot4_sve(q5_dst + row, w, w + nb, w + 2 * nb,
+                                w + 3 * nb, qx, nb);
+        }
+        for (; row < row1; row++)
+            q5_dst[row] = tf_q5_k_a8_dot_sve(
+                q5 + (size_t)row * nb, qx, nb);
+        for (row = row0; row < row1; row++) {
+            iq4_dst[row] = tf_iq4_xs_a8_dot_sve(
+                iq4 + (size_t)row * nb, qx, nb);
+        }
+    }
+}
+
 int main(void) {
     const int nb = TEST_COLS / 256;
     size_t compact_blocks = (size_t)TEST_ROWS * nb;
@@ -108,6 +135,7 @@ int main(void) {
     float *x = aligned_alloc(256, TEST_COLS * sizeof(*x));
     float native_q5[TEST_ROWS], packed_q5[TEST_ROWS];
     float native_iq4[TEST_ROWS], packed_iq4[TEST_ROWS];
+    float compact_q5_a8[TEST_ROWS], compact_iq4_a8[TEST_ROWS];
     float ranged_q5[TEST_ROWS], ranged_iq4[TEST_ROWS];
     float owned_q5[TEST_ROWS], owned_iq4[TEST_ROWS];
     float tail_q5[TEST_ROWS], tail_reference[TEST_ROWS];
@@ -132,6 +160,7 @@ int main(void) {
         kquant_cache_quant_a8(qx, x, TEST_COLS);
         reference_a8(native_q5, GGML_TYPE_Q5_K, q5, qx);
         reference_a8(native_iq4, GGML_TYPE_IQ4_XS, iq4, qx);
+        compact_a8(compact_q5_a8, compact_iq4_a8, q5, iq4, x);
         if (run_packed_q5r(packed_q5, q5r, x, TEST_ROWS, TEST_COLS) ||
             run_packed_iq4r(packed_iq4, iq4r, x, TEST_ROWS, TEST_COLS)) {
             fprintf(stderr, "matvec failed\n");
@@ -203,16 +232,28 @@ int main(void) {
             return 1;
         }
         double q5_nrmse, q5_max, iq4_nrmse, iq4_max;
+        double q5_compact_nrmse, q5_compact_max;
+        double iq4_compact_nrmse, iq4_compact_max;
         if (compare(packed_q5, native_q5, 2e-5f, 0, &q5_nrmse, &q5_max) ||
-            compare(packed_iq4, native_iq4, 2e-5f, 0, &iq4_nrmse, &iq4_max)) {
+            compare(packed_iq4, native_iq4, 2e-5f, 0, &iq4_nrmse, &iq4_max) ||
+            compare(packed_q5, compact_q5_a8, 2e-5f, 0,
+                    &q5_compact_nrmse, &q5_compact_max) ||
+            compare(packed_iq4, compact_iq4_a8, 0.0f, 1,
+                    &iq4_compact_nrmse, &iq4_compact_max)) {
             fprintf(stderr, "pattern=%d mismatch q5_nrmse=%.3g q5_max=%.3g "
-                    "iq4_nrmse=%.3g iq4_max=%.3g\n",
-                    pattern, q5_nrmse, q5_max, iq4_nrmse, iq4_max);
+                    "iq4_nrmse=%.3g iq4_max=%.3g q5_compact_nrmse=%.3g "
+                    "q5_compact_max=%.3g iq4_compact_nrmse=%.3g "
+                    "iq4_compact_max=%.3g\n",
+                    pattern, q5_nrmse, q5_max, iq4_nrmse, iq4_max,
+                    q5_compact_nrmse, q5_compact_max,
+                    iq4_compact_nrmse, iq4_compact_max);
             return 1;
         }
         printf("pattern=%d q5_nrmse=%.3g q5_max=%.3g "
-               "iq4_nrmse=%.3g iq4_max=%.3g\n",
-               pattern, q5_nrmse, q5_max, iq4_nrmse, iq4_max);
+               "iq4_nrmse=%.3g iq4_max=%.3g q5_compact_nrmse=%.3g "
+               "q5_compact_max=%.3g iq4_compact_exact=1\n",
+               pattern, q5_nrmse, q5_max, iq4_nrmse, iq4_max,
+               q5_compact_nrmse, q5_compact_max);
     }
     qtensor bad = {.type = GGML_TYPE_Q5_K, .n_rows = TEST_ROWS,
                    .n_cols = TEST_COLS, .kquant_cache = q5r,
@@ -243,6 +284,15 @@ int main(void) {
     char attach_error[128] = {0};
     if (q38kc_model_attach(&attach_cache, &attach_model,
                            attach_error, sizeof(attach_error)) ||
+        attach_layer.ffn_gate.kquant_cache ||
+        attach_layer.ffn_gate.kquant_cache_format ||
+        attach_cache.attached_entries) {
+        fprintf(stderr, "default Q5 skip failed: %s\n", attach_error);
+        return 1;
+    }
+    attach_cache.enable_q5 = 1;
+    if (q38kc_model_attach(&attach_cache, &attach_model,
+                           attach_error, sizeof(attach_error)) ||
         attach_layer.ffn_gate.kquant_cache != q5r ||
         attach_layer.ffn_gate.kquant_cache_format != Q38KC_FORMAT_Q5R ||
         attach_cache.attached_entries != 1) {
@@ -256,7 +306,7 @@ int main(void) {
         fprintf(stderr, "model cache detach failed\n");
         return 1;
     }
-    printf("SENTINEL qwen38_kquant_cache=OK layout_version=%d q5r_bytes=%zu iq4r_bytes=%zu ownership_threads=3 tail_fallback=1 attach_detach=1\n",
+    printf("SENTINEL qwen38_kquant_cache=OK layout_version=%d q5r_bytes=%zu iq4r_bytes=%zu ownership_threads=3 tail_fallback=1 q5_default_skip=1 attach_detach=1\n",
            TF_KQUANT_CACHE_LAYOUT_VERSION, q5r_size, iq4r_size);
     free(x);
     free(iq4r);
