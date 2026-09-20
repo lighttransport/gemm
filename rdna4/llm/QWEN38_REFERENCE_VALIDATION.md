@@ -91,11 +91,12 @@ timing is explicitly marked in the result; it is not a new measurement.
 - Sampler: **13,801,002** exact token/candidate/logit/probability comparisons
   against libllama, including sorting ties, disabled top-k, non-neutral
   penalties, clone/reset, multiple seeds and the 248,320-token vocabulary.
-- Q8/Q8 attention: **39,536,640** bitwise comparisons against the actual HIP
+- Q8/Q8 attention: **46,743,552** bitwise comparisons against the actual HIP
   reference kernels, including zero inputs, 127/128/129, 255/256/257,
   511/512/513, 4096/4097/8192, 1..32 splits and device-side split selection.
   Includes prefill batches of 2, 7 and 512 queries against the two-column
-  reference kernel, with causal masking and nonzero prefix positions.
+  reference kernel, plus shared-cache verifier batches and matching split
+  schedules at 64K, with causal masking and nonzero prefix positions.
 - RMSNorm: **62,145,280** bitwise comparisons, weighted and unweighted.
 - Convolution/SiLU: **5,712,768** bitwise comparisons with recurrent history.
 - Q2_K: **402,432** bitwise activation-quantization checks and **95,364**
@@ -103,10 +104,11 @@ timing is explicitly marked in the result; it is not a new measurement.
   inputs and the model's 5120/6144/17408-column shapes. Reproduce with
   `test_reference_q2k.py --llama tmp/qwen38/reference-build/source --out tmp/qwen38/reference-q2k`,
   then run `tmp/qwen38/reference-q2k/test` with the ROCm library path.
-  The expanded test also covers IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S with
-  32/64/128/256-thread launches and both Q2_K schedules:
-  **2,515,200** activation checks and **3,950,820** output comparisons
-  across all six types, including 17408-row Q2_K projections.
+  The expanded test also covers IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and
+  IQ4_XS with scalar, shared-row and fixed-eight schedules:
+  **2,948,352** activation checks and **13,191,360** output comparisons
+  across Q2_K and six IQ types, including fixed-eight verifier projections,
+  IQ4_XS, and 17408-row Q2_K projections.
   Representative 5120x17408 IQ2_S/IQ3_XXS kernels
   take 46.3/53.6 microseconds versus 88.7/93.2 for the pinned reference.
   IQ2_XXS/IQ2_XS take 49.3/52.6 microseconds versus 88.0/88.0; test log:

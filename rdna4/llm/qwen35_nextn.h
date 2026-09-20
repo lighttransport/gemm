@@ -358,20 +358,28 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
         }
         void *a[] = { &dst, &w, &m->verify_q, &m->verify_scales, &nr, &nc };
         if (type == GGML_TYPE_Q2_K) {
-            int first = rows <= HLLM_DENSE_MTP_SMALL_REUSE_ROWS ? rows :
-                HLLM_DENSE_MTP_SMALL_REUSE_ROWS;
-            void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
-                           &nr, &nc, &first };
-            LAUNCH(fn, (nr+3)/4, 1, 1, 128, 1, 1, 0, r->stream, ma);
-            if (rows > first) {
-                int tail = rows - first;
-                void *tail_dst = (float *)dst + (size_t)first*nr;
-                void *tail_q = (signed char *)m->verify_q + (size_t)first*nc;
-                void *tail_scales = (float *)m->verify_scales +
-                    (size_t)first*(nc/32);
-                void *ta[] = { &tail_dst, &w, &tail_q, &tail_scales,
-                               &nr, &nc, &tail };
-                LAUNCH(fn, (nr+3)/4, 1, 1, 128, 1, 1, 0, r->stream, ta);
+            if (rows == HLLM_DENSE_MTP_REUSE_ROWS) {
+                void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
+                               &nr, &nc, &rows };
+                LAUNCH(r->fn_qwen35_matvec_q2k_fixed8, (nr+3)/4, 1, 1,
+                       128, 1, 1, 0, r->stream, ma);
+            } else {
+                int first = rows <= HLLM_DENSE_MTP_SMALL_REUSE_ROWS ? rows :
+                    HLLM_DENSE_MTP_SMALL_REUSE_ROWS;
+                void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
+                               &nr, &nc, &first };
+                LAUNCH(fn, (nr+3)/4, 1, 1, 128, 1, 1, 0, r->stream, ma);
+                if (rows > first) {
+                    int tail = rows - first;
+                    void *tail_dst = (float *)dst + (size_t)first*nr;
+                    void *tail_q = (signed char *)m->verify_q +
+                        (size_t)first*nc;
+                    void *tail_scales = (float *)m->verify_scales +
+                        (size_t)first*(nc/32);
+                    void *ta[] = { &tail_dst, &w, &tail_q, &tail_scales,
+                                   &nr, &nc, &tail };
+                    LAUNCH(fn, (nr+3)/4, 1, 1, 128, 1, 1, 0, r->stream, ta);
+                }
             }
         } else if (rows > HLLM_DENSE_MTP_SMALL_REUSE_ROWS &&
                    type == GGML_TYPE_IQ4_XS) {

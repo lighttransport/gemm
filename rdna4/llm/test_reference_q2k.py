@@ -147,12 +147,12 @@ int main() {
         }
         }
 
-        if(kind<=5 && pattern==0) {
+        if(kind<=6 && pattern==0 && (kind!=6 || cols==5120)) {
             signed char *mq; float *ms,*mo,*mr;
-            CHECK(hipMalloc(&mq,4*cols));CHECK(hipMalloc(&ms,4*cols/32*4));
-            CHECK(hipMalloc(&mo,4*rows*4));CHECK(hipMalloc(&mr,4*rows*4));
-            std::vector<signed char> hq(4*cols);std::vector<float> hs(4*cols/32);
-            for(int m=0;m<4;++m) {
+            CHECK(hipMalloc(&mq,8*cols));CHECK(hipMalloc(&ms,8*cols/32*4));
+            CHECK(hipMalloc(&mo,8*rows*4));CHECK(hipMalloc(&mr,8*rows*4));
+            std::vector<signed char> hq(8*cols);std::vector<float> hs(8*cols/32);
+            for(int m=0;m<8;++m) {
                 for(int j=0;j<cols;++j) hq[m*cols+j]=q[(j+32*m)%cols];
                 for(int j=0;j<cols/32;++j) hs[m*cols/32+j]=sc[(j+m)%(cols/32)];
             }
@@ -168,27 +168,41 @@ int main() {
                     if(kind==3) qwen35_matvec_iq3s<<<(rows+7)/8,256>>>(o,dw,q,sc,rows,cols);
                     if(kind==4) qwen35_matvec_iq2xxs<<<(rows+7)/8,256>>>(o,dw,q,sc,rows,cols);
                     if(kind==5) qwen35_matvec_iq2xs<<<(rows+7)/8,256>>>(o,dw,q,sc,rows,cols);
-                } else if(kind==0) qwen35_matvec_q2k_multi4<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                    if(kind==6) qwen35_matvec_iq4xs<<<(rows+7)/8,256>>>(o,dw,q,sc,rows,cols);
+                } else if(kind==0 && count==8) qwen35_matvec_q2k_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                else if(kind==0) qwen35_matvec_q2k_multi4<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                else if(kind==6) qwen35_matvec_iq4xs_5120_multi8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                else if(count==8) {
+                    if(kind==1) qwen35_matvec_iq2s_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                    if(kind==2) qwen35_matvec_iq3xxs_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                    if(kind==3) qwen35_matvec_iq3s_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                    if(kind==4) qwen35_matvec_iq2xxs_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                    if(kind==5) qwen35_matvec_iq2xs_fixed8<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,count);
+                }
                 else qwen35_matvec_iq_multi4<<<(rows+3)/4,128>>>(mo,dw,mq,ms,rows,cols,multi_kind,count);
             };
-            for(int count : {2,3,4}) {
+            for(int count : {2,3,4,8}) {
+                if(kind==6 && count!=8) continue;
                 multi(true,count);multi(false,count);
                 CHECK(hipDeviceSynchronize());
                 std::vector<float> ao(count*rows),ar(count*rows);
                 CHECK(hipMemcpy(ao.data(),mo,ao.size()*4,hipMemcpyDeviceToHost));
                 CHECK(hipMemcpy(ar.data(),mr,ar.size()*4,hipMemcpyDeviceToHost));
                 if(memcmp(ao.data(),ar.data(),ao.size()*4)) {
-                    fprintf(stderr,"multi4 mismatch kind=%d rows=%d cols=%d count=%d\n",kind,rows,cols,count);return 1;
+                    fprintf(stderr,"multi%d mismatch kind=%d rows=%d cols=%d\n",
+                        count,kind,rows,cols);return 1;
                 }
                 matrix_checked+=ao.size();
-                if(count==4 && rows==5120 && (cols==5120 || cols==17408)) {
+                if((count==4 || count==8) && rows==5120 &&
+                   (cols==5120 || cols==17408)) {
                     for(bool reference : {true,false}) {
                         hipEvent_t start,stop; CHECK(hipEventCreate(&start));CHECK(hipEventCreate(&stop));
                         CHECK(hipEventRecord(start));
                         for(int rep=0;rep<100;++rep) multi(reference,count);
                         CHECK(hipEventRecord(stop));CHECK(hipEventSynchronize(stop));
                         float ms;CHECK(hipEventElapsedTime(&ms,start,stop));
-                        printf("multi4 %s %s rows=%d cols=%d %.3f us/window\n",name,reference?"scalar":"shared",rows,cols,ms*10);
+                        printf("multi%d %s %s rows=%d cols=%d %.3f us/window\n",
+                            count,name,reference?"scalar":"shared",rows,cols,ms*10);
                         CHECK(hipEventDestroy(start));CHECK(hipEventDestroy(stop));
                     }
                 }

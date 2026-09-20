@@ -150,8 +150,8 @@ match every ordinary-target logit bitwise with MTP enabled. Artifacts:
 and `target-*-parity.json`. Reference outputs/timings are reused from the
 hash-checked pinned build; runner timings are fresh.
 
-Exact native operator checks cover 2,948,352 activation values, 9,951,984
-matrix outputs, 4,528,128 fused SSM preparation values and 39,536,640 attention
+Exact native operator checks cover 2,948,352 activation values, 13,191,360
+matrix outputs, 4,528,128 fused SSM preparation values and 46,743,552 attention
 outputs. Parallel greedy selection passes 40 shape/pattern comparisons and
 reduces its standalone time from 207.6 to 11.6 microseconds. Retained decode
 changes include native IQ4_XS, computed IQ signs, selected packed IQ3_S loads,

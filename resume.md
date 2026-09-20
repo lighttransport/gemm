@@ -12,31 +12,33 @@ On the 4096-token C clamp prompt, K=4 accepted 37/40 drafts and K=7 accepted
 41/42.  Both produced the ordinary target's exact 46-token response, EOS and
 sequence hash `15f17d2640c1adfc`; the emitted C is coherent, compiles warning
 free as C17 and passes `INT_MIN`/`INT_MAX` boundary cases.  The final K=7 run
-measured **69.75 tok/s decode and 538.46 tok/s prefill**.  K=4 measured 52.41
-and 537.86.  A recent ordinary native baseline measured 39.55 and 533.19.
+measured **76.16 tok/s decode and 539.54 tok/s prefill**.  K=4 measured 52.78
+and 537.39.  A recent ordinary native baseline measured 39.55 and 533.19.
 The upstream llama.cpp server path measured 16.54 tok/s at K=4 with the same
-37/40 acceptance, versus its 25.88 baseline.  Native K=4 is 3.17x faster than
-upstream DFlash2, and K=7 is 76 percent faster than the recent ordinary native
+37/40 acceptance, versus its 25.88 baseline.  Native K=4 is 3.19x faster than
+upstream DFlash2, and K=7 is 93 percent faster than the recent ordinary native
 decode baseline.  Both short-context performance targets are met.
 
 The exact verifier now reuses decoded weights across up to eight rows for
 Q2_K, IQ1_S, IQ1_M, IQ2/IQ3 and IQ4_XS.  Eight-row IQ kernels specialize the
 quantization format at compile time, eliminating runtime codebook branches.
+Compact Q2_K, IQ2 and IQ3_S schedules finish one verifier query at a time to
+lower accumulator pressure without changing the reference reduction order.
 RMSNorm and residual-plus-RMSNorm use one batched launch with an independent
 block and unchanged reduction per row.  The DFlash draft reuses Q4_K weights
 across eight rows and K/V values across four attention rows.  Exact target
 attention now loads each old Q8 K/V row once while evaluating up to eight
 adjacent verifier queries.  It retains the pinned query quantization, online
 softmax, packed-F16 accumulation and split-combine order.  K=7 timing for the
-final 46-token response is draft 108.702 ms, target verify 539.605 ms and
-commit 10.382 ms, for 659.45 ms total.  The exact attention differential
+final 46-token response is draft 108.910 ms, target verify 483.679 ms and
+commit 10.651 ms, for 604.00 ms total.  The exact attention differential
 passes 46,743,552 values; its eight-query operator takes 213.382 microseconds
 at 4K and 3.076784 milliseconds at 64K with eight splits.
 
 After a fully processed 65,536-token random prefix, DFlash K=7 now sustains
-**44.94 tok/s** for a 256-token suffix.  The prefix sustains 443.41 tok/s and
+**47.72 tok/s** for a 256-token suffix.  The prefix sustains 445.71 tok/s and
 has hash `90178de69a24a76e`; the suffix retains hash `2ddd068dca63669a`.
-It drafted 259 tokens, accepted 217, and spent 667.500/4936.944/56.114 ms in
+It drafted 259 tokens, accepted 217, and spent 668.717/4602.977/57.440 ms in
 draft/verify/commit.  This meets the random-depth 40 tok/s goal.  Ordinary
 single-token decode remains about 29.13 tok/s at the same depth and is the
 main open decode target.
@@ -59,7 +61,7 @@ and `--kv-cache q8q8`.  Details and the reproduction command:
 The IQ2 runner sustains more than 400 tok/s while processing 65,536 random
 tokens in 512-token chunks on RX 9070 XT / gfx1201 / ROCm 10.  The original
 optimized ordinary run measured 413.25 tok/s; the current DFlash K=7 run
-measures 443.41 tok/s.  The previous native Q8/Q8 path took 460.37 seconds at
+measures 445.71 tok/s.  The previous native Q8/Q8 path took 460.37 seconds at
 142.36 tok/s.  Long-context prefill therefore remains above its target after
 adding sidecar feature capture and cache injection.
 
@@ -100,8 +102,8 @@ sustain 26.92/26.91/26.90 tok/s and share sequence hash
 `b01a17fae16f806d`; the latest retained ordinary result is about 29.13 tok/s.
 The prior 27.94 tok/s result used zero cache values and is superseded.
 
-The optimized DFlash K=7 path processes the same random prefix in 147.801
-seconds at 443.41 tok/s, then sustains 44.94 tok/s for 256 tokens with suffix
+The optimized DFlash K=7 path processes the same random prefix in 147.039
+seconds at 445.71 tok/s, then sustains 47.72 tok/s for 256 tokens with suffix
 hash `2ddd068dca63669a`.  Its exact eight-query shared-K/V attention kernel
 takes 3.077 ms per layer at 64K, compared with 8.654 ms for the generic
 verifier at the same eight-split schedule.  DFlash therefore meets the 40
@@ -151,8 +153,8 @@ match every ordinary-target logit bitwise with MTP enabled. Artifacts:
 and `target-*-parity.json`. Reference outputs/timings are reused from the
 hash-checked pinned build; runner timings are fresh.
 
-Exact native operator checks cover 2,948,352 activation values, 9,951,984
-matrix outputs, 4,528,128 fused SSM preparation values and 39,536,640 attention
+Exact native operator checks cover 2,948,352 activation values, 13,191,360
+matrix outputs, 4,528,128 fused SSM preparation values and 46,743,552 attention
 outputs. Parallel greedy selection passes 40 shape/pattern comparisons and
 reduces its standalone time from 207.6 to 11.6 microseconds. Retained decode
 changes include native IQ4_XS, computed IQ signs, selected packed IQ3_S loads,
@@ -211,12 +213,12 @@ New controls: `--sampling-profile llama`, `--qwen35-decode-graph`,
 `--qwen35-native-q8-attn`, `--qwen35-native-q8-prefill`, and diagnostic
 `--qwen35-reference-math`. `--qwen35-native-mmvq` enables native Q2_K,
 IQ2_XXS/XS/S and IQ3_XXS/S decode; `--qwen35-native-q2k` isolates Q2_K. The native
-matrix-vector kernels and quantizer pass 2,515,200 activation and 3,950,820
+matrix-vector kernels and quantizer pass 2,948,352 activation and 13,191,360
 output comparisons against actual reference kernels. Normal generation stops at EOS; use the explicit
 `--bench-ignore-eos` only for synthetic timing. Native attention eliminates
 the repeated Q8-to-F16 expansion and follows the pinned reference's Q8_1
 query quantization, half2 arithmetic and split reductions. Its standalone
-test passes 39,536,640 bitwise comparisons against actual llama.cpp HIP kernels.
+test passes 46,743,552 bitwise comparisons against actual llama.cpp HIP kernels.
 The independent sampler passes 13,801,002 exact comparisons against libllama.
 Graph replay before changing attention matches uncaptured logits bitwise.
 

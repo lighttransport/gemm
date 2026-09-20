@@ -43,14 +43,14 @@ RX 9070 XT / gfx1201 / ROCm 10, Q8 K and Q8 V, greedy sampling:
 | Path | Measured suffix | Decode tok/s | Prefix tok/s | Free VRAM | Sequence hash |
 |---|---:|---:|---:|---:|---|
 | IQ2_XS ordinary, original exact gate | 3 x 512 tokens | 26.92 / 26.91 / 26.90 | 142.36 | 4284 MiB | `b01a17fae16f806d` |
-| IQ2_XS + DFlash2 K=7, optimized | 256 tokens | 44.94 | 443.41 | 1274 MiB | `2ddd068dca63669a` |
+| IQ2_XS + DFlash2 K=7, optimized | 256 tokens | 47.72 | 445.71 | 1274 MiB | `2ddd068dca63669a` |
 
 Both runs use the same fully processed 65,536-token random prefix with token
 hash `90178de69a24a76e`.  The ordinary row records the original exact gate.  Its
 prefix took 460.37 seconds before long-context WMMA prefill was enabled.  The
-optimized DFlash run processed the prefix in 147.801 seconds, then generated
-256 tokens in 5.696 seconds.  It drafted 259 tokens, accepted 217, and spent
-667.500/4936.944/56.114 ms in draft/verify/commit.  The earlier 27.94 tok/s
+optimized DFlash run processed the prefix in 147.039 seconds, then generated
+256 tokens in 5.365 seconds.  It drafted 259 tokens, accepted 217, and spent
+668.717/4602.977/57.440 ms in draft/verify/commit.  The earlier 27.94 tok/s
 result used zero cache rows and is not comparable.
 
 At 16K and longer, native Q8 attention uses up to 128 splits and submits the
@@ -87,6 +87,11 @@ at short context, plus real random-like 64K K/V patterns at 8, 12, 16, 32, 64,
 128 and 256 matching split counts. The full benchmark separately exercises
 real random K/V and recurrent state. The optimized DFlash run retains the
 earlier suffix hash despite changing the verifier scheduling.
+
+The exact projection differential separately passes 2,948,352 activation
+values and 13,191,360 Q2_K/IQ outputs.  It covers the compact fixed-eight
+Q2_K, IQ2_XXS, IQ2_XS, IQ2_S and IQ3_S schedules, the retained IQ3_XXS
+schedule, and the exact IQ4_XS eight-row reduction.
 
 Fresh 4096-token C++ coding-task validations cover the normal semantic path.
 For IQ2 and IQ3, greedy and temperature-0.6 responses match pinned llama.cpp

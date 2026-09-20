@@ -191,3 +191,55 @@ extern "C" __global__ void qwen35_matvec_q2k_multi8(
         const float *scales, int rows, int cols, int count) {
     qwen35_matvec_q2k_multi<8>(out,weights,q,scales,rows,cols,count);
 }
+
+/* The K=7 verifier evaluates exactly eight rows.  Keep the eight reference
+ * virtual-warp partials, but finish one query's four dot products before
+ * starting the next query.  This avoids keeping sixteen sd/sm accumulators
+ * live across the inner loop while still decoding each weight block once. */
+extern "C" __global__ void qwen35_matvec_q2k_fixed8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    (void)count;
+    int lane=threadIdx.x&31, row=blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
+    if (row>=rows) return;
+    int blocks=cols/256, iqs=lane&15;
+    const unsigned char *w=weights+(size_t)row*blocks*84;
+    float sum[8]={};
+#pragma unroll
+    for (int vw=0; vw<8; ++vw) {
+        float partial[8]={};
+        for (int b=lane/16+2*vw; b<blocks; b+=16) {
+            const unsigned char *p=w+b*84;
+            const unsigned char *s=p+(iqs&~7)+(iqs&7)/4;
+            int v=((const int *)(p+16))[iqs];
+            float d=(float)*(const _Float16 *)(p+80);
+            float dm=(float)*(const _Float16 *)(p+82);
+#pragma unroll
+            for (int t=0; t<8; ++t) {
+                float sd=0.0f, sm=0.0f;
+#pragma unroll
+                for (int j=0; j<4; ++j) {
+                    int qb=b*8+4*(iqs/8)+j;
+                    int u=((const int *)(q+(size_t)t*cols+qb*32))[iqs&7];
+                    int low=s[2*j]&15;
+                    int high=(s[2*j]>>4)*0x01010101;
+                    int z=__builtin_amdgcn_sudot4(true,
+                        (v>>(2*j))&0x03030303,true,u,0,false);
+                    int zm=__builtin_amdgcn_sudot4(true,high,true,u,0,false);
+                    float scale=scales[(size_t)t*(cols/32)+qb];
+                    sd+=scale*(z*low);
+                    sm+=scale*zm;
+                }
+                partial[t]+=d*sd-dm*sm;
+            }
+        }
+#pragma unroll
+        for (int t=0; t<8; ++t) sum[t]+=partial[t];
+    }
+#pragma unroll
+    for (int t=0; t<8; ++t) {
+        for (int offset=16; offset; offset>>=1)
+            sum[t]+=__shfl_xor(sum[t],offset,32);
+        if (lane==0) out[(size_t)t*rows+row]=sum[t];
+    }
+}

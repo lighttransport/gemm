@@ -384,22 +384,119 @@ extern "C" __global__ void qwen35_matvec_iq3s_multi8(
     qwen35_matvec_iq_multi<8>(out,weights,q,scales,rows,cols,4,count);
 }
 
-/* K=7 target verification always evaluates eight rows.  Literal counts let
- * HIPRTC discard the per-activation bounds while retaining the generic
- * eight-row arithmetic and output layout. */
+/* Decode the four grids first, then finish one activation row at a time.
+ * This keeps only two dot accumulators live instead of sixteen while still
+ * sharing every codebook lookup across all eight verifier rows. */
+template<int KIND>
+__device__ __forceinline__ void qwen35_matvec_iq_fixed8_compact(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols) {
+    int lane=threadIdx.x&31;
+    int row=blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
+    if (row>=rows) return;
+    constexpr int bs=KIND==0 ? 66 : KIND==1 ? 74 : KIND==2 ? 82 :
+                     KIND==3 ? 98 : 110;
+    const unsigned char *w=weights+(size_t)row*(cols/256)*bs;
+    float sum[8]={};
+    for (int qb=lane; qb<cols/32; qb+=32) {
+        int ib=qb&7;
+        const unsigned char *p=w+(qb/8)*bs;
+        unsigned int aux=KIND==0 ? *(const unsigned int *)(p+6+ib*8) :
+            KIND==3 ? *(const unsigned int *)(p+66+ib*4) : 0;
+        int av[4], bv[4];
+#pragma unroll
+        for (int j=0; j<4; ++j) {
+            unsigned int lo,hi,signs;
+            if (KIND<=2) {
+                unsigned long long grid;
+                if (KIND==0) {
+                    grid=qwen35_iq2xxs_grid[p[2+ib*8+j]];
+                    signs=qwen35_parity_signs((aux>>(7*j))&127);
+                } else if (KIND==1) {
+                    unsigned int code=((const unsigned short *)(p+2))[ib*4+j];
+                    grid=qwen35_iq2xs_grid[code&511];
+                    signs=qwen35_parity_signs(code>>9);
+                } else {
+                    int index=p[2+ib*4+j] |
+                        ((p[66+ib]<<(8-2*j))&0x300);
+                    grid=qwen35_iq2s_grid[index];
+                    signs=p[34+ib*4+j];
+                }
+                lo=(unsigned int)grid;
+                hi=(unsigned int)(grid>>32);
+            } else if (KIND==3) {
+                signs=qwen35_parity_signs((aux>>(7*j))&127);
+                lo=qwen35_iq3xxs_grid[p[2+ib*8+2*j]];
+                hi=qwen35_iq3xxs_grid[p[3+ib*8+2*j]];
+            } else {
+                unsigned int qh=p[66+ib];
+                signs=p[74+ib*4+j];
+                lo=qwen35_iq3s_grid[p[2+ib*8+2*j] |
+                    ((qh<<(8-2*j))&0x100)];
+                hi=qwen35_iq3s_grid[p[3+ib*8+2*j] |
+                    ((qh<<(7-2*j))&0x100)];
+            }
+            av[j]=qwen35_signed_grid(lo,signs,0);
+            bv[j]=qwen35_signed_grid(hi,signs,4);
+        }
+#pragma unroll
+        for (int m=0; m<8; ++m) {
+            const int *u=(const int *)(q+(size_t)m*cols+qb*32);
+            int z0=0,z1=0;
+#pragma unroll
+            for (int j=0; j<4; ++j) {
+                if ((KIND==1 || KIND==2) && j>=2) {
+                    z1=qwen35_dot4(av[j],u[2*j],z1);
+                    z1=qwen35_dot4(bv[j],u[2*j+1],z1);
+                } else {
+                    z0=qwen35_dot4(av[j],u[2*j],z0);
+                    z0=qwen35_dot4(bv[j],u[2*j+1],z0);
+                }
+            }
+            int z=z0;
+            if (KIND==0) z=z*(int)((aux>>27)|1)/8;
+            else if (KIND==1 || KIND==2) {
+                int sc=p[(KIND==1?66:74)+ib];
+                z=(z*(sc&15)+z1*(sc>>4)+(z+z1)/2)/4;
+            } else if (KIND==3) z=((int)(aux>>28)*z+z/2)/2;
+            else z*=1+2*((p[106+ib/2]>>((ib&1)*4))&15);
+            float d=(float)*(const _Float16 *)p *
+                scales[(size_t)m*(cols/32)+qb];
+            sum[m]+=d*z;
+        }
+    }
+#pragma unroll
+    for (int m=0; m<8; ++m) {
+        for (int offset=16; offset; offset>>=1)
+            sum[m]+=__shfl_xor(sum[m],offset,32);
+        if (lane==0) out[(size_t)m*rows+row]=sum[m];
+    }
+}
+
+/* K=7 target verification always evaluates eight rows.  Literal formats and
+ * counts let HIPRTC discard unused branches and per-activation bounds. */
 #define QWEN35_IQ_FIXED8(name, kind_value) \
 extern "C" __global__ void name( \
         float *out, const unsigned char *weights, const signed char *q, \
         const float *scales, int rows, int cols, int count) { \
     (void)count; \
-    qwen35_matvec_iq_multi<8>(out,weights,q,scales,rows,cols,kind_value,8); \
+    qwen35_matvec_iq_fixed8_compact<kind_value>( \
+        out,weights,q,scales,rows,cols); \
 }
 QWEN35_IQ_FIXED8(qwen35_matvec_iq2xxs_fixed8, 0)
 QWEN35_IQ_FIXED8(qwen35_matvec_iq2xs_fixed8, 1)
 QWEN35_IQ_FIXED8(qwen35_matvec_iq2s_fixed8, 2)
-QWEN35_IQ_FIXED8(qwen35_matvec_iq3xxs_fixed8, 3)
 QWEN35_IQ_FIXED8(qwen35_matvec_iq3s_fixed8, 4)
 #undef QWEN35_IQ_FIXED8
+
+/* IQ3_XXS is faster with the original j-major schedule despite its higher
+ * register count, so retain that exact specialization for this format. */
+extern "C" __global__ void qwen35_matvec_iq3xxs_fixed8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    (void)count;
+    qwen35_matvec_iq_multi<8>(out,weights,q,scales,rows,cols,3,8);
+}
 
 /* IQ4_XS keeps eight virtual reference sums per output row.  Reuse decoded
  * nibbles across the verifier rows without changing that per-row summation
