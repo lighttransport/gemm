@@ -34,9 +34,10 @@ The goal is complete only when all of the following are true:
 
 ## Verified starting point
 
-The initial Q5 layout benchmark is commit `b383fc0b` and the shared exact-cache
-milestone is commit `7d37cd3c`. The current branch has advanced beyond those
-commits; they are landmarks, not reset targets.
+The initial Q5 layout benchmark is commit `b383fc0b`, the shared exact-cache
+milestone is `7d37cd3c`, and the rank-local sidecar builder milestone is
+`8cf312cf`. The current branch may advance beyond those commits; they are
+landmarks, not reset targets.
 
 Relevant files:
 
@@ -44,6 +45,7 @@ Relevant files:
 - `a64fx/llm/kquant_decode_cache.h`
 - `a64fx/llm/test_qwen38_kquant_cache.c`
 - `a64fx/llm/qwen38_kquant_stage.[ch]`
+- `a64fx/llm/qwen38_kquant_load.[ch]`
 - `a64fx/llm/test_qwen38_kquant_stage.c`
 - `a64fx/llm/qwen38_tp_stage.h`
 - `a64fx/llm/Makefile`
@@ -97,11 +99,26 @@ payload bytes, all relevant hashes, and rebuild after deliberate header
 corruption:
 
 ```text
-SENTINEL qwen38_kquant_stage=OK entries=2 q5r=2240 iq4r=2176 reuse=1 corrupt_rebuild=1
+SENTINEL qwen38_kquant_stage=OK entries=2 q5r=2240 iq4r=2176 reuse=1 corrupt_rebuild=1 loader_rejects=9
 ```
 
+The independent read-only loader validates the compact source identity, fixed
+headers, entry-table hashes, unique names, type/format pairs, local shapes,
+monotonic non-overlapping extents, source checksums, and every payload hash.
+It uses a fixed 1 MiB hashing buffer, evicts validation reads, and maps the
+sidecar only after every entry passes. Tests require rejection of bad magic,
+version, layout, truncation, offset, duplicate name, source entry, source file
+size, and payload data. This loader is complete but is not yet wired into the
+TP runner or persistent-pool dispatch.
+
 No real compact `rank00.blob` was present under `/local/u14346` during the
-sidecar milestone, so real per-rank planning and conversion remain required.
+sidecar-builder milestone. A later bounded rank-0 run has now built and checked
+the real mixed-Q4 artifact. All four TP4 metadata plans are symmetric: 866
+compact entries, a 5.758 GB compact file, 390 cache entries, a 7.810 GB
+sidecar, and 13.568 GB combined files per rank. Rank 0 produced exact file
+sizes of `5,757,905,920` and `7,809,826,816` bytes. Full payload validation
+passed in 31.635 seconds, builder reuse passed, and `MemAvailable` remained
+about 30.8 GB. Ranks 1--3 still require physical builds on their own nodes.
 The sidecar is not yet attached to `tp_runner`.
 
 ## Constraints and safety rules
@@ -127,41 +144,30 @@ The sidecar is not yet attached to `tp_runner`.
 
 ## Remaining work, in order
 
-1. **Revalidate the focused baseline.** Build the benchmark, shared-layout
-   test, builder, and builder test. Run both tests and one real IQ4R benchmark.
+1. **Complete real staging on all TP4 nodes.** Rank 0 is built and fully hash-
+   validated; metadata plans cover ranks 0--3. On a four-node allocation, build
+   the compact stage and sidecar locally on ranks 1--3, run
+   `qwen38_kquant_check` on every rank, and record validation time plus
+   `MemAvailable`. Do not copy rank 0's `/local` files between nodes.
 
-2. **Exercise a real rank-local stage.** Locate or create the intended compact
-   Q38TP stage using the existing safe staging workflow. For every rank, run
-   `--plan`, record entry counts and compact/cache/combined sizes, then build
-   the sidecar with bounded memory. Do not infer the rank budget from the
-   single-node GGUF summary.
-
-3. **Add a read-only sidecar loader.** Prefer a small dedicated module so
-   validation can be tested independently of the already-dirty transformer
-   header. Validate header and entry bounds before hashing variable-length
-   tables or payloads. Match tensors by name plus source type, local shape, and
-   source checksum. Reject duplicates. Expose no pointer until its payload hash
-   succeeds. Add tests for bad magic/version/layout, truncated files, invalid
-   offsets, duplicate entries, source mismatch, and payload corruption.
-
-4. **Attach decode dispatch explicitly.** Add a runner argument for the cache
+2. **Attach decode dispatch explicitly.** Add a runner argument for the cache
    stage/directory and keep the default compact behavior unchanged. Route only
    compatible Q5_K and IQ4_XS decode matvecs to `run_packed_q5r` and
    `run_packed_iq4r`. Keep compact dispatch for prefill, missing caches,
    unsupported dimensions, failed validation, and ownership-alignment tails.
 
-5. **Preserve NUMA/CMG placement.** Reconcile each cached tensor's eight-row
+3. **Preserve NUMA/CMG placement.** Reconcile each cached tensor's eight-row
    groups with the persistent pool's static worker ranges. Load/first-touch
    worker-owned ranges locally or prove that the selected file mapping gives
    equivalent placement. Add an ownership/tail test rather than relying only
    on divisible current shapes.
 
-6. **Run correctness acceptance.** Use the same prompt and settings for compact
+4. **Run correctness acceptance.** Use the same prompt and settings for compact
    and cached paths. Require exact token hashes at 128 and 256 generated tokens.
    Also retain the isolated multi-pattern tests so an end-to-end pass cannot
    conceal a tensor-level regression.
 
-7. **Measure and document.** On a clean node record load/stage timings, peak
+5. **Measure and document.** On a clean node record load/stage timings, peak
    and steady memory, forward/decode timing, total tok/s, and per-rank storage.
    Update `qwen-q8.md`, run `git diff --check`, stage only the focused files,
    commit an imperative single-subsystem change, and report the hash. Do not
@@ -174,7 +180,7 @@ mkdir -p /local/u14346/codex-research
 TMPDIR=/local/u14346/codex-research \
   make -B -C a64fx/llm \
   qwen38_kquant_bench qwen38_kquant_test \
-  qwen38_kquant_stage qwen38_kquant_stage_test \
+  qwen38_kquant_stage qwen38_kquant_stage_test qwen38_kquant_check \
   CC=fcc OPENMP=1
 
 OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
@@ -184,6 +190,11 @@ OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
   ./a64fx/llm/build/test_qwen38_kquant_stage \
   ./a64fx/llm/build/qwen38_kquant_stage \
   /local/u14346/codex-research/kquant-stage-test
+
+Q38TP_RANK=0 Q38TP_SIZE=4 \
+  ./a64fx/llm/build/qwen38_kquant_check \
+  /local/u14346/codex-research/qwen38-q4-tp4 \
+  /local/u14346/codex-research/qwen38-q4-tp4-kquant
 
 OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
   numactl --interleave=all ./a64fx/llm/build/bench_qwen38_kquants \
@@ -206,8 +217,11 @@ Q38TP_RANK=0 Q38TP_SIZE=4 ./a64fx/llm/build/qwen38_kquant_stage \
 Continue the active goal in resume-dequant.md: finish safe rank-local Q5R/IQ4R
 decode integration for Qwen3.8 on A64FX. Read AGENTS.md and the whole goal file
 first, inspect git status/diffs, and preserve every unrelated dirty-worktree
-change. The exact layouts, kernel tests, and versioned Q38KQC1 sidecar builder
-are complete; revalidate them, then continue at the first unfinished item.
+change. The exact layouts, kernel tests, versioned Q38KQC1 sidecar builder, and
+strict read-only loader are complete. Real rank 0 is built and hash-validated;
+metadata plans cover all four symmetric TP4 ranks. Revalidate the focused
+tests, then continue at the first unfinished item: physical staging/checking
+on ranks 1--3 in a four-node allocation, followed by explicit runtime attach.
 
 Do not create a full single-node additive cache. Plan real per-rank memory
 before conversion, use bounded I/O and /local/u14346/codex-research, preserve

@@ -22,6 +22,10 @@
 #define GGUF_LOADER_IMPLEMENTATION
 #include "../../common/gguf_loader.h"
 #include "qwen38_tp_stage.h"
+#define TF_KQUANT_CACHE_LAYOUT_ONLY
+#define TF_KQUANT_CACHE_PACK_ONLY
+#include "kquant_decode_cache.h"
+#include "qwen38_kquant_stage.h"
 
 static void die(const char *s) { perror(s); exit(1); }
 static long env_rank(void) {
@@ -58,6 +62,16 @@ static void tp_chunk_range(int n, int parts, int rank, int *lo, int *hi) {
     if (*hi > n) *hi = n;
 }
 static uint64_t align_up(uint64_t x, uint64_t a) { return (x + a - 1) & ~(a - 1); }
+
+static size_t kquant_cache_bytes(const q38tp_entry *entry) {
+    if (!entry->local_rows || !entry->local_cols ||
+        entry->local_rows > INT_MAX || entry->local_cols > INT_MAX) return 0;
+    if (entry->type == GGML_TYPE_Q5_K)
+        return packed_q5r_bytes((int)entry->local_rows, (int)entry->local_cols);
+    if (entry->type == GGML_TYPE_IQ4_XS)
+        return packed_iq4r_bytes((int)entry->local_rows, (int)entry->local_cols);
+    return 0;
+}
 static int mkdir_p(const char *path) {
     char tmp[PATH_MAX]; size_t n = strlen(path);
     if (!n || n >= sizeof(tmp)) return -1;
@@ -307,16 +321,27 @@ int main(int argc, char **argv) {
     }
     if (getenv("Q38TP_PLAN") && atoi(getenv("Q38TP_PLAN"))) {
         uint64_t planned = Q38TP_HEADER_BYTES;
+        uint64_t cache_planned = Q38KC_HEADER_BYTES;
+        uint32_t cache_entries = 0;
         for (uint32_t i = 0; i < h->n_entries; i++) {
             planned = align_up(planned, 256);
             planned += h->entries[i].byte_length;
+            size_t cache_bytes = kquant_cache_bytes(&h->entries[i]);
+            if (cache_bytes) {
+                cache_planned = align_up(cache_planned, 256);
+                cache_planned += cache_bytes;
+                cache_entries++;
+            }
         }
         uint32_t type_count[GGML_TYPE_COUNT] = {0};
         for (uint32_t i = 0; i < h->n_entries; i++)
             if (h->entries[i].type < GGML_TYPE_COUNT) type_count[h->entries[i].type]++;
-        printf("qwen38_tp_stage plan rank=%ld/%ld entries=%u data=%.3fGB file=%.3fGB types=",
+        printf("qwen38_tp_stage plan rank=%ld/%ld entries=%u data=%.3fGB "
+               "file=%.3fGB kquant_entries=%u kquant_file=%.3fGB "
+               "combined_file=%.3fGB types=",
                rank, size, h->n_entries, (double)(planned-Q38TP_HEADER_BYTES)/1e9,
-               (double)planned/1e9);
+               (double)planned/1e9, cache_entries, (double)cache_planned/1e9,
+               (double)(planned + cache_planned)/1e9);
         for (uint32_t type = 0, printed = 0; type < GGML_TYPE_COUNT; type++) {
             if (!type_count[type]) continue;
             printf("%s%s:%u", printed++ ? "," : "", ggml_type_name(type), type_count[type]);

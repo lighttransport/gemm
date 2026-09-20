@@ -20,6 +20,7 @@
 #include "qwen38_tp_stage.h"
 #define TF_KQUANT_CACHE_PACK_ONLY
 #include "kquant_decode_cache.h"
+#include "qwen38_kquant_load.h"
 #include "qwen38_kquant_stage.h"
 
 static uint64_t align_up(uint64_t value, uint64_t alignment) {
@@ -92,6 +93,38 @@ static int run_builder(const char *builder, const char *compact_dir,
     int status = 0;
     if (waitpid(pid, &status, 0) != pid) return -1;
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int write_variant(const char *path, const void *data, size_t bytes) {
+    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0644);
+    if (fd < 0) return -1;
+    int rc = write_all_at(fd, data, bytes, 0) || fdatasync(fd);
+    close(fd);
+    return rc ? -1 : 0;
+}
+
+static int expect_load_failure(const char *label, const char *path,
+                               const q38tp_header *source,
+                               uint64_t source_file_bytes) {
+    q38kc_loaded loaded = {0};
+    char error[256] = {0};
+    if (!q38kc_load(&loaded, path, source, source_file_bytes, 0, 2,
+                    error, sizeof(error))) {
+        fprintf(stderr, "loader accepted invalid %s sidecar\n", label);
+        q38kc_unload(&loaded);
+        return -1;
+    }
+    if (!error[0]) {
+        fprintf(stderr, "loader gave no error for invalid %s sidecar\n", label);
+        return -1;
+    }
+    return 0;
+}
+
+static void refresh_entries_hash(q38kc_header *header) {
+    header->entries_checksum = q38kc_hash_update(
+        0, header->entries,
+        (size_t)header->n_entries * sizeof(header->entries[0]));
 }
 
 int main(int argc, char **argv) {
@@ -238,8 +271,74 @@ int main(int argc, char **argv) {
         return 1;
     }
     close(cache_fd);
+
+    q38kc_loaded loaded = {0};
+    char load_error[256] = {0};
+    const void *payload_q5 = NULL, *payload_iq4 = NULL;
+    if (q38kc_load(&loaded, cache_path, source, offset, 0, 2,
+                   load_error, sizeof(load_error)) ||
+        !q38kc_find(&loaded, q5_entry, &payload_q5) ||
+        !q38kc_find(&loaded, iq4_entry, &payload_iq4) ||
+        memcmp(payload_q5, expected_q5, sizeof(expected_q5)) ||
+        memcmp(payload_iq4, expected_iq4, sizeof(expected_iq4))) {
+        fprintf(stderr, "valid cache load failed: %s\n", load_error);
+        return 1;
+    }
+    q38kc_unload(&loaded);
+
+    struct stat cache_stat;
+    cache_fd = open(cache_path, O_RDONLY);
+    if (cache_fd < 0 || fstat(cache_fd, &cache_stat) || cache_stat.st_size < 0)
+        return 1;
+    size_t cache_bytes = (size_t)cache_stat.st_size;
+    uint8_t *pristine = malloc(cache_bytes);
+    uint8_t *variant = malloc(cache_bytes);
+    char variant_path[PATH_MAX];
+    snprintf(variant_path, sizeof(variant_path), "%s/invalid.kquant", cache_dir);
+    if (!pristine || !variant ||
+        read_all_at(cache_fd, pristine, cache_bytes, 0)) return 1;
+    close(cache_fd);
+
+#define TEST_VARIANT(label, bytes) do { \
+        if (write_variant(variant_path, variant, (bytes)) || \
+            expect_load_failure((label), variant_path, source, offset)) return 1; \
+    } while (0)
+
+    memcpy(variant, pristine, cache_bytes);
+    variant[0] ^= 1;
+    TEST_VARIANT("magic", cache_bytes);
+    memcpy(variant, pristine, cache_bytes);
+    ((q38kc_header *)variant)->version++;
+    TEST_VARIANT("version", cache_bytes);
+    memcpy(variant, pristine, cache_bytes);
+    ((q38kc_header *)variant)->layout_version++;
+    TEST_VARIANT("layout", cache_bytes);
+    memcpy(variant, pristine, cache_bytes);
+    TEST_VARIANT("truncated", cache_bytes - 1);
+    memcpy(variant, pristine, cache_bytes);
+    ((q38kc_header *)variant)->entries[0].file_offset++;
+    refresh_entries_hash((q38kc_header *)variant);
+    TEST_VARIANT("offset", cache_bytes);
+    memcpy(variant, pristine, cache_bytes);
+    memcpy(((q38kc_header *)variant)->entries[1].name,
+           ((q38kc_header *)variant)->entries[0].name, Q38KC_NAME_BYTES);
+    refresh_entries_hash((q38kc_header *)variant);
+    TEST_VARIANT("duplicate", cache_bytes);
+    memcpy(variant, pristine, cache_bytes);
+    ((q38kc_header *)variant)->entries[0].source_checksum++;
+    refresh_entries_hash((q38kc_header *)variant);
+    TEST_VARIANT("source", cache_bytes);
+    memcpy(variant, pristine, cache_bytes);
+    variant[((q38kc_header *)variant)->entries[0].file_offset] ^= 1;
+    TEST_VARIANT("payload", cache_bytes);
+#undef TEST_VARIANT
+    if (expect_load_failure("source-size", cache_path, source, offset + 1)) return 1;
+    unlink(variant_path);
+    free(variant);
+    free(pristine);
+
     printf("SENTINEL qwen38_kquant_stage=OK entries=%u q5r=%zu iq4r=%zu "
-           "reuse=1 corrupt_rebuild=1\n",
+           "reuse=1 corrupt_rebuild=1 loader_rejects=9\n",
            cache->n_entries, sizeof(actual_q5), sizeof(actual_iq4));
     free(cache);
     free(source);

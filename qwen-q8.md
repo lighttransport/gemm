@@ -3412,7 +3412,7 @@ packers, verifies all relevant hashes, corrupts the entry-table checksum, and
 requires a successful rebuild. Its completion line is:
 
 ```text
-SENTINEL qwen38_kquant_stage=OK entries=2 q5r=2240 iq4r=2176 reuse=1 corrupt_rebuild=1
+SENTINEL qwen38_kquant_stage=OK entries=2 q5r=2240 iq4r=2176 reuse=1 corrupt_rebuild=1 loader_rejects=9
 ```
 
 The shared four-pattern kernel test still passes after separating pack-only
@@ -3420,9 +3420,44 @@ code from the SVE runner, and a real layer-0 IQ4_XS wave rerun measured 0.466
 ms native A8 versus 0.213 ms IQ4R, 222.3 GB/s effective bandwidth, with exact
 native-A8 output.
 
+`a64fx/llm/qwen38_kquant_load.c` supplies the corresponding read-only loader
+without changing the transformer runtime. It validates the compact source
+header and entry table first, then the sidecar identity, bounds, monotonic
+non-overlapping extents, unique names, type/format pairs, local shapes, source
+checksums, and entry-table hash. It streams every payload through a fixed 1 MiB
+buffer, checks the payload hash, and drops those validation reads from page
+cache before mapping the file. No payload pointer is exposed until all entries
+pass. Lookup additionally matches name, source type, local dimensions, and
+source checksum. The synthetic test requires rejection of bad magic, version,
+layout, truncation, offset, duplicate name, source entry, source file size, and
+payload data.
+
+The TP stager's metadata-only plan now reports the derived cache footprint in
+the same pass as the compact stage. All four mixed-Q4 TP4 ranks are symmetric:
+
+```text
+qwen38_tp_stage plan rank=N/4 entries=866 data=5.756GB file=5.758GB kquant_entries=390 kquant_file=7.810GB combined_file=13.568GB types=F32:360,Q4_K:97,Q5_K:325,Q6_K:19,IQ4_XS:65
+```
+
+On the available node, a bounded real rank-0 build produced a
+`5,757,905,920`-byte compact file and a `7,809,826,816`-byte sidecar file. The
+sidecar contains 390 entries and `7,808,778,240` payload bytes. The standalone
+checker exercised the complete loader and payload-hash path:
+
+```text
+SENTINEL qwen38_kquant_check=OK rank=0/4 entries=390 file_bytes=7809826816 seconds=31.635 path=/local/u14346/codex-research/qwen38-q4-tp4-kquant/rank00.kquant
+```
+
+The subsequent builder invocation selected the reuse path. `MemAvailable` was
+30,855,168 kB before staging and 30,802,176 kB after validation/reuse, confirming
+that the bounded I/O and page-cache eviction did not leave the 13.568 GB of
+files resident in HBM. Ranks 1--3 were metadata-planned but not physically
+built on this single node; a four-node allocation must repeat the build and
+validation locally on every rank before runtime acceptance.
+
 This milestone does not yet attach the sidecar to `tp_runner`. Runtime work
-must validate the sidecar before exposing pointers, first-touch/cache-map row
-groups in their owning CMGs, dispatch Q5R/IQ4R only for validated entries, and
-retain compact dispatch otherwise. The current `common/transformer.h` has
+must call the strict loader before exposing pointers, first-touch/cache-map
+row groups in their owning CMGs, dispatch Q5R/IQ4R only for validated entries,
+and retain compact dispatch otherwise. The current `common/transformer.h` has
 unrelated local edits and was deliberately not modified by this focused stage
 change.

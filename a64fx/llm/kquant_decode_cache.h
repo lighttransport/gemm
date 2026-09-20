@@ -31,6 +31,7 @@ static size_t packed_q5r_bytes(int rows, int cols) {
            (size_t)(cols / TF_KQUANT_CACHE_COLS) * packed_q5r_block_bytes();
 }
 
+#ifndef TF_KQUANT_CACHE_LAYOUT_ONLY
 static int pack_q5r(uint8_t *dst, const block_q5_K *src, int rows, int cols) {
     if (!dst || !src || !packed_q5r_bytes(rows, cols)) return -1;
     int nb = cols / 256;
@@ -63,6 +64,7 @@ static int pack_q5r(uint8_t *dst, const block_q5_K *src, int rows, int cols) {
     }
     return 0;
 }
+#endif
 
 #ifndef TF_KQUANT_CACHE_PACK_ONLY
 static inline void packed_q5r_dot8(float out[8], const uint8_t *weights,
@@ -142,10 +144,12 @@ typedef struct {
 
 _Static_assert(sizeof(packed_iq4r_header) == 16, "packed IQ4R header size");
 
+#ifndef TF_KQUANT_CACHE_LAYOUT_ONLY
 static const int8_t packed_iq4r_values[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10,
        1,   13,  25,  38,  53,  69,  89, 113,
 };
+#endif
 
 static size_t packed_iq4r_block_bytes(void) {
     return 8 * sizeof(packed_iq4r_header) + 8 * 256;
@@ -158,6 +162,7 @@ static size_t packed_iq4r_bytes(int rows, int cols) {
            (size_t)(cols / TF_KQUANT_CACHE_COLS) * packed_iq4r_block_bytes();
 }
 
+#ifndef TF_KQUANT_CACHE_LAYOUT_ONLY
 static int pack_iq4r(uint8_t *dst, const block_iq4_xs *src,
                      int rows, int cols) {
     if (!dst || !src || !packed_iq4r_bytes(rows, cols)) return -1;
@@ -189,6 +194,7 @@ static int pack_iq4r(uint8_t *dst, const block_iq4_xs *src,
     }
     return 0;
 }
+#endif
 
 #ifndef TF_KQUANT_CACHE_PACK_ONLY
 static inline void packed_iq4r_dot8(float out[8], const uint8_t *weights,
