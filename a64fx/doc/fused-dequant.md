@@ -237,16 +237,96 @@ W4A16 does not saturate the 230 GB/s packed-read interface: doubling the dot
 work plus widening/conversion moves the bottleneck back to instruction issue
 and dependency latency.
 
-The current INT4/INT16 schedule exposes four cache-line loads from both blocks
+An intermediate INT4/INT16 schedule exposes four cache-line loads from both blocks
 before unpacking and alternates their widening and SDOT chains. A six-result
 unpack window raises the controlled rate further to **171.03 GB/s median /
-171.04 best**, still short of the 200 GB/s target. An alternative packs each
-activation in `[-32768, 32639]` exactly into signed radix-256 digits and evaluates
-`dot(lo) + 256*dot(hi)` with ordinary INT8 SDOT. It verifies exactly for the
-benchmark range but reaches only 119.92 GB/s median, demonstrating that
-removing weight widening is not enough when two INT8 dot streams are needed.
+171.04 best**. Both performance targets are now met by the approaches below.
 
-The last result needs careful interpretation. Separate allocations showed both
+### Exact W4A16 through two byte SDOT streams
+
+Two signed radix-256 digits alone exclude the largest 128 positive INT16
+values. Adding a constant bias gives an exact representation of the entire
+INT16 domain:
+
+```text
+u  = uint16(a) & 255
+lo = u - 128                  // signed INT8
+hi = (a - u) / 256            // signed INT8; division is exact
+a  = lo + 256*hi + 128
+
+dot(w,a) = dot(w,lo) + 256*dot(w,hi) + 128*sum(w)
+```
+
+The converter appends signed INT16 column sums to each two-block supertile:
+8192 packed-weight bytes followed by 256 sum bytes. This adds 3.125% storage.
+For K=128 and doubled E2M1 weights, the largest weight-sum magnitude is 1536;
+the largest dot-product magnitude is 50,331,648, so INT16 sums and INT32
+outputs suffice. Activations retain all sixteen input bits. The two SDOT
+streams share each decoded weight vector; the final correction loads and
+arithmetic are included in the measured kernel time.
+
+With four packed loads and independent temporaries for both blocks, the
+full-range kernel reaches **219.44--220.09 GB/s for INT4** and
+**214.23--215.45 GB/s for FP4**, measured as the median of five trials in
+each of three fresh processes. These rates count packed weights in the
+numerator while charging all metadata traffic to elapsed time.
+Activation digit packing costs approximately 392 ns per 256 values,
+reported separately because activations can be reused across output tiles.
+
+Native INT16 SDOT also improves: low INT4 nibbles can remain multiplied by
+16 during widening and dot products. An exact right shift in the INT64
+epilogue removes one repeated sign-extension operation per packed vector.
+This reaches **201.46--201.58 GB/s** without weight-sum metadata.
+The direct INT16 table variant for FP4 reaches **173.21--173.36 GB/s**.
+
+### FP16 without integer conversion in the inner loop
+
+The sixteen possible codes fit in one SVE halfword table. Its entries are
+the exact FP16 representations of INT4 values or the doubled E2M1 lattice.
+Load 32 packed bytes directly into 32 halfword lanes, then use:
+
+```asm
+ld1b {z16.h}, p0/z, [x0]        // zero-extend 32 bytes to halfwords
+lsr  z17.h, z16.h, #4
+and  z16.d, z16.d, z30.d        // z30.h = 0x000f
+tbl  z16.h, {z31.h}, z16.h      // table already contains FP16 bits
+tbl  z17.h, {z31.h}, z17.h
+fmla z0.h, p0/m, z16.h, z24.h
+fmla z1.h, p0/m, z17.h, z24.h
+```
+
+This avoids both `sunpk` and `scvtf`. It uses 48 arithmetic instructions
+per 256 packed bytes, compared with 80 for the original INT4 path and 88 for
+FP4. Four independent blocks expose eight accumulators; the selected
+two-K loop uses separate temporary registers for its two steps. Each output
+still receives its FMAs in ascending K order, preserving rounding exactly.
+Three-launch medians are **171.84--172.04 GB/s for INT4** and
+**172.08--172.18 GB/s for FP4**. Scalar half-FMA and original-kernel comparisons
+pass bit-for-bit, including fractional, subnormal, cancellation, and overflow
+cases. FP16 accumulation still has its original range and accuracy limits.
+
+The same table sequence is also a standalone dequantization building block:
+replace the FMAs with stores of the two halfword vectors, applying scales if
+required. That preserves the existing split-column ordering. Its standalone
+store bandwidth has not been measured here; the fused rates above avoid
+those expanded-weight stores entirely.
+
+### Establish placement before judging arithmetic
+
+The initial bounded radix-256 kernel was incorrectly rejected after a
+119.92 GB/s run. Launching with `taskset -c 12` before XOS initialization
+raised the unchanged kernel to 219.99 GB/s for INT4 and 202.00 GB/s for FP4.
+Pinning after allocation could not reliably establish local placement.
+The final acceptance procedure records 2 MiB page backing and NUMA node 4,
+and brackets each kernel with read-only measurements on its own allocation.
+All eighteen runs qualified, with paired-read medians of 227.74--229.71 GB/s.
+
+```sh
+bash a64fx/dequant-pipe/run_w4a16_acceptance.sh
+# acceptance=PASS qualified=18/18 SDOT=6 FP16=6 failed_targets=0
+```
+
+The earlier allocation results need careful interpretation. Separate allocations showed both
 roughly 120 and 229 GB/s states. A controlled sweep later found that changing
 a 16 KiB inter-core gap did not select the state; physical allocation and page
 placement were stronger variables. With Fujitsu XOS 2 MiB pages, the controlled

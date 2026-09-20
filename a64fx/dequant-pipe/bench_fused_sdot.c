@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include "fused_opt.h"
 
 enum { BLOCK_BYTES = 4096, K_BLOCK = 128, N_TILE = 64, MAX_CORES = 12 };
 
@@ -24,9 +25,9 @@ extern void fused_fp4_i16x8_m1_k2_super_sve(const uint8_t *, const int8_t *, int
 extern void fused_i4_f16_m1_k4_super_sve(const uint8_t *, const _Float16 *, _Float16 *);
 extern void fused_fp4_f16_m1_k4_super_sve(const uint8_t *, const _Float16 *, _Float16 *);
 
-typedef enum { PATH_I8, PATH_I16, PATH_I16X8, PATH_F16 } path_kind;
+typedef enum { PATH_I8, PATH_I16, PATH_I16X8, PATH_F16, PATH_FULL } path_kind;
 typedef enum { FORMAT_I4, FORMAT_FP4 } format_kind;
-typedef enum { KERNEL_SHIFT, KERNEL_LUT, KERNEL_PIPE, KERNEL_SUPER } kernel_kind;
+typedef enum { KERNEL_SHIFT, KERNEL_LUT, KERNEL_PIPE, KERNEL_SUPER, KERNEL_OPT, KERNEL_OPT2 } kernel_kind;
 typedef void (*fused_i8_fn)(const uint8_t *, const int8_t *, int32_t *);
 
 static fused_i8_fn select_i8_kernel(kernel_kind kernel)
@@ -42,11 +43,14 @@ static const char *kernel_name(kernel_kind kernel)
     if (kernel == KERNEL_LUT) return "lut";
     if (kernel == KERNEL_PIPE) return "pipe";
     if (kernel == KERNEL_SUPER) return "super";
+    if (kernel == KERNEL_OPT) return "opt";
+    if (kernel == KERNEL_OPT2) return "opt2";
     return "shift";
 }
 
 static const char *reported_kernel_name(path_kind path, kernel_kind kernel)
 {
+    if (kernel >= KERNEL_OPT) return kernel_name(kernel);
     if (kernel == KERNEL_SUPER) return "super";
     if (path == PATH_I16) return "split";
     return kernel_name(kernel);
@@ -67,7 +71,22 @@ typedef struct {
     uint64_t end;
     uint64_t checksum;
     int error;
+    int read_only;
 } worker;
+
+extern void hbm_read_256_sve(const uint8_t *, size_t);
+
+static size_t group_bytes(path_kind path)
+{
+    if (path == PATH_FULL) return FUSED_FULL_BYTES;
+    return path == PATH_I16 || path == PATH_I16X8 ? 8192 : 16384;
+}
+
+static const char *path_name(path_kind path)
+{
+    static const char *names[] = {"int8", "int16", "int16x8", "fp16", "int16x8-full"};
+    return names[path];
+}
 
 static inline uint64_t cntvct(void)
 {
@@ -98,22 +117,30 @@ static void *run_worker(void *opaque)
     int64_t out16[2 * N_TILE] __attribute__((aligned(256)));
     int32_t out16x8[2 * N_TILE] __attribute__((aligned(256)));
     _Float16 outf16[4 * N_TILE] __attribute__((aligned(256)));
-    const size_t group = (w->path == PATH_I16 || w->path == PATH_I16X8) ?
-                         2 * BLOCK_BYTES : 4 * BLOCK_BYTES;
-    if (pin_cpu(w->cpu) != 0) w->error = errno ? errno : EINVAL;
+    const size_t group = group_bytes(w->path);
+    w->error = pin_cpu(w->cpu);
     atomic_fetch_add_explicit(w->ready, 1, memory_order_release);
     while (!atomic_load_explicit(w->start, memory_order_acquire))
         __asm__ volatile("yield");
     w->begin = cntvct();
     if (!w->error) {
         for (int iteration = 0; iteration < w->iterations; ++iteration) {
+            if (w->read_only) {
+                hbm_read_256_sve(w->packed, w->bytes);
+                continue;
+            }
             for (size_t offset = 0; offset < w->bytes; offset += group) {
                 if (w->path == PATH_I8) {
                     fused_i8_fn kernel = select_i8_kernel(w->kernel);
                     kernel(w->packed + offset, w->activation, out8);
                     w->checksum += (uint32_t)out8[(offset / group) & 255u];
                 } else if (w->path == PATH_I16) {
-                    if (w->kernel != KERNEL_SUPER)
+                    if (w->kernel == KERNEL_OPT) {
+                        if (w->format == FORMAT_FP4)
+                            fused_fp4_i16_opt_sve(w->packed + offset, w->activation, out16);
+                        else
+                            fused_i4_i16_opt_sve(w->packed + offset, w->activation, out16);
+                    } else if (w->kernel != KERNEL_SUPER)
                         fused_i4_i16_m1_k2_sve(w->packed + offset,
                                                w->activation, out16);
                     else if (w->format == FORMAT_FP4)
@@ -123,6 +150,12 @@ static void *run_worker(void *opaque)
                         fused_i4_i16_m1_k2_super_sve(w->packed + offset,
                                                     w->activation, out16);
                     w->checksum += (uint64_t)out16[(offset / group) & 127u];
+                } else if (w->path == PATH_FULL) {
+                    if (w->format == FORMAT_FP4)
+                        fused_fp4_i16x8_full_sve(w->packed + offset, w->activation, out16x8);
+                    else
+                        fused_i4_i16x8_full_sve(w->packed + offset, w->activation, out16x8);
+                    w->checksum += (uint32_t)out16x8[(offset / group) & 127u];
                 } else if (w->path == PATH_I16X8) {
                     if (w->format == FORMAT_FP4)
                         fused_fp4_i16x8_m1_k2_super_sve(w->packed + offset,
@@ -132,7 +165,17 @@ static void *run_worker(void *opaque)
                                                        w->activation, out16x8);
                     w->checksum += (uint32_t)out16x8[(offset / group) & 127u];
                 } else {
-                    if (w->format == FORMAT_FP4)
+                    if (w->kernel == KERNEL_OPT) {
+                        if (w->format == FORMAT_FP4)
+                            fused_fp4_f16_opt1_sve(w->packed + offset, w->activation, outf16);
+                        else
+                            fused_i4_f16_opt1_sve(w->packed + offset, w->activation, outf16);
+                    } else if (w->kernel == KERNEL_OPT2) {
+                        if (w->format == FORMAT_FP4)
+                            fused_fp4_f16_opt2_sve(w->packed + offset, w->activation, outf16);
+                        else
+                            fused_i4_f16_opt2_sve(w->packed + offset, w->activation, outf16);
+                    } else if (w->format == FORMAT_FP4)
                         fused_fp4_f16_m1_k4_super_sve(w->packed + offset,
                                                       w->activation, outf16);
                     else
@@ -340,8 +383,8 @@ static int verify(kernel_kind kernel_kind)
 
 static void usage(const char *name)
 {
-    fprintf(stderr, "usage: %s [--format int4|fp4] [--path int8|int16|int16x8|fp16] [--kernel shift|lut|pipe|super] [--cores N] [--mib N] "
-                    "[--iterations N] [--trials N] [--core-base N] [--skew-kib N] [--verify]\n", name);
+    fprintf(stderr, "usage: %s [--format int4|fp4] [--path int8|int16|int16x8|int16x8-full|fp16] [--kernel shift|lut|pipe|super|opt|opt2] [--cores N] [--mib N] "
+                    "[--iterations N] [--trials N] [--core-base N] [--skew-kib N] [--paired-baseline] [--compare-kernels] [--verify]\n", name);
 }
 
 int main(int argc, char **argv)
@@ -352,7 +395,7 @@ int main(int argc, char **argv)
     int cores = 12, iterations = 10, trials = 3, core_base = 12;
     size_t mib = 240;
     size_t skew_kib = 0;
-    int do_verify = 0;
+    int do_verify = 0, paired = 0, compare = 0;
     static const struct option options[] = {
         {"path", required_argument, NULL, 'p'}, {"format", required_argument, NULL, 'f'},
         {"cores", required_argument, NULL, 'c'},
@@ -360,15 +403,18 @@ int main(int argc, char **argv)
         {"mib", required_argument, NULL, 'm'}, {"iterations", required_argument, NULL, 'i'},
         {"trials", required_argument, NULL, 't'}, {"core-base", required_argument, NULL, 'b'},
         {"skew-kib", required_argument, NULL, 's'},
+        {"paired-baseline", no_argument, NULL, 'r'},
+        {"compare-kernels", no_argument, NULL, 'a'},
         {"verify", no_argument, NULL, 'v'}, {NULL, 0, NULL, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:f:k:c:m:i:t:b:s:v", options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:f:k:c:m:i:t:b:s:vra", options, NULL)) != -1) {
         switch (opt) {
         case 'p':
             if (!strcmp(optarg, "int8")) path = PATH_I8;
             else if (!strcmp(optarg, "int16")) path = PATH_I16;
             else if (!strcmp(optarg, "int16x8")) path = PATH_I16X8;
+            else if (!strcmp(optarg, "int16x8-full")) path = PATH_FULL;
             else if (!strcmp(optarg, "fp16")) path = PATH_F16;
             else { usage(argv[0]); return 2; }
             break;
@@ -382,6 +428,8 @@ int main(int argc, char **argv)
             else if (!strcmp(optarg, "lut")) kernel = KERNEL_LUT;
             else if (!strcmp(optarg, "pipe")) kernel = KERNEL_PIPE;
             else if (!strcmp(optarg, "super")) kernel = KERNEL_SUPER;
+            else if (!strcmp(optarg, "opt")) kernel = KERNEL_OPT;
+            else if (!strcmp(optarg, "opt2")) kernel = KERNEL_OPT2;
             else { usage(argv[0]); return 2; }
             break;
         case 'c': cores = atoi(optarg); break;
@@ -391,37 +439,66 @@ int main(int argc, char **argv)
         case 'b': core_base = atoi(optarg); break;
         case 's': skew_kib = strtoull(optarg, NULL, 0); break;
         case 'v': do_verify = 1; break;
+        case 'r': paired = 1; break;
+        case 'a': compare = 1; break;
         default: usage(argv[0]); return 2;
         }
     }
-    if (do_verify && verify(kernel) != 0) return 1;
+    if (do_verify && (verify(kernel >= KERNEL_OPT ? KERNEL_SUPER : kernel) != 0 ||
+                      verify_fused_opt() != 0)) return 1;
     if (cores < 1 || cores > MAX_CORES || iterations < 1 || trials < 1 || trials > 32) return 2;
     if (format == FORMAT_FP4 && path == PATH_I8) {
         fprintf(stderr, "FP4 requires --path int16 or fp16\n");
         return 2;
     }
+    if (kernel >= KERNEL_OPT && path != PATH_F16 && path != PATH_FULL && path != PATH_I16) {
+        fprintf(stderr, "opt kernels require int16, fp16 or int16x8-full\n");
+        return 2;
+    }
+    if (kernel == KERNEL_OPT2 && path != PATH_F16) {
+        fprintf(stderr, "opt2 requires fp16\n");
+        return 2;
+    }
+    if (path == PATH_FULL && kernel != KERNEL_OPT) {
+        fprintf(stderr, "int16x8-full requires --kernel opt\n");
+        return 2;
+    }
+    if (compare && ((path != PATH_I16 && path != PATH_F16) || kernel < KERNEL_OPT)) {
+        fprintf(stderr, "--compare-kernels requires optimized int16 or fp16\n");
+        return 2;
+    }
     if ((format == FORMAT_FP4 || path == PATH_F16 || path == PATH_I16X8) &&
-        kernel != KERNEL_SUPER) {
+        kernel < KERNEL_SUPER) {
         fprintf(stderr, "FP4, FP16, and INT16x8 paths require --kernel super\n");
         return 2;
     }
-    size_t group = (path == PATH_I16 || path == PATH_I16X8) ?
-                   2 * BLOCK_BYTES : 4 * BLOCK_BYTES;
+    size_t group = group_bytes(path);
     size_t skew = skew_kib * 1024u;
     if (skew % group != 0) {
         fprintf(stderr, "--skew-kib must preserve the %zu-byte kernel group alignment\n", group);
         return 2;
     }
-    size_t bytes = mib * 1024u * 1024u;
-    bytes -= bytes % ((size_t)cores * group);
+    size_t weight_group = path == PATH_FULL ? 8192 : group;
+    size_t packed_bytes = mib * 1024u * 1024u;
+    packed_bytes -= packed_bytes % ((size_t)cores * weight_group);
+    size_t bytes = packed_bytes / weight_group * group;
     if (!bytes) return 2;
     uint8_t *packed = NULL;
     size_t allocation_bytes = bytes + (size_t)(cores - 1) * skew;
-    if (posix_memalign((void **)&packed, 256, allocation_bytes) != 0) return 1;
+    int pin_error = pin_cpu(core_base);
+    if (pin_error) { fprintf(stderr, "affinity: %s\n", strerror(pin_error)); return 1; }
+    if (posix_memalign((void **)&packed, 2u * 1024u * 1024u, allocation_bytes) != 0) return 1;
     (void)madvise(packed, allocation_bytes, MADV_HUGEPAGE);
-    if (pin_cpu(core_base) != 0) { perror("affinity"); return 1; }
     for (size_t i = 0; i < allocation_bytes; i += 256)
         for (size_t j = 0; j < 256; ++j) packed[i + j] = (uint8_t)(i + j * 13u);
+    if (path == PATH_FULL)
+        for (int c = 0; c < cores; ++c)
+            for (size_t offset = 0; offset < bytes / (size_t)cores; offset += group)
+                pack_weight_sums(packed + (size_t)c * (bytes / (size_t)cores + skew) + offset,
+                                 format == FORMAT_FP4);
+    report_fused_mapping(packed);
+    printf("# packed_bytes=%zu metadata_bytes=%zu group_bytes=%zu\n",
+           packed_bytes, bytes - packed_bytes, group);
     int8_t act8[4 * K_BLOCK] __attribute__((aligned(256)));
     int16_t act16[2 * K_BLOCK] __attribute__((aligned(256)));
     int8_t act16x8[4 * K_BLOCK] __attribute__((aligned(256)));
@@ -429,58 +506,75 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < sizeof(act8); ++i) act8[i] = (int8_t)(i % 15u - 7);
     for (size_t i = 0; i < sizeof(act16) / sizeof(act16[0]); ++i) act16[i] = (int16_t)(i % 127u - 63);
     if (pack_i16x8(act16x8, act16, 2) != 0) return 1;
+    if (path == PATH_FULL) {
+        for (int i = 0; i < 256; ++i) act16[i] = (int16_t)(i * 257 - 32768);
+        uint64_t pack_begin = cntvct();
+        for (int i = 0; i < 10000; ++i) pack_i16x8_full(act16x8, act16, 2);
+        printf("# activation_pack_ns=%.2f per_256_values\n",
+               (double)(cntvct() - pack_begin) * 1e9 / (double)cntfrq() / 10000);
+    }
     for (size_t i = 0; i < sizeof(actf16) / sizeof(actf16[0]); ++i)
         actf16[i] = (_Float16)((int)(i % 7u) - 3);
-    double values[32];
-    for (int run = 0; run <= trials; ++run) {
-        pthread_t threads[MAX_CORES];
-        worker workers[MAX_CORES];
-        atomic_int ready, start;
-        atomic_init(&ready, 0); atomic_init(&start, 0);
-        size_t per_core = bytes / (size_t)cores;
-        for (int c = 0; c < cores; ++c) {
-            workers[c] = (worker){ .packed = packed + (size_t)c * (per_core + skew),
-                .activation = path == PATH_I8 ? (const void *)act8 :
-                              path == PATH_I16 ? (const void *)act16 :
-                              path == PATH_I16X8 ? (const void *)act16x8 :
-                              (const void *)actf16,
-                .bytes = per_core, .iterations = iterations, .cpu = core_base + c,
-                .path = path, .format = format,
-                .ready = &ready, .start = &start };
-            workers[c].kernel = kernel;
-            int rc = pthread_create(&threads[c], NULL, run_worker, &workers[c]);
-            if (rc) { fprintf(stderr, "pthread_create: %s\n", strerror(rc)); return 1; }
+    double values[32], paired_read[2] = {0,0};
+    for (int phase = paired ? 0 : 1; phase <= (paired ? 2 : 1); ++phase) {
+        for (int reference = phase == 1 && compare; reference >= 0; --reference) {
+            kernel_kind measured_kernel = reference ? KERNEL_SUPER : kernel;
+            for (int run = 0; run <= trials; ++run) {
+                pthread_t threads[MAX_CORES];
+                worker workers[MAX_CORES];
+                atomic_int ready, start;
+                atomic_init(&ready, 0); atomic_init(&start, 0);
+                size_t per_core = bytes / (size_t)cores;
+                for (int c = 0; c < cores; ++c) {
+                    workers[c] = (worker){ .packed = packed + (size_t)c * (per_core + skew),
+                        .activation = path == PATH_I8 ? (const void *)act8 :
+                                      path == PATH_I16 ? (const void *)act16 :
+                                      path == PATH_I16X8 || path == PATH_FULL ? (const void *)act16x8 :
+                                      (const void *)actf16,
+                        .bytes = per_core, .iterations = iterations, .cpu = core_base + c,
+                        .path = path, .format = format, .read_only = phase != 1,
+                        .ready = &ready, .start = &start };
+                    workers[c].kernel = measured_kernel;
+                    int rc = pthread_create(&threads[c], NULL, run_worker, &workers[c]);
+                    if (rc) { fprintf(stderr, "pthread_create: %s\n", strerror(rc)); return 1; }
+                }
+                while (atomic_load_explicit(&ready, memory_order_acquire) != cores) __asm__ volatile("yield");
+                atomic_store_explicit(&start, 1, memory_order_release);
+                uint64_t first = UINT64_MAX, last = 0, checksum = 0;
+                for (int c = 0; c < cores; ++c) {
+                    pthread_join(threads[c], NULL);
+                    if (workers[c].error) { fprintf(stderr, "worker: %s\n", strerror(workers[c].error)); return 1; }
+                    if (workers[c].begin < first) first = workers[c].begin;
+                    if (workers[c].end > last) last = workers[c].end;
+                    checksum += workers[c].checksum;
+                }
+                double seconds = (double)(last - first) / (double)cntfrq();
+                double bandwidth = (double)(phase == 1 ? packed_bytes : bytes) * iterations / seconds / 1e9;
+                if (run > 0) values[run - 1] = bandwidth;
+                printf("format=%s path=%s kernel=%s cores=%d skew_kib=%zu %s=%d %s=%.2f checksum=%lu\n",
+                       format == FORMAT_I4 ? "int4" : "fp4",
+                       phase == 1 ? path_name(path) : "paired-read",
+                       reported_kernel_name(path, measured_kernel),
+                       cores, skew_kib, run == 0 ? "warmup" : "trial", run == 0 ? 1 : run,
+                       phase == 1 ? "packed_GB/s" : "read_GB/s",
+                       bandwidth, (unsigned long)checksum);
+            }
+            for (int i = 0; i < trials; ++i)
+                for (int j = i + 1; j < trials; ++j)
+                    if (values[j] < values[i]) { double x = values[i]; values[i] = values[j]; values[j] = x; }
+            double median = (values[(trials - 1) / 2] + values[trials / 2]) / 2;
+            printf("summary format=%s path=%s kernel=%s cores=%d skew_kib=%zu %s=%.2f best=%.2f\n",
+                   format == FORMAT_I4 ? "int4" : "fp4",
+                   phase == 1 ? path_name(path) : "paired-read",
+                   reported_kernel_name(path, measured_kernel),
+                   cores, skew_kib, phase == 1 ? "packed_GB/s_median" : "read_GB/s_median",
+                   median, values[trials - 1]);
+            if (phase != 1) paired_read[phase / 2] = median;
         }
-        while (atomic_load_explicit(&ready, memory_order_acquire) != cores) __asm__ volatile("yield");
-        atomic_store_explicit(&start, 1, memory_order_release);
-        uint64_t first = UINT64_MAX, last = 0, checksum = 0;
-        for (int c = 0; c < cores; ++c) {
-            pthread_join(threads[c], NULL);
-            if (workers[c].error) { fprintf(stderr, "worker: %s\n", strerror(workers[c].error)); return 1; }
-            if (workers[c].begin < first) first = workers[c].begin;
-            if (workers[c].end > last) last = workers[c].end;
-            checksum += workers[c].checksum;
-        }
-        double seconds = (double)(last - first) / (double)cntfrq();
-        double bandwidth = (double)bytes * iterations / seconds / 1e9;
-        if (run > 0) values[run - 1] = bandwidth;
-        printf("format=%s path=%s kernel=%s cores=%d skew_kib=%zu %s=%d packed_GB/s=%.2f logical_Gweight/s=%.2f checksum=%lu\n",
-               format == FORMAT_I4 ? "int4" : "fp4",
-               path == PATH_I8 ? "int8" : path == PATH_I16 ? "int16" :
-               path == PATH_I16X8 ? "int16x8" : "fp16",
-               reported_kernel_name(path, kernel),
-               cores, skew_kib, run == 0 ? "warmup" : "trial", run == 0 ? 1 : run,
-               bandwidth, 2.0 * bandwidth, (unsigned long)checksum);
     }
-    for (int i = 0; i < trials; ++i)
-        for (int j = i + 1; j < trials; ++j)
-            if (values[j] < values[i]) { double x = values[i]; values[i] = values[j]; values[j] = x; }
-    printf("summary format=%s path=%s kernel=%s cores=%d skew_kib=%zu packed_GB/s_median=%.2f best=%.2f\n",
-           format == FORMAT_I4 ? "int4" : "fp4",
-           path == PATH_I8 ? "int8" : path == PATH_I16 ? "int16" :
-           path == PATH_I16X8 ? "int16x8" : "fp16",
-           reported_kernel_name(path, kernel),
-           cores, skew_kib, values[trials / 2], values[trials - 1]);
+    if (paired) printf("# paired_read_before=%.2f after=%.2f qualified=%s\n",
+                       paired_read[0], paired_read[1],
+                       paired_read[0] >= 220 && paired_read[1] >= 220 ? "yes" : "no");
     free(packed);
     return 0;
 }

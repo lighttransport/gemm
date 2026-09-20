@@ -4,7 +4,62 @@ Measured 2026-09-19 with Fujitsu `fcc` 4.12.2 on CPUs 12--23 of one 2.0 GHz
 A64FX CMG.  All end-to-end numbers below use `--sync atomic`; they are controls,
 not headline hardware-barrier results.
 
-## Outcome
+## W4A16 acceptance: 2026-09-20
+
+Both requested targets pass on CPUs 12--23 of one A64FX CMG. Every number
+below is packed-weight GB/s, with metadata reads and correction included in
+elapsed time. Three fresh launches each used 240 MiB of packed weights,
+ten iterations, five timed trials, and read controls before and after the
+kernel on the same allocation. Observed paired reads were 227.74--229.71
+GB/s; all mappings reported 2048 KiB pages and NUMA node 4.
+
+| format | arithmetic / selector | launch 1 median | launch 2 median | launch 3 median |
+|:-------|:----------------------|----------------:|----------------:|----------------:|
+| INT4 | full-range SDOT, `int16x8-full/opt` | 219.44 | 219.94 | 220.09 |
+| FP4 | full-range SDOT, `int16x8-full/opt` | 214.23 | 215.45 | 214.70 |
+| INT4 | sequential FP16 FMA, `fp16/opt2` | 171.84 | 172.04 | 172.00 |
+| FP4 | sequential FP16 FMA, `fp16/opt2` | 172.18 | 172.15 | 172.08 |
+| INT4 | native INT16 SDOT, `int16/opt` | 201.47 | 201.58 | 201.46 |
+| FP4 | native INT16 SDOT, `int16/opt` | 173.21 | 173.36 | 173.26 |
+
+On the same allocations, the original `super` kernels measured
+171.07--171.10 GB/s for native INT4/INT16, 154.87--155.03 for FP4/INT16,
+96.20--96.21 for INT4/FP16, and 84.49--84.56 for FP4/FP16.
+The one-K direct FP16 table schedule measured about 169.6 GB/s;
+the two-K schedule above is selected.
+
+The full-range route uses signed digits satisfying
+`a = lo + 256*hi + 128` for every INT16 input. Each 8192-byte supertile has
+a 256-byte INT16 weight-sum trailer (3.125% metadata). INT32 output includes
+`128*sum(weights)`. Packing 256 activation values takes approximately
+392 ns and is reported separately; static weight sums are prepared outside
+timing. No activation clipping is used.
+
+Correctness covers all 65,536 INT16 values, random weights, all constant
+nibble codes with alternating activation extremes, native INT16 results,
+and bit-exact FP16 comparison with scalar half FMA and the original kernel.
+Fractional values, signed zero, subnormals, cancellation, and overflow are
+included. The normal exhaustive module tests also pass.
+
+Commands:
+
+```sh
+TMPDIR="$PWD/tmp/dequant" make -C a64fx/dequant-pipe test CC=fcc
+bash a64fx/dequant-pipe/run_w4a16_acceptance.sh
+# acceptance=PASS qualified=18/18 SDOT=6 FP16=6 failed_targets=0
+```
+
+Raw logs for this run are in
+`tmp/dequant/w4a16-acceptance.ByB7iv/`. The script recreates the complete
+procedure, including `taskset -c 12` before XOS is loaded. The earlier
+119.92 GB/s radix-256 result was placement-confounded: a pinned rerun of the
+unchanged bounded kernel reached 219.99 GB/s (INT4) and 202.00 GB/s (FP4).
+It was not evidence that INT8 SDOT saturated at 120 GB/s.
+
+These remain unscaled M=1 compute probes, not end-to-end model rates.
+FP16 preserves its original half-precision accumulation semantics.
+
+## Earlier outcomes
 
 - Isolated 256-byte-cache-line HBM reads scale from **188.59 GB/s** with four
   cores to **229.96 GB/s median / 230.00 GB/s best** with eight cores.  This is
@@ -177,18 +232,16 @@ A subsequent two-block schedule issues all four cache-line loads before
 unpacking and alternates block-0/block-1 `sunpk` and SDOT work. Expanding the
 unpack window from four to six independent results raised the controlled
 INT4 result to **171.03 GB/s median / 171.04 best**, a 16.3% gain over 147.00
-GB/s. This is the current selected W4A16 integer kernel, but it remains below
-the requested 200 GB/s packed-input target.
+GB/s. That schedule was the starting point for the accepted kernels above.
 
 An alternative radix-256 kernel represents activation values in
 `[-32768, 32639]` exactly as two signed INT8 digits and computes
 `dot(lo) + 256*dot(hi)`.
-It passes scalar checks for both INT4 and FP4, but reaches only **119.92 GB/s
-median / 120.06 best** for INT4 on the controlled 12-core run. Removing
-`sunpk` does not compensate for the two INT8 accumulator streams on A64FX, so
-this path is retained only for comparison.
+Its initial INT4 result was **119.92 GB/s median / 120.06 best**, but this
+run lacked a same-allocation read control and startup affinity. The rejection
+was invalid; see the corrected measurements and full-range successor above.
 
-The remaining controlled gap is arithmetic. Relative to W4A8, W4A16 doubles
+For the original widened kernels, relative to W4A8, W4A16 doubles
 the dot-product count per packed line and adds four signed-byte-to-halfword
 unpacks per 64-byte load. FP4 adds table lookup; FP16 adds integer widening,
 conversion, and half-precision FMA. These paths are therefore issue/dependency

@@ -20,7 +20,7 @@ bench_hbm_read: bench_hbm_read.o kernels.o
 bench_hbm_color: bench_hbm_color.o kernels.o
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
-bench_fused_sdot: bench_fused_sdot.o kernels.o
+bench_fused_sdot: bench_fused_sdot.o kernels.o kernels_opt.o fused_opt.o
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
 bench_dequant_pipe.o: bench_dequant_pipe.c hwb_compat.h
@@ -35,11 +35,17 @@ bench_hbm_read.o: bench_hbm_read.c
 bench_hbm_color.o: bench_hbm_color.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-bench_fused_sdot.o: bench_fused_sdot.c
+bench_fused_sdot.o: bench_fused_sdot.c fused_opt.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 kernels.o: kernels.S
 	$(CC) -Nclang -march=armv8.2-a+sve -c $< -o $@
+
+kernels_opt.o: kernels_opt.S
+	$(CC) -Nclang -march=armv8.2-a+sve -c $< -o $@
+
+fused_opt.o: fused_opt.c fused_opt.h
+	$(CC) $(CFLAGS) -c $< -o $@
 
 test: bench_dequant_pipe bench_fused_sdot
 	./bench_dequant_pipe --self-test
@@ -47,4 +53,4 @@ test: bench_dequant_pipe bench_fused_sdot
 		--cores 1 --mib 1 --iterations 1 --trials 1
 
 clean:
-	rm -f $(TARGETS) bench_dequant_pipe.o bench_null_pipe.o bench_hbm_read.o bench_hbm_color.o bench_fused_sdot.o kernels.o
+	rm -f $(TARGETS) bench_dequant_pipe.o bench_null_pipe.o bench_hbm_read.o bench_hbm_color.o bench_fused_sdot.o kernels.o kernels_opt.o fused_opt.o

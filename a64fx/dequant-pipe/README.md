@@ -118,31 +118,63 @@ the low and high nibbles of each byte hold complete 16-column SDOT vectors,
 removing two byte permutations before widening.  A model converter must emit
 that layout when selecting the INT16 kernel.
 
-The W4A16 extension covers both signed INT4 and E2M1 FP4 with two arithmetic
-routes:
+The W4A16 extension covers both signed INT4 and E2M1 FP4:
 
 - `--path int16 --kernel super` expands into INT16 registers and uses the
   INT16-to-INT64 SVE `sdot`. Its two K=128 blocks are interleaved by K quartet,
   producing one sequential packed stream and 16 independent accumulator
   vectors. FP4 uses the exact doubled-integer E2M1 table and folds the factor
   of one half into the eventual block scale.
+- `--path int16 --kernel opt` preserves the same interface. INT4 delays the
+  low-nibble divide by 16 until the INT64 epilogue; FP4 loads bytes directly
+  into halfword lanes and looks up signed INT16 values.
 - `--path int16x8 --kernel super` is an exact experimental radix-256 form for
   activations in `[-32768, 32639]`. Each activation is packed as two signed
   bytes, `a = lo + 256*hi`, and two ordinary INT8 SDOT streams are combined
-  into INT32. It removes weight widening, but is slower on A64FX because the
-  INT8 SDOT route saturates before HBM. It remains selectable as a documented
-  rejected alternative rather than replacing the INT16-to-INT64 kernel.
+  into INT32. The earlier 120 GB/s rejection was a placement-confounded
+  measurement: startup affinity raised INT4 to 219.99 and FP4 to 202.00 GB/s.
+  This bounded route remains a comparison; use the full-range route below.
+- `--path int16x8-full --kernel opt` represents every INT16 value exactly as
+  `a = lo + 256*hi + 128`. Each 8192-byte two-block supertile is followed by
+  128 signed INT16 column sums (256 bytes). The kernel adds
+  `128*sum(weights)` in its INT32 epilogue. The 8448-byte record adds 3.125%
+  metadata; metadata reads and correction are inside the kernel timing.
 - `--path fp16 --kernel super` uses a separate N-lane layout. For each K
   scalar, 32 packed bytes hold 64 output columns; four independent blocks are
   adjacent. Each load expands directly into two 32-lane FP16 vectors and is
   consumed by FP16 FMA without an expanded-weight store. This experimental
   kernel accumulates in FP16 and therefore needs a production overflow/error
   gate, just like the staged FP16 route.
+- `--path fp16 --kernel opt2` is the selected FP16 kernel. Widening byte
+  loads, register masking, and halfword table lookup decode directly to FP16,
+  eliminating `sunpk` and `scvtf`. Two K steps use separate temporary
+  registers while retaining the original sequential FMA order.
+  `--kernel opt` exposes the slightly slower one-K version.
 
-Both are unscaled compute-kernel bandwidth probes. They demonstrate direct
+These are unscaled compute-kernel bandwidth probes. They demonstrate direct
 dequantization and arithmetic, but a production block-quantized GEMV must add
 scale application and a wider accumulation policy where model accuracy
 requires it.
+
+The optimized paths passed three independent launches for both formats:
+full-range SDOT exceeds 200 GB/s and FP16 exceeds 150 GB/s in every launch.
+Run the complete acceptance procedure with:
+
+```sh
+TMPDIR="$PWD/tmp/dequant" make -C a64fx/dequant-pipe test CC=fcc
+bash a64fx/dequant-pipe/run_w4a16_acceptance.sh
+```
+
+The runner records all results under repository-local `tmp/dequant/` and
+returns failure if either target is missed or any paired read is below
+220 GB/s. It sets CPU affinity **before** XOS initialization, uses 2 MiB
+pages, and records actual page sizes and NUMA placement. Setting affinity
+only after allocating does not reliably establish local placement.
+`--paired-baseline` brackets the kernel with reads on the same allocation.
+`--compare-kernels` additionally measures the original `super` kernel on
+the same buffer for native INT16 and FP16. Paired reads count all bytes,
+including metadata; kernel packed GB/s counts only compressed weights.
+Activation digit packing is reported separately in ns per 256 values.
 
 ```sh
 a64fx/dequant-pipe/bench_fused_sdot --verify \

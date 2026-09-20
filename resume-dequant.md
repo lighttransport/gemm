@@ -256,15 +256,33 @@ Q38TP_RANK=0 Q38TP_SIZE=4 ./a64fx/llm/build/qwen38_kquant_stage \
 
 ### A64FX W4A16 fused-kernel follow-up (2026-09-20)
 
-The direct INT16 SDOT supertile was rescheduled to keep both K=128 blocks and
-four cache lines in flight. Correctness passes for INT4 and FP4; the controlled
-INT4 rate improved from 147.00 to **171.03 GB/s median (171.04 best)**. The
-200+ GB/s packed-input target remains open. An exact two-signed-byte
-radix-256 activation path was added and verified, but measured only 119.92
-GB/s median, so it is a rejected comparison path. Remaining single-node work:
-reduce INT4 nibble sign-extension/unpack issue cost or find a schedule/layout
-that raises the selected INT16-to-INT64 kernel by another 17%; then rerun the
-paired W4A8 control in the same XOS allocation and repeat FP4 measurements.
+Both requested single-CMG targets now pass for INT4 and E2M1 FP4. Three fresh
+launches (240 MiB packed weights, 12 cores, ten iterations, five trials) gave:
+
+| path | INT4 median range, GB/s | FP4 median range, GB/s |
+|:-----|-----------------------:|----------------------:|
+| full-range SDOT, `int16x8-full/opt` | 219.44--220.09 | 214.23--215.45 |
+| sequential FP16, `fp16/opt2` | 171.84--172.04 | 172.08--172.18 |
+| native INT16 SDOT, `int16/opt` | 201.46--201.58 | 173.21--173.36 |
+
+The full-range route uses `a = lo + 256*hi + 128` and a 256-byte signed
+weight-sum trailer per 8192-byte supertile. Metadata reads and correction are
+timed; packed GB/s excludes metadata from its numerator. All INT16 inputs are
+representable. FP16 table decoding eliminates integer widening/conversion
+and preserves sequential FMA rounding bit-for-bit.
+
+Correctness covers all 65,536 INT16 values and both formats, signed extremes,
+random weights, constant nibble codes, and scalar/original FP16 comparisons.
+The prior radix-256 rejection at 119.92 GB/s was placement-confounded:
+affinity before XOS startup raised the unchanged bounded kernel above
+200 GB/s. The acceptance script now records page/NUMA backing and brackets
+each kernel with reads on the same allocation; all eighteen runs qualified.
+
+Reproduce with `bash a64fx/dequant-pipe/run_w4a16_acceptance.sh`.
+Recorded logs: `tmp/dequant/w4a16-acceptance.ByB7iv/`; details are in
+`a64fx/dequant-pipe/RESULTS.md` and `a64fx/doc/fused-dequant.md`.
+These are unscaled M=1 kernel rates. Production scale epilogues, arbitrary
+tails, model integration, and wider FP accumulation remain separate work.
 
 ```text
 Continue the active goal in resume-dequant.md: finish and accept safe rank-local
