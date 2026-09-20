@@ -3267,6 +3267,57 @@ static const char *hip_kernel_source =
 "        if (i < d_state) S[i] = s[rr];\n"
 "    }\n"
 "}\n"
+"/* Exact multi-token verifier recurrence with a rollback checkpoint after\n"
+" * every row.  The canonical state is left untouched; commit copies the\n"
+" * selected checkpoint after target acceptance is known. */\n"
+"__global__ void deltanet_step_batch_gda_verify_f32(\n"
+"    const float *state, float *checkpoints, float *out_batch,\n"
+"    const float *Q_batch, const float *K_batch, const float *V_batch,\n"
+"    const float *alpha_batch, const float *beta_batch,\n"
+"    int dt_rank, int d_state, int v_row_stride, int M) {\n"
+"    int h = blockIdx.x, lane = threadIdx.x;\n"
+"    int col = blockIdx.z * blockDim.y + threadIdx.y;\n"
+"    if (h >= dt_rank || col >= d_state || lane >= 32) return;\n"
+"    const int rows_per_lane = (d_state + 31) / 32;\n"
+"    float s[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
+"    const float *S = state + (size_t)h * d_state * d_state +\n"
+"                     (size_t)col * d_state;\n"
+"    for (int rr = 0; rr < rows_per_lane; ++rr) {\n"
+"        int i = rr * 32 + lane;\n"
+"        s[rr] = i < d_state ? S[i] : 0.0f;\n"
+"    }\n"
+"    const float scale = rsqrtf((float)d_state);\n"
+"    const size_t per_tok = (size_t)dt_rank * d_state;\n"
+"    const size_t per_state = per_tok * d_state;\n"
+"    for (int m = 0; m < M; ++m) {\n"
+"        size_t base = (size_t)m * per_tok + (size_t)h * d_state;\n"
+"        const float decay = expf(alpha_batch[(size_t)m * dt_rank + h]);\n"
+"        float k[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
+"        float q[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
+"        float kv = 0.0f;\n"
+"        for (int rr = 0; rr < rows_per_lane; ++rr) {\n"
+"            int i = rr * 32 + lane;\n"
+"            k[rr] = i < d_state ? K_batch[base + i] : 0.0f;\n"
+"            q[rr] = i < d_state ? Q_batch[base + i] : 0.0f;\n"
+"            kv += s[rr] * k[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) kv += __shfl_xor(kv, off);\n"
+"        const float delta = (V_batch[(size_t)m * v_row_stride +\n"
+"                                      (size_t)h * d_state + col] - decay * kv) *\n"
+"                            beta_batch[(size_t)m * dt_rank + h];\n"
+"        float y = 0.0f;\n"
+"        for (int rr = 0; rr < rows_per_lane; ++rr) {\n"
+"            int i = rr * 32 + lane;\n"
+"            s[rr] = decay * s[rr] + k[rr] * delta;\n"
+"            y += s[rr] * q[rr];\n"
+"            if (i < d_state)\n"
+"                checkpoints[(size_t)m * per_state +\n"
+"                            ((size_t)h * d_state + col) * d_state + i] = s[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) y += __shfl_xor(y, off);\n"
+"        if (lane == 0) out_batch[base + col] = y * scale;\n"
+"    }\n"
+"}\n"
 "/* ---- 25. gated_rmsnorm_silu_f32 ---- */\n"
 "__global__ void gated_rmsnorm_silu_f32(\n"
 "    float *out, const float *z, const float *norm_w,\n"
@@ -3452,6 +3503,7 @@ static const char *hip_kernel_source =
 "#define CONV1D_BATCH_MAX_K 8\n"
 "__global__ void conv1d_depthwise_silu_batch_f32(\n"
 "    float *conv_out_batch, float *conv_state,\n"
+"    float *checkpoints,\n"
 "    const float *input_batch, const float *weight,\n"
 "    int qkv_dim, int conv_k, int row_stride, int M) {\n"
 "    int j = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -3476,9 +3528,15 @@ static const char *hip_kernel_source =
 "        /* Shift state: drop oldest, append current input. */\n"
 "        for (int f = 0; f < conv_k - 2; f++) st[f] = st[f + 1];\n"
 "        st[conv_k - 2] = in_val;\n"
+"        if (checkpoints) {\n"
+"            size_t checkpoint = (size_t)m * (conv_k - 1) * qkv_dim;\n"
+"            for (int f = 0; f < conv_k - 1; ++f)\n"
+"                checkpoints[checkpoint + (size_t)f * qkv_dim + j] = st[f];\n"
+"        }\n"
 "    }\n"
 "    /* Store final state back to global. */\n"
-"    for (int f = 0; f < conv_k - 1; f++) conv_state[f * qkv_dim + j] = st[f];\n"
+"    if (!checkpoints)\n"
+"        for (int f = 0; f < conv_k - 1; f++) conv_state[f * qkv_dim + j] = st[f];\n"
 "}\n"
 
 "/* ---- 21c. ssm_prep_batch_f32 -------------------------------------------\n"
@@ -12801,6 +12859,7 @@ struct hip_llm_runner {
     hipFunction_t fn_glm5next_mhc_finish_f32;
     hipFunction_t fn_deltanet_step_batch_f32;
     hipFunction_t fn_deltanet_step_batch_gda_ref_f32;
+    hipFunction_t fn_deltanet_step_batch_gda_verify_f32;
     hipFunction_t fn_l2_norm_heads_batch_f32;
     hipFunction_t fn_l2_norm_repeat_qk_batch_f32;
     hipFunction_t fn_repeat_tile_batch_f32;
@@ -13896,6 +13955,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(glm5next_mhc_finish_f32);
     GET_FUNC(deltanet_step_batch_f32);
     GET_FUNC(deltanet_step_batch_gda_ref_f32);
+    GET_FUNC(deltanet_step_batch_gda_verify_f32);
     GET_FUNC(l2_norm_heads_batch_f32);
     GET_FUNC(l2_norm_repeat_qk_batch_f32);
     GET_FUNC(repeat_tile_batch_f32);
@@ -22204,6 +22264,24 @@ static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
            (size_t)r->q8_attention_max_splits * 2 * sizeof(float), r->stream, b);
 }
 
+static inline void launch_attn_verify_native_q8(hip_llm_runner *r, void *out,
+        void *parts, void *meta, void *q, void *k, void *v, void *ks,
+        void *vs, void *positions, int queries) {
+    /* Match scalar decode's pinned split contract while exposing every query
+     * in the exact window to one launch.  Each query reads its device-resident
+     * causal position, so the captured graph remains reusable. */
+    int occupancy = 11, forced_splits = 0, position_start = -1;
+    void *a[] = { &out, &parts, &meta, &q, &k, &v, &ks, &vs, &positions,
+        &r->n_heads, &r->n_kv_heads, &r->q8_attention_nsm, &occupancy,
+        &forced_splits, &queries, &position_start };
+    LAUNCH(r->fn_q8_attention_decode, queries, r->q8_attention_max_splits,
+           r->n_heads, 32, 4, 1, 0, r->stream, a);
+    void *b[] = { &out, &parts, &meta, &positions, &r->n_heads,
+        &r->q8_attention_nsm, &occupancy, &forced_splits };
+    LAUNCH(r->fn_q8_attention_combine, r->n_heads, queries, 1, 256, 1, 1,
+           (size_t)r->q8_attention_max_splits * 2 * sizeof(float), r->stream, b);
+}
+
 static int launch_attn_prefill_native_q8(hip_llm_runner *r, void *out,
         void *q, void *k, void *v, void *ks, void *vs, int queries, int position_start) {
     /* At long context the exact vector kernel re-reads K/V for every query.
@@ -22630,6 +22708,16 @@ static inline void launch_repeat_tile_batch(hip_llm_runner *r, void *dst, void *
 static inline void launch_gated_rmsnorm_silu_batch(hip_llm_runner *r, void *out,
     void *z, void *norm_w, int dt_rank, int d_state, int row_stride, int M,
     float eps) {
+    if (r->fn_qwen35_rmsnorm_reference && !r->is_qwen4exp &&
+        row_stride == dt_rank * d_state) {
+        launch_rmsnorm_batch(r, out, out, norm_w, d_state, M * dt_rank,
+                             d_state, eps);
+        int n = M * dt_rank * d_state;
+        void *a[] = { &out, &z, &n };
+        LAUNCH(r->fn_qwen35_silu_gate_reference, (n + 255) / 256, 1, 1,
+               256, 1, 1, 0, r->stream, a);
+        return;
+    }
     int threads = (d_state <= 128) ? 128 : 256;
     int gate_silu = !r->is_qwen4exp;
     void *args[] = { &out, &z, &norm_w, &dt_rank, &d_state, &row_stride, &M, &eps, &gate_silu };
@@ -22638,12 +22726,24 @@ static inline void launch_gated_rmsnorm_silu_batch(hip_llm_runner *r, void *out,
 }
 
 static inline void launch_conv1d_batch(hip_llm_runner *r, void *conv_out_batch,
-    void *conv_state, void *input_batch, void *weight,
+    void *conv_state, void *checkpoints, void *input_batch, void *weight,
     int qkv_dim, int conv_k, int row_stride, int M) {
-    void *args[] = { &conv_out_batch, &conv_state, &input_batch, &weight,
+    void *args[] = { &conv_out_batch, &conv_state, &checkpoints, &input_batch,
+                     &weight,
                      &qkv_dim, &conv_k, &row_stride, &M };
     LAUNCH(r->fn_conv1d_depthwise_silu_batch_f32, (qkv_dim + 255) / 256, 1, 1,
            256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_deltanet_step_batch_verify(hip_llm_runner *r,
+    void *state, void *checkpoints, void *out_batch, void *Q_batch,
+    void *K_batch, void *V_batch, void *alpha_batch, void *beta_batch,
+    int dt_rank, int d_state, int v_row_stride, int M) {
+    void *args[] = { &state, &checkpoints, &out_batch, &Q_batch, &K_batch,
+                     &V_batch, &alpha_batch, &beta_batch, &dt_rank, &d_state,
+                     &v_row_stride, &M };
+    LAUNCH(r->fn_deltanet_step_batch_gda_verify_f32, dt_rank, 1,
+           (d_state + 3) / 4, 32, 4, 1, 0, r->stream, args);
 }
 
 static inline void launch_ssm_prep_batch(hip_llm_runner *r, void *conv_out_batch,
@@ -29821,7 +29921,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                     qkv_dim, dt_rank * d_state, M, eps);
             } else if (batch_conv_env && atoi(batch_conv_env) != 0) {
                 launch_conv1d_batch(r, r->d_ssm_conv_out_batch, cl->d_conv_state,
-                                    r->d_ssm_qkv_batch, cl->ssm_conv1d_w,
+                                    NULL, r->d_ssm_qkv_batch, cl->ssm_conv1d_w,
                                     qkv_dim, conv_k, qkv_dim, M);
             } else {
                 /* Scalar conv preserves the exact state/update arithmetic;

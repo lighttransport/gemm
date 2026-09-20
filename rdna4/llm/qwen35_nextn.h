@@ -21,6 +21,7 @@ typedef struct hllm_qwen35_mtp {
     void *verify_quant_source;
     int verify_quant_rows, verify_quant_cols;
     void *verify_ssm_qkv, *verify_ssm_z, *verify_ssm_alpha, *verify_ssm_beta, *verify_ssm_out;
+    void *verify_attn_parts, *verify_attn_meta;
     void *verify_conv[128], *verify_rec[128];
     float *host_logits;
     hipGraph_t graphs[HLLM_DENSE_MTP_MAX_ROWS + 1];
@@ -42,6 +43,7 @@ static void hllm_free_qwen35_mtp(hip_llm_runner *r) {
     DENSE_FREE(m->verify_q); DENSE_FREE(m->verify_scales);
     DENSE_FREE(m->verify_ssm_qkv); DENSE_FREE(m->verify_ssm_z);
     DENSE_FREE(m->verify_ssm_alpha); DENSE_FREE(m->verify_ssm_beta); DENSE_FREE(m->verify_ssm_out);
+    DENSE_FREE(m->verify_attn_parts); DENSE_FREE(m->verify_attn_meta);
     for (int i = 0; i < 128; ++i) {
         DENSE_FREE(m->verify_conv[i]); DENSE_FREE(m->verify_rec[i]);
     }
@@ -317,9 +319,7 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
     switch (type) {
         case GGML_TYPE_Q2_K:
             if (rows <= HLLM_DENSE_MTP_REUSE_ROWS && nc <= 6144) {
-                fn = rows <= HLLM_DENSE_MTP_SMALL_REUSE_ROWS ?
-                    r->fn_qwen35_matvec_q2k_multi4 :
-                    r->fn_qwen35_matvec_q2k_multi8;
+                fn = r->fn_qwen35_matvec_q2k_multi4;
             }
             break;
         case GGML_TYPE_IQ2_XXS: fn = r->fn_qwen35_matvec_iq2xxs; break;
@@ -342,8 +342,21 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
         }
         void *a[] = { &dst, &w, &m->verify_q, &m->verify_scales, &nr, &nc };
         if (type == GGML_TYPE_Q2_K) {
-            void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales, &nr, &nc, &rows };
+            int first = rows <= HLLM_DENSE_MTP_SMALL_REUSE_ROWS ? rows :
+                HLLM_DENSE_MTP_SMALL_REUSE_ROWS;
+            void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
+                           &nr, &nc, &first };
             LAUNCH(fn, (nr+3)/4, 1, 1, 128, 1, 1, 0, r->stream, ma);
+            if (rows > first) {
+                int tail = rows - first;
+                void *tail_dst = (float *)dst + (size_t)first*nr;
+                void *tail_q = (signed char *)m->verify_q + (size_t)first*nc;
+                void *tail_scales = (float *)m->verify_scales +
+                    (size_t)first*(nc/32);
+                void *ta[] = { &tail_dst, &w, &tail_q, &tail_scales,
+                               &nr, &nc, &tail };
+                LAUNCH(fn, (nr+3)/4, 1, 1, 128, 1, 1, 0, r->stream, ta);
+            }
         } else if (rows > HLLM_DENSE_MTP_SMALL_REUSE_ROWS &&
                    type == GGML_TYPE_IQ4_XS) {
             void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
@@ -379,40 +392,60 @@ static void hllm_dense_mtp_ssm(hip_llm_runner *r, hip_layer *cl, int l, int rows
                               size_t conv, size_t rec) {
     hllm_qwen35_mtp *m = r->qwen35_mtp;
     int ne = r->n_embd, dt = r->ssm_dt_rank, ds = r->ssm_d_state;
+    int qkv_dim = r->ssm_qkv_dim, d_inner = r->ssm_d_inner;
+    int n_group = r->ssm_n_group, conv_k = r->ssm_conv_kernel;
     float eps = r->rms_norm_eps;
+    (void)conv;
+    (void)rec;
     launch_rmsnorm_batch(r, m->verify_norm, m->verify_x, cl->attn_norm_w,
                          ne, rows, ne, eps);
     hllm_dense_mtp_projection(r, m->verify_ssm_qkv, cl->ssm_qkv_w, m->verify_norm,
         rows, cl->ssm_qkv_rows, cl->ssm_qkv_cols, cl->ssm_qkv_type);
     hllm_dense_mtp_projection(r, m->verify_ssm_z, cl->ssm_gate_w, m->verify_norm,
         rows, cl->ssm_gate_rows, cl->ssm_gate_cols, cl->ssm_gate_type);
-    void *qkv = r->d_ssm_qkv, *z = r->d_ssm_z, *alpha = r->d_ssm_alpha;
-    void *beta = r->d_ssm_beta, *out = r->d_ssm_out;
     for (int i = 0; i < rows; ++i) {
-        r->d_ssm_qkv = (float *)m->verify_ssm_qkv+(size_t)i*r->ssm_qkv_dim;
-        r->d_ssm_z = (float *)m->verify_ssm_z+(size_t)i*r->ssm_d_inner;
-        r->d_ssm_alpha = (float *)m->verify_ssm_alpha+(size_t)i*dt;
-        r->d_ssm_beta = (float *)m->verify_ssm_beta+(size_t)i*dt;
-        r->d_ssm_out = (float *)m->verify_ssm_out+(size_t)i*r->ssm_d_inner;
         void *x = (float *)m->verify_norm+(size_t)i*ne;
         if (cl->ssm_alpha_type == GGML_TYPE_BF16)
-            launch_matvec_llama_bf16(r, r->d_ssm_alpha, cl->ssm_alpha_w, x, dt, ne);
-        else launch_matvec_llama_f16(r, r->d_ssm_alpha, cl->ssm_alpha_w, x, dt, ne);
+            launch_matvec_llama_bf16(r, (float *)m->verify_ssm_alpha+(size_t)i*dt,
+                                     cl->ssm_alpha_w, x, dt, ne);
+        else launch_matvec_llama_f16(r, (float *)m->verify_ssm_alpha+(size_t)i*dt,
+                                     cl->ssm_alpha_w, x, dt, ne);
         if (cl->ssm_beta_type == GGML_TYPE_BF16)
-            launch_matvec_llama_bf16(r, r->d_ssm_beta, cl->ssm_beta_w, x, dt, ne);
-        else launch_matvec_llama_f16(r, r->d_ssm_beta, cl->ssm_beta_w, x, dt, ne);
-        forward_dense_ssm_core(r, cl, l);
-        const char *separate = getenv("LLM_QWEN35_SSM_NORM_SEPARATE");
-        if (separate && atoi(separate)) {
-            launch_rmsnorm_heads_inplace(r, r->d_ssm_out, cl->ssm_norm_w, dt, ds, eps);
-            launch_silu_gate_mul(r, r->d_ssm_out, r->d_ssm_z, dt*ds);
-        } else launch_gated_rmsnorm_silu(r, r->d_ssm_out, r->d_ssm_z, cl->ssm_norm_w, dt, ds, eps);
-        hipMemcpyAsync((char *)m->verify_conv[l]+(size_t)i*conv,
-            cl->d_conv_state, conv, hipMemcpyDeviceToDevice, r->stream);
-        hipMemcpyAsync((char *)m->verify_rec[l]+(size_t)i*rec,
-            cl->d_recurrent_state, rec, hipMemcpyDeviceToDevice, r->stream);
+            launch_matvec_llama_bf16(r, (float *)m->verify_ssm_beta+(size_t)i*dt,
+                                     cl->ssm_beta_w, x, dt, ne);
+        else launch_matvec_llama_f16(r, (float *)m->verify_ssm_beta+(size_t)i*dt,
+                                     cl->ssm_beta_w, x, dt, ne);
     }
-    r->d_ssm_qkv=qkv; r->d_ssm_z=z; r->d_ssm_alpha=alpha; r->d_ssm_beta=beta; r->d_ssm_out=out;
+
+    launch_softplus_mul_batch(r, m->verify_ssm_alpha, m->verify_ssm_alpha,
+                              cl->ssm_dt_bias, cl->ssm_a, dt, rows);
+    launch_sigmoid_inplace(r, m->verify_ssm_beta, rows*dt);
+    launch_conv1d_batch(r, r->d_ssm_conv_out_batch, cl->d_conv_state,
+                        m->verify_conv[l], m->verify_ssm_qkv, cl->ssm_conv1d_w,
+                        qkv_dim, conv_k, qkv_dim, rows);
+
+    /* Keep llama.cpp's two-stage L2 normalization reduction order.  The
+     * normalized rows can then be expanded together because repeat-tile is a
+     * pure copy. */
+    for (int i = 0; i < rows; ++i) {
+        float *q = (float *)r->d_ssm_conv_out_batch+(size_t)i*qkv_dim;
+        float *k = q+(size_t)n_group*ds;
+        launch_l2_norm_heads(r, q, n_group, ds, eps);
+        launch_l2_norm_heads(r, k, n_group, ds, eps);
+    }
+    launch_repeat_tile_batch(r, r->d_ssm_Q_exp_batch, r->d_ssm_conv_out_batch,
+                             dt, ds, n_group, qkv_dim, d_inner, rows);
+    launch_repeat_tile_batch(r, r->d_ssm_K_exp_batch,
+                             (float *)r->d_ssm_conv_out_batch+(size_t)n_group*ds,
+                             dt, ds, n_group, qkv_dim, d_inner, rows);
+
+    float *v = (float *)r->d_ssm_conv_out_batch+(size_t)2*n_group*ds;
+    launch_deltanet_step_batch_verify(r, cl->d_recurrent_state, m->verify_rec[l],
+        m->verify_ssm_out, r->d_ssm_Q_exp_batch, r->d_ssm_K_exp_batch, v,
+        m->verify_ssm_alpha, m->verify_ssm_beta, dt, ds, qkv_dim, rows);
+    launch_gated_rmsnorm_silu_batch(r, m->verify_ssm_out, m->verify_ssm_z,
+                                    cl->ssm_norm_w, dt, ds, d_inner, rows, eps);
+
     hllm_dense_mtp_projection(r, m->verify_norm, cl->ssm_out_w, m->verify_ssm_out,
         rows, cl->ssm_out_rows, cl->ssm_out_cols, cl->ssm_out_type);
     const char *split = getenv("LLM_QWEN35_SPLIT_RES_RMSNORM");
@@ -463,7 +496,6 @@ static void hllm_dense_mtp_attention(hip_llm_runner *r, hip_layer *cl,
         void *q = (float *)r->d_q_batch+(size_t)i*qd;
         void *k = (float *)r->d_k_batch+(size_t)i*kd;
         void *v = (float *)r->d_v_batch+(size_t)i*kd;
-        void *out = (float *)r->d_attn_out_batch+(size_t)i*qd;
         hipMemcpyAsync(r->d_position, (int *)m->verify_positions+i,
                        sizeof(int), hipMemcpyDeviceToDevice, r->stream);
         launch_rope_devp(r, q, r->n_heads, r->head_dim, r->rope_freq_base);
@@ -473,10 +505,11 @@ static void hllm_dense_mtp_attention(hip_llm_runner *r, hip_layer *cl,
             &r->n_kv_heads, &r->head_dim, &r->d_position };
         LAUNCH(r->fn_kv_cache_store_q8q8_devp, r->n_kv_heads, 1, 1,
                256, 1, 1, 0, r->stream, a);
-        launch_attn_decode_native_q8(r, out, q, r->d_key_cache[l],
-            r->d_value_cache[l], r->d_key_cache_scale[l],
-            r->d_value_cache_scale[l]);
     }
+    launch_attn_verify_native_q8(r, r->d_attn_out_batch,
+        m->verify_attn_parts, m->verify_attn_meta, r->d_q_batch,
+        r->d_key_cache[l], r->d_value_cache[l], r->d_key_cache_scale[l],
+        r->d_value_cache_scale[l], m->verify_positions, rows);
     launch_sigmoid_mul(r, r->d_attn_out_batch, r->d_attn_gate_batch,
                        rows*qd);
     hllm_dense_mtp_projection(r, r->d_attn_proj_batch,
@@ -517,6 +550,10 @@ float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
             hipMalloc(&m->verify_ssm_out, (size_t)capacity*r->ssm_d_inner*sizeof(float)) ||
             hipMalloc(&m->verify_ssm_alpha, (size_t)capacity*r->ssm_dt_rank*sizeof(float)) ||
             hipMalloc(&m->verify_ssm_beta, (size_t)capacity*r->ssm_dt_rank*sizeof(float)) ||
+            hipMalloc(&m->verify_attn_parts, (size_t)capacity*r->n_heads*
+                r->q8_attention_max_splits*r->head_dim*sizeof(float)) ||
+            hipMalloc(&m->verify_attn_meta, (size_t)capacity*r->n_heads*
+                r->q8_attention_max_splits*2*sizeof(float)) ||
             hipMalloc(&m->verify_logits, (size_t)capacity*r->n_vocab*sizeof(float)) ||
             hipMalloc(&m->verify_positions, (size_t)capacity*sizeof(int))) return NULL;
         m->host_logits = malloc((size_t)capacity*r->n_vocab*sizeof(float));
@@ -547,11 +584,14 @@ float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
                 r->fn_qwen35_matvec_iq3xxs;
             int grouped_ssm = grouped && cl->is_ssm &&
                 (cl->ssm_alpha_type == GGML_TYPE_F16 || cl->ssm_alpha_type == GGML_TYPE_BF16) &&
-                (cl->ssm_beta_type == GGML_TYPE_F16 || cl->ssm_beta_type == GGML_TYPE_BF16);
+                (cl->ssm_beta_type == GGML_TYPE_F16 || cl->ssm_beta_type == GGML_TYPE_BF16) &&
+                r->d_ssm_conv_out_batch && r->d_ssm_Q_exp_batch &&
+                r->d_ssm_K_exp_batch && r->fn_deltanet_step_batch_gda_verify_f32;
             int grouped_attn = grouped && !cl->is_ssm &&
                 r->d_qfull_batch && r->d_attn_gate_batch &&
                 r->d_q_batch && r->d_k_batch && r->d_v_batch &&
-                r->d_attn_out_batch && r->d_attn_proj_batch;
+                r->d_attn_out_batch && r->d_attn_proj_batch &&
+                m->verify_attn_parts && m->verify_attn_meta;
             if (grouped_ssm) hllm_dense_mtp_ssm(r, cl, l, rows, conv, rec);
             else if (grouped_attn) hllm_dense_mtp_attention(r, cl, l, rows);
             else for (int i = 0; i < rows; ++i) {

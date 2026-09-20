@@ -274,10 +274,11 @@ extern "C" __global__ __launch_bounds__(128, 1)
 void qwen35_attention_q8_decode(float *out, float *parts, float2 *meta,
         const float *q, const signed char *kc, const signed char *vc,
         const float *ks, const float *vs, const int *position,
-        int heads, int kv_heads, int nsm, int occupancy, int forced_splits,
-        int queries, int position_start) {
+    int heads, int kv_heads, int nsm, int occupancy, int forced_splits,
+    int queries, int position_start) {
     int query = queries == 1 ? 0 : blockIdx.x;
-    int length = position_start < 0 ? *position + 1 : position_start + query + 1;
+    int length = position_start < 0 ? position[query] + 1 :
+                                      position_start + query + 1;
     int splits = forced_splits ? forced_splits : q8_attention_splits(length, heads, nsm, occupancy);
     int head, split;
     if (queries == 1) {
@@ -422,9 +423,11 @@ void qwen35_attention_q8_decode(float *out, float *parts, float2 *meta,
 extern "C" __global__ __launch_bounds__(256, 1)
 void qwen35_attention_q8_combine(float *out, const float *parts, const float2 *meta,
         const int *position, int heads, int nsm, int occupancy, int forced_splits) {
-    int splits = forced_splits ? forced_splits : q8_attention_splits(*position + 1, heads, nsm, occupancy);
+    int query = blockIdx.y;
+    int splits = forced_splits ? forced_splits :
+        q8_attention_splits(position[query] + 1, heads, nsm, occupancy);
     if (splits == 1) return;
-    int head = blockIdx.y * heads + blockIdx.x, tid = threadIdx.x;
+    int head = query * heads + blockIdx.x, tid = threadIdx.x;
     parts += head * splits * 256; meta += head * splits;
     extern __shared__ float2 shared_meta[];
     for (int i = tid; i < 2 * splits; i += 256) ((float *)shared_meta)[i] = ((const float *)meta)[i];
