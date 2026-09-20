@@ -1,0 +1,5 @@
+*.o
+bench_dspark
+test_dspark
+validate_dspark
+tmp/

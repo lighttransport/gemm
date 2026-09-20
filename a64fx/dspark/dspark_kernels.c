@@ -267,6 +267,9 @@ void ds_attention_values_bf16(const float *scores, const uint16_t *vc,
                               const uint16_t *vn, size_t context,
                               size_t total, size_t kv_head, float norm,
                               float *out, dspark_backend backend) {
+#if !defined(__ARM_FEATURE_SVE)
+    (void)backend;
+#endif
 #if defined(__ARM_FEATURE_SVE)
     if (backend == DSPARK_BACKEND_SVE && svcntw() == 16) {
         svbool_t pg=svptrue_b32();

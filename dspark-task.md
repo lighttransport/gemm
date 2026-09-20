@@ -9,8 +9,8 @@ the binaries directly on that node.
 The authoritative shared-filesystem checkpoints are:
 
 ```text
-/home/u14346/models/qwen38/radixark/Qwen3.8-27B-DSpark
-/home/u14346/models/qwen38/radixark/Qwen3.8-27B-NVFP4
+~/models/qwen38/radixark/Qwen3.8-27B-DSpark
+~/models/qwen38/radixark/Qwen3.8-27B-NVFP4
 ```
 
 They occupy about 3.5 GiB and 21 GiB respectively. **Always stage both trees
@@ -22,10 +22,10 @@ A single `cp` of the roughly 25 GiB tree can build a large dirty page cache on
 a 32 GiB A64FX node. Use bounded 1 GiB writes with an fsync after each chunk:
 
 ```sh
-cd /vol0006/mdt0/data/hp250467/work/gemm/glm53f
+cd "$(git rev-parse --show-toplevel)"
 
-SRC_ROOT=/home/u14346/models/qwen38/radixark
-STAGE_ROOT=/local/u14346/qwen38-radixark
+SRC_ROOT=$(cd ~/models/qwen38/radixark && pwd)
+STAGE_ROOT=/local/$USER/qwen38-radixark
 mkdir -p "$STAGE_ROOT"
 
 stage_one() {
@@ -82,7 +82,7 @@ Keep compiler temporaries inside the repository; `/tmp` is not available on
 the compute node. The Makefile already sets `TMPDIR` appropriately.
 
 ```sh
-cd /vol0006/mdt0/data/hp250467/work/gemm/glm53f
+cd "$(git rev-parse --show-toplevel)"
 make -C a64fx/dspark clean all CC=fcc \
   CFLAGS='-Nclang -O3 -std=c11 -march=armv8.2-a+sve -ffp-contract=fast'
 
@@ -105,7 +105,7 @@ comparison fails.
 All commands below deliberately use only `/local` checkpoint paths:
 
 ```sh
-STAGE_ROOT=/local/u14346/qwen38-radixark
+STAGE_ROOT=/local/$USER/qwen38-radixark
 DRAFT=$STAGE_ROOT/Qwen3.8-27B-DSpark
 TARGET=$STAGE_ROOT/Qwen3.8-27B-NVFP4
 test -s "$DRAFT/model.safetensors"
@@ -131,7 +131,7 @@ machine with PyTorch, Transformers 5.8.1, and safetensors. Copy only the small
 JSON fixture back to this checkout, then validate the locally staged weights:
 
 ```sh
-STAGE_ROOT=/local/u14346/qwen38-radixark
+STAGE_ROOT=/local/$USER/qwen38-radixark
 python3 a64fx/dspark/export_golden.py \
   "$STAGE_ROOT/Qwen3.8-27B-DSpark" \
   "$STAGE_ROOT/Qwen3.8-27B-NVFP4" \
@@ -152,7 +152,7 @@ relative error must each remain within the validator's `2e-3` tolerance.
 Run the benchmark only after the full real-weight validator passes:
 
 ```sh
-STAGE_ROOT=/local/u14346/qwen38-radixark
+STAGE_ROOT=/local/$USER/qwen38-radixark
 DRAFT=$STAGE_ROOT/Qwen3.8-27B-DSpark
 TARGET=$STAGE_ROOT/Qwen3.8-27B-NVFP4
 
@@ -187,7 +187,7 @@ this is a kernel sanity check, not a substitute for the real-weight proposal
 benchmark.
 
 Native real-weight validation on job `51819460` staged both checkpoint trees
-under `/local/u14346/qwen38-radixark`. The original 48-way concurrent `pread`
+under `/local/$USER/qwen38-radixark`. The original 48-way concurrent `pread`
 loader took 1595.2 seconds and accumulated 1384.5 seconds of system time even
 though a direct read of the local 3.5 GiB draft took about two seconds. LLIO
 was serializing the concurrent reads into anonymous pages. The loader now
