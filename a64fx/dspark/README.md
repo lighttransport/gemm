@@ -110,6 +110,16 @@ DSPARK_PROFILE=1 OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
 The output separates embedding, normalization, QKV, attention, output
 projection, FFN, NVFP4 LM-head, and sequential Markov/confidence costs.
 
+To measure context scaling without requiring thousands of target-feature
+rows, the benchmark can allocate a zero-filled synthetic BF16 KV history and
+run one 48-thread SVE proposal. This is a performance probe, not a correctness
+fixture:
+
+```sh
+DSPARK_PROFILE=1 OMP_PROC_BIND=close OMP_PLACES=cores \
+  ./a64fx/dspark/bench_dspark "$DRAFT" "$TARGET" --profile-context 8192
+```
+
 The dominant SVE kernels are width-1-through-8 BF16 GEMM, GQA attention, and
 a width-seven NVFP4 output-panel kernel. The width-seven paths stream each
 weight matrix once rather than decomposing the proposal into 4+2+1 passes.

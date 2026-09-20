@@ -223,6 +223,16 @@ stable totals of 64.3--66.6 ms and gate/up times of 17.4--17.9 ms, versus
 checkpoint proposals remained exactly unchanged. A dedicated paired-GEMM
 scalar/SVE test covers both outputs.
 
+The second profile-guided change moves a complete attention score row and
+BF16 value reduction into SVE kernels, avoiding millions of tiny dot calls and
+scalar BF16 conversions at long context. Synthetic zero-KV context probes
+measured 1024-token attention at 4.1 ms (previously 15.8 ms) and 8192-token
+attention at 58.1 ms (previously 158.3 ms). The 8192-token total proposal fell
+from 223.0 to 122.0 ms. The full real-weight scalar/SVE gate still matches all
+seven tokens; maximum confidence difference is `1.31279e-4` and maximum
+selected-logit relative difference is `3.58070e-4`. A direct scalar/SVE test
+covers split persistent/current K/V inputs.
+
 Continue in this order:
 
 1. Generate the independent golden fixture and run the golden validator; the

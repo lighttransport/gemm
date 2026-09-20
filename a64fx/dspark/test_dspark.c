@@ -62,6 +62,25 @@ static void test_nvfp4(void){
 #endif
 }
 
+#if defined(__ARM_FEATURE_SVE)
+static void test_attention_kernels(void){
+    const size_t context=17,total=24,head=3,stride=DS_KV_HEADS*DS_HEAD_DIM;
+    float q[DS_HEAD_DIM],ss[24],sv[24],os[DS_HEAD_DIM],ov[DS_HEAD_DIM];
+    uint16_t*kc=calloc(context*stride,sizeof(*kc)),*vc=calloc(context*stride,sizeof(*vc));
+    uint16_t*kn=calloc(DSPARK_BLOCK_SIZE*stride,sizeof(*kn)),*vn=calloc(DSPARK_BLOCK_SIZE*stride,sizeof(*vn));
+    for(size_t i=0;i<DS_HEAD_DIM;i++)q[i]=(float)((int)(i%13)-6)/17.0f;
+    for(size_t i=0;i<context*stride;i++){kc[i]=ds_f32_to_bf16((float)((int)(i%19)-9)/23.0f);vc[i]=ds_f32_to_bf16((float)((int)(i%17)-8)/29.0f);}
+    for(size_t i=0;i<DSPARK_BLOCK_SIZE*stride;i++){kn[i]=ds_f32_to_bf16((float)((int)(i%11)-5)/13.0f);vn[i]=ds_f32_to_bf16((float)((int)(i%7)-3)/11.0f);}
+    ds_attention_scores_bf16(q,kc,kn,context,total,head,0.125f,ss,DSPARK_BACKEND_SCALAR);
+    ds_attention_scores_bf16(q,kc,kn,context,total,head,0.125f,sv,DSPARK_BACKEND_SVE);
+    float mx=0;for(size_t i=0;i<total;i++){float e=fabsf(ss[i]-sv[i]);if(e>mx)mx=e;ss[i]=expf(ss[i]);sv[i]=expf(sv[i]);}
+    ds_attention_values_bf16(ss,vc,vn,context,total,head,1.0f,os,DSPARK_BACKEND_SCALAR);
+    ds_attention_values_bf16(sv,vc,vn,context,total,head,1.0f,ov,DSPARK_BACKEND_SVE);
+    for(size_t i=0;i<DS_HEAD_DIM;i++){float e=fabsf(os[i]-ov[i]);if(e>mx)mx=e;}
+    check(mx<2e-5f,"attention kernels scalar/SVE");free(vn);free(kn);free(vc);free(kc);
+}
+#endif
+
 static void test_state(void){
     dspark_model m={0};m.threads=2;dspark_state*s=NULL;dspark_state_options opt={4};char err[128]={0};
     int rc=dspark_state_create(&s,&m,&opt,err,sizeof(err));check(rc==0&&s&&dspark_state_context_tokens(s)==0,"state create/reset");
@@ -90,6 +109,7 @@ static void test_long_k(void){
 
 int main(void){test_formats();test_gemm();test_norm_rope();test_nvfp4();test_state();
 #if defined(__ARM_FEATURE_SVE)
+    test_attention_kernels();
     test_long_k();
 #endif
     printf("dspark tests: %s\n",failures?"FAIL":"PASS");return failures?1:0;}

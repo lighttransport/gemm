@@ -92,6 +92,14 @@ void ds_apply_rope(const dspark_model *model, float *x, size_t rows,
                    size_t heads, size_t position0, int threads);
 float ds_dot_bf16(const float *x, const uint16_t *y, size_t n,
                   dspark_backend backend);
+float ds_attention_scores_bf16(const float *q, const uint16_t *kc,
+                               const uint16_t *kn, size_t context,
+                               size_t total, size_t kv_head, float scale,
+                               float *scores, dspark_backend backend);
+void ds_attention_values_bf16(const float *scores, const uint16_t *vc,
+                              const uint16_t *vn, size_t context,
+                              size_t total, size_t kv_head, float norm,
+                              float *out, dspark_backend backend);
 void ds_nvfp4_gemm(const dspark_model *model, const ds_nvfp4_matrix *w,
                    const float *x, size_t m, float *y);
 

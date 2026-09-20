@@ -223,6 +223,79 @@ float ds_dot_bf16(const float *x, const uint16_t *y, size_t n,
     return sum;
 }
 
+static inline const uint16_t *ds_attention_row(const uint16_t *cache,
+                                                const uint16_t *block,
+                                                size_t context, size_t at,
+                                                size_t kv_head) {
+    size_t row = at < context ? at : at - context;
+    const uint16_t *base = at < context ? cache : block;
+    return base + (row * DS_KV_HEADS + kv_head) * DS_HEAD_DIM;
+}
+
+float ds_attention_scores_bf16(const float *q, const uint16_t *kc,
+                               const uint16_t *kn, size_t context,
+                               size_t total, size_t kv_head, float scale,
+                               float *scores, dspark_backend backend) {
+    float mx = -INFINITY;
+#if defined(__ARM_FEATURE_SVE)
+    if (backend == DSPARK_BACKEND_SVE) {
+        svbool_t all = svptrue_b32();
+        size_t vl = svcntw();
+        for (size_t at = 0; at < total; ++at) {
+            const uint16_t *kp=ds_attention_row(kc,kn,context,at,kv_head);
+            svfloat32_t a=svdup_f32(0),b=svdup_f32(0);size_t d=0;
+            for(;d+vl<DS_HEAD_DIM;d+=2*vl){
+                svbool_t p0=svwhilelt_b32(d,(size_t)DS_HEAD_DIM);
+                svbool_t p1=svwhilelt_b32(d+vl,(size_t)DS_HEAD_DIM);
+                a=svmla_f32_m(p0,a,svld1_f32(p0,q+d),ds_load_bf16_lo(p0,kp+d));
+                b=svmla_f32_m(p1,b,svld1_f32(p1,q+d+vl),ds_load_bf16_lo(p1,kp+d+vl));
+            }
+            if(d<DS_HEAD_DIM){svbool_t p=svwhilelt_b32(d,(size_t)DS_HEAD_DIM);a=svmla_f32_m(p,a,svld1_f32(p,q+d),ds_load_bf16_lo(p,kp+d));}
+            float z=svaddv_f32(all,svadd_f32_x(all,a,b))*scale;scores[at]=z;if(z>mx)mx=z;
+        }
+        return mx;
+    }
+#endif
+    for(size_t at=0;at<total;at++){
+        const uint16_t*kp=ds_attention_row(kc,kn,context,at,kv_head);
+        float z=ds_dot_bf16(q,kp,DS_HEAD_DIM,backend)*scale;scores[at]=z;if(z>mx)mx=z;
+    }
+    return mx;
+}
+
+void ds_attention_values_bf16(const float *scores, const uint16_t *vc,
+                              const uint16_t *vn, size_t context,
+                              size_t total, size_t kv_head, float norm,
+                              float *out, dspark_backend backend) {
+#if defined(__ARM_FEATURE_SVE)
+    if (backend == DSPARK_BACKEND_SVE && svcntw() == 16) {
+        svbool_t pg=svptrue_b32();
+        svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
+        svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+        for(size_t at=0;at<total;at++){
+            const uint16_t*vp=ds_attention_row(vc,vn,context,at,kv_head);
+            float w=scores[at]*norm;
+            a0=svmla_n_f32_x(pg,a0,ds_load_bf16_lo(pg,vp+0),w);
+            a1=svmla_n_f32_x(pg,a1,ds_load_bf16_lo(pg,vp+16),w);
+            a2=svmla_n_f32_x(pg,a2,ds_load_bf16_lo(pg,vp+32),w);
+            a3=svmla_n_f32_x(pg,a3,ds_load_bf16_lo(pg,vp+48),w);
+            a4=svmla_n_f32_x(pg,a4,ds_load_bf16_lo(pg,vp+64),w);
+            a5=svmla_n_f32_x(pg,a5,ds_load_bf16_lo(pg,vp+80),w);
+            a6=svmla_n_f32_x(pg,a6,ds_load_bf16_lo(pg,vp+96),w);
+            a7=svmla_n_f32_x(pg,a7,ds_load_bf16_lo(pg,vp+112),w);
+        }
+        svst1_f32(pg,out+0,a0);svst1_f32(pg,out+16,a1);svst1_f32(pg,out+32,a2);svst1_f32(pg,out+48,a3);
+        svst1_f32(pg,out+64,a4);svst1_f32(pg,out+80,a5);svst1_f32(pg,out+96,a6);svst1_f32(pg,out+112,a7);
+        return;
+    }
+#endif
+    memset(out,0,DS_HEAD_DIM*sizeof(float));
+    for(size_t at=0;at<total;at++){
+        float w=scores[at]*norm;const uint16_t*vp=ds_attention_row(vc,vn,context,at,kv_head);
+        for(size_t d=0;d<DS_HEAD_DIM;d++)out[d]=fmaf(w,ds_bf16_to_f32(vp[d]),out[d]);
+    }
+}
+
 static void ds_nvfp4_gemm_scalar(const ds_nvfp4_matrix *w, const float *x,
                                  size_t m, float *y, int threads) {
     size_t panels = (w->n + 15) / 16;

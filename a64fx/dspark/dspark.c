@@ -398,17 +398,13 @@ static int ds_attention(const dspark_state*s,int layer,const float*q,const uint1
         #pragma omp for schedule(static)
         for(size_t job=0;job<jobs;job++){
             size_t row=job/DS_HEADS,head=job%DS_HEADS,kh=head/(DS_HEADS/DS_KV_HEADS);
-            const float*qr=q+(row*DS_HEADS+head)*DS_HEAD_DIM;float mx=-FLT_MAX;
-            for(size_t at=0;at<total;at++){
-                const uint16_t*kp=at<s->cursor?kc+(at*DS_KV_HEADS+kh)*DS_HEAD_DIM:kn+(((at-s->cursor)*DS_KV_HEADS+kh)*DS_HEAD_DIM);
-                float z=ds_dot_bf16(qr,kp,DS_HEAD_DIM,m->backend)*(1.0f/sqrtf((float)DS_HEAD_DIM));scores[at]=z;if(z>mx)mx=z;
-            }
+            const float*qr=q+(row*DS_HEADS+head)*DS_HEAD_DIM;
+            float mx=ds_attention_scores_bf16(qr,kc,kn,s->cursor,total,kh,
+                                                1.0f/sqrtf((float)DS_HEAD_DIM),scores,m->backend);
             double sum=0;for(size_t at=0;at<total;at++){scores[at]=expf(scores[at]-mx);sum+=scores[at];}
-            float*dst=out+(row*DS_HEADS+head)*DS_HEAD_DIM;memset(dst,0,DS_HEAD_DIM*sizeof(float));
-            for(size_t at=0;at<total;at++){
-                float a=scores[at]/(float)sum;const uint16_t*vp=at<s->cursor?vc+(at*DS_KV_HEADS+kh)*DS_HEAD_DIM:vn+(((at-s->cursor)*DS_KV_HEADS+kh)*DS_HEAD_DIM);
-                for(size_t d=0;d<DS_HEAD_DIM;d++)dst[d]=fmaf(a,ds_bf16_to_f32(vp[d]),dst[d]);
-            }
+            float*dst=out+(row*DS_HEADS+head)*DS_HEAD_DIM;
+            ds_attention_values_bf16(scores,vc,vn,s->cursor,total,kh,
+                                      1.0f/(float)sum,dst,m->backend);
         }
     }
     free(score_mem);return DSPARK_OK;
