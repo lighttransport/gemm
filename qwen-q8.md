@@ -3479,13 +3479,16 @@ installed on the exactly matching Q5_K/IQ4_XS tensors. Detachment precedes
 unmapping and model destruction.
 
 The persistent decode pool partitions complete eight-row groups directly
-across its static worker IDs, so a group has one owner and is first-faulted by
-that worker. Validation reads are evicted before `mmap`; the mapping retains
-normal sequential-fault readahead because forcing 4 KiB random faults makes
-the 7.81 GB cold scan unusably slow. Calls whose row extent is not the tensor's
-complete eight-row-aligned extent explicitly clear the cache view and take the
-compact path. Non-persistent row-range dispatch safely computes intersecting
-groups and copies only the requested rows.
+across its static worker IDs. After the strict loader accepts the file, those
+same workers `pread` their groups into a read-only anonymous arena and evict
+the source pages as they progress. This makes the cache resident before decode
+and first-touches it under the same row/CMG ownership as the kernel. Direct
+file mapping was rejected in acceptance: 7.81 GB of demand faults made cold
+tokens take about a minute even with normal readahead, and `MADV_RANDOM` was
+worse. Calls whose row extent is not the tensor's complete eight-row-aligned
+extent explicitly clear the cache view and take the compact path.
+Non-persistent row-range dispatch safely computes intersecting groups and
+copies only the requested rows.
 
 The focused synthetic test covers three uneven persistent-worker partitions,
 unaligned non-persistent ranges, a 15-row compact fallback, invalid format

@@ -128,9 +128,11 @@ sidecar hashes, then votes before retaining the mapping. Cache pointers are
 attached only after compact prefill and a second all-rank vote. Any validation
 or attachment mismatch coherently returns all ranks to compact dispatch. The
 persistent pool statically partitions complete eight-row groups, while partial
-or tail extents explicitly use the compact path. Validation reads are evicted
-before mapping; retain normal sequential-fault readahead because `MADV_RANDOM`
-made the first 7.81 GB scan pathologically slow in four-node acceptance.
+or tail extents explicitly use the compact path. File-backed demand paging was
+pathologically slow in four-node acceptance, so after strict validation each
+worker now `pread`s its own groups into a read-only anonymous arena and evicts
+the source pages. This makes the sidecar resident before decode and preserves
+CMG-local first touch.
 Synthetic coverage includes uneven three-worker ownership, unaligned ranged
 dispatch, a 15-row compact fallback, invalid format rejection, and model
 attach/detach. Fujitsu builds of the focused test and full runner pass; the

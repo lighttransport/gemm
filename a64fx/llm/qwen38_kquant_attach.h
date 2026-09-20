@@ -21,6 +21,15 @@ typedef struct {
     uint32_t attached_entries;
 } q38kc_model_cache;
 
+typedef struct {
+    int fd;
+    uint8_t *destination;
+    const q38kc_header *header;
+    int tid;
+    int threads;
+    int failed;
+} q38kc_materialize_task;
+
 static int q38kc_model_error(char *error, size_t error_bytes,
                              const char *format, ...) {
     if (error && error_bytes) {
@@ -43,6 +52,96 @@ static int q38kc_read_exact(int fd, void *buffer, size_t bytes,
         bytes -= (size_t)got;
         offset += (uint64_t)got;
     }
+    return 0;
+}
+
+static void *q38kc_materialize_worker(void *argument) {
+    q38kc_materialize_task *task = (q38kc_materialize_task *)argument;
+    const size_t chunk_max = 8u * 1024u * 1024u;
+    for (uint32_t i = 0; i < task->header->n_entries; i++) {
+        const q38kc_entry *entry = &task->header->entries[i];
+        uint64_t groups = entry->local_rows / TF_KQUANT_CACHE_ROWS;
+        uint64_t group_bytes = groups ? entry->byte_length / groups : 0;
+        uint64_t group0 = groups * (uint64_t)task->tid /
+                          (uint64_t)task->threads;
+        uint64_t group1 = groups * (uint64_t)(task->tid + 1) /
+                          (uint64_t)task->threads;
+        uint64_t offset = entry->file_offset + group0 * group_bytes;
+        uint64_t remaining = (group1 - group0) * group_bytes;
+        while (remaining) {
+            size_t chunk = remaining > chunk_max ? chunk_max : (size_t)remaining;
+            if (q38kc_read_exact(task->fd, task->destination + offset,
+                                  chunk, offset)) {
+                task->failed = 1;
+                return NULL;
+            }
+#ifdef POSIX_FADV_DONTNEED
+            (void)posix_fadvise(task->fd, (off_t)offset, (off_t)chunk,
+                                POSIX_FADV_DONTNEED);
+#endif
+            offset += chunk;
+            remaining -= chunk;
+        }
+    }
+    return NULL;
+}
+
+static int q38kc_model_materialize(q38kc_model_cache *cache,
+                                   transformer_model *model,
+                                   const char *path,
+                                   char *error, size_t error_bytes) {
+    size_t bytes = cache->loaded.mapping_bytes;
+    double available = tf_mem_available_gb();
+    double required = (double)bytes / 1e9 + 3.0;
+    if (available >= 0.0 && available < required)
+        return q38kc_model_error(error, error_bytes,
+                                  "insufficient HBM: %.2f GB available, %.2f GB required",
+                                  available, required);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return q38kc_model_error(error, error_bytes, "open %s: %s",
+                                  path, strerror(errno));
+    uint8_t *anonymous = (uint8_t *)mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (anonymous == MAP_FAILED) {
+        close(fd);
+        return q38kc_model_error(error, error_bytes,
+                                  "allocate %.3f GB sidecar arena: %s",
+                                  (double)bytes / 1e9, strerror(errno));
+    }
+    int failed = q38kc_read_exact(fd, anonymous, Q38KC_HEADER_BYTES, 0);
+    int threads = model->n_threads > 1 && model->pool_alive ?
+        model->n_threads : 1;
+    q38kc_materialize_task *tasks =
+        (q38kc_materialize_task *)alloca((size_t)threads * sizeof(*tasks));
+    for (int tid = 0; tid < threads; tid++)
+        tasks[tid] = (q38kc_materialize_task){
+            fd, anonymous, cache->loaded.header, tid, threads, 0
+        };
+    if (!failed) {
+        if (threads > 1)
+            tf_pool_dispatch(model, q38kc_materialize_worker, tasks,
+                             sizeof(*tasks));
+        else
+            q38kc_materialize_worker(&tasks[0]);
+        for (int tid = 0; tid < threads; tid++)
+            if (tasks[tid].failed) failed = 1;
+    }
+    close(fd);
+    if (failed) {
+        munmap(anonymous, bytes);
+        return q38kc_model_error(error, error_bytes,
+                                  "materialize sidecar arena: read failed");
+    }
+    if (mprotect(anonymous, bytes, PROT_READ)) {
+        int saved_errno = errno;
+        munmap(anonymous, bytes);
+        return q38kc_model_error(error, error_bytes,
+                                  "protect sidecar arena: %s",
+                                  strerror(saved_errno));
+    }
+    munmap(cache->loaded.mapping, cache->loaded.mapping_bytes);
+    cache->loaded.mapping = anonymous;
     return 0;
 }
 
@@ -99,6 +198,11 @@ static int q38kc_model_prepare(q38kc_model_cache *cache,
             q38kc_unload(&cache->loaded);
             goto done;
         }
+    }
+    if (q38kc_model_materialize(cache, model, cache_path,
+                                error, error_bytes)) {
+        q38kc_unload(&cache->loaded);
+        goto done;
     }
     rc = 0;
 done:
