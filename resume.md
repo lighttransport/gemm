@@ -117,6 +117,17 @@ quantizer.  A split-path diagnostic produces bitwise-identical values for all
 (42.79 mean) to 42.81--43.36 tok/s (43.11 mean).  Trace artifact:
 `tmp/qwen38/ordinary-decode-profile-siluq81/`.
 
+The gated RMSNorm/SiLU producer for all 48 recurrent output projections now
+also stages its exact native Q8_1 input.  Preserving the original 128-thread
+reduction and load loop is required: an algebraically equivalent first draft
+moved low activation bits and failed the logit gate.  The corrected fused and
+split paths are bitwise identical across all 248,320 final logits (SHA-256
+`5b5f2f1a334ae644ac5633908e3d447c6d741c764a61dc0e9573addf699553c0`)
+and keep the pinned 256-token hash `3c53b75f283cb9b0`.  A 64-row trace removes
+3,072 launches, exactly 48 per row.  Matched three-repeat decode is
+42.62--43.36 tok/s (43.07 mean) fused versus 41.64--43.14 tok/s (42.60 mean)
+split.  Trace artifact: `tmp/qwen38/ordinary-decode-profile-ssmq81/`.
+
 Prioritize ordinary one-row target projection traffic first, followed by the
 long-context verifier attention tail, sampled verifier-row parity audit, and
 fusion of the remaining activation/state-preparation launches.

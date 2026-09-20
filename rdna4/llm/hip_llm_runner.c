@@ -3558,6 +3558,47 @@ static const char *hip_kernel_source =
 "        o[i] = normed * gate;\n"
 "    }\n"
 "}\n"
+"/* Qwen3.5 decode specialization: preserve the per-head gated RMSNorm\n"
+" * arithmetic above while staging its 128-wide result as exact Q8_1 for\n"
+" * the following native SSM output projection. Each wave owns one Q8 block. */\n"
+"__global__ void gated_rmsnorm_silu_q81_f32(\n"
+"    float *out, const float *z, const float *norm_w,\n"
+"    signed char *q, float *qscale,\n"
+"    int dt_rank, int d_state, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= dt_rank) return;\n"
+"    int tid = threadIdx.x;\n"
+"    float *o = out + h * d_state;\n"
+"    const float *zh = z + h * d_state;\n"
+"    float sum = 0.0f;\n"
+"    for (int i = tid; i < d_state; i += blockDim.x) {\n"
+"        float v = o[i]; sum += v * v;\n"
+"    }\n"
+"    sdata[tid] = sum;\n"
+"    __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)d_state + eps);\n"
+"    for (int i = tid; i < d_state; i += blockDim.x) {\n"
+"        float normed = o[i] * scale * norm_w[i];\n"
+"        float zv = zh[i];\n"
+"        float gate = 1.0f / (1.0f + expf(-zv));\n"
+"        gate *= zv;\n"
+"        o[i] = normed * gate;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    int i = h * d_state + tid;\n"
+"    float v = o[tid];\n"
+"    float a = fabsf(v);\n"
+"    for (int off = 16; off; off >>= 1)\n"
+"        a = fmaxf(a, __shfl_xor(a, off, 32));\n"
+"    float d = q8_div_contract(a, 127.0f);\n"
+"    q[i] = a == 0.0f ? 0 : (signed char)roundf(q8_div_contract(v, d));\n"
+"    if ((tid & 31) == 0) qscale[i >> 5] = round_f16_contract(d);\n"
+"}\n"
 "\n"
 "/* ---- 25c. GLM5Next mHC affine/gates/collapse ---- */\n"
 "__global__ void glm5next_mhc_finish_f32(float *collapsed, float *post,\n"
@@ -13115,6 +13156,7 @@ struct hip_llm_runner {
     hipFunction_t fn_conv1d_depthwise_silu_batch_f32;
     hipFunction_t fn_ssm_prep_batch_f32;
     hipFunction_t fn_gated_rmsnorm_silu_f32;
+    hipFunction_t fn_gated_rmsnorm_silu_q81_f32;
     hipFunction_t fn_sigmoid_mul_f32;
     hipFunction_t fn_deinterleave_qgate_f32;
     hipFunction_t fn_deinterleave_qgate_batch_f32;
@@ -14228,6 +14270,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(conv1d_depthwise_silu_batch_f32);
     GET_FUNC(ssm_prep_batch_f32);
     GET_FUNC(gated_rmsnorm_silu_f32);
+    GET_FUNC(gated_rmsnorm_silu_q81_f32);
     GET_FUNC(sigmoid_mul_f32);
     GET_FUNC(deinterleave_qgate_f32);
     GET_FUNC(deinterleave_qgate_batch_f32);
@@ -20128,6 +20171,16 @@ static inline void launch_silu_mul_native_q81(hip_llm_runner *r, void *gate,
     r->native_q81_valid = 1;
 }
 
+static inline int qwen35_native_q81_matvec_type(hip_llm_runner *r, int type) {
+    return (type == GGML_TYPE_Q2_K && r->fn_qwen35_matvec_q2k) ||
+           (type == GGML_TYPE_IQ2_XXS && r->fn_qwen35_matvec_iq2xxs) ||
+           (type == GGML_TYPE_IQ2_XS && r->fn_qwen35_matvec_iq2xs) ||
+           (type == GGML_TYPE_IQ2_S && r->fn_qwen35_matvec_iq2s) ||
+           (type == GGML_TYPE_IQ3_XXS && r->fn_qwen35_matvec_iq3xxs) ||
+           (type == GGML_TYPE_IQ3_S && r->fn_qwen35_matvec_iq3s) ||
+           (type == GGML_TYPE_IQ4_XS && r->fn_qwen35_matvec_iq4xs);
+}
+
 static inline void launch_qwen35_argmax(hip_llm_runner *r, void *x, void *out) {
     int groups=(r->n_vocab+4095)/4096;
     if (r->fn_qwen35_argmax_parts && groups <= 256) {
@@ -23071,6 +23124,17 @@ static inline void launch_gated_rmsnorm_silu(hip_llm_runner *r, void *out,
     int gate_silu = !r->is_qwen4exp;
     void *args[] = { &out, &z, &norm_w, &dt_rank, &d_state, &eps, &gate_silu };
     LAUNCH(r->fn_gated_rmsnorm_silu_f32, dt_rank, 1, 1, threads, 1, 1, threads * sizeof(float), r->stream, args);
+}
+
+static inline void launch_gated_rmsnorm_silu_native_q81(hip_llm_runner *r,
+    void *out, void *z, void *norm_w, int dt_rank, int d_state, float eps) {
+    void *args[] = { &out, &z, &norm_w, &r->d_native_q81,
+                     &r->d_native_scale, &dt_rank, &d_state, &eps };
+    LAUNCH(r->fn_gated_rmsnorm_silu_q81_f32, dt_rank, 1, 1,
+           128, 1, 1, 128 * sizeof(float), r->stream, args);
+    r->native_q81_source = out;
+    r->native_q81_n = dt_rank * d_state;
+    r->native_q81_valid = 1;
 }
 
 /* ---- Batched SSM aux op launchers (one launch over M rows) ---- */
@@ -28468,6 +28532,13 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                  * path does not yet match the scalar IQ3 matvec bit-for-bit.
                  * Keep the reference sequence as the quality-safe default. */
                 const char *separate_norm_env = getenv("LLM_QWEN35_SSM_NORM_SEPARATE");
+                const char *split_norm_q81_env = getenv("LLM_QWEN35_SPLIT_SSM_NORM_Q81");
+                int native_out_q81 = !r->fn_qwen35_rmsnorm_reference &&
+                    d_state == 128 && r->ssm_d_inner <= 17408 &&
+                    (r->ssm_d_inner % 256) == 0 &&
+                    qwen35_native_q81_matvec_type(r, cl->ssm_out_type) &&
+                    (!separate_norm_env || atoi(separate_norm_env) == 0) &&
+                    (!split_norm_q81_env || atoi(split_norm_q81_env) == 0);
                 if (separate_norm_env && atoi(separate_norm_env) != 0) {
                     /* Match llama.cpp's build_norm_gated graph order:
                      * RMSNorm(core_out), SiLU(z), then elementwise multiply. */
@@ -28476,6 +28547,11 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                                                  d_state, eps);
                     launch_silu_gate_mul(r, r->d_ssm_out, r->d_ssm_z,
                                          dt_rank * d_state);
+                } else if (native_out_q81) {
+                    launch_gated_rmsnorm_silu_native_q81(
+                        r, r->d_ssm_out, r->d_ssm_z, cl->ssm_norm_w,
+                        dt_rank, d_state, eps);
+                    begin_native_q81_prepared(r);
                 } else {
                     launch_gated_rmsnorm_silu(r, r->d_ssm_out, r->d_ssm_z,
                                               cl->ssm_norm_w, dt_rank, d_state,
@@ -28484,6 +28560,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 debug_f32_state(r, l, "Q4 ssm_norm", r->d_ssm_out, r->ssm_d_inner);
                 launch_matvec_auto(r, r->d_xb, cl->ssm_out_w, r->d_ssm_out,
                                   cl->ssm_out_rows, cl->ssm_out_cols, cl->ssm_out_type);
+                if (native_out_q81) end_q8x2_reuse(r);
                 if (r->debug_layers && l < 6)
                     debug_f32_state(r, l, "Q4 ssm_linear_out", r->d_xb, n_embd);
             }
@@ -28863,14 +28940,8 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                     debug_f32_state(r, l, "scalar ffn_gate_raw", r->d_gate, n_ff);
                     debug_f32_state(r, l, "scalar ffn_up_raw", r->d_up, n_ff);
                 }
-                int native_down_q81 = n_ff <= 17408 && (n_ff % 256) == 0 && (
-                    (cl->ffn_down_type == GGML_TYPE_Q2_K && r->fn_qwen35_matvec_q2k) ||
-                    (cl->ffn_down_type == GGML_TYPE_IQ2_XXS && r->fn_qwen35_matvec_iq2xxs) ||
-                    (cl->ffn_down_type == GGML_TYPE_IQ2_XS && r->fn_qwen35_matvec_iq2xs) ||
-                    (cl->ffn_down_type == GGML_TYPE_IQ2_S && r->fn_qwen35_matvec_iq2s) ||
-                    (cl->ffn_down_type == GGML_TYPE_IQ3_XXS && r->fn_qwen35_matvec_iq3xxs) ||
-                    (cl->ffn_down_type == GGML_TYPE_IQ3_S && r->fn_qwen35_matvec_iq3s) ||
-                    (cl->ffn_down_type == GGML_TYPE_IQ4_XS && r->fn_qwen35_matvec_iq4xs));
+                int native_down_q81 = n_ff <= 17408 && (n_ff % 256) == 0 &&
+                    qwen35_native_q81_matvec_type(r, cl->ffn_down_type);
                 const char *split_silu_q81 = getenv("LLM_QWEN35_SPLIT_SILU_Q81");
                 if (split_silu_q81 && atoi(split_silu_q81) != 0)
                     native_down_q81 = 0;

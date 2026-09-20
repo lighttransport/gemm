@@ -197,6 +197,18 @@ tok/s fused mean.  The kernel trace is under
 `tmp/qwen38/ordinary-decode-profile-siluq81/`; set the diagnostic
 `LLM_QWEN35_SPLIT_SILU_Q81=1` to restore the two-launch boundary.
 
+The 48 recurrent output layers now fold native Q8_1 staging into their
+per-head gated RMSNorm/SiLU kernel.  The fused kernel retains the original
+128-thread reduction, load loop, and stored activation boundary before four
+independent waves quantize each head.  Its split-path A/B is bitwise identical
+for all 248,320 final logits (SHA-256
+`5b5f2f1a334ae644ac5633908e3d447c6d741c764a61dc0e9573addf699553c0`),
+and three-repeat decode keeps the pinned `3c53b75f283cb9b0` sequence hash at
+42.62--43.36 tok/s (43.07 mean), versus 41.64--43.14 tok/s (42.60 mean) for
+the matched split path.  A 64-row trace removes exactly 3,072 launches, 48 per
+row, and is under `tmp/qwen38/ordinary-decode-profile-ssmq81/`.  Set
+`LLM_QWEN35_SPLIT_SSM_NORM_Q81=1` to restore the standalone quantizer.
+
 ## Remaining optimization opportunities
 
 The short-context K=7 response emits 46 tokens in 566.72 ms, clearing the
@@ -216,7 +228,9 @@ reflects the remaining measured costs.
    operator to 321.8--323.6 microseconds per layer and raises the full run to
    34.21 tok/s with unchanged prefix and suffix hashes, so the
    remaining gap is dominated by work outside attention. SiLU and Q8_1
-   staging for 58 dense down projections now share one exact launch.
+   staging for 58 dense down projections now share one exact launch; gated
+   RMSNorm and Q8_1 staging do the same for all 48 recurrent output
+   projections.
    Fixed-eight Q2_K/IQ projections already share decoded weights, but
    ordinary decode still streams weights for one row at a time. Reuse the
    quantized input across gate/up projections and investigate cooperative
