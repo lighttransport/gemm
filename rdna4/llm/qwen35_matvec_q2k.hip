@@ -15,6 +15,64 @@ extern "C" __global__ void qwen35_quantize_q81(
     if (threadIdx.x == 0) scales[blockIdx.x] = (float)(_Float16)d;
 }
 
+/* DFlash2's Q4_K projections evaluate at most eight adjacent draft rows.
+ * Quantizing those activations once per 32 values replaces the scalar F32
+ * inner products with packed gfx1201 dot products while each output warp
+ * still reuses one decoded weight block across every row.  This path is only
+ * used to propose tokens; the target model remains the authority. */
+extern "C" __global__ void qwen35_matvec_q4k_q81_multi8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    int lane=threadIdx.x&31;
+    int row=blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
+    if(row>=rows)return;
+    int blocks=cols/256;
+    const unsigned char *w=weights+(size_t)row*blocks*144;
+    float sum[8]={};
+    for(int chunk=lane;chunk<blocks*4;chunk+=32){
+        int b=chunk>>2,c=chunk&3,is=2*c;
+        const unsigned char *p=w+(size_t)b*144;
+        const unsigned char *sc=p+4;
+        int sv0,mv0,sv1,mv1;
+        if(is<4){sv0=sc[is]&63;mv0=sc[is+4]&63;}
+        else{sv0=(sc[is+4]&15)|((sc[is-4]>>6)<<4);
+             mv0=(sc[is+4]>>4)|((sc[is]>>6)<<4);}
+        if(is+1<4){sv1=sc[is+1]&63;mv1=sc[is+5]&63;}
+        else{sv1=(sc[is+5]&15)|((sc[is-3]>>6)<<4);
+             mv1=(sc[is+5]>>4)|((sc[is+1]>>6)<<4);}
+        const unsigned int *qw=(const unsigned int *)(p+16+c*32);
+        int dot0[8]={},dot1[8]={},xsum0[8]={},xsum1[8]={};
+#pragma unroll
+        for(int j=0;j<8;++j){
+            unsigned int packed=qw[j];
+            int lo=(int)(packed&0x0f0f0f0fu);
+            int hi=(int)((packed>>4)&0x0f0f0f0fu);
+#pragma unroll
+            for(int m=0;m<8;++m)if(m<count){
+                const int *u=(const int *)(q+(size_t)m*cols+b*256+c*64);
+                dot0[m]=__builtin_amdgcn_sudot4(true,lo,true,u[j],dot0[m],false);
+                dot1[m]=__builtin_amdgcn_sudot4(true,hi,true,u[j+8],dot1[m],false);
+                xsum0[m]=__builtin_amdgcn_sudot4(true,0x01010101,true,u[j],xsum0[m],false);
+                xsum1[m]=__builtin_amdgcn_sudot4(true,0x01010101,true,u[j+8],xsum1[m],false);
+            }
+        }
+        float d=(float)*(const _Float16 *)p;
+        float dm=(float)*(const _Float16 *)(p+2);
+#pragma unroll
+        for(int m=0;m<8;++m)if(m<count){
+            const float *sx=scales+(size_t)m*(cols/32)+b*8+is;
+            sum[m]+=sx[0]*(d*sv0*dot0[m]-dm*mv0*xsum0[m])+
+                    sx[1]*(d*sv1*dot1[m]-dm*mv1*xsum1[m]);
+        }
+    }
+#pragma unroll
+    for(int m=0;m<8;++m)if(m<count){
+        for(int offset=16;offset;offset>>=1)
+            sum[m]+=__shfl_down(sum[m],offset,32);
+        if(lane==0)out[(size_t)m*rows+row]=sum[m];
+    }
+}
+
 extern "C" __global__ void qwen35_argmax_parts(const float *x, int n,
                                                float *scores, int *indices) {
     __shared__ float values[256];

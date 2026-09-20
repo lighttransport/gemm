@@ -46,6 +46,7 @@ RX 9070 XT / gfx1201 / ROCm 10, Q8 K and Q8 V, greedy sampling:
 | IQ2_XS ordinary, exact three-head K/V reuse | 512 tokens | 32.56 | 444.31 | 4282 MiB | `051e7338c23a544e` |
 | IQ2_XS ordinary, staged IQ codebooks | 512 tokens | 33.31 | 443.44 | 4282 MiB | `051e7338c23a544e` |
 | IQ2_XS + DFlash2 K=7, optimized | 256 tokens | 47.72 | 445.71 | 1274 MiB | `2ddd068dca63669a` |
+| IQ2_XS + DFlash2 K=7, packed Q4_K/Q8_1 draft | 256 tokens | 49.74 | 443.57 | 1274 MiB | `2ddd068dca63669a` |
 
 All runs use the same fully processed 65,536-token random prefix with token
 hash `90178de69a24a76e`.  The ordinary row records the original exact gate.  Its
@@ -54,6 +55,11 @@ optimized DFlash run processed the prefix in 147.039 seconds, then generated
 256 tokens in 5.365 seconds.  It drafted 259 tokens, accepted 217, and spent
 668.717/4602.977/57.440 ms in draft/verify/commit.  The earlier 27.94 tok/s
 result used zero cache rows and is not comparable.
+
+The packed draft run processed the prefix in 147.747 seconds and generated the
+same suffix in 5.147 seconds. Its 474.117/4585.996/56.181 ms
+draft/verify/commit split shows that Q4_K/Q8_1 packed dots removed 194.600 ms
+from proposal work without changing acceptance or the authoritative suffix.
 
 At 16K and longer, native Q8 attention uses an exact three-head GQA kernel.
 Four waves load each K/V row once and update three independent query heads;

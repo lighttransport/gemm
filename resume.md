@@ -15,9 +15,9 @@ sampled output while the remaining verifier-row gap is investigated.
 On the 4096-token C clamp prompt, K=4 accepted 37/40 drafts and K=7 accepted
 41/42.  Both produced the ordinary target's exact 46-token response, EOS and
 sequence hash `15f17d2640c1adfc`; the emitted C is coherent, compiles warning
-free as C17 and passes `INT_MIN`/`INT_MAX` boundary cases.  The final K=7 run
-measured **76.16 tok/s decode and 539.54 tok/s prefill**.  K=4 measured 52.78
-and 537.39.  A recent ordinary native baseline measured 39.55 and 533.19.
+free as C17 and passes `INT_MIN`/`INT_MAX` boundary cases. The final K=7 run
+measured **80.61 tok/s decode and 536.78 tok/s prefill**. K=4 measured 54.49
+and 537.42. A recent ordinary native baseline measured 39.55 and 533.19.
 The upstream llama.cpp server path measured 16.54 tok/s at K=4 with the same
 37/40 acceptance, versus its 25.88 baseline.  Native K=4 is 3.19x faster than
 upstream DFlash2, and K=7 is 93 percent faster than the recent ordinary native
@@ -29,9 +29,9 @@ Greedy output matches the pinned llama.cpp bytes and token IDs with SHA-256
 temperature-0.6 output uses the exact-target fallback and matches SHA-256
 `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac`.
 Both functions pass ASan/UBSan, fixed edge cases and 10,000 randomized cases.
-Warm K=7 greedy runs sustain 605.95–606.83 tok/s prefill and
-79.69–79.74 tok/s decode.  K=4 sustains 607.24–607.84 and 58.35–58.42.
-Sampled exact-target decode sustains 38.74–38.86 tok/s.  The early-context
+Warm K=7 greedy runs sustain 607.44–608.13 tok/s prefill and
+85.05–85.06 tok/s decode. K=4 sustains 605.19–605.76 and 60.54–60.57.
+Sampled exact-target decode sustains 39.75–40.02 tok/s. The early-context
 retrieval gate also emits exactly `ZEPHYR-7319` at K=7 with the pinned token
 sequence and EOS.
 
@@ -48,20 +48,22 @@ quantization format at compile time, eliminating runtime codebook branches.
 Compact Q2_K, IQ2 and IQ3_S schedules finish one verifier query at a time to
 lower accumulator pressure without changing the reference reduction order.
 RMSNorm and residual-plus-RMSNorm use one batched launch with an independent
-block and unchanged reduction per row.  The DFlash draft reuses Q4_K weights
-across eight rows and K/V values across four attention rows.  Exact target
+block and unchanged reduction per row. The DFlash draft quantizes each row to
+Q8_1 and evaluates Q4_K projections with packed gfx1201 integer dots, reusing
+decoded weights across eight rows and quantized inputs across adjacent
+projections. It also reuses K/V values across four attention rows. Exact target
 attention now loads each old Q8 K/V row once while evaluating up to eight
 adjacent verifier queries.  It retains the pinned query quantization, online
 softmax, packed-F16 accumulation and split-combine order.  K=7 timing for the
-final 46-token response is draft 108.910 ms, target verify 483.679 ms and
-commit 10.651 ms, for 604.00 ms total.  The exact attention differential
+final 46-token response is draft 77.625 ms, target verify 481.791 ms and
+commit 10.511 ms, for 570.66 ms total. The exact attention differential
 passes 46,743,552 values; its eight-query operator takes 213.382 microseconds
 at 4K and 3.076784 milliseconds at 64K with eight splits.
 
 After a fully processed 65,536-token random prefix, DFlash K=7 now sustains
-**47.72 tok/s** for a 256-token suffix.  The prefix sustains 445.71 tok/s and
+**49.74 tok/s** for a 256-token suffix. The prefix sustains 443.57 tok/s and
 has hash `90178de69a24a76e`; the suffix retains hash `2ddd068dca63669a`.
-It drafted 259 tokens, accepted 217, and spent 668.717/4602.977/57.440 ms in
+It drafted 259 tokens, accepted 217, and spent 474.117/4585.996/56.181 ms in
 draft/verify/commit.  This meets the random-depth 40 tok/s goal.  Ordinary
 scalar decode now stages the IQ2_XXS, IQ2_XS and IQ3_XXS codebooks in LDS. A
 512-token zero-depth run sustains 41.90--42.03 tok/s with unchanged hash
@@ -70,7 +72,7 @@ retained `051e7338c23a544e` hash. The 40 tok/s long-context target remains
 open.
 
 Prioritize ordinary one-row target projection traffic first, followed by the
-sampled verifier-row parity audit, recurrent-state checkpoint traffic, and
+long-context verifier attention tail, sampled verifier-row parity audit, and
 fusion of QK norm/RoPE/KV store and activation/state-preparation launches.
 The shared-K/V attention path may still benefit from an exact in-kernel
 combine or an adaptive split policy.  DFlash prompt feature capture and
@@ -82,8 +84,8 @@ CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
 and `--kv-cache q8q8`.  `validate_qwen38_reference.py` accepts `--dflash2`
 and `--dflash2-draft` for the greedy/sampled C++ gate.  Current artifacts are
-under `tmp/qwen38/dflash2-quality-k4-v5/`,
-`tmp/qwen38/dflash2-quality-k7-v4/`, and
+under `tmp/qwen38/dflash2-q4k-q81-k4/`,
+`tmp/qwen38/dflash2-q4k-q81-k7-v2/`, and
 `tmp/qwen38/dflash2-retrieval-k7.*`.  Details and the reproduction command:
 [QWEN38_DFLASH2.md](rdna4/llm/QWEN38_DFLASH2.md).
 
@@ -92,7 +94,7 @@ under `tmp/qwen38/dflash2-quality-k4-v5/`,
 The IQ2 runner sustains more than 400 tok/s while processing 65,536 random
 tokens in 512-token chunks on RX 9070 XT / gfx1201 / ROCm 10.  The original
 optimized ordinary run measured 413.25 tok/s; the current DFlash K=7 run
-measures 445.71 tok/s.  The previous native Q8/Q8 path took 460.37 seconds at
+measures 443.57 tok/s. The previous native Q8/Q8 path took 460.37 seconds at
 142.36 tok/s.  Long-context prefill therefore remains above its target after
 adding sidecar feature capture and cache injection.
 
@@ -136,8 +138,8 @@ tok/s after processing the same prefix at 443.44 tok/s; its hash is the
 retained `051e7338c23a544e`.
 The prior 27.94 tok/s result used zero cache values and is superseded.
 
-The optimized DFlash K=7 path processes the same random prefix in 147.039
-seconds at 445.71 tok/s, then sustains 47.72 tok/s for 256 tokens with suffix
+The optimized DFlash K=7 path processes the same random prefix in 147.747
+seconds at 443.57 tok/s, then sustains 49.74 tok/s for 256 tokens with suffix
 hash `2ddd068dca63669a`.  Its exact eight-query shared-K/V attention kernel
 takes 3.077 ms per layer at 64K, compared with 8.654 ms for the generic
 verifier at the same eight-split schedule.  DFlash therefore meets the 40

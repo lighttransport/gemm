@@ -51,6 +51,8 @@ typedef struct hllm_qwen35_dflash2 {
     void *q, *k, *v, *attn, *attn_partial, *proj, *gate, *up;
     void *logits, *selector_gate;
     void *selector_candidates, *selector_drafts;
+    void *q81_source;
+    int q81_rows, q81_cols;
 } hllm_qwen35_dflash2;
 
 static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
@@ -122,6 +124,11 @@ static void hllm_qwen35_dflash2_capture(hip_llm_runner *r, int layer,
 
 static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
         void *x, int rows, int nr, int nc, int stride, int type) {
+    hllm_qwen35_dflash2 *d=r->qwen35_dflash2;
+    int q4_q81=type==GGML_TYPE_Q4_K && rows>1 &&
+        rows<=HLLM_DFLASH_MAX_BLOCK && stride==nc && nc%256==0 &&
+        r->fn_qwen35_quantize_q81 && r->fn_qwen35_matvec_q4k_q81_multi8;
+    if(!q4_q81)d->q81_source=NULL;
     if (type == GGML_TYPE_Q2_K && rows > 1 &&
         rows <= HLLM_DENSE_MTP_REUSE_ROWS && stride == nc && nc <= 6144 &&
         nc % 256 == 0 && r->fn_qwen35_matvec_q2k_multi4) {
@@ -147,9 +154,21 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
             r->fn_qwen35_matvec_iq4xs_multi8;
         LAUNCH(iq4_fn, (nr+3)/4, 1, 1,
                128, 1, 1, 0, r->stream, ma);
+    } else if (q4_q81) {
+        if(d->q81_source!=x||d->q81_rows!=rows||d->q81_cols!=nc){
+            int total=rows*nc;
+            void *qa[]={&r->d_act_q8_batch,&r->d_act_scale_batch,&x,&total};
+            LAUNCH(r->fn_qwen35_quantize_q81,total/32,1,1,32,1,1,0,
+                   r->stream,qa);
+            d->q81_source=x;d->q81_rows=rows;d->q81_cols=nc;
+        }
+        void *ma[]={&dst,&weight,&r->d_act_q8_batch,
+                    &r->d_act_scale_batch,&nr,&nc,&rows};
+        LAUNCH(r->fn_qwen35_matvec_q4k_q81_multi8,(nr+7)/8,1,1,
+               256,1,1,0,r->stream,ma);
     } else if (type == GGML_TYPE_Q4_K && rows > 1) {
-        launch_matvec_qwen35_native_batch(r, dst, weight, x, rows, nr, nc,
-                                          stride, type);
+        launch_matvec_qwen35_native_batch(r,dst,weight,x,rows,nr,nc,
+                                          stride,type);
     } else {
         for (int i = 0; i < rows; ++i)
             launch_matvec_auto(r, (float *)dst + (size_t)i * nr, weight,
@@ -409,6 +428,7 @@ static void hllm_dflash_conv(hip_llm_runner *r, hllm_qwen35_dflash2 *d,
     void *a[] = { &out, &hidden, &dynamic, &base, &rows, &r->n_embd,
                   &groups, &side };
     LAUNCH(d->fn_conv,(total+255)/256,1,1,256,1,1,0,r->stream,a);
+    d->q81_source=NULL;
 }
 
 int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
@@ -426,12 +446,14 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
     }
     int rows=count+1, ne=r->n_embd, qd=HLLM_DFLASH_HEADS*HLLM_DFLASH_HEAD_DIM;
     int kd=HLLM_DFLASH_KV_HEADS*HLLM_DFLASH_HEAD_DIM;
+    d->q81_source=NULL;
     launch_embed_iq1_m(r,d->x,r->d_token_embd,anchor,ne);
     for (int i=1;i<rows;++i)
         launch_embed_iq1_m(r,(float *)d->x+(size_t)i*ne,r->d_token_embd,d->mask_token,ne);
     for (int l=0;l<HLLM_DFLASH_LAYERS;++l) {
         hllm_dflash_layer *cl=&d->layers[l];
         launch_rmsnorm_batch(r,d->norm,d->x,cl->attn_norm,ne,rows,ne,r->rms_norm_eps);
+        d->q81_source=NULL;
         hllm_dflash_project(r,d->dynamic,cl->attn_conv_proj,d->norm,rows,
             HLLM_DFLASH_DYNAMIC,ne,ne,cl->attn_conv_proj_type);
         hllm_dflash_conv(r,d,d->conv,d->norm,d->dynamic,cl->attn_conv_base,rows,0);
@@ -464,6 +486,7 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         hllm_dflash_conv(r,d,d->conv,d->proj,d->dynamic,cl->attn_conv_base,rows,1);
         launch_add(r,d->x,d->conv,rows*ne);
         launch_rmsnorm_batch(r,d->norm,d->x,cl->ffn_norm,ne,rows,ne,r->rms_norm_eps);
+        d->q81_source=NULL;
         hllm_dflash_project(r,d->dynamic,cl->ffn_conv_proj,d->norm,rows,
             HLLM_DFLASH_DYNAMIC,ne,ne,cl->ffn_conv_proj_type);
         hllm_dflash_conv(r,d,d->conv,d->norm,d->dynamic,cl->ffn_conv_base,rows,0);
@@ -475,6 +498,7 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         launch_add(r,d->x,d->conv,rows*ne);
     }
     launch_rmsnorm_batch(r,d->norm,d->x,d->out_norm,ne,rows,ne,r->rms_norm_eps);
+    d->q81_source=NULL;
     /* The anchor row seeds the selector's predecessor but never contributes
      * logits or a selector gate.  Keep row-indexed buffers so the top-k and
      * selector kernels retain their established indexing, and project only
