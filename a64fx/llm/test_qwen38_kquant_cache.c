@@ -123,6 +123,93 @@ static void compact_a8(float *q5_dst, float *iq4_dst,
     }
 }
 
+static int test_selective_materialize(void) {
+    enum { PAYLOAD_BYTES = 4096 };
+    const char *scratch = getenv("TMPDIR");
+    if (!scratch || !*scratch) scratch = ".";
+    char path[PATH_MAX];
+    int length = snprintf(path, sizeof(path),
+                          "%s/q38kc-materialize-%ld", scratch, (long)getpid());
+    if (length < 0 || (size_t)length >= sizeof(path)) return -1;
+
+    q38kc_header *header = calloc(1, sizeof(*header));
+    uint8_t *q5_payload = malloc(PAYLOAD_BYTES);
+    uint8_t *iq4_payload = malloc(PAYLOAD_BYTES);
+    if (!header || !q5_payload || !iq4_payload) return -1;
+    memcpy(header->magic, Q38KC_MAGIC, sizeof(header->magic));
+    header->n_entries = 2;
+    header->entries[0].source_type = GGML_TYPE_Q5_K;
+    header->entries[0].local_rows = TF_KQUANT_CACHE_ROWS;
+    header->entries[0].file_offset = Q38KC_HEADER_BYTES;
+    header->entries[0].byte_length = PAYLOAD_BYTES;
+    header->entries[1].source_type = GGML_TYPE_IQ4_XS;
+    header->entries[1].local_rows = TF_KQUANT_CACHE_ROWS;
+    header->entries[1].file_offset = Q38KC_HEADER_BYTES + PAYLOAD_BYTES;
+    header->entries[1].byte_length = PAYLOAD_BYTES;
+    memset(q5_payload, 0x5a, PAYLOAD_BYTES);
+    memset(iq4_payload, 0x49, PAYLOAD_BYTES);
+    size_t file_bytes = Q38KC_HEADER_BYTES + 2 * PAYLOAD_BYTES;
+
+    int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    int failed = fd < 0 || ftruncate(fd, (off_t)file_bytes) ||
+        pwrite(fd, header, sizeof(*header), 0) != (ssize_t)sizeof(*header) ||
+        pwrite(fd, q5_payload, PAYLOAD_BYTES,
+               (off_t)header->entries[0].file_offset) != PAYLOAD_BYTES ||
+        pwrite(fd, iq4_payload, PAYLOAD_BYTES,
+               (off_t)header->entries[1].file_offset) != PAYLOAD_BYTES;
+    void *mapping = MAP_FAILED;
+    if (!failed)
+        mapping = mmap(NULL, file_bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (fd >= 0) close(fd);
+    if (mapping == MAP_FAILED) failed = 1;
+
+    q38kc_model_cache cache = {0};
+    transformer_model model = {0};
+    char error[256] = {0};
+    if (!failed) {
+        cache.loaded.header = header;
+        cache.loaded.mapping = mapping;
+        cache.loaded.mapping_bytes = file_bytes;
+        if (q38kc_model_materialize(&cache, &model, path,
+                                    error, sizeof(error))) {
+            fprintf(stderr, "selective materialize failed: %s\n", error);
+            failed = 1;
+        }
+    }
+    if (!failed) {
+        const uint8_t *materialized = (const uint8_t *)cache.loaded.mapping;
+        const uint8_t *q5 = materialized + header->entries[0].file_offset;
+        const uint8_t *iq4 = materialized + header->entries[1].file_offset;
+        for (int i = 0; i < PAYLOAD_BYTES; i++)
+            if (q5[i] || iq4[i] != 0x49) {
+                fprintf(stderr,
+                        "selective payload mismatch at byte %d q5=%02x iq4=%02x\n",
+                        i, q5[i], iq4[i]);
+                failed = 1;
+                break;
+            }
+        if (cache.materialized_entries != 1 ||
+            cache.materialized_bytes != Q38KC_HEADER_BYTES + PAYLOAD_BYTES) {
+            fprintf(stderr,
+                    "selective accounting mismatch entries=%u bytes=%llu\n",
+                    cache.materialized_entries,
+                    (unsigned long long)cache.materialized_bytes);
+            failed = 1;
+        }
+    }
+
+    if (cache.loaded.mapping && cache.loaded.mapping != MAP_FAILED)
+        q38kc_unload(&cache.loaded);
+    else {
+        if (mapping != MAP_FAILED) munmap(mapping, file_bytes);
+        free(header);
+    }
+    unlink(path);
+    free(iq4_payload);
+    free(q5_payload);
+    return failed ? -1 : 0;
+}
+
 int main(void) {
     const int nb = TEST_COLS / 256;
     size_t compact_blocks = (size_t)TEST_ROWS * nb;
@@ -143,6 +230,7 @@ int main(void) {
         fprintf(stderr, "allocation failed\n");
         return 1;
     }
+    if (test_selective_materialize()) return 1;
     if (packed_q5r_bytes(7, TEST_COLS) || packed_iq4r_bytes(TEST_ROWS, 255) ||
         !q5r_size || !iq4r_size) {
         fprintf(stderr, "dimension validation failed\n");
@@ -306,7 +394,7 @@ int main(void) {
         fprintf(stderr, "model cache detach failed\n");
         return 1;
     }
-    printf("SENTINEL qwen38_kquant_cache=OK layout_version=%d q5r_bytes=%zu iq4r_bytes=%zu ownership_threads=3 tail_fallback=1 q5_default_skip=1 attach_detach=1\n",
+    printf("SENTINEL qwen38_kquant_cache=OK layout_version=%d q5r_bytes=%zu iq4r_bytes=%zu ownership_threads=3 tail_fallback=1 q5_default_skip=1 selective_materialize=1 attach_detach=1\n",
            TF_KQUANT_CACHE_LAYOUT_VERSION, q5r_size, iq4r_size);
     free(x);
     free(iq4r);

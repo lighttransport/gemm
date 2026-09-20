@@ -3571,6 +3571,23 @@ The native-node focused revalidation after this safety change used repo-local
 compiler/test scratch and passed:
 
 ```text
-SENTINEL qwen38_kquant_cache=OK layout_version=1 q5r_bytes=8960 iq4r_bytes=8704 ownership_threads=3 tail_fallback=1 q5_default_skip=1 attach_detach=1
+SENTINEL qwen38_kquant_cache=OK layout_version=1 q5r_bytes=8960 iq4r_bytes=8704 ownership_threads=3 tail_fallback=1 q5_default_skip=1 selective_materialize=1 attach_detach=1
 SENTINEL qwen38_kquant_stage=OK entries=2 q5r=2240 iq4r=2176 reuse=1 corrupt_rebuild=1 loader_rejects=9
 ```
+
+The selective-materialization check writes a bounded synthetic two-entry
+sidecar, materializes it through the production loader, and verifies that the
+IQ4R payload is present while every byte of the skipped Q5R payload remains an
+untouched zero page.  It also requires `materialized_entries=1` and exact
+resident-byte accounting.
+
+The real layer-0 IQ4R benchmark was repeated on the native 2.0 GHz node for
+all four activation patterns.  Every output remained bit-identical to compact
+IQ4_XS A8 (`a8_nrmse=0`, `a8_max_abs=0`):
+
+| Pattern | Compact A8 | IQ4R | Effective compact BW |
+| --- | ---: | ---: | ---: |
+| wave | 0.460 ms | 0.217 ms | 218.5 GB/s |
+| sparse | 0.461 ms | 0.217 ms | 217.9 GB/s |
+| dynamic | 0.460 ms | 0.212 ms | 223.1 GB/s |
+| random | 0.459 ms | 0.215 ms | 220.3 GB/s |

@@ -132,8 +132,9 @@ worker now `pread`s its own groups into a read-only anonymous arena and evicts
 the source pages. This makes the sidecar resident before decode and preserves
 CMG-local first touch.
 Synthetic coverage includes uneven three-worker ownership, unaligned ranged
-dispatch, a 15-row compact fallback, invalid format rejection, and model
-attach/detach. Fujitsu builds of the focused test and full runner pass. The
+dispatch, a 15-row compact fallback, invalid format rejection, selective
+IQ4-only anonymous materialization with zero Q5 pages, and model attach/detach.
+Fujitsu builds of the focused test and full runner pass. The
 full Q5R+IQ4R TP4 path reached 25.40 tok/s versus 11.73 compact and matched 128
 tokens, but failed the 256-token gate at token 17. An exact Q5R scheduling
 experiment was slower than compact and was rejected. Q5R is therefore skipped
