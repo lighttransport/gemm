@@ -126,6 +126,12 @@ routes:
   producing one sequential packed stream and 16 independent accumulator
   vectors. FP4 uses the exact doubled-integer E2M1 table and folds the factor
   of one half into the eventual block scale.
+- `--path int16x8 --kernel super` is an exact experimental radix-256 form for
+  activations in `[-32768, 32639]`. Each activation is packed as two signed
+  bytes, `a = lo + 256*hi`, and two ordinary INT8 SDOT streams are combined
+  into INT32. It removes weight widening, but is slower on A64FX because the
+  INT8 SDOT route saturates before HBM. It remains selectable as a documented
+  rejected alternative rather than replacing the INT16-to-INT64 kernel.
 - `--path fp16 --kernel super` uses a separate N-lane layout. For each K
   scalar, 32 packed bytes hold 64 output columns; four independent blocks are
   adjacent. Each load expands directly into two 32-lane FP16 vectors and is

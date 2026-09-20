@@ -254,6 +254,18 @@ Q38TP_RANK=0 Q38TP_SIZE=4 ./a64fx/llm/build/qwen38_kquant_stage \
 
 ## Resume prompt
 
+### A64FX W4A16 fused-kernel follow-up (2026-09-20)
+
+The direct INT16 SDOT supertile was rescheduled to keep both K=128 blocks and
+four cache lines in flight. Correctness passes for INT4 and FP4; the controlled
+INT4 rate improved from 147.00 to **171.03 GB/s median (171.04 best)**. The
+200+ GB/s packed-input target remains open. An exact two-signed-byte
+radix-256 activation path was added and verified, but measured only 119.92
+GB/s median, so it is a rejected comparison path. Remaining single-node work:
+reduce INT4 nibble sign-extension/unpack issue cost or find a schedule/layout
+that raises the selected INT16-to-INT64 kernel by another 17%; then rerun the
+paired W4A8 control in the same XOS allocation and repeat FP4 measurements.
+
 ```text
 Continue the active goal in resume-dequant.md: finish and accept safe rank-local
 Q5R/IQ4R decode for Qwen3.8 on A64FX. Read AGENTS.md and the whole goal file

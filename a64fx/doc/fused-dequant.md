@@ -237,6 +237,15 @@ W4A16 does not saturate the 230 GB/s packed-read interface: doubling the dot
 work plus widening/conversion moves the bottleneck back to instruction issue
 and dependency latency.
 
+The current INT4/INT16 schedule exposes four cache-line loads from both blocks
+before unpacking and alternates their widening and SDOT chains. A six-result
+unpack window raises the controlled rate further to **171.03 GB/s median /
+171.04 best**, still short of the 200 GB/s target. An alternative packs each
+activation in `[-32768, 32639]` exactly into signed radix-256 digits and evaluates
+`dot(lo) + 256*dot(hi)` with ordinary INT8 SDOT. It verifies exactly for the
+benchmark range but reaches only 119.92 GB/s median, demonstrating that
+removing weight widening is not enough when two INT8 dot streams are needed.
+
 The last result needs careful interpretation. Separate allocations showed both
 roughly 120 and 229 GB/s states. A controlled sweep later found that changing
 a 16 KiB inter-core gap did not select the state; physical allocation and page

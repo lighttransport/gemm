@@ -1197,6 +1197,120 @@ fused_i4_i8_m1_k4_super_sve:
     sdot    \c7\().d, z27.h, z28.h
     .endm
 
+/* Interleave both supertile blocks to expose four independent cache lines. */
+    .macro FUSED_W4_I16_LINE fp4
+    ld1b {z16.b}, p0/z, [x0]
+    ld1b {z17.b}, p0/z, [x0, #1, mul vl]
+    ld1b {z18.b}, p0/z, [x0, #2, mul vl]
+    ld1b {z19.b}, p0/z, [x0, #3, mul vl]
+    mov z20.d, z16.d
+    mov z21.d, z17.d
+    mov z22.d, z18.d
+    mov z23.d, z19.d
+    .if \fp4
+    and z16.b, z16.b, #0x0f
+    and z17.b, z17.b, #0x0f
+    and z18.b, z18.b, #0x0f
+    and z19.b, z19.b, #0x0f
+    lsr z20.b, z20.b, #4
+    lsr z21.b, z21.b, #4
+    lsr z22.b, z22.b, #4
+    lsr z23.b, z23.b, #4
+    tbl z16.b, {z31.b}, z16.b
+    tbl z17.b, {z31.b}, z17.b
+    tbl z18.b, {z31.b}, z18.b
+    tbl z19.b, {z31.b}, z19.b
+    tbl z20.b, {z31.b}, z20.b
+    tbl z21.b, {z31.b}, z21.b
+    tbl z22.b, {z31.b}, z22.b
+    tbl z23.b, {z31.b}, z23.b
+    .else
+    lsl z16.b, z16.b, #4
+    lsl z17.b, z17.b, #4
+    lsl z18.b, z18.b, #4
+    lsl z19.b, z19.b, #4
+    asr z16.b, z16.b, #4
+    asr z17.b, z17.b, #4
+    asr z18.b, z18.b, #4
+    asr z19.b, z19.b, #4
+    asr z20.b, z20.b, #4
+    asr z21.b, z21.b, #4
+    asr z22.b, z22.b, #4
+    asr z23.b, z23.b, #4
+    .endif
+    .if !\fp4
+    ld1rd {z30.d}, p0/z, [x1]
+    ld1rd {z31.d}, p0/z, [x3]
+    sunpklo z24.h, z16.b
+    sunpkhi z25.h, z16.b
+    sunpklo z26.h, z20.b
+    sunpkhi z27.h, z20.b
+    sunpklo z28.h, z18.b
+    sunpkhi z29.h, z18.b
+    sdot z0.d, z24.h, z30.h
+    sdot z1.d, z25.h, z30.h
+    sdot z2.d, z26.h, z30.h
+    sdot z3.d, z27.h, z30.h
+    sdot z8.d, z28.h, z31.h
+    sdot z9.d, z29.h, z31.h
+    sunpklo z24.h, z22.b
+    sunpkhi z25.h, z22.b
+    sunpklo z26.h, z17.b
+    sunpkhi z27.h, z17.b
+    sunpklo z28.h, z19.b
+    sunpkhi z29.h, z19.b
+    sdot z10.d, z24.h, z31.h
+    sdot z11.d, z25.h, z31.h
+    sdot z4.d, z26.h, z30.h
+    sdot z5.d, z27.h, z30.h
+    sdot z12.d, z28.h, z31.h
+    sdot z13.d, z29.h, z31.h
+    sunpklo z24.h, z21.b
+    sunpkhi z25.h, z21.b
+    sunpklo z26.h, z23.b
+    sunpkhi z27.h, z23.b
+    sdot z6.d, z24.h, z30.h
+    sdot z7.d, z25.h, z30.h
+    sdot z14.d, z26.h, z31.h
+    sdot z15.d, z27.h, z31.h
+    .else
+    ld1rd {z28.d}, p0/z, [x1]
+    ld1rd {z29.d}, p0/z, [x3]
+    sunpklo z24.h, z16.b
+    sunpkhi z25.h, z16.b
+    sdot z0.d, z24.h, z28.h
+    sdot z1.d, z25.h, z28.h
+    sunpklo z24.h, z20.b
+    sunpkhi z25.h, z20.b
+    sdot z2.d, z24.h, z28.h
+    sdot z3.d, z25.h, z28.h
+    sunpklo z24.h, z17.b
+    sunpkhi z25.h, z17.b
+    sdot z4.d, z24.h, z28.h
+    sdot z5.d, z25.h, z28.h
+    sunpklo z24.h, z21.b
+    sunpkhi z25.h, z21.b
+    sdot z6.d, z24.h, z28.h
+    sdot z7.d, z25.h, z28.h
+    sunpklo z24.h, z18.b
+    sunpkhi z25.h, z18.b
+    sdot z8.d, z24.h, z29.h
+    sdot z9.d, z25.h, z29.h
+    sunpklo z24.h, z22.b
+    sunpkhi z25.h, z22.b
+    sdot z10.d, z24.h, z29.h
+    sdot z11.d, z25.h, z29.h
+    sunpklo z24.h, z19.b
+    sunpkhi z25.h, z19.b
+    sdot z12.d, z24.h, z29.h
+    sdot z13.d, z25.h, z29.h
+    sunpklo z24.h, z23.b
+    sunpkhi z25.h, z23.b
+    sdot z14.d, z24.h, z29.h
+    sdot z15.d, z25.h, z29.h
+    .endif
+    .endm
+
     .global fused_i4_i16_m1_k2_sve
     .type fused_i4_i16_m1_k2_sve, %function
 fused_i4_i16_m1_k2_sve:
@@ -1298,9 +1412,7 @@ fused_i4_i16_m1_k2_sve:
     mov     x10, #32
     .p2align 6
 1:
-    FUSED_W4_I16_PAIR x0, x1, \fp4, z0, z1, z2, z3, z4, z5, z6, z7
-    add     x4, x0, #128
-    FUSED_W4_I16_PAIR x4, x3, \fp4, z8, z9, z10, z11, z12, z13, z14, z15
+    FUSED_W4_I16_LINE \fp4
     add     x0, x0, #256
     add     x1, x1, #8
     add     x3, x3, #8
@@ -1333,6 +1445,122 @@ fused_i4_i16_m1_k2_sve:
 
     FUSED_W4_I16_SUPER fused_i4_i16_m1_k2_super_sve, 0
     FUSED_W4_I16_SUPER fused_fp4_i16_m1_k2_super_sve, 1
+
+/*
+ * Exact bounded-A16 route using two signed radix-256 activation digits:
+ * a = lo + 256*hi.  The caller supplies [block0 lo][block0 hi]
+ * [block1 lo][block1 hi], 128 bytes each.  This uses ordinary INT8 SDOT and
+ * combines accumulator pairs in INT32, avoiding all weight SUNPK operations.
+ */
+    .macro FUSED_W4_A16X8_PAIR wp, alo, ahi, fp4, c0, c1, c2, c3, c4, c5, c6, c7
+    ld1b    {z16.b}, p0/z, [\wp]
+    ld1b    {z17.b}, p0/z, [\wp, #1, mul vl]
+    mov     z18.d, z16.d
+    mov     z19.d, z17.d
+    .if \fp4
+    and     z16.b, z16.b, #0x0f
+    and     z17.b, z17.b, #0x0f
+    lsr     z18.b, z18.b, #4
+    lsr     z19.b, z19.b, #4
+    tbl     z16.b, {z31.b}, z16.b
+    tbl     z17.b, {z31.b}, z17.b
+    tbl     z18.b, {z31.b}, z18.b
+    tbl     z19.b, {z31.b}, z19.b
+    .else
+    lsl     z16.b, z16.b, #4
+    lsl     z17.b, z17.b, #4
+    asr     z16.b, z16.b, #4
+    asr     z17.b, z17.b, #4
+    asr     z18.b, z18.b, #4
+    asr     z19.b, z19.b, #4
+    .endif
+    ld1rw   {z20.s}, p0/z, [\alo]
+    ld1rw   {z21.s}, p0/z, [\ahi]
+    sdot    \c0\().s, z16.b, z20.b
+    sdot    \c1\().s, z16.b, z21.b
+    sdot    \c2\().s, z18.b, z20.b
+    sdot    \c3\().s, z18.b, z21.b
+    sdot    \c4\().s, z17.b, z20.b
+    sdot    \c5\().s, z17.b, z21.b
+    sdot    \c6\().s, z19.b, z20.b
+    sdot    \c7\().s, z19.b, z21.b
+    .endm
+
+    .macro FUSED_W4_A16X8_SUPER name, fp4
+    .global \name
+    .type \name, %function
+\name:
+    SAVE_D8_D15
+    ptrue   p0.b
+    .if \fp4
+    adr     x9, .Lfp4_lut
+    ld1b    {z31.b}, p0/z, [x9]
+    .endif
+    add     x3, x1, #128
+    add     x4, x3, #128
+    add     x5, x4, #128
+    eor     z0.d, z0.d, z0.d
+    eor     z1.d, z1.d, z1.d
+    eor     z2.d, z2.d, z2.d
+    eor     z3.d, z3.d, z3.d
+    eor     z4.d, z4.d, z4.d
+    eor     z5.d, z5.d, z5.d
+    eor     z6.d, z6.d, z6.d
+    eor     z7.d, z7.d, z7.d
+    eor     z8.d, z8.d, z8.d
+    eor     z9.d, z9.d, z9.d
+    eor     z10.d, z10.d, z10.d
+    eor     z11.d, z11.d, z11.d
+    eor     z12.d, z12.d, z12.d
+    eor     z13.d, z13.d, z13.d
+    eor     z14.d, z14.d, z14.d
+    eor     z15.d, z15.d, z15.d
+    mov     x10, #32
+    .p2align 6
+1:
+    FUSED_W4_A16X8_PAIR x0, x1, x3, \fp4, z0, z1, z2, z3, z4, z5, z6, z7
+    add     x6, x0, #128
+    FUSED_W4_A16X8_PAIR x6, x4, x5, \fp4, z8, z9, z10, z11, z12, z13, z14, z15
+    add     x0, x0, #256
+    add     x1, x1, #4
+    add     x3, x3, #4
+    add     x4, x4, #4
+    add     x5, x5, #4
+    subs    x10, x10, #1
+    b.ne    1b
+    lsl     z1.s, z1.s, #8
+    lsl     z3.s, z3.s, #8
+    lsl     z5.s, z5.s, #8
+    lsl     z7.s, z7.s, #8
+    lsl     z9.s, z9.s, #8
+    lsl     z11.s, z11.s, #8
+    lsl     z13.s, z13.s, #8
+    lsl     z15.s, z15.s, #8
+    add     z0.s, z0.s, z1.s
+    add     z2.s, z2.s, z3.s
+    add     z4.s, z4.s, z5.s
+    add     z6.s, z6.s, z7.s
+    add     z8.s, z8.s, z9.s
+    add     z10.s, z10.s, z11.s
+    add     z12.s, z12.s, z13.s
+    add     z14.s, z14.s, z15.s
+    ptrue   p1.s
+    st1w    {z0.s}, p1, [x2]
+    st1w    {z2.s}, p1, [x2, #1, mul vl]
+    st1w    {z4.s}, p1, [x2, #2, mul vl]
+    st1w    {z6.s}, p1, [x2, #3, mul vl]
+    add     x2, x2, #256
+    st1w    {z8.s}, p1, [x2]
+    st1w    {z10.s}, p1, [x2, #1, mul vl]
+    st1w    {z12.s}, p1, [x2, #2, mul vl]
+    st1w    {z14.s}, p1, [x2, #3, mul vl]
+    RESTORE_D8_D15
+    ret
+    .size \name, .-\name
+    .endm
+
+    FUSED_W4_A16X8_SUPER fused_i4_i16x8_m1_k2_super_sve, 0
+    FUSED_W4_A16X8_SUPER fused_fp4_i16x8_m1_k2_super_sve, 1
 
 /*
  * FP16-FMA W4A16 supertile.  For each K scalar, 32 packed bytes contain 64

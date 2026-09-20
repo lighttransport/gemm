@@ -161,7 +161,7 @@ the fast HBM state:
 | packed format | A arithmetic | median packed GB/s | best | percent of 230.09 |
 |:--------------|:-------------|-------------------:|-----:|------------------:|
 | INT4 | INT8 SDOT (W4A8 control) | 230.09 | 230.41 | 100.0% |
-| INT4 | INT16 SDOT | **147.00** | 147.02 | 63.9% |
+| INT4 | INT16 SDOT, original schedule | **147.00** | 147.02 | 63.9% |
 | E2M1 FP4 | INT16 SDOT | **132.44** | 132.49 | 57.6% |
 | INT4 | FP16 FMA | **96.28** | 96.30 | 41.8% |
 | E2M1 FP4 | FP16 FMA | **84.59** | 84.64 | 36.8% |
@@ -172,6 +172,21 @@ ordinary heap allocation the same new kernel plateaued near 120.9 GB/s; a
 1/4/6/8/10/12-core sweep scaled 13.24, 49.55, 73.83, 98.32, 117.94, and
 119.29 GB/s, identifying the familiar slow-placement ceiling. XOS huge pages
 raised the result to 147 GB/s, but not to 230 GB/s.
+
+A subsequent two-block schedule issues all four cache-line loads before
+unpacking and alternates block-0/block-1 `sunpk` and SDOT work. Expanding the
+unpack window from four to six independent results raised the controlled
+INT4 result to **171.03 GB/s median / 171.04 best**, a 16.3% gain over 147.00
+GB/s. This is the current selected W4A16 integer kernel, but it remains below
+the requested 200 GB/s packed-input target.
+
+An alternative radix-256 kernel represents activation values in
+`[-32768, 32639]` exactly as two signed INT8 digits and computes
+`dot(lo) + 256*dot(hi)`.
+It passes scalar checks for both INT4 and FP4, but reaches only **119.92 GB/s
+median / 120.06 best** for INT4 on the controlled 12-core run. Removing
+`sunpk` does not compensate for the two INT8 accumulator streams on A64FX, so
+this path is retained only for comparison.
 
 The remaining controlled gap is arithmetic. Relative to W4A8, W4A16 doubles
 the dot-product count per packed line and adds four signed-byte-to-halfword
