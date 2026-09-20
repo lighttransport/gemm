@@ -245,6 +245,33 @@ RMBG-2.0 is gated by its publisher and needs an authorized Hugging Face account.
 Pinned multiview verification can still run on inputs with useful RGBA alpha
 through `run_reference_mv.py`. Its placeholder raises on RGB or fully opaque
 views, so it does not replace RMBG or change reference masking behavior.
+The upstream binary extensions publish CPython 3.10 CUDA wheels. Create their
+isolated, pinned environment and run the reference CLI with:
+
+```sh
+ref/pixal3d/setup_reference_cuda310.sh
+ref/pixal3d/run_reference_cuda310.sh cuda ref/pixal3d/run_reference_mv.py \
+  --views_dir ref/pixal3d/upstream/assets/mv_images/example \
+  --output tmp/pixal3d/reference-mv/mesh.glb \
+  --model_path /mnt/disk2/models/Pixal3D --seed 42 --low_vram --resolution 1024
+```
+This environment is separate from the per-backend validation environments so
+the native-versus-PyTorch checks retain their newer PyTorch setup. The setup
+pins Torch 2.7.1/cu128 for `sm_120`, rebuilds Torch-ABI extensions from pinned
+source revisions, and uses PyTorch SDPA plus bounded chunked NAF attention on
+Blackwell. On the 16 GB RTX 5060 Ti, four-view 1024 reference inference reaches
+both shape samplers but the texture-conditioning NAF output alone needs a 4 GiB
+allocation with about 12.4 GiB already live. Full four-view reference output
+therefore requires a larger CUDA GPU; native four-view inference remains
+validated at the 7 and 12 GiB budgets. Single-view and submodule reference
+validation remain available on the 5060 Ti.
+
+Verify the bounded NAF fallback against a direct PyTorch implementation with:
+
+```sh
+ref/pixal3d/run_reference_cuda310.sh cuda \
+  ref/pixal3d/validate_reference_attention.py
+```
 
 After producing the two full multiview budget runs, repeat resident recovery,
 mixed/FP32 matched-reference checks, invalid-input handling, queue cancellation,

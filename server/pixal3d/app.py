@@ -286,18 +286,21 @@ def rmbg_ready(path: Path) -> bool:
 
 
 def reference_environment_ready(backend: str) -> tuple[bool, list[str]]:
-    environment = ROOT / f"ref/pixal3d/.venv-{backend}"
+    environment = (ROOT / "ref/pixal3d/.venv-reference-cuda310" if backend == "cuda"
+                   else ROOT / f"ref/pixal3d/.venv-{backend}")
     missing = []
     if not (environment / "bin/python").is_file():
         missing.append("python")
+    if backend == "cuda" and not (environment / ".pixal3d-reference-ready").is_file():
+        missing.append("validated_environment")
     site_packages = list((environment / "lib").glob("python*/site-packages"))
     if not site_packages or not any((site / "o_voxel").is_dir() or
                                     any(site.glob("o_voxel*.so"))
                                     for site in site_packages):
         missing.append("o_voxel")
-    if backend == "cuda":
-        cumesh = ROOT / "ref/pixal3d/cumesh-upstream/cumesh"
-        if not any(cumesh.glob("_C*.so")):
+    if backend == "cuda" and not any(
+            (site / "cumesh").is_dir() or any(site.glob("cumesh*.so"))
+            for site in site_packages):
             missing.append("cumesh")
     return not missing, missing
 
@@ -352,7 +355,8 @@ class PixalServer:
         self.reference_script = ROOT / "ref/pixal3d/upstream/inference.py"
         self.reference_mv_script = ROOT / "ref/pixal3d/run_reference_mv.py"
         self.reference_mv_upstream = ROOT / "ref/pixal3d/upstream/inference_mv.py"
-        self.reference_launcher = ROOT / "ref/pixal3d/run.sh"
+        self.python_launcher = ROOT / "ref/pixal3d/run.sh"
+        self.reference_launcher = ROOT / "ref/pixal3d/run_reference_cuda310.sh"
         self.prepare_script = ROOT / "ref/pixal3d/prepare_input.py"
 
     def health(self) -> dict:
@@ -371,7 +375,9 @@ class PixalServer:
             }
         reference = {}
         for backend in ("cuda", "rocm"):
-            environment = ROOT / f"ref/pixal3d/.venv-{backend}/bin/python"
+            environment = (ROOT / "ref/pixal3d/.venv-reference-cuda310/bin/python"
+                           if backend == "cuda"
+                           else ROOT / f"ref/pixal3d/.venv-{backend}/bin/python")
             environment_ready, missing = reference_environment_ready(backend)
             reference[backend] = {
                 "available": (environment_ready and self.reference_script.is_file() and
@@ -449,7 +455,7 @@ class PixalServer:
                     if auto_mask:
                         prepared = run_dir / f"view{index:02d}-prepared.png"
                         metadata = run_dir / f"view{index:02d}-prepared.json"
-                        prep = [str(self.reference_launcher), backend, str(self.prepare_script),
+                        prep = [str(self.python_launcher), backend, str(self.prepare_script),
                                 "--input", str(view_path), "--output", str(prepared),
                                 "--metadata", str(metadata), "--rembg-model", str(self.rembg),
                                 "--fov", str(frame.get("camera_angle_x", fov)),
@@ -477,7 +483,7 @@ class PixalServer:
                 if auto_mask or auto_camera:
                     prepared = run_dir / "prepared.png"
                     metadata = run_dir / "prepared.json"
-                    prep = [str(self.reference_launcher), backend, str(self.prepare_script),
+                    prep = [str(self.python_launcher), backend, str(self.prepare_script),
                             "--input", str(image_path), "--output", str(prepared),
                             "--metadata", str(metadata), "--mesh-scale", str(mesh_scale),
                             "--device", "cpu" if backend == "cpu" else "cuda"]
@@ -577,6 +583,7 @@ class PixalServer:
         with self.locks[backend], tempfile.TemporaryDirectory(prefix="reference-", dir=self.work_dir) as td:
             run_dir = Path(td)
             output_path = run_dir / "reference.glb"
+            launcher = self.reference_launcher if backend == "cuda" else self.python_launcher
             if multiview:
                 frames = []
                 for index, item in enumerate(views):
@@ -594,14 +601,14 @@ class PixalServer:
                 mesh_scale = finite_number(request.get("mesh_scale", 1.0), "mesh_scale", 1e-5, 1000.0)
                 (run_dir / "transforms.json").write_text(json.dumps(
                     {"camera_angle_x": fov, "mesh_scale": mesh_scale, "frames": frames}))
-                cmd = [str(self.reference_launcher), backend, str(self.reference_mv_script),
+                cmd = [str(launcher), backend, str(self.reference_mv_script),
                        "--views_dir", str(run_dir), "--output", str(output_path),
                        "--seed", str(seed), "--model_path", str(self.model_dir),
                        "--low_vram", "--resolution", "1024"]
             else:
                 image_path = run_dir / ("input" + ext)
                 image_path.write_bytes(image)
-                cmd = [str(self.reference_launcher), backend, str(self.reference_script), "--image", str(image_path),
+                cmd = [str(launcher), backend, str(self.reference_script), "--image", str(image_path),
                        "--output", str(output_path), "--seed", str(seed), "--fov", str(fov),
                        "--model_path", str(self.model_dir), "--low_vram", "--resolution", "1024"]
             started = time.monotonic()
