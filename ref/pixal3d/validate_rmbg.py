@@ -14,6 +14,8 @@ p = argparse.ArgumentParser()
 p.add_argument("--model", type=Path, default=Path("/mnt/disk2/models/RMBG-2.0"))
 p.add_argument("--input", type=Path, default=HERE / "upstream/assets/images/1_img.png")
 p.add_argument("--output-dir", type=Path, default=HERE.parents[1] / "tmp/pixal3d/rmbg-validation")
+p.add_argument("--json-output", type=Path,
+               help="Write the machine-readable result in addition to stdout")
 p.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
 p.add_argument("--minimum-source-iou", type=float, default=.99,
                help="Required IoU against the input alpha reference")
@@ -57,5 +59,8 @@ assert result["metadata"]["mask_source"] == "rmbg-2.0"
 assert result["alpha_min"] == 0 and result["alpha_max"] == 255
 assert result["foreground_pixels"] and result["background_pixels"]
 assert result["source_alpha_iou"] >= a.minimum_source_iou
+if a.json_output:
+    a.json_output.parent.mkdir(parents=True, exist_ok=True)
+    a.json_output.write_text(json.dumps(result, indent=2) + "\n")
 print(json.dumps(result, indent=2))
 print("Pixal3D RMBG-2.0: PASS")

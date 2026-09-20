@@ -59,26 +59,15 @@ Important measured results:
   Chamfer RMS, directional p95, and absolute normal agreement in the web UI.
 - Unit and fake-backed Chrome coverage exercise the new behavior; real RTX 5060
   Ti evidence is recorded in the server documentation and repo-local artifacts.
+- Consolidated the 7/12 GiB multiview, pinned PyTorch, render, mask provenance,
+  CUDA reliability, byte-identical replay, and real queued-web evidence into
+  `validation-results.json`, with commands, commits, revisions, hashes, runtime
+  identity, and concurrency qualifications. A validator checks the schema and
+  optionally rehashes all retained artifacts.
 
 ## Remaining work, in priority order
 
-### 1. Consolidate the current validation record
-
-`ref/pixal3d/validation-results.json` predates several recent results. Add
-machine-readable entries for:
-
-- 7168/12288 MiB four-view native runs;
-- full four-view pinned PyTorch comparison;
-- matched geometry, normal, PSNR, and silhouette metrics;
-- RMBG-2.0 and exact-upstream BiRefNet provenance results;
-- the latest CUDA reliability soak;
-- the 92.6-second byte-identical postprocessing replay.
-
-Record commands, commit IDs, checkpoint revisions, artifact hashes, device and
-driver identity, and whether a number is isolated or affected by concurrent
-load. Avoid duplicating large logs or model files.
-
-### 2. Continue byte-identical CPU postprocessing optimization
+### 1. Continue byte-identical CPU postprocessing optimization
 
 The latest 4K/1M replay still spends about 17.8 s in hole filling plus original
 mesh BVH construction, 16.2 s in unwrap/normals, and 14.3 s in inpainting.
@@ -88,7 +77,7 @@ Promising bounded work includes compact BVH build inputs, allocation reuse in
 UV chart construction, and removal of avoidable image repacking. Do not change
 the 4K/1M reference-quality defaults.
 
-### 3. Evaluate remaining CUDA memory/performance opportunities
+### 2. Evaluate remaining CUDA memory/performance opportunities
 
 `cpu/pixal3d/OPTIMIZATION.md` still identifies packed flow activation storage
 and additional GEMM tiling as opportunities. Measure full-stage and complete
@@ -97,7 +86,7 @@ generation behavior, not only microbenchmarks. Preserve mixed-trajectory error
 outputs between the 7 and 12 GiB budget runs. Remove experiments that do not
 improve end-to-end time or peak memory.
 
-### 4. Refresh user-facing performance wording
+### 3. Refresh user-facing performance wording
 
 Some older documentation describes the initial host-offloaded implementation
 and 28–97 minute runs under concurrent load, while the resident path and newer
@@ -107,7 +96,7 @@ its execution mode, fixture, concurrency conditions, and whether serialization
 is included. Keep historical results only when they explain a regression or
 tradeoff.
 
-### 5. Optional service durability
+### 4. Optional service durability
 
 Queued artifacts are file-backed, but job metadata remains in memory and is
 discarded on server restart. If the demo is promoted beyond a workstation
@@ -170,9 +159,8 @@ Torch-ABI extensions for `sm_120`.
 Resume Pixal3D work in /mnt/nvme02/work/gemm/pixal3d on branch pixal3d.
 Read AGENTS.md and resume-pixal3d.md first. Treat the current worktree and
 artifacts as authoritative. Work through the prioritized remaining tasks,
-starting with the consolidated machine-readable validation record, then
-byte-identical CPU postprocessing profiling and measured CUDA memory/performance
-work.
+starting with byte-identical CPU postprocessing profiling and optimization,
+then measured CUDA memory/performance work.
 Keep scope on Pixal3D main. Exclude Direct3D-S2/paper work, all HIP/ROCm-specific
 work, previously excluded items 1 and 15, and git push. Use the per-project uv
 environments and repository tmp/ only. Preserve the verified 7168 MiB minimum

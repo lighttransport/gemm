@@ -229,6 +229,20 @@ ref/pixal3d/run.sh cpu ref/pixal3d/manifest.py --full-hash \
   --output tmp/pixal3d/model-manifest.json
 ```
 
+The extended 2026-09-20 section of `validation-results.json` consolidates the
+7/12 GiB multiview runs, pinned PyTorch comparison, render metrics, mask-model
+provenance, CUDA reliability soak, postprocessing replay, and real queued web
+tests. It records exact commands, implementation commits, source/checkpoint
+revisions, artifact hashes, runtime versions, and concurrency qualifications.
+Large artifacts remain under `tmp/pixal3d/` and are represented by size and
+SHA-256 only. Validate the checked-in schema and thresholds, and optionally all
+retained local artifacts, with:
+
+```sh
+ref/pixal3d/run.sh cpu ref/pixal3d/validate_results_record.py
+ref/pixal3d/run.sh cpu ref/pixal3d/validate_results_record.py --artifacts
+```
+
 Automatic single-view preparation uses the upstream RMBG-2.0 and MoGe-2
 semantics without loading the Pixal3D generation stack. Fetch the pinned source
 and locally available checkpoints, then emit an RGBA image and resolved camera
@@ -259,7 +273,8 @@ model-backed check with:
 
 ```sh
 ref/pixal3d/run.sh cuda ref/pixal3d/validate_rmbg.py \
-  --model /mnt/disk2/models/RMBG-2.0 --device cuda
+  --model /mnt/disk2/models/RMBG-2.0 --device cuda \
+  --json-output tmp/pixal3d/rmbg-validation/result.json
 ```
 
 ### RMBG mask-parity interpretation
@@ -280,6 +295,14 @@ Changing the binary validation threshold would not improve the soft alpha mask
 consumed by Pixal3D. The experiment therefore attributes the remaining gap to
 checkpoint provenance and minor reconstruction details rather than to an
 inference implementation mismatch.
+
+Reproduce the standard and diagnostic measurements for both pinned checkpoints
+and record their full model SHA-256 values with:
+
+```sh
+ref/pixal3d/run.sh cuda ref/pixal3d/validate_mask_provenance.py \
+  --device cuda --output tmp/pixal3d/rmbg-validation/provenance.json
+```
 
 Pinned multiview verification can still run on inputs with useful RGBA alpha
 through `run_reference_mv.py`. Its placeholder raises on RGB or fully opaque
