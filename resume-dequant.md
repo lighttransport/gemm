@@ -129,7 +129,8 @@ attached only after compact prefill and a second all-rank vote. Any validation
 or attachment mismatch coherently returns all ranks to compact dispatch. The
 persistent pool statically partitions complete eight-row groups, while partial
 or tail extents explicitly use the compact path. Validation reads are evicted
-before mapping and `MADV_RANDOM` limits readahead beyond worker-owned ranges.
+before mapping; retain normal sequential-fault readahead because `MADV_RANDOM`
+made the first 7.81 GB scan pathologically slow in four-node acceptance.
 Synthetic coverage includes uneven three-worker ownership, unaligned ranged
 dispatch, a 15-row compact fallback, invalid format rejection, and model
 attach/detach. Fujitsu builds of the focused test and full runner pass; the

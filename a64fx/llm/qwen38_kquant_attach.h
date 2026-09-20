@@ -100,12 +100,6 @@ static int q38kc_model_prepare(q38kc_model_cache *cache,
             goto done;
         }
     }
-#ifdef MADV_RANDOM
-    /* Payload hashes were read with DONTNEED.  Suppressing cross-group readahead
-     * lets each persistent worker fault its own static eight-row range. */
-    (void)madvise(cache->loaded.mapping, cache->loaded.mapping_bytes,
-                  MADV_RANDOM);
-#endif
     rc = 0;
 done:
     free(source);

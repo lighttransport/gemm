@@ -3480,8 +3480,9 @@ unmapping and model destruction.
 
 The persistent decode pool partitions complete eight-row groups directly
 across its static worker IDs, so a group has one owner and is first-faulted by
-that worker. Validation reads are evicted before `mmap`, and `MADV_RANDOM`
-suppresses cross-range readahead. Calls whose row extent is not the tensor's
+that worker. Validation reads are evicted before `mmap`; the mapping retains
+normal sequential-fault readahead because forcing 4 KiB random faults makes
+the 7.81 GB cold scan unusably slow. Calls whose row extent is not the tensor's
 complete eight-row-aligned extent explicitly clear the cache view and take the
 compact path. Non-persistent row-range dispatch safely computes intersecting
 groups and copies only the requested rows.
