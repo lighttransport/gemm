@@ -81,25 +81,41 @@ result = {
 if bool(a.native_renders) != bool(a.reference_renders):
     raise ValueError("provide both render directories")
 if a.native_renders:
-    native_images = {path.name: path for path in a.native_renders.glob("*.png")}
-    reference_images = {path.name: path for path in a.reference_renders.glob("*.png")}
+    # preview_glb.py also emits source textures and a tiled contact sheet.
+    # Compare only the independently rendered, camera-matched views.
+    native_images = {path.name: path for path in a.native_renders.glob("view-*.png")}
+    reference_images = {path.name: path for path in a.reference_renders.glob("view-*.png")}
     names = sorted(native_images.keys() & reference_images.keys())
     if not names:
         raise RuntimeError("render directories have no matching PNG names")
     images = []
     for name in names:
-        x = np.asarray(Image.open(native_images[name]).convert("RGBA"), dtype=np.float32) / 255
-        y = np.asarray(Image.open(reference_images[name]).convert("RGBA"), dtype=np.float32) / 255
+        native_image = Image.open(native_images[name])
+        reference_image = Image.open(reference_images[name])
+        x = np.asarray(native_image.convert("RGBA"), dtype=np.float32) / 255
+        y = np.asarray(reference_image.convert("RGBA"), dtype=np.float32) / 255
         if x.shape != y.shape:
             raise RuntimeError(f"render shape mismatch for {name}: {x.shape} vs {y.shape}")
         delta = x[..., :3] - y[..., :3]
         mse = float(np.mean(delta * delta))
-        xa, ya = x[..., 3] > .5, y[..., 3] > .5
-        union = np.logical_or(xa, ya).sum()
+        suffix = name.removeprefix("view-")
+        native_mask = a.native_renders / f"mask-{suffix}"
+        reference_mask = a.reference_renders / f"mask-{suffix}"
+        silhouette_iou = None
+        if native_mask.is_file() and reference_mask.is_file():
+            xa = np.asarray(Image.open(native_mask).convert("L")) > 127
+            ya = np.asarray(Image.open(reference_mask).convert("L")) > 127
+            union = np.logical_or(xa, ya).sum()
+            silhouette_iou = float(np.logical_and(xa, ya).sum() / max(1, union))
+        elif native_image.mode in ("LA", "RGBA") and reference_image.mode in ("LA", "RGBA"):
+            xa, ya = x[..., 3] > .5, y[..., 3] > .5
+            if xa.min() != xa.max() and ya.min() != ya.max():
+                union = np.logical_or(xa, ya).sum()
+                silhouette_iou = float(np.logical_and(xa, ya).sum() / max(1, union))
         images.append({"name": name, "rgb_mae": float(np.mean(np.abs(delta))),
                        "rgb_rmse": math.sqrt(mse),
                        "rgb_psnr": None if mse == 0 else -10 * math.log10(mse),
-                       "silhouette_iou": float(np.logical_and(xa, ya).sum() / max(1, union))})
+                       "silhouette_iou": silhouette_iou})
     result["renders"] = images
 
 encoded = json.dumps(result, indent=2, allow_nan=False) + "\n"

@@ -36,7 +36,7 @@ namespace {
 
 void usage(const char* argv0) {
   fprintf(stderr,
-    "usage: %s --in mesh.safetensors [--texture base.png] [--out beauty.png] [--exr aov.exr]\n"
+    "usage: %s --in mesh.safetensors [--texture base.png] [--out beauty.png] [--mask-out mask.png] [--exr aov.exr]\n"
     "         [--stats stats.json]\n"
     "         [-w 800] [-h 600] [--yaw 35] [--pitch 20] [--frame-scale 1]\n"
     "         [--sun-yaw 45] [--sun-elev 50] [--turbidity 2.5] [--exposure 0.0]\n",
@@ -71,6 +71,19 @@ int writeBeautyPNG(const char* path, const trellis2::AOVImage& img, float exposu
     return -1;
   }
   fprintf(stderr, "wrote %s (%ux%u, sRGB)\n", path, img.width, img.height);
+  return 0;
+}
+
+int writeMaskPNG(const char* path, const trellis2::AOVImage& img) {
+  std::vector<uint8_t> mask(img.mask.size());
+  for (size_t i = 0; i < mask.size(); ++i) mask[i] = img.mask[i] > 0.5f ? 255 : 0;
+  int ok = stbi_write_png(path, (int)img.width, (int)img.height, 1,
+                          mask.data(), (int)img.width);
+  if (!ok) {
+    fprintf(stderr, "stb_image_write: failed %s\n", path);
+    return -1;
+  }
+  fprintf(stderr, "wrote %s (%ux%u, mask)\n", path, img.width, img.height);
   return 0;
 }
 
@@ -148,6 +161,7 @@ int main(int argc, char** argv) {
   const char* in_path  = nullptr;
   const char* tex_path = nullptr;
   const char* png_path = nullptr;
+  const char* mask_path = nullptr;
   const char* exr_path = nullptr;
   const char* stats_path = nullptr;
   uint32_t W = 800, H = 600;
@@ -166,6 +180,7 @@ int main(int argc, char** argv) {
     if      (a == "--in")        in_path = need("--in");
     else if (a == "--texture")   tex_path = need("--texture");
     else if (a == "--out")       png_path = need("--out");
+    else if (a == "--mask-out")  mask_path = need("--mask-out");
     else if (a == "--exr")       exr_path = need("--exr");
     else if (a == "--stats")     stats_path = need("--stats");
     else if (a == "-w")          W = (uint32_t)std::atoi(need("-w"));
@@ -268,6 +283,7 @@ int main(int argc, char** argv) {
   // ---- write -------------------------------------------------------------
   int rc = 0;
   if (png_path) rc |= writeBeautyPNG(png_path, img, exposure);
+  if (mask_path) rc |= writeMaskPNG(mask_path, img);
   if (exr_path) rc |= writeAOVEXR(exr_path, img);
   if (stats_path) {
     trellis2::StatsOpts opts;

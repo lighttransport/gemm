@@ -209,7 +209,8 @@ zero boundary normals separately, while still bounding their count and requiring
 every other normal to be unit length. Build the shared preview renderer with `ref/pixal3d/build_preview.sh`,
 then use `preview_glb.py FILE.glb --output-dir DIR` for four CPU-rendered views.
 The preview copy is uniformly scaled to avoid the renderer's fixed triangle-size
-epsilon and uses wider camera framing; exported GLB geometry is unchanged.
+epsilon and uses wider camera framing; exported GLB geometry is unchanged. Each
+view includes a renderer-derived binary mask for meaningful silhouette metrics.
 `compare_outputs.py NATIVE.glb REFERENCE.glb` deterministically samples both
 surfaces and reports bidirectional Chamfer distances plus oriented and
 orientation-independent nearest-face normal agreement. Pass matching
@@ -273,7 +274,10 @@ surface samples measured symmetric Chamfer RMS 0.005548; directional means were
 cosine means were 0.9533 and 0.9586, which avoids conflating local winding
 differences with surface-direction disagreement. The outputs had 961,142 and
 960,561 triangles respectively. Native four-view inference is also validated at
-the 7 GiB budget.
+the 7 GiB budget. Four matched CPU previews measured RGB PSNR from 26.39 to
+29.09 dB and silhouette IoU from 0.9885 to 0.9949. The reference uses
+`EXT_texture_webp`; the preview extractor resolves both extension-backed WebP
+and direct core image sources.
 
 Verify the bounded NAF fallback against a direct PyTorch implementation with:
 

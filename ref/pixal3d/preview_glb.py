@@ -36,12 +36,21 @@ mesh=a.output_dir/'preview.safetensors'
 save_file({'vertices':vertices,'faces':accessor(primitive['indices']).reshape(-1,3).astype(np.int32),
            'vertex_normals':accessor(attributes['NORMAL']),'uvs':uv},str(mesh))
 material=scene['materials'][primitive['material']]['pbrMetallicRoughness']
-image=scene['images'][scene['textures'][material['baseColorTexture']['index']]['source']]
+texture_info=scene['textures'][material['baseColorTexture']['index']]
+if 'source' in texture_info:
+    source=texture_info['source']
+else:
+    webp=texture_info.get('extensions',{}).get('EXT_texture_webp')
+    if not webp or 'source' not in webp:
+        raise RuntimeError('base-color texture has no supported image source')
+    source=webp['source']
+image=scene['images'][source]
 view=scene['bufferViews'][image['bufferView']];offset=view.get('byteOffset',0)
 texture=a.output_dir/'base.png'
 Image.open(io.BytesIO(blob[offset:offset+view['byteLength']])).save(texture)
 for yaw in [0,90,180,270]:
     subprocess.run([str(a.renderer.resolve()),'--in',str(mesh),'--texture',str(texture),'--out',str(a.output_dir/f'view-{yaw}.png'),
+                    '--mask-out',str(a.output_dir/f'mask-{yaw}.png'),
                     '-w','512','-h','512','--yaw',str(yaw),'--pitch','10','--frame-scale','2.1'],check=True)
 views=[Image.open(a.output_dir/f'view-{yaw}.png').convert('RGB') for yaw in [0,90,180,270]]
 canvas=Image.new('RGB',(1024,1024))
