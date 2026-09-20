@@ -139,6 +139,50 @@ same layout benefits INT16 because it also eliminates permutations before four
 `sunpk` operations; its stable 10-iteration result improved from 62.04 to 67.55
 GB/s.  Pairing both INT16 halves more aggressively regressed and was rejected.
 
+## Fused W4A16: INT4/FP4 with INT16 SDOT or FP16 FMA
+
+The fused benchmark now includes the missing W4A16 paths. The INT16 route uses
+a two-block K-major supertile and keeps 16 independent INT64 accumulator
+vectors. The FP16 route uses a four-block N-lane supertile: each K scalar's 32
+packed bytes expand into two FP16 output vectors and feed FMA immediately.
+Neither route writes expanded weights.
+
+The scalar verifier passes for all four combinations: signed INT4 and E2M1
+FP4, each with INT16 SDOT and FP16 FMA. E2M1 is decoded as its exact doubled
+integer lattice, with the x0.5 factor reserved for the scale epilogue. The
+FP16 correctness input uses exactly representable values so it checks layout,
+nibble mapping, conversion, and FMA without conflating expected FP16 rounding.
+
+Controlled 12-core results use the same 240 MiB packed stream and Fujitsu XOS
+2 MiB hugepage configuration as the placement study. The paired INT4 W4A8
+supertile rerun reached 230.09 GB/s median, confirming the allocation was in
+the fast HBM state:
+
+| packed format | A arithmetic | median packed GB/s | best | percent of 230.09 |
+|:--------------|:-------------|-------------------:|-----:|------------------:|
+| INT4 | INT8 SDOT (W4A8 control) | 230.09 | 230.41 | 100.0% |
+| INT4 | INT16 SDOT | **147.00** | 147.02 | 63.9% |
+| E2M1 FP4 | INT16 SDOT | **132.44** | 132.49 | 57.6% |
+| INT4 | FP16 FMA | **96.28** | 96.30 | 41.8% |
+| E2M1 FP4 | FP16 FMA | **84.59** | 84.64 | 36.8% |
+
+The INT4 INT16 supertile improves substantially over the original four-stream
+kernel: 147.00 GB/s controlled versus the earlier 67.55 GB/s result. On an
+ordinary heap allocation the same new kernel plateaued near 120.9 GB/s; a
+1/4/6/8/10/12-core sweep scaled 13.24, 49.55, 73.83, 98.32, 117.94, and
+119.29 GB/s, identifying the familiar slow-placement ceiling. XOS huge pages
+raised the result to 147 GB/s, but not to 230 GB/s.
+
+The remaining controlled gap is arithmetic. Relative to W4A8, W4A16 doubles
+the dot-product count per packed line and adds four signed-byte-to-halfword
+unpacks per 64-byte load. FP4 adds table lookup; FP16 adds integer widening,
+conversion, and half-precision FMA. These paths are therefore issue/dependency
+limited even when the identical allocation permits the W4A8 control to
+saturate HBM. The `a64fx/swfp4fp8` kernels informed the E2M1 lookup and fused
+register dataflow, but their exact FP8 paths decode to FP32 and their fused
+MXFP4 SDOT path is W4A8 with dynamically quantized activations; neither is a
+drop-in W4A16 kernel.
+
 ## Isolated HBM read prerequisite
 
 Command:

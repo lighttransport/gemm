@@ -1156,6 +1156,47 @@ fused_i4_i8_m1_k4_super_sve:
     sdot    \c3\().d, z23.h, z24.h
     .endm
 
+    .macro FUSED_W4_I16_PAIR wp, ap, fp4, c0, c1, c2, c3, c4, c5, c6, c7
+    ld1b    {z16.b}, p0/z, [\wp]
+    ld1b    {z17.b}, p0/z, [\wp, #1, mul vl]
+    mov     z18.d, z16.d
+    mov     z19.d, z17.d
+    .if \fp4
+    and     z16.b, z16.b, #0x0f
+    and     z17.b, z17.b, #0x0f
+    lsr     z18.b, z18.b, #4
+    lsr     z19.b, z19.b, #4
+    tbl     z16.b, {z31.b}, z16.b
+    tbl     z17.b, {z31.b}, z17.b
+    tbl     z18.b, {z31.b}, z18.b
+    tbl     z19.b, {z31.b}, z19.b
+    .else
+    lsl     z16.b, z16.b, #4
+    lsl     z17.b, z17.b, #4
+    asr     z16.b, z16.b, #4
+    asr     z17.b, z17.b, #4
+    asr     z18.b, z18.b, #4
+    asr     z19.b, z19.b, #4
+    .endif
+    sunpklo z20.h, z16.b
+    sunpkhi z21.h, z16.b
+    sunpklo z22.h, z18.b
+    sunpkhi z23.h, z18.b
+    sunpklo z24.h, z17.b
+    sunpkhi z25.h, z17.b
+    sunpklo z26.h, z19.b
+    sunpkhi z27.h, z19.b
+    ld1rd   {z28.d}, p0/z, [\ap]
+    sdot    \c0\().d, z20.h, z28.h
+    sdot    \c1\().d, z21.h, z28.h
+    sdot    \c2\().d, z22.h, z28.h
+    sdot    \c3\().d, z23.h, z28.h
+    sdot    \c4\().d, z24.h, z28.h
+    sdot    \c5\().d, z25.h, z28.h
+    sdot    \c6\().d, z26.h, z28.h
+    sdot    \c7\().d, z27.h, z28.h
+    .endm
+
     .global fused_i4_i16_m1_k2_sve
     .type fused_i4_i16_m1_k2_sve, %function
 fused_i4_i16_m1_k2_sve:
@@ -1220,6 +1261,167 @@ fused_i4_i16_m1_k2_sve:
     RESTORE_D8_D15
     ret
     .size fused_i4_i16_m1_k2_sve, .-fused_i4_i16_m1_k2_sve
+
+/*
+ * Sequential two-block W4A16 supertile.  Each K quartet contributes 128
+ * packed bytes per block; the two blocks are adjacent, so the kernel presents
+ * one 256-byte stream to HBM instead of two streams 4 KiB apart.  The split
+ * nibble contract is the same as fused_i4_i16_m1_k2_sve.
+ */
+    .macro FUSED_W4_I16_SUPER name, fp4
+    .global \name
+    .type \name, %function
+\name:
+    SAVE_D8_D15
+    ptrue   p0.b
+    .if \fp4
+    adr     x9, .Lfp4_lut
+    ld1b    {z31.b}, p0/z, [x9]
+    .endif
+    add     x3, x1, #256
+    eor     z0.d, z0.d, z0.d
+    eor     z1.d, z1.d, z1.d
+    eor     z2.d, z2.d, z2.d
+    eor     z3.d, z3.d, z3.d
+    eor     z4.d, z4.d, z4.d
+    eor     z5.d, z5.d, z5.d
+    eor     z6.d, z6.d, z6.d
+    eor     z7.d, z7.d, z7.d
+    eor     z8.d, z8.d, z8.d
+    eor     z9.d, z9.d, z9.d
+    eor     z10.d, z10.d, z10.d
+    eor     z11.d, z11.d, z11.d
+    eor     z12.d, z12.d, z12.d
+    eor     z13.d, z13.d, z13.d
+    eor     z14.d, z14.d, z14.d
+    eor     z15.d, z15.d, z15.d
+    mov     x10, #32
+    .p2align 6
+1:
+    FUSED_W4_I16_PAIR x0, x1, \fp4, z0, z1, z2, z3, z4, z5, z6, z7
+    add     x4, x0, #128
+    FUSED_W4_I16_PAIR x4, x3, \fp4, z8, z9, z10, z11, z12, z13, z14, z15
+    add     x0, x0, #256
+    add     x1, x1, #8
+    add     x3, x3, #8
+    subs    x10, x10, #1
+    b.ne    1b
+    ptrue   p1.d
+    st1d    {z0.d}, p1, [x2]
+    st1d    {z1.d}, p1, [x2, #1, mul vl]
+    st1d    {z2.d}, p1, [x2, #2, mul vl]
+    st1d    {z3.d}, p1, [x2, #3, mul vl]
+    add     x2, x2, #256
+    st1d    {z4.d}, p1, [x2]
+    st1d    {z5.d}, p1, [x2, #1, mul vl]
+    st1d    {z6.d}, p1, [x2, #2, mul vl]
+    st1d    {z7.d}, p1, [x2, #3, mul vl]
+    add     x2, x2, #256
+    st1d    {z8.d}, p1, [x2]
+    st1d    {z9.d}, p1, [x2, #1, mul vl]
+    st1d    {z10.d}, p1, [x2, #2, mul vl]
+    st1d    {z11.d}, p1, [x2, #3, mul vl]
+    add     x2, x2, #256
+    st1d    {z12.d}, p1, [x2]
+    st1d    {z13.d}, p1, [x2, #1, mul vl]
+    st1d    {z14.d}, p1, [x2, #2, mul vl]
+    st1d    {z15.d}, p1, [x2, #3, mul vl]
+    RESTORE_D8_D15
+    ret
+    .size \name, .-\name
+    .endm
+
+    FUSED_W4_I16_SUPER fused_i4_i16_m1_k2_super_sve, 0
+    FUSED_W4_I16_SUPER fused_fp4_i16_m1_k2_super_sve, 1
+
+/*
+ * FP16-FMA W4A16 supertile.  For each K scalar, 32 packed bytes contain 64
+ * output-column codes (low nibble N=0..31, high nibble N=32..63). Four
+ * independent K=128 blocks are adjacent. Expansion, integer-to-FP16
+ * conversion, and FMA all stay in registers; only the eight final FP16
+ * accumulator vectors are stored.
+ */
+    .macro FUSED_W4_F16_STEP wp, ap, fp4, c0, c1
+    ld1b    {z16.b}, p1/z, [\wp]
+    mov     z17.d, z16.d
+    .if \fp4
+    and     z16.b, z16.b, #0x0f
+    lsr     z17.b, z17.b, #4
+    tbl     z16.b, {z31.b}, z16.b
+    tbl     z17.b, {z31.b}, z17.b
+    .else
+    lsl     z16.b, z16.b, #4
+    asr     z16.b, z16.b, #4
+    asr     z17.b, z17.b, #4
+    .endif
+    sunpklo z18.h, z16.b
+    sunpklo z19.h, z17.b
+    scvtf   z18.h, p0/m, z18.h
+    scvtf   z19.h, p0/m, z19.h
+    ld1rh   {z20.h}, p0/z, [\ap]
+    fmla    \c0\().h, p0/m, z18.h, z20.h
+    fmla    \c1\().h, p0/m, z19.h, z20.h
+    .endm
+
+    .macro FUSED_W4_F16_SUPER name, fp4
+    .global \name
+    .type \name, %function
+\name:
+    SAVE_D8_D15
+    ptrue   p0.h
+    mov     x9, #32
+    whilelo p1.b, xzr, x9
+    .if \fp4
+    adr     x9, .Lfp4_lut
+    ptrue   p2.b
+    ld1b    {z31.b}, p2/z, [x9]
+    .endif
+    add     x3, x1, #256
+    add     x4, x3, #256
+    add     x5, x4, #256
+    eor     z0.d, z0.d, z0.d
+    eor     z1.d, z1.d, z1.d
+    eor     z2.d, z2.d, z2.d
+    eor     z3.d, z3.d, z3.d
+    eor     z4.d, z4.d, z4.d
+    eor     z5.d, z5.d, z5.d
+    eor     z6.d, z6.d, z6.d
+    eor     z7.d, z7.d, z7.d
+    mov     x10, #128
+    .p2align 6
+1:
+    FUSED_W4_F16_STEP x0, x1, \fp4, z0, z1
+    add     x6, x0, #32
+    FUSED_W4_F16_STEP x6, x3, \fp4, z2, z3
+    add     x6, x0, #64
+    FUSED_W4_F16_STEP x6, x4, \fp4, z4, z5
+    add     x6, x0, #96
+    FUSED_W4_F16_STEP x6, x5, \fp4, z6, z7
+    add     x0, x0, #128
+    add     x1, x1, #2
+    add     x3, x3, #2
+    add     x4, x4, #2
+    add     x5, x5, #2
+    subs    x10, x10, #1
+    b.ne    1b
+    st1h    {z0.h}, p0, [x2]
+    st1h    {z1.h}, p0, [x2, #1, mul vl]
+    add     x2, x2, #128
+    st1h    {z2.h}, p0, [x2]
+    st1h    {z3.h}, p0, [x2, #1, mul vl]
+    add     x2, x2, #128
+    st1h    {z4.h}, p0, [x2]
+    st1h    {z5.h}, p0, [x2, #1, mul vl]
+    add     x2, x2, #128
+    st1h    {z6.h}, p0, [x2]
+    st1h    {z7.h}, p0, [x2, #1, mul vl]
+    RESTORE_D8_D15
+    ret
+    .size \name, .-\name
+    .endm
+
+    FUSED_W4_F16_SUPER fused_i4_f16_m1_k4_super_sve, 0
+    FUSED_W4_F16_SUPER fused_fp4_f16_m1_k4_super_sve, 1
 
 /*
  * M=6 INT8 schedule: fetch activation scalars into GPRs, then broadcast four

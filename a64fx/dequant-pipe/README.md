@@ -118,6 +118,42 @@ the low and high nibbles of each byte hold complete 16-column SDOT vectors,
 removing two byte permutations before widening.  A model converter must emit
 that layout when selecting the INT16 kernel.
 
+The W4A16 extension covers both signed INT4 and E2M1 FP4 with two arithmetic
+routes:
+
+- `--path int16 --kernel super` expands into INT16 registers and uses the
+  INT16-to-INT64 SVE `sdot`. Its two K=128 blocks are interleaved by K quartet,
+  producing one sequential packed stream and 16 independent accumulator
+  vectors. FP4 uses the exact doubled-integer E2M1 table and folds the factor
+  of one half into the eventual block scale.
+- `--path fp16 --kernel super` uses a separate N-lane layout. For each K
+  scalar, 32 packed bytes hold 64 output columns; four independent blocks are
+  adjacent. Each load expands directly into two 32-lane FP16 vectors and is
+  consumed by FP16 FMA without an expanded-weight store. This experimental
+  kernel accumulates in FP16 and therefore needs a production overflow/error
+  gate, just like the staged FP16 route.
+
+Both are unscaled compute-kernel bandwidth probes. They demonstrate direct
+dequantization and arithmetic, but a production block-quantized GEMV must add
+scale application and a wider accumulation policy where model accuracy
+requires it.
+
+```sh
+a64fx/dequant-pipe/bench_fused_sdot --verify \
+  --format int4 --path int16 --kernel super \
+  --cores 12 --mib 240 --iterations 10 --trials 5
+a64fx/dequant-pipe/bench_fused_sdot \
+  --format fp4 --path int16 --kernel super \
+  --cores 12 --mib 240 --iterations 10 --trials 5
+a64fx/dequant-pipe/bench_fused_sdot \
+  --format int4 --path fp16 --kernel super \
+  --cores 12 --mib 240 --iterations 10 --trials 5
+```
+
+Use the XOS 2 MiB allocation environment shown below for the controlled
+single-CMG headline. Ordinary heap allocations can land in the previously
+documented approximately 120 GB/s placement state.
+
 The no-degradation INT8 observation uses a four-block K-major supertile. One
 observed fast allocation used a 16 KiB gap between core-local shards:
 

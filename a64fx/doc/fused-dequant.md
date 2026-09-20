@@ -226,6 +226,17 @@ All figures below are packed input rates on one 2.0 GHz CMG unless noted.
 | Direct fused INT4→INT16 SDOT, 12 cores | 67.55 GB/s | 1.93× staged |
 | Four-block supertile, favorable allocation | 228.84 GB/s | Unscaled probe; matched paired read |
 
+A later W4A16 extension replaced the INT16 kernel's separated block streams
+with a two-block K-major supertile and added E2M1 FP4 plus FP16-FMA routes. On
+controlled XOS 2 MiB pages, with an INT4 W4A8 control at 230.09 GB/s, the new
+INT4/INT16 path reached 147.00 GB/s and FP4/INT16 reached 132.44 GB/s. Direct
+FP16-FMA paths reached 96.28 GB/s for INT4 and 84.59 GB/s for FP4. These are
+unscaled upper bounds; the FP16 probe accumulates in FP16 and needs an
+overflow/accuracy gate before production use. The results also show that
+W4A16 does not saturate the 230 GB/s packed-read interface: doubling the dot
+work plus widening/conversion moves the bottleneck back to instruction issue
+and dependency latency.
+
 The last result needs careful interpretation. Separate allocations showed both
 roughly 120 and 229 GB/s states. A controlled sweep later found that changing
 a 16 KiB inter-core gap did not select the state; physical allocation and page

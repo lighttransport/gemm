@@ -17,8 +17,13 @@ extern void fused_i4_i8_m1_k4_lut_sve(const uint8_t *, const int8_t *, int32_t *
 extern void fused_i4_i8_m1_k4_pipe_sve(const uint8_t *, const int8_t *, int32_t *);
 extern void fused_i4_i8_m1_k4_super_sve(const uint8_t *, const int8_t *, int32_t *);
 extern void fused_i4_i16_m1_k2_sve(const uint8_t *, const int16_t *, int64_t *);
+extern void fused_i4_i16_m1_k2_super_sve(const uint8_t *, const int16_t *, int64_t *);
+extern void fused_fp4_i16_m1_k2_super_sve(const uint8_t *, const int16_t *, int64_t *);
+extern void fused_i4_f16_m1_k4_super_sve(const uint8_t *, const _Float16 *, _Float16 *);
+extern void fused_fp4_f16_m1_k4_super_sve(const uint8_t *, const _Float16 *, _Float16 *);
 
-typedef enum { PATH_I8, PATH_I16 } path_kind;
+typedef enum { PATH_I8, PATH_I16, PATH_F16 } path_kind;
+typedef enum { FORMAT_I4, FORMAT_FP4 } format_kind;
 typedef enum { KERNEL_SHIFT, KERNEL_LUT, KERNEL_PIPE, KERNEL_SUPER } kernel_kind;
 typedef void (*fused_i8_fn)(const uint8_t *, const int8_t *, int32_t *);
 
@@ -38,6 +43,13 @@ static const char *kernel_name(kernel_kind kernel)
     return "shift";
 }
 
+static const char *reported_kernel_name(path_kind path, kernel_kind kernel)
+{
+    if (kernel == KERNEL_SUPER) return "super";
+    if (path == PATH_I16) return "split";
+    return kernel_name(kernel);
+}
+
 typedef struct {
     const uint8_t *packed;
     const void *activation;
@@ -45,6 +57,7 @@ typedef struct {
     int iterations;
     int cpu;
     path_kind path;
+    format_kind format;
     kernel_kind kernel;
     atomic_int *ready;
     atomic_int *start;
@@ -81,7 +94,8 @@ static void *run_worker(void *opaque)
     worker *w = opaque;
     int32_t out8[4 * N_TILE] __attribute__((aligned(256)));
     int64_t out16[2 * N_TILE] __attribute__((aligned(256)));
-    const size_t group = w->path == PATH_I8 ? 4 * BLOCK_BYTES : 2 * BLOCK_BYTES;
+    _Float16 outf16[4 * N_TILE] __attribute__((aligned(256)));
+    const size_t group = w->path == PATH_I16 ? 2 * BLOCK_BYTES : 4 * BLOCK_BYTES;
     if (pin_cpu(w->cpu) != 0) w->error = errno ? errno : EINVAL;
     atomic_fetch_add_explicit(w->ready, 1, memory_order_release);
     while (!atomic_load_explicit(w->start, memory_order_acquire))
@@ -94,9 +108,28 @@ static void *run_worker(void *opaque)
                     fused_i8_fn kernel = select_i8_kernel(w->kernel);
                     kernel(w->packed + offset, w->activation, out8);
                     w->checksum += (uint32_t)out8[(offset / group) & 255u];
-                } else {
-                    fused_i4_i16_m1_k2_sve(w->packed + offset, w->activation, out16);
+                } else if (w->path == PATH_I16) {
+                    if (w->kernel != KERNEL_SUPER)
+                        fused_i4_i16_m1_k2_sve(w->packed + offset,
+                                               w->activation, out16);
+                    else if (w->format == FORMAT_FP4)
+                        fused_fp4_i16_m1_k2_super_sve(w->packed + offset,
+                                                      w->activation, out16);
+                    else
+                        fused_i4_i16_m1_k2_super_sve(w->packed + offset,
+                                                    w->activation, out16);
                     w->checksum += (uint64_t)out16[(offset / group) & 127u];
+                } else {
+                    if (w->format == FORMAT_FP4)
+                        fused_fp4_f16_m1_k4_super_sve(w->packed + offset,
+                                                      w->activation, outf16);
+                    else
+                        fused_i4_f16_m1_k4_super_sve(w->packed + offset,
+                                                    w->activation, outf16);
+                    union { _Float16 h; uint16_t u; } bits = {
+                        .h = outf16[(offset / group) & 255u]
+                    };
+                    w->checksum += bits.u;
                 }
             }
         }
@@ -110,6 +143,14 @@ static int nibble_i4(uint8_t x)
     return (int)(int8_t)(x << 4) >> 4;
 }
 
+static int nibble_fp4(uint8_t x)
+{
+    static const int8_t table[16] = {
+        0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+    };
+    return table[x & 15u];
+}
+
 static int verify(kernel_kind kernel_kind)
 {
     uint8_t packed[4 * BLOCK_BYTES] __attribute__((aligned(256)));
@@ -118,6 +159,8 @@ static int verify(kernel_kind kernel_kind)
     int16_t act16[2 * K_BLOCK] __attribute__((aligned(256)));
     int32_t out8[4 * N_TILE] __attribute__((aligned(256)));
     int64_t out16[2 * N_TILE] __attribute__((aligned(256)));
+    _Float16 actf16[4 * K_BLOCK] __attribute__((aligned(256)));
+    _Float16 outf16[4 * N_TILE] __attribute__((aligned(256)));
     for (size_t i = 0; i < sizeof(packed); ++i)
         packed[i] = (uint8_t)(i * 29u + (i >> 3) * 7u);
     for (size_t kg = 0; kg < K_BLOCK / 4; ++kg)
@@ -127,6 +170,8 @@ static int verify(kernel_kind kernel_kind)
     for (size_t i = 0; i < sizeof(act8); ++i) act8[i] = (int8_t)((i * 11u) % 23u - 11);
     for (size_t i = 0; i < sizeof(act16) / sizeof(act16[0]); ++i)
         act16[i] = (int16_t)((i * 17u) % 257u - 128);
+    for (size_t i = 0; i < sizeof(actf16) / sizeof(actf16[0]); ++i)
+        actf16[i] = (i & 1u) ? (_Float16)-1.0f : (_Float16)1.0f;
     fused_i8_fn kernel = select_i8_kernel(kernel_kind);
     kernel(kernel_kind == KERNEL_SUPER ? packed_super : packed, act8, out8);
     fused_i4_i16_m1_k2_sve(packed, act16, out16);
@@ -162,26 +207,101 @@ static int verify(kernel_kind kernel_kind)
             }
         }
     }
-    puts("fused correctness: PASS (INT4->INT8 SDOT and INT4->INT16 SDOT)");
+
+    /* Repack the split-nibble INT16 layout into one sequential two-block stream. */
+    for (size_t kg = 0; kg < K_BLOCK / 4; ++kg)
+        for (size_t b = 0; b < 2; ++b)
+            memcpy(packed_super + (kg * 2 + b) * 128,
+                   packed + b * BLOCK_BYTES + kg * 128, 128);
+    fused_i4_i16_m1_k2_super_sve(packed_super, act16, out16);
+    for (size_t b = 0; b < 2; ++b) for (size_t n = 0; n < N_TILE; ++n) {
+        int64_t ref = 0;
+        for (size_t k = 0; k < K_BLOCK; ++k) {
+            size_t byte_index = (k / 4 * 2 + b) * 128 +
+                                n / 32 * 64 + n % 16 * 4 + k % 4;
+            uint8_t byte = packed_super[byte_index];
+            ref += (int64_t)nibble_i4((n & 16u) ? byte >> 4 : byte) *
+                   act16[b * K_BLOCK + k];
+        }
+        if (out16[b * N_TILE + n] != ref) {
+            fprintf(stderr, "INT16 super mismatch block=%zu n=%zu got=%ld ref=%ld\n",
+                    b, n, (long)out16[b * N_TILE + n], (long)ref);
+            return -1;
+        }
+    }
+    fused_fp4_i16_m1_k2_super_sve(packed_super, act16, out16);
+    for (size_t b = 0; b < 2; ++b) for (size_t n = 0; n < N_TILE; ++n) {
+        int64_t ref = 0;
+        for (size_t k = 0; k < K_BLOCK; ++k) {
+            size_t byte_index = (k / 4 * 2 + b) * 128 +
+                                n / 32 * 64 + n % 16 * 4 + k % 4;
+            uint8_t byte = packed_super[byte_index];
+            ref += (int64_t)nibble_fp4((n & 16u) ? byte >> 4 : byte) *
+                   act16[b * K_BLOCK + k];
+        }
+        if (out16[b * N_TILE + n] != ref) {
+            fprintf(stderr, "FP4 INT16 mismatch block=%zu n=%zu got=%ld ref=%ld\n",
+                    b, n, (long)out16[b * N_TILE + n], (long)ref);
+            return -1;
+        }
+    }
+
+    /* N-lane FP16 layout: four K=128 blocks are adjacent for every K scalar. */
+    for (size_t k = 0; k < K_BLOCK; ++k)
+        for (size_t b = 0; b < 4; ++b)
+            for (size_t n = 0; n < N_TILE / 2; ++n)
+                packed_super[(k * 4 + b) * 32 + n] =
+                    (uint8_t)((k * 19 + b * 37 + n * 11) & 255u);
+    fused_i4_f16_m1_k4_super_sve(packed_super, actf16, outf16);
+    for (size_t b = 0; b < 4; ++b) for (size_t n = 0; n < N_TILE; ++n) {
+        int ref = 0;
+        for (size_t k = 0; k < K_BLOCK; ++k) {
+            uint8_t byte = packed_super[(k * 4 + b) * 32 + n % 32];
+            int weight = nibble_i4(n < 32 ? byte : byte >> 4);
+            ref += weight * (actf16[b * K_BLOCK + k] < 0 ? -1 : 1);
+        }
+        if ((float)outf16[b * N_TILE + n] != (float)ref) {
+            fprintf(stderr, "INT4 FP16 mismatch block=%zu n=%zu got=%g ref=%d\n",
+                    b, n, (double)outf16[b * N_TILE + n], ref);
+            return -1;
+        }
+    }
+    fused_fp4_f16_m1_k4_super_sve(packed_super, actf16, outf16);
+    for (size_t b = 0; b < 4; ++b) for (size_t n = 0; n < N_TILE; ++n) {
+        int ref = 0;
+        for (size_t k = 0; k < K_BLOCK; ++k) {
+            uint8_t byte = packed_super[(k * 4 + b) * 32 + n % 32];
+            int weight = nibble_fp4(n < 32 ? byte : byte >> 4);
+            ref += weight * (actf16[b * K_BLOCK + k] < 0 ? -1 : 1);
+        }
+        if ((float)outf16[b * N_TILE + n] != (float)ref) {
+            fprintf(stderr, "FP4 FP16 mismatch block=%zu n=%zu got=%g ref=%d\n",
+                    b, n, (double)outf16[b * N_TILE + n], ref);
+            return -1;
+        }
+    }
+    puts("fused correctness: PASS (INT4 W4A8; INT4/FP4 W4A16 SDOT and FP16 FMA)");
     return 0;
 }
 
 static void usage(const char *name)
 {
-    fprintf(stderr, "usage: %s [--path int8|int16] [--kernel shift|lut|pipe|super] [--cores N] [--mib N] "
+    fprintf(stderr, "usage: %s [--format int4|fp4] [--path int8|int16|fp16] [--kernel shift|lut|pipe|super] [--cores N] [--mib N] "
                     "[--iterations N] [--trials N] [--core-base N] [--skew-kib N] [--verify]\n", name);
 }
 
 int main(int argc, char **argv)
 {
     path_kind path = PATH_I8;
+    format_kind format = FORMAT_I4;
     kernel_kind kernel = KERNEL_SHIFT;
     int cores = 12, iterations = 10, trials = 3, core_base = 12;
     size_t mib = 240;
     size_t skew_kib = 0;
     int do_verify = 0;
     static const struct option options[] = {
-        {"path", required_argument, NULL, 'p'}, {"cores", required_argument, NULL, 'c'},
+        {"path", required_argument, NULL, 'p'}, {"format", required_argument, NULL, 'f'},
+        {"cores", required_argument, NULL, 'c'},
         {"kernel", required_argument, NULL, 'k'},
         {"mib", required_argument, NULL, 'm'}, {"iterations", required_argument, NULL, 'i'},
         {"trials", required_argument, NULL, 't'}, {"core-base", required_argument, NULL, 'b'},
@@ -189,11 +309,17 @@ int main(int argc, char **argv)
         {"verify", no_argument, NULL, 'v'}, {NULL, 0, NULL, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:k:c:m:i:t:b:s:v", options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:f:k:c:m:i:t:b:s:v", options, NULL)) != -1) {
         switch (opt) {
         case 'p':
             if (!strcmp(optarg, "int8")) path = PATH_I8;
             else if (!strcmp(optarg, "int16")) path = PATH_I16;
+            else if (!strcmp(optarg, "fp16")) path = PATH_F16;
+            else { usage(argv[0]); return 2; }
+            break;
+        case 'f':
+            if (!strcmp(optarg, "int4")) format = FORMAT_I4;
+            else if (!strcmp(optarg, "fp4")) format = FORMAT_FP4;
             else { usage(argv[0]); return 2; }
             break;
         case 'k':
@@ -215,7 +341,15 @@ int main(int argc, char **argv)
     }
     if (do_verify && verify(kernel) != 0) return 1;
     if (cores < 1 || cores > MAX_CORES || iterations < 1 || trials < 1 || trials > 32) return 2;
-    size_t group = path == PATH_I8 ? 4 * BLOCK_BYTES : 2 * BLOCK_BYTES;
+    if (format == FORMAT_FP4 && path == PATH_I8) {
+        fprintf(stderr, "FP4 requires --path int16 or fp16\n");
+        return 2;
+    }
+    if ((format == FORMAT_FP4 || path == PATH_F16) && kernel != KERNEL_SUPER) {
+        fprintf(stderr, "FP4 and FP16 paths require --kernel super\n");
+        return 2;
+    }
+    size_t group = path == PATH_I16 ? 2 * BLOCK_BYTES : 4 * BLOCK_BYTES;
     size_t skew = skew_kib * 1024u;
     if (skew % group != 0) {
         fprintf(stderr, "--skew-kib must preserve the %zu-byte kernel group alignment\n", group);
@@ -233,8 +367,11 @@ int main(int argc, char **argv)
         for (size_t j = 0; j < 256; ++j) packed[i + j] = (uint8_t)(i + j * 13u);
     int8_t act8[4 * K_BLOCK] __attribute__((aligned(256)));
     int16_t act16[2 * K_BLOCK] __attribute__((aligned(256)));
+    _Float16 actf16[4 * K_BLOCK] __attribute__((aligned(256)));
     for (size_t i = 0; i < sizeof(act8); ++i) act8[i] = (int8_t)(i % 15u - 7);
     for (size_t i = 0; i < sizeof(act16) / sizeof(act16[0]); ++i) act16[i] = (int16_t)(i % 127u - 63);
+    for (size_t i = 0; i < sizeof(actf16) / sizeof(actf16[0]); ++i)
+        actf16[i] = (_Float16)((int)(i % 7u) - 3);
     double values[32];
     for (int run = 0; run <= trials; ++run) {
         pthread_t threads[MAX_CORES];
@@ -244,9 +381,12 @@ int main(int argc, char **argv)
         size_t per_core = bytes / (size_t)cores;
         for (int c = 0; c < cores; ++c) {
             workers[c] = (worker){ .packed = packed + (size_t)c * (per_core + skew),
-                .activation = path == PATH_I8 ? (const void *)act8 : (const void *)act16,
+                .activation = path == PATH_I8 ? (const void *)act8 :
+                              path == PATH_I16 ? (const void *)act16 :
+                              (const void *)actf16,
                 .bytes = per_core, .iterations = iterations, .cpu = core_base + c,
-                .path = path, .ready = &ready, .start = &start };
+                .path = path, .format = format,
+                .ready = &ready, .start = &start };
             workers[c].kernel = kernel;
             int rc = pthread_create(&threads[c], NULL, run_worker, &workers[c]);
             if (rc) { fprintf(stderr, "pthread_create: %s\n", strerror(rc)); return 1; }
@@ -264,20 +404,20 @@ int main(int argc, char **argv)
         double seconds = (double)(last - first) / (double)cntfrq();
         double bandwidth = (double)bytes * iterations / seconds / 1e9;
         if (run > 0) values[run - 1] = bandwidth;
-        printf("path=%s kernel=%s cores=%d skew_kib=%zu %s=%d packed_GB/s=%.2f logical_Gweight/s=%.2f checksum=%lu\n",
-               path == PATH_I8 ? "int8" : "int16",
-               path == PATH_I16 ? "split" :
-                   kernel_name(kernel),
+        printf("format=%s path=%s kernel=%s cores=%d skew_kib=%zu %s=%d packed_GB/s=%.2f logical_Gweight/s=%.2f checksum=%lu\n",
+               format == FORMAT_I4 ? "int4" : "fp4",
+               path == PATH_I8 ? "int8" : path == PATH_I16 ? "int16" : "fp16",
+               reported_kernel_name(path, kernel),
                cores, skew_kib, run == 0 ? "warmup" : "trial", run == 0 ? 1 : run,
                bandwidth, 2.0 * bandwidth, (unsigned long)checksum);
     }
     for (int i = 0; i < trials; ++i)
         for (int j = i + 1; j < trials; ++j)
             if (values[j] < values[i]) { double x = values[i]; values[i] = values[j]; values[j] = x; }
-    printf("summary path=%s kernel=%s cores=%d skew_kib=%zu packed_GB/s_median=%.2f best=%.2f\n",
-           path == PATH_I8 ? "int8" : "int16",
-           path == PATH_I16 ? "split" :
-               kernel_name(kernel),
+    printf("summary format=%s path=%s kernel=%s cores=%d skew_kib=%zu packed_GB/s_median=%.2f best=%.2f\n",
+           format == FORMAT_I4 ? "int4" : "fp4",
+           path == PATH_I8 ? "int8" : path == PATH_I16 ? "int16" : "fp16",
+           reported_kernel_name(path, kernel),
            cores, skew_kib, values[trials / 2], values[trials - 1]);
     free(packed);
     return 0;

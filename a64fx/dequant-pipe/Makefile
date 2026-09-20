@@ -41,8 +41,10 @@ bench_fused_sdot.o: bench_fused_sdot.c
 kernels.o: kernels.S
 	$(CC) -Nclang -march=armv8.2-a+sve -c $< -o $@
 
-test: bench_dequant_pipe
+test: bench_dequant_pipe bench_fused_sdot
 	./bench_dequant_pipe --self-test
+	./bench_fused_sdot --verify --format int4 --path int16 --kernel super \
+		--cores 1 --mib 1 --iterations 1 --trials 1
 
 clean:
 	rm -f $(TARGETS) bench_dequant_pipe.o bench_null_pipe.o bench_hbm_read.o bench_hbm_color.o bench_fused_sdot.o kernels.o
