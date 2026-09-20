@@ -596,11 +596,151 @@ static int bench_tensor(const gguf_context *g, const char *name, int reps,
     return 0;
 }
 
+typedef struct {
+    uint64_t tensors;
+    uint64_t cases;
+    uint64_t compact_bytes;
+    uint64_t iq4r_bytes;
+    double compact_seconds;
+    double iq4r_seconds;
+    double slowest_seconds;
+    char slowest_name[128];
+    char slowest_pattern[16];
+} iq4_sweep_result;
+
+static int sweep_iq4_tensor(const gguf_context *g, int ti, int reps,
+                            iq4_sweep_result *total) {
+    static const char *patterns[] = {"wave", "sparse", "dynamic", "random"};
+    const gguf_tensor_info *info = &g->tensors[ti];
+    const char *name = gguf_tensor_name(g, ti);
+    int cols = (int)info->dims[0], rows = (int)info->dims[1];
+    size_t compact_bytes = gguf_tensor_size(g, ti);
+    size_t iq4r_bytes = packed_iq4r_bytes(rows, cols);
+    size_t output_bytes = (size_t)rows * sizeof(float);
+    void *weights = NULL;
+    uint8_t *iq4r = NULL;
+    float *x = NULL, *compact = NULL, *packed = NULL;
+
+    if (posix_memalign(&weights, 256, (compact_bytes + 255) & ~(size_t)255) ||
+        posix_memalign((void **)&iq4r, 256, (iq4r_bytes + 255) & ~(size_t)255) ||
+        posix_memalign((void **)&x, 256,
+                       ((size_t)cols * sizeof(*x) + 255) & ~(size_t)255) ||
+        posix_memalign((void **)&compact, 256,
+                       (output_bytes + 255) & ~(size_t)255) ||
+        posix_memalign((void **)&packed, 256,
+                       (output_bytes + 255) & ~(size_t)255)) {
+        fprintf(stderr, "IQ4 sweep allocation failed for %s\n", name);
+        free(packed); free(compact); free(x); free(iq4r); free(weights);
+        return -1;
+    }
+    memcpy(weights, gguf_tensor_data(g, ti), compact_bytes);
+    if (pack_iq4r(iq4r, (const block_iq4_xs *)weights, rows, cols)) {
+        fprintf(stderr, "IQ4 sweep pack failed for %s\n", name);
+        free(packed); free(compact); free(x); free(iq4r); free(weights);
+        return -1;
+    }
+
+    for (size_t pi = 0; pi < sizeof(patterns) / sizeof(patterns[0]); pi++) {
+        const char *pattern = patterns[pi];
+        if (fill_activation(x, cols, pattern)) {
+            free(packed); free(compact); free(x); free(iq4r); free(weights);
+            return -1;
+        }
+        run_rows(compact, weights, GGML_TYPE_IQ4_XS, x, rows, cols, 1);
+        run_packed_iq4r(packed, iq4r, x, rows, cols);
+        if (memcmp(compact, packed, output_bytes)) {
+            int bad = 0;
+            while (bad < rows &&
+                   !memcmp(&compact[bad], &packed[bad], sizeof(compact[bad])))
+                bad++;
+            fprintf(stderr,
+                    "IQ4 sweep mismatch tensor=%s pattern=%s row=%d compact=%g iq4r=%g\n",
+                    name, pattern, bad,
+                    bad < rows ? compact[bad] : 0.0f,
+                    bad < rows ? packed[bad] : 0.0f);
+            free(packed); free(compact); free(x); free(iq4r); free(weights);
+            return -1;
+        }
+
+        double compact_best = 1e9, iq4r_best = 1e9;
+        for (int rep = 0; rep < reps; rep++) {
+            double t0 = seconds();
+            run_rows(compact, weights, GGML_TYPE_IQ4_XS, x, rows, cols, 1);
+            double elapsed = seconds() - t0;
+            if (elapsed < compact_best) compact_best = elapsed;
+            t0 = seconds();
+            run_packed_iq4r(packed, iq4r, x, rows, cols);
+            elapsed = seconds() - t0;
+            if (elapsed < iq4r_best) iq4r_best = elapsed;
+        }
+        printf("IQ4_SWEEP tensor=%s shape=%dx%d pattern=%s exact=1 "
+               "compact_ms=%.3f iq4r_ms=%.3f speedup=%.3fx "
+               "compact_GBps=%.1f iq4r_physical_GBps=%.1f\n",
+               name, rows, cols, pattern, compact_best * 1e3,
+               iq4r_best * 1e3, compact_best / iq4r_best,
+               compact_bytes / compact_best / 1e9,
+               iq4r_bytes / iq4r_best / 1e9);
+        total->cases++;
+        total->compact_bytes += compact_bytes;
+        total->iq4r_bytes += iq4r_bytes;
+        total->compact_seconds += compact_best;
+        total->iq4r_seconds += iq4r_best;
+        if (iq4r_best > total->slowest_seconds) {
+            total->slowest_seconds = iq4r_best;
+            snprintf(total->slowest_name, sizeof(total->slowest_name), "%s", name);
+            snprintf(total->slowest_pattern, sizeof(total->slowest_pattern),
+                     "%s", pattern);
+        }
+    }
+    total->tensors++;
+    fflush(stdout);
+    free(packed); free(compact); free(x); free(iq4r); free(weights);
+    return 0;
+}
+
+static int sweep_all_iq4(const gguf_context *g, int reps) {
+    iq4_sweep_result total = {0};
+    uint64_t ineligible = 0;
+    for (uint64_t i = 0; i < g->n_tensors; i++) {
+        const gguf_tensor_info *info = &g->tensors[i];
+        if (info->type != GGML_TYPE_IQ4_XS) continue;
+        if (info->n_dims != 2 || info->dims[0] % 256 || info->dims[1] % 8) {
+            fprintf(stderr, "IQ4_SWEEP skip tensor=%s dims=%u\n",
+                    gguf_tensor_name(g, (int)i), info->n_dims);
+            ineligible++;
+            continue;
+        }
+        if (sweep_iq4_tensor(g, (int)i, reps, &total)) return -1;
+    }
+    if (!total.tensors || !total.cases) {
+        fprintf(stderr, "IQ4_SWEEP found no eligible tensors\n");
+        return -1;
+    }
+    printf("SENTINEL qwen38_iq4_sweep=OK tensors=%llu cases=%llu "
+           "ineligible=%llu exact=%llu/%llu compact_ms=%.3f iq4r_ms=%.3f "
+           "speedup=%.3fx compact_effective_GBps=%.1f "
+           "iq4r_physical_GBps=%.1f slowest=%s/%s/%.3fms\n",
+           (unsigned long long)total.tensors,
+           (unsigned long long)total.cases,
+           (unsigned long long)ineligible,
+           (unsigned long long)total.cases,
+           (unsigned long long)total.cases,
+           total.compact_seconds * 1e3, total.iq4r_seconds * 1e3,
+           total.compact_seconds / total.iq4r_seconds,
+           total.compact_bytes / total.iq4r_seconds / 1e9,
+           total.iq4r_bytes / total.iq4r_seconds / 1e9,
+           total.slowest_name, total.slowest_pattern,
+           total.slowest_seconds * 1e3);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL [REPS] [TENSOR] [PATTERN]\n"
                         "       PATTERN: wave (default), sparse, dynamic, random\n"
-                        "       %s MODEL --summary\n", argv[0], argv[0]);
+                        "       %s MODEL --summary\n"
+                        "       %s MODEL --sweep-iq4 [REPS]\n",
+                        argv[0], argv[0], argv[0]);
         return 2;
     }
     setenv("GGUF_LAZY_MMAP", "1", 1);
@@ -610,6 +750,13 @@ int main(int argc, char **argv) {
         print_model_summary(g);
         gguf_close(g);
         return 0;
+    }
+    if (argc > 2 && !strcmp(argv[2], "--sweep-iq4")) {
+        int reps = argc > 3 ? atoi(argv[3]) : 3;
+        if (reps < 1) reps = 1;
+        int rc = sweep_all_iq4(g, reps);
+        gguf_close(g);
+        return rc != 0;
     }
     int reps = argc > 2 ? atoi(argv[2]) : 3;
     if (reps < 1) reps = 1;

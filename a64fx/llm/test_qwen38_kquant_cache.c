@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "kquant_decode_cache.h"
 #include "qwen38_kquant_attach.h"
@@ -21,6 +22,12 @@ enum { TEST_ROWS = 16, TEST_COLS = 512 };
 static uint32_t test_random(uint32_t *state) {
     *state = *state * 1664525u + 1013904223u;
     return *state;
+}
+
+static double test_seconds(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec + now.tv_nsec * 1e-9;
 }
 
 static void fill_weights(block_q5_K *q5, block_iq4_xs *iq4) {
@@ -124,7 +131,7 @@ static void compact_a8(float *q5_dst, float *iq4_dst,
 }
 
 static int test_selective_materialize(void) {
-    enum { PAYLOAD_BYTES = 4096 };
+    enum { PAYLOAD_BYTES = 8 * 1024 * 1024 };
     const char *scratch = getenv("TMPDIR");
     if (!scratch || !*scratch) scratch = ".";
     char path[PATH_MAX];
@@ -166,6 +173,8 @@ static int test_selective_materialize(void) {
     q38kc_model_cache cache = {0};
     transformer_model model = {0};
     char error[256] = {0};
+    double available_before = tf_mem_available_gb();
+    double materialize_start = test_seconds();
     if (!failed) {
         cache.loaded.header = header;
         cache.loaded.mapping = mapping;
@@ -176,6 +185,8 @@ static int test_selective_materialize(void) {
             failed = 1;
         }
     }
+    double materialize_seconds = test_seconds() - materialize_start;
+    double available_resident = tf_mem_available_gb();
     if (!failed) {
         const uint8_t *materialized = (const uint8_t *)cache.loaded.mapping;
         const uint8_t *q5 = materialized + header->entries[0].file_offset;
@@ -198,12 +209,25 @@ static int test_selective_materialize(void) {
         }
     }
 
+    double detach_start = test_seconds();
     if (cache.loaded.mapping && cache.loaded.mapping != MAP_FAILED)
         q38kc_unload(&cache.loaded);
     else {
         if (mapping != MAP_FAILED) munmap(mapping, file_bytes);
         free(header);
     }
+    double detach_seconds = test_seconds() - detach_start;
+    double available_detached = tf_mem_available_gb();
+    if (!failed)
+        printf("selective_materialize entries=%u resident_bytes=%llu "
+               "skipped_q5_bytes=%u seconds=%.6f detach_us=%.3f "
+               "MemAvailable_before=%.3fGB "
+               "resident=%.3fGB detached=%.3fGB skipped_q5_zero=1\n",
+               cache.materialized_entries,
+               (unsigned long long)cache.materialized_bytes,
+               PAYLOAD_BYTES, materialize_seconds, detach_seconds * 1e6,
+               available_before,
+               available_resident, available_detached);
     unlink(path);
     free(iq4_payload);
     free(q5_payload);

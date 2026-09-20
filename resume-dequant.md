@@ -165,37 +165,26 @@ validated sidecar path materializes and attaches only exact IQ4R entries.
 
 ## Remaining work, in order
 
-### Work that remains possible on one node
+### Completed on one node
 
-1. **Sweep every real IQ4_XS tensor through the promoted IQ4R kernel.** Use
-   the real model metadata to cover all 65 eligible tensors, including shape
-   tails, and compare against compact A8 for exact output on wave, sparse,
-   high-dynamic-range, and deterministic-random inputs. Record the slowest
-   tensor and aggregate compact/IQ4R time and effective bandwidth. The four
-   layer-0 pattern checks are evidence for one shape, not yet a model-wide
-   sweep.
+The five previously listed single-node tasks are complete. The native
+48-thread sweep covered all 65 real IQ4_XS tensors under all four activation
+patterns: 260/260 compact-A8 versus IQ4R outputs were byte-identical. Aggregate
+best-of-three time was 113.246 ms compact versus 55.318 ms IQ4R (2.047x), with
+222.5 GB/s effective compact bandwidth; the slowest IQ4R observation was
+`blk.38.ffn_gate.weight`/random at 0.257 ms. All tensors had the eligible
+17408-by-5120 shape; the separate synthetic 15-row test retains tail-fallback
+coverage.
 
-2. **Finish single-rank loader and fallback fault injection.** On a bounded
-   synthetic stage under repository-local `tmp/`, exercise missing, truncated,
-   corrupt-header, corrupt-table, corrupt-payload, wrong-source, and unsupported
-   entry cases. Confirm strict rejection, zero attachment, unchanged compact
-   dispatch, and no partially resident cache payload. The cross-rank vote still
-   requires TP4, but its local inputs can be fully tested here.
-
-3. **Measure bounded IQ4-only preparation and residency.** Record validation,
-   anonymous materialization, and detach time; resident bytes; page-cache
-   behavior; and `MemAvailable` before/peak/steady state for a representative
-   rank or bounded tensor set. Confirm the default prepares exactly IQ4R and
-   leaves skipped Q5R payload pages untouched.
-
-4. **Re-run the focused native build and tests.** Build the cache benchmark,
-   cache test, stage builder/test, checker, and runner with `fcc`; run the
-   synthetic tests and the real single-tensor benchmark from this checkout.
-   Preserve `common/transformer.h` and every unrelated dirty file.
-
-5. **Consolidate single-node evidence.** Add commands, exact-output results,
-   timings, bandwidth, and memory observations to `qwen-q8.md`. Run
-   `git diff --check` and commit only the focused files. Do not push.
+The bounded loader matrix now rejects 11 invalid cases, including missing and
+unsupported sidecars, and asserts completely empty loader state after every
+rejection. An 8 MiB IQ4 plus 8 MiB skipped-Q5 materialization test records
+time, detach time, exact resident-byte accounting, and `MemAvailable`; it
+materializes exactly one IQ4 entry and verifies every skipped Q5 byte remains
+zero. The benchmark, cache test, stage builder/test, checker, and full
+`tp_runner` all build with native `fcc`; the fresh synthetic stage and checker
+pass. Commands and representative output are recorded in `qwen-q8.md` under
+“Single-node IQ4R model sweep and fault acceptance.”
 
 The exact 128/256-token TP4 hash gate, an injected all-rank fallback vote, and
 clean four-rank throughput remain inherently multi-node and are listed below;

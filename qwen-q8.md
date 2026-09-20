@@ -3591,3 +3591,70 @@ IQ4_XS A8 (`a8_nrmse=0`, `a8_max_abs=0`):
 | sparse | 0.461 ms | 0.217 ms | 217.9 GB/s |
 | dynamic | 0.460 ms | 0.212 ms | 223.1 GB/s |
 | random | 0.459 ms | 0.215 ms | 220.3 GB/s |
+
+### Single-node IQ4R model sweep and fault acceptance
+
+The real-model benchmark now has a bounded `--sweep-iq4` mode. It walks the
+GGUF metadata, copies and repacks one tensor at a time, and frees that tensor
+before advancing. It therefore tests every eligible shape without creating a
+full-model additive cache. Each tensor is compared byte-for-byte against the
+unchanged compact IQ4_XS A8 kernel for wave, sparse, high-dynamic-range, and
+deterministic-random activations.
+
+The native 2.0 GHz, 48-thread run was:
+
+```sh
+OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+  numactl --interleave=all \
+  ./a64fx/llm/build/bench_qwen38_kquants \
+  /home/u14346/models/qwen38/27b/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --sweep-iq4 3
+```
+
+All 65 IQ4_XS tensors have the eligible `17408 x 5120` shape; none needed to
+be skipped. All 260 tensor/pattern comparisons were exact. Summing each case's
+best of three timings gave 113.246 ms for compact A8 and 55.318 ms for IQ4R,
+or 2.047x. At the IQ4R time, the original compact bytes correspond to 222.5
+GB/s; the expanded IQ4R stream corresponds to 445.1 GB/s physical. The slowest
+observed IQ4R case was `blk.38.ffn_gate.weight` with random activations at
+0.257 ms. Shape-tail dispatch remains covered separately by the synthetic
+15-row compact-fallback test.
+
+```text
+SENTINEL qwen38_iq4_sweep=OK tensors=65 cases=260 ineligible=0 exact=260/260 compact_ms=113.246 iq4r_ms=55.318 speedup=2.047x compact_effective_GBps=222.5 iq4r_physical_GBps=445.1 slowest=blk.38.ffn_gate.weight/random/0.257ms
+```
+
+The strict-loader fault matrix now covers 11 cases: bad magic, version,
+layout, truncation, offset, duplicate name, wrong source entry, wrong source
+file size, corrupt payload, unsupported source format, and a missing sidecar.
+Every rejection must include a diagnostic and leave the loader with no header,
+mapping, or mapped byte count, so there is no state that a later attachment
+can expose. The existing invalid-format, tail, and null-cache runtime tests
+confirm unchanged compact dispatch when a cache cannot be used.
+
+The bounded production-materializer test uses an 8 MiB IQ4 payload beside an
+8 MiB Q5 payload. With Q5 disabled it materialized exactly one entry and
+9,437,184 bytes (the 1 MiB header plus IQ4), while every byte in the anonymous
+Q5 range remained zero. The final run took 37.518 ms and detach took 2.602 ms;
+`MemAvailable` sampled 29.379 GB before, 29.368 GB with the bounded resident
+payload, and 29.378 GB after detach. The small differences are
+allocator/reclaim noise, while the exact
+byte accounting and zero Q5 range are deterministic. Materialization reads in
+bounded chunks and issues `POSIX_FADV_DONTNEED`; the post-detach sample shows
+no accumulating source-cache cost in this bounded run.
+
+The full focused native build included the benchmark, cache test, stage
+builder/test, standalone checker, and `tp_runner`. The fresh synthetic stage
+passed plan, build, reuse, corruption rebuild, all 11 loader rejections, and
+empty-on-reject state. Its independent checker validated the full synthetic
+sidecar in 0.041 seconds:
+
+```text
+SENTINEL qwen38_kquant_stage=OK entries=2 q5r=2240 iq4r=2176 reuse=1 corrupt_rebuild=1 loader_rejects=11 empty_on_reject=1
+SENTINEL qwen38_kquant_check=OK rank=0/2 entries=2 file_bytes=1053056 seconds=0.041
+```
+
+These results complete the work possible on one node. They do not replace the
+remaining TP4 requirements: exact 128/256-token compact-versus-IQ4R hashes,
+an all-rank missing/corrupt-sidecar fallback vote, and clean four-rank load,
+memory, and end-to-end decode throughput.

@@ -114,6 +114,11 @@ static int expect_load_failure(const char *label, const char *path,
         q38kc_unload(&loaded);
         return -1;
     }
+    if (loaded.header || loaded.mapping || loaded.mapping_bytes) {
+        fprintf(stderr, "loader retained state after invalid %s sidecar\n", label);
+        q38kc_unload(&loaded);
+        return -1;
+    }
     if (!error[0]) {
         fprintf(stderr, "loader gave no error for invalid %s sidecar\n", label);
         return -1;
@@ -331,14 +336,20 @@ int main(int argc, char **argv) {
     memcpy(variant, pristine, cache_bytes);
     variant[((q38kc_header *)variant)->entries[0].file_offset] ^= 1;
     TEST_VARIANT("payload", cache_bytes);
+    memcpy(variant, pristine, cache_bytes);
+    ((q38kc_header *)variant)->entries[0].source_type = GGML_TYPE_F32;
+    refresh_entries_hash((q38kc_header *)variant);
+    TEST_VARIANT("unsupported", cache_bytes);
 #undef TEST_VARIANT
     if (expect_load_failure("source-size", cache_path, source, offset + 1)) return 1;
+    if (expect_load_failure("missing", "/nonexistent/q38kc-sidecar", source,
+                            offset)) return 1;
     unlink(variant_path);
     free(variant);
     free(pristine);
 
     printf("SENTINEL qwen38_kquant_stage=OK entries=%u q5r=%zu iq4r=%zu "
-           "reuse=1 corrupt_rebuild=1 loader_rejects=9\n",
+           "reuse=1 corrupt_rebuild=1 loader_rejects=11 empty_on_reject=1\n",
            cache->n_entries, sizeof(actual_q5), sizeof(actual_iq4));
     free(cache);
     free(source);
