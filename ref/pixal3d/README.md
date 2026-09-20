@@ -262,6 +262,25 @@ ref/pixal3d/run.sh cuda ref/pixal3d/validate_rmbg.py \
   --model /mnt/disk2/models/RMBG-2.0 --device cuda
 ```
 
+### RMBG mask-parity interpretation
+
+The bundled house alpha is closer to the checkpoint named by Pixal3D's pinned
+wrapper, `ZhengPeng7/BiRefNet` at revision `e2bf8e44`, than to the newer
+`briaai/RMBG-2.0` checkpoint used by automatic preparation. With the same
+opaque RGB input and the validator's normal `alpha > 127` comparison, measured
+IoU was 0.994194 for RMBG-2.0 and 0.998310 for the exact upstream BiRefNet
+checkpoint. The corresponding upstream-checkpoint soft masks had 0.150 mean
+absolute 8-bit alpha error and agreed exactly at 96.0% of pixels.
+
+An exhaustive diagnostic sweep reached IoU 0.999004 using the upstream
+checkpoint, Lanczos output resizing, and a threshold of 122. This is an
+asset-tuned threshold and differs from the pinned wrapper's implicit PIL resize
+semantics, so it is not used as the production path or headline RMBG-2.0 score.
+Changing the binary validation threshold would not improve the soft alpha mask
+consumed by Pixal3D. The experiment therefore attributes the remaining gap to
+checkpoint provenance and minor reconstruction details rather than to an
+inference implementation mismatch.
+
 Pinned multiview verification can still run on inputs with useful RGBA alpha
 through `run_reference_mv.py`. Its placeholder raises on RGB or fully opaque
 views, so it does not replace RMBG or change reference masking behavior.

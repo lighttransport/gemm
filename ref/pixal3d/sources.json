@@ -35,6 +35,11 @@
     "model": "briaai/RMBG-2.0",
     "revision": "5df4c9c76d8170882c34f6986e848ee07fd0ba43"
   },
+  "birefnet_upstream": {
+    "model": "ZhengPeng7/BiRefNet",
+    "revision": "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4",
+    "scope": "Exact default checkpoint named by Pixal3D's pinned BiRefNet wrapper"
+  },
   "naf_checkpoint_sha256": "c096c1ab2217a5c3ac136365f721685e2201379cb69d509cfb0261183847c98f",
   "opencv_inpaint": {
     "url": "https://github.com/opencv/opencv/blob/4.12.0/modules/photo/src/inpaint.cpp",
