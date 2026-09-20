@@ -192,23 +192,24 @@ static int ds_pread_all(int fd,void *dst,size_t bytes,off_t offset){
 }
 
 static int ds_load_region(const char *path,off_t offset,size_t bytes,void **out,int threads,char *error,size_t error_size){
-    void *mem=ds_anon_alloc(bytes);if(!mem)return ds_error(error,error_size,DSPARK_ENOMEM,"cannot allocate %.2f GiB",(double)bytes/(1u<<30));
-    int fd=open(path,O_RDONLY);if(fd<0){ds_anon_free(mem,bytes);return ds_error(error,error_size,DSPARK_EIO,"cannot open %s",path);}
-    int failed=0;
-    #pragma omp parallel num_threads(threads) shared(failed)
+    void *src=ds_anon_alloc(bytes);if(!src)return ds_error(error,error_size,DSPARK_ENOMEM,"cannot allocate %.2f GiB load buffer",(double)bytes/(1u<<30));
+    int fd=open(path,O_RDONLY);if(fd<0){ds_anon_free(src,bytes);return ds_error(error,error_size,DSPARK_EIO,"cannot open %s",path);}
+    int failed=ds_pread_all(fd,src,bytes,offset);
+    (void)posix_fadvise(fd,offset,(off_t)bytes,POSIX_FADV_DONTNEED);close(fd);
+    if(failed){ds_anon_free(src,bytes);return ds_error(error,error_size,DSPARK_EIO,"short read from %s",path);}
+    void *mem=ds_anon_alloc(bytes);if(!mem){ds_anon_free(src,bytes);return ds_error(error,error_size,DSPARK_ENOMEM,"cannot allocate %.2f GiB resident arena",(double)bytes/(1u<<30));}
+    /* LLIO serializes concurrent pread into anonymous pages on A64FX.  Read
+     * once, then first-touch the resident arena in parallel for HBM locality. */
+    #pragma omp parallel num_threads(threads)
     {
         int tid=0,nth=1;
         #ifdef _OPENMP
         tid=omp_get_thread_num();nth=omp_get_num_threads();
         #endif
         size_t a=bytes*(size_t)tid/(size_t)nth,b=bytes*(size_t)(tid+1)/(size_t)nth;
-        if(ds_pread_all(fd,(uint8_t*)mem+a,b-a,offset+(off_t)a)){
-            #pragma omp atomic write
-            failed=1;
-        }
+        memcpy((uint8_t*)mem+a,(const uint8_t*)src+a,b-a);
     }
-    (void)posix_fadvise(fd,offset,(off_t)bytes,POSIX_FADV_DONTNEED);close(fd);
-    if(failed){ds_anon_free(mem,bytes);return ds_error(error,error_size,DSPARK_EIO,"short read from %s",path);}
+    ds_anon_free(src,bytes);
     *out=mem;return DSPARK_OK;
 }
 
