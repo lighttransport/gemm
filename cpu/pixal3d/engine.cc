@@ -81,6 +81,7 @@ const float *Weights::get(const std::string &name) {
 }
 Engine::Engine(const pixal3d_options &o) : threads(o.threads) {
     cache_limit_ = o.vram_budget_mib * 1024 * 1024 / 2;
+    resident_budget_ = o.vram_budget_mib * 1024 * 1024;
     require(threads > 0, "threads must be positive");
     openblas_set_num_threads(threads);
     omp_set_num_threads(threads);
@@ -125,6 +126,7 @@ Engine::Engine(const pixal3d_options &o) : threads(o.threads) {
             px_device_metrics metrics{};
             require(api_.metrics(gpu_, &metrics) == 0, api_.error(gpu_));
             cache_limit_ = metrics.effective_budget_bytes / 2;
+            resident_budget_ = metrics.effective_budget_bytes;
         }
     } catch (...) {
         dlclose(library_);

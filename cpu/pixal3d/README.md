@@ -111,6 +111,60 @@ pool trimming all passed against PyTorch. Median 12-head BF16 attention times
 were 0.373 ms at 1024 tokens and 3.730 ms at 4096 tokens for the retained MMA
 kernel, versus 3.781 ms and 25.116 ms for the diagnostic BLAS path.
 
+The complete host pipeline is tested on Windows through WSL2 Ubuntu 24.04. The
+PowerShell wrapper stages Ubuntu development packages, pins uv and its Python
+packages, and assembles NVIDIA CUDA 13.3 artifacts under the repository without
+administrator access. It then builds an `sm_86` Linux plugin and the native host:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ref\pixal3d\setup_windows_wsl.ps1 `
+  -Distribution ubu2404
+```
+
+Weights remain explicit and are not downloaded by the setup script. The tested
+layout was `tmp/pixal3d/models/Pixal3D`,
+`tmp/pixal3d/models/dinov3-vitl16/model.safetensors`, and
+`tmp/pixal3d/models/naf/naf_release.safetensors`. A monitored generation can be
+launched from PowerShell with:
+
+```powershell
+wsl.exe -d ubu2404 -- bash /mnt/d/work/gemm/ref/pixal3d/run_windows_wsl.sh `
+  --backend cuda --input tmp/pixal3d/windows-generation-inputs/1_img.png `
+  --output-dir tmp/pixal3d/windows-3070/house-smoke `
+  --model-dir tmp/pixal3d/models/Pixal3D `
+  --dinov3 tmp/pixal3d/models/dinov3-vitl16/model.safetensors `
+  --naf tmp/pixal3d/models/naf/naf_release.safetensors `
+  --fov 0.857556 --seed 42 --threads 8 `
+  --gpu-execution resident --gpu-kernels auto `
+  --gpu-flow-precision mixed --vram-budget-mib 7168 `
+  --texture-size 1024 --triangle-target 250000
+```
+
+Three complete single-view runs were retained on the 8 GB RTX 3070 using those
+settings. All outputs passed GLB structure, finite geometry, unit-normal, UV,
+embedded PBR texture, and connected-component validation:
+
+| Asset | Native / wall time | Shape tokens | Vertices / triangles | Native peak / total-device peak / host RSS | GLB SHA-256 |
+|---|---:|---:|---:|---:|---|
+| house | 443.379 / 446.730 s | 10,432 | 217,011 / 234,108 | 6.38 / 7.56 / 6.30 GiB | `2868a4d4...730a2a2` |
+| crab | 1169.443 / 1174.504 s | 18,274 | 225,875 / 237,990 | 4.54 / 5.80 / 14.17 GiB | `fb6a5859...6452439` |
+| jester | 438.041 / 442.508 s | 8,866 | 201,339 / 245,826 | 5.98 / 7.04 / 6.24 GiB | `71303947...dbc2bb2` |
+
+After deleting and reproducibly reassembling the repository-local CUDA 13.3
+tree, rebuilding the `sm_86` plugin, and rebuilding the host, the house fixture
+completed again in 466.056 / 469.483 seconds. Its GLB was byte-identical to the
+first run (`2868a4d4...730a2a2`) and passed the complete validator again. The
+native allocator peak remained 6.38 GiB; total device use peaked at 6.60 GiB.
+
+The total-device measurement includes roughly 1 GiB used by the Windows WDDM
+desktop. WSL reports per-process NVML memory as unavailable, so the fixture
+retains total-device and native allocator peaks separately. At an effective
+budget of 7 GiB or less, inputs above 16,384 shape tokens automatically use the
+existing tiled host-offloaded decoder. This preserved the crab run's full
+7,079,106-voxel decodes and FP16 precision while avoiding the resident neighbor
+map overlap that exceeded the card budget. Smaller outputs stay fully resident;
+cards with more than a 7 GiB effective budget retain the resident decoder.
+
 The inpainting implementation is pinned to OpenCV 4.12 to match the Python
 reference. It uses its stable priority heap even when the system libraries are
 4.6; the old 4.6 photo implementation is prohibitively slow on some 4096 atlases.

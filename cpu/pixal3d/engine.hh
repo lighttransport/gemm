@@ -93,7 +93,7 @@ class Engine {
     uint64_t model_identity_ = 0;
     std::map<std::string, Tensor> weights_;
     std::vector<std::shared_ptr<DeviceConditioning>> conditioning_cache_;
-    size_t cache_bytes_ = 0, cache_limit_ = 0;
+    size_t cache_bytes_ = 0, cache_limit_ = 0, resident_budget_ = 0;
     std::string profile_;
     std::map<std::string, double> timings_;
 
@@ -103,6 +103,7 @@ class Engine {
     ~Engine();
     void configure(const pixal3d_gpu_options &options);
     bool resident() const { return resident_; }
+    size_t resident_budget() const { return resident_budget_; }
     pixal3d_flow_precision flow_mode(bool requested) const {
         if (!requested || flow_precision_ == PIXAL3D_FLOW_FP32)
             return PIXAL3D_FLOW_FP32;

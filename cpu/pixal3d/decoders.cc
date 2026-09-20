@@ -169,9 +169,19 @@ static Sparse decode_sparse_gpu(Engine &e, Weights &w, const Sparse &input, bool
 Sparse decode_sparse(Engine &e, Weights &w, const Sparse &input, bool upsample_only,
                      std::vector<Subdivision> &subdivisions, bool guided, int precision,
                      std::vector<Sparse> *subdivision_logits) {
-    if (e.resident())
+    // Dense foregrounds can expand past seven million decoder voxels. On the
+    // minimum 7 GiB path, the final resident neighbor map and activations then
+    // overlap by more than the device budget. Keep the learned resolution and
+    // precision unchanged, but use the existing tiled host-offloaded decoder
+    // for these high-occupancy cases. Larger budgets retain the faster fully
+    // resident path.
+    constexpr size_t seven_gib = size_t(7) << 30;
+    bool low_memory_fallback = e.resident() && e.resident_budget() <= seven_gib && input.rows() > 16384;
+    if (e.resident() && !low_memory_fallback)
         return decode_sparse_gpu(e, w, input, upsample_only, subdivisions, guided, precision,
                                  subdivision_logits);
+    if (low_memory_fallback)
+        std::fprintf(stderr, "Pixal3D decoder: tiled low-memory path for %d input voxels\n", input.rows());
     Sparse h{input.coords, e.linear(input.feats, w, "from_latent"), w.shape("from_latent.weight")[0]};
     round_precision(h.feats, precision);
     if (!guided)

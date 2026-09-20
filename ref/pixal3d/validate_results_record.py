@@ -20,6 +20,7 @@ required = {
     "four_view_pytorch_reference", "mask_provenance", "cuda_reliability_soak",
     "byte_identical_postprocess_replay", "real_queued_http_cuda", "evidence_policy",
     "cuda_optimization_evaluation", "main_release_followup",
+    "windows_rtx3070_generation",
 }
 assert required <= extended.keys(), required - extended.keys()
 
@@ -94,7 +95,7 @@ assert followup["service"]["per_view_masks"]
 assert followup["service"]["reference_reuses_prepared_rgba"]
 assert followup["cuda_architectures"]["default"] == "sm_120"
 assert followup["cuda_architectures"]["compile_checked"] == [
-    "sm_80", "sm_89", "sm_120",
+    "sm_80", "sm_86", "sm_89", "sm_120",
 ]
 assert followup["cpu_fallback"]["improvement_percent"] >= 10
 assert followup["cpu_fallback"]["outputs_byte_identical"]
@@ -106,6 +107,26 @@ assert quality["validated_run"]["triangles"] > 0
 assert quality["validated_run"]["zero_area_faces"] == 0
 assert (quality["validated_run"]["peak_reserved_device_bytes"] <=
         quality["validated_run"]["effective_budget_bytes"])
+
+windows = extended["windows_rtx3070_generation"]
+assert windows["host"]["gpu_name"] == "NVIDIA GeForce RTX 3070"
+assert windows["host"]["device_memory_mib"] == 8192
+assert windows["host"]["compute_capability"] == "8.6"
+assert windows["configuration"]["requested_budget_mib"] == 7168
+windows_runs = windows["runs"]
+assert {item["name"] for item in windows_runs} == {"house", "crab", "jester"}
+assert all(item["vertices"] > 0 and item["triangles"] > 0 for item in windows_runs)
+assert all(len(item["glb_sha256"]) == 64 for item in windows_runs)
+assert max(item["peak_native_device_bytes"] for item in windows_runs) <= 7168 * 1024 * 1024
+assert next(item for item in windows_runs if item["name"] == "crab")["decoder_path"] == "tiled_low_memory"
+repeat = windows["clean_setup_repeat"]
+house = next(item for item in windows_runs if item["name"] == "house")
+assert repeat["toolkit_reassembled"] and repeat["cuda_architecture"] == "sm_86"
+assert repeat["byte_identical_to_first_house_run"]
+assert repeat["glb_sha256"] == house["glb_sha256"]
+assert repeat["peak_native_device_bytes"] <= 7168 * 1024 * 1024
+assert windows["validation"]["zero_area_faces"] == 0
+assert windows["validation"]["referenced_zero_normals"] == 0
 
 
 def artifacts(value):

@@ -2235,7 +2235,7 @@
       }
     },
     "main_release_followup": {
-      "scope": "selected mid- and low-priority main-release work; Direct3D-S2, HIP-specific work, and physical 8/12 GB hardware validation excluded",
+      "scope": "selected mid- and low-priority main-release work; Direct3D-S2, HIP-specific work, and physical 12 GB hardware validation excluded",
       "service": {
         "per_view_masks": true,
         "reference_reuses_prepared_rgba": true,
@@ -2253,6 +2253,7 @@
         "default": "sm_120",
         "compile_checked": [
           "sm_80",
+          "sm_86",
           "sm_89",
           "sm_120"
         ]
@@ -2295,6 +2296,99 @@
           "peak_reserved_device_bytes": 11392995116,
           "effective_budget_bytes": 11685986304
         }
+      }
+    },
+    "windows_rtx3070_generation": {
+      "host": {
+        "name": "titanv-win10",
+        "os": "Windows with WSL2 Ubuntu 24.04",
+        "gpu_name": "NVIDIA GeForce RTX 3070",
+        "device_memory_mib": 8192,
+        "compute_capability": "8.6",
+        "nvidia_driver": "610.62",
+        "native_cuda": "13.3",
+        "windows_torch": "2.7.1+cu128"
+      },
+      "configuration": {
+        "seed": 42,
+        "fov": 0.857556,
+        "gpu_execution": "resident",
+        "gpu_kernels": "auto",
+        "gpu_flow_precision": "mixed",
+        "requested_budget_mib": 7168,
+        "texture_size": 1024,
+        "triangle_target": 250000,
+        "threads": 8
+      },
+      "runs": [
+        {
+          "name": "house",
+          "shape_tokens": 10432,
+          "native_seconds": 443.379,
+          "observed_seconds": 446.73,
+          "vertices": 217011,
+          "triangles": 234108,
+          "peak_native_device_bytes": 6846028392,
+          "peak_total_device_bytes": 8119689216,
+          "peak_host_rss_bytes": 6766522368,
+          "glb_bytes": 15267692,
+          "glb_sha256": "2868a4d4020a2b3daa4118752d4008e6b4dbbfe91f433b751abd4621d730a2a2",
+          "decoder_path": "resident"
+        },
+        {
+          "name": "crab",
+          "shape_tokens": 18274,
+          "native_seconds": 1169.443,
+          "observed_seconds": 1174.504,
+          "vertices": 225875,
+          "triangles": 237990,
+          "peak_native_device_bytes": 4876244416,
+          "peak_total_device_bytes": 6231597056,
+          "peak_host_rss_bytes": 15215120384,
+          "glb_bytes": 14077700,
+          "glb_sha256": "fb6a58590e725ca29e7445e81d28dd12a45a28eab34ae64e1e4c909316452439",
+          "decoder_path": "tiled_low_memory",
+          "decoded_voxels": 7079106
+        },
+        {
+          "name": "jester",
+          "shape_tokens": 8866,
+          "native_seconds": 438.041,
+          "observed_seconds": 442.508,
+          "vertices": 201339,
+          "triangles": 245826,
+          "peak_native_device_bytes": 6421086348,
+          "peak_total_device_bytes": 7563288576,
+          "peak_host_rss_bytes": 6699196416,
+          "glb_bytes": 14656556,
+          "glb_sha256": "7130394726792737f66c9b4a88ef6b6a9c7b8fcbf52bccd56c12ce60edbc2bb2",
+          "decoder_path": "resident"
+        }
+      ],
+      "validation": {
+        "glb_structure": "pass",
+        "finite_geometry": "pass",
+        "unit_normals": "pass",
+        "uvs": "pass",
+        "embedded_pbr_textures": "pass",
+        "connected_components": "pass",
+        "zero_area_faces": 0,
+        "referenced_zero_normals": 0
+      },
+      "memory_interpretation": "Total device use includes the Windows desktop. WSL/WDDM exposes total-device memory but reports NVML per-process memory unavailable; native allocator peaks are retained separately.",
+      "clean_setup_repeat": {
+        "toolkit_reassembled": true,
+        "cuda_version": "13.3.33",
+        "cuda_architecture": "sm_86",
+        "native_seconds": 466.056,
+        "observed_seconds": 469.4832265560108,
+        "peak_native_device_bytes": 6846028392,
+        "peak_total_device_bytes": 7081062400,
+        "peak_host_rss_bytes": 6775791616,
+        "glb_bytes": 15267692,
+        "glb_sha256": "2868a4d4020a2b3daa4118752d4008e6b4dbbfe91f433b751abd4621d730a2a2",
+        "byte_identical_to_first_house_run": true,
+        "glb_validation": "pass"
       }
     },
     "evidence_policy": [
