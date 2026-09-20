@@ -340,6 +340,24 @@ def mesh_comparison(native: dict, reference: dict) -> dict:
     return result
 
 
+def attach_comparison(pixal, result: dict, cancel: threading.Event | None = None) -> None:
+    """Attach cheap structural and optional bounded surface diagnostics."""
+    native_mesh = result.get("mesh_summary", {})
+    reference = result.get("reference", {})
+    reference_mesh = reference.get("mesh_summary", {})
+    if not (native_mesh.get("vertices") and reference_mesh.get("vertices")):
+        return
+    comparison = mesh_comparison(native_mesh, reference_mesh)
+    if hasattr(pixal, "surface_comparison"):
+        try:
+            comparison["surface"] = pixal.surface_comparison(result, reference, cancel)
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            comparison["surface"] = {"available": False, "error": str(exc)}
+    result["comparison"] = comparison
+
+
 class PixalServer:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -358,6 +376,7 @@ class PixalServer:
         self.python_launcher = ROOT / "ref/pixal3d/run.sh"
         self.reference_launcher = ROOT / "ref/pixal3d/run_reference_cuda310.sh"
         self.prepare_script = ROOT / "ref/pixal3d/prepare_input.py"
+        self.compare_script = ROOT / "ref/pixal3d/compare_outputs.py"
 
     def health(self) -> dict:
         lib = {
@@ -480,7 +499,7 @@ class PixalServer:
                 if mask is not None:
                     mask_path = run_dir / "mask.png"
                     mask_path.write_bytes(mask)
-                if auto_mask or auto_camera:
+                if auto_mask or auto_camera or (mask_path is not None and request.get("reference")):
                     prepared = run_dir / "prepared.png"
                     metadata = run_dir / "prepared.json"
                     prep = [str(self.python_launcher), backend, str(self.prepare_script),
@@ -502,6 +521,10 @@ class PixalServer:
                     image_path = prepared
                     mask_path = None
                     fov, distance = preparation["fov"], preparation["distance"]
+                    if request.get("reference"):
+                        request["_reference_image_b64"] = base64.b64encode(
+                            prepared.read_bytes()).decode("ascii")
+                        request["_reference_image_ext"] = ".png"
                 cmd = [str(self.binary), "--backend", backend, "--input", str(image_path), "--output", str(output_path),
                        "--fov", str(fov), "--distance", str(distance), "--mesh-scale", str(mesh_scale), "--seed", str(seed),
                        "--model-dir", str(self.model_dir), "--dinov3", str(self.dinov3), "--naf", str(self.naf)]
@@ -572,10 +595,14 @@ class PixalServer:
         views = request.get("views") if multiview else None
         if multiview and (not isinstance(views, list) or not 1 <= len(views) <= 16):
             raise ValueError("views must contain 1 to 16 posed images")
-        if not multiview and request.get("mask_b64"):
-            raise ValueError("PyTorch reference comparison currently requires an image without a separate mask")
-        image = None if multiview else decode_b64(request.get("image_b64"), "image_b64", MAX_IMAGE_BYTES)
-        ext = str(request.get("image_ext", ".png")).lower()
+        prepared_image = request.get("_reference_image_b64")
+        if not multiview and request.get("mask_b64") and not prepared_image:
+            raise ValueError("explicit-mask reference comparison requires prepared RGBA input")
+        image = None if multiview else decode_b64(
+            prepared_image or request.get("image_b64"),
+            "_reference_image_b64" if prepared_image else "image_b64", MAX_IMAGE_BYTES)
+        ext = str(request.get(
+            "_reference_image_ext" if prepared_image else "image_ext", ".png")).lower()
         if ext not in (".png", ".jpg", ".jpeg", ".webp"):
             ext = ".png"
         fov = finite_number(request.get("fov", 0.857556), "fov", 0.05, 3.14)
@@ -630,6 +657,24 @@ class PixalServer:
             except (KeyError, IndexError, OSError, TypeError, ValueError, struct.error):
                 result["mesh_summary"] = {"available": False}
             return result
+
+    def surface_comparison(self, native: dict, reference: dict,
+                           cancel: threading.Event | None = None) -> dict:
+        """Run bounded geometry metrics in an isolated short-lived process."""
+        with tempfile.TemporaryDirectory(prefix="comparison-", dir=self.work_dir) as td:
+            directory = Path(td)
+            native_path = directory / "native.glb"
+            reference_path = directory / "reference.glb"
+            native_path.write_bytes(base64.b64decode(native["glb_b64"], validate=True))
+            reference_path.write_bytes(base64.b64decode(reference["glb_b64"], validate=True))
+            command = [str(self.python_launcher), "cpu", str(self.compare_script),
+                       str(native_path), str(reference_path), "--samples", "50000"]
+            proc = run_command(command, min(self.args.reference_timeout, 600), cancel)
+            if proc.returncode:
+                raise RuntimeError((proc.stderr or proc.stdout).strip()[-2000:])
+            measured = json.loads(proc.stdout)
+            return {"available": True, "samples": measured["samples"],
+                    "seed": measured["seed"], **measured["geometry"]}
 
 
 class JobQueue:
@@ -812,10 +857,8 @@ class JobQueue:
                 if request.get("reference"):
                     self._update(job_id, phase="PyTorch reference", progress=98)
                     result["reference"] = self.pixal.reference(reference_request(request, result), cancel)
-                    native_mesh = result.get("mesh_summary", {})
-                    reference_mesh = result["reference"].get("mesh_summary", {})
-                    if native_mesh.get("vertices") and reference_mesh.get("vertices"):
-                        result["comparison"] = mesh_comparison(native_mesh, reference_mesh)
+                    self._update(job_id, phase="surface comparison", progress=99)
+                    attach_comparison(self.pixal, result, cancel)
                 self._store_artifacts(job_id, result)
                 self._update(job_id, state="complete", phase="complete", progress=100, result=result,
                              completed_at=time.time())
@@ -906,10 +949,7 @@ class Handler(BaseHTTPRequestHandler):
             result = self.server.pixal.infer(request)
             if request.get("reference"):
                 result["reference"] = self.server.pixal.reference(reference_request(request, result))
-                native_mesh = result.get("mesh_summary", {})
-                reference_mesh = result["reference"].get("mesh_summary", {})
-                if native_mesh.get("vertices") and reference_mesh.get("vertices"):
-                    result["comparison"] = mesh_comparison(native_mesh, reference_mesh)
+                attach_comparison(self.server.pixal, result)
             self.json_response(200, result)
         except QueueFull as exc: self.json_response(429, error_payload("queue_full", str(exc)))
         except TimeoutError as exc: self.json_response(504, error_payload("timeout", str(exc)))

@@ -6,7 +6,6 @@ Work on the Pixal3D **main** release is on branch `pixal3d`. The native CPU and
 CUDA pipelines, single-view and posed multiview inference, mixed/FP32 precision
 modes, 7 GiB and 12 GiB CUDA memory paths, pinned PyTorch reference runners,
 RMBG/MoGe preparation, GLB/PLY export, and the Python web demo are implemented.
-The worktree was clean before this handoff file was added.
 
 Recent commits:
 
@@ -42,44 +41,28 @@ Important measured results:
   present this threshold-tuned result as general production quality.
 - Byte-identical 4K/1M postprocessing replay: 92.6 s, SHA-256
   `6d8c267b006df8cf60e3c5ea71d470e89c3cb734f61b91b5e1c622e1f711a8b7`.
+- Real queued automatic-mask test: 312.1 s, 11.66 GB peak device memory;
+  cancellation, recovery, artifact download, and native GLB validation passed.
+- Real paired explicit-mask test: 689.2 s, 13.29 GB peak device memory;
+  native/reference GLB validation passed and 50k-sample Chamfer RMS was
+  `0.015580` for the pinned public upstream image.
+
+## Completed in the current follow-up
+
+- Added an opt-in, reproducible real queued HTTP/CUDA harness using a public
+  upstream image pinned by Git revision and SHA-256. It covers automatic RMBG,
+  cancellation, recovery, polling, progress, file-backed download, GLB
+  validation, and peak RSS/VRAM recording.
+- Paired single-view comparison now supports explicit masks by reusing the exact
+  prepared RGBA input and resolved camera values for native and PyTorch runs.
+- Paired jobs compute a bounded 50,000-sample surface comparison and show
+  Chamfer RMS, directional p95, and absolute normal agreement in the web UI.
+- Unit and fake-backed Chrome coverage exercise the new behavior; real RTX 5060
+  Ti evidence is recorded in the server documentation and repo-local artifacts.
 
 ## Remaining work, in priority order
 
-### 1. Run a real web-demo end-to-end CUDA test
-
-`server/pixal3d/test_browser.py` drives the real HTTP handler and Chrome, but
-uses `FakePixal` for inference. Add an opt-in test or documented harness that
-runs one real RTX 5060 Ti generation through the queued HTTP API and verifies:
-
-- upload, job polling, progress, and file-backed artifact download;
-- native GLB validation and viewer loading;
-- an automatic RMBG input path;
-- a paired PyTorch reference result when memory permits;
-- cancellation followed by successful queue/GPU recovery.
-
-Keep the normal browser test fast and fake-backed. Gate the real test behind an
-explicit command-line option and record peak process VRAM/RSS and elapsed time.
-
-### 2. Support explicit masks in paired PyTorch comparison
-
-The native server accepts RGB plus `mask_upload`, but `PixalServer.reference`
-currently rejects any request containing a separate mask. Route the already
-prepared RGBA image into the single-view reference runner so native and
-reference paths consume the same alpha and resolved camera values. Add unit and
-real CUDA checks proving that enabling `reference` does not invoke RMBG again
-and produces both artifacts.
-
-### 3. Surface quantitative comparison in the web job result
-
-The browser currently displays side-by-side/overlay meshes, while the HTTP
-result exposes only vertex/triangle deltas and bounds differences. Integrate a
-bounded version of the existing `compare_outputs.py` geometry metrics into
-paired jobs, or run it asynchronously after both GLBs are ready. Display
-Chamfer RMS, directional p95, and orientation-independent normal agreement.
-Render metrics should remain optional because four CPU previews add latency.
-Do not hold decoded meshes or images in the long-lived job dictionary.
-
-### 4. Consolidate the current validation record
+### 1. Consolidate the current validation record
 
 `ref/pixal3d/validation-results.json` predates several recent results. Add
 machine-readable entries for:
@@ -95,7 +78,7 @@ Record commands, commit IDs, checkpoint revisions, artifact hashes, device and
 driver identity, and whether a number is isolated or affected by concurrent
 load. Avoid duplicating large logs or model files.
 
-### 5. Continue byte-identical CPU postprocessing optimization
+### 2. Continue byte-identical CPU postprocessing optimization
 
 The latest 4K/1M replay still spends about 17.8 s in hole filling plus original
 mesh BVH construction, 16.2 s in unwrap/normals, and 14.3 s in inpainting.
@@ -105,7 +88,7 @@ Promising bounded work includes compact BVH build inputs, allocation reuse in
 UV chart construction, and removal of avoidable image repacking. Do not change
 the 4K/1M reference-quality defaults.
 
-### 6. Evaluate remaining CUDA memory/performance opportunities
+### 3. Evaluate remaining CUDA memory/performance opportunities
 
 `cpu/pixal3d/OPTIMIZATION.md` still identifies packed flow activation storage
 and additional GEMM tiling as opportunities. Measure full-stage and complete
@@ -114,7 +97,7 @@ generation behavior, not only microbenchmarks. Preserve mixed-trajectory error
 outputs between the 7 and 12 GiB budget runs. Remove experiments that do not
 improve end-to-end time or peak memory.
 
-### 7. Refresh user-facing performance wording
+### 4. Refresh user-facing performance wording
 
 Some older documentation describes the initial host-offloaded implementation
 and 28–97 minute runs under concurrent load, while the resident path and newer
@@ -124,7 +107,7 @@ its execution mode, fixture, concurrency conditions, and whether serialization
 is included. Keep historical results only when they explain a regression or
 tradeoff.
 
-### 8. Optional service durability
+### 5. Optional service durability
 
 Queued artifacts are file-backed, but job metadata remains in memory and is
 discarded on server restart. If the demo is promoted beyond a workstation
@@ -187,8 +170,9 @@ Torch-ABI extensions for `sm_120`.
 Resume Pixal3D work in /mnt/nvme02/work/gemm/pixal3d on branch pixal3d.
 Read AGENTS.md and resume-pixal3d.md first. Treat the current worktree and
 artifacts as authoritative. Work through the prioritized remaining tasks,
-starting with the real queued web-demo CUDA end-to-end test, then explicit-mask
-paired PyTorch comparison and bounded quantitative metrics in web results.
+starting with the consolidated machine-readable validation record, then
+byte-identical CPU postprocessing profiling and measured CUDA memory/performance
+work.
 Keep scope on Pixal3D main. Exclude Direct3D-S2/paper work, all HIP/ROCm-specific
 work, previously excluded items 1 and 15, and git push. Use the per-project uv
 environments and repository tmp/ only. Preserve the verified 7168 MiB minimum

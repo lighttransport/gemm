@@ -38,8 +38,11 @@ clamped to currently free VRAM, preserving the lower-memory path on smaller
 cards. Set `reference: true` with CUDA or ROCm to
 also run the pinned upstream PyTorch pipeline; the response includes a second
 GLB for comparison. This is opt-in because it loads another model stack and
-requires an image without a separate mask upload. The browser displays native
-AMD and PyTorch reference meshes side by side or as an opacity overlay. Viewer
+adds several minutes to a request. Explicit masks are supported: the server
+prepares one RGBA image and passes that exact image and resolved camera values
+to both implementations without running RMBG a second time. The browser
+displays native and PyTorch reference meshes side by side or as an opacity
+overlay. Viewer
 cameras remain synchronized while comparing the meshes. `GET /health` reports
 binary, GPU-library, native-model, preparation-model, and pinned PyTorch
 reference readiness. Reference readiness includes the project Python and
@@ -47,8 +50,11 @@ compiled `o_voxel`/CuMesh dependencies; missing names are returned explicitly.
 
 Native and reference results include `mesh_summary` with byte, vertex and
 triangle counts and declared position bounds. A paired run also returns
-`comparison` with relative count differences and the maximum bounds delta;
-these provide reproducible structural diagnostics alongside visual inspection.
+`comparison` with relative count differences, the maximum bounds delta, and a
+bounded 50,000-sample surface comparison. The UI summarizes symmetric Chamfer
+RMS, both directional p95 distances, and orientation-independent normal
+agreement. These provide reproducible geometry diagnostics alongside visual
+inspection without retaining decoded meshes in the job record.
 
 For single-view requests, `auto_mask: true` uses the pinned RMBG-2.0 reference
 when the image lacks useful alpha, and `auto_camera: true` estimates horizontal
@@ -91,6 +97,39 @@ When Chrome or Chromium is installed, `python3 server/pixal3d/test_browser.py`
 boots the real HTTP handler and drives the page through Chrome DevTools. It
 verifies single-view and multiview uploads, queued polling, native/reference
 downloads, PLY delivery, readiness rendering, and active-job cancellation.
+
+The opt-in real test downloads an upstream image at a pinned Git commit,
+verifies its SHA-256, and exercises the queued HTTP API on CUDA. It forces the
+automatic RMBG path, cancels one real job, verifies recovery with a complete
+generation, downloads and validates its file-backed GLB, and records elapsed
+time plus peak process RSS and device memory:
+
+```sh
+ref/pixal3d/run.sh cuda server/pixal3d/test_real_cuda.py \
+  --vram-budget-mib 12288
+```
+
+Run the paired explicit-mask path separately to reuse the fixture alpha in both
+native and pinned PyTorch inference and verify the bounded surface metrics:
+
+```sh
+ref/pixal3d/run.sh cuda server/pixal3d/test_real_cuda.py \
+  --vram-budget-mib 12288 --skip-cancel --explicit-mask --reference
+```
+
+Both commands write their reproducibility record and validated artifacts under
+`tmp/pixal3d/real-web-cuda/`. They require network access for the pinned input,
+the local model paths reported by `/health`, and an NVIDIA GPU.
+
+On 2026-09-20, the automatic-mask command passed on an RTX 5060 Ti 16 GB in
+312.1 seconds, including cancellation and recovery. The recovery generation
+peaked at 11,656,101,888 device bytes and 6,946,299,904 aggregate host RSS
+bytes and produced a validated 9,335,888-byte GLB. The input SHA-256 was
+`fdd82d60b7ec11e6d5699df29693d8ab538f9dab4b04e3f2abaa59ccd7b4709a`.
+The paired explicit-mask command passed in 689.2 seconds, peaked at
+13,285,916,672 device bytes and 25,487,593,472 aggregate host RSS bytes, and
+produced validated native/reference GLBs. Its 50,000-sample symmetric Chamfer
+RMS was `0.015580`; directional p95 distances were `0.027573` and `0.034187`.
 
 For multiview API requests, replace `image_b64` with `views`, an ordered array
 of 1 to 16 objects. Each object contains `image_b64`, a 4-by-4

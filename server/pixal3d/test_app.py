@@ -175,6 +175,77 @@ class PixalServerTest(unittest.TestCase):
         self.assertEqual(native[native.index("--fov") + 1], "0.6")
         self.assertEqual(native[native.index("--distance") + 1], "1.5")
 
+    def test_explicit_mask_prepares_shared_reference_rgba(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        commands = []
+        reference_input = {}
+        with tempfile.TemporaryDirectory(prefix="mask-reference-", dir=scratch) as td:
+            server = self.make_server(Path(td))
+
+            def run(command, **kwargs):
+                commands.append(command)
+                output = Path(command[command.index("--output") + 1])
+                if str(server.prepare_script) in command:
+                    output.write_bytes(b"prepared-rgba")
+                    Path(command[command.index("--metadata") + 1]).write_text(json.dumps({
+                        "fov": 0.8, "distance": 1.2, "mesh_scale": 1.0,
+                        "mask_source": "mask", "camera_source": "manual"}))
+                    return subprocess.CompletedProcess(command, 0, "{}\n", "")
+                if str(server.reference_script) in command:
+                    reference_input["bytes"] = Path(command[command.index("--image") + 1]).read_bytes()
+                    output.write_bytes(b"reference-glb")
+                    return subprocess.CompletedProcess(command, 0, "reference\n", "")
+                output.write_bytes(b"native-glb")
+                Path(command[command.index("--profile-json") + 1]).write_text("{}")
+                return subprocess.CompletedProcess(command, 0, "{}\n", "")
+
+            request = {
+                "backend": "cuda", "reference": True, "fov": 0.8,
+                "image_b64": base64.b64encode(b"rgb").decode(),
+                "mask_b64": base64.b64encode(b"mask").decode(),
+            }
+            with mock.patch.object(app.subprocess, "run", side_effect=run):
+                native = server.infer(request)
+                reference = server.reference(app.reference_request(request, native))
+
+        preparation = [c for c in commands if str(server.prepare_script) in c]
+        self.assertEqual(len(preparation), 1)
+        self.assertIn("--mask", preparation[0])
+        native_command = next(c for c in commands if "--profile-json" in c)
+        self.assertNotIn("--mask", native_command)
+        self.assertEqual(reference_input["bytes"], b"prepared-rgba")
+        self.assertEqual(base64.b64decode(reference["glb_b64"]), b"reference-glb")
+
+    def test_surface_comparison_is_bounded_and_attached(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="comparison-", dir=scratch) as td:
+            server = self.make_server(Path(td))
+            measured = {"samples": 50000, "seed": 17, "geometry": {
+                "symmetric_chamfer_rms": 0.01,
+                "native_to_reference": {"p95": 0.02, "normal_abs_cosine_mean": 0.98},
+                "reference_to_native": {"p95": 0.03, "normal_abs_cosine_mean": 0.97}}}
+            captured = {}
+
+            def run(command, **kwargs):
+                captured["command"] = command
+                return subprocess.CompletedProcess(command, 0, json.dumps(measured), "")
+
+            native = {"glb_b64": base64.b64encode(b"native").decode(),
+                      "mesh_summary": {"vertices": 10, "triangles": 8,
+                                       "bounds": [[0, 0, 0], [1, 1, 1]]}}
+            reference = {"glb_b64": base64.b64encode(b"reference").decode(),
+                         "mesh_summary": {"vertices": 9, "triangles": 7,
+                                          "bounds": [[0, 0, 0], [1, 1, 1]]}}
+            with mock.patch.object(app.subprocess, "run", side_effect=run):
+                result = dict(native, reference=reference)
+                app.attach_comparison(server, result)
+
+        self.assertEqual(result["comparison"]["surface"]["samples"], 50000)
+        self.assertEqual(result["comparison"]["surface"]["symmetric_chamfer_rms"], 0.01)
+        self.assertEqual(captured["command"][captured["command"].index("--samples") + 1], "50000")
+
     def test_multiview_reference_uses_pinned_entry_point(self):
         scratch = app.ROOT / "tmp/pixal3d/tests"
         scratch.mkdir(parents=True, exist_ok=True)

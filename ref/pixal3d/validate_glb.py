@@ -6,7 +6,10 @@ from pathlib import Path
 import struct
 import numpy as np
 from PIL import Image
-p=argparse.ArgumentParser();p.add_argument('path',type=Path);a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('path',type=Path)
+p.add_argument('--allow-material-red',action='store_true',
+               help='accept reference exporters that use the material red channel')
+a=p.parse_args()
 raw=a.path.read_bytes();magic,version,total=struct.unpack_from('<III',raw)
 assert magic==0x46546c67 and version==2 and total==len(raw)
 length,kind=struct.unpack_from('<II',raw,12);assert kind==0x4e4f534a
@@ -58,12 +61,15 @@ assert images[0].shape==(texture_size,texture_size,4) and images[1].shape==(text
 # Lossy WebP can introduce small red-channel ringing around metallic/roughness
 # edges; native PNG output remains exactly zero in that unused channel.
 red_limit=0 if all(item['mimeType']=='image/png' for item in scene['images']) else 32
-assert images[1][:,:,0].max()<=red_limit
+material_red_max=int(images[1][:,:,0].max())
+assert a.allow_material_red or material_red_max<=red_limit
 print(json.dumps(dict(path=str(a.path),bytes=len(raw),vertices=len(v),triangles=len(f),
     bounds=[v.min(0).tolist(),v.max(0).tolist()],texture_size=texture_size,
     zero_normal_count=int(zero_normals.sum()),
     referenced_zero_normal_count=int(np.isin(np.flatnonzero(zero_normals),f).sum()),
     zero_area_face_count=int(zero_area_faces.sum()),
     normal_max_error=float(abs(normal_lengths[~zero_normals]-1).max(initial=0)),
-    base_median=np.median(images[0].reshape(-1,4),axis=0).tolist(),material_median=np.median(images[1].reshape(-1,3),axis=0).tolist())),flush=True)
+    base_median=np.median(images[0].reshape(-1,4),axis=0).tolist(),
+    material_median=np.median(images[1].reshape(-1,3),axis=0).tolist(),
+    material_red_max=material_red_max)),flush=True)
 print('GLB PASS',flush=True)

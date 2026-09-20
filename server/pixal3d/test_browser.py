@@ -48,11 +48,21 @@ class FakePixal:
         return {"ok": True, "backend": request["backend"], "elapsed_ms": 1,
                 "glb_b64": base64.b64encode(b"glTF-browser-test").decode(),
                 "ply_b64": base64.b64encode(b"ply-browser-test").decode(),
-                "stats": {"views": len(request.get("views", [None]))}, "profile": {}}
+                "stats": {"views": len(request.get("views", [None]))}, "profile": {},
+                "mesh_summary": {"vertices": 100, "triangles": 80,
+                                 "bounds": [[-.5, -.5, -.5], [.5, .5, .5]]}}
 
     def reference(self, request, cancel=None):
         return {"backend": request["backend"], "elapsed_ms": 1,
-                "glb_b64": base64.b64encode(b"glTF-reference-test").decode()}
+                "glb_b64": base64.b64encode(b"glTF-reference-test").decode(),
+                "mesh_summary": {"vertices": 99, "triangles": 79,
+                                 "bounds": [[-.5, -.5, -.5], [.5, .5, .5]]}}
+
+    def surface_comparison(self, native, reference, cancel=None):
+        return {"available": True, "samples": 50000, "seed": 17,
+                "symmetric_chamfer_rms": .01,
+                "native_to_reference": {"p95": .02, "normal_abs_cosine_mean": .98},
+                "reference_to_native": {"p95": .03, "normal_abs_cosine_mean": .97}}
 
 
 class Cdp:
@@ -175,6 +185,7 @@ def main():
                 cdp.evaluate("document.getElementById('include-ply').checked=true; document.getElementById('reference').checked=true; document.getElementById('form').requestSubmit()")
                 wait_for(cdp, "document.getElementById('status').textContent === 'Complete'")
                 assert cdp.evaluate("!document.getElementById('download').hidden && !document.getElementById('ply-download').hidden && !document.getElementById('reference-download').hidden")
+                assert cdp.evaluate("document.getElementById('stats').textContent.includes('Chamfer RMS: 0.010000')")
                 assert cdp.evaluate("Promise.all(['download','ply-download','reference-download'].map(id=>fetch(document.getElementById(id).href).then(r=>r.ok&&r.arrayBuffer()).then(b=>b.byteLength))).then(v=>v.every(n=>n>0))")
                 assert len(pixal.requests) == 1 and "views" not in pixal.requests[0]
 
