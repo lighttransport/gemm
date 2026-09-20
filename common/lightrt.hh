@@ -2117,6 +2117,10 @@ public:
   // Build SBVH from triangles
   bool build(const std::vector<Triangle>& triangles,
              const SBVHBuildConfig& config = SBVHBuildConfig()) noexcept;
+  // Transfer a temporary triangle array into the BVH without retaining a
+  // second full copy during and after construction.
+  bool build(std::vector<Triangle>&& triangles,
+             const SBVHBuildConfig& config = SBVHBuildConfig()) noexcept;
 
   // Traverse and find closest triangle intersection
   uint32_t traverse(const Ray& ray, float& hit_t, float& hit_u, float& hit_v) const noexcept;
@@ -2223,6 +2227,7 @@ private:
   };
 
   // Build methods
+  bool buildOwned(const SBVHBuildConfig& config) noexcept;
   uint32_t buildRecursive(std::vector<PrimRef>& refs, uint32_t depth) noexcept;
 
   // Split finding

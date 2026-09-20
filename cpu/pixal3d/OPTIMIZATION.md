@@ -83,6 +83,27 @@ per-vertex vectors plus a hash set. For the 2.9-million-vertex extracted mesh,
 adjacency container storage falls from about 70 MB plus heap allocations to
 about 26 MB. A full replay completed in 92.6 s and retained the byte-identical
 `6d8c267b...11a8b7` GLB; the combined hole-fill/BVH phase measured 17.8 s.
+
+Detailed profiling separated the remaining combined phases. On the same saved
+4K/1M fixture, hole filling used 0.37 s while original-mesh SBVH construction
+used 17.71 s; UV unwrap used 16.87 s while normal generation and remapping used
+0.036 s; the two Telea solves used 14.68 s while material interleave and
+deinterleave used 0.23 s. Stable vector grouping now replaces the UV merge
+loop's per-entry `std::map` allocation while preserving each key's original
+floating-point accumulation order. Measured unwrap time fell to 14.48–14.61 s
+(13–14%), and two complete optimized observations were 92.93 s and 95.91 s
+under variable host load. Both retained the exact `6d8c267b...11a8b7` GLB.
+
+Texture baking now writes the packed material image directly, removing 48 MiB
+of temporary planar material arrays and both repacking passes. Closest-point
+queries use the SBVH-owned triangle array instead of retaining a duplicate,
+removing 290.1 MiB after construction; an rvalue SBVH build also avoids that
+duplicate at construction peak. The final replay's measured maximum RSS was
+3,169,464 KiB. A parallel regular-BVH experiment reduced construction from
+17.71 s to 2.44 s and total replay time to 80.05 s, but changed the GLB hash to
+`06ad7053...15a0`; it was rejected and removed because closest-point tie order
+must remain byte-identical.
+
 Reproduce with:
 
 ```sh

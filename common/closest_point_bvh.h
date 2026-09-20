@@ -134,8 +134,8 @@ public:
   // faces:    [num_f, 3] int32 row-major
   bool build(const float* vertices, uint32_t num_v,
              const int32_t* faces, uint32_t num_f) {
-    triangles_.clear();
-    triangles_.reserve(num_f);
+    std::vector<lightrt::Triangle> triangles;
+    triangles.reserve(num_f);
     for (uint32_t f = 0; f < num_f; ++f) {
       uint32_t i0 = static_cast<uint32_t>(faces[3 * f + 0]);
       uint32_t i1 = static_cast<uint32_t>(faces[3 * f + 1]);
@@ -144,13 +144,13 @@ public:
       const float* p0 = vertices + 3 * i0;
       const float* p1 = vertices + 3 * i1;
       const float* p2 = vertices + 3 * i2;
-      triangles_.emplace_back(
+      triangles.emplace_back(
           lightrt::Vec3(p0[0], p0[1], p0[2]),
           lightrt::Vec3(p1[0], p1[1], p1[2]),
           lightrt::Vec3(p2[0], p2[1], p2[2]));
     }
     lightrt::SBVHBuildConfig cfg;
-    return sbvh_.build(triangles_, cfg);
+    return sbvh_.build(std::move(triangles), cfg);
   }
 
   // Single-point closest-point query.
@@ -162,6 +162,7 @@ public:
 
     const auto& nodes = sbvh_.getNodes();
     const auto& refs  = sbvh_.getReferences();
+    const auto& triangles = sbvh_.getTriangles();
     if (nodes.empty()) return best;
 
     // Iterative DFS with a small fixed stack.
@@ -180,7 +181,7 @@ public:
         for (uint32_t i = 0; i < node.prim_count; ++i) {
           const auto& ref = refs[node.prim_offset + i];
           uint32_t pid = ref.prim_id;
-          const lightrt::Triangle& tri = triangles_[pid];
+          const lightrt::Triangle& tri = triangles[pid];
           lightrt::Vec3 c;
           float w0, w1, w2;
           closest_point_on_triangle(p, tri.v0, tri.v1, tri.v2, c, w0, w1, w2);
@@ -243,11 +244,10 @@ public:
     }
   }
 
-  uint32_t numTriangles() const noexcept { return static_cast<uint32_t>(triangles_.size()); }
+  uint32_t numTriangles() const noexcept { return sbvh_.getNumPrimitives(); }
 
 private:
   lightrt::SBVH sbvh_;
-  std::vector<lightrt::Triangle> triangles_;
 };
 
 }  // namespace trellis2

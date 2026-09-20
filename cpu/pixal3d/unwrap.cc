@@ -67,6 +67,7 @@ void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, 
     __gnu_parallel::sort(edges.begin(), edges.end(),
                          [](const auto &a, const auto &b) { return a.edge < b.edge; });
     std::vector<Adjacency> adjacency;
+    adjacency.reserve(edges.size() / 2);
     for (size_t i = 0; i < edges.size();) {
         size_t j = i + 1;
         while (j < edges.size() && edges[j].edge == edges[i].edge)
@@ -93,22 +94,32 @@ void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, 
         for (int f = 0; f < nf; ++f)
             angle[charts[f]] =
                 std::max(angle[charts[f]], std::acos(std::clamp(axes[charts[f]].dot(normals[f]), -1.f, 1.f)));
-        std::map<uint64_t, float> merged;
+        std::vector<std::pair<uint64_t, float>> merged;
+        merged.reserve(adjacency.size());
         for (const auto &e : adjacency) {
             int a = charts[e.a], b = charts[e.b];
             if (a == b)
                 continue;
             if (a > b)
                 std::swap(a, b);
-            merged[(uint64_t(a) << 32) | uint32_t(b)] += e.length;
+            merged.emplace_back((uint64_t(a) << 32) | uint32_t(b), e.length);
         }
+        // Stable grouping retains each chart pair's original adjacency order,
+        // and therefore the exact floating-point accumulation used by std::map.
+        std::stable_sort(merged.begin(), merged.end(),
+                         [](const auto &a, const auto &b) { return a.first < b.first; });
         std::vector<Adjacency> ce;
         ce.reserve(merged.size());
-        for (auto &e : merged) {
-            int a = int(e.first >> 32), b = uint32_t(e.first);
-            ce.push_back({a, b, e.second});
-            perimeter[a] += e.second;
-            perimeter[b] += e.second;
+        for (size_t i = 0; i < merged.size();) {
+            size_t j = i + 1;
+            float length = merged[i].second;
+            while (j < merged.size() && merged[j].first == merged[i].first)
+                length += merged[j++].second;
+            int a = int(merged[i].first >> 32), b = uint32_t(merged[i].first);
+            ce.push_back({a, b, length});
+            perimeter[a] += length;
+            perimeter[b] += length;
+            i = j;
         }
         Vec cost(ce.size());
         std::vector<int> best(nc, -1);
@@ -144,6 +155,11 @@ void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, 
     }
     std::fprintf(stderr, "Pixal3D UV: %d normal-cone charts\n", nc);
     std::vector<std::vector<int>> chart_faces(nc);
+    std::vector<size_t> chart_sizes(nc);
+    for (int f = 0; f < nf; ++f)
+        ++chart_sizes[charts[f]];
+    for (int c = 0; c < nc; ++c)
+        chart_faces[c].reserve(chart_sizes[c]);
     for (int f = 0; f < nf; ++f)
         chart_faces[charts[f]].push_back(f);
     std::unique_ptr<xatlas::Atlas, decltype(&xatlas::Destroy)> atlas(xatlas::Create(), xatlas::Destroy);
@@ -151,6 +167,7 @@ void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, 
     std::vector<std::vector<int>> maps(nc);
     for (int c = 0; c < nc; ++c) {
         auto &map = maps[c];
+        map.reserve(chart_faces[c].size() * 3);
         for (int f : chart_faces[c])
             for (int j = 0; j < 3; ++j)
                 map.push_back(m.f[3 * f + j]);
@@ -158,6 +175,8 @@ void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, 
         map.erase(std::unique(map.begin(), map.end()), map.end());
         Vec v;
         std::vector<uint32_t> f;
+        v.reserve(map.size() * 3);
+        f.reserve(chart_faces[c].size() * 3);
         for (int id : map)
             v.insert(v.end(), m.v.begin() + 3 * id, m.v.begin() + 3 * id + 3);
         for (int id : chart_faces[c])

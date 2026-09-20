@@ -4540,26 +4540,37 @@ bool SBVH::build(const std::vector<Triangle>& triangles, const SBVHBuildConfig& 
   if (triangles.empty()) {
     return false;
   }
-
   triangles_ = triangles;
+  return buildOwned(config);
+}
+
+bool SBVH::build(std::vector<Triangle>&& triangles, const SBVHBuildConfig& config) noexcept {
+  if (triangles.empty()) {
+    return false;
+  }
+  triangles_ = std::move(triangles);
+  return buildOwned(config);
+}
+
+bool SBVH::buildOwned(const SBVHBuildConfig& config) noexcept {
   config_ = config;
 
   // Compute scene bounds and create initial references
   scene_bounds_ = AABB();
   std::vector<PrimRef> initial_refs;
-  initial_refs.reserve(triangles.size());
+  initial_refs.reserve(triangles_.size());
 
-  for (uint32_t i = 0; i < triangles.size(); i++) {
-    AABB bounds = triangles[i].bounds();
+  for (uint32_t i = 0; i < triangles_.size(); i++) {
+    AABB bounds = triangles_[i].bounds();
     scene_bounds_.expand(bounds);
     initial_refs.emplace_back(i, bounds);
   }
 
   // Clear output arrays
   nodes_.clear();
-  nodes_.reserve(triangles.size() * 2);
+  nodes_.reserve(triangles_.size() * 2);
   refs_.clear();
-  refs_.reserve(static_cast<size_t>(triangles.size() * config_.max_split_factor));
+  refs_.reserve(static_cast<size_t>(triangles_.size() * config_.max_split_factor));
 
   // Build recursively
   buildRecursive(initial_refs, 0);

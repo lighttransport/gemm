@@ -150,6 +150,11 @@ static void dump_mesh(const pixal3d_options &options, const char *name, const Me
 void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_options &options,
                  pixal3d_result &result, Engine *profile) {
     auto phase = std::chrono::steady_clock::now();
+    auto record = [&](const char *name, std::chrono::steady_clock::time_point begin) {
+        if (profile)
+            profile->record(std::string("postprocess.") + name,
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    };
     auto mark = [&](const char *name) {
         auto now = std::chrono::steady_clock::now();
         if (profile)
@@ -173,12 +178,16 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
     t2_fdg_mesh_free(&extracted);
     require(original.numF() > 0, "FDG extraction produced no faces");
     mark("fdg");
+    auto detail = std::chrono::steady_clock::now();
     fill_holes(original);
+    record("holes", detail);
     dump_mesh(options, "mesh_fdg", original);
     std::fprintf(stderr, "Pixal3D FDG: %u vertices, %u faces\n", original.numV(), original.numF());
+    detail = std::chrono::steady_clock::now();
     trellis2::ClosestPointBVH bvh;
     require(bvh.build(original.v.data(), original.numV(), original.f.data(), original.numF()),
             "Cannot build original mesh BVH");
+    record("original_bvh", detail);
     mark("holes_bvh");
     Mesh mesh = remesh(original, bvh);
     mark("remesh");
@@ -189,12 +198,16 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
     dump_mesh(options, "mesh_simplified", mesh);
     Vec vertices, uv, normals;
     std::vector<int32_t> faces, vmap;
+    detail = std::chrono::steady_clock::now();
     unwrap(mesh, vertices, faces, uv, vmap);
+    record("unwrap", detail);
+    detail = std::chrono::steady_clock::now();
     Vec original_normals;
     vertex_normals(mesh, original_normals);
     normals.resize(vertices.size());
     for (size_t i = 0; i < vmap.size(); ++i)
         std::copy_n(original_normals.data() + size_t(vmap[i]) * 3, 3, normals.data() + i * 3);
+    record("normals", detail);
     mark("unwrap_normals");
     int size = options.texture_size;
     size_t pixels = size_t(size) * size;
@@ -235,7 +248,7 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
     for (int i = 0; i < texture.rows(); ++i)
         index.emplace(packed(texture.coords[4 * i + 1], texture.coords[4 * i + 2], texture.coords[4 * i + 3]),
                       i);
-    std::vector<uint8_t> base(pixels * 3), metal(pixels), rough(pixels), alpha(pixels), missing(pixels, 1);
+    std::vector<uint8_t> base(pixels * 3), material(pixels * 3), missing(pixels, 1);
     std::fprintf(stderr, "Pixal3D bake: %d x %d PBR textures\n", size, size);
 #pragma omp parallel for schedule(dynamic, 256)
     for (size_t id = 0; id < pixels; ++id) {
@@ -274,19 +287,14 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
             color[c] = uint8_t(std::clamp(attr[c] / std::max(sum, 1e-12f) * 255, 0.f, 255.f));
         for (int c = 0; c < 3; ++c)
             base[id * 3 + c] = color[c];
-        metal[id] = color[3];
-        rough[id] = color[4];
-        alpha[id] = color[5];
+        material[id * 3] = color[3];
+        material[id * 3 + 1] = color[4];
+        material[id * 3 + 2] = color[5];
     }
     mark("bake");
-    std::vector<uint8_t> material(pixels * 3);
-    for (size_t i = 0; i < pixels; ++i) {
-        material[3 * i] = metal[i];
-        material[3 * i + 1] = rough[i];
-        material[3 * i + 2] = alpha[i];
-    }
     // The two Telea solves share only the immutable missing-pixel mask.
     // Execute them concurrently without changing either numerical path.
+    detail = std::chrono::steady_clock::now();
 #pragma omp parallel sections num_threads(2)
     {
 #pragma omp section
@@ -294,18 +302,15 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
 #pragma omp section
         inpaint(material, 3, missing, size, 1);
     }
-    for (size_t i = 0; i < pixels; ++i) {
-        metal[i] = material[3 * i];
-        rough[i] = material[3 * i + 1];
-        alpha[i] = material[3 * i + 2];
-    }
+    record("inpaint_solve", detail);
     mark("inpaint");
+    detail = std::chrono::steady_clock::now();
     std::vector<uint8_t> rgba(pixels * 4), mr(pixels * 3);
     for (size_t i = 0; i < pixels; ++i) {
         std::copy_n(base.data() + i * 3, 3, rgba.data() + i * 4);
-        rgba[i * 4 + 3] = alpha[i];
-        mr[i * 3 + 1] = rough[i];
-        mr[i * 3 + 2] = metal[i];
+        rgba[i * 4 + 3] = material[i * 3 + 2];
+        mr[i * 3 + 1] = material[i * 3 + 1];
+        mr[i * 3 + 2] = material[i * 3];
     }
     // Combined o_voxel GLB and Pixal3D rotations: (x,y,z) -> (-x,y,-z).
     // Trimesh flips V on export, cancelling o_voxel's preceding V flip.
@@ -324,5 +329,6 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
     result.vertex_count = int(vertices.size() / 3);
     result.triangle_count = int(faces.size() / 3);
     result.texture_size = size;
+    record("result_pack", detail);
 }
 } // namespace px
