@@ -162,7 +162,10 @@ multi-node token and performance gates have not run yet.
    validated; metadata plans cover ranks 0--3. On a four-node allocation, build
    the compact stage and sidecar locally on ranks 1--3, run
    `qwen38_kquant_check` on every rank, and record validation time plus
-   `MemAvailable`. Do not copy rank 0's `/local` files between nodes.
+   `MemAvailable`. Do not copy rank 0's `/local` files between nodes. The full
+   gate is scripted by `a64fx/llm/pjsub_qwen38_q4_kquant_tp4.sh`; submit it from
+   a login node with `pjsub --no-check-directory` because the current one-node
+   compute allocation cannot request additional nodes.
 
 2. **Run the integrated smoke test on TP4.** Use the explicit
    `--kquant-stage` argument with all four local compact/sidecar pairs. Confirm
@@ -232,7 +235,8 @@ fallback votes, decode-only activation, and persistent eight-row ownership are
 implemented. Real rank 0 is built and hash-validated; metadata plans cover all
 four symmetric TP4 ranks. Revalidate the focused tests, then continue at the
 first unfinished item: physically stage and check ranks 1--3 in a four-node
-allocation, then run the integrated TP4 smoke test.
+allocation by submitting `a64fx/llm/pjsub_qwen38_q4_kquant_tp4.sh` from a
+Fugaku login node. That job also runs the integrated TP4 smoke test.
 
 Do not create a full single-node additive cache. Plan real per-rank memory
 before conversion, use bounded I/O and /local/u14346/codex-research, preserve

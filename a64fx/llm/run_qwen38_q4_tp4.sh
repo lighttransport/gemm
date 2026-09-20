@@ -11,6 +11,7 @@ case "$TP_SIZE" in 2|4) ;; *) echo "Q4 TP_SIZE must be 2 or 4" >&2; exit 2 ;; es
 NEXTN_SUFFIX=
 if [ "${TP_NEXTN_SHARD:-0}" != 0 ]; then NEXTN_SUFFIX=-nextnshard; fi
 STAGE=${TP_STAGE_DIR:-/local/u14346/qwen38-q4-tp${TP_SIZE}${NEXTN_SUFFIX}}
+KQUANT_STAGE=${TP_KQUANT_STAGE_DIR:-}
 
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:/usr/local/bin:/usr/bin:/bin"
 export TP_STAGE_DIR=$STAGE PJM_MPI_PROC=$TP_SIZE
@@ -37,6 +38,22 @@ case "$MODE" in
         make qwen38_tp_stage CC=fcc OPENMP=1
         if [ "$MODE" = plan ]; then export Q38TP_PLAN=1; fi
         exec mpiexec -np "$TP_SIZE" ./build/qwen38_tp_stage "$MODEL" "$STAGE"
+        ;;
+    kquant-plan|kquant-stage)
+        make qwen38_kquant_stage CC=fcc OPENMP=1
+        if [ -z "$KQUANT_STAGE" ]; then KQUANT_STAGE=${STAGE}-kquant; fi
+        if [ "$MODE" = kquant-plan ]; then
+            exec mpiexec -np "$TP_SIZE" ./build/qwen38_kquant_stage \
+                --plan "$STAGE" "$KQUANT_STAGE"
+        fi
+        exec mpiexec -np "$TP_SIZE" ./build/qwen38_kquant_stage \
+            "$STAGE" "$KQUANT_STAGE"
+        ;;
+    kquant-check)
+        make qwen38_kquant_check CC=fcc OPENMP=1
+        if [ -z "$KQUANT_STAGE" ]; then KQUANT_STAGE=${STAGE}-kquant; fi
+        exec mpiexec -np "$TP_SIZE" ./build/qwen38_kquant_check \
+            "$STAGE" "$KQUANT_STAGE"
         ;;
     check|bench|mtp-check|mtp-bench|profile)
         if [ "$MODE" = profile ]; then
@@ -70,10 +87,14 @@ case "$MODE" in
         esac
         export TP_MAXSEQ=${TP_MAXSEQ:-512}
         rm -f tp_run_*.txt tp_load_rank*.txt tp_perf_rank*.txt tp_stderr_rank*.txt tp_tokens_rank00.txt
-        exec mpiexec -np "$TP_SIZE" "$RUNNER" "$MODEL"
+        runner_args=("$MODEL")
+        if [ -n "$KQUANT_STAGE" ]; then
+            runner_args+=(--kquant-stage "$KQUANT_STAGE")
+        fi
+        exec mpiexec -np "$TP_SIZE" "$RUNNER" "${runner_args[@]}"
         ;;
     *)
-        echo "usage: TP_SIZE={2|4} $0 {plan|stage|check|bench|mtp-check|mtp-bench|profile}" >&2
+        echo "usage: TP_SIZE={2|4} $0 {plan|stage|kquant-plan|kquant-stage|kquant-check|check|bench|mtp-check|mtp-bench|profile}" >&2
         exit 2
         ;;
 esac

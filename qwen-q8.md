@@ -3499,3 +3499,19 @@ acceptance is still pending: ranks 1--3 must be built and checked on their own
 `/local` files, followed by compact/cache A/B runs with exact 128- and
 256-token greedy hashes and clean-node load, memory, bandwidth, and tok/s
 measurements. The runtime path is therefore integrated but not yet promoted.
+
+The complete remaining gate is scripted in
+`a64fx/llm/pjsub_qwen38_q4_kquant_tp4.sh`. Submit it from a Fugaku login node:
+
+```sh
+pjsub --no-check-directory a64fx/llm/pjsub_qwen38_q4_kquant_tp4.sh
+```
+
+The job requests four nodes, builds each node's compact and sidecar files
+directly under its own `/local`, validates all four payloads, records
+`MemAvailable` at each phase, and runs adjacent compact/cached 128- and
+256-token decodes. It fails unless both token files compare byte-for-byte and
+writes small logs and hashes under `tmp/qwen38_q4_kquant_tp4_$PJM_JOBID`.
+`run_qwen38_q4_tp4.sh` also exposes `kquant-plan`, `kquant-stage`, and
+`kquant-check`; setting `TP_KQUANT_STAGE_DIR` on a decode mode is translated
+to the runner's explicit `--kquant-stage` argument.
