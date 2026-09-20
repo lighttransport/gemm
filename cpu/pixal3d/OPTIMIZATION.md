@@ -77,7 +77,13 @@ byte-identical (`6d8c267b...11a8b7`), and the GLB validator passed. Texture
 baking is already a small part of total postprocessing. Running the independent
 base-color and packed material Telea solves concurrently reduced the measured
 inpaint phase from 21.6 s to 17.2 s on the same CSR build; output remained
-byte-identical. Reproduce with:
+byte-identical. Boundary-loop discovery now stores its only relevant case,
+two sorted neighbors per vertex, inline and uses byte visitation instead of
+per-vertex vectors plus a hash set. For the 2.9-million-vertex extracted mesh,
+adjacency container storage falls from about 70 MB plus heap allocations to
+about 26 MB. A full replay completed in 92.6 s and retained the byte-identical
+`6d8c267b...11a8b7` GLB; the combined hole-fill/BVH phase measured 17.8 s.
+Reproduce with:
 
 ```sh
 ref/pixal3d/run.sh cpu ref/pixal3d/replay_postprocess.py \

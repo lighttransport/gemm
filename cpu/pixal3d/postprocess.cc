@@ -1,11 +1,11 @@
 #include "../../common/safetensors_writer.h"
 #include "../../common/trellis2_fdg_mesh.h"
 #include "mesh.hh"
+#include <array>
 #include <filesystem>
 #include <opencv2/photo.hpp>
 #include <parallel/algorithm>
 #include <unordered_map>
-#include <unordered_set>
 
 void px_opencv_inpaint(cv::InputArray, cv::InputArray, cv::OutputArray, double, int);
 
@@ -24,34 +24,43 @@ void fill_holes(Mesh &m) {
             edges.push_back((uint64_t(a) << 32) | uint32_t(b));
         }
     __gnu_parallel::sort(edges.begin(), edges.end());
-    std::vector<std::vector<int>> adjacency(m.numV());
+    // Only degree-two boundary vertices can participate in a fill loop. Keep
+    // their first two sorted neighbors inline and saturate the degree count;
+    // this preserves traversal order without hundreds of thousands of tiny
+    // vector allocations on a full-resolution mesh.
+    std::vector<std::array<int, 2>> adjacency(m.numV());
+    std::vector<uint8_t> degree(m.numV());
     for (size_t i = 0; i < edges.size();) {
         size_t j = i + 1;
         while (j < edges.size() && edges[j] == edges[i])
             ++j;
         if (j == i + 1) {
             int a = int(edges[i] >> 32), b = uint32_t(edges[i]);
-            adjacency[a].push_back(b);
-            adjacency[b].push_back(a);
+            if (degree[a] < 2)
+                adjacency[a][degree[a]] = b;
+            if (degree[b] < 2)
+                adjacency[b][degree[b]] = a;
+            degree[a] = std::min<int>(3, degree[a] + 1);
+            degree[b] = std::min<int>(3, degree[b] + 1);
         }
         i = j;
     }
     edges.clear();
     edges.shrink_to_fit();
-    std::unordered_set<int> visited;
+    std::vector<uint8_t> visited(m.numV());
     for (size_t start_index = 0; start_index < adjacency.size(); ++start_index) {
         int start = int(start_index);
-        if (visited.count(start) || adjacency[start].size() != 2)
+        if (visited[start] || degree[start] != 2)
             continue;
         std::vector<int> loop;
         int last = -1, current = start;
         bool valid = true;
         do {
-            if (visited.count(current) || adjacency[current].size() != 2) {
+            if (visited[current] || degree[current] != 2) {
                 valid = false;
                 break;
             }
-            visited.insert(current);
+            visited[current] = 1;
             loop.push_back(current);
             const auto &next = adjacency[current];
             int id = next[0] == last ? next[1] : next[0];
