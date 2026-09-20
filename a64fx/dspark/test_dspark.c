@@ -63,4 +63,28 @@ static void test_state(void){
     if(s){s->cursor=3;check(dspark_state_truncate(s,2)==0&&dspark_state_context_tokens(s)==2,"state truncate");check(dspark_state_truncate(s,3)==DSPARK_EINVAL,"truncate rejects growth");dspark_state_reset(s);check(dspark_state_context_tokens(s)==0,"state reset");dspark_state_free(s);}
 }
 
-int main(void){test_formats();test_gemm();test_norm_rope();test_nvfp4();test_state();printf("dspark tests: %s\n",failures?"FAIL":"PASS");return failures?1:0;}
+#if defined(__ARM_FEATURE_SVE)
+static uint32_t long_rng=7;
+static float long_value(void){long_rng=long_rng*1664525u+1013904223u;return (float)((int)(long_rng>>16)-32768)/65536.0f;}
+
+static int close_arrays(const float*a,const float*b,size_t n,double limit,double*rel_out,double*max_out){
+    double se=0,sr=0,mx=0,mr=0;for(size_t i=0;i<n;i++){double e=(double)a[i]-b[i];se+=e*e;sr+=(double)b[i]*b[i];if(fabs(e)>mx)mx=fabs(e);if(fabs(b[i])>mr)mr=fabs(b[i]);}
+    *rel_out=sqrt(se/(sr+1e-300));*max_out=mx/fmax(1.0,mr);return *rel_out<=limit&&*max_out<=limit*5;
+}
+
+static void test_long_k(void){
+    const size_t rows=9,k=5120,mrows=7;dspark_model m={0};m.threads=4;
+    uint16_t*w=malloc(rows*k*2);float*x=malloc(mrows*k*4),*scalar=malloc(mrows*rows*4),*sve=malloc(mrows*rows*4);
+    for(size_t i=0;i<rows*k;i++)w[i]=ds_f32_to_bf16(long_value());for(size_t i=0;i<mrows*k;i++)x[i]=long_value();
+    m.backend=DSPARK_BACKEND_SCALAR;ds_gemm_bf16(&m,w,rows,k,x,mrows,scalar);m.backend=DSPARK_BACKEND_SVE;ds_gemm_bf16(&m,w,rows,k,x,mrows,sve);
+    double rel,mx;int ok=close_arrays(sve,scalar,mrows*rows,2e-5,&rel,&mx);printf("long-K GEMM rel_l2=%g scaled_max=%g\n",rel,mx);check(ok,"long-K BF16 scalar/SVE");
+    float ds=ds_dot_bf16(x,w,k,DSPARK_BACKEND_SCALAR),dv=ds_dot_bf16(x,w,k,DSPARK_BACKEND_SVE);check(fabsf(ds-dv)<=2e-5f*fmaxf(1.0f,fabsf(ds)),"long-K dot scalar/SVE");
+    free(sve);free(scalar);free(x);free(w);
+}
+#endif
+
+int main(void){test_formats();test_gemm();test_norm_rope();test_nvfp4();test_state();
+#if defined(__ARM_FEATURE_SVE)
+    test_long_k();
+#endif
+    printf("dspark tests: %s\n",failures?"FAIL":"PASS");return failures?1:0;}

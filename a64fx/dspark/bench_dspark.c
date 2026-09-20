@@ -20,9 +20,9 @@ int main(int argc,char**argv){
         t0=now_sec();rc=dspark_state_propose(s,42,&sve,err,sizeof(err));double ts=now_sec()-t0;
         if(rc)break;
         m->backend=DSPARK_BACKEND_SCALAR;t0=now_sec();rc=dspark_state_propose(s,42,&scalar,err,sizeof(err));double tc=now_sec()-t0;
-        int match=1;float max_conf=0;for(int i=0;i<7;i++){if(sve.token_ids[i]!=scalar.token_ids[i])match=0;float e=fabsf(sve.confidence[i]-scalar.confidence[i]);if(e>max_conf)max_conf=e;}
-        printf("DSPARK_BENCH threads=%d sve_ms=%.3f scalar_ms=%.3f speedup=%.3f token_match=%d max_conf_diff=%g\n",teams[ti],ts*1e3,tc*1e3,tc/ts,match,max_conf);
-        if(!match||max_conf>2e-3f)rc=DSPARK_EFORMAT;
+        int match=1;float max_conf=0,max_logit_rel=0;for(int i=0;i<7;i++){if(sve.token_ids[i]!=scalar.token_ids[i])match=0;float e=fabsf(sve.confidence[i]-scalar.confidence[i]);if(e>max_conf)max_conf=e;e=fabsf(sve.selected_logits[i]-scalar.selected_logits[i])/fmaxf(1.0f,fabsf(scalar.selected_logits[i]));if(e>max_logit_rel)max_logit_rel=e;}
+        printf("DSPARK_BENCH threads=%d sve_ms=%.3f scalar_ms=%.3f speedup=%.3f token_match=%d max_conf_diff=%g max_logit_rel=%g\n",teams[ti],ts*1e3,tc*1e3,tc/ts,match,max_conf,max_logit_rel);
+        if(!match||max_conf>2e-4f||max_logit_rel>5e-4f)rc=DSPARK_EFORMAT;
     }
     for(int j=0;j<5;j++)free(tap[j]);
     dspark_state_free(s);dspark_model_free(m);return rc?1:0;

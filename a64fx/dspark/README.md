@@ -101,3 +101,18 @@ OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
 The dominant SVE kernels are width-1-through-8 BF16 GEMM, GQA attention, and
 a width-seven NVFP4 output-panel kernel. The width-seven paths stream each
 weight matrix once rather than decomposing the proposal into 4+2+1 passes.
+
+The validated two-chain FP32 accumulation path measured on the current A64FX
+node with one accepted context row as follows:
+
+| Threads | SVE proposal | Scalar proposal | Speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 1746.9 ms | 96160.3 ms | 55.05x |
+| 12 | 204.2 ms | 8083.5 ms | 39.59x |
+| 48 | 69.4 ms | 2074.2 ms | 29.87x |
+
+All seven token IDs matched. Maximum confidence difference was `1.24037e-4`
+and maximum selected-logit relative difference was `4.05867e-4`. The
+benchmark treats `2e-4` confidence error and `5e-4` selected-logit relative
+error as failures. A production-length synthetic BF16 GEMM additionally
+measured `1.45e-6` relative L2 and `2.30e-6` scaled maximum error.

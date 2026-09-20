@@ -71,8 +71,24 @@ static void ds_gemm_bf16_sve(const uint16_t *w, size_t rows, size_t cols,
         const uint16_t *wr = w + r * cols;
         svfloat32_t a0=svdup_f32(0),a1=svdup_f32(0),a2=svdup_f32(0),a3=svdup_f32(0);
         svfloat32_t a4=svdup_f32(0),a5=svdup_f32(0),a6=svdup_f32(0),a7=svdup_f32(0);
+        svfloat32_t b0=svdup_f32(0),b1=svdup_f32(0),b2=svdup_f32(0),b3=svdup_f32(0);
+        svfloat32_t b4=svdup_f32(0),b5=svdup_f32(0),b6=svdup_f32(0),b7=svdup_f32(0);
         size_t vl = svcntw();
-        for (size_t k = 0; k < cols; k += vl) {
+        size_t k = 0;
+        for (; k + vl < cols; k += 2 * vl) {
+            svbool_t pg = svwhilelt_b32(k, cols);
+            svbool_t pg1 = svwhilelt_b32(k + vl, cols);
+            svfloat32_t wa = ds_load_bf16_lo(pg, wr + k);
+            svfloat32_t wb = ds_load_bf16_lo(pg1, wr + k + vl);
+            #define DS_FMA2(A,B,I) do { if (m > (I)) { \
+                (A)=svmla_f32_m(pg,(A),wa,svld1_f32(pg,x+(size_t)(I)*cols+k)); \
+                (B)=svmla_f32_m(pg1,(B),wb,svld1_f32(pg1,x+(size_t)(I)*cols+k+vl)); \
+            } } while (0)
+            DS_FMA2(a0,b0,0); DS_FMA2(a1,b1,1); DS_FMA2(a2,b2,2); DS_FMA2(a3,b3,3);
+            DS_FMA2(a4,b4,4); DS_FMA2(a5,b5,5); DS_FMA2(a6,b6,6); DS_FMA2(a7,b7,7);
+            #undef DS_FMA2
+        }
+        if (k < cols) {
             svbool_t pg = svwhilelt_b32(k, cols);
             svfloat32_t vw = ds_load_bf16_lo(pg, wr + k);
             #define DS_FMA(A,I) do { if (m > (I)) (A)=svmla_f32_m(pg,(A),vw,svld1_f32(pg,x+(size_t)(I)*cols+k)); } while (0)
@@ -81,10 +97,10 @@ static void ds_gemm_bf16_sve(const uint16_t *w, size_t rows, size_t cols,
             #undef DS_FMA
         }
         svbool_t all=svptrue_b32();
-        if(m>0)y[r]=svaddv_f32(all,a0); if(m>1)y[rows+r]=svaddv_f32(all,a1);
-        if(m>2)y[2*rows+r]=svaddv_f32(all,a2); if(m>3)y[3*rows+r]=svaddv_f32(all,a3);
-        if(m>4)y[4*rows+r]=svaddv_f32(all,a4); if(m>5)y[5*rows+r]=svaddv_f32(all,a5);
-        if(m>6)y[6*rows+r]=svaddv_f32(all,a6); if(m>7)y[7*rows+r]=svaddv_f32(all,a7);
+        if(m>0)y[r]=svaddv_f32(all,svadd_f32_x(all,a0,b0)); if(m>1)y[rows+r]=svaddv_f32(all,svadd_f32_x(all,a1,b1));
+        if(m>2)y[2*rows+r]=svaddv_f32(all,svadd_f32_x(all,a2,b2)); if(m>3)y[3*rows+r]=svaddv_f32(all,svadd_f32_x(all,a3,b3));
+        if(m>4)y[4*rows+r]=svaddv_f32(all,svadd_f32_x(all,a4,b4)); if(m>5)y[5*rows+r]=svaddv_f32(all,svadd_f32_x(all,a5,b5));
+        if(m>6)y[6*rows+r]=svaddv_f32(all,svadd_f32_x(all,a6,b6)); if(m>7)y[7*rows+r]=svaddv_f32(all,svadd_f32_x(all,a7,b7));
     }
 }
 #endif
@@ -163,14 +179,21 @@ float ds_dot_bf16(const float *x, const uint16_t *y, size_t n,
                   dspark_backend backend) {
 #if defined(__ARM_FEATURE_SVE)
     if (backend == DSPARK_BACKEND_SVE) {
-        svfloat32_t sum = svdup_f32(0.0f);
+        svfloat32_t sum0 = svdup_f32(0.0f), sum1 = svdup_f32(0.0f);
         size_t vl = svcntw();
-        for (size_t i = 0; i < n; i += vl) {
+        size_t i = 0;
+        for (; i + vl < n; i += 2 * vl) {
             svbool_t pg = svwhilelt_b32(i, n);
-            sum = svmla_f32_m(pg, sum, svld1_f32(pg, x + i),
-                              ds_load_bf16_lo(pg, y + i));
+            svbool_t pg1 = svwhilelt_b32(i + vl, n);
+            sum0 = svmla_f32_m(pg, sum0, svld1_f32(pg, x + i), ds_load_bf16_lo(pg, y + i));
+            sum1 = svmla_f32_m(pg1, sum1, svld1_f32(pg1, x + i + vl), ds_load_bf16_lo(pg1, y + i + vl));
         }
-        return svaddv_f32(svptrue_b32(), sum);
+        if (i < n) {
+            svbool_t pg = svwhilelt_b32(i, n);
+            sum0=svmla_f32_m(pg,sum0,svld1_f32(pg,x+i),ds_load_bf16_lo(pg,y+i));
+        }
+        svbool_t all=svptrue_b32();
+        return svaddv_f32(all,svadd_f32_x(all,sum0,sum1));
     }
 #else
     (void)backend;
@@ -236,6 +259,8 @@ static void ds_nvfp4_gemm7_sve(const ds_nvfp4_matrix *w, const float *x,
         svfloat32_t tab=svld1_f32(pg,ds_fp4_table);
         svfloat32_t z0=svdup_f32(0),z1=svdup_f32(0),z2=svdup_f32(0),z3=svdup_f32(0);
         svfloat32_t z4=svdup_f32(0),z5=svdup_f32(0),z6=svdup_f32(0);
+        svfloat32_t u0=svdup_f32(0),u1=svdup_f32(0),u2=svdup_f32(0),u3=svdup_f32(0);
+        svfloat32_t u4=svdup_f32(0),u5=svdup_f32(0),u6=svdup_f32(0);
         for(size_t g=0;g<w->groups;++g){
             const uint8_t*sp=w->scales+(p*w->groups+g)*16;
             svuint32_t si=svld1ub_u32(pg,sp);
@@ -246,15 +271,15 @@ static void ds_nvfp4_gemm7_sve(const ds_nvfp4_matrix *w, const float *x,
                 svfloat32_t b=svmul_f32_x(pg,svtbl_f32(tab,svlsr_n_u32_x(pg,raw,4)),scale);
                 size_t k=g*16+q*2;
                 #define DS_NV_ROW(Z,R) do { (Z)=svmla_n_f32_x(pg,(Z),a,x[(R)*w->k+k]); (Z)=svmla_n_f32_x(pg,(Z),b,x[(R)*w->k+k+1]); } while(0)
-                DS_NV_ROW(z0,0);DS_NV_ROW(z1,1);DS_NV_ROW(z2,2);DS_NV_ROW(z3,3);
-                DS_NV_ROW(z4,4);DS_NV_ROW(z5,5);DS_NV_ROW(z6,6);
+                if(q&1){DS_NV_ROW(u0,0);DS_NV_ROW(u1,1);DS_NV_ROW(u2,2);DS_NV_ROW(u3,3);DS_NV_ROW(u4,4);DS_NV_ROW(u5,5);DS_NV_ROW(u6,6);}
+                else{DS_NV_ROW(z0,0);DS_NV_ROW(z1,1);DS_NV_ROW(z2,2);DS_NV_ROW(z3,3);DS_NV_ROW(z4,4);DS_NV_ROW(z5,5);DS_NV_ROW(z6,6);}
                 #undef DS_NV_ROW
             }
         }
-        svst1_f32(pg,y+0*w->n+p*16,z0);svst1_f32(pg,y+1*w->n+p*16,z1);
-        svst1_f32(pg,y+2*w->n+p*16,z2);svst1_f32(pg,y+3*w->n+p*16,z3);
-        svst1_f32(pg,y+4*w->n+p*16,z4);svst1_f32(pg,y+5*w->n+p*16,z5);
-        svst1_f32(pg,y+6*w->n+p*16,z6);
+        svst1_f32(pg,y+0*w->n+p*16,svadd_f32_x(pg,z0,u0));svst1_f32(pg,y+1*w->n+p*16,svadd_f32_x(pg,z1,u1));
+        svst1_f32(pg,y+2*w->n+p*16,svadd_f32_x(pg,z2,u2));svst1_f32(pg,y+3*w->n+p*16,svadd_f32_x(pg,z3,u3));
+        svst1_f32(pg,y+4*w->n+p*16,svadd_f32_x(pg,z4,u4));svst1_f32(pg,y+5*w->n+p*16,svadd_f32_x(pg,z5,u5));
+        svst1_f32(pg,y+6*w->n+p*16,svadd_f32_x(pg,z6,u6));
     }
 }
 #endif
