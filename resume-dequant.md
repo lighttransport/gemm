@@ -144,8 +144,9 @@ validated sidecar path materializes and attaches only exact IQ4R entries.
 ## Constraints and safety rules
 
 - Read `AGENTS.md` and this entire file before changing code.
-- Use `/local/u14346/codex-research` for compiler scratch and temporary staged
-  test data. Never use `/tmp`.
+- On the current native A64FX node, work directly in this Git checkout. Use
+  repository-local `tmp/` only for disposable compiler scratch or synthetic
+  stage data; do not redirect this work through `/local` or `/tmp`.
 - Never `cat` or make an interactive full copy of a multi-gigabyte model.
   Keep model and stage access lazy or bounded, use positioned/chunked I/O, and
   discard page cache as work progresses.
@@ -163,6 +164,44 @@ validated sidecar path materializes and attaches only exact IQ4R entries.
   those changes.
 
 ## Remaining work, in order
+
+### Work that remains possible on one node
+
+1. **Sweep every real IQ4_XS tensor through the promoted IQ4R kernel.** Use
+   the real model metadata to cover all 65 eligible tensors, including shape
+   tails, and compare against compact A8 for exact output on wave, sparse,
+   high-dynamic-range, and deterministic-random inputs. Record the slowest
+   tensor and aggregate compact/IQ4R time and effective bandwidth. The four
+   layer-0 pattern checks are evidence for one shape, not yet a model-wide
+   sweep.
+
+2. **Finish single-rank loader and fallback fault injection.** On a bounded
+   synthetic stage under repository-local `tmp/`, exercise missing, truncated,
+   corrupt-header, corrupt-table, corrupt-payload, wrong-source, and unsupported
+   entry cases. Confirm strict rejection, zero attachment, unchanged compact
+   dispatch, and no partially resident cache payload. The cross-rank vote still
+   requires TP4, but its local inputs can be fully tested here.
+
+3. **Measure bounded IQ4-only preparation and residency.** Record validation,
+   anonymous materialization, and detach time; resident bytes; page-cache
+   behavior; and `MemAvailable` before/peak/steady state for a representative
+   rank or bounded tensor set. Confirm the default prepares exactly IQ4R and
+   leaves skipped Q5R payload pages untouched.
+
+4. **Re-run the focused native build and tests.** Build the cache benchmark,
+   cache test, stage builder/test, checker, and runner with `fcc`; run the
+   synthetic tests and the real single-tensor benchmark from this checkout.
+   Preserve `common/transformer.h` and every unrelated dirty file.
+
+5. **Consolidate single-node evidence.** Add commands, exact-output results,
+   timings, bandwidth, and memory observations to `qwen-q8.md`. Run
+   `git diff --check` and commit only the focused files. Do not push.
+
+The exact 128/256-token TP4 hash gate, an injected all-rank fallback vote, and
+clean four-rank throughput remain inherently multi-node and are listed below;
+they cannot be accepted from a single-node run.
+
+### Work that still requires four nodes
 
 1. **Run the IQ4-only correctness gate on TP4.** Re-run
    `a64fx/llm/pjsub_qwen38_q4_kquant_tp4.sh` on four clean nodes. The updated
@@ -189,8 +228,8 @@ validated sidecar path materializes and attaches only exact IQ4R entries.
 ## Revalidation commands
 
 ```sh
-mkdir -p /local/u14346/codex-research
-TMPDIR=/local/u14346/codex-research \
+mkdir -p tmp/dequant
+TMPDIR="$PWD/tmp/dequant" \
   make -B -C a64fx/llm \
   qwen38_kquant_bench qwen38_kquant_test \
   qwen38_kquant_stage qwen38_kquant_stage_test qwen38_kquant_check \
@@ -202,12 +241,12 @@ OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
 OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
   ./a64fx/llm/build/test_qwen38_kquant_stage \
   ./a64fx/llm/build/qwen38_kquant_stage \
-  /local/u14346/codex-research/kquant-stage-test
+  "$PWD/tmp/dequant/kquant-stage-test"
 
 Q38TP_RANK=0 Q38TP_SIZE=4 \
   ./a64fx/llm/build/qwen38_kquant_check \
-  /local/u14346/codex-research/qwen38-q4-tp4 \
-  /local/u14346/codex-research/qwen38-q4-tp4-kquant
+  /path/to/qwen38-q4-tp4 \
+  /path/to/qwen38-q4-tp4-kquant
 
 OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
   numactl --interleave=all ./a64fx/llm/build/bench_qwen38_kquants \
@@ -220,8 +259,8 @@ rank count only after verifying them:
 
 ```sh
 Q38TP_RANK=0 Q38TP_SIZE=4 ./a64fx/llm/build/qwen38_kquant_stage \
-  --plan /local/u14346/ACTUAL_COMPACT_STAGE \
-  /local/u14346/ACTUAL_KQUANT_STAGE
+  --plan /path/to/ACTUAL_COMPACT_STAGE \
+  /path/to/ACTUAL_KQUANT_STAGE
 ```
 
 ## Resume prompt
@@ -243,7 +282,7 @@ four-node allocation and record its `prepared 65 tensors`/`decode attach OK
 entries=65` diagnostics, memory, load time, and throughput.
 
 Do not create a full single-node additive cache. Plan real per-rank memory
-before conversion, use bounded I/O and /local/u14346/codex-research, preserve
+before conversion, use bounded I/O and repository-local tmp/ scratch, preserve
 compact prefill/fallback, and verify the `prepared`/post-prefill `decode attach
 OK` diagnostics on every rank. common/transformer.h may retain unrelated user
 edits, so never overwrite or stage them. Require exact 128/256-token compact
