@@ -158,10 +158,10 @@ The tested sidecar is
 
 The short-context K=7 response emits 46 tokens in 604.00 ms, clearing the
 60 tok/s target with about 21 percent wall-time headroom.  DFlash also clears
-40 tok/s after a real random-token 64K prefix.  Ordinary one-token decode is
-still about 29.13 tok/s at 64K, so work that helps both ordinary and verifier
-execution remains useful.  The following order reflects the remaining
-measured costs.
+40 tok/s after a real random-token 64K prefix. Ordinary one-token decode now
+reaches 32.56 tok/s at 64K with exact three-head K/V reuse, so work that helps
+both ordinary and verifier execution remains useful. The following order
+reflects the remaining measured costs.
 
 1. **Ordinary one-row target projections.**  Fixed-eight Q2_K/IQ projections now share
    decoded weights with lower accumulator pressure, but ordinary decode still

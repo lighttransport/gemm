@@ -8,7 +8,7 @@ depth="${QWEN38_GSQ_64K_DEPTH:-65536}"
 context="${QWEN38_GSQ_64K_CONTEXT:-66560}"
 decode="${QWEN38_GSQ_64K_DECODE:-512}"
 repeats="${QWEN38_GSQ_64K_REPEATS:-3}"
-floor_tps="${QWEN38_GSQ_64K_FLOOR_TPS:-26.5}"
+floor_tps="${QWEN38_GSQ_64K_FLOOR_TPS:-32.0}"
 prefill_floor_tps="${QWEN38_GSQ_64K_PREFILL_FLOOR_TPS:-400.0}"
 
 mkdir -p "${log_dir}"

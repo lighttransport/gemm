@@ -127,7 +127,9 @@ K/V rows on device. Seed one produces prefix hash `90178de69a24a76e`.
 Before the long-prefill WMMA change, the 65,536-token IQ2 prefix took 460.37
 seconds at 142.36 tok/s. Three original ordinary 512-token decode repeats
 sustain 26.92/26.91/26.90 tok/s and share sequence hash
-`b01a17fae16f806d`; the latest retained ordinary result is about 29.13 tok/s.
+`b01a17fae16f806d`. Exact three-head GQA K/V reuse now reaches 32.56 tok/s for
+a 512-token suffix after processing the same prefix at 444.31 tok/s; its hash
+is the retained `051e7338c23a544e`.
 The prior 27.94 tok/s result used zero cache values and is superseded.
 
 The optimized DFlash K=7 path processes the same random prefix in 147.039
@@ -135,14 +137,17 @@ seconds at 445.71 tok/s, then sustains 47.72 tok/s for 256 tokens with suffix
 hash `2ddd068dca63669a`.  Its exact eight-query shared-K/V attention kernel
 takes 3.077 ms per layer at 64K, compared with 8.654 ms for the generic
 verifier at the same eight-split schedule.  DFlash therefore meets the 40
-tok/s random-depth target.  Ordinary decode remains below 40 tok/s; its 64K
-profile assigns about 9.8 ms/token to attention and about 26 ms/token to the
-projection/state path.  Dense NextN still needs a real random-depth rerun.
+tok/s random-depth target. Ordinary decode remains below 40 tok/s. Its exact
+three-head K/V-reuse kernel cuts the 128-split attention operator from about
+606 to 363 microseconds per layer, leaving about 5.8 ms/token in attention and
+25 ms/token in the projection/state path. Dense NextN still needs a real
+random-depth rerun.
 Full results and commands:
 [QWEN38_64K_DECODE.md](rdna4/llm/QWEN38_64K_DECODE.md).
 
-The pinned-kernel differential test passes 46,743,552 bitwise Q8/Q8 values,
-including shared-cache verifier cases and matching split counts at 64K. Fresh
+The pinned-kernel differential test passes 49,188,864 bitwise Q8/Q8 values,
+including the adaptive short/long graph path, three-head K/V reuse,
+shared-cache verifier cases, and matching split counts at 64K. Fresh
 normal-context IQ2 and IQ3
 greedy/sampled C++ outputs remain byte-identical to llama.cpp and pass fixed
 cases plus 10,000 randomized cases. Artifacts:

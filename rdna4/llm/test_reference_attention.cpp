@@ -84,7 +84,8 @@ int main() {
                 }
             }
             if(splits>(padded+127)/128) continue;
-            auto run=[&](bool reference, bool gqa3=false, bool reuse8=false) {
+            auto run=[&](bool reference, bool gqa3=false, bool reuse8=false,
+                         bool gqa3_reuse=false, bool adaptive=false) {
                 if(reference) {
                     if(queries==1) flash_attn_ext_vec<256,1,GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,false><<<dim3(1,splits,heads),dim3(32,4)>>>(
                         (char *)dq,(char *)drk,(char *)drv,(char *)dm,nullptr,nullptr,splits==1?ref:rp,rm,
@@ -100,11 +101,22 @@ int main() {
                 } else {
                     int force=queries==1?requested:splits;
                     dim3 grid = queries==1 ?
-                        dim3((gqa3?2*kv_heads:heads)*(force?splits:128),1,1) :
+                        dim3((gqa3||gqa3_reuse||adaptive?2*kv_heads:heads)*
+                             (force?splits:128),1,1) :
                         dim3(reuse8?1:queries,force?splits:128,heads);
-                    if(gqa3) qwen35_attention_q8_decode_gqa3<<<grid,dim3(32,12)>>>(
+                    if(adaptive) {
+                        qwen35_attention_q8_decode_gqa3<<<grid,dim3(32,12)>>>(
                             ours,op,om,dq,dk,dv,dks,dvs,dp,heads,kv_heads,
-                            props.multiProcessorCount,occupancy,force,queries,-1);
+                            props.multiProcessorCount,occupancy,force,queries,-1,1);
+                        qwen35_attention_q8_decode_gqa3_reuse<<<grid,dim3(32,4)>>>(
+                            ours,op,om,dq,dk,dv,dks,dvs,dp,heads,kv_heads,
+                            props.multiProcessorCount,occupancy,force,queries,-1,1);
+                    } else if(gqa3_reuse) qwen35_attention_q8_decode_gqa3_reuse<<<grid,dim3(32,4)>>>(
+                            ours,op,om,dq,dk,dv,dks,dvs,dp,heads,kv_heads,
+                            props.multiProcessorCount,occupancy,force,queries,-1,0);
+                    else if(gqa3) qwen35_attention_q8_decode_gqa3<<<grid,dim3(32,12)>>>(
+                            ours,op,om,dq,dk,dv,dks,dvs,dp,heads,kv_heads,
+                            props.multiProcessorCount,occupancy,force,queries,-1,0);
                     else if(reuse8) qwen35_attention_q8_decode_reuse8<<<grid,dim3(32,4)>>>(
                             ours,op,om,dq,dk,dv,dks,dvs,dp,heads,kv_heads,
                             props.multiProcessorCount,occupancy,force,
@@ -159,6 +171,32 @@ int main() {
                     ++checked;
                 }
                 if(wrong) { fprintf(stderr,"gqa3 mismatches=%zu/%d max=%.9g\n",wrong,output_size,worst);return 1; }
+                run(false,false,false,true);CHECK(hipDeviceSynchronize());
+                CHECK(hipMemcpy(a.data(),ours,output_size*4,hipMemcpyDeviceToHost));
+                wrong=0;worst=0;
+                for(int i=0;i<output_size;++i) {
+                    if(memcmp(&a[i],&b[i],4) || !std::isfinite(a[i])) {
+                        if(wrong++<3) fprintf(stderr,
+                            "gqa3_reuse length=%d splits=%d i=%d ours=%.9g ref=%.9g\n",
+                            length,splits,i,a[i],b[i]);
+                        worst=fmaxf(worst,fabsf(a[i]-b[i]));
+                    }
+                    ++checked;
+                }
+                if(wrong) { fprintf(stderr,"gqa3_reuse mismatches=%zu/%d max=%.9g\n",wrong,output_size,worst);return 1; }
+                run(false,false,false,false,true);CHECK(hipDeviceSynchronize());
+                CHECK(hipMemcpy(a.data(),ours,output_size*4,hipMemcpyDeviceToHost));
+                wrong=0;worst=0;
+                for(int i=0;i<output_size;++i) {
+                    if(memcmp(&a[i],&b[i],4) || !std::isfinite(a[i])) {
+                        if(wrong++<3) fprintf(stderr,
+                            "adaptive length=%d splits=%d i=%d ours=%.9g ref=%.9g\n",
+                            length,splits,i,a[i],b[i]);
+                        worst=fmaxf(worst,fabsf(a[i]-b[i]));
+                    }
+                    ++checked;
+                }
+                if(wrong) { fprintf(stderr,"adaptive mismatches=%zu/%d max=%.9g\n",wrong,output_size,worst);return 1; }
             }
             if(queries==512 && length==4097 && pattern==0 && requested==0) {
                 qwen35_attention_q8_prefill_wmma<<<dim3(heads,(queries+127)/128),512>>>(
@@ -184,15 +222,18 @@ int main() {
                 }
             }
             if(length==65536) {
-                for(int mode=0;mode<2;++mode) {
+                int modes = queries == 1 ? 3 : 2;
+                for(int mode=0;mode<modes;++mode) {
                     hipEvent_t start,stop;CHECK(hipEventCreate(&start));CHECK(hipEventCreate(&stop));
                     CHECK(hipEventRecord(start));
                     for(int i=0;i<20;++i)
-                        run(false,queries==1 && mode==1,queries>1 && mode==1);
+                        run(false,queries==1 && mode==1,queries>1 && mode==1,
+                            queries==1 && mode==2);
                     CHECK(hipEventRecord(stop));CHECK(hipEventSynchronize(stop));
                     float elapsed=0;CHECK(hipEventElapsedTime(&elapsed,start,stop));
                     printf("%s attention length=65536 splits=%d %.3f us\n",
-                           mode==0?"ours":queries==1?"gqa3":"reuse8",
+                           mode==0?"ours":queries==1?
+                               (mode==1?"gqa3":"gqa3_reuse"):"reuse8",
                            splits,elapsed*50);
                     CHECK(hipEventDestroy(start));CHECK(hipEventDestroy(stop));
                 }

@@ -428,9 +428,10 @@ void qwen35_attention_q8_decode_gqa3(float *out, float *parts, float2 *meta,
         const float *q, const signed char *kc, const signed char *vc,
         const float *ks, const float *vs, const int *position,
         int heads, int kv_heads, int nsm, int occupancy, int forced_splits,
-        int queries, int position_start) {
+        int queries, int position_start, int adaptive_long_context) {
     if (queries != 1 || heads != 6 * kv_heads) return;
     int length = position_start < 0 ? position[0] + 1 : position_start + 1;
+    if (adaptive_long_context && length >= 16384) return;
     int splits = forced_splits ? forced_splits :
         q8_attention_splits(length, heads, nsm, occupancy);
     int flat = blockIdx.x, group, split;
@@ -581,6 +582,214 @@ void qwen35_attention_q8_decode_gqa3(float *out, float *parts, float2 *meta,
     }
     if (tid == 0 && splits > 1)
         meta[head * splits + split] = make_float2(next_max, sum);
+}
+
+/* Bitwise-equivalent 3-head GQA kernel with explicit K/V reuse.  Four waves
+ * process the reference kernel's four row stripes for three heads at once.
+ * Each head retains the scalar dot, online-softmax, packed-F16 accumulation,
+ * and reduction order, while every K/V word is loaded only once. */
+extern "C" __global__ __launch_bounds__(128, 1)
+void qwen35_attention_q8_decode_gqa3_reuse(float *out, float *parts,
+        float2 *meta, const float *q, const signed char *kc,
+        const signed char *vc, const float *ks, const float *vs,
+        const int *position, int heads, int kv_heads, int nsm,
+        int occupancy, int forced_splits, int queries,
+        int position_start, int adaptive_long_context) {
+    if (queries != 1 || heads != 6 * kv_heads) return;
+    int length = position_start < 0 ? position[0] + 1 : position_start + 1;
+    if (adaptive_long_context && length < 16384) return;
+    int splits = forced_splits ? forced_splits :
+        q8_attention_splits(length, heads, nsm, occupancy);
+    int flat = blockIdx.x, group, split;
+    if (flat >= 2 * kv_heads * splits) return;
+    if (length >= 16384) {
+        group = flat % (2 * kv_heads);
+        split = flat / (2 * kv_heads);
+    } else {
+        group = flat / splits;
+        split = flat % splits;
+    }
+    int kh = group >> 1, head_base = kh * 6 + (group & 1) * 3;
+    int lane = threadIdx.x, warp = threadIdx.y;
+    int tid = warp * 32 + lane;
+    int stride = kv_heads * 256, scale_stride = kv_heads * 8;
+    __shared__ int qi[3][64];
+    __shared__ float qd[3][8];
+    __shared__ q8_half probabilities[3][1024];
+    __shared__ float maxima[3][32], sums_shared[3][32];
+    if (warp < 3) {
+        const float *qh = q + (head_base + warp) * 256;
+        #pragma unroll
+        for (int base = 0; base < 64; base += 32) {
+            float value[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                value[i] = .0625f * qh[4 * (base + lane) + i];
+            float amax = fabsf(value[0]);
+            #pragma unroll
+            for (int i = 1; i < 4; ++i)
+                amax = fmaxf(amax, fabsf(value[i]));
+            #pragma unroll
+            for (int offset = 4; offset; offset >>= 1)
+                amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
+            float d = amax / 127;
+            int packed = 0;
+            signed char *bytes = (signed char *)&packed;
+            if (d != 0.0f) {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    bytes[i] = roundf(value[i] / d);
+            }
+            qi[warp][base + lane] = packed;
+            if (lane % 8 == 0) qd[warp][(base + lane) / 8] = d;
+        }
+    }
+    __syncthreads();
+
+    q8_half2 acc[3][4] = {};
+    float maximum[3], sum[3];
+    #pragma unroll
+    for (int h = 0; h < 3; ++h) {
+        maximum[h] = -3.402823466e+38f / 2;
+        sum[h] = 0.0f;
+    }
+    int padded = (length + 255) / 256 * 256;
+    for (int base = split * 128; base < padded; base += splits * 128) {
+        float score[3] = {};
+        float next_max[3];
+        #pragma unroll
+        for (int h = 0; h < 3; ++h) next_max[h] = maximum[h];
+        #pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            int row = base + warp * 32 + (lane & ~1) + pair;
+            float dot[3] = {};
+            if (row < length) {
+                const int *key = (const int *)(kc +
+                    (size_t)row * stride + kh * 256);
+                const float *key_scale = ks +
+                    (size_t)row * scale_stride + kh * 8;
+                #pragma unroll
+                for (int i = 0; i < 32; ++i) {
+                    int word = 2 * i + lane % 2;
+                    int key_word = key[word];
+                    #pragma unroll
+                    for (int h = 0; h < 3; ++h) {
+                        int product = __builtin_amdgcn_sudot4(
+                            true, key_word, true, qi[h][word], 0, false);
+                        float scale = key_scale[i / 4] * qd[h][i / 4];
+                        dot[h] += scale * (float)product;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int h = 0; h < 3; ++h) {
+                dot[h] += __shfl_xor(dot[h], 1, 32);
+                if (row >= length) dot[h] = -__builtin_inff();
+                next_max[h] = fmaxf(next_max[h], dot[h] + (3.0f * .6931f));
+                if (lane % 2 == pair) score[h] = dot[h];
+            }
+        }
+        #pragma unroll
+        for (int h = 0; h < 3; ++h) {
+            #pragma unroll
+            for (int offset = 2; offset < 32; offset <<= 1)
+                next_max[h] = fmaxf(next_max[h],
+                    __shfl_xor(next_max[h], offset, 32));
+            float rescale = expf(maximum[h] - next_max[h]);
+            maximum[h] = next_max[h];
+            score[h] = expf(score[h] - maximum[h]);
+            sum[h] = sum[h] * rescale + score[h];
+            probabilities[h][tid] = (q8_half)score[h];
+            q8_half2 rescale_h = q8_hsplat(rescale);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                acc[h][i] = q8_hmul(acc[h][i], rescale_h);
+        }
+        __builtin_amdgcn_wave_barrier();
+        #pragma unroll
+        for (int col = 0; col < 32; ++col) {
+            int row = base + warp * 32 + col;
+            #pragma unroll
+            for (int tile = 0; tile < 2; ++tile) {
+                int dim = tile * 128 + lane * 4;
+                q8_half2 v0 = {}, v1 = {};
+                if (row < length) {
+                    const signed char *value = vc +
+                        (size_t)row * stride + kh * 256 + dim;
+                    unsigned int packed = *(const unsigned int *)value;
+                    q8_half2 d = q8_hsplat(vs[
+                        (size_t)row * scale_stride + kh * 8 + dim / 32]);
+                    v0 = q8_hmul(d, q8_hpair((signed char)packed,
+                        (signed char)(packed >> 8)));
+                    v1 = q8_hmul(d, q8_hpair((signed char)(packed >> 16),
+                        (signed char)(packed >> 24)));
+                }
+                #pragma unroll
+                for (int h = 0; h < 3; ++h) {
+                    q8_half2 p = q8_hsplat(
+                        probabilities[h][warp * 32 + col]);
+                    acc[h][2 * tile] = q8_hfma(
+                        v0, p, acc[h][2 * tile]);
+                    acc[h][2 * tile + 1] = q8_hfma(
+                        v1, p, acc[h][2 * tile + 1]);
+                }
+            }
+        }
+    }
+    if (warp == 0) {
+        #pragma unroll
+        for (int h = 0; h < 3; ++h) {
+            maxima[h][lane] = -3.402823466e+38f / 2;
+            sums_shared[h][lane] = 0.0f;
+        }
+    }
+    __syncthreads();
+    if (lane == 0) {
+        #pragma unroll
+        for (int h = 0; h < 3; ++h) maxima[h][warp] = maximum[h];
+    }
+    __syncthreads();
+    float final_max[3];
+    #pragma unroll
+    for (int h = 0; h < 3; ++h) {
+        final_max[h] = maxima[h][lane];
+        #pragma unroll
+        for (int offset = 16; offset; offset >>= 1)
+            final_max[h] = fmaxf(final_max[h],
+                __shfl_xor(final_max[h], offset, 32));
+        float rescale = expf(maximum[h] - final_max[h]);
+        q8_half2 rescale_h = q8_hsplat(rescale);
+        #pragma unroll
+        for (int tile = 0; tile < 2; ++tile) {
+            q8_half2 *p = (q8_half2 *)(probabilities[h] +
+                warp * 256 + tile * 128 + lane * 4);
+            p[0] = q8_hmul(acc[h][2 * tile], rescale_h);
+            p[1] = q8_hmul(acc[h][2 * tile + 1], rescale_h);
+        }
+        sum[h] = q8_attention_sum(sum[h] * rescale);
+        if (lane == 0) sums_shared[h][warp] = sum[h];
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int h = 0; h < 3; ++h) {
+        sum[h] = q8_attention_sum(sums_shared[h][lane]);
+        #pragma unroll
+        for (int base = 0; base < 256; base += 128) {
+            float value = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 4; ++w)
+                value += (float)probabilities[h][w * 256 + base + tid];
+            int head = head_base + h;
+            if (splits == 1)
+                out[head * 256 + base + tid] = value / sum[h];
+            else
+                parts[(head * splits + split) * 256 + base + tid] = value;
+        }
+        if (tid == 0 && splits > 1) {
+            int head = head_base + h;
+            meta[head * splits + split] = make_float2(final_max[h], sum[h]);
+        }
+    }
 }
 
 /* Exact verifier kernel for up to eight adjacent queries. Four waves share

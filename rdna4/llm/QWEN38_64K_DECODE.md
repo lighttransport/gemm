@@ -32,7 +32,7 @@ bash rdna4/llm/run_qwen38_gsq_rocm.sh \
   --decode 512 --bench-ignore-eos --bench-depth 65536 --bench-repeat 3
 ```
 
-The script's default 26.5 tok/s floor is an IQ2 random-depth regression gate,
+The script's default 32.0 tok/s floor is an IQ2 random-depth regression gate,
 not the open 40 tok/s performance goal. For IQ3, set `QWEN38_MODEL` to the
 IQ3_XXS file and choose a floor after recording a full random-depth baseline.
 
@@ -43,9 +43,10 @@ RX 9070 XT / gfx1201 / ROCm 10, Q8 K and Q8 V, greedy sampling:
 | Path | Measured suffix | Decode tok/s | Prefix tok/s | Free VRAM | Sequence hash |
 |---|---:|---:|---:|---:|---|
 | IQ2_XS ordinary, original exact gate | 3 x 512 tokens | 26.92 / 26.91 / 26.90 | 142.36 | 4284 MiB | `b01a17fae16f806d` |
+| IQ2_XS ordinary, exact three-head K/V reuse | 512 tokens | 32.56 | 444.31 | 4282 MiB | `051e7338c23a544e` |
 | IQ2_XS + DFlash2 K=7, optimized | 256 tokens | 47.72 | 445.71 | 1274 MiB | `2ddd068dca63669a` |
 
-Both runs use the same fully processed 65,536-token random prefix with token
+All runs use the same fully processed 65,536-token random prefix with token
 hash `90178de69a24a76e`.  The ordinary row records the original exact gate.  Its
 prefix took 460.37 seconds before long-context WMMA prefill was enabled.  The
 optimized DFlash run processed the prefix in 147.039 seconds, then generated
@@ -53,13 +54,15 @@ optimized DFlash run processed the prefix in 147.039 seconds, then generated
 668.717/4602.977/57.440 ms in draft/verify/commit.  The earlier 27.94 tok/s
 result used zero cache rows and is not comparable.
 
-At 16K and longer, native Q8 attention uses up to 128 splits and submits the
-decode grid in split-major order. This keeps blocks that read the same GQA K/V
-group close in the launch order. On the 64K operator test, 128 splits took
-578.648 microseconds per attention layer; 16, 32, 64, and 256 splits took
-718.924, 637.534, 584.820, and 624.078 microseconds. The runner also avoids
-allocating F16 Q/K/V packing buffers when native Q8/Q8 decode and prefill are
-both selected, recovering about 266 MiB.
+At 16K and longer, native Q8 attention uses an exact three-head GQA kernel.
+Four waves load each K/V row once and update three independent query heads;
+each head retains llama.cpp's dot, online-softmax, packed-F16 accumulation and
+split-combine order. The decode graph records both the short and long kernels,
+which gate themselves from the device position so graph capture at position
+zero cannot freeze the short path. At 64K and 128 splits, the complete
+attention operator fell from about 606 to 363 microseconds per layer. The
+runner also avoids allocating F16 Q/K/V packing buffers when native Q8/Q8
+decode and prefill are both selected, recovering about 266 MiB.
 
 The exact DFlash verifier now evaluates up to eight adjacent causal queries in
 one four-wave block.  Each old K/V row is loaded once, while each query retains
@@ -70,19 +73,20 @@ generic verifier at the same split count.  The DFlash path therefore clears
 the 40 tok/s sustained target without approximating authoritative target
 output.
 
-Ordinary one-token decode remains about 29.13 tok/s in the latest retained
-run, so its 40 tok/s target remains open. A prior trace attributes about
-9.8 ms/token to the 16 attention layers at 64K and about 26 ms/token to the
-projection, SSM, normalization, and output path. Reducing projection weight
-traffic and recurrent-state work is now more useful than attention-only work.
+Ordinary one-token decode now reaches 32.56 tok/s in the latest retained run,
+so its 40 tok/s target remains open. The 16 attention layers now cost about
+5.8 ms/token at 64K; the remaining projection, SSM, normalization and output
+path is about 25 ms/token. Reducing projection weight traffic and recurrent
+state work is now more useful than further attention-only work.
 Dense NextN remains opt-in; its previous 64K result used the removed zero-cache
 setup and must be remeasured before making a random-depth performance claim.
 
 ## Correctness evidence
 
 `make -C rdna4/llm reference-attention-test` compares the runner kernel with
-the pinned llama.cpp HIP kernel. The final run passed 46,743,552 bitwise Q8/Q8
-output comparisons.  It covers the shared-K/V verifier with 2, 7 and 8 queries
+the pinned llama.cpp HIP kernel. The final run passed 49,188,864 bitwise Q8/Q8
+output comparisons. It covers the adaptive ordinary decode graph, the
+three-head K/V-reuse kernel, and the shared-K/V verifier with 2, 7 and 8 queries
 at short context, plus real random-like 64K K/V patterns at 8, 12, 16, 32, 64,
 128 and 256 matching split counts. The full benchmark separately exercises
 real random K/V and recurrent state. The optimized DFlash run retains the
