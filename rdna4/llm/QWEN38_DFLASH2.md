@@ -178,6 +178,14 @@ The tested sidecar is
 `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, SHA-256
 `1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd`.
 
+The ordinary target's recurrent alpha and beta F16 projections now use one
+flattened launch while retaining the exact per-row FMA and XOR-reduction
+order.  In a matched 65-row trace, this replaces 6,144 launches taking 23.102
+ms with 3,072 launches taking 12.492 ms, or about 0.163 ms saved per target
+row.  Zero-depth decode measures 42.83--43.04 tok/s and keeps the pinned
+256-token hash `3c53b75f283cb9b0`.  The profile is under
+`tmp/qwen38/ordinary-decode-profile-f16pair/`.
+
 ## Remaining optimization opportunities
 
 The short-context K=7 response emits 46 tokens in 566.72 ms, clearing the
@@ -211,8 +219,9 @@ reflects the remaining measured costs.
    probabilistic sampling only after every verifier row produces the ordinary
    target logits bitwise and both pinned sampling fixtures still match.
 4. **Hybrid recurrent tail.** Sequential candidate recurrence and rollback
-   checkpoints are already batched and device-local. DeltaNet, state
-   preparation, checkpoint copies, and F16 matrix-vector work remain visible;
+   checkpoints are already batched and device-local. Alpha/beta F16 work now
+   shares one exact launch per recurrent layer. DeltaNet, state preparation,
+   checkpoint copies, and the remaining matrix-vector work remain visible;
    fuse preparation with the recurrence where exact row rollback is retained.
 5. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
    and Q8/Q8 KV storage are now fused exactly. The remaining small launches

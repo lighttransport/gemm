@@ -484,6 +484,42 @@ static const char *hip_kernel_source =
 "    }\n"
 "    if (tid == 0) dst[row] = sumf;\n"
 "}\n"
+"/* Two independent F16 projections over the same activation.  Flattening the\n"
+" * two row grids into one launch preserves matvec_f16_llama_f32's per-row\n"
+" * arithmetic and reduction order while removing one launch from every SSM\n"
+" * decode layer. */\n"
+"__global__ void matvec_f16_llama_pair_f32(float *dst0, float *dst1,\n"
+"        const half_raw *mat0, const half_raw *mat1, const float *x,\n"
+"        int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    float *dst = row < n_rows ? dst0 : dst1;\n"
+"    const half_raw *mat = row < n_rows ? mat0 : mat1;\n"
+"    if (row >= 2 * n_rows) return;\n"
+"    if (row >= n_rows) row -= n_rows;\n"
+"    int tid = threadIdx.x; int ncols2 = n_cols >> 1;\n"
+"    const unsigned int *rp = (const unsigned int *)(mat + (size_t)row * n_cols);\n"
+"    float sumf = 0.0f;\n"
+"    for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {\n"
+"        unsigned int tmpx = rp[col2];\n"
+"        float2 w = __half22float2(*(const __half2 *)&tmpx);\n"
+"        sumf = fmaf(w.x, x[2 * col2], sumf);\n"
+"        sumf = fmaf(w.y, x[2 * col2 + 1], sumf);\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"    __shared__ float buf_iw[32];\n"
+"    if (blockDim.x > 32) {\n"
+"        if (tid < 32) buf_iw[tid] = 0.0f;\n"
+"        __syncthreads();\n"
+"        buf_iw[tid >> 5] = sumf;\n"
+"        __syncthreads();\n"
+"        if (tid < 32) {\n"
+"            sumf = buf_iw[tid];\n"
+"            for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) dst[row] = sumf;\n"
+"}\n"
 "/* Bit-exact port of llama.cpp ggml-cuda/mmvf.cu mul_mat_vec_f for\n"
 " * T=nv_bfloat16, type_acc=float on AMD HIP.  Accumulation uses f32 FMA over\n"
 " * (bf16,bf16) pairs, then an XOR warp reduction and the warp-level block fold\n"
@@ -12920,6 +12956,7 @@ struct hip_llm_runner {
     hipFunction_t fn_rmsnorm_batch_f32;
     hipFunction_t fn_matvec_f16_f32;
     hipFunction_t fn_matvec_f16_llama_f32;
+    hipFunction_t fn_matvec_f16_llama_pair_f32;
     hipFunction_t fn_matvec_bf16_llama_f32;
     hipFunction_t fn_matvec_bf16_f32;
     hipFunction_t fn_qknorm_f32;
@@ -14030,6 +14067,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(rmsnorm_batch_f32);
     GET_FUNC(matvec_f16_f32);
     GET_FUNC(matvec_f16_llama_f32);
+    GET_FUNC(matvec_f16_llama_pair_f32);
     GET_FUNC(matvec_bf16_llama_f32);
     GET_FUNC(matvec_bf16_f32);
     GET_FUNC(qknorm_f32);
@@ -19136,6 +19174,13 @@ static inline void launch_matvec_llama_f16(hip_llm_runner *r, void *dst, void *m
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     LAUNCH(r->fn_matvec_f16_llama_f32, n_rows, 1, 1, 256, 1, 1, 0,
            r->stream, args);
+}
+static inline void launch_matvec_llama_f16_pair(hip_llm_runner *r,
+        void *dst0, void *dst1, void *mat0, void *mat1, void *x,
+        int n_rows, int n_cols) {
+    void *args[] = { &dst0, &dst1, &mat0, &mat1, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_f16_llama_pair_f32, 2 * n_rows, 1, 1,
+           256, 1, 1, 0, r->stream, args);
 }
 static inline void launch_matvec_llama_f16_batch(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols, int rows) {
@@ -28327,31 +28372,41 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
              * mul_mat_vec_f, not the generic F32-dequant matvec.  Match its
              * f32-FMA accumulation and warp-fold order so the decay and update
              * gate agree with the reference before the recurrent scan. */
-            if (cl->ssm_alpha_type == GGML_TYPE_F16) {
-                launch_matvec_llama_f16(r, r->d_ssm_alpha, cl->ssm_alpha_w,
-                                        r->d_xb, cl->ssm_alpha_rows,
-                                        cl->ssm_alpha_cols);
-            } else if (cl->ssm_alpha_type == GGML_TYPE_BF16) {
-                launch_matvec_llama_bf16(r, r->d_ssm_alpha, cl->ssm_alpha_w,
-                                         r->d_xb, cl->ssm_alpha_rows,
-                                         cl->ssm_alpha_cols);
+            if (cl->ssm_alpha_type == GGML_TYPE_F16 &&
+                cl->ssm_beta_type == GGML_TYPE_F16 &&
+                cl->ssm_alpha_rows == cl->ssm_beta_rows &&
+                cl->ssm_alpha_cols == cl->ssm_beta_cols) {
+                launch_matvec_llama_f16_pair(r, r->d_ssm_alpha, r->d_ssm_beta,
+                                             cl->ssm_alpha_w, cl->ssm_beta_w,
+                                             r->d_xb, cl->ssm_alpha_rows,
+                                             cl->ssm_alpha_cols);
             } else {
-                launch_matvec_auto(r, r->d_ssm_alpha, cl->ssm_alpha_w, r->d_xb,
-                                   cl->ssm_alpha_rows, cl->ssm_alpha_cols,
-                                   cl->ssm_alpha_type);
-            }
-            if (cl->ssm_beta_type == GGML_TYPE_F16) {
-                launch_matvec_llama_f16(r, r->d_ssm_beta, cl->ssm_beta_w,
-                                        r->d_xb, cl->ssm_beta_rows,
-                                        cl->ssm_beta_cols);
-            } else if (cl->ssm_beta_type == GGML_TYPE_BF16) {
-                launch_matvec_llama_bf16(r, r->d_ssm_beta, cl->ssm_beta_w,
-                                         r->d_xb, cl->ssm_beta_rows,
-                                         cl->ssm_beta_cols);
-            } else {
-                launch_matvec_auto(r, r->d_ssm_beta, cl->ssm_beta_w, r->d_xb,
-                                   cl->ssm_beta_rows, cl->ssm_beta_cols,
-                                   cl->ssm_beta_type);
+                if (cl->ssm_alpha_type == GGML_TYPE_F16) {
+                    launch_matvec_llama_f16(r, r->d_ssm_alpha, cl->ssm_alpha_w,
+                                            r->d_xb, cl->ssm_alpha_rows,
+                                            cl->ssm_alpha_cols);
+                } else if (cl->ssm_alpha_type == GGML_TYPE_BF16) {
+                    launch_matvec_llama_bf16(r, r->d_ssm_alpha, cl->ssm_alpha_w,
+                                             r->d_xb, cl->ssm_alpha_rows,
+                                             cl->ssm_alpha_cols);
+                } else {
+                    launch_matvec_auto(r, r->d_ssm_alpha, cl->ssm_alpha_w, r->d_xb,
+                                       cl->ssm_alpha_rows, cl->ssm_alpha_cols,
+                                       cl->ssm_alpha_type);
+                }
+                if (cl->ssm_beta_type == GGML_TYPE_F16) {
+                    launch_matvec_llama_f16(r, r->d_ssm_beta, cl->ssm_beta_w,
+                                            r->d_xb, cl->ssm_beta_rows,
+                                            cl->ssm_beta_cols);
+                } else if (cl->ssm_beta_type == GGML_TYPE_BF16) {
+                    launch_matvec_llama_bf16(r, r->d_ssm_beta, cl->ssm_beta_w,
+                                             r->d_xb, cl->ssm_beta_rows,
+                                             cl->ssm_beta_cols);
+                } else {
+                    launch_matvec_auto(r, r->d_ssm_beta, cl->ssm_beta_w, r->d_xb,
+                                       cl->ssm_beta_rows, cl->ssm_beta_cols,
+                                       cl->ssm_beta_type);
+                }
             }
             end_q8x2_reuse(r);
             }

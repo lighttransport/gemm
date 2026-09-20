@@ -89,6 +89,15 @@ accumulation sequence. After the real 64K prefix, a 256-token suffix sustains
 tok/s with hash `90178de69a24a76e`. The 40 tok/s long-context target remains
 open.
 
+The two exact F16 projections that form each recurrent layer's alpha and beta
+vectors now share one flattened launch.  Every row retains the
+`matvec_f16_llama_f32` FMA and XOR-reduction order.  A 65-row kernel trace
+drops these projections from 6,144 launches and 23.102 ms to 3,072 launches
+and 12.492 ms, saving about 0.163 ms per decoded row.  Zero-depth decode rises
+from the immediate 42.65--42.77 tok/s baseline to 42.83--43.04 tok/s, with the
+pinned 256-token hash `3c53b75f283cb9b0` unchanged.  Trace artifact:
+`tmp/qwen38/ordinary-decode-profile-f16pair/`.
+
 Prioritize ordinary one-row target projection traffic first, followed by the
 long-context verifier attention tail, sampled verifier-row parity audit, and
 fusion of the remaining activation/state-preparation launches.
