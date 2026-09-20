@@ -245,11 +245,17 @@ ref/pixal3d/run.sh cuda ref/pixal3d/prepare_input.py \
   --moge-model /mnt/disk2/models/moge-2-vitl/model.pt
 ```
 
+The downloader fetches only the Transformers inference files for RMBG-2.0. It
+skips the repository's duplicate PyTorch checkpoint, ONNX variants, and sample
+images, avoiding several gigabytes of unrelated downloads.
+
 RMBG-2.0 is gated by its publisher and needs an authorized Hugging Face account.
 The pinned revision was validated on the RTX 5060 Ti by converting the upstream
 RGBA house asset to opaque RGB and forcing the model path. Its generated mask
 contained both foreground and background and reached 0.99419 IoU against the
-asset's reference alpha. Reproduce the model-backed check with:
+asset's reference alpha. The validator requires a nontrivial alpha channel as
+its oracle before creating the opaque RGB model input. Reproduce the
+model-backed check with:
 
 ```sh
 ref/pixal3d/run.sh cuda ref/pixal3d/validate_rmbg.py \

@@ -25,7 +25,15 @@ if a.component in ("all", "moge"):
     result["moge_model"] = str(path)
 if a.component in ("all", "rmbg"):
     rmbg = a.model_root / "RMBG-2.0"
+    # The repository also contains several large ONNX variants and a duplicate
+    # PyTorch .bin checkpoint. Pixal3D's Transformers path needs only the
+    # safetensors checkpoint, configuration, and trusted remote-code modules.
+    required = ("config.json", "preprocessor_config.json", "model.safetensors",
+                "birefnet.py", "BiRefNet_config.py")
     snapshot_download(sources["rmbg"]["model"], revision=sources["rmbg"]["revision"],
-                      local_dir=rmbg)
+                      local_dir=rmbg, allow_patterns=list(required))
+    missing = [name for name in required if not (rmbg / name).is_file()]
+    if missing:
+        raise RuntimeError(f"RMBG-2.0 snapshot is incomplete: {', '.join(missing)}")
     result["rembg_model"] = str(rmbg)
 print(json.dumps(result, indent=2))
