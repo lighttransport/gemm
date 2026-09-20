@@ -2052,6 +2052,188 @@
         "reason": "Harness serialized its Pixal3D jobs, but desktop GPU processes remained present; peak_device_bytes is total NVML device use."
       }
     },
+    "cuda_optimization_evaluation": {
+      "date_jst": "2026-09-20",
+      "runtime_implementation_commit": "13a50a3b376ef2d4ef412bb34279fe7af700a7d5",
+      "hardware": {
+        "gpu_name": "NVIDIA GeForce RTX 5060 Ti",
+        "gpu_uuid": "GPU-9c25b7e3-0e46-6b8a-4096-2f8b132178ac",
+        "nvidia_driver": "615.71.09",
+        "device_memory_mib": 16311
+      },
+      "fixture": {
+        "dump_dir": "tmp/pixal3d/resident-runs/cuda-house/dumps",
+        "stage": "shape1024",
+        "tokens": 10765,
+        "blocks": 30,
+        "threads": 16,
+        "execution": "resident",
+        "kernels": "auto",
+        "precision": "mixed"
+      },
+      "profile_command": [
+        "ref/pixal3d/run.sh",
+        "cuda",
+        "ref/pixal3d/benchmark_flow_block.py",
+        "--backend",
+        "cuda",
+        "--dump-dir",
+        "tmp/pixal3d/resident-runs/cuda-house/dumps",
+        "--stage",
+        "shape1024",
+        "--blocks",
+        "30",
+        "--repeats",
+        "3",
+        "--gpu-execution",
+        "resident",
+        "--gpu-kernels",
+        "auto",
+        "--gpu-flow-precision",
+        "mixed",
+        "--vram-budget-mib",
+        "7168",
+        "--profile-json",
+        "PROFILE.json",
+        "--output",
+        "OUTPUT.safetensors"
+      ],
+      "retained_design": {
+        "flow_activation_storage": "F32",
+        "gemm_input_conversion": "BF16 tiles of at most 2048 rows",
+        "gemm_rows_per_tile": 2048,
+        "reason": "best measured full-stage and complete-generation balance; more packing or a 4096-row schedule did not improve reserved memory and end-to-end time"
+      },
+      "profiled_baseline_7168": {
+        "cold_plus_warm_runs": 4,
+        "warm_median_seconds": 3.3539065370569006,
+        "allocations": 908,
+        "peak_active_device_bytes": 3528072016,
+        "peak_reserved_device_bytes": 4007324112,
+        "output_sha256": "b510f666a29deaec140dc30e526e7d3a9c3ed8f0074213c64cc87f9d0e722387"
+      },
+      "rejected_experiments": [
+        {
+          "name": "pack all transient GEMM inputs",
+          "decision": "removed",
+          "warm_median_seconds": 3.7114758959505707,
+          "allocations": 2337,
+          "peak_active_device_bytes": 3582690128,
+          "peak_reserved_device_bytes": 4003722512,
+          "outputs_exact": true,
+          "reason": "10.7% slower than the profiled baseline, 2.6x allocations, and a 52.1 MiB higher active peak"
+        },
+        {
+          "name": "pack cached projected/global conditioning only",
+          "decision": "removed",
+          "same_binary_disabled_median_seconds": 3.468362799962051,
+          "same_binary_enabled_median_seconds": 3.5422960850410163,
+          "disabled_peak_active_device_bytes": 3528072016,
+          "enabled_peak_active_device_bytes": 3483970384,
+          "disabled_peak_reserved_device_bytes": 4007324112,
+          "enabled_peak_reserved_device_bytes": 4043010512,
+          "outputs_exact": true,
+          "reason": "active storage fell 42.1 MiB, but reserved peak rose 34.0 MiB and the median regressed 2.1%"
+        },
+        {
+          "name": "4096-row GEMM schedule",
+          "decision": "removed",
+          "outputs_exact": true,
+          "reason": "microbenchmark gain did not survive full dense multiview generation because differently sized workspaces reused poorly"
+        }
+      ],
+      "final_budget_matrix": {
+        "command": [
+          "ref/pixal3d/run.sh",
+          "cuda",
+          "ref/pixal3d/validate_budget_matrix.py",
+          "--dump-dir",
+          "tmp/pixal3d/resident-runs/cuda-house/dumps",
+          "--output-dir",
+          "tmp/pixal3d/packed-activation-eval/final",
+          "--repeats",
+          "3",
+          "--budgets",
+          "7168",
+          "12288"
+        ],
+        "budgets_mib": [
+          7168,
+          12288
+        ],
+        "outputs_exact": true,
+        "output_sha256": "b510f666a29deaec140dc30e526e7d3a9c3ed8f0074213c64cc87f9d0e722387",
+        "timing_interpretation": "Correctness run under desktop contention; controlled medians in cpu/pixal3d/OPTIMIZATION.md remain the performance reference."
+      },
+      "mixed_pytorch_trajectories": {
+        "command_template": [
+          "ref/pixal3d/run.sh",
+          "cuda",
+          "ref/pixal3d/validate_mixed_trajectory.py",
+          "--dump-dir",
+          "tmp/pixal3d/resident-runs/cuda-house/dumps",
+          "--stage",
+          "STAGE"
+        ],
+        "pytorch": "project .venv-cuda, Torch 2.7.1+cu128, model dtype FP32, TF32 disabled",
+        "runs": [
+          {
+            "stage": "structure",
+            "tokens": 4096,
+            "steps": 12,
+            "nrmse": 7.1086900281804e-05,
+            "cosine": 0.9999999974735517,
+            "max_abs": 0.0018579959869384766
+          },
+          {
+            "stage": "shape512",
+            "tokens": 2423,
+            "steps": 12,
+            "nrmse": 9.449527120480263e-06,
+            "cosine": 0.9999999999553536,
+            "max_abs": 0.00023061037063598633
+          },
+          {
+            "stage": "shape1024",
+            "tokens": 10765,
+            "steps": 12,
+            "nrmse": 2.46986268979532e-05,
+            "cosine": 0.9999999996950507,
+            "max_abs": 0.0019264668226242065
+          },
+          {
+            "stage": "texture",
+            "tokens": 10765,
+            "steps": 12,
+            "nrmse": 1.092619912500301e-06,
+            "cosine": 0.9999999999994486,
+            "max_abs": 2.580881118774414e-05
+          }
+        ]
+      },
+      "complete_generation_reference": {
+        "native_budgets_mib": [
+          7168,
+          12288
+        ],
+        "seconds_excluding_serialization": [
+          506.207,
+          484.915
+        ],
+        "outputs_exact": true,
+        "glb_sha256": "a5a22a90a51a4399044d629df4044501be47e443258092b4114d9aa55c700383",
+        "details": "four_view_native_budget_runs in this record"
+      },
+      "local_evidence": {
+        "path": "tmp/pixal3d/packed-activation-eval/summary.json",
+        "bytes": 10214,
+        "sha256": "aeaef464a1382ed1fa001b013b08c60502fc1471baba54c55ad4e5ee417fb22c"
+      },
+      "concurrency": {
+        "isolated": false,
+        "reason": "Desktop GPU processes were present. Correctness, output exactness, allocator deltas, and same-binary A/B decisions are retained; controlled historical runs remain the performance claims."
+      }
+    },
     "evidence_policy": [
       "Artifact hashes are retained here; large GLBs, model files, renders, and logs remain outside git.",
       "Timings marked non-isolated or unknown are functional observations and must not be used as isolated performance claims.",

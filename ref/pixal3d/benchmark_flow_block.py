@@ -23,6 +23,7 @@ p.add_argument('--gpu-flow-precision',choices=['bf16','fp32','mixed'],default='b
 p.add_argument('--vram-budget-mib',type=int,default=12288)
 p.add_argument('--tokens',type=int,default=0,help='Limit recorded token count for bounded tuning')
 p.add_argument('--check-cache',action='store_true',help='Check alternating guidance, changed content and restored content on the same engine')
+p.add_argument('--profile-json',type=Path,help='Write aggregate resident allocator/kernel metrics')
 a=p.parse_args()
 assert 1<=a.blocks<=30 and a.repeats>0 and a.tokens>=0 and 512<a.vram_budget_mib<=14336
 lib=C.CDLL(str(a.library));lib.px_test_error.restype=C.c_char_p
@@ -35,11 +36,15 @@ lib.px_test_set_gpu.argtypes=[C.c_int,C.c_int]
 assert lib.px_test_set_gpu(int(a.gpu_execution=='resident'),['auto','blas','mma'].index(a.gpu_kernels))==0
 lib.px_test_set_vram_budget.argtypes=[C.c_size_t]
 assert lib.px_test_set_vram_budget(a.vram_budget_mib)==0
+lib.px_test_set_profile_json.argtypes=[C.c_char_p]
+profile_path=str(a.profile_json.resolve()).encode() if a.profile_json else None
+assert lib.px_test_set_profile_json(profile_path)==0
 if hasattr(lib,'px_test_set_gpu_flow_precision'):
     lib.px_test_set_gpu_flow_precision.argtypes=[C.c_int]
     assert lib.px_test_set_gpu_flow_precision(['bf16','fp32','mixed'].index(a.gpu_flow_precision))==0
 lib.px_test_flow_open.argtypes=[C.c_int,C.c_char_p];lib.px_test_flow_open.restype=C.c_void_p
 lib.px_test_flow_close.argtypes=[C.c_void_p]
+lib.px_test_flow_write_profile.argtypes=[C.c_void_p]
 lib.px_test_flow_run.argtypes=[C.c_void_p,fp,fp,ip,C.c_int,C.c_int,fp,C.c_int,fp,C.c_int,C.c_float,C.c_int,C.c_int]
 stems={'structure':'ss_flow_img_dit_1_3B_64_bf16','shape512':'slat_flow_img2shape_dit_1_3B_512_bf16',
        'shape1024':'slat_flow_img2shape_dit_1_3B_1024_bf16','texture':'slat_flow_imgshape2tex_dit_1_3B_1024_bf16'}
@@ -74,7 +79,13 @@ try:
             if changed:assert not np.array_equal(actual,saved), "Changed conditioning must change the prediction"
         np.testing.assert_array_equal(actual,saved)
         print('Conditioning cache alternating-content check PASS',flush=True)
-finally:lib.px_test_flow_close(session)
+finally:
+    profile_rc=0
+    if a.profile_json:
+        a.profile_json.parent.mkdir(parents=True,exist_ok=True)
+        profile_rc=lib.px_test_flow_write_profile(session)
+    lib.px_test_flow_close(session)
+    assert profile_rc==0,lib.px_test_error().decode()
 a.output.parent.mkdir(parents=True,exist_ok=True)
 save_file({'feats':actual},str(a.output))
 report=dict(backend=a.backend,execution=a.gpu_execution,kernels=a.gpu_kernels,stage=a.stage,blocks=a.blocks,

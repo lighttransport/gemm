@@ -7,6 +7,7 @@
 static thread_local std::string last_error;
 static thread_local int test_threads = 16;
 static thread_local size_t test_vram_budget_mib = 14336;
+static thread_local std::string test_profile_json;
 static thread_local pixal3d_gpu_options test_gpu_options{sizeof(pixal3d_gpu_options), 1, PIXAL3D_GPU_LEGACY,
                                                          PIXAL3D_KERNEL_AUTO, PIXAL3D_FLOW_BF16, nullptr};
 extern "C" int px_test_set_gpu(int execution, int kernels) {
@@ -32,6 +33,11 @@ extern "C" int px_test_set_vram_budget(size_t mib) {
     if (mib <= 512 || mib > 14336)
         return -1;
     test_vram_budget_mib = mib;
+    return 0;
+}
+extern "C" int px_test_set_profile_json(const char *path) {
+    test_profile_json = path ? path : "";
+    test_gpu_options.profile_json = test_profile_json.empty() ? nullptr : test_profile_json.c_str();
     return 0;
 }
 static pixal3d_options options(int backend) {
@@ -247,6 +253,7 @@ struct FlowSession {
     px::Weights weights;
     FlowSession(int backend, const char *path) : engine(options(backend)), weights(path) {
         engine.configure(test_gpu_options);
+        engine.begin_profile();
     }
 };
 extern "C" void *px_test_flow_open(int backend, const char *path) {
@@ -258,6 +265,15 @@ extern "C" void *px_test_flow_open(int backend, const char *path) {
     }
 }
 extern "C" void px_test_flow_close(void *session) { delete static_cast<FlowSession *>(session); }
+extern "C" int px_test_flow_write_profile(void *session) {
+    try {
+        static_cast<FlowSession *>(session)->engine.write_profile();
+        return 0;
+    } catch (const std::exception &ex) {
+        last_error = ex.what();
+        return -1;
+    }
+}
 extern "C" int px_test_flow_run(void *session, float *y, const float *x, const int32_t *coords, int n, int ci,
                                 const float *global, int gc, const float *proj, int pc, float t, int blocks,
                                 int precision) {

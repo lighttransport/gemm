@@ -9,6 +9,8 @@ RMBG/MoGe preparation, GLB/PLY export, and the Python web demo are implemented.
 
 Recent commits:
 
+- `13a50a3b` reduces byte-identical postprocessing allocations and UV overhead.
+- `d73dde4b` consolidates reproducible Pixal3D validation evidence.
 - `aadd125c` documents RMBG/BiRefNet mask-parity provenance.
 - `a62a785c` limits RMBG setup to required inference files and hardens validation.
 - `01534c1c` adds real RMBG-2.0 CUDA validation.
@@ -64,29 +66,17 @@ Important measured results:
   `validation-results.json`, with commands, commits, revisions, hashes, runtime
   identity, and concurrency qualifications. A validator checks the schema and
   optionally rehashes all retained artifacts.
+- Profiled the remaining byte-identical postprocessing phases, removed 338 MiB
+  of duplicate/temporary image and BVH storage, and reduced UV merge overhead
+  while retaining GLB SHA-256 `6d8c267b...11a8b7`.
+- Evaluated packed flow activations and a larger GEMM tile at full-stage and
+  complete-generation scale. Both packing variants and the 4096-row schedule
+  were removed because they did not improve reserved memory and end-to-end
+  time. Current mixed trajectories remain below `0.001` NRMSE for all stages.
 
 ## Remaining work, in priority order
 
-### 1. Continue byte-identical CPU postprocessing optimization
-
-The latest 4K/1M replay still spends about 17.8 s in hole filling plus original
-mesh BVH construction, 16.2 s in unwrap/normals, and 14.3 s in inpainting.
-Profile those phases separately before changing them. Preserve face/vertex
-ordering and require the established GLB SHA-256 after every optimization.
-Promising bounded work includes compact BVH build inputs, allocation reuse in
-UV chart construction, and removal of avoidable image repacking. Do not change
-the 4K/1M reference-quality defaults.
-
-### 2. Evaluate remaining CUDA memory/performance opportunities
-
-`cpu/pixal3d/OPTIMIZATION.md` still identifies packed flow activation storage
-and additional GEMM tiling as opportunities. Measure full-stage and complete
-generation behavior, not only microbenchmarks. Preserve mixed-trajectory error
-(`<0.001` NRMSE for all four stages), the 7168 MiB path, and byte-identical
-outputs between the 7 and 12 GiB budget runs. Remove experiments that do not
-improve end-to-end time or peak memory.
-
-### 3. Refresh user-facing performance wording
+### 1. Refresh user-facing performance wording
 
 Some older documentation describes the initial host-offloaded implementation
 and 28–97 minute runs under concurrent load, while the resident path and newer
@@ -96,7 +86,7 @@ its execution mode, fixture, concurrency conditions, and whether serialization
 is included. Keep historical results only when they explain a regression or
 tradeoff.
 
-### 4. Optional service durability
+### 2. Optional service durability
 
 Queued artifacts are file-backed, but job metadata remains in memory and is
 discarded on server restart. If the demo is promoted beyond a workstation

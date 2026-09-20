@@ -19,6 +19,7 @@ required = {
     "hardware", "checkpoint_provenance", "four_view_native_budget_runs",
     "four_view_pytorch_reference", "mask_provenance", "cuda_reliability_soak",
     "byte_identical_postprocess_replay", "real_queued_http_cuda", "evidence_policy",
+    "cuda_optimization_evaluation",
 }
 assert required <= extended.keys(), required - extended.keys()
 
@@ -73,6 +74,20 @@ assert web["automatic_rmbg"]["mask_source"] == "rmbg-2.0"
 assert web["automatic_rmbg"]["cancel_then_recover"]
 assert web["explicit_mask_paired_reference"]["mask_source"] == "mask"
 assert web["explicit_mask_paired_reference"]["surface"]["available"]
+
+optimization = extended["cuda_optimization_evaluation"]
+assert optimization["retained_design"]["flow_activation_storage"] == "F32"
+assert optimization["retained_design"]["gemm_rows_per_tile"] == 2048
+assert optimization["final_budget_matrix"]["budgets_mib"] == [7168, 12288]
+assert optimization["final_budget_matrix"]["outputs_exact"]
+assert optimization["complete_generation_reference"]["outputs_exact"]
+assert len(optimization["rejected_experiments"]) == 3
+assert all(item["decision"] == "removed" for item in optimization["rejected_experiments"])
+trajectories = optimization["mixed_pytorch_trajectories"]["runs"]
+assert {item["stage"] for item in trajectories} == {
+    "structure", "shape512", "shape1024", "texture",
+}
+assert max(item["nrmse"] for item in trajectories) < .001
 
 
 def artifacts(value):

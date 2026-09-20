@@ -35,8 +35,9 @@ conditioning boundaries are unchanged.
 Weights use their compute storage type. Flow activations use F32 storage with
 BF16/FP16 rounding at model boundaries. Sparse decoder gathers are written
 directly in FP16/BF16 and consumed by GEMM without an intermediate F32 tensor
-or a second conversion allocation. More packed flow activation storage and
-additional GEMM tiling remain opportunities for further optimization.
+or a second conversion allocation. Flow activation packing and larger GEMM
+tiles have been evaluated at full-stage and complete-generation scale; the
+current F32 activation storage and 2048-row schedule are retained below.
 
 ## 8 GB memory profile and exact postprocessing
 
@@ -159,9 +160,29 @@ ref/pixal3d/run.sh cuda ref/pixal3d/validate_budget_matrix.py \
   --dump-dir tmp/pixal3d/resident-runs/cuda-house/dumps
 ```
 
-A tested
-4096-row schedule was removed: its microbenchmark gain did not survive the
+A tested 4096-row schedule was removed: its microbenchmark gain did not survive the
 full dense multiview run because differently sized workspaces reused poorly.
+
+Packed flow storage was evaluated on the same Shape-1024 fixture. Packing every
+transient GEMM input preserved the exact `b510f666...e722387` tensor, but raised
+the warm median from 3.354 s to 3.711 s, raised allocations from 908 to 2,337,
+and raised peak active storage from 3,528,072,016 to 3,582,690,128 bytes. A
+narrower same-binary A/B packed only cached projected/global conditioning. It
+reduced active storage by 42.1 MiB, but raised the reserved peak by 34.0 MiB and
+moved the five-run warm median from 3.468 s to 3.542 s. Both experiments were
+removed because the 7 GiB path is bounded by reserved memory and neither
+improved full-stage time. The runs were made with desktop GPU processes present;
+the allocator deltas, exact output and rejection decisions are retained, while
+the controlled table above remains the performance reference.
+
+`benchmark_flow_block.py --profile-json FILE` records aggregate allocator and
+kernel counters for this comparison. The local result bundle is
+`tmp/pixal3d/packed-activation-eval/summary.json`; the checked result record in
+`ref/pixal3d/validation-results.json` contains its hash and the rejection data.
+Fresh twelve-step mixed comparisons against the pinned FP32 PyTorch models
+reported NRMSE `7.10869e-5`, `9.44953e-6`, `2.46986e-5`, and `1.09262e-6` for
+Structure, Shape-512, Shape-1024, and Texture respectively. All remain below
+`0.001`.
 
 Complete four-view generation was also validated at the 8 GB-card and 12 GiB
 target profiles on the RTX 5060 Ti. Both runs used the pinned four-view example,
