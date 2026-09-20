@@ -89,14 +89,14 @@ ASan/UBSan, and 10,000 randomized cases.  Warm results were:
 
 | Draft width / selection | Prefill tok/s | Decode tok/s | Output SHA-256 |
 |---|---:|---:|---|
-| K=4 / greedy | 604.88–605.60 | 60.76–60.83 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
-| K=7 / greedy | 606.05–606.91 | 85.15–85.26 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
-| sampled exact-target fallback | 605.12–605.87 | 39.84–39.93 | `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac` |
+| K=4 / greedy | 606.22–606.73 | 60.83 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
+| K=7 / greedy | 607.36–608.28 | 85.35–85.44 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
+| sampled exact-target fallback | 605.92–607.82 | 40.17–40.23 | `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac` |
 
 The 4096-token early-context retrieval fixture also returns exactly
 `ZEPHYR-7319` with K=7, including the ordinary target's token sequence and
-EOS.  These results are under `tmp/qwen38/dflash2-launch256-k4/`,
-`tmp/qwen38/dflash2-launch256-k7-v2/`, and
+EOS.  These results are under `tmp/qwen38/dflash2-qkprep-k4/`,
+`tmp/qwen38/dflash2-qkprep-k7/`, and
 `tmp/qwen38/dflash2-retrieval-k7.*`.
 
 The upstream llama.cpp server reference accepted 37/40 drafts at K=4 on the
@@ -154,6 +154,17 @@ contracts.  This restores the pinned sampled sequence while retaining the
 specialized prefill speed; spelling the four rows as separate accumulators
 reassociated operations and changed the sampled output.
 
+Decode attention preparation now uses one exact kernel per attention layer for
+Q/gate deinterleave, Q and K RMSNorm, Q and K M-RoPE, and Q8/Q8 K/V storage.
+It replaces six launches with one in each of the 16 attention layers, removing
+80 launches per decoded target row. The fused kernel retains the separate
+operators' reduction order, trigonometric operations, Q8 scale rounding and
+integer conversion. The complete K=4 and K=7 greedy and sampled C++ gates
+remain byte-identical to the pinned llama.cpp fixtures. At a zero-length
+prefix, ordinary throughput is unchanged at 42.53--42.65 tok/s; at the 4K
+coding shape, sampled exact-target fallback improves from 39.84--39.93 to
+40.17--40.23 tok/s.
+
 The same K=7 path was measured after a fully processed 65,536-token random
 prefix. Prefix processing sustained 443.57 tok/s with hash
 `90178de69a24a76e`; the following 256 generated tokens sustained **49.74
@@ -200,10 +211,10 @@ reflects the remaining measured costs.
    checkpoints are already batched and device-local. DeltaNet, state
    preparation, checkpoint copies, and F16 matrix-vector work remain visible;
    fuse preparation with the recurrence where exact row rollback is retained.
-5. **Kernel and graph count.**  The remaining small launches include QK
-   normalization, RoPE, KV storage, SiLU/gating, and state preparation.  Fuse
-   adjacent operations when their intermediate values need no external
-   checkpoint.
+5. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
+   and Q8/Q8 KV storage are now fused exactly. The remaining small launches
+   include SiLU/gating and state preparation. Fuse adjacent operations when
+   their intermediate values need no external checkpoint.
 6. **Remaining draft cost.** Top-k and selector decisions already run on the
    GPU, and packed Q4_K/Q8_1 projections cut draft work to 77.239 ms at 4K and
    474.117 ms across the 256-token 64K suffix. Position-parallel attention and

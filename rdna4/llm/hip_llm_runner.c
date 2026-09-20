@@ -584,6 +584,93 @@ static const char *hip_kernel_source =
 "    for (int d = tid; d < head_dim; d += NT) v[d] = v[d] * scale * w[d];\n"
 "}\n"
 "\n"
+"/* Decode-only Qwen3.5 attention preparation.  Q heads first split the gated\n"
+" * projection, then Q and K heads independently run the same 256-thread\n"
+" * RMSNorm reduction and M-RoPE arithmetic as the separate kernels. */\n"
+"__device__ __forceinline__ float q8_recip_contract(float b);\n"
+"__device__ __forceinline__ float q8_div_contract(float a, float b);\n"
+"__global__ void deinterleave_qgate_qknorm_mrope_pair_devp(\n"
+"        float *q, float *gate, const float *qfull, float *k, const float *value,\n"
+"        const float *qw, const float *kw, int n_q_heads, int n_kv_heads,\n"
+"        int head_dim, float eps, const int *pos_p, float freq_base,\n"
+"        int sect0, int sect1, int sect2, int sect3, int store_q8q8,\n"
+"        signed char *kc, signed char *vc, float *ks, float *vs) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int bh = blockIdx.x, tid = threadIdx.x, NT = blockDim.x;\n"
+"    bool is_k = bh >= n_q_heads;\n"
+"    int h = is_k ? bh - n_q_heads : bh;\n"
+"    if ((!is_k && h >= n_q_heads) || (is_k && h >= n_kv_heads)) return;\n"
+"    float *v = (is_k ? k : q) + h * head_dim;\n"
+"    const float *w = is_k ? kw : qw;\n"
+"    if (!is_k) {\n"
+"        for (int d = tid; d < head_dim; d += NT) {\n"
+"            size_t src = (size_t)h * 2 * head_dim + d;\n"
+"            v[d] = qfull[src];\n"
+"            gate[(size_t)h * head_dim + d] = qfull[src + head_dim];\n"
+"        }\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float sum = 0.0f;\n"
+"    for (int d = tid; d < head_dim; d += NT) { float x = v[d]; sum += x * x; }\n"
+"    sdata[tid] = sum;\n"
+"    __syncthreads();\n"
+"    for (int s = NT / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
+"    for (int d = tid; d < head_dim; d += NT) v[d] = v[d] * scale * w[d];\n"
+"    __syncthreads();\n"
+"    int j = tid;\n"
+"    int half_dim = sect0 + sect1 + sect2 + sect3;\n"
+"    if (j < half_dim) {\n"
+"        int rope_dim = 2 * half_dim;\n"
+"        int pos_v = *pos_p;\n"
+"        int pos;\n"
+"        if (j < sect0) pos = pos_v;\n"
+"        else if (j < sect0 + sect1) pos = pos_v;\n"
+"        else if (j < sect0 + sect1 + sect2) pos = pos_v;\n"
+"        else pos = 0;\n"
+"        float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)rope_dim);\n"
+"        float theta = (float)pos * freq;\n"
+"        float cos_t = cosf(theta);\n"
+"        float sin_t = sinf(theta);\n"
+"        float v0 = v[j], v1 = v[j + half_dim];\n"
+"        v[j] = v0 * cos_t - v1 * sin_t;\n"
+"        v[j + half_dim] = v0 * sin_t + v1 * cos_t;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    if (is_k && store_q8q8) {\n"
+"        int lane = tid & 31, group = tid >> 5, groups = head_dim / 32;\n"
+"        int kv_dim = n_kv_heads * head_dim, pos = *pos_p;\n"
+"        size_t input = (size_t)h * head_dim + tid;\n"
+"        float xk = tid < head_dim ? k[input] : 0.0f;\n"
+"        float xv = tid < head_dim ? value[input] : 0.0f;\n"
+"        float ak = fabsf(xk), av = fabsf(xv);\n"
+"        for (int z = 16; z; z >>= 1) {\n"
+"            ak = fmaxf(ak, __shfl_xor(ak, z, 32));\n"
+"            av = fmaxf(av, __shfl_xor(av, z, 32));\n"
+"        }\n"
+"        float dk = q8_div_contract(ak, 127.0f);\n"
+"        float dv = q8_div_contract(av, 127.0f);\n"
+"        float ik = dk ? q8_recip_contract(dk) : 0.0f;\n"
+"        float iv = dv ? q8_recip_contract(dv) : 0.0f;\n"
+"        if (tid < head_dim) {\n"
+"            size_t o = (size_t)pos * kv_dim + h * head_dim + tid;\n"
+"            float qk, qv;\n"
+"            asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qk):\"v\"(xk),\"v\"(ik));\n"
+"            asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qv):\"v\"(xv),\"v\"(iv));\n"
+"            kc[o] = (signed char)roundf(qk);\n"
+"            vc[o] = (signed char)roundf(qv);\n"
+"            if (lane == 0) {\n"
+"                size_t sg = ((size_t)pos * n_kv_heads + h) * groups + group;\n"
+"                ks[sg] = round_f16_contract(dk);\n"
+"                vs[sg] = round_f16_contract(dv);\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- 4b. qknorm_batch_f32: per-row, per-head RMSNorm; grid=(n_heads, M) ---- */\n"
 "__global__ void qknorm_batch_f32(float *vec, const float *w,\n"
 "                                   int n_heads, int head_dim, int row_stride,\n"
@@ -12836,6 +12923,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_bf16_llama_f32;
     hipFunction_t fn_matvec_bf16_f32;
     hipFunction_t fn_qknorm_f32;
+    hipFunction_t fn_deinterleave_qgate_qknorm_mrope_pair_devp;
     hipFunction_t fn_qknorm_batch_f32;
     hipFunction_t fn_rope_neox_f32;
     hipFunction_t fn_rope_mrope_f32;
@@ -13945,6 +14033,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_bf16_llama_f32);
     GET_FUNC(matvec_bf16_f32);
     GET_FUNC(qknorm_f32);
+    GET_FUNC(deinterleave_qgate_qknorm_mrope_pair_devp);
     GET_FUNC(qknorm_batch_f32);
     GET_FUNC(rope_neox_f32);
     GET_FUNC(rope_mrope_f32);
@@ -19091,6 +19180,23 @@ static inline void launch_qknorm(hip_llm_runner *r, void *vec, void *w,
     if (bdim > 256) bdim = 256;
     void *args[] = { &vec, &w, &n_heads, &head_dim, &eps };
     LAUNCH(r->fn_qknorm_f32, n_heads, 1, 1, bdim, 1, 1, bdim * sizeof(float), r->stream, args);
+}
+
+static inline void launch_qwen35_decode_qk_prep(hip_llm_runner *r,
+        void *q, void *gate, void *qfull, void *k, void *value,
+        void *qw, void *kw, int n_q_heads, int n_kv_heads, int head_dim,
+        float eps, int store_q8q8, void *kc, void *vc, void *ks, void *vs) {
+    int *pos_p = r->d_position;
+    float freq_base = r->rope_freq_base;
+    int s0 = r->mrope_sections[0], s1 = r->mrope_sections[1];
+    int s2 = r->mrope_sections[2], s3 = r->mrope_sections[3];
+    void *args[] = { &q, &gate, &qfull, &k, &value, &qw, &kw, &n_q_heads,
+                     &n_kv_heads, &head_dim, &eps, &pos_p, &freq_base,
+                     &s0, &s1, &s2, &s3, &store_q8q8,
+                     &kc, &vc, &ks, &vs };
+    LAUNCH(r->fn_deinterleave_qgate_qknorm_mrope_pair_devp,
+           n_q_heads + n_kv_heads, 1, 1, 256, 1, 1,
+           256 * sizeof(float), r->stream, args);
 }
 
 /* Batched QK-norm: grid = (n_heads, n_rows). row_stride = n_heads*head_dim. */
@@ -28325,7 +28431,22 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
             launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
             end_q8x2_reuse(r);
             }
-            launch_deinterleave_qgate(r, r->d_q, r->d_attn_gate, r->d_xb2, n_heads, head_dim);
+            int fused_qk_prep = r->use_mrope && cl->has_qk_norm &&
+                cl->attn_q_norm_w && cl->attn_k_norm_w && !r->is_qwen4exp &&
+                !(r->debug_layers && debug_attention_layer_selected(l));
+            int fused_qk_store = fused_qk_prep && r->kv_quantized &&
+                r->requested_qwen35_decode_graph &&
+                r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0;
+            if (fused_qk_prep) {
+                launch_qwen35_decode_qk_prep(r, r->d_q, r->d_attn_gate,
+                        r->d_xb2, r->d_k, r->d_v, cl->attn_q_norm_w,
+                        cl->attn_k_norm_w, n_heads, n_kv_heads, head_dim, eps,
+                        fused_qk_store, key_cache, value_cache,
+                        r->d_key_cache_scale[l], r->d_value_cache_scale[l]);
+            } else {
+                launch_deinterleave_qgate(r, r->d_q, r->d_attn_gate,
+                                          r->d_xb2, n_heads, head_dim);
+            }
 
             if (r->debug_layers && debug_attention_layer_selected(l)) {
                 debug_f32_state(r, l, "scalar-attn-qraw", r->d_q, n_heads * head_dim);
@@ -28333,13 +28454,15 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 debug_f32_state(r, l, "scalar-attn-vraw", r->d_v, kv_dim);
             }
 
-            if (cl->has_qk_norm) {
+            if (!fused_qk_prep && cl->has_qk_norm) {
                 if (cl->attn_q_norm_w) launch_qknorm(r, r->d_q, cl->attn_q_norm_w, n_heads, head_dim, eps);
                 if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, n_kv_heads, head_dim, eps);
             }
 
-            launch_rope_devp(r, r->d_q, n_heads, head_dim, r->rope_freq_base);
-            launch_rope_devp(r, r->d_k, n_kv_heads, head_dim, r->rope_freq_base);
+            if (!fused_qk_prep) {
+                launch_rope_devp(r, r->d_q, n_heads, head_dim, r->rope_freq_base);
+                launch_rope_devp(r, r->d_k, n_kv_heads, head_dim, r->rope_freq_base);
+            }
 
             if (r->debug_layers && debug_attention_layer_selected(l)) {
                 debug_f32_state(r, l, "scalar-attn-q", r->d_q, n_heads * head_dim);
@@ -28395,11 +28518,13 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
             } else {
                 if (r->kv_quantized) {
                     if (r->requested_qwen35_decode_graph && r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0) {
-                        void *a[] = { &key_cache, &value_cache, &r->d_key_cache_scale[l],
-                            &r->d_value_cache_scale[l], &r->d_k, &r->d_v, &n_kv_heads,
-                            &head_dim, &r->d_position };
-                        LAUNCH(r->fn_kv_cache_store_q8q8_devp, n_kv_heads, 1, 1,
-                               256, 1, 1, 0, r->stream, a);
+                        if (!fused_qk_store) {
+                            void *a[] = { &key_cache, &value_cache, &r->d_key_cache_scale[l],
+                                &r->d_value_cache_scale[l], &r->d_k, &r->d_v, &n_kv_heads,
+                                &head_dim, &r->d_position };
+                            LAUNCH(r->fn_kv_cache_store_q8q8_devp, n_kv_heads, 1, 1,
+                                   256, 1, 1, 0, r->stream, a);
+                        }
                     } else launch_kv_store_q8q4_batch(r, key_cache, value_cache,
                                                r->d_key_cache_scale[l], r->d_value_cache_scale[l],
                                                r->d_k, r->d_v, n_kv_heads, head_dim, r->cur_position, 1);
