@@ -2920,18 +2920,21 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
-"/* ---- 19b. softplus_mul_batch_f32: same op over M rows of dt_rank ---- */\n"
-"/* bias and a are dt_rank-wide constants; broadcast across the M rows. */\n"
+"/* ---- 19b. softplus_mul_batch_f32: prepare GDA decay over M rows. ---- */\n"
+"/* bias and a are dt_rank-wide constants; broadcast across the M rows.\n"
+" * Batched recurrence used to evaluate expf(alpha) independently for every\n"
+" * state column.  Store the FP32 decay once per token/head here instead. */\n"
 "__global__ void softplus_mul_batch_f32(float *out, const float *in,\n"
 "                                         const float *bias, const float *a,\n"
-"                                         int dt_rank, int M) {\n"
+"                                         int dt_rank, int M, int exponentiate) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    int total = M * dt_rank;\n"
 "    if (i >= total) return;\n"
 "    int hi = i % dt_rank;\n"
 "    float x = in[i] + bias[hi];\n"
 "    float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));\n"
-"    out[i] = sp * a[hi];\n"
+"    float alpha = sp * a[hi];\n"
+"    out[i] = exponentiate ? expf(alpha) : alpha;\n"
 "}\n"
 "\n"
 "/* ---- 20. sigmoid_inplace_f32: data[i] = 1/(1+exp(-data[i])) ---- */\n"
@@ -3170,8 +3173,7 @@ static const char *hip_kernel_source =
 "        size_t base    = (size_t)m * per_tok_dt + (size_t)h * d_state;\n"
 "        size_t v_base  = (size_t)m * (size_t)v_row_stride + (size_t)h * d_state;\n"
 "        float v_r   = V_batch[v_base + r];\n"
-"        float decay = parity ? expf(alpha_batch[(size_t)m * dt_rank + h])\n"
-"                             : __expf(alpha_batch[(size_t)m * dt_rank + h]);\n"
+"        float decay = alpha_batch[(size_t)m * dt_rank + h];\n"
 "        float b     = beta_batch[(size_t)m * dt_rank + h];\n"
 "\n"
 "        /* Cooperatively stage k and q into LDS (every thread loads one elt). */\n"
@@ -3244,7 +3246,7 @@ static const char *hip_kernel_source =
 "    for (int c = 0; c < d_state; c++) S_dst[c] = S_row[c];\n"
 "}\n"
 "/* llama.cpp HIP layout for Qwen3.5 GDA: one 32-lane warp per state\n"
-" * column, four columns per block. Preserve the reference order: old-state\n"
+" * column. Preserve the reference order: old-state\n"
 " * dot, decay*dot, update, and XOR warp reduction. */\n"
 "__global__ void deltanet_step_batch_gda_ref_f32(\n"
 "    float *state, float *out_batch,\n"
@@ -3265,8 +3267,8 @@ static const char *hip_kernel_source =
 "    const size_t per_tok = (size_t)dt_rank * d_state;\n"
 "    for (int m = 0; m < M; ++m) {\n"
 "        size_t base = (size_t)m * per_tok + (size_t)h * d_state;\n"
-"        const float decay = parity ? expf(alpha_batch[(size_t)m * dt_rank + h]) :\n"
-"                                    __expf(alpha_batch[(size_t)m * dt_rank + h]);\n"
+"        const float alpha = alpha_batch[(size_t)m * dt_rank + h];\n"
+"        const float decay = parity ? alpha : expf(alpha);\n"
 "        float k[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
 "        float q[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
 "        float kv = 0.0f;\n"
@@ -3293,6 +3295,52 @@ static const char *hip_kernel_source =
 "        if (i < d_state) S[i] = s[rr];\n"
 "    }\n"
 "}\n"
+"/* Fixed Qwen3.5 state shape.  Spell out the four rows owned by each lane\n"
+" * while retaining the reference kernel's accumulation and shuffle order. */\n"
+"__global__ void deltanet_step_batch_gda_ref_128_f32(\n"
+"    float *state, float *out_batch,\n"
+"    const float *Q_batch, const float *K_batch, const float *V_batch,\n"
+"    const float *alpha_batch, const float *beta_batch,\n"
+"    int dt_rank, int d_state, int v_row_stride, int M, int parity) {\n"
+"    (void)d_state;\n"
+"    int h = blockIdx.x, lane = threadIdx.x;\n"
+"    int col = blockIdx.z * blockDim.y + threadIdx.y;\n"
+"    if (h >= dt_rank || col >= 128 || lane >= 32) return;\n"
+"    float *S = state + (size_t)h * 128 * 128 + (size_t)col * 128;\n"
+"    float s0 = S[lane], s1 = S[32 + lane];\n"
+"    float s2 = S[64 + lane], s3 = S[96 + lane];\n"
+"    const float scale = rsqrtf(128.0f);\n"
+"    const size_t per_tok = (size_t)dt_rank * 128;\n"
+"    for (int m = 0; m < M; ++m) {\n"
+"        size_t base = (size_t)m * per_tok + (size_t)h * 128;\n"
+"        float k0 = K_batch[base + lane];\n"
+"        float k1 = K_batch[base + 32 + lane];\n"
+"        float k2 = K_batch[base + 64 + lane];\n"
+"        float k3 = K_batch[base + 96 + lane];\n"
+"        float q0 = Q_batch[base + lane];\n"
+"        float q1 = Q_batch[base + 32 + lane];\n"
+"        float q2 = Q_batch[base + 64 + lane];\n"
+"        float q3 = Q_batch[base + 96 + lane];\n"
+"        float kv = 0.0f;\n"
+"        kv += s0 * k0; kv += s1 * k1;\n"
+"        kv += s2 * k2; kv += s3 * k3;\n"
+"        for (int off = 16; off > 0; off >>= 1) kv += __shfl_xor(kv, off);\n"
+"        float alpha = alpha_batch[(size_t)m * dt_rank + h];\n"
+"        float decay = parity ? alpha : expf(alpha);\n"
+"        float delta = (V_batch[(size_t)m * v_row_stride +\n"
+"                               (size_t)h * 128 + col] - decay * kv) *\n"
+"                      beta_batch[(size_t)m * dt_rank + h];\n"
+"        float y = 0.0f;\n"
+"        s0 = decay * s0 + k0 * delta; y += s0 * q0;\n"
+"        s1 = decay * s1 + k1 * delta; y += s1 * q1;\n"
+"        s2 = decay * s2 + k2 * delta; y += s2 * q2;\n"
+"        s3 = decay * s3 + k3 * delta; y += s3 * q3;\n"
+"        for (int off = 16; off > 0; off >>= 1) y += __shfl_xor(y, off);\n"
+"        if (lane == 0) out_batch[base + col] = y * scale;\n"
+"    }\n"
+"    S[lane] = s0; S[32 + lane] = s1;\n"
+"    S[64 + lane] = s2; S[96 + lane] = s3;\n"
+"}\n"
 "/* Exact multi-token verifier recurrence with a rollback checkpoint after\n"
 " * every row.  The canonical state is left untouched; commit copies the\n"
 " * selected checkpoint after target acceptance is known. */\n"
@@ -3317,7 +3365,7 @@ static const char *hip_kernel_source =
 "    const size_t per_state = per_tok * d_state;\n"
 "    for (int m = 0; m < M; ++m) {\n"
 "        size_t base = (size_t)m * per_tok + (size_t)h * d_state;\n"
-"        const float decay = expf(alpha_batch[(size_t)m * dt_rank + h]);\n"
+"        const float decay = alpha_batch[(size_t)m * dt_rank + h];\n"
 "        float k[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
 "        float q[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
 "        float kv = 0.0f;\n"
@@ -8226,8 +8274,8 @@ static const char *hip_kernel_source =
 "        const float *k = K_batch + (size_t)m * per_tok + h * d_state + c0;\n"
 "        const float *q = Q_batch + (size_t)m * per_tok + h * d_state + c0;\n"
 "        float v_r   = V_batch[(size_t)m * v_row_stride + h * d_state + r];\n"
-"        /* Match ggml_exp in llama.cpp's gated-delta-net graph. */\n"
-"        float decay = expf(alpha_batch[(size_t)m * dt_rank + h]);\n"
+"        /* The batched alpha-preparation kernel already applied ggml_exp. */\n"
+"        float decay = alpha_batch[(size_t)m * dt_rank + h];\n"
 "        float b     = beta_batch[(size_t)m * dt_rank + h];\n"
 "        float k_[32], q_[32];\n"
 "        float sk = 0.0f;\n"
@@ -12917,6 +12965,7 @@ struct hip_llm_runner {
     hipFunction_t fn_glm5next_mhc_finish_f32;
     hipFunction_t fn_deltanet_step_batch_f32;
     hipFunction_t fn_deltanet_step_batch_gda_ref_f32;
+    hipFunction_t fn_deltanet_step_batch_gda_ref_128_f32;
     hipFunction_t fn_deltanet_step_batch_gda_verify_f32;
     hipFunction_t fn_l2_norm_heads_batch_f32;
     hipFunction_t fn_l2_norm_repeat_qk_batch_f32;
@@ -14021,6 +14070,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(glm5next_mhc_finish_f32);
     GET_FUNC(deltanet_step_batch_f32);
     GET_FUNC(deltanet_step_batch_gda_ref_f32);
+    GET_FUNC(deltanet_step_batch_gda_ref_128_f32);
     GET_FUNC(deltanet_step_batch_gda_verify_f32);
     GET_FUNC(l2_norm_heads_batch_f32);
     GET_FUNC(l2_norm_repeat_qk_batch_f32);
@@ -22590,8 +22640,8 @@ static inline void launch_softplus_mul(hip_llm_runner *r, void *out,
 
 /* Batched softplus_mul: bias/a are dt_rank-wide layer constants, broadcast over M rows. */
 static inline void launch_softplus_mul_batch(hip_llm_runner *r, void *out,
-    void *in, void *bias, void *a, int dt_rank, int M) {
-    void *args[] = { &out, &in, &bias, &a, &dt_rank, &M };
+    void *in, void *bias, void *a, int dt_rank, int M, int exponentiate) {
+    void *args[] = { &out, &in, &bias, &a, &dt_rank, &M, &exponentiate };
     int total = M * dt_rank;
     LAUNCH(r->fn_softplus_mul_batch_f32, (total + 255) / 256, 1, 1, 256, 1, 1, 0,
            r->stream, args);
@@ -22659,10 +22709,11 @@ static inline void launch_deltanet_step(hip_llm_runner *r, void *state,
         ref_env && atoi(ref_env) != 0) {
         /* Reuse the audited reference layout with one token. All scalar
          * inputs are contiguous; V has a single dt_rank*d_state row. */
-        int stride = dt_rank * d_state, one = 1, parity = 1;
+        int stride = dt_rank * d_state, one = 1, decay_ready = 0;
         void *ref_args[] = { &state, &out, &Q, &K, &V, &alpha, &beta,
-                            &dt_rank, &d_state, &stride, &one, &parity };
-        LAUNCH(r->fn_deltanet_step_batch_gda_ref_f32, dt_rank, 1,
+                            &dt_rank, &d_state, &stride, &one, &decay_ready };
+        hipFunction_t ref_fn = r->fn_deltanet_step_batch_gda_ref_128_f32;
+        LAUNCH(ref_fn, dt_rank, 1,
                (d_state + 3) / 4, 32, 4, 1, 0, r->stream, ref_args);
         return;
     }
@@ -22748,8 +22799,15 @@ static inline void launch_deltanet_step_batch(hip_llm_runner *r, void *state,
     } else if (d_state <= 128 && (parity || !use_warp)) {
         /* Match llama.cpp's GDA kernel: 32-lane warp per column, four
          * columns per block.  Qwen3.5 uses the scalar-decay GDA form. */
-        LAUNCH(r->fn_deltanet_step_batch_gda_ref_f32, dt_rank, 1,
-               (d_state + 3) / 4, 32, 4, 1, 0, r->stream, args);
+        int decay_ready = 1;
+        void *ref_args[] = { &state, &out_batch, &Q_batch, &K_batch, &V_batch,
+            &alpha_batch, &beta_batch, &dt_rank, &d_state, &v_row_stride, &M,
+            &decay_ready };
+        hipFunction_t ref_fn = d_state == 128 ?
+            r->fn_deltanet_step_batch_gda_ref_128_f32 :
+            r->fn_deltanet_step_batch_gda_ref_f32;
+        LAUNCH(ref_fn, dt_rank, 1,
+               (d_state + 3) / 4, 32, 4, 1, 0, r->stream, ref_args);
     } else {
         LAUNCH(r->fn_deltanet_step_batch_f32, dt_rank, 1, 1, d_state, 1, 1, 0,
                r->stream, args);
@@ -29981,10 +30039,15 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                 cl->ssm_beta_rows);
             }
 
-            /* softplus_mul broadcasts dt_rank-wide bias/a over M rows; sigmoid
-             * is a flat elementwise op so the per-token kernel works as-is. */
+            /* softplus_mul broadcasts dt_rank-wide bias/a over M rows.  The
+             * fused recurrence consumes exp(alpha); compute that scalar once
+             * per token/head here instead of once per state column. */
+            const char *batch_recur_env = getenv("LLM_SSM_BATCH_RECURRENCE");
+            int use_deltanet_batch = d_state <= 128 && batch_recur_env &&
+                                     atoi(batch_recur_env) != 0;
             launch_softplus_mul_batch(r, r->d_ssm_alpha_batch, r->d_ssm_alpha_batch,
-                                      cl->ssm_dt_bias, cl->ssm_a, dt_rank, M);
+                                      cl->ssm_dt_bias, cl->ssm_a, dt_rank, M,
+                                      use_deltanet_batch);
             launch_sigmoid_inplace(r, r->d_ssm_beta_batch, M * dt_rank);
 
             if (r->debug_layers && l < 6) {
@@ -30107,9 +30170,6 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
              * and __expf/FMA contraction accumulate a measurable logit delta
              * over Qwen4's 36 SSM layers.  Batched projections/conv/norm remain
              * useful without sacrificing the scalar recurrence's parity. */
-            const char *batch_recur_env = getenv("LLM_SSM_BATCH_RECURRENCE");
-            int use_deltanet_batch = d_state <= 128 && batch_recur_env &&
-                                     atoi(batch_recur_env) != 0;
             if (use_deltanet_batch) {
                 launch_deltanet_step_batch(r, cl->d_recurrent_state,
                     r->d_ssm_out_batch,

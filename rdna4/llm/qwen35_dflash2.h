@@ -26,6 +26,10 @@ typedef struct hllm_dflash_layer {
     void *ffn_conv_base, *ffn_conv_proj;
     int attn_conv_proj_type, ffn_conv_proj_type;
     void *key_cache, *value_cache;
+    /* Prompt injection is a large-M operation.  Keep only its K/V weights in
+     * BF16; draft decode continues to use the authoritative quantized
+     * matrices above. */
+    void *inject_k_bf16, *inject_v_bf16;
 } hllm_dflash_layer;
 
 typedef struct hllm_qwen35_dflash2 {
@@ -33,7 +37,7 @@ typedef struct hllm_qwen35_dflash2 {
     hipModule_t module;
     hipFunction_t fn_capture, fn_conv, fn_attention, fn_attention_combine;
     hipFunction_t fn_topk, fn_select;
-    void *fc, *enc_norm, *out_norm, *selector_hidden;
+    void *fc, *fc_bf16, *enc_norm, *out_norm, *selector_hidden;
     int fc_type, selector_hidden_type;
     qtensor selector_prev, selector_next;
     void *selector_prev_w, *selector_next_w;
@@ -43,7 +47,7 @@ typedef struct hllm_qwen35_dflash2 {
     hllm_dflash_layer layers[HLLM_DFLASH_LAYERS];
 
     /* All activation storage is row-major F32. */
-    void *features, *x, *norm, *dynamic, *conv;
+    void *features, *features_bf16, *x, *x_bf16, *norm, *dynamic, *conv;
     void *q, *k, *v, *attn, *attn_partial, *proj, *gate, *up;
     void *logits, *selector_gate;
     void *selector_candidates, *selector_drafts;
@@ -54,10 +58,12 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
     if (!d) return;
     if (r->stream) hipStreamSynchronize(r->stream);
 #define DFLASH_FREE(p) do { if (p) hipFree(p); } while (0)
-    DFLASH_FREE(d->fc); DFLASH_FREE(d->enc_norm); DFLASH_FREE(d->out_norm);
+    DFLASH_FREE(d->fc); DFLASH_FREE(d->fc_bf16);
+    DFLASH_FREE(d->enc_norm); DFLASH_FREE(d->out_norm);
     DFLASH_FREE(d->selector_hidden);
     DFLASH_FREE(d->selector_prev_w); DFLASH_FREE(d->selector_next_w);
-    DFLASH_FREE(d->features); DFLASH_FREE(d->x); DFLASH_FREE(d->norm);
+    DFLASH_FREE(d->features); DFLASH_FREE(d->features_bf16);
+    DFLASH_FREE(d->x); DFLASH_FREE(d->x_bf16); DFLASH_FREE(d->norm);
     DFLASH_FREE(d->dynamic); DFLASH_FREE(d->conv); DFLASH_FREE(d->q);
     DFLASH_FREE(d->k); DFLASH_FREE(d->v); DFLASH_FREE(d->attn);
     DFLASH_FREE(d->attn_partial);
@@ -73,7 +79,8 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
         DFLASH_FREE(cl->down); DFLASH_FREE(cl->attn_conv_base);
         DFLASH_FREE(cl->attn_conv_proj); DFLASH_FREE(cl->ffn_conv_base);
         DFLASH_FREE(cl->ffn_conv_proj); DFLASH_FREE(cl->key_cache);
-        DFLASH_FREE(cl->value_cache);
+        DFLASH_FREE(cl->value_cache); DFLASH_FREE(cl->inject_k_bf16);
+        DFLASH_FREE(cl->inject_v_bf16);
     }
 #undef DFLASH_FREE
     if (d->module) hipModuleUnload(d->module);
@@ -156,17 +163,34 @@ static int hllm_qwen35_dflash2_inject(hip_llm_runner *r, int position,
     hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
     if (!d || rows < 1 || rows > d->feature_rows) return -1;
     int ne = r->n_embd, kd = HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM;
-    hllm_dflash_project(r, d->x, d->fc, d->features, rows, ne,
-                        HLLM_DFLASH_LAYERS * ne,
-                        HLLM_DFLASH_LAYERS * ne, d->fc_type);
+    if (d->fc_bf16 && d->features_bf16) {
+        int feature_dim = HLLM_DFLASH_LAYERS * ne;
+        launch_pack_bf16_from_f32(r, d->features_bf16, d->features,
+                                  rows * feature_dim);
+        if (gemm_run_bf16_w(r, d->x, d->fc_bf16, d->features_bf16,
+                            rows, ne, feature_dim, r->stream) != 0) return -1;
+    } else {
+        hllm_dflash_project(r, d->x, d->fc, d->features, rows, ne,
+                            HLLM_DFLASH_LAYERS * ne,
+                            HLLM_DFLASH_LAYERS * ne, d->fc_type);
+    }
     launch_rmsnorm_batch(r, d->x, d->x, d->enc_norm, ne, rows, ne,
                          r->rms_norm_eps);
+    if (d->x_bf16)
+        launch_pack_bf16_from_f32(r, d->x_bf16, d->x, rows * ne);
     for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
         hllm_dflash_layer *cl = &d->layers[l];
-        hllm_dflash_project(r, d->k, cl->k, d->x, rows, kd, ne, ne,
-                            cl->k_type);
-        hllm_dflash_project(r, d->v, cl->v, d->x, rows, kd, ne, ne,
-                            cl->v_type);
+        if (d->x_bf16 && cl->inject_k_bf16 && cl->inject_v_bf16) {
+            if (gemm_run_bf16_w(r, d->k, cl->inject_k_bf16, d->x_bf16,
+                                rows, kd, ne, r->stream) != 0 ||
+                gemm_run_bf16_w(r, d->v, cl->inject_v_bf16, d->x_bf16,
+                                rows, kd, ne, r->stream) != 0) return -1;
+        } else {
+            hllm_dflash_project(r, d->k, cl->k, d->x, rows, kd, ne, ne,
+                                cl->k_type);
+            hllm_dflash_project(r, d->v, cl->v, d->x, rows, kd, ne, ne,
+                                cl->v_type);
+        }
         launch_qknorm_batch(r, d->k, cl->k_norm, HLLM_DFLASH_KV_HEADS,
                             HLLM_DFLASH_HEAD_DIM, rows, kd, r->rms_norm_eps);
         launch_rope_mrope_batch(r, d->k, HLLM_DFLASH_KV_HEADS, HLLM_DFLASH_HEAD_DIM,
@@ -191,6 +215,15 @@ static int hllm_dflash_upload_norm(const gguf_context *g, const char *name,
     qtensor t = hllm_load_tensor(g, name, 1);
     return (!t.data || (size_t)t.n_rows * t.n_cols != (size_t)n ||
             upload_norm_f32(dst, &t, n)) ? -1 : 0;
+}
+
+static int hllm_dflash_dequant_bf16(hip_llm_runner *r, void *dst, void *src,
+                                    int type, int rows, int cols) {
+    if (type == GGML_TYPE_Q4_K)
+        return launch_dequant_q4_K_to_bf16(r, dst, src, rows, cols);
+    if (type == GGML_TYPE_Q6_K)
+        return launch_dequant_q6_K_to_bf16(r, dst, src, rows, cols);
+    return -1;
 }
 
 int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
@@ -317,6 +350,41 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
     DALLOC(logits, HLLM_DFLASH_MAX_BLOCK*r->n_vocab);
     DALLOC(selector_gate, HLLM_DFLASH_MAX_BLOCK*HLLM_DFLASH_RANK);
 #undef DALLOC
+    /* The DFlash prompt cache is populated in 512-row tiles.  Its fusion
+     * projection is 5x wider than an ordinary model projection, and the
+     * decode-oriented Q4_K reuse kernel rereads that matrix for every tile
+     * row.  Dequantize the prompt-only fusion and K/V weights once so the
+     * existing large-M BF16 GEMM path can reuse them.  Proposal decode keeps
+     * the compact quantized weights and exact small-row kernels. */
+    if (d->fc_type == GGML_TYPE_Q4_K) {
+        size_t fc_elems = (size_t)ne * HLLM_DFLASH_LAYERS * ne;
+        if (hipMalloc(&d->fc_bf16, fc_elems * sizeof(uint16_t)) ||
+            launch_dequant_q4_K_to_bf16(r, d->fc_bf16, d->fc, ne,
+                                        HLLM_DFLASH_LAYERS * ne) ||
+            hipMalloc(&d->features_bf16,
+                      cap * HLLM_DFLASH_LAYERS * ne * sizeof(uint16_t)) ||
+            hipMalloc(&d->x_bf16, cap * ne * sizeof(uint16_t))) goto fail;
+        for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
+            hllm_dflash_layer *cl = &d->layers[l];
+            size_t kv_elems = (size_t)HLLM_DFLASH_KV_HEADS *
+                              HLLM_DFLASH_HEAD_DIM * ne;
+            if (hipMalloc(&cl->inject_k_bf16, kv_elems * sizeof(uint16_t)) ||
+                hipMalloc(&cl->inject_v_bf16, kv_elems * sizeof(uint16_t)) ||
+                hllm_dflash_dequant_bf16(r, cl->inject_k_bf16, cl->k,
+                    cl->k_type, HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM,
+                    ne) ||
+                hllm_dflash_dequant_bf16(r, cl->inject_v_bf16, cl->v,
+                    cl->v_type, HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM,
+                    ne)) goto fail;
+        }
+        if (hipStreamSynchronize(r->stream) != hipSuccess) goto fail;
+        if (r->verbose >= 1)
+            fprintf(stderr,
+                "DFlash2 prompt injection: cached %.1f MiB BF16 weights\n",
+                (double)(fc_elems + 2 * HLLM_DFLASH_LAYERS *
+                    (size_t)HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM * ne) *
+                    sizeof(uint16_t) / (1024.0 * 1024.0));
+    }
     if (hipMalloc(&d->selector_candidates,
             HLLM_DFLASH_MAX_BLOCK*HLLM_DFLASH_TOPK*sizeof(int)) ||
         hipMalloc(&d->selector_drafts,
