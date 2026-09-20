@@ -33474,9 +33474,6 @@ int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *s) {
         m->origin = -1;
         m->verify_rows = 0;
         m->verify_position = 0;
-        m->verify_quant_source = NULL;
-        m->verify_quant_rows = 0;
-        m->verify_quant_cols = 0;
     }
     return hipDeviceSynchronize() == hipSuccess ? 0 : -1;
 }

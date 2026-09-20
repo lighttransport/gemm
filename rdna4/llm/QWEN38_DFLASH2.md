@@ -19,12 +19,12 @@ committed only through the accepted row.  The corresponding target features
 are then injected into the draft cache, replacing the speculative rows.  A
 rejection therefore cannot alter later target output.
 
-The multi-row verifier is enabled only for greedy selection.  Its first row
-matches ordinary decode, while later rows currently have small logit changes
-from batching recurrent and projection work.  Greedy token choices pass the
-pinned fixtures; probabilistic and coding samplers use ordinary exact-target
-decode so the sidecar cannot change their token stream.  The runner prints
-`DFLASH2 sampled fallback=exact-target` when this happens.
+The exact multi-row verifier is enabled for greedy, probabilistic, and coding
+samplers. Every candidate row follows ordinary decode's projection, recurrent,
+Q8/Q8 attention, and rollback arithmetic. The runner prints
+`DFLASH2 sampled verifier=exact-window` for a sampled window. The target remains
+authoritative: the sampler sees target logits and only accepted target state is
+committed.
 
 ## Run
 
@@ -89,14 +89,15 @@ ASan/UBSan, and 10,000 randomized cases.  Warm results were:
 
 | Draft width / selection | Prefill tok/s | Decode tok/s | Output SHA-256 |
 |---|---:|---:|---|
-| K=4 / greedy | 606.22–606.73 | 60.83 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
-| K=7 / greedy | 607.36–608.28 | 85.35–85.44 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
-| sampled exact-target fallback | 605.92–607.82 | 40.17–40.23 | `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac` |
+| K=4 / greedy exact window | 605.43–605.74 | 59.43–59.50 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
+| K=4 / sampled exact window | 606.85–607.42 | 55.79–55.82 | `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac` |
+| K=7 / greedy exact window | 607.37–608.15 | 81.68–81.82 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
+| K=7 / sampled exact window | 605.37–605.85 | 68.67–68.78 | `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac` |
 
 The 4096-token early-context retrieval fixture also returns exactly
 `ZEPHYR-7319` with K=7, including the ordinary target's token sequence and
-EOS.  These results are under `tmp/qwen38/dflash2-qkprep-k4/`,
-`tmp/qwen38/dflash2-qkprep-k7/`, and
+EOS.  These results are under `tmp/qwen38/dflash2-sampled-window-k4/`,
+`tmp/qwen38/dflash2-sampled-window-k7/`, and
 `tmp/qwen38/dflash2-retrieval-k7.*`.
 
 The upstream llama.cpp server reference accepted 37/40 drafts at K=4 on the
@@ -126,6 +127,18 @@ queries in the same four-wave block.  It preserves each query's quantization,
 online softmax, packed-F16 accumulation and split-combine order.  The draft
 also reuses Q4_K weights and holds one K/V vector while evaluating four mask
 rows.
+
+Sampled parity exposed three verifier-specific hazards. Non-FFN IQ1_S
+projections must use the scalar path's MMQ-scale interpretation, so their
+batched launch now uses the same MMQ-scale kernel with the candidate row in
+the grid Y dimension. Attention split counts must be selected independently
+for each causal query, so the native query grid applies the ordinary adaptive
+split policy in one launch. Finally, all verifier projections share one Q8_1
+scratch allocation inside the captured graph; each projection now restages
+that scratch instead of treating source-pointer identity as proof that its
+contents are still live. With these fixes, all 135 sampled target rows match
+the former ordinary exact-target trace bit-for-bit, including every stored
+248,320-entry logit row.
 
 The exact fixed-eight Q2_K/IQ kernels and IQ4_XS multi-row projection use
 eight-wave, 256-thread blocks. This changes only the assignment of eight
@@ -160,10 +173,12 @@ It replaces six launches with one in each of the 16 attention layers, removing
 80 launches per decoded target row. The fused kernel retains the separate
 operators' reduction order, trigonometric operations, Q8 scale rounding and
 integer conversion. The complete K=4 and K=7 greedy and sampled C++ gates
-remain byte-identical to the pinned llama.cpp fixtures. At a zero-length
-prefix, ordinary throughput is unchanged at 42.53--42.65 tok/s; at the 4K
-coding shape, sampled exact-target fallback improves from 39.84--39.93 to
-40.17--40.23 tok/s.
+remain byte-identical to the pinned llama.cpp fixtures. Both emitted functions
+pass ASan/UBSan, fixed edge cases, and 10,000 randomized cases. At K=7, the
+exact sampled window sustains 68.67--68.78 tok/s instead of the former
+40.17--40.23 tok/s scalar fallback. K=4 sustains 55.79--55.82 tok/s; its
+shorter draft does less useful work per verifier launch and remains below the
+60 tok/s speculative target.
 
 The same K=7 path was measured after a fully processed 65,536-token random
 prefix. Prefix processing sustained 443.57 tok/s with hash
@@ -233,9 +248,9 @@ tok/s. `LLM_QWEN35_IQ_SHAPE_THREADS=0` restores the diagnostic fallback.
 
 ## Remaining optimization opportunities
 
-The short-context K=7 response emits 46 tokens in 566.72 ms, clearing the
-60 tok/s target with about 35 percent throughput headroom. DFlash also clears
-40 tok/s after a real random-token 64K prefix. Ordinary one-token decode now
+The current 4K C++ gate sustains 68.67--68.78 tok/s for sampled K=7 and
+81.68--81.82 tok/s for greedy K=7, clearing the 60 tok/s target. DFlash also
+clears 40 tok/s after a real random-token 64K prefix. Ordinary one-token decode now
 reaches 34.98 tok/s at 64K after exact GQA reuse, grouped K/Q scale products,
 packed-probability reuse and scalar IQ codebook staging, so work that helps
 both ordinary and verifier execution remains useful. The following order
@@ -260,31 +275,26 @@ reflects the remaining measured costs.
    weight staging. A WMMA or reordered reduction path needs full
    output-token and logit validation because the current kernels preserve the
    target arithmetic order.
-2. **Verifier attention tail.** The shared-K/V kernel dominates the remaining
-   long-context verifier time and still writes split partials for a second
-   combine launch. An exact in-kernel combine or adaptive split policy may
-   reduce the tail if it preserves the pinned arithmetic at the selected split
-   count.
-3. **Exact sampled multi-row verification.** Audit the first divergent
-   verifier row against repeated scalar target decode, beginning with the
-   recurrent checkpoints and compact projection inputs.  Enable DFlash for
-   probabilistic sampling only after every verifier row produces the ordinary
-   target logits bitwise and both pinned sampling fixtures still match.
-4. **Hybrid recurrent tail.** Sequential candidate recurrence and rollback
+2. **Verifier attention tail.** The query-grid verifier now selects ordinary
+   decode's split count independently for every causal row. It still writes
+   split partials for a second combine launch, and that shared-K/V pass
+   dominates the long-context verifier tail. Fuse the combine only if the
+   selected split count and packed-F16 accumulation order remain exact.
+3. **Hybrid recurrent tail.** Sequential candidate recurrence and rollback
    checkpoints are already batched and device-local. Alpha/beta F16 work now
    shares one exact launch per recurrent layer. DeltaNet, state preparation,
    checkpoint copies, and the remaining matrix-vector work remain visible;
    fuse preparation with the recurrence where exact row rollback is retained.
-5. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
+4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
    and Q8/Q8 KV storage are now fused exactly. The remaining small launches
    include SiLU/gating and state preparation. Fuse adjacent operations when
    their intermediate values need no external checkpoint.
-6. **Remaining draft cost.** Top-k and selector decisions already run on the
+5. **Remaining draft cost.** Top-k and selector decisions already run on the
    GPU, and packed Q4_K/Q8_1 projections cut draft work to 77.239 ms at 4K and
    474.117 ms across the 256-token 64K suffix. Position-parallel attention and
    cheaper draft-cache storage are the next candidates, provided K=4/K=7
    acceptance and authoritative output remain stable.
-7. **Prompt-cache injection.**  The 4K and random 64K prefill targets are now
+6. **Prompt-cache injection.**  The 4K and random 64K prefill targets are now
    met, but the five feature taps and sidecar K/V injection still consume
    avoidable bandwidth.  Fuse tap capture with target hidden writes, batch the
    five sidecar injections, and overlap independent sidecar work with the next

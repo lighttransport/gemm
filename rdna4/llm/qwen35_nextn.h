@@ -18,8 +18,6 @@ typedef struct hllm_qwen35_mtp {
     void *verify_x, *verify_logits, *verify_positions, *verify_argmax;
     void *verify_norm, *verify_gate, *verify_up;
     void *verify_q, *verify_scales;
-    void *verify_quant_source;
-    int verify_quant_rows, verify_quant_cols;
     void *verify_ssm_qkv, *verify_ssm_z, *verify_ssm_alpha, *verify_ssm_beta, *verify_ssm_out;
     void *verify_attn_parts, *verify_attn_meta;
     void *verify_conv[128], *verify_rec[128];
@@ -317,6 +315,8 @@ static void hllm_dense_mtp_res_rmsnorm_batch(hip_llm_runner *r, void *x,
 static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
         void *x, int rows, int nr, int nc, int type) {
     hllm_qwen35_mtp *m = r->qwen35_mtp;
+    hip_layer *active = r->active_layer >= 0 && r->active_layer < r->n_layers ?
+        &r->layers[r->active_layer] : NULL;
     if (rows <= HLLM_DENSE_MTP_REUSE_ROWS && nc % 256 == 0 && nc <= r->n_ff &&
         (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M)) {
         /* The generic batch scratch is shared by mixed-format projections.
@@ -325,9 +325,23 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
         launch_quantize_q81_iq1_batch(r, x, nc, rows, nc);
         hipFunction_t iq1_fn = type == GGML_TYPE_IQ1_S ?
             r->fn_matvec_iq1_s_q81_reuse8 : r->fn_matvec_iq1_m_q81_reuse8;
-        void *a[] = { &dst, &w, &r->d_act_q8_batch, &r->d_act_scale_batch,
-                      &r->d_act_scale_batch_b, &nr, &nc, &rows };
-        LAUNCH(iq1_fn, (nr+7)/8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        void *a[] = { &dst, &w, &r->d_act_q8_batch,
+                      &r->d_act_scale_batch, &r->d_act_scale_batch_b,
+                      &nr, &nc, &rows };
+        const char *mmq_env = type == GGML_TYPE_IQ1_S ?
+            getenv("LLM_IQ1S_MMQ_SCALES") : NULL;
+        int ffn_role = active && (w == active->ffn_gate_w ||
+            w == active->ffn_up_w || w == active->ffn_down_w);
+        if (type == GGML_TYPE_IQ1_S && !ffn_role && mmq_env &&
+            atoi(mmq_env) != 0) {
+            int threads = nr < nc ? 64 : 256;
+            int rows_per_block = threads/32;
+            LAUNCH(r->fn_matvec_iq1_s_mmq_scales,
+                   (nr+rows_per_block-1)/rows_per_block, rows, 1,
+                   threads, 1, 1, 0, r->stream, a);
+        } else {
+            LAUNCH(iq1_fn, (nr+7)/8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        }
         r->q8x2_reuse_valid = r->iq1_q8_valid = r->batch_q8_valid = 0;
         return;
     }
@@ -346,16 +360,13 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
         case GGML_TYPE_IQ4_XS: fn = r->fn_qwen35_matvec_iq4xs; break;
     }
     if (fn && nc % 256 == 0 && nc <= r->n_ff) {
-        if (m->verify_quant_source != x || m->verify_quant_rows != rows ||
-            m->verify_quant_cols != nc) {
-            int total = rows*nc;
-            void *qa[] = { &m->verify_q, &m->verify_scales, &x, &total };
-            LAUNCH(r->fn_qwen35_quantize_q81, total/32, 1, 1, 32, 1, 1, 0,
-                   r->stream, qa);
-            m->verify_quant_source = x;
-            m->verify_quant_rows = rows;
-            m->verify_quant_cols = nc;
-        }
+        /* The captured graph reuses one quantized scratch allocation for all
+         * projections.  Always restage it: pointer identity does not imply
+         * that an earlier graph node's contents survive later scratch writes. */
+        int total = rows*nc;
+        void *qa[] = { &m->verify_q, &m->verify_scales, &x, &total };
+        LAUNCH(r->fn_qwen35_quantize_q81, total/32, 1, 1, 32, 1, 1, 0,
+               r->stream, qa);
         void *a[] = { &dst, &w, &m->verify_q, &m->verify_scales, &nr, &nc };
         if (type == GGML_TYPE_Q2_K) {
             if (rows == HLLM_DENSE_MTP_REUSE_ROWS) {
@@ -414,7 +425,7 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
             launch_matvec_ffn_auto(r, (float *)dst+(size_t)i*nr, w,
                 (float *)x+(size_t)i*nc, nr, nc, type, 0);
     }
-    r->q8x2_reuse_valid = r->iq1_q8_valid = 0;
+    r->q8x2_reuse_valid = r->iq1_q8_valid = r->batch_q8_valid = 0;
 }
 
 static void hllm_dense_mtp_ssm(hip_llm_runner *r, hip_layer *cl, int l, int rows,
@@ -547,11 +558,14 @@ static void hllm_dense_mtp_attention(hip_llm_runner *r, hip_layer *cl,
         LAUNCH(r->fn_kv_cache_store_q8q8_devp, r->n_kv_heads, 1, 1,
                256, 1, 1, 0, r->stream, a);
     }
+    /* The fixed-split reuse kernel is exact for a requested split count, but
+     * ordinary decode selects splits independently for each causal row.  The
+     * native query grid preserves that selector in one batched launch. */
     launch_attn_verify_native_q8(r, r->d_attn_out_batch,
         m->verify_attn_parts, m->verify_attn_meta, r->d_q_batch,
         r->d_key_cache[l], r->d_value_cache[l], r->d_key_cache_scale[l],
         r->d_value_cache_scale[l], m->verify_positions, rows,
-        rows <= 8);
+        0);
     launch_sigmoid_mul(r, r->d_attn_out_batch, r->d_attn_gate_batch,
                        rows*qd);
     hllm_dense_mtp_projection(r, r->d_attn_proj_batch,

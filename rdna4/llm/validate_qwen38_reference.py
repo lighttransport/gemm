@@ -57,7 +57,7 @@ def main():
     parser.add_argument("--mtp", type=Path, help="dense NextN sidecar, with exact target window verification")
     parser.add_argument("--mtp-draft", type=int, default=3)
     parser.add_argument("--dflash2", type=Path,
-                        help="DFlash2 sidecar; greedy target windows and sampled target fallback")
+                        help="DFlash2 sidecar with exact greedy and sampled target windows")
     parser.add_argument("--dflash2-draft", type=int, default=7)
     parser.add_argument("--cpp-merge", action="store_true")
     args = parser.parse_args()

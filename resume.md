@@ -1,16 +1,15 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
-## Optimized native DFlash2 (2026-09-20)
+## Optimized native DFlash2 (2026-09-21)
 
 The runner now loads the IncoAI Qwen3.8-27B DFlash2 Q4_K_M sidecar and runs
 its five-layer block-diffusion graph entirely through HIP.  Target inputs from
 layers 6/20/34/48/62 seed a private 2048-token draft KV ring.  The rank-256,
 top-16 selector proposes up to seven tokens, while the Q8/Q8
-target window remains the only source of greedy emitted tokens and committed
-state.  Later rows in a batched window are not yet logit-bitwise identical to
-ordinary scalar decode, so probabilistic and coding samplers now bypass the
-window and use exact-target decode.  This prevents the sidecar from changing
-sampled output while the remaining verifier-row gap is investigated.
+target window remains the only source of emitted tokens and committed state.
+Greedy, probabilistic, and coding samplers now all use the batched target
+window. Every sampled verifier row matches the former ordinary exact-target
+trace bit-for-bit, including all 135 stored 248,320-entry logit rows.
 
 On the 4096-token C clamp prompt, K=4 accepted 37/40 drafts and K=7 accepted
 41/42.  Both produced the ordinary target's exact 46-token response, EOS and
@@ -26,14 +25,23 @@ decode baseline.  Both short-context performance targets are met.
 The broader 4096-token C++ merge-intervals gate now passes at K=4 and K=7.
 Greedy output matches the pinned llama.cpp bytes and token IDs with SHA-256
 `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354`;
-temperature-0.6 output uses the exact-target fallback and matches SHA-256
+temperature-0.6 output uses the exact multi-row target window and matches SHA-256
 `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac`.
 Both functions pass ASan/UBSan, fixed edge cases and 10,000 randomized cases.
-Warm K=7 greedy runs sustain 607.36–608.28 tok/s prefill and
-85.35–85.44 tok/s decode. K=4 sustains 606.22–606.73 and 60.83.
-Sampled exact-target decode sustains 40.17–40.23 tok/s. The early-context
+Warm K=7 runs sustain 607.37–608.15 tok/s prefill and 81.68–81.82 tok/s
+greedy decode; sampled decode sustains 605.37–605.85 and 68.67–68.78 tok/s.
+K=4 sustains 605.43–607.42 tok/s prefill, 59.43–59.50 greedy decode, and
+55.79–55.82 sampled decode. The early-context
 retrieval gate also emits exactly `ZEPHYR-7319` at K=7 with the pinned token
 sequence and EOS.
+
+Three fixes closed sampled verifier parity. Non-FFN IQ1_S projections now use
+the scalar path's MMQ-scale arithmetic in one batched launch. Q8/Q8 verifier
+attention uses the native query grid so each causal row retains ordinary
+decode's adaptive split count. Each captured-graph projection restages the
+shared Q8_1 scratch because source-pointer identity did not prove that earlier
+scratch contents survived later writes. The exact weight-reuse kernels remain
+enabled.
 
 The prefill regression was a fast-math reassociation in the fixed 128-wide
 GDA kernel.  A fixed-bound four-iteration loop now matches the generic
@@ -146,11 +154,11 @@ run keeps prefix/suffix hashes `90178de69a24a76e`/`f4b35758fb99e6db` and
 measures 441.44 tok/s prefill plus 34.98 tok/s ordinary decode. Use
 `LLM_QWEN35_IQ_SHAPE_THREADS=0` only for the eight-wave diagnostic fallback.
 
-Prioritize ordinary one-row target projection traffic first, followed by the
-long-context verifier attention tail, sampled verifier-row parity audit, and
+Prioritize ordinary one-row target projection traffic first, followed by an
+exact in-kernel combine for the long-context verifier attention tail and
 fusion of the remaining activation/state-preparation launches.
-The shared-K/V attention path may still benefit from an exact in-kernel
-combine or an adaptive split policy.  DFlash prompt feature capture and
+The shared-K/V attention path already uses the ordinary adaptive split policy.
+DFlash prompt feature capture and
 sidecar-cache injection are secondary prefill targets now that both 4K and
 random 64K prefill clear their goals.  Detailed priorities and validation
 gates are in the linked DFlash2 document.
@@ -159,8 +167,8 @@ CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
 and `--kv-cache q8q8`.  `validate_qwen38_reference.py` accepts `--dflash2`
 and `--dflash2-draft` for the greedy/sampled C++ gate.  Current artifacts are
-under `tmp/qwen38/dflash2-qkprep-k4/`,
-`tmp/qwen38/dflash2-qkprep-k7/`, and
+under `tmp/qwen38/dflash2-sampled-window-k4/`,
+`tmp/qwen38/dflash2-sampled-window-k7/`, and
 `tmp/qwen38/dflash2-retrieval-k7.*`.  Details and the reproduction command:
 [QWEN38_DFLASH2.md](rdna4/llm/QWEN38_DFLASH2.md).
 
