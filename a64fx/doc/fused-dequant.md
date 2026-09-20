@@ -10,8 +10,9 @@ low-bit kernel therefore has a simple rule:
 > immediately, and write only accumulators or final output.
 
 This chapter develops that rule from standalone dequantization through a fused
-INT4-to-SDOT kernel. The examples are real kernels and measurements from this
-repository, not a claim that one layout fits every quantization format.
+INT4-to-SDOT kernel, sequential FP16 FMA, and exact E4M3FN decoding with
+modest packing expansion. The examples are real kernels and measurements
+from this repository, not a claim that one layout fits every quantization format.
 
 ## The machine-level constraint
 
@@ -343,7 +344,7 @@ These are still unscaled M=1 probes. Full results and rejected schedules are
 in [RESULTS.md](../dequant-pipe/RESULTS.md); raw acceptance logs are under
 `tmp/dequant/w4a16-acceptance.s5EThb/`.
 
-### Eight-bit weights: INT8 meets the read-bandwidth target, FP8 does not
+### Native eight-bit storage: INT8 meets 220 GB/s, FP8 does not
 
 The follow-up keeps one byte per weight and tests both FP16 and FP32
 activations with same-width sequential FMA accumulation. Signed INT8 widens
@@ -374,8 +375,9 @@ All eighteen final runs had 227.63--229.77 GB/s paired reads, 2 MiB pages
 on NUMA node 4, and twelve 2.0 GHz cores. Thus the FP8 misses are not
 slow-placement results. Exhaustive code-point tests and sequential scalar
 FMA comparisons pass; finite results match bits and NaNs match classification.
-These remain unscaled probes, and FP8 performance acceptance is explicitly
-**FAIL**. The full commands, launch medians, rejected decoders, and outstanding
+These remain unscaled probes, and native-layout FP8 performance acceptance
+at 220 GB/s is explicitly **FAIL**. The expanded E4M3FN layout below addresses
+the later >200 GB/s target separately. The full commands, launch medians, rejected decoders, and outstanding
 work are in [RESULTS.md](../dequant-pipe/RESULTS.md); reproduce with
 `bash a64fx/dequant-pipe/run_w8_acceptance.sh`.
 
@@ -415,22 +417,63 @@ Including a 64-byte tile header, storage grows by 12.70% for FP16 and 12.89%
 for FP32. This replaces the original special-value correction tables in the
 hot FP16 loop with a shift and predicated sign operation.
 
-Three fresh launches reach **203.39--204.32 GB/s of original FP8 bytes** with
-FP16 FMA, corresponding to 229.21--230.26 GB/s of stored input. The FP32
-path reaches 183.83--183.95 original GB/s, or 207.53--207.67 stored GB/s;
-it still fails the >200 original-byte target. Paired reads are
-228.38--229.80 GB/s. Expansion cannot be counted as useful original-byte
-throughput when comparing to the native 143.2/92.2 GB/s kernels.
+The P9 layout crosses the revised **>200 GB/s original-byte target for
+W8A16**. Three fresh launches, each with five timed trials, give:
+
+| path | native original GB/s | P9 original GB/s | P9 stored GB/s | >200 original |
+|:-----|---------------------:|-----------------:|---------------:|:--------------|
+| W8A16, FP16 FMA | 143.18--143.20 | **203.39--204.32** | 229.21--230.26 | PASS |
+| W8A32, FP32 FMA | 92.24--92.25 | 183.83--183.95 | 207.53--207.67 | FAIL |
+
+Original-byte rate is `original FP8 weight count / elapsed time`; stored-byte
+rate includes the sign plane and tile headers. Both charge decoding and FMA
+to elapsed time. Each launch streams 240 MiB of original weights, including
+all finite subnormal codes, ten times per trial on CPUs 12--23 at 2.0 GHz.
+Allocations use 2 MiB pages on NUMA node 4. Paired reads on the same stored
+arenas reach 228.38--229.80 GB/s. FP16 therefore approaches the measured
+memory ceiling after expansion; FP32 still leaves a decode/scheduling gap.
+
+The layout has K=128 and N=256 for FP16 or N=128 for FP32. Each K row stores
+N magnitude bytes followed by N/8 sign bytes. Including the tile header,
+these are 36,928- and 18,496-byte records. Weight generation plus packing
+costs about 3.2 seconds per 240 MiB in this benchmark and is outside kernel
+timing; this combined number includes the random-input generator.
 
 FP32 decodes finite weights at an exact `2^-112` scale and reuses activations
 scaled by `2^112`, preserving each exact product and sequential FMA rounding.
-A preparation guard and native fallback cover activation overflow risk,
-nondefault FPCR and weight NaNs. Preparation takes about 548 ns per 128
+Preparation requires FPCR=0 and finite `|a| <= 0x1.fffffep15`; callers must
+keep FPCR unchanged until use. Unsafe activations or weight NaNs select
+unpacking followed by the original native FP32 kernel. Preparation takes about 548 ns per 128
 activations, reusable across output tiles and excluded from the kernel rate.
 All FP8 codes, guard boundaries and subnormal inputs pass output comparisons;
 NaN payloads and exception flags are outside this contract. These remain
 unscaled, fixed-shape M=1 probes. The [full result log](../dequant-pipe/RESULTS.md)
 and [packing contract](../dequant-pipe/e4_pack.h) describe the costs and limits.
+
+
+Transposing the sign plane raises the exploratory FP32 result from 140.94
+to 174.44 GB/s; interleaving sign reconstruction with FMA and unrolling eight
+K steps raises it further to the measured 183.83--183.95 GB/s range. Each
+output still accumulates in ascending K order. An exactly-eight-bit biased
+encoding reaches about 186 GB/s for FP16, below the revised target. A simpler
+FP32 rescaling that creates subnormal weight operands passed output checks
+but reached only 7.17 GB/s on all-finite weights, so it was discarded.
+
+Reproduce the correctness checks and the separate P9 performance gate with:
+
+```sh
+mkdir -p tmp/dequant
+TMPDIR="$PWD/tmp/dequant" make -C a64fx/dequant-pipe test CC=fcc
+bash a64fx/dequant-pipe/run_e4_p9_acceptance.sh
+# acceptance=FAIL qualified=6/6 passed_targets=3/6
+```
+
+The combined gate intentionally remains a failure until FP32 also exceeds
+200 GB/s in original bytes. Raw launch logs and source/binary hashes are in
+`tmp/dequant/e4-p9-acceptance.oaCn3W/`. The implementation is in
+[e4_pack.S](../dequant-pipe/e4_pack.S) and
+[e4_pack.c](../dequant-pipe/e4_pack.c); scales, tails and model integration
+remain separate work.
 
 ## Placement and threading
 
