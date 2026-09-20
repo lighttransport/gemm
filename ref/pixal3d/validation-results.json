@@ -2234,6 +2234,69 @@
         "reason": "Desktop GPU processes were present. Correctness, output exactness, allocator deltas, and same-binary A/B decisions are retained; controlled historical runs remain the performance claims."
       }
     },
+    "main_release_followup": {
+      "scope": "selected mid- and low-priority main-release work; Direct3D-S2, HIP-specific work, and physical 8/12 GB hardware validation excluded",
+      "service": {
+        "per_view_masks": true,
+        "reference_reuses_prepared_rgba": true,
+        "queued_artifacts_direct_to_job_storage": true,
+        "streamed_downloads": true,
+        "rendered_comparison": true,
+        "disk_admission": true,
+        "bounded_logs": true,
+        "cancellable_cross_process_device_lock": true,
+        "graceful_shutdown": true,
+        "unit_tests": 25,
+        "browser_integration": "pass"
+      },
+      "cuda_architectures": {
+        "default": "sm_120",
+        "compile_checked": [
+          "sm_80",
+          "sm_89",
+          "sm_120"
+        ]
+      },
+      "cpu_fallback": {
+        "fixture": "saved CUDA-house shape-1024, 256 tokens, 30 blocks, 8 threads",
+        "baseline_median_seconds": 6.898388,
+        "optimized_median_seconds": 6.034122,
+        "improvement_percent": 12.5,
+        "outputs_byte_identical": true
+      },
+      "postprocess_followup": {
+        "fixture": "saved CUDA-jester decoder outputs, 4096 textures, 1000000 triangle target",
+        "restored_replay_seconds": 94.499,
+        "maximum_rss_kib": 3172004,
+        "glb_sha256": "6d8c267b006df8cf60e3c5ea71d470e89c3cb734f61b91b5e1c622e1f711a8b7",
+        "retained_changes": 0,
+        "rejected_candidates": [
+          "GNU parallel stable sort for UV grouping",
+          "parallel face-plane setup and simplifier vector preallocation"
+        ]
+      },
+      "quality_corpus": {
+        "manifest_assets": 7,
+        "runner": "ref/pixal3d/check.py",
+        "validated_run": {
+          "name": "crab-smoke",
+          "seed": 42,
+          "texture_size": 1024,
+          "triangle_target": 250000,
+          "seconds": 432.7749373469269,
+          "artifact_sha256": "03ed07c1bf393abdba0e2469c55cb9884fd0aeadef3ebc3ddc7762fda280d40f",
+          "vertices": 231931,
+          "triangles": 249104,
+          "zero_area_faces": 0,
+          "referenced_zero_normals": 0,
+          "components": 102,
+          "largest_component_area_fraction": 0.9781306863734973,
+          "peak_active_device_bytes": 10620476712,
+          "peak_reserved_device_bytes": 11392995116,
+          "effective_budget_bytes": 11685986304
+        }
+      }
+    },
     "evidence_policy": [
       "Artifact hashes are retained here; large GLBs, model files, renders, and logs remain outside git.",
       "Timings marked non-isolated or unknown are functional observations and must not be used as isolated performance claims.",

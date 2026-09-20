@@ -9,6 +9,16 @@ RMBG/MoGe preparation, GLB/PLY export, and the Python web demo are implemented.
 
 Recent commits:
 
+- `d7a11c23` optimizes the exact CPU fallback by 12.5% on the retained
+  all-30-block benchmark.
+- `51e9d0c8` parameterizes CUDA builds for `sm_80`, `sm_89`, and `sm_120`.
+- `31f7429e` adds the pinned seven-asset quality corpus, component diagnostics,
+  and tiered regression runner.
+- `9a1cc619` adds service disk admission, bounded logs, device locks, and
+  graceful shutdown.
+- `2cbad68a` adds opt-in same-job rendered native/reference comparison.
+- `057306b6` adds per-view masks, exact prepared-reference inputs, direct queued
+  artifact publication, and streamed downloads.
 - `60e49173` reconciles retained performance measurements and their scope.
 - `3258a09f` evaluates and rejects unhelpful CUDA activation packing/tiling.
 - `13a50a3b` reduces byte-identical postprocessing allocations and UV overhead.
@@ -58,7 +68,7 @@ Important measured results:
   RMS `0.015580` for the pinned public upstream image. Both web tests used one
   serialized CUDA worker while desktop GPU processes remained.
 
-## Completed in the current follow-up
+## Completed follow-ups
 
 - Added an opt-in, reproducible real queued HTTP/CUDA harness using a public
   upstream image pinned by Git revision and SHA-256. It covers automatic RMBG,
@@ -89,12 +99,41 @@ Important measured results:
   applies the configured TTL and retention limit, removes corrupt or
   incomplete records, and marks interrupted queued/running jobs failed with
   the stable `server_restarted` error code.
+- Added one explicit mask per multiview input. Automatic and explicit masking
+  now resolve once and feed the identical prepared RGBA views to native and
+  pinned PyTorch inference.
+- Queued GLB, PLY, and reference results are written directly to job-local
+  partial files and atomically published. Artifact GETs stream bounded chunks;
+  synchronous `POST /v1/infer` retains its compatibility base64 response.
+- Added opt-in four-view rendered comparison to paired jobs, including preview
+  artifacts, RGB error, PSNR, and silhouette IoU.
+- Added disk admission with HTTP 507, bounded persistent logs, cancellable
+  per-device Linux locks, log retrieval, and graceful signal shutdown.
+- Added the resumable `check.py` runner and pinned seven-asset corpus. The first
+  real RTX 5060 Ti corpus run (`crab-smoke`, seed 42, 1024 textures, 250k target)
+  passed in 434.3 s. Its 249,104-triangle GLB has no zero-area faces or
+  referenced zero normals; the largest exact-weld component contains 97.81% of
+  surface area. Peak native reserved storage was 10.61 GiB at the 12 GiB budget.
+- CUDA targets are selected with `GPU_ARCH=sm_80|sm_89|sm_120`; `sm_120`
+  remains the default and all three compile checks pass.
+- CPU fallback avoids redundant low-precision weight rounding, vectorizes bias
+  rounding, and reuses attention scratch. The retained 30-block median improved
+  from 6.8984 s to 6.0341 s (12.5%) with byte-identical tensors.
+- Two final deterministic postprocess candidates were measured and removed.
+  The restored 4K/1M replay completed in 94.50 s at 3,172,004 KiB maximum RSS
+  and retained SHA-256 `6d8c267b...11a8b7`.
 
-## Remaining work, in priority order
+## Remaining validation and optional work
 
-The five-item main-release follow-up is complete. No unresolved high-priority
-Pixal3D task is known. Future work should begin from a measured regression,
-new supported hardware requirement, or a separately approved feature.
+The selected implementation plan is complete. The corpus runner is resumable,
+but its remaining six smoke assets, two alternate seeds, four full-resolution
+assets, and house/jester PyTorch-render pairs are intentionally long-running and
+have not all been materialized in `tmp/` on this checkout. Run them unattended
+with `--tier quality`; completed runs resume from hashed result records.
+
+Physical validation on actual 8 GB and 12 GB cards remains outside the approved
+scope. The existing 7168/12288 MiB bounded runs on the 16 GB RTX 5060 Ti remain
+the release evidence. No unresolved implementation defect is known.
 
 ## Explicitly out of scope
 
@@ -132,6 +171,8 @@ ref/pixal3d/run.sh cuda ref/pixal3d/validate_rmbg.py \
 
 ref/pixal3d/run.sh cpu -m unittest server.pixal3d.test_app
 ref/pixal3d/run.sh cpu server/pixal3d/test_browser.py
+ref/pixal3d/run.sh cpu ref/pixal3d/check.py --tier quick
+ref/pixal3d/run.sh cuda ref/pixal3d/check.py --tier quality
 
 ref/pixal3d/run.sh cpu ref/pixal3d/replay_postprocess.py \
   --dump-dir tmp/pixal3d/resident-runs/cuda-jester/dumps \
@@ -149,9 +190,11 @@ Torch-ABI extensions for `sm_120`.
 ```text
 Resume Pixal3D work in /mnt/nvme02/work/gemm/pixal3d on branch pixal3d.
 Read AGENTS.md and resume-pixal3d.md first. Treat the current worktree and
-artifacts as authoritative. The five-item main-release follow-up is complete;
-start by reproducing the specific regression or new requirement that prompted
-the next work.
+artifacts as authoritative. The selected main-release implementation plan is
+complete. Resume the quality corpus if comprehensive evidence is needed, using
+`ref/pixal3d/run.sh cuda ref/pixal3d/check.py --tier quality`; it reuses hashed
+completed outputs. Otherwise start by reproducing the specific regression or
+new requirement that prompted the next work.
 Keep scope on Pixal3D main. Exclude Direct3D-S2/paper work, all HIP/ROCm-specific
 work, previously excluded items 1 and 15, and git push. Use the per-project uv
 environments and repository tmp/ only. Preserve the verified 7168 MiB minimum

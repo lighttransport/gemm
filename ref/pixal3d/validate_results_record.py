@@ -19,7 +19,7 @@ required = {
     "hardware", "checkpoint_provenance", "four_view_native_budget_runs",
     "four_view_pytorch_reference", "mask_provenance", "cuda_reliability_soak",
     "byte_identical_postprocess_replay", "real_queued_http_cuda", "evidence_policy",
-    "cuda_optimization_evaluation",
+    "cuda_optimization_evaluation", "main_release_followup",
 }
 assert required <= extended.keys(), required - extended.keys()
 
@@ -88,6 +88,24 @@ assert {item["stage"] for item in trajectories} == {
     "structure", "shape512", "shape1024", "texture",
 }
 assert max(item["nrmse"] for item in trajectories) < .001
+
+followup = extended["main_release_followup"]
+assert followup["service"]["per_view_masks"]
+assert followup["service"]["reference_reuses_prepared_rgba"]
+assert followup["cuda_architectures"]["default"] == "sm_120"
+assert followup["cuda_architectures"]["compile_checked"] == [
+    "sm_80", "sm_89", "sm_120",
+]
+assert followup["cpu_fallback"]["improvement_percent"] >= 10
+assert followup["cpu_fallback"]["outputs_byte_identical"]
+assert (followup["postprocess_followup"]["glb_sha256"] ==
+        postprocess["artifact"]["sha256"])
+quality = followup["quality_corpus"]
+assert quality["manifest_assets"] == 7
+assert quality["validated_run"]["triangles"] > 0
+assert quality["validated_run"]["zero_area_faces"] == 0
+assert (quality["validated_run"]["peak_reserved_device_bytes"] <=
+        quality["validated_run"]["effective_budget_bytes"])
 
 
 def artifacts(value):

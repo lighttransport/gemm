@@ -118,6 +118,17 @@ duplicate at construction peak. The final replay's measured maximum RSS was
 `06ad7053...15a0`; it was rejected and removed because closest-point tie order
 must remain byte-identical.
 
+A final follow-up retested two deterministic parallelization candidates against
+the same saved decoder tensors. GNU parallel stable sort in UV grouping retained
+the established SHA-256, but reduced unwrap from 14.94 s to only 14.24 s and the
+complete replay from 95.58 s to 93.49 s (2.2%). Parallel face-plane setup plus
+preallocated simplifier vectors regressed the complete replay to 98.18 s. Both
+experiments were removed: neither met the retention rule of at least 5% complete
+replay improvement, 15% target-phase improvement without a total regression, or
+10% peak-RSS reduction with no more than 2% slowdown. The restored source replay
+completed in 94.50 s, used 3,172,004 KiB maximum RSS, and reproduced SHA-256
+`6d8c267b...11a8b7`. No additional postprocessing change was retained.
+
 Reproduce with:
 
 ```sh

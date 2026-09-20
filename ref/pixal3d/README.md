@@ -251,6 +251,13 @@ render comparisons. Required paired thresholds are symmetric Chamfer RMS below
 20 dB, and every available silhouette IoU above 0.95. Use `--runs NAME ...`
 for a bounded subset and `--no-resume` to regenerate existing outputs.
 
+The retained RTX 5060 Ti smoke check used `--runs crab-smoke` at the 12288 MiB
+budget. It completed generation and validation in 434.3 s, produced 249,104
+triangles with no zero-area faces or referenced zero normals, and reserved
+10.61 GiB at peak. Exact-position welding found 102 components, with 97.81% of
+surface area in the largest. The remaining corpus entries are long-running;
+rerun the same command without `--runs` to complete or resume all of them.
+
 `--tier all` runs every tier and requires `--postprocess-dump DIR`. Its final
 4096/1M replay must retain the established byte-identical GLB SHA-256
 `6d8c267b006df8cf60e3c5ea71d470e89c3cb734f61b91b5e1c622e1f711a8b7`.
