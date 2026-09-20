@@ -11,8 +11,10 @@ $PythonExe = Join-Path $Venv "Scripts\python.exe"
 
 Push-Location $Root
 try {
-    uv venv --python $Python $Venv
-    if ($LASTEXITCODE) { throw "uv venv failed" }
+    if (-not (Test-Path $PythonExe)) {
+        uv venv --python $Python $Venv
+        if ($LASTEXITCODE) { throw "uv venv failed" }
+    }
     uv pip install --python $PythonExe --index-url https://download.pytorch.org/whl/cu128 `
         "torch==2.7.1" "torchvision==0.22.1"
     if ($LASTEXITCODE) { throw "PyTorch installation failed" }

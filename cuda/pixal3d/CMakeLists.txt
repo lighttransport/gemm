@@ -1,13 +1,12 @@
 cmake_minimum_required(VERSION 3.24)
-project(pixal3d_cuda LANGUAGES CXX CUDA)
-
-find_package(CUDAToolkit REQUIRED)
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
-
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING
         "CUDA architectures for Pixal3D (for example 86 for RTX 3070)")
 endif()
+project(pixal3d_cuda LANGUAGES CXX CUDA)
+
+find_package(CUDAToolkit REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 get_filename_component(PIXAL3D_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(FA2_INCLUDE "${PIXAL3D_ROOT}/tmp/pixal3d/fa2.inc")

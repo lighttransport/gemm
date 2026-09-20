@@ -16,10 +16,12 @@ if (-not (Test-Path $PythonExe)) {
     throw "Missing $PythonExe; run ref\pixal3d\setup_windows.ps1 first"
 }
 if (-not $CudaRoot) {
-    $CudaRoot = $env:CUDA_PATH
-}
-if (-not $CudaRoot) {
-    $CudaRoot = Join-Path $Root ".cuda\13.3"
+    $LocalCuda = Join-Path $Root ".cuda\13.3"
+    $CudaRoot = if (Test-Path (Join-Path $LocalCuda "bin\nvcc.exe")) {
+        $LocalCuda
+    } else {
+        $env:CUDA_PATH
+    }
 }
 if (-not $CudaRoot -or -not (Test-Path (Join-Path $CudaRoot "bin\nvcc.exe"))) {
     throw "A complete NVIDIA CUDA Toolkit with nvcc.exe is required; pass -CudaRoot or set CUDA_PATH"
