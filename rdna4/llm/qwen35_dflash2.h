@@ -416,7 +416,14 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
     hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
     hllm_qwen35_mtp *m = r ? r->qwen35_mtp : NULL;
     if (!d || !m || m->verify_rows || !drafts || count < 1 || count > 7 ||
-        anchor < 0 || anchor >= r->n_vocab || position != d->kv_end) return -1;
+        anchor < 0 || anchor >= r->n_vocab || position != d->kv_end) {
+        fprintf(stderr,
+            "DFlash2 propose rejected: d=%d verifier=%d drafts=%d count=%d "
+            "anchor=%d position=%d kv_end=%d\n",
+            d != NULL, m ? m->verify_rows : -1, drafts != NULL, count,
+            anchor, position, d ? d->kv_end : -1);
+        return -1;
+    }
     int rows=count+1, ne=r->n_embd, qd=HLLM_DFLASH_HEADS*HLLM_DFLASH_HEAD_DIM;
     int kd=HLLM_DFLASH_KV_HEADS*HLLM_DFLASH_HEAD_DIM;
     launch_embed_iq1_m(r,d->x,r->d_token_embd,anchor,ne);
@@ -486,9 +493,24 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         &d->selector_next_w,&d->selector_candidates,&d->selector_drafts,
         &anchor,&rows,&r->n_vocab};
     LAUNCH(d->fn_select,1,1,1,32,1,1,0,r->stream,sa);
-    if (hipMemcpyAsync(drafts,d->selector_drafts,(size_t)count*sizeof(int),
-            hipMemcpyDeviceToHost,r->stream) || hipStreamSynchronize(r->stream) ||
-        r->qwen4_forward_error) return -1;
+    hipError_t copy_error = hipMemcpyAsync(drafts, d->selector_drafts,
+        (size_t)count * sizeof(int), hipMemcpyDeviceToHost, r->stream);
+    hipError_t sync_error = copy_error == hipSuccess ?
+        hipStreamSynchronize(r->stream) : hipSuccess;
+    if (copy_error != hipSuccess || sync_error != hipSuccess ||
+        r->qwen4_forward_error) {
+        const char *copy_string = "unknown", *sync_string = "unknown";
+        if (hipGetErrorString) {
+            hipGetErrorString(copy_error, &copy_string);
+            hipGetErrorString(sync_error, &sync_string);
+        }
+        fprintf(stderr,
+            "DFlash2 propose failed: copy=%s sync=%s forward_error=%d "
+            "position=%d count=%d\n",
+            copy_string, sync_string,
+            r->qwen4_forward_error, position, count);
+        return -1;
+    }
     return 0;
 }
 

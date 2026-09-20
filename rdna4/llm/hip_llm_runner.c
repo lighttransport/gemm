@@ -8670,7 +8670,7 @@ static const char *hip_kernel_source =
 "__device__ __forceinline__ void iq1_s_q81_body(float *dst,const unsigned char *mat,\n"
 "        const signed char *q,const float *sd,const float *ss,int n_rows,\n"
 "        int n_cols,int M,int mmq_scales){\n"
-"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*(blockDim.x/32)+warp,token=blockIdx.y;\n"
 "    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*8; float sum=0.0f;\n"
 "    const unsigned char *rp=mat+(size_t)row*nb*50; const signed char *tq=q+(size_t)token*n_cols;\n"
 "    const float *td=sd+(size_t)token*(n_cols/32),*ts=ss+(size_t)token*(n_cols/32);\n"
@@ -8949,7 +8949,7 @@ static const char *hip_kernel_source =
 "__global__ void matvec_iq1_m_q81_batch(float *dst,const unsigned char *mat,\n"
 "        const signed char *q,const float *sd,const float *ss,int n_rows,\n"
 "        int n_cols,int M){\n"
-"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*(blockDim.x/32)+warp,token=blockIdx.y;\n"
 "    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*32; float sum=0.0f;\n"
 "    const unsigned char *rp=mat+(size_t)row*nb*56; const signed char *tq=q+(size_t)token*n_cols;\n"
 "    const float *td=sd+(size_t)token*(n_cols/32);\n"
@@ -8968,8 +8968,8 @@ static const char *hip_kernel_source =
 "        unsigned int grid=iq1s_grid_gpu_dev[gi];\n"
 "        int w0=(int)(grid & 0x0f0f0f0fu);\n"
 "        int w1=(int)((grid >> 4) & 0x0f0f0f0fu);\n"
-"        const int *u=(const int*)xp; int z=dp4a_hw(w0,u[0],0); z=dp4a_hw(w1,u[1],z); int qsum=0;\n"
-"        for(int j=0;j<8;++j)qsum+=(int)xp[j];\n"
+"        const int *u=(const int*)xp; int z=dp4a_hw(w0,u[0],0); z=dp4a_hw(w1,u[1],z);\n"
+"        int qsum=dp4a_hw(0x01010101,u[0],0);qsum=dp4a_hw(0x01010101,u[1],qsum);\n"
 "        sum+=base*(float)scode*td[qb]*((float)z+delta*(float)qsum);\n"
 "    }\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
@@ -8990,7 +8990,8 @@ static const char *hip_kernel_source =
 "        float delta=(hv&((l&1)?0x80:0x08))?(-1.0f-0.125f):(-1.0f+0.125f);\n"
 "        unsigned int grid=iq1s_grid_gpu_dev[gi];int w0=(int)(grid&0x0f0f0f0fu),w1=(int)((grid>>4)&0x0f0f0f0fu);\n"
 "        for(int t=0;t<M;++t){const signed char *xp=q+(size_t)t*nc+(size_t)qb*32+l*8;const int *u=(const int*)xp;\n"
-"            int z=dp4a_hw(w0,u[0],0);z=dp4a_hw(w1,u[1],z);int qsum=0;for(int j=0;j<8;++j)qsum+=(int)xp[j];\n"
+"            int z=dp4a_hw(w0,u[0],0);z=dp4a_hw(w1,u[1],z);\n"
+"            int qsum=dp4a_hw(0x01010101,u[0],0);qsum=dp4a_hw(0x01010101,u[1],qsum);\n"
 "            sum[t]+=base*(float)scode*sd[(size_t)t*qblocks+qb]*((float)z+delta*(float)qsum);}\n"
 "    }\n"
 "    for(int t=0;t<M;++t){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
@@ -21560,7 +21561,15 @@ static inline int launch_iq1_q81_scalar(hip_llm_runner *r, hipFunction_t fn,
            32, 1, 1, 0, r->stream, qa);
     void *args[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
                      &r->d_act_scale_b, &n_rows, &n_cols, &one };
-    LAUNCH(fn, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+    /* Measured exact geometries on gfx1201. IQ1_S benefits from two waves on
+     * the wide down projection; IQ1_M's heavier codebook decode benefits from
+     * two waves for tall projections and sixteen for the wide down shape. */
+    int iq1_m = fn == r->fn_matvec_iq1_m_q81_batch;
+    int threads = iq1_m ? (n_rows >= n_cols ? 64 : 512) :
+                           (n_rows < n_cols ? 64 : 256);
+    int rows_per_block = threads / 32;
+    LAUNCH(fn, (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+           threads, 1, 1, 0, r->stream, args);
     return 1;
 }
 static inline void launch_matvec_iq1_s(hip_llm_runner *r, void *dst, void *mat,
@@ -31243,7 +31252,11 @@ static int batched_path_eligible(const hip_llm_runner *r, int M) {
     if (!r->batch_path_ok && !r->qwen4_grouped_verify) return 0;
     if (r->qwen4_grouped_verify &&
         (!r->d_x_batch || !r->d_qwen4_logits_batch || !r->d_moe_out_batch)) return 0;
-    if (M < r->gemm_m_threshold) return 0;
+    /* DFlash prompt-cache injection consumes hidden taps captured by the
+     * batched Qwen3.5 driver.  A short tail after a cached/random prefix must
+     * use that same driver or the target position advances while the
+     * sidecar's circular KV cache does not. */
+    if (M < r->gemm_m_threshold && !r->qwen35_dflash2) return 0;
     /* Qwen4 carries recurrent/PLE state between chunks.  The single-chunk
      * batched path is parity-checked, but a 2K request split into multiple
      * device batches has not been proven safe on gfx1201 (a failed experiment
@@ -32811,6 +32824,9 @@ struct hip_llm_state_snapshot {
     size_t index_bytes;
     void *nextn_key_host, *nextn_value_host;
     size_t nextn_kv_bytes;
+    void **dflash_key_host, **dflash_value_host;
+    size_t dflash_kv_bytes;
+    int dflash_kv_end;
 };
 
 void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
@@ -32823,6 +32839,14 @@ void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
     free(s->rec_host);
     free(s->conv_bytes);
     free(s->rec_bytes);
+    if (s->dflash_key_host || s->dflash_value_host) {
+        for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
+            free(s->dflash_key_host ? s->dflash_key_host[l] : NULL);
+            free(s->dflash_value_host ? s->dflash_value_host[l] : NULL);
+        }
+    }
+    free(s->dflash_key_host);
+    free(s->dflash_value_host);
     free(s->ple_host);
     if (s->kv_key_host && s->kv_value_host) {
         for (int l = 0; l < s->n_layers; ++l) {
@@ -32952,6 +32976,25 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
         s->ple_history[0] = r->ple_history[0];
         s->ple_history[1] = r->ple_history[1];
     }
+    if (r->qwen35_dflash2) {
+        hllm_qwen35_dflash2 *d = r->qwen35_dflash2;
+        s->dflash_key_host = calloc(HLLM_DFLASH_LAYERS, sizeof(void *));
+        s->dflash_value_host = calloc(HLLM_DFLASH_LAYERS, sizeof(void *));
+        s->dflash_kv_bytes = (size_t)HLLM_DFLASH_WINDOW *
+            HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM * sizeof(float);
+        s->dflash_kv_end = d->kv_end;
+        if (!s->dflash_key_host || !s->dflash_value_host) goto fail;
+        for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
+            s->dflash_key_host[l] = malloc(s->dflash_kv_bytes);
+            s->dflash_value_host[l] = malloc(s->dflash_kv_bytes);
+            if (!s->dflash_key_host[l] || !s->dflash_value_host[l] ||
+                hipMemcpy(s->dflash_key_host[l], d->layers[l].key_cache,
+                          s->dflash_kv_bytes, hipMemcpyDeviceToHost) != hipSuccess ||
+                hipMemcpy(s->dflash_value_host[l], d->layers[l].value_cache,
+                          s->dflash_kv_bytes, hipMemcpyDeviceToHost) != hipSuccess)
+                goto fail;
+        }
+    }
     return s;
 fail:
     hip_llm_free_state_snapshot(s);
@@ -33007,6 +33050,36 @@ int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *s) {
         if(!r->qwen4_nextn_fusion_loaded ||
            hipMemcpy((char *)r->d_qwen4_nextn_key_cache+s->kv_start*stride,s->nextn_key_host,s->nextn_kv_bytes,hipMemcpyHostToDevice) ||
            hipMemcpy((char *)r->d_qwen4_nextn_value_cache+s->kv_start*stride,s->nextn_value_host,s->nextn_kv_bytes,hipMemcpyHostToDevice))return -1;
+    }
+    if (s->dflash_key_host) {
+        hllm_qwen35_dflash2 *d = r->qwen35_dflash2;
+        if (!d) return -1;
+        for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
+            if (hipMemcpy(d->layers[l].key_cache, s->dflash_key_host[l],
+                          s->dflash_kv_bytes, hipMemcpyHostToDevice) != hipSuccess ||
+                hipMemcpy(d->layers[l].value_cache, s->dflash_value_host[l],
+                          s->dflash_kv_bytes, hipMemcpyHostToDevice) != hipSuccess)
+                return -1;
+        }
+        d->kv_end = s->dflash_kv_end;
+        d->feature_rows = 0;
+    }
+    /* A snapshot contains persistent request state, not the contents of the
+     * scratch quantization buffers.  Reused device addresses can otherwise
+     * make the next request treat scratch left by the previous repeat as a
+     * valid quantization of its first activation. */
+    r->q8x2_reuse_valid = 0;
+    r->iq1_q8_valid = 0;
+    r->batch_q8_valid = 0;
+    r->qwen4_forward_error = 0;
+    if (r->qwen35_mtp) {
+        hllm_qwen35_mtp *m = r->qwen35_mtp;
+        m->origin = -1;
+        m->verify_rows = 0;
+        m->verify_position = 0;
+        m->verify_quant_source = NULL;
+        m->verify_quant_rows = 0;
+        m->verify_quant_cols = 0;
     }
     return hipDeviceSynchronize() == hipSuccess ? 0 : -1;
 }
