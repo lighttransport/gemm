@@ -133,6 +133,9 @@ class Cdp:
                                                 "selector": selector})
         self.call("DOM.setFileInputFiles", {"nodeId": node["nodeId"], "files": paths})
 
+    def close(self):
+        self.sock.close()
+
 
 def wait_for(cdp, expression, timeout=10):
     deadline = time.monotonic() + timeout
@@ -164,6 +167,7 @@ def main():
                 [chrome, "--headless=new", "--no-sandbox", "--disable-gpu",
                  "--remote-debugging-port=0", f"--user-data-dir={profile}", "about:blank"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cdp = None
             try:
                 active = Path(profile) / "DevToolsActivePort"
                 deadline = time.monotonic() + 10
@@ -210,8 +214,21 @@ def main():
                 wait_for(cdp, "document.getElementById('status').textContent.includes('cancelled')")
                 print("Pixal3D functional browser test: PASS")
             finally:
-                process.terminate()
-                process.wait(timeout=10)
+                if cdp is not None:
+                    try:
+                        cdp.call("Browser.close")
+                    except (EOFError, OSError, RuntimeError):
+                        pass
+                    cdp.close()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
     finally:
         server.shutdown()
         server.server_close()

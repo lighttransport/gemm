@@ -459,6 +459,121 @@ class PixalServerTest(unittest.TestCase):
             jobs.delete(submitted["id"])
             self.assertFalse(artifact_dir.exists())
 
+    def test_completed_job_survives_restart(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="job-recovery-", dir=scratch) as td:
+            class ArtifactPixal:
+                work_dir = Path(td)
+                def infer(self, request, cancel=None, progress=None):
+                    return {"ok": True,
+                            "glb_b64": base64.b64encode(b"native-glb").decode(),
+                            "ply_b64": base64.b64encode(b"native-ply").decode()}
+                def reference(self, request, cancel=None):
+                    return {"glb_b64": base64.b64encode(b"reference-glb").decode()}
+
+            first = app.JobQueue(ArtifactPixal(), retained=2)
+            submitted = first.submit({"reference": True})
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                status = first.status(submitted["id"], include_result=True)
+                if status["state"] == "complete":
+                    break
+                time.sleep(0.01)
+            self.assertEqual(status["state"], "complete")
+
+            directory = Path(td) / "results" / submitted["id"]
+            manifest = json.loads((directory / "job.json").read_text())
+            self.assertEqual((manifest["version"], manifest["state"]), (1, "complete"))
+            self.assertNotIn("request", manifest)
+            self.assertFalse(any(path.name.endswith(".tmp") for path in directory.iterdir()))
+
+            recovered = app.JobQueue(ArtifactPixal(), retained=2)
+            status = recovered.status(submitted["id"], include_result=True)
+            self.assertEqual(status["state"], "complete")
+            self.assertTrue(status["result"]["ok"])
+            self.assertEqual(recovered.artifact(submitted["id"], "native.glb").read_bytes(),
+                             b"native-glb")
+            self.assertEqual(recovered.artifact(submitted["id"], "native.ply").read_bytes(),
+                             b"native-ply")
+            self.assertEqual(recovered.artifact(submitted["id"], "reference.glb").read_bytes(),
+                             b"reference-glb")
+            self.assertTrue(recovered.delete(submitted["id"])["deleted"])
+            self.assertFalse(directory.exists())
+
+    def test_interrupted_job_is_failed_on_restart(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="job-interrupted-", dir=scratch) as td:
+            class IdlePixal:
+                work_dir = Path(td)
+
+            job_id = "a" * 32
+            directory = Path(td) / "results" / job_id
+            directory.mkdir(parents=True)
+            now = time.time()
+            (directory / "native.glb").write_bytes(b"partial")
+            (directory / "job.json").write_text(json.dumps({
+                "version": 1, "id": job_id, "state": "running",
+                "phase": "shape diffusion", "progress": 47,
+                "created_at": now - 10, "updated_at": now - 1,
+            }))
+
+            recovered = app.JobQueue(IdlePixal(), retained=2)
+            status = recovered.status(job_id)
+            self.assertEqual(status["state"], "failed")
+            self.assertEqual(status["phase"], "failed")
+            self.assertEqual(status["progress"], 47)
+            self.assertEqual(status["error_code"], "server_restarted")
+            self.assertIn("server restarted", status["error"])
+            self.assertFalse((directory / "native.glb").exists())
+            manifest = json.loads((directory / "job.json").read_text())
+            self.assertEqual(manifest["state"], "failed")
+            self.assertEqual(manifest["error_code"], "server_restarted")
+
+    def test_recovery_expires_old_and_removes_corrupt_jobs(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="job-expiry-", dir=scratch) as td:
+            class IdlePixal:
+                work_dir = Path(td)
+
+            root = Path(td) / "results"
+            old_id = "b" * 32
+            corrupt_id = "c" * 32
+            incomplete_id = "d" * 32
+            old = root / old_id
+            corrupt = root / corrupt_id
+            incomplete = root / incomplete_id
+            old.mkdir(parents=True)
+            corrupt.mkdir()
+            incomplete.mkdir()
+            now = time.time()
+            (old / "job.json").write_text(json.dumps({
+                "version": 1, "id": old_id, "state": "failed",
+                "phase": "failed", "progress": 0,
+                "created_at": now - 20, "updated_at": now - 10,
+                "error_code": "execution_failed", "error": "old",
+            }))
+            (corrupt / "job.json").write_text("not-json")
+            (incomplete / "job.json").write_text(json.dumps({
+                "version": 1, "id": incomplete_id, "state": "complete",
+                "phase": "complete", "progress": 100,
+                "created_at": now - 1, "updated_at": now,
+                "result": {"ok": True},
+            }))
+
+            recovered = app.JobQueue(IdlePixal(), retained=2, ttl=1)
+            with self.assertRaises(KeyError):
+                recovered.status(old_id)
+            with self.assertRaises(KeyError):
+                recovered.status(corrupt_id)
+            with self.assertRaises(KeyError):
+                recovered.status(incomplete_id)
+            self.assertFalse(old.exists())
+            self.assertFalse(corrupt.exists())
+            self.assertFalse(incomplete.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

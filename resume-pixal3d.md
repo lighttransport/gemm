@@ -9,6 +9,7 @@ RMBG/MoGe preparation, GLB/PLY export, and the Python web demo are implemented.
 
 Recent commits:
 
+- `60e49173` reconciles retained performance measurements and their scope.
 - `3258a09f` evaluates and rejects unhelpful CUDA activation packing/tiling.
 - `13a50a3b` reduces byte-identical postprocessing allocations and UV overhead.
 - `d73dde4b` consolidates reproducible Pixal3D validation evidence.
@@ -84,17 +85,16 @@ Important measured results:
 - Reconciled performance wording across native, optimization, reference, web,
   and resume documentation; retained timings now identify mode, fixture,
   concurrency and serialization scope.
+- Added atomic on-disk web job manifests. Startup restores complete results,
+  applies the configured TTL and retention limit, removes corrupt or
+  incomplete records, and marks interrupted queued/running jobs failed with
+  the stable `server_restarted` error code.
 
 ## Remaining work, in priority order
 
-### 1. Optional service durability
-
-Queued artifacts are file-backed, but job metadata remains in memory and is
-discarded on server restart. If the demo is promoted beyond a workstation
-tool, add an atomic on-disk job manifest and startup recovery for terminal
-results. Preserve current TTL/deletion behavior and never resurrect running
-jobs as active; mark interrupted work failed with a clear reason. This is lower
-priority than inference and validation work.
+The five-item main-release follow-up is complete. No unresolved high-priority
+Pixal3D task is known. Future work should begin from a measured regression,
+new supported hardware requirement, or a separately approved feature.
 
 ## Explicitly out of scope
 
@@ -149,9 +149,9 @@ Torch-ABI extensions for `sm_120`.
 ```text
 Resume Pixal3D work in /mnt/nvme02/work/gemm/pixal3d on branch pixal3d.
 Read AGENTS.md and resume-pixal3d.md first. Treat the current worktree and
-artifacts as authoritative. Work through the prioritized remaining tasks,
-starting with the optional persistent terminal-job manifests and startup
-recovery if the workstation service warrants the added state.
+artifacts as authoritative. The five-item main-release follow-up is complete;
+start by reproducing the specific regression or new requirement that prompted
+the next work.
 Keep scope on Pixal3D main. Exclude Direct3D-S2/paper work, all HIP/ROCm-specific
 work, previously excluded items 1 and 15, and git push. Use the per-project uv
 environments and repository tmp/ only. Preserve the verified 7168 MiB minimum

@@ -75,14 +75,20 @@ memory. The synchronous `POST /v1/infer` response keeps its original base64
 fields for API compatibility.
 Job status includes a monotonic `progress` percentage and a `phase` derived
 from native conditioning, diffusion, mesh, and texture milestones.
-The bounded in-memory queue defaults to four active requests and four retained
-terminal results; change it with `--retained-jobs`.
+The bounded worker queue defaults to four active requests and four retained
+terminal results; change it with `--retained-jobs`. Each state transition is
+written to an atomic `results/ID/job.json` manifest. On startup, completed
+jobs and their artifact URLs are restored. Work that was queued or running
+when the process stopped is retained as failed with `server_restarted`; it is
+never submitted again automatically. Invalid manifests and incomplete
+artifact sets are removed during recovery.
 Terminal jobs expire after 24 hours by default. Deleting a completed, failed,
 or cancelled job releases it immediately; deleting queued or running work
 continues to request cancellation. Configure expiry with `--job-ttl` in seconds.
 Errors include a stable `error_code` such as `invalid_request`, `queue_full`,
-`timeout`, `not_found`, or `internal_error`. Queue saturation returns HTTP 429,
-and `/health` publishes request, image, output, and view-count limits.
+`timeout`, `not_found`, `server_restarted`, or `internal_error`. Queue
+saturation returns HTTP 429, and `/health` publishes request, image, output,
+and view-count limits.
 
 The browser sends each image as raw bytes to `POST /v1/uploads`, then places
 the returned `upload_id` in `image_upload`, `mask_upload`, or each view's
@@ -174,6 +180,10 @@ Keep `tmp/pixal3d/web-runs` on a local filesystem with room for uploads and
 generated assets. Queued output artifacts are retained under its `results`
 directory until job expiry or deletion. Size `--retained-jobs` and filesystem
 capacity for native GLB, optional PLY, and reference GLB output together.
+Keep that directory on one local filesystem: manifests are flushed to a
+temporary file beside the final path and installed with an atomic rename.
+Recovery applies the configured TTL and retained-job limit before serving
+requests.
 
 Use a service manager to restart the process and set a file-descriptor limit
 appropriate for concurrent uploads. Check `GET /health` after startup and

@@ -13,6 +13,7 @@ import binascii
 import copy
 import json
 import math
+import os
 from pathlib import Path
 import queue
 import re
@@ -678,7 +679,11 @@ class PixalServer:
 
 
 class JobQueue:
-    """Bounded in-memory queue for long-running demo requests."""
+    """Bounded queue with atomic manifests for retained job results."""
+    MANIFEST = "job.json"
+    MANIFEST_VERSION = 1
+    TERMINAL = ("complete", "failed", "cancelled")
+
     def __init__(self, pixal: PixalServer, retained: int = 4,
                  uploads: UploadStore | None = None, ttl: float = 86400):
         self.pixal = pixal
@@ -692,12 +697,109 @@ class JobQueue:
         self.result_root = Path(work_dir) / "results" if work_dir is not None else None
         if self.result_root is not None:
             self.result_root.mkdir(parents=True, exist_ok=True)
-            for path in self.result_root.iterdir():
-                if path.is_dir():
-                    shutil.rmtree(path)
-                else:
-                    path.unlink(missing_ok=True)
+            self._recover()
         threading.Thread(target=self._worker, daemon=True, name="pixal3d-jobs").start()
+
+    @staticmethod
+    def _public_job(job: dict) -> dict:
+        return {key: value for key, value in job.items()
+                if key != "request" and not key.startswith("_")}
+
+    def _persist_locked(self, job: dict) -> None:
+        if self.result_root is None:
+            return
+        directory = self.result_root / job["id"]
+        directory.mkdir(parents=True, exist_ok=True)
+        job["_artifact_dir"] = directory
+        payload = {"version": self.MANIFEST_VERSION, **self._public_job(job)}
+        temporary = directory / f".{self.MANIFEST}.{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("x") as handle:
+                json.dump(payload, handle, separators=(",", ":"), allow_nan=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, directory / self.MANIFEST)
+            descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _artifact_paths(directory: Path, result: dict) -> dict[str, Path]:
+        stored = {}
+        expected = [(result, "glb", "native.glb", True),
+                    (result, "ply", "native.ply", False)]
+        if isinstance(result.get("reference"), dict):
+            expected.append((result["reference"], "glb", "reference.glb", True))
+        for container, public, name, required in expected:
+            artifacts = container.get("artifacts")
+            if not isinstance(artifacts, dict) or public not in artifacts:
+                if required:
+                    raise ValueError(f"recovered result has no {name}")
+                continue
+            path = directory / name
+            if not path.is_file():
+                raise ValueError(f"missing recovered artifact {name}")
+            stored[name] = path
+            artifacts[public] = f"/v1/jobs/{directory.name}/artifacts/{name}"
+        return stored
+
+    def _recover(self) -> None:
+        now = time.time()
+        recovered = []
+        for directory in self.result_root.iterdir():
+            if (not directory.is_dir() or
+                    re.fullmatch(r"[0-9a-f]{32}", directory.name) is None):
+                if directory.is_dir():
+                    shutil.rmtree(directory, ignore_errors=True)
+                else:
+                    directory.unlink(missing_ok=True)
+                continue
+            try:
+                payload = json.loads((directory / self.MANIFEST).read_text())
+                if (payload.get("version") != self.MANIFEST_VERSION or
+                        payload.get("id") != directory.name or
+                        payload.get("state") not in (*self.TERMINAL, "queued", "running")):
+                    raise ValueError("invalid job manifest")
+                created = float(payload["created_at"])
+                updated = float(payload["updated_at"])
+                if not math.isfinite(created) or not math.isfinite(updated):
+                    raise ValueError("invalid job timestamps")
+                if payload["state"] in self.TERMINAL and updated < now - self.ttl:
+                    shutil.rmtree(directory, ignore_errors=True)
+                    continue
+                job = {key: value for key, value in payload.items() if key != "version"}
+                job.update(created_at=created, updated_at=updated)
+                job.update(_cancel=threading.Event(), _uploads=[], _artifact_dir=directory,
+                           _artifacts={})
+                if job["state"] in ("queued", "running"):
+                    progress = int(job.get("progress", 0))
+                    shutil.rmtree(directory)
+                    directory.mkdir()
+                    job.pop("result", None)
+                    job.update(state="failed", phase="failed",
+                               progress=max(0, min(progress, 99)),
+                               updated_at=now, completed_at=now, error_code="server_restarted",
+                               error="server restarted before job completed",
+                               _artifact_dir=directory, _artifacts={})
+                elif job["state"] == "complete":
+                    if not isinstance(job.get("result"), dict):
+                        raise ValueError("complete job has no result")
+                    job["_artifacts"] = self._artifact_paths(directory, job["result"])
+                recovered.append(job)
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                shutil.rmtree(directory, ignore_errors=True)
+        recovered.sort(key=lambda job: job["updated_at"], reverse=True)
+        for job in recovered[:self.retained]:
+            self.jobs[job["id"]] = job
+            if job["state"] == "failed" and job.get("error_code") == "server_restarted":
+                self._persist_locked(job)
+        for job in recovered[self.retained:]:
+            shutil.rmtree(job["_artifact_dir"], ignore_errors=True)
 
     def _remove_artifacts_locked(self, job: dict) -> None:
         directory = job.get("_artifact_dir")
@@ -708,7 +810,7 @@ class JobQueue:
         if self.result_root is None:
             return
         directory = self.result_root / job_id
-        directory.mkdir()
+        directory.mkdir(parents=True, exist_ok=True)
         stored = {}
 
         def save(container: dict, field: str, name: str, public: str) -> None:
@@ -760,6 +862,7 @@ class JobQueue:
             self.jobs[job_id] = {"id": job_id, "state": "queued", "phase": "queued", "progress": 0,
                                  "created_at": now, "updated_at": now, "request": request,
                                  "_cancel": threading.Event(), "_uploads": upload_paths}
+            self._persist_locked(self.jobs[job_id])
         self.pending.put(job_id)
         return self.status(job_id)
 
@@ -769,8 +872,8 @@ class JobQueue:
             if job_id not in self.jobs:
                 raise KeyError(job_id)
             job = self.jobs[job_id]
-            out = {key: value for key, value in job.items()
-                   if key not in ("request", "result") and not key.startswith("_")}
+            out = {key: value for key, value in self._public_job(job).items()
+                   if key != "result"}
             out["queue_position"] = self._queue_position(job_id) if job["state"] == "queued" else None
             if include_result and job["state"] == "complete":
                 out["result"] = job["result"]
@@ -784,12 +887,14 @@ class JobQueue:
             job = self.jobs[job_id]
             if job["state"] == "queued":
                 job.update(state="cancelled", phase="cancelled", updated_at=time.time())
+                self._persist_locked(job)
             elif job["state"] == "running":
                 job["cancel_requested"] = True
                 job["_cancel"].set()
                 job["updated_at"] = time.time()
-            return {key: value for key, value in job.items()
-                    if key not in ("request", "result") and not key.startswith("_")}
+                self._persist_locked(job)
+            return {key: value for key, value in self._public_job(job).items()
+                    if key != "result"}
 
     def delete(self, job_id: str) -> dict:
         with self.lock:
@@ -804,6 +909,7 @@ class JobQueue:
                     job["cancel_requested"] = True
                     job["_cancel"].set()
                     job["updated_at"] = time.time()
+                self._persist_locked(job)
                 return {"id": job_id, "state": job["state"], "deleted": False}
             self.jobs.pop(job_id)
             self._remove_artifacts_locked(job)
@@ -827,14 +933,19 @@ class JobQueue:
 
     def _update(self, job_id: str, **values):
         with self.lock:
-            self.jobs[job_id].update(values, updated_at=time.time())
+            job = self.jobs[job_id]
+            job.update(values, updated_at=time.time())
+            if "state" in values:
+                self._persist_locked(job)
 
     def _worker(self):
         while True:
             job_id = self.pending.get()
             try:
                 with self.lock:
-                    job = self.jobs[job_id]
+                    job = self.jobs.get(job_id)
+                    if job is None:
+                        continue
                     if job["state"] == "cancelled":
                         continue
                     request = job["request"]
@@ -872,7 +983,8 @@ class JobQueue:
                              completed_at=time.time())
             finally:
                 with self.lock:
-                    paths = self.jobs[job_id].get("_uploads", [])
+                    job = self.jobs.get(job_id)
+                    paths = [] if job is None else job.get("_uploads", [])
                 for path in paths:
                     path.unlink(missing_ok=True)
                 self.pending.task_done()
