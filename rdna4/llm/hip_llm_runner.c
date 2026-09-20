@@ -975,6 +975,22 @@ static const char *hip_kernel_source =
 "        gate[i] = g * up[i];\n"
 "    }\n"
 "}\n"
+"/* Decode FFN activation plus exact native Q8_1 staging.  One wave owns one\n"
+" * 32-value block, so this retains the standalone SiLU arithmetic while\n"
+" * replacing the following qwen35_quantize_q81 launch and reread. */\n"
+"__global__ void silu_mul_q81_f32(float *gate, const float *up,\n"
+"        signed char *q, float *qscale, int n) {\n"
+"    int lane=threadIdx.x, i=blockIdx.x*32+lane;\n"
+"    float g=gate[i];\n"
+"    g=g/(1.0f+expf(-g));\n"
+"    float v=g*up[i];\n"
+"    gate[i]=v;\n"
+"    float a=fabsf(v);\n"
+"    for(int off=16;off;off>>=1)a=fmaxf(a,__shfl_xor(a,off,32));\n"
+"    float d=q8_div_contract(a,127.0f);\n"
+"    q[i]=a==0.0f?0:(signed char)roundf(q8_div_contract(v,d));\n"
+"    if(lane==0)qscale[blockIdx.x]=round_f16_contract(d);\n"
+"}\n"
 "\n"
 "/* Repack compact GGUF Q8_0 blocks (34 B) into the runner's aligned 36 B\n"
 " * cache representation directly on-device. One warp owns one block. */\n"
@@ -12968,6 +12984,7 @@ struct hip_llm_runner {
     hipFunction_t fn_attn_decode_f32;
     hipFunction_t fn_attn_prefill_scalar_f32;
     hipFunction_t fn_silu_mul_f32;
+    hipFunction_t fn_silu_mul_q81_f32;
     hipFunction_t fn_swiglu_limit_f32;
     hipFunction_t fn_q8_0_compact_to_padded;
     hipFunction_t fn_qwen4_stage_misses;
@@ -14083,6 +14100,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(kv_cache_store_devp);
     GET_FUNC(attn_decode_f32_devp);
     GET_FUNC(silu_mul_f32);
+    GET_FUNC(silu_mul_q81_f32);
     GET_FUNC(swiglu_limit_f32);
     GET_FUNC(q8_0_compact_to_padded);
     GET_FUNC(qwen4_stage_misses);
@@ -20100,6 +20118,16 @@ static inline void launch_native_q81(hip_llm_runner *r, void *x, int n) {
     r->native_q81_valid = r->q8x2_reuse_active;
 }
 
+static inline void launch_silu_mul_native_q81(hip_llm_runner *r, void *gate,
+        void *up, int n) {
+    void *a[] = { &gate, &up, &r->d_native_q81, &r->d_native_scale, &n };
+    LAUNCH(r->fn_silu_mul_q81_f32, n / 32, 1, 1, 32, 1, 1,
+           0, r->stream, a);
+    r->native_q81_source = gate;
+    r->native_q81_n = n;
+    r->native_q81_valid = 1;
+}
+
 static inline void launch_qwen35_argmax(hip_llm_runner *r, void *x, void *out) {
     int groups=(r->n_vocab+4095)/4096;
     if (r->fn_qwen35_argmax_parts && groups <= 256) {
@@ -21379,6 +21407,13 @@ static inline void end_q8x2_reuse(hip_llm_runner *r) {
     r->q8x2_reuse_active = 0;
     r->q8x2_reuse_valid = 0;
     r->native_q81_valid = 0;
+}
+
+/* Enter a one-projection reuse scope after a fused producer has already
+ * refreshed native Q8_1. */
+static inline void begin_native_q81_prepared(hip_llm_runner *r) {
+    r->q8x2_reuse_active = 1;
+    r->q8x2_reuse_valid = 0;
 }
 /* Batched projections commonly share the same activation matrix (Q/K/V and
  * gate/up). Reuse its Q8x2 representation until the next layer changes the
@@ -28828,7 +28863,23 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                     debug_f32_state(r, l, "scalar ffn_gate_raw", r->d_gate, n_ff);
                     debug_f32_state(r, l, "scalar ffn_up_raw", r->d_up, n_ff);
                 }
-                launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
+                int native_down_q81 = n_ff <= 17408 && (n_ff % 256) == 0 && (
+                    (cl->ffn_down_type == GGML_TYPE_Q2_K && r->fn_qwen35_matvec_q2k) ||
+                    (cl->ffn_down_type == GGML_TYPE_IQ2_XXS && r->fn_qwen35_matvec_iq2xxs) ||
+                    (cl->ffn_down_type == GGML_TYPE_IQ2_XS && r->fn_qwen35_matvec_iq2xs) ||
+                    (cl->ffn_down_type == GGML_TYPE_IQ2_S && r->fn_qwen35_matvec_iq2s) ||
+                    (cl->ffn_down_type == GGML_TYPE_IQ3_XXS && r->fn_qwen35_matvec_iq3xxs) ||
+                    (cl->ffn_down_type == GGML_TYPE_IQ3_S && r->fn_qwen35_matvec_iq3s) ||
+                    (cl->ffn_down_type == GGML_TYPE_IQ4_XS && r->fn_qwen35_matvec_iq4xs));
+                const char *split_silu_q81 = getenv("LLM_QWEN35_SPLIT_SILU_Q81");
+                if (split_silu_q81 && atoi(split_silu_q81) != 0)
+                    native_down_q81 = 0;
+                if (native_down_q81) {
+                    launch_silu_mul_native_q81(r, r->d_gate, r->d_up, n_ff);
+                    begin_native_q81_prepared(r);
+                } else {
+                    launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
+                }
             }
             if (r->ssm_fused_decode && cl->ffn_down_type == GGML_TYPE_Q6_K) {
                 int nr = cl->ffn_down_rows; /* n_embd */
@@ -28849,6 +28900,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 launch_matvec_ffn_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
                                       cl->ffn_down_rows, cl->ffn_down_cols,
                                       cl->ffn_down_type, 0);
+                if (r->q8x2_reuse_active) end_q8x2_reuse(r);
                 if (r->debug_layers && debug_attention_layer_selected(l))
                     debug_f32_state(r, l, "scalar ffn_out", r->d_xb, n_embd);
                 launch_add(r, r->d_x, r->d_xb, n_embd);

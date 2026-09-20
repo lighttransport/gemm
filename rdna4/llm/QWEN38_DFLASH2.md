@@ -186,6 +186,17 @@ row.  Zero-depth decode measures 42.83--43.04 tok/s and keeps the pinned
 256-token hash `3c53b75f283cb9b0`.  The profile is under
 `tmp/qwen38/ordinary-decode-profile-f16pair/`.
 
+The dense FFN path also fuses SiLU multiplication with native Q8_1 staging
+when the following down projection uses Q2_K, IQ2/3, or IQ4_XS.  This covers
+58 of 64 layers in the tested IQ2_XS target and removes 58 launches per
+ordinary decoded row.  The protected quotient and FP16 scale conversion match
+the split quantizer: all 248,320 final logits are bitwise identical in the
+fused/split A/B, and the 256-token hash remains `3c53b75f283cb9b0`.
+Three-repeat zero-depth decode rises from a 42.79 tok/s split mean to a 43.11
+tok/s fused mean.  The kernel trace is under
+`tmp/qwen38/ordinary-decode-profile-siluq81/`; set the diagnostic
+`LLM_QWEN35_SPLIT_SILU_Q81=1` to restore the two-launch boundary.
+
 ## Remaining optimization opportunities
 
 The short-context K=7 response emits 46 tokens in 566.72 ms, clearing the
@@ -204,8 +215,9 @@ reflects the remaining measured costs.
    packed probability across both value tiles lowers the exact 128-split
    operator to 321.8--323.6 microseconds per layer and raises the full run to
    34.21 tok/s with unchanged prefix and suffix hashes, so the
-   remaining gap is dominated by work outside attention. Fixed-eight Q2_K/IQ
-   projections already share decoded weights, but
+   remaining gap is dominated by work outside attention. SiLU and Q8_1
+   staging for 58 dense down projections now share one exact launch.
+   Fixed-eight Q2_K/IQ projections already share decoded weights, but
    ordinary decode still streams weights for one row at a time. Reuse the
    quantized input across gate/up projections and investigate cooperative
    weight staging. A WMMA or reordered reduction path needs full

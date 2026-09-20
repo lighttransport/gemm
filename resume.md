@@ -106,6 +106,17 @@ from the immediate 42.65--42.77 tok/s baseline to 42.83--43.04 tok/s, with the
 pinned 256-token hash `3c53b75f283cb9b0` unchanged.  Trace artifact:
 `tmp/qwen38/ordinary-decode-profile-f16pair/`.
 
+Dense FFN decode now combines SiLU multiplication with the native Q8_1
+staging consumed by 58 of the model's 64 down projections.  Each 32-value
+wave keeps the original fast-math SiLU expression, then applies the protected
+division and FP16 scale-rounding contract used by the standalone exact
+quantizer.  A split-path diagnostic produces bitwise-identical values for all
+248,320 final logits, and the pinned 256-token hash remains
+`3c53b75f283cb9b0`.  The 64-row trace removes 3,712 quantizer launches, exactly
+58 per row; matched three-repeat decode improves from 42.45--42.97 tok/s
+(42.79 mean) to 42.81--43.36 tok/s (43.11 mean).  Trace artifact:
+`tmp/qwen38/ordinary-decode-profile-siluq81/`.
+
 Prioritize ordinary one-row target projection traffic first, followed by the
 long-context verifier attention tail, sampled verifier-row parity audit, and
 fusion of the remaining activation/state-preparation launches.
