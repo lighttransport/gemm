@@ -35,9 +35,10 @@ The goal is complete only when all of the following are true:
 ## Verified starting point
 
 The initial Q5 layout benchmark is commit `b383fc0b`, the shared exact-cache
-milestone is `7d37cd3c`, and the rank-local sidecar builder milestone is
-`8cf312cf`. The current branch may advance beyond those commits; they are
-landmarks, not reset targets.
+milestone is `7d37cd3c`, the rank-local sidecar builder milestone is
+`8cf312cf`, and strict real-sidecar validation is `cfcdf019`. The current
+branch may advance beyond those commits; they are landmarks, not reset
+targets.
 
 Relevant files:
 
@@ -108,18 +109,31 @@ monotonic non-overlapping extents, source checksums, and every payload hash.
 It uses a fixed 1 MiB hashing buffer, evicts validation reads, and maps the
 sidecar only after every entry passes. Tests require rejection of bad magic,
 version, layout, truncation, offset, duplicate name, source entry, source file
-size, and payload data. This loader is complete but is not yet wired into the
-TP runner or persistent-pool dispatch.
+size, and payload data. The runtime attachment described below now wires this
+loader into the TP runner and persistent-pool dispatch without weakening those
+checks.
 
 No real compact `rank00.blob` was present under `/local/u14346` during the
-sidecar-builder milestone. A later bounded rank-0 run has now built and checked
-the real mixed-Q4 artifact. All four TP4 metadata plans are symmetric: 866
+sidecar-builder milestone. A later bounded rank-0 run built and checked the
+real mixed-Q4 artifact. All four TP4 metadata plans are symmetric: 866
 compact entries, a 5.758 GB compact file, 390 cache entries, a 7.810 GB
 sidecar, and 13.568 GB combined files per rank. Rank 0 produced exact file
 sizes of `5,757,905,920` and `7,809,826,816` bytes. Full payload validation
 passed in 31.635 seconds, builder reuse passed, and `MemAvailable` remained
 about 30.8 GB. Ranks 1--3 still require physical builds on their own nodes.
-The sidecar is not yet attached to `tp_runner`.
+
+The decode-only runtime attachment is now implemented. `tp_runner` accepts
+`--kquant-stage DIR`; every rank validates its local compact identity and all
+sidecar hashes, then votes before retaining the mapping. Cache pointers are
+attached only after compact prefill and a second all-rank vote. Any validation
+or attachment mismatch coherently returns all ranks to compact dispatch. The
+persistent pool statically partitions complete eight-row groups, while partial
+or tail extents explicitly use the compact path. Validation reads are evicted
+before mapping and `MADV_RANDOM` limits readahead beyond worker-owned ranges.
+Synthetic coverage includes uneven three-worker ownership, unaligned ranged
+dispatch, a 15-row compact fallback, invalid format rejection, and model
+attach/detach. Fujitsu builds of the focused test and full runner pass; the
+multi-node token and performance gates have not run yet.
 
 ## Constraints and safety rules
 
@@ -150,28 +164,23 @@ The sidecar is not yet attached to `tp_runner`.
    `qwen38_kquant_check` on every rank, and record validation time plus
    `MemAvailable`. Do not copy rank 0's `/local` files between nodes.
 
-2. **Attach decode dispatch explicitly.** Add a runner argument for the cache
-   stage/directory and keep the default compact behavior unchanged. Route only
-   compatible Q5_K and IQ4_XS decode matvecs to `run_packed_q5r` and
-   `run_packed_iq4r`. Keep compact dispatch for prefill, missing caches,
-   unsupported dimensions, failed validation, and ownership-alignment tails.
+2. **Run the integrated smoke test on TP4.** Use the explicit
+   `--kquant-stage` argument with all four local compact/sidecar pairs. Confirm
+   every rank reports `prepared` before prefill and `decode attach OK` after
+   prefill. Exercise one missing/corrupt sidecar on a disposable synthetic or
+   staged copy and confirm the all-rank vote selects compact fallback. Do not
+   corrupt the validated rank artifacts.
 
-3. **Preserve NUMA/CMG placement.** Reconcile each cached tensor's eight-row
-   groups with the persistent pool's static worker ranges. Load/first-touch
-   worker-owned ranges locally or prove that the selected file mapping gives
-   equivalent placement. Add an ownership/tail test rather than relying only
-   on divisible current shapes.
-
-4. **Run correctness acceptance.** Use the same prompt and settings for compact
+3. **Run correctness acceptance.** Use the same prompt and settings for compact
    and cached paths. Require exact token hashes at 128 and 256 generated tokens.
    Also retain the isolated multi-pattern tests so an end-to-end pass cannot
    conceal a tensor-level regression.
 
-5. **Measure and document.** On a clean node record load/stage timings, peak
+4. **Measure and document.** On clean nodes record load/stage timings, peak
    and steady memory, forward/decode timing, total tok/s, and per-rank storage.
-   Update `qwen-q8.md`, run `git diff --check`, stage only the focused files,
-   commit an imperative single-subsystem change, and report the hash. Do not
-   push.
+   Add the exact multi-node commands and representative output to `qwen-q8.md`,
+   run `git diff --check`, commit only focused follow-up files, and report the
+   hash. Do not push.
 
 ## Revalidation commands
 
@@ -214,20 +223,23 @@ Q38TP_RANK=0 Q38TP_SIZE=4 ./a64fx/llm/build/qwen38_kquant_stage \
 ## Resume prompt
 
 ```text
-Continue the active goal in resume-dequant.md: finish safe rank-local Q5R/IQ4R
-decode integration for Qwen3.8 on A64FX. Read AGENTS.md and the whole goal file
+Continue the active goal in resume-dequant.md: finish and accept safe rank-local
+Q5R/IQ4R decode for Qwen3.8 on A64FX. Read AGENTS.md and the whole goal file
 first, inspect git status/diffs, and preserve every unrelated dirty-worktree
-change. The exact layouts, kernel tests, versioned Q38KQC1 sidecar builder, and
-strict read-only loader are complete. Real rank 0 is built and hash-validated;
-metadata plans cover all four symmetric TP4 ranks. Revalidate the focused
-tests, then continue at the first unfinished item: physical staging/checking
-on ranks 1--3 in a four-node allocation, followed by explicit runtime attach.
+change. The exact layouts, kernel tests, versioned Q38KQC1 sidecar builder,
+strict loader, explicit `tp_runner --kquant-stage DIR` attachment, all-rank
+fallback votes, decode-only activation, and persistent eight-row ownership are
+implemented. Real rank 0 is built and hash-validated; metadata plans cover all
+four symmetric TP4 ranks. Revalidate the focused tests, then continue at the
+first unfinished item: physically stage and check ranks 1--3 in a four-node
+allocation, then run the integrated TP4 smoke test.
 
 Do not create a full single-node additive cache. Plan real per-rank memory
 before conversion, use bounded I/O and /local/u14346/codex-research, preserve
-compact prefill/fallback, validate all sidecar metadata and payload hashes, and
-retain CMG-local row ownership. common/transformer.h has unrelated user edits,
-so isolate runtime work and never overwrite or stage those edits. Require exact
-128/256-token greedy hashes plus clean-node memory and tok/s evidence. Update
-qwen-q8.md, commit only focused files, report the commit hash, and do not push.
+compact prefill/fallback, and verify the `prepared`/post-prefill `decode attach
+OK` diagnostics on every rank. common/transformer.h may retain unrelated user
+edits, so never overwrite or stage them. Require exact 128/256-token compact
+versus cached greedy hashes plus clean-node sidecar-load, memory, bandwidth, and
+tok/s evidence. Update qwen-q8.md, commit only focused files, report the commit
+hash, and do not push.
 ```

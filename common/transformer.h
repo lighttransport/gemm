@@ -52,6 +52,8 @@ typedef struct {
     int      q8_block64;  /* 1/2=Q8 original layout, 3=compact W8A8 groups */
     void    *mixed_iq_cache; /* optional lossless A64FX decode-only expanded codebook */
     void    *iq4_cache;   /* optional lossless signed-palette worker-local cache */
+    void    *kquant_cache; /* optional validated Q5R/IQ4R rank-local decode sidecar */
+    uint32_t kquant_cache_format;
     void    *tp_owned_data; /* owned contiguous TP column repack, if any */
 } qtensor;
 
@@ -1216,6 +1218,9 @@ static inline float tf_iq4_xs_dot_sve(const block_iq4_xs *blocks, const float *x
 
 #include "../a64fx/llm/mixed_iq_decode.h"
 #include "../a64fx/llm/iq4_decode_cache.h"
+#if defined(__ARM_FEATURE_SVE)
+#include "../a64fx/llm/kquant_decode_runtime.h"
+#endif
 
 static inline void tf_compact_k_check(uint32_t type, const void *row,
                                       const float *x, int n, float got) {
@@ -1351,6 +1356,9 @@ static void *tf_qmatvec_worker(void *arg) {
         return NULL;
     }
 #if defined(__ARM_FEATURE_SVE)
+    if (tf_kquant_cache_rows(t->dst, t->mat, t->x,
+                             t->row_start, t->row_end))
+        return NULL;
     if (t->mat->q8_block64) {
         int nb = n_cols / 64;
         int8_t *xq = (int8_t *)t->tmp;
@@ -3266,6 +3274,8 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
         size_t rb = (size_t)(n_cols / 32) * sizeof(block_q4_0);
         tf_matvec_q4_0_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
 #if defined(__ARM_FEATURE_SVE)
+    } else if (tf_kquant_cache_rows(dst, mat, x, row_start, row_end)) {
+        return;
     } else if (mat->iq4_cache) {
         tf_iq4_cache_view_rows(dst,mat->iq4_cache,x,row_start,row_end);
     } else if (mat->mixed_iq_cache) {
@@ -3474,6 +3484,8 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         return;
     }
 #if defined(__ARM_FEATURE_SVE)
+    if (tf_kquant_cache_rows(dst, mat, x, 0, n_rows))
+        return;
     if (mat->iq4_cache) {
         tf_iq4_cache_view_rows(dst,mat->iq4_cache,x,0,n_rows);
         return;
@@ -7788,6 +7800,18 @@ static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
         return;
     }
 #if defined(__ARM_FEATURE_SVE)
+    if (mat->kquant_cache && n_rows == mat->n_rows &&
+        n_rows % TF_KQUANT_CACHE_ROWS == 0) {
+        int groups = n_rows / TF_KQUANT_CACHE_ROWS;
+        int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
+        if (g1 > g0 &&
+            !tf_kquant_cache_rows(dst, mat, x,
+                                  g0 * TF_KQUANT_CACHE_ROWS,
+                                  g1 * TF_KQUANT_CACHE_ROWS))
+            goto compact_fallback;
+        return;
+    }
+compact_fallback:
     if (mat->type == GGML_TYPE_BF16 && mat->bf16_pv) {
         int groups = n_rows / 8;
         int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
@@ -8052,7 +8076,15 @@ static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
         tf_matvec_f16_rows(dst, (const uint8_t *)mat->data,
                             (size_t)n_cols * 2, x, n_cols, rs, rs + rc);
     } else {
-        tf_matvec_qtensor_rows(dst, mat, x, rs, rs + rc);
+        if (mat->kquant_cache &&
+            (n_rows != mat->n_rows || n_rows % TF_KQUANT_CACHE_ROWS)) {
+            qtensor compact = *mat;
+            compact.kquant_cache = NULL;
+            compact.kquant_cache_format = 0;
+            tf_matvec_qtensor_rows(dst, &compact, x, rs, rs + rc);
+        } else {
+            tf_matvec_qtensor_rows(dst, mat, x, rs, rs + rc);
+        }
     }
 }
 

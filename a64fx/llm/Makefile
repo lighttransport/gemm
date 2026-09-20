@@ -158,8 +158,9 @@ $(BUILD)/bench_qwen38_kquants: $(LLM_DIR)bench_qwen38_kquants.c $(LLM_DIR)kquant
 	$(CC) $(filter-out -g -rdynamic,$(CFLAGS)) $(QWEN_CFLAGS) -o $@ $(LLM_DIR)bench_qwen38_kquants.c $(LDFLAGS)
 
 qwen38_kquant_test: $(BUILD)/test_qwen38_kquant_cache
-$(BUILD)/test_qwen38_kquant_cache: $(LLM_DIR)test_qwen38_kquant_cache.c $(LLM_DIR)kquant_decode_cache.h $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h | $(BUILD)
-	$(CC) $(filter-out -g -rdynamic,$(CFLAGS)) $(QWEN_CFLAGS) -o $@ $(LLM_DIR)test_qwen38_kquant_cache.c $(LDFLAGS)
+$(BUILD)/test_qwen38_kquant_cache: $(LLM_DIR)test_qwen38_kquant_cache.c $(LLM_DIR)kquant_decode_cache.h $(LLM_DIR)kquant_decode_runtime.h $(LLM_DIR)qwen38_kquant_attach.h $(LLM_DIR)qwen38_kquant_load.c $(LLM_DIR)qwen38_kquant_load.h $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h | $(BUILD)
+	$(CC) $(filter-out -g -rdynamic,$(CFLAGS)) $(QWEN_CFLAGS) -o $@ \
+		$(LLM_DIR)test_qwen38_kquant_cache.c $(LLM_DIR)qwen38_kquant_load.c $(LDFLAGS)
 
 qwen38_kquant_stage: $(BUILD)/qwen38_kquant_stage
 $(BUILD)/qwen38_kquant_stage: $(LLM_DIR)qwen38_kquant_stage.c $(LLM_DIR)qwen38_kquant_stage.h $(LLM_DIR)qwen38_tp_stage.h $(LLM_DIR)kquant_decode_cache.h $(COMMON)/ggml_dequant.h | $(BUILD)
@@ -204,7 +205,7 @@ vlm_objs:
 	$(MAKE) -C $(VLM_DIR) CC=$(CC) OPENMP=$(OPENMP)
 
 # transformer.h includes the A64FX mixed-format kernels directly.
-$(addprefix $(BUILD)/,llm_runner pp_runner tp_runner qwen38_runner qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner): $(LLM_DIR)mixed_iq_decode.h $(LLM_DIR)iq4_decode_cache.h $(LLM_DIR)iq4_cache_build.h
+$(addprefix $(BUILD)/,llm_runner pp_runner tp_runner qwen38_runner qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner): $(LLM_DIR)mixed_iq_decode.h $(LLM_DIR)iq4_decode_cache.h $(LLM_DIR)iq4_cache_build.h $(LLM_DIR)kquant_decode_runtime.h $(LLM_DIR)kquant_decode_cache.h
 
 $(BUILD)/llm_runner: $(MAIN_SRC) vlm_objs | $(BUILD)
 	$(CC) $(CFLAGS) -DTF_LINK_PODD -o $@ $(MAIN_SRC) $(VLM_OBJS) $(BF16_PODD_KERNEL) $(LDFLAGS)
@@ -217,16 +218,16 @@ $(BUILD)/pp_runner: $(PP_SRC) vlm_objs | $(BUILD)
 
 # Multi-node tensor-parallel decode runner (pure uTofu, no MPI in the binary).
 tp_runner: $(BUILD)/tp_runner
-$(BUILD)/tp_runner: $(TP_SRC) $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h ../utofu-tests/tp_allreduce.h $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(BF16_PODD_KERNEL) | $(BUILD)
+$(BUILD)/tp_runner: $(TP_SRC) $(LLM_DIR)qwen38_kquant_attach.h $(LLM_DIR)qwen38_kquant_load.c $(LLM_DIR)qwen38_kquant_load.h $(LLM_DIR)qwen38_kquant_stage.h $(LLM_DIR)qwen38_tp_stage.h $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h ../utofu-tests/tp_allreduce.h $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(BF16_PODD_KERNEL) | $(BUILD)
 	$(CC) $(filter-out -g -rdynamic,$(CFLAGS)) -DTF_HAVE_Q8V2 -DTF_LINK_PODD $(QWEN_CFLAGS) -o $@ \
-		$(TP_SRC) $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(BF16_PODD_KERNEL) $(LDFLAGS) -ltofucom
+		$(TP_SRC) $(LLM_DIR)qwen38_kquant_load.c $(Q8V2_KERNEL) $(Q8B6_KERNEL) $(BF16_PODD_KERNEL) $(LDFLAGS) -ltofucom
 
 # Same as tp_runner but with -DTF_POOL_PROFILE: dumps the per-dispatch work-vs-wait
 # and per-tid matvec/barrier/attn decode breakdown at pool shutdown. Separate binary
 # so production tp_runner stays profile-free.
 tp_runner_prof: $(BUILD)/tp_runner_prof
-$(BUILD)/tp_runner_prof: $(TP_SRC) vlm_objs | $(BUILD)
-	$(CC) $(CFLAGS) -DTF_POOL_PROFILE -o $@ $(TP_SRC) $(VLM_OBJS) $(LDFLAGS) -ltofucom
+$(BUILD)/tp_runner_prof: $(TP_SRC) $(LLM_DIR)qwen38_kquant_attach.h $(LLM_DIR)qwen38_kquant_load.c $(LLM_DIR)qwen38_kquant_load.h vlm_objs | $(BUILD)
+	$(CC) $(CFLAGS) -DTF_POOL_PROFILE -o $@ $(TP_SRC) $(LLM_DIR)qwen38_kquant_load.c $(VLM_OBJS) $(LDFLAGS) -ltofucom
 
 # Multi-node expert-parallel decode runner for MoE models. Shards experts across
 # ranks; non-expert weights replicated. Pure uTofu, no MPI in the binary.

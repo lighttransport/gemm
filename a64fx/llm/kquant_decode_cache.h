@@ -12,6 +12,41 @@
 #define TF_KQUANT_CACHE_ROWS 8
 #define TF_KQUANT_CACHE_COLS 256
 
+#ifndef TF_KQUANT_CACHE_LAYOUT_ONLY
+typedef struct {
+    int8_t q[256];
+    float d[8];
+    int32_t sum[8];
+} kquant_cache_a8_block;
+
+static inline void kquant_cache_quant_a8(kquant_cache_a8_block *out,
+                                          const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    for (int b = 0; b < n / 256; b++) {
+        svfloat32_t vmax = svdup_f32(0.0f);
+        for (int k = 0; k < 256; k += 16)
+            vmax = svmax_f32_x(pg, vmax,
+                svabs_f32_x(pg, svld1_f32(pg, x + b * 256 + k)));
+        float amax = svmaxv_f32(pg, vmax);
+        float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+        float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        for (int g = 0; g < 8; g++) {
+            const float *src = x + b * 256 + g * 32;
+            out[b].d[g] = d;
+            int32_t sum = 0;
+            for (int k = 0; k < 32; k += 16) {
+                svint32_t v = svcvt_s32_f32_x(pg, svrintn_f32_x(pg,
+                    svmul_n_f32_x(pg, svld1_f32(pg, src + k), inv)));
+                v = svmin_n_s32_x(pg, svmax_n_s32_x(pg, v, -127), 127);
+                svst1b_s32(pg, out[b].q + g * 32 + k, v);
+                sum += svaddv_s32(pg, v);
+            }
+            out[b].sum[g] = sum;
+        }
+    }
+}
+#endif
+
 typedef struct {
     float d, dmin;
     uint8_t scales[8];
@@ -68,7 +103,7 @@ static int pack_q5r(uint8_t *dst, const block_q5_K *src, int rows, int cols) {
 
 #ifndef TF_KQUANT_CACHE_PACK_ONLY
 static inline void packed_q5r_dot8(float out[8], const uint8_t *weights,
-                                   const tf_kquant_a8_block *x, int nb) {
+                                   const kquant_cache_a8_block *x, int nb) {
     const svbool_t p8 = svptrue_b8(), pg = svptrue_b32();
     const svbool_t first8 = svwhilelt_b32(0, 8);
     svfloat32_t a0 = svdup_f32(0), a1 = a0, a2 = a0, a3 = a0;
@@ -126,8 +161,8 @@ static int run_packed_q5r(float *y, const uint8_t *weights,
         int tid = omp_get_thread_num(), nt = omp_get_num_threads();
         int g0 = (rows / 8) * tid / nt;
         int g1 = (rows / 8) * (tid + 1) / nt;
-        tf_kquant_a8_block *qx = alloca((size_t)nb * sizeof(*qx));
-        tf_kquant_quant_a8(qx, x, cols);
+        kquant_cache_a8_block *qx = alloca((size_t)nb * sizeof(*qx));
+        kquant_cache_quant_a8(qx, x, cols);
         for (int g = g0; g < g1; g++)
             packed_q5r_dot8(y + g * 8, weights + (size_t)g * row_group_bytes,
                             qx, nb);
@@ -198,7 +233,7 @@ static int pack_iq4r(uint8_t *dst, const block_iq4_xs *src,
 
 #ifndef TF_KQUANT_CACHE_PACK_ONLY
 static inline void packed_iq4r_dot8(float out[8], const uint8_t *weights,
-                                    const tf_kquant_a8_block *x, int nb) {
+                                    const kquant_cache_a8_block *x, int nb) {
     const svbool_t p8 = svptrue_b8(), pg = svptrue_b32();
     const svbool_t first8 = svwhilelt_b32(0, 8);
     svfloat32_t a0 = svdup_f32(0), a1 = a0, a2 = a0, a3 = a0;
@@ -250,8 +285,8 @@ static int run_packed_iq4r(float *y, const uint8_t *weights,
         int tid = omp_get_thread_num(), nt = omp_get_num_threads();
         int g0 = (rows / 8) * tid / nt;
         int g1 = (rows / 8) * (tid + 1) / nt;
-        tf_kquant_a8_block *qx = alloca((size_t)nb * sizeof(*qx));
-        tf_kquant_quant_a8(qx, x, cols);
+        kquant_cache_a8_block *qx = alloca((size_t)nb * sizeof(*qx));
+        kquant_cache_quant_a8(qx, x, cols);
         for (int g = g0; g < g1; g++)
             packed_iq4r_dot8(y + g * 8, weights + (size_t)g * row_group_bytes,
                              qx, nb);

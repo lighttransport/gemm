@@ -3360,8 +3360,10 @@ The promoted experimental layouts now live in
 `a64fx/llm/kquant_decode_cache.h`, with layout version 1, dimension checks,
 packers, and eight-row SVE matvecs. The real-tensor benchmark consumes this
 shared implementation. `make -C a64fx/llm qwen38_kquant_test CC=fcc OPENMP=1`
-builds a model-independent synthetic check; its four patterns pass strict
-IQ4R bit identity and the Q5R numerical gate.
+builds a model-independent synthetic check. Its four patterns compare both
+layouts against an independently dequantized A8 reference; observed Q5R NRMSE
+is `1.09e-7`--`2.06e-7` and IQ4R NRMSE is `1.07e-7`--`3.56e-7`. The separate
+native-A8 real-tensor benchmark above establishes IQ4R bit identity.
 
 The footprint summary now also reports:
 
@@ -3455,9 +3457,45 @@ files resident in HBM. Ranks 1--3 were metadata-planned but not physically
 built on this single node; a four-node allocation must repeat the build and
 validation locally on every rank before runtime acceptance.
 
-This milestone does not yet attach the sidecar to `tp_runner`. Runtime work
-must call the strict loader before exposing pointers, first-touch/cache-map
-row groups in their owning CMGs, dispatch Q5R/IQ4R only for validated entries,
-and retain compact dispatch otherwise. The current `common/transformer.h` has
-unrelated local edits and was deliberately not modified by this focused stage
-change.
+### Decode-only runtime attachment
+
+`tp_runner` now accepts an explicit decode-cache argument while retaining the
+compact default:
+
+```sh
+TP_STAGE_DIR=/local/u14346/codex-research/qwen38-q4-tp4 \
+  ./a64fx/llm/build/tp_runner \
+  /home/u14346/models/qwen38/27b/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --kquant-stage /local/u14346/codex-research/qwen38-q4-tp4-kquant
+```
+
+Each rank rereads its local compact header and runs the strict sidecar loader,
+including every payload hash, before voting through the existing TP
+collective. If any rank is missing or invalid, all ranks discard their mapping
+and continue with compact kernels. A successful mapping is still not exposed
+to the transformer during prompt prefill. Immediately before decode, all
+ranks validate and vote on attachment again; only then are Q5R/IQ4R pointers
+installed on the exactly matching Q5_K/IQ4_XS tensors. Detachment precedes
+unmapping and model destruction.
+
+The persistent decode pool partitions complete eight-row groups directly
+across its static worker IDs, so a group has one owner and is first-faulted by
+that worker. Validation reads are evicted before `mmap`, and `MADV_RANDOM`
+suppresses cross-range readahead. Calls whose row extent is not the tensor's
+complete eight-row-aligned extent explicitly clear the cache view and take the
+compact path. Non-persistent row-range dispatch safely computes intersecting
+groups and copies only the requested rows.
+
+The focused synthetic test covers three uneven persistent-worker partitions,
+unaligned non-persistent ranges, a 15-row compact fallback, invalid format
+rejection, and model attach/detach. The current completion line is:
+
+```text
+SENTINEL qwen38_kquant_cache=OK layout_version=1 q5r_bytes=8960 iq4r_bytes=8704 ownership_threads=3 tail_fallback=1 attach_detach=1
+```
+
+The full `tp_runner` and focused tests compile with Fujitsu `fcc`. Multi-node
+acceptance is still pending: ranks 1--3 must be built and checked on their own
+`/local` files, followed by compact/cache A/B runs with exact 128- and
+256-token greedy hashes and clean-node load, memory, bandwidth, and tok/s
+measurements. The runtime path is therefore integrated but not yet promoted.

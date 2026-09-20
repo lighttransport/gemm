@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "kquant_decode_cache.h"
+#include "qwen38_kquant_attach.h"
 
 enum { TEST_ROWS = 16, TEST_COLS = 512 };
 
@@ -76,6 +77,25 @@ static int compare(const float *got, const float *want, float rel_limit,
     return nrmse <= rel_limit ? 0 : -1;
 }
 
+static void reference_a8(float *dst, uint32_t type, const void *weights,
+                         const kquant_cache_a8_block *qx) {
+    size_t row_bytes = tf_row_bytes(type, TEST_COLS);
+    float dequant[TEST_COLS];
+    for (int row = 0; row < TEST_ROWS; row++) {
+        dequant_row(type, (const uint8_t *)weights + (size_t)row * row_bytes,
+                    dequant, TEST_COLS);
+        float sum = 0.0f;
+        for (int block = 0; block < TEST_COLS / 256; block++)
+            for (int group = 0; group < 8; group++)
+                for (int k = 0; k < 32; k++) {
+                    int col = block * 256 + group * 32 + k;
+                    sum += dequant[col] * (float)qx[block].q[group * 32 + k] *
+                           qx[block].d[group];
+                }
+        dst[row] = sum;
+    }
+}
+
 int main(void) {
     const int nb = TEST_COLS / 256;
     size_t compact_blocks = (size_t)TEST_ROWS * nb;
@@ -88,6 +108,9 @@ int main(void) {
     float *x = aligned_alloc(256, TEST_COLS * sizeof(*x));
     float native_q5[TEST_ROWS], packed_q5[TEST_ROWS];
     float native_iq4[TEST_ROWS], packed_iq4[TEST_ROWS];
+    float ranged_q5[TEST_ROWS], ranged_iq4[TEST_ROWS];
+    float owned_q5[TEST_ROWS], owned_iq4[TEST_ROWS];
+    float tail_q5[TEST_ROWS], tail_reference[TEST_ROWS];
     if (!q5 || !iq4 || !q5r || !iq4r || !x) {
         fprintf(stderr, "allocation failed\n");
         return 1;
@@ -105,29 +128,135 @@ int main(void) {
     }
     for (int pattern = 0; pattern < 4; pattern++) {
         fill_activation(x, pattern);
-        tf_kquant_a8_block qx[TEST_COLS / 256];
-        tf_kquant_quant_a8(qx, x, TEST_COLS);
-        for (int r = 0; r < TEST_ROWS; r++) {
-            native_q5[r] = tf_q5_k_a8_dot_sve(q5 + (size_t)r * nb, qx, nb);
-            native_iq4[r] = tf_iq4_xs_a8_dot_sve(iq4 + (size_t)r * nb, qx, nb);
-        }
+        kquant_cache_a8_block qx[TEST_COLS / 256];
+        kquant_cache_quant_a8(qx, x, TEST_COLS);
+        reference_a8(native_q5, GGML_TYPE_Q5_K, q5, qx);
+        reference_a8(native_iq4, GGML_TYPE_IQ4_XS, iq4, qx);
         if (run_packed_q5r(packed_q5, q5r, x, TEST_ROWS, TEST_COLS) ||
             run_packed_iq4r(packed_iq4, iq4r, x, TEST_ROWS, TEST_COLS)) {
             fprintf(stderr, "matvec failed\n");
             return 1;
         }
+        qtensor tq5 = {.data = q5, .type = GGML_TYPE_Q5_K,
+                       .n_rows = TEST_ROWS, .n_cols = TEST_COLS,
+                       .kquant_cache = q5r,
+                       .kquant_cache_format = Q38KC_FORMAT_Q5R};
+        qtensor tiq4 = {.data = iq4, .type = GGML_TYPE_IQ4_XS,
+                        .n_rows = TEST_ROWS, .n_cols = TEST_COLS,
+                        .kquant_cache = iq4r,
+                        .kquant_cache_format = Q38KC_FORMAT_IQ4R};
+        memset(ranged_q5, 0, sizeof(ranged_q5));
+        memset(ranged_iq4, 0, sizeof(ranged_iq4));
+        const int cuts[] = {0, 3, 11, TEST_ROWS};
+        for (int cut = 0; cut < 3; cut++) {
+            if (!tf_kquant_cache_rows(ranged_q5, &tq5, x,
+                                      cuts[cut], cuts[cut + 1]) ||
+                !tf_kquant_cache_rows(ranged_iq4, &tiq4, x,
+                                      cuts[cut], cuts[cut + 1])) {
+                fprintf(stderr, "ranged runtime dispatch failed\n");
+                return 1;
+            }
+        }
+        if (memcmp(ranged_q5, packed_q5, sizeof(ranged_q5)) ||
+            memcmp(ranged_iq4, packed_iq4, sizeof(ranged_iq4))) {
+            fprintf(stderr, "unaligned ranged runtime mismatch pattern=%d\n", pattern);
+            return 1;
+        }
+        for (int row = 0; row < TEST_ROWS; row++) {
+            owned_q5[row] = NAN;
+            owned_iq4[row] = NAN;
+        }
+        for (int tid = 0; tid < 3; tid++) {
+            tf_thread_matvec(owned_q5, &tq5, x, TEST_ROWS, tid, 3);
+            tf_thread_matvec(owned_iq4, &tiq4, x, TEST_ROWS, tid, 3);
+        }
+        if (memcmp(owned_q5, packed_q5, sizeof(owned_q5)) ||
+            memcmp(owned_iq4, packed_iq4, sizeof(owned_iq4))) {
+            fprintf(stderr, "persistent ownership mismatch pattern=%d\n", pattern);
+            return 1;
+        }
+        qtensor compact_q5 = tq5;
+        compact_q5.kquant_cache = NULL;
+        compact_q5.kquant_cache_format = 0;
+        for (int row = 0; row < TEST_ROWS; row++) {
+            tail_q5[row] = 1234567.0f;
+            tail_reference[row] = 1234567.0f;
+        }
+        tf_matvec_qtensor_rows(tail_reference, &compact_q5, x, 0,
+                               TEST_ROWS - 1);
+        for (int tid = 0; tid < 3; tid++)
+            tf_thread_matvec(tail_q5, &tq5, x, TEST_ROWS - 1, tid, 3);
+        if (memcmp(tail_q5, tail_reference,
+                   (TEST_ROWS - 1) * sizeof(tail_q5[0])) ||
+            tail_q5[TEST_ROWS - 1] != 1234567.0f) {
+            int bad_row = -1;
+            for (int row = 0; row < TEST_ROWS - 1; row++)
+                if (memcmp(&tail_q5[row], &tail_reference[row], sizeof(float))) {
+                    bad_row = row;
+                    break;
+                }
+            fprintf(stderr, "persistent compact-tail fallback mismatch pattern=%d row=%d got=%g want=%g tail=%g\n",
+                    pattern, bad_row,
+                    bad_row >= 0 ? tail_q5[bad_row] : 0.0f,
+                    bad_row >= 0 ? tail_reference[bad_row] : 0.0f,
+                    tail_q5[TEST_ROWS - 1]);
+            return 1;
+        }
         double q5_nrmse, q5_max, iq4_nrmse, iq4_max;
-        if (compare(packed_q5, native_q5, 2e-6f, 0, &q5_nrmse, &q5_max) ||
-            compare(packed_iq4, native_iq4, 0.0f, 1, &iq4_nrmse, &iq4_max)) {
+        if (compare(packed_q5, native_q5, 2e-5f, 0, &q5_nrmse, &q5_max) ||
+            compare(packed_iq4, native_iq4, 2e-5f, 0, &iq4_nrmse, &iq4_max)) {
             fprintf(stderr, "pattern=%d mismatch q5_nrmse=%.3g q5_max=%.3g "
                     "iq4_nrmse=%.3g iq4_max=%.3g\n",
                     pattern, q5_nrmse, q5_max, iq4_nrmse, iq4_max);
             return 1;
         }
         printf("pattern=%d q5_nrmse=%.3g q5_max=%.3g "
-               "iq4_bit_exact=1\n", pattern, q5_nrmse, q5_max);
+               "iq4_nrmse=%.3g iq4_max=%.3g\n",
+               pattern, q5_nrmse, q5_max, iq4_nrmse, iq4_max);
     }
-    printf("SENTINEL qwen38_kquant_cache=OK layout_version=%d q5r_bytes=%zu iq4r_bytes=%zu\n",
+    qtensor bad = {.type = GGML_TYPE_Q5_K, .n_rows = TEST_ROWS,
+                   .n_cols = TEST_COLS, .kquant_cache = q5r,
+                   .kquant_cache_format = Q38KC_FORMAT_IQ4R};
+    if (tf_kquant_cache_rows(ranged_q5, &bad, x, 0, TEST_ROWS)) {
+        fprintf(stderr, "invalid runtime format accepted\n");
+        return 1;
+    }
+    transformer_model attach_model = {0};
+    transformer_layer attach_layer = {0};
+    attach_model.n_layers = 1;
+    attach_model.layers = &attach_layer;
+    attach_layer.ffn_gate = (qtensor){.data = q5, .type = GGML_TYPE_Q5_K,
+        .n_rows = TEST_ROWS, .n_cols = TEST_COLS};
+    q38kc_header attach_header = {0};
+    attach_header.n_entries = 1;
+    snprintf(attach_header.entries[0].name,
+             sizeof(attach_header.entries[0].name),
+             "blk.0.ffn_gate.weight");
+    attach_header.entries[0].source_type = GGML_TYPE_Q5_K;
+    attach_header.entries[0].cache_format = Q38KC_FORMAT_Q5R;
+    attach_header.entries[0].local_rows = TEST_ROWS;
+    attach_header.entries[0].local_cols = TEST_COLS;
+    q38kc_model_cache attach_cache = {0};
+    attach_cache.loaded.header = &attach_header;
+    attach_cache.loaded.mapping = q5r;
+    attach_cache.loaded.mapping_bytes = q5r_size;
+    char attach_error[128] = {0};
+    if (q38kc_model_attach(&attach_cache, &attach_model,
+                           attach_error, sizeof(attach_error)) ||
+        attach_layer.ffn_gate.kquant_cache != q5r ||
+        attach_layer.ffn_gate.kquant_cache_format != Q38KC_FORMAT_Q5R ||
+        attach_cache.attached_entries != 1) {
+        fprintf(stderr, "model cache attach failed: %s\n", attach_error);
+        return 1;
+    }
+    q38kc_model_detach(&attach_cache, &attach_model);
+    if (attach_layer.ffn_gate.kquant_cache ||
+        attach_layer.ffn_gate.kquant_cache_format ||
+        attach_cache.attached_entries) {
+        fprintf(stderr, "model cache detach failed\n");
+        return 1;
+    }
+    printf("SENTINEL qwen38_kquant_cache=OK layout_version=%d q5r_bytes=%zu iq4r_bytes=%zu ownership_threads=3 tail_fallback=1 attach_detach=1\n",
            TF_KQUANT_CACHE_LAYOUT_VERSION, q5r_size, iq4r_size);
     free(x);
     free(iq4r);

@@ -74,6 +74,7 @@ extern void kmp_set_blocktime(int milliseconds);
 #include "../../common/bpe_tokenizer.h"
 #define TRANSFORMER_IMPLEMENTATION
 #include "../../common/transformer.h"
+#include "qwen38_kquant_attach.h"
 
 #include "../utofu-tests/tofu_demo.h"
 #include "../utofu-tests/tp_allreduce.h"
@@ -1265,8 +1266,14 @@ static double tp_local_weight_bytes(const transformer_model *m) {
 
 int main(int argc, char **argv) {
     int rc;
-    if (argc < 2) { fprintf(stderr, "usage: %s <model-shard1.gguf>\n", argv[0]); return 1; }
+    if (argc != 2 &&
+        !(argc == 4 && !strcmp(argv[2], "--kquant-stage"))) {
+        fprintf(stderr, "usage: %s <model-shard1.gguf> [--kquant-stage DIR]\n",
+                argv[0]);
+        return 1;
+    }
     const char *model_path = argv[1];
+    const char *kquant_stage_dir = argc == 4 ? argv[3] : "";
     const char *prompt_env = envs("TP_PROMPT", "Hello, who are you?");
     const char *prompt_file = envs("TP_PROMPT_FILE", "");
     char *prompt_file_text = NULL;
@@ -1727,6 +1734,38 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    q38kc_model_cache kquant_cache = {0};
+    int kquant_prepared = 0;
+    int kquant_attached = 0;
+    if (kquant_stage_dir[0]) {
+        char error[256] = {0};
+        double kc0 = now_sec();
+        int local_ready = tp_stage_dir[0] &&
+            q38kc_model_prepare(&kquant_cache, m, tp_stage_dir,
+                                kquant_stage_dir, MyRank, N,
+                                error, sizeof(error)) == 0;
+        double kc1 = now_sec();
+        float ready_votes = local_ready ? 1.0f : 0.0f;
+        tp_allreduce_sum(&c, &ready_votes, 1);
+        if ((int)(ready_votes + 0.5f) == N) {
+            kquant_prepared = 1;
+            fprintf(stderr,
+                    "kquant_stage: rank %d prepared %u tensors %.3f GB in %.3f s MemAvailable=%.2fGB\n",
+                    MyRank, kquant_cache.loaded.header->n_entries,
+                    (double)kquant_cache.loaded.mapping_bytes / 1e9,
+                    kc1 - kc0, tf_mem_available_gb());
+        } else {
+            if (local_ready) q38kc_model_close(&kquant_cache, m);
+            fprintf(stderr,
+                    "kquant_stage: rank %d compact fallback (local=%d votes=%.0f/%d): %s\n",
+                    MyRank, local_ready, ready_votes, N,
+                    error[0] ? error : "another rank failed validation");
+            if (is_first)
+                logmsg("kquant cache disabled: validation votes %.0f/%d\n",
+                       ready_votes, N);
+        }
+    }
+
     int cache_loaded = 0;
     int cache_prefill_used = 0;
     int cache_prefill_skipped = 0;
@@ -2051,6 +2090,33 @@ int main(int argc, char **argv) {
         }
         final_cache_pos = prefill_from + prefill_tokens;
         goto done;
+    }
+
+    if (kquant_prepared) {
+        char error[256] = {0};
+        int local_attached =
+            q38kc_model_attach(&kquant_cache, m, error, sizeof(error)) == 0;
+        float attach_votes = local_attached ? 1.0f : 0.0f;
+        tp_allreduce_sum(&c, &attach_votes, 1);
+        if ((int)(attach_votes + 0.5f) == N) {
+            kquant_attached = 1;
+            fprintf(stderr,
+                    "kquant_stage: rank %d decode attach OK entries=%u\n",
+                    MyRank, kquant_cache.attached_entries);
+            if (is_first)
+                logmsg("kquant decode cache attached after compact prefill: entries=%u\n",
+                       kquant_cache.attached_entries);
+        } else {
+            if (local_attached) q38kc_model_detach(&kquant_cache, m);
+            q38kc_model_close(&kquant_cache, m);
+            kquant_prepared = 0;
+            fprintf(stderr,
+                    "kquant_stage: rank %d attach fallback (local=%d votes=%.0f/%d): %s\n",
+                    MyRank, local_attached, attach_votes, N,
+                    error[0] ? error : "another rank failed attachment");
+            if (is_first)
+                logmsg("kquant decode cache attach failed; using compact kernels\n");
+        }
     }
 
     t_fwd = 0.0; t_comm = 0.0; ar_calls = 0; pcnt = 0;  /* decode-only stats */
@@ -2649,6 +2715,8 @@ done:
     /* transformer_free joins+shuts down the worker pool, which under
      * -DTF_POOL_PROFILE emits the per-dispatch work/wait + per-tid
      * matvec/barrier/serial/attn decode breakdown to stderr. */
+    if (kquant_prepared || kquant_attached)
+        q38kc_model_close(&kquant_cache, m);
     transformer_free(m);
     if (draft_comm_ready) {
         tp_comm_free(&draft_comm);
