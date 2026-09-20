@@ -18,6 +18,7 @@ TAG=${PJM_JOBID:-manual_$$}
 RESULT=$REPO/tmp/qwen38_q4_kquant_tp4_$TAG
 STAGE=/local/u14346/codex-research/qwen38-q4-tp4
 KQUANT_STAGE=/local/u14346/codex-research/qwen38-q4-tp4-kquant
+COMPILER_TMP=/local/u14346/codex-research/compiler-tmp
 
 export PATH=/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:/usr/local/bin:/usr/bin:/bin
 export PJM_MPI_PROC=4 TP_SIZE=4 TP_STAGE_DIR=$STAGE
@@ -26,6 +27,8 @@ export OMP_DYNAMIC=false OMP_WAIT_POLICY=active KMP_BLOCKTIME=1
 export TP_RAW_PROMPT=1 TP_PROMPT='Explain why deterministic reductions matter.'
 export TP_AR_DETERMINISTIC=1 TP_PERF_WARMUP=0 TP_IGNORE_EOS=1
 export TP_MAXSEQ=512 TP_DUMP_TOKENS=1
+mkdir -p "$COMPILER_TMP"
+export TMPDIR=$COMPILER_TMP
 
 mkdir -p "$RESULT"
 cd "$LLM"
