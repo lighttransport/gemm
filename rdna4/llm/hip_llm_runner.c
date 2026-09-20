@@ -3295,8 +3295,10 @@ static const char *hip_kernel_source =
 "        if (i < d_state) S[i] = s[rr];\n"
 "    }\n"
 "}\n"
-"/* Fixed Qwen3.5 state shape.  Spell out the four rows owned by each lane\n"
-" * while retaining the reference kernel's accumulation and shuffle order. */\n"
+"/* Fixed Qwen3.5 scalar-decode shape.  Spell out the four rows owned by each\n"
+" * lane while retaining the original reference kernel's exp and accumulation\n"
+" * order.  Mode 1 has the original scalar contract (expf); mode 2 consumes\n"
+" * a decay precomputed once per token/head for batched prefill. */\n"
 "__global__ void deltanet_step_batch_gda_ref_128_f32(\n"
 "    float *state, float *out_batch,\n"
 "    const float *Q_batch, const float *K_batch, const float *V_batch,\n"
@@ -3307,39 +3309,35 @@ static const char *hip_kernel_source =
 "    int col = blockIdx.z * blockDim.y + threadIdx.y;\n"
 "    if (h >= dt_rank || col >= 128 || lane >= 32) return;\n"
 "    float *S = state + (size_t)h * 128 * 128 + (size_t)col * 128;\n"
-"    float s0 = S[lane], s1 = S[32 + lane];\n"
-"    float s2 = S[64 + lane], s3 = S[96 + lane];\n"
+"    float s[4];\n"
+"    for (int rr = 0; rr < 4; ++rr) s[rr] = S[rr * 32 + lane];\n"
 "    const float scale = rsqrtf(128.0f);\n"
 "    const size_t per_tok = (size_t)dt_rank * 128;\n"
 "    for (int m = 0; m < M; ++m) {\n"
 "        size_t base = (size_t)m * per_tok + (size_t)h * 128;\n"
-"        float k0 = K_batch[base + lane];\n"
-"        float k1 = K_batch[base + 32 + lane];\n"
-"        float k2 = K_batch[base + 64 + lane];\n"
-"        float k3 = K_batch[base + 96 + lane];\n"
-"        float q0 = Q_batch[base + lane];\n"
-"        float q1 = Q_batch[base + 32 + lane];\n"
-"        float q2 = Q_batch[base + 64 + lane];\n"
-"        float q3 = Q_batch[base + 96 + lane];\n"
+"        float k[4], q[4];\n"
 "        float kv = 0.0f;\n"
-"        kv += s0 * k0; kv += s1 * k1;\n"
-"        kv += s2 * k2; kv += s3 * k3;\n"
+"        for (int rr = 0; rr < 4; ++rr) {\n"
+"            k[rr] = K_batch[base + rr * 32 + lane];\n"
+"            q[rr] = Q_batch[base + rr * 32 + lane];\n"
+"            kv += s[rr] * k[rr];\n"
+"        }\n"
 "        for (int off = 16; off > 0; off >>= 1) kv += __shfl_xor(kv, off);\n"
 "        float alpha = alpha_batch[(size_t)m * dt_rank + h];\n"
-"        float decay = parity ? alpha : expf(alpha);\n"
+"        float decay = parity == 2 ? alpha :\n"
+"                      parity ? expf(alpha) : __expf(alpha);\n"
 "        float delta = (V_batch[(size_t)m * v_row_stride +\n"
 "                               (size_t)h * 128 + col] - decay * kv) *\n"
 "                      beta_batch[(size_t)m * dt_rank + h];\n"
 "        float y = 0.0f;\n"
-"        s0 = decay * s0 + k0 * delta; y += s0 * q0;\n"
-"        s1 = decay * s1 + k1 * delta; y += s1 * q1;\n"
-"        s2 = decay * s2 + k2 * delta; y += s2 * q2;\n"
-"        s3 = decay * s3 + k3 * delta; y += s3 * q3;\n"
+"        for (int rr = 0; rr < 4; ++rr) {\n"
+"            s[rr] = decay * s[rr] + k[rr] * delta;\n"
+"            y += s[rr] * q[rr];\n"
+"        }\n"
 "        for (int off = 16; off > 0; off >>= 1) y += __shfl_xor(y, off);\n"
 "        if (lane == 0) out_batch[base + col] = y * scale;\n"
 "    }\n"
-"    S[lane] = s0; S[32 + lane] = s1;\n"
-"    S[64 + lane] = s2; S[96 + lane] = s3;\n"
+"    for (int rr = 0; rr < 4; ++rr) S[rr * 32 + lane] = s[rr];\n"
 "}\n"
 "/* Exact multi-token verifier recurrence with a rollback checkpoint after\n"
 " * every row.  The canonical state is left untouched; commit copies the\n"
@@ -22752,9 +22750,9 @@ static inline void launch_deltanet_step(hip_llm_runner *r, void *state,
         ref_env && atoi(ref_env) != 0) {
         /* Reuse the audited reference layout with one token. All scalar
          * inputs are contiguous; V has a single dt_rank*d_state row. */
-        int stride = dt_rank * d_state, one = 1, decay_ready = 0;
+        int stride = dt_rank * d_state, one = 1, parity = 1;
         void *ref_args[] = { &state, &out, &Q, &K, &V, &alpha, &beta,
-                            &dt_rank, &d_state, &stride, &one, &decay_ready };
+                            &dt_rank, &d_state, &stride, &one, &parity };
         hipFunction_t ref_fn = r->fn_deltanet_step_batch_gda_ref_128_f32;
         LAUNCH(ref_fn, dt_rank, 1,
                (d_state + 3) / 4, 32, 4, 1, 0, r->stream, ref_args);
@@ -22842,7 +22840,7 @@ static inline void launch_deltanet_step_batch(hip_llm_runner *r, void *state,
     } else if (d_state <= 128 && (parity || !use_warp)) {
         /* Match llama.cpp's GDA kernel: 32-lane warp per column, four
          * columns per block.  Qwen3.5 uses the scalar-decay GDA form. */
-        int decay_ready = 1;
+        int decay_ready = d_state == 128 ? 2 : 1;
         void *ref_args[] = { &state, &out_batch, &Q_batch, &K_batch, &V_batch,
             &alpha_batch, &beta_batch, &dt_rank, &d_state, &v_row_stride, &M,
             &decay_ready };

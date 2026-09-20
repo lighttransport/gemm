@@ -56,6 +56,9 @@ def main():
     parser.add_argument("--native-mmvq", action="store_true")
     parser.add_argument("--mtp", type=Path, help="dense NextN sidecar, with exact target window verification")
     parser.add_argument("--mtp-draft", type=int, default=3)
+    parser.add_argument("--dflash2", type=Path,
+                        help="DFlash2 sidecar; greedy target windows and sampled target fallback")
+    parser.add_argument("--dflash2-draft", type=int, default=7)
     parser.add_argument("--cpp-merge", action="store_true")
     args = parser.parse_args()
     if args.decode < 1 or args.decode > 4096 or args.repeats < 2:
@@ -66,6 +69,12 @@ def main():
         args.mtp = args.mtp.resolve()
         if not 1 <= args.mtp_draft <= 15:
             parser.error("MTP draft width must be 1..15")
+    if args.dflash2:
+        args.dflash2 = args.dflash2.resolve()
+        if not 1 <= args.dflash2_draft <= 7:
+            parser.error("DFlash2 draft width must be 1..7")
+    if args.mtp and args.dflash2:
+        parser.error("MTP and DFlash2 sidecars are mutually exclusive")
     args.reference, args.out = args.reference.resolve(), args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=False)
     if args.prompt is None:
@@ -90,6 +99,8 @@ def main():
         manifest["sha256"][str(path)] = digest(path)
     if args.mtp:
         manifest["sha256"][str(args.mtp)] = digest(args.mtp)
+    if args.dflash2:
+        manifest["sha256"][str(args.dflash2)] = digest(args.dflash2)
     previous = None
     if args.reuse_reference:
         args.reuse_reference = args.reuse_reference.resolve()
@@ -143,6 +154,9 @@ def main():
         if args.mtp:
             commands["ours"] += ["--qwen35-mtp", str(args.mtp), "--qwen35-mtp-draft",
                                  str(args.mtp_draft), "--qwen35-mtp-window"]
+        if args.dflash2:
+            commands["ours"] += ["--qwen35-dflash2", str(args.dflash2),
+                                 "--qwen35-dflash2-draft", str(args.dflash2_draft)]
         prefixes = {}
         for backend, command in commands.items():
             reuse = backend == "llama" and previous is not None

@@ -44,6 +44,11 @@ kv-q8q8-test:
 	python3 test_kv_q8q8.py --hipcc $(HIPCC) --out tmp/kv-q8q8
 	env LD_LIBRARY_PATH=$(ROCM_LIB) ./tmp/kv-q8q8/test
 
+.PHONY: qwen35-gda-test
+qwen35-gda-test:
+	python3 test_qwen35_gda.py --hipcc $(HIPCC) --out tmp/qwen35-gda
+	env LD_LIBRARY_PATH=$(ROCM_LIB) ./tmp/qwen35-gda/test
+
 ifeq ($(HIPBLASLT),1)
 CFLAGS += -DLLM_HIPBLASLT_ENABLED
 LDFLAGS += -L$(ROCM_LIB) -Wl,-rpath,$(ROCM_LIB) -lhipblaslt -lhipblas -lstdc++

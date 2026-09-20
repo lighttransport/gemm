@@ -13,11 +13,18 @@ fuses them, and injects the resulting K/V rows into the draft cache.  A draft
 step evaluates one non-causal block containing the target anchor followed by
 mask tokens.  Its rank-256 selector walks the top-16 candidate lattice.
 
-The target remains authoritative.  Draft tokens are evaluated by the existing
-exact Q8/Q8 multi-row target verifier.  Recurrent states and the target hidden
-state are committed only through the accepted row.  The corresponding target
-features are then injected into the draft cache, replacing the speculative
-rows.  A rejection therefore cannot alter later target output.
+The target remains authoritative.  Draft tokens are evaluated by the Q8/Q8
+multi-row target verifier.  Recurrent states and the target hidden state are
+committed only through the accepted row.  The corresponding target features
+are then injected into the draft cache, replacing the speculative rows.  A
+rejection therefore cannot alter later target output.
+
+The multi-row verifier is enabled only for greedy selection.  Its first row
+matches ordinary decode, while later rows currently have small logit changes
+from batching recurrent and projection work.  Greedy token choices pass the
+pinned fixtures; probabilistic and coding samplers use ordinary exact-target
+decode so the sidecar cannot change their token stream.  The runner prints
+`DFLASH2 sampled fallback=exact-target` when this happens.
 
 ## Run
 
@@ -37,6 +44,19 @@ Draft width may be 1 through 7.  The sidecar currently requires benchmark
 mode, batched Qwen3.8 prefill, the decode graph, and Q8 K plus Q8 V.  It is
 mutually exclusive with dense NextN and Qwen4 MTP.  HTTP/stdio scheduling is
 not implemented.
+
+The reference validator accepts the sidecar directly:
+
+```sh
+python3 rdna4/llm/validate_qwen38_reference.py \
+  --model /mnt/nvme02/models/qwen38/27b/gsq/Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf \
+  --out tmp/qwen38/dflash2-quality-k7 \
+  --reuse-reference tmp/qwen38/final-iq2-native-q2k \
+  --native-q8-prefill --native-mmvq \
+  --dflash2 \
+    /mnt/nvme02/models/qwen38/27b/dflash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
+  --dflash2-draft 7 --decode 256 --repeats 3
+```
 
 ## Validation and performance
 
@@ -62,13 +82,30 @@ int clamp(int x, int lo, int hi) {
 }
 ```
 
+A broader 4096-token C++17 merge-intervals fixture covers greedy and
+temperature-0.6 sampling.  Both K=4 and K=7 match the pinned llama.cpp token
+IDs, EOS and output bytes.  The generated function passes fixed edge cases,
+ASan/UBSan, and 10,000 randomized cases.  Warm results were:
+
+| Draft width / selection | Prefill tok/s | Decode tok/s | Output SHA-256 |
+|---|---:|---:|---|
+| K=4 / greedy | 607.24–607.84 | 58.35–58.42 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
+| K=7 / greedy | 605.95–606.83 | 79.69–79.74 | `4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354` |
+| sampled exact-target fallback | 605.21–606.85 | 38.74–38.86 | `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac` |
+
+The 4096-token early-context retrieval fixture also returns exactly
+`ZEPHYR-7319` with K=7, including the ordinary target's token sequence and
+EOS.  These results are under `tmp/qwen38/dflash2-quality-k4-v5/`,
+`tmp/qwen38/dflash2-quality-k7-v4/`, and
+`tmp/qwen38/dflash2-retrieval-k7.*`.
+
 The upstream llama.cpp server reference accepted 37/40 drafts at K=4 on the
 same prompt, but measured 16.54 tok/s versus its 25.88 tok/s ordinary path.
 The native K=4 implementation reproduces that acceptance exactly and is 3.19
 times as fast.  K=7 is 93 percent faster than the retained recent ordinary
 native baseline on this prompt.  DFlash prefill also clears the 500 tok/s
 target.  The feature remains opt-in while serving integration and broader
-quality coverage are incomplete.
+quality coverage remain incomplete.
 
 The optimized target verifier decodes IQ and Q2_K weights once for up to eight
 candidate rows.  Quantization-format-specific kernels remove runtime codebook
@@ -96,6 +133,14 @@ eight-row Q2_K/IQ kernels.  The emitted source passes
 `gcc -std=c17 -Wall -Wextra -Wpedantic -Werror` and boundary tests using
 `INT_MIN` and `INT_MAX`.
 
+The fixed-shape GDA recurrence has separate contracts for raw scalar alpha and
+prefill's precomputed decay.  Its fixed-bound loop preserves the generic
+kernel's operation order under the runner's `-ffast-math` HIPRTC mode.  The
+dedicated test compares 19,537,920 state/output values bitwise across both
+contracts.  This restores the pinned sampled sequence while retaining the
+specialized prefill speed; spelling the four rows as separate accumulators
+reassociated operations and changed the sampled output.
+
 The same K=7 path was measured after a fully processed 65,536-token random
 prefix.  Prefix processing sustained 445.71 tok/s with hash
 `90178de69a24a76e`; the following 256 generated tokens sustained 47.72 tok/s
@@ -118,33 +163,38 @@ still about 29.13 tok/s at 64K, so work that helps both ordinary and verifier
 execution remains useful.  The following order reflects the remaining
 measured costs.
 
-1. **One-row target projections.**  Fixed-eight Q2_K/IQ projections now share
+1. **Ordinary one-row target projections.**  Fixed-eight Q2_K/IQ projections now share
    decoded weights with lower accumulator pressure, but ordinary decode still
    streams the same weights for one row at a time.  Reuse the quantized input
    across gate/up projections, reduce codebook traffic, and investigate
    cooperative staging.  A WMMA or reordered reduction path needs full
    output-token and logit validation because the current kernels preserve the
    target arithmetic order.
-2. **Hybrid recurrent state.**  DeltaNet used 65.17 ms, state preparation
+2. **Exact sampled multi-row verification.**  Audit the first divergent
+   verifier row against repeated scalar target decode, beginning with the
+   recurrent checkpoints and compact projection inputs.  Enable DFlash for
+   probabilistic sampling only after every verifier row produces the ordinary
+   target logits bitwise and both pinned sampling fixtures still match.
+3. **Hybrid recurrent state.**  DeltaNet used 65.17 ms, state preparation
    14.94 ms, checkpoint copies 16.45 ms, and F16 matrix-vector work 13.32 ms.
    Processing sequential candidate rows in one state kernel and keeping
    checkpoints device-local could remove launches and memory traffic.  Every
    row must retain a rollback point so a rejected draft cannot affect later
    target state.
-3. **Verifier attention tail.**  The shared-K/V kernel halves the 64K
+4. **Verifier attention tail.**  The shared-K/V kernel halves the 64K
    eight-query operator time, but it still writes split partials for a second
    combine launch.  An exact in-kernel combine or adaptive split policy may
    reduce the tail if it preserves the pinned arithmetic at the selected split
    count.
-4. **Kernel and graph count.**  The remaining small launches include QK
+5. **Kernel and graph count.**  The remaining small launches include QK
    normalization, RoPE, KV storage, SiLU/gating, and state preparation.  Fuse
    adjacent operations when their intermediate values need no external
    checkpoint.
-5. **Draft and selector cost.**  Draft work is 108.910 ms at 4K and 668.717 ms
+6. **Draft and selector cost.**  Draft work is 108.910 ms at 4K and 668.717 ms
    across the 256-token 64K suffix.  Position-parallel attention, cheaper
    draft-cache storage, and more selector work on the GPU are candidates,
    provided K=4/K=7 acceptance and authoritative output remain stable.
-6. **Prompt-cache injection.**  The 4K and random 64K prefill targets are now
+7. **Prompt-cache injection.**  The 4K and random 64K prefill targets are now
    met, but the five feature taps and sidecar K/V injection still consume
    avoidable bandwidth.  Fuse tap capture with target hidden writes, batch the
    five sidecar injections, and overlap independent sidecar work with the next

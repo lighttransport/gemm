@@ -1697,7 +1697,8 @@ int main(int argc, char **argv) {
             if (cpu_model) transformer_free(cpu_model);
             bpe_vocab_free(vocab); gguf_close_shards(gguf_model); return 1;
         }
-        fprintf(stderr, "DFlash2 loaded: draft=%d, exact target windows enabled\n",
+        fprintf(stderr, "DFlash2 loaded: draft=%d, greedy target windows enabled; "
+                        "sampled generation uses exact target decode\n",
                 qwen35_dflash2_draft);
     }
     if (load_qwen4_nextn_fusion) {
@@ -2087,6 +2088,9 @@ int main(int argc, char **argv) {
             int text_finished = 0;
             const int text_eos = bpe_eos_id(vocab);
             const int text_eot = bpe_eot_id(vocab);
+            if (qwen35_dflash2_path && (coding_mode ||
+                (sampler && !sampler_argmax)))
+                fprintf(stderr, "DFLASH2 sampled fallback=exact-target\n");
             if (gen_text) fprintf(stderr, "\n=== Generated text ===\n");
             const char *finish_reason = "length";
             int selected = 0;
@@ -2096,7 +2100,14 @@ int main(int argc, char **argv) {
             float *dense_logits = NULL;
             int32_t dense_argmax[16];
             int dense_window_rows = 0;
-            const int dense_dflash2 = qwen35_dflash2_path != NULL;
+            const int dense_dflash2_configured = qwen35_dflash2_path != NULL;
+            /* Batched verifier rows preserve greedy selections, but rows after
+             * the first are not logit-bitwise identical to scalar target
+             * decode yet.  Sampling can therefore change the token stream.
+             * Keep DFlash2 on its validated greedy path and use the exact
+             * scalar target for probabilistic and coding samplers. */
+            const int dense_dflash2 = dense_dflash2_configured && !coding_mode &&
+                (!sampler || sampler_argmax);
             const int dense_path = qwen35_mtp_path != NULL || dense_dflash2;
             const int dense_window = qwen35_mtp_window || dense_dflash2;
             const int dense_draft_width = dense_dflash2 ? qwen35_dflash2_draft : qwen35_mtp_draft;
