@@ -44,6 +44,7 @@ RX 9070 XT / gfx1201 / ROCm 10, Q8 K and Q8 V, greedy sampling:
 |---|---:|---:|---:|---:|---|
 | IQ2_XS ordinary, original exact gate | 3 x 512 tokens | 26.92 / 26.91 / 26.90 | 142.36 | 4284 MiB | `b01a17fae16f806d` |
 | IQ2_XS ordinary, exact three-head K/V reuse | 512 tokens | 32.56 | 444.31 | 4282 MiB | `051e7338c23a544e` |
+| IQ2_XS ordinary, staged IQ codebooks | 512 tokens | 33.31 | 443.44 | 4282 MiB | `051e7338c23a544e` |
 | IQ2_XS + DFlash2 K=7, optimized | 256 tokens | 47.72 | 445.71 | 1274 MiB | `2ddd068dca63669a` |
 
 All runs use the same fully processed 65,536-token random prefix with token
@@ -73,11 +74,18 @@ generic verifier at the same split count.  The DFlash path therefore clears
 the 40 tok/s sustained target without approximating authoritative target
 output.
 
-Ordinary one-token decode now reaches 32.56 tok/s in the latest retained run,
+Ordinary one-token decode now reaches 33.31 tok/s in the latest retained run,
 so its 40 tok/s target remains open. The 16 attention layers now cost about
 5.8 ms/token at 64K; the remaining projection, SSM, normalization and output
 path is about 25 ms/token. Reducing projection weight traffic and recurrent
 state work is now more useful than further attention-only work.
+
+The scalar IQ2_XXS, IQ2_XS and IQ3_XXS kernels stage their 1--4 KiB decode
+tables in LDS once per block. IQ3_XXS uses four waves because eight or more
+waves lose occupancy after staging. The change retains the short-context
+sequence hash and raises a 512-token zero-depth run from about 40.7 to
+41.9--42.0 tok/s. IQ3_S staging was measured and rejected because its 2 KiB
+table slowed the important projection shapes.
 Dense NextN remains opt-in; its previous 64K result used the removed zero-cache
 setup and must be remeasured before making a random-depth performance claim.
 

@@ -63,8 +63,11 @@ After a fully processed 65,536-token random prefix, DFlash K=7 now sustains
 has hash `90178de69a24a76e`; the suffix retains hash `2ddd068dca63669a`.
 It drafted 259 tokens, accepted 217, and spent 668.717/4602.977/57.440 ms in
 draft/verify/commit.  This meets the random-depth 40 tok/s goal.  Ordinary
-single-token decode remains about 29.13 tok/s at the same depth and is the
-main open decode target.
+scalar decode now stages the IQ2_XXS, IQ2_XS and IQ3_XXS codebooks in LDS. A
+512-token zero-depth run sustains 41.90--42.03 tok/s with unchanged hash
+`c08c332d32a63532`; after the real 64K prefix it sustains 33.31 tok/s with the
+retained `051e7338c23a544e` hash. The 40 tok/s long-context target remains
+open.
 
 Prioritize ordinary one-row target projection traffic first, followed by the
 sampled verifier-row parity audit, recurrent-state checkpoint traffic, and
@@ -127,9 +130,10 @@ K/V rows on device. Seed one produces prefix hash `90178de69a24a76e`.
 Before the long-prefill WMMA change, the 65,536-token IQ2 prefix took 460.37
 seconds at 142.36 tok/s. Three original ordinary 512-token decode repeats
 sustain 26.92/26.91/26.90 tok/s and share sequence hash
-`b01a17fae16f806d`. Exact three-head GQA K/V reuse now reaches 32.56 tok/s for
-a 512-token suffix after processing the same prefix at 444.31 tok/s; its hash
-is the retained `051e7338c23a544e`.
+`b01a17fae16f806d`. Exact three-head GQA K/V reuse reached 32.56 tok/s for a
+512-token suffix. Staging the profitable scalar IQ codebooks now reaches 33.31
+tok/s after processing the same prefix at 443.44 tok/s; its hash is the
+retained `051e7338c23a544e`.
 The prior 27.94 tok/s result used zero cache values and is superseded.
 
 The optimized DFlash K=7 path processes the same random prefix in 147.039

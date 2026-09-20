@@ -83,6 +83,10 @@ extern "C" __global__ void qwen35_matvec_iq4xs(
 extern "C" __global__ void qwen35_matvec_iq2xxs(
         float *out, const unsigned char *weights, const signed char *q,
         const float *scales, int rows, int cols) {
+    __shared__ unsigned long long grid_cache[256];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x)
+        grid_cache[i] = qwen35_iq2xxs_grid[i];
+    __syncthreads();
     int lane = threadIdx.x & 31;
     int linear = blockIdx.y * gridDim.x + blockIdx.x;
     int token = linear % gridDim.y;
@@ -102,7 +106,7 @@ extern "C" __global__ void qwen35_matvec_iq2xxs(
         int z = 0;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            unsigned long long grid = qwen35_iq2xxs_grid[p[2 + ib * 8 + j]];
+            unsigned long long grid = grid_cache[p[2 + ib * 8 + j]];
             unsigned int signs = qwen35_parity_signs((aux >> (7*j)) & 127);
             int lo = qwen35_signed_grid((unsigned int)grid, signs, 0);
             int hi = qwen35_signed_grid((unsigned int)(grid >> 32), signs, 4);
@@ -120,6 +124,10 @@ extern "C" __global__ void qwen35_matvec_iq2xxs(
 extern "C" __global__ void qwen35_matvec_iq2xs(
         float *out, const unsigned char *weights, const signed char *q,
         const float *scales, int rows, int cols) {
+    __shared__ unsigned long long grid_cache[512];
+    for (int i = threadIdx.x; i < 512; i += blockDim.x)
+        grid_cache[i] = qwen35_iq2xs_grid[i];
+    __syncthreads();
     int lane = threadIdx.x & 31;
     int linear = blockIdx.y * gridDim.x + blockIdx.x;
     int token = linear % gridDim.y;
@@ -140,7 +148,7 @@ extern "C" __global__ void qwen35_matvec_iq2xs(
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             unsigned int code = ((const unsigned short *)(p + 2))[ib * 4 + j];
-            unsigned long long grid = qwen35_iq2xs_grid[code & 511];
+            unsigned long long grid = grid_cache[code & 511];
             unsigned int signs = qwen35_parity_signs(code >> 9);
             int lo = qwen35_signed_grid((unsigned int)grid, signs, 0);
             int hi = qwen35_signed_grid((unsigned int)(grid >> 32), signs, 4);
@@ -196,6 +204,10 @@ extern "C" __global__ void qwen35_matvec_iq2s(
 extern "C" __global__ void qwen35_matvec_iq3xxs(
         float *out, const unsigned char *weights, const signed char *q,
         const float *scales, int rows, int cols) {
+    __shared__ unsigned int grid_cache[256];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x)
+        grid_cache[i] = qwen35_iq3xxs_grid[i];
+    __syncthreads();
     int lane = threadIdx.x & 31;
     int linear = blockIdx.y * gridDim.x + blockIdx.x;
     int token = linear % gridDim.y;
@@ -216,8 +228,8 @@ extern "C" __global__ void qwen35_matvec_iq3xxs(
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             unsigned int signs = qwen35_parity_signs((aux >> (7*j)) & 127);
-            int lo = qwen35_signed_grid(qwen35_iq3xxs_grid[p[2 + ib*8 + 2*j]], signs, 0);
-            int hi = qwen35_signed_grid(qwen35_iq3xxs_grid[p[3 + ib*8 + 2*j]], signs, 4);
+            int lo = qwen35_signed_grid(grid_cache[p[2 + ib*8 + 2*j]], signs, 0);
+            int hi = qwen35_signed_grid(grid_cache[p[3 + ib*8 + 2*j]], signs, 4);
             z = qwen35_dot4(lo, u[2*j], z);
             z = qwen35_dot4(hi, u[2*j+1], z);
         }

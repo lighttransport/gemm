@@ -21025,7 +21025,9 @@ static inline void launch_matvec_iq3_xxs(hip_llm_runner *r, void *dst,
         r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
-        int threads = n_rows == 5120 ? 1024 : 256;
+        /* The native kernel stages its 1 KiB codebook once per block.  Four
+         * waves amortize that load without the occupancy loss seen at 1024. */
+        int threads = 256;
         int rpb = threads/32;
         LAUNCH(r->fn_qwen35_matvec_iq3xxs, (n_rows+rpb-1)/rpb, 1, 1, threads, 1, 1, 0, r->stream, a);
         return;
