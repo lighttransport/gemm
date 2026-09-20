@@ -27,6 +27,9 @@ export OMP_DYNAMIC=false OMP_WAIT_POLICY=active KMP_BLOCKTIME=1
 export TP_RAW_PROMPT=1 TP_PROMPT='Explain why deterministic reductions matter.'
 export TP_AR_DETERMINISTIC=1 TP_PERF_WARMUP=0 TP_IGNORE_EOS=1
 export TP_MAXSEQ=512 TP_DUMP_TOKENS=1
+# Q5R/IQ4R retain the established compact-A8 activation quantizer.  Compare
+# against that exact compact-weight baseline, not the separate FP32-x kernel.
+export TF_KQUANT_A8=1
 mkdir -p "$COMPILER_TMP"
 export TMPDIR=$COMPILER_TMP
 
@@ -35,9 +38,12 @@ cd "$LLM"
 
 record_memory() {
     local label=$1
-    mpiexec -np 4 sh -c \
-        'printf "host=%s " "$(hostname)"; awk '\''/^MemAvailable:/{print $1 " " $2 " " $3}'\'' /proc/meminfo' \
-        | tee "$RESULT/memory_$label.txt"
+    export Q38_RESULT=$RESULT Q38_MEMORY_LABEL=$label
+    mpiexec -np 4 sh -c '
+        rank=${PMIX_RANK:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-unknown}}}
+        file="$Q38_RESULT/memory_${Q38_MEMORY_LABEL}_rank${rank}.txt"
+        printf "host=%s rank=%s " "$(hostname)" "$rank" > "$file"
+        awk '\''/^MemAvailable:/{print $1 " " $2 " " $3}'\'' /proc/meminfo >> "$file"'
 }
 
 save_run() {
@@ -61,8 +67,11 @@ TP_KQUANT_STAGE_DIR=$KQUANT_STAGE bash ./run_qwen38_q4_tp4.sh kquant-stage
 record_memory kquant
 
 echo "=== strict sidecar check: $(date) ==="
-TP_KQUANT_STAGE_DIR=$KQUANT_STAGE bash ./run_qwen38_q4_tp4.sh kquant-check \
-    | tee "$RESULT/kquant-check.txt"
+export Q38_RESULT=$RESULT Q38_KQUANT_STAGE=$KQUANT_STAGE
+mpiexec -np 4 sh -c '
+    rank=${PMIX_RANK:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-unknown}}}
+    ./build/qwen38_kquant_check "$TP_STAGE_DIR" "$Q38_KQUANT_STAGE" \
+        > "$Q38_RESULT/kquant-check-rank${rank}.txt" 2>&1'
 record_memory checked
 
 for tokens in 128 256; do
