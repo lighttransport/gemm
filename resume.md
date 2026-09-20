@@ -9,7 +9,7 @@ top-16 selector proposes up to seven tokens, while the existing exact Q8/Q8
 target window remains the only source of emitted tokens and committed state.
 
 On the 4096-token C clamp prompt, K=4 accepted 37/40 drafts and K=7 accepted
-40/42.  Both produced the ordinary target's exact 46-token response, EOS and
+41/42.  Both produced the ordinary target's exact 46-token response, EOS and
 sequence hash `15f17d2640c1adfc`; the emitted C is coherent, compiles warning
 free as C17 and passes `INT_MIN`/`INT_MAX` boundary cases.  The final warm K=7
 run measured **43.68 tok/s decode and 446.38 tok/s prefill**, versus 37.82 and
@@ -24,11 +24,28 @@ quantization format at compile time, eliminating runtime codebook branches.
 RMSNorm and residual-plus-RMSNorm use one batched launch with an independent
 block and unchanged reduction per row.  The DFlash draft reuses Q4_K weights
 across eight rows and K/V values across four attention rows.  K=7 timing for
-the final 46-token response is draft 198.01 ms, target verify 814.35 ms and
+the final 46-token response is draft 197.28 ms, target verify 813.57 ms and
 commit 15.51 ms.  Target verification remains the largest cost; profiling
 before the final norm batching assigned the largest exact kernels to Q2_K
 multi-row (93.96 ms), IQ multi-row (265.74 ms combined), IQ4_XS (61.20 ms),
 target Q8 attention (56.78 ms including combine), and state/norm work.
+
+At 46 tokens, 60 tok/s permits 766.67 ms total versus the current 1053.09 ms.
+With draft, commit and the approximately 26.74 ms remaining overhead fixed,
+verification must reach about 527.15 ms, 35 percent below its current time.
+Prioritize target projection kernels first, followed by recurrent-state
+checkpoint traffic, batched target attention, and fusion of QK norm/RoPE/KV
+store and activation/state-preparation launches.  The draft's 197.28 ms is a
+secondary target; changes must retain 41/42 K=7 acceptance and identical
+authoritative output.
+
+DFlash prefill is 446.38 tok/s versus 489.49 ordinary.  Feature capture and
+sidecar-cache injection account for about 808 ms at 4K, while reaching 500
+tok/s still needs about 176 ms from target prefill after eliminating that
+entire overhead.  Fuse feature taps with target hidden writes, batch the five
+sidecar K/V injections, and overlap independent sidecar work with the next
+target tile.  Detailed priorities and validation gates are in the linked
+DFlash2 document.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`

@@ -13558,7 +13558,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen35_matvec_iq2xxs, fn_qwen35_matvec_iq2xs;
     hipFunction_t fn_qwen35_matvec_iq2s, fn_qwen35_matvec_iq3xxs, fn_qwen35_matvec_iq3s;
     hipFunction_t fn_qwen35_matvec_iq4xs, fn_qwen35_matvec_iq4xs_multi8;
-    hipFunction_t fn_qwen35_matvec_iq_multi4, fn_qwen35_matvec_iq_multi8;
+    hipFunction_t fn_qwen35_matvec_iq_multi4;
     hipFunction_t fn_qwen35_matvec_iq2xxs_multi8, fn_qwen35_matvec_iq2xs_multi8;
     hipFunction_t fn_qwen35_matvec_iq2s_multi8, fn_qwen35_matvec_iq3xxs_multi8;
     hipFunction_t fn_qwen35_matvec_iq3s_multi8;
@@ -17418,8 +17418,6 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                           r->iq_module, "qwen35_matvec_iq4xs_multi8"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq_multi4,
                           r->iq_module, "qwen35_matvec_iq_multi4"));
-                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq_multi8,
-                          r->iq_module, "qwen35_matvec_iq_multi8"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xxs_multi8,
                           r->iq_module, "qwen35_matvec_iq2xxs_multi8"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_multi8,

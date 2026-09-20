@@ -15,6 +15,7 @@
 #define HLLM_DFLASH_HEADS 32
 #define HLLM_DFLASH_KV_HEADS 8
 #define HLLM_DFLASH_HEAD_DIM 128
+#define HLLM_DFLASH_ATTN_ROWS_PER_WAVE 4
 
 typedef struct hllm_dflash_layer {
     void *attn_norm, *q_norm, *k_norm, *ffn_norm;
@@ -110,7 +111,9 @@ static void hllm_qwen35_dflash2_capture(hip_llm_runner *r, int layer,
 
 static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
         void *x, int rows, int nr, int nc, int stride, int type) {
-    if (type == GGML_TYPE_IQ4_XS && rows > 4 && rows <= 8 && stride == nc &&
+    if (type == GGML_TYPE_IQ4_XS &&
+        rows > HLLM_DFLASH_ATTN_ROWS_PER_WAVE &&
+        rows <= HLLM_DFLASH_MAX_BLOCK && stride == nc &&
         nc % 256 == 0 && r->fn_qwen35_quantize_q81 &&
         r->fn_qwen35_matvec_iq4xs_multi8) {
         int total = rows*nc;
@@ -353,7 +356,9 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         void *aa[]={&d->attn,&d->q,&cl->key_cache,&cl->value_cache,&rows,
             &position,&(int){HLLM_DFLASH_HEADS},&(int){HLLM_DFLASH_KV_HEADS},
             &(int){HLLM_DFLASH_HEAD_DIM},&window};
-        LAUNCH(d->fn_attention,HLLM_DFLASH_HEADS,(rows+3)/4,1,
+        LAUNCH(d->fn_attention, HLLM_DFLASH_HEADS,
+               (rows + HLLM_DFLASH_ATTN_ROWS_PER_WAVE - 1) /
+                   HLLM_DFLASH_ATTN_ROWS_PER_WAVE, 1,
                32,1,1,0,r->stream,aa);
         hllm_dflash_project(r,d->proj,cl->o,d->attn,rows,ne,qd,qd,cl->o_type);
         hllm_dflash_conv(r,d,d->conv,d->proj,d->dynamic,cl->attn_conv_base,rows,1);

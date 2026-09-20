@@ -1,5 +1,11 @@
 /* Dense NextN draft path. Included after the scalar layer executor.
  * Draft state is independent; no unverified token may reach the caller. */
+enum {
+    HLLM_DENSE_MTP_MAX_ROWS = 16,
+    HLLM_DENSE_MTP_REUSE_ROWS = 8,
+    HLLM_DENSE_MTP_SMALL_REUSE_ROWS = 4,
+};
+
 typedef struct hllm_qwen35_mtp {
     gguf_shards *source;
     qtensor embedding;
@@ -17,8 +23,8 @@ typedef struct hllm_qwen35_mtp {
     void *verify_ssm_qkv, *verify_ssm_z, *verify_ssm_alpha, *verify_ssm_beta, *verify_ssm_out;
     void *verify_conv[128], *verify_rec[128];
     float *host_logits;
-    hipGraph_t graphs[17];
-    hipGraphExec_t executions[17];
+    hipGraph_t graphs[HLLM_DENSE_MTP_MAX_ROWS + 1];
+    hipGraphExec_t executions[HLLM_DENSE_MTP_MAX_ROWS + 1];
     int verify_capacity, verify_rows, verify_position;
 } hllm_qwen35_mtp;
 
@@ -26,7 +32,7 @@ static void hllm_free_qwen35_mtp(hip_llm_runner *r) {
     hllm_qwen35_mtp *m = r->qwen35_mtp;
     if (!m) return;
     hipStreamSynchronize(r->stream);
-    for (int i = 0; i < 17; ++i) {
+    for (int i = 0; i <= HLLM_DENSE_MTP_MAX_ROWS; ++i) {
         if (m->executions[i]) hipGraphExecDestroy(m->executions[i]);
         if (m->graphs[i]) hipGraphDestroy(m->graphs[i]);
     }
@@ -160,7 +166,8 @@ fail:
 int hip_llm_qwen35_mtp_propose(hip_llm_runner *r, int32_t anchor, int position,
                               int count, int32_t *drafts) {
     hllm_qwen35_mtp *m = r ? r->qwen35_mtp : NULL;
-    if (!m || !m->source || !m->head || m->verify_rows || !drafts || count < 1 || count > 16 || anchor < 0 ||
+    if (!m || !m->source || !m->head || m->verify_rows || !drafts ||
+        count < 1 || count > HLLM_DENSE_MTP_MAX_ROWS || anchor < 0 ||
         anchor >= r->n_vocab || position < 0 || position > r->max_seq_len-count) return -1;
     if (m->origin < 0) { m->origin = position; m->kv_end = 0; }
     if (position < m->origin) return -1;
@@ -259,10 +266,40 @@ int hip_llm_qwen35_mtp_propose(hip_llm_runner *r, int32_t anchor, int position,
     return rc;
 }
 
+static int hllm_dense_mtp_iq_kind(int type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: return 0;
+        case GGML_TYPE_IQ2_XS: return 1;
+        case GGML_TYPE_IQ2_S: return 2;
+        case GGML_TYPE_IQ3_XXS: return 3;
+        case GGML_TYPE_IQ3_S: return 4;
+        default: return -1;
+    }
+}
+
+static hipFunction_t hllm_dense_mtp_iq_multi8(hip_llm_runner *r, int type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: return r->fn_qwen35_matvec_iq2xxs_multi8;
+        case GGML_TYPE_IQ2_XS: return r->fn_qwen35_matvec_iq2xs_multi8;
+        case GGML_TYPE_IQ2_S: return r->fn_qwen35_matvec_iq2s_multi8;
+        case GGML_TYPE_IQ3_XXS: return r->fn_qwen35_matvec_iq3xxs_multi8;
+        case GGML_TYPE_IQ3_S: return r->fn_qwen35_matvec_iq3s_multi8;
+        default: return NULL;
+    }
+}
+
+static void hllm_dense_mtp_res_rmsnorm_batch(hip_llm_runner *r, void *x,
+        void *res, void *normalized, void *weight, int width, int rows) {
+    float eps = r->rms_norm_eps;
+    void *args[] = { &x, &res, &normalized, &weight, &width, &rows, &eps };
+    LAUNCH(r->fn_res_rmsnorm_batch_f32, rows, 1, 1, 256, 1, 1,
+           256*sizeof(float), r->stream, args);
+}
+
 static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
         void *x, int rows, int nr, int nc, int type) {
     hllm_qwen35_mtp *m = r->qwen35_mtp;
-    if (rows <= 8 && nc % 256 == 0 && nc <= r->n_ff &&
+    if (rows <= HLLM_DENSE_MTP_REUSE_ROWS && nc % 256 == 0 && nc <= r->n_ff &&
         (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M)) {
         /* The generic batch scratch is shared by mixed-format projections.
          * Requantize every IQ1 launch so a Q/K/V format change cannot leave
@@ -278,16 +315,19 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
     }
     hipFunction_t fn = NULL;
     switch (type) {
-        case GGML_TYPE_Q2_K: if (rows <= 8 && nc <= 6144)
-            fn = rows <= 4 ? r->fn_qwen35_matvec_q2k_multi4 :
-                             r->fn_qwen35_matvec_q2k_multi8;
+        case GGML_TYPE_Q2_K:
+            if (rows <= HLLM_DENSE_MTP_REUSE_ROWS && nc <= 6144) {
+                fn = rows <= HLLM_DENSE_MTP_SMALL_REUSE_ROWS ?
+                    r->fn_qwen35_matvec_q2k_multi4 :
+                    r->fn_qwen35_matvec_q2k_multi8;
+            }
             break;
-        case GGML_TYPE_IQ2_XXS: fn=r->fn_qwen35_matvec_iq2xxs; break;
-        case GGML_TYPE_IQ2_XS: fn=r->fn_qwen35_matvec_iq2xs; break;
-        case GGML_TYPE_IQ2_S: fn=r->fn_qwen35_matvec_iq2s; break;
-        case GGML_TYPE_IQ3_XXS: fn=r->fn_qwen35_matvec_iq3xxs; break;
-        case GGML_TYPE_IQ3_S: fn=r->fn_qwen35_matvec_iq3s; break;
-        case GGML_TYPE_IQ4_XS: fn=r->fn_qwen35_matvec_iq4xs; break;
+        case GGML_TYPE_IQ2_XXS: fn = r->fn_qwen35_matvec_iq2xxs; break;
+        case GGML_TYPE_IQ2_XS: fn = r->fn_qwen35_matvec_iq2xs; break;
+        case GGML_TYPE_IQ2_S: fn = r->fn_qwen35_matvec_iq2s; break;
+        case GGML_TYPE_IQ3_XXS: fn = r->fn_qwen35_matvec_iq3xxs; break;
+        case GGML_TYPE_IQ3_S: fn = r->fn_qwen35_matvec_iq3s; break;
+        case GGML_TYPE_IQ4_XS: fn = r->fn_qwen35_matvec_iq4xs; break;
     }
     if (fn && nc % 256 == 0 && nc <= r->n_ff) {
         if (m->verify_quant_source != x || m->verify_quant_rows != rows ||
@@ -304,26 +344,23 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
         if (type == GGML_TYPE_Q2_K) {
             void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales, &nr, &nc, &rows };
             LAUNCH(fn, (nr+3)/4, 1, 1, 128, 1, 1, 0, r->stream, ma);
-        } else if (rows > 4 && type == GGML_TYPE_IQ4_XS) {
+        } else if (rows > HLLM_DENSE_MTP_SMALL_REUSE_ROWS &&
+                   type == GGML_TYPE_IQ4_XS) {
             void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
                            &nr, &nc, &rows };
             LAUNCH(r->fn_qwen35_matvec_iq4xs_multi8, (nr+3)/4, 1, 1,
                    128, 1, 1, 0, r->stream, ma);
-        } else if (rows <= 8 && type != GGML_TYPE_IQ4_XS &&
+        } else if (rows <= HLLM_DENSE_MTP_REUSE_ROWS &&
+                   type != GGML_TYPE_IQ4_XS &&
                    !(type == GGML_TYPE_IQ2_S && nc > 6144)) {
-            int kind = type==GGML_TYPE_IQ2_XXS ? 0 : type==GGML_TYPE_IQ2_XS ? 1 :
-                type==GGML_TYPE_IQ2_S ? 2 : type==GGML_TYPE_IQ3_XXS ? 3 : 4;
-            if (rows <= 4) {
+            int kind = hllm_dense_mtp_iq_kind(type);
+            if (rows <= HLLM_DENSE_MTP_SMALL_REUSE_ROWS) {
                 void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
                                &nr, &nc, &kind, &rows };
                 LAUNCH(r->fn_qwen35_matvec_iq_multi4, (nr+3)/4, 1, 1,
                        128, 1, 1, 0, r->stream, ma);
             } else {
-                hipFunction_t multi = type==GGML_TYPE_IQ2_XXS ? r->fn_qwen35_matvec_iq2xxs_multi8 :
-                    type==GGML_TYPE_IQ2_XS ? r->fn_qwen35_matvec_iq2xs_multi8 :
-                    type==GGML_TYPE_IQ2_S ? r->fn_qwen35_matvec_iq2s_multi8 :
-                    type==GGML_TYPE_IQ3_XXS ? r->fn_qwen35_matvec_iq3xxs_multi8 :
-                                              r->fn_qwen35_matvec_iq3s_multi8;
+                hipFunction_t multi = hllm_dense_mtp_iq_multi8(r, type);
                 void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
                                &nr, &nc, &rows };
                 LAUNCH(multi, (nr+3)/4, 1, 1, 128, 1, 1, 0,
@@ -387,10 +424,8 @@ static void hllm_dense_mtp_ssm(hip_llm_runner *r, hip_layer *cl, int l, int rows
             launch_rmsnorm(r, y, x, cl->ffn_norm_w, ne, eps);
         }
     } else {
-        void *a[] = { &m->verify_x, &m->verify_norm, &m->verify_norm,
-                      &cl->ffn_norm_w, &ne, &rows, &eps };
-        LAUNCH(r->fn_res_rmsnorm_batch_f32, rows, 1, 1, 256, 1, 1,
-               256*sizeof(float), r->stream, a);
+        hllm_dense_mtp_res_rmsnorm_batch(r, m->verify_x, m->verify_norm,
+            m->verify_norm, cl->ffn_norm_w, ne, rows);
     }
 }
 
@@ -447,20 +482,19 @@ static void hllm_dense_mtp_attention(hip_llm_runner *r, hip_layer *cl,
     hllm_dense_mtp_projection(r, r->d_attn_proj_batch,
         cl->attn_output_w, r->d_attn_out_batch, rows,
         cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
-    void *a[] = { &m->verify_x, &r->d_attn_proj_batch, &m->verify_norm,
-                  &cl->ffn_norm_w, &ne, &rows, &eps };
-    LAUNCH(r->fn_res_rmsnorm_batch_f32, rows, 1, 1, 256, 1, 1,
-           256*sizeof(float), r->stream, a);
+    hllm_dense_mtp_res_rmsnorm_batch(r, m->verify_x,
+        r->d_attn_proj_batch, m->verify_norm, cl->ffn_norm_w, ne, rows);
 }
 
-/* Capture a layer-major window using precisely the scalar target kernels.
- * Each row owns its hidden vector; recurrent state is checkpointed after
- * every row. Positions are device inputs, so graphs remain valid as the
- * context grows. Rejected KV rows are masked by the committed position. */
+/* Capture a layer-major window with the target's exact arithmetic contract.
+ * Grouped kernels share weights without changing each row's accumulation
+ * order. Recurrent state is checkpointed after every row, and positions stay
+ * device-resident so graphs remain valid at later context offsets. */
 float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
                                 int rows, int position) {
     hllm_qwen35_mtp *m = r ? r->qwen35_mtp : NULL;
-    if (!m || m->verify_rows || !tokens || rows < 1 || rows > 16 || position < 0 ||
+    if (!m || m->verify_rows || !tokens || rows < 1 ||
+        rows > HLLM_DENSE_MTP_MAX_ROWS || position < 0 ||
         position > r->max_seq_len-rows || !r->decode_mode || r->debug_layers ||
         !r->requested_qwen35_decode_graph ||
         r->kv_cache_type != HIP_LLM_KV_Q8_0_Q8_0 || !r->fn_q8_attention_decode) return NULL;
@@ -468,7 +502,8 @@ float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
     size_t conv = (size_t)(r->ssm_conv_kernel-1)*r->ssm_qkv_dim*sizeof(float);
     size_t rec = (size_t)r->ssm_dt_rank*r->ssm_d_state*r->ssm_d_state*sizeof(float);
     if (!m->verify_capacity) {
-        /* Fixed capacity keeps graph pointers stable; four rows cover K<=3. */
+        /* Fixed capacity keeps captured graph pointers stable.  A loaded
+         * draft backend uses one fixed verification width for its lifetime. */
         int capacity = rows;
         m->verify_capacity = -1; /* A partial allocation cannot be retried over live pointers. */
         if (hipMalloc(&m->verify_x, (size_t)capacity*r->n_embd*sizeof(float)) ||
@@ -558,7 +593,7 @@ float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
         if (hipStreamEndCapture(r->stream, &m->graphs[rows]) ||
             hipGraphInstantiate(&m->executions[rows], m->graphs[rows], NULL, NULL, 0)) return NULL;
     }
-    int positions[16];
+    int positions[HLLM_DENSE_MTP_MAX_ROWS];
     for (int i = 0; i < rows; ++i) {
         positions[i] = position+i;
         void *x = (float *)m->verify_x + (size_t)i*r->n_embd;

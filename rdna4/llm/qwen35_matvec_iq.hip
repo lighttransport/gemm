@@ -355,16 +355,9 @@ extern "C" __global__ void qwen35_matvec_iq_multi4(
     qwen35_matvec_iq_multi<4>(out,weights,q,scales,rows,cols,kind,count);
 }
 
-extern "C" __global__ void qwen35_matvec_iq_multi8(
-        float *out, const unsigned char *weights, const signed char *q,
-        const float *scales, int rows, int cols, int kind, int count) {
-    qwen35_matvec_iq_multi<8>(out,weights,q,scales,rows,cols,kind,count);
-}
-
 /* Give the compiler a constant format for the eight-row verifier.  The
- * generic entry point keeps its runtime selector for diagnostics, while
- * these production variants discard the unused codebook branches and their
- * live values. */
+ * production variants discard unused codebook branches and their live
+ * values. */
 extern "C" __global__ void qwen35_matvec_iq2xxs_multi8(
         float *out, const unsigned char *weights, const signed char *q,
         const float *scales, int rows, int cols, int count) {

@@ -84,3 +84,54 @@ tests using `INT_MIN` and `INT_MAX`.
 The tested sidecar is
 `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, SHA-256
 `1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd`.
+
+## Remaining optimization opportunities
+
+The K=7 response emits 46 tokens in 1053.09 ms.  Reaching 60 tok/s requires
+at most 766.67 ms, a 286.42 ms or 27 percent reduction.  Draft and commit take
+197.28 and 15.51 ms, while unassigned host/runtime overhead is about 26.74 ms.
+If those costs remain fixed, target verification must fall from 813.57 to
+527.15 ms, a 35 percent reduction.  The following order reflects the current
+profile; its kernel times were captured before final batched normalization and
+are useful for ranking rather than summing into the final wall time.
+
+1. **Target projection kernels.**  Exact Q2_K multi-row projection used 93.96
+   ms; IQ2/IQ3 formats used 265.74 ms combined; IQ4_XS used 61.20 ms; and
+   IQ1_S/IQ1_M used 52.68 ms.  The next kernel work should reduce register
+   pressure and repeated codebook traffic, cooperatively stage decoded weight
+   tiles, and fuse gate/up activation quantization where the same input is
+   reused.  A WMMA or reordered reduction path needs full output-token and
+   logit validation because the current kernels preserve the target arithmetic
+   order.
+2. **Hybrid recurrent state.**  DeltaNet used 65.17 ms, state preparation
+   14.94 ms, checkpoint copies 16.45 ms, and F16 matrix-vector work 13.32 ms.
+   Processing sequential candidate rows in one state kernel and keeping
+   checkpoints device-local could remove launches and memory traffic.  Every
+   row must retain a rollback point so a rejected draft cannot affect later
+   target state.
+3. **Target Q8/Q8 attention.**  Attention plus combine used 56.78 ms.  Store
+   all speculative K/V rows first, then evaluate them in one batched kernel
+   with a row-specific causal end while reusing older cache vectors across
+   rows.  Preserve Q8 K and Q8 V and each row's reduction order.
+4. **Kernel and graph count.**  Batching normalization already removed about
+   55 ms from the response.  The remaining small launches include QK
+   normalization, RoPE, KV storage, SiLU/gating, and state preparation.  Fuse
+   adjacent operations when their intermediate values need no external
+   checkpoint.
+5. **Draft cost.**  The final DFlash stage takes 197.28 ms.  Position-parallel
+   attention and cheaper draft-cache storage are candidates, provided K=7
+   acceptance stays at 41/42 and target output remains unchanged.
+
+Prefill also has a separate gap.  DFlash runs at 446.38 tok/s versus 489.49
+tok/s for the ordinary target.  Capturing five feature taps and injecting the
+sidecar cache costs about 808 ms over 4096 tokens.  Removing that entire cost
+would only recover the ordinary 489.49 tok/s rate; 500 tok/s also requires
+about 176 ms from the underlying target prefill.  The most direct DFlash work
+is to fuse tap capture into the target hidden writes, batch the five sidecar
+K/V injections, and overlap independent sidecar work with the next target
+tile.
+
+Each optimization should retain the exact sequence hash and response bytes at
+K=4 and K=7, compile the emitted program, and cover non-coding prompts plus
+random-token 64K depth.  HTTP/stdio scheduling remains a separate integration
+task after the benchmark path has broader quality coverage.
