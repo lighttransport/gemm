@@ -13707,6 +13707,7 @@ struct hip_llm_runner {
     hipModule_t q8_attention_module;
     hipModule_t q8_prefill_module;
     hipFunction_t fn_q8_attention_decode, fn_q8_attention_decode_gqa3;
+    hipFunction_t fn_q8_attention_decode_reuse8;
     hipFunction_t fn_q8_attention_combine;
     hipFunction_t fn_q8_attention_prefill_wmma;
     void *d_q8_attention_parts, *d_q8_attention_meta;
@@ -17686,6 +17687,9 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                   r->q8_attention_module, "qwen35_attention_q8_decode"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_gqa3,
                   r->q8_attention_module, "qwen35_attention_q8_decode_gqa3"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_reuse8,
+                  r->q8_attention_module,
+                  "qwen35_attention_q8_decode_reuse8"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine,
                   r->q8_attention_module, "qwen35_attention_q8_combine"));
         if (hip_compile_kernels_ex(&r->q8_prefill_module, r->device,
@@ -22437,16 +22441,28 @@ static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
 
 static inline void launch_attn_verify_native_q8(hip_llm_runner *r, void *out,
         void *parts, void *meta, void *q, void *k, void *v, void *ks,
-        void *vs, void *positions, int queries) {
-    /* Match scalar decode's pinned split contract while exposing every query
-     * in the exact window to one launch.  Each query reads its device-resident
+        void *vs, void *positions, int queries, int group_queries) {
+    /* Expose the exact verifier window in one launch. Up to eight queries use
+     * the measured eight-split shared-K/V schedule; wider dense-NextN windows
+     * retain the scalar split selector. Each query reads its device-resident
      * causal position, so the captured graph remains reusable. */
-    int occupancy = 11, forced_splits = 0, position_start = -1;
+    int occupancy = 11, forced_splits = group_queries ? 8 : 0;
+    int position_start = -1;
+    int launch_splits = forced_splits ? forced_splits :
+        r->q8_attention_max_splits;
     void *a[] = { &out, &parts, &meta, &q, &k, &v, &ks, &vs, &positions,
         &r->n_heads, &r->n_kv_heads, &r->q8_attention_nsm, &occupancy,
         &forced_splits, &queries, &position_start };
-    LAUNCH(r->fn_q8_attention_decode, queries, r->q8_attention_max_splits,
-           r->n_heads, 32, 4, 1, 0, r->stream, a);
+    if (group_queries && queries > 1 && queries <= 8 &&
+        r->fn_q8_attention_decode_reuse8) {
+        LAUNCH(r->fn_q8_attention_decode_reuse8, 1,
+               launch_splits, r->n_heads,
+               32, 4, 1, 0, r->stream, a);
+    } else {
+        LAUNCH(r->fn_q8_attention_decode, queries,
+               launch_splits, r->n_heads,
+               32, 4, 1, 0, r->stream, a);
+    }
     void *b[] = { &out, &parts, &meta, &positions, &r->n_heads,
         &r->q8_attention_nsm, &occupancy, &forced_splits };
     LAUNCH(r->fn_q8_attention_combine, r->n_heads, queries, 1, 256, 1, 1,

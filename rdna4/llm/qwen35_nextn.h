@@ -542,7 +542,8 @@ static void hllm_dense_mtp_attention(hip_llm_runner *r, hip_layer *cl,
     launch_attn_verify_native_q8(r, r->d_attn_out_batch,
         m->verify_attn_parts, m->verify_attn_meta, r->d_q_batch,
         r->d_key_cache[l], r->d_value_cache[l], r->d_key_cache_scale[l],
-        r->d_value_cache_scale[l], m->verify_positions, rows);
+        r->d_value_cache_scale[l], m->verify_positions, rows,
+        rows <= 8);
     launch_sigmoid_mul(r, r->d_attn_out_batch, r->d_attn_gate_batch,
                        rows*qd);
     hllm_dense_mtp_projection(r, r->d_attn_proj_batch,

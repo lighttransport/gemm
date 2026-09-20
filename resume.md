@@ -11,41 +11,43 @@ target window remains the only source of emitted tokens and committed state.
 On the 4096-token C clamp prompt, K=4 accepted 37/40 drafts and K=7 accepted
 41/42.  Both produced the ordinary target's exact 46-token response, EOS and
 sequence hash `15f17d2640c1adfc`; the emitted C is coherent, compiles warning
-free as C17 and passes `INT_MIN`/`INT_MAX` boundary cases.  The final warm K=7
-run measured **43.68 tok/s decode and 446.38 tok/s prefill**, versus 37.82 and
-489.49 for ordinary native execution.  K=4 measured 38.91 and 446.24.  The
-upstream llama.cpp server path measured 16.54 tok/s at K=4 with the same 37/40
-acceptance, versus its 25.88 baseline.  Native K=4 is 2.35x faster than
-upstream DFlash2, and K=7 is 15 percent faster than ordinary native decode.
+free as C17 and passes `INT_MIN`/`INT_MAX` boundary cases.  The final K=7 run
+measured **69.75 tok/s decode and 538.46 tok/s prefill**.  K=4 measured 52.41
+and 537.86.  A recent ordinary native baseline measured 39.55 and 533.19.
+The upstream llama.cpp server path measured 16.54 tok/s at K=4 with the same
+37/40 acceptance, versus its 25.88 baseline.  Native K=4 is 3.17x faster than
+upstream DFlash2, and K=7 is 76 percent faster than the recent ordinary native
+decode baseline.  Both short-context performance targets are met.
 
 The exact verifier now reuses decoded weights across up to eight rows for
 Q2_K, IQ1_S, IQ1_M, IQ2/IQ3 and IQ4_XS.  Eight-row IQ kernels specialize the
 quantization format at compile time, eliminating runtime codebook branches.
 RMSNorm and residual-plus-RMSNorm use one batched launch with an independent
 block and unchanged reduction per row.  The DFlash draft reuses Q4_K weights
-across eight rows and K/V values across four attention rows.  K=7 timing for
-the final 46-token response is draft 197.28 ms, target verify 813.57 ms and
-commit 15.51 ms.  Target verification remains the largest cost; profiling
-before the final norm batching assigned the largest exact kernels to Q2_K
-multi-row (93.96 ms), IQ multi-row (265.74 ms combined), IQ4_XS (61.20 ms),
-target Q8 attention (56.78 ms including combine), and state/norm work.
+across eight rows and K/V values across four attention rows.  Exact target
+attention now loads each old Q8 K/V row once while evaluating up to eight
+adjacent verifier queries.  It retains the pinned query quantization, online
+softmax, packed-F16 accumulation and split-combine order.  K=7 timing for the
+final 46-token response is draft 108.702 ms, target verify 539.605 ms and
+commit 10.382 ms, for 659.45 ms total.  The exact attention differential
+passes 46,743,552 values; its eight-query operator takes 213.382 microseconds
+at 4K and 3.076784 milliseconds at 64K with eight splits.
 
-At 46 tokens, 60 tok/s permits 766.67 ms total versus the current 1053.09 ms.
-With draft, commit and the approximately 26.74 ms remaining overhead fixed,
-verification must reach about 527.15 ms, 35 percent below its current time.
-Prioritize target projection kernels first, followed by recurrent-state
-checkpoint traffic, batched target attention, and fusion of QK norm/RoPE/KV
-store and activation/state-preparation launches.  The draft's 197.28 ms is a
-secondary target; changes must retain 41/42 K=7 acceptance and identical
-authoritative output.
+After a fully processed 65,536-token random prefix, DFlash K=7 now sustains
+**44.94 tok/s** for a 256-token suffix.  The prefix sustains 443.41 tok/s and
+has hash `90178de69a24a76e`; the suffix retains hash `2ddd068dca63669a`.
+It drafted 259 tokens, accepted 217, and spent 667.500/4936.944/56.114 ms in
+draft/verify/commit.  This meets the random-depth 40 tok/s goal.  Ordinary
+single-token decode remains about 29.13 tok/s at the same depth and is the
+main open decode target.
 
-DFlash prefill is 446.38 tok/s versus 489.49 ordinary.  Feature capture and
-sidecar-cache injection account for about 808 ms at 4K, while reaching 500
-tok/s still needs about 176 ms from target prefill after eliminating that
-entire overhead.  Fuse feature taps with target hidden writes, batch the five
-sidecar K/V injections, and overlap independent sidecar work with the next
-target tile.  Detailed priorities and validation gates are in the linked
-DFlash2 document.
+Prioritize exact target projection weight traffic first, followed by
+recurrent-state checkpoint traffic and fusion of QK norm/RoPE/KV store and
+activation/state-preparation launches.  The shared-K/V attention path may
+still benefit from an exact in-kernel combine or an adaptive split policy.
+DFlash prompt feature capture and sidecar-cache injection are secondary
+prefill targets now that both 4K and random 64K prefill clear their goals.
+Detailed priorities and validation gates are in the linked DFlash2 document.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
@@ -54,10 +56,12 @@ and `--kv-cache q8q8`.  Details and the reproduction command:
 
 ## Long-context Q8/Q8 prefill (2026-09-20)
 
-The IQ2 runner now sustains **413.25 tok/s** while processing 65,536 random
-tokens in 512-token chunks on RX 9070 XT / gfx1201 / ROCm 10. The previous
-native Q8/Q8 path took 460.37 seconds at 142.36 tok/s; the new path takes
-158.59 seconds, a 2.90x speedup. It leaves 4282 MiB free at a 12,024 MiB peak.
+The IQ2 runner sustains more than 400 tok/s while processing 65,536 random
+tokens in 512-token chunks on RX 9070 XT / gfx1201 / ROCm 10.  The original
+optimized ordinary run measured 413.25 tok/s; the current DFlash K=7 run
+measures 443.41 tok/s.  The previous native Q8/Q8 path took 460.37 seconds at
+142.36 tok/s.  Long-context prefill therefore remains above its target after
+adding sidecar feature capture and cache injection.
 
 Long-context chunks use a gfx1201 WMMA attention kernel after position 4096.
 Eight pairs of waves process 128 queries per block, split the 256-wide head
@@ -72,7 +76,7 @@ generated exactly the eleven bytes `ZEPHYR-7319`, retrieving the passphrase
 from the prompt's first line after about 440 KB of filler. The output validator
 passed. Against the pinned llama.cpp attention kernel, the WMMA path measures
 0.000259 relative L2 and 0.01816 maximum absolute error at 4097 positions;
-the existing exact path still passes 39,567,360 bitwise comparisons. The
+the existing exact path now passes 46,743,552 bitwise comparisons. The
 optimized reduction order is approximate, so this is a semantic long-context
 check rather than a general byte-parity claim. Artifacts:
 `rdna4/llm/tmp/qwen38_gsq_iq2_64k_wmma_i8_local.log` and
@@ -91,22 +95,25 @@ resulting recurrent state before each timed repeat while retaining the prefix
 K/V rows on device. Seed one produces prefix hash `90178de69a24a76e`.
 
 Before the long-prefill WMMA change, the 65,536-token IQ2 prefix took 460.37
-seconds at 142.36 tok/s. Three 512-token decode repeats sustain
-26.92/26.91/26.90 tok/s and share sequence hash `b01a17fae16f806d`. The prior
-27.94 tok/s result used zero cache values and is superseded. Long Q8 attention
-uses 128 splits with split-major block ordering; the 64K
-attention microbenchmark improved from 718.9 microseconds at 16 splits to
-578.6 microseconds at 128. Unused F16 cache-packing scratch is not allocated
-for the fully native Q8/Q8 path; the random-depth run leaves 4284 MiB free.
+seconds at 142.36 tok/s. Three original ordinary 512-token decode repeats
+sustain 26.92/26.91/26.90 tok/s and share sequence hash
+`b01a17fae16f806d`; the latest retained ordinary result is about 29.13 tok/s.
+The prior 27.94 tok/s result used zero cache values and is superseded.
 
-The 40 tok/s sustained target remains unmet. The 64K profile assigns about
-9.8 ms/token to attention and about 26 ms/token to the projection/state path.
-The old 64K MTP measurement also used zero cache values, so MTP stays opt-in
-pending a random-depth rerun. Full results and commands:
+The optimized DFlash K=7 path processes the same random prefix in 147.801
+seconds at 443.41 tok/s, then sustains 44.94 tok/s for 256 tokens with suffix
+hash `2ddd068dca63669a`.  Its exact eight-query shared-K/V attention kernel
+takes 3.077 ms per layer at 64K, compared with 8.654 ms for the generic
+verifier at the same eight-split schedule.  DFlash therefore meets the 40
+tok/s random-depth target.  Ordinary decode remains below 40 tok/s; its 64K
+profile assigns about 9.8 ms/token to attention and about 26 ms/token to the
+projection/state path.  Dense NextN still needs a real random-depth rerun.
+Full results and commands:
 [QWEN38_64K_DECODE.md](rdna4/llm/QWEN38_64K_DECODE.md).
 
-The pinned-kernel differential test passes 39,567,360 bitwise Q8/Q8 values,
-including matching split counts at 64K. Fresh normal-context IQ2 and IQ3
+The pinned-kernel differential test passes 46,743,552 bitwise Q8/Q8 values,
+including shared-cache verifier cases and matching split counts at 64K. Fresh
+normal-context IQ2 and IQ3
 greedy/sampled C++ outputs remain byte-identical to llama.cpp and pass fixed
 cases plus 10,000 randomized cases. Artifacts:
 `tmp/qwen38/depth64-final-iq2-v2/` and `depth64-final-iq3/`. Preserve unrelated
@@ -129,7 +136,8 @@ timing excludes trace I/O. Sampled mode uses temperature 0.6 and seed 42.
 | IQ3 / MTP K=3 / greedy | 33.76 | 572.32–573.07 |
 | IQ3 / MTP K=3 / sampled | 34.99–35.01 | 571.43–571.59 |
 
-**The 40 tok/s decode and 60 tok/s MTP targets remain unmet.** Ordinary
+**Ordinary 40 tok/s and dense NextN 60 tok/s remain unmet; DFlash2 now clears
+60 tok/s at 4K and 40 tok/s at random-token 64K depth.** Ordinary
 greedy decode improved from 33.8 to 38.0 tok/s on IQ2 and 32.1 to 36.1 on
 IQ3 (about 12–13%). MTP is opt-in because this verified implementation is
 slower on the tested coding response. The next performance work belongs in
@@ -227,7 +235,9 @@ Attention-only baselines remain in `final-iq2-native-prefill/` and
 `final-iq3-native-prefill/` (25.6–26.0 tok/s decode).
 The validation script includes the exact 4096-token C++ prompt by default.
 
-Decode 40 tok/s, dense NextN/MTP 60 tok/s, and general byte parity remain open.
+Ordinary decode at 40 tok/s, dense NextN/MTP at 60 tok/s, and general byte
+parity remain open.  DFlash2 separately meets its 60 tok/s short-context and
+40 tok/s random-depth goals.
 The existing Qwen4 MoE/HC MTP implementation is incompatible with the dense
 27B sidecar. The pinned graph passes the **post-output-norm** hidden vector
 to NextN. Do not use the earlier pre-norm assumption.
