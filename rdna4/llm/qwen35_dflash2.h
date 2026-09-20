@@ -30,10 +30,12 @@ typedef struct hllm_dflash_layer {
 typedef struct hllm_qwen35_dflash2 {
     gguf_shards *source;
     hipModule_t module;
-    hipFunction_t fn_capture, fn_conv, fn_attention;
+    hipFunction_t fn_capture, fn_conv, fn_attention, fn_topk, fn_select;
     void *fc, *enc_norm, *out_norm, *selector_hidden;
     int fc_type, selector_hidden_type;
     qtensor selector_prev, selector_next;
+    void *selector_prev_w, *selector_next_w;
+    int selector_prev_type, selector_next_type;
     int target_layers[HLLM_DFLASH_LAYERS];
     int mask_token, feature_rows, kv_end;
     hllm_dflash_layer layers[HLLM_DFLASH_LAYERS];
@@ -42,8 +44,7 @@ typedef struct hllm_qwen35_dflash2 {
     void *features, *x, *norm, *dynamic, *conv;
     void *q, *k, *v, *attn, *proj, *gate, *up;
     void *logits, *selector_gate;
-    float *host_logits, *host_selector_gate;
-    float *selector_prev_row, *selector_next_rows;
+    void *selector_candidates, *selector_drafts;
 } hllm_qwen35_dflash2;
 
 static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
@@ -53,11 +54,13 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
 #define DFLASH_FREE(p) do { if (p) hipFree(p); } while (0)
     DFLASH_FREE(d->fc); DFLASH_FREE(d->enc_norm); DFLASH_FREE(d->out_norm);
     DFLASH_FREE(d->selector_hidden);
+    DFLASH_FREE(d->selector_prev_w); DFLASH_FREE(d->selector_next_w);
     DFLASH_FREE(d->features); DFLASH_FREE(d->x); DFLASH_FREE(d->norm);
     DFLASH_FREE(d->dynamic); DFLASH_FREE(d->conv); DFLASH_FREE(d->q);
     DFLASH_FREE(d->k); DFLASH_FREE(d->v); DFLASH_FREE(d->attn);
     DFLASH_FREE(d->proj); DFLASH_FREE(d->gate); DFLASH_FREE(d->up);
     DFLASH_FREE(d->logits); DFLASH_FREE(d->selector_gate);
+    DFLASH_FREE(d->selector_candidates); DFLASH_FREE(d->selector_drafts);
     for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
         hllm_dflash_layer *cl = &d->layers[l];
         DFLASH_FREE(cl->attn_norm); DFLASH_FREE(cl->q_norm);
@@ -70,8 +73,6 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
         DFLASH_FREE(cl->value_cache);
     }
 #undef DFLASH_FREE
-    free(d->host_logits); free(d->host_selector_gate);
-    free(d->selector_prev_row); free(d->selector_next_rows);
     if (d->module) hipModuleUnload(d->module);
     if (d->source) gguf_close_shards(d->source);
     free(d);
@@ -222,7 +223,11 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
         hipModuleGetFunction(&d->fn_conv, d->module,
                              "qwen35_dflash2_conv") != hipSuccess ||
         hipModuleGetFunction(&d->fn_attention, d->module,
-                             "qwen35_dflash2_attention") != hipSuccess) goto fail;
+                             "qwen35_dflash2_attention") != hipSuccess ||
+        hipModuleGetFunction(&d->fn_topk, d->module,
+                             "qwen35_dflash2_topk") != hipSuccess ||
+        hipModuleGetFunction(&d->fn_select, d->module,
+                             "qwen35_dflash2_select") != hipSuccess) goto fail;
 
     if (hllm_dflash_upload_matrix(g, "fc.weight", &d->fc, &d->fc_type,
             r->n_embd, HLLM_DFLASH_LAYERS*r->n_embd) ||
@@ -240,6 +245,12 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
         d->selector_next.n_rows != r->n_vocab ||
         d->selector_prev.n_cols != HLLM_DFLASH_RANK ||
         d->selector_next.n_cols != HLLM_DFLASH_RANK) goto fail;
+    if (upload_weight_matrix(&d->selector_prev_w, &d->selector_prev,
+                             &d->selector_prev_type) ||
+        upload_weight_matrix(&d->selector_next_w, &d->selector_next,
+                             &d->selector_next_type) ||
+        d->selector_prev_type != GGML_TYPE_Q4_K ||
+        d->selector_next_type != GGML_TYPE_Q4_K) goto fail;
 
     char name[128];
     for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
@@ -285,12 +296,11 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
     DALLOC(logits, HLLM_DFLASH_MAX_BLOCK*r->n_vocab);
     DALLOC(selector_gate, HLLM_DFLASH_MAX_BLOCK*HLLM_DFLASH_RANK);
 #undef DALLOC
-    d->host_logits = malloc((size_t)HLLM_DFLASH_MAX_BLOCK*r->n_vocab*sizeof(float));
-    d->host_selector_gate = malloc((size_t)HLLM_DFLASH_MAX_BLOCK*HLLM_DFLASH_RANK*sizeof(float));
-    d->selector_prev_row = malloc(HLLM_DFLASH_RANK*sizeof(float));
-    d->selector_next_rows = malloc((size_t)HLLM_DFLASH_TOPK*HLLM_DFLASH_RANK*sizeof(float));
-    if (!d->host_logits || !d->host_selector_gate || !d->selector_prev_row ||
-        !d->selector_next_rows || hllm_qwen35_verify_workspace_create(r)) goto fail;
+    if (hipMalloc(&d->selector_candidates,
+            HLLM_DFLASH_MAX_BLOCK*HLLM_DFLASH_TOPK*sizeof(int)) ||
+        hipMalloc(&d->selector_drafts,
+            (HLLM_DFLASH_MAX_BLOCK-1)*sizeof(int)) ||
+        hllm_qwen35_verify_workspace_create(r)) goto fail;
     hllm_active_shards = saved;
     if (error && error_cap) error[0] = 0;
     hllm_vram_sample(r);
@@ -310,18 +320,6 @@ static void hllm_dflash_conv(hip_llm_runner *r, hllm_qwen35_dflash2 *d,
     void *a[] = { &out, &hidden, &dynamic, &base, &rows, &r->n_embd,
                   &groups, &side };
     LAUNCH(d->fn_conv,(total+255)/256,1,1,256,1,1,0,r->stream,a);
-}
-
-static void hllm_dflash_topk(const float *logits, int n, int *ids) {
-    float scores[HLLM_DFLASH_TOPK];
-    for (int k=0;k<HLLM_DFLASH_TOPK;++k) { scores[k]=-INFINITY; ids[k]=0; }
-    for (int i=0;i<n;++i) if (logits[i] > scores[HLLM_DFLASH_TOPK-1]) {
-        int k=HLLM_DFLASH_TOPK-1;
-        while (k>0 && logits[i] > scores[k-1]) {
-            scores[k]=scores[k-1]; ids[k]=ids[k-1]; --k;
-        }
-        scores[k]=logits[i]; ids[k]=i;
-    }
 }
 
 int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
@@ -378,41 +376,15 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
     hllm_dflash_project(r,d->logits,r->d_output_w,d->norm,rows,r->n_vocab,ne,ne,r->output_w_type);
     hllm_dflash_project(r,d->selector_gate,d->selector_hidden,d->norm,rows,
         HLLM_DFLASH_RANK,ne,ne,d->selector_hidden_type);
-    if (hipMemcpyAsync(d->host_logits,d->logits,(size_t)rows*r->n_vocab*sizeof(float),
-            hipMemcpyDeviceToHost,r->stream) ||
-        hipMemcpyAsync(d->host_selector_gate,d->selector_gate,
-            (size_t)rows*HLLM_DFLASH_RANK*sizeof(float),hipMemcpyDeviceToHost,r->stream) ||
-        hipStreamSynchronize(r->stream) || r->qwen4_forward_error) return -1;
-
-    int candidate[HLLM_DFLASH_MAX_BLOCK][HLLM_DFLASH_TOPK];
-    int predecessor=0, predecessor_token=anchor;
-    size_t row_bytes_prev=dequant_row_size(d->selector_prev.type,HLLM_DFLASH_RANK);
-    size_t row_bytes_next=dequant_row_size(d->selector_next.type,HLLM_DFLASH_RANK);
-    if (!row_bytes_prev || !row_bytes_next) return -1;
-    for (int p=1;p<rows;++p) {
-        const float *logit=d->host_logits+(size_t)p*r->n_vocab;
-        hllm_dflash_topk(logit,r->n_vocab,candidate[p]);
-        if (p>1) predecessor_token=candidate[p-1][predecessor];
-        if (dequant_row(d->selector_prev.type,
-                (const char *)d->selector_prev.data+(size_t)predecessor_token*row_bytes_prev,
-                d->selector_prev_row,HLLM_DFLASH_RANK)) return -1;
-        for (int k=0;k<HLLM_DFLASH_TOPK;++k)
-            if (dequant_row(d->selector_next.type,
-                (const char *)d->selector_next.data+(size_t)candidate[p][k]*row_bytes_next,
-                d->selector_next_rows+(size_t)k*HLLM_DFLASH_RANK,
-                HLLM_DFLASH_RANK)) return -1;
-        const float *sg=d->host_selector_gate+(size_t)p*HLLM_DFLASH_RANK;
-        float best=-INFINITY; int best_k=0;
-        for (int k=0;k<HLLM_DFLASH_TOPK;++k) {
-            const float *sn=d->selector_next_rows+(size_t)k*HLLM_DFLASH_RANK;
-            float score=logit[candidate[p][k]];
-            for (int j=0;j<HLLM_DFLASH_RANK;++j)
-                score += d->selector_prev_row[j]*sg[j]*sn[j];
-            if (score>best) { best=score; best_k=k; }
-        }
-        predecessor=best_k;
-        drafts[p-1]=candidate[p][best_k];
-    }
+    void *ta[]={&d->logits,&d->selector_candidates,&rows,&r->n_vocab};
+    LAUNCH(d->fn_topk,rows-1,1,1,256,1,1,0,r->stream,ta);
+    void *sa[]={&d->logits,&d->selector_gate,&d->selector_prev_w,
+        &d->selector_next_w,&d->selector_candidates,&d->selector_drafts,
+        &anchor,&rows,&r->n_vocab};
+    LAUNCH(d->fn_select,1,1,1,32,1,1,0,r->stream,sa);
+    if (hipMemcpyAsync(drafts,d->selector_drafts,(size_t)count*sizeof(int),
+            hipMemcpyDeviceToHost,r->stream) || hipStreamSynchronize(r->stream) ||
+        r->qwen4_forward_error) return -1;
     return 0;
 }
 
