@@ -246,6 +246,16 @@ ref/pixal3d/run.sh cuda ref/pixal3d/prepare_input.py \
 ```
 
 RMBG-2.0 is gated by its publisher and needs an authorized Hugging Face account.
+The pinned revision was validated on the RTX 5060 Ti by converting the upstream
+RGBA house asset to opaque RGB and forcing the model path. Its generated mask
+contained both foreground and background and reached 0.99419 IoU against the
+asset's reference alpha. Reproduce the model-backed check with:
+
+```sh
+ref/pixal3d/run.sh cuda ref/pixal3d/validate_rmbg.py \
+  --model /mnt/disk2/models/RMBG-2.0 --device cuda
+```
+
 Pinned multiview verification can still run on inputs with useful RGBA alpha
 through `run_reference_mv.py`. Its placeholder raises on RGB or fully opaque
 views, so it does not replace RMBG or change reference masking behavior.
