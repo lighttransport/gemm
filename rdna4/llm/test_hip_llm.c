@@ -2094,11 +2094,14 @@ int main(int argc, char **argv) {
             int dense_count = 0, dense_index = 0, dense_proposed = 0, dense_accepted = 0;
             double dense_draft_ms = 0, dense_verify_ms = 0, dense_commit_ms = 0;
             float *dense_logits = NULL;
+            int32_t dense_argmax[16];
             int dense_window_rows = 0;
             const int dense_dflash2 = qwen35_dflash2_path != NULL;
             const int dense_path = qwen35_mtp_path != NULL || dense_dflash2;
             const int dense_window = qwen35_mtp_window || dense_dflash2;
             const int dense_draft_width = dense_dflash2 ? qwen35_dflash2_draft : qwen35_mtp_draft;
+            const int dense_device_argmax = !coding_mode &&
+                (!sampler || sampler_argmax) && !trace.logits;
             float *selection_logits = last_logits;
             int32_t stop_ids[3] = {text_eos, text_eot, -1};
             for (int id = 0; id < n_vocab; ++id) {
@@ -2204,18 +2207,29 @@ int main(int argc, char **argv) {
                         memcpy(inputs+1, dense_drafts, (size_t)dense_count*sizeof(int32_t));
                         dense_window_rows = dense_count+1;
                         double tv = get_time_ms();
-                        dense_logits = hip_llm_qwen35_mtp_verify(gpu, inputs, dense_window_rows, pos);
+                        int verify_rc = 0;
+                        if (dense_device_argmax)
+                            verify_rc = hip_llm_qwen35_mtp_verify_argmax(gpu, inputs,
+                                dense_window_rows, pos, dense_argmax);
+                        else {
+                            dense_logits = hip_llm_qwen35_mtp_verify(gpu, inputs,
+                                dense_window_rows, pos);
+                            verify_rc = dense_logits ? 0 : -1;
+                        }
                         dense_verify_ms += get_time_ms()-tv;
-                        if (!dense_logits) { pass = 0; finish_reason = "error"; break; }
+                        if (verify_rc) { pass = 0; finish_reason = "error"; break; }
                     }
                 }
                 if (dense_window_rows) {
-                    selection_logits = dense_logits + (size_t)dense_index*n_vocab;
-                    if (seen) seen[next_tok] = 1;
-                    next_tok = sampler ? hllm_sampler_sample(sampler, selection_logits) : coding_mode ?
-                        sample_top_k_p_coding(selection_logits, n_vocab, 20, 0.80f,
-                            0.70f, 1.50f, 1.0f, 0.0f, seen, &sample_rng, vocab) :
-                        argmax_logits(selection_logits, n_vocab);
+                    if (dense_device_argmax) next_tok = dense_argmax[dense_index];
+                    else {
+                        selection_logits = dense_logits + (size_t)dense_index*n_vocab;
+                        if (seen) seen[next_tok] = 1;
+                        next_tok = sampler ? hllm_sampler_sample(sampler, selection_logits) : coding_mode ?
+                            sample_top_k_p_coding(selection_logits, n_vocab, 20, 0.80f,
+                                0.70f, 1.50f, 1.0f, 0.0f, seen, &sample_rng, vocab) :
+                            argmax_logits(selection_logits, n_vocab);
+                    }
                 } else if (!coding_mode && (!sampler || sampler_argmax) && !trace.logits) {
                     next_tok = hip_llm_forward_argmax(gpu, next_tok, pos);
                     if (next_tok < 0) { pass = 0; finish_reason = "error"; break; }

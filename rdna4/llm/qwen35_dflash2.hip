@@ -161,26 +161,30 @@ void qwen35_dflash2_select(const float *logits, const float *selector_gate,
     }
 }
 
-/* One wave owns four query rows for one head.  Those rows attend the same KV
- * interval, so retain each K/V vector in registers and reuse it four times.
- * Every row preserves the original position order, wave reduction, and
- * online-softmax arithmetic.  DFlash2 attention is non-causal inside the
- * current noise block. */
+/* One wave owns four query rows for one head and one contiguous position
+ * split.  Splitting the 2K window supplies enough independent waves to hide
+ * cache latency while each partial retains position order.  DFlash2 is a
+ * proposal model, so the target verifier remains authoritative if the stable
+ * softmax merge below perturbs a proposal score at the last bit. */
 extern "C" __global__ __launch_bounds__(32, 8)
-void qwen35_dflash2_attention(float *out, const float *query,
+void qwen35_dflash2_attention(float *partial, const float *query,
         const float *key_cache, const float *value_cache,
         int rows, int position_start, int n_heads, int n_kv_heads,
-        int head_dim, int window) {
+        int head_dim, int window, int splits) {
     int head = blockIdx.x;
     int row0 = blockIdx.y * DFLASH_ATTN_ROWS_PER_WAVE;
+    int split = blockIdx.z;
     int lane = threadIdx.x;
-    if (head >= n_heads || row0 >= rows || lane >= 32) return;
+    if (head >= n_heads || row0 >= rows || split >= splits || lane >= 32) return;
     int ratio = n_heads / n_kv_heads;
     int kv_head = head / ratio;
     int q_stride = n_heads * head_dim;
     int kv_stride = n_kv_heads * head_dim;
     int end = position_start + rows;
     int begin = end > window ? end - window : 0;
+    int length = end - begin;
+    int split_begin = begin + (length * split) / splits;
+    int split_end = begin + (length * (split + 1)) / splits;
     float maximum[DFLASH_ATTN_ROWS_PER_WAVE] = {
         -3.402823466e+38f, -3.402823466e+38f,
         -3.402823466e+38f, -3.402823466e+38f};
@@ -188,7 +192,7 @@ void qwen35_dflash2_attention(float *out, const float *query,
     float accum[DFLASH_ATTN_ROWS_PER_WAVE][4] = {};
     float scale = rsqrtf((float)head_dim);
 
-    for (int pos = begin; pos < end; ++pos) {
+    for (int pos = split_begin; pos < split_end; ++pos) {
         int slot = pos % window;
         size_t cache = (size_t)slot * kv_stride + kv_head * head_dim;
         float kval[4], vval[4];
@@ -231,15 +235,57 @@ void qwen35_dflash2_attention(float *out, const float *query,
     #pragma unroll
     for (int r = 0; r < DFLASH_ATTN_ROWS_PER_WAVE; ++r) {
         if (row0 + r < rows) {
-            size_t obase = ((size_t)(row0+r) * n_heads + head) * head_dim;
+            size_t obase = (((size_t)split * rows + row0+r) * n_heads + head) *
+                           (head_dim + 2);
             #pragma unroll
             for (int part = 0; part < 4; ++part) {
                 int dim = lane + part * 32;
                 if (dim < head_dim) {
-                    out[obase + dim] = accum[r][part] /
-                        (normalizer[r] > 0.0f ? normalizer[r] : 1.0f);
+                    partial[obase + dim] = accum[r][part];
                 }
             }
+            if (lane == 0) {
+                partial[obase + head_dim] = maximum[r];
+                partial[obase + head_dim + 1] = normalizer[r];
+            }
         }
+    }
+}
+
+/* Merge contiguous split summaries in increasing position order. */
+extern "C" __global__ __launch_bounds__(32, 8)
+void qwen35_dflash2_attention_combine(float *out, const float *partial,
+        int rows, int n_heads, int head_dim, int splits) {
+    int head = blockIdx.x;
+    int row = blockIdx.y;
+    int lane = threadIdx.x;
+    if (head >= n_heads || row >= rows || lane >= 32) return;
+    float maximum = -3.402823466e+38f;
+    float normalizer = 0.0f;
+    float accum[4] = {};
+    for (int split = 0; split < splits; ++split) {
+        size_t base = (((size_t)split * rows + row) * n_heads + head) *
+                      (head_dim + 2);
+        float part_max = partial[base + head_dim];
+        float part_norm = partial[base + head_dim + 1];
+        float next_max = fmaxf(maximum, part_max);
+        float alpha = maximum < -1.0e30f ? 0.0f : expf(maximum - next_max);
+        float beta = part_max < -1.0e30f ? 0.0f : expf(part_max - next_max);
+        normalizer = normalizer * alpha + part_norm * beta;
+        #pragma unroll
+        for (int part = 0; part < 4; ++part) {
+            int dim = lane + part * 32;
+            if (dim < head_dim)
+                accum[part] = accum[part] * alpha + partial[base + dim] * beta;
+        }
+        maximum = next_max;
+    }
+    size_t obase = ((size_t)row * n_heads + head) * head_dim;
+    #pragma unroll
+    for (int part = 0; part < 4; ++part) {
+        int dim = lane + part * 32;
+        if (dim < head_dim)
+            out[obase + dim] = accum[part] /
+                (normalizer > 0.0f ? normalizer : 1.0f);
     }
 }

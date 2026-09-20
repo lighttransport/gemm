@@ -176,6 +176,10 @@ int hip_llm_qwen35_mtp_propose(hip_llm_runner *r, int32_t anchor, int position,
  * reset the target before reuse; partially executed GPU work is not reusable. */
 float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
                                 int rows, int position);
+/* Greedy verifier variant: reduce logits on the GPU and return one token ID
+ * per row.  The target transaction and commit contract are unchanged. */
+int hip_llm_qwen35_mtp_verify_argmax(hip_llm_runner *r, const int32_t *tokens,
+                                    int rows, int position, int32_t *argmax);
 int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed);
 
 /* Qwen3.8 DFlash2 block-diffusion drafter. Target verification remains exact;

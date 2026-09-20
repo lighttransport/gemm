@@ -452,6 +452,7 @@ static const char *hip_kernel_source =
 "__global__ void matvec_f16_llama_f32(float *dst, const half_raw *mat, const float *x,\n"
 "                                      int n_rows, int n_cols) {\n"
 "    int row = blockIdx.x; if (row >= n_rows) return;\n"
+"    x += (size_t)blockIdx.y*n_cols; dst += (size_t)blockIdx.y*n_rows;\n"
 "    int tid = threadIdx.x; int ncols2 = n_cols >> 1;\n"
 "    const unsigned int *rp = (const unsigned int *)(mat + (size_t)row * n_cols);\n"
 "    float sumf = 0.0f;\n"
@@ -484,6 +485,7 @@ static const char *hip_kernel_source =
 "__global__ void matvec_bf16_llama_f32(float *dst, const unsigned short *mat,\n"
 "                                      const float *x, int n_rows, int n_cols) {\n"
 "    int row = blockIdx.x; if (row >= n_rows) return;\n"
+"    x += (size_t)blockIdx.y*n_cols; dst += (size_t)blockIdx.y*n_rows;\n"
 "    int tid = threadIdx.x; int ncols2 = n_cols >> 1;\n"
 "    const int *rp = (const int *)(mat + (size_t)row * n_cols);\n"
 "    float sumf = 0.0f;\n"
@@ -2597,6 +2599,23 @@ static const char *hip_kernel_source =
 "        for (int w = 0; w < nw; w++) total += ws6[w];\n"
 "        dst[row] = total;\n"
 "    }\n"
+"}\n"
+"__global__ void matvec_q6_K_batch_reuse8(float *dst, const unsigned char *mat,\n"
+"        const float *x, int M, int n_rows, int n_cols, int x_stride) {\n"
+"    int row=blockIdx.x, token0=blockIdx.y*8; if(row>=n_rows)return;\n"
+"    int tid=threadIdx.x, nb=n_cols/256, G=nb*16;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*210; float sum[8]={};\n"
+"    for(int g=tid;g<G;g+=blockDim.x){int b=g>>4,rem=g&15;\n"
+"        const unsigned char *bp=rp+b*210;\n"
+"        for(int t=0;t<8;t++){int token=token0+t;if(token<M)\n"
+"            sum[t]+=q6k_dot4(bp,x+(size_t)token*x_stride+b*256,rem>>3,rem&7);}\n"
+"    }\n"
+"    __shared__ float ws[8][2]; int lane=tid&31,wave=tid>>5;\n"
+"    for(int t=0;t<8;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0)ws[t][wave]=sum[t];}\n"
+"    __syncthreads();\n"
+"    if(tid==0)for(int t=0;t<8&&token0+t<M;t++)\n"
+"        dst[(size_t)(token0+t)*n_rows+row]=ws[t][0]+ws[t][1];\n"
 "}\n"
 "\n"
 "/* ---- 17b. matvec_q5_K_f32: Q5_K matrix x F32 vector -> F32 ---- */\n"
@@ -10914,6 +10933,19 @@ static const char *hip_kernel_source =
 "    v[j]            = v0 * cos_t - v1 * sin_t;\n"
 "    v[j + half_dim] = v0 * sin_t + v1 * cos_t;\n"
 "}\n"
+"__global__ void rope_mrope_batch_devpos_f32(float *vec_batch, int n_heads,\n"
+"        int head_dim, const int *positions, float freq_base, int sect0,\n"
+"        int sect1, int sect2, int sect3, int row_stride) {\n"
+"    int h=blockIdx.x,row=blockIdx.y,j=threadIdx.x; if(h>=n_heads)return;\n"
+"    int half_dim=sect0+sect1+sect2+sect3;if(j>=half_dim)return;\n"
+"    int rope_dim=2*half_dim,pos_v=positions[row];\n"
+"    int pos=j<sect0+sect1+sect2?pos_v:0;\n"
+"    float freq=1.0f/powf(freq_base,(float)(2*j)/(float)rope_dim);\n"
+"    float theta=(float)pos*freq,ct=cosf(theta),st=sinf(theta);\n"
+"    float *v=vec_batch+(size_t)row*row_stride+h*head_dim;\n"
+"    float v0=v[j],v1=v[j+half_dim];v[j]=v0*ct-v1*st;\n"
+"    v[j+half_dim]=v0*st+v1*ct;\n"
+"}\n"
 "\n"
 "/* Batched KV cache store: copies M rows from k_batch/v_batch into the cache.\n"
 " * Grid: ceil((kv_dim*M)/256), block: 256. */\n"
@@ -11898,6 +11930,23 @@ static const char *hip_kernel_source =
 "            ks[sg]=round_f16_contract(dk);vs[sg]=round_f16_contract(dv);}\n"
 "    }\n"
 "}\n"
+"__global__ void kv_cache_store_q8q8_positions(signed char *kc, signed char *vc,\n"
+"    float *ks, float *vs, const float *k, const float *v, int n_kv_heads,\n"
+"    int head_dim, const int *positions, int M) {\n"
+"    int m=blockIdx.x/n_kv_heads,h=blockIdx.x%n_kv_heads,tid=threadIdx.x;\n"
+"    int lane=tid&31,group=tid>>5,groups=head_dim/32,kv_dim=n_kv_heads*head_dim;\n"
+"    if(m>=M)return; size_t input=(size_t)m*kv_dim+h*head_dim+tid;\n"
+"    float xk=tid<head_dim?k[input]:0.0f,xv=tid<head_dim?v[input]:0.0f;\n"
+"    float ak=fabsf(xk),av=fabsf(xv);\n"
+"    for(int z=16;z;z>>=1){ak=fmaxf(ak,__shfl_xor(ak,z,32));av=fmaxf(av,__shfl_xor(av,z,32));}\n"
+"    float dk=q8_div_contract(ak,127.0f),dv=q8_div_contract(av,127.0f);\n"
+"    float ik=dk?q8_recip_contract(dk):0.0f,iv=dv?q8_recip_contract(dv):0.0f;\n"
+"    if(tid<head_dim){int pos=positions[m];size_t o=(size_t)pos*kv_dim+h*head_dim+tid;\n"
+"        float qk,qv;asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qk):\"v\"(xk),\"v\"(ik));asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qv):\"v\"(xv),\"v\"(iv));kc[o]=(signed char)roundf(qk);vc[o]=(signed char)roundf(qv);\n"
+"        if(lane==0){size_t sg=((size_t)pos*n_kv_heads+h)*groups+group;\n"
+"            ks[sg]=round_f16_contract(dk);vs[sg]=round_f16_contract(dv);}\n"
+"    }\n"
+"}\n"
 "__global__ void kv_cache_store_q8q8_devp(signed char *kc, signed char *vc,\n"
 "    float *ks, float *vs, const float *k, const float *v, int n_kv_heads,\n"
 "    int head_dim, const int *position) {\n"
@@ -12838,6 +12887,7 @@ struct hip_llm_runner {
     hipFunction_t fn_glm5next_kda_qkv_q5k_batch_f32;
     hipFunction_t fn_glm5next_dsa_qkv_a_q5k_f32;
     hipFunction_t fn_matvec_q6_K_f32;
+    hipFunction_t fn_matvec_q6_K_batch_reuse8;
     hipFunction_t fn_embed_q2_K;
     hipFunction_t fn_embed_q2_K_devtoken;
     hipFunction_t fn_embed_iq1_m;
@@ -13134,6 +13184,7 @@ struct hip_llm_runner {
     hipFunction_t fn_unpack_kv_q8q4_decode_f16_devp;
     hipFunction_t fn_rope_neox_batch_f32;
     hipFunction_t fn_rope_mrope_batch_f32;
+    hipFunction_t fn_rope_mrope_batch_devpos_f32;
     hipFunction_t fn_kv_cache_store_batch;
     hipFunction_t fn_kv_cache_store_batch_strided;
     hipFunction_t fn_flash_attn_wmma_f16_4w_causal;
@@ -13569,6 +13620,7 @@ struct hip_llm_runner {
     hipFunction_t fn_kv_cache_store_q8q4_batch;
     hipFunction_t fn_kv_cache_store_q8q8_batch;
     hipFunction_t fn_kv_cache_store_q8q8_devp;
+    hipFunction_t fn_kv_cache_store_q8q8_positions;
     hipFunction_t fn_attn_decode_flash_i8;
     hipFunction_t fn_attn_decode_flash_q8q4;
     hipFunction_t fn_attn_decode_q8q4_warpred;
@@ -13934,6 +13986,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(glm5next_kda_qkv_q5k_batch_f32);
     GET_FUNC(glm5next_dsa_qkv_a_q5k_f32);
     GET_FUNC(matvec_q6_K_f32);
+    GET_FUNC(matvec_q6_K_batch_reuse8);
     GET_FUNC(embed_q2_K);
     GET_FUNC(embed_q2_K_devtoken);
     GET_FUNC(embed_iq1_m);
@@ -14181,6 +14234,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(kv_cache_store_q8q4_batch);
     GET_FUNC(kv_cache_store_q8q8_batch);
     GET_FUNC(kv_cache_store_q8q8_devp);
+    GET_FUNC(kv_cache_store_q8q8_positions);
     GET_FUNC(attn_decode_flash_i8);
     GET_FUNC(attn_decode_flash_q8q4);
     GET_FUNC(attn_decode_q8q4_warpred);
@@ -14223,6 +14277,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(unpack_kv_q8q4_decode_f16_devp);
     GET_FUNC(rope_neox_batch_f32);
     GET_FUNC(rope_mrope_batch_f32);
+    GET_FUNC(rope_mrope_batch_devpos_f32);
     GET_FUNC(kv_cache_store_batch);
     GET_FUNC(kv_cache_store_batch_strided);
     GET_FUNC(flash_attn_wmma_f16_4w_causal);
@@ -18902,6 +18957,12 @@ static inline void launch_matvec_llama_f16(hip_llm_runner *r, void *dst, void *m
     LAUNCH(r->fn_matvec_f16_llama_f32, n_rows, 1, 1, 256, 1, 1, 0,
            r->stream, args);
 }
+static inline void launch_matvec_llama_f16_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols, int rows) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_f16_llama_f32, n_rows, rows, 1, 256, 1, 1, 0,
+           r->stream, args);
+}
 static inline void launch_matvec_bf16(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -18919,6 +18980,17 @@ static inline void launch_matvec_llama_bf16(hip_llm_runner *r, void *dst, void *
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     LAUNCH(r->fn_matvec_bf16_llama_f32, n_rows, 1, 1, (unsigned)bs, 1, 1, 0,
            r->stream, args);
+}
+static inline void launch_matvec_llama_bf16_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols, int rows) {
+    int64_t bs = 32, niter_best = (n_cols + 63) / 64;
+    for (int64_t b = 64; b <= 256; b += 32) {
+        int64_t niter = (n_cols + 2 * b - 1) / (2 * b);
+        if (niter < niter_best) { niter_best = niter; bs = b; }
+    }
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_bf16_llama_f32, n_rows, rows, 1,
+           (unsigned)bs, 1, 1, 0, r->stream, args);
 }
 
 static inline void launch_qknorm(hip_llm_runner *r, void *vec, void *w,

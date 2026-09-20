@@ -16,6 +16,7 @@
 #define HLLM_DFLASH_KV_HEADS 8
 #define HLLM_DFLASH_HEAD_DIM 128
 #define HLLM_DFLASH_ATTN_ROWS_PER_WAVE 4
+#define HLLM_DFLASH_ATTN_MAX_SPLITS 16
 
 typedef struct hllm_dflash_layer {
     void *attn_norm, *q_norm, *k_norm, *ffn_norm;
@@ -30,7 +31,8 @@ typedef struct hllm_dflash_layer {
 typedef struct hllm_qwen35_dflash2 {
     gguf_shards *source;
     hipModule_t module;
-    hipFunction_t fn_capture, fn_conv, fn_attention, fn_topk, fn_select;
+    hipFunction_t fn_capture, fn_conv, fn_attention, fn_attention_combine;
+    hipFunction_t fn_topk, fn_select;
     void *fc, *enc_norm, *out_norm, *selector_hidden;
     int fc_type, selector_hidden_type;
     qtensor selector_prev, selector_next;
@@ -42,7 +44,7 @@ typedef struct hllm_qwen35_dflash2 {
 
     /* All activation storage is row-major F32. */
     void *features, *x, *norm, *dynamic, *conv;
-    void *q, *k, *v, *attn, *proj, *gate, *up;
+    void *q, *k, *v, *attn, *attn_partial, *proj, *gate, *up;
     void *logits, *selector_gate;
     void *selector_candidates, *selector_drafts;
 } hllm_qwen35_dflash2;
@@ -58,6 +60,7 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
     DFLASH_FREE(d->features); DFLASH_FREE(d->x); DFLASH_FREE(d->norm);
     DFLASH_FREE(d->dynamic); DFLASH_FREE(d->conv); DFLASH_FREE(d->q);
     DFLASH_FREE(d->k); DFLASH_FREE(d->v); DFLASH_FREE(d->attn);
+    DFLASH_FREE(d->attn_partial);
     DFLASH_FREE(d->proj); DFLASH_FREE(d->gate); DFLASH_FREE(d->up);
     DFLASH_FREE(d->logits); DFLASH_FREE(d->selector_gate);
     DFLASH_FREE(d->selector_candidates); DFLASH_FREE(d->selector_drafts);
@@ -112,8 +115,17 @@ static void hllm_qwen35_dflash2_capture(hip_llm_runner *r, int layer,
 
 static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
         void *x, int rows, int nr, int nc, int stride, int type) {
-    if (type == GGML_TYPE_IQ4_XS &&
-        rows > HLLM_DFLASH_ATTN_ROWS_PER_WAVE &&
+    if (type == GGML_TYPE_Q2_K && rows > 1 &&
+        rows <= HLLM_DENSE_MTP_REUSE_ROWS && stride == nc && nc <= 6144 &&
+        nc % 256 == 0 && r->fn_qwen35_matvec_q2k_multi4) {
+        hllm_dense_mtp_projection(r,dst,weight,x,rows,nr,nc,type);
+    } else if (type == GGML_TYPE_Q6_K && rows > 1 && stride == nc &&
+               r->fn_matvec_q6_K_batch_reuse8) {
+        void *a[]={&dst,&weight,&x,&rows,&nr,&nc,&stride};
+        LAUNCH(r->fn_matvec_q6_K_batch_reuse8,nr,(rows+7)/8,1,
+               64,1,1,0,r->stream,a);
+    } else if (type == GGML_TYPE_IQ4_XS &&
+        rows >= HLLM_DFLASH_ATTN_ROWS_PER_WAVE &&
         rows <= HLLM_DFLASH_MAX_BLOCK && stride == nc &&
         nc % 256 == 0 && r->fn_qwen35_quantize_q81 &&
         r->fn_qwen35_matvec_iq4xs_multi8) {
@@ -224,6 +236,8 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
                              "qwen35_dflash2_conv") != hipSuccess ||
         hipModuleGetFunction(&d->fn_attention, d->module,
                              "qwen35_dflash2_attention") != hipSuccess ||
+        hipModuleGetFunction(&d->fn_attention_combine, d->module,
+                             "qwen35_dflash2_attention_combine") != hipSuccess ||
         hipModuleGetFunction(&d->fn_topk, d->module,
                              "qwen35_dflash2_topk") != hipSuccess ||
         hipModuleGetFunction(&d->fn_select, d->module,
@@ -291,7 +305,11 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
     DALLOC(x, cap*ne); DALLOC(norm, cap*ne); DALLOC(dynamic, cap*HLLM_DFLASH_DYNAMIC);
     DALLOC(conv, cap*ne); DALLOC(q, cap*HLLM_DFLASH_HEADS*HLLM_DFLASH_HEAD_DIM);
     DALLOC(k, cap*HLLM_DFLASH_KV_HEADS*HLLM_DFLASH_HEAD_DIM); DALLOC(v, cap*HLLM_DFLASH_KV_HEADS*HLLM_DFLASH_HEAD_DIM);
-    DALLOC(attn, cap*HLLM_DFLASH_HEADS*HLLM_DFLASH_HEAD_DIM); DALLOC(proj, cap*ne);
+    DALLOC(attn, cap*HLLM_DFLASH_HEADS*HLLM_DFLASH_HEAD_DIM);
+    DALLOC(attn_partial, HLLM_DFLASH_ATTN_MAX_SPLITS*HLLM_DFLASH_MAX_BLOCK*
+            HLLM_DFLASH_HEADS*
+            (HLLM_DFLASH_HEAD_DIM+2));
+    DALLOC(proj, cap*ne);
     DALLOC(gate, cap*ff); DALLOC(up, cap*ff);
     DALLOC(logits, HLLM_DFLASH_MAX_BLOCK*r->n_vocab);
     DALLOC(selector_gate, HLLM_DFLASH_MAX_BLOCK*HLLM_DFLASH_RANK);
@@ -351,13 +369,19 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         launch_kv_store_batch_strided(r,cl->key_cache,cl->value_cache,d->k,d->v,
             position,rows,kd,kd,HLLM_DFLASH_WINDOW);
         int window=HLLM_DFLASH_WINDOW;
-        void *aa[]={&d->attn,&d->q,&cl->key_cache,&cl->value_cache,&rows,
+        int attention_length=position+rows < window ? position+rows : window;
+        int splits=attention_length >= 1024 ? 16 : attention_length >= 512 ? 4 : 1;
+        void *aa[]={&d->attn_partial,&d->q,&cl->key_cache,&cl->value_cache,&rows,
             &position,&(int){HLLM_DFLASH_HEADS},&(int){HLLM_DFLASH_KV_HEADS},
-            &(int){HLLM_DFLASH_HEAD_DIM},&window};
+            &(int){HLLM_DFLASH_HEAD_DIM},&window,&splits};
         LAUNCH(d->fn_attention, HLLM_DFLASH_HEADS,
                (rows + HLLM_DFLASH_ATTN_ROWS_PER_WAVE - 1) /
-                   HLLM_DFLASH_ATTN_ROWS_PER_WAVE, 1,
+                   HLLM_DFLASH_ATTN_ROWS_PER_WAVE, splits,
                32,1,1,0,r->stream,aa);
+        void *ac[]={&d->attn,&d->attn_partial,&rows,
+            &(int){HLLM_DFLASH_HEADS},&(int){HLLM_DFLASH_HEAD_DIM},&splits};
+        LAUNCH(d->fn_attention_combine,HLLM_DFLASH_HEADS,rows,1,
+               32,1,1,0,r->stream,ac);
         hllm_dflash_project(r,d->proj,cl->o,d->attn,rows,ne,qd,qd,cl->o_type);
         hllm_dflash_conv(r,d,d->conv,d->proj,d->dynamic,cl->attn_conv_base,rows,1);
         launch_add(r,d->x,d->conv,rows*ne);
@@ -373,9 +397,18 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         launch_add(r,d->x,d->conv,rows*ne);
     }
     launch_rmsnorm_batch(r,d->norm,d->x,d->out_norm,ne,rows,ne,r->rms_norm_eps);
-    hllm_dflash_project(r,d->logits,r->d_output_w,d->norm,rows,r->n_vocab,ne,ne,r->output_w_type);
-    hllm_dflash_project(r,d->selector_gate,d->selector_hidden,d->norm,rows,
-        HLLM_DFLASH_RANK,ne,ne,d->selector_hidden_type);
+    /* The anchor row seeds the selector's predecessor but never contributes
+     * logits or a selector gate.  Keep row-indexed buffers so the top-k and
+     * selector kernels retain their established indexing, and project only
+     * the K mask rows that they consume. */
+    int selected_rows=rows-1;
+    void *selected_norm=(float *)d->norm+ne;
+    void *selected_logits=(float *)d->logits+r->n_vocab;
+    void *selected_gate=(float *)d->selector_gate+HLLM_DFLASH_RANK;
+    hllm_dflash_project(r,selected_logits,r->d_output_w,selected_norm,
+        selected_rows,r->n_vocab,ne,ne,r->output_w_type);
+    hllm_dflash_project(r,selected_gate,d->selector_hidden,selected_norm,
+        selected_rows,HLLM_DFLASH_RANK,ne,ne,d->selector_hidden_type);
     void *ta[]={&d->logits,&d->selector_candidates,&rows,&r->n_vocab};
     LAUNCH(d->fn_topk,rows-1,1,1,256,1,1,0,r->stream,ta);
     void *sa[]={&d->logits,&d->selector_gate,&d->selector_prev_w,
