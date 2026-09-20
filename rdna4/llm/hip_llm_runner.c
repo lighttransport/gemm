@@ -3873,6 +3873,19 @@ static const char *hip_kernel_source =
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i < n) data[i] *= 1.0f / (1.0f + expf(-gate[i]));\n"
 "}\n"
+"__global__ void sigmoid_mul_q81_f32(float *data, const float *gate,\n"
+"        signed char *q, float *qscale, int n) {\n"
+"    int lane = threadIdx.x, i = blockIdx.x * 32 + lane;\n"
+"    float v = data[i];\n"
+"    v *= 1.0f / (1.0f + expf(-gate[i]));\n"
+"    data[i] = v;\n"
+"    float a = fabsf(v);\n"
+"    for (int off = 16; off; off >>= 1)\n"
+"        a = fmaxf(a, __shfl_xor(a, off, 32));\n"
+"    float d = q8_div_contract(a, 127.0f);\n"
+"    q[i] = a == 0.0f ? 0 : (signed char)roundf(q8_div_contract(v, d));\n"
+"    if (lane == 0) qscale[blockIdx.x] = round_f16_contract(d);\n"
+"}\n"
 
 "__global__ void silu_gate_mul_f32(float *data, const float *gate, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -13158,6 +13171,7 @@ struct hip_llm_runner {
     hipFunction_t fn_gated_rmsnorm_silu_f32;
     hipFunction_t fn_gated_rmsnorm_silu_q81_f32;
     hipFunction_t fn_sigmoid_mul_f32;
+    hipFunction_t fn_sigmoid_mul_q81_f32;
     hipFunction_t fn_deinterleave_qgate_f32;
     hipFunction_t fn_deinterleave_qgate_batch_f32;
     /* MoE kernels */
@@ -14272,6 +14286,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(gated_rmsnorm_silu_f32);
     GET_FUNC(gated_rmsnorm_silu_q81_f32);
     GET_FUNC(sigmoid_mul_f32);
+    GET_FUNC(sigmoid_mul_q81_f32);
     GET_FUNC(deinterleave_qgate_f32);
     GET_FUNC(deinterleave_qgate_batch_f32);
     /* MoE kernels */
@@ -23224,6 +23239,17 @@ static inline void launch_sigmoid_mul(hip_llm_runner *r, void *data, void *gate,
     LAUNCH(r->fn_sigmoid_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
+static inline void launch_sigmoid_mul_native_q81(hip_llm_runner *r,
+        void *data, void *gate, int n) {
+    void *args[] = { &data, &gate, &r->d_native_q81,
+                     &r->d_native_scale, &n };
+    LAUNCH(r->fn_sigmoid_mul_q81_f32, n / 32, 1, 1, 32, 1, 1,
+           0, r->stream, args);
+    r->native_q81_source = data;
+    r->native_q81_n = n;
+    r->native_q81_valid = 1;
+}
+
 static inline void launch_deinterleave_qgate_batch(hip_llm_runner *r,
         void *q_out, void *gate_out, void *qfull,
         int n_heads, int head_dim, int M) {
@@ -28751,9 +28777,22 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 void *a[] = { &r->d_xb, &cl->attn_output_w, &r->d_xb2, &r->d_attn_gate, &nr, &nc };
                 LAUNCH(r->fn_matvec_out_gated_iq3xxs, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
-                launch_sigmoid_mul(r, r->d_xb2, r->d_attn_gate, q_dim_local);
+                const char *split_gate_q81_env = getenv("LLM_QWEN35_SPLIT_ATTN_GATE_Q81");
+                int native_gate_q81 = q_dim_local <= 17408 &&
+                    (q_dim_local % 256) == 0 &&
+                    qwen35_native_q81_matvec_type(r, cl->attn_output_type) &&
+                    (!split_gate_q81_env || atoi(split_gate_q81_env) == 0);
+                if (native_gate_q81) {
+                    launch_sigmoid_mul_native_q81(
+                        r, r->d_xb2, r->d_attn_gate, q_dim_local);
+                    begin_native_q81_prepared(r);
+                } else {
+                    launch_sigmoid_mul(r, r->d_xb2, r->d_attn_gate,
+                                       q_dim_local);
+                }
                 launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
                                   cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+                if (native_gate_q81) end_q8x2_reuse(r);
             }
 
         } else {

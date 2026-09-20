@@ -128,6 +128,15 @@ and keep the pinned 256-token hash `3c53b75f283cb9b0`.  A 64-row trace removes
 42.62--43.36 tok/s (43.07 mean) fused versus 41.64--43.14 tok/s (42.60 mean)
 split.  Trace artifact: `tmp/qwen38/ordinary-decode-profile-ssmq81/`.
 
+Twelve of the sixteen gated-attention output layers now combine sigmoid
+gating with exact native Q8_1 staging; the four IQ1 output layers keep their
+specialized quantizer.  The fused/split logit files remain bitwise identical
+with SHA-256 `5b5f2f1a334ae644ac5633908e3d447c6d741c764a61dc0e9573addf699553c0`,
+and all three 256-token repeats retain `3c53b75f283cb9b0`.  Matched means are
+43.33 tok/s fused and 43.21 tok/s split.  The 64-row trace removes exactly 768
+launches, 12 per row.  Trace artifact:
+`tmp/qwen38/ordinary-decode-profile-attngateq81/`.
+
 Prioritize ordinary one-row target projection traffic first, followed by the
 long-context verifier attention tail, sampled verifier-row parity audit, and
 fusion of the remaining activation/state-preparation launches.

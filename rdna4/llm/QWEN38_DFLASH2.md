@@ -209,6 +209,17 @@ the matched split path.  A 64-row trace removes exactly 3,072 launches, 48 per
 row, and is under `tmp/qwen38/ordinary-decode-profile-ssmq81/`.  Set
 `LLM_QWEN35_SPLIT_SSM_NORM_Q81=1` to restore the standalone quantizer.
 
+Gated-attention output now applies sigmoid gating and stages native Q8_1 in
+one wave-per-block kernel for 12 of 16 attention layers; the four IQ1 output
+layers retain their dedicated quantizer.  The fused/split final logits are
+bitwise identical with the same `5b5f2f1a...953c0` SHA-256, and all three
+256-token repeats keep `3c53b75f283cb9b0`.  Matched decode means are 43.33
+tok/s fused and 43.21 tok/s split.  A 64-row trace replaces 768 standalone
+quantizer launches with 768 `sigmoid_mul_q81_f32` launches, reducing the total
+by exactly 12 launches per row; it is under
+`tmp/qwen38/ordinary-decode-profile-attngateq81/`.  Set
+`LLM_QWEN35_SPLIT_ATTN_GATE_Q81=1` for the split path.
+
 ## Remaining optimization opportunities
 
 The short-context K=7 response emits 46 tokens in 566.72 ms, clearing the
@@ -230,6 +241,7 @@ reflects the remaining measured costs.
    remaining gap is dominated by work outside attention. SiLU and Q8_1
    staging for 58 dense down projections now share one exact launch; gated
    RMSNorm and Q8_1 staging do the same for all 48 recurrent output
+   projections, and sigmoid gating does the same for 12 attention output
    projections.
    Fixed-eight Q2_K/IQ projections already share decoded weights, but
    ordinary decode still streams weights for one row at a time. Reuse the
