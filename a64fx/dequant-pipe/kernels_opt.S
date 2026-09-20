@@ -868,6 +868,374 @@ fused_fp4_i16_opt_sve:
     RESTORE
     ret
 .size fused_fp4_i16_opt_sve, .-fused_fp4_i16_opt_sve
+
+/* Cross-K pipeline: decode K+1 while retiring K, with an explicit drain.
+ * Same four-block layout and ascending-K half FMA order as opt2.
+ * Prologue prepares K=0. Each of 63 iterations retires two K steps;
+ * the final transition retires K=126 and the drain retires K=127.
+ * z0-z7: accumulators; z8-z15/z16-z23: alternating decoded weights;
+ * z24-z27: activations, reloaded after their two consumers; z30/31: mask/table.
+ * Extraction precedes alternating FMLA(K)/TBL(K+1) pairs, separating
+ * lookup producers from consumers without spills or reassociation. */
+.text
+.p2align 6
+.global fused_i4_f16_pipe_sve
+.type fused_i4_f16_pipe_sve, %function
+fused_i4_f16_pipe_sve:
+    SAVE
+    ptrue p0.h
+    adr x9, .Li4_f16
+    ld1h {z31.h}, p0/z, [x9]
+    mov z30.h, #15
+    eor z0.d, z0.d, z0.d
+    eor z1.d, z1.d, z1.d
+    eor z2.d, z2.d, z2.d
+    eor z3.d, z3.d, z3.d
+    eor z4.d, z4.d, z4.d
+    eor z5.d, z5.d, z5.d
+    eor z6.d, z6.d, z6.d
+    eor z7.d, z7.d, z7.d
+    add x3, x1, #256
+    add x4, x1, #512
+    add x5, x1, #768
+    ld1b {z8.h}, p0/z, [x0, #0, mul vl]
+    ld1b {z10.h}, p0/z, [x0, #1, mul vl]
+    ld1b {z12.h}, p0/z, [x0, #2, mul vl]
+    ld1b {z14.h}, p0/z, [x0, #3, mul vl]
+    ld1rh {z24.h}, p0/z, [x1]
+    ld1rh {z25.h}, p0/z, [x3]
+    ld1rh {z26.h}, p0/z, [x4]
+    ld1rh {z27.h}, p0/z, [x5]
+    lsr z9.h, z8.h, #4
+    and z8.d, z8.d, z30.d
+    lsr z11.h, z10.h, #4
+    and z10.d, z10.d, z30.d
+    lsr z13.h, z12.h, #4
+    and z12.d, z12.d, z30.d
+    lsr z15.h, z14.h, #4
+    and z14.d, z14.d, z30.d
+    tbl z8.h, {z31.h}, z8.h
+    tbl z9.h, {z31.h}, z9.h
+    tbl z10.h, {z31.h}, z10.h
+    tbl z11.h, {z31.h}, z11.h
+    tbl z12.h, {z31.h}, z12.h
+    tbl z13.h, {z31.h}, z13.h
+    tbl z14.h, {z31.h}, z14.h
+    tbl z15.h, {z31.h}, z15.h
+    mov x10, #63
+.p2align 6
+1:
+    add x0, x0, #128
+    ld1b {z16.h}, p0/z, [x0, #0, mul vl]
+    ld1b {z18.h}, p0/z, [x0, #1, mul vl]
+    ld1b {z20.h}, p0/z, [x0, #2, mul vl]
+    ld1b {z22.h}, p0/z, [x0, #3, mul vl]
+    lsr z17.h, z16.h, #4
+    and z16.d, z16.d, z30.d
+    lsr z19.h, z18.h, #4
+    and z18.d, z18.d, z30.d
+    lsr z21.h, z20.h, #4
+    and z20.d, z20.d, z30.d
+    lsr z23.h, z22.h, #4
+    and z22.d, z22.d, z30.d
+    fmla z0.h, p0/m, z8.h, z24.h
+    fmla z1.h, p0/m, z9.h, z24.h
+    tbl z16.h, {z31.h}, z16.h
+    tbl z17.h, {z31.h}, z17.h
+    add x1, x1, #2
+    ld1rh {z24.h}, p0/z, [x1]
+    fmla z2.h, p0/m, z10.h, z25.h
+    fmla z3.h, p0/m, z11.h, z25.h
+    tbl z18.h, {z31.h}, z18.h
+    tbl z19.h, {z31.h}, z19.h
+    add x3, x3, #2
+    ld1rh {z25.h}, p0/z, [x3]
+    fmla z4.h, p0/m, z12.h, z26.h
+    fmla z5.h, p0/m, z13.h, z26.h
+    tbl z20.h, {z31.h}, z20.h
+    tbl z21.h, {z31.h}, z21.h
+    add x4, x4, #2
+    ld1rh {z26.h}, p0/z, [x4]
+    fmla z6.h, p0/m, z14.h, z27.h
+    fmla z7.h, p0/m, z15.h, z27.h
+    tbl z22.h, {z31.h}, z22.h
+    tbl z23.h, {z31.h}, z23.h
+    add x5, x5, #2
+    ld1rh {z27.h}, p0/z, [x5]
+    add x0, x0, #128
+    ld1b {z8.h}, p0/z, [x0, #0, mul vl]
+    ld1b {z10.h}, p0/z, [x0, #1, mul vl]
+    ld1b {z12.h}, p0/z, [x0, #2, mul vl]
+    ld1b {z14.h}, p0/z, [x0, #3, mul vl]
+    lsr z9.h, z8.h, #4
+    and z8.d, z8.d, z30.d
+    lsr z11.h, z10.h, #4
+    and z10.d, z10.d, z30.d
+    lsr z13.h, z12.h, #4
+    and z12.d, z12.d, z30.d
+    lsr z15.h, z14.h, #4
+    and z14.d, z14.d, z30.d
+    fmla z0.h, p0/m, z16.h, z24.h
+    fmla z1.h, p0/m, z17.h, z24.h
+    tbl z8.h, {z31.h}, z8.h
+    tbl z9.h, {z31.h}, z9.h
+    add x1, x1, #2
+    ld1rh {z24.h}, p0/z, [x1]
+    fmla z2.h, p0/m, z18.h, z25.h
+    fmla z3.h, p0/m, z19.h, z25.h
+    tbl z10.h, {z31.h}, z10.h
+    tbl z11.h, {z31.h}, z11.h
+    add x3, x3, #2
+    ld1rh {z25.h}, p0/z, [x3]
+    fmla z4.h, p0/m, z20.h, z26.h
+    fmla z5.h, p0/m, z21.h, z26.h
+    tbl z12.h, {z31.h}, z12.h
+    tbl z13.h, {z31.h}, z13.h
+    add x4, x4, #2
+    ld1rh {z26.h}, p0/z, [x4]
+    fmla z6.h, p0/m, z22.h, z27.h
+    fmla z7.h, p0/m, z23.h, z27.h
+    tbl z14.h, {z31.h}, z14.h
+    tbl z15.h, {z31.h}, z15.h
+    add x5, x5, #2
+    ld1rh {z27.h}, p0/z, [x5]
+    subs x10, x10, #1
+    b.ne 1b
+    add x0, x0, #128
+    ld1b {z16.h}, p0/z, [x0, #0, mul vl]
+    ld1b {z18.h}, p0/z, [x0, #1, mul vl]
+    ld1b {z20.h}, p0/z, [x0, #2, mul vl]
+    ld1b {z22.h}, p0/z, [x0, #3, mul vl]
+    lsr z17.h, z16.h, #4
+    and z16.d, z16.d, z30.d
+    lsr z19.h, z18.h, #4
+    and z18.d, z18.d, z30.d
+    lsr z21.h, z20.h, #4
+    and z20.d, z20.d, z30.d
+    lsr z23.h, z22.h, #4
+    and z22.d, z22.d, z30.d
+    fmla z0.h, p0/m, z8.h, z24.h
+    fmla z1.h, p0/m, z9.h, z24.h
+    tbl z16.h, {z31.h}, z16.h
+    tbl z17.h, {z31.h}, z17.h
+    add x1, x1, #2
+    ld1rh {z24.h}, p0/z, [x1]
+    fmla z2.h, p0/m, z10.h, z25.h
+    fmla z3.h, p0/m, z11.h, z25.h
+    tbl z18.h, {z31.h}, z18.h
+    tbl z19.h, {z31.h}, z19.h
+    add x3, x3, #2
+    ld1rh {z25.h}, p0/z, [x3]
+    fmla z4.h, p0/m, z12.h, z26.h
+    fmla z5.h, p0/m, z13.h, z26.h
+    tbl z20.h, {z31.h}, z20.h
+    tbl z21.h, {z31.h}, z21.h
+    add x4, x4, #2
+    ld1rh {z26.h}, p0/z, [x4]
+    fmla z6.h, p0/m, z14.h, z27.h
+    fmla z7.h, p0/m, z15.h, z27.h
+    tbl z22.h, {z31.h}, z22.h
+    tbl z23.h, {z31.h}, z23.h
+    add x5, x5, #2
+    ld1rh {z27.h}, p0/z, [x5]
+    fmla z0.h, p0/m, z16.h, z24.h
+    fmla z1.h, p0/m, z17.h, z24.h
+    fmla z2.h, p0/m, z18.h, z25.h
+    fmla z3.h, p0/m, z19.h, z25.h
+    fmla z4.h, p0/m, z20.h, z26.h
+    fmla z5.h, p0/m, z21.h, z26.h
+    fmla z6.h, p0/m, z22.h, z27.h
+    fmla z7.h, p0/m, z23.h, z27.h
+    st1h {z0.h}, p0, [x2, #0, mul vl]
+    st1h {z1.h}, p0, [x2, #1, mul vl]
+    st1h {z2.h}, p0, [x2, #2, mul vl]
+    st1h {z3.h}, p0, [x2, #3, mul vl]
+    st1h {z4.h}, p0, [x2, #4, mul vl]
+    st1h {z5.h}, p0, [x2, #5, mul vl]
+    st1h {z6.h}, p0, [x2, #6, mul vl]
+    st1h {z7.h}, p0, [x2, #7, mul vl]
+    RESTORE
+    ret
+.size fused_i4_f16_pipe_sve, .-fused_i4_f16_pipe_sve
+.p2align 6
+.global fused_fp4_f16_pipe_sve
+.type fused_fp4_f16_pipe_sve, %function
+fused_fp4_f16_pipe_sve:
+    SAVE
+    ptrue p0.h
+    adr x9, .Lfp4_f16
+    ld1h {z31.h}, p0/z, [x9]
+    mov z30.h, #15
+    eor z0.d, z0.d, z0.d
+    eor z1.d, z1.d, z1.d
+    eor z2.d, z2.d, z2.d
+    eor z3.d, z3.d, z3.d
+    eor z4.d, z4.d, z4.d
+    eor z5.d, z5.d, z5.d
+    eor z6.d, z6.d, z6.d
+    eor z7.d, z7.d, z7.d
+    add x3, x1, #256
+    add x4, x1, #512
+    add x5, x1, #768
+    ld1b {z8.h}, p0/z, [x0, #0, mul vl]
+    ld1b {z10.h}, p0/z, [x0, #1, mul vl]
+    ld1b {z12.h}, p0/z, [x0, #2, mul vl]
+    ld1b {z14.h}, p0/z, [x0, #3, mul vl]
+    ld1rh {z24.h}, p0/z, [x1]
+    ld1rh {z25.h}, p0/z, [x3]
+    ld1rh {z26.h}, p0/z, [x4]
+    ld1rh {z27.h}, p0/z, [x5]
+    lsr z9.h, z8.h, #4
+    and z8.d, z8.d, z30.d
+    lsr z11.h, z10.h, #4
+    and z10.d, z10.d, z30.d
+    lsr z13.h, z12.h, #4
+    and z12.d, z12.d, z30.d
+    lsr z15.h, z14.h, #4
+    and z14.d, z14.d, z30.d
+    tbl z8.h, {z31.h}, z8.h
+    tbl z9.h, {z31.h}, z9.h
+    tbl z10.h, {z31.h}, z10.h
+    tbl z11.h, {z31.h}, z11.h
+    tbl z12.h, {z31.h}, z12.h
+    tbl z13.h, {z31.h}, z13.h
+    tbl z14.h, {z31.h}, z14.h
+    tbl z15.h, {z31.h}, z15.h
+    mov x10, #63
+.p2align 6
+1:
+    add x0, x0, #128
+    ld1b {z16.h}, p0/z, [x0, #0, mul vl]
+    ld1b {z18.h}, p0/z, [x0, #1, mul vl]
+    ld1b {z20.h}, p0/z, [x0, #2, mul vl]
+    ld1b {z22.h}, p0/z, [x0, #3, mul vl]
+    lsr z17.h, z16.h, #4
+    and z16.d, z16.d, z30.d
+    lsr z19.h, z18.h, #4
+    and z18.d, z18.d, z30.d
+    lsr z21.h, z20.h, #4
+    and z20.d, z20.d, z30.d
+    lsr z23.h, z22.h, #4
+    and z22.d, z22.d, z30.d
+    fmla z0.h, p0/m, z8.h, z24.h
+    fmla z1.h, p0/m, z9.h, z24.h
+    tbl z16.h, {z31.h}, z16.h
+    tbl z17.h, {z31.h}, z17.h
+    add x1, x1, #2
+    ld1rh {z24.h}, p0/z, [x1]
+    fmla z2.h, p0/m, z10.h, z25.h
+    fmla z3.h, p0/m, z11.h, z25.h
+    tbl z18.h, {z31.h}, z18.h
+    tbl z19.h, {z31.h}, z19.h
+    add x3, x3, #2
+    ld1rh {z25.h}, p0/z, [x3]
+    fmla z4.h, p0/m, z12.h, z26.h
+    fmla z5.h, p0/m, z13.h, z26.h
+    tbl z20.h, {z31.h}, z20.h
+    tbl z21.h, {z31.h}, z21.h
+    add x4, x4, #2
+    ld1rh {z26.h}, p0/z, [x4]
+    fmla z6.h, p0/m, z14.h, z27.h
+    fmla z7.h, p0/m, z15.h, z27.h
+    tbl z22.h, {z31.h}, z22.h
+    tbl z23.h, {z31.h}, z23.h
+    add x5, x5, #2
+    ld1rh {z27.h}, p0/z, [x5]
+    add x0, x0, #128
+    ld1b {z8.h}, p0/z, [x0, #0, mul vl]
+    ld1b {z10.h}, p0/z, [x0, #1, mul vl]
+    ld1b {z12.h}, p0/z, [x0, #2, mul vl]
+    ld1b {z14.h}, p0/z, [x0, #3, mul vl]
+    lsr z9.h, z8.h, #4
+    and z8.d, z8.d, z30.d
+    lsr z11.h, z10.h, #4
+    and z10.d, z10.d, z30.d
+    lsr z13.h, z12.h, #4
+    and z12.d, z12.d, z30.d
+    lsr z15.h, z14.h, #4
+    and z14.d, z14.d, z30.d
+    fmla z0.h, p0/m, z16.h, z24.h
+    fmla z1.h, p0/m, z17.h, z24.h
+    tbl z8.h, {z31.h}, z8.h
+    tbl z9.h, {z31.h}, z9.h
+    add x1, x1, #2
+    ld1rh {z24.h}, p0/z, [x1]
+    fmla z2.h, p0/m, z18.h, z25.h
+    fmla z3.h, p0/m, z19.h, z25.h
+    tbl z10.h, {z31.h}, z10.h
+    tbl z11.h, {z31.h}, z11.h
+    add x3, x3, #2
+    ld1rh {z25.h}, p0/z, [x3]
+    fmla z4.h, p0/m, z20.h, z26.h
+    fmla z5.h, p0/m, z21.h, z26.h
+    tbl z12.h, {z31.h}, z12.h
+    tbl z13.h, {z31.h}, z13.h
+    add x4, x4, #2
+    ld1rh {z26.h}, p0/z, [x4]
+    fmla z6.h, p0/m, z22.h, z27.h
+    fmla z7.h, p0/m, z23.h, z27.h
+    tbl z14.h, {z31.h}, z14.h
+    tbl z15.h, {z31.h}, z15.h
+    add x5, x5, #2
+    ld1rh {z27.h}, p0/z, [x5]
+    subs x10, x10, #1
+    b.ne 1b
+    add x0, x0, #128
+    ld1b {z16.h}, p0/z, [x0, #0, mul vl]
+    ld1b {z18.h}, p0/z, [x0, #1, mul vl]
+    ld1b {z20.h}, p0/z, [x0, #2, mul vl]
+    ld1b {z22.h}, p0/z, [x0, #3, mul vl]
+    lsr z17.h, z16.h, #4
+    and z16.d, z16.d, z30.d
+    lsr z19.h, z18.h, #4
+    and z18.d, z18.d, z30.d
+    lsr z21.h, z20.h, #4
+    and z20.d, z20.d, z30.d
+    lsr z23.h, z22.h, #4
+    and z22.d, z22.d, z30.d
+    fmla z0.h, p0/m, z8.h, z24.h
+    fmla z1.h, p0/m, z9.h, z24.h
+    tbl z16.h, {z31.h}, z16.h
+    tbl z17.h, {z31.h}, z17.h
+    add x1, x1, #2
+    ld1rh {z24.h}, p0/z, [x1]
+    fmla z2.h, p0/m, z10.h, z25.h
+    fmla z3.h, p0/m, z11.h, z25.h
+    tbl z18.h, {z31.h}, z18.h
+    tbl z19.h, {z31.h}, z19.h
+    add x3, x3, #2
+    ld1rh {z25.h}, p0/z, [x3]
+    fmla z4.h, p0/m, z12.h, z26.h
+    fmla z5.h, p0/m, z13.h, z26.h
+    tbl z20.h, {z31.h}, z20.h
+    tbl z21.h, {z31.h}, z21.h
+    add x4, x4, #2
+    ld1rh {z26.h}, p0/z, [x4]
+    fmla z6.h, p0/m, z14.h, z27.h
+    fmla z7.h, p0/m, z15.h, z27.h
+    tbl z22.h, {z31.h}, z22.h
+    tbl z23.h, {z31.h}, z23.h
+    add x5, x5, #2
+    ld1rh {z27.h}, p0/z, [x5]
+    fmla z0.h, p0/m, z16.h, z24.h
+    fmla z1.h, p0/m, z17.h, z24.h
+    fmla z2.h, p0/m, z18.h, z25.h
+    fmla z3.h, p0/m, z19.h, z25.h
+    fmla z4.h, p0/m, z20.h, z26.h
+    fmla z5.h, p0/m, z21.h, z26.h
+    fmla z6.h, p0/m, z22.h, z27.h
+    fmla z7.h, p0/m, z23.h, z27.h
+    st1h {z0.h}, p0, [x2, #0, mul vl]
+    st1h {z1.h}, p0, [x2, #1, mul vl]
+    st1h {z2.h}, p0, [x2, #2, mul vl]
+    st1h {z3.h}, p0, [x2, #3, mul vl]
+    st1h {z4.h}, p0, [x2, #4, mul vl]
+    st1h {z5.h}, p0, [x2, #5, mul vl]
+    st1h {z6.h}, p0, [x2, #6, mul vl]
+    st1h {z7.h}, p0, [x2, #7, mul vl]
+    RESTORE
+    ret
+.size fused_fp4_f16_pipe_sve, .-fused_fp4_f16_pipe_sve
 .section .rodata
 .p2align 6
 .Lfp4_i16:

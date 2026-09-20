@@ -4,6 +4,80 @@ Measured 2026-09-19 with Fujitsu `fcc` 4.12.2 on CPUs 12--23 of one 2.0 GHz
 A64FX CMG.  All end-to-end numbers below use `--sync atomic`; they are controls,
 not headline hardware-barrier results.
 
+## FP16 above 200 GB/s: 2026-09-20
+
+The new `--path fp16 --kernel f16pipe` passes the raised **>200 GB/s**
+packed-weight target for both formats in all three fresh launches. The
+original `opt`, `opt2`, and `super` kernels remain available unchanged.
+
+| format | arithmetic / selector | launch 1 median | launch 2 median | launch 3 median |
+|:-------|:----------------------|----------------:|----------------:|----------------:|
+| INT4 | sequential FP16, `fp16/f16pipe` | 204.07 | 204.13 | 204.11 |
+| FP4 | sequential FP16, `fp16/f16pipe` | 204.02 | 204.07 | 204.03 |
+| INT4 | full-range SDOT, `int16x8-full/opt` | 219.64 | 218.03 | 218.93 |
+| FP4 | full-range SDOT, `int16x8-full/opt` | 214.27 | 214.13 | 215.37 |
+| INT4 | native INT16 SDOT, `int16/opt` | 201.66 | 201.73 | 201.82 |
+| FP4 | native INT16 SDOT, `int16/opt` | 173.13 | 173.24 | 173.33 |
+
+Each launch uses 240 MiB packed weights, twelve cores (CPUs 12--23), ten
+iterations and five timed trials. All eighteen runs qualify: paired reads
+before/after on the same allocation range from 227.96 to 229.77 GB/s.
+Every mapping reports 2048 KiB pages on NUMA node 4; all twelve CPUs report
+2,000,000 kHz in `host.txt`. No slow-placement run occurred in this series.
+Fresh `opt2` controls measured 171.75 GB/s INT4 and 171.96 GB/s FP4, so the
+pipeline improves this baseline by approximately 18.8% and 18.6%.
+
+The prologue prepares K=0. Each of 63 loop iterations retires two K steps;
+a final transition retires K=126 and a load-free drain retires K=127.
+Next-step packed loads precede extraction; current-step FMA pairs alternate
+with next-step TBL pairs. Each activation register is reloaded after its two
+consumers, before the next K step. The eight output chains retain ascending-K
+half-precision FMA order. There are no partial sums, activation quantization,
+clipping, changed layouts, or wider accumulators. E2M1 still uses the doubled
+lattice; model scales remain omitted.
+
+Disassembly confirms 48 SVE arithmetic instructions per 256 packed bytes
+(16 extraction, 16 TBL, 16 FMLA), 16 weight/activation loads, ten pointer
+increments, and loop control. There are no loop spills or indexed FMAs;
+only the ABI's d8--d15 saves/restores use the stack. This is the same arithmetic
+count as `opt2`: separating lookup producers from consumers improves the
+schedule. At 204 GB/s the effective budget is about 30.1 cycles per 256 bytes
+per core, versus about 35.8 at 172 GB/s. The remaining gap to paired reads
+is consistent with mixed instruction/dependency overhead; these measurements
+do not isolate a particular execution port as the limit.
+
+Controlled development candidates (five-trial medians, same launch settings):
+
+| schedule | INT4 GB/s | FP4 GB/s | paired-read medians GB/s |
+|:---------|----------:|---------:|:------------------------|
+| cross-K, all next-step lookups at end | 198.21 | 198.28 | 228.44--229.63 |
+| above, activation offsets with updates every two K | 186.76 | 186.77 | 227.44--229.58 |
+| alternating current FMA / next TBL pairs, selected | 204.03 | 203.94 | 228.26--229.35 |
+
+The offset schedule reduces pointer instructions but regresses throughput;
+retain the per-step updates. Full 64-byte loads/layout changes were unnecessary
+after the existing-layout pipeline passed the target. Development logs are
+`tmp/dequant/pipe-v{1,2,3}-{int4,fp4}.log`; rejected assembly snapshots are
+`tmp/dequant/kernels-pipe-v{1,2}.S`. Fresh baseline controls are
+`tmp/dequant/baseline-opt2-{int4,fp4}.log`.
+
+Reproduce correctness and the complete acceptance procedure:
+
+```sh
+mkdir -p tmp/dequant
+TMPDIR="$PWD/tmp/dequant" make -C a64fx/dequant-pipe test CC=fcc
+bash a64fx/dequant-pipe/run_w4a16_acceptance.sh
+# acceptance=PASS qualified=18/18 SDOT=6 FP16=6 failed_targets=0
+```
+
+The test compares the new pipeline and both old table kernels bit-for-bit
+with scalar half FMADD and the original kernel across fractional inputs,
+signed zero, subnormals, cancellation, and overflow. The exhaustive INT16
+and dequant regression checks pass. Compiler output is warning-free.
+Acceptance logs: `tmp/dequant/w4a16-acceptance.s5EThb/`.
+The script now requires **>200 GB/s for both FP16 and full-range SDOT**;
+the older FP16 >150 GB/s acceptance below is historical.
+
 ## W4A16 acceptance: 2026-09-20
 
 Both requested targets pass on CPUs 12--23 of one A64FX CMG. Every number

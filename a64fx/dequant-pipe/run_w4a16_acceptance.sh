@@ -6,12 +6,19 @@ cd "$repo_dir"
 mkdir -p tmp/dequant
 log_dir=$(mktemp -d "$repo_dir/tmp/dequant/w4a16-acceptance.XXXXXX")
 printf 'Logs: %s\n' "$log_dir"
+{
+    uname -a
+    for cpu in {12..23}; do
+        printf 'cpu=%s frequency_khz=' "$cpu"
+        cat "/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_cur_freq"
+    done
+} > "$log_dir/host.txt"
 for launch in 1 2 3; do
     for format in int4 fp4; do
         for path in int16 int16x8-full fp16; do
             kernel=opt
             extra=()
-            if [[ $path == fp16 ]]; then kernel=opt2; fi
+            if [[ $path == fp16 ]]; then kernel=f16pipe; fi
             if [[ $path != int16x8-full ]]; then extra=(--compare-kernels); fi
             taskset -c 12 env \
                 LD_PRELOAD=/opt/FJSVxos/mmm/lib64/libmpg.so.1 \
@@ -36,9 +43,9 @@ awk '
             split($i,a,"="); sdot++; if (a[2] <= 200) bad++
         }
     }
-    /^summary/ && /path=fp16/ && /kernel=opt2/ {
+    /^summary/ && /path=fp16/ && /kernel=f16pipe/ {
         for (i=1;i<=NF;i++) if ($i ~ /^packed_GB\/s_median=/) {
-            split($i,a,"="); fp16++; if (a[2] <= 150) bad++
+            split($i,a,"="); fp16++; if (a[2] <= 200) bad++
         }
     }
     END {

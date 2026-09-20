@@ -311,6 +311,38 @@ required. That preserves the existing split-column ordering. Its standalone
 store bandwidth has not been measured here; the fused rates above avoid
 those expanded-weight stores entirely.
 
+### Cross-K scheduling raises FP16 above 200 GB/s
+
+The follow-up `fp16/f16pipe` keeps the same layout, eight accumulators, and
+48 arithmetic instructions per 256 packed bytes. It prepares K=0 before the
+loop, then loads and extracts K+1 while retiring K. Alternating current-step
+FMA pairs with next-step table lookups separates each lookup from its consumer;
+activation registers are reloaded immediately after their two FMAs. An
+explicit final drain avoids reading past K=127. The assembly has no loop
+spills, reassociated sums, indexed FMAs, or activation conversion.
+
+Three fresh launches produced INT4 medians of **204.07, 204.13, 204.11 GB/s**
+and FP4 medians of **204.02, 204.07, 204.03 GB/s**. Every launch used 240 MiB,
+twelve 2.0 GHz cores, ten iterations, and five trials. Across the complete
+18-run acceptance suite, paired-read medians were 227.96--229.77 GB/s, with
+2 MiB pages on NUMA node 4. Full-range SDOT also remained above 200 GB/s.
+The acceptance script now enforces >200 GB/s for both arithmetic paths.
+
+The initial pipeline placed all next-step lookups at the end and reached only
+198.21/198.28 GB/s (INT4/FP4). Reducing activation pointer updates through
+two-step offsets regressed to 186.76/186.77 despite healthy paired reads.
+Interleaving lookup and FMA pairs was the successful change. The instruction
+count alone therefore did not predict throughput; the dependency schedule
+mattered. The residual gap to read-only bandwidth has not been attributed to
+an individual execution port.
+
+Scalar half-FMADD, original-kernel, and exhaustive INT16 regressions all pass.
+FP16 rounding remains bit-identical, including signed zero, subnormals,
+cancellation, and overflow; this does not improve FP16's numerical range.
+These are still unscaled M=1 probes. Full results and rejected schedules are
+in [RESULTS.md](../dequant-pipe/RESULTS.md); raw acceptance logs are under
+`tmp/dequant/w4a16-acceptance.s5EThb/`.
+
 ### Establish placement before judging arithmetic
 
 The initial bounded radix-256 kernel was incorrectly rejected after a

@@ -145,11 +145,17 @@ The W4A16 extension covers both signed INT4 and E2M1 FP4:
   consumed by FP16 FMA without an expanded-weight store. This experimental
   kernel accumulates in FP16 and therefore needs a production overflow/error
   gate, just like the staged FP16 route.
-- `--path fp16 --kernel opt2` is the selected FP16 kernel. Widening byte
+- `--path fp16 --kernel opt2` is the earlier FP16 table kernel. Widening byte
   loads, register masking, and halfword table lookup decode directly to FP16,
   eliminating `sunpk` and `scvtf`. Two K steps use separate temporary
   registers while retaining the original sequential FMA order.
   `--kernel opt` exposes the slightly slower one-K version.
+
+- `--path fp16 --kernel f16pipe` is the selected FP16 kernel. A cross-K
+  pipeline interleaves current-step FMA pairs with next-step table lookups,
+  while preserving the four-block layout and sequential FP16 rounding.
+  Three-launch medians are 204.07--204.13 GB/s for INT4 and
+  204.02--204.07 GB/s for FP4, with bit-exact scalar/original comparisons.
 
 These are unscaled compute-kernel bandwidth probes. They demonstrate direct
 dequantization and arithmetic, but a production block-quantized GEMV must add
@@ -157,7 +163,8 @@ scale application and a wider accumulation policy where model accuracy
 requires it.
 
 The optimized paths passed three independent launches for both formats:
-full-range SDOT exceeds 200 GB/s and FP16 exceeds 150 GB/s in every launch.
+full-range SDOT and the selected FP16 pipeline both exceed 200 GB/s in every
+launch. The old `opt2` kernel remains a roughly 172 GB/s comparator.
 Run the complete acceptance procedure with:
 
 ```sh

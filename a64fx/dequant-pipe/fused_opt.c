@@ -119,12 +119,14 @@ int verify_fused_opt(void)
         else fused_i4_f16_m1_k4_super_sve(packed, a, legacy);
         if (memcmp(legacy, ref, sizeof(ref)) != 0)
             return fprintf(stderr, "legacy FP16 reference mismatch f=%d pass=%d\n", f, pass), -1;
-        for (int u = 1; u <= 2; ++u) {
+        for (int u = 1; u <= 3; ++u) {
             if (f) {
                 if (u == 1) fused_fp4_f16_opt1_sve(packed, a, got);
+                else if (u == 3) fused_fp4_f16_pipe_sve(packed, a, got);
                 else fused_fp4_f16_opt2_sve(packed, a, got);
             } else {
                 if (u == 1) fused_i4_f16_opt1_sve(packed, a, got);
+                else if (u == 3) fused_i4_f16_pipe_sve(packed, a, got);
                 else fused_i4_f16_opt2_sve(packed, a, got);
             }
             for (int i = 0; i < 256; ++i) {

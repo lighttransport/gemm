@@ -252,7 +252,7 @@ Q38TP_RANK=0 Q38TP_SIZE=4 ./a64fx/llm/build/qwen38_kquant_stage \
   /path/to/ACTUAL_KQUANT_STAGE
 ```
 
-## Resume prompt
+## Resume prompts
 
 ### A64FX W4A16 fused-kernel follow-up (2026-09-20)
 
@@ -283,6 +283,121 @@ Recorded logs: `tmp/dequant/w4a16-acceptance.ByB7iv/`; details are in
 `a64fx/dequant-pipe/RESULTS.md` and `a64fx/doc/fused-dequant.md`.
 These are unscaled M=1 kernel rates. Production scale epilogues, arbitrary
 tails, model integration, and wider FP accumulation remain separate work.
+
+### Completed task: FP16 FMA above 200 GB/s
+
+Completed natively on 2026-09-20. The selected `--path fp16 --kernel f16pipe`
+uses a genuine cross-K pipeline with alternating current FMA / next TBL pairs,
+preserving the original layout and ascending-K FP16 rounding bit-for-bit.
+Three fresh launch medians (GB/s): INT4 **204.07 / 204.13 / 204.11**;
+FP4 **204.02 / 204.07 / 204.03**. Paired reads: 227.96--229.77 GB/s;
+2 MiB pages, NUMA node 4, CPUs 12--23, all at 2.0 GHz.
+The raised >200 GB/s FP16 and full-range SDOT gates pass in all launches:
+`acceptance=PASS qualified=18/18 SDOT=6 FP16=6 failed_targets=0`.
+
+Reproduce with `TMPDIR="$PWD/tmp/dequant" make -C a64fx/dequant-pipe test CC=fcc`
+and `bash a64fx/dequant-pipe/run_w4a16_acceptance.sh`.
+Tests include scalar/original bit-exact FP16 and exhaustive full-range INT16.
+Raw acceptance: `tmp/dequant/w4a16-acceptance.s5EThb/`.
+`RESULTS.md` records all medians, commands, and rejected schedules: putting
+all lookups at the end reached ~198 GB/s; reducing activation pointer updates
+regressed to ~187 GB/s. Both had qualified placement. Original kernels remain
+available; no layout changes or 64-byte-load experiment was needed.
+Production scales, tails, model integration, and wider accumulation remain
+separate future work. The following is the completed task's original brief.
+
+```text
+Continue optimizing the A64FX fused W4A16 FP16-FMA kernel toward more than
+200 GB/s of packed weight input for BOTH signed INT4 and E2M1 FP4 on one
+12-core CMG. Work directly on the native A64FX node in this Git repository.
+Read AGENTS.md, this resume file, and the focused sources/docs first; inspect
+git status/diffs and preserve unrelated edits. Use repository-local
+tmp/dequant/ for scratch and logs, never /tmp or /local. This is single-node
+kernel work; do not resume the unrelated Qwen TP4 task below.
+
+Starting point: commit a6d8c053, "Reach A64FX W4A16 SDOT and FP16 bandwidth
+targets". Both original targets are accepted: full-range SDOT reaches
+219.44--220.09 GB/s for INT4 and 214.23--215.45 for FP4; FP16 reaches
+171.84--172.04 and 172.08--172.18 respectively. The new task raises the FP16
+target from 150 to 200 GB/s. More than 200 GB/s for FP16 is plausible but has
+NOT been demonstrated.
+
+Read a64fx/dequant-pipe/kernels_opt.S, bench_fused_sdot.c, fused_opt.c/.h,
+run_w4a16_acceptance.sh, README.md, RESULTS.md, and
+a64fx/doc/fused-dequant.md. The selected FP16 path is --path fp16 --kernel
+opt2; opt is the one-K comparator, and super is the original conversion
+kernel. The fixed SVE512 layout interleaves four K=128, N=64 blocks. Each
+K/block consumes 32 bytes; low/high nibbles encode columns 0--31/32--63.
+LD1B .h widens bytes, register AND and LSR extract codes, TBL .h produces
+exact FP16 weight bits, and FMLA .h updates eight output accumulators.
+FP4 uses the doubled E2M1 lattice with the eventual scale factor left to the
+caller. Existing benchmarks omit model block scales.
+
+Preserve ascending-K sequential FP16 FMA rounding BIT-FOR-BIT. Do not use
+reassociated partial sums, quantize activations, change accumulation type,
+or clip inputs to claim the target. Keep the accepted SDOT paths correct.
+
+Attack in this order:
+1. Implement a genuine cross-K software pipeline. The current opt2 kernel
+   mainly unrolls two steps using separate temporary registers; it does not
+   explicitly interleave next-step loads/lookup with current-step FMA.
+   Preserve prologue/drain correctness and the per-output K order.
+2. Reduce activation-load/address overhead by loading upcoming activations
+   early and using offsets to reduce pointer updates. Inspect the actual
+   instructions and register allocation; avoid spills and indexed-FMA
+   substitutions that cost more on A64FX.
+3. If still short, compare full 64-byte packed loads and alternative nibble
+   extraction/layout schedules. Keep any changed layout explicit and include
+   its correct packer/reference; never benchmark one layout using another's
+   interpretation. Preserve original kernels as comparison paths.
+
+The current loop has about 48 arithmetic instructions per 256 packed bytes,
+including 16 table lookups. The previous arithmetic-only roofline retained
+about 230 GB/s at 48 operations, but this does NOT prove the mixed lookup/FMA
+loop can do so: TBL pressure, load latency, and dependencies must be measured.
+Use instruction/port analysis and native measurements to choose schedules.
+
+Validate each candidate against scalar half-precision FMADD and the original
+kernel using the existing bit-exact tests: fractional inputs, signed zero,
+subnormals, cancellation, and overflow. Keep the exhaustive full-range SDOT
+checks passing. Build/test with:
+  TMPDIR="$PWD/tmp/dequant" make -C a64fx/dequant-pipe test CC=fcc
+
+Benchmark with startup affinity established BEFORE XOS initialization:
+  taskset -c 12 env \
+    LD_PRELOAD=/opt/FJSVxos/mmm/lib64/libmpg.so.1 \
+    XOS_MMM_L_HPAGE_TYPE=hugetlbfs XOS_MMM_L_HUGETLB_SZ=2M \
+    XOS_MMM_L_HUGE_MALLOC=1 XOS_MMM_L_FORCE_MMAP_THRESHOLD=1 \
+    XOS_MMM_L_HUGETLB_FALLBACK=0 \
+    ./a64fx/dequant-pipe/bench_fused_sdot \
+    --format int4 --path fp16 --kernel opt2 \
+    --cores 12 --core-base 12 --mib 240 --iterations 10 --trials 5 \
+    --paired-baseline --compare-kernels
+Repeat for --format fp4 and substitute the candidate selector as needed.
+Record actual page size, NUMA placement, and CPU frequency. The accepted
+baseline used 2 MiB pages, NUMA node 4, CPUs 12--23, and 2.0 GHz.
+
+Acceptance: both formats must exceed 200 GB/s MEDIAN packed-weight bandwidth
+in each of three fresh launches, five timed trials per launch. Require
+same-allocation read controls before/after to exceed 220 GB/s; retain and
+label all slow-placement runs. Do not mistake logical Gweight/s or best-only
+measurements for acceptance. The old roughly 120 GB/s radix-256 rejection
+was caused by placement; startup pinning resolved it.
+
+Extend run_w4a16_acceptance.sh for the new FP16 candidate and >200 GB/s gate.
+Its existing FP16 >150 GB/s PASS is only the old regression threshold.
+Keep full-range SDOT >200 GB/s checks. Previous raw acceptance logs are in
+tmp/dequant/w4a16-acceptance.ByB7iv/.
+
+Once measured, update RESULTS.md, README.md, the fused-dequant blog, and this
+resume file with commands, numerical guarantees, all launch medians, and
+rejected schedules with controlled evidence. If the target remains unmet,
+state the best validated result and measured bottleneck explicitly. Run
+git diff --check, commit only focused changes, report the hash, and do not
+push.
+```
+
+### Separate Qwen TP4 task (not the current single-node objective)
 
 ```text
 Continue the active goal in resume-dequant.md: finish and accept safe rank-local

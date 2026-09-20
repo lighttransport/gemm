@@ -27,7 +27,7 @@ extern void fused_fp4_f16_m1_k4_super_sve(const uint8_t *, const _Float16 *, _Fl
 
 typedef enum { PATH_I8, PATH_I16, PATH_I16X8, PATH_F16, PATH_FULL } path_kind;
 typedef enum { FORMAT_I4, FORMAT_FP4 } format_kind;
-typedef enum { KERNEL_SHIFT, KERNEL_LUT, KERNEL_PIPE, KERNEL_SUPER, KERNEL_OPT, KERNEL_OPT2 } kernel_kind;
+typedef enum { KERNEL_SHIFT, KERNEL_LUT, KERNEL_PIPE, KERNEL_SUPER, KERNEL_OPT, KERNEL_OPT2, KERNEL_F16PIPE } kernel_kind;
 typedef void (*fused_i8_fn)(const uint8_t *, const int8_t *, int32_t *);
 
 static fused_i8_fn select_i8_kernel(kernel_kind kernel)
@@ -45,6 +45,7 @@ static const char *kernel_name(kernel_kind kernel)
     if (kernel == KERNEL_SUPER) return "super";
     if (kernel == KERNEL_OPT) return "opt";
     if (kernel == KERNEL_OPT2) return "opt2";
+    if (kernel == KERNEL_F16PIPE) return "f16pipe";
     return "shift";
 }
 
@@ -170,6 +171,11 @@ static void *run_worker(void *opaque)
                             fused_fp4_f16_opt1_sve(w->packed + offset, w->activation, outf16);
                         else
                             fused_i4_f16_opt1_sve(w->packed + offset, w->activation, outf16);
+                    } else if (w->kernel == KERNEL_F16PIPE) {
+                        if (w->format == FORMAT_FP4)
+                            fused_fp4_f16_pipe_sve(w->packed + offset, w->activation, outf16);
+                        else
+                            fused_i4_f16_pipe_sve(w->packed + offset, w->activation, outf16);
                     } else if (w->kernel == KERNEL_OPT2) {
                         if (w->format == FORMAT_FP4)
                             fused_fp4_f16_opt2_sve(w->packed + offset, w->activation, outf16);
@@ -383,7 +389,7 @@ static int verify(kernel_kind kernel_kind)
 
 static void usage(const char *name)
 {
-    fprintf(stderr, "usage: %s [--format int4|fp4] [--path int8|int16|int16x8|int16x8-full|fp16] [--kernel shift|lut|pipe|super|opt|opt2] [--cores N] [--mib N] "
+    fprintf(stderr, "usage: %s [--format int4|fp4] [--path int8|int16|int16x8|int16x8-full|fp16] [--kernel shift|lut|pipe|super|opt|opt2|f16pipe] [--cores N] [--mib N] "
                     "[--iterations N] [--trials N] [--core-base N] [--skew-kib N] [--paired-baseline] [--compare-kernels] [--verify]\n", name);
 }
 
@@ -429,6 +435,7 @@ int main(int argc, char **argv)
             else if (!strcmp(optarg, "pipe")) kernel = KERNEL_PIPE;
             else if (!strcmp(optarg, "super")) kernel = KERNEL_SUPER;
             else if (!strcmp(optarg, "opt")) kernel = KERNEL_OPT;
+            else if (!strcmp(optarg, "f16pipe")) kernel = KERNEL_F16PIPE;
             else if (!strcmp(optarg, "opt2")) kernel = KERNEL_OPT2;
             else { usage(argv[0]); return 2; }
             break;
@@ -455,8 +462,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "opt kernels require int16, fp16 or int16x8-full\n");
         return 2;
     }
-    if (kernel == KERNEL_OPT2 && path != PATH_F16) {
-        fprintf(stderr, "opt2 requires fp16\n");
+    if (kernel >= KERNEL_OPT2 && path != PATH_F16) {
+        fprintf(stderr, "opt2/f16pipe require fp16\n");
         return 2;
     }
     if (path == PATH_FULL && kernel != KERNEL_OPT) {

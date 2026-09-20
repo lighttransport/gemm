@@ -22,4 +22,6 @@ void fused_i4_f16_opt1_sve(const uint8_t *, const _Float16 *, _Float16 *);
 void fused_fp4_f16_opt1_sve(const uint8_t *, const _Float16 *, _Float16 *);
 void fused_i4_f16_opt2_sve(const uint8_t *, const _Float16 *, _Float16 *);
 void fused_fp4_f16_opt2_sve(const uint8_t *, const _Float16 *, _Float16 *);
+void fused_i4_f16_pipe_sve(const uint8_t *, const _Float16 *, _Float16 *);
+void fused_fp4_f16_pipe_sve(const uint8_t *, const _Float16 *, _Float16 *);
 #endif
