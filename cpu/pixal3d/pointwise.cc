@@ -40,6 +40,25 @@ PX_AVX2 static void round_range(float *x, size_t n, int precision) {
     for (; i < n; ++i)
         x[i] = rounded(x[i], precision);
 }
+PX_AVX2 static void bias_round_row(float *x, const float *bias, int columns,
+                                   int precision, bool bias_is_rounded) {
+    int i = 0;
+    for (; i + 8 <= columns; i += 8) {
+        __m256 value = _mm256_loadu_ps(x + i);
+        if (bias) {
+            __m256 add = _mm256_loadu_ps(bias + i);
+            if (!bias_is_rounded)
+                add = round_vector(add, precision);
+            value = _mm256_add_ps(value, add);
+        }
+        _mm256_storeu_ps(x + i, round_vector(value, precision));
+    }
+    for (; i < columns; ++i) {
+        float value = x[i] + (bias ? (bias_is_rounded ? bias[i] :
+                                     rounded(bias[i], precision)) : 0);
+        x[i] = rounded(value, precision);
+    }
+}
 PX_AVX2 static void residual_row(float *x, const float *h, const float *gate, int c, bool bf) {
     int i = 0;
     for (; i + 8 <= c; i += 8) {
@@ -105,6 +124,28 @@ void round_precision(Vec &x, int precision) {
 #endif
         for (size_t i = start; i < start + n; ++i)
             x[i] = rounded(x[i], precision);
+    }
+}
+void bias_round(float *x, const float *bias, int rows, int columns, int precision,
+                bool bias_is_rounded) {
+    require(x && rows > 0 && columns > 0, "Invalid bias/round dimensions");
+    bool vector = vector_available();
+#pragma omp parallel for schedule(static) if (size_t(rows) * columns >= 65536)
+    for (int row = 0; row < rows; ++row) {
+        float *values = x + size_t(row) * columns;
+#if defined(__x86_64__)
+        if (vector) {
+            bias_round_row(values, bias, columns, precision, bias_is_rounded);
+            continue;
+        }
+#else
+        (void)vector;
+#endif
+        for (int i = 0; i < columns; ++i) {
+            float value = values[i] + (bias ? (bias_is_rounded ? bias[i] :
+                                               rounded(bias[i], precision)) : 0);
+            values[i] = rounded(value, precision);
+        }
     }
 }
 void round_bf16(Vec &x) { round_precision(x, 1); }

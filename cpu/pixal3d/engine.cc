@@ -29,6 +29,12 @@ Weights::~Weights() {
 bool Weights::has(const std::string &name) const {
     return safetensors_find(st, name.c_str()) >= 0;
 }
+int Weights::storage_precision(const std::string &name) const {
+    int i = safetensors_find(st, name.c_str());
+    require(i >= 0, "Missing tensor: " + name);
+    const char *dtype = safetensors_dtype(st, i);
+    return !std::strcmp(dtype, "BF16") ? 1 : !std::strcmp(dtype, "F16") ? 2 : 0;
+}
 std::vector<int> Weights::shape(const std::string &name) const {
     int i = safetensors_find(st, name.c_str());
     require(i >= 0, "Missing tensor: " + name);
@@ -156,20 +162,28 @@ void Engine::gemm(float *out, const float *x, const float *w, const float *b, in
         w = bw.data();
     }
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, co, ci, 1, x, ci, w, ci, 0, out, co);
-    for (size_t i = 0; i < size_t(n) * co; ++i) {
-        if (b)
-            out[i] += rounded(b[i % co], bf);
-        if (bf)
-            out[i] = rounded(out[i], bf);
-    }
+    bias_round(out, b, n, co, bf);
 }
 Vec Engine::linear(const Vec &x, Weights &w, const std::string &name, int bf) {
     auto s = w.shape(name + ".weight");
     require(s.size() == 2 && x.size() % s[1] == 0, "Invalid linear shape: " + name);
     int n = int(x.size() / s[1]);
     Vec out(size_t(n) * s[0]);
-    gemm(out.data(), x.data(), w.get(name + ".weight"),
-         w.has(name + ".bias") ? w.get(name + ".bias") : nullptr, n, s[0], s[1], bf);
+    std::string weight_name = name + ".weight", bias_name = name + ".bias";
+    const float *weight = w.get(weight_name);
+    const float *bias = w.has(bias_name) ? w.get(bias_name) : nullptr;
+    // BF16/F16 safetensors convert to exactly representable F32 values.
+    // Avoid allocating and re-rounding immutable weights on every CPU call.
+    if (!gpu_ && bf && w.storage_precision(weight_name) == bf) {
+        Vec rounded_x = x;
+        round_precision(rounded_x, bf);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, s[0], s[1], 1,
+                    rounded_x.data(), s[1], weight, s[1], 0, out.data(), s[0]);
+        bool exact_bias = bias && w.storage_precision(bias_name) == bf;
+        bias_round(out.data(), bias, n, s[0], bf, exact_bias);
+    } else {
+        gemm(out.data(), x.data(), weight, bias, n, s[0], s[1], bf);
+    }
     return out;
 }
 void Engine::attention(float *out, const float *q, const float *k, const float *v, int n, int m, int heads,
@@ -182,11 +196,11 @@ void Engine::attention(float *out, const float *q, const float *k, const float *
     // Larger host tiles amortize BLAS dispatch without materializing N x N.
     // The GPU plugin retains its independent, smaller device workspace tiles.
     const int tile = 1024, c = heads * d;
+    Vec scores(size_t(std::min(tile, n)) * m);
     // Query tiling bounds memory while each query still attends to every key.
     for (int h = 0; h < heads; ++h)
         for (int start = 0; start < n; start += tile) {
             int rows = std::min(tile, n - start);
-            Vec scores(size_t(rows) * m);
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, rows, m, d, 1 / std::sqrt(float(d)),
                         q + size_t(start) * c + h * d, c, k + h * d, c, 0, scores.data(), m);
 #pragma omp parallel for schedule(static) if (size_t(rows) * m >= 65536)

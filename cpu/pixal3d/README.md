@@ -43,6 +43,15 @@ with `pixal3d_default_gpu_options`, then applied with `pixal3d_configure_gpu`
 before generation. The original options/result layouts are unchanged. Rebuild
 both the host library and GPU plugins together for resident execution.
 
+## CPU fallback
+
+The CPU path uses OpenBLAS plus runtime-dispatched AVX2/F16C pointwise kernels.
+Immutable BF16/F16 weights are converted once and consumed directly without a
+second no-op rounding copy. Attention score storage is bounded to one query
+tile and reused across heads. The retained all-30-block benchmark improves the
+recorded 256-token shape-1024 median by 12.5% with byte-identical output; see
+[the CPU measurements](OPTIMIZATION.md#cpu-fallback).
+
 ## Build
 
 Run from the repository root. Requirements: Linux x86-64, GCC 12+ or a Clang compiler with `_Float16`, C++17, OpenMP,

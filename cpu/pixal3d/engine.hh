@@ -34,6 +34,8 @@ inline float rounded(float x, int precision) {
     return precision == 1 ? bf16(x) : precision == 2 ? fp16(x) : x;
 }
 void round_precision(Vec &x, int precision);
+void bias_round(float *x, const float *bias, int rows, int columns, int precision,
+                bool bias_is_rounded = false);
 void add_residual(Vec &x, const Vec &h, const float *gate, int channels, bool bf);
 void apply_modulation(Vec &x, const Vec &mod, int offset, int channels, bool bf);
 void gelu(Vec &x, bool approximate, int precision = 0);
@@ -45,6 +47,7 @@ struct Weights {
     ~Weights();
     Weights(const Weights &) = delete;
     const float *get(const std::string &name);
+    int storage_precision(const std::string &name) const;
     std::vector<int> shape(const std::string &name) const;
     bool has(const std::string &name) const;
 };

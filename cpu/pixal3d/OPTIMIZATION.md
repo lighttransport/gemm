@@ -134,6 +134,31 @@ default. Both 1K and 4K outputs pass mesh, normal, texture, and material
 validation. This option changes output fidelity and remains opt-in; 4K/1M is
 the default used for reference-quality comparisons.
 
+### CPU fallback
+
+The CPU linear path no longer copies and rounds immutable weights when their
+safetensors storage already matches the requested BF16 or FP16 compute type.
+Converted BF16/F16 values are exactly representable in F32, so the removed
+round is a no-op. Output bias addition and precision rounding now use the
+existing runtime-dispatched AVX2 implementation with row-parallel OpenMP, and
+host attention reuses one score allocation across heads and query tiles.
+
+On the recorded CUDA-house shape-1024 fixture, 256 tokens, all 30 flow blocks,
+eight threads, and two or three warm observations, the prior binary's median
+was 6.8984 s and the optimized binary's median was 6.0341 s, a 12.5% reduction.
+The complete output tensors were byte-identical. The corresponding three-block
+median fell from 0.7233 s to 0.6462 s (10.7%). This path creates no persistent
+rounded-weight cache and therefore adds no retained model memory.
+
+Reproduce the all-block comparison with:
+
+```sh
+ref/pixal3d/run.sh cpu ref/pixal3d/benchmark_flow_block.py \
+  --backend cpu --dump-dir tmp/pixal3d/resident-runs/cuda-house/dumps \
+  --stage shape1024 --blocks 30 --repeats 3 --tokens 256 --threads 8 \
+  --output tmp/pixal3d/cpu-opt/optimized-simd-30.safetensors
+```
+
 Reproduce the constrained full run with:
 
 ```sh
