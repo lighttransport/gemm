@@ -352,7 +352,7 @@ class PixalServer:
         self.work_dir = Path(args.work_dir).resolve()
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.locks = {backend: threading.Lock() for backend in ("cpu", "cuda", "rocm")}
-        self.reference_script = ROOT / "ref/pixal3d/upstream/inference.py"
+        self.reference_script = ROOT / "ref/pixal3d/run_reference_sv.py"
         self.reference_mv_script = ROOT / "ref/pixal3d/run_reference_mv.py"
         self.reference_mv_upstream = ROOT / "ref/pixal3d/upstream/inference_mv.py"
         self.python_launcher = ROOT / "ref/pixal3d/run.sh"

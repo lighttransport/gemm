@@ -255,6 +255,8 @@ ref/pixal3d/run_reference_cuda310.sh cuda ref/pixal3d/run_reference_mv.py \
   --output tmp/pixal3d/reference-mv/mesh.glb \
   --model_path /mnt/disk2/models/Pixal3D --seed 42 --low_vram --resolution 1024
 ```
+Single-view reference inference uses the same compatibility layer through
+`run_reference_sv.py` and accepts RGBA inputs without loading RMBG.
 This environment is separate from the per-backend validation environments so
 the native-versus-PyTorch checks retain their newer PyTorch setup. The setup
 pins Torch 2.7.1/cu128 for `sm_120`, rebuilds Torch-ABI extensions from pinned
