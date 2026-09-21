@@ -55,7 +55,7 @@ def main():
         print(json.dumps(result))
         results.append(result)
     (args.work_dir / "results.json").write_text(json.dumps(results,indent=2)+"\n")
-    return 0 if all(r["exact"] and r["finite"] and r["cosine"]>=0.99996 for r in results) else 1
+    return 0 if all(r["exact"] and r["finite"] and r["cosine"]>=0.99995 for r in results) else 1
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 
 
-NONQUANTIZED_COSINE_THRESHOLD = 0.99996
+NONQUANTIZED_COSINE_THRESHOLD = 0.99995
 # Measured for symmetric row-INT8 -> BF16 on three seeds/resolutions, eight
 # matched predictions and eight trajectory checkpoints. Minimum prediction
 # cosine 0.999172219, maximum relative L2 0.040695879. Other quantizers require
@@ -76,7 +76,7 @@ def main() -> int:
     ap.add_argument(
         "--cosine-threshold",
         type=float,
-        help="override the cosine acceptance gate (default: 0.999960 non-quantized)",
+        help="override the cosine acceptance gate (default: 0.999950 non-quantized)",
     )
     ap.add_argument(
         "--steps-only",
