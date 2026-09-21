@@ -278,6 +278,15 @@ Remaining optimization items, in measured priority order:
    47.87--47.93 tok/s, but remains below 60 tok/s and falls to 28.82 tok/s at
    real random-token 64K depth.
 
+2026-09-22 continuation: the one-row IQ2/IQ3/IQ4 kernels now declare their
+output, weight, activation, and scale buffers non-aliasing.  This preserves
+the existing dot and reduction order while giving HIPRTC safe load scheduling.
+The final build passes the random 16K gate at 41.47 tok/s with prefix hash
+`2cd51a0159d12ee0` and suffix hash `d70e119a6c94bc4c`; a random 64K run remains
+exact at 35.80 tok/s (prefill 443.99 tok/s, prefix `90178de69a24a76e`, suffix
+`7463f176c9b85ba3`).  The gain is small, so the grouped/mixed projection work
+in item 1 remains open; no production tuning defaults changed.
+
 The resident Qwen3.8/DFlash2 server now has request-owned, bounded
 multi-context state. `REQ3` carries a hashed cache namespace, and the HTTP
 shim derives it from `prompt_cache_key`, conversation/session metadata, or

@@ -40,8 +40,9 @@ __device__ __forceinline__ unsigned int qwen35_iq4_lookup(unsigned int indices) 
 }
 
 extern "C" __global__ void qwen35_matvec_iq4xs(
-        float *out, const unsigned char *weights, const signed char *q,
-        const float *scales, int rows, int cols) {
+        float *__restrict__ out, const unsigned char *__restrict__ weights,
+        const signed char *__restrict__ q, const float *__restrict__ scales,
+        int rows, int cols) {
     int lane = threadIdx.x & 31;
     int linear = blockIdx.y * gridDim.x + blockIdx.x;
     int token = linear % gridDim.y;
@@ -81,8 +82,9 @@ extern "C" __global__ void qwen35_matvec_iq4xs(
 }
 
 extern "C" __global__ void qwen35_matvec_iq2xxs(
-        float *out, const unsigned char *weights, const signed char *q,
-        const float *scales, int rows, int cols) {
+        float *__restrict__ out, const unsigned char *__restrict__ weights,
+        const signed char *__restrict__ q, const float *__restrict__ scales,
+        int rows, int cols) {
     __shared__ unsigned long long grid_cache[256];
     for (int i = threadIdx.x; i < 256; i += blockDim.x)
         grid_cache[i] = qwen35_iq2xxs_grid[i];
@@ -122,8 +124,9 @@ extern "C" __global__ void qwen35_matvec_iq2xxs(
 }
 
 extern "C" __global__ void qwen35_matvec_iq2xs(
-        float *out, const unsigned char *weights, const signed char *q,
-        const float *scales, int rows, int cols) {
+        float *__restrict__ out, const unsigned char *__restrict__ weights,
+        const signed char *__restrict__ q, const float *__restrict__ scales,
+        int rows, int cols) {
     __shared__ unsigned long long grid_cache[512];
     for (int i = threadIdx.x; i < 512; i += blockDim.x)
         grid_cache[i] = qwen35_iq2xs_grid[i];
@@ -164,8 +167,9 @@ extern "C" __global__ void qwen35_matvec_iq2xs(
 }
 
 extern "C" __global__ void qwen35_matvec_iq2s(
-        float *out, const unsigned char *weights, const signed char *q,
-        const float *scales, int rows, int cols) {
+        float *__restrict__ out, const unsigned char *__restrict__ weights,
+        const signed char *__restrict__ q, const float *__restrict__ scales,
+        int rows, int cols) {
     int lane = threadIdx.x & 31;
     int linear = blockIdx.y * gridDim.x + blockIdx.x;
     int token = linear % gridDim.y;
@@ -202,8 +206,9 @@ extern "C" __global__ void qwen35_matvec_iq2s(
 }
 
 extern "C" __global__ void qwen35_matvec_iq3xxs(
-        float *out, const unsigned char *weights, const signed char *q,
-        const float *scales, int rows, int cols) {
+        float *__restrict__ out, const unsigned char *__restrict__ weights,
+        const signed char *__restrict__ q, const float *__restrict__ scales,
+        int rows, int cols) {
     __shared__ unsigned int grid_cache[256];
     for (int i = threadIdx.x; i < 256; i += blockDim.x)
         grid_cache[i] = qwen35_iq3xxs_grid[i];
@@ -242,8 +247,9 @@ extern "C" __global__ void qwen35_matvec_iq3xxs(
 }
 
 extern "C" __global__ void qwen35_matvec_iq3s(
-        float *out, const unsigned char *weights, const signed char *q,
-        const float *scales, int rows, int cols) {
+        float *__restrict__ out, const unsigned char *__restrict__ weights,
+        const signed char *__restrict__ q, const float *__restrict__ scales,
+        int rows, int cols) {
     int lane = threadIdx.x & 31;
     int linear = blockIdx.y * gridDim.x + blockIdx.x;
     int token = linear % gridDim.y;
