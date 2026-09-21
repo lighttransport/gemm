@@ -37,6 +37,11 @@ The native Q2_K one-row kernel received the same `256, 1` bound for an A/B;
 it retained the exact 4K hashes at 42.91 tok/s without exceeding control, so
 the change was reverted.
 
+An opt-in IQ3_S K/V pair launch retained the exact C++ response and 4K hash,
+but measured 35.74 tok/s at random 64K versus 35.77 tok/s for the validated
+separate projections.  It was removed; long-context attention still dominates
+the saved small projection launch.
+
 ## Packed Q8/Q8 KV scales (2026-09-21)
 
 Q8 K/V cache scales now use the same rounded FP16 contract as the stored

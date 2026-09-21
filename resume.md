@@ -38,6 +38,12 @@ Native Q2_K was similarly tested with `__launch_bounds__(256, 1)`.  The 4K
 random gate retained `1c891c2232aa1b7f`/`f44846dacf013e9e` at 42.91 tok/s,
 which did not exceed the control, so it was reverted.
 
+An opt-in IQ3_S gated-attention K/V pair kernel preserved the pinned C++ hash
+and lifted the short random gate to 42.93 tok/s, but the sustained 64K gate
+was 35.74 tok/s versus 35.77 tok/s control with the same hashes.  The pair
+kernel and dispatch were removed because its launch saving does not survive
+the long-context attention cost.
+
 ## 2026-09-22 continuation: IQ1_M micro-tuning and fusion audit
 
 The default one-row IQ1_M F32 kernel now marks its output, weight and
