@@ -565,6 +565,7 @@ int main(int argc, char **argv) {
             if (!strcmp(mode, "reverse64")) qimg21_attention_reverse64 = 1;
             else if (!strcmp(mode, "math")) qimg21_attention_reverse64 = 0;
             else if (!strcmp(mode, "mma64")) {qimg21_attention_mma64=1;qimg21_attention_reverse64=0;}
+            else if (!strcmp(mode, "mma64-flash")) {qimg21_attention_mma64=2;qimg21_attention_reverse64=0;}
             else { fprintf(stderr, "native: attention must be math, reverse64, or mma64\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--prompt-embeds") && i + 1 < argc) prompt_path = argv[++i];
@@ -673,10 +674,16 @@ int main(int argc, char **argv) {
            cuModuleGetFunction(&k.final_ln,norm_module,"final_ln_vector"))return 1;
         k.norm_threads=128;
     }
-    if(qimg21_attention_mma64 &&
-       (cu_compile_kernels(&mma_module,r->device,q21_mma64_src,"qimg21_mma64.cu",verbose,"qimg21_mma64")<0 ||
-        cuModuleGetFunction(&k.mma_attention,mma_module,"q21_flash_reverse64") ||
-        cuFuncSetAttribute(k.mma_attention,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,4*64*136*2)))return 1;
+    if(qimg21_attention_mma64) {
+        size_t length=strlen(q21_mma64_src)+64;
+        char *source=malloc(length);
+        if(!source)return 1;
+        snprintf(source,length,"#define Q21_FLASH_SOFTMAX %d\n%s",qimg21_attention_mma64==2,q21_mma64_src);
+        int compiled=cu_compile_kernels(&mma_module,r->device,source,"qimg21_mma64.cu",verbose,"qimg21_mma64");
+        free(source);
+        if(compiled<0 || cuModuleGetFunction(&k.mma_attention,mma_module,"q21_flash_reverse64") ||
+           cuFuncSetAttribute(k.mma_attention,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,4*64*136*2))return 1;
+    }
     if (dump_dir) mkdir(dump_dir, 0755);
     if (pred_dir) mkdir(pred_dir, 0755);
     float *pred = (float *)malloc((size_t)ni * 64 * sizeof(float));

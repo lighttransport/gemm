@@ -569,6 +569,30 @@ Artifacts are `tmp/qimg21-rms-vector-{low,rect-low,512-low}`. These are isolated
 matched-input predictions, not a rerun of all trajectories or editing/CFG.
 No defaults or acceptance thresholds change. CPU tests remain 25/25 passing.
 
+The additional `--attention mma64-flash` option (Python wrappers:
+`--native-attention mma64-flash`) tests base-2 softmax with separately rounded
+score/max scaling and lane-local denominator sums reduced only at the end.
+This follows the numerical structure in
+[upstream FlashAttention softmax](https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/src/softmax.h),
+including its documented PyTorch unfused-scaling variant; it is not a claim
+of a bit-exact port of the installed backend. Replay with
+`test_bf16_attention STAGES LAYOUT OUT.npy --flash-softmax`.
+Saved editing-block Q/K/V target-region cosine improves from 0.999999997039
+to 0.999999998629, relative L2 from 7.70e-5 to 5.24e-5, and exact fraction
+from 99.9435% to 99.9739%. Original `--reverse64` replay remains bit-identical
+to its saved baseline. Text-only rows remain less exact (cosine 0.999999772809,
+92.6904% elementwise equality); scalar math is worse on these same inputs.
+Full matched low-timestep predictions with vector normalization and vector
+RMS improve to **0.999948668832** at 256x512/seed123 and **0.999948430099** at
+512x512/seed7, but both still fail 0.99996. Artifacts are under
+`tmp/qimg21-flash-softmax-{rect-low,512-low}` and `tmp/qimg21-edit-attn0`.
+All 25 CPU tests pass; broader trajectory/editing acceptance remains unproven.
+CPU dispatch profiling of this GPU replay confirms that both masked text
+segments use `aten::_scaled_dot_product_efficient_attention`, while condition
+and target image segments use `aten::_scaled_dot_product_flash_attention`.
+The trace is `tmp/qimg21-attention-backends.log`. Matching the masked-text
+backend's arithmetic is therefore a separate remaining parity task.
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh

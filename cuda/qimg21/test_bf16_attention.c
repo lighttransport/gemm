@@ -5,8 +5,8 @@
 #include "mma64_kernels.h"
 
 int main(int argc, char **argv) {
-    if(argc!=4 && !(argc==5 && !strcmp(argv[4],"--reverse64"))){
-        fprintf(stderr,"usage: %s STAGE_DIR LAYOUT.txt OUT.npy [--reverse64]\n",argv[0]);return 2;
+    if(argc!=4 && !(argc==5 && (!strcmp(argv[4],"--reverse64") || !strcmp(argv[4],"--flash-softmax")))){
+        fprintf(stderr,"usage: %s STAGE_DIR LAYOUT.txt OUT.npy [--reverse64|--flash-softmax]\n",argv[0]);return 2;
     }
     q21_joint_layout layout={0};
     int nt,ih,iw,rc=1;
@@ -31,7 +31,12 @@ int main(int argc, char **argv) {
     if(cuModuleGetFunction(&attention,r->module,"flash_attn_bf16_xq"))goto done;
     if(argc==5) {
         shared_bytes=4*64*136*2;
-        if(cu_compile_kernels(&mma_module,r->device,q21_mma64_src,"qimg21_mma64.cu",1,"qimg21_mma64")<0 ||
+        char *source=malloc(strlen(q21_mma64_src)+64);
+        if(!source)goto done;
+        snprintf(source,strlen(q21_mma64_src)+64,"#define Q21_FLASH_SOFTMAX %d\n%s",!strcmp(argv[4],"--flash-softmax"),q21_mma64_src);
+        int compiled=cu_compile_kernels(&mma_module,r->device,source,"qimg21_mma64.cu",1,"qimg21_mma64");
+        free(source);
+        if(compiled<0 ||
            cuModuleGetFunction(&attention,mma_module,"q21_flash_reverse64") ||
            cuFuncSetAttribute(attention,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,shared_bytes))goto done;
     }
