@@ -43,10 +43,20 @@ PyTorch-packed noise input for native denoiser comparisons.
 Current native BF16 arithmetic explicitly rounds the text projection before
 GELU and Q/K normalization before multiplication by the learned RMS weights.
 On the saved 256x256/seed42 two-step reference, matched-input denoiser cosine
-is 0.999985586 at timestep 1 and 0.999948850 at timestep 0.02001953125.
+is 0.999981133 at timestep 1 and 0.999955009 at timestep 0.02001953125.
 The latter **fails** the 0.99996 acceptance gate; full native parity remains
 unfinished. These are direct denoiser comparisons, not free-running trajectory
 or end-to-end quality guarantees.
+
+Timestep embedding, shared modulation, and final modulation use the same
+two-row `[real timestep, zero timestep]` GEMM shapes as PyTorch. Separate
+single-row GEMVs select different reduction paths: on the low-timestep
+fixture, batching the rows makes both timestep linear outputs and the
+shared modulation tensor bit-exact with the saved PyTorch stages. This also
+initializes the final scale for text rows, which previously reused unrelated
+scratch contents. Final normalization on identical hidden states and scales
+matches PyTorch at cosine 0.99999999919; remaining denoiser error accumulates
+upstream across the transformer blocks.
 
 The F32-to-BF16 weight loader also has a guarded-memory regression:
 

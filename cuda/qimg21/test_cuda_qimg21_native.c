@@ -309,7 +309,7 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
     /* tmp/bf are also the N*12288 SwiGLU activation hand-off buffers. */
     A(tmp,(size_t)N*12288*4); A(tmp2,(size_t)N*D*4); A(bf,(size_t)N*12288*2);
     A(q,(size_t)N*D*4); A(kk,(size_t)N*D*4); A(v,(size_t)N*D*4); A(att,(size_t)N*D*4); A(mlp0,(size_t)N*12288*4); A(mlp1,(size_t)N*12288*4);
-    A(temb,2*D*4); A(time0,256*4); A(timebf,256*2); A(mod,2*16384*4); A(scale,2*D*4);
+    A(temb,2*D*4); A(time0,512*4); A(timebf,512*2); A(mod,2*16384*4); A(scale,2*D*4);
     cuMemcpyHtoD(txt,prompt,(size_t)nt*D*4); cuMemcpyHtoD(img,latent,(size_t)ni*64*4);
     dump_stage("txt_input", txt, (size_t)nt * D, nt, D);
     dump_stage("img_input", img, (size_t)ni * 64, ni, 64);
@@ -330,32 +330,30 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
     /* The joint sequence is [text, image]. */
     cuMemcpyDtoD(hidden + (size_t)nt*D*4, tmp, (size_t)ni*D*4); cuCtxSynchronize();
     probe(r,"hidden",hidden,N*D); dump_stage("hidden0",hidden,(size_t)N*D,N,D);
-    /* sinusoidal timestep, cos half followed by sin half, time_factor=1000. */
-    float te[256]; for(int i=0;i<128;i++){float f=expf(-logf(10000.f)*(float)i/128.f),a=timestep*1000.f*f;te[i]=cosf(a);te[128+i]=sinf(a);} cuMemcpyHtoD(time0,te,sizeof(te));
-    if(launch_cast(r,timebf,time0,256)!=CUDA_SUCCESS||gemm(r,temb,w_t1,timebf,1,D,256)!=0||launch_vec(k->round_bf16,r->stream,D,temb)!=CUDA_SUCCESS)goto fail; probe(r,"time1",temb,D); dump_stage("time1",temb,D,1,D); if(launch_vec(k->silu,r->stream,D,temb)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,D,temb)!=CUDA_SUCCESS)goto fail;
-    if(launch_cast(r,bf,temb,D)!=CUDA_SUCCESS||gemm(r,temb,w_t2,bf,1,D,D)!=0||launch_vec(k->round_bf16,r->stream,D,temb)!=CUDA_SUCCESS)goto fail; probe(r,"time2",temb,D); dump_stage("time2",temb,D,1,D);
-    /* modulation receives the real timestep in row 0 and a true t=0
-     * sinusoidal embedding in row 1.  TimestepEmbedding's modulation
-     * Sequential starts with SiLU, so keep the unsquashed temb intact for
-     * norm_out and apply that activation to a scratch copy for this GEMM. */
-    float zt[256]={0}; for (int i=0;i<128;i++) zt[i]=1.0f;
-    cuMemcpyHtoD(time0,zt,sizeof(zt));
-    if(launch_cast(r,timebf,time0,256)!=CUDA_SUCCESS||gemm(r,scale,w_t1,timebf,1,D,256)!=0||launch_vec(k->round_bf16,r->stream,D,scale)!=CUDA_SUCCESS)goto fail;
-    probe(r,"zero1",scale,D);
-    if(launch_vec(k->silu,r->stream,D,scale)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,D,scale)!=CUDA_SUCCESS||launch_cast(r,bf,scale,D)!=CUDA_SUCCESS||gemm(r,scale,w_t2,bf,1,D,D)!=0||launch_vec(k->round_bf16,r->stream,D,scale)!=CUDA_SUCCESS)goto fail;
-    probe(r,"zero2",scale,D);
-    /* modulation.0 is a second SiLU after timestep_embedder.linear_2. */
-    if (launch_vec(k->silu,r->stream,D,scale)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,D,scale)!=CUDA_SUCCESS) goto fail;
-    probe(r,"scale_zero",scale,D);
-    cuMemcpyDtoD(tmp2,temb,(size_t)D*4); cuCtxSynchronize();
-    probe(r,"temb_copy",tmp2,D);
-    if (launch_vec(k->silu,r->stream,D,tmp2)!=CUDA_SUCCESS || launch_vec(k->round_bf16,r->stream,D,tmp2)!=CUDA_SUCCESS || launch_cast(r,bf,tmp2,D)!=CUDA_SUCCESS || launch_cast(r,bf+D*2,scale,D)!=CUDA_SUCCESS) goto fail;
-    /* Keep the two causal-condition rows as separate GEMMs.  Besides making
-     * the row hand-off explicit, this avoids relying on a row-major cuBLAS
-     * stride for the tiny 2-row modulation matrix on older drivers. */
-    if (gemm(r,mod,w_mod,bf,1,16384,D)!=0 ||
-        gemm(r,mod+(size_t)16384*4,w_mod,bf+(size_t)D*2,1,16384,D)!=0 ||
-        launch_vec(k->round_bf16,r->stream,2*16384,mod)!=CUDA_SUCCESS) goto fail;
+    /* Match the model's [real timestep, zero timestep] two-row GEMMs.
+     * Single-row GEMV dispatch has different reduction/rounding behavior. */
+    float te[512]={0};
+    for(int i=0;i<128;i++){
+        float f=expf(-logf(10000.f)*(float)i/128.f),a=timestep*1000.f*f;
+        te[i]=cosf(a);te[128+i]=sinf(a);te[256+i]=1.0f;
+    }
+    cuMemcpyHtoD(time0,te,sizeof(te));
+    if(launch_cast(r,timebf,time0,512)!=CUDA_SUCCESS ||
+       gemm(r,temb,w_t1,timebf,2,D,256)!=0 ||
+       launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS) goto fail;
+    dump_stage("time1",temb,2u*D,2,D);
+    if(launch_vec(k->silu,r->stream,2*D,temb)!=CUDA_SUCCESS ||
+       launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS ||
+       launch_cast(r,bf,temb,2*D)!=CUDA_SUCCESS ||
+       gemm(r,temb,w_t2,bf,2,D,D)!=0 ||
+       launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS) goto fail;
+    dump_stage("time2",temb,2u*D,2,D);
+    cuMemcpyDtoD(tmp2,temb,(size_t)2*D*4); cuCtxSynchronize();
+    if(launch_vec(k->silu,r->stream,2*D,tmp2)!=CUDA_SUCCESS ||
+       launch_vec(k->round_bf16,r->stream,2*D,tmp2)!=CUDA_SUCCESS ||
+       launch_cast(r,bf,tmp2,2*D)!=CUDA_SUCCESS ||
+       gemm(r,mod,w_mod,bf,2,16384,D)!=0 ||
+       launch_vec(k->round_bf16,r->stream,2*16384,mod)!=CUDA_SUCCESS) goto fail;
     probe(r,"mod",mod,2*16384); dump_stage("mod",mod,2u*16384u,2,16384);
     probe(r,"mod_zero",mod+(size_t)16384*4,16384);
     for(int bidx=0;bidx<32;bidx++){
@@ -382,8 +380,10 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
 fail_block: free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn);goto fail;
     }
     w_img=upload_bf16(s,"norm_out.linear.weight");w_proj=upload_bf16(s,"proj_out.weight");if(!w_img||!w_proj)goto fail;
-    /* norm_out.linear(SiLU(temb)) is the scale for target rows. */
-    if(launch_vec(k->silu,r->stream,D,temb)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,D,temb)!=CUDA_SUCCESS||launch_cast(r,bf,temb,D)!=CUDA_SUCCESS||gemm(r,scale,w_img,bf,1,D,D)!=0||launch_vec(k->round_bf16,r->stream,D,scale)!=CUDA_SUCCESS)goto fail;
+    /* Preserve both real and zero timestep rows through final modulation. */
+    if(launch_vec(k->silu,r->stream,2*D,temb)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS||launch_cast(r,bf,temb,2*D)!=CUDA_SUCCESS||gemm(r,scale,w_img,bf,2,D,D)!=0||launch_vec(k->round_bf16,r->stream,2*D,scale)!=CUDA_SUCCESS)goto fail;
+    dump_stage("final_hidden",hidden,(size_t)N*D,N,D);
+    dump_stage("final_scale",scale,2u*D,2,D);
     {void *a[]={&tmp,&hidden,&scale,&N,&D,&nt};cuLaunchKernel(k->final_ln,N,1,1,256,1,1,256*sizeof(double),r->stream,a,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail; dump_stage("final_ln",tmp,(size_t)N*D,N,D);}
     {CUdeviceptr dout=checked_cuMemAlloc((size_t)ni*64*4);if(!dout)goto fail;if(launch_cast(r,bf,tmp+(size_t)nt*D*4,ni*D)!=CUDA_SUCCESS){free_d(&dout);goto fail;} void *pa[]={&dout,&w_proj,&bf,&ni,&(int){64},&D}; if (cuLaunchKernel(k->proj,(ni*64+255)/256,1,1,256,1,1,0,r->stream,pa,NULL)!=CUDA_SUCCESS || launch_vec(k->round_bf16,r->stream,ni*64,dout)!=CUDA_SUCCESS){free_d(&dout);goto fail;}cuCtxSynchronize();cuMemcpyDtoH(out,dout,(size_t)ni*64*4); dump_stage("out",dout,(size_t)ni*64,ni,64);free_d(&dout);}
     result = 0;
