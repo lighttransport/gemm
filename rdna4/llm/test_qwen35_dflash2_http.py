@@ -57,10 +57,13 @@ def main():
     parser.add_argument("--sidecar", required=True)
     parser.add_argument("--runner", default="./rdna4/llm/test_hip_llm")
     parser.add_argument("--port", type=int, default=18090)
+    parser.add_argument("--context", type=int, default=512)
+    parser.add_argument("--long-prompt-tokens", type=int, default=0,
+                        help="also exercise a deterministic longer cached prompt")
     args = parser.parse_args()
     command = [
         "python3", "rdna4/llm/codex_server.py", args.model,
-        "--runner", args.runner, "--context", "512", "--port", str(args.port),
+        "--runner", args.runner, "--context", str(args.context), "--port", str(args.port),
         "--max-output", "8", "--qwen35-dflash2", args.sidecar,
         "--qwen35-dflash2-draft", "7",
     ]
@@ -104,7 +107,27 @@ def main():
             require(first.get("usage", {}).get("completion_tokens", 0) > 0, first)
             require(first_text == second["choices"][0]["message"]["content"],
                     "greedy request was not repeatable")
+            require(second.get("usage", {}).get("cached_tokens", 0) > 0,
+                    "repeated prompt did not report cache reuse")
             require(expected in first_text, first_text)
+
+        if args.long_prompt_tokens:
+            require(args.long_prompt_tokens > 0, args.long_prompt_tokens)
+            require(args.long_prompt_tokens + 32 < args.context,
+                    "long prompt must fit the selected context")
+            unit = ("C++ uses deterministic compilation, explicit ownership, and "
+                    "well-defined arithmetic. ")
+            long_text = (unit * ((args.long_prompt_tokens * 4) // len(unit) + 1))[:
+                args.long_prompt_tokens * 4]
+            long_body = {"messages": [{"role": "user", "content": long_text}],
+                         "temperature": 0, "max_tokens": 8}
+            long_a = post(args.port, long_body)
+            long_b = post(args.port, long_body)
+            require(long_a["choices"][0]["message"]["content"] ==
+                    long_b["choices"][0]["message"]["content"],
+                    "long cached prompt was not repeatable")
+            require(long_b.get("usage", {}).get("cached_tokens", 0) > 0,
+                    "long prompt did not report cache reuse")
 
         cancel_stream(args.port)
         time.sleep(1)
