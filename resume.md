@@ -8,9 +8,10 @@ scale-cache bandwidth without changing the quantization contract.  The
 reference attention gate remains bitwise clean across 49,188,864 comparisons,
 including 64K split and multi-query reuse cases.  A captured zero-depth decode
 completed 506 generated tokens at 43.1--43.2 tok/s with stable output.  The
-full random 64K runner gate should be repeated after the long-context
-allocation path is refreshed; the attention differential already covers the
-64K operator.
+full random 64K runner gate now completes with a 443.33 tok/s prefix and
+35.52 tok/s ordinary decode suffix, retaining prefix hash `90178de69a24a76e`
+and `Result: PASS`.  The ordinary 40 tok/s long-context target remains open;
+the attention differential is bitwise clean at 64K.
 
 ## Optimized native DFlash2 (2026-09-21)
 

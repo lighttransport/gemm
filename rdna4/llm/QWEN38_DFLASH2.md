@@ -9,8 +9,9 @@ Q8/Q8 arithmetic.  The exact differential test passes 49,188,864 bitwise
 comparisons, including 64K split counts and the multi-query reuse paths.  A
 graph-captured 506-token zero-depth run completed at 43.1--43.2 tok/s with
 stable output and `Result: PASS`.  The long-context operator differential is
-also clean; a full 64K runner gate still needs to be rerun after the next
-long-context allocation cleanup.
+also clean.  A real random 65,536-token depth run completed with a 443.33
+tok/s prefix and 35.52 tok/s ordinary decode suffix, retaining prefix hash
+`90178de69a24a76e`; the gate completed with `Result: PASS`.
 
 The Qwen3.8 runner can load the
 [IncoAI Qwen3.8-27B DFlash2 GGUF](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF)
