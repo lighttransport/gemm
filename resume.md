@@ -214,6 +214,8 @@ loopback test returned coherent output for both greedy and sampled requests;
 the DFlash sidecar currently replays each prompt because target snapshots do
 not yet include its private recurrent cache.  This favors output correctness
 over cache reuse until a sidecar snapshot is implemented.
+The reproducible GPU gate is `test_qwen35_dflash2_http.py`; it checks greedy
+and seeded sampled repeatability plus a coherent C++ response.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`

@@ -64,6 +64,15 @@ prompt because the sidecar's private recurrent cache is not part of target
 snapshots; this preserves output correctness at the cost of prompt-cache
 reuse.
 
+The opt-in HTTP quality gate covers deterministic greedy and seeded sampled
+requests, repeated-request state isolation, and a coherent C++ response:
+
+```sh
+python3 rdna4/llm/test_qwen35_dflash2_http.py \
+  --model /mnt/nvme02/models/qwen38/27b/gsq/Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf \
+  --sidecar /mnt/nvme02/models/qwen38/27b/dflash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+```
+
 The reference validator accepts the sidecar directly:
 
 ```sh
