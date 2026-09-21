@@ -432,8 +432,11 @@ reflects the remaining measured costs.
    weight staging.  The opt-in IQ1 Q8_1 audit now reuses the activation bytes
    and block sums across the IQ1_S gate and IQ1_M up pair; it raises the
    measured 65,536-depth suffix from 34.18 to 36.13 tok/s with the same
-   prefix/suffix hashes, but changes full logits and therefore remains
-   diagnostic until the sampled matrix is complete. A WMMA or reordered
+   prefix/suffix hashes.  The seeded temperature-0.6 C++ response also kept
+   sequence hash `630b7cbc72230e0d` and output SHA-256
+   `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac`.
+   It changes full logits and therefore remains diagnostic until the broader
+   logit matrix is complete. A WMMA or reordered
    reduction path needs full output-token and logit validation because the
    current kernels preserve the target arithmetic order.
 2. **Verifier attention tail.** The query-grid verifier now selects ordinary

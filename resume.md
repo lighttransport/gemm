@@ -14,8 +14,11 @@ file byte-for-byte (`44915ec1039a64c8`, output SHA-256
 same 4K/64-token exact gate it measured 42.24 tok/s versus 39.74 tok/s for
 the disabled control, and the random-token 65,536-depth gate retained prefix
 hash `90178de69a24a76e`, suffix hash `4f46d4fe27743a5b`, and measured
-36.13 tok/s versus 34.18 tok/s.  Production defaults remain unchanged until
-the broader sampled/logit quality matrix is rerun.
+36.13 tok/s versus 34.18 tok/s.  A seeded temperature-0.6 C++ run also
+retained the sampled sequence hash `630b7cbc72230e0d` and output SHA-256
+`ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac`.
+Production defaults remain unchanged until the broader sampled/logit quality
+matrix is rerun.
 
 A DFlash2 proposal probe also replaced the anchor-plus-mask IQ1_M embedding
 loop with one row-batched launch using the existing verifier kernel.  K=7
