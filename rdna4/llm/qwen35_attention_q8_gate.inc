@@ -1,7 +1,12 @@
 static const char qwen35_attention_q8_gate_source[] =
 "__device__ __forceinline__ int q8_gate_splits(int length, int heads, int nsm, int occupancy) {\n"
 "    int tiles = (length + 255) / 256;\n"
-"    if (length >= 16384) return min(128, max(occupancy, (length + 511) / 512));\n"
+"    if (length >= 16384) {\n"
+"        int splits = (length + 511) / 512;\n"
+"        if (length >= 65536 && length < 98304)\n"
+"            splits = min(splits, 64);\n"
+"        return min(128, max(occupancy, splits));\n"
+"    }\n"
 "    int result = min(occupancy, tiles), best = 0, waves_best = 0;\n"
 "    int blocks_per_wave = nsm * occupancy;\n"
 "    for (int trial = result; trial <= tiles; ++trial) {\n"
