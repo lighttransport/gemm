@@ -119,12 +119,12 @@ static int q21_npy_write_chw(const char *path, const float *x, size_t n,
     memset(body, ' ', (size_t)padded);
     memcpy(body, hdr, (size_t)len);
     body[padded - 1] = '\n';
-    fwrite("\x93NUMPY\x01\x00", 1, 8, fp);
     uint16_t hlen = (uint16_t)padded;
-    fwrite(&hlen, 2, 1, fp);
-    fwrite(body, 1, (size_t)padded, fp);
-    int ok = fwrite(x, sizeof(float), n, fp) == n ? 0 : -1;
-    fclose(fp);
+    int ok = fwrite("\x93NUMPY\x01\x00", 1, 8, fp) == 8 &&
+             fwrite(&hlen, 2, 1, fp) == 1 &&
+             fwrite(body, 1, (size_t)padded, fp) == (size_t)padded &&
+             fwrite(x, sizeof(float), n, fp) == n ? 0 : -1;
+    if (fclose(fp) != 0) ok = -1;
     return ok;
 }
 
@@ -328,15 +328,16 @@ static CUdeviceptr q21_dup_first(cuda_qimg_runner *r, CUdeviceptr x,
     return out;
 }
 
-static CUdeviceptr q21_mid_attention(cuda_qimg_runner *r, const st_context *st,
-                                     CUdeviceptr x, int c, int h, int w) {
+static CUdeviceptr q21_mid_attention_named(cuda_qimg_runner *r, const st_context *st,
+                                     CUdeviceptr x, int c, int h, int w, const char *prefix) {
     int spatial = h * w;
     CUdeviceptr gn=0,qkvw=0,qkvb=0,pw=0,pb=0,norm=0,qkv=0,qs=0,ks=0,vs=0,as=0,ach=0,po=0;
-    gn=q21_load_weight(st,"decoder.mid_block.attentions.0.norm.gamma");
-    qkvw=q21_load_weight(st,"decoder.mid_block.attentions.0.to_qkv.weight");
-    qkvb=q21_load_weight(st,"decoder.mid_block.attentions.0.to_qkv.bias");
-    pw=q21_load_weight(st,"decoder.mid_block.attentions.0.proj.weight");
-    pb=q21_load_weight(st,"decoder.mid_block.attentions.0.proj.bias");
+    char name[256];
+    snprintf(name,sizeof(name),"%s.norm.gamma",prefix);gn=q21_load_weight(st,name);
+    snprintf(name,sizeof(name),"%s.to_qkv.weight",prefix);qkvw=q21_load_weight(st,name);
+    snprintf(name,sizeof(name),"%s.to_qkv.bias",prefix);qkvb=q21_load_weight(st,name);
+    snprintf(name,sizeof(name),"%s.proj.weight",prefix);pw=q21_load_weight(st,name);
+    snprintf(name,sizeof(name),"%s.proj.bias",prefix);pb=q21_load_weight(st,name);
     if(!gn||!qkvw||!qkvb||!pw||!pb) goto fail;
     norm=checked_cuMemAlloc((size_t)c*spatial*sizeof(float));
     qkv=checked_cuMemAlloc((size_t)3*c*spatial*sizeof(float));
@@ -375,6 +376,11 @@ fail:
     q21_free(&gn);q21_free(&qkvw);q21_free(&qkvb);q21_free(&pw);q21_free(&pb);q21_free(&norm);q21_free(&qkv);
     q21_free(&qs);q21_free(&ks);q21_free(&vs);q21_free(&as);q21_free(&ach);q21_free(&po);
     return 0;
+}
+
+static CUdeviceptr q21_mid_attention(cuda_qimg_runner *r, const st_context *st,
+                                     CUdeviceptr x, int c, int h, int w) {
+    return q21_mid_attention_named(r,st,x,c,h,w,"decoder.mid_block.attentions.0");
 }
 
 static int qimg21_vae_decode(cuda_qimg_runner *r, const st_context *st,

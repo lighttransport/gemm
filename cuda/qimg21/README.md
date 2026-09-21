@@ -947,8 +947,8 @@ Add `--native-vae` to use the native F32 CUDA decoder. It reads the original
 VAE safetensors, applies latent denormalization and the learned post-quant
 convolution, then runs the residual/attention/upsampling graph and clamps the
 RGBA result. Text encoding still uses Python. This decoder supports single
-images; encoding/editing and larger-resolution memory validation remain work
-in progress. Its kernels and residual copies share the default CUDA stream
+images; integrated editing and peak-memory validation remain work in progress.
+The separate single-frame encoder is described below. Decoder kernels and residual copies share the default CUDA stream
 to avoid races with the shared VAE helpers' synchronous device copies.
 
 Reproduce the decoder comparison with:
@@ -997,6 +997,47 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/vae_regression.py \
 
 The reference model remains F32 with TF32 disabled. These are seeded
 single-frame decoder checks, not encoder/editing or denoiser parity evidence.
+
+## Native single-frame VAE encoder
+
+`test_cuda_qimg21_vae_encode` implements the original-weight F32 encoder:
+input convolution, five residual down blocks with first-frame averaging
+shortcuts, mid-block attention/residuals, output normalization/convolution,
+and the learned quant convolution. It reuses the validated decoder's native
+convolution, RMS normalization and attention kernels. First-chunk temporal
+padding is handled explicitly; video/temporal continuation is not supported.
+
+```sh
+TMPDIR="$PWD/tmp" make -C cuda/qimg21 native-vae
+cuda/qimg21/test_cuda_qimg21_vae_encode \
+  --model /mnt/nvme01/models/qimg-21/vae --image normalized_rgba.npy --out moments.npy
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/vae_encoder_regression.py \
+  --model /mnt/nvme01/models/qimg-21/vae --case 128x128:42 --case 64x128:123 \
+  --case 256x256:7 --work-dir tmp/qimg21-encoder-matrix
+```
+
+Input is finite F32 `[4,H,W]` RGBA already normalized to `[-1,1]`, with both
+dimensions divisible by 16 and at most 1024. Output is raw F32 posterior
+parameters `[128,H/16,W/16]`: mean channels first, then log-variance channels.
+It does **not** resize/read image files, sample the posterior, clamp log
+variance, normalize latent channels, or pack transformer tokens. In particular,
+this output is not yet a condition-latent fixture for the denoiser.
+
+Against official PyTorch F32 encoding with TF32 disabled, all four synthetic
+RGBA cases pass: 64x64/seed17, 128x128/seed42, 64x128/seed123, and
+256x256/seed7. Minimum posterior cosine is **0.999999999998848**; minimum
+latent-mean cosine is **0.999999999989884**, and all outputs are finite. Both
+cosines are gated independently at 0.99996. Maximum absolute error is
+0.00044835 on the 256x256 case. Results are under `tmp/qimg21-encoder-first`
+and `tmp/qimg21-encoder-matrix`. A decoder smoke test after the shared-helper
+refactor also passes at cosine 0.999999999347549 (128x128/seed17).
+
+CPU input guards reject wrong channel counts, unsupported dimensions,
+non-finite pixels and out-of-range pixels before CUDA initialization; the
+CPU suite is 27/27 passing. Larger encoder resolutions, peak VRAM, real-image
+preprocessing/normalization and native editing handoff remain unverified.
+The initial downsampler computes a full convolution then samples odd spatial
+positions; it is correct but not yet optimized as a stride-2 convolution.
 
 ## Completed 1024x1024/40-step generation benchmark
 
