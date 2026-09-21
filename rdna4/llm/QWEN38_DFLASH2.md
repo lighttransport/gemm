@@ -465,9 +465,12 @@ reflects the remaining measured costs.
    acceptance and authoritative output remain stable.
 6. **Prompt-cache injection.**  Feature capture now shares the target
    RMSNorm kernel and both 4K and random-64K prefill retain their targets.
-   Sidecar K/V injection remains serial.  Add per-stream hipBLASLt
-   plans/workspaces before overlapping it with the next target tile; the
-   current global shape cache cannot be used concurrently.
+   The hipBLASLt bridge now allocates scratch lazily per HIP stream, so a
+   target and sidecar stream can safely share a shape without racing a
+   workspace.  A two-stream BF16 smoke test passes with identical outputs.
+   Scheduling the actual overlap remains open: retain explicit stream/event
+   dependencies and keep the serial path as the fallback until a measured
+   prefill gain is demonstrated.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus

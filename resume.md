@@ -222,6 +222,11 @@ accepted tokens, and 443.45--444.22 tok/s prefill.  The 4K K=7 gate retains
 greedy hash at 59.75 tok/s.  The sampled output, token, and full-logit SHA-256
 values remain pinned.
 
+The host-side verifier split selector now mirrors the native Q8 kernel's
+64-split cap for the 64K--<96K window.  This prevents a shared captured graph
+from crossing the 96K transition with a stale 128-split assumption; the
+ordinary 4K and dense-MTP exact gates remain passing after the change.
+
 Device-guard dual launches, fixed split pinning, shared combine scales, a
 one-wave combine, and fused draft/verify synchronization were all measured
 and rejected.  They were exact, but none beat the selected-graph result.  The
@@ -247,9 +252,10 @@ Remaining optimization items, in measured priority order:
    cheaper draft-cache representation. K=7 already clears 60 tok/s, while
    K=4 remains below that target.
 4. Overlap sidecar cache injection with the next target prefill tile.  The
-   capture half is complete.  Safe overlap first requires a per-stream
-   hipBLASLt plan/workspace because the target and sidecar currently share the
-   same shape-keyed workspace; concurrent use would race it.
+   capture half is complete, and the hipBLASLt bridge now owns scratch lazily
+   per HIP stream (validated by a two-stream BF16 smoke test).  Add explicit
+   event dependencies and measure the overlap before enabling it; the serial
+   injection path remains the fallback.
 5. Revisit dense NextN/MTP scheduling. The current exact implementation now
    improves the pinned 4K IQ2 coding fixture from 38.97 tok/s ordinary to
    47.87--47.93 tok/s, but remains below 60 tok/s and falls to 28.82 tok/s at

@@ -1,7 +1,9 @@
 /*
  * mm_blaslt_bridge.h - C-callable multi-shape hipBLASLt BF16 GEMM bridge.
  *
- * Provides a per-(M,N,K) plan cache. All plans use:
+ * Provides a per-(M,N,K) plan cache. Plans are immutable after creation and
+ * allocate scratch lazily per HIP stream, allowing independent target and
+ * sidecar streams to use the same shape concurrently. All plans use:
  *   X row-major [M,K] BF16, W row-major [N,K] BF16, Y row-major [M,N] F32
  *   computing Y = X * W^T (no bias, no epilogue in v1).
  * hipBLASLt sees this as col-major Y^T[N,M] = W[N,K] * X^T[K,M], so

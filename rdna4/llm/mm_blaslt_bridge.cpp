@@ -54,6 +54,7 @@ extern "C" void mm_blaslt_destroy(void) {}
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 #include <dlfcn.h>
@@ -91,8 +92,14 @@ struct Plan {
   hipblasLtMatmulDesc_t matmul = nullptr;
   hipblasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr, d = nullptr;
   hipblasLtMatmulAlgo_t algo{};
-  void *workspace = nullptr;
   size_t workspace_size = 0;
+  /* hipBLASLt workspaces are scratch, not immutable plan state.  Keep one
+   * allocation per stream so a target stream and a sidecar stream can issue
+   * the same shape concurrently without racing the old shape-global buffer. */
+  struct StreamWorkspace {
+    void *ptr = nullptr;
+  };
+  std::unordered_map<uintptr_t, StreamWorkspace> workspaces;
   bool valid = false;
 };
 
@@ -174,10 +181,11 @@ struct State {
 State g_state;
 
 void destroy_plan(Plan &p) {
-  if (p.workspace) {
-    (void)bridge_hip_free(p.workspace);
-    p.workspace = nullptr;
+  for (auto &entry : p.workspaces) {
+    if (entry.second.ptr)
+      (void)bridge_hip_free(entry.second.ptr);
   }
+  p.workspaces.clear();
   if (p.d) hipblasLtMatrixLayoutDestroy(p.d);
   if (p.c) hipblasLtMatrixLayoutDestroy(p.c);
   if (p.b) hipblasLtMatrixLayoutDestroy(p.b);
@@ -299,9 +307,6 @@ int build_plan(int M, int N, int K, int batch, int flags, Plan &p) {
 
   p.algo = results[best].algo;
   p.workspace_size = results[best].workspaceSize;
-  if (p.workspace_size > 0) {
-    HIP_RET(bridge_hip_malloc(&p.workspace, p.workspace_size));
-  }
   p.valid = true;
   if (g_state.verbose) {
     std::fprintf(stderr,
@@ -309,6 +314,26 @@ int build_plan(int M, int N, int K, int batch, int flags, Plan &p) {
                  M, N, K, hipblaslt_ext::getIndexFromAlgo(p.algo),
                  p.workspace_size);
   }
+  return 0;
+}
+
+static int plan_workspace(Plan &p, hipStream_t stream, void **workspace) {
+  *workspace = nullptr;
+  if (p.workspace_size == 0) return 0;
+  const uintptr_t key = reinterpret_cast<uintptr_t>(stream);
+  auto it = p.workspaces.find(key);
+  if (it == p.workspaces.end()) {
+    Plan::StreamWorkspace ws;
+    hipError_t err = bridge_hip_malloc(&ws.ptr, p.workspace_size);
+    if (err != hipSuccess) {
+      std::fprintf(stderr, "[mm_blaslt] workspace allocation failed (%zu bytes, stream=%p): %s\n",
+                   p.workspace_size, static_cast<void *>(stream),
+                   bridge_hip_error_string(err));
+      return -1;
+    }
+    it = p.workspaces.emplace(key, ws).first;
+  }
+  *workspace = it->second.ptr;
   return 0;
 }
 
@@ -382,12 +407,14 @@ extern "C" int mm_blaslt_run_bf16_strided_batch(
   }
   Plan &p = it->second;
   if (!p.valid) return -1;
+  hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+  void *workspace = nullptr;
+  if (plan_workspace(p, hip_stream, &workspace) != 0) return -1;
   const float alpha = 1.0f, beta = 0.0f;
   HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha,
                            d_w_bf16, p.a, d_x_bf16, p.b, &beta,
                            d_y_f32, p.c, d_y_f32, p.d, &p.algo,
-                           p.workspace, p.workspace_size,
-                           static_cast<hipStream_t>(stream)));
+                           workspace, p.workspace_size, hip_stream));
   return 0;
 }
 
@@ -416,12 +443,14 @@ extern "C" int mm_blaslt_run_f32(void *d_y_f32, const void *d_w_f32,
   }
   Plan &p = it->second;
   if (!p.valid) return -1;
+  hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+  void *workspace = nullptr;
+  if (plan_workspace(p, hip_stream, &workspace) != 0) return -1;
   const float alpha = 1.0f, beta = 0.0f;
   HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha,
                            d_w_f32, p.a, d_x_f32, p.b, &beta,
                            d_y_f32, p.c, d_y_f32, p.d, &p.algo,
-                           p.workspace, p.workspace_size,
-                           static_cast<hipStream_t>(stream)));
+                           workspace, p.workspace_size, hip_stream));
   return 0;
 }
 
@@ -461,6 +490,9 @@ extern "C" int mm_blaslt_run_bf16_bias_residual(
   }
   Plan &p = it->second;
   if (!p.valid) return -1;
+  hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+  void *workspace = nullptr;
+  if (plan_workspace(p, hip_stream, &workspace) != 0) return -1;
 
   if (with_bias) {
     HBLT_RET(hipblasLtMatmulDescSetAttribute(
@@ -473,8 +505,7 @@ extern "C" int mm_blaslt_run_bf16_bias_residual(
   const void *c_ptr = (d_c_f32 != nullptr) ? d_c_f32 : d_y_f32;
   HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha, d_w_bf16, p.a,
                            d_x_bf16, p.b, &beta, c_ptr, p.c, d_y_f32, p.d,
-                           &p.algo, p.workspace, p.workspace_size,
-                           static_cast<hipStream_t>(stream)));
+                           &p.algo, workspace, p.workspace_size, hip_stream));
   return 0;
 }
 
@@ -501,6 +532,9 @@ extern "C" int mm_blaslt_run_bf16_bias_bf16d(
   }
   Plan &p = it->second;
   if (!p.valid) return -1;
+  hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+  void *workspace = nullptr;
+  if (plan_workspace(p, hip_stream, &workspace) != 0) return -1;
 
   HBLT_RET(hipblasLtMatmulDescSetAttribute(
       p.matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &d_bias_f32,
@@ -510,8 +544,7 @@ extern "C" int mm_blaslt_run_bf16_bias_bf16d(
   const float beta = 0.0f;
   HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha, d_w_bf16, p.a,
                            d_x_bf16, p.b, &beta, d_y_bf16, p.c, d_y_bf16, p.d,
-                           &p.algo, p.workspace, p.workspace_size,
-                           static_cast<hipStream_t>(stream)));
+                           &p.algo, workspace, p.workspace_size, hip_stream));
   return 0;
 }
 
@@ -538,6 +571,9 @@ extern "C" int mm_blaslt_run_bf16_bias_gelu_bf16d(
   }
   Plan &p = it->second;
   if (!p.valid) return -1;
+  hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+  void *workspace = nullptr;
+  if (plan_workspace(p, hip_stream, &workspace) != 0) return -1;
 
   HBLT_RET(hipblasLtMatmulDescSetAttribute(
       p.matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &d_bias_f32,
@@ -547,8 +583,7 @@ extern "C" int mm_blaslt_run_bf16_bias_gelu_bf16d(
   const float beta = 0.0f;
   HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha, d_w_bf16, p.a,
                            d_x_bf16, p.b, &beta, d_y_bf16, p.c, d_y_bf16, p.d,
-                           &p.algo, p.workspace, p.workspace_size,
-                           static_cast<hipStream_t>(stream)));
+                           &p.algo, workspace, p.workspace_size, hip_stream));
   return 0;
 }
 

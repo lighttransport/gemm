@@ -11,6 +11,12 @@ static int hllm_qwen35_attention_splits(const hip_llm_runner *r, int length) {
     int tiles = (length + 255) / 256;
     if (length >= 16384) {
         int splits = (length + 511) / 512;
+        /* Keep graph selection identical to the native Q8 attention kernel.
+         * The validated 64K--<96K serving window uses 64 larger partitions;
+         * without this cap a reuse graph could span the 96K boundary while
+         * the device kernel changes from 64 to 128 partitions. */
+        if (length >= 65536 && length < 98304)
+            splits = splits < 64 ? splits : 64;
         if (splits < occupancy) splits = occupancy;
         return splits > 128 ? 128 : splits;
     }
