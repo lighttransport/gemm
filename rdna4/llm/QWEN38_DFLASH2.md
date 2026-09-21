@@ -493,6 +493,10 @@ reflects the remaining measured costs.
    Position-parallel attention and
    cheaper draft-cache storage are the next candidates, provided K=4/K=7
    acceptance and authoritative output remain stable.
+
+   A row-batched IQ1_M embedding probe removed the per-mask-row launch loop,
+   but the matched K=7 4K gate measured 79.51 tok/s versus 79.66 tok/s for
+   the serialized embedding path, so it was reverted.
 6. **Prompt-cache injection.**  Feature capture now shares the target
    RMSNorm kernel and both 4K and random-64K prefill retain their targets.
    The hipBLASLt bridge now allocates scratch lazily per HIP stream, so a

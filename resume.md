@@ -17,6 +17,12 @@ hash `90178de69a24a76e`, suffix hash `4f46d4fe27743a5b`, and measured
 36.13 tok/s versus 34.18 tok/s.  Production defaults remain unchanged until
 the broader sampled/logit quality matrix is rerun.
 
+A DFlash2 proposal probe also replaced the anchor-plus-mask IQ1_M embedding
+loop with one row-batched launch using the existing verifier kernel.  K=7
+remained exact (`15f17d2640c1adfc`, 41/42 accepted), but matched 4K runs were
+79.51 tok/s batched versus 79.66 tok/s serialized, so the extra token-id
+upload and changed launch schedule were reverted.
+
 The sidecar commit path now has an opt-in event-ordered injection stream via
 `LLM_QWEN35_DFLASH_OVERLAP_INJECT=1`.  Injection runs on a nonblocking stream
 while the authoritative target publishes its accepted-row checkpoints; the
