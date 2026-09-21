@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,8 @@ def main():
     ap.add_argument("--native-bin", type=Path,
                     default=Path(__file__).with_name("test_cuda_qimg21_vae"))
     ap.add_argument("--case", action="append", help="HEIGHTxWIDTH:SEED; repeatable")
+    ap.add_argument("--discard-frame-cache", action="store_true",
+                    help="Discard unused single-frame PyTorch temporal caches (same decode arithmetic)")
     args = ap.parse_args()
     cases = args.case or ["128x128:17", "256x256:42", "128x256:123"]
     args.work_dir.mkdir(parents=True, exist_ok=True)
@@ -43,6 +46,7 @@ def main():
 
     import torch
     from diffusers import AutoencoderKLQwenImage21
+    from vae_reference import discard_single_frame_cache
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -57,7 +61,8 @@ def main():
     for case, folder, height, width, elapsed in fixtures:
         latent = torch.from_numpy(np.load(folder / "latents.npy")).to("cuda")
         latent = latent.T.reshape(1, 64, 1, height // 16, width // 16).contiguous()
-        with torch.inference_mode():
+        with torch.inference_mode(), (discard_single_frame_cache(vae)
+                                      if args.discard_frame_cache else nullcontext()):
             target = vae.decode(latent * std + mean, return_dict=False)[0][0, :, 0]
         reference = target.cpu().numpy()
         np.save(folder / "reference.npy", reference)
@@ -69,6 +74,7 @@ def main():
         cosine = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
         mae = float(np.mean(abs(a - b)))
         result = dict(case=case, cosine=cosine, mae=mae, finite=finite,
+                      reference_discard_frame_cache=args.discard_frame_cache,
                       native_seconds=elapsed, passed=finite and cosine >= 0.99996)
         results.append(result)
         (args.work_dir / "results.json").write_text(json.dumps(results, indent=2) + "\n")

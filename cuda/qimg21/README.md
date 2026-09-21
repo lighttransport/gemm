@@ -353,3 +353,15 @@ The additional 512x512/seed42 F32 decoder comparison passed with cosine
 1024x1024 decoding completed, but the untiled F32 PyTorch reference ran out
 of VRAM on this GPU; its 1024 parity is therefore unverified. This is not
 the requested 1024x1024/40-step generation benchmark, which remains pending.
+
+For memory-bounded untiled PyTorch comparison, `vae_regression.py` has an
+opt-in `--discard-frame-cache` mode. It executes the official decoder with
+the same arithmetic and first-chunk branches, but discards temporal cache
+writes that only a later video frame could use. Checked cache access fails
+if any discarded slot is read again. This is not spatial tiling, and does
+not change temporal upsampling behavior by setting `feat_cache=None`.
+Results explicitly record this reference mode. CPU tests are bit-exact for
+individual official modules and a reduced-width complete five-stage decoder:
+`OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_vae_reference.py`.
+Full-checkpoint GPU equivalence and the 1024-resolution memory benefit still
+need validation; this option does not yet resolve the unverified parity above.
