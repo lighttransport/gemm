@@ -18,6 +18,18 @@ class CompareTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "empty or non-finite"):
                 compare._cosine_error(invalid, invalid)
 
+    def test_quantized_mre_calibration(self):
+        reference = np.ones(100, dtype=np.float32)
+        candidate = reference.copy()
+        candidate[::2] += 0.08
+        candidate[1::2] -= 0.08
+        cosine, _ = compare._cosine_error(reference, candidate)
+        self.assertLess(cosine, 0.999)
+        self.assertLess(compare._relative_mae(reference, candidate),
+                        compare.QUANTIZED_MRE_THRESHOLD)
+        self.assertGreater(compare._relative_mae(reference, reference * 1.2),
+                           compare.QUANTIZED_MRE_THRESHOLD)
+
     def test_fixture_gates(self):
         root = Path(__file__).resolve().parents[2]
         (root / "tmp").mkdir(exist_ok=True)

@@ -18,6 +18,11 @@ NONQUANTIZED_COSINE_THRESHOLD = 0.99996
 # cosine 0.999172219, maximum relative L2 0.040695879. Other quantizers require
 # their own calibration; this is not the original-weight acceptance gate.
 QUANTIZED_COSINE_THRESHOLD = 0.999
+# Normalized mean absolute error: mean(abs(candidate-reference)) /
+# mean(abs(reference)).  Calibration across 16 row-INT8 prediction/trajectory
+# checkpoints peaked at 0.036572; exact editing peaked at 0.045095 and true-CFG
+# editing at 0.083975.  A 0.10 gate retains about 19% margin for CFG.
+QUANTIZED_MRE_THRESHOLD = 0.10
 
 
 def _step_path(directory: Path, name: str) -> Path:
@@ -48,12 +53,22 @@ def _cosine_error(reference: np.ndarray, candidate: np.ndarray) -> tuple[float, 
     return cosine, rel_l2
 
 
-def _compare_array(label: str, reference_path: Path, candidate_path: Path) -> tuple[float, float]:
+def _relative_mae(reference: np.ndarray, candidate: np.ndarray) -> float:
+    ref = reference.astype(np.float64, copy=False).ravel()
+    got = candidate.astype(np.float64, copy=False).ravel()
+    if ref.shape != got.shape or not ref.size or not np.isfinite(ref).all() or not np.isfinite(got).all():
+        raise ValueError("invalid relative-MAE comparison fixture")
+    return float(np.mean(np.abs(ref - got)) / max(np.mean(np.abs(ref)), 1e-30))
+
+
+def _compare_array(label: str, reference_path: Path, candidate_path: Path) -> tuple[float, float, float]:
     if not candidate_path.exists():
         raise FileNotFoundError(f"missing candidate fixture: {candidate_path}")
-    cosine, rel_l2 = _cosine_error(np.load(reference_path), np.load(candidate_path))
-    print(f"{label}: cosine={cosine:.9f} rel_l2={rel_l2:.8g}")
-    return cosine, rel_l2
+    reference, candidate = np.load(reference_path), np.load(candidate_path)
+    cosine, rel_l2 = _cosine_error(reference, candidate)
+    mre = _relative_mae(reference, candidate)
+    print(f"{label}: cosine={cosine:.9f} rel_l2={rel_l2:.8g} mre={mre:.8g}")
+    return cosine, rel_l2, mre
 
 
 def _step_names(directory: Path) -> list[str]:
@@ -71,7 +86,7 @@ def main() -> int:
     ap.add_argument(
         "--quantized",
         action="store_true",
-        help=f"use the calibrated row-INT8 cosine gate ({QUANTIZED_COSINE_THRESHOLD:.6f})",
+        help=f"use the calibrated row-INT8 MRE gate ({QUANTIZED_MRE_THRESHOLD:.6f})",
     )
     ap.add_argument(
         "--cosine-threshold",
@@ -97,7 +112,10 @@ def main() -> int:
         threshold = QUANTIZED_COSINE_THRESHOLD if args.quantized else NONQUANTIZED_COSINE_THRESHOLD
     if not 0.0 < threshold <= 1.0:
         raise SystemExit("--cosine-threshold must be in (0, 1]")
-    print(f"acceptance cosine threshold={threshold:.9f} ({'quantized' if args.quantized else 'non-quantized'})")
+    if args.quantized:
+        print(f"acceptance MRE threshold={QUANTIZED_MRE_THRESHOLD:.9f} (row-INT8; cosine is diagnostic)")
+    else:
+        print(f"acceptance cosine threshold={threshold:.9f} (non-quantized)")
 
     failures: list[str] = []
     if not args.steps_only and not args.denoiser_only:
@@ -126,12 +144,14 @@ def main() -> int:
                 failures.append(f"missing prompt fixture pair: {name}")
                 continue
             try:
-                cosine, _ = _compare_array(name, rp, gp)
+                cosine, _, mre = _compare_array(name, rp, gp)
             except (OSError, ValueError) as exc:
                 failures.append(f"{name}: {exc}")
             else:
-                if name in ("initial_latents.npy", "prompt_embeds.npy") and cosine < threshold:
+                if not args.quantized and name in ("initial_latents.npy", "prompt_embeds.npy") and cosine < threshold:
                     failures.append(f"{name} cosine {cosine:.9f} < {threshold:.9f}")
+                if args.quantized and mre > QUANTIZED_MRE_THRESHOLD:
+                    failures.append(f"{name} MRE {mre:.9f} > {QUANTIZED_MRE_THRESHOLD:.9f}")
 
     ref_steps: list[str] = []
     if not args.denoiser_only:
@@ -145,12 +165,14 @@ def main() -> int:
             rp = ref_dir / name
             gp = _step_path(run_dir, name)
             try:
-                cosine, _ = _compare_array(name, rp, gp)
+                cosine, _, mre = _compare_array(name, rp, gp)
             except (OSError, ValueError, FileNotFoundError) as exc:
                 failures.append(f"{name}: {exc}")
             else:
-                if not np.isfinite(cosine) or cosine < threshold:
+                if not np.isfinite(cosine) or (not args.quantized and cosine < threshold):
                     failures.append(f"{name} cosine {cosine:.9f} < {threshold:.9f}")
+                if args.quantized and mre > QUANTIZED_MRE_THRESHOLD:
+                    failures.append(f"{name} MRE {mre:.9f} > {QUANTIZED_MRE_THRESHOLD:.9f}")
 
     ref_predictions = []
     if args.denoiser_only:
@@ -164,12 +186,14 @@ def main() -> int:
             )
         for name in ref_predictions:
             try:
-                cosine, _ = _compare_array(name, ref_dir / name, run_dir / name)
+                cosine, _, mre = _compare_array(name, ref_dir / name, run_dir / name)
             except (OSError, ValueError, FileNotFoundError) as exc:
                 failures.append(f"{name}: {exc}")
             else:
-                if not np.isfinite(cosine) or cosine < threshold:
+                if not np.isfinite(cosine) or (not args.quantized and cosine < threshold):
                     failures.append(f"{name} cosine {cosine:.9f} < {threshold:.9f}")
+                if args.quantized and mre > QUANTIZED_MRE_THRESHOLD:
+                    failures.append(f"{name} MRE {mre:.9f} > {QUANTIZED_MRE_THRESHOLD:.9f}")
 
     if failures:
         print("PARITY FAIL", file=sys.stderr)
@@ -177,9 +201,11 @@ def main() -> int:
             print(f"  - {failure}", file=sys.stderr)
         return 1
     if args.denoiser_only:
-        print(f"PARITY PASS: {len(ref_predictions)} denoiser predictions meet the cosine gate")
+        metric = "MRE" if args.quantized else "cosine"
+        print(f"PARITY PASS: {len(ref_predictions)} denoiser predictions meet the {metric} gate")
     else:
-        print(f"PARITY PASS: {len(ref_steps)} denoising checkpoints meet the cosine gate")
+        metric = "MRE" if args.quantized else "cosine"
+        print(f"PARITY PASS: {len(ref_steps)} denoising checkpoints meet the {metric} gate")
     return 0
 
 

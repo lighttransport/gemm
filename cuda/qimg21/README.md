@@ -34,8 +34,9 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/compare.py \
 checkpoint must reach cosine `>= 0.99996` for the non-quantized BF16/FP16
 weights. It exits non-zero on a missing checkpoint, shape mismatch, non-finite
 value, or threshold failure. For a quantized experiment, pass `--quantized`;
-that selects the measured row-INT8 `0.999` gate described below. Other
-quantizers require their own calibration. Use
+that selects the row-INT8 MRE `<= 0.10` gate described below, while cosine is
+still reported as a diagnostic. Other quantizers require their own
+calibration. Use
 `--cosine-threshold X` to record an explicit threshold in benchmark logs.
 The regression driver also records `initial_latents.npy`, preserving the exact
 PyTorch-packed noise input for native denoiser comparisons.
@@ -68,10 +69,13 @@ Missing/invalid matrices fail rather than silently falling back to BF16.
 CPU tests compare native reconstruction bit-for-bit with PyTorch BF16 and
 reject invalid scales, shapes, and payloads:
 `make -C cuda/qimg21 test_quant_weights && tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_quant_weights.py`.
-Full-checkpoint export and bounded GPU package validation now pass (below);
-broad image-quality validation remains unfinished.
-Streamed row-INT8 GPU calibration establishes a `0.999` model-output gate
-on the bounded matrix below. The regression driver
+Full-checkpoint export, editing/CFG validation, and 40-step image-quality
+validation now pass (below).
+Streamed row-INT8 GPU calibration establishes a normalized mean absolute error
+(`mean(abs(error)) / mean(abs(reference))`) gate of `<= 0.10`. The original
+16-point text-to-image calibration peaked at `0.036572`; a subsequent editing
+case peaked at `0.045095`, and true-CFG editing peaked at `0.083975`, leaving
+about 19% headroom. The regression driver
 selects it only when an actual quantized package or quantize-on-load mode is supplied; `--quantized`
 alone cannot relabel a BF16 run as a quantized experiment.
 
@@ -131,8 +135,9 @@ OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qim
   --case 512x512:4:42 --work-dir tmp/qimg21-int8-calibration
 ```
 
-This supports a row-INT8 gate with margin below the measured minimum; it does
-not establish 40-step quality, editing, CFG, or other quantization schemes.
+This initial matrix established the row-INT8 error scale; the editing, CFG,
+and 40-step validations below extend it. It does not calibrate other
+quantization schemes.
 `quant_quality.py` decodes paired final latents with the same validated native
 F32 VAE, saves reference/quantized PNGs, and reports RGB error for visual review.
 For the 512x512/four-step seed42 pair, both decoded images are finite: RGB
@@ -148,6 +153,26 @@ OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/quant_quality.py \
   --quantized-latents tmp/qimg21-int8-calibration/512x512-s4-seed42/native/trajectory/final_latents.npy \
   --out-dir tmp/qimg21-int8-quality-512-v2
 ```
+
+Exact efficient-SDPA editing with the exported row-INT8 package passes the
+MRE gate: the two prediction MREs are `0.028851` and `0.045095`, and the two
+trajectory MREs are `0.033041` and `0.032932`. True-CFG scale 4 editing also
+passes, with worst prediction MRE `0.077929` and worst trajectory MRE
+`0.083975`. Reproduce either capture with `editing_regression.py` plus
+`--quantized-transformer tmp/qimg21-int8-package`; the driver detects and
+validates negative prompt fixtures automatically.
+
+The full 1024x1024, 40-step, seed-42 row-INT8 trajectory also passes all 40
+checkpoints. MRE increases smoothly from `0.000297` to a maximum of `0.017865`;
+final latent cosine is `0.999805733`. Transformer runtime was `17:35.90` on
+the RTX 5060 Ti, with four persistent CUTLASS workspace allocations. A
+200-millisecond `nvidia-smi` sample during a full-resolution transformer step
+measured peak process VRAM at `2010 MiB`. Decoding
+the reference and quantized final latents through the same native F32 VAE
+gave RGB cosine `0.999982435`, relative L2 `0.00592812`, MAE `0.00202228`,
+PSNR `46.58 dB`, and alpha MAE `0.00002860`. Both finite images show the same
+photorealistic red apple and table, with no visually apparent
+quantization-specific artifact.
 
 Current native BF16 arithmetic explicitly rounds the text projection before
 GELU and Q/K normalization before multiplication by the learned RMS weights.

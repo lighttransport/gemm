@@ -11,7 +11,8 @@ import subprocess
 
 import numpy as np
 
-from compare import _cosine_error, NONQUANTIZED_COSINE_THRESHOLD
+from compare import (_cosine_error, _relative_mae, NONQUANTIZED_COSINE_THRESHOLD,
+                     QUANTIZED_MRE_THRESHOLD)
 from prepare_edit_fixture import prepare
 
 
@@ -35,6 +36,9 @@ def main():
     ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient"), default="math")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default="default")
+    quant = ap.add_mutually_exclusive_group()
+    quant.add_argument("--quantized-transformer", type=Path)
+    quant.add_argument("--quantize-on-load", choices=("int8-row",))
     args = ap.parse_args()
     ref = args.reference_dir.resolve()
     predictions = sorted(ref.glob("pred_*.npy"))
@@ -45,7 +49,11 @@ def main():
     work = args.work_dir.resolve()
     work.mkdir(parents=True, exist_ok=False)
     binary = str(Path(__file__).with_name("test_cuda_qimg21_native").resolve())
-    results = {"threshold": NONQUANTIZED_COSINE_THRESHOLD, "quantized": False,
+    is_quantized = bool(args.quantized_transformer or args.quantize_on_load)
+    cosine_threshold = None if is_quantized else NONQUANTIZED_COSINE_THRESHOLD
+    results = {"threshold": cosine_threshold,
+               "mre_threshold": QUANTIZED_MRE_THRESHOLD if is_quantized else None,
+               "quantized": is_quantized,
                "reference": str(ref), "model": str(args.model.resolve()),
                "true_cfg_scale": scale, "predictions": [], "trajectory": [],
                "attention": args.native_attention, "normalization": args.native_normalization,
@@ -63,6 +71,10 @@ def main():
                 "--editing-layout", str(fixture / "layout.txt"),
                 "--height-tokens", str(metadata["height_tokens"]),
                 "--width-tokens", str(metadata["width_tokens"])]
+        if args.quantized_transformer:
+            cmd.extend(["--quantized-transformer", str(args.quantized_transformer.resolve())])
+        elif args.quantize_on_load:
+            cmd.extend(["--quantize-on-load", args.quantize_on_load])
         if scale > 1:
             negative = fixture / "negative"
             cmd.extend(["--negative-editing-layout", str(negative / "layout.txt"),
@@ -71,10 +83,13 @@ def main():
         return cmd
 
     def compare(reference, candidate):
-        cosine, relative_l2 = _cosine_error(np.load(reference, allow_pickle=False),
-                                           np.load(candidate, allow_pickle=False))
-        return {"cosine": cosine, "relative_l2": relative_l2,
-                "passed": cosine >= NONQUANTIZED_COSINE_THRESHOLD}
+        reference_array = np.load(reference, allow_pickle=False)
+        candidate_array = np.load(candidate, allow_pickle=False)
+        cosine, relative_l2 = _cosine_error(reference_array, candidate_array)
+        mre = _relative_mae(reference_array, candidate_array)
+        passed = mre <= QUANTIZED_MRE_THRESHOLD if is_quantized else cosine >= cosine_threshold
+        return {"cosine": cosine, "relative_l2": relative_l2, "mre": mre,
+                "passed": passed}
 
     for i in range(steps):
         fixture = work / f"fixture-{i:03d}"

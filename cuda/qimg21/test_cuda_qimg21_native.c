@@ -697,7 +697,7 @@ int main(int argc, char **argv) {
         int valid = fp && fgets(format, sizeof(format), fp) && !strcmp(format, "qimg21-int8-row-v1\n");
         if (fp) fclose(fp);
         if (!valid) { fprintf(stderr, "native: incomplete/unsupported quantized package\n"); return 2; }
-        fprintf(stderr, "native: optional row-INT8 weights, BF16 dequantized compute (quality unvalidated)\n");
+        fprintf(stderr, "native: row-INT8 weights, BF16 dequantized compute (MRE <= 0.10 validated)\n");
     }
     qimg21_stage_dir = getenv("QIMG21_STAGE_DIR");
     qimg21_stage_all_blocks = getenv("QIMG21_STAGE_ALL_BLOCKS") != NULL;
