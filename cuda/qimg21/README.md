@@ -437,6 +437,24 @@ OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/norm_probe.py \
 This probe requires exact equality, not just a passing cosine. The native
 option changes block and final normalization; combined attention/normalization
 full-model validation remains necessary despite isolated exactness.
+The combined `--normalization vector4 --attention mma64` low-timestep run
+completed at cosine **0.999954275**, still below acceptance. On the same saved
+first-block inputs, the native SwiGLU activation is bit-exact with PyTorch.
+
+`rope_probe.py` isolates real-weight Q RMSNorm/complex RoPE on matching inputs:
+
+```sh
+OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/rope_probe.py \
+  --model /mnt/nvme01/models/qimg-21 --stage-dir tmp/qimg21-batch2-low \
+  --height-tokens 16 --width-tokens 16
+```
+
+The saved first-block Q RoPE has 201 mismatched values, cosine
+**0.999999997836**. Replaying the native pairwise RMS reduction with official
+RoPE finds 9 normalization mismatches and 11 post-RoPE mismatches; 190 values
+differ between native output and that replay. This points to rotary frequency
+or complex arithmetic as the larger local discrepancy, not SwiGLU. These
+operator diagnostics do not establish whole-model parity.
 
 Compare the replay without loading PyTorch or allocating GPU memory:
 
