@@ -9,10 +9,24 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from codex_server import Backend, responses_input_messages
+from codex_server import Backend, responses_input_messages, runner_command
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_qwen35_runner_command_uses_exact_server_profile(self):
+        args = SimpleNamespace(
+            runner="./test_hip_llm", model="target.gguf", context=65536,
+            moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
+            qwen4_exact=False, qwen4_mtp=None, qwen4_mtp_draft=1,
+            qwen4_mtp_cache_mb=128, qwen4_mtp_verify="scalar",
+            qwen35_server_profile=True,
+        )
+        command = runner_command(args)
+        self.assertIn("--stdio-server", command)
+        self.assertIn("--kv-cache", command)
+        self.assertIn("q8q8", command)
+        self.assertEqual(command[-2:], ["--sampling-profile", "llama"])
+
     def test_seed_uses_versioned_reference_sampler_request(self):
         backend = Backend.__new__(Backend)
         backend.lock = threading.Lock()
