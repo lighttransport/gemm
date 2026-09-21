@@ -846,6 +846,13 @@ below 0.99995. Artifacts are `tmp/qimg21-edit-host-scale-flash-tree` and
 `tmp/qimg21-edit-host-scale-mma-tree`. Thus text-to-image checkpoints clearing
 the revised gate do not establish editing acceptance.
 
+The stronger combination of vector4 LayerNorm, ordinary-tree Q/K RMS and
+ordinary `mma64` raises the high-timestep editing prediction to
+**0.999957879** (pass), but its low-timestep prediction is **0.999881718** and
+trajectory cosines are **0.999942440 / 0.999943021** (fail). Artifact:
+`tmp/qimg21-edit-host-scale-mma-vector-ln/results.json`. This is the current
+best complete two-step editing result under the revised acceptance target.
+
 An explicit non-fused multiply/add RoPE experiment was rejected: matched
 block-17 Q/K mismatches rose to 13/11 elements and block-output relative L2
 rose to 5.0646e-5. No production RoPE change was retained; diagnostic artifacts
