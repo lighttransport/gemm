@@ -883,6 +883,21 @@ reverse-Flash after blocks 8, 16, or 24. Low-prediction cosines were
 reverse MMA64 at 0.999881718. The switch implementation was removed; artifacts
 are `tmp/qimg21-edit-hybrid-cut{8,16,24}-low`.
 
+### Revised-gate true-CFG editing status
+
+A fresh scale-4 two-step editing run with forward-Flash, vector4 LayerNorm and
+host-table/original-tree Q/K RMS still fails: combined predictions are
+**0.999795049 / 0.999448447**, and trajectory cosines are
+**0.999784429 / 0.999786137**. At the failing low timestep, isolated positive
+and negative branches independently pass at **0.999969063** and
+**0.999965500**. PyTorch reconstruction from the saved branch tensors using
+BF16 `negative + 4 * (positive - negative)` is bit-exact to the saved combined
+reference, matching the native operation order. The CFG failure is therefore
+error amplification between two slightly different branch residuals, not an
+incorrect guidance formula. Artifacts: `tmp/qimg21-edit-cfg-forward-flash-095`,
+`tmp/qimg21-edit-cfg-positive-forward-low`, and
+`tmp/qimg21-edit-cfg-negative-forward-low`.
+
 An explicit non-fused multiply/add RoPE experiment was rejected: matched
 block-17 Q/K mismatches rose to 13/11 elements and block-output relative L2
 rose to 5.0646e-5. No production RoPE change was retained; diagnostic artifacts
