@@ -519,6 +519,20 @@ OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qim
   --case 512x512:4:7 --work-dir tmp/qimg21-accurate-regression
 ```
 
+The 256x256/seed42 case passes all four checks: predictions
+**0.999992279 / 0.999961807**, trajectory **0.999985893 / 0.999986316**.
+The original matrix process subsequently exited during the rectangular case
+when the filesystem filled. Its partial remaining cases are not acceptance
+evidence. After space recovery, the two unfinished cases were restarted in
+`tmp/qimg21-accurate-regression-remaining` with fresh outputs.
+Completed large replay outputs may be compressed as `.npy.gz`; decompress
+before using the replay commands. The original forward-MMA candidate can be
+regenerated from its preserved Q/K/V and layout; its metrics remain recorded.
+
+`editing_regression.py` also accepts and records the same three native
+accuracy options. Positive-only editing validation with this combination is
+queued after the restarted matrix, not yet accepted.
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh

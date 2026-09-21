@@ -32,6 +32,9 @@ def main():
     ap.add_argument("--model", required=True, type=Path)
     ap.add_argument("--reference-dir", required=True, type=Path)
     ap.add_argument("--work-dir", required=True, type=Path)
+    ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64"), default="math")
+    ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
+    ap.add_argument("--native-rope", choices=("default", "host-table"), default="default")
     args = ap.parse_args()
     ref = args.reference_dir.resolve()
     predictions = sorted(ref.glob("pred_*.npy"))
@@ -44,12 +47,16 @@ def main():
     binary = str(Path(__file__).with_name("test_cuda_qimg21_native").resolve())
     results = {"threshold": NONQUANTIZED_COSINE_THRESHOLD, "quantized": False,
                "reference": str(ref), "model": str(args.model.resolve()),
-               "true_cfg_scale": scale, "predictions": [], "trajectory": []}
+               "true_cfg_scale": scale, "predictions": [], "trajectory": [],
+               "attention": args.native_attention, "normalization": args.native_normalization,
+               "rope": args.native_rope}
     first_condition = None
     first_fixture = None
 
     def command(fixture, metadata):
         cmd = [binary, "--model", str(args.model.resolve()),
+                "--attention", args.native_attention, "--normalization", args.native_normalization,
+                "--rope", args.native_rope,
                 "--prompt-embeds", str(fixture / "prompt_embeds.npy"),
                 "--latents", str(fixture / "target_latents.npy"),
                 "--condition-latents", str(fixture / "condition_latents.npy"),
