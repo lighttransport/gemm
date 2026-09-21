@@ -338,8 +338,9 @@ reflects the remaining measured costs.
    hashes.
 
    The HTTP quality harness now checks the server's reported cached input on
-   repeated requests and supports deterministic longer prompts. A 1,024-token,
-   2,048-context run passes repeatability and cache reuse, including after the
+   repeated requests and supports deterministic longer prompts. Q8 target
+   snapshots now cover up to 16,384 tokens; a roughly 10k-token, 12k-context
+   run passes repeatability and cache reuse, including after the
    cancellation/recovery sequence.
 4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
    and Q8/Q8 KV storage are now fused exactly. The remaining small launches

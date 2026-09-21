@@ -33491,10 +33491,10 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
     }
     /* A Q8 target snapshot must include the target attention rows as well as
      * the hybrid SSM and DFlash state.  Bound this host-side copy to short
-     * prompts; long-context serving falls back to replay instead of silently
-     * consuming multiple gigabytes per cached conversation. */
+     * prompts; keep the host copy bounded so long-context serving does not
+     * silently consume multiple gigabytes per cached conversation. */
     if (r->qwen35_dflash2 && r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 &&
-        s->position >= 0 && s->position + 1 <= 8192) {
+        s->position >= 0 && s->position + 1 <= 16384) {
         s->qwen35_kv_count = s->position + 1;
         s->qwen35_key_host = calloc((size_t)s->n_layers, sizeof(void *));
         s->qwen35_value_host = calloc((size_t)s->n_layers, sizeof(void *));

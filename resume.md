@@ -247,8 +247,9 @@ launch per grouped attention layer. The HTTP and llama.cpp gates remain exact.
 
 The DFlash2 HTTP quality gate now requires repeated requests to report cached
 input tokens and accepts `--context N --long-prompt-tokens N` for deterministic
-longer-context cache reuse checks. The 1,024-token prompt case passes with
-repeatable output and nonzero cache reuse after cancellation recovery.
+longer-context cache reuse checks. The Q8 target snapshot bound is now 16,384
+tokens; a roughly 10k-token prompt in a 12k context passes repeatability and
+nonzero cache reuse after cancellation recovery.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
