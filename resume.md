@@ -225,7 +225,8 @@ values remain pinned.
 The host-side verifier split selector now mirrors the native Q8 kernel's
 64-split cap for the 64K--<96K window.  This prevents a shared captured graph
 from crossing the 96K transition with a stale 128-split assumption; the
-ordinary 4K and dense-MTP exact gates remain passing after the change.
+gated HIPRTC combine helper follows the same schedule, and the ordinary 4K
+and dense-MTP exact gates remain passing after the change.
 
 Device-guard dual launches, fixed split pinning, shared combine scales, a
 one-wave combine, and fused draft/verify synchronization were all measured
