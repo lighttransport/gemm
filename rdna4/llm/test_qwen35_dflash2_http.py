@@ -1,7 +1,8 @@
-"""Opt-in GPU quality gate for the resident DFlash2 HTTP window path.
+"""Opt-in GPU quality gate for resident Qwen3.8 speculative HTTP paths.
 
-Run with ``--model TARGET --sidecar DFLASH``.  The test is intentionally
-separate from the CPU-only protocol suite because it loads both GGUF files.
+Run with ``--model TARGET`` and either ``--sidecar DFLASH`` or ``--mtp NEXTN``.
+The test is separate from the CPU-only protocol suite because it loads both
+GGUF files.
 """
 import argparse
 import concurrent.futures
@@ -116,13 +117,13 @@ def cancel_stream(port, prompt="List ten facts about C++.", explicit=False):
             require(payload.get("status") == "cancellation_requested", payload)
             while response.readline():
                 pass
-        # Closing after a real token leaves a DFlash window transaction active
-        # and exercises cooperative rollback in the resident stdio child.
+        # Closing after a real token can leave a speculative target window
+        # active and exercises cooperative rollback in the resident child.
     finally:
         connection.close()
 
 
-def direct_stdio_cases(backend):
+def direct_stdio_cases(backend, label="DFlash2"):
     """Exercise the JSONL child independently of HTTP request formatting."""
     messages = [{"role": "user", "content": "What is 8+5? Answer with just 13."}]
     prompt = chat_prompt(messages)
@@ -183,7 +184,33 @@ def direct_stdio_cases(backend):
         results = list(pool.map(run_case, cases))
     for result, expected in results:
         require(result[3] > 0 and expected in result[0], result)
-    print("DFlash2 stdio window/cache/sampling/cancel/concurrency: PASS")
+    print(f"{label} stdio window/cache/sampling/cancel/concurrency: PASS")
+
+
+def parity_cases(backend, namespace):
+    """Return exact bytes for fixed greedy, sampled, coding, and retrieval requests."""
+    cases = (
+        ("Explain RAII in one short sentence.", 24, 0.0, None),
+        ("Write one short sentence about deterministic C++ builds.",
+         24, 0.7, None),
+        ("Return only valid C++17 source code for a complete program that "
+         "prints exactly 42 followed by a newline.", 64, 0.0, None),
+        ("The passphrase is ZEPHYR-7319. Remember it and answer this question "
+         "using only the passphrase: what is the passphrase?",
+         24, 0.0, "ZEPHYR-7319"),
+    )
+    outputs = []
+    for index, (text, max_tokens, temperature, expected) in enumerate(cases):
+        messages = [{"role": "user", "content": text}]
+        result = backend.generate(
+            chat_prompt(messages), max_tokens, temperature, 0.95, 20,
+            0, 1, 0, prefix=chat_prefix(messages), seed=42,
+            cache_key=f"{namespace}-{index}")
+        require(result[3] > 0 and result[-1] in ("stop", "length"), result)
+        if expected is not None:
+            require(result[0].strip() == expected, result)
+        outputs.append(result[0])
+    return outputs
 
 
 def extract_cpp(text):
@@ -220,7 +247,7 @@ def compile_cpp_answer(text):
                 f"generated C++ returned {run.returncode}: {run.stdout!r} {run.stderr!r}")
 
 
-def coding_agent_cases(port):
+def coding_agent_cases(port, label="DFlash2"):
     first_messages = [{
         "role": "user",
         "content": ("Return only valid C++17 source code, without Markdown. "
@@ -249,7 +276,7 @@ def coding_agent_cases(port):
     require(second.get("usage", {}).get("cached_tokens", 0) > 0, second)
     require("answer" in second_text, second_text)
     compile_cpp_answer(second_text)
-    print("DFlash2 multi-turn C++ compile/run quality: PASS")
+    print(f"{label} multi-turn C++ compile/run quality: PASS")
 
 
 def cleanup_on_signal(signum, _frame):
@@ -264,7 +291,9 @@ def main():
     global _active_backend
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
-    parser.add_argument("--sidecar", required=True)
+    sidecars = parser.add_mutually_exclusive_group(required=True)
+    sidecars.add_argument("--sidecar", help="DFlash2 GGUF")
+    sidecars.add_argument("--mtp", help="dense NextN GGUF")
     parser.add_argument("--runner", default="./rdna4/llm/test_hip_llm")
     parser.add_argument("--port", type=int, default=18090)
     parser.add_argument("--context", type=int, default=512)
@@ -272,18 +301,35 @@ def main():
     parser.add_argument("--long-prompt-tokens", type=int, default=0,
                         help="target token count for a deterministic longer cached prompt")
     args = parser.parse_args()
+    label = "Dense NextN" if args.mtp else "DFlash2"
     options = SimpleNamespace(
         runner=args.runner, model=args.model, context=args.context,
         moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
-        qwen4_exact=False, qwen4_mtp=None, qwen35_mtp=None,
+        qwen4_exact=False, qwen4_mtp=None, qwen35_mtp=args.mtp,
+        qwen35_mtp_draft=3, qwen35_mtp_window=bool(args.mtp),
         qwen35_server_profile=False, qwen35_dflash2=args.sidecar,
         qwen35_dflash2_draft=7,
         qwen35_snapshot_max_tokens=args.snapshot_max_tokens,
         context_cache_entries=2, context_cache_max_mib=2048,
     )
+    ordinary_outputs = None
+    if args.mtp:
+        ordinary_options = SimpleNamespace(**vars(options))
+        ordinary_options.qwen35_mtp = None
+        ordinary_options.qwen35_server_profile = True
+        ordinary = Backend(ordinary_options)
+        try:
+            ordinary_outputs = parity_cases(ordinary, "ordinary-parity")
+        finally:
+            ordinary.close()
     backend = Backend(options)
     _active_backend = backend
-    direct_stdio_cases(backend)
+    if ordinary_outputs is not None:
+        mtp_outputs = parity_cases(backend, "mtp-parity")
+        require(mtp_outputs == ordinary_outputs,
+                "Dense NextN changed ordinary target response bytes")
+        print("Dense NextN ordinary-target byte parity: PASS")
+    direct_stdio_cases(backend, label)
 
     class TestHandler(Handler):
         pass
@@ -429,7 +475,7 @@ def main():
         require(eviction_results[-1].get("usage", {}).get("cached_tokens", -1) == 0,
                 "LRU did not evict the oldest context")
 
-        coding_agent_cases(args.port)
+        coding_agent_cases(args.port, label)
 
         prompt = [{"role": "user", "content": cases[0][0]}]
         sampled = {
@@ -445,7 +491,7 @@ def main():
         require(sampled_text == sampled_b["choices"][0]["message"]["content"],
                 "seeded sampled request was not repeatable")
         require("C++" in sampled_text, sampled_text)
-        print("DFlash2 HTTP greedy/sampled repeatability and quality: PASS")
+        print(f"{label} HTTP greedy/sampled repeatability and quality: PASS")
     finally:
         server.shutdown()
         server.server_close()

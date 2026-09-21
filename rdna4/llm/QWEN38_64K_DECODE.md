@@ -110,8 +110,10 @@ waves lose occupancy after staging. The change retains the short-context
 sequence hash and raises a 512-token zero-depth run from about 40.7 to
 41.9--42.0 tok/s. IQ3_S staging was measured and rejected because its 2 KiB
 table slowed the important projection shapes.
-Dense NextN remains opt-in; its previous 64K result used the removed zero-cache
-setup and must be remeasured before making a random-depth performance claim.
+Dense NextN remains opt-in. Its real random-token K=3 rerun processes the
+65,536-token prefix at 408.64 tok/s and decodes 256 tokens at 28.82 tok/s,
+retaining prefix/suffix hashes `90178de69a24a76e`/`f4b35758fb99e6db` and
+`Result: PASS`. It is correct but slower than ordinary and DFlash2 at 64K.
 
 ## Correctness evidence
 

@@ -4,13 +4,40 @@ This is a benchmark-runner and C API implementation for the dense Qwen3.5/3.8
 architecture. It does not use the Qwen4 MoE/HC speculative path. The resident
 HTTP/stdio server can schedule exact greedy windows with
 `--qwen35-mtp SIDECAR --qwen35-mtp-draft N`; sampled requests automatically
-use ordinary target decoding so sampler state remains exact.
+use ordinary target decoding so sampler state remains exact. The Python server
+always adds the required window flag and limits resident draft width to 1--15.
 
 The target retains Q8 K **and** Q8 V. The draft sidecar owns its fusion weights,
 one attention/FFN block, output head and F16 KV. Its embedding stays mapped on
 the CPU; only the selected embedding row is uploaded. The initial draft cache
 starts at the first generated token, rather than replaying the prompt. Target
 hidden states still carry the complete prompt context.
+
+## Resident serving validation — 2026-09-21
+
+Dense NextN now runs through the same request-owned stdio/HTTP transaction as
+the ordinary and DFlash2 paths. Every request discards only the draft KV and
+starts it again at the completed prompt boundary. Cancellation or verifier
+failure resets target and draft state before the next request. Portable prompt
+snapshots include the final target hidden vector in addition to logits,
+Q8/Q8 KV, convolution and recurrent state; otherwise a restored prompt would
+feed stale hidden input into its first NextN proposal.
+
+`test_qwen35_dflash2_http.py --mtp SIDECAR` covers direct stdio, exact repeats,
+forced A/B/A restoration, seeded sampled fallback, targeted and disconnect
+cancellation, recovery, concurrent cache identities, LRU eviction, and a
+two-turn C++ task. A separate ordinary-target resident process produced
+byte-identical greedy, sampled, C++, and retrieval responses; the retrieval
+case returns exactly `ZEPHYR-7319`. The pinned llama.cpp gate also matches
+complete greedy and sampled token streams, EOS, and output bytes; both C++
+outputs pass fixed edge cases and 10,000 randomized cases.
+
+On the 4,096-token IQ2 coding fixture, the current exact K=3 window reaches
+47.87--47.93 tok/s greedy and 46.25--46.32 tok/s sampled after warm prefill at
+609.24--610.77 tok/s. Greedy and sampled output SHA-256 values remain
+`4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354`
+and `ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac`.
+Artifacts are in `tmp/qwen38/dense-nextn-serving-final/`.
 
 ## Run
 
@@ -26,7 +53,7 @@ bash rdna4/llm/run_qwen38_gsq_rocm.sh --gpu-only-bench \
   --prompt-file tmp/qwen38/final-iq2-native-mmvq-v4/prompt-4096.txt \
   -n 4096 -s 8192 --ubatch 512 --kv-cache q8q8 \
   --qwen35-prefill-bf16 --qwen35-decode-graph \
-  --qwen35-native-q8-prefill --qwen35-native-mmvq \
+  --qwen35-native-q8-prefill --qwen35-native-q2k --qwen35-native-mmvq \
   --sampling-profile llama --temp 0 --seed 42 --decode 256 \
   --qwen35-mtp /mnt/nvme02/models/qwen38/27b/mtp-Qwen3.8-27B-Q4_0.gguf \
   --qwen35-mtp-draft 3 --qwen35-mtp-window --bench-repeat 3
@@ -178,5 +205,8 @@ retain the preceding binary hash. No inference math changed in that rebuild.
 The 64K-offset benchmark and long-context attention scheduling are documented
 in [QWEN38_64K_DECODE.md](QWEN38_64K_DECODE.md). The benchmark now processes
 random tokens through the model, matching llama-bench depth semantics. The
-older zero-cache MTP number is obsolete; MTP remains opt-in pending a new
-random-depth measurement.
+older zero-cache MTP number is obsolete. A real 65,536-token run now records
+408.64 tok/s prefill and 28.82 tok/s Dense NextN decode for 256 tokens. It
+retains prefix hash `90178de69a24a76e`, suffix hash `f4b35758fb99e6db`, and
+`Result: PASS`. This is slower than ordinary and DFlash2 decode at that depth,
+so Dense NextN remains opt-in.

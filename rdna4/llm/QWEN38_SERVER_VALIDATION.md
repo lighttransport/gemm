@@ -7,7 +7,7 @@ Launcher: `run_qwen38_codex_server_rocm.sh`, 7200 MiB expert cache,
 Sampling: temperature 1.0, top_p .95, top_k 40, min_p .01,
 presence penalty 0; no implicit frequency/no-repeat penalty in server requests.
 
-## Current Qwen3.8/DFlash2 multi-context gate — 2026-09-21
+## Current Qwen3.8 speculative multi-context gate — 2026-09-21
 
 The Qwen3.8 resident backend now assigns each request a FIFO ticket and a
 request-owned cancellation event. Cache reuse is namespaced by a hashed
@@ -31,7 +31,9 @@ original ordering for duplicate-valued messages and removes complete user /
 assistant / tool turn groups, avoiding orphaned tool results.
 
 Portable snapshots contain prompt logits, hybrid convolution/recurrent state,
-target Q8/Q8 KV plus FP16 scales, and DFlash private state. Publication occurs
+target Q8/Q8 KV plus FP16 scales, and DFlash private state. Dense NextN
+snapshots also retain the prompt-boundary target hidden vector used by the
+first draft proposal. Publication occurs
 only after successful generation; failures and cancellations discard pending
 snapshots but preserve older committed entries. Restore uses the longest exact
 token prefix for the same cache identity. The runner rejects a snapshot unless
@@ -52,6 +54,16 @@ targeted/disconnect cancellation with recovery, concurrent distinct
 identities, and a two-turn C++ generation whose programs compiled and printed
 the expected result. Repeated exact prompts restored one committed snapshot
 without republishing it. The CPU protocol/template/tool suite passes 31 tests.
+
+Dense NextN now uses the resident path for exact greedy K=3 windows. Draft KV
+is reset at every request boundary, sampled requests use ordinary target
+decode, and cancellation/error recovery invalidates any open verifier window.
+The GPU gate passes ordinary-target byte parity, A/B/A cache restore,
+cancellation, concurrent identities, compiled two-turn C++ output, and an
+exact `ZEPHYR-7319` retrieval response. The pinned 4K llama.cpp gate matches
+tokens, EOS and bytes for greedy and sampled generation; random-token 64K
+preserves the established target suffix hash but measures only 28.82 tok/s,
+so the feature remains opt-in.
 
 The gate exposed and fixed two portability bugs: batched prefill left the host
 position stale, and Q8/Q8 FP16 scale rows were copied using an FP32 byte size.

@@ -229,14 +229,18 @@ Remaining optimization items, in measured priority order:
    already use the dedicated captured shared-K/V graph; the remaining work is
    the split-partial/combine boundary.  Keep it in a verifier-only kernel so
    captured generic-decode graph ABIs remain stable.
-3. Move DFlash top-k/selector work and draft-cache overhead onto the GPU;
-   K=7 already clears 60 tok/s, while K=4 remains below that target.
+3. Reduce the remaining DFlash draft cost. Top-k and selector decisions are
+   already on the GPU; investigate position-parallel draft attention and a
+   cheaper draft-cache representation. K=7 already clears 60 tok/s, while
+   K=4 remains below that target.
 4. Overlap sidecar cache injection with the next target prefill tile.  The
    capture half is complete.  Safe overlap first requires a per-stream
    hipBLASLt plan/workspace because the target and sidecar currently share the
    same shape-keyed workspace; concurrent use would race it.
-5. Revisit dense NextN/MTP scheduling; the current exact implementation is
-   slower than ordinary decode and remains below 60 tok/s.
+5. Revisit dense NextN/MTP scheduling. The current exact implementation now
+   improves the pinned 4K IQ2 coding fixture from 38.97 tok/s ordinary to
+   47.87--47.93 tok/s, but remains below 60 tok/s and falls to 28.82 tok/s at
+   real random-token 64K depth.
 
 The resident Qwen3.8/DFlash2 server now has request-owned, bounded
 multi-context state. `REQ3` carries a hashed cache namespace, and the HTTP
@@ -259,8 +263,9 @@ an entry- and byte-bounded LRU (`--context-cache-entries`, default 4;
 requests never publish, while earlier committed entries survive. Longest
 exact token-prefix reuse is restricted to the same cache identity. The
 snapshot includes target Q8/Q8 KV and scales, hybrid convolution/recurrent
-state, prompt logits, and DFlash private KV/features. Snapshot position must
-exactly match the token key before publication.
+state, prompt logits, and DFlash private KV/features. Dense NextN additionally
+stores the prompt-boundary target hidden vector needed by its first proposal.
+Snapshot position must exactly match the token key before publication.
 
 Nonportable snapshots used by the older Qwen4 path remain eligible only while
 their matching device context is resident. They are tagged separately and
@@ -291,9 +296,19 @@ The sampled random-64K target gate now passes 32 suffix tokens with prefix hash
 445.67 tok/s prefix.
 
 Dense Qwen3.8 NextN is now selectable in the resident HTTP/stdio harness with
-`--qwen35-mtp SIDECAR --qwen35-mtp-draft N [--qwen35-mtp-window]`.  The command
-uses the validated Q8/Q8 server profile; exact speculative windows are used for
-greedy requests, while sampled requests remain on ordinary target decoding.
+`--qwen35-mtp SIDECAR --qwen35-mtp-draft N`. The Python server supplies the
+required exact-window flag and validated Q8/Q8 profile. Greedy requests use
+exact target windows, while sampled requests remain on ordinary target decode.
+Draft KV resets at every request boundary; cancellation and errors discard an
+open verifier transaction before another request runs.
+
+The real-GPU resident gate passes direct stdio and HTTP traffic,
+ordinary-target byte parity, repeated and A/B/A cache restoration,
+targeted/disconnect cancellation, concurrent identities, and compiled
+two-turn C++ output. Its retrieval case returns exactly `ZEPHYR-7319` from both
+ordinary and Dense NextN serving. Prompt snapshots restore the target hidden
+vector as well as logits, KV, and recurrent state, so the first post-restore
+proposal retains its normal acceptance behavior.
 
 The dense verifier now fuses Q8 attention split-combine with the per-head gate
 for grouped verifier windows.  The ordinary decode path is unchanged.  The
@@ -393,8 +408,10 @@ decode also remains below 40 tok/s. Its exact
 three-head K/V-reuse kernel cuts the 128-split attention operator from about
 606 to about 348 microseconds per layer after the grouped scale-product
 change, leaving about 5.6 ms/token in attention and
-25 ms/token in the projection/state path. Dense NextN still needs a real
-random-depth rerun.
+25 ms/token in the projection/state path. Dense NextN has now been rerun at
+real random-token 64K depth: 408.64 tok/s prefill and 28.82 tok/s decode for a
+256-token suffix, with prefix/suffix hashes `90178de69a24a76e` and
+`f4b35758fb99e6db` and `Result: PASS`.
 Full results and commands:
 [QWEN38_64K_DECODE.md](rdna4/llm/QWEN38_64K_DECODE.md).
 
@@ -407,7 +424,7 @@ cases plus 10,000 randomized cases. Artifacts:
 `tmp/qwen38/depth64-final-iq2-v2/` and `depth64-final-iq3/`. Preserve unrelated
 A64FX/common edits; no push.
 
-## Final decode validation (2026-09-20)
+## Earlier final decode validation (2026-09-20)
 
 RX 9070 XT / gfx1201 / ROCm 10, 4096 prompt tokens, 512-token chunks,
 context 8192, Q8 K and Q8 V. Warm repetitions reset all target/draft state;
@@ -427,9 +444,12 @@ timing excludes trace I/O. Sampled mode uses temperature 0.6 and seed 42.
 **Ordinary 40 tok/s and dense NextN 60 tok/s remain unmet; DFlash2 clears
 60 tok/s at 4K and reaches 39.89--39.93 tok/s at random-token 64K depth.** Ordinary
 greedy decode improved from 33.8 to 38.0 tok/s on IQ2 and 32.1 to 36.1 on
-IQ3 (about 12–13%). MTP is opt-in because this verified implementation is
-slower on the tested coding response. The next performance work belongs in
-multirow projection reuse and reducing verification/checkpoint overhead.
+IQ3 (about 12–13%). Later verifier scheduling supersedes the IQ2 MTP timing:
+the 2026-09-21 pinned run reaches 47.87--47.93 tok/s greedy and
+46.25--46.32 tok/s sampled with 609.24--610.77 tok/s warm prefill. It remains
+opt-in because it is below 60 tok/s and degrades to 28.82 tok/s at 64K. The
+next performance work belongs in multirow projection reuse and reducing
+verification/checkpoint overhead.
 
 All eight complete C++ responses match the pinned llama.cpp token IDs, EOS
 and output bytes. Each passes C++17 compilation, ASan/UBSan, fixed edge cases
@@ -455,14 +475,15 @@ commands: `tmp/qwen38/decode-final-retrieval/manifest.json` and adjacent
 comparison files.
 
 Dense NextN implementation and reproduction details:
-[QWEN38_DENSE_MTP.md](rdna4/llm/QWEN38_DENSE_MTP.md). The benchmark/C API
-supports `--qwen35-mtp SIDECAR --qwen35-mtp-draft 3 --qwen35-mtp-window`;
-HTTP/stdio scheduling is not implemented. Draft state is independent, all
-emitted tokens come from exact target verification, and sampler RNG advances
-only for consumed target logits. The draft starts at generation rather than
-replaying the prompt. A three-step independent llama.cpp NextN oracle checks
-the post-output-norm hidden-input contract (matching top tokens; relative L2
-0.01254/0.01218/0.01512), not bitwise draft-logit parity.
+[QWEN38_DENSE_MTP.md](rdna4/llm/QWEN38_DENSE_MTP.md). The benchmark/C API and
+resident HTTP/stdio path support
+`--qwen35-mtp SIDECAR --qwen35-mtp-draft 3 --qwen35-mtp-window`. Draft state
+is independent, all emitted tokens come from exact target verification, and
+sampler RNG advances only for consumed target logits. The draft starts at
+generation rather than replaying the prompt. A three-step independent
+llama.cpp NextN oracle checks the post-output-norm hidden-input contract
+(matching top tokens; relative L2 0.01254/0.01218/0.01512), not bitwise
+draft-logit parity.
 
 Full-model llama.cpp logits still differ; BF16 prefill remains approximate.
 The byte-parity evidence is fixture-specific. Keep MTP opt-in until it
@@ -524,8 +545,9 @@ Attention-only baselines remain in `final-iq2-native-prefill/` and
 The validation script includes the exact 4096-token C++ prompt by default.
 
 Ordinary decode at 40 tok/s, dense NextN/MTP at 60 tok/s, and general byte
-parity remain open.  DFlash2 separately meets its 60 tok/s short-context and
-40 tok/s random-depth goals.
+parity remain open. DFlash2 separately meets its 60 tok/s short-context goal
+and reaches 39.89--39.93 tok/s at random-token 64K depth, just below the strict
+40 tok/s threshold.
 The existing Qwen4 MoE/HC MTP implementation is incompatible with the dense
 27B sidecar. The pinned graph passes the **post-output-norm** hidden vector
 to NextN. Do not use the earlier pre-norm assumption.

@@ -115,7 +115,9 @@ restores 6,535 tokens after an unrelated conversation, reports
 uses 448.3 MiB versus about 234 MiB for a 26-token prompt. The harness also
 checks LRU eviction, malformed metadata, concurrent identities, deterministic
 seeded sampling, cancellation recovery, and a two-turn C++ task by compiling
-and running both generated programs.
+and running both generated programs. The same harness accepts `--mtp` in place
+of `--sidecar` to validate resident Dense NextN, including a separate ordinary
+target process for greedy, sampled, and C++ byte parity.
 
 The ordinary target's sampled random-64K quality gate also passes: a
 temperature-0.6, seed-42 suffix retains prefix hash `90178de69a24a76e`,
