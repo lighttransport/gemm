@@ -30,6 +30,10 @@ only after successful generation; failures and cancellations discard pending
 snapshots but preserve older committed entries. Restore uses the longest exact
 token prefix for the same cache identity. The runner rejects a snapshot unless
 its position equals its token-key length, and evicts entries that fail restore.
+Models whose snapshots omit positional KV retain same-resident-context prefix
+reuse, but those entries are marked resident-only and discarded before a
+reset, identity switch, or portable restore. They are never used as
+multi-context snapshots.
 
 The real-GPU harness now forces A/B/A switching rather than accepting an
 immediate same-context hit. On RX 9070 XT it restored an actual 6,535-token

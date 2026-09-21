@@ -256,6 +256,11 @@ snapshot includes target Q8/Q8 KV and scales, hybrid convolution/recurrent
 state, prompt logits, and DFlash private KV/features. Snapshot position must
 exactly match the token key before publication.
 
+Nonportable snapshots used by the older Qwen4 path remain eligible only while
+their matching device context is resident. They are tagged separately and
+discarded before a reset, identity switch, or portable restore, preserving
+same-context prefix reuse without treating incomplete KV state as portable.
+
 This validation exposed two long-context snapshot bugs that immediate repeats
 had hidden: batched prefill did not publish its final host position, and Q8/Q8
 FP16 scale rows were copied with an FP32 size. The former captured only a

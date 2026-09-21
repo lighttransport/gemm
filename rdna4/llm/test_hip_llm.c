@@ -277,6 +277,7 @@ typedef struct {
     hip_llm_state_snapshot *snapshot;
     size_t bytes;
     uint64_t age;
+    int portable;
 } stdio_snapshot_entry;
 
 typedef struct {
@@ -318,13 +319,22 @@ static void stdio_snapshot_cache_free(stdio_snapshot_cache *cache) {
     memset(cache, 0, sizeof(*cache));
 }
 
+static void stdio_snapshot_cache_drop_resident(stdio_snapshot_cache *cache) {
+    if (!cache || !cache->entries) return;
+    for (int i = 0; i < cache->capacity; ++i)
+        if (cache->entries[i].snapshot && !cache->entries[i].portable)
+            stdio_snapshot_entry_clear(cache, i);
+}
+
 static int stdio_snapshot_cache_find(const stdio_snapshot_cache *cache,
                                      const char *identity,
-                                     const int32_t *tokens, int n_tokens) {
+                                     const int32_t *tokens, int n_tokens,
+                                     int allow_resident) {
     int best = -1;
     for (int i = 0; i < cache->capacity; ++i) {
         const stdio_snapshot_entry *entry = &cache->entries[i];
         if (!entry->snapshot || entry->n_tokens > n_tokens ||
+            (!entry->portable && !allow_resident) ||
             strcmp(entry->identity, identity) != 0) continue;
         if (memcmp(entry->tokens, tokens,
                    (size_t)entry->n_tokens * sizeof(*tokens)) != 0) continue;
@@ -344,8 +354,8 @@ static int stdio_snapshot_cache_publish(stdio_snapshot_cache *cache,
     size_t bytes = state_bytes + (size_t)n_tokens * sizeof(*tokens) +
                    strlen(identity) + 1;
     int snapshot_tokens = hip_llm_state_snapshot_token_count(snapshot);
-    if (!hip_llm_state_snapshot_is_portable(snapshot) ||
-        snapshot_tokens != n_tokens || !cache->entries ||
+    int portable = hip_llm_state_snapshot_is_portable(snapshot);
+    if (snapshot_tokens != n_tokens || !cache->entries ||
         n_tokens <= 0 || bytes > cache->byte_limit) {
         fprintf(stderr,
                 "llm_server: context snapshot rejected tokens=%d state_tokens=%d portable=%d "
@@ -401,12 +411,14 @@ static int stdio_snapshot_cache_publish(stdio_snapshot_cache *cache,
         .tokens = token_copy, .n_tokens = n_tokens,
         .identity = identity_copy, .snapshot = snapshot,
         .bytes = bytes, .age = ++cache->clock,
+        .portable = portable,
     };
     cache->bytes += bytes;
     fprintf(stderr,
-            "llm_server: context snapshot committed slot=%d tokens=%d "
+            "llm_server: context snapshot committed slot=%d kind=%s tokens=%d "
             "bytes=%.1f MiB cache=%.1f MiB\n",
-            slot, n_tokens, bytes / (double)(1ULL << 20),
+            slot, portable ? "portable" : "resident", n_tokens,
+            bytes / (double)(1ULL << 20),
             cache->bytes / (double)(1ULL << 20));
     return 1;
 }
@@ -433,6 +445,14 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
     fflush(stdout);
     while (fgets(line, sizeof(line), stdin)) {
         g_stdio_cancel = 0;
+        size_t line_len = strlen(line);
+        if (line_len == sizeof(line) - 1 && line[line_len - 1] != '\n') {
+            int ch;
+            while ((ch = fgetc(stdin)) != '\n' && ch != EOF) {}
+            puts("ERR request too large");
+            fflush(stdout);
+            continue;
+        }
         int max_tokens = 16, top_k = 20;
         float temperature = 0.2f, top_p = 0.95f, presence = 0.0f;
         float repetition = 1.0f, min_p = 0.0f;
@@ -577,8 +597,12 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                    cache[common] == tokens[common]) common++;
         int have_state = cache_n > 0 && common == cache_n;
         if (!have_state) {
+            int allow_resident = strcmp(active_identity, cache_identity) == 0;
             int hit = stdio_snapshot_cache_find(&snapshot_cache, cache_identity,
-                                                 tokens, n_tokens);
+                                                 tokens, n_tokens,
+                                                 allow_resident);
+            if (hit >= 0 && snapshot_cache.entries[hit].portable)
+                stdio_snapshot_cache_drop_resident(&snapshot_cache);
             int restore_rc = hit >= 0 ? hip_llm_restore_state(
                 gpu, snapshot_cache.entries[hit].snapshot) : -1;
             if (hit >= 0 && restore_rc == 0) {
@@ -613,6 +637,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             }
         }
         if (!have_state) {
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
             common = 0;
@@ -663,7 +688,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                     batch_ms > 0.0 ? 1000.0 * (off + cc) / batch_ms : 0.0);
             fflush(stderr);
             if (!logits) break;
-            if (requested_prefix > common &&
+            if (snapshot_cache.entries && requested_prefix > common &&
                 common + off + cc == requested_prefix)
                 pending_prefix_snapshot = hip_llm_snapshot_state(gpu);
             off += cc;
@@ -672,6 +697,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         if (g_stdio_cancel) cancelled = 1;
         if (cancelled) {
             hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
             active_identity[0] = '\0';
@@ -682,6 +708,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         }
         if (!logits && prompt_added > 0) {
             hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
             active_identity[0] = '\0';
@@ -691,11 +718,13 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
          * decoded to UTF-8 and may not re-tokenize to the original BPE pieces
          * on the next turn. If that happens, restore this boundary and replay
          * only the appended conversation suffix instead of resetting. */
-        pending_prompt_snapshot = hip_llm_snapshot_state(gpu);
+        if (snapshot_cache.entries)
+            pending_prompt_snapshot = hip_llm_snapshot_state(gpu);
         hllm_sampler *sampler = use_reference ? hllm_sampler_create(&request_sampling, n_vocab) : NULL;
         if (use_reference && !sampler) {
             hip_llm_free_state_snapshot(pending_prefix_snapshot);
             hip_llm_free_state_snapshot(pending_prompt_snapshot);
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
             active_identity[0] = '\0';
@@ -910,6 +939,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         if (mtp_error) {
             hip_llm_free_state_snapshot(pending_prefix_snapshot);
             hip_llm_free_state_snapshot(pending_prompt_snapshot);
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             cache_n = 0;
             active_identity[0] = '\0';
             hip_llm_reset_state(gpu);
@@ -969,6 +999,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             hip_llm_free_state_snapshot(pending_prefix_snapshot);
             hip_llm_free_state_snapshot(pending_prompt_snapshot);
             pending_prefix_snapshot = pending_prompt_snapshot = NULL;
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
             active_identity[0] = '\0';
@@ -977,6 +1008,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             hip_llm_free_state_snapshot(pending_prefix_snapshot);
             hip_llm_free_state_snapshot(pending_prompt_snapshot);
             pending_prefix_snapshot = pending_prompt_snapshot = NULL;
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
             active_identity[0] = '\0';
@@ -1568,7 +1600,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       [--qwen35-mtp-window] (exact Q8/Q8 target windows, draft <=15; requires decode graph)\n");
             fprintf(stderr, "       [--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7] (exact DFlash2 windows)\n");
             fprintf(stderr, "       [--qwen35-snapshot-max-tokens N] (bound Qwen3.8 Q8 prompt snapshots)\n");
-            fprintf(stderr, "       [--context-cache-entries N] [--context-cache-max-mib MiB] (bounded portable prompt snapshots)\n");
+            fprintf(stderr, "       [--context-cache-entries N] [--context-cache-max-mib MiB] (bounded prompt snapshots; portable snapshots may cross contexts)\n");
             fprintf(stderr, "       [--qwen35-reference-math] (diagnostic; incomplete whole-model parity)\n");
             fprintf(stderr, "       [--sampling-profile llama] [--seed N] [--temp T] [--top-k K] [--top-p P] [--min-p P]\n");
             fprintf(stderr, "       [--repeat-penalty R] [--presence-penalty P] [--frequency-penalty F] [--penalty-last-n N]\n");
