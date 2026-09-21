@@ -130,6 +130,7 @@ static const char *qimg21_stage_dir;
 static int qimg21_stage_block = 0;
 static int qimg21_stage_error;
 static const char *qimg21_replay_hidden;
+static const char *qimg21_replay_attention;
 
 static void dump_stage(const char *label, CUdeviceptr d, size_t n, int d0, int d1) {
     if (!qimg21_stage_dir) return;
@@ -496,7 +497,19 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
             dump_stage("rope_q",q,(size_t)N*D,N,D);
             dump_stage("rope_k",kk,(size_t)N*D,N,D);
         }
-        if(k->mma_attention) {
+        if(qimg21_replay_attention) {
+            npy_f32 replay={0};
+            if(npy_read_f32(qimg21_replay_attention,&replay))goto fail_block;
+            int valid=(replay.ndim==2 && replay.shape[0]==(size_t)N && replay.shape[1]==(size_t)D) ||
+                      (replay.ndim==3 && replay.shape[0]==1 && replay.shape[1]==(size_t)N && replay.shape[2]==(size_t)D);
+            for(size_t i=0;valid && i<replay.n;i++)
+                if(!isfinite(replay.data[i]) || replay.data[i]!=qimg21_round_bf16_host(replay.data[i]))valid=0;
+            int error=!valid || cuMemcpyHtoD(att,replay.data,replay.n*sizeof(float)) || cuCtxSynchronize();
+            npy_free(&replay);
+            if(error){fprintf(stderr,"native: invalid or failed attention-state replay\n");goto fail_block;}
+            fprintf(stderr,"native: DIAGNOSTIC ONLY: injecting attention before output projection\n");
+        }
+        else if(k->mma_attention) {
             /* Reuse the 3*D BF16 MLP hand-off allocation for Q/K/V. */
             CUdeviceptr qb=bf,kb=bf+(size_t)N*D*2,vb=bf+(size_t)N*D*4;
             if(launch_cast(r,qb,q,N*D) || launch_cast(r,kb,kk,N*D) || launch_cast(r,vb,v,N*D))goto fail_block;
@@ -639,6 +652,11 @@ int main(int argc, char **argv) {
     }
     qimg21_stage_dir = getenv("QIMG21_STAGE_DIR");
     qimg21_replay_hidden = getenv("QIMG21_REPLAY_HIDDEN");
+    qimg21_replay_attention = getenv("QIMG21_REPLAY_ATTENTION");
+    if(qimg21_replay_attention && !qimg21_replay_hidden) {
+        fprintf(stderr,"native: attention replay requires guarded hidden replay\n");
+        return 2;
+    }
     if(qimg21_replay_hidden) {
         const char *block=getenv("QIMG21_STAGE_BLOCK");char *end=NULL;
         long number=block?strtol(block,&end,10):-1;

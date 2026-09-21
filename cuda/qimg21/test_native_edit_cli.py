@@ -6,6 +6,15 @@ import unittest
 
 
 class NativeEditCliTest(unittest.TestCase):
+    def test_attention_replay_requires_hidden_replay(self):
+        binary = Path(__file__).with_name("test_cuda_qimg21_native")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("QIMG21_REPLAY_")}
+        env["QIMG21_REPLAY_ATTENTION"] = "missing.npy"
+        result = subprocess.run([str(binary)], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("attention replay requires guarded hidden replay", result.stderr)
+        self.assertNotIn("NVIDIA", result.stderr)
+
     def test_hidden_replay_guards_before_cuda(self):
         binary = Path(__file__).with_name("test_cuda_qimg21_native")
         base = {key: value for key, value in os.environ.items() if not key.startswith("QIMG21_STAGE_")}

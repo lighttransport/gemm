@@ -725,6 +725,36 @@ already exact input projections. Artifacts are
 `tmp/qimg21-replay-block17` and `tmp/qimg21-replay-block17-mixed`.
 CLI guard coverage brings the CPU suite to 26 passing tests.
 
+`QIMG21_REPLAY_ATTENTION=attention.npy` optionally injects a finite,
+BF16-valued F32 `[N,4096]` or `[1,N,4096]` tensor before attention's output
+projection. It requires the guarded hidden-state replay above and retains
+status 3/no-prediction semantics. This isolates the residual/MLP tail without
+changing normal execution. For the same low-timestep block 17, injecting
+`tmp/qimg21-pytorch-low17/b17_attn_raw.npy` alongside `b17_hidden.npy`
+produces **bit-exact** attention output projection, MLP gate/projection,
+MLP output, and final block output. The saved `b17_mod_ln2` reference hook is
+before modulation, unlike native `mod_ln2`; those boundaries must not be
+directly compared. Results: `tmp/qimg21-replay-exact-attention17/results.json`.
+This isolates the discrepancy in this block to attention/its inputs; it does
+not establish parity for other blocks or the full denoiser.
+
+```sh
+QIMG21_REPLAY_HIDDEN=tmp/qimg21-pytorch-low17/b17_hidden.npy \
+QIMG21_REPLAY_ATTENTION=tmp/qimg21-pytorch-low17/b17_attn_raw.npy \
+QIMG21_STAGE_DIR=tmp/qimg21-replay-exact-attention17 QIMG21_STAGE_BLOCK=17 \
+QIMG21_STAGE_KEYS=attn_raw,attn_out,mlp_gate,mlp_proj,mlp_out,block_17 \
+cuda/qimg21/test_cuda_qimg21_native --model /mnt/nvme01/models/qimg-21 \
+  --prompt-embeds tmp/qimg21-blockref/prompt_embeds.npy \
+  --latents tmp/qimg21-blockref/input_001.npy --height-tokens 16 --width-tokens 16 \
+  --steps 1 --timestep 0.02001953125 --normalization vector4 \
+  --rope host-table-vector4 --attention mma64-flash \
+  --out tmp/qimg21-replay-exact-attention17/forbidden.npy
+# Expected diagnostic exit status: 3; forbidden.npy must not exist.
+OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/block_replay_compare.py \
+  --reference tmp/qimg21-pytorch-low17 --candidate tmp/qimg21-replay-exact-attention17 \
+  --block 17 --require-exact --out tmp/qimg21-replay-exact-attention17/results.json
+```
+
 A subsequent exact-Q/K/V block-17 diagnostic reversed the eight 16-element
 Q/K contraction fragments while retaining reverse-64 Flash-style softmax.
 This worsened aggregate relative L2 from 5.8743e-5 to 1.0927e-4 and elementwise
