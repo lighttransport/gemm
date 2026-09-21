@@ -1,5 +1,24 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## 2026-09-22 continuation: DFlash2 long-window split retune
+
+The DFlash2 sidecar now uses twelve attention partitions once its 2,048-token
+window reaches 1,024 tokens; the 1/4 split schedule for shorter windows is
+unchanged.  An opt-in `LLM_QWEN35_DFLASH_ATTN_SPLITS` override remains for
+repeatable A/B runs.  On the fixed 256-token K=7 gate, twelve partitions
+measured 56.57 tok/s versus 56.21 with eight; the EOS-limited gate measured
+82.57 tok/s versus 82.14.  The K=4 fixed gate measured 47.50 tok/s, and the
+normal K=4 gate measured 59.69 tok/s.  Greedy K=7 retained sequence hash
+`44915ec1039a64c8`; seeded sampled K=7 and K=4 retained
+`630b7cbc72230e0d`.  The production-default K=7 sampled run measured
+69.28 tok/s with `DFLASH2 sampled verifier=exact-window`.
+
+Two other small table-staging probes were rejected.  Staging the native IQ3_S
+512-entry grid measured 42.88 tok/s at 4K and 35.74 tok/s after a random 64K
+prefix, versus 43.00 and 35.84 controls.  Staging the larger IQ2_S 1,024-entry
+grid measured 42.47 tok/s at 4K.  Both retained exact prefix/suffix hashes and
+were reverted; their existing occupancy choices remain production defaults.
+
 ## 2026-09-22 continuation: IQ2_XS launch-bounds probe
 
 The native one-row IQ2_XS matvec now carries `__launch_bounds__(512, 1)` so

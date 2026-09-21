@@ -1,5 +1,18 @@
 # Qwen3.8 DFlash2 on RDNA4
 
+## DFlash2 long-window split retune (2026-09-22)
+
+The sidecar attention launch now uses twelve partitions once its 2,048-token
+window reaches 1,024 tokens.  The 1/4 split schedule for shorter windows is
+unchanged, and `LLM_QWEN35_DFLASH_ATTN_SPLITS` remains an opt-in A/B override.
+On a fixed 256-token K=7 gate, twelve partitions measured 56.57 tok/s versus
+56.21 with eight; an EOS-limited K=7 gate measured 82.57 versus 82.14 tok/s.
+K=4 measured 47.50 tok/s on the fixed gate and 59.69 tok/s on the normal gate.
+Greedy K=7 retained sequence hash `44915ec1039a64c8`; seeded sampled K=7 and
+K=4 retained `630b7cbc72230e0d`.  The production-default sampled K=7 run
+reported `DFLASH2 sampled verifier=exact-window`, 69.28 tok/s, and the same
+seeded hash.  The target verifier and captured graph ABI are unchanged.
+
 ## IQ2_XS launch-bounds probe (2026-09-22)
 
 The native one-row IQ2_XS decode kernel is compiled with
@@ -331,15 +344,14 @@ draft/verify/commit range was 532.352--533.268 / 5818.192--5821.733 /
 60.532--62.229 ms.  This is the pre-retune 16-split sidecar baseline; the
 eight-split sidecar result below clears 40 tok/s with the same exact hashes.
 
-The DFlash2 draft attention window now uses eight splits once its 2,048-token
-window is at least half full (shorter windows retain the existing 1/4-split
-schedule).  This is separate from the target verifier's adaptive split
-selector.  On the same random-token 64K K=7 gate, the exact target suffix hash
+The earlier DFlash2 draft attention retune used eight splits once its 2,048-token
+window was at least half full (shorter windows retained the existing 1/4-split
+schedule).  This was separate from the target verifier's adaptive split
+selector.  On the random-token 64K K=7 gate, the exact target suffix hash
 remained `1c68ea2ff63ba5ab` and the prefix hash remained
 `90178de69a24a76e`; decode rose from the matched 16-split baseline of 39.91
-tok/s to 41.01 tok/s.  The run drafted 289 and accepted 213, with
-561.610/5617.379/62.382 ms draft/verify/commit.  A matched 4K K=7 run kept
-the `15f17d2640c1adfc` output hash.  The target verifier and its captured graph
+tok/s to 41.01 tok/s.  The current production choice is twelve splits based on
+the fixed-window comparison above.  The target verifier and its captured graph
 ABI are unchanged; only the sidecar proposal attention launch is retuned.
 
 The tested sidecar is

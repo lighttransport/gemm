@@ -527,7 +527,17 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
             position,rows,kd,kd,HLLM_DFLASH_WINDOW);
         int window=HLLM_DFLASH_WINDOW;
         int attention_length=position+rows < window ? position+rows : window;
-        int splits=attention_length >= 1024 ? 8 : attention_length >= 512 ? 4 : 1;
+        /* Twelve partitions improve the long 2K sidecar window by keeping
+         * more independent waves resident during the cache walk.  Keep the
+         * shorter-window geometry unchanged; the override is useful for
+         * repeatable A/B measurements without changing serving code. */
+        int splits=attention_length >= 1024 ? 12 : attention_length >= 512 ? 4 : 1;
+        const char *split_env = getenv("LLM_QWEN35_DFLASH_ATTN_SPLITS");
+        if (split_env) {
+            int forced = atoi(split_env);
+            if (forced >= 1 && forced <= HLLM_DFLASH_ATTN_MAX_SPLITS)
+                splits = forced;
+        }
         void *aa[]={&d->attn_partial,&d->q,&cl->key_cache,&cl->value_cache,&rows,
             &position,&(int){HLLM_DFLASH_HEADS},&(int){HLLM_DFLASH_KV_HEADS},
             &(int){HLLM_DFLASH_HEAD_DIM},&window,&splits};
