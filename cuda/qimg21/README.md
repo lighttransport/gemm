@@ -258,6 +258,23 @@ key-validity mask, and `img_shapes` layout. This is preparatory work only:
 the native denoiser does not yet consume editing layouts, and native VAE
 encoding/vision-conditioned text encoding remain unimplemented.
 
+`edit_kernels.h` adds experimental CUDA primitives for that layout:
+interleaved text/image scatter, Q/K RMSNorm plus layout-driven three-axis
+RoPE, and block-causal attention that keeps adjacent images separate.
+They are not selected by the denoiser yet. A synthetic, checkpoint-free
+GPU comparison is available:
+
+```sh
+make -C cuda/qimg21 test_edit_kernels
+OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/editing_kernel_regression.py
+```
+
+The harness checks exact scatter and applies the 0.99996 gate to RoPE and
+attention against official Diffusers metadata/RoPE and PyTorch math. Host
+build and sm_120 NVRTC compilation pass; GPU comparison is queued and remains
+unverified. Passing this synthetic test would not establish model editing
+parity or implement the still-missing conditioning pipeline.
+
 For native text-encoder bring-up, `test_cuda_qimg21.py --test-text
 --dump-text-stages --dump-dir DIR` additionally records `text_positive/`
 (and `text_negative/` when requested). Each directory contains exact integer
