@@ -47,6 +47,8 @@ def _flow_sigmas(steps: int, image_tokens: int) -> list[float]:
         # The C implementation evaluates 1/0 as +inf for the terminal
         # scheduler sample; its limiting sigma is exactly zero.
         sigmas.append(0.0 if u == 0.0 else emu / (emu + (1.0 / u - 1.0)))
+    if steps == 1:
+        return [1.0]
     scale = (1.0 - sigmas[-1]) / (1.0 - 0.02)
     return [1.0 - (1.0 - sigma) / scale for sigma in sigmas]
 

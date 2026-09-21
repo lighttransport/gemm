@@ -146,6 +146,13 @@ static void qimg21_flow_sigmas(int steps, int image_tokens, float *sigmas) {
         float u = (steps == 1) ? 1.0f : 1.0f - (float)i / (float)(steps - 1);
         sigmas[i] = emu / (emu + (1.0f / u - 1.0f));
     }
+    /* With one inference step the scheduler has no interior endpoint to
+     * stretch; it is simply the t=1 denoiser call followed by sigma=0. */
+    if (steps == 1) {
+        sigmas[0] = 1.0f;
+        sigmas[1] = 0.0f;
+        return;
+    }
     /* shift_terminal=0.02: stretch so the last requested sigma is .02. */
     const float scale = (1.0f - sigmas[steps - 1]) / (1.0f - 0.02f);
     for (int i = 0; i < steps; i++) sigmas[i] = 1.0f - (1.0f - sigmas[i]) / scale;
@@ -382,12 +389,16 @@ done:
 
 int main(int argc, char **argv) {
     const char *model = NULL, *prompt_path = NULL, *latent_path = NULL;
+    const char *negative_prompt_path = NULL;
     const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
     int ih = 16, iw = 16, steps = 1, verbose = 1;
+    float guidance_scale = 1.0f;
     float manual_t = -1.0f;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--prompt-embeds") && i + 1 < argc) prompt_path = argv[++i];
+        else if (!strcmp(argv[i], "--negative-prompt-embeds") && i + 1 < argc) negative_prompt_path = argv[++i];
+        else if (!strcmp(argv[i], "--guidance-scale") && i + 1 < argc) guidance_scale = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--latents") && i + 1 < argc) latent_path = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) dump_dir = argv[++i];
@@ -400,6 +411,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--quiet")) verbose = 0;
         else {
             fprintf(stderr, "usage: %s --model DIR --prompt-embeds E.npy --latents L.npy "
+                    "[--negative-prompt-embeds NEG.npy --guidance-scale S] "
                     "[--steps N --dump-dir DIR --pred-dir DIR --height-tokens 16 --width-tokens 16 "
                     "--timestep .5 --out O.npy --verbose]\n", argv[0]);
             return 2;
@@ -413,17 +425,26 @@ int main(int argc, char **argv) {
         mkdir(qimg21_stage_dir, 0755);
     }
     if(!model||!prompt_path||!latent_path||ih*iw<=0)return 2;
-    npy_f32 pe,la;if(npy_read_f32(prompt_path,&pe)!=0||npy_read_f32(latent_path,&la)!=0)return 1;
+    npy_f32 pe,neg,la; memset(&neg,0,sizeof(neg));
+    if(npy_read_f32(prompt_path,&pe)!=0||npy_read_f32(latent_path,&la)!=0)return 1;
+    if (negative_prompt_path && npy_read_f32(negative_prompt_path, &neg) != 0) { npy_free(&pe); npy_free(&la); return 1; }
     int nt=(pe.ndim==3&&pe.shape[0]==1)?(int)pe.shape[1]:(pe.ndim==2?(int)pe.shape[0]:0), ni=(la.ndim==3&&la.shape[0]==1)?(int)la.shape[1]:(la.ndim==2?(int)la.shape[0]:0);
-    if(nt<=0||pe.shape[pe.ndim-1]!=4096||ni!=ih*iw||la.shape[la.ndim-1]!=64){fprintf(stderr,"native: expected embeds [1,T,4096] and latents [N,64]\n");return 1;}
+    int nnt=(neg.ndim==3&&neg.shape[0]==1)?(int)neg.shape[1]:(neg.ndim==2?(int)neg.shape[0]:0);
+    if(nt<=0||pe.shape[pe.ndim-1]!=4096||ni!=ih*iw||la.shape[la.ndim-1]!=64||
+       (negative_prompt_path && (nnt<=0 || neg.shape[neg.ndim-1]!=4096))){
+        fprintf(stderr,"native: expected embeds [T,4096], optional negative embeds [U,4096], and latents [N,64]\n");
+        npy_free(&pe); npy_free(&neg); npy_free(&la); return 1;
+    }
+    if (negative_prompt_path && guidance_scale <= 1.0f) { fprintf(stderr,"native: guidance-scale must be > 1 with negative embeds\n"); npy_free(&pe); npy_free(&neg); npy_free(&la); return 1; }
     const float *p=pe.data; cuda_qimg_runner*r=cuda_qimg_init(0,verbose);if(!r)return 1;
     qimg21_shards s={{0},0};char path[1024];for(int i=1;i<=2;i++){snprintf(path,sizeof(path),"%s/transformer/diffusion_pytorch_model-%05d-of-00002.safetensors",model,i);s.st[s.n]=safetensors_open(path);if(!s.st[s.n]){fprintf(stderr,"native: cannot open %s\n",path);cuda_qimg_free(r);return 1;}fprintf(stderr,"native: opened shard %d (%d tensors)\n",i,s.st[s.n]->n_tensors);s.n++;}
     qimg21_kernels k;CUmodule m;if(cu_compile_kernels(&m,r->device,qimg21_src,"qimg21_native.cu",verbose,"qimg21_native")<0||get_kernel(&k,m)!=0){fprintf(stderr,"native: custom kernel compile failed\n");return 1;}fprintf(stderr,"native: custom kernels ready\n");
     if (dump_dir) mkdir(dump_dir, 0755);
     if (pred_dir) mkdir(pred_dir, 0755);
     float *pred = (float *)malloc((size_t)ni * 64 * sizeof(float));
+    float *neg_pred = negative_prompt_path ? (float *)malloc((size_t)ni * 64 * sizeof(float)) : NULL;
     float *sigmas = (float *)malloc((size_t)(steps + 1) * sizeof(float));
-    if (!pred || !sigmas) return 1;
+    if (!pred || (negative_prompt_path && !neg_pred) || !sigmas) { free(pred); free(neg_pred); free(sigmas); npy_free(&pe); npy_free(&neg); npy_free(&la); return 1; }
     if (manual_t >= 0.0f) {
         for (int i = 0; i <= steps; i++) sigmas[i] = (i == 0) ? manual_t : 0.0f;
     } else qimg21_flow_sigmas(steps, ni, sigmas);
@@ -431,6 +452,11 @@ int main(int argc, char **argv) {
     for (int i = 0; i < steps; i++) {
         fprintf(stderr, "native: step %d/%d sigma=%.7f\n", i + 1, steps, sigmas[i]);
         rc = native_step(r, &k, &s, p, nt, la.data, ni, ih, iw, sigmas[i], pred);
+        if (rc == 0 && negative_prompt_path) {
+            rc = native_step(r, &k, &s, neg.data, nnt, la.data, ni, ih, iw, sigmas[i], neg_pred);
+            if (rc == 0) for (size_t j = 0; j < (size_t)ni * 64; j++)
+                pred[j] = neg_pred[j] + guidance_scale * (pred[j] - neg_pred[j]);
+        }
         if (rc != 0) break;
         if (pred_dir) {
             char pred_path[1024];
@@ -449,6 +475,6 @@ int main(int argc, char **argv) {
         npy_write_f32(out_path, la.data, (size_t)ni * 64, ni, 64);
         fprintf(stderr, "native: wrote %s (%d tokens x 64, %d steps)\n", out_path, ni, steps);
     }
-    free(pred); free(sigmas); cuModuleUnload(m); for(int i=0;i<s.n;i++)safetensors_close(s.st[i]);
-    cuda_qimg_free(r); npy_free(&pe); npy_free(&la); return rc;
+    free(pred); free(neg_pred); free(sigmas); cuModuleUnload(m); for(int i=0;i<s.n;i++)safetensors_close(s.st[i]);
+    cuda_qimg_free(r); npy_free(&pe); npy_free(&neg); npy_free(&la); return rc;
 }

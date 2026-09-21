@@ -77,6 +77,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompt", default="a red apple on a white table")
+    ap.add_argument("--negative-prompt")
+    ap.add_argument("--true-cfg-scale", type=float, default=1.0)
+    ap.add_argument("--image", help="editing image (native denoiser does not support image conditioning yet)")
     ap.add_argument("--height", type=int, default=256)
     ap.add_argument("--width", type=int, default=256)
     ap.add_argument("--steps", type=int, default=2)
@@ -106,6 +109,10 @@ def main() -> int:
         raise SystemExit("height and width must be divisible by 32")
     if args.steps < 1 or args.steps > 100:
         raise SystemExit("steps must be between 1 and 100")
+    if args.negative_prompt and args.true_cfg_scale <= 1.0:
+        raise SystemExit("--true-cfg-scale must be > 1 when --negative-prompt is used")
+    if args.image:
+        raise SystemExit("native image conditioning is not yet supported; use test_cuda_qimg21.py for editing")
 
     prompt_dir = work / "prompt"
     steps_dir = work / "steps"
@@ -113,9 +120,9 @@ def main() -> int:
     steps_dir.mkdir(parents=True, exist_ok=True)
 
     # --test-text uses the exact Qwen3-VL tokenizer/text encoder from the
-    # reference runner and writes prompt_embeds.npy through its callback.
-    _run(
-        [
+    # reference runner and writes prompt_embeds.npy.  With a negative prompt
+    # it also writes a second embedding fixture for native true CFG.
+    text_command = [
             sys.executable,
             str(root / "cuda/qimg21/test_cuda_qimg21.py"),
             "--test-text",
@@ -129,9 +136,10 @@ def main() -> int:
             str(prompt_dir),
             "--out",
             str(prompt_dir / "text_smoke.png"),
-        ],
-        cwd=root,
-    )
+        ]
+    if args.negative_prompt:
+        text_command.extend(["--negative-prompt", args.negative_prompt])
+    _run(text_command, cwd=root)
     prompt_path = prompt_dir / "prompt_embeds.npy"
     if not prompt_path.exists():
         raise SystemExit(f"text runner did not produce {prompt_path}")
@@ -162,11 +170,10 @@ def main() -> int:
             "--out-dir",
             str(work),
         ],
-        root,
+        cwd=root,
     )
     native_latents = work / "native_latents.npy"
-    _run(
-        [
+    native_command = [
             str(native_bin),
             "--model",
             str(model),
@@ -184,9 +191,15 @@ def main() -> int:
             str(steps_dir),
             "--out",
             str(native_latents),
-        ],
-        cwd=root,
-    )
+        ]
+    if args.negative_prompt:
+        native_command.extend([
+            "--negative-prompt-embeds",
+            str(prompt_dir / "negative_prompt_embeds.npy"),
+            "--guidance-scale",
+            str(args.true_cfg_scale),
+        ])
+    _run(native_command, cwd=root)
     _decode_vae(model, native_latents, out, args.height, args.width, args.dtype)
     print(f"native denoise trace: {steps_dir}")
     print(f"fixtures: {work}")

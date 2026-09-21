@@ -69,12 +69,26 @@ not the denoiser acceptance metric: small arithmetic differences can compound
 through repeated scheduler updates. This direct check does not require a VAE
 image decode.
 
-The first native deliverable is batch-1 text-to-image with the model’s
-recommended no-guidance path. Condition-image editing, true CFG, and
-quantized weights remain outside the native path. The native executable takes the text
-encoder output as an F32 `.npy` fixture; text-tokenisation and the Qwen3-VL
+The native path is batch-1 text-to-image. It accepts either the model’s
+recommended no-guidance path or a second negative embedding fixture for true
+CFG; the latter runs two native denoiser passes per step and applies the same
+linear blend as the Qwen-Image 2.1 pipeline. The native executable takes the
+text encoder output as an F32 `.npy` fixture; tokenisation and the Qwen3-VL
 text encoder remain at that Python boundary. The scheduler loop is native now,
 while the official Qwen-Image 2.1 VAE is used as a separate decode stage.
+
+For native true CFG, pass `--negative-prompt` and `--true-cfg-scale` to
+`native_generate.py` (the negative embedding is exported beside the positive
+fixture):
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/native_generate.py \
+  --model /mnt/nvme01/models/qimg-21 \
+  --prompt "a red apple on a white table" \
+  --negative-prompt "blurry, distorted" --true-cfg-scale 4.0 \
+  --height 256 --width 256 --steps 2 \
+  --work-dir tmp/qimg21-native-cfg --out tmp/qimg21-native-cfg.png
+```
 
 The Python reference/runner also expose the model’s editing and true-CFG
 controls for baseline comparisons:
@@ -88,9 +102,11 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_cuda_qimg21.py \
   --steps 40 --out tmp/qimg21-edit.png
 ```
 
-These controls are currently a Python baseline; the native C denoiser remains
-text-only/no-guidance until image conditioning and the second CFG pass are
-ported and accepted against the same checkpoint gate.
+Editing remains a Python baseline: native condition-image tokens and the VAE
+image-conditioning hand-off still need to be ported and accepted against the
+same checkpoint gate. Quantized native weights likewise remain a separate
+calibration task; use the provisional `--quantized` comparator threshold until
+that work is measured.
 
 ## Native transformer step
 

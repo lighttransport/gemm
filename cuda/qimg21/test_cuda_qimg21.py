@@ -55,7 +55,7 @@ def _save_array(path: Path, value) -> None:
     np.save(path, np.ascontiguousarray(np.asarray(value)))
 
 
-def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None) -> None:
+def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None, negative_prompt: str | None = None) -> None:
     torch = _torch()
     with torch.inference_mode():
         embeds, mask, image_mask = pipe.encode_prompt(
@@ -67,6 +67,20 @@ def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None) -> None:
     _save_array(out_dir / "prompt_embeds.npy", embeds)
     _save_array(out_dir / "prompt_mask.npy", mask if mask is not None else np.ones(embeds.shape[:2], dtype=np.bool_))
     _save_array(out_dir / "image_pad_mask.npy", image_mask)
+    if negative_prompt is not None:
+        with torch.inference_mode():
+            negative_embeds, negative_mask, negative_image_mask = pipe.encode_prompt(
+                prompt=negative_prompt,
+                image=image,
+                device=torch.device("cuda"),
+                num_images_per_prompt=1,
+            )
+        _save_array(out_dir / "negative_prompt_embeds.npy", negative_embeds)
+        _save_array(
+            out_dir / "negative_prompt_mask.npy",
+            negative_mask if negative_mask is not None else np.ones(negative_embeds.shape[:2], dtype=np.bool_),
+        )
+        _save_array(out_dir / "negative_image_pad_mask.npy", negative_image_mask)
     print(f"saved prompt fixtures in {out_dir}")
 
 
@@ -184,11 +198,11 @@ def main() -> int:
         if args.test_text:
             if not args.dump_dir:
                 raise SystemExit("--test-text requires --dump-dir")
-            args.generate = True
-            args.steps = 1
-            args.height = 256
-            args.width = 256
-            return generate(args)
+            pipe = _load_pipe(Path(args.model).resolve(), args.dtype)
+            image = Image.open(args.image) if args.image else None
+            _dump_prompt(pipe, args.prompt, Path(args.dump_dir), image, args.negative_prompt)
+            del pipe
+            return 0
         pipe = _load_pipe(Path(args.model).resolve(), args.dtype)
         del pipe
         return 0
