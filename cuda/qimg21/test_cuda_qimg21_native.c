@@ -15,6 +15,7 @@
 #define SAFETENSORS_IMPLEMENTATION
 #define CUDA_QIMG_RUNNER_IMPLEMENTATION
 #include "../../common/safetensors.h"
+#include "quant_weights.h"
 #include "../qimg/cuda_qimg_runner.h"
 
 #include <errno.h>
@@ -169,9 +170,24 @@ static st_context *find_tensor(const qimg21_shards *s, const char *name, int *id
     return NULL;
 }
 
+static const char *qimg21_quantized_transformer;
+
 static CUdeviceptr upload_bf16(const qimg21_shards *s, const char *name) {
     int idx; st_context *st = find_tensor(s, name, &idx);
     if (!st) { fprintf(stderr, "native: missing tensor %s\n", name); return 0; }
+    if (qimg21_quantized_transformer && safetensors_ndims(st, idx) == 2) {
+        const uint64_t *shape = safetensors_shape(st, idx);
+        char path[2048];
+        int len = snprintf(path, sizeof(path), "%s/%s.safetensors", qimg21_quantized_transformer, name);
+        if (len < 0 || len >= (int)sizeof(path)) return 0;
+        uint16_t *data = q21_read_int8_matrix(path, shape[0], shape[1]);
+        if (!data) { fprintf(stderr, "native: invalid/missing INT8 matrix %s\n", path); return 0; }
+        size_t bytes = (size_t)shape[0] * shape[1] * 2;
+        CUdeviceptr d = checked_cuMemAlloc(bytes);
+        if (d && cuMemcpyHtoD(d, data, bytes) != CUDA_SUCCESS) { cuMemFree(d); d = 0; }
+        free(data);
+        return d;
+    }
     const char *dt = safetensors_dtype(st, idx);
     size_t nbytes = safetensors_nbytes(st, idx);
     size_t n = nbytes / (!strcmp(dt, "F32") ? sizeof(float) : sizeof(uint16_t));
@@ -424,6 +440,7 @@ int main(int argc, char **argv) {
     float manual_t = -1.0f;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
+        else if (!strcmp(argv[i], "--quantized-transformer") && i + 1 < argc) qimg21_quantized_transformer = argv[++i];
         else if (!strcmp(argv[i], "--prompt-embeds") && i + 1 < argc) prompt_path = argv[++i];
         else if (!strcmp(argv[i], "--negative-prompt-embeds") && i + 1 < argc) negative_prompt_path = argv[++i];
         else if (!strcmp(argv[i], "--guidance-scale") && i + 1 < argc) guidance_scale = (float)atof(argv[++i]);
@@ -446,6 +463,16 @@ int main(int argc, char **argv) {
         }
     }
     if (steps < 1 || steps > 100 || (manual_t >= 0.0f && steps != 1)) return 2;
+    if (qimg21_quantized_transformer) {
+        char path[2048], format[64];
+        int len = snprintf(path, sizeof(path), "%s/format.txt", qimg21_quantized_transformer);
+        if (len < 0 || len >= (int)sizeof(path)) return 2;
+        FILE *fp = fopen(path, "r");
+        int valid = fp && fgets(format, sizeof(format), fp) && !strcmp(format, "qimg21-int8-row-v1\n");
+        if (fp) fclose(fp);
+        if (!valid) { fprintf(stderr, "native: incomplete/unsupported quantized package\n"); return 2; }
+        fprintf(stderr, "native: optional row-INT8 weights, BF16 dequantized compute (quality unvalidated)\n");
+    }
     qimg21_stage_dir = getenv("QIMG21_STAGE_DIR");
     if (qimg21_stage_dir) {
         const char *b = getenv("QIMG21_STAGE_BLOCK");

@@ -100,8 +100,15 @@ def main() -> int:
     )
     ap.add_argument("--native-bin", default="cuda/qimg21/test_cuda_qimg21_native")
     ap.add_argument("--quantized", action="store_true")
+    ap.add_argument("--quantized-transformer", type=Path, help="Optional native row-INT8 package")
     ap.add_argument("--cosine-threshold", type=float)
     args = ap.parse_args()
+    if args.quantized_transformer:
+        if not args.native:
+            ap.error("--quantized-transformer requires --native")
+        args.quantized = True
+    elif args.quantized:
+        ap.error("--quantized requires an actual --quantized-transformer package")
 
     root = Path(__file__).resolve().parents[2]
     model = Path(args.model).resolve()
@@ -174,6 +181,8 @@ def main() -> int:
                 if args.negative_prompt is not None:
                     guidance = ["--negative-prompt-embeds", str(ref_dir / "negative_prompt_embeds.npy"),
                                 "--guidance-scale", str(args.true_cfg_scale)]
+                if args.quantized_transformer:
+                    guidance.extend(["--quantized-transformer", str(args.quantized_transformer.resolve())])
                 fallback_sigmas = _flow_sigmas(case.steps, (case.height // 16) * (case.width // 16))
                 timesteps = []
                 for step, fallback in enumerate(fallback_sigmas):

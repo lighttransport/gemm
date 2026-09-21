@@ -40,6 +40,35 @@ calibration set establishes a tighter measured threshold. Use
 The regression driver also records `initial_latents.npy`, preserving the exact
 PyTorch-packed noise input for native denoiser comparisons.
 
+An optional **experimental** row-scaled INT8 transformer package can be
+exported without modifying the original snapshot:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/quantize_weights.py \
+  --model /mnt/nvme01/models/qimg-21 --out tmp/qimg21-int8-weights
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/regression.py --native \
+  --model /mnt/nvme01/models/qimg-21 --quantized-transformer tmp/qimg21-int8-weights \
+  --case 256x256:2:42 --work-dir tmp/qimg21-int8-regression
+```
+
+The output directory must be new and needs space for the complete compressed
+transformer. Each matrix stores symmetric `[-127,127]` INT8 rows with F32
+scales; vectors remain in the original checkpoint. The native C loader
+dequantizes one matrix at a time to BF16 before upload, retaining the existing
+BF16 GEMM path. This compresses weights on disk; it is not an INT8 GEMM
+acceleration or a reduction in the uploaded matrix's GPU size. Both the native
+executable and `native_generate.py` accept `--quantized-transformer DIR`.
+Missing/invalid matrices fail rather than silently falling back to BF16.
+
+CPU tests compare native reconstruction bit-for-bit with PyTorch BF16 and
+reject invalid scales, shapes, and payloads:
+`make -C cuda/qimg21 test_quant_weights && tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_quant_weights.py`.
+Full-checkpoint export, GPU model parity, image quality, and quantizer-specific
+threshold calibration remain unverified. The `0.995` quantized model-output
+gate is still provisional, not measured acceptance. The regression driver
+selects it only when an actual quantized package is supplied; `--quantized`
+alone cannot relabel a BF16 run as a quantized experiment.
+
 Current native BF16 arithmetic explicitly rounds the text projection before
 GELU and Q/K normalization before multiplication by the learned RMS weights.
 On the saved 256x256/seed42 two-step reference, matched-input denoiser cosine
