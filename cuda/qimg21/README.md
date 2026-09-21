@@ -322,6 +322,13 @@ executable can save matching boundaries with `--dump-dir DIR`.
 First-layer `stage_*.npy` files expose normalization, Q/K/V projections,
 Q/K normalization, attention output, and MLP projections for matched-stage
 comparisons.
+RoPE-specific diagnosis shows precise CUDA math matches the first layer's
+rotary Q/K values bit-for-bit; default fast math differs in 36 Q and 2 K
+elements on the 29-token prompt. A full precise-math text run still fails
+(full cosine 0.9997824312, cropped 0.9994433137), so this is not a solution
+to encoder acceptance. Unlike the text projections, changing all denoiser
+GEMMs to BF16 outputs left both low-timestep attention-mode results unchanged;
+that unsuccessful denoiser experiment was removed.
 
 For native true CFG, pass `--negative-prompt` and `--true-cfg-scale` to
 `native_generate.py` (the negative embedding is exported beside the positive

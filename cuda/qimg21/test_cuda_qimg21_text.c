@@ -152,6 +152,7 @@ int main(int argc, char **argv) {
         CHECK(cuLaunchKernel(rope,n,32,1,64,1,1,0,r->stream,qa,NULL));
         heads=8; void *ka[]={&key,&heads};
         CHECK(cuLaunchKernel(rope,n,8,1,64,1,1,0,r->stream,ka,NULL));
+        DUMP("rope_q",q,4096); DUMP("rope_k",key,1024);
         void *aa[]={&att,&q,&key,&v,&n};
         CHECK(cuLaunchKernel(attention,32,n,1,32,1,1,0,r->stream,aa,NULL));
         CHECK(launch_vec(base.round_bf16,r->stream,n*4096,att));
