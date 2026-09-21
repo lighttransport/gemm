@@ -73,6 +73,11 @@ python3 rdna4/llm/test_qwen35_dflash2_http.py \
   --sidecar /mnt/nvme02/models/qwen38/27b/dflash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 ```
 
+The ordinary target's sampled random-64K quality gate also passes: a
+temperature-0.6, seed-42 suffix retains prefix hash `90178de69a24a76e`,
+produces suffix hash `34e2f6bc082bc49f`, and completes 32 tokens with
+`Result: PASS` after a 445.67 tok/s random prefix.
+
 The reference validator accepts the sidecar directly:
 
 ```sh

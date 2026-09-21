@@ -216,6 +216,9 @@ not yet include its private recurrent cache.  This favors output correctness
 over cache reuse until a sidecar snapshot is implemented.
 The reproducible GPU gate is `test_qwen35_dflash2_http.py`; it checks greedy
 and seeded sampled repeatability plus a coherent C++ response.
+The sampled random-64K target gate now passes 32 suffix tokens with prefix hash
+`90178de69a24a76e`, suffix hash `34e2f6bc082bc49f`, and `Result: PASS` after a
+445.67 tok/s prefix.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
