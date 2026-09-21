@@ -97,6 +97,8 @@ def main() -> int:
     )
     ap.add_argument("--native-bin", default="cuda/qimg21/test_cuda_qimg21_native")
     ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64"), default="math")
+    ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
+    ap.add_argument("--native-rope", choices=("default", "host-table"), default="default")
     ap.add_argument("--quantized", action="store_true")
     ap.add_argument("--quantized-transformer", type=Path, help="Optional native row-INT8 package")
     ap.add_argument("--quantize-on-load", choices=("int8-row",), help="Quantize each matrix without a disk export")
@@ -104,6 +106,8 @@ def main() -> int:
     args = ap.parse_args()
     if args.native_attention != "math" and not args.native:
         ap.error("--native-attention requires --native")
+    if not args.native and (args.native_normalization != "default" or args.native_rope != "default"):
+        ap.error("native normalization/rope options require --native")
     if args.quantized_transformer and args.quantize_on_load:
         ap.error("choose a package or quantize-on-load, not both")
     if args.quantized_transformer or args.quantize_on_load:
@@ -180,7 +184,8 @@ def main() -> int:
             _run(reference_command, root)
             if args.native:
                 run_dir.mkdir(parents=True, exist_ok=True)
-                guidance = ["--attention", args.native_attention]
+                guidance = ["--attention", args.native_attention, "--normalization", args.native_normalization,
+                            "--rope", args.native_rope]
                 if args.negative_prompt is not None:
                     guidance.extend(["--negative-prompt-embeds", str(ref_dir / "negative_prompt_embeds.npy"),
                                      "--guidance-scale", str(args.true_cfg_scale)])
@@ -191,6 +196,7 @@ def main() -> int:
                 timesteps = _load_timesteps(ref_dir, case.steps)
                 (run_dir / "native_config.json").write_text(json.dumps({
                     "attention": args.native_attention, "model": str(model),
+                    "normalization": args.native_normalization, "rope": args.native_rope,
                     "quantized_transformer": str(args.quantized_transformer.resolve()) if args.quantized_transformer else None,
                     "quantize_on_load": args.quantize_on_load,
                     "dtype": args.dtype, "timesteps": timesteps,

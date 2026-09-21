@@ -89,6 +89,8 @@ def main() -> int:
     ap.add_argument("--out", default="tmp/qimg21-native-generate.png")
     ap.add_argument("--native-bin", default="cuda/qimg21/test_cuda_qimg21_native")
     ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64"), default="math")
+    ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
+    ap.add_argument("--native-rope", choices=("default", "host-table"), default="default")
     ap.add_argument("--quantized-transformer", type=Path,
                     help="Optional experimental row-INT8 transformer package")
     ap.add_argument("--quantize-on-load", choices=("int8-row",))
@@ -202,6 +204,7 @@ def main() -> int:
             "--out",
             str(native_latents),
         ]
+    native_command.extend(["--normalization", args.native_normalization, "--rope", args.native_rope])
     if args.negative_prompt is not None:
         native_command.extend([
             "--negative-prompt-embeds",

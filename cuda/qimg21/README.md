@@ -499,6 +499,26 @@ the denoiser's projection, not the separate Qwen3-VL text encoder. The prior
 host-table/vector-normalization/MMA64 combination (before this GELU fix)
 completed at cosine 0.999952815 and did not meet acceptance either.
 
+With the GELU fix, the combined `--attention mma64 --normalization vector4
+--rope host-table` path passes the previously failing saved low-timestep
+checkpoint: cosine **0.9999618066543818**, relative L2 **0.0087566643**.
+The corrected GELU/default-attention high-timestep check is **0.999987734990**.
+These are bounded checkpoint results, not complete acceptance or a default
+configuration change. A refreshed combined first-block capture has bit-exact
+text projection, modulation, Q and V; block output is 98.7822% exact with
+cosine 0.999999999837.
+
+Both Python wrappers now accept `--native-normalization` and `--native-rope`
+alongside `--native-attention`; regression records them in `native_config.json`.
+Broader validation is running with:
+
+```sh
+OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/regression.py \
+  --native --native-attention mma64 --native-normalization vector4 --native-rope host-table \
+  --model /mnt/nvme01/models/qimg-21 --case 256x256:2:42 --case 256x512:2:123 \
+  --case 512x512:4:7 --work-dir tmp/qimg21-accurate-regression
+```
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh
