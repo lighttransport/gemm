@@ -151,6 +151,12 @@ set `QIMG21_STAGE_DIR` and `QIMG21_STAGE_BLOCK` when running a native denoiser
 fixture. The dump includes `rope_q.npy`, `rope_k.npy`, `v.npy`, and
 `attn_raw.npy`. Replay those exact inputs with:
 
+For disk-bounded capture, set `QIMG21_STAGE_KEYS=rope_q,rope_k,v,attn_raw`
+(exact comma-separated labels). A text-to-image probe also needs `txt_input`;
+editing probes instead take `--editing-reference CAPTURE_DIR` and reproduce
+the official per-segment attention calls from its image layout. This separates
+attention arithmetic from accumulated projection/normalization errors.
+
 ```sh
 tmp/qimg21-ref-venv/bin/python cuda/qimg21/attention_probe.py \
   --stage-dir tmp/qimg21-attn-native17
@@ -346,6 +352,11 @@ After editing integration, the original 256x256 text-to-image timestep-1
 prediction still has cosine 0.9999811334183142 versus its saved reference,
 the same measured result as before integration. The independent editing
 rerun reproduces its failing timestep-1 cosine exactly (0.9999323775131732).
+The complete two-step editing regression fails all four checks: prediction
+cosines **0.999932378 / 0.999845282**, trajectory cosines
+**0.999911016 / 0.999911662**. All outputs are finite. Separately, disabling
+CUDA fast math and FMA for the original text-to-image low-timestep fixture
+gives **0.999953708**, also below the gate; neither diagnostic changes defaults.
 
 `edit_kernels.h` adds experimental CUDA primitives for that layout:
 interleaved text/image scatter, Q/K RMSNorm plus layout-driven three-axis

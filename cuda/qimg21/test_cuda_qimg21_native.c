@@ -124,6 +124,21 @@ static int qimg21_stage_block = 0;
 
 static void dump_stage(const char *label, CUdeviceptr d, size_t n, int d0, int d1) {
     if (!qimg21_stage_dir) return;
+    /* Bound diagnostics for editing sequences: a full block dump can exceed
+     * a gigabyte. Exact comma-separated labels avoid copying unused stages. */
+    const char *selected=getenv("QIMG21_STAGE_KEYS");
+    if(selected) {
+        int found=0;
+        size_t length=strlen(label);
+        for(const char *p=selected;*p;) {
+            const char *end=strchr(p,',');
+            size_t size=end?(size_t)(end-p):strlen(p);
+            if(size==length && !memcmp(p,label,length)){found=1;break;}
+            if(!end)break;
+            p=end+1;
+        }
+        if(!found)return;
+    }
     char path[1024];
     float *h = (float *)malloc(n * sizeof(float));
     if (!h) return;

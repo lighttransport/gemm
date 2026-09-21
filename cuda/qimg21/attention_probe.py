@@ -14,9 +14,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--stage-dir", type=Path, required=True)
     ap.add_argument("--backend", choices=("default", "math", "flash"), default="default")
+    ap.add_argument("--editing-reference", type=Path,
+                    help="Use official segmented editing attention from a positive-branch capture")
     args = ap.parse_args()
     folder = args.stage_dir
-    prefix = np.load(folder / "txt_input.npy").shape[0]
+    prefix = None if args.editing_reference else np.load(folder / "txt_input.npy").shape[0]
 
     def load(name):
         a = np.load(folder / f"{name}.npy")
@@ -24,15 +26,39 @@ def main():
             1, -1, 32, 128).transpose(1, 2)
 
     q, k, v = load("rope_q"), load("rope_k"), load("v")
-    mask = torch.ones(prefix, prefix, device="cuda", dtype=torch.bool).tril()
     from torch.nn.attention import SDPBackend, sdpa_kernel
     backend = nullcontext() if args.backend == "default" else sdpa_kernel(
         SDPBackend.MATH if args.backend == "math" else SDPBackend.FLASH_ATTENTION)
     with torch.inference_mode(), backend:
-        text = F.scaled_dot_product_attention(q[:, :, :prefix], k[:, :, :prefix],
+        if args.editing_reference:
+            from diffusers.models.transformers.transformer_qwenimage21 import (
+                QwenImage21Transformer2DModel, _qwenimage21_prefix_segments,
+            )
+            reference = args.editing_reference
+            slots = torch.from_numpy(np.load(reference / "positive_img_mask.npy"))[0].bool()
+            shapes = json.loads((reference / "positive_layout.json").read_text())["img_shapes"][0]
+            ids, target = QwenImage21Transformer2DModel.build_token_metadata(
+                slots.repeat_interleave(torch.where(slots, 4, 1)), shapes)
+            prefix = int((~target).sum())
+            valid = np.load(reference / "positive_encoder_hidden_states_mask.npy")
+            if not (valid == 1).all() or len(ids) != q.shape[2]:
+                raise ValueError("editing probe requires matching unpadded capture")
+            outputs = []
+            for start, end, is_text in _qwenimage21_prefix_segments(ids, prefix):
+                mask = None
+                if is_text:
+                    mask = torch.cat([torch.ones(end-start, start, device="cuda", dtype=torch.bool),
+                                      torch.ones(end-start, end-start, device="cuda", dtype=torch.bool).tril()], dim=1)
+                outputs.append(F.scaled_dot_product_attention(q[:, :, start:end], k[:, :, :end],
+                                                              v[:, :, :end], attn_mask=mask))
+            outputs.append(F.scaled_dot_product_attention(q[:, :, prefix:], k, v))
+            ref = torch.cat(outputs, dim=2).transpose(1, 2).flatten(2)
+        else:
+            mask = torch.ones(prefix, prefix, device="cuda", dtype=torch.bool).tril()
+            text = F.scaled_dot_product_attention(q[:, :, :prefix], k[:, :, :prefix],
                                               v[:, :, :prefix], attn_mask=mask)
-        image = F.scaled_dot_product_attention(q[:, :, prefix:], k, v)
-        ref = torch.cat([text, image], dim=2).transpose(1, 2).flatten(2)
+            image = F.scaled_dot_product_attention(q[:, :, prefix:], k, v)
+            ref = torch.cat([text, image], dim=2).transpose(1, 2).flatten(2)
     ref = ref.float().cpu().numpy()[0]
     native = np.load(folder / "attn_raw.npy")
     if native.shape != ref.shape:
