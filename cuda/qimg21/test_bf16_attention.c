@@ -6,8 +6,9 @@
 
 int main(int argc, char **argv) {
     if(argc!=4 && !(argc==5 && (!strcmp(argv[4],"--reverse64") || !strcmp(argv[4],"--flash-softmax") ||
-                              !strcmp(argv[4],"--forward64") || !strcmp(argv[4],"--forward64-flash")))){
-        fprintf(stderr,"usage: %s STAGE_DIR LAYOUT.txt OUT.npy [--reverse64|--flash-softmax|--forward64|--forward64-flash]\n",argv[0]);return 2;
+                              !strcmp(argv[4],"--forward64") || !strcmp(argv[4],"--forward64-flash") ||
+                              !strcmp(argv[4],"--forward64-flash-raw")))){
+        fprintf(stderr,"usage: %s STAGE_DIR LAYOUT.txt OUT.npy [--reverse64|--flash-softmax|--forward64|--forward64-flash|--forward64-flash-raw]\n",argv[0]);return 2;
     }
     q21_joint_layout layout={0};
     int nt,ih,iw,rc=1;
@@ -34,8 +35,10 @@ int main(int argc, char **argv) {
         shared_bytes=4*64*136*2;
         char *source=malloc(strlen(q21_mma64_src)+128);
         if(!source)goto done;
-        int flash=!strcmp(argv[4],"--flash-softmax") || !strcmp(argv[4],"--forward64-flash");
-        int forward=!strcmp(argv[4],"--forward64") || !strcmp(argv[4],"--forward64-flash");
+        int flash=!strcmp(argv[4],"--flash-softmax") || !strcmp(argv[4],"--forward64-flash") ||
+                  !strcmp(argv[4],"--forward64-flash-raw");
+        int forward=!strcmp(argv[4],"--forward64") || !strcmp(argv[4],"--forward64-flash") ||
+                    !strcmp(argv[4],"--forward64-flash-raw");
         snprintf(source,strlen(q21_mma64_src)+128,"#define Q21_FLASH_SOFTMAX %d\n#define Q21_FORWARD_KEYS %d\n%s",flash,forward,q21_mma64_src);
         int compiled=cu_compile_kernels(&mma_module,r->device,source,"qimg21_mma64.cu",1,"qimg21_mma64");
         free(source);
@@ -64,8 +67,9 @@ int main(int argc, char **argv) {
            cuCtxSynchronize())goto done;
         start=end;
     }
-    if(launch_vec(kernels.round_bf16,r->stream,(int)count,output) ||
-       cuMemcpyDtoH(input[0].data,output,count*4))goto done;
+    if((argc!=5 || strcmp(argv[4],"--forward64-flash-raw")) &&
+       launch_vec(kernels.round_bf16,r->stream,(int)count,output))goto done;
+    if(cuMemcpyDtoH(input[0].data,output,count*4))goto done;
     rc=npy_write_f32(argv[3],input[0].data,count,layout.n,4096);
 done:
     for(int i=0;i<3;i++)free_d(&packed[i]);

@@ -942,6 +942,21 @@ A fused score-scaling variant worsens equality to 99.9668% and was removed.
 Inputs, candidates and region metrics are under `tmp/qimg21-exact-attention17`;
 these operator results do not establish full-model acceptance.
 
+Backend-forced replay corrected the earlier long-sequence dispatch diagnosis.
+For the 256-query target segment with 4,372 keys, PyTorch
+`EFFICIENT_ATTENTION` reproduces the captured official `attn_raw` tensor
+**bit-exactly** (relative L2 0, exact fraction 1.0). Forced Flash and default
+SDPA both give target cosine **0.999999663446**, relative L2 **8.20448e-4**,
+and exact fraction **88.4286%**; forced cuDNN gives relative L2
+**4.44236e-4** and exact fraction **98.0833%**. Profiling identifies the exact
+target kernel as `fmha_cutlassF_bf16_aligned_64x128_rf_sm80`, specifically
+PyTorch's `AttentionKernel<bf16, Sm80, aligned, 64 queries, 128 keys, max-K
+128>`. Editing parity therefore requires the memory-efficient CUTLASS
+accumulation order; matching FlashAttention tile order cannot close this gap.
+`attention_probe.py` accepts `--backend efficient` and `--backend cudnn` and
+forces only the unmasked target call, leaving masked prefix dispatch
+unchanged. Artifacts are in `tmp/qimg21-edit-low-block17-v3`.
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh

@@ -14,7 +14,8 @@ from attention_replay_compare import metrics
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--stage-dir", type=Path, required=True)
-    ap.add_argument("--backend", choices=("default", "math", "flash"), default="default")
+    ap.add_argument("--backend", choices=("default", "math", "flash", "efficient", "cudnn"),
+                    default="default")
     ap.add_argument("--editing-reference", type=Path,
                     help="Use official segmented editing attention from a positive-branch capture")
     args = ap.parse_args()
@@ -28,9 +29,14 @@ def main():
 
     q, k, v = load("rope_q"), load("rope_k"), load("v")
     from torch.nn.attention import SDPBackend, sdpa_kernel
-    backend = nullcontext() if args.backend == "default" else sdpa_kernel(
-        SDPBackend.MATH if args.backend == "math" else SDPBackend.FLASH_ATTENTION)
-    with torch.inference_mode(), backend:
+    selected = {
+        "math": SDPBackend.MATH,
+        "flash": SDPBackend.FLASH_ATTENTION,
+        "efficient": SDPBackend.EFFICIENT_ATTENTION,
+        "cudnn": SDPBackend.CUDNN_ATTENTION,
+    }
+    target_backend = nullcontext() if args.backend == "default" else sdpa_kernel(selected[args.backend])
+    with torch.inference_mode():
         if args.editing_reference:
             from diffusers.models.transformers.transformer_qwenimage21 import (
                 QwenImage21Transformer2DModel, _qwenimage21_prefix_segments,
@@ -52,16 +58,20 @@ def main():
                                       torch.ones(end-start, end-start, device="cuda", dtype=torch.bool).tril()], dim=1)
                 outputs.append(F.scaled_dot_product_attention(q[:, :, start:end], k[:, :, :end],
                                                               v[:, :, :end], attn_mask=mask))
-            outputs.append(F.scaled_dot_product_attention(q[:, :, prefix:], k, v))
+            with target_backend:
+                outputs.append(F.scaled_dot_product_attention(q[:, :, prefix:], k, v))
             ref = torch.cat(outputs, dim=2).transpose(1, 2).flatten(2)
         else:
             mask = torch.ones(prefix, prefix, device="cuda", dtype=torch.bool).tril()
             text = F.scaled_dot_product_attention(q[:, :, :prefix], k[:, :, :prefix],
                                               v[:, :, :prefix], attn_mask=mask)
-            image = F.scaled_dot_product_attention(q[:, :, prefix:], k, v)
+            with target_backend:
+                image = F.scaled_dot_product_attention(q[:, :, prefix:], k, v)
             ref = torch.cat([text, image], dim=2).transpose(1, 2).flatten(2)
     ref = ref.float().cpu().numpy()[0]
     native = np.load(folder / "attn_raw.npy")
+    if native.ndim == 3 and native.shape[0] == 1:
+        native = native[0]
     if native.shape != ref.shape:
         raise ValueError(f"shape mismatch: {native.shape} vs {ref.shape}")
     result = metrics(ref, native, len(ref)-prefix)
