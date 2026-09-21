@@ -1,5 +1,18 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Q8/Q8 attention split cap at 64K (2026-09-21)
+
+The native gfx1201 Q8/Q8 decode selector now caps the validated 64K serving
+window at 64 K/V partitions instead of the adaptive 128-way schedule.  This
+reduces split/combine work without changing the short-context schedule or
+token stream.  The 4K random-depth gate remains exact (`d7284dcf729e565e`),
+with 525.75 tok/s prefill and 42.08 tok/s decode.  The production 64K gate
+retains prefix hash `90178de69a24a76e`, suffix hash `051e7338c23a544e`, and
+passes at 444.10 tok/s prefill and 35.08 tok/s ordinary decode.  Three repeated
+64K runs with the same schedule measured 35.05--35.09 tok/s and the same hash.
+The strict ordinary 40 tok/s long-context target remains open; the next
+high-value work is still mixed-type projection reuse and verifier-tail fusion.
+
 ## Packed Q8/Q8 KV scales (2026-09-21)
 
 The Q8 K/V cache now stores its per-group scales as rounded FP16 values and
