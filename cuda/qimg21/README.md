@@ -329,6 +329,24 @@ one-step editing scheduler produced nonfinite output; two-step capture is
 used instead. A native `--steps 1 --timestep T` call above is a matched-input
 prediction diagnostic, not the official one-step generation trajectory.
 
+For full fixture-driven editing validation, `editing_regression.py` checks
+every captured timestep at matched inputs, then runs an independent Euler
+trajectory from the first target latent. It requires unchanged conditioning
+and prompt/layout across calls, rejects CFG captures, writes per-checkpoint
+results, and returns nonzero if any cosine is below 0.99996:
+
+```sh
+OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/editing_regression.py \
+  --model /mnt/nvme01/models/qimg-21 \
+  --reference-dir tmp/qimg21-edit-reference-256-s2-mask \
+  --work-dir tmp/qimg21-edit-regression-256
+```
+
+After editing integration, the original 256x256 text-to-image timestep-1
+prediction still has cosine 0.9999811334183142 versus its saved reference,
+the same measured result as before integration. The independent editing
+rerun reproduces its failing timestep-1 cosine exactly (0.9999323775131732).
+
 `edit_kernels.h` adds experimental CUDA primitives for that layout:
 interleaved text/image scatter, Q/K RMSNorm plus layout-driven three-axis
 RoPE, and block-causal attention that keeps adjacent images separate.
