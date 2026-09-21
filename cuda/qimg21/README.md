@@ -1381,8 +1381,11 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/editing_regression.py \
 On the RTX 5060 Ti, the measured prediction cosines were
 `0.9999999818465785` and `0.9999999912661135`; the matched two-step Euler
 trajectory cosines were `0.999998675096587` and `0.9999982127383727`. All
-four pass the required `0.99996` threshold. Generated tables, libraries, and
-fixtures remain ignored.
+comparisons clear the `0.99996` non-quantized gate. The CUTLASS plugin retains
+and grows one output/LSE workspace per process; a 4,352-token editing step now
+uses four setup allocations across all 60 attention calls (instead of 120
+per-call allocations), and releases them before the CUDA context is closed.
+Generated tables, libraries, and fixtures remain ignored.
 
 The same two-step case with negative prompt `red apple, blurry` and true-CFG
 scale 4 also passes: prediction cosines `0.9999998485751089` and

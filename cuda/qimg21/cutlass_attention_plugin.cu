@@ -17,6 +17,62 @@ q21_cutlass_attention_kernel(typename q21_kernel::Params params) {
     q21_kernel::attention_kernel(params);
 }
 
+/* The runners are single-stream, single-threaded processes.  Retain the two
+ * scratch allocations across layers/steps instead of making cudaMalloc and
+ * cudaFree synchronize every attention call. */
+struct q21_workspace {
+    cutlass::bfloat16_t *output = nullptr;
+    float *lse = nullptr;
+    size_t output_bytes = 0;
+    size_t lse_bytes = 0;
+    unsigned allocations = 0;
+};
+static q21_workspace workspace;
+
+static cudaError_t q21_reserve_workspace(size_t output_bytes, size_t lse_bytes) {
+    cudaError_t error;
+    if (workspace.output_bytes < output_bytes) {
+        if (workspace.output) {
+            error = cudaFree(workspace.output);
+            if (error != cudaSuccess) return error;
+            workspace.output = nullptr;
+            workspace.output_bytes = 0;
+        }
+        error = cudaMalloc(&workspace.output, output_bytes);
+        if (error != cudaSuccess) return error;
+        workspace.output_bytes = output_bytes;
+        workspace.allocations++;
+    }
+    if (workspace.lse_bytes < lse_bytes) {
+        if (workspace.lse) {
+            error = cudaFree(workspace.lse);
+            if (error != cudaSuccess) return error;
+            workspace.lse = nullptr;
+            workspace.lse_bytes = 0;
+        }
+        error = cudaMalloc(&workspace.lse, lse_bytes);
+        if (error != cudaSuccess) return error;
+        workspace.lse_bytes = lse_bytes;
+        workspace.allocations++;
+    }
+    return cudaSuccess;
+}
+
+extern "C" int q21_cutlass_workspace_release(void) {
+    cudaError_t first = cudaSuccess;
+    if (workspace.lse) first = cudaFree(workspace.lse);
+    if (workspace.output) {
+        cudaError_t error = cudaFree(workspace.output);
+        if (first == cudaSuccess) first = error;
+    }
+    workspace = {};
+    return first;
+}
+
+extern "C" unsigned q21_cutlass_workspace_allocations(void) {
+    return workspace.allocations;
+}
+
 __global__ void q21_cutlass_bf16_to_f32(float *out,
                                          const cutlass::bfloat16_t *in,
                                          int count) {
@@ -89,20 +145,15 @@ extern "C" int q21_cutlass_attention(float *out, const void *q, const void *k,
     params.query_ptr = static_cast<const cutlass::bfloat16_t *>(q);
     params.key_ptr = static_cast<const cutlass::bfloat16_t *>(k);
     params.value_ptr = static_cast<const cutlass::bfloat16_t *>(v);
-    cutlass::bfloat16_t *output = nullptr;
-    float *lse = nullptr;
     int lse_queries = ((nq + q21_kernel::kAlignLSE - 1) /
                        q21_kernel::kAlignLSE) * q21_kernel::kAlignLSE;
-    cudaError_t error = cudaMalloc(&output, static_cast<size_t>(nq) * heads *
-                                   head_dim * sizeof(*output));
+    size_t output_bytes = static_cast<size_t>(nq) * heads * head_dim *
+                          sizeof(*workspace.output);
+    size_t lse_bytes = static_cast<size_t>(lse_queries) * heads * sizeof(*workspace.lse);
+    cudaError_t error = q21_reserve_workspace(output_bytes, lse_bytes);
     if (error != cudaSuccess) return error;
-    error = cudaMalloc(&lse, static_cast<size_t>(lse_queries) * heads * sizeof(*lse));
-    if (error != cudaSuccess) {
-        cudaFree(output);
-        return error;
-    }
-    params.output_ptr = output;
-    params.logsumexp_ptr = lse;
+    params.output_ptr = workspace.output;
+    params.logsumexp_ptr = workspace.lse;
     params.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim)));
     params.head_dim = params.head_dim_value = head_dim;
     params.num_queries = nq;
@@ -126,13 +177,10 @@ extern "C" int q21_cutlass_attention(float *out, const void *q, const void *k,
     }
     if (error == cudaSuccess) {
         int count = nq * heads * head_dim;
-        q21_cutlass_bf16_to_f32<<<(count + 255) / 256, 256, 0, stream>>>(out, output, count);
+        q21_cutlass_bf16_to_f32<<<(count + 255) / 256, 256, 0, stream>>>(out, workspace.output, count);
         error = cudaGetLastError();
     }
-    cudaError_t lse_error = cudaFree(lse);
-    cudaError_t output_error = cudaFree(output);
-    if (error != cudaSuccess) return error;
-    return lse_error == cudaSuccess ? output_error : lse_error;
+    return error;
 }
 
 /* Text-only causal GQA entry point. Q is [N,32,128], K/V are [N,8,128]. */
@@ -145,20 +193,15 @@ extern "C" int q21_cutlass_text_attention(float *out, const void *q,
     params.query_ptr = static_cast<const cutlass::bfloat16_t *>(q);
     params.key_ptr = static_cast<const cutlass::bfloat16_t *>(k);
     params.value_ptr = static_cast<const cutlass::bfloat16_t *>(v);
-    cutlass::bfloat16_t *output = nullptr;
-    float *lse = nullptr;
     int lse_queries = ((tokens + q21_kernel::kAlignLSE - 1) /
                        q21_kernel::kAlignLSE) * q21_kernel::kAlignLSE;
-    cudaError_t error = cudaMalloc(&output, static_cast<size_t>(tokens) *
-                                   query_heads * head_dim * sizeof(*output));
+    size_t output_bytes = static_cast<size_t>(tokens) * query_heads * head_dim *
+                          sizeof(*workspace.output);
+    size_t lse_bytes = static_cast<size_t>(lse_queries) * query_heads * sizeof(*workspace.lse);
+    cudaError_t error = q21_reserve_workspace(output_bytes, lse_bytes);
     if (error != cudaSuccess) return error;
-    error = cudaMalloc(&lse, static_cast<size_t>(lse_queries) * query_heads * sizeof(*lse));
-    if (error != cudaSuccess) {
-        cudaFree(output);
-        return error;
-    }
-    params.output_ptr = output;
-    params.logsumexp_ptr = lse;
+    params.output_ptr = workspace.output;
+    params.logsumexp_ptr = workspace.lse;
     params.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim)));
     params.head_dim = params.head_dim_value = head_dim;
     params.num_queries = params.num_keys = params.num_keys_absolute = tokens;
@@ -183,11 +226,8 @@ extern "C" int q21_cutlass_text_attention(float *out, const void *q,
     }
     if (error == cudaSuccess) {
         int count = tokens * query_heads * head_dim;
-        q21_cutlass_bf16_to_f32<<<(count + 255) / 256, 256, 0, stream>>>(out, output, count);
+        q21_cutlass_bf16_to_f32<<<(count + 255) / 256, 256, 0, stream>>>(out, workspace.output, count);
         error = cudaGetLastError();
     }
-    cudaError_t lse_error = cudaFree(lse);
-    cudaError_t output_error = cudaFree(output);
-    if (error != cudaSuccess) return error;
-    return lse_error == cudaSuccess ? output_error : lse_error;
+    return error;
 }

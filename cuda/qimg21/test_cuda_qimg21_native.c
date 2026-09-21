@@ -336,6 +336,10 @@ static const char *qimg21_rope_base_path;
 typedef int (*qimg21_cutlass_attention_fn)(float *, const void *, const void *,
                                            const void *, int, int, int, int, void *);
 static qimg21_cutlass_attention_fn qimg21_cutlass_attention;
+typedef int (*qimg21_cutlass_workspace_release_fn)(void);
+typedef unsigned (*qimg21_cutlass_workspace_allocations_fn)(void);
+static qimg21_cutlass_workspace_release_fn qimg21_cutlass_workspace_release;
+static qimg21_cutlass_workspace_allocations_fn qimg21_cutlass_workspace_allocations;
 typedef int (*qimg21_exact_rope_fn)(float *, float *, const float *, const float *,
                                     const float *, int, int, void *);
 static qimg21_exact_rope_fn qimg21_exact_rope;
@@ -757,6 +761,10 @@ int main(int argc, char **argv) {
             cuda_qimg_free(r);return 1;
         }
         qimg21_exact_rope=(qimg21_exact_rope_fn)dlsym(cutlass_plugin,"q21_exact_qk_rope");
+        qimg21_cutlass_workspace_release=(qimg21_cutlass_workspace_release_fn)
+            dlsym(cutlass_plugin,"q21_cutlass_workspace_release");
+        qimg21_cutlass_workspace_allocations=(qimg21_cutlass_workspace_allocations_fn)
+            dlsym(cutlass_plugin,"q21_cutlass_workspace_allocations");
         fprintf(stderr,"native: exact CUTLASS efficient attention enabled\n");
     }
     q21_edit_context edit={0};
@@ -859,6 +867,12 @@ int main(int argc, char **argv) {
     if(text_mma_module)cuModuleUnload(text_mma_module);
     if(norm_module)cuModuleUnload(norm_module);
     if(rope_module)cuModuleUnload(rope_module);
-    if(cutlass_plugin)dlclose(cutlass_plugin);
+    if(cutlass_plugin) {
+        if(qimg21_cutlass_workspace_allocations)
+            fprintf(stderr,"native: CUTLASS workspace allocations=%u\n",
+                    qimg21_cutlass_workspace_allocations());
+        if(qimg21_cutlass_workspace_release)qimg21_cutlass_workspace_release();
+        dlclose(cutlass_plugin);
+    }
     cuda_qimg_free(r); npy_free(&pe); npy_free(&neg); npy_free(&la); return rc;
 }
