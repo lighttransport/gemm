@@ -52,7 +52,7 @@ def _save_array(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(value, torch.Tensor):
         value = value.detach().float().cpu().numpy()
-    np.save(path, np.asarray(value))
+    np.save(path, np.ascontiguousarray(np.asarray(value)))
 
 
 def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None) -> None:

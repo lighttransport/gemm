@@ -33,7 +33,7 @@ if a.torch_rng:
     )
     # Qwen-Image 2.1 uses a plain spatial flatten: [B,C,H,W] -> [B,HW,C].
     latents = latents.view(1, 64, a.height_tokens * a.width_tokens).transpose(1, 2)[0]
-    np.save(out / "latents.npy", latents.float().cpu().numpy())
+    np.save(out / "latents.npy", np.ascontiguousarray(latents.float().cpu().numpy()))
 else:
     g = np.random.default_rng(a.seed)
     np.save(out / "latents.npy", g.standard_normal((a.height_tokens * a.width_tokens, 64), dtype=np.float32))

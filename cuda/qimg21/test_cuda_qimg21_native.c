@@ -67,7 +67,7 @@ static int npy_read_f32(const char *path, npy_f32 *out) {
     if (!strstr(header, "'descr': '<f4'") && !strstr(header, "\"descr\": \"<f4\"")) {
         fprintf(stderr, "native: %s is not little-endian F32\n", path); fclose(fp); return -1;
     }
-    if (strstr(header, "fortran_order')") || strstr(header, "fortran_order\": True")) {
+    if (strstr(header, "fortran_order': True") || strstr(header, "fortran_order\": True")) {
         fprintf(stderr, "native: Fortran-order fixture is unsupported: %s\n", path); fclose(fp); return -1;
     }
     char *shape = strstr(header, "shape");
@@ -210,6 +210,7 @@ static const char *qimg21_src =
 "__global__ void gate_res(float*x,const float*y,const float*m,int N,int D,int prefix,int which){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=N*D)return;int t=i/D,j=i%D,row=t<prefix?1:0;int base=row*4*D+which*2*D+D;x[i]+=tanhf(m[base+j])*y[i];}\n"
 "__global__ void qk_rope(float*q,float*k,const float*qw,const float*kw,int N,int D,int nh,int hd,int prefix,int ih,int iw){int t=blockIdx.x,h=blockIdx.y,j=threadIdx.x;if(t>=N||h>=nh)return;__shared__ float sq[128],sk[128];float aq=0,ak=0;for(int z=j;z<hd;z+=blockDim.x){float v=q[t*D+h*hd+z];aq+=v*v;v=k[t*D+h*hd+z];ak+=v*v;}sq[j]=aq;sk[j]=ak;__syncthreads();for(int z=64;z;z>>=1){if(j<z){sq[j]+=sq[j+z];sk[j]+=sk[j+z];}__syncthreads();}if(j&1)return;float iq=rsqrtf(sq[0]/hd+1e-6f),ik=rsqrtf(sk[0]/hd+1e-6f);int axis,off,pos;if(j<16){axis=16;off=0;pos=t<prefix?t:prefix;}else if(j<72){axis=56;off=16;pos=t<prefix?t:-(ih-ih/2)+(t-prefix)/iw;}else{axis=56;off=72;pos=t<prefix?t:-(iw-iw/2)+(t-prefix)%iw;}int pair=(j-off)&~1;float ang=(float)pos*exp2f(-log2f(10000.f)*(float)(pair)/(float)axis);float c=cosf(ang),sn=sinf(ang);int d0=h*hd+off+pair,d1=d0+1;float x0=q[t*D+d0]*iq*qw[off+pair],x1=q[t*D+d1]*iq*qw[off+pair+1];float y0=k[t*D+d0]*ik*kw[off+pair],y1=k[t*D+d1]*ik*kw[off+pair+1];q[t*D+d0]=x0*c-x1*sn;q[t*D+d1]=x0*sn+x1*c;k[t*D+d0]=y0*c-y1*sn;k[t*D+d1]=y0*sn+y1*c;}\n"
 "__global__ void masked_attn(float*o,const float*q,const float*k,const float*v,int N,int P,int nh,int hd){int h=blockIdx.x,warp=threadIdx.x/32,lane=threadIdx.x&31,qi=blockIdx.y*4+warp;if(h>=nh)return;int D=nh*hd;float qr[4],or_[4];for(int e=0;e<4;e++){int d=lane*4+e;qr[e]=(qi<N&&d<hd)?q[qi*D+h*hd+d]:0;or_[e]=0;}float mi=-1e30f,li=0;extern __shared__ float sm[];float*sk=sm,*sv=sm+32*128;for(int b=0;b<N;b+=32){for(int z=threadIdx.x;z<32*128;z+=128){int kk=z/128,d=z%128,t=b+kk;sk[z]=(t<N)?k[t*D+h*hd+d]:0;sv[z]=(t<N)?v[t*D+h*hd+d]:0;}__syncthreads();for(int kk=0;kk<32;kk++){int kt=b+kk;bool allow=kt<N&&qi<N&&(qi>=P||kt<=qi);if(!allow)continue;float dot=0;for(int e=0;e<4;e++)dot+=qr[e]*sk[kk*128+lane*4+e];for(int z=16;z;z>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,z);float score=dot*rsqrtf((float)hd),nm=fmaxf(mi,score),a=expf(mi-nm),p=expf(score-nm);li=li*a+p;for(int e=0;e<4;e++)or_[e]=or_[e]*a+p*sv[kk*128+lane*4+e];mi=nm;}__syncthreads();}if(qi<N){float il=li>0?1.f/li:0;for(int e=0;e<4;e++){int d=lane*4+e;if(d<hd)o[qi*D+h*hd+d]=or_[e]*il;}}}\n"
+"__global__ void masked_attn_precise(float*o,const float*q,const float*k,const float*v,int N,int P,int nh,int hd){int h=blockIdx.x,warp=threadIdx.x/32,lane=threadIdx.x&31,qi=blockIdx.y*4+warp;if(h>=nh)return;int D=nh*hd;float qr[4],or_[4];for(int e=0;e<4;e++){int d=lane*4+e;qr[e]=(qi<N&&d<hd)?q[qi*D+h*hd+d]:0;or_[e]=0;}extern __shared__ float sm[];float*sk=sm,*sv=sm+32*128;float mx=-1e30f;for(int b=0;b<N;b+=32){for(int z=threadIdx.x;z<32*128;z+=128){int kk=z/128,d=z%128,t=b+kk;sk[z]=(t<N)?k[t*D+h*hd+d]:0;sv[z]=(t<N)?v[t*D+h*hd+d]:0;}__syncthreads();for(int kk=0;kk<32;kk++){int kt=b+kk;if(!(kt<N&&qi<N&&(qi>=P||kt<=qi)))continue;float dot=0;for(int e=0;e<4;e++)dot+=qr[e]*sk[kk*128+lane*4+e];for(int z=16;z;z>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,z);mx=fmaxf(mx,dot*rsqrtf((float)hd));}__syncthreads();}for(int z=16;z;z>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,z));float sum=0;for(int b=0;b<N;b+=32){for(int z=threadIdx.x;z<32*128;z+=128){int kk=z/128,d=z%128,t=b+kk;sk[z]=(t<N)?k[t*D+h*hd+d]:0;sv[z]=(t<N)?v[t*D+h*hd+d]:0;}__syncthreads();for(int kk=0;kk<32;kk++){int kt=b+kk;if(!(kt<N&&qi<N&&(qi>=P||kt<=qi)))continue;float dot=0;for(int e=0;e<4;e++)dot+=qr[e]*sk[kk*128+lane*4+e];for(int z=16;z;z>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,z);float p=expf(dot*rsqrtf((float)hd)-mx);sum+=p;for(int e=0;e<4;e++)or_[e]+=p*sv[kk*128+lane*4+e];}__syncthreads();}if(qi<N){float il=sum>0?1.f/sum:0;for(int e=0;e<4;e++){int d=lane*4+e;if(d<hd)o[qi*D+h*hd+d]=or_[e]*il;}}}\n"
 "__global__ void final_ln(float*y,const float*x,const float*s,int N,int D,int prefix){int t=blockIdx.x,i=threadIdx.x;extern __shared__ float z[];float a=0;for(int j=i;j<D;j+=blockDim.x)a+=x[t*D+j];z[i]=a;__syncthreads();for(int q=blockDim.x/2;q;q>>=1){if(i<q)z[i]+=z[i+q];__syncthreads();}float mu=z[0]/D;__syncthreads();a=0;for(int j=i;j<D;j+=blockDim.x){float d=x[t*D+j]-mu;a+=d*d;}z[i]=a;__syncthreads();for(int q=blockDim.x/2;q;q>>=1){if(i<q)z[i]+=z[i+q];__syncthreads();}float iv=rsqrtf(z[0]/D+1e-6f);int row=t<prefix?1:0;for(int j=i;j<D;j+=blockDim.x)y[t*D+j]=(x[t*D+j]-mu)*iv*(1.f+s[row*D+j]);}\n"
 "}\n";
 
@@ -287,6 +288,8 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
     A(q,(size_t)N*D*4); A(kk,(size_t)N*D*4); A(v,(size_t)N*D*4); A(att,(size_t)N*D*4); A(mlp0,(size_t)N*12288*4); A(mlp1,(size_t)N*12288*4);
     A(temb,2*D*4); A(time0,256*4); A(timebf,256*2); A(mod,2*16384*4); A(scale,2*D*4);
     cuMemcpyHtoD(txt,prompt,(size_t)nt*D*4); cuMemcpyHtoD(img,latent,(size_t)ni*64*4);
+    dump_stage("txt_input", txt, (size_t)nt * D, nt, D);
+    dump_stage("img_input", img, (size_t)ni * 64, ni, 64);
     wt_norm=upload_f32(s,"txt_in.text_norm.weight"); wt_in=upload_bf16(s,"txt_in.in_layer.weight"); wt_out=upload_bf16(s,"txt_in.out_layer.weight"); wi=upload_bf16(s,"img_in.weight");
     w_t1=upload_bf16(s,"time_text_embed.timestep_embedder.linear_1.weight"); w_t2=upload_bf16(s,"time_text_embed.timestep_embedder.linear_2.weight"); w_mod=upload_bf16(s,"modulation.1.weight");
     if(!wt_norm||!wt_in||!wt_out||!wi||!w_t1||!w_t2||!w_mod)goto fail;
@@ -365,7 +368,7 @@ done:
 
 int main(int argc, char **argv) {
     const char *model = NULL, *prompt_path = NULL, *latent_path = NULL;
-    const char *out_path = "native_latents.npy", *dump_dir = NULL;
+    const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
     int ih = 16, iw = 16, steps = 1, verbose = 1;
     float manual_t = -1.0f;
     for (int i = 1; i < argc; i++) {
@@ -374,6 +377,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--latents") && i + 1 < argc) latent_path = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) dump_dir = argv[++i];
+        else if (!strcmp(argv[i], "--pred-dir") && i + 1 < argc) pred_dir = argv[++i];
         else if (!strcmp(argv[i], "--height-tokens") && i + 1 < argc) ih = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--width-tokens") && i + 1 < argc) iw = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
@@ -382,7 +386,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--quiet")) verbose = 0;
         else {
             fprintf(stderr, "usage: %s --model DIR --prompt-embeds E.npy --latents L.npy "
-                    "[--steps N --dump-dir DIR --height-tokens 16 --width-tokens 16 "
+                    "[--steps N --dump-dir DIR --pred-dir DIR --height-tokens 16 --width-tokens 16 "
                     "--timestep .5 --out O.npy --verbose]\n", argv[0]);
             return 2;
         }
@@ -396,12 +400,13 @@ int main(int argc, char **argv) {
     }
     if(!model||!prompt_path||!latent_path||ih*iw<=0)return 2;
     npy_f32 pe,la;if(npy_read_f32(prompt_path,&pe)!=0||npy_read_f32(latent_path,&la)!=0)return 1;
-    int nt=(pe.ndim==3&&pe.shape[0]==1)?(int)pe.shape[1]:(pe.ndim==2?(int)pe.shape[0]:0), ni=(la.ndim==3&&la.shape[0]==1)?(int)(la.shape[1]*la.shape[2]):(la.ndim==2?(int)la.shape[0]:0);
+    int nt=(pe.ndim==3&&pe.shape[0]==1)?(int)pe.shape[1]:(pe.ndim==2?(int)pe.shape[0]:0), ni=(la.ndim==3&&la.shape[0]==1)?(int)la.shape[1]:(la.ndim==2?(int)la.shape[0]:0);
     if(nt<=0||pe.shape[pe.ndim-1]!=4096||ni!=ih*iw||la.shape[la.ndim-1]!=64){fprintf(stderr,"native: expected embeds [1,T,4096] and latents [N,64]\n");return 1;}
     const float *p=pe.data; cuda_qimg_runner*r=cuda_qimg_init(0,verbose);if(!r)return 1;
     qimg21_shards s={{0},0};char path[1024];for(int i=1;i<=2;i++){snprintf(path,sizeof(path),"%s/transformer/diffusion_pytorch_model-%05d-of-00002.safetensors",model,i);s.st[s.n]=safetensors_open(path);if(!s.st[s.n]){fprintf(stderr,"native: cannot open %s\n",path);cuda_qimg_free(r);return 1;}fprintf(stderr,"native: opened shard %d (%d tensors)\n",i,s.st[s.n]->n_tensors);s.n++;}
     qimg21_kernels k;CUmodule m;if(cu_compile_kernels(&m,r->device,qimg21_src,"qimg21_native.cu",verbose,"qimg21_native")<0||get_kernel(&k,m)!=0){fprintf(stderr,"native: custom kernel compile failed\n");return 1;}fprintf(stderr,"native: custom kernels ready\n");
     if (dump_dir) mkdir(dump_dir, 0755);
+    if (pred_dir) mkdir(pred_dir, 0755);
     float *pred = (float *)malloc((size_t)ni * 64 * sizeof(float));
     float *sigmas = (float *)malloc((size_t)(steps + 1) * sizeof(float));
     if (!pred || !sigmas) return 1;
@@ -413,6 +418,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "native: step %d/%d sigma=%.7f\n", i + 1, steps, sigmas[i]);
         rc = native_step(r, &k, &s, p, nt, la.data, ni, ih, iw, sigmas[i], pred);
         if (rc != 0) break;
+        if (pred_dir) {
+            char pred_path[1024];
+            snprintf(pred_path, sizeof(pred_path), "%s/pred_%03d.npy", pred_dir, i);
+            npy_write_f32(pred_path, pred, (size_t)ni * 64, ni, 64);
+        }
         for (size_t j = 0; j < (size_t)ni * 64; j++)
             la.data[j] += (sigmas[i + 1] - sigmas[i]) * pred[j];
         if (dump_dir) {

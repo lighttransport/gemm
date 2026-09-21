@@ -57,6 +57,10 @@ def _step_names(directory: Path) -> list[str]:
     return sorted(path.name for path in directory.glob("step_*.npy"))
 
 
+def _prediction_names(directory: Path) -> list[str]:
+    return sorted(path.name for path in directory.glob("pred_*.npy"))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--reference-dir", required=True)
@@ -76,7 +80,14 @@ def main() -> int:
         action="store_true",
         help="compare denoising checkpoints only (for the native C runner, which has no image output)",
     )
+    ap.add_argument(
+        "--denoiser-only",
+        action="store_true",
+        help="compare per-step native denoiser predictions only",
+    )
     args = ap.parse_args()
+    if args.steps_only and args.denoiser_only:
+        raise SystemExit("--steps-only and --denoiser-only are mutually exclusive")
     ref_dir, run_dir = Path(args.reference_dir), Path(args.runner_dir)
     threshold = args.cosine_threshold
     if threshold is None:
@@ -86,7 +97,7 @@ def main() -> int:
     print(f"acceptance cosine threshold={threshold:.9f} ({'quantized' if args.quantized else 'non-quantized'})")
 
     failures: list[str] = []
-    if not args.steps_only:
+    if not args.steps_only and not args.denoiser_only:
         ref_image = ref_dir / "reference_rgba.npy"
         run_image = run_dir / "runner.png"
         if ref_image.exists() and run_image.exists():
@@ -104,7 +115,7 @@ def main() -> int:
         elif ref_image.exists() or run_image.exists():
             failures.append("image fixture is present on only one side")
 
-    fixture_names = () if args.steps_only else ("initial_latents.npy", "prompt_embeds.npy", "prompt_mask.npy", "image_pad_mask.npy")
+    fixture_names = () if args.steps_only or args.denoiser_only else ("initial_latents.npy", "prompt_embeds.npy", "prompt_mask.npy", "image_pad_mask.npy")
     for name in fixture_names:
         rp, gp = ref_dir / name, run_dir / name
         if rp.exists() or gp.exists():
@@ -119,26 +130,50 @@ def main() -> int:
                 if name in ("initial_latents.npy", "prompt_embeds.npy") and cosine < threshold:
                     failures.append(f"{name} cosine {cosine:.9f} < {threshold:.9f}")
 
-    ref_steps = _step_names(ref_dir)
-    if not ref_steps:
-        failures.append(f"no reference step fixtures in {ref_dir}")
-    for name in ref_steps:
-        rp = ref_dir / name
-        gp = _step_path(run_dir, name)
-        try:
-            cosine, _ = _compare_array(name, rp, gp)
-        except (OSError, ValueError, FileNotFoundError) as exc:
-            failures.append(f"{name}: {exc}")
-        else:
-            if not np.isfinite(cosine) or cosine < threshold:
-                failures.append(f"{name} cosine {cosine:.9f} < {threshold:.9f}")
+    ref_steps: list[str] = []
+    if not args.denoiser_only:
+        ref_steps = _step_names(ref_dir)
+        if not ref_steps:
+            failures.append(f"no reference step fixtures in {ref_dir}")
+        for name in ref_steps:
+            rp = ref_dir / name
+            gp = _step_path(run_dir, name)
+            try:
+                cosine, _ = _compare_array(name, rp, gp)
+            except (OSError, ValueError, FileNotFoundError) as exc:
+                failures.append(f"{name}: {exc}")
+            else:
+                if not np.isfinite(cosine) or cosine < threshold:
+                    failures.append(f"{name} cosine {cosine:.9f} < {threshold:.9f}")
+
+    ref_predictions = []
+    if args.denoiser_only:
+        ref_predictions = _prediction_names(ref_dir)
+        if not ref_predictions:
+            failures.append(f"no reference denoiser prediction fixtures in {ref_dir}")
+        run_predictions = _prediction_names(run_dir)
+        if run_predictions != ref_predictions:
+            failures.append(
+                f"denoiser prediction fixture mismatch: reference={ref_predictions} candidate={run_predictions}"
+            )
+        for name in ref_predictions:
+            try:
+                cosine, _ = _compare_array(name, ref_dir / name, run_dir / name)
+            except (OSError, ValueError, FileNotFoundError) as exc:
+                failures.append(f"{name}: {exc}")
+            else:
+                if not np.isfinite(cosine) or cosine < threshold:
+                    failures.append(f"{name} cosine {cosine:.9f} < {threshold:.9f}")
 
     if failures:
         print("PARITY FAIL", file=sys.stderr)
         for failure in failures:
             print(f"  - {failure}", file=sys.stderr)
         return 1
-    print(f"PARITY PASS: {len(ref_steps)} denoising checkpoints meet the cosine gate")
+    if args.denoiser_only:
+        print(f"PARITY PASS: {len(ref_predictions)} denoiser predictions meet the cosine gate")
+    else:
+        print(f"PARITY PASS: {len(ref_steps)} denoising checkpoints meet the cosine gate")
     return 0
 
 

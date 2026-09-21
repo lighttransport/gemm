@@ -60,9 +60,14 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/regression.py \
   --case 256x256:2:42
 ```
 
-Native mode compares every C/NVRTC scheduler checkpoint directly against the
-PyTorch reference using the exact `initial_latents.npy` fixture and does not
-require a VAE image decode.
+Native mode captures the exact PyTorch transformer input and BF16 timestep for
+each denoising iteration, then replays that single denoiser call in the native
+C/NVRTC runner. The acceptance gate is applied to every matched
+`pred_NNN.npy` output (`cosine >= 0.99996` for these non-quantized weights).
+The scheduler `step_NNN.npy` files are still emitted for diagnostics, but are
+not the denoiser acceptance metric: small arithmetic differences can compound
+through repeated scheduler updates. This direct check does not require a VAE
+image decode.
 
 The first native deliverable is batch-1 text-to-image with the model’s
 recommended no-guidance path. Condition-image editing, true CFG, and

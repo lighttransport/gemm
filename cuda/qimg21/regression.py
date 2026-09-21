@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import math
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,23 @@ DEFAULT_CASES = (
     Case(512, 512, 4, 42),
 )
 FULL_CASE = Case(1024, 1024, 40, 42)
+
+
+def _flow_sigmas(steps: int, image_tokens: int) -> list[float]:
+    """Mirror FlowMatchEulerDiscreteScheduler's dynamic-shift schedule."""
+    base_seq, max_seq = 256.0, 8192.0
+    base_shift, max_shift = 0.5, 0.9
+    mu = image_tokens * (max_shift - base_shift) / (max_seq - base_seq)
+    mu += base_shift - (max_shift - base_shift) / (max_seq - base_seq) * base_seq
+    emu = math.exp(mu)
+    sigmas = []
+    for i in range(steps):
+        u = 1.0 if steps == 1 else 1.0 - i / (steps - 1)
+        # The C implementation evaluates 1/0 as +inf for the terminal
+        # scheduler sample; its limiting sigma is exactly zero.
+        sigmas.append(0.0 if u == 0.0 else emu / (emu + (1.0 / u - 1.0)))
+    scale = (1.0 - sigmas[-1]) / (1.0 - 0.02)
+    return [1.0 - (1.0 - sigma) / scale for sigma in sigmas]
 
 
 def _parse_case(value: str) -> Case:
@@ -131,42 +152,57 @@ def main() -> int:
             common.extend(["--true-cfg-scale", str(args.true_cfg_scale)])
         print(f"\n=== {case.name} ===", flush=True)
         try:
-            _run(
-                [
-                    sys.executable,
-                    str(reference),
-                    *common,
-                    "--dtype",
-                    args.dtype,
-                    "--dump-initial-latents",
-                    "--dump-dir",
-                    str(ref_dir),
-                ],
-                root,
-            )
+            reference_command = [
+                sys.executable,
+                str(reference),
+                *common,
+                "--dtype",
+                args.dtype,
+                "--dump-initial-latents",
+            ]
             if args.native:
-                _run(
-                    [
-                        str(native_bin),
-                        "--model",
-                        str(model),
-                        "--prompt-embeds",
-                        str(ref_dir / "prompt_embeds.npy"),
-                        "--latents",
-                        str(ref_dir / "initial_latents.npy"),
-                        "--height-tokens",
-                        str(case.height // 16),
-                        "--width-tokens",
-                        str(case.width // 16),
-                        "--steps",
-                        str(case.steps),
-                        "--dump-dir",
-                        str(run_dir),
-                        "--out",
-                        str(run_dir / "native_latents.npy"),
-                    ],
-                    root,
-                )
+                reference_command.extend(["--dump-pred-dir", str(ref_dir)])
+            reference_command.extend(["--dump-dir", str(ref_dir)])
+            _run(reference_command, root)
+            if args.native:
+                run_dir.mkdir(parents=True, exist_ok=True)
+                fallback_sigmas = _flow_sigmas(case.steps, (case.height // 16) * (case.width // 16))
+                timesteps = []
+                for step, fallback in enumerate(fallback_sigmas):
+                    timestep_path = ref_dir / f"timestep_{step:03d}.npy"
+                    if timestep_path.exists():
+                        timesteps.append(float(np.load(timestep_path).reshape(-1)[0]))
+                    else:
+                        timesteps.append(fallback)
+                for step, sigma in enumerate(timesteps):
+                    step_pred_dir = run_dir / f"pred-step-{step:03d}"
+                    _run(
+                        [
+                            str(native_bin),
+                            "--model",
+                            str(model),
+                            "--prompt-embeds",
+                            str(ref_dir / "prompt_embeds.npy"),
+                            "--latents",
+                            str(ref_dir / f"input_{step:03d}.npy"),
+                            "--height-tokens",
+                            str(case.height // 16),
+                            "--width-tokens",
+                            str(case.width // 16),
+                            "--steps",
+                            "1",
+                            "--timestep",
+                            f"{sigma:.10f}",
+                            "--pred-dir",
+                            str(step_pred_dir),
+                            "--out",
+                            str(run_dir / f"native_step_{step:03d}.npy"),
+                        ],
+                        root,
+                    )
+                    shutil.copyfile(
+                        step_pred_dir / "pred_000.npy", run_dir / f"pred_{step:03d}.npy"
+                    )
             else:
                 _run(
                     [
@@ -186,7 +222,7 @@ def main() -> int:
                 )
             compare_command = [sys.executable, str(compare), "--reference-dir", str(ref_dir), "--runner-dir", str(run_dir)]
             if args.native:
-                compare_command.append("--steps-only")
+                compare_command.append("--denoiser-only")
             if args.quantized:
                 compare_command.append("--quantized")
             if args.cosine_threshold is not None:
