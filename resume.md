@@ -14,15 +14,16 @@
 5. Prepare safe sidecar cache-injection overlap with per-stream workspaces;
    production defaults remain unchanged until measured gains are demonstrated.
 
-The sidecar attention merge is landed, and DFlash2 proposal embedding now uses
-one exact row-batched IQ1_M launch for the anchor plus fixed mask rows. The
-pinned 4K C++ merge gate is byte-stable: greedy K=7 is 83.69 tok/s warm with
-140 drafted/134 accepted and hash `44915ec1039a64c8`; seeded sampled K=7 is
-70.47 tok/s with 140 drafted/115 accepted and hash `630b7cbc72230e0d`. Draft
-time is about 264 ms (greedy) or 250 ms (sampled) for 140 proposals. The full
-HTTP/stdio, cancellation, cache, concurrency, and multi-turn C++ quality suite
-passes. The strict ordinary 64K target, target-tail fusion, and production
-cache-injection overlap default remain open.
+The sidecar attention merge is landed, and DFlash2 proposal embedding now
+decodes one exact anchor row and one exact mask row before copying the repeated
+mask row on device. The pinned 4K C++ merge gate is byte-stable: greedy K=7 is
+82.65--84.12 tok/s warm with 140 drafted/134 accepted and hash
+`44915ec1039a64c8`; seeded sampled K=7 is 70.47 tok/s with 140 drafted/115
+accepted and hash `630b7cbc72230e0d`. Draft time is about 263--264 ms (greedy)
+or 250 ms (sampled) for 140 proposals. The full HTTP/stdio, cancellation,
+cache, concurrency, and multi-turn C++ quality suite passes. The strict
+ordinary 64K target, target-tail fusion, and production cache-injection
+overlap default remain open.
 
 ## 2026-09-22 continuation: sidecar overlap ordering hardening
 
@@ -528,6 +529,13 @@ older row-batched embedding for A/B checks. Matched 4K K=7 greedy runs kept
 82.65--84.12 tok/s. The full HTTP/stdio, cancellation, cache, concurrency,
 sampled-repeatability, and multi-turn C++ harness passed with the broadcast
 path. Target verification and selector indexing remain unchanged.
+
+The K=4 greedy gate now measures 55.51--56.19 tok/s across two warm repeats,
+with 124/124 accepted rows, `draft_ms` 274.5--283.8, `verify_ms`
+2,188.5--2,197.9, and the same `44915ec1039a64c8` hash. A single-launch
+device broadcast probe for the repeated mask rows was exact but neutral at the
+same range, so it was reverted; the ordered copies keep the simpler stream
+contract.
 
 The DeltaNet warp-per-row batch probe was rerun three times under the seeded
 sampled 4K gate. It averaged 38.99 tok/s versus 38.94 tok/s for the

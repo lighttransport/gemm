@@ -2,12 +2,13 @@
 
 ## Draft embedding launch cleanup (2026-09-22)
 
-Each DFlash2 proposal now publishes the anchor and fixed mask-token IDs into
-the selector-candidate scratch and decodes all rows with one exact
-`embed_iq1_m_batch` launch. The selector overwrites that scratch only after the
-embedding launch has consumed it on the same stream; the scalar embedding
-fallback remains available when the batch entry point is absent. Target
-verification, selector state, and captured graph arguments are unchanged.
+Each DFlash2 proposal now decodes one anchor row and one fixed mask-token row
+with the exact IQ1_M scalar kernel, then copies that device row for every
+remaining mask candidate. The selector overwrites its scratch only after the
+embedding and copies have completed on the same stream; setting
+`LLM_QWEN35_DFLASH_EMBED_BROADCAST=0` restores the older exact
+`embed_iq1_m_batch` A/B path. Target verification, selector state, and captured
+graph arguments are unchanged.
 
 The pinned 4K C++ merge benchmark improved greedy K=7 from the previous
 79.88 tok/s run to 83.69 tok/s warm (140 drafted, 134 accepted), with stable
@@ -25,6 +26,13 @@ accepted and hash `44915ec1039a64c8`; draft time fell from 368--370 ms to
 263--264 ms, and warm decode improved from 78.66--79.88 to 82.65--84.12
 tok/s. The complete HTTP/stdio and multi-turn C++ quality suite, including
 seeded sampling, passed with the default fast path.
+
+The same default path at K=4 retained 124/124 accepted rows and the greedy
+hash, measuring 55.51--56.19 tok/s across two warm repeats (`draft_ms`
+274.5--283.8, `verify_ms` 2,188.5--2,197.9). A single-launch device broadcast
+probe for the repeated mask rows was byte-stable but neutral at 55.51--56.19
+tok/s, so the existing ordered device copies remain the simpler production
+path.
 
 ## Fused sidecar attention merge (2026-09-22)
 
