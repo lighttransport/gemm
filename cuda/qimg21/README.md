@@ -870,6 +870,19 @@ only **0.999868168**, so the run still fails overall. Artifacts:
 `tmp/qimg21-edit-low-block17-v3` and
 `tmp/qimg21-edit-forward-flash-vector-ln/results.json`.
 
+The same low-step block replay with its matched PyTorch hidden state shows
+where long-sequence error enters: target Q/K after RMS+RoPE have relative L2
+1.15e-5 / 2.15e-6, while ordinary MMA64 attention reaches 8.22e-4 and the
+block output reaches 1.96e-3. Replaying the exact PyTorch Q/K/V yields the same
+ordinary-attention error (8.2169e-4), proving that the dominant local error is
+inside long segmented attention rather than its Q/K inputs.
+
+A bounded depth-switch experiment used forward-Flash for early blocks and
+reverse-Flash after blocks 8, 16, or 24. Low-prediction cosines were
+0.999862188, 0.999844693, and 0.999870276 respectively, all worse than uniform
+reverse MMA64 at 0.999881718. The switch implementation was removed; artifacts
+are `tmp/qimg21-edit-hybrid-cut{8,16,24}-low`.
+
 An explicit non-fused multiply/add RoPE experiment was rejected: matched
 block-17 Q/K mismatches rose to 13/11 elements and block-output relative L2
 rose to 5.0646e-5. No production RoPE change was retained; diagnostic artifacts
